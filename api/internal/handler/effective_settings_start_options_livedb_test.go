@@ -2,11 +2,17 @@ package handler
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
 
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/clitoken"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
@@ -107,15 +113,103 @@ func TestStartPreviewUnhonorableModelIsARefusalLiveDB(t *testing.T) {
 		})
 	}
 
-	t.Run("a credential refusal keeps precedence over the model refusal", func(t *testing.T) {
+	t.Run("an explicit harness answers the model refusal before a credential refusal", func(t *testing.T) {
 		f := newEffFix(t, nil)
 		f.bothUsable(10, 10)
 		f.addToken(uuid.MustParse(corpusDisabledToken), "pre-disabled", true)
 		dto, _ := f.preview(`{"harness":"claude","model":"gpt-6-sol","credential_override":{"mode":"pinned","secret_id":"` + corpusDisabledToken + `"}}`)
+		if strs(dto.Refusal) != "model_incompatible_with_harness" || dto.Credential != nil || dto.Harness == nil || strs(dto.Harness.Value) != "claude" {
+			t.Fatalf("preview = %+v, want the model refusal on claude with no credential cell", dto)
+		}
+	})
+	t.Run("a harness the server decides keeps the credential refusal first", func(t *testing.T) {
+		f := newEffFix(t, nil)
+		f.bothUsable(10, 10)
+		f.addToken(uuid.MustParse(corpusDisabledToken), "pre-disabled", true)
+		dto, _ := f.preview(`{"model":"gpt-6-sol","credential_override":{"mode":"pinned","secret_id":"` + corpusDisabledToken + `"}}`)
 		if strs(dto.Refusal) != "credential_disabled" {
 			t.Fatalf("refusal = %s, want credential_disabled", strs(dto.Refusal))
 		}
 	})
+}
+
+// TestStartPreviewRefusalPrecedenceMatchesCreateRouteLiveDB drives the REAL create route and the
+// preview route with the same body and asserts they refuse with the same reason: an explicit
+// harness gets the model refusal ahead of any credential refusal, a harness the server decides
+// gets the credential refusal ahead of the model refusal.
+func TestStartPreviewRefusalPrecedenceMatchesCreateRouteLiveDB(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name, body, wantCode, wantRefusal string
+		onlyAnthropic, disabledPin        bool
+	}{
+		{
+			name: "explicit codex with a claude alias, owner holds only an Anthropic token",
+			body: `{"harness":"codex","model":"opus"}`, wantCode: "model_incompatible_with_harness", wantRefusal: "model_incompatible_with_harness",
+			onlyAnthropic: true,
+		},
+		{
+			name:     "explicit claude with a codex id, pinned to a disabled token",
+			body:     `{"harness":"claude","model":"gpt-6-sol","credential_override":{"mode":"pinned","secret_id":"DISABLED_ID"}}`,
+			wantCode: "model_incompatible_with_harness", wantRefusal: "model_incompatible_with_harness",
+			disabledPin: true,
+		},
+		{
+			name:     "server-decided harness, pinned to a disabled token, incompatible model",
+			body:     `{"model":"gpt-6-sol","credential_override":{"mode":"pinned","secret_id":"DISABLED_ID"}}`,
+			wantCode: "credential_disabled", wantRefusal: "credential_disabled",
+			disabledPin: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newRunStartFixture(ctx, t)
+			cliMustExec(t, f.pool, `UPDATE users SET default_harness = 'claude' WHERE id = $1`, f.owner)
+			if tc.onlyAnthropic {
+				cliMustExec(t, f.pool, `DELETE FROM user_secrets WHERE user_id = $1 AND kind = 'openai_api_key'`, f.owner)
+			}
+			body := tc.body
+			if tc.disabledPin {
+				id := uuid.New()
+				cliMustExec(t, f.pool,
+					`INSERT INTO user_secrets (id, user_id, kind, label, is_default, ciphertext, sealed_with, disabled_at)
+					 VALUES ($1, $2, 'anthropic_token', 'pre-disabled', false, $3, 'master', now())`, id, f.owner, []byte("ct"))
+				body = strings.ReplaceAll(body, "DISABLED_ID", id.String())
+			}
+			token := cliMintToken(t, f.pool, f.owner, clitoken.ScopeUser)
+			repoID, path := f.seedIssue(ctx, t, 7)
+
+			var m map[string]any
+			if err := json.Unmarshal([]byte(body), &m); err != nil {
+				t.Fatal(err)
+			}
+			m["issue_iid"] = 7
+			createBody, _ := json.Marshal(m)
+			rec := bearerReqBody(f.router, http.MethodPost, path, token, string(createBody))
+			if rec.Code != http.StatusUnprocessableEntity && rec.Code != http.StatusConflict && rec.Code != http.StatusNotFound {
+				t.Fatalf("create status = %d, want a refusal (body %s)", rec.Code, rec.Body.String())
+			}
+			created := decodeErrBody(t, rec.Body.Bytes())
+			if tc.wantCode == "model_incompatible_with_harness" && created["code"] != tc.wantCode {
+				t.Fatalf("create body = %v, want code %s", created, tc.wantCode)
+			}
+			if tc.wantCode != "model_incompatible_with_harness" && created["code"] == "model_incompatible_with_harness" {
+				t.Fatalf("create body = %v, want the credential refusal, not the model one", created)
+			}
+			if rows := f.runRows(ctx, t, repoID); len(rows) != 0 {
+				t.Errorf("create left %d run rows", len(rows))
+			}
+
+			prev := bearerReqBody(f.router, http.MethodPost, "/api/me/effective-settings/start-preview", token, body)
+			if prev.Code != http.StatusOK {
+				t.Fatalf("preview status = %d (body %s)", prev.Code, prev.Body.String())
+			}
+			var dto apitypes.StartPreviewDTO
+			strictDecode(t, prev.Body.Bytes(), &dto)
+			if strs(dto.Refusal) != tc.wantRefusal {
+				t.Fatalf("preview refusal = %s, create answered %v; want %s", strs(dto.Refusal), created, tc.wantRefusal)
+			}
+		})
+	}
 }
 
 // TestStartPreviewModelOptsOutOfAutomaticHarnessLiveDB is D22 (user decision 2026-11-14): a model
@@ -141,6 +235,12 @@ func TestStartPreviewModelOptsOutOfAutomaticHarnessLiveDB(t *testing.T) {
 			if control.Harness == nil || control.Harness.Value != nil || len(control.Alternatives) != 2 {
 				t.Fatalf("control preview = %+v, want a harness chosen at create", control)
 			}
+			// The premise, under the same readings: a create without a model is steered to Codex, so
+			// the opus create below choosing Claude is the opt-out and not the default.
+			noModel, err := f.createWithOptions(nil, nil, nil)
+			if err != nil || noModel.Harness != "codex" {
+				t.Fatalf("create without a model = %q %v, want a run frozen on codex under these readings", noModel.Harness, err)
+			}
 
 			dto, body := f.preview(`{"harness":null,"credential_override":null,"model":"opus"}`)
 			if dto.Harness == nil || strs(dto.Harness.Value) != "claude" || dto.Refusal != nil || len(dto.Alternatives) != 0 || dto.Credential == nil {
@@ -162,7 +262,7 @@ func TestStartPreviewModelOptsOutOfAutomaticHarnessLiveDB(t *testing.T) {
 			for _, hn := range []string{"claude", "codex"} {
 				a := altOf(t, eff, hn)
 				e := a.WorkerEffort
-				if e == nil || e.Harness != hn || e.Source != "run_override" || e.Mode != "explicit" || strs(e.ResolvedEffort) != "high" || a.WorkerModel != nil || a.Refusal != nil {
+				if e == nil || e.Harness != hn || e.Source != "run_override" || e.Mode != "explicit" || strs(e.ResolvedEffort) != "high" || a.Refusal != nil {
 					t.Fatalf("%s alternative = %+v, want worker_effort high from run_override", hn, a)
 				}
 			}

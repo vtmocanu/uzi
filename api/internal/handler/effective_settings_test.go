@@ -341,8 +341,8 @@ func TestEffectiveSettingsStoreErrorIs500WithNoPartialBody(t *testing.T) {
 	}
 }
 
-// TestStartPreviewBodyBoundAdmitsALongestModel: the 1 KiB body bound still admits the largest
-// well-formed request, a 100-byte model with every other member present (PRD #3250 section 8).
+// TestStartPreviewBodyBoundAdmitsALongestModel: the 1 KiB body bound still admits a
+// maximal-field request, a 100-byte model with every other member present (PRD #3250 section 8).
 func TestStartPreviewBodyBoundAdmitsALongestModel(t *testing.T) {
 	model := strings.Repeat("m", 100)
 	body := `{"harness":"codex","credential_override":{"mode":"pinned","secret_id":"` + uuid.NewString() + `"},"model":"` + model + `","effort":"xhigh"}`

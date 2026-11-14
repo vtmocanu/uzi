@@ -127,24 +127,27 @@ type StartPreviewRequest struct {
 
 // StartPreviewAlternativeDTO is one harness a creation-time policy might choose, computed as if
 // that harness were chosen. Credential is null on a refused branch, which carries its own
-// refusal and refusal_detail; both are null on a valid branch. WorkerModel and WorkerEffort appear
-// only when the request carried that choice (source run_override); a model the harness cannot run
-// is the branch's model_incompatible_with_harness refusal, never a substituted model.
+// refusal and refusal_detail; both are null on a valid branch. WorkerEffort appears only when the
+// request carried an effort (source run_override). There is no worker_model: a request with a model
+// opts out of automatic harness selection (D22), so its harness is never undecided.
 type StartPreviewAlternativeDTO struct {
 	Harness       string                `json:"harness"`
 	Credential    *CredentialDTO        `json:"credential"`
 	Refusal       *string               `json:"refusal"`
 	RefusalDetail *string               `json:"refusal_detail"`
-	WorkerModel   *ModelSettingCellDTO  `json:"worker_model,omitempty"`
 	WorkerEffort  *EffortSettingCellDTO `json:"worker_effort,omitempty"`
 }
 
 // StartPreviewDTO is the body of POST /api/me/effective-settings/start-preview. When the
 // harness is chosen at creation, Credential is null and Alternatives lists Claude then Codex,
-// neither marked as chosen. Refusal is set only for a failure before a harness is decided, or when
-// every alternative is refused for the same reason. WorkerModel and WorkerEffort are present only when
+// neither marked as chosen. Refusal is set for a failure before a harness is decided, for a refusal
+// on a decided harness (a credential refusal, or the model refusal), or when every alternative is
+// refused for the same reason. Credential convention: a credential refusal leaves it null; the
+// model_incompatible_with_harness refusal keeps the credential cell when the harness was decided by
+// the server, and leaves it null when the request named the harness (create refuses that model before
+// any credential check, so the preview does too). WorkerModel and WorkerEffort are present only when
 // the request carried that choice and the harness is decided (source run_override); with an undecided
-// harness each alternative carries its own.
+// harness only effort is answered, per alternative (a model request always decides the harness).
 type StartPreviewDTO struct {
 	Version       int                          `json:"version"`
 	Harness       *HarnessValueDTO             `json:"harness"`

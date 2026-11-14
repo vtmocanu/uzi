@@ -94,7 +94,7 @@ func TestEffectiveSettingsRunOverrideClaimEquivalenceLiveDB(t *testing.T) {
 			if run.Harness != string(c.want.harness) {
 				t.Fatalf("created run harness = %q, want %q", run.Harness, c.want.harness)
 			}
-			lead, err := fx.svc.PredictRunOverrideLead(fx.env.ctx, fx.userID, Harness(run.Harness), c.model, c.effort, false)
+			lead, err := fx.svc.PredictRunOverrideLead(fx.env.ctx, fx.userID, Harness(run.Harness), c.model, c.effort)
 			if err != nil {
 				t.Fatalf("PredictRunOverrideLead: %v", err)
 			}
@@ -130,7 +130,7 @@ func TestEffectiveSettingsRunOverrideUnhonorableIsNeverSubstitutedLiveDB(t *test
 			run := fx.mustCreate(tc.explicit)
 			setRunStartOptions(fx.env, run.ID, tc.model, "run_override", nil, nil)
 
-			lead, err := fx.svc.PredictRunOverrideLead(fx.env.ctx, fx.userID, Harness(run.Harness), strp(tc.model), nil, false)
+			lead, err := fx.svc.PredictRunOverrideLead(fx.env.ctx, fx.userID, Harness(run.Harness), strp(tc.model), nil)
 			if err != nil {
 				t.Fatalf("PredictRunOverrideLead: %v", err)
 			}
@@ -170,6 +170,16 @@ func TestEffectiveSettingsModelOptsOutOfAutomaticHarnessLiveDB(t *testing.T) {
 		t.Fatalf("control prediction = %+v, want chosen at create under the automatic policy", control)
 	}
 
+	// The premise, under the same readings: a create without a model is steered to Codex by the
+	// automatic policy, so the opus create below choosing Claude is the opt-out and not the default.
+	noModel, err := fx.createWithStartOptions(nil, nil, nil)
+	if err != nil {
+		t.Fatalf("create without a model: %v", err)
+	}
+	if noModel.Harness != string(HarnessCodex) {
+		t.Fatalf("create without a model froze %q, want codex under these readings", noModel.Harness)
+	}
+
 	model := "opus" // compatible with the D11 harness, Claude
 	origin := IssueStartOrigin()
 	origin.Model = &model
@@ -189,9 +199,13 @@ func TestEffectiveSettingsModelOptsOutOfAutomaticHarnessLiveDB(t *testing.T) {
 		t.Fatalf("create froze %q with model %v, preview promised %q with %q", created.Harness, created.Model, pred.Harness, model)
 	}
 
-	// Effort never touches the origin: the harness stays undecided.
-	effortOnly, err := fx.predictHarness(nil)
-	if err != nil || !effortOnly.ChosenAtCreate {
-		t.Fatalf("effort-only prediction = %+v %v, want chosen at create", effortOnly, err)
+	// Effort alone is not an opt-out: the create is still steered to Codex.
+	effort := "high"
+	effortOnly, err := fx.createWithStartOptions(nil, nil, &effort)
+	if err != nil {
+		t.Fatalf("create with effort only: %v", err)
+	}
+	if effortOnly.Harness != string(HarnessCodex) {
+		t.Fatalf("create with effort only froze %q, want codex", effortOnly.Harness)
 	}
 }

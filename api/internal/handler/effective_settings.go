@@ -545,16 +545,32 @@ func (h *Handler) PreviewStartSettings(w http.ResponseWriter, r *http.Request) {
 // passes it in the creation origin; effort never touches the origin, so an effort-only request can
 // still leave the harness undecided. The model and effort cells come from the claim's own resolver
 // (PredictRunOverrideLead); an incompatible model is the model_incompatible_with_harness refusal.
+//
+// Refusal precedence mirrors the create route: with an explicit harness the model refusal comes
+// before any credential refusal (create fast-fails it before the credential checks); with a harness
+// the server decides, the credential refusals come first (create's in-transaction model check runs
+// after them).
 func (h *Handler) buildStartPreview(ctx context.Context, userID uuid.UUID, explicit *workersvc.Harness, ov *previewOverride, model, effort *string) (apitypes.StartPreviewDTO, error) {
 	dto := apitypes.StartPreviewDTO{Version: apitypes.EffectiveSettingsVersion}
 	origin := workersvc.IssueStartOrigin()
 	origin.AnthropicOverride = ov != nil && ov.Mode != workersvc.CredentialOverrideModeInherit
 	origin.Model = model
+	modelFirst := explicit != nil && model != nil && !workersvc.RunOverrideModelHonorable(*explicit, *model)
+	// refuseModel answers the explicit-harness model refusal over a credential refusal: the decided
+	// harness is the explicit one and the credential cell is null.
+	refuseModel := func() apitypes.StartPreviewDTO {
+		dto.Harness = harnessValue(workersvc.HarnessPrediction{Harness: *explicit, Rule: workersvc.PredictRuleExplicit}, harnessSourceRunOverride)
+		dto.Refusal, dto.RefusalDetail = refusal{Token: refusalModelIncompatible}.ptrs()
+		return dto
+	}
 	out, err := h.predictStart(ctx, userID, explicit, origin)
 	if err != nil {
 		return dto, err
 	}
 	if out.refused.Token != "" {
+		if modelFirst {
+			return refuseModel(), nil
+		}
 		dto.Refusal, dto.RefusalDetail = out.refused.ptrs()
 		return dto, nil
 	}
@@ -566,6 +582,9 @@ func (h *Handler) buildStartPreview(ctx context.Context, userID uuid.UUID, expli
 			return dto, err
 		}
 		if ref.Token != "" {
+			if modelFirst {
+				return refuseModel(), nil
+			}
 			dto.Refusal, dto.RefusalDetail = ref.ptrs()
 			return dto, nil
 		}
@@ -611,15 +630,12 @@ func (h *Handler) buildStartPreview(ctx context.Context, userID uuid.UUID, expli
 		alt.Credential = cred
 		alt.Refusal, alt.RefusalDetail = ref.ptrs()
 		if ref.Token == "" {
-			cells, err := h.runOverrideCells(ctx, userID, hn, model, effort)
+			// A request with a model never reaches here (D22 decides its harness), so only effort remains.
+			cells, err := h.runOverrideCells(ctx, userID, hn, nil, effort)
 			if err != nil {
 				return dto, err
 			}
-			if cells.refused.Token != "" {
-				alt.Credential = nil
-				alt.Refusal, alt.RefusalDetail = cells.refused.ptrs()
-			}
-			alt.WorkerModel, alt.WorkerEffort = cells.model, cells.effort
+			alt.WorkerEffort = cells.effort
 		}
 		dto.Alternatives = append(dto.Alternatives, alt)
 	}
@@ -644,7 +660,7 @@ func (h *Handler) runOverrideCells(ctx context.Context, userID uuid.UUID, hn wor
 	if model == nil && effort == nil {
 		return out, nil
 	}
-	lead, err := h.wsvc.PredictRunOverrideLead(ctx, userID, hn, model, effort, false)
+	lead, err := h.wsvc.PredictRunOverrideLead(ctx, userID, hn, model, effort)
 	if err != nil {
 		return out, fmt.Errorf("predict run override lead %s: %w", hn, err)
 	}

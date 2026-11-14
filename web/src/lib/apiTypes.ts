@@ -358,14 +358,16 @@ export interface StartPreviewAlternative {
   credential: Credential | null;
   refusal: EffectiveRefusal | null;
   refusal_detail: EffectiveRefusalDetail | null;
-  /** Present only when the request carried that choice (source run_override). */
-  worker_model?: ModelSettingCell;
+  /** Present only when the request carried an effort (source run_override). There is no worker_model
+   *  here: a request with a model never leaves the harness undecided (D22). */
   worker_effort?: EffortSettingCell;
 }
 
 /** The start-preview response. When the harness is chosen at creation, `credential` is null and
- *  `alternatives` lists Claude then Codex. A top-level `refusal` is set only for a failure before
- *  a harness is decided, or when every alternative is refused for the same reason. */
+ *  `alternatives` lists Claude then Codex. A top-level `refusal` is set for a failure before a
+ *  harness is decided, for a refusal on a decided harness, or when every alternative is refused for
+ *  the same reason. A credential refusal leaves `credential` null; `model_incompatible_with_harness`
+ *  keeps it when the server decided the harness and nulls it when the request named the harness. */
 export interface StartPreview {
   version: number;
   harness: HarnessValue | null;

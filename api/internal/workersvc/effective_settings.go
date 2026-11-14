@@ -327,8 +327,8 @@ func (s *Service) PredictLead(ctx context.Context, userID uuid.UUID, harness Har
 // effort (PRD #3250): both are frozen onto the run with source run_override, so resolveLeadSettings
 // decides them exactly as a claim of that run would. A model the harness cannot run is not replaced:
 // the result carries Unhonorable. A nil argument is simply absent.
-func (s *Service) PredictRunOverrideLead(ctx context.Context, userID uuid.UUID, harness Harness, model, effort *string, overrideSubagent bool) (LeadPrediction, error) {
-	return s.predictLead(ctx, userID, harness, leadRunChoice{model: model, effort: effort, runOverride: true}, overrideSubagent, false)
+func (s *Service) PredictRunOverrideLead(ctx context.Context, userID uuid.UUID, harness Harness, model, effort *string) (LeadPrediction, error) {
+	return s.predictLead(ctx, userID, harness, leadRunChoice{model: model, effort: effort, runOverride: true}, false, false)
 }
 
 // leadRunChoice is the run-frozen model and effort a lead prediction starts from. runOverride marks

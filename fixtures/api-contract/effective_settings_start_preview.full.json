@@ -51,14 +51,6 @@
       },
       "refusal": "x",
       "refusal_detail": "x",
-      "worker_model": {
-        "harness": "x",
-        "model": "x",
-        "default_model": "x",
-        "default_source": "x",
-        "resolved_model": "x",
-        "source": "x"
-      },
       "worker_effort": {
         "harness": "x",
         "effort": "x",

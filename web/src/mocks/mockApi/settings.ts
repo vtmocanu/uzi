@@ -800,7 +800,7 @@ function withJudgeRunsOn(view: EffectiveSettings, runsOn: Harness | null | undef
   return view;
 }
 
-// Absent and null request members mean the same choice, so key on the normalized triple.
+// Absent and null request members mean the same choice, so key on the normalized five members.
 function previewRequestKey(r: StartPreviewRequest): string {
   const o = r.credential_override;
   return JSON.stringify([r.harness ?? null, o?.mode ?? null, o?.secret_id ?? null, r.model ?? null, r.effort ?? null]);

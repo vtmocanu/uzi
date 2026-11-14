@@ -24,7 +24,7 @@ func TestPredictRunOverrideLead(t *testing.T) {
 	predict := func(h Harness, model, effort *string) LeadPrediction {
 		t.Helper()
 		f := &predictFake{poolFakeStore: &poolFakeStore{}, pins: pinRow(lanes)}
-		got, err := (&Service{q: f}).PredictRunOverrideLead(context.Background(), uuid.New(), h, model, effort, false)
+		got, err := (&Service{q: f}).PredictRunOverrideLead(context.Background(), uuid.New(), h, model, effort)
 		if err != nil {
 			t.Fatal(err)
 		}
