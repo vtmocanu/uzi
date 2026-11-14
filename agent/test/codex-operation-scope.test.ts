@@ -9,6 +9,8 @@ it("authority identity is opaque and stable, and isolates replacement scope owne
   const capabilityB = ["authority", "b"].join("-");
   const identityA = codexOperationAuthorityIdentity(capabilityA);
   const identityB = codexOperationAuthorityIdentity(capabilityB);
+  assert.ok(identityA);
+  assert.ok(identityB);
   // Boolean assertions keep credential values out of failure diffs.
   assert.ok(identityA === codexOperationAuthorityIdentity(capabilityA));
   assert.ok(identityA !== identityB);
@@ -96,4 +98,10 @@ it("scope records final negotiation loss before a simultaneous source guard thro
     assert.equal(next(), true);
     assert.equal(reads, 2);
   } finally { abort.abort(); await successor?.catch(() => {}); scope.close(); }
+});
+
+it("malformed authority has no identity and cannot reach crypto hashing", () => {
+  for (const capability of [undefined, null, 42, {}, ""]) {
+    assert.equal(codexOperationAuthorityIdentity(capability), undefined);
+  }
 });

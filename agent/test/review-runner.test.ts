@@ -522,6 +522,24 @@ describe("ReviewRunner", () => {
     assert.equal(gitCalls.pushBranch, 0);
   });
 
+  for (const capability of [undefined, null, 42, {}, ""]) {
+    it(`malformed subscription capability ${JSON.stringify(capability)} lands deterministic fallback`, async () => {
+      const { client, calls } = fakeClient();
+      let modelCalls = 0;
+      const queryFn: SdkQueryFn = (() => { modelCalls++; throw new Error("unexpected Claude call"); }) as unknown as SdkQueryFn;
+      const codexAdviceHarnessFactory = (async () => { modelCalls++; throw new Error("unexpected Codex call"); }) as never;
+      const { git } = fakeGit("diff --git a/x b/x\n+one\n");
+      const runner = new ReviewRunner(client, git, nullLogger(), { homeRoot: PASS_HOME_ROOT, queryFn, codexAdviceHarnessFactory });
+      await runner.execute(reviewClaim({ secrets: { forge_pat: "", anthropic_oauth_token: "claude-fallback-forbidden",
+        codex: { auth_mode: "subscription", access_token: "fixture-access", capability,
+          generation: 3, chatgpt_account_id: "fixture-account", chatgpt_plan_type: null } } as never }));
+      assert.equal(modelCalls, 0);
+      assert.equal(calls.review?.review.status, "failed");
+      assert.deepEqual(calls.review?.review.findings, []);
+      assert.equal(calls.states.at(-1)?.body.status, "completed");
+    });
+  }
+
   it("posts status failed and still completes the run when no Anthropic token is present", async () => {
     const { client, calls } = fakeClient();
     const { git } = fakeGit("diff --git a/x b/x\n+one\n");

@@ -1,4 +1,4 @@
-import { acquireCodexOperationScope } from "../src/codex-operation-scope.js";
+import { acquireCodexOperationScope, codexOperationAuthorityIdentity } from "../src/codex-operation-scope.js";
 import { AdmissionClock, flushUntil } from "./operation-admission-clock.js";
 import type { CodexOperationRequest } from "../src/protocol.js";
 import { describe, it } from "node:test";
@@ -1700,7 +1700,8 @@ for (const family of ["judge", "review", "intent", "plan", "delivery", "now"] as
         postReview: async (_id: string, value: unknown) => { posted = value; },
         postTaskReview: async (_id: string, value: unknown) => { posted = value; },
       } as unknown as import("../src/client.js").WorkerClient;
-      const scope = acquireCodexOperationScope(client, "run", 7, { now: () => clock.now, sleep: clock.sleep });
+      const scope = acquireCodexOperationScope(client, "run", 7, { now: () => clock.now, sleep: clock.sleep },
+        undefined, undefined, undefined, codexOperationAuthorityIdentity(codex.capability));
       const output = family === "judge" ? { verdict: "ok", summary: "Reviewed", recommendations: [] }
         : family === "review" ? { status: "complete", summary: "Reviewed", findings: [] }
         : family === "plan" ? { summary: "Planned", deltas: [] }
@@ -1780,7 +1781,8 @@ it("M3 actual advice built before root closure cannot acquire a fresh unbound sc
     releaseCodex: async () => ({ auth_mode: "subscription", access_token: "released-token", generation: 3, chatgpt_account_id: "verified-account" }),
     checkCodexOperationAdmission: async () => { reads++; throw new Error("unexpected read"); },
   } as unknown as import("../src/client.js").WorkerClient;
-  const root = acquireCodexOperationScope(client, "run", 7);
+  const root = acquireCodexOperationScope(client, "run", 7, {}, undefined, undefined, undefined,
+    codexOperationAuthorityIdentity(codex.capability));
   root.bind(async () => () => true);
   const transport = new FakeTransport(authResponder);
   transport.push(agentMessage("ok")).push(turnCompleted()).end();

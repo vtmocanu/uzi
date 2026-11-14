@@ -35,7 +35,9 @@ interface Scope {
 const scopes = new WeakMap<Client, Map<string, Scope>>();
 
 /** Stable opaque identity for one credential authority; never retain the capability in a key. */
-export function codexOperationAuthorityIdentity(capability: string): string {
+export function codexOperationAuthorityIdentity(capability: unknown): string | undefined {
+  // Raw claims reach this helper before selectCodexBinding rejects malformed authority.
+  if (typeof capability !== "string" || capability.length === 0) return undefined;
   return createHash("sha256").update(capability).digest("hex");
 }
 
