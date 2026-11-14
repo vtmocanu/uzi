@@ -10,6 +10,7 @@ import { formatTokens, formatCost } from "../lib/formatTokens";
 import { useNow } from "../lib/useNow";
 import { Markdown } from "./Markdown";
 import { cx } from "./ui";
+import { stripUnsafeChars } from "../lib/safeText";
 import {
   BotIcon,
   CircleIcon,
@@ -1299,6 +1300,24 @@ export const RunEventRow = memo(function RunEventRow({
           labels={asStringArray(rec?.["labels"])}
           onMutation={onFindingMutation}
         />
+      );
+    }
+    // Issue #3250: a run parked because its chosen model or effort cannot run on its harness.
+    // Every payload string is worker/server-authored: React text only, length-capped.
+    case "run_override_unavailable": {
+      const setting = asString(rec?.["setting"]);
+      const value = asString(rec?.["value"]);
+      const harnessName = asString(rec?.["harness"]);
+      if (!setting && !value && !harnessName) return <UnrenderableRow kind={msg.kind} rec={rec} />;
+      return (
+        <div className="rounded-md border border-warn/40 bg-warn/10 px-2.5 py-1.5 text-sm" data-testid="run-override-unavailable">
+          <div className="text-xs font-semibold text-warn">Model choice unavailable</div>
+          <p className="text-xs text-muted">
+            {setting ? truncate(stripUnsafeChars(setting), 48) : "setting"}
+            {value ? ` "${truncate(stripUnsafeChars(value), 120)}"` : ""} cannot run on
+            {harnessName ? ` the ${truncate(stripUnsafeChars(harnessName), 48)} harness` : " this harness"}.
+          </p>
+        </div>
       );
     }
     default:

@@ -617,6 +617,32 @@ describe("RunEventRow rendering", () => {
   });
 });
 
+describe("run_override_unavailable feed row (issue #3250)", () => {
+  it("renders setting, value and harness as readable text, not an unrenderable row", () => {
+    const { container } = render(
+      <RunEventRow
+        msg={msg({ seq: 1, kind: "run_override_unavailable", payload: { setting: "model", value: "opus-9", harness: "codex", note: "x" } })}
+        live={false}
+      />,
+    );
+    expect(container.textContent).toContain("Model choice unavailable");
+    expect(container.textContent).toContain('model "opus-9" cannot run on the codex harness');
+    expect(container.textContent).not.toContain("unrenderable");
+  });
+
+  it("renders markup as inert text and truncates a long value", () => {
+    const { container } = render(
+      <RunEventRow
+        msg={msg({ seq: 1, kind: "run_override_unavailable", payload: { setting: "model", value: `<img src=x onerror=alert(1)>${"v".repeat(400)}`, harness: "claude" } })}
+        live={false}
+      />,
+    );
+    expect(container.querySelector("img")).toBeNull();
+    expect(container.textContent).toContain("<img src=x");
+    expect(container.textContent!.length).toBeLessThan(300);
+  });
+});
+
 describe("highlightShell", () => {
   const renderCmd = (cmd: string) => render(<div data-testid="h">{highlightShell(cmd)}</div>);
 

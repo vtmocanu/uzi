@@ -498,7 +498,7 @@ uzi version
   Resume requeues on the newly chosen token and the next claim re-proves quiescence fail
   closed, or Cancel); or a run-override hold, `hold_reason` `run_override_unavailable` (the
   run's chosen model or effort cannot run on its harness; the notice reads `model choice
-  unavailable`; owner Resume retries, or Cancel); or the weekly usage reserve, `hold_reason` `weekly_reserve` (the credential the
+  unavailable`; owner Resume retries only if the choice has become available on that harness, otherwise Cancel and start a new run with a different choice); or the weekly usage reserve, `hold_reason` `weekly_reserve` (the credential the
   run spends reached the owner's weekly threshold; it releases by itself once usage drops below it,
   and `uzi run resume <id>` overrides the reserve until the next weekly reset, printing
   `Resumed <id>: queued (overrides the weekly usage reserve until the next weekly reset).`);

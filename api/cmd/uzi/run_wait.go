@@ -152,7 +152,7 @@ func runWait(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, runI
 				runID, cellText(run.Status))
 		}
 
-		if targets[run.Status] || (defaultUntil && (isDiskOwnerHold(run) || isForgeOwnerHold(run) || isOwnerRequiredWorkerHold(run) || isSpendLimitHold(run) || isCredentialSwitchHold(run) || isBaseAttestationHold(run))) {
+		if targets[run.Status] || (defaultUntil && (isDiskOwnerHold(run) || isForgeOwnerHold(run) || isOwnerRequiredWorkerHold(run) || isSpendLimitHold(run) || stopsDefaultWait(run))) {
 			// PRD #603: `--min-plan-seq N` (N >= 0) gates ONLY the awaiting_approval
 			// stop so a wait after `run revise` returns on the REVISED plan, not the
 			// stale gate left by the pre-revise plan. Every other target — terminals,

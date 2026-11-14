@@ -2139,6 +2139,38 @@ describe("RunView — paused header: Resume + pending-pause chip (PRD #1190)", (
     await waitFor(() => expect(refreshRun).toHaveBeenCalled());
   });
 
+  // Issue #3250 review: the hold has its own VISIBLE panel; the sr-only announcement is not the text.
+  it("a run-override hold shows a visible panel with Resume and Cancel, and no Stop or 'session continues' text", async () => {
+    const { refreshRun, submit, container } = renderPage({ ...PAUSED, hold_reason: "run_override_unavailable" }, true);
+    const heading = await screen.findByRole("heading", { name: "Model choice unavailable: waiting for owner" });
+    const panel = within(heading.parentElement!);
+    expect(panel.getByText(/cannot run on this harness/i)).toBeTruthy();
+    expect(panel.getByText(/Resume retries only if the choice has become available on that harness/i)).toBeTruthy();
+    expect(panel.getByText(/start a new run with a different choice/i)).toBeTruthy();
+    expect(panel.getByRole("button", { name: "Resume" })).toBeTruthy();
+    expect(panel.getByRole("button", { name: "Cancel" })).toBeTruthy();
+    expect(screen.getAllByRole("button", { name: /resume/i })).toHaveLength(1);
+    // The page-wide steer card keeps its own Stop run; the hold panel itself offers none.
+    expect(panel.queryByRole("button", { name: /stop/i })).toBeNull();
+    // Visible text only: the sr-only announcement region is excluded.
+    const visible = Array.from(container.querySelectorAll("*"))
+      .filter((el) => !el.closest(".sr-only") && el.children.length === 0)
+      .map((el) => el.textContent ?? "").join(" ");
+    expect(visible).not.toMatch(/session continues/i);
+    await act(async () => { fireEvent.click(panel.getByRole("button", { name: "Resume" })); });
+    await waitFor(() => expect(mockApi.resumeRun).toHaveBeenCalledWith("r1"));
+    await waitFor(() => expect(refreshRun).toHaveBeenCalled());
+    await act(async () => { fireEvent.click(panel.getByRole("button", { name: "Cancel" })); });
+    await waitFor(() => expect(submit).toHaveBeenCalledWith("cancel", "", undefined, undefined, false));
+  });
+
+  it("a run-override hold gives non-owners no Resume or Cancel controls", async () => {
+    renderPage({ ...PAUSED, hold_reason: "run_override_unavailable" }, false);
+    const heading = await screen.findByRole("heading", { name: "Model choice unavailable: waiting for owner" });
+    expect(within(heading.parentElement!).queryByRole("button")).toBeNull();
+    expect(screen.queryByRole("button", { name: /resume/i })).toBeNull();
+  });
+
   it("clicking Resume calls api.resumeRun(id) then refreshRun", async () => {
     const { refreshRun } = renderPage(PAUSED, true);
     await screen.findByText("Add rate limiting");

@@ -122,7 +122,7 @@
     "owner_resumable": true,
     "tone": "warning",
     "web_label": "model choice unavailable: owner hold",
-    "cli_notice": "model choice unavailable · the run's chosen model or effort cannot run on its harness; resume to retry or cancel",
+    "cli_notice": "held, model choice unavailable; the run's chosen model or effort cannot run on its harness; Resume retries only if the choice has become available on that harness, otherwise Cancel and start a new run with a different choice; Resume: uzi run resume run-1; Cancel: uzi run cancel run-1",
     "announces_entry": true,
     "completion_panel_early_return": true,
     "completion_panel_held_deny": "always",

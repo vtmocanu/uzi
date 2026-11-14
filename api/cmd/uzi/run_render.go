@@ -590,7 +590,8 @@ func holdRow(r apitypes.RunDTO, now time.Time) []string {
 	// Resume retains this marker through queued/claimed until the running report.
 	// Only the paused state is still an owner hold.
 	if (*r.HoldReason == holdProviderUnavailable && !isProviderUnavailableHold(r)) ||
-		(*r.HoldReason == holdIterationExhausted && !isIterationHold(r)) {
+		(*r.HoldReason == holdIterationExhausted && !isIterationHold(r)) ||
+		(*r.HoldReason == holdRunOverrideUnavailable && !isRunOverrideHold(r)) {
 		return nil
 	}
 	if *r.HoldReason == holdCodexPolicy && !isCodexPolicyHold(r) {
@@ -622,7 +623,7 @@ func holdRow(r apitypes.RunDTO, now time.Time) []string {
 	case holdRepoAgentSource:
 		clauses = append(clauses, repoAgentSourceAction(r))
 	case holdRunOverrideUnavailable:
-		clauses = append(clauses, runOverrideAction)
+		clauses = append(clauses, runOverrideAction(r))
 	case holdWeeklyReserve:
 		clauses = append(clauses, weeklyReserveAction(r))
 	}
@@ -669,8 +670,18 @@ func repoAgentSourceAction(r apitypes.RunDTO) string {
 	return "resume once the repository can be fetched: uzi run resume " + cellText(r.ID)
 }
 
+// isRunOverrideHold reports whether r is paused on a run_override_unavailable hold. Resume keeps
+// the marker through queued/claimed until the run starts, so only paused is an owner hold.
+func isRunOverrideHold(r apitypes.RunDTO) bool {
+	return r.Status == statusPaused && strOr(r.HoldReason, "") == holdRunOverrideUnavailable
+}
+
 // runOverrideAction is the owner's next step for a run_override_unavailable hold (issue #3250).
-const runOverrideAction = "the run's chosen model or effort cannot run on its harness; resume to retry or cancel"
+func runOverrideAction(r apitypes.RunDTO) string {
+	id := cellText(r.ID)
+	return "the run's chosen model or effort cannot run on its harness; Resume retries only if the choice has become available on that harness, otherwise Cancel and start a new run with a different choice; Resume: uzi run resume " +
+		id + "; Cancel: uzi run cancel " + id
+}
 
 // weeklyReserveAction is the owner's next step for a weekly_reserve hold (PRD #3522): the run resumes
 // by itself when usage falls below the threshold, and `uzi run resume` overrides the reserve until the
@@ -776,7 +787,7 @@ func pausedHoldNotice(r apitypes.RunDTO, origin ...string) string {
 	case holdBaseAttestation:
 		return "held, its kept work is not attested against the planned base (--require-base); " + baseAttestationAction(r)
 	case holdRunOverrideUnavailable:
-		return holdReasonLabel(reason) + " · " + runOverrideAction
+		return "held, " + holdReasonLabel(reason) + "; " + runOverrideAction(r)
 	case holdWeeklyReserve:
 		return "held by the weekly usage reserve; " + weeklyReserveAction(r)
 	default:

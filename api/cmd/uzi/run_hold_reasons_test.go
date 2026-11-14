@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
 // holdPresentationCase is one row of fixtures/hold-reasons/presentation.json, the table the web
@@ -77,8 +78,70 @@ func TestHoldRowRunOverrideUnavailable(t *testing.T) {
 	if len(row) != 2 || row[0] != "HOLD" {
 		t.Fatalf("holdRow = %v", row)
 	}
-	if !strings.HasPrefix(row[1], "model choice unavailable · parked ") || !strings.HasSuffix(row[1], " · "+runOverrideAction) {
+	if !strings.HasPrefix(row[1], "model choice unavailable · parked ") || !strings.HasSuffix(row[1], " · "+runOverrideAction(r)) {
 		t.Errorf("HOLD cell = %q, want the label first and the owner action last", row[1])
+	}
+}
+
+// A queued/claimed run after Resume keeps hold_reason until it starts, but it is no longer an owner hold.
+func TestHoldRowRunOverrideUnavailableOnlyWhilePaused(t *testing.T) {
+	reason := holdRunOverrideUnavailable
+	for _, status := range []string{"queued", "claimed", "running"} {
+		r := apitypes.RunDTO{ID: "run-1", Status: status, Kind: "issue", HoldReason: &reason}
+		if row := holdRow(r, time.Now()); row != nil {
+			t.Errorf("%s: holdRow = %v, want no HOLD row", status, row)
+		}
+	}
+}
+
+func TestRunOverrideNoticeCopy(t *testing.T) {
+	reason := holdRunOverrideUnavailable
+	r := apitypes.RunDTO{ID: "run-1", Status: statusPaused, Kind: "issue", HoldReason: &reason}
+	n := pausedHoldNotice(r)
+	for _, part := range []string{"Resume retries only if the choice has become available", "Cancel and start a new run", "Resume: uzi run resume run-1; Cancel: uzi run cancel run-1"} {
+		if !strings.Contains(n, part) {
+			t.Errorf("notice %q lacks %q", n, part)
+		}
+	}
+}
+
+// The set drives the default `run wait` stop and the TUI owner band and count: membership is pinned.
+func TestHoldSetStopAndBoardMembership(t *testing.T) {
+	wantWait := map[string]bool{holdBaseAttestation: true, holdCredentialSwitchSettling: true, holdCredentialSwitchUnsettled: true, holdRunOverrideUnavailable: true}
+	wantBoard := map[string]bool{holdCredentialDisabled: true, holdCredentialsReset: true, holdProviderUnavailable: true, holdIterationExhausted: true,
+		holdCredentialSwitchSettling: true, holdCredentialSwitchUnsettled: true, holdRunOverrideUnavailable: true}
+	for reason := range nonCompletionHolds {
+		reason := reason
+		r := apitypes.RunDTO{ID: "r1", Status: statusPaused, HoldReason: &reason}
+		if got := stopsDefaultWait(r); got != wantWait[reason] {
+			t.Errorf("%s: stopsDefaultWait = %v, want %v", reason, got, wantWait[reason])
+		}
+		if got := isBoardOwnerHold(r); got != wantBoard[reason] {
+			t.Errorf("%s: isBoardOwnerHold = %v, want %v", reason, got, wantBoard[reason])
+		}
+		r.Status = "queued"
+		if stopsDefaultWait(r) || isBoardOwnerHold(r) {
+			t.Errorf("%s: a non-paused run must not match", reason)
+		}
+		// The board agrees with the helper for a paused run.
+		item := apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{ID: "r1", Status: statusPaused, HoldReason: &reason}}
+		if wantBoard[reason] && runBandOf(item) != bandNeedsYou {
+			t.Errorf("%s: runBandOf = %d, want needs-you", reason, runBandOf(item))
+		}
+		m := tuiModel{}
+		m.board.runs = []apitypes.RunListItemDTO{item}
+		if got := strings.Contains(m.boardSummary(), "⊘"); got != wantBoard[reason] {
+			t.Errorf("%s: boardSummary %q owner-hold segment = %v, want %v", reason, m.boardSummary(), got, wantBoard[reason])
+		}
+	}
+}
+
+func TestRunWaitStopsOnRunOverrideHold(t *testing.T) {
+	held := heldRun("r1", holdRunOverrideUnavailable, time.Now())
+	fc := &uzicli.FakeClient{GetRunHook: scriptHook(okStep("running"), waitStep{run: held})}
+	_, stderr, code := runCLI(t, fakeEnv(fc), "run", "wait", "r1", "--interval", "1ms", "--timeout", "2s")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0 (stderr: %s)", code, stderr)
 	}
 }
 

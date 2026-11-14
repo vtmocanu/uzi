@@ -163,8 +163,6 @@ export function isRevisingRun(run: { status: string; is_revising?: boolean }): b
 //   - attention: counts toward needsHumanAttention (a needs-you state).
 //   - afterCompletionPhase: effectiveRunStatus overlays it AFTER the completion_phase switch,
 //     so a live completion phase wins; false overlays it ahead of that switch.
-//   - genericResume: the run header's generic Resume button is offered (every other hold has
-//     its own panel or is refused by the server).
 // The remaining fields keep each pre-existing reason's per-surface behavior exactly as it was
 // before the set existed (the sites disagreed on membership, so the differences are explicit):
 //   - completionEarlyReturn: while paused, CompletionStatePanel renders nothing at all.
@@ -173,17 +171,18 @@ export function isRevisingRun(run: { status: string; is_revising?: boolean }): b
 //   - historyParkLabel: IssueView history rows print parkLabel for a paused run.
 //   - ownerActionsLink: LastRun links "View owner actions" for a paused run.
 export const NON_COMPLETION_HOLDS = {
-  credential_disabled: { tone: "warning", label: "waiting: credential disabled", ownerResumable: false, attention: false, afterCompletionPhase: true, genericResume: false, completionEarlyReturn: false, heldDeny: "always", historyParkLabel: false, ownerActionsLink: false },
-  credentials_reset: { tone: "warning", label: "waiting: credentials were reset", ownerResumable: false, attention: false, afterCompletionPhase: true, genericResume: false, completionEarlyReturn: false, heldDeny: "always", historyParkLabel: false, ownerActionsLink: false },
-  provider_unavailable: { tone: "warning", label: "provider unavailable: owner hold", ownerResumable: true, attention: true, afterCompletionPhase: false, genericResume: false, completionEarlyReturn: true, heldDeny: "always", historyParkLabel: false, ownerActionsLink: true },
-  codex_policy_hold: { tone: "warning", label: "Codex policy hold", ownerResumable: false, attention: true, afterCompletionPhase: false, genericResume: false, completionEarlyReturn: false, heldDeny: "never", historyParkLabel: true, ownerActionsLink: false },
-  base_attestation_missing: { tone: "warning", label: "base unverified: owner hold", ownerResumable: false, attention: true, afterCompletionPhase: false, genericResume: false, completionEarlyReturn: false, heldDeny: "always", historyParkLabel: false, ownerActionsLink: false },
-  repo_agent_source_unavailable: { tone: "warning", label: "repo agents unreadable: owner hold", ownerResumable: true, attention: true, afterCompletionPhase: false, genericResume: false, completionEarlyReturn: false, heldDeny: "always", historyParkLabel: false, ownerActionsLink: false },
-  credential_switch_settling: { tone: "warning", label: "settling: token switch", ownerResumable: true, attention: true, afterCompletionPhase: false, genericResume: false, completionEarlyReturn: false, heldDeny: "paused", historyParkLabel: false, ownerActionsLink: true },
-  credential_switch_unsettled: { tone: "warning", label: "held: token switch", ownerResumable: true, attention: true, afterCompletionPhase: false, genericResume: false, completionEarlyReturn: false, heldDeny: "paused", historyParkLabel: false, ownerActionsLink: true },
-  iteration_budget_exhausted: { tone: "warning", label: "Iteration limit reached", ownerResumable: true, attention: true, afterCompletionPhase: false, genericResume: false, completionEarlyReturn: true, heldDeny: "never", historyParkLabel: false, ownerActionsLink: true },
-  // Issue #3250: the run's chosen model or effort cannot run on its harness; the owner resumes to retry.
-  run_override_unavailable: { tone: "warning", label: "model choice unavailable: owner hold", ownerResumable: true, attention: true, afterCompletionPhase: false, genericResume: true, completionEarlyReturn: true, heldDeny: "always", historyParkLabel: true, ownerActionsLink: true },
+  credential_disabled: { tone: "warning", label: "waiting: credential disabled", ownerResumable: false, attention: false, afterCompletionPhase: true, completionEarlyReturn: false, heldDeny: "always", historyParkLabel: false, ownerActionsLink: false },
+  credentials_reset: { tone: "warning", label: "waiting: credentials were reset", ownerResumable: false, attention: false, afterCompletionPhase: true, completionEarlyReturn: false, heldDeny: "always", historyParkLabel: false, ownerActionsLink: false },
+  provider_unavailable: { tone: "warning", label: "provider unavailable: owner hold", ownerResumable: true, attention: true, afterCompletionPhase: false, completionEarlyReturn: true, heldDeny: "always", historyParkLabel: false, ownerActionsLink: true },
+  codex_policy_hold: { tone: "warning", label: "Codex policy hold", ownerResumable: false, attention: true, afterCompletionPhase: false, completionEarlyReturn: false, heldDeny: "never", historyParkLabel: true, ownerActionsLink: false },
+  base_attestation_missing: { tone: "warning", label: "base unverified: owner hold", ownerResumable: false, attention: true, afterCompletionPhase: false, completionEarlyReturn: false, heldDeny: "always", historyParkLabel: false, ownerActionsLink: false },
+  repo_agent_source_unavailable: { tone: "warning", label: "repo agents unreadable: owner hold", ownerResumable: true, attention: true, afterCompletionPhase: false, completionEarlyReturn: false, heldDeny: "always", historyParkLabel: false, ownerActionsLink: false },
+  credential_switch_settling: { tone: "warning", label: "settling: token switch", ownerResumable: true, attention: true, afterCompletionPhase: false, completionEarlyReturn: false, heldDeny: "paused", historyParkLabel: false, ownerActionsLink: true },
+  credential_switch_unsettled: { tone: "warning", label: "held: token switch", ownerResumable: true, attention: true, afterCompletionPhase: false, completionEarlyReturn: false, heldDeny: "paused", historyParkLabel: false, ownerActionsLink: true },
+  iteration_budget_exhausted: { tone: "warning", label: "Iteration limit reached", ownerResumable: true, attention: true, afterCompletionPhase: false, completionEarlyReturn: true, heldDeny: "never", historyParkLabel: false, ownerActionsLink: true },
+  // Issue #3250: the run's chosen model or effort cannot run on its harness. RunOverrideHoldPanel owns
+  // Resume and Cancel; Resume retries only if the choice has become available on that harness.
+  run_override_unavailable: { tone: "warning", label: "model choice unavailable: owner hold", ownerResumable: true, attention: true, afterCompletionPhase: false, completionEarlyReturn: true, heldDeny: "always", historyParkLabel: true, ownerActionsLink: true },
 } as const;
 
 type NonCompletionHold = keyof typeof NON_COMPLETION_HOLDS;
@@ -220,13 +219,6 @@ export function offersOwnerActionsLink(run: { status: string; hold_reason?: stri
 
 export function isOwnerResumableHold(reason: string | null | undefined): boolean {
   return holdEntry(reason)?.ownerResumable === true;
-}
-
-// holdOffersGenericResume: the paused run header's generic Resume button applies. False for
-// every hold that is not a non-completion hold's generic case (completion_blocked and the
-// weekly-reserve pause are handled by the caller).
-export function holdOffersGenericResume(reason: string | null | undefined): boolean {
-  return holdEntry(reason)?.genericResume === true;
 }
 
 // The tone and label maps StatusPill spreads into RUN_STATUS_TONES / RUN_STATUS_LABELS.

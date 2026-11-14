@@ -62,7 +62,6 @@ import {
   isStoppedRun,
   isRejectedRun,
   isNonCompletionHold,
-  holdOffersGenericResume,
   completionPanelEarlyReturn,
   completionPanelHeld,
   milestoneBadge,
@@ -958,9 +957,8 @@ export function PausedPanel({
     run.status !== "paused" ||
     policyBlocksContinuation(run) ||
     run.hold_reason === "completion_blocked" ||
-    // Every non-completion hold has its own panel or Resume gating (NON_COMPLETION_HOLDS),
-    // except the ones the generic Resume applies to (run_override_unavailable).
-    (isNonCompletionHold(run.hold_reason) && !holdOffersGenericResume(run.hold_reason))
+    // Every non-completion hold has its own panel or Resume gating (NON_COMPLETION_HOLDS).
+    isNonCompletionHold(run.hold_reason)
   )
     return null;
 
@@ -1669,6 +1667,26 @@ function BaseAttestationHoldPanel({ run, ownerProof = false, busy = false, onCan
     {ownerProof ? <div className="mt-3 flex gap-2">
       <Button size="sm" variant="danger" disabled={busy} onClick={onCancel}>Cancel</Button>
     </div> : <p className="mt-2 text-xs text-muted">Only the run owner can cancel this hold.</p>}
+  </Card>;
+}
+
+// Issue #3250: the run's chosen model or effort cannot run on its harness, so the agent never
+// started. Resume re-checks at the next claim and parks again unless the choice has become
+// available on that harness (e.g. a narrowing release was rolled back); otherwise the owner
+// cancels and starts a new run with a different choice. No Stop (not a milestone issue run's
+// completed scope) and no "session continues" claim.
+function RunOverrideHoldPanel({ run, ownerProof, busy, onResume, onCancel }: {
+  run: Run; ownerProof: boolean; busy: boolean; onResume: () => void; onCancel: () => void;
+}) {
+  if (run.status !== "paused" || run.hold_reason !== "run_override_unavailable") return null;
+  return <Card className="p-4">
+    <h2 className="text-sm font-semibold text-warn">Model choice unavailable: waiting for owner</h2>
+    <p className="mt-1 text-xs text-muted">The model or effort chosen for this run cannot run on this harness. The agent was not started.</p>
+    <p className="mt-1 text-xs text-muted">Resume retries only if the choice has become available on that harness. Otherwise, Cancel and start a new run with a different choice. This run does not resume automatically.</p>
+    {ownerProof ? <div className="mt-3 flex gap-2">
+      <Button size="sm" disabled={busy} onClick={onResume}>Resume</Button>
+      <Button size="sm" variant="danger" disabled={busy} onClick={onCancel}>Cancel</Button>
+    </div> : <p className="mt-2 text-xs text-muted">Only the run owner can Resume or Cancel this hold.</p>}
   </Card>;
 }
 
@@ -2627,7 +2645,7 @@ export function RunView() {
             : parkKey === "repo_agent_source_unavailable"
               ? "The repository's agent definitions could not be read. The agent was not started. Only the run owner can Resume when the revision is available, or Cancel. There is no automatic retry."
             : parkKey === "run_override_unavailable"
-              ? "Model choice unavailable. The run's chosen model or effort cannot run on its harness. The run waits for its owner: Resume to retry, or Cancel."
+              ? "Model choice unavailable. The run's chosen model or effort cannot run on its harness. Resume retries only if the choice has become available on that harness; otherwise Cancel and start a new run with a different choice."
             : parkKey === "iteration_budget_exhausted:spent"
               ? "Iteration limit reached. The remaining wall budget is spent. Extend time, then explicitly Resume, or Cancel. Extend leaves the run paused."
             : parkKey === "iteration_budget_exhausted"
@@ -2827,8 +2845,8 @@ export function RunView() {
                 run.hold_reason !== "completion_blocked" &&
                 // The non-completion holds (NON_COMPLETION_HOLDS) have their own panel (an
                 // Enable, a credential add, the token-switch refusal inline) or are refused by
-                // the server; only run_override_unavailable offers this generic Resume.
-                (!isNonCompletionHold(run.hold_reason) || holdOffersGenericResume(run.hold_reason)) &&
+                // the server; run_override_unavailable has RunOverrideHoldPanel.
+                !isNonCompletionHold(run.hold_reason) &&
                 (canSteer ? (
                   <Button
                     size="sm"
@@ -3237,6 +3255,12 @@ export function RunView() {
           if (isCurrent()) await refreshRun();
         }); }}
         onCancel={() => { void cancelRun(); }} />
+      <RunOverrideHoldPanel run={run} ownerProof={canSteer && run.id === id} busy={busy}
+        onResume={() => { void act(async (isCurrent) => {
+          await api.resumeRun(run.id);
+          if (isCurrent()) await refreshRun();
+        }); }}
+        onCancel={() => { void cancelRun(); }} />
       <PausedPanel
         run={run}
         origin={pauseOrigin(run, messages, pauseOriginReady)}
@@ -3405,7 +3429,7 @@ export function RunView() {
 
       {/* PRD #88: ALWAYS MOUNTED, empty until a park announces itself — see the note at
           parkAnnounce for why the region cannot live inside QuestionPanel. sr-only
-          because the panel below already carries the message for everyone else. The
+          because the visible panels already carry the message for everyone else. The
           effect fires after mount, so the region exists before its content changes even
           on a page load that arrives at an already-parked run. */}
       <div className="sr-only" role="status" aria-live="polite">

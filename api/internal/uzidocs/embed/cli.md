@@ -4015,8 +4015,9 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   A `paused` run can also be **held because its chosen model or effort cannot
   run on its harness** (`hold_reason: run_override_unavailable`): `run get`
   prints a `HOLD` row reading `model choice unavailable`, and `run wait` and
-  `run logs --follow` print the same notice. Resume the run with
-  `uzi run resume <id>` to retry, or cancel it.
+  `run logs --follow` print the same notice. `uzi run resume <id>` retries only
+  if the choice has become available on that harness; otherwise cancel the run
+  (`uzi run cancel <id>`) and start a new run with a different choice.
 
 For an ordinary pause, human `run get` makes one supplemental message read
 (`tail=100`). Its pause detail reads **paused by the run's lead** for
@@ -4361,7 +4362,8 @@ except a default wait also stops at `recovery_wait` with cause
 `retained_recovery_adoption_failed`, `retained_continuation_unwitnessed`, or
 owner-held `retained_recovery_exhausted` or `codex_idle_stall` (NULL retry), `anthropic_spend_limit` (an
 Anthropic API spend-limit hold, Resume, Switch token or Cancel), and at a `paused` run held on
-`base_attestation_missing`, for an owner decision:
+`base_attestation_missing`, `run_override_unavailable` or a credential-switch
+hold, for an owner decision:
 timed limit and recovery waits retry on a timer, pool waits need an available pooled token,
 and ordinary owner or lead pauses need `uzi run resume`. A bare `run wait` means
 "wait for the plan gate, a clarification, an interactive task's park,

@@ -4261,9 +4261,12 @@ export interface Run {
    *  never completed-scope Stop. Extend wall time first only when remaining wall is spent;
    *  Extend leaves it paused, and credential changes never retry it automatically.
    *  Issue #3250: 'run_override_unavailable' is a nonterminal owner hold: the run's chosen model
-   *  or effort cannot run on its harness; owner Resume retries, or Cancel.
-   *  The non-completion holds (every value above except 'completion_blocked' and
-   *  'budget_exhausted') form one set, NON_COMPLETION_HOLDS in lib/runBadge.ts, which owns their
+   *  or effort cannot run on its harness; owner Resume retries only if the choice has become available
+   *  on that harness, otherwise Cancel and start a new run with a different choice.
+   *  The non-completion holds (credential_disabled, credentials_reset, provider_unavailable,
+   *  codex_policy_hold, base_attestation_missing, repo_agent_source_unavailable, the two token-switch
+   *  holds, iteration_budget_exhausted and run_override_unavailable; NOT completion_blocked,
+   *  budget_exhausted or weekly_reserve) form one set, NON_COMPLETION_HOLDS in lib/runBadge.ts, which owns their
    *  tone, label and owner-resumability (fixtures/hold-reasons/presentation.json).
    *  Render an unrecognised value honestly.
    *  `hold_context` is the constant "unavailable(same_worker_only)" ONLY while held, else null:
