@@ -211,7 +211,7 @@ a running one.
   `model_incompatible_with_harness`), frozen across requeue and reclaim, and,
   if the claim can no longer honor it, parks the run `paused` on hold
   `run_override_unavailable` instead of substituting another value
-  ([PRD #3250](prds/3250-run-start-model-effort.md)).
+  ([PRD #3250](prds/done/3250-run-start-model-effort.md)).
   A subagent's delivered pin wins when set;
   otherwise it follows the resolved main-thread model, subject to the schedule's
   subagent override. See [docs/worker-model.md](docs/worker-model.md). The same

@@ -2,7 +2,7 @@
 
 **Issue:** #3250 (child P of epic #1703)
 **Sibling issues (children of #1703):** A #3255, B #3247, B2 #3251, C #3245, D #3248, E #3257, F #3254, G #3249, H #3244, I #3263, J1 #3256, J2 #3260, K #3261, L #3262, M #3259, N #3258, O #3264, P #3250, Q-spike #3246, Q-claude #3252, Q-codex #3253.  
-**Status:** Draft r4, 2026-11-13. Source anchors re-checked against origin/main `403f8055c7500f8c6dabe7a9e23478e687de88d0`. H's implementation (#3695) is on main although its separate acceptance remains open; C, B2, D, E, F and J1 have closed, and B and G's implementation seams are on main.
+**Status:** Done, 2026-11-14. Implemented on branch agent/issue-3250 (milestones m1 to m7): migrations 00442 (columns, NOT VALID CHECKs, backfill) and 00443 (VALIDATE), renumbered at landing if main has advanced; deviations and user decision D22 are in the Decision Log. Full exact-head PR CI (`test:api`, `test:web`, `test:web-browser`, `gate:repo`, the agent suite) and the affected compose E2E phases are landing obligations. Earlier status: Draft r4, 2026-11-13.
 **Priority:** Medium (`priority::normal`).
 **Parent:** #1703. Source: the epic's 2026-10-20 comment "per-run model and effort override at start". The user approved it superseding the epic's earlier "never a per-run override" lock (2026-10-21).
 **Blocked by:** no implementation blocker. H's code (#3695) and C's guard (#3245) are on main; P extends them. H's remaining acceptance is tracked by #3244 and is not a gate for P's implementation.
