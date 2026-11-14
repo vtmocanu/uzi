@@ -318,6 +318,9 @@ type RunDTO struct {
 	// An older api omits it, and clients then render nothing for it.
 	PlanCrossCheckGated      bool    `json:"plan_cross_check_gated,omitempty"`
 	PlanCrossCheckGateReason *string `json:"plan_cross_check_gate_reason"`
+	// CrossCheckActive reports the currently live plan or advisory code cross-check.
+	// The single-run read and list share the same closed vocabulary: "plan", "code", or null.
+	CrossCheckActive *string `json:"cross_check_active"`
 	// PlanCrossCheckDiffRefusal is the planning-diff refusal sub-code. It is set only
 	// while PlanCrossCheckGateReason is planning_diff_refused; otherwise nil.
 	PlanCrossCheckDiffRefusal *string `json:"plan_cross_check_diff_refusal"`
@@ -2473,16 +2476,16 @@ func (s RunSummaryItemDTO) ListItem() RunListItemDTO {
 			IsRevising:                    s.IsRevising,
 			CodeCrossCheckRequired:        s.CodeCrossCheckRequired,
 			CodeCrossCheckSummary:         s.CodeCrossCheckSummary,
+			CrossCheckActive:              s.CrossCheckActive,
 			AccountCooldownClass:          s.AccountCooldownClass,
 			AccountCooldownEligibleAt:     s.AccountCooldownEligibleAt,
 		},
-		RepoPath:         s.RepoPath,
-		WorkerName:       s.WorkerName,
-		OwnerEmail:       s.OwnerEmail,
-		JudgeVerdict:     s.JudgeVerdict,
-		JudgeTodoCount:   s.JudgeTodoCount,
-		PendingQuestion:  s.PendingQuestion,
-		CrossCheckActive: s.CrossCheckActive,
+		RepoPath:        s.RepoPath,
+		WorkerName:      s.WorkerName,
+		OwnerEmail:      s.OwnerEmail,
+		JudgeVerdict:    s.JudgeVerdict,
+		JudgeTodoCount:  s.JudgeTodoCount,
+		PendingQuestion: s.PendingQuestion,
 	}
 }
 
@@ -2518,10 +2521,7 @@ type RunListItemDTO struct {
 	// #4040), runquestion.Excerpt of the question message. Owner-only: ListRuns sets it for
 	// awaiting_input rows; the admin list never carries it. Omitted when absent.
 	PendingQuestion string `json:"pending_question,omitempty"`
-	// CrossCheckActive is "plan" while a plan cross-check is live for the run, "code" while a
-	// code cross-check is live, and null otherwise (issue #4082). List-only presence flag: it
-	// carries no findings, verdict, model or deadline. Always sent (null when none).
-	CrossCheckActive *string `json:"cross_check_active"`
+	// CrossCheckActive is embedded from RunDTO; the list overlays it from its live SQL flags.
 }
 
 // MessageDTO is one persisted run message (the replay source a reconnecting
@@ -2768,20 +2768,19 @@ func (r *RunListItemDTO) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	var context struct {
-		RepoPath         string  `json:"repo_path"`
-		WorkerName       *string `json:"worker_name"`
-		OwnerEmail       *string `json:"owner_email"`
-		JudgeVerdict     *string `json:"judge_verdict"`
-		JudgeTodoCount   int     `json:"judge_todo_count"`
-		PendingQuestion  string  `json:"pending_question"`
-		CrossCheckActive *string `json:"cross_check_active"`
+		RepoPath        string  `json:"repo_path"`
+		WorkerName      *string `json:"worker_name"`
+		OwnerEmail      *string `json:"owner_email"`
+		JudgeVerdict    *string `json:"judge_verdict"`
+		JudgeTodoCount  int     `json:"judge_todo_count"`
+		PendingQuestion string  `json:"pending_question"`
 	}
 	if err := json.Unmarshal(data, &context); err != nil {
 		return err
 	}
 	*r = RunListItemDTO{RunDTO: run, RepoPath: context.RepoPath, WorkerName: context.WorkerName,
 		OwnerEmail: context.OwnerEmail, JudgeVerdict: context.JudgeVerdict, JudgeTodoCount: context.JudgeTodoCount,
-		PendingQuestion: context.PendingQuestion, CrossCheckActive: context.CrossCheckActive}
+		PendingQuestion: context.PendingQuestion}
 	return nil
 }
 

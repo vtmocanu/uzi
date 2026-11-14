@@ -145,6 +145,9 @@ func renderRunDetailAt(p *uzicli.Printer, r apitypes.RunDTO, now time.Time, orig
 	rows = append(rows, completionPendingRows(r)...)
 	rows = append(rows, semanticDriftRows(r)...)
 	rows = append(rows, planCrossCheckRows(r)...)
+	if label := crossCheckActiveLabel(r.CrossCheckActive); label != "" {
+		rows = append(rows, []string{"CROSS_CHECK", label})
+	}
 	rows = append(rows, codeCrossCheckRows(r)...)
 	rows = append(rows, workerExhaustionRows(r)...)
 	for _, line := range forgeRunLines(r) {

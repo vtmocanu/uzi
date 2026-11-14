@@ -2331,6 +2331,14 @@ completed, failed, or cancelled run. The floor run summary (cost, count, and
 visible row range) sits right-aligned with the account meters, or on its own
 line when space is insufficient.
 
+The floor state word distinguishes `checking`, `reworking`, `compl blocked`,
+`xchecking`, and plan-gate cross-check outcomes (`xchk revise`, `xchk blocked`,
+`xchk n/a`). Each has a one-cell glyph and a word, so the meaning survives
+`NO_COLOR`. A run's detail names its completion phase and any live plan or
+advisory code cross-check on separate lines; `uzi run get` prints a
+`CROSS_CHECK` row while either check is live. The detail read refreshes this
+presence from the server rather than keeping a board snapshot.
+
 The floor summary, workers list and worker detail share one request chain,
 polling every 5s while any is visible, including an unfocused top pane.
 Failures back off to at most 60s and keep the last snapshot. Polling pauses

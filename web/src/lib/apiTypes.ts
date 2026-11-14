@@ -3713,6 +3713,9 @@ export interface Run {
   plan_cross_check_gated?: boolean;
   /** Persisted forced-gate reason; optional for older server and mock responses. */
   plan_cross_check_gate_reason?: string | null;
+  /** Live plan/code cross-check presence, shared by the run list and single-run detail.
+   *  Older APIs omit it; null or absent means no visible live check. */
+  cross_check_active?: "plan" | "code" | null;
   /** Planning-diff refusal sub-code; set only while the gate reason is planning_diff_refused. */
   plan_cross_check_diff_refusal?: string | null;
   /** Owner detail only. Historical findings describe an earlier plan. */
@@ -4709,11 +4712,6 @@ export interface RunListItem extends Run {
    *  GET /api/runs. Absent otherwise, and never on the admin list. Untrusted model text:
    *  render as plain text. */
   pending_question?: string;
-
-  /** Which cross-check is live for this run: "plan" or "code". Non-null only while the
-   *  run's plan or code cross-check is live. Older APIs omit it, and an absent value
-   *  shows no tag. */
-  cross_check_active?: "plan" | "code" | null;
 
   repo_path: string;
   worker_name: string | null;

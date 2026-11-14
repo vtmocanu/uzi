@@ -404,13 +404,43 @@ func demoRuns(now time.Time) []apitypes.RunListItemDTO {
 	codexPast.CodexSecretLabel = sp("former-codex") // deleted alias: snapshot survives
 	codexPast.CodexSelectReason = sp("auto")
 
+	// Issue #4345: every completion and cross-check display state is reachable in the
+	// real demo board and its openable run detail, without a server or hand-built frame.
+	checking := mk("c0de0003-1111-2222-3333-444444444444", "issue", "running", "Check the completion contract", "", nil, 0, 14*time.Minute)
+	checking.CompletionPhase = "checking"
+	reworking := mk("c0de0004-1111-2222-3333-444444444444", "issue", "running", "Rework an unmet milestone", "", nil, 0, 31*time.Minute)
+	reworking.CompletionPhase = "reworking"
+	reworking.CompletionUnmet = []string{"m3"}
+	reworking.CompletionAttempts = 2
+	reworking.CrossCheckActive = sp("code") // completion wins on the row; both facts show in detail
+	blocked := mk("c0de0005-1111-2222-3333-444444444444", "issue", statusPaused, "Resolve a blocked completion", "", nil, 0, 44*time.Minute)
+	blocked.CompletionPhase = "blocked"
+	blocked.HoldReason = sp("completion_blocked")
+	gateBlocked := mk("c0de0006-1111-2222-3333-444444444444", "issue", "awaiting_approval", "Review a blocked cross-check", "", nil, 0, 12*time.Minute)
+	gateBlocked.PlanCrossCheckRequired = true
+	gateBlocked.PlanCrossCheckGateReason = sp("block")
+	gateUnavailable := mk("c0de0007-1111-2222-3333-444444444444", "issue", "awaiting_approval", "Review an unavailable cross-check", "", nil, 0, 19*time.Minute)
+	gateUnavailable.PlanCrossCheckRequired = true
+	gateUnavailable.PlanCrossCheckGateReason = sp("worker_unsupported")
+	codexLive.CrossCheckActive = sp("code")
+
 	return []apitypes.RunListItemDTO{
 		// The inline planning run carries an issue id but NO web URL — it exercises the
 		// "id shown but NOT clickable" path.
-		{RunDTO: apitypes.RunDTO{ID: "d0e1f2a3-1111-2222-3333-444444444444", Kind: "issue", Status: "running", IsPlanning: true, IssueTitle: "Draft the plan for webhook delivery retries", CreatedAt: now.Add(-90 * time.Second), IssueIID: ip(488)}},
+		{RunDTO: apitypes.RunDTO{ID: "d0e1f2a3-1111-2222-3333-444444444444", Kind: "issue", Status: "running", IsPlanning: true, CrossCheckActive: sp("plan"), IssueTitle: "Draft the plan for webhook delivery retries", CreatedAt: now.Add(-90 * time.Second), IssueIID: ip(488)}},
 		scheduler,
+		checking,
+		reworking,
+		blocked,
 		// The ci_fix run keeps nil IssueIID/IssueWebURL — the no-issue (`#`-less) path.
-		mk("b2c3d4e5-1111-2222-3333-444444444444", "ci_fix", "awaiting_approval", "Fix flaky pipeline on main", "", nil, 0, 2*time.Minute),
+		func() apitypes.RunListItemDTO {
+			r := mk("b2c3d4e5-1111-2222-3333-444444444444", "ci_fix", "awaiting_approval", "Fix flaky pipeline on main", "", nil, 0, 2*time.Minute)
+			r.PlanCrossCheckRequired = true
+			r.PlanCrossCheckGateReason = sp("revise")
+			return r
+		}(),
+		gateBlocked,
+		gateUnavailable,
 		sync,
 		oidc,
 		portJudge,

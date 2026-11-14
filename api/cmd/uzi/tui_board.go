@@ -285,6 +285,9 @@ func runStateWord(r apitypes.RunListItemDTO) string {
 	if isCredentialSwitchUnsettledHold(r.RunDTO) {
 		return credSwitchUnsettledWord
 	}
+	if _, word, _ := checkRunState(r.RunDTO, r.IsRevising); word != "" {
+		return word
+	}
 	_, word := stateGlyphWord(r.Status, r.Health, r.IsPlanning, r.IsRevising, r.LandingState, strOr(r.StopKind, ""), strOr(r.RecoveryWaitCause, ""))
 	return word
 }
