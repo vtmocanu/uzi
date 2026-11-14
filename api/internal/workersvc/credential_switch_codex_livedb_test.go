@@ -23,7 +23,7 @@ func TestCodexSwitchPreflightLiveDB(t *testing.T) {
 	} {
 		t.Run(scenario, func(t *testing.T) {
 			f := newApplyFx(t)
-			f.env.exec("UPDATE workers SET protocol_capabilities = array_append(protocol_capabilities, $2) WHERE id = $1", f.o.workerID, capability.CodexCredentialSwitchV1)
+			f.env.exec("UPDATE workers SET credential_switch_apply_nonce=snapshot_register_nonce, protocol_capabilities = array_append(protocol_capabilities, $2) WHERE id = $1", f.o.workerID, capability.CodexCredentialSwitchV1)
 			run, op := f.run(t, "running")
 			old := f.env.seedStaticAPIKey(t, f.o.userID, "old-api", "old-test-key")
 			target := f.env.seedStaticAPIKey(t, f.o.userID, "new-api", "new-test-key")

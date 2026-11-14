@@ -306,7 +306,8 @@ func (s *Service) applyCredentialSwitchOnce(ctx context.Context, wkr store.Worke
 	if run.Harness == harnessCodex {
 		requiredCapability = capability.CodexCredentialSwitchV1
 	}
-	if !slices.Contains(w.ProtocolCapabilities, requiredCapability) ||
+	if (run.Harness == harnessCodex && !codexSwitchNegotiated(w)) ||
+		!slices.Contains(w.ProtocolCapabilities, requiredCapability) ||
 		run.Kind == runkind.Job || run.Kind == runkind.CrossCheck ||
 		!w.SnapshotRegisterNonce.Valid || w.SnapshotRegisterNonce.String != req.RegisterNonce ||
 		!run.WorkerID.Valid || uuid.UUID(run.WorkerID.Bytes) != wkr.ID ||

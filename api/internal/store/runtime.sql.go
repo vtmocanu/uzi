@@ -17297,7 +17297,7 @@ WITH candidates AS MATERIALIZED (
     WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
 )
 SELECT runs.id, runs.kind, runs.status, runs.worker_id, runs.claim_generation, runs.claim_released_at, runs.credential_switch_requested_at,
-       runs.credential_switch_generation, runs.egress_profile_id
+       runs.credential_switch_generation, runs.egress_profile_id, runs.harness
 FROM runs WHERE runs.id = $1
   AND runs.id IN (SELECT run_id FROM eligible_candidates)
 FOR UPDATE OF runs
@@ -17313,6 +17313,7 @@ type LockRunForInputReceiptRow struct {
 	CredentialSwitchRequestedAt pgtype.Timestamptz `json:"credential_switch_requested_at"`
 	CredentialSwitchGeneration  pgtype.Int8        `json:"credential_switch_generation"`
 	EgressProfileID             pgtype.UUID        `json:"egress_profile_id"`
+	Harness                     string             `json:"harness"`
 }
 
 // egress_profile_id rides this lock (PRD #1906 M5, Decision D-D) so inputReceipt applies the
@@ -17330,6 +17331,7 @@ func (q *Queries) LockRunForInputReceipt(ctx context.Context, runID uuid.UUID) (
 		&i.CredentialSwitchRequestedAt,
 		&i.CredentialSwitchGeneration,
 		&i.EgressProfileID,
+		&i.Harness,
 	)
 	return i, err
 }

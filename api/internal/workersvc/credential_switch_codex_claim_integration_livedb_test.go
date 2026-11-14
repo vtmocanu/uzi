@@ -18,7 +18,7 @@ func TestCodexSwitchWorkerLossClaimIntegrationLiveDB(t *testing.T) {
 		t.Run(scenario, func(t *testing.T) {
 			x := newOutageCodexFlight(t, codexAuthModeAPIKey)
 			id := x.f.runID
-			x.env.exec("UPDATE workers SET protocol_capabilities=array_append(protocol_capabilities,$2) WHERE id=$1", x.f.workerID, capability.CodexCredentialSwitchV1)
+			x.env.exec("UPDATE workers SET credential_switch_apply_nonce=snapshot_register_nonce, protocol_capabilities=array_append(protocol_capabilities,$2) WHERE id=$1", x.f.workerID, capability.CodexCredentialSwitchV1)
 			target := x.env.seedStaticAPIKey(t, x.f.userID, "unused-switch-target", "unused-target-key")
 			x.env.exec("UPDATE runs SET credential_switch_requested_at=now(), credential_switch_generation=claim_generation WHERE id=$1", id)
 			x.env.exec(`UPDATE runs SET codex_switch_target_secret_id=$2,

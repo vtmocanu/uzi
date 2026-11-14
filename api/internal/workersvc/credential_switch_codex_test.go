@@ -28,8 +28,9 @@ func TestCodexSwitchOwnerStateRefusals(t *testing.T) {
 
 func TestCodexSwitchNegotiation(t *testing.T) {
 	w := store.Worker{
-		SnapshotRegisterNonce: pgtype.Text{String: "registration", Valid: true},
-		ProtocolCapabilities:  []string{capability.CredentialSwitchInPlaceV1},
+		SnapshotRegisterNonce:      pgtype.Text{String: "registration", Valid: true},
+		CredentialSwitchApplyNonce: pgtype.Text{String: "registration", Valid: true},
+		ProtocolCapabilities:       []string{capability.CredentialSwitchInPlaceV1},
 	}
 	if codexSwitchNegotiated(w) {
 		t.Fatal("Claude negotiation authorized Codex")
@@ -38,6 +39,11 @@ func TestCodexSwitchNegotiation(t *testing.T) {
 	if !codexSwitchNegotiated(w) {
 		t.Fatal("explicit Codex negotiation refused")
 	}
+	w.CredentialSwitchApplyNonce.String = "older-registration"
+	if codexSwitchNegotiated(w) {
+		t.Fatal("older API registration accepted for Codex switching")
+	}
+	w.CredentialSwitchApplyNonce.String = "registration"
 	w.SnapshotRegisterNonce.Valid = false
 	if codexSwitchNegotiated(w) {
 		t.Fatal("missing registration accepted")

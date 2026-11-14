@@ -25,7 +25,7 @@ func TestOwnerCodexPendingTargetLiveDB(t *testing.T) {
 	if f.snap(t, run) != snap {
 		t.Fatal("refused owner request changed state")
 	}
-	f.env.exec("UPDATE workers SET protocol_capabilities = array_append(protocol_capabilities, $2) WHERE id = $1", f.o.workerID, capability.CodexCredentialSwitchV1)
+	f.env.exec("UPDATE workers SET credential_switch_apply_nonce=snapshot_register_nonce, protocol_capabilities = array_append(protocol_capabilities, $2) WHERE id = $1", f.o.workerID, capability.CodexCredentialSwitchV1)
 	got, err := f.svc.SetRunCredential(f.env.ctx, f.o.userID, run, BindModePinned, &target)
 	if err != nil {
 		t.Fatal(err)

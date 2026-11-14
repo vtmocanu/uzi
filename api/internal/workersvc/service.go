@@ -6493,7 +6493,10 @@ func (s *Service) ConsumeInputs(ctx context.Context, wkr store.Worker, runID uui
 // inPlaceSwitchDrains reports whether a pending credential switch leaves the worker's /inputs
 // draining normally: the worker registered the in-place capability AND uses the receipts path
 // (the only drain that is a read-only replay, so a drain the worker never applies loses nothing).
-func inPlaceSwitchDrains(wkr store.Worker) bool {
+func inPlaceSwitchDrains(wkr store.Worker, harness string) bool {
+	if harness == harnessCodex {
+		return codexSwitchNegotiated(wkr) && slices.Contains(wkr.ProtocolCapabilities, capability.InputReceiptsV1)
+	}
 	return slices.Contains(wkr.ProtocolCapabilities, capability.CredentialSwitchInPlaceV1) &&
 		slices.Contains(wkr.ProtocolCapabilities, capability.InputReceiptsV1)
 }
@@ -6509,7 +6512,7 @@ func (s *Service) consumeInputsLocked(ctx context.Context, wkr store.Worker, run
 		}}, nil
 	}
 	sig := PendingCredentialSwitchSignal(run)
-	if sig != nil && !inPlaceSwitchDrains(wkr) {
+	if sig != nil && !inPlaceSwitchDrains(wkr, run.Harness) {
 		// Pending switch: signal + no drain, so a racing answer/follow-up survives for the reclaim.
 		return ConsumeInputsResult{CredentialSwitch: sig}, nil
 	}

@@ -15,7 +15,7 @@ import (
 func codexApplyFixture(t *testing.T, subscription bool) (applyFx, uuid.UUID, uuid.UUID) {
 	t.Helper()
 	f := newApplyFx(t)
-	f.env.exec("UPDATE workers SET protocol_capabilities=ARRAY[$2]::text[] WHERE id=$1", f.o.workerID, capability.CodexCredentialSwitchV1)
+	f.env.exec("UPDATE workers SET credential_switch_apply_nonce=snapshot_register_nonce, protocol_capabilities=ARRAY[$2]::text[] WHERE id=$1", f.o.workerID, capability.CodexCredentialSwitchV1)
 	run, _ := f.run(t, "running")
 	old := f.env.seedStaticAPIKey(t, f.o.userID, "apply-old", "apply-old-key")
 	if err := f.svc.FreezeCodexBinding(f.env.ctx, f.o.userID, run, old, codexAuthModeAPIKey); err != nil {

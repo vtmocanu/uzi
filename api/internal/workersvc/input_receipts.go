@@ -60,7 +60,7 @@ func receiptInactiveReason(run store.LockRunForInputReceiptRow, wkr store.Worker
 		return ReceiptStale
 	case run.ClaimReleasedAt.Valid:
 		return ReceiptReleased
-	case run.CredentialSwitchRequestedAt.Valid && run.CredentialSwitchGeneration.Valid && run.CredentialSwitchGeneration.Int64 == generation && (mode != receiptAck || !inPlaceSwitchDrains(wkr)):
+	case run.CredentialSwitchRequestedAt.Valid && run.CredentialSwitchGeneration.Valid && run.CredentialSwitchGeneration.Int64 == generation && (mode != receiptAck || !inPlaceSwitchDrains(wkr, run.Harness)):
 		return ReceiptSwitchPending
 	}
 	return ""

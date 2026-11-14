@@ -249,8 +249,7 @@ func (s *Service) validateCodexSwitchLocked(ctx context.Context, q *store.Querie
 				return codexSwitchReadFailure(err)
 			}
 			// Use the transaction reader even for the bounded vault-conversion retry.
-			opener := *s
-			opener.q = q
+			opener := Service{q: q, box: s.box, vlt: s.vlt}
 			key, err := codexAccountKey(acct.ProviderUserID, acct.WorkspaceAccountID)
 			if err != nil || !run.CodexSwitchTargetAccountKey.Valid || run.CodexSwitchTargetAccountKey.String != key ||
 				!run.CodexSwitchTargetAccountRevision.Valid || run.CodexSwitchTargetAccountRevision.Int64 != acct.CredentialRevision {
@@ -381,8 +380,14 @@ func codexSwitchBaselineMatches(r store.Run, bases []store.RunCredentialEpoch, c
 
 // Both owner requests and worker preflight require the Codex protocol explicitly.
 func codexSwitchNegotiated(w store.Worker) bool {
-	return slices.Contains(w.ProtocolCapabilities, capability.CodexCredentialSwitchV1) &&
-		w.SnapshotRegisterNonce.Valid && w.SnapshotRegisterNonce.String != ""
+	return slices.Contains(w.ProtocolCapabilities, capability.CodexCredentialSwitchV1) && currentSwitchApplyRegistration(w)
+}
+
+// A stale registration made against an older API replica cannot negotiate apply.
+func currentSwitchApplyRegistration(w store.Worker) bool {
+	return w.SnapshotRegisterNonce.Valid && w.SnapshotRegisterNonce.String != "" &&
+		w.CredentialSwitchApplyNonce.Valid &&
+		w.CredentialSwitchApplyNonce.String == w.SnapshotRegisterNonce.String
 }
 
 func codexSwitchPolicyBlocked(r store.Run) bool {
