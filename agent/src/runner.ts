@@ -17632,7 +17632,7 @@ export class RunRunner {
         this.runGatedSink(flight, () => this.runSecretRemediationGate(flight, barePath, runnerClone, options)),
       // issue #4258: advisory, non-terminal mid-run consumer; a no-op unless a trigger is pending.
       midRunSecretRemediation: () => flight.secretRemediation?.midRunTrigger
-        ? this.runGatedSink(flight, () => this.runMidRunSecretRemediation(flight, barePath, runnerClone))
+        ? this.runGatedSink(flight, () => this.runMidRunSecretRemediationScoped(flight, barePath, runnerClone))
         : Promise.resolve({ action: "proceed" as const }),
       ...(claim.code_cross_check_required === true
         && isCodePublishingKind(claim.kind ?? "issue") ? {
@@ -20142,23 +20142,24 @@ export class RunRunner {
   }
 
   private async persistRemediationRestrictions(flight: RunFlight, barePath: string, branch: string,
-    tip: string, findings: readonly SecretFinding[]): Promise<void> {
+    tip: string, findings: readonly SecretFinding[], wait?: AuthorityWait): Promise<void> {
     const flaggedOIDs = this.latchRemediationFindings(flight, barePath, branch, findings);
     if (flaggedOIDs === undefined) return;
     const source = this.remediationSource(flight);
     await this.inFlightAuthority(flight, () => this.git.recordRemediationRestrictions(barePath, branch,
       { runId: source.runId, clonePath: source.clonePath!, attemptId: source.attemptId! },
-      { trusted: true, tip, flaggedOIDs }), this.authorityWait(flight));
+      { trusted: true, tip, flaggedOIDs }), wait ?? this.authorityWait(flight));
   }
 
   private async persistRemediationScan(flight: RunFlight, barePath: string, branch: string,
-    tip: string, findings: readonly SecretFinding[], origin?: "checkpoint-pending" | "pre-exit"): Promise<void> {
+    tip: string, findings: readonly SecretFinding[], origin?: "checkpoint-pending" | "pre-exit",
+    wait?: AuthorityWait): Promise<void> {
     const flaggedOIDs = this.latchRemediationFindings(flight, barePath, branch, findings);
     if (flaggedOIDs === undefined) return;
     const source = this.remediationSource(flight);
     await this.inFlightAuthority(flight, () => this.git.recordRemediationScan(barePath, branch,
       { runId: source.runId, clonePath: source.clonePath!, attemptId: source.attemptId! },
-      { trusted: true, tip, flaggedOIDs, ...(origin ? { origin } : {}) }), this.authorityWait(flight));
+      { trusted: true, tip, flaggedOIDs, ...(origin ? { origin } : {}) }), wait ?? this.authorityWait(flight));
   }
 
   /**
@@ -20267,11 +20268,14 @@ export class RunRunner {
    * gitleaks; true (withhold EVERY path on every surface) when that scan is untrusted or flags any
    * path (fail closed).
    */
-  private async withholdPathsFor(findings: readonly SecretFinding[]): Promise<boolean> {
+  private async withholdPathsFor(
+    findings: readonly SecretFinding[],
+    pathScope?: <T>(fn: () => Promise<T>) => Promise<T>,
+  ): Promise<boolean> {
     try {
-      const pathScan = await this.git.scanPatchForSecrets(
+      const pathScan = await (pathScope ?? ((fn) => fn()))(() => this.git.scanPatchForSecrets(
         findings.map((f) => (typeof f.file === "string" ? f.file : "")).join("\n"),
-      );
+      ));
       return !pathScan.trusted || pathScan.findings.length > 0;
     } catch {
       return true;
@@ -20292,7 +20296,7 @@ export class RunRunner {
     barePath: string,
     branch: string,
     expectedTip: string,
-    options?: { explicitTip?: boolean; unpublishedOnly?: boolean },
+    options?: { explicitTip?: boolean; unpublishedOnly?: boolean; scanScope?: <T>(fn: () => Promise<T>) => Promise<T> },
   ): Promise<
     | { trusted: true; range: CheckpointRange; findings: SecretFinding[]; floorCandidates: string[] }
     | { trusted: false; why: string; publishedOnly?: true }
@@ -20311,7 +20315,8 @@ export class RunRunner {
     if (options?.unpublishedOnly && (range.tipSha === range.excludeSha || range.scanFloorShas?.includes(range.tipSha))) {
       return { trusted: false, why: "published_only", publishedOnly: true };
     }
-    const scan = await this.git.secretScanCheckpointRange(barePath, range, { deadlineMs: this.scanDeadlineMs() });
+    const scan = await (options?.scanScope ?? ((fn) => fn()))(() =>
+      this.git.secretScanCheckpointRange(barePath, range, { deadlineMs: this.scanDeadlineMs() }));
     if (!scan.trusted) return { trusted: false, why: scan.reason ?? "scan_untrusted" };
     return { trusted: true, range, findings: scan.findings, floorCandidates };
   }
@@ -20465,38 +20470,57 @@ export class RunRunner {
    * proceed or remediate; never fail, and it never sets `blocked`, `known`, `everKnown` or `cleanTip`.
    * It revalidates from scratch (fresh fetch-back, tip agreement, restriction certainty, fresh scan);
    * the trigger's stored tip is never used. Anything uncertain DEFERS: the trigger is kept, no turn is given and no attempt
-   * is spent, and the done gate stays the authority. If `persistRemediationScan` throws after the
+   * is spent, and the done gate stays the authority. The seam runs under the owned `stop` scope of
+   * {@link runMidRunSecretRemediationScoped}: a cancel, claim fence or worker shutdown stops its git/gitleaks work,
+   * and an aborted seam defers ("aborted") with the trigger kept, no attempt spent and nothing emitted.
+   * If `persistRemediationScan` throws after the
    * restrictions and flaggedCommits were recorded, that recorded state stays, which fails closed. Shares `attempts` with the done gate.
    */
   private async runMidRunSecretRemediation(
     flight: RunFlight,
     barePath: string | undefined,
     runnerClone: RunnerClone,
+    stop: AbortSignal,
+    scopes: {
+      wait: AuthorityWait;
+      scanScope: <T>(fn: () => Promise<T>) => Promise<T>;
+      pathScope: <T>(fn: () => Promise<T>) => Promise<T>;
+    },
   ): Promise<SecretRemediationDecision> {
     const { runLog, runId } = flight;
     const state = flight.secretRemediation;
     const proceed = { action: "proceed" as const };
     if (!state?.midRunTrigger || !barePath) return proceed;
-    const clear = (): { action: "proceed" } => { state.midRunTrigger = undefined; return proceed; };
-    if (state.blocked && state.blocked.length > 0) return clear();
     const defer = (why: string): { action: "proceed" } => {
       runLog.info("mid-run secret remediation deferred", { run_id: runId, why });
       return proceed;
     };
+    // A stopped seam never clears the trigger: the revalidation did not complete.
+    const clear = (): { action: "proceed" } => {
+      if (stop.aborted) return defer("aborted");
+      state.midRunTrigger = undefined;
+      return proceed;
+    };
+    if (state.blocked && state.blocked.length > 0) return clear();
     const branch = runnerClone.branch;
     try {
-      const fetched = await this.fetchBackBestEffort(barePath, runnerClone.path, branch, flight, runLog);
+      const fetched = await this.fetchBackBestEffort(barePath, runnerClone.path, branch, flight, runLog,
+        {}, undefined, scopes.wait);
       const cloneTip = await this.git.branchTip(runnerClone.path, branch);
       const trackTip = await this.git.trackingTip(barePath, branch);
       if (fetched.kind === "refused") throw new PreservationRefusedError();
+      if (stop.aborted) return defer("aborted");
       if (fetched.kind !== "updated" || cloneTip === null || trackTip === null || cloneTip !== trackTip) return defer("tracking_tip_stale");
       const pending = flight.remediationRestrictions?.pending;
       if (pending?.bindingUncertain || pending?.requireDenial) return defer("restriction_uncertain");
       if (state.overflow) return defer("overflow");
-      const scanned = await this.scanRemediationRange(flight, barePath, branch, cloneTip, { unpublishedOnly: true });
+      const scanned = await this.scanRemediationRange(flight, barePath, branch, cloneTip,
+        { unpublishedOnly: true, scanScope: scopes.scanScope });
+      if (stop.aborted) return defer("aborted");
       if (!scanned.trusted) return scanned.publishedOnly ? clear() : defer(scanned.why);
       const { range, floorCandidates } = scanned;
       const reach = await this.classifyFlaggedReachability(state, barePath, cloneTip);
+      if (stop.aborted) return defer("aborted");
       if (reach.includes("unknown")) return defer("flagged_ancestry_unknown");
       const retained = state.flaggedFindings ?? [];
       // Every fresh finding is kept as is (a commit adding two secret files yields two); only
@@ -20516,6 +20540,7 @@ export class RunRunner {
       });
       if (findings.length === 0) return clear();
       const verdict = await this.classifyFindingFloors(flight, barePath, findings, floorCandidates);
+      if (stop.aborted) return defer("aborted");
       if (verdict === "unknown") return defer("floor_ancestry_unknown");
       if (verdict === "at_floor") return clear();
       if (state.attempts >= SECRET_REMEDIATION_MAX_ATTEMPTS) return clear();
@@ -20523,12 +20548,16 @@ export class RunRunner {
       const known = new Set(state.flaggedCommits ?? []);
       const fresh = findings.filter((f) => typeof f.commit === "string" && !known.has(f.commit.toLowerCase())).length;
       if (known.size + fresh > cap) return defer("overflow");
-      await this.persistRemediationRestrictions(flight, barePath, branch, range.tipSha, findings);
+      await this.persistRemediationRestrictions(flight, barePath, branch, range.tipSha, findings, scopes.wait);
+      if (stop.aborted) return defer("aborted");
       this.recordFlaggedCommits(state, findings, runLog);
       if (state.overflow) return defer("overflow");
-      await this.persistRemediationScan(flight, barePath, branch, range.tipSha, findings, "pre-exit");
+      await this.persistRemediationScan(flight, barePath, branch, range.tipSha, findings, "pre-exit", scopes.wait);
+      if (stop.aborted) return defer("aborted");
+      const withholdPaths = await this.withholdPathsFor(findings, scopes.pathScope);
+      // No await separates this check from the attempt spend, the trigger clear and the emit below.
+      if (stop.aborted) return defer("aborted");
       state.attempts++;
-      const withholdPaths = await this.withholdPathsFor(findings);
       const floorSha =
         flight.checkpointFloor &&
         (flight.publishedRealTips ?? []).includes(flight.checkpointFloor) &&
@@ -20560,9 +20589,222 @@ export class RunRunner {
         }),
       };
     } catch (e) {
-      if (isCheckpointBoundaryFailure(e)) throw e;
       if (e instanceof PreservationRefusedError) throw e;
+      if (stop.aborted) return defer("aborted");
+      if (isCheckpointBoundaryFailure(e)) throw e;
       return defer(`threw: ${errMessage(e)}`);
+    }
+  }
+
+  /**
+   * Issue #4258: the owned process scope around {@link runMidRunSecretRemediation}, built like the
+   * mid-turn tick (startMidTurnTicker). A hard stop (cancel, claim fence, shutdown deadline) kills the
+   * seam's git/gitleaks children through `ac`; a soft stop (graceful lifecycle abort) is cooperative
+   * through `softAc`. Either one makes the revalidation defer ("aborted"). The caller holds the sink gate
+   * (runGatedSink), and this method returns only after every child exited and lock custody ran; when a
+   * child survived its SIGKILL it keeps waiting, still inside the gate, until the group is gone.
+   */
+  private async runMidRunSecretRemediationScoped(
+    flight: RunFlight,
+    barePath: string | undefined,
+    runnerClone: RunnerClone,
+  ): Promise<SecretRemediationDecision> {
+    const { runLog, batcher, runId } = flight;
+    const proceed = { action: "proceed" as const };
+    if (!flight.secretRemediation?.midRunTrigger || !barePath) return proceed;
+    const hooks = this.checkpointTestHooks;
+    const deferPre = (why: string): { action: "proceed" } => {
+      runLog.info("mid-run secret remediation deferred", { run_id: runId, why });
+      return proceed;
+    };
+    if (this.tickSurvivorsRemain(flight)) return deferPre("tick_process_survived");
+    if (await this.retainedBareLockRemains(flight)) return deferPre("bare_lock_retained");
+
+    const ac = new AbortController();
+    const softAc = new AbortController();
+    const stop = AbortSignal.any([ac.signal, softAc.signal]);
+    const steering = flight.steering;
+    const now = hooks?.absoluteNow ?? Date.now;
+    const neverStop = new AbortController().signal;
+    const classify = (): "hard" | "soft" | "none" => {
+      try {
+        checkCheckpointStop({ ...checkpointStopFields(steering, now), signal: neverStop });
+        return steering.lifecycleSignal().aborted ? "soft" : "none";
+      } catch {
+        return "hard";
+      }
+    };
+    const lifecycleSignal = steering.lifecycleSignal();
+    const terminalSignal = steering.terminalLifecycleSignal();
+    const authoritySignal = steering.checkpointAuthoritySignal();
+    const shutdownSignal = this.shutdownSignal.signal;
+    let shutdownAttached = false;
+    let cancelShutdownTimer: (() => void) | undefined;
+    const attachShutdown = (): void => {
+      if (shutdownAttached) return;
+      const shutdown = steering.workerShutdownCheckpoint();
+      if (!shutdown) return;
+      shutdownAttached = true;
+      cancelShutdownTimer = this.setTimer(() => ac.abort(), Math.max(0, shutdown.deadlineAt - now()));
+    };
+    const onEvent = (): void => {
+      attachShutdown();
+      const verdict = classify();
+      if (verdict === "hard") ac.abort();
+      else if (verdict === "soft") softAc.abort();
+    };
+    // The worker's own shutdown must bound the seam even when the steering classification reads "none".
+    const onShutdown = (): void => {
+      onEvent();
+      if (!stop.aborted) softAc.abort();
+    };
+    lifecycleSignal.addEventListener("abort", onEvent, { once: true });
+    terminalSignal.addEventListener("abort", onEvent, { once: true });
+    authoritySignal.addEventListener("abort", onEvent, { once: true });
+    shutdownSignal.addEventListener("abort", onShutdown, { once: true });
+    // Initial state: authoritySignal is sticky for the flight (a given-up credential switch leaves it
+    // aborted), so it counts only as an event, never as a standing stop.
+    attachShutdown();
+    if (terminalSignal.aborted || steering.isCancelled() || steering.claimFence() !== undefined) {
+      onEvent();
+      if (!stop.aborted) ac.abort();
+    } else if (lifecycleSignal.aborted || shutdownSignal.aborted) {
+      onShutdown();
+    }
+
+    const spawner = new TickSpawner({
+      signal: ac.signal,
+      barePath,
+      branch: runnerClone.branch,
+      log: runLog,
+      ...(hooks?.tickKillGraceMs !== undefined ? { killGraceMs: hooks.tickKillGraceMs } : {}),
+      ...(hooks?.tickSpawn ? { hooks: hooks.tickSpawn } : {}),
+    });
+    let survivedHere = false;
+    const recordSurvivors = (): void => {
+      const survivors = spawner.survivors();
+      if (survivors.length === 0) return;
+      survivedHere = true;
+      runLog.warn("mid-turn checkpoint: a tick process group survived its SIGKILL; blocking the sink", {
+        run_id: runId,
+        pgids: survivors.map((g) => g.pgid),
+      });
+      const wasBlocked = flight.retainedBareLocks.length > 0 || flight.survivingTickGroups.length > 0;
+      for (const g of survivors) {
+        if (!flight.survivingTickGroups.some((x) => x.pgid === g.pgid)) flight.survivingTickGroups.push(g);
+      }
+      if (!wasBlocked) {
+        batcher.emit({
+          kind: "status",
+          agent: "worker",
+          payload: { text: "mid-turn checkpoint sink blocked: a checkpoint process survived being stopped" },
+        });
+      }
+    };
+    const recordLocks = (res: { removed: string[]; retained: RetainedLock[] }): void => {
+      for (const p of res.removed) {
+        runLog.info("mid-turn checkpoint removed a lock file its cancelled child provably owned", { run_id: runId, path: p });
+      }
+      if (res.retained.length === 0) return;
+      runLog.warn("mid-turn checkpoint retained a git lock file in the worker bare", {
+        run_id: runId,
+        retained: res.retained.map((r) => ({
+          path: r.path,
+          dev: r.dev,
+          ino: r.ino,
+          size: r.size,
+          mtime_ms: r.mtimeMs,
+          pre_spawn: r.preSpawn,
+          reason: r.reason,
+          argv_class: r.argvClass,
+        })),
+      });
+      const wasBlocked = flight.retainedBareLocks.length > 0 || flight.survivingTickGroups.length > 0;
+      for (const r of res.retained) {
+        if (!flight.retainedBareLocks.includes(r.path)) flight.retainedBareLocks.push(r.path);
+      }
+      if (!wasBlocked) {
+        batcher.emit({
+          kind: "status",
+          agent: "worker",
+          payload: { text: "mid-turn checkpoint sink blocked: a git lock file remains in the worker repository" },
+        });
+      }
+    };
+    // Settle + reconcile while the per-bare lock is still held, as the tick does.
+    const beforeLockRelease = async (key: string): Promise<void> => {
+      if (key !== barePath || !stop.aborted) return;
+      await spawner.settled();
+      recordSurvivors();
+      recordLocks(await spawner.reconcileLocks());
+    };
+    // A sub-scope aborted by the seam's stop and, for the range scan only, by the scan deadline.
+    const subScope = (deadlineMs?: number) =>
+      <T>(fn: () => Promise<T>): Promise<T> => {
+        const sub = new AbortController();
+        const onStop = (): void => sub.abort();
+        if (stop.aborted) sub.abort();
+        else stop.addEventListener("abort", onStop, { once: true });
+        const cancel = deadlineMs === undefined ? undefined : this.setTimer(() => sub.abort(), deadlineMs);
+        return this.git
+          .withBoundaryProcessSpawner(spawner.scoped(sub.signal), sub.signal, fn, { beforeLockRelease })
+          .finally(() => {
+            cancel?.();
+            stop.removeEventListener("abort", onStop);
+          });
+      };
+    const scopes = {
+      wait: { ...this.authorityWait(flight), signal: AbortSignal.any([this.retainedLifecycleSignal(flight), ac.signal]) },
+      scanScope: <T>(fn: () => Promise<T>): Promise<T> => subScope(this.scanDeadlineMs())(fn),
+      pathScope: <T>(fn: () => Promise<T>): Promise<T> => subScope()(fn),
+    };
+    try {
+      return await this.git.withBoundaryProcessSpawner(
+        spawner.spawn,
+        ac.signal,
+        () => this.runMidRunSecretRemediation(flight, barePath, runnerClone, stop, scopes),
+        { beforeLockRelease, softSignal: softAc.signal },
+      );
+    } catch (e) {
+      if (e instanceof PreservationRefusedError) throw e;
+      if (stop.aborted) return deferPre("aborted");
+      if (isCheckpointBoundaryFailure(e)) throw e;
+      return deferPre(`threw: ${errMessage(e)}`);
+    } finally {
+      cancelShutdownTimer?.();
+      lifecycleSignal.removeEventListener("abort", onEvent);
+      terminalSignal.removeEventListener("abort", onEvent);
+      authoritySignal.removeEventListener("abort", onEvent);
+      shutdownSignal.removeEventListener("abort", onShutdown);
+      // Full settlement before the gate is released: every child exited, then lock custody.
+      await spawner.settled();
+      recordSurvivors();
+      if (spawner.cancelledAny()) {
+        const res = await this.git
+          .withBareLock(barePath, () => spawner.reconcileLocks())
+          .catch((e: unknown) => {
+            runLog.warn("mid-turn checkpoint lock reconcile failed", { run_id: runId, error: errMessage(e) });
+            return { removed: [], retained: [] };
+          });
+        recordLocks(res);
+      }
+      // A surviving group may still be running: the seam does not return (and the sink gate stays
+      // held) until it is gone. Deliberately unbounded; one log line per verdict change.
+      if (survivedHere) {
+        let last: "stuck" | "unconfirmed" | undefined;
+        for (;;) {
+          const verdict = await this.awaitTickSurvivorsGone(flight);
+          if (verdict === "gone") break;
+          if (verdict !== last) {
+            last = verdict;
+            const log = verdict === "stuck" ? runLog.warn : runLog.error;
+            log.call(runLog, "mid-run secret remediation waiting for a surviving process group to exit", {
+              run_id: runId,
+              verdict,
+            });
+          }
+        }
+      }
     }
   }
 
