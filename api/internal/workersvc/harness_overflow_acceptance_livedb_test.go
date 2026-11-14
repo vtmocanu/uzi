@@ -36,11 +36,11 @@ func TestHarnessOverflowPublicCreationExclusionsLiveDB(t *testing.T) {
 			switch scenario {
 			case "manual explicit":
 				run, err = fx.svc.CreateRun(fx.env.ctx, fx.userID, fx.repoID, fx.nextIssue(),
-					"explicit", nil, nil, false, nil, nil, &claude, nil)
+					"explicit", nil, nil, false, nil, nil, &claude, nil, nil, nil)
 			case "manual credential":
 				run, err = fx.svc.CreateRun(fx.env.ctx, fx.userID, fx.repoID, fx.nextIssue(),
 					"credential", nil, nil, false, nil, nil, nil,
-					&RawCredentialOverride{Mode: CredentialOverrideModePinned, SecretID: &fx.token})
+					&RawCredentialOverride{Mode: CredentialOverrideModePinned, SecretID: &fx.token}, nil, nil)
 			default:
 				var explicit *Harness
 				var pinnedModel *string

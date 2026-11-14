@@ -737,7 +737,7 @@ func TestClaimIssueRerunCreatedThroughServiceLiveDB(t *testing.T) {
 	}
 
 	seedEligibleIssue(t, env, repoID, n)
-	rerun, err := svc.CreateRun(env.ctx, userID, repoID, n, "desc", nil, nil, true /*force*/, nil, nil, nil, nil)
+	rerun, err := svc.CreateRun(env.ctx, userID, repoID, n, "desc", nil, nil, true /*force*/, nil, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("CreateRun: %v", err)
 	}

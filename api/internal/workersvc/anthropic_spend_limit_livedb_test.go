@@ -203,7 +203,7 @@ func TestAnthropicSpendLimitSetTokenFencesOldClaimLiveDB(t *testing.T) {
 	          VALUES ($1, $2, $3, 'spend fence issue', 'opened', '["uzi"]', 'https://forge.e2e/i', false, now(), now())`, uuid.New(), repoID, int64(iid))
 	waitFalse := false
 	run, err := svc.CreateRun(env.ctx, userID, repoID, iid, "desc", &waitFalse, nil, false, nil, nil, nil,
-		&RawCredentialOverride{Mode: CredentialOverrideModePinned, SecretID: &tokenB})
+		&RawCredentialOverride{Mode: CredentialOverrideModePinned, SecretID: &tokenB}, nil, nil)
 	if err != nil {
 		t.Fatalf("CreateRun: %v", err)
 	}
@@ -293,7 +293,7 @@ func TestAnthropicSpendLimitResumeKeepsPinnedSecretLiveDB(t *testing.T) {
 	          VALUES ($1, $2, $3, 'spend issue', 'opened', '["uzi"]', 'https://forge.e2e/i', false, now(), now())`, uuid.New(), repoID, int64(iid))
 	waitFalse := false
 	run, err := svc.CreateRun(env.ctx, userID, repoID, iid, "desc", &waitFalse, nil, false, nil, nil, nil,
-		&RawCredentialOverride{Mode: CredentialOverrideModePinned, SecretID: &tokenB})
+		&RawCredentialOverride{Mode: CredentialOverrideModePinned, SecretID: &tokenB}, nil, nil)
 	if err != nil {
 		t.Fatalf("CreateRun: %v", err)
 	}
@@ -344,7 +344,7 @@ func TestAnthropicSpendLimitAutoResumeReentersAutoChoiceLiveDB(t *testing.T) {
 	env.exec(`INSERT INTO issues (id, repo_id, forge_issue_iid, title, state, labels, web_url, has_prd_link, forge_updated_at, synced_at)
 	          VALUES ($1, $2, $3, 'spend issue', 'opened', '["uzi"]', 'https://forge.e2e/i', false, now(), now())`, uuid.New(), repoID, int64(iid))
 	waitFalse := false
-	run, err := svc.CreateRun(env.ctx, userID, repoID, iid, "desc", &waitFalse, nil, false, nil, nil, nil, nil)
+	run, err := svc.CreateRun(env.ctx, userID, repoID, iid, "desc", &waitFalse, nil, false, nil, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("CreateRun: %v", err)
 	}

@@ -1,0 +1,183 @@
+{
+  "description": "Hand-authored POST /api/repos/{id}/runs start-option cases (PRD #3250). harness is the explicit request harness. A 201 case persists the sources; a 422 case asserts code and harness only, never the remedy list; a 400 case is a pre-forge shape refusal.",
+  "cases": [
+    {
+      "name": "claude opus alias",
+      "harness": "claude",
+      "model": "opus",
+      "expect": {
+        "status": 201
+      }
+    },
+    {
+      "name": "claude custom id",
+      "harness": "claude",
+      "model": "claude-x-1",
+      "expect": {
+        "status": 201
+      }
+    },
+    {
+      "name": "codex curated gpt-6-sol",
+      "harness": "codex",
+      "model": "gpt-6-sol",
+      "expect": {
+        "status": 201
+      }
+    },
+    {
+      "name": "claude effort max",
+      "harness": "claude",
+      "effort": "max",
+      "expect": {
+        "status": 201
+      }
+    },
+    {
+      "name": "codex effort max",
+      "harness": "codex",
+      "effort": "max",
+      "expect": {
+        "status": 201
+      }
+    },
+    {
+      "name": "claude effort only",
+      "harness": "claude",
+      "effort": "high",
+      "expect": {
+        "status": 201
+      }
+    },
+    {
+      "name": "claude model only",
+      "harness": "claude",
+      "model": "sonnet",
+      "expect": {
+        "status": 201
+      }
+    },
+    {
+      "name": "claude refuses codex gpt-6-sol",
+      "harness": "claude",
+      "model": "gpt-6-sol",
+      "expect": {
+        "status": 422,
+        "code": "model_incompatible_with_harness",
+        "harness": "claude"
+      }
+    },
+    {
+      "name": "claude refuses codex role gpt-6-luna",
+      "harness": "claude",
+      "model": "gpt-6-luna",
+      "expect": {
+        "status": 422,
+        "code": "model_incompatible_with_harness",
+        "harness": "claude"
+      }
+    },
+    {
+      "name": "codex refuses claude alias opus",
+      "harness": "codex",
+      "model": "opus",
+      "expect": {
+        "status": 422,
+        "code": "model_incompatible_with_harness",
+        "harness": "codex"
+      }
+    },
+    {
+      "name": "codex refuses unknown gpt-foo",
+      "harness": "codex",
+      "model": "gpt-foo",
+      "expect": {
+        "status": 422,
+        "code": "model_incompatible_with_harness",
+        "harness": "codex"
+      }
+    },
+    {
+      "name": "codex refuses role-only gpt-6-luna",
+      "harness": "codex",
+      "model": "gpt-6-luna",
+      "expect": {
+        "status": 422,
+        "code": "model_incompatible_with_harness",
+        "harness": "codex"
+      }
+    },
+    {
+      "name": "effort wrong case",
+      "harness": "claude",
+      "effort": "HIGH",
+      "expect": {
+        "status": 400
+      }
+    },
+    {
+      "name": "effort unknown level",
+      "harness": "claude",
+      "effort": "ultra",
+      "expect": {
+        "status": 400
+      }
+    },
+    {
+      "name": "empty model",
+      "harness": "claude",
+      "model": "",
+      "expect": {
+        "status": 400
+      }
+    },
+    {
+      "name": "model leading space",
+      "harness": "claude",
+      "model": " opus",
+      "expect": {
+        "status": 400
+      }
+    },
+    {
+      "name": "model trailing space",
+      "harness": "claude",
+      "model": "opus ",
+      "expect": {
+        "status": 400
+      }
+    },
+    {
+      "name": "model whitespace only",
+      "harness": "claude",
+      "model": "   ",
+      "expect": {
+        "status": 400
+      }
+    },
+    {
+      "name": "effort leading space",
+      "harness": "claude",
+      "effort": " high",
+      "expect": {
+        "status": 400
+      }
+    },
+    {
+      "name": "model of 101 bytes",
+      "harness": "claude",
+      "model": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "expect": {
+        "status": 400
+      }
+    },
+    {
+      "name": "model with bidi override U+202E",
+      "harness": "claude",
+      "model": "op\u202eus",
+      "expect": {
+        "status": 400
+      }
+    }
+  ]
+}

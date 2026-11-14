@@ -144,7 +144,7 @@ func TestCreateRunPinConcurrentDisableRefusedLiveDB(t *testing.T) {
 	waitFalse := false
 	pinned := &RawCredentialOverride{Mode: CredentialOverrideModePinned, SecretID: &fx.otherTok}
 	err := fx.raceDisable(t, fx.otherTok, func() error {
-		_, err := fx.svc.CreateRun(fx.env.ctx, fx.userID, fx.repoID, iid, "desc", &waitFalse, nil, false, nil, nil, nil, pinned)
+		_, err := fx.svc.CreateRun(fx.env.ctx, fx.userID, fx.repoID, iid, "desc", &waitFalse, nil, false, nil, nil, nil, pinned, nil, nil)
 		return err
 	})
 	if !errors.Is(err, ErrCredentialDisabled) {

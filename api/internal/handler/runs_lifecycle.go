@@ -9,10 +9,12 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
@@ -101,6 +103,11 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 		// implicit D11 resolution. An invalid enum is a 400. The web start dialog picker is M4a and
 		// the `uzi run create --harness` flag is M5; this handler accepts the field now.
 		Harness string `json:"harness"`
+		// PRD #3250: the optional start-time model and reasoning effort. POINTERS so an absent
+		// key stays distinct from a present one; unlike every other surface the values are NOT
+		// trimmed (see validateRunStartOptions). Only this handler can produce a run_override.
+		Model  *string `json:"model"`
+		Effort *string `json:"effort"`
 	}
 	if err := httpx.DecodeJSON(r, &req); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
@@ -150,6 +157,18 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// PRD #3250: shape-check the start-time model/effort before any forge read, then fast-fail an
+	// explicit harness that cannot serve the model (D11 cannot fall back from an explicit one). The
+	// authoritative check, on the harness the create resolves to, runs inside the create transaction.
+	if msg := validateRunStartOptions(req.Model, req.Effort); msg != "" {
+		httpx.Error(w, http.StatusBadRequest, msg)
+		return
+	}
+	if req.Model != nil && explicit != nil && !workersvc.RunOverrideModelHonorable(*explicit, *req.Model) {
+		h.writeModelIncompatible(w, &workersvc.ModelIncompatibleError{Model: *req.Model, Harness: *explicit})
+		return
+	}
+
 	// PRD #1429 M2 (D5): thread the RAW credential override (mode + optional secret id) down into
 	// the create path. It is validated through the one validator against the D11-RESOLVED harness
 	// INSIDE the create transaction (createRunAtomic) — not against a pre-transaction guess — so an
@@ -174,12 +193,52 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 	// The forge GetIssue snapshot, the uzi-label eligibility gate and the description
 	// cap all live inside StartRunForUser (PRD #191 M1), shared with the Slack/web chat
 	// start-run card.
-	run, err := h.wsvc.StartRunForUser(r.Context(), user.ID, repo.ID, req.IssueIID, req.WaitOnLimit, req.MrReworkEnabled, req.Force, seed, requested, explicit, rawOverride)
+	run, err := h.wsvc.StartRunForUser(r.Context(), user.ID, repo.ID, req.IssueIID, req.WaitOnLimit, req.MrReworkEnabled, req.Force, seed, requested, explicit, rawOverride, req.Model, req.Effort)
 	if err != nil {
 		h.writeStartRunError(w, r, err)
 		return
 	}
 	httpx.JSON(w, http.StatusCreated, h.createdRunBody(r.Context(), runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues)))
+}
+
+// validateRunStartOptions is the pure shape step for the start-time model and effort (PRD #3250).
+// Inputs are NOT trimmed: a present value is refused if empty, if it contains any whitespace
+// (leading, trailing or interior), or if agenttmpl's validators reject the exact string. The
+// validators trim, so a changed result also means whitespace. It returns the 400 message, or ""
+// when both are well formed. Every other surface keeps trim-then-blank.
+func validateRunStartOptions(model, effort *string) string {
+	if model != nil {
+		const blank = "model must not contain whitespace; omit it to use your default"
+		if *model == "" || strings.IndexFunc(*model, unicode.IsSpace) >= 0 {
+			return blank
+		}
+		m, err := agenttmpl.ValidateModel(*model)
+		if err != nil {
+			return err.Error()
+		}
+		if m != *model {
+			return blank
+		}
+	}
+	if effort != nil {
+		const bad = "effort must be one of low, medium, high, xhigh, max"
+		e, err := agenttmpl.ValidateEffort(*effort)
+		if err != nil || e == "" || e != *effort {
+			return bad
+		}
+	}
+	return ""
+}
+
+// writeModelIncompatible writes the 422 for a run_override model the run's harness cannot serve,
+// following the issue_has_open_mr / no_credential_for_harness precedent: a stable code and the
+// resolved harness beside the complete, surface-neutral error text.
+func (h *Handler) writeModelIncompatible(w http.ResponseWriter, e *workersvc.ModelIncompatibleError) {
+	httpx.JSON(w, http.StatusUnprocessableEntity, map[string]any{
+		"error":   e.Error(),
+		"code":    "model_incompatible_with_harness",
+		"harness": string(e.Harness),
+	})
 }
 
 // parseHarnessParam parses the optional public harness enum (PRD #1429 M2, D2), shared by the
@@ -399,6 +458,15 @@ func (h *Handler) writeStartRunError(w http.ResponseWriter, r *http.Request, err
 	case errors.Is(err, workersvc.ErrBranchInUse):
 		// Issue #1626: an active ci_fix OR mr_rework on agent/issue-<iid> holds the branch.
 		httpx.Error(w, http.StatusConflict, "a CI-fix or MR-rework run is already working this issue's branch; cancel it before starting an issue run")
+	case errors.Is(err, workersvc.ErrModelIncompatibleWithHarness):
+		// PRD #3250: the run's resolved harness cannot serve the chosen run_override model.
+		var mie *workersvc.ModelIncompatibleError
+		if errors.As(err, &mie) {
+			h.writeModelIncompatible(w, mie)
+			return
+		}
+		slog.Error("start run: model incompatibility without detail", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
 	case errors.Is(err, workersvc.ErrHarnessCredentialDisabled):
 		// PRD #1732 D15: an explicit harness whose credentials are all disabled. Still the
 		// stable no_credential_for_harness refusal (no run, no fallback), naming Settings.

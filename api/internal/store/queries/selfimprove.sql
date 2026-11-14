@@ -48,9 +48,9 @@
 -- implicit D11; M2 wires the real resolved value. Every current caller passes
 -- string(HarnessClaude) as a mechanical stopgap.
 INSERT INTO runs (
-    user_id, repo_id, kind, issue_iid, issue_title, issue_description, auto_approve, wait_on_limit, model, override_subagent_model, mr_rework_enabled, required_capabilities, hinted_capabilities, ignored_inferred_capabilities, trigger_source, harness, plan_cross_check_required
+    user_id, repo_id, kind, issue_iid, issue_title, issue_description, auto_approve, wait_on_limit, model, model_source, override_subagent_model, mr_rework_enabled, required_capabilities, hinted_capabilities, ignored_inferred_capabilities, trigger_source, harness, plan_cross_check_required
 , code_cross_check_required, repo_agent_source_required) VALUES (
-    @user_id, @repo_id::uuid, 'self_improve', @issue_iid, @issue_title, @issue_description, true, @wait_on_limit, sqlc.narg('model'), @override_subagent_model, sqlc.narg('mr_rework_enabled'),
+    @user_id, @repo_id::uuid, 'self_improve', @issue_iid, @issue_title, @issue_description, true, @wait_on_limit, sqlc.narg('model'), CASE WHEN sqlc.narg('model')::text IS NOT NULL THEN 'schedule_pin' END, @override_subagent_model, sqlc.narg('mr_rework_enabled'),
     -- required_capabilities (PRD #84 M2, issue #512 M1): a self_improve run is REPO-BEARING
     -- (it targets uzi's own repo, the likeliest to require docker to build/test), so it must
     -- inherit the repo's capability hint like every other repo-bearing path — else with

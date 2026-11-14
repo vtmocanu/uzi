@@ -1337,6 +1337,9 @@ type Run struct {
 	PolicyFreshConsumedGeneration    pgtype.Int8        `json:"policy_fresh_consumed_generation"`
 	PolicyFreshConfirmedGeneration   pgtype.Int8        `json:"policy_fresh_confirmed_generation"`
 	RecoveryWaitDetail               pgtype.Text        `json:"recovery_wait_detail"`
+	Effort                           pgtype.Text        `json:"effort"`
+	ModelSource                      pgtype.Text        `json:"model_source"`
+	EffortSource                     pgtype.Text        `json:"effort_source"`
 }
 
 type RunCompletionAttempt struct {

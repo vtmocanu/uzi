@@ -308,7 +308,7 @@ func (f *effFix) create(explicit *workersvc.Harness, override *workersvc.RawCred
 	f.iid++
 	f.exec(`INSERT INTO issues (id, repo_id, forge_issue_iid, title, state, labels, web_url, has_prd_link, forge_updated_at, synced_at)
 		VALUES ($1, $2, $3, 'eff issue', 'opened', '["uzi"]', 'https://forge.e2e/i', false, now(), now())`, uuid.New(), f.repo, f.iid)
-	return f.h.wsvc.CreateRun(f.ctx, f.user, f.repo, f.iid, "eff", nil, nil, false, nil, nil, explicit, override)
+	return f.h.wsvc.CreateRun(f.ctx, f.user, f.repo, f.iid, "eff", nil, nil, false, nil, nil, explicit, override, nil, nil)
 }
 
 func hptr(h workersvc.Harness) *workersvc.Harness { return &h }
