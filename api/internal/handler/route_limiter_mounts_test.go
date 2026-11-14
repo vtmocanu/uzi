@@ -950,7 +950,7 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/worker/runs/{id}/proposals", noLimiter},
 	{"POST", "/api/worker/runs/{id}/publish", noLimiter},
 	// Issue #2545 step A: the failed run's held-work upload. Worker-authenticated, no per-user
-	// limiter; a process-wide slot cap bounds it instead (AcquireHeldPublishSlot).
+	// limiter; shared global and per-worker slots bound it (AcquireHeldPublishSlot).
 	{"POST", "/api/worker/runs/{id}/held-publication", noLimiter},
 	// Issue #4007: the terminal-preservation upload, worker-authenticated and unlimited like the held-work upload above.
 	{"POST", "/api/worker/runs/{id}/terminal-preservation", noLimiter},
