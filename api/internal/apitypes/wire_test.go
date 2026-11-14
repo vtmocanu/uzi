@@ -381,7 +381,7 @@ func TestRunListItemDTOTags(t *testing.T) {
 	// worker_name field shadows the embedded one (json collapses the duplicate tag to one key), so it
 	// is NOT appended here any more.
 	// is_revising moved onto RunDTO (issue #2760), so it is in runDTOKeys.
-	want := append(append([]string{}, runDTOKeys...), "judge_verdict", "judge_todo_count", "cross_check_active")
+	want := append(append([]string{}, runDTOKeys...), "judge_verdict", "judge_todo_count")
 	assertTags(t, "RunListItemDTO(no owner)", RunListItemDTO{}, want...)
 	// owner_email present when set.
 	email := "u@example.test"
