@@ -10,7 +10,7 @@
 import type { CheckpointRange } from "./git.js";
 import type { TerminalPreservationRequest } from "./protocol.js";
 import type { TerminalPreservationResult } from "./client.js";
-import type { TerminalCoverageResult, TerminalUniverse } from "./terminal-inventory.js";
+import { TERMINAL_SNAPSHOT_SUFFIX, type TerminalCoverageResult, type TerminalUniverse } from "./terminal-inventory.js";
 import { parseCheckpointRange, serializeCheckpointRange } from "./terminal-range.js";
 
 export type TerminalManifest = TerminalPreservationRequest["manifest"];
@@ -263,7 +263,7 @@ export type TerminalOperationResult =
   | { outcome: "unknown"; reason: string };
 
 export type CaptureOutcome =
-  | { kind: "ok"; base: string; extraRoots: string[]; manifest: TerminalManifest }
+  | { kind: "ok"; base: string; extraRoots: string[]; manifest: TerminalManifest; snapshot?: { commit: string; tree: string } }
   | { kind: "refused"; reason: string };
 export type PrepareOutcome =
   | { pack: Buffer; range: CheckpointRange; digests: { scan: string; transport: string } }
@@ -280,7 +280,8 @@ export interface TerminalOperationDeps {
   capture(onPhase: (phase: "capturing" | "captured", info: { cloneRef: string; bareRef: string; commit?: string }) => Promise<void>): Promise<CaptureOutcome>;
   aggregate(input: { base: string; extraRoots: string[] }): Promise<{ tip: string } | { refused: string }>;
   prepare(range: CheckpointRange | "resolve", expectDigests: { scan: string; transport: string } | undefined, tip: string): Promise<PrepareOutcome>;
-  coverage(universe: Extract<TerminalUniverse, { kind: "proved" }>, manifest: TerminalManifest): TerminalCoverageResult;
+  /** `snapshot` is the capture's own snapshot root, the one extra root a manifest may declare. */
+  coverage(universe: Extract<TerminalUniverse, { kind: "proved" }>, manifest: TerminalManifest, snapshot?: { commit: string; tree: string }): TerminalCoverageResult;
   /** A late local failure (secret remediation, residue) discovered after preparation; undefined when none. */
   recheck(): Promise<string | undefined>;
   boundaryValid(): boolean;
@@ -305,8 +306,17 @@ const kept = (reason: string): TerminalOperationResult => ({ outcome: "kept", re
 const reasonToken = (reason: string): string => reason.toLowerCase().replace(/[^a-z0-9_]+/g, "_").slice(0, 120) || "unknown";
 const iso = (deps: TerminalOperationDeps): string => new Date(deps.now()).toISOString();
 
+/** The snapshot root the record's (MAC-protected) manifest declared at capture, re-presented to the coverage check on
+ *  resume and on the late check. */
+function recordedSnapshot(manifest: TerminalManifest): { commit: string; tree: string } | undefined {
+  const root = manifest.roots.find(r => r.source_id.endsWith(TERMINAL_SNAPSHOT_SUFFIX));
+  return root ? { commit: root.commit, tree: root.tree } : undefined;
+}
+
 function finalResult(record: TerminalOperationRecord): TerminalOperationResult {
   const outcome = terminalFinalOutcome(record);
+  // A block that landed while the send was in flight keeps the factual receipt but never yields head authority.
+  if (outcome && record.localBlock.length > 0) return kept(record.localBlock[0]!);
   if (outcome && record.tip && record.manifest) return { outcome, tip: record.tip, manifest: record.manifest };
   return kept(record.closedReason ?? "closed");
 }
@@ -373,7 +383,7 @@ async function initial(deps: TerminalOperationDeps, input: TerminalOperationInpu
   });
   if (captured.kind === "refused") return recordCreated ? markIncomplete(deps, input, captured.reason) : kept(captured.reason);
   if (!recordCreated) return kept("record_not_created");
-  const cov = deps.coverage(proof.universe, captured.manifest);
+  const cov = deps.coverage(proof.universe, captured.manifest, captured.snapshot);
   if (!cov.ok) return markIncomplete(deps, input, `coverage_${cov.reason}`);
   const agg = await deps.aggregate({ base: captured.base, extraRoots: captured.extraRoots });
   if ("refused" in agg) return markIncomplete(deps, input, `aggregate_${agg.refused}`);
@@ -398,7 +408,7 @@ async function resume(deps: TerminalOperationDeps, input: TerminalOperationInput
   const proof = await proveUniverse(deps);
   if (!proof.ok) return kept(proof.reason);
   if (proof.universe.universeDigest !== rec.universeDigest) return kept("universe_changed");
-  const cov = deps.coverage(proof.universe, rec.manifest);
+  const cov = deps.coverage(proof.universe, rec.manifest, recordedSnapshot(rec.manifest));
   if (!cov.ok) return kept(`coverage_${cov.reason}`);
   const prepared = await deps.prepare(range, { scan: rec.scanDigest, transport: rec.transportDigest }, rec.tip);
   if (!("pack" in prepared)) return prepareFailure(deps, input, prepared, false);
@@ -441,13 +451,18 @@ async function finishAndSend(deps: TerminalOperationDeps, input: TerminalOperati
   const proof = await proveUniverse(deps);
   if (!proof.ok) return lateFailure(deps, input, proof.reason);
   if (proof.universe.universeDigest !== rec.universeDigest) return lateFailure(deps, input, "universe_changed");
-  const cov = deps.coverage(proof.universe, rec.manifest!);
+  const cov = deps.coverage(proof.universe, rec.manifest!, recordedSnapshot(rec.manifest!));
   if (!cov.ok) return lateFailure(deps, input, `coverage_${cov.reason}`);
   const late = await deps.recheck();
   if (late !== undefined) return lateFailure(deps, input, late);
   if (!deps.boundaryValid()) return kept("boundary_invalid");
   const invoked = await store.invoke(input.runId, input.generation, iso(deps));
   if (invoked.kind !== "invoked") return kept(invoked.kind === "blocked" ? invoked.reason : `invoke_${invoked.kind}`);
+  // The boundary can lapse while `invoke` is in flight: nothing is sent, and the lapse is latched so no resume sends.
+  if (!deps.boundaryValid()) {
+    await store.addLocalBlock(input.runId, input.generation, ["boundary_lost"]);
+    return kept("boundary_lost");
+  }
   const req: TerminalPreservationRequest = {
     generation: input.generation, tip: rec.tip!, ...(rec.priorTip !== undefined ? { prior_tip: rec.priorTip } : {}),
     manifest: rec.manifest!, disposition: "preserve", ...(pack.length > 0 ? { pack: pack.toString("base64") } : {}),
@@ -464,6 +479,10 @@ async function finishAndSend(deps: TerminalOperationDeps, input: TerminalOperati
       phase: "closed", appendInvocations: [{ at, outcome: result.outcome }], closedReason: result.outcome,
     });
     if (done.kind !== "ok") return { outcome: "unknown", reason: `record_${done.kind}` };
+    // The factual receipt is recorded above; head authority is returned only when nothing blocked or lapsed meanwhile.
+    const blocked = done.record.localBlock[0] ?? deps.failureFirst();
+    if (blocked !== undefined) return kept(blocked);
+    if (!deps.boundaryValid()) return kept("boundary_lost");
     return { outcome: result.outcome, tip: rec.tip!, manifest: rec.manifest! };
   }
   if (result.kind === "refused") {

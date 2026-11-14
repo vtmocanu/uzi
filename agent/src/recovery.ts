@@ -16,7 +16,7 @@ import type { ExclusionRefusal, MaintenanceExclusion, MaintenanceWriterExclusion
 import { MaintenanceResources as M1MaintenanceResources, RecoveryMaintenance, type MaintenanceAdmission } from "./recovery-maintenance.js";
 import { classifyRecoveryOrigin } from "./recovery-origin.js";
 import { prepareFrozenHeld, prepareFrozenHeldPinned, validFrozenHeldPolicy, type FrozenHeldPolicy, type HeldGit, type TerminalDigestGit } from "./frozen-held.js";
-import { checkManifestCoverage, readTerminalSourceUniverse, type TerminalUniverse } from "./terminal-inventory.js";
+import { checkManifestCoverage, classifyTerminalOutput, readTerminalSourceUniverse, type TerminalUniverse } from "./terminal-inventory.js";
 // Durable run recovery: worker capture, authenticated journal, and model-free
 // restart-safe upload (PRD #1296 M3, decisions D1/D3/D5/D6/D9).
 //
@@ -1910,7 +1910,7 @@ export class RecoveryCoordinator {
           }, range);
         } catch { MaintenanceBudget.current()?.check(); return { reason: "preparation_failed" }; }
       },
-      coverage: (universe, manifest) => checkManifestCoverage(universe, manifest, { currentFlight: false }),
+      coverage: (universe, manifest, snapshot) => checkManifestCoverage(universe, manifest, { currentFlight: false, ...(snapshot ? { snapshot } : {}) }),
       recheck: async () => {
         if (!await ctx.prove()) return "boundary_unproved";
         if (!await this.restrictionsAllowCapturedC(record)) return "restrictions";
@@ -3967,7 +3967,9 @@ export class RecoveryCoordinator {
       if (hold !== "open") { result = hold === "settled" ? "settled" : "kept"; return; }
       if (input.signal?.aborted || residueQuarantine() !== undefined) { result = "kept"; return; }
       // #4007 slice B M6-V: with the gate on, the work is preserved before any held FINAL can be minted this pass.
-      if (this.terminalPreservationEnabled()) {
+      // Only branch-source kinds enter it; every other kind keeps the shipped held flow, as with the gate off.
+      if (this.terminalPreservationEnabled() &&
+          classifyTerminalOutput({ kind: record.kind, adoptedSource: true }) === "branch_source") {
         if (!await this.restrictionsAllowCapturedC(record)) { result = "kept"; return; }
         const tp = await this.runGuardedTerminalPreservation(record, input, { failOrigin: terminal?.fail_origin, prove });
         if (tp.outcome === "kept" && (tp.reason === "secret_found" || tp.reason === "secret_found_unlatched")) {

@@ -57,7 +57,7 @@ export function classifyTerminalOutput(facts: TerminalOutputFacts): TerminalOutp
 export type TerminalUnprovedReason =
   | "unknown_read" | "thrown" | "foreign_owner" | "predecessor" | "join_contradiction" | "duplicate"
   | "record_outside_universe" | "foreign_bare" | "cap" | "deadline" | "local_ref" | "non_current_clone_present" | "g10_unreachable_root"
-  | "current_missing" | "identity_mismatch" | "ledger_attempt_clone_missing";
+  | "current_missing" | "identity_mismatch" | "ledger_attempt_clone_missing" | "record_root_uncovered";
 
 export interface TerminalSource {
   sourceId: string;
@@ -84,7 +84,7 @@ const TERMINAL_UNIVERSE_MAX_BARES = 64;
 const TERMINAL_UNIVERSE_MAX_ATTEMPTS = 1024;
 const TERMINAL_UNIVERSE_MAX_RECORDS = 256;
 
-type UniverseGit = Pick<GitCache, "listRunBares" | "readInventoryCloneHeads" | "readTerminalAttribution" | "readTerminalCloneLocalRefs">;
+type UniverseGit = Pick<GitCache, "listRunBares" | "readInventoryCloneHeads" | "readTerminalAttribution" | "readTerminalCloneLocalRefs" | "ancestry">;
 type UniverseRecovery = Pick<RecoveryCoordinator, "readTerminalRecords">;
 
 export interface TerminalUniverseInput {
@@ -216,6 +216,7 @@ export async function readTerminalSourceUniverse(input: TerminalUniverseInput): 
     if (read.kind !== "records") throw new Unproved(expired() ? "deadline" : "unknown_read", "recovery records");
     if (read.records.length > TERMINAL_UNIVERSE_MAX_RECORDS) throw new Unproved("cap", "records");
     const generations = new Set<number>();
+    const boundRecords: Array<{ captureId: string; generation: number | null; sourceSha: string; bundle: string | null }> = [];
     const explicitRoots = new Set<string>([currentSource.head, ...owedAll]);
     for (const record of read.records) {
       // Binding rule: a record binds to the proved source (the current present attempt) when it is on the same branch
@@ -233,7 +234,22 @@ export async function readTerminalSourceUniverse(input: TerminalUniverseInput): 
         throw new Unproved("record_outside_universe", `bundle of ${record.captureId}`);
       }
       if (boundToCurrent && record.generation !== undefined) generations.add(record.generation);
+      if (boundToCurrent) {
+        // A bound record's sourceSha must itself be covered: the head, an owed root, or an ancestor of the head (read on
+        // the bare). Anything else is a root the manifest would never declare.
+        const covered = async (sha: string): Promise<boolean> =>
+          explicitRoots.has(sha) || await git.ancestry(currentSource.bare, sha, currentSource.head) === "ancestor";
+        // A frozen inventory record's sourceSha is a synthetic aggregate; its real sources are the original ones.
+        const originals = record.originalSourceSha === undefined ? [] :
+          [record.originalSourceSha, ...(record.inventoryCurrentSha ? [record.inventoryCurrentSha] : []), ...(record.originalRoots ?? []).map(r => r.sha)];
+        if (!await covered(record.sourceSha) && !(originals.length > 0 && (await Promise.all(originals.map(covered))).every(Boolean))) {
+          throw new Unproved("record_root_uncovered", `record ${record.captureId}`);
+        }
+        boundRecords.push({ captureId: record.captureId, generation: record.generation ?? null, sourceSha: record.sourceSha,
+          bundle: record.bundlePath === undefined ? null : path.basename(record.bundlePath) });
+      }
     }
+    boundRecords.sort((a, b) => (a.captureId < b.captureId ? -1 : a.captureId > b.captureId ? 1 : (a.generation ?? 0) - (b.generation ?? 0)));
     currentSource.recordGenerations = [...generations].sort((a, b) => a - b);
 
     const refs = await git.readTerminalCloneLocalRefs(currentSource.clonePath, currentSource.head);
@@ -244,7 +260,7 @@ export async function readTerminalSourceUniverse(input: TerminalUniverseInput): 
     for (const commit of [...owedAll].sort()) if (commit !== currentSource.head) roots.push({ commit, origin: "owed" });
     sources.sort((a, b) => (a.sourceId < b.sourceId ? -1 : 1));
     roots.sort((a, b) => (a.commit === b.commit ? (a.origin < b.origin ? -1 : 1) : a.commit < b.commit ? -1 : 1));
-    return { kind: "proved", sources, roots, universeDigest: sha256(canonicalJson({ sources, roots })) };
+    return { kind: "proved", sources, roots, universeDigest: sha256(canonicalJson({ sources, roots, records: boundRecords })) };
   } catch (err) {
     if (err instanceof Unproved) {
       return { kind: "unproved", reason: err.reason, ...(err.subreason === undefined ? {} : { subreason: err.subreason }),
@@ -255,6 +271,9 @@ export async function readTerminalSourceUniverse(input: TerminalUniverseInput): 
 }
 
 // ---- manifest coverage ----------------------------------------------------------------------------------
+
+/** A snapshot root's `source_id` is the owning source's id plus this suffix. */
+export const TERMINAL_SNAPSHOT_SUFFIX = ":snapshot";
 
 type Manifest = Pick<TerminalPreservationRequest["manifest"], "roots" | "abandoned">;
 
@@ -273,9 +292,10 @@ export type TerminalCoverageResult =
 export function checkManifestCoverage(
   universe: Extract<TerminalUniverse, { kind: "proved" }>,
   manifest: Manifest,
-  opts: { currentFlight: boolean; expectedTrees?: ReadonlyMap<string, string> },
+  opts: { currentFlight: boolean; expectedTrees?: ReadonlyMap<string, string>; snapshot?: { commit: string; tree: string } },
 ): TerminalCoverageResult {
   const fail = (reason: Extract<TerminalCoverageResult, { ok: false }>["reason"], detail: string): TerminalCoverageResult => ({ ok: false, reason, detail });
+  let snapshotSeen = false;
   const bySource = new Map(universe.sources.map(s => [s.sourceId, s]));
   const abandonedKeys = new Set<string>();
   for (const item of manifest.abandoned) {
@@ -290,12 +310,22 @@ export function checkManifestCoverage(
     const key = `${root.source_id}\0${root.commit}`;
     if (seen.has(key)) return fail("duplicate_root", root.commit);
     seen.add(key);
+    if (root.source_id.endsWith(TERMINAL_SNAPSHOT_SUFFIX)) {
+      // The one declared extra root: the capture's own snapshot commit, never a universe root.
+      const owner = bySource.get(root.source_id.slice(0, -TERMINAL_SNAPSHOT_SUFFIX.length));
+      if (!opts.snapshot || snapshotSeen || !owner || owner.attemptId !== root.attempt_id) return fail("extra_root", root.commit);
+      if (root.commit !== opts.snapshot.commit) return fail("commit_mismatch", root.commit);
+      if (root.tree !== opts.snapshot.tree) return fail("tree_mismatch", root.commit);
+      snapshotSeen = true;
+      continue;
+    }
     const source = bySource.get(root.source_id);
     if (!source || source.attemptId !== root.attempt_id) return fail("extra_source", root.source_id);
     manifestCommits.add(root.commit);
     sourcesWithRoot.add(root.source_id);
     if (opts.expectedTrees && opts.expectedTrees.get(root.commit) !== root.tree) return fail("tree_mismatch", root.commit);
   }
+  if (opts.snapshot && !snapshotSeen) return fail("missing_root", opts.snapshot.commit);
   for (const source of universe.sources) {
     if (!sourcesWithRoot.has(source.sourceId)) return fail("missing_source", source.sourceId);
     if (!manifest.roots.some(r => r.source_id === source.sourceId && r.commit === source.head)) return fail("commit_mismatch", source.sourceId);

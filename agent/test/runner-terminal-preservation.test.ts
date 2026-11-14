@@ -8,8 +8,11 @@ import { fixture as codexReapFixture } from "./codex-reap-fixture.js";
 import type { StateRequest } from "../src/protocol.js";
 import type { RunContext } from "../src/executor.js";
 import { Outbox } from "../src/outbox.js";
+import { resolvePendingTerminal } from "../src/terminal-resolve.js";
+import { CodexBoundaryError } from "../src/codex/safety.js";
+import type { Logger } from "../src/log.js";
 import { nullLogger } from "./helpers.js";
-import { api, baseUrl, client, fakeGitlab, fx, git, gitlabClaim, installHarness, runner } from "./runner-harness.js";
+import { api, baseUrl, client, fakeGitlab, fx, git, gitlabClaim, installHarness, runner, runnerWith } from "./runner-harness.js";
 import {
   mergeTerminalRecord, type TerminalDelta, type TerminalManifest, type TerminalOperationRecord, type TerminalOperationStore,
 } from "../src/terminal-operation.js";
@@ -424,6 +427,10 @@ interface Drive {
   emptyDiff?: boolean;
   failRun?: string;
   deps?: NonNullable<TerminalPreservationTestHooks["deps"]>;
+  /** Every completed-report response is lost (the server applied it): the terminal journal stays pending for a replay. */
+  lostAcks?: boolean;
+  /** Codex: the finalize boundary fails after the lane prepared and before it invoked, then again after the publish returned. */
+  unwind?: boolean;
 }
 interface Driven {
   completed: StateRequest[];
@@ -435,6 +442,18 @@ interface Driven {
   order: string[];
   lane: unknown[];
   sites: Array<{ signal?: AbortSignal; deadlineAt?: number; at: number }>;
+  /** The state of the fake server's terminal contribution for the completing generation (undefined: none recorded). */
+  contribution?: "published" | "refused" | "publish_unknown";
+  /** Completed reports the fake server verified and released custody for, and the reasons it refused the others. */
+  serverReleases: number;
+  refusals: string[];
+  /** Whether the worker has been told to release custody (the worker only does so on an authenticated receipt). */
+  custodyReleasedByWorker: () => boolean;
+  journal: () => Promise<{ body: StateRequest } | undefined>;
+  /** The real worker-side replay of the pending terminal journal over client.reportState. */
+  replay: () => Promise<void>;
+  warnings: string[];
+  unwindSignal: AbortSignal;
 }
 
 async function drive(t: TestContext, d: Drive = {}): Promise<Driven> {
@@ -449,8 +468,13 @@ async function drive(t: TestContext, d: Drive = {}): Promise<Driven> {
   api.setRegisterProtocolFeatures(["claim_generation_fence", "recovery_inventory_v1", feature, "terminal_rejection_report",
     ...(kind === "mr_rework" ? ["refresh_publication_context_v1"] : [])]);
   const registration = await client.register("tp-lane", undefined, undefined, undefined, ["claim_generation_fence", "recovery_inventory_v1", feature]);
-  const out: Driven = { completed: [], failed: [], finalHead: "", sends: 0, withBoundaryCalls: [], quiesced: 0, order: [], lane: [], sites: [] };
+  const out: Driven = {
+    completed: [], failed: [], finalHead: "", sends: 0, withBoundaryCalls: [], quiesced: 0, order: [], lane: [], sites: [],
+    serverReleases: 0, refusals: [], warnings: [], unwindSignal: undefined as never,
+    custodyReleasedByWorker: () => !open, journal: async () => undefined, replay: async () => undefined,
+  };
   let open = true;
+  let replaying = false;
   client.getRunOwnership = async () => ({
     status: api.states.some(s => s.body.status === "completed") ? "completed" : "running",
     claim_generation: claim.claim_generation, inventory_guarded: true,
@@ -470,11 +494,24 @@ async function drive(t: TestContext, d: Drive = {}): Promise<Driven> {
     return { ok: true, body: { published: true, ref: `refs/uzi-checkpoints/${branch}` } };
   };
   const safetyFx = d.codex ? codexReapFixture([], () => false) : undefined;
+  const unwindControl = new AbortController();
+  out.unwindSignal = unwindControl.signal;
   if (safetyFx) {
     t.after(() => fs.rmSync(safetyFx.root, { recursive: true, force: true }));
     const wb = safetyFx.safety.withBoundary.bind(safetyFx.safety);
     safetyFx.safety.withBoundary = (request, action) => {
       out.withBoundaryCalls.push(request.boundary);
+      if (d.unwind && request.boundary === "finalize") {
+        // The real facade runs the real publish; only its permit signal is ours (aborted mid-lane by the prepare dep) and the
+        // boundary reports a failure once the publish has returned, exactly as a deadline expiring around a committed publish does.
+        return wb(request, async permit => {
+          // The permit keeps its identity (spawnBoundaryProcess refuses a copy as stale); only the signal the runner reads is ours.
+          const realSignal = permit.signal;
+          Object.defineProperty(permit, "signal", { value: AbortSignal.any([realSignal, unwindControl.signal]), configurable: true });
+          await action(permit);
+          throw new CodexBoundaryError("action", [{ category: "protocol", message: "finalize deadline" } as never]);
+        });
+      }
       return wb(request, action);
     };
   }
@@ -496,21 +533,26 @@ async function drive(t: TestContext, d: Drive = {}): Promise<Driven> {
           roots: [{ source_id: "s1", attempt_id: "at1", commit: d.rootCommit ?? out.finalHead, tree: B }], abandoned: [] } };
       },
       aggregate: async () => ({ tip: out.finalHead }),
-      prepare: async () => (d.prepareDelayMs ? new Promise<void>(res => setTimeout(res, d.prepareDelayMs)) : Promise.resolve()).then(() => ({ pack: Buffer.alloc(0), range: { tipSha: out.finalHead, excludeSha: C }, digests: { scan: "s", transport: "t" } })),
+      prepare: async () => (d.prepareDelayMs ? new Promise<void>(res => setTimeout(res, d.prepareDelayMs)) : Promise.resolve()).then(() => {
+        if (d.unwind) unwindControl.abort();
+        return { pack: Buffer.alloc(0), range: { tipSha: out.finalHead, excludeSha: C }, digests: { scan: "s", transport: "t" } };
+      }),
       coverage: () => ({ ok: true }),
       recheck: async () => undefined,
       send: async () => {
         out.sends++;
         out.order.push("send");
-        if (send === "throws") throw new Error("send exploded");
-        if (send === "refused") return { kind: "refused", reason: "forge_unavailable", httpStatus: 409 } as unknown as TerminalPreservationResult;
-        if (send === "unknown") return { kind: "unknown", cause: "transport" };
+        if (send === "throws") { out.contribution = "publish_unknown"; throw new Error("send exploded"); }
+        if (send === "refused") { out.contribution = "refused"; return { kind: "refused", reason: "forge_unavailable", httpStatus: 409 } as unknown as TerminalPreservationResult; }
+        if (send === "unknown") { out.contribution = "publish_unknown"; return { kind: "unknown", cause: "transport" }; }
+        out.contribution = "published";
         return FINAL;
       },
       ...d.deps,
     },
   };
-  const r = runner({ ...(safetyFx ? { safety: safetyFx.safety } : {}), run: async (ctx: RunContext) => {
+  const warnLog: Logger = { ...nullLogger(), warn: (message: string) => { out.warnings.push(message); }, child: () => warnLog };
+  const executor = { ...(safetyFx ? { safety: safetyFx.safety } : {}), run: async (ctx: RunContext) => {
     const clone = ctx.worktreePath;
     commit(clone, "checkpoint.txt");
     await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] } });
@@ -518,7 +560,8 @@ async function drive(t: TestContext, d: Drive = {}): Promise<Driven> {
     forge.pr.head = out.finalHead;
     if (d.failRun) throw new Error(d.failRun);
     return { branch: ctx.branch };
-  } } as never, forge.gitlab, "tp-lane-key", {
+  } } as never;
+  const r = runnerWith(() => ({ executor }), forge.gitlab, "tp-lane-key", warnLog, {
     outbox, checkpointIntervalMs: 1, checkpointTickIntervalMs: 0,
     ...(hooks ? { terminalPreservationTestOverride: hooks } : {}),
   });
@@ -540,15 +583,40 @@ async function drive(t: TestContext, d: Drive = {}): Promise<Driven> {
     if (body.status === "completed") {
       out.completed.push(body);
       const ack = { ...wire.ack, run: { ...wire.ack.run, id: claim.run_id, worker_id: registration.worker_id } };
-      if (body.completion_final_head) ack.completed_publication_receipt = {
-        ...literal, run_id: claim.run_id, worker_id: registration.worker_id, generation: claim.claim_generation,
-        repo_id: claim.repo!.id, branch, final_head: out.finalHead, observed_branch_head: out.finalHead, mr_iid: body.mr_iid };
-      else delete ack.completed_publication_receipt;
+      // Mirrors workersvc verifyCompletedPublication: a body without the frozen head is not capable, and a head is
+      // released only while the generation's terminal contribution is absent or published/recorded (terminalGateReason).
+      const reason = !body.completion_final_head ? "completion_identity_missing"
+        : out.contribution === undefined || out.contribution === "published" ? ""
+          : out.contribution === "refused" ? "terminal_preservation_refused" : "terminal_preservation_pending";
+      if (reason === "") {
+        out.serverReleases++;
+        ack.completed_publication_receipt = {
+          ...literal, run_id: claim.run_id, worker_id: registration.worker_id, generation: claim.claim_generation,
+          repo_id: claim.repo!.id, branch, final_head: out.finalHead, observed_branch_head: out.finalHead, mr_iid: body.mr_iid };
+      } else {
+        out.refusals.push(reason);
+        delete ack.completed_publication_receipt;
+      }
+      if (d.lostAcks && !replaying) throw new TypeError("response lost after the server applied the completed report");
       return Response.json(ack);
     }
     if (body.status === "failed") out.failed.push(body);
     return response;
   });
+  out.journal = () => outbox.readTerminalJournal(claim.run_id, claim.claim_generation!) as Promise<{ body: StateRequest } | undefined>;
+  out.replay = async () => {
+    replaying = true;
+    const fenced = (body: StateRequest): StateRequest => ({ ...body, claim_generation: claim.claim_generation! });
+    // The worker's boot replay: resolvePendingTerminal over client.reportState, stamped with the journal's generation.
+    await resolvePendingTerminal(r.protectRecoveryTerminalDeps({ outbox, client, gapFillMax: 100, terminalMaxBytes: 1 << 20, log: nullLogger() } as never), {
+      runId: claim.run_id, claimGeneration: claim.claim_generation!,
+      send: async body => {
+        const ack = await client.reportState(claim.run_id, fenced(body));
+        await r.observeSettlementTerminalAck(claim.run_id, claim.claim_generation!, fenced(body), ack);
+        return ack;
+      },
+    });
+  };
   await r.execute(claim);
   out.quiesced = quiesce.mock.callCount();
   return out;
@@ -641,6 +709,67 @@ describe("terminal preservation through a full execute", { concurrency: false },
       if (codex) assert.ok(site.signal instanceof AbortSignal, "the Codex permit signal reaches the lane");
     });
   }
+
+  // Release ordering: the worker-side half (the frozen body, its journal, its replay) against a fake server whose
+  // completed-publication verification follows workersvc verifyCompletedPublication.
+  for (const codex of [false, true]) {
+    const harness = codex ? "codex" : "claude";
+    for (const send of ["refused", "unknown", "throws"] as const) {
+      it(`${harness}: ${send} terminal contribution: the journaled body and its replay carry no head, and the server refuses release`, async t => {
+        const out = await drive(t, { codex, send, lostAcks: true });
+        const journaled = await out.journal();
+        assert.ok(journaled, "the completed terminal is journaled write-ahead and still pending after the lost responses");
+        assert.equal(journaled.body.completion_final_head, undefined, "no unproven head in the journal");
+        assert.ok(out.completed.length > 0 && out.completed.every(b => b.completion_final_head === undefined), "no unproven head on any initial send");
+        assert.equal(out.custodyReleasedByWorker(), false);
+        await out.replay();
+        const replayed = out.completed.at(-1)!;
+        assert.equal(replayed.completion_final_head, undefined, "the replayed body is the journaled one: still no head");
+        assert.equal(normalise(replayed, [out.finalHead]), COMPLETED_NO_HEAD);
+        assert.equal(out.serverReleases, 0, "the server never releases for an unproven terminal");
+        assert.ok(out.refusals.length > 0 && out.refusals.every(r => r === "completion_identity_missing"));
+        assert.equal(out.custodyReleasedByWorker(), false, "custody stays open");
+        assert.equal(out.failed.length, 0);
+      });
+    }
+
+    it(`${harness}: a published contribution: the journaled body carries the head, the replay is released by the server`, async t => {
+      const out = await drive(t, { codex, lostAcks: true });
+      const journaled = await out.journal();
+      assert.ok(journaled);
+      assert.equal(journaled.body.completion_final_head, out.finalHead, "the proven head is journaled");
+      assert.ok(out.serverReleases > 0, "the server verified the head against the published contribution and released");
+      assert.equal(out.custodyReleasedByWorker(), false, "the worker was never told: every response was lost");
+      const before = out.completed.length;
+      await out.replay();
+      assert.equal(out.completed.length, before + 1);
+      assert.equal(normalise(out.completed.at(-1), [out.finalHead]), COMPLETED_WITH_HEAD);
+      assert.equal(await out.journal(), undefined, "the replay retires the journal");
+      assert.deepEqual(out.refusals, []);
+    });
+  }
+
+  it("the fake server's rule: a head over an unproven contribution is refused, a headless body never verified", async t => {
+    const out = await drive(t, { send: "unknown" });
+    assert.equal(out.contribution, "publish_unknown");
+    const forged = { ...out.completed[0]!, completion_final_head: out.finalHead };
+    const ack = await client.reportState(literal.run_id, forged as StateRequest).catch(() => undefined);
+    assert.equal(ack?.completedPublicationReceipt, undefined);
+    assert.equal(out.refusals.at(-1), "terminal_preservation_pending", "the model refuses a head over a pending contribution");
+    assert.equal(out.serverReleases, 0);
+  });
+
+  it("codex committed unwind: a finalize boundary that fails after the lane prepared and before it invoked sends nothing, proves no head, and still reports the committed publication", async t => {
+    const out = await drive(t, { codex: true, unwind: true });
+    assert.deepEqual(out.order, ["capture"], "the lane captured and prepared, then never sent");
+    assert.equal(out.sends, 0, "zero terminal-preservation sends");
+    assert.ok(out.warnings.some(w => /Codex finalize boundary failed after committed publish/.test(w)), "the real finalize catch took the committed arm");
+    assert.equal(out.failed.length, 0, "the committed publication is not reported failed");
+    assert.equal(out.completed.length, 1);
+    assert.equal(normalise(out.completed[0], [out.finalHead]), COMPLETED_NO_HEAD, "the deferred committed report carries the branch and MR facts and no head");
+    assert.equal(out.serverReleases, 0);
+    assert.deepEqual(statuses(), ["running", "running", "completed"]);
+  });
 
   it("a typed phasePublish failure keeps its typed failure and the lane runs in place, once", async t => {
     const on = await drive(t, { emptyDiff: true });

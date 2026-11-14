@@ -18,7 +18,7 @@ import type { RecoveryCoordinator } from "./recovery.js";
 import type { TerminalPreservationRequest } from "./protocol.js";
 import { terminalPreservationActive, type TerminalPreservationTestHooks } from "./terminal-preservation.js";
 import {
-  checkManifestCoverage, classifyTerminalOutput, readTerminalSourceUniverse,
+  checkManifestCoverage, classifyTerminalOutput, readTerminalSourceUniverse, TERMINAL_SNAPSHOT_SUFFIX,
   type TerminalOutputLabel, type TerminalUniverse,
 } from "./terminal-inventory.js";
 import {
@@ -59,7 +59,7 @@ export interface TerminalLaneFlight {
 export interface TerminalLaneBody { status: string; fail_origin?: string; failure_reason?: string }
 
 type LaneGit = Pick<GitCache, "captureTerminalSnapshot" | "buildTerminalAggregate" | "listRunBares" | "readInventoryCloneHeads" |
-  "readTerminalAttribution" | "readTerminalCloneLocalRefs" | "revParse" | "defaultBranchTip"> & HeldGit & TerminalDigestGit;
+  "readTerminalAttribution" | "readTerminalCloneLocalRefs" | "ancestry" | "revParse" | "defaultBranchTip"> & HeldGit & TerminalDigestGit;
 
 export interface TerminalLaneEnv {
   git: LaneGit;
@@ -188,11 +188,14 @@ async function run(env: TerminalLaneEnv, flight: TerminalLaneFlight, body: Termi
           if (!tree) return { kind: "refused", reason: "tree_unreadable" };
           roots.push({ source_id: source.sourceId, attempt_id: source.attemptId, commit: r.commit, tree });
         }
+        // A captured snapshot is a commit of its own that the aggregate is built on: it is declared as the one extra root.
+        const snapshot = snap.kind === "captured" ? { commit: snap.root, tree: snap.tree } : undefined;
+        if (snapshot) roots.push({ source_id: `${source.sourceId}${TERMINAL_SNAPSHOT_SUFFIX}`, attempt_id: source.attemptId, ...snapshot });
         const manifest: TerminalManifest = {
           run_id: flight.runId, generation: flight.claimGeneration, worker_id: workerId, roots,
           abandoned: snap.ignored.files > 0 ? [{ class: "ignored", source_id: source.sourceId, extents: snap.ignored }] : [],
         };
-        return { kind: "ok", base: snap.root, extraRoots: proved.roots.map(r => r.commit), manifest };
+        return { kind: "ok", base: snap.root, extraRoots: proved.roots.map(r => r.commit), manifest, ...(snapshot ? { snapshot } : {}) };
       },
       aggregate: input => env.git.buildTerminalAggregate(barePath, { ...input, runId: flight.runId, generation: flight.claimGeneration }),
       prepare: async (range: CheckpointRange | "resolve", expectDigests, tip): Promise<PrepareOutcome> => {
@@ -207,7 +210,7 @@ async function run(env: TerminalLaneEnv, flight: TerminalLaneFlight, body: Termi
         }, range);
         return "pack" in out ? out : { ...out, ...(out.reason === "secret_found" ? { flaggedCommits: flagged } : {}) };
       },
-      coverage: (universe, manifest) => checkManifestCoverage(universe, manifest, { currentFlight: true }),
+      coverage: (universe, manifest, snapshot) => checkManifestCoverage(universe, manifest, { currentFlight: true, ...(snapshot ? { snapshot } : {}) }),
       // The late gate before the send: the latches and the policy again, then the remediation hold against the prepared tip
       // (a hold that appeared after prepare must stop the send).
       recheck: async () => firstFailure(env, body) ?? (preparedTip !== undefined && await env.remediationHold(preparedTip)

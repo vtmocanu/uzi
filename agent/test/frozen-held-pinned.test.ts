@@ -1,6 +1,13 @@
 import assert from "node:assert/strict";
-import { it } from "node:test";
+import { after, describe, it, type TestContext } from "node:test";
 import { Readable } from "node:stream";
+import { execFileSync } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
+import { makeFixture, type Fixture } from "./fixture-repo.js";
+import { nullLogger, testGitCacheOptions } from "./helpers.js";
+import { GitCache } from "../src/git.js";
+import { defaultGitleaksShim } from "./gitleaks-shim.js";
 import { MaintenanceBudget } from "../src/maintenance-budget.js";
 import { prepareFrozenHeld, prepareFrozenHeldPinned, type FrozenHeldPolicy, type HeldGit } from "../src/frozen-held.js";
 import { parseCheckpointRange, serializeCheckpointRange } from "../src/terminal-range.js";
@@ -221,4 +228,127 @@ it("range parse is strict", () => {
     JSON.stringify({ tipSha: tip, excludeSha: floor, defaultBlobSha: 5 })]) {
     assert.equal(parseCheckpointRange(bad), undefined, bad);
   }
+});
+
+// ---- replay over a real GitCache and real bare repositories ---------------------------------------------------
+// The retry of a pinned held publication must use the persisted range verbatim: the default branch moving between
+// attempts changes what a fresh resolve would return, so a retry that re-resolved would publish different bytes.
+
+const GIT_ENV = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null", GIT_TERMINAL_PROMPT: "0" };
+const REAL_BRANCH = "agent/issue-77";
+const sh = (cwd: string, ...args: string[]): string =>
+  execFileSync("git", ["-C", cwd, ...args], { env: GIT_ENV, encoding: "utf8" }).trim();
+function commitFile(repo: string, name: string, content: string): string {
+  fs.writeFileSync(path.join(repo, name), content);
+  sh(repo, "add", ".");
+  sh(repo, "-c", "commit.gpgsign=false", "commit", "-m", `edit ${name}`);
+  return sh(repo, "rev-parse", "HEAD");
+}
+
+describe("pinned replay over a real GitCache", () => {
+  const roots: Fixture[] = [];
+  after(() => { for (const f of roots.splice(0)) f.cleanup(); });
+
+  async function rig() {
+    const fx = makeFixture();
+    roots.push(fx);
+    const cache = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({ gitleaksBin: defaultGitleaksShim() }));
+    const bare = await cache.ensureClone(fx.originPath);
+    const work = fx.originPath;
+    sh(work, "config", "user.email", "t@t");
+    sh(work, "config", "user.name", "t");
+    const sync = () => { sh(bare, "fetch", "origin", "+refs/heads/*:refs/remotes/origin/*"); };
+    const root = sh(work, "rev-parse", "HEAD");
+    return { fx, cache, bare, work, sync, root };
+  }
+  type Rig = Awaited<ReturnType<typeof rig>>;
+
+  /** The object set of a pack, read by unpacking it into a throwaway bare repository. */
+  function objects(r: Rig, pack: Buffer): string[] {
+    const probe = fs.mkdtempSync(path.join(r.fx.dataDir, "probe-"));
+    sh(probe, "init", "-q", "--bare");
+    execFileSync("git", ["-C", probe, "unpack-objects", "-q"], { env: GIT_ENV, input: pack });
+    return execFileSync("git", ["-C", probe, "cat-file", "--batch-all-objects", "--batch-check"], { env: GIT_ENV, encoding: "utf8" })
+      .split("\n").filter(Boolean).sort();
+  }
+
+  type Prepared = Exclude<Awaited<ReturnType<typeof prepareFrozenHeldPinned>>, { reason: string }>;
+  const input = (r: Rig, tipSha: string, extra: Record<string, unknown> = {}) => ({
+    git: r.cache as unknown as HeldGit, barePath: r.bare, branch: REAL_BRANCH, sourceSha: tipSha, policy: base,
+    deadlineMs: 60_000, defaultBranch: "main", ...extra,
+  });
+
+  /** First attempt resolves; the default branch moves; the retry carries the persisted range. */
+  async function replay(t: TestContext, r: Rig, tipSha: string, moveDefault: () => void) {
+    const resolve = t.mock.method(r.cache, "resolveCheckpointRange");
+    const first = await prepareFrozenHeldPinned(input(r, tipSha), "resolve");
+    assert.ok("pack" in first, `first attempt prepared: ${"reason" in first ? first.reason : ""}`);
+    assert.equal(resolve.mock.callCount(), 1);
+    const persisted = parseCheckpointRange(serializeCheckpointRange(first.range));
+    assert.deepEqual(persisted, first.range, "the persisted record round-trips exactly");
+    moveDefault();
+    r.sync();
+    const second = await prepareFrozenHeldPinned(input(r, tipSha, { expectDigests: first.digests }), persisted!);
+    assert.ok("pack" in second, `retry prepared: ${"reason" in second ? second.reason : ""}`);
+    assert.equal(resolve.mock.callCount(), 1, "the retry never re-resolves the range");
+    assert.deepEqual(second.range, first.range);
+    assert.deepEqual(second.digests, first.digests);
+    assert.deepEqual(objects(r, second.pack), objects(r, first.pack), "the retry publishes the same object set");
+    return { first: first as Prepared, persisted: persisted!, resolve };
+  }
+
+  async function tampered(r: Rig, tipSha: string, persisted: CheckpointRange, digests: Prepared["digests"], over: Partial<CheckpointRange>) {
+    return prepareFrozenHeldPinned(input(r, tipSha, { expectDigests: digests }), { ...persisted, ...over });
+  }
+
+  it("zero range with no origin branch: packExcludeShas pinned, replay stable, tamper refused", async t => {
+    const r = await rig();
+    const parent = commitFile(r.work, "a.txt", "a\n");
+    const tip = commitFile(r.work, "b.txt", "b\n");
+    commitFile(r.work, "c.txt", "c\n");
+    r.sync();
+    const out = await replay(t, r, tip, () => { commitFile(r.work, "d.txt", "d\n"); });
+    assert.deepEqual(out.first.range.packExcludeShas, [parent], "a zero range excludes the tip's literal parents");
+    assert.equal(out.first.range.excludeSha, tip);
+    const bad = await tampered(r, tip, out.persisted, out.first.digests, { packExcludeShas: [] });
+    assert.equal((bad as { reason: string }).reason, "digest_mismatch");
+  });
+
+  it("zero range at a root commit: an empty packExcludeShas survives the round trip and the replay", async t => {
+    const r = await rig();
+    commitFile(r.work, "a.txt", "a\n");
+    r.sync();
+    const out = await replay(t, r, r.root, () => { commitFile(r.work, "d.txt", "d\n"); });
+    assert.deepEqual(out.first.range.packExcludeShas, [], "a root commit has no parents to exclude");
+    const bad = await tampered(r, r.root, out.persisted, out.first.digests, { packExcludeShas: [r.root] });
+    assert.ok("reason" in bad && ["digest_mismatch", "digest_unavailable"].includes(bad.reason), "a tampered root range is refused, never published");
+  });
+
+  it("selective pack: the pinned defaultBlobSha is replayed after the default branch moves", async t => {
+    const r = await rig();
+    // The origin branch sits at an earlier checkpoint F0, so the pack floor is F0 and the default is merged above it.
+    sh(r.work, "checkout", "-q", "-b", REAL_BRANCH);
+    const f0 = commitFile(r.work, "p0.txt", "checkpointed\n");
+    sh(r.work, "checkout", "-q", "-b", "wip");
+    fs.writeFileSync(path.join(r.work, "u.txt"), "Z\n");
+    commitFile(r.work, "p.txt", "private\n");
+    sh(r.work, "checkout", "-q", "main");
+    const d1 = commitFile(r.work, "s.txt", "X\n");
+    sh(r.work, "checkout", "-q", "wip");
+    sh(r.work, "-c", "commit.gpgsign=false", "merge", "-q", "--no-ff", "-m", "merge default", "main");
+    const tip = sh(r.work, "rev-parse", "HEAD");
+    sh(r.work, "checkout", "-q", "main");
+    r.sync();
+    const out = await replay(t, r, tip, () => { commitFile(r.work, "u.txt", "Z\n"); });
+    assert.equal(out.first.range.excludeSha, f0);
+    assert.equal(out.first.range.defaultBlobSha, d1, "the selective pack is pinned to the default tip at first resolution");
+    const blobX = sh(r.work, "rev-parse", `${d1}:s.txt`), blobP = sh(r.work, "rev-parse", `${tip}:p.txt`);
+    const has = (pack: Buffer, blob: string) => objects(r, pack).some(l => l.startsWith(`${blob} blob`));
+    assert.equal(has(out.first.pack, blobX), false, "a blob the pinned default carries is omitted");
+    assert.equal(has(out.first.pack, blobP), true, "the run's own blob is carried");
+    const fresh = await r.cache.resolveCheckpointRange(r.bare, REAL_BRANCH, { tipSha: tip, defaultBranch: "main" });
+    assert.notEqual(fresh?.defaultBlobSha, d1, "control: a fresh resolve after the move would have changed the range");
+    const bad = await tampered(r, tip, out.persisted, out.first.digests, { defaultBlobSha: undefined });
+    assert.equal((bad as { reason: string }).reason, "digest_mismatch");
+  });
 });

@@ -660,6 +660,88 @@ describe("terminal operation engine", () => {
   });
 });
 
+describe("terminal operation final authority", () => {
+  const SNAP = { commit: C, tree: B };
+  const SNAP_MANIFEST: TerminalManifest = {
+    ...MANIFEST, roots: [...MANIFEST.roots, { source_id: "s1:snapshot", attempt_id: "at1", commit: C, tree: B }],
+  };
+
+  it("a block that lands while the send is in flight keeps the receipt but returns no authority", async () => {
+    const coord = mkCoord(mkRoot());
+    const h = harness(coord);
+    const sendGate = gate();
+    h.sendResult = async () => { await sendGate.p; return { kind: "final", outcome: "published", response: {} as never }; };
+    const running = runTerminalOperation(h.deps, input());
+    await until(() => h.sends.length === 1);
+    assert.equal((await h.deps.store.addLocalBlock(RUN, 1, ["secret_found"])).kind, "ok");
+    sendGate.open();
+    assert.deepEqual(await running, { outcome: "kept", reason: "secret_found" });
+    const r = await readRec(h.deps.store);
+    assert.deepEqual(r.invocations.map(i => i.outcome), ["invoked", "published"]);
+    assert.equal(r.phase, "closed");
+    // The closed record read on the idempotent path gives no authority either.
+    assert.deepEqual(await runTerminalOperation(h.deps, input()), { outcome: "kept", reason: "secret_found" });
+    assert.equal(h.sends.length, 1);
+  });
+
+  it("a latch that lands right after the final outcome is written returns no authority either", async () => {
+    const coord = mkCoord(mkRoot());
+    const h = harness(coord);
+    const real = h.deps.store;
+    h.deps.store = { ...real, update: async (r, g, d) => {
+      const out = await real.update(r, g, d);
+      if (d.phase === "closed") h.failure = "secret_found";
+      return out;
+    }, read: real.read.bind(real), create: real.create.bind(real), addLocalBlock: real.addLocalBlock.bind(real), invoke: real.invoke.bind(real) };
+    assert.deepEqual(await runTerminalOperation(h.deps, input()), { outcome: "kept", reason: "secret_found" });
+    assert.deepEqual((await readRec(real)).invocations.map(i => i.outcome), ["invoked", "published"]);
+  });
+
+  it("a boundary lost while invoke is in flight sends nothing and latches boundary_lost", async () => {
+    const coord = mkCoord(mkRoot());
+    const h = harness(coord);
+    const real = h.deps.store;
+    h.deps.store = { ...real, invoke: async (r, g, at) => { const out = await real.invoke(r, g, at); h.boundary = false; return out; },
+      read: real.read.bind(real), create: real.create.bind(real), update: real.update.bind(real), addLocalBlock: real.addLocalBlock.bind(real) };
+    assert.deepEqual(await runTerminalOperation(h.deps, input()), { outcome: "kept", reason: "boundary_lost" });
+    assert.equal(h.sends.length, 0);
+    const r = await readRec(real);
+    assert.deepEqual(r.invocations.map(i => i.outcome), ["invoked"]);
+    assert.deepEqual(r.localBlock, ["boundary_lost"]);
+    h.boundary = true;
+    assert.deepEqual(await runTerminalOperation(h.deps, input("resume")), { outcome: "kept", reason: "local_block" });
+    assert.equal(h.sends.length, 0);
+  });
+
+  it("a boundary lost during the send records the receipt but returns no authority", async () => {
+    const coord = mkCoord(mkRoot());
+    const h = harness(coord);
+    h.sendResult = async () => { h.boundary = false; return { kind: "final", outcome: "recorded", response: {} as never }; };
+    assert.deepEqual(await runTerminalOperation(h.deps, input()), { outcome: "kept", reason: "boundary_lost" });
+    const r = await readRec(h.deps.store);
+    assert.deepEqual(r.invocations.map(i => i.outcome), ["invoked", "recorded"]);
+    assert.equal(r.phase, "closed");
+  });
+
+  it("the capture's snapshot reaches the coverage check on the first run and, from the record, on resume", async () => {
+    const coord = mkCoord(mkRoot());
+    const h = harness(coord);
+    const seen: Array<{ commit: string; tree: string } | undefined> = [];
+    h.deps.coverage = (_u, _m, snapshot) => { seen.push(snapshot); return { ok: true }; };
+    h.deps.capture = async onPhase => {
+      await onPhase("capturing", { cloneRef: "refs/c", bareRef: "refs/c" });
+      await onPhase("captured", { cloneRef: "refs/c", bareRef: "refs/c", commit: C });
+      return { kind: "ok", base: C, extraRoots: [], manifest: SNAP_MANIFEST, snapshot: SNAP };
+    };
+    h.deps.aggregate = async ({ base }) => ({ tip: base });
+    h.sendResult = async () => ({ kind: "unknown", cause: "transport" });
+    await runTerminalOperation(h.deps, input());
+    assert.deepEqual(seen, [SNAP, SNAP]);
+    await runTerminalOperation(h.deps, input("resume"));
+    assert.deepEqual(seen.slice(2), [SNAP, SNAP]);
+  });
+});
+
 describe("terminal operation rediscovery", () => {
   it("runs on the boot recovery pass when the gate is on, and not at all when it is off", async () => {
     const root = mkRoot();

@@ -419,7 +419,7 @@ describe("readTerminalSourceUniverse", () => {
     const bare = await rig.bare();
     const second = await rig.bare("second.git");
     const current = await rig.attempt(bare);
-    const rec = (over: Record<string, unknown>) => ({ captureId: "c1", branch: BRANCH, sourceSha: "f".repeat(40), generation: 1, ...over });
+    const rec = (over: Record<string, unknown>) => ({ captureId: "c1", branch: BRANCH, sourceSha: current.head, generation: 1, ...over });
     const run = (r: Record<string, unknown>) => rig.universe(current, { recovery: fakeRecovery([r]) });
     assert.equal((await run(rec({ bareDir: path.basename(bare) }))).kind, "proved");
     assert.equal(unproved(await run(rec({ bareDir: path.basename(second) }))).reason, "record_outside_universe");
@@ -432,8 +432,56 @@ describe("readTerminalSourceUniverse", () => {
     const rig = new Rig();
     const bare = await rig.bare();
     const current = await rig.attempt(bare);
-    const rec = { captureId: "c1", branch: BRANCH, sourceSha: "f".repeat(40), generation: 1 };
+    const rec = { captureId: "c1", branch: BRANCH, sourceSha: current.head, generation: 1 };
     assert.equal((await rig.universe(current, { recovery: fakeRecovery([rec]) })).kind, "proved");
+  });
+
+  describe("a bound record's sourceSha must be covered", () => {
+    const bound = (sourceSha: string, over: Record<string, unknown> = {}) => ({ captureId: "c1", branch: BRANCH, sourceSha, generation: 1, ...over });
+
+    it("refuses an unrelated sourceSha, which the manifest would never declare", async () => {
+      const rig = new Rig();
+      const bare = await rig.bare();
+      const current = await rig.attempt(bare);
+      const u = await rig.universe(current, { recovery: fakeRecovery([bound("f".repeat(40))]) });
+      assert.equal(unproved(u).reason, "record_root_uncovered");
+    });
+
+    it("accepts an ancestor of the head, and refuses a commit the bare knows that is not one", async () => {
+      const rig = new Rig();
+      const bare = await rig.bare();
+      const current = await rig.attempt(bare);
+      git(bare, "fetch", current.clonePath, `refs/heads/${BRANCH}:refs/heads/${BRANCH}`);
+      git(current.clonePath, "checkout", "-b", "side", "HEAD~1");
+      await fs.writeFile(path.join(current.clonePath, "side.txt"), "x");
+      git(current.clonePath, "add", "side.txt");
+      git(current.clonePath, "commit", "-m", "side");
+      const side = git(current.clonePath, "rev-parse", "HEAD");
+      git(current.clonePath, "checkout", BRANCH);
+      git(bare, "fetch", current.clonePath, "refs/heads/side:refs/heads/side");
+      git(current.clonePath, "branch", "-D", "side");
+      const parent = git(current.clonePath, "rev-parse", "HEAD~1");
+      assert.equal((await rig.universe(current, { recovery: fakeRecovery([bound(parent)]) })).kind, "proved");
+      assert.equal(unproved(await rig.universe(current, { recovery: fakeRecovery([bound(side)]) })).reason, "record_root_uncovered");
+    });
+
+    it("keeps the bound record identities in the universe digest", async () => {
+      const rig = new Rig();
+      const bare = await rig.bare();
+      const current = await rig.attempt(bare);
+      const digest = async (records: Array<Record<string, unknown>>) => {
+        const u = await rig.universe(current, { recovery: fakeRecovery(records) });
+        assert.equal(u.kind, "proved", JSON.stringify(u));
+        return u.kind === "proved" ? u.universeDigest : "";
+      };
+      const base = await digest([]);
+      const one = await digest([bound(current.head)]);
+      assert.notEqual(one, base);
+      assert.equal(await digest([bound(current.head)]), one);
+      assert.notEqual(await digest([bound(current.head, { captureId: "c2" })]), one);
+      assert.notEqual(await digest([bound(current.head, { generation: 2 })]), one);
+      assert.notEqual(await digest([bound(current.head, { bundlePath: "/x/c1.bundle" })]), one);
+    });
   });
 
   it("accepts a record on a retired attempt's branch only when its sourceSha is an explicit root", async () => {
@@ -599,6 +647,20 @@ describe("checkManifestCoverage", () => {
     const expected = new Map([[head, "t"], [owed, "other-tree"]]);
     assert.equal(reasonOf(checkManifestCoverage(universe, { roots: full, abandoned: [] }, { currentFlight: true, expectedTrees: expected })), "tree_mismatch");
     assert.equal(reasonOf(checkManifestCoverage(universe, { roots: full, abandoned: [] }, { currentFlight: true, expectedTrees: new Map([[head, "t"]]) })), "tree_mismatch");
+  });
+  it("admits exactly the one declared snapshot root, and refuses it missing, substituted or unexpected", () => {
+    const snap = { commit: "d".repeat(40), tree: "snaptree" };
+    const snapRoot = (over: { commit?: string; tree?: string; source_id?: string } = {}) =>
+      root(over.commit ?? snap.commit, over.source_id ?? "s1:snapshot", "att", over.tree ?? snap.tree);
+    const run = (roots: ReturnType<typeof root>[], snapshot?: typeof snap) =>
+      reasonOf(checkManifestCoverage(universe, { roots, abandoned: [] }, { currentFlight: true, ...(snapshot ? { snapshot } : {}) }));
+    assert.equal(run([...full, snapRoot()], snap), "ok");
+    assert.equal(run(full, snap), "missing_root");
+    assert.equal(run([...full, snapRoot({ tree: "other" })], snap), "tree_mismatch");
+    assert.equal(run([...full, snapRoot({ commit: "e".repeat(40) })], snap), "commit_mismatch");
+    assert.equal(run([...full, snapRoot()]), "extra_root");
+    assert.equal(run([...full, snapRoot(), snapRoot({ commit: "e".repeat(40) })], snap), "extra_root");
+    assert.equal(run([...full, snapRoot({ source_id: "s9:snapshot" })], snap), "extra_root");
   });
   it("refuses an unknown abandoned class and cold_dirty on a current flight", () => {
     const abandoned = (cls: string) => [{ class: cls as "ignored", source_id: "s1", extents: { files: 1, bytes: 1 } }];

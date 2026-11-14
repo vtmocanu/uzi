@@ -26,7 +26,7 @@ const ATTEMPT = "20260101T000000Z-g7-0123456789abcdef";
 
 const FINAL: TerminalPreservationResult = { kind: "final", outcome: "published", response: {} as never };
 
-async function rig(opts: { gate: boolean; boundary?: "pass" | "refuse"; heldBinding?: boolean } = { gate: true }) {
+async function rig(opts: { gate: boolean; boundary?: "pass" | "refuse"; heldBinding?: boolean; kind?: "issue" | "ci_fix" | "prompt" | "task" } = { gate: true }) {
   const root = makeScratchRoot("terminal-replay-", os.tmpdir());
   const barePath = path.join(root, "repo.git");
   const clonePath = path.join(root, "clones", `issue-1.attempt-${ATTEMPT}`);
@@ -34,7 +34,7 @@ async function rig(opts: { gate: boolean; boundary?: "pass" | "refuse"; heldBind
   const st = await fs.lstat(clonePath);
   const identity = `${st.dev}:${st.ino}`;
   const context: PositiveOwedCandidateContext = {
-    runId: RUN, generation: 7, kind: "issue", branch: "task", barePath,
+    runId: RUN, generation: 7, kind: opts.kind ?? "issue", branch: "task", barePath,
     defaultIdentity: { ref: "refs/remotes/origin/main", sha: "d".repeat(40) },
   };
   const s = {
@@ -299,6 +299,22 @@ describe("M6-V guarded replay of a frozen open held record", () => {
       assert.equal(f.s.publishHeld, 1);
     } finally { await f.close(); }
   });
+
+  for (const kind of ["ci_fix", "prompt", "task"] as const) {
+    it(`a ${kind} held record runs no terminal producer work and keeps the shipped held flow`, async () => {
+      const gated = await rig({ gate: true, kind });
+      const off = await rig({ gate: false, kind });
+      try {
+        assert.equal(gated.record.kind, kind);
+        await gated.operate();
+        await off.operate();
+        assert.equal(gated.s.terminal.length, 0);
+        assert.equal(gated.s.publishHeld, 1);
+        assert.deepEqual(gated.s.order, off.s.order, "the same call sequence as with the gate off");
+        await assert.rejects(fs.stat(path.join(gated.root, "terminal-preservation")), { code: "ENOENT" });
+      } finally { await gated.close(); await off.close(); }
+    });
+  }
 
   it("with the gate off the closure's call sequence is the base one and nothing terminal is created", async () => {
     const off = await rig({ gate: false });
