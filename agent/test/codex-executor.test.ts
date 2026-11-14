@@ -31150,7 +31150,7 @@ it("suspended A denies expired inspection and reopening without closing the old 
 
 describe("CodexExecutor: replacement B boundary", () => {
   for (const oldClaim of [SUBSCRIPTION, API_KEY]) {
-    for (const outcome of ["resume", "refuse-fresh", "refuse-preserve", "partial-init", "invalid-metadata"] as const) {
+    for (const outcome of ["resume", "refuse-fresh", "refuse-preserve", "partial-init", "invalid-metadata", "post-construction-guard"] as const) {
       it(`${oldClaim.auth_mode} to B: ${outcome}`, async () => {
         const binding = bindingOf({ ...(oldClaim.auth_mode === "subscription" ? API_KEY : SUBSCRIPTION),
           capability: "B-capability", access_token: "B-token",
@@ -31209,6 +31209,32 @@ describe("CodexExecutor: replacement B boundary", () => {
           }
           return refresh(run, req);
         };
+        const resumeEntered = installerBarrier(), resumeContinue = installerBarrier();
+        const freshEntered = installerBarrier(), freshContinue = installerBarrier();
+        let constructedB = false, fileops = 0;
+        const fileopHandles: ReturnType<typeof fakeFileopHandle>[] = [];
+        const effectCleanup: { disposes: number }[] = [];
+        const launchEffectRoot = rig.deps.launchEffectRoot!;
+        rig.deps = { ...rig.deps,
+          launchEffectRoot: async (...args) => {
+            const root = await launchEffectRoot(...args);
+            const cleanup = { disposes: 0 };
+            effectCleanup.push(cleanup);
+            const dispose = root.dispose.bind(root);
+            root.dispose = async (...disposeArgs) => {
+              const result = await dispose(...disposeArgs);
+              cleanup.disposes++;
+              return result;
+            };
+            return root;
+          },
+          wireFileop: () => {
+            const fileop = fakeFileopHandle();
+            fileopHandles.push(fileop);
+            if (++fileops === 2) constructedB = true;
+            return fileop.handle;
+          },
+        };
         const request = b.transport.request.bind(b.transport);
         b.transport.request = async (method, params, opts) => {
           events.push(method);
@@ -31218,7 +31244,13 @@ describe("CodexExecutor: replacement B boundary", () => {
             assert.equal(rec(params)[binding.authMode === "api_key" ? "apiKey" : "accessToken"], "B-released-token");
             if (binding.authMode === "subscription") assert.equal(rec(params).chatgptAccountId, "B-account");
           }
+          if (method === "thread/start") {
+            freshEntered.resolve();
+            await freshContinue.promise;
+          }
           if (method === "thread/resume") {
+            resumeEntered.resolve();
+            await resumeContinue.promise;
             assert.equal(rec(params).threadId, savedId);
             if (outcome === "partial-init") return { thread: {} } as never;
             if (outcome.startsWith("refuse")) throw new CodexTransportError({
@@ -31228,7 +31260,9 @@ describe("CodexExecutor: replacement B boundary", () => {
           return request(method, params, opts);
         };
         const exec = makeExecutor(rig, bindingOf(oldClaim));
-        const bounds = { signal: new AbortController().signal, deadline: 60_000, guard() {} };
+        const guardStop = new Error("B post-construction guard failed");
+        const bounds = { signal: new AbortController().signal, deadline: 60_000,
+          guard() { if (outcome === "post-construction-guard" && constructedB) throw guardStop; } };
         const stop = new Error("B held proof complete");
         const { ctx, emitted } = makeCtx({ planApproved: false, approvedPlan: undefined, sessionId: savedId,
           preserveConversation: outcome === "refuse-preserve",
@@ -31253,15 +31287,36 @@ describe("CodexExecutor: replacement B boundary", () => {
             await assert.rejects(lease.publishB(bundle, bounds), /publication refused/);
             await assert.rejects(exec.suspendCodexEpoch(bounds), /settled live boundary/);
             await assert.rejects(lease.restartAndResume("wrong-thread", bounds), /preparation refused/);
+            if (outcome === "post-construction-guard") {
+              await assert.rejects(lease.restartAndResume(savedId, bounds), error => error === guardStop);
+              assert.equal(constructedB, true, "B fileop root exists before guard failure");
+              assert.equal(rig.providerLaunches(), 1, "B provider remains lazy");
+              throw stop;
+            }
+            const preparing = lease.restartAndResume(savedId, bounds);
+            const preparedResult = preparing.then(value => ({ value }), error => ({ error }));
+            await resumeEntered.promise;
+            const launches = rig.providerLaunches(), releasesAtEntry = bReleases;
+            const rejectRepeat = async () => {
+              await assert.rejects(lease.restartAndResume(savedId, bounds), /preparation refused/);
+              assert.equal(rig.providerLaunches(), launches, "no extra provider launch");
+              assert.equal(bReleases, releasesAtEntry, "no extra credential release");
+            };
+            try { await rejectRepeat(); } finally { resumeContinue.resolve(); }
+            const result = await preparedResult;
             if (outcome === "partial-init") {
-              await assert.rejects(lease.restartAndResume(savedId, bounds), /returned no thread id/);
+              assert.ok("error" in result);
+              assert.match(String(result.error), /returned no thread id/);
+              await rejectRepeat();
               await assert.rejects(lease.finishB(bounds), /admission refused/);
               assert.equal(b.transport.turnStartCount, 0);
               assert.equal(await CodexSessionStore.inspectSession(store, savedId), "present");
               throw stop;
             }
-            assert.deepEqual(await lease.restartAndResume(savedId, bounds),
+            assert.ok("value" in result);
+            assert.deepEqual(result.value,
               { kind: outcome === "resume" ? "resumed" : "confirmed_resume_refusal" });
+            await rejectRepeat();
             assert.notEqual(rig.launchRoots[0], rig.launchRoots[1], "B has fresh CODEX_HOME root");
             assert.equal(adoptedHomes.length, 2);
             assert.notEqual(adoptedHomes[0], adoptedHomes[1], "distinct adoption homes");
@@ -31275,11 +31330,22 @@ describe("CodexExecutor: replacement B boundary", () => {
               assert.equal(b.transport.threadStartCount, 0, "refusal requires explicit fallback");
               if (outcome === "refuse-preserve") {
                 await assert.rejects(lease.startFreshLineage(bounds), /provider_resume_rejected/);
+                await assert.rejects(lease.startFreshLineage(bounds), /preparation refused/);
+                assert.equal(rig.providerLaunches(), launches);
+                assert.equal(bReleases, releasesAtEntry);
                 assert.equal(b.transport.threadStartCount, 0);
                 assert.equal(b.transport.turnStartCount, 0);
                 throw stop;
               }
-              await lease.startFreshLineage(bounds);
+              const fresh = lease.startFreshLineage(bounds);
+              await freshEntered.promise;
+              try {
+                await assert.rejects(lease.startFreshLineage(bounds), /preparation refused/);
+              } finally { freshContinue.resolve(); }
+              await fresh;
+              await assert.rejects(lease.startFreshLineage(bounds), /preparation refused/);
+              assert.equal(rig.providerLaunches(), launches);
+              assert.equal(bReleases, releasesAtEntry);
               assert.equal(b.transport.threadStartCount, 1);
               assert.ok(emitted.some(m => m.payload.event === "resume_lineage_break"));
             }
@@ -31302,8 +31368,20 @@ describe("CodexExecutor: replacement B boundary", () => {
             throw stop;
           },
         });
-        try { await assert.rejects(exec.run(ctx), error => error === stop); }
-        finally { await fs.rm(dir, { recursive: true, force: true }); }
+        try {
+          await assert.rejects(exec.run(ctx), error => error === stop);
+          const constructed = outcome === "invalid-metadata" ? 1 : 2;
+          assert.equal(fileops, constructed, "no extra constructed epoch");
+          assert.ok(effectCleanup.length >= constructed, "constructed epochs own effect roots");
+          for (const cleanup of effectCleanup)
+            assert.ok(cleanup.disposes > 0, "finally disposes each constructed effect root");
+          for (const fileop of fileopHandles)
+            assert.ok(fileop.disposed() > 0, "finally disposes each constructed fileop handle");
+          for (const epoch of rig.epochs.slice(0, rig.providerLaunches())) {
+            assert.ok(epoch.reaped() > 0, "finally reaps each launched provider root");
+            assert.ok(epoch.disposed() > 0, "finally disposes each launched provider root");
+          }
+        } finally { await fs.rm(dir, { recursive: true, force: true }); }
       });
     }
   }

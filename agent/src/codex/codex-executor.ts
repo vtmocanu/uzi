@@ -3978,6 +3978,8 @@ export class CodexExecutor implements Executor {
         let reaped = false;
         let replacement: CodexEpochAuthority | undefined;
         let prepared = false;
+        let preparationStarted = false;
+        let freshStarted = false;
         let resumeRefused = false;
         const current = (): void => {
           bounds.guard();
@@ -4100,8 +4102,9 @@ export class CodexExecutor implements Executor {
           restartAndResume: async (sessionId, nextBounds) => {
             nextBounds.guard(); bounds.guard();
             const next = replacement;
-            if (!next || !retired || !reaped || prepared || sessionId !== saved)
+            if (!next || !retired || !reaped || preparationStarted || sessionId !== saved)
               throw new TrustedExecutionRefusal("Codex replacement preparation refused");
+            preparationStarted = true;
             next.assertCurrent();
             const base = this.lastRootRequest ?? this.buildRunRequest(ctx,
               ctx.planApproved ? "implement" : "plan", "", sessionId, nextBounds.signal,
@@ -4110,8 +4113,9 @@ export class CodexExecutor implements Executor {
             try {
               const fresh = await this.startProviderEpoch(ctx, shared, sessionId, epochNamespace, ++epochIndex,
                 { persistAfterLaunchOnly: true });
-              nextBounds.guard(); bounds.guard(); next.assertCurrent();
+              // Transfer cleanup ownership before any post-construction guard can throw.
               epoch = fresh; this.safety = fresh.safety;
+              nextBounds.guard(); bounds.guard(); next.assertCurrent();
               const request = { ...base, signal: nextBounds.signal, resumeSessionId: sessionId,
                 rootDispatch: undefined, onRuntimeConfig: undefined };
               try {
@@ -4129,8 +4133,9 @@ export class CodexExecutor implements Executor {
           startFreshLineage: async (nextBounds): Promise<void> => {
             nextBounds.guard(); bounds.guard();
             const next = replacement;
-            if (!next || !resumeRefused || prepared || !epoch || epoch === captured)
+            if (!next || !resumeRefused || freshStarted || prepared || !epoch || epoch === captured)
               throw new TrustedExecutionRefusal("Codex fresh lineage preparation refused");
+            freshStarted = true;
             if (ctx.preserveConversation) throw new PolicyContinuationRejected("provider_resume_rejected");
             next.assertCurrent();
             const base = this.lastRootRequest ?? this.buildRunRequest(ctx, ctx.planApproved ? "implement" : "plan",
