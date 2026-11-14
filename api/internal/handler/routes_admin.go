@@ -70,6 +70,8 @@ func (h *Handler) mountAdminRoutes(r chi.Router, forgeLimiter, authLimiter *mw.L
 			// STORED privilege_report across all users (no forge call), so it carries no
 			// per-user limiter — same shape as /runs and /workers.
 			r.Get("/blocked-repos", h.AdminListBlockedRepos)
+			// Issue #4334: the admin cross-user repo-activity list (enabled or active repos); a DB read, no limiter.
+			r.Get("/repo-activity", h.AdminRepoActivity)
 			// PRD #66 M3: the live, non-persisting guardrail pre-flight impact count.
 			// It fans out a 1 + 2×repos forge scan across every user's connections,
 			// so it wears the per-user forge budget — forgeLimiter is a Routes

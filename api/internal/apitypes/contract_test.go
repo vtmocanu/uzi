@@ -254,6 +254,10 @@ func contractCases() []contractCase {
 		newContractCase[ResetLinkPreviewRequest]("reset_link_preview_request"),
 		newContractCase[ResetLinkPreviewDTO]("reset_link_preview"),
 		newContractCase[ResetLinkRedeemRequest]("reset_link_redeem_request"),
+		// Issue #4334: the admin repo-activity envelope; repos is non-omitempty (the
+		// zero.json carries a null the handler normalizes to []) and last_run_at is
+		// present-as-null.
+		newContractCase[AdminRepoActivityDTO]("admin_repo_activity"),
 	}
 }
 
