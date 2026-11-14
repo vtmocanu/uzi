@@ -953,3 +953,34 @@ describe("real child", () => {
     }
   });
 });
+
+describe("builder-prune child fixture", () => {
+  // Regression for the main CI flake (run 43631560241): the tests poll existsSync(stateFile)
+  // and then JSON.parse it, so the fixture must never expose a created-but-unwritten file.
+  // The pause hook holds the fixture between creating and writing; a non-atomic write is
+  // then observed empty on every run, an atomic temp-file + rename never is.
+  it("never exposes a partially written state file", async () => {
+    const stateFile = join(scratch(), "state.json");
+    const child = spawn(process.execPath, [CHILD, "env", stateFile], {
+      env: { ...process.env, DIND_PRUNE_FIXTURE_STATE_PAUSE_MS: "400" },
+      stdio: "ignore",
+    });
+    let exited = false;
+    const done = new Promise<void>((resolve) => child.on("exit", () => { exited = true; resolve(); }));
+    let partialReads = 0;
+    while (!exited) {
+      if (existsSync(stateFile)) {
+        try {
+          JSON.parse(readFileSync(stateFile, "utf8"));
+        } catch {
+          partialReads++;
+        }
+      }
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    await done;
+    assert.equal(child.exitCode, 0);
+    assert.equal(partialReads, 0, "state file was observed before its content was written");
+    assert.doesNotThrow(() => JSON.parse(readFileSync(stateFile, "utf8")));
+  });
+});

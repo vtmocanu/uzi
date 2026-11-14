@@ -20,14 +20,20 @@
 // {"child":pid,"grandchild":pid} to <stateFile> once the grandchild exists.
 
 import { spawn } from "node:child_process";
-import { appendFileSync, renameSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, openSync, renameSync, writeSync } from "node:fs";
 
 const [mode, stateFile] = process.argv.slice(2);
 // The tests poll for the state file's existence and then parse it, so it must appear
 // complete: write a sibling temp file and rename it into place (atomic on one filesystem).
+// DIND_PRUNE_FIXTURE_STATE_PAUSE_MS (tests only) pauses between creating and writing the
+// file, widening the window a non-atomic write would expose.
+const statePauseMs = Number(process.env.DIND_PRUNE_FIXTURE_STATE_PAUSE_MS ?? 0);
 const writeState = (value) => {
   const tmp = `${stateFile}.tmp-${process.pid}`;
-  writeFileSync(tmp, JSON.stringify(value));
+  const fd = openSync(tmp, "wx");
+  if (statePauseMs > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, statePauseMs);
+  writeSync(fd, JSON.stringify(value));
+  closeSync(fd);
   renameSync(tmp, stateFile);
 };
 if (stateFile) appendFileSync(`${stateFile}.spawns`, `${mode}\n`);
