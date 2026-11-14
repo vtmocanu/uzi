@@ -89,6 +89,10 @@ import {
   type RunRegistrationEvidence,
   type CompletedPublicationReceipt,
   type CompletedPublicationReason,
+  TERMINAL_CONTRIBUTION_STATES,
+  TERMINAL_REASONS,
+  type TerminalPreservationRequest,
+  type TerminalPreservationResponse,
   type PlanCrossCheckReconciliation,
   type StateRequest,
   type UserInput,
@@ -3653,6 +3657,66 @@ export class WorkerClient {
     return { ok: true, body: body as HeldPublicationResponse };
   }
 
+  /**
+   * Issue #4007: ask the api to publish a terminal run's work to `refs/uzi-terminal/<run-id>`. Never throws
+   * for a transport, HTTP or decode outcome; see {@link TerminalPreservationResult}. Only a 200 whose strict
+   * decode passes and which proves the work published at `req.tip` (or durably recorded) is `final`. Sends
+   * nothing gate-related: the server refuses `unsupported` itself.
+   */
+  async publishTerminalPreservation(
+    runId: string,
+    req: TerminalPreservationRequest,
+    signal?: AbortSignal,
+  ): Promise<TerminalPreservationResult> {
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/terminal-preservation`;
+    let res: Response;
+    let text: string;
+    try {
+      const timeout = maintenanceSignal(TERMINAL_PRESERVATION_TIMEOUT_MS);
+      const init: RequestInit = {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${this.token}`,
+          "X-Client-Version": this.version,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(req),
+        signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+      };
+      res = await maintenanceFetch(fetch, this.baseUrl + path, init);
+      try {
+        text = await readBoundedText(res, TERMINAL_PRESERVATION_RESPONSE_MAX_BYTES, true, init.signal ?? undefined);
+      } catch {
+        if (init.signal?.aborted) return { kind: "unknown", cause: "aborted", httpStatus: res.status };
+        return { kind: "unknown", cause: "malformed_response", httpStatus: res.status };
+      }
+    } catch (error) {
+      const aborted = (error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError")) ||
+        signal?.aborted === true;
+      return { kind: "unknown", cause: aborted ? "aborted" : "transport" };
+    }
+    let body: unknown;
+    try { body = JSON.parse(text); } catch { body = undefined; }
+    if (res.status !== 200) {
+      const reason = isRecord(body) && typeof body.reason === "string" ? body.reason : undefined;
+      if (reason !== undefined && (TERMINAL_WIRE_ONLY_REASONS.has(reason) || TERMINAL_REASONS.some(r => r === reason)))
+        return { kind: "refused", reason, httpStatus: res.status };
+      return { kind: "unknown", cause: "http_status", httpStatus: res.status };
+    }
+    const response = decodeTerminalPreservationResponse(body, runId);
+    if (!response) return { kind: "unknown", cause: "malformed_response", httpStatus: 200 };
+    if (response.state === "published" && response.tip === req.tip) return { kind: "final", outcome: "published", response };
+    if (response.state === "recorded") return { kind: "final", outcome: "recorded", response };
+    if (response.state === "refused") {
+      return response.reason
+        ? { kind: "refused", reason: response.reason, httpStatus: 200 }
+        : { kind: "unknown", cause: "malformed_response", httpStatus: 200 };
+    }
+    // published at a different tip is a contradiction, not a partial success.
+    if (response.state === "published") return { kind: "unknown", cause: "malformed_response", httpStatus: 200 };
+    return { kind: "unknown", cause: "not_final", httpStatus: 200 };
+  }
+
   // ── Durable run recovery archive RPC (PRD #1296 M3, D3/D5) ─────────────────────
   // The Bearer-authenticated worker↔API archive endpoints. Shapes are the M1-frozen
   // protocol types (agent/src/protocol.ts, mirrored from apitypes/recovery.go). The bundle
@@ -6403,9 +6467,44 @@ function decodeCompletedPublicationReason(value: unknown): CompletedPublicationR
   switch (value) {
     case "completion_identity_missing": case "not_completed": case "identity_changed":
     case "mr_missing": case "branch_missing": case "branch_mismatch": case "head_mismatch":
-    case "not_ancestor": case "ancestry_unknown": case "forge_timeout": return value;
+    case "not_ancestor": case "ancestry_unknown": case "forge_timeout":
+    case "terminal_preservation_pending": case "terminal_preservation_refused": return value;
     default: return undefined;
   }
+}
+
+const TERMINAL_PRESERVATION_TIMEOUT_MS = 330_000;
+const TERMINAL_PRESERVATION_RESPONSE_MAX_BYTES = 16 * 1024;
+const TERMINAL_WIRE_ONLY_REASONS: ReadonlySet<string> =
+  new Set(["busy", "stale_claim", "missing_claim_generation", "invalid_request"]);
+const TERMINAL_RESPONSE_KEYS: ReadonlySet<string> = new Set([
+  "preservation_id", "contribution_id", "ref", "tip", "state", "preservation_state", "disposition", "reason",
+]);
+
+/** Outcome of {@link WorkerClient.publishTerminalPreservation}. Only `final` means the work is on the forge
+ *  (`published`) or the server durably recorded it as abandoned (`recorded`); everything ambiguous is `unknown`. */
+export type TerminalPreservationResult =
+  | { kind: "final"; outcome: "published" | "recorded"; response: TerminalPreservationResponse }
+  | { kind: "refused"; reason: string; httpStatus: number }
+  | { kind: "unknown"; cause: "malformed_response" | "transport" | "aborted" | "http_status" | "not_final"; httpStatus?: number };
+
+/** Strict decode of the 200 body; undefined on any defect (unknown field, state, reason, bad tip or ref). */
+// The run_terminal_preservations state CHECK (migration 00448): a value outside it is malformed.
+const TERMINAL_PRESERVATION_STATES: ReadonlySet<string> = new Set(
+  ["bound", "publishing", "live", "retiring", "deleted", "abandoned", "not_published"]);
+function decodeTerminalPreservationResponse(value: unknown, runId: string): TerminalPreservationResponse | undefined {
+  if (!isRecord(value) || Object.keys(value).some(k => !TERMINAL_RESPONSE_KEYS.has(k))) return undefined;
+  const str = (k: string) => typeof value[k] === "string" && (value[k] as string).length > 0 ? value[k] as string : undefined;
+  const state = TERMINAL_CONTRIBUTION_STATES.find(s => s === value.state);
+  const reason = value.reason === undefined ? undefined : TERMINAL_REASONS.find(r => r === value.reason);
+  if (!state || (value.reason !== undefined && !reason) || !/^[0-9a-f]{40}$/.test(String(value.tip))) return undefined;
+  if (value.ref !== `refs/uzi-terminal/${runId}` || value.disposition !== "preserve") return undefined;
+  const preservation_id = str("preservation_id"), contribution_id = str("contribution_id"),
+    preservation_state = str("preservation_state");
+  if (!preservation_id || !contribution_id || !preservation_state ||
+      !TERMINAL_PRESERVATION_STATES.has(preservation_state)) return undefined;
+  return { preservation_id, contribution_id, ref: value.ref, tip: value.tip as string, state,
+    preservation_state, disposition: "preserve", ...(reason ? { reason } : {}) };
 }
 
 const TERMINAL_REJECTION_RESPONSE_MAX_BYTES = 128 * 1024;
