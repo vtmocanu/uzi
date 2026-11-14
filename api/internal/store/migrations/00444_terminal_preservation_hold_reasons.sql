@@ -22,12 +22,12 @@ ALTER TABLE recovery_custody_holds ADD CONSTRAINT recovery_custody_holds_complet
 -- +goose Down
 SET LOCAL lock_timeout = '5s';
 
--- A rolled-back chain must refuse before it clears anything: the same live-rows refusal the 00437
--- and 00436 Downs make, repeated here because this Down runs first and would otherwise null the
+-- A rolled-back chain must refuse before it clears anything: the same live-rows refusal the 00443
+-- and 00442 Downs make, repeated here because this Down runs first and would otherwise null the
 -- reasons of a rollback that those two then refuse.
 -- Lock order matches the writers' (worker, run, hold, preservation, contribution): the hold table
 -- first. ACCESS EXCLUSIVE is the mode the CHECK swap below needs, so no lock upgrade happens
--- mid-transaction, which is the usual deadlock shape. This Down drops no table; the 00437 and 00436
+-- mid-transaction, which is the usual deadlock shape. This Down drops no table; the 00443 and 00442
 -- Downs that follow take their own up-front locks.
 -- A writer already holding a row lock blocks this statement until it finishes (bounded by the
 -- lock_timeout above), and once the locks are held no writer can start; the order above is the

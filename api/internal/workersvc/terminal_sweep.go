@@ -103,7 +103,7 @@ func (s *Service) terminalRetireMaxAge() time.Duration {
 	return retireObservationMaxAge
 }
 
-// The retire_reason vocabulary the sweep writes (a subset of the 00436 CHECK). A no_pr run (neither
+// The retire_reason vocabulary the sweep writes (a subset of the 00442 CHECK). A no_pr run (neither
 // issue nor merge request) has no closure signal, so it retires only by age.
 const (
 	terminalRetireIssueClosed = "issue_closed"
@@ -112,7 +112,7 @@ const (
 )
 
 // terminalNoPRRetention is how long after its first publication a no_pr row becomes retirement
-// eligible. first_published_at is set once (the 00436 trigger refuses a change), so a later update of
+// eligible. first_published_at is set once (the 00442 trigger refuses a change), so a later update of
 // the ref never renews it.
 const terminalNoPRRetention = 30 * 24 * time.Hour
 

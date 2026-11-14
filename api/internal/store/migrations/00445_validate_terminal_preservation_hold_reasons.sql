@@ -2,9 +2,9 @@
 
 SET LOCAL lock_timeout = '5s';
 
--- Validate the CHECK re-added NOT VALID in 00438 (issue #4007). VALIDATE CONSTRAINT scans the
+-- Validate the CHECK re-added NOT VALID in 00444 (issue #4007). VALIDATE CONSTRAINT scans the
 -- table but takes only a SHARE UPDATE EXCLUSIVE lock (write-compatible), unlike the ACCESS
--- EXCLUSIVE lock an inline validated ADD CONSTRAINT would hold. Split from 00438 per the
+-- EXCLUSIVE lock an inline validated ADD CONSTRAINT would hold. Split from 00444 per the
 -- two-step pattern (00428/00429).
 --
 -- The backlog satisfies the CHECK by construction: it widens the set the previous CHECK
@@ -16,8 +16,8 @@ ALTER TABLE recovery_custody_holds VALIDATE CONSTRAINT recovery_custody_holds_co
 
 SET LOCAL lock_timeout = '5s';
 
--- There is no VALIDATE inverse, so restore the pre-00439 state (constraint present but NOT VALID)
--- by dropping and re-adding it NOT VALID. The body matches 00438's Up verbatim; 00438's Down then
+-- There is no VALIDATE inverse, so restore the pre-00445 state (constraint present but NOT VALID)
+-- by dropping and re-adding it NOT VALID. The body matches 00444's Up verbatim; 00444's Down then
 -- replaces it. Mirrors 00429's Down.
 ALTER TABLE recovery_custody_holds DROP CONSTRAINT recovery_custody_holds_completed_publication_reason_check;
 ALTER TABLE recovery_custody_holds ADD CONSTRAINT recovery_custody_holds_completed_publication_reason_check
