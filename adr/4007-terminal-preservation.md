@@ -1,6 +1,6 @@
 # ADR-4007: a run's terminal work is preserved under its own forge ref namespace, separate from held work and checkpoint retention
 
-**Status**: Accepted (slice A implemented API-side and dark: no shipped worker advertises the capability, so no ref is created, no gate fires and the sweep lists no rows; slices B to E and the retirement switch are deferred, see below)
+**Status**: Accepted (slice A implemented API-side and dark: no shipped worker advertises the capability, so no ref is created, no gate fires and the sweep lists no rows; slice B is in progress (partial, dark), slices C to E and the retirement switch are deferred, see below)
 **Date**: 2026-11-13
 **Issue**: [vtmocanu/uzi#4007](https://github.com/vtmocanu/uzi/issues/4007)
 **Refs**: #4007, #2545, #1810, #1867, #2507, #1296
@@ -220,8 +220,10 @@ and the total. A race that reaches the RESTRICT FK maps to the same 409.
 
 ### Slice B (partial, in progress)
 
-Slice B is the worker half: the producer that calls the route. It is
-delivered partially and production-dark. Nothing below runs in production.
+Slice B is the worker half: the producer that calls the route. It is being
+delivered partially and production-dark; this section states its planned
+contract and supersedes the Deferred "B" bullet for the parts it scopes in.
+Nothing below runs in production.
 
 - **Gate.** One compile-time constant, `TERMINAL_PRESERVATION_ENABLED = false`
   in `agent/src/terminal-preservation.ts`, is the first check of every new
