@@ -31,8 +31,8 @@ comes from: the Claude model picker reads `Default · lead template` (the
 `Default · automatic`: uzi picks your only usable harness, or, when both are
 usable, chooses by weekly limits for eligible new issue runs (started
 manually, by autopilot or by a schedule, with no explicit harness or issue
-harness label, model pin, Anthropic credential override or Plan/Code
-cross-check; other runs keep the usual resolution: an explicit harness, else
+harness label, model pin or model chosen at start, Anthropic credential
+override or Plan/Code cross-check; other runs keep the usual resolution: an explicit harness, else
 Claude). It picks the harness whose weekly allowance
 resets soonest, falling back to Claude when usage is unknown; see [How the
 automatic default picks a harness](./rate-limits.md#how-the-automatic-default-picks-a-harness).
@@ -90,13 +90,16 @@ creation, and with **Default · automatic** and both harnesses usable, the
 harness is chosen by weekly limits), and only then
 reads that harness's model lane:
 
-1. The **schedule's model**, if the run was started by a
+1. A **model you chose when starting the run** (`uzi run create --model`, or
+   `model` on the create-run API); see [A model chosen when starting a
+   run](#a-model-chosen-when-starting-a-run).
+2. The **schedule's model**, if the run was started by a
    [schedule](./scheduling.md) that pins one compatible with the run's
    harness.
-2. Your **worker model** for that harness, if set.
-3. The harness fallback: the `lead` template's Claude pin (`opus` by default)
+3. Your **worker model** for that harness, if set.
+4. The harness fallback: the `lead` template's Claude pin (`opus` by default)
    for Claude, or its Codex pin, else `gpt-6.1-sol`, for Codex.
-4. Whatever the underlying SDK/your account defaults to.
+5. Whatever the underlying SDK/your account defaults to.
 
 The lead's Codex fallback requires a worker from this release. Older Codex
 workers fall through to the built-in provider model (`gpt-6.1-sol`) when no
@@ -116,6 +119,48 @@ lane**, whichever harness is your default.
 To see what these rules give you right now, without starting a run, read the
 read-only [effective settings](./configuration.md#effective-settings) view
 (`uzi settings get`).
+
+## A model chosen when starting a run
+
+You can choose the model (and, see [Reasoning effort](./worker-effort.md#a-run-level-effort),
+the effort) for one run when you create it: `uzi run create --model <id>`, or
+an optional `"model"` string on `POST /api/repos/{id}/runs` (the web Start run
+button sends neither; a web Run options dialog is not available yet). The
+choice is stored on the run and shown with the source **this run**
+(`model_source: run_override` in `uzi run get --json`).
+
+- **It wins.** It beats the schedule's model and your worker model for that
+  harness, and is frozen: requeues, reclaims and resumes keep it, and later
+  changes to your settings do not touch it. Subagents without their own
+  model pin follow it; an explicit subagent pin still wins. A run started
+  without one is unchanged.
+- **Shape.** A single token, no whitespace anywhere (it is not trimmed), at
+  most 100 bytes, no control or format characters (such as a bidirectional
+  override); otherwise 400.
+- **Checked against the run's harness at create.** Claude accepts a Claude
+  alias or custom model ID but not a Codex model ID; Codex accepts only the
+  curated models (`gpt-6-astra`, `gpt-5.6-sol`, `gpt-6-sol`, `gpt-6.1-sol`).
+  An incompatible pair returns 422 with `code: model_incompatible_with_harness`
+  and the resolved `harness`, and creates no run. With an explicit harness the
+  check runs before the forge is read. uzi never substitutes another model.
+- **Held, not substituted, if it stops working.** If a worker claims the run
+  and the model is no longer honorable on its harness, the run parks
+  `paused` with hold `run_override_unavailable` (`model choice unavailable`)
+  rather than falling back to your lane the way an incompatible schedule
+  model does. Resume retries only if the choice has become available;
+  otherwise cancel the run and start a new one with a different choice. See
+  [the CLI reference](./cli.md#waiting-for-a-state-uzi-run-wait).
+- **Choosing a model opts the run out of the automatic harness choice.** A
+  run with a model chosen at start is not eligible for the limit-aware
+  **Default · automatic** harness choice or for overflow, just like a
+  schedule model pin; it uses the usual resolution (an explicit harness,
+  else your default, else Claude). An effort-only choice stays eligible. The
+  Start preview (`POST /api/me/effective-settings/start-preview`) takes the same optional
+  `model` and `effort` and applies the same rule; it returns `worker_model` /
+  `worker_effort` with source this run, or the refusal
+  `model_incompatible_with_harness`, and never starts a run.
+- Successor runs do not inherit the choice, and chat and Slack start cards
+  carry no model or effort.
 
 ## Claude model guard and recovery
 
@@ -226,7 +271,8 @@ attempt; the earlier attempt's `plan` row stays in the history.
 
 For each phase the record holds:
 
-- **Requested** model and effort, with their **source**: *fixed by schedule*,
+- **Requested** model and effort, with their **source**: *this run* (chosen
+  when the run was started), *fixed by schedule*,
   *your Claude default* or *your Codex default*, *lead template*, or
   *built-in*. A Claude row that sent no model reads *Claude SDK default*. When
   you chose [Runtime default](./worker-effort.md#runtime-default) effort, uzi

@@ -202,7 +202,7 @@ uzi run logs <run-id> [--follow] [--after <seq>] [--tail <n>]
 uzi run plan <run-id> [--version N] [--diff] [--json]
 uzi run wait <run-id> [--until <status,...>] [--interval <dur>] [--timeout <dur>] [--min-plan-seq <n>]
 uzi run review <run-id>
-uzi run create --repo <repo-id> --issue <issue-iid> [--wait-on-limit[=false]] [--mr-rework[=false]] [--plan-file <path>] [--agent-source own|repo] [--exclude-agents <a,b>] [--planned-commit <sha>] [--require-base] [--token <label>|auto|default|inherit] [--harness claude|codex]
+uzi run create --repo <repo-id> --issue <issue-iid> [--wait-on-limit[=false]] [--mr-rework[=false]] [--plan-file <path>] [--agent-source own|repo] [--exclude-agents <a,b>] [--planned-commit <sha>] [--require-base] [--token <label>|auto|default|inherit] [--harness claude|codex] [--model <id>] [--effort low|medium|high|xhigh|max]
 uzi run approve <run-id> [--agent-source own|repo] [--exclude-agents <a,b>] [--token <label>|auto|default|inherit] [--expected-gate-revision <n>]
 uzi run reject <run-id> [--message <text>] [--expected-gate-revision <n>]
 uzi run revise <run-id> [--message <text>] [--expected-gate-revision <n>]
@@ -648,6 +648,16 @@ uzi version
   `--harness claude|codex` picks which harness this run uses, validated client-side
   before any request; omit it to let the server resolve your effective default. A value
   outside `claude`/`codex` is a usage error before any request is sent.
+
+  `--model <id>` and `--effort low|medium|high|xhigh|max` choose this run's model and
+  reasoning effort (PRD #3250). Each is sent only when passed, verbatim, and frozen on
+  the run, beating your Settings default. An empty or whitespace-containing `--model` or
+  an `--effort` outside the set is a usage error before any request. A model the run's
+  harness cannot serve is refused with 422 `model_incompatible_with_harness` (the CLI
+  prints the server's message; no run is created). A `--model` also opts the run out of the
+  automatic harness choice; `--effort` alone does not. If the choice later cannot run at
+  claim, the run parks `paused` on `hold_reason: run_override_unavailable`
+  (see the hold notes above).
 - `uzi run approve <run-id>` — approve the plan gate. Omitting `--agent-source`
   sends no selection at all, and an absent selection resolves to **the agents the
   worker detected in the clone's `.claude/agents/`**, falling back to your own

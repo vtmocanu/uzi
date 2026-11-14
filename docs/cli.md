@@ -149,6 +149,7 @@ uzi run create --repo <id> --issue <iid> [--plan-file <path>]
                 [--agent-source own|repo] [--exclude-agents a,b]
                 [--planned-commit <sha>] [--require-base] [--force]
                 [--harness claude|codex]
+                [--model <id>] [--effort low|medium|high|xhigh|max]
 uzi run approve <id> [--agent-source own|repo] [--exclude-agents a,b]
                 [--override-capabilities]
                 [--expected-gate-revision <n>]
@@ -365,6 +366,23 @@ A few worth knowing:
   choice is `"agent_selection": {"source": "own"|"repo"}` on
   `POST /api/repos/{id}/runs` without `plan_md`; non-empty `exclusions`
   without `plan_md` returns 400 `exclusions require a plan file or an approval`.
+- **`run create --model <id>` and `--effort <level>` choose this run's model
+  and reasoning effort.** Each is sent only when you pass it, verbatim, and is
+  frozen onto the run, beating your Settings default for the run's lead;
+  omit them and nothing changes.
+  `--model` must be a single token without whitespace, and `--effort` one of
+  `low`, `medium`, `high`, `xhigh` or `max`; anything else is a usage error
+  (exit 2) before any request. Whether the model fits the run's harness is
+  the server's call: an incompatible pair (for example a Claude alias on a
+  Codex run) is refused with 422 `model_incompatible_with_harness` and the
+  CLI prints the server's message, creating no run. A `--model` also opts the
+  run out of the automatic harness choice; `--effort` alone does not. See
+  [Worker model](worker-model.md#a-model-chosen-when-starting-a-run) and
+  [Reasoning effort](worker-effort.md#a-run-level-effort). Over the API the
+  same choice is optional `"model"` and `"effort"` strings on
+  `POST /api/repos/{id}/runs`. `run get` shows the choice with the source
+  "this run" (`--json`: `model_source` / `effort_source` `run_override`,
+  `effort`).
 - **`run create --force` re-runs an issue that already has an open MR.** By
   default, creating a run for an issue whose last completed run still owns an
   open MR is refused (a 409, exit 5) — re-running would spend budget building
@@ -4015,7 +4033,7 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   A `paused` run can also be **held because its chosen model or effort cannot
   run on its harness** (`hold_reason: run_override_unavailable`): `run get`
   prints a `HOLD` row reading `model choice unavailable`, and `run wait` and
-  `run logs --follow` print the same notice. `uzi run resume <id>` retries only
+  `run logs --follow` print a notice naming the hold. `uzi run resume <id>` retries only
   if the choice has become available on that harness; otherwise cancel the run
   (`uzi run cancel <id>`) and start a new run with a different choice.
 

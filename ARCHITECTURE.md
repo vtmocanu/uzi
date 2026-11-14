@@ -202,14 +202,20 @@ a running one.
   `lead`/`orchestrator` case-insensitively and routes its body and delivered
   harness pin into the main thread. Every own lead-shaped template is withheld
   from subagents; repo templates, including `lead`, remain ordinary subagents.
-  Both harnesses use this rule. Run models follow the frozen schedule pin,
-  the owner's per-harness lane, the selected lead's harness pin, then the
-  SDK/account default for Claude or `gpt-6.1-sol` for Codex.
+  Both harnesses use this rule. Run models follow the model chosen when the
+  run was started (`runs.model_source = 'run_override'`), else the frozen
+  schedule pin (`schedule_pin`), then the owner's per-harness lane, the selected
+  lead's harness pin, then the SDK/account default for Claude or `gpt-6.1-sol`
+  for Codex. A run-chosen model or effort is validated at create (422
+  `model_incompatible_with_harness`), frozen across requeue and reclaim, and,
+  if the claim can no longer honor it, parks the run `paused` on hold
+  `run_override_unavailable` instead of substituting another value
+  ([PRD #3250](prds/3250-run-start-model-effort.md)).
   A subagent's delivered pin wins when set;
   otherwise it follows the resolved main-thread model, subject to the schedule's
   subagent override. See [docs/worker-model.md](docs/worker-model.md). The same
-  claim carries the owner's
-  per-user **reasoning effort** (`users.default_effort`, PRD #617): set, it applies
+  claim carries the run's chosen **reasoning effort** (`runs.effort`), else the
+  owner's per-user effort (`users.default_effort`, PRD #617): set, it applies
   to the SDK top-level effort for the main thread and its subagents; unset, the SDK
   default (`high`) applies. See [docs/worker-effort.md](docs/worker-effort.md).
 - **Per-harness pins (PRD #3249).** The template API validates `model` as

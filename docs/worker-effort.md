@@ -13,9 +13,31 @@ choose `low`, `medium`, `high`, `xhigh` or `max` for that harness, or choose
 **Runtime default** to send no level.
 
 Your explicit preference overrides the product default for the lead and its
-subagents. The setting is resolved when a worker claims the run, including a
-scheduled or already queued run and a resumed run; there is no per-schedule
-effort freeze. Other users and the shared lead template are unaffected.
+subagents. An effort you choose when starting a run (see [A run-level
+effort](#a-run-level-effort)) is frozen on the run and beats the setting.
+For a run without one, the setting is resolved when a worker claims the run,
+including a scheduled or already queued run and a resumed run; there is no
+per-schedule effort freeze. Subagents without their own effort pin inherit
+the run's effort. Other users and the shared lead template are unaffected.
+
+## A run-level effort
+
+Choose the effort for a single run when you create it: `uzi run create
+--effort <level>` (`low`, `medium`, `high`, `xhigh` or `max`), or an optional
+`"effort"` string on `POST /api/repos/{id}/runs`. The web Start run button
+sends none (a web Run options dialog is not available yet). It is checked
+for shape at create (otherwise 400, no whitespace allowed), stored on the run
+with the source **this run** (`effort_source: run_override`), and frozen:
+requeues, reclaims and resumes keep it, and later changes to your Settings do
+not touch it. It applies on both harnesses.
+
+uzi does not check the level against the model. Claude may silently
+downgrade an unsupported level and Codex may reject it; both show up in the
+requested-versus-effective effort below. If a claim can no longer honor the
+choice, the run parks `paused` on hold `run_override_unavailable` instead of
+running at another effort; see [Worker
+model](./worker-model.md#a-model-chosen-when-starting-a-run). Choosing only an
+effort does not opt the run out of the automatic harness choice.
 
 When upgrading from the shared setting, every existing explicit value is
 copied into the Codex setting and retained for Claude. An unset or blank
