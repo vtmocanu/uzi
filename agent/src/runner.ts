@@ -78,7 +78,7 @@ import type {
 } from "./executor.js";
 import { PlanRejectedError } from "./executor.js";
 import type { InPlaceSwitchSite } from "./executor.js";
-import { acquireCodexOperationScope } from "./codex-operation-scope.js";
+import { acquireCodexOperationScope, codexOperationAuthorityIdentity } from "./codex-operation-scope.js";
 import { type CodexOperationController, type CodexOperationWaitPolicy } from "./codex-operation-controller.js";
 import { CodexOperationAdmissionError } from "./client.js";
 import { transientOwnershipReadCause } from "./ownership-read-transient.js";
@@ -6060,7 +6060,7 @@ export class RunRunner {
             this.snapshotRegistry?.setAccountCooldown(runId, flight.claimGeneration, operation, registration);
           return token === undefined ? undefined :
             () => this.snapshotRegistry?.clearAccountCooldown(runId, flight.claimGeneration, token);
-      }, ["root", "child"], flight.runLog);
+      }, ["root", "child"], flight.runLog, codexOperationAuthorityIdentity(claim.secrets.codex.capability));
       flight.operationScope.own();
       flight.operationAdmission = flight.operationScope.controller;
       flight.releaseOperationAdmission = () => flight.operationScope?.close();

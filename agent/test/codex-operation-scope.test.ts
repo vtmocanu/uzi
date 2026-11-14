@@ -1,8 +1,62 @@
 import { it } from "node:test";
 import assert from "node:assert/strict";
-import { acquireCodexOperationScope } from "../src/codex-operation-scope.js";
+import { acquireCodexOperationScope, codexOperationAuthorityIdentity } from "../src/codex-operation-scope.js";
 import { AdmissionClock, flushUntil } from "./operation-admission-clock.js";
 import type { CodexOperationRequest } from "../src/protocol.js";
+
+it("authority identity is opaque and stable, and isolates replacement scope ownership", async () => {
+  const capabilityA = ["authority", "a"].join("-");
+  const capabilityB = ["authority", "b"].join("-");
+  const identityA = codexOperationAuthorityIdentity(capabilityA);
+  const identityB = codexOperationAuthorityIdentity(capabilityB);
+  // Boolean assertions keep credential values out of failure diffs.
+  assert.ok(identityA === codexOperationAuthorityIdentity(capabilityA));
+  assert.ok(identityA !== identityB);
+  assert.ok(!identityA.includes(capabilityA) && !identityB.includes(capabilityB));
+  assert.match(identityA, /^[a-f0-9]{64}$/);
+  const client = {};
+  const acquire = (identity: string) =>
+    acquireCodexOperationScope(client, "run", 7, {}, undefined, undefined, undefined, identity);
+  const ownerA = acquire(identityA);
+  const adviceA = acquire(identityA);
+  const ownerB = acquire(identityB);
+  const adviceB = acquire(identityB);
+  let resume!: () => void;
+  let entered!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const delayed = new Promise<void>(resolve => { resume = resolve; });
+  ownerA.bind(async () => () => true);
+  const signal = new AbortController().signal;
+  const oldPermit = await adviceA.prepare("advice", signal, () => {});
+  const callback = ownerA.bind(async () => {
+    entered();
+    await delayed;
+    return () => true;
+  });
+  ownerB.own();
+  try {
+    assert.ok(ownerA.controller === adviceA.controller);
+    assert.ok(ownerB.controller === adviceB.controller);
+    assert.ok(ownerA.controller !== ownerB.controller);
+    const pending = adviceA.prepare("advice", signal, () => {});
+    const denied = assert.rejects(pending, /closed/);
+    await started;
+    ownerA.close();
+    assert.throws(oldPermit, /closed/);
+    resume();
+    await denied;
+    await assert.rejects(adviceA.prepare("advice", signal, () => {}), /owner closed/);
+    await assert.rejects(callback(signal, () => {}), /scope closed/);
+    const permitB = await adviceB.prepare("advice", signal, () => {});
+    assert.doesNotThrow(() => permitB());
+  } finally {
+    resume();
+    ownerA.close();
+    adviceA.close();
+    ownerB.close();
+    adviceB.close();
+  }
+});
 
 it("scope records final negotiation loss before a simultaneous source guard throws", async () => {
   const clock = new AdmissionClock();

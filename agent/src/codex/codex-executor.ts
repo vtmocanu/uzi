@@ -1,4 +1,4 @@
-import { acquireCodexOperationScope } from "../codex-operation-scope.js";
+import { acquireCodexOperationScope, codexOperationAuthorityIdentity } from "../codex-operation-scope.js";
 import type { CodexAdmissionReporter } from "./admission-signal.js";
 import { checkCheckpointStop, cleanCheckpointAdmission, CheckpointSoftDeadlineError } from "../checkpoint-stop.js";
 import { ExecutorLifetime, type ExecutorSealResult, type ExecutorTerminalSeal } from "./executor-lifetime.js";
@@ -1500,7 +1500,7 @@ export function makeProductionCodexAdviceHarnessFactory(
     // Retain the owner's scope before credential release can yield. A delayed advice
     // launch must still observe root closure, rather than create a fresh unbound scope.
     const scope = binding.authMode === "subscription"
-      ? acquireCodexOperationScope(client, runId, params.claimGeneration ?? 0, {}, undefined, undefined, log) : undefined;
+      ? acquireCodexOperationScope(client, runId, params.claimGeneration ?? 0, {}, undefined, undefined, log, codexOperationAuthorityIdentity(binding.capability)) : undefined;
     const close = (): void => { signal?.removeEventListener("abort", close); scope?.close(); };
     signal?.addEventListener("abort", close, { once: true });
     if (signal?.aborted) close();
@@ -3038,7 +3038,7 @@ export class CodexExecutor implements Executor {
     this.runActive = true;
     const authority = createCodexEpochAuthority(this.opts.binding);
     const operation = authority.binding.authMode === "subscription" && !ctx.prepareCodexRootDispatch
-      ? acquireCodexOperationScope(this.opts.client, ctx.runId, ctx.claimGeneration ?? 0, {}, undefined, undefined, this.log) : undefined;
+      ? acquireCodexOperationScope(this.opts.client, ctx.runId, ctx.claimGeneration ?? 0, {}, undefined, undefined, this.log, codexOperationAuthorityIdentity(authority.binding.capability)) : undefined;
     operation?.own();
     if (operation) ctx = { ...ctx,
       codexRootAdmissionActive: () => operation.controller.active(),

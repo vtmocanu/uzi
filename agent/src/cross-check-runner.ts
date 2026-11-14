@@ -1,5 +1,5 @@
 import { crossCheckDiagnostic } from "./cross-check-diagnostic.js";
-import { acquireCodexOperationScope } from "./codex-operation-scope.js";
+import { acquireCodexOperationScope, codexOperationAuthorityIdentity } from "./codex-operation-scope.js";
 import fs from "node:fs/promises";
 import { collectCodeInventory, normalizeCodeCoverage, type CodeInventory } from "./code-cross-check-coverage.js";
 import { decodeCrossCheckClaim, decodeCodeSnapshotCleanup } from "./code-cross-check-contract.js";
@@ -212,7 +212,7 @@ export class CrossCheckRunner {
         if (registration === undefined || op.kind !== "checker") return undefined;
         const token = this.opts.activeRuns?.setAccountCooldown(runId, generation, op, registration);
         return token === undefined ? undefined : () => this.opts.activeRuns?.clearAccountCooldown(runId, generation, token);
-      }, ["checker"], this.log) : undefined;
+      }, ["checker"], this.log, codexOperationAuthorityIdentity(claim.secrets.codex.capability)) : undefined;
     operation?.own();
     try {
       const ack = await this.client.reportState(runId, { status: "running", claim_generation: claim.claim_generation });
