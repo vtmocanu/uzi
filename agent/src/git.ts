@@ -2092,6 +2092,19 @@ export interface AttemptLedgerEntry {
   state: AttemptLedgerState;
 }
 
+/** issue #4007 M3: {@link GitCache.readTerminalAttribution}'s result. */
+export type TerminalAttribution =
+  | { kind: "verified";
+      attempts: Array<{ attemptId: string; clonePath: string; branch: string; state: AttemptLedgerState }>;
+      journal: Array<{ branch: string; clonePath: string; attemptId?: string }>;
+      stoppedMarkers: Array<{ branch: string; clonePath: string }>;
+      protected: Array<{ branch: string; key: string; clonePaths: string[] }>;
+      owedRoots: string[] }
+  | { kind: "unknown"; cause: string };
+
+/** issue #4007 M3: why {@link GitCache.readTerminalCloneLocalRefs} refused. */
+export type TerminalLocalRefReason = "stash" | "linked_worktree" | "not_ancestor" | "stderr" | "cap" | "unreadable";
+
 // ---- issue #3638: the cooperative memory-park record (strict v1 parser) ---------------------------------------
 
 const MEMORY_PARK_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -16005,6 +16018,125 @@ export class GitCache {
     } finally {
       this.checkRecoveryInterruption();
       if (physicalFailure) this.warnRecoveryPhysicalFailure();
+    }
+  }
+
+  /** issue #4007 M3 (read-only): the worker's bares, strictly enumerated. Any failure propagates; a caller treats it as unproved. */
+  listRunBares(): Promise<string[]> {
+    return this.retainedBares(undefined, { strict: true });
+  }
+
+  /**
+   * issue #4007 M3 (read-only): the attribution of ONE bare for ONE run, read under the bare lock inside the caller's
+   * report-proof budget. It reuses the strict parsers of {@link readInventoryCloneHeadsUnderLock}: a malformed ledger value,
+   * journal, stopped marker or protected record is `unknown` (FINAL cannot skip malformed evidence). The attempt ledger
+   * carries no generation; the generation is only what the attempt id embeds ({@link attemptGeneration}).
+   * Nothing is written, retired or repaired.
+   */
+  async readTerminalAttribution(barePath: string, runId: string, budget: { signal: AbortSignal; deadline: number }): Promise<TerminalAttribution> {
+    try {
+      return await this.withReportProofBudget(budget, async (): Promise<TerminalAttribution> => {
+        if (typeof runId !== "string" || !OWED_RUN_ID.test(runId)) return { kind: "unknown", cause: "invalid_run" };
+        await this.assertOwedBare(barePath);
+        return await this.withLock(barePath, async (): Promise<TerminalAttribution> => {
+          this.checkReportProof();
+          const entries = await this.configEntries(barePath);
+          const bad = (cause: string): TerminalAttribution => ({ kind: "unknown", cause });
+          const ledger = new Map<string, AttemptLedgerEntry & { branch: string }>();
+          for (const [branch, raw] of await this.readAllAttemptLedgerRaw(barePath, entries)) {
+            const parsed = parseAttemptLedgerEntry(raw);
+            if (!parsed) return bad("malformed_ledger");
+            ledger.set(parsed.attemptId, { ...parsed, branch });
+          }
+          const attempts = [...ledger.values()].filter(e => e.runId === runId)
+            .map(e => ({ attemptId: e.attemptId, clonePath: e.clonePath, branch: e.branch, state: e.state }))
+            .sort((a, b) => (a.attemptId < b.attemptId ? -1 : a.attemptId > b.attemptId ? 1 : 0));
+          const journal: Array<{ branch: string; clonePath: string; attemptId?: string }> = [];
+          for (const item of entries) {
+            const nl = item.indexOf("\n");
+            const key = nl < 0 ? item : item.slice(0, nl);
+            const match = /^uzi-recovery\.(.+)\.clone$/.exec(key);
+            if (!match) continue;
+            if (nl < 0) return bad("valueless_journal");
+            if (item.slice(nl + 1) === "") continue; // retirement clears the key; the latest value is authoritative
+            let entry: RecoveryJournalEntry | undefined;
+            try { entry = await this.readRecoveryCapture(barePath, match[1]!, entries); } catch { return bad("malformed_journal"); }
+            if (!entry) return bad("malformed_journal");
+            if (entry.runId !== runId) continue;
+            for (const source of this.recoverySources(entry)) {
+              const row = { branch: match[1]!, clonePath: source.clonePath, ...(source.attemptId === undefined ? {} : { attemptId: source.attemptId }) };
+              if (!journal.some(j => j.branch === row.branch && j.clonePath === row.clonePath)) journal.push(row);
+            }
+          }
+          const markers = await this.readStoppedMarkers(barePath, entries);
+          if (markers.malformed.length > 0 || markers.overflow.size > 0) return bad("malformed_marker");
+          const stoppedMarkers = markers.valid.filter(v => v.marker.runId === runId)
+            .map(v => ({ branch: v.marker.branch, clonePath: v.marker.clonePath }));
+          const protectedRows = (await this.protectedRecoveries(barePath)).filter(r => r.journal.runId === runId)
+            .map(r => ({ branch: r.branch, key: r.key, clonePaths: this.recoverySources(r.journal).map(s => s.clonePath) }));
+          const owedRoots = (await this.enumerateOwedUnderLock(barePath, runId)).map(c => c.sha);
+          return { kind: "verified", attempts, journal, stoppedMarkers, protected: protectedRows, owedRoots };
+        });
+      });
+    } catch (error) {
+      return { kind: "unknown", cause: budget.signal.aborted || Date.now() >= budget.deadline ? "deadline" : gitErrorMessage(error).slice(0, 200) };
+    }
+  }
+
+  /**
+   * issue #4007 M3 (read-only): is every local ref of the clone, `refs/remotes/origin/*` included, an ancestor of `head`, with
+   * no stash and no linked worktree? Unlike {@link localRefsReachableFrom}, reachability from the bare's refs or from tracking
+   * state is NEVER evidence: only `head` counts. An annotated tag object is not a commit and is refused as `not_ancestor`
+   * (conservative). Refs are read as the runner uid in the clone and the ancestry question is chunked `rev-list` in the clone.
+   */
+  async readTerminalCloneLocalRefs(clonePath: string, head: string): Promise<{ ok: true } | { ok: false; reason: TerminalLocalRefReason }> {
+    const refuse = (reason: TerminalLocalRefReason): { ok: false; reason: TerminalLocalRefReason } => ({ ok: false, reason });
+    if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(head) || typeof clonePath !== "string" || !path.isAbsolute(clonePath)) return refuse("unreadable");
+    let stderr = "";
+    let oversized = false;
+    try {
+      this.checkReportProof();
+      const dotGit = await fs.lstat(path.join(clonePath, ".git"));
+      if (!dotGit.isDirectory() || dotGit.isSymbolicLink()) return refuse("unreadable");
+      try {
+        const wt = await fs.lstat(path.join(clonePath, ".git", "worktrees"));
+        if (!wt.isDirectory() || wt.isSymbolicLink()) return refuse("linked_worktree");
+        if ((await fs.readdir(path.join(clonePath, ".git", "worktrees"))).length > 0) return refuse("linked_worktree");
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") return refuse("unreadable");
+      }
+      const env = { ...NO_REPLACE_ENV, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL };
+      const worktrees = await this.runGitAsRunner(clonePath, ["worktree", "list", "--porcelain"], { env });
+      const listed = worktrees.split("\n").filter(line => line.startsWith("worktree ")).length;
+      if (listed !== 1) return refuse(listed > 1 ? "linked_worktree" : "unreadable");
+      const out = await this.runGitAsRunner(clonePath, ["for-each-ref", "--format=%(objectname) %(refname)"], {
+        env,
+        onStderr: (text) => {
+          if (oversized || text === "") return;
+          if (stderr.length + text.length > 4096) { stderr = ""; oversized = true; } else stderr += text;
+        },
+      });
+      if (stderr !== "" || oversized) return refuse("stderr");
+      const shas = new Set<string>();
+      for (const line of out.split("\n")) {
+        if (line === "") continue;
+        const sp = line.indexOf(" ");
+        const sha = line.slice(0, sp), ref = line.slice(sp + 1);
+        if (sp < 0 || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(sha)) return refuse("unreadable");
+        if (ref === "refs/stash") return refuse("stash");
+        shas.add(sha);
+        if (shas.size > MAX_LOCAL_REF_SHAS) return refuse("cap");
+      }
+      const all = [...shas];
+      for (let i = 0; i < all.length; i += LOCAL_REF_REVLIST_CHUNK) {
+        this.checkReportProof();
+        const extra = await this.runGitAsRunner(clonePath,
+          ["rev-list", "--objects", "-n", "1", ...all.slice(i, i + LOCAL_REF_REVLIST_CHUNK), "--not", head], { env: NO_REPLACE_ENV });
+        if (extra.trim() !== "") return refuse("not_ancestor");
+      }
+      return { ok: true };
+    } catch {
+      return refuse("unreadable");
     }
   }
 

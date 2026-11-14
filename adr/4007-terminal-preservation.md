@@ -249,6 +249,44 @@ Nothing below runs in production.
   with CLI, one-worker activation and startup disable, retirement (T3),
   reclaim and custody (C), fleet rollout (E) and hosted acceptance.
 
+#### Source universe and the feasibility gate (M3)
+
+`agent/src/terminal-inventory.ts` composes, read-only, the run's complete
+local source universe: every repo bare (`listRunBares`, strict), the clone
+inventory, the attempt ledger, journal, stopped-marker and protected
+attribution (`readTerminalAttribution`), owed roots, and the run's
+authenticated recovery records. It refuses (keep) on any unknown read,
+contradiction, duplicate, record or bundle outside the universe, foreign bare,
+cap or deadline, any present attempt clone other than the current flight's
+own, any retained predecessor, and any clone-local ref (`origin/*` included)
+that is not an ancestor of the clone HEAD, a stash or a linked worktree.
+Tracking state and reachability from bare refs are never evidence. Known
+limits:
+
+- The attempt ledger carries no generation. A source's generation is parsed
+  from its attempt ID, and bound records report their own generations.
+- Records carry no attempt ID or clone path. A record binds by branch and bare.
+- The existing inventory reports any other run's attribution in the shared
+  bare as a foreign owner. The universe refuses on that, so in a bare shared
+  with other runs it is unproved. This is over-conservative (keep) and must be
+  revisited before any activation; it is not narrowed in slice B.
+
+Feasibility gate. The test "F-gate: an inventory-guarded single-attempt issue
+flight is proved end to end (clean and dirty)" in
+`agent/test/terminal-inventory.test.ts` runs real Git, a real `GitCache` and a
+real `RecoveryCoordinator`.
+
+- Fixture evidence: one bare found by `listRunBares`; one live ledger attempt
+  and its journal binding; one owed root; one authenticated inventory-guarded
+  recovery record bound to the attempt (generation 1); one proved source with
+  the clone HEAD and `dev:ino`; roots `current_head` and `owed`; label
+  `branch_source`; the omission check accepts the matching manifest and
+  refuses it with a root omitted.
+- Inferred, not yet evidenced: that the read happens at the joined boundary
+  before the terminal report, the capture limits and dirty capture (the
+  universe does not read dirty content), and egress binding (the claim carries
+  no egress marker, so it is a caller-supplied input).
+
 The remaining sections of slice B (capture, preparation, records and
 callers) are filled in as they land.
 

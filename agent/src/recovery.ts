@@ -7904,6 +7904,21 @@ export class RecoveryCoordinator {
     return out;
   }
 
+  /**
+   * issue #4007 M3 (read-only): this run's authenticated recovery records, or `unknown`. It is the strict
+   * {@link checkedRecords} pass: every `.json` entry must authenticate as a record of this run and every other entry
+   * must be a bundle of one of them (or this coordinator's own crash-era temp), so an unreadable, foreign or
+   * unattributed entry is `unknown`, never an empty or partial list. A run with no directory has no records.
+   */
+  async readTerminalRecords(runId: string, budget: { signal: AbortSignal; deadline: number }):
+    Promise<{ kind: "records"; records: RecoveryRecord[] } | { kind: "unknown" }> {
+    try {
+      return { kind: "records", records: await this.checkedRecords(runId, budget, true, true) };
+    } catch {
+      return { kind: "unknown" };
+    }
+  }
+
   private async findRecord(
     runId: string,
     predicate: (r: RecoveryRecord) => boolean,
