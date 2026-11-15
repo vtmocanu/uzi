@@ -57,6 +57,16 @@ async function registered(url: string, caps: string[] = ["credential_switch_v1",
 const json = (status: number, body: unknown): Reply => ({ status, body: JSON.stringify(body) });
 
 describe("applyCredentialSwitch classification", () => {
+  it("an already aborted apply never sends and remains uncertain", async () => {
+    const s = await server(() => json(200, { outcome: "superseded" }));
+    try {
+      const c = await registered(s.url);
+      const got = await c.applyCredentialSwitch("run-1", REQ, AbortSignal.abort());
+      assert.equal(got.kind, "uncertain");
+      assert.equal(s.posts.length, 0);
+    } finally { await s.close(); }
+  });
+
   const cases: Array<[string, Reply, Record<string, unknown>]> = [
     ["exact chi 404", { status: 404, headers: { "Content-Type": "text/plain; charset=utf-8" }, body: "404 page not found\n" }, { kind: "route_absent" }],
     ["exact chi 404 without newline", { status: 404, headers: { "Content-Type": "text/plain" }, body: "404 page not found" }, { kind: "route_absent" }],

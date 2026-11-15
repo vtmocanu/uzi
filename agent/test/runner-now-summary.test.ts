@@ -19,6 +19,7 @@ import { defaultGitleaksShim } from "./gitleaks-shim.js";
 import type { Executor, RunContext } from "../src/executor.js";
 import { GitLabClient, type FetchFn } from "../src/forge.js";
 import { RunRunner } from "../src/runner.js";
+import { CredentialSwitchSignal } from "../src/steering.js";
 import type { SdkQueryFn } from "../src/sdk-executor.js";
 import { CodexExecutor, CODEX_PRODUCTION_PROVIDER, createCodexEpochAuthority, type CodexAdviceHarnessFactory } from "../src/codex/codex-executor.js";
 import { selectCodexBinding } from "../src/codex/select.js";
@@ -247,6 +248,35 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
     anthropic_oauth_token: "oauth-fixture-token",
     codex: { auth_mode: "subscription", access_token: "claim-key", capability: "cap", generation: 3, chatgpt_account_id: "verified-account", chatgpt_plan_type: null },
   };
+
+  for (const entry of ["escaped", "claude_hook"] as const) {
+    it(`M2 Codex ${entry} retains work without legacy release`, async () => {
+      const claim = claimFor(2625, { secrets: CODEX_SECRETS });
+      let worktree = "";
+      let entered = false;
+      const runner = runnerFor({
+        async run(ctx) {
+          entered = true;
+          worktree = ctx.worktreePath;
+          fs.writeFileSync(path.join(worktree, "retained.txt"), "pending switch work");
+          if (entry === "claude_hook") await ctx.attemptCredentialSwitch!({ site: "implement_turn", laneSettled: true });
+          throw new CredentialSwitchSignal();
+        },
+      });
+      let legacyCalls = 0;
+      const legacy = runner as unknown as { enterCredentialSwitch(...args: unknown[]): Promise<never> };
+      legacy.enterCredentialSwitch = async () => { legacyCalls++; throw new Error("legacy release entered"); };
+      await runner.execute(claim);
+      assert.equal(legacyCalls, 0);
+      assert.equal(entered, true);
+      assert.equal(fs.readFileSync(path.join(worktree, "retained.txt"), "utf8"), "pending switch work");
+      const statuses = api.states.filter(s => s.runId === claim.run_id).map(s => s.body.status);
+      assert.ok(!statuses.includes("credential_switch"), JSON.stringify(statuses));
+      assert.ok(!statuses.includes("credential_switch_failed"), JSON.stringify(statuses));
+      assert.ok(!statuses.includes("failed"), JSON.stringify(statuses));
+      assert.ok(!statuses.includes("completed"), JSON.stringify(statuses));
+    });
+  }
 
   /** A fake production factory: records the build params and each request, answers like luna. */
   function lunaFactory(rec: { builds: unknown[]; requests: AdviceRequest[] }, text = "Running the api gate for the docs milestone"): CodexAdviceHarnessFactory {

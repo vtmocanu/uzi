@@ -2136,7 +2136,7 @@ export class WorkerClient {
    * supportsInPlaceCredentialSwitch() or supportsInPlaceCodexCredentialSwitch() first. The shared
    * request has no harness discriminator; either independently negotiated lane authorizes it.
    */
-  async applyCredentialSwitch(runId: string, req: CredentialSwitchApplyRequest): Promise<CredentialSwitchApplyResult> {
+  async applyCredentialSwitch(runId: string, req: CredentialSwitchApplyRequest, signal?: AbortSignal): Promise<CredentialSwitchApplyResult> {
     if (!this.supportsInPlaceCredentialSwitch() && !this.supportsInPlaceCodexCredentialSwitch())
       throw new Error("applyCredentialSwitch requires supportsInPlaceCredentialSwitch() or supportsInPlaceCodexCredentialSwitch() negotiation");
     const body: Record<string, unknown> = {
@@ -2147,13 +2147,13 @@ export class WorkerClient {
     const uncertain = (detail: string): CredentialSwitchApplyResult => ({ kind: "uncertain", detail });
     let res: Response;
     try {
-      res = await this.fetchRaw("POST", path, body);
+      res = await this.fetchRaw("POST", path, body, this.httpTimeoutMs, signal);
     } catch {
       return uncertain("transport_error");
     }
     let raw: Buffer;
     try {
-      raw = await readBoundedBytes(res, APPLY_RESPONSE_MAX_BYTES, true);
+      raw = await readBoundedBytes(res, APPLY_RESPONSE_MAX_BYTES, true, signal);
     } catch {
       return uncertain("response_unreadable");
     }

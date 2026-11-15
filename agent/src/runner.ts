@@ -6886,6 +6886,16 @@ export class RunRunner {
         });
         await batcher.close().catch(() => undefined);
       } else if (err instanceof CredentialSwitchSignal) {
+        // The Codex executor has unwound: neither continuation A nor Claude release is safe.
+        if (claim.secrets.codex) {
+          flight.preserveRecoveryClone = true;
+          flight.preserveSession = true;
+          flight.keepGuardedInventoryOpen = true;
+          flight.retainedLocalCustody = true;
+          runLog.warn("Codex switch escaped its live boundary; retaining work without release", { run_id: flight.runId });
+          await batcher.close().catch(() => undefined);
+          return;
+        }
         // PRD #1247 M5b (data-integrity fix): a SAFETY NET. The switch is now handled IN PLACE by the
         // executor via ctx.attemptCredentialSwitch — the implement loop's turn catch and each idle
         // held-state waiter (plan gate / question / follow-up) call it and, on a give-up, CONTINUE the
@@ -16941,6 +16951,14 @@ export class RunRunner {
       // issue #1597 M2: gated end to end — from the wip marker captureRecoveryRestorePoint commits to
       // the give-up's undoWipMarker — so a mid-turn tick can never publish that throwaway marker.
       attemptCredentialSwitch: async (opts) => {
+        // This hook belongs to Claude, including its give-up and v1 release outcomes.
+        if (claim.secrets.codex) {
+          flight.preserveRecoveryClone = true;
+          flight.preserveSession = true;
+          flight.keepGuardedInventoryOpen = true;
+          flight.retainedLocalCustody = true;
+          throw new CredentialSwitchRetainedStop();
+        }
         // Issue #3974: an owner cancel was committed while the switch was withheld. Do not enter the
         // switch (no capture, no credential_switch* report): throw the ordinary cancel error so the
         // executor lets it reach executeClaim's dispatchFailure, which reports "run cancelled".
