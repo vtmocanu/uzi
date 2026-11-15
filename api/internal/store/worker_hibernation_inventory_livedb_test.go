@@ -14,7 +14,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// PRD #4208 M1: every query over worker_hibernation_inventories (migration 00454), the batched
+// PRD #4208 M1: every query over worker_hibernation_inventories (migration 00456), the batched
 // retirement-evaluator reads and the poll select's inventory_status column, executed against a
 // real database. Skipped without UZI_TEST_DATABASE_URL (run via e2e/run-store-it.sh).
 
