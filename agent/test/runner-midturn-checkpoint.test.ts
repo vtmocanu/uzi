@@ -6166,7 +6166,8 @@ describe("issue #4313 real SdkExecutor + RunRunner: a stop during the stalled do
   const SESSION = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
   type GateKind = "done" | "resume";
   type GateStage = "range" | "path";
-  type GateStop = "cancel" | "shutdown" | "disk" | "after-scan-shutdown";
+  type GateStop = "cancel" | "shutdown" | "disk" | "after-scan-shutdown" | "entry-cancel" | "entry-shutdown";
+  const isEntry = (s: GateStop): boolean => s === "entry-cancel" || s === "entry-shutdown";
 
   interface GateObservation {
     elapsedMs: number;
@@ -6186,6 +6187,7 @@ describe("issue #4313 real SdkExecutor + RunRunner: a stop during the stalled do
     publishedTips: string[];
     publishCount: number;
     flight: Record<string, unknown>;
+    seeded: { blocked: unknown[]; trigger: { observation: number; tip: string } } | undefined;
   }
 
   async function stalledGate(o: { iid: number; kind: GateKind; stage: GateStage; stop: GateStop }): Promise<GateObservation> {
@@ -6212,7 +6214,7 @@ describe("issue #4313 real SdkExecutor + RunRunner: a stop during the stalled do
     let gateError: unknown;
     let gateSettledAt = 0;
     let gateSettledWhileChildAlive = false;
-    const stallMode = o.stop === "after-scan-shutdown" ? "pass" : o.stage === "range" ? "stall-git" : "stall-stdin";
+    const stallMode = o.stop === "after-scan-shutdown" || isEntry(o.stop) ? "pass" : o.stage === "range" ? "stall-git" : "stall-stdin";
     let secretSha = "";
     const plantAndStall = (tree: string): void => {
       secretSha = commitIn(tree, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
@@ -6253,6 +6255,13 @@ describe("issue #4313 real SdkExecutor + RunRunner: a stop during the stalled do
         const orig = ctx.secretRemediationGate!;
         ctx.secretRemediationGate = async (options) => {
           try {
+            // A stop already standing when the gate is entered: shutdown is synchronous; a cancel is delivered by
+            // input polling, so wait until it is recorded before the gate runs.
+            if (o.stop === "entry-shutdown") runnerRef!.shutdown();
+            if (o.stop === "entry-cancel") {
+              api.setInputs(claim.run_id, [{ id: 1, kind: "cancel" }]);
+              await bounded(waitFor(() => ctx.cancelRequested?.() === true, 10_000), 11_000, "the cancel to be recorded", "control");
+            }
             return await orig(options);
           } catch (e) {
             gateError = e;
@@ -6280,16 +6289,29 @@ describe("issue #4313 real SdkExecutor + RunRunner: a stop during the stalled do
     const internals = runner as unknown as { runSecretRemediationGate: (f: Record<string, unknown>, ...rest: unknown[]) => Promise<unknown> };
     const origGate = internals.runSecretRemediationGate.bind(runner);
     let flight: Record<string, unknown> | undefined;
-    internals.runSecretRemediationGate = (f, ...rest) => { flight = f; return origGate(f, ...rest); };
+    let seeded: GateObservation["seeded"];
+    internals.runSecretRemediationGate = (f, ...rest) => {
+      flight = f;
+      if (isEntry(o.stop)) {
+        // Seed a prior blocked set and a pending mid-run trigger: a stopped gate must keep both untouched.
+        const st = (f.secretRemediation ??= { attempts: 0 }) as Record<string, unknown>;
+        const blocked = [{ file: "cfg.env", startLine: 1, commit: secretSha || "1".repeat(40), ruleId: "generic-api-key" }];
+        const trigger = { observation: 3, tip: secretSha || "2".repeat(40) };
+        st.blocked = blocked.map((b) => ({ ...b }));
+        st.midRunTrigger = { ...trigger };
+        seeded = { blocked, trigger };
+      }
+      return origGate(f, ...rest);
+    };
     let exec: Promise<unknown> | undefined;
     try {
       exec = runner.execute(claim);
       const settled = exec.then(() => undefined, (e: unknown) => e);
-      if (o.stop === "after-scan-shutdown") await bounded(waitFor(() => gateSettledAt > 0, 30_000), 31_000, "the gate to settle", "gate");
+      if (o.stop === "after-scan-shutdown" || isEntry(o.stop)) await bounded(waitFor(() => gateSettledAt > 0, 30_000), 31_000, "the gate to settle", "gate");
       else await bounded(Promise.resolve().then(() => waitFor(() => stall.pids().length > 0, 30_000)), 31_000, "the gate's scan child to stall", "stall");
       const pids = stall.pids();
       const t0 = Date.now();
-      if (o.stop === "after-scan-shutdown") { /* the hook already stopped the worker */ }
+      if (o.stop === "after-scan-shutdown" || isEntry(o.stop)) { /* the stop was raised before the gate ran */ }
       else if (o.stop === "cancel") api.setInputs(claim.run_id, [{ id: 1, kind: "cancel" }]);
       else if (o.stop === "shutdown") runner.shutdown();
       else (flight!.steering as { requestDiskStop: () => void }).requestDiskStop();
@@ -6318,6 +6340,7 @@ describe("issue #4313 real SdkExecutor + RunRunner: a stop during the stalled do
         publishedTips: [...pub.tips],
         publishCount: pub.count(),
         flight: flight!,
+        seeded,
       };
     } finally {
       stall.setMode("pass");
@@ -6346,7 +6369,7 @@ describe("issue #4313 real SdkExecutor + RunRunner: a stop during the stalled do
   };
 
   const iidOf = (kind: GateKind, stage: GateStage, stop: GateStop): number =>
-    4313_000 + (kind === "done" ? 0 : 100) + (stage === "range" ? 0 : 10) + ["cancel", "shutdown", "disk"].indexOf(stop);
+    4313_000 + (kind === "done" ? 0 : 100) + (stage === "range" ? 0 : 10) + ["cancel", "shutdown", "disk", "entry-cancel", "entry-shutdown"].indexOf(stop);
 
   for (const kind of ["done", "resume"] as const) {
     for (const stage of ["range", "path"] as const) {
@@ -6363,6 +6386,32 @@ describe("issue #4313 real SdkExecutor + RunRunner: a stop during the stalled do
           }
         });
       }
+    }
+  }
+
+  // A stop already standing when the gate is entered must route its control and leave the blocked set and the
+  // pending mid-run trigger exactly as seeded (it must not fail on the old blocked set, nor clear the trigger).
+  for (const kind of ["done", "resume"] as const) {
+    for (const stop of ["entry-cancel", "entry-shutdown"] as const) {
+      it(`${kind} gate: ${stop} with a seeded blocked set: throws the stop, keeps blocked and the trigger, takes the control's route`, { timeout: 90_000 }, async () => {
+        const obs = await stalledGate({ iid: iidOf(kind, "range", stop), kind, stage: "range", stop });
+        const { SecretRemediationStoppedError } = await import("../src/executor.js");
+        assert.ok(obs.gateError instanceof SecretRemediationStoppedError, `the gate threw SecretRemediationStoppedError (${String(obs.gateError)})`);
+        assert.ok(obs.seeded, "the state was seeded");
+        assert.deepEqual(obs.state?.blocked, obs.seeded.blocked, "the blocked set was kept");
+        assert.deepEqual(obs.state?.midRunTrigger, obs.seeded.trigger, "the pending mid-run trigger was kept");
+        assert.ok(obs.prompts.every((p) => !REMEDIATION_PROMPT.test(p)), "no remediation guidance was prompted");
+        assert.notEqual(obs.end?.fail_origin, "push_secret_blocked", "not failed on the old blocked set");
+        assert.notEqual(obs.end?.failure_reason, "push_secret_blocked");
+        if (stop === "entry-cancel") {
+          assert.equal(obs.end?.status, "failed");
+          assert.equal(obs.end?.failure_reason, "run cancelled", "the executor's cancel route");
+          assert.ok(obs.thrown.some((e) => e instanceof Error && e.message === "run cancelled"), `the executor threw run cancelled (${obs.thrown.map(String).join("; ")})`);
+        } else {
+          assert.equal(obs.final, undefined, "a worker shutdown leaves the run non-terminal for recovery");
+          assert.notEqual(obs.end?.status, "failed", "no failed end state");
+        }
+      });
     }
   }
 

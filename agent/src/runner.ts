@@ -21262,6 +21262,8 @@ export class RunRunner {
       if (refusal !== undefined) throw refusal;
       throw new SecretRemediationStoppedError();
     };
+    // A stopped scope routes its control and keeps the blocked set and the pending midRunTrigger; it must not fail on an old blocked set.
+    throwIfStopped();
     if (state.blocked && state.blocked.length > 0) return { action: "fail" };
     if (!barePath) return { action: "proceed" };
     const branch = runnerClone.branch;
