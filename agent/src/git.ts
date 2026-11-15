@@ -20775,6 +20775,7 @@ try {
     };
     const cloneRef = `refs/uzi-terminal-local/${opts.runId}/g${opts.generation}`;
     const bareRef = cloneRef;
+    let transferBudgeted = false;
     // `strictStderr` fails closed on ANY stderr from an enumeration or staging read (git reports a directory or file
     // it could not read as a warning on a zero exit, so the walk would silently omit work); there is no allowlist.
     const git = async (args: string[], extra: { env?: NodeJS.ProcessEnv; input?: string; overflow?: string; strictStderr?: boolean } = {}): Promise<string> => {
@@ -21075,7 +21076,10 @@ try {
         if (current !== commit) return refused("clone_ref_exists");
       }
       await opts.seam?.afterCloneRef?.();
-      await this.withLock(opts.barePath, async () => {
+      // The lock wait and every bare child git call run under the capture's own budget: an abort or the deadline
+      // forfeits a queued wait without running, and clamps, kills and awaits a running child.
+      transferBudgeted = true;
+      await this.withReportProofBudget({ signal: opts.signal ?? new AbortController().signal, deadline: deadlineAt }, () => this.withLock(opts.barePath, async () => {
         const present = (await this.runGit(opts.barePath, ["for-each-ref", "--format=%(objectname)", bareRef])).trim();
         if (present !== "" && present !== commit) fail("bare_ref_conflict");
         if (!(await alternatesClean())) fail("alternates_present");
@@ -21115,18 +21119,22 @@ try {
             else if (type !== "blob" || !newBlobs.has(oid)) fail("foreign_object");
           }
           if (commits !== 1 || trees > maxTrees) fail("foreign_object");
+          left();
           if (present !== commit) await this.runGit(opts.barePath, ["update-ref", bareRef, commit, ""]);
           if ((await this.runGit(opts.barePath, ["for-each-ref", "--format=%(objectname)", bareRef])).trim() !== commit) fail("bare_transfer_mismatch");
         } finally {
-          // Only the staging ref is dropped, never the final ref.
-          const staged = (await this.runGit(opts.barePath, ["for-each-ref", "--format=%(objectname)", stage]).catch(() => "")).trim();
-          if (staged !== "") {
-            await this.runGit(opts.barePath, ["update-ref", "-d", stage, staged]).catch((cleanup: unknown) => {
-              this.log.warn("terminal snapshot staging ref cleanup failed", { error: gitErrorMessage(cleanup) });
-            });
-          }
+          // Only the staging ref is dropped, never the final ref. Cleanup runs outside the capture's budget (still under
+          // the lock) so an expired budget does not leave our staging ref behind.
+          await this.reportProofs.exit(async () => {
+            const staged = (await this.runGit(opts.barePath, ["for-each-ref", "--format=%(objectname)", stage]).catch(() => "")).trim();
+            if (staged !== "") {
+              await this.runGit(opts.barePath, ["update-ref", "-d", stage, staged]).catch((cleanup: unknown) => {
+                this.log.warn("terminal snapshot staging ref cleanup failed", { error: gitErrorMessage(cleanup) });
+              });
+            }
+          });
         }
-      });
+      }));
       await git(["update-ref", "-d", cloneRef, commit]);
       if (!sameInvariants(before, await invariants())) return refused("invariant_changed");
       try { await opts.onPhase?.("captured", { cloneRef, bareRef, commit }); }
@@ -21134,6 +21142,10 @@ try {
       return { kind: "captured", root: commit, parent: head, tree, ignored };
     } catch (err) {
       if (err instanceof TerminalSnapshotRefusal) return refused(err.reason);
+      // A lapse of this capture's own budget alone is a refusal; the outer boundary's abort is rethrown below.
+      if (transferBudgeted && !this.boundaryProcesses.getStore()?.signal.aborted && (opts.signal?.aborted || Date.now() >= deadlineAt)) {
+        return refused(opts.signal?.aborted ? "aborted" : "deadline");
+      }
       if (err instanceof GitBoundaryAbortError || err instanceof CheckpointSoftDeadlineError || isCheckpointBoundaryFailure(err)) throw err;
       this.log.warn("terminal snapshot failed (refused)", { cwd: clonePath, error: gitErrorMessage(err) });
       return refused("error");

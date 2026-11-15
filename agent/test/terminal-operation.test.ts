@@ -857,6 +857,39 @@ describe("terminal record byte bound on write", () => {
     assert.ok(Buffer.byteLength(JSON.stringify(r), "utf8") > 256 * 1024);
   });
 
+  // BMP multibyte chars JSON does not escape: the serialized UTF-16 length is within the limit while the UTF-8 bytes are not,
+  // so only a byte-based bound (not a string-length bound) refuses it.
+  const multibyte = (unit: string): TerminalManifest => bigManifest(50, unit, 4000);
+  const mac = "0".repeat(64);
+  const assertLengthWithinBytesOver = (r: TerminalOperationRecord) => {
+    const serialized = JSON.stringify({ ...r, mac });
+    assert.ok(serialized.length <= 256 * 1024, `serialized length ${serialized.length} is within the limit`);
+    assert.ok(Buffer.byteLength(serialized, "utf8") > 256 * 1024, "its UTF-8 bytes exceed the limit");
+  };
+
+  for (const [name, unit] of [["euro (3 bytes)", "\u20AC"], ["e-acute (2 bytes)", "\u00E9"]] as const) {
+    it(`a ${name} create whose string length fits but whose bytes exceed the limit is an error that creates no file`, async () => {
+      const root = mkRoot();
+      const store = mkCoord(root).terminalOperationStore();
+      const r = rec({ manifest: multibyte(unit) });
+      assertLengthWithinBytesOver(r);
+      assert.equal((await store.create(r)).kind, "error");
+      assert.equal(fs.existsSync(path.join(root, "terminal-preservation")), false);
+    });
+
+    it(`a ${name} update whose string length fits but whose bytes exceed the limit leaves the prior file byte-identical`, async () => {
+      const root = mkRoot();
+      const store = mkCoord(root).terminalOperationStore();
+      assert.equal((await store.create(rec())).kind, "created");
+      const before = fs.readFileSync(recFile(root));
+      assertLengthWithinBytesOver(rec({ manifest: multibyte(unit) }));
+      assert.equal((await store.update(RUN, 1, { manifest: multibyte(unit) })).kind, "error");
+      assert.deepEqual(fs.readFileSync(recFile(root)), before);
+      assert.equal((await store.read(RUN, 1)).kind, "ok");
+      assert.deepEqual(fs.readdirSync(tpDir(root)), ["g1.json"]);
+    });
+  }
+
   it("an oversized update is an error that leaves the prior file byte-identical and readable", async () => {
     const root = mkRoot();
     const store = mkCoord(root).terminalOperationStore();

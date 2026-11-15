@@ -609,6 +609,57 @@ describe("captureTerminalSnapshot", () => {
     assert.match(f.refsOf(f.bare), /refs\/uzi-terminal-local\/run-1\/g2 [0-9a-f]{40}/);
   });
 
+  async function heldBareLock(f: Awaited<ReturnType<typeof fixture>>, holdMs: number) {
+    const empty = run(f.bare, "mktree");
+    const env = ["-c", "user.name=a", "-c", "user.email=a@b.c"];
+    const base = run(f.bare, "rev-parse", "HEAD");
+    const root = run(f.bare, ...env, "commit-tree", empty, "-m", "holder root");
+    let started!: () => void;
+    const holdStarted = new Promise<void>((res) => { started = res; });
+    const holder = f.git.buildTerminalAggregate(f.bare, {
+      base, extraRoots: [root], runId: "run-holder", generation: 1,
+      seam: { afterLink: async () => { started(); await new Promise<void>((res) => setTimeout(res, holdMs)); } },
+    });
+    await holdStarted;
+    return { holder };
+  }
+
+  test("a capture whose deadline lapses while queued behind the bare lock is refused promptly and mutates nothing later", async (t) => {
+    const f = await fixture(t);
+    await f.write("new.txt", "brand new\n");
+    const holdMs = 6000;
+    const { holder } = await heldBareLock(f, holdMs);
+    const started = Date.now();
+    const result = await f.capture({ deadlineMs: 2500 });
+    const elapsed = Date.now() - started;
+    assert.deepEqual(result, { kind: "refused", reason: "deadline" });
+    assert.ok(elapsed < holdMs - 1500, `refused while the lock was still held (elapsed ${elapsed}ms)`);
+    const cloneRefLine = f.refsOf(f.root).split("\n").find((l) => l.startsWith(f.ref));
+    const commit = cloneRefLine?.split(" ")[1];
+    assert.match(commit ?? "", /^[0-9a-f]{40}$/, "record-first: the clone ref stays");
+    assert.ok("tip" in await holder);
+    await new Promise<void>((res) => setTimeout(res, 300));
+    assert.equal(run(f.bare, "for-each-ref", f.ref), "", "no final ref lands after the lock is released");
+    assert.equal(run(f.bare, "for-each-ref", "refs/uzi-incoming/"), "", "no staging ref");
+    assert.throws(() => run(f.bare, "cat-file", "-e", commit!), "the snapshot commit never reached the bare");
+  });
+
+  test("a capture aborted by its signal while queued behind the bare lock is refused aborted and mutates nothing later", async (t) => {
+    const f = await fixture(t);
+    await f.write("new.txt", "brand new\n");
+    const { holder } = await heldBareLock(f, 6000);
+    const ac = new AbortController();
+    setTimeout(() => ac.abort(), 2500);
+    const started = Date.now();
+    const result = await f.capture({ signal: ac.signal });
+    assert.deepEqual(result, { kind: "refused", reason: "aborted" });
+    assert.ok(Date.now() - started < 4500);
+    assert.ok("tip" in await holder);
+    await new Promise<void>((res) => setTimeout(res, 300));
+    assert.equal(run(f.bare, "for-each-ref", f.ref), "");
+    assert.equal(run(f.bare, "for-each-ref", "refs/uzi-incoming/"), "");
+  });
+
   test("a failing capturing callback refuses before any clone ref", async (t) => {
     const f = await fixture(t);
     await f.write("new.txt", "brand new\n");

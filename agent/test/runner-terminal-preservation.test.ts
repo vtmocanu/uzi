@@ -347,6 +347,27 @@ describe("terminal-preservation lane (#4007 slice B)", () => {
     assert.equal(r.store.record, undefined);
   });
 
+  it("a cooperative quiesce that honours the deadlineAt it receives returns the lane kept within its budget", async () => {
+    const cap = 200;
+    let received: number | undefined;
+    const r = rig({ env: { quiesce: async o => {
+      received = o.deadlineAt;
+      await new Promise(res => setTimeout(res, Math.max(0, o.deadlineAt - Date.now())));
+      throw new Error("quiescence deadline");
+    } } });
+    r.env.hooks = { ...r.env.hooks!, capMs: cap, deps: { ...r.env.hooks!.deps!, universe: async () => { r.order.push("universe"); throw new Error("must not run"); } } };
+    const started = Date.now();
+    const out = await preserveInLane(r.env, r.flight, body);
+    const elapsed = Date.now() - started;
+    assert.ok(received !== undefined, "quiesce received its deadline");
+    assert.equal(out.outcome, "kept");
+    assert.ok(out.reason === "deadline" || out.reason === "not_quiescent", `reason ${out.reason}`);
+    assert.ok(elapsed < 1500, `returned within the cap plus slack (took ${elapsed} ms)`);
+    assert.deepEqual(r.order, [], "no universe or capture call");
+    assert.equal(r.sends, 0);
+    assert.equal(r.store.record, undefined, "nothing stored");
+  });
+
   it("a permit abort during quiesce keeps the work: deadline, nothing read, captured or stored", async () => {
     const permit = new AbortController();
     const r = rig({ env: { signal: permit.signal, quiesce: async () => { permit.abort(); } } });
