@@ -642,15 +642,15 @@ export function buildSignalMcpServer(
                 // treated as nonoptional by output-mode validation (and listed as
                 // `required` in output-mode JSON Schema), so MCP tool-call validation
                 // rejected a call omitting it (-32602, seen via the deferred ToolSearch
-                // path). The handler ignores args; scanSignals treats a missing array as [].
+                // path). The handler ignores args; scanSignals treats a missing side as [].
                 completed: z
-                  .array(z.string())
+                  .union([z.array(z.string()), z.string()])
                   .optional()
-                  .describe("Milestone ids reported complete (cumulative; repeats are fine)."),
+                  .describe("Milestone ids reported complete (cumulative; repeats are fine); a single id string is also accepted."),
                 in_progress: z
-                  .array(z.string())
+                  .union([z.array(z.string()), z.string()])
                   .optional()
-                  .describe("Milestone ids currently being worked on (a snapshot, replaced each call)."),
+                  .describe("Milestone ids currently being worked on (a snapshot, replaced each call); a single id string is also accepted."),
                 milestones_agents: z
                   .array(z.object({ id: z.string(), agent: z.string(), agent_label: z.string().optional() }))
                   .optional()
@@ -835,6 +835,16 @@ function parseMilestones(raw: unknown): Milestone[] {
     });
   }
   return out;
+}
+
+/**
+ * Parse one side (`completed` or `in_progress`) of a report_progress call. The MCP schema
+ * accepts a bare id string as well as an array, so a string becomes a one-element list
+ * before parseProgressIds clamps it; any other non-array still yields []. Used only by
+ * the report_progress scan: signal_done's `milestones_completed` stays array-only.
+ */
+function parseProgressSide(raw: unknown): string[] {
+  return parseProgressIds(typeof raw === "string" ? [raw] : raw);
 }
 
 /**
@@ -1186,7 +1196,7 @@ export function scanSignals(message: unknown, opts: SignalScanOptions = {}): Sca
       // deduped, bad entries dropped, never throws).
       //
       // PRD #390 D3: an all-empty report_progress is NO SIGNAL. If neither side carries a
-      // real id after parsing (a `{}`, a defaulted, or a non-array-sided call), we assign
+      // real id after parsing (a `{}`, a defaulted, or a call whose sides are neither string nor array), we assign
       // nothing so out.progress stays undefined — the call never overwrites real progress
       // and never persists a misleading `[]`. A call carrying ANY real id is still a
       // signal. Last-wins within the turn holds for real reports (a later real call still
@@ -1200,8 +1210,8 @@ export function scanSignals(message: unknown, opts: SignalScanOptions = {}): Sca
       // out.progress ONLY when the progress object is being set AND the parsed list is
       // non-empty; it never manufactures a progress signal.
       const input = asRecord(block["input"]);
-      const completed = parseProgressIds(input?.["completed"]);
-      const in_progress = parseProgressIds(input?.["in_progress"]);
+      const completed = parseProgressSide(input?.["completed"]);
+      const in_progress = parseProgressSide(input?.["in_progress"]);
       if (completed.length > 0 || in_progress.length > 0) {
         out.progress = { completed, in_progress };
         const milestones_agents = parseMilestoneAgents(input?.["milestones_agents"]);
