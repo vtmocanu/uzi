@@ -61,10 +61,20 @@ function Where() {
   return <div data-testid="where">{l.pathname + l.search}</div>;
 }
 
+function BrowserBack() {
+  const navigate = useNavigate();
+  return (
+    <button type="button" onClick={() => navigate(-1)}>
+      browser back
+    </button>
+  );
+}
+
 function renderAt(entry: string, navTo?: string) {
   return render(
     <MemoryRouter initialEntries={[entry]}>
       {navTo && <Nav to={navTo} />}
+      <BrowserBack />
       <Where />
       <Skills />
     </MemoryRouter>,
@@ -122,6 +132,28 @@ describe("Skills deep-link view (#4373)", () => {
     expect(screen.getByTestId("where").textContent).toBe("/skills");
     await act(async () => {});
     expect(screen.queryByRole("button", { name: "Back" })).toBeNull();
+  });
+
+  it("browser Back from a deep-linked view returns to the list", async () => {
+    renderAt("/skills", linkFor("s-global"));
+    await screen.findByText("odd-skill");
+    fireEvent.click(screen.getByRole("button", { name: "go" }));
+    await screen.findByRole("heading", { name: "argocd-debugging" });
+    fireEvent.click(screen.getByRole("button", { name: "browser back" }));
+    await screen.findByText("odd-skill");
+    expect(screen.getByTestId("where").textContent).toBe("/skills");
+    expect(screen.queryByRole("button", { name: "Back" })).toBeNull();
+  });
+
+  it("navigating from a deep-linked view to an unknown or product id closes that view", async () => {
+    for (const id of ["nope", "s-product"]) {
+      const view = renderAt(linkFor("s-global"), linkFor(id));
+      await screen.findByRole("heading", { name: "argocd-debugging" });
+      fireEvent.click(screen.getByRole("button", { name: "go" }));
+      await screen.findByText("odd-skill");
+      expect(screen.queryByRole("button", { name: "Back" })).toBeNull();
+      view.unmount();
+    }
   });
 
   it("re-navigating to the same skill after Back reopens it (new location.key)", async () => {

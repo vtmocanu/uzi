@@ -90,15 +90,30 @@ export function Skills() {
   const [searchParams, setSearchParams] = useSearchParams();
   const skillParam = searchParams.get("skill");
   const consumedLocationKey = useRef<string | null>(null);
+  // The skill id whose view the deep link opened. Navigation that removes `skill` (browser
+  // Back) or names no eligible skill closes only that view; an editor or view the viewer
+  // opened themselves is left alone.
+  const deepLinkView = useRef<string | null>(null);
   useEffect(() => {
-    if (!skillParam || loading || !data) return;
+    if (loading || !data) return;
     if (consumedLocationKey.current === location.key) return;
     consumedLocationKey.current = location.key;
-    const target = data.skills.find((s) => s.id === skillParam && s.scope !== "product");
-    if (target) setEdit({ mode: "view", skill: target });
+    const target = skillParam
+      ? data.skills.find((s) => s.id === skillParam && s.scope !== "product")
+      : undefined;
+    if (target) {
+      deepLinkView.current = target.id;
+      setEdit({ mode: "view", skill: target });
+      return;
+    }
+    const owned = deepLinkView.current;
+    if (owned === null) return;
+    deepLinkView.current = null;
+    setEdit((e) => (e?.mode === "view" && e.skill.id === owned ? null : e));
   }, [skillParam, loading, data, location.key]);
   // Back from a deep-linked view also drops `skill` so the URL no longer names it.
   const closeView = () => {
+    deepLinkView.current = null;
     setEdit(null);
     if (searchParams.has("skill")) {
       const next = new URLSearchParams(searchParams);
