@@ -54,7 +54,10 @@ Register a worker and start a run from a board card: see
   worker and plan gate.
 - **The command menu** (Cmd K on macOS, Ctrl K elsewhere, or Search on the
   Overview) jumps to a page, a repo's board, or one of your pending
-  decisions. It only navigates; it never approves or answers for you.
+  decisions. Type to also find a Settings or Admin tab or section, an
+  agent, schedule, worker or skill by name, a recent run by issue number
+  or title, and a doc or one of its headings. It only navigates; it never
+  approves or answers for you.
 - **The browser tab icon** carries a small status dot for the most urgent
   thing across your runs, so a backgrounded tab still tells you: rose once
   one of your runs has freshly failed, amber once one is awaiting your
