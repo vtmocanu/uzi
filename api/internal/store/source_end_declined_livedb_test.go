@@ -151,7 +151,7 @@ func TestSourceEndDeclinedMigrationAndLegacyResumeLiveDB(t *testing.T) {
 	if err := pool.QueryRow(ctx, "SELECT convalidated FROM pg_constraint WHERE conrelid='runs'::regclass AND conname='runs_recovery_wait_detail_check'").Scan(&valid); err != nil || !valid {
 		t.Fatalf("458 CHECK validated: valid=%v err=%v", valid, err)
 	}
-	b, err := os.ReadFile("migrations/00457_retained_source_end_hold.sql")
+	b, err := os.ReadFile("migrations/00462_retained_source_end_hold.sql")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -168,7 +168,7 @@ func TestSourceEndDeclinedMigrationAndLegacyResumeLiveDB(t *testing.T) {
 		}
 		_, err = tx.Exec(ctx, down)
 		_ = tx.Rollback(ctx)
-		if err == nil || !strings.Contains(err.Error(), "refusing rollback 00457") {
+		if err == nil || !strings.Contains(err.Error(), "refusing rollback 00462") {
 			t.Fatalf("Down must refuse %s evidence: %v", status, err)
 		}
 		var detail, nonce string

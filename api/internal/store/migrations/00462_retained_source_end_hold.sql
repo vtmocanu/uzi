@@ -13,7 +13,7 @@ LOCK TABLE runs IN ACCESS EXCLUSIVE MODE;
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM runs WHERE recovery_wait_detail = 'source_end_declined') THEN
-        RAISE EXCEPTION 'refusing rollback 00457 while source-end hold evidence exists';
+        RAISE EXCEPTION 'refusing rollback 00462 while source-end hold evidence exists';
     END IF;
 END
 $$;
