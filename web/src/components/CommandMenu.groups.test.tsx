@@ -249,6 +249,35 @@ describe("failed reads", () => {
     expect(screen.queryByText(/unavailable/)).toBeNull();
   });
 
+  // A list method that throws synchronously (not a rejected promise) must still hide only its
+  // own group; useOnceItems wraps the call so the throw becomes a rejection, never an effect error.
+  it("a list read that throws synchronously hides only that group, without an uncaught error", async () => {
+    all();
+    // The schedules loader is the one non-async arrow, so a synchronous throw reaches the effect.
+    mockApi.listSchedules.mockImplementation(() => {
+      throw new Error("sync boom");
+    });
+    const reported: unknown[] = [];
+    const onError = (e: ErrorEvent) => {
+      reported.push(e.error);
+      e.preventDefault();
+    };
+    window.addEventListener("error", onError);
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await search("zorblax");
+    } finally {
+      window.removeEventListener("error", onError);
+    }
+    const logged = consoleError.mock.calls.flat().map(String).join(" ");
+    consoleError.mockRestore();
+    expect(reported).toEqual([]);
+    expect(logged).not.toContain("sync boom");
+    const l = labels();
+    expect(l).not.toContain("Sweep · label zorblax");
+    for (const other of everything.filter((x) => x !== "Sweep · label zorblax")) expect(l).toContain(other);
+  });
+
   it("a failed run read hides recent runs and decisions", async () => {
     all();
     listRunsMock.mockRejectedValue(new Error("x"));

@@ -1,21 +1,22 @@
-// isInsideDocsDir is the doc-headings Vite plugin's file guard: true only for a .md file
-// inside docsDir (no traversal out of it). The dev server does not apply its fs.allow check
-// to the plugin's ?doc-headings query, so the plugin must bound its own reads. Pure string
-// logic (no node:path) so it type-checks with the app; both paths are absolute POSIX paths
-// or Windows paths with backslashes, normalized here.
-function normalize(p: string): string[] {
-  const out: string[] = [];
-  for (const part of p.replace(/\\/g, "/").split("/")) {
-    if (part === "" || part === ".") continue;
-    if (part === "..") out.pop();
-    else out.push(part);
-  }
-  return out;
-}
+import { realpathSync } from "node:fs";
+import { isAbsolute, relative, sep } from "node:path";
 
+// isInsideDocsDir is the doc-headings Vite plugin's file guard (Node only; the plugin and its
+// test import it, the app bundle never does). The dev server does not apply its fs.allow check
+// to the plugin's ?doc-headings query, so this is the load-bearing boundary: it compares the
+// CANONICAL paths on disk (realpath, so a symlink under docs/ that points elsewhere, or a
+// filename containing a literal backslash, is judged by what it really is) and admits only an
+// existing .md file strictly inside docsDir. Anything it cannot resolve is refused.
 export function isInsideDocsDir(docsDir: string, file: string): boolean {
-  const dir = normalize(docsDir);
-  const f = normalize(file);
-  if (f.length <= dir.length || !f[f.length - 1].endsWith(".md")) return false;
-  return dir.every((seg, i) => f[i] === seg);
+  let dir: string;
+  let real: string;
+  try {
+    dir = realpathSync(docsDir);
+    real = realpathSync(file);
+  } catch {
+    return false;
+  }
+  if (!real.endsWith(".md")) return false;
+  const rel = relative(dir, real);
+  return rel !== "" && !isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${sep}`);
 }
