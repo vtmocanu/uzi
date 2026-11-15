@@ -20902,7 +20902,8 @@ try {
       // A non-finite caller deadline fails closed (already lapsed). Neither opts.signal nor the capture's own
       // deadline applies: both have usually lapsed by the time cleanup runs.
       const deadline = Math.min(Date.now() + (opts.caps?.cleanupMs ?? TERMINAL_CAPTURE_CLEANUP_MS),
-        bound ? (Number.isFinite(bound.deadlineAt) ? bound.deadlineAt : 0) : Infinity, boundary?.softDeadlineAt ?? Infinity);
+        bound?.deadlineAt === undefined ? Infinity : (Number.isFinite(bound.deadlineAt) ? bound.deadlineAt : 0),
+        boundary?.softDeadlineAt ?? Infinity);
       allowance = { deadline, signal: signals.length ? AbortSignal.any(signals) : new AbortController().signal };
       return allowance;
     };
@@ -21191,7 +21192,10 @@ try {
             try { await opts.seam?.afterStagingRead?.(); } catch (err) { unconfirmed(err); return; }
             // Confirmed present but the allowance is spent: no delete is launched, the ref is known to be retained.
             if (allowanceNow.signal.aborted || Date.now() >= allowanceNow.deadline) {
-              stagingRemnant = { ref: stage, oid: present, state: "retained" };
+              // Only a ref still at our commit is known retained; a different oid is reported with both.
+              stagingRemnant = present === commit
+                ? { ref: stage, oid: present, state: "retained" }
+                : { ref: stage, oid: present, expectedOid: commit, state: "unknown" };
               return;
             }
             try { await this.runGit(opts.barePath, ["update-ref", "-d", stage, present]); }
@@ -21202,7 +21206,6 @@ try {
             // A delete was launched: only a confirming read showing the ref gone clears it.
             try { if (await readStage() !== "") stagingRemnant = unknown; } catch (err) { unconfirmed(err); }
           }));
-          if (stagingUnsafe !== undefined) throw stagingUnsafe;
           // Unsafe cleanup outranks the transfer's own failure.
           if (stagingUnsafe !== undefined) throw stagingUnsafe;
           if (transferFailure) throw transferFailure.error;
@@ -21237,14 +21240,17 @@ try {
       const index = privateIndex;
       await underCleanup(async () => {
         for (const leftover of [index, `${index}.lock`]) {
+          const isLock = leftover !== index;
           try {
             if (opts.seam?.indexCleanupError !== undefined) throw opts.seam.indexCleanupError;
+            if (isLock && opts.seam?.indexLockCleanupError !== undefined) throw opts.seam.indexLockCleanupError;
             const remaining = cleanupAllowance().deadline - Date.now();
             if (remaining <= 0) throw new Error("cleanup allowance exhausted");
             await runnerNode(`try{require("fs").rmSync(process.argv[1],{force:true})}catch{process.exitCode=1}`, leftover,
               Math.max(1, Math.min(15_000, Math.floor(remaining))));
           } catch (cleanup) {
-            indexRemnant = index;
+            // The index itself is the remnant; a lock-only failure is logged, not reported.
+            if (!isLock) indexRemnant = index;
             if (isUnsafeCleanup(cleanup)) indexUnsafe ??= cleanup;
             else this.log.warn("terminal snapshot private index cleanup failed", { error: gitErrorMessage(cleanup) });
           }
@@ -28488,20 +28494,22 @@ export interface TerminalSnapshotOptions {
    * Bound the caller's own lane imposes on the post-capture cleanup (staging-ref delete, private-index removal):
    * the cleanup allowance ends at the earlier of `deadlineAt` (absolute `Date.now()` ms), the cleanup cap
    * ({@link TERMINAL_CAPTURE_CLEANUP_MS}) and the boundary scope's soft deadline, and is cancelled by `signal`.
-   * Cleanup is never bound to {@link TerminalSnapshotOptions.signal} or the capture's own deadline, which have
+   * An absent `deadlineAt` means no caller deadline (the cap and soft deadline still apply); a present non-finite
+   * one fails closed. Cleanup is never bound to {@link TerminalSnapshotOptions.signal} or the capture's own deadline, which have
    * usually lapsed by then.
    */
-  cleanupBound?: { deadlineAt: number; signal?: AbortSignal };
+  cleanupBound?: { deadlineAt?: number; signal?: AbortSignal };
   /**
    * Test-only seams; production never passes them. `lockQueued` runs synchronously right after the bare-lock
    * wait is queued (not awaited); `beforeFetch` runs under the lock before the fetch; `inTransfer` after the
    * fetch landed the staging ref; `afterStagingRead` after the cleanup's confirming read of the staging ref;
-   * `indexCleanupError` makes each private-index removal reject with that value.
+   * `indexCleanupError` makes each private-index removal reject with that value; `indexLockCleanupError` does so
+   * for the `.lock` removal only.
    */
   seam?: {
     beforeStaging?: () => Promise<void>; afterCloneRef?: () => Promise<void>;
     lockQueued?: () => void; beforeFetch?: () => Promise<void>; inTransfer?: () => Promise<void>;
-    afterStagingRead?: () => Promise<void>; indexCleanupError?: unknown;
+    afterStagingRead?: () => Promise<void>; indexCleanupError?: unknown; indexLockCleanupError?: unknown;
   };
   /** Test-only lowered caps; production never passes them. */
   caps?: { maxEntries?: number; maxTotalBytes?: number; cleanupMs?: number };
@@ -28510,9 +28518,11 @@ export interface TerminalSnapshotOptions {
  * What a capture could not prove it removed. Absent when the staging ref was confirmed absent or deleted and the
  * private index was removed. `ref` names the bare's staging ref: `state: "retained"` (with `oid`) only when a
  * confirming read inside the cleanup allowance showed it at the snapshot commit and no delete was launched;
- * `state: "unknown"` (with the commit it may hold as `expectedOid`) for every other unconfirmed case (no read was
- * possible, the read failed or was cancelled, or a launched delete was cancelled or failed unconfirmed).
- * `index` is the private index path when its removal did not run or could not be confirmed. Nothing retries
+ * `state: "unknown"` (with the commit it may hold as `expectedOid`, and the `oid` a confirming read observed when
+ * that differs from it) for every other unconfirmed case (no read was possible, the read failed or was cancelled,
+ * the ref was seen at a different oid, or a launched delete was cancelled or failed unconfirmed).
+ * `index` is the private index path when the index file's own removal did not run or could not be confirmed (a
+ * failed `.lock` removal alone is only logged). Nothing retries
  * after the call returns.
  */
 export interface TerminalSnapshotRemnant {

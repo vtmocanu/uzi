@@ -367,14 +367,16 @@ cannot hide untracked work.
 
 Cleanup is bounded. The staging-ref delete and the private-index removal share
 one allowance: the earlier of 2 s (`TERMINAL_CAPTURE_CLEANUP_MS`), the lane's
-`cleanupBound.deadlineAt` and the boundary's soft deadline, cancelled by
+`cleanupBound.deadlineAt` (when the lane has one; absent means no caller
+deadline) and the boundary's soft deadline, cancelled by
 `cleanupBound.signal` or the boundary signal. It is never bound to the
 capture's own signal or deadline, which have usually lapsed. Anything not
 confirmed removed is reported as `remnant` on the result: the staging ref as
 `retained` (confirmed present at the commit, no delete launched) or `unknown`
-(no read was possible, or a launched delete was cancelled or failed
-unconfirmed), and the private index path when its removal did not run or was
-unconfirmed. Nothing retries after the call returns. An error the boundary
+(no read was possible, the ref was seen at a different oid, reported with both
+the observed and expected oid, or a launched delete was cancelled or failed
+unconfirmed), and the private index path when the index file's own removal did
+not run or was unconfirmed (a failed lock-file removal alone is only logged). Nothing retries after the call returns. An error the boundary
 marks `unsafe_cleanup` propagates from every internal handler and both public
 catches instead of becoming a refusal, after the remaining cleanup steps ran.
 

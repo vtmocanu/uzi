@@ -985,6 +985,18 @@ describe("terminal-preservation lane: snapshot cleanup bound and remnant (#4007)
     } finally { s.cleanup(); }
   });
 
+  it("a signal-only permit (no remainder) passes the signal and no deadlineAt", async () => {
+    const permit = new AbortController();
+    const s = snapRig({ signal: permit.signal }, refused);
+    try {
+      await preserveInLane(s.r.env, s.r.flight, body);
+      assert.equal(s.calls.length, 1);
+      const bound = s.calls[0]!.cleanupBound as { deadlineAt?: number; signal?: AbortSignal };
+      assert.equal(bound.signal, permit.signal);
+      assert.equal("deadlineAt" in bound, false);
+    } finally { s.cleanup(); }
+  });
+
   it("logs terminal_snapshot_remnant with the snapshot's remnant", async () => {
     const remnant = { ref: "refs/uzi-terminal-local/x", expectedOid: A, state: "retained" };
     const s = snapRig({}, { kind: "refused", reason: "x", remnant });

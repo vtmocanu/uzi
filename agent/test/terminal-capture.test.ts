@@ -765,6 +765,27 @@ describe("buildTerminalAggregate", () => {
     assert.notEqual(f.refsOf(f.bare), before);
   });
 
+  for (const [label, match] of [
+    ["the root kind probe", (a: string[]) => a.includes("cat-file")],
+    ["the base tree read, after the call's own budget lapsed", (a: string[]) => a.includes("rev-parse")],
+  ] as const) {
+    test(`an unsafe cleanup from ${label} rejects instead of returning a refusal`, async (t) => {
+      const f = await fixture(t);
+      const base = run(f.bare, "rev-parse", "HEAD");
+      const [r1] = await roots(f, 1);
+      const spy = f.git as unknown as { runGit: (cwd: string, args: string[], ...rest: unknown[]) => Promise<string> };
+      const original = spy.runGit.bind(f.git);
+      const ac = new AbortController();
+      t.mock.method(spy, "runGit", async (cwd: string, args: string[], ...rest: unknown[]) => {
+        if (match(args)) { ac.abort(); throw new CheckpointUnsafeCleanupError("cancelled without verified disposal"); }
+        return original(cwd, args, ...rest);
+      });
+      await assert.rejects(f.git.buildTerminalAggregate(f.bare, {
+        base, extraRoots: [r1!], runId: "run-1", generation: 2, budget: { signal: ac.signal, deadline: Date.now() + 60_000 } }),
+        (e) => e instanceof CheckpointUnsafeCleanupError);
+    });
+  }
+
   test("a root missing from the bare is refused", async (t) => {
     const f = await fixture(t);
     const base = run(f.bare, "rev-parse", "HEAD");
@@ -1124,10 +1145,22 @@ describe("captureTerminalSnapshot: index-independent verdict, bounded cleanup, u
     await fs.rm(index!, { force: true });
   });
 
+  test("a signal-only cleanupBound (no deadline) leaves the full cleanup allowance: no staging ref, no private index", async (t) => {
+    const f = await fixture(t);
+    await f.write("new.txt", "brand new\n");
+    const result = await f.capture({ cleanupBound: { signal: new AbortController().signal } });
+    assert.equal(result.kind, "captured", JSON.stringify(result));
+    assert.equal("remnant" in result, false, JSON.stringify(result));
+    assert.equal(stagingRefs(f), "");
+    assert.deepEqual(await f.stray(), []);
+  });
+
   test("retained: allowance exhausted after the confirming read reports the staging ref at the commit and launches no delete", async (t) => {
     const f = await fixture(t);
     await f.write("new.txt", "brand new\n");
-    const result = await f.capture({ caps: { cleanupMs: 400 }, seam: { afterStagingRead: () => new Promise<void>((res) => setTimeout(res, 700)) } });
+    // The seam itself spends the allowance (a cancelled caller bound), so no real time is involved.
+    const ac = new AbortController();
+    const result = await f.capture({ cleanupBound: { signal: ac.signal }, seam: { afterStagingRead: async () => { ac.abort(); } } });
     assert.equal(result.kind, "captured", JSON.stringify(result));
     if (result.kind !== "captured") return;
     const [stageName, stageOid] = stagingRefs(f).split(" ") as [string, string];
@@ -1137,6 +1170,35 @@ describe("captureTerminalSnapshot: index-independent verdict, bounded cleanup, u
     assert.deepEqual(result.remnant, { ref: stageName, oid: result.root, state: "retained", index });
     assert.match(stageName, stageRefRe);
     await fs.rm(index!, { force: true });
+  });
+
+  test("unknown: a confirming read that observes a different oid reports observed and expected, not retained", async (t) => {
+    const f = await fixture(t);
+    await f.write("new.txt", "brand new\n");
+    const other = "b".repeat(40);
+    const original = spies(f).runGit.bind(f.git);
+    let stageReads = 0;
+    t.mock.method(spies(f), "runGit", async (cwd: string, args: string[], ...rest: unknown[]) => {
+      // The first read of the staging ref is the transfer's own check; the second is the cleanup's confirming read.
+      if (args[0] === "for-each-ref" && String(args[args.length - 1]).startsWith("refs/uzi-incoming/") && ++stageReads === 2) return `${other}\n`;
+      return original(cwd, args, ...rest);
+    });
+    const ac = new AbortController();
+    const result = await f.capture({ cleanupBound: { signal: ac.signal }, seam: { afterStagingRead: async () => { ac.abort(); } } });
+    assert.equal(result.kind, "captured", JSON.stringify(result));
+    if (result.kind !== "captured") return;
+    const [stageName] = stagingRefs(f).split(" ") as [string];
+    assert.deepEqual(result.remnant, { ref: stageName, oid: other, expectedOid: result.root, state: "unknown", index: result.remnant?.index });
+    if (result.remnant?.index) await fs.rm(result.remnant.index, { force: true });
+  });
+
+  test("a failed private-index .lock removal alone is not reported as an index remnant", async (t) => {
+    const f = await fixture(t);
+    await f.write("new.txt", "brand new\n");
+    const result = await f.capture({ seam: { indexLockCleanupError: new Error("lock rm failed") } });
+    assert.equal(result.kind, "captured", JSON.stringify(result));
+    assert.equal("remnant" in result, false, JSON.stringify(result));
+    assert.deepEqual(await f.stray(), [], "the index itself was removed");
   });
 
   test("unknown: allowance exhausted before the confirming read could run", async (t) => {

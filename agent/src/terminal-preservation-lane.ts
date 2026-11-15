@@ -180,7 +180,10 @@ async function run(env: TerminalLaneEnv, flight: TerminalLaneFlight, body: Termi
           onPhase, reprove: async () => boundaryValid(),
           // Cleanup after a lapsed window (at most 2 s, inside the reserve) never outlives the permit and stops on a permit abort.
           ...(permitDeadlineAt !== undefined || env.signal
-            ? { cleanupBound: { deadlineAt: permitDeadlineAt ?? Infinity, ...(env.signal ? { signal: env.signal } : {}) } } : {}),
+            ? { cleanupBound: {
+              ...(permitDeadlineAt !== undefined ? { deadlineAt: permitDeadlineAt } : {}),
+              ...(env.signal ? { signal: env.signal } : {}),
+            } } : {}),
         });
         if (snap.remnant) env.log("terminal_snapshot_remnant", { remnant: snap.remnant });
         if (snap.kind === "refused") return { kind: "refused", reason: snap.reason };
