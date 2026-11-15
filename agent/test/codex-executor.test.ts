@@ -793,24 +793,31 @@ function makeExecutor(
   );
 }
 
-/** issue #4069: the late-cleanup sibling-ready wait. 3000ms from execute; path 1 restarts the 3000ms at the hold
- *  release. A pending release decision or path 1 is bounded by a hard wall cap anchored at execute, 1500 + 3000ms
- *  (the reference waiter's 1500ms starts only once the sibling's read queues, so the cap may shorten path 1's window
- *  by that queueing delay), so a reference waiter that never settles cannot stall the wait. `tick` must yield a
- *  macrotask so timers (and a per-test timeout) still run. */
+/** issue #4069: the late-cleanup sibling-ready wait. Until the sibling's first restriction-facts read, no hold
+ *  exists and the only work is the sibling's own CPU-bound startup, so that phase gets SIBLING_PRE_READ_CAP_MS from
+ *  execute (the custody windows below would otherwise charge startup to the race). From the read: 3000ms; path 1
+ *  restarts the 3000ms at the hold release. A pending release decision or path 1 is bounded by a hard wall cap
+ *  anchored at the read, 1500 + 3000ms, so a reference waiter that never settles cannot stall the wait. `tick` must
+ *  yield a macrotask so timers (and a per-test timeout) still run. */
+const SIBLING_PRE_READ_CAP_MS = 20_000;
 async function waitSiblingReady(opts: {
   ready: () => boolean;
-  state: () => { decided: "pending" | "path1" | "path2"; pendingDecision: boolean; releasedAt?: number };
+  state: () => { decided: "pending" | "path1" | "path2"; pendingDecision: boolean; releasedAt?: number; readAt?: number };
   executedAt: number;
   now: () => number;
   tick: () => Promise<void>;
 }): Promise<void> {
-  const cap = opts.executedAt + 1500 + 3000;
   while (!opts.ready()) {
-    const { decided, pendingDecision, releasedAt } = opts.state();
-    const limit = decided === "path1" ? Math.min((releasedAt ?? Infinity) + 3000, cap)
-      : pendingDecision ? cap : opts.executedAt + 3000;
-    if (opts.now() > limit) throw new Error("timed out waiting for independent sibling executes in its own source");
+    const { decided, pendingDecision, releasedAt, readAt } = opts.state();
+    if (readAt === undefined) {
+      if (opts.now() > opts.executedAt + SIBLING_PRE_READ_CAP_MS)
+        throw new Error("timed out waiting for independent sibling executes in its own source (before its restriction read)");
+    } else {
+      const cap = readAt + 1500 + 3000;
+      const limit = decided === "path1" ? Math.min((releasedAt ?? Infinity) + 3000, cap)
+        : pendingDecision ? cap : readAt + 3000;
+      if (opts.now() > limit) throw new Error("timed out waiting for independent sibling executes in its own source");
+    }
     await opts.tick();
   }
 }
@@ -820,34 +827,47 @@ describe("late-cleanup sibling wait caps a stalled reference decision", () => {
   const clock = (step: number) => { let t = 0; return { now: () => (t += step), at: () => t }; };
   // Each case self-bounds `ready` at 10s on the fake clock: a missing limit resolves the wait, so assert.rejects
   // fails cleanly instead of spinning past the per-test timeout.
-  it("pending decision that never settles fails within 1500 + 3000ms of execute", async () => {
+  it("pending decision that never settles fails within 1500 + 3000ms of the read", async () => {
     const c = clock(7);
     await assert.rejects(waitSiblingReady({ ready: () => c.at() > 10_000, executedAt: 0, now: c.now, tick,
-      state: () => ({ decided: "pending", pendingDecision: true }) }), /timed out waiting for independent sibling/);
+      state: () => ({ decided: "pending", pendingDecision: true, readAt: 0 }) }), /timed out waiting for independent sibling/);
     assert.ok(c.at() > 4500 && c.at() <= 4500 + 7, `failed at ${c.at()}`);
   });
-  it("path 2 keeps the absolute 3000ms from execute", async () => {
+  it("path 2 keeps the absolute 3000ms from the read", async () => {
     const c = clock(7);
     await assert.rejects(waitSiblingReady({ ready: () => c.at() > 10_000, executedAt: 0, now: c.now, tick,
-      state: () => ({ decided: "path2", pendingDecision: false }) }), /timed out/);
+      state: () => ({ decided: "path2", pendingDecision: false, readAt: 0 }) }), /timed out/);
     assert.ok(c.at() > 3000 && c.at() <= 3000 + 7, `failed at ${c.at()}`);
   });
-  it("path 1 with a late release is capped at 1500 + 3000ms from execute", async () => {
+  it("path 1 with a late release is capped at 1500 + 3000ms from the read", async () => {
     const c = clock(7);
     await assert.rejects(waitSiblingReady({ ready: () => c.at() > 10_000, executedAt: 0, now: c.now, tick,
-      state: () => ({ decided: "path1", pendingDecision: false, releasedAt: 2000 }) }), /timed out/);
+      state: () => ({ decided: "path1", pendingDecision: false, releasedAt: 2000, readAt: 0 }) }), /timed out/);
     assert.ok(c.at() > 4500 && c.at() <= 4500 + 7, `failed at ${c.at()}`);
   });
-  it("an undecided wait that is not pending keeps 3000ms from execute", async () => {
+  it("an undecided wait that is not pending keeps 3000ms from the read", async () => {
     const c = clock(7);
     await assert.rejects(waitSiblingReady({ ready: () => c.at() > 10_000, executedAt: 0, now: c.now, tick,
-      state: () => ({ decided: "pending", pendingDecision: false }) }), /timed out/);
+      state: () => ({ decided: "pending", pendingDecision: false, readAt: 0 }) }), /timed out/);
     assert.ok(c.at() > 3000 && c.at() <= 3000 + 7, `failed at ${c.at()}`);
+  });
+  it("before the restriction read, startup is bounded by the pre-read cap from execute", async () => {
+    const c = clock(7);
+    await assert.rejects(waitSiblingReady({ ready: () => c.at() > 30_000, executedAt: 0, now: c.now, tick,
+      state: () => ({ decided: "pending", pendingDecision: false }) }), /before its restriction read/);
+    assert.ok(c.at() > SIBLING_PRE_READ_CAP_MS && c.at() <= SIBLING_PRE_READ_CAP_MS + 7, `failed at ${c.at()}`);
+  });
+  it("custody windows start at a late read, not at execute", async () => {
+    const c = clock(7);
+    await assert.rejects(waitSiblingReady({ ready: () => c.at() > 30_000, executedAt: 0, now: c.now, tick,
+      state: () => ({ decided: "pending", pendingDecision: false, readAt: c.at() >= 5000 ? 5000 : undefined }) }),
+      /timed out waiting for independent sibling executes in its own source$/);
+    assert.ok(c.at() > 8000 && c.at() <= 8000 + 7, `failed at ${c.at()}`);
   });
   it("path 1 with an early release keeps 3000ms from the release", async () => {
     const c = clock(7);
     await assert.rejects(waitSiblingReady({ ready: () => c.at() > 10_000, executedAt: 0, now: c.now, tick,
-      state: () => ({ decided: "path1", pendingDecision: false, releasedAt: 500 }) }), /timed out/);
+      state: () => ({ decided: "path1", pendingDecision: false, releasedAt: 500, readAt: 0 }) }), /timed out/);
     assert.ok(c.at() > 3500 && c.at() <= 3500 + 7, `failed at ${c.at()}`);
   });
 });
@@ -1155,11 +1175,16 @@ describe("M3 actual runner memory Codex delivery", () => {
           });
           const realNow = Date.now.bind(Date);
           let skew = 0, skewed = false, entrySkewed = false, siblingReads = 0;
+          // #4069: the late-cleanup wait reads this clock. A forward skew applied right after execute (before the
+          // sibling's read) must not count against the custody windows, which start at the first read.
+          let preReadSkew = 0, siblingReadAt: number | undefined, readSawPreReadSkew = false;
+          const waitClock = () => performance.now() + preReadSkew;
           const queued = new Promise<boolean>(resolve => { signalQueued = resolve; });
           const readOriginal = m2Runner.git.readRemediationRestrictionFacts.bind(m2Runner.git);
           t.mock.method(m2Runner.git, "readRemediationRestrictionFacts", async (...args: Parameters<typeof readOriginal>) => {
             if (args[2] !== sibling.run_id) return readOriginal(...args);
             siblingReads++;
+            if (siblingReadAt === undefined) { siblingReadAt = waitClock(); readSawPreReadSkew = preReadSkew > 0; }
             const read = readOriginal(...args); // queues on the bare lock synchronously
             signalQueued(true);
             // Late cleanup only: a Node timer is armed from libuv's cached loop time and can fire before Date.now()
@@ -1234,7 +1259,7 @@ describe("M3 actual runner memory Codex delivery", () => {
               const siblingOver = progresses[0]?.cause === "pre_read_unavailable" ||
                 siblingOpSignal?.aborted === true || (siblingDeadline !== undefined && siblingDeadline <= Date.now());
               if (siblingOver) { decided = "path2"; await readyWait; }
-              else { releasedAt = performance.now(); decided = "path1"; }
+              else { releasedAt = waitClock(); decided = "path1"; }
               releaseHold();
               holdState = "released";
             })();
@@ -1242,23 +1267,28 @@ describe("M3 actual runner memory Codex delivery", () => {
           disarm = () => { armed = false; };
           resolveHoldReady = holdReady;
           armed = true;
-          const executedAt = performance.now();
+          const executedAt = waitClock();
           siblingWork = runner.execute(sibling);
-          const failure = (error: unknown) => new Error(`${String(error)}; refState=${refState}; hold=${holdState}; decided=${decided}; sibling causes=${JSON.stringify(progresses.map(p => p.cause))}; sibling states=${JSON.stringify(m2Runner.api.states.filter(s => s.runId === sibling.run_id))}; launch/remediation lines=${JSON.stringify(ownerLog.lines.filter(l => /launch round|remediation|restriction/.test(JSON.stringify(l))))}; owner=${JSON.stringify(ownerLog.lines)}`);
+          // Deterministic proof for #4069: jump the wait clock past the old 3000ms-from-execute window before the
+          // sibling can reach its read (execute yields before any read). A window anchored at execute fails here.
+          if (!lateCapture) preReadSkew = 3500;
+          const failure = (error: unknown) => new Error(`${String(error)}; refState=${refState}; hold=${holdState}; decided=${decided}; readAfterMs=${siblingReadAt === undefined ? "none" : Math.round(siblingReadAt - executedAt)}; sibling causes=${JSON.stringify(progresses.map(p => p.cause))}; sibling states=${JSON.stringify(m2Runner.api.states.filter(s => s.runId === sibling.run_id))}; launch/remediation lines=${JSON.stringify(ownerLog.lines.filter(l => /launch round|remediation|restriction/.test(JSON.stringify(l))))}; owner=${JSON.stringify(ownerLog.lines)}`);
           try {
             if (lateCapture) {
               await waitFor(() => siblingReady, "independent sibling executes in its own source", 3000, () => performance.now())
                 .catch(error => { throw failure(error); });
             } else {
-              // 3000ms from execute, except while the hold's release decision is pending or after path 1, whose
-              // 3000ms starts at the release; both are hard-capped at 1500 + 3000ms from execute.
-              await waitSiblingReady({ ready: () => siblingReady, executedAt, now: () => performance.now(),
+              // The pre-read cap from execute, then 3000ms from the sibling's first read, except while the hold's
+              // release decision is pending or after path 1, whose 3000ms starts at the release; both are
+              // hard-capped at 1500 + 3000ms from the read.
+              await waitSiblingReady({ ready: () => siblingReady, executedAt, now: waitClock,
                 tick: () => new Promise<void>(resolve => setImmediate(resolve)),
-                state: () => ({ decided, pendingDecision: decided === "pending" && holdState === "held" && refStarted, releasedAt }) })
+                state: () => ({ decided, pendingDecision: decided === "pending" && holdState === "held" && refStarted, releasedAt, readAt: siblingReadAt }) })
                 .catch(error => { throw failure(error); });
             }
           } finally { settleReady(); }
           assert.ok(siblingReads >= 1 && progresses.length >= 1, "sibling performed its restriction-facts read");
+          if (!lateCapture) assert.equal(readSawPreReadSkew, true, "the pre-read skew was applied before the sibling's first read");
           for (const progress of progresses)
             assert.ok(progress.cause !== "pre_read_unavailable" && progress.cause !== "post_read_expiry",
               `sibling saw restriction cause ${String(progress.cause)}`);
