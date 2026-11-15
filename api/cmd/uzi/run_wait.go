@@ -122,24 +122,16 @@ func runWait(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, runI
 				_, _ = fmt.Fprintf(env.Stderr,
 					"run %s: parked at its time limit; waiting for the owner (uzi run extend %s --by 2h)\n", runID, runID)
 			}
-			// Iteration and provider holds require an owner action; paused remains nonterminal.
-			if isIterationHold(run) || isProviderUnavailableHold(run) {
-				_, _ = fmt.Fprintf(env.Stderr, "run %s: %s\n", cellText(runID), pausedHoldNotice(run))
-			}
-			if isCredentialSwitchHold(run) {
-				_, _ = fmt.Fprintf(env.Stderr, "run %s: %s\n", cellText(runID), pausedHoldNotice(run))
-			}
-			if isCredentialsResetHold(run) {
-				_, _ = fmt.Fprintf(env.Stderr, "run %s: %s\n", cellText(runID), pausedHoldNotice(run))
-			}
-			if isCredentialDisabledHold(run) {
-				_, _ = fmt.Fprintf(env.Stderr,
-					"run %s: held, a credential it needs is disabled; %s\n", runID, credentialDisabledAction(run))
-			}
-			// issue #3194: a base-attestation hold never moves by itself; the default wait
-			// stops on it below, and the line names the recovery verbs.
-			if isBaseAttestationHold(run) {
-				_, _ = fmt.Fprintf(env.Stderr, "run %s: %s\n", cellText(runID), pausedHoldNotice(run))
+			// Every non-completion hold (nonCompletionHolds) names itself once on entry; a
+			// credential_disabled hold keeps its own wording. A base-attestation hold never moves by
+			// itself: the default wait stops on it below, and its notice names the recovery verbs.
+			if run.Status == statusPaused && holdAnnouncesEntry(hold) {
+				if isCredentialDisabledHold(run) {
+					_, _ = fmt.Fprintf(env.Stderr,
+						"run %s: held, a credential it needs is disabled; %s\n", runID, credentialDisabledAction(run))
+				} else if notice := pausedHoldNotice(run); notice != "" {
+					_, _ = fmt.Fprintf(env.Stderr, "run %s: %s\n", cellText(runID), notice)
+				}
 			}
 		} else if run.Status == statusPaused && hold != lastHold {
 			// A move between holds keeps the status at paused, so the status line above
@@ -160,7 +152,7 @@ func runWait(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, runI
 				runID, cellText(run.Status))
 		}
 
-		if targets[run.Status] || (defaultUntil && (isDiskOwnerHold(run) || isForgeOwnerHold(run) || isOwnerRequiredWorkerHold(run) || isSpendLimitHold(run) || isCredentialSwitchHold(run) || isBaseAttestationHold(run))) {
+		if targets[run.Status] || (defaultUntil && (isDiskOwnerHold(run) || isForgeOwnerHold(run) || isOwnerRequiredWorkerHold(run) || isSpendLimitHold(run) || stopsDefaultWait(run))) {
 			// PRD #603: `--min-plan-seq N` (N >= 0) gates ONLY the awaiting_approval
 			// stop so a wait after `run revise` returns on the REVISED plan, not the
 			// stale gate left by the pre-revise plan. Every other target — terminals,

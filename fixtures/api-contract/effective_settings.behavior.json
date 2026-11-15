@@ -628,6 +628,421 @@
             "refusal_detail": null,
             "credential": null
           }
+        },
+        {
+          "name": "claude with a model",
+          "request": {
+            "harness": "claude",
+            "credential_override": null,
+            "model": "opus"
+          },
+          "response": {
+            "version": 1,
+            "harness": {
+              "value": "claude",
+              "source": "run_override",
+              "fixed_at": "create",
+              "notes": []
+            },
+            "refusal": null,
+            "refusal_detail": null,
+            "credential": {
+              "kind": "anthropic",
+              "source": "claim_selection",
+              "fixed_at": "claim",
+              "auth_mode": null
+            },
+            "worker_model": {
+              "harness": "claude",
+              "model": "opus",
+              "default_model": "opus",
+              "default_source": "template",
+              "resolved_model": "opus",
+              "source": "run_override"
+            }
+          }
+        },
+        {
+          "name": "codex with a model",
+          "request": {
+            "harness": "codex",
+            "credential_override": null,
+            "model": "gpt-6-sol"
+          },
+          "response": {
+            "version": 1,
+            "harness": {
+              "value": "codex",
+              "source": "run_override",
+              "fixed_at": "create",
+              "notes": []
+            },
+            "refusal": null,
+            "refusal_detail": null,
+            "credential": {
+              "kind": "codex",
+              "source": "codex_default_credential",
+              "fixed_at": "create",
+              "auth_mode": "subscription"
+            },
+            "worker_model": {
+              "harness": "codex",
+              "model": "gpt-6-sol",
+              "default_model": "gpt-6-sol",
+              "default_source": "template",
+              "resolved_model": "gpt-6-sol",
+              "source": "run_override"
+            }
+          }
+        },
+        {
+          "name": "claude with an incompatible model",
+          "request": {
+            "harness": "claude",
+            "credential_override": null,
+            "model": "gpt-6-sol"
+          },
+          "response": {
+            "version": 1,
+            "harness": {
+              "value": "claude",
+              "source": "run_override",
+              "fixed_at": "create",
+              "notes": []
+            },
+            "refusal": "model_incompatible_with_harness",
+            "refusal_detail": null,
+            "credential": {
+              "kind": "anthropic",
+              "source": "claim_selection",
+              "fixed_at": "claim",
+              "auth_mode": null
+            }
+          }
+        },
+        {
+          "name": "codex with an incompatible model",
+          "request": {
+            "harness": "codex",
+            "credential_override": null,
+            "model": "opus"
+          },
+          "response": {
+            "version": 1,
+            "harness": {
+              "value": "codex",
+              "source": "run_override",
+              "fixed_at": "create",
+              "notes": []
+            },
+            "refusal": "model_incompatible_with_harness",
+            "refusal_detail": null,
+            "credential": {
+              "kind": "codex",
+              "source": "codex_default_credential",
+              "fixed_at": "create",
+              "auth_mode": "subscription"
+            }
+          }
+        },
+        {
+          "name": "model and effort on claude",
+          "request": {
+            "harness": "claude",
+            "credential_override": null,
+            "model": "opus",
+            "effort": "xhigh"
+          },
+          "response": {
+            "version": 1,
+            "harness": {
+              "value": "claude",
+              "source": "run_override",
+              "fixed_at": "create",
+              "notes": []
+            },
+            "refusal": null,
+            "refusal_detail": null,
+            "credential": {
+              "kind": "anthropic",
+              "source": "claim_selection",
+              "fixed_at": "claim",
+              "auth_mode": null
+            },
+            "worker_model": {
+              "harness": "claude",
+              "model": "opus",
+              "default_model": "opus",
+              "default_source": "template",
+              "resolved_model": "opus",
+              "source": "run_override"
+            },
+            "worker_effort": {
+              "harness": "claude",
+              "effort": "xhigh",
+              "default_effort": "medium",
+              "default_source": "builtin",
+              "resolved_effort": "xhigh",
+              "source": "run_override",
+              "mode": "explicit"
+            }
+          }
+        },
+        {
+          "name": "model and effort on codex",
+          "request": {
+            "harness": "codex",
+            "credential_override": null,
+            "model": "gpt-6-sol",
+            "effort": "max"
+          },
+          "response": {
+            "version": 1,
+            "harness": {
+              "value": "codex",
+              "source": "run_override",
+              "fixed_at": "create",
+              "notes": []
+            },
+            "refusal": null,
+            "refusal_detail": null,
+            "credential": {
+              "kind": "codex",
+              "source": "codex_default_credential",
+              "fixed_at": "create",
+              "auth_mode": "subscription"
+            },
+            "worker_model": {
+              "harness": "codex",
+              "model": "gpt-6-sol",
+              "default_model": "gpt-6-sol",
+              "default_source": "template",
+              "resolved_model": "gpt-6-sol",
+              "source": "run_override"
+            },
+            "worker_effort": {
+              "harness": "codex",
+              "effort": "max",
+              "default_effort": "medium",
+              "default_source": "builtin",
+              "resolved_effort": "max",
+              "source": "run_override",
+              "mode": "explicit"
+            }
+          }
+        },
+        {
+          "name": "effort only on claude",
+          "request": {
+            "harness": "claude",
+            "credential_override": null,
+            "effort": "high"
+          },
+          "response": {
+            "version": 1,
+            "harness": {
+              "value": "claude",
+              "source": "run_override",
+              "fixed_at": "create",
+              "notes": []
+            },
+            "refusal": null,
+            "refusal_detail": null,
+            "credential": {
+              "kind": "anthropic",
+              "source": "claim_selection",
+              "fixed_at": "claim",
+              "auth_mode": null
+            },
+            "worker_effort": {
+              "harness": "claude",
+              "effort": "high",
+              "default_effort": "medium",
+              "default_source": "builtin",
+              "resolved_effort": "high",
+              "source": "run_override",
+              "mode": "explicit"
+            }
+          }
+        },
+        {
+          "name": "effort only on codex",
+          "request": {
+            "harness": "codex",
+            "credential_override": null,
+            "effort": "low"
+          },
+          "response": {
+            "version": 1,
+            "harness": {
+              "value": "codex",
+              "source": "run_override",
+              "fixed_at": "create",
+              "notes": []
+            },
+            "refusal": null,
+            "refusal_detail": null,
+            "credential": {
+              "kind": "codex",
+              "source": "codex_default_credential",
+              "fixed_at": "create",
+              "auth_mode": "subscription"
+            },
+            "worker_effort": {
+              "harness": "codex",
+              "effort": "low",
+              "default_effort": "medium",
+              "default_source": "builtin",
+              "resolved_effort": "low",
+              "source": "run_override",
+              "mode": "explicit"
+            }
+          }
+        },
+        {
+          "name": "model without a harness",
+          "request": {
+            "harness": null,
+            "credential_override": null,
+            "model": "opus"
+          },
+          "response": {
+            "version": 1,
+            "harness": {
+              "value": "claude",
+              "source": "automatic",
+              "fixed_at": "create",
+              "notes": []
+            },
+            "refusal": null,
+            "refusal_detail": null,
+            "credential": {
+              "kind": "anthropic",
+              "source": "claim_selection",
+              "fixed_at": "claim",
+              "auth_mode": null
+            },
+            "worker_model": {
+              "harness": "claude",
+              "model": "opus",
+              "default_model": "opus",
+              "default_source": "template",
+              "resolved_model": "opus",
+              "source": "run_override"
+            }
+          }
+        },
+        {
+          "name": "incompatible model without a harness",
+          "request": {
+            "harness": null,
+            "credential_override": null,
+            "model": "gpt-6-sol"
+          },
+          "response": {
+            "version": 1,
+            "harness": {
+              "value": "claude",
+              "source": "automatic",
+              "fixed_at": "create",
+              "notes": []
+            },
+            "refusal": "model_incompatible_with_harness",
+            "refusal_detail": null,
+            "credential": {
+              "kind": "anthropic",
+              "source": "claim_selection",
+              "fixed_at": "claim",
+              "auth_mode": null
+            }
+          }
+        },
+        {
+          "name": "effort only without a harness",
+          "request": {
+            "harness": null,
+            "credential_override": null,
+            "effort": "medium"
+          },
+          "response": {
+            "version": 1,
+            "harness": {
+              "value": null,
+              "source": "chosen_at_create",
+              "fixed_at": "create",
+              "notes": [
+                "automatic_weekly_reset"
+              ]
+            },
+            "refusal": null,
+            "refusal_detail": null,
+            "credential": null,
+            "alternatives": [
+              {
+                "harness": "claude",
+                "credential": {
+                  "kind": "anthropic",
+                  "source": "claim_selection",
+                  "fixed_at": "claim",
+                  "auth_mode": null
+                },
+                "refusal": null,
+                "refusal_detail": null,
+                "worker_effort": {
+                  "harness": "claude",
+                  "effort": "medium",
+                  "default_effort": "medium",
+                  "default_source": "builtin",
+                  "resolved_effort": "medium",
+                  "source": "run_override",
+                  "mode": "explicit"
+                }
+              },
+              {
+                "harness": "codex",
+                "credential": {
+                  "kind": "codex",
+                  "source": "codex_default_credential",
+                  "fixed_at": "create",
+                  "auth_mode": "subscription"
+                },
+                "refusal": null,
+                "refusal_detail": null,
+                "worker_effort": {
+                  "harness": "codex",
+                  "effort": "medium",
+                  "default_effort": "medium",
+                  "default_source": "builtin",
+                  "resolved_effort": "medium",
+                  "source": "run_override",
+                  "mode": "explicit"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "name": "effort only with a disabled pinned token",
+          "request": {
+            "harness": null,
+            "credential_override": {
+              "mode": "pinned",
+              "secret_id": "00000000-0000-4000-8000-0000000000a2"
+            },
+            "effort": "medium"
+          },
+          "response": {
+            "version": 1,
+            "harness": {
+              "value": "claude",
+              "source": "automatic",
+              "fixed_at": "create",
+              "notes": []
+            },
+            "refusal": "credential_disabled",
+            "refusal_detail": null,
+            "credential": null
+          }
         }
       ],
       "schedule_previews": [
@@ -1740,6 +2155,98 @@
               "source": "codex_default_credential",
               "fixed_at": "create",
               "auth_mode": "subscription"
+            }
+          }
+        },
+        {
+          "name": "model without a harness",
+          "request": {
+            "harness": null,
+            "credential_override": null,
+            "model": "gpt-6-sol"
+          },
+          "response": {
+            "version": 1,
+            "harness": {
+              "value": "codex",
+              "source": "automatic",
+              "fixed_at": "create",
+              "notes": []
+            },
+            "refusal": null,
+            "refusal_detail": null,
+            "credential": {
+              "kind": "codex",
+              "source": "codex_default_credential",
+              "fixed_at": "create",
+              "auth_mode": "subscription"
+            },
+            "worker_model": {
+              "harness": "codex",
+              "model": "gpt-6-sol",
+              "default_model": "gpt-6.1-sol",
+              "default_source": "builtin",
+              "resolved_model": "gpt-6-sol",
+              "source": "run_override"
+            }
+          }
+        },
+        {
+          "name": "incompatible model without a harness",
+          "request": {
+            "harness": null,
+            "credential_override": null,
+            "model": "opus"
+          },
+          "response": {
+            "version": 1,
+            "harness": {
+              "value": "codex",
+              "source": "automatic",
+              "fixed_at": "create",
+              "notes": []
+            },
+            "refusal": "model_incompatible_with_harness",
+            "refusal_detail": null,
+            "credential": {
+              "kind": "codex",
+              "source": "codex_default_credential",
+              "fixed_at": "create",
+              "auth_mode": "subscription"
+            }
+          }
+        },
+        {
+          "name": "effort only without a harness",
+          "request": {
+            "harness": null,
+            "credential_override": null,
+            "effort": "max"
+          },
+          "response": {
+            "version": 1,
+            "harness": {
+              "value": "codex",
+              "source": "automatic",
+              "fixed_at": "create",
+              "notes": []
+            },
+            "refusal": null,
+            "refusal_detail": null,
+            "credential": {
+              "kind": "codex",
+              "source": "codex_default_credential",
+              "fixed_at": "create",
+              "auth_mode": "subscription"
+            },
+            "worker_effort": {
+              "harness": "codex",
+              "effort": "max",
+              "default_effort": "medium",
+              "default_source": "builtin",
+              "resolved_effort": "max",
+              "source": "run_override",
+              "mode": "explicit"
             }
           }
         }

@@ -130,7 +130,7 @@ func TestIssueCommentsSnapshotLiveDB(t *testing.T) {
 	}
 
 	// (1) Human + bot ⇒ stored JSONB carries the human comment and NOT the bot one.
-	run1, err := svc.CreateRun(ctx, userID, repoKnown, 11, "desc", &waitFalse, nil, false, nil, nil, nil, nil)
+	run1, err := svc.CreateRun(ctx, userID, repoKnown, 11, "desc", &waitFalse, nil, false, nil, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("create run for issue 11: %v", err)
 	}
@@ -161,7 +161,7 @@ func TestIssueCommentsSnapshotLiveDB(t *testing.T) {
 	}
 
 	// (2) Only bot comments ⇒ versioned empty thread.
-	run2, err := svc.CreateRun(ctx, userID, repoKnown, 12, "desc", &waitFalse, nil, false, nil, nil, nil, nil)
+	run2, err := svc.CreateRun(ctx, userID, repoKnown, 12, "desc", &waitFalse, nil, false, nil, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("create run for issue 12: %v", err)
 	}
@@ -179,7 +179,7 @@ func TestIssueCommentsSnapshotLiveDB(t *testing.T) {
 	assertEmpty(run2.ID, false)
 
 	// (3) Unknown bot identity ⇒ versioned unknown empty thread.
-	run3, err := svc.CreateRun(ctx, userID, repoZero, 13, "desc", &waitFalse, nil, false, nil, nil, nil, nil)
+	run3, err := svc.CreateRun(ctx, userID, repoZero, 13, "desc", &waitFalse, nil, false, nil, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("create run for issue 13: %v", err)
 	}

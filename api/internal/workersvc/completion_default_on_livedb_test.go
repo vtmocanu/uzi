@@ -44,7 +44,7 @@ func interlockLiveSvc(env codexTestEnv) *Service {
 func createInterlockRun(t *testing.T, env codexTestEnv, svc *Service, userID, repoID uuid.UUID, iid int64, want Harness) uuid.UUID {
 	t.Helper()
 	seedEligibleIssue(t, env, repoID, iid)
-	run, err := svc.CreateRun(env.ctx, userID, repoID, iid, "desc", nil, nil, false, nil, nil, nil, nil)
+	run, err := svc.CreateRun(env.ctx, userID, repoID, iid, "desc", nil, nil, false, nil, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("CreateRun: %v", err)
 	}
@@ -143,7 +143,7 @@ func TestCompletionInterlockDefaultOnKeepsSeededCodexLegacyLiveDB(t *testing.T) 
 	const iid = 92006
 	seedEligibleIssue(t, env, repoID, iid)
 	seed := &SeededPlan{PlanMD: "Implement the approved plan"}
-	run, err := svc.CreateRun(env.ctx, userID, repoID, iid, "desc", nil, nil, false, seed, nil, nil, nil)
+	run, err := svc.CreateRun(env.ctx, userID, repoID, iid, "desc", nil, nil, false, seed, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("CreateRun (seeded Codex): %v", err)
 	}

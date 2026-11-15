@@ -234,7 +234,7 @@ func runBand(status string, isRevising bool) int {
 // holds also require the owner to Resume, Stop or Cancel. Both are NEEDS YOU. Every band decision on the board
 // (the ordering, the eyebrow counts, the row's title ink) goes through here so they agree.
 func runBandOf(r apitypes.RunListItemDTO) int {
-	if isDiskOwnerHold(r.RunDTO) || isIterationHold(r.RunDTO) || isForgeOwnerHold(r.RunDTO) || codexReloginHold(r.RunDTO) || isCredentialDisabledHold(r.RunDTO) || isCredentialsResetHold(r.RunDTO) || isOwnerRequiredWorkerHold(r.RunDTO) || isSpendLimitHold(r.RunDTO) || isProviderUnavailableHold(r.RunDTO) || isCredentialSwitchHold(r.RunDTO) {
+	if isDiskOwnerHold(r.RunDTO) || isForgeOwnerHold(r.RunDTO) || codexReloginHold(r.RunDTO) || isOwnerRequiredWorkerHold(r.RunDTO) || isSpendLimitHold(r.RunDTO) || isBoardOwnerHold(r.RunDTO) {
 		return bandNeedsYou
 	}
 	return runBand(r.Status, r.IsRevising)
@@ -1287,7 +1287,7 @@ func (m tuiModel) boardSummary() string {
 		if codexReloginHold(r.RunDTO) {
 			relogins++
 		}
-		if isIterationHold(r.RunDTO) || isCredentialDisabledHold(r.RunDTO) || isCredentialsResetHold(r.RunDTO) || isProviderUnavailableHold(r.RunDTO) || isCredentialSwitchHold(r.RunDTO) {
+		if isBoardOwnerHold(r.RunDTO) {
 			ownerHolds++
 		}
 		switch r.Status {

@@ -453,7 +453,7 @@ describe("mockApi setRunCredential harness gate (PRD #1429 M4a review Fix 3)", (
 
     // repo-uzi issue #31 is seeded with no active run and no open MR (data/boards.ts),
     // so an explicit harness:"codex" create lands a fresh codex-harness run.
-    const { run } = await api.createRun("repo-uzi", 31, undefined, undefined, "codex");
+    const { run } = await api.createRun("repo-uzi", 31, { harness: "codex" });
     expect(run.harness).toBe("codex");
 
     await expect(api.setRunCredential(run.id, { mode: "inherit" })).rejects.toMatchObject({
@@ -467,7 +467,7 @@ describe("mockApi setRunCredential harness gate (PRD #1429 M4a review Fix 3)", (
     installStorage();
     const api = await reload();
 
-    const { run } = await api.createRun("repo-uzi", 31, undefined, undefined, "claude");
+    const { run } = await api.createRun("repo-uzi", 31, { harness: "claude" });
     expect(run.harness).toBe("claude");
 
     const { run: updated } = await api.setRunCredential(run.id, { mode: "inherit" });
