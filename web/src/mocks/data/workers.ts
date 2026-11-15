@@ -537,6 +537,7 @@ export const mockAdminWorkers: AdminWorker[] = [
     hibernation_state: "hibernated",
     hibernation_reason: "idle overnight",
     hibernated_at: minsAgo(94),
+    hibernation_cleanup: { state: "settled", outcome: "skipped", reason: "daemon_unreachable" },
     wake_error: "pod did not become ready: image pull backoff",
     owner_email: "mira@uzi.local",
     disk_pressure_volumes: [],

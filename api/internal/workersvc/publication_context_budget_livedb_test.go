@@ -1,9 +1,11 @@
 package workersvc
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/vtmocanu/uzi/api/internal/forge"
@@ -46,7 +48,16 @@ func TestPublicationContextAssociationBudgetLiveDB(t *testing.T) {
 			if scenario == "request_mr_conflict" {
 				f.e.exec(t, "UPDATE runs SET branch=$2,mr_iid=8 WHERE id=$1", id, branch)
 			}
-			snapshot, err := f.e.q.PublicationContextSnapshot(f.e.ctx, store.PublicationContextSnapshotParams{RunID: id, UserID: f.w.UserID})
+			// Plan the snapshot against statistics that include the bulk insert (#4302).
+			// The workersvc LiveDB tests share one database. An analyze taken while runs
+			// held only dead tuples records reltuples=0; the planner then estimates one row
+			// per runs scan, picks filter-only nested loops over ~4096 rows, and the query
+			// ran past the 45m package timeout. Fresh statistics plan it in milliseconds.
+			f.e.exec(t, "ANALYZE runs")
+			// Fail within a minute, naming the query, if the plan regresses again.
+			ctx, cancel := context.WithTimeout(f.e.ctx, 60*time.Second)
+			defer cancel()
+			snapshot, err := f.e.q.PublicationContextSnapshot(ctx, store.PublicationContextSnapshotParams{RunID: id, UserID: f.w.UserID})
 			if err != nil {
 				t.Fatal(err)
 			}

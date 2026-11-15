@@ -540,9 +540,9 @@ describe("SdkExecutor attribution opt-out (issue #916)", () => {
 
     assert.strictEqual(turns.length, 2);
     // Plan turn carries the suppression...
-    assert.deepEqual(turns[0]!.options.settings, { attribution: { commit: "", pr: "" } });
+    assert.deepEqual(turns[0]!.options.settings, { attribution: { commit: "", pr: "" }, enabledPlugins: { "cc-plugin-privacy@builtin": false } });
     // ...and it cascades into the implement turn via the baseOptions spread.
-    assert.deepEqual(turns[1]!.options.settings, { attribution: { commit: "", pr: "" } });
+    assert.deepEqual(turns[1]!.options.settings, { attribution: { commit: "", pr: "" }, enabledPlugins: { "cc-plugin-privacy@builtin": false } });
   });
 
   it("explicit true → sets nothing (SDK default preserved, no settings key)", async () => {
@@ -550,8 +550,8 @@ describe("SdkExecutor attribution opt-out (issue #916)", () => {
     const probe = makeCtx({ agents: [lead, coder, reviewer], config: { attribution_enabled: true } }, approve);
     await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
 
-    assert.equal(turns[0]!.options.settings, undefined);
-    assert.equal(turns[1]!.options.settings, undefined);
+    assert.deepEqual(turns[0]!.options.settings, { enabledPlugins: { "cc-plugin-privacy@builtin": false } });
+    assert.deepEqual(turns[1]!.options.settings, { enabledPlugins: { "cc-plugin-privacy@builtin": false } });
   });
 
   it("absent field (null config) → sets nothing (back-compat with an older server)", async () => {
@@ -559,8 +559,8 @@ describe("SdkExecutor attribution opt-out (issue #916)", () => {
     const probe = makeCtx({ agents: [lead, coder, reviewer], config: null }, approve);
     await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
 
-    assert.equal(turns[0]!.options.settings, undefined);
-    assert.equal(turns[1]!.options.settings, undefined);
+    assert.deepEqual(turns[0]!.options.settings, { enabledPlugins: { "cc-plugin-privacy@builtin": false } });
+    assert.deepEqual(turns[1]!.options.settings, { enabledPlugins: { "cc-plugin-privacy@builtin": false } });
   });
 });
 
@@ -3426,7 +3426,7 @@ describe("SdkExecutor lead-config reporting (PRD #3244)", () => {
       fs.readFileSync(path.join(import.meta.dirname, "..", "..", "fixtures", "lead-config", "contract.json"), "utf8"),
     ) as { request_cases: Array<{ id: string; harness: string; phase: "plan" | "implement"; config: ClaimConfig; templateModel?: string; agents?: Array<{ name: string; model?: string | null }>; expect: import("../src/lead-config-report.js").LeadRequest }> };
     const cases = contract.request_cases.filter((c) => c.harness === "claude");
-    assert.equal(cases.length, 13, "all Claude request cases loaded");
+    assert.equal(cases.length, 16, "all Claude request cases loaded");
     const visited: string[] = [];
     for (const c of cases) {
       const agents = leadRequestCaseAgents(c);
@@ -3472,7 +3472,7 @@ describe("SdkExecutor lead-config reporting (PRD #3244)", () => {
       visited.push(c.id);
     }
     assert.deepEqual(visited, cases.map((c) => c.id));
-    assert.equal(visited.length, 13);
+    assert.equal(visited.length, 16);
   });
 
   /** fakeTurns plus init frames carrying `effort`, and an optional getSettings on each instance. */

@@ -77,6 +77,9 @@ type ReleaseStatus struct {
 	NotesURL      string
 	PublishedAt   string
 	CheckedAt     string
+	// FormulaStableTag / FormulaRCTag are the uzi tags the tap formulas install ("" unknown).
+	FormulaStableTag string
+	FormulaRCTag     string
 	// BannerSnoozeTag is the release tag the escalation banner was snoozed for (PRD
 	// #836 M6), or "" when never snoozed. "banner_snoozed" is derived: it is true iff
 	// this equals LatestTag, so a newer release auto-clears the snooze.
@@ -104,6 +107,9 @@ func (c *Cache) ReleaseStatus(ctx context.Context) (ReleaseStatus, error) {
 		PublishedAt:     c.effective(KeyReleasePublishedAt, m),
 		CheckedAt:       c.effective(KeyReleaseCheckedAt, m),
 		BannerSnoozeTag: c.effective(KeyReleaseBannerSnoozeTag, m),
+
+		FormulaStableTag: c.effective(KeyReleaseFormulaStableTag, m),
+		FormulaRCTag:     c.effective(KeyReleaseFormulaRCTag, m),
 	}, nil
 }
 

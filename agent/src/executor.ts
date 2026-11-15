@@ -175,6 +175,21 @@ export type SecretRemediationDecision =
   | { action: "remediate"; followUp: string }
   | { action: "fail" };
 
+/**
+ * Issue #4313: thrown by `RunContext.secretRemediationGate` when a cancel, claim fence, terminal
+ * lifecycle fence, graceful worker shutdown or disk stop stopped the gate before it reached a decision.
+ * It is not a decision: none is returned, no attempt is spent and nothing is emitted. State the gate already
+ * wrote before the stop (restriction and scan records, in-memory known/everKnown/withholdPaths) and any
+ * negative knowledge it records on stopping (a latched trusted finding set) remain. The executor
+ * routes the control that caused it (terminal, cancel, disk park, or a cancel when none is visible).
+ */
+export class SecretRemediationStoppedError extends Error {
+  constructor() {
+    super("secret remediation gate stopped before a decision");
+    this.name = "SecretRemediationStoppedError";
+  }
+}
+
 /** Marks only the exhausted revision's owner-event wait, excluding recovery work. */
 export type PlanRevisionOwnerWaitObserver = (waiting: boolean) => void;
 
@@ -664,6 +679,17 @@ export interface RunContext {
    * or the authority of the done/checkpoint/finalize guards.
    */
   secretRemediationGate?(options?: { unpublishedOnly: true }): Promise<SecretRemediationDecision>;
+  /**
+   * Issue #4258: the advisory, NON-TERMINAL mid-run secret remediation consumer. The executor calls it
+   * at an admitted work-turn boundary (never at the done point, never on an interactive run, and
+   * only when no interruption and no system text such as a clarification answer, completion rework,
+   * code repair or resume-preflight remediation owns the turn; otherwise the trigger stays pending). The runner re-validates everything
+   * from scratch (a pending content-free trigger recorded by the mid-turn checkpoint scan is only a
+   * hint) and returns ONLY `proceed` or `remediate` (with a mid-run rewrite follow-up); it never
+   * returns `fail`. It never changes the authority of the done, checkpoint or finalize guards, which
+   * keep holding publication while a flagged commit is reachable. Absent is treated as `proceed`.
+   */
+  midRunSecretRemediation?(): Promise<SecretRemediationDecision>;
   /** Advisory code gate at a finalizing done exit; permits one repair pass. `repairAvailable: false` means no
    *  implementation iteration remains: the gate must not start a repair (findings stay unreported) and never
    *  extends the iteration budget. Absent is treated as available. */

@@ -14,8 +14,8 @@ import (
 	githttp "github.com/go-git/go-git/v5/plumbing/transport/http"
 )
 
-// MaxRefAdvertisementBytes bounds ListRefTips discovery input before go-git's
-// parser allocates reference maps. Packet framing and capabilities count too.
+// MaxRefAdvertisementBytes bounds ref lookup and terminal-preflight discovery before
+// go-git's parser allocates reference maps. Packet framing and capabilities count too.
 const MaxRefAdvertisementBytes = 1 << 20
 
 // ErrRefAdvertisementTooLarge means the lookup cannot prove presence or absence.

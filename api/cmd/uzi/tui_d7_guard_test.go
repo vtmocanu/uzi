@@ -116,6 +116,9 @@ var d7UntrustedFields = []string{
 	"AgentLabel",
 	"HealthReason",
 	"FailureReason",
+	// Structural completion's unmet milestone ids are model-authored and now render below
+	// the detail header through renderer.Plain (issue #4345).
+	"CompletionUnmet",
 	// Detail and Tool are model-authored fields on apitypes.RunActivity AND apitypes.MilestoneLane.
 	// Detail (a file path, an Agent/Bash description) is surfaced on the crew rail's now line
 	// (railNowLines, via activityLabel's fallback), the board's selected-row second line
@@ -182,6 +185,9 @@ var d7UntrustedFields = []string{
 	// view) through renderer.Plain; HibernationReason is not drawn and stays as a tripwire.
 	"WakeError",
 	"HibernationReason",
+	// HibernationCleanupDTO.CleanupReason (PRD #4206): the bounded cleanup reason code for a
+	// skipped or failed hibernation cache cleanup. Not drawn in the tui; a tripwire only.
+	"CleanupReason",
 	"PathWithNamespace",
 	// WebURL is the PR's forge URL, drawn only as an OSC-8 hyperlink target via oscLink
 	// (pullLink, https-gated). Like IssueWebURL it stays here as a tripwire for any DIRECT

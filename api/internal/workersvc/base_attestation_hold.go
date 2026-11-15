@@ -20,6 +20,12 @@ import (
 // every promoter refuse or skip it.
 const HoldReasonBaseAttestationMissing = "base_attestation_missing"
 
+// HoldReasonRunOverrideUnavailable (PRD #3250) is the hold a run enters when its start-time
+// run_override model or effort cannot be honored at claim time. Unlike the base-attestation hold the
+// owner may resume it (ResumePausedRun), but no automatic promoter does and the next claim parks it
+// again until the run is cancelled and replaced.
+const HoldReasonRunOverrideUnavailable = "run_override_unavailable"
+
 // ErrBaseAttestationHeld refuses every owner verb that would run the agent on a run held on
 // HoldReasonBaseAttestationMissing (resume, extend, set-token). The hold is resolved by recovering
 // the kept work or starting a successor, never by running this run again.

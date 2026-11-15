@@ -3,7 +3,7 @@ import { aggregateDisclosure } from "./costStatus";
 import type { UsageWindow } from "../components/UsageCards";
 
 // The per-user rows and the factory total row of the admin usage breakdown, for one window.
-// Shared by the current Overview's PerUserUsageTable and the preview's By user table, so the
+// Shared by the classic Overview's PerUserUsageTable and the default Overview's By user table, so the
 // two cannot disagree about sorting, the window's source fields or the PR-count rule.
 
 // A RunUsage bundle split the way the run view splits it: fresh = fresh input +

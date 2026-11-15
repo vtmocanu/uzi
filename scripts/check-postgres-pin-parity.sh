@@ -4,7 +4,7 @@
 #   check-postgres-pin-parity.sh [compose ci store-it deploy-compose chart m3b-server m3b-lifecycle]
 #     defaults are the corresponding repository files below.
 #
-# 1. ci.yml's UZI_CI_PG_IMAGE (the single LiveDB job, test-codex-refresh-lostreply-e2e) pins the same tag AND digest as
+# 1. ci.yml's workflow-level UZI_CI_PG_IMAGE (both LiveDB jobs) pins the same tag AND digest as
 #    both compose files, the chart simple-mode default and both packaged-proof
 #    defaults. CI pulls through mirror.gcr.io; normalize that repository alias to
 #    the same tag+digest. Renovate groups all six pins (#2622, #4275).

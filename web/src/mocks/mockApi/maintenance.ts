@@ -20,7 +20,7 @@ type MockMaintenance = MaintenanceState & { by_label: string | null };
 
 let current: MockMaintenance | null = null;
 
-// ?mock=overview-next (PRD #3878) also turns maintenance on, so the Overview preview shows a
+// ?mock=overview-next (PRD #3878) also turns maintenance on, so the default Overview shows a
 // banner of every kind in one scene.
 function scenarioActive(): boolean {
   return mockScenario() === "maintenance" || mockScenario() === "overview-next";

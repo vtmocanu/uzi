@@ -1,4 +1,5 @@
-import { afterEach, describe, it } from "node:test";
+import { afterEach, describe, it, mock } from "node:test";
+import fsp from "node:fs/promises";
 import { establishTrackingOwnership } from "./publication-fixture.js";
 import { AsyncResource } from "node:async_hooks";
 import assert from "node:assert/strict";
@@ -10,7 +11,8 @@ import path from "node:path";
 import { PassThrough, type Readable } from "node:stream";
 import type { ExecutorFactory, RunnerOptions } from "../src/runner.js";
 import { RunRunner } from "../src/runner.js";
-import type { RunContext } from "../src/executor.js";
+import type { Executor, RunContext } from "../src/executor.js";
+import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
 import type { BoundaryPermit, BoundaryProcessRequest, CodexExecutionSafety } from "../src/harness.js";
 import { CodexBoundaryError } from "../src/codex/safety.js";
 import { codexRig } from "./runner-codex-sinks-fixture.js";
@@ -18,7 +20,12 @@ import { GitCache } from "../src/git.js";
 import { PauseNowSignal } from "../src/steering.js";
 import { nullLogger, recordingLogger, testGitCacheOptions } from "./helpers.js";
 import { defaultGitleaksShim, shimCalls, writeGitleaksShim as writeShim } from "./gitleaks-shim.js";
+import { writeStallShim } from "./stall-gitleaks-shim.js";
 import { realProcfsSkip } from "./real-procfs.js";
+import { acquireWorkerLifetime, type FlockResult } from "../src/authority-lock.js";
+import { AuthorityRuntime } from "../src/authority-runtime.js";
+import { testLockOptions } from "./authority-test-support.js";
+import { portableTeardownTestDeps } from "./teardown-fixtures.js";
 import { makeScratchRoot } from "./fixture-repo.js";
 import type { Logger } from "../src/log.js";
 import {
@@ -30,6 +37,8 @@ import {
   fx,
   gitlabClaim,
   installHarness,
+  assistant as sdkAssistant,
+  resultOk as sdkResultOk,
   isAlive,
 } from "./runner-harness.js";
 
@@ -4855,5 +4864,1905 @@ describe("mid-turn checkpoint tick step logging (issue #3896)", () => {
       pub.restore();
       fs.rmSync(tmp, { recursive: true, force: true });
     }
+  });
+});
+
+// ── issue #4258 — the content-free mid-run trigger and its non-terminal consumer ─────────────
+//
+// A trusted mid-turn finding ABOVE every floor arms a pending trigger; `ctx.midRunSecretRemediation`
+// (called by the executor at an admitted work-turn boundary) revalidates from scratch and returns
+// ONLY proceed / remediate. The done/checkpoint/finalize guards keep holding publication regardless.
+
+describe("issue #4258 mid-run secret remediation consumer", () => {
+  type RState = {
+    attempts: number;
+    known?: unknown[];
+    blocked?: unknown[];
+    everKnown?: boolean;
+    cleanTip?: string;
+    flaggedCommits?: string[];
+    overflow?: boolean;
+    midRunTrigger?: { observation: number; tip: string };
+    midRunSeq?: number;
+  };
+  type MFlight = Record<string, unknown> & { secretRemediation?: RState };
+  interface Rig {
+    ctx: RunContext;
+    ctl: Ctl;
+    g: GitCache;
+    runner: RunRunner;
+    bare: string;
+    flight: () => MFlight;
+    state: () => RState;
+    /** Every uploaded tip, with the flagged SHAs the publish guard saw reachable or unknown. */
+    tips: string[];
+    violations: string[];
+    flagged: string[];
+    /** Make the clock pass the checkpoint time gate and fire one tick. */
+    tick: () => Promise<string>;
+    /** Replace one GitCache method for the duration of `fn`. */
+    withStub: <T>(patch: Partial<Record<"ancestry" | "trackingTip" | "branchTip" | "secretScanCheckpointRange", unknown>>, fn: () => Promise<T>) => Promise<T>;
+    /** Replace the runner's fetch-back (the git seam the mid-run consumer revalidates through) for the duration of `fn`. */
+    withFetchBack: <T>(stub: () => Promise<unknown>, fn: () => Promise<T>) => Promise<T>;
+  }
+
+  /** git merge-base --is-ancestor as a tri-state, independent of any stubbed GitCache method. */
+  function ancestryOf(dir: string, a: string, d: string): "ancestor" | "divergent" | "unknown" {
+    try {
+      execFileSync("git", ["-C", dir, "merge-base", "--is-ancestor", a, d], { env: GIT_ENV, stdio: "ignore" });
+      return "ancestor";
+    } catch (e) {
+      return (e as { status?: number }).status === 1 ? "divergent" : "unknown";
+    }
+  }
+
+  /** Rewrite `flagged` out of history: drop it and everything after it, then commit clean content. */
+  function rewriteOut(tree: string, flagged: string, file: string): void {
+    gitIn(tree, ["reset", "-q", "--hard", `${flagged}^`]);
+    commitIn(tree, file, "rewritten clean\n");
+  }
+
+  async function rig(
+    iid: number,
+    body: (r: Rig) => Promise<void>,
+    opts: {
+      executorTail?: boolean; seed?: (f: MFlight) => void; log?: Logger;
+      gitleaksBin?: string; ctlHooks?: Parameters<typeof control>[0];
+    } = {},
+  ): Promise<{ claimRunId: string; tips: string[]; violations: string[] }> {
+    const ctl = control(opts.ctlHooks);
+    const g = mkGit(fx.dataDir, opts.gitleaksBin);
+    const tips: string[] = [];
+    const violations: string[] = [];
+    const flagged: string[] = [];
+    const bare = g.barePathFor(fx.originPath);
+    const pub = stubPublish(async (_n, tip, pack) => {
+      await drain(pack);
+      tips.push(tip);
+      for (const sha of flagged) {
+        const rel = ancestryOf(bare, sha, tip);
+        if (rel !== "divergent") violations.push(`${sha} ${rel} ${tip}`);
+      }
+      return LANDED;
+    });
+    const claim = gitlabClaim(iid);
+    const runner = mkRunner(g, () => ({
+      executor: {
+        run: async (ctx: RunContext) => {
+          await recordingTurnErrors(async () => {
+            const r: Rig = {
+              ctx, ctl, g, runner, bare, tips, violations, flagged,
+              flight: () => { assert.ok(captured, "a checkpoint scan captured the flight"); return captured; },
+              state: () => { assert.ok(captured?.secretRemediation, "remediation state exists"); return captured.secretRemediation; },
+              tick: () => { ctl.advance(INTERVAL_MS + 1); return ctl.fire(); },
+              withStub: async (patch, fn) => {
+                const target = g as unknown as Record<string, unknown>;
+                const saved: Record<string, unknown> = {};
+                for (const [k, v] of Object.entries(patch)) { saved[k] = target[k]; target[k] = v; }
+                try { return await fn(); } finally { for (const [k, v] of Object.entries(saved)) target[k] = v; }
+              },
+              withFetchBack: async (stub, fn) => {
+                const target = runner as unknown as Record<string, unknown>;
+                const saved = target.fetchBackBestEffort;
+                target.fetchBackBestEffort = stub;
+                try { return await fn(); } finally { target.fetchBackBestEffort = saved; }
+              },
+            };
+            await body(r);
+          });
+          return { branch: ctx.branch };
+        },
+      },
+    }), ctl, {}, opts.log);
+    let captured: MFlight | undefined;
+    const internals = runner as unknown as { scanCheckpointForPublish: (f: MFlight, ...rest: unknown[]) => Promise<unknown> };
+    const origScan = internals.scanCheckpointForPublish.bind(runner);
+    internals.scanCheckpointForPublish = (f, ...rest) => { captured = f; opts.seed?.(f); return origScan(f, ...rest); };
+    try {
+      await runner.execute(claim);
+    } finally {
+      pub.restore();
+    }
+    return { claimRunId: claim.run_id, tips, violations };
+  }
+
+  /** commit a secret-shaped file, tick, and return its SHA with the trigger armed. */
+  async function flagAndTick(r: Rig, file = "cfg.env"): Promise<string> {
+    const sha = commitIn(r.ctx.worktreePath, file, `TOKEN=${runtimeSecret()}\n`);
+    r.flagged.push(sha);
+    assert.equal(await r.tick(), "secret_found");
+    return sha;
+  }
+
+  const untouched = (s: RState): void => {
+    assert.equal(s.blocked, undefined);
+    assert.equal(s.known, undefined);
+    assert.equal(s.everKnown, undefined);
+    assert.equal(s.cleanTip, undefined);
+  };
+
+  it("a trusted mid-turn finding above the floors arms a content-free trigger and yields exactly one mid-run remediate", async () => {
+    const out = await rig(4258_001, async (r) => {
+      const sha = await flagAndTick(r);
+      const s = r.state();
+      assert.equal(s.midRunSeq, 1);
+      assert.deepEqual(Object.keys(s.midRunTrigger!).sort(), ["observation", "tip"]);
+      assert.equal(s.midRunTrigger!.observation, 1);
+      assert.match(s.midRunTrigger!.tip, /^[0-9a-f]{40}$/);
+      assert.equal(s.attempts, 0, "arming is not a turn");
+      const d = await r.ctx.midRunSecretRemediation!();
+      assert.equal(d.action, "remediate");
+      if (d.action !== "remediate") return;
+      assert.match(d.followUp, /not published yet, so publication of your work is withheld/);
+      assert.doesNotMatch(d.followUp, /signal_done/);
+      assert.match(d.followUp, /attempt 1 of 2/);
+      assert.ok(d.followUp.includes("cfg.env"), d.followUp);
+      assert.equal(s.attempts, 1);
+      assert.equal(s.midRunTrigger, undefined);
+      untouched(s);
+      assert.deepEqual(await r.ctx.midRunSecretRemediation!(), { action: "proceed" });
+      assert.equal(s.attempts, 1);
+      assert.ok(sha);
+    });
+    assert.deepEqual(out.violations, []);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.ok(statusTexts(out.claimRunId).some((t) => /^mid-run checkpoint secret scan flagged 1 finding\(s\) .*attempt 1 of 2\)$/.test(t)), "the mid-run status feed line");
+  });
+
+  it("never publishes a flagged commit: before remediation, after a deletion-only commit, and a rewrite publishes again", async () => {
+    const out = await rig(4258_002, async (r) => {
+      const sha = await flagAndTick(r);
+      assert.equal(r.tips.length, 0, "the tick held publication");
+      // deletion-only follow-up commit before the boundary: the retained flagged commit still ships
+      commitIn(r.ctx.worktreePath, "cfg.env", "TOKEN=\n");
+      const first = await r.ctx.midRunSecretRemediation!();
+      assert.equal(first.action, "remediate");
+      assert.equal(await r.tick(), "secret_remediation_pending");
+      assert.equal(r.tips.length, 0, "a deletion-only commit does not clear the flagged commit");
+      rewriteOut(r.ctx.worktreePath, sha, "cfg.env");
+      assert.equal(ancestryOf(r.ctx.worktreePath, sha, "HEAD"), "divergent");
+      assert.equal(await r.tick(), "published", "positive control: the rewritten branch publishes");
+      assert.ok(r.tips.length >= 1);
+      assert.deepEqual(await r.ctx.midRunSecretRemediation!(), { action: "proceed" });
+    });
+    assert.deepEqual(out.violations, []);
+  });
+
+  it("a deletion-only follow-up still remediates through the retained flagged commit when a fresh scan is clean", async () => {
+    await rig(4258_003, async (r) => {
+      const sha = await flagAndTick(r);
+      commitIn(r.ctx.worktreePath, "cfg.env", "TOKEN=\n");
+      const d = await r.withStub(
+        { secretScanCheckpointRange: async () => ({ trusted: true, findings: [] }) },
+        () => r.ctx.midRunSecretRemediation!(),
+      );
+      assert.equal(d.action, "remediate");
+      assert.equal(r.state().attempts, 1);
+      assert.ok(r.state().flaggedCommits!.includes(sha));
+    });
+  });
+
+  it("finalize refuses to push while the flagged commit is reachable (push_secret_blocked)", async () => {
+    const iid = 4258_004;
+    const out = await rig(iid, async (r) => {
+      await flagAndTick(r);
+      assert.equal((await r.ctx.midRunSecretRemediation!()).action, "remediate");
+      // the lead does not rewrite: the turn ends with the flagged commit reachable
+    });
+    assertPushSecretBlocked(out.claimRunId);
+    assert.equal(refOr(fx.originPath, `refs/heads/agent/issue-${iid}`), null, "nothing was pushed");
+    assert.deepEqual(out.tips, []);
+    assert.deepEqual(out.violations, []);
+  });
+
+  describe("defers (proceed, trigger kept, attempts unchanged, nothing blocked or known)", () => {
+    const stubs: Array<{ name: string; run: (r: Rig, sha: string) => Promise<{ action: string }> }> = [
+      {
+        name: "an untrusted scan",
+        run: (r) => r.withStub({ secretScanCheckpointRange: async () => ({ trusted: false, findings: [], reason: "stubbed" }) },
+          () => r.ctx.midRunSecretRemediation!()),
+      },
+      {
+        name: "a stale tip",
+        run: (r) => r.withStub({ trackingTip: async () => "0".repeat(40) }, () => r.ctx.midRunSecretRemediation!()),
+      },
+      {
+        name: "a throw",
+        run: (r) => r.withStub({ branchTip: async () => { throw new Error("boom"); } }, () => r.ctx.midRunSecretRemediation!()),
+      },
+      {
+        name: "restriction uncertainty",
+        run: (r) => {
+          r.flight().remediationRestrictions = {
+            roots: [],
+            pending: { runId: "x", requiredOIDs: [], requireDenial: false, bindingUncertain: true },
+          };
+          return r.ctx.midRunSecretRemediation!();
+        },
+      },
+      {
+        name: "a required denial",
+        run: (r) => {
+          r.flight().remediationRestrictions = {
+            roots: [],
+            pending: { runId: "x", requiredOIDs: [], requireDenial: true, bindingUncertain: false },
+          };
+          return r.ctx.midRunSecretRemediation!();
+        },
+      },
+      {
+        name: "unknown ancestry of a retained flagged commit on a clean scan",
+        run: (r, sha) => r.withStub({
+          secretScanCheckpointRange: async () => ({ trusted: true, findings: [] }),
+          ancestry: async (_b: string, a: string) => (a === sha ? "unknown" : "divergent"),
+        }, () => r.ctx.midRunSecretRemediation!()),
+      },
+      {
+        name: "unknown floor ancestry",
+        run: (r, sha) => r.withStub({
+          ancestry: async (_b: string, a: string, t: string) => (a === sha && t !== r.state().midRunTrigger!.tip ? "unknown" : "ancestor"),
+        }, () => r.ctx.midRunSecretRemediation!()),
+      },
+    ];
+    for (const [i, c] of stubs.entries()) {
+      it(c.name, async () => {
+        await rig(4258_010 + i, async (r) => {
+          // a clean published checkpoint first, so a published floor exists for the floor-unknown case
+          commitIn(r.ctx.worktreePath, "clean.txt", "clean\n");
+          assert.equal(await r.tick(), "published");
+          const sha = await flagAndTick(r);
+          const before = r.state().midRunTrigger;
+          const d = await c.run(r, sha);
+          assert.equal(d.action, "proceed");
+          const s = r.state();
+          assert.deepEqual(s.midRunTrigger, before, "the trigger is kept");
+          assert.equal(s.attempts, 0);
+          untouched(s);
+        });
+      });
+    }
+  });
+
+  it("a refused fetch-back rethrows PreservationRefusedError; the trigger stays and no attempt is spent", async () => {
+    await rig(4258_044, async (r) => {
+      await flagAndTick(r);
+      const before = r.state().midRunTrigger;
+      assert.ok(before);
+      await assert.rejects(
+        r.withFetchBack(async () => ({ kind: "refused" }), () => r.ctx.midRunSecretRemediation!()),
+        (e: unknown) => e instanceof Error && e.name === "PreservationRefusedError",
+      );
+      const s = r.state();
+      assert.deepEqual(s.midRunTrigger, before, "the trigger is kept");
+      assert.equal(s.attempts, 0);
+      untouched(s);
+    });
+  });
+
+  it("unknown flagged-commit ancestry against the tip defers even when every floor is divergent", async () => {
+    await rig(4258_040, async (r) => {
+      commitIn(r.ctx.worktreePath, "clean.txt", "clean\n");
+      assert.equal(await r.tick(), "published");
+      const sha = await flagAndTick(r);
+      const before = r.state().midRunTrigger;
+      assert.ok(before);
+      const tip = before.tip;
+      const real = r.g.ancestry.bind(r.g);
+      const d = await r.withStub({
+        secretScanCheckpointRange: async () => ({ trusted: true, findings: [] }),
+        ancestry: async (b: string, a: string, t: string) => (a === sha ? (t === tip ? "unknown" : "divergent") : real(b, a, t)),
+      }, () => r.ctx.midRunSecretRemediation!());
+      assert.equal(d.action, "proceed");
+      const s = r.state();
+      assert.deepEqual(s.midRunTrigger, before, "the trigger is kept");
+      assert.equal(s.attempts, 0);
+      untouched(s);
+    });
+  });
+
+  it("an unknown floor ancestry during the tick arms no trigger", async () => {
+    await rig(4258_041, async (r) => {
+      commitIn(r.ctx.worktreePath, "clean.txt", "clean\n");
+      assert.equal(await r.tick(), "published");
+      const sha = commitIn(r.ctx.worktreePath, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
+      const real = r.g.ancestry.bind(r.g);
+      assert.equal(await r.withStub(
+        { ancestry: async (b: string, a: string, t: string) => (a === sha ? "unknown" : real(b, a, t)) },
+        () => r.tick(),
+      ), "secret_found");
+      assert.equal(r.state().midRunTrigger, undefined);
+      assert.equal(r.state().midRunSeq, undefined);
+    });
+  });
+
+  it("a flight whose flagged-commit list already overflowed arms no trigger", async () => {
+    await rig(4258_042, async (r) => {
+      commitIn(r.ctx.worktreePath, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
+      await r.tick();
+      assert.equal(r.state().overflow, true);
+      assert.equal(r.state().midRunTrigger, undefined);
+      assert.equal(r.state().midRunSeq, undefined);
+    }, { seed: (f) => { f.secretRemediation ??= { attempts: 0 }; f.secretRemediation.overflow = true; } });
+  });
+
+  it("a commit adding two secret files yields two findings at the boundary", async () => {
+    await rig(4258_043, async (r) => {
+      fs.writeFileSync(path.join(r.ctx.worktreePath, "aaa.env"), `TOKEN=${runtimeSecret()}\n`);
+      fs.writeFileSync(path.join(r.ctx.worktreePath, "bbb.env"), `TOKEN=${runtimeSecret()}\n`);
+      gitIn(r.ctx.worktreePath, ["add", "-A"]);
+      gitIn(r.ctx.worktreePath, [...IDENT, "commit", "-m", "work two secrets"]);
+      r.flagged.push(gitIn(r.ctx.worktreePath, ["rev-parse", "HEAD"]));
+      assert.equal(await r.tick(), "secret_found");
+      const d = await r.ctx.midRunSecretRemediation!();
+      assert.equal(d.action, "remediate");
+      if (d.action !== "remediate") return;
+      assert.equal((d.followUp.match(/\(rule github-pat\)/g) ?? []).length, 2, d.followUp);
+      assert.ok(d.followUp.includes("aaa.env") && d.followUp.includes("bbb.env"), d.followUp);
+    });
+  });
+
+  it("an ancestry at or below a floor arms no trigger and leaves the done gate's decision unchanged", async () => {
+    await rig(4258_020, async (r) => {
+      commitIn(r.ctx.worktreePath, "clean.txt", "clean\n");
+      assert.equal(await r.tick(), "published");
+      const sha = commitIn(r.ctx.worktreePath, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
+      const real = r.g.ancestry.bind(r.g);
+      assert.equal(await r.withStub(
+        { ancestry: async (b: string, a: string, t: string) => (a === sha ? "ancestor" : real(b, a, t)) },
+        () => r.tick(),
+      ), "secret_found");
+      const s = r.state();
+      assert.equal(s.midRunTrigger, undefined);
+      assert.equal(s.midRunSeq, undefined);
+      assert.deepEqual(await r.ctx.midRunSecretRemediation!(), { action: "proceed" });
+      const gate = await r.withStub(
+        { ancestry: async (b: string, a: string, t: string) => (a === sha ? "ancestor" : real(b, a, t)) },
+        () => r.ctx.secretRemediationGate!(),
+      );
+      assert.deepEqual(gate, { action: "proceed" }, "at a floor the done gate asks for no rewrite");
+      assert.equal(s.attempts, 0);
+      assert.ok(s.known && s.known.length > 0);
+    });
+  });
+
+  it("a floor change between observation and boundary: the fresh scan decides and no turn is given", async () => {
+    await rig(4258_021, async (r) => {
+      commitIn(r.ctx.worktreePath, "clean.txt", "clean\n");
+      assert.equal(await r.tick(), "published");
+      const sha = await flagAndTick(r);
+      assert.ok(r.state().midRunTrigger);
+      const real = r.g.ancestry.bind(r.g);
+      const d = await r.withStub(
+        { ancestry: async (b: string, a: string, t: string) => (a === sha && t !== r.state().midRunTrigger!.tip ? "ancestor" : real(b, a, t)) },
+        () => r.ctx.midRunSecretRemediation!(),
+      );
+      assert.deepEqual(d, { action: "proceed" });
+      const s = r.state();
+      assert.equal(s.midRunTrigger, undefined);
+      assert.equal(s.attempts, 0);
+      untouched(s);
+    });
+  });
+
+  it("a real published floor descending from the flagged commit, added after observation: the fresh classification decides and no turn is given", async () => {
+    await rig(4258_023, async (r) => {
+      const sha = await flagAndTick(r);
+      assert.ok(r.state().midRunTrigger);
+      // No ancestry stub: real commits descend from the flagged one and the later one becomes a published floor.
+      const floor = commitIn(r.ctx.worktreePath, "clean-a.txt", "a\n");
+      commitIn(r.ctx.worktreePath, "clean-b.txt", "b\n");
+      assert.equal(ancestryOf(r.ctx.worktreePath, sha, floor), "ancestor");
+      const flight = r.flight() as { publishedRealTips?: string[] };
+      (flight.publishedRealTips ??= []).push(floor);
+      assert.deepEqual(await r.ctx.midRunSecretRemediation!(), { action: "proceed" });
+      const s = r.state();
+      assert.equal(s.midRunTrigger, undefined);
+      assert.equal(s.attempts, 0);
+      untouched(s);
+    });
+  });
+
+  // The default-branch tip is a scan floor of the checkpoint range, not a published tip. A retained flagged
+  // commit that the default branch now contains is public history: the seam must classify it against the
+  // range's resolved floors, as the checkpoint and publish paths do, and ask for no rewrite.
+  it("a retained flagged commit already under the default-branch floor: no guidance, no attempt, still held", async () => {
+    const out = await rig(4258_050, async (r) => {
+      const c1 = await flagAndTick(r);
+      const armed = r.state().midRunTrigger;
+      assert.ok(armed);
+      commitIn(r.ctx.worktreePath, "later-a.txt", "a\n");
+      commitIn(r.ctx.worktreePath, "later-b.txt", "b\n");
+      // The seam's fetch-back runs clone -> bare, so the default branch is advanced on the bare itself.
+      gitIn(r.bare, ["update-ref", "refs/remotes/origin/main", c1]);
+      assert.equal(ancestryOf(r.bare, c1, "refs/remotes/origin/main"), "ancestor");
+      const d = await r.ctx.midRunSecretRemediation!();
+      assert.deepEqual(d, { action: "proceed" }, "no rewrite guidance for a commit the default branch contains");
+      const s = r.state();
+      assert.equal(s.attempts, 0, "no attempt was spent");
+      assert.equal(s.midRunTrigger, undefined, "the trigger is cleared");
+      assert.ok(s.flaggedCommits!.includes(c1), "the flagged commit stays recorded");
+      untouched(s);
+      commitIn(r.ctx.worktreePath, "later-c.txt", "c\n");
+      assert.equal(await r.tick(), "secret_remediation_pending", "an unscanned publication attempt is still held");
+      assert.equal(r.tips.length, 0, "nothing was uploaded");
+    });
+    assert.deepEqual(statusTexts(out.claimRunId).filter((t) => /returning to the lead/.test(t)), []);
+  });
+
+  it("a retained commit under the default floor beside a fresh secret above every floor: the trigger clears with no turn, and both stay recorded and held", async () => {
+    await rig(4258_051, async (r) => {
+      const c1 = await flagAndTick(r);
+      commitIn(r.ctx.worktreePath, "later-a.txt", "a\n");
+      gitIn(r.bare, ["update-ref", "refs/remotes/origin/main", c1]);
+      const c2 = commitIn(r.ctx.worktreePath, "second.env", `TOKEN=${runtimeSecret()}\n`);
+      r.flagged.push(c2);
+      const d = await r.ctx.midRunSecretRemediation!();
+      // Accepted behaviour: classifyFindingFloors returns at_floor as soon as ANY finding is at a floor, so
+      // the fresh C2 is recorded (negative knowledge, held at publication) but earns no turn here.
+      assert.deepEqual(d, { action: "proceed" });
+      const s = r.state();
+      assert.equal(s.attempts, 0);
+      assert.equal(s.midRunTrigger, undefined);
+      assert.ok(s.flaggedCommits!.includes(c1) && s.flaggedCommits!.includes(c2), "both commits are recorded");
+      untouched(s);
+      assert.equal(await r.tick(), "secret_remediation_pending", "publication stays held");
+      assert.equal(r.tips.length, 0);
+    });
+  });
+
+  // gitleaks reports an empty File for any name git must quote (control bytes, bidi, other
+  // non-ASCII), so the runner-level names here are plain ASCII that the report keeps. Control/bidi
+  // escaping itself is pinned in secret-finding-render.test.ts. A secret-shaped path in the scan makes
+  // the runner withhold every path (fail closed), so the two shapes run as separate cases.
+  // `ruleId` (optional) replaces the rule id of every finding the mid-run consumer's FRESH scan
+  // returns (the stub sits on GitCache.secretScanCheckpointRange, the seam scanRemediationRange calls),
+  // because real gitleaks only ever reports well-formed ids.
+  async function hostileRun(iid: number, name: string, content: string, secret: string, ruleId?: string) {
+    let followUp = "";
+    const { logger, lines } = recordingLogger();
+    const out = await rig(iid, async (r) => {
+      r.flagged.push(commitIn(r.ctx.worktreePath, name, content));
+      assert.equal(await r.tick(), "secret_found");
+      const real = r.g.secretScanCheckpointRange.bind(r.g);
+      const hostile = async (...a: Parameters<GitCache["secretScanCheckpointRange"]>) => {
+        const s = await real(...a);
+        return ruleId !== undefined && s.trusted ? { ...s, findings: s.findings.map((f) => ({ ...f, ruleId })) } : s;
+      };
+      const d = await r.withStub({ secretScanCheckpointRange: hostile }, () => r.ctx.midRunSecretRemediation!());
+      assert.equal(d.action, "remediate");
+      if (d.action === "remediate") followUp = d.followUp;
+    }, { log: logger });
+    assert.ok(followUp.length > 0);
+    // eslint-disable-next-line no-control-regex
+    const unsafe = /[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/;
+    const strings = (v: unknown): string[] =>
+      typeof v === "string" ? [v] : v && typeof v === "object" ? Object.values(v).flatMap(strings) : [];
+    const logEntries = (lines as Array<Record<string, unknown>>).filter(
+      (l) => typeof l.msg === "string" && l.msg.startsWith("mid-run checkpoint secret scan flagged commits above the checkpoint floor"),
+    );
+    assert.equal(logEntries.length, 1, "exactly one mid-run run-log entry");
+    const logFindings = strings(logEntries[0]!.findings);
+    assert.ok(logFindings.length > 0, "the run-log entry carries rendered findings");
+    const emitted = [followUp, ...api.messages(out.claimRunId).flatMap((m) => strings(m.payload)), ...strings(logEntries[0])];
+    for (const text of emitted) {
+      assert.ok(!text.includes(secret), "no raw secret value");
+      assert.ok(!unsafe.test(text), `no raw control byte in ${JSON.stringify(text.slice(0, 80))}`);
+    }
+    const statusLine = statusTexts(out.claimRunId).find((t) => t.startsWith("mid-run checkpoint secret scan flagged"));
+    assert.ok(statusLine, "the status line was emitted");
+    return { followUp, emitted, logFindings, statusLine };
+  }
+
+  it("a token used as the flagged file name is withheld from the follow-up and the feed", async () => {
+    const secret = runtimeSecret();
+    const { followUp, logFindings } = await hostileRun(4258_024, `${secret}.env`, `TOKEN=${secret}\n`, secret);
+    assert.ok(/\b[0-9a-f]{12} \[path withheld\]:1 \(rule github-pat\)/.test(followUp), followUp);
+    assert.ok(logFindings.every((f) => /^[0-9a-f]{12} \[path withheld\]:1 \(rule github-pat\)$/.test(f)), JSON.stringify(logFindings));
+  });
+
+  it("a hostile rule id (secret-shaped, with ANSI escapes) renders as the withheld rule marker in the feed, the run log and the follow-up", async () => {
+    const secret = runtimeSecret();
+    const ruleId = `github-pat\u001b[31m${secret}\u001b[0m`;
+    const { followUp, logFindings, statusLine } = await hostileRun(4258_026, "plain-rule.env", `TOKEN=${secret}\n`, secret, ruleId);
+    assert.ok(/\(rule \[rule withheld\]\)/.test(followUp), followUp);
+    assert.ok(logFindings.length > 0 && logFindings.every((f) => f.endsWith("(rule [rule withheld])")), JSON.stringify(logFindings));
+    assert.ok(/\(rule \[rule withheld\]\);/.test(statusLine), statusLine);
+    assert.ok(!statusLine.includes("github-pat"), statusLine);
+  });
+
+  it("a flagged file name shaped like a forged finding label renders as one JSON-quoted value", async () => {
+    const forgedName = "a.ts:1 (rule x); bbbbbbbbbbbb evil.ts";
+    const secret = runtimeSecret();
+    const { followUp, emitted, logFindings } = await hostileRun(4258_025, forgedName, `TOKEN=${secret}\n`, secret);
+    assert.ok(logFindings.length > 0 && logFindings.every((f) => f.includes(JSON.stringify(forgedName).slice(0, -1)) && !f.replaceAll(JSON.stringify(forgedName).slice(0, -1), "").includes(forgedName)), JSON.stringify(logFindings));
+    // gitleaks may append a trailing tab to a name containing spaces (a git diff header quirk); it is
+    // escaped by the renderer, so allow an optional escaped suffix inside the quotes.
+    const quoted = JSON.stringify(forgedName).slice(0, -1);
+    const rest = followUp.slice(followUp.indexOf(quoted) + quoted.length);
+    assert.ok(followUp.includes(quoted) && /^(\\\\u\{9\})?":1 \(rule github-pat\)/.test(rest), followUp);
+    for (const text of emitted) {
+      assert.ok(!text.replaceAll(quoted, "").includes(forgedName), "the forged name only appears JSON-quoted");
+    }
+  });
+
+  it("a tip change that drops the commit: the fresh scan decides and no turn is given", async () => {
+    await rig(4258_022, async (r) => {
+      const sha = await flagAndTick(r);
+      rewriteOut(r.ctx.worktreePath, sha, "cfg.env");
+      assert.deepEqual(await r.ctx.midRunSecretRemediation!(), { action: "proceed" });
+      const s = r.state();
+      assert.equal(s.midRunTrigger, undefined);
+      assert.equal(s.attempts, 0);
+      untouched(s);
+    });
+  });
+
+  it("shares the attempt cap with the done gate: a mid-run turn plus gate turns never exceed 2", async () => {
+    await rig(4258_030, async (r) => {
+      await flagAndTick(r);
+      assert.equal((await r.ctx.midRunSecretRemediation!()).action, "remediate");
+      assert.equal((await r.ctx.secretRemediationGate!()).action, "remediate");
+      assert.equal(r.state().attempts, 2);
+      assert.equal((await r.ctx.secretRemediationGate!()).action, "fail");
+      assert.equal(r.state().attempts, 2);
+    });
+  });
+
+  it("an exhausted cap at the boundary: proceed, trigger cleared, blocked unset, restrictions kept", async () => {
+    await rig(4258_031, async (r) => {
+      await flagAndTick(r);
+      const before = JSON.stringify(r.flight().remediationRestrictions ?? null);
+      assert.ok(r.state().midRunTrigger);
+      assert.deepEqual(await r.ctx.midRunSecretRemediation!(), { action: "proceed" });
+      const s = r.state();
+      assert.equal(s.midRunTrigger, undefined);
+      assert.equal(s.attempts, 2);
+      untouched(s);
+      assert.equal(JSON.stringify(r.flight().remediationRestrictions ?? null), before);
+    }, { seed: (f) => { f.secretRemediation ??= { attempts: 2 }; f.secretRemediation.attempts = 2; } });
+  });
+
+  it("an exhausted cap with a divergent rewrite still carrying the secret: the new commit is recorded and an unscanned publish holds", async () => {
+    await rig(4258_035, async (r) => {
+      const a = await flagAndTick(r);
+      assert.ok(r.state().midRunTrigger);
+      assert.deepEqual(r.state().flaggedCommits, [a]);
+      // The lead rewrites the flagged commit into a divergent one that still carries a secret.
+      gitIn(r.ctx.worktreePath, ["reset", "-q", "--hard", `${a}^`]);
+      const b = commitIn(r.ctx.worktreePath, "other.env", `TOKEN=${runtimeSecret()}\n`);
+      r.flagged.push(b);
+      assert.deepEqual(await r.ctx.midRunSecretRemediation!(), { action: "proceed" });
+      const s = r.state();
+      assert.equal(s.midRunTrigger, undefined);
+      assert.equal(s.attempts, 2);
+      untouched(s);
+      assert.ok(s.flaggedCommits?.includes(b), "the fresh trusted finding is recorded at the cap");
+      // An unscanned publication path (no fresh scan runs here) must not ship the new flagged commit.
+      const outcome = await (r.runner as unknown as {
+        publishCheckpointOutcome: (f: unknown, bare: string, branch: string) => Promise<unknown>;
+      }).publishCheckpointOutcome(r.flight(), r.bare, r.ctx.branch);
+      assert.equal((outcome as { published: boolean }).published, false);
+      assert.equal(r.tips.length, 0, "no candidate containing the flagged commit was uploaded");
+    }, { seed: (f) => { f.secretRemediation ??= { attempts: 2 }; f.secretRemediation.attempts = 2; } });
+  });
+
+  const publishUnscanned = (r: Rig) => (r.runner as unknown as {
+    publishCheckpointOutcome: (f: unknown, bare: string, branch: string) => Promise<{ published: boolean }>;
+  }).publishCheckpointOutcome(r.flight(), r.bare, r.ctx.branch);
+
+  it("temporarily unknown floor ancestry on a divergent rewrite: deferred, new commit recorded, an unscanned publish holds", async () => {
+    await rig(4258_036, async (r) => {
+      commitIn(r.ctx.worktreePath, "clean.txt", "clean\n");
+      assert.equal(await r.tick(), "published");
+      const a = await flagAndTick(r);
+      gitIn(r.ctx.worktreePath, ["reset", "-q", "--hard", `${a}^`]);
+      const b = commitIn(r.ctx.worktreePath, "other.env", `TOKEN=${runtimeSecret()}\n`);
+      r.flagged.push(b);
+      const real = r.g.ancestry.bind(r.g);
+      const d = await r.withStub(
+        { ancestry: async (bp: string, x: string, t: string) => (x === b && t !== b ? "unknown" : real(bp, x, t)) },
+        () => r.ctx.midRunSecretRemediation!(),
+      );
+      assert.deepEqual(d, { action: "proceed" });
+      const s = r.state();
+      assert.ok(s.midRunTrigger, "the defer keeps the trigger");
+      assert.equal(s.attempts, 0);
+      untouched(s);
+      assert.ok(s.flaggedCommits?.includes(b), "the fresh trusted finding is recorded before the defer");
+      const before = r.tips.length;
+      assert.equal((await publishUnscanned(r)).published, false);
+      assert.equal(r.tips.length, before, "nothing containing the flagged commit was uploaded");
+    });
+  });
+
+  it("unknown retained-commit ancestry on a divergent rewrite: deferred, new commit recorded, an unscanned publish holds", async () => {
+    await rig(4258_038, async (r) => {
+      const a = await flagAndTick(r);
+      gitIn(r.ctx.worktreePath, ["reset", "-q", "--hard", `${a}^`]);
+      const b = commitIn(r.ctx.worktreePath, "other.env", `TOKEN=${runtimeSecret()}\n`);
+      r.flagged.push(b);
+      const real = r.g.ancestry.bind(r.g);
+      const d = await r.withStub(
+        { ancestry: async (bp: string, x: string, t: string) => (x === a ? "unknown" : real(bp, x, t)) },
+        () => r.ctx.midRunSecretRemediation!(),
+      );
+      assert.deepEqual(d, { action: "proceed" });
+      const s = r.state();
+      assert.ok(s.midRunTrigger, "the defer keeps the trigger");
+      assert.equal(s.attempts, 0);
+      untouched(s);
+      assert.ok(s.flaggedCommits?.includes(b), "the fresh trusted finding is recorded before the defer");
+      const before = r.tips.length;
+      assert.equal((await publishUnscanned(r)).published, false);
+      assert.equal(r.tips.length, before);
+    });
+  });
+
+  it("a fresh finding that would overflow the flagged-commit list: deferred, overflow fails closed, an unscanned publish holds", async () => {
+    await rig(4258_039, async (r) => {
+      const a = await flagAndTick(r);
+      gitIn(r.ctx.worktreePath, ["reset", "-q", "--hard", `${a}^`]);
+      const b = commitIn(r.ctx.worktreePath, "other.env", `TOKEN=${runtimeSecret()}\n`);
+      r.flagged.push(b);
+      assert.deepEqual(await r.ctx.midRunSecretRemediation!(), { action: "proceed" });
+      const s = r.state();
+      assert.ok(s.midRunTrigger, "the defer keeps the trigger");
+      assert.equal(s.attempts, 0);
+      untouched(s);
+      assert.equal(s.overflow, true, "the list that cannot hold the new commit fails closed");
+      const before = r.tips.length;
+      assert.equal((await publishUnscanned(r)).published, false);
+      assert.equal(r.tips.length, before);
+    }, { ctlHooks: { flaggedCommitsCap: 1 } });
+  });
+
+  it("a stop right after the trusted rescan found a divergent commit: aborted defer, commit already recorded, an unscanned publish holds", async () => {
+    const { logger, lines } = recordingLogger();
+    await rig(4258_040, async (r) => {
+      const a = await flagAndTick(r);
+      gitIn(r.ctx.worktreePath, ["reset", "-q", "--hard", `${a}^`]);
+      const b = commitIn(r.ctx.worktreePath, "other.env", `TOKEN=${runtimeSecret()}\n`);
+      r.flagged.push(b);
+      const realScan = r.g.secretScanCheckpointRange.bind(r.g);
+      const d = await r.withStub(
+        {
+          secretScanCheckpointRange: async (...args: Parameters<typeof realScan>) => {
+            const res = await realScan(...args);
+            r.runner.shutdown(); // the stop lands the moment the trusted result exists
+            return res;
+          },
+        },
+        () => r.ctx.midRunSecretRemediation!(),
+      );
+      assert.deepEqual(d, { action: "proceed" });
+      assert.ok(
+        lines.some((l) => (l as Record<string, unknown>).msg === "mid-run secret remediation deferred" && (l as Record<string, unknown>).why === "aborted"),
+        "the seam deferred as aborted",
+      );
+      const s = r.state();
+      assert.ok(s.midRunTrigger, "the aborted defer keeps the trigger");
+      assert.equal(s.attempts, 0);
+      untouched(s);
+      assert.ok(s.flaggedCommits?.includes(b), "the trusted finding was recorded before the stop return");
+      const before = r.tips.length;
+      assert.equal((await publishUnscanned(r)).published, false);
+      assert.equal(r.tips.length, before);
+    }, { log: logger });
+  });
+
+  it("a local-only checkpoint floor containing the finding: at_floor clears, the commit is recorded and an unscanned publish holds", async () => {
+    await rig(4258_037, async (r) => {
+      commitIn(r.ctx.worktreePath, "clean.txt", "clean\n");
+      assert.equal(await r.tick(), "published");
+      const a = await flagAndTick(r);
+      gitIn(r.ctx.worktreePath, ["reset", "-q", "--hard", `${a}^`]);
+      const b = commitIn(r.ctx.worktreePath, "other.env", `TOKEN=${runtimeSecret()}\n`);
+      r.flagged.push(b);
+      const local = commitIn(r.ctx.worktreePath, "clean-b.txt", "b\n");
+      const flight = r.flight() as { checkpointFloor?: string; publishedRealTips?: string[] };
+      assert.ok(!(flight.publishedRealTips ?? []).includes(local));
+      flight.checkpointFloor = local;
+      assert.equal(ancestryOf(r.ctx.worktreePath, b, local), "ancestor");
+      assert.deepEqual(await r.ctx.midRunSecretRemediation!(), { action: "proceed" });
+      const s = r.state();
+      assert.equal(s.midRunTrigger, undefined, "at_floor clears the trigger");
+      assert.equal(s.attempts, 0);
+      untouched(s);
+      assert.ok(s.flaggedCommits?.includes(b), "the commit behind the local-only floor is recorded");
+      const before = r.tips.length;
+      assert.equal((await publishUnscanned(r)).published, false);
+      assert.equal(r.tips.length, before, "the local-only bridge containing the flagged commit was not uploaded");
+    });
+  });
+
+  it("the done gate clears a pending trigger, so no duplicate turn follows", async () => {
+    await rig(4258_032, async (r) => {
+      await flagAndTick(r);
+      assert.ok(r.state().midRunTrigger);
+      assert.equal((await r.ctx.secretRemediationGate!()).action, "remediate");
+      assert.equal(r.state().midRunTrigger, undefined);
+      assert.deepEqual(await r.ctx.midRunSecretRemediation!(), { action: "proceed" });
+      assert.equal(r.state().attempts, 1);
+    });
+  });
+
+  it("the resume preflight (unpublishedOnly gate) clears a pending trigger", async () => {
+    await rig(4258_033, async (r) => {
+      await flagAndTick(r);
+      assert.ok(r.state().midRunTrigger);
+      await r.ctx.secretRemediationGate!({ unpublishedOnly: true });
+      assert.equal(r.state().midRunTrigger, undefined);
+    });
+  });
+
+  it("a newer observation replaces an older pending trigger", async () => {
+    await rig(4258_034, async (r) => {
+      const a = await flagAndTick(r, "a.env");
+      const first = r.state().midRunTrigger!;
+      rewriteOut(r.ctx.worktreePath, a, "a.env");
+      await flagAndTick(r, "b.env");
+      const second = r.state().midRunTrigger!;
+      assert.equal(second.observation, first.observation + 1);
+      assert.notEqual(second.tip, first.tip);
+    });
+  });
+
+  // ── a stop (cancel / worker shutdown) bounds the seam by its owned process scope ──────────────
+  //
+  // The gitleaks stand-in STALLS like a real long-running child (no test-side release): the seam can
+  // only return promptly if the stop kills it. Scan deadline and stall are both far above the wait
+  // bound, so an unscoped seam fails these by a bounded timeout, never by hanging the suite.
+  describe("a stop aborts a stalled scan child and defers (aborted)", () => {
+    const WAIT_MS = 15_000;
+    const stallHooks = { scanDeadlineMs: 60_000 };
+    const gateHeld = (r: Rig): boolean => (r.flight().sinkGate as { isHeld(): boolean }).isHeld();
+    const stopRun = (r: Rig, stop: "cancel" | "shutdown"): void => {
+      if (stop === "cancel") api.setInputs(r.flight().runId as string, [{ id: 1, kind: "cancel" }]);
+      else r.runner.shutdown();
+    };
+
+    for (const stage of ["range", "path"] as const) {
+      for (const stop of ["cancel", "shutdown"] as const) {
+        it(`${stage} scan stalled, then ${stop}: resolves proceed promptly, child and group gone, trigger kept`, { timeout: 90_000 }, async () => {
+          const tmp = scratchDir(`4258-${stage}-${stop}`);
+          const stall = writeStallShim(tmp);
+          const { logger, lines } = recordingLogger();
+          const iid = 4258_100 + (stage === "range" ? 0 : 10) + (stop === "cancel" ? 0 : 1);
+          let elapsed = Infinity;
+          try {
+            const out = await rig(iid, async (r) => {
+              try {
+                await flagAndTick(r);
+                stall.setMode(stage === "range" ? "stall-git" : "stall-stdin");
+                const p = r.ctx.midRunSecretRemediation!();
+                let settled = false;
+                p.then(() => { settled = true; }, () => { settled = true; });
+                await bounded(Promise.resolve().then(() => waitFor(() => stall.pids().length > 0, WAIT_MS)), WAIT_MS + 1_000, "the scan child to stall", "stall");
+                const pids = stall.pids();
+                assert.ok(pids.every((pid) => isAlive(pid)), "the scan child is running");
+                assert.equal(settled, false, "the seam waits on the stalled scan");
+                const t0 = Date.now();
+                stopRun(r, stop);
+                const d = await bounded(p, WAIT_MS, "the seam resolving after the stop", "mid-run seam");
+                elapsed = Date.now() - t0;
+                assert.deepEqual(d, { action: "proceed" });
+                for (const pid of pids) {
+                  assert.equal(isAlive(pid), false, `scan child ${pid} exited`);
+                  assert.equal(groupAlive(pid), false, `scan child group ${pid} is gone`);
+                }
+                assert.deepEqual(r.flight().survivingTickGroups, []);
+                assert.ok(r.state().midRunTrigger, "the trigger is kept");
+                assert.equal(r.state().attempts, 0, "no attempt was spent");
+                assert.equal(gateHeld(r), false, "the sink gate was released");
+                untouched(r.state());
+              } finally {
+                stall.setMode("pass"); // the run's own finalize scan must not stall too
+                await killAndReap(stall.pids()).catch(() => undefined);
+              }
+            }, { gitleaksBin: stall.bin, ctlHooks: stallHooks, log: logger });
+            if (turnErrors.length > 0) throw turnErrors.splice(0)[0];
+            assert.ok(elapsed < 10_000, `the seam returned ${elapsed}ms after the stop`);
+            assert.ok(
+              lines.some((l) => (l as Record<string, unknown>).msg === "mid-run secret remediation deferred" && (l as Record<string, unknown>).why === "aborted"),
+              "the seam logged an aborted deferral",
+            );
+            assert.deepEqual(statusTexts(out.claimRunId).filter((t) => /returning to the lead/.test(t)), []);
+            assert.deepEqual(out.tips, [], "nothing was published");
+            assert.deepEqual(out.violations, []);
+            // The stub executor returns normally after the deferral, so the run ends at finalize with the
+            // flagged commit still reachable: the done contract, not a remediation turn.
+            assertPushSecretBlocked(out.claimRunId);
+          } finally {
+            await killAndReap(stall.pids()).catch(() => undefined);
+            fs.rmSync(tmp, { recursive: true, force: true });
+          }
+        });
+      }
+    }
+
+    // No stop here: the path scan's own deadline must kill the stalled child. The range-scan deadline is
+    // far above the wait bound and the shim stalls for 120s, so an unbounded path scope fails this by the
+    // bounded wait, not by hanging the suite. An aborted path scan is fail-closed: every path is withheld.
+    it("path scan stalled with no stop: its own deadline kills the child and the seam remediates with every path withheld", { timeout: 90_000 }, async () => {
+      const PATH_DEADLINE_MS = 1_500;
+      const tmp = scratchDir("4258-path-deadline");
+      const stall = writeStallShim(tmp);
+      const { logger, lines } = recordingLogger();
+      let elapsed = Infinity;
+      let followUp = "";
+      try {
+        const out = await rig(4258_120, async (r) => {
+          try {
+            await flagAndTick(r);
+            stall.setMode("stall-stdin");
+            const t0 = Date.now();
+            const p = r.ctx.midRunSecretRemediation!();
+            p.catch(() => undefined);
+            const d = await bounded(p, WAIT_MS, "the seam resolving after the path-scan deadline", "mid-run seam");
+            elapsed = Date.now() - t0;
+            assert.equal(d.action, "remediate");
+            if (d.action !== "remediate") return;
+            followUp = d.followUp;
+            assert.ok(followUp.includes("[path withheld]"), followUp);
+            assert.ok(!followUp.includes("cfg.env"), "the flagged path was withheld, not reported");
+            const pids = stall.pids();
+            assert.ok(pids.length > 0, "the path scan child ran");
+            for (const pid of pids) {
+              assert.equal(isAlive(pid), false, `scan child ${pid} exited`);
+              assert.equal(groupAlive(pid), false, `scan child group ${pid} is gone`);
+            }
+            assert.deepEqual(r.flight().survivingTickGroups, []);
+            assert.equal(gateHeld(r), false, "the sink gate was released");
+            assert.equal(r.state().attempts, 1, "the attempt was spent");
+            assert.equal(r.state().midRunTrigger, undefined, "the trigger was cleared");
+            untouched(r.state());
+          } finally {
+            stall.setMode("pass");
+            await killAndReap(stall.pids()).catch(() => undefined);
+          }
+        }, { gitleaksBin: stall.bin, ctlHooks: { scanDeadlineMs: 60_000, pathScanDeadlineMs: PATH_DEADLINE_MS }, log: logger });
+        if (turnErrors.length > 0) throw turnErrors.splice(0)[0];
+        assert.ok(elapsed >= PATH_DEADLINE_MS - 200 && elapsed < PATH_DEADLINE_MS + 10_000, `the seam returned ${elapsed}ms after starting`);
+        assert.ok(followUp.length > 0);
+        // A deadline expiry is not a stop: no aborted deferral, and nothing was published.
+        assert.ok(
+          !lines.some((l) => (l as Record<string, unknown>).msg === "mid-run secret remediation deferred"),
+          "a deadline expiry is not a deferral",
+        );
+        assert.deepEqual(out.tips, [], "nothing was published");
+        assert.deepEqual(out.violations, []);
+        // The stub executor returns after the remediate decision, so the run ends at finalize with the
+        // flagged commit still reachable: the done contract, as in the stop cases above.
+        assertPushSecretBlocked(out.claimRunId);
+      } finally {
+        await killAndReap(stall.pids()).catch(() => undefined);
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    it("a boundary failure thrown after the stop is a deferral (aborted), not a rethrow", { timeout: 90_000 }, async () => {
+      const { logger, lines } = recordingLogger();
+      const out = await rig(4258_140, async (r) => {
+        await flagAndTick(r);
+        const d = await bounded(r.withFetchBack(async () => {
+          stopRun(r, "shutdown");
+          await new Promise((resolve) => setTimeout(resolve, 300));
+          throw Object.assign(new Error("boundary failure after the stop"), { checkpointBoundary: "hard" });
+        }, () => r.ctx.midRunSecretRemediation!()), WAIT_MS, "the seam resolving", "mid-run seam");
+        assert.deepEqual(d, { action: "proceed" });
+        assert.ok(r.state().midRunTrigger, "the trigger is kept");
+        assert.equal(r.state().attempts, 0, "no attempt was spent");
+        assert.equal(gateHeld(r), false, "the sink gate was released");
+      }, { log: logger });
+      if (turnErrors.length > 0) throw turnErrors.splice(0)[0];
+      assert.ok(
+        lines.some((l) => (l as Record<string, unknown>).msg === "mid-run secret remediation deferred" && (l as Record<string, unknown>).why === "aborted"),
+        "the seam logged an aborted deferral",
+      );
+      assert.deepEqual(statusTexts(out.claimRunId).filter((t) => /returning to the lead/.test(t)), []);
+    });
+
+    // The seam's cleanup reconciles a cancelled child's lock files under the bare lock. Only the WAIT for that
+    // lock is bounded: another holder must not pin the seam (and the sink gate), and a reconcile that already
+    // started is never cut off or relabelled as a lock-wait timeout.
+    describe("the cleanup's wait for the bare lock is bounded", () => {
+      const BOUND_MS = 500;
+      const logged = (lines: unknown[], msg: string): Array<Record<string, unknown>> =>
+        (lines as Array<Record<string, unknown>>).filter((l) => l.msg === msg);
+      const NOT_RUN = "mid-run secret remediation lock reconcile not run";
+      const FAILED = "mid-turn checkpoint lock reconcile failed";
+      const REMOVED = "mid-turn checkpoint removed a lock file its cancelled child provably owned";
+      const RETAINED = "mid-turn checkpoint retained a git lock file in the worker bare";
+      const SINK_BLOCKED = "mid-turn checkpoint sink blocked: a git lock file remains in the worker repository";
+
+      /** Stall the seam's scan child, then cancel the run once `afterStall` has set up its scenario. */
+      async function lockScenario(iid: number, hooks: Record<string, unknown>, body: (c: {
+        r: Rig; seam: Promise<unknown>; lockFile: string; stop: () => number;
+      }) => Promise<void>): Promise<{ lines: unknown[]; runId: string }> {
+        const tmp = scratchDir(`4258-lock-${iid}`);
+        const stall = writeStallShim(tmp);
+        const { logger, lines } = recordingLogger();
+        let runId = "";
+        try {
+          ({ claimRunId: runId } = await rig(iid, async (r) => {
+            try {
+              await flagAndTick(r);
+              stall.setMode("stall-git");
+              const seam = r.ctx.midRunSecretRemediation!();
+              seam.catch(() => undefined);
+              await bounded(Promise.resolve().then(() => waitFor(() => stall.pids().length > 0, WAIT_MS)), WAIT_MS + 1_000, "the scan child to stall", "stall");
+              const lockFile = path.join(r.bare, "shallow.lock");
+              await body({ r, seam, lockFile, stop: () => { const t0 = Date.now(); stopRun(r, "cancel"); return t0; } });
+              fs.rmSync(lockFile, { force: true });
+            } finally {
+              stall.setMode("pass");
+              await killAndReap(stall.pids()).catch(() => undefined);
+            }
+          }, { gitleaksBin: stall.bin, log: logger, ctlHooks: { ...stallHooks, midRunLockReconcileWaitMs: BOUND_MS, ...hooks } }));
+        } finally {
+          await killAndReap(stall.pids()).catch(() => undefined);
+          fs.rmSync(tmp, { recursive: true, force: true });
+        }
+        return { lines, runId };
+      }
+      const retainedHas = (r: Rig, file: string): boolean => {
+        const kept = r.flight().retainedBareLocks as string[];
+        return kept.includes(file) || kept.includes(fs.realpathSync(file));
+      };
+
+      it("another holder of the bare lock cannot pin the seam: it returns within the bound, reconcile never runs, the lock file stays blocking", { timeout: 90_000 }, async () => {
+        let reconciles = 0;
+        let release!: () => void;
+        const held = new Promise<void>((resolve) => { release = resolve; });
+        let holder: Promise<void> | undefined;
+        let atReturn = -1;
+        let elapsed = Infinity;
+        const { lines, runId } = await lockScenario(4258_300, { tickSpawn: { beforeReconcile: async () => { reconciles++; } } }, async ({ r, seam, lockFile, stop }) => {
+          try {
+            holder = r.g.withBareLock(r.bare, async () => { await held; });
+            holder.catch(() => undefined);
+            fs.writeFileSync(lockFile, "x");
+            const t0 = stop();
+            const d = await bounded(seam, BOUND_MS + 8_000, "the seam resolving while another holder owns the bare lock", "mid-run seam");
+            elapsed = Date.now() - t0;
+            atReturn = reconciles;
+            assert.deepEqual(d, { action: "proceed" });
+            assert.ok(retainedHas(r, lockFile), "the lock file that may belong to the unreconciled child blocks the sink");
+            assert.ok(r.state().midRunTrigger, "the trigger is kept");
+            assert.equal(r.state().attempts, 0);
+            assert.equal((r.flight().sinkGate as { isHeld(): boolean }).isHeld(), false, "the sink gate was released");
+          } finally {
+            release();
+            await holder;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 300));
+          assert.equal(reconciles, atReturn, "no reconcile ran after the holder released the lock");
+        });
+        assert.ok(elapsed < BOUND_MS + 5_000, `the seam returned ${elapsed}ms after the stop`);
+        const notRun = logged(lines, NOT_RUN);
+        assert.equal(notRun.length, 1, "the unreconciled outcome was logged once");
+        assert.equal(notRun[0]!.reconciled, false);
+        assert.equal(notRun[0]!.reason, "lock_wait_timeout");
+        assert.deepEqual(logged(lines, REMOVED), [], "no lock file was removed");
+        assert.deepEqual(logged(lines, FAILED), []);
+        assert.equal(statusTexts(runId).filter((t) => t === SINK_BLOCKED).length, 1, "the sink-blocked status was emitted once");
+      });
+
+      it("a non-ENOENT lstat failure on a candidate lock keeps it blocking the sink (only ENOENT proves absence)", { timeout: 90_000 }, async () => {
+        const realLstat = fsp.lstat.bind(fsp);
+        let injected = 0;
+        let armed = false;
+        let target = "";
+        const stub = mock.method(fsp, "lstat", (async (p: Parameters<typeof fsp.lstat>[0], ...rest: unknown[]) => {
+          if (armed && path.basename(String(p)) === target) {
+            injected++;
+            throw Object.assign(new Error("EACCES: permission denied, lstat"), { code: "EACCES" });
+          }
+          return (realLstat as (...a: unknown[]) => Promise<unknown>)(p, ...rest);
+        }) as unknown as typeof fsp.lstat);
+        let runId = "";
+        try {
+          // The reconcile rejects, so the seam cleanup falls back to recordUnreconciledLocks (the lstat probe).
+          const hooks = { tickSpawn: { beforeReconcile: async () => { throw new Error("reconcile boom"); } } };
+          ({ runId } = await lockScenario(4258_304, hooks, async ({ r, seam, lockFile, stop }) => {
+            fs.writeFileSync(lockFile, "x");
+            target = path.basename(lockFile);
+            armed = true;
+            stop();
+            const d = await bounded(seam, BOUND_MS + 15_000, "the seam resolving with an unreadable lock path", "mid-run seam");
+            armed = false;
+            assert.deepEqual(d, { action: "proceed" });
+            assert.ok(injected >= 1, "the EACCES stub fired for the lock path");
+            assert.ok(retainedHas(r, lockFile), "an lstat failure other than ENOENT keeps the lock path blocking");
+          }));
+        } finally {
+          stub.mock.restore();
+        }
+        assert.ok(statusTexts(runId).includes(SINK_BLOCKED), "the sink-blocked status was emitted");
+      });
+
+      it("an acquired reconcile that outlasts the bound completes and is recorded, never labelled a timeout", { timeout: 90_000 }, async () => {
+        let delayed = 0;
+        const { lines } = await lockScenario(4258_301, {
+          tickSpawn: { beforeReconcile: async () => { delayed++; await new Promise((resolve) => setTimeout(resolve, BOUND_MS * 3)); } },
+        }, async ({ r, seam, lockFile, stop }) => {
+          fs.writeFileSync(lockFile, "x");
+          stop();
+          const d = await bounded(seam, BOUND_MS + 15_000, "the seam resolving after a slow reconcile", "mid-run seam");
+          assert.deepEqual(d, { action: "proceed" });
+          assert.ok(delayed >= 1, "the reconcile ran its delayed hook");
+          assert.ok(retainedHas(r, lockFile), "the reconcile's own retained evidence was recorded");
+        });
+        assert.deepEqual(logged(lines, NOT_RUN), [], "never labelled a lock-wait timeout");
+        assert.deepEqual(logged(lines, FAILED), []);
+        assert.equal(logged(lines, RETAINED).length, 1, "the reconcile result was recorded");
+      });
+
+      it("an acquired reconcile that rejects after the bound is recorded as failed (not a timeout) and keeps the lock file blocking", { timeout: 90_000 }, async () => {
+        const { lines } = await lockScenario(4258_302, {
+          tickSpawn: { beforeReconcile: async () => { await new Promise((resolve) => setTimeout(resolve, BOUND_MS * 3)); throw new Error("reconcile boom"); } },
+        }, async ({ r, seam, lockFile, stop }) => {
+          fs.writeFileSync(lockFile, "x");
+          stop();
+          const d = await bounded(seam, BOUND_MS + 15_000, "the seam resolving after a failing reconcile", "mid-run seam");
+          assert.deepEqual(d, { action: "proceed" });
+          assert.ok(retainedHas(r, lockFile), "the failed reconcile left its candidate lock file blocking");
+        });
+        assert.deepEqual(logged(lines, NOT_RUN), [], "never labelled a lock-wait timeout");
+        const failed = logged(lines, FAILED);
+        assert.ok(failed.length >= 1);
+        assert.equal(failed.at(-1)!.reconciled, false);
+        assert.match(String(failed.at(-1)!.error), /reconcile boom/);
+      });
+
+      it("a rejection after a completed reconcile still records its retained lock and blocks the sink, never labelled a timeout", { timeout: 90_000 }, async () => {
+        const { lines, runId } = await lockScenario(4258_303, {}, async ({ r, seam, lockFile, stop }) => {
+          const g = r.g as unknown as { withRecoveryOperation: (...a: unknown[]) => Promise<unknown> };
+          const orig = g.withRecoveryOperation;
+          let armed = false;
+          let injected = 0;
+          g.withRecoveryOperation = function (this: unknown, ...args: unknown[]) {
+            const p = orig.apply(this, args);
+            // Only the seam cleanup's unbounded-budget call after the stop: the action runs fully, then rejects.
+            if (!armed || args[1] !== Infinity) return p;
+            injected++;
+            return p.then(() => { throw new Error("post-acquire boom"); });
+          };
+          try {
+            fs.writeFileSync(lockFile, "x");
+            armed = true;
+            stop();
+            const d = await bounded(seam, BOUND_MS + 15_000, "the seam resolving after a post-reconcile failure", "mid-run seam");
+            assert.deepEqual(d, { action: "proceed" });
+            assert.ok(injected >= 1, "the post-acquire failure was injected");
+            assert.ok(retainedHas(r, lockFile), "the reconciled retained lock is recorded despite the later rejection");
+          } finally {
+            g.withRecoveryOperation = orig;
+          }
+        });
+        assert.deepEqual(logged(lines, NOT_RUN), [], "never labelled a lock-wait timeout");
+        assert.equal(logged(lines, RETAINED).length, 1, "the reconcile result was recorded");
+        assert.equal(statusTexts(runId).filter((t) => t === SINK_BLOCKED).length, 1, "the sink-blocked status was emitted");
+        const failed = logged(lines, FAILED);
+        assert.ok(failed.length >= 1);
+        assert.equal(failed.at(-1)!.reconciled, true);
+        assert.match(String(failed.at(-1)!.error), /post-acquire boom/);
+      });
+    });
+
+    it("a surviving process group keeps the seam open and the sink gate held until it is gone", { timeout: 90_000 }, async () => {
+      const tmp = scratchDir("4258-survivor");
+      const stall = writeStallShim(tmp);
+      const { logger, lines } = recordingLogger();
+      const selected = new Set<number>();
+      const kills: number[] = [];
+      let forceAlive = true;
+      let selecting = false; // only the seam's stalled scan child is modelled as a survivor, not the arming tick's
+      try {
+        await rig(4258_130, async (r) => {
+          try {
+            await flagAndTick(r);
+            stall.setMode("stall-git");
+            selecting = true;
+            const p = r.ctx.midRunSecretRemediation!();
+            let settled = false;
+            p.then(() => { settled = true; }, () => { settled = true; });
+            await waitFor(() => stall.pids().length > 0, WAIT_MS);
+            stopRun(r, "cancel");
+            // The real child dies; only the group probe is forced to keep reporting it alive.
+            await waitFor(() => lines.some((l) => (l as Record<string, unknown>).msg === "mid-run secret remediation waiting for a surviving process group to exit"), 40_000);
+            const pgid = stall.pids()[0]!;
+            assert.equal(settled, false, "the seam has not returned while a group survives");
+            assert.equal(gateHeld(r), true, "the sink gate is still held");
+            assert.deepEqual((r.flight().survivingTickGroups as Array<{ pgid: number }>).map((g) => g.pgid), [pgid]);
+            const before = kills.length;
+            await waitFor(() => kills.length >= before + 1, WAIT_MS);
+            assert.equal(settled, false, "still waiting after another round of re-sent SIGKILL");
+            assert.equal(gateHeld(r), true, "the sink gate is still held after another round");
+            forceAlive = false;
+            const d = await bounded(p, WAIT_MS, "the seam returning once the group is gone", "mid-run seam");
+            assert.deepEqual(d, { action: "proceed" });
+            assert.deepEqual(r.flight().survivingTickGroups, []);
+            assert.ok(r.state().midRunTrigger, "the trigger is kept");
+            assert.equal(r.state().attempts, 0);
+            assert.equal(gateHeld(r), false, "the sink gate was released once the group was gone");
+          } finally {
+            forceAlive = false;
+            stall.setMode("pass");
+            await killAndReap(stall.pids()).catch(() => undefined);
+          }
+        }, {
+          gitleaksBin: stall.bin,
+          log: logger,
+          ctlHooks: {
+            ...stallHooks,
+            tickSpawn: {
+              groupAlive: (pid) => (forceAlive && selected.has(pid) ? true : undefined),
+              signalGroup: (pid, sig) => {
+                if (sig === "SIGKILL" && selected.has(pid)) kills.push(pid);
+                return undefined;
+              },
+              onSpawn: (pid, argv) => { if (selecting && argv[0] === stall.bin) selected.add(pid); },
+            },
+          },
+        });
+      } finally {
+        await killAndReap(stall.pids()).catch(() => undefined);
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+  });
+});
+
+// ── issue #4258 — the scoped seam under the real Claude executor ──────────────────────────────────
+//
+// A real SdkExecutor (fake query function) inside a real RunRunner: turn 2 commits a secret and fires
+// a tick (the trigger arms); at the next boundary the real seam stalls on a gitleaks child and a cancel
+// or a worker shutdown arrives. The seam must return promptly, the executor must take its normal stop
+// route (no third turn, so no remediation guidance is ever prompted), and the child must be gone.
+describe("issue #4258 real SdkExecutor + RunRunner: a stop during the stalled seam", () => {
+  const sdkMsg = (content: unknown[]) => sdkAssistant(content);
+  for (const stage of ["range", "path"] as const) {
+    for (const stop of ["cancel", "shutdown"] as const) {
+      it(`${stage} scan stalled, then ${stop}: the run takes its normal stop route and the child is gone`, { timeout: 90_000 }, async () => {
+        const tmp = scratchDir(`4258-sdk-${stage}-${stop}`);
+        const stall = writeStallShim(tmp);
+        const ctl = control({ scanDeadlineMs: 60_000 });
+        const g = mkGit(fx.dataDir, stall.bin);
+        const claim = gitlabClaim(4258_200 + (stage === "range" ? 0 : 10) + (stop === "cancel" ? 0 : 1), { auto_approve: true });
+        const pub = stubPublish(async (_n, _tip, pack) => { await drain(pack); return LANDED; });
+        const prompts: string[] = [];
+        let turns = 0;
+        let ctxRef: RunContext | undefined;
+        const decisions: unknown[] = [];
+        let captured: Record<string, unknown> | undefined;
+        const queryFn: SdkQueryFn = (params) => {
+          const turn = ++turns;
+          return (async function* () {
+            let text = "";
+            for await (const m of params.prompt) text += JSON.stringify(m);
+            prompts.push(text);
+            if (turn === 1) {
+              yield sdkMsg([{ type: "tool_use", id: "p", name: "mcp__uzi__submit_plan", input: { plan_md: "# Plan\n- do it", milestones: [] } }]);
+              yield sdkResultOk();
+              return;
+            }
+            try {
+              if (turn === 2) {
+                const sha = commitIn(ctxRef!.worktreePath, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
+                assert.ok(sha);
+                ctl.advance(INTERVAL_MS + 1);
+                assert.equal(await bounded(ctl.fire(), TEARDOWN_MS, "the arming tick"), "secret_found");
+                stall.setMode(stage === "range" ? "stall-git" : "stall-stdin");
+              }
+            } catch (e) {
+              turnErrors.push(e);
+              throw e;
+            }
+            yield sdkMsg([{ type: "text", text: "working" }]);
+            yield sdkResultOk();
+          })();
+        };
+        // The runner removes the agent home on teardown: keep it apart from the shim's directory.
+        const agentHome = fs.mkdtempSync(path.join(tmp, "home-"));
+        const sdk = new SdkExecutor(nullLogger(), agentHome, { queryFn });
+        const executor: Executor = {
+          run: async (ctx) => {
+            ctxRef = ctx;
+            const orig = ctx.midRunSecretRemediation!;
+            ctx.midRunSecretRemediation = async () => {
+              const d = await orig();
+              decisions.push(d);
+              return d;
+            };
+            return sdk.run(ctx);
+          },
+          closeAndSettlePlanSummary: (d) => sdk.closeAndSettlePlanSummary(d),
+          killAgentTree: () => sdk.killAgentTree(),
+          reapAttributedProcesses: () => sdk.reapAttributedProcesses(),
+        };
+        const { logger, lines } = recordingLogger();
+        const runner = mkRunner(g, () => ({ executor, homeDir: agentHome }), ctl, {}, logger);
+        const internals = runner as unknown as { scanCheckpointForPublish: (f: Record<string, unknown>, ...rest: unknown[]) => Promise<unknown> };
+        const origScan = internals.scanCheckpointForPublish.bind(runner);
+        internals.scanCheckpointForPublish = (f, ...rest) => { captured = f; return origScan(f, ...rest); };
+        let exec: Promise<unknown> | undefined;
+        try {
+          exec = runner.execute(claim);
+          const settled = exec.then(() => undefined, (e: unknown) => e);
+          await bounded(Promise.resolve().then(() => waitFor(() => stall.pids().length > 0, 30_000)), 31_000, "the seam's scan child to stall", "stall");
+          const pids = stall.pids();
+          // Earlier boundaries (trigger not armed yet) returned proceed at once; the stalled one has not.
+          const before = decisions.length;
+          assert.ok(decisions.every((d) => (d as { action: string }).action === "proceed"));
+          const t0 = Date.now();
+          if (stop === "cancel") api.setInputs(claim.run_id, [{ id: 1, kind: "cancel" }]);
+          else runner.shutdown();
+          const outcome = await bounded(settled, 20_000, "execute() settling after the stop", "run");
+          assert.equal(outcome, undefined, `execute() resolved normally after the ${stop}, not with a rejection`);
+          const elapsed = Date.now() - t0;
+          if (turnErrors.length > 0) throw turnErrors.splice(0)[0];
+          assert.ok(elapsed < 10_000, `the run settled ${elapsed}ms after the stop`);
+          assert.equal(decisions.length, before + 1, "the stalled boundary's seam call resolved");
+          assert.deepEqual(decisions.at(-1), { action: "proceed" });
+          for (const pid of pids) {
+            assert.equal(isAlive(pid), false, `scan child ${pid} exited`);
+            assert.equal(groupAlive(pid), false, `scan child group ${pid} is gone`);
+          }
+          const flight = captured as { survivingTickGroups: unknown[]; secretRemediation?: { attempts: number; midRunTrigger?: unknown }; sinkGate: { isHeld(): boolean } };
+          assert.deepEqual(flight.survivingTickGroups, []);
+          assert.ok(flight.secretRemediation?.midRunTrigger, "the trigger is kept");
+          assert.equal(flight.secretRemediation?.attempts, 0);
+          assert.equal(flight.sinkGate.isHeld(), false);
+          assert.equal(turns, 2, "no provider turn was dispatched after the stalled boundary");
+          assert.ok(prompts.every((p) => !/not published yet|rewrite the commit|history rewrite/i.test(p)), "no remediation guidance was ever prompted");
+          assert.deepEqual(statusTexts(claim.run_id).filter((t) => /returning to the lead/.test(t)), []);
+          assert.ok(lines.some((l) => (l as Record<string, unknown>).msg === "mid-run secret remediation deferred" && (l as Record<string, unknown>).why === "aborted"));
+          const end = api.states.filter((x) => x.runId === claim.run_id).map((x) => x.body).at(-1);
+          if (stop === "cancel") {
+            assert.equal(end?.status, "failed");
+            assert.equal(end?.failure_reason, "run cancelled", "the executor's cancel route");
+          } else {
+            assert.equal(finalStatus(claim.run_id), undefined, "a worker shutdown leaves the run non-terminal for recovery");
+          }
+        } finally {
+          stall.setMode("pass");
+          await killAndReap(stall.pids()).catch(() => undefined);
+          await settleAndClean({ ctl, runners: [runner], running: [exec], restore: pub.restore, paths: [tmp] });
+        }
+      });
+    }
+  }
+});
+
+// ── issue #4313 — the done gate and the resume preflight run under an owned abortable scope ─────────
+//
+// A real SdkExecutor (fake query function) inside a real RunRunner. The gate's range scan (git mode) or its
+// path scan (stdin mode) stalls on a gitleaks child; a cancel, a worker shutdown or a disk stop arrives. The
+// gate must end promptly with the stalled child gone BEFORE it settles, change no gate state, and the
+// executor must take the control's normal route (never a finalize, never a remediation prompt).
+describe("issue #4313 real SdkExecutor + RunRunner: a stop during the stalled done gate / resume preflight", () => {
+  const sdkMsg = (content: unknown[]) => sdkAssistant(content);
+  const SESSION = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+  type GateKind = "done" | "resume";
+  type GateStage = "range" | "path";
+  type GateStop = "cancel" | "shutdown" | "disk" | "after-scan-shutdown" | "entry-cancel" | "entry-shutdown";
+  const isEntry = (s: GateStop): boolean => s === "entry-cancel" || s === "entry-shutdown";
+
+  interface GateObservation {
+    /** What RunRunner.execute() settled with: undefined on normal resolution, else the rejection. */
+    executeOutcome: unknown;
+    elapsedMs: number;
+    gateError: unknown;
+    gateSettledWhileChildAlive: boolean;
+    pids: number[];
+    thrown: unknown[];
+    prompts: string[];
+    turns: number;
+    state: Record<string, unknown> | undefined;
+    statuses: string[];
+    end: Record<string, unknown> | undefined;
+    final: string | undefined;
+    sinkHeld: boolean;
+    survivors: unknown[];
+    secretSha: string;
+    publishedTips: string[];
+    publishCount: number;
+    flight: Record<string, unknown>;
+    seeded: { blocked: unknown[]; trigger: { observation: number; tip: string } } | undefined;
+  }
+
+  async function stalledGate(o: { iid: number; kind: GateKind; stage: GateStage; stop: GateStop }): Promise<GateObservation> {
+    const tmp = scratchDir(`4313-${o.kind}-${o.stage}-${o.stop}`);
+    const stall = writeStallShim(tmp);
+    // "after-scan-shutdown": no stall; the test hook shuts the worker down right after the gate's range scan returns.
+    let runnerRef: RunRunner | undefined;
+    const ctl = control({
+      scanDeadlineMs: 60_000,
+      ...(o.stop === "after-scan-shutdown" ? { afterRemediationGateScan: () => { runnerRef!.shutdown(); } } : {}),
+    });
+    const g = mkGit(fx.dataDir, stall.bin);
+    const claim = o.kind === "done"
+      ? gitlabClaim(o.iid, { auto_approve: true })
+      : gitlabClaim(o.iid, {
+        kind: "issue", claim_generation: 7, session_id: SESSION, plan_approved: true, plan_md: "# Plan\n- do it",
+        config: { iteration_park_version: 1, max_iterations: 3 },
+      });
+    const pub = stubPublish(async (_n, _tip, pack) => { await drain(pack); return LANDED; });
+    const prompts: string[] = [];
+    let turns = 0;
+    let ctxRef: RunContext | undefined;
+    const thrown: unknown[] = [];
+    let gateError: unknown;
+    let gateSettledAt = 0;
+    let gateSettledWhileChildAlive = false;
+    const stallMode = o.stop === "after-scan-shutdown" || isEntry(o.stop) ? "pass" : o.stage === "range" ? "stall-git" : "stall-stdin";
+    let secretSha = "";
+    const plantAndStall = (tree: string): void => {
+      secretSha = commitIn(tree, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
+      assert.ok(secretSha);
+      stall.setMode(stallMode);
+    };
+    const queryFn: SdkQueryFn = (params) => {
+      const turn = ++turns;
+      return (async function* () {
+        let text = "";
+        for await (const m of params.prompt) text += JSON.stringify(m);
+        prompts.push(text);
+        if (o.kind === "done" && turn === 1) {
+          yield sdkMsg([{ type: "tool_use", id: "p", name: "mcp__uzi__submit_plan", input: { plan_md: "# Plan\n- do it", milestones: [] } }]);
+          yield sdkResultOk();
+          return;
+        }
+        try {
+          if (o.kind === "done" && turn === 2) plantAndStall(ctxRef!.worktreePath);
+        } catch (e) {
+          turnErrors.push(e);
+          throw e;
+        }
+        yield sdkMsg([{ type: "tool_use", id: "d", name: "mcp__uzi__signal_done", input: {} }]);
+        yield sdkResultOk();
+      })();
+    };
+    const agentHome = fs.mkdtempSync(path.join(tmp, "home-"));
+    if (o.kind === "resume") {
+      const dir = path.join(agentHome, ".claude", "projects", "-runner-4313");
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, `${SESSION}.jsonl`), "{}\n");
+    }
+    const sdk = new SdkExecutor(nullLogger(), agentHome, { queryFn });
+    const executor: Executor = {
+      run: async (ctx) => {
+        ctxRef = ctx;
+        const orig = ctx.secretRemediationGate!;
+        ctx.secretRemediationGate = async (options) => {
+          try {
+            // A stop already standing when the gate is entered: shutdown is synchronous; a cancel is delivered by
+            // input polling, so wait until it is recorded before the gate runs.
+            if (o.stop === "entry-shutdown") runnerRef!.shutdown();
+            if (o.stop === "entry-cancel") {
+              api.setInputs(claim.run_id, [{ id: 1, kind: "cancel" }]);
+              await bounded(waitFor(() => ctx.cancelRequested?.() === true, 10_000), 11_000, "the cancel to be recorded", "control");
+            }
+            return await orig(options);
+          } catch (e) {
+            gateError = e;
+            throw e;
+          } finally {
+            gateSettledAt = Date.now();
+            gateSettledWhileChildAlive = stall.pids().some((pid) => isAlive(pid) || groupAlive(pid));
+          }
+        };
+        if (o.kind === "resume") plantAndStall(ctx.worktreePath);
+        try {
+          return await sdk.run(ctx);
+        } catch (e) {
+          thrown.push(e);
+          throw e;
+        }
+      },
+      closeAndSettlePlanSummary: (d) => sdk.closeAndSettlePlanSummary(d),
+      killAgentTree: () => sdk.killAgentTree(),
+      reapAttributedProcesses: () => sdk.reapAttributedProcesses(),
+    };
+    const { logger } = recordingLogger();
+    const runner = mkRunner(g, () => ({ executor, homeDir: agentHome }), ctl, {}, logger);
+    runnerRef = runner;
+    const internals = runner as unknown as { runSecretRemediationGate: (f: Record<string, unknown>, ...rest: unknown[]) => Promise<unknown> };
+    const origGate = internals.runSecretRemediationGate.bind(runner);
+    let flight: Record<string, unknown> | undefined;
+    let seeded: GateObservation["seeded"];
+    internals.runSecretRemediationGate = (f, ...rest) => {
+      flight = f;
+      if (isEntry(o.stop)) {
+        // Seed a prior blocked set and a pending mid-run trigger: a stopped gate must keep both untouched.
+        const st = (f.secretRemediation ??= { attempts: 0 }) as Record<string, unknown>;
+        const blocked = [{ file: "cfg.env", startLine: 1, commit: secretSha || "1".repeat(40), ruleId: "generic-api-key" }];
+        const trigger = { observation: 3, tip: secretSha || "2".repeat(40) };
+        st.blocked = blocked.map((b) => ({ ...b }));
+        st.midRunTrigger = { ...trigger };
+        seeded = { blocked, trigger };
+      }
+      return origGate(f, ...rest);
+    };
+    let exec: Promise<unknown> | undefined;
+    try {
+      exec = runner.execute(claim);
+      const settled = exec.then(() => undefined, (e: unknown) => e);
+      if (o.stop === "after-scan-shutdown" || isEntry(o.stop)) await bounded(waitFor(() => gateSettledAt > 0, 30_000), 31_000, "the gate to settle", "gate");
+      else await bounded(Promise.resolve().then(() => waitFor(() => stall.pids().length > 0, 30_000)), 31_000, "the gate's scan child to stall", "stall");
+      const pids = stall.pids();
+      const t0 = Date.now();
+      if (o.stop === "after-scan-shutdown" || isEntry(o.stop)) { /* the stop was raised before the gate ran */ }
+      else if (o.stop === "cancel") api.setInputs(claim.run_id, [{ id: 1, kind: "cancel" }]);
+      else if (o.stop === "shutdown") runner.shutdown();
+      else (flight!.steering as { requestDiskStop: () => void }).requestDiskStop();
+      const executeOutcome = await bounded(settled, 20_000, "execute() settling after the stop", "run");
+      if (turnErrors.length > 0) throw turnErrors.splice(0)[0];
+      const f = flight as {
+        secretRemediation?: Record<string, unknown>;
+        survivingTickGroups: unknown[];
+        sinkGate: { isHeld(): boolean };
+      };
+      return {
+        executeOutcome,
+        elapsedMs: gateSettledAt - t0,
+        gateError,
+        gateSettledWhileChildAlive,
+        pids,
+        thrown,
+        prompts,
+        turns,
+        state: f.secretRemediation,
+        statuses: statusTexts(claim.run_id),
+        end: api.states.filter((x) => x.runId === claim.run_id).map((x) => x.body).at(-1) as Record<string, unknown> | undefined,
+        final: finalStatus(claim.run_id),
+        sinkHeld: f.sinkGate.isHeld(),
+        survivors: f.survivingTickGroups,
+        secretSha,
+        publishedTips: [...pub.tips],
+        publishCount: pub.count(),
+        flight: flight!,
+        seeded,
+      };
+    } finally {
+      stall.setMode("pass");
+      await killAndReap(stall.pids()).catch(() => undefined);
+      await settleAndClean({ ctl, runners: [runner], running: [exec], restore: pub.restore, paths: [tmp] });
+    }
+  }
+
+  const REMEDIATION_PROMPT = /not published yet|rewrite the commit|history rewrite/i;
+  // Cancel and worker shutdown both end the executor with REASON_CANCELLED ("run cancelled").
+  const assertThrewCancelled = (thrown: unknown[], label: string): void => {
+    assert.ok(thrown.some((e) => e instanceof Error && e.message === "run cancelled"), `${label}: the executor threw run cancelled (${thrown.map(String).join("; ")})`);
+  };
+  const assertQuietStop = async (obs: GateObservation, label: string): Promise<void> => {
+    const { SecretRemediationStoppedError } = await import("../src/executor.js");
+    assert.equal(obs.executeOutcome, undefined, `${label}: execute() resolved normally (got ${String(obs.executeOutcome)})`);
+    assert.ok(obs.gateError instanceof SecretRemediationStoppedError, `${label}: the gate threw SecretRemediationStoppedError, not a decision (${String(obs.gateError)})`);
+    assert.ok(obs.elapsedMs < 15_000, `${label}: the gate ended ${obs.elapsedMs}ms after the stop`);
+    assert.equal(obs.gateSettledWhileChildAlive, false, `${label}: the stalled child was gone before the gate settled`);
+    for (const pid of obs.pids) {
+      assert.equal(isAlive(pid), false, `${label}: child ${pid} exited`);
+      assert.equal(groupAlive(pid), false, `${label}: child group ${pid} is gone`);
+    }
+    assert.equal(obs.state?.attempts, 0, `${label}: no attempt was spent`);
+    assert.equal(obs.state?.blocked, undefined, `${label}: nothing was blocked`);
+    assert.equal(obs.state?.cleanTip, undefined, `${label}: no clean tip was recorded`);
+    assert.deepEqual(obs.survivors, []);
+    assert.equal(obs.sinkHeld, false, `${label}: the sink gate was released`);
+    assert.ok(obs.prompts.every((p) => !REMEDIATION_PROMPT.test(p)), `${label}: no remediation guidance was prompted`);
+    assert.deepEqual(obs.statuses.filter((t) => /returning to the lead|pre-exit secret scan flagged/.test(t)), [], `${label}: nothing was emitted`);
+  };
+
+  const iidOf = (kind: GateKind, stage: GateStage, stop: GateStop): number =>
+    4313_000 + (kind === "done" ? 0 : 100) + (stage === "range" ? 0 : 10) + ["cancel", "shutdown", "disk", "entry-cancel", "entry-shutdown"].indexOf(stop);
+
+  for (const kind of ["done", "resume"] as const) {
+    for (const stage of ["range", "path"] as const) {
+      for (const stop of ["cancel", "shutdown"] as const) {
+        it(`${kind} gate: ${stage} scan stalled, then ${stop}: ends promptly, child gone, normal route`, { timeout: 90_000 }, async () => {
+          const obs = await stalledGate({ iid: iidOf(kind, stage, stop), kind, stage, stop });
+          await assertQuietStop(obs, `${kind}/${stage}/${stop}`);
+          assert.equal(obs.turns, kind === "done" ? 2 : 0, "no provider turn was dispatched after the stalled gate");
+          assertThrewCancelled(obs.thrown, `${kind}/${stage}/${stop}`);
+          if (stop === "cancel") {
+            assert.equal(obs.end?.status, "failed");
+            assert.equal(obs.end?.failure_reason, "run cancelled", "the executor's cancel route");
+          } else {
+            assert.equal(obs.final, undefined, "a worker shutdown leaves the run non-terminal for recovery");
+          }
+        });
+      }
+    }
+  }
+
+  // A stop already standing when the gate is entered must route its control and leave the blocked set and the
+  // pending mid-run trigger exactly as seeded (it must not fail on the old blocked set, nor clear the trigger).
+  for (const kind of ["done", "resume"] as const) {
+    for (const stop of ["entry-cancel", "entry-shutdown"] as const) {
+      it(`${kind} gate: ${stop} with a seeded blocked set: throws the stop, keeps blocked and the trigger, takes the control's route`, { timeout: 90_000 }, async () => {
+        const obs = await stalledGate({ iid: iidOf(kind, "range", stop), kind, stage: "range", stop });
+        const { SecretRemediationStoppedError } = await import("../src/executor.js");
+        assert.equal(obs.executeOutcome, undefined, `${kind}/${stop}: execute() resolved normally (got ${String(obs.executeOutcome)})`);
+        assert.ok(obs.gateError instanceof SecretRemediationStoppedError, `the gate threw SecretRemediationStoppedError (${String(obs.gateError)})`);
+        assert.ok(obs.seeded, "the state was seeded");
+        assert.deepEqual(obs.state?.blocked, obs.seeded.blocked, "the blocked set was kept");
+        assert.deepEqual(obs.state?.midRunTrigger, obs.seeded.trigger, "the pending mid-run trigger was kept");
+        assert.ok(obs.prompts.every((p) => !REMEDIATION_PROMPT.test(p)), "no remediation guidance was prompted");
+        assert.notEqual(obs.end?.fail_origin, "push_secret_blocked", "not failed on the old blocked set");
+        assert.notEqual(obs.end?.failure_reason, "push_secret_blocked");
+        if (stop === "entry-cancel") {
+          assert.equal(obs.end?.status, "failed");
+          assert.equal(obs.end?.failure_reason, "run cancelled", "the executor's cancel route");
+          assertThrewCancelled(obs.thrown, `${kind}/${stop}`);
+        } else {
+          assertThrewCancelled(obs.thrown, `${kind}/${stop}`);
+          assert.equal(obs.final, undefined, "a worker shutdown leaves the run non-terminal for recovery");
+          assert.notEqual(obs.end?.status, "failed", "no failed end state");
+        }
+      });
+    }
+  }
+
+  it("done gate: a trusted scan result, then a shutdown before any state write, still holds the unscanned shutdown-capture publish", { timeout: 90_000 }, async () => {
+    const obs = await stalledGate({ iid: 4313_300, kind: "done", stage: "range", stop: "after-scan-shutdown" });
+    const { SecretRemediationStoppedError } = await import("../src/executor.js");
+    assertThrewCancelled(obs.thrown, "after-scan-shutdown");
+    assert.equal(obs.executeOutcome, undefined, `execute() resolved normally (got ${String(obs.executeOutcome)})`);
+    assert.ok(obs.gateError instanceof SecretRemediationStoppedError, String(obs.gateError));
+    const state = obs.state as { attempts: number; flaggedCommits?: string[]; known?: unknown; blocked?: unknown; cleanTip?: unknown; everKnown?: unknown; withholdPaths?: unknown };
+    // The trusted finding was held before the stop was thrown: negative knowledge only.
+    assert.deepEqual(state.flaggedCommits, [obs.secretSha], "the flagged commit stays recorded");
+    // This rig has no attempt clone, so latchRemediationFindings is a no-op here and the hold is carried by
+    // the recorded flagged commit (checkpointRemediationHold's flaggedCommits branch).
+    assert.equal(state.attempts, 0, "no attempt was spent");
+    for (const k of ["known", "blocked", "cleanTip", "everKnown", "withholdPaths"] as const) {
+      assert.equal(state[k], undefined, `${k} was not written after the stop`);
+    }
+    assert.ok(obs.prompts.every((p) => !REMEDIATION_PROMPT.test(p)), "no remediation guidance was prompted");
+    assert.deepEqual(obs.statuses.filter((t) => /returning to the lead|pre-exit secret scan flagged/.test(t)), [], "nothing was emitted");
+    // The shutdown capture attempted a publication over the flagged history, with no fresh scan, and it was held.
+    assert.equal(obs.publishCount, 0, `no publication carried the flagged history (published tips: ${obs.publishedTips.join(",")})`);
+    assert.ok(obs.statuses.some((t) => /checkpoint publish skipped: secret_remediation_pending/.test(t)), `the hold was reported (${obs.statuses.join(" | ")})`);
+    assert.equal(obs.final, undefined, "a worker shutdown leaves the run non-terminal for recovery");
+  });
+
+  it("done gate: a disk stop during the stalled range scan takes the DiskParkSignal route", { timeout: 90_000 }, async () => {
+    const obs = await stalledGate({ iid: iidOf("done", "range", "disk"), kind: "done", stage: "range", stop: "disk" });
+    await assertQuietStop(obs, "done/range/disk");
+    assert.equal(obs.turns, 2);
+    assert.ok(obs.thrown.some((e) => e instanceof Error && e.constructor.name === "DiskParkSignal"),
+      `the executor threw DiskParkSignal (got ${obs.thrown.map(String).join("; ")})`);
+    assert.notEqual(obs.end?.failure_reason, "run cancelled", "a disk stop is not a cancel");
+  });
+});
+
+// ── issue #4313 (d) — a pending wait for the source-authority transaction A ────────────────────────
+//
+// The gate's fetch-back and its restriction writes take A. While another holder keeps it, the acquisition
+// pends. A cancel or a worker shutdown must abort that wait promptly (the gate throws
+// SecretRemediationStoppedError); a pause-now or a credential switch must NOT: the gate keeps waiting and,
+// once A is free, reaches the same decision it reaches with no control at all.
+describe("issue #4313 real SdkExecutor + RunRunner: a pending wait for authority A", () => {
+  const sdkMsg = (content: unknown[]) => sdkAssistant(content);
+  const SESSION = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+  type Site = "fetch" | "persist";
+  type Control = "none" | "pause" | "switch" | "cancel" | "shutdown" | "scan-shutdown";
+
+  /** Stands in for the lock layer's private flock spawn on a util-linux host. */
+  function spawnFlock(args: string[], fd: number | undefined, _signal: AbortSignal | undefined, timeoutMs: number): Promise<FlockResult> {
+    return new Promise((resolve, reject) => {
+      const child = spawn("/usr/bin/flock", args, {
+        stdio: ["ignore", "pipe", "pipe", ...(fd === undefined ? [] : [fd])], env: { PATH: "/usr/bin:/bin", LC_ALL: "C" } });
+      let output = "";
+      child.stdout!.on("data", (c: Buffer) => { output += c.toString("utf8"); });
+      child.stderr!.on("data", (c: Buffer) => { output += c.toString("utf8"); });
+      const timer = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
+      child.once("error", reject);
+      child.once("close", (code) => { clearTimeout(timer); resolve({ code: code ?? 2, output }); });
+    });
+  }
+
+  /** The production authority stack over the test's data dir. While armed, the non-blocking A attempt answers
+   *  "held elsewhere" (exit 200), so every acquisition pends in the lock layer's own retry delay, honouring its
+   *  wait signal and timeout exactly as production does. Each armed acquisition is recorded. */
+  async function authorityStack(): Promise<{ rt: AuthorityRuntime; git: GitCache; arm: () => void; disarm: () => void; acquisitions: Array<{ signal?: AbortSignal; error?: unknown }> }> {
+    let armed = false;
+    const real = testLockOptions().run ?? spawnFlock;
+    const run = (args: string[], fd: number | undefined, signal: AbortSignal | undefined, timeoutMs: number): Promise<FlockResult> => {
+      if (armed && args[0] === "-x" && args.includes("-n")) return Promise.resolve({ code: 200, output: "" });
+      return real(args, fd, signal, timeoutMs);
+    };
+    const dataDir = fs.realpathSync(fx.dataDir);
+    const lifetime = await acquireWorkerLifetime(dataDir, testLockOptions({ run }));
+    const rt = new AuthorityRuntime({ lifetime, workerToken: "unit-gate-4313", timeoutMs: 5000 });
+    const acquisitions: Array<{ signal?: AbortSignal; error?: unknown }> = [];
+    const original = rt.withTransaction.bind(rt) as (fn: unknown, wait?: { signal?: AbortSignal; timeoutMs?: number }) => Promise<unknown>;
+    (rt as unknown as { withTransaction: typeof original }).withTransaction = (fn, wait) => {
+      if (!armed) return original(fn, wait);
+      const seen: { signal?: AbortSignal; error?: unknown } = { signal: wait?.signal };
+      acquisitions.push(seen);
+      return original(fn, wait).catch((error: unknown) => { seen.error = error; throw error; });
+    };
+    const git = new GitCache(dataDir, nullLogger(), undefined, testGitCacheOptions({
+      authority: rt.hooks, authorityRequired: true, gitleaksBin: defaultGitleaksShim(),
+    }));
+    return { rt, git, arm: () => { armed = true; }, disarm: () => { armed = false; }, acquisitions };
+  }
+
+  interface LockObservation {
+    /** What RunRunner.execute() settled with: undefined on normal resolution, else the rejection. */
+    executeOutcome: unknown;
+    gateError: unknown;
+    decision: { action: string } | undefined;
+    pendingAfterControl: boolean;
+    elapsedMs: number;
+    attempts: unknown;
+    thrown: unknown[];
+    states: Array<Record<string, unknown>>;
+    final: string | undefined;
+    flight: Record<string, unknown>;
+    secretSha: string;
+    publishCount: number;
+    statuses: string[];
+    prompts: string[];
+  }
+
+  async function lockedGate(o: { iid: number; kind: "done" | "resume"; site: Site; control: Control }): Promise<LockObservation> {
+    const tmp = scratchDir(`4313-lock-${o.kind}-${o.site}-${o.control}`);
+    const auth = await authorityStack();
+    const secret = o.site === "persist";
+    let runnerRef: RunRunner | undefined;
+    // The persist site arms A right after the gate's range scan, so the fetch-back and the scan ran freely and
+    // the pending acquisition is the restriction write. The fetch site arms it when the gate is entered.
+    const ctl = control({
+      scanDeadlineMs: 60_000,
+      ...(o.control === "scan-shutdown" ? { afterRemediationGateScan: () => { runnerRef!.shutdown(); } }
+        : o.site === "persist" ? { afterRemediationGateScan: () => auth.arm() } : {}),
+    });
+    const claim = o.kind === "done"
+      ? gitlabClaim(o.iid, { auto_approve: true })
+      : gitlabClaim(o.iid, {
+        kind: "issue", claim_generation: 7, session_id: SESSION, plan_approved: true, plan_md: "# Plan\n- do it", auto_approve: true,
+        config: { iteration_park_version: 1, max_iterations: 3 },
+      });
+    const pub = stubPublish(async (_n, _tip, pack) => { await drain(pack); return LANDED; });
+    let turns = 0;
+    let ctxRef: RunContext | undefined;
+    const thrown: unknown[] = [];
+    let gateError: unknown;
+    let decision: { action: string } | undefined;
+    let gateSettledAt = 0;
+    let secretSha = "";
+    const prompts: string[] = [];
+    const work = (tree: string): void => {
+      secretSha = commitIn(tree, secret ? "cfg.env" : "ok.txt", secret ? `TOKEN=${runtimeSecret()}\n` : "ordinary work\n");
+    };
+    const queryFn: SdkQueryFn = (params) => {
+      const turn = ++turns;
+      return (async function* () {
+        let text = "";
+        for await (const m of params.prompt) text += JSON.stringify(m);
+        prompts.push(text);
+        // A resume whose transcript is not on this worker re-plans first (the attempt-path rig drops it).
+        if (turn === 1 && (o.kind === "done" || !ctxRef!.planApproved)) {
+          yield sdkMsg([{ type: "tool_use", id: "p", name: "mcp__uzi__submit_plan", input: { plan_md: "# Plan\n- do it", milestones: [] } }]);
+          yield sdkResultOk();
+          return;
+        }
+        try {
+          if (o.kind === "done" && turn === 2) work(ctxRef!.worktreePath);
+        } catch (e) {
+          turnErrors.push(e);
+          throw e;
+        }
+        yield sdkMsg([{ type: "tool_use", id: "d", name: "mcp__uzi__signal_done", input: {} }]);
+        yield sdkResultOk();
+      })();
+    };
+    const agentHome = fs.mkdtempSync(path.join(tmp, "home-"));
+    if (o.kind === "resume") {
+      const dir = path.join(agentHome, ".claude", "projects", "-runner-4313");
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, `${SESSION}.jsonl`), "{}\n");
+    }
+    const sdk = new SdkExecutor(nullLogger(), agentHome, { queryFn });
+    const executor: Executor = {
+      run: async (ctx) => {
+        ctxRef = ctx;
+        const orig = ctx.secretRemediationGate!;
+        ctx.secretRemediationGate = async (options) => {
+          if (o.site === "fetch") auth.arm();
+          // Only the first call: a remediate decision brings a second gate call that this scenario does not control.
+          const first = gateSettledAt === 0;
+          try {
+            const d = await orig(options);
+            if (first) decision = d;
+            return d;
+          } catch (e) {
+            if (first) gateError = e;
+            throw e;
+          } finally {
+            if (first) gateSettledAt = Date.now();
+          }
+        };
+        if (o.kind === "resume") work(ctx.worktreePath);
+        try {
+          return await sdk.run(ctx);
+        } catch (e) {
+          thrown.push(e);
+          throw e;
+        }
+      },
+      closeAndSettlePlanSummary: (d) => sdk.closeAndSettlePlanSummary(d),
+      killAgentTree: () => sdk.killAgentTree(),
+      reapAttributedProcesses: () => sdk.reapAttributedProcesses(),
+    };
+    const { gitlab } = fakeGitlab();
+    const { logger } = recordingLogger();
+    const runner = new RunRunner(client, auth.git, () => ({ executor, homeDir: agentHome }), logger, 20, undefined, {
+      pollMs: 5,
+      planApprovalTimeoutMs: 0,
+      questionTimeoutMs: 600,
+      prDescriptionHeadLagMs: 0,
+      gitlab,
+      teardownTestDeps: portableTeardownTestDeps,
+      authority: auth.rt,
+      checkpointIntervalMs: INTERVAL_MS,
+      checkpointTickIntervalMs: TICK_MS,
+      setTimer: ctl.setTimer,
+      setTickTimer: ctl.setTickTimer,
+      now: ctl.now,
+      checkpointTestHooks: ctl.hooks,
+    });
+    // The attempt-bound clone paths are what give the flight an attempt id, so the restriction writes take A.
+    Object.assign(runner, { attemptPaths: true });
+    runnerRef = runner;
+    const internals = runner as unknown as { runSecretRemediationGate: (f: Record<string, unknown>, ...rest: unknown[]) => Promise<unknown> };
+    const origGate = internals.runSecretRemediationGate.bind(runner);
+    let flight: Record<string, unknown> | undefined;
+    internals.runSecretRemediationGate = (f, ...rest) => { flight = f; return origGate(f, ...rest); };
+    let exec: Promise<unknown> | undefined;
+    // A credential switch is "delivered" once the poller has read it; the steering channel may hold it while a sink runs.
+    const realGetInputs = client.getInputs.bind(client);
+    let switchDelivered = false;
+    client.getInputs = async (runId) => {
+      const r = await realGetInputs(runId);
+      if (r.credentialSwitch?.generation === 1) switchDelivered = true;
+      return r;
+    };
+    try {
+      exec = runner.execute(claim);
+      const settled = exec.then(() => undefined, (e: unknown) => e);
+      if (o.control === "scan-shutdown") await bounded(waitFor(() => gateSettledAt > 0, 30_000), 31_000, "the gate to settle", "gate");
+      else await bounded(waitFor(() => auth.acquisitions.length > 0, 30_000), 31_000, "the gate's pending acquisition of A", "lock");
+      const steering = flight!.steering as { getPauseMode(): unknown; pendingCredentialSwitch(): unknown };
+      const t0 = Date.now();
+      if (o.control === "pause") {
+        api.setInputs(claim.run_id, [{ id: 1, kind: "pause", body: "now" }]);
+        await bounded(waitFor(() => steering.getPauseMode() === "now", 10_000), 11_000, "the pause-now to be recorded", "control");
+      } else if (o.control === "switch") {
+        api.requestCredentialSwitch(claim.run_id, 1);
+        await bounded(waitFor(() => switchDelivered, 10_000), 11_000, "the switch to be delivered", "control");
+      } else if (o.control === "scan-shutdown") { /* the hook already stopped the worker */ }
+      else if (o.control === "cancel") api.setInputs(claim.run_id, [{ id: 1, kind: "cancel" }]);
+      else if (o.control === "shutdown") runnerRef.shutdown();
+      let pendingAfterControl = false;
+      if (o.control === "scan-shutdown") {
+        auth.disarm();
+      } else if (o.control === "none" || o.control === "pause" || o.control === "switch") {
+        // Hold A for a while longer: the gate must still be waiting (not stopped, not decided).
+        await sleepMs(700);
+        pendingAfterControl = gateSettledAt === 0;
+        auth.disarm();
+        await bounded(waitFor(() => gateSettledAt > 0, 15_000), 16_000, "the gate to decide once A is free", "gate");
+        // What the run does after the decision is not this test's subject: let it run briefly, then stop it.
+        const early = await Promise.race([settled, sleepMs(5_000).then(() => "running" as const)]);
+        if (early === "running") runnerRef.shutdown();
+      } else {
+        await bounded(waitFor(() => gateSettledAt > 0, 15_000), 16_000, "the gate to end after the stop", "gate");
+        auth.disarm();
+      }
+      const executeOutcome = await bounded(settled, 30_000, "execute() settling", "run");
+      if (turnErrors.length > 0) throw turnErrors.splice(0)[0];
+      const f = flight as { secretRemediation?: { attempts: unknown } };
+      return {
+        executeOutcome, gateError, decision, pendingAfterControl, elapsedMs: gateSettledAt - t0,
+        attempts: f.secretRemediation?.attempts, thrown,
+        states: api.states.filter((x) => x.runId === claim.run_id).map((x) => x.body as unknown as Record<string, unknown>),
+        final: finalStatus(claim.run_id), flight: flight!,
+        secretSha, publishCount: pub.count(), statuses: statusTexts(claim.run_id), prompts,
+      };
+    } finally {
+      client.getInputs = realGetInputs;
+      auth.disarm();
+      await settleAndClean({ ctl, runners: [runner], running: [exec], restore: pub.restore, paths: [tmp] });
+    }
+  }
+
+  const iidOf = (kind: "done" | "resume", site: Site, control: Control): number =>
+    4313_500 + (kind === "done" ? 0 : 100) + (site === "fetch" ? 0 : 20) + ["none", "pause", "switch", "cancel", "shutdown", "scan-shutdown"].indexOf(control);
+
+  // One scenario per test: each builds its own authority stack, and a worker lifetime has no release.
+  for (const site of ["fetch", "persist"] as const) {
+    const expected = site === "fetch" ? "proceed" : "remediate";
+    for (const control of ["none", "pause", "switch"] as const) {
+      it(`done gate, ${site} wait, ${control === "none" ? "no control (baseline)" : control}: waits for A and decides ${expected}${control === "none" ? "" : " like the baseline, not stopped"}`, { timeout: 120_000 }, async () => {
+        const { SecretRemediationStoppedError } = await import("../src/executor.js");
+        const obs = await lockedGate({ iid: iidOf("done", site, control), kind: "done", site, control });
+        assert.equal(obs.executeOutcome, undefined, `execute() resolved normally (got ${String(obs.executeOutcome)})`);
+        assert.ok(!(obs.gateError instanceof SecretRemediationStoppedError), `not stopped (${String(obs.gateError)})`);
+        assert.equal(obs.pendingAfterControl, true, "the gate was still waiting for A after the control arrived");
+        assert.equal(obs.decision?.action, expected, `decision (${String(obs.gateError)})`);
+        if (site === "fetch") assert.equal(obs.attempts, 0, "no attempt was spent");
+        else assert.ok((obs.attempts as number) >= 1, "the remediate decision spent its attempt");
+        assert.ok(obs.thrown.every((e) => !(e instanceof Error && /secret remediation gate stopped/.test(e.message))), "no stop error reached the executor");
+      });
+    }
+
+    for (const control of ["cancel", "shutdown"] as const) {
+      it(`done gate, ${site} wait: ${control} aborts the pending acquisition promptly (SecretRemediationStoppedError)`, { timeout: 120_000 }, async () => {
+        const { SecretRemediationStoppedError } = await import("../src/executor.js");
+        const obs = await lockedGate({ iid: iidOf("done", site, control), kind: "done", site, control });
+        assert.equal(obs.executeOutcome, undefined, `execute() resolved normally (got ${String(obs.executeOutcome)})`);
+        assert.ok(obs.thrown.some((e) => e instanceof Error && e.message === "run cancelled"), `the executor threw run cancelled (${obs.thrown.map(String).join("; ")})`);
+        assert.ok(obs.gateError instanceof SecretRemediationStoppedError, `stopped (${String(obs.gateError)})`);
+        assert.ok(obs.elapsedMs < 15_000, `the gate ended ${obs.elapsedMs}ms after the ${control}`);
+        assert.equal(obs.attempts, 0, "no attempt was spent");
+        if (control === "cancel") assert.equal(obs.states.at(-1)?.failure_reason, "run cancelled");
+        else assert.equal(obs.final, undefined);
+      });
+    }
+  }
+
+  it("attempt-path rig: a trusted scan result, then a shutdown before any state write, keeps the latch and withholds the shutdown-capture publish", { timeout: 120_000 }, async () => {
+    const { SecretRemediationStoppedError } = await import("../src/executor.js");
+    const obs = await lockedGate({ iid: iidOf("done", "persist", "scan-shutdown"), kind: "done", site: "persist", control: "scan-shutdown" });
+    assert.equal(obs.executeOutcome, undefined, `execute() resolved normally (got ${String(obs.executeOutcome)})`);
+    assert.ok(obs.thrown.some((e) => e instanceof Error && e.message === "run cancelled"), `the executor threw run cancelled (${obs.thrown.map(String).join("; ")})`);
+    assert.ok(obs.gateError instanceof SecretRemediationStoppedError, String(obs.gateError));
+    const f = obs.flight as {
+      remediationRestrictions?: { pending?: { requiredOIDs: string[] } };
+      secretRemediation?: Record<string, unknown> & { flaggedCommits?: string[] };
+    };
+    assert.ok(f.remediationRestrictions?.pending?.requiredOIDs.includes(obs.secretSha), "the latch holds the secret commit");
+    assert.deepEqual(f.secretRemediation?.flaggedCommits, [obs.secretSha]);
+    assert.equal(f.secretRemediation?.attempts, 0, "no attempt was spent");
+    for (const k of ["known", "cleanTip", "withholdPaths", "blocked", "everKnown"]) assert.equal(f.secretRemediation?.[k], undefined, `${k} unchanged`);
+    assert.ok(obs.prompts.every((p) => !/not published yet|rewrite the commit|history rewrite/i.test(p)), "no rewrite guidance");
+    assert.deepEqual(obs.statuses.filter((x) => /returning to the lead|pre-exit secret scan flagged/.test(x)), [], "nothing emitted");
+    assert.equal(obs.publishCount, 0, "the flagged history was never published");
+    assert.equal(obs.final, undefined, "a worker shutdown leaves the run non-terminal");
+  });
+
+  it("resume preflight, fetch-back wait, pause-now: waits for A and proceeds, not stopped", { timeout: 120_000 }, async () => {
+    const { SecretRemediationStoppedError } = await import("../src/executor.js");
+    const obs = await lockedGate({ iid: iidOf("resume", "fetch", "pause"), kind: "resume", site: "fetch", control: "pause" });
+    assert.equal(obs.executeOutcome, undefined, `execute() resolved normally (got ${String(obs.executeOutcome)})`);
+    assert.ok(!(obs.gateError instanceof SecretRemediationStoppedError), String(obs.gateError));
+    assert.equal(obs.pendingAfterControl, true, "the preflight was still waiting for A after the control arrived");
+    assert.equal(obs.decision?.action, "proceed", "the decision is the no-pause one (a clean fetch-back proceeds)");
   });
 });

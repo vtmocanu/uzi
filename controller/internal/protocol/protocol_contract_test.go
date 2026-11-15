@@ -35,8 +35,8 @@ func TestControllerParsesTheAPIsPollShape(t *testing.T) {
 		t.Fatalf("decode golden: %v", err)
 	}
 
-	if len(resp.Workers) != 3 {
-		t.Fatalf("%d workers, want 3", len(resp.Workers))
+	if len(resp.Workers) != 4 {
+		t.Fatalf("%d workers, want 4", len(resp.Workers))
 	}
 
 	// A worker whose token is still awaiting delivery.
@@ -212,11 +212,17 @@ func TestControllerParsesTheAPIsPollShape(t *testing.T) {
 	if pending.Hibernation != nil {
 		t.Fatalf("awake worker decoded a hibernation object: %+v", pending.Hibernation)
 	}
-	if h := noToken.Hibernation; h == nil || h.State != "hibernated" || h.OpID != "55555555-5555-5555-5555-555555555555" {
-		t.Fatalf("hibernated worker lost its hibernation object: %+v", h)
+	if h := noToken.Hibernation; h == nil || h.State != "preparing" || h.OpID != "55555555-5555-5555-5555-555555555555" || h.InventoryGate != InventoryGateAwait {
+		t.Fatalf("preparing worker lost its hibernation object: %+v", h)
 	}
 	if h := dind.Hibernation; h == nil || h.State != "waking" || h.OpID != "66666666-6666-6666-6666-666666666666" {
 		t.Fatalf("waking worker lost its hibernation object: %+v", h)
+	}
+	// An unsettled cache prune attempt (PRD #4206): state cleaning with the cleanup block.
+	if h := resp.Workers[3].Hibernation; h == nil || h.State != HibernationCleaning ||
+		h.OpID != "66666666-6666-6666-6666-666666666666" || h.Cleanup == nil ||
+		*h.Cleanup != (HibernationCleanup{OpID: "88888888-8888-8888-8888-888888888888", StopProofPodUID: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", ReconcileSeq: 2}) {
+		t.Fatalf("cleaning worker lost its cleanup object: %+v", h)
 	}
 	roundTrip, err := json.Marshal(resp)
 	if err != nil {

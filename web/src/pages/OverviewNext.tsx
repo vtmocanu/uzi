@@ -1,10 +1,13 @@
-// The Overview preview at /overview/next (PRD #3878): the same data as Dashboard through
+// The default Overview at /dashboard (PRD #3877 M1): the same data as the classic page through
 // the shared useOverviewData hook, with a header that carries a status sentence (and, for an
-// admin, the health chip) above the app-wide banner stack. It is a preview route, linked
-// from and back to the current Overview at /dashboard.
+// admin, the health chip) above the app-wide banner stack. The classic page stays linked
+// at /overview/classic until M2 retires it.
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
+import { api, type TemplateAllocation } from "../lib/api";
+import { agentCountModel } from "../lib/agentCounts";
+import { AgentsChip } from "../components/AgentsChip";
 import { overviewScope, ISSUE_WORK_SCOPE_KEY, USAGE_SCOPE_KEY } from "../lib/prefs";
 import { executingPeople, peopleModel } from "../lib/overviewPeople";
 import { useAuth } from "../auth/AuthContext";
@@ -33,21 +36,33 @@ import { HeldWorkCard } from "../components/HeldWorkCard";
 import { HealthPlatformLine } from "../components/HealthPlatformLine";
 import { HealthChip } from "../components/HealthChip";
 import { PeopleChip } from "../components/PeopleChip";
+import { RepoChip } from "../components/RepoChip";
+import { repoActivityModel } from "../lib/overviewRepos";
 import { InShellHeader } from "../components/PageHeaderSlot";
 import { Button, PageHeader } from "../components/ui";
 import { useCommandMenu } from "../components/CommandMenuContext";
 import { SearchIcon } from "../components/icons";
 import { commandShortcutKeys, commandShortcutLabel } from "../lib/platform";
 
+// Remounted per signed-in user: every read on the page (the core load, the admin reads and the
+// Agents chip's allocations) belongs to one viewer, so a different user never sees, or joins
+// against, the previous viewer's data. A same-user session refresh keeps the mount.
 export function OverviewNext() {
+  const { user } = useAuth();
+  return <OverviewNextPage key={user?.id ?? "signed-out"} />;
+}
+
+function OverviewNextPage() {
   const commandMenu = useCommandMenu();
   const demo = useDemoMode();
   const { user } = useAuth();
-  const { data, usageWindow, changeUsageWindow, adminRuns, adminUsers, holds, holdsFailed } = useOverviewData({
-    includeAdminRuns: true,
-    includeRecoveryHolds: true,
-    includeAdminUsers: true,
-  });
+  const { data, usageWindow, changeUsageWindow, adminRuns, adminUsers, adminRepoActivity, holds, holdsFailed } =
+    useOverviewData({
+      includeAdminRuns: true,
+      includeRecoveryHolds: true,
+      includeAdminUsers: true,
+      includeAdminRepoActivity: true,
+    });
   const now = useNow(30_000);
   // The Usage card's scope is owned here so the People chip's "Usage by user" can switch it to
   // All users; focusByUser is the counter that tells the card to move focus to By user.
@@ -58,6 +73,29 @@ export function OverviewNext() {
   // The admin's remembered Issue work scope (#4052); written only on a click, so a scope
   // forced to "you" while the admin list loads never overwrites the saved choice.
   const [issueScope, setIssueScope] = useState(() => overviewScope.get(ISSUE_WORK_SCOPE_KEY));
+
+  // The Agents chip's allocation read: once on mount, never polled, separate from
+  // useOverviewData so the Dashboard's requests are untouched. StrictMode (main.tsx) replays
+  // effects in development; the ref keeps that to one request. A failure, even a synchronous
+  // throw, resolves null and hides only the chip.
+  // One viewer per mount (see OverviewNext above), so this read never outlives its viewer.
+  const allocRequest = useRef<Promise<TemplateAllocation[] | null> | null>(null);
+  const [allocations, setAllocations] = useState<TemplateAllocation[] | null>(null);
+  useEffect(() => {
+    allocRequest.current ??= Promise.resolve()
+      .then(() => api.getTemplateAllocations())
+      .then(
+        (r) => r.templates,
+        () => null,
+      );
+    let cancelled = false;
+    void allocRequest.current.then((a) => {
+      if (!cancelled) setAllocations(a);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   if (!user) return null;
 
@@ -108,6 +146,21 @@ export function OverviewNext() {
         demo,
       })
     : null;
+  // The Repos chip's model: admins only, from the same run rows plus the one-shot repo-activity read.
+  const repos = isAdmin
+    ? repoActivityModel({
+        ownRuns,
+        adminRuns,
+        viewerEmail: user.email,
+        repoActivity: adminRepoActivity,
+        now,
+        demo,
+      })
+    : null;
+  // The Agents chip's model: every user. Needs both the mount-only allocations and the core
+  // templates read, so it appears once both have landed.
+  const agentCounts =
+    allocations && data ? agentCountModel(allocations, data.agentTemplates, { isAdmin, viewerId: user.id }) : null;
   const showUsageByUser = () => {
     setUsageScope("all");
     overviewScope.set(USAGE_SCOPE_KEY, "all");
@@ -127,6 +180,8 @@ export function OverviewNext() {
             <>
               {isAdmin && <HealthChip />}
               {people && <PeopleChip model={people} onShowUsageByUser={showUsageByUser} />}
+              {repos && <RepoChip model={repos} />}
+              {agentCounts && <AgentsChip model={agentCounts} />}
               {commandMenu && (
                 <Button variant="secondary" size="sm" onClick={commandMenu.open} aria-keyshortcuts={commandShortcutKeys()}>
                   <SearchIcon aria-hidden="true" />
@@ -139,8 +194,8 @@ export function OverviewNext() {
                   </kbd>
                 </Button>
               )}
-              <Link to="/dashboard" className="text-sm font-medium text-brand hover:text-brand-hover">
-                Back to the current Overview
+              <Link to="/overview/classic" className="text-sm font-medium text-brand hover:text-brand-hover">
+                Back to the old Overview
               </Link>
             </>
           }

@@ -360,6 +360,7 @@
   "plan_cross_check_required": true,
   "plan_cross_check_gated": true,
   "plan_cross_check_gate_reason": "x",
+  "cross_check_active": "x",
   "plan_cross_check_diff_refusal": "x",
   "plan_cross_check_summary": {
     "checker_model_source": "x",
@@ -817,6 +818,9 @@
     ]
   },
   "model": "x",
+  "effort": "x",
+  "model_source": "x",
+  "effort_source": "x",
   "override_subagent_model": true,
   "priority": "x",
   "required_capabilities": [
@@ -877,6 +881,5 @@
   "owner_email": "x",
   "judge_verdict": "x",
   "judge_todo_count": 1,
-  "pending_question": "x",
-  "cross_check_active": "x"
+  "pending_question": "x"
 }

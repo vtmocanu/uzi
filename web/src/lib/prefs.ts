@@ -133,7 +133,7 @@ export const judgeScope = {
   },
 };
 
-// #4052: the admin's remembered scope ("you" | "all") on the Overview preview's cards, one
+// #4052: the admin's remembered scope ("you" | "all") on the default Overview's cards, one
 // key per card (Issue work, Usage). Same shape as judgeScope: a browser preference only,
 // never authoritative for access. Only an exact "all" reads as "all"; unset, unknown or
 // unreadable storage reads as "you" (prefs.get guards window and storage errors).

@@ -62,6 +62,35 @@ func step(m tuiModel, msg tea.Msg) tuiModel {
 	return next.(tuiModel)
 }
 
+// updatePromptScene drives the real update-prompt path for a brew-owned (uzi-cli) v0.83.0
+// binary offered v0.85.0 while the tap's uzi-cli formula installs formulaTag. The offline
+// installed-version probe reports the still-older running version, so the modal shows
+// instead of the restart hint. The package-level version stamp is restored on return.
+func updatePromptScene(dark bool, formulaTag string) string {
+	oldVersion := version
+	version = "v0.83.0"
+	defer func() { version = oldVersion }()
+	m := uxModel(&uzicli.FakeClient{}, "", dark)
+	m.skewCheck, m.showVersion = true, true
+	m.updatePrompt.owner, m.updatePrompt.brewKnown = "uzi-cli", true
+	m.installedVersion = func(string) (string, error) { return "v0.83.0", nil }
+	next, cmd := m.Update(buildInfoMsg{
+		version: "v0.85.0",
+		latest: &apitypes.LatestReleaseDTO{
+			Version:  "v0.85.0",
+			Name:     "Calmer board footer",
+			NotesURL: "https://github.com/vtmocanu/uzi/releases/tag/v0.85.0",
+		},
+		formulas: &apitypes.HomebrewFormulasDTO{UziCLI: formulaTag},
+	})
+	m = next.(tuiModel)
+	if cmd != nil {
+		// Run the installed-version probe offline and feed its result back.
+		m = step(m, cmd())
+	}
+	return m.View().Content
+}
+
 // key drives one keypress through the real key path (no *testing.T dependency, unlike the
 // sibling press helper).
 func key(m tuiModel, k string) tuiModel {
@@ -101,6 +130,9 @@ func TestGenerateUXLabFrames(t *testing.T) {
 		"board-accounts-one-each":           func(d bool) string { return boardAccountScene(d, now, 1, 140) },
 		"board-accounts-two-plus-one":       func(d bool) string { return boardAccountScene(d, now, 2, 140) },
 		"board-populated":                   func(d bool) string { return boardPopulated(d, now) },
+		"board-check-states":                func(d bool) string { return boardCheckStates(d, now) },
+		"detail-check-reworking":            func(d bool) string { return detailCheckState(d, now, "c0de0004-1111-2222-3333-444444444444") },
+		"detail-check-gate":                 func(d bool) string { return detailCheckState(d, now, "b2c3d4e5-1111-2222-3333-444444444444") },
 		"board-worker-name-tail":            func(d bool) string { return boardWorkerNameTailScene(d, now) },
 		"board-rejected":                    func(d bool) string { return rejectedScene(d, "board", 0, false) },
 		"board-rejected-selected":           func(d bool) string { return rejectedScene(d, "board", 0, true) },
@@ -120,6 +152,10 @@ func TestGenerateUXLabFrames(t *testing.T) {
 			m.updatePrompt.installedVersion = "v0.85.0"
 			return m.View().Content
 		},
+		// The startup update prompt for a brew-owned stable binary (#4314): the owning formula
+		// is still at v0.84.0 (notes only) vs already at the offered v0.85.0 (Update now).
+		"update-prompt-brew-notes":      func(d bool) string { return updatePromptScene(d, "v0.84.0") },
+		"update-prompt-brew-ready":      func(d bool) string { return updatePromptScene(d, "v0.85.0") },
 		"board-admin":                   boardAdmin,
 		"board-filter":                  func(d bool) string { return boardFilter(d, now) },
 		"board-planning":                func(d bool) string { return boardPlanning(d, now) },
@@ -722,6 +758,31 @@ func boardPopulated(dark bool, now time.Time) string {
 	m = step(m, rateLimitsMsg{tokens: boardMeters()})
 	m = step(m, settingsMsg{settings: apitypes.UserSettingsDTO{SidebarTokenIds: []string{"sec-meta"}}})
 	return m.View().Content
+}
+
+func boardCheckStates(dark bool, now time.Time) string {
+	var rows []apitypes.RunListItemDTO
+	for _, row := range demoRuns(now) {
+		word := runStateWord(row)
+		if word == "checking" || word == "reworking" || word == "compl blocked" ||
+			word == "xchecking" || word == "xchk revise" || word == "xchk blocked" || word == "xchk n/a" {
+			rows = append(rows, row)
+		}
+	}
+	m := uxModel(&uzicli.FakeClient{Runs: rows}, "", dark)
+	m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: rows})
+	return m.View().Content
+}
+
+func detailCheckState(dark bool, now time.Time, id string) string {
+	for _, row := range demoRuns(now) {
+		if row.ID == id {
+			m := uxModel(&uzicli.FakeClient{}, id, dark)
+			m = applyDetail(m, row.RunDTO, nil)
+			return m.View().Content
+		}
+	}
+	return "missing demo check run"
 }
 
 // boardCodex is boardPopulated PLUS the viewer's own Codex meters and Codex sidebar selection, so

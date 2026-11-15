@@ -4,9 +4,9 @@ import { mockRuns } from "./runs";
 import { mockWorkers } from "./workers";
 import { mockOtherUserRuns } from "./runHistories";
 
-// ?mock=overview-next (PRD #3878): extra runs for the /overview/next preview, seeded only
+// ?mock=overview-next (PRD #3878, #3877): extra runs for the default Overview, seeded only
 // under that scenario so every other mock test and scenario sees the unchanged fixture set.
-// Open /overview/next?mock=overview-next signed in as the demo admin.
+// Open /dashboard?mock=overview-next signed in as the demo admin.
 //
 //   - Other users' runs (owners below): one awaiting approval, one running, one in a usage-limit
 //     wait. The existing run-mira-embed and run-andrei-queued fixtures add a running and a

@@ -115,6 +115,16 @@ var liveDBCleanupSteps = []struct {
 		refusal_reason='create_refused', next_attempt_at=NULL, updated_at=now()
 		WHERE (user_id = ANY($1) OR run_id IN (SELECT id FROM runs WHERE user_id = ANY($1)))
 		  AND state IN ('invoked','create_unknown')`, liveDBUsers},
+	// Terminal preservations (issue #4007): the guard triggers refuse to delete a row that bears
+	// the live pointer or may own a ref, and the live pointer RESTRICTs the run. Triggers are off
+	// for these deletes only (session_replication_role is local to this transaction and restored
+	// straight after, because the later steps rely on the FK cascades).
+	{"terminal cleanup: triggers off", `SELECT set_config('session_replication_role', 'replica', true) WHERE $1::uuid[] IS NOT NULL`, liveDBUsers},
+	{"run_terminal_contributions", `DELETE FROM run_terminal_contributions
+		WHERE user_id = ANY($1) OR run_id IN (SELECT id FROM runs WHERE user_id = ANY($1))`, liveDBUsers},
+	{"run_terminal_preservations", `DELETE FROM run_terminal_preservations
+		WHERE user_id = ANY($1) OR run_id IN (SELECT id FROM runs WHERE user_id = ANY($1))`, liveDBUsers},
+	{"terminal cleanup: triggers on", `SELECT set_config('session_replication_role', 'origin', true) WHERE $1::uuid[] IS NOT NULL`, liveDBUsers},
 	{"run_salvage", `DELETE FROM run_salvage WHERE user_id = ANY($1)
 		OR run_id IN (SELECT id FROM runs WHERE user_id = ANY($1))
 		OR live_run_id IN (SELECT id FROM runs WHERE user_id = ANY($1))`, liveDBUsers},

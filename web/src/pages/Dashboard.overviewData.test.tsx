@@ -25,6 +25,7 @@ vi.mock("../lib/api", async (importOriginal) => {
       adminListRuns: vi.fn(),
       getRecoveryHolds: vi.fn(),
       listUsers: vi.fn(),
+      getTemplateAllocations: vi.fn(),
     },
   };
 });
@@ -103,9 +104,19 @@ describe("Dashboard on the shared overview data hook", () => {
     expect(mockApi.adminListRuns).not.toHaveBeenCalled();
   });
 
-  it("links to the preview Overview and renders the same Recent runs", async () => {
+  // #4335: the allocations read belongs to the Overview Agents chip alone.
+  it("never reads the template allocations, on first load or on a poll", async () => {
     await mountDashboard();
-    expect(screen.getByRole("link", { name: "Try the new Overview" }).getAttribute("href")).toBe("/overview/next");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(30_000);
+    });
+    expect(mockApi.listRuns.mock.calls.length).toBeGreaterThan(1);
+    expect(mockApi.getTemplateAllocations).not.toHaveBeenCalled();
+  });
+
+  it("links to the new default Overview and renders the same Recent runs", async () => {
+    await mountDashboard();
+    expect(screen.getByRole("link", { name: "Go to the new Overview" }).getAttribute("href")).toBe("/dashboard");
     expect(screen.getByText("Recent runs")).toBeTruthy();
     expect(screen.getByText("Live run row")).toBeTruthy();
   });

@@ -198,7 +198,7 @@ export const chatApi = {
     const repoId = [...state.boards.keys()][0];
     const card = repoId ? state.boards.get(repoId)?.cards[0] : undefined;
     if (!repoId || !card) throw new ApiError(404, `repo ${repoPath} not found`);
-    return runsApi.createRun(repoId, card.iid);
+    return runsApi.createRun(repoId, card.iid, {});
   },
 
   // PRD #322 M1: cancel a run from a chat's cancel card. run_id is untrusted; the real

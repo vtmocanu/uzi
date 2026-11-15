@@ -169,6 +169,72 @@ describe("Agents page shadowed hint (PRD #18 M7/M8)", () => {
   });
 });
 
+describe("Agents page summary line (#4335)", () => {
+  const seed = () => {
+    mockApi.listAgentTemplates.mockResolvedValue({
+      templates: [
+        tmpl({ id: "b-lead", name: "lead", scope: "builtin" }),
+        tmpl({ id: "b-coder", name: "coder", scope: "builtin" }),
+        tmpl({ id: "g-ops", name: "ops", scope: "global" }),
+        tmpl({ id: "u-mine", name: "mine", scope: "user" }),
+      ],
+    });
+    mockApi.getTemplateAllocations.mockResolvedValue({
+      templates: [
+        alloc({ id: "b-lead", name: "lead", scope: "builtin" }),
+        alloc({ id: "b-coder", name: "coder", scope: "builtin", effective: false }),
+        alloc({ id: "g-ops", name: "ops", scope: "global" }),
+        alloc({ id: "u-mine", name: "mine", scope: "user", global_default: false }),
+      ],
+    });
+  };
+
+  it("describes the page as defining the lead and subagents", async () => {
+    mockUseAuth.mockReturnValue({ user: MEMBER } as ReturnType<typeof useAuth>);
+    seed();
+    render(<MemoryRouter><Agents /></MemoryRouter>);
+    expect(
+      await screen.findByText(/Agent templates define the lead and the subagents your runs use\./),
+    ).toBeTruthy();
+  });
+
+  it("shows counts for a non-admin without global defaults", async () => {
+    mockUseAuth.mockReturnValue({ user: MEMBER } as ReturnType<typeof useAuth>);
+    seed();
+    render(<MemoryRouter><Agents /></MemoryRouter>);
+    const summary = await screen.findByTestId("agents-summary");
+    expect(summary.textContent).toContain("4 agents");
+    expect(summary.textContent).toContain("2 ride your runs");
+    expect(summary.textContent).toContain("2 builtin · 1 global · 1 mine");
+    expect(summary.textContent).not.toContain("global default");
+  });
+
+  it("shows global defaults for an admin", async () => {
+    mockUseAuth.mockReturnValue({ user: { ...MEMBER, is_admin: true } } as ReturnType<typeof useAuth>);
+    seed();
+    render(<MemoryRouter><Agents /></MemoryRouter>);
+    const summary = await screen.findByTestId("agents-summary");
+    expect(summary.textContent).toContain("3 global defaults");
+  });
+
+  it("is hidden while loading", async () => {
+    mockUseAuth.mockReturnValue({ user: MEMBER } as ReturnType<typeof useAuth>);
+    mockApi.listAgentTemplates.mockReturnValue(new Promise(() => {}));
+    mockApi.getTemplateAllocations.mockReturnValue(new Promise(() => {}));
+    render(<MemoryRouter><Agents /></MemoryRouter>);
+    expect(screen.queryByTestId("agents-summary")).toBeNull();
+  });
+
+  it("is hidden on a load error", async () => {
+    mockUseAuth.mockReturnValue({ user: MEMBER } as ReturnType<typeof useAuth>);
+    mockApi.listAgentTemplates.mockRejectedValue(new Error("boom"));
+    mockApi.getTemplateAllocations.mockResolvedValue({ templates: [] });
+    render(<MemoryRouter><Agents /></MemoryRouter>);
+    await screen.findByText(/boom|Failed to load templates/);
+    expect(screen.queryByTestId("agents-summary")).toBeNull();
+  });
+});
+
 describe("Agents page builtin drift badge (issue #201 M4a)", () => {
   it("badges only the row the server says differs, and reads 'differs from shipped'", async () => {
     mockUseAuth.mockReturnValue({ user: MEMBER } as ReturnType<typeof useAuth>);

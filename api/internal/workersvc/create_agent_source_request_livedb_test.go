@@ -13,7 +13,7 @@ import (
 func (f *crFix) createRequestedRun(t *testing.T, iid int64, requested *AgentSelection) uuid.UUID {
 	t.Helper()
 	seedEligibleIssue(t, f.env, f.repo, iid)
-	run, err := f.svc.CreateRun(f.env.ctx, f.user, f.repo, iid, "desc", nil, nil, false, nil, requested, nil, nil)
+	run, err := f.svc.CreateRun(f.env.ctx, f.user, f.repo, iid, "desc", nil, nil, false, nil, requested, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("CreateRun(%d): %v", iid, err)
 	}
@@ -63,7 +63,7 @@ func TestCreateRunExplicitAgentSourceRefusalsLiveDB(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			iid := int64(93411 + i)
 			seedEligibleIssue(t, f.env, f.repo, iid)
-			_, err := f.svc.CreateRun(f.env.ctx, f.user, f.repo, iid, "desc", nil, nil, false, tc.seed, tc.requested, nil, nil)
+			_, err := f.svc.CreateRun(f.env.ctx, f.user, f.repo, iid, "desc", nil, nil, false, tc.seed, tc.requested, nil, nil, nil, nil)
 			if !errors.Is(err, tc.want) {
 				t.Fatalf("CreateRun err = %v, want %v", err, tc.want)
 			}

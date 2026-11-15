@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"testing"
 	"time"
 
@@ -30,7 +31,7 @@ func TestReportHibernationPostsTheTransition(t *testing.T) {
 	if gotMethod != http.MethodPost || gotPath != "/api/controller/workers/w1/hibernation" || gotAuth != "Bearer the-token" {
 		t.Fatalf("request = %s %s auth=%q", gotMethod, gotPath, gotAuth)
 	}
-	if gotBody != want {
+	if !reflect.DeepEqual(gotBody, want) {
 		t.Fatalf("body = %+v, want %+v", gotBody, want)
 	}
 }

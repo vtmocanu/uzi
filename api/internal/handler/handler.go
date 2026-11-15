@@ -133,7 +133,8 @@ type Handler struct {
 	productSkillsSyncing atomic.Bool
 	svc                  *forgesvc.Service
 	wsvc                 *workersvc.Service
-	heldSvc              heldPublisher // test seam for WorkerRunHeldPublication; nil = wsvc
+	heldSvc              heldPublisher     // test seam for WorkerRunHeldPublication; nil = wsvc
+	terminalSvc          terminalPublisher // test seam for WorkerRunTerminalPreservation; nil = wsvc
 	// catalogDefaults is the test seam for the settings cell's Codex catalog default read
 	// (issue #3251); nil = wsvc, and a nil wsvc reads unknown.
 	catalogDefaults codexCatalogReader
@@ -899,6 +900,12 @@ func (h *Handler) attachReleaseInfo(ctx context.Context, info *apitypes.BuildInf
 			Security:    releasecheck.Security(st.RCBody),
 		}
 	}
+	if st.FormulaStableTag != "" || st.FormulaRCTag != "" {
+		info.HomebrewFormulas = &apitypes.HomebrewFormulasDTO{
+			UziCLI:   st.FormulaStableTag,
+			UziCLIRC: st.FormulaRCTag,
+		}
+	}
 	ua := releasecheck.UpdateAvailable(h.version, st.LatestTag)
 	info.UpdateAvailable = &ua
 	fb := releasecheck.FarBehind(h.version, st.LatestTag, st.PublishedAt, h.clock())
@@ -1222,6 +1229,10 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		r.Use(laneWorkerRouteGuard)
 		r.Post("/register", h.WorkerRegister)
 		r.Post("/heartbeat", h.WorkerHeartbeat)
+		// PRD #4208 M1: the volume inventory a preparing worker takes before scale-down, and its
+		// last exclusion report. Identity is the bearer worker; neither is lane-allowlisted.
+		r.Post("/hibernation/inventory", h.WorkerHibernationInventory)
+		r.Post("/hibernation/exclusion-final", h.WorkerHibernationExclusionFinal)
 		r.Post("/runs/claim", h.WorkerClaim)
 		r.Post("/runs/{id}/messages", h.WorkerRunMessages)
 		// Issue #2014: per-message usage for the estimated tail of an interrupted Claude session.
@@ -1342,6 +1353,12 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// at maxPackBytes. Eligibility is checked before the body is read.
 		r.With(h.refuseJobRuns).Post("/runs/{id}/held-publication", h.WorkerRunHeldPublication)
 		r.With(h.refuseJobRuns).Post("/runs/{id}/publication-context", h.WorkerRunPublicationContext)
+
+		// Terminal preservation (issue #4007): the worker of a terminal run publishes its final work
+		// to refs/uzi-terminal/<run-id>. Same deadlines, slot pool and pack cap as the route above;
+		// the route refuses unsupported, with no write, for a worker without
+		// recovery_terminal_preservation_v1.
+		r.With(h.refuseJobRuns).Post("/runs/{id}/terminal-preservation", h.WorkerRunTerminalPreservation)
 
 		// Agent memory (PRD #90): the worker's save_memory tool POSTs one bounded
 		// entry; the read half lists the run's (user, repo) memory the worker fences

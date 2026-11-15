@@ -11,6 +11,7 @@ import { DEFAULT_RECLAIM_MAX_CONSECUTIVE_FAILURES, TERMINAL_RUN_STATUSES, type R
 import type { RunDiskLocks } from "./run-disk-locks.js";
 import { hasRetainedHomeMarker } from "./retained-homes.js";
 import { errMessage, parseRunDirName, sleep } from "./util.js";
+import { asWriter } from "./hibernation-inventory.js";
 
 /**
  * PRD #1809 D7: the running, non-destructive disk reclaim. The startup sweep
@@ -1036,7 +1037,7 @@ export class DiskPressureController {
     // microtask, so even a reclaim that throws synchronously settles through the catch below
     // and clears inFlight after it was set, never before.
     const pass: Promise<void> = Promise.resolve()
-      .then(reclaim)
+      .then(() => asWriter("disk_reclaim", reclaim))
       .then(
         () => undefined,
         (err: unknown) => this.opts.log.warn("disk reclaim pass failed", { reason, error: errMessage(err) }),

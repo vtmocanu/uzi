@@ -308,7 +308,7 @@ func (f *effFix) create(explicit *workersvc.Harness, override *workersvc.RawCred
 	f.iid++
 	f.exec(`INSERT INTO issues (id, repo_id, forge_issue_iid, title, state, labels, web_url, has_prd_link, forge_updated_at, synced_at)
 		VALUES ($1, $2, $3, 'eff issue', 'opened', '["uzi"]', 'https://forge.e2e/i', false, now(), now())`, uuid.New(), f.repo, f.iid)
-	return f.h.wsvc.CreateRun(f.ctx, f.user, f.repo, f.iid, "eff", nil, nil, false, nil, nil, explicit, override)
+	return f.h.wsvc.CreateRun(f.ctx, f.user, f.repo, f.iid, "eff", nil, nil, false, nil, nil, explicit, override, nil, nil)
 }
 
 func hptr(h workersvc.Harness) *workersvc.Harness { return &h }
@@ -1054,6 +1054,20 @@ func TestEffectiveSettingsCorpusLiveDB(t *testing.T) {
 		[2]string{"disabled pinned token", `{"harness":null,"credential_override":{"mode":"pinned","secret_id":"` + corpusDisabledToken + `"}}`},
 		[2]string{"missing pinned token", `{"harness":null,"credential_override":{"mode":"pinned","secret_id":"` + corpusMissingToken + `"}}`},
 		[2]string{"pinned without a token", `{"harness":null,"credential_override":{"mode":"pinned"}}`},
+		// PRD #3250 section 8: the start-time model and effort. A model opts the run out of automatic
+		// harness selection, so it never leaves the harness undecided; effort alone does.
+		[2]string{"claude with a model", `{"harness":"claude","credential_override":null,"model":"opus"}`},
+		[2]string{"codex with a model", `{"harness":"codex","credential_override":null,"model":"gpt-6-sol"}`},
+		[2]string{"claude with an incompatible model", `{"harness":"claude","credential_override":null,"model":"gpt-6-sol"}`},
+		[2]string{"codex with an incompatible model", `{"harness":"codex","credential_override":null,"model":"opus"}`},
+		[2]string{"model and effort on claude", `{"harness":"claude","credential_override":null,"model":"opus","effort":"xhigh"}`},
+		[2]string{"model and effort on codex", `{"harness":"codex","credential_override":null,"model":"gpt-6-sol","effort":"max"}`},
+		[2]string{"effort only on claude", `{"harness":"claude","credential_override":null,"effort":"high"}`},
+		[2]string{"effort only on codex", `{"harness":"codex","credential_override":null,"effort":"low"}`},
+		[2]string{"model without a harness", `{"harness":null,"credential_override":null,"model":"opus"}`},
+		[2]string{"incompatible model without a harness", `{"harness":null,"credential_override":null,"model":"gpt-6-sol"}`},
+		[2]string{"effort only without a harness", `{"harness":null,"credential_override":null,"effort":"medium"}`},
+		[2]string{"effort only with a disabled pinned token", `{"harness":null,"credential_override":{"mode":"pinned","secret_id":"` + corpusDisabledToken + `"},"effort":"medium"}`},
 	), SchedulePreviews: schedules(f,
 		[2]string{"unpinned sweep", `{"target":"sweep"}`},
 		[2]string{"sweep pinned to codex with a claude model pin", `{"target":"sweep","harness":"codex","model":"sonnet","override_subagent_model":true}`},
@@ -1078,6 +1092,9 @@ func TestEffectiveSettingsCorpusLiveDB(t *testing.T) {
 		[2]string{"default start", `{"harness":null,"credential_override":null}`},
 		[2]string{"claude", `{"harness":"claude","credential_override":null}`},
 		[2]string{"codex", `{"harness":"codex","credential_override":null}`},
+		[2]string{"model without a harness", `{"harness":null,"credential_override":null,"model":"gpt-6-sol"}`},
+		[2]string{"incompatible model without a harness", `{"harness":null,"credential_override":null,"model":"opus"}`},
+		[2]string{"effort only without a harness", `{"harness":null,"credential_override":null,"effort":"max"}`},
 	), SchedulePreviews: schedules(f,
 		[2]string{"unpinned sweep", `{"target":"sweep"}`},
 		[2]string{"sweep with a claude model pin", `{"target":"sweep","model":"sonnet","override_subagent_model":true}`},

@@ -107,3 +107,27 @@ func TestWorkerIntakeLabelHibernating(t *testing.T) {
 		t.Errorf("manual cordon lost: %q", got)
 	}
 }
+
+// TestWorkerListJSONCarriesHibernationCleanup pins PRD #4206: `worker list --json` emits the
+// WorkerDTO verbatim, so the hibernation_cleanup object reaches a script, and the key is
+// present (null) for a worker without one.
+func TestWorkerListJSONCarriesHibernationCleanup(t *testing.T) {
+	skipped, reason := "skipped", "daemon_unreachable"
+	fc := &uzicli.FakeClient{Workers: []apitypes.WorkerDTO{
+		{ID: "w1", Name: "pruned-ish", Status: "offline", HibernationState: "hibernated",
+			HibernationCleanup: &apitypes.HibernationCleanupDTO{State: "settled", Outcome: &skipped, CleanupReason: &reason}},
+		{ID: "w2", Name: "plain", Status: "online", HibernationState: "none"},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "worker", "list", "--json")
+	if code != uzicli.ExitOK {
+		t.Fatalf("worker list --json exit = %d, want 0", code)
+	}
+	for _, want := range []string{
+		`"hibernation_cleanup": {`, `"state": "settled"`, `"outcome": "skipped"`, `"reason": "daemon_unreachable"`,
+		`"hibernation_cleanup": null`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("worker list --json = %q, want it to carry %s", out, want)
+		}
+	}
+}

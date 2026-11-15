@@ -490,7 +490,7 @@ func (r *CreatedRunResult) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-func (c *HTTPClient) CreateRun(ctx context.Context, repoID string, issueIID int64, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *CreateRunSeed, agentSource string, credOverride *CreateRunCredentialOverride, harness string) (CreatedRunResult, error) {
+func (c *HTTPClient) CreateRun(ctx context.Context, repoID string, issueIID int64, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *CreateRunSeed, agentSource string, credOverride *CreateRunCredentialOverride, harness, model, effort string) (CreatedRunResult, error) {
 	var env struct {
 		Run    apitypes.RunDTO `json:"run"`
 		Notice string          `json:"notice"`
@@ -543,7 +543,10 @@ func (c *HTTPClient) CreateRun(ctx context.Context, repoID string, issueIID int6
 		RequireBase        bool                         `json:"require_base,omitempty"`
 		CredentialOverride *createRunCredentialOverride `json:"credential_override,omitempty"`
 		Harness            string                       `json:"harness,omitempty"`
-	}{IssueIID: issueIID, WaitOnLimit: waitOnLimit, MrReworkEnabled: mrReworkEnabled, Force: force, Harness: harness}
+		// PRD #3250: the start-time model and effort; "" (flag omitted) sends no key.
+		Model  string `json:"model,omitempty"`
+		Effort string `json:"effort,omitempty"`
+	}{IssueIID: issueIID, WaitOnLimit: waitOnLimit, MrReworkEnabled: mrReworkEnabled, Force: force, Harness: harness, Model: model, Effort: effort}
 	if seed != nil {
 		reqBody.PlanMD = &seed.PlanMD
 		reqBody.Selection = seed.Selection

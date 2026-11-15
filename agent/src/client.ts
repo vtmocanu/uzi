@@ -23,6 +23,13 @@ import { MaintenanceResources } from "./recovery-maintenance.js";
 import { MaintenanceBudget } from "./maintenance-budget.js";
 import { readPlanCrossCheckReconciliation } from "./cross-check-reconciliation.js";
 import type { DindMeterSample } from "./dind-meter.js";
+import {
+  decodeHibernationInventory,
+  type ExclusionFinalRequest,
+  type HibernationExclusionReport,
+  type HibernationInventoryBody,
+  type HibernationInventoryMember,
+} from "./hibernation-inventory.js";
 import { isHarnessEffort } from "./harness.js";
 import type { Logger } from "./log.js";
 import type { ResidueQuarantineState } from "./residue-quarantine.js";
@@ -78,6 +85,8 @@ import {
   type HeartbeatRequest,
   type DindMaintenance,
   type DindMaintenanceReadyACK,
+  type HibernationCachePrune,
+  type HibernationCachePruneReport,
   type MessagesRequest,
   type OutboxHeartbeatEntry,
   type OutgoingMessage,
@@ -1225,6 +1234,26 @@ function decodeDindMaintenance(value: unknown): DindMaintenance | null | undefin
   };
 }
 
+/** Strict, bounded decode of the heartbeat member `hibernation_cache_prune` (PRD #4206): null and an
+ *  absent member are "no attempt"; anything malformed is undefined (unknown, never a release). */
+function decodeHibernationCachePrune(value: unknown, present: boolean): HibernationCachePrune | null | undefined {
+  if (value === null || !present) return null;
+  if (!isRecord(value)) return undefined;
+  const nonce = value.register_nonce;
+  const seq = value.reconcile_seq;
+  if (!isDindUUID(value.op_id) || typeof nonce !== "string" || nonce.length === 0 || nonce.length > 128 ||
+      typeof value.cancel_requested !== "boolean" ||
+      typeof seq !== "number" || !Number.isSafeInteger(seq) || seq < 0 || seq > 2_147_483_647) return undefined;
+  switch (value.phase) {
+    case "requested": case "started": case "unknown": case "settled":
+      break;
+    default:
+      return undefined;
+  }
+  return { op_id: value.op_id, register_nonce: nonce, phase: value.phase,
+    cancel_requested: value.cancel_requested, reconcile_seq: seq };
+}
+
 function validDindSample(sample: DindMeterSample | null | undefined): sample is DindMeterSample {
   if (!sample || ![sample.epochS, sample.bytesUsed, sample.bytesTotal, sample.inodesUsed, sample.inodesTotal]
     .every((v) => Number.isSafeInteger(v) && v >= 0)) return false;
@@ -1708,10 +1737,62 @@ export class WorkerClient {
   private registrationReport: Omit<NonNullable<HeartbeatRequest["protocol_refresh"]>, "register_nonce"> | undefined;
 
   private latestDindMaintenanceValue: DindMaintenance | null | undefined;
+  private latestHibernationInventoryValue: HibernationInventoryMember | null | undefined;
+  private hibernationExclusionReceipt?: { report: HibernationExclusionReport; opId: string; held: boolean };
+
+  /** Exact-input receipt: another concurrent heartbeat must not acknowledge this report.
+   *  A lost receipt can cause a harmless resend; an omitted/stripped report never gets one. */
+  hibernationExclusionDelivered(report: HibernationExclusionReport): boolean {
+    const receipt = this.hibernationExclusionReceipt;
+    return receipt?.report === report && receipt.opId === report.op_id && receipt.held === report.held;
+  }
+
+  /** Latest heartbeat's `hibernation_inventory` (PRD #4208): null = none, undefined = unknown or malformed. */
+  get latestHibernationInventory(): HibernationInventoryMember | null | undefined {
+    return this.latestHibernationInventoryValue;
+  }
+
+  /** The current registration's nonce (the original register response), or undefined before register. */
+  currentRegisterNonce(): string | undefined {
+    return this.registerNonce;
+  }
+
+  /** PRD #4208: report the inventory, or one of its refusal statuses. Needs `hibernation_inventory_v1`. */
+  async postHibernationInventory(body: HibernationInventoryBody, signal?: AbortSignal): Promise<void> {
+    if (!this.hasFeature("hibernation_inventory_v1")) throw new Error("hibernation inventory feature unavailable");
+    await this.postJSON(`${WORKER_API_PREFIX}/hibernation/inventory`, body, this.httpTimeoutMs, signal, 64 * 1024);
+  }
+
+  /** PRD #4208: the shutdown-time exclusion proof. A short bounded post; the caller sends nothing on failure. */
+  async postHibernationExclusionFinal(
+    body: ExclusionFinalRequest, opts: { timeoutMs?: number; signal?: AbortSignal } = {},
+  ): Promise<void> {
+    if (!this.hasFeature("hibernation_inventory_v1")) throw new Error("hibernation inventory feature unavailable");
+    await this.postJSON(`${WORKER_API_PREFIX}/hibernation/exclusion-final`, body,
+      opts.timeoutMs ?? this.httpTimeoutMs, opts.signal, 64 * 1024);
+  }
 
   /** Latest heartbeat observation: null means known none; undefined means unknown. */
   get latestDindMaintenance(): DindMaintenance | null | undefined {
     return this.latestDindMaintenanceValue;
+  }
+
+  /** PRD #4206: whether this registration advertised `hibernation_cache_prune_v1`; the response
+   *  member is decoded and the report sent only then (the api does not echo it as a feature). */
+  private hibernationPruneAdvertised = false;
+  private latestHibernationCachePruneValue: HibernationCachePrune | null | undefined;
+  private hibernationReportOutcomeValue: "none" | "sent" | "dropped" = "none";
+
+  /** Latest heartbeat's hibernation cache prune projection: null is known none, undefined unknown. */
+  get latestHibernationCachePrune(): HibernationCachePrune | null | undefined {
+    return this.latestHibernationCachePruneValue;
+  }
+
+  /** What the latest heartbeat did with the hibernation report it was handed: `sent` (accepted),
+   *  `dropped` (the api answered 409; the report was removed and the heartbeat resynced) or `none`
+   *  (not included, or the heartbeat failed). */
+  get hibernationReportOutcome(): "none" | "sent" | "dropped" {
+    return this.hibernationReportOutcomeValue;
   }
 
   /**
@@ -1970,6 +2051,10 @@ export class WorkerClient {
     this.hasExactHoldCapability = false;
     this.hasBindinglessHoldCapability = false;
     this.latestDindMaintenanceValue = undefined;
+    this.latestHibernationCachePruneValue = undefined;
+    this.hibernationReportOutcomeValue = "none";
+    this.hibernationExclusionReceipt = undefined;
+    this.hibernationPruneAdvertised = false;
     this.registerNonce = undefined;
     this.registrationEvidenceDropped = false;
     this.registrationReport = undefined;
@@ -2036,6 +2121,7 @@ export class WorkerClient {
     // PRD #1247 fix round: remember whether THIS image advertised the credential_switch_v1
     // capability, so the send-gate can stamp the claim generation optimistically (its runs
     // are fenced server-side) even when a one-shot register missed the negotiated feature.
+    this.hibernationPruneAdvertised = originalCapabilities?.includes("hibernation_cache_prune_v1") ?? false;
     this.hasCredentialSwitchCapability = originalCapabilities?.includes("credential_switch_v1") ?? false;
     this.hasInPlaceCredentialSwitchCapability = originalCapabilities?.includes(CREDENTIAL_SWITCH_IN_PLACE_CAPABILITY) ?? false;
     this.hasCodexCredentialSwitchCapability = originalCapabilities?.includes(CODEX_CREDENTIAL_SWITCH_CAPABILITY) ?? false;
@@ -2218,6 +2304,7 @@ export class WorkerClient {
     for (const owned of this.codexAdmission.values()) owned.reporter.seal();
     this.revokeMemoryAuthority();
     this.latestDindMaintenanceValue = undefined;
+    this.latestHibernationInventoryValue = undefined;
   }
 
   /** Drop ONE negotiated feature (PRD #1733), where {@link clearFeatures} drops the whole set:
@@ -2240,9 +2327,15 @@ export class WorkerClient {
     maintenance?: { sample?: DindMeterSample | null; ack?: DindMaintenanceReadyACK },
     quarantine?: ResidueQuarantineState,
     outboxRootUnusable?: "symlink" | "unreadable",
+    hibernationReport?: HibernationCachePruneReport,
+    hibernationExclusion?: HibernationExclusionReport,
   ): Promise<boolean | undefined> {
     this.latestDindMaintenanceValue = undefined;
-    const body: HeartbeatRequest = { version: this.version };
+    this.latestHibernationCachePruneValue = undefined;
+    this.hibernationReportOutcomeValue = "none";
+    this.hibernationExclusionReceipt = undefined;
+    this.latestHibernationInventoryValue = undefined;
+    const body: HeartbeatRequest & { hibernation_exclusion?: HibernationExclusionReport } = { version: this.version };
     if (this.hasFeature("heartbeat_outbox_root_unusable")) body.outbox_root_unusable = outboxRootUnusable ?? null;
     // Only attach stats when the collector produced a sample (PRD #49): an absent
     // field is the same wire shape as today, so a pre-#49 server ignores the extra
@@ -2273,6 +2366,16 @@ export class WorkerClient {
         body.dind_maintenance_ready_ack = { ...maintenance.ack, register_nonce: this.registerNonce };
       }
     }
+    // PRD #4206: the hibernation cache prune report rides only for a registration that advertised
+    // the capability, bound to the current nonce, and never beside a maintenance ACK (the ACK goes
+    // first; the report waits for the next heartbeat and the caller sees outcome "none").
+    if (hibernationReport && this.hibernationPruneAdvertised && this.registerNonce !== undefined &&
+        hibernationReport.register_nonce === this.registerNonce && body.dind_maintenance_ready_ack === undefined) {
+      body.hibernation_cache_prune_report = { ...hibernationReport };
+    }
+    // PRD #4208: the writer-exclusion report rides only when negotiated and the controller has one.
+    const includeHibernation = this.hasFeature("hibernation_inventory_v1") && hibernationExclusion !== undefined;
+    if (includeHibernation) body.hibernation_exclusion = { op_id: hibernationExclusion.op_id, held: hibernationExclusion.held };
     // issue #2213: the residue quarantine latch rides the heartbeat ONLY while latched and ONLY when
     // the api advertised `worker_residue_quarantine`, so an older api sees a byte-identical wire.
     const includeQuarantine = this.hasFeature("worker_residue_quarantine") && quarantine !== undefined;
@@ -2295,24 +2398,41 @@ export class WorkerClient {
         register_nonce: this.registerNonce,
       };
     }
+    const recordExclusionDelivery = (sent: HeartbeatRequest & { hibernation_exclusion?: HibernationExclusionReport }): void => {
+      const packet = sent.hibernation_exclusion;
+      this.hibernationExclusionReceipt = packet && hibernationExclusion
+        ? { report: hibernationExclusion, opId: packet.op_id, held: packet.held } : undefined;
+    };
     const includeExtension = body.protocol_refresh !== undefined || includeOutbox || includeSnapshot || body.dind_meter !== undefined ||
-      body.dind_maintenance_ready_ack !== undefined || includeQuarantine || body.outbox_root_unusable !== undefined;
+      body.dind_maintenance_ready_ack !== undefined || body.hibernation_cache_prune_report !== undefined || includeQuarantine || body.outbox_root_unusable !== undefined || includeHibernation;
     try {
       try {
-        return await this.postHeartbeat(body);
+        const sent = await this.postHeartbeat(body);
+        recordExclusionDelivery(body);
+        if (body.hibernation_cache_prune_report) this.hibernationReportOutcomeValue = "sent";
+        return sent;
       } catch (err) {
         // A diagnostic rejected after API rollback must not strip protection fields.
         if (body.outbox_root_unusable !== undefined && isStrictDecodeError(err)) {
           delete body.outbox_root_unusable;
           this.dropFeature("heartbeat_outbox_root_unusable");
-          return await this.postHeartbeat(body);
+          const sent = await this.postHeartbeat(body);
+          recordExclusionDelivery(body);
+          return sent;
         }
         // A stale ACK gets one ACK-free resync; sibling extensions remain intact.
         // Any failure of that request reaches the usual strict-decode fallback below.
-        if (!body.dind_maintenance_ready_ack || !(err instanceof RequestError) || err.status !== 409) throw err;
+        if ((!body.dind_maintenance_ready_ack && !body.hibernation_cache_prune_report) ||
+            !(err instanceof RequestError) || err.status !== 409) throw err;
         const resync = { ...body };
         delete resync.dind_maintenance_ready_ack;
-        return await this.postHeartbeat(resync);
+        // A stale or mismatched hibernation report is dropped for good (the caller never resends it).
+        const droppedReport = resync.hibernation_cache_prune_report !== undefined;
+        delete resync.hibernation_cache_prune_report;
+        const resynced = await this.postHeartbeat(resync);
+        recordExclusionDelivery(resync);
+        if (droppedReport) this.hibernationReportOutcomeValue = "dropped";
+        return resynced;
       }
     } catch (err) {
       // Rollback fallback (PRD #1391 M5, extended by #1390 M2a): a rolled-back api that no
@@ -2329,6 +2449,7 @@ export class WorkerClient {
       const stripped: HeartbeatRequest = { version: this.version };
       if (stats) stripped.stats = stats;
       const retaining = await this.postHeartbeat(stripped, false);
+      recordExclusionDelivery(stripped);
       this.clearFeatures();
       this.log.warn(
         "heartbeat extension rejected by a rolled-back api; retried stripped and cleared the negotiated feature set",
@@ -2352,6 +2473,8 @@ export class WorkerClient {
    */
   private async postHeartbeat(body: HeartbeatRequest, applyAdverts = true): Promise<boolean | undefined> {
     this.latestDindMaintenanceValue = undefined;
+    this.latestHibernationCachePruneValue = undefined;
+    this.latestHibernationInventoryValue = undefined;
     const path = `${WORKER_API_PREFIX}/heartbeat`;
     const res = await this.fetchRaw("POST", path, body);
     if (!res.ok) throw await this.toError("POST", path, res);
@@ -2384,6 +2507,17 @@ export class WorkerClient {
     if (this.hasFeature("dind_maintenance_v1")) {
       this.latestDindMaintenanceValue = decodeDindMaintenance(
         (decoded as { dind_maintenance?: unknown }).dind_maintenance,
+      );
+    }
+    if (this.hibernationPruneAdvertised) {
+      this.latestHibernationCachePruneValue = decodeHibernationCachePrune(
+        (decoded as { hibernation_cache_prune?: unknown }).hibernation_cache_prune,
+        "hibernation_cache_prune" in (decoded as object),
+      );
+    }
+    if (this.hasFeature("hibernation_inventory_v1")) {
+      this.latestHibernationInventoryValue = decodeHibernationInventory(
+        (decoded as { hibernation_inventory?: unknown }).hibernation_inventory,
       );
     }
     const worker = (decoded as { worker?: unknown }).worker;

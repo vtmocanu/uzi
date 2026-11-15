@@ -19,6 +19,8 @@ export const MODEL_SETTING_SOURCE_LABELS: readonly { field: string; token: strin
   { field: "model", token: "cross_check_worker_default", label: "worker default" },
   { field: "effort", token: "cross_check_pin", label: "checker pin" },
   { field: "effort", token: "cross_check_default", label: "cross-check default" },
+  { field: "model", token: "run_override", label: "this run" },
+  { field: "effort", token: "run_override", label: "this run" },
   { field: "harness", token: "run_override", label: "your choice for this run" },
   { field: "harness", token: "schedule_pin", label: "schedule pin" },
   { field: "harness", token: "user_default", label: "your default harness" },

@@ -681,7 +681,17 @@ workers:
   #   The same flag also enables the pressure-only anonymous-volume prune leg (issue
   #   #3891) on busy or custody-held workers; false disables that leg too, along with
   #   PVC recycle and the cache prune (it is not leg-only).
+  #   It likewise disables the pressure-only builder-cache prune leg (issue #4291,
+  #   see dindBuilderPruneEnabled below).
   diskRecycleEnabled: true
+  # dindBuilderPruneEnabled: default-on switch for the pressure-only builder-cache
+  #   prune leg (issue #4291): `docker builder prune -f --filter type=regular
+  #   --filter until=24h --max-used-space 4GiB`, run on busy or custody-held docker
+  #   workers. Subordinate to diskRecycleEnabled: false there disables this leg too.
+  #   Setting this false disables only this leg. Flipping it changes docker worker
+  #   pods' spec hash, so they roll through the normal safe drift roll. Strict boolean
+  #   (a string or null refuses to render); always sent explicitly.
+  dindBuilderPruneEnabled: true
   # diskRecycleCooldown: the PVC-age thrash guard (Decision D6). A worker back at pressure
   #   within this window is a CAPACITY problem (working set exceeds nixSize) — it is
   #   capacity-warned and skipped, not recycled in a loop. An ordinary Go duration
@@ -711,7 +721,7 @@ workers:
     # so the fleet rolls as its workers finish their runs. It must be concrete: the
     # controller-deployment template wraps it in `required`, so a blank tag fails the
     # render loudly rather than shipping an empty image reference.
-    tag: "0.87.0-rc.11"
+    tag: "0.87.0-rc.12"
   # The Harbor pull secret IN THE WORKER NAMESPACE. It cannot be the release
   # namespace's copy: a ServiceAccount's imagePullSecrets can only name a Secret in
   # its OWN namespace. Empty = no pull secret (the KinD smoke, where the agent image

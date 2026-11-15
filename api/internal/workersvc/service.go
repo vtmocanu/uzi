@@ -2115,20 +2115,26 @@ type Service struct {
 	// heldPrepareFn / heldSendFn / heldListFn are step A's broker seams (issue #2545): the
 	// read-only pack pre-verify, the single create-only push and the reconcile listing. They
 	// default to pushbroker.PrepareHeldPack, SendHeldCreate and ListRefTips (set in New); tests
-	// stub them with a fake forge. heldSlots is the process-wide step-A semaphore.
+	// stub them with a fake forge. heldSlots is the shared publication semaphore;
+	// heldSlotsMu protects each worker reservation together with its global slot.
 	// heldOutcomeHook, when set, runs inside tx2 before its commit (fault injection).
 	heldPrepareFn      func(ctx context.Context, o pushbroker.HeldPackOptions) (*pushbroker.PreparedHeldPack, error)
 	heldSendFn         func(ctx context.Context, p *pushbroker.PreparedHeldPack) (pushbroker.HeldCreateOutcome, error)
 	heldListFn         func(ctx context.Context, o pushbroker.ListRefsOptions, refs ...string) (map[string]string, error)
 	prerequisite       *prerequisiteRuntime
 	heldSlots          chan struct{}
+	heldSlotsMu        sync.Mutex
+	heldSlotWorkers    map[uuid.UUID]struct{}
 	heldBeforeSendHook func()
 	heldOutcomeHook    func() error
 	// heldDeleteFn is the held cleanup's CAS delete (default pushbroker.Delete); heldCleanupHook,
 	// when set, runs inside the cleanup transaction after the run lock and before any forge call
 	// (test fault injection). Both belong to SweepHeldPublications (held_cleanup.go).
-	heldDeleteFn       func(ctx context.Context, o pushbroker.DeleteOptions) error
-	heldCleanupHook    func(stage string)
+	heldDeleteFn    func(ctx context.Context, o pushbroker.DeleteOptions) error
+	heldCleanupHook func(stage string)
+	// terminal holds the terminal-preservation route's broker seams and fault-injection points
+	// (terminal_preservation.go); its zero value uses the pushbroker functions.
+	terminal           terminalHooks
 	salvageLeadPending bool
 	// createRefFn is the go-git recovery-ref CREATOR (PRD #1810 M3, D2): supersession preserves
 	// a retained checkpoint tip under refs/uzi-recovery/<run id> before freeing the branch ref.
@@ -2483,6 +2489,7 @@ func New(q Store, box *secretbox.Box, p Params) *Service {
 		heldListFn:           pushbroker.ListRefTips,
 		heldDeleteFn:         pushbroker.Delete,
 		heldSlots:            make(chan struct{}, heldPublishMaxConcurrent),
+		heldSlotWorkers:      make(map[uuid.UUID]struct{}, heldPublishMaxConcurrent),
 		prerequisite:         newPrerequisiteRuntime(),
 		createRefFn:          pushbroker.CreateRef,
 		listRefTipsFn:        pushbroker.ListRefTips,
@@ -2740,6 +2747,13 @@ func (s *Service) RegisterWithCrossCheckSlots(ctx context.Context, wkr store.Wor
 	// transaction under the row lock taken above.
 	if prior.HibernationState == "waking" || prior.HibernationState == "preparing" {
 		if err := s.settleRegisteredWaking(ctx, qtx, store.Worker(row), registeredPodUID); err != nil {
+			return store.Worker{}, "", err
+		}
+	}
+	// PRD #4208 M1: a Register is also evidence against a bound volume inventory (another pod, or
+	// the same pod's process restarting), under the same row lock.
+	if prior.HibernationState == "preparing" || prior.HibernationState == "hibernated" {
+		if err := s.inventoryOnRegister(ctx, qtx, store.Worker(row), registeredPodUID); err != nil {
 			return store.Worker{}, "", err
 		}
 	}
@@ -7825,11 +7839,17 @@ func (s *Service) DeleteWorker(ctx context.Context, userID, workerID uuid.UUID) 
 		}
 		return &WorkerHasCustodyError{Holds: holds, List: list}
 	}
+	// PRD #4206: an unsettled hibernation cache prune keeps its claim fence until settled, and the
+	// delete query repeats the predicate so a concurrent attempt cannot slip past this read.
 	n, err := s.q.DeleteWorkerForUser(ctx, store.DeleteWorkerForUserParams{ID: workerID, UserID: userID})
 	if err != nil {
 		return err
 	}
 	if n == 0 {
+		cur, gerr := s.q.GetWorkerByIDForUser(ctx, store.GetWorkerByIDForUserParams{ID: workerID, UserID: userID})
+		if gerr == nil && cleanupUnsettled(cur.CleanupPhase) {
+			return &WorkerHibernationCleanupUnsettledError{Phase: cur.CleanupPhase}
+		}
 		return ErrWorkerNotFound
 	}
 	// The worker is gone; drop its last-known outbox depth (PRD #1391 M5) so a
@@ -7851,7 +7871,7 @@ func (s *Service) DeleteWorker(ctx context.Context, userID, workerID uuid.UUID) 
 // PRD #1429 M2: explicit is the manual request's optional harness (D2), nil ⇒ implicit D11;
 // rawOverride is the raw #1247 credential override validated against the resolved harness inside
 // the create transaction (D5). The old pre-transaction createRunEffectiveHarness guesser is gone.
-func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *SeededPlan, requested *AgentSelection, explicit *Harness, rawOverride *RawCredentialOverride) (store.Run, error) {
+func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, force bool, seed *SeededPlan, requested *AgentSelection, explicit *Harness, rawOverride *RawCredentialOverride, model, effort *string) (store.Run, error) {
 	// waitOnLimit nil ⇒ inherit the owner's default. It is a *bool rather than a bool
 	// because "the caller said false" and "the caller said nothing" are different
 	// requests, and collapsing them would make every API client that omits the field
@@ -7863,8 +7883,10 @@ func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issue
 	//
 	// This is THE interactive, human-initiated path (the board / issue-view Start
 	// button, and `uzi run start` through the same HTTP endpoint).
-	// nil model: a non-scheduled human run inherits the owner's per-user Worker default
-	// (PRD #300) — the per-schedule override applies only to runs a schedule fires.
+	// model / effort (PRD #3250): the manual request's optional start-time choice. nil model
+	// inherits the owner's per-user Worker default (PRD #300); a present one is a run_override,
+	// stamped with its source and checked against the resolved harness inside the create
+	// transaction. nil effort leaves the effort pair NULL.
 	// false overrideSubagentModel (PRD #305): an interactive run is not a schedule fire,
 	// so it stays in the default lane where subagent pins win.
 	// force (issue #856): threaded straight through so the interactive/CLI caller can
@@ -7872,7 +7894,7 @@ func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issue
 	// credOverride nil ⇒ inherit the worker binding (PRD #1247 M1); the create-time
 	// user choice is wired in M2. Threaded through the signature now so M2 does not
 	// reopen this seam (the freeze).
-	return s.createRun(ctx, userID, repoID, issueIID, "manual", description, false, waitOnLimit, mrReworkEnabled, nil, false, force, seed, requested, nil /*credOverride: manual uses rawOverride*/, explicit, rawOverride)
+	return s.createRun(ctx, userID, repoID, issueIID, "manual", description, false, waitOnLimit, mrReworkEnabled, model, runOverrideSource(model), effort, false, force, seed, requested, nil /*credOverride: manual uses rawOverride*/, explicit, rawOverride)
 }
 
 // CreateScheduledRun queues a NON-auto-approve scheduled issue run (PRD #241: a timer
@@ -7883,7 +7905,7 @@ func (s *Service) CreateScheduledRun(ctx context.Context, userID, repoID uuid.UU
 	// false force (issue #856): a scheduled run never bypasses the open-MR dedup.
 	// credOverride: the schedule's stored (pre-validated) override, written as-is. explicit: the
 	// schedule's pin or fresh issue-label selection (nil ⇒ implicit D11 at fire time).
-	return s.createRun(ctx, userID, repoID, issueIID, "schedule", description, false, waitOnLimit, mrReworkEnabled, model, overrideSubagentModel, false, seed, nil, credOverride, explicit, nil /*rawOverride*/)
+	return s.createRun(ctx, userID, repoID, issueIID, "schedule", description, false, waitOnLimit, mrReworkEnabled, model, scheduleModelSource(model), nil /*effort*/, overrideSubagentModel, false, seed, nil, credOverride, explicit, nil /*rawOverride*/)
 }
 
 // CreateAutopilotRun queues a run the poller's autopilot detection started on a
@@ -7912,7 +7934,7 @@ func (s *Service) CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UU
 	// choice, so it inherits the worker binding exactly as before.
 	// explicit is the fresh issue-label selection; nil keeps implicit D11 resolution.
 	// No raw credential override is supplied by the poller.
-	return s.createRun(ctx, userID, repoID, issueIID, "autopilot", description, true, nil, nil, nil, false, false, nil, nil, nil /*credOverride*/, explicit, nil /*rawOverride*/)
+	return s.createRun(ctx, userID, repoID, issueIID, "autopilot", description, true, nil, nil, nil, modelSourceNone, nil /*effort*/, false, false, nil, nil, nil /*credOverride*/, explicit, nil /*rawOverride*/)
 }
 
 // CreateScheduledAutopilotRun queues an auto-approve scheduled issue run. It carries
@@ -7922,7 +7944,7 @@ func (s *Service) CreateScheduledAutopilotRun(ctx context.Context, userID, repoI
 	// false force (issue #856): a scheduled autopilot run never bypasses the open-MR dedup.
 	// credOverride: the schedule's stored override; explicit: the schedule's pinned harness
 	// or fresh issue-label selection (nil ⇒ implicit D11 at fire time).
-	return s.createRun(context.WithValue(ctx, scheduleApprovalKey{}, true), userID, repoID, issueIID, "autopilot", description, true /*autoApprove*/, waitOnLimit, mrReworkEnabled, model, overrideSubagentModel, false /*force*/, nil /*seed*/, nil, credOverride, explicit, nil /*rawOverride*/)
+	return s.createRun(context.WithValue(ctx, scheduleApprovalKey{}, true), userID, repoID, issueIID, "autopilot", description, true /*autoApprove*/, waitOnLimit, mrReworkEnabled, model, scheduleModelSource(model), nil /*effort*/, overrideSubagentModel, false /*force*/, nil /*seed*/, nil, credOverride, explicit, nil /*rawOverride*/)
 }
 
 // SeededPlan carries a create-time externally-authored plan and its optional agent
@@ -7959,10 +7981,19 @@ type SeededPlan struct {
 // stored choice), written to the columns as-is; rawOverride is an UNVALIDATED request override
 // (manual/chat-start) validated against the D11-resolved harness INSIDE the create transaction
 // (D5). At most one of credOverride/rawOverride is non-nil.
-func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, triggerSource string, description string, autoApprove bool, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, force bool, seed *SeededPlan, requested *AgentSelection, credOverride *CredentialOverride, explicit *Harness, rawOverride *RawCredentialOverride) (store.Run, error) {
+//
+// modelSrc (PRD #3250) is the explicit provenance of model, set by each public entrypoint and never
+// inferred from triggerSource: run_override from a manual request's model, schedule_pin from a
+// schedule's, none otherwise. A run_override model is checked against the resolved harness inside
+// the create transaction; effort, when present, is stamped with effort_source run_override.
+func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, triggerSource string, description string, autoApprove bool, waitOnLimit *bool, mrReworkEnabled *bool, model *string, modelSrc modelSource, effort *string, overrideSubagentModel bool, force bool, seed *SeededPlan, requested *AgentSelection, credOverride *CredentialOverride, explicit *Harness, rawOverride *RawCredentialOverride) (store.Run, error) {
+	// PRD #3250: an effort is stored only as an exact canonical level, whichever caller supplied it.
+	if effort != nil && !validRunEffort(*effort) {
+		return store.Run{}, ErrInvalidRunEffort
+	}
 	// The description cap is enforced HERE, once, so the manual (handler → 422) and
 	// autopilot (poller → too-large comment) paths cannot drift (PRD #19 M5). Checked
-	// first: it is pure input validation, independent of the repo/issue gates below.
+	// with the other pure input validation, before the repo/issue gates below.
 	if len(description) > MaxIssueDescriptionBytes {
 		return store.Run{}, ErrDescriptionTooLarge
 	}
@@ -8292,6 +8323,17 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		if credOverride != nil && resolved.Harness == HarnessCodex {
 			return store.Run{}, ErrCredentialOverrideHarnessUnsupported
 		}
+		// PRD #3250: a run_override model must be servable by the RESOLVED harness. After the
+		// credential-override validation and the pin lock above so every credential refusal keeps
+		// its precedence; a refusal rolls back the whole create (no run row, no Codex binding
+		// freeze, no queued notify). Schedule pins keep the soft harnessModelCompatible fallback.
+		if modelSrc == modelSourceRunOverride && (model == nil || !runOverrideModelHonorable(resolved.Harness, *model)) {
+			refused := ""
+			if model != nil {
+				refused = *model
+			}
+			return store.Run{}, &ModelIncompatibleError{Model: refused, Harness: resolved.Harness}
+		}
 		// Stamp unseeded issue runs for either resolved harness when the switch is on.
 		var completionContractVersion pgtype.Int4
 		if interlockOn {
@@ -8337,6 +8379,11 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 			// nil for every non-scheduled caller (interactive, label-poller autopilot) →
 			// NULL → the run inherits the owner's per-user Worker default at claim assembly.
 			Model: pgconv.TextPtr(model),
+			// PRD #3250: where the model came from (NULL with no model) and the start-time effort
+			// pair. Listed explicitly per runtime.sql's silently-omittable-narg warning.
+			ModelSource:  pgconv.TextOrNull(string(modelSrc)),
+			Effort:       pgconv.TextPtr(effort),
+			EffortSource: effortSourceFor(effort),
 			// PRD #305: the schedule's "apply model also to agents" opt-in, frozen onto the
 			// run at fire time. false for every non-scheduled caller (interactive,
 			// label-poller autopilot) → the default lane where subagent pins win. M1 stores

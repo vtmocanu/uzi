@@ -335,6 +335,36 @@ func (m *Materializer) storageClassVerdict(ctx context.Context, tick *rollTick, 
 	return verdict
 }
 
+// classReclaimPolicy returns the StorageClass's reclaim policy (Retain, Delete or Recycle)
+// for the hibernation volume inventory, memoised for the tick. A nil or empty class name,
+// a Forbidden, NotFound or any other read error, or an unrecognised value yields
+// "unknown". It reads only the StorageClass object; no PersistentVolume is read.
+func (m *Materializer) classReclaimPolicy(ctx context.Context, name *string) string {
+	if name == nil || *name == "" {
+		return protocol.ReclaimPolicyUnknown
+	}
+	tick, _ := ctx.Value(rollTickKey{}).(*rollTick)
+	if tick != nil {
+		if v, ok := tick.reclaimPolicies[*name]; ok {
+			return v
+		}
+	}
+	policy := protocol.ReclaimPolicyUnknown
+	if sc, err := m.client.StorageV1().StorageClasses().Get(ctx, *name, metav1.GetOptions{}); err == nil && sc != nil && sc.ReclaimPolicy != nil {
+		switch string(*sc.ReclaimPolicy) {
+		case protocol.ReclaimPolicyRetain, protocol.ReclaimPolicyDelete, protocol.ReclaimPolicyRecycle:
+			policy = string(*sc.ReclaimPolicy)
+		}
+	}
+	if tick != nil {
+		if tick.reclaimPolicies == nil {
+			tick.reclaimPolicies = map[string]string{}
+		}
+		tick.reclaimPolicies[*name] = policy
+	}
+	return policy
+}
+
 // resizeState classifies a claim's resize progress from its observed status only.
 func resizeState(c *reconcile.ClaimObservation) (token, reason string) {
 	statuses := make([]string, 0, len(c.AllocatedResourceStatuses))

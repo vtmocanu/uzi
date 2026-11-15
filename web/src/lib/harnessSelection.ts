@@ -77,8 +77,9 @@ export function bothHarnessesUsable(claudeUsable: boolean, codexUsable: boolean)
 //     sole-Claude both resolve to Claude (D11 rules 3/4) in this usage-free answer; an
 //     eligible automatic creation with both usable may choose Codex by weekly limits (#3845).
 //
-// Used by every NOT-YET-CREATED start-dialog Anthropic TokenPicker gate (IssueView's
-// start dialog, Board/IssueCard's per-card picker, ScheduleModal's per-schedule picker),
+// Used by every NOT-YET-CREATED start-dialog Anthropic TokenPicker gate (the Run options
+// dialog on Board and IssueView through startRun.ts's startRunRows, ScheduleModal's
+// per-schedule picker),
 // each passing the caller's own usable default_harness (a user's for the two start
 // sites, a schedule's owner's for ScheduleModal) alongside the picker's live selection.
 // The EXISTING-run sites (RunView, PlanPanel, the "Switch token" action) do NOT call

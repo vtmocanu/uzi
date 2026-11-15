@@ -403,7 +403,8 @@ function PoweredBy({
 }
 
 function isNavActive(pathname: string, href: string): boolean {
-  return pathname === href || pathname.startsWith(href + "/");
+  return (pathname === "/overview/classic" && href === "/dashboard")
+    || pathname === href || pathname.startsWith(href + "/");
 }
 
 // forgeIcon picks a board entry's glyph from its connection's forge type
@@ -1374,8 +1375,8 @@ export function AppShell({ children }: { children: ReactNode }) {
 
       <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
         <div data-page-content-column={fullBleed ? undefined : ""} className={cx(!fullBleed && "mx-auto w-full max-w-[68rem]")}>
-          {/* Header slot (PRD #3878): a page that wants its header above the banners (the
-              /overview/next preview) portals it here through InShellHeader. Empty on every
+          {/* Header slot (PRD #3878, promoted by #3877): the default Overview at /dashboard
+              portals its header above the banners through InShellHeader. Empty on every
               other page, where `empty:hidden` leaves it out of layout. Its position, like
               the stack's, is fixed on every route, so neither remounts on navigation. */}
           <div ref={setHeaderSlot} className="empty:hidden" />

@@ -12,6 +12,76 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const acceptHibernationInventory = `-- name: AcceptHibernationInventory :execrows
+UPDATE worker_hibernation_inventories SET
+    status = 'accepted',
+    register_nonce = $1::text,
+    received_at = $2::timestamptz,
+    complete = $3::boolean,
+    entries = $4::jsonb,
+    receipt_keys = $5::jsonb,
+    digest = $6::text,
+    fingerprint = $7::text,
+    lane = $8::text,
+    mechanism = $9::text,
+    uncovered = $10::jsonb
+WHERE worker_id = $11 AND op_id = $12
+  AND pod_uid = $13::uuid
+  AND status = 'awaiting' AND invalidated_reason IS NULL
+`
+
+type AcceptHibernationInventoryParams struct {
+	RegisterNonce string             `json:"register_nonce"`
+	ReceivedAt    pgtype.Timestamptz `json:"received_at"`
+	Complete      bool               `json:"complete"`
+	Entries       []byte             `json:"entries"`
+	ReceiptKeys   []byte             `json:"receipt_keys"`
+	Digest        string             `json:"digest"`
+	Fingerprint   string             `json:"fingerprint"`
+	Lane          pgtype.Text        `json:"lane"`
+	Mechanism     pgtype.Text        `json:"mechanism"`
+	Uncovered     []byte             `json:"uncovered"`
+	WorkerID      uuid.UUID          `json:"worker_id"`
+	OpID          uuid.UUID          `json:"op_id"`
+	PodUid        uuid.UUID          `json:"pod_uid"`
+}
+
+// Bind the worker's echoed inventory. Zero rows means refused: the row is not awaiting, was
+// invalidated, or belongs to another op or pod.
+func (q *Queries) AcceptHibernationInventory(ctx context.Context, arg AcceptHibernationInventoryParams) (int64, error) {
+	result, err := q.db.Exec(ctx, acceptHibernationInventory,
+		arg.RegisterNonce,
+		arg.ReceivedAt,
+		arg.Complete,
+		arg.Entries,
+		arg.ReceiptKeys,
+		arg.Digest,
+		arg.Fingerprint,
+		arg.Lane,
+		arg.Mechanism,
+		arg.Uncovered,
+		arg.WorkerID,
+		arg.OpID,
+		arg.PodUid,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const countHibernationRetirementCandidates = `-- name: CountHibernationRetirementCandidates :one
+SELECT count(*) FROM workers
+WHERE hibernation_state IN ('hibernated', 'waking') AND kind = 'hosted' AND NOT ephemeral
+`
+
+func (q *Queries) CountHibernationRetirementCandidates(ctx context.Context) (int64, error) {
+	row := q.db.QueryRow(ctx, countHibernationRetirementCandidates)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const deleteHibernationWake = `-- name: DeleteHibernationWake :execrows
 DELETE FROM hibernation_wakes WHERE run_id = $1 AND worker_id = $2
 `
@@ -45,6 +115,145 @@ func (q *Queries) GetControllerHibernationAdvertisement(ctx context.Context) (Ge
 	row := q.db.QueryRow(ctx, getControllerHibernationAdvertisement)
 	var i GetControllerHibernationAdvertisementRow
 	err := row.Scan(&i.HibernationVersion, &i.HibernationAdvertisedAt, &i.PollIntervalSeconds)
+	return i, err
+}
+
+const getHibernationInventoryForOp = `-- name: GetHibernationInventoryForOp :one
+SELECT worker_id, op_id, observed_at, deployment_uid, deployment_resource_version, pod_uid, pvcs, register_nonce, received_at, status, status_reason, complete, entries, receipt_keys, digest, fingerprint, lane, mechanism, uncovered, invalidated_reason, invalidated_at, scaling_down_pod_uid, fence_generation, scaled_down_at, last_held_at, exclusion_final_at, exclusion_final_digest, exclusion_final_fingerprint FROM worker_hibernation_inventories
+WHERE worker_id = $1 AND op_id = $2
+`
+
+type GetHibernationInventoryForOpParams struct {
+	WorkerID uuid.UUID `json:"worker_id"`
+	OpID     uuid.UUID `json:"op_id"`
+}
+
+// The full row, entries included, for the evaluator and the accept path.
+func (q *Queries) GetHibernationInventoryForOp(ctx context.Context, arg GetHibernationInventoryForOpParams) (WorkerHibernationInventory, error) {
+	row := q.db.QueryRow(ctx, getHibernationInventoryForOp, arg.WorkerID, arg.OpID)
+	var i WorkerHibernationInventory
+	err := row.Scan(
+		&i.WorkerID,
+		&i.OpID,
+		&i.ObservedAt,
+		&i.DeploymentUid,
+		&i.DeploymentResourceVersion,
+		&i.PodUid,
+		&i.Pvcs,
+		&i.RegisterNonce,
+		&i.ReceivedAt,
+		&i.Status,
+		&i.StatusReason,
+		&i.Complete,
+		&i.Entries,
+		&i.ReceiptKeys,
+		&i.Digest,
+		&i.Fingerprint,
+		&i.Lane,
+		&i.Mechanism,
+		&i.Uncovered,
+		&i.InvalidatedReason,
+		&i.InvalidatedAt,
+		&i.ScalingDownPodUid,
+		&i.FenceGeneration,
+		&i.ScaledDownAt,
+		&i.LastHeldAt,
+		&i.ExclusionFinalAt,
+		&i.ExclusionFinalDigest,
+		&i.ExclusionFinalFingerprint,
+	)
+	return i, err
+}
+
+const getHibernationInventoryGateForOp = `-- name: GetHibernationInventoryGateForOp :one
+SELECT status, observed_at, invalidated_reason, pod_uid, register_nonce,
+       deployment_resource_version, pvcs
+FROM worker_hibernation_inventories
+WHERE worker_id = $1 AND op_id = $2
+`
+
+type GetHibernationInventoryGateForOpParams struct {
+	WorkerID uuid.UUID `json:"worker_id"`
+	OpID     uuid.UUID `json:"op_id"`
+}
+
+type GetHibernationInventoryGateForOpRow struct {
+	Status                    string             `json:"status"`
+	ObservedAt                pgtype.Timestamptz `json:"observed_at"`
+	InvalidatedReason         pgtype.Text        `json:"invalidated_reason"`
+	PodUid                    uuid.UUID          `json:"pod_uid"`
+	RegisterNonce             pgtype.Text        `json:"register_nonce"`
+	DeploymentResourceVersion string             `json:"deployment_resource_version"`
+	Pvcs                      []byte             `json:"pvcs"`
+}
+
+// The narrow row the poll snapshot and the settle gate read. Never selects entries.
+func (q *Queries) GetHibernationInventoryGateForOp(ctx context.Context, arg GetHibernationInventoryGateForOpParams) (GetHibernationInventoryGateForOpRow, error) {
+	row := q.db.QueryRow(ctx, getHibernationInventoryGateForOp, arg.WorkerID, arg.OpID)
+	var i GetHibernationInventoryGateForOpRow
+	err := row.Scan(
+		&i.Status,
+		&i.ObservedAt,
+		&i.InvalidatedReason,
+		&i.PodUid,
+		&i.RegisterNonce,
+		&i.DeploymentResourceVersion,
+		&i.Pvcs,
+	)
+	return i, err
+}
+
+const getHibernationInventoryStateForWorker = `-- name: GetHibernationInventoryStateForWorker :one
+SELECT worker_id, op_id, observed_at, deployment_uid, deployment_resource_version, pod_uid, pvcs,
+       register_nonce, status, invalidated_reason, scaling_down_pod_uid, fence_generation,
+       scaled_down_at, last_held_at, digest, fingerprint
+FROM worker_hibernation_inventories
+WHERE worker_id = $1
+`
+
+type GetHibernationInventoryStateForWorkerRow struct {
+	WorkerID                  uuid.UUID          `json:"worker_id"`
+	OpID                      uuid.UUID          `json:"op_id"`
+	ObservedAt                pgtype.Timestamptz `json:"observed_at"`
+	DeploymentUid             string             `json:"deployment_uid"`
+	DeploymentResourceVersion string             `json:"deployment_resource_version"`
+	PodUid                    uuid.UUID          `json:"pod_uid"`
+	Pvcs                      []byte             `json:"pvcs"`
+	RegisterNonce             pgtype.Text        `json:"register_nonce"`
+	Status                    string             `json:"status"`
+	InvalidatedReason         pgtype.Text        `json:"invalidated_reason"`
+	ScalingDownPodUid         pgtype.UUID        `json:"scaling_down_pod_uid"`
+	FenceGeneration           pgtype.Int8        `json:"fence_generation"`
+	ScaledDownAt              pgtype.Timestamptz `json:"scaled_down_at"`
+	LastHeldAt                pgtype.Timestamptz `json:"last_held_at"`
+	Digest                    pgtype.Text        `json:"digest"`
+	Fingerprint               pgtype.Text        `json:"fingerprint"`
+}
+
+// Everything the transition, register, accept and settle paths decide on, entries and receipt_keys
+// excluded so a locked transaction never drags a megabyte it does not need. Read by worker (the
+// primary key); the caller compares op_id with the worker's current hibernation_op_id.
+func (q *Queries) GetHibernationInventoryStateForWorker(ctx context.Context, workerID uuid.UUID) (GetHibernationInventoryStateForWorkerRow, error) {
+	row := q.db.QueryRow(ctx, getHibernationInventoryStateForWorker, workerID)
+	var i GetHibernationInventoryStateForWorkerRow
+	err := row.Scan(
+		&i.WorkerID,
+		&i.OpID,
+		&i.ObservedAt,
+		&i.DeploymentUid,
+		&i.DeploymentResourceVersion,
+		&i.PodUid,
+		&i.Pvcs,
+		&i.RegisterNonce,
+		&i.Status,
+		&i.InvalidatedReason,
+		&i.ScalingDownPodUid,
+		&i.FenceGeneration,
+		&i.ScaledDownAt,
+		&i.LastHeldAt,
+		&i.Digest,
+		&i.Fingerprint,
+	)
 	return i, err
 }
 
@@ -178,6 +387,148 @@ func (q *Queries) InsertWorkerHibernationEvent(ctx context.Context, arg InsertWo
 		arg.OccurredAt,
 	)
 	return err
+}
+
+const invalidateHibernationInventory = `-- name: InvalidateHibernationInventory :execrows
+UPDATE worker_hibernation_inventories SET
+    invalidated_reason = COALESCE(invalidated_reason, $1::text),
+    invalidated_at = COALESCE(invalidated_at, $2::timestamptz)
+WHERE worker_id = $3 AND op_id = $4
+`
+
+type InvalidateHibernationInventoryParams struct {
+	Reason   string             `json:"reason"`
+	At       pgtype.Timestamptz `json:"at"`
+	WorkerID uuid.UUID          `json:"worker_id"`
+	OpID     uuid.UUID          `json:"op_id"`
+}
+
+// Monotonic: the first reason and timestamp stick.
+func (q *Queries) InvalidateHibernationInventory(ctx context.Context, arg InvalidateHibernationInventoryParams) (int64, error) {
+	result, err := q.db.Exec(ctx, invalidateHibernationInventory,
+		arg.Reason,
+		arg.At,
+		arg.WorkerID,
+		arg.OpID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const listAwaitingHibernationInventoriesOlderThan = `-- name: ListAwaitingHibernationInventoriesOlderThan :many
+SELECT i.worker_id FROM worker_hibernation_inventories i
+JOIN workers w ON w.id = i.worker_id AND w.hibernation_op_id = i.op_id
+WHERE i.status = 'awaiting' AND i.observed_at < $1::timestamptz
+ORDER BY i.worker_id
+`
+
+// Candidates for the settle pass timeout; the pass re-checks on the locked row. Only a row of the
+// worker's CURRENT op is listed, so a stale-op row is not re-listed on every pass.
+func (q *Queries) ListAwaitingHibernationInventoriesOlderThan(ctx context.Context, cutoff pgtype.Timestamptz) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, listAwaitingHibernationInventoriesOlderThan, cutoff)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var worker_id uuid.UUID
+		if err := rows.Scan(&worker_id); err != nil {
+			return nil, err
+		}
+		items = append(items, worker_id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listHibernationCleanupWorkerIDs = `-- name: ListHibernationCleanupWorkerIDs :many
+SELECT id FROM workers
+WHERE cleanup_phase IN ('started', 'unknown')
+ORDER BY id
+`
+
+// Candidates for the cleanup reconcile step (PRD #4206): started attempts that may have timed out
+// and unknown attempts due a reconcile bump. The pass re-checks every predicate on the locked row.
+func (q *Queries) ListHibernationCleanupWorkerIDs(ctx context.Context) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, listHibernationCleanupWorkerIDs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listHibernationRetirementCandidates = `-- name: ListHibernationRetirementCandidates :many
+SELECT id, user_id, hibernation_state, hibernation_op_id, hibernated_at, manual_cordoned_at,
+       draining_since, maintenance_fenced, maintenance_phase, kind, docker_enabled, isolated_lane
+FROM workers
+WHERE hibernation_state IN ('hibernated', 'waking') AND kind = 'hosted' AND NOT ephemeral
+ORDER BY hibernated_at ASC NULLS LAST, id ASC
+LIMIT $1::int
+`
+
+type ListHibernationRetirementCandidatesRow struct {
+	ID                uuid.UUID          `json:"id"`
+	UserID            uuid.UUID          `json:"user_id"`
+	HibernationState  string             `json:"hibernation_state"`
+	HibernationOpID   pgtype.UUID        `json:"hibernation_op_id"`
+	HibernatedAt      pgtype.Timestamptz `json:"hibernated_at"`
+	ManualCordonedAt  pgtype.Timestamptz `json:"manual_cordoned_at"`
+	DrainingSince     pgtype.Timestamptz `json:"draining_since"`
+	MaintenanceFenced bool               `json:"maintenance_fenced"`
+	MaintenancePhase  string             `json:"maintenance_phase"`
+	Kind              string             `json:"kind"`
+	DockerEnabled     pgtype.Bool        `json:"docker_enabled"`
+	IsolatedLane      bool               `json:"isolated_lane"`
+}
+
+func (q *Queries) ListHibernationRetirementCandidates(ctx context.Context, rowLimit int32) ([]ListHibernationRetirementCandidatesRow, error) {
+	rows, err := q.db.Query(ctx, listHibernationRetirementCandidates, rowLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListHibernationRetirementCandidatesRow{}
+	for rows.Next() {
+		var i ListHibernationRetirementCandidatesRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.UserID,
+			&i.HibernationState,
+			&i.HibernationOpID,
+			&i.HibernatedAt,
+			&i.ManualCordonedAt,
+			&i.DrainingSince,
+			&i.MaintenanceFenced,
+			&i.MaintenancePhase,
+			&i.Kind,
+			&i.DockerEnabled,
+			&i.IsolatedLane,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const listHibernationWakeDemand = `-- name: ListHibernationWakeDemand :many
@@ -396,10 +747,14 @@ func (q *Queries) ListStaleHibernationWakes(ctx context.Context, maxRows int32) 
 const listStalePreparingWorkerIDs = `-- name: ListStalePreparingWorkerIDs :many
 SELECT id FROM workers
 WHERE hibernation_state = 'preparing' AND hibernation_requested_at < $1
+  AND cleanup_phase NOT IN ('started', 'unknown')
+  AND (cleanup_settled_at IS NULL OR cleanup_settled_at < $1)
 ORDER BY id
 `
 
-// Candidates only: the pass re-checks the predicate on the locked row.
+// Candidates only: the pass re-checks the predicate on the locked row. The deadline is measured
+// from the later of the request and the cleanup settlement, and is suspended while an attempt is
+// started or unknown (PRD #4206).
 func (q *Queries) ListStalePreparingWorkerIDs(ctx context.Context, cutoff pgtype.Timestamptz) ([]uuid.UUID, error) {
 	rows, err := q.db.Query(ctx, listStalePreparingWorkerIDs, cutoff)
 	if err != nil {
@@ -413,6 +768,66 @@ func (q *Queries) ListStalePreparingWorkerIDs(ctx context.Context, cutoff pgtype
 			return nil, err
 		}
 		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listValidCaptureReceipts = `-- name: ListValidCaptureReceipts :many
+SELECT DISTINCT want.run_id::uuid AS run_id, want.source_sha::text AS source_sha
+FROM (
+    SELECT r.run_id, s.source_sha
+    FROM unnest($1::uuid[]) WITH ORDINALITY AS r(run_id, n)
+    JOIN unnest($2::text[]) WITH ORDINALITY AS s(source_sha, n) ON s.n = r.n
+    -- Mismatched array lengths pair nothing rather than silently pairing a prefix.
+    WHERE cardinality($1::uuid[]) = cardinality($2::text[])
+) AS want
+JOIN recovery_captures c ON c.run_id = want.run_id AND c.source_sha = want.source_sha
+WHERE c.user_id = $3::uuid
+  AND c.state = 'available'
+  AND c.manifest_bound
+  AND c.expires_at > now()
+  AND (
+    COALESCE(cardinality(c.prerequisite_shas), 0) = 0
+    OR EXISTS (
+        SELECT 1 FROM recovery_prerequisite_closures pc
+        WHERE pc.capture_id = c.id AND pc.hold_id = c.hold_id AND pc.state = 'pinned'
+          AND pc.absent_since IS NULL AND pc.checksum = c.checksum
+          AND pc.prerequisite_shas = c.prerequisite_shas
+    )
+  )
+ORDER BY 1, 2
+`
+
+type ListValidCaptureReceiptsParams struct {
+	RunIds     []uuid.UUID `json:"run_ids"`
+	SourceShas []string    `json:"source_shas"`
+	UserID     uuid.UUID   `json:"user_id"`
+}
+
+type ListValidCaptureReceiptsRow struct {
+	RunID     uuid.UUID `json:"run_id"`
+	SourceSha string    `json:"source_sha"`
+}
+
+// (run_id, source_sha) pairs for which an available, manifest-bound, unexpired capture of exactly
+// that source exists for the worker's own user (another user's capture never satisfies the entry), and whose thin-bundle prerequisites (when any) have an exactly bound, still-pinned closure (the rule
+// ProtectFinalClosureCapture applies).
+func (q *Queries) ListValidCaptureReceipts(ctx context.Context, arg ListValidCaptureReceiptsParams) ([]ListValidCaptureReceiptsRow, error) {
+	rows, err := q.db.Query(ctx, listValidCaptureReceipts, arg.RunIds, arg.SourceShas, arg.UserID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListValidCaptureReceiptsRow{}
+	for rows.Next() {
+		var i ListValidCaptureReceiptsRow
+		if err := rows.Scan(&i.RunID, &i.SourceSha); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -472,6 +887,114 @@ func (q *Queries) ListWorkersToWakeOnDisable(ctx context.Context, maxRows int32)
 	return items, nil
 }
 
+const listWorkersWithActivePublicationResumeCustody = `-- name: ListWorkersWithActivePublicationResumeCustody :many
+SELECT DISTINCT worker_id::uuid AS worker_id FROM run_publication_resume
+WHERE state = 'active' AND worker_id = ANY($1::uuid[])
+ORDER BY 1
+`
+
+func (q *Queries) ListWorkersWithActivePublicationResumeCustody(ctx context.Context, workerIds []uuid.UUID) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, listWorkersWithActivePublicationResumeCustody, workerIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var worker_id uuid.UUID
+		if err := rows.Scan(&worker_id); err != nil {
+			return nil, err
+		}
+		items = append(items, worker_id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listWorkersWithLocalReplicaCaptures = `-- name: ListWorkersWithLocalReplicaCaptures :many
+SELECT DISTINCT local_replica_worker_id::uuid AS worker_id FROM recovery_captures
+WHERE local_replica_worker_id = ANY($1::uuid[])
+ORDER BY 1
+`
+
+// Workers named as the local replica of some recovery capture.
+func (q *Queries) ListWorkersWithLocalReplicaCaptures(ctx context.Context, workerIds []uuid.UUID) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, listWorkersWithLocalReplicaCaptures, workerIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var worker_id uuid.UUID
+		if err := rows.Scan(&worker_id); err != nil {
+			return nil, err
+		}
+		items = append(items, worker_id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listWorkersWithNonTerminalRuns = `-- name: ListWorkersWithNonTerminalRuns :many
+SELECT DISTINCT worker_id::uuid AS worker_id FROM runs
+WHERE worker_id = ANY($1::uuid[])
+  AND status NOT IN ('completed', 'failed', 'cancelled')
+ORDER BY 1
+`
+
+// The same predicate as CountWorkerNonTerminalRuns (without its user scope), batched.
+func (q *Queries) ListWorkersWithNonTerminalRuns(ctx context.Context, workerIds []uuid.UUID) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, listWorkersWithNonTerminalRuns, workerIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var worker_id uuid.UUID
+		if err := rows.Scan(&worker_id); err != nil {
+			return nil, err
+		}
+		items = append(items, worker_id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listWorkersWithOpenCustodyHolds = `-- name: ListWorkersWithOpenCustodyHolds :many
+SELECT DISTINCT live_worker_id::uuid AS worker_id FROM recovery_custody_holds
+WHERE state = 'open' AND live_worker_id = ANY($1::uuid[])
+ORDER BY 1
+`
+
+// The same predicate as WorkerHasOpenCustodyHold, batched.
+func (q *Queries) ListWorkersWithOpenCustodyHolds(ctx context.Context, workerIds []uuid.UUID) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, listWorkersWithOpenCustodyHolds, workerIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var worker_id uuid.UUID
+		if err := rows.Scan(&worker_id); err != nil {
+			return nil, err
+		}
+		items = append(items, worker_id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const lockRunForShare = `-- name: LockRunForShare :one
 SELECT status FROM runs WHERE id = $1 FOR SHARE
 `
@@ -483,6 +1006,117 @@ func (q *Queries) LockRunForShare(ctx context.Context, id uuid.UUID) (string, er
 	var status string
 	err := row.Scan(&status)
 	return status, err
+}
+
+const recordHibernationExclusionFinal = `-- name: RecordHibernationExclusionFinal :execrows
+UPDATE worker_hibernation_inventories SET
+    exclusion_final_at = COALESCE(exclusion_final_at, $1::timestamptz),
+    exclusion_final_digest = COALESCE(exclusion_final_digest, $2::text),
+    exclusion_final_fingerprint = COALESCE(exclusion_final_fingerprint, $3::text)
+WHERE worker_id = $4 AND op_id = $5
+`
+
+type RecordHibernationExclusionFinalParams struct {
+	At          pgtype.Timestamptz `json:"at"`
+	Digest      string             `json:"digest"`
+	Fingerprint string             `json:"fingerprint"`
+	WorkerID    uuid.UUID          `json:"worker_id"`
+	OpID        uuid.UUID          `json:"op_id"`
+}
+
+// Set once: the first final report sticks.
+func (q *Queries) RecordHibernationExclusionFinal(ctx context.Context, arg RecordHibernationExclusionFinalParams) (int64, error) {
+	result, err := q.db.Exec(ctx, recordHibernationExclusionFinal,
+		arg.At,
+		arg.Digest,
+		arg.Fingerprint,
+		arg.WorkerID,
+		arg.OpID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const recordHibernationInventoryHeld = `-- name: RecordHibernationInventoryHeld :execrows
+UPDATE worker_hibernation_inventories SET
+    last_held_at = GREATEST(COALESCE(last_held_at, $1::timestamptz), $1::timestamptz)
+WHERE worker_id = $2 AND op_id = $3
+`
+
+type RecordHibernationInventoryHeldParams struct {
+	LastHeldAt pgtype.Timestamptz `json:"last_held_at"`
+	WorkerID   uuid.UUID          `json:"worker_id"`
+	OpID       uuid.UUID          `json:"op_id"`
+}
+
+// The worker reported it still holds exclusion. Never moves the stamp backwards.
+func (q *Queries) RecordHibernationInventoryHeld(ctx context.Context, arg RecordHibernationInventoryHeldParams) (int64, error) {
+	result, err := q.db.Exec(ctx, recordHibernationInventoryHeld, arg.LastHeldAt, arg.WorkerID, arg.OpID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const recordHibernationInventoryScaleDown = `-- name: RecordHibernationInventoryScaleDown :execrows
+UPDATE worker_hibernation_inventories SET
+    scaling_down_pod_uid = COALESCE(scaling_down_pod_uid, $1::uuid),
+    fence_generation = COALESCE(fence_generation, $2::bigint),
+    last_held_at = GREATEST(last_held_at, $3::timestamptz)
+WHERE worker_id = $4 AND op_id = $5
+`
+
+type RecordHibernationInventoryScaleDownParams struct {
+	ScalingDownPodUid pgtype.UUID        `json:"scaling_down_pod_uid"`
+	FenceGeneration   pgtype.Int8        `json:"fence_generation"`
+	LastHeldAt        pgtype.Timestamptz `json:"last_held_at"`
+	WorkerID          uuid.UUID          `json:"worker_id"`
+	OpID              uuid.UUID          `json:"op_id"`
+}
+
+// The controller reported scaling_down for this pod. The first pod uid and fence generation stick.
+func (q *Queries) RecordHibernationInventoryScaleDown(ctx context.Context, arg RecordHibernationInventoryScaleDownParams) (int64, error) {
+	result, err := q.db.Exec(ctx, recordHibernationInventoryScaleDown,
+		arg.ScalingDownPodUid,
+		arg.FenceGeneration,
+		arg.LastHeldAt,
+		arg.WorkerID,
+		arg.OpID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const recordHibernationInventoryScaledDown = `-- name: RecordHibernationInventoryScaledDown :execrows
+UPDATE worker_hibernation_inventories SET
+    scaled_down_at = COALESCE(scaled_down_at, $1::timestamptz),
+    last_held_at = GREATEST(last_held_at, $2::timestamptz)
+WHERE worker_id = $3 AND op_id = $4
+`
+
+type RecordHibernationInventoryScaledDownParams struct {
+	ScaledDownAt pgtype.Timestamptz `json:"scaled_down_at"`
+	LastHeldAt   pgtype.Timestamptz `json:"last_held_at"`
+	WorkerID     uuid.UUID          `json:"worker_id"`
+	OpID         uuid.UUID          `json:"op_id"`
+}
+
+// scaled_down_at is set once; last_held_at never moves backwards.
+func (q *Queries) RecordHibernationInventoryScaledDown(ctx context.Context, arg RecordHibernationInventoryScaledDownParams) (int64, error) {
+	result, err := q.db.Exec(ctx, recordHibernationInventoryScaledDown,
+		arg.ScaledDownAt,
+		arg.LastHeldAt,
+		arg.WorkerID,
+		arg.OpID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const runHasWakingHibernationWake = `-- name: RunHasWakingHibernationWake :one
@@ -506,6 +1140,35 @@ func (q *Queries) RunHasWakingHibernationWake(ctx context.Context, runID uuid.UU
 	return waking, err
 }
 
+const setHibernationInventoryStatus = `-- name: SetHibernationInventoryStatus :execrows
+UPDATE worker_hibernation_inventories SET
+    status = $1::text,
+    status_reason = $2::text
+WHERE worker_id = $3 AND op_id = $4 AND status = 'awaiting'
+`
+
+type SetHibernationInventoryStatusParams struct {
+	Status       string      `json:"status"`
+	StatusReason pgtype.Text `json:"status_reason"`
+	WorkerID     uuid.UUID   `json:"worker_id"`
+	OpID         uuid.UUID   `json:"op_id"`
+}
+
+// A worker-reported non-inventory status, a timeout, a missing capability or a scale-down that
+// closed the window. Only an awaiting row moves.
+func (q *Queries) SetHibernationInventoryStatus(ctx context.Context, arg SetHibernationInventoryStatusParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setHibernationInventoryStatus,
+		arg.Status,
+		arg.StatusReason,
+		arg.WorkerID,
+		arg.OpID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const upsertControllerHibernationAdvertisement = `-- name: UpsertControllerHibernationAdvertisement :exec
 INSERT INTO controller_report_status (id, observed_at, hibernation_version, hibernation_advertised_at, poll_interval_seconds)
 VALUES (1, $1, $2, $1, $3)
@@ -527,6 +1190,112 @@ type UpsertControllerHibernationAdvertisementParams struct {
 func (q *Queries) UpsertControllerHibernationAdvertisement(ctx context.Context, arg UpsertControllerHibernationAdvertisementParams) error {
 	_, err := q.db.Exec(ctx, upsertControllerHibernationAdvertisement, arg.AdvertisedAt, arg.HibernationVersion, arg.PollIntervalSeconds)
 	return err
+}
+
+const upsertHibernationInventoryObserved = `-- name: UpsertHibernationInventoryObserved :one
+
+INSERT INTO worker_hibernation_inventories (
+    worker_id, op_id, observed_at, deployment_uid, deployment_resource_version, pod_uid, pvcs, status, status_reason
+) VALUES (
+    $1, $2, $3, $4, $5, $6, $7::jsonb, $8::text,
+    $9::text
+)
+ON CONFLICT (worker_id) DO UPDATE SET
+    op_id = EXCLUDED.op_id,
+    observed_at = EXCLUDED.observed_at,
+    deployment_uid = EXCLUDED.deployment_uid,
+    deployment_resource_version = EXCLUDED.deployment_resource_version,
+    pod_uid = EXCLUDED.pod_uid,
+    pvcs = EXCLUDED.pvcs,
+    status = EXCLUDED.status,
+    status_reason = EXCLUDED.status_reason,
+    register_nonce = NULL,
+    received_at = NULL,
+    complete = NULL,
+    entries = NULL,
+    receipt_keys = NULL,
+    digest = NULL,
+    fingerprint = NULL,
+    lane = NULL,
+    mechanism = NULL,
+    uncovered = NULL,
+    invalidated_reason = NULL,
+    invalidated_at = NULL,
+    scaling_down_pod_uid = NULL,
+    fence_generation = NULL,
+    scaled_down_at = NULL,
+    last_held_at = NULL,
+    exclusion_final_at = NULL,
+    exclusion_final_digest = NULL,
+    exclusion_final_fingerprint = NULL
+RETURNING worker_id, op_id, observed_at, deployment_uid, deployment_resource_version, pod_uid, pvcs, register_nonce, received_at, status, status_reason, complete, entries, receipt_keys, digest, fingerprint, lane, mechanism, uncovered, invalidated_reason, invalidated_at, scaling_down_pod_uid, fence_generation, scaled_down_at, last_held_at, exclusion_final_at, exclusion_final_digest, exclusion_final_fingerprint
+`
+
+type UpsertHibernationInventoryObservedParams struct {
+	WorkerID                  uuid.UUID          `json:"worker_id"`
+	OpID                      uuid.UUID          `json:"op_id"`
+	ObservedAt                pgtype.Timestamptz `json:"observed_at"`
+	DeploymentUid             string             `json:"deployment_uid"`
+	DeploymentResourceVersion string             `json:"deployment_resource_version"`
+	PodUid                    uuid.UUID          `json:"pod_uid"`
+	Pvcs                      []byte             `json:"pvcs"`
+	Status                    string             `json:"status"`
+	StatusReason              pgtype.Text        `json:"status_reason"`
+}
+
+// ---------------------------------------------------------------------------
+// PRD #4208 M1: worker_hibernation_inventories (migration 00456).
+// Every write to worker_hibernation_inventories runs in a transaction that already holds the
+// workers row lock (GetWorkerForUpdate); lock order workers -> inventory. The reads below that
+// take a worker-id list are batched and unlocked: they feed the dry-run report, which only
+// reports and never deletes anything.
+// ---------------------------------------------------------------------------
+// Start (or restart) the inventory for the worker's current op: every column is replaced and the
+// inventory and validity columns are NULLed, so a new op never inherits an older op's entries.
+func (q *Queries) UpsertHibernationInventoryObserved(ctx context.Context, arg UpsertHibernationInventoryObservedParams) (WorkerHibernationInventory, error) {
+	row := q.db.QueryRow(ctx, upsertHibernationInventoryObserved,
+		arg.WorkerID,
+		arg.OpID,
+		arg.ObservedAt,
+		arg.DeploymentUid,
+		arg.DeploymentResourceVersion,
+		arg.PodUid,
+		arg.Pvcs,
+		arg.Status,
+		arg.StatusReason,
+	)
+	var i WorkerHibernationInventory
+	err := row.Scan(
+		&i.WorkerID,
+		&i.OpID,
+		&i.ObservedAt,
+		&i.DeploymentUid,
+		&i.DeploymentResourceVersion,
+		&i.PodUid,
+		&i.Pvcs,
+		&i.RegisterNonce,
+		&i.ReceivedAt,
+		&i.Status,
+		&i.StatusReason,
+		&i.Complete,
+		&i.Entries,
+		&i.ReceiptKeys,
+		&i.Digest,
+		&i.Fingerprint,
+		&i.Lane,
+		&i.Mechanism,
+		&i.Uncovered,
+		&i.InvalidatedReason,
+		&i.InvalidatedAt,
+		&i.ScalingDownPodUid,
+		&i.FenceGeneration,
+		&i.ScaledDownAt,
+		&i.LastHeldAt,
+		&i.ExclusionFinalAt,
+		&i.ExclusionFinalDigest,
+		&i.ExclusionFinalFingerprint,
+	)
+	return i, err
 }
 
 const workerHasOpenCustodyHold = `-- name: WorkerHasOpenCustodyHold :one
@@ -578,9 +1347,22 @@ UPDATE workers SET
     wake_ready_pod_uid = $11,
     wake_ready_resource_version = $12,
     wake_register_op_id = $13,
-    wake_register_pod_uid = $14
-WHERE id = $15
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason, hibernation_state, hibernation_op_id, hibernation_requested_at, hibernated_at, wake_requested_at, wake_error, hibernation_reason, hibernation_admission_pod_uid, hibernation_scaling_down_at, wake_ready_op_id, wake_ready_pod_uid, wake_ready_resource_version, wake_register_op_id, wake_register_pod_uid, credential_switch_apply_nonce
+    wake_register_pod_uid = $14,
+    hibernation_cleanup = $15,
+    hibernation_cleanup_reason = $16,
+    cleanup_op_id = $17,
+    cleanup_phase = $18::text,
+    cleanup_register_nonce = $19,
+    cleanup_pod_uid = $20,
+    cleanup_requested_at = $21,
+    cleanup_started_at = $22,
+    cleanup_unknown_at = $23,
+    cleanup_settled_at = $24,
+    cleanup_cancel_requested = $25::boolean,
+    cleanup_reconcile_seq = $26::int,
+    cleanup_reconciled_at = $27
+WHERE id = $28
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason, hibernation_state, hibernation_op_id, hibernation_requested_at, hibernated_at, wake_requested_at, wake_error, hibernation_reason, hibernation_admission_pod_uid, hibernation_scaling_down_at, wake_ready_op_id, wake_ready_pod_uid, wake_ready_resource_version, wake_register_op_id, wake_register_pod_uid, credential_switch_apply_nonce, hibernation_cleanup, hibernation_cleanup_reason, cleanup_op_id, cleanup_phase, cleanup_register_nonce, cleanup_pod_uid, cleanup_requested_at, cleanup_started_at, cleanup_unknown_at, cleanup_settled_at, cleanup_cancel_requested, cleanup_reconcile_seq, cleanup_reconciled_at
 `
 
 type WriteWorkerHibernationParams struct {
@@ -598,6 +1380,19 @@ type WriteWorkerHibernationParams struct {
 	WakeReadyResourceVersion   pgtype.Text        `json:"wake_ready_resource_version"`
 	WakeRegisterOpID           pgtype.UUID        `json:"wake_register_op_id"`
 	WakeRegisterPodUid         pgtype.UUID        `json:"wake_register_pod_uid"`
+	HibernationCleanup         pgtype.Text        `json:"hibernation_cleanup"`
+	HibernationCleanupReason   pgtype.Text        `json:"hibernation_cleanup_reason"`
+	CleanupOpID                pgtype.UUID        `json:"cleanup_op_id"`
+	CleanupPhase               string             `json:"cleanup_phase"`
+	CleanupRegisterNonce       pgtype.Text        `json:"cleanup_register_nonce"`
+	CleanupPodUid              pgtype.UUID        `json:"cleanup_pod_uid"`
+	CleanupRequestedAt         pgtype.Timestamptz `json:"cleanup_requested_at"`
+	CleanupStartedAt           pgtype.Timestamptz `json:"cleanup_started_at"`
+	CleanupUnknownAt           pgtype.Timestamptz `json:"cleanup_unknown_at"`
+	CleanupSettledAt           pgtype.Timestamptz `json:"cleanup_settled_at"`
+	CleanupCancelRequested     bool               `json:"cleanup_cancel_requested"`
+	CleanupReconcileSeq        int32              `json:"cleanup_reconcile_seq"`
+	CleanupReconciledAt        pgtype.Timestamptz `json:"cleanup_reconciled_at"`
 	ID                         uuid.UUID          `json:"id"`
 }
 
@@ -623,6 +1418,19 @@ func (q *Queries) WriteWorkerHibernation(ctx context.Context, arg WriteWorkerHib
 		arg.WakeReadyResourceVersion,
 		arg.WakeRegisterOpID,
 		arg.WakeRegisterPodUid,
+		arg.HibernationCleanup,
+		arg.HibernationCleanupReason,
+		arg.CleanupOpID,
+		arg.CleanupPhase,
+		arg.CleanupRegisterNonce,
+		arg.CleanupPodUid,
+		arg.CleanupRequestedAt,
+		arg.CleanupStartedAt,
+		arg.CleanupUnknownAt,
+		arg.CleanupSettledAt,
+		arg.CleanupCancelRequested,
+		arg.CleanupReconcileSeq,
+		arg.CleanupReconciledAt,
 		arg.ID,
 	)
 	var i Worker
@@ -716,6 +1524,19 @@ func (q *Queries) WriteWorkerHibernation(ctx context.Context, arg WriteWorkerHib
 		&i.WakeRegisterOpID,
 		&i.WakeRegisterPodUid,
 		&i.CredentialSwitchApplyNonce,
+		&i.HibernationCleanup,
+		&i.HibernationCleanupReason,
+		&i.CleanupOpID,
+		&i.CleanupPhase,
+		&i.CleanupRegisterNonce,
+		&i.CleanupPodUid,
+		&i.CleanupRequestedAt,
+		&i.CleanupStartedAt,
+		&i.CleanupUnknownAt,
+		&i.CleanupSettledAt,
+		&i.CleanupCancelRequested,
+		&i.CleanupReconcileSeq,
+		&i.CleanupReconciledAt,
 	)
 	return i, err
 }

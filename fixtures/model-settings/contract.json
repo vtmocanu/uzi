@@ -66,6 +66,16 @@
       "label": "cross-check default"
     },
     {
+      "field": "model",
+      "token": "run_override",
+      "label": "this run"
+    },
+    {
+      "field": "effort",
+      "token": "run_override",
+      "label": "this run"
+    },
+    {
       "field": "harness",
       "token": "run_override",
       "label": "your choice for this run"

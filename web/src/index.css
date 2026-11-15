@@ -410,7 +410,7 @@ body {
   }
 }
 
-/* The flowing segment into a live station of the Overview preview's issue-work line
+/* The flowing segment into a live station of the default Overview's issue-work line
    (PRD #3879): a dashed run in the station's tone (--tone, set per station) drifting
    toward it. Segments show only from md up, where the line is horizontal. Declared
    above the reduced-motion block below on purpose: both are unlayered with equal

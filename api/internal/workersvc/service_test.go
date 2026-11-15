@@ -204,10 +204,12 @@ type fakeStore struct {
 	// PRD #1732 D14: claimSecretDisabled is what the finisher's enablement re-check reads for
 	// the resolved credential; claimSecretLockErrs is consumed one per re-check (55P03
 	// staging); claimCredParked records the COMMITTED credential_disabled park.
-	claimSecretDisabled bool
-	claimSecretLockErrs []error
-	claimSecretChecks   int
-	claimCredParked     *store.ParkCredentialDisabledRunParams
+	claimSecretDisabled   bool
+	claimSecretLockErrs   []error
+	claimSecretChecks     int
+	claimCredParked       *store.ParkCredentialDisabledRunParams
+	claimOverrideParked   *store.ParkRunOverrideUnavailableRunParams
+	claimOverrideMessages []store.InsertRunOverrideUnavailableMessageParams
 	// hasActiveRunForIssue is what the CreateRun dedup pre-check returns (PRD #754 M4);
 	// hasActiveRunForIssueErr forces its error path.
 	hasActiveRunForIssue    bool
@@ -617,6 +619,9 @@ type fakeStore struct {
 	listActiveErr      error
 	deleteWorkerRows   int64
 	deleteWorkerParams *store.DeleteWorkerForUserParams
+	// deleteWorkerRow is the row GetWorkerByIDForUser serves after a 0-row delete (PRD #4206: the
+	// guard that tells "not found" from "hibernation cleanup unsettled"); nil reads as no row.
+	deleteWorkerRow *store.Worker
 	// PRD #529 M4 ephemeral teardown: delEphemeralRuns is the rows-affected the fake
 	// reports (defaults to 0); delEphemeralArg captures the run id passed, nil until the
 	// teardown query is reached — so a test can assert the SetState hook fired (or did
@@ -1909,6 +1914,12 @@ func (f *fakeStore) ListWorkerNonTerminalRuns(_ context.Context, arg store.ListW
 func (f *fakeStore) DeleteWorkerForUser(_ context.Context, arg store.DeleteWorkerForUserParams) (int64, error) {
 	f.deleteWorkerParams = &arg
 	return f.deleteWorkerRows, nil
+}
+func (f *fakeStore) GetWorkerByIDForUser(context.Context, store.GetWorkerByIDForUserParams) (store.Worker, error) {
+	if f.deleteWorkerRow == nil {
+		return store.Worker{}, pgx.ErrNoRows
+	}
+	return *f.deleteWorkerRow, nil
 }
 func (f *fakeStore) DeleteEphemeralWorkerForRun(_ context.Context, arg store.DeleteEphemeralWorkerForRunParams) (int64, error) {
 	f.delEphemeralArg = &arg.RunID
@@ -5081,7 +5092,7 @@ func TestCreateRunSnapshotsTitleAndRunsWithoutPRDLink(t *testing.T) {
 		createRunResult: store.Run{ID: uuid.New()},
 	}
 	svc := New(fs, newBox(t), testParams())
-	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "the description", nil, nil, false, nil, nil, nil, nil); err != nil {
+	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "the description", nil, nil, false, nil, nil, nil, nil, nil, nil); err != nil {
 		t.Fatalf("CreateRun: %v", err)
 	}
 	if fs.createRunParams == nil {
@@ -5113,7 +5124,7 @@ func TestCreateRunOpenMRGuard(t *testing.T) {
 			createRunResult:   store.Run{ID: uuid.New()},
 		}
 		svc := New(fs, newBox(t), testParams())
-		_, err := svc.CreateRun(context.Background(), user, repo, 4, "the description", nil, nil, false /*force*/, nil, nil, nil, nil)
+		_, err := svc.CreateRun(context.Background(), user, repo, 4, "the description", nil, nil, false /*force*/, nil, nil, nil, nil, nil, nil)
 		if !errors.Is(err, ErrOpenMRExists) {
 			t.Fatalf("CreateRun err = %v, want ErrOpenMRExists", err)
 		}
@@ -5138,7 +5149,7 @@ func TestCreateRunOpenMRGuard(t *testing.T) {
 			createRunResult:   store.Run{ID: uuid.New()},
 		}
 		svc := New(fs, newBox(t), testParams())
-		_, err := svc.CreateRun(context.Background(), user, repo, 4, "the description", nil, nil, true /*force*/, nil, nil, nil, nil)
+		_, err := svc.CreateRun(context.Background(), user, repo, 4, "the description", nil, nil, true /*force*/, nil, nil, nil, nil, nil, nil)
 		if errors.Is(err, ErrOpenMRExists) {
 			t.Fatalf("CreateRun with force=true err = %v, must NOT be ErrOpenMRExists (guard bypassed)", err)
 		}
@@ -5188,7 +5199,7 @@ func TestCreateAutopilotRunSetsAutoApproveAndSharesGates(t *testing.T) {
 		createRunResult: store.Run{ID: uuid.New()},
 	}
 	svc = New(fsManual, newBox(t), testParams())
-	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "d", nil, nil, false, nil, nil, nil, nil); err != nil {
+	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "d", nil, nil, false, nil, nil, nil, nil, nil, nil); err != nil {
 		t.Fatalf("CreateRun: %v", err)
 	}
 	if fsManual.createRunParams.AutoApprove {
@@ -5255,7 +5266,7 @@ func TestCreateRunRejectsOversizeDescription(t *testing.T) {
 
 	// Manual and autopilot both reject at the one shared cap, before any run is made.
 	fs := &fakeStore{issueByID: store.Issue{Title: "T", Labels: uziLabels(), HasPrdLink: true}}
-	if _, err := New(fs, newBox(t), testParams()).CreateRun(context.Background(), user, repo, 4, big, nil, nil, false, nil, nil, nil, nil); err != ErrDescriptionTooLarge {
+	if _, err := New(fs, newBox(t), testParams()).CreateRun(context.Background(), user, repo, 4, big, nil, nil, false, nil, nil, nil, nil, nil, nil); err != ErrDescriptionTooLarge {
 		t.Fatalf("CreateRun err = %v, want ErrDescriptionTooLarge", err)
 	}
 	if fs.createRunParams != nil {
@@ -5270,7 +5281,7 @@ func TestCreateRunRejectsOversizeDescription(t *testing.T) {
 	// Exactly at the cap is accepted (boundary).
 	ok := strings.Repeat("x", MaxIssueDescriptionBytes)
 	fsOK := &fakeStore{issueByID: store.Issue{Title: "T", Labels: uziLabels(), HasPrdLink: true}, createRunResult: store.Run{ID: uuid.New()}}
-	if _, err := New(fsOK, newBox(t), testParams()).CreateRun(context.Background(), user, repo, 4, ok, nil, nil, false, nil, nil, nil, nil); err != nil {
+	if _, err := New(fsOK, newBox(t), testParams()).CreateRun(context.Background(), user, repo, 4, ok, nil, nil, false, nil, nil, nil, nil, nil, nil); err != nil {
 		t.Fatalf("a description exactly at the cap must be accepted, got %v", err)
 	}
 }
@@ -5282,7 +5293,7 @@ func TestCreateRunMapsDuplicateToActiveRunExists(t *testing.T) {
 		createRunErr: &pgconn.PgError{Code: "23505"},
 	}
 	svc := New(fs, newBox(t), testParams())
-	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "d", nil, nil, false, nil, nil, nil, nil); err != ErrActiveRunExists {
+	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "d", nil, nil, false, nil, nil, nil, nil, nil, nil); err != ErrActiveRunExists {
 		t.Fatalf("err = %v, want ErrActiveRunExists", err)
 	}
 }
@@ -5301,7 +5312,7 @@ func TestCreateRunPreCheckBlocksDuplicateOnHeldIssue(t *testing.T) {
 		createRunResult:      store.Run{ID: uuid.New()},
 	}
 	svc := New(fs, newBox(t), testParams())
-	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "d", nil, nil, false, nil, nil, nil, nil); err != ErrActiveRunExists {
+	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "d", nil, nil, false, nil, nil, nil, nil, nil, nil); err != ErrActiveRunExists {
 		t.Fatalf("err = %v, want ErrActiveRunExists — the pre-check must refuse a second run on a held issue", err)
 	}
 }
@@ -5317,7 +5328,7 @@ func TestCreateRunPreCheckErrorPropagates(t *testing.T) {
 		createRunResult:         store.Run{ID: uuid.New()},
 	}
 	svc := New(fs, newBox(t), testParams())
-	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "d", nil, nil, false, nil, nil, nil, nil); !errors.Is(err, sentinel) {
+	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "d", nil, nil, false, nil, nil, nil, nil, nil, nil); !errors.Is(err, sentinel) {
 		t.Fatalf("err = %v, want the pre-check error to propagate", err)
 	}
 }
@@ -5325,7 +5336,7 @@ func TestCreateRunPreCheckErrorPropagates(t *testing.T) {
 func TestCreateRunRepoNotOwned(t *testing.T) {
 	fs := &fakeStore{repoErr: pgx.ErrNoRows}
 	svc := New(fs, newBox(t), testParams())
-	if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "d", nil, nil, false, nil, nil, nil, nil); err != ErrRepoNotFound {
+	if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "d", nil, nil, false, nil, nil, nil, nil, nil, nil); err != ErrRepoNotFound {
 		t.Fatalf("err = %v, want ErrRepoNotFound", err)
 	}
 }
@@ -5416,6 +5427,27 @@ func TestDeleteWorkerNotFoundWhenNoRowDeleted(t *testing.T) {
 	svc := New(fs, newBox(t), testParams())
 	if err := svc.DeleteWorker(context.Background(), uuid.New(), uuid.New()); err != ErrWorkerNotFound {
 		t.Fatalf("err = %v, want ErrWorkerNotFound", err)
+	}
+}
+
+// PRD #4206: a delete that matched no row because the worker's hibernation cache prune is
+// unsettled is a 409-class error, not a not-found; a settled or absent attempt stays not-found.
+func TestDeleteWorkerRefusedWhileCleanupUnsettled(t *testing.T) {
+	for _, tc := range []struct {
+		phase string
+		want  error
+	}{
+		{CleanupPhaseRequested, ErrWorkerHibernationCleanupUnsettled},
+		{CleanupPhaseStarted, ErrWorkerHibernationCleanupUnsettled},
+		{CleanupPhaseUnknown, ErrWorkerHibernationCleanupUnsettled},
+		{CleanupPhaseSettled, ErrWorkerNotFound},
+		{CleanupPhaseNone, ErrWorkerNotFound},
+	} {
+		fs := &fakeStore{deleteWorkerRows: 0, deleteWorkerRow: &store.Worker{CleanupPhase: tc.phase}}
+		err := New(fs, newBox(t), testParams()).DeleteWorker(context.Background(), uuid.New(), uuid.New())
+		if !errors.Is(err, tc.want) {
+			t.Fatalf("phase %s: err = %v, want %v", tc.phase, err, tc.want)
+		}
 	}
 }
 
@@ -5758,7 +5790,7 @@ func TestCreateRunNotifiesQueuedWithOriginSnapshot(t *testing.T) {
 	lc := &fakeLifecycle{}
 	svc.SetLifecycle(lc)
 
-	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "desc", nil, nil, false, nil, nil, nil, nil); err != nil {
+	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "desc", nil, nil, false, nil, nil, nil, nil, nil, nil); err != nil {
 		t.Fatalf("CreateRun: %v", err)
 	}
 	// origin_column snapshots the issue's current column ("Later"), always a valid
@@ -5785,7 +5817,7 @@ func TestCreateRunOriginNullWhenColumnsUnavailable(t *testing.T) {
 	}
 	svc := New(fs, newBox(t), testParams())
 
-	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "desc", nil, nil, false, nil, nil, nil, nil); err != nil {
+	if _, err := svc.CreateRun(context.Background(), user, repo, 4, "desc", nil, nil, false, nil, nil, nil, nil, nil, nil); err != nil {
 		t.Fatalf("CreateRun should not be blocked by a column-list error: %v", err)
 	}
 	if fs.createRunParams == nil {

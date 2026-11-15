@@ -1,4 +1,4 @@
-// The Overview preview's issue-work line (PRD #3879): which station of the issue lifecycle
+// The default Overview's issue-work line (PRD #3879): which station of the issue lifecycle
 // each active run stands at, and the counts and captions the card prints. Pure; nothing
 // here fetches or renders. Everything derives from the summary rows the Overview already
 // loads (PRD #3878), and the park wording and the automatic-versus-owner split come from

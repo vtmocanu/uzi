@@ -1,4 +1,4 @@
-import { Navigate, Route, Routes } from "react-router-dom";
+import { Navigate, Route, Routes, useLocation } from "react-router-dom";
 import type { ReactElement } from "react";
 import { AppShell } from "./components/AppShell";
 import { AdminRoute, GuestRoute, ProtectedRoute } from "./components/RouteGuards";
@@ -67,6 +67,12 @@ export interface AppRoute {
   layout?: "runs";
 }
 
+// Keep the preview bookmark's demo scenario and fragment while moving it to the default Overview.
+function OverviewNextRedirect() {
+  const { search, hash } = useLocation();
+  return <Navigate to={{ pathname: "/dashboard", search, hash }} replace />;
+}
+
 // Every route the app serves. React Router v6 ranks matches by specificity, not
 // source/array order, so building the <Routes> by mapping this in any order is
 // safe — /runs/history out-ranks /runs/:id by construction (a static segment
@@ -100,9 +106,10 @@ export const APP_ROUTES: AppRoute[] = [
   // The sidebar's single Admin entry lands on the first AdminShell tab.
   { path: "/admin", element: <Navigate to="/admin/users" replace />, guard: "public" },
   // Authenticated app.
-  { path: "/dashboard", element: <Dashboard />, guard: "protected" },
-  // The Overview preview (PRD #3878): linked from /dashboard and back; #3877 promotes or drops it.
-  { path: "/overview/next", element: <OverviewNext />, guard: "protected" },
+  { path: "/dashboard", element: <OverviewNext />, guard: "protected" },
+  // PRD #3877 M1: the old page remains one click away during the bounded soak.
+  { path: "/overview/classic", element: <Dashboard />, guard: "protected" },
+  { path: "/overview/next", element: <OverviewNextRedirect />, guard: "protected" },
   { path: "/settings", element: <Settings />, guard: "protected" },
   // Appearance (theme/mode/typeface) + demo mode, split out of the Account tab.
   { path: "/settings/appearance", element: <AppearanceSettings />, guard: "protected" },

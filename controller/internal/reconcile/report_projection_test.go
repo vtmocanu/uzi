@@ -80,7 +80,7 @@ func TestTickProjectsRollHealthOntoStatusWire(t *testing.T) {
         "reported_at": "2026-10-05T10:11:12.789Z",
 		"poll_interval_seconds": 37,
 		"worker_image_tag": "controller-target",
-		"hibernation": 1,
+		"hibernation": 2,
 		"workers": [
 			{
 				"id": "worker-stuck",
@@ -150,7 +150,7 @@ func TestTickReplacesRollHealthStatusAcrossTicks(t *testing.T) {
         "reported_at": "2026-10-05T12:00:00Z",
 		"poll_interval_seconds": 23,
 		"worker_image_tag": "transition-target",
-		"hibernation": 1,
+		"hibernation": 2,
 		"workers": [{
 			"id": "worker-transition",
 			"phase": "stuck",
@@ -182,7 +182,7 @@ func TestTickReplacesRollHealthStatusAcrossTicks(t *testing.T) {
         "reported_at": "2026-10-05T12:00:23Z",
 		"poll_interval_seconds": 23,
 		"worker_image_tag": "transition-target",
-		"hibernation": 1,
+		"hibernation": 2,
 		"workers": [{
 			"id": "worker-transition",
 			"phase": "settled",
@@ -206,7 +206,7 @@ func TestTickReplacesRollHealthStatusAcrossTicks(t *testing.T) {
         "reported_at": "2026-10-05T12:00:46Z",
 		"poll_interval_seconds": 23,
 		"worker_image_tag": "transition-target",
-		"hibernation": 1,
+		"hibernation": 2,
 		"workers": []
 	}`)
 }
@@ -278,13 +278,15 @@ func TestTickOmitsRollHealthRowsForPreparingAndHibernatedWorkers(t *testing.T) {
 	m := &pacingMaterializer{
 		fakeMaterializer: fakeMaterializer{observed: []ObservedWorker{
 			{ID: "w-prep", Roll: RollHealth{Phase: protocol.PhaseRolling}},
+			{ID: "w-clean", Roll: RollHealth{Phase: protocol.PhaseRolling}},
 			{ID: "w-wake", Roll: RollHealth{Phase: protocol.PhaseRolling, TargetImage: "img-wake"}},
 		}},
-		outcomes: map[string]*protocol.Pacing{"w-hib": pacing, "w-prep": pacing, "w-wake": pacing},
+		outcomes: map[string]*protocol.Pacing{"w-hib": pacing, "w-prep": pacing, "w-wake": pacing, "w-clean": pacing},
 	}
 	poller := &fakePoller{resp: protocol.PollResponse{Workers: []protocol.DesiredWorker{
 		{ID: "w-prep", Hibernation: &protocol.Hibernation{State: protocol.HibernationPreparing, OpID: "o1"}},
 		{ID: "w-hib", Hibernation: &protocol.Hibernation{State: protocol.HibernationHibernated, OpID: "o2"}},
+		{ID: "w-clean", Hibernation: &protocol.Hibernation{State: protocol.HibernationCleaning, OpID: "o4", Cleanup: &protocol.HibernationCleanup{OpID: "c1"}}},
 		{ID: "w-wake", Hibernation: &protocol.Hibernation{State: protocol.HibernationWaking, OpID: "o3"}},
 	}}}
 	l := New(poller, m, client, 10*time.Second, "tag", slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -297,7 +299,7 @@ func TestTickOmitsRollHealthRowsForPreparingAndHibernatedWorkers(t *testing.T) {
 		"reported_at": "2026-10-05T10:00:00Z",
 		"poll_interval_seconds": 10,
 		"worker_image_tag": "tag",
-		"hibernation": 1,
+		"hibernation": 2,
 		"workers": [{
 			"id": "w-wake", "phase": "rolling", "phase_since": null, "target_image": "img-wake",
 			"pod_phase": "", "blocking_container": null, "blocking_reason": null,

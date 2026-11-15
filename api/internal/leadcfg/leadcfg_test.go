@@ -378,7 +378,12 @@ func TestContractCasesAreWellFormed(t *testing.T) {
 		if err := json.Unmarshal(dc.Input, &in); err != nil {
 			t.Fatal(err)
 		}
-		if in.Status == "" || !slices.Contains(c.Vocabulary.Harnesses, in.Harness) || in.PreClaim["modelSource"] != "schedule_pin" {
+		// The pre-claim model source is schedule_pin or run_override, or absent (no model, or a legacy
+		// NULL source, DC-P8); the effort source is run_override or absent.
+		modelSrc, effortSrc := in.PreClaim["modelSource"], in.PreClaim["effortSource"]
+		srcOK := (modelSrc == nil || modelSrc == "schedule_pin" || modelSrc == "run_override") &&
+			(effortSrc == nil || effortSrc == "run_override")
+		if in.Status == "" || !slices.Contains(c.Vocabulary.Harnesses, in.Harness) || !srcOK {
 			t.Errorf("display case %s has a malformed input", dc.ID)
 		}
 		if (dc.Expect.Chip == "") != (in.LeadCfg == nil) {

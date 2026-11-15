@@ -1,10 +1,12 @@
-// Compact instance-health chip for the /overview/next header (PRD #3878). Admin-only by
+// Compact instance-health chip for the default Overview header (PRD #3878, #3877). Admin-only by
 // construction: it reads the ONE shared HealthStatusProvider, whose doc is null for a
 // non-admin (no fetch) and before the first load, and the chip then renders nothing.
 // It mirrors HealthOverviewCard's severity in one line and always opens a popover (#4281).
 // Attention rows use the card's shared row (#4166); passing checks appear by area. The
 // footer's Open health link reaches the full Health tab. Live verdict changes keep the
 // popover open and move focus only if the previously focused item disappeared.
+// Its wide panel placement and live-update focus tracking need a different effect order
+// from the three 360 px chips, so this component keeps its own dismissal effect (#4341).
 
 import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";

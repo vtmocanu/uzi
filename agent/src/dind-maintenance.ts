@@ -9,6 +9,7 @@ import {
 import type { DindMaintenance, DindMaintenanceReadyACK } from "./protocol.js";
 import type { Logger } from "./log.js";
 import { errMessage, sleep as abortableSleep } from "./util.js";
+import { asWriter } from "./hibernation-inventory.js";
 
 const COMMANDS = Object.freeze({
   version: DIND_VOLUME_SERVER_VERSION_ARGV,
@@ -237,7 +238,7 @@ export class DindMaintenanceController {
   async loop(signal: AbortSignal): Promise<void> {
     while (!signal.aborted) {
       try {
-        await this.tick(signal);
+        await asWriter("dind_maintenance", () => this.tick(signal));
         await this.sleep(1000, signal);
       } catch (err) {
         if (signal.aborted) return;

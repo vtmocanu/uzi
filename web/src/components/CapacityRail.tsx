@@ -1,4 +1,4 @@
-// The Overview preview's Capacity card (PRD #3880 M1): run slots in use across the viewer's
+// The default Overview's Capacity card (PRD #3880 M1): run slots in use across the viewer's
 // own fleet, a segmented bar, and every owner worker as a row with its stats behind a
 // disclosure. "Open" means advertised spare slots, not a promise that a run is claimed.
 

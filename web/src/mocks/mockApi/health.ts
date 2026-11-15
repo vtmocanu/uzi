@@ -30,7 +30,7 @@ function withAgentSource(doc: HealthDoc): HealthDoc {
 //   ?mock=health-confirmed-drain → orderly upgrade wait, all checks ok and no episode
 //   ?mock=health-silent    → every check passing (healthy/all-ok)
 //   ?mock=overview-next    → one owner warning that raises the admin attention banner
-//                            (the Overview preview scenario, PRD #3878)
+//                            (the default Overview scenario, PRD #3878 and #3877)
 //   ?mock=maintenance      → maintenance.active warns (PRD #3454; see mockApi/maintenance.ts)
 //   (default)              → healthy, same as health-silent
 //

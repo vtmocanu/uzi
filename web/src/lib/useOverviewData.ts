@@ -1,5 +1,5 @@
-// The Overview's data loading, shared by Dashboard and the /overview/next preview
-// (PRD #3878): the first load, the 10 s runs/workers poll and the 30 s usage poll that
+// The Overview's data loading, shared by the classic and default pages (PRD #3878, #3877):
+// the first load, the 10 s runs/workers poll and the 30 s usage poll that
 // used to live in Dashboard.tsx, moved here unchanged so the two pages cannot drift in
 // what they fetch or how they poll.
 
@@ -8,7 +8,9 @@ import { useAuth } from "../auth/AuthContext";
 import {
   api,
   type AdminUsage,
+  type AgentTemplate,
   type RecoveryCustodyHolds,
+  type RepoActivity,
   type RunSummaryItem,
   type SelfUsage,
   type User,
@@ -27,6 +29,8 @@ export interface Overview {
   workersTotal: number;
   reposEnabled: number;
   templates: number;
+  // The same core read's rows, for the Overview Agents chip (#4335); no extra request.
+  agentTemplates: AgentTemplate[];
   hasToken: boolean;
   hasForge: boolean;
   // PRD #40: the caller's own usage (everyone) + the factory view (admins only).
@@ -70,10 +74,20 @@ export interface AdminUsersState {
 
 const NO_ADMIN_USERS: AdminUsersState = { users: null, failed: false };
 
+// The admin repo-activity read (Repos chip, #4334): last good rows (null before any success)
+// plus a failure flag.
+export interface AdminRepoActivityState {
+  repos: RepoActivity[] | null;
+  failed: boolean;
+}
+
+const NO_ADMIN_REPO_ACTIVITY: AdminRepoActivityState = { repos: null, failed: false };
+
 export function useOverviewData(opts?: {
   includeAdminRuns?: boolean;
   includeRecoveryHolds?: boolean;
   includeAdminUsers?: boolean;
+  includeAdminRepoActivity?: boolean;
 }) {
   const { user } = useAuth();
   const [data, setData] = useState<Overview | null>(null);
@@ -121,6 +135,7 @@ export function useOverviewData(opts?: {
           workersTotal: workers.length,
           reposEnabled: repos.filter((r) => r.enabled).length,
           templates: templates.length,
+          agentTemplates: templates,
           hasToken: hasAnthropicToken(secrets),
           hasForge: connections.length > 0,
           selfUsage,
@@ -278,6 +293,37 @@ export function useOverviewData(opts?: {
     void loadUsers();
   }, [usersEnabled, loadUsers]);
 
+  // The admin repo-activity read (Repos chip, #4334) is opt-in per page AND admin-only. It is
+  // fetched once on mount (and again if the enabled flag flips), never on a poll: the
+  // "last run" ages it feeds are day-scale. A failure keeps the last good rows but flags
+  // `failed`. The same applied-id guard as users: an older response never overwrites a newer one.
+  const repoActivityEnabled = opts?.includeAdminRepoActivity === true && user?.is_admin === true;
+  const [adminRepoActivity, setAdminRepoActivity] = useState<AdminRepoActivityState>(NO_ADMIN_REPO_ACTIVITY);
+  const repoActivityRequestIdRef = useRef(0);
+  const repoActivityAppliedIdRef = useRef(0);
+  const loadRepoActivity = useCallback(async () => {
+    if (!repoActivityEnabled) return;
+    const id = ++repoActivityRequestIdRef.current;
+    try {
+      const { repos } = await api.adminRepoActivity();
+      if (!pollAliveRef.current || id <= repoActivityAppliedIdRef.current) return;
+      repoActivityAppliedIdRef.current = id;
+      setAdminRepoActivity({ repos, failed: false });
+    } catch {
+      if (!pollAliveRef.current || id <= repoActivityAppliedIdRef.current) return;
+      setAdminRepoActivity((prev) => ({ ...prev, failed: true }));
+    }
+  }, [repoActivityEnabled]);
+  useEffect(() => {
+    if (!repoActivityEnabled) {
+      // Admin revoked (or never granted): drop the rows and orphan pending requests.
+      repoActivityAppliedIdRef.current = repoActivityRequestIdRef.current;
+      setAdminRepoActivity(NO_ADMIN_REPO_ACTIVITY);
+      return;
+    }
+    void loadRepoActivity();
+  }, [repoActivityEnabled, loadRepoActivity]);
+
   const poll = useCallback(async () => {
     try {
       const [{ runs }, { workers }] = await Promise.all([api.listRuns({ view: "summary" }), api.listWorkers()]);
@@ -320,6 +366,7 @@ export function useOverviewData(opts?: {
     changeUsageWindow,
     adminRuns,
     adminUsers,
+    adminRepoActivity,
     holds,
     holdsFailed: holdsRequestFailed && holds === null,
   };

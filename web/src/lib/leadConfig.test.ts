@@ -98,11 +98,19 @@ describe("leadConfigView display_cases (fixtures/lead-config/contract.json)", ()
       const got = leadConfigView(c.input as unknown as LeadConfigViewInput);
       // The fixture pins chip and lines; preClaim is the web-only flag, asserted below.
       expect({ chip: got.chip, lines: got.lines }, c.id).toEqual(c.expect);
-      expect(got.preClaim, c.id).toBe(c.input.status === "queued" && c.expect.chip !== "");
+      // A run paused before its first report (DC-P6) shows the pre-claim chip, so it is muted too.
+      const input = c.input as unknown as LeadConfigViewInput;
+      const preClaimChip = (input.status === "queued" && c.expect.chip !== "")
+        || (input.status === "paused" && input.holdReason === "run_override_unavailable");
+      expect(got.preClaim, c.id).toBe(preClaimChip);
       visited.push(c.id);
     }
     expect(visited).toEqual(contract.display_cases.map((c) => c.id));
     expect(new Set(visited).size).toBe(visited.length);
+    // PRD #3250 DC-P1 to DC-P8 stay in the contract.
+    for (const n of [1, 2, 3, 4, 5, 6, 7, 8]) {
+      expect(visited.some((id) => id.startsWith(`dcp${n}-`)), `dcp${n}`).toBe(true);
+    }
   });
 });
 
@@ -122,8 +130,34 @@ describe("leadConfigViewInput", () => {
     expect(leadConfigViewInput(run)).toEqual({
       status: "queued",
       harness: "codex",
-      preClaim: { model: "gpt-6-astra", modelSource: "schedule_pin" },
+      holdReason: null,
+      preClaim: { model: "gpt-6-astra", modelSource: "schedule_pin", effort: null, effortSource: null },
       leadConfig: undefined,
     });
+  });
+
+  it("carries the run-start model and effort with their sources", () => {
+    const run = {
+      status: "queued", harness: "claude", model: "opus", model_source: "run_override",
+      effort: "xhigh", effort_source: "run_override",
+    } as unknown as Run;
+    expect(leadConfigViewInput(run).preClaim).toEqual({
+      model: "opus", modelSource: "run_override", effort: "xhigh", effortSource: "run_override",
+    });
+  });
+
+  it("shows an effort only when its source is run_override", () => {
+    const run = { status: "queued", harness: "claude", model: null, effort: "high", effort_source: null } as unknown as Run;
+    expect(leadConfigViewInput(run).preClaim).toMatchObject({ effort: null, effortSource: null });
+  });
+
+  it("carries hold_reason", () => {
+    const run = { status: "paused", harness: "claude", hold_reason: "run_override_unavailable" } as unknown as Run;
+    expect(leadConfigViewInput(run).holdReason).toBe("run_override_unavailable");
+  });
+
+  it("reads a model with a NULL source as schedule_pin (DC-P8)", () => {
+    const run = { status: "queued", harness: "claude", model: "opus", model_source: null, effort: null } as unknown as Run;
+    expect(leadConfigViewInput(run).preClaim.modelSource).toBe("schedule_pin");
   });
 });

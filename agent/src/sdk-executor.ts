@@ -40,7 +40,7 @@ import type {
   SpawnOptions,
 } from "@anthropic-ai/claude-agent-sdk";
 import { buildCIEvidenceServer, CI_EVIDENCE_SERVER, ciEvidencePrompt, withCIEvidenceAgents } from "./ci-evidence-tools.js";
-import type { Executor, ExecutorResult, InPlaceSwitchSite, RunContext, WallParkOutcome } from "./executor.js";
+import type { Executor, ExecutorResult, InPlaceSwitchSite, RunContext, SecretRemediationDecision, WallParkOutcome } from "./executor.js";
 import type { Logger } from "./log.js";
 import { resolveLeadRequest, type LeadRequest, type PhaseEntry } from "./lead-config-report.js";
 import { toLeadObservation } from "./runtime-observation.js";
@@ -137,7 +137,7 @@ import type {
 import { evidencesModelProcessing } from "./harness.js";
 import { RESUME_LINEAGE_BREAK_EVENT } from "./harness-messages.js";
 import { isResumeTranscriptIncompatible } from "./sdk-session.js";
-import { PlanRejectedError, PlanRevisionReplacedError, stampPrSummaryHead } from "./executor.js";
+import { PlanRejectedError, PlanRevisionReplacedError, SecretRemediationStoppedError, stampPrSummaryHead } from "./executor.js";
 import { emitPlanMissingNotice, isProseOnlyPlanTurn, PLAN_MISSING_NUDGE, REASON_PLAN_MISSING, resolvePlanMissing } from "./plan-missing.js";
 import { errMessage } from "./util.js";
 import { assertResidueQuarantineOpen } from "./residue-quarantine.js";
@@ -3512,7 +3512,13 @@ export class SdkExecutor implements Executor {
         // turn, including an attempt-path restore with no surviving provider session.
         // Only remediate owns the prompt; the done/finalize gates remain authoritative.
         if (resumeSecretPreflightPending && !state.tripReason) {
-          const decision = await ctx.secretRemediationGate?.({ unpublishedOnly: true });
+          let decision: SecretRemediationDecision | undefined;
+          try {
+            decision = await ctx.secretRemediationGate?.({ unpublishedOnly: true });
+          } catch (e) {
+            if (e instanceof SecretRemediationStoppedError) this.routeSecretRemediationStop(ctx);
+            throw e;
+          }
           resumeSecretPreflightPending = false;
           this.throwIfTerminal(ctx);
           if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
@@ -3520,6 +3526,23 @@ export class SdkExecutor implements Executor {
           if (decision?.action === "remediate") followUp = decision.followUp;
           // A switch/pause/wall arriving during the await still goes through the
           // ordinary turn's interruption checks before any model event.
+        }
+        // Issue #4258: the advisory mid-run secret remediation seam, only at a boundary no control
+        // owns and no system text owns (a clarification answer or verdict text in followUp, which
+        // also covers a resume-preflight remediate just above, or a completion rework). The trigger
+        // stays pending for a later boundary otherwise. A terminal fence, sticky cancel or disk stop
+        // arriving during the await is stopped by the explicit post-await checks below; pause,
+        // wall, credential switch and shutdown are routed by the turn's own interruption checks
+        // before any model event. Remediate replaces this turn's prompt and adds no turn.
+        // An exhausted wall (armWall trips it before the next dispatch) must not spend an attempt
+        // on guidance no turn would carry.
+        if (!ctx.interactive && !state.tripReason && state.wallRemainingMs > 0 && followUp === undefined &&
+            !completionRework && ctx.midRunSecretRemediation) {
+          const decision = await ctx.midRunSecretRemediation();
+          this.throwIfTerminal(ctx);
+          if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
+          throwIfDiskStop(ctx);
+          if (decision.action === "remediate") followUp = decision.followUp;
         }
         const reworkForTurn = completionRework;
         completionRework = undefined;
@@ -4212,7 +4235,13 @@ export class SdkExecutor implements Executor {
           // rework); `fail` stops here with no done checkpoint and no completion attempt (the runner
           // already recorded the blocked state). Never reached by an interactive run.
           if (!ctx.interactive) {
-            const secretDecision = await ctx.secretRemediationGate?.();
+            let secretDecision: SecretRemediationDecision | undefined;
+            try {
+              secretDecision = await ctx.secretRemediationGate?.();
+            } catch (e) {
+              if (e instanceof SecretRemediationStoppedError) this.routeSecretRemediationStop(ctx);
+              throw e;
+            }
             if (secretDecision?.action === "remediate") {
               followUp = secretDecision.followUp;
               resetStallState();
@@ -5980,6 +6009,18 @@ export class SdkExecutor implements Executor {
 
   private throwIfTerminal(ctx: RunContext): void {
     if (ctx.terminalLifecycleSignal?.aborted || ctx.claimFenced?.()) throw new Error(REASON_CANCELLED);
+  }
+
+  /**
+   * Issue #4313: the secret-remediation gate was stopped before it reached a decision. Route the control
+   * that stopped it with the same order as every other post-await check (terminal fence, sticky cancel,
+   * disk stop); a stop no control explains is a cancel. Never returns, and never finalizes.
+   */
+  private routeSecretRemediationStop(ctx: RunContext): never {
+    this.throwIfTerminal(ctx);
+    if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
+    throwIfDiskStop(ctx);
+    throw new Error(REASON_CANCELLED);
   }
 
   /**

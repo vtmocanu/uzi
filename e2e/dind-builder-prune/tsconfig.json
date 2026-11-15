@@ -1,0 +1,14 @@
+{
+  "extends": "../../agent/tsconfig.json",
+  "compilerOptions": {
+    "typeRoots": [
+      "../../agent/node_modules/@types"
+    ]
+  },
+  "include": [
+    "./**/*.mts"
+  ],
+  "exclude": [
+    "node_modules"
+  ]
+}

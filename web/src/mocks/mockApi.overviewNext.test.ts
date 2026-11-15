@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { issueLineModel, issueLineStage, type LineStage } from "../lib/issueLine";
 import { overviewNextCrossCheckActive } from "./data/overviewNext";
 
-// ?mock=overview-next (PRD #3878): scenario-gated seeding for the Overview preview. The
+// ?mock=overview-next (PRD #3878): scenario-gated seeding for the default Overview. The
 // scenario is read when the store seeds, so each test re-imports a fresh mockApi.
 async function freshApi(scenario: string | null) {
   vi.resetModules();

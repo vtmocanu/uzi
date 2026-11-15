@@ -109,9 +109,10 @@ func samplePollResponse() PollResponse {
 			// No token to write: a pod already proved it holds one (its plaintext
 			// lives only in the cluster Secret now), or the buffer expired unread.
 			JoinToken: nil,
-			// A sleeping worker carries the hibernation object (PRD #4205); the first and
-			// third workers are awake or waking, so a drop on either side reddens.
-			Hibernation: &Hibernation{State: "hibernated", OpID: "55555555-5555-5555-5555-555555555555"},
+			// A preparing worker carries the hibernation object with its inventory gate (PRD
+			// #4205, #4208); the first and third workers are awake or waking (no gate), so a
+			// drop on either side reddens.
+			Hibernation: &Hibernation{State: "preparing", OpID: "55555555-5555-5555-5555-555555555555", InventoryGate: InventoryGateAwait},
 		},
 		{
 			ID:       "33333333-3333-3333-3333-333333333333",
@@ -123,6 +124,16 @@ func samplePollResponse() PollResponse {
 				RegisterNonce: "registration-nonce",
 			},
 			Hibernation: &Hibernation{State: "waking", OpID: "66666666-6666-6666-6666-666666666666"},
+		},
+		{
+			// An unsettled hibernation cache prune attempt (PRD #4206): state cleaning with the
+			// cleanup block; the stop-proof pod uid rides the wire only while settlement is unknown.
+			ID:       "99999999-9999-9999-9999-999999999999",
+			Template: "base", Size: "m", Generation: 1, Docker: true,
+			DiskPressureVolumes: []string{},
+			Hibernation: &Hibernation{State: HibernationCleaning, OpID: "66666666-6666-6666-6666-666666666666", Cleanup: &HibernationCleanup{
+				OpID: "88888888-8888-8888-8888-888888888888", StopProofPodUID: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", ReconcileSeq: 2,
+			}},
 		},
 	}}
 }

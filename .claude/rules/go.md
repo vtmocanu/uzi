@@ -47,6 +47,7 @@ cd api && ../scripts/sqlc.sh v1.31.1 generate
 | `fixtures/code-cross-check/` | `api/internal/handler/code_cross_check_contract_test.go`, `agent/test/code-cross-check-wire.test.ts` |
 | `fixtures/claims/resume-unapproved-no-session.json` | `api/internal/workersvc/resume_unapproved_claim_livedb_test.go`, `agent/test/runner-gate-verdict-interruption.test.ts` |
 | `fixtures/claims/claim-response-limit.json` | `api/internal/workersvc/claim_size_test.go`, `agent/test/client-claim-response-bound.test.ts` |
+| `fixtures/run-start-options/cases.json` | `api/internal/handler/run_start_options_livedb_test.go` (LiveDB; the web mock test joins it in M2) |
 | `fixtures/forge-api-origin/cases.json` | `api/internal/store/forge_api_origin_livedb_test.go` (LiveDB), `agent/test/forge-api-origin-parity.test.ts` |
 | `fixtures/recovery-archive-redundancy/vectors.json` | `api/internal/workersvc/archive_redundancy_test.go`, `agent/test/recovery-archive-redundancy.test.ts` |
 | `api/internal/hostedsvc/testdata/` | the controller's contract goldens, the other way |
@@ -87,8 +88,8 @@ Same token-not-annotation mechanism as `+goose`, with GitLab as the parser.
 - `go test ./...` does not cover them: they skip silently without `UZI_TEST_DATABASE_URL`.
 - Run the ordinary gate with that variable unset; exporting it there turns them red, because package binaries race one shared database and truncate mid-flight.
 - Run the sweep via `./e2e/run-store-it.sh`, or by hand with `-p 1`. `-p 1` is load-bearing, not a speed knob: without it you get nondeterministic reds that look like a regression in whatever you just touched.
-- The sweep runs only the packages it enumerates; a `*LiveDB` test in any other package runs nowhere while its skip message claims otherwise. The one list, `PKGS` in `e2e/run-store-it.sh` (CI runs that script, not a copy), carries eight: `store`, `handler`, `forgesvc`, `schedsvc`, `workersvc`, `recovery`, `poller`, `hostedsvc`.
-- A `*LiveDB` test in a new package is a one-list edit, `PKGS` in `./e2e/run-store-it.sh`; CI runs that script once for both the `test-api-store-it` and `test-codex-refresh-lostreply-e2e` contexts. The skip message is a claim about that list: do not write it before it is true.
+- The sweep runs only the packages it enumerates; a `*LiveDB` test in any other package runs nowhere while its skip message claims otherwise. The one list, `ALL_PKGS` in `e2e/run-store-it.sh` (CI runs that script, not a copy), carries eight: `store`, `handler`, `forgesvc`, `schedsvc`, `workersvc`, `recovery`, `poller`, `hostedsvc`.
+- A `*LiveDB` test in a new package is a one-list edit, `ALL_PKGS` in `./e2e/run-store-it.sh`; CI splits that one sweep across `test-livedb-workersvc` (`UZI_STORE_IT_GROUP=workersvc`) and `test-codex-refresh-lostreply-e2e` (`rest`, which a new package joins automatically), and `test-api-store-it` requires both. The skip message is a claim about that list: do not write it before it is true.
 - Fixtures share one database across packages, so a fixed literal in a `UNIQUE` column (`workers.token_hash` bit here) passes alone and fails once another package inserted it first. Derive per-test uniqueness from a fresh `uuid.New()`, as `handler/hosted_provision_livedb_test.go` documents.
 
 ## Reading test output: the `PASS=0` family

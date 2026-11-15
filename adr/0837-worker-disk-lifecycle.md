@@ -121,7 +121,9 @@ same default-on flag also enables the pressure-only anonymous-volume prune leg
 on already-enabled persistent Docker workers once the fixed worker deploys.
 The opt-out `workers.diskRecycleEnabled: false` is not leg-only: it also
 disables PVC recycle and the cache prune, and flipping it rolls non-ephemeral
-Docker worker pods. The leg touches no PVC, so the ADR-3153 source-PVC and
+Docker worker pods. (AI-synced 2026-11-13, #4291: it likewise disables the
+separate pressure-only builder-cache leg, which has its own leg-only opt-out
+`workers.dindBuilderPruneEnabled: false`; see ADR-1759 D8, "Exception — #4291".) The leg touches no PVC, so the ADR-3153 source-PVC and
 writer-exclusion boundaries are unchanged.) With simultaneous eligible Nix and DinD pressure,
 Nix-only recycle runs first with pending DinD intent, then DinD on a later tick
 before another legacy recycle. Data-only pressure yields to DinD maintenance;

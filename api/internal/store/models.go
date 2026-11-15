@@ -1349,6 +1349,9 @@ type Run struct {
 	CodexSwitchTargetMaterialRevision pgtype.Int8        `json:"codex_switch_target_material_revision"`
 	CodexSwitchTargetAccountKey       pgtype.Text        `json:"codex_switch_target_account_key"`
 	CodexSwitchTargetAccountRevision  pgtype.Int8        `json:"codex_switch_target_account_revision"`
+	Effort                            pgtype.Text        `json:"effort"`
+	ModelSource                       pgtype.Text        `json:"model_source"`
+	EffortSource                      pgtype.Text        `json:"effort_source"`
 }
 
 type RunCompletionAttempt struct {
@@ -1649,6 +1652,51 @@ type RunSchedule struct {
 	RecentFires                []byte             `json:"recent_fires"`
 	CiWorkflows                []byte             `json:"ci_workflows"`
 	CiArtifacts                []byte             `json:"ci_artifacts"`
+}
+
+type RunTerminalContribution struct {
+	ID              uuid.UUID          `json:"id"`
+	PreservationID  uuid.UUID          `json:"preservation_id"`
+	RunID           uuid.UUID          `json:"run_id"`
+	Generation      int64              `json:"generation"`
+	WorkerID        uuid.UUID          `json:"worker_id"`
+	UserID          uuid.UUID          `json:"user_id"`
+	HoldID          pgtype.UUID        `json:"hold_id"`
+	Authority       string             `json:"authority"`
+	Tip             string             `json:"tip"`
+	PriorTip        pgtype.Text        `json:"prior_tip"`
+	CoverageDigest  string             `json:"coverage_digest"`
+	Manifest        []byte             `json:"manifest"`
+	Disposition     string             `json:"disposition"`
+	State           string             `json:"state"`
+	RefusalReason   pgtype.Text        `json:"refusal_reason"`
+	CreateInvokedAt pgtype.Timestamptz `json:"create_invoked_at"`
+	PublishedAt     pgtype.Timestamptz `json:"published_at"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+}
+
+type RunTerminalPreservation struct {
+	ID               uuid.UUID          `json:"id"`
+	RunID            uuid.UUID          `json:"run_id"`
+	UserID           uuid.UUID          `json:"user_id"`
+	RepoID           uuid.UUID          `json:"repo_id"`
+	LiveRunID        pgtype.UUID        `json:"live_run_id"`
+	Ref              string             `json:"ref"`
+	Tip              pgtype.Text        `json:"tip"`
+	LifetimeAtBind   string             `json:"lifetime_at_bind"`
+	State            string             `json:"state"`
+	FirstPublishedAt pgtype.Timestamptz `json:"first_published_at"`
+	RetireTip        pgtype.Text        `json:"retire_tip"`
+	RetireReason     pgtype.Text        `json:"retire_reason"`
+	RetireObservedAt pgtype.Timestamptz `json:"retire_observed_at"`
+	RetireDecidedAt  pgtype.Timestamptz `json:"retire_decided_at"`
+	NextCheckAt      pgtype.Timestamptz `json:"next_check_at"`
+	Attempts         int32              `json:"attempts"`
+	LastError        pgtype.Text        `json:"last_error"`
+	DeletedAt        pgtype.Timestamptz `json:"deleted_at"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
 }
 
 type RunUsage struct {
@@ -2033,6 +2081,19 @@ type Worker struct {
 	WakeRegisterOpID           pgtype.UUID        `json:"wake_register_op_id"`
 	WakeRegisterPodUid         pgtype.UUID        `json:"wake_register_pod_uid"`
 	CredentialSwitchApplyNonce pgtype.Text        `json:"credential_switch_apply_nonce"`
+	HibernationCleanup         pgtype.Text        `json:"hibernation_cleanup"`
+	HibernationCleanupReason   pgtype.Text        `json:"hibernation_cleanup_reason"`
+	CleanupOpID                pgtype.UUID        `json:"cleanup_op_id"`
+	CleanupPhase               string             `json:"cleanup_phase"`
+	CleanupRegisterNonce       pgtype.Text        `json:"cleanup_register_nonce"`
+	CleanupPodUid              pgtype.UUID        `json:"cleanup_pod_uid"`
+	CleanupRequestedAt         pgtype.Timestamptz `json:"cleanup_requested_at"`
+	CleanupStartedAt           pgtype.Timestamptz `json:"cleanup_started_at"`
+	CleanupUnknownAt           pgtype.Timestamptz `json:"cleanup_unknown_at"`
+	CleanupSettledAt           pgtype.Timestamptz `json:"cleanup_settled_at"`
+	CleanupCancelRequested     bool               `json:"cleanup_cancel_requested"`
+	CleanupReconcileSeq        int32              `json:"cleanup_reconcile_seq"`
+	CleanupReconciledAt        pgtype.Timestamptz `json:"cleanup_reconciled_at"`
 }
 
 type WorkerActiveRun struct {
@@ -2074,6 +2135,37 @@ type WorkerHibernationEvent struct {
 	OpID       uuid.UUID          `json:"op_id"`
 	Reason     pgtype.Text        `json:"reason"`
 	OccurredAt pgtype.Timestamptz `json:"occurred_at"`
+}
+
+type WorkerHibernationInventory struct {
+	WorkerID                  uuid.UUID          `json:"worker_id"`
+	OpID                      uuid.UUID          `json:"op_id"`
+	ObservedAt                pgtype.Timestamptz `json:"observed_at"`
+	DeploymentUid             string             `json:"deployment_uid"`
+	DeploymentResourceVersion string             `json:"deployment_resource_version"`
+	PodUid                    uuid.UUID          `json:"pod_uid"`
+	Pvcs                      []byte             `json:"pvcs"`
+	RegisterNonce             pgtype.Text        `json:"register_nonce"`
+	ReceivedAt                pgtype.Timestamptz `json:"received_at"`
+	Status                    string             `json:"status"`
+	StatusReason              pgtype.Text        `json:"status_reason"`
+	Complete                  pgtype.Bool        `json:"complete"`
+	Entries                   []byte             `json:"entries"`
+	ReceiptKeys               []byte             `json:"receipt_keys"`
+	Digest                    pgtype.Text        `json:"digest"`
+	Fingerprint               pgtype.Text        `json:"fingerprint"`
+	Lane                      pgtype.Text        `json:"lane"`
+	Mechanism                 pgtype.Text        `json:"mechanism"`
+	Uncovered                 []byte             `json:"uncovered"`
+	InvalidatedReason         pgtype.Text        `json:"invalidated_reason"`
+	InvalidatedAt             pgtype.Timestamptz `json:"invalidated_at"`
+	ScalingDownPodUid         pgtype.UUID        `json:"scaling_down_pod_uid"`
+	FenceGeneration           pgtype.Int8        `json:"fence_generation"`
+	ScaledDownAt              pgtype.Timestamptz `json:"scaled_down_at"`
+	LastHeldAt                pgtype.Timestamptz `json:"last_held_at"`
+	ExclusionFinalAt          pgtype.Timestamptz `json:"exclusion_final_at"`
+	ExclusionFinalDigest      pgtype.Text        `json:"exclusion_final_digest"`
+	ExclusionFinalFingerprint pgtype.Text        `json:"exclusion_final_fingerprint"`
 }
 
 type WorkerPendingOutcomeIdentity struct {
