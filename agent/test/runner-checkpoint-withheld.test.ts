@@ -324,13 +324,14 @@ const FACTS = (over: Record<string, unknown>) => ({ enrolled: false, blocked: fa
 
 it("a failed restriction-facts read latches an empty restriction but reports no withheld diagnostic", async () => {
   const { sent } = seam();
-  uploads();
+  const tips = uploads();
   await withFlight(async (ctx, f, r) => {
     git.readRemediationRestrictionFacts = async () => { throw new Error("facts read failed"); };
     commit(ctx.worktreePath);
     // The hold comes from the real failed read (the empty latch), not from a forced hold stub.
     assert.equal((await r.publishCheckpointOutcome(f, String(f.barePath), ctx.branch)).reason, "secret_remediation_pending");
     assert.ok(f.remediationRestrictions, "the failed read latched an empty restriction");
+    assert.equal(tips.length, 0, "publication stayed held: nothing was uploaded");
     await settle();
     assert.equal(sent.length, 0);
     assert.equal(f.checkpointWithheld, undefined);
