@@ -770,10 +770,14 @@ func TestReservePauseUsesCodexAliasForCodexRunsLiveDB(t *testing.T) {
 // pauseRun), so two non-terminal runs could collide on uq_runs_one_active_per_issue (#4357, seen
 // on PR #4353's CI). The fixture now numbers issues itself with one counter shared by both helpers.
 func TestReserveFixtureIssueIIDsIgnoreRunIDBytesLiveDB(t *testing.T) {
-	pinned := func(fx *reserveFix, ids ...string) {
+	// pinned feeds the fixture fresh random ids whose first two bytes are fixed, so the old
+	// derivation collides deterministically while every id stays unique across runs of the
+	// shared LiveDB database.
+	pinned := func(fx *reserveFix, prefixes ...[2]byte) {
 		fx.newRunID = func() uuid.UUID {
-			id := uuid.MustParse(ids[0])
-			ids = ids[1:]
+			id := uuid.New()
+			id[0], id[1] = prefixes[0][0], prefixes[0][1]
+			prefixes = prefixes[1:]
 			return id
 		}
 	}
@@ -788,7 +792,7 @@ func TestReserveFixtureIssueIIDsIgnoreRunIDBytesLiveDB(t *testing.T) {
 	t.Run("two pause runs sharing their first two id bytes", func(t *testing.T) {
 		fx := newReserveFix(t, 70, true)
 		tok := fx.token("only", true, false, 90)
-		pinned(fx, "abcd0000-0000-4000-8000-000000000001", "abcd0000-0000-4000-8000-000000000002")
+		pinned(fx, [2]byte{0xab, 0xcd}, [2]byte{0xab, 0xcd})
 		a := fx.pauseRun(pauseRun{cred: &tok, status: "paused"})
 		b := fx.pauseRun(pauseRun{cred: &tok, status: "paused"})
 		seeded(t, fx, a, b)
@@ -797,7 +801,7 @@ func TestReserveFixtureIssueIIDsIgnoreRunIDBytesLiveDB(t *testing.T) {
 		fx := newReserveFix(t, 70, true)
 		tok := fx.token("only", true, false, 90)
 		// 0x07d0 = 2000: the old queueRun gave 3000+2000, the old pauseRun 5000+0.
-		pinned(fx, "07d00000-0000-4000-8000-000000000001", "00000000-0000-4000-8000-000000000002")
+		pinned(fx, [2]byte{0x07, 0xd0}, [2]byte{0x00, 0x00})
 		q := fx.queueRun(reserveRun{})
 		p := fx.pauseRun(pauseRun{cred: &tok, status: "paused"})
 		seeded(t, fx, q, p)
