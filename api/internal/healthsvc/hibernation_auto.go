@@ -7,6 +7,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/google/uuid"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -153,7 +154,12 @@ func (s *Service) checkFleetHibernation(ctx context.Context, now time.Time, work
 	for _, r := range rows {
 		var suffix string
 		if r.Kind == "parked" {
-			suffix = fmt.Sprintf(" blocked: assigned run parked (%s, %s)", r.RunID.String()[:8], cutBytes(safe(r.Status.String), 16))
+			runRef := "-"
+			if r.RunID.Valid {
+				// A canonical UUID string is 36 bytes, so the 8-byte prefix always exists.
+				runRef = uuid.UUID(r.RunID.Bytes).String()[:8]
+			}
+			suffix = fmt.Sprintf(" blocked: assigned run parked (%s, %s)", runRef, cutBytes(safe(r.Status.String), 16))
 		} else {
 			suffix = fmt.Sprintf(" idle %s, hibernation blocked: %s", hibernationIdleFor(now.Sub(r.Anchor.Time)), hibernationBlockedLabel(r.Reason))
 		}

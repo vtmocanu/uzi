@@ -118,6 +118,14 @@ func TestFleetHibernationAuto(t *testing.T) {
 			t.Fatalf("since = %s (the query-wide oldest blocker)", *c.Since)
 		}
 	})
+	t.Run("a parked row without a valid run id renders a placeholder instead of panicking", func(t *testing.T) {
+		row := parkedRow("p", uuid.New(), "paused", 20*24*time.Hour, 1)
+		row.RunID = pgtype.UUID{}
+		c := eval(&fakeStore{hibRows: []store.ListAutoHibernationBlockersRow{row}}, on(), hostedRows)
+		if got := c.Evidence[1].Value; got != "worker p blocked: assigned run parked (-, paused)" {
+			t.Fatalf("got %q", got)
+		}
+	})
 	t.Run("idle under a day renders hours", func(t *testing.T) {
 		c := eval(&fakeStore{hibRows: []store.ListAutoHibernationBlockersRow{idleRow("a", "manual_cordon", 20*time.Hour, 1)}}, on(), hostedRows)
 		if c.Evidence[1].Value != "worker a idle 20h, hibernation blocked: manual cordon" {

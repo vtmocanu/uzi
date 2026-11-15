@@ -73,9 +73,20 @@ func TestHibernationAutoThenScheduleWakeLiveDB(t *testing.T) {
 		return n
 	}
 
-	// Example 1: only the worker past the threshold is admitted.
-	if n := pass(); n < 1 {
-		t.Fatalf("pass admitted %d, want at least the 15d worker", n)
+	// Example 1: only the worker past the threshold is admitted. Residue workers from other tests
+	// may be admitted first (a pass admits a bounded batch, and the once-per-minute gate holds
+	// back an immediate rerun), so settle: advance the clock and rerun until a pass admits
+	// nothing, bounded.
+	passesSettled := false
+	for i := 0; i < 50; i++ {
+		if pass() == 0 {
+			passesSettled = true
+			break
+		}
+		advance(2 * time.Minute)
+	}
+	if !passesSettled {
+		t.Fatalf("the automatic pass still admitted workers after 50 passes")
 	}
 	if got := e.state(idle15); got != "preparing" {
 		t.Fatalf("15d worker state = %q, want preparing", got)
