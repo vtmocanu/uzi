@@ -76,7 +76,7 @@ export interface TerminalLaneEnv {
   lookupDefaultBranch?: (bound: { signal: AbortSignal; deadline: number }) => Promise<string | undefined>;
   /**
    * Reads the default branch's tip under the lane's own window (`bound` as for `lookupDefaultBranch`). Absent: the lane calls
-   * `git.defaultBranchTip` directly. A throw or an aborted or past-deadline return refuses the prepare as `deadline`.
+   * `git.defaultBranchTip` directly. A throw is treated as no tip; a read that ends after the window lapsed or its signal aborted refuses the prepare as `deadline`.
    */
   readDefaultBranchTip?: (barePath: string, branch: string, bound: { signal: AbortSignal; deadline: number }) => Promise<string | undefined>;
   egressBound: boolean;

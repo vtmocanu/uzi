@@ -1037,6 +1037,86 @@ describe("terminal preservation adapter predicates (gate on, real RunRunner meth
   }
 });
 
+describe("terminal preservation adapter: default-branch git reads run under the lane's window (real RunRunner method)", () => {
+  type Lane = { preserveTerminalInLane(claim: unknown, flight: unknown, body: unknown, site: unknown): Promise<{ outcome: string; reason?: string }> };
+  type GitSpy = {
+    withReportProofBudget: (b: { signal: AbortSignal; deadline: number }, action: () => Promise<unknown>) => Promise<unknown>;
+    defaultBranchTip: (bare: string, branch: string) => Promise<string | undefined>;
+    defaultBranchName: (bare: string) => Promise<string | undefined>;
+  };
+  const CAP_MS = 150;
+
+  /** The real RunRunner with the lane's own prepare (the hooked one dropped, so the tip read is the lane's). The runner's git
+   *  is spied: `withReportProofBudget` calls through while recording the signal it was bound to, and a stall waits on that
+   *  signal, so a read made outside a bound window never stalls and shows as not inside. */
+  function rigWithSpiedGit(t: TestContext) {
+    const r = runner({ run: async () => ({}) } as never, fakeGitlab().gitlab, "tp-adapter-window-key", {
+      terminalPreservationTestOverride: {
+        workerId: "w1", attemptId: "at1", capMs: CAP_MS, store: memStore(), owner: fn => fn(),
+        deps: {
+          universe: async () => ({ kind: "proved", sources: [], roots: [], universeDigest: "u" }),
+          capture: async onPhase => {
+            await onPhase("capturing", { cloneRef: "x", bareRef: "x" });
+            await onPhase("captured", { cloneRef: "x", bareRef: "x" });
+            return { kind: "ok", base: A, extraRoots: [], manifest: MANIFEST };
+          },
+          aggregate: async () => ({ tip: A }),
+          coverage: () => ({ ok: true }), recheck: async () => undefined,
+          send: async () => FINAL,
+        },
+      },
+    }) as unknown as Lane & { git: GitSpy };
+    const g = r.git;
+    const bound: AbortSignal[] = [];
+    let depth = 0;
+    const real = g.withReportProofBudget.bind(g);
+    t.mock.method(g, "withReportProofBudget", async (b: { signal: AbortSignal; deadline: number }, action: () => Promise<unknown>) => {
+      bound.push(b.signal);
+      depth++;
+      try { return await real(b, action); } finally { depth--; }
+    });
+    const reads = { insideBudget: [] as boolean[] };
+    const stall = async (): Promise<undefined> => {
+      reads.insideBudget.push(depth > 0);
+      if (depth === 0) return undefined;
+      const sig = bound[bound.length - 1]!;
+      await new Promise<void>(res => { if (sig.aborted) res(); else sig.addEventListener("abort", () => res(), { once: true }); });
+      return undefined;
+    };
+    t.mock.method(g, "defaultBranchTip", stall);
+    t.mock.method(g, "defaultBranchName", stall);
+    const flight = {
+      runId: RUN, claimGeneration: 1, runKind: "issue", barePath: "/bare", branch: "agent/issue-1", worktreePath: "/clone",
+      attemptId: "at1", iterationParkState: "none", policyHold: undefined, completionSendAttempted: false,
+      completionHoldOutcome: "none", runLog: { info: () => undefined },
+    };
+    return { r, flight, reads };
+  }
+  const laneSite = { quiesce: false, site: "t" };
+
+  it("a default-branch tip read runs inside the report-proof window and a stall past it refuses as a prepare deadline", async t => {
+    const { r, flight, reads } = rigWithSpiedGit(t);
+    const started = Date.now();
+    const out = await r.preserveTerminalInLane({ repo: { default_branch: "main" } }, flight, { status: "completed" }, laneSite);
+    const elapsed = Date.now() - started;
+    assert.deepEqual(reads.insideBudget, [true], "defaultBranchTip was called once, inside withReportProofBudget");
+    assert.equal(out.outcome, "kept");
+    assert.match(String(out.reason), /deadline/);
+    assert.ok(elapsed < CAP_MS + 1500, `elapsed ${elapsed} ms`);
+  });
+
+  it("a default-branch lookup runs inside the report-proof window and a stall past it keeps as default_branch_unresolved", async t => {
+    const { r, flight, reads } = rigWithSpiedGit(t);
+    const started = Date.now();
+    const out = await r.preserveTerminalInLane({ repo: {} }, flight, { status: "completed" }, laneSite);
+    const elapsed = Date.now() - started;
+    assert.deepEqual(reads.insideBudget, [true], "defaultBranchName was called once, inside withReportProofBudget");
+    assert.equal(out.outcome, "kept");
+    assert.equal(out.reason, "default_branch_unresolved");
+    assert.ok(elapsed < CAP_MS + 1500, `elapsed ${elapsed} ms`);
+  });
+});
+
 describe("terminal-preservation lane: snapshot cleanup bound and remnant (#4007)", () => {
   /** A rig whose universe is the lane's own (a real clone dir and a fake git), so the lane builds the capture call itself. */
   function snapRig(over: Partial<TerminalLaneEnv>, snap: unknown): { r: Rig; calls: Array<Record<string, unknown>>; logs: Array<[string, Record<string, unknown>]>; cleanup(): void } {
