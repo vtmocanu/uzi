@@ -16,6 +16,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { getEventListeners } from "node:events";
 import { AsyncLocalStorage } from "node:async_hooks";
 import fs from "node:fs/promises";
+import syncFs from "node:fs";
+import vm from "node:vm";
 import { readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -144,7 +146,7 @@ import type {
   DisposeEvidence,
   DisposeOutcome,
 } from "../src/codex/launcher.js";
-import { SupervisedChildExitTimeoutError } from "../src/codex/launcher.js";
+import { SupervisedChildExitTimeoutError, SUPERVISOR_BIN } from "../src/codex/launcher.js";
 import { CommandDeadlineError } from "../src/codex/broker.js";
 import { CODEX_M3B_LOOPBACK_PROVIDER_NAME } from "../src/codex/config.js";
 import { renderCodexRun } from "../src/codex/render.js";
@@ -32287,15 +32289,17 @@ describe("M2 actualRunner credential replacement", () => {
   for (const [oldClaim, target] of [[SUBSCRIPTION, API_KEY], [API_KEY, SUBSCRIPTION],
     [SUBSCRIPTION, { ...SUBSCRIPTION, generation: 20, chatgpt_account_id: "M2-B-account" }]] as const) {
     for (const phase of ["factory", "already-running-body"] as const) {
-      for (const publication of ["baseline", "gated", "publish-failure", "now-publish-failure", "login-failure", "subscription-refresh", "api-key-refresh", "subscription-refresh-prepare-failure", "subscription-refresh-cancel"] as const) {
+      for (const publication of ["baseline", "gated", "publish-failure", "now-publish-failure", "login-failure", "subscription-refresh", "api-key-refresh", "subscription-refresh-prepare-failure", "subscription-refresh-cancel", "crash-login-recovery"] as const) {
         if (publication !== "baseline" && (phase !== "factory" || (oldClaim !== API_KEY && target !== API_KEY))) continue;
         if (publication === "subscription-refresh" && target.auth_mode !== "subscription") continue;
         if (publication === "api-key-refresh" && target.auth_mode !== "api_key") continue;
         const queuedRefreshStop = publication === "subscription-refresh-prepare-failure" || publication === "subscription-refresh-cancel";
-        if (queuedRefreshStop && (oldClaim !== API_KEY || target !== SUBSCRIPTION || phase !== "factory")) continue;
+        const crashRecovery = publication === "crash-login-recovery";
+        if ((queuedRefreshStop || crashRecovery) && (oldClaim !== API_KEY || target !== SUBSCRIPTION || phase !== "factory")) continue;
       it(publication === "baseline"
         ? `M2 actualRunner ${oldClaim.auth_mode} to ${target.auth_mode} ${phase} account resumes saved thread`
         : publication === "gated" ? `Codex ${oldClaim.auth_mode} to ${target.auth_mode} publication gates Now, retired A and B preparation children; finished B root dispatch admits work`
+        : crashRecovery ? "Codex switch crash during B login retains committed B"
         : publication === "subscription-refresh" ? "Codex subscription startup refresh stays deferred until B finish"
         : publication === "subscription-refresh-prepare-failure" ? "Codex queued subscription refresh settles on B preparation failure"
         : publication === "subscription-refresh-cancel" ? "Codex queued subscription refresh settles on cancellation after B preparation"
@@ -32311,6 +32315,8 @@ describe("M2 actualRunner credential replacement", () => {
         claim.secrets = { ...claim.secrets, codex: oldClaim as import("../src/protocol.js").ClaimCodexSecrets };
         api.setOwnershipStatus(claim.run_id, "running", 7);
         let pending = false, cancelled = false, applies = 0, hooks = 0, factories = 0, preflights = 0;
+        let predecessorFenced = false;
+        let committedCodex = claim.secrets.codex!;
         let context!: RunContext;
         let clockOffset = 0;
         const nowEntered = installerBarrier(), nowAborted = installerBarrier(), nowContinue = installerBarrier();
@@ -32337,7 +32343,7 @@ describe("M2 actualRunner credential replacement", () => {
         client.supportsInPlaceCodexCredentialSwitch = () => true;
         const feature = client.hasFeature.bind(client);
         client.hasFeature = name => name === "credential_switch_hold" || feature(name);
-        client.getRunOwnership = async () => ({ status: "running", claim_generation: 7,
+        client.getRunOwnership = async () => ({ status: "running", claim_generation: predecessorFenced ? 8 : 7,
           claim_released: false, hold_reason: null });
         client.getInputs = async () => ({ inputs: [], nowSummary: true, ...((cancelled || api.messages(claim.run_id).some(m => m.kind === "progress_note" && m.credential_epoch_ordinal === 1 && String(m.payload.text).startsWith("Inspecting B"))) ? { terminalCancelled: { run_id: claim.run_id, generation: 7 } } : {}),
           ...(pending ? { credentialSwitch: { generation: 7, op_id: "M2-op", target_secret_id: "M2-target" } } : {}) });
@@ -32347,6 +32353,7 @@ describe("M2 actualRunner credential replacement", () => {
         client.applyCredentialSwitch = async (_id, req) => {
           applyRequests.push({ claimGeneration: req.claimGeneration, opId: req.opId });
           applies++; pending = false;
+          committedCodex = next; // Simulated committed row, not evidence of DB durability.
           return { kind: "codex_applied", codex: next, ordinal: 1,
             capabilityEpoch: 42, messageSeq: 7, replay: false };
         };
@@ -32367,7 +32374,7 @@ describe("M2 actualRunner credential replacement", () => {
           barrier.entered.resolve();
           await barrier.proceed.promise;
           if ((publication === "publish-failure" && stage === "after-publish") ||
-              (publication === "login-failure" && stage === "login") ||
+              ((publication === "login-failure" || crashRecovery) && stage === "login") ||
               (publication === "subscription-refresh-prepare-failure" && stage === "prepared"))
             throw new Error(`injected ${stage} failure`);
         };
@@ -32417,6 +32424,7 @@ describe("M2 actualRunner credential replacement", () => {
         };
         const launch = rig.deps.launchEffectRoot!;
         let effects = 0;
+        const disposedEffects = new Set<number>();
         const adoptedDestinations: string[] = [];
         rig.deps = { ...rig.deps,
           wireFileop: () => { const handle = fakeFileopHandle(); fileops.push(handle); return handle.handle; },
@@ -32426,6 +32434,7 @@ describe("M2 actualRunner credential replacement", () => {
             root.dispose = async (...disposeArgs) => {
               if (epoch === 0) { cleanupStarts++; events.push("A-cleanup-start"); cleanupEntered.resolve(); await cleanupContinue.promise; }
               const result = await dispose(...disposeArgs);
+              if (result.clean) disposedEffects.add(epoch);
               if (epoch === 0) events.push("A-effect-disposed");
               return result;
             };
@@ -32785,6 +32794,7 @@ describe("M2 actualRunner credential replacement", () => {
                   } });
                   assert.equal(bFinished, false, "API-key auth owner refuses before B finish");
                 }
+                if (crashRecovery && barrier.stage === "login") predecessorFenced = true;
                 // Join the event queue without a wall-clock sleep.
                 await new Promise<void>(resolve => setImmediate(resolve));
                 assert.equal(nowBuilds.length, builds, "ordinary Now cannot construct a half-published harness");
@@ -32797,11 +32807,11 @@ describe("M2 actualRunner credential replacement", () => {
                   assert.deepEqual(nowPublicationProbes, ["before-Now-publish", "after-Now-publish"]);
               } finally { barrier.proceed.resolve(); }
               if ((publication === "publish-failure" && barrier.stage === "after-publish") ||
-                  ((publication === "login-failure" || publication === "api-key-refresh") && barrier.stage === "login") ||
+                  ((publication === "login-failure" || publication === "api-key-refresh" || crashRecovery) && barrier.stage === "login") ||
                   (queuedRefreshStop && barrier.stage === "prepared") ||
                   (publication === "now-publish-failure" && barrier.stage === "after-publish")) break;
             }
-            assert.equal(consumerProbes.length, publication === "publish-failure" || publication === "now-publish-failure" ? 2 : (publication === "login-failure" || publication === "api-key-refresh") ? 4 : 5);
+            assert.equal(consumerProbes.length, publication === "publish-failure" || publication === "now-publish-failure" ? 2 : (publication === "login-failure" || publication === "api-key-refresh" || crashRecovery) ? 4 : 5);
             if (publication !== "gated" && publication !== "subscription-refresh") {
               await withTimeout(running, 5000, "failed publication retained stop");
               assert.equal(reopenAttempts, 0);
@@ -32829,7 +32839,7 @@ describe("M2 actualRunner credential replacement", () => {
                 // Cleanup must not publish success or a replacement owner hold.
                 assert.equal(context.terminalLifecycleSignal?.aborted, true);
                 assert.ok(!reports.includes("completed") && !reports.some(status => status.startsWith("credential_switch")));
-              } else {
+              } else if (!crashRecovery) {
                 assert.ok(reports.some(status => status.startsWith("credential_switch")), "Runner reports owner hold");
                 if (publication === "subscription-refresh-prepare-failure") {
                   assert.ok(dispositions.some(body => body.status === "credential_switch_uncertain" && body.failure_reason === "initialization_failed"),
@@ -32839,6 +32849,196 @@ describe("M2 actualRunner credential replacement", () => {
               }
               assert.equal(await fs.readFile(path.join(worktree, "M2-retained.txt"), "utf8"), "A work");
               assert.equal(await CodexSessionStore.inspectSession(store, savedId), "present");
+              if (crashRecovery) {
+                // Model worker loss by fencing generation 7 at the held login, then
+                // join its cleanup. The injected transport failure is NOT an abrupt
+                // process crash. LiveDB tests separately prove commit/remint authority.
+                assert.equal(predecessorFenced, true);
+                for (const epoch of [a, b]) {
+                  assert.ok(epoch.reaped() > 0, "predecessor provider root quiescent before recovery");
+                  assert.ok(epoch.disposed() > 0);
+                }
+                assert.ok(effects >= 2, "both predecessor epochs launched tools");
+                assert.equal(disposedEffects.size, effects, "every launched predecessor effect root proved disposal");
+                for (const handle of fileops) assert.ok(handle.disposed() > 0);
+                assert.throws(() => owners[0]!.guard(), /authority|aborted|admission|closed/i);
+                const predecessorSends = [a.transport.requests.length, b.transport.requests.length];
+                const recovered: ClaimResponse = { ...claim, claim_generation: 8, session_id: savedId,
+                  last_seq: api.messages(claim.run_id).reduce((seq, message) => Math.max(seq, message.seq), 0),
+                  secrets: { ...claim.secrets, codex: { ...committedCodex, capability: "M3-reminted-capability" } } };
+                api.setOwnershipStatus(claim.run_id, "running", 8);
+                client.getRunOwnership = async () => ({ status: "running", claim_generation: 8,
+                  claim_released: false, hold_reason: null });
+                let recoveryWorkSent = false;
+                client.getInputs = async () => ({ inputs: [], ...(recoveryWorkSent
+                  ? { terminalCancelled: { run_id: recovered.run_id, generation: 8 } } : {}) });
+                client.applyCredentialSwitch = async () => { throw new Error("recovery must not replay apply"); };
+                await CodexSessionStore.persist(source, path.join(m2Runner.homeDir, "codex-session-store"));
+                let executedRecoveryRig: ReturnType<typeof makeRig> | undefined;
+                let executedRecoveryExecutor: CodexExecutor | undefined;
+                let recoveryBodies = 0, recoveryFactories = 0;
+                let readinessLaunches = 0, readinessWaits = 0, readinessDisposals = 0;
+                const readinessResults: string[] = [];
+                const releases: unknown[] = [];
+                const buildRecovery = () => {
+                  const recoveryRig = makeRig({ responder: c => {
+                    if (c.method === "thread/start") return { thread: { id: "M3-recovered-fresh-thread" } };
+                    if (c.method === "thread/resume") throw new Error("fresh-checkout recovery must disclose a lineage break");
+                    if (c.method === "turn/start") {
+                      const tn = "M3-recovery-turn";
+                      recoveryWorkSent = true;
+                      return { turn: { id: tn } };
+                    }
+                    return {};
+                  } });
+                  const adopted = path.join(dir, `recovery-adopted-${recoveryFactories++}`);
+                  const launchRecoveryEffect = recoveryRig.deps.launchEffectRoot!;
+                  recoveryRig.deps = { ...recoveryRig.deps, deferRegistryTeardown: true,
+                    launchEffectRoot: async (spec, deadline) => forwardCredentialFreeGitRoot(spec, deadline,
+                      await launchRecoveryEffect(spec, deadline)), sessionStore: {
+                    ...recoveryRig.deps.sessionStore!,
+                    inspect: async () => "present",
+                    inspectSession: async (_dir, id) => CodexSessionStore.inspectSession(store, id),
+                    adopt: async () => { await fs.mkdir(adopted, { recursive: true }); return CodexSessionStore.adopt(store, adopted); },
+                    persist: async () => CodexSessionStore.persist(source, store),
+                  } };
+                  recoveryRig.client.releaseCodex = async (_id, req) => {
+                    releases.push(req.capability);
+                    assert.equal(req.capability, recovered.secrets.codex!.capability);
+                    return { access_token: committedCodex.access_token };
+                  };
+                  const recoveryExecutor = makeExecutor(recoveryRig, bindingOf(recovered.secrets.codex!), noopLog,
+                    undefined, provider, m2Runner.homeDir);
+                  const recoveryRun = recoveryExecutor.run.bind(recoveryExecutor);
+                  recoveryExecutor.run = async ctx => {
+                    executedRecoveryRig = recoveryRig; executedRecoveryExecutor = recoveryExecutor;
+                    recoveryBodies++;
+                    assert.ok(readinessLaunches > 0, "retained readiness ran before model admission");
+                    assert.equal(readinessWaits, readinessLaunches);
+                    assert.equal(readinessDisposals, readinessLaunches, "readiness disposed before recovered executor body");
+                    assert.equal(ctx.sessionId, undefined, "normal recovery drops the persisted candidate when cwd changes");
+                    assert.equal(await fs.readFile(path.join(ctx.worktreePath, "M2-retained.txt"), "utf8"), "A work");
+                    const result = await recoveryRun(ctx);
+                    assert.equal(await fs.readFile(path.join(adopted, "sessions", `rollout-${savedId}.jsonl`), "utf8"), "{}\n");
+                    await assert.rejects(fs.access(path.join(adopted, "auth.json")));
+                    return result;
+                  };
+                  return { executor: recoveryExecutor, homeDir: m2Runner.homeDir };
+                };
+                // A distinct Runner/flight and executor consume the recovered claim.
+                const recoveryLog = recordingLogger();
+                const recoveryRunner = m2Runner.runnerWith(buildRecovery,
+                  m2Runner.fakeGitlab().gitlab, undefined, recoveryLog.logger);
+                // Fake UID metadata and supervisor lifecycle only: this is not a real
+                // abrupt crash or kernel confinement/security proof. The supplied helper
+                // runs unchanged against real descriptors, bytes, modes and alternates;
+                // production worker-side attribution/revalidation remains in place.
+                const readinessProbe = mock.method(m2Runner.git as unknown as {
+                  retainedReadinessLaunch: typeof import("../src/codex/launcher.js").launchCodexEffectRoot;
+                }, "retainedReadinessLaunch", async (spec: CodexEffectLaunchSpec) => {
+                  readinessLaunches++;
+                  assert.equal(spec.identity, "command");
+                  assert.equal(spec.command, process.execPath);
+                  assert.equal(spec.cwd, "/");
+                  assert.equal(spec.supervisorBin, SUPERVISOR_BIN);
+                  assert.deepEqual(spec.env, { LANG: "C" });
+                  assert.equal(spec.args[0], "-e");
+                  assert.equal(spec.args.length, 3);
+                  const program = spec.args[1]!;
+                  const payload = spec.args[2]!;
+                  const { roots, identities, deadline } = JSON.parse(payload) as {
+                    roots: string[]; identities: string[]; deadline: number;
+                  };
+                  assert.deepEqual(roots.slice(0, 3), [worktree, path.join(worktree, ".git"), path.join(worktree, ".git/objects")]);
+                  assert.equal(roots.length, 5);
+                  assert.equal(roots[4], path.join(roots[3]!, "objects"));
+                  assert.equal(identities.length, 5);
+                  assert.ok(deadline > Date.now());
+                  roots.forEach((root, i) => {
+                    const st = syncFs.lstatSync(root);
+                    assert.ok(st.isDirectory() && !st.isSymbolicLink());
+                    assert.equal(identities[i], `${st.dev}:${st.ino}`);
+                  });
+                  const rootIds = new Set(identities.slice(0, 2));
+                  const objectId = identities[2];
+                  const adapter = {
+                    ...syncFs,
+                    fstatSync(fd: number) {
+                      const st = syncFs.fstatSync(fd);
+                      const id = `${st.dev}:${st.ino}`;
+                      // Only identity fields are synthetic; type, modes, link count,
+                      // inode stability and all filesystem operations remain real.
+                      const uid = rootIds.has(id) ? 10003
+                        : id === objectId && st.uid !== 10003 ? 10002 : 10003;
+                      Object.assign(st, { uid, gid: 10002 });
+                      return st;
+                    },
+                  };
+                  const stdout = new PassThrough(), stderr = new PassThrough();
+                  let waited = false, disposed = false;
+                  return {
+                    started: { uid: 10003, liveCapsZero: true, noNewPrivs: true },
+                    transport: { stdin: new PassThrough(), stdout, stderr },
+                    async waitChild() {
+                      assert.equal(waited, false); waited = true; readinessWaits++;
+                      let output = "";
+                      vm.runInNewContext(program, {
+                        require(name: string) { assert.equal(name, "node:fs"); return adapter; },
+                        process: { argv: ["node", payload], platform: "linux",
+                          getuid: () => 10003, getgroups: () => [10002],
+                          stdout: { write(text: string) { output += text; } } },
+                        Buffer, Date,
+                      }, { timeout: 5000 });
+                      readinessResults.push(output);
+                      stdout.end(output); stderr.end();
+                      return { code: 0 };
+                    },
+                    async dispose() {
+                      assert.equal(waited, true);
+                      assert.equal(disposed, false); disposed = true; readinessDisposals++;
+                      return { clean: true };
+                    },
+                  } as unknown as CodexRootHandle;
+                });
+                const recoveryFlight = recoveryRunner.execute(recovered);
+                try {
+                  await withTimeout(recoveryFlight, 10000, "distinct committed B recovery flight").catch(error => {
+                    throw new Error(JSON.stringify({ readinessLaunches, readinessWaits, readinessDisposals, readinessResults,
+                      recoveryBodies, recoveryFactories, releases: releases.length, logs: recoveryLog.lines.slice(-12) }), { cause: error });
+                  });
+                } finally {
+                  recoveryRunner.shutdown();
+                  await recoveryFlight;
+                  readinessProbe.mock.restore();
+                }
+                assert.ok(readinessLaunches > 0);
+                assert.equal(readinessWaits, readinessLaunches);
+                assert.equal(readinessDisposals, readinessLaunches);
+                assert.equal(readinessResults.length, readinessLaunches);
+                for (const output of readinessResults) assert.match(output, /^ok [1-9][0-9]* [0-9]+\n$/);
+                assert.equal(recoveryBodies, 1, JSON.stringify(recoveryLog.lines.slice(-12)));
+                assert.ok(releases.length > 0, "real recovery auth bridge consumed reminted capability");
+                assert.ok(executedRecoveryExecutor && executedRecoveryRig);
+                const authority = (executedRecoveryExecutor as unknown as {
+                  currentCodexAuthority: ReturnType<typeof createCodexEpochAuthority>;
+                }).currentCodexAuthority;
+                assert.equal(authority.binding.capability, recovered.secrets.codex!.capability);
+                assert.equal(authority.ordinal, 0, "new flight starts its server-owned usage baseline");
+                assert.equal(authority.capabilityEpoch, undefined, "never inherits predecessor switch metadata");
+                const requests = executedRecoveryRig.transport.requests;
+                const login = requests.find(r => r.method === "account/login/start");
+                assert.ok(login);
+                assert.equal(rec(login.params).accessToken, committedCodex.access_token);
+                assert.equal(rec(login.params).chatgptAccountId, next.auth_mode === "subscription" ? next.chatgpt_account_id : undefined);
+                assert.deepEqual(requests.filter(r => r.method === "thread/start" || r.method === "thread/resume")
+                  .map(r => [r.method, rec(r.params).threadId]), [["thread/start", undefined]]);
+                assert.ok(api.messages(claim.run_id).some(message => message.kind === "status" &&
+                  rec(message.payload).event === "resume_lineage_break"), "changed-cwd recovery visibly discloses lost conversation lineage");
+                assert.ok(requests.some(r => r.method === "turn/start"), "recovered executor actually sends work");
+                assert.deepEqual([a.transport.requests.length, b.transport.requests.length], predecessorSends,
+                  "fenced predecessor never sends during recovery");
+                assert.equal(applies, 1);
+              }
               return;
             }
           }
