@@ -48,6 +48,9 @@ export interface ChildSpec {
   /** issue #3885: a digest to try (and have refused) before the freshly described one is confirmed. */
   staleConfirm?: string;
   marker: string;
+  /** issue #4377 (test only): hold the marker write after its temp file is created and before it is written and
+   *  renamed; the child creates `<markerGate>.opened`, then waits for `<markerGate>` to exist. */
+  markerGate?: string;
   result: string;
   /** Base URL of the fake worker API the parent hosts (http://127.0.0.1:<port>). */
   apiUrl: string;
@@ -66,10 +69,20 @@ function writeResult(value: unknown): void {
   fsSync.renameSync(tmp, spec.result);
 }
 
-/** Announce the seam and stop here forever. The interval keeps the loop alive: only SIGKILL ends this. */
+/** Announce the seam and stop here forever. The interval keeps the loop alive: only SIGKILL ends this.
+ *  issue #4377: the parent polls for the marker and then reads it, so publish it atomically (a sibling temp
+ *  file, then a rename, as writeResult does); a created-but-unwritten marker would read as empty. */
 async function block(point: KillAt): Promise<never> {
   setInterval(() => undefined, 1000);
-  fsSync.writeFileSync(spec.marker, point);
+  const tmp = spec.marker + ".tmp";
+  const fd = fsSync.openSync(tmp, "w");
+  if (spec.markerGate) {
+    fsSync.writeFileSync(`${spec.markerGate}.opened`, "");
+    while (!fsSync.existsSync(spec.markerGate)) await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  fsSync.writeSync(fd, point);
+  fsSync.closeSync(fd);
+  fsSync.renameSync(tmp, spec.marker);
   await new Promise<never>(() => undefined);
   throw new Error("unreachable");
 }
