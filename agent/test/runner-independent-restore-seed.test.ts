@@ -93,6 +93,27 @@ async function restoreRig(o: RigOptions = {}): Promise<{ r: Rig; seen: Record<st
 describe("the independent restore (issue #3644 m4b)", () => {
   beforeEach(() => { resetRigRoots(); });
 
+  it("CrashRestoreUsesVerifiedPinWithoutPredecessorReuse: dead active predecessor uses only the verified pin", async () => {
+    const { r, seen } = await restoreRig();
+    advanceP(r);
+    const before = await pFacts(r);
+    assert.equal(before.slot?.state, "active");
+    const traps = armTraps(r);
+    try { await r.runner.execute(r.claim); } finally { traps.armed = false; }
+    assert.equal(traps.hits.length, 0, String(traps.hits[0] ?? "no predecessor filesystem or Git access"));
+    assert.deepEqual(traps.calls, {}, "no predecessor adoption, capture or recovery reservation");
+    assert.equal(failed(r).length, 0);
+    assert.equal(refusals(r).length, 0);
+    assert.equal(logged(r, "independent restore seeded").length, 1);
+    assert.equal(seen.head, r.pinSha);
+    assert.notEqual(seen.worktree, r.pPath);
+    assert.equal(seen.untracked, false);
+    assert.equal((seen.tracked as string[]).includes("UNPINNED.txt"), false);
+    assert.deepEqual(await pFacts(r), before);
+    // This existing restore rig represents a dead predecessor; it does not drive
+    // the source-end hold transaction or simulate loss of its server ACK.
+  });
+
   it("seeds one distinct attempt from the verified pin, runs it on HOME <runId>.g<N>, and leaves the predecessor byte-identical", async () => {
     const { r, seen } = await restoreRig();
     const pHead = advanceP(r);
@@ -1259,7 +1280,7 @@ describe("a predecessor at the canonical clone path is not restorable (issue #36
   it("a journal that keeps an attempt id on the canonical path is not the canonical shape: predecessor_path, the unchanged refusal, no park", async () => {
     const { r } = await restoreRig({ features: [...FEATURES, PARK_FEATURE] });
     // P's journal and `live` ledger entry name the canonical path while the journal still carries an attempt id; its active foreign slot is keyed there.
-    const canonical = r.pPath.replace(/\.attempt-.*$/, "");
+    const canonical = path.join(path.dirname(r.pPath), path.basename(r.pPath).replace(/\.attempt-.*$/, ""));
     assert.notEqual(canonical, r.pPath);
     fs.mkdirSync(canonical, { recursive: true });
     await r.pRt.withTransaction(() => r.pRt.hooks.admitSourceUse(canonical, "seed-canonical"));

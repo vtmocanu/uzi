@@ -1707,6 +1707,7 @@ export class WorkerClient {
    *  `registration_evidence`. Sticky until the next register(); a heartbeat feature refresh does
    *  not reopen it, which is why it is not simply dropFeature(). */
   private registrationEvidenceDropped = false;
+  private readonly witnessedRunning = new Map<string, RunRegistrationEvidence>();
   /** Issue #4257: same shape for `checkpoint_publication`; sticky until the next register(). */
   private checkpointPublicationDropped = false;
 
@@ -2045,6 +2046,7 @@ export class WorkerClient {
     this.hibernationPruneAdvertised = false;
     this.registerNonce = undefined;
     this.registrationEvidenceDropped = false;
+    this.witnessedRunning.clear();
     this.checkpointPublicationDropped = false;
     this.registrationReport = undefined;
     const originalCapabilities = Array.isArray(protocolCapabilities) ? [...protocolCapabilities] : undefined;
@@ -3080,6 +3082,9 @@ export class WorkerClient {
           body.status !== "recovery_wait" || !Number.isSafeInteger(body.claim_generation) ||
           (body.claim_generation ?? 0) < 1) throw new Error("retained recovery park requires support and a positive generation");
       // This contract cannot degrade to an unfenced or untyped recovery park on rollback.
+      if (body.recovery_detail === "source_end_declined" &&
+          (body.register_nonce !== this.sourceEndDeclinedRegistration(runId, body.claim_generation!) ||
+           !body.register_nonce)) throw new Error("source end hold requires current running witness");
       const evidence: StateAttemptEvidence = { ambiguous: false, refusals: 0 };
       try {
         return await this.reportStateOnce(runId, path, Object.freeze({ ...body }), signal, CROSS_CHECK_RESPONSE_MAX_BYTES, evidence);
@@ -3301,7 +3306,33 @@ export class WorkerClient {
       throw err;
     }
     if (body.completion_final_head !== undefined && !this.hasFeature("recovery_completed_publication_v1")) ack.completedPublicationReason = "unsupported_feature";
+    if (witness && (ack.status === "running" ||
+        (ack.status === "claimed" && !ack.applied && ack.runId === runId &&
+          ack.workerIdentityMatches === true && ack.sentClaimGeneration === witness.claim_generation &&
+          !ack.credentialSwitchReleased && !ack.credentialSwitchHeld && !ack.credentialSwitchUncertain)) &&
+        ack.registrationEvidence === "recorded" && !ack.staleClaim && !ack.credentialSwitch &&
+        !this.registrationEvidenceDropped && this.registerNonce === witness.register_nonce) {
+      // A refused running transition can still persist registration evidence on a claimed row.
+      // This capability only enables the exact source-end hold; it never changes the running ACK.
+      // Witnesses remain valid for this registration, including while a hold ACK is in flight.
+      // Keep one per run until re-registration clears witnessedRunning; unrelated ACKs must
+      // never revoke an active run's exact-generation capability. A delayed ACK from an older
+      // claim generation must not replace a newer generation's witness.
+      const held = this.witnessedRunning.get(runId);
+      if (!held || held.register_nonce !== witness.register_nonce || held.claim_generation <= witness.claim_generation) {
+        this.witnessedRunning.set(runId, witness);
+      }
+    }
     return ack;
+  }
+
+  /** Read-only capability: only an acknowledged running report of this exact registration and claim. */
+  sourceEndDeclinedRegistration(runId: string, generation: number): string | undefined {
+    const witness = this.witnessedRunning.get(runId);
+    if (this.registrationEvidenceDropped || !this.hasFeature("retained_source_end_hold_v1") ||
+        !this.hasFeature(RUN_REGISTRATION_EVIDENCE_FEATURE) || !this.registerNonce ||
+        witness?.register_nonce !== this.registerNonce || witness.claim_generation !== generation) return undefined;
+    return this.registerNonce;
   }
 
   /** Issue #4257: the stamped checkpoint-publication diagnostic for a `running` report, or
@@ -3471,6 +3502,7 @@ export class WorkerClient {
             applied: res.status === 200,
             status: fields.status,
             ...(fields.recoveryCause !== undefined ? { recoveryCause: fields.recoveryCause } : {}),
+            ...(fields.recoveryDetail !== undefined ? { recoveryDetail: fields.recoveryDetail } : {}),
           };
           // parkWorkerMemoryPressure returns 409 only for exact replay when these DTO fields
           // match and no decline/switch disposition is present. Generation/nonce stay in the
@@ -6216,6 +6248,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
   runId?: unknown;
   workerId?: unknown;
   recoveryCause?: string;
+  recoveryDetail?: string;
   memoryEpisode?: number;
   memoryParkUndisposed?: boolean;
   status?: string;
@@ -6271,6 +6304,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
         worker_id?: unknown;
         status?: unknown;
         recovery_wait_cause?: unknown;
+        recovery_wait_detail?: unknown;
         memory_hold?: unknown;
         // PRD #1497 M2: the run's hold_reason on the RunDTO, read beside `status` to recognise a
         // SERVER-side wall park (paused + budget_exhausted) from a fenced stale-claim ACK.
@@ -6316,6 +6350,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
       runId?: unknown;
       workerId?: unknown;
       recoveryCause?: string;
+      recoveryDetail?: string;
       memoryEpisode?: number;
       memoryParkUndisposed?: boolean;
       status?: string;
@@ -6374,6 +6409,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
     if (run?.worker_id !== undefined) out.workerId = run.worker_id;
     if (typeof run?.status === "string") out.status = run.status;
     if (typeof run?.recovery_wait_cause === "string") out.recoveryCause = run.recovery_wait_cause;
+    if (typeof run?.recovery_wait_detail === "string") out.recoveryDetail = run.recovery_wait_detail;
     if (isRecord(run?.memory_hold) && memoryNatural(run.memory_hold.episode))
       out.memoryEpisode = run.memory_hold.episode;
     // Presence, even malformed/null, blocks authority rather than degrading to absence.

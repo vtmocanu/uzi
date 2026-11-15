@@ -143,3 +143,19 @@ it("a 409 on Resume shows the server message", async () => {
   await waitFor(() => expect(screen.getByText(message)).toBeTruthy());
   expect(resumeBtn().disabled).toBe(false);
 });
+
+it("source-end decline explains guarded attempts, re-announces and keeps owner Cancel", async () => {
+  const { container, rerender } = render(view(adoption(null)));
+  const region = container.querySelector('div.sr-only[role="status"]')!;
+  await waitFor(() => expect(region.textContent).toMatch(/Resume or Cancel/));
+  rerender(view(adoption("source_end_declined")));
+  await waitFor(() => expect(region.textContent).toMatch(/earlier flight declined source-use end/));
+  expect(screen.getAllByText(/A different worker registration only enables a guarded attempt/).length).toBeGreaterThan(0);
+  expect(screen.getAllByText(/archive may omit the latest work/).length).toBeGreaterThan(0);
+  expect(resumeBtn().disabled).toBe(false);
+  vi.mocked(api.resumeRun).mockRejectedValueOnce(new ApiError(409, "Resume refused: unchanged worker registration"));
+  fireEvent.click(resumeBtn());
+  await waitFor(() => expect(screen.getByText("Resume refused: unchanged worker registration")).toBeTruthy());
+  fireEvent.click(screen.getByRole("button", { name: /^Cancel$/ }));
+  await waitFor(() => expect(submit).toHaveBeenCalledWith("cancel", "", undefined, undefined, false));
+});

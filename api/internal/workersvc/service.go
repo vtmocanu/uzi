@@ -4552,13 +4552,13 @@ type StateRequest struct {
 	// httpx.DecodeJSON rejects unknown fields, so a worker sends it only once the api advertises
 	// the retained_recovery_capacity_hold_v1 feature.
 	RetainedCapacityOnly *bool `json:"retained_capacity_only,omitempty"`
-	// RecoveryDetail qualifies a recovery_cause "retained_recovery_adoption_failed" park (issue
-	// #4177) with a closed-set sub-cause: "secret_remediation_active" (retrying unchanged cannot
-	// help; Resume is refused) or "remediation_proof_unknown" (a retry may help). Absent means
-	// unclassified and never permits anything new. SetState rejects any other value, state or
-	// cause, or a missing or non-positive claim_generation, as ErrInvalidState (400) before any
-	// SQL (validateRecoveryDetail). httpx.DecodeJSON rejects unknown fields, so a worker sends it
-	// only once the api advertises the recovery_detail_adoption_refusal_v1 feature.
+	// RecoveryDetail qualifies a recovery_cause "retained_recovery_adoption_failed" park with
+	// "secret_remediation_active" (Resume refused), "remediation_proof_unknown" (retry may help),
+	// or "source_end_declined" (requires register_nonce). Absent means unclassified. SetState
+	// rejects other values, states, causes or non-positive/missing claim_generation before SQL
+	// as ErrInvalidState (validateRecoveryDetail). The first two require the advertised feature
+	// recovery_detail_adoption_refusal_v1; source_end_declined requires retained_source_end_hold_v1
+	// paired with run_registration_evidence_v1. httpx.DecodeJSON rejects unknown fields.
 	RecoveryDetail *string `json:"recovery_detail,omitempty"`
 	// ProductiveTurns qualifies a recovery_cause "provider_outage" park (PRD #1733): the number
 	// of model turns the PARKING FLIGHT completed without error since its claim. A positive value
@@ -4743,7 +4743,8 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 	if err != nil {
 		return store.Run{}, false, err
 	}
-	if ownerHoldRefusesReport(owned, req) {
+
+	if (req.RecoveryDetail == nil || *req.RecoveryDetail != RecoveryDetailSourceEndDeclined) && ownerHoldRefusesReport(owned, req) {
 		if req.ClaimGeneration != nil && (owned.ClaimGeneration != *req.ClaimGeneration || owned.ClaimReleasedAt.Valid) {
 			return owned, false, ErrStaleClaim
 		}
@@ -4760,6 +4761,10 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 	if err := validateCappedReportOnly(owned, req); err != nil {
 		return owned, false, err
 	}
+	if req.RecoveryDetail != nil && *req.RecoveryDetail == RecoveryDetailSourceEndDeclined {
+		return s.parkSourceEndDeclined(ctx, wkr, runID, req)
+	}
+
 	if s.txBeginner == nil && parentTx == nil && semanticCompletionRequiresLock(owned) &&
 		(stateUsesGenerationFence(req.State, owned) || req.State == "pause_failed" ||
 			req.State == stateClarificationSettled ||

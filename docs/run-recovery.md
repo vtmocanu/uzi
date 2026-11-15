@@ -65,6 +65,10 @@ For operators investigating checkpoint acknowledgement failures, see
 HTTP evidence boundary and a deployment comparison procedure. An unknown
 acknowledgement does not prove that origin rejected the update.
 
+For a definitive declined source end, follow the
+[source-end declined hold instructions](./run-recovery-wait.md#source-end-declined-hold).
+This is distinct from an uncertain source end or a settled memory park.
+
 ## Memory-pressure holds
 
 With the [proactive memory guard](./worker-setup.md#proactive-memory-guard)
@@ -135,14 +139,18 @@ leaves the slot ineligible, so the run continues normally on Resume). The
 record may be missing because of an unknown authority incarnation or source
 epoch, a stopped or protected source, a write failure, or a timeout whose write
 did not land (a write already holding the bare lock may still land, and Resume
-then re-parks). Without a record, on a different worker process (for example
-after a restart, when the slot is foreign-active), or when the successor lacks
-the memory guard, the existing flow runs and the run fails as
-`preservation_failed`, as before. Without a record on the same worker process
+then re-parks). Without a record, a different worker process now takes the
+eligible #3644 verified-pin restore route; otherwise that route refuses
+nonterminally or holds an unsupported predecessor. Outside that route,
+including a successor lacking the required memory support, the terminal
+`preservation_failed` fallback remains. Restore preserves the predecessor and
+may omit edits after the verified pin. Without a record on the same worker process
 (the earlier flight's source end unconfirmed), the claim stops without failing
 ("held by an earlier flight's unended source use") and retries until the requeue
 cap, then ends in `worker_requeue_exhausted` or `failed` per the existing
-exhaustion rule; this is new with #3638, not as before.
+exhaustion rule; this is new with #3638, not as before. A positive definitive
+source-end decline now takes the separate owner-held `source_end_declined`
+path linked above; sink retirement or an uncertain end alone does not qualify.
 
 At the two retained-predecessor refusals inside retained recovery (before capture
 or model execution), a worker can observe an already accepted owner **Cancel**
@@ -170,8 +178,9 @@ the fresh worker logs `predecessor cooperative settlement verified` or
 issue on that worker, meeting another flight's unconfirmed source end, now stops
 without failing until the requeue cap, then ends in `worker_requeue_exhausted`
 (or `failed` per the existing exhaustion rule). A crash after the park was
-accepted but before the worker finished tearing down leaves no record and
-follows the existing terminal path.
+accepted but before the worker finished tearing down can leave no record;
+the eligible #3644 restore route now applies instead of an unconditional
+terminal outcome.
 
 A successor that meets a terminal owner whose completed source is not yet retired
 (#3645) takes the same kind of stop. The owner's journal carries a

@@ -209,7 +209,13 @@ describe("RunRunner — cache drop on a process-ending park (PRD #1809 M1)", () 
         };
       };
       const runId = "18090000-0000-4000-8000-000000001813";
-      await runnerWith(factory, gitlab).execute(gitlabClaim(1813, { run_id: runId, wait_on_limit: true }));
+      const log = recordingLogger();
+      await runnerWith(factory, gitlab, undefined, log.logger).execute(gitlabClaim(1813, { run_id: runId, wait_on_limit: true }));
+      const summaries = (log.lines as Array<Record<string, unknown>>)
+        .filter(line => line.msg === "source use teardown summary");
+      assert.equal(summaries.length, 1);
+      assert.equal(summaries[0]!.park_reap, true);
+      assert.equal(JSON.stringify(summaries).includes(home), false);
       assert.ok(api.states.some((s) => s.runId === runId && s.body.status === "limit_wait"), "precondition: parked");
       assert.ok(events.includes("reap"), `the attributed reap ran (${JSON.stringify(events)})`);
       assert.deepStrictEqual(cachesAtReap, [true, true, true], "it ran while the caches were still there: before the drop");
@@ -246,7 +252,14 @@ describe("RunRunner — cache drop on a process-ending park (PRD #1809 M1)", () 
           };
         };
         const runId = "18090000-0000-4000-8000-000000001828";
-        await runnerWith(factory, gitlab).execute(gitlabClaim(1828, { run_id: runId, wait_on_limit: true, claim_generation: 1 }));
+        const log = recordingLogger();
+        await runnerWith(factory, gitlab, undefined, log.logger).execute(gitlabClaim(1828, { run_id: runId, wait_on_limit: true, claim_generation: 1 }));
+        const summaries = (log.lines as Array<Record<string, unknown>>)
+          .filter(line => line.msg === "source use teardown summary");
+        assert.equal(summaries.length, 1);
+        assert.equal(summaries[0]!.park_reap, false);
+        for (const secret of [home, runId, "reap exploded"])
+          assert.equal(JSON.stringify({ ...summaries[0], run_id: undefined, issue_iid: undefined }).includes(secret), false);
         assert.ok(api.states.some((s) => s.runId === runId && s.body.status === "limit_wait"), "precondition: parked");
         assertCachesKept(home);
         assertResumeStateKept(home);

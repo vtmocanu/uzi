@@ -464,6 +464,7 @@ func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled, publication
 		// and refuses Resume for the secret_remediation_active value. A worker sends the field ONLY
 		// after seeing this token, because an older api's strict decoder 400s the unknown field.
 		{workersvc.RecoveryDetailFeature},
+		{workersvc.RetainedSourceEndHoldFeature},
 		// Issue #3859: this api accepts the nested registration_evidence object on a `running`
 		// report ({register_nonce, claim_generation, registration_epoch}) and answers
 		// registration_evidence "recorded" | "refused" on the ACK, whether or not the status write
@@ -1678,6 +1679,25 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 			slog.Error("worker run state", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 		}
+		return
+	}
+	if !applied && req.State == "recovery_wait" && req.RecoveryCause != nil &&
+		*req.RecoveryCause == "retained_recovery_adoption_failed" && req.RecoveryDetail != nil &&
+		*req.RecoveryDetail == workersvc.RecoveryDetailSourceEndDeclined && req.ClaimGeneration != nil &&
+		*req.ClaimGeneration > 0 && run.ClaimGeneration == *req.ClaimGeneration && req.RegisterNonce != "" &&
+		run.Status == "recovery_wait" && run.RecoveryWaitCause.String == *req.RecoveryCause &&
+		run.RecoveryWaitDetail.String == *req.RecoveryDetail && run.ClaimReleasedAt.Valid &&
+		run.ReleasedWorkerID.Valid && run.ReleasedWorkerID.Bytes == wkr.ID &&
+		run.ReleasedWorkerNonce.Valid && run.ReleasedWorkerNonce.String == req.RegisterNonce && run.StopKind.String == "" {
+		// The service validated current registration and prior evidence under the worker lock.
+		// ACK a lost response to that exact hold without repeating transition effects.
+		ack, ackErr := h.workerStateAck(w, r, run)
+		if ackErr != nil {
+			httpx.Error(w, http.StatusInternalServerError, "semantic completion authority unavailable")
+			return
+		}
+		ack["applied"] = false
+		httpx.JSON(w, http.StatusOK, ack)
 		return
 	}
 	if !applied {

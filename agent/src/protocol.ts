@@ -3385,7 +3385,7 @@ export interface StateRequest {
    *  Only with state `recovery_wait`, that cause and a positive `claim_generation`; closed set. Sent only when
    *  the api advertised `recovery_detail_adoption_refusal_v1` at register (an older api 400s the unknown field).
    *  Absent selects the generic text and never permits adoption. */
-  recovery_detail?: "secret_remediation_active" | "remediation_proof_unknown";
+  recovery_detail?: "secret_remediation_active" | "remediation_proof_unknown" | "source_end_declined";
   /** PRD #1809 D8: on a process-ending park report that published a checkpoint (the usage-limit
    *  park, the owner pause park, a recovery park including the mid-run `data_volume_full` one),
    *  whether that published checkpoint contains the run's latest committed work. `false` when the
@@ -3520,6 +3520,7 @@ export interface TerminalPreservationResponse {
 export interface StateAck {
   /** Cause read from the same RunDTO as status; required to confirm a typed idle park. */
   recoveryCause?: string;
+  recoveryDetail?: string;
   /** Local acceptance proof from the memory park RPC, never a serialized API receipt.
    *  Only this binding authorizes marking a memory park; status/applied alone do not. */
   readonly memoryParkAccepted?: Readonly<{

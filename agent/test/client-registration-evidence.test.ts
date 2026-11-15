@@ -48,6 +48,86 @@ async function make(replies: Reply[], opts: { features?: string[]; nonce?: strin
 const parsed = (wires: string[]) => wires.map(w => JSON.parse(w) as Record<string, unknown>);
 
 describe("registration evidence on the running report", () => {
+  it("source end hold requires paired features and exact acknowledged witness; reset and drop close it", async () => {
+    const features = [...FEATURES, "retained_source_end_hold_v1"];
+    const recorded: Reply = { status: 200, body: JSON.stringify({
+      run: { id: "r1", status: "running" }, registration_evidence: "recorded",
+    }) };
+    const { c } = await make([recorded, "strict", "ok", recorded], { features });
+    assert.equal(c.sourceEndDeclinedRegistration("r1", GEN), undefined);
+    await c.reportState("r1", { status: "running", claim_generation: GEN }, undefined, { registrationEpoch: EPOCH });
+    assert.equal(c.sourceEndDeclinedRegistration("r1", GEN), NONCE);
+    assert.equal(c.sourceEndDeclinedRegistration("r2", GEN), undefined);
+    assert.equal(c.sourceEndDeclinedRegistration("r1", GEN + 1), undefined);
+    c.protocolFeatures = FEATURES;
+    assert.equal(c.sourceEndDeclinedRegistration("r1", GEN), undefined);
+    c.protocolFeatures = features;
+    await c.reportState("r1", { status: "running", claim_generation: GEN }, undefined, { registrationEpoch: EPOCH });
+    assert.equal(c.sourceEndDeclinedRegistration("r1", GEN), undefined);
+    c.protocolFeatures = features;
+    assert.equal(c.sourceEndDeclinedRegistration("r1", GEN), undefined, "drop is sticky");
+    await c.register("fixture", "base", 1, undefined, ["credential_switch_v1"], undefined, 0);
+    assert.equal(c.sourceEndDeclinedRegistration("r1", GEN), undefined, "old witness cleared");
+    await c.reportState("r1", { status: "running", claim_generation: GEN }, undefined, { registrationEpoch: EPOCH });
+    assert.equal(c.sourceEndDeclinedRegistration("r1", GEN), NONCE);
+  });
+
+  for (const fault of ["none", "foreign-run", "foreign-worker", "missing-worker", "stale", "switch", "refused"] as const) {
+    it(`claimed 409 recorded evidence is hold-only and identity fenced: ${fault}`, async () => {
+      const { c, wires } = await make([{ status: 409, body: JSON.stringify({
+        run: { id: fault === "foreign-run" ? "other" : "r1", status: "claimed",
+          ...(fault === "missing-worker" ? {} : { worker_id: fault === "foreign-worker"
+            ? "22222222-2222-4222-8222-222222222222" : "11111111-1111-4111-8111-111111111111" }) },
+        registration_evidence: fault === "refused" ? "refused" : "recorded",
+        ...(fault === "stale" ? { disposition: "stale_claim" } : {}),
+        ...(fault === "switch" ? { credential_switch: { generation: 1 } } : {}),
+      }) }], { features: [...FEATURES, "retained_source_end_hold_v1"] });
+      const ack = await c.reportState("r1", { status: "running", claim_generation: GEN },
+        undefined, { registrationEpoch: EPOCH });
+      assert.equal(ack.applied, false);
+      assert.equal(ack.status, "claimed", "witness cannot turn a refusal into running");
+      assert.equal(ack.registrationEvidence, fault === "refused" ? "refused" : "recorded");
+      assert.equal(c.sourceEndDeclinedRegistration("r1", GEN), fault === "none" ? NONCE : undefined);
+      assert.equal(c.sourceEndDeclinedRegistration("r1", GEN + 1), undefined);
+      assert.equal(wires.length, 1, "no legacy retry of a declined running transition");
+    });
+  }
+
+  it("preserves active exact-generation witnesses across more than 2048 unrelated ACKs", async () => {
+    const ids = Array.from({ length: 2050 }, (_, i) => `boundary-${i}`);
+    const replies: Reply[] = ids.map(id => ({ status: 200, body: JSON.stringify({
+      run: { id, status: "running" }, registration_evidence: "recorded",
+    }) }));
+    const { c } = await make(replies, { features: [...FEATURES, "retained_source_end_hold_v1"] });
+    // Sequential ACKs bound the test's work and keep every witness active in one registration.
+    for (const id of ids) {
+      await c.reportState(id, { status: "running", claim_generation: GEN }, undefined, { registrationEpoch: EPOCH });
+    }
+    for (const id of [ids[0]!, ids[2047]!, ids[2048]!, ids[2049]!]) {
+      assert.equal(c.sourceEndDeclinedRegistration(id, GEN), NONCE, id);
+      assert.equal(c.sourceEndDeclinedRegistration(id, GEN + 1), undefined, id);
+    }
+    await c.register("fixture", "base", 1, undefined, ["credential_switch_v1"], undefined, 0);
+    assert.equal(c.sourceEndDeclinedRegistration(ids[0]!, GEN), undefined);
+  });
+
+  it("a delayed older-generation ACK keeps the newer generation's witness", async () => {
+    const recorded: Reply = { status: 200, body: JSON.stringify({
+      run: { id: "r1", status: "running" }, registration_evidence: "recorded",
+    }) };
+    const { c } = await make([recorded, recorded], { features: [...FEATURES, "retained_source_end_hold_v1"] });
+    await c.reportState("r1", { status: "running", claim_generation: GEN + 1 }, undefined, { registrationEpoch: EPOCH });
+    await c.reportState("r1", { status: "running", claim_generation: GEN }, undefined, { registrationEpoch: EPOCH });
+    assert.equal(c.sourceEndDeclinedRegistration("r1", GEN + 1), NONCE);
+    assert.equal(c.sourceEndDeclinedRegistration("r1", GEN), undefined);
+  });
+
+  it("a status-only running ACK is not a recorded witness", async () => {
+    const { c } = await make(["ok"], { features: [...FEATURES, "retained_source_end_hold_v1"] });
+    await c.reportState("r1", { status: "running", claim_generation: GEN }, undefined, { registrationEpoch: EPOCH });
+    assert.equal(c.sourceEndDeclinedRegistration("r1", GEN), undefined);
+  });
+
   it("emits exactly the shared fixture body", async () => {
     const { c, wires } = await make(["ok"]);
     await c.reportState("r1", { status: "running", claim_generation: GEN }, undefined, { registrationEpoch: EPOCH });

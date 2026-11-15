@@ -209,6 +209,15 @@ Today D4's owner-held re-park takes precedence over a later pin-based restore. T
 
 `reclaimTerminalOrphan` branch by branch (behaviour unchanged): the refusal branches (classification failure, malformed identity, nonterminal owner, repo/branch/path mismatch, path-probe error, `terminalRetainedSnapshot` error, quiescence error or block) throw with journal, ledger and path untouched; `retained` is `detachTerminalRetained`; the attempt shape is `releaseAttemptInPlace(..., "reclaimed")` (fence refusal first, then carry or clear); the canonical shape is `retireRunnerClone(..., { discard: false })` (rollback carries, a successful move clears the active key); a retirement error is a refusal. `refuseFenceDrop` in `releaseAttemptInPlace` still runs first, and `memoryPark` never clears a journal or bypasses it. The restart follow-up (#3644) must keep the adopt-successor payload, `memoryPark` included, byte-identical.
 
+### Later source-end classification (#4365, 2026-11-15)
+
+The transient same-process stop below is qualified by a positive process-local
+definitive declined-end witness after the admission barrier. That exact retired
+sink/key/lease-epoch case takes the owner-held `retained_recovery_adoption_failed`
+/ `source_end_declined` path. Sink retirement alone, queued ends, pending
+operations and end-unconfirmed results keep bounded transient retry. No memory
+receipt or reuse proof is inferred. See [ADR-4365](4365-retained-source-end-hold.md).
+
 ### Material change from the approved plan
 
 The canonical clone path `issue-N` is shared across runs of the same issue, so the same-process ownership refusal reaches a same-issue re-claim, not only a same-run one. When such a claim meets another flight's unconfirmed end in `phaseClone` or reseed (and in retained recovery without memory provenance), it stops nonterminal: `RetainedRecoveryStop`, custody retained, no `failed` report. It is bounded by the server requeue cap, which ends in a `worker_requeue_exhausted` owner hold or `failed` according to the exhaustion evidence. `keepGuardedInventoryOpen` on that path may pin re-dispatch to the worker until the cap.
@@ -216,12 +225,12 @@ The canonical clone path `issue-N` is shared across runs of the same issue, so t
 ### Residuals and not shipped
 
 - Docker and other unregistered writers are unchanged (#3404, ADR-1783).
-- A crash after the park ACK and before teardown writes no record, so today's terminal path remains. This is the crashed-active boundary of [ADR-1783](1783-run-quiescence-and-attempt-clone-paths.md#amendment-2026-10-27--3404-durable-completion-source-authority-executor-lifetime-seal-and-restart-retirement); the hard-kill companion owns it.
-- The re-park of an unsettled park (a confirmed source end leaves the slot ineligible, so that run continues normally) needs a `memoryPark` record in the active journal. The record can be missing for an unknown authority incarnation or source epoch, a stopped or protected source, a write failure, or a timeout whose write did not land (a write already holding the bare lock may still land, and Resume then re-parks). On a different worker process (for example after a restart, slot foreign-active) the run then fails as `preservation_failed`, as before. On the same worker process (the earlier flight's source end unconfirmed) the claim stops without failing ("held by an earlier flight's unended source use") and retries until the requeue cap, then ends in `worker_requeue_exhausted` or `failed` per the existing exhaustion rule; this is new with #3638, not "as before".
+- A crash after the park ACK and before teardown can leave no `memoryPark` record. #3644 now supplies verified-pin restore for eligible predecessors; unsupported or uncertain predecessors retain their refusal/hold paths. This does not settle the crashed-active source. See [ADR-4365](4365-retained-source-end-hold.md) for the later process-local declined-end classification.
+- The re-park of an unsettled park (a confirmed source end leaves the slot ineligible, so that run continues normally) needs a `memoryPark` record in the active journal. The record can be missing for an unknown authority incarnation or source epoch, a stopped or protected source, a write failure, or a timeout whose write did not land (a write already holding the bare lock may still land, and Resume then re-parks). On a different worker process (for example after a restart, slot foreign-active), #3644 now takes its verified-pin restore route where eligible, otherwise its nonterminal refusal or unsupported-predecessor hold; the terminal `preservation_failed` fallback remains outside that route. On the same worker process (the earlier flight's source end unconfirmed) the claim stops without failing ("held by an earlier flight's unended source use") and retries until the requeue cap, then ends in `worker_requeue_exhausted` or `failed` per the existing exhaustion rule; this is new with #3638, not "as before".
 - A successor without the memory guard or `worker_memory_pressure_v1` behaves as before. Descriptor-only sources are not continued.
 - The `sent` latch is set before `reportState`, so it can over-claim `sent_unconfirmed` if the call throws before sending; that only widens eligibility of the owner-held re-park.
 - A refused retained-source discard can still end an unowned active lease, and a quiescence-proven discard ends a key whose owner sink is live. This is accepted ("live owner").
-- Generic terminal reconciliation (#2494, #3031) and the restart follow-up (#3644) are not built (receipt delivery and consumption landed later with #3639, see the 2026-10-31 amendment). No hosted or compose acceptance of a memory park followed by a pod roll is claimed; it remains a human step.
+- Generic terminal reconciliation (#2494, #3031) remains outside this amendment. The #3644 restart follow-up subsequently delivered eligible verified-pin restore (two-source guards remain in force); receipt delivery and consumption landed with #3639, see the 2026-10-31 amendment. No hosted or compose acceptance of a memory park followed by a pod roll is claimed; it remains a human step.
 
 ## Amendment 2026-10-31: settled memory-park continuation (#3639)
 

@@ -946,7 +946,8 @@ type RunDTO struct {
 	RecoveryWaitCause *string `json:"recovery_wait_cause"`
 	// RecoveryWaitDetail is the closed-set sub-cause of a retained_recovery_adoption_failed park
 	// (issue #4177): "secret_remediation_active" (retrying unchanged cannot help; Resume is
-	// refused with a 409) or "remediation_proof_unknown" (a retry may help). The server sets it
+	// refused with a 409), "remediation_proof_unknown" (a retry may help), or
+	// "source_end_declined" (Resume requires a different nonempty worker registration). The server sets it
 	// only when status is recovery_wait, the cause is retained_recovery_adoption_failed and the
 	// stored value is in that set; it is omitted otherwise. Absent means unclassified and only
 	// selects the generic text; it never permits anything new. Clients render only a known value
@@ -1895,7 +1896,8 @@ type RunSummaryItemDTO struct {
 	RecoveryWaitCause *string `json:"recovery_wait_cause"`
 	// RecoveryWaitDetail is the closed-set sub-cause of a retained_recovery_adoption_failed park
 	// (issue #4177): "secret_remediation_active" (retrying unchanged cannot help; Resume is
-	// refused with a 409) or "remediation_proof_unknown" (a retry may help). The server sets it
+	// refused with a 409), "remediation_proof_unknown" (a retry may help), or
+	// "source_end_declined" (Resume requires a different nonempty worker registration). The server sets it
 	// only when status is recovery_wait, the cause is retained_recovery_adoption_failed and the
 	// stored value is in that set; it is omitted otherwise. Absent means unclassified and only
 	// selects the generic text; it never permits anything new. Clients render only a known value
