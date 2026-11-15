@@ -355,7 +355,7 @@ describe("terminal-preservation lane (#4007 slice B)", () => {
       git: { defaultBranchTip: async () => { tipCalls++; return undefined; } } as never,
       lookupDefaultBranch: async b => {
         await new Promise<void>(res => { if (b.signal.aborted) res(); else b.signal.addEventListener("abort", () => res(), { once: true }); });
-        return undefined;
+        return { kind: "absent" };
       },
     } });
     r.env.hooks = { ...r.env.hooks!, capMs: 150, deps: { ...r.env.hooks!.deps!, universe: async () => { r.order.push("universe"); throw new Error("must not run"); } } };
@@ -388,18 +388,42 @@ describe("terminal-preservation lane (#4007 slice B)", () => {
     return { branches, reason: out.reason, looked };
   }
 
-  it("a default-branch lookup that resolves nothing with the budget intact is not refused and falls back to main", async () => {
-    const o = await resolvedBranch(async () => undefined);
+  it("a default-branch lookup that proves no default branch with the budget intact is not refused and falls back to main", async () => {
+    const o = await resolvedBranch(async () => ({ kind: "absent" }));
     assert.equal(o.looked, 1);
     assert.notEqual(o.reason, "default_branch_unresolved");
     assert.deepEqual(o.branches, ["main"]);
   });
 
-  it("a default-branch lookup that throws with the budget intact is not refused and falls back to main", async () => {
-    const o = await resolvedBranch(async () => { throw new Error("lookup failed"); });
+  it("a default-branch lookup that resolves a name hands that branch to the tip read", async () => {
+    const o = await resolvedBranch(async () => ({ kind: "resolved", name: "develop" }));
     assert.equal(o.looked, 1);
     assert.notEqual(o.reason, "default_branch_unresolved");
-    assert.deepEqual(o.branches, ["main"]);
+    assert.deepEqual(o.branches, ["develop"]);
+  });
+
+  async function keptUnresolved(lookup: NonNullable<TerminalLaneEnv["lookupDefaultBranch"]>) {
+    const r = rig({ env: { defaultBranch: undefined, lookupDefaultBranch: lookup } });
+    const out = await preserveInLane(r.env, r.flight, body);
+    return { out, r };
+  }
+
+  it("a default-branch lookup that throws with the budget intact keeps the output: nothing captured or sent", async () => {
+    const o = await keptUnresolved(async () => { throw new Error("lookup failed"); });
+    assert.equal(o.out.outcome, "kept");
+    assert.equal(o.out.reason, "default_branch_unresolved");
+    assert.deepEqual(o.r.order, []);
+    assert.equal(o.r.sends, 0);
+    assert.equal(o.r.store.record, undefined);
+  });
+
+  it("a default-branch lookup that reports unknown with the budget intact keeps the output: nothing captured or sent", async () => {
+    const o = await keptUnresolved(async () => ({ kind: "unknown", detail: "dangling" }));
+    assert.equal(o.out.outcome, "kept");
+    assert.equal(o.out.reason, "default_branch_unresolved");
+    assert.deepEqual(o.r.order, []);
+    assert.equal(o.r.sends, 0);
+    assert.equal(o.r.store.record, undefined);
   });
 
   // The tip read runs under the lane's window through env.readDefaultBranchTip; the real prepare runs (hooked one dropped) and
@@ -1042,7 +1066,7 @@ describe("terminal preservation adapter: default-branch git reads run under the 
   type GitSpy = {
     withReportProofBudget: (b: { signal: AbortSignal; deadline: number }, action: () => Promise<unknown>) => Promise<unknown>;
     defaultBranchTip: (bare: string, branch: string) => Promise<string | undefined>;
-    defaultBranchName: (bare: string) => Promise<string | undefined>;
+    terminalDefaultBranch: (bare: string) => Promise<{ kind: "absent" }>;
   };
   const CAP_MS = 150;
 
@@ -1084,7 +1108,7 @@ describe("terminal preservation adapter: default-branch git reads run under the 
       return undefined;
     };
     t.mock.method(g, "defaultBranchTip", stall);
-    t.mock.method(g, "defaultBranchName", stall);
+    t.mock.method(g, "terminalDefaultBranch", async (): Promise<{ kind: "absent" }> => { await stall(); return { kind: "absent" }; });
     const flight = {
       runId: RUN, claimGeneration: 1, runKind: "issue", barePath: "/bare", branch: "agent/issue-1", worktreePath: "/clone",
       attemptId: "at1", iterationParkState: "none", policyHold: undefined, completionSendAttempted: false,
@@ -1110,10 +1134,156 @@ describe("terminal preservation adapter: default-branch git reads run under the 
     const started = Date.now();
     const out = await r.preserveTerminalInLane({ repo: {} }, flight, { status: "completed" }, laneSite);
     const elapsed = Date.now() - started;
-    assert.deepEqual(reads.insideBudget, [true], "defaultBranchName was called once, inside withReportProofBudget");
+    assert.deepEqual(reads.insideBudget, [true], "terminalDefaultBranch was called once, inside withReportProofBudget");
     assert.equal(out.outcome, "kept");
     assert.equal(out.reason, "default_branch_unresolved");
     assert.ok(elapsed < CAP_MS + 1500, `elapsed ${elapsed} ms`);
+  });
+});
+
+describe("terminal preservation adapter: default branch read from real bare repositories (real RunRunner method)", () => {
+  type Lane = { preserveTerminalInLane(claim: unknown, flight: unknown, body: unknown, site: unknown): Promise<{ outcome: string; reason?: string }>; git: { defaultBranchTip: (bare: string, branch: string) => Promise<string | undefined> } };
+  const gitIdentity = { GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@example.com", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@example.com" };
+  const laneSite = { quiesce: false, site: "t" };
+
+  function git(cwd: string, args: string[], input?: string): string {
+    return execFileSync("git", ["-C", cwd, ...args], { env: { ...process.env, ...gitIdentity }, encoding: "utf8", input, stdio: ["pipe", "pipe", "pipe"] }).trim();
+  }
+
+  /** A real bare repository with one commit object (unreferenced); `ref(name, sha)` writes a loose ref file directly. */
+  function bareRepo(t: TestContext) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "lane-bare-"));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const bare = path.join(dir, "bare.git");
+    execFileSync("git", ["init", "-q", "--bare", bare], { env: { ...process.env, ...gitIdentity } });
+    git(bare, ["symbolic-ref", "HEAD", "refs/heads/main"]);
+    const tree = git(bare, ["mktree"], "");
+    const commit = git(bare, ["commit-tree", tree, "-m", "m"]);
+    const file = (rel: string, content: string) => {
+      fs.mkdirSync(path.dirname(path.join(bare, rel)), { recursive: true });
+      fs.writeFileSync(path.join(bare, rel), content);
+    };
+    return { dir, bare, commit, file, ref: (name: string, sha: string) => file(name, `${sha}\n`) };
+  }
+
+  /** The real RunRunner; capture and send are counted. No git method is mocked unless `branches` is passed, which records the
+   *  branch handed to the tip read (the lane's own prepare then runs). */
+  function realRig(t: TestContext, barePath: string, observeTip = false) {
+    const calls = { capture: 0, send: 0, universe: 0 };
+    const branches: string[] = [];
+    const r = runner({ run: async () => ({}) } as never, fakeGitlab().gitlab, "tp-real-bare-key", {
+      terminalPreservationTestOverride: {
+        workerId: "w1", attemptId: "at1", capMs: 5_000, store: memStore(), owner: fn => fn(),
+        deps: {
+          universe: async () => { calls.universe++; return { kind: "proved", sources: [], roots: [], universeDigest: "u" }; },
+          capture: async onPhase => {
+            calls.capture++;
+            await onPhase("capturing", { cloneRef: "x", bareRef: "x" });
+            await onPhase("captured", { cloneRef: "x", bareRef: "x" });
+            return { kind: "ok", base: A, extraRoots: [], manifest: MANIFEST };
+          },
+          aggregate: async () => ({ tip: A }),
+          coverage: () => ({ ok: true }), recheck: async () => undefined,
+          ...(observeTip ? {} : { prepare: async () => ({ pack: Buffer.from("pack"), range: { tipSha: A, excludeSha: C }, digests: { scan: "s", transport: "t" } }) }),
+          send: async () => { calls.send++; return FINAL; },
+        },
+      },
+    }) as unknown as Lane;
+    if (observeTip) t.mock.method(r.git, "defaultBranchTip", async (_bare: string, branch: string) => { branches.push(branch); return undefined; });
+    const flight = {
+      runId: RUN, claimGeneration: 1, runKind: "issue", barePath, branch: "agent/issue-1", worktreePath: "/clone",
+      attemptId: "at1", iterationParkState: "none", policyHold: undefined, completionSendAttempted: false,
+      completionHoldOutcome: "none", runLog: { info: () => undefined },
+    };
+    return { r, flight, calls, branches };
+  }
+
+  async function keeps(t: TestContext, barePath: string) {
+    const { r, flight, calls } = realRig(t, barePath);
+    const out = await r.preserveTerminalInLane({ repo: {} }, flight, { status: "completed" }, laneSite);
+    assert.equal(out.outcome, "kept");
+    assert.equal(out.reason, "default_branch_unresolved");
+    assert.deepEqual(calls, { capture: 0, send: 0, universe: 0 });
+  }
+
+  it("R1: origin/HEAD points at a ref whose object is missing, origin/main valid: kept before capture and send", async t => {
+    const b = bareRepo(t);
+    b.ref("refs/remotes/origin/main", b.commit);
+    b.ref("refs/remotes/origin/develop", "d".repeat(40));
+    git(b.bare, ["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/develop"]);
+    await keeps(t, b.bare);
+  });
+
+  it("R2: a garbage loose ref for origin/develop that origin/HEAD names, origin/main valid: kept", async t => {
+    const b = bareRepo(t);
+    b.ref("refs/remotes/origin/main", b.commit);
+    b.file("refs/remotes/origin/develop", "this is not a sha\n");
+    git(b.bare, ["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/develop"]);
+    await keeps(t, b.bare);
+  });
+
+  it("R3: a bare path that is a plain non-git directory: kept", async t => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "lane-notgit-"));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    await keeps(t, dir);
+  });
+
+  it("R4: a detached HEAD and no main or master: kept", async t => {
+    const b = bareRepo(t);
+    fs.writeFileSync(path.join(b.bare, "HEAD"), `${b.commit}\n`);
+    await keeps(t, b.bare);
+  });
+
+  it("R5: an unborn HEAD and a refs/heads/main that is a dangling symbolic ref: kept", async t => {
+    const b = bareRepo(t);
+    b.file("refs/heads/main", "ref: refs/heads/gone\n");
+    await keeps(t, b.bare);
+  });
+
+  it("R6: origin/HEAD symref to a nonexistent origin/develop, origin/main valid: kept", async t => {
+    const b = bareRepo(t);
+    b.ref("refs/remotes/origin/main", b.commit);
+    git(b.bare, ["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/develop"]);
+    await keeps(t, b.bare);
+  });
+
+  async function tipBranch(t: TestContext, barePath: string) {
+    const { r, flight, branches } = realRig(t, barePath, true);
+    const out = await r.preserveTerminalInLane({ repo: {} }, flight, { status: "completed" }, laneSite);
+    return { out, branches };
+  }
+
+  it("C1: origin/HEAD names a valid origin/develop: the tip read receives develop", async t => {
+    const b = bareRepo(t);
+    b.ref("refs/remotes/origin/develop", b.commit);
+    b.ref("refs/remotes/origin/main", b.commit);
+    git(b.bare, ["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/develop"]);
+    const o = await tipBranch(t, b.bare);
+    assert.notEqual(o.out.reason, "default_branch_unresolved");
+    assert.deepEqual(o.branches, ["develop"]);
+  });
+
+  it("C2: an empty bare repository proves no default branch and proceeds with main", async t => {
+    const b = bareRepo(t);
+    const o = await tipBranch(t, b.bare);
+    assert.notEqual(o.out.reason, "default_branch_unresolved");
+    assert.deepEqual(o.branches, ["main"]);
+  });
+
+  it("C2b: an empty bare repository reaches the send with the lane's hooked prepare", async t => {
+    const b = bareRepo(t);
+    const { r, flight, calls } = realRig(t, b.bare);
+    const out = await r.preserveTerminalInLane({ repo: {} }, flight, { status: "completed" }, laneSite);
+    assert.notEqual(out.reason, "default_branch_unresolved");
+    assert.equal(calls.send, 1);
+  });
+
+  it("C5: no origin/HEAD and a valid origin/main resolves main and proceeds", async t => {
+    const b = bareRepo(t);
+    b.ref("refs/remotes/origin/main", b.commit);
+    const o = await tipBranch(t, b.bare);
+    assert.notEqual(o.out.reason, "default_branch_unresolved");
+    assert.deepEqual(o.branches, ["main"]);
   });
 });
 

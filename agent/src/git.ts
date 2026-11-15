@@ -207,6 +207,12 @@ interface RecoveryPhysicalWarningScope {
 const codeGeneration = (value: number): boolean => Number.isSafeInteger(value) && value >= 0;
 const codeTerminal = (value: string): boolean => ["completed", "failed", "cancelled"].includes(value);
 
+/** Outcome of {@link GitCache.terminalDefaultBranch}: a positively read branch, a proven absence, or an unknowable state. */
+export type TerminalDefaultBranch =
+  | { kind: "resolved"; name: string }
+  | { kind: "absent" }
+  | { kind: "unknown"; detail: string };
+
 export interface CodeSnapshotReaderProof {
   childId: string;
   childGeneration: number;
@@ -5758,6 +5764,92 @@ export class GitCache {
     const ref = await this.defaultBranchRef(barePath).catch(() => undefined);
     if (!ref) return undefined;
     return ref.replace(/^refs\/remotes\/origin\//, "").replace(/^refs\/heads\//, "") || undefined;
+  }
+
+  /**
+   * The terminal-preservation lane's default-branch lookup. Unlike {@link defaultBranchName} (which collapses every
+   * failed read into "absent"), it separates three answers: `resolved` (a commit-bearing default ref was positively
+   * read), `absent` (every read completed normally and proved there is no default ref at all) and `unknown` (any read
+   * failed, was cut short, or met a shape it cannot classify: a dangling or broken ref, a detached HEAD, a throw).
+   * Only `absent` may fall back to "main"; `unknown` must keep the output.
+   */
+  async terminalDefaultBranch(barePath: string): Promise<TerminalDefaultBranch> {
+    const unknown = (detail: string): TerminalDefaultBranch => ({ kind: "unknown", detail });
+    const originHead = await this.strictGitRead(barePath, ["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"]);
+    if (!originHead.ok) return unknown(`origin/HEAD read failed: ${originHead.detail}`);
+    const originTarget = originHead.code === 0 ? originHead.stdout.trim() : undefined;
+    if (originHead.code === 0 && !originTarget?.startsWith("refs/")) return unknown("origin/HEAD target is not a ref");
+    const head = await this.strictGitRead(barePath, ["symbolic-ref", "--quiet", "HEAD"]);
+    if (!head.ok) return unknown(`HEAD read failed: ${head.detail}`);
+    const headTarget = head.code === 0 ? head.stdout.trim() : undefined;
+    if (head.code === 0 && !headTarget?.startsWith("refs/")) return unknown("HEAD target is not a ref");
+
+    const candidates: { ref: string; headRung: boolean }[] = [];
+    const add = (ref: string | undefined, headRung = false): void => {
+      if (ref && !candidates.some(c => c.ref === ref)) candidates.push({ ref, headRung });
+    };
+    add(originTarget);
+    for (const ref of ["refs/remotes/origin/main", "refs/remotes/origin/master", "refs/heads/main", "refs/heads/master"]) add(ref);
+    add(headTarget, true);
+
+    const symbolic = new Set<string>();
+    for (const { ref } of candidates) {
+      const sym = await this.strictGitRead(barePath, ["symbolic-ref", "--quiet", ref]);
+      if (!sym.ok) return unknown(`symbolic-ref ${ref} failed: ${sym.detail}`);
+      if (sym.code === 0) symbolic.add(ref);
+    }
+
+    const listing = await this.strictGitRead(barePath, ["for-each-ref",
+      "--format=%(refname)%00%(objecttype)%00%(*objecttype)", ...candidates.map(c => c.ref)]);
+    if (!listing.ok) return unknown(`for-each-ref failed: ${listing.detail}`);
+    if (listing.code !== 0 || listing.stderr.trim() !== "") return unknown("for-each-ref reported a problem");
+    // for-each-ref prefix-matches a pattern (refs/heads/main also lists refs/heads/main/x): keep exact names only.
+    const counted = new Set<string>();
+    const listed = new Set<string>();
+    for (const row of listing.stdout.split("\n")) {
+      if (row === "") continue;
+      const [refname, type, peeled] = row.split("\0");
+      if (refname === undefined || !candidates.some(c => c.ref === refname)) continue;
+      listed.add(refname);
+      if (type === "commit" || (type === "tag" && peeled === "commit")) counted.add(refname);
+      else return unknown(`${refname} does not name a commit`);
+    }
+
+    if (originTarget && !counted.has(originTarget)) return unknown(`origin/HEAD target ${originTarget} is not a readable commit ref`);
+    for (const ref of symbolic) if (!listed.has(ref)) return unknown(`${ref} is a dangling symbolic ref`);
+    const first = candidates.find(c => counted.has(c.ref));
+    if (first) {
+      if (first.headRung) return { kind: "resolved", name: "HEAD" };
+      const name = first.ref.replace(/^refs\/remotes\/origin\//, "").replace(/^refs\/heads\//, "");
+      return name ? { kind: "resolved", name } : unknown(`${first.ref} has no short name`);
+    }
+    if (originHead.code === 1 && head.code === 0 && symbolic.size === 0 && listed.size === 0) return { kind: "absent" };
+    return unknown("no default branch could be proven absent");
+  }
+
+  /**
+   * A git read whose exit status is trusted only when it is a genuine, in-window, ordinary exit: 0, or exactly 1 (the
+   * "no such symref / nothing" answer). A timeout, kill, signal, output overrun, spawn failure, a lapsed or aborted
+   * report-proof window, or any other exit is `ok: false`. Residue and boundary aborts rethrow, as in tryGitExit.
+   */
+  private async strictGitRead(cwd: string, args: string[]):
+    Promise<{ ok: true; code: 0 | 1; stdout: string; stderr: string } | { ok: false; detail: string }> {
+    try {
+      const out = await this.execScoped("git", withDir(cwd, args), { env: gitEnv(), timeout: GIT_TIMEOUT_MS });
+      return { ok: true, code: 0, stdout: out.stdout, stderr: out.stderr };
+    } catch (err) {
+      if (err instanceof RunResidueBlockedError) throw err;
+      const abort = this.boundaryAbortError(err);
+      if (abort) throw abort;
+      const e = err as { code?: unknown; killed?: unknown; signal?: unknown; outputExceeded?: unknown; stderr?: unknown };
+      const budget = this.reportProofs.getStore();
+      const windowOpen = !budget || (!budget.signal.aborted && Date.now() < budget.deadline);
+      if (windowOpen && e.code === 1 && e.killed !== true && (e.signal === null || e.signal === undefined) && e.outputExceeded !== true) {
+        return { ok: true, code: 1, stdout: "", stderr: typeof e.stderr === "string" ? e.stderr : "" };
+      }
+      const why = windowOpen ? `exit ${String(e.code)}${e.killed === true ? " (killed)" : ""}` : "report-proof window ended";
+      return { ok: false, detail: why };
+    }
   }
 
   /**

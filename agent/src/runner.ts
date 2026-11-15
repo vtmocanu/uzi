@@ -4182,7 +4182,7 @@ export class RunRunner {
       workerId: this.client.memoryIncarnation?.worker_id ?? hooks?.workerId,
       defaultBranch: claimBranch ?? (lookupBare ? undefined : "main"),
       ...(lookupBare ? { lookupDefaultBranch: (b: { signal: AbortSignal; deadline: number }) =>
-        this.git.withReportProofBudget(b, () => this.git.defaultBranchName(lookupBare)) } : {}),
+        this.git.withReportProofBudget(b, () => this.git.terminalDefaultBranch(lookupBare)) } : {}),
       readDefaultBranchTip: (bare, branch, b) => this.git.withReportProofBudget(b, () => this.git.defaultBranchTip(bare, branch)),
       egressBound: false,
       skip, failureFirst, policy: () => this.frozenHeldPolicy(flight),

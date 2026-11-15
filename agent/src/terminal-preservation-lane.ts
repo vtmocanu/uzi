@@ -11,7 +11,7 @@
  * direct `quiesce` closure the runner supplies.
  */
 import fs from "node:fs/promises";
-import type { CheckpointRange, GitCache } from "./git.js";
+import type { CheckpointRange, GitCache, TerminalDefaultBranch } from "./git.js";
 import type { TerminalPreservationResult } from "./client.js";
 import { prepareFrozenHeldPinned, type FrozenHeldPolicy, type HeldGit, type TerminalDigestGit } from "./frozen-held.js";
 import type { RecoveryCoordinator } from "./recovery.js";
@@ -71,9 +71,11 @@ export interface TerminalLaneEnv {
   /**
    * Resolves the default branch when the claim names none (`defaultBranch` undefined). Runs inside the lane's own window:
    * `bound.signal` aborts at the sub-deadline or a permit abort and `bound.deadline` is the sub-deadline (epoch ms). The
-   * lane treats an aborted or past-deadline return as a refusal (`default_branch_unresolved`), never as "main".
+   * lane treats an aborted or past-deadline return as a refusal (`default_branch_unresolved`). It returns `resolved` (the
+   * name), `absent` (proven no default branch: the only case that falls back to "main") or `unknown` (a read that failed
+   * or could not be classified); `unknown` and a throw keep the output as `default_branch_unresolved`.
    */
-  lookupDefaultBranch?: (bound: { signal: AbortSignal; deadline: number }) => Promise<string | undefined>;
+  lookupDefaultBranch?: (bound: { signal: AbortSignal; deadline: number }) => Promise<TerminalDefaultBranch>;
   /**
    * Reads the default branch's tip under the lane's own window (`bound` as for `lookupDefaultBranch`). Absent: the lane calls
    * `git.defaultBranchTip` directly. A throw is treated as no tip; a read that ends after the window lapsed or its signal aborted refuses the prepare as `deadline`.
@@ -163,12 +165,15 @@ async function run(env: TerminalLaneEnv, flight: TerminalLaneFlight, body: Termi
       if (abort.signal.aborted || env.now() >= deadlineAt) return result(label, "kept", "deadline");
     }
     // A claim without a default branch resolves it here, inside the window; a lookup the window cut short keeps the output
-    // rather than guessing "main". A lookup that finished in time with no answer falls back to "main".
+    // rather than guessing "main". Only a lookup that proved no default branch exists falls back to "main"; an unknown
+    // answer or a throw keeps the output before any universe, capture, prepare or send.
     let defaultBranch = env.defaultBranch;
     if (defaultBranch === undefined && env.lookupDefaultBranch) {
-      try { defaultBranch = await env.lookupDefaultBranch({ signal: abort.signal, deadline: deadlineAt }); } catch { defaultBranch = undefined; }
+      let found: TerminalDefaultBranch;
+      try { found = await env.lookupDefaultBranch({ signal: abort.signal, deadline: deadlineAt }); } catch { found = { kind: "unknown", detail: "lookup threw" }; }
       if (abort.signal.aborted || env.now() >= deadlineAt) return result(label, "kept", "default_branch_unresolved");
-      defaultBranch = defaultBranch || "main";
+      if (found.kind === "unknown") return result(label, "kept", "default_branch_unresolved");
+      defaultBranch = found.kind === "resolved" && found.name ? found.name : "main";
     }
     const boundaryValid = (): boolean => !abort.signal.aborted && env.now() < deadlineAt && quiesced;
     const left = (): number => Math.max(1, deadlineAt - env.now());

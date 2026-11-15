@@ -84,6 +84,123 @@ describe("defaultBranchName under a report-proof budget", () => {
   });
 });
 
+describe("terminalDefaultBranch on real bare repositories", () => {
+  const identity = { GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@example.com", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@example.com" };
+
+  async function bareRepo(t: test.TestContext) {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "term-defbranch-"));
+    t.after(() => fs.rm(dir, { recursive: true, force: true }));
+    const bare = path.join(dir, "bare.git");
+    execFileSync("/usr/bin/git", ["init", "-q", "--bare", bare], { env: gitEnv });
+    run(bare, "symbolic-ref", "HEAD", "refs/heads/main");
+    const tree = execFileSync("/usr/bin/git", ["-C", bare, "mktree"], { env: gitEnv, input: "", encoding: "utf8" }).trim();
+    const commit = execFileSync("/usr/bin/git", ["-C", bare, "commit-tree", tree, "-m", "m"], { env: { ...gitEnv, ...identity }, encoding: "utf8" }).trim();
+    const file = async (rel: string, content: string) => {
+      await fs.mkdir(path.dirname(path.join(bare, rel)), { recursive: true });
+      await fs.writeFile(path.join(bare, rel), content);
+    };
+    return { dir, bare, commit, file, ref: (name: string, sha: string) => file(name, `${sha}\n`) };
+  }
+  const within = <T>(git: GitCache, action: () => Promise<T>, over: { signal?: AbortSignal; deadline?: number } = {}) =>
+    git.withReportProofBudget({ signal: over.signal ?? new AbortController().signal, deadline: over.deadline ?? Date.now() + 60_000 }, action);
+
+  /** The lookup's answer, with a rejection (a rethrown abort) counted as the lane counts it: unknown. */
+  const answer = (action: () => Promise<{ kind: string }>) => action().catch(() => ({ kind: "unknown" }));
+
+  test("S1: a budget whose deadline has passed is unknown, not absent", async (t) => {
+    const b = await bareRepo(t);
+    const git = new GitCache(b.dir, nullLogger());
+    const out = await answer(() => within(git, () => git.terminalDefaultBranch(b.bare), { deadline: Date.now() - 1 }));
+    assert.equal(out.kind, "unknown");
+  });
+
+  test("S2: an aborted budget signal with no reason is unknown, not absent", async (t) => {
+    const b = await bareRepo(t);
+    const git = new GitCache(b.dir, nullLogger());
+    const out = await answer(() => within(git, () => git.terminalDefaultBranch(b.bare), { signal: AbortSignal.abort() }));
+    assert.equal(out.kind, "unknown");
+  });
+
+  test("S3: an abort while a read is in flight is unknown", async (t) => {
+    const b = await bareRepo(t);
+    // A FIFO with no writer blocks any git read of packed-refs until the child is killed.
+    execFileSync("mkfifo", [path.join(b.bare, "packed-refs")]);
+    const git = new GitCache(b.dir, nullLogger());
+    const ac = new AbortController();
+    const started = Date.now();
+    setTimeout(() => ac.abort(), 400);
+    const out = await answer(() => within(git, () => git.terminalDefaultBranch(b.bare), { signal: ac.signal }));
+    const elapsed = Date.now() - started;
+    assert.equal(out.kind, "unknown");
+    assert.ok(elapsed >= 350, `the read was in flight when aborted (${elapsed} ms)`);
+    assert.ok(elapsed < 10_000, `elapsed ${elapsed} ms`);
+  });
+
+  test("S4: an empty bare repository is proven absent", async (t) => {
+    const b = await bareRepo(t);
+    const git = new GitCache(b.dir, nullLogger());
+    assert.deepEqual(await within(git, () => git.terminalDefaultBranch(b.bare)), { kind: "absent" });
+  });
+
+  test("S5: origin/HEAD naming a valid origin/develop resolves develop", async (t) => {
+    const b = await bareRepo(t);
+    await b.ref("refs/remotes/origin/develop", b.commit);
+    await b.ref("refs/remotes/origin/main", b.commit);
+    run(b.bare, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/develop");
+    const git = new GitCache(b.dir, nullLogger());
+    assert.deepEqual(await within(git, () => git.terminalDefaultBranch(b.bare)), { kind: "resolved", name: "develop" });
+  });
+
+  test("S6: a dangling refs/heads/main with an unborn HEAD is unknown", async (t) => {
+    const b = await bareRepo(t);
+    await b.file("refs/heads/main", "ref: refs/heads/gone\n");
+    const git = new GitCache(b.dir, nullLogger());
+    assert.equal((await within(git, () => git.terminalDefaultBranch(b.bare))).kind, "unknown");
+  });
+
+  test("S7: a dangling origin/HEAD with a valid origin/main is unknown", async (t) => {
+    const b = await bareRepo(t);
+    await b.ref("refs/remotes/origin/main", b.commit);
+    run(b.bare, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/develop");
+    const git = new GitCache(b.dir, nullLogger());
+    assert.equal((await within(git, () => git.terminalDefaultBranch(b.bare))).kind, "unknown");
+  });
+
+  test("a detached HEAD with no main or master is unknown", async (t) => {
+    const b = await bareRepo(t);
+    await fs.writeFile(path.join(b.bare, "HEAD"), `${b.commit}\n`);
+    const git = new GitCache(b.dir, nullLogger());
+    assert.equal((await within(git, () => git.terminalDefaultBranch(b.bare))).kind, "unknown");
+  });
+
+  test("a garbage loose ref for the origin/HEAD target is unknown", async (t) => {
+    const b = await bareRepo(t);
+    await b.ref("refs/remotes/origin/main", b.commit);
+    await b.file("refs/remotes/origin/develop", "not a sha\n");
+    run(b.bare, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/develop");
+    const git = new GitCache(b.dir, nullLogger());
+    assert.equal((await within(git, () => git.terminalDefaultBranch(b.bare))).kind, "unknown");
+  });
+
+  test("refs under refs/heads/main/ do not make refs/heads/main count; the real main wins when present", async (t) => {
+    const b = await bareRepo(t);
+    await b.ref("refs/heads/main/x", b.commit);
+    const git = new GitCache(b.dir, nullLogger());
+    assert.notEqual((await within(git, () => git.terminalDefaultBranch(b.bare))).kind, "resolved");
+  });
+
+  test("the HEAD rung alone resolves to HEAD, and a HEAD naming heads/main resolves main", async (t) => {
+    const b = await bareRepo(t);
+    await b.ref("refs/heads/trunk", b.commit);
+    run(b.bare, "symbolic-ref", "HEAD", "refs/heads/trunk");
+    const git = new GitCache(b.dir, nullLogger());
+    assert.deepEqual(await within(git, () => git.terminalDefaultBranch(b.bare)), { kind: "resolved", name: "HEAD" });
+    await b.ref("refs/heads/main", b.commit);
+    run(b.bare, "symbolic-ref", "HEAD", "refs/heads/main");
+    assert.deepEqual(await within(git, () => git.terminalDefaultBranch(b.bare)), { kind: "resolved", name: "main" });
+  });
+});
+
 describe("captureTerminalSnapshot", () => {
   test("captures dirty and untracked work into a snapshot tree and leaves the clone untouched", async (t) => {
     const f = await fixture(t);
