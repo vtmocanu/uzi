@@ -202,8 +202,9 @@ function useOnceItems<T>(load: () => Promise<T>, build: (value: T) => CommandIte
   const fns = useRef({ load, build });
   useEffect(() => {
     let alive = true;
-    fns.current
-      .load()
+    // Promise.resolve().then(...) turns a synchronous throw from `load` into a rejection.
+    Promise.resolve()
+      .then(() => fns.current.load())
       .then((value) => {
         if (alive) setState({ status: "ok", items: fns.current.build(value) });
       })

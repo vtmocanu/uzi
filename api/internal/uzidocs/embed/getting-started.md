@@ -57,8 +57,7 @@ Register a worker and start a run from a board card: see
   decisions. Type to also find a Settings tab, an Admin tab or Admin
   Settings section (admins only), an agent, schedule, worker or skill by
   name, a recent run by issue number or title, and a doc or one of its
-  headings. It only navigates; it never
-  approves or answers for you.
+  headings. It only navigates; it never approves or answers for you.
 - **The browser tab icon** carries a small status dot for the most urgent
   thing across your runs, so a backgrounded tab still tells you: rose once
   one of your runs has freshly failed, amber once one is awaiting your
