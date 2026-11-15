@@ -31,6 +31,17 @@ type reserveFix struct {
 	repoID   uuid.UUID
 	workerID uuid.UUID
 	targetID uuid.UUID // a completed issue run: the judge runs' target
+	// lastIID numbers the issues this fixture's runs claim: each seeded run gets a distinct
+	// issue_iid, so two non-terminal runs never trip uq_runs_one_active_per_issue.
+	lastIID int64
+	// newRunID mints seeded run ids; uuid.New unless a test pins colliding ids.
+	newRunID func() uuid.UUID
+}
+
+// nextIssueIID returns the next issue number this fixture has not used.
+func (fx *reserveFix) nextIssueIID() int64 {
+	fx.lastIID++
+	return 3000 + fx.lastIID
 }
 
 func newReserveFix(t *testing.T, threshold int16, pause bool) *reserveFix {
@@ -45,7 +56,7 @@ func newReserveFix(t *testing.T, threshold int16, pause bool) *reserveFix {
 	svc := New(env.q, env.box, p)
 	svc.SetVault(env.vlt)
 	svc.SetTxBeginner(env.pool)
-	fx := &reserveFix{t: t, env: env, svc: svc, userID: userID, repoID: repoID, workerID: workerID, targetID: uuid.New()}
+	fx := &reserveFix{t: t, env: env, svc: svc, userID: userID, repoID: repoID, workerID: workerID, targetID: uuid.New(), newRunID: uuid.New}
 	env.exec(`UPDATE workers SET last_heartbeat_at = now(), protocol_capabilities = $2 WHERE id = $1`,
 		workerID, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2})
 	env.exec(`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, status)
@@ -156,8 +167,8 @@ type reserveRun struct {
 
 func (fx *reserveFix) queueRun(o reserveRun) uuid.UUID {
 	fx.t.Helper()
-	id := uuid.New()
-	iid := 3000 + int64(id[0])*256 + int64(id[1])
+	id := fx.newRunID()
+	iid := fx.nextIssueIID()
 	switch o.kind {
 	case runkind.Judge:
 		fx.env.exec(`INSERT INTO runs (id, user_id, kind, issue_title, issue_description, status, target_run_id)
