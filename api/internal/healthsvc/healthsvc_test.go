@@ -1192,9 +1192,9 @@ func TestEvaluateRollupAndRegistry(t *testing.T) {
 	// (integrations), so it is 14, not 11; PRD #1809 M6 added fleet.rundisk
 	// (workers), issue #2203 adds forge.sync (integrations), and issue #2213 adds
 	// fleet.quarantine and issue #3142 adds fleet.memory_authority (workers); pricing.codex follows release.check, db.size follows db and
-	// recovery.storage follows custody.holds, fleet.hibernation_wake (PRD #4205 M6) follows fleet.memory_authority, fleet.hibernation_cleanup (PRD #4206) follows it, making 25 with agentsource.update after release.check and maintenance.active after schedules.paused (PRD #3454).
+	// Both fleet.hibernation_cleanup and fleet.hibernation_retirement follow fleet.hibernation_wake; there are 26 checks.
 	wantIDs := []string{
-		"fleet.roll", "fleet.capacity", "fleet.disk", "fleet.rundisk", "fleet.quarantine", "fleet.memory_authority", "fleet.hibernation_wake", "fleet.hibernation_cleanup", "queue.waiting", "queue.undispatched",
+		"fleet.roll", "fleet.capacity", "fleet.disk", "fleet.rundisk", "fleet.quarantine", "fleet.memory_authority", "fleet.hibernation_wake", "fleet.hibernation_cleanup", "fleet.hibernation_retirement", "queue.waiting", "queue.undispatched",
 		"controller.report", "db", "db.size", "loops", "forge.ciwatch", "forge.sync", "slack.socket",
 		"schedules.paused", "maintenance.active", "board.drift", "custody.holds", "recovery.storage", "release.check", "agentsource.update", "pricing.codex",
 	}

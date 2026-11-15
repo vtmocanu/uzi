@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"testing"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/clitoken"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -337,6 +339,24 @@ func TestRunListCrossCheckActiveStatesLiveDB(t *testing.T) {
 					t.Errorf("%s %q: cross_check_active = %s, want %q", label, c.name, ccStr(v), c.want)
 				}
 			}
+		}
+	}
+	// The single-run detail read uses the same live probes. It must work even when
+	// the TUI enters directly by run id, with no list row to borrow from (#4345).
+	for i, c := range cases {
+		rec := bearerReq(router, http.MethodGet, "/api/runs/"+ids[i].String(), ownerTok)
+		if rec.Code != http.StatusOK {
+			t.Errorf("detail %q: status %d: %s", c.name, rec.Code, rec.Body.String())
+			continue
+		}
+		var body struct {
+			Run apitypes.RunDTO `json:"run"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("detail %q decode: %v", c.name, err)
+		}
+		if got := ccStr(body.Run.CrossCheckActive); got != map[bool]string{true: c.want, false: "null"}[c.want != ""] {
+			t.Errorf("detail %q cross_check_active = %s, want %q", c.name, got, c.want)
 		}
 	}
 }

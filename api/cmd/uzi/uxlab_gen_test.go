@@ -130,6 +130,9 @@ func TestGenerateUXLabFrames(t *testing.T) {
 		"board-accounts-one-each":           func(d bool) string { return boardAccountScene(d, now, 1, 140) },
 		"board-accounts-two-plus-one":       func(d bool) string { return boardAccountScene(d, now, 2, 140) },
 		"board-populated":                   func(d bool) string { return boardPopulated(d, now) },
+		"board-check-states":                func(d bool) string { return boardCheckStates(d, now) },
+		"detail-check-reworking":            func(d bool) string { return detailCheckState(d, now, "c0de0004-1111-2222-3333-444444444444") },
+		"detail-check-gate":                 func(d bool) string { return detailCheckState(d, now, "b2c3d4e5-1111-2222-3333-444444444444") },
 		"board-worker-name-tail":            func(d bool) string { return boardWorkerNameTailScene(d, now) },
 		"board-rejected":                    func(d bool) string { return rejectedScene(d, "board", 0, false) },
 		"board-rejected-selected":           func(d bool) string { return rejectedScene(d, "board", 0, true) },
@@ -755,6 +758,31 @@ func boardPopulated(dark bool, now time.Time) string {
 	m = step(m, rateLimitsMsg{tokens: boardMeters()})
 	m = step(m, settingsMsg{settings: apitypes.UserSettingsDTO{SidebarTokenIds: []string{"sec-meta"}}})
 	return m.View().Content
+}
+
+func boardCheckStates(dark bool, now time.Time) string {
+	var rows []apitypes.RunListItemDTO
+	for _, row := range demoRuns(now) {
+		word := runStateWord(row)
+		if word == "checking" || word == "reworking" || word == "compl blocked" ||
+			word == "xchecking" || word == "xchk revise" || word == "xchk blocked" || word == "xchk n/a" {
+			rows = append(rows, row)
+		}
+	}
+	m := uxModel(&uzicli.FakeClient{Runs: rows}, "", dark)
+	m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: rows})
+	return m.View().Content
+}
+
+func detailCheckState(dark bool, now time.Time, id string) string {
+	for _, row := range demoRuns(now) {
+		if row.ID == id {
+			m := uxModel(&uzicli.FakeClient{}, id, dark)
+			m = applyDetail(m, row.RunDTO, nil)
+			return m.View().Content
+		}
+	}
+	return "missing demo check run"
 }
 
 // boardCodex is boardPopulated PLUS the viewer's own Codex meters and Codex sidebar selection, so

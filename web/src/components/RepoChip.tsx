@@ -2,12 +2,15 @@
 // whether to mount it). A compact "N repos active of M" trigger with a badge stack opens a
 // popover listing which repos have listed active work, which ran in the last week and how
 // many are idle. All figures come from the pure repoActivityModel; this component only draws
-// it. The open/close model, focus handling and panel are a parallel copy of PeopleChip's.
+// it. The shared chip hook handles focus and dismissal; this chip keeps its own desktop
+// left-alignment decision for a wrapped header.
 
-import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
+import { useLayoutEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { repoIdleText, type ActiveRepo, type RepoActivityModel } from "../lib/overviewRepos";
 import { cx } from "./ui";
+import { ChipPopoverPanel } from "./ChipPopoverPanel";
+import { useChipPopover } from "./useChipPopover";
 
 const INFO_TEXT =
   "Active counts repos with a listed non-terminal run: chat, judge and cross-check runs are not listed, and the list stops at 500 runs. Last run includes every run kind.";
@@ -65,20 +68,8 @@ function headerText(active: Active, total: number | null): string {
 }
 
 export function RepoChip({ model }: { model: RepoActivityModel }) {
-  const [open, setOpen] = useState(false);
+  const { open, setOpen, hostRef, panelRef, triggerRef, panelId } = useChipPopover();
   const [alignLeft, setAlignLeft] = useState(false);
-  const hostRef = useRef<HTMLDivElement>(null);
-  const panelRef = useRef<HTMLDivElement>(null);
-  const triggerRef = useRef<HTMLButtonElement>(null);
-  // Pending click-away refocus frame, cancelled only on unmount (see ExtendTimePopover).
-  const refocusRaf = useRef(0);
-  const panelId = useId();
-
-  // keydown has no focus default action, so returning focus synchronously on Escape wins.
-  const close = useCallback((returnFocus: boolean) => {
-    setOpen(false);
-    if (returnFocus) triggerRef.current?.focus();
-  }, []);
 
   // Decided on open: a right-aligned panel needs the trigger's right edge to leave room for the
   // panel width plus a 16px margin; otherwise align to the trigger's left edge.
@@ -86,39 +77,7 @@ export function RepoChip({ model }: { model: RepoActivityModel }) {
     if (!open || !triggerRef.current) return;
     const panelWidth = Math.min(360, window.innerWidth - 32);
     setAlignLeft(triggerRef.current.getBoundingClientRect().right < panelWidth + 16);
-  }, [open]);
-
-  useEffect(() => {
-    if (!open) return;
-    panelRef.current?.focus();
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") close(true);
-    };
-    const onDown = (e: MouseEvent) => {
-      if (hostRef.current && !hostRef.current.contains(e.target as Node)) {
-        setOpen(false);
-        // The native mousedown moves focus to <body> after this handler, so refocus a frame later,
-        // but only when focus was left on nothing: a control the user clicked keeps it.
-        refocusRaf.current = requestAnimationFrame(() => {
-          const a = document.activeElement;
-          if (a == null || a === document.body) triggerRef.current?.focus({ preventScroll: true });
-        });
-      }
-    };
-    document.addEventListener("keydown", onKey);
-    document.addEventListener("mousedown", onDown);
-    return () => {
-      document.removeEventListener("keydown", onKey);
-      document.removeEventListener("mousedown", onDown);
-    };
-  }, [open, close]);
-
-  useEffect(
-    () => () => {
-      if (refocusRaf.current) cancelAnimationFrame(refocusRaf.current);
-    },
-    [],
-  );
+  }, [open, triggerRef]);
 
   const { active, total, recent, idle, listFailed } = model;
   if (active.state === "loading") return null;
@@ -165,20 +124,11 @@ export function RepoChip({ model }: { model: RepoActivityModel }) {
         </span>
       </button>
       {open && (
-        <div
+        <ChipPopoverPanel
           id={panelId}
-          ref={panelRef}
-          role="dialog"
-          aria-label="Repos in uzi"
-          tabIndex={-1}
-          // Desktop: below the chip, right edge aligned to it, or left edge when the chip sits too
-          // close to the viewport's left edge (a wrapped header) for a right-aligned panel to fit.
-          // Below sm the panel becomes a bottom sheet (fixed, 1rem insets), so it fits anywhere.
-          className={cx(
-            "absolute top-full z-30 mt-2 max-h-[70vh]",
-            alignLeft ? "sm:left-0" : "sm:right-0",
-            " w-[min(360px,calc(100vw-32px))] overflow-y-auto rounded-xl border border-edge bg-raised text-left shadow-2xl outline-hidden max-sm:fixed max-sm:inset-x-4 max-sm:bottom-4 max-sm:top-auto max-sm:mt-0 max-sm:max-h-[calc(100dvh-2rem)] max-sm:w-auto",
-          )}
+          panelRef={panelRef}
+          label="Repos in uzi"
+          alignment={alignLeft ? "left" : "right"}
         >
           <div className="space-y-3 p-3">
             <div className="flex items-start justify-between gap-2">
@@ -254,7 +204,7 @@ export function RepoChip({ model }: { model: RepoActivityModel }) {
               Your repos
             </Link>
           </div>
-        </div>
+        </ChipPopoverPanel>
       )}
     </div>
   );

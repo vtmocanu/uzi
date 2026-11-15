@@ -318,6 +318,10 @@ type RunDTO struct {
 	// An older api omits it, and clients then render nothing for it.
 	PlanCrossCheckGated      bool    `json:"plan_cross_check_gated,omitempty"`
 	PlanCrossCheckGateReason *string `json:"plan_cross_check_gate_reason"`
+	// CrossCheckActive reports the currently live plan or advisory code cross-check.
+	// GetRun and the run lists compute it with the same live semantics and closed
+	// vocabulary: "plan", "code", or null. Other RunDTO responses leave it null.
+	CrossCheckActive *string `json:"cross_check_active"`
 	// PlanCrossCheckDiffRefusal is the planning-diff refusal sub-code. It is set only
 	// while PlanCrossCheckGateReason is planning_diff_refused; otherwise nil.
 	PlanCrossCheckDiffRefusal *string `json:"plan_cross_check_diff_refusal"`
@@ -1062,10 +1066,19 @@ type RunDTO struct {
 	// SINGLE-RUN READ ONLY, best-effort: set by GET /api/runs/{id} for lead-lane runs (leadcfg.LeadLane)
 	// and absent on every list row and on runs that have no lead agent. Display-only.
 	LeadConfig *RunLeadConfigDTO `json:"lead_config,omitempty"`
-	// Model is the model frozen onto the run at fire time by the schedule that created it
-	// (PRD #300): nil means the run inherited the owner's per-user Worker default. Surfaced
-	// read-only so a scheduled run's model is confirmable.
+	// Model is the model frozen onto the run at create time, either chosen when the run was started
+	// (ModelSource run_override, PRD #3250) or pinned by the schedule that created it (schedule_pin,
+	// PRD #300): nil means the run inherits the owner's per-user Worker default at claim. Surfaced
+	// read-only so the run's model is confirmable.
 	Model *string `json:"model"`
+	// Effort is the reasoning effort chosen when the run was started (PRD #3250), frozen at create:
+	// nil means the claim-time setting applies.
+	Effort *string `json:"effort"`
+	// ModelSource names the writer of Model: run_override or schedule_pin; nil when Model is nil and for
+	// a legacy row an older binary wrote (display treats a model with no source as schedule_pin).
+	ModelSource *string `json:"model_source"`
+	// EffortSource names the writer of Effort: run_override; nil when Effort is nil.
+	EffortSource *string `json:"effort_source"`
 	// OverrideSubagentModel is the "apply model also to agents" flag frozen onto the run
 	// at fire time by the schedule that created it (PRD #305): true means the run's model
 	// was applied to every subagent (overriding pins), false is today's default. Surfaced
@@ -1998,9 +2011,10 @@ type RunSummaryItemDTO struct {
 	HomeBytes     *int64 `json:"home_bytes,omitempty"`
 	CacheBytes    *int64 `json:"cache_bytes,omitempty"`
 	DiskTruncated bool   `json:"disk_truncated,omitempty"`
-	// Model is the model frozen onto the run at fire time by the schedule that created it
-	// (PRD #300): nil means the run inherited the owner's per-user Worker default. Surfaced
-	// read-only so a scheduled run's model is confirmable.
+	// Model is the model frozen onto the run at create time, either chosen when the run was started
+	// (ModelSource run_override, PRD #3250) or pinned by the schedule that created it (schedule_pin,
+	// PRD #300): nil means the run inherits the owner's per-user Worker default at claim. Surfaced
+	// read-only so the run's model is confirmable.
 	Model *string `json:"model"`
 	// OverrideSubagentModel is the "apply model also to agents" flag frozen onto the run
 	// at fire time by the schedule that created it (PRD #305): true means the run's model
@@ -2463,16 +2477,16 @@ func (s RunSummaryItemDTO) ListItem() RunListItemDTO {
 			IsRevising:                    s.IsRevising,
 			CodeCrossCheckRequired:        s.CodeCrossCheckRequired,
 			CodeCrossCheckSummary:         s.CodeCrossCheckSummary,
+			CrossCheckActive:              s.CrossCheckActive,
 			AccountCooldownClass:          s.AccountCooldownClass,
 			AccountCooldownEligibleAt:     s.AccountCooldownEligibleAt,
 		},
-		RepoPath:         s.RepoPath,
-		WorkerName:       s.WorkerName,
-		OwnerEmail:       s.OwnerEmail,
-		JudgeVerdict:     s.JudgeVerdict,
-		JudgeTodoCount:   s.JudgeTodoCount,
-		PendingQuestion:  s.PendingQuestion,
-		CrossCheckActive: s.CrossCheckActive,
+		RepoPath:        s.RepoPath,
+		WorkerName:      s.WorkerName,
+		OwnerEmail:      s.OwnerEmail,
+		JudgeVerdict:    s.JudgeVerdict,
+		JudgeTodoCount:  s.JudgeTodoCount,
+		PendingQuestion: s.PendingQuestion,
 	}
 }
 
@@ -2508,10 +2522,7 @@ type RunListItemDTO struct {
 	// #4040), runquestion.Excerpt of the question message. Owner-only: ListRuns sets it for
 	// awaiting_input rows; the admin list never carries it. Omitted when absent.
 	PendingQuestion string `json:"pending_question,omitempty"`
-	// CrossCheckActive is "plan" while a plan cross-check is live for the run, "code" while a
-	// code cross-check is live, and null otherwise (issue #4082). List-only presence flag: it
-	// carries no findings, verdict, model or deadline. Always sent (null when none).
-	CrossCheckActive *string `json:"cross_check_active"`
+	// CrossCheckActive is embedded from RunDTO; the list overlays it from its live SQL flags.
 }
 
 // MessageDTO is one persisted run message (the replay source a reconnecting
@@ -2758,20 +2769,19 @@ func (r *RunListItemDTO) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	var context struct {
-		RepoPath         string  `json:"repo_path"`
-		WorkerName       *string `json:"worker_name"`
-		OwnerEmail       *string `json:"owner_email"`
-		JudgeVerdict     *string `json:"judge_verdict"`
-		JudgeTodoCount   int     `json:"judge_todo_count"`
-		PendingQuestion  string  `json:"pending_question"`
-		CrossCheckActive *string `json:"cross_check_active"`
+		RepoPath        string  `json:"repo_path"`
+		WorkerName      *string `json:"worker_name"`
+		OwnerEmail      *string `json:"owner_email"`
+		JudgeVerdict    *string `json:"judge_verdict"`
+		JudgeTodoCount  int     `json:"judge_todo_count"`
+		PendingQuestion string  `json:"pending_question"`
 	}
 	if err := json.Unmarshal(data, &context); err != nil {
 		return err
 	}
 	*r = RunListItemDTO{RunDTO: run, RepoPath: context.RepoPath, WorkerName: context.WorkerName,
 		OwnerEmail: context.OwnerEmail, JudgeVerdict: context.JudgeVerdict, JudgeTodoCount: context.JudgeTodoCount,
-		PendingQuestion: context.PendingQuestion, CrossCheckActive: context.CrossCheckActive}
+		PendingQuestion: context.PendingQuestion}
 	return nil
 }
 

@@ -188,7 +188,11 @@ type FakeClient struct {
 	// LastCreateHarness captures PRD #1429 M5's create-time explicit harness selection (""
 	// when --harness was omitted), so a test can assert the CLI forwarded the validated
 	// claude|codex value (or sent none at all).
-	LastCreateHarness  string
+	LastCreateHarness string
+	// LastCreateModel and LastCreateEffort capture PRD #3250's start-time model and effort
+	// ("" when --model / --effort was omitted).
+	LastCreateModel    string
+	LastCreateEffort   string
 	InputResp          apitypes.RunInputResponse
 	LastInputRunID     string
 	LastInputKind      string

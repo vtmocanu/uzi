@@ -7,6 +7,7 @@ import {
   type TerminalDelta, type TerminalManifest, type TerminalOperationDeps, type TerminalOperationResult, type TerminalInvokeResult, type TerminalOperationRecord, type TerminalOperationStore,
   type TerminalReadResult, type TerminalRediscovery, type TerminalUpdateResult,
 } from "./terminal-operation.js";
+import { hibernationWriters } from "./hibernation-inventory.js";
 import { AuthorityLockBusy, AuthorityRefusal } from "./authority-lock.js";
 import type { AuthorityScope, AuthorityWait, RetirementHandle, RetirementView } from "./authority-runtime.js";
 import {
@@ -5663,6 +5664,13 @@ export class RecoveryCoordinator {
 
   /** Install ownership synchronously before dispatch, including reentrant shutdown from hooks. */
   private trackPass(callerSignal: AbortSignal | undefined, fn: () => Promise<void>): Promise<void> {
+    // PRD #4208: every pass writes capture records or bundles on the data volume and can outlive the
+    // run that spawned it, so it is a registered hibernation writer. Entered synchronously, before any
+    // await, and counted so the hibernation settle waits for a pass already in flight. A pass refused
+    // while the writer latch is held does nothing: its records stay journaled for the next boot pass
+    // or heartbeat re-drive. No equivalence between the live re-drive and the terminal pass is claimed.
+    const releaseWriter = hibernationWriters.enter("recovery_pass");
+    if (!releaseWriter) return Promise.resolve();
     const signal = AbortSignal.any([this.passShutdown.signal, ...(callerSignal ? [callerSignal] : [])]);
     const pass = Promise.resolve().then(async () => {
       if (signal.aborted) return;
@@ -5680,6 +5688,7 @@ export class RecoveryCoordinator {
     this.passes.add(pass);
     return pass.finally(() => {
       this.passes.delete(pass);
+      releaseWriter();
     });
   }
 

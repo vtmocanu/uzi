@@ -356,15 +356,76 @@ function createRuntime(options = {}) {
         requireUnscoped();
         if (mode !== 'exclusive') return;
         // Deliberately no conversion: admission must remain closed across this gap.
+        const previousIdentity = heldIdentity;
         io.closeSync(fd);
         fd = undefined;
         closed = true;
         const next = open(names.epoch);
-        try { await lock(next, 'shared', 120000, signal); verify(next, names.epoch); }
+        // The re-taken SH must be the very inode held before (as in upgradeExclusive): a replaced
+        // inode throws with the handle left closed, never adopted as the new lock file.
+        try { await lock(next, 'shared', 120000, signal); heldIdentity = identity(verify(next, names.epoch, 0o600, previousIdentity)); }
         catch (error) { io.closeSync(next); throw error; }
         fd = next;
         mode = 'shared';
         closed = false;
+      },
+      // Shared -> exclusive for the hibernation inventory (PRD #4208). Mirrors reacquireShared:
+      // there is deliberately no flock conversion. The descriptor is closed, the file reopened and
+      // exclusivity attempted once without waiting, so the lock is unlocked for an instant between
+      // the close and the reopen. That gap is accepted for the same reason as in reacquireShared:
+      // worker admission (the claim gate) is already closed for the whole of it, and `pending` makes
+      // every other operation throw, so no new work can start while the lock is not held. The
+      // reopened file must be the very inode held before (heldIdentity), so EX on a replaced inode
+      // fails like any other failure of the attempt and shared ownership is re-taken. The re-taken
+      // shared descriptor is held to the same identity: a replaced inode there is 'epoch shared
+      // ownership lost' (fatal), not an adopted new lock file.
+      //   true  -> EX held (mode is 'exclusive').
+      //   false -> contended; shared ownership was re-taken (mode is still 'shared').
+      // A non-contention failure of the exclusive attempt re-takes SH and then rethrows. If SH
+      // itself cannot be re-taken the handle is closed and the call throws 'epoch shared
+      // ownership lost': the caller must treat that as fatal and exit, never continue lockless.
+      // While the gap is open `pending` makes every other operation throw, but `mode` keeps
+      // answering (the previous 'shared') so a concurrent reader never throws mid-transition.
+      async upgradeExclusive() {
+        requireUnscoped();
+        if (mode !== 'shared' || fd === undefined) throw new Error('shared epoch ownership required');
+        pending = true;
+        const previousIdentity = heldIdentity;
+        let failure;
+        let upgraded = false;
+        try {
+          io.closeSync(fd);
+          fd = undefined;
+          let next;
+          try {
+            next = open(names.epoch);
+            if (await lock(next, 'exclusive', 120000, signal, true)) {
+              heldIdentity = identity(verify(next, names.epoch, 0o600, previousIdentity));
+              fd = next;
+              mode = 'exclusive';
+              upgraded = true;
+              return true;
+            }
+          } catch (error) { failure = error; }
+          if (next !== undefined && !upgraded) {
+            try { io.closeSync(next); } catch (error) { failure ??= error; }
+          }
+          let shared;
+          try {
+            shared = open(names.epoch);
+            await lock(shared, 'shared', 120000, signal);
+            // The re-taken SH must be the very inode held before the attempt, like the EX verify: a
+            // replaced inode here is lost shared ownership (fatal), never silently adopted.
+            heldIdentity = identity(verify(shared, names.epoch, 0o600, previousIdentity));
+            fd = shared;
+          } catch (error) {
+            if (shared !== undefined) { try { io.closeSync(shared); } catch { /* already failing */ } }
+            closed = true;
+            throw new Error('epoch shared ownership lost: ' + (error?.message ?? error));
+          }
+          if (failure) throw failure;
+          return false;
+        } finally { pending = false; }
       },
       close() {
         requireUnscoped();

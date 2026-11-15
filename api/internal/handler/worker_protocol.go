@@ -425,6 +425,7 @@ func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled, publication
 		{"refresh_publication_context_v1"},
 		{"completion_semantic_publication_v1"}, // PRD #1230 D4: independent of completion_non_closing_v1; advertises the semantic coverage park report
 		{"dind_maintenance_v1"},
+		{capability.HibernationInventoryV1}, // PRD #4208 M1: this api binds a worker's pre-scale-down volume inventory (the heartbeat's hibernation_inventory and hibernation_exclusion members)
 		{"worker_memory_pressure_v1"},
 		{"memory_park_settlement_v1"},        // issue #3639: this api accepts the memory-park settlement receipt and answers the claim body's memory_park_reference
 		{"worker_memory_authority_claim_v1"}, // issue #3142: this api accepts the run-lane claim body's memory_authority member
@@ -614,10 +615,25 @@ func (h *Handler) WorkerHeartbeat(w http.ResponseWriter, r *http.Request) {
 		// without failing the heartbeat's liveness. The worker sends it only while latched
 		// and only after the register response advertised `worker_residue_quarantine`.
 		ResidueQuarantine json.RawMessage `json:"residue_quarantine"`
+		// HibernationExclusion (PRD #4208 M1) is the worker's report that it still holds, or
+		// has lost, the writer exclusion its volume inventory was taken under. A malformed member
+		// is answered 400 rather than dropped. The whole heartbeat is refused, so the agent's
+		// strip-and-retry fallback resends it without its extension members: a held=false can be
+		// dropped there and liveness is kept. The consequence is an unproven exclusion, not a hidden
+		// one: no exclusion-final follows, so the inventory is never confirmed as still held.
+		HibernationExclusion *workersvc.HibernationExclusionReport `json:"hibernation_exclusion"`
 	}
 	if err := httpx.DecodeJSON(r, &req); err != nil && !errors.Is(err, io.EOF) {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
+	}
+	var exclusion *workersvc.HibernationExclusion
+	if req.HibernationExclusion != nil {
+		var perr error
+		if exclusion, perr = req.HibernationExclusion.Parse(); perr != nil {
+			httpx.Error(w, http.StatusBadRequest, "invalid request body")
+			return
+		}
 	}
 	// Second step: validate + clamp the isolated stats (Decision 5). A malformed or
 	// invalid sample drops to nil (columns written NULL) and the heartbeat still 200s.
@@ -733,6 +749,25 @@ func (h *Handler) WorkerHeartbeat(w http.ResponseWriter, r *http.Request) {
 	} else if req.HibernationCachePruneReport != nil {
 		httpx.Error(w, http.StatusConflict, "hibernation cache prune precondition failed")
 		return
+	}
+	// PRD #4208 M1: the hibernation half runs in its own transaction that locks the worker row
+	// first (Service.HibernationHeartbeat), so an exclusion report is always recorded under the
+	// worker lock, never on the lockless liveness write above. Only a preparing worker with the
+	// capability is asked for an inventory; a worker that reports an exclusion is always heard.
+	if exclusion != nil || (updated.HibernationState == "preparing" && slices.Contains(updated.ProtocolCapabilities, capability.HibernationInventoryV1)) {
+		member, herr := h.wsvc.HibernationHeartbeat(r.Context(), wkr.ID, exclusion)
+		switch {
+		case errors.Is(herr, workersvc.ErrHibernationUnavailable):
+		case herr != nil:
+			slog.Error("worker heartbeat: hibernation inventory", "worker_id", wkr.ID.String(), "error", herr)
+			// Liveness is already committed, but omission in a 200 would tell the worker to
+			// release its exclusion. Fail the heartbeat so it keeps the observation unknown
+			// and retries any exclusion report instead of acknowledging evidence we lost.
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		case member != nil:
+			response["hibernation_inventory"] = member
+		}
 	}
 	httpx.JSON(w, http.StatusOK, response)
 }

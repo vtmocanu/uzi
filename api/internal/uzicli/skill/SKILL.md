@@ -202,7 +202,7 @@ uzi run logs <run-id> [--follow] [--after <seq>] [--tail <n>]
 uzi run plan <run-id> [--version N] [--diff] [--json]
 uzi run wait <run-id> [--until <status,...>] [--interval <dur>] [--timeout <dur>] [--min-plan-seq <n>]
 uzi run review <run-id>
-uzi run create --repo <repo-id> --issue <issue-iid> [--wait-on-limit[=false]] [--mr-rework[=false]] [--plan-file <path>] [--agent-source own|repo] [--exclude-agents <a,b>] [--planned-commit <sha>] [--require-base] [--token <label>|auto|default|inherit] [--harness claude|codex]
+uzi run create --repo <repo-id> --issue <issue-iid> [--wait-on-limit[=false]] [--mr-rework[=false]] [--plan-file <path>] [--agent-source own|repo] [--exclude-agents <a,b>] [--planned-commit <sha>] [--require-base] [--token <label>|auto|default|inherit] [--harness claude|codex] [--model <id>] [--effort low|medium|high|xhigh|max]
 uzi run approve <run-id> [--agent-source own|repo] [--exclude-agents <a,b>] [--token <label>|auto|default|inherit] [--expected-gate-revision <n>]
 uzi run reject <run-id> [--message <text>] [--expected-gate-revision <n>]
 uzi run revise <run-id> [--message <text>] [--expected-gate-revision <n>]
@@ -496,7 +496,9 @@ uzi version
   always works) or `credential_switch_unsettled` (the worker finished its own operations
   but the run's processes were not proven stopped; work and custody stay on that worker;
   Resume requeues on the newly chosen token and the next claim re-proves quiescence fail
-  closed, or Cancel); or the weekly usage reserve, `hold_reason` `weekly_reserve` (the credential the
+  closed, or Cancel); or a run-override hold, `hold_reason` `run_override_unavailable` (the
+  run's chosen model or effort cannot run on its harness; the notice reads `model choice
+  unavailable`; owner Resume retries only if the choice has become available on that harness, otherwise Cancel and start a new run with a different choice); or the weekly usage reserve, `hold_reason` `weekly_reserve` (the credential the
   run spends reached the owner's weekly threshold; it releases by itself once usage drops below it,
   and `uzi run resume <id>` overrides the reserve until the next weekly reset, printing
   `Resumed <id>: queued (overrides the weekly usage reserve until the next weekly reset).`);
@@ -646,6 +648,16 @@ uzi version
   `--harness claude|codex` picks which harness this run uses, validated client-side
   before any request; omit it to let the server resolve your effective default. A value
   outside `claude`/`codex` is a usage error before any request is sent.
+
+  `--model <id>` and `--effort low|medium|high|xhigh|max` choose this run's model and
+  reasoning effort (PRD #3250). Each is sent only when passed, verbatim, and frozen on
+  the run, beating your Settings default. An empty or whitespace-containing `--model` or
+  an `--effort` outside the set is a usage error before any request. A model the run's
+  harness cannot serve is refused with 422 `model_incompatible_with_harness` (the CLI
+  prints the server's message; no run is created). A `--model` also opts the run out of the
+  automatic harness choice; `--effort` alone does not. If the choice later cannot run at
+  claim, the run parks `paused` on `hold_reason: run_override_unavailable`
+  (see the hold notes above).
 - `uzi run approve <run-id>` — approve the plan gate. Omitting `--agent-source`
   sends no selection at all, and an absent selection resolves to **the agents the
   worker detected in the clone's `.claude/agents/`**, falling back to your own

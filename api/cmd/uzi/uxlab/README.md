@@ -106,6 +106,7 @@ Every scene is rendered from the SHIPPED model, `-dark` and `-light`.
 | Frame | State it captures |
 |---|---|
 | `board-populated` / `board-empty` / `board-admin` / `board-filter` | the run board: mixed statuses/health, empty state, factory-wide admin (OWNER), and the `/` filter |
+| `board-check-states` / `detail-check-reworking` / `detail-check-gate` | completion and cross-check state words on the board, plus a reworking run with an advisory code check and a plan-check revision in the run detail (#4345) |
 | `board-done-failures` / `board-done-failures-selected` | one dimmed red for DONE failure state tokens, their issue links and every DONE issues judge badge; full-red active issues badges and failure count; quiet human stops, with and without selection |
 | `board-done-age` | recent finishes from older runs, legacy finish fallback, and unchanged active age |
 | `board-done-run-length-160` | `board-done-age` at 160 columns: DONE rows show run length after the age (blank without a finish stamp; running row blank) |

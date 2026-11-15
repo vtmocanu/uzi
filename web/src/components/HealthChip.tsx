@@ -5,6 +5,8 @@
 // Attention rows use the card's shared row (#4166); passing checks appear by area. The
 // footer's Open health link reaches the full Health tab. Live verdict changes keep the
 // popover open and move focus only if the previously focused item disappeared.
+// Its wide panel placement and live-update focus tracking need a different effect order
+// from the three 360 px chips, so this component keeps its own dismissal effect (#4341).
 
 import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
