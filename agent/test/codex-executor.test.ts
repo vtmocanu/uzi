@@ -32710,6 +32710,7 @@ describe("M2 actualRunner credential replacement", () => {
         const { NowSummaryController } = await import("../src/now-summary.js");
         const suspendNow = NowSummaryController.prototype.suspendCodexSwitch;
         const nowPublicationProbes: string[] = [];
+        let startPublicationProbe: ((stage: string, assignment?: boolean) => void) | undefined;
         const nowConsumerProbes: Promise<{ error?: unknown }>[] = [];
         const nowConsumerStages: string[] = [];
         const joinNowConsumerProbes = async () => {
@@ -32720,15 +32721,16 @@ describe("M2 actualRunner credential replacement", () => {
         };
         const nowProbe = mock.method(NowSummaryController.prototype, "suspendCodexSwitch", function (this: InstanceType<typeof NowSummaryController>, bounds: Parameters<typeof suspendNow>[0]) {
           const lease = suspendNow.call(this, bounds);
-          const probe = (stage: string): void => {
+          const probe = (stage: string, assignment = false): void => {
             const builds = nowBuilds.length;
+            const releases = credentialReleases, refreshes = credentialRefreshes;
             const aSends = a.transport.requests.length, bSends = b.transport.requests.length;
             this.observeProgress({ completed: [], in_progress: [stage] }, [{ id: stage, title: stage }]);
             this.observeFrame({ kind: "tool_use", agent: "lead", payload: { id: stage, name: "Bash", input: { command: "true", description: stage } } });
             assert.equal(nowBuilds.length, builds, stage);
             assert.equal(a.transport.requests.length, aSends, stage);
             assert.equal(b.transport.requests.length, bSends, stage);
-            nowPublicationProbes.push(stage);
+            if (!assignment) nowPublicationProbes.push(stage);
             if (publication === "gated") {
               const probeConsumers = async () => {
                 assert.equal(bFinished, false, stage);
@@ -32753,12 +32755,16 @@ describe("M2 actualRunner credential replacement", () => {
                 if ("error" in refreshed) throw refreshed.error;
                 assert.equal(a.transport.requests.length, aSends, `no A sends at ${stage}`);
                 assert.equal(b.transport.requests.length, bSends, `no B sends at ${stage}`);
+                assert.equal(nowBuilds.length, builds, stage);
+                assert.equal(credentialReleases, releases, stage);
+                assert.equal(credentialRefreshes, refreshes, stage);
                 nowConsumerStages.push(stage);
               };
               // Now publishB is synchronous; join these at the executor barrier.
               nowConsumerProbes.push(probeConsumers().then(() => ({}), error => ({ error })));
             }
           };
+          startPublicationProbe = probe;
           return { ...lease, publishB: (bundle: Parameters<ReturnType<typeof suspendNow>["publishB"]>[0]) => {
             probe("before-Now-publish");
             const published = lease.publishB(bundle);
@@ -32870,9 +32876,77 @@ describe("M2 actualRunner credential replacement", () => {
           return useBroker.call(this, broker);
         });
         const consumerProbes: string[] = [];
+        type ObservedFlight = {
+          runId: string;
+          claimGeneration: number;
+          executor: typeof executor;
+          operationScope?: object;
+        };
+        const flightBuilder = runner as unknown as { buildFlight(...args: unknown[]): ObservedFlight };
+        const buildFlight = flightBuilder.buildFlight;
+        let actualFlight: ObservedFlight | undefined;
+        const flightProbe = mock.method(flightBuilder, "buildFlight", function (this: typeof flightBuilder, ...args: unknown[]) {
+          const flight = buildFlight.apply(this, args);
+          if (flight.runId === claim.run_id && flight.claimGeneration === claim.claim_generation &&
+              flight.executor === executor) {
+            assert.equal(actualFlight, undefined, "capture exactly one matching real flight");
+            actualFlight = flight;
+          }
+          return flight;
+        });
+        const expectedAssignmentStages = next.auth_mode === "subscription"
+          ? ["before-scope-clear", "after-scope-clear", "before-scope-install", "after-scope-install"]
+          : ["before-scope-clear", "after-scope-clear"];
+        const assignmentStages: string[] = [];
+        let scopeDescriptor: PropertyDescriptor | undefined;
+        let scopeBacking: ObservedFlight["operationScope"];
+        let scopeIntercepted = false, scopeProbesArmed = false;
+        const probeAssignment = (stage: string) => {
+          assignmentStages.push(stage);
+          assert.equal(context.prepareCodexRootDispatch, retainedPrepareRootDispatch,
+            `context dispatcher still retains A at ${stage}`);
+          assert.equal(bRefresh, undefined, stage);
+          assert.equal(bHarness, undefined, stage);
+          assert.equal(bPreparationBroker, undefined, stage);
+          assert.equal(bRootObserved, false, stage);
+          assert.equal(rig.providerLaunches(), 1, `B provider work root absent at ${stage}`);
+          assert.ok(startPublicationProbe, "retain the actual Now controller probe");
+          startPublicationProbe(stage, true);
+        };
         const running = runner.execute(claim);
+        const joinExecution = async () => {
+          const settled = await Promise.allSettled([running, ...triggers]);
+          for (const result of settled) {
+            if (result.status === "rejected") throw result.reason;
+          }
+        };
         try {
           await withTimeout(aEntered.promise, 5000, "M2 A turn");
+          if (publication === "gated") {
+            assert.ok(actualFlight, "capture the real run/generation/executor flight");
+            scopeDescriptor = Object.getOwnPropertyDescriptor(actualFlight, "operationScope");
+            assert.ok(!scopeDescriptor || ("value" in scopeDescriptor && scopeDescriptor.configurable),
+              "intercept only a configurable data property");
+            scopeBacking = actualFlight.operationScope;
+            const initialScope = scopeBacking;
+            assert.equal(initialScope !== undefined, oldClaim.auth_mode === "subscription");
+            scopeProbesArmed = true;
+            Object.defineProperty(actualFlight, "operationScope", {
+              configurable: true, enumerable: scopeDescriptor?.enumerable ?? true,
+              get: () => scopeBacking,
+              set: (value: ObservedFlight["operationScope"]) => {
+                if (!scopeProbesArmed) { scopeBacking = value; return; }
+                const installing = assignmentStages.length === 2;
+                assert.equal(value === undefined, !installing, "clear precedes subscription installation");
+                if (installing) assert.notEqual(value, initialScope, "B owns a distinct scope");
+                probeAssignment(installing ? "before-scope-install" : "before-scope-clear");
+                scopeBacking = value;
+                probeAssignment(installing ? "after-scope-install" : "after-scope-clear");
+                if (assignmentStages.length === expectedAssignmentStages.length) scopeProbesArmed = false;
+              },
+            });
+            scopeIntercepted = true;
+          }
           await triggerNow("A");
           await withTimeout(nowEntered.promise, 5000, "M2 active A Now factory");
           pending = true;
@@ -32905,16 +32979,22 @@ describe("M2 actualRunner credential replacement", () => {
               const aRequests: number = a.transport.requests.length;
               const bRequests: number = b.transport.requests.length;
               try {
+                if (publication === "gated" && barrier.stage === "before-publish") {
+                  await joinNowConsumerProbes();
+                  assert.deepEqual(assignmentStages, expectedAssignmentStages);
+                  assert.deepEqual([...nowConsumerStages].sort(), [...expectedAssignmentStages].sort());
+                  assert.equal(scopeProbesArmed, false, "cleanup is not replacement publication");
+                }
                 if (publication === "gated" && barrier.stage === "before-prepare") {
                   await joinNowConsumerProbes();
-                  assert.deepEqual([...nowConsumerStages].sort(), ["after-Now-publish", "before-Now-publish"]);
-                  assert.equal(nowConsumerProbes.length, 2, "both synchronous Now callbacks invoke retained A consumers");
+                  assert.deepEqual([...nowConsumerStages].sort(), [...expectedAssignmentStages, "after-Now-publish", "before-Now-publish"].sort());
+                  assert.equal(nowConsumerProbes.length, expectedAssignmentStages.length + 2, "assignment and Now callbacks invoke retained A consumers");
                 }
                 if (publication === "gated" && (barrier.stage === "before-publish" ||
                     barrier.stage === "after-publish" || barrier.stage === "before-prepare")) {
                   await probeRetiredRefresh(barrier.stage);
                   if (barrier.stage === "before-prepare")
-                    assert.deepEqual([...refreshProbeStages].sort(), ["after-Now-publish", "after-publish",
+                    assert.deepEqual([...refreshProbeStages].sort(), [...expectedAssignmentStages, "after-Now-publish", "after-publish",
                       "before-Now-publish", "before-prepare", "before-publish"].sort());
                 }
                 if (publication === "gated" && barrier.stage === "before-publish") {
@@ -33455,11 +33535,19 @@ describe("M2 actualRunner credential replacement", () => {
           a.transport.push(turnCompleted("interrupted", savedId, "M2-A-turn"));
           b.transport.push(turnCompleted("interrupted", savedId, bTurns > 1 ? "M2-B-idle" : "M2-B-turn"));
           try {
-            await running;
-            await Promise.all(triggers);
+            await joinExecution();
           } finally {
             try { await joinNowConsumerProbes(); }
             finally {
+              scopeProbesArmed = false;
+              try {
+                if (scopeIntercepted && actualFlight) {
+                  // Preserve Runner's latest backing value, including terminal cleanup.
+                  Object.defineProperty(actualFlight, "operationScope", scopeDescriptor
+                    ? { ...scopeDescriptor, value: scopeBacking }
+                    : { configurable: true, enumerable: true, writable: true, value: scopeBacking });
+                }
+              } finally { flightProbe.mock.restore(); }
               preparationProbe.mock.restore();
               epochProbe.mock.restore();
               startTurnProbe.mock.restore();
