@@ -245,6 +245,9 @@ export interface TerminalOperationStore {
   /** The pre-send step, atomic under the journal lock: refuse when any local block or secret record exists for the run,
    *  else append `invoked` durably. */
   invoke(runId: string, generation: number, at: string): Promise<TerminalInvokeResult>;
+  /** Run-wide head-authority check (any generation): clear only when no record of the run carries a local block, a
+   *  flagged commit or a secret closure. Disabled, unreadable or corrupt state is never `clear`. */
+  runBlock(runId: string): Promise<{ kind: "clear" } | { kind: "blocked"; reason: string } | { kind: "error"; reason: string }>;
 }
 
 /** Result of RecoveryCoordinator.resumeTerminalOperations: in-memory only, nothing here was sent or touched in git. */
@@ -313,11 +316,16 @@ function recordedSnapshot(manifest: TerminalManifest): { commit: string; tree: s
   return root ? { commit: root.commit, tree: root.tree } : undefined;
 }
 
-function finalResult(record: TerminalOperationRecord): TerminalOperationResult {
+async function finalResult(deps: TerminalOperationDeps, record: TerminalOperationRecord): Promise<TerminalOperationResult> {
   const outcome = terminalFinalOutcome(record);
   // A block that landed while the send was in flight keeps the factual receipt but never yields head authority.
   if (outcome && record.localBlock.length > 0) return kept(record.localBlock[0]!);
-  if (outcome && record.tip && record.manifest) return { outcome, tip: record.tip, manifest: record.manifest };
+  if (outcome && record.tip && record.manifest) {
+    // Head authority is run-wide: a block on any other generation of the run also withholds it.
+    const run = await deps.store.runBlock(record.runId);
+    if (run.kind !== "clear") return kept(run.reason);
+    return { outcome, tip: record.tip, manifest: record.manifest };
+  }
   return kept(record.closedReason ?? "closed");
 }
 
@@ -341,7 +349,7 @@ async function operate(deps: TerminalOperationDeps, input: TerminalOperationInpu
   if (existing.kind === "corrupt") return kept("record_corrupt");
   if (existing.kind === "ok") {
     const rec = existing.record;
-    if (rec.phase === "closed") return finalResult(rec);
+    if (rec.phase === "closed") return finalResult(deps, rec);
     if (input.mode !== "resume") return kept("existing_record");
     return resume(deps, input, rec);
   }
@@ -481,6 +489,8 @@ async function finishAndSend(deps: TerminalOperationDeps, input: TerminalOperati
     // The factual receipt is recorded above; head authority is returned only when nothing blocked or lapsed meanwhile.
     const blocked = done.record.localBlock[0] ?? deps.failureFirst();
     if (blocked !== undefined) return kept(blocked);
+    const run = await store.runBlock(input.runId);
+    if (run.kind !== "clear") return kept(run.reason);
     if (!deps.boundaryValid()) return kept("boundary_lost");
     return { outcome: result.outcome, tip: rec.tip!, manifest: rec.manifest! };
   }

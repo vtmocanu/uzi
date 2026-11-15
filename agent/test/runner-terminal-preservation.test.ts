@@ -52,6 +52,11 @@ function memStore(): TerminalOperationStore & { record?: TerminalOperationRecord
     async addLocalBlock(r, g, reasons, flagged) {
       return s.update(r, g, { addLocalBlock: reasons, ...(flagged?.length ? { addFlaggedCommits: flagged } : {}) });
     },
+    async runBlock() {
+      const r = s.record;
+      if (r && (r.localBlock.length > 0 || r.flaggedCommits.length > 0 || r.closedReason === "secret_found")) return { kind: "blocked", reason: r.localBlock[0] ?? "secret_found" };
+      return { kind: "clear" };
+    },
     async invoke(_r, _g, at) {
       if (!s.record) return { kind: "absent" };
       if (s.record.localBlock.length > 0) return { kind: "blocked", reason: s.record.localBlock[0]! };

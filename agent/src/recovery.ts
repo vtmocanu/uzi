@@ -394,6 +394,14 @@ export class PredecessorAuthorityLost extends Error {
   }
 }
 
+/** A terminal record whose serialized bytes exceed what the strict reader accepts; thrown before any file operation. */
+class TerminalRecordOversized extends Error {
+  constructor() {
+    super("terminal record oversized");
+    this.name = "TerminalRecordOversized";
+  }
+}
+
 /**
  * How a refusal code recorded under a predecessor scope is classified. `integrity` latches
  * {@link RecoveryOutcome.predecessor} (the runner then stops the pass and keeps custody); `ordinary` is a
@@ -1577,6 +1585,9 @@ export class RecoveryCoordinator {
     // Same authority chokepoint as writeRecordUnlocked: a lost predecessor scope writes nothing.
     this.assertPredecessorAuthority();
     const raw = JSON.stringify({ ...record, mac: this.terminalMac(record) });
+    // The strict reader refuses a file over the byte bound, so an oversized record must never reach the disk (the
+    // decoder bounds UTF-16 length, which can serialize to several times as many bytes).
+    if (Buffer.byteLength(raw, "utf8") > TERMINAL_RECORD_MAX_BYTES) throw new TerminalRecordOversized();
     const sync = async (dir: string) => {
       const h = await fs.open(dir, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
       try { await h.sync(); } finally { await h.close(); }
@@ -1674,6 +1685,18 @@ export class RecoveryCoordinator {
       update: mutate,
       addLocalBlock: (runId, generation, reasons, flaggedCommits) =>
         mutate(runId, generation, { addLocalBlock: reasons, ...(flaggedCommits?.length ? { addFlaggedCommits: flaggedCommits } : {}) }),
+      runBlock: async (runId) => {
+        if (!this.terminalPreservationEnabled()) return { kind: "blocked", reason: "disabled" };
+        if (!isTerminalRunId(runId)) return { kind: "error", reason: "invalid_id" };
+        try {
+          return await this.withJournalLock(runId, async () => {
+            const blocked = await this.terminalRunBlockedUnlocked(runId);
+            return blocked === undefined ? { kind: "clear" as const } : { kind: "blocked" as const, reason: blocked };
+          });
+        } catch (error) {
+          return failure(error);
+        }
+      },
       invoke: async (runId, generation, at): Promise<TerminalInvokeResult> => {
         if (!this.terminalPreservationEnabled()) return { kind: "disabled" };
         if (!valid(runId, generation)) return { kind: "error", reason: "invalid_id" };

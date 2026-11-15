@@ -826,3 +826,65 @@ describe("terminal operation rediscovery", () => {
     await held;
   });
 });
+
+describe("terminal record byte bound on write", () => {
+  const bigManifest = (n: number, unit: string, len: number): TerminalManifest => ({
+    ...MANIFEST, roots: Array.from({ length: n }, (_, i) => ({ source_id: `${i}`.padStart(4, "0") + unit.repeat(len - 4), attempt_id: "at1", commit: A, tree: B })),
+  });
+  // 80 roots x 4096 ASCII chars = about 320 KiB serialized, over the 256 KiB read bound.
+  const oversized = (): TerminalOperationRecord => rec({ manifest: bigManifest(80, "a", 4096) });
+  // Control chars: 1 UTF-16 unit each but 6 bytes JSON-escaped; 50 x 4000 = 200000 chars, under the limit as a count.
+  const controlHeavy = (): TerminalOperationRecord => rec({ manifest: bigManifest(50, "\u0001", 4000) });
+  // Astral chars: 2 units each, 4 bytes; 5-unit-safe: 2000 chars = 4000 units, 8000 bytes.
+  const astralHeavy = (): TerminalOperationRecord => rec({ manifest: bigManifest(70, "\u{1F600}", 2000) });
+
+  for (const [name, make] of [["ascii", oversized], ["control-char", controlHeavy], ["astral", astralHeavy]] as const) {
+    it(`an oversized ${name} create is an error that creates no directory or file`, async () => {
+      const root = mkRoot();
+      const store = mkCoord(root).terminalOperationStore();
+      const r = make();
+      assert.ok(Buffer.byteLength(JSON.stringify(r), "utf8") > 256 * 1024);
+      const res = await store.create(r);
+      assert.equal(res.kind, "error");
+      assert.equal(fs.existsSync(path.join(root, "terminal-preservation")), false);
+    });
+  }
+
+  it("the character count of the control-char record stays within the limit while its bytes exceed it", () => {
+    const r = controlHeavy();
+    const chars = r.manifest!.roots.reduce((n, x) => n + x.source_id.length, 0);
+    assert.ok(chars <= 256 * 1024);
+    assert.ok(Buffer.byteLength(JSON.stringify(r), "utf8") > 256 * 1024);
+  });
+
+  it("an oversized update is an error that leaves the prior file byte-identical and readable", async () => {
+    const root = mkRoot();
+    const store = mkCoord(root).terminalOperationStore();
+    assert.equal((await store.create(rec())).kind, "created");
+    const before = fs.readFileSync(recFile(root));
+    const res = await store.update(RUN, 1, { manifest: controlHeavy().manifest! });
+    assert.equal(res.kind, "error");
+    assert.deepEqual(fs.readFileSync(recFile(root)), before);
+    assert.equal((await store.read(RUN, 1)).kind, "ok");
+    assert.deepEqual(fs.readdirSync(tpDir(root)), ["g1.json"]);
+  });
+});
+
+describe("run-wide block gates head authority", () => {
+  it("a block latched on another generation during the final send keeps the receipt but yields no head, now and on replay", async () => {
+    const root = mkRoot();
+    const coord = mkCoord(root);
+    const h = harness(coord);
+    assert.equal((await h.deps.store.create(rec({ generation: 2 }))).kind, "created");
+    h.sendResult = async () => {
+      assert.equal((await h.deps.store.addLocalBlock(RUN, 2, ["secret_found"])).kind, "ok");
+      return { kind: "final", outcome: "published", response: {} as never };
+    };
+    assert.deepEqual(await runTerminalOperation(h.deps, input()), { outcome: "kept", reason: "secret_found" });
+    const r = await readRec(h.deps.store);
+    assert.equal(r.phase, "closed");
+    assert.equal(r.closedReason, "published");
+    assert.deepEqual(await runTerminalOperation(h.deps, input()), { outcome: "kept", reason: "secret_found" });
+    assert.equal(h.sends.length, 1);
+  });
+});

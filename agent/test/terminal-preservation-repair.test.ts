@@ -28,6 +28,11 @@ function memStore(): TerminalOperationStore & { record?: TerminalOperationRecord
       return { kind: "ok", record: m.record };
     },
     async addLocalBlock(r, g, reasons) { return s.update(r, g, { addLocalBlock: reasons }); },
+    async runBlock() {
+      const r = s.record;
+      if (r && (r.localBlock.length > 0 || r.flaggedCommits.length > 0 || r.closedReason === "secret_found")) return { kind: "blocked", reason: r.localBlock[0] ?? "secret_found" };
+      return { kind: "clear" };
+    },
     async invoke(_r, _g, at) {
       if (!s.record) return { kind: "absent" };
       const m = mergeTerminalRecord(s.record, { appendInvocations: [{ at, outcome: "invoked" }] });
