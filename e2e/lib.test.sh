@@ -3069,7 +3069,14 @@ case "$SCENARIO" in
     out="$(shape bogus)" && fail "an unknown mode must fail"
     echo "OK predecessor shape: attempt vs exactly {runId, clonePath} at a canonical path" ;;
   refusal)
-    db_psql() { cat "$S/dbrow"; }
+    db_psql() {
+      # Pin the projection as well as its row comparison: an omitted or reordered
+      # detail column must not make the unsupported-predecessor control pass.
+      case "$1" in
+        *"COALESCE(recovery_wait_cause,'')||'|'||COALESCE(recovery_wait_detail,'')||'|'||COALESCE(recovery_retry_not_before::text,'')"*) cat "$S/dbrow" ;;
+        *) echo "canonical refusal query omitted or reordered detail" >&2; return 1 ;;
+      esac
+    }
     apiget() { case "$1" in /api/runs/R/messages) cat "$S/feed.json" ;; *) return 1 ;; esac; }
     good_log() {
       echo '{"msg":"run claimed","run_id":"R"}'; echo '{"msg":"run claimed","run_id":"R"}'
