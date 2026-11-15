@@ -17046,6 +17046,16 @@ export class RunRunner {
           try { const value = await Promise.race([fn(), stopped]); guard(); return value; }
           finally { signal.removeEventListener("abort", abort); }
         };
+        const ownedEffect = async <T,>(fn: () => Promise<T>): Promise<T> => {
+          let raw: Promise<T> | undefined;
+          try {
+            return await effect(() => { raw = fn(); return raw; });
+          } finally {
+            // The lease operation retains sink custody until its owned work settles,
+            // even if effect's guard has already interrupted the caller.
+            if (raw) await raw.catch(() => {});
+          }
+        };
         let revision = 0;
         let lastOp: string | undefined;
         const reconcile = async (afterTeardown = false): Promise<CodexSwitchAuthority> => {
@@ -17293,13 +17303,14 @@ export class RunRunner {
                 scope.own();
                 flight.operationScope = scope;
                 flight.operationAdmission = scope.controller;
+                flight.releaseOperationAdmission = () => flight.operationScope?.close();
               }
               ctx.prepareCodexRootDispatch = prepareDispatch(flight.operationScope);
               ctx.emit = epochEmitter(bundle.ordinal);
-              await effect(() => a.publishB(bundle, bounds));
+              await ownedEffect(() => a.publishB(bundle, bounds));
               if (nowLease && !nowLease.publishB(bundle)) throw new Error("Now publication refused");
               await appliedAuthority();
-              const started = await effect(() => a.restartAndResume(savedSessionId, bounds));
+              const started = await ownedEffect(() => a.restartAndResume(savedSessionId, bounds));
               let fresh = false;
               if (started.kind === "confirmed_resume_refusal") {
                 if (ctx.preserveConversation) {
@@ -17310,11 +17321,11 @@ export class RunRunner {
                   }
                 }
                 await appliedAuthority();
-                await effect(() => a.startFreshLineage(bounds));
+                await ownedEffect(() => a.startFreshLineage(bounds));
                 fresh = true;
               } else if (started.kind !== "resumed") throw new Error("Codex resume uncertain");
               await appliedAuthority();
-              await effect(() => a.finishB(bounds));
+              await ownedEffect(() => a.finishB(bounds));
               guard();
               if (nowLease && !nowLease.finishB()) throw new Error("Now finish refused");
               if (!hold.release({ messageSeq: bundle.messageSeq }) &&
