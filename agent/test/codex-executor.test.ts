@@ -32295,7 +32295,7 @@ describe("M2 actualRunner credential replacement", () => {
         if (queuedRefreshStop && (oldClaim !== API_KEY || target !== SUBSCRIPTION || phase !== "factory")) continue;
       it(publication === "baseline"
         ? `M2 actualRunner ${oldClaim.auth_mode} to ${target.auth_mode} ${phase} account resumes saved thread`
-        : publication === "gated" ? `Codex ${oldClaim.auth_mode} to ${target.auth_mode} publication gates Now and retired A consumers`
+        : publication === "gated" ? `Codex ${oldClaim.auth_mode} to ${target.auth_mode} publication gates Now, retired A and B preparation children; finished B root dispatch admits work`
         : publication === "subscription-refresh" ? "Codex subscription startup refresh stays deferred until B finish"
         : publication === "subscription-refresh-prepare-failure" ? "Codex queued subscription refresh settles on B preparation failure"
         : publication === "subscription-refresh-cancel" ? "Codex queued subscription refresh settles on cancellation after B preparation"
@@ -32522,6 +32522,10 @@ describe("M2 actualRunner credential replacement", () => {
         const run = executor.run.bind(executor);
         let worktree = "";
         executor.run = async ctx => {
+          ctx.agents = [
+            { name: "lead", description: "lead", prompt_body: "lead", tools: null, skills: [] },
+            { name: "coder", description: "coder", prompt_body: "coder", tools: null, skills: [] },
+          ];
           context = ctx;
           worktree = ctx.worktreePath;
           await fs.writeFile(path.join(worktree, "M2-retained.txt"), "A work");
@@ -32615,10 +32619,64 @@ describe("M2 actualRunner credential replacement", () => {
         });
         let retainedRootDispatch: import("../src/harness.js").RunTurnRequest["rootDispatch"];
         let retainedBroker: import("../src/codex/broker.js").CodexCallbackBroker | undefined;
+        type PreparationEpoch = {
+          harness: CodexHarness;
+          buildPhaseBroker: (phase: "plan" | "implement", signal?: AbortSignal) => import("../src/codex/broker.js").CodexCallbackBroker;
+        };
+        const epochBuilder = executor as unknown as { startProviderEpoch(...args: unknown[]): Promise<PreparationEpoch> };
+        const startProviderEpoch = epochBuilder.startProviderEpoch.bind(executor);
+        let epochBuilds = 0;
+        let bHarness: CodexHarness | undefined;
+        let bPreparationBroker: import("../src/codex/broker.js").CodexCallbackBroker | undefined;
+        let bPreparationObserved = false, bRootObserved = false;
+        let bRootPrepares = 0, bRootChecks = 0;
+        const bChildProbes: string[] = [];
+        const epochProbe = mock.method(epochBuilder, "startProviderEpoch", async (...args: unknown[]) => {
+          const epoch = await startProviderEpoch(...args);
+          if (epochBuilds++ === 1) {
+            bHarness = epoch.harness;
+            const buildPhaseBroker = epoch.buildPhaseBroker.bind(epoch);
+            epoch.buildPhaseBroker = (...brokerArgs) => {
+              const broker = buildPhaseBroker(...brokerArgs);
+              bPreparationBroker ??= broker;
+              return broker;
+            };
+            // Use the returned epoch's real builder before login, without publishing
+            // a root dispatcher or changing the harness's seeded PLAN broker.
+            epoch.buildPhaseBroker("implement");
+          }
+          return epoch;
+        });
+        const prepareRootAndThread = CodexHarness.prototype.prepareRootAndThread;
+        const preparationProbe = mock.method(CodexHarness.prototype, "prepareRootAndThread", function (
+          this: CodexHarness, ...args: Parameters<typeof prepareRootAndThread>
+        ) {
+          if (this === bHarness && !bFinished) {
+            assert.equal(args[0].rootDispatch, undefined, "B preparation has no ordinary root dispatcher");
+            assert.equal(bFinished, false);
+            bPreparationObserved = true;
+          }
+          return prepareRootAndThread.apply(this, args);
+        });
         const startTurn = CodexHarness.prototype.startTurn;
         const useBroker = CodexHarness.prototype.useBroker;
         const startTurnProbe = mock.method(CodexHarness.prototype, "startTurn", function (this: CodexHarness, request: import("../src/harness.js").RunTurnRequest) {
-          retainedRootDispatch ??= request.rootDispatch;
+          if (this === bHarness && !bRootObserved) {
+            assert.equal(bFinished, true, "first B work turn follows finishB");
+            assert.ok(bPreparationObserved);
+            const dispatch = request.rootDispatch;
+            assert.ok(dispatch, "first B work turn carries the actual root dispatcher");
+            bRootObserved = true;
+            request.rootDispatch = {
+              prepare: async () => { await dispatch.prepare(); bRootPrepares++; },
+              check: () => {
+                const admitted = dispatch.check();
+                assert.notEqual(admitted, false, "finished B root check admits work");
+                bRootChecks++;
+                return admitted;
+              },
+            };
+          } else if (!bRootObserved) retainedRootDispatch ??= request.rootDispatch;
           return startTurn.call(this, request);
         });
         const brokerProbe = mock.method(CodexHarness.prototype, "useBroker", function (this: CodexHarness, broker: import("../src/codex/broker.js").CodexCallbackBroker) {
@@ -32670,6 +32728,26 @@ describe("M2 actualRunner credential replacement", () => {
                   "spawn_agent", { role: "coder", prompt: "work" }, "root");
                 assert.equal(child.ok, false, "retired real broker denies child work");
                 consumerProbes.push(barrier.stage);
+                assert.equal(bRootObserved, false, "no B work-turn root dispatcher exists during preparation");
+                if (barrier.stage === "login" || barrier.stage === "prepared") {
+                  assert.ok(bPreparationObserved);
+                  assert.ok(bPreparationBroker, "returned B epoch builder constructed the preparation broker");
+                  const child = await withTimeout(bPreparationBroker.handleToolCall(
+                    { threadId: savedId, turnId: "M2-B-preparation", callId: `held-B-child-${barrier.stage}` },
+                    "spawn_agent", { role: "coder", prompt: "work" }, "root"), 3000, `B child refusal at ${barrier.stage}`)
+                    .finally(() => {
+                      assert.equal(b.transport.requests.length, bRequests,
+                        `B preparation child sends no ordinary request at ${barrier.stage}`);
+                    });
+                  assert.equal(child.ok, false, `real B preparation broker refuses child work at ${barrier.stage}`);
+                  assert.notEqual(child.ok ? undefined : child.code, "unknown_role", "B probe must reach the real child seam");
+                  assert.notEqual(child.ok ? undefined : child.code, "bad_args", "B probe carries valid child instructions");
+                  bChildProbes.push(barrier.stage);
+                } else {
+                  assert.equal(bHarness, undefined, `B harness unavailable at ${barrier.stage}`);
+                  assert.equal(bPreparationBroker, undefined, `B preparation broker not constructed at ${barrier.stage}`);
+                  assert.equal(bPreparationObserved, false);
+                }
                 if ((publication === "subscription-refresh" || publication === "api-key-refresh" || queuedRefreshStop) && barrier.stage === "login") {
                   // push() only feeds notifications; startup auth requests use the read-path interceptor.
                   b.transport.deliverServerRequest({ kind: "activity", method: "account/chatgptAuthTokens/refresh", requestId: 91,
@@ -32769,6 +32847,10 @@ describe("M2 actualRunner credential replacement", () => {
           });
           await withTimeout(running, 5000, "M2 B usage and ordinary cancellation");
           await Promise.all(triggers);
+          assert.equal(bRootObserved, true, "actual B root dispatch reached the first post-finish work turn");
+          assert.ok(bRootPrepares > 0, "actual B root prepare succeeded after finishB");
+          assert.ok(bRootChecks > 0, "actual B root check succeeded after finishB");
+          if (publication !== "baseline") assert.deepEqual(bChildProbes, ["login", "prepared"]);
           assert.equal(nowBuilds.length, 2, "real owned composition constructs A then B Now");
           assert.equal(retiredADenied, true, "A guard rejected during live B construction");
           assert.equal(liveBAdmitted, true, "B guard accepted before executor shutdown");
@@ -32848,6 +32930,8 @@ describe("M2 actualRunner credential replacement", () => {
             await running;
             await Promise.all(triggers);
           } finally {
+            preparationProbe.mock.restore();
+            epochProbe.mock.restore();
             startTurnProbe.mock.restore();
             brokerProbe.mock.restore();
             nowProbe.mock.restore();

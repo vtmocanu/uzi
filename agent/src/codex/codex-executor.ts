@@ -6994,6 +6994,8 @@ export class CodexExecutor implements Executor {
     ctx: RunContext,
   ): Promise<ChildThreadController> {
     return (async (): Promise<ChildThreadController> => {
+      // Preparation may construct B's broker before ordinary work is admitted.
+      this.assertSwitchAdmission();
       // Start a CHILD thread on the SAME app-server transport as the root (same untrusted
       // project / doc-max-0 config, never a hook-trust bypass).
       const threadRes = await harness.requestOnTransport<{ thread?: { id?: string } }>(
@@ -7037,6 +7039,7 @@ export class CodexExecutor implements Executor {
           spec.signal?.throwIfAborted();
           if (ctx.cancelRequested?.() || ctx.claimFenced?.() || ctx.terminalLifecycleSignal?.aborted)
             throw new CodexRequestFailure("parent_abort");
+          this.assertSwitchAdmission();
           this.assertCaptureAdmission(revision);
           assertResidueQuarantineOpen("provider_turn");
         };
