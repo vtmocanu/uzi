@@ -193,6 +193,35 @@ describe("captureTerminalSnapshot", () => {
     assert.deepEqual(f.calls, []);
   });
 
+  test("an unreadable untracked directory is refused as an enumeration warning", async (t) => {
+    if (process.getuid?.() === 0) { t.skip("running as root: chmod 000 does not hide a directory from git"); return; }
+    const f = await fixture(t);
+    await f.write("hidden/secret.txt", "work the enumeration cannot see\n");
+    const hidden = path.join(f.root, "hidden");
+    await fs.chmod(hidden, 0o000);
+    try {
+      const before = await f.state();
+      const result = await f.capture({ seam: { beforeStaging: async () => { f.calls.push("staging"); } } });
+      assert.deepEqual(result, { kind: "refused", reason: "enumeration_warning" });
+      assert.deepEqual(f.calls, []);
+      assert.deepEqual(await f.state(), before);
+    } finally {
+      await fs.chmod(hidden, 0o755);
+    }
+  });
+
+  for (const flag of ["--assume-unchanged", "--skip-worktree"]) {
+    test(`an edited tracked file hidden by ${flag} is refused as index_flags`, async (t) => {
+      const f = await fixture(t);
+      f.g("update-index", flag, "tracked.txt");
+      await f.write("tracked.txt", "edited behind the index\n");
+      const result = await f.capture({ seam: { beforeStaging: async () => { f.calls.push("staging"); } } });
+      assert.deepEqual(result, { kind: "refused", reason: "index_flags" });
+      assert.deepEqual(f.calls, []);
+      assert.deepEqual(await f.stray(), []);
+    });
+  }
+
   test("a nested repository is refused", async (t) => {
     const f = await fixture(t);
     const nested = path.join(f.root, "sub");

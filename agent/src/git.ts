@@ -16045,8 +16045,14 @@ export class GitCache {
           const ledger = new Map<string, AttemptLedgerEntry & { branch: string }>();
           for (const [branch, raw] of await this.readAllAttemptLedgerRaw(barePath, entries)) {
             const parsed = parseAttemptLedgerEntry(raw);
-            if (!parsed) return bad("malformed_ledger");
-            if (ledger.has(parsed.attemptId)) return bad("duplicate_attempt");
+            // Only the canonical serialization is accepted, so a hand-written or reordered value is malformed evidence.
+            if (!parsed || raw !== attemptLedgerValue(parsed)) return bad("malformed_ledger");
+            // A state change re-appends the same attempt: the last value wins (config order) while run, clone and
+            // branch stay identical; any other repeat of an attempt id is a conflict.
+            const previous = ledger.get(parsed.attemptId);
+            if (previous && (previous.runId !== parsed.runId || previous.clonePath !== parsed.clonePath || previous.branch !== branch)) {
+              return bad("duplicate_attempt");
+            }
             ledger.set(parsed.attemptId, { ...parsed, branch });
           }
           const attempts = [...ledger.values()].filter(e => e.runId === runId)
@@ -20769,18 +20775,25 @@ try {
     };
     const cloneRef = `refs/uzi-terminal-local/${opts.runId}/g${opts.generation}`;
     const bareRef = cloneRef;
-    const git = async (args: string[], extra: { env?: NodeJS.ProcessEnv; input?: string; overflow?: string } = {}): Promise<string> => {
+    // `strictStderr` fails closed on ANY stderr from an enumeration or staging read (git reports a directory or file
+    // it could not read as a warning on a zero exit, so the walk would silently omit work); there is no allowlist.
+    const git = async (args: string[], extra: { env?: NodeJS.ProcessEnv; input?: string; overflow?: string; strictStderr?: boolean } = {}): Promise<string> => {
       const timeoutMs = left();
+      let stderr = "";
+      let out: string;
       try {
-        return await this.runGitAsRunner(clonePath, [...TERMINAL_GIT_PINS, ...args], {
+        out = await this.runGitAsRunner(clonePath, [...TERMINAL_GIT_PINS, ...args], {
           timeoutMs, env: { ...TERMINAL_GIT_ENV, ...extra.env },
           ...(extra.input === undefined ? {} : { input: extra.input }),
+          ...(extra.strictStderr ? { onStderr: (text: string) => { stderr += text; } } : {}),
         });
       } catch (err) {
-        if (err instanceof GitBoundaryAbortError || err instanceof CheckpointSoftDeadlineError) throw err;
+        if (err instanceof GitBoundaryAbortError || err instanceof CheckpointSoftDeadlineError || err instanceof TerminalSnapshotRefusal) throw err;
         if (extra.overflow && isBoundOverflow(err)) return fail(extra.overflow);
         return fail("git_failed");
       }
+      if (stderr !== "") return fail("enumeration_warning");
+      return out;
     };
     const runnerNode = async (script: string, arg: string, fixedTimeoutMs?: number): Promise<string> => {
       const timeoutMs = fixedTimeoutMs ?? Math.min(left(), 30_000);
@@ -20897,9 +20910,14 @@ try {
       const head = before.head;
       const headTree = (await git(["rev-parse", "--verify", `${head}^{tree}`])).trim();
 
+      // An assume-unchanged or skip-worktree entry hides edits from status: refuse (same rule as worktreeCleanHardened).
+      for (const entry of (await git(["ls-files", "-v", "-z"], { overflow: "entry_cap", strictStderr: true })).split("\0")) {
+        if (entry.length > 0 && !/^[HMRCK?U] /.test(entry)) return refused("index_flags");
+      }
+
       // 1. Enumeration before any staging.
       const status = rows(await git(["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none", "--no-renames"],
-        { overflow: "entry_cap" }), opts.caps?.maxEntries ?? WIP_CAPTURE_MAX_ENTRIES, "entry_cap");
+        { overflow: "entry_cap", strictStderr: true }), opts.caps?.maxEntries ?? WIP_CAPTURE_MAX_ENTRIES, "entry_cap");
       type Entry = { kind: "file" | "exec" | "symlink" | "absent"; size: number; untracked: boolean };
       const entries = new Map<string, Entry>();
       let totalBytes = 0;
@@ -20932,7 +20950,7 @@ try {
         entries.set(rel, { kind, size: st.size, untracked: x === "?" && y === "?" });
       }
       if (entries.size > 0) {
-        const attrs = (await git(["check-attr", "-z", "--stdin", "filter"], { input: [...entries.keys()].join("\0") + "\0" })).split("\0");
+        const attrs = (await git(["check-attr", "-z", "--stdin", "filter"], { input: [...entries.keys()].join("\0") + "\0", strictStderr: true })).split("\0");
         if (attrs[attrs.length - 1] === "") attrs.pop();
         if (attrs.length !== entries.size * 3) return refused("attr_unreadable");
         for (let i = 0; i < attrs.length; i += 3) {
@@ -20942,7 +20960,7 @@ try {
       }
 
       // 2. Ignored extents: counted with their own caps, never captured.
-      const ignoredPaths = rows(await git(["ls-files", "--others", "--ignored", "--exclude-standard", "-z"], { overflow: "ignored_cap" }),
+      const ignoredPaths = rows(await git(["ls-files", "--others", "--ignored", "--exclude-standard", "-z"], { overflow: "ignored_cap", strictStderr: true }),
         TERMINAL_IGNORED_MAX_ENTRIES, "ignored_cap");
       let ignoredBytes = 0;
       for (let i = 0; i < ignoredPaths.length; i++) {
@@ -20963,11 +20981,11 @@ try {
       left();
       privateIndex = path.join(runnerTmpdir() || os.tmpdir(), `uzi-term-idx-${randomUUID()}`);
       const indexEnv = { GIT_INDEX_FILE: privateIndex };
-      await git(["read-tree", head], { env: indexEnv });
-      await git(["add", "-A"], { env: indexEnv });
+      await git(["read-tree", head], { env: indexEnv, strictStderr: true });
+      await git(["add", "-A"], { env: indexEnv, strictStderr: true });
 
       // 5. Staged validation against the enumeration, then the commit.
-      const rawStaged = await git(["diff", "--cached", "--raw", "-z", "--no-abbrev", "--no-renames", head], { env: indexEnv });
+      const rawStaged = await git(["diff", "--cached", "--raw", "-z", "--no-abbrev", "--no-renames", head], { env: indexEnv, strictStderr: true });
       const staged = terminalParseRaw(rawStaged);
       if (!staged || staged.length > WIP_CAPTURE_MAX_ENTRIES) return refused("staged_unparseable");
       const stagedPaths = new Set<string>();
@@ -28356,6 +28374,9 @@ const TERMINAL_CREDENTIAL_TAILS = [".docker/config.json", ".kube/config", ".conf
 /** Pins every terminal-snapshot git carries (the captureMaintenanceWip set plus the proof-read walk pins). */
 const TERMINAL_GIT_PINS: readonly string[] = [
   "--no-replace-objects", "--no-optional-locks",
+  // GIT_GRAFT_FILE=/dev/null (TERMINAL_GIT_ENV) makes newer Git print a deprecation hint on stderr; the strict stderr check
+  // would otherwise refuse every capture, so silence only that advice (same pin as the ancestry proof reads).
+  "-c", "advice.graftFileDeprecated=false",
   "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false",
   "-c", "core.ignoreStat=false", "-c", "core.checkStat=default",
   "-c", "core.trustctime=true", "-c", "core.fileMode=true", "-c", "core.ignoreCase=false",

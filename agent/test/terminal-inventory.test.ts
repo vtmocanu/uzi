@@ -307,8 +307,8 @@ describe("readTerminalSourceUniverse", () => {
     const current = await rig.attempt(bare);
     await fs.mkdir(path.dirname(rig.cache.runnerClonePath(second, "issue-1")), { recursive: true });
     git(second, "config", "--local", "--add", `uzi-attempts.${BRANCH}.entry`, JSON.stringify({
-      attemptId: current.attemptId, runId: RUN, state: "abandoned",
-      clonePath: `${rig.cache.runnerClonePath(second, "issue-1")}.attempt-${current.attemptId}` }));
+      attemptId: current.attemptId, runId: RUN,
+      clonePath: `${rig.cache.runnerClonePath(second, "issue-1")}.attempt-${current.attemptId}`, state: "abandoned" }));
     assert.deepEqual(await rig.universe(current), { kind: "unproved", reason: "duplicate", detail: `attempt ${current.attemptId} in two ledgers` });
   });
 
@@ -541,6 +541,56 @@ describe("readTerminalSourceUniverse", () => {
     git(bare, "config", "--local", "--add", "uzi-attempts.other.entry",
       JSON.stringify({ attemptId: current.attemptId, runId: RUN, clonePath: `${current.clonePath}-x`, state: "retired" }));
     assert.deepEqual(await rig.cache.readTerminalAttribution(bare, RUN, rig.budget()), { kind: "unknown", cause: "duplicate_attempt" });
+  });
+
+  describe("an attempt re-appended under the same key as its state advances", () => {
+    const entry = (a: Attempt, over: Record<string, string>) => JSON.stringify({
+      attemptId: a.attemptId, runId: RUN, clonePath: a.clonePath, state: "live", ...over });
+
+    it("the last state wins for the requested run (live then reclaimed)", async () => {
+      const rig = new Rig();
+      const bare = await rig.bare();
+      const a = await rig.attempt(bare);
+      git(bare, "config", "--local", "--add", `uzi-attempts.${BRANCH}.entry`, entry(a, { state: "reclaimed" }));
+      const read = await rig.cache.readTerminalAttribution(bare, RUN, rig.budget());
+      assert.equal(read.kind, "verified", JSON.stringify(read));
+      assert.deepEqual((read as { attempts: Array<{ attemptId: string; state: string }> }).attempts
+        .map(x => [x.attemptId, x.state]), [[a.attemptId, "reclaimed"]]);
+    });
+
+    it("an unrelated run's re-appended attempt on the same bare does not block the requested run", async () => {
+      const rig = new Rig();
+      const bare = await rig.bare();
+      const mine = await rig.attempt(bare);
+      const other = await rig.attempt(bare, { runId: "run-other", journal: false });
+      git(bare, "config", "--local", "--add", `uzi-attempts.${BRANCH}.entry`,
+        JSON.stringify({ attemptId: other.attemptId, runId: "run-other", clonePath: other.clonePath, state: "reclaimed" }));
+      const read = await rig.cache.readTerminalAttribution(bare, RUN, rig.budget());
+      assert.equal(read.kind, "verified", JSON.stringify(read));
+      assert.deepEqual((read as { attempts: Array<{ attemptId: string }> }).attempts.map(x => x.attemptId), [mine.attemptId]);
+    });
+
+    it("refuses the same attempt id with a conflicting run, clone path or branch", async () => {
+      for (const variant of ["runId", "clonePath", "branch"] as const) {
+        const rig = new Rig();
+        const bare = await rig.bare();
+        const a = await rig.attempt(bare);
+        const key = variant === "branch" ? "other" : BRANCH;
+        const over: Record<string, string> = variant === "runId" ? { runId: "run-other" } : variant === "clonePath" ? { clonePath: `${a.clonePath}-x` } : {};
+        git(bare, "config", "--local", "--add", `uzi-attempts.${key}.entry`, entry(a, { ...over, state: "reclaimed" }));
+        assert.deepEqual(await rig.cache.readTerminalAttribution(bare, RUN, rig.budget()),
+          { kind: "unknown", cause: "duplicate_attempt" }, variant);
+      }
+    });
+
+    it("refuses a ledger value whose field order is not the canonical one", async () => {
+      const rig = new Rig();
+      const bare = await rig.bare();
+      const a = await rig.attempt(bare);
+      git(bare, "config", "--local", "--add", `uzi-attempts.other.entry`,
+        JSON.stringify({ attemptId: attemptId(), runId: RUN, state: "retired", clonePath: `${a.clonePath}-y` }));
+      assert.deepEqual(await rig.cache.readTerminalAttribution(bare, RUN, rig.budget()), { kind: "unknown", cause: "malformed_ledger" });
+    });
   });
 
   it("refuses a journal whose attempt id differs from the ledger attempt at the same path", async () => {
