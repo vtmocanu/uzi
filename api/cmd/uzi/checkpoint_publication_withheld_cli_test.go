@@ -72,7 +72,7 @@ func TestRailShowsWithheldReasonAndHintOnRunningRun(t *testing.T) {
 	m.detail.run.Status, m.detail.run.Health, m.detail.run.HealthReason = "running", "publication_withheld", &reason
 	rail := stripANSI(m.railWaitingLineAt(time.Now()))
 	flat := strings.Join(strings.Fields(rail), " ")
-	for _, want := range []string{"withheld ▸ checkpoint publication is withheld", "secret-scan restriction", "uzi run follow-up"} {
+	for _, want := range []string{"withheld ▸ checkpoint publication is withheld", "secret-scan restriction", "an eligible finding reaches the lead"} {
 		if !strings.Contains(flat, want) {
 			t.Fatalf("rail lacks %q:\n%s", want, rail)
 		}

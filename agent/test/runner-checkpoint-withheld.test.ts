@@ -26,6 +26,8 @@ type Flight = Record<string, unknown> & {
 type Subject = {
   publishCheckpointOutcome: (f: Flight, bare: string, branch: string, ...rest: unknown[]) => Promise<{ published: boolean; reason?: string }>;
   persistRemediationScan: (...a: unknown[]) => Promise<void>;
+  noteMidRunTrigger: (...a: unknown[]) => Promise<void>;
+  checkpointRemediationHold: (...a: unknown[]) => Promise<boolean>;
   ciConfigGuardBlocksPublication: (...a: unknown[]) => Promise<boolean>;
   runSecretRemediationGate: (f: Flight, ...rest: unknown[]) => Promise<unknown>;
 };
@@ -161,6 +163,23 @@ it("a blocking persistRemediationScan: the report is sent while persistence is s
   });
 });
 
+it("a blocking noteMidRunTrigger: the report is sent while the trigger is still pending", async () => {
+  const { sent } = seam();
+  uploads();
+  await withFlight(async (ctx, _f, r) => {
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    r.noteMidRunTrigger = () => gate;
+    trustedFinding(commit(ctx.worktreePath));
+    const checkpoint = ctx.checkpoint!({ reap: true });
+    try {
+      await until(() => sent.length >= 1, "the withheld report while the trigger is pending");
+      assert.equal(sent[0]!.state, "withheld");
+    } finally { release(); }
+    await checkpoint;
+  });
+});
+
 it("an untrusted scan with findings, and a clean scan, set nothing", async () => {
   const { sent } = seam();
   uploads();
@@ -208,9 +227,18 @@ it("the hold sites need a restriction or remediation record on the flight", asyn
   await withFlight(async (ctx, f, r) => {
     commit(ctx.worktreePath);
     f.secretRemediation = undefined;
+    f.remediationRestrictions = undefined;
     assert.equal((await r.publishCheckpointOutcome(f, String(f.barePath), ctx.branch)).published, true);
     await settle();
     assert.equal(sent.length, 0);
+    // Force the hold outcome with no record on the flight: the gate in noteCheckpointWithheld,
+    // not the absence of a hold, must keep the diagnostic silent.
+    r.checkpointRemediationHold = async () => true;
+    commit(ctx.worktreePath, "again\n");
+    assert.equal((await r.publishCheckpointOutcome(f, String(f.barePath), ctx.branch)).reason, "secret_remediation_pending");
+    await settle();
+    assert.equal(sent.length, 0);
+    assert.equal(f.checkpointWithheld, undefined);
   });
 });
 

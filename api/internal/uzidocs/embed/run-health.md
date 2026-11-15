@@ -9,7 +9,8 @@ audience: user
 uzi watches every active run and can flag one that looks stuck, looping, or
 close to its timeout — a **⚠** badge on the board, dashboard, runs list, and
 run view, and (if you've set up [Slack](./slack.md)) a DM, except for a
-cross-check run, which never gets a DM of its own. The badge's
+cross-check run, which never gets a DM of its own, and for
+[publication withheld](#publication-withheld), which sends no per-run DM. The badge's
 elapsed time counts from when the flag was raised, not from when the run
 started — except **near timeout**, whose badge instead counts down the time
 left to the deadline (e.g. `1h 5m left`).
@@ -261,16 +262,18 @@ only; it never stops, fails or requeues the run.
 
 - **Reason and hint.** The reason reads _"checkpoint publication is withheld by a
   secret-scan restriction; new work stays on the worker until it is resolved"_ and
-  is shown to the run's owner only. The hint reads _"an eligible finding reaches the
+  is shown to the run's owner (and admins). The hint reads _"an eligible finding reaches the
   lead at its next work-turn boundary, subject to the existing safety checks and the
   shared attempt cap; the done-point fallback remains subject to its safety checks
   and the same cap; `uzi run follow-up` can give the agent owner guidance"_. Both are
   fixed text: neither names a finding, path, rule or secret. The CLI prints the hint
   as `HEALTH_HINT` in `uzi run get`, the TUI crew rail shows the reason with a short
   pointer to `uzi run follow-up`, and the run view shows the hint beside the reason.
-- **Precedence.** It ranks below stalled (including a long tool call, a silent
-  delegation and a cross-check wait) and below an account cooldown wait, and above
-  near timeout.
+- **Precedence.** It ranks below looping (both causes), the plan and code
+  cross-check waits, an account cooldown wait, stalled, a long tool call and a
+  silent delegation, and above only the final near-timeout check.
+- **No per-run Slack DM.** The Slack root status line reads _"checkpoint
+  publication withheld"_, but the owner gets no per-run nudge for this flag.
 - **Clearing.** It clears only after a later checkpoint publication is admitted and
   accepted. A scan finding alone, or the passage of time, does not clear it.
 

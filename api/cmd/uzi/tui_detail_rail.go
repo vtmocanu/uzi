@@ -124,11 +124,11 @@ const railWaitingMaxRows = 5
 const railWaitingLabel = "queued ▸ "
 
 // railWithheldLabel leads the reason of a running run whose checkpoint publication is withheld
-// (issue #4257); railWithheldHint is the rail's short fixed pointer, the full owner hint being
-// the HEALTH_HINT row of `uzi run get`.
+// (issue #4257). The rail then draws apitypes.HintCheckpointPublicationWithheld, bounded to
+// railWithheldHintRows; the HEALTH_HINT row of `uzi run get` carries it in full.
 const (
-	railWithheldLabel = "withheld ▸ "
-	railWithheldHint  = "hint ▸ `uzi run follow-up` can guide the agent"
+	railWithheldLabel    = "withheld ▸ "
+	railWithheldHintRows = 6
 )
 
 // railWaitingLine explains why a queued run is waiting (issue #2705: for example a stale-requeued
@@ -162,7 +162,8 @@ func (m tuiModel) railWaitingLineAt(now time.Time) string {
 			plain := m.renderer.Plain(text.runHealthReason, m.railWidth()*railWaitingMaxRows+railWaitingMaxRows)
 			rows = wrapWords(label+plain, m.railWidth(), railWaitingMaxRows)
 		}
-		rows = append(rows, wrapWords(m.renderer.Plain(railWithheldHint, m.railWidth()*2), m.railWidth(), 2)...)
+		hint := m.renderer.Plain(apitypes.HintCheckpointPublicationWithheld, m.railWidth()*railWithheldHintRows+railWithheldHintRows)
+		rows = append(rows, wrapWords(hint, m.railWidth(), railWithheldHintRows)...)
 	} else if run.Health == "waiting_worker" && reason != "" && reason != admission {
 		text := struct{ runHealthReason string }{runHealthReason: reason}
 		plain := m.renderer.Plain(text.runHealthReason, m.railWidth()*railWaitingMaxRows+railWaitingMaxRows)

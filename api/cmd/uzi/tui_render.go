@@ -214,12 +214,15 @@ func (p palette) state(s crewState) lipgloss.Style {
 	return p.faint
 }
 
-// displayHealth maps a health enum to its human DISPLAY word. Only `slow` is remapped:
-// PRD #1170 kept the enum value (D1) but relabels every human surface "near timeout", so
-// the token, the board strip and the CLI HEALTH row all read the same word through this one
-// map. Every other value (stalled, looping, ok, waiting_worker, …) passes through unchanged.
-// "near timeout" is 12 cells, tying the existing longest word ("rate-limited"), so no column
-// widens. Logic, filtering and sorting still key off the raw enum; this only changes display.
+// displayHealth maps a health enum to its human DISPLAY word. Two values are remapped:
+// `slow` (PRD #1170 kept the enum value (D1) but relabels every human surface "near
+// timeout") and `publication_withheld` (issue #4257, "publication withheld"), so the token,
+// the board strip and the CLI HEALTH row all read the same word through this one map. Every
+// other value (stalled, looping, ok, waiting_worker, …) passes through unchanged. "near
+// timeout" is 12 cells, tying the existing longest word ("rate-limited"); "publication
+// withheld" is 20 cells and is wider than that, so a surface sized to the old longest word
+// must allow for it. Logic, filtering and sorting still key off the raw enum; this only
+// changes display.
 func displayHealth(health string) string {
 	if health == "slow" {
 		return "near timeout"
