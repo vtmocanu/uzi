@@ -178,6 +178,105 @@ describe("compact Overview header (#4366)", () => {
   });
 });
 
+describe("sticky Overview chips (#4370)", () => {
+  beforeEach(() => localStorage.removeItem("uzi.sidebar.collapsed"));
+  afterEach(() => localStorage.removeItem("uzi.sidebar.collapsed"));
+
+  async function mountAt(width: number) {
+    await page.viewport(width, 900);
+    render(
+      <MemoryRouter initialEntries={["/dashboard"]}>
+        <AppShell><OverviewNext /></AppShell>
+      </MemoryRouter>,
+    );
+    const title = await screen.findByRole("heading", { name: /Welcome/ });
+    const chip = await screen.findByRole("button", { name: /^System health:/ });
+    await screen.findByRole("region", { name: "Issue work" });
+    await document.fonts.ready;
+    const row = document.querySelector<HTMLElement>("[data-overview-chip-row]")!;
+    return { title, chip, row };
+  }
+
+  for (const width of [1280, 1440]) {
+    it(`pins one chip row above scrolling content without a layout jump at ${width}px`, async () => {
+      const { title, row } = await mountAt(width);
+      const content = screen.getByRole("region", { name: "Issue work" });
+      const contentDocumentTop = content.getBoundingClientRect().top + window.scrollY;
+      window.scrollTo(0, 650);
+      await expect.poll(() => row.dataset.stuck).toBe("true");
+      expect(title.getBoundingClientRect().bottom).toBeLessThan(0);
+      expect(row.getBoundingClientRect().top).toBe(0);
+      expect(row.getBoundingClientRect().height).toBeLessThanOrEqual(50);
+      expect(getComputedStyle(row).borderBottomWidth).toBe("1px");
+      expect(document.documentElement.style.scrollPaddingTop).toBe("56px");
+      expect(Math.abs(content.getBoundingClientRect().top + window.scrollY - contentDocumentTop)).toBeLessThanOrEqual(1);
+      expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(width);
+      window.scrollTo(0, 0);
+      await expect.poll(() => row.dataset.stuck).toBe("false");
+      expect(document.documentElement.style.scrollPaddingTop).toBe("");
+    });
+  }
+
+  for (const width of [1024, 400]) {
+    it(`lets the chips scroll away at ${width}px`, async () => {
+      const { row } = await mountAt(width);
+      window.scrollTo(0, 650);
+      await expect.poll(() => window.scrollY).toBeGreaterThan(100);
+      expect(row.dataset.stuck).toBe("false");
+      expect(row.getBoundingClientRect().bottom).toBeLessThan(0);
+      expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(width);
+    });
+  }
+
+  it("keeps a popover visible from the pinned row and restores focus on Escape", async () => {
+    const { chip, row } = await mountAt(1440);
+    window.scrollTo(0, 650);
+    await expect.poll(() => row.dataset.stuck).toBe("true");
+    await userEvent.click(chip);
+    const dialog = await screen.findByRole("dialog", { name: "System health" });
+    const rect = dialog.getBoundingClientRect();
+    expect(rect.top).toBeGreaterThanOrEqual(row.getBoundingClientRect().bottom);
+    expect(rect.left).toBeGreaterThanOrEqual(0);
+    expect(rect.right).toBeLessThanOrEqual(1440);
+    await userEvent.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog", { name: "System health" })).toBeNull();
+    expect(document.activeElement).toBe(chip);
+    await userEvent.click(chip);
+    await screen.findByRole("dialog", { name: "System health" });
+    const outside = document.createElement("button");
+    outside.textContent = "Outside popover";
+    outside.style.cssText = "position:fixed;left:300px;bottom:20px;z-index:40";
+    document.body.appendChild(outside);
+    await userEvent.click(outside);
+    outside.remove();
+    expect(screen.queryByRole("dialog", { name: "System health" })).toBeNull();
+  });
+
+  it("tracks the content column when the desktop sidebar collapses while stuck", async () => {
+    const { row } = await mountAt(1440);
+    window.scrollTo(0, 650);
+    await expect.poll(() => row.dataset.stuck).toBe("true");
+    const before = row.getBoundingClientRect().left;
+    await userEvent.click(screen.getByRole("button", { name: "Collapse sidebar" }));
+    const column = document.querySelector<HTMLElement>("[data-page-content-column]")!;
+    await expect.poll(() => row.getBoundingClientRect().left).toBe(column.getBoundingClientRect().left);
+    expect(row.getBoundingClientRect().left).not.toBe(before);
+    expect(row.getBoundingClientRect().width).toBe(column.getBoundingClientRect().width);
+  });
+
+  it("scrolls the next focused control below the pinned bar", async () => {
+    const { row } = await mountAt(1440);
+    window.scrollTo(0, 650);
+    await expect.poll(() => row.dataset.stuck).toBe("true");
+    const search = screen.getByRole("button", { name: /^Search/ });
+    search.focus();
+    await userEvent.tab();
+    const focused = document.activeElement as HTMLElement;
+    expect(focused).not.toBe(search);
+    expect(focused.getBoundingClientRect().top).toBeGreaterThanOrEqual(row.getBoundingClientRect().bottom);
+  });
+});
+
 describe("promoted Overview routes in the real shell (PRD #3877 M1)", () => {
   const follows = (a: Node, b: Node) => (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
 

@@ -29,6 +29,7 @@ import { OnboardingChecklist } from "../components/OnboardingChecklist";
 import { NeedsDecisionCard } from "../components/NeedsDecisionCard";
 import { IssueLine } from "../components/IssueLine";
 import { OverviewRunsWidget } from "../components/OverviewRunsWidget";
+import { OverviewStickyActions } from "../components/OverviewStickyActions";
 import { CapacityRail } from "../components/CapacityRail";
 import { HeldWorkCard } from "../components/HeldWorkCard";
 import { HealthPlatformLine } from "../components/HealthPlatformLine";
@@ -51,6 +52,7 @@ export function OverviewNext() {
 }
 
 function OverviewNextPage() {
+  const titleRef = useRef<HTMLHeadingElement>(null);
   const commandMenu = useCommandMenu();
   const demo = useDemoMode();
   const { user } = useAuth();
@@ -164,14 +166,15 @@ function OverviewNextPage() {
       <InShellHeader>
         <PageHeader
           title={`Welcome${user.display_name ? `, ${maskName(user.display_name, demo)}` : ""}`}
-          actionsClassName="min-[1440px]:min-w-0 min-[1440px]:flex-1 min-[1440px]:basis-0 min-[1440px]:flex-nowrap min-[1440px]:justify-end min-[1440px]:gap-1 min-[1440px]:[&>div>button]:px-1.5 min-[1440px]:[&>div>button]:text-[11px] min-[1440px]:[&>button]:px-1.5 min-[1440px]:[&>button]:text-[11px]"
+          titleRef={titleRef}
+          actionsClassName="w-full min-[1440px]:min-w-0 min-[1440px]:flex-1 min-[1440px]:basis-0"
           description={
             <Link to="/overview/classic" className="font-medium text-brand hover:text-brand-hover">
               Back to the old Overview
             </Link>
           }
           actions={
-            <>
+            <OverviewStickyActions titleRef={titleRef}>
               {isAdmin && <HealthChip />}
               {people && <PeopleChip model={people} onShowUsageByUser={showUsageByUser} />}
               {repos && <RepoChip model={repos} />}
@@ -188,7 +191,7 @@ function OverviewNextPage() {
                   </kbd>
                 </Button>
               )}
-            </>
+            </OverviewStickyActions>
           }
         />
       </InShellHeader>

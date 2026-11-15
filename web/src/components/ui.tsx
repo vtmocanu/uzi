@@ -8,6 +8,7 @@ import {
   type ButtonHTMLAttributes,
   type InputHTMLAttributes,
   type ReactNode,
+  type Ref,
   type SelectHTMLAttributes,
   type TextareaHTMLAttributes,
 } from "react";
@@ -777,6 +778,7 @@ export function EmptyState({
 // to kill).
 export function PageHeader({
   title,
+  titleRef,
   titleNode,
   description,
   actions,
@@ -786,6 +788,7 @@ export function PageHeader({
   backLabel,
 }: {
   title?: string;
+  titleRef?: Ref<HTMLHeadingElement>;
   titleNode?: ReactNode;
   description?: ReactNode;
   actions?: ReactNode;
@@ -808,7 +811,7 @@ export function PageHeader({
       <div className={cx("flex flex-wrap items-start justify-between gap-x-6 gap-y-3", actionsBesideTitle && "lg:flex-nowrap")}>
         <div className={cx("min-w-0", actionsBesideTitle && "lg:flex-1")}>
           {titleNode ?? (
-            <h1 className="text-xl font-semibold tracking-tight">{title}</h1>
+            <h1 ref={titleRef} className="text-xl font-semibold tracking-tight">{title}</h1>
           )}
           {description && (
             <p className="mt-1 max-w-4xl text-sm text-muted">{description}</p>
