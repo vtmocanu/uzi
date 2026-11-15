@@ -3,14 +3,120 @@ package workersvc
 import (
 	"context"
 	"errors"
+	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
+
+// codexOwnerRequestDB accepts one generated owner lookup and rejects all other
+// database calls. It checks query wiring, not PostgreSQL owner isolation.
+type codexOwnerRequestDB struct {
+	t        *testing.T
+	observed store.Run
+	reads    int
+}
+
+func (db *codexOwnerRequestDB) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
+	db.t.Fatal("unexpected Exec during owner request refusal")
+	return pgconn.CommandTag{}, errors.New("unexpected Exec")
+}
+
+func (db *codexOwnerRequestDB) Query(context.Context, string, ...any) (pgx.Rows, error) {
+	db.t.Fatal("unexpected Query during owner request refusal")
+	return nil, errors.New("unexpected Query")
+}
+
+func (db *codexOwnerRequestDB) QueryRow(_ context.Context, query string, args ...any) pgx.Row {
+	db.reads++
+	if db.reads != 1 {
+		db.t.Fatal("additional QueryRow during owner request refusal")
+	}
+	if !strings.HasPrefix(query, "-- name: GetRunByIDForUser :one\n") ||
+		!strings.HasSuffix(strings.TrimSpace(query), "FROM runs WHERE id = $1 AND user_id = $2") {
+		db.t.Fatal("expected generated owner lookup name and predicate")
+	}
+	if len(args) != 2 {
+		db.t.Fatal("owner lookup must have exactly two arguments")
+	}
+	runID, runOK := args[0].(uuid.UUID)
+	ownerID, ownerOK := args[1].(uuid.UUID)
+	if !runOK || !ownerOK || runID == uuid.Nil || ownerID == uuid.Nil ||
+		runID != db.observed.ID || ownerID != db.observed.UserID {
+		db.t.Fatal("owner lookup must receive ordered nonzero run and owner UUIDs")
+	}
+	return crossCheckBoundaryRow{value: db.observed}
+}
+
+// These public-method cases cover Codex routing and early refusal ordering.
+// They do not exercise transactions, credential material, or pending writes.
+func TestSetRunCredentialCodexOwnerRequestRefusals(t *testing.T) {
+	type refusal struct {
+		name     string
+		status   string
+		mode     string
+		secretID *uuid.UUID
+		want     error
+	}
+	var cases []refusal
+	secretID := uuid.New()
+	for _, status := range []string{"running", "awaiting_approval", "awaiting_input", "awaiting_followup"} {
+		cases = append(cases, refusal{
+			name: status + "/pinned_without_secret", status: status,
+			mode: CredentialOverrideModePinned, want: ErrCredentialOverridePinnedNeedsSecret,
+		})
+		for _, mode := range []string{CredentialOverrideModeAuto, CredentialOverrideModeDefault, CredentialOverrideModeInherit} {
+			cases = append(cases, refusal{
+				name: status + "/" + mode + "_with_secret", status: status,
+				mode: mode, secretID: &secretID, want: ErrCredentialOverridePinnedNeedsSecret,
+			})
+		}
+		cases = append(cases, refusal{
+			name: status + "/pinned_without_worker", status: status,
+			mode: CredentialOverrideModePinned, secretID: &secretID, want: ErrCredentialSwitchNoLiveWorker,
+		})
+	}
+	cases = append(cases, refusal{
+		name: "claimed", status: "claimed", mode: CredentialOverrideModePinned,
+		want: ErrCredentialSwitchClaimAssembling,
+	})
+	for _, status := range []string{"queued", "paused", "limit_wait", "pool_wait", "recovery_wait"} {
+		cases = append(cases, refusal{
+			name: status, status: status, mode: CredentialOverrideModePinned,
+			want: ErrCodexSwitchIneligible,
+		})
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runID, ownerID := uuid.New(), uuid.New()
+			db := &codexOwnerRequestDB{
+				t: t,
+				observed: store.Run{
+					ID: runID, UserID: ownerID, Harness: harnessCodex,
+					Kind: "issue", Status: tc.status,
+				},
+			}
+			svc := Service{q: store.New(db)}
+			got, err := svc.SetRunCredential(context.Background(), ownerID, runID, tc.mode, tc.secretID)
+			if !errors.Is(err, tc.want) {
+				t.Errorf("got error %v, want %v", err, tc.want)
+			}
+			if !reflect.ValueOf(got).IsZero() {
+				t.Error("refusal returned a nonzero result")
+			}
+			if db.reads != 1 {
+				t.Errorf("owner lookup count = %d, want 1", db.reads)
+			}
+		})
+	}
+}
 
 func TestCodexSwitchOwnerStateRefusals(t *testing.T) {
 	var svc Service
