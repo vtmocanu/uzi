@@ -1,12 +1,17 @@
-import { describe, it } from "node:test";
+import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { rmSync } from "node:fs";
 import { DindMaintenanceController } from "../src/dind-maintenance.js";
-import { DindPruneGate } from "../src/dind-prune.js";
+import { DindPruneGate, dockerExecEnvironment } from "../src/dind-prune.js";
 import { DindVolumePruneController } from "../src/dind-volume-prune.js";
 import { DiskPressureController } from "../src/disk-reclaim.js";
 import { Worker } from "../src/worker.js";
 import { hibernationWriters } from "../src/hibernation-inventory.js";
 import { nullLogger } from "./helpers.js";
+
+// A prune leg under test builds its child env once per process, which creates the shared
+// empty DOCKER_CONFIG dir in tmpdir; remove it so tmpdir-leak-guard stays clean.
+after(() => { rmSync(dockerExecEnvironment("unix:///unused").DOCKER_CONFIG as string, { recursive: true, force: true }); });
 
 // PRD #4208 M1: production entry points of writer classes the wiring test does not drive (dind_prune is in
 // hibernation-wiring, recovery_pass in hibernation-recovery-writers, live_settle in runner-recovery-settlement).

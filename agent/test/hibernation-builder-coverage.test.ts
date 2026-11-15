@@ -1,15 +1,19 @@
-import { it } from "node:test";
+import { after, it } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import type { Config } from "../src/config.js";
 import { createDindBuilderPrune } from "../src/dind-builder-prune.js";
-import { DindPruneGate, TRIGGER_STREAK } from "../src/dind-prune.js";
+import { DindPruneGate, TRIGGER_STREAK, dockerExecEnvironment } from "../src/dind-prune.js";
 import {
   HibernationInventoryController, hibernationWriters,
   type HibernationInventoryBody, type HibernationInventoryMember, type InventoryRequest,
 } from "../src/hibernation-inventory.js";
 import { nullLogger } from "./helpers.js";
+
+// The builder leg builds its child env once per process, which creates the shared empty
+// DOCKER_CONFIG dir in tmpdir; remove it so tmpdir-leak-guard stays clean.
+after(() => { rmSync(dockerExecEnvironment("unix:///unused").DOCKER_CONFIG as string, { recursive: true, force: true }); });
 
 const wire = JSON.parse(readFileSync(new URL("../../fixtures/hibernation-inventory/wire.json", import.meta.url), "utf8"));
 const member = wire.heartbeat_response_member.awaiting.hibernation_inventory as HibernationInventoryMember;
