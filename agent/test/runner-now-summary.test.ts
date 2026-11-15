@@ -524,7 +524,7 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
   }
 
 
-  for (const outcome of ["policy_refusal", "baseline_missing", "failed_clear", "ready", "missing_negotiation", "persist_failed", "persist_threw", "released_after_clear", "unproven", "busy_after", "vault_after", "route_after", "refused_after", "lost_after", "fenced_after", "superseded_after", "applied_after", "key_to_sub_after", "applied_key_after", "init_after", "publish_after", "fresh_after", "invalid_after", "replay_after", "ledger_after", "ack_after", "budget_after", "newop_after", "no_op_after"] as const) {
+  for (const outcome of ["policy_refusal", "baseline_missing", "failed_clear", "ready", "missing_negotiation", "persist_failed", "persist_threw", "released_after_clear", "unproven", "busy_after", "vault_after", "route_after", "refused_after", "lost_after", "fenced_after", "superseded_after", "applied_after", "key_to_sub_after", "applied_key_after", "init_after", "publish_after", "fresh_after", "invalid_after", "replay_after", "ledger_after", "ack_after", "budget_after", "newop_after", "successor_refusal_after", "successor_fence_after", "successor_route_after", "successor_ledger_after", "successor_noop_after", "successor_teardown_after", "successor_cycle_after", "no_op_after"] as const) {
     it(`M2 firsthalf Codex Runner ${outcome}`, async (t) => {
       const claim = claimFor(2630, { secrets: outcome === "key_to_sub_after"
         ? { ...CODEX_SECRETS, codex: { auth_mode: "api_key", access_token: "A-key", capability: "A-capability" } }
@@ -532,6 +532,12 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
       let bDispatch: Parameters<Executor["run"]>[0]["prepareCodexRootDispatch"];
       let pending = false;
       let pendingId = "current-op";
+      const successor = outcome === "newop_after" || outcome.startsWith("successor_");
+      let pendingTarget = "target";
+      let failedClears = 0;
+      const probed: { opId: string; target: string }[] = [];
+      const appliedOps: string[] = [];
+      const holdReasons: string[] = [];
       let ordinaryPause = 0;
       let heldReports = 0;
       let settledReports = 0;
@@ -546,39 +552,49 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
       let apply = 0;
       let teardown = 0;
       let continued = false;
+      let runEntries = 0;
       let probeBudget: number | undefined;
       let drainBound = false;
       const feature = client.hasFeature.bind(client);
       client.hasFeature = name => name === "credential_switch_hold" || feature(name);
       client.registrationNonce = () => "original-nonce";
-      client.supportsInPlaceCodexCredentialSwitch = () => outcome !== "missing_negotiation";
+      client.supportsInPlaceCodexCredentialSwitch = () => outcome !== "missing_negotiation" && !(outcome === "successor_route_after" && pendingId === "successor-op");
       client.getRunOwnership = async () => ({ status: "running", claim_generation: 1,
         claim_released: outcome === "released_after_clear" && !pending, hold_reason: null });
       client.getInputs = async () => ({ inputs: [], ...(pending ? { credentialSwitch: {
-        generation: 1, op_id: pendingId, target_secret_id: "target",
+        generation: 1, op_id: pendingId, target_secret_id: pendingTarget,
       } } : {}) });
       client.requestWorkerPause = async () => { ordinaryPause++; return { applied: false }; };
-      client.preflightCodexCredentialSwitch = async () => {
+      client.preflightCodexCredentialSwitch = async (_id, request) => {
+        probed.push({ opId: request.opId, target: request.targetSecretId });
+        assert.equal(request.opId, pendingId);
+        assert.equal(request.targetSecretId, pendingTarget);
         preflights++; order.push("preflight");
         if (outcome === "budget_after") elapsed = 9000;
-        const coords = { claimGeneration: 1, registerNonce: "original-nonce", opId: "current-op" };
+        const coords = { claimGeneration: 1, registerNonce: "original-nonce", opId: pendingId };
+        if (pendingId === "successor-op") {
+          if (outcome === "successor_refusal_after") return { kind: "not_applied", reason: "policy_refusal", ...coords };
+          if (outcome === "successor_fence_after") return { kind: "fenced", ...coords };
+          if (outcome === "successor_noop_after") { pending = false; return { kind: "superseded", ...coords }; }
+          if (outcome === "successor_cycle_after") { pendingId = "current-op"; pendingTarget = "target"; return { kind: "superseded", ...coords }; }
+        }
         return post ? { kind: "ready", ...coords } :
           { kind: "not_applied", reason: outcome === "baseline_missing" ? outcome : "policy_refusal", ...coords };
       };
       client.applyCredentialSwitch = async (_id, req, signal) => {
-        apply++; order.push("apply");
-        assert.equal(req.opId, "current-op");
+        apply++; order.push("apply"); appliedOps.push(req.opId);
+        assert.equal(req.opId, successor && (apply > 1 || outcome === "successor_teardown_after") ? "successor-op" : "current-op");
         assert.equal(req.registerNonce, "original-nonce");
         assert.equal(req.claimGeneration, 1);
         assert.ok(signal && !signal.aborted);
         if (outcome === "lost_after") return { kind: "uncertain", detail: "response_lost" };
         if (outcome === "route_after") return { kind: "route_absent" };
         if (outcome === "fenced_after") return { kind: "fenced" };
-        if (outcome === "newop_after") { pendingId = "successor-op"; return { kind: "superseded" }; }
+        if (successor && apply === 1 && outcome !== "successor_teardown_after") { pendingId = "successor-op"; pendingTarget = "new-target"; return { kind: "superseded" }; }
         if (outcome === "no_op_after") { pending = false; return { kind: "superseded" }; }
         if (outcome === "superseded_after") return { kind: "superseded" };
         if (outcome === "refused_after") return { kind: "refused_committed", reason: "committed" };
-        if (["applied_after", "key_to_sub_after", "applied_key_after", "init_after", "publish_after", "fresh_after", "invalid_after", "replay_after"].includes(outcome)) {
+        if (["newop_after", "successor_teardown_after", "applied_after", "key_to_sub_after", "applied_key_after", "init_after", "publish_after", "fresh_after", "invalid_after", "replay_after"].includes(outcome)) {
           pending = false;
           return { kind: "codex_applied", codex: outcome === "applied_key_after"
             ? { auth_mode: "api_key", access_token: "B-access", capability: "B-capability" }
@@ -590,8 +606,8 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
       const report = client.reportState.bind(client);
       client.reportState = (async (id, body, ...args) => {
         if (body.status === "credential_switch_uncertain") {
-          uncertainReports++; order.push("hold");
-          assert.equal(body.op_id, outcome === "newop_after" ? "successor-op" : "current-op");
+          uncertainReports++; order.push("hold"); holdReasons.push(body.failure_reason!);
+          assert.equal(body.op_id, successor && outcome !== "successor_cycle_after" ? "successor-op" : "current-op");
           if (outcome === "ack_after" && uncertainReports === 1) throw new Error("lost reply");
           if (outcome === "ack_after" && uncertainReports === 2) return { applied: true, status: "paused" };
           return { applied: true, credentialSwitchUncertain: true };
@@ -607,6 +623,7 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
           return { applied: true };
         }
         if (body.status === "credential_switch_failed") {
+          failedClears++;
           assert.equal(body.op_id, "current-op");
           if (outcome === "failed_clear") return { applied: false };
           pending = false;
@@ -629,6 +646,7 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
             reopenA: async () => { reopened++; },
             teardown: async bounds => {
               teardown++; order.push("reap");
+              if (outcome === "successor_teardown_after") { pendingId = "successor-op"; pendingTarget = "new-target"; }
               if (outcome === "budget_after") {
                 cleanupBudget = bounds.deadline - performance.now();
                 elapsed = 11000; // Past the original admission deadline, without sleeping.
@@ -651,6 +669,7 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
           };
         },
         async run(ctx) {
+          runEntries++;
           worktree = ctx.worktreePath;
           fs.writeFileSync(path.join(worktree, "retained.txt"), "A work");
           pending = true;
@@ -676,7 +695,7 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
             clock?.mock.restore();
           }
           assert.equal(result, outcome === "fresh_after" ? "fresh_B" :
-            outcome === "applied_after" || outcome === "key_to_sub_after" || outcome === "applied_key_after" ? "resumed_B" : "continued_A");
+            outcome === "newop_after" || outcome === "successor_teardown_after" || outcome === "applied_after" || outcome === "key_to_sub_after" || outcome === "applied_key_after" ? "resumed_B" : "continued_A");
           if (result !== "continued_A") {
             if (outcome !== "key_to_sub_after") {
               assert.ok(oldDispatch);
@@ -694,7 +713,7 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
       const runner = runnerFor(executor);
       (runner as unknown as { waitRecoveryRetry: () => Promise<void> }).waitRecoveryRetry = async () => {};
       (runner as unknown as { credentialSwitchLedger: unknown }).credentialSwitchLedger = {
-        stateOf: async () => undefined,
+        stateOf: async (_runId: string, opId: string) => outcome === "successor_ledger_after" && opId === "successor-op" ? "ambiguous" : undefined,
         markSending: async () => { order.push("ledger"); if (outcome === "ledger_after") throw new Error("ledger unavailable"); return { wasAmbiguous: false }; },
         record: async () => "settled",
       };
@@ -714,10 +733,10 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
         assert.equal(drainBound, true);
         assert.equal(probeBudget, 4000, "drain and epoch probes share the original budget");
       }
-      const success = outcome === "applied_after" || outcome === "key_to_sub_after" || outcome === "applied_key_after" || outcome === "fresh_after";
+      const success = outcome === "newop_after" || outcome === "successor_teardown_after" || outcome === "applied_after" || outcome === "key_to_sub_after" || outcome === "applied_key_after" || outcome === "fresh_after";
       assert.equal(continued, refusal || success);
       if (success) {
-        assert.deepEqual(order.slice(5), outcome === "fresh_after"
+        assert.deepEqual(order.slice(order.indexOf("publish")), outcome === "fresh_after"
           ? ["publish", "login-resume", "fresh", "finish"] : ["publish", "login-resume", "finish"]);
         const frames = api.messages(claim.run_id);
         const old = frames.find(m => (m.payload as { text?: string }).text === "old epoch frame");
@@ -730,17 +749,28 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
       if (outcome === "invalid_after" || outcome === "replay_after") assert.ok(!order.includes("publish"));
       if (outcome === "init_after") assert.ok(order.includes("login-resume"));
       if (outcome === "publish_after") assert.ok(!order.includes("login-resume"));
+      assert.equal(runEntries, 1, "successors stay inside the same stopped A boundary");
       assert.equal(reopened, refusal ? 1 : 0);
       assert.equal(suspended, outcome === "missing_negotiation" ? 0 : 1);
-      assert.equal(preflights, ["missing_negotiation", "persist_failed", "persist_threw"].includes(outcome) ? 0 : 1);
-      assert.equal(apply, post && !["unproven", "ledger_after"].includes(outcome) ? 1 : 0);
+      if (successor) {
+        assert.equal(failedClears, 0, "never clear a successor after teardown");
+        assert.deepEqual(appliedOps, outcome === "newop_after" ? ["current-op", "successor-op"] :
+          outcome === "successor_teardown_after" ? ["successor-op"] : ["current-op"]);
+        assert.deepEqual(probed, ["successor_route_after", "successor_ledger_after"].includes(outcome)
+          ? [{ opId: "current-op", target: "target" }]
+          : [{ opId: "current-op", target: "target" }, { opId: "successor-op", target: "new-target" }]);
+        assert.ok(holdReasons.every(reason => reason === (outcome === "successor_ledger_after" ? "apply_uncertain" : "not_applied_after_teardown")));
+        if (!success) assert.ok(!order.includes("publish"), "refused successor cannot publish");
+      }
+      assert.equal(preflights, successor && !["successor_route_after", "successor_ledger_after"].includes(outcome) ? 2 : ["missing_negotiation", "persist_failed", "persist_threw"].includes(outcome) ? 0 : 1);
+      assert.equal(apply, outcome === "newop_after" ? 2 : post && !["unproven", "ledger_after"].includes(outcome) ? 1 : 0);
       assert.equal(teardown, post ? 1 : 0);
-      assert.equal(uncertainReports, outcome === "ack_after" ? 3 : post && !["unproven", "fenced_after", "no_op_after", "applied_after", "key_to_sub_after", "applied_key_after", "fresh_after"].includes(outcome) ? 1 : 0);
-      assert.equal(ordinaryPause, outcome === "no_op_after" ? 1 : 0);
+      assert.equal(uncertainReports, outcome === "ack_after" ? 3 : post && !["unproven", "fenced_after", "successor_fence_after", "successor_noop_after", "newop_after", "successor_teardown_after", "no_op_after", "applied_after", "key_to_sub_after", "applied_key_after", "fresh_after"].includes(outcome) ? 1 : 0);
+      assert.equal(ordinaryPause, outcome === "no_op_after" || outcome === "successor_noop_after" ? 1 : 0);
       assert.equal(heldReports, outcome === "unproven" ? 1 : 0);
       assert.equal(settledReports, outcome === "unproven" ? 1 : 0);
       if (outcome === "budget_after") assert.equal(cleanupBudget, 30_000);
-      if (apply) assert.deepEqual(order.slice(0, 5), ["persist", "preflight", "reap", "ledger", "apply"]);
+      if (apply && outcome !== "successor_teardown_after") assert.deepEqual(order.slice(0, 5), ["persist", "preflight", "reap", "ledger", "apply"]);
       assert.equal(fs.readFileSync(path.join(worktree, "retained.txt"), "utf8"), "A work");
       assert.ok(!api.states.some(s => s.runId === claim.run_id && s.body.status === "credential_switch"));
     });

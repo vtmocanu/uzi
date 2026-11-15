@@ -17149,7 +17149,7 @@ export class RunRunner {
             if (decision.kind === "continued_A") return await reopen(decision.operation, decision.reason);
             if (decision.kind === "fenced") throw new StaleClaimError();
             if (decision.kind !== "ready") return retain();
-            const selected = decision.operation;
+            let selected = decision.operation;
             const current = await reconcile();
             if (!current.owned) throw new StaleClaimError();
             if (current.pending?.opId !== selected.opId || current.registerNonce !== nonce ||
@@ -17193,7 +17193,8 @@ export class RunRunner {
             };
             const pauseCurrent = async (reason: string): Promise<never> => {
               const latest = await reconcile(true);
-              if (!latest.owned) throw new StaleClaimError();
+              if (!latest.owned || latest.claimGeneration !== generation || latest.registerNonce !== nonce)
+                throw new StaleClaimError();
               if (latest.pending) return await ownerHold(latest.pending.opId, reason);
               if (possibleApply) this.releaseHoldPastPossibleApply(hold, flight, runLog);
               else hold.cancel();
@@ -17232,36 +17233,95 @@ export class RunRunner {
             // Required Now/executor users drained before preflight, and teardown proved the root gone.
             // Preflight refusal must never close this scope.
             flight.operationScope?.close();
-            const beforeApply = await reconcile(true);
-            if (!beforeApply.owned) throw new StaleClaimError();
-            if (!beforeApply.routeAvailable || !beforeApply.ledgerAvailable)
-              return await ownerHold(selected.opId, "not_applied_after_teardown");
-            if (beforeApply.pending?.opId !== selected.opId ||
-                beforeApply.pending.targetSecretId !== selected.targetSecretId)
-              return await pauseCurrent("not_applied_after_teardown");
-            possibleApply = true;
+            const seenSuccessors = new Set([selected.opId]);
+            let priorAmbiguous = false;
             let result: LedgerApplyResult;
-            try {
-              result = await effect(() => applyThroughLedger({
-                applyCredentialSwitch: (id, request) => {
-                  guard();
-                  return this.client.applyCredentialSwitch(id, request, signal);
-                },
-              }, this.credentialSwitchLedger!, runId, {
-                claimGeneration: selected.claimGeneration, registerNonce: nonce, opId: selected.opId, oldCumulative,
-              }));
-            } catch (error) {
-              guard();
-              if (error instanceof StaleClaimError || isCheckedLifecycleControl(error)) throw error;
-              return await ownerHold(selected.opId, "apply_uncertain");
+            // Successors run serially under the existing cleanup deadline, with at most
+            // 32 attempts. A refusal stops the chain; A remains reaped throughout.
+            for (let attempt = 0; ; attempt++) {
+              const beforeApply = await reconcile(true);
+              if (!beforeApply.owned || beforeApply.claimGeneration !== generation ||
+                  beforeApply.registerNonce !== nonce) throw new StaleClaimError();
+              if (attempt >= 32 || !beforeApply.routeAvailable || !beforeApply.ledgerAvailable)
+                return await pauseCurrent(possibleApply ? "apply_uncertain" : "not_applied_after_teardown");
+              const next = beforeApply.pending;
+              if (!next) return await pauseCurrent(possibleApply ? "apply_uncertain" : "not_applied_after_teardown");
+              if (next.opId !== selected.opId || next.targetSecretId !== selected.targetSecretId ||
+                  next.revision !== selected.revision) {
+                if (next.claimGeneration !== generation || next.registerNonce !== nonce ||
+                    !Number.isSafeInteger(next.revision) || next.revision <= selected.revision ||
+                    seenSuccessors.has(next.opId))
+                  return await pauseCurrent(possibleApply ? "apply_uncertain" : "not_applied_after_teardown");
+                seenSuccessors.add(next.opId);
+                selected = next;
+                const observedSuccessors = new Set<string>();
+                const successor = await coordinateCodexSwitchPreflight({
+                  initial: selected, signal, now: () => performance.now(),
+                  reconcile: async () => {
+                    const authority = await reconcile(true);
+                    const p = authority.pending;
+                    if (p && p.opId !== selected.opId && seenSuccessors.has(p.opId))
+                      throw new Error("successor cycle");
+                    if (p) observedSuccessors.add(p.opId);
+                    return authority;
+                  },
+                  probe: async op => {
+                    if (await effect(() => this.credentialSwitchLedger!.stateOf(runId, op.opId))) {
+                      possibleApply = true;
+                      throw new Error("successor ledger already contains an operation");
+                    }
+                    return effect(() => this.client.preflightCodexCredentialSwitch(runId, { ...op, oldCumulative }, signal));
+                  },
+                  // A is irreversibly stopped: a refusal can only hold the current op.
+                  confirmFailedClear: async () => false,
+                  delay: ms => effect(() => new Promise<void>((resolve, reject) => {
+                    const done = () => { clearTimeout(wait); signal.removeEventListener("abort", aborted); };
+                    const aborted = () => { done(); reject(new CredentialSwitchRetainedStop()); };
+                    const wait = setTimeout(() => { done(); resolve(); }, Math.min(ms, remaining()));
+                    signal.addEventListener("abort", aborted, { once: true });
+                  })),
+                });
+                guard();
+                if (successor.kind === "fenced") throw new StaleClaimError();
+                if (successor.kind !== "ready")
+                  return await pauseCurrent(possibleApply ? "apply_uncertain" : "not_applied_after_teardown");
+                if (successor.operation.opId !== selected.opId) {
+                  if (seenSuccessors.has(successor.operation.opId) ||
+                      successor.operation.revision <= selected.revision)
+                    return await pauseCurrent(possibleApply ? "apply_uncertain" : "not_applied_after_teardown");
+                  seenSuccessors.add(successor.operation.opId);
+                }
+                for (const opId of observedSuccessors) seenSuccessors.add(opId);
+                selected = successor.operation;
+                // Reconcile once more after readonly preflight, before the fenced send.
+                continue;
+              }
+              possibleApply = true;
+              try {
+                result = await effect(() => applyThroughLedger({
+                  applyCredentialSwitch: (id, request) => {
+                    guard();
+                    return this.client.applyCredentialSwitch(id, request, signal);
+                  },
+                }, this.credentialSwitchLedger!, runId, {
+                  claimGeneration: selected.claimGeneration, registerNonce: nonce, opId: selected.opId, oldCumulative,
+                }));
+              } catch (error) {
+                guard();
+                if (error instanceof StaleClaimError || isCheckedLifecycleControl(error)) throw error;
+                return await ownerHold(selected.opId, "apply_uncertain");
+              }
+              if (result.kind === "fenced") throw new StaleClaimError();
+              priorAmbiguous ||= "priorAmbiguous" in result && result.priorAmbiguous === true;
+              if (result.kind !== "superseded") break;
+              possibleApply = priorAmbiguous;
+              const latest = await reconcile(true);
+              if (!latest.owned || latest.claimGeneration !== generation || latest.registerNonce !== nonce)
+                throw new StaleClaimError();
+              if (!latest.pending || latest.pending.opId === selected.opId)
+                return await pauseCurrent(possibleApply ? "apply_uncertain" : "not_applied_after_teardown");
             }
-            if (result.kind === "fenced") throw new StaleClaimError();
-            if (result.kind === "superseded") {
-              // Supersession is checked after committed-op replay, so it proves no apply.
-              possibleApply = false;
-              return await pauseCurrent("not_applied_after_teardown");
-            }
-            const clean = !("priorAmbiguous" in result && result.priorAmbiguous) &&
+            const clean = !priorAmbiguous &&
               ["not_applied", "route_absent", "ledger_unavailable"].includes(result.kind);
             if (clean) possibleApply = false;
             if (result.kind !== "codex_applied")
