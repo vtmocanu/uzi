@@ -16,7 +16,7 @@ ALTER TABLE runs
 ALTER TABLE runs DROP CONSTRAINT runs_health_check;
 ALTER TABLE runs ADD CONSTRAINT runs_health_check CHECK
  (health IN ('ok', 'stalled', 'looping', 'slow', 'waiting_worker', 'approval_idle', 'waiting_account_cooldown', 'publication_withheld')) NOT VALID;
--- The CHECK is installed NOT VALID so no runs scan happens under ACCESS EXCLUSIVE; 00455 validates it.
+-- The CHECK is installed NOT VALID so no runs scan happens under ACCESS EXCLUSIVE; 00458 validates it.
 
 -- +goose Down
 SET LOCAL lock_timeout = '5s';
