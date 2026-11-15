@@ -39,8 +39,7 @@ export interface OverviewCounts {
 // Executing, queued and parked counts over the non-terminal runs. Buckets on the RAW
 // status, as Dashboard's tile always has, with an account cooldown counted as waiting;
 // feeding it effective statuses would drop runs. Runs that need the owner (the
-// needsYou bucket) are deliberately not counted here: the decision clause of the
-// status sentence covers them.
+// needsYou bucket) are deliberately not counted here: the decision card covers them.
 export function overviewCounts(runs: ReadonlyArray<Pick<RunSummaryItem, "status" | "health">>): OverviewCounts {
   const counts: OverviewCounts = { executing: 0, queued: 0, parked: 0 };
   for (const run of runs) {
@@ -350,7 +349,7 @@ function heldDecision(holds: RecoveryCustodyHolds | null | undefined): HeldDecis
   };
 }
 
-// The number of decisions the header sentence counts: the run items other than open pull
+// The number of owner decisions: the run items other than open pull
 // requests, plus the aggregate's held-work decisions.
 export function decisionCount(items: ReadonlyArray<DecisionItem>): number {
   let n = 0;
@@ -365,44 +364,22 @@ function plural(n: number, one: string, many: string): string {
   return `${n} ${n === 1 ? one : many}`;
 }
 
-// The page header's status sentence. Decisions and pull requests come from the viewer's own
-// items only (decisions excludes pull requests; prs is the open-PR count). `acrossFactory` is the admin's factory-wide scope;
-// when the admin list is unavailable the sentence counts only the viewer's runs, says so,
-// and never claims the factory.
-export function statusSentence(input: {
-  decisions: number;
-  prs: number;
+// The compact Runs-card line is the same all-kind population the former header sentence
+// counted. Null means the card's existing empty state is the only copy it needs.
+export function runTotalsLine(input: {
   counts: OverviewCounts;
   acrossFactory: boolean;
-  adminUnavailable: boolean;
-  // Distinct owners among the executing runs (executingPeople over the same rows as counts);
-  // shown only on the factory-wide sentence.
   executingPeople?: number;
-}): string {
-  const { decisions, prs, counts, adminUnavailable } = input;
-  const across = input.acrossFactory && !adminUnavailable;
-
-  const subject = [
-    decisions > 0 ? plural(decisions, "decision", "decisions") : null,
-    prs > 0 ? plural(prs, "pull request", "pull requests") : null,
-  ].filter((s): s is string => s !== null);
-  const waiting =
-    subject.length === 0
-      ? "Nothing needs you right now."
-      : `${subject.join(" and ")} ${decisions + prs === 1 ? "is" : "are"} waiting on you.`;
-
-  const rest = [
+}): string | null {
+  const { counts } = input;
+  const parts = [
+    counts.executing > 0
+      ? `${counts.executing} executing${input.acrossFactory && input.executingPeople && input.executingPeople > 0
+        ? ` for ${plural(input.executingPeople, "person", "people")}`
+        : ""}`
+      : null,
     counts.queued > 0 ? `${counts.queued} queued` : null,
     counts.parked > 0 ? `${counts.parked} parked` : null,
-  ].filter((s): s is string => s !== null);
-  const runs =
-    `${counts.executing} ${counts.executing === 1 ? "run is" : "runs are"} executing` +
-    (across ? " across the factory" : "") +
-    (across && counts.executing > 0 && input.executingPeople !== undefined && input.executingPeople > 0
-      ? ` for ${plural(input.executingPeople, "person", "people")}`
-      : "") +
-    (rest.length === 2 ? `, ${rest[0]} and ${rest[1]}` : rest.length === 1 ? ` and ${rest[0]}` : "") +
-    ".";
-
-  return `${waiting} ${runs}${adminUnavailable ? " Counting only your runs." : ""}`;
+  ].filter((part): part is string => part !== null);
+  return parts.length > 0 ? parts.join(" · ") : null;
 }

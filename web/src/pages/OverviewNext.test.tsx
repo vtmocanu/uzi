@@ -7,9 +7,9 @@ import { MemoryRouter } from "react-router-dom";
 import { OverviewNext } from "./OverviewNext";
 import { CommandMenuContext } from "../components/CommandMenuContext";
 import { Dashboard } from "./Dashboard";
-import { api, type AgentTemplate, type TemplateAllocation } from "../lib/api";
+import { api, type AgentTemplate } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
-import { healthySilentDoc, overviewNextDoc } from "../mocks/data";
+import { healthySilentDoc, mockAgentSource, overviewNextDoc } from "../mocks/data";
 import { aRun, aUser, aWorker, authValue, emptySelf } from "./overviewFixtures";
 
 vi.mock("../lib/api", async (importOriginal) => {
@@ -31,6 +31,7 @@ vi.mock("../lib/api", async (importOriginal) => {
       listUsers: vi.fn(),
       adminRepoActivity: vi.fn(),
       getTemplateAllocations: vi.fn(),
+      getAgentSource: vi.fn(),
     },
   };
 });
@@ -40,7 +41,7 @@ const mockApi = vi.mocked(api);
 const admin = { ...aUser, is_admin: true };
 
 // Every endpoint a non-admin must never reach.
-const adminEndpoints = () => [mockApi.adminListRuns, mockApi.getAdminUsage, mockApi.getAdminHealth, mockApi.listUsers, mockApi.adminRepoActivity];
+const adminEndpoints = () => [mockApi.adminListRuns, mockApi.getAdminUsage, mockApi.getAdminHealth, mockApi.listUsers, mockApi.adminRepoActivity, mockApi.getAgentSource];
 
 beforeEach(() => {
   vi.useFakeTimers();
@@ -52,6 +53,7 @@ beforeEach(() => {
   mockApi.listRepos.mockResolvedValue({ repos: [] });
   mockApi.listAgentTemplates.mockResolvedValue({ templates: [] });
   mockApi.getTemplateAllocations.mockResolvedValue({ templates: [] });
+  mockApi.getAgentSource.mockResolvedValue({ agent_source: structuredClone(mockAgentSource) });
   mockApi.listSecrets.mockResolvedValue({ secrets: [] });
   mockApi.listConnections.mockResolvedValue({ connections: [] });
   mockApi.getUsage.mockResolvedValue(emptySelf());
@@ -88,14 +90,15 @@ async function mount(page: "next" | "classic" = "next") {
   return view;
 }
 
-const sentence = () => screen.getByText(/run(s are| is) executing/).textContent ?? "";
+const totals = () => screen.getByText(/\d+ executing/).textContent ?? "";
 
 describe("OverviewNext for a non-admin", () => {
-  it("shows the greeting, the calm sentence and the run, and calls no admin endpoint", async () => {
+  it("shows the greeting, calm notice and run totals, and calls no admin endpoint", async () => {
     await mount();
     await settle(30_000);
     expect(screen.getByRole("heading", { name: "Welcome, Admin" })).toBeTruthy();
-    expect(sentence()).toBe("Nothing needs you right now. 1 run is executing.");
+    expect(totals()).toBe("1 executing");
+    expect(screen.getByRole("status").textContent).toBe("Nothing needs you right now.");
     expect(screen.getByText("Live run row")).toBeTruthy();
     for (const call of adminEndpoints()) expect(call).not.toHaveBeenCalled();
     expect(screen.getByRole("region", { name: "Your usage" })).toBeTruthy();
@@ -105,6 +108,42 @@ describe("OverviewNext for a non-admin", () => {
     // The health chip is admin-only.
     expect(screen.queryByRole("link", { name: /System health/ })).toBeNull();
     expect(screen.queryByRole("button", { name: /System health/ })).toBeNull();
+  });
+
+  it("hides calm after a later holds poll fails, then restores it on recovery", async () => {
+    await mount();
+    expect(screen.getByText("Nothing needs you right now.")).toBeTruthy();
+    mockApi.getRecoveryHolds.mockRejectedValueOnce(new Error("holds down"));
+    await settle(10_000);
+    expect(screen.queryByText("Nothing needs you right now.")).toBeNull();
+    expect(screen.getByText("Live run row")).toBeTruthy();
+    mockApi.getRecoveryHolds.mockResolvedValue(noHolds());
+    await settle(10_000);
+    expect(screen.getByText("Nothing needs you right now.")).toBeTruthy();
+  });
+
+  it("hides calm after a later runs poll fails, then restores it on recovery", async () => {
+    await mount();
+    expect(screen.getByText("Nothing needs you right now.")).toBeTruthy();
+    mockApi.listRuns.mockRejectedValueOnce(new Error("runs down"));
+    await settle(10_000);
+    expect(screen.queryByText("Nothing needs you right now.")).toBeNull();
+    expect(screen.getByText("Live run row")).toBeTruthy();
+    mockApi.listRuns.mockResolvedValue({ runs: [aRun()] });
+    await settle(10_000);
+    expect(screen.getByText("Nothing needs you right now.")).toBeTruthy();
+  });
+
+  it("hides calm when the combined runs/workers poll cannot apply a fresh run snapshot", async () => {
+    await mount();
+    expect(screen.getByText("Nothing needs you right now.")).toBeTruthy();
+    mockApi.listWorkers.mockRejectedValueOnce(new Error("workers down"));
+    await settle(10_000);
+    expect(screen.queryByText("Nothing needs you right now.")).toBeNull();
+    expect(screen.getByText("Live run row")).toBeTruthy();
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
+    await settle(10_000);
+    expect(screen.getByText("Nothing needs you right now.")).toBeTruthy();
   });
 
   it("links to the classic Overview, which links back to the new default", async () => {
@@ -161,7 +200,7 @@ describe("OverviewNext for an admin", () => {
     await mount();
     expect(mockApi.adminListRuns).toHaveBeenCalledWith({ view: "summary" });
     expect(mockApi.adminListRuns).toHaveBeenCalledTimes(1);
-    expect(sentence()).toBe("Nothing needs you right now. 2 runs are executing across the factory for 2 people and 1 queued.");
+    expect(totals()).toBe("2 executing for 2 people · 1 queued");
     expect(screen.getByRole("group", { name: "Usage scope" })).toBeTruthy();
     // The admin's own row is shown once, under Yours; the other users' rows under Other users.
     expect(within(screen.getByRole("list", { name: "Your runs" })).getAllByText("Live run row")).toHaveLength(1);
@@ -174,8 +213,8 @@ describe("OverviewNext for an admin", () => {
     mockApi.adminListRuns.mockRejectedValue(new Error("admin api down"));
     await mount();
     expect(screen.getByText("Live run row")).toBeTruthy();
-    expect(sentence()).toBe("Nothing needs you right now. 1 run is executing. Counting only your runs.");
-    expect(sentence()).not.toContain("across the factory");
+    expect(totals()).toBe("1 executing");
+    expect(screen.getByText("Other users' runs are unavailable")).toBeTruthy();
     expect(screen.getByRole("heading", { name: "Welcome, Admin" })).toBeTruthy();
   });
 
@@ -184,12 +223,12 @@ describe("OverviewNext for an admin", () => {
       runs: [aRun({ id: "x-1", status: "running", owner_email: "mira@uzi.local" })],
     });
     await mount();
-    expect(sentence()).toContain("2 runs are executing across the factory");
+    expect(totals()).toContain("2 executing");
     mockApi.adminListRuns.mockRejectedValueOnce(new Error("blip"));
     await settle(10_000);
-    expect(sentence()).toBe("Nothing needs you right now. 1 run is executing. Counting only your runs.");
+    expect(totals()).toBe("1 executing");
     await settle(10_000);
-    expect(sentence()).toContain("2 runs are executing across the factory");
+    expect(totals()).toContain("2 executing");
   });
 
   it("shows both run groups, and says so when the admin list becomes unavailable", async () => {
@@ -203,8 +242,9 @@ describe("OverviewNext for an admin", () => {
     expect(within(screen.getByRole("list", { name: "Other users' runs" })).getByText("Theirs")).toBeTruthy();
     mockApi.adminListRuns.mockRejectedValueOnce(new Error("blip"));
     await settle(10_000);
-    expect(screen.getByRole("status").textContent).toBe("Other users' runs are unavailable");
-    expect(screen.getByRole("status").parentElement?.textContent).toMatch(/unavailable \(last read/);
+    const unavailable = screen.getByText("Other users' runs are unavailable");
+    expect(unavailable.textContent).toBe("Other users' runs are unavailable");
+    expect(unavailable.parentElement?.textContent).toMatch(/unavailable \(last read/);
     expect(screen.queryByText("Theirs")).toBeNull();
     expect(screen.getByText("Mine")).toBeTruthy();
   });
@@ -361,7 +401,7 @@ describe("Held work card", () => {
     expect(within(card).getByText("holds need a decision")).toBeTruthy();
     expect(within(card).queryByRole("link", { name: /^Review held work/ })).toBeNull();
     expect(screen.queryByText("Needs your decision")).toBeNull();
-    expect(sentence()).toBe("Nothing needs you right now. 1 run is executing.");
+    expect(totals()).toBe("1 executing");
   });
 
   it("counts two decision holds as 2 decisions and lists one held row", async () => {
@@ -370,7 +410,8 @@ describe("Held work card", () => {
       holds: [decisionHold("run-a", "2026-07-05T10:00:00Z"), decisionHold("run-b", "2026-07-05T11:00:00Z")],
     });
     await mount();
-    expect(sentence()).toBe("2 decisions are waiting on you. 1 run is executing.");
+    expect(totals()).toBe("1 executing");
+    expect(screen.queryByText("Nothing needs you right now.")).toBeNull();
     const needs = screen.getByRole("region", { name: "Needs your decision" });
     expect(within(needs).getAllByRole("listitem")).toHaveLength(1);
     expect(within(needs).getByText("Held work needs 2 decisions")).toBeTruthy();
@@ -392,7 +433,8 @@ describe("Held work card", () => {
     });
     await mount();
     expect(screen.getByText(/Held work from run/).textContent).toBe("Held work from run a83c51f0 needs a decision");
-    expect(sentence()).toBe("1 decision is waiting on you. 1 run is executing.");
+    expect(totals()).toBe("1 executing");
+    expect(screen.queryByText("Nothing needs you right now.")).toBeNull();
   });
 
   it("keeps blocked runs a danger headline with no review link and no held row", async () => {
@@ -406,7 +448,7 @@ describe("Held work card", () => {
     expect(within(card).getByRole("heading", { level: 3 }).className).toContain("text-danger");
     expect(screen.queryByRole("link", { name: /^Review held work/ })).toBeNull();
     expect(screen.queryByText("Needs your decision")).toBeNull();
-    expect(sentence()).toBe("Nothing needs you right now. 1 run is executing.");
+    expect(totals()).toBe("1 executing");
   });
 
   it("says held work is unavailable when the holds request fails, and keeps the rest of the page", async () => {
@@ -414,6 +456,7 @@ describe("Held work card", () => {
     await mount();
     expect(within(heldCard()).getByText("Held work is unavailable right now.")).toBeTruthy();
     expect(screen.getByText("Live run row")).toBeTruthy();
+    expect(screen.queryByText("Nothing needs you right now.")).toBeNull();
   });
 
   it("says it is loading, not unavailable, until the first holds response", async () => {
@@ -421,6 +464,7 @@ describe("Held work card", () => {
     await mount();
     expect(within(heldCard()).getByText("Loading held work…")).toBeTruthy();
     expect(screen.queryByText(/Held work is unavailable/)).toBeNull();
+    expect(screen.queryByText("Nothing needs you right now.")).toBeNull();
   });
 
   it("still shows the danger headline and the held row when a first-load endpoint rejects", async () => {
@@ -444,6 +488,7 @@ describe("Held work card", () => {
     });
     await mount();
     expect([...heldCard().querySelectorAll("strong")].map((e) => e.textContent)).toEqual(["2 / 8", "2", "0"]);
+    expect(screen.queryByText("Nothing needs you right now.")).toBeNull();
   });
 
   it("does not fetch holds on Dashboard beyond its own alert", async () => {
@@ -461,21 +506,32 @@ describe("Needs your decision", () => {
     await mount();
     expect(screen.getByText("Needs your decision")).toBeTruthy();
     expect(screen.getByRole("link", { name: "Review plan" }).getAttribute("href")).toBe("/runs/plan-1");
-    expect(screen.getByText(/^1 decision is waiting on you\./)).toBeTruthy();
+    expect(screen.queryByText("Nothing needs you right now.")).toBeNull();
+    const live = screen.getByRole("status");
+    expect(live.textContent).toBe("");
     mockApi.listRuns.mockResolvedValue({ runs: [aRun({ id: "plan-1", status: "running", issue_title: "Plan me" })] });
     await settle(10_000);
     expect(screen.queryByText("Needs your decision")).toBeNull();
     expect(screen.getByText(/^Nothing needs you right now\./)).toBeTruthy();
+    expect(screen.getByRole("status")).toBe(live);
   });
 
-  it("counts a plan and an open pull request in the sentence", async () => {
+  it("shows a plan and an open pull request without a calm notice", async () => {
     mockApi.listRuns.mockResolvedValue({ runs: [aRun({ id: "plan-1", status: "awaiting_approval" }), prRun()] });
     await mount();
-    expect(screen.getByText(/^1 decision and 1 pull request are waiting on you\./)).toBeTruthy();
+    expect(screen.queryByText("Nothing needs you right now.")).toBeNull();
     // The PR sits in its group: its ref links to the forge, and so does its action once expanded.
     expect(screen.getByRole("link", { name: "vtmocanu/uzi #4" }).getAttribute("href")).toBe("https://github.com/o/r/pull/4");
     fireEvent.click(screen.getByRole("button", { name: "Review PRs" }));
     expect(screen.getByRole("link", { name: "Review PR" }).getAttribute("href")).toBe("https://github.com/o/r/pull/4");
+  });
+
+  it("does not show the calm notice when only an open pull request needs review", async () => {
+    mockApi.listRuns.mockResolvedValue({ runs: [prRun()] });
+    await mount();
+    expect(screen.getByRole("region", { name: "Needs your decision" })).toBeTruthy();
+    expect(screen.getByText("1 pull request is open for your review")).toBeTruthy();
+    expect(screen.queryByText("Nothing needs you right now.")).toBeNull();
   });
 
   it("never lists another user's item for an admin, and counts none", async () => {
@@ -514,7 +570,10 @@ describe("Issue work line", () => {
     mockApi.listRuns.mockResolvedValue({ runs: [aRun({ id: "plan-1", status: "awaiting_approval" })] });
     await mount();
     const needs = screen.getByRole("region", { name: "Needs your decision" });
-    expect(needs.nextElementSibling).toBe(line());
+    const live = needs.nextElementSibling;
+    expect(live?.getAttribute("role")).toBe("status");
+    expect(live?.textContent).toBe("");
+    expect(live?.nextElementSibling).toBe(line());
     cleanup();
     mockApi.listRuns.mockImplementation(() => new Promise(() => {}));
     await mount();
@@ -722,10 +781,10 @@ describe("Issue work line", () => {
       await mount();
       await click("review");
       expect(rows("Your runs")).toHaveLength(1);
-      expect(screen.getByRole("status").textContent).toBe("Other users' runs are unavailable");
+      expect(screen.getByText("Other users' runs are unavailable")).toBeTruthy();
       await click("review");
       await click("queued");
-      expect(screen.getByRole("status").textContent).toBe("Other users' runs are unavailable");
+      expect(screen.getByText("Other users' runs are unavailable")).toBeTruthy();
       expect(screen.getByText("No runs at this stage.")).toBeTruthy();
     });
   });
@@ -892,7 +951,7 @@ describe("People chip (issue #4042)", () => {
     seedRoster();
     await mount();
     expect(chip().getAttribute("aria-label")).toBe("People: 4 active now of 9");
-    expect(sentence()).toContain("2 runs are executing across the factory for 2 people");
+    expect(totals()).toContain("2 executing for 2 people");
     await openChip();
     const rows = dialog().getAllByRole("listitem").map((li) => li.textContent ?? "");
     expect(rows).toHaveLength(5);
@@ -906,7 +965,7 @@ describe("People chip (issue #4042)", () => {
     expect(dialog().queryByText(/online/i)).toBeNull();
   });
 
-  it("keeps the sentence's people count within its executing count for a viewer run only the admin list has", async () => {
+  it("keeps the Runs line's people count within its executing count for a viewer run only the admin list has", async () => {
     vi.mocked(useAuth).mockReturnValue(authValue(admin));
     mockApi.listRuns.mockResolvedValue({ runs: [] });
     mockApi.adminListRuns.mockResolvedValue({
@@ -916,7 +975,7 @@ describe("People chip (issue #4042)", () => {
       ],
     });
     await mount();
-    const m = sentence().match(/(\d+) runs? (?:is|are) executing across the factory for (\d+) (?:person|people)/);
+    const m = totals().match(/(\d+) executing for (\d+) (?:person|people)/);
     expect(m).not.toBeNull();
     expect(Number(m![2])).toBeLessThanOrEqual(Number(m![1]));
     await openChip();
@@ -969,11 +1028,11 @@ describe("People chip (issue #4042)", () => {
     expect(JSON.parse(localStorage.getItem(SCOPE_KEY)!)).toBe("all");
   });
 
-  it("gives a non-admin no chip, no 'for' in the sentence and no admin or user request", async () => {
+  it("gives a non-admin no chip, no people count and no admin or user request", async () => {
     await mount();
     await settle(30_000);
     expect(screen.queryByRole("button", { name: /^People:/ })).toBeNull();
-    expect(sentence()).not.toContain(" for ");
+    expect(totals()).not.toContain(" for ");
     for (const call of adminEndpoints()) expect(call).not.toHaveBeenCalled();
   });
 });
@@ -1041,7 +1100,7 @@ describe("Repos chip (issue #4334)", () => {
 
 // PRD #3875 M1: the Search button in the header opens the shell's command menu.
 describe("OverviewNext Search button", () => {
-  it("follows the health, People and Repos chips, before the Back link", async () => {
+  it("puts the Back link after the title and before the chips in reading order", async () => {
     vi.mocked(useAuth).mockReturnValue(authValue(admin));
     mockApi.getAdminHealth.mockResolvedValue(overviewNextDoc());
     render(
@@ -1063,7 +1122,8 @@ describe("OverviewNext Search button", () => {
     expect(before(health, people)).toBe(true);
     expect(before(people, repos)).toBe(true);
     expect(before(repos, search)).toBe(true);
-    expect(before(search, back)).toBe(true);
+    expect(before(screen.getByRole("heading", { name: "Welcome, Admin" }), back)).toBe(true);
+    expect(before(back, health)).toBe(true);
   });
 
   it("calls the shell's open() on click, with the shortcut shown on the button", async () => {
@@ -1111,7 +1171,7 @@ describe("OverviewNext Search button", () => {
   });
 });
 
-// #4335: the Agents chip sits after the People and Repos chips and before Search, for every user.
+// #4367: the configured Agents chip sits after People and Repos and before Search.
 describe("OverviewNext Agents chip", () => {
   const tmpl = (id: string, name: string, scope: AgentTemplate["scope"], userId: string | null = null): AgentTemplate => ({
     id,
@@ -1129,18 +1189,7 @@ describe("OverviewNext Agents chip", () => {
     created_at: "2026-01-01T00:00:00Z",
     updated_at: "2026-01-01T00:00:00Z",
   });
-  const alloc = (t: AgentTemplate, effective: boolean, globalDefault = t.scope !== "user"): TemplateAllocation => ({
-    id: t.id,
-    name: t.name,
-    description: "",
-    scope: t.scope,
-    is_builtin: t.is_builtin,
-    global_default: globalDefault,
-    my_override: null,
-    effective,
-  });
-
-  // Three builtins (two on), one global (on), the viewer's own (on) and another user's (dropped).
+  // Three builtins, one global, the viewer's own, and another user's private row.
   const rows = [
     tmpl("b1", "coder", "builtin"),
     tmpl("b2", "tester", "builtin"),
@@ -1148,14 +1197,6 @@ describe("OverviewNext Agents chip", () => {
     tmpl("g1", "release", "global"),
     tmpl("m1", "mine", "user", aUser.id),
     tmpl("o1", "theirs", "user", "someone-else"),
-  ];
-  const allocations = [
-    alloc(rows[0], true),
-    alloc(rows[1], true),
-    alloc(rows[2], false),
-    alloc(rows[3], true),
-    alloc(rows[4], true),
-    alloc(rows[5], true),
   ];
   const agentsChip = () => screen.getByRole("button", { name: /^Agents:/ });
   const before = (a: Element, b: Element) => (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
@@ -1193,65 +1234,75 @@ describe("OverviewNext Agents chip", () => {
     expect(before(agentsChip(), screen.getByRole("button", { name: /^Search/ }))).toBe(true);
   });
 
-  it("counts from the core templates read joined with the allocations", async () => {
+  it("counts the core templates directly, even when allocations are missing", async () => {
     mockApi.listAgentTemplates.mockResolvedValue({ templates: rows });
-    mockApi.getTemplateAllocations.mockResolvedValue({ templates: allocations });
+    mockApi.getTemplateAllocations.mockRejectedValue(new Error("allocations down"));
     mountWithMenu();
     await settle();
-    expect(agentsChip().getAttribute("aria-label")).toBe("Agents: 4 in your runs of 5");
+    expect(agentsChip().getAttribute("aria-label")).toBe("Agents: 5 configured");
+    expect(mockApi.getTemplateAllocations).not.toHaveBeenCalled();
     fireEvent.click(agentsChip());
-    const dialog = screen.getByRole("dialog", { name: "Agents in your runs" });
-    expect(within(dialog).getByRole("heading", { name: "4 of 5 agents ride your runs" })).toBeTruthy();
-    expect(within(dialog).queryByText("Admin only")).toBeNull();
+    const dialog = screen.getByRole("dialog", { name: "Agents configured" });
+    expect(within(dialog).getByRole("heading", { name: "5 agents configured" })).toBeTruthy();
+    expect(within(dialog).getByText("mine")).toBeTruthy();
+    expect(within(dialog).queryByText("theirs")).toBeNull();
+    expect(within(dialog).queryByText("From your agent source")).toBeNull();
+    expect(agentsChip().textContent).toBe("5 agents");
   });
 
-  it("shows the admin-only global defaults count for an admin", async () => {
+  it("shows the admin-only source status and review action", async () => {
     vi.mocked(useAuth).mockReturnValue(authValue(admin));
     mockApi.listAgentTemplates.mockResolvedValue({ templates: rows });
-    mockApi.getTemplateAllocations.mockResolvedValue({ templates: allocations });
     mountWithMenu();
     await settle();
+    expect(mockApi.getAgentSource).toHaveBeenCalledTimes(1);
+    expect(agentsChip().getAttribute("aria-label")).toBe("Agents: 5 configured, 4 changes to review");
     fireEvent.click(agentsChip());
-    // builtin x3 and global x1 are defaults; the viewer's own row is not.
-    expect(screen.getByText("Global defaults for new users").nextElementSibling?.textContent).toBe("4");
+    expect(screen.getByText("From your agent source")).toBeTruthy();
+    expect(screen.getByRole("link", { name: "Review in Settings" }).getAttribute("href")).toBe("/admin/settings#agent-source");
   });
 
-  it("hides only the chip when the allocations read fails", async () => {
-    mockApi.getTemplateAllocations.mockRejectedValue(new Error("down"));
+  it("keeps the count when the admin source read fails", async () => {
+    vi.mocked(useAuth).mockReturnValue(authValue(admin));
+    mockApi.listAgentTemplates.mockResolvedValue({ templates: rows });
+    mockApi.getAgentSource.mockRejectedValue(new Error("down"));
     mountWithMenu();
     await settle();
     await settle(10_000);
-    expect(mockApi.getTemplateAllocations).toHaveBeenCalledTimes(1);
-    expect(screen.queryByRole("button", { name: /^Agents:/ })).toBeNull();
+    expect(mockApi.getAgentSource).toHaveBeenCalledTimes(1);
+    expect(agentsChip().getAttribute("aria-label")).toBe("Agents: 5 configured");
     expect(screen.getByRole("heading", { name: "Welcome, Admin" })).toBeTruthy();
     expect(screen.getByRole("button", { name: /^Search/ })).toBeTruthy();
     expect(screen.getByText("Live run row")).toBeTruthy();
   });
 
-  it("hides only the chip when the allocations call throws synchronously", async () => {
-    mockApi.getTemplateAllocations.mockImplementation(() => {
+  it("keeps the count when the admin source call throws synchronously", async () => {
+    vi.mocked(useAuth).mockReturnValue(authValue(admin));
+    mockApi.listAgentTemplates.mockResolvedValue({ templates: rows });
+    mockApi.getAgentSource.mockImplementation(() => {
       throw new Error("x");
     });
     mountWithMenu();
     await settle();
-    expect(screen.queryByRole("button", { name: /^Agents:/ })).toBeNull();
+    expect(agentsChip().getAttribute("aria-label")).toBe("Agents: 5 configured");
     expect(screen.getByRole("heading", { name: "Welcome, Admin" })).toBeTruthy();
     expect(screen.getByRole("button", { name: /^Search/ })).toBeTruthy();
     expect(screen.getByText("Live run row")).toBeTruthy();
   });
 
-  it("reads the allocations once under StrictMode and never again while the page polls", async () => {
+  it("reads agent source once for admins under StrictMode and never again while the page polls", async () => {
+    vi.mocked(useAuth).mockReturnValue(authValue(admin));
     mockApi.listAgentTemplates.mockResolvedValue({ templates: rows });
-    mockApi.getTemplateAllocations.mockResolvedValue({ templates: allocations });
     mountWithMenu(true);
     await settle();
-    expect(mockApi.getTemplateAllocations).toHaveBeenCalledTimes(1);
+    expect(mockApi.getAgentSource).toHaveBeenCalledTimes(1);
+    expect(mockApi.getTemplateAllocations).not.toHaveBeenCalled();
     expect(agentsChip()).toBeTruthy();
     const runsBefore = mockApi.listRuns.mock.calls.length;
     await settle(10_000);
     await settle(30_000);
     expect(mockApi.listRuns.mock.calls.length).toBeGreaterThan(runsBefore);
-    expect(mockApi.getTemplateAllocations).toHaveBeenCalledTimes(1);
+    expect(mockApi.getAgentSource).toHaveBeenCalledTimes(1);
   });
 
   it("re-reads every viewer-scoped list for a different signed-in viewer of the same role, never joining the previous viewer's data", async () => {
@@ -1263,17 +1314,16 @@ describe("OverviewNext Agents chip", () => {
     const aTemplates = [...shared, rows[4]];
     const bTemplates = [...shared, bOwn];
     mockApi.listAgentTemplates.mockResolvedValue({ templates: aTemplates });
-    mockApi.getTemplateAllocations.mockResolvedValue({ templates: aTemplates.map((t) => alloc(t, true)) });
     const view = mountWithMenu();
     await settle();
-    expect(agentsChip().getAttribute("aria-label")).toBe("Agents: 5 in your runs of 5");
+    expect(agentsChip().getAttribute("aria-label")).toBe("Agents: 5 configured");
+    fireEvent.click(agentsChip());
+    expect(screen.getByText("mine")).toBeTruthy();
+    fireEvent.click(agentsChip());
 
     // The session switches to B without a signed-out render in between (AuthContext.applySession).
     let releaseB: (v: { templates: AgentTemplate[] }) => void = () => {};
     mockApi.listAgentTemplates.mockReturnValue(new Promise((r) => (releaseB = r)));
-    mockApi.getTemplateAllocations.mockResolvedValue({
-      templates: bTemplates.map((t) => alloc(t, t.id === "bown")),
-    });
     vi.mocked(useAuth).mockReturnValue(authValue(userB));
     view.rerender(
       <MemoryRouter>
@@ -1283,11 +1333,14 @@ describe("OverviewNext Agents chip", () => {
       </MemoryRouter>,
     );
     await settle();
-    // B's templates have not arrived: no chip, and never A's "5 in your runs".
+    // B's templates have not arrived: no chip, and never A's private name.
     expect(screen.queryByRole("button", { name: /^Agents:/ })).toBeNull();
     releaseB({ templates: bTemplates });
     await settle();
-    expect(agentsChip().getAttribute("aria-label")).toBe("Agents: 1 in your runs of 5");
-    expect(mockApi.getTemplateAllocations).toHaveBeenCalledTimes(2);
+    expect(agentsChip().getAttribute("aria-label")).toBe("Agents: 5 configured");
+    fireEvent.click(agentsChip());
+    expect(screen.getByText("b-own")).toBeTruthy();
+    expect(screen.queryByText("mine")).toBeNull();
+    expect(mockApi.getTemplateAllocations).not.toHaveBeenCalled();
   });
 });

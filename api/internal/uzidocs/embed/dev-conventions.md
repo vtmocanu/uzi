@@ -735,6 +735,11 @@ scenarios are mutually exclusive by construction. Known values:
   but nothing waiting on a decision (no plan review, question, owner-action
   park, open pull request or custody hold), so the decision card stays hidden.
   (PRD #3878, PRD #3880.)
+- `overview-agents-synced`, `overview-agents-review`, `overview-agents-off` —
+  `/dashboard?mock=<name>` exercises the Agents chip's applied-and-synced,
+  staged-review (four changes), and sync-disabled states. The configured count
+  comes from the same mock template list in all three. Turn on the separate
+  `uzi_demo_mode` toggle to mask the source URL and ref in screenshots (#4367).
 
 ### What keeps the mock build current
 

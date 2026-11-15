@@ -10,8 +10,8 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { OverviewNext } from "./OverviewNext";
 import { Dashboard } from "./Dashboard";
 import { AppShell } from "../components/AppShell";
-import { api, type AgentTemplate, type TemplateAllocation } from "../lib/api";
-import { healthySilentDoc, incidentDoc, overviewNextDoc } from "../mocks/data";
+import { api, type AgentTemplate } from "../lib/api";
+import { healthySilentDoc, incidentDoc, mockAgentSource, overviewNextDoc } from "../mocks/data";
 import { overviewNextOwnerWorkers } from "../mocks/data/overviewNext";
 import { aRun, aUser, aWorker, authValue, emptySelf } from "./overviewFixtures";
 import { useAuth } from "../auth/AuthContext";
@@ -47,6 +47,7 @@ vi.mock("../lib/api", async (importOriginal) => {
       version: vi.fn(),
       adminRepoActivity: vi.fn(),
       getTemplateAllocations: vi.fn(),
+      getAgentSource: vi.fn(),
     },
   };
 });
@@ -86,6 +87,7 @@ beforeEach(() => {
   mockApi.listRepos.mockResolvedValue({ repos: [{ enabled: true } as never] });
   mockApi.listAgentTemplates.mockResolvedValue({ templates: [] });
   mockApi.getTemplateAllocations.mockResolvedValue({ templates: [] });
+  mockApi.getAgentSource.mockResolvedValue({ agent_source: structuredClone(mockAgentSource) });
   mockApi.listSecrets.mockResolvedValue({ secrets: [{ kind: "anthropic_token" } as never] });
   mockApi.listConnections.mockResolvedValue({ connections: [{} as never] });
   mockApi.getUsage.mockResolvedValue(emptySelf());
@@ -111,6 +113,254 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+});
+
+describe("compact Overview header (#4366)", () => {
+  async function mountHeader(width: number) {
+    await page.viewport(width, 900);
+    render(
+      <MemoryRouter initialEntries={["/dashboard"]}>
+        <AppShell>
+          <OverviewNext />
+        </AppShell>
+      </MemoryRouter>,
+    );
+    const title = await screen.findByRole("heading", { name: /Welcome/ });
+    const back = screen.getByRole("link", { name: "Back to the old Overview" });
+    const health = await screen.findByRole("button", { name: /^System health:/ });
+    const people = await screen.findByRole("button", { name: /^People:/ });
+    const repos = await screen.findByRole("button", { name: /^Repos:/ });
+    const agents = await screen.findByRole("button", { name: /^Agents:/ });
+    const search = screen.getByRole("button", { name: /^Search/ });
+    await document.fonts.ready;
+    return { title, back, chips: [health, people, repos, agents, search] };
+  }
+
+  const populatedLabels = [
+    "26 of 26 checks passing",
+    "3 active now of 5",
+    "3 repos active of 6",
+    "10 agents · 4 changes to review",
+  ];
+  function setPopulatedLabels(chips: HTMLElement[]) {
+    for (let i = 0; i < populatedLabels.length; i++) {
+      const text = chips[i].querySelector<HTMLElement>(".truncate");
+      expect(text).not.toBeNull();
+      text!.textContent = populatedLabels[i];
+    }
+  }
+  function expectFullLabels(chips: HTMLElement[]) {
+    for (const chip of chips) {
+      const text = chip.querySelector<HTMLElement>(".truncate");
+      if (text) expect(text.scrollWidth, text.textContent ?? "chip label").toBeLessThanOrEqual(text.clientWidth + 1);
+    }
+  }
+
+  it("keeps populated chips on the title row at 1440px without truncation, with Back first in tab order", async () => {
+    const { title, back, chips } = await mountHeader(1440);
+    setPopulatedLabels(chips);
+    const titleRect = title.getBoundingClientRect();
+    const backRect = back.getBoundingClientRect();
+    expect(backRect.top).toBeGreaterThan(titleRect.top);
+    for (const chip of chips) {
+      const rect = chip.getBoundingClientRect();
+      expect(rect.top, chip.getAttribute("aria-label") ?? chip.textContent ?? "chip").toBeLessThan(titleRect.bottom + 2);
+    }
+    expectFullLabels(chips);
+    back.focus();
+    expect(document.activeElement).toBe(back);
+    for (const chip of chips) {
+      await userEvent.tab();
+      expect(document.activeElement).toBe(chip);
+    }
+  });
+
+  it("wraps below a long greeting at 1440px instead of truncating chip labels", async () => {
+    vi.mocked(useAuth).mockReturnValue(authValue({ ...aUser, is_admin: true, display_name: "Alexandra-Margareta Constantinescu" }));
+    const { title, chips } = await mountHeader(1440);
+    setPopulatedLabels(chips);
+    expect(chips[0].getBoundingClientRect().top).toBeGreaterThanOrEqual(title.getBoundingClientRect().bottom);
+    expectFullLabels(chips);
+    expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(1440);
+  });
+
+  it("lets crowded status labels wrap at 1440px without clipping their text", async () => {
+    const { title, chips } = await mountHeader(1440);
+    const labels = [
+      "3 checks need attention",
+      "at least 123 active now of 456",
+      "at least 321 repos active of 500",
+      "150 agents · 20 changes to review",
+    ];
+    for (let i = 0; i < labels.length; i++) chips[i].querySelector<HTMLElement>(".truncate")!.textContent = labels[i];
+    expect(chips[0].getBoundingClientRect().top).toBeGreaterThanOrEqual(title.getBoundingClientRect().bottom);
+    expectFullLabels(chips);
+    expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(1440);
+  });
+
+  it("wraps the chips below the title at 400px without horizontal page overflow", async () => {
+    const { title, back, chips } = await mountHeader(400);
+    const backRect = back.getBoundingClientRect();
+    expect(backRect.top).toBeGreaterThan(title.getBoundingClientRect().top);
+    expect(chips[0].getBoundingClientRect().top).toBeGreaterThanOrEqual(backRect.bottom);
+    for (const chip of chips) {
+      const rect = chip.getBoundingClientRect();
+      expect(rect.left).toBeGreaterThanOrEqual(0);
+      expect(rect.right).toBeLessThanOrEqual(400);
+    }
+    expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(400);
+  });
+});
+
+describe("sticky Overview chips (#4370)", () => {
+  beforeEach(() => localStorage.removeItem("uzi.sidebar.collapsed"));
+  afterEach(() => localStorage.removeItem("uzi.sidebar.collapsed"));
+
+  async function mountAt(width: number) {
+    await page.viewport(width, 900);
+    render(
+      <MemoryRouter initialEntries={["/dashboard"]}>
+        <AppShell><OverviewNext /></AppShell>
+      </MemoryRouter>,
+    );
+    const title = await screen.findByRole("heading", { name: /Welcome/ });
+    const chip = await screen.findByRole("button", { name: /^System health:/ });
+    await screen.findByRole("region", { name: "Issue work" });
+    await document.fonts.ready;
+    const row = document.querySelector<HTMLElement>("[data-overview-chip-row]")!;
+    return { title, chip, row };
+  }
+
+  for (const width of [1280, 1440]) {
+    it(`pins one chip row above scrolling content without a layout jump at ${width}px`, async () => {
+      const { title, row } = await mountAt(width);
+      const content = screen.getByRole("region", { name: "Issue work" });
+      const contentDocumentTop = content.getBoundingClientRect().top + window.scrollY;
+      window.scrollTo(0, 650);
+      await expect.poll(() => row.dataset.stuck).toBe("true");
+      expect(title.getBoundingClientRect().bottom).toBeLessThan(0);
+      expect(row.getBoundingClientRect().top).toBe(0);
+      expect(row.getBoundingClientRect().height).toBeLessThanOrEqual(50);
+      expect(getComputedStyle(row).borderBottomWidth).toBe("1px");
+      await expect.poll(() => parseFloat(document.documentElement.style.scrollPaddingTop))
+        .toBeGreaterThanOrEqual(Math.ceil(row.getBoundingClientRect().height) + 12);
+      expect(Math.abs(content.getBoundingClientRect().top + window.scrollY - contentDocumentTop)).toBeLessThanOrEqual(1);
+      expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(width);
+      window.scrollTo(0, 0);
+      await expect.poll(() => row.dataset.stuck).toBe("false");
+      expect(document.documentElement.style.scrollPaddingTop).toBe("");
+    });
+  }
+
+  it("pins without shifting content after a long greeting wraps the chips below the title", async () => {
+    vi.mocked(useAuth).mockReturnValue(authValue({ ...aUser, is_admin: true, display_name: "Alexandra-Margareta Constantinescu" }));
+    const { title, row } = await mountAt(1440);
+    expect(row.getBoundingClientRect().top).toBeGreaterThanOrEqual(title.getBoundingClientRect().bottom);
+    const content = screen.getByRole("region", { name: "Issue work" });
+    const before = content.getBoundingClientRect().top + window.scrollY;
+    window.scrollTo(0, 650);
+    await expect.poll(() => row.dataset.stuck).toBe("true");
+    expect(row.getBoundingClientRect().top).toBe(0);
+    expect(Math.abs(content.getBoundingClientRect().top + window.scrollY - before)).toBeLessThanOrEqual(1);
+    await expect.poll(() => parseFloat(document.documentElement.style.scrollPaddingTop))
+      .toBeGreaterThanOrEqual(Math.ceil(row.getBoundingClientRect().height) + 12);
+  });
+
+  it("keeps a wrapped pinned row and its focus clearance when chip labels grow", async () => {
+    const { row } = await mountAt(1280);
+    const chips = [...row.querySelectorAll<HTMLElement>("button[aria-haspopup='dialog']")];
+    expect(chips.length).toBeGreaterThanOrEqual(2);
+    for (const chip of chips.slice(0, 2)) chip.parentElement!.style.flex = "0 0 500px";
+    await expect.poll(() => row.getBoundingClientRect().height).toBeGreaterThan(50);
+    window.scrollTo(0, 650);
+    await expect.poll(() => row.dataset.stuck).toBe("true");
+    expect(row.getBoundingClientRect().height).toBeGreaterThan(50);
+    await expect.poll(() => parseFloat(document.documentElement.style.scrollPaddingTop))
+      .toBeGreaterThanOrEqual(Math.ceil(row.getBoundingClientRect().height) + 12);
+    expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(1280);
+  });
+
+  it("updates the flow placeholder when chips wrap while pinned, then unsticks without a jump", async () => {
+    const { row } = await mountAt(1280);
+    const content = screen.getByRole("region", { name: "Issue work" });
+    window.scrollTo(0, 650);
+    await expect.poll(() => row.dataset.stuck).toBe("true");
+    const chips = [...row.querySelectorAll<HTMLElement>("button[aria-haspopup='dialog']")];
+    for (const chip of chips.slice(0, 2)) chip.parentElement!.style.flex = "0 0 500px";
+    await expect.poll(() => row.getBoundingClientRect().height).toBeGreaterThan(50);
+    await expect.poll(() => parseFloat(document.documentElement.style.scrollPaddingTop))
+      .toBeGreaterThanOrEqual(Math.ceil(row.getBoundingClientRect().height) + 12);
+    const afterGrowth = content.getBoundingClientRect().top + window.scrollY;
+    window.scrollTo(0, 0);
+    await expect.poll(() => row.dataset.stuck).toBe("false");
+    expect(Math.abs(content.getBoundingClientRect().top + window.scrollY - afterGrowth)).toBeLessThanOrEqual(1);
+  });
+
+  for (const width of [1024, 400]) {
+    it(`lets the chips scroll away at ${width}px`, async () => {
+      const { row } = await mountAt(width);
+      window.scrollTo(0, 650);
+      await expect.poll(() => window.scrollY).toBeGreaterThan(100);
+      expect(row.dataset.stuck).toBe("false");
+      expect(row.getBoundingClientRect().bottom).toBeLessThan(0);
+      expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(width);
+    });
+  }
+
+  it("keeps a popover visible from the pinned row and restores focus on Escape", async () => {
+    const { chip, row } = await mountAt(1440);
+    window.scrollTo(0, 650);
+    await expect.poll(() => row.dataset.stuck).toBe("true");
+    await userEvent.click(chip);
+    const dialog = await screen.findByRole("dialog", { name: "System health" });
+    const rect = dialog.getBoundingClientRect();
+    expect(rect.top).toBeGreaterThanOrEqual(row.getBoundingClientRect().bottom);
+    expect(rect.left).toBeGreaterThanOrEqual(0);
+    expect(rect.right).toBeLessThanOrEqual(1440);
+    await userEvent.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog", { name: "System health" })).toBeNull();
+    expect(document.activeElement).toBe(chip);
+    await userEvent.click(chip);
+    await screen.findByRole("dialog", { name: "System health" });
+    const outside = document.createElement("button");
+    outside.textContent = "Outside popover";
+    outside.style.cssText = "position:fixed;left:300px;bottom:20px;z-index:40";
+    document.body.appendChild(outside);
+    await userEvent.click(outside);
+    outside.remove();
+    expect(screen.queryByRole("dialog", { name: "System health" })).toBeNull();
+  });
+
+  it("tracks the content column when the desktop sidebar collapses while stuck", async () => {
+    const { row } = await mountAt(1440);
+    window.scrollTo(0, 650);
+    await expect.poll(() => row.dataset.stuck).toBe("true");
+    const before = row.getBoundingClientRect().left;
+    await userEvent.click(screen.getByRole("button", { name: "Collapse sidebar" }));
+    const column = document.querySelector<HTMLElement>("[data-page-content-column]")!;
+    await expect.poll(() => row.getBoundingClientRect().left).toBe(column.getBoundingClientRect().left);
+    expect(row.getBoundingClientRect().left).not.toBe(before);
+    expect(row.getBoundingClientRect().width).toBe(column.getBoundingClientRect().width);
+  });
+
+  it("scrolls the next focused control below the pinned bar", async () => {
+    const { row } = await mountAt(1440);
+    window.scrollTo(0, 650);
+    await expect.poll(() => row.dataset.stuck).toBe("true");
+    const probe = document.createElement("button");
+    probe.textContent = "Focus clearance probe";
+    probe.style.cssText = `position:absolute;left:320px;top:${window.scrollY + row.getBoundingClientRect().height / 2}px`;
+    const content = row.closest<HTMLElement>("[data-page-content-column]")!;
+    content.firstElementChild!.insertAdjacentElement("afterend", probe);
+    expect(probe.getBoundingClientRect().top).toBeGreaterThan(0);
+    expect(probe.getBoundingClientRect().top).toBeLessThan(row.getBoundingClientRect().bottom);
+    const search = screen.getByRole("button", { name: /^Search/ });
+    search.focus();
+    await userEvent.tab();
+    expect(document.activeElement).toBe(probe);
+    expect(probe.getBoundingClientRect().top).toBeGreaterThanOrEqual(row.getBoundingClientRect().bottom);
+    probe.remove();
+  });
 });
 
 describe("promoted Overview routes in the real shell (PRD #3877 M1)", () => {
@@ -1842,8 +2092,9 @@ describe("OverviewNext health chip popover", () => {
     const dialog = await screen.findByRole("dialog", { name: "System health" });
     await document.fonts.ready;
     const before = chip.getBoundingClientRect().left;
-    // Wide enough that a stale chip-relative offset would push the panel past the right edge.
-    preceding.style.width = "720px";
+    // #4366 moved Back under the title; 720px then moved this chip only 378px.
+    // 800px still forces the >400px reflow that discriminates a stale placement.
+    preceding.style.width = "800px";
     await expect.poll(() => chip.getBoundingClientRect().left - before).toBeGreaterThan(400);
     // Re-placed against the chip's new position: attached to it and inside the viewport.
     await expect
@@ -1895,7 +2146,7 @@ describe("OverviewNext health chip popover", () => {
   });
 });
 
-// #4335: the Agents chip's popover, like the People and health popovers, opens below the chip
+// #4367: the configured Agents chip's popover, like the People and health popovers, opens below the chip
 // on desktop and as a bottom sheet on a phone, never pushes the page sideways, and Escape
 // returns focus to the chip.
 describe("OverviewNext Agents chip", () => {
@@ -1916,28 +2167,16 @@ describe("OverviewNext Agents chip", () => {
     updated_at: "2026-01-01T00:00:00Z",
   });
 
-  // 12 builtins (8 on), 1 global (on) and 1 of the viewer's own (off): 14 agents, 9 in runs.
+  // 12 builtins, 1 global and 1 of the viewer's own: 14 configured agents.
   const rows = [
     ...Array.from({ length: 12 }, (_, i) => tmpl(`b${i}`, `builtin-agent-${i}`, "builtin")),
     tmpl("g0", "global-agent", "global"),
     tmpl("m0", "my-agent", "user", aUser.id),
   ];
-  const allocations: TemplateAllocation[] = rows.map((t, i) => ({
-    id: t.id,
-    name: t.name,
-    description: "",
-    scope: t.scope,
-    is_builtin: t.is_builtin,
-    global_default: t.scope !== "user",
-    my_override: null,
-    effective: t.scope === "builtin" ? i < 8 : t.scope === "global",
-  }));
-
   for (const width of [1280, 400]) {
     it(`opens inside the viewport, closes on Escape and returns focus at ${width}px`, async () => {
       await page.viewport(width, 900);
       mockApi.listAgentTemplates.mockResolvedValue({ templates: rows });
-      mockApi.getTemplateAllocations.mockResolvedValue({ templates: allocations });
       render(
         <MemoryRouter initialEntries={["/dashboard"]}>
           <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
@@ -1945,16 +2184,17 @@ describe("OverviewNext Agents chip", () => {
           </main>
         </MemoryRouter>,
       );
-      const chip = await screen.findByRole("button", { name: "Agents: 9 in your runs of 14" });
+      const chip = await screen.findByRole("button", { name: "Agents: 14 configured, 4 changes to review" });
       await document.fonts.ready;
       expect(window.innerWidth).toBe(width);
       expect(chip.getBoundingClientRect().right, "chip inside the viewport").toBeLessThanOrEqual(window.innerWidth);
 
       await userEvent.click(chip);
-      const dialog = await screen.findByRole("dialog", { name: "Agents in your runs" });
+      const dialog = await screen.findByRole("dialog", { name: "Agents configured" });
       expect(dialog.checkVisibility()).toBe(true);
-      expect(within(dialog).getByRole("heading", { name: "9 of 14 agents ride your runs" })).toBeTruthy();
-      expect(within(dialog).getByText("Admin only")).toBeTruthy();
+      expect(within(dialog).getByRole("heading", { name: "14 agents configured" })).toBeTruthy();
+      expect(within(dialog).getByText("From your agent source")).toBeTruthy();
+      expect(within(dialog).getByRole("link", { name: "Review in Settings" })).toBeTruthy();
       const r = dialog.getBoundingClientRect();
       expect.soft(r.left, "dialog left").toBeGreaterThanOrEqual(0);
       expect.soft(r.right, "dialog right").toBeLessThanOrEqual(document.documentElement.clientWidth);
@@ -1968,7 +2208,7 @@ describe("OverviewNext Agents chip", () => {
       );
 
       await userEvent.keyboard("{Escape}");
-      expect(screen.queryByRole("dialog", { name: "Agents in your runs" })).toBeNull();
+      expect(screen.queryByRole("dialog", { name: "Agents configured" })).toBeNull();
       expect(document.activeElement).toBe(chip);
       expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(document.documentElement.clientWidth);
     });

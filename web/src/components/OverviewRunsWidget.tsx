@@ -7,6 +7,7 @@ import { Link } from "react-router-dom";
 import { isTerminalRun, type RunSummaryItem } from "../lib/api";
 import { issueLineStage, type IssueStage, type IssueWorkScope } from "../lib/issueLine";
 import { formatAgo } from "../lib/rateLimits";
+import { runTotalsLine, type OverviewCounts } from "../lib/overview";
 import type { AdminRunsState } from "../lib/useOverviewData";
 import { OverviewRunRow } from "./OverviewRunRow";
 import { Card, SectionTitle, Skeleton } from "./ui";
@@ -40,6 +41,9 @@ export function OverviewRunsWidget({
   stage = null,
   prRuns = [],
   scope = "all",
+  totals = null,
+  acrossFactory = false,
+  executingPeople,
 }: {
   ownRuns: RunSummaryItem[];
   adminRuns: AdminRunsState | null;
@@ -56,7 +60,11 @@ export function OverviewRunsWidget({
   prRuns?: RunSummaryItem[];
   // The issue-work line's scope: "you" hides other users' runs while a stage is picked.
   scope?: IssueWorkScope;
+  totals?: OverviewCounts | null;
+  acrossFactory?: boolean;
+  executingPeople?: number;
 }) {
+  const totalsText = totals ? runTotalsLine({ counts: totals, acrossFactory, executingPeople }) : null;
   const openPrIds = new Set(prRuns.map((r) => r.id));
   const onStage = (r: RunSummaryItem) => stage == null || issueLineStage(r, openPrIds) === stage;
   const filtered = stage != null;
@@ -84,6 +92,7 @@ export function OverviewRunsWidget({
           </Link>
         </span>
       </div>
+      {totalsText && <p className="mt-2 text-xs text-muted">{totalsText}</p>}
       {loading ? (
         <div className="mt-3 space-y-2">
           <Skeleton className="h-10" />

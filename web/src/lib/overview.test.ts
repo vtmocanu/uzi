@@ -14,7 +14,7 @@ import {
   parkDisposition,
   ownRecoveryWaitCount,
   setupComplete,
-  statusSentence,
+  runTotalsLine,
   workerJoined,
 } from "./overview";
 
@@ -98,78 +98,24 @@ describe("ownRecoveryWaitCount", () => {
   });
 });
 
-describe("statusSentence", () => {
+describe("runTotalsLine", () => {
   const none = { executing: 0, queued: 0, parked: 0 };
-  const base = { decisions: 0, prs: 0, counts: none, acrossFactory: false, adminUnavailable: false };
-
-  it("reads calm when nothing needs the owner", () => {
-    expect(statusSentence({ ...base, counts: { executing: 1, queued: 0, parked: 0 } })).toBe(
-      "Nothing needs you right now. 1 run is executing.",
-    );
+  it("omits an all-zero line", () => {
+    expect(runTotalsLine({ counts: none, acrossFactory: false })).toBeNull();
   });
 
-  it("uses a singular verb for one decision and one pull request, a plural for the others", () => {
-    expect(statusSentence({ ...base, decisions: 1 })).toMatch(/^1 decision is waiting on you\./);
-    expect(statusSentence({ ...base, prs: 2 })).toMatch(/^2 pull requests are waiting on you\./);
-    expect(statusSentence({ ...base, prs: 1 })).toMatch(/^1 pull request is waiting on you\./);
-    expect(statusSentence({ ...base, decisions: 1, prs: 1 })).toMatch(
-      /^1 decision and 1 pull request are waiting on you\./,
+  it("lists each nonzero all-kind bucket in order", () => {
+    expect(runTotalsLine({ counts: { executing: 3, queued: 1, parked: 2 }, acrossFactory: false })).toBe(
+      "3 executing · 1 queued · 2 parked",
     );
-    expect(statusSentence({ ...base, decisions: 3, prs: 1 })).toMatch(
-      /^3 decisions and 1 pull request are waiting on you\./,
-    );
+    expect(runTotalsLine({ counts: { executing: 0, queued: 1, parked: 0 }, acrossFactory: false })).toBe("1 queued");
   });
 
-  it("lists queued and parked counts, dropping a zero one", () => {
-    expect(statusSentence({ ...base, counts: { executing: 3, queued: 1, parked: 2 } })).toBe(
-      "Nothing needs you right now. 3 runs are executing, 1 queued and 2 parked.",
-    );
-    expect(statusSentence({ ...base, counts: { executing: 3, queued: 0, parked: 2 } })).toBe(
-      "Nothing needs you right now. 3 runs are executing and 2 parked.",
-    );
-    expect(statusSentence({ ...base, counts: { executing: 2, queued: 4, parked: 0 } })).toBe(
-      "Nothing needs you right now. 2 runs are executing and 4 queued.",
-    );
-  });
-
-  it("says across the factory for an admin's factory scope", () => {
-    expect(statusSentence({ ...base, acrossFactory: true, counts: { executing: 3, queued: 1, parked: 2 } })).toBe(
-      "Nothing needs you right now. 3 runs are executing across the factory, 1 queued and 2 parked.",
-    );
-  });
-
-  it("adds how many people are executing to the factory-wide sentence", () => {
-    const f = { ...base, acrossFactory: true, counts: { executing: 6, queued: 1, parked: 2 } };
-    expect(statusSentence({ ...f, executingPeople: 3 })).toBe(
-      "Nothing needs you right now. 6 runs are executing across the factory for 3 people, 1 queued and 2 parked.",
-    );
-    expect(statusSentence({ ...f, counts: { executing: 1, queued: 0, parked: 0 }, executingPeople: 1 })).toBe(
-      "Nothing needs you right now. 1 run is executing across the factory for 1 person.",
-    );
-  });
-
-  it("leaves the people clause out when nothing executes, the scope is not the factory, or the field is absent", () => {
-    const f = { ...base, acrossFactory: true, counts: { executing: 3, queued: 0, parked: 0 } };
-    expect(statusSentence({ ...f, counts: { executing: 0, queued: 1, parked: 0 }, executingPeople: 2 })).not.toContain(
-      "for 2 people",
-    );
-    expect(statusSentence({ ...f, acrossFactory: false, executingPeople: 2 })).toBe(
-      "Nothing needs you right now. 3 runs are executing.",
-    );
-    expect(statusSentence({ ...f, adminUnavailable: true, executingPeople: 2 })).not.toContain("people");
-    expect(statusSentence({ ...f, executingPeople: 0 })).toBe(statusSentence(f));
-    expect(statusSentence(f)).toBe("Nothing needs you right now. 3 runs are executing across the factory.");
-  });
-
-  it("counts only the viewer's runs, says so and never claims the factory when the admin list is unavailable", () => {
-    const sentence = statusSentence({
-      ...base,
-      acrossFactory: true,
-      adminUnavailable: true,
-      counts: { executing: 1, queued: 0, parked: 0 },
-    });
-    expect(sentence).toBe("Nothing needs you right now. 1 run is executing. Counting only your runs.");
-    expect(sentence).not.toContain("across the factory");
+  it("adds people only to factory executing runs", () => {
+    const counts = { executing: 6, queued: 1, parked: 0 };
+    expect(runTotalsLine({ counts, acrossFactory: true, executingPeople: 3 })).toBe("6 executing for 3 people · 1 queued");
+    expect(runTotalsLine({ counts, acrossFactory: false, executingPeople: 3 })).toBe("6 executing · 1 queued");
+    expect(runTotalsLine({ counts: { ...counts, executing: 0 }, acrossFactory: true, executingPeople: 3 })).toBe("1 queued");
   });
 });
 
@@ -389,38 +335,26 @@ describe("overviewDecisions", () => {
   });
 });
 
-describe("statusSentence from decisions", () => {
-  const sentenceFor = (runs: RunSummaryItem[], holds?: RecoveryCustodyHolds) => {
-    const items = overviewDecisions(runs, holds);
-    return statusSentence({
-      decisions: decisionCount(items),
-      prs: items.filter((d) => d.kind === "pr").length,
-      counts: { executing: 0, queued: 0, parked: 0 },
-      acrossFactory: false,
-      adminUnavailable: false,
-    });
-  };
+describe("decisionCount from Overview decisions", () => {
+  const countFor = (runs: RunSummaryItem[], holds?: RecoveryCustodyHolds) => decisionCount(overviewDecisions(runs, holds));
   const plan = run({ id: "p", status: "awaiting_approval" });
   const pr = (id: string) =>
     run({ id, status: "completed", kind: "issue", mr_iid: 9, mr_state: "opened", repo_id: "r", created_at: "2026-07-01T00:00:00Z" });
 
-  it("reads the four documented sentences", () => {
-    expect(sentenceFor([plan, pr("a")])).toMatch(/^1 decision and 1 pull request are waiting on you\./);
-    expect(sentenceFor([plan])).toMatch(/^1 decision is waiting on you\./);
-    expect(sentenceFor([pr("a"), run({ id: "b", status: "completed", kind: "issue", mr_iid: 10, mr_state: "opened", repo_id: "r", created_at: "2026-07-01T00:00:00Z" })])).toMatch(
-      /^2 pull requests are waiting on you\./,
-    );
-    expect(sentenceFor([])).toMatch(/^Nothing needs you right now\./);
+  it("counts owner decisions but excludes PRs", () => {
+    expect(countFor([plan, pr("a")])).toBe(1);
+    expect(countFor([plan])).toBe(1);
+    expect(countFor([])).toBe(0);
   });
 
   it("counts two runs sharing one PR once", () => {
-    expect(sentenceFor([pr("a"), pr("b")])).toMatch(/^1 pull request is waiting on you\./);
+    expect(overviewDecisions([pr("a"), pr("b")]).filter((d) => d.kind === "pr")).toHaveLength(1);
   });
 
   it("counts the aggregate's held-work decisions", () => {
     const holds = heldHolds({ decision_needed: 2, open_holds: 2 }, [decisionHold("h1", "2026-07-05T10:01:00Z"), decisionHold("h2", "2026-07-05T10:02:00Z")]);
-    expect(sentenceFor([], holds)).toMatch(/^2 decisions are waiting on you\./);
-    expect(sentenceFor([plan], holds)).toMatch(/^3 decisions are waiting on you\./);
+    expect(countFor([], holds)).toBe(2);
+    expect(countFor([plan], holds)).toBe(3);
   });
 });
 

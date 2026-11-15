@@ -1,101 +1,117 @@
 // @vitest-environment jsdom
-// #4335: the Overview Agents chip and its popover.
 import { afterEach, describe, expect, it } from "vitest";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { AgentsChip } from "./AgentsChip";
-import type { AgentCountModel } from "../lib/agentCounts";
+import { agentSourceChipModel, type AgentSourceChipModel } from "../lib/agentSourceChip";
+import { mockAgentSource } from "../mocks/data";
 
 afterEach(cleanup);
 
-const model: AgentCountModel = {
-  total: 14,
-  inRuns: 9,
-  byScope: [
-    { scope: "builtin", label: "Builtin", total: 12, inRuns: 8 },
-    { scope: "global", label: "Global", total: 1, inRuns: 1 },
-    { scope: "user", label: "Mine", total: 1, inRuns: 0 },
+const model: AgentSourceChipModel = {
+  total: 16,
+  groups: [
+    { key: "source", label: "From your agent source", agents: [{ name: "reviewer", detail: null }] },
+    { key: "shipped", label: "Shipped with uzi", agents: [{ name: "lead", detail: null }, { name: "tester", detail: "edited by an admin" }] },
+    { key: "admin", label: "Added by an admin", agents: [{ name: "ui-copy", detail: null }] },
+    { key: "yours", label: "Yours", agents: [{ name: "mine", detail: null }] },
   ],
+  suffix: null,
+  sourceMeta: null,
+  sourceAppliedSha: null,
+  sourceNotice: null,
+  reviewInSettings: false,
 };
 
-function mount(m: AgentCountModel) {
-  return render(
-    <MemoryRouter>
-      <AgentsChip model={m} />
-    </MemoryRouter>,
-  );
+function mount(m: AgentSourceChipModel = model) {
+  return render(<MemoryRouter><AgentsChip model={m} /></MemoryRouter>);
 }
 
 const chip = () => screen.getByRole("button", { name: /^Agents:/ });
 
 describe("AgentsChip", () => {
-  it("reads the agents in your runs of the total, with a matching accessible name", () => {
-    mount(model);
-    expect(chip().getAttribute("aria-label")).toBe("Agents: 9 in your runs of 14");
-    expect(chip().textContent).toContain("9 agents in your runs");
-    expect(chip().textContent).toContain("of 14");
+  it("shows the configured count with its matching accessible name", () => {
+    mount();
+    expect(chip().getAttribute("aria-label")).toBe("Agents: 16 configured");
+    expect(chip().textContent).toBe("16 agents");
     expect(chip().getAttribute("aria-expanded")).toBe("false");
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 
-  it("uses the singular for one agent", () => {
-    mount({ total: 3, inRuns: 1, byScope: [{ scope: "builtin", label: "Builtin", total: 3, inRuns: 1 }] });
-    expect(chip().textContent).toContain("1 agent in your runs");
-    expect(chip().textContent).not.toContain("1 agents");
+  it("uses the singular and adds only an admin source suffix supplied by the model", () => {
+    mount({ ...model, total: 1, suffix: { text: "3 changes to review", tone: "warn" }, reviewInSettings: true });
+    expect(chip().textContent).toBe("1 agent · 3 changes to review");
+    expect(chip().getAttribute("aria-label")).toBe("Agents: 1 configured, 3 changes to review");
+    expect(chip().querySelector(".text-warn")).not.toBeNull();
   });
 
-  it("opens a popover with the header and one row per scope", () => {
-    mount(model);
+  it("groups agents by source and scope, with admin-edited builtins named", () => {
+    mount();
     fireEvent.click(chip());
-    const dialog = screen.getByRole("dialog", { name: "Agents in your runs" });
-    expect(chip().getAttribute("aria-expanded")).toBe("true");
-    expect(within(dialog).getByRole("heading", { name: "9 of 14 agents ride your runs" })).toBeTruthy();
-    expect(within(dialog).getByText("By scope")).toBeTruthy();
-    expect(within(dialog).getByText("Builtin").nextElementSibling?.textContent).toBe("12 · 8 on");
-    expect(within(dialog).getByText("Global").nextElementSibling?.textContent).toBe("1 · 1 on");
-    expect(within(dialog).getByText("Mine").nextElementSibling?.textContent).toBe("1 · 0 on");
+    const dialog = screen.getByRole("dialog", { name: "Agents configured" });
+    expect(within(dialog).getByRole("heading", { name: "16 agents configured" })).toBeTruthy();
+    for (const label of ["From your agent source", "Shipped with uzi", "Added by an admin", "Yours"]) {
+      expect(within(dialog).getByText(label)).toBeTruthy();
+    }
+    expect(within(dialog).getByText("tester").parentElement?.textContent).toContain("edited by an admin");
+    expect(within(dialog).getByRole("link", { name: "Manage agents" }).getAttribute("href")).toBe("/agents");
   });
 
-  it("shows the Admin only group when global defaults are known, and not otherwise", () => {
-    const { unmount } = mount({ ...model, globalDefaults: 13 });
+  it("shows sanitized metadata in text and title and routes attention to Settings", () => {
+    const meta = "https://forge.example.com@demo-ref, synced 2h ago";
+    mount({ ...model, suffix: { text: "sync failed", tone: "danger" }, sourceMeta: meta, sourceAppliedSha: "a1b2c3d", sourceNotice: "The last agent-source sync failed.", reviewInSettings: true });
     fireEvent.click(chip());
-    const dialog = screen.getByRole("dialog");
-    expect(within(dialog).getByText("Admin only")).toBeTruthy();
-    expect(within(dialog).getByText("Global defaults for new users").nextElementSibling?.textContent).toBe("13");
+    const text = screen.getByText(meta).closest("p")!;
+    expect(text.getAttribute("title")).toBe(`${meta}, (a1b2c3d)`);
+    expect(screen.getByText(/a1b2c3d/).className).toContain("whitespace-nowrap");
+    expect(screen.getByText("The last agent-source sync failed.")).toBeTruthy();
+    expect(screen.getByRole("link", { name: "Review in Settings" }).getAttribute("href")).toBe("/admin/settings#agent-source");
+  });
+
+  it("strips unsafe URL/ref characters in rendered text and title, and masks both in demo mode", () => {
+    const source = structuredClone(mockAgentSource);
+    source.config.url = "https://github.com/private/agents\u202e\u0007";
+    source.config.ref = "secret-ref\u202e\u0007";
+    const build = (demo: boolean) => agentSourceChipModel([], { viewerId: "owner", isAdmin: true, source, demo, now: Date.now() });
+    const { unmount } = mount(build(false));
+    fireEvent.click(chip());
+    const normal = screen.getByText(build(false).sourceMeta!).closest("p")!;
+    expect(normal.textContent).not.toContain("\u202e");
+    expect(normal.textContent).not.toContain("\u0007");
+    expect(normal.getAttribute("title")).not.toContain("\u202e");
+    expect(normal.getAttribute("title")).not.toContain("\u0007");
     unmount();
-
-    mount(model);
+    mount(build(true));
     fireEvent.click(chip());
-    expect(screen.queryByText("Admin only")).toBeNull();
-    expect(screen.queryByText("Global defaults for new users")).toBeNull();
+    const demo = screen.getByText(build(true).sourceMeta!).closest("p")!;
+    expect(demo.textContent).toContain("https://forge.example.com@demo-ref");
+    expect(demo.textContent).not.toContain("private");
+    expect(demo.getAttribute("title")).toContain("https://forge.example.com@demo-ref");
   });
 
-  it("shows a zero global default count for an admin", () => {
-    mount({ ...model, globalDefaults: 0 });
+  it("keeps admin-only source details absent when the model has none", () => {
+    mount();
     fireEvent.click(chip());
-    expect(screen.getByText("Global defaults for new users").nextElementSibling?.textContent).toBe("0");
+    expect(screen.queryByText(/forge\.example\.com|sync failed|review pending/)).toBeNull();
+    expect(screen.queryByRole("link", { name: "Review in Settings" })).toBeNull();
   });
 
-  it("links to the Agents page and closes when the link is used", () => {
-    mount(model);
+  it("closes the popover when its footer link is used", () => {
+    mount();
     fireEvent.click(chip());
     const link = screen.getByRole("link", { name: "Manage agents" });
     expect(link.getAttribute("href")).toBe("/agents");
     fireEvent.click(link);
-    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.queryByRole("dialog", { name: "Agents configured" })).toBeNull();
   });
 
-  it("closes on Escape and returns focus to the chip", () => {
-    mount(model);
+  it("closes on Escape and an outside click, restoring focus to the chip", () => {
+    mount();
     fireEvent.click(chip());
     expect(document.activeElement).toBe(screen.getByRole("dialog"));
     fireEvent.keyDown(document, { key: "Escape" });
     expect(screen.queryByRole("dialog")).toBeNull();
     expect(document.activeElement).toBe(chip());
-  });
-
-  it("closes on a click outside", () => {
-    mount(model);
     fireEvent.click(chip());
     fireEvent.mouseDown(document.body);
     expect(screen.queryByRole("dialog")).toBeNull();
