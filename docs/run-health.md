@@ -276,7 +276,8 @@ only; it never stops, fails or requeues the run.
 - **No per-run Slack DM.** The Slack root status line reads _"checkpoint
   publication withheld"_, but the owner gets no per-run nudge for this flag.
 - **Clearing.** It clears only after a later checkpoint publication is admitted and
-  accepted. A scan finding alone, or the passage of time, does not clear it.
+  accepted, and only if no newer trusted finding arrived after that admission. A scan
+  finding alone, or the passage of time, does not clear it.
 
 ## This is an early-warning aid, not a guardrail
 
