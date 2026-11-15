@@ -196,6 +196,8 @@ export function mergeTerminalRecord(current: TerminalOperationRecord, delta: Ter
     if (inv.outcome === "invoked") {
       if (next.localBlock.length > 0) return no("local_block");
       if (next.phase !== "prepared") return no("not_prepared");
+      // Leave room for the final outcome (or a conflict) that must follow an `invoked` entry.
+      if (next.invocations.length + 2 > MAX_INVOCATIONS) return no("bound");
     }
     if (inv.outcome === "conflict") addBlock("server_conflict");
     next.invocations.push(inv);

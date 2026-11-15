@@ -287,3 +287,37 @@ describe("publishTerminalPreservation", () => {
     assert.deepEqual(await publish(abort.signal), { kind: "unknown", cause: "aborted" });
   });
 });
+
+describe("publishTerminalPreservation with an injected transport", () => {
+  afterEach(() => mock.restoreAll());
+
+  it("posts through the constructor fetch and never the global one", async () => {
+    const globalCalls: string[] = [];
+    mock.method(globalThis, "fetch", async (input: string | URL | Request) => {
+      globalCalls.push(String(input));
+      throw new Error("global fetch must not be used");
+    });
+    const injected: Array<{ url: URL; method?: string }> = [];
+    const transport: typeof fetch = async (input, init) => {
+      injected.push({ url: new URL(String(input)), method: init?.method });
+      return Response.json(response("published"));
+    };
+    const client = new WorkerClient("http://tp.test", "worker-token", "test", nullLogger(), { fetch: transport, sleep: async () => {} });
+    const result = await client.publishTerminalPreservation(RUN, request);
+    assert.equal(result.kind, "final");
+    assert.equal(injected.length, 1);
+    assert.equal(injected[0]!.url.pathname, `/api/worker/runs/${RUN}/terminal-preservation`);
+    assert.equal(injected[0]!.method, "POST");
+    assert.deepEqual(globalCalls, []);
+  });
+
+  it("a non-string tip is malformed even when its string form is a valid sha", async () => {
+    const base = response("recorded") as unknown as Record<string, unknown>;
+    for (const tip of [[String(base.tip)], 12345, { toString: () => String(base.tip) }]) {
+      const transport: typeof fetch = async () => Response.json({ ...base, tip });
+      const client = new WorkerClient("http://tp.test", "worker-token", "test", nullLogger(), { fetch: transport, sleep: async () => {} });
+      assert.deepEqual(await client.publishTerminalPreservation(RUN, request),
+        { kind: "unknown", cause: "malformed_response", httpStatus: 200 }, JSON.stringify(tip));
+    }
+  });
+});

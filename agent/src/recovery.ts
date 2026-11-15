@@ -1555,7 +1555,7 @@ export class RecoveryCoordinator {
     }
     let handle: FileHandle;
     try {
-      handle = await fs.open(this.terminalFile(runId, generation), constants.O_RDONLY | constants.O_NOFOLLOW);
+      handle = await fs.open(this.terminalFile(runId, generation), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
     } catch (error) {
       return (error as NodeJS.ErrnoException).code === "ENOENT" ? { kind: "absent" } : { kind: "corrupt" };
     }

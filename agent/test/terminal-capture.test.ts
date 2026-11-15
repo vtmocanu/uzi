@@ -973,6 +973,8 @@ describe("terminal digests and per-commit CI paths", () => {
     const pack = execFileSync("/usr/bin/git", ["-C", bare, "pack-objects", "--revs", "--stdout"], { env: gitEnv, input: `${c}\n^${a}\n`, maxBuffer: 64 * MIB });
     const transport = await f.git.terminalTransportDigest(pack, { deadlineMs: 30_000 });
     const scan = await f.git.terminalScanDigest(bare, range, { deadlineMs: 30_000 });
+    assert.match(scan ?? "", /^[0-9a-f]{64}$/);
+    assert.match(transport ?? "", /^[0-9a-f]{64}$/);
     assert.equal(scan, transport);
   });
 });

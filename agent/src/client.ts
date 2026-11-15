@@ -3750,7 +3750,7 @@ export class WorkerClient {
         body: JSON.stringify(req),
         signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
       };
-      res = await maintenanceFetch(fetch, this.baseUrl + path, init);
+      res = await maintenanceFetch(this.transport ?? fetch, this.baseUrl + path, init);
       try {
         text = await readBoundedText(res, TERMINAL_PRESERVATION_RESPONSE_MAX_BYTES, true, init.signal ?? undefined);
       } catch {
@@ -6592,7 +6592,7 @@ function decodeTerminalPreservationResponse(value: unknown, runId: string): Term
   const str = (k: string) => typeof value[k] === "string" && (value[k] as string).length > 0 ? value[k] as string : undefined;
   const state = TERMINAL_CONTRIBUTION_STATES.find(s => s === value.state);
   const reason = value.reason === undefined ? undefined : TERMINAL_REASONS.find(r => r === value.reason);
-  if (!state || (value.reason !== undefined && !reason) || !/^[0-9a-f]{40}$/.test(String(value.tip))) return undefined;
+  if (!state || (value.reason !== undefined && !reason) || typeof value.tip !== "string" || !/^[0-9a-f]{40}$/.test(value.tip)) return undefined;
   if (value.ref !== `refs/uzi-terminal/${runId}`) return undefined;
   const disposition = TERMINAL_RESPONSE_DISPOSITIONS.find(d => d === value.disposition);
   // recorded <=> an abandonment disposition (run_terminal_contributions_recorded_check).

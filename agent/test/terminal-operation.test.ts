@@ -1,6 +1,7 @@
 import { afterEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import { execFileSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 
@@ -954,5 +955,66 @@ describe("run-wide block gates head authority", () => {
     assert.equal(r.closedReason, "published");
     assert.deepEqual(await runTerminalOperation(h.deps, input()), { outcome: "kept", reason: "secret_found" });
     assert.equal(h.sends.length, 1);
+  });
+});
+
+describe("terminal invocation bound leaves room for the final outcome", () => {
+  const alternating = (n: number) =>
+    Array.from({ length: n }, (_, i) => (i % 2 === 0 ? inv("invoked") : inv("publish_unknown", "transport")));
+
+  it("merge refuses a 255th-entry invoked as bound", () => {
+    assert.equal(mergeReason(preparedRec({ invocations: alternating(255) }), { appendInvocations: [inv("invoked")] }), "bound");
+  });
+
+  it("merge admits invoked at 254 and the final outcome then closes the record at 256", () => {
+    const a = mustMerge(preparedRec({ invocations: alternating(254) }), { appendInvocations: [inv("invoked")] });
+    assert.equal(a.invocations.length, 255);
+    const b = mustMerge(a, { phase: "closed", appendInvocations: [inv("published")] });
+    assert.equal(b.invocations.length, 256);
+    assert.equal(b.phase, "closed");
+  });
+
+  it("the store refuses to invoke at 255 and the engine never sends", async () => {
+    const h = harness(mkCoord(mkRoot()));
+    assert.equal((await h.deps.store.create(preparedRec({ invocations: alternating(255) }))).kind, "created");
+    const res = await h.deps.store.invoke(RUN, 1, "2026-01-01T00:00:00.000Z");
+    assert.equal(res.kind, "rejected");
+    assert.deepEqual(res, { kind: "rejected", reason: "bound" });
+    await runTerminalOperation(h.deps, input("resume"));
+    assert.equal(h.sends.length, 0);
+    assert.equal((await readRec(h.deps.store)).invocations.length, 255);
+  });
+
+  it("the store invokes at 254 and records a closing final outcome", async () => {
+    const store = mkCoord(mkRoot()).terminalOperationStore();
+    assert.equal((await store.create(preparedRec({ invocations: alternating(254) }))).kind, "created");
+    assert.equal((await store.invoke(RUN, 1, "2026-01-01T00:00:00.000Z")).kind, "invoked");
+    const closed = await store.update(RUN, 1, { phase: "closed", appendInvocations: [inv("published")] });
+    assert.equal(closed.kind, "ok");
+    assert.equal((await readRec(store)).invocations.length, 256);
+  });
+});
+
+describe("terminal record read never blocks on a non-regular file", () => {
+  it("a FIFO record reads as corrupt promptly and releases the restore journal lock", async () => {
+    const root = mkRoot();
+    const coord = mkCoord(root);
+    const dir = tpDir(root);
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const fifo = recFile(root);
+    // Fail (never skip) when mkfifo is unavailable.
+    execFileSync("mkfifo", [fifo]);
+    let timer: NodeJS.Timeout | undefined;
+    const bound = <T>(p: Promise<T>, what: string) => Promise.race([
+      p, new Promise<never>((_, rej) => { timer = setTimeout(() => rej(new Error(`${what} hung on the FIFO`)), 2000); }),
+    ]).finally(() => clearTimeout(timer));
+    try {
+      const read = await bound(coord.terminalOperationStore().read(RUN, 1), "terminal read");
+      assert.deepEqual(read, { kind: "corrupt" });
+      assert.equal(await bound(coord.withRestoreJournalLock(RUN, async () => "ok"), "restore journal lock"), "ok");
+    } finally {
+      // Unblock any thread-pool open still parked on the FIFO so the process can exit.
+      try { fs.closeSync(fs.openSync(fifo, fs.constants.O_RDWR)); } catch { /* best effort */ }
+    }
   });
 });
