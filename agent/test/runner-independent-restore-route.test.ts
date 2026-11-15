@@ -28,15 +28,18 @@ import {
 
 // Hosted runs may themselves execute inside an attempt worktree. Keep that shape
 // in every fixture's parent so suffix removal must operate on the basename only.
-beforeEach(t => {
-  const parent = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "restore-route.attempt-")));
-  mock.method(os, "tmpdir", () => parent);
-  t.after(() => fs.rmSync(parent, { recursive: true, force: true }));
+let fixtureParent: string;
+beforeEach(() => {
+  fixtureParent = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "restore-route.attempt-")));
+  mock.method(os, "tmpdir", () => fixtureParent);
 });
 installHarness();
 rigDefaults.independentRestore = false;
 
-afterEach(() => { cleanupRig(); });
+afterEach(() => {
+  cleanupRig();
+  fs.rmSync(fixtureParent, { recursive: true, force: true });
+});
 
 // ---- tests ------------------------------------------------------------------------------------------------------------------
 
