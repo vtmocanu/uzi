@@ -419,7 +419,7 @@ is smaller, and a window under 5 s starts nothing). The completion head is
 attached only for a `published` or `recorded` manifest root. A held V2
 replay/resume runs inside `inventorySourceBoundary` before any held FINAL; a
 non-final outcome keeps the hold and no hold is reopened.
-When the claim names no default branch, the lane resolves it inside its own window and signal; a lookup that times out or is aborted keeps the output (`default_branch_unresolved`) rather than assuming `main`.
+When the claim names no default branch, the lane resolves it inside its own window and signal; a lookup that ends after the lane window lapsed or its signal aborted keeps the output (`default_branch_unresolved`) rather than assuming `main`; the decision is that window check, since the lookup itself reports any failure as no answer.
 
 #### Failure model and what is not claimed
 

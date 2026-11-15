@@ -371,7 +371,7 @@ describe("terminal-preservation lane (#4007 slice B)", () => {
     assert.equal(r.store.record, undefined);
   });
 
-  it("a default-branch lookup that resolves nothing with the budget intact proceeds with main", async () => {
+  it("a default-branch lookup that resolves nothing with the budget intact is not refused and proceeds", async () => {
     // The rig's hooked prepare replaces the real one, so the observable is that the operation proceeds to its send.
     let looked = 0;
     const r = rig({ env: { defaultBranch: undefined, lookupDefaultBranch: async () => { looked++; return undefined; } } });
