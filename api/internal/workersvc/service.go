@@ -2023,6 +2023,14 @@ type Service struct {
 	// hibernationSettings reads the worker-hibernation kill-switch (PRD #4205). Optional;
 	// set via SetHibernationSettings. Nil is "off".
 	hibernationSettings HibernationSettings
+	// hibernationAuto reads the automatic hibernation settings (issue #4207). Optional; nil
+	// disables HibernationAutoPass. autoPassMu guards lastAutoPass, the start of the last
+	// pass that ran, which paces the pass to HibernationAutoPassEvery. autoPassAfterList is a
+	// TEST-ONLY hook called after the candidate list is read and before any lock is taken.
+	hibernationAuto   HibernationAutoSettings
+	autoPassMu        sync.Mutex
+	lastAutoPass      time.Time
+	autoPassAfterList func()
 	// isolatedLaneDisabled is true when the deployment did not enable the isolated research
 	// lane (issue #1965); set via SetIsolatedLaneEnabled. Stored negated so a Service that never
 	// calls the setter (tests, other wiring) keeps the pre-#1965 queued reasons.

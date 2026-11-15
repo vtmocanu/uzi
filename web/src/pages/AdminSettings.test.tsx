@@ -274,7 +274,7 @@ describe("agent-source Health navigation", () => {
     const check = doc.checks.find((c) => c.id === "agentsource.update")!;
     check.severity = "warn";
     check.action = "Untrusted action https://example.com/#arbitrary";
-    doc.counts = { ok: 22, warn: 1, danger: 0, unknown: 0, na: 0 };
+    doc.counts = { ...doc.counts, ok: doc.counts.ok - 1, warn: doc.counts.warn + 1 };
     mockApi.getAdminHealth.mockResolvedValue(doc);
     let resolveSettings!: (value: ReturnType<typeof response>) => void;
     mockApi.getSettings.mockReturnValue(new Promise((resolve) => { resolveSettings = resolve; }));

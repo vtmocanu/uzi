@@ -601,6 +601,9 @@ func run() error {
 	wsvc.SetEphemeralSettings(settingsCache)
 	// Worker hibernation kill-switch (PRD #4205): admission and the disable-wake pass read it.
 	wsvc.SetHibernationSettings(settingsCache)
+	// Automatic idle-worker hibernation (issue #4207): the pass reads worker_hibernation_auto and
+	// worker_hibernation_idle_after on top of the kill-switch above.
+	wsvc.SetHibernationAutoSettings(settingsCache)
 	// Issue #1965: a profile-bound run on a deployment without the lane says so instead of waiting.
 	wsvc.SetIsolatedLaneEnabled(cfg.IsolatedLaneEnabled())
 	// PRD #2006: lease entry on a worker-reported terminal and lease-arm claims (0 disables).
@@ -910,6 +913,15 @@ func run() error {
 		sweeper.Pass{
 			Name: "worker_hibernation_settle",
 			Run:  wsvc.HibernationSettlePass,
+		},
+		// Automatic idle-worker hibernation (issue #4207). It sits AFTER the settle pass so a wake that
+		// settled this tick has already stamped last_wake_settled_at (its grace anchor) before idle
+		// workers are listed, and BEFORE the demand wake so a worker admitted here is seen as
+		// preparing by the wake pass rather than racing it. It is gated inside the pass on
+		// worker_hibernation_enabled AND worker_hibernation_auto and runs at most once a minute.
+		sweeper.Pass{
+			Name: "worker_hibernation_auto",
+			Run:  wsvc.HibernationAutoPass,
 		},
 		// Hibernation demand wake (PRD #4205 M5): wakes a sleeping worker for a queued run no online
 		// worker can claim. It MUST run BEFORE ephemeral_workers_provision so sleeping capacity is
