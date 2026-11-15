@@ -495,6 +495,9 @@ async function finishAndSend(deps: TerminalOperationDeps, input: TerminalOperati
     if (blocked !== undefined) return kept(blocked);
     const run = await store.runBlock(input.runId);
     if (run.kind !== "clear") return kept(run.reason);
+    // A failure latched while runBlock was pending still withholds head authority (same rule as the replay path).
+    const lateFailure = deps.failureFirst();
+    if (lateFailure !== undefined) return kept(lateFailure);
     if (!deps.boundaryValid()) return kept("boundary_lost");
     return { outcome: result.outcome, tip: rec.tip!, manifest: rec.manifest! };
   }

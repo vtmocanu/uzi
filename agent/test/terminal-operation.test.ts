@@ -714,6 +714,24 @@ describe("terminal operation final authority", () => {
     });
   }
 
+  it("live final: a failure that latches while the post-send runBlock is pending returns no head authority", async () => {
+    const coord = mkCoord(mkRoot());
+    const h = harness(coord);
+    const real = h.deps.store;
+    let flipped = false;
+    h.deps.store = { ...real, runBlock: async (id: string) => {
+      const out = await real.runBlock(id);
+      // Only the post-send check: the latch lands after the factual receipt was recorded.
+      if (h.sends.length > 0 && !flipped) { flipped = true; h.failure = "secret_found"; }
+      return out;
+    }, read: real.read.bind(real), create: real.create.bind(real), update: real.update.bind(real),
+      addLocalBlock: real.addLocalBlock.bind(real), invoke: real.invoke.bind(real) };
+    assert.deepEqual(await runTerminalOperation(h.deps, input()), { outcome: "kept", reason: "secret_found" });
+    assert.equal(flipped, true, "the latch landed during the post-send runBlock");
+    assert.equal(h.sends.length, 1);
+    assert.deepEqual((await readRec(real)).invocations.map(i => i.outcome), ["invoked", "published"], "the receipt stays factual");
+  });
+
   it("a boundary lost while invoke is in flight sends nothing, latches no block, and a later resume may send", async () => {
     let lapses = 1;
     const coord = mkCoord(mkRoot());
