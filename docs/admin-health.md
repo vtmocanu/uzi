@@ -62,7 +62,7 @@ It surfaces six ways:
 - **One notice per admin per Danger episode**, as a Slack DM for a linked
   admin, selects checks with server-supplied `scope: instance` and severity
   `danger`. The current instance checks are `db`, `db.size`, `controller.report`,
-  `loops`, `fleet.roll`, `fleet.hibernation_wake`, `fleet.hibernation_cleanup`, `maintenance.active`,
+  `loops`, `fleet.roll`, `fleet.hibernation_wake`, `fleet.hibernation_cleanup`, `fleet.hibernation_retirement`, `maintenance.active`,
   `agentsource.update` and `pricing.codex`; the rest are `owner`. `fleet.roll` remains instance infrastructure even when the hosted
   workers belong to a single owner.
 
@@ -202,6 +202,7 @@ except `forge.sync`, whose windows follow the effective forge poll interval.
 | `fleet.memory_authority` | Whether any worker has lost [memory authority](worker-setup.md#lost-memory-authority) (the api withholds guard-bound runs from it until its container restarts) | any worker with a fresh heartbeat has a gated claim recorded; the evidence names at most 10 workers (the summary carries the full count), each with how long ago it was first gated | — | — |
 | `fleet.hibernation_wake` | Whether a [hibernated worker's wake](hosted-workers.md#hibernation) failed or is not confirmed (scope `instance`) | a wake failed, or is not confirmed within 15 minutes; the evidence names at most 10 workers (the first evidence row, `Workers`, carries the full count) | — | `na` when no hosted workers are configured |
 | `fleet.hibernation_cleanup` | Whether a [hibernating worker's cache cleanup](hosted-workers.md#cache-cleanup-before-sleep) has an unknown settlement, which keeps the worker's claims fenced (scope `instance`) | — | any attempt's settlement is unknown; it stays until the same attempt reports or the controller observes its pod stopped, and blocks the worker's delete | `na` when no hosted workers are configured |
+| `fleet.hibernation_retirement` | A **dry run** of [volume retirement](hosted-workers.md#volume-retirement-dry-run-m1) for workers that have been hibernated a long time (scope `instance`). Nothing is deleted: it says which workers a later release could retire and which are blocked, and why | a worker past the 21-day (504 hour) retirement period is blocked, or more than 50 workers are hibernated so only the oldest 50 were evaluated (the summary says "evaluated 50 of N (oldest first)"); each evidence row is a short worker id with `blocked by <code> (<source>)` (a missing receipt names the retained source and the run, `<kind>:<path> run <id>`, cut to fit, so a long path can hide the run), followed by `; class policy <policy>, actual PV unverified` when the inventory recorded the claims, or, for a worker nothing blocks, a fixed sentence that it "would retire only after M2 verifies" the actual PV reclaim policy and that no pod ran between observations (flagged when the StorageClass policy is `Retain` or unknown), `not yet eligible: <time> left` (blocker and class policy appended as for a blocked worker), or `cancelled: wake requested`; at most 10 rows, blocked workers first | — | `na` when no worker is hibernated or waking; `unknown` when the evaluation itself fails |
 
 `fleet.quarantine` reads the worker's own heartbeat report, which the api keeps in
 memory only. A worker without a fresh heartbeat is skipped (`fleet.capacity`

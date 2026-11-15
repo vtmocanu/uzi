@@ -62,6 +62,9 @@ import {
   queuedBlockerPrecedesCodexAdmission,
   isStoppedRun,
   isRejectedRun,
+  isNonCompletionHold,
+  completionPanelEarlyReturn,
+  completionPanelHeld,
   milestoneBadge,
   mrChipState,
   mrChipSuffix,
@@ -475,12 +478,12 @@ function policyBlocksContinuation(run: Run): boolean {
 // never durability across workers. Policy cases have their own presentation.
 export function CompletionStatePanel({ run }: { run: Run }) {
   if (policyBlocksContinuation(run)) return null;
-  if (run.status === "paused" && (run.hold_reason === "provider_unavailable" || run.hold_reason === "iteration_budget_exhausted")) return null;
+  // A non-completion hold (NON_COMPLETION_HOLDS: credential, provider, token-switch,
+  // base-attestation, repo-agent source, iteration, run-override ...) is not a completion state;
+  // its own badge, panel and announcement cover it.
+  if (completionPanelEarlyReturn(run)) return null;
   const phase = run.completion_phase ?? "";
-  // PRD #1732: a credential_disabled hold is not a completion state; its own panel covers it.
-  // Token-switch, base-attestation and repo-agent source holds have their own panels.
-  const held = run.hold_reason != null && run.hold_reason !== "credential_disabled" && run.hold_reason !== "credentials_reset" && run.hold_reason !== "provider_unavailable" &&
-    run.hold_reason !== "base_attestation_missing" && run.hold_reason !== "repo_agent_source_unavailable" && credentialSwitchHold(run) === null;
+  const held = completionPanelHeld(run);
   if (phase === "" && !held) return null;
   const unmet = run.completion_unmet ?? [];
   const attempts = run.completion_attempts ?? 0;
@@ -958,14 +961,8 @@ export function PausedPanel({
     run.status !== "paused" ||
     policyBlocksContinuation(run) ||
     run.hold_reason === "completion_blocked" ||
-    run.hold_reason === "credential_disabled" ||
-    run.hold_reason === "credentials_reset" ||
-    run.hold_reason === "provider_unavailable" ||
-    run.hold_reason === "iteration_budget_exhausted" ||
-    // Issue #3181: the token-switch holds have their own panel and Resume gating.
-    credentialSwitchHold(run) !== null ||
-    run.hold_reason === "base_attestation_missing" ||
-    run.hold_reason === "repo_agent_source_unavailable"
+    // Every non-completion hold has its own panel or Resume gating (NON_COMPLETION_HOLDS).
+    isNonCompletionHold(run.hold_reason)
   )
     return null;
 
@@ -1674,6 +1671,26 @@ function BaseAttestationHoldPanel({ run, ownerProof = false, busy = false, onCan
     {ownerProof ? <div className="mt-3 flex gap-2">
       <Button size="sm" variant="danger" disabled={busy} onClick={onCancel}>Cancel</Button>
     </div> : <p className="mt-2 text-xs text-muted">Only the run owner can cancel this hold.</p>}
+  </Card>;
+}
+
+// Issue #3250: the run's chosen model or effort cannot run on its harness, so the agent never
+// started. Resume re-checks at the next claim and parks again unless the choice has become
+// available on that harness (e.g. a narrowing release was rolled back); otherwise the owner
+// cancels and starts a new run with a different choice. No Stop (not a milestone issue run's
+// completed scope) and no "session continues" claim.
+function RunOverrideHoldPanel({ run, ownerProof, busy, onResume, onCancel }: {
+  run: Run; ownerProof: boolean; busy: boolean; onResume: () => void; onCancel: () => void;
+}) {
+  if (run.status !== "paused" || run.hold_reason !== "run_override_unavailable") return null;
+  return <Card className="p-4">
+    <h2 className="text-sm font-semibold text-warn">Model choice unavailable: waiting for owner</h2>
+    <p className="mt-1 text-xs text-muted">The model or effort chosen for this run cannot run on this harness. The agent was not started.</p>
+    <p className="mt-1 text-xs text-muted">Resume retries only if the choice has become available on that harness. Otherwise, Cancel and start a new run with a different choice. This run does not resume automatically.</p>
+    {ownerProof ? <div className="mt-3 flex gap-2">
+      <Button size="sm" disabled={busy} onClick={onResume}>Resume</Button>
+      <Button size="sm" variant="danger" disabled={busy} onClick={onCancel}>Cancel</Button>
+    </div> : <p className="mt-2 text-xs text-muted">Only the run owner can Resume or Cancel this hold.</p>}
   </Card>;
 }
 
@@ -2561,6 +2578,8 @@ export function RunView() {
               ? "base_attestation_missing"
             : run?.status === "paused" && run.hold_reason === "repo_agent_source_unavailable"
               ? "repo_agent_source_unavailable"
+            : run?.status === "paused" && run.hold_reason === "run_override_unavailable"
+              ? "run_override_unavailable"
             : run?.status === "paused"
               ? "paused"
             : "";
@@ -2629,6 +2648,8 @@ export function RunView() {
               ? "The run is held because its retained work is not attested to the planned base commit. The agent was not started. Recover the work or start a successor run."
             : parkKey === "repo_agent_source_unavailable"
               ? "The repository's agent definitions could not be read. The agent was not started. Only the run owner can Resume when the revision is available, or Cancel. There is no automatic retry."
+            : parkKey === "run_override_unavailable"
+              ? "Model choice unavailable. The run's chosen model or effort cannot run on its harness. Resume retries only if the choice has become available on that harness; otherwise Cancel and start a new run with a different choice."
             : parkKey === "iteration_budget_exhausted:spent"
               ? "Iteration limit reached. The remaining wall budget is spent. Extend time, then explicitly Resume, or Cancel. Extend leaves the run paused."
             : parkKey === "iteration_budget_exhausted"
@@ -2826,20 +2847,10 @@ export function RunView() {
                   + the "Completion blocked" StatusPill cover it. */}
               {!policyBlocked && run.status === "paused" &&
                 run.hold_reason !== "completion_blocked" &&
-                // PRD #1732: a credential_disabled hold resumes on Enable (its panel), and a
-                // plain Resume would only park it again.
-                run.hold_reason !== "credential_disabled" &&
-                // PRD #3989 M3: the server refuses Resume (409) for a credentials_reset hold; it
-                // resumes on its own once a credential is added.
-                run.hold_reason !== "credentials_reset" &&
-                run.hold_reason !== "provider_unavailable" &&
-                run.hold_reason !== "iteration_budget_exhausted" &&
-                // Issue #3181: the token-switch holds offer Resume in their own panel, which
-                // shows the server's settling refusal inline.
-                credentialSwitchHold(run) === null &&
-                // Issue #3194: Resume is refused by the server for a base-attestation hold.
-                run.hold_reason !== "base_attestation_missing" &&
-                run.hold_reason !== "repo_agent_source_unavailable" &&
+                // The non-completion holds (NON_COMPLETION_HOLDS) have their own panel (an
+                // Enable, a credential add, the token-switch refusal inline) or are refused by
+                // the server; run_override_unavailable has RunOverrideHoldPanel.
+                !isNonCompletionHold(run.hold_reason) &&
                 (canSteer ? (
                   <Button
                     size="sm"
@@ -3248,6 +3259,12 @@ export function RunView() {
           if (isCurrent()) await refreshRun();
         }); }}
         onCancel={() => { void cancelRun(); }} />
+      <RunOverrideHoldPanel run={run} ownerProof={canSteer && run.id === id} busy={busy}
+        onResume={() => { void act(async (isCurrent) => {
+          await api.resumeRun(run.id);
+          if (isCurrent()) await refreshRun();
+        }); }}
+        onCancel={() => { void cancelRun(); }} />
       <PausedPanel
         run={run}
         origin={pauseOrigin(run, messages, pauseOriginReady)}
@@ -3416,7 +3433,7 @@ export function RunView() {
 
       {/* PRD #88: ALWAYS MOUNTED, empty until a park announces itself — see the note at
           parkAnnounce for why the region cannot live inside QuestionPanel. sr-only
-          because the panel below already carries the message for everyone else. The
+          because the visible panels already carry the message for everyone else. The
           effect fires after mount, so the region exists before its content changes even
           on a page load that arrives at an already-parked run. */}
       <div className="sr-only" role="status" aria-live="polite">

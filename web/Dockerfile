@@ -78,6 +78,9 @@ COPY fixtures/lead-config/ /app/fixtures/lead-config/
 COPY fixtures/effort-defaults/ /app/fixtures/effort-defaults/
 # issue #3607: the policy-hold wording table the web panel and the CLI share.
 COPY fixtures/policy-hold/ /app/fixtures/policy-hold/
+# issue #3250: the hold presentation table and the run start-options cases the web and the CLI share.
+COPY fixtures/hold-reasons/ /app/fixtures/hold-reasons/
+COPY fixtures/run-start-options/ /app/fixtures/run-start-options/
 RUN npm run build
 
 # --- runtime stage ---

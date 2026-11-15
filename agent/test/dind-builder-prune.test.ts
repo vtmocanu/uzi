@@ -953,3 +953,46 @@ describe("real child", () => {
     }
   });
 });
+
+describe("builder-prune child fixture", () => {
+  // Regression for the main CI flake (run 43631560241): the tests poll existsSync(stateFile)
+  // and then JSON.parse it, so the fixture must never expose a created-but-unwritten file.
+  // The gate holds the fixture after it has created its file and before it writes it; while
+  // it is held, a non-atomic write leaves an empty state file, an atomic one leaves none.
+  it("never exposes a partially written state file", async () => {
+    const dir = scratch();
+    const stateFile = join(dir, "state.json");
+    const gate = join(dir, "gate");
+    const child = spawn(process.execPath, [CHILD, "env", stateFile], {
+      env: { ...process.env, DIND_PRUNE_FIXTURE_STATE_GATE: gate },
+      stdio: "ignore",
+    });
+    let failure: unknown;
+    // Handle a spawn error as soon as it can happen, so it never surfaces as an unhandled
+    // rejection while the readiness wait below is still pending.
+    const done = new Promise<number | null>((resolve, reject) => {
+      child.once("error", reject);
+      child.once("exit", (code) => resolve(code));
+    }).catch((error: unknown) => {
+      failure ??= error;
+      return null;
+    });
+    try {
+      await waitFor(() => existsSync(`${gate}.opened`), "fixture holding its state write");
+      assert.equal(existsSync(stateFile), false, "state file visible before its content was written");
+    } catch (error) {
+      failure ??= error;
+    }
+    // Always release and join the owned child before scratch cleanup; if the release itself
+    // fails, stop the child instead. The first failure is the one reported.
+    try {
+      writeFileSync(`${gate}.release`, "");
+    } catch {
+      child.kill("SIGKILL");
+    }
+    const code = await done;
+    if (failure !== undefined) throw failure;
+    assert.equal(code, 0);
+    assert.doesNotThrow(() => JSON.parse(readFileSync(stateFile, "utf8")));
+  });
+});

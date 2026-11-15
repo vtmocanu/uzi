@@ -8,6 +8,7 @@ import { useAuth } from "../auth/AuthContext";
 import {
   api,
   type AdminUsage,
+  type AgentTemplate,
   type RecoveryCustodyHolds,
   type RepoActivity,
   type RunSummaryItem,
@@ -28,6 +29,8 @@ export interface Overview {
   workersTotal: number;
   reposEnabled: number;
   templates: number;
+  // The same core read's rows, for the Overview Agents chip (#4335); no extra request.
+  agentTemplates: AgentTemplate[];
   hasToken: boolean;
   hasForge: boolean;
   // PRD #40: the caller's own usage (everyone) + the factory view (admins only).
@@ -132,6 +135,7 @@ export function useOverviewData(opts?: {
           workersTotal: workers.length,
           reposEnabled: repos.filter((r) => r.enabled).length,
           templates: templates.length,
+          agentTemplates: templates,
           hasToken: hasAnthropicToken(secrets),
           hasForge: connections.length > 0,
           selfUsage,

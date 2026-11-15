@@ -9,10 +9,13 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
@@ -54,15 +57,17 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 		// A POINTER, so "the caller said false" and "the caller said nothing" stay
 		// distinct — a plain bool would make every existing client silently override
 		// the user's own Settings default with false the moment this field shipped.
-		// The web start button omits it and inherits the default (the user ruled
-		// against a start-run modal on 2026-07-27); the per-run toggle is
-		// PUT /api/runs/{id}/wait-on-limit.
+		// The web omits it and inherits the default: Start run stays one click (the user
+		// ruled against a start-run modal on 2026-07-27), and the optional Run options
+		// dialog (PRD #3250) carries harness, token, model and effort, not wait-on-limit.
+		// The per-run toggle is PUT /api/runs/{id}/wait-on-limit.
 		WaitOnLimit *bool `json:"wait_on_limit"`
 		// PRD #841 M2: the per-run MR-rework override for CLI and API callers. A POINTER
 		// so "the caller said false" and "the caller said nothing" stay distinct — nil
 		// leaves the run inheriting the owner default live (D1), true/false stamp an
-		// explicit override. The web start button omits it; the per-run toggle is
-		// PUT /api/runs/{id}/mr-rework.
+		// explicit override. The web omits it: Start run stays one click, and the optional
+		// Run options dialog (PRD #3250) carries harness, token, model and effort, not MR
+		// rework. The per-run toggle is PUT /api/runs/{id}/mr-rework.
 		MrReworkEnabled *bool `json:"mr_rework_enabled"`
 		// PRD #209 seeded plan: an externally-authored plan and its optional agent
 		// roster. A POINTER so absence (an ordinary run planned from the issue) stays
@@ -101,6 +106,11 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 		// implicit D11 resolution. An invalid enum is a 400. The web start dialog picker is M4a and
 		// the `uzi run create --harness` flag is M5; this handler accepts the field now.
 		Harness string `json:"harness"`
+		// PRD #3250: the optional start-time model and reasoning effort. POINTERS so an absent
+		// key stays distinct from a present one; unlike every other surface the values are NOT
+		// trimmed (see validateRunStartOptions). Only this handler can produce a run_override.
+		Model  *string `json:"model"`
+		Effort *string `json:"effort"`
 	}
 	if err := httpx.DecodeJSON(r, &req); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
@@ -171,15 +181,68 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 		rawOverride = &workersvc.RawCredentialOverride{Mode: req.CredentialOverride.Mode, SecretID: secretID}
 	}
 
+	// PRD #3250: shape-check the start-time model/effort before any forge read (after the
+	// credential-override parse above, so its malformed-secret_id 400 keeps precedence), then fast-fail an
+	// explicit harness that cannot serve the model (D11 cannot fall back from an explicit one). The
+	// authoritative check, on the harness the create resolves to, runs inside the create transaction.
+	if msg := validateRunStartOptions(req.Model, req.Effort); msg != "" {
+		httpx.Error(w, http.StatusBadRequest, msg)
+		return
+	}
+	if req.Model != nil && explicit != nil && !workersvc.RunOverrideModelHonorable(*explicit, *req.Model) {
+		h.writeModelIncompatible(w, &workersvc.ModelIncompatibleError{Model: *req.Model, Harness: *explicit})
+		return
+	}
+
 	// The forge GetIssue snapshot, the uzi-label eligibility gate and the description
 	// cap all live inside StartRunForUser (PRD #191 M1), shared with the Slack/web chat
 	// start-run card.
-	run, err := h.wsvc.StartRunForUser(r.Context(), user.ID, repo.ID, req.IssueIID, req.WaitOnLimit, req.MrReworkEnabled, req.Force, seed, requested, explicit, rawOverride)
+	run, err := h.wsvc.StartRunForUser(r.Context(), user.ID, repo.ID, req.IssueIID, req.WaitOnLimit, req.MrReworkEnabled, req.Force, seed, requested, explicit, rawOverride, req.Model, req.Effort)
 	if err != nil {
 		h.writeStartRunError(w, r, err)
 		return
 	}
 	httpx.JSON(w, http.StatusCreated, h.createdRunBody(r.Context(), runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues)))
+}
+
+// validateRunStartOptions is the pure shape step for the start-time model and effort (PRD #3250).
+// Inputs are NOT trimmed: a present value is refused if empty, if it contains any whitespace
+// (leading, trailing or interior), or if agenttmpl's validators reject the exact string. The
+// validators trim, so a changed result also means whitespace. It returns the 400 message, or ""
+// when both are well formed. Every other surface keeps trim-then-blank.
+func validateRunStartOptions(model, effort *string) string {
+	if model != nil {
+		const blank = "model must not contain whitespace; omit it to use your default"
+		if *model == "" || strings.IndexFunc(*model, unicode.IsSpace) >= 0 {
+			return blank
+		}
+		m, err := agenttmpl.ValidateModel(*model)
+		if err != nil {
+			return err.Error()
+		}
+		if m != *model {
+			return blank
+		}
+	}
+	if effort != nil {
+		const bad = "effort must be one of low, medium, high, xhigh, max"
+		e, err := agenttmpl.ValidateEffort(*effort)
+		if err != nil || e == "" || e != *effort {
+			return bad
+		}
+	}
+	return ""
+}
+
+// writeModelIncompatible writes the 422 for a run_override model the run's harness cannot serve,
+// following the issue_has_open_mr / no_credential_for_harness precedent: a stable code and the
+// resolved harness beside the complete, surface-neutral error text.
+func (h *Handler) writeModelIncompatible(w http.ResponseWriter, e *workersvc.ModelIncompatibleError) {
+	httpx.JSON(w, http.StatusUnprocessableEntity, map[string]any{
+		"error":   e.Error(),
+		"code":    "model_incompatible_with_harness",
+		"harness": string(e.Harness),
+	})
 }
 
 // parseHarnessParam parses the optional public harness enum (PRD #1429 M2, D2), shared by the
@@ -399,6 +462,17 @@ func (h *Handler) writeStartRunError(w http.ResponseWriter, r *http.Request, err
 	case errors.Is(err, workersvc.ErrBranchInUse):
 		// Issue #1626: an active ci_fix OR mr_rework on agent/issue-<iid> holds the branch.
 		httpx.Error(w, http.StatusConflict, "a CI-fix or MR-rework run is already working this issue's branch; cancel it before starting an issue run")
+	case errors.Is(err, workersvc.ErrInvalidRunEffort):
+		httpx.Error(w, http.StatusBadRequest, "effort must be one of low, medium, high, xhigh, max")
+	case errors.Is(err, workersvc.ErrModelIncompatibleWithHarness):
+		// PRD #3250: the run's resolved harness cannot serve the chosen run_override model.
+		var mie *workersvc.ModelIncompatibleError
+		if errors.As(err, &mie) {
+			h.writeModelIncompatible(w, mie)
+			return
+		}
+		slog.Error("start run: model incompatibility without detail", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
 	case errors.Is(err, workersvc.ErrHarnessCredentialDisabled):
 		// PRD #1732 D15: an explicit harness whose credentials are all disabled. Still the
 		// stable no_credential_for_harness refusal (no run, no fallback), naming Settings.
@@ -433,6 +507,40 @@ func (h *Handler) writeStartRunError(w http.ResponseWriter, r *http.Request, err
 		slog.Error("start run", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 	}
+}
+
+// detailCrossCheckActive reuses the live probes mirrored by the list query. It is
+// called only after GetRun's viewer gate, so the unscoped probes disclose nothing.
+func (h *Handler) detailCrossCheckActive(ctx context.Context, run store.Run) (*string, error) {
+	if h.q == nil { // unit handlers without a store have no live-check rows to read
+		return nil, nil
+	}
+	if run.Status != "claimed" && run.Status != "running" {
+		return nil, nil
+	}
+	if runkind.PlanCrossCheckable(run.Kind) && (run.PlanCrossCheckRequired || run.PlanCrossCheckGated) {
+		plan, err := h.q.HasLivePlanCrossCheck(ctx, run.ID)
+		if err != nil {
+			return nil, err
+		}
+		if plan {
+			return crossCheckActive(true, false), nil
+		}
+	}
+	if run.Status != "running" || !run.CodeCrossCheckRequired || run.ReportOnly {
+		return nil, nil
+	}
+	_, err := h.q.GetLiveCodeCrossCheckDeadline(ctx, store.GetLiveCodeCrossCheckDeadlineParams{
+		LeadRunID: run.ID,
+		ServerNow: pgtype.Timestamptz{Time: h.clock(), Valid: true},
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return crossCheckActive(false, true), nil
 }
 
 // GetRun returns one run visible to the viewer (owner, or any run for an admin).
@@ -514,6 +622,14 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 		applyRevising(&dto, revising[run.ID])
 	}
 	h.overlayPlanCrossCheckSummary(r.Context(), user.ID, run, &dto)
+	// The detail read needs the same live presence signal as the run lists. Reuse the
+	// health probes that the list SQL mirrors, after the viewer gate above, so direct
+	// TUI entry and its metadata refresh do not depend on an older board row.
+	if active, activeErr := h.detailCrossCheckActive(r.Context(), run); activeErr != nil {
+		slog.Error("get run cross-check state", "run_id", run.ID, "error", activeErr)
+	} else {
+		dto.CrossCheckActive = active
+	}
 	// PRD #1064 M2: the server-derived "now" line. runToDTO stays pure, so the field is
 	// set here in the caller from the batched lookup (one run this time). null for a
 	// terminal run (no "now") and, via the batched query, for a run with no tool_use

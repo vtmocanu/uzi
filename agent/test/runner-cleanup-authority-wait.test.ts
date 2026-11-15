@@ -425,7 +425,10 @@ describe("runner.ts: which sites use the cleanup wait", () => {
     assert.ok(!restore.includes("this.cleanupAuthorityWait("), "the restore seed has no cleanup wait");
     // issue #4258: the mid-run remediation seam derives its restriction-write wait from the flight lifecycle wait,
     // adding only the seam's own abort signal, so it stays in the live-flight class and never uses the cleanup wait.
-    const seamWait = statement(source.indexOf("wait: { ...this.authorityWait(flight), signal: AbortSignal.any(["));
+    // issue #4313: the same single wait now lives in withOwnedRemediationScope, shared by the mid-run seam and
+    // the terminal gate (which swaps the lifecycle signal for its own stop signals), so the needle is the
+    // multi-line form of the same spread.
+    const seamWait = statement(source.indexOf("wait: {\n        ...this.authorityWait(flight),"));
     assert.ok(seamWait.includes("this.retainedLifecycleSignal(flight)"), seamWait);
     assert.equal(starts("this.authorityWait(").length, 18, "live source, remediation, existing admission, the two restore-seed waits and the mid-run seam wait remain enumerated");
   });

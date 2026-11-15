@@ -174,6 +174,21 @@ export type SecretRemediationDecision =
   | { action: "remediate"; followUp: string }
   | { action: "fail" };
 
+/**
+ * Issue #4313: thrown by `RunContext.secretRemediationGate` when a cancel, claim fence, terminal
+ * lifecycle fence, graceful worker shutdown or disk stop stopped the gate before it reached a decision.
+ * It is not a decision: none is returned, no attempt is spent and nothing is emitted. State the gate already
+ * wrote before the stop (restriction and scan records, in-memory known/everKnown/withholdPaths) and any
+ * negative knowledge it records on stopping (a latched trusted finding set) remain. The executor
+ * routes the control that caused it (terminal, cancel, disk park, or a cancel when none is visible).
+ */
+export class SecretRemediationStoppedError extends Error {
+  constructor() {
+    super("secret remediation gate stopped before a decision");
+    this.name = "SecretRemediationStoppedError";
+  }
+}
+
 /** Marks only the exhausted revision's owner-event wait, excluding recovery work. */
 export type PlanRevisionOwnerWaitObserver = (waiting: boolean) => void;
 

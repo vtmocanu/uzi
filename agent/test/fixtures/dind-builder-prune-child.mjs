@@ -20,9 +20,30 @@
 // {"child":pid,"grandchild":pid} to <stateFile> once the grandchild exists.
 
 import { spawn } from "node:child_process";
-import { appendFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, openSync, renameSync, writeFileSync } from "node:fs";
 
 const [mode, stateFile] = process.argv.slice(2);
+// The tests poll for the state file's existence and then parse it, so it must appear
+// complete: write a sibling temp file and rename it into place (atomic on one filesystem).
+// DIND_PRUNE_FIXTURE_STATE_GATE=<path> (tests only) holds the write between creating and
+// filling the file: it touches <path>.opened, then waits for <path>.release (30 s cap).
+const stateGate = process.env.DIND_PRUNE_FIXTURE_STATE_GATE;
+const sleepSync = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+const writeState = (value) => {
+  const tmp = `${stateFile}.tmp-${process.pid}`;
+  const fd = openSync(tmp, "wx");
+  try {
+    if (stateGate) {
+      writeFileSync(`${stateGate}.opened`, "");
+      const deadline = Date.now() + 30_000;
+      while (!existsSync(`${stateGate}.release`) && Date.now() < deadline) sleepSync(10);
+    }
+    writeFileSync(fd, JSON.stringify(value));
+  } finally {
+    closeSync(fd);
+  }
+  renameSync(tmp, stateFile);
+};
 if (stateFile) appendFileSync(`${stateFile}.spawns`, `${mode}\n`);
 
 const forever = () => setInterval(() => {}, 1000);
@@ -50,19 +71,19 @@ switch (mode) {
     process.exitCode = 1;
     break;
   case "env":
-    writeFileSync(stateFile, JSON.stringify(process.env));
+    writeState(process.env);
     break;
   case "sleep":
   case "daemon-then-sleep":
   case "escape": {
     if (mode === "daemon-then-sleep") process.stderr.write("Error response from daemon: boom\n");
     const grandchild = holder(mode === "escape");
-    writeFileSync(stateFile, JSON.stringify({ child: process.pid, grandchild: grandchild.pid }));
+    writeState({ child: process.pid, grandchild: grandchild.pid });
     forever();
     break;
   }
   case "overflow": {
-    writeFileSync(stateFile, JSON.stringify({ child: process.pid }));
+    writeState({ child: process.pid });
     const chunk = Buffer.alloc(64 * 1024, 120);
     for (let i = 0; i < 16; i++) process.stdout.write(chunk);
     forever();

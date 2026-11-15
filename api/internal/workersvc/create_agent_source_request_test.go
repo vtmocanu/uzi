@@ -12,7 +12,7 @@ func TestCreateRunExplicitAgentSourceParams(t *testing.T) {
 	for _, source := range []string{AgentSourceOwn, AgentSourceRepo} {
 		fs := seededIssueStore()
 		svc := New(fs, newBox(t), testParams())
-		if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "desc", nil, nil, false, nil, &AgentSelection{Source: source}, nil, nil); err != nil {
+		if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "desc", nil, nil, false, nil, &AgentSelection{Source: source}, nil, nil, nil, nil); err != nil {
 			t.Fatalf("CreateRun(%s): %v", source, err)
 		}
 		p := fs.createRunParams
@@ -31,7 +31,7 @@ func TestCreateRunExplicitAgentSourceParams(t *testing.T) {
 func TestCreateRunWithoutRequestPassesNoExplicitSource(t *testing.T) {
 	fs := seededIssueStore()
 	svc := New(fs, newBox(t), testParams())
-	if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "desc", nil, nil, false, nil, nil, nil, nil); err != nil {
+	if _, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "desc", nil, nil, false, nil, nil, nil, nil, nil, nil); err != nil {
 		t.Fatalf("CreateRun: %v", err)
 	}
 	if p := fs.createRunParams; p == nil || p.AgentSourceRequested.Valid {
@@ -55,7 +55,7 @@ func TestCreateRunExplicitAgentSourceRefusals(t *testing.T) {
 			fs := seededIssueStore()
 			svc := New(fs, newBox(t), testParams())
 			requested := tc.requested
-			_, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "desc", nil, nil, false, tc.seed, &requested, nil, nil)
+			_, err := svc.CreateRun(context.Background(), uuid.New(), uuid.New(), 4, "desc", nil, nil, false, tc.seed, &requested, nil, nil, nil, nil)
 			if !errors.Is(err, tc.want) {
 				t.Fatalf("err = %v, want %v", err, tc.want)
 			}

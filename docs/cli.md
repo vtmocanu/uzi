@@ -149,6 +149,7 @@ uzi run create --repo <id> --issue <iid> [--plan-file <path>]
                 [--agent-source own|repo] [--exclude-agents a,b]
                 [--planned-commit <sha>] [--require-base] [--force]
                 [--harness claude|codex]
+                [--model <id>] [--effort low|medium|high|xhigh|max]
 uzi run approve <id> [--agent-source own|repo] [--exclude-agents a,b]
                 [--override-capabilities]
                 [--expected-gate-revision <n>]
@@ -368,6 +369,23 @@ A few worth knowing:
   choice is `"agent_selection": {"source": "own"|"repo"}` on
   `POST /api/repos/{id}/runs` without `plan_md`; non-empty `exclusions`
   without `plan_md` returns 400 `exclusions require a plan file or an approval`.
+- **`run create --model <id>` and `--effort <level>` choose this run's model
+  and reasoning effort.** Each is sent only when you pass it, verbatim, and is
+  frozen onto the run, beating your Settings default for the run's lead;
+  omit them and nothing changes.
+  `--model` must be a single token without whitespace, and `--effort` one of
+  `low`, `medium`, `high`, `xhigh` or `max`; anything else is a usage error
+  (exit 2) before any request. Whether the model fits the run's harness is
+  the server's call: an incompatible pair (for example a Claude alias on a
+  Codex run) is refused with 422 `model_incompatible_with_harness` and the
+  CLI prints the server's message, creating no run. A `--model` also opts the
+  run out of the automatic harness choice; `--effort` alone does not. See
+  [Worker model](worker-model.md#a-model-chosen-when-starting-a-run) and
+  [Reasoning effort](worker-effort.md#a-run-level-effort). Over the API the
+  same choice is optional `"model"` and `"effort"` strings on
+  `POST /api/repos/{id}/runs`. `run get` shows the choice with the source
+  "this run" (`--json`: `model_source` / `effort_source` `run_override`,
+  `effort`).
 - **`run create --force` re-runs an issue that already has an open MR.** By
   default, creating a run for an issue whose last completed run still owns an
   open MR is refused (a 409, exit 5) — re-running would spend budget building
@@ -2313,6 +2331,16 @@ completed, failed, or cancelled run. The floor run summary (cost, count, and
 visible row range) sits right-aligned with the account meters, or on its own
 line when space is insufficient.
 
+The floor state word distinguishes `checking`, `reworking`, `compl blocked`,
+`xchecking`, and plan-gate cross-check outcomes (`xchk revise`, `xchk blocked`,
+`xchk n/a`). Each has a one-cell glyph and a word, so the meaning survives
+`NO_COLOR`. A run's detail names its completion phase and any live plan or
+advisory code cross-check on separate lines; `uzi run get` prints a
+`CROSS_CHECK` row while either check is live. The detail read refreshes this
+presence from the server rather than keeping a board snapshot. A held
+completion-blocked run appears under NEEDS YOU and has its own `‖ N` count in
+the floor summary, since it needs an owner decision.
+
 The floor summary, workers list and worker detail share one request chain,
 polling every 5s while any is visible, including an unfocused top pane.
 Failures back off to at most 60s and keep the last snapshot. Polling pauses
@@ -4045,6 +4073,12 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   `HOLD` row reading `repo agents unreadable`; resume the run with
   `uzi run resume <id>` once the repository can be fetched, or cancel it. See
   [Repo agents](repo-agents.md#which-revision-is-read).
+  A `paused` run can also be **held because its chosen model or effort cannot
+  run on its harness** (`hold_reason: run_override_unavailable`): `run get`
+  prints a `HOLD` row reading `model choice unavailable`, and `run wait` and
+  `run logs --follow` print a notice naming the hold. `uzi run resume <id>` retries only
+  if the choice has become available on that harness; otherwise cancel the run
+  (`uzi run cancel <id>`) and start a new run with a different choice.
 
 For an ordinary pause, human `run get` makes one supplemental message read
 (`tail=100`). Its pause detail reads **paused by the run's lead** for
@@ -4389,7 +4423,8 @@ except a default wait also stops at `recovery_wait` with cause
 `retained_recovery_adoption_failed`, `retained_continuation_unwitnessed`, or
 owner-held `retained_recovery_exhausted` or `codex_idle_stall` (NULL retry), `anthropic_spend_limit` (an
 Anthropic API spend-limit hold, Resume, Switch token or Cancel), and at a `paused` run held on
-`base_attestation_missing`, for an owner decision:
+`base_attestation_missing`, `run_override_unavailable` or a credential-switch
+hold, for an owner decision:
 timed limit and recovery waits retry on a timer, pool waits need an available pooled token,
 and ordinary owner or lead pauses need `uzi run resume`. A bare `run wait` means
 "wait for the plan gate, a clarification, an interactive task's park,

@@ -2145,6 +2145,55 @@ describe("RunView — paused header: Resume + pending-pause chip (PRD #1190)", (
     expect(screen.queryByRole("heading", { name: "Completion state" })).toBeNull();
   });
 
+  // Issue #3250: the run's chosen model or effort cannot run on its harness. A non-completion
+  // owner hold: its own pill text and announcement, no Completion state panel, and the generic
+  // owner Resume (the retry) is offered.
+  it("a run-override hold renders its own hold text, not a completion panel, and offers owner Resume", async () => {
+    const { refreshRun } = renderPage({ ...PAUSED, hold_reason: "run_override_unavailable" }, true);
+    await screen.findByText("Add rate limiting");
+    expect(screen.getAllByText("model choice unavailable: owner hold").length).toBeGreaterThan(0);
+    expect(screen.queryByRole("heading", { name: "Completion state" })).toBeNull();
+    expect(screen.queryByText("Completion blocked")).toBeNull();
+    expect(screen.getAllByText(/cannot run on its harness/i).length).toBeGreaterThan(0);
+    const resume = screen.getAllByRole("button", { name: /resume/i });
+    expect(resume.length).toBeGreaterThan(0);
+    await act(async () => { fireEvent.click(resume[0]); });
+    await waitFor(() => expect(mockApi.resumeRun).toHaveBeenCalledWith("r1"));
+    await waitFor(() => expect(refreshRun).toHaveBeenCalled());
+  });
+
+  // Issue #3250 review: the hold has its own VISIBLE panel; the sr-only announcement is not the text.
+  it("a run-override hold shows a visible panel with Resume and Cancel, and no Stop or 'session continues' text", async () => {
+    const { refreshRun, submit, container } = renderPage({ ...PAUSED, hold_reason: "run_override_unavailable" }, true);
+    const heading = await screen.findByRole("heading", { name: "Model choice unavailable: waiting for owner" });
+    const panel = within(heading.parentElement!);
+    expect(panel.getByText(/cannot run on this harness/i)).toBeTruthy();
+    expect(panel.getByText(/Resume retries only if the choice has become available on that harness/i)).toBeTruthy();
+    expect(panel.getByText(/start a new run with a different choice/i)).toBeTruthy();
+    expect(panel.getByRole("button", { name: "Resume" })).toBeTruthy();
+    expect(panel.getByRole("button", { name: "Cancel" })).toBeTruthy();
+    expect(screen.getAllByRole("button", { name: /resume/i })).toHaveLength(1);
+    // The page-wide steer card keeps its own Stop run; the hold panel itself offers none.
+    expect(panel.queryByRole("button", { name: /stop/i })).toBeNull();
+    // Visible text only: the sr-only announcement region is excluded.
+    const visible = Array.from(container.querySelectorAll("*"))
+      .filter((el) => !el.closest(".sr-only") && el.children.length === 0)
+      .map((el) => el.textContent ?? "").join(" ");
+    expect(visible).not.toMatch(/session continues/i);
+    await act(async () => { fireEvent.click(panel.getByRole("button", { name: "Resume" })); });
+    await waitFor(() => expect(mockApi.resumeRun).toHaveBeenCalledWith("r1"));
+    await waitFor(() => expect(refreshRun).toHaveBeenCalled());
+    await act(async () => { fireEvent.click(panel.getByRole("button", { name: "Cancel" })); });
+    await waitFor(() => expect(submit).toHaveBeenCalledWith("cancel", "", undefined, undefined, false));
+  });
+
+  it("a run-override hold gives non-owners no Resume or Cancel controls", async () => {
+    renderPage({ ...PAUSED, hold_reason: "run_override_unavailable" }, false);
+    const heading = await screen.findByRole("heading", { name: "Model choice unavailable: waiting for owner" });
+    expect(within(heading.parentElement!).queryByRole("button")).toBeNull();
+    expect(screen.queryByRole("button", { name: /resume/i })).toBeNull();
+  });
+
   it("clicking Resume calls api.resumeRun(id) then refreshRun", async () => {
     const { refreshRun } = renderPage(PAUSED, true);
     await screen.findByText("Add rate limiting");
@@ -6536,6 +6585,41 @@ describe("ProgressCountCard (done / in-progress / left, PRD #122)", () => {
 });
 
 describe("CompletionStatePanel — honest completion-interlock detail (PRD #1226 M5, D8)", () => {
+  // Issue #3250: the non-completion hold set must not change what the panel did for each
+  // pre-existing reason. The old sites disagreed on membership (an early return for two reasons,
+  // a "held" deny-list for five plus the paused-only token-switch holds), so pin each outcome.
+  it.each([
+    ["provider_unavailable", false],
+    ["iteration_budget_exhausted", false],
+    ["codex_policy_hold", false],
+    ["credential_disabled", true],
+    ["credentials_reset", true],
+    ["base_attestation_missing", true],
+    ["repo_agent_source_unavailable", true],
+    ["credential_switch_settling", true],
+    ["credential_switch_unsettled", true],
+    ["run_override_unavailable", false],
+  ] as const)("a paused run held on %s with a live completion phase shows the panel: %s", (hold, shown) => {
+    const { container } = render(<CompletionStatePanel run={run({ status: "paused", completion_phase: "checking", hold_reason: hold })} />);
+    expect(container.textContent?.includes("Completion state") ?? false).toBe(shown);
+  });
+
+  it.each([
+    ["provider_unavailable", false],
+    ["iteration_budget_exhausted", true],
+    ["codex_policy_hold", true],
+    ["credential_disabled", false],
+    ["credentials_reset", false],
+    ["base_attestation_missing", false],
+    ["repo_agent_source_unavailable", false],
+    ["credential_switch_settling", true],
+    ["credential_switch_unsettled", true],
+    ["run_override_unavailable", false],
+  ] as const)("a retained %s marker on a non-paused run with no phase shows the panel: %s", (hold, shown) => {
+    const { container } = render(<CompletionStatePanel run={run({ status: "queued", completion_phase: "", hold_reason: hold })} />);
+    expect(container.textContent?.includes("Completion state") ?? false).toBe(shown);
+  });
+
   it("renders unmet ids, the attempt count, and the same-worker-only hold context when blocked", () => {
     const { container } = render(
       <CompletionStatePanel

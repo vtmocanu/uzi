@@ -403,6 +403,60 @@ type runToken struct {
 	color color.Color
 }
 
+// checkRunState is the fixed display vocabulary added for the Overview's completion and
+// cross-check phases. The run's server-computed fields are the source of truth; the same
+// token feeds the board filter, row and detail header. Existing stop and health states win.
+func checkRunState(r apitypes.RunDTO, isRevising bool) (glyph, word, tone string) {
+	if runpresentation.HumanStopReason(r.Status, strOr(r.StopKind, "")) != "" ||
+		(r.Status != statusRecoveryWait && stalledHealth[r.Health]) ||
+		(r.Health == "waiting_account_cooldown" &&
+			(r.Status == "claimed" || r.Status == "running" || r.Status == "awaiting_approval")) {
+		return "", "", ""
+	}
+	if r.Status == "awaiting_approval" && !isRevising && (r.PlanCrossCheckRequired || r.PlanCrossCheckGated) && r.PlanCrossCheckGateReason != nil && *r.PlanCrossCheckGateReason != "" {
+		switch *r.PlanCrossCheckGateReason {
+		case "revise", "revisions_exhausted":
+			return "⚑", "xchk revise", "warn"
+		case "block":
+			return "⚑", "xchk blocked", "danger"
+		default:
+			return "⚑", "xchk n/a", "warn"
+		}
+	}
+	if isCompletionBlockedTUI(r) {
+		return "‖", "compl blocked", "danger"
+	}
+	if r.Status == "running" {
+		switch r.CompletionPhase {
+		case "checking":
+			return "◎", "checking", "check"
+		case "reworking":
+			return "⊕", "reworking", "warn"
+		}
+	}
+	if (r.Status == "claimed" || r.Status == "running") && r.CrossCheckActive != nil {
+		if *r.CrossCheckActive == "plan" || *r.CrossCheckActive == "code" {
+			return "◈", "xchecking", "check"
+		}
+	}
+	return "", "", ""
+}
+
+func (p palette) checkRunStateToken(r apitypes.RunDTO, isRevising bool) (runToken, bool) {
+	glyph, word, tone := checkRunState(r, isRevising)
+	if word == "" {
+		return runToken{}, false
+	}
+	color := p.indigo
+	switch tone {
+	case "warn":
+		color = p.amber
+	case "danger":
+		color = p.alarm
+	}
+	return runToken{glyph: glyph, word: word, color: color}, true
+}
+
 // stateToken shares a run's glyph, colour and compact word across the board row,
 // board strip and detail header. detailHeaderLines expands human stops to their full
 // HumanStopLabel while retaining the shared glyph and colour.
@@ -499,6 +553,9 @@ func (p palette) runStateToken(r apitypes.RunDTO, isRevising bool) runToken {
 	}
 	if isCredentialSwitchUnsettledHold(r) {
 		return runToken{glyph: credSwitchGlyph, word: credSwitchUnsettledWord, color: p.amber}
+	}
+	if token, ok := p.checkRunStateToken(r, isRevising); ok {
+		return token
 	}
 	return p.stateToken(r.Status, r.Health, r.IsPlanning, isRevising, r.LandingState, strOr(r.StopKind, ""), strOr(r.RecoveryWaitCause, ""))
 }
