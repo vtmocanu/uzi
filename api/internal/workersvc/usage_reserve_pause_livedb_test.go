@@ -35,7 +35,7 @@ type pauseRun struct {
 
 func (fx *reserveFix) pauseRun(o pauseRun) uuid.UUID {
 	fx.t.Helper()
-	id := uuid.New()
+	id := fx.newRunID()
 	status, kind := o.status, o.kind
 	if status == "" {
 		status = "running"
@@ -43,7 +43,7 @@ func (fx *reserveFix) pauseRun(o pauseRun) uuid.UUID {
 	if kind == "" {
 		kind = "issue"
 	}
-	iid := 5000 + int64(id[0])*256 + int64(id[1])
+	iid := fx.nextIssueIID()
 	worker := fx.workerID
 	if o.worker != nil {
 		worker = *o.worker
@@ -764,4 +764,46 @@ func TestReservePauseUsesCodexAliasForCodexRunsLiveDB(t *testing.T) {
 			t.Fatalf("%s: a pause was requested", name)
 		}
 	}
+}
+
+// Seeded runs once derived issue_iid from their id's first two bytes (3000+ in queueRun, 5000+ in
+// pauseRun), so two non-terminal runs could collide on uq_runs_one_active_per_issue (#4357, seen
+// on PR #4353's CI). The fixture now numbers issues itself with one counter shared by both helpers.
+func TestReserveFixtureIssueIIDsIgnoreRunIDBytesLiveDB(t *testing.T) {
+	// pinned feeds the fixture fresh random ids whose first two bytes are fixed, so the old
+	// derivation collides deterministically while every id stays unique across runs of the
+	// shared LiveDB database.
+	pinned := func(fx *reserveFix, prefixes ...[2]byte) {
+		fx.newRunID = func() uuid.UUID {
+			id := uuid.New()
+			id[0], id[1] = prefixes[0][0], prefixes[0][1]
+			prefixes = prefixes[1:]
+			return id
+		}
+	}
+	seeded := func(t *testing.T, fx *reserveFix, ids ...uuid.UUID) {
+		t.Helper()
+		for _, id := range ids {
+			if mustRun(t, fx.env, id).Status == "" {
+				t.Fatalf("run %s was not seeded", id)
+			}
+		}
+	}
+	t.Run("two pause runs sharing their first two id bytes", func(t *testing.T) {
+		fx := newReserveFix(t, 70, true)
+		tok := fx.token("only", true, false, 90)
+		pinned(fx, [2]byte{0xab, 0xcd}, [2]byte{0xab, 0xcd})
+		a := fx.pauseRun(pauseRun{cred: &tok, status: "paused"})
+		b := fx.pauseRun(pauseRun{cred: &tok, status: "paused"})
+		seeded(t, fx, a, b)
+	})
+	t.Run("a queued run and a pause run whose old offsets met", func(t *testing.T) {
+		fx := newReserveFix(t, 70, true)
+		tok := fx.token("only", true, false, 90)
+		// 0x07d0 = 2000: the old queueRun gave 3000+2000, the old pauseRun 5000+0.
+		pinned(fx, [2]byte{0x07, 0xd0}, [2]byte{0x00, 0x00})
+		q := fx.queueRun(reserveRun{})
+		p := fx.pauseRun(pauseRun{cred: &tok, status: "paused"})
+		seeded(t, fx, q, p)
+	})
 }
