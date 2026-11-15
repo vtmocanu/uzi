@@ -32287,7 +32287,16 @@ describe("M2 actualRunner credential replacement", () => {
   for (const [oldClaim, target] of [[SUBSCRIPTION, API_KEY], [API_KEY, SUBSCRIPTION],
     [SUBSCRIPTION, { ...SUBSCRIPTION, generation: 20, chatgpt_account_id: "M2-B-account" }]] as const) {
     for (const phase of ["factory", "already-running-body"] as const) {
-      it(`M2 actualRunner ${oldClaim.auth_mode} to ${target.auth_mode} ${phase} account resumes saved thread`, async () => {
+      for (const publication of ["baseline", "gated", "publish-failure", "now-publish-failure", "login-failure", "subscription-refresh", "api-key-refresh"] as const) {
+        if (publication !== "baseline" && (phase !== "factory" || (oldClaim !== API_KEY && target !== API_KEY))) continue;
+        if (publication === "subscription-refresh" && target.auth_mode !== "subscription") continue;
+        if (publication === "api-key-refresh" && target.auth_mode !== "api_key") continue;
+      it(publication === "baseline"
+        ? `M2 actualRunner ${oldClaim.auth_mode} to ${target.auth_mode} ${phase} account resumes saved thread`
+        : publication === "gated" ? `Codex ${oldClaim.auth_mode} to ${target.auth_mode} publication gates Now and retired A consumers`
+        : publication === "subscription-refresh" ? "Codex subscription startup refresh stays deferred until B finish"
+        : publication === "api-key-refresh" ? "Codex API-key B refuses subscription refresh and retains the workspace"
+        : `Codex ${oldClaim.auth_mode} to ${target.auth_mode} partial B publication never reopens A (${publication})`, async () => {
         const { api, client } = m2Runner;
         const next = { ...target, access_token: "M2-B-access", capability: "M2-B-capability" } as import("../src/protocol.js").ClaimCodexSecrets;
         if ("chatgpt_account_id" in oldClaim && next.auth_mode === "subscription")
@@ -32343,6 +32352,17 @@ describe("M2 actualRunner credential replacement", () => {
         await fs.writeFile(path.join(source, "unapproved.txt"), "not a session");
         await CodexSessionStore.persist(source, store);
         const aEntered = installerBarrier(), bEntered = installerBarrier();
+        const publicationStages = ["before-publish", "after-publish", "before-prepare", "login", "prepared"] as const;
+        const publicationBarriers = publicationStages.map(stage => ({ stage, entered: installerBarrier(), proceed: installerBarrier() }));
+        const publicationBoundary = async (stage: typeof publicationStages[number]) => {
+          if (publication === "baseline") return;
+          const barrier = publicationBarriers.find(candidate => candidate.stage === stage)!;
+          barrier.entered.resolve();
+          await barrier.proceed.promise;
+          if ((publication === "publish-failure" && stage === "after-publish") ||
+              (publication === "login-failure" && stage === "login"))
+            throw new Error(`injected ${stage} failure`);
+        };
         const cleanupEntered = installerBarrier(), cleanupContinue = installerBarrier();
         const events: string[] = [];
         let cleanupStarts = 0;
@@ -32419,10 +32439,20 @@ describe("M2 actualRunner credential replacement", () => {
         rig.client.releaseCodex = async (id, req) => req.capability === next.capability
           ? { access_token: next.access_token } : release(id, req);
         const refresh = rig.client.refreshCodex.bind(rig.client);
-        rig.client.refreshCodex = async (id, req) => req.capability === next.capability
-          ? { access_token: next.access_token, generation: req.observed_generation + 1,
-            chatgpt_account_id: next.auth_mode === "subscription" ? next.chatgpt_account_id : "unused-api-key-account", outcome: "advanced" }
-          : refresh(id, req);
+        let ordinaryBRefreshes = 0, refreshDeliveries = 0, bFinished = false;
+        const refreshDelivered = installerBarrier(), refreshResponded = installerBarrier();
+        const respond = b.transport.respond.bind(b.transport);
+        b.transport.respond = (id, response) => {
+          respond(id, response);
+          if (id === 91) refreshResponded.resolve();
+        };
+        rig.client.refreshCodex = async (id, req) => {
+          if (req.capability !== next.capability) return refresh(id, req);
+          ordinaryBRefreshes++;
+          assert.equal(bFinished, true, "ordinary B refresh requires full initialization and finishB reopen");
+          return { access_token: next.access_token, generation: req.observed_generation + 1,
+            chatgpt_account_id: next.auth_mode === "subscription" ? next.chatgpt_account_id : "unused-api-key-account", outcome: "advanced" };
+        };
         const request = b.transport.request.bind(b.transport);
         const loginObservations: { params: Record<string, unknown>; reaped: boolean; effectDisposed: boolean; fileopDisposed: number }[] = [];
         const resumedThreads: unknown[] = [];
@@ -32431,11 +32461,51 @@ describe("M2 actualRunner credential replacement", () => {
           if (method === "account/login/start") {
             loginObservations.push({ params: rec(params), reaped: events.includes("A-reaped"),
               effectDisposed: events.includes("A-effect-disposed"), fileopDisposed: fileops[0]!.disposed() });
+            await publicationBoundary("login");
           }
           if (method === "thread/resume") resumedThreads.push(rec(params).threadId);
           return request(method, params, opts);
         };
         const executor = makeExecutor(rig, bindingOf(oldClaim), noopLog, undefined, provider, m2Runner.homeDir);
+        let reopenAttempts = 0;
+        const suspend = executor.suspendCodexEpoch.bind(executor);
+        executor.suspendCodexEpoch = async bounds => {
+          const lease = await suspend(bounds);
+          return { ...lease,
+            reopenA: async nextBounds => { reopenAttempts++; return lease.reopenA(nextBounds); },
+            publishB: async (...args) => {
+              await publicationBoundary("before-publish");
+              await lease.publishB(...args);
+              await publicationBoundary("after-publish");
+            },
+            restartAndResume: async (...args) => {
+              await publicationBoundary("before-prepare");
+              const result = await lease.restartAndResume(...args);
+              await publicationBoundary("prepared");
+              return result;
+            },
+            finishB: async (...args) => {
+              assert.equal(ordinaryBRefreshes, 0, "no ordinary refresh before finishB");
+              if (publication === "subscription-refresh") {
+                await withTimeout(refreshDelivered.promise, 5000, "B startup refresh delivered to auth owner");
+                assert.equal(refreshDeliveries, 1);
+                assert.equal(b.transport.responses.some(response => response.requestId === 91), false,
+                  "startup refresh remains deferred through full B preparation");
+              }
+              await lease.finishB(...args);
+              bFinished = true;
+              if (publication === "subscription-refresh") {
+                await withTimeout(refreshResponded.promise, 5000, "deferred B refresh settlement after finish");
+                const replies = b.transport.responses.filter(response => response.requestId === 91);
+                assert.equal(replies.length, 1);
+                assert.deepEqual(replies[0]!.response, { result: { accessToken: next.access_token,
+                  chatgptAccountId: next.auth_mode === "subscription" ? next.chatgpt_account_id : "unused-api-key-account",
+                  chatgptPlanType: null } });
+                assert.equal(ordinaryBRefreshes, 1, "delivered deferred request actually reaches B refresh bridge");
+              }
+            },
+          };
+        };
         const run = executor.run.bind(executor);
         let worktree = "";
         executor.run = async ctx => {
@@ -32506,6 +32576,43 @@ describe("M2 actualRunner credential replacement", () => {
             },
             credentialSwitchLedger: new (await import("../src/credential-switch-op-ledger.js")).CredentialSwitchOpLedger(dir),
           });
+        // Wrap real leases and consumers; no replacement switch orchestration.
+        const { NowSummaryController } = await import("../src/now-summary.js");
+        const suspendNow = NowSummaryController.prototype.suspendCodexSwitch;
+        const nowPublicationProbes: string[] = [];
+        const nowProbe = mock.method(NowSummaryController.prototype, "suspendCodexSwitch", function (this: InstanceType<typeof NowSummaryController>, bounds: Parameters<typeof suspendNow>[0]) {
+          const lease = suspendNow.call(this, bounds);
+          const probe = (stage: string): void => {
+            const builds = nowBuilds.length;
+            const aSends = a.transport.requests.length, bSends = b.transport.requests.length;
+            this.observeProgress({ completed: [], in_progress: [stage] }, [{ id: stage, title: stage }]);
+            this.observeFrame({ kind: "tool_use", agent: "lead", payload: { id: stage, name: "Bash", input: { command: "true", description: stage } } });
+            assert.equal(nowBuilds.length, builds, stage);
+            assert.equal(a.transport.requests.length, aSends, stage);
+            assert.equal(b.transport.requests.length, bSends, stage);
+            nowPublicationProbes.push(stage);
+          };
+          return { ...lease, publishB: (bundle: Parameters<ReturnType<typeof suspendNow>["publishB"]>[0]) => {
+            probe("before-Now-publish");
+            const published = lease.publishB(bundle);
+            probe("after-Now-publish");
+            assert.equal(published, true, "real Now lease publishes synchronously");
+            return publication === "now-publish-failure" ? false : published;
+          } };
+        });
+        let retainedRootDispatch: import("../src/harness.js").RunTurnRequest["rootDispatch"];
+        let retainedBroker: import("../src/codex/broker.js").CodexCallbackBroker | undefined;
+        const startTurn = CodexHarness.prototype.startTurn;
+        const useBroker = CodexHarness.prototype.useBroker;
+        const startTurnProbe = mock.method(CodexHarness.prototype, "startTurn", function (this: CodexHarness, request: import("../src/harness.js").RunTurnRequest) {
+          retainedRootDispatch ??= request.rootDispatch;
+          return startTurn.call(this, request);
+        });
+        const brokerProbe = mock.method(CodexHarness.prototype, "useBroker", function (this: CodexHarness, broker: import("../src/codex/broker.js").CodexCallbackBroker) {
+          retainedBroker ??= broker;
+          return useBroker.call(this, broker);
+        });
+        const consumerProbes: string[] = [];
         const running = runner.execute(claim);
         try {
           await withTimeout(aEntered.promise, 5000, "M2 A turn");
@@ -32534,6 +32641,75 @@ describe("M2 actualRunner credential replacement", () => {
           await withTimeout(cleanupEntered.promise, 5000, "M2 A teardown");
           assert.equal(b.transport.requests.length, 0, "B auth waits for A reap");
           cleanupContinue.resolve();
+          if (publication !== "baseline") {
+            for (const barrier of publicationBarriers) {
+              await withTimeout(barrier.entered.promise, 5000, barrier.stage);
+              const builds = nowBuilds.length;
+              const aRequests: number = a.transport.requests.length;
+              const bRequests: number = b.transport.requests.length;
+              try {
+                assert.throws(() => owners[0]!.guard(), /authority|aborted|admission|closed/i);
+                await triggerNow(`held-${barrier.stage}`);
+                assert.ok(retainedRootDispatch);
+                await assert.rejects(retainedRootDispatch.prepare(), "retired A root dispatch is refused");
+                assert.ok(retainedBroker);
+                const child = await retainedBroker.handleToolCall({ threadId: savedId, turnId: "M2-A-turn", callId: `held-child-${barrier.stage}` },
+                  "spawn_agent", { role: "coder", prompt: "work" }, "root");
+                assert.equal(child.ok, false, "retired real broker denies child work");
+                consumerProbes.push(barrier.stage);
+                if ((publication === "subscription-refresh" || publication === "api-key-refresh") && barrier.stage === "login") {
+                  // push() only feeds notifications; startup auth requests use the read-path interceptor.
+                  b.transport.deliverServerRequest({ kind: "activity", method: "account/chatgptAuthTokens/refresh", requestId: 91,
+                    params: { reason: "unauthorized", previousAccountId: null } });
+                  refreshDeliveries++;
+                  refreshDelivered.resolve();
+                  await withTimeout(refreshDelivered.promise, 5000, "B auth interceptor delivery");
+                  assert.equal(refreshDeliveries, 1);
+                  if (publication === "subscription-refresh")
+                    assert.equal(b.transport.responses.some(response => response.requestId === 91), false,
+                      "auth owner defers refresh while login is held");
+                }
+                if (publication === "api-key-refresh" && barrier.stage === "login") {
+                  await withTimeout(refreshResponded.promise, 3000, "API-key refresh refusal");
+                  const replies = b.transport.responses.filter(response => response.requestId === 91);
+                  assert.equal(replies.length, 1);
+                  assert.deepEqual(replies[0]!.response, { error: {
+                    code: -32600, message: "codex authentication protocol violation",
+                  } });
+                  assert.equal(bFinished, false, "API-key auth owner refuses before B finish");
+                }
+                // Join the event queue without a wall-clock sleep.
+                await new Promise<void>(resolve => setImmediate(resolve));
+                assert.equal(nowBuilds.length, builds, "ordinary Now cannot construct a half-published harness");
+                assert.equal(a.transport.requests.length, aRequests, "retired A receives no ordinary sends");
+                assert.equal(b.transport.requests.length, bRequests, "held B receives no ordinary sends");
+                assert.equal(b.transport.turnStartCount, 0, "initialization never admits a work turn");
+                assert.equal(reopenAttempts, 0);
+                assert.equal(ordinaryBRefreshes, 0, `ordinary subscription refresh remains deferred at ${barrier.stage}`);
+                if (barrier.stage === "before-prepare")
+                  assert.deepEqual(nowPublicationProbes, ["before-Now-publish", "after-Now-publish"]);
+              } finally { barrier.proceed.resolve(); }
+              if ((publication === "publish-failure" && barrier.stage === "after-publish") ||
+                  ((publication === "login-failure" || publication === "api-key-refresh") && barrier.stage === "login") ||
+                  (publication === "now-publish-failure" && barrier.stage === "after-publish")) break;
+            }
+            assert.equal(consumerProbes.length, publication === "publish-failure" || publication === "now-publish-failure" ? 2 : (publication === "login-failure" || publication === "api-key-refresh") ? 4 : 5);
+            if (publication !== "gated" && publication !== "subscription-refresh") {
+              await withTimeout(running, 5000, "failed publication retained stop");
+              assert.equal(reopenAttempts, 0);
+              assert.equal(applies, 1, "B was acknowledged before the injected initialization failure");
+              assert.equal(b.transport.turnStartCount, 0);
+              assert.equal(ordinaryBRefreshes, 0);
+              if (publication === "now-publish-failure") {
+                assert.deepEqual(nowPublicationProbes, ["before-Now-publish", "after-Now-publish"]);
+                assert.equal(loginObservations.length, 0, "Now refusal prevents B preparation");
+              }
+              assert.ok(reports.some(status => status.startsWith("credential_switch")), "Runner reports owner hold");
+              assert.equal(await fs.readFile(path.join(worktree, "M2-retained.txt"), "utf8"), "A work");
+              assert.equal(await CodexSessionStore.inspectSession(store, savedId), "present");
+              return;
+            }
+          }
           await withTimeout(bEntered.promise, 5000, "M2 B turn").catch(error => {
             throw new Error(JSON.stringify({ events, applies, hooks, diagnostics: diagnostics.lines, messages: api.messages(claim.run_id) }), { cause: error });
           });
@@ -32611,13 +32787,21 @@ describe("M2 actualRunner credential replacement", () => {
           assert.equal(await fs.readFile(path.join(worktree, "M2-retained.txt"), "utf8"), "A work");
         } finally {
           cancelled = true; pending = false; nowContinue.resolve(); summaryDisposeContinue.resolve(); cleanupContinue.resolve();
+          for (const barrier of publicationBarriers) barrier.proceed.resolve();
           a.transport.push(turnCompleted("interrupted", savedId, "M2-A-turn"));
           b.transport.push(turnCompleted("interrupted", savedId, bTurns > 1 ? "M2-B-idle" : "M2-B-turn"));
-          await running;
-          await Promise.all(triggers);
-          await fs.rm(dir, { recursive: true, force: true });
+          try {
+            await running;
+            await Promise.all(triggers);
+          } finally {
+            startTurnProbe.mock.restore();
+            brokerProbe.mock.restore();
+            nowProbe.mock.restore();
+            await fs.rm(dir, { recursive: true, force: true });
+          }
         }
       });
+      }
     }
   }
 });

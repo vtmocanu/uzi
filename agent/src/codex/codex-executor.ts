@@ -4021,6 +4021,7 @@ export class CodexExecutor implements Executor {
         let replacement: CodexEpochAuthority | undefined;
         let prepared = false;
         let preparationStarted = false;
+        let replacementRefresh: import("./appserver-auth.js").CodexAuthSuspensionLease | undefined;
         let freshStarted = false;
         let resumeRefused = false;
         const current = (): void => {
@@ -4157,6 +4158,10 @@ export class CodexExecutor implements Executor {
                 { persistAfterLaunchOnly: true });
               // Transfer cleanup ownership before any post-construction guard can throw.
               epoch = fresh; this.safety = fresh.safety;
+              // Login initializes B, but ordinary refresh stays gated until the
+              // complete authority bundle opens. Teardown refuses queued refreshes
+              // if preparation or publication fails before finishB.
+              replacementRefresh = fresh.harness.suspendRefreshAdmission();
               nextBounds.guard(); bounds.guard(); next.assertCurrent();
               const request = { ...base, signal: nextBounds.signal, resumeSessionId: sessionId,
                 rootDispatch: undefined, onRuntimeConfig: undefined };
@@ -4202,6 +4207,7 @@ export class CodexExecutor implements Executor {
               throw new TrustedExecutionRefusal("Codex replacement ownership lost");
             this.summaryLifecycleClosed = summaryWasClosed;
             reopened = true; this.switchAdmissionClosed = false;
+            replacementRefresh?.resume();
           },
         });
       };
