@@ -109,9 +109,10 @@ func samplePollResponse() PollResponse {
 			// No token to write: a pod already proved it holds one (its plaintext
 			// lives only in the cluster Secret now), or the buffer expired unread.
 			JoinToken: nil,
-			// A sleeping worker carries the hibernation object (PRD #4205); the first and
-			// third workers are awake or waking, so a drop on either side reddens.
-			Hibernation: &Hibernation{State: "hibernated", OpID: "55555555-5555-5555-5555-555555555555"},
+			// A preparing worker carries the hibernation object with its inventory gate (PRD
+			// #4205, #4208); the first and third workers are awake or waking (no gate), so a
+			// drop on either side reddens.
+			Hibernation: &Hibernation{State: "preparing", OpID: "55555555-5555-5555-5555-555555555555", InventoryGate: InventoryGateAwait},
 		},
 		{
 			ID:       "33333333-3333-3333-3333-333333333333",

@@ -9,6 +9,7 @@ import path from "node:path";
 import { StubExecutor, type ExecutorResult, type RunContext } from "../src/executor.js";
 import type { GitCache, RunnerClone } from "../src/git.js";
 import { Outbox, canonicalizeTerminalBody } from "../src/outbox.js";
+import { hibernationWriters } from "../src/hibernation-inventory.js";
 import { RecoveryCoordinator } from "../src/recovery.js";
 import type { ExecutorFactory } from "../src/runner.js";
 import {
@@ -1007,6 +1008,40 @@ describe("RunRunner — live settle on a confirmed checkpoint publish (issue #17
       assert.equal(r.settleClient.liveCalls.length, 1, "the live leg was recorded and sent");
       assert.deepEqual(await r.settlement.listRun(RUN_ID), [], "released cleaned the record up");
     } finally {
+      r.cleanup();
+    }
+  });
+
+  it("a live settle is skipped while the hibernation writer latch is held and runs after release", async () => {
+    const r = await liveRig();
+    try {
+      await git.ensureClone(fx.originPath);
+      await r.settlement.put(adoptedRecord(r, HOLD_A));
+      assert.ok(await git.pinSettlementRefs(r.bare, RUN_ID, HOLD_A, { source: r.src, adopted: r.adopted }));
+      r.settleClient.liveAnswer = (h) => released(RUN_ID, h);
+      const flight = liveFlight();
+      await preparePublication(r, flight);
+      const trigger = () => (r.runner as unknown as {
+        triggerLiveSettle: (f: unknown, publishedSha: string, target: "checkpoint") => void;
+      }).triggerLiveSettle(flight, r.published, "checkpoint");
+      hibernationWriters.latch();
+      try {
+        trigger();
+        assert.equal(r.observed.length, 0, "no live trigger while latched");
+        assert.equal(r.settleClient.liveCalls.length, 0);
+        assert.equal(hibernationWriters.inFlight(), 0, "a refused trigger is not counted");
+        assert.equal((await r.settlement.listRun(RUN_ID))[0]!.live, undefined, "no leg recorded");
+      } finally {
+        hibernationWriters.unlatch();
+      }
+      trigger();
+      assert.equal(r.observed.length, 1, "the trigger fires once the latch is released");
+      await Promise.all(r.observed);
+      await Promise.all(r.settled);
+      assert.equal(r.settleClient.liveCalls.length, 1, "the live leg was recorded and sent");
+      assert.equal(hibernationWriters.inFlight(), 0, "the writer is released after the settle");
+    } finally {
+      hibernationWriters.unlatch();
       r.cleanup();
     }
   });

@@ -61,6 +61,7 @@ import { readDindMeterSample, type DindMeterSample } from "./dind-meter.js";
 import type { DindVolumePruneController } from "./dind-volume-prune.js";
 import type { DindBuilderPruneController } from "./dind-builder-prune.js";
 import { errMessage, sleep as abortableSleep } from "./util.js";
+import { asWriter } from "./hibernation-inventory.js";
 
 /** Pressure threshold: a sample at or above this fraction of bytes OR inodes is "over". */
 const HIGH_WATERMARK = 0.85;
@@ -203,8 +204,8 @@ export const execDocker: DockerExec = (argv, opts) =>
 /** Who may hold the claim gate closed; `open(owner)` removes only that owner's key. `retained_ops`
  *  is the operator retained-source channel (issue #1786); `terminal_maintenance` is the model-free
  *  terminal producer's writer exclusion (issue #3031); `hibernation` is the hibernation cache prune's
- *  exclusive hold (PRD #4206). */
-export type GateOwner = "cache" | "maintenance" | "retained_ops" | "terminal_maintenance" | "hibernation";
+ *  exclusive hold (PRD #4206); `hibernation_inventory` is the volume inventory hold (PRD #4208). */
+export type GateOwner = "cache" | "maintenance" | "retained_ops" | "terminal_maintenance" | "hibernation" | "hibernation_inventory";
 
 /**
  * The claim gate the two claim loops and the prune share. A claim loop calls
@@ -421,7 +422,7 @@ export class DindPruneController {
   private async cacheLoop(signal: AbortSignal): Promise<void> {
     while (!signal.aborted) {
       try {
-        await this.tick(signal);
+        await asWriter("dind_prune", () => this.tick(signal));
       } catch (err) {
         this.log.warn("dind-prune: evaluation failed", { error: errMessage(err) });
       }

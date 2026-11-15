@@ -8,6 +8,11 @@ import { establishProcessBoundary } from "./restore-boundary.js";
 import { AuthorityRuntime } from "./authority-runtime.js";
 import { createLogger, type Logger } from "./log.js";
 import { startMainWatchdog } from "./main-watchdog.js";
+import {
+  hibernationWriters, HibernationInventoryController,
+} from "./hibernation-inventory.js";
+import { createHibernationCensus } from "./hibernation-census.js";
+import { scratchLayout } from "./pod-epoch-scratch.js";
 import { maintenanceBootstrapRoots, readMaintenancePosture, recordMaintenanceBootstrap, snapshotMaintenanceBootstrap, terminalMaintenanceProof } from "./run-quiescence.js";
 import { MaintenanceWriterExclusion } from "./maintenance-exclusion.js";
 import { WorkerClient, RequestError } from "./client.js";
@@ -441,6 +446,8 @@ async function mainBody(): Promise<void> {
   // protected startup access. Runtime shutdown hooks are installed once built.
   const controller = new AbortController();
   let shutdownRuntime: (() => void) | undefined;
+  // PRD #4208: the hibernation inventory controller (DinD lane with epoch participation only).
+  let hibernation: HibernationInventoryController | undefined;
   // issue #4066: the shutdown budget starts at the FIRST signal, or at barrier entry when no signal came; a repeated
   // signal resets nothing. The observer is
   // armed with a lazily bound snapshot: the authority runtime (and the git cache) may not exist yet at an early signal.
@@ -976,8 +983,9 @@ async function mainBody(): Promise<void> {
   // The job lane (PRD #1908 M4): a slim runner for `job` claims, the repo-less run kind. Its
   // per-run workspaces live under `<dataDir>/jobs`, outside the clone and attempt roots. Under
   // UZI_E2E_EXECUTOR=stub the model call is the stub job queryFn (no live Anthropic).
+  const jobsRoot = path.join(config.dataDir, "jobs");
   const jobRunner = new JobRunner(client, log, {
-    jobsRoot: path.join(config.dataDir, "jobs"),
+    jobsRoot,
     secretPaths: workerSecretDenyPaths(config.workerTokenFile),
     joinToken: config.workerToken,
     activeRuns,
@@ -1123,6 +1131,40 @@ async function mainBody(): Promise<void> {
     isIdle: () => worker?.isIdle() ?? false,
   });
   notifyRetained = () => { void retainedSource.reportRetained(); };
+  // PRD #4208 M1: the hibernation inventory participates only where an exclusion mechanism is
+  // proven: the DinD lane (Docker wired, not the isolated lane) holding the pod-epoch lock in a
+  // supported mode. Its presence is what advertises `hibernation_inventory_v1`. The census seam walks the
+  // whole data volume (hibernation-census.ts); the shutdown seam recomputes only the walk fingerprint.
+  if (hibernationParticipates(config, epochOwnership?.mode)) {
+    // The volume census (hibernation-census.ts): top-level names come from the same config the writers use, the worker's
+    // own TMPDIR is walked like everything else (a non-empty one is unknown), and the scratch root is the shipped layout's.
+    const scratch = scratchLayout(process.env);
+    const volumeCensus = createHibernationCensus({
+      dataDir: config.dataDir,
+      layout: { outbox: path.basename(config.outboxDataDir), agentHome: path.basename(sdkHomeRoot), jobs: path.basename(jobsRoot) },
+      workerTmpDirs: process.env.TMPDIR ? [process.env.TMPDIR] : [],
+      ...("refused" in scratch ? {} : { scratchRoot: scratch.root }),
+      ...(config.dockerWiring.dockerHost !== undefined ? { dockerHost: config.dockerWiring.dockerHost } : {}),
+      git, client, ownership: epochOwnership,
+    });
+    hibernation = new HibernationInventoryController({
+      registry: hibernationWriters,
+      gate: dindGate,
+      client,
+      ownership: epochOwnership,
+      laneSupported: true,
+      podUid: () => process.env.UZI_POD_UID,
+      isIdle: () => worker?.isIdle() ?? false,
+      proof: () => terminalMaintenanceProof(3, config.dockerWiring.dockerHost),
+      census: volumeCensus.census,
+      recomputeFingerprint: volumeCensus.fingerprint,
+      fatalExit: (reason) => {
+        log.error("uzi-agent exiting", { cause: reason, phase: lifecyclePhase, exit_code: 1 });
+        process.exit(1);
+      },
+      log,
+    });
+  }
   worker = new Worker(
     config,
     client,
@@ -1152,11 +1194,13 @@ async function mainBody(): Promise<void> {
     memory,
     undefined,
     hibernationPrune,
+    hibernation,
   );
 
   // Preserve shutdown ordering: revoke memory, initiate run-lane drain, then
   // abort loops. The early signal handler also cancels startup lock waits.
   shutdownRuntime = () => {
+    hibernation?.stop();
     if (shutdownDeadlineAt !== undefined) authority.beginShutdown(shutdownDeadlineAt);
     void worker.shutdownMemory();
     runner.shutdown();
@@ -1244,6 +1288,20 @@ async function mainBody(): Promise<void> {
   lifecyclePhase = "worker";
   await worker.run(controller.signal);
   const gate = await finishShutdown();
+  // PRD #4208: only now, after every other shutdown writer has joined (run lanes, outbox,
+  // recoveries, the shutdown barrier), recompute the content fingerprint and report the held
+  // exclusion. It must finish by the barrier deadline, so it is skipped when too little of that
+  // deadline remains and otherwise capped at 15 s (see hibernationFinalizeBudgetMs).
+  if (hibernation) {
+    const left = hibernationFinalizeBudgetMs(shutdownDeadlineAt, Date.now());
+    if (left !== undefined) {
+      let timer: NodeJS.Timeout | undefined;
+      await Promise.race([
+        hibernation.finalizeAtShutdown(),
+        new Promise<void>((resolve) => { timer = setTimeout(resolve, left); }),
+      ]).finally(() => clearTimeout(timer));
+    }
+  }
   lifecyclePhase = "stopped";
   log.info("uzi-agent stopped", {
     cause: shutdownSignal ? "signal" : "worker_returned",
@@ -1251,6 +1309,29 @@ async function mainBody(): Promise<void> {
     exit_code: gate.exitCode,
     shutdown_result: gate.result,
   });
+}
+
+/**
+ * Whether this worker builds the hibernation inventory controller (and so advertises
+ * `hibernation_inventory_v1`): the DinD lane only (Docker wired, not the isolated fetcher lane)
+ * holding the pod-epoch lock in a supported mode (`ownershipMode` undefined = no epoch ownership).
+ */
+export function hibernationParticipates(
+  config: { dockerWiring: { dockerHost?: string }; fetcherUrl?: string; fetcherCaFile?: string },
+  ownershipMode: string | undefined,
+): boolean {
+  return config.dockerWiring.dockerHost !== undefined && !(config.fetcherUrl && config.fetcherCaFile) &&
+    ownershipMode !== undefined && ownershipMode !== "unsupported";
+}
+
+/**
+ * Time the shutdown hibernation finalize may take: at most 15 s and never past the shutdown barrier
+ * deadline `deadlineAt` (epoch ms; undefined = no barrier, full 15 s). Undefined when under 3 s
+ * remain, so the finalize is skipped rather than overrunning the barrier.
+ */
+export function hibernationFinalizeBudgetMs(deadlineAt: number | undefined, nowMs: number): number | undefined {
+  const left = deadlineAt === undefined ? 15_000 : Math.min(15_000, deadlineAt - nowMs);
+  return left >= 3_000 ? left : undefined;
 }
 
 // PRD #1429 M6: only auto-run `main()` when this module is the process ENTRYPOINT

@@ -18,7 +18,7 @@
 -- entire snapshot when it exceeds 512; a truncated set would permit orphan teardown.
 SELECT w.id,
        w.user_id, w.capabilities, w.protocol_capabilities, w.version,
-       w.status, w.last_heartbeat_at, w.hibernation_state, w.hibernation_op_id,
+       w.status, w.last_heartbeat_at, w.hibernation_state, w.hibernation_op_id, w.hibernation_scaling_down_at,
        -- Hibernation cache prune attempt (PRD #4206): the controller projects state 'cleaning' while
        -- the phase is requested/started/unknown, and needs the stop-proof coordinates when unknown.
        w.cleanup_phase, w.cleanup_op_id, w.cleanup_pod_uid, w.cleanup_reconcile_seq,
@@ -99,9 +99,14 @@ SELECT w.id,
            SELECT 1 FROM recovery_custody_holds h
            WHERE h.live_worker_id = w.id AND h.state = 'open'
        ))::boolean AS custody_held,
+       -- inventory_status (PRD #4208 M1): the status of the inventory row for the worker's CURRENT
+       -- hibernation op, NULL when there is none (an awake worker, or an op with no observation yet).
+       -- Only the status leaves the table here; never the entries.
+       i.status AS inventory_status,
        t.token_ciphertext
 FROM workers w
 LEFT JOIN hosted_worker_tokens t ON t.worker_id = w.id
+LEFT JOIN worker_hibernation_inventories i ON i.worker_id = w.id AND i.op_id = w.hibernation_op_id
 WHERE w.kind = 'hosted'
 ORDER BY w.created_at ASC, w.id ASC
 LIMIT 513;

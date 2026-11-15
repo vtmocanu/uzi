@@ -212,8 +212,8 @@ func TestControllerParsesTheAPIsPollShape(t *testing.T) {
 	if pending.Hibernation != nil {
 		t.Fatalf("awake worker decoded a hibernation object: %+v", pending.Hibernation)
 	}
-	if h := noToken.Hibernation; h == nil || h.State != "hibernated" || h.OpID != "55555555-5555-5555-5555-555555555555" {
-		t.Fatalf("hibernated worker lost its hibernation object: %+v", h)
+	if h := noToken.Hibernation; h == nil || h.State != "preparing" || h.OpID != "55555555-5555-5555-5555-555555555555" || h.InventoryGate != InventoryGateAwait {
+		t.Fatalf("preparing worker lost its hibernation object: %+v", h)
 	}
 	if h := dind.Hibernation; h == nil || h.State != "waking" || h.OpID != "66666666-6666-6666-6666-666666666666" {
 		t.Fatalf("waking worker lost its hibernation object: %+v", h)

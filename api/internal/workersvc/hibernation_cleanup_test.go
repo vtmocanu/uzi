@@ -1,6 +1,7 @@
 package workersvc
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -204,5 +205,21 @@ func TestHibernationCachePruneProjection(t *testing.T) {
 	p := HibernationCachePruneFromWorker(w)
 	if p == nil || p.OpID != uuid.UUID(w.CleanupOpID.Bytes).String() || p.RegisterNonce != "n1" || p.Phase != CleanupPhaseUnknown || !p.CancelRequested || p.ReconcileSeq != 3 {
 		t.Fatalf("projection = %+v", p)
+	}
+}
+
+// Even a delayed inventory upload cannot overtake cleanup or acquire its writer gate.
+func TestInventoryCannotBindWhileCleanupIsUnsettled(t *testing.T) {
+	for _, phase := range []string{CleanupPhaseRequested, CleanupPhaseStarted, CleanupPhaseUnknown} {
+		t.Run(phase, func(t *testing.T) {
+			w := cleanupWorker(phase)
+			op, pod := uuid.New(), uuid.New()
+			w.Kind, w.HibernationOpID = "hosted", pgconv.UUID(op)
+			// A nil query handle proves the refusal precedes all inventory access.
+			_, err := boundAwaitingInventory(context.Background(), nil, w, op, pod, "n1")
+			if !errors.Is(err, ErrHibernationConflict) {
+				t.Fatalf("unsettled cleanup inventory bind: %v", err)
+			}
+		})
 	}
 }
