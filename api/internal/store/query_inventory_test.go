@@ -423,6 +423,8 @@ var inventoryQueryFiles = []string{
 	"credential_disabled.sql",
 	// Issue #4007 slice A — the terminal preservation store
 	"terminal_preservation.sql",
+	// Issue #4257 — the checkpoint-publication-withheld fact
+	"checkpoint_publication.sql",
 	// Issue #4207 — automatic hibernation of idle workers (its own file: the rest of
 	// hibernation.sql is not inventoried)
 	"hibernation_auto.sql",
@@ -465,6 +467,14 @@ var inventoryPackages = []string{".", "../handler", "../workersvc"}
 // queryInventory is the declaration. Every row was verified by opening the call site named in
 // `why`; none was inferred.
 var queryInventory = []queryPin{
+	{"RecordRunCheckpointWithheld", "checkpoint_publication.sql", "TestCheckpointWithheldOrderRuleLiveDB",
+		"issue #4257; the fence refusals are TestCheckpointWithheldFenceRefusalsLiveDB and the delayed-older-report " +
+			"race is TestCheckpointPublicationServerOrderingLiveDB (../handler). Direct call through the f.set helper " +
+			"(../workersvc checkpoint_publication_livedb_test.go)"},
+	{"ClearRunCheckpointWithheld", "checkpoint_publication.sql", "TestCheckpointWithheldOrderRuleLiveDB",
+		"issue #4257; direct call through the f.clear helper (../workersvc checkpoint_publication_livedb_test.go), " +
+			"fence refusals in TestCheckpointWithheldFenceRefusalsLiveDB, delayed old clear in " +
+			"TestCheckpointPublicationServerOrderingLiveDB (../handler)"},
 	{"UpsertRecommendationDisposition", "dispositions.sql", "TestRecommendationDispositionsLiveDB",
 		"direct call, recommendation_dispositions_integration_test.go:108"},
 	{"SystemDismissDeniedCLIRecommendation", "dispositions.sql", "TestPostReviewAutoDismissesDeniedCLILiveDB",

@@ -9,7 +9,8 @@ audience: user
 uzi watches every active run and can flag one that looks stuck, looping, or
 close to its timeout — a **⚠** badge on the board, dashboard, runs list, and
 run view, and (if you've set up [Slack](./slack.md)) a DM, except for a
-cross-check run, which never gets a DM of its own. The badge's
+cross-check run, which never gets a DM of its own, and for
+[publication withheld](#publication-withheld), which sends no per-run DM. The badge's
 elapsed time counts from when the flag was raised, not from when the run
 started — except **near timeout**, whose badge instead counts down the time
 left to the deadline (e.g. `1h 5m left`).
@@ -24,6 +25,7 @@ left to the deadline (e.g. `1h 5m left`).
 | ⚠ waiting for worker | Queued longer than expected with no worker claiming it — or, for a repo the Docker worker allowlist blocks, as soon as the next health sweep detects it (see below). | The reason names why, if you own the run: no worker online, your protected vault is locked, or just a wait — start a worker or unlock your vault as needed. A judge or self-improve run instead reads **deprioritized** (yielding to interactive work on purpose, not stuck) or, once it's waited past the grace window, **priority restored** — see [Queue priority](#queue-priority). |
 | waiting for account cooldown | Required new Codex subscription work is blocked by a current account cooldown in `claimed`, `running` or `awaiting_approval`; this is an expected wait, not a fault. | Wait for a fresh admission check, or use the existing run controls. Earliest eligibility does not promise dispatch; see [Account cooldown waits](#account-cooldown-waits). |
 | ⚠ needs approval | Sitting at `awaiting_approval` longer than expected (never shown for autopilot runs, which approve themselves). | Approve, reject, or request changes to the plan — see [Plan approval gate](./run-activity.md#plan-approval-gate). |
+| ⚠ publication withheld | A running run's checkpoint publication is withheld by a secret-scan restriction; new work stays on the worker until it is resolved. See [Publication withheld](#publication-withheld). | Read the hint on the run view or in `uzi run get` (`HEALTH_HINT`); `uzi run follow-up` can give the agent guidance. |
 
 Tool-loop detection considers the newest 12 tool uses within 40 fetched tool-use/result rows. Only valid calls with a unique ID and one matching later result count; unmatched or malformed uses occupy a slot without being counted or replaced by older calls. Repeated calls with varying results can still be stuck, but this detector does not flag them.
 
@@ -250,6 +252,32 @@ priority precedence or immediate provisioning.
 **A run parked at `limit_wait` on a Claude or Codex usage window is excluded
 from these running-state flags, even after hours.** It isn't stuck — see
 [Paused on a usage limit](run-limit-wait.md) for that state.
+
+## Publication withheld
+
+**publication withheld** shows on a `running` run when a secret-scan restriction
+stops the worker from publishing its checkpoints. The run keeps working, but new
+work stays on the worker until the restriction is resolved. The flag is a warning
+only; it never stops, fails or requeues the run.
+
+- **Reason and hint.** The reason reads _"checkpoint publication is withheld by a
+  secret-scan restriction; new work stays on the worker until it is resolved"_ and
+  is shown to the run's owner (and admins). The hint reads _"an eligible finding reaches the
+  lead at its next work-turn boundary, subject to the existing safety checks and the
+  shared attempt cap; the done-point fallback remains subject to its safety checks
+  and the same cap; `uzi run follow-up` can give the agent owner guidance"_. Both are
+  fixed text: neither names a finding, path, rule or secret. The CLI prints the hint
+  as `HEALTH_HINT` in `uzi run get`, the TUI crew rail shows the reason and the opening of the hint
+  (cut to fit the rail; the full hint is in `uzi run get` and the web run view), and
+  the run view shows the hint beside the reason.
+- **Precedence.** It ranks below looping (both causes), the plan and code
+  cross-check waits, an account cooldown wait, stalled, a long tool call and a
+  silent delegation, and above only the final near-timeout check.
+- **No per-run Slack DM.** The Slack root status line reads _"checkpoint
+  publication withheld"_, but the owner gets no per-run nudge for this flag.
+- **Clearing.** It clears only after a later checkpoint publication is admitted and
+  accepted, and only if no newer trusted finding arrived after that admission. A scan
+  finding alone, or the passage of time, does not clear it.
 
 ## This is an early-warning aid, not a guardrail
 

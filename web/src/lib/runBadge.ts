@@ -523,7 +523,20 @@ const HEALTH_FLAG_LABELS: Record<Exclude<RunHealth, "ok">, string> = {
   waiting_worker: "waiting for worker",
   approval_idle: "needs approval",
   waiting_account_cooldown: "waiting for account cooldown",
+  // Issue #4257: a running run whose checkpoint publication a secret-scan restriction withholds.
+  publication_withheld: "publication withheld",
 };
+
+// The fixed owner hint for health "publication_withheld". The api does not send it: this is a
+// mirrored copy of apitypes.HintCheckpointPublicationWithheld
+// (api/internal/apitypes/checkpoint_publication.go); a test pins it to the literal.
+export const PUBLICATION_WITHHELD_HINT =
+  "an eligible finding reaches the lead at its next work-turn boundary, subject to the existing safety checks and the shared attempt cap; the done-point fallback remains subject to its safety checks and the same cap; `uzi run follow-up` can give the agent owner guidance";
+
+// healthHint returns the fixed hint for a withheld run and null for every other health value.
+export function healthHint(run: Pick<HealthFlaggable, "health">): string | null {
+  return run.health === "publication_withheld" ? PUBLICATION_WITHHELD_HINT : null;
+}
 
 // HEALTH_FLAGGABLE_STATUSES mirrors the server's flaggable set: a health flag is
 // only ever rendered while a run is in one of these (belt-and-braces with the

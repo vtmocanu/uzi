@@ -6,6 +6,9 @@ import {
   formatElapsed,
   hasActiveRun,
   healthBadge,
+  healthHint,
+  isAccountCooldownWaiting,
+  PUBLICATION_WITHHELD_HINT,
   codexAdmissionText,
   healthFlagLabel,
   isAwaitingApproval,
@@ -42,6 +45,7 @@ import {
   shouldShowHealthFlag,
 } from "./runBadge";
 import boundFixture from "../../../fixtures/api-contract/run.custody_run_hold_bound.json";
+import withheldFixture from "../../../fixtures/api-contract/run.checkpoint_publication_withheld.json";
 import { RUN_STATUS_TONES } from "../components/ui";
 import holdPresentation from "../../../fixtures/hold-reasons/presentation.json";
 import { credentialSwitchHold } from "./credentialSwitchHold";
@@ -1699,6 +1703,35 @@ it.each([
   expect(badge).toMatchObject({ label, tone: "warning", pulse: false });
   expect(badge.kind === "badge" && badge.title).not.toMatch(/requeues|episode|Used:|Remaining:/);
   expect(effectiveRunStatus({ ...input, status: "running" })).toBe("running");
+});
+
+describe("checkpoint publication withheld (issue #4257, api-contract fixture)", () => {
+  // The literals are apitypes.ReasonCheckpointPublicationWithheld and
+  // apitypes.HintCheckpointPublicationWithheld; api/cmd/uzi TestCheckpointPublicationWithheldFixtureRenders
+  // checks the fixture against the Go constants.
+  const reason = "checkpoint publication is withheld by a secret-scan restriction; new work stays on the worker until it is resolved";
+  const hint = "an eligible finding reaches the lead at its next work-turn boundary, subject to the existing safety checks and the shared attempt cap; the done-point fallback remains subject to its safety checks and the same cap; `uzi run follow-up` can give the agent owner guidance";
+  const withheld = run({ status: "running", health: "publication_withheld", health_reason: withheldFixture.health_reason, health_since: withheldFixture.health_since });
+
+  it("labels the flag and keeps the fixture reason exact", () => {
+    expect(withheldFixture.health).toBe("publication_withheld");
+    expect(withheldFixture.health_reason).toBe(reason);
+    expect(healthFlagLabel("publication_withheld")).toBe("publication withheld");
+    expect(shouldShowHealthFlag("publication_withheld", "running")).toBe(true);
+  });
+  it("pins the mirrored hint literal and returns it only for this health", () => {
+    expect(PUBLICATION_WITHHELD_HINT).toBe(hint);
+    expect(healthHint(withheld)).toBe(hint);
+    for (const h of ["ok", "stalled", "looping", "slow", "waiting_worker", "approval_idle", "waiting_account_cooldown"] as const) {
+      expect(healthHint({ health: h })).toBeNull();
+    }
+  });
+  it("renders a warning flag on a running run, not a waiting state", () => {
+    const badge = healthBadge(withheld, NOW);
+    expect(badge).toMatchObject({ kind: "badge", tone: "warning", title: reason });
+    expect(badge && badge.kind === "badge" && badge.label).toMatch(/^⚠ publication withheld/);
+    expect(isAccountCooldownWaiting(withheld)).toBe(false);
+  });
 });
 
 // Issue #3250: the non-completion hold set is one table (NON_COMPLETION_HOLDS) pinned against

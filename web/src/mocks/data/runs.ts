@@ -2260,6 +2260,15 @@ mockRuns.push({
   health: "ok", health_since: null,
   health_reason: "this run has reached its own custody hold limit; retained holds still protect its work; resolve or discard this run's own retained holds to let it start",
 });
+// Issue #4257: a running run whose checkpoint publication is withheld by a secret-scan
+// restriction: open /runs/run-publication-withheld. The reason literal is
+// apitypes.ReasonCheckpointPublicationWithheld (api/internal/apitypes/checkpoint_publication.go);
+// the hint is not on the wire and RunView renders it from lib/runBadge.ts.
+mockRuns.push({
+  ...mockRuns.find((r) => r.id === "run-live")!, id: "run-publication-withheld",
+  health: "publication_withheld", health_since: minsAgo(12),
+  health_reason: "checkpoint publication is withheld by a secret-scan restriction; new work stays on the worker until it is resolved",
+});
 // Issue #3767: a Claude run held on its Anthropic API key's spend limit. Owner-held (explicit
 // null retry stamp); open /runs/run-spend-limit-hold.
 mockRuns.push({

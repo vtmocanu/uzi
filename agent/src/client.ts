@@ -38,6 +38,10 @@ import {
   WORKER_API_PREFIX,
   CAPABILITY_INFERENCE_EVIDENCE_FEATURE,
   RUN_REGISTRATION_EVIDENCE_FEATURE,
+  CHECKPOINT_PUBLICATION_WITHHELD_FEATURE,
+  type CheckpointPublicationInput,
+  type CheckpointPublicationAck,
+  type CheckpointPublicationReport,
   type MemoryBinding,
   type MemoryPolicy,
   type MemoryOutcome,
@@ -509,6 +513,14 @@ function hasRevisionSourceFields(body: StateRequest): boolean {
 
 // Internal per-attempt evidence, minted only after reading the authenticated response through EOF.
 class StateDecodeRefusalError extends RequestError {}
+
+/** Issue #4257: the same report without the checkpoint-publication diagnostic. */
+function withoutCheckpointPublication<T extends { checkpoint_publication?: unknown }>(b: T): T {
+  if (b.checkpoint_publication === undefined) return b;
+  const copy = { ...b };
+  delete copy.checkpoint_publication;
+  return copy;
+}
 interface StateAttemptEvidence {
   ambiguous: boolean; refusals: number; refusedAfterAmbiguity?: boolean;
   /** Any definite HTTP answer (any status) after an earlier ambiguous attempt. */
@@ -1695,6 +1707,8 @@ export class WorkerClient {
    *  `registration_evidence`. Sticky until the next register(); a heartbeat feature refresh does
    *  not reopen it, which is why it is not simply dropFeature(). */
   private registrationEvidenceDropped = false;
+  /** Issue #4257: same shape for `checkpoint_publication`; sticky until the next register(). */
+  private checkpointPublicationDropped = false;
 
   /**
    * The per-registration nonce the api minted on the last successful register (PRD #1390
@@ -2031,6 +2045,7 @@ export class WorkerClient {
     this.hibernationPruneAdvertised = false;
     this.registerNonce = undefined;
     this.registrationEvidenceDropped = false;
+    this.checkpointPublicationDropped = false;
     this.registrationReport = undefined;
     const originalCapabilities = Array.isArray(protocolCapabilities) ? [...protocolCapabilities] : undefined;
     const body: RegisterRequest = { name, version: this.version };
@@ -2964,7 +2979,7 @@ export class WorkerClient {
    * fail on real runs.
    */
   async reportState(runId: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal,
-    options?: { iterationCancellation?: true; registrationEpoch?: number }): Promise<StateAck> {
+    options?: { iterationCancellation?: true; registrationEpoch?: number; checkpointPublication?: CheckpointPublicationInput }): Promise<StateAck> {
     const path = `${WORKER_API_PREFIX}/runs/${runId}/state`;
     if (options?.iterationCancellation) {
       // Snapshot before any asynchronous work; only the iteration sink cancellation
@@ -3174,6 +3189,11 @@ export class WorkerClient {
     delete outbound.registration_evidence;
     const witness = this.registrationEvidenceFor(body, included, options?.registrationEpoch);
     if (witness) outbound.registration_evidence = witness;
+    // Issue #4257: the checkpoint-publication diagnostic, same discipline: a caller-set copy in
+    // the body is discarded and the client alone stamps nonce and generation.
+    delete outbound.checkpoint_publication;
+    const publication = this.checkpointPublicationFor(body, included, options?.checkpointPublication);
+    if (publication) outbound.checkpoint_publication = publication;
     // PRD #1795 M3: the api refuses an id-bearing awaiting_approval report without
     // claim_generation (400 claim_generation_required), and the strict-decode fallback exists for
     // an api that rolled back past the fields. So whenever claim_generation is NOT on the wire, the
@@ -3181,7 +3201,7 @@ export class WorkerClient {
     // allocating api still answers with its revision and an older api accepts unchanged.
     const evidence: StateAttemptEvidence = { ambiguous: false, refusals: 0 };
     let ack: StateAck;
-    const sendWith = (b: PlanCrossCheckStateRequest) => (includeField: boolean) =>
+    const sendOne = (b: PlanCrossCheckStateRequest, includeField: boolean) =>
       this.reportStateOnce(
         runId,
         path,
@@ -3194,6 +3214,21 @@ export class WorkerClient {
         undefined,
         b.claim_generation,
       );
+    // Issue #4257: checkpoint_publication is the NEWEST field, so its rollback is resolved first,
+    // at the innermost send, ahead of every older-field fallback below: on the exact strict-decode
+    // refusal (StateDecodeRefusalError) strip ONLY it, remember that for this registration and
+    // resend this same variant once. Later variants of the same report never carry it again.
+    const sendWith = (b: PlanCrossCheckStateRequest) => async (includeField: boolean): Promise<StateAck> => {
+      const base = this.checkpointPublicationDropped ? withoutCheckpointPublication(b) : b;
+      try {
+        return await sendOne(base, includeField);
+      } catch (err) {
+        if (base.checkpoint_publication === undefined || !isStrictDecodeError(err) || !(err instanceof StateDecodeRefusalError)) throw err;
+        this.checkpointPublicationDropped = true;
+        this.log.warn("checkpoint publication diagnostic rejected by an api that cannot decode it; re-sent without it and stopped sending it for this registration", { run_id: runId });
+        return sendOne(withoutCheckpointPublication(base), includeField);
+      }
+    };
     try {
       if (outbound.registration_evidence !== undefined) {
         // Issue #3859. Ordering with the older claim_generation fallback: the evidence strip comes
@@ -3267,6 +3302,24 @@ export class WorkerClient {
     }
     if (body.completion_final_head !== undefined && !this.hasFeature("recovery_completed_publication_v1")) ack.completedPublicationReason = "unsupported_feature";
     return ack;
+  }
+
+  /** Issue #4257: the stamped checkpoint-publication diagnostic for a `running` report, or
+   *  undefined. Every guard is required: negotiated and not dropped for this registration, a
+   *  known register nonce, a claim generation that is a safe integer >= 1 really on the wire,
+   *  and a caller input with a positive integer report_seq (and `since` for `withheld`). */
+  private checkpointPublicationFor(body: StateRequest, included: boolean, input: CheckpointPublicationInput | undefined): CheckpointPublicationReport | undefined {
+    const generation = body.claim_generation;
+    if (input === undefined || body.status !== "running" || !included || this.checkpointPublicationDropped ||
+        !this.hasFeature(CHECKPOINT_PUBLICATION_WITHHELD_FEATURE) || !this.registerNonce ||
+        generation === undefined || !Number.isSafeInteger(generation) || generation < 1 ||
+        !Number.isSafeInteger(input.report_seq) || input.report_seq < 1) return undefined;
+    if (input.state === "withheld") {
+      if (typeof input.since !== "string" || input.since === "") return undefined;
+      return { state: "withheld", since: input.since, claim_generation: generation, register_nonce: this.registerNonce, report_seq: input.report_seq };
+    }
+    if (input.state !== "cleared") return undefined;
+    return { state: "cleared", claim_generation: generation, register_nonce: this.registerNonce, report_seq: input.report_seq };
   }
 
   /** Issue #3859: the registration witness for a `running` report, or undefined. Every guard is
@@ -3531,6 +3584,10 @@ export class WorkerClient {
           if (body.registration_evidence !== undefined && fields.registrationEvidence !== undefined) {
             ack.registrationEvidence = fields.registrationEvidence;
             this.log.info("registration evidence answered", { run_id: runId, registration_evidence: fields.registrationEvidence });
+          }
+          if (body.checkpoint_publication !== undefined && fields.checkpointPublication !== undefined) {
+            ack.checkpointPublication = fields.checkpointPublication;
+            this.log.info("checkpoint publication answered", { run_id: runId, checkpoint_publication: fields.checkpointPublication });
           }
           if (!ack.applied) {
             this.log.info("state report not applied server-side", {
@@ -6191,6 +6248,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
   staleRevisionSource?: boolean;
   reconciliation?: PlanCrossCheckReconciliation;
   registrationEvidence?: "recorded" | "refused";
+  checkpointPublication?: CheckpointPublicationAck;
 }> {
   const pendingMarker = res.headers.get(COMPLETION_PENDING_HEADER);
   const ackCap = maxAckBytes === undefined ? undefined
@@ -6244,6 +6302,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
       superseded_revision_input_ids?: unknown;
       // Issue #3859: top-level answer to a report that carried registration_evidence.
       registration_evidence?: unknown;
+      checkpoint_publication?: unknown;
     };
     const run = parsed?.run;
     const out: {
@@ -6289,6 +6348,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
       staleRevisionSource?: boolean;
       reconciliation?: PlanCrossCheckReconciliation;
       registrationEvidence?: "recorded" | "refused";
+      checkpointPublication?: CheckpointPublicationAck;
     } = {};
     if (isRecord(parsed) && (Object.hasOwn(parsed, "semantic_presentation") || Object.hasOwn(parsed, "semantic_approval"))) {
       try {
@@ -6439,6 +6499,9 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
     }
     if (parsed?.registration_evidence === "recorded" || parsed?.registration_evidence === "refused")
       out.registrationEvidence = parsed.registration_evidence;
+    if (parsed?.checkpoint_publication === "recorded" || parsed?.checkpoint_publication === "cleared" ||
+        parsed?.checkpoint_publication === "refused" || parsed?.checkpoint_publication === "unrecorded")
+      out.checkpointPublication = parsed.checkpoint_publication;
     const gateRev = parsed?.gate_revision;
     if (typeof gateRev === "number" && Number.isSafeInteger(gateRev) && gateRev >= 1) out.gateRevision = gateRev;
     const reconciliation = readPlanCrossCheckReconciliation(parsed);

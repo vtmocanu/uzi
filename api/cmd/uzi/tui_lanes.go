@@ -47,13 +47,15 @@ const (
 // the active lane would flip every long healthy tool call to idle.
 const laneStaleAfter = 45 * time.Second
 
-// stalledHealth is the WARN set for the status TOKEN and the board strip: all three
-// PRD #47 flags (stalled, slow, looping) replace the status word with ▲ + the health
-// word, because a run that needs a glance is what the board is FOR. It drives
-// stateGlyphWord/stateColor (tui_render.go) and the board-summary ▲ counter
-// (tui_board.go). "slow" is the enum value PRD #1170 kept (D1); the token DISPLAYS it as
-// "near timeout" via displayHealth, but it is still a WARN flag on the board.
-var stalledHealth = map[string]bool{"stalled": true, "slow": true, "looping": true}
+// stalledHealth is the WARN set for the status TOKEN and the board strip: the three
+// PRD #47 flags (stalled, slow, looping) plus publication_withheld (issue #4257) replace
+// the status word with ▲ + the health word, because a run that needs a glance is what the
+// board is FOR. It drives stateGlyphWord/stateColor (tui_render.go) and the board-summary ▲
+// counter (tui_board.go). "slow" is the enum value PRD #1170 kept (D1); the token DISPLAYS it
+// as "near timeout" via displayHealth, but it is still a WARN flag on the board.
+// publication_withheld draws the short word "pub withheld" on the token (stateGlyphWord) so it
+// fits the board status column; the long displayHealth label stays on the CLI HEALTH row.
+var stalledHealth = map[string]bool{"stalled": true, "slow": true, "looping": true, healthPublicationWithheld: true}
 
 // laneStalledHealth is the narrower set that turns an ACTIVE lane amber (crewStalled):
 // only stalled and looping, NOT slow/near-timeout. A near-timeout run is a fact about the
