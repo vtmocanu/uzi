@@ -561,7 +561,10 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		// re-nudge, and the cooldown term below still applies.
 		enteredRunBound := reason == apitypes.ReasonCustodyRunHoldBound &&
 			(!r.HealthReason.Valid || r.HealthReason.String != apitypes.ReasonCustodyRunHoldBound)
-		nudge := target != healthOK && (r.Health == healthOK || leftPin || enteredRunBound || (leftAccountCooldown && independentFault)) &&
+		// Issue #4257: publication_withheld never nudges itself, so a run leaving it into a real fault
+		// (stalled, looping, ...) is a new episode no earlier DM described: nudge-eligible, cooldown applies.
+		leftWithheld := r.Health == healthPublicationWithheld && target != healthPublicationWithheld && target != healthOK
+		nudge := target != healthOK && (r.Health == healthOK || leftPin || leftWithheld || enteredRunBound || (leftAccountCooldown && independentFault)) &&
 			(cooldown == 0 || !r.HealthNotifiedAt.Valid || now.Sub(r.HealthNotifiedAt.Time) >= cooldown)
 		// PRD #1349 M6 (D10): SUPPRESS the per-run Slack nudge for the custody-limit reason. The
 		// owner-level custody-episode reconciler (slacksvc) coalesces this crossing into ONE owner

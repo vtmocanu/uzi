@@ -51,6 +51,13 @@ type cpRoute struct {
 
 func newCPRoute(t *testing.T) *cpRoute {
 	t.Helper()
+	return newCPRouteWith(t, false)
+}
+
+// newCPRouteWith seeds the run; crossCheck marks it plan_cross_check_required so a running report
+// takes the reconciled-ACK branch (result.Reconciliation non-nil) instead of the plain ACK.
+func newCPRouteWith(t *testing.T, crossCheck bool) *cpRoute {
+	t.Helper()
 	h, router, pool := cliLiveDB(t)
 	hold := &holdClearStore{Store: store.New(pool), entered: make(chan struct{}), release: make(chan struct{})}
 	h.wsvc = workersvc.New(hold, newHandlerTestBox(t), workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})
@@ -66,10 +73,44 @@ func newCPRoute(t *testing.T) *cpRoute {
 	cliMustExec(t, pool, "INSERT INTO workers(id,user_id,name,token_hash,status,protocol_capabilities,snapshot_register_nonce) VALUES($1,$2,'cp',$3,'online',$4,$5)",
 		worker, owner, sum[:], []string{}, r.nonce)
 	cliMustExec(t, pool, "UPDATE runs SET worker_id=$2, claim_generation=$3, claimed_at=now() - interval '1 hour' WHERE id=$1", run, worker, r.gen)
+	if crossCheck {
+		cliMustExec(t, pool, "UPDATE runs SET plan_cross_check_required=true WHERE id=$1", run)
+	}
 	if code, _ := r.post(`{"status":"running","claim_generation":4}`); code != http.StatusOK {
 		t.Fatalf("running report: code=%d", code)
 	}
 	return r
+}
+
+// TestCheckpointPublicationReconciledAckLiveDB: a running report that takes the reconciled ACK branch
+// (a plan-cross-check run) must still carry the checkpoint_publication outcome; it was dropped there.
+func TestCheckpointPublicationReconciledAckLiveDB(t *testing.T) {
+	r := newCPRouteWith(t, true)
+	s1 := time.Now().Add(-30 * time.Minute).UTC().Truncate(time.Second)
+	for _, c := range []struct {
+		state string
+		seq   int64
+		want  string
+	}{{"withheld", 1, "recorded"}, {"cleared", 2, "cleared"}} {
+		cp := map[string]any{"state": c.state, "claim_generation": r.gen, "register_nonce": r.nonce, "report_seq": c.seq}
+		if c.state == "withheld" {
+			cp["since"] = s1.Format(time.RFC3339)
+		}
+		body, err := json.Marshal(map[string]any{"status": "running", "claim_generation": r.gen, "checkpoint_publication": cp})
+		if err != nil {
+			t.Fatal(err)
+		}
+		code, ack := r.post(string(body))
+		if code != http.StatusOK {
+			t.Fatalf("%s: code=%d", c.state, code)
+		}
+		if _, ok := ack["lead_last_seq"]; !ok {
+			t.Fatalf("%s: response lacks lead_last_seq, so the reconciled branch was not taken: %v", c.state, ack)
+		}
+		var got string
+		_ = json.Unmarshal(ack["checkpoint_publication"], &got)
+		r.wantACK(c.state+" (reconciled ACK)", got, c.want)
+	}
 }
 
 func (r *cpRoute) post(body string) (int, map[string]json.RawMessage) {

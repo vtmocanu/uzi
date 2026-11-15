@@ -1789,6 +1789,7 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 		httpx.JSON(w, http.StatusOK, workerReconciledStateAck{
 			RevisionInputID: result.RevisionInputID, SupersededRevisionInputIDs: supersededIDs,
 			Run: ack["run"], CredentialSwitch: ack["credential_switch"], Disposition: ack["disposition"],
+			CheckpointPublication: result.CheckpointPublication, RegistrationEvidence: result.RegistrationEvidence,
 			leadReconciliationResponse: reconciliationResponse(0, result.Reconciliation),
 		})
 		return

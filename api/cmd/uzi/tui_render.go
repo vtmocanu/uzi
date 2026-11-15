@@ -270,6 +270,10 @@ func stateGlyphWord(status, health string, isPlanning, isRevising bool, landingS
 	}
 	// Recovery does no work while parked; stale health must not hide its wait state.
 	if status != statusRecoveryWait && stalledHealth[health] {
+		if health == healthPublicationWithheld {
+			// displayHealth's 20-cell label overflows the board status column (boardStatusWordWidth).
+			return "▲", "pub withheld"
+		}
 		return "▲", displayHealth(health)
 	}
 	if health == "waiting_account_cooldown" && (status == "claimed" || status == "running" || status == "awaiting_approval") {

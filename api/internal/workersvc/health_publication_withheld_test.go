@@ -166,6 +166,49 @@ func TestHealthPublicationWithheldEpisodeAndExit(t *testing.T) {
 	}
 }
 
+// pwLeaving is a run stored as withheld that now reads stalled (silent for 10 minutes, fact present).
+func pwLeaving(notified pgtype.Timestamptz) store.ListActiveRunsForHealthRow {
+	r := pwRun()
+	r.Health = healthPublicationWithheld
+	r.HealthReason = pgconv.Text(apitypes.ReasonCheckpointPublicationWithheld)
+	r.HealthSince = pgconv.Time(pwSince())
+	r.LastActivityAt = ago(10 * time.Minute)
+	r.HealthNotifiedAt = notified
+	return r
+}
+
+func TestHealthPublicationWithheldThenStalledNudges(t *testing.T) {
+	// Entering withheld from ok never nudges; a later fault out of withheld is a new episode and does.
+	r := pwRun()
+	_, svc, b := nudgeSvc(t, r, defaultHealthSettings())
+	svc.detectRunHealth(context.Background(), t0)
+	if len(b.healthNudges) != 1 || b.healthNudges[0] {
+		t.Fatalf("ok to withheld nudged: %v", b.healthNudges)
+	}
+	fs, svc, b := nudgeSvc(t, pwLeaving(pgtype.Timestamptz{}), defaultHealthSettings())
+	svc.detectRunHealth(context.Background(), t0)
+	w := lastWrite(t, fs, fs.active[0].ID)
+	wantHealth(t, "stalled", w.Health, w.HealthReason.String, healthStalled, reasonStalled)
+	if len(b.healthNudges) != 1 || !b.healthNudges[0] {
+		t.Fatalf("withheld to stalled did not nudge: %v", b.healthNudges)
+	}
+	if !w.HealthNotifiedAt.Valid || !w.HealthNotifiedAt.Time.Equal(t0) {
+		t.Fatalf("health_notified_at = %v, want %v", w.HealthNotifiedAt, t0)
+	}
+}
+
+func TestHealthPublicationWithheldThenStalledHonoursCooldown(t *testing.T) {
+	fs, svc, b := nudgeSvc(t, pwLeaving(ago(10*time.Minute)), defaultHealthSettings())
+	svc.detectRunHealth(context.Background(), t0)
+	w := lastWrite(t, fs, fs.active[0].ID)
+	if w.Health != healthStalled {
+		t.Fatalf("health = %q, want stalled", w.Health)
+	}
+	if len(b.healthNudges) != 1 || b.healthNudges[0] || w.HealthNotifiedAt.Valid {
+		t.Fatalf("nudged inside the cooldown: nudges=%v notified=%v", b.healthNudges, w.HealthNotifiedAt)
+	}
+}
+
 func TestHealthPublicationWithheldFromCooldownKeepsProjectedSince(t *testing.T) {
 	// The cooldown ended while the fact stays present: the run moves into withheld and the pill
 	// ages from the worker's since, not from the restamp a cooldown exit normally gets.
