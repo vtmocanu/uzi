@@ -31826,3 +31826,201 @@ describe("M2 external Now owned composition", () => {
     assert.equal(builds, 1, "old binding never enters raw factory again");
   });
 });
+
+describe("M2 actualRunner credential replacement", () => {
+  m2Runner.installHarness();
+  for (const [oldClaim, target] of [[SUBSCRIPTION, API_KEY], [API_KEY, SUBSCRIPTION],
+    [SUBSCRIPTION, { ...SUBSCRIPTION, generation: 20, chatgpt_account_id: "M2-B-account" }]] as const) {
+    it(`M2 actualRunner ${oldClaim.auth_mode} to ${target.auth_mode} account resumes saved thread`, async () => {
+      const { api, client } = m2Runner;
+      const next = { ...target, access_token: "M2-B-access", capability: "M2-B-capability" } as import("../src/protocol.js").ClaimCodexSecrets;
+      if ("chatgpt_account_id" in oldClaim && next.auth_mode === "subscription")
+        assert.notEqual(oldClaim.chatgpt_account_id, next.chatgpt_account_id);
+      const claim: ClaimResponse = { ...m2Runner.gitlabClaim(4202, {
+        plan_md: "Approved integration proof", plan_approved: true, plan_source: "seeded",
+      }), claim_generation: 7 };
+      claim.secrets = { ...claim.secrets, codex: oldClaim as import("../src/protocol.js").ClaimCodexSecrets };
+      api.setOwnershipStatus(claim.run_id, "running", 7);
+      let pending = false, cancelled = false, applies = 0, hooks = 0, factories = 0;
+      const reports: string[] = [];
+      const report = client.reportState.bind(client);
+      client.reportState = async (id, body, ...args) => {
+        reports.push(body.status); return report(id, body, ...args);
+      };
+      client.registrationNonce = () => "M2-original-nonce";
+      client.supportsInPlaceCodexCredentialSwitch = () => true;
+      const feature = client.hasFeature.bind(client);
+      client.hasFeature = name => name === "credential_switch_hold" || feature(name);
+      client.getRunOwnership = async () => ({ status: "running", claim_generation: 7,
+        claim_released: false, hold_reason: null });
+      client.getInputs = async () => ({ inputs: [], ...((cancelled || api.messages(claim.run_id).some(m => m.payload.event === "codex_response_usage")) ? { terminalCancelled: { run_id: claim.run_id, generation: 7 } } : {}),
+        ...(pending ? { credentialSwitch: { generation: 7, op_id: "M2-op", target_secret_id: "M2-target" } } : {}) });
+      client.preflightCodexCredentialSwitch = async () => ({ kind: "ready",
+        claimGeneration: 7, registerNonce: "M2-original-nonce", opId: "M2-op" });
+      client.applyCredentialSwitch = async (_id, req) => {
+        assert.equal(req.claimGeneration, 7);
+        assert.equal(req.opId, "M2-op");
+        applies++; pending = false;
+        return { kind: "codex_applied", codex: next, ordinal: 1,
+          capabilityEpoch: 42, messageSeq: 7, replay: false };
+      };
+      const savedId = "12345678-1234-1234-1234-123456789abc";
+      const dir = await fs.mkdtemp(path.resolve("../.uzi/scratch/M2-actualRunner-"));
+      const source = path.join(dir, "source"), store = path.join(dir, "store");
+      await fs.mkdir(path.join(source, "sessions"), { recursive: true });
+      await fs.writeFile(path.join(source, "sessions", `rollout-${savedId}.jsonl`), "{}\n");
+      await fs.writeFile(path.join(source, "auth.json"), "M2-A-auth-canary");
+      await fs.writeFile(path.join(source, "unapproved.txt"), "not a session");
+      await CodexSessionStore.persist(source, store);
+      const aEntered = installerBarrier(), bEntered = installerBarrier();
+      const cleanupEntered = installerBarrier(), cleanupContinue = installerBarrier();
+      const events: string[] = [];
+      const fileops: ReturnType<typeof fakeFileopHandle>[] = [];
+      const aResponder = epochResponder(savedId, "M2-A-turn", () => {
+        pending = true; aEntered.resolve();
+      });
+      let bTurns = 0;
+      const rig = makeMultiEpochRig([
+        c => {
+          if (c.method === "turn/interrupt")
+            c.transport.push(turnCompleted("interrupted", savedId, "M2-A-turn"));
+          return aResponder(c);
+        },
+        c => {
+          if (c.method === "thread/resume" || c.method === "thread/start") return { thread: { id: savedId } };
+          if (c.method === "turn/interrupt")
+            c.transport.push(turnCompleted("interrupted", savedId, bTurns > 1 ? "M2-B-idle" : "M2-B-turn"));
+          if (c.method === "turn/start") {
+            bTurns++;
+            if (bTurns === 1) {
+              // Pinned cold-resume replay precedes the matching inbound turn boundary.
+              c.transport.push(tokenUsageUpdated(savedId, "M2-historical", { totalTokens: 0 }));
+              c.transport.push({ kind: "turn_started", method: "turn/started", threadId: savedId,
+                turnId: "M2-B-turn", params: { threadId: savedId, turn: { id: "M2-B-turn" } } });
+              c.transport.push(agentMessage(`M2 B output ${next.access_token} ${next.capability}`, savedId));
+              c.transport.push(tokenUsageUpdated(savedId, "M2-B-turn", { inputTokens: 200, outputTokens: 100, totalTokens: 300 }));
+              c.transport.push(turnCompleted("completed", savedId, "M2-B-turn"));
+              bEntered.resolve();
+            }
+            return { turn: { id: bTurns === 1 ? "M2-B-turn" : "M2-B-idle" } };
+          }
+          return {};
+        },
+      ]);
+      const a = rig.epochs[0]!, b = rig.epochs[1]!;
+      const reap = a.root.reap.bind(a.root);
+      a.root.reap = async ms => {
+        cleanupEntered.resolve(); await cleanupContinue.promise;
+        const result = await reap(ms); events.push("A-reaped"); return result;
+      };
+      const launch = rig.deps.launchEffectRoot!;
+      let effects = 0, adoptions = 0;
+      rig.deps = { ...rig.deps,
+        wireFileop: () => { const handle = fakeFileopHandle(); fileops.push(handle); return handle.handle; },
+        launchEffectRoot: async (...args) => {
+          const root = await launch(...args), epoch = effects++;
+          const dispose = root.dispose.bind(root);
+          root.dispose = async (...disposeArgs) => {
+            if (epoch === 0) { cleanupEntered.resolve(); await cleanupContinue.promise; }
+            const result = await dispose(...disposeArgs);
+            if (epoch === 0) events.push("A-effect-disposed");
+            return result;
+          };
+          return root;
+        },
+        sessionStore: { ...rig.deps.sessionStore!,
+          inspect: async () => "present",
+          inspectSession: async (_dir, id) => CodexSessionStore.inspectSession(store, id),
+          persist: async () => CodexSessionStore.persist(source, store),
+          adopt: async () => {
+            const dest = path.join(dir, `adopted-${adoptions++}`);
+            await fs.mkdir(dest);
+            const result = await CodexSessionStore.adopt(store, dest);
+            if (adoptions > 1) {
+              assert.equal(await fs.readFile(path.join(dest, "sessions", `rollout-${savedId}.jsonl`), "utf8"), "{}\n");
+              await assert.rejects(fs.access(path.join(dest, "auth.json")));
+              await assert.rejects(fs.access(path.join(dest, "unapproved.txt")));
+            }
+            return result;
+          },
+        },
+      };
+      const release = rig.client.releaseCodex.bind(rig.client);
+      rig.client.releaseCodex = async (id, req) => req.capability === next.capability
+        ? { access_token: next.access_token } : release(id, req);
+      const refresh = rig.client.refreshCodex.bind(rig.client);
+      rig.client.refreshCodex = async (id, req) => req.capability === next.capability
+        ? { access_token: next.access_token, generation: req.observed_generation + 1,
+          chatgpt_account_id: next.auth_mode === "subscription" ? next.chatgpt_account_id : "unused-api-key-account", outcome: "advanced" }
+        : refresh(id, req);
+      const request = b.transport.request.bind(b.transport);
+      b.transport.request = async (method, params, opts) => {
+        events.push(method);
+        if (method === "account/login/start") {
+          assert.ok(events.includes("A-reaped"));
+          assert.ok(events.includes("A-effect-disposed"));
+          assert.ok(fileops[0]!.disposed() > 0, "A tool handle disposed before B auth");
+          assert.equal(rec(params).type, next.auth_mode === "api_key" ? "apiKey" : "chatgptAuthTokens");
+          assert.equal(rec(params)[next.auth_mode === "api_key" ? "apiKey" : "accessToken"], next.access_token);
+          if (next.auth_mode === "subscription") assert.equal(rec(params).chatgptAccountId, next.chatgpt_account_id);
+        }
+        if (method === "thread/resume") assert.equal(rec(params).threadId, savedId);
+        return request(method, params, opts);
+      };
+      const executor = makeExecutor(rig, bindingOf(oldClaim), noopLog, undefined, provider, m2Runner.homeDir);
+      const run = executor.run.bind(executor);
+      let worktree = "";
+      executor.run = async ctx => {
+        worktree = ctx.worktreePath;
+        await fs.writeFile(path.join(worktree, "M2-retained.txt"), "A work");
+        const attempt = ctx.attemptCodexCredentialSwitch!;
+        ctx.attemptCodexCredentialSwitch = async (...args) => { hooks++; return attempt(...args); };
+        return run(ctx);
+      };
+      const diagnostics = recordingLogger();
+      const runner = m2Runner.runnerWith(() => { factories++; return { executor, homeDir: m2Runner.homeDir }; },
+        m2Runner.fakeGitlab().gitlab, undefined, diagnostics.logger, {
+          credentialSwitchLedger: new (await import("../src/credential-switch-op-ledger.js")).CredentialSwitchOpLedger(dir),
+        });
+      const running = runner.execute(claim);
+      try {
+        await withTimeout(aEntered.promise, 5000, "M2 A turn");
+        await withTimeout(cleanupEntered.promise, 5000, "M2 A teardown");
+        assert.equal(b.transport.requests.length, 0, "B auth waits for A reap");
+        cleanupContinue.resolve();
+        await withTimeout(bEntered.promise, 5000, "M2 B turn").catch(error => {
+          throw new Error(JSON.stringify({ events, applies, hooks, diagnostics: diagnostics.lines, messages: api.messages(claim.run_id) }), { cause: error });
+        });
+        await withTimeout(running, 5000, "M2 B usage and ordinary cancellation");
+        assert.equal(applies, 1);
+        assert.equal(factories, 1, "no reclaim or second executor");
+        assert.ok(!reports.some(status => /credential_switch_(held|uncertain|hold_settled)/.test(status)));
+        const feed = api.messages(claim.run_id);
+        const bMessage = feed.find(m => String(m.payload.text).startsWith("M2 B output"));
+        assert.ok(bMessage, "B output reaches real Runner feed");
+        assert.equal(bMessage.credential_epoch_ordinal, 1);
+        const authority = (executor as unknown as { currentCodexAuthority: ReturnType<typeof createCodexEpochAuthority> }).currentCodexAuthority;
+        assert.equal(authority.ordinal, 1);
+        assert.equal(authority.capabilityEpoch, 42, "capability counter is distinct from the usage ordinal");
+        assert.equal(authority.binding.capability, next.capability);
+        const usage = feed.filter(m => m.payload.event === "codex_response_usage");
+        assert.equal(usage.length, 1, "only B emitted provider usage");
+        assert.equal(usage[0]!.credential_epoch_ordinal, authority.ordinal);
+        assert.equal(rec(usage[0]!.payload.usage).input_tokens, 200);
+        assert.equal(rec(usage[0]!.payload.usage).output_tokens, 100);
+        assert.doesNotMatch(JSON.stringify({ feed, diagnostics: diagnostics.lines }), /M2-B-access|M2-B-capability|M2-A-auth-canary/);
+        assert.ok(hooks > 0, "real Executor invoked Runner switch hook");
+        assert.ok(events.indexOf("account/login/start") < events.indexOf("thread/resume"));
+        assert.ok(events.indexOf("thread/resume") < events.indexOf("turn/start"));
+        assert.equal(b.transport.threadStartCount, 0);
+        assert.equal(await fs.readFile(path.join(worktree, "M2-retained.txt"), "utf8"), "A work");
+      } finally {
+        cancelled = true; pending = false; cleanupContinue.resolve();
+        a.transport.push(turnCompleted("interrupted", savedId, "M2-A-turn"));
+        b.transport.push(turnCompleted("interrupted", savedId, bTurns > 1 ? "M2-B-idle" : "M2-B-turn"));
+        await running;
+        await fs.rm(dir, { recursive: true, force: true });
+      }
+    });
+  }
+});
