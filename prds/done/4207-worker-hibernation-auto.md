@@ -1,6 +1,6 @@
 # PRD #4207: Worker hibernation: automatic hibernation of idle workers
 
-**Epic**: #4204. **Status**: Done (M1, M2). **Blocked by**: PRD #4205 and PRD #4206, both merged. The edge on #4206 is a release dependency, not a code one: automatic hibernation must not go live before the promised cleanup (user decision; see D5).
+**Epic**: #4204. **Status**: Done (M1, M2), 2026-11-15. **Blocked by**: PRD #4205 and PRD #4206, both merged. The edge on #4206 is a release dependency, not a code one: automatic hibernation must not go live before the promised cleanup (user decision; see D5).
 
 ## Problem
 
@@ -55,7 +55,7 @@ Acceptance examples:
 - It is bounded by the fleet size (≤512) and does at most N=10 admissions per pass, to pace scale-downs.
 - Candidates are ordered deterministically by `idle anchor` ascending, then id. A candidate refused within the last hour moves to the back of the order, so repeatedly blocked workers cannot starve the rest of the fleet.
 
-**Admin health.** A new **instance-scoped** `fleet.hibernation` check in `api/internal/healthsvc/checks.go`, with its `docs/admin-health.md` row and `apitypes/health.go` entry.
+**Admin health.** A new **instance-scoped** `fleet.hibernation` check in `api/internal/healthsvc/checks.go`, with its `docs/admin-health.md` row and `apitypes/health.go` entry (moot, see D10).
 
 - **What it warns about:** each worker idle past the threshold whose admission was refused, with the reason (custody, cordon, maintenance, roll, or a cleanup still in progress).
 - **Long-parked workers:** a worker whose only assigned run is parked (`recovery_wait`, `paused`, `limit_wait`) is non-idle by definition. Once the parked run is older than the threshold, it is listed as "blocked: assigned run parked (RUN, status)", so a long park is visible rather than silently keeping the worker awake.
