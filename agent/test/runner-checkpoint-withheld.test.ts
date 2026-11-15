@@ -35,6 +35,8 @@ type Subject = {
   noteCheckpointWithheld: (f: Flight, gated: boolean) => void;
   bootstrapRemediationRestrictions: (f: Flight, barePath?: string, branch?: string) => Promise<{ kind: string; enrolled?: boolean }>;
   restoreRemediationRestrictions: (f: Flight) => Promise<unknown>;
+  scanRemediationRange: (...a: unknown[]) => Promise<unknown>;
+  persistRemediationRestrictions: (...a: unknown[]) => Promise<void>;
 };
 
 const PATH_MARK = "src/zz-distinct-path-7f3a.txt";
@@ -117,7 +119,7 @@ async function withFlight(
 }
 
 it("withFlight rejects when the scenario body never runs", async () => {
-  await assert.rejects(withFlight(async () => {}, { bypassBody: true }));
+  await assert.rejects(withFlight(async () => {}, { bypassBody: true }), /executor body was entered/);
 });
 
 function uploads(): string[] {
@@ -149,6 +151,52 @@ it("a first trusted finding at the milestone scan reports withheld on the first 
     assert.equal(sent[0]!.report_seq, 1);
     assert.equal(f.checkpointWithheld?.phase, "withheld");
     assert.equal(attempts, 0, "the scan blocked before any publish attempt");
+    assert.equal(tips.length, 0);
+  });
+});
+
+it("a real trusted pre-pack finding records the flight's evidence, so a later gated hold opens its own episode", async () => {
+  const { sent } = seam();
+  uploads();
+  await withFlight(async (ctx, f, r) => {
+    trustedFinding(commit(ctx.worktreePath));
+    await ctx.checkpoint!({ reap: true });
+    await until(() => sent.length >= 1, "the withheld report");
+    assert.equal(sent[0]!.state, "withheld");
+    assert.deepEqual(f.trustedFindingEvidence, { runId: f.runId, barePath: f.barePath, branch: f.branch });
+    // The episode is retired (as a cleared ACK would), then a gated hold alone starts a new one
+    // because the pre-pack site's evidence persists.
+    f.checkpointWithheld = undefined;
+    r.noteCheckpointWithheld(f, true);
+    const current = (): Flight["checkpointWithheld"] => f.checkpointWithheld;
+    assert.deepEqual(current() && { e: current()!.episode, p: current()!.phase }, { e: 2, p: "withheld" });
+  });
+});
+
+it("a trusted finding inside the candidate admission scan records evidence even when persistence rejects", async () => {
+  const { sent } = seam();
+  const tips = uploads();
+  await withFlight(async (ctx, f, r) => {
+    const sha = commit(ctx.worktreePath);
+    // The admission selects its source from the flight's runner clone, which this harness leaves unset.
+    const clone = { path: String(f.worktreePath), attemptId: "a1" };
+    f.runnerClone = clone;
+    // Enrolled restrictions with confirmed facts, so the hold goes through the real admission.
+    f.remediationRestrictions = { roots: [], flaggedOIDs: [] };
+    r.bootstrapRemediationRestrictions = async () => ({ kind: "confirmed", enrolled: true });
+    r.restoreRemediationRestrictions = async () =>
+      recoveryRecord(f, { clonePath: clone.path, attemptId: clone.attemptId, ownedTip: sha, flaggedOIDs: [] });
+    git.readRemediationRestrictionFacts = async () => FACTS({ enrolled: true }) as never;
+    // The admission scan (not the pre-pack scan, which this direct publish never runs) is trusted
+    // and finds a secret; persistence of the restriction then fails.
+    r.scanRemediationRange = async () => ({
+      trusted: true, range: { tipSha: sha }, floorCandidates: [],
+      findings: [{ file: "remembered.txt", startLine: 1, commit: sha, ruleId: "github-pat" }],
+    });
+    r.persistRemediationRestrictions = async () => { throw new Error("persist failed"); };
+    assert.equal((await r.publishCheckpointOutcome(f, String(f.barePath), ctx.branch)).reason, "secret_remediation_pending");
+    await until(() => sent.length >= 1, "the withheld report");
+    assert.equal(sent[0]!.state, "withheld");
     assert.equal(tips.length, 0);
   });
 });

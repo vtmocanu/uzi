@@ -2718,7 +2718,7 @@ interface RunFlight {
   /** Issue #4257: the flight's trusted-finding provenance, the only thing that lets a hold outcome
    *  start a withheld episode. Set from a trusted scan finding, confirmed enrolled restriction facts
    *  or a matching recovery record; never from a latch alone (a failed facts read also latches).
-   *  Valid only while all three identity fields still equal the flight's. Content-free: no OIDs. */
+   *  Valid only while all three identity fields still equal the flight's. Holds no OIDs or finding content. */
   trustedFindingEvidence?: { runId: string; barePath: string; branch: string };
   /** Issue #4257: monotonic per flight. A new episode takes the next number. */
   withheldEpisodeSeq?: number;
@@ -4373,8 +4373,10 @@ export class RunRunner {
       checkRemediation();
       if (!record) return;
       const scan = await this.scanRemediationRange(flight, flight.barePath!, flight.branch!, record.ownedTip, { explicitTip: true });
-      if (scan.trusted && scan.findings.length)
+      if (scan.trusted && scan.findings.length) {
+        this.noteTrustedFinding(flight, flight.barePath, flight.branch);
         await this.persistRemediationRestrictions(flight, flight.barePath!, flight.branch!, scan.range.tipSha, scan.findings);
+      }
       if (!scan.trusted || scan.findings.length) throw new Error("remediation continuation history unavailable");
       for (const floor of this.remediationRangeFloors(scan.range, scan.floorCandidates))
         for (const root of flight.remediationRestrictions!.roots)
@@ -21967,6 +21969,9 @@ export class RunRunner {
               if (scan.trusted && scan.findings.length) {
                 findings.push({ tip: scan.range.tipSha, findings: scan.findings });
                 this.latchRemediationFindings(flight, barePath, branch, scan.findings);
+                // Issue #4257: the hold this throw becomes is gated on evidence, and
+                // recordFlaggedCommits is skipped here; a failing persist in the finally must not hide it.
+                this.noteTrustedFinding(flight, barePath, branch);
                 throw new SecretRemediationPendingError();
               }
               check();
@@ -30437,6 +30442,7 @@ export class RunRunner {
                     if (scan.trusted && scan.findings.length) {
                       deferredRestrictions = { tip: input.sourceTip, findings: scan.findings };
                       this.latchRemediationFindings(flight, bare, branch, scan.findings);
+                      this.noteTrustedFinding(flight, bare, branch);
                       return noteCallbackRefusal("secret_remediation_active");
                     }
                     this.retainedLifecycleGuard(flight);
