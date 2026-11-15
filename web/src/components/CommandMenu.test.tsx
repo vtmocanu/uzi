@@ -6,7 +6,8 @@ import { MemoryRouter, useLocation } from "react-router-dom";
 import { AppShell } from "./AppShell";
 import { Modal } from "./Modal";
 import { useCommandMenu } from "./CommandMenuContext";
-import { CommandMenu, decisionCommandItems, filterCommandItems, type CommandItem } from "./CommandMenu";
+import { CommandMenu, decisionCommandItems, filterCommandItems } from "./CommandMenu";
+import type { CommandItem } from "./commandMenuItems";
 import { HELD_WORK_HREF } from "./HeldWorkCard";
 import { visibleNavItems } from "./navItems";
 import { overviewDecisions } from "../lib/overview";
@@ -31,6 +32,9 @@ vi.mock("../lib/api", () => ({
       .mockResolvedValue({ total: 0, todo: 0, filed: 0, done: 0, dismissed: 0, false_positives: 0 }),
     runsInProgressCount: vi.fn().mockResolvedValue({ count: 0 }),
     listSchedules: vi.fn().mockResolvedValue([]),
+    listAgentTemplates: vi.fn().mockResolvedValue({ templates: [] }),
+    listWorkers: vi.fn().mockResolvedValue({ workers: [] }),
+    listSkills: vi.fn().mockResolvedValue({ skills: [] }),
     getFindingsStats: vi.fn().mockResolvedValue({ total: 0, todo: 0, filed: 0, done: 0, dismissed: 0, false_positives: 0 }),
     listRuns: vi.fn().mockResolvedValue({ runs: [] }),
     getRecoveryHolds: vi.fn(),
@@ -42,6 +46,12 @@ vi.mock("../lib/api", () => ({
   },
 }));
 vi.mock("../auth/AuthContext", () => ({ useAuth: vi.fn() }));
+// The real bundled docs would match ordinary queries ("work", "board"); the docs group has its
+// own tests in CommandMenu.groups.test.tsx.
+vi.mock("../lib/docs", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../lib/docs")>()),
+  docsForIndex: () => [],
+}));
 
 const mockApi = vi.mocked(api);
 // vi.mocked sees the legacy listRuns overload; the menu calls the summary one.
@@ -135,6 +145,10 @@ beforeEach(() => {
   // decision sources explicitly: no runs, no holds.
   listRunsMock.mockResolvedValue({ runs: [] });
   mockApi.getRecoveryHolds.mockResolvedValue(heldHolds({}));
+  mockApi.listAgentTemplates.mockResolvedValue({ templates: [] });
+  mockApi.listSchedules.mockResolvedValue([]);
+  mockApi.listWorkers.mockResolvedValue({ workers: [] });
+  mockApi.listSkills.mockResolvedValue({ skills: [] });
 });
 
 afterEach(() => {
