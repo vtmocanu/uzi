@@ -267,8 +267,9 @@ only; it never stops, fails or requeues the run.
   shared attempt cap; the done-point fallback remains subject to its safety checks
   and the same cap; `uzi run follow-up` can give the agent owner guidance"_. Both are
   fixed text: neither names a finding, path, rule or secret. The CLI prints the hint
-  as `HEALTH_HINT` in `uzi run get`, the TUI crew rail shows the reason with a short
-  pointer to `uzi run follow-up`, and the run view shows the hint beside the reason.
+  as `HEALTH_HINT` in `uzi run get`, the TUI crew rail shows the reason and the opening of the hint
+  (cut to fit the rail; the full hint is in `uzi run get` and the web run view), and
+  the run view shows the hint beside the reason.
 - **Precedence.** It ranks below looping (both causes), the plan and code
   cross-check waits, an account cooldown wait, stalled, a long tool call and a
   silent delegation, and above only the final near-timeout check.
