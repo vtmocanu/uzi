@@ -4976,40 +4976,52 @@ export class RunRunner {
       }
       const rootsKey = (roots: CompletionSource["roots"]): string => canonicalJson(
         roots.map(r => ({ sha: r.sha, contexts: r.contexts.map(c => canonicalJson(c)).sort() })).sort((a, b) => a.sha < b.sha ? -1 : a.sha > b.sha ? 1 : 0));
+      let publicationDiagnostic: "head_changed" | "roots_changed" | "fence_conflict" | "bare_unresolved" | undefined;
       const outcome = await authority.publishSource(bound.clonePath, lease, { timeoutMs: this.sourceUseEndWaitMs }, async ({ tx, store }) => {
-        const { barePath, branch, runId, generation } = bound.context;
-        // The roots are read without the bare lock: a bare mutation another operation left unresolved on this
-        // bare (a running pending record) means they may not describe a settled bare, so publication refuses.
-        await authority.hooks.assertBareClear(barePath, "publish-source");
-        if (await this.git.worktreeHead(bound.clonePath) !== bound.expectedHead) throw new Error("the source HEAD changed since it was bound");
-        if (rootsKey(await this.completionRoots(barePath, runId, generation)) !== rootsKey(bound.roots)) {
-          throw new Error("the source roots changed since they were bound");
+        try {
+          const { barePath, branch, runId, generation } = bound.context;
+          // The roots are read without the bare lock: a bare mutation another operation left unresolved on this
+          // bare (a running pending record) means they may not describe a settled bare, so publication refuses.
+          await authority.hooks.assertBareClear(barePath, "publish-source");
+          if (await this.git.worktreeHead(bound.clonePath) !== bound.expectedHead) {
+            publicationDiagnostic = "head_changed";
+            throw new Error("the source HEAD changed since it was bound");
+          }
+          if (rootsKey(await this.completionRoots(barePath, runId, generation)) !== rootsKey(bound.roots)) {
+            publicationDiagnostic = "roots_changed";
+            throw new Error("the source roots changed since they were bound");
+          }
+          const core = codex ? buildCodexSourceCore({ store, base: bound, lease, seal }) : buildClaudeSourceCore({ store, base: bound, lease });
+          const certified = await store.certifySource(tx, lease, core, codex ? { seal } : undefined);
+          await this.recovery.publishCompletionSource({
+            bound, certified,
+            installFence: async () => {
+              const expected = { runId, clonePath: bound.clonePath, ...(bound.attemptId === undefined ? {} : { attemptId: bound.attemptId }) };
+              const fence = sourceFenceOf(certified);
+              // A fence an earlier, never-completed publication left behind (a published source is never resumed:
+              // GitCache refuses a fenced journal) is replaced only when the authority slot proves it dead: this
+              // publication's lease is the slot's current, active, owned epoch, and the old fence names a
+              // different epoch.
+              const old = await this.git.readCompletionSourceFence(barePath, branch, expected);
+              let replaceStale: { expectedOld: typeof fence } | undefined;
+              if (old !== undefined && serializeSourceFence(old) !== serializeSourceFence(fence)) {
+                const slot = await store.readSlot(tx, await store.slotKey(tx, bound.clonePath));
+                if (slot && slot.state === "active" && slot.owner.worker === store.workerIncarnation &&
+                    slot.epoch === leaseEpoch(lease) && old.sourceUseEpoch !== slot.epoch) replaceStale = { expectedOld: old };
+              }
+              return this.git.installCompletionSourceFence(barePath, branch, expected, fence, replaceStale ? { replaceStale } : {});
+            },
+            commit: captureIds => store.transition(tx, lease, codex ? "sealed" : "claude_ready", { source: certified, captureIds }),
+          });
+        } catch (error) {
+          // Keep the finite diagnostic locally: publishSource consumes callback errors.
+          if (error instanceof AuthorityRefusal && error.kind === "bare_unresolved") publicationDiagnostic = "bare_unresolved";
+          else if (isCompletionSourceFenceError(error) && error.kind === "fence_conflict") publicationDiagnostic = "fence_conflict";
+          throw error;
         }
-        const core = codex ? buildCodexSourceCore({ store, base: bound, lease, seal }) : buildClaudeSourceCore({ store, base: bound, lease });
-        const certified = await store.certifySource(tx, lease, core, codex ? { seal } : undefined);
-        await this.recovery.publishCompletionSource({
-          bound, certified,
-          installFence: async () => {
-            const expected = { runId, clonePath: bound.clonePath, ...(bound.attemptId === undefined ? {} : { attemptId: bound.attemptId }) };
-            const fence = sourceFenceOf(certified);
-            // A fence an earlier, never-completed publication left behind (a published source is never resumed:
-            // GitCache refuses a fenced journal) is replaced only when the authority slot proves it dead: this
-            // publication's lease is the slot's current, active, owned epoch, and the old fence names a
-            // different epoch.
-            const old = await this.git.readCompletionSourceFence(barePath, branch, expected);
-            let replaceStale: { expectedOld: typeof fence } | undefined;
-            if (old !== undefined && serializeSourceFence(old) !== serializeSourceFence(fence)) {
-              const slot = await store.readSlot(tx, await store.slotKey(tx, bound.clonePath));
-              if (slot && slot.state === "active" && slot.owner.worker === store.workerIncarnation &&
-                  slot.epoch === leaseEpoch(lease) && old.sourceUseEpoch !== slot.epoch) replaceStale = { expectedOld: old };
-            }
-            return this.git.installCompletionSourceFence(barePath, branch, expected, fence, replaceStale ? { replaceStale } : {});
-          },
-          commit: captureIds => store.transition(tx, lease, codex ? "sealed" : "claude_ready", { source: certified, captureIds }),
-        });
       });
       if (outcome.published) return "published";
-      unpublished("publication_refused");
+      unpublished(publicationDiagnostic ?? "publication_refused");
       return outcome.ended ? "ended" : "unpublished";
     } catch {
       return unpublished("publication_unconfirmed");

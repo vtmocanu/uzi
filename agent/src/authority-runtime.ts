@@ -1493,7 +1493,7 @@ export class AuthorityRuntime implements AuthorityScope {
         { dataDir: this.#options.lifetime.dataDir, workerToken: this.#options.workerToken }, path.resolve(bare));
     if (slot?.pending?.status === "running") {
       this.#logBareRefusal(slot, tx !== undefined);
-      throw new AuthorityRefusal(`${op}: an unresolved ${slot.pending.kind} (${slot.pending.operation}) covers this bare`);
+      throw new AuthorityRefusal(`${op}: an unresolved ${slot.pending.kind} (${slot.pending.operation}) covers this bare`, "bare_unresolved");
     }
   }
 

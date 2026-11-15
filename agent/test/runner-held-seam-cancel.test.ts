@@ -527,7 +527,7 @@ describe("issue #3860: owner cancel at a held-predecessor refusal", { skip: !HAS
     assertPlainStop(r, "timeout");
   });
 
-  it("a retained stop outside the two seam sites (fresh-claim stopOnHeldSource) never invokes the helper", async t => {
+  it("a fresh-claim held-source refusal invokes the helper once but incomplete ownership cannot authorize cancel", async t => {
     const r = await rig(t, { site: "B", iid: 3950, outbox: "ok" });
     const freshRunId = randomUUID();
     t.mock.method(r.runner as Priv, "runnerCloneForClaim", async () => {
@@ -537,10 +537,15 @@ describe("issue #3860: owner cancel at a held-predecessor refusal", { skip: !HAS
     });
     api.setOwnershipStatus(freshRunId, "running", 2);
     await r.runner.execute(gitlabClaim(3951, { run_id: freshRunId, claim_generation: 2 }));
-    assert.equal(r.seamCalls(), 0, "the seam helper is not invoked");
+    assert.equal(r.seamCalls(), 1, "the held-source refusal invokes the helper exactly once");
     assert.equal(r.started(), 0);
-    assert.equal(api.ownershipRequests.includes(freshRunId), false, "no ownership cancel read for the fresh claim");
-    assert.equal(api.states.some(s => s.runId === freshRunId && s.body.status === "failed"), false, "no failed report");
+    assert.equal(api.ownershipRequests.filter(id => id === freshRunId).length, 1, "one bounded ownership cancel read");
+    // The default fixture names the generation and requests cancel, but omits claim_released: false.
+    // readCancellationRequested requires all authorization fields before committing cancellation.
+    assert.equal(r.flight.steering.isCancelled(), false, "incomplete ownership cannot authorize cancel");
+    assert.equal(api.states.some(s => s.runId === freshRunId && s.body.status === "failed"), false, "no terminal report");
+    assert.deepEqual(journaledGenerations(r), [], "no unauthorized terminal outcome is journaled");
+    assert.equal(treeHash(r.pred.clonePath), r.before, "predecessor custody is untouched");
     assert.ok(r.lines.some(l => String((l as { msg?: string }).msg).includes("clone path held by an earlier flight")),
       "the claim stopped through stopOnHeldSource");
   });

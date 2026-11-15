@@ -1791,11 +1791,11 @@ class AuthorityRefusedError extends Error {
 
 /** The retained journal does not carry the exact fence an install or retirement expected. */
 class CompletionSourceFenceError extends Error {
-  constructor(message: string) { super(message); this.name = "CompletionSourceFenceError"; }
+  constructor(message: string, readonly kind?: "fence_conflict") { super(message); this.name = "CompletionSourceFenceError"; }
 }
 
 /** issue #3645: true for the refusal a non-certified retirement raises on a fenced journal. The class stays private. */
-export function isCompletionSourceFenceError(e: unknown): boolean {
+export function isCompletionSourceFenceError(e: unknown): e is CompletionSourceFenceError {
   return e instanceof CompletionSourceFenceError;
 }
 
@@ -9927,7 +9927,7 @@ export class GitCache {
         serializeSourceFence(journal.completionSourceFence) !== serializeSourceFence(want);
       if (replacing && (opts.replaceStale === undefined ||
           serializeSourceFence(journal.completionSourceFence!) !== serializeSourceFence(parseSourceFence(opts.replaceStale.expectedOld)))) {
-        throw new CompletionSourceFenceError("completion source already carries a different fence");
+        throw new CompletionSourceFenceError("completion source already carries a different fence", "fence_conflict");
       }
       if (journal.completionSourceFence === undefined || replacing) {
         await this.writeRecovery(barePath, branch, { ...journal, completionSourceFence: want });
