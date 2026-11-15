@@ -9,6 +9,7 @@
 // admission. runner-independent-restore-seed.test.ts covers the same eligible verdict with the restore ON.
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, it, mock } from "node:test";
 import { randomUUID } from "node:crypto";
@@ -25,6 +26,13 @@ import {
   type RigOptions, type Rig,
 } from "./restore-route-rig.js";
 
+// Hosted runs may themselves execute inside an attempt worktree. Keep that shape
+// in every fixture's parent so suffix removal must operate on the basename only.
+beforeEach(t => {
+  const parent = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "restore-route.attempt-")));
+  mock.method(os, "tmpdir", () => parent);
+  t.after(() => fs.rmSync(parent, { recursive: true, force: true }));
+});
 installHarness();
 rigDefaults.independentRestore = false;
 
@@ -34,6 +42,14 @@ afterEach(() => { cleanupRig(); });
 
 describe("the independent restore route (issue #3644 m4a)", () => {
   beforeEach(() => { resetRigRoots(); });
+
+  it("ledger fixtures preserve an ancestor .attempt- directory", async () => {
+    const r = await buildRig();
+    assert.ok(path.dirname(r.pPath).includes(".attempt-"));
+    const entry = JSON.parse(olderLedgerEntry(r, "retired")) as { clonePath: string; attemptId: string };
+    assert.equal(path.dirname(entry.clonePath), path.dirname(r.pPath));
+    assert.equal(path.basename(entry.clonePath), `issue-${IID}.attempt-${entry.attemptId}`);
+  });
 
   it("an eligible foreign-active predecessor stops nonterminally, writes nothing, and says seeding is not enabled", async () => {
     const r = await buildRig();
@@ -139,7 +155,10 @@ describe("the independent restore route (issue #3644 m4a)", () => {
       { name: "a stopped marker of the run", reason: "conflicting_attribution", arrange: r => { cfgAdd(r, `uzi-stopped.${r.runId}.entry`, "{}"); } },
       { name: "another live ledger entry of the run", reason: "conflicting_attribution", arrange: r => {
         const id = mintAttemptId(2);
-        cfgAdd(r, r.ledgerKey, JSON.stringify({ attemptId: id, runId: r.runId, clonePath: `${r.pPath.replace(/\.attempt-.*$/, "")}.attempt-${id}`, state: "live" }));
+        const canonical = path.join(path.dirname(r.pPath), path.basename(r.pPath).replace(/\.attempt-.*$/, ""));
+        const clonePath = `${canonical}.attempt-${id}`;
+        assert.equal(path.dirname(clonePath), path.dirname(r.pPath), "the conflicting ledger fixture stays inside its original bare's clone directory");
+        cfgAdd(r, r.ledgerKey, JSON.stringify({ attemptId: id, runId: r.runId, clonePath, state: "live" }));
       } },
       { name: "another key naming the predecessor's path", reason: "conflicting_attribution", arrange: r => {
         cfgSet(r, "uzi-recovery.agent/issue-9998.clone", JSON.stringify({ runId: randomUUID(), clonePath: r.pPath }));
