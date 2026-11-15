@@ -32342,12 +32342,15 @@ describe("M2 actualRunner credential replacement", () => {
   for (const [oldClaim, target] of [[SUBSCRIPTION, API_KEY], [API_KEY, SUBSCRIPTION],
     [SUBSCRIPTION, { ...SUBSCRIPTION, generation: 20, chatgpt_account_id: "M2-B-account" }]] as const) {
     for (const phase of ["factory", "already-running-body"] as const) {
-      for (const publication of ["baseline", "persist-clear-confirmed", "persist-clear-rejected", "persist-clear-lost-reply", "gated", "before-scope-clear", "after-scope-clear", "before-scope-install", "after-scope-install", "before-executor-publication", "before-Now-publication", "after-Now-publication", "before-B-preparation", "Now-finish-false", "publish-failure", "now-publish-failure", "login-failure", "subscription-refresh", "api-key-refresh", "subscription-refresh-prepare-failure", "subscription-refresh-cancel", "crash-after-a-teardown-recovery", "crash-apply-reply-lost-recovery", "crash-apply-ack-recovery", "crash-login-recovery"] as const) {
+      for (const publication of ["baseline", "persist-clear-confirmed", "persist-clear-rejected", "persist-clear-lost-reply", "persist-clear-empty-reply", "persist-clear-pending", "inspect-missing-clear-confirmed", "inspect-unknown-clear-confirmed", "gated", "before-scope-clear", "after-scope-clear", "before-scope-install", "after-scope-install", "before-executor-publication", "before-Now-publication", "after-Now-publication", "before-B-preparation", "Now-finish-false", "publish-failure", "now-publish-failure", "login-failure", "subscription-refresh", "api-key-refresh", "subscription-refresh-prepare-failure", "subscription-refresh-cancel", "crash-after-a-teardown-recovery", "crash-apply-reply-lost-recovery", "crash-apply-ack-recovery", "crash-login-recovery"] as const) {
         if (publication !== "baseline" && (phase !== "factory" || (oldClaim !== API_KEY && target !== API_KEY))) continue;
         if (publication === "subscription-refresh" && target.auth_mode !== "subscription") continue;
         if (publication === "api-key-refresh" && target.auth_mode !== "api_key") continue;
+        const inspectFailure = publication === "inspect-missing-clear-confirmed" || publication === "inspect-unknown-clear-confirmed";
+        const confirmedClear = publication === "persist-clear-confirmed" || inspectFailure;
         const persistFailure = publication === "persist-clear-confirmed" ||
-          publication === "persist-clear-rejected" || publication === "persist-clear-lost-reply";
+          publication === "persist-clear-rejected" || publication === "persist-clear-lost-reply" ||
+          publication === "persist-clear-empty-reply" || publication === "persist-clear-pending" || inspectFailure;
         if (persistFailure && (oldClaim !== API_KEY || target !== SUBSCRIPTION || phase !== "factory")) continue;
         const injectedStage = ["before-scope-clear", "after-scope-clear", "before-scope-install", "after-scope-install", "before-executor-publication", "before-Now-publication", "after-Now-publication", "before-B-preparation", "Now-finish-false"].includes(publication) ? publication : undefined;
         const scopeClearFailure = injectedStage === "before-scope-clear" || injectedStage === "after-scope-clear";
@@ -32372,7 +32375,7 @@ describe("M2 actualRunner credential replacement", () => {
           const missingRecoveryRollout = recoveryMode.endsWith("missing retained rollout");
       it((publication === "baseline"
         ? `M2 actualRunner ${oldClaim.auth_mode} to ${target.auth_mode} ${phase} account resumes saved thread`
-        : persistFailure ? `Codex real rollout persist failure before teardown (${publication})`
+        : persistFailure ? `Codex real rollout ${inspectFailure ? "inspection unavailable" : "persist failure"} before teardown (${publication})`
         : publication === "gated" ? `Codex ${oldClaim.auth_mode} to ${target.auth_mode} publication gates Now, retired A and B preparation children; finished B root dispatch admits work${positiveBChild ? "; finished B preparation broker dispatches an actual child" : ""}`
         : crashRecovery ? publication === "crash-after-a-teardown-recovery"
           ? "Codex switch crash after A teardown before apply recovers committed A without switching"
@@ -32418,6 +32421,7 @@ describe("M2 actualRunner credential replacement", () => {
         let switchResult: Awaited<ReturnType<NonNullable<RunContext["attemptCodexCredentialSwitch"]>>> | undefined;
         let switchError: unknown;
         let failingPersist = false, persistFailures = 0, teardownAttempts = 0;
+        let persistedCopies = 0, unavailableInspections = 0;
         const failedClearRequests: { generation?: number; opId?: string; reason?: string }[] = [];
         const reports: string[] = [];
         const dispositions: { status: string; failure_reason?: string }[] = [];
@@ -32428,7 +32432,10 @@ describe("M2 actualRunner credential replacement", () => {
           if (persistFailure && body.status === "credential_switch_failed") {
             failedClearRequests.push({ generation: body.claim_generation, opId: body.op_id, reason: body.failure_reason });
             if (publication === "persist-clear-rejected") return { applied: false };
-            pending = false; // The lost reply commits the clear without acknowledging it.
+            if (publication === "persist-clear-pending") return { applied: true };
+            pending = false; // Empty and lost replies commit the clear without acknowledging it.
+            // Fault injection: a malformed transport acknowledgment must fail closed.
+            if (publication === "persist-clear-empty-reply") return {} as unknown as Awaited<ReturnType<typeof client.reportState>>;
             if (publication === "persist-clear-lost-reply") throw new Error("lost failed-clear reply");
             return { applied: true };
           }
@@ -32568,10 +32575,22 @@ describe("M2 actualRunner credential replacement", () => {
           },
           sessionStore: { ...rig.deps.sessionStore!,
             inspect: async () => "present",
-            inspectSession: async (_dir, id) => CodexSessionStore.inspectSession(store, id),
+            inspectSession: async (_dir, id) => {
+              if (failingPersist && inspectFailure) {
+                assert.equal(id, savedId, "real lease inspects the exact saved thread");
+                assert.equal(persistedCopies, 1, "real copy completes before unavailable inspection");
+                assert.equal(await CodexSessionStore.inspectSession(store, id), "present",
+                  "injected unavailability follows an actual usable persisted copy");
+                unavailableInspections++;
+                return publication === "inspect-missing-clear-confirmed" ? "absent" : "unknown";
+              }
+              return CodexSessionStore.inspectSession(store, id);
+            },
             persist: async () => {
-              if (failingPersist) { persistFailures++; throw new Error("injected real rollout persist failure"); }
-              return CodexSessionStore.persist(source, store);
+              if (failingPersist && !inspectFailure) { persistFailures++; throw new Error("injected real rollout persist failure"); }
+              const result = await CodexSessionStore.persist(source, store);
+              if (failingPersist) persistedCopies++;
+              return result;
             },
             adopt: async () => {
               const dest = path.join(dir, `adopted-${adoptedDestinations.length}`);
@@ -33043,7 +33062,10 @@ describe("M2 actualRunner credential replacement", () => {
           }
           if (persistFailure) {
             await withTimeout(switchSettled.promise, 5000, "real pre-teardown persist refusal settles");
-            assert.equal(persistFailures, 1, "real lease reaches the failing session-store copy");
+            assert.equal(failingPersist, false, "persistRollout injection is restored before continuation or final cleanup");
+            assert.equal(persistFailures, inspectFailure ? 0 : 1, "real lease reaches the session-store copy");
+            assert.equal(persistedCopies, inspectFailure ? 1 : 0, "inspection refusal follows a successful real copy");
+            assert.equal(unavailableInspections, inspectFailure ? 1 : 0, "inspection injection runs only inside real persistRollout");
             assert.deepEqual(failedClearRequests, [{ generation: 7, opId: "M2-op", reason: "rollout_persist_failed" }]);
             assert.equal(preflights, 0, "unproven rollout never reaches preflight");
             assert.equal(teardownAttempts, 0, "switch lease never tears down A");
@@ -33051,7 +33073,7 @@ describe("M2 actualRunner credential replacement", () => {
             assert.equal(b.transport.requests.length, 0, "no B auth or ordinary work");
             assert.equal(rig.providerLaunches(), 1);
             assert.equal(factories, 1);
-            if (publication === "persist-clear-confirmed") {
+            if (confirmedClear) {
               assert.equal(switchError, undefined);
               assert.equal(switchResult, "continued_A");
               assert.equal(pending, false);
@@ -33066,7 +33088,7 @@ describe("M2 actualRunner credential replacement", () => {
               assert.equal(switchError.name, "CredentialSwitchRetainedStop");
               assert.equal(reopenAttempts, 0);
               assert.equal(a.transport.turnStartCount, 1, "unacknowledged clear cannot admit another A turn");
-              assert.equal(pending, publication === "persist-clear-rejected");
+              assert.equal(pending, publication === "persist-clear-rejected" || publication === "persist-clear-pending");
             }
             assert.equal(await fs.readFile(path.join(worktree, "M2-retained.txt"), "utf8"), "A work");
             cancelled = true;
@@ -33076,8 +33098,8 @@ describe("M2 actualRunner credential replacement", () => {
             assert.equal(teardownAttempts, 0);
             assert.equal(applies, 0);
             assert.equal(b.transport.requests.length, 0);
-            assert.equal(a.transport.turnStartCount, publication === "persist-clear-confirmed" ? 2 : 1);
-            if (publication !== "persist-clear-confirmed") {
+            assert.equal(a.transport.turnStartCount, confirmedClear ? 2 : 1);
+            if (!confirmedClear) {
               assert.ok(!reports.some(status => ["completed", "failed", "cancelled", "credential_switch"].includes(status)),
                 "unconfirmed clear retains custody without terminal or release reporting");
               assert.equal(await fs.readFile(path.join(worktree, "M2-retained.txt"), "utf8"), "A work",
