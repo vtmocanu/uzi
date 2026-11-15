@@ -544,6 +544,23 @@ it("a fresh scan finding recorded after admission, during the upload, survives t
   });
 });
 
+it("commits re-asserted from a record are known: a restarted flight's rescan of them does not block the clear", async () => {
+  const { sent } = seam();
+  uploads();
+  await withFlight(async (ctx, f, r) => {
+    const sha = commit(ctx.worktreePath);
+    f.secretRemediation = { attempts: 0, flaggedCommits: [sha] };
+    r.noteTrustedFinding(f, String(f.barePath), ctx.branch, "record", [sha]); // e.g. the restored journal record
+    assert.equal((await r.publishCheckpointOutcome(f, String(f.barePath), ctx.branch)).reason, "secret_remediation_pending");
+    await until(() => sent.length >= 1, "withheld");
+    r.noteTrustedFinding(f, String(f.barePath), ctx.branch, "scan", [{ commit: sha }]); // the mid-run rescan
+    f.secretRemediation = undefined;
+    assert.deepEqual(await r.publishCheckpointOutcome(f, String(f.barePath), ctx.branch), { published: true });
+    await until(() => f.checkpointWithheld === undefined, "episode retired by the cleared ACK");
+    assert.equal(f.trustedFindingEvidence, undefined, "the record's commit was already known");
+  });
+});
+
 it("historical provenance (confirmed enrolled facts, a journal record) never revives retired evidence; only a scan finding does", async () => {
   const { sent } = seam();
   const tips = uploads();

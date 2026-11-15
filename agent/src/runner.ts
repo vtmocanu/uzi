@@ -22112,8 +22112,8 @@ export class RunRunner {
 
   /** Issue #4257: record trusted-finding provenance, only for this flight's own run, bare and branch.
    *  Changes the diagnostic's eligibility and nothing else (no hold, latch or publish outcome).
-   *  `scan` is a trusted scan finding: when it is NEWER (no `findings` given, a finding without a valid
-   *  commit, or a flagged commit not yet in trustedFindingCommits) it advances trustedFindingSeq and
+   *  `scan` is a trusted scan finding: when it is NEWER (no `commits` given, a finding without a valid
+   *  commit, or a flagged commit not yet in trustedFindingCommits; an empty list is not newer) it advances trustedFindingSeq and
    *  lifts a retirement. A scan that only re-finds known commits, and every `record` call (enrolled
    *  facts, a journal record, a persisted remediation record; its flagged commits become known), re-asserts historical provenance: it is
    *  ignored once an accepted publication retired the evidence, and never advances the seq. */
