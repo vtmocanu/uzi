@@ -165,3 +165,35 @@ func TestHealthPublicationWithheldEpisodeAndExit(t *testing.T) {
 		t.Fatalf("stalled to withheld write = %+v", w)
 	}
 }
+
+func TestHealthPublicationWithheldFromCooldownKeepsProjectedSince(t *testing.T) {
+	// The cooldown ended while the fact stays present: the run moves into withheld and the pill
+	// ages from the worker's since, not from the restamp a cooldown exit normally gets.
+	r := pwRun()
+	r.Health = healthWaitingAccountCooldown
+	r.HealthReason = pgconv.Text(apitypes.AccountCooldownReason)
+	r.HealthSince = ago(5 * time.Minute)
+	fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}}
+	healthSvc(fs, defaultHealthSettings()).detectRunHealth(context.Background(), t0)
+	w := lastWrite(t, fs, r.ID)
+	if w.Health != healthPublicationWithheld || !w.HealthSince.Valid || !w.HealthSince.Time.Equal(pwSince()) {
+		t.Fatalf("cooldown to withheld write = %+v, want since %v", w, pwSince())
+	}
+}
+
+func TestHealthPublicationWithheldStaleSinceIsRewritten(t *testing.T) {
+	// The fact was cleared and re-withheld with a fresh since inside one tick: same enum and
+	// reason, but the stored health_since is stale, so the write must not be skipped.
+	r := pwRun()
+	r.Health = healthPublicationWithheld
+	r.HealthReason = pgconv.Text(apitypes.ReasonCheckpointPublicationWithheld)
+	r.HealthSince = ago(time.Hour)
+	fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}}
+	if n := healthSvc(fs, defaultHealthSettings()).detectRunHealth(context.Background(), t0); n != 1 {
+		t.Fatalf("stale since was skipped: n=%d", n)
+	}
+	w := lastWrite(t, fs, r.ID)
+	if !w.HealthSince.Time.Equal(pwSince()) {
+		t.Fatalf("since = %+v, want %v", w.HealthSince, pwSince())
+	}
+}

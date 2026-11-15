@@ -418,3 +418,24 @@ func TestCheckpointPublicationWriteFailureDoesNotFailStatusLiveDB(t *testing.T) 
 		t.Fatalf("status = %q, want running", r.Status)
 	}
 }
+
+func TestCheckpointWithheldStatusSinceChangeStartsFreshEpisodeLiveDB(t *testing.T) {
+	f := newCPFixture(t)
+	run := f.runningRun()
+	s1 := f.since()
+	if got := f.set(t, run, f.workerID, cpGen, f.nonce, 1, s1); got != "recorded" {
+		t.Fatalf("first set = %q", got)
+	}
+	// running -> park -> running under the same worker, generation and nonce moves status_since
+	// while the fact stays present.
+	newStatusSince := f.statusSince.Add(10 * time.Minute)
+	f.env.exec(`UPDATE runs SET status_since=$2 WHERE id=$1`, run, newStatusSince)
+	s2 := f.claimedAt.Add(45 * time.Minute)
+	if got := f.set(t, run, f.workerID, cpGen, f.nonce, 2, s2); got != "recorded" {
+		t.Fatalf("higher set = %q", got)
+	}
+	c := f.fact(t, run)
+	if c.since == nil || !c.since.Equal(s2) || c.statusSince == nil || !c.statusSince.Equal(newStatusSince) {
+		t.Fatalf("fact after status_since change: %+v, want fresh since %v and status_since %v", c, s2, newStatusSince)
+	}
+}

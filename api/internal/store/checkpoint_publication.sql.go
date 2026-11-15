@@ -93,7 +93,8 @@ WITH target AS (
          (runs.checkpoint_withheld_since IS NOT NULL
           AND runs.checkpoint_withheld_worker_id IS NOT DISTINCT FROM $1::uuid
           AND runs.checkpoint_withheld_generation IS NOT DISTINCT FROM $2::bigint
-          AND runs.checkpoint_withheld_nonce IS NOT DISTINCT FROM $3::text) AS same_episode,
+          AND runs.checkpoint_withheld_nonce IS NOT DISTINCT FROM $3::text
+          AND runs.checkpoint_withheld_status_since IS NOT DISTINCT FROM runs.status_since) AS same_episode,
          runs.checkpoint_withheld_since AS prior_since
   FROM runs
   WHERE runs.id = $5::uuid AND runs.worker_id = $1::uuid AND runs.claim_generation = $2::bigint

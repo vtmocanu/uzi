@@ -520,7 +520,8 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 	var changed int64
 	for _, r := range runs {
 		target, reason := s.healthTargetFor(ctx, now, r, th)
-		if r.Health == target && textEq(r.HealthReason, reason) {
+		if r.Health == target && textEq(r.HealthReason, reason) &&
+			(target != healthPublicationWithheld || r.HealthSince.Valid && r.PublicationWithheldSince.Valid && r.HealthSince.Time.Equal(r.PublicationWithheldSince.Time)) {
 			continue // nothing changed — skip the write (and, later, its broadcast)
 		}
 		// Nudge-worthiness (Decision 7): only the ok→flagged transition (a new
@@ -634,7 +635,8 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		leftReserve := target != healthOK && r.Health == healthWaitingWorker && r.HealthReason.Valid &&
 			isReserveHoldReason(r.HealthReason.String) && !isReserveHoldReason(reason)
 		since := healthSince(now, target, r)
-		if leftPin || leftMaintenance || leftReserve || leftAdmission || leftAccountCooldown {
+		// publication_withheld keeps the projected (clamped worker) since whatever state it came from.
+		if target != healthPublicationWithheld && (leftPin || leftMaintenance || leftReserve || leftAdmission || leftAccountCooldown) {
 			since = pgconv.Time(now)
 		}
 		notifiedAt := pgtype.Timestamptz{}
