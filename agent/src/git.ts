@@ -20976,8 +20976,9 @@ try {
       const ignored = { files: ignoredPaths.length, bytes: ignoredBytes };
 
       // 3. Clean: the agent-writable real index (stat cache and entry oids) is never trusted for this verdict, so a
-      // private index is rebuilt from HEAD and the work tree (raw bytes: attributes are pinned to the empty tree, and
-      // filter config and info/attributes were refused above) and must reproduce HEAD's tree. No ref or real-index write.
+      // private index is rebuilt from HEAD and the work tree (no attribute, filter, or autocrlf/eol conversion
+      // applies: attributes are pinned to the empty tree, autocrlf/safecrlf/eol are pinned off, and filter config and
+      // info/attributes were refused above) and must reproduce HEAD's tree. No ref or real-index write.
       if (entries.size === 0) {
         privateIndex = path.join(runnerTmpdir() || os.tmpdir(), `uzi-term-idx-${randomUUID()}`);
         const cleanEnv = { GIT_INDEX_FILE: privateIndex };
@@ -21011,7 +21012,9 @@ try {
         if (row.mode !== "100644" && row.mode !== "100755" && row.mode !== "120000") return refused("staged_mode");
         if (row.mode !== expectedMode) return refused("staged_mode");
       }
-      for (const [rel, info] of entries) if (info.untracked && !stagedPaths.has(rel)) return refused("staged_set_mismatch");
+      // Backstop: every enumerated entry (tracked, untracked or deleted) must stage to a change, so a conversion that
+      // makes a status-visible edit stage to HEAD's bytes fails closed instead of capturing HEAD's content.
+      for (const rel of entries.keys()) if (!stagedPaths.has(rel)) return refused("staged_set_mismatch");
       const live = staged.filter((r) => r.status !== "D");
       const sizes = await this.wipBlobSizes(clonePath, live.map((r) => r.oid)).catch(() => fail("staged_unsized"));
       let stagedTotal = 0;
@@ -28407,9 +28410,11 @@ const TERMINAL_CREDENTIAL_TAILS = [".docker/config.json", ".kube/config", ".conf
 const TERMINAL_GIT_PINS: readonly string[] = [
   "--no-replace-objects", "--no-optional-locks",
   // Attributes come from the empty tree only (not the work-tree .gitattributes, no global or system file), so no
-  // attribute-selected filter, eol or ident conversion can apply to the verdict or the staging. `.git/info/attributes`
+  // attribute-selected filter, eol or ident conversion is selected for the verdict or the staging. `.git/info/attributes`
   // is read regardless of these pins; captureTerminalSnapshot refuses a clone that has one, and any `filter.*` key.
+  // The core.autocrlf/safecrlf/eol pins disable the config-driven conversion that applies without any attribute.
   `--attr-source=${EPOCH_EMPTY_TREE_OID}`, "-c", "core.attributesFile=/dev/null",
+  "-c", "core.autocrlf=false", "-c", "core.safecrlf=false", "-c", "core.eol=lf",
   // GIT_GRAFT_FILE=/dev/null (TERMINAL_GIT_ENV) makes newer Git print a deprecation hint on stderr; the strict stderr check
   // would otherwise refuse every capture, so silence only that advice (same pin as the ancestry proof reads).
   "-c", "advice.graftFileDeprecated=false",

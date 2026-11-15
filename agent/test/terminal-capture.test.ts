@@ -234,6 +234,47 @@ describe("captureTerminalSnapshot", () => {
     assert.deepEqual(f.calls, []);
   });
 
+  // Line-ending conversion configured in the agent-writable local config or attributes file must never rewrite the
+  // captured bytes or hide a CRLF-only edit: the verdict is either refused or the CRLF bytes themselves.
+  const rawShow = (f: Awaited<ReturnType<typeof fixture>>, root: string, rel: string) =>
+    execFileSync("/usr/bin/git", ["-C", f.bare, "show", `${root}:${rel}`], { env: gitEnv });
+  const CRLF = Buffer.from("original\r\n");
+
+  test("core.autocrlf=input with a staged CRLF-only edit is never reported clean", async (t) => {
+    const f = await fixture(t);
+    f.g("config", "core.autocrlf", "input");
+    f.g("config", "core.safecrlf", "false");
+    await f.write("tracked.txt", CRLF);
+    f.g("add", "tracked.txt");
+    const result = await f.capture();
+    assert.notEqual(result.kind, "clean", JSON.stringify(result));
+    if (result.kind === "captured") assert.deepEqual(rawShow(f, result.root, "tracked.txt"), CRLF);
+  });
+
+  test("core.autocrlf=input with an unstaged CRLF-only edit and a new file never captures HEAD's bytes for the edit", async (t) => {
+    const f = await fixture(t);
+    f.g("config", "core.autocrlf", "input");
+    f.g("config", "core.safecrlf", "false");
+    await f.write("tracked.txt", CRLF);
+    await f.write("new.txt", "brand new\n");
+    const result = await f.capture();
+    assert.notEqual(result.kind, "clean", JSON.stringify(result));
+    if (result.kind === "captured") assert.deepEqual(rawShow(f, result.root, "tracked.txt"), CRLF);
+  });
+
+  test("a local core.attributesFile with a text rule never normalizes a CRLF-only edit into a clean verdict", async (t) => {
+    const f = await fixture(t);
+    const attrs = path.join(f.dir, "evil-attributes");
+    await fs.writeFile(attrs, "* text\n");
+    f.g("config", "core.attributesFile", attrs);
+    f.g("config", "core.safecrlf", "false");
+    await f.write("tracked.txt", CRLF);
+    f.g("add", "tracked.txt");
+    const result = await f.capture();
+    assert.notEqual(result.kind, "clean", JSON.stringify(result));
+    if (result.kind === "captured") assert.deepEqual(rawShow(f, result.root, "tracked.txt"), CRLF);
+  });
+
   test("a .git/info/attributes file alone is refused", async (t) => {
     const f = await fixture(t);
     await fs.writeFile(path.join(f.root, ".git", "info", "attributes"), "# nothing\n");
