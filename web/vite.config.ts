@@ -4,6 +4,7 @@ import { defineConfig } from "vite";
 // `exclude` REPLACES the default list rather than extending it.
 import { configDefaults } from "vitest/config";
 import react from "@vitejs/plugin-react";
+import { docHeadingsPlugin } from "./vite-doc-headings";
 
 // In production the SPA is served by nginx, which also proxies /api to the API
 // service (same origin, no CORS). The dev proxy below mirrors that so `npm run
@@ -11,7 +12,7 @@ import react from "@vitejs/plugin-react";
 // /api/ws WebSocket too (nginx does this via its dedicated /api/ws location), so
 // the live run view streams under `npm run dev` and not just behind nginx.
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), docHeadingsPlugin()],
   // Vitest's default testTimeout is 5s, and this project had no `test` block at all — so
   // every one of the 862 tests ran on that default. Measured during PRD #98: under full-suite
   // CPU contention, THREE unrelated tests each timed out once across ~20 runs —

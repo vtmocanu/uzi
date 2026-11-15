@@ -114,3 +114,18 @@ describe("DocPage — role-aware operator routing", () => {
     expect(screen.getByRole("heading", { name: "Configuration", level: 1 })).toBeTruthy();
   });
 });
+
+describe("DocPage repeated hash navigation", () => {
+  it("re-scrolls when navigating to the same /docs/<slug>#<id> again", () => {
+    render(
+      <MemoryRouter initialEntries={["/docs/cli#root"]}>
+        <div id="root" />
+        <Link to="/docs/cli#root">Again</Link>
+        <Routes><Route path="/docs/:slug" element={<DocPage />} /></Routes>
+      </MemoryRouter>,
+    );
+    expect(scroll).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByRole("link", { name: "Again" }));
+    expect(scroll).toHaveBeenCalledTimes(2);
+  });
+});

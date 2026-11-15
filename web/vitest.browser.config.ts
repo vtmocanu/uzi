@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import { defineConfig } from "vitest/config";
 import react from "@vitejs/plugin-react";
+import { docHeadingsPlugin } from "./vite-doc-headings";
 import { playwright } from "@vitest/browser-playwright";
 
 // Which Chromium runs the tests. CI and contributors use Playwright's pinned download
@@ -41,7 +42,7 @@ const launchOptions = executablePath
 // Nothing is inherited from vite.config.ts, so testTimeout is restated here. The test file
 // imports src/index.css itself: Tailwind classes only mean something with the real stylesheet.
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), docHeadingsPlugin()],
   test: {
     include: ["src/**/*.browser.test.{ts,tsx}"],
     testTimeout: 20000,
