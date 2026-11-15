@@ -2715,6 +2715,8 @@ interface RunFlight {
   policyFreshAllowance?: { remaining: number };
   forgeCloneSuccess?: AbortController;
   defaultBranchTip?: string;
+  codexAuthority?: Readonly<import("./codex-switch-coordinator.js").CodexSwitchBundle>;
+  codexSecrets?: NonNullable<ClaimResponse["secrets"]["codex"]>;
   operationAdmission?: CodexOperationController;
   operationScope?: ReturnType<typeof acquireCodexOperationScope>;
   releaseOperationAdmission?: () => void;
@@ -13027,9 +13029,11 @@ export class RunRunner {
     // Issue #4201: the editor pass reads the credential ONCE, here at the publication's start: it uses that
     // token and its usage frame carries that epoch ordinal, whatever an in-place switch does meanwhile.
     const descCredential = flight.credential?.current();
+    const codexOrdinal = flight.codexAuthority?.ordinal;
+    const currentClaim = this.claimWithCodexAuthority(claim, flight);
     const descClaim = descCredential
       ? { ...claim, secrets: { ...claim.secrets, anthropic_oauth_token: descCredential.token } }
-      : claim;
+      : currentClaim;
     const publisher = new PrDescriptionPublisher({
       forge,
       api: this.client,
@@ -13043,7 +13047,7 @@ export class RunRunner {
       emitUsage: (u) => {
         if (flight.steering.claimFence() !== undefined) return;
         batcher.emit({ kind: "summary_usage", agent: "worker", payload: { pass: "pr_description", model_usage: u },
-          ...(descCredential && descCredential.ordinal > 0 ? { credentialEpochOrdinal: descCredential.ordinal } : {}) });
+          ...((descCredential?.ordinal ?? codexOrdinal ?? 0) > 0 ? { credentialEpochOrdinal: descCredential?.ordinal ?? codexOrdinal } : {}) });
       },
       forgeRetry,
       headLagRetryMs: this.prDescriptionHeadLagMs,
@@ -13546,7 +13550,7 @@ export class RunRunner {
         generation: claim.claim_generation ?? 0,
         // Issue #4201: a frame's credential epoch ordinal reaches the wire only on an api that
         // negotiated the apply feature (an older api strict-decodes unknown fields).
-        credentialEpochsNegotiated: () => this.client.hasFeature("credential_switch_apply_v1"),
+        credentialEpochsNegotiated: () => this.client.hasFeature("credential_switch_apply_v1") || this.client.supportsInPlaceCodexCredentialSwitch(),
         ...(this.transientTripMs !== undefined ? { transientTripMs: this.transientTripMs } : {}),
         ...(this.outboxSpillBufferBytes !== undefined
           ? { spillBufferBytes: this.outboxSpillBufferBytes }
@@ -16681,6 +16685,62 @@ export class RunRunner {
         if ("dir" in prepared) flight.managedGoWorkDir = prepared.dir;
       }
     }
+    const prepareDispatch = (scope: RunFlight["operationScope"]): RunContext["prepareCodexRootDispatch"] => {
+      const controller = scope?.controller;
+      return scope?.bind(async (signal, localCheck, kind = "root") => {
+        if (!controller?.active())
+          return () => !controller?.active();
+        const source = revisionRecovery?.dispatchSource();
+        const control = new AbortController();
+        const operationSignal = AbortSignal.any([
+          signal, control.signal, steering.terminalLifecycleSignal(), this.shutdownSignal.signal,
+        ]);
+        const check = (): void => {
+          localCheck();
+          operationSignal.throwIfAborted();
+          if (steering.isCancelled()) throw new Error("run cancelled");
+          if (steering.claimFence() !== undefined || flight.claimGeneration !== (claim.claim_generation ?? 0))
+            throw new StaleClaimError();
+          if (flight.active?.shuttingDown || this.shuttingDownGlobal)
+            throw new Error("worker shutdown during Codex operation admission");
+          try { revisionRecovery?.assertDispatchSource(source, kind === "root"); }
+          catch (error) {
+            // A lead check can consume a replacement verdict. Preserve
+            // that control outcome when the admission catch rechecks currency.
+            control.abort(error);
+            throw error;
+          }
+        };
+        check();
+        const unsubscribe = steering.observeRevisionDispatchControl(() => {
+          try { check(); } catch (error) { control.abort(error); }
+        });
+        let permit!: () => boolean;
+        try {
+          permit = await controller.admit({ operation_id: randomUUID(), kind,
+            ...(source ? { source } : {}) }, operationSignal, check,
+          async () => { await revisionRecovery?.proveDispatchSource(source, check, kind === "root"); check(); });
+        } catch (error) {
+          check();
+          if (error instanceof CodexOperationAdmissionError) {
+            if (error.reason === "authority_lost") throw new StaleClaimError();
+            if (error.reason === "stale_source")
+              throw new PlanRevisionRecoveryStoppedError("plan revision dispatch lost its source");
+          }
+          throw error;
+        } finally { unsubscribe(); }
+        permit();
+        check();
+        return () => { const valid = permit(); check(); return valid; };
+      });
+    };
+    const epochEmitter = (ordinal: number): RunContext["emit"] => m => {
+      if (claim.secrets.codex && (flight.codexAuthority?.ordinal ?? 0) !== ordinal)
+        throw new Error("Codex epoch callback retired");
+      const frame = { ...m, ...(ordinal > 0 ? { credentialEpochOrdinal: ordinal } : {}) };
+      batcher.emit(frame);
+      nowSummary?.observeFrame(frame);
+    };
     const ctx: RunContext = {
       semanticPlanning,
       managedGoWorkDir: flight.managedGoWorkDir,
@@ -16772,10 +16832,7 @@ export class RunRunner {
       // threaded to prompt-build time so both builders name it on a run with a published
       // floor. Absent (fresh branch) ⇒ no note.
       publishedTip: flight.publishedTip,
-      emit: (m) => {
-        batcher.emit(m);
-        nowSummary?.observeFrame(m);
-      },
+      emit: epochEmitter(flight.codexAuthority?.ordinal ?? 0),
       // Issue #2686: the same predicate the Now summary checks before a usage-only emit.
       claimFenced: () => flight.steering.claimFence() !== undefined,
       // Issue #2014: the run's usage-tail recorder; the batcher drains it first at every flush/close.
@@ -17066,6 +17123,7 @@ export class RunRunner {
               if (await confirmClear(operation, "rollout_persist_failed")) return await reopen(operation, "rollout_persist_failed");
               retain();
             }
+            const savedSessionId = saved.kind === "usable" ? saved.sessionId : "";
             const decision = await coordinateCodexSwitchPreflight({
               initial: operation, signal, now: () => performance.now(), reconcile: () => reconcile(),
               probe: op => effect(() => this.client.preflightCodexCredentialSwitch(runId, { ...op, oldCumulative }, signal)),
@@ -17196,9 +17254,81 @@ export class RunRunner {
             const clean = !("priorAmbiguous" in result && result.priorAmbiguous) &&
               ["not_applied", "route_absent", "ledger_unavailable"].includes(result.kind);
             if (clean) possibleApply = false;
-            // Temporary partial-unit gate: even valid codex_applied requires owner pause.
-            // Full B publication and initialization remain required before any B authentication.
-            return await ownerHold(selected.opId, clean ? "not_applied_after_teardown" : "apply_uncertain");
+            if (result.kind !== "codex_applied")
+              return await ownerHold(selected.opId, clean ? "not_applied_after_teardown" : "apply_uncertain");
+            let binding: ReturnType<typeof selectCodexBinding>;
+            try { binding = selectCodexBinding({ codex: result.codex }); }
+            catch { return await ownerHold(selected.opId, "apply_uncertain"); }
+            if (binding.kind !== "codex" || result.ordinal !== (flight.codexAuthority?.ordinal ?? 0) + 1 ||
+                !Number.isSafeInteger(result.ordinal) || !Number.isSafeInteger(result.capabilityEpoch) ||
+                result.capabilityEpoch <= 0 || !Number.isSafeInteger(result.messageSeq) ||
+                result.messageSeq <= 0 || result.replay)
+              return await ownerHold(selected.opId, "apply_uncertain");
+            const bundle = Object.freeze({ binding: Object.freeze(binding.binding),
+              ordinal: result.ordinal, capabilityEpoch: result.capabilityEpoch, messageSeq: result.messageSeq });
+            const appliedAuthority = async (): Promise<void> => {
+              // A settled ledger entry is expected here; do not use the pre-apply ledger check.
+              const current = await reconcile(true);
+              if (!current.owned || current.registerNonce !== nonce) throw new StaleClaimError();
+              if (current.pending) throw new Error("pending operation after Codex apply");
+            };
+            try {
+              await appliedAuthority();
+              guard();
+              for (const token of [bundle.binding.accessToken, bundle.binding.capability]) {
+                flight.secrets.add(token); this.log.addSecret(token); flight.runScopedSecrets.push(token);
+              }
+              flight.codexAuthority = bundle;
+              flight.codexSecrets = Object.freeze({ ...result.codex });
+              flight.operationScope = undefined;
+              flight.operationAdmission = undefined;
+              if (bundle.binding.authMode === "subscription") {
+                const scope = acquireCodexOperationScope(this.client, runId, generation!,
+                  this.codexOperationWaitPolicy, operation => {
+                    const token = flight.registrationToken === undefined ? undefined :
+                      this.snapshotRegistry?.setAccountCooldown(runId, generation!, operation, flight.registrationToken);
+                    return token === undefined ? undefined :
+                      () => this.snapshotRegistry?.clearAccountCooldown(runId, generation!, token);
+                  }, ["root", "child"], runLog, codexOperationAuthorityIdentity(bundle.binding.capability));
+                scope.own();
+                flight.operationScope = scope;
+                flight.operationAdmission = scope.controller;
+              }
+              ctx.prepareCodexRootDispatch = prepareDispatch(flight.operationScope);
+              ctx.emit = epochEmitter(bundle.ordinal);
+              await effect(() => a.publishB(bundle, bounds));
+              if (nowLease && !nowLease.publishB(bundle)) throw new Error("Now publication refused");
+              await appliedAuthority();
+              const started = await effect(() => a.restartAndResume(savedSessionId, bounds));
+              let fresh = false;
+              if (started.kind === "confirmed_resume_refusal") {
+                if (ctx.preserveConversation) {
+                  try { await ownerHold(selected.opId, "initialization_failed"); }
+                  catch (error) {
+                    if (!(error instanceof CredentialSwitchRetainedStop)) throw error;
+                    throw new PolicyContinuationRejected("provider_resume_rejected");
+                  }
+                }
+                await appliedAuthority();
+                await effect(() => a.startFreshLineage(bounds));
+                fresh = true;
+              } else if (started.kind !== "resumed") throw new Error("Codex resume uncertain");
+              await appliedAuthority();
+              await effect(() => a.finishB(bounds));
+              guard();
+              if (nowLease && !nowLease.finishB()) throw new Error("Now finish refused");
+              if (!hold.release({ messageSeq: bundle.messageSeq }) &&
+                  !hold.release({ messageSeq: Math.max(bundle.messageSeq, batcher.currentSeq()) }))
+                throw new Error("Codex sequence hold release refused");
+              flight.retainedSwitchSettlement = undefined;
+              steering.settleCredentialSwitch(selected.opId, "applied");
+              steering.rearmLifecycle();
+              return fresh ? "fresh_B" : "resumed_B";
+            } catch (error) {
+              guard();
+              if (error instanceof PolicyContinuationRejected || error instanceof StaleClaimError || isCheckedLifecycleControl(error)) throw error;
+              return await ownerHold(selected.opId, "initialization_failed");
+            }
           }, { stop: { signal }, deadlineAt: Date.now() + remaining() });
         } catch (error) {
           flight.preserveRecoveryClone = true;
@@ -17206,7 +17336,7 @@ export class RunRunner {
           flight.keepGuardedInventoryOpen = true;
           flight.retainedLocalCustody = true;
           guard();
-          if (error instanceof StaleClaimError || isCheckedLifecycleControl(error)) throw error;
+          if (error instanceof PolicyContinuationRejected || error instanceof StaleClaimError || isCheckedLifecycleControl(error)) throw error;
           return retain();
         } finally { clearTimeout(timer); }
       },
@@ -17315,52 +17445,7 @@ export class RunRunner {
         } }
         : {}),
       codexRootAdmissionActive: () => flight.operationAdmission?.active() ?? false,
-      prepareCodexRootDispatch: flight.operationScope?.bind(async (signal, localCheck, kind = "root") => {
-        if (!flight.operationAdmission?.active())
-          return () => !flight.operationAdmission?.active();
-        const source = revisionRecovery?.dispatchSource();
-        const control = new AbortController();
-        const operationSignal = AbortSignal.any([
-          signal, control.signal, steering.terminalLifecycleSignal(), this.shutdownSignal.signal,
-        ]);
-        const check = (): void => {
-          localCheck();
-          operationSignal.throwIfAborted();
-          if (steering.isCancelled()) throw new Error("run cancelled");
-          if (steering.claimFence() !== undefined || flight.claimGeneration !== (claim.claim_generation ?? 0))
-            throw new StaleClaimError();
-          if (flight.active?.shuttingDown || this.shuttingDownGlobal)
-            throw new Error("worker shutdown during Codex operation admission");
-          try { revisionRecovery?.assertDispatchSource(source, kind === "root"); }
-          catch (error) {
-            // A lead check can consume a replacement verdict. Preserve
-            // that control outcome when the admission catch rechecks currency.
-            control.abort(error);
-            throw error;
-          }
-        };
-        check();
-        const unsubscribe = steering.observeRevisionDispatchControl(() => {
-          try { check(); } catch (error) { control.abort(error); }
-        });
-        let permit!: () => boolean;
-        try {
-          permit = await flight.operationAdmission.admit({ operation_id: randomUUID(), kind,
-            ...(source ? { source } : {}) }, operationSignal, check,
-          async () => { await revisionRecovery?.proveDispatchSource(source, check, kind === "root"); check(); });
-        } catch (error) {
-          check();
-          if (error instanceof CodexOperationAdmissionError) {
-            if (error.reason === "authority_lost") throw new StaleClaimError();
-            if (error.reason === "stale_source")
-              throw new PlanRevisionRecoveryStoppedError("plan revision dispatch lost its source");
-          }
-          throw error;
-        } finally { unsubscribe(); }
-        permit();
-        check();
-        return () => { const valid = permit(); check(); return valid; };
-      }),
+      prepareCodexRootDispatch: prepareDispatch(flight.operationScope),
       beforePlanRevisionTurn: (observer, remainingWallMs) => revisionRecovery?.beforeTurn(observer, remainingWallMs) ?? Promise.resolve(),
       retryPlanRevisionTurn: async (cause, observer, remainingWallMs) => {
         if (!(cause instanceof TransientRecoveryError) || (!cause.providerOrigin && cause.idleStallKind !== "zero_evidence") || !revisionRecovery) throw cause;
@@ -26438,6 +26523,12 @@ export class RunRunner {
     return { branch: `agent/issue-${claim.issue_iid}`, key: `issue-${claim.issue_iid}`, issueIid: claim.issue_iid };
   }
 
+  /** Capture current credential authority once for a later capture, restore or delivery call. */
+  private claimWithCodexAuthority(claim: ClaimResponse, flight: RunFlight): ClaimResponse {
+    const codex = flight.codexSecrets;
+    return codex ? { ...claim, secrets: { ...claim.secrets, codex } } : claim;
+  }
+
   private bindWorkerMemory(claim: ClaimResponse, flight: RunFlight): void {
     if (!this.memoryRuntime) return;
     const incarnation = this.client.memoryIncarnation;
@@ -26921,7 +27012,7 @@ export class RunRunner {
         identity();
         // The server's accepted-park binding, carried out of the held callback for the witness below.
         const carried: { binding?: MemoryParkWitness["binding"] } = {};
-        const result = await this.runFreeCapture(memory.claim, flight, deadline, signal, async held => {
+        const result = await this.runFreeCapture(this.claimWithCodexAuthority(memory.claim, flight), flight, deadline, signal, async held => {
           const check = async () => {
             this.assertHeldFreeCapture(flight, held);
             identity();
@@ -26947,7 +27038,7 @@ export class RunRunner {
           // Three attempts share one deadline. Failure holds this flight; siblings continue.
           for (let attempt = 0; attempt < 3 && !captured.verified; attempt++) {
             await check();
-            captured = await this.captureRecoveryRestorePoint(memory.claim, flight, flight.runLog, "recovery_capture", {
+            captured = await this.captureRecoveryRestorePoint(this.claimWithCodexAuthority(memory.claim, flight), flight, flight.runLog, "recovery_capture", {
               credentialFree: true, heldCapture: held, publish: true, signal: held.signal, beforeMutation: check,
             });
           }
@@ -29150,7 +29241,7 @@ export class RunRunner {
   private async swapRestoreExecutor(claim: ClaimResponse, flight: RunFlight): Promise<void> {
     const generation = flight.claimGeneration;
     const initialHome = flight.runHome;
-    const built = this.makeExecutor(flight.runId, claim.secrets.codex, { generation });
+    const built = this.makeExecutor(flight.runId, this.claimWithCodexAuthority(claim, flight).secrets.codex, { generation });
     if (initialHome !== undefined && built.homeDir === initialHome) throw new Error("the successor executor was built on the predecessor's HOME");
     const next = publicationOnlyExecutor(claim, built.executor);
     const prior = flight.executor;
@@ -30006,7 +30097,7 @@ export class RunRunner {
             const disposal = await flight.executor.safety?.dispose({ boundary: "shutdown", deadlineMs: Math.max(1, Math.min(this.codexBoundaryDeadlineMs, iteration.deadline - Date.now())) });
             await this.confirmPostAdoptionOwnership(flight, iteration.deadline, signal);
             if (flight.executor.safety && disposal?.kind !== "disposed") throw finalize;
-            flight.executor = publicationOnlyExecutor(claim, this.makeExecutor(claim.run_id, claim.secrets.codex).executor);
+            flight.executor = publicationOnlyExecutor(claim, this.makeExecutor(claim.run_id, this.claimWithCodexAuthority(claim, flight).secrets.codex).executor);
             this.registerEvidenceExecutor(flight);
           }
           // The (possibly new) executor is bound to the successor's epoch before it runs anything there.

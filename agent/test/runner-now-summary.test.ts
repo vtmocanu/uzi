@@ -406,7 +406,7 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
     });
   }
 
-  for (const outcome of ["policy_refusal", "baseline_missing", "failed_clear", "ready", "missing_negotiation", "persist_failed", "persist_threw", "released_after_clear", "unproven", "busy_after", "vault_after", "route_after", "refused_after", "lost_after", "fenced_after", "superseded_after", "applied_after", "ledger_after", "ack_after", "budget_after", "newop_after", "no_op_after"] as const) {
+  for (const outcome of ["policy_refusal", "baseline_missing", "failed_clear", "ready", "missing_negotiation", "persist_failed", "persist_threw", "released_after_clear", "unproven", "busy_after", "vault_after", "route_after", "refused_after", "lost_after", "fenced_after", "superseded_after", "applied_after", "applied_key_after", "init_after", "publish_after", "fresh_after", "invalid_after", "replay_after", "ledger_after", "ack_after", "budget_after", "newop_after", "no_op_after"] as const) {
     it(`M2 firsthalf Codex Runner ${outcome}`, async (t) => {
       const claim = claimFor(2630, { secrets: CODEX_SECRETS, claim_generation: 1 });
       let pending = false;
@@ -457,8 +457,13 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
         if (outcome === "no_op_after") { pending = false; return { kind: "superseded" }; }
         if (outcome === "superseded_after") return { kind: "superseded" };
         if (outcome === "refused_after") return { kind: "refused_committed", reason: "committed" };
-        if (outcome === "applied_after") return { kind: "codex_applied", codex: CODEX_SECRETS.codex!,
-          ordinal: 1, capabilityEpoch: 2, messageSeq: 7, replay: false };
+        if (["applied_after", "applied_key_after", "init_after", "publish_after", "fresh_after", "invalid_after", "replay_after"].includes(outcome)) {
+          pending = false;
+          return { kind: "codex_applied", codex: outcome === "applied_key_after"
+            ? { auth_mode: "api_key", access_token: "B-access", capability: "B-capability" }
+            : { ...CODEX_SECRETS.codex!, access_token: "B-access", capability: "B-capability" }, ordinal: outcome === "invalid_after" ? 2 : 1,
+            capabilityEpoch: 42, messageSeq: 7, replay: outcome === "replay_after" };
+        }
         return { kind: "not_applied", reason: outcome === "busy_after" ? "busy" : "vault_locked" };
       };
       const report = client.reportState.bind(client);
@@ -511,10 +516,17 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
               }
               return outcome !== "unproven";
             },
-            publishB: async () => { throw new Error("B forbidden"); },
-            restartAndResume: async () => { throw new Error("B forbidden"); },
-            startFreshLineage: async () => { throw new Error("B forbidden"); },
-            finishB: async () => { throw new Error("B forbidden"); },
+            publishB: async bundle => {
+              order.push("publish"); assert.equal(bundle.ordinal, 1); assert.equal(bundle.capabilityEpoch, 42);
+              if (outcome === "publish_after") throw new Error("publication failed");
+            },
+            restartAndResume: async session => {
+              order.push("login-resume"); assert.equal(session, "saved-A");
+              if (outcome === "init_after") throw new Error("login transport failed");
+              return { kind: outcome === "fresh_after" ? "confirmed_resume_refusal" : "resumed" };
+            },
+            startFreshLineage: async () => { order.push("fresh"); assert.equal(outcome, "fresh_after"); },
+            finishB: async () => { order.push("finish"); },
           };
         },
         async run(ctx) {
@@ -533,6 +545,8 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
             elapsed = 6000;
             return "gone";
           };
+          const oldDispatch = ctx.prepareCodexRootDispatch;
+          const oldEmit = ctx.emit;
           let result;
           try {
             result = await ctx.attemptCodexCredentialSwitch!({ site: "implement_turn", laneSettled: true });
@@ -540,7 +554,15 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
             internal.awaitTickSurvivorsGone = drain;
             clock?.mock.restore();
           }
-          assert.equal(result, "continued_A");
+          assert.equal(result, outcome === "fresh_after" ? "fresh_B" :
+            outcome === "applied_after" || outcome === "applied_key_after" ? "resumed_B" : "continued_A");
+          if (result !== "continued_A") {
+            assert.ok(oldDispatch);
+            await assert.rejects(() => oldDispatch(new AbortController().signal, () => {}), /closed/);
+            assert.equal(ctx.prepareCodexRootDispatch === undefined, outcome === "applied_key_after");
+            assert.throws(() => oldEmit({ kind: "status", agent: "worker", payload: { text: "old epoch frame" } }), /epoch callback retired/);
+            ctx.emit({ kind: "status", agent: "worker", payload: { text: "new epoch B-access B-capability" } });
+          }
           continued = true;
           throw new CredentialSwitchSignal();
         },
@@ -564,13 +586,28 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
         assert.equal(drainBound, true);
         assert.equal(probeBudget, 4000, "drain and epoch probes share the original budget");
       }
-      assert.equal(continued, refusal);
+      const success = outcome === "applied_after" || outcome === "applied_key_after" || outcome === "fresh_after";
+      assert.equal(continued, refusal || success);
+      if (success) {
+        assert.deepEqual(order.slice(5), outcome === "fresh_after"
+          ? ["publish", "login-resume", "fresh", "finish"] : ["publish", "login-resume", "finish"]);
+        const frames = api.messages(claim.run_id);
+        const old = frames.find(m => (m.payload as { text?: string }).text === "old epoch frame");
+        const next = frames.find(m => (m.payload as { text?: string }).text?.startsWith("new epoch"));
+        assert.equal(old, undefined, "retired A callback cannot publish"); assert.ok(next);
+        assert.equal(next.credential_epoch_ordinal, 1);
+        assert.ok(!JSON.stringify(next).includes("B-access"));
+        assert.ok(!JSON.stringify(next).includes("B-capability"));
+      }
+      if (outcome === "invalid_after" || outcome === "replay_after") assert.ok(!order.includes("publish"));
+      if (outcome === "init_after") assert.ok(order.includes("login-resume"));
+      if (outcome === "publish_after") assert.ok(!order.includes("login-resume"));
       assert.equal(reopened, refusal ? 1 : 0);
       assert.equal(suspended, outcome === "missing_negotiation" ? 0 : 1);
       assert.equal(preflights, ["missing_negotiation", "persist_failed", "persist_threw"].includes(outcome) ? 0 : 1);
       assert.equal(apply, post && !["unproven", "ledger_after"].includes(outcome) ? 1 : 0);
       assert.equal(teardown, post ? 1 : 0);
-      assert.equal(uncertainReports, outcome === "ack_after" ? 3 : post && !["unproven", "fenced_after", "no_op_after"].includes(outcome) ? 1 : 0);
+      assert.equal(uncertainReports, outcome === "ack_after" ? 3 : post && !["unproven", "fenced_after", "no_op_after", "applied_after", "applied_key_after", "fresh_after"].includes(outcome) ? 1 : 0);
       assert.equal(ordinaryPause, outcome === "no_op_after" ? 1 : 0);
       assert.equal(heldReports, outcome === "unproven" ? 1 : 0);
       assert.equal(settledReports, outcome === "unproven" ? 1 : 0);
