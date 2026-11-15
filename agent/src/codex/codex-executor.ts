@@ -86,7 +86,7 @@ import { TransientRecoveryError } from "../sdk-executor.js";
 import { classifyLimitEvidence, LimitReachedError } from "../limit.js";
 import { type CodexErrorClassification, CodexTurnFailedError, formatCodexClassification, isCodexTransientClassification } from "./terminal-normalize.js";
 import type { DockerWiring } from "../docker-wiring.js";
-import { PlanRejectedError, PlanRevisionReplacedError, stampPrSummaryHead, type EmittedMessage, type Executor, type ExecutorResult, type RunContext, type PlanRevisionOwnerWaitObserver, type WallParkOutcome, type WallParkRefresh } from "../executor.js";
+import { PlanRejectedError, PlanRevisionReplacedError, SecretRemediationStoppedError, stampPrSummaryHead, type EmittedMessage, type Executor, type ExecutorResult, type RunContext, type PlanRevisionOwnerWaitObserver, type WallParkOutcome, type WallParkRefresh } from "../executor.js";
 import type { PrSummaryClaim } from "../signals.js";
 import { PauseNowSignal, MAX_FOLLOW_UP_BATCH_RUNES, followUpRunes } from "../steering.js";
 import { isRunSummaryKind, resolveRunKind } from "../run-kind.js";
@@ -4559,7 +4559,16 @@ export class CodexExecutor implements Executor {
         // requiring a surviving thread. The ordinary turn wrapper retains control
         // precedence for interruptions that arrive during this advisory await.
         if (resumeSecretPreflightPending && this.pendingInterruption(ctx, pauseNow, wall) === undefined) {
-          const decision = await ctx.secretRemediationGate?.({ unpublishedOnly: true });
+          let decision: Awaited<ReturnType<NonNullable<typeof ctx.secretRemediationGate>>> | undefined;
+          try {
+            decision = await ctx.secretRemediationGate?.({ unpublishedOnly: true });
+          } catch (e) {
+            // Issue #4313: only a stopped gate is routed. It is a cancel whether or not a control
+            // explains it (cancel, claim fence and terminal lifecycle signal, which a worker shutdown
+            // also aborts); an unexplained stop fails closed to the same cancel and never finalizes.
+            if (e instanceof SecretRemediationStoppedError) throw new Error(REASON_CANCEL);
+            throw e;
+          }
           resumeSecretPreflightPending = false;
           if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
           if (decision?.action === "remediate") completionFollowUp = decision.followUp;
@@ -4822,7 +4831,14 @@ export class CodexExecutor implements Executor {
           // publishes the branch. `remediate` re-prompts the SAME live epoch (no persist, no
           // recreate); `fail` stops (the runner already recorded the blocked state).
           if (!ctx.interactive) {
-            const secretDecision = await ctx.secretRemediationGate?.();
+            let secretDecision: Awaited<ReturnType<NonNullable<typeof ctx.secretRemediationGate>>> | undefined;
+            try {
+              secretDecision = await ctx.secretRemediationGate?.();
+            } catch (e) {
+              // Issue #4313: same routing as the resume preflight; no persist, no completion attempt.
+              if (e instanceof SecretRemediationStoppedError) throw new Error(REASON_CANCEL);
+              throw e;
+            }
             if (secretDecision?.action === "remediate") {
               completionFollowUp = secretDecision.followUp;
               continue;

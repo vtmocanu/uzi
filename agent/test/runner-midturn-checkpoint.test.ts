@@ -22,6 +22,10 @@ import { nullLogger, recordingLogger, testGitCacheOptions } from "./helpers.js";
 import { defaultGitleaksShim, shimCalls, writeGitleaksShim as writeShim } from "./gitleaks-shim.js";
 import { writeStallShim } from "./stall-gitleaks-shim.js";
 import { realProcfsSkip } from "./real-procfs.js";
+import { acquireWorkerLifetime, type FlockResult } from "../src/authority-lock.js";
+import { AuthorityRuntime } from "../src/authority-runtime.js";
+import { testLockOptions } from "./authority-test-support.js";
+import { portableTeardownTestDeps } from "./teardown-fixtures.js";
 import { makeScratchRoot } from "./fixture-repo.js";
 import type { Logger } from "../src/log.js";
 import {
@@ -6149,4 +6153,616 @@ describe("issue #4258 real SdkExecutor + RunRunner: a stop during the stalled se
       });
     }
   }
+});
+
+// ── issue #4313 — the done gate and the resume preflight run under an owned abortable scope ─────────
+//
+// A real SdkExecutor (fake query function) inside a real RunRunner. The gate's range scan (git mode) or its
+// path scan (stdin mode) stalls on a gitleaks child; a cancel, a worker shutdown or a disk stop arrives. The
+// gate must end promptly with the stalled child gone BEFORE it settles, change no gate state, and the
+// executor must take the control's normal route (never a finalize, never a remediation prompt).
+describe("issue #4313 real SdkExecutor + RunRunner: a stop during the stalled done gate / resume preflight", () => {
+  const sdkMsg = (content: unknown[]) => sdkAssistant(content);
+  const SESSION = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+  type GateKind = "done" | "resume";
+  type GateStage = "range" | "path";
+  type GateStop = "cancel" | "shutdown" | "disk" | "after-scan-shutdown" | "entry-cancel" | "entry-shutdown";
+  const isEntry = (s: GateStop): boolean => s === "entry-cancel" || s === "entry-shutdown";
+
+  interface GateObservation {
+    /** What RunRunner.execute() settled with: undefined on normal resolution, else the rejection. */
+    executeOutcome: unknown;
+    elapsedMs: number;
+    gateError: unknown;
+    gateSettledWhileChildAlive: boolean;
+    pids: number[];
+    thrown: unknown[];
+    prompts: string[];
+    turns: number;
+    state: Record<string, unknown> | undefined;
+    statuses: string[];
+    end: Record<string, unknown> | undefined;
+    final: string | undefined;
+    sinkHeld: boolean;
+    survivors: unknown[];
+    secretSha: string;
+    publishedTips: string[];
+    publishCount: number;
+    flight: Record<string, unknown>;
+    seeded: { blocked: unknown[]; trigger: { observation: number; tip: string } } | undefined;
+  }
+
+  async function stalledGate(o: { iid: number; kind: GateKind; stage: GateStage; stop: GateStop }): Promise<GateObservation> {
+    const tmp = scratchDir(`4313-${o.kind}-${o.stage}-${o.stop}`);
+    const stall = writeStallShim(tmp);
+    // "after-scan-shutdown": no stall; the test hook shuts the worker down right after the gate's range scan returns.
+    let runnerRef: RunRunner | undefined;
+    const ctl = control({
+      scanDeadlineMs: 60_000,
+      ...(o.stop === "after-scan-shutdown" ? { afterRemediationGateScan: () => { runnerRef!.shutdown(); } } : {}),
+    });
+    const g = mkGit(fx.dataDir, stall.bin);
+    const claim = o.kind === "done"
+      ? gitlabClaim(o.iid, { auto_approve: true })
+      : gitlabClaim(o.iid, {
+        kind: "issue", claim_generation: 7, session_id: SESSION, plan_approved: true, plan_md: "# Plan\n- do it",
+        config: { iteration_park_version: 1, max_iterations: 3 },
+      });
+    const pub = stubPublish(async (_n, _tip, pack) => { await drain(pack); return LANDED; });
+    const prompts: string[] = [];
+    let turns = 0;
+    let ctxRef: RunContext | undefined;
+    const thrown: unknown[] = [];
+    let gateError: unknown;
+    let gateSettledAt = 0;
+    let gateSettledWhileChildAlive = false;
+    const stallMode = o.stop === "after-scan-shutdown" || isEntry(o.stop) ? "pass" : o.stage === "range" ? "stall-git" : "stall-stdin";
+    let secretSha = "";
+    const plantAndStall = (tree: string): void => {
+      secretSha = commitIn(tree, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
+      assert.ok(secretSha);
+      stall.setMode(stallMode);
+    };
+    const queryFn: SdkQueryFn = (params) => {
+      const turn = ++turns;
+      return (async function* () {
+        let text = "";
+        for await (const m of params.prompt) text += JSON.stringify(m);
+        prompts.push(text);
+        if (o.kind === "done" && turn === 1) {
+          yield sdkMsg([{ type: "tool_use", id: "p", name: "mcp__uzi__submit_plan", input: { plan_md: "# Plan\n- do it", milestones: [] } }]);
+          yield sdkResultOk();
+          return;
+        }
+        try {
+          if (o.kind === "done" && turn === 2) plantAndStall(ctxRef!.worktreePath);
+        } catch (e) {
+          turnErrors.push(e);
+          throw e;
+        }
+        yield sdkMsg([{ type: "tool_use", id: "d", name: "mcp__uzi__signal_done", input: {} }]);
+        yield sdkResultOk();
+      })();
+    };
+    const agentHome = fs.mkdtempSync(path.join(tmp, "home-"));
+    if (o.kind === "resume") {
+      const dir = path.join(agentHome, ".claude", "projects", "-runner-4313");
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, `${SESSION}.jsonl`), "{}\n");
+    }
+    const sdk = new SdkExecutor(nullLogger(), agentHome, { queryFn });
+    const executor: Executor = {
+      run: async (ctx) => {
+        ctxRef = ctx;
+        const orig = ctx.secretRemediationGate!;
+        ctx.secretRemediationGate = async (options) => {
+          try {
+            // A stop already standing when the gate is entered: shutdown is synchronous; a cancel is delivered by
+            // input polling, so wait until it is recorded before the gate runs.
+            if (o.stop === "entry-shutdown") runnerRef!.shutdown();
+            if (o.stop === "entry-cancel") {
+              api.setInputs(claim.run_id, [{ id: 1, kind: "cancel" }]);
+              await bounded(waitFor(() => ctx.cancelRequested?.() === true, 10_000), 11_000, "the cancel to be recorded", "control");
+            }
+            return await orig(options);
+          } catch (e) {
+            gateError = e;
+            throw e;
+          } finally {
+            gateSettledAt = Date.now();
+            gateSettledWhileChildAlive = stall.pids().some((pid) => isAlive(pid) || groupAlive(pid));
+          }
+        };
+        if (o.kind === "resume") plantAndStall(ctx.worktreePath);
+        try {
+          return await sdk.run(ctx);
+        } catch (e) {
+          thrown.push(e);
+          throw e;
+        }
+      },
+      closeAndSettlePlanSummary: (d) => sdk.closeAndSettlePlanSummary(d),
+      killAgentTree: () => sdk.killAgentTree(),
+      reapAttributedProcesses: () => sdk.reapAttributedProcesses(),
+    };
+    const { logger } = recordingLogger();
+    const runner = mkRunner(g, () => ({ executor, homeDir: agentHome }), ctl, {}, logger);
+    runnerRef = runner;
+    const internals = runner as unknown as { runSecretRemediationGate: (f: Record<string, unknown>, ...rest: unknown[]) => Promise<unknown> };
+    const origGate = internals.runSecretRemediationGate.bind(runner);
+    let flight: Record<string, unknown> | undefined;
+    let seeded: GateObservation["seeded"];
+    internals.runSecretRemediationGate = (f, ...rest) => {
+      flight = f;
+      if (isEntry(o.stop)) {
+        // Seed a prior blocked set and a pending mid-run trigger: a stopped gate must keep both untouched.
+        const st = (f.secretRemediation ??= { attempts: 0 }) as Record<string, unknown>;
+        const blocked = [{ file: "cfg.env", startLine: 1, commit: secretSha || "1".repeat(40), ruleId: "generic-api-key" }];
+        const trigger = { observation: 3, tip: secretSha || "2".repeat(40) };
+        st.blocked = blocked.map((b) => ({ ...b }));
+        st.midRunTrigger = { ...trigger };
+        seeded = { blocked, trigger };
+      }
+      return origGate(f, ...rest);
+    };
+    let exec: Promise<unknown> | undefined;
+    try {
+      exec = runner.execute(claim);
+      const settled = exec.then(() => undefined, (e: unknown) => e);
+      if (o.stop === "after-scan-shutdown" || isEntry(o.stop)) await bounded(waitFor(() => gateSettledAt > 0, 30_000), 31_000, "the gate to settle", "gate");
+      else await bounded(Promise.resolve().then(() => waitFor(() => stall.pids().length > 0, 30_000)), 31_000, "the gate's scan child to stall", "stall");
+      const pids = stall.pids();
+      const t0 = Date.now();
+      if (o.stop === "after-scan-shutdown" || isEntry(o.stop)) { /* the stop was raised before the gate ran */ }
+      else if (o.stop === "cancel") api.setInputs(claim.run_id, [{ id: 1, kind: "cancel" }]);
+      else if (o.stop === "shutdown") runner.shutdown();
+      else (flight!.steering as { requestDiskStop: () => void }).requestDiskStop();
+      const executeOutcome = await bounded(settled, 20_000, "execute() settling after the stop", "run");
+      if (turnErrors.length > 0) throw turnErrors.splice(0)[0];
+      const f = flight as {
+        secretRemediation?: Record<string, unknown>;
+        survivingTickGroups: unknown[];
+        sinkGate: { isHeld(): boolean };
+      };
+      return {
+        executeOutcome,
+        elapsedMs: gateSettledAt - t0,
+        gateError,
+        gateSettledWhileChildAlive,
+        pids,
+        thrown,
+        prompts,
+        turns,
+        state: f.secretRemediation,
+        statuses: statusTexts(claim.run_id),
+        end: api.states.filter((x) => x.runId === claim.run_id).map((x) => x.body).at(-1) as Record<string, unknown> | undefined,
+        final: finalStatus(claim.run_id),
+        sinkHeld: f.sinkGate.isHeld(),
+        survivors: f.survivingTickGroups,
+        secretSha,
+        publishedTips: [...pub.tips],
+        publishCount: pub.count(),
+        flight: flight!,
+        seeded,
+      };
+    } finally {
+      stall.setMode("pass");
+      await killAndReap(stall.pids()).catch(() => undefined);
+      await settleAndClean({ ctl, runners: [runner], running: [exec], restore: pub.restore, paths: [tmp] });
+    }
+  }
+
+  const REMEDIATION_PROMPT = /not published yet|rewrite the commit|history rewrite/i;
+  // Cancel and worker shutdown both end the executor with REASON_CANCELLED ("run cancelled").
+  const assertThrewCancelled = (thrown: unknown[], label: string): void => {
+    assert.ok(thrown.some((e) => e instanceof Error && e.message === "run cancelled"), `${label}: the executor threw run cancelled (${thrown.map(String).join("; ")})`);
+  };
+  const assertQuietStop = async (obs: GateObservation, label: string): Promise<void> => {
+    const { SecretRemediationStoppedError } = await import("../src/executor.js");
+    assert.equal(obs.executeOutcome, undefined, `${label}: execute() resolved normally (got ${String(obs.executeOutcome)})`);
+    assert.ok(obs.gateError instanceof SecretRemediationStoppedError, `${label}: the gate threw SecretRemediationStoppedError, not a decision (${String(obs.gateError)})`);
+    assert.ok(obs.elapsedMs < 15_000, `${label}: the gate ended ${obs.elapsedMs}ms after the stop`);
+    assert.equal(obs.gateSettledWhileChildAlive, false, `${label}: the stalled child was gone before the gate settled`);
+    for (const pid of obs.pids) {
+      assert.equal(isAlive(pid), false, `${label}: child ${pid} exited`);
+      assert.equal(groupAlive(pid), false, `${label}: child group ${pid} is gone`);
+    }
+    assert.equal(obs.state?.attempts, 0, `${label}: no attempt was spent`);
+    assert.equal(obs.state?.blocked, undefined, `${label}: nothing was blocked`);
+    assert.equal(obs.state?.cleanTip, undefined, `${label}: no clean tip was recorded`);
+    assert.deepEqual(obs.survivors, []);
+    assert.equal(obs.sinkHeld, false, `${label}: the sink gate was released`);
+    assert.ok(obs.prompts.every((p) => !REMEDIATION_PROMPT.test(p)), `${label}: no remediation guidance was prompted`);
+    assert.deepEqual(obs.statuses.filter((t) => /returning to the lead|pre-exit secret scan flagged/.test(t)), [], `${label}: nothing was emitted`);
+  };
+
+  const iidOf = (kind: GateKind, stage: GateStage, stop: GateStop): number =>
+    4313_000 + (kind === "done" ? 0 : 100) + (stage === "range" ? 0 : 10) + ["cancel", "shutdown", "disk", "entry-cancel", "entry-shutdown"].indexOf(stop);
+
+  for (const kind of ["done", "resume"] as const) {
+    for (const stage of ["range", "path"] as const) {
+      for (const stop of ["cancel", "shutdown"] as const) {
+        it(`${kind} gate: ${stage} scan stalled, then ${stop}: ends promptly, child gone, normal route`, { timeout: 90_000 }, async () => {
+          const obs = await stalledGate({ iid: iidOf(kind, stage, stop), kind, stage, stop });
+          await assertQuietStop(obs, `${kind}/${stage}/${stop}`);
+          assert.equal(obs.turns, kind === "done" ? 2 : 0, "no provider turn was dispatched after the stalled gate");
+          assertThrewCancelled(obs.thrown, `${kind}/${stage}/${stop}`);
+          if (stop === "cancel") {
+            assert.equal(obs.end?.status, "failed");
+            assert.equal(obs.end?.failure_reason, "run cancelled", "the executor's cancel route");
+          } else {
+            assert.equal(obs.final, undefined, "a worker shutdown leaves the run non-terminal for recovery");
+          }
+        });
+      }
+    }
+  }
+
+  // A stop already standing when the gate is entered must route its control and leave the blocked set and the
+  // pending mid-run trigger exactly as seeded (it must not fail on the old blocked set, nor clear the trigger).
+  for (const kind of ["done", "resume"] as const) {
+    for (const stop of ["entry-cancel", "entry-shutdown"] as const) {
+      it(`${kind} gate: ${stop} with a seeded blocked set: throws the stop, keeps blocked and the trigger, takes the control's route`, { timeout: 90_000 }, async () => {
+        const obs = await stalledGate({ iid: iidOf(kind, "range", stop), kind, stage: "range", stop });
+        const { SecretRemediationStoppedError } = await import("../src/executor.js");
+        assert.equal(obs.executeOutcome, undefined, `${kind}/${stop}: execute() resolved normally (got ${String(obs.executeOutcome)})`);
+        assert.ok(obs.gateError instanceof SecretRemediationStoppedError, `the gate threw SecretRemediationStoppedError (${String(obs.gateError)})`);
+        assert.ok(obs.seeded, "the state was seeded");
+        assert.deepEqual(obs.state?.blocked, obs.seeded.blocked, "the blocked set was kept");
+        assert.deepEqual(obs.state?.midRunTrigger, obs.seeded.trigger, "the pending mid-run trigger was kept");
+        assert.ok(obs.prompts.every((p) => !REMEDIATION_PROMPT.test(p)), "no remediation guidance was prompted");
+        assert.notEqual(obs.end?.fail_origin, "push_secret_blocked", "not failed on the old blocked set");
+        assert.notEqual(obs.end?.failure_reason, "push_secret_blocked");
+        if (stop === "entry-cancel") {
+          assert.equal(obs.end?.status, "failed");
+          assert.equal(obs.end?.failure_reason, "run cancelled", "the executor's cancel route");
+          assertThrewCancelled(obs.thrown, `${kind}/${stop}`);
+        } else {
+          assertThrewCancelled(obs.thrown, `${kind}/${stop}`);
+          assert.equal(obs.final, undefined, "a worker shutdown leaves the run non-terminal for recovery");
+          assert.notEqual(obs.end?.status, "failed", "no failed end state");
+        }
+      });
+    }
+  }
+
+  it("done gate: a trusted scan result, then a shutdown before any state write, still holds the unscanned shutdown-capture publish", { timeout: 90_000 }, async () => {
+    const obs = await stalledGate({ iid: 4313_300, kind: "done", stage: "range", stop: "after-scan-shutdown" });
+    const { SecretRemediationStoppedError } = await import("../src/executor.js");
+    assertThrewCancelled(obs.thrown, "after-scan-shutdown");
+    assert.equal(obs.executeOutcome, undefined, `execute() resolved normally (got ${String(obs.executeOutcome)})`);
+    assert.ok(obs.gateError instanceof SecretRemediationStoppedError, String(obs.gateError));
+    const state = obs.state as { attempts: number; flaggedCommits?: string[]; known?: unknown; blocked?: unknown; cleanTip?: unknown; everKnown?: unknown; withholdPaths?: unknown };
+    // The trusted finding was held before the stop was thrown: negative knowledge only.
+    assert.deepEqual(state.flaggedCommits, [obs.secretSha], "the flagged commit stays recorded");
+    // This rig has no attempt clone, so latchRemediationFindings is a no-op here and the hold is carried by
+    // the recorded flagged commit (checkpointRemediationHold's flaggedCommits branch).
+    assert.equal(state.attempts, 0, "no attempt was spent");
+    for (const k of ["known", "blocked", "cleanTip", "everKnown", "withholdPaths"] as const) {
+      assert.equal(state[k], undefined, `${k} was not written after the stop`);
+    }
+    assert.ok(obs.prompts.every((p) => !REMEDIATION_PROMPT.test(p)), "no remediation guidance was prompted");
+    assert.deepEqual(obs.statuses.filter((t) => /returning to the lead|pre-exit secret scan flagged/.test(t)), [], "nothing was emitted");
+    // The shutdown capture attempted a publication over the flagged history, with no fresh scan, and it was held.
+    assert.equal(obs.publishCount, 0, `no publication carried the flagged history (published tips: ${obs.publishedTips.join(",")})`);
+    assert.ok(obs.statuses.some((t) => /checkpoint publish skipped: secret_remediation_pending/.test(t)), `the hold was reported (${obs.statuses.join(" | ")})`);
+    assert.equal(obs.final, undefined, "a worker shutdown leaves the run non-terminal for recovery");
+  });
+
+  it("done gate: a disk stop during the stalled range scan takes the DiskParkSignal route", { timeout: 90_000 }, async () => {
+    const obs = await stalledGate({ iid: iidOf("done", "range", "disk"), kind: "done", stage: "range", stop: "disk" });
+    await assertQuietStop(obs, "done/range/disk");
+    assert.equal(obs.turns, 2);
+    assert.ok(obs.thrown.some((e) => e instanceof Error && e.constructor.name === "DiskParkSignal"),
+      `the executor threw DiskParkSignal (got ${obs.thrown.map(String).join("; ")})`);
+    assert.notEqual(obs.end?.failure_reason, "run cancelled", "a disk stop is not a cancel");
+  });
+});
+
+// ── issue #4313 (d) — a pending wait for the source-authority transaction A ────────────────────────
+//
+// The gate's fetch-back and its restriction writes take A. While another holder keeps it, the acquisition
+// pends. A cancel or a worker shutdown must abort that wait promptly (the gate throws
+// SecretRemediationStoppedError); a pause-now or a credential switch must NOT: the gate keeps waiting and,
+// once A is free, reaches the same decision it reaches with no control at all.
+describe("issue #4313 real SdkExecutor + RunRunner: a pending wait for authority A", () => {
+  const sdkMsg = (content: unknown[]) => sdkAssistant(content);
+  const SESSION = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+  type Site = "fetch" | "persist";
+  type Control = "none" | "pause" | "switch" | "cancel" | "shutdown" | "scan-shutdown";
+
+  /** Stands in for the lock layer's private flock spawn on a util-linux host. */
+  function spawnFlock(args: string[], fd: number | undefined, _signal: AbortSignal | undefined, timeoutMs: number): Promise<FlockResult> {
+    return new Promise((resolve, reject) => {
+      const child = spawn("/usr/bin/flock", args, {
+        stdio: ["ignore", "pipe", "pipe", ...(fd === undefined ? [] : [fd])], env: { PATH: "/usr/bin:/bin", LC_ALL: "C" } });
+      let output = "";
+      child.stdout!.on("data", (c: Buffer) => { output += c.toString("utf8"); });
+      child.stderr!.on("data", (c: Buffer) => { output += c.toString("utf8"); });
+      const timer = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
+      child.once("error", reject);
+      child.once("close", (code) => { clearTimeout(timer); resolve({ code: code ?? 2, output }); });
+    });
+  }
+
+  /** The production authority stack over the test's data dir. While armed, the non-blocking A attempt answers
+   *  "held elsewhere" (exit 200), so every acquisition pends in the lock layer's own retry delay, honouring its
+   *  wait signal and timeout exactly as production does. Each armed acquisition is recorded. */
+  async function authorityStack(): Promise<{ rt: AuthorityRuntime; git: GitCache; arm: () => void; disarm: () => void; acquisitions: Array<{ signal?: AbortSignal; error?: unknown }> }> {
+    let armed = false;
+    const real = testLockOptions().run ?? spawnFlock;
+    const run = (args: string[], fd: number | undefined, signal: AbortSignal | undefined, timeoutMs: number): Promise<FlockResult> => {
+      if (armed && args[0] === "-x" && args.includes("-n")) return Promise.resolve({ code: 200, output: "" });
+      return real(args, fd, signal, timeoutMs);
+    };
+    const dataDir = fs.realpathSync(fx.dataDir);
+    const lifetime = await acquireWorkerLifetime(dataDir, testLockOptions({ run }));
+    const rt = new AuthorityRuntime({ lifetime, workerToken: "unit-gate-4313", timeoutMs: 5000 });
+    const acquisitions: Array<{ signal?: AbortSignal; error?: unknown }> = [];
+    const original = rt.withTransaction.bind(rt) as (fn: unknown, wait?: { signal?: AbortSignal; timeoutMs?: number }) => Promise<unknown>;
+    (rt as unknown as { withTransaction: typeof original }).withTransaction = (fn, wait) => {
+      if (!armed) return original(fn, wait);
+      const seen: { signal?: AbortSignal; error?: unknown } = { signal: wait?.signal };
+      acquisitions.push(seen);
+      return original(fn, wait).catch((error: unknown) => { seen.error = error; throw error; });
+    };
+    const git = new GitCache(dataDir, nullLogger(), undefined, testGitCacheOptions({
+      authority: rt.hooks, authorityRequired: true, gitleaksBin: defaultGitleaksShim(),
+    }));
+    return { rt, git, arm: () => { armed = true; }, disarm: () => { armed = false; }, acquisitions };
+  }
+
+  interface LockObservation {
+    /** What RunRunner.execute() settled with: undefined on normal resolution, else the rejection. */
+    executeOutcome: unknown;
+    gateError: unknown;
+    decision: { action: string } | undefined;
+    pendingAfterControl: boolean;
+    elapsedMs: number;
+    attempts: unknown;
+    thrown: unknown[];
+    states: Array<Record<string, unknown>>;
+    final: string | undefined;
+    flight: Record<string, unknown>;
+    secretSha: string;
+    publishCount: number;
+    statuses: string[];
+    prompts: string[];
+  }
+
+  async function lockedGate(o: { iid: number; kind: "done" | "resume"; site: Site; control: Control }): Promise<LockObservation> {
+    const tmp = scratchDir(`4313-lock-${o.kind}-${o.site}-${o.control}`);
+    const auth = await authorityStack();
+    const secret = o.site === "persist";
+    let runnerRef: RunRunner | undefined;
+    // The persist site arms A right after the gate's range scan, so the fetch-back and the scan ran freely and
+    // the pending acquisition is the restriction write. The fetch site arms it when the gate is entered.
+    const ctl = control({
+      scanDeadlineMs: 60_000,
+      ...(o.control === "scan-shutdown" ? { afterRemediationGateScan: () => { runnerRef!.shutdown(); } }
+        : o.site === "persist" ? { afterRemediationGateScan: () => auth.arm() } : {}),
+    });
+    const claim = o.kind === "done"
+      ? gitlabClaim(o.iid, { auto_approve: true })
+      : gitlabClaim(o.iid, {
+        kind: "issue", claim_generation: 7, session_id: SESSION, plan_approved: true, plan_md: "# Plan\n- do it", auto_approve: true,
+        config: { iteration_park_version: 1, max_iterations: 3 },
+      });
+    const pub = stubPublish(async (_n, _tip, pack) => { await drain(pack); return LANDED; });
+    let turns = 0;
+    let ctxRef: RunContext | undefined;
+    const thrown: unknown[] = [];
+    let gateError: unknown;
+    let decision: { action: string } | undefined;
+    let gateSettledAt = 0;
+    let secretSha = "";
+    const prompts: string[] = [];
+    const work = (tree: string): void => {
+      secretSha = commitIn(tree, secret ? "cfg.env" : "ok.txt", secret ? `TOKEN=${runtimeSecret()}\n` : "ordinary work\n");
+    };
+    const queryFn: SdkQueryFn = (params) => {
+      const turn = ++turns;
+      return (async function* () {
+        let text = "";
+        for await (const m of params.prompt) text += JSON.stringify(m);
+        prompts.push(text);
+        // A resume whose transcript is not on this worker re-plans first (the attempt-path rig drops it).
+        if (turn === 1 && (o.kind === "done" || !ctxRef!.planApproved)) {
+          yield sdkMsg([{ type: "tool_use", id: "p", name: "mcp__uzi__submit_plan", input: { plan_md: "# Plan\n- do it", milestones: [] } }]);
+          yield sdkResultOk();
+          return;
+        }
+        try {
+          if (o.kind === "done" && turn === 2) work(ctxRef!.worktreePath);
+        } catch (e) {
+          turnErrors.push(e);
+          throw e;
+        }
+        yield sdkMsg([{ type: "tool_use", id: "d", name: "mcp__uzi__signal_done", input: {} }]);
+        yield sdkResultOk();
+      })();
+    };
+    const agentHome = fs.mkdtempSync(path.join(tmp, "home-"));
+    if (o.kind === "resume") {
+      const dir = path.join(agentHome, ".claude", "projects", "-runner-4313");
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, `${SESSION}.jsonl`), "{}\n");
+    }
+    const sdk = new SdkExecutor(nullLogger(), agentHome, { queryFn });
+    const executor: Executor = {
+      run: async (ctx) => {
+        ctxRef = ctx;
+        const orig = ctx.secretRemediationGate!;
+        ctx.secretRemediationGate = async (options) => {
+          if (o.site === "fetch") auth.arm();
+          // Only the first call: a remediate decision brings a second gate call that this scenario does not control.
+          const first = gateSettledAt === 0;
+          try {
+            const d = await orig(options);
+            if (first) decision = d;
+            return d;
+          } catch (e) {
+            if (first) gateError = e;
+            throw e;
+          } finally {
+            if (first) gateSettledAt = Date.now();
+          }
+        };
+        if (o.kind === "resume") work(ctx.worktreePath);
+        try {
+          return await sdk.run(ctx);
+        } catch (e) {
+          thrown.push(e);
+          throw e;
+        }
+      },
+      closeAndSettlePlanSummary: (d) => sdk.closeAndSettlePlanSummary(d),
+      killAgentTree: () => sdk.killAgentTree(),
+      reapAttributedProcesses: () => sdk.reapAttributedProcesses(),
+    };
+    const { gitlab } = fakeGitlab();
+    const { logger } = recordingLogger();
+    const runner = new RunRunner(client, auth.git, () => ({ executor, homeDir: agentHome }), logger, 20, undefined, {
+      pollMs: 5,
+      planApprovalTimeoutMs: 0,
+      questionTimeoutMs: 600,
+      prDescriptionHeadLagMs: 0,
+      gitlab,
+      teardownTestDeps: portableTeardownTestDeps,
+      authority: auth.rt,
+      checkpointIntervalMs: INTERVAL_MS,
+      checkpointTickIntervalMs: TICK_MS,
+      setTimer: ctl.setTimer,
+      setTickTimer: ctl.setTickTimer,
+      now: ctl.now,
+      checkpointTestHooks: ctl.hooks,
+    });
+    // The attempt-bound clone paths are what give the flight an attempt id, so the restriction writes take A.
+    Object.assign(runner, { attemptPaths: true });
+    runnerRef = runner;
+    const internals = runner as unknown as { runSecretRemediationGate: (f: Record<string, unknown>, ...rest: unknown[]) => Promise<unknown> };
+    const origGate = internals.runSecretRemediationGate.bind(runner);
+    let flight: Record<string, unknown> | undefined;
+    internals.runSecretRemediationGate = (f, ...rest) => { flight = f; return origGate(f, ...rest); };
+    let exec: Promise<unknown> | undefined;
+    // A credential switch is "delivered" once the poller has read it; the steering channel may hold it while a sink runs.
+    const realGetInputs = client.getInputs.bind(client);
+    let switchDelivered = false;
+    client.getInputs = async (runId) => {
+      const r = await realGetInputs(runId);
+      if (r.credentialSwitch?.generation === 1) switchDelivered = true;
+      return r;
+    };
+    try {
+      exec = runner.execute(claim);
+      const settled = exec.then(() => undefined, (e: unknown) => e);
+      if (o.control === "scan-shutdown") await bounded(waitFor(() => gateSettledAt > 0, 30_000), 31_000, "the gate to settle", "gate");
+      else await bounded(waitFor(() => auth.acquisitions.length > 0, 30_000), 31_000, "the gate's pending acquisition of A", "lock");
+      const steering = flight!.steering as { getPauseMode(): unknown; pendingCredentialSwitch(): unknown };
+      const t0 = Date.now();
+      if (o.control === "pause") {
+        api.setInputs(claim.run_id, [{ id: 1, kind: "pause", body: "now" }]);
+        await bounded(waitFor(() => steering.getPauseMode() === "now", 10_000), 11_000, "the pause-now to be recorded", "control");
+      } else if (o.control === "switch") {
+        api.requestCredentialSwitch(claim.run_id, 1);
+        await bounded(waitFor(() => switchDelivered, 10_000), 11_000, "the switch to be delivered", "control");
+      } else if (o.control === "scan-shutdown") { /* the hook already stopped the worker */ }
+      else if (o.control === "cancel") api.setInputs(claim.run_id, [{ id: 1, kind: "cancel" }]);
+      else if (o.control === "shutdown") runnerRef.shutdown();
+      let pendingAfterControl = false;
+      if (o.control === "scan-shutdown") {
+        auth.disarm();
+      } else if (o.control === "none" || o.control === "pause" || o.control === "switch") {
+        // Hold A for a while longer: the gate must still be waiting (not stopped, not decided).
+        await sleepMs(700);
+        pendingAfterControl = gateSettledAt === 0;
+        auth.disarm();
+        await bounded(waitFor(() => gateSettledAt > 0, 15_000), 16_000, "the gate to decide once A is free", "gate");
+        // What the run does after the decision is not this test's subject: let it run briefly, then stop it.
+        const early = await Promise.race([settled, sleepMs(5_000).then(() => "running" as const)]);
+        if (early === "running") runnerRef.shutdown();
+      } else {
+        await bounded(waitFor(() => gateSettledAt > 0, 15_000), 16_000, "the gate to end after the stop", "gate");
+        auth.disarm();
+      }
+      const executeOutcome = await bounded(settled, 30_000, "execute() settling", "run");
+      if (turnErrors.length > 0) throw turnErrors.splice(0)[0];
+      const f = flight as { secretRemediation?: { attempts: unknown } };
+      return {
+        executeOutcome, gateError, decision, pendingAfterControl, elapsedMs: gateSettledAt - t0,
+        attempts: f.secretRemediation?.attempts, thrown,
+        states: api.states.filter((x) => x.runId === claim.run_id).map((x) => x.body as unknown as Record<string, unknown>),
+        final: finalStatus(claim.run_id), flight: flight!,
+        secretSha, publishCount: pub.count(), statuses: statusTexts(claim.run_id), prompts,
+      };
+    } finally {
+      client.getInputs = realGetInputs;
+      auth.disarm();
+      await settleAndClean({ ctl, runners: [runner], running: [exec], restore: pub.restore, paths: [tmp] });
+    }
+  }
+
+  const iidOf = (kind: "done" | "resume", site: Site, control: Control): number =>
+    4313_500 + (kind === "done" ? 0 : 100) + (site === "fetch" ? 0 : 20) + ["none", "pause", "switch", "cancel", "shutdown", "scan-shutdown"].indexOf(control);
+
+  // One scenario per test: each builds its own authority stack, and a worker lifetime has no release.
+  for (const site of ["fetch", "persist"] as const) {
+    const expected = site === "fetch" ? "proceed" : "remediate";
+    for (const control of ["none", "pause", "switch"] as const) {
+      it(`done gate, ${site} wait, ${control === "none" ? "no control (baseline)" : control}: waits for A and decides ${expected}${control === "none" ? "" : " like the baseline, not stopped"}`, { timeout: 120_000 }, async () => {
+        const { SecretRemediationStoppedError } = await import("../src/executor.js");
+        const obs = await lockedGate({ iid: iidOf("done", site, control), kind: "done", site, control });
+        assert.equal(obs.executeOutcome, undefined, `execute() resolved normally (got ${String(obs.executeOutcome)})`);
+        assert.ok(!(obs.gateError instanceof SecretRemediationStoppedError), `not stopped (${String(obs.gateError)})`);
+        assert.equal(obs.pendingAfterControl, true, "the gate was still waiting for A after the control arrived");
+        assert.equal(obs.decision?.action, expected, `decision (${String(obs.gateError)})`);
+        if (site === "fetch") assert.equal(obs.attempts, 0, "no attempt was spent");
+        else assert.ok((obs.attempts as number) >= 1, "the remediate decision spent its attempt");
+        assert.ok(obs.thrown.every((e) => !(e instanceof Error && /secret remediation gate stopped/.test(e.message))), "no stop error reached the executor");
+      });
+    }
+
+    for (const control of ["cancel", "shutdown"] as const) {
+      it(`done gate, ${site} wait: ${control} aborts the pending acquisition promptly (SecretRemediationStoppedError)`, { timeout: 120_000 }, async () => {
+        const { SecretRemediationStoppedError } = await import("../src/executor.js");
+        const obs = await lockedGate({ iid: iidOf("done", site, control), kind: "done", site, control });
+        assert.equal(obs.executeOutcome, undefined, `execute() resolved normally (got ${String(obs.executeOutcome)})`);
+        assert.ok(obs.thrown.some((e) => e instanceof Error && e.message === "run cancelled"), `the executor threw run cancelled (${obs.thrown.map(String).join("; ")})`);
+        assert.ok(obs.gateError instanceof SecretRemediationStoppedError, `stopped (${String(obs.gateError)})`);
+        assert.ok(obs.elapsedMs < 15_000, `the gate ended ${obs.elapsedMs}ms after the ${control}`);
+        assert.equal(obs.attempts, 0, "no attempt was spent");
+        if (control === "cancel") assert.equal(obs.states.at(-1)?.failure_reason, "run cancelled");
+        else assert.equal(obs.final, undefined);
+      });
+    }
+  }
+
+  it("attempt-path rig: a trusted scan result, then a shutdown before any state write, keeps the latch and withholds the shutdown-capture publish", { timeout: 120_000 }, async () => {
+    const { SecretRemediationStoppedError } = await import("../src/executor.js");
+    const obs = await lockedGate({ iid: iidOf("done", "persist", "scan-shutdown"), kind: "done", site: "persist", control: "scan-shutdown" });
+    assert.equal(obs.executeOutcome, undefined, `execute() resolved normally (got ${String(obs.executeOutcome)})`);
+    assert.ok(obs.thrown.some((e) => e instanceof Error && e.message === "run cancelled"), `the executor threw run cancelled (${obs.thrown.map(String).join("; ")})`);
+    assert.ok(obs.gateError instanceof SecretRemediationStoppedError, String(obs.gateError));
+    const f = obs.flight as {
+      remediationRestrictions?: { pending?: { requiredOIDs: string[] } };
+      secretRemediation?: Record<string, unknown> & { flaggedCommits?: string[] };
+    };
+    assert.ok(f.remediationRestrictions?.pending?.requiredOIDs.includes(obs.secretSha), "the latch holds the secret commit");
+    assert.deepEqual(f.secretRemediation?.flaggedCommits, [obs.secretSha]);
+    assert.equal(f.secretRemediation?.attempts, 0, "no attempt was spent");
+    for (const k of ["known", "cleanTip", "withholdPaths", "blocked", "everKnown"]) assert.equal(f.secretRemediation?.[k], undefined, `${k} unchanged`);
+    assert.ok(obs.prompts.every((p) => !/not published yet|rewrite the commit|history rewrite/i.test(p)), "no rewrite guidance");
+    assert.deepEqual(obs.statuses.filter((x) => /returning to the lead|pre-exit secret scan flagged/.test(x)), [], "nothing emitted");
+    assert.equal(obs.publishCount, 0, "the flagged history was never published");
+    assert.equal(obs.final, undefined, "a worker shutdown leaves the run non-terminal");
+  });
+
+  it("resume preflight, fetch-back wait, pause-now: waits for A and proceeds, not stopped", { timeout: 120_000 }, async () => {
+    const { SecretRemediationStoppedError } = await import("../src/executor.js");
+    const obs = await lockedGate({ iid: iidOf("resume", "fetch", "pause"), kind: "resume", site: "fetch", control: "pause" });
+    assert.equal(obs.executeOutcome, undefined, `execute() resolved normally (got ${String(obs.executeOutcome)})`);
+    assert.ok(!(obs.gateError instanceof SecretRemediationStoppedError), String(obs.gateError));
+    assert.equal(obs.pendingAfterControl, true, "the preflight was still waiting for A after the control arrived");
+    assert.equal(obs.decision?.action, "proceed", "the decision is the no-pause one (a clean fetch-back proceeds)");
+  });
 });
