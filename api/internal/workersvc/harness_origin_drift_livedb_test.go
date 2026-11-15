@@ -109,7 +109,7 @@ func runOriginDriftOrigins(t *testing.T, env codexTestEnv, svc *Service, userID,
 	t.Run("manual issue create (Service.CreateRun)", func(t *testing.T) {
 		iid := iidBase + 1
 		seedEligibleIssue(t, env, repoID, iid)
-		run, err := svc.CreateRun(env.ctx, userID, repoID, iid, "desc", nil, nil, false, nil, nil, nil, nil)
+		run, err := svc.CreateRun(env.ctx, userID, repoID, iid, "desc", nil, nil, false, nil, nil, nil, nil, nil, nil)
 		if err != nil {
 			t.Fatalf("CreateRun: %v", err)
 		}
@@ -231,7 +231,7 @@ func TestOriginDriftExplicitPinHonoredLiveDB(t *testing.T) {
 	const iid = 92001
 	seedEligibleIssue(t, env, repoID, iid)
 	codex := HarnessCodex
-	run, err := svc.CreateRun(env.ctx, userID, repoID, iid, "desc", nil, nil, false, nil, nil, &codex, nil)
+	run, err := svc.CreateRun(env.ctx, userID, repoID, iid, "desc", nil, nil, false, nil, nil, &codex, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("CreateRun with explicit codex pin: %v", err)
 	}

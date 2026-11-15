@@ -104,7 +104,7 @@ func (fx *effFix) create(explicit *Harness, override *RawCredentialOverride) (st
 	fx.t.Helper()
 	fx.iid++
 	seedEligibleIssue(fx.t, fx.env, fx.repoID, fx.iid)
-	return fx.svc.CreateRun(fx.env.ctx, fx.userID, fx.repoID, fx.iid, "eff", nil, nil, false, nil, nil, explicit, override)
+	return fx.svc.CreateRun(fx.env.ctx, fx.userID, fx.repoID, fx.iid, "eff", nil, nil, false, nil, nil, explicit, override, nil, nil)
 }
 
 func (fx *effFix) mustCreate(explicit *Harness) store.Run {

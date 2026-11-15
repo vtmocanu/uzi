@@ -31,6 +31,7 @@ import { CODEX_COMPLETION_INTERLOCK_CAPABILITY, CODEX_CUSTOM_MODEL_CAPABILITY, C
 import { residueQuarantine } from "./residue-quarantine.js";
 import type { WorkerMemoryRuntime } from "./worker-memory-runtime.js";
 import { reportProofTiming } from "./report-proof-timing.js";
+import { asWriter, asWriterWhenOpen, hibernationWriters, type HibernationInventoryController } from "./hibernation-inventory.js";
 
 class UnsupportedMemoryAPI extends Error {}
 
@@ -163,6 +164,9 @@ export class Worker {
     private readonly launcherPreflight: () => Promise<MemoryLauncherPreflightResult> = () => memoryLauncherPreflight(),
     // PRD #4206: the hibernation cache prune; present only with Docker wiring and the prune flag on.
     private readonly hibernationPrune?: HibernationCachePruneController,
+    // PRD #4208 M1: present only on the DinD lane with epoch participation. Its presence is what
+    // advertises `hibernation_inventory_v1`; its heartbeat report and member handling live here.
+    private readonly hibernation?: HibernationInventoryController,
   ) {
     // Existing constructor callers with a real outbox/client also reconcile after restart.
     if (!this.terminalRejections && outbox && typeof client.reportTerminalRejections === "function" &&
@@ -552,7 +556,7 @@ export class Worker {
       // journaled bundle bytes with NO forge PAT. Fire-and-forget and fully swallowed — a
       // resume failure must never block the claim loops, and the source stays protected by
       // the journal + the server custody hold regardless.
-      void this.runner.resumePendingRecoveries(signal, bootRecoveries).catch((err) => {
+      void asWriterWhenOpen("recovery_resume", () => this.runner.resumePendingRecoveries(signal, bootRecoveries), signal).catch((err) => {
         this.log.warn("recovery: restart resume sweep failed", { error: errMessage(err) });
       });
       // PRD #1391 M2: admit any spill tail a crash may have lost, then drain the outbox
@@ -581,9 +585,10 @@ export class Worker {
       // exists. The claim loops themselves additionally stay closed while the pending set exceeds the
       // cap (`pending_overflow`, checked each iteration in claimLoop), and message drain stays in the
       // background above. The heartbeat promise is created once and awaited alongside the claim loops.
-      await this.resolveBootTerminals(signal);
+      await asWriterWhenOpen("boot_terminals", () => this.resolveBootTerminals(signal), signal);
       try {
-        await this.crossCheckRunner?.cleanupBootCodeSnapshots?.(bootCodeSnapshots, signal);
+        await asWriterWhenOpen("boot_terminals",
+          async () => { await this.crossCheckRunner?.cleanupBootCodeSnapshots?.(bootCodeSnapshots, signal); }, signal);
       } catch {
         this.log.warn("code snapshot boot cleanup failed; snapshots retained");
       }
@@ -624,7 +629,7 @@ export class Worker {
   private async settlementLoop(signal: AbortSignal): Promise<void> {
     while (!signal.aborted) {
       try {
-        await this.runner.settlePendingPredecessors(signal);
+        await asWriter("settlement_sweep", () => this.runner.settlePendingPredecessors(signal));
       } catch (err) {
         this.log.warn("recovery settlement: sweep failed", { error: errMessage(err) });
       }
@@ -1115,6 +1120,7 @@ export class Worker {
         if (this.dindMaintenance) protocolCapabilities.push("dind_maintenance_v1");
         // PRD #4206: offered only when the prune is enabled and a docker host is wired (main.ts builds the controller then).
         if (this.hibernationPrune) protocolCapabilities.push("hibernation_cache_prune_v1");
+        if (this.hibernation) protocolCapabilities.push("hibernation_inventory_v1");
         // Issue #1324: publication_resume_v1 promises a durable local publication-intent record, so it is
         // advertised only while the outbox that holds it is usable. Without it the api never enrolls this
         // worker's runs and an ordinary finalize runs exactly as before.
@@ -1222,6 +1228,7 @@ export class Worker {
         // PRD #4206: a maintenance ACK goes first; the cache prune report waits for the next heartbeat.
         const ack = this.dindMaintenance?.acknowledgement();
         const hibernationReport = ack ? undefined : this.hibernationPrune?.report();
+        const hibernationExclusion = this.hibernation?.exclusionReport();
         const retaining = await this.client.heartbeat(
           sample,
           this.outboxEntries(),
@@ -1231,8 +1238,12 @@ export class Worker {
           residueQuarantine(),
           this.outbox?.unusableRootReason?.(),
           hibernationReport,
+          hibernationExclusion,
         );
         ok = true;
+        if (hibernationExclusion && this.client.hibernationExclusionDelivered(hibernationExclusion)) {
+          this.hibernation?.acknowledgeExclusion(hibernationExclusion);
+        }
         if (hibernationReport) {
           const outcome = this.client.hibernationReportOutcome;
           this.hibernationPrune?.reported(hibernationReport, outcome === "none" ? "failed" : outcome);
@@ -1248,9 +1259,14 @@ export class Worker {
         this.dindPrune?.recordCustody(retaining, sentAtMs);
         this.dindMaintenance?.observe(this.client.latestDindMaintenance, retaining, sentAtMs);
         this.hibernationPrune?.observe(this.client.latestHibernationCachePrune, retaining, sentAtMs);
+        // A successful heartbeat that no longer negotiates the feature is an explicit "none" (null,
+        // not undefined), so an active hold releases instead of leaking; a failed one stays unknown.
+        this.hibernation?.observe(this.client.hasFeature("hibernation_inventory_v1")
+          ? this.client.latestHibernationInventory : null);
       } catch (err) {
         this.dindMaintenance?.observe(undefined, undefined, sentAtMs);
         this.hibernationPrune?.observe(undefined, undefined, sentAtMs);
+        this.hibernation?.observe(undefined);
         this.log.warn("heartbeat failed", { error: errMessage(err) });
       }
       // PRD #1809 D5: the data volume's used fraction from THIS tick's sample, checked
@@ -1277,16 +1293,16 @@ export class Worker {
         });
         // Issue #1512: also re-resolve journaled terminals that have no message records (the
         // drainer never visits those). Fire-and-forget for the same reason as the drain above.
-        void this.sweepPendingTerminals(signal).catch((err) => {
+        void asWriter("terminal_sweep", () => this.sweepPendingTerminals(signal)).catch((err) => {
           this.log.warn("outbox terminal sweep failed", { error: errMessage(err) });
         });
-        void this.sweepPendingFinalizes(signal).catch((err) => {
+        void asWriter("finalize_sweep", () => this.sweepPendingFinalizes(signal)).catch((err) => {
           this.log.warn("outbox finalize sweep failed", { error: errMessage(err) });
         });
         // issue #3181: re-deliver a credential-switch hold-settled acknowledgement that failed at the
         // end of its flight. Fire-and-forget and single-flight inside the runner.
         if (typeof this.runner.retryPendingHoldSettled === "function") {
-          void this.runner.retryPendingHoldSettled().catch((err) => {
+          void asWriter("hold_settled_retry", () => this.runner.retryPendingHoldSettled()).catch((err) => {
             this.log.warn("credential switch hold acknowledgement retry failed", { error: errMessage(err) });
           });
         }
@@ -1297,7 +1313,8 @@ export class Worker {
         // heartbeat's send time, so a credential rejection newer than it keeps the pass closed. A
         // runner double without the method has nothing to re-drive.
         if (sampledAtMs !== undefined && typeof this.runner.resumeLiveRecoveries === "function") {
-          void this.runner.resumeLiveRecoveries(sampledAtMs, signal).catch((err) => {
+          const redriveAt = sampledAtMs;
+          void asWriter("recovery_redrive", () => this.runner.resumeLiveRecoveries(redriveAt, signal)).catch((err) => {
             this.log.warn("recovery: live re-drive failed", { error: errMessage(err) });
           });
         }
@@ -1386,6 +1403,9 @@ export class Worker {
     const outbox = this.outbox;
     if (!outbox) return;
     if (this.draining) return; // single-flight
+    // PRD #4208: a latched worker skips the pass; the next heartbeat tick retries.
+    const writer = hibernationWriters.enter("outbox_drain");
+    if (!writer) return;
     this.draining = true;
     try {
       for (const runId of outbox.runsWithPending()) {
@@ -1412,6 +1432,7 @@ export class Worker {
       }
     } finally {
       this.draining = false;
+      writer();
     }
   }
 

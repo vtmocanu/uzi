@@ -39,7 +39,7 @@ describe("mock judge resolver vs fixtures/model-settings/judge.json", () => {
       ran++;
     }
     expect(ran).toBe(contract.source_labels.length);
-    expect(modelSettingSourceLabel("model", "run_override")).toBe("unknown");
+    expect(modelSettingSourceLabel("model", "bogus")).toBe("unknown");
   });
 });
 

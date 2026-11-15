@@ -19,7 +19,7 @@ import { scanScratchProcesses, type Settlement } from "../src/pod-epoch-scratch.
 import { WORKER_UID } from "../src/runner-uid.js";
 import { buildPodEpochScratchDeps } from "../src/main.js";
 import { nullLogger } from "./helpers.js";
-import { ENABLE_DELETION_FOR_TEST, ENABLE_SCRATCH_FOR_TEST } from "./pod-epoch-reclaim-support.js";
+import { ENABLE_DELETION_FOR_TEST, ENABLE_SCRATCH_FOR_TEST, perGroupInspect } from "./pod-epoch-reclaim-support.js";
 import type { PodEpochOwnership } from "../src/pod-epoch-lock.js";
 
 const bytes = await readFile(new URL("../../fixtures/pod-epoch/v2/positive.json", import.meta.url));
@@ -144,7 +144,7 @@ async function makeWorld(leaves: string[] = ["a", "b"]): Promise<World> {
     client: { listRecoveryHolds: async run_id => ({ run_id, holds: [] }), getRunOwnership: async () => ({ status: "completed" }) },
     git: {
       discoverEpochRetainedSources: async () => ({ groups: [], inventoryComplete: true, physicalPaths: 0, overflow: 0, overflowExact: true, unreadable: 0 }),
-      inspectRetainedSources: async () => { throw new Error("unexpected inspection"); },
+      inspectEpochRetainedGroups: async () => { throw new Error("unexpected inspection"); },
     },
     openDaemonGuard: async () => w.guard,
     scratch: {
@@ -1082,10 +1082,10 @@ function attemptSource(over: Partial<RetainedSourceEvidence> = {}, partOver: Rec
 function withAttemptInventory(w: World, source: () => RetainedSourceEvidence) {
   const group = { barePath: "/bare", selector: { runId: "run0", generation: 1, attempt: "attempt" }, paths: ["/tree/0"] };
   w.options.git.discoverEpochRetainedSources = async () => ({ groups: [group], inventoryComplete: true, physicalPaths: 1, overflow: 0, overflowExact: true, unreadable: 0 });
-  w.options.git.inspectRetainedSources = async opts => {
+  w.options.git.inspectEpochRetainedGroups = perGroupInspect(async opts => {
     for (const p of group.paths) opts.beforeTree!(p);
     return { sources: [source()], partial: false, unreadable: 0, sampledAt: "" };
-  };
+  });
   w.options.client.listRecoveryHolds = async run_id => ({ run_id, holds: [], run_open_holds: { run_id, count: 0 } });
 }
 

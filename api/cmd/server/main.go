@@ -1204,6 +1204,7 @@ func run() error {
 		WorkerEligibilityForHealth: wsvc.WorkerEligibilityForHealth,
 		ResidueQuarantine:          wsvc.ResidueQuarantineFor,
 		MemoryAuthorityLost:        wsvc.MemoryAuthorityLostFor,
+		HibernationRetirement:      wsvc.EvaluateHibernationRetirement,
 		Store:                      q,
 		MaintenanceReadout: func(ctx context.Context) (store.MaintenanceReadout, error) {
 			return store.ReadMaintenanceReadout(ctx, pool)

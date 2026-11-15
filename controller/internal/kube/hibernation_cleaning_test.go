@@ -3,6 +3,7 @@ package kube
 import (
 	"context"
 	"errors"
+	"reflect"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -124,7 +125,7 @@ func TestCleaningStopProof(t *testing.T) {
 			}
 			got, d := rec.calls[0], hibGet(t, client)
 			want := protocol.HibernationTransition{OpID: "op-1", Transition: protocol.TransitionCleanupStopped, DeploymentUID: string(d.UID), PodUID: c.proof, CleanupOpID: "clean-1"}
-			if got != want {
+			if !reflect.DeepEqual(got, want) {
 				t.Fatalf("report = %+v, want %+v", got, want)
 			}
 			noClusterWrites(t, client)
@@ -144,7 +145,7 @@ func TestCleaningReportsStoppedProofWithoutDeployment(t *testing.T) {
 		t.Fatalf("calls = %v, want one cleanup_stopped", rec.transitions())
 	}
 	want := protocol.HibernationTransition{OpID: "op-1", Transition: protocol.TransitionCleanupStopped, PodUID: "pod-uid-1", CleanupOpID: "clean-1"}
-	if rec.calls[0] != want {
+	if !reflect.DeepEqual(rec.calls[0], want) {
 		t.Fatalf("report = %+v, want %+v", rec.calls[0], want)
 	}
 	noClusterWrites(t, client)

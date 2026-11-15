@@ -39,6 +39,10 @@
 // any run. The pipes are unref'd (never destroyed) and drained into a discard sink so a late
 // `close` is still observed and a worker that finishes its work can still exit.
 //
+// Hibernation inventory: a configured leg marks `dind_builder` as an uncovered writer.
+// The inventory is incomplete even after a client closes: local settlement says nothing
+// about the daemon's last in-flight batch. No pressure trigger, backoff or gate semantics change.
+//
 // Outcomes (every attempt outcome consumes the backoff, re-armed by a <75% sample or after 1h,
 // except `unknown`, which always waits the full hour):
 //   refused   nothing was submitted (buildx plugin missing, spawn failure, buildx CLI error).
@@ -68,6 +72,7 @@ import {
   type DindPruneGate,
 } from "./dind-prune.js";
 import type { Config } from "./config.js";
+import { hibernationWriters } from "./hibernation-inventory.js";
 import type { Logger } from "./log.js";
 import { errMessage, sleep as abortableSleep } from "./util.js";
 
@@ -428,6 +433,10 @@ export class DindBuilderPruneController {
     this.spawnArgvPrefix = opts.spawnArgvPrefix ?? [];
     this.exec = opts.exec ?? execBuilderPrune;
     this.onSettled = opts.onSettled;
+    // This pressure leg may outlive its client, and local close does not prove daemon-side
+    // settlement. A registry lease around tick would therefore be insufficient. Keep the
+    // configured writer explicitly uncovered for this worker process (PRD #4208 M1).
+    hibernationWriters.markUncovered("dind_builder");
   }
 
   /** The api-assigned worker id, once registration returns it. */

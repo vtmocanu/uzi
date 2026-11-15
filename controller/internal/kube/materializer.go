@@ -429,6 +429,10 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 		return nil
 	}
 	byWorker := map[string][]corev1.Pod{}
+	// claimUsers maps a PVC claim name to the uids of every pod in the namespace, labelled
+	// or not, that mounts it: a writer the worker's own label never shows (hibernation
+	// volume inventory, PRD #4208).
+	claimUsers := claimUsersOf(pods.Items)
 	for i := range pods.Items {
 		p := &pods.Items[i]
 		id, ours := IsOurs(p.Labels)
@@ -446,6 +450,7 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 	for _, o := range byID {
 		if o.Namespace == ns {
 			o.PodsKnown = true
+			o.PVCUserPodUIDs = pvcUserPodUIDs(claimUsers, o.ID)
 			// Terminating pods are in byWorker too: they still hold the workdir.
 			o.RunnerLayout = observeRunnerLayout(o.ID, byWorker[o.ID])
 		}
@@ -488,6 +493,45 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 		o.Roll.TargetImage = targetImages[id]
 	}
 	return nil
+}
+
+// claimUsersOf maps a PVC claim name to the uids of every pod in the list that mounts it.
+// The roll snapshot derives the PVC-user set with it from the same list that supplies
+// WorkerPodUIDs, so one report's pod set and PVC-user set never come from two reads.
+func claimUsersOf(pods []corev1.Pod) map[string][]string {
+	users := map[string][]string{}
+	for i := range pods {
+		p := &pods[i]
+		if p.UID == "" {
+			continue
+		}
+		seen := map[string]bool{}
+		for _, v := range p.Spec.Volumes {
+			if v.PersistentVolumeClaim == nil || seen[v.PersistentVolumeClaim.ClaimName] {
+				continue
+			}
+			seen[v.PersistentVolumeClaim.ClaimName] = true
+			users[v.PersistentVolumeClaim.ClaimName] = append(users[v.PersistentVolumeClaim.ClaimName], string(p.UID))
+		}
+	}
+	return users
+}
+
+// pvcUserPodUIDs returns the sorted, de-duplicated uids of the pods that mount any of the
+// worker's data, nix or DinD data claims. Never nil: an empty result is a known-empty set.
+func pvcUserPodUIDs(claimUsers map[string][]string, id string) []string {
+	set := map[string]bool{}
+	for _, name := range []string{dataPVCName(id), nixPVCName(id), dindDataPVCName(id)} {
+		for _, u := range claimUsers[name] {
+			set[u] = true
+		}
+	}
+	out := make([]string, 0, len(set))
+	for u := range set {
+		out = append(out, u)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // replicaFailureReason returns the reason on a worker Deployment's ReplicaFailure

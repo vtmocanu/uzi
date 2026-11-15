@@ -96,6 +96,16 @@ func (t *fakeClaimFinishTx) ParkCredentialDisabledRun(_ context.Context, arg sto
 	return 1, nil
 }
 
+func (t *fakeClaimFinishTx) ParkRunOverrideUnavailableRun(_ context.Context, arg store.ParkRunOverrideUnavailableRunParams) (int64, error) {
+	t.pending = append(t.pending, func() { t.f.claimOverrideParked = &arg })
+	return 1, nil
+}
+
+func (t *fakeClaimFinishTx) InsertRunOverrideUnavailableMessage(_ context.Context, arg store.InsertRunOverrideUnavailableMessageParams) (int32, error) {
+	t.pending = append(t.pending, func() { t.f.claimOverrideMessages = append(t.f.claimOverrideMessages, arg) })
+	return 1, nil
+}
+
 // GetUserCredentialsResetAt: the fake users have never redeemed a reset link (NULL marker).
 func (t *fakeClaimFinishTx) GetUserCredentialsResetAt(context.Context, uuid.UUID) (pgtype.Timestamptz, error) {
 	return pgtype.Timestamptz{}, nil

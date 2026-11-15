@@ -35,7 +35,10 @@ function aCard(over: Partial<Card> = {}): Card {
   };
 }
 
-function renderCard(over: Partial<Card> = {}) {
+function renderCard(
+  over: Partial<Card> = {},
+  props: Partial<Pick<Parameters<typeof IssueCard>[0], "gate" | "starting" | "onStart" | "onOptions">> = {},
+) {
   return render(
     <MemoryRouter>
       <IssueCard
@@ -48,9 +51,10 @@ function renderCard(over: Partial<Card> = {}) {
         onMoveUp={vi.fn()}
         onMoveDown={vi.fn()}
         insertionEdge={null}
-        gate={{ enabled: true, reason: "" }}
-        starting={false}
-        onStart={vi.fn()}
+        gate={props.gate ?? { enabled: true, reason: "" }}
+        starting={props.starting ?? false}
+        onStart={props.onStart ?? vi.fn()}
+        onOptions={props.onOptions}
         fixCiBusy={false}
         onFixCi={vi.fn()}
         uziLabel="uzi"
@@ -162,4 +166,48 @@ it.each([true, false])("active account wait card respects owner metadata (mine=%
   expect(container.textContent).not.toMatch(/⚠|stuck|provider reported/);
   if (!is_mine) expect(container.textContent).not.toContain("waiting for account cooldown");
   expect(r.id).toBe("same-run");
+});
+
+// PRD #3250 M2 (user decision P1): the card keeps one-click Start run and adds a secondary
+// Options button that opens the board's ONE Run options dialog. The card itself renders
+// no pickers and no dialog (D9: never inside the draggable card).
+describe("IssueCard — Start run and Options (PRD #3250 M2)", () => {
+  it("renders Options with the accessible name Run options for #<iid> beside Start run", () => {
+    const onOptions = vi.fn();
+    const onStart = vi.fn();
+    renderCard({}, { onOptions, onStart });
+    const options = screen.getByRole("button", { name: "Run options for #7" });
+    expect(options.textContent).toBe("Options");
+    options.click();
+    expect(onOptions).toHaveBeenCalledTimes(1);
+    expect(onStart).not.toHaveBeenCalled();
+    screen.getByRole("button", { name: "Start run" }).click();
+    expect(onStart).toHaveBeenCalledTimes(1);
+    expect(onOptions).toHaveBeenCalledTimes(1);
+  });
+
+  it("renders no inline harness or token picker and no dialog", () => {
+    renderCard({}, { onOptions: vi.fn() });
+    expect(screen.queryByRole("combobox")).toBeNull();
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("puts Options under the same gate as Start run", () => {
+    renderCard({}, { onOptions: vi.fn(), gate: { enabled: false, reason: "Connect a worker first (Settings → Workers)." } });
+    const options = screen.getByRole("button", { name: "Run options for #7" }) as HTMLButtonElement;
+    expect(options.disabled).toBe(true);
+    expect(options.title).toBe("Connect a worker first (Settings → Workers).");
+    expect((screen.getByRole("button", { name: "Start run (gated)" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("disables Options while this card's one-click start is in flight", () => {
+    renderCard({}, { onOptions: vi.fn(), starting: true });
+    expect((screen.getByRole("button", { name: "Run options for #7" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("renders no Options button when the board does not wire it", () => {
+    renderCard();
+    expect(screen.queryByRole("button", { name: /Run options/ })).toBeNull();
+    expect(screen.getByRole("button", { name: "Start run" })).toBeTruthy();
+  });
 });

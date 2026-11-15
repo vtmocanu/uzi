@@ -224,6 +224,7 @@ var limiterNames = [...]string{
 // POST /api/controller/workers/{workerID}/hibernation (all noLimiter), making the table 411 rows
 // (len(wantRouteMounts) at that change). Issue #4334 adds GET /api/admin/repo-activity (noLimiter); re-tallied at that change,
 // len(wantRouteMounts) is 414 (the earlier figures above were not re-tallied).
+// PRD #4208 adds the two noLimiter inventory/exclusion-final routes, making 416 rows.
 // THIS SENTENCE IS DOWNSTREAM OF ANY NEW ROUTE — see the note above wantRouteMounts for
 // which lines a mount-adder owns.
 //
@@ -869,6 +870,9 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/vault/passphrase", limAuth},
 	{"POST", "/api/vault/unlock", limAuth},
 	{"POST", "/api/worker/heartbeat", noLimiter},
+	// PRD #4208 M1: bounded (1.25 MiB / 8 KiB) strict decode, one write each per hibernation attempt.
+	{"POST", "/api/worker/hibernation/inventory", noLimiter},
+	{"POST", "/api/worker/hibernation/exclusion-final", noLimiter},
 	{"POST", "/api/worker/register", noLimiter},
 	{"POST", "/api/worker/runs/claim", noLimiter},
 	// PRD #1171 M1: the Codex credential release/refresh bridge. Bearer-only, scoped to

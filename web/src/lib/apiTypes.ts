@@ -249,15 +249,16 @@ export interface CatalogDefault {
  *  source_labels of fixtures/model-settings/contract.json. */
 type EffectiveModelSource =
   | "user_default" | "instance_default" | "builtin" | "schedule_pin" | "template"
-  | "cross_check_pin" | "cross_check_worker_default";
+  | "cross_check_pin" | "cross_check_worker_default" | "run_override";
 type EffectiveEffortSource =
-  | "user_default" | "builtin" | "cross_check_pin" | "cross_check_default";
+  | "user_default" | "builtin" | "cross_check_pin" | "cross_check_default" | "run_override";
 type EffectiveHarnessSource = "run_override" | "schedule_pin" | "user_default" | "automatic" | "chosen_at_create" | "same_as_run";
 type EffectiveCredentialSource =
   | "claim_selection" | "codex_default_credential" | "chosen_at_create" | "auto_selection" | "owner_default" | "token_override";
 type EffectiveRefusal =
   | "no_credential_for_harness" | "no_usable_credential" | "credential_disabled" | "credential_not_found"
-  | "credential_override_harness_unsupported" | "credential_override_invalid";
+  | "credential_override_harness_unsupported" | "credential_override_invalid"
+  | "model_incompatible_with_harness";
 type EffectiveRefusalDetail = "credential_disabled" | "codex_pool_unavailable";
 type EffectiveModelSetting = "worker_model" | "judge_model" | "summary_model" | "task_review_model" | "cross_check_plan" | "cross_check_code";
 type EffectiveEffortSetting = "worker_effort" | "task_review_effort" | "cross_check_plan" | "cross_check_code";
@@ -343,6 +344,11 @@ export interface StartPreviewCredentialOverride {
 export interface StartPreviewRequest {
   harness: string | null;
   credential_override: StartPreviewCredentialOverride | null;
+  /** PRD #3250: the start-time model, shape-checked like run create (no trim). A model opts the
+   *  run out of automatic harness selection. Omit for the default. */
+  model?: string | null;
+  /** PRD #3250: the start-time reasoning effort (low, medium, high, xhigh or max). Omit for the default. */
+  effort?: string | null;
 }
 
 /** One harness a creation-time policy might choose, computed as if it were chosen. A refused
@@ -352,17 +358,27 @@ export interface StartPreviewAlternative {
   credential: Credential | null;
   refusal: EffectiveRefusal | null;
   refusal_detail: EffectiveRefusalDetail | null;
+  /** Present only when the request carried an effort (source run_override). There is no worker_model
+   *  here: a request with a model never leaves the harness undecided (D22). */
+  worker_effort?: EffortSettingCell;
 }
 
 /** The start-preview response. When the harness is chosen at creation, `credential` is null and
- *  `alternatives` lists Claude then Codex. A top-level `refusal` is set only for a failure before
- *  a harness is decided, or when every alternative is refused for the same reason. */
+ *  `alternatives` lists Claude then Codex. A top-level `refusal` is set for a failure before a
+ *  harness is decided, for a refusal on a decided harness, or when every alternative is refused for
+ *  the same reason. A credential refusal leaves `credential` null; `model_incompatible_with_harness`
+ *  keeps it whenever the credential resolves, and is null only when, on a request that named the
+ *  harness, it superseded a credential refusal (create checks that model first). */
 export interface StartPreview {
   version: number;
   harness: HarnessValue | null;
   refusal: EffectiveRefusal | null;
   refusal_detail: EffectiveRefusalDetail | null;
   credential: Credential | null;
+  /** Present only when the request carried that choice and the harness is decided (source
+   *  run_override, effort mode explicit); with an undecided harness each alternative carries its own. */
+  worker_model?: ModelSettingCell;
+  worker_effort?: EffortSettingCell;
   alternatives?: StartPreviewAlternative[];
 }
 
@@ -1207,6 +1223,8 @@ export interface LatestRun {
   // 'base_attestation_missing' (issue #3194) reads "base unverified: owner hold" likewise.
   // 'iteration_budget_exhausted' is a nonterminal owner hold: "Iteration limit reached".
   // Resume grants a fresh finite allowance; Extend adds wall time without resuming; Cancel ends it.
+  // 'run_override_unavailable' (issue #3250) reads "model choice unavailable: owner hold". The set of
+  // these non-completion holds is NON_COMPLETION_HOLDS in lib/runBadge.ts.
   // Optional for api/web rollout skew: an absent key reads as no hold.
   hold_reason?: string | null;
   owner_name: string;
@@ -3700,6 +3718,9 @@ export interface Run {
   plan_cross_check_gated?: boolean;
   /** Persisted forced-gate reason; optional for older server and mock responses. */
   plan_cross_check_gate_reason?: string | null;
+  /** Live plan/code cross-check presence, shared by the run list and single-run detail.
+   *  Older APIs omit it; null or absent means no visible live check. */
+  cross_check_active?: "plan" | "code" | null;
   /** Planning-diff refusal sub-code; set only while the gate reason is planning_diff_refused. */
   plan_cross_check_diff_refusal?: string | null;
   /** Owner detail only. Historical findings describe an earlier plan. */
@@ -3714,10 +3735,19 @@ export interface Run {
   trigger_source?: RunTriggerSource;
   worker_id: string | null;
   branch: string | null;
-  /** PRD #300: the per-schedule model a schedule froze onto this run at fire time;
-   *  null = the run inherited the owner's worker model (Run defaults). Applies to all
-   *  schedule targets (unlike guidance). */
+  /** The model frozen onto this run at create time: chosen when the run was started
+   *  (model_source run_override, PRD #3250) or pinned by the schedule that created it
+   *  (schedule_pin, PRD #300); null = the run inherits the owner's worker model at claim. */
   model: string | null;
+  /** PRD #3250: the reasoning effort chosen when the run was started, frozen at create;
+   *  null = the claim-time setting applies. OPTIONAL here only to avoid forcing mock-object
+   *  updates (like trigger_source); the server always sends it. */
+  effort?: string | null;
+  /** Writer of `model`: run_override or schedule_pin; null for no model and for a legacy
+   *  row (display reads a model with no source as schedule_pin). */
+  model_source?: "run_override" | "schedule_pin" | null;
+  /** Writer of `effort`: run_override; null when there is no effort. */
+  effort_source?: "run_override" | null;
   /** PRD #305: the frozen "apply model also to agents" flag; true means this run's
    *  model was applied to every subagent (overriding pins), false is the default. */
   override_subagent_model: boolean;
@@ -4295,6 +4325,14 @@ export interface Run {
    *  'iteration_budget_exhausted' is a nonterminal iteration hold: owner Resume or Cancel,
    *  never completed-scope Stop. Extend wall time first only when remaining wall is spent;
    *  Extend leaves it paused, and credential changes never retry it automatically.
+   *  Issue #3250: 'run_override_unavailable' is a nonterminal owner hold: the run's chosen model
+   *  or effort cannot run on its harness; owner Resume retries only if the choice has become available
+   *  on that harness, otherwise Cancel and start a new run with a different choice.
+   *  The non-completion holds (credential_disabled, credentials_reset, provider_unavailable,
+   *  codex_policy_hold, base_attestation_missing, repo_agent_source_unavailable, the two token-switch
+   *  holds, iteration_budget_exhausted and run_override_unavailable; NOT completion_blocked,
+   *  budget_exhausted or weekly_reserve) form one set, NON_COMPLETION_HOLDS in lib/runBadge.ts, which owns their
+   *  tone, label and owner-resumability (fixtures/hold-reasons/presentation.json).
    *  Render an unrecognised value honestly.
    *  `hold_context` is the constant "unavailable(same_worker_only)" ONLY while held, else null:
    *  the UI/CLI state the hold's durability HONESTLY from it — the hold is same-worker-only and
@@ -4444,6 +4482,19 @@ export interface RunJobFinding {
 export interface CredentialOverride {
   mode: string;
   label: string | null;
+}
+
+/** RunStartBody is the optional start-option part of POST /repos/{id}/runs (PRD #3250 M2),
+ *  shaped by lib/startRun.ts's runStartBody, the one builder. Every key is OPTIONAL and sent
+ *  only when present: an empty object is today's one-click body ({issue_iid} alone).
+ *  credential_override mirrors the Go create handler's write shape ({mode, secret_id?}),
+ *  harness is an explicit pick, and model / effort are sent verbatim (the server does not
+ *  trim them). */
+export interface RunStartBody {
+  credential_override?: { mode: string; secret_id?: string };
+  harness?: Harness;
+  model?: string;
+  effort?: string;
 }
 
 /** CredentialEpoch is one claim's credential attribution (PRD #1247 M1, D7): the
@@ -4667,11 +4718,6 @@ export interface RunListItem extends Run {
    *  render as plain text. */
   pending_question?: string;
 
-  /** Which cross-check is live for this run: "plan" or "code". Non-null only while the
-   *  run's plan or code cross-check is live. Older APIs omit it, and an absent value
-   *  shows no tag. */
-  cross_check_active?: "plan" | "code" | null;
-
   repo_path: string;
   worker_name: string | null;
   owner_email?: string;
@@ -4687,6 +4733,8 @@ export type RunSummaryItem = Omit<
   | "reset_state_digest" | "milestone_reconciliations" | "milestone_reconciliations_next_before_gate_revision"
   | "semantic_gate" | "completion_pending" | "semantic_drift"
   | "capability_provenance" | "lead_config" | "created_issues"
+  // PRD #3250: the start-time choice is on the run page and the list, not the polling shape.
+  | "effort" | "model_source" | "effort_source"
 >;
 
 /** The GET /api/runs/{id}/inputs response (Go RunInputsEnvelopeDTO, issue #4198): the steer

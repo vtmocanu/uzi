@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { healthApi } from "./mockApi/health";
+import { appSettings } from "./mockApi/settings";
 import { workersApi, workers } from "./mockApi/workers";
 import type { Worker } from "../lib/api";
 import { ownerOnlyWaitingOwnerId, ownerOnlyWaitingRunId } from "./data/health";
@@ -15,6 +16,18 @@ vi.mock("./mockApi/shared", async (importOriginal) => ({
 }));
 
 describe("health scenario routing", () => {
+  it("makes automatic hibernation applicable only while both settings are enabled", async () => {
+    const saved = { worker_hibernation_enabled: appSettings.worker_hibernation_enabled, worker_hibernation_auto: appSettings.worker_hibernation_auto };
+    try {
+      vi.mocked(mockScenario).mockReturnValue("health-silent");
+      for (const [enabled, auto, severity] of [["false", "false", "na"], ["true", "false", "na"], ["false", "true", "na"], ["true", "true", "ok"]]) {
+        Object.assign(appSettings, { worker_hibernation_enabled: enabled, worker_hibernation_auto: auto });
+        const check = (await healthApi.getAdminHealth()).checks.find((c) => c.id === "fleet.hibernation");
+        expect(check?.severity).toBe(severity);
+      }
+    } finally { Object.assign(appSettings, saved); }
+  });
+
   it("counts all attention statuses with provisioning excluded", async () => {
     const saved = workers.map((w) => ({ ...w }));
     try {
@@ -31,7 +44,7 @@ describe("health scenario routing", () => {
   it("appends healthy Codex pricing metadata with empty evidence", async () => {
     vi.mocked(mockScenario).mockReturnValue("health-silent");
     const doc = await healthApi.getAdminHealth();
-    expect(doc.checks).toHaveLength(26);
+    expect(doc.checks).toHaveLength(27);
     expect(doc.checks[doc.checks.length - 1]).toMatchObject({
       id: "pricing.codex", scope: "instance", group: "housekeeping", title: "Codex price coverage",
       doc: "admin-health", severity: "ok", summary: "no recent Codex usage on unpriced models", evidence: [],
@@ -80,14 +93,25 @@ describe("health scenario routing", () => {
     });
   });
 
-  it("emits fleet.hibernation as an instance workers check, ok, right after fleet.hibernation_cleanup", async () => {
+  it("emits fleet.hibernation as an instance workers check, not applicable by default, right after fleet.hibernation_cleanup", async () => {
     vi.mocked(mockScenario).mockReturnValue("health-silent");
     const doc = await healthApi.getAdminHealth();
     const ids = doc.checks.map((c) => c.id);
     expect(ids.indexOf("fleet.hibernation")).toBe(ids.indexOf("fleet.hibernation_cleanup") + 1);
     expect(doc.checks.find((c) => c.id === "fleet.hibernation")).toMatchObject({
-      scope: "instance", group: "workers", title: "Automatic hibernation", severity: "ok", doc: "hosted-workers",
+      scope: "instance", group: "workers", title: "Automatic hibernation", severity: "na", doc: "hosted-workers",
     });
+  });
+
+  it("emits fleet.hibernation_retirement as an instance workers check, ok, right after fleet.hibernation", async () => {
+    vi.mocked(mockScenario).mockReturnValue("health-silent");
+    const doc = await healthApi.getAdminHealth();
+    const ids = doc.checks.map((c) => c.id);
+    expect(ids.indexOf("fleet.hibernation_retirement")).toBe(ids.indexOf("fleet.hibernation") + 1);
+    expect(doc.checks.find((c) => c.id === "fleet.hibernation_retirement")).toMatchObject({
+      scope: "instance", group: "workers", title: "Hibernation volume retirement (dry run)", severity: "ok", doc: "hosted-workers",
+    });
+    expect(doc.checks.find((c) => c.id === "fleet.hibernation_retirement")!.summary).toContain("Dry run: no volumes are deleted");
   });
 
   it("emits forge.sync in the integrations group, ok, right after forge.ciwatch", async () => {
@@ -113,7 +137,7 @@ describe("health scenario routing", () => {
     expect(doc.checks.filter((c) => c.attention_banner === true)).toMatchObject([
       { id: "recovery.storage", scope: "owner", severity: "warn", summary: "2 captures currently marked quota-refused." },
     ]);
-    expect(doc.counts).toEqual({ ok: 22, warn: 2, danger: 2, unknown: 0, na: 0 });
+    expect(doc.counts).toEqual({ ok: 22, warn: 2, danger: 2, unknown: 0, na: 1 });
     for (const id of ["fleet.capacity", "queue.waiting"]) {
       expect(doc.checks.find((c) => c.id === id)?.evidence[0]).toEqual({
         label: "Waiting run",
@@ -137,7 +161,7 @@ describe("health scenario routing", () => {
     expect(doc.blocking).toBe(false);
     expect(doc.episode_id).toBeNull();
     expect(doc.snoozed_until).toBeNull();
-    expect(doc.counts).toEqual({ ok: 26, warn: 0, danger: 0, unknown: 0, na: 0 });
+    expect(doc.counts).toEqual({ ok: 26, warn: 0, danger: 0, unknown: 0, na: 1 });
     expect(doc.checks.find((c) => c.id === "fleet.roll")).toMatchObject({
       scope: "instance", severity: "ok", summary: "All 4 hosted workers are rolling cleanly.",
     });

@@ -25,6 +25,9 @@ var summaryOmitted = map[string]bool{
 	"issue_description":        true,
 	"preserved_patch":          true,
 	"lead_config":              true, // GetRun-only overlay (PRD #3244); never on a list or summary.
+	"effort":                   true, // PRD #3250: the start-time choice is shown on the run page and the list, not the polling shape.
+	"model_source":             true, // PRD #3250: same; the summary shows no run-start choice.
+	"effort_source":            true, // PRD #3250: same.
 }
 
 // TestRunSummaryItemDTOKeys pins the summary key set to the list item's key set minus
@@ -73,6 +76,9 @@ func TestRunSummaryItemRoundTrip(t *testing.T) {
 	want.RunDTO.RepoPath = "" // detail-only; the list carries its own shadowing RepoPath
 	want.CapabilityProvenance = nil
 	want.LeadConfig = nil
+	want.Effort = nil
+	want.ModelSource = nil
+	want.EffortSource = nil
 
 	got := RunSummaryOf(full).ListItem()
 	if !reflect.DeepEqual(got, want) {

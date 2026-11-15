@@ -302,11 +302,11 @@ assert.call(guard['environment'], nil, 'release proof has no credential environm
 assert.call(guard.fetch('permissions'), {'contents' => 'read', 'actions' => 'read'}, 'release proof is read-only')
 assert.call(guard.to_s.include?('HOMEBREW_TAP_TOKEN'), false, 'tap credential absent from proof job')
 assert.call(publisher.fetch('environment'), 'release', 'tap environment stays tag-restricted')
-proof_command = 'python3 -I scripts/release-ci-coverage.py published HEAD --tag "$INPUT_TAG" --wait 3600 --interval 15'
+proof_command = 'python3 -I scripts/release-ci-coverage.py published HEAD --tag "$INPUT_TAG" --wait 18000 --interval 15'
 assert.call(guard.fetch('steps').any? { |step| step['run'] == proof_command }, true, 'exact publication proof command must run')
 assert.call(guard['continue-on-error'], nil, 'proof job cannot suppress failure')
 guard.fetch('steps').each { |step| assert.call(step['continue-on-error'], nil, 'proof steps cannot suppress failure') }
-assert.call(3600 < guard.fetch('timeout-minutes') * 60, true, 'proof finishes within job timeout')
+assert.call(18000 < guard.fetch('timeout-minutes') * 60, true, 'proof finishes within job timeout')
 validation = guard.fetch('steps').find { |step| step['id'] == 'tag' }.fetch('run')
 [['v0.2.0', 'v0.2.0', 'tag', true], ['v0.2.0-rc.1', 'v0.2.0-rc.1', 'tag', true],
  ['v0.2.0', 'v0.1.0', 'tag', false], ['v0.2.0', 'v0.2.0', 'branch', false],

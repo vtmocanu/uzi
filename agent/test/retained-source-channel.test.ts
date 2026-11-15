@@ -639,6 +639,22 @@ describe("discard through the real socket", () => {
     await rig.abort();
   });
 
+  for (const owner of ["hibernation", "hibernation_inventory"] as const) {
+    it(`an operator discard never runs while the ${owner} owner holds the gate`, async () => {
+      const a = await retainedAttempt(`run-${owner}`, 1);
+      const rig = await rigOf({});
+      const ev = await inspectOne(rig, a);
+      rig.gate.close(owner);
+      const r = await send(rig.sock, { op: "discard", run: a.runId, generation: 1, attempt: a.attemptId, confirm: ev.descriptor });
+      assert.equal(r.result.reason, "worker_not_idle");
+      assert.equal(fs.existsSync(a.path), true);
+      assert.equal(rig.events.includes("gate_closed:retained_ops"), false, "it never closes alongside the holder");
+      assert.equal(rig.gate.heldBy(owner), true, "the holder's block is left alone");
+      rig.gate.open(owner);
+      await rig.abort();
+    });
+  }
+
   it("an execution active after its claim completed is not idle: the discard refuses and the gate reopens", async () => {
     const a = await retainedAttempt("run-act", 1);
     const rig = await rigOf({ idle: () => false });
@@ -1400,6 +1416,18 @@ describe("resolve-local-record: admission", () => {
     assert.equal(rig.events.includes("gate_closed:retained_ops"), false);
     assert.equal(rig.resolveCalls.length, 0);
   });
+
+  for (const owner of ["hibernation", "hibernation_inventory"] as const) {
+    it(`a held ${owner} owner refuses a resolve worker_not_idle without closing the gate`, async () => {
+      const rig = await rigOf();
+      rig.gate.close(owner);
+      refusedWith(await send(rig.sock, resolveReq()), "worker_not_idle");
+      assert.equal(rig.events.includes("gate_closed:retained_ops"), false);
+      assert.equal(rig.gate.heldBy(owner), true, "the holder's block is left alone");
+      assert.equal(rig.resolveCalls.length, 0);
+      rig.gate.open(owner);
+    });
+  }
 
   it("claims that never drain refuse claims_not_drained, reopen the gate and skip the runner", async () => {
     let t = 0;
