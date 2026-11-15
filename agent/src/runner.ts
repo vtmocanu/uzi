@@ -4183,6 +4183,7 @@ export class RunRunner {
       defaultBranch: claimBranch ?? (lookupBare ? undefined : "main"),
       ...(lookupBare ? { lookupDefaultBranch: (b: { signal: AbortSignal; deadline: number }) =>
         this.git.withReportProofBudget(b, () => this.git.defaultBranchName(lookupBare)) } : {}),
+      readDefaultBranchTip: (bare, branch, b) => this.git.withReportProofBudget(b, () => this.git.defaultBranchTip(bare, branch)),
       egressBound: false,
       skip, failureFirst, policy: () => this.frozenHeldPolicy(flight),
       remediationHold: sha => this.checkpointRemediationHold(flight, flight.barePath!, sha, false),

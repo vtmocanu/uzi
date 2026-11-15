@@ -74,6 +74,11 @@ export interface TerminalLaneEnv {
    * lane treats an aborted or past-deadline return as a refusal (`default_branch_unresolved`), never as "main".
    */
   lookupDefaultBranch?: (bound: { signal: AbortSignal; deadline: number }) => Promise<string | undefined>;
+  /**
+   * Reads the default branch's tip under the lane's own window (`bound` as for `lookupDefaultBranch`). Absent: the lane calls
+   * `git.defaultBranchTip` directly. A throw or an aborted or past-deadline return refuses the prepare as `deadline`.
+   */
+  readDefaultBranchTip?: (barePath: string, branch: string, bound: { signal: AbortSignal; deadline: number }) => Promise<string | undefined>;
   egressBound: boolean;
   workerTokenFile?: string;
   /** Run-gate predicates (policy hold, park, claim fence, pending/attempted terminal, permanent-failure reap). */
@@ -227,7 +232,14 @@ async function run(env: TerminalLaneEnv, flight: TerminalLaneFlight, body: Termi
       }),
       prepare: async (range: CheckpointRange | "resolve", expectDigests, tip): Promise<PrepareOutcome> => {
         let flagged: string[] = [];
-        const ciTarget = defaultBranch ? await env.git.defaultBranchTip(barePath, defaultBranch) : undefined;
+        let ciTarget: string | undefined;
+        if (defaultBranch && env.readDefaultBranchTip) {
+          try { ciTarget = await env.readDefaultBranchTip(barePath, defaultBranch, { signal: abort.signal, deadline: deadlineAt }); } catch { ciTarget = undefined; }
+          // A tip read cut short by the window must not proceed with a missing ciTarget.
+          if (abort.signal.aborted || env.now() >= deadlineAt) return { reason: "deadline" };
+        } else if (defaultBranch) {
+          ciTarget = await env.git.defaultBranchTip(barePath, defaultBranch);
+        }
         const out = await prepareFrozenHeldPinned({
           git: env.git, barePath, branch, sourceSha: tip, policy: env.policy(), deadlineMs: left(),
           ...(defaultBranch ? { defaultBranch } : {}),

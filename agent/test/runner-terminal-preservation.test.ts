@@ -402,6 +402,48 @@ describe("terminal-preservation lane (#4007 slice B)", () => {
     assert.deepEqual(o.branches, ["main"]);
   });
 
+  // The tip read runs under the lane's window through env.readDefaultBranchTip; the real prepare runs (hooked one dropped) and
+  // any git call other than the tip read is recorded, so a refusal before prepareFrozenHeldPinned shows as an empty list.
+  async function tipReadRig(readTip: NonNullable<TerminalLaneEnv["readDefaultBranchTip"]>, capMs: number) {
+    const otherGitCalls: string[] = [];
+    const git = new Proxy({}, { get: (_t, name) => (name === "defaultBranchTip"
+      ? async () => { throw new Error("the lane must use readDefaultBranchTip"); }
+      : async () => { otherGitCalls.push(String(name)); return undefined; }) });
+    const r = rig({ env: { defaultBranch: "main", git: git as never, readDefaultBranchTip: readTip } });
+    const { prepare: _hooked, ...deps } = r.env.hooks!.deps!;
+    r.env.hooks = { ...r.env.hooks!, capMs, deps };
+    const started = Date.now();
+    const out = await preserveInLane(r.env, r.flight, body);
+    return { out, elapsed: Date.now() - started, otherGitCalls, r };
+  }
+
+  it("a default-branch tip read that stalls past the window keeps the output as a prepare deadline before any prepare git call", async () => {
+    const capMs = 150;
+    const o = await tipReadRig(async (_bare, _branch, b) => {
+      await new Promise<void>(res => { if (b.signal.aborted) res(); else b.signal.addEventListener("abort", () => res(), { once: true }); });
+      return undefined;
+    }, capMs);
+    assert.equal(o.out.outcome, "kept");
+    assert.match(String(o.out.reason), /deadline/);
+    assert.ok(o.elapsed < capMs + 1500, `elapsed ${o.elapsed} ms`);
+    assert.deepEqual(o.otherGitCalls, [], "prepareFrozenHeldPinned never started");
+    assert.equal(o.r.sends, 0);
+  });
+
+  it("the tip read is handed the lane's live signal and a deadline inside the lane window", async () => {
+    let seen: { aborted: boolean; deadline: number; branch: string; at: number } | undefined;
+    const before = Date.now();
+    const o = await tipReadRig(async (_bare, branch, b) => {
+      seen = { aborted: b.signal.aborted, deadline: b.deadline, branch, at: Date.now() };
+      return undefined;
+    }, 5_000);
+    assert.ok(seen, "the tip read ran");
+    assert.equal(seen.aborted, false);
+    assert.equal(seen.branch, "main");
+    assert.ok(Number.isFinite(seen.deadline) && seen.deadline > seen.at && seen.deadline <= before + 5_000 + 1_000, `deadline ${seen.deadline - before} ms ahead`);
+    void o;
+  });
+
   it("a cooperative quiesce that honours the deadlineAt it receives returns the lane kept within its budget", async () => {
     const cap = 200;
     let received: number | undefined;
