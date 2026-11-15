@@ -19,7 +19,7 @@ import { defaultGitleaksShim } from "./gitleaks-shim.js";
 import type { Executor, RunContext } from "../src/executor.js";
 import { GitLabClient, type FetchFn } from "../src/forge.js";
 import { RunRunner } from "../src/runner.js";
-import { CredentialSwitchSignal } from "../src/steering.js";
+import { CredentialSwitchSignal, SteeringChannel } from "../src/steering.js";
 import type { SdkQueryFn } from "../src/sdk-executor.js";
 import { CodexExecutor, CODEX_PRODUCTION_PROVIDER, createCodexEpochAuthority, type CodexAdviceHarnessFactory } from "../src/codex/codex-executor.js";
 import { selectCodexBinding } from "../src/codex/select.js";
@@ -277,6 +277,50 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
       assert.ok(!statuses.includes("completed"), JSON.stringify(statuses));
     });
   }
+
+  it("M2 Codex claude_hook honours committed withheld cancel without legacy release", async () => {
+    const claim = claimFor(2626, { secrets: CODEX_SECRETS, claim_generation: 1 });
+    api.setInputClaimGeneration(claim.run_id, 1);
+    api.deriveCancellationRequested = true;
+    const channels: SteeringChannel[] = [];
+    const begin = SteeringChannel.prototype.beginCredentialSwitchDefer;
+    SteeringChannel.prototype.beginCredentialSwitchDefer = function () {
+      channels.push(this);
+      return begin.call(this);
+    };
+    let hookEntered = false;
+    let legacyCalls = 0;
+    const runner = runnerFor({
+      async run(ctx) {
+        await ctx.deferCredentialSwitch!(async () => {
+          api.requestCredentialSwitch(claim.run_id, 1);
+          api.setInputs(claim.run_id, [{ id: 1, kind: "cancel", body: null }]);
+          // Cancellation sets its committed marker before aborting terminal lifecycle.
+          const terminal = ctx.terminalLifecycleSignal!;
+          await new Promise<void>(resolve => {
+            if (terminal.aborted) resolve();
+            else terminal.addEventListener("abort", () => resolve(), { once: true });
+          });
+          assert.ok(channels.some(ch => ch.cancelCommittedUnderWithheldSwitch()), "cancel committed under the deferred switch");
+          hookEntered = true;
+          await ctx.attemptCredentialSwitch!({ site: "implement_turn", laneSettled: true });
+        });
+        return { branch: ctx.branch };
+      },
+    });
+    const legacy = runner as unknown as { enterCredentialSwitch(...args: unknown[]): Promise<never> };
+    legacy.enterCredentialSwitch = async () => { legacyCalls++; throw new Error("legacy release entered"); };
+    try {
+      await runner.execute(claim);
+    } finally {
+      SteeringChannel.prototype.beginCredentialSwitchDefer = begin;
+    }
+    assert.equal(hookEntered, true);
+    assert.equal(legacyCalls, 0);
+    const states = api.states.filter(s => s.runId === claim.run_id).map(s => s.body);
+    assert.deepEqual(states.filter(s => s.status === "failed").map(s => s.failure_reason), ["run cancelled"]);
+    assert.ok(!states.some(s => s.status === "credential_switch" || s.status === "credential_switch_failed" || s.status === "completed"));
+  });
 
   /** A fake production factory: records the build params and each request, answers like luna. */
   function lunaFactory(rec: { builds: unknown[]; requests: AdviceRequest[] }, text = "Running the api gate for the docs milestone"): CodexAdviceHarnessFactory {

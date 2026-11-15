@@ -16951,6 +16951,10 @@ export class RunRunner {
       // issue #1597 M2: gated end to end — from the wip marker captureRecoveryRestorePoint commits to
       // the give-up's undoWipMarker — so a mid-turn tick can never publish that throwaway marker.
       attemptCredentialSwitch: async (opts) => {
+        // Issue #3974: an owner cancel was committed while the switch was withheld. Do not enter the
+        // switch (no capture, no credential_switch* report): throw the ordinary cancel error so the
+        // executor lets it reach executeClaim's dispatchFailure, which reports "run cancelled".
+        if (steering.cancelCommittedUnderWithheldSwitch()) throw new Error("run cancelled");
         // This hook belongs to Claude, including its give-up and v1 release outcomes.
         if (claim.secrets.codex) {
           flight.preserveRecoveryClone = true;
@@ -16959,10 +16963,6 @@ export class RunRunner {
           flight.retainedLocalCustody = true;
           throw new CredentialSwitchRetainedStop();
         }
-        // Issue #3974: an owner cancel was committed while the switch was withheld. Do not enter the
-        // switch (no capture, no credential_switch* report): throw the ordinary cancel error so the
-        // executor lets it reach executeClaim's dispatchFailure, which reports "run cancelled".
-        if (steering.cancelCommittedUnderWithheldSwitch()) throw new Error("run cancelled");
         if (batcher.hasCandidateReservation()) {
           // Invariant guard: no capture, report, clear or continuation. Not a checked lifecycle
           // control, so it reaches dispatchFailure's generic branch (reportGenericFailure closes
