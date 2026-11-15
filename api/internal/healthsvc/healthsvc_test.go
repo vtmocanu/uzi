@@ -77,11 +77,9 @@ type fakeStore struct {
 	ciwatchErr             error
 	runDisk                []store.WorkerRunDisk
 	runDiskErr             error
-	hibIdle                []store.ListAutoHibernationBlockedIdleRow
-	hibIdleErr             error
-	hibParked              []store.ListAutoHibernationParkedBlockersRow
-	hibParkedErr           error
-	hibParams              []store.ListAutoHibernationBlockedIdleParams
+	hibRows                []store.ListAutoHibernationBlockersRow
+	hibErr                 error
+	hibParams              []store.ListAutoHibernationBlockersParams
 }
 
 func (f *fakeStore) RecoveryStorageHealth(ctx context.Context, p store.RecoveryStorageHealthParams) ([]store.RecoveryStorageHealthRow, error) {
@@ -165,12 +163,9 @@ func (f *fakeStore) ListLargestRunDiskForWorkers(context.Context, store.ListLarg
 	return f.runDisk, f.runDiskErr
 }
 
-func (f *fakeStore) ListAutoHibernationBlockedIdle(_ context.Context, p store.ListAutoHibernationBlockedIdleParams) ([]store.ListAutoHibernationBlockedIdleRow, error) {
+func (f *fakeStore) ListAutoHibernationBlockers(_ context.Context, p store.ListAutoHibernationBlockersParams) ([]store.ListAutoHibernationBlockersRow, error) {
 	f.hibParams = append(f.hibParams, p)
-	return f.hibIdle, f.hibIdleErr
-}
-func (f *fakeStore) ListAutoHibernationParkedBlockers(context.Context, store.ListAutoHibernationParkedBlockersParams) ([]store.ListAutoHibernationParkedBlockersRow, error) {
-	return f.hibParked, f.hibParkedErr
+	return f.hibRows, f.hibErr
 }
 
 type fakeSettings struct {

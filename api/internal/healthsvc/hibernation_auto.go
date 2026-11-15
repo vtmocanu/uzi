@@ -7,7 +7,6 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -15,8 +14,8 @@ import (
 )
 
 const (
-	// hibernationEvidenceRows bounds the listed workers per source; the window total each
-	// query returns stays exact whatever this is.
+	// hibernationEvidenceRows bounds the listed workers in total; the window total the query
+	// returns stays exact whatever this is.
 	hibernationEvidenceRows = 50
 	// hibernationNameBytes is the worker-name budget in an evidence value. It shrinks when the
 	// rest of the value is long, so the blocker text always survives maxEvidenceBytes.
@@ -95,10 +94,10 @@ func hibernationIdleFor(d time.Duration) string {
 // custody hold, cordon, maintenance, roll, ...) or every run assigned to it is parked and the
 // oldest parked run is older than the idle threshold. `na` when no hosted workers are
 // configured or automatic hibernation is off (hibernation enabled AND automatic both on);
-// `unknown` when a setting or either query cannot be read. The summary is fixed text. Evidence
-// is the exact worker count (the two sources are disjoint, so the sum of their window totals),
-// then at most hibernationEvidenceRows rows per source, then an explicit More row when the
-// listing is cut. Since is the oldest blocker timestamp.
+// `unknown` when a setting or the query cannot be read. The summary is fixed text. Evidence
+// is the exact worker count (one statement over both disjoint sources), then at most
+// hibernationEvidenceRows rows in total (idle workers first), then an explicit More row when the
+// listing is cut. Since is the oldest blocker timestamp across every matching worker.
 func (s *Service) checkFleetHibernation(ctx context.Context, now time.Time, workers []store.ListAllWorkersRow) apitypes.HealthCheckDTO {
 	c := s.base("fleet.hibernation")
 	if !s.hostedConfigured(workers) {
@@ -135,56 +134,37 @@ func (s *Service) checkFleetHibernation(ctx context.Context, now time.Time, work
 		return unknown("worker_hibernation_idle_after", err)
 	}
 	cutoff := pgconv.Time(now.Add(-idleAfter))
-	idle, err := s.cfg.Store.ListAutoHibernationBlockedIdle(ctx, store.ListAutoHibernationBlockedIdleParams{Cutoff: cutoff, MaxRows: hibernationEvidenceRows})
+	rows, err := s.cfg.Store.ListAutoHibernationBlockers(ctx, store.ListAutoHibernationBlockersParams{Cutoff: cutoff, MaxRows: hibernationEvidenceRows})
 	if err != nil {
-		return unknown("blocked idle workers", err)
+		return unknown("blockers", err)
 	}
-	parked, err := s.cfg.Store.ListAutoHibernationParkedBlockers(ctx, store.ListAutoHibernationParkedBlockersParams{Cutoff: cutoff, MaxRows: hibernationEvidenceRows})
-	if err != nil {
-		return unknown("parked blockers", err)
-	}
-
-	var total int64
-	if len(idle) > 0 {
-		total += idle[0].Total
-	}
-	if len(parked) > 0 {
-		total += parked[0].Total
-	}
-	if total == 0 && len(idle) == 0 && len(parked) == 0 {
+	if len(rows) == 0 {
 		c.Severity = sevOK
 		c.Summary = "No idle hosted worker is blocked from automatic hibernation."
 		return c
 	}
-	if listed := int64(len(idle) + len(parked)); total < listed {
-		total = listed
-	}
 
-	var oldest time.Time
-	note := func(t pgtype.Timestamptz) {
-		if t.Valid && (oldest.IsZero() || t.Time.Before(oldest)) {
-			oldest = t.Time
-		}
-	}
+	// Every row repeats the exact window total and the true oldest since (window functions
+	// over the whole matching set, one snapshot), so they are read from the first row.
+	total := rows[0].Total
 	c.Severity = sevWarn
 	c.Summary = "Some idle hosted workers cannot be hibernated automatically."
 	c.Evidence = append(c.Evidence, apitypes.HealthEvidenceDTO{Label: "Workers", Value: fmt.Sprintf("%d", total)})
-	for _, r := range idle {
-		suffix := fmt.Sprintf(" idle %s, hibernation blocked: %s", hibernationIdleFor(now.Sub(r.Anchor.Time)), hibernationBlockedLabel(r.Reason))
+	for _, r := range rows {
+		var suffix string
+		if r.Kind == "parked" {
+			suffix = fmt.Sprintf(" blocked: assigned run parked (%s, %s)", r.RunID.String()[:8], cutBytes(safe(r.Status.String), 16))
+		} else {
+			suffix = fmt.Sprintf(" idle %s, hibernation blocked: %s", hibernationIdleFor(now.Sub(r.Anchor.Time)), hibernationBlockedLabel(r.Reason))
+		}
 		c.Evidence = append(c.Evidence, apitypes.HealthEvidenceDTO{Label: "Worker", Value: hibernationEvidenceValue(r.Name, suffix)})
-		note(r.BlockedSince)
 	}
-	for _, r := range parked {
-		suffix := fmt.Sprintf(" blocked: assigned run parked (%s, %s)", r.RunID.String()[:8], cutBytes(safe(r.Status), 16))
-		c.Evidence = append(c.Evidence, apitypes.HealthEvidenceDTO{Label: "Worker", Value: hibernationEvidenceValue(r.Name, suffix)})
-		note(r.StatusSince)
-	}
-	if more := total - int64(len(idle)+len(parked)); more > 0 {
+	if more := total - int64(len(rows)); more > 0 {
 		c.Evidence = append(c.Evidence, apitypes.HealthEvidenceDTO{Label: "More", Value: fmt.Sprintf("%d more not listed", more)})
 	}
 	c.Action = strPtr("Clear the blocker so the worker can hibernate: release its recovery custody hold, lift the manual cordon or maintenance, or resume or cancel the parked run. The pass retries on its own; see Automatic hibernation in the hosted workers doc.")
-	if !oldest.IsZero() {
-		c.Since = sincePtr(oldest)
+	if rows[0].OldestSince.Valid {
+		c.Since = sincePtr(rows[0].OldestSince.Time)
 	}
 	return c
 }

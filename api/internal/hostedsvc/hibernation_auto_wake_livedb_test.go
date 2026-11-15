@@ -58,8 +58,9 @@ func TestHibernationAutoThenScheduleWakeLiveDB(t *testing.T) {
 			id, e.user, name+"-"+id.String(), append(id[:], id[:]...), pod, clock.Add(-idleFor))
 		return id, pod
 	}
-	// Other hostedsvc LiveDB tests seed their workers recently or hibernated, so on a fresh
-	// database these two are the only candidates and the admission count is exact.
+	// The database is shared across packages and never truncated, so residue workers from other
+	// tests may also be candidates: every assertion below is on these two workers' own state,
+	// never on the pass's admitted count.
 	idle15, pod15 := seed("idle15", 15*24*time.Hour)
 	idle13, _ := seed("idle13", 13*24*time.Hour)
 
@@ -73,8 +74,8 @@ func TestHibernationAutoThenScheduleWakeLiveDB(t *testing.T) {
 	}
 
 	// Example 1: only the worker past the threshold is admitted.
-	if n := pass(); n != 1 {
-		t.Fatalf("pass admitted %d, want 1 (the 15d worker)", n)
+	if n := pass(); n < 1 {
+		t.Fatalf("pass admitted %d, want at least the 15d worker", n)
 	}
 	if got := e.state(idle15); got != "preparing" {
 		t.Fatalf("15d worker state = %q, want preparing", got)

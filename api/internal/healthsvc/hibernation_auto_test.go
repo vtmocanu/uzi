@@ -22,10 +22,17 @@ func TestFleetHibernationAuto(t *testing.T) {
 	on := func() *fakeSettings {
 		return &fakeSettings{hibEnabled: true, hibAuto: true, hibIdleAfter: 14 * 24 * time.Hour}
 	}
-	idleRow := func(name, reason string, idle time.Duration, total int64) store.ListAutoHibernationBlockedIdleRow {
-		return store.ListAutoHibernationBlockedIdleRow{
-			ID: uuid.New(), Name: name, Anchor: stamp(fixedNow.Add(-idle)), Reason: reason,
-			BlockedSince: stamp(fixedNow.Add(-idle / 2)), Total: total,
+	idleRow := func(name, reason string, idle time.Duration, total int64) store.ListAutoHibernationBlockersRow {
+		return store.ListAutoHibernationBlockersRow{
+			Kind: "idle", ID: uuid.New(), Name: name, Anchor: stamp(fixedNow.Add(-idle)), Reason: reason,
+			Since: stamp(fixedNow.Add(-idle / 2)), Total: total, OldestSince: stamp(fixedNow.Add(-idle / 2)),
+		}
+	}
+	parkedRow := func(name string, runID uuid.UUID, status string, parkedFor time.Duration, total int64) store.ListAutoHibernationBlockersRow {
+		return store.ListAutoHibernationBlockersRow{
+			Kind: "parked", ID: uuid.New(), Name: name, RunID: pgtype.UUID{Bytes: runID, Valid: true},
+			Status: pgtype.Text{String: status, Valid: true}, Since: stamp(fixedNow.Add(-parkedFor)),
+			Total: total, OldestSince: stamp(fixedNow.Add(-parkedFor)),
 		}
 	}
 	eval := func(fs *fakeStore, sett *fakeSettings, workers []store.ListAllWorkersRow) apitypes.HealthCheckDTO {
@@ -42,7 +49,7 @@ func TestFleetHibernationAuto(t *testing.T) {
 	t.Run("na when hibernation is disabled", func(t *testing.T) {
 		s := on()
 		s.hibEnabled = false
-		c := eval(&fakeStore{hibIdle: []store.ListAutoHibernationBlockedIdleRow{idleRow("a", "manual_cordon", 20*24*time.Hour, 1)}}, s, hostedRows)
+		c := eval(&fakeStore{hibRows: []store.ListAutoHibernationBlockersRow{idleRow("a", "manual_cordon", 20*24*time.Hour, 1)}}, s, hostedRows)
 		if c.Severity != sevNA || !strings.Contains(c.Summary, "Automatic hibernation is off") {
 			t.Fatalf("got %+v", c)
 		}
@@ -64,11 +71,8 @@ func TestFleetHibernationAuto(t *testing.T) {
 		}
 	})
 	t.Run("unknown on a query error", func(t *testing.T) {
-		if c := eval(&fakeStore{hibIdleErr: errors.New("boom")}, on(), hostedRows); c.Severity != sevUnknown {
-			t.Fatalf("idle: got %+v", c)
-		}
-		if c := eval(&fakeStore{hibParkedErr: errors.New("boom")}, on(), hostedRows); c.Severity != sevUnknown {
-			t.Fatalf("parked: got %+v", c)
+		if c := eval(&fakeStore{hibErr: errors.New("boom")}, on(), hostedRows); c.Severity != sevUnknown {
+			t.Fatalf("got %+v", c)
 		}
 	})
 	t.Run("ok when nothing is blocked", func(t *testing.T) {
@@ -77,19 +81,22 @@ func TestFleetHibernationAuto(t *testing.T) {
 		if c.Severity != sevOK || len(c.Evidence) != 0 || c.Summary != "No idle hosted worker is blocked from automatic hibernation." {
 			t.Fatalf("got %+v", c)
 		}
+	})
+	t.Run("the merged query gets cutoff now minus the threshold and a total cap of 50", func(t *testing.T) {
+		fs := &fakeStore{}
+		eval(fs, on(), hostedRows)
 		if len(fs.hibParams) != 1 || !fs.hibParams[0].Cutoff.Time.Equal(fixedNow.Add(-14*24*time.Hour)) || fs.hibParams[0].MaxRows != 50 {
 			t.Fatalf("params = %+v", fs.hibParams)
 		}
 	})
 	t.Run("warn with both sources", func(t *testing.T) {
 		runID := uuid.MustParse("abcdef12-0000-4000-8000-000000000000")
-		fs := &fakeStore{
-			hibIdle: []store.ListAutoHibernationBlockedIdleRow{idleRow("idle-one", "custody_hold", 20*24*time.Hour, 1)},
-			hibParked: []store.ListAutoHibernationParkedBlockersRow{{
-				ID: uuid.New(), Name: "parked-one", RunID: runID, Status: "paused",
-				StatusSince: stamp(fixedNow.Add(-30 * 24 * time.Hour)), Total: 1,
-			}},
-		}
+		fs := &fakeStore{hibRows: []store.ListAutoHibernationBlockersRow{
+			idleRow("idle-one", "custody_hold", 20*24*time.Hour, 2),
+			parkedRow("parked-one", runID, "paused", 30*24*time.Hour, 2),
+		}}
+		fs.hibRows[0].OldestSince = stamp(fixedNow.Add(-30 * 24 * time.Hour))
+		fs.hibRows[1].OldestSince = stamp(fixedNow.Add(-30 * 24 * time.Hour))
 		c := eval(fs, on(), hostedRows)
 		if c.Severity != sevWarn || c.Action == nil || c.Since == nil {
 			t.Fatalf("got %+v", c)
@@ -108,21 +115,21 @@ func TestFleetHibernationAuto(t *testing.T) {
 			}
 		}
 		if *c.Since != fixedNow.Add(-30*24*time.Hour).UTC().Format("2006-01-02T15:04:05Z") {
-			t.Fatalf("since = %s (the oldest blocker is the parked run)", *c.Since)
+			t.Fatalf("since = %s (the query-wide oldest blocker)", *c.Since)
 		}
 	})
 	t.Run("idle under a day renders hours", func(t *testing.T) {
-		c := eval(&fakeStore{hibIdle: []store.ListAutoHibernationBlockedIdleRow{idleRow("a", "manual_cordon", 20*time.Hour, 1)}}, on(), hostedRows)
+		c := eval(&fakeStore{hibRows: []store.ListAutoHibernationBlockersRow{idleRow("a", "manual_cordon", 20*time.Hour, 1)}}, on(), hostedRows)
 		if c.Evidence[1].Value != "worker a idle 20h, hibernation blocked: manual cordon" {
 			t.Fatalf("got %q", c.Evidence[1].Value)
 		}
 	})
 	t.Run("workers count is the exact window total, not the row count", func(t *testing.T) {
-		var rows []store.ListAutoHibernationBlockedIdleRow
+		var rows []store.ListAutoHibernationBlockersRow
 		for i := 0; i < 50; i++ {
 			rows = append(rows, idleRow(fmt.Sprintf("w%d", i), "maintenance", 20*24*time.Hour, 70))
 		}
-		c := eval(&fakeStore{hibIdle: rows}, on(), hostedRows)
+		c := eval(&fakeStore{hibRows: rows}, on(), hostedRows)
 		if c.Evidence[0].Label != "Workers" || c.Evidence[0].Value != "70" {
 			t.Fatalf("first evidence = %+v", c.Evidence[0])
 		}
@@ -131,14 +138,27 @@ func TestFleetHibernationAuto(t *testing.T) {
 			t.Fatalf("evidence len %d, last %+v", len(c.Evidence), last)
 		}
 	})
-	t.Run("totals of both sources add up", func(t *testing.T) {
-		fs := &fakeStore{
-			hibIdle:   []store.ListAutoHibernationBlockedIdleRow{idleRow("a", "roll", 20*24*time.Hour, 3)},
-			hibParked: []store.ListAutoHibernationParkedBlockersRow{{ID: uuid.New(), Name: "p", RunID: uuid.New(), Status: "limit_wait", StatusSince: stamp(fixedNow.Add(-20 * 24 * time.Hour)), Total: 4}},
+	t.Run("more row is total minus listed and since is the query-wide oldest", func(t *testing.T) {
+		rows := []store.ListAutoHibernationBlockersRow{
+			idleRow("a", "roll", 20*24*time.Hour, 7),
+			parkedRow("p", uuid.New(), "limit_wait", 20*24*time.Hour, 7),
 		}
-		c := eval(fs, on(), hostedRows)
+		// The oldest blocker is a worker beyond the listed rows.
+		rows[0].OldestSince = stamp(fixedNow.Add(-90 * 24 * time.Hour))
+		c := eval(&fakeStore{hibRows: rows}, on(), hostedRows)
 		if c.Evidence[0].Value != "7" || c.Evidence[len(c.Evidence)-1].Value != "5 more not listed" {
 			t.Fatalf("evidence = %+v", c.Evidence)
+		}
+		if c.Since == nil || *c.Since != fixedNow.Add(-90*24*time.Hour).UTC().Format("2006-01-02T15:04:05Z") {
+			t.Fatalf("since = %v", c.Since)
+		}
+	})
+	t.Run("no More row when everything is listed", func(t *testing.T) {
+		c := eval(&fakeStore{hibRows: []store.ListAutoHibernationBlockersRow{idleRow("a", "roll", 20*24*time.Hour, 1)}}, on(), hostedRows)
+		for _, e := range c.Evidence {
+			if e.Label == "More" {
+				t.Fatalf("unexpected More row: %+v", c.Evidence)
+			}
 		}
 	})
 	t.Run("every recorded reason has its label", func(t *testing.T) {
@@ -159,12 +179,12 @@ func TestFleetHibernationAuto(t *testing.T) {
 			if !ok {
 				t.Fatalf("reason %q has no expected label in this test", code)
 			}
-			c := eval(&fakeStore{hibIdle: []store.ListAutoHibernationBlockedIdleRow{idleRow("w", code, 20*24*time.Hour, 1)}}, on(), hostedRows)
+			c := eval(&fakeStore{hibRows: []store.ListAutoHibernationBlockersRow{idleRow("w", code, 20*24*time.Hour, 1)}}, on(), hostedRows)
 			if got := c.Evidence[1].Value; got != "worker w idle 20d, hibernation blocked: "+want {
 				t.Fatalf("%s: got %q", code, got)
 			}
 		}
-		c := eval(&fakeStore{hibIdle: []store.ListAutoHibernationBlockedIdleRow{idleRow("w", "weird\x1b[31m_code", 20*24*time.Hour, 1)}}, on(), hostedRows)
+		c := eval(&fakeStore{hibRows: []store.ListAutoHibernationBlockersRow{idleRow("w", "weird\x1b[31m_code", 20*24*time.Hour, 1)}}, on(), hostedRows)
 		if strings.ContainsRune(c.Evidence[1].Value, 0x1b) || !strings.Contains(c.Evidence[1].Value, "weird") {
 			t.Fatalf("unknown code: %q", c.Evidence[1].Value)
 		}
@@ -174,11 +194,11 @@ func TestFleetHibernationAuto(t *testing.T) {
 		multi := strings.Repeat("é世", 60) // 2- and 3-byte runes
 		for _, name := range []string{long, multi, "x\x1b[31m" + long} {
 			fs := &fakeStore{
-				hibIdle: []store.ListAutoHibernationBlockedIdleRow{
-					idleRow(name, workersvc.BlockedControllerNotAdvertise, 400*24*time.Hour, 2),
-					idleRow(name, strings.Repeat("世", 80), 400*24*time.Hour, 2),
+				hibRows: []store.ListAutoHibernationBlockersRow{
+					idleRow(name, workersvc.BlockedControllerNotAdvertise, 400*24*time.Hour, 3),
+					idleRow(name, strings.Repeat("世", 80), 400*24*time.Hour, 3),
+					parkedRow(name, uuid.New(), "recovery_wait", 40*24*time.Hour, 3),
 				},
-				hibParked: []store.ListAutoHibernationParkedBlockersRow{{ID: uuid.New(), Name: name, RunID: uuid.New(), Status: "recovery_wait", StatusSince: stamp(fixedNow.Add(-40 * 24 * time.Hour)), Total: 1}},
 			}
 			c := eval(fs, on(), hostedRows)
 			for i, e := range c.Evidence[1:] {

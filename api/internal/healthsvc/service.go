@@ -106,8 +106,7 @@ type Store interface {
 	ListRecentUnpricedCodexModels(context.Context, store.ListRecentUnpricedCodexModelsParams) ([]store.ListRecentUnpricedCodexModelsRow, error)
 	// fleet.hibernation (issue #4207): idle workers the automatic pass could not hibernate, and
 	// workers whose only runs are parked; each row carries the exact window total.
-	ListAutoHibernationBlockedIdle(context.Context, store.ListAutoHibernationBlockedIdleParams) ([]store.ListAutoHibernationBlockedIdleRow, error)
-	ListAutoHibernationParkedBlockers(context.Context, store.ListAutoHibernationParkedBlockersParams) ([]store.ListAutoHibernationParkedBlockersRow, error)
+	ListAutoHibernationBlockers(context.Context, store.ListAutoHibernationBlockersParams) ([]store.ListAutoHibernationBlockersRow, error)
 }
 
 // Settings is the slice of the settings cache healthsvc reads: the run-health kill switch

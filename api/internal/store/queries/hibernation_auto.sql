@@ -64,59 +64,69 @@ UPDATE workers SET
     hibernation_blocked_at = @at::timestamptz
 WHERE id = @id;
 
--- name: ListAutoHibernationBlockedIdle :many
--- fleet.hibernation (admin health): idle persistent hosted workers the automatic pass could
--- not hibernate. The worker and idleness predicates repeat ListAutoHibernationCandidates
--- (same non-terminal NOT EXISTS text, so runs_worker_nonterminal_idx serves it). A recorded
--- block counts only when it was seen at or after the anchor (hibernation_blocked_at >= anchor),
--- so a stale reason from before the worker's latest activity is ignored. total is the exact
--- number of matching workers across the window, not the LIMIT row count. The set is disjoint
--- from ListAutoHibernationParkedBlockers (this one has no non-terminal run, that one has at
--- least one). @cutoff comes from Go (the injectable clock).
-SELECT w.id, w.name, a.anchor::timestamptz AS anchor,
-       w.hibernation_blocked_reason::text AS reason,
-       w.hibernation_blocked_since AS blocked_since,
-       (count(*) OVER ())::bigint AS total
-FROM workers w
-CROSS JOIN LATERAL (
-    SELECT GREATEST(
-        (SELECT max(COALESCE(r.finished_at, r.status_since)) FROM runs r
-          WHERE r.worker_id = w.id AND r.status IN ('completed', 'failed', 'cancelled')),
-        w.last_wake_settled_at,
-        w.created_at
-    ) AS anchor
-) a
-WHERE w.kind = 'hosted' AND NOT w.ephemeral AND w.hibernation_state = 'none'
-  AND NOT EXISTS (
-      SELECT 1 FROM runs r
-      WHERE r.worker_id = w.id AND r.status NOT IN ('completed', 'failed', 'cancelled'))
-  AND a.anchor <= @cutoff::timestamptz
-  AND w.hibernation_blocked_reason IS NOT NULL
-  AND w.hibernation_blocked_at >= a.anchor
-ORDER BY a.anchor ASC, w.id ASC
-LIMIT @max_rows::int;
-
--- name: ListAutoHibernationParkedBlockers :many
--- fleet.hibernation (admin health): persistent hosted workers whose every assigned run is
--- parked (recovery_wait, paused or limit_wait), with the oldest parked run past @cutoff. The
--- automatic pass cannot hibernate them while a run is assigned. One row per worker: the
--- oldest parked run (status_since, then id). total is the exact number of matching workers
--- across the window, not the LIMIT row count. Disjoint from ListAutoHibernationBlockedIdle.
-SELECT w.id, w.name, p.run_id, p.status::text AS status, p.status_since::timestamptz AS status_since,
-       (count(*) OVER ())::bigint AS total
-FROM workers w
-CROSS JOIN LATERAL (
-    SELECT r.id AS run_id, r.status, r.status_since
-    FROM runs r
-    WHERE r.worker_id = w.id AND r.status NOT IN ('completed', 'failed', 'cancelled')
-    ORDER BY r.status_since ASC NULLS LAST, r.id ASC
-    LIMIT 1
-) p
-WHERE w.kind = 'hosted' AND NOT w.ephemeral AND w.hibernation_state = 'none'
-  AND NOT EXISTS (
-      SELECT 1 FROM runs r
-      WHERE r.worker_id = w.id AND r.status NOT IN ('completed', 'failed', 'cancelled')
-        AND r.status NOT IN ('recovery_wait', 'paused', 'limit_wait'))
-  AND p.status_since <= @cutoff::timestamptz
-ORDER BY p.status_since ASC, w.id ASC
+-- name: ListAutoHibernationBlockers :many
+-- fleet.hibernation (admin health): idle persistent hosted workers the automatic pass cannot
+-- hibernate, in ONE statement so total and oldest_since share one snapshot (a worker cannot
+-- fall out of one source between two READ COMMITTED reads). Two disjoint sets, told apart by
+-- kind: 'idle' = no non-terminal run, anchor (see GetWorkerIdleness) at or before @cutoff and a
+-- recorded block seen at or after the anchor (hibernation_blocked_at >= anchor, so a stale
+-- reason from before the latest activity is ignored); 'parked' = at least one non-terminal run
+-- and every one of them recovery_wait, paused or limit_wait, the oldest one (status_since, then
+-- id) at or before @cutoff. The worker and run predicates repeat ListAutoHibernationCandidates
+-- text so runs_worker_nonterminal_idx and runs_worker_terminal_end_idx serve them. since is
+-- when the blocker began: for idle the later of the reason's first sighting and the anchor (the
+-- reason can predate the current idle episode), for parked the oldest parked run's
+-- status_since. total is the exact number of matching workers and oldest_since the true oldest
+-- since, both across the whole window, not the LIMIT rows. Order: idle first (anchor, id), then
+-- parked (status_since, id). @cutoff comes from Go (the injectable clock).
+WITH idle AS (
+    SELECT w.id, w.name, a.anchor::timestamptz AS anchor,
+           w.hibernation_blocked_reason::text AS reason,
+           GREATEST(w.hibernation_blocked_since, a.anchor)::timestamptz AS since
+    FROM workers w
+    CROSS JOIN LATERAL (
+        SELECT GREATEST(
+            (SELECT max(COALESCE(r.finished_at, r.status_since)) FROM runs r
+              WHERE r.worker_id = w.id AND r.status IN ('completed', 'failed', 'cancelled')),
+            w.last_wake_settled_at,
+            w.created_at
+        ) AS anchor
+    ) a
+    WHERE w.kind = 'hosted' AND NOT w.ephemeral AND w.hibernation_state = 'none'
+      AND NOT EXISTS (
+          SELECT 1 FROM runs r
+          WHERE r.worker_id = w.id AND r.status NOT IN ('completed', 'failed', 'cancelled'))
+      AND a.anchor <= @cutoff::timestamptz
+      AND w.hibernation_blocked_reason IS NOT NULL
+      AND w.hibernation_blocked_at >= a.anchor
+), parked AS (
+    SELECT w.id, w.name, p.run_id, p.status::text AS status, p.status_since::timestamptz AS since
+    FROM workers w
+    CROSS JOIN LATERAL (
+        SELECT r.id AS run_id, r.status, r.status_since
+        FROM runs r
+        WHERE r.worker_id = w.id AND r.status NOT IN ('completed', 'failed', 'cancelled')
+        ORDER BY r.status_since ASC, r.id ASC
+        LIMIT 1
+    ) p
+    WHERE w.kind = 'hosted' AND NOT w.ephemeral AND w.hibernation_state = 'none'
+      AND NOT EXISTS (
+          SELECT 1 FROM runs r
+          WHERE r.worker_id = w.id AND r.status NOT IN ('completed', 'failed', 'cancelled')
+            AND r.status NOT IN ('recovery_wait', 'paused', 'limit_wait'))
+      AND p.status_since <= @cutoff::timestamptz
+), blockers AS (
+    SELECT 'idle'::text AS kind, 0 AS kind_order, i.id, i.name, i.anchor AS sort_at, i.anchor,
+           i.reason, i.since, NULL::uuid AS run_id, NULL::text AS status
+    FROM idle i
+    UNION ALL
+    SELECT 'parked'::text, 1, k.id, k.name, k.since, NULL::timestamptz,
+           ''::text, k.since, k.run_id, k.status
+    FROM parked k
+)
+SELECT b.kind, b.id, b.name, b.anchor, b.reason, b.since, b.run_id, b.status,
+       (count(*) OVER ())::bigint AS total,
+       (min(b.since) OVER ())::timestamptz AS oldest_since
+FROM blockers b
+ORDER BY b.kind_order ASC, b.sort_at ASC, b.id ASC
 LIMIT @max_rows::int;

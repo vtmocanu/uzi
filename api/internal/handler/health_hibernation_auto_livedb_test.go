@@ -24,9 +24,16 @@ import (
 // with an open recovery custody hold is refused by the REAL automatic pass
 // (workersvc.HibernationAutoPass), which records custody_hold; the check is then `warn` with the
 // worker listed. A second worker whose only run is paused beyond the threshold is listed as a
-// parked blocker. Once the hold is released and the worker hibernated the check no longer lists
-// it. The shared database may hold other tests' workers, so the assertions are relative to a
-// baseline read before seeding and every listed worker is matched by its unique name.
+// parked blocker, and a third with BOTH a recorded reason and a 30-day paused run is listed once
+// (as parked) and counted once. Workers the check must NOT list are seeded too: a stale recorded
+// reason from before the worker's latest activity, a run paused for less than the threshold, and
+// a worker with a paused and a running run. After the hold is released the real pass admits the
+// worker (preparing) and the check no longer lists it.
+//
+// The shared database may hold other tests' workers (run-store-it never truncates them), so the
+// assertions are per seeded worker, matched by unique name. The only count asserted is the
+// Workers delta around the seeding: the pass is first run until it admits nothing, so residue
+// workers no longer change between the baseline read and the read after seeding.
 //
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres.
 func TestAdminHealthHibernationAutoLiveDB(t *testing.T) {
@@ -122,6 +129,38 @@ func TestAdminHealthHibernationAutoLiveDB(t *testing.T) {
 		return "", false
 	}
 
+	// advance moves the shared clock and refreshes the controller advertisement so the pass
+	// (once per minute on its own clock) can run again.
+	advance := func(d time.Duration) {
+		t.Helper()
+		now = now.Add(d)
+		if err := h.q.UpsertControllerHibernationAdvertisement(ctx, store.UpsertControllerHibernationAdvertisementParams{
+			AdvertisedAt:        pgtype.Timestamptz{Time: now, Valid: true},
+			HibernationVersion:  pgtype.Int4{Int32: 1, Valid: true},
+			PollIntervalSeconds: pgtype.Int4{Int32: 300, Valid: true},
+		}); err != nil {
+			t.Fatalf("advertise: %v", err)
+		}
+	}
+	pass := func() int64 {
+		t.Helper()
+		advance(2 * time.Minute)
+		n, err := svc.HibernationAutoPass(ctx)
+		if err != nil {
+			t.Fatalf("HibernationAutoPass: %v", err)
+		}
+		return n
+	}
+	// Settle residue workers from other tests: run the real pass until it admits nothing (it
+	// admits a bounded number per run), then read the baseline.
+	for i := 0; ; i++ {
+		if pass() == 0 {
+			break
+		}
+		if i > 50 {
+			t.Fatal("the automatic pass keeps admitting residue workers")
+		}
+	}
 	baseline := workersCount(read())
 
 	// Seed: a repo, a persistent hosted worker idle 20 days with an open custody hold, and a
@@ -129,7 +168,7 @@ func TestAdminHealthHibernationAutoLiveDB(t *testing.T) {
 	conn, repo := uuid.New(), uuid.New()
 	cliMustExec(t, pool, `INSERT INTO forge_connections (id,user_id,forge_type,base_url,bot_username,bot_forge_user_id,token_ciphertext) VALUES ($1,$2,'gitlab','https://hib.example','bot',1,$3)`, conn, admin, []byte{1})
 	cliMustExec(t, pool, `INSERT INTO repos (id,connection_id,forge_project_id,path_with_namespace,web_url,enabled) VALUES ($1,$2,1,'g/hib','https://hib.example/g/hib',false)`, repo, conn)
-	var iid int32 = int32(time.Now().UnixNano()%1_000_000_000) + 1
+	iid := int32(time.Now().UnixNano()%1_000_000_000) + 1
 	newWorker := func(name string, createdAgo time.Duration) uuid.UUID {
 		id, pod := uuid.New(), uuid.New()
 		cliMustExec(t, pool, `INSERT INTO workers (id, user_id, name, token_hash, status, kind, hosted_size, template_declared, registered_pod_uid, created_at, last_heartbeat_at)
@@ -146,12 +185,15 @@ func TestAdminHealthHibernationAutoLiveDB(t *testing.T) {
 
 	suffix := uuid.NewString()[:8]
 	idleName, parkedName := "hib-idle-"+suffix, "hib-parked-"+suffix
+	both := "hib-both-" + suffix
 	idleID := newWorker(idleName, 20*24*time.Hour)
 	parkedID := newWorker(parkedName, 60*24*time.Hour)
+	bothID := newWorker(both, 60*24*time.Hour)
+	all := []uuid.UUID{idleID, parkedID, bothID}
 	t.Cleanup(func() {
 		_, _ = pool.Exec(ctx, `DELETE FROM recovery_custody_holds WHERE repo_id = $1`, repo)
 		_, _ = pool.Exec(ctx, `DELETE FROM runs WHERE repo_id = $1`, repo)
-		_, _ = pool.Exec(ctx, `DELETE FROM workers WHERE id = ANY($1)`, []uuid.UUID{idleID, parkedID})
+		_, _ = pool.Exec(ctx, `DELETE FROM workers WHERE id = ANY($1)`, all)
 		_, _ = pool.Exec(ctx, `DELETE FROM repos WHERE id = $1`, repo)
 		_, _ = pool.Exec(ctx, `DELETE FROM forge_connections WHERE id = $1`, conn)
 	})
@@ -163,11 +205,12 @@ func TestAdminHealthHibernationAutoLiveDB(t *testing.T) {
 	cliMustExec(t, pool, `INSERT INTO recovery_custody_holds(id,user_id,repo_id,run_id,generation,state,original_worker_id,original_worker_identity,live_worker_id,live_run_id,inventory_guarded)
 	                      VALUES($1,$2,$3,$4,1,'open',$5,'ident',$5,$4,true)`, hold, admin, repo, doneRun, idleID)
 	pausedRun := newRun(parkedID, "paused", now.Add(-30*24*time.Hour), nil)
+	// A recorded reason AND a 30-day paused run: the worker is listed once, as parked.
+	bothRun := newRun(bothID, "paused", now.Add(-30*24*time.Hour), nil)
+	cliMustExec(t, pool, `UPDATE workers SET hibernation_blocked_reason = 'custody_hold', hibernation_blocked_at = $2, hibernation_blocked_since = $2 WHERE id = $1`, bothID, now)
 
 	// The real pass refuses the held worker and records why.
-	if _, err := svc.HibernationAutoPass(ctx); err != nil {
-		t.Fatalf("HibernationAutoPass: %v", err)
-	}
+	pass()
 	var reason string
 	if err := pool.QueryRow(ctx, `SELECT COALESCE(hibernation_blocked_reason,'') FROM workers WHERE id = $1`, idleID).Scan(&reason); err != nil || reason != workersvc.BlockedCustodyHold {
 		t.Fatalf("recorded reason = %q, %v; want custody_hold", reason, err)
@@ -177,8 +220,8 @@ func TestAdminHealthHibernationAutoLiveDB(t *testing.T) {
 	if c.Severity != "warn" {
 		t.Fatalf("severity = %q, want warn: %+v", c.Severity, c)
 	}
-	if got, want := workersCount(c), baseline+2; got != want {
-		t.Fatalf("Workers = %d, want %d (baseline %d + 2)", got, want, baseline)
+	if got, want := workersCount(c), baseline+3; got != want {
+		t.Fatalf("Workers = %d, want %d (baseline %d + 3 distinct seeded workers)", got, want, baseline)
 	}
 	if v, ok := listed(c, idleName); !ok || v != fmt.Sprintf("worker %s idle 20d, hibernation blocked: recovery custody hold", idleName) {
 		t.Fatalf("idle worker evidence = %q (listed %v), all: %+v", v, ok, c.Evidence)
@@ -188,22 +231,66 @@ func TestAdminHealthHibernationAutoLiveDB(t *testing.T) {
 		t.Fatalf("parked worker evidence = %q (listed %v), want %q", v, ok, wantParked)
 	}
 
-	// Release the hold and hibernate the worker (state no longer none), and finish the paused
-	// run: neither worker is listed any more.
-	cliMustExec(t, pool, `DELETE FROM recovery_custody_holds WHERE id = $1`, hold)
-	cliMustExec(t, pool, `UPDATE workers SET hibernation_state = 'hibernated', hibernation_op_id = $2, hibernated_at = $3 WHERE id = $1`, idleID, uuid.New(), now)
-	cliMustExec(t, pool, `UPDATE runs SET status = 'cancelled', finished_at = $2, status_since = $2 WHERE id = $1`, pausedRun, now)
+	wantBoth := fmt.Sprintf("worker %s blocked: assigned run parked (%s, paused)", both, bothRun.String()[:8])
+	if v, ok := listed(c, both); !ok || v != wantBoth {
+		t.Fatalf("worker with a reason and a parked run = %q (listed %v), want %q", v, ok, wantBoth)
+	}
+	count := func(c check, name string) int {
+		n := 0
+		for _, e := range c.Evidence {
+			if e.Label == "Worker" && strings.HasPrefix(e.Value, "worker "+name+" ") {
+				n++
+			}
+		}
+		return n
+	}
+	if n := count(c, both); n != 1 {
+		t.Fatalf("worker with a reason and a parked run listed %d times, want 1", n)
+	}
+
+	// Workers the check must not list, seeded in state none after the pass above so nothing
+	// has acted on them.
+	// stale: idle past the threshold with a recorded reason last seen BEFORE its latest run
+	// finished (blocked_at < anchor), so the marker is stale.
+	staleName, youngName, mixedName := "hib-stale-"+suffix, "hib-young-"+suffix, "hib-mixed-"+suffix
+	staleID := newWorker(staleName, 40*24*time.Hour)
+	youngID := newWorker(youngName, 60*24*time.Hour)
+	mixedID := newWorker(mixedName, 60*24*time.Hour)
+	all = append(all, staleID, youngID, mixedID)
+	newRun(staleID, "completed", now.Add(-25*24*time.Hour), now.Add(-25*24*time.Hour))
+	cliMustExec(t, pool, `UPDATE workers SET hibernation_blocked_reason = 'manual_cordon', hibernation_blocked_at = $2, hibernation_blocked_since = $2 WHERE id = $1`, staleID, now.Add(-30*24*time.Hour))
+	// young: its only run has been paused for 3 days, under the 14-day threshold.
+	newRun(youngID, "paused", now.Add(-3*24*time.Hour), nil)
+	// mixed: one paused run for 30 days and one running run.
+	newRun(mixedID, "paused", now.Add(-30*24*time.Hour), nil)
+	mixedRunning := newRun(mixedID, "running", now.Add(-30*24*time.Hour), nil)
+
 	c = read()
-	if _, ok := listed(c, idleName); ok {
-		t.Fatalf("hibernated worker still listed: %+v", c.Evidence)
+	for _, name := range []string{staleName, youngName, mixedName} {
+		if _, ok := listed(c, name); ok {
+			t.Fatalf("%s must not be listed: %+v", name, c.Evidence)
+		}
 	}
-	if _, ok := listed(c, parkedName); ok {
-		t.Fatalf("worker with a finished run still listed as parked: %+v", c.Evidence)
+	if got, want := workersCount(c), baseline+3; got != want {
+		t.Fatalf("Workers = %d after seeding the unlisted workers, want %d", got, want)
 	}
-	if got := workersCount(c); got != baseline {
-		t.Fatalf("Workers = %d after release, want baseline %d", got, baseline)
+
+	// PRD example 3, end to end: release the custody hold, finish the parked runs, and run the
+	// REAL pass again. The held worker (reason custody_hold, so at the back of the queue but
+	// still eligible) is admitted and is no longer listed.
+	cliMustExec(t, pool, `DELETE FROM recovery_custody_holds WHERE id = $1`, hold)
+	cliMustExec(t, pool, `UPDATE runs SET status = 'cancelled', finished_at = $2, status_since = $2 WHERE id = ANY($1)`, []uuid.UUID{pausedRun, bothRun}, now)
+	// Keep the mixed run from affecting anything else.
+	cliMustExec(t, pool, `UPDATE runs SET status = 'cancelled', finished_at = $2, status_since = $2 WHERE id = $1`, mixedRunning, now)
+	pass()
+	var state string
+	if err := pool.QueryRow(ctx, `SELECT hibernation_state FROM workers WHERE id = $1`, idleID).Scan(&state); err != nil || state != "preparing" {
+		t.Fatalf("released worker state = %q, %v; want preparing", state, err)
 	}
-	if baseline == 0 && c.Severity != "ok" {
-		t.Fatalf("severity = %q after release, want ok", c.Severity)
+	c = read()
+	for _, name := range []string{idleName, parkedName, both} {
+		if _, ok := listed(c, name); ok {
+			t.Fatalf("%s still listed: %+v", name, c.Evidence)
+		}
 	}
 }
