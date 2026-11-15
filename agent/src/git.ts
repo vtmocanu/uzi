@@ -20789,7 +20789,7 @@ try {
           ...(extra.strictStderr ? { onStderr: (text: string) => { stderr += text; } } : {}),
         });
       } catch (err) {
-        if (err instanceof GitBoundaryAbortError || err instanceof CheckpointSoftDeadlineError || err instanceof TerminalSnapshotRefusal) throw err;
+        if (err instanceof GitBoundaryAbortError || err instanceof CheckpointSoftDeadlineError || err instanceof TerminalSnapshotRefusal || isUnsafeCleanup(err)) throw err;
         if (extra.overflow && isBoundOverflow(err)) return fail(extra.overflow);
         return fail("git_failed");
       }
@@ -20809,7 +20809,7 @@ try {
         if (result.stderr) return fail("helper_failed");
         return result.stdout;
       } catch (err) {
-        if (err instanceof TerminalSnapshotRefusal || err instanceof GitBoundaryAbortError || err instanceof CheckpointSoftDeadlineError) throw err;
+        if (err instanceof TerminalSnapshotRefusal || err instanceof GitBoundaryAbortError || err instanceof CheckpointSoftDeadlineError || isUnsafeCleanup(err)) throw err;
         return fail("helper_failed");
       }
     };
@@ -20891,275 +20891,372 @@ try {
     };
 
     let privateIndex: string | undefined;
-    try {
-      // Clone shape and configuration that would redirect or extend the staging.
-      const dotGit = await fs.lstat(path.join(clonePath, ".git")).catch(() => undefined);
-      if (!dotGit?.isDirectory()) return refused("clone_shape");
-      // A commondir file redirects every object and ref read to another store.
-      if (await fs.lstat(path.join(clonePath, ".git", "commondir")).then(() => true, () => false)) return refused("clone_shape");
-      // A per-worktree config file (core.worktree, sparse and index keys) is read by git but not by `config --local`.
-      if (await fs.lstat(path.join(clonePath, ".git", "config.worktree")).then(() => true, () => false)) return refused("config_refused");
-      if (!(await alternatesClean())) return refused("alternates_present");
-      // `.git/info/attributes` is read whatever --attr-source says, so any entry there (or any type of node) could
-      // select a filter driver: refuse it outright.
-      if (await fs.lstat(path.join(clonePath, ".git", "info", "attributes")).then(() => true, (err: NodeJS.ErrnoException) => err.code !== "ENOENT")) return refused("config_refused");
-      for (const row of rows(await git(["config", "--local", "--null", "--list"]), 100_000, "config_cap")) {
-        // A valueless boolean key (`key\0` with no newline) is the whole row, never "".
-        const nl = row.indexOf("\n");
-        const key = (nl < 0 ? row : row.slice(0, nl)).toLowerCase();
-        if (key === "core.worktree" || key === "extensions.worktreeconfig" || key.startsWith("include.") || key.startsWith("includeif.") ||
-            key.startsWith("filter.") || key === "core.sparsecheckout" || key === "core.splitindex" || key === "index.sparse" ||
-            (key === "core.bare" && row.slice(key.length + 1) !== "false")) return refused("config_refused");
-      }
-      if ((await git(["rev-parse", "--shared-index-path"])).trim() !== "") return refused("config_refused");
-      const before = await invariants();
-      const head = before.head;
-      const headTree = (await git(["rev-parse", "--verify", `${head}^{tree}`])).trim();
-
-      // An assume-unchanged or skip-worktree entry hides edits from status: refuse (same rule as worktreeCleanHardened).
-      for (const entry of (await git(["ls-files", "-v", "-z"], { overflow: "entry_cap", strictStderr: true })).split("\0")) {
-        if (entry.length > 0 && !/^[HMRCK?U] /.test(entry)) return refused("index_flags");
-      }
-
-      // 1. Enumeration before any staging.
-      const status = rows(await git(["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none", "--no-renames"],
-        { overflow: "entry_cap", strictStderr: true }), opts.caps?.maxEntries ?? WIP_CAPTURE_MAX_ENTRIES, "entry_cap");
-      type Entry = { kind: "file" | "exec" | "symlink" | "absent"; size: number; untracked: boolean };
-      const entries = new Map<string, Entry>();
-      let totalBytes = 0;
-      for (const row of status) {
-        const m = /^(.)(.) ([\s\S]+)$/.exec(row);
-        if (!m) return refused("unparseable");
-        const [, x, y, rel] = m as unknown as [string, string, string, string];
-        if (x === "U" || y === "U" || (x === "A" && y === "A") || (x === "D" && y === "D") || "RC!".includes(x) || "RC!".includes(y)) return refused("unsupported_status");
-        if (!wipPathValid(rel) || rel.endsWith("/") || entries.has(rel)) return refused("unsafe_path");
-        if (rel === ".uzi/scratch" || rel.startsWith(".uzi/scratch/")) return refused("scratch_not_ignored");
-        let st: Stats | undefined;
-        try { st = await fs.lstat(path.join(clonePath, rel)); }
-        catch (err) { if ((err as NodeJS.ErrnoException).code !== "ENOENT") return refused("unsized"); }
-        if (entries.size % 1024 === 0) left();
-        if (!st) {
-          if (x !== "D" && y !== "D") return refused("vanished");
-          entries.set(rel, { kind: "absent", size: 0, untracked: false });
-          continue;
-        }
-        if (x === "?" && y === "?" && st.isDirectory()) return refused("nested_repository");
-        let kind: Entry["kind"];
-        if (st.isSymbolicLink()) kind = "symlink";
-        else if (st.isFile()) kind = (st.mode & 0o100) !== 0 ? "exec" : "file";
-        else return refused("unsafe_type");
-        if (WIP_CORE_FILE_RE.test(path.posix.basename(rel))) return refused("core_file");
-        if (kind !== "symlink" && st.size > WIP_CAPTURE_MAX_FILE_BYTES) return refused("oversized");
-        if (terminalCredentialPath(rel, opts.workerTokenFile, clonePath)) return refused("credential_path");
-        totalBytes += st.size;
-        if (totalBytes > (opts.caps?.maxTotalBytes ?? CHECKPOINT_SCAN_MAX_TOTAL_BYTES)) return refused("total_bytes");
-        entries.set(rel, { kind, size: st.size, untracked: x === "?" && y === "?" });
-      }
-      if (entries.size > 0) {
-        const attrs = (await git(["check-attr", "-z", "--stdin", "filter"], { input: [...entries.keys()].join("\0") + "\0", strictStderr: true })).split("\0");
-        if (attrs[attrs.length - 1] === "") attrs.pop();
-        if (attrs.length !== entries.size * 3) return refused("attr_unreadable");
-        for (let i = 0; i < attrs.length; i += 3) {
-          if (!entries.has(attrs[i]!) || attrs[i + 1] !== "filter") return refused("attr_unreadable");
-          if (attrs[i + 2] !== "unspecified" && attrs[i + 2] !== "unset") return refused("filter_attribute");
-        }
-      }
-
-      // 2. Ignored extents: counted with their own caps, never captured.
-      const ignoredPaths = rows(await git(["ls-files", "--others", "--ignored", "--exclude-standard", "-z"], { overflow: "ignored_cap", strictStderr: true }),
-        TERMINAL_IGNORED_MAX_ENTRIES, "ignored_cap");
-      let ignoredBytes = 0;
-      for (let i = 0; i < ignoredPaths.length; i++) {
-        if (i % 1024 === 0) left();
-        const st = await fs.lstat(path.join(clonePath, ignoredPaths[i]!)).catch(() => undefined);
-        if (st?.isFile()) ignoredBytes += st.size;
-      }
-      const ignored = { files: ignoredPaths.length, bytes: ignoredBytes };
-
-      // 3. Clean: the agent-writable real index (stat cache and entry oids) is never trusted for this verdict, so a
-      // private index is rebuilt from HEAD and the work tree (no attribute, filter, or autocrlf/eol conversion
-      // applies: attributes are pinned to the empty tree, autocrlf/safecrlf/eol are pinned off, and filter config and
-      // info/attributes were refused above) and must reproduce HEAD's tree. No ref or real-index write.
-      if (entries.size === 0) {
-        privateIndex = path.join(runnerTmpdir() || os.tmpdir(), `uzi-term-idx-${randomUUID()}`);
-        const cleanEnv = { GIT_INDEX_FILE: privateIndex };
-        await git(["read-tree", head], { env: cleanEnv, strictStderr: true });
-        await git(["add", "-A"], { env: cleanEnv, strictStderr: true });
-        const rebuilt = (await git(["write-tree"], { env: cleanEnv })).trim();
-        if (rebuilt !== headTree) return refused("index_mismatch");
-        if (!sameInvariants(before, await invariants())) return refused("invariant_changed");
-        return { kind: "clean", root: head, tree: headTree, ignored };
-      }
-
-      // 4. Private-index staging.
-      await opts.seam?.beforeStaging?.();
-      left();
-      privateIndex = path.join(runnerTmpdir() || os.tmpdir(), `uzi-term-idx-${randomUUID()}`);
-      const indexEnv = { GIT_INDEX_FILE: privateIndex };
-      await git(["read-tree", head], { env: indexEnv, strictStderr: true });
-      await git(["add", "-A"], { env: indexEnv, strictStderr: true });
-
-      // 5. Staged validation against the enumeration, then the commit.
-      const rawStaged = await git(["diff", "--cached", "--raw", "-z", "--no-abbrev", "--no-renames", head], { env: indexEnv, strictStderr: true });
-      const staged = terminalParseRaw(rawStaged);
-      if (!staged || staged.length > WIP_CAPTURE_MAX_ENTRIES) return refused("staged_unparseable");
-      const stagedPaths = new Set<string>();
-      for (const row of staged) {
-        const info = entries.get(row.path);
-        if (!info || stagedPaths.has(row.path)) return refused("staged_set_mismatch");
-        stagedPaths.add(row.path);
-        if (row.status === "D") { if (row.mode !== "000000" || info.kind !== "absent") return refused("staged_set_mismatch"); continue; }
-        const expectedMode = info.kind === "file" ? "100644" : info.kind === "exec" ? "100755" : info.kind === "symlink" ? "120000" : "";
-        if (row.mode !== "100644" && row.mode !== "100755" && row.mode !== "120000") return refused("staged_mode");
-        if (row.mode !== expectedMode) return refused("staged_mode");
-      }
-      // Backstop: every enumerated entry (tracked, untracked or deleted) must stage to a change, so a conversion that
-      // makes a status-visible edit stage to HEAD's bytes fails closed instead of capturing HEAD's content.
-      for (const rel of entries.keys()) if (!stagedPaths.has(rel)) return refused("staged_set_mismatch");
-      const live = staged.filter((r) => r.status !== "D");
-      const sizes = await this.wipBlobSizes(clonePath, live.map((r) => r.oid)).catch(() => fail("staged_unsized"));
-      let stagedTotal = 0;
-      for (const row of live) {
-        const size = sizes.get(row.oid)!;
-        if (size > WIP_CAPTURE_MAX_FILE_BYTES) return refused("staged_oversized");
-        if (size !== entries.get(row.path)!.size) return refused("staged_size_changed");
-        stagedTotal += size;
-      }
-      if (stagedTotal > CHECKPOINT_SCAN_MAX_TOTAL_BYTES) return refused("staged_total_bytes");
-      if (staged.length === 0) return refused("staged_empty");
-      if (opts.reprove && !(await opts.reprove())) return refused("reprove_failed");
-
-      const tree = (await git(["write-tree"], { env: indexEnv })).trim();
-      if (!SHA40_RE.test(tree)) return refused("tree_unreadable");
-      if (tree === headTree) return refused("staged_empty");
-      const when = "2000-01-01T00:00:00Z";
-      const subject = `uzi terminal snapshot ${opts.runId} g${opts.generation}`;
-      const commit = (await git(["commit-tree", tree, "-p", head, "-m", subject], { env: {
-        GIT_AUTHOR_NAME: AGENT_GIT_IDENTITY.name, GIT_AUTHOR_EMAIL: AGENT_GIT_IDENTITY.email,
-        GIT_COMMITTER_NAME: AGENT_GIT_IDENTITY.name, GIT_COMMITTER_EMAIL: AGENT_GIT_IDENTITY.email,
-        GIT_AUTHOR_DATE: when, GIT_COMMITTER_DATE: when,
-      } })).trim();
-      if (!SHA40_RE.test(commit)) return refused("commit_unreadable");
-      const identity = `${AGENT_GIT_IDENTITY.name} <${AGENT_GIT_IDENTITY.email}> 946684800 +0000`;
-      if (await git(["cat-file", "-p", commit]) !== `tree ${tree}\nparent ${head}\nauthor ${identity}\ncommitter ${identity}\n\n${subject}\n`)
-        return refused("commit_mismatch");
-      // Backstop: the commit's own tree-diff against HEAD is exactly the validated staged diff.
-      if (await git(["diff-tree", "-r", "--raw", "-z", "--no-abbrev", "--no-renames", head, commit]) !== rawStaged)
-        return refused("backstop_mismatch");
-      if (opts.reprove && !(await opts.reprove())) return refused("reprove_failed");
-      if (!sameInvariants(before, await invariants())) return refused("invariant_changed");
-
-      // The parent must already be reachable in the bare from the fetched-back agent branch (no fetch yet).
-      const branchMatch = /^refs\/heads\/(.+)$/.exec(before.symbolic);
-      if (!branchMatch) return refused("parent_not_in_bare");
-      const runnerRef = `refs/uzi-runner/${branchMatch[1]}`;
+    // Cleanup state. One allowance (see TerminalSnapshotOptions.cleanupBound) serves the staging-ref delete and the
+    // private-index removal; it starts at the first cleanup step, so a capture that needs none never opens one.
+    let allowance: { deadline: number; signal: AbortSignal } | undefined;
+    const cleanupAllowance = (): { deadline: number; signal: AbortSignal } => {
+      if (allowance) return allowance;
+      const boundary = this.boundaryProcesses.getStore();
+      const bound = opts.cleanupBound;
+      const signals = [bound?.signal, boundary?.signal].filter((sig): sig is AbortSignal => sig !== undefined);
+      // A non-finite caller deadline fails closed (already lapsed). Neither opts.signal nor the capture's own
+      // deadline applies: both have usually lapsed by the time cleanup runs.
+      const deadline = Math.min(Date.now() + (opts.caps?.cleanupMs ?? TERMINAL_CAPTURE_CLEANUP_MS),
+        bound ? (Number.isFinite(bound.deadlineAt) ? bound.deadlineAt : 0) : Infinity, boundary?.softDeadlineAt ?? Infinity);
+      allowance = { deadline, signal: signals.length ? AbortSignal.any(signals) : new AbortController().signal };
+      return allowance;
+    };
+    const underCleanup = <T>(action: () => Promise<T>): Promise<T> => {
+      const a = cleanupAllowance();
+      return this.withReportProofBudget({ signal: a.signal, deadline: a.deadline }, action);
+    };
+    let stagingRemnant: TerminalSnapshotRemnant | undefined;
+    let stagingUnsafe: unknown;
+    let indexRemnant: string | undefined;
+    let indexUnsafe: unknown;
+    const attempt = async (): Promise<TerminalSnapshotResult> => {
       try {
-        await bareRead(["cat-file", "-e", `${head}^{commit}`]);
-        await bareRead(["merge-base", "--is-ancestor", head, runnerRef]);
-      } catch (err) {
-        if (err instanceof GitBoundaryAbortError || err instanceof CheckpointSoftDeadlineError || isCheckpointBoundaryFailure(err)) throw err;
-        if (err instanceof TerminalSnapshotRefusal) throw err;
-        return refused("parent_not_in_bare");
-      }
-      const newBlobs = new Set(live.map((r) => r.oid));
-      const maxTrees = wipDirectoryCount(staged.map((r) => r.path));
+        // Clone shape and configuration that would redirect or extend the staging.
+        const dotGit = await fs.lstat(path.join(clonePath, ".git")).catch(() => undefined);
+        if (!dotGit?.isDirectory()) return refused("clone_shape");
+        // A commondir file redirects every object and ref read to another store.
+        if (await fs.lstat(path.join(clonePath, ".git", "commondir")).then(() => true, () => false)) return refused("clone_shape");
+        // A per-worktree config file (core.worktree, sparse and index keys) is read by git but not by `config --local`.
+        if (await fs.lstat(path.join(clonePath, ".git", "config.worktree")).then(() => true, () => false)) return refused("config_refused");
+        if (!(await alternatesClean())) return refused("alternates_present");
+        // `.git/info/attributes` is read whatever --attr-source says, so any entry there (or any type of node) could
+        // select a filter driver: refuse it outright.
+        if (await fs.lstat(path.join(clonePath, ".git", "info", "attributes")).then(() => true, (err: NodeJS.ErrnoException) => err.code !== "ENOENT")) return refused("config_refused");
+        for (const row of rows(await git(["config", "--local", "--null", "--list"]), 100_000, "config_cap")) {
+          // A valueless boolean key (`key\0` with no newline) is the whole row, never "".
+          const nl = row.indexOf("\n");
+          const key = (nl < 0 ? row : row.slice(0, nl)).toLowerCase();
+          if (key === "core.worktree" || key === "extensions.worktreeconfig" || key.startsWith("include.") || key.startsWith("includeif.") ||
+              key.startsWith("filter.") || key === "core.sparsecheckout" || key === "core.splitindex" || key === "index.sparse" ||
+              (key === "core.bare" && row.slice(key.length + 1) !== "false")) return refused("config_refused");
+        }
+        if ((await git(["rev-parse", "--shared-index-path"])).trim() !== "") return refused("config_refused");
+        const before = await invariants();
+        const head = before.head;
+        const headTree = (await git(["rev-parse", "--verify", `${head}^{tree}`])).trim();
 
-      // 6. Record-first transfer. From the clone ref's creation on, a failure leaves refs as they are.
-      try { await opts.onPhase?.("capturing", { cloneRef, bareRef, commit }); }
-      catch { return refused("phase_callback_failed"); }
-      left();
-      try { await git(["update-ref", cloneRef, commit, ""]); }
-      catch (err) {
-        if (err instanceof GitBoundaryAbortError || err instanceof CheckpointSoftDeadlineError) throw err;
-        // A retry of the same capture finds its own deterministic commit already pinned.
-        const current = (await git(["for-each-ref", "--format=%(objectname)", cloneRef]).catch(() => "")).trim();
-        if (current !== commit) return refused("clone_ref_exists");
-      }
-      await opts.seam?.afterCloneRef?.();
-      // The lock wait and every bare child git call run under the capture's own budget: an abort or the deadline
-      // forfeits a queued wait without running, and clamps, kills and awaits a running child.
-      transferBudgeted = true;
-      await this.withReportProofBudget({ signal: opts.signal ?? new AbortController().signal, deadline: deadlineAt }, () => this.withLock(opts.barePath, async () => {
-        const present = (await this.runGit(opts.barePath, ["for-each-ref", "--format=%(objectname)", bareRef])).trim();
-        if (present !== "" && present !== commit) fail("bare_ref_conflict");
-        if (!(await alternatesClean())) fail("alternates_present");
+        // An assume-unchanged or skip-worktree entry hides edits from status: refuse (same rule as worktreeCleanHardened).
+        for (const entry of (await git(["ls-files", "-v", "-z"], { overflow: "entry_cap", strictStderr: true })).split("\0")) {
+          if (entry.length > 0 && !/^[HMRCK?U] /.test(entry)) return refused("index_flags");
+        }
+
+        // 1. Enumeration before any staging.
+        const status = rows(await git(["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none", "--no-renames"],
+          { overflow: "entry_cap", strictStderr: true }), opts.caps?.maxEntries ?? WIP_CAPTURE_MAX_ENTRIES, "entry_cap");
+        type Entry = { kind: "file" | "exec" | "symlink" | "absent"; size: number; untracked: boolean };
+        const entries = new Map<string, Entry>();
+        let totalBytes = 0;
+        for (const row of status) {
+          const m = /^(.)(.) ([\s\S]+)$/.exec(row);
+          if (!m) return refused("unparseable");
+          const [, x, y, rel] = m as unknown as [string, string, string, string];
+          if (x === "U" || y === "U" || (x === "A" && y === "A") || (x === "D" && y === "D") || "RC!".includes(x) || "RC!".includes(y)) return refused("unsupported_status");
+          if (!wipPathValid(rel) || rel.endsWith("/") || entries.has(rel)) return refused("unsafe_path");
+          if (rel === ".uzi/scratch" || rel.startsWith(".uzi/scratch/")) return refused("scratch_not_ignored");
+          let st: Stats | undefined;
+          try { st = await fs.lstat(path.join(clonePath, rel)); }
+          catch (err) { if ((err as NodeJS.ErrnoException).code !== "ENOENT") return refused("unsized"); }
+          if (entries.size % 1024 === 0) left();
+          if (!st) {
+            if (x !== "D" && y !== "D") return refused("vanished");
+            entries.set(rel, { kind: "absent", size: 0, untracked: false });
+            continue;
+          }
+          if (x === "?" && y === "?" && st.isDirectory()) return refused("nested_repository");
+          let kind: Entry["kind"];
+          if (st.isSymbolicLink()) kind = "symlink";
+          else if (st.isFile()) kind = (st.mode & 0o100) !== 0 ? "exec" : "file";
+          else return refused("unsafe_type");
+          if (WIP_CORE_FILE_RE.test(path.posix.basename(rel))) return refused("core_file");
+          if (kind !== "symlink" && st.size > WIP_CAPTURE_MAX_FILE_BYTES) return refused("oversized");
+          if (terminalCredentialPath(rel, opts.workerTokenFile, clonePath)) return refused("credential_path");
+          totalBytes += st.size;
+          if (totalBytes > (opts.caps?.maxTotalBytes ?? CHECKPOINT_SCAN_MAX_TOTAL_BYTES)) return refused("total_bytes");
+          entries.set(rel, { kind, size: st.size, untracked: x === "?" && y === "?" });
+        }
+        if (entries.size > 0) {
+          const attrs = (await git(["check-attr", "-z", "--stdin", "filter"], { input: [...entries.keys()].join("\0") + "\0", strictStderr: true })).split("\0");
+          if (attrs[attrs.length - 1] === "") attrs.pop();
+          if (attrs.length !== entries.size * 3) return refused("attr_unreadable");
+          for (let i = 0; i < attrs.length; i += 3) {
+            if (!entries.has(attrs[i]!) || attrs[i + 1] !== "filter") return refused("attr_unreadable");
+            // Under the pins (empty attribute tree, `.git/info/attributes` refused above, `filter.*` config refused) this is
+          // reachable only through a `.git/info/attributes` created after that earlier lstat (a TOCTOU window) or a future
+          // pin regression: kept as a fail-closed backstop, not as the primary control.
+          if (attrs[i + 2] !== "unspecified" && attrs[i + 2] !== "unset") return refused("filter_attribute");
+          }
+        }
+
+        // 2. Ignored extents: counted with their own caps, never captured.
+        const ignoredPaths = rows(await git(["ls-files", "--others", "--ignored", "--exclude-standard", "-z"], { overflow: "ignored_cap", strictStderr: true }),
+          TERMINAL_IGNORED_MAX_ENTRIES, "ignored_cap");
+        let ignoredBytes = 0;
+        for (let i = 0; i < ignoredPaths.length; i++) {
+          if (i % 1024 === 0) left();
+          const st = await fs.lstat(path.join(clonePath, ignoredPaths[i]!)).catch(() => undefined);
+          if (st?.isFile()) ignoredBytes += st.size;
+        }
+        const ignored = { files: ignoredPaths.length, bytes: ignoredBytes };
+
+        // 3. Index-independent preflight. The agent-writable real index (stat cache and entry oids) can hide an edit from
+        // the enumeration above, and `add -A` on it would write the hidden content into the object store before any
+        // check could refuse it. So a private index is built from HEAD (read-tree writes no object), `status` runs on it
+        // with the same pins (no attribute, filter, or autocrlf/eol conversion applies: attributes are pinned to the
+        // empty tree, autocrlf/safecrlf/eol are pinned off, and filter config and info/attributes were refused above),
+        // and its changed-path set must equal the real enumeration's before anything is staged. A clean verdict is an
+        // empty set on both, reached with no `add` and no `write-tree`. No ref or real-index write.
+        privateIndex = path.join(runnerTmpdir() || os.tmpdir(), `uzi-term-idx-${randomUUID()}`);
+        const indexEnv = { GIT_INDEX_FILE: privateIndex };
+        await git(["read-tree", head], { env: indexEnv, strictStderr: true });
+        const privateStatus = rows(await git(["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none", "--no-renames"],
+          { env: indexEnv, overflow: "entry_cap", strictStderr: true }), opts.caps?.maxEntries ?? WIP_CAPTURE_MAX_ENTRIES, "entry_cap");
+        const privatePaths = new Set<string>();
+        for (const row of privateStatus) {
+          const m = /^(.)(.) ([\s\S]+)$/.exec(row);
+          if (!m) return refused("unparseable");
+          privatePaths.add(m[3]!);
+        }
+        if (privatePaths.size !== entries.size || ![...privatePaths].every((rel) => entries.has(rel))) return refused("index_mismatch");
+        if (entries.size === 0) {
+          if (!sameInvariants(before, await invariants())) return refused("invariant_changed");
+          return { kind: "clean", root: head, tree: headTree, ignored };
+        }
+
+        // 4. Private-index staging (the preflight's index, still exactly HEAD's tree). Residual: a file can still change
+        // between its lstat above, the preflight status and this `add`; the staged validation and the tree-diff backstop
+        // below bound the set, modes and sizes, and the secret scan over the published range is the content control.
+        await opts.seam?.beforeStaging?.();
         left();
-        // Fetch into a unique staging ref (ours by uuid), validate it, and only then create the final ref by CAS,
-        // so a clone ref swapped after validation never lands an unvalidated commit in the final ref.
-        const stage = `refs/uzi-incoming/${randomUUID()}`;
+        await git(["add", "-A"], { env: indexEnv, strictStderr: true });
+
+        // 5. Staged validation against the enumeration, then the commit.
+        const rawStaged = await git(["diff", "--cached", "--raw", "-z", "--no-abbrev", "--no-renames", head], { env: indexEnv, strictStderr: true });
+        const staged = terminalParseRaw(rawStaged);
+        if (!staged || staged.length > WIP_CAPTURE_MAX_ENTRIES) return refused("staged_unparseable");
+        const stagedPaths = new Set<string>();
+        for (const row of staged) {
+          const info = entries.get(row.path);
+          if (!info || stagedPaths.has(row.path)) return refused("staged_set_mismatch");
+          stagedPaths.add(row.path);
+          if (row.status === "D") { if (row.mode !== "000000" || info.kind !== "absent") return refused("staged_set_mismatch"); continue; }
+          const expectedMode = info.kind === "file" ? "100644" : info.kind === "exec" ? "100755" : info.kind === "symlink" ? "120000" : "";
+          if (row.mode !== "100644" && row.mode !== "100755" && row.mode !== "120000") return refused("staged_mode");
+          if (row.mode !== expectedMode) return refused("staged_mode");
+        }
+        // Backstop: every enumerated entry (tracked, untracked or deleted) must stage to a change, so a conversion that
+        // makes a status-visible edit stage to HEAD's bytes fails closed instead of capturing HEAD's content.
+        for (const rel of entries.keys()) if (!stagedPaths.has(rel)) return refused("staged_set_mismatch");
+        const live = staged.filter((r) => r.status !== "D");
+        const sizes = await this.wipBlobSizes(clonePath, live.map((r) => r.oid), left()).catch((err: unknown) => {
+          if (isUnsafeCleanup(err)) throw err;
+          return fail("staged_unsized");
+        });
+        let stagedTotal = 0;
+        for (const row of live) {
+          const size = sizes.get(row.oid)!;
+          if (size > WIP_CAPTURE_MAX_FILE_BYTES) return refused("staged_oversized");
+          if (size !== entries.get(row.path)!.size) return refused("staged_size_changed");
+          stagedTotal += size;
+        }
+        if (stagedTotal > CHECKPOINT_SCAN_MAX_TOTAL_BYTES) return refused("staged_total_bytes");
+        if (staged.length === 0) return refused("staged_empty");
+        if (opts.reprove && !(await opts.reprove())) return refused("reprove_failed");
+
+        const tree = (await git(["write-tree"], { env: indexEnv })).trim();
+        if (!SHA40_RE.test(tree)) return refused("tree_unreadable");
+        if (tree === headTree) return refused("staged_empty");
+        const when = "2000-01-01T00:00:00Z";
+        const subject = `uzi terminal snapshot ${opts.runId} g${opts.generation}`;
+        const commit = (await git(["commit-tree", tree, "-p", head, "-m", subject], { env: {
+          GIT_AUTHOR_NAME: AGENT_GIT_IDENTITY.name, GIT_AUTHOR_EMAIL: AGENT_GIT_IDENTITY.email,
+          GIT_COMMITTER_NAME: AGENT_GIT_IDENTITY.name, GIT_COMMITTER_EMAIL: AGENT_GIT_IDENTITY.email,
+          GIT_AUTHOR_DATE: when, GIT_COMMITTER_DATE: when,
+        } })).trim();
+        if (!SHA40_RE.test(commit)) return refused("commit_unreadable");
+        const identity = `${AGENT_GIT_IDENTITY.name} <${AGENT_GIT_IDENTITY.email}> 946684800 +0000`;
+        if (await git(["cat-file", "-p", commit]) !== `tree ${tree}\nparent ${head}\nauthor ${identity}\ncommitter ${identity}\n\n${subject}\n`)
+          return refused("commit_mismatch");
+        // Backstop: the commit's own tree-diff against HEAD is exactly the validated staged diff.
+        if (await git(["diff-tree", "-r", "--raw", "-z", "--no-abbrev", "--no-renames", head, commit]) !== rawStaged)
+          return refused("backstop_mismatch");
+        if (opts.reprove && !(await opts.reprove())) return refused("reprove_failed");
+        if (!sameInvariants(before, await invariants())) return refused("invariant_changed");
+
+        // The parent must already be reachable in the bare from the fetched-back agent branch (no fetch yet).
+        const branchMatch = /^refs\/heads\/(.+)$/.exec(before.symbolic);
+        if (!branchMatch) return refused("parent_not_in_bare");
+        const runnerRef = `refs/uzi-runner/${branchMatch[1]}`;
         try {
-          await this.runGit(opts.barePath, [
-            "-c", "protocol.file.allow=user", "fetch", "--refmap=", "--no-tags", "--no-write-fetch-head",
-            `--negotiation-tip=${runnerRef}`, `file://${clonePath}`, `${cloneRef}:${stage}`,
-          ]);
-          const landed = (await this.runGit(opts.barePath, ["for-each-ref", "--format=%(objectname)", stage])).trim();
-          if (landed !== commit) fail("bare_transfer_mismatch");
-          if ((await this.runGit(opts.barePath, ["--no-replace-objects", "cat-file", "-t", commit])).trim() !== "commit") fail("bare_transfer_mismatch");
+          await bareRead(["cat-file", "-e", `${head}^{commit}`]);
+          await bareRead(["merge-base", "--is-ancestor", head, runnerRef]);
+        } catch (err) {
+          if (err instanceof GitBoundaryAbortError || err instanceof CheckpointSoftDeadlineError || isCheckpointBoundaryFailure(err)) throw err;
+          if (err instanceof TerminalSnapshotRefusal) throw err;
+          return refused("parent_not_in_bare");
+        }
+        const newBlobs = new Set(live.map((r) => r.oid));
+        const maxTrees = wipDirectoryCount(staged.map((r) => r.path));
+
+        // 6. Record-first transfer. From the clone ref's creation on, a failure leaves refs as they are.
+        try { await opts.onPhase?.("capturing", { cloneRef, bareRef, commit }); }
+        catch (err) { if (isUnsafeCleanup(err)) throw err; return refused("phase_callback_failed"); }
+        left();
+        try { await git(["update-ref", cloneRef, commit, ""]); }
+        catch (err) {
+          if (err instanceof GitBoundaryAbortError || err instanceof CheckpointSoftDeadlineError || isUnsafeCleanup(err)) throw err;
+          // A retry of the same capture finds its own deterministic commit already pinned.
+          const current = (await git(["for-each-ref", "--format=%(objectname)", cloneRef]).catch((readErr: unknown) => {
+            if (isUnsafeCleanup(readErr)) throw readErr;
+            return "";
+          })).trim();
+          if (current !== commit) return refused("clone_ref_exists");
+        }
+        await opts.seam?.afterCloneRef?.();
+        // The lock wait and every bare child git call run under the capture's own budget: an abort or the deadline
+        // forfeits a queued wait without running, and clamps, kills and awaits a running child.
+        transferBudgeted = true;
+        await this.withReportProofBudget({ signal: opts.signal ?? new AbortController().signal, deadline: deadlineAt }, () => {
+          const locked = this.withLock(opts.barePath, async () => {
+          const present = (await this.runGit(opts.barePath, ["for-each-ref", "--format=%(objectname)", bareRef])).trim();
+          if (present !== "" && present !== commit) fail("bare_ref_conflict");
           if (!(await alternatesClean())) fail("alternates_present");
-          // Everything the snapshot reaches beyond the fetched-back branch: the commit, trees (at most one
-          // per touched directory) and blobs of the validated staged diff; any other object refuses.
-          const cap = 1 + newBlobs.size + maxTrees;
-          let listed: string;
-          try {
-            listed = await bareRead(["rev-list", "--objects", "--no-object-names", commit, "--not", runnerRef], (cap + 1) * 41 + 4096);
-          } catch (err) {
-            if (err instanceof GitBoundaryAbortError || err instanceof CheckpointSoftDeadlineError || isCheckpointBoundaryFailure(err)) throw err;
-            return fail(isBoundOverflow(err) ? "foreign_object" : "object_verify_failed");
-          }
-          const oids = listed.split("\n").filter((l) => l !== "");
-          if (oids.length > cap || oids.some((o) => !SHA40_RE.test(o))) fail("foreign_object");
-          const kinds = (await bareRead(["cat-file", "--batch-check=%(objecttype) %(objectname)"], 1 << 20, oids.join("\n") + "\n"))
-            .split("\n").filter((l) => l !== "");
-          if (kinds.length !== oids.length) fail("foreign_object");
-          let commits = 0, trees = 0;
-          for (const line of kinds) {
-            const [type, oid] = line.split(" ") as [string, string];
-            if (type === "commit" && oid === commit) commits++;
-            else if (type === "tree") trees++;
-            else if (type !== "blob" || !newBlobs.has(oid)) fail("foreign_object");
-          }
-          if (commits !== 1 || trees > maxTrees) fail("foreign_object");
           left();
-          if (present !== commit) await this.runGit(opts.barePath, ["update-ref", bareRef, commit, ""]);
-          if ((await this.runGit(opts.barePath, ["for-each-ref", "--format=%(objectname)", bareRef])).trim() !== commit) fail("bare_transfer_mismatch");
-        } finally {
-          // Only the staging ref is dropped, never the final ref. Cleanup runs outside the capture's budget (still under
-          // the lock) so an expired budget does not leave our staging ref behind.
-          await this.reportProofs.exit(async () => {
-            const staged = (await this.runGit(opts.barePath, ["for-each-ref", "--format=%(objectname)", stage]).catch(() => "")).trim();
-            if (staged !== "") {
-              await this.runGit(opts.barePath, ["update-ref", "-d", stage, staged]).catch((cleanup: unknown) => {
-                this.log.warn("terminal snapshot staging ref cleanup failed", { error: gitErrorMessage(cleanup) });
-              });
+          // Fetch into a unique staging ref (ours by uuid), validate it, and only then create the final ref by CAS,
+          // so a clone ref swapped after validation never lands an unvalidated commit in the final ref.
+          const stage = `refs/uzi-incoming/${randomUUID()}`;
+          let transferFailure: { error: unknown } | undefined;
+          try {
+            await opts.seam?.beforeFetch?.();
+            left();
+            await this.runGit(opts.barePath, [
+              "-c", "protocol.file.allow=user", "fetch", "--refmap=", "--no-tags", "--no-write-fetch-head",
+              `--negotiation-tip=${runnerRef}`, `file://${clonePath}`, `${cloneRef}:${stage}`,
+            ]);
+            await opts.seam?.inTransfer?.();
+            const landed = (await this.runGit(opts.barePath, ["for-each-ref", "--format=%(objectname)", stage])).trim();
+            if (landed !== commit) fail("bare_transfer_mismatch");
+            if ((await this.runGit(opts.barePath, ["--no-replace-objects", "cat-file", "-t", commit])).trim() !== "commit") fail("bare_transfer_mismatch");
+            if (!(await alternatesClean())) fail("alternates_present");
+            // Everything the snapshot reaches beyond the fetched-back branch: the commit, trees (at most one
+            // per touched directory) and blobs of the validated staged diff; any other object refuses.
+            const cap = 1 + newBlobs.size + maxTrees;
+            let listed: string;
+            try {
+              listed = await bareRead(["rev-list", "--objects", "--no-object-names", commit, "--not", runnerRef], (cap + 1) * 41 + 4096);
+            } catch (err) {
+              if (err instanceof GitBoundaryAbortError || err instanceof CheckpointSoftDeadlineError || isCheckpointBoundaryFailure(err)) throw err;
+              return fail(isBoundOverflow(err) ? "foreign_object" : "object_verify_failed");
             }
+            const oids = listed.split("\n").filter((l) => l !== "");
+            if (oids.length > cap || oids.some((o) => !SHA40_RE.test(o))) fail("foreign_object");
+            const kinds = (await bareRead(["cat-file", "--batch-check=%(objecttype) %(objectname)"], 1 << 20, oids.join("\n") + "\n"))
+              .split("\n").filter((l) => l !== "");
+            if (kinds.length !== oids.length) fail("foreign_object");
+            let commits = 0, trees = 0;
+            for (const line of kinds) {
+              const [type, oid] = line.split(" ") as [string, string];
+              if (type === "commit" && oid === commit) commits++;
+              else if (type === "tree") trees++;
+              else if (type !== "blob" || !newBlobs.has(oid)) fail("foreign_object");
+            }
+            if (commits !== 1 || trees > maxTrees) fail("foreign_object");
+            left();
+            if (present !== commit) await this.runGit(opts.barePath, ["update-ref", bareRef, commit, ""]);
+            if ((await this.runGit(opts.barePath, ["for-each-ref", "--format=%(objectname)", bareRef])).trim() !== commit) fail("bare_transfer_mismatch");
+          } catch (transferError) {
+            transferFailure = { error: transferError };
+          }
+          // Only the staging ref is dropped, never the final ref. Cleanup runs outside the capture's budget (still under
+          // the lock) on its own bounded allowance, so an expired capture budget neither leaves our staging ref behind
+          // nor lets the cleanup run unbounded. A ref that is not confirmed gone is reported (stagingRemnant); nothing
+          // is retried after this call returns.
+          const unknown: TerminalSnapshotRemnant = { ref: stage, expectedOid: commit, state: "unknown" };
+          await this.reportProofs.exit(() => underCleanup(async () => {
+            const allowanceNow = cleanupAllowance();
+            const readStage = async (): Promise<string> => (await this.runGit(opts.barePath, ["for-each-ref", "--format=%(objectname)", stage])).trim();
+            // A failed or cancelled step leaves the ref unconfirmed; an unsafe-cleanup error also stops further launches.
+            const unconfirmed = (err: unknown): void => {
+              stagingRemnant = unknown;
+              if (isUnsafeCleanup(err)) stagingUnsafe ??= err;
+              else this.log.warn("terminal snapshot staging ref cleanup failed", { error: gitErrorMessage(err) });
+            };
+            let present: string;
+            try { present = await readStage(); } catch (err) { unconfirmed(err); return; }
+            if (present === "") return;
+            try { await opts.seam?.afterStagingRead?.(); } catch (err) { unconfirmed(err); return; }
+            // Confirmed present but the allowance is spent: no delete is launched, the ref is known to be retained.
+            if (allowanceNow.signal.aborted || Date.now() >= allowanceNow.deadline) {
+              stagingRemnant = { ref: stage, oid: present, state: "retained" };
+              return;
+            }
+            try { await this.runGit(opts.barePath, ["update-ref", "-d", stage, present]); }
+            catch (err) {
+              if (isUnsafeCleanup(err)) { unconfirmed(err); return; }
+              this.log.warn("terminal snapshot staging ref cleanup failed", { error: gitErrorMessage(err) });
+            }
+            // A delete was launched: only a confirming read showing the ref gone clears it.
+            try { if (await readStage() !== "") stagingRemnant = unknown; } catch (err) { unconfirmed(err); }
+          }));
+          if (stagingUnsafe !== undefined) throw stagingUnsafe;
+          // Unsafe cleanup outranks the transfer's own failure.
+          if (stagingUnsafe !== undefined) throw stagingUnsafe;
+          if (transferFailure) throw transferFailure.error;
           });
+          opts.seam?.lockQueued?.();
+          return locked;
+        });
+        await git(["update-ref", "-d", cloneRef, commit]);
+        if (!sameInvariants(before, await invariants())) return refused("invariant_changed");
+        try { await opts.onPhase?.("captured", { cloneRef, bareRef, commit }); }
+        catch (err) { if (isUnsafeCleanup(err)) throw err; return refused("phase_callback_failed"); }
+        return { kind: "captured", root: commit, parent: head, tree, ignored };
+      } catch (err) {
+        if (err instanceof TerminalSnapshotRefusal) return refused(err.reason);
+        // An unsafe cleanup is never a refusal, whatever the capture's own budget did.
+        if (isUnsafeCleanup(err)) throw err;
+        // A lapse of this capture's own budget alone is a refusal; the outer boundary's abort is rethrown below.
+        if (transferBudgeted && !this.boundaryProcesses.getStore()?.signal.aborted && (opts.signal?.aborted || Date.now() >= deadlineAt)) {
+          return refused(opts.signal?.aborted ? "aborted" : "deadline");
         }
-      }));
-      await git(["update-ref", "-d", cloneRef, commit]);
-      if (!sameInvariants(before, await invariants())) return refused("invariant_changed");
-      try { await opts.onPhase?.("captured", { cloneRef, bareRef, commit }); }
-      catch { return refused("phase_callback_failed"); }
-      return { kind: "captured", root: commit, parent: head, tree, ignored };
-    } catch (err) {
-      if (err instanceof TerminalSnapshotRefusal) return refused(err.reason);
-      // A lapse of this capture's own budget alone is a refusal; the outer boundary's abort is rethrown below.
-      if (transferBudgeted && !this.boundaryProcesses.getStore()?.signal.aborted && (opts.signal?.aborted || Date.now() >= deadlineAt)) {
-        return refused(opts.signal?.aborted ? "aborted" : "deadline");
+        if (err instanceof GitBoundaryAbortError || err instanceof CheckpointSoftDeadlineError || isCheckpointBoundaryFailure(err)) throw err;
+        this.log.warn("terminal snapshot failed (refused)", { cwd: clonePath, error: gitErrorMessage(err) });
+        return refused("error");
       }
-      if (err instanceof GitBoundaryAbortError || err instanceof CheckpointSoftDeadlineError || isCheckpointBoundaryFailure(err)) throw err;
-      this.log.warn("terminal snapshot failed (refused)", { cwd: clonePath, error: gitErrorMessage(err) });
-      return refused("error");
-    } finally {
-      if (privateIndex) {
-        // The private index (and any lock a killed git left) is runner-owned: remove it as the runner, past the deadline.
-        for (const leftover of [privateIndex, `${privateIndex}.lock`]) {
-          await runnerNode(`try{require("fs").rmSync(process.argv[1],{force:true})}catch{process.exitCode=1}`, leftover, 15_000)
-            .catch((cleanup: unknown) => {
-              this.log.warn("terminal snapshot private index cleanup failed", { error: gitErrorMessage(cleanup) });
-            });
+    };
+    let outcome: TerminalSnapshotResult | undefined;
+    let thrown: { error: unknown } | undefined;
+    try { outcome = await attempt(); } catch (error) { thrown = { error }; }
+    if (privateIndex) {
+      // The private index (and any lock a killed git left) is runner-owned: remove it as the runner, on the cleanup
+      // allowance shared with the staging-ref delete. A removal that did not run or is unconfirmed is reported.
+      const index = privateIndex;
+      await underCleanup(async () => {
+        for (const leftover of [index, `${index}.lock`]) {
+          try {
+            if (opts.seam?.indexCleanupError !== undefined) throw opts.seam.indexCleanupError;
+            const remaining = cleanupAllowance().deadline - Date.now();
+            if (remaining <= 0) throw new Error("cleanup allowance exhausted");
+            await runnerNode(`try{require("fs").rmSync(process.argv[1],{force:true})}catch{process.exitCode=1}`, leftover,
+              Math.max(1, Math.min(15_000, Math.floor(remaining))));
+          } catch (cleanup) {
+            indexRemnant = index;
+            if (isUnsafeCleanup(cleanup)) indexUnsafe ??= cleanup;
+            else this.log.warn("terminal snapshot private index cleanup failed", { error: gitErrorMessage(cleanup) });
+          }
         }
-      }
+      });
     }
+    // Unsafe cleanup outranks every other outcome, but only after every cleanup step above ran.
+    if (thrown && isUnsafeCleanup(thrown.error)) throw thrown.error;
+    if (indexUnsafe !== undefined) throw indexUnsafe;
+    if (thrown) throw thrown.error;
+    const remnant: TerminalSnapshotRemnant = { ...stagingRemnant, ...(indexRemnant === undefined ? {} : { index: indexRemnant }) };
+    return Object.keys(remnant).length === 0 ? outcome! : { ...outcome!, remnant };
   }
 
   /**
@@ -21189,7 +21286,10 @@ try {
     const ref = `refs/uzi-terminal-local/${input.runId}/g${input.generation}`;
     const body = (): Promise<{ tip: string } | { refused: string }> => this.withLock(barePath, async () => {
         const kind = async (sha: string): Promise<string> => {
-          const out = (await this.runGit(barePath, ["--no-replace-objects", "cat-file", "-t", sha]).catch(() => "")).trim();
+          const out = (await this.runGit(barePath, ["--no-replace-objects", "cat-file", "-t", sha]).catch((err: unknown) => {
+            if (isUnsafeCleanup(err)) throw err;
+            return "";
+          })).trim();
           // A budget abort or lapse that the catch swallowed must surface, not read as a missing root.
           if (out === "" && budget) this.checkReportProof();
           return out;
@@ -21223,6 +21323,8 @@ try {
     try {
       return budget ? await this.withReportProofBudget(budget, body) : await body();
     } catch (err) {
+      // An unsafe cleanup is never a refusal, whatever the budget did.
+      if (isUnsafeCleanup(err)) throw err;
       // The outer boundary's own abort is rethrown below; a lapse of this call's budget alone is a refusal.
       if (budget && !this.boundaryProcesses.getStore()?.signal.aborted && (budget.signal.aborted || Date.now() >= budget.deadline)) {
         return { refused: "deadline" };
@@ -21835,14 +21937,14 @@ try {
   }
 
   /** Sizes of `oids` (blobs) from ONE `cat-file --batch-check`; a missing or non-blob object throws. */
-  private async wipBlobSizes(clonePath: string, oids: string[]): Promise<Map<string, number>> {
+  private async wipBlobSizes(clonePath: string, oids: string[], timeoutMs?: number): Promise<Map<string, number>> {
     const uniq = [...new Set(oids)];
     const sizes = new Map<string, number>();
     if (uniq.length === 0) return sizes;
     const out = await this.runGitAsRunner(
       clonePath,
       ["cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)"],
-      { input: `${uniq.join("\n")}\n`, env: NO_REPLACE_ENV },
+      { input: `${uniq.join("\n")}\n`, env: NO_REPLACE_ENV, ...(timeoutMs === undefined ? {} : { timeoutMs }) },
     );
     const lines = out.split("\n");
     if (lines[lines.length - 1] === "") lines.pop();
@@ -28382,15 +28484,54 @@ export interface TerminalSnapshotOptions {
   onPhase?: (phase: "capturing" | "captured", info: { cloneRef: string; bareRef: string; commit?: string }) => Promise<void>;
   /** Post-runner-git re-proof supplied by the caller's flight context; false refuses. */
   reprove?: () => Promise<boolean>;
-  /** Test-only seams; production never passes them. */
-  seam?: { beforeStaging?: () => Promise<void>; afterCloneRef?: () => Promise<void> };
+  /**
+   * Bound the caller's own lane imposes on the post-capture cleanup (staging-ref delete, private-index removal):
+   * the cleanup allowance ends at the earlier of `deadlineAt` (absolute `Date.now()` ms), the cleanup cap
+   * ({@link TERMINAL_CAPTURE_CLEANUP_MS}) and the boundary scope's soft deadline, and is cancelled by `signal`.
+   * Cleanup is never bound to {@link TerminalSnapshotOptions.signal} or the capture's own deadline, which have
+   * usually lapsed by then.
+   */
+  cleanupBound?: { deadlineAt: number; signal?: AbortSignal };
+  /**
+   * Test-only seams; production never passes them. `lockQueued` runs synchronously right after the bare-lock
+   * wait is queued (not awaited); `beforeFetch` runs under the lock before the fetch; `inTransfer` after the
+   * fetch landed the staging ref; `afterStagingRead` after the cleanup's confirming read of the staging ref;
+   * `indexCleanupError` makes each private-index removal reject with that value.
+   */
+  seam?: {
+    beforeStaging?: () => Promise<void>; afterCloneRef?: () => Promise<void>;
+    lockQueued?: () => void; beforeFetch?: () => Promise<void>; inTransfer?: () => Promise<void>;
+    afterStagingRead?: () => Promise<void>; indexCleanupError?: unknown;
+  };
   /** Test-only lowered caps; production never passes them. */
-  caps?: { maxEntries?: number; maxTotalBytes?: number };
+  caps?: { maxEntries?: number; maxTotalBytes?: number; cleanupMs?: number };
+}
+/**
+ * What a capture could not prove it removed. Absent when the staging ref was confirmed absent or deleted and the
+ * private index was removed. `ref` names the bare's staging ref: `state: "retained"` (with `oid`) only when a
+ * confirming read inside the cleanup allowance showed it at the snapshot commit and no delete was launched;
+ * `state: "unknown"` (with the commit it may hold as `expectedOid`) for every other unconfirmed case (no read was
+ * possible, the read failed or was cancelled, or a launched delete was cancelled or failed unconfirmed).
+ * `index` is the private index path when its removal did not run or could not be confirmed. Nothing retries
+ * after the call returns.
+ */
+export interface TerminalSnapshotRemnant {
+  ref?: string;
+  oid?: string;
+  expectedOid?: string;
+  state?: "retained" | "unknown";
+  index?: string;
 }
 export type TerminalSnapshotResult =
-  | { kind: "clean"; root: string; tree: string; ignored: { files: number; bytes: number } }
-  | { kind: "captured"; root: string; parent: string; tree: string; ignored: { files: number; bytes: number } }
-  | { kind: "refused"; reason: string };
+  | { kind: "clean"; root: string; tree: string; ignored: { files: number; bytes: number }; remnant?: TerminalSnapshotRemnant }
+  | { kind: "captured"; root: string; parent: string; tree: string; ignored: { files: number; bytes: number }; remnant?: TerminalSnapshotRemnant }
+  | { kind: "refused"; reason: string; remnant?: TerminalSnapshotRemnant };
+
+/** Cap on the staging-ref and private-index cleanup that follows a capture (one shared allowance per call). */
+const TERMINAL_CAPTURE_CLEANUP_MS = 2000;
+/** An error the boundary marked as cancellation without verified disposal: never downgraded to a refusal. */
+const isUnsafeCleanup = (err: unknown): boolean =>
+  err instanceof CheckpointUnsafeCleanupError || (err as { checkpointBoundary?: unknown } | null)?.checkpointBoundary === "unsafe_cleanup";
 
 /** A refusal carrying a stable, path-free reason. Never thrown past the public methods below. */
 class TerminalSnapshotRefusal extends Error {
@@ -28437,6 +28578,9 @@ const TERMINAL_GIT_PINS: readonly string[] = [
   "-c", "core.symlinks=true",
   "-c", "commit.gpgsign=false", "-c", "core.commitGraph=false", "-c", "core.multiPackIndex=false",
   "-c", `core.hooksPath=${EMPTY_GIT_HOOKS_DIR}`,
+  // The global excludes file (core.excludesFile, else $XDG_CONFIG_HOME/git/ignore or $HOME/.config/git/ignore) would
+  // hide untracked work from the enumeration and the staging; no ignore source outside the repository applies.
+  "-c", "core.excludesFile=/dev/null",
 ];
 /** Env for every terminal-snapshot git: no replace refs, no grafts, no shallow file, no optional locks. */
 const TERMINAL_GIT_ENV: NodeJS.ProcessEnv = {

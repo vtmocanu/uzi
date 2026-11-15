@@ -351,6 +351,33 @@ private ref `refs/uzi-terminal-local/<run>/g<gen>` (in the clone while
 transient, in the bare once private), and a post-fetch reachable-object check
 runs. `buildTerminalAggregate` builds the aggregate over the captured roots.
 
+The clone's real index is agent-writable, so it never decides the verdict or
+stages anything. After the real-index enumeration and per-file checks, and
+before any `add`, a private index is built from HEAD (`read-tree` writes no
+object) and `status` runs on it with the same pins. Its changed-path set must
+equal the enumeration's, else the capture refuses `index_mismatch` (a forged
+stat cache or entry oid hiding an edit, even a credential or over-limit file,
+therefore refuses before its content is hashed into the object store). A clean
+tree is empty on both and returns with no `add` and no `write-tree`; a dirty
+tree stages into the same private index. A file can still change between its
+`lstat`, the preflight and the `add`; the staged-set, mode and size checks and
+the tree-diff backstop bound that, and the secret scan is the content control.
+The pins include `core.excludesFile=/dev/null`, so a global excludes file
+cannot hide untracked work.
+
+Cleanup is bounded. The staging-ref delete and the private-index removal share
+one allowance: the earlier of 2 s (`TERMINAL_CAPTURE_CLEANUP_MS`), the lane's
+`cleanupBound.deadlineAt` and the boundary's soft deadline, cancelled by
+`cleanupBound.signal` or the boundary signal. It is never bound to the
+capture's own signal or deadline, which have usually lapsed. Anything not
+confirmed removed is reported as `remnant` on the result: the staging ref as
+`retained` (confirmed present at the commit, no delete launched) or `unknown`
+(no read was possible, or a launched delete was cancelled or failed
+unconfirmed), and the private index path when its removal did not run or was
+unconfirmed. Nothing retries after the call returns. An error the boundary
+marks `unsafe_cleanup` propagates from every internal handler and both public
+catches instead of becoming a refusal, after the remaining cleanup steps ran.
+
 #### Pinned preparation
 
 `prepareFrozenHeldPinned` (see ADR-2545 amendment) prepares over a frozen

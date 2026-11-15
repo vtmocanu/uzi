@@ -9,6 +9,7 @@ import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { GitCache, type CheckpointRange, type TerminalSnapshotOptions } from "../src/git.js";
+import { CheckpointUnsafeCleanupError } from "../src/checkpoint-stop.js";
 import { nullLogger } from "./helpers.js";
 
 const cleanEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_")));
@@ -609,53 +610,74 @@ describe("captureTerminalSnapshot", () => {
     assert.match(f.refsOf(f.bare), /refs\/uzi-terminal-local\/run-1\/g2 [0-9a-f]{40}/);
   });
 
-  async function heldBareLock(f: Awaited<ReturnType<typeof fixture>>, holdMs: number) {
+  // Holds the bare's lock (a real buildTerminalAggregate parked in its afterLink seam) until `release` is called.
+  async function heldBareLock(f: Awaited<ReturnType<typeof fixture>>) {
     const empty = run(f.bare, "mktree");
     const env = ["-c", "user.name=a", "-c", "user.email=a@b.c"];
     const base = run(f.bare, "rev-parse", "HEAD");
     const root = run(f.bare, ...env, "commit-tree", empty, "-m", "holder root");
     let started!: () => void;
     const holdStarted = new Promise<void>((res) => { started = res; });
+    let release!: () => void;
+    const released = new Promise<void>((res) => { release = res; });
+    let isReleased = false;
     const holder = f.git.buildTerminalAggregate(f.bare, {
       base, extraRoots: [root], runId: "run-holder", generation: 1,
-      seam: { afterLink: async () => { started(); await new Promise<void>((res) => setTimeout(res, holdMs)); } },
+      seam: { afterLink: async () => { started(); await released; } },
     });
     await holdStarted;
-    return { holder };
+    // A later lock-serialized operation: once it settles, every earlier waiter on the bare lock has run or forfeited.
+    const laterOp = async () => {
+      const later = run(f.bare, ...env, "commit-tree", empty, "-m", "later root");
+      return f.git.buildTerminalAggregate(f.bare, { base, extraRoots: [later], runId: "run-later", generation: 1 });
+    };
+    return { holder, release: () => { isReleased = true; release(); }, isReleased: () => isReleased, laterOp };
   }
 
-  test("a capture whose deadline lapses while queued behind the bare lock is refused promptly and mutates nothing later", async (t) => {
+  test("a capture whose deadline lapses while queued behind the bare lock is refused while the lock is still held and mutates nothing later", async (t) => {
     const f = await fixture(t);
     await f.write("new.txt", "brand new\n");
-    const holdMs = 6000;
-    const { holder } = await heldBareLock(f, holdMs);
-    const started = Date.now();
-    const result = await f.capture({ deadlineMs: 2500 });
-    const elapsed = Date.now() - started;
+    const lock = await heldBareLock(f);
+    let queued = 0;
+    let heldWhenQueued = false;
+    // Time is frozen from here: the only way the deadline lapses is the tick issued from the lockQueued seam.
+    t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
+    let result;
+    try {
+      result = await f.capture({ deadlineMs: 5000, seam: { lockQueued: () => {
+        queued++;
+        heldWhenQueued = !lock.isReleased();
+        t.mock.timers.tick(5001);
+      } } });
+    } finally { t.mock.timers.reset(); }
+    assert.equal(queued, 1, "the capture reached the queued lock wait");
+    assert.ok(heldWhenQueued);
     assert.deepEqual(result, { kind: "refused", reason: "deadline" });
-    assert.ok(elapsed < holdMs - 1500, `refused while the lock was still held (elapsed ${elapsed}ms)`);
+    assert.equal(lock.isReleased(), false, "refused while the lock was still held");
     const cloneRefLine = f.refsOf(f.root).split("\n").find((l) => l.startsWith(f.ref));
     const commit = cloneRefLine?.split(" ")[1];
     assert.match(commit ?? "", /^[0-9a-f]{40}$/, "record-first: the clone ref stays");
-    assert.ok("tip" in await holder);
-    await new Promise<void>((res) => setTimeout(res, 300));
+    lock.release();
+    assert.ok("tip" in await lock.holder);
+    assert.ok("tip" in await lock.laterOp());
     assert.equal(run(f.bare, "for-each-ref", f.ref), "", "no final ref lands after the lock is released");
     assert.equal(run(f.bare, "for-each-ref", "refs/uzi-incoming/"), "", "no staging ref");
     assert.throws(() => run(f.bare, "cat-file", "-e", commit!), "the snapshot commit never reached the bare");
   });
 
-  test("a capture aborted by its signal while queued behind the bare lock is refused aborted and mutates nothing later", async (t) => {
+  test("a capture aborted by its signal while queued behind the bare lock is refused aborted while the lock is still held and mutates nothing later", async (t) => {
     const f = await fixture(t);
     await f.write("new.txt", "brand new\n");
-    const { holder } = await heldBareLock(f, 6000);
+    const lock = await heldBareLock(f);
     const ac = new AbortController();
-    setTimeout(() => ac.abort(), 2500);
-    const started = Date.now();
-    const result = await f.capture({ signal: ac.signal });
+    let queued = 0;
+    const result = await f.capture({ signal: ac.signal, seam: { lockQueued: () => { queued++; ac.abort(); } } });
+    assert.equal(queued, 1, "the capture reached the queued lock wait");
     assert.deepEqual(result, { kind: "refused", reason: "aborted" });
-    assert.ok(Date.now() - started < 4500);
-    assert.ok("tip" in await holder);
-    await new Promise<void>((res) => setTimeout(res, 300));
+    assert.equal(lock.isReleased(), false, "refused while the lock was still held");
+    lock.release();
+    assert.ok("tip" in await lock.holder);
+    assert.ok("tip" in await lock.laterOp());
     assert.equal(run(f.bare, "for-each-ref", f.ref), "");
     assert.equal(run(f.bare, "for-each-ref", "refs/uzi-incoming/"), "");
   });
@@ -931,5 +953,336 @@ describe("terminal digests and per-commit CI paths", () => {
     const transport = await f.git.terminalTransportDigest(pack, { deadlineMs: 30_000 });
     const scan = await f.git.terminalScanDigest(bare, range, { deadlineMs: 30_000 });
     assert.equal(scan, transport);
+  });
+});
+
+describe("captureTerminalSnapshot: index-independent verdict, bounded cleanup, unsafe propagation", () => {
+  type Fx = Awaited<ReturnType<typeof fixture>>;
+  const looseObjects = async (dir: string): Promise<string[]> => {
+    const out: string[] = [];
+    const objects = path.join(dir, ".git", "objects");
+    for (const d of await fs.readdir(objects)) {
+      if (!/^[0-9a-f]{2}$/.test(d)) continue;
+      for (const n of await fs.readdir(path.join(objects, d))) out.push(d + n);
+    }
+    return out.sort();
+  };
+  const absent = (cwd: string, oid: string) => assert.throws(() => run(cwd, "cat-file", "-e", oid), `${oid} must not exist in ${cwd}`);
+
+  /** Commits `rel` (and publishes the commit to the bare's runner ref, the production shape). */
+  async function track(f: Fx, rel: string, content: Buffer | string) {
+    await f.write(rel, content);
+    f.g("add", rel); f.g("commit", "-q", "-m", `tracks ${rel}`);
+    const head = f.g("rev-parse", "HEAD");
+    run(f.bare, "fetch", "-q", f.root, `+${head}:refs/uzi-runner/main`);
+  }
+
+  /**
+   * Edits tracked `rel` (same byte length as HEAD's) and forges the real index so `git status` reads clean, WITHOUT leaving
+   * the edited blob in the clone's object store: `update-index` records the stat data (and writes the blob), then the entry's
+   * oid is patched back to HEAD's and the seeded loose object is removed. Returns the edited content's blob oid.
+   */
+  async function forgeHidden(f: Fx, rel: string, edited: Buffer | string): Promise<string> {
+    await f.write(rel, edited);
+    const past = new Date(Date.now() - 60_000);
+    await fs.utimes(path.join(f.root, rel), past, past);
+    f.g("update-index", rel);
+    const oid = f.g("hash-object", rel);
+    await fs.rm(path.join(f.root, ".git", "objects", oid.slice(0, 2), oid.slice(2)));
+    const idx = await f.indexBytes();
+    const needle = Buffer.concat([Buffer.from(rel), Buffer.from([0])]);
+    const pathPos = idx.indexOf(needle);
+    assert.ok(pathPos > 22, "entry located");
+    Buffer.from(f.g("rev-parse", `HEAD:${rel}`), "hex").copy(idx, pathPos - 2 - 20);
+    const body = idx.subarray(0, idx.length - 20);
+    await fs.writeFile(path.join(f.root, ".git", "index"), Buffer.concat([body, createHash("sha1").update(body).digest()]));
+    assert.equal(f.g("status", "--porcelain"), "", "the forgery hides the edit from status");
+    absent(f.root, oid);
+    return oid;
+  }
+
+  test("a forged index hiding an edited tracked auth.json refuses without writing the hidden content", async (t) => {
+    const f = await fixture(t);
+    await track(f, "auth.json", "{\"t\":\"AAAAAAAA\"}\n");
+    const oid = await forgeHidden(f, "auth.json", "{\"t\":\"BBBBBBBB\"}\n");
+    const before = await f.state();
+    const result = await f.capture({ seam: { beforeStaging: async () => { f.calls.push("staging"); } } });
+    assert.deepEqual(result, { kind: "refused", reason: "index_mismatch" });
+    assert.deepEqual(f.calls, []);
+    absent(f.root, oid);
+    absent(f.bare, oid);
+    assert.deepEqual(await f.state(), before);
+    assert.deepEqual(await f.stray(), []);
+    assert.equal(f.refsOf(f.root).includes("uzi-terminal-local"), false);
+  });
+
+  test("a forged index hiding an over-limit edit of a tracked file refuses without writing the oversized content", async (t) => {
+    const f = await fixture(t);
+    await track(f, "big.bin", Buffer.alloc(8 * MIB + 1, 0x61));
+    const oid = await forgeHidden(f, "big.bin", Buffer.alloc(8 * MIB + 1, 0x62));
+    const result = await f.capture();
+    assert.deepEqual(result, { kind: "refused", reason: "index_mismatch" });
+    absent(f.root, oid);
+    absent(f.bare, oid);
+    assert.deepEqual(await f.stray(), []);
+  });
+
+  test("a forged index plus a visible new file still refuses and writes nothing hidden", async (t) => {
+    const f = await fixture(t);
+    await track(f, "auth.json", "{\"t\":\"AAAAAAAA\"}\n");
+    const oid = await forgeHidden(f, "auth.json", "{\"t\":\"BBBBBBBB\"}\n");
+    await f.write("new.txt", "visible\n");
+    assert.deepEqual(await f.capture(), { kind: "refused", reason: "index_mismatch" });
+    absent(f.root, oid);
+  });
+
+  test("positive control: a clean repo is clean and writes no object", async (t) => {
+    const f = await fixture(t);
+    await f.write("ignored.log", "abc");
+    const objects = await looseObjects(f.root);
+    const result = await f.capture();
+    assert.equal(result.kind, "clean");
+    assert.equal("remnant" in result, false);
+    assert.deepEqual(await looseObjects(f.root), objects);
+    assert.deepEqual(await f.stray(), []);
+  });
+
+  const dirty: Array<[string, (f: Fx) => Promise<void>, string]> = [
+    ["an edited tracked file", (f) => f.write("tracked.txt", "edited\n"), "tracked.txt"],
+    ["a deleted tracked file", (f) => fs.rm(path.join(f.root, "gone.txt")), "gone.txt"],
+    ["a new untracked file", (f) => f.write("brand/new.txt", "new\n"), "brand/new.txt"],
+  ];
+  for (const [name, mutate, changed] of dirty) {
+    test(`positive control: ${name} is still captured`, async (t) => {
+      const f = await fixture(t);
+      await mutate(f);
+      const result = await f.capture();
+      assert.equal(result.kind, "captured", JSON.stringify(result));
+      if (result.kind !== "captured") return;
+      assert.equal("remnant" in result, false);
+      assert.equal(run(f.bare, "diff-tree", "-r", "--name-only", result.parent, result.root), changed);
+      assert.deepEqual(await f.stray(), []);
+    });
+  }
+
+  // ---- bounded cleanup ----
+  const stagingRefs = (f: Fx) => run(f.bare, "for-each-ref", "--format=%(refname) %(objectname)", "refs/uzi-incoming/");
+  const cloneCommit = (f: Fx) => f.refsOf(f.root).split("\n").find((l) => l.startsWith(f.ref))!.split(" ")[1]!;
+  /** Every live process whose argv names `update-ref` and this bare repository. */
+  async function updateRefChildren(bare: string): Promise<number[]> {
+    const pids: number[] = [];
+    for (const name of await fs.readdir("/proc")) {
+      if (!/^\d+$/.test(name)) continue;
+      const argv = (await fs.readFile(`/proc/${name}/cmdline`, "utf8").catch(() => "")).split("\0");
+      if (argv.includes("update-ref") && argv.some((a) => a.includes(bare))) pids.push(Number(name));
+    }
+    return pids;
+  }
+  const stageRefRe = /^refs\/uzi-incoming\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+  test("a stalled staging-ref delete (real child) is cancelled at the cleanup allowance: bounded, no leftover child, remnant unknown, ref unchanged later", async (t) => {
+    if (process.platform !== "linux") { t.skip("inspects the process table"); return; }
+    const f = await fixture(t);
+    await f.write("new.txt", "brand new\n");
+    // Deleting a loose ref takes packed-refs.lock; wait for it indefinitely so the delete is a genuine stalled child.
+    await fs.appendFile(path.join(f.bare, "config"), "[core]\n\tpackedRefsTimeout = -1\n");
+    const lockFile = path.join(f.bare, "packed-refs.lock");
+    const ac = new AbortController();
+    let abortedAt = 0;
+    let sawChild = false;
+    const sampler = setInterval(() => { void updateRefChildren(f.bare).then((p) => { if (p.length > 0) sawChild = true; }); }, 25);
+    let result;
+    try {
+      result = await f.capture({ signal: ac.signal, caps: { cleanupMs: 700 }, seam: { inTransfer: async () => {
+        await fs.writeFile(lockFile, "");
+        abortedAt = Date.now();
+        ac.abort();
+      } } });
+    } finally { clearInterval(sampler); }
+    const returnedAt = Date.now();
+    assert.ok(abortedAt > 0, "the transfer seam ran");
+    assert.ok(returnedAt - abortedAt < 700 + 2500, `returned within the allowance plus slack (${returnedAt - abortedAt}ms)`);
+    assert.ok(sawChild, "the delete really ran as a child that stalled on the lock");
+    assert.deepEqual(await updateRefChildren(f.bare), [], "no leftover update-ref child");
+    assert.equal(result.kind, "refused", JSON.stringify(result));
+    if (result.kind !== "refused") return;
+    assert.equal(result.reason, "aborted");
+    const staged = stagingRefs(f);
+    assert.match(staged, /^refs\/uzi-incoming\/\S+ [0-9a-f]{40}$/, "the staging ref is still there");
+    const [stageName, stageOid] = staged.split(" ") as [string, string];
+    assert.equal(stageOid, cloneCommit(f));
+    const index = result.remnant?.index;
+    assert.match(index ?? "", /uzi-term-idx-/, "the shared allowance was spent, so the private index removal did not run and is reported");
+    assert.deepEqual(result.remnant, { ref: stageName, expectedOid: stageOid, state: "unknown", index });
+    assert.match(stageName, stageRefRe);
+    // Release the lock and let every lock-serialized operation drain: nothing may touch the ref afterwards.
+    await fs.rm(lockFile);
+    const root = run(f.bare, "-c", "user.name=a", "-c", "user.email=a@b.c", "commit-tree", run(f.bare, "mktree"), "-m", "later");
+    assert.ok("tip" in await f.git.buildTerminalAggregate(f.bare, { base: run(f.bare, "rev-parse", "HEAD"), extraRoots: [root], runId: "run-later", generation: 1 }));
+    assert.equal(stagingRefs(f), staged, "ref state is exactly what was observed at return");
+    assert.deepEqual(await updateRefChildren(f.bare), []);
+    await fs.rm(index!, { force: true });
+  });
+
+  test("retained: allowance exhausted after the confirming read reports the staging ref at the commit and launches no delete", async (t) => {
+    const f = await fixture(t);
+    await f.write("new.txt", "brand new\n");
+    const result = await f.capture({ caps: { cleanupMs: 400 }, seam: { afterStagingRead: () => new Promise<void>((res) => setTimeout(res, 700)) } });
+    assert.equal(result.kind, "captured", JSON.stringify(result));
+    if (result.kind !== "captured") return;
+    const [stageName, stageOid] = stagingRefs(f).split(" ") as [string, string];
+    assert.equal(stageOid, result.root);
+    const index = result.remnant?.index;
+    assert.match(index ?? "", /uzi-term-idx-/, "the spent allowance also skipped the private index removal");
+    assert.deepEqual(result.remnant, { ref: stageName, oid: result.root, state: "retained", index });
+    assert.match(stageName, stageRefRe);
+    await fs.rm(index!, { force: true });
+  });
+
+  test("unknown: allowance exhausted before the confirming read could run", async (t) => {
+    const f = await fixture(t);
+    await f.write("new.txt", "brand new\n");
+    const ac = new AbortController();
+    const result = await f.capture({ signal: ac.signal, cleanupBound: { deadlineAt: Date.now() - 1 }, seam: { inTransfer: async () => { ac.abort(); } } });
+    assert.equal(result.kind, "refused", JSON.stringify(result));
+    if (result.kind !== "refused") return;
+    const [stageName, stageOid] = stagingRefs(f).split(" ") as [string, string];
+    assert.deepEqual(result.remnant, { ref: stageName, expectedOid: stageOid, state: "unknown", index: result.remnant?.index });
+    assert.match(result.remnant?.index ?? "", /uzi-term-idx-/);
+    await fs.rm(result.remnant!.index!, { force: true });
+  });
+
+  test("a fetch interrupted before it ran leaves no staging ref and no remnant", async (t) => {
+    const f = await fixture(t);
+    await f.write("new.txt", "brand new\n");
+    const ac = new AbortController();
+    const result = await f.capture({ signal: ac.signal, seam: { beforeFetch: async () => { ac.abort(); } } });
+    assert.deepEqual(result, { kind: "refused", reason: "aborted" });
+    assert.equal(stagingRefs(f), "");
+    assert.deepEqual(await f.stray(), []);
+  });
+
+  test("cleanup is not bound to the capture's own signal: an aborted capture still deletes its staging ref", async (t) => {
+    const f = await fixture(t);
+    await f.write("new.txt", "brand new\n");
+    const ac = new AbortController();
+    const result = await f.capture({ signal: ac.signal, seam: { inTransfer: async () => { ac.abort(); } } });
+    assert.deepEqual(result, { kind: "refused", reason: "aborted" });
+    assert.equal(stagingRefs(f), "");
+    assert.deepEqual(await f.stray(), []);
+  });
+
+  // ---- unsafe-cleanup propagation ----
+  const unsafe = () => new CheckpointUnsafeCleanupError("cancelled without verified disposal");
+  const isUnsafe = (e: unknown) => e instanceof CheckpointUnsafeCleanupError;
+  type Spy = { runGitAsRunner: (cwd: string | undefined, args: string[], opts?: { timeoutMs?: number }) => Promise<string>;
+    runGit: (cwd: string, args: string[], ...rest: unknown[]) => Promise<string> };
+  const spies = (f: Fx) => f.git as unknown as Spy;
+
+  test("an unsafe cleanup from the private-index removal propagates from the public method", async (t) => {
+    const f = await fixture(t);
+    await f.write("new.txt", "brand new\n");
+    await assert.rejects(f.capture({ seam: { indexCleanupError: unsafe() } }), isUnsafe);
+  });
+
+  test("an unsafe cleanup from the enumeration status call is not downgraded to git_failed", async (t) => {
+    const f = await fixture(t);
+    await f.write("new.txt", "brand new\n");
+    const original = spies(f).runGitAsRunner.bind(f.git);
+    t.mock.method(spies(f), "runGitAsRunner", async (cwd: string | undefined, args: string[], opts?: { timeoutMs?: number }) => {
+      if (args.includes("status")) throw unsafe();
+      return original(cwd, args, opts);
+    });
+    await assert.rejects(f.capture(), isUnsafe);
+    assert.deepEqual(await f.stray(), []);
+  });
+
+  test("an unsafe cleanup from the staged blob-size read is not downgraded to staged_unsized", async (t) => {
+    const f = await fixture(t);
+    await f.write("new.txt", "brand new\n");
+    const original = spies(f).runGitAsRunner.bind(f.git);
+    t.mock.method(spies(f), "runGitAsRunner", async (cwd: string | undefined, args: string[], opts?: { timeoutMs?: number }) => {
+      if (args.some((a) => a.startsWith("--batch-check"))) throw unsafe();
+      return original(cwd, args, opts);
+    });
+    await assert.rejects(f.capture(), isUnsafe);
+    assert.deepEqual(await f.stray(), []);
+  });
+
+  test("an unsafe cleanup from a bare child propagates even after the capture's signal aborted", async (t) => {
+    const f = await fixture(t);
+    await f.write("new.txt", "brand new\n");
+    const ac = new AbortController();
+    const original = spies(f).runGit.bind(f.git);
+    t.mock.method(spies(f), "runGit", async (cwd: string, args: string[], ...rest: unknown[]) => {
+      if (args.includes("fetch")) { ac.abort(); throw unsafe(); }
+      return original(cwd, args, ...rest);
+    });
+    await assert.rejects(f.capture({ signal: ac.signal }), isUnsafe);
+    assert.deepEqual(await f.stray(), []);
+    assert.equal(stagingRefs(f), "");
+  });
+
+  test("an unsafe cleanup from the staging-ref delete propagates and the private index is still removed", async (t) => {
+    const f = await fixture(t);
+    await f.write("new.txt", "brand new\n");
+    const original = spies(f).runGit.bind(f.git);
+    t.mock.method(spies(f), "runGit", async (cwd: string, args: string[], ...rest: unknown[]) => {
+      if (args[0] === "update-ref" && args[1] === "-d") throw unsafe();
+      return original(cwd, args, ...rest);
+    });
+    await assert.rejects(f.capture(), isUnsafe);
+    assert.deepEqual(await f.stray(), [], "the remaining cleanup step still ran");
+  });
+
+  test("the staged blob-size read is bounded by the remaining budget", async (t) => {
+    const f = await fixture(t);
+    await f.write("new.txt", "brand new\n");
+    const original = spies(f).runGitAsRunner.bind(f.git);
+    const seen: Array<number | undefined> = [];
+    t.mock.method(spies(f), "runGitAsRunner", async (cwd: string | undefined, args: string[], opts?: { timeoutMs?: number }) => {
+      if (args.some((a) => a.startsWith("--batch-check"))) seen.push(opts?.timeoutMs);
+      return original(cwd, args, opts);
+    });
+    const result = await f.capture({ deadlineMs: 45_000 });
+    assert.equal(result.kind, "captured", JSON.stringify(result));
+    assert.equal(seen.length, 1);
+    assert.ok(typeof seen[0] === "number" && Number.isFinite(seen[0]) && seen[0] > 0 && seen[0] <= 45_000, `timeoutMs ${seen[0]}`);
+  });
+
+  // ---- global excludes ----
+  async function withHome(t: test.TestContext, setup: (home: string) => Promise<void>) {
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), "term-home-"));
+    const previous = process.env.HOME;
+    process.env.HOME = home;
+    t.after(async () => {
+      if (previous === undefined) delete process.env.HOME; else process.env.HOME = previous;
+      await fs.rm(home, { recursive: true, force: true });
+    });
+    await setup(home);
+  }
+
+  test("a hostile global excludes file never hides new work: still captured", async (t) => {
+    const f = await fixture(t);
+    await withHome(t, async (home) => {
+      await fs.mkdir(path.join(home, ".config", "git"), { recursive: true });
+      await fs.writeFile(path.join(home, ".config", "git", "ignore"), "*\n");
+    });
+    await f.write("new.txt", "brand new\n");
+    const result = await f.capture();
+    assert.equal(result.kind, "captured", JSON.stringify(result));
+    if (result.kind === "captured") assert.equal(run(f.bare, "show", `${result.root}:new.txt`), "brand new");
+  });
+
+  test("an unreadable global excludes path never changes the verdict", async (t) => {
+    const f = await fixture(t);
+    await withHome(t, async (home) => {
+      // A directory where the file belongs: git cannot read it as an excludes file.
+      await fs.mkdir(path.join(home, ".config", "git", "ignore"), { recursive: true });
+    });
+    await f.write("new.txt", "brand new\n");
+    const result = await f.capture();
+    assert.equal(result.kind, "captured", JSON.stringify(result));
+    if (result.kind === "captured") assert.equal(run(f.bare, "show", `${result.root}:new.txt`), "brand new");
   });
 });

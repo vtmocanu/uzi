@@ -3482,7 +3482,14 @@ without an egress profile); other kinds are kept unchanged.
   ref in the run's bare repository, and sometimes a short-lived
   `refs/uzi-incoming/<id>` staging ref. If a worker restarts mid-capture, the
   record is marked incomplete and its refs are kept. Nothing removes them yet;
-  that is a later slice.
+  that is a later slice. A capture never deletes the staging ref past a short
+  fixed cleanup bound (2 seconds, or the caller's earlier bound); a staging ref
+  or private index file it could not confirm removed is reported on the
+  capture's result as a remnant and is not retried.
+- **The clean verdict does not trust the clone's own index.** The capture
+  rebuilds a private index from HEAD and compares it with the work tree; an
+  edit hidden by a forged real index is refused (`index_mismatch`) before any
+  content is written to the object store, and a clean tree writes nothing.
 - **The work is kept, not published, when proof is missing.** A run whose
   local sources cannot be fully accounted for (for example an extra attempt
   clone, a stash, or an unreachable local ref) is kept as it is.
