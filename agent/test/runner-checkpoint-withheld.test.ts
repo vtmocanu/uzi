@@ -21,6 +21,7 @@ type Flight = Record<string, unknown> & {
   runLog: Logger; runId: string;
   secretRemediation?: { attempts: number; flaggedCommits?: string[] };
   checkpointWithheld?: { episode: number; since: string; phase: "withheld" | "clear_pending" };
+  trustedFindingEvidence?: { runId: string; barePath: string; branch: string };
   reportState: (body: { status: string }, signal?: AbortSignal) => Promise<unknown>;
 };
 type Subject = {
@@ -30,6 +31,10 @@ type Subject = {
   checkpointRemediationHold: (...a: unknown[]) => Promise<boolean>;
   ciConfigGuardBlocksPublication: (...a: unknown[]) => Promise<boolean>;
   runSecretRemediationGate: (f: Flight, ...rest: unknown[]) => Promise<unknown>;
+  noteTrustedFinding: (f: Flight, barePath: string | undefined, branch: string | undefined) => void;
+  noteCheckpointWithheld: (f: Flight, gated: boolean) => void;
+  bootstrapRemediationRestrictions: (f: Flight, barePath?: string, branch?: string) => Promise<{ kind: string; enrolled?: boolean }>;
+  restoreRemediationRestrictions: (f: Flight) => Promise<unknown>;
 };
 
 const PATH_MARK = "src/zz-distinct-path-7f3a.txt";
@@ -79,17 +84,25 @@ async function until(cond: () => boolean, what: string): Promise<void> {
 }
 const settle = () => new Promise(r => setTimeout(r, 60));
 
-async function withFlight(body: (ctx: RunContext, f: Flight, r: Subject, runner: RunRunner) => Promise<void>): Promise<void> {
+async function withFlight(
+  body: (ctx: RunContext, f: Flight, r: Subject, runner: RunRunner) => Promise<void>,
+  opts: { bypassBody?: true } = {},
+): Promise<void> {
   let flight: Flight | undefined;
   let failure: unknown;
+  let entered = false;
+  let completed = false;
   const { gitlab } = fakeGitlab();
   const runner = runnerWith(() => ({
     homeDir,
     executor: { run: async (ctx: RunContext) => {
+      if (opts.bypassBody) return { branch: ctx.branch }; // Test seam: the helper must notice the body never ran.
       try {
+        entered = true;
         await ctx.secretRemediationGate!();
         assert.ok(flight);
         await body(ctx, flight, subject, runner);
+        completed = true;
       } catch (e) { failure = e; throw e; }
       return { branch: ctx.branch };
     } },
@@ -99,7 +112,13 @@ async function withFlight(body: (ctx: RunContext, f: Flight, r: Subject, runner:
   subject.runSecretRemediationGate = async (f, ...rest) => { flight = f; return gate(f, ...rest); };
   await runner.execute(gitlabClaim(4257, { wait_on_limit: true }));
   if (failure) throw failure;
+  assert.ok(entered, "executor body was entered");
+  assert.ok(completed, "scenario body completed");
 }
+
+it("withFlight rejects when the scenario body never runs", async () => {
+  await assert.rejects(withFlight(async () => {}, { bypassBody: true }));
+});
 
 function uploads(): string[] {
   const tips: string[] = [];
@@ -201,8 +220,9 @@ it("an untrusted scan with findings, and a clean scan, set nothing", async () =>
 it("the post-bridge hold (milestone) sets it", async () => {
   const { sent } = seam();
   const tips = uploads();
-  await withFlight(async (ctx, f) => {
+  await withFlight(async (ctx, f, r) => {
     f.secretRemediation = { attempts: 0, flaggedCommits: [commit(ctx.worktreePath)] };
+    r.noteTrustedFinding(f, f.barePath as string, ctx.branch); // the hold this models came from a trusted finding
     await ctx.checkpoint!({ reap: true });
     await until(() => sent.length >= 1, "the withheld report");
     assert.equal(sent[0]!.state, "withheld");
@@ -213,8 +233,9 @@ it("the post-bridge hold (milestone) sets it", async () => {
 it("a best-effort sink (pause park) sets it", async () => {
   const { sent } = seam();
   uploads();
-  await withFlight(async (ctx, f) => {
+  await withFlight(async (ctx, f, r) => {
     f.secretRemediation = { attempts: 0, flaggedCommits: [commit(ctx.worktreePath)] };
+    r.noteTrustedFinding(f, f.barePath as string, ctx.branch);
     assert.equal(await ctx.parkForPause!({ completedCount: 1, total: 2 }), false);
     await until(() => sent.length >= 1, "the withheld report");
     assert.equal(sent[0]!.state, "withheld");
@@ -246,9 +267,113 @@ it("the hold sites need a restriction or remediation record on the flight", asyn
 async function startEpisode(ctx: RunContext, f: Flight, r: Subject): Promise<string> {
   const sha = commit(ctx.worktreePath);
   f.secretRemediation = { attempts: 0, flaggedCommits: [sha] };
+  r.noteTrustedFinding(f, f.barePath as string, ctx.branch);
   assert.equal((await r.publishCheckpointOutcome(f, String(f.barePath), ctx.branch)).reason, "secret_remediation_pending");
   return sha;
 }
+
+const FACTS = (over: Record<string, unknown>) => ({ enrolled: false, blocked: false, flaggedOIDs: [] as string[], roots: [] as string[], fingerprint: "fp", ...over });
+
+it("a failed restriction-facts read latches an empty restriction but reports no withheld diagnostic", async () => {
+  const { sent } = seam();
+  uploads();
+  await withFlight(async (ctx, f, r) => {
+    git.readRemediationRestrictionFacts = async () => { throw new Error("facts read failed"); };
+    commit(ctx.worktreePath);
+    // The hold comes from the real failed read (the empty latch), not from a forced hold stub.
+    assert.equal((await r.publishCheckpointOutcome(f, String(f.barePath), ctx.branch)).reason, "secret_remediation_pending");
+    assert.ok(f.remediationRestrictions, "the failed read latched an empty restriction");
+    await settle();
+    assert.equal(sent.length, 0);
+    assert.equal(f.checkpointWithheld, undefined);
+    assert.equal(f.trustedFindingEvidence, undefined);
+  });
+});
+
+it("confirmed enrolled facts with flagged OIDs for this bare/branch/run set the evidence and report withheld", async () => {
+  const { sent } = seam();
+  uploads();
+  await withFlight(async (ctx, f, r) => {
+    const sha = commit(ctx.worktreePath);
+    git.readRemediationRestrictionFacts = async () => FACTS({ enrolled: true, flaggedOIDs: [sha], roots: [sha] }) as never;
+    assert.deepEqual(await r.bootstrapRemediationRestrictions(f, String(f.barePath), ctx.branch), { kind: "confirmed", enrolled: true });
+    assert.deepEqual(f.trustedFindingEvidence, { runId: f.runId, barePath: f.barePath, branch: ctx.branch });
+    r.noteCheckpointWithheld(f, true);
+    await until(() => sent.length >= 1, "the withheld report");
+    assert.equal(sent[0]!.state, "withheld");
+  });
+});
+
+it("blocked facts with flagged OIDs hold but leave no evidence and no diagnostic", async () => {
+  const { sent } = seam();
+  uploads();
+  await withFlight(async (ctx, f, r) => {
+    const sha = commit(ctx.worktreePath);
+    git.readRemediationRestrictionFacts = async () => FACTS({ enrolled: true, blocked: true, flaggedOIDs: [sha], roots: [sha] }) as never;
+    assert.deepEqual(await r.bootstrapRemediationRestrictions(f, String(f.barePath), ctx.branch), { kind: "unavailable" });
+    assert.ok(f.remediationRestrictions, "custody-only facts still latch the hold");
+    assert.equal(f.trustedFindingEvidence, undefined);
+    commit(ctx.worktreePath, "again\n");
+    assert.equal((await r.publishCheckpointOutcome(f, String(f.barePath), ctx.branch)).reason, "secret_remediation_pending");
+    await settle();
+    assert.equal(sent.length, 0);
+    assert.equal(f.checkpointWithheld, undefined);
+  });
+});
+
+it("evidence for a different branch, bare or run never enables the diagnostic", async () => {
+  const { sent } = seam();
+  uploads();
+  await withFlight(async (ctx, f, r) => {
+    r.noteTrustedFinding(f, String(f.barePath), "some/other-branch");
+    r.noteTrustedFinding(f, "/elsewhere/bare.git", ctx.branch);
+    r.noteTrustedFinding(f, undefined, ctx.branch);
+    r.noteTrustedFinding(f, String(f.barePath), undefined);
+    assert.equal(f.trustedFindingEvidence, undefined);
+    // Evidence recorded for this identity stops counting once the flight's identity differs.
+    r.noteTrustedFinding(f, String(f.barePath), ctx.branch);
+    assert.ok(f.trustedFindingEvidence);
+    const original = f.runId;
+    f.runId = "another-run";
+    r.noteCheckpointWithheld(f, true);
+    f.runId = original;
+    f.branch = "moved/branch";
+    r.noteCheckpointWithheld(f, true);
+    await settle();
+    assert.equal(sent.length, 0);
+    assert.equal(f.checkpointWithheld, undefined);
+  });
+});
+
+function recoveryRecord(f: Flight, over: Record<string, unknown>) {
+  return { version: 1, blocked: false, runId: f.runId, branch: f.branch, clonePath: f.worktreePath, attemptId: "a1", sequence: 1,
+    ownedTip: "0".repeat(40), flaggedOIDs: ["1".repeat(40)], edges: [], ...over };
+}
+
+it("restoring a matching recovery record with flagged OIDs sets the evidence", async () => {
+  await withFlight(async (_ctx, f, r) => {
+    git.readRuntimeRemediationRecovery = async () => recoveryRecord(f, {}) as never;
+    await r.restoreRemediationRestrictions(f);
+    assert.deepEqual(f.trustedFindingEvidence, { runId: f.runId, barePath: f.barePath, branch: f.branch });
+  });
+});
+
+it("restoring a mismatched, empty or unreadable recovery record sets no evidence", async () => {
+  await withFlight(async (_ctx, f, r) => {
+    git.readRuntimeRemediationRecovery = async () => recoveryRecord(f, { runId: "someone-else" }) as never;
+    await r.restoreRemediationRestrictions(f);
+    assert.equal(f.trustedFindingEvidence, undefined);
+    git.readRuntimeRemediationRecovery = async () => recoveryRecord(f, { branch: "some/other-branch" }) as never;
+    await r.restoreRemediationRestrictions(f);
+    assert.equal(f.trustedFindingEvidence, undefined);
+    git.readRuntimeRemediationRecovery = async () => recoveryRecord(f, { flaggedOIDs: [] }) as never;
+    await r.restoreRemediationRestrictions(f);
+    assert.equal(f.trustedFindingEvidence, undefined);
+    git.readRuntimeRemediationRecovery = async () => { throw new Error("journal unreadable"); };
+    await assert.rejects(r.restoreRemediationRestrictions(f), /journal unreadable/);
+    assert.equal(f.trustedFindingEvidence, undefined);
+  });
+});
 
 it("an admitted and accepted publication clears; the cleared ACK retires the episode", async () => {
   const { sent, server } = seam();
