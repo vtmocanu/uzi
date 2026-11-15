@@ -29718,6 +29718,59 @@ it("M3 actual child send retries final permits and leaves the root demux running
   assert.equal(rig.transport.requests.filter(r => r.method === "turn/start").length, 2);
 });
 
+it("M3 unit guard proof: closure after child thread creation blocks turn/start and unregisters its sink", async () => {
+  // Inject only the gate state: this is not actualRunner, real-lease or protocol proof.
+  const rig = makeRig();
+  const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+  const gate = executor as unknown as { switchAdmissionClosed: boolean };
+  const registered = installerBarrier(), unregistered = installerBarrier(), replied = installerBarrier();
+  let requestsAtClosure = -1;
+  const sinks = new Set<string>();
+  const register = CodexHarness.prototype.registerChildSink;
+  const unregister = CodexHarness.prototype.unregisterChildSink;
+  const registerProbe = mock.method(CodexHarness.prototype, "registerChildSink", function (
+    this: CodexHarness, ...args: Parameters<typeof register>
+  ) {
+    register.apply(this, args);
+    sinks.add(args[0]);
+    assert.equal(args[0], "th-child");
+    assert.equal(rig.transport.threadStartCount, 2, "real child thread/start already returned");
+    requestsAtClosure = rig.transport.requests.length;
+    gate.switchAdmissionClosed = true;
+    registered.resolve();
+  });
+  const unregisterProbe = mock.method(CodexHarness.prototype, "unregisterChildSink", function (
+    this: CodexHarness, ...args: Parameters<typeof unregister>
+  ) {
+    unregister.apply(this, args);
+    assert.equal(sinks.delete(args[0]), true, "the registered child sink is removed");
+    unregistered.resolve();
+  });
+  const respond = rig.transport.respond.bind(rig.transport);
+  rig.transport.respond = (id, response) => {
+    respond(id, response);
+    if (id === 1) replied.resolve();
+  };
+  const { ctx } = makeCtx({ agents: [
+    { name: "lead", description: "lead", prompt_body: "lead", tools: null, skills: [] },
+    { name: "coder", description: "coder", prompt_body: "coder", tools: null, skills: [] },
+  ] });
+  rig.transport.push(threadStarted()).push(toolCall(1, "spawn_agent", { role: "coder", prompt: "work" }, "th-1", "tn-1", "closed-child"));
+  const running = executor.run(ctx);
+  try {
+    await withTimeout(Promise.all([registered.promise, unregistered.promise, replied.promise]), 3000, "closed child cleanup");
+    assert.equal(sinks.size, 0);
+    assert.equal(gate.switchAdmissionClosed, true);
+    assert.equal(rig.transport.requests.length, requestsAtClosure, "no provider request while admission is closed");
+    assert.equal(rig.transport.turnStartCount, 1, "only the root turn was sent");
+  } finally {
+    gate.switchAdmissionClosed = false;
+    rig.transport.push(signalDone()).push(turnCompleted()).end();
+    try { await withTimeout(running, 3000, "unit guard root cleanup"); }
+    finally { registerProbe.mock.restore(); unregisterProbe.mock.restore(); }
+  }
+});
+
 for (const stop of ["deadline", "parent terminal", "parent cancel"] as const) {
   it(`M3 child admission settles on ${stop} without sending its turn`, async () => {
     const rig = makeRig();
@@ -32293,6 +32346,7 @@ describe("M2 actualRunner credential replacement", () => {
         if (publication !== "baseline" && (phase !== "factory" || (oldClaim !== API_KEY && target !== API_KEY))) continue;
         if (publication === "subscription-refresh" && target.auth_mode !== "subscription") continue;
         if (publication === "api-key-refresh" && target.auth_mode !== "api_key") continue;
+        const positiveBChild = publication === "gated" && oldClaim === API_KEY && target === SUBSCRIPTION && phase === "factory";
         const queuedRefreshStop = publication === "subscription-refresh-prepare-failure" || publication === "subscription-refresh-cancel";
         const crashRecovery = publication === "crash-after-a-teardown-recovery" ||
           publication === "crash-apply-reply-lost-recovery" || publication === "crash-apply-ack-recovery" ||
@@ -32310,7 +32364,7 @@ describe("M2 actualRunner credential replacement", () => {
           const missingRecoveryRollout = recoveryMode.endsWith("missing retained rollout");
       it((publication === "baseline"
         ? `M2 actualRunner ${oldClaim.auth_mode} to ${target.auth_mode} ${phase} account resumes saved thread`
-        : publication === "gated" ? `Codex ${oldClaim.auth_mode} to ${target.auth_mode} publication gates Now, retired A and B preparation children; finished B root dispatch admits work`
+        : publication === "gated" ? `Codex ${oldClaim.auth_mode} to ${target.auth_mode} publication gates Now, retired A and B preparation children; finished B root dispatch admits work${positiveBChild ? "; finished B preparation broker dispatches an actual child" : ""}`
         : crashRecovery ? publication === "crash-after-a-teardown-recovery"
           ? "Codex switch crash after A teardown before apply recovers committed A without switching"
           : publication === "crash-apply-reply-lost-recovery"
@@ -32419,22 +32473,41 @@ describe("M2 actualRunner credential replacement", () => {
             return aResponder(c);
           },
           c => {
+            if (positiveBChild && c.method === "thread/start") return { thread: { id: "M3-B-child" } };
+            if (positiveBChild && c.method === "turn/start" && rec(c.params).threadId === "M3-B-child") {
+              assert.equal(bFinished, true, "actual child turn follows finishB");
+              c.transport.push(turnCompleted("completed", "M3-B-child", "M3-B-child-turn"));
+              return { turn: { id: "M3-B-child-turn" } };
+            }
             if (c.method === "thread/resume" || c.method === "thread/start") return { thread: { id: savedId } };
             if (c.method === "turn/interrupt")
               c.transport.push(turnCompleted("interrupted", savedId, bTurns > 1 ? "M2-B-idle" : "M2-B-turn"));
             if (c.method === "turn/start") {
               bTurns++;
               if (bTurns === 1) {
-                // Pinned cold-resume replay precedes the matching inbound turn boundary.
-                c.transport.push(tokenUsageUpdated(savedId, "M2-historical", { totalTokens: 0 }));
-                c.transport.push({ kind: "turn_started", method: "turn/started", threadId: savedId,
-                  turnId: "M2-B-turn", params: { threadId: savedId, turn: { id: "M2-B-turn" } } });
-                c.transport.push(agentMessage(`M2 B output ${next.access_token} ${next.capability}`, savedId));
-                c.transport.push(tokenUsageUpdated(savedId, "M2-B-turn", { inputTokens: 200, outputTokens: 100, totalTokens: 300 }));
-                c.transport.push(turnCompleted("completed", savedId, "M2-B-turn"));
-                clockOffset += 300001;
-                triggers.push(triggerNow("B"));
-                bEntered.resolve();
+                const completeRoot = async () => {
+                  if (positiveBChild) {
+                    assert.equal(bFinished, true);
+                    assert.ok(bPreparationBroker);
+                    const child = await bPreparationBroker.handleToolCall(
+                      { threadId: savedId, turnId: "M2-B-turn", callId: "finished-B-child" },
+                      "spawn_agent", { role: "coder", prompt: "work after finishB" }, "root");
+                    assert.equal(child.ok, true, "real B preparation broker and child runner admit valid work after finishB");
+                    assert.equal(b.transport.requests.filter(r => r.method === "thread/start").length, 1);
+                    assert.equal(b.transport.requests.filter(r => r.method === "turn/start" && rec(r.params).threadId === "M3-B-child").length, 1);
+                  }
+                  // Pinned cold-resume replay precedes the matching inbound turn boundary.
+                  c.transport.push(tokenUsageUpdated(savedId, "M2-historical", { totalTokens: 0 }));
+                  c.transport.push({ kind: "turn_started", method: "turn/started", threadId: savedId,
+                    turnId: "M2-B-turn", params: { threadId: savedId, turn: { id: "M2-B-turn" } } });
+                  c.transport.push(agentMessage(`M2 B output ${next.access_token} ${next.capability}`, savedId));
+                  c.transport.push(tokenUsageUpdated(savedId, "M2-B-turn", { inputTokens: 200, outputTokens: 100, totalTokens: 300 }));
+                  c.transport.push(turnCompleted("completed", savedId, "M2-B-turn"));
+                  clockOffset += 300001;
+                  triggers.push(triggerNow("B"));
+                  bEntered.resolve();
+                };
+                triggers.push(completeRoot());
               }
               return { turn: { id: bTurns === 1 ? "M2-B-turn" : "M2-B-idle" } };
             }
@@ -33270,7 +33343,7 @@ describe("M2 actualRunner credential replacement", () => {
             assert.ok(events.includes(method), `B sent ${method}`);
           assert.ok(events.indexOf("account/login/start") < events.indexOf("thread/resume"));
           assert.ok(events.indexOf("thread/resume") < events.indexOf("turn/start"));
-          assert.equal(b.transport.threadStartCount, 0);
+          assert.equal(b.transport.threadStartCount, positiveBChild ? 1 : 0);
           assert.equal(await fs.readFile(path.join(worktree, "M2-retained.txt"), "utf8"), "A work");
         } finally {
           cancelled = true; pending = false; nowContinue.resolve(); summaryDisposeContinue.resolve(); cleanupContinue.resolve();
