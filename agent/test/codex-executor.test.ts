@@ -32289,17 +32289,29 @@ describe("M2 actualRunner credential replacement", () => {
   for (const [oldClaim, target] of [[SUBSCRIPTION, API_KEY], [API_KEY, SUBSCRIPTION],
     [SUBSCRIPTION, { ...SUBSCRIPTION, generation: 20, chatgpt_account_id: "M2-B-account" }]] as const) {
     for (const phase of ["factory", "already-running-body"] as const) {
-      for (const publication of ["baseline", "gated", "publish-failure", "now-publish-failure", "login-failure", "subscription-refresh", "api-key-refresh", "subscription-refresh-prepare-failure", "subscription-refresh-cancel", "crash-login-recovery"] as const) {
+      for (const publication of ["baseline", "gated", "publish-failure", "now-publish-failure", "login-failure", "subscription-refresh", "api-key-refresh", "subscription-refresh-prepare-failure", "subscription-refresh-cancel", "crash-after-a-teardown-recovery", "crash-apply-reply-lost-recovery", "crash-apply-ack-recovery", "crash-login-recovery"] as const) {
         if (publication !== "baseline" && (phase !== "factory" || (oldClaim !== API_KEY && target !== API_KEY))) continue;
         if (publication === "subscription-refresh" && target.auth_mode !== "subscription") continue;
         if (publication === "api-key-refresh" && target.auth_mode !== "api_key") continue;
         const queuedRefreshStop = publication === "subscription-refresh-prepare-failure" || publication === "subscription-refresh-cancel";
-        const crashRecovery = publication === "crash-login-recovery";
+        const crashRecovery = publication === "crash-after-a-teardown-recovery" ||
+          publication === "crash-apply-reply-lost-recovery" || publication === "crash-apply-ack-recovery" ||
+          publication === "crash-login-recovery";
+        const crashStage = publication === "crash-after-a-teardown-recovery" ? "before-apply"
+          : publication === "crash-apply-reply-lost-recovery" ? "apply-reply-lost"
+          : publication === "crash-apply-ack-recovery" ? "before-publish" : "login";
+        const expectedApplies = publication === "crash-after-a-teardown-recovery" ? 0 : 1;
         if ((queuedRefreshStop || crashRecovery) && (oldClaim !== API_KEY || target !== SUBSCRIPTION || phase !== "factory")) continue;
       it(publication === "baseline"
         ? `M2 actualRunner ${oldClaim.auth_mode} to ${target.auth_mode} ${phase} account resumes saved thread`
         : publication === "gated" ? `Codex ${oldClaim.auth_mode} to ${target.auth_mode} publication gates Now, retired A and B preparation children; finished B root dispatch admits work`
-        : crashRecovery ? "Codex switch crash during B login retains committed B"
+        : crashRecovery ? publication === "crash-after-a-teardown-recovery"
+          ? "Codex switch crash after A teardown before apply recovers committed A without switching"
+          : publication === "crash-apply-reply-lost-recovery"
+          ? "Codex switch crash after apply commit loses auth response and recovers committed B"
+          : publication === "crash-apply-ack-recovery"
+          ? "Codex switch crash after apply acknowledgement before B login recovers committed B"
+          : "Codex switch crash during B login retains committed B"
         : publication === "subscription-refresh" ? "Codex subscription startup refresh stays deferred until B finish"
         : publication === "subscription-refresh-prepare-failure" ? "Codex queued subscription refresh settles on B preparation failure"
         : publication === "subscription-refresh-cancel" ? "Codex queued subscription refresh settles on cancellation after B preparation"
@@ -32315,7 +32327,7 @@ describe("M2 actualRunner credential replacement", () => {
         claim.secrets = { ...claim.secrets, codex: oldClaim as import("../src/protocol.js").ClaimCodexSecrets };
         api.setOwnershipStatus(claim.run_id, "running", 7);
         let pending = false, cancelled = false, applies = 0, hooks = 0, factories = 0, preflights = 0;
-        let predecessorFenced = false;
+        let predecessorFenced = false, applyAcknowledgements = 0;
         let committedCodex = claim.secrets.codex!;
         let context!: RunContext;
         let clockOffset = 0;
@@ -32351,9 +32363,12 @@ describe("M2 actualRunner credential replacement", () => {
           claimGeneration: 7, registerNonce: "M2-original-nonce", opId: "M2-op" }; };
         const applyRequests: { claimGeneration: number; opId: string }[] = [];
         client.applyCredentialSwitch = async (_id, req) => {
+          if (crashRecovery) await publicationBoundary("before-apply");
           applyRequests.push({ claimGeneration: req.claimGeneration, opId: req.opId });
           applies++; pending = false;
           committedCodex = next; // Simulated committed row, not evidence of DB durability.
+          if (crashRecovery) await publicationBoundary("apply-reply-lost");
+          applyAcknowledgements++;
           return { kind: "codex_applied", codex: next, ordinal: 1,
             capabilityEpoch: 42, messageSeq: 7, replay: false };
         };
@@ -32366,7 +32381,9 @@ describe("M2 actualRunner credential replacement", () => {
         await fs.writeFile(path.join(source, "unapproved.txt"), "not a session");
         await CodexSessionStore.persist(source, store);
         const aEntered = installerBarrier(), bEntered = installerBarrier();
-        const publicationStages = ["before-publish", "after-publish", "before-prepare", "login", "prepared"] as const;
+        const publicationStages = crashRecovery
+          ? ["before-apply", "apply-reply-lost", "before-publish", "after-publish", "before-prepare", "login", "prepared"] as const
+          : ["before-publish", "after-publish", "before-prepare", "login", "prepared"] as const;
         const publicationBarriers = publicationStages.map(stage => ({ stage, entered: installerBarrier(), proceed: installerBarrier() }));
         const publicationBoundary = async (stage: typeof publicationStages[number]) => {
           if (publication === "baseline") return;
@@ -32374,7 +32391,8 @@ describe("M2 actualRunner credential replacement", () => {
           barrier.entered.resolve();
           await barrier.proceed.promise;
           if ((publication === "publish-failure" && stage === "after-publish") ||
-              ((publication === "login-failure" || crashRecovery) && stage === "login") ||
+              (publication === "login-failure" && stage === "login") ||
+              (crashRecovery && stage === crashStage) ||
               (publication === "subscription-refresh-prepare-failure" && stage === "prepared"))
             throw new Error(`injected ${stage} failure`);
         };
@@ -32794,7 +32812,18 @@ describe("M2 actualRunner credential replacement", () => {
                   } });
                   assert.equal(bFinished, false, "API-key auth owner refuses before B finish");
                 }
-                if (crashRecovery && barrier.stage === "login") predecessorFenced = true;
+                if (crashRecovery && barrier.stage === crashStage) {
+                  predecessorFenced = true;
+                  assert.equal(applies, expectedApplies);
+                  assert.equal(applyAcknowledgements,
+                    crashStage === "before-publish" || crashStage === "login" ? 1 : 0,
+                    "commit with a lost reply exposes no applied auth response");
+                  assert.ok(a.reaped() > 0 && a.disposed() > 0, "A teardown precedes every crash point");
+                  assert.ok(events.includes("A-effect-disposed"));
+                  assert.ok(fileops[0]!.disposed() > 0);
+                  assert.equal(committedCodex, expectedApplies === 0 ? oldClaim : next);
+                  assert.equal(loginObservations.length, crashStage === "login" ? 1 : 0);
+                }
                 // Join the event queue without a wall-clock sleep.
                 await new Promise<void>(resolve => setImmediate(resolve));
                 assert.equal(nowBuilds.length, builds, "ordinary Now cannot construct a half-published harness");
@@ -32807,15 +32836,16 @@ describe("M2 actualRunner credential replacement", () => {
                   assert.deepEqual(nowPublicationProbes, ["before-Now-publish", "after-Now-publish"]);
               } finally { barrier.proceed.resolve(); }
               if ((publication === "publish-failure" && barrier.stage === "after-publish") ||
-                  ((publication === "login-failure" || publication === "api-key-refresh" || crashRecovery) && barrier.stage === "login") ||
+                  ((publication === "login-failure" || publication === "api-key-refresh") && barrier.stage === "login") ||
+                  (crashRecovery && barrier.stage === crashStage) ||
                   (queuedRefreshStop && barrier.stage === "prepared") ||
                   (publication === "now-publish-failure" && barrier.stage === "after-publish")) break;
             }
-            assert.equal(consumerProbes.length, publication === "publish-failure" || publication === "now-publish-failure" ? 2 : (publication === "login-failure" || publication === "api-key-refresh" || crashRecovery) ? 4 : 5);
+            assert.equal(consumerProbes.length, crashRecovery ? publicationStages.findIndex(stage => stage === crashStage) + 1 : publication === "publish-failure" || publication === "now-publish-failure" ? 2 : (publication === "login-failure" || publication === "api-key-refresh" || crashRecovery) ? 4 : 5);
             if (publication !== "gated" && publication !== "subscription-refresh") {
               await withTimeout(running, 5000, "failed publication retained stop");
               assert.equal(reopenAttempts, 0);
-              assert.equal(applies, 1, "B was acknowledged before the injected initialization failure");
+              assert.equal(applies, expectedApplies, "apply count matches the injected crash boundary");
               assert.equal(b.transport.turnStartCount, 0);
               assert.equal(ordinaryBRefreshes, 0);
               if (queuedRefreshStop) {
@@ -32850,19 +32880,27 @@ describe("M2 actualRunner credential replacement", () => {
               assert.equal(await fs.readFile(path.join(worktree, "M2-retained.txt"), "utf8"), "A work");
               assert.equal(await CodexSessionStore.inspectSession(store, savedId), "present");
               if (crashRecovery) {
-                // Model worker loss by fencing generation 7 at the held login, then
+                // Model worker loss by fencing generation 7 at the held crash point, then
                 // join its cleanup. The injected transport failure is NOT an abrupt
                 // process crash. LiveDB tests separately prove commit/remint authority.
                 assert.equal(predecessorFenced, true);
-                for (const epoch of [a, b]) {
+                const launchedPredecessors = rig.epochs.slice(0, rig.providerLaunches());
+                assert.equal(launchedPredecessors.length, crashStage === "login" ? 2 : 1,
+                  "only actually launched provider epochs require quiescence");
+                for (const epoch of launchedPredecessors) {
                   assert.ok(epoch.reaped() > 0, "predecessor provider root quiescent before recovery");
                   assert.ok(epoch.disposed() > 0);
                 }
-                assert.ok(effects >= 2, "both predecessor epochs launched tools");
+                if (crashStage !== "login") {
+                  assert.equal(b.transport.requests.length, 0, "B never launches before preparation");
+                  assert.equal(loginObservations.length, 0);
+                }
+                assert.ok(effects >= launchedPredecessors.length, "launched predecessors own tool roots");
                 assert.equal(disposedEffects.size, effects, "every launched predecessor effect root proved disposal");
                 for (const handle of fileops) assert.ok(handle.disposed() > 0);
                 assert.throws(() => owners[0]!.guard(), /authority|aborted|admission|closed/i);
                 const predecessorSends = [a.transport.requests.length, b.transport.requests.length];
+                // Simulated claim/last_seq/remint projection only; no actual DB proof.
                 const recovered: ClaimResponse = { ...claim, claim_generation: 8, session_id: savedId,
                   last_seq: api.messages(claim.run_id).reduce((seq, message) => Math.max(seq, message.seq), 0),
                   secrets: { ...claim.secrets, codex: { ...committedCodex, capability: "M3-reminted-capability" } } };
@@ -32881,6 +32919,11 @@ describe("M2 actualRunner credential replacement", () => {
                 const readinessResults: string[] = [];
                 const releases: unknown[] = [];
                 const buildRecovery = () => {
+                  assert.equal(rig.providerLaunches(), launchedPredecessors.length, "predecessor launches stay fenced");
+                  for (const epoch of launchedPredecessors) {
+                    assert.ok(epoch.reaped() > 0 && epoch.disposed() > 0, "no provider overlap with recovery");
+                  }
+                  assert.equal(disposedEffects.size, effects, "no predecessor effect overlap with recovery");
                   const recoveryRig = makeRig({ responder: c => {
                     if (c.method === "thread/start") return { thread: { id: "M3-recovered-fresh-thread" } };
                     if (c.method === "thread/resume") throw new Error("fresh-checkout recovery must disclose a lineage break");
@@ -32916,6 +32959,8 @@ describe("M2 actualRunner credential replacement", () => {
                     assert.ok(readinessLaunches > 0, "retained readiness ran before model admission");
                     assert.equal(readinessWaits, readinessLaunches);
                     assert.equal(readinessDisposals, readinessLaunches, "readiness disposed before recovered executor body");
+                    assert.equal(recovered.session_id, savedId, "claim retains the saved conversation candidate");
+                    assert.notEqual(ctx.worktreePath, worktree, "retained recovery selects a fresh checkout");
                     assert.equal(ctx.sessionId, undefined, "normal recovery drops the persisted candidate when cwd changes");
                     assert.equal(await fs.readFile(path.join(ctx.worktreePath, "M2-retained.txt"), "utf8"), "A work");
                     const result = await recoveryRun(ctx);
@@ -33002,14 +33047,14 @@ describe("M2 actualRunner credential replacement", () => {
                 });
                 const recoveryFlight = recoveryRunner.execute(recovered);
                 try {
-                  await withTimeout(recoveryFlight, 10000, "distinct committed B recovery flight").catch(error => {
+                  await withTimeout(recoveryFlight, 10000, "distinct committed-credential recovery flight").catch(error => {
                     throw new Error(JSON.stringify({ readinessLaunches, readinessWaits, readinessDisposals, readinessResults,
                       recoveryBodies, recoveryFactories, releases: releases.length, logs: recoveryLog.lines.slice(-12) }), { cause: error });
                   });
                 } finally {
                   try {
-                    recoveryRunner.shutdown();
-                    await recoveryFlight;
+                    try { recoveryRunner.shutdown(); }
+                    finally { await recoveryFlight; }
                   } finally {
                     readinessProbe.mock.restore();
                   }
@@ -33031,16 +33076,23 @@ describe("M2 actualRunner credential replacement", () => {
                 const requests = executedRecoveryRig.transport.requests;
                 const login = requests.find(r => r.method === "account/login/start");
                 assert.ok(login);
-                assert.equal(rec(login.params).accessToken, committedCodex.access_token);
-                assert.equal(rec(login.params).chatgptAccountId, next.auth_mode === "subscription" ? next.chatgpt_account_id : undefined);
+                assert.equal(rec(login.params).type, committedCodex.auth_mode === "subscription" ? "chatgptAuthTokens" : "apiKey");
+                assert.equal(rec(login.params)[committedCodex.auth_mode === "subscription" ? "accessToken" : "apiKey"],
+                  committedCodex.access_token);
+                assert.equal(rec(login.params).chatgptAccountId,
+                  committedCodex.auth_mode === "subscription" ? committedCodex.chatgpt_account_id : undefined);
                 assert.deepEqual(requests.filter(r => r.method === "thread/start" || r.method === "thread/resume")
                   .map(r => [r.method, rec(r.params).threadId]), [["thread/start", undefined]]);
                 assert.ok(api.messages(claim.run_id).some(message => message.kind === "status" &&
-                  rec(message.payload).event === "resume_lineage_break"), "changed-cwd recovery visibly discloses lost conversation lineage");
+                  rec(message.payload).event === "resume_lineage_break" &&
+                  JSON.stringify(message.payload).includes("cwd_changed_attempt_path")),
+                  "changed-cwd recovery visibly discloses the path lineage break");
                 assert.ok(requests.some(r => r.method === "turn/start"), "recovered executor actually sends work");
                 assert.deepEqual([a.transport.requests.length, b.transport.requests.length], predecessorSends,
                   "fenced predecessor never sends during recovery");
-                assert.equal(applies, 1);
+                assert.equal(applies, expectedApplies, "recovery never replays predecessor apply");
+                assert.equal(applyRequests.length, expectedApplies);
+                assert.equal(rig.providerLaunches(), launchedPredecessors.length, "recovery cannot relaunch predecessor roots");
               }
               return;
             }
