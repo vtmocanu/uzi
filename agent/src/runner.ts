@@ -2714,16 +2714,17 @@ interface RunFlight {
    *  secret-scan restriction holds checkpoints back; `clear_pending` once a later publication was
    *  admitted and accepted, until a `cleared` ACK retires the episode. Content-free by construction:
    *  nothing here names a finding, path, rule or SHA. */
-  checkpointWithheld?: { episode: number; since: string; phase: "withheld" | "clear_pending"; evidenceSeq: number };
+  checkpointWithheld?: { episode: number; since: string; phase: "withheld" | "clear_pending" };
   /** Issue #4257: the flight's trusted-finding provenance, the only thing that lets a hold outcome
    *  start a withheld episode. Set from a trusted scan finding, confirmed enrolled restriction facts
    *  or a matching recovery record; never from a latch alone (a failed facts read also latches).
-   *  Valid only while all three identity fields still equal the flight's. Holds no OIDs or finding content. */
+   *  Valid only while all three identity fields still equal the flight's; cleared when an admitted,
+   *  accepted publication retires it (noteCheckpointPublished). Holds no OIDs or finding content. */
   trustedFindingEvidence?: { runId: string; barePath: string; branch: string };
   /** Issue #4257: monotonic version of the trusted-finding evidence, advanced only by a fresh scan
-   *  finding (noteTrustedFinding source "scan"); historical re-assertions never advance it. An
-   *  episode and an admitted publication each capture it, so an accepted publication retires only
-   *  the evidence that existed when it was admitted. */
+   *  finding (noteTrustedFinding source "scan"); historical re-assertions never advance it. The
+   *  admission guard captures it, so an accepted publication retires only the evidence that existed
+   *  when it was admitted. */
   trustedFindingSeq?: number;
   /** Issue #4257: set when an accepted publication retired the evidence; while set, historical
    *  re-assertions (confirmed enrolled facts, a journal record) cannot record it again. Only a fresh
@@ -22100,8 +22101,7 @@ export class RunRunner {
     if (gated && !this.hasTrustedFindingEvidence(flight)) return;
     if (flight.checkpointWithheld?.phase === "withheld") return;
     const episode = flight.withheldEpisodeSeq = (flight.withheldEpisodeSeq ?? 0) + 1;
-    flight.checkpointWithheld = { episode, since: new Date(this.now()).toISOString(), phase: "withheld",
-      evidenceSeq: flight.trustedFindingSeq ?? 0 };
+    flight.checkpointWithheld = { episode, since: new Date(this.now()).toISOString(), phase: "withheld" };
     this.queueCheckpointPublicationReport(flight);
   }
 
@@ -22130,15 +22130,15 @@ export class RunRunner {
 
   /** Issue #4257: an accepted publication that was admitted under `admittedEpisode` clears that
    *  episode only while it is still `withheld` (a newer episode is never cleared by an older call).
-   *  On that transition it also retires the trusted-finding evidence, but only when no fresh scan
-   *  finding arrived after the episode opened or after the publication was admitted
-   *  (`admittedEvidenceSeq`, captured by the admission guard); newer evidence survives. */
+   *  On that transition it also retires the trusted-finding evidence the admission covered: only when
+   *  no fresh scan finding arrived after the publication was admitted (`admittedEvidenceSeq`, captured
+   *  by the last successful admission guard). A finding recorded later (e.g. during the upload) survives. */
   private noteCheckpointPublished(flight: RunFlight, admittedEpisode: number | undefined,
     admittedEvidenceSeq?: number): void {
     const current = flight.checkpointWithheld;
     if (admittedEpisode === undefined || current?.episode !== admittedEpisode || current.phase !== "withheld") return;
     if (admittedEvidenceSeq !== undefined &&
-        (flight.trustedFindingSeq ?? 0) <= Math.min(current.evidenceSeq, admittedEvidenceSeq)) {
+        (flight.trustedFindingSeq ?? 0) <= admittedEvidenceSeq) {
       flight.trustedFindingEvidence = undefined;
       flight.trustedFindingRetired = true;
     }
@@ -22267,7 +22267,7 @@ export class RunRunner {
       // an accepted publication of this call may clear that same episode.
       const admittedEpisode = flight.checkpointWithheld?.episode;
       // Issue #4257: the evidence version when the last successful admission guard ran (a retry
-      // re-captures); an accepted publication retires only evidence no newer than this.
+      // re-captures); an accepted publication retires only evidence no newer than this (noteCheckpointPublished).
       let admittedEvidenceSeq: number | undefined;
       let guard: (candidate: string, context?: CheckpointPublicationContext) => Promise<void>;
       const produce = <T,>(start: (identity: RemediationRestrictionIdentity) => Promise<T>) =>

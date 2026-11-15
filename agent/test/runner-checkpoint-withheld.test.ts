@@ -20,7 +20,7 @@ type Pub = { state: "withheld" | "cleared"; since?: string; report_seq: number }
 type Flight = Record<string, unknown> & {
   runLog: Logger; runId: string;
   secretRemediation?: { attempts: number; flaggedCommits?: string[] };
-  checkpointWithheld?: { episode: number; since: string; phase: "withheld" | "clear_pending"; evidenceSeq: number };
+  checkpointWithheld?: { episode: number; since: string; phase: "withheld" | "clear_pending" };
   trustedFindingEvidence?: { runId: string; barePath: string; branch: string };
   trustedFindingRetired?: boolean;
   reportState: (body: { status: string }, signal?: AbortSignal) => Promise<unknown>;
@@ -465,25 +465,25 @@ it("a cleared episode's evidence never re-enables the flag: a later failed facts
   });
 });
 
-it("a fresh scan finding recorded before the clearing publication survives it and re-enables the flag", async () => {
+it("a rescan finding recorded before the clearing publication's admission is resolved by that admission", async () => {
+  // e.g. the mid-run remediation rescan re-finding the same secret after the episode opened: the
+  // later admission checked the candidate against it, so the accepted clear retires it.
   const { sent } = seam();
   const tips = uploads();
   await withFlight(async (ctx, f, r) => {
     await startEpisode(ctx, f, r);
     await until(() => sent.length >= 1, "withheld");
     f.secretRemediation = undefined;
-    r.noteTrustedFinding(f, String(f.barePath), ctx.branch); // fresh scan finding after the episode opened
+    r.noteTrustedFinding(f, String(f.barePath), ctx.branch); // fresh scan finding after the episode opened, before admission
     assert.deepEqual(await r.publishCheckpointOutcome(f, String(f.barePath), ctx.branch), { published: true });
     await until(() => sent.length >= 2, "cleared");
     await until(() => f.checkpointWithheld === undefined, "episode retired by the cleared ACK");
-    assert.ok(f.trustedFindingEvidence, "newer evidence survived");
+    assert.equal(f.trustedFindingEvidence, undefined, "the admission covered it");
     git.readRemediationRestrictionFacts = async () => { throw new Error("facts read failed"); };
     commit(ctx.worktreePath, "later\n");
     assert.equal((await r.publishCheckpointOutcome(f, String(f.barePath), ctx.branch)).reason, "secret_remediation_pending");
-    await until(() => sent.length >= 3, "a new withheld report");
-    assert.equal(sent[2]!.state, "withheld");
-    assert.equal(f.checkpointWithheld?.episode, 2);
-    assert.ok(f.trustedFindingEvidence);
+    await settle();
+    assert.equal(sent.length, 2, JSON.stringify(sent));
     assert.equal(tips.length, 1, "still held");
   });
 });
