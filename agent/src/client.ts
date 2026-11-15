@@ -3316,8 +3316,12 @@ export class WorkerClient {
       // This capability only enables the exact source-end hold; it never changes the running ACK.
       // Witnesses remain valid for this registration, including while a hold ACK is in flight.
       // Keep one per run until re-registration clears witnessedRunning; unrelated ACKs must
-      // never revoke an active run's exact-generation capability.
-      this.witnessedRunning.set(runId, witness);
+      // never revoke an active run's exact-generation capability. A delayed ACK from an older
+      // claim generation must not replace a newer generation's witness.
+      const held = this.witnessedRunning.get(runId);
+      if (!held || held.register_nonce !== witness.register_nonce || held.claim_generation <= witness.claim_generation) {
+        this.witnessedRunning.set(runId, witness);
+      }
     }
     return ack;
   }

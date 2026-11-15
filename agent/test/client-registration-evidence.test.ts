@@ -111,6 +111,17 @@ describe("registration evidence on the running report", () => {
     assert.equal(c.sourceEndDeclinedRegistration(ids[0]!, GEN), undefined);
   });
 
+  it("a delayed older-generation ACK keeps the newer generation's witness", async () => {
+    const recorded: Reply = { status: 200, body: JSON.stringify({
+      run: { id: "r1", status: "running" }, registration_evidence: "recorded",
+    }) };
+    const { c } = await make([recorded, recorded], { features: [...FEATURES, "retained_source_end_hold_v1"] });
+    await c.reportState("r1", { status: "running", claim_generation: GEN + 1 }, undefined, { registrationEpoch: EPOCH });
+    await c.reportState("r1", { status: "running", claim_generation: GEN }, undefined, { registrationEpoch: EPOCH });
+    assert.equal(c.sourceEndDeclinedRegistration("r1", GEN + 1), NONCE);
+    assert.equal(c.sourceEndDeclinedRegistration("r1", GEN), undefined);
+  });
+
   it("a status-only running ACK is not a recorded witness", async () => {
     const { c } = await make(["ok"], { features: [...FEATURES, "retained_source_end_hold_v1"] });
     await c.reportState("r1", { status: "running", claim_generation: GEN }, undefined, { registrationEpoch: EPOCH });

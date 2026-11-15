@@ -163,6 +163,8 @@ func TestSourceEndDeclinedRefusalsLiveDB(t *testing.T) {
 
 func TestSourceEndDeclinedConcurrentDuplicateLiveDB(t *testing.T) {
 	e, svc, w, id := sourceEndFixture(t, "running")
+	before := sourceEndRead(t, e, id)
+	openBefore, totalBefore := e.countHolds(t, id)
 	start := make(chan struct{})
 	type outcome struct {
 		applied bool
@@ -187,8 +189,16 @@ func TestSourceEndDeclinedConcurrentDuplicateLiveDB(t *testing.T) {
 			count++
 		}
 	}
-	if r := sourceEndRead(t, e, id); count != 1 || r.RecoveryWaitCount != 1 {
-		t.Fatalf("duplicate applications=%d wait_count=%d", count, r.RecoveryWaitCount)
+	r := sourceEndRead(t, e, id)
+	if count != 1 || r.Status != "recovery_wait" || r.RecoveryWaitCause.String != recoveryCauseRetainedRecoveryAdoptionFailed ||
+		r.RecoveryWaitDetail.String != RecoveryDetailSourceEndDeclined || r.RecoveryRetryNotBefore.Valid ||
+		!r.ClaimReleasedAt.Valid || !r.ReleasedWorkerID.Valid || r.ReleasedWorkerID.Bytes != w.ID ||
+		r.ReleasedWorkerNonce.String != sourceEndReport().RegisterNonce || r.RecoveryWaitCount != before.RecoveryWaitCount+1 ||
+		r.ClaimGeneration != before.ClaimGeneration || r.WorkerID != before.WorkerID {
+		t.Fatalf("duplicate applications=%d row=%+v", count, r)
+	}
+	if open, total := e.countHolds(t, id); open != openBefore || total != totalBefore {
+		t.Fatalf("concurrent duplicate changed custody: open %d->%d total %d->%d", openBefore, open, totalBefore, total)
 	}
 }
 

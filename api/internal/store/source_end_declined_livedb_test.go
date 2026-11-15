@@ -110,7 +110,7 @@ func TestSourceEndDeclinedLegacyResumeClaimFenceLiveDB(t *testing.T) {
 
 func TestSourceEndDeclinedMigrationAndLegacyResumeLiveDB(t *testing.T) {
 	ctx, dsn := standIsolatedDB(t, "source_end_declined_")
-	if err := store.MigrateTo(ctx, dsn, 456); err != nil {
+	if err := store.MigrateTo(ctx, dsn, 461); err != nil {
 		t.Fatal(err)
 	}
 	pool, err := store.OpenPool(ctx, dsn)
@@ -128,12 +128,12 @@ func TestSourceEndDeclinedMigrationAndLegacyResumeLiveDB(t *testing.T) {
 	mustExec(ctx, t, pool, `INSERT INTO runs(id,user_id,repo_id,worker_id,kind,issue_iid,issue_title,issue_description,status,claim_generation)
  VALUES($1,$2,$3,$4,'issue',4177,'detail','fixture','running',1)`, run, user, repo, worker)
 
-	if err := store.MigrateTo(ctx, dsn, 457); err != nil {
+	if err := store.MigrateTo(ctx, dsn, 462); err != nil {
 		t.Fatal(err)
 	}
 	var valid bool
 	if err := pool.QueryRow(ctx, "SELECT convalidated FROM pg_constraint WHERE conrelid='runs'::regclass AND conname='runs_recovery_wait_detail_check'").Scan(&valid); err != nil || valid {
-		t.Fatalf("457 CHECK NOT VALID: valid=%v err=%v", valid, err)
+		t.Fatalf("462 CHECK NOT VALID: valid=%v err=%v", valid, err)
 	}
 	_, err = pool.Exec(ctx, "UPDATE runs SET recovery_wait_detail='unknown-detail' WHERE id=$1", run)
 	var pe *pgconn.PgError
@@ -145,11 +145,11 @@ func TestSourceEndDeclinedMigrationAndLegacyResumeLiveDB(t *testing.T) {
  recovery_wait_detail='source_end_declined', claim_released_at=now(), released_worker_id=$2,
  released_worker_nonce='released-source', registration_evidence_generation=1, registration_evidence_nonce='released-source'
  WHERE id=$1`, run, worker)
-	if err := store.MigrateTo(ctx, dsn, 458); err != nil {
+	if err := store.MigrateTo(ctx, dsn, 463); err != nil {
 		t.Fatal(err)
 	}
 	if err := pool.QueryRow(ctx, "SELECT convalidated FROM pg_constraint WHERE conrelid='runs'::regclass AND conname='runs_recovery_wait_detail_check'").Scan(&valid); err != nil || !valid {
-		t.Fatalf("458 CHECK validated: valid=%v err=%v", valid, err)
+		t.Fatalf("463 CHECK validated: valid=%v err=%v", valid, err)
 	}
 	b, err := os.ReadFile("migrations/00462_retained_source_end_hold.sql")
 	if err != nil {
