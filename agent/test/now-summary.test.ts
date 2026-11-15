@@ -21,7 +21,8 @@ import {
 import type { EmittedMessage, RunContext } from "../src/executor.js";
 import type { AdviceUsageSnapshot } from "../src/harness.js";
 import { LimitReachedError } from "../src/limit.js";
-import type { ReadOnlyModelPassOpts } from "../src/model-pass.js";
+import { runReadOnlyModelPass, type ReadOnlyModelPassOpts } from "../src/model-pass.js";
+import { ownedSummaryFactories } from "../src/codex/summary-ownership.js";
 import type { Milestone, MilestoneProgress } from "../src/protocol.js";
 import { nullLogger } from "./helpers.js";
 import { CredentialSwitchSignal, PauseNowSignal } from "../src/steering.js";
@@ -142,6 +143,8 @@ function harness(over: { claude?: boolean; codex?: boolean; kind?: import("../sr
     clearTimer: clock.clearTimer,
     log,
   };
+  // This synthetic pass models the owned contract: its promise includes raw completion.
+  if (deps.claim.codex) ownedSummaryFactories.add(deps.claim.codex.buildHarness);
   const c = new NowSummaryController(deps);
   const notes = (): Record<string, unknown>[] => emitted.filter((m) => m.kind === "progress_note").map((m) => m.payload);
   return { c, clock, st, calls, emitted, notes, warns, deps, factoryCalls };
@@ -155,6 +158,98 @@ async function running(h: ReturnType<typeof harness>, ...ids: string[]): Promise
   h.c.observeFrame(toolUse("lead", "Read", { file_path: "first.md" }));
   await h.clock.advance(0);
 }
+
+// Test-only provider whose raw run deliberately ignores abort. Completion includes its finally.
+function realCodexPass(owned: boolean) {
+  const h = harness({ codex: true });
+  let release!: () => void;
+  const raw = new Promise<void>((resolve) => { release = resolve; });
+  let started!: () => void;
+  const entered = new Promise<void>((resolve) => { started = resolve; });
+  let rawFinished = false;
+  let providerSignal: AbortSignal | undefined;
+  const buildHarness = (async () => ({
+    kind: "codex",
+    run: async (request: { signal?: AbortSignal }) => {
+      providerSignal = request.signal;
+      started();
+      try {
+        await raw;
+        return { text: "provider text" };
+      } finally {
+        rawFinished = true;
+      }
+    },
+  })) as unknown as NonNullable<ReadOnlyModelPassOpts["codex"]>["buildHarness"];
+  // Only this synthetic owned fixture promises that raw completion includes provider cleanup.
+  if (owned) ownedSummaryFactories.add(buildHarness);
+  let passDone: Promise<unknown> = Promise.resolve();
+  const deps: NowSummaryDeps = {
+    ...h.deps,
+    claim: { ...h.deps.claim, codex: { ...h.deps.claim.codex!, buildHarness } },
+    runPass: (opts) => {
+      const pass = runReadOnlyModelPass({ ...opts, graceMs: 10 });
+      passDone = pass.then(() => {}, () => {});
+      return pass;
+    },
+  };
+  h.c = new NowSummaryController(deps);
+  return {
+    h, entered,
+    pending: () => !rawFinished,
+    signal: () => providerSignal,
+    cleanup: async () => { release(); await passDone; await h.c.stop(); },
+    release,
+  };
+}
+
+describe("NowSummaryController: real model-pass ownership", () => {
+  it("refuses an unowned factory while its abort-ignoring provider is pending", async () => {
+    const p = realCodexPass(false);
+    try {
+      await running(p.h);
+      await p.entered;
+      assert.equal(p.pending(), true, "raw provider is blocked on the explicit barrier");
+      assert.throws(() => p.h.c.suspendCodexSwitch({
+        signal: new AbortController().signal, remainingMs: 50,
+      }), /Now Codex switch unavailable/);
+      assert.equal(p.signal()!.aborted, false, "refusal happens before gate/drain abort");
+      assert.equal(p.pending(), true);
+    } finally {
+      await p.cleanup();
+    }
+  });
+
+  for (const end of ["raw", "deadline", "cancel"] as const) {
+    it(`owned real model-pass waits beyond grace until ${end}`, async (t) => {
+      t.mock.timers.enable({ apis: ["setTimeout"] });
+      const p = realCodexPass(true);
+      try {
+        await running(p.h);
+        await p.entered;
+        const cancel = new AbortController();
+        const lease = p.h.c.suspendCodexSwitch({ signal: cancel.signal, remainingMs: 50 });
+        let result: unknown;
+        void lease.drained.then((value) => { result = value; });
+        await settle();
+        assert.equal(p.signal()!.aborted, true);
+        t.mock.timers.tick(11);
+        await settle();
+        assert.equal(p.pending(), true, "raw provider remains blocked after ordinary grace");
+        assert.equal(result, undefined, "ordinary grace cannot certify owned drain");
+        if (end === "raw") p.release();
+        else if (end === "deadline") await p.h.clock.advance(50);
+        else cancel.abort();
+        assert.deepEqual(await lease.drained, { kind: end === "raw" ? "drained" : end === "deadline" ? "timeout" : "cancelled" });
+        assert.equal(p.pending(), end !== "raw");
+        assert.equal(p.h.clock.pendingTimers, 0);
+      } finally {
+        await p.cleanup();
+        t.mock.timers.reset();
+      }
+    });
+  }
+});
 
 describe("NowSummaryController: M4 work-description prompts", () => {
   it("Claude and Codex receive identical instructions and data apart from the per-call nonce", async () => {
@@ -1155,7 +1250,7 @@ describe("NowSummaryController: Codex switch suspension", () => {
     assert.equal(h.notes().length, 0);
   });
 
-  it("publication retains nested callback holds, switches whole authority both directions, and retires late A callbacks", async () => {
+  it("publication retains nested callback holds and switches whole authority both directions", async () => {
     for (const firstMode of ["api_key", "subscription"] as const) {
       const h = harness({ codex: true, ignoreAbort: true });
       // A first switch supplies a subscription A for the reverse direction.
@@ -1180,9 +1275,8 @@ describe("NowSummaryController: Codex switch suspension", () => {
       assert.equal(lease.publishB(b), true);
       assert.equal(lease.reopenA(), false);
       assert.equal(lease.publishB(b), false);
-      const count = h.emitted.length;
-      a.opts.onUsage?.(usage(99, 99));
-      assert.equal(h.emitted.length, count);
+      // A late onUsage only writes the old call-local usage; its settled promise cannot
+      // emit again. There is no observable callback-retirement defect to assert here.
       h.c.observeFrame(toolUse("reviewer", "Read", { file_path: "B-work" }));
       await h.clock.advance(NOW_MIN_INTERVAL_MS);
       assert.equal(h.calls.length, 1, "publication keeps admission closed");

@@ -45,6 +45,7 @@ import type { AdviceUsageSnapshot, HarnessEffort } from "./harness.js";
 import type { Logger } from "./log.js";
 import type { CodexAdviceHarnessFactory } from "./codex/codex-executor.js";
 import type { CodexSwitchBundle } from "./codex-switch-coordinator.js";
+import { ownedSummaryFactories } from "./codex/summary-ownership.js";
 import { selectCodexBinding } from "./codex/select.js"; // the pure, fail-closed claim-shape discriminator, NOT a Codex class construction
 import type { ReadOnlyModelPassOpts } from "./model-pass.js";
 import type { Milestone, MilestoneProgress } from "./protocol.js";
@@ -304,13 +305,14 @@ export class NowSummaryController {
   }
 
   /**
-   * Close admission synchronously, then bound one wait for the captured raw call.
+   * Only executor-owned factory composition makes model-pass completion join raw work.
+   * Close admission synchronously, then bound one wait for that captured call.
    * Failure leaves the gate closed permanently; only a verified drain can authorize
    * A again or publish B. Publication performs no provider work.
    */
   suspendCodexSwitch({ signal, remainingMs }: { signal: AbortSignal; remainingMs: number }): NowCodexSwitchLease {
     if (this.stopped || this.switchGate || !this.initialValidatedCodex || !this.authority ||
-        typeof this.authority.buildHarness !== "function") throw new Error("Now Codex switch unavailable");
+        typeof this.authority.buildHarness !== "function" || !ownedSummaryFactories.has(this.authority.buildHarness)) throw new Error("Now Codex switch unavailable");
     if (!Number.isFinite(remainingMs) || remainingMs < 0) throw new Error("Invalid Now drain duration");
     this.switchGate = true;
     if (this.timer !== undefined) {
