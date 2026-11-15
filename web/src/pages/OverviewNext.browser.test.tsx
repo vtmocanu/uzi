@@ -10,8 +10,8 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { OverviewNext } from "./OverviewNext";
 import { Dashboard } from "./Dashboard";
 import { AppShell } from "../components/AppShell";
-import { api, type AgentTemplate, type TemplateAllocation } from "../lib/api";
-import { healthySilentDoc, incidentDoc, overviewNextDoc } from "../mocks/data";
+import { api, type AgentTemplate } from "../lib/api";
+import { healthySilentDoc, incidentDoc, mockAgentSource, overviewNextDoc } from "../mocks/data";
 import { overviewNextOwnerWorkers } from "../mocks/data/overviewNext";
 import { aRun, aUser, aWorker, authValue, emptySelf } from "./overviewFixtures";
 import { useAuth } from "../auth/AuthContext";
@@ -47,6 +47,7 @@ vi.mock("../lib/api", async (importOriginal) => {
       version: vi.fn(),
       adminRepoActivity: vi.fn(),
       getTemplateAllocations: vi.fn(),
+      getAgentSource: vi.fn(),
     },
   };
 });
@@ -86,6 +87,7 @@ beforeEach(() => {
   mockApi.listRepos.mockResolvedValue({ repos: [{ enabled: true } as never] });
   mockApi.listAgentTemplates.mockResolvedValue({ templates: [] });
   mockApi.getTemplateAllocations.mockResolvedValue({ templates: [] });
+  mockApi.getAgentSource.mockResolvedValue({ agent_source: structuredClone(mockAgentSource) });
   mockApi.listSecrets.mockResolvedValue({ secrets: [{ kind: "anthropic_token" } as never] });
   mockApi.listConnections.mockResolvedValue({ connections: [{} as never] });
   mockApi.getUsage.mockResolvedValue(emptySelf());
@@ -2059,7 +2061,7 @@ describe("OverviewNext health chip popover", () => {
   });
 });
 
-// #4335: the Agents chip's popover, like the People and health popovers, opens below the chip
+// #4367: the configured Agents chip's popover, like the People and health popovers, opens below the chip
 // on desktop and as a bottom sheet on a phone, never pushes the page sideways, and Escape
 // returns focus to the chip.
 describe("OverviewNext Agents chip", () => {
@@ -2080,28 +2082,16 @@ describe("OverviewNext Agents chip", () => {
     updated_at: "2026-01-01T00:00:00Z",
   });
 
-  // 12 builtins (8 on), 1 global (on) and 1 of the viewer's own (off): 14 agents, 9 in runs.
+  // 12 builtins, 1 global and 1 of the viewer's own: 14 configured agents.
   const rows = [
     ...Array.from({ length: 12 }, (_, i) => tmpl(`b${i}`, `builtin-agent-${i}`, "builtin")),
     tmpl("g0", "global-agent", "global"),
     tmpl("m0", "my-agent", "user", aUser.id),
   ];
-  const allocations: TemplateAllocation[] = rows.map((t, i) => ({
-    id: t.id,
-    name: t.name,
-    description: "",
-    scope: t.scope,
-    is_builtin: t.is_builtin,
-    global_default: t.scope !== "user",
-    my_override: null,
-    effective: t.scope === "builtin" ? i < 8 : t.scope === "global",
-  }));
-
   for (const width of [1280, 400]) {
     it(`opens inside the viewport, closes on Escape and returns focus at ${width}px`, async () => {
       await page.viewport(width, 900);
       mockApi.listAgentTemplates.mockResolvedValue({ templates: rows });
-      mockApi.getTemplateAllocations.mockResolvedValue({ templates: allocations });
       render(
         <MemoryRouter initialEntries={["/dashboard"]}>
           <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
@@ -2109,16 +2099,17 @@ describe("OverviewNext Agents chip", () => {
           </main>
         </MemoryRouter>,
       );
-      const chip = await screen.findByRole("button", { name: "Agents: 9 in your runs of 14" });
+      const chip = await screen.findByRole("button", { name: "Agents: 14 configured, 4 changes to review" });
       await document.fonts.ready;
       expect(window.innerWidth).toBe(width);
       expect(chip.getBoundingClientRect().right, "chip inside the viewport").toBeLessThanOrEqual(window.innerWidth);
 
       await userEvent.click(chip);
-      const dialog = await screen.findByRole("dialog", { name: "Agents in your runs" });
+      const dialog = await screen.findByRole("dialog", { name: "Agents configured" });
       expect(dialog.checkVisibility()).toBe(true);
-      expect(within(dialog).getByRole("heading", { name: "9 of 14 agents ride your runs" })).toBeTruthy();
-      expect(within(dialog).getByText("Admin only")).toBeTruthy();
+      expect(within(dialog).getByRole("heading", { name: "14 agents configured" })).toBeTruthy();
+      expect(within(dialog).getByText("From your agent source")).toBeTruthy();
+      expect(within(dialog).getByRole("link", { name: "Review in Settings" })).toBeTruthy();
       const r = dialog.getBoundingClientRect();
       expect.soft(r.left, "dialog left").toBeGreaterThanOrEqual(0);
       expect.soft(r.right, "dialog right").toBeLessThanOrEqual(document.documentElement.clientWidth);
@@ -2132,7 +2123,7 @@ describe("OverviewNext Agents chip", () => {
       );
 
       await userEvent.keyboard("{Escape}");
-      expect(screen.queryByRole("dialog", { name: "Agents in your runs" })).toBeNull();
+      expect(screen.queryByRole("dialog", { name: "Agents configured" })).toBeNull();
       expect(document.activeElement).toBe(chip);
       expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(document.documentElement.clientWidth);
     });

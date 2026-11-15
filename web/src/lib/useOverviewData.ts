@@ -9,6 +9,7 @@ import {
   api,
   type AdminUsage,
   type AgentTemplate,
+  type AgentSourceView,
   type RecoveryCustodyHolds,
   type RepoActivity,
   type RunSummaryItem,
@@ -88,6 +89,7 @@ export function useOverviewData(opts?: {
   includeRecoveryHolds?: boolean;
   includeAdminUsers?: boolean;
   includeAdminRepoActivity?: boolean;
+  includeAdminAgentSource?: boolean;
 }) {
   const { user } = useAuth();
   const [data, setData] = useState<Overview | null>(null);
@@ -324,6 +326,28 @@ export function useOverviewData(opts?: {
     void loadRepoActivity();
   }, [repoActivityEnabled, loadRepoActivity]);
 
+  // The Overview Agents chip reads the admin agent-source status once, independent of the
+  // core load and polls. A missing admin read affects only its optional sync details.
+  // The ref keeps StrictMode's effect replay to one request per viewer mount.
+  const agentSourceEnabled = opts?.includeAdminAgentSource === true && user?.is_admin === true;
+  const [adminAgentSource, setAdminAgentSource] = useState<AgentSourceView | null>(null);
+  const agentSourceRequestRef = useRef<Promise<AgentSourceView | null> | null>(null);
+  useEffect(() => {
+    if (!agentSourceEnabled) {
+      agentSourceRequestRef.current = null;
+      setAdminAgentSource(null);
+      return;
+    }
+    agentSourceRequestRef.current ??= Promise.resolve()
+      .then(() => api.getAgentSource())
+      .then((result) => result.agent_source, () => null);
+    let cancelled = false;
+    void agentSourceRequestRef.current.then((view) => {
+      if (!cancelled) setAdminAgentSource(view);
+    });
+    return () => { cancelled = true; };
+  }, [agentSourceEnabled]);
+
   const poll = useCallback(async () => {
     try {
       const [{ runs }, { workers }] = await Promise.all([api.listRuns({ view: "summary" }), api.listWorkers()]);
@@ -367,6 +391,7 @@ export function useOverviewData(opts?: {
     adminRuns,
     adminUsers,
     adminRepoActivity,
+    adminAgentSource,
     holds,
     holdsFailed: holdsRequestFailed && holds === null,
   };

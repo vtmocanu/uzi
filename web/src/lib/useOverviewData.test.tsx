@@ -1,11 +1,13 @@
 // @vitest-environment jsdom
 // PRD #3878: the admin run list's loading rules inside the shared Overview data hook.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { StrictMode } from "react";
 import { act, cleanup, renderHook } from "@testing-library/react";
 import { api, type RecoveryCustodyHolds, type RunSummaryItem } from "./api";
 import { useAuth } from "../auth/AuthContext";
 import { useOverviewData } from "./useOverviewData";
 import { aRun, aUser, authValue, emptySelf } from "../pages/overviewFixtures";
+import { mockAgentSource } from "../mocks/data";
 
 vi.mock("./api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./api")>();
@@ -24,6 +26,7 @@ vi.mock("./api", async (importOriginal) => {
       getRecoveryHolds: vi.fn(),
       listUsers: vi.fn(),
       adminRepoActivity: vi.fn(),
+      getAgentSource: vi.fn(),
     },
   };
 });
@@ -49,6 +52,7 @@ beforeEach(() => {
   mockApi.getRecoveryHolds.mockResolvedValue(holdsWith(1));
   mockApi.listUsers.mockResolvedValue({ users: [] });
   mockApi.adminRepoActivity.mockResolvedValue({ repos: [] });
+  mockApi.getAgentSource.mockResolvedValue({ agent_source: structuredClone(mockAgentSource) });
 });
 
 afterEach(() => {
@@ -394,6 +398,36 @@ describe("useOverviewData admin repo activity", () => {
     await settle();
     expect(mockApi.adminRepoActivity).toHaveBeenCalledTimes(2);
     expect(result.current.adminRepoActivity.repos).toEqual([row("a")]);
+  });
+});
+
+describe("useOverviewData admin agent source", () => {
+  it("reads once under StrictMode, independently of both polls", async () => {
+    const { result } = renderHook(() => useOverviewData({ includeAdminAgentSource: true }), { wrapper: StrictMode });
+    await settle();
+    expect(mockApi.getAgentSource).toHaveBeenCalledTimes(1);
+    expect(result.current.adminAgentSource?.config.enabled).toBe(true);
+    await settle(65_000);
+    expect(mockApi.getAgentSource).toHaveBeenCalledTimes(1);
+  });
+
+  it("never calls the admin read on the classic page or for a non-admin", async () => {
+    renderHook(() => useOverviewData());
+    await settle();
+    expect(mockApi.getAgentSource).not.toHaveBeenCalled();
+    vi.mocked(useAuth).mockReturnValue(authValue(aUser));
+    const { result } = renderHook(() => useOverviewData({ includeAdminAgentSource: true }));
+    await settle();
+    expect(mockApi.getAgentSource).not.toHaveBeenCalled();
+    expect(result.current.adminAgentSource).toBeNull();
+  });
+
+  it("fails without blanking the core Overview data", async () => {
+    mockApi.getAgentSource.mockRejectedValue(new Error("down"));
+    const { result } = renderHook(() => useOverviewData({ includeAdminAgentSource: true }));
+    await settle();
+    expect(result.current.adminAgentSource).toBeNull();
+    expect(result.current.data).not.toBeNull();
   });
 });
 

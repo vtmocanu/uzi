@@ -7,9 +7,9 @@ import { MemoryRouter } from "react-router-dom";
 import { OverviewNext } from "./OverviewNext";
 import { CommandMenuContext } from "../components/CommandMenuContext";
 import { Dashboard } from "./Dashboard";
-import { api, type AgentTemplate, type TemplateAllocation } from "../lib/api";
+import { api, type AgentTemplate } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
-import { healthySilentDoc, overviewNextDoc } from "../mocks/data";
+import { healthySilentDoc, mockAgentSource, overviewNextDoc } from "../mocks/data";
 import { aRun, aUser, aWorker, authValue, emptySelf } from "./overviewFixtures";
 
 vi.mock("../lib/api", async (importOriginal) => {
@@ -31,6 +31,7 @@ vi.mock("../lib/api", async (importOriginal) => {
       listUsers: vi.fn(),
       adminRepoActivity: vi.fn(),
       getTemplateAllocations: vi.fn(),
+      getAgentSource: vi.fn(),
     },
   };
 });
@@ -40,7 +41,7 @@ const mockApi = vi.mocked(api);
 const admin = { ...aUser, is_admin: true };
 
 // Every endpoint a non-admin must never reach.
-const adminEndpoints = () => [mockApi.adminListRuns, mockApi.getAdminUsage, mockApi.getAdminHealth, mockApi.listUsers, mockApi.adminRepoActivity];
+const adminEndpoints = () => [mockApi.adminListRuns, mockApi.getAdminUsage, mockApi.getAdminHealth, mockApi.listUsers, mockApi.adminRepoActivity, mockApi.getAgentSource];
 
 beforeEach(() => {
   vi.useFakeTimers();
@@ -52,6 +53,7 @@ beforeEach(() => {
   mockApi.listRepos.mockResolvedValue({ repos: [] });
   mockApi.listAgentTemplates.mockResolvedValue({ templates: [] });
   mockApi.getTemplateAllocations.mockResolvedValue({ templates: [] });
+  mockApi.getAgentSource.mockResolvedValue({ agent_source: structuredClone(mockAgentSource) });
   mockApi.listSecrets.mockResolvedValue({ secrets: [] });
   mockApi.listConnections.mockResolvedValue({ connections: [] });
   mockApi.getUsage.mockResolvedValue(emptySelf());
@@ -1119,7 +1121,7 @@ describe("OverviewNext Search button", () => {
   });
 });
 
-// #4335: the Agents chip sits after the People and Repos chips and before Search, for every user.
+// #4367: the configured Agents chip sits after People and Repos and before Search.
 describe("OverviewNext Agents chip", () => {
   const tmpl = (id: string, name: string, scope: AgentTemplate["scope"], userId: string | null = null): AgentTemplate => ({
     id,
@@ -1137,18 +1139,7 @@ describe("OverviewNext Agents chip", () => {
     created_at: "2026-01-01T00:00:00Z",
     updated_at: "2026-01-01T00:00:00Z",
   });
-  const alloc = (t: AgentTemplate, effective: boolean, globalDefault = t.scope !== "user"): TemplateAllocation => ({
-    id: t.id,
-    name: t.name,
-    description: "",
-    scope: t.scope,
-    is_builtin: t.is_builtin,
-    global_default: globalDefault,
-    my_override: null,
-    effective,
-  });
-
-  // Three builtins (two on), one global (on), the viewer's own (on) and another user's (dropped).
+  // Three builtins, one global, the viewer's own, and another user's private row.
   const rows = [
     tmpl("b1", "coder", "builtin"),
     tmpl("b2", "tester", "builtin"),
@@ -1156,14 +1147,6 @@ describe("OverviewNext Agents chip", () => {
     tmpl("g1", "release", "global"),
     tmpl("m1", "mine", "user", aUser.id),
     tmpl("o1", "theirs", "user", "someone-else"),
-  ];
-  const allocations = [
-    alloc(rows[0], true),
-    alloc(rows[1], true),
-    alloc(rows[2], false),
-    alloc(rows[3], true),
-    alloc(rows[4], true),
-    alloc(rows[5], true),
   ];
   const agentsChip = () => screen.getByRole("button", { name: /^Agents:/ });
   const before = (a: Element, b: Element) => (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
@@ -1201,65 +1184,74 @@ describe("OverviewNext Agents chip", () => {
     expect(before(agentsChip(), screen.getByRole("button", { name: /^Search/ }))).toBe(true);
   });
 
-  it("counts from the core templates read joined with the allocations", async () => {
+  it("counts the core templates directly, even when allocations are missing", async () => {
     mockApi.listAgentTemplates.mockResolvedValue({ templates: rows });
-    mockApi.getTemplateAllocations.mockResolvedValue({ templates: allocations });
+    mockApi.getTemplateAllocations.mockRejectedValue(new Error("allocations down"));
     mountWithMenu();
     await settle();
-    expect(agentsChip().getAttribute("aria-label")).toBe("Agents: 4 in your runs of 5");
+    expect(agentsChip().getAttribute("aria-label")).toBe("Agents: 5 configured");
+    expect(mockApi.getTemplateAllocations).not.toHaveBeenCalled();
     fireEvent.click(agentsChip());
-    const dialog = screen.getByRole("dialog", { name: "Agents in your runs" });
-    expect(within(dialog).getByRole("heading", { name: "4 of 5 agents ride your runs" })).toBeTruthy();
-    expect(within(dialog).queryByText("Admin only")).toBeNull();
+    const dialog = screen.getByRole("dialog", { name: "Agents configured" });
+    expect(within(dialog).getByRole("heading", { name: "5 agents configured" })).toBeTruthy();
+    expect(within(dialog).getByText("mine")).toBeTruthy();
+    expect(within(dialog).queryByText("theirs")).toBeNull();
+    expect(within(dialog).queryByText("Agent source")).toBeNull();
   });
 
-  it("shows the admin-only global defaults count for an admin", async () => {
+  it("shows the admin-only source status and review action", async () => {
     vi.mocked(useAuth).mockReturnValue(authValue(admin));
     mockApi.listAgentTemplates.mockResolvedValue({ templates: rows });
-    mockApi.getTemplateAllocations.mockResolvedValue({ templates: allocations });
     mountWithMenu();
     await settle();
+    expect(mockApi.getAgentSource).toHaveBeenCalledTimes(1);
+    expect(agentsChip().getAttribute("aria-label")).toBe("Agents: 5 configured, 4 changes to review");
     fireEvent.click(agentsChip());
-    // builtin x3 and global x1 are defaults; the viewer's own row is not.
-    expect(screen.getByText("Global defaults for new users").nextElementSibling?.textContent).toBe("4");
+    expect(screen.getByText("From your agent source")).toBeTruthy();
+    expect(screen.getByRole("link", { name: "Review in Settings" }).getAttribute("href")).toBe("/admin/settings#agent-source");
   });
 
-  it("hides only the chip when the allocations read fails", async () => {
-    mockApi.getTemplateAllocations.mockRejectedValue(new Error("down"));
+  it("keeps the count when the admin source read fails", async () => {
+    vi.mocked(useAuth).mockReturnValue(authValue(admin));
+    mockApi.listAgentTemplates.mockResolvedValue({ templates: rows });
+    mockApi.getAgentSource.mockRejectedValue(new Error("down"));
     mountWithMenu();
     await settle();
     await settle(10_000);
-    expect(mockApi.getTemplateAllocations).toHaveBeenCalledTimes(1);
-    expect(screen.queryByRole("button", { name: /^Agents:/ })).toBeNull();
+    expect(mockApi.getAgentSource).toHaveBeenCalledTimes(1);
+    expect(agentsChip().getAttribute("aria-label")).toBe("Agents: 5 configured");
     expect(screen.getByRole("heading", { name: "Welcome, Admin" })).toBeTruthy();
     expect(screen.getByRole("button", { name: /^Search/ })).toBeTruthy();
     expect(screen.getByText("Live run row")).toBeTruthy();
   });
 
-  it("hides only the chip when the allocations call throws synchronously", async () => {
-    mockApi.getTemplateAllocations.mockImplementation(() => {
+  it("keeps the count when the admin source call throws synchronously", async () => {
+    vi.mocked(useAuth).mockReturnValue(authValue(admin));
+    mockApi.listAgentTemplates.mockResolvedValue({ templates: rows });
+    mockApi.getAgentSource.mockImplementation(() => {
       throw new Error("x");
     });
     mountWithMenu();
     await settle();
-    expect(screen.queryByRole("button", { name: /^Agents:/ })).toBeNull();
+    expect(agentsChip().getAttribute("aria-label")).toBe("Agents: 5 configured");
     expect(screen.getByRole("heading", { name: "Welcome, Admin" })).toBeTruthy();
     expect(screen.getByRole("button", { name: /^Search/ })).toBeTruthy();
     expect(screen.getByText("Live run row")).toBeTruthy();
   });
 
-  it("reads the allocations once under StrictMode and never again while the page polls", async () => {
+  it("reads agent source once for admins under StrictMode and never again while the page polls", async () => {
+    vi.mocked(useAuth).mockReturnValue(authValue(admin));
     mockApi.listAgentTemplates.mockResolvedValue({ templates: rows });
-    mockApi.getTemplateAllocations.mockResolvedValue({ templates: allocations });
     mountWithMenu(true);
     await settle();
-    expect(mockApi.getTemplateAllocations).toHaveBeenCalledTimes(1);
+    expect(mockApi.getAgentSource).toHaveBeenCalledTimes(1);
+    expect(mockApi.getTemplateAllocations).not.toHaveBeenCalled();
     expect(agentsChip()).toBeTruthy();
     const runsBefore = mockApi.listRuns.mock.calls.length;
     await settle(10_000);
     await settle(30_000);
     expect(mockApi.listRuns.mock.calls.length).toBeGreaterThan(runsBefore);
-    expect(mockApi.getTemplateAllocations).toHaveBeenCalledTimes(1);
+    expect(mockApi.getAgentSource).toHaveBeenCalledTimes(1);
   });
 
   it("re-reads every viewer-scoped list for a different signed-in viewer of the same role, never joining the previous viewer's data", async () => {
@@ -1271,17 +1263,16 @@ describe("OverviewNext Agents chip", () => {
     const aTemplates = [...shared, rows[4]];
     const bTemplates = [...shared, bOwn];
     mockApi.listAgentTemplates.mockResolvedValue({ templates: aTemplates });
-    mockApi.getTemplateAllocations.mockResolvedValue({ templates: aTemplates.map((t) => alloc(t, true)) });
     const view = mountWithMenu();
     await settle();
-    expect(agentsChip().getAttribute("aria-label")).toBe("Agents: 5 in your runs of 5");
+    expect(agentsChip().getAttribute("aria-label")).toBe("Agents: 5 configured");
+    fireEvent.click(agentsChip());
+    expect(screen.getByText("mine")).toBeTruthy();
+    fireEvent.click(agentsChip());
 
     // The session switches to B without a signed-out render in between (AuthContext.applySession).
     let releaseB: (v: { templates: AgentTemplate[] }) => void = () => {};
     mockApi.listAgentTemplates.mockReturnValue(new Promise((r) => (releaseB = r)));
-    mockApi.getTemplateAllocations.mockResolvedValue({
-      templates: bTemplates.map((t) => alloc(t, t.id === "bown")),
-    });
     vi.mocked(useAuth).mockReturnValue(authValue(userB));
     view.rerender(
       <MemoryRouter>
@@ -1291,11 +1282,14 @@ describe("OverviewNext Agents chip", () => {
       </MemoryRouter>,
     );
     await settle();
-    // B's templates have not arrived: no chip, and never A's "5 in your runs".
+    // B's templates have not arrived: no chip, and never A's private name.
     expect(screen.queryByRole("button", { name: /^Agents:/ })).toBeNull();
     releaseB({ templates: bTemplates });
     await settle();
-    expect(agentsChip().getAttribute("aria-label")).toBe("Agents: 1 in your runs of 5");
-    expect(mockApi.getTemplateAllocations).toHaveBeenCalledTimes(2);
+    expect(agentsChip().getAttribute("aria-label")).toBe("Agents: 5 configured");
+    fireEvent.click(agentsChip());
+    expect(screen.getByText("b-own")).toBeTruthy();
+    expect(screen.queryByText("mine")).toBeNull();
+    expect(mockApi.getTemplateAllocations).not.toHaveBeenCalled();
   });
 });

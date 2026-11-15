@@ -199,6 +199,7 @@ Build from what exists; do not re-implement these. The original anchors were che
 - **D24** The new Overview lives at `/overview/next`, linked both ways with the current Overview, until #3877. #3877 M1 moves it to `/dashboard` and the old page to `/overview/classic` (linked both ways) until M2 retires the old page.
 - **D25** The compact header removes the status sentence; the all-kind run totals move to the Runs card, and an empty decisions card becomes a polite calm notice only after successful runs and holds reads (#4366, maintainer call 2026-11-15).
 - **D26** At xl widths the compact header's single chip row pins to the content column after the title scrolls away; below xl it scrolls away with the title. One row stays in the DOM, the banner stack stays after the header, and focused controls remain clear of the pinned bar (#4370, maintainer call 2026-11-15).
+- **D27** The Agents header chip shows configured templates by origin and scope, with admin-only agent-source sync status. Its count comes from the core template read, independent of allocations; the Agents page keeps its allocation summary (#4367, maintainer call 2026-11-15).
 
 ## Open decisions
 
