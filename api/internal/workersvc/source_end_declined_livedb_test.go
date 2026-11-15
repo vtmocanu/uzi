@@ -164,7 +164,19 @@ func TestSourceEndDeclinedRefusalsLiveDB(t *testing.T) {
 func TestSourceEndDeclinedConcurrentDuplicateLiveDB(t *testing.T) {
 	e, svc, w, id := sourceEndFixture(t, "running")
 	before := sourceEndRead(t, e, id)
-	openBefore, totalBefore := e.countHolds(t, id)
+	snapshotHolds := func() string {
+		t.Helper()
+		var holds string
+		if err := e.pool.QueryRow(e.ctx,
+			`SELECT COALESCE(jsonb_agg(to_jsonb(h) ORDER BY h.id)::text, '[]') FROM recovery_custody_holds h WHERE h.run_id = $1`, id).Scan(&holds); err != nil {
+			t.Fatalf("snapshot custody holds: %v", err)
+		}
+		return holds
+	}
+	holdsBefore := snapshotHolds()
+	if holdsBefore == "[]" {
+		t.Fatal("precondition: run has no custody holds")
+	}
 	start := make(chan struct{})
 	type outcome struct {
 		applied bool
@@ -197,8 +209,8 @@ func TestSourceEndDeclinedConcurrentDuplicateLiveDB(t *testing.T) {
 		r.ClaimGeneration != before.ClaimGeneration || r.WorkerID != before.WorkerID {
 		t.Fatalf("duplicate applications=%d row=%+v", count, r)
 	}
-	if open, total := e.countHolds(t, id); open != openBefore || total != totalBefore {
-		t.Fatalf("concurrent duplicate changed custody: open %d->%d total %d->%d", openBefore, open, totalBefore, total)
+	if holdsAfter := snapshotHolds(); holdsAfter != holdsBefore {
+		t.Fatal("concurrent duplicate changed custody rows")
 	}
 }
 
