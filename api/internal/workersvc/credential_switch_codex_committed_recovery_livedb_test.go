@@ -14,7 +14,8 @@ func TestCodexCommittedSwitchFreshClaimLiveDB(t *testing.T) {
 	x := newOutageCodexFlight(t, codexAuthModeAPIKey)
 	id := x.f.runID
 	x.env.exec("UPDATE workers SET protocol_capabilities=array_append(protocol_capabilities,$2), credential_switch_apply_nonce=snapshot_register_nonce WHERE id=$1", x.f.workerID, capability.CodexCredentialSwitchV1)
-	x.env.exec("UPDATE runs SET status='running' WHERE id=$1", id)
+	const savedSessionID = "12345678-1234-1234-1234-123456789abc"
+	x.env.exec("UPDATE runs SET status='running', session_id=$2 WHERE id=$1", id, savedSessionID)
 	target := x.env.seedStaticAPIKey(t, x.f.userID, "committed-target", "committed-target-key")
 	if _, err := x.f.svc.SetRunCredential(x.env.ctx, x.f.userID, id, BindModePinned, &target); err != nil {
 		t.Fatal(err)
@@ -35,6 +36,12 @@ func TestCodexCommittedSwitchFreshClaimLiveDB(t *testing.T) {
 		t.Fatal("fresh recovery claim failed", err)
 	}
 	after := mustRun(t, x.env, id)
+	// Recovery projects the reported thread independently of the committed binding.
+	// This does not assert the worker's local rollout still exists or B accepts it.
+	if fresh.SessionID == nil || *fresh.SessionID != savedSessionID ||
+		!after.SessionID.Valid || after.SessionID.String != savedSessionID {
+		t.Fatal("committed B recovery lost the persisted conversation candidate")
+	}
 	if fresh.Secrets.Codex.AccessToken != "committed-target-key" ||
 		fresh.Secrets.Codex.Capability == applied.Codex.Capability ||
 		after.CodexSecretID != committed.CodexSecretID ||

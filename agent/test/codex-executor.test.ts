@@ -32287,14 +32287,18 @@ describe("M2 actualRunner credential replacement", () => {
   for (const [oldClaim, target] of [[SUBSCRIPTION, API_KEY], [API_KEY, SUBSCRIPTION],
     [SUBSCRIPTION, { ...SUBSCRIPTION, generation: 20, chatgpt_account_id: "M2-B-account" }]] as const) {
     for (const phase of ["factory", "already-running-body"] as const) {
-      for (const publication of ["baseline", "gated", "publish-failure", "now-publish-failure", "login-failure", "subscription-refresh", "api-key-refresh"] as const) {
+      for (const publication of ["baseline", "gated", "publish-failure", "now-publish-failure", "login-failure", "subscription-refresh", "api-key-refresh", "subscription-refresh-prepare-failure", "subscription-refresh-cancel"] as const) {
         if (publication !== "baseline" && (phase !== "factory" || (oldClaim !== API_KEY && target !== API_KEY))) continue;
         if (publication === "subscription-refresh" && target.auth_mode !== "subscription") continue;
         if (publication === "api-key-refresh" && target.auth_mode !== "api_key") continue;
+        const queuedRefreshStop = publication === "subscription-refresh-prepare-failure" || publication === "subscription-refresh-cancel";
+        if (queuedRefreshStop && (oldClaim !== API_KEY || target !== SUBSCRIPTION || phase !== "factory")) continue;
       it(publication === "baseline"
         ? `M2 actualRunner ${oldClaim.auth_mode} to ${target.auth_mode} ${phase} account resumes saved thread`
         : publication === "gated" ? `Codex ${oldClaim.auth_mode} to ${target.auth_mode} publication gates Now and retired A consumers`
         : publication === "subscription-refresh" ? "Codex subscription startup refresh stays deferred until B finish"
+        : publication === "subscription-refresh-prepare-failure" ? "Codex queued subscription refresh settles on B preparation failure"
+        : publication === "subscription-refresh-cancel" ? "Codex queued subscription refresh settles on cancellation after B preparation"
         : publication === "api-key-refresh" ? "Codex API-key B refuses subscription refresh and retains the workspace"
         : `Codex ${oldClaim.auth_mode} to ${target.auth_mode} partial B publication never reopens A (${publication})`, async () => {
         const { api, client } = m2Runner;
@@ -32307,7 +32311,7 @@ describe("M2 actualRunner credential replacement", () => {
         claim.secrets = { ...claim.secrets, codex: oldClaim as import("../src/protocol.js").ClaimCodexSecrets };
         api.setOwnershipStatus(claim.run_id, "running", 7);
         let pending = false, cancelled = false, applies = 0, hooks = 0, factories = 0, preflights = 0;
-        let context: RunContext;
+        let context!: RunContext;
         let clockOffset = 0;
         const nowEntered = installerBarrier(), nowAborted = installerBarrier(), nowContinue = installerBarrier();
         const summaryDisposeEntered = installerBarrier(), summaryDisposeContinue = installerBarrier();
@@ -32322,9 +32326,12 @@ describe("M2 actualRunner credential replacement", () => {
           context.emit({ kind: "tool_use", agent: "lead", payload: { id, name: "Bash", input: { command: "true", description: `Inspect ${id}` } } });
         };
         const reports: string[] = [];
+        const dispositions: { status: string; failure_reason?: string }[] = [];
         const report = client.reportState.bind(client);
         client.reportState = async (id, body, ...args) => {
-          reports.push(body.status); return report(id, body, ...args);
+          reports.push(body.status);
+          dispositions.push({ status: body.status, failure_reason: body.failure_reason });
+          return report(id, body, ...args);
         };
         client.registrationNonce = () => "M2-original-nonce";
         client.supportsInPlaceCodexCredentialSwitch = () => true;
@@ -32360,7 +32367,8 @@ describe("M2 actualRunner credential replacement", () => {
           barrier.entered.resolve();
           await barrier.proceed.promise;
           if ((publication === "publish-failure" && stage === "after-publish") ||
-              (publication === "login-failure" && stage === "login"))
+              (publication === "login-failure" && stage === "login") ||
+              (publication === "subscription-refresh-prepare-failure" && stage === "prepared"))
             throw new Error(`injected ${stage} failure`);
         };
         const cleanupEntered = installerBarrier(), cleanupContinue = installerBarrier();
@@ -32442,7 +32450,12 @@ describe("M2 actualRunner credential replacement", () => {
         let ordinaryBRefreshes = 0, refreshDeliveries = 0, bFinished = false;
         const refreshDelivered = installerBarrier(), refreshResponded = installerBarrier();
         const respond = b.transport.respond.bind(b.transport);
+        const refreshRefusals: Parameters<FakeTransport["respond"]>[1][] = [];
         b.transport.respond = (id, response) => {
+          if (id === 91 && queuedRefreshStop) {
+            refreshRefusals.push(response);
+            refreshResponded.resolve();
+          }
           respond(id, response);
           if (id === 91) refreshResponded.resolve();
         };
@@ -32657,7 +32670,7 @@ describe("M2 actualRunner credential replacement", () => {
                   "spawn_agent", { role: "coder", prompt: "work" }, "root");
                 assert.equal(child.ok, false, "retired real broker denies child work");
                 consumerProbes.push(barrier.stage);
-                if ((publication === "subscription-refresh" || publication === "api-key-refresh") && barrier.stage === "login") {
+                if ((publication === "subscription-refresh" || publication === "api-key-refresh" || queuedRefreshStop) && barrier.stage === "login") {
                   // push() only feeds notifications; startup auth requests use the read-path interceptor.
                   b.transport.deliverServerRequest({ kind: "activity", method: "account/chatgptAuthTokens/refresh", requestId: 91,
                     params: { reason: "unauthorized", previousAccountId: null } });
@@ -32665,9 +32678,25 @@ describe("M2 actualRunner credential replacement", () => {
                   refreshDelivered.resolve();
                   await withTimeout(refreshDelivered.promise, 5000, "B auth interceptor delivery");
                   assert.equal(refreshDeliveries, 1);
-                  if (publication === "subscription-refresh")
+                  if (publication === "subscription-refresh" || queuedRefreshStop)
                     assert.equal(b.transport.responses.some(response => response.requestId === 91), false,
                       "auth owner defers refresh while login is held");
+                }
+                if (queuedRefreshStop && barrier.stage === "prepared") {
+                  assert.equal(refreshDeliveries, 1);
+                  assert.equal(b.transport.responses.some(response => response.requestId === 91), false,
+                    "queued refresh remains unsettled until preparation failure or cancellation teardown");
+                  assert.equal(ordinaryBRefreshes, 0);
+                }
+                if (publication === "subscription-refresh-cancel" && barrier.stage === "prepared") {
+                  assert.ok(context.terminalLifecycleSignal);
+                  const signal: AbortSignal = context.terminalLifecycleSignal;
+                  const stopped = installerBarrier();
+                  signal.addEventListener("abort", () => stopped.resolve(), { once: true });
+                  cancelled = true;
+                  if (signal.aborted) stopped.resolve();
+                  await withTimeout(stopped.promise, 5000, "Runner observes terminal cancellation while B preparation is held");
+                  assert.equal(signal.aborted, true);
                 }
                 if (publication === "api-key-refresh" && barrier.stage === "login") {
                   await withTimeout(refreshResponded.promise, 3000, "API-key refresh refusal");
@@ -32691,6 +32720,7 @@ describe("M2 actualRunner credential replacement", () => {
               } finally { barrier.proceed.resolve(); }
               if ((publication === "publish-failure" && barrier.stage === "after-publish") ||
                   ((publication === "login-failure" || publication === "api-key-refresh") && barrier.stage === "login") ||
+                  (queuedRefreshStop && barrier.stage === "prepared") ||
                   (publication === "now-publish-failure" && barrier.stage === "after-publish")) break;
             }
             assert.equal(consumerProbes.length, publication === "publish-failure" || publication === "now-publish-failure" ? 2 : (publication === "login-failure" || publication === "api-key-refresh") ? 4 : 5);
@@ -32700,11 +32730,35 @@ describe("M2 actualRunner credential replacement", () => {
               assert.equal(applies, 1, "B was acknowledged before the injected initialization failure");
               assert.equal(b.transport.turnStartCount, 0);
               assert.equal(ordinaryBRefreshes, 0);
+              if (queuedRefreshStop) {
+                await withTimeout(refreshResponded.promise, 5000, "queued subscription refresh refuses on B teardown");
+                // A closed transport cannot deliver a reply. The attempted refusal
+                // and joined Runner completion prove the auth task settled anyway.
+                assert.equal(refreshDeliveries, 1);
+                assert.equal(refreshRefusals.length, 1, "queued refresh refuses exactly once");
+                assert.deepEqual(refreshRefusals[0], { error: {
+                  code: -32001, message: "codex authentication refresh unavailable",
+                } }, "teardown refuses rather than releases credentials");
+                assert.equal(bFinished, false);
+                assert.equal(ordinaryBRefreshes, 0, "teardown never calls the refresh bridge");
+              }
               if (publication === "now-publish-failure") {
                 assert.deepEqual(nowPublicationProbes, ["before-Now-publish", "after-Now-publish"]);
                 assert.equal(loginObservations.length, 0, "Now refusal prevents B preparation");
               }
-              assert.ok(reports.some(status => status.startsWith("credential_switch")), "Runner reports owner hold");
+              if (publication === "subscription-refresh-cancel") {
+                // getInputs has already reported a committed terminal cancellation.
+                // Cleanup must not publish success or a replacement owner hold.
+                assert.equal(context.terminalLifecycleSignal?.aborted, true);
+                assert.ok(!reports.includes("completed") && !reports.some(status => status.startsWith("credential_switch")));
+              } else {
+                assert.ok(reports.some(status => status.startsWith("credential_switch")), "Runner reports owner hold");
+                if (publication === "subscription-refresh-prepare-failure") {
+                  assert.ok(dispositions.some(body => body.status === "credential_switch_uncertain" && body.failure_reason === "initialization_failed"),
+                    "acknowledged B preparation failure requires owner action");
+                  assert.ok(!reports.includes("failed") && !reports.includes("completed"));
+                }
+              }
               assert.equal(await fs.readFile(path.join(worktree, "M2-retained.txt"), "utf8"), "A work");
               assert.equal(await CodexSessionStore.inspectSession(store, savedId), "present");
               return;
