@@ -62,7 +62,7 @@ It surfaces six ways:
 - **One notice per admin per Danger episode**, as a Slack DM for a linked
   admin, selects checks with server-supplied `scope: instance` and severity
   `danger`. The current instance checks are `db`, `db.size`, `controller.report`,
-  `loops`, `fleet.roll`, `fleet.hibernation_wake`, `fleet.hibernation_cleanup`, `maintenance.active`,
+  `loops`, `fleet.roll`, `fleet.hibernation_wake`, `fleet.hibernation_cleanup`, `fleet.hibernation`, `maintenance.active`,
   `agentsource.update` and `pricing.codex`; the rest are `owner`. `fleet.roll` remains instance infrastructure even when the hosted
   workers belong to a single owner.
 
@@ -202,6 +202,7 @@ except `forge.sync`, whose windows follow the effective forge poll interval.
 | `fleet.memory_authority` | Whether any worker has lost [memory authority](worker-setup.md#lost-memory-authority) (the api withholds guard-bound runs from it until its container restarts) | any worker with a fresh heartbeat has a gated claim recorded; the evidence names at most 10 workers (the summary carries the full count), each with how long ago it was first gated | — | — |
 | `fleet.hibernation_wake` | Whether a [hibernated worker's wake](hosted-workers.md#hibernation) failed or is not confirmed (scope `instance`) | a wake failed, or is not confirmed within 15 minutes; the evidence names at most 10 workers (the first evidence row, `Workers`, carries the full count) | — | `na` when no hosted workers are configured |
 | `fleet.hibernation_cleanup` | Whether a [hibernating worker's cache cleanup](hosted-workers.md#cache-cleanup-before-sleep) has an unknown settlement, which keeps the worker's claims fenced (scope `instance`) | — | any attempt's settlement is unknown; it stays until the same attempt reports or the controller observes its pod stopped, and blocks the worker's delete | `na` when no hosted workers are configured |
+| `fleet.hibernation` | Whether [automatic hibernation](hosted-workers.md#automatic-hibernation) is stuck on an idle worker or a long-parked run (title "Automatic hibernation", scope `instance`) | an exact "Workers" count, then up to 50 lines such as `worker <name> idle 20d, hibernation blocked: recovery custody hold` or `worker <name> blocked: assigned run parked (<run id prefix>, paused)`, and a "More" line past 50 | an idle persistent hosted worker past `worker_hibernation_idle_after` has a recorded hibernation refusal (custody hold, manual cordon, maintenance, image roll, draining, a queued run waking it, controller not advertising hibernation, no pod identity, controller refused), or a worker's only assigned runs are parked (`recovery_wait`, `paused`, `limit_wait`) for longer than the threshold; it clears once the blocker is gone and the worker hibernates | `na` when no hosted workers are configured or automatic hibernation is off (`worker_hibernation_enabled` and `worker_hibernation_auto` must both be on); `unknown` when the settings or the query cannot be read |
 
 `fleet.quarantine` reads the worker's own heartbeat report, which the api keeps in
 memory only. A worker without a fresh heartbeat is skipped (`fleet.capacity`

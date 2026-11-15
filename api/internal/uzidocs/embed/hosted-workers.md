@@ -237,9 +237,12 @@ admission checks as a manual hibernation (see the refusal list above) and the sa
 locked worker row, so a run assigned or finished in the meantime wins.
 
 **Refusals.** A worker the pass could not admit is recorded with a reason and moves
-to the back of the queue, so blocked workers do not starve clean ones. When the
-controller refuses before scaling down, the worker is not tried again for at least
-1 hour.
+to the back of the queue for an hour (`HibernationAutoRefusalCooldown`; the order
+puts workers refused in the last hour after the rest), so blocked workers do not
+starve clean ones. When the controller refuses before scaling down, the worker is
+not tried again for at least 1 hour. Admin health's `fleet.hibernation` check names
+idle workers that are blocked this way and runs that have been parked past the
+threshold; see [Admin health](./admin-health.md).
 
 **Waking.** Every completed wake restarts the idle clock: a manual wake, a demand
 wake, turning the setting off, or a withdrawn hibernation. A woken worker gets a full
