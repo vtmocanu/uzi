@@ -32342,13 +32342,14 @@ describe("M2 actualRunner credential replacement", () => {
   for (const [oldClaim, target] of [[SUBSCRIPTION, API_KEY], [API_KEY, SUBSCRIPTION],
     [SUBSCRIPTION, { ...SUBSCRIPTION, generation: 20, chatgpt_account_id: "M2-B-account" }]] as const) {
     for (const phase of ["factory", "already-running-body"] as const) {
-      for (const publication of ["baseline", "preflight-target-mismatch", "preflight-foreign-op", "persist-clear-confirmed", "persist-clear-rejected", "persist-clear-lost-reply", "persist-clear-empty-reply", "persist-clear-pending", "inspect-missing-clear-confirmed", "inspect-unknown-clear-confirmed", "gated", "before-scope-clear", "after-scope-clear", "before-scope-install", "after-scope-install", "before-executor-publication", "before-Now-publication", "after-Now-publication", "before-B-preparation", "Now-finish-false", "publish-failure", "now-publish-failure", "login-failure", "subscription-refresh", "api-key-refresh", "subscription-refresh-prepare-failure", "subscription-refresh-cancel", "crash-after-a-teardown-recovery", "crash-apply-reply-lost-recovery", "crash-apply-ack-recovery", "crash-login-recovery"] as const) {
+      for (const publication of ["baseline", "preflight-target-mismatch", "preflight-foreign-op", "preflight-busy-ready", "preflight-transport-ready", "persist-clear-confirmed", "persist-clear-rejected", "persist-clear-lost-reply", "persist-clear-empty-reply", "persist-clear-pending", "inspect-missing-clear-confirmed", "inspect-unknown-clear-confirmed", "gated", "before-scope-clear", "after-scope-clear", "before-scope-install", "after-scope-install", "before-executor-publication", "before-Now-publication", "after-Now-publication", "before-B-preparation", "Now-finish-false", "publish-failure", "now-publish-failure", "login-failure", "subscription-refresh", "api-key-refresh", "subscription-refresh-prepare-failure", "subscription-refresh-cancel", "crash-after-a-teardown-recovery", "crash-apply-reply-lost-recovery", "crash-apply-ack-recovery", "crash-login-recovery"] as const) {
         if (publication !== "baseline" && (phase !== "factory" || (oldClaim !== API_KEY && target !== API_KEY))) continue;
         if (publication === "subscription-refresh" && target.auth_mode !== "subscription") continue;
         if (publication === "api-key-refresh" && target.auth_mode !== "api_key") continue;
         const preflightRefusal = publication === "preflight-target-mismatch" || publication === "preflight-foreign-op";
         const targetMismatch = publication === "preflight-target-mismatch";
-        if (preflightRefusal && (oldClaim !== API_KEY || target !== SUBSCRIPTION || phase !== "factory")) continue;
+        const preflightRetry = publication === "preflight-busy-ready" || publication === "preflight-transport-ready";
+        if ((preflightRefusal || preflightRetry) && (oldClaim !== API_KEY || target !== SUBSCRIPTION || phase !== "factory")) continue;
         const inspectFailure = publication === "inspect-missing-clear-confirmed" || publication === "inspect-unknown-clear-confirmed";
         const confirmedClear = publication === "persist-clear-confirmed" || inspectFailure;
         const persistFailure = publication === "persist-clear-confirmed" ||
@@ -32378,6 +32379,8 @@ describe("M2 actualRunner credential replacement", () => {
           const missingRecoveryRollout = recoveryMode.endsWith("missing retained rollout");
       it((publication === "baseline"
         ? `M2 actualRunner ${oldClaim.auth_mode} to ${target.auth_mode} ${phase} account resumes saved thread`
+        : publication === "preflight-busy-ready" ? "Codex real Runner retries credential_busy then exact ready for the same operation"
+        : publication === "preflight-transport-ready" ? "Codex real Runner retries uncertain transport then exact ready for the same operation"
         : targetMismatch ? "Codex real rollout preflight target_mismatch clears the exact operation and continues A"
         : publication === "preflight-foreign-op" ? "Codex real rollout preflight foreign ready op retains A without reopening"
         : persistFailure ? `Codex real rollout ${inspectFailure ? "inspection unavailable" : "persist failure"} before teardown (${publication})`
@@ -32394,7 +32397,7 @@ describe("M2 actualRunner credential replacement", () => {
         : publication === "subscription-refresh-cancel" ? "Codex queued subscription refresh settles on cancellation after B preparation"
         : publication === "api-key-refresh" ? "Codex API-key B refuses subscription refresh and retains the workspace"
         : `Codex ${oldClaim.auth_mode} to ${target.auth_mode} partial B publication never reopens A (${publication})`) +
-        (recoveryMode === "normal" ? "" : `; recovery ${recoveryMode}`), async () => {
+        (recoveryMode === "normal" ? "" : `; recovery ${recoveryMode}`), async t => {
         const { api, client } = m2Runner;
         const next = { ...target, access_token: "M2-B-access", capability: "M2-B-capability" } as import("../src/protocol.js").ClaimCodexSecrets;
         if ("chatgpt_account_id" in oldClaim && next.auth_mode === "subscription")
@@ -32428,7 +32431,10 @@ describe("M2 actualRunner credential replacement", () => {
         let failingPersist = false, persistFailures = 0, teardownAttempts = 0;
         let persistedCopies = 0, unavailableInspections = 0;
         const usableSaves: import("../src/executor.js").UsableSavedRollout[] = [];
-        const deliveredPreflightReplies: { kind: string; opId: string }[] = [];
+        const deliveredPreflightReplies: import("../src/client.js").CodexSwitchPreflightResult[] = [];
+        const retryScheduled = installerBarrier();
+        let retryArmed = false, retryCallbacks = 0;
+        let releaseRetry: (() => void) | undefined;
         let preflightStorePresence: string | undefined;
         const preflightRequests: { runId: string; claimGeneration: number; registerNonce: string; opId: string; targetSecretId: string }[] = [];
         const failedClearRequests: { generation?: number; opId?: string; reason?: string }[] = [];
@@ -32473,17 +32479,22 @@ describe("M2 actualRunner credential replacement", () => {
           preflights++; events.push("preflight");
           preflightRequests.push({ runId, claimGeneration: req.claimGeneration, registerNonce: req.registerNonce,
             opId: req.opId, targetSecretId: req.targetSecretId });
-          if (preflightRefusal) {
-            assert.equal(usableSaves.length, 1, "real lease saves before preflight");
-            assert.equal(usableSaves[0]!.kind, "usable");
+          if (preflightRefusal || preflightRetry)
             preflightStorePresence = await CodexSessionStore.inspectSession(store, savedId);
-            assert.equal(preflightStorePresence, "present");
+          if (preflightRetry && preflights === 1) {
+            const reply = publication === "preflight-busy-ready"
+              ? { kind: "not_applied" as const, reason: "credential_busy", claimGeneration: 7,
+                registerNonce: "M2-original-nonce", opId: "M2-op" }
+              : { kind: "uncertain" as const, detail: "transport" as const };
+            deliveredPreflightReplies.push(reply);
+            retryArmed = true;
+            return reply;
           }
           const reply = targetMismatch ? { kind: "not_applied" as const, reason: "target_mismatch",
             claimGeneration: 7, registerNonce: "M2-original-nonce", opId: "M2-op" }
             : { kind: "ready" as const, claimGeneration: 7, registerNonce: "M2-original-nonce",
               opId: publication === "preflight-foreign-op" ? "M2-FOREIGN-op" : "M2-op" };
-          if (preflightRefusal) deliveredPreflightReplies.push(reply);
+          if (preflightRefusal || preflightRetry) deliveredPreflightReplies.push(reply);
           return reply;
         };
         const applyRequests: { claimGeneration: number; opId: string }[] = [];
@@ -32685,7 +32696,7 @@ describe("M2 actualRunner credential replacement", () => {
               failingPersist = persistFailure;
               try {
                 const saved = await lease.persistRollout(bounds);
-                if (preflightRefusal) usableSaves.push(saved);
+                if (preflightRefusal || preflightRetry) usableSaves.push(saved);
                 return saved;
               }
               finally { failingPersist = false; }
@@ -33043,6 +33054,22 @@ describe("M2 actualRunner credential replacement", () => {
             throw new Error(`injected ${stage} failure`);
           }
         };
+        const nativeSetTimeout = globalThis.setTimeout;
+        const nativeClearTimeout = globalThis.clearTimeout;
+        const retryTimer = preflightRetry ? t.mock.method(globalThis, "setTimeout",
+          (callback: (...args: unknown[]) => void, ms?: number, ...args: unknown[]) => {
+            if (!retryArmed || ms !== 250) return nativeSetTimeout(callback, ms, ...args);
+            retryArmed = false; // Only the first probe's production retry delay is intercepted.
+            const handle = nativeSetTimeout(() => {}, 0);
+            nativeClearTimeout(handle);
+            releaseRetry = () => {
+              releaseRetry = undefined;
+              retryCallbacks++;
+              callback(...args);
+            };
+            retryScheduled.resolve();
+            return handle;
+          }) : undefined;
         const running = runner.execute(claim);
         const joinExecution = async () => {
           const settled = await Promise.allSettled([running, ...triggers]);
@@ -33146,6 +33173,33 @@ describe("M2 actualRunner credential replacement", () => {
             }
             return;
           }
+          if (preflightRetry) {
+            await withTimeout(retryScheduled.promise, 5000, "real preflight retry scheduled");
+            assert.equal(preflights, 1);
+            assert.equal(retryArmed, false);
+            assert.equal(retryCallbacks, 0);
+            assert.equal(preflightStorePresence, "present");
+            assert.equal(usableSaves.length, 1);
+            assert.equal(usableSaves[0]!.kind, "usable");
+            if (usableSaves[0]!.kind === "usable") assert.equal(usableSaves[0]!.sessionId, savedId);
+            assert.deepEqual(preflightRequests, [{ runId: claim.run_id, claimGeneration: 7,
+              registerNonce: "M2-original-nonce", opId: "M2-op", targetSecretId: "M2-target" }]);
+            assert.deepEqual(deliveredPreflightReplies, [publication === "preflight-busy-ready"
+              ? { kind: "not_applied", reason: "credential_busy", claimGeneration: 7,
+                registerNonce: "M2-original-nonce", opId: "M2-op" }
+              : { kind: "uncertain", detail: "transport" }]);
+            assert.equal(teardownAttempts, 0);
+            assert.equal(cleanupStarts, 0);
+            assert.equal(applies, 0);
+            assert.equal(b.transport.requests.length, 0);
+            assert.equal(a.transport.turnStartCount, 1);
+            assert.equal(reopenAttempts, 0);
+            assert.ok(retainedRootDispatch);
+            await assert.rejects(retainedRootDispatch.prepare(), "A dispatch stays closed while retry is scheduled");
+            assert.equal(a.transport.turnStartCount, 1);
+            assert.ok(releaseRetry);
+            releaseRetry();
+          }
           if (preflightRefusal) {
             await withTimeout(switchSettled.promise, 5000, "real preflight refusal settles");
             assert.equal(preflights, 1);
@@ -33200,6 +33254,21 @@ describe("M2 actualRunner credential replacement", () => {
             return;
           }
           await withTimeout(cleanupEntered.promise, 5000, "M2 A teardown");
+          if (preflightRetry) {
+            assert.equal(retryCallbacks, 1);
+            assert.equal(preflights, 2);
+            assert.deepEqual(preflightRequests, Array.from({ length: 2 }, () => ({ runId: claim.run_id,
+              claimGeneration: 7, registerNonce: "M2-original-nonce", opId: "M2-op", targetSecretId: "M2-target" })));
+            assert.deepEqual(deliveredPreflightReplies[1], { kind: "ready", claimGeneration: 7,
+              registerNonce: "M2-original-nonce", opId: "M2-op" });
+            assert.equal(deliveredPreflightReplies.length, 2);
+            assert.deepEqual(failedClearRequests, []);
+            assert.equal(applies, 0);
+            assert.equal(reopenAttempts, 0);
+            assert.equal(a.transport.turnStartCount, 1);
+            assert.ok(retainedRootDispatch);
+            await assert.rejects(retainedRootDispatch.prepare(), "A dispatch stays closed after retry timer clears");
+          }
           assert.equal(b.transport.requests.length, 0, "B auth waits for A reap");
           cleanupContinue.resolve();
           if (publication !== "baseline") {
@@ -33351,7 +33420,7 @@ describe("M2 actualRunner credential replacement", () => {
                   (publication === "now-publish-failure" && barrier.stage === "after-publish")) break;
             }
             assert.equal(consumerProbes.length, injectedStage ? failureBoundaryCount : crashRecovery ? publicationStages.findIndex(stage => stage === crashStage) + 1 : publication === "publish-failure" || publication === "now-publish-failure" ? 2 : (publication === "login-failure" || publication === "api-key-refresh" || crashRecovery) ? 4 : 5);
-            if (publication !== "gated" && publication !== "subscription-refresh") {
+            if (publication !== "gated" && publication !== "subscription-refresh" && !preflightRetry) {
               await withTimeout(running, 5000, "failed publication retained stop");
               await joinNowConsumerProbes();
               assert.equal(reopenAttempts, 0);
@@ -33760,7 +33829,7 @@ describe("M2 actualRunner credential replacement", () => {
             assert.ok(events.includes(event), `observed ${event}`);
             assert.ok(events.indexOf("A-Now-drained") < events.indexOf(event), `raw Now drain precedes ${event}`);
           }
-          assert.equal(preflights, 1);
+          assert.equal(preflights, preflightRetry ? 2 : 1);
           assert.equal(applies, 1);
           assert.deepEqual(applyRequests, [{ claimGeneration: 7, opId: "M2-op" }]);
           assert.equal(loginObservations.length, 1);
@@ -33811,6 +33880,8 @@ describe("M2 actualRunner credential replacement", () => {
           assert.equal(await fs.readFile(path.join(worktree, "M2-retained.txt"), "utf8"), "A work");
         } finally {
           scopeProbesArmed = false;
+          releaseRetry?.();
+          retryTimer?.mock.restore();
           cancelled = true; pending = false; nowContinue.resolve(); summaryDisposeContinue.resolve(); cleanupContinue.resolve();
           for (const barrier of publicationBarriers) barrier.proceed.resolve();
           a.transport.push(turnCompleted("interrupted", savedId, "M2-A-turn"));
