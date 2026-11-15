@@ -3265,8 +3265,14 @@ export class WorkerClient {
       throw err;
     }
     if (body.completion_final_head !== undefined && !this.hasFeature("recovery_completed_publication_v1")) ack.completedPublicationReason = "unsupported_feature";
-    if (witness && ack.status === "running" && ack.registrationEvidence === "recorded" && !ack.staleClaim && !ack.credentialSwitch &&
+    if (witness && (ack.status === "running" ||
+        (ack.status === "claimed" && !ack.applied && ack.runId === runId &&
+          ack.workerIdentityMatches === true && ack.sentClaimGeneration === witness.claim_generation &&
+          !ack.credentialSwitchReleased && !ack.credentialSwitchHeld && !ack.credentialSwitchUncertain)) &&
+        ack.registrationEvidence === "recorded" && !ack.staleClaim && !ack.credentialSwitch &&
         !this.registrationEvidenceDropped && this.registerNonce === witness.register_nonce) {
+      // A refused running transition can still persist registration evidence on a claimed row.
+      // This capability only enables the exact source-end hold; it never changes the running ACK.
       // Witnesses remain valid for this registration, including while a hold ACK is in flight.
       // Keep one per run until re-registration clears witnessedRunning; unrelated ACKs must
       // never revoke an active run's exact-generation capability.

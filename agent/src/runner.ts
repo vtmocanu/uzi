@@ -4688,7 +4688,9 @@ export class RunRunner {
     if (sourceEndDiagnosticsEmitted.has(flight)) return;
     sourceEndDiagnosticsEmitted.add(flight);
     try {
-      runLog.warn("source use teardown summary", { ...this.sourceEndDiagnosticState(flight) });
+      const diagnostic = this.sourceEndDiagnosticState(flight);
+      const healthy = diagnostic.outcome === "ended" || diagnostic.outcome === "no_sources" || diagnostic.outcome === "no_authority";
+      runLog[healthy ? "info" : "warn"]("source use teardown summary", { ...diagnostic });
     } catch { /* Logging cannot replace the original error or change source disposition. */ }
   }
 

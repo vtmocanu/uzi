@@ -25,7 +25,7 @@ A restart loses the declined-end witness; it does not prove the old source reusa
 
 The API advertises `retained_source_end_hold_v1` paired with
 `run_registration_evidence_v1`. Reporting requires the current registration
-nonce and claim generation and a prior running witness. The park and its server
+nonce and claim generation and evidence durably recorded from a running report. A refused running transition may leave the row `claimed` while recording that evidence; its exact identity-fenced 409 can enable the hold capability without authorizing a running/model turn. The park and its server
 evidence become visible together at transaction commit. That atomic visibility
 does not make the server transaction atomic with independent worker source fsyncs.
 
@@ -34,6 +34,17 @@ against an API missing the feature keeps legacy behavior. An older API serving a
 migrated row may clear its detail and requeue it on Resume under the existing cap;
 it does not acquire the new API's refusal or counter-preservation semantics.
 Worker source guards still prevent unsafe reuse. There is no new database trigger.
+
+Compatibility proof scope: `TestSourceEndDeclinedLegacyResumeClaimFenceLiveDB`
+uses the unchanged baseline Resume SQL and real `ClaimRun`: legacy Resume clears
+the detail and queues, but the preserved released pair blocks the same registration
+under D19. Repeated refusals preserve generation, requeue/park counters and open
+custody. Changing only the worker nonce permits a generation-2 claim while preserving
+the original hold; that admission grants no source-use authority. Worker tests at
+three separate feature-absent seams cover held-source refusal for a differently
+admitted claim. These are separate SQL-admission and worker-source proofs, not an
+end-to-end claim that legacy Resume admits the same incarnation. The new SQL
+regression awaits the lead's full store race and LiveDB runs.
 
 On the new API, owner Resume is refused without writes when the original
 registration is unchanged, or worker/registration identity is unavailable, even
@@ -103,6 +114,33 @@ owner actions and subsequent guarded attempt on the deployed build.
 Record the exact deployed image and commit, selected source, claim-generation and hold-count deltas, and continuity of the retained work. Verify either same-worker continuation after every exact durable end is proved or one actionable owner hold. Include a second retained source and show that restart does not make it eligible without its independent guards. That acceptance is unverified and issue #4365 remains open.
 
 The client retains one acknowledged running witness per distinct run for its registration lifetime; re-registration clears the map. Terminal pruning is not implemented. This avoids revoking an active flight's evidence when unrelated reports cross an arbitrary size threshold, at the cost of registration-lifetime memory growth. It grants no end or reuse authority.
+
+## Cross-check repair evidence
+
+The client also accepts recorded registration evidence on an exact claimed-409
+response to its running report. Foreign or absent run/worker identity, a stale
+claim, a credential-switch disposition or a changed registration does not supply
+that capability. It changes neither the refused running ACK nor source admission.
+Runner tests cover the claimed-state hold and absent hold-feature behavior at
+all three refusal seams; missing registration-evidence support stays legacy.
+
+Healthy `ended`, `no_sources` and `no_authority` teardown summaries use INFO;
+non-end outcomes retain WARN. Both retain once-only, bounded secret-free fields,
+and logging failures cannot change source disposition.
+
+The new legacy Resume control runs the unchanged baseline SQL, then the real
+`ClaimRun`. Same-registration claim attempts are excluded without generation,
+requeue or custody changes; a changed-nonce positive control demonstrates that
+the released-incarnation fence is the cause. It would be incorrect to fabricate
+a subsequent same-incarnation claim on that path. Separately, the absent-feature
+runner controls prove source protection at the three worker refusal seams.
+These are complementary SQL and worker proofs, not a claim of one end-to-end
+legacy same-incarnation execution.
+
+Focused repair logs: `.uzi/scratch/gate-log.aeMdTA` (agent tests, exit 0)
+and `.uzi/scratch/gate-log.WCco96` (two LiveDB tests, zero skips, exit 0).
+Original historical-cause uncertainty and the unmet forge-fake gate below
+are unchanged. Exact-head CI and hosted acceptance remain pending.
 
 ## M4 completion evidence ledger
 

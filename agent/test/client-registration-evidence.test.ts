@@ -72,6 +72,27 @@ describe("registration evidence on the running report", () => {
     assert.equal(c.sourceEndDeclinedRegistration("r1", GEN), NONCE);
   });
 
+  for (const fault of ["none", "foreign-run", "foreign-worker", "missing-worker", "stale", "switch", "refused"] as const) {
+    it(`claimed 409 recorded evidence is hold-only and identity fenced: ${fault}`, async () => {
+      const { c, wires } = await make([{ status: 409, body: JSON.stringify({
+        run: { id: fault === "foreign-run" ? "other" : "r1", status: "claimed",
+          ...(fault === "missing-worker" ? {} : { worker_id: fault === "foreign-worker"
+            ? "22222222-2222-4222-8222-222222222222" : "11111111-1111-4111-8111-111111111111" }) },
+        registration_evidence: fault === "refused" ? "refused" : "recorded",
+        ...(fault === "stale" ? { disposition: "stale_claim" } : {}),
+        ...(fault === "switch" ? { credential_switch: { generation: 1 } } : {}),
+      }) }], { features: [...FEATURES, "retained_source_end_hold_v1"] });
+      const ack = await c.reportState("r1", { status: "running", claim_generation: GEN },
+        undefined, { registrationEpoch: EPOCH });
+      assert.equal(ack.applied, false);
+      assert.equal(ack.status, "claimed", "witness cannot turn a refusal into running");
+      assert.equal(ack.registrationEvidence, fault === "refused" ? "refused" : "recorded");
+      assert.equal(c.sourceEndDeclinedRegistration("r1", GEN), fault === "none" ? NONCE : undefined);
+      assert.equal(c.sourceEndDeclinedRegistration("r1", GEN + 1), undefined);
+      assert.equal(wires.length, 1, "no legacy retry of a declined running transition");
+    });
+  }
+
   it("preserves active exact-generation witnesses across more than 2048 unrelated ACKs", async () => {
     const ids = Array.from({ length: 2050 }, (_, i) => `boundary-${i}`);
     const replies: Reply[] = ids.map(id => ({ status: 200, body: JSON.stringify({

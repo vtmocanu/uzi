@@ -36,15 +36,36 @@ function fixture(options: { held?: boolean; barrier?: boolean; throwing?: boolea
     cleanupAuthorityWait: () => ({ timeoutMs: 1 }) });
   const flight = { worktreePath: "/private/source-secret", sourceUsePaths: new Set(["/private/source-secret"]),
     sourceTailsJoined: options.tails !== false, ...(options.held ? { remediationRestrictions: { roots: ["private-root"] } } : {}) };
-  const emitted: Array<{ message: string; fields?: Record<string, unknown> }> = [];
-  const log = { warn(message: string, fields?: Record<string, unknown>) {
-    emitted.push({ message, fields });
+  const emitted: Array<{ level: "info" | "warn"; message: string; fields?: Record<string, unknown> }> = [];
+  const record = (level: "info" | "warn") => (message: string, fields?: Record<string, unknown>) => {
+    emitted.push({ level, message, fields });
     if (options.throwing) throw new Error("private-logger-error");
-  } } as Logger;
+  };
+  const log = { warn: record("warn"), info: record("info") } as Logger;
   return { subject, flight, log, emitted, counts: () => ({ ends, declines }) };
 }
 
 describe("bounded source-end diagnostics", () => {
+  for (const outcome of ["ended", "no_sources", "no_authority"] as const) {
+    for (const throwing of [false, true]) {
+      it(`healthy ${outcome} summary uses info once (throwing=${throwing})`, async () => {
+        const f = fixture({ throwing });
+        if (outcome === "no_authority") delete f.subject.authority;
+        if (outcome === "no_sources") {
+          f.flight.sourceUsePaths.clear();
+          f.flight.worktreePath = "";
+        }
+        await f.subject.endFlightSourceUse(f.flight, f.log);
+        f.subject.emitSourceEndDiagnostics(f.flight, f.log);
+        assert.equal(f.emitted.length, 1, "whole emitted set contains only one healthy summary");
+        assert.equal(f.emitted[0]!.level, "info");
+        assert.equal(f.emitted[0]!.fields?.outcome, outcome);
+        for (const secret of ["/private", "source-secret", "private-epoch", "private-logger-error"])
+          assert.equal(JSON.stringify(f.emitted).includes(secret), false);
+      });
+    }
+  }
+
   it("copies only fixed reasons without guessing a retry from kept", async () => {
     for (const reasons of [undefined, ["no_lease"], ["pending_operation", "queued_retry", "queued_retry", "/private/raw-error"]]) {
       const f = fixture({ kept: true, reasons });
@@ -91,6 +112,7 @@ describe("bounded source-end diagnostics", () => {
       await f.subject.endFlightSourceUse(f.flight, f.log);
       const summaries = f.emitted.filter(entry => entry.message === "source use teardown summary");
       assert.equal(summaries.length, 1);
+      assert.equal(summaries[0]!.level, "warn");
       const fields = summaries[0]!.fields!;
       assert.equal(fields.outcome, options.tails === false ? "tails_unjoined" : "unconfirmed");
       assert.equal(fields.foreign, options.foreign === true);
@@ -183,12 +205,14 @@ describe("bounded source-end diagnostics", () => {
     const summaries: Record<string, unknown>[] = [];
     const log = nullLogger();
     log.child = () => log;
-    log.warn = (message, fields) => {
+    const capture = (level: "info" | "warn"): Logger["info"] => (message, fields) => {
       if (message === "source use teardown summary") {
-        summaries.push(fields!);
+        summaries.push({ level, ...fields });
         throw new Error("private-logger-error");
       }
     };
+    log.info = capture("info");
+    log.warn = capture("warn");
     const runner = runnerWith(() => ({ executor: { run: async () => ({ branch: "unused" }) } }),
       fakeGitlab().gitlab, undefined, log);
     const seam = runner as unknown as {
@@ -203,6 +227,7 @@ describe("bounded source-end diagnostics", () => {
     await runner.execute(gitlabClaim(436501));
     assert.ok(stops > 0, "the actual auxiliary settlement must run");
     assert.equal(summaries.length, 1);
+    assert.equal(summaries[0]!.level, "info");
     assert.equal(summaries[0]!.auxiliaries, false);
     assert.equal(summaries[0]!.outcome, "no_authority", "this auxiliary diagnostic fixture has no authority; source-end protection is covered by authority fixtures");
     for (const secret of ["private-auxiliary-error", "private-logger-error"])
