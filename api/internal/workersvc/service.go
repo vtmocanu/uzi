@@ -4726,7 +4726,8 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 	if err != nil {
 		return store.Run{}, false, err
 	}
-	if ownerHoldRefusesReport(owned, req) {
+
+	if (req.RecoveryDetail == nil || *req.RecoveryDetail != RecoveryDetailSourceEndDeclined) && ownerHoldRefusesReport(owned, req) {
 		if req.ClaimGeneration != nil && (owned.ClaimGeneration != *req.ClaimGeneration || owned.ClaimReleasedAt.Valid) {
 			return owned, false, ErrStaleClaim
 		}
@@ -4743,6 +4744,10 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 	if err := validateCappedReportOnly(owned, req); err != nil {
 		return owned, false, err
 	}
+	if req.RecoveryDetail != nil && *req.RecoveryDetail == RecoveryDetailSourceEndDeclined {
+		return s.parkSourceEndDeclined(ctx, wkr, runID, req)
+	}
+
 	if s.txBeginner == nil && parentTx == nil && semanticCompletionRequiresLock(owned) &&
 		(stateUsesGenerationFence(req.State, owned) || req.State == "pause_failed" ||
 			req.State == stateClarificationSettled ||

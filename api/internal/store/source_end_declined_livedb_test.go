@@ -1,0 +1,117 @@
+package store_test
+
+import (
+	"errors"
+	"os"
+	"strings"
+	"testing"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/vtmocanu/uzi/api/internal/store"
+)
+
+func TestSourceEndDeclinedMigrationAndLegacyResumeLiveDB(t *testing.T) {
+	ctx, dsn := standIsolatedDB(t, "source_end_declined_")
+	if err := store.MigrateTo(ctx, dsn, 456); err != nil {
+		t.Fatal(err)
+	}
+	pool, err := store.OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	user, conn, repo, worker, run := uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	mustExec(ctx, t, pool, "INSERT INTO users(id,email,password_hash) VALUES($1,$2,'x')", user, user.String()+"@example.com")
+	mustExec(ctx, t, pool, `INSERT INTO forge_connections(id,user_id,forge_type,base_url,bot_username,bot_forge_user_id,token_ciphertext)
+ VALUES($1,$2,'github','https://example.com','bot',1,'x')`, conn, user)
+	mustExec(ctx, t, pool, `INSERT INTO repos(id,connection_id,forge_project_id,path_with_namespace,web_url,default_branch)
+ VALUES($1,$2,1,'example/detail','https://example.com/detail','main')`, repo, conn)
+	mustExec(ctx, t, pool, "INSERT INTO workers(id,user_id,name,token_hash,status) VALUES($1,$2,$3,$4,'online')", worker, user, worker.String(), worker[:])
+	mustExec(ctx, t, pool, `INSERT INTO runs(id,user_id,repo_id,worker_id,kind,issue_iid,issue_title,issue_description,status,claim_generation)
+ VALUES($1,$2,$3,$4,'issue',4177,'detail','fixture','running',1)`, run, user, repo, worker)
+
+	if err := store.MigrateTo(ctx, dsn, 457); err != nil {
+		t.Fatal(err)
+	}
+	var valid bool
+	if err := pool.QueryRow(ctx, "SELECT convalidated FROM pg_constraint WHERE conrelid='runs'::regclass AND conname='runs_recovery_wait_detail_check'").Scan(&valid); err != nil || valid {
+		t.Fatalf("457 CHECK NOT VALID: valid=%v err=%v", valid, err)
+	}
+	_, err = pool.Exec(ctx, "UPDATE runs SET recovery_wait_detail='unknown-detail' WHERE id=$1", run)
+	var pe *pgconn.PgError
+	if !errors.As(err, &pe) || pe.Code != "23514" || pe.ConstraintName != "runs_recovery_wait_detail_check" {
+		t.Fatalf("unknown detail must violate CHECK: %v", err)
+	}
+	mustExec(ctx, t, pool, "UPDATE workers SET snapshot_register_nonce='released-source' WHERE id=$1", worker)
+	mustExec(ctx, t, pool, `UPDATE runs SET status='recovery_wait', recovery_wait_cause='retained_recovery_adoption_failed',
+ recovery_wait_detail='source_end_declined', claim_released_at=now(), released_worker_id=$2,
+ released_worker_nonce='released-source', registration_evidence_generation=1, registration_evidence_nonce='released-source'
+ WHERE id=$1`, run, worker)
+	if err := store.MigrateTo(ctx, dsn, 458); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, "SELECT convalidated FROM pg_constraint WHERE conrelid='runs'::regclass AND conname='runs_recovery_wait_detail_check'").Scan(&valid); err != nil || !valid {
+		t.Fatalf("458 CHECK validated: valid=%v err=%v", valid, err)
+	}
+	b, err := os.ReadFile("migrations/00457_retained_source_end_hold.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parts := strings.SplitN(string(b), "-- +goose Down", 2)
+	if len(parts) != 2 {
+		t.Fatal("missing Down")
+	}
+	down := parts[1]
+	for _, status := range []string{"recovery_wait", "cancelled"} {
+		mustExec(ctx, t, pool, "UPDATE runs SET status=$2 WHERE id=$1", run, status)
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = tx.Exec(ctx, down)
+		_ = tx.Rollback(ctx)
+		if err == nil || !strings.Contains(err.Error(), "refusing rollback 00457") {
+			t.Fatalf("Down must refuse %s evidence: %v", status, err)
+		}
+		var detail, nonce string
+		if err := pool.QueryRow(ctx, "SELECT recovery_wait_detail, released_worker_nonce FROM runs WHERE id=$1", run).Scan(&detail, &nonce); err != nil || detail != "source_end_declined" || nonce != "released-source" {
+			t.Fatalf("Down lost evidence: %q %q %v", detail, nonce, err)
+		}
+	}
+	mustExec(ctx, t, pool, "UPDATE runs SET status='recovery_wait' WHERE id=$1", run)
+	q := store.New(pool)
+	if _, err := q.ResumeWorkerRecoveryEpisode(ctx, store.ResumeWorkerRecoveryEpisodeParams{ID: run, UserID: user, GlobalTimeoutSeconds: 3600}); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("new SQL must refuse unchanged nonce: %v", err)
+	}
+	// This is the unchanged baseline named SQL region, not a recreation of the old API.
+	// There is intentionally no trigger: the legacy writer MAY clear detail and queue.
+	legacyBytes, err := os.ReadFile("testdata/legacy_resume_worker_recovery_episode_97440d596.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := strings.NewReplacer("@global_timeout_seconds", "$3", "@user_id", "$2", "@id", "$1").Replace(string(legacyBytes))
+	var gotRun, gotUser uuid.UUID
+	var status string
+	if err := pool.QueryRow(ctx, legacy, run, user, int32(3600)).Scan(&gotRun, &gotUser, &status); err != nil || status != "queued" || gotRun != run || gotUser != user {
+		t.Fatalf("legacy writer may queue: %s %v", status, err)
+	}
+	var detail *string
+	var released uuid.UUID
+	var nonce string
+	var generation int64
+	if err := pool.QueryRow(ctx, "SELECT recovery_wait_detail, released_worker_id, released_worker_nonce, claim_generation FROM runs WHERE id=$1", run).Scan(&detail, &released, &nonce, &generation); err != nil || detail != nil || released != worker || nonce != "released-source" || generation != 1 {
+		t.Fatalf("legacy resume changed released identity/generation bounds: detail=%v worker=%s nonce=%q gen=%d err=%v", detail, released, nonce, generation, err)
+	}
+	// With no new-detail value remaining, narrowing is permitted. Roll it back so
+	// this test does not alter the migration bookkeeping behind goose's back.
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, down); err != nil {
+		t.Fatalf("Down without new detail: %v", err)
+	}
+}

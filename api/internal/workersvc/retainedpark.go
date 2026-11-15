@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
@@ -41,8 +42,12 @@ func validateRetainedCapacityOnly(req StateRequest) error {
 	return nil
 }
 
-// RecoveryDetailFeature is the register feature token an api advertises once it accepts
-// StateRequest.RecoveryDetail (issue #4177). A worker sends the field only after seeing it.
+// RetainedSourceEndHoldFeature is advertised alongside run_registration_evidence_v1.
+const RetainedSourceEndHoldFeature = "retained_source_end_hold_v1"
+
+const RecoveryDetailSourceEndDeclined = "source_end_declined"
+
+// RecoveryDetailFeature gates the original adoption-refusal detail values.
 const RecoveryDetailFeature = "recovery_detail_adoption_refusal_v1"
 
 // Closed set of recovery_wait_detail values for a retained_recovery_adoption_failed park.
@@ -61,7 +66,7 @@ func validateRecoveryDetail(req StateRequest) error {
 		return nil
 	}
 	switch *req.RecoveryDetail {
-	case RecoveryDetailSecretRemediationActive, RecoveryDetailRemediationProofUnknown:
+	case RecoveryDetailSecretRemediationActive, RecoveryDetailRemediationProofUnknown, RecoveryDetailSourceEndDeclined:
 	default:
 		return fmt.Errorf("%w: unknown recovery_detail", ErrInvalidState)
 	}
@@ -73,6 +78,9 @@ func validateRecoveryDetail(req StateRequest) error {
 	}
 	if req.ClaimGeneration == nil || *req.ClaimGeneration <= 0 {
 		return fmt.Errorf("%w: recovery_detail requires positive claim_generation", ErrInvalidState)
+	}
+	if *req.RecoveryDetail == RecoveryDetailSourceEndDeclined && req.RegisterNonce == "" {
+		return fmt.Errorf("%w: source_end_declined requires register_nonce", ErrInvalidState)
 	}
 	return nil
 }
@@ -147,4 +155,130 @@ func (s *Service) parkRetainedRecovery(ctx context.Context, wkr store.Worker, ow
 		return run, 0, err
 	}
 	return parked, 1, nil
+}
+
+// parkSourceEndDeclined consumes prior registration evidence, never creates it.
+// The worker lock serializes registration and owner Resume before taking the run lock.
+func (s *Service) parkSourceEndDeclined(ctx context.Context, w store.Worker, id uuid.UUID, req StateRequest) (store.Run, bool, error) {
+	if s.txBeginner == nil {
+		return store.Run{}, false, ErrSemanticCompletionAuthority
+	}
+	tx, err := s.beginReadCommitted(ctx)
+	if err != nil {
+		return store.Run{}, false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	q := store.New(tx)
+	current, err := q.GetWorkerForUpdate(ctx, w.ID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return store.Run{}, false, ErrRunNotOwned
+	}
+	if err != nil {
+		return store.Run{}, false, err
+	}
+	run, err := q.GetRunOwnedByWorkerForUpdate(ctx, store.GetRunOwnedByWorkerForUpdateParams{ID: id, WorkerID: pgconv.UUID(w.ID)})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return run, false, ErrRunNotOwned
+	}
+	if err != nil {
+		return run, false, err
+	}
+	if current.UserID != w.UserID || run.UserID != w.UserID {
+		return run, false, ErrRunNotOwned
+	}
+	nonce := current.SnapshotRegisterNonce
+	if !nonce.Valid || nonce.String == "" || nonce.String != req.RegisterNonce ||
+		run.ClaimGeneration != *req.ClaimGeneration ||
+		!run.RegistrationEvidenceGeneration.Valid || run.RegistrationEvidenceGeneration.Int64 != *req.ClaimGeneration ||
+		!run.RegistrationEvidenceNonce.Valid || run.RegistrationEvidenceNonce.String != nonce.String {
+		return run, false, ErrStaleClaim
+	}
+	if unresolvedPolicyEpisode(run) {
+		return run, false, nil
+	}
+	if run.Status == "recovery_wait" && run.RecoveryWaitCause.String == recoveryCauseRetainedRecoveryAdoptionFailed &&
+		run.RecoveryWaitDetail.String == RecoveryDetailSourceEndDeclined && run.ClaimReleasedAt.Valid &&
+		run.ReleasedWorkerID.Valid && run.ReleasedWorkerID.Bytes == w.ID && run.ReleasedWorkerNonce.Valid && run.ReleasedWorkerNonce.String == nonce.String &&
+		run.StopKind.String == "" {
+		return run, false, nil
+	}
+	if run.ClaimReleasedAt.Valid {
+		return run, false, ErrStaleClaim
+	}
+	if run.Status != "claimed" && run.Status != "running" {
+		return run, false, nil
+	}
+	if run.StopKind.String != "" {
+		return run, false, nil
+	}
+	reconciled, err := reconciliationExists(ctx, tx, id)
+	if err != nil {
+		return run, false, err
+	}
+	if reconciled {
+		if err := validateReconciledGeneration(run, req.ClaimGeneration); err != nil {
+			return run, false, err
+		}
+	}
+	if err := optInRunFences(ctx, q, w.ID, true); err != nil {
+		return run, false, err
+	}
+	parked, err := q.ParkRunRetainedRecovery(ctx, store.ParkRunRetainedRecoveryParams{
+		ID: id, WorkerID: pgconv.UUID(w.ID), ClaimGeneration: *req.ClaimGeneration,
+		RecoveryCause: recoveryCauseRetainedRecoveryAdoptionFailed, RecoveryDetail: pgconv.TextPtr(req.RecoveryDetail),
+		SessionID: stripNULParam(req.SessionID), CheckpointContainsLatest: pgconv.BoolPtr(req.CheckpointContainsLatest),
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return run, false, nil
+	}
+	if err != nil {
+		return run, false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return run, false, err
+	}
+	if s.bcast != nil {
+		s.bcast.PublishState(id, parked.Status)
+	}
+	s.notify(id, parked.Status)
+	return parked, true, nil
+}
+
+// ResumeSourceEndHold keeps registration stable through the ordinary budget/custody guards.
+func (s *Service) ResumeSourceEndHold(ctx context.Context, userID uuid.UUID, observed store.Run, timeout int32) error {
+	if s.txBeginner == nil || !observed.WorkerID.Valid {
+		return pgx.ErrNoRows
+	}
+	tx, err := s.beginReadCommitted(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	q := store.New(tx)
+	worker, err := q.GetWorkerForUpdate(ctx, uuid.UUID(observed.WorkerID.Bytes))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return pgx.ErrNoRows
+	}
+	if err != nil {
+		return err
+	}
+	if worker.UserID != userID {
+		return pgx.ErrNoRows
+	}
+	run, err := q.GetRunOwnedByWorkerForUpdate(ctx, store.GetRunOwnedByWorkerForUpdateParams{ID: observed.ID, WorkerID: pgconv.UUID(worker.ID)})
+	if err != nil {
+		return err
+	}
+	if run.UserID != userID || run.Status != "recovery_wait" || run.RecoveryWaitCause.String != recoveryCauseRetainedRecoveryAdoptionFailed ||
+		run.RecoveryWaitDetail.String != RecoveryDetailSourceEndDeclined || run.ClaimGeneration != observed.ClaimGeneration ||
+		!run.ClaimReleasedAt.Valid || !run.ReleasedWorkerID.Valid || run.ReleasedWorkerID.Bytes != worker.ID ||
+		!run.ReleasedWorkerNonce.Valid || run.ReleasedWorkerNonce.String == "" ||
+		!worker.SnapshotRegisterNonce.Valid || worker.SnapshotRegisterNonce.String == "" || worker.SnapshotRegisterNonce.String == run.ReleasedWorkerNonce.String {
+		return pgx.ErrNoRows
+	}
+	_, err = q.ResumeWorkerRecoveryEpisode(ctx, store.ResumeWorkerRecoveryEpisodeParams{ID: observed.ID, UserID: userID, GlobalTimeoutSeconds: timeout})
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
