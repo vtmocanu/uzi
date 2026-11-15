@@ -64,8 +64,9 @@ It surfaces six ways:
   `danger`. The current instance checks are `db`, `db.size`, `controller.report`,
   `loops`, `fleet.roll`, `fleet.hibernation_wake`, `fleet.hibernation_cleanup`, `fleet.hibernation`, `fleet.hibernation_retirement`, `maintenance.active`,
   `agentsource.update` and `pricing.codex`; the rest are `owner`. `fleet.roll` remains instance infrastructure even when the hosted
-  workers belong to a single owner. Instance scope alone does not send a DM: `fleet.hibernation` and
-  `fleet.hibernation_wake` never reach `danger`, so they raise no notice.
+  workers belong to a single owner. Instance scope alone does not send a DM: `fleet.hibernation`,
+  `fleet.hibernation_wake` and `fleet.hibernation_retirement` never reach `danger`,
+  so they raise no notice.
 
   Episodes follow `blocking`: the opening evaluation sends nothing, and the
   next still-blocking evaluation claims one notice per admin. Another instance

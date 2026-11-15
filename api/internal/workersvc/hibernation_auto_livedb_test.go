@@ -854,3 +854,33 @@ func TestHibernationAutoCommitFailureLeavesNoTraceLiveDB(t *testing.T) {
 	a.wantUntouched(bad, before)
 	wantNotBlocked(t, a.row(bad))
 }
+
+// The automatic setting can change after candidate enumeration or while a row lock is pending.
+// Count reads to ensure the pass checks a locked candidate and stops, even if residue means the
+// first candidate belongs to another fixture.
+type autoModeReadCounter struct {
+	*autoSettings
+	reads int
+}
+
+func (s *autoModeReadCounter) WorkerHibernationAuto(ctx context.Context) (bool, error) {
+	s.reads++
+	return s.autoSettings.WorkerHibernationAuto(ctx)
+}
+func TestHibernationAutoOffAfterListStopsPassLiveDB(t *testing.T) {
+	a := newAutoFx(t)
+	id, _ := a.idle(400 * 24 * time.Hour)
+	before := a.row(id)
+	reader := &autoModeReadCounter{autoSettings: a.set}
+	a.svc.SetHibernationAutoSettings(reader)
+	listed := false
+	a.svc.autoPassAfterList = func() { listed = true; a.set.auto = false }
+	n, err := a.runPass()
+	if err != nil || n != 0 {
+		t.Fatalf("auto-off pass=%d, %v, want no admissions", n, err)
+	}
+	if !listed || reader.reads != 2 {
+		t.Fatalf("listed=%v automatic-mode reads=%d; want pass gate plus first locked candidate", listed, reader.reads)
+	}
+	a.wantUntouched(id, before)
+}

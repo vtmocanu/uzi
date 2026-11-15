@@ -234,7 +234,9 @@ user's last or only worker is included, and there is no per-user opt-out.
 most 10 workers per pass, oldest idle first. Each worker goes through the same
 admission checks as a manual hibernation (see the refusal list above) and the same
 [cache cleanup](#cache-cleanup-before-sleep). The idleness is re-checked on the
-locked worker row, so a run assigned or finished in the meantime wins.
+locked worker row, so a run assigned or finished in the meantime wins. At that
+point the pass also re-reads the automatic-mode switch: off ends the pass, and a
+read failure prevents that candidate from being admitted.
 
 **Refusals.** A worker the pass could not admit is recorded with a reason and moves
 to the back of the queue for an hour (`HibernationAutoRefusalCooldown`; the order

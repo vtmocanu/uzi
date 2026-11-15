@@ -188,6 +188,15 @@ func (s *Service) autoAdmit(ctx context.Context, q *store.Queries, w store.Worke
 	if idle.Nonterminal > 0 || !idle.Anchor.Valid || idle.Anchor.Time.After(cutoff) {
 		return false, false, nil
 	}
+	// Automatic mode may have changed since enumeration or while the row lock was pending.
+	// The manual admission check below re-reads only the separate main hibernation switch.
+	auto, err := s.hibernationAuto.WorkerHibernationAuto(ctx)
+	if err != nil {
+		return false, false, err
+	}
+	if !auto {
+		return false, true, nil
+	}
 	code, err := s.hibernateRefusal(ctx, q, w, now)
 	if err != nil {
 		return false, false, err

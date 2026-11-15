@@ -10,10 +10,10 @@ function withAgentSource(doc: HealthDoc): HealthDoc {
   const autoEnabled = appSettings.worker_hibernation_enabled === "true" && appSettings.worker_hibernation_auto === "true";
   const checks = doc.checks.map((c) => {
     if (c.id === source.id) return source;
-    if (c.id !== "fleet.hibernation" || c.summary === "No hosted workers are configured on this deployment.") return c;
-    if (!autoEnabled) return { ...c, severity: "na", summary: "Automatic hibernation is off." };
-    return c.summary === "Automatic hibernation is off."
-      ? { ...c, severity: "ok", summary: "No idle hosted worker is blocked from automatic hibernation." } : c;
+    if (c.id !== "fleet.hibernation") return c;
+    // These routed scenarios all have hosted workers and model only off/healthy auto status.
+    return { ...c, severity: autoEnabled ? "ok" : "na", summary: autoEnabled
+      ? "No idle hosted worker is blocked from automatic hibernation." : "Automatic hibernation is off." };
   });
   const counts = { ok: 0, warn: 0, danger: 0, unknown: 0, na: 0 };
   for (const c of checks) counts[c.severity as keyof typeof counts]++;
