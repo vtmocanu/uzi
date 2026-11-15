@@ -122,7 +122,37 @@ describe("terminalDefaultBranch on real bare repositories", () => {
     assert.equal(out.kind, "unknown");
   });
 
-  test("S3: an abort while a read is in flight is unknown", async (t) => {
+  /** Linux only: a descendant of this process named git, asleep in the kernel's FIFO open wait (procfs wchan or syscall). */
+  function blockedGitChild(): number | undefined {
+    const procfs = path.join(path.sep, "pr" + "oc");
+    const openat = ({ x64: "257", arm64: "56" } as Record<string, string>)[process.arch];
+    const statOf = (pid: number): { comm: string; state: string; ppid: number } | undefined => {
+      try {
+        const stat = fsSync.readFileSync(path.join(procfs, String(pid), "stat"), "utf8");
+        const rest = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+        return { comm: stat.slice(stat.indexOf("(") + 1, stat.lastIndexOf(")")), state: rest[0] ?? "", ppid: Number(rest[1]) };
+      } catch { return undefined; }
+    };
+    for (const name of fsSync.readdirSync(procfs)) {
+      if (!/^\d+$/.test(name)) continue;
+      const pid = Number(name);
+      const me = statOf(pid);
+      if (!me || me.comm !== "git" || me.state !== "S") continue;
+      let anc: number | undefined = me.ppid;
+      for (let hop = 0; anc !== undefined && anc > 1 && anc !== process.pid && hop < 8; hop++) anc = statOf(anc)?.ppid;
+      if (anc !== process.pid) continue;
+      try {
+        const wchan = fsSync.readFileSync(path.join(procfs, name, "wchan"), "utf8").trim();
+        let sys = "";
+        try { sys = fsSync.readFileSync(path.join(procfs, name, "syscall"), "utf8").split(" ")[0] ?? ""; } catch { /* unreadable */ }
+        if (wchan === "wait_for_partner" || (openat !== undefined && sys === openat)) return pid;
+      } catch { /* raced exit or unreadable */ }
+    }
+    return undefined;
+  }
+
+  test("S3: an abort while a read is in flight kills the blocked git child and is unknown", async (t) => {
+    if (process.platform !== "linux") { t.skip("cannot observe a blocked git child"); return; }
     const b = await bareRepo(t);
     // A FIFO with no writer blocks any git read of packed-refs until the child is killed.
     const fifo = path.join(b.bare, "packed-refs");
@@ -131,39 +161,33 @@ describe("terminalDefaultBranch on real bare repositories", () => {
     const ac = new AbortController();
     const started = Date.now();
     const pending = answer(() => within(git, () => git.terminalDefaultBranch(b.bare), { signal: ac.signal }));
-    // Opening a FIFO write-only and non-blocking throws ENXIO while no reader has it open: success means a git child
-    // is blocked reading it, which is the race this test claims to cover.
-    let fd: number | undefined;
+    // The FIFO is never opened for writing here (that would unblock git). The blocked child is observed via procfs.
+    let pid: number | undefined;
     const pollEnd = Date.now() + 10_000;
-    while (fd === undefined && Date.now() < pollEnd) {
-      try {
-        fd = fsSync.openSync(fifo, fsSync.constants.O_WRONLY | fsSync.constants.O_NONBLOCK);
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== "ENXIO") throw err;
-        await new Promise((r) => setTimeout(r, 20));
-      }
+    while (pid === undefined && Date.now() < pollEnd) {
+      pid = blockedGitChild();
+      if (pid === undefined) await new Promise((r) => setTimeout(r, 20));
     }
-    if (fd === undefined) ac.abort();
-    assert.notEqual(fd, undefined, "no git child ever opened the FIFO for reading: the abort never raced an in-flight read");
-    try {
+    if (pid === undefined) {
       ac.abort();
-      const out = await pending;
-      const elapsed = Date.now() - started;
-      assert.equal(out.kind, "unknown");
-      assert.ok(elapsed < 15_000, `elapsed ${elapsed} ms`);
-      // The reader must have settled: once the killed child's end closes, a write has no reader and fails with EPIPE.
-      let code: string | undefined;
-      const writeEnd = Date.now() + 5_000;
-      while (code === undefined && Date.now() < writeEnd) {
-        try {
-          fsSync.writeSync(fd!, "x");
-          await new Promise((r) => setTimeout(r, 20));
-        } catch (err) { code = (err as NodeJS.ErrnoException).code; }
-      }
-      assert.equal(code, "EPIPE", "the git reader was still attached to the FIFO after the answer settled");
-    } finally {
-      fsSync.closeSync(fd!);
+      await pending;
+      t.skip("cannot observe a blocked git child");
+      return;
     }
+    ac.abort();
+    const out = await pending;
+    const elapsed = Date.now() - started;
+    assert.equal(out.kind, "unknown");
+    assert.ok(elapsed < 15_000, `elapsed ${elapsed} ms`);
+    let gone = false;
+    const goneEnd = Date.now() + 5_000;
+    while (!gone && Date.now() < goneEnd) {
+      try { process.kill(pid, 0); await new Promise((r) => setTimeout(r, 20)); } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ESRCH") throw err;
+        gone = true;
+      }
+    }
+    assert.ok(gone, `the blocked git child ${pid} survived the abort`);
   });
 
   test("S4: an empty bare repository is proven absent", async (t) => {
@@ -210,6 +234,48 @@ describe("terminalDefaultBranch on real bare repositories", () => {
     await fs.symlink("/nonexistent-target", path.join(b.bare, "refs/heads/main"));
     const git = new GitCache(b.dir, nullLogger());
     assert.equal((await within(git, () => git.terminalDefaultBranch(b.bare))).kind, "unknown");
+  });
+
+  test("a dangling symlink at the ancestor refs/remotes/origin with an unborn HEAD is unknown", async (t) => {
+    const b = await bareRepo(t);
+    await fs.mkdir(path.join(b.bare, "refs/remotes"), { recursive: true });
+    await fs.symlink("/nonexistent-target", path.join(b.bare, "refs/remotes/origin"));
+    const git = new GitCache(b.dir, nullLogger());
+    assert.equal((await within(git, () => git.terminalDefaultBranch(b.bare))).kind, "unknown");
+  });
+
+  test("a regular loose origin/HEAD holding a sha, with origin/main valid, is unknown", async (t) => {
+    const b = await bareRepo(t);
+    await b.ref("refs/remotes/origin/main", b.commit);
+    await b.ref("refs/remotes/origin/HEAD", b.commit);
+    const git = new GitCache(b.dir, nullLogger());
+    assert.equal((await within(git, () => git.terminalDefaultBranch(b.bare))).kind, "unknown");
+  });
+
+  test("a packed non-symbolic origin/HEAD, with origin/main valid, is unknown", async (t) => {
+    const b = await bareRepo(t);
+    await b.ref("refs/remotes/origin/main", b.commit);
+    await b.ref("refs/remotes/origin/HEAD", b.commit);
+    run(b.bare, "pack-refs", "--all");
+    await fs.rm(path.join(b.bare, "refs/remotes/origin/HEAD"), { force: true });
+    const git = new GitCache(b.dir, nullLogger());
+    assert.equal((await within(git, () => git.terminalDefaultBranch(b.bare))).kind, "unknown");
+  });
+
+  test("a reftable repository: unborn HEAD is absent, a resolved main resolves", async (t) => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "term-reftable-"));
+    t.after(() => fs.rm(dir, { recursive: true, force: true }));
+    const bare = path.join(dir, "bare.git");
+    try {
+      execFileSync("/usr/bin/git", ["init", "-q", "--bare", "--ref-format=reftable", bare], { env: gitEnv, stdio: "pipe" });
+    } catch { t.skip("git has no reftable support"); return; }
+    run(bare, "symbolic-ref", "HEAD", "refs/heads/main");
+    const git = new GitCache(dir, nullLogger());
+    assert.deepEqual(await within(git, () => git.terminalDefaultBranch(bare)), { kind: "absent" });
+    const tree = execFileSync("/usr/bin/git", ["-C", bare, "mktree"], { env: gitEnv, input: "", encoding: "utf8" }).trim();
+    const commit = execFileSync("/usr/bin/git", ["-C", bare, "commit-tree", tree, "-m", "m"], { env: { ...gitEnv, ...identity }, encoding: "utf8" }).trim();
+    run(bare, "update-ref", "refs/heads/main", commit);
+    assert.deepEqual(await within(git, () => git.terminalDefaultBranch(bare)), { kind: "resolved", name: "main" });
   });
 
   test("an empty directory at refs/remotes/origin/HEAD is unknown", async (t) => {

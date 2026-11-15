@@ -5803,7 +5803,7 @@ export class GitCache {
     }
 
     const listing = await this.strictGitRead(barePath, ["for-each-ref",
-      "--format=%(refname)%00%(objecttype)%00%(*objecttype)", ...candidates.map(c => c.ref)]);
+      "--format=%(refname)%00%(objecttype)%00%(*objecttype)", "refs/remotes/origin/HEAD", ...candidates.map(c => c.ref)]);
     if (!listing.ok) return unknown(`for-each-ref failed: ${listing.detail}`);
     if (listing.code !== 0 || listing.stderr.trim() !== "") return unknown("for-each-ref reported a problem");
     // for-each-ref prefix-matches a pattern (refs/heads/main also lists refs/heads/main/x): keep exact names only.
@@ -5812,6 +5812,11 @@ export class GitCache {
     for (const row of listing.stdout.split("\n")) {
       if (row === "") continue;
       const [refname, type, peeled] = row.split("\0");
+      // origin/HEAD is listed only to catch a non-symbolic one (loose or packed) that the symbolic-ref read missed.
+      if (refname === "refs/remotes/origin/HEAD") {
+        if (originHead.code === 1) return unknown("refs/remotes/origin/HEAD exists but is not a symbolic ref");
+        continue;
+      }
       if (refname === undefined || !candidates.some(c => c.ref === refname)) continue;
       listed.add(refname);
       if (type === "commit" || (type === "tag" && peeled === "commit")) counted.add(refname);
@@ -5850,6 +5855,7 @@ export class GitCache {
       return { kind: "unknown", detail: `${ref} is not a safe ref path` };
     }
     try {
+      // Nit: this lstat does not observe the report-proof signal or window; the lane's post-lookup window check covers it.
       const st = await fs.lstat(path.join(barePath, ref));
       if (st.isFile()) return { kind: "regular" };
       // A directory holding entries is a namespace (refs/heads/main/x), which can never be this ref; an empty one is
@@ -5858,9 +5864,25 @@ export class GitCache {
       return { kind: "unknown", detail: `${ref} is not a regular loose ref file` };
     } catch (err) {
       const code = (err as { code?: unknown }).code;
-      if (code === "ENOENT" || code === "ENOTDIR") return { kind: "none" };
-      return { kind: "unknown", detail: `lstat ${ref} failed: ${String(code ?? err)}` };
+      if (code !== "ENOENT" && code !== "ENOTDIR") return { kind: "unknown", detail: `lstat ${ref} failed: ${String(code ?? err)}` };
     }
+    // The path is missing. git also reads a dangling symlink at an ANCESTOR as a missing ref, so walk the ancestors.
+    const segs = ref.split("/");
+    for (let i = 1; i < segs.length; i++) {
+      const anc = segs.slice(0, i).join("/");
+      try {
+        const st = await fs.lstat(path.join(barePath, anc));
+        if (st.isDirectory()) continue;
+        // The reftable layout keeps a stub regular file at refs/heads; nothing else non-directory is acceptable.
+        if (st.isFile() && anc === "refs/heads") return { kind: "none" };
+        return { kind: "unknown", detail: `ancestor ${anc} of ${ref} is not a directory` };
+      } catch (err) {
+        const code = (err as { code?: unknown }).code;
+        if (code === "ENOENT") return { kind: "none" };
+        return { kind: "unknown", detail: `lstat ancestor ${anc} failed: ${String(code ?? err)}` };
+      }
+    }
+    return { kind: "none" };
   }
 
   /**
