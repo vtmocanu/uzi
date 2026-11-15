@@ -348,6 +348,39 @@ describe("terminal-preservation lane (#4007 slice B)", () => {
     assert.equal(r.store.record, undefined);
   });
 
+  it("a default-branch lookup cut short by the window keeps the output as default_branch_unresolved, never main", async () => {
+    let tipCalls = 0;
+    const r = rig({ env: {
+      defaultBranch: undefined,
+      git: { defaultBranchTip: async () => { tipCalls++; return undefined; } } as never,
+      lookupDefaultBranch: async b => {
+        await new Promise<void>(res => { if (b.signal.aborted) res(); else b.signal.addEventListener("abort", () => res(), { once: true }); });
+        return undefined;
+      },
+    } });
+    r.env.hooks = { ...r.env.hooks!, capMs: 150, deps: { ...r.env.hooks!.deps!, universe: async () => { r.order.push("universe"); throw new Error("must not run"); } } };
+    const started = Date.now();
+    const out = await preserveInLane(r.env, r.flight, body);
+    const elapsed = Date.now() - started;
+    assert.equal(out.outcome, "kept");
+    assert.equal(out.reason, "default_branch_unresolved");
+    assert.ok(elapsed < 150 + 1500, `elapsed ${elapsed} ms`);
+    assert.equal(tipCalls, 0);
+    assert.deepEqual(r.order, []);
+    assert.equal(r.sends, 0);
+    assert.equal(r.store.record, undefined);
+  });
+
+  it("a default-branch lookup that resolves nothing with the budget intact proceeds with main", async () => {
+    // The rig's hooked prepare replaces the real one, so the observable is that the operation proceeds to its send.
+    let looked = 0;
+    const r = rig({ env: { defaultBranch: undefined, lookupDefaultBranch: async () => { looked++; return undefined; } } });
+    const out = await preserveInLane(r.env, r.flight, body);
+    assert.equal(out.outcome, "published");
+    assert.equal(looked, 1);
+    assert.equal(r.sends, 1);
+  });
+
   it("a cooperative quiesce that honours the deadlineAt it receives returns the lane kept within its budget", async () => {
     const cap = 200;
     let received: number | undefined;

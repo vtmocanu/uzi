@@ -4174,12 +4174,16 @@ export class RunRunner {
       if (flight.permanentFailureReap !== undefined) return "permanent_failure_reap";
       return undefined;
     };
-    let defaultBranch = claim.repo.default_branch?.trim() || undefined;
-    if (defaultBranch === undefined && flight.barePath) defaultBranch = (await this.git.defaultBranchName(flight.barePath).catch(() => undefined)) || undefined;
+    // A claim without a default branch is resolved by the lane inside its own window and signal (never before it).
+    const claimBranch = claim.repo.default_branch?.trim() || undefined;
+    const lookupBare = claimBranch === undefined ? flight.barePath : undefined;
     return preserveInLane({
       git: this.git, recovery: this.recovery, client: this.client, hooks,
       workerId: this.client.memoryIncarnation?.worker_id ?? hooks?.workerId,
-      defaultBranch: defaultBranch || "main", egressBound: false,
+      defaultBranch: claimBranch ?? (lookupBare ? undefined : "main"),
+      ...(lookupBare ? { lookupDefaultBranch: (b: { signal: AbortSignal; deadline: number }) =>
+        this.git.withReportProofBudget(b, () => this.git.defaultBranchName(lookupBare)) } : {}),
+      egressBound: false,
       skip, failureFirst, policy: () => this.frozenHeldPolicy(flight),
       remediationHold: sha => this.checkpointRemediationHold(flight, flight.barePath!, sha, false),
       ciHold: sha => this.ciConfigGuardVerdict(flight, flight.barePath!, sha, "terminal preservation"),

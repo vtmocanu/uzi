@@ -68,6 +68,12 @@ export interface TerminalLaneEnv {
   hooks: TerminalPreservationTestHooks | undefined;
   workerId: string | undefined;
   defaultBranch: string | undefined;
+  /**
+   * Resolves the default branch when the claim names none (`defaultBranch` undefined). Runs inside the lane's own window:
+   * `bound.signal` aborts at the sub-deadline or a permit abort and `bound.deadline` is the sub-deadline (epoch ms). The
+   * lane treats an aborted or past-deadline return as a refusal (`default_branch_unresolved`), never as "main".
+   */
+  lookupDefaultBranch?: (bound: { signal: AbortSignal; deadline: number }) => Promise<string | undefined>;
   egressBound: boolean;
   workerTokenFile?: string;
   /** Run-gate predicates (policy hold, park, claim fence, pending/attempted terminal, permanent-failure reap). */
@@ -151,6 +157,14 @@ async function run(env: TerminalLaneEnv, flight: TerminalLaneFlight, body: Termi
       // A proof that finished after the sub-deadline or a permit abort starts nothing: no store, universe or capture call.
       if (abort.signal.aborted || env.now() >= deadlineAt) return result(label, "kept", "deadline");
     }
+    // A claim without a default branch resolves it here, inside the window; a lookup the window cut short keeps the output
+    // rather than guessing "main". A lookup that finished in time with no answer falls back to "main".
+    let defaultBranch = env.defaultBranch;
+    if (defaultBranch === undefined && env.lookupDefaultBranch) {
+      try { defaultBranch = await env.lookupDefaultBranch({ signal: abort.signal, deadline: deadlineAt }); } catch { defaultBranch = undefined; }
+      if (abort.signal.aborted || env.now() >= deadlineAt) return result(label, "kept", "default_branch_unresolved");
+      defaultBranch = defaultBranch || "main";
+    }
     const boundaryValid = (): boolean => !abort.signal.aborted && env.now() < deadlineAt && quiesced;
     const left = (): number => Math.max(1, deadlineAt - env.now());
     let proved: Extract<TerminalUniverse, { kind: "proved" }> | undefined;
@@ -213,10 +227,11 @@ async function run(env: TerminalLaneEnv, flight: TerminalLaneFlight, body: Termi
       }),
       prepare: async (range: CheckpointRange | "resolve", expectDigests, tip): Promise<PrepareOutcome> => {
         let flagged: string[] = [];
-        const ciTarget = env.defaultBranch ? await env.git.defaultBranchTip(barePath, env.defaultBranch) : undefined;
+        const ciTarget = defaultBranch ? await env.git.defaultBranchTip(barePath, defaultBranch) : undefined;
+        if (defaultBranch && (abort.signal.aborted || env.now() >= deadlineAt)) return { reason: "default_branch_unresolved" };
         const out = await prepareFrozenHeldPinned({
           git: env.git, barePath, branch, sourceSha: tip, policy: env.policy(), deadlineMs: left(),
-          ...(env.defaultBranch ? { defaultBranch: env.defaultBranch } : {}),
+          ...(defaultBranch ? { defaultBranch } : {}),
           perCommitCi: true, ...(ciTarget ? { ciTarget } : {}), ...(expectDigests ? { expectDigests } : {}),
           onScan: scan => { if (scan.trusted && scan.findings.length) flagged = scan.findings.map(f => f.commit); },
           remediationHold: () => env.remediationHold(tip), ciHold: () => env.ciHold(tip),

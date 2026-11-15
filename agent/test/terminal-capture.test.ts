@@ -73,6 +73,17 @@ async function fixture(t: test.TestContext, opts: { ignore?: string } = {}) {
     ref: "refs/uzi-terminal-local/run-1/g2" };
 }
 
+describe("defaultBranchName under a report-proof budget", () => {
+  test("an already-aborted budget returns undefined promptly instead of reading", async (t) => {
+    const f = await fixture(t);
+    const started = Date.now();
+    const name = await f.git.withReportProofBudget({ signal: AbortSignal.abort(), deadline: Date.now() + 60_000 },
+      () => f.git.defaultBranchName(f.bare));
+    assert.equal(name, undefined);
+    assert.ok(Date.now() - started < 2000, `took ${Date.now() - started} ms`);
+  });
+});
+
 describe("captureTerminalSnapshot", () => {
   test("captures dirty and untracked work into a snapshot tree and leaves the clone untouched", async (t) => {
     const f = await fixture(t);
