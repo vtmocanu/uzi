@@ -26,7 +26,7 @@
 # vX.Y.Z-rc.N), release.yml publishes the images + chart, and this publishes the matching
 # formula only after that tag's release.yml succeeds. brew stays a SEPARATE workflow
 # because a failed tap push must not redden the image+chart release.
-# If the proof times out, first wait for the same tag's release.yml to succeed, then
+# If the five-hour proof times out, first wait for the same tag's release.yml to succeed, then
 # recover the failed Brew run with `gh run rerun <brew-run> --failed`.
 #
 # The default GITHUB_TOKEN cannot write to a second repo, so the cross-repo push uses
@@ -62,7 +62,7 @@ permissions:
 jobs:
   assert-release-published:
     runs-on: ubuntu-latest
-    timeout-minutes: 65
+    timeout-minutes: 310
     permissions:
       contents: read
       actions: read
@@ -102,7 +102,7 @@ jobs:
       - name: Wait for the same tag's release publication
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python3 -I scripts/release-ci-coverage.py published HEAD --tag "$INPUT_TAG" --wait 3600 --interval 15
+        run: python3 -I scripts/release-ci-coverage.py published HEAD --tag "$INPUT_TAG" --wait 18000 --interval 15
 
   publish-formula:
     # Serialize only the tap read/guard/write interval. Publication proofs can wait
