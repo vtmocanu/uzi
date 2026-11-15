@@ -239,6 +239,8 @@ checks none of these; it reads only the maintenance hold
 its D5 custody gate, the image prunes, terminal maintenance (#2257), PVC recycle
 and the #3891 leg. No image or volume prune is added.
 
+(AI-synced 2026-11-15, #4362) Hibernation inventory: this leg stays an uncovered writer (`dind_builder`). No settlement or epoch baseline was established for its daemon-side work (a docs-only negative result), and no pressure prune is deferred; see [PRD #4208](../prds/4208-worker-hibernation-volume-retirement.md) D16.
+
 - **Owner boundary.** The standard is "no worse than a fresh worker": the same
   preserved Git and capture inputs, with an empty ordinary build cache.
   Accepted: ordinary `regular` build-cache misses, meaning slower rebuilds, loss
