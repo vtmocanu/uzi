@@ -310,6 +310,102 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
 
   }
 
+  for (const stop of ["deadline", "cancel", "fence"] as const) {
+    it(`M2 raw teardown remains owned through ${stop}`, async (t) => {
+      const claim = claimFor(2632, { secrets: CODEX_SECRETS, claim_generation: 1 });
+      let release!: () => void;
+      let entered!: () => void;
+      const barrier = new Promise<void>(resolve => { release = resolve; });
+      const started = new Promise<void>(resolve => { entered = resolve; });
+      let pending = false;
+      let rawDone = false;
+      let runDone = false;
+      let hookDone = false;
+      let gateDone = false;
+      let worktree = "";
+      let interrupt!: () => void;
+      let deadlineFire!: () => void;
+      let steering!: SteeringChannel;
+      let sink!: { isHeld(): boolean };
+      const timer = globalThis.setTimeout;
+      t.mock.method(globalThis, "setTimeout", ((fn: () => void, ms: number, ...args: unknown[]) => {
+        if (ms === 30_000) {
+          deadlineFire = fn;
+          return { unref() { return this; } } as unknown as ReturnType<typeof setTimeout>;
+        }
+        return Reflect.apply(timer, globalThis, [fn, ms, ...args]);
+      }) as typeof setTimeout);
+      client.registrationNonce = () => "original-nonce";
+      client.supportsInPlaceCodexCredentialSwitch = () => true;
+      client.getRunOwnership = async () => ({ status: "running", claim_generation: 1, claim_released: false, hold_reason: null });
+      const operation = { generation: 1, op_id: "current-op", target_secret_id: "target" };
+      client.getInputs = async () => ({ inputs: [], ...(pending ? { credentialSwitch: operation } : {}) });
+      client.preflightCodexCredentialSwitch = async () => ({
+        kind: "ready", claimGeneration: 1, registerNonce: "original-nonce", opId: "current-op",
+      });
+      client.applyCredentialSwitch = async () => { assert.fail("apply after interruption"); };
+      const report = client.reportState.bind(client);
+      client.reportState = (async (id, body, ...args) => {
+        if (body.status === "credential_switch_hold_settled") assert.equal(rawDone, true);
+        assert.ok(!["credential_switch_failed", "credential_switch_uncertain"].includes(body.status),
+          "interruption must not mutate the server operation");
+        return report(id, body, ...args);
+      }) as typeof client.reportState;
+      const runner = runnerFor({
+        // Deliberately no optional joinOwnedOperations: the lease owns this promise.
+        suspendCodexEpoch: async () => ({
+          reconcileA: async () => ({ kind: "ready" }),
+          persistRollout: async () => ({ kind: "usable", sessionId: "saved-A" }),
+          reopenA: async () => { assert.fail("A reopened"); },
+          teardown: async () => { entered(); await barrier; rawDone = true; return true; },
+          publishB: async () => { assert.fail("B published"); },
+          restartAndResume: async () => { assert.fail("B resumed"); },
+          startFreshLineage: async () => { assert.fail("B started"); },
+          finishB: async () => { assert.fail("B finished"); },
+        }),
+        async run(ctx) {
+          worktree = ctx.worktreePath;
+          fs.writeFileSync(path.join(worktree, "retained.txt"), "A work");
+          pending = true;
+          const internal = runner as unknown as {
+            runGatedSink(flight: { steering: SteeringChannel; sinkGate: typeof sink }, fn: () => Promise<unknown>, bound?: unknown): Promise<unknown>;
+          };
+          const original = internal.runGatedSink.bind(runner);
+          internal.runGatedSink = async (flight, fn, bound) => {
+            steering = flight.steering;
+            sink = flight.sinkGate;
+            try { return await original(flight, fn, bound); }
+            finally { gateDone = true; }
+          };
+          interrupt = () => {
+            if (stop === "cancel") (steering as unknown as { commitCancel(): void }).commitCancel();
+            else if (stop === "fence") client.registrationNonce = () => "successor-nonce";
+            deadlineFire();
+          };
+          try { await ctx.attemptCodexCredentialSwitch!({ site: "implement_turn", laneSettled: true }); }
+          finally { hookDone = true; internal.runGatedSink = original; }
+          assert.fail("A continued");
+        },
+      });
+      (runner as unknown as { credentialSwitchLedger: unknown }).credentialSwitchLedger = {
+        stateOf: async () => undefined,
+        markSending: async () => { assert.fail("ledger apply after interruption"); },
+      };
+      const running = runner.execute(claim).finally(() => { runDone = true; });
+      await started;
+      interrupt();
+      // Event-loop barrier lets the abort race and finalizers run without a timed sleep.
+      await new Promise<void>(resolve => setImmediate(resolve));
+      const beforeRelease = { hookDone, gateDone, runDone, held: sink.isHeld() };
+      release();
+      await running;
+      assert.deepEqual(beforeRelease, { hookDone: false, gateDone: false, runDone: false, held: true });
+      assert.equal(rawDone, true);
+      assert.deepEqual(operation, { generation: 1, op_id: "current-op", target_secret_id: "target" });
+      assert.equal(fs.readFileSync(path.join(worktree, "retained.txt"), "utf8"), "A work");
+    });
+  }
+
   for (const outcome of ["policy_refusal", "baseline_missing", "failed_clear", "ready", "missing_negotiation", "persist_failed", "persist_threw", "released_after_clear", "unproven", "busy_after", "vault_after", "route_after", "refused_after", "lost_after", "fenced_after", "superseded_after", "applied_after", "ledger_after", "ack_after", "budget_after", "newop_after", "no_op_after"] as const) {
     it(`M2 firsthalf Codex Runner ${outcome}`, async (t) => {
       const claim = claimFor(2630, { secrets: CODEX_SECRETS, claim_generation: 1 });

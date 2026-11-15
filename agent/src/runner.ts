@@ -17139,7 +17139,20 @@ export class RunRunner {
               return retain();
             };
             let reaped = false;
-            try { reaped = await effect(() => a.teardown(bounds)); } catch { guard(); }
+            // Register the obligation before teardown can start or the effect guard can throw.
+            flight.retainedSwitchSettlement = "unproven";
+            let rawTeardown: Promise<boolean> | undefined;
+            try {
+              reaped = await effect(() => {
+                rawTeardown = a.teardown(bounds);
+                return rawTeardown;
+              });
+            } catch { guard(); }
+            finally {
+              // The lease promise itself owns cleanup; the executor may have no join hook.
+              // Keep sink custody through cancellation, fencing and deadline interruption.
+              if (rawTeardown) await rawTeardown.catch(() => {});
+            }
             if (!reaped) {
               flight.retainedSwitchSettlement = "unproven";
               hold.cancel();
