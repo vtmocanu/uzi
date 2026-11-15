@@ -267,9 +267,10 @@ function assertPlainStop(r: Rig, why: string): void {
   assert.equal(treeHash(r.pred.clonePath), r.before, `${why}: custody and clone untouched`);
 }
 
-function journaledGenerations(r: Rig): unknown[] {
+function journaledGenerations(r: Rig, runId = r.runId): unknown[] {
   return r.lines
-    .filter(l => (l as { msg?: string }).msg === "outbox: terminal journaled write-ahead")
+    .filter(l => (l as { msg?: string; run_id?: string }).msg === "outbox: terminal journaled write-ahead" &&
+      (l as { run_id?: string }).run_id === runId)
     .map(l => (l as { claim_generation?: number }).claim_generation);
 }
 
@@ -527,28 +528,88 @@ describe("issue #3860: owner cancel at a held-predecessor refusal", { skip: !HAS
     assertPlainStop(r, "timeout");
   });
 
-  it("a fresh-claim held-source refusal invokes the helper once but incomplete ownership cannot authorize cancel", async t => {
-    const r = await rig(t, { site: "B", iid: 3950, outbox: "ok" });
-    const freshRunId = randomUUID();
-    t.mock.method(r.runner as Priv, "runnerCloneForClaim", async () => {
-      api.setInputs(freshRunId, [input("cancel")]);
-      api.cancellationRequested.set(freshRunId, true);
-      throw new SourceUseHeldRefusal("held_unended (fixture, fresh seed)");
+  for (const complete of [false, true]) {
+    it(`a fresh-claim held-source refusal: ${complete ? "complete ownership authorizes cancel" : "incomplete ownership cannot authorize cancel"}`, async t => {
+      const freshRunId = randomUUID();
+      let preCalls = 0;
+      let freshGetsAtSeam = 0;
+      let preError: unknown;
+      const r = await rig(t, {
+        site: "B", iid: complete ? 3952 : 3950, outbox: "ok",
+        pre: (_rg, flight, claim) => {
+          preCalls++;
+          freshGetsAtSeam = api.inputGets.get(freshRunId) ?? 0;
+          try {
+            assert.equal(claim.run_id, freshRunId);
+            assert.equal(flight.runId, freshRunId, "inspect the actual fresh flight before the helper runs");
+            assert.equal(flight.claimGeneration, 2);
+            for (const latch of ["retainedLocalCustody", "retainedEpisodeCustody", "preserveRecoveryClone",
+              "preserveSession", "keepGuardedInventoryOpen"]) {
+              assert.equal(flight[latch], true, `${latch} is latched synchronously by disposeHeldSource`);
+            }
+            assert.equal(flight.steering.isCancelled(), false, "the helper has not committed cancellation yet");
+          } catch (err) {
+            preError = err;
+            throw err;
+          }
+        },
+      });
+      t.mock.method(r.runner as Priv, "runnerCloneForClaim", async () => {
+        api.setInputs(freshRunId, [input("cancel")]);
+        api.cancellationRequested.set(freshRunId, true);
+        throw new SourceUseHeldRefusal("held_unended (fixture, fresh seed)");
+      });
+      if (complete) api.ownershipWire.set(freshRunId, res => {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "running", claim_generation: 2,
+          claim_released: false, cancellation_requested: true }));
+      });
+      // Observe the real durable journal before the send can settle or retire it.
+      const journalTerminal = r.outbox!.journalTerminal.bind(r.outbox!);
+      const journals: Array<{ runId: string; generation: number; body: Record<string, unknown> }> = [];
+      t.mock.method(r.outbox!, "journalTerminal", async (...args: Parameters<Outbox["journalTerminal"]>) => {
+        const result = await journalTerminal(...args);
+        const journal = await r.outbox!.readTerminalJournal(args[0], args[1]);
+        assert.ok(journal, "write-ahead journal is readable for its explicit run and generation");
+        journals.push({ runId: args[0], generation: args[1], body: journal.body });
+        return result;
+      });
+      api.setOwnershipStatus(freshRunId, "running", 2);
+      await r.runner.execute(gitlabClaim(3951, { run_id: freshRunId, claim_generation: 2 }));
+      // execute handles seam errors as run failures; surface fixture assertions to node:test.
+      if (preError !== undefined) throw preError;
+      assert.equal(preCalls, 1);
+      assert.equal(r.seamCalls(), 1, "the held-source refusal invokes the helper exactly once");
+      assert.equal(r.started(), 0, "no executor starts");
+      assert.equal(api.ownershipRequests.filter(id => id === freshRunId).length, 1, "one bounded ownership cancel read");
+      assert.equal(r.flight.steering.isCancelled(), complete);
+      assert.equal(api.inputGets.get(freshRunId) ?? 0, freshGetsAtSeam, "the seam never reads fresh-run inputs");
+      const outcomes = api.states.filter(s => s.runId === freshRunId && s.body.status !== "running");
+      if (complete) {
+        assert.equal(outcomes.length, 1, "exactly one fresh-run outcome");
+        const outcome = outcomes[0];
+        assert.ok(outcome);
+        assert.deepEqual(outcome.body, { status: "failed", failure_reason: "run cancelled" });
+        assert.deepEqual(journaledGenerations(r, freshRunId), [2]);
+        assert.deepEqual(journals, [{ runId: freshRunId, generation: 2, body: outcome.body }],
+          "the fresh-run journal contains exactly the delivered cancellation contract");
+      } else {
+        // The default DTO omits claim_released: false; readCancellationRequested fails closed.
+        assert.deepEqual(outcomes, [], "no fresh-run terminal or hold outcome");
+        assert.deepEqual(journaledGenerations(r, freshRunId), [], "no unauthorized fresh-run journal");
+        assert.deepEqual(journals, []);
+        assert.equal(await r.outbox!.readTerminalJournal(freshRunId, 2), undefined);
+      }
+      assert.equal(api.pendingInputRows(freshRunId).some(row => row.kind === "cancel"), true,
+        "the seam observes ownership without consuming the persisted cancel");
+      assert.deepEqual(api.states.filter(s => s.runId === r.runId), [], "no predecessor state mutation");
+      assert.deepEqual(journaledGenerations(r, r.runId), [], "no predecessor journal");
+      assert.equal(await r.outbox!.readTerminalJournal(r.runId, r.generation), undefined);
+      assert.equal(treeHash(r.pred.clonePath), r.before, "predecessor custody is untouched");
+      assert.ok(r.lines.some(l => String((l as { msg?: string }).msg).includes("clone path held by an earlier flight")),
+        "the claim stopped through stopOnHeldSource");
     });
-    api.setOwnershipStatus(freshRunId, "running", 2);
-    await r.runner.execute(gitlabClaim(3951, { run_id: freshRunId, claim_generation: 2 }));
-    assert.equal(r.seamCalls(), 1, "the held-source refusal invokes the helper exactly once");
-    assert.equal(r.started(), 0);
-    assert.equal(api.ownershipRequests.filter(id => id === freshRunId).length, 1, "one bounded ownership cancel read");
-    // The default fixture names the generation and requests cancel, but omits claim_released: false.
-    // readCancellationRequested requires all authorization fields before committing cancellation.
-    assert.equal(r.flight.steering.isCancelled(), false, "incomplete ownership cannot authorize cancel");
-    assert.equal(api.states.some(s => s.runId === freshRunId && s.body.status === "failed"), false, "no terminal report");
-    assert.deepEqual(journaledGenerations(r), [], "no unauthorized terminal outcome is journaled");
-    assert.equal(treeHash(r.pred.clonePath), r.before, "predecessor custody is untouched");
-    assert.ok(r.lines.some(l => String((l as { msg?: string }).msg).includes("clone path held by an earlier flight")),
-      "the claim stopped through stopOnHeldSource");
-  });
+  }
 
   it("issue #4066: a shutdown refusal at the retained predecessor admission is a nonterminal stop, never preservation_failed", async t => {
     const r = await rig(t, { site: "B", iid: 4066, outbox: "ok" });
