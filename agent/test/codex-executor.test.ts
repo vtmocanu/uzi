@@ -32531,6 +32531,15 @@ describe("M2 actualRunner credential replacement", () => {
             if (clearNonceChanged) registrationNonce = "M2-replacement-nonce";
             return { applied: true };
           }
+          if (cleanRetainedStop && body.status === "paused") {
+            const ack = await report(id, body, ...args);
+            // Observe a real acknowledged park transition, never a request-only ACK.
+            if (ack.applied === true && ack.status === "paused") {
+              cleanOwnership.status = ack.status;
+              api.setOwnershipStatus(id, ack.status, body.claim_generation);
+            }
+            return ack;
+          }
           return report(id, body, ...args);
         };
         client.registrationNonce = () => {
