@@ -249,6 +249,85 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
     codex: { auth_mode: "subscription", access_token: "claim-key", capability: "cap", generation: 3, chatgpt_account_id: "verified-account", chatgpt_plan_type: null },
   };
 
+  for (const outcome of ["policy_refusal", "baseline_missing", "failed_clear", "ready", "missing_negotiation", "persist_failed", "persist_threw", "released_after_clear"] as const) {
+    it(`M2 firsthalf Codex Runner ${outcome}`, async () => {
+      const claim = claimFor(2630, { secrets: CODEX_SECRETS, claim_generation: 1 });
+      let pending = false;
+      let reopened = 0;
+      let suspended = 0;
+      let preflights = 0;
+      let apply = 0;
+      let teardown = 0;
+      let continued = false;
+      client.registrationNonce = () => "original-nonce";
+      client.supportsInPlaceCodexCredentialSwitch = () => outcome !== "missing_negotiation";
+      client.getRunOwnership = async () => ({ status: "running", claim_generation: 1,
+        claim_released: outcome === "released_after_clear" && !pending, hold_reason: null });
+      client.getInputs = async () => ({ inputs: [], ...(pending ? { credentialSwitch: {
+        generation: 1, op_id: "current-op", target_secret_id: "target",
+      } } : {}) });
+      client.preflightCodexCredentialSwitch = async () => {
+        preflights++;
+        const coords = { claimGeneration: 1, registerNonce: "original-nonce", opId: "current-op" };
+        return outcome === "ready" ? { kind: "ready", ...coords } :
+          { kind: "not_applied", reason: outcome === "baseline_missing" ? outcome : "policy_refusal", ...coords };
+      };
+      client.applyCredentialSwitch = async () => { apply++; throw new Error("apply forbidden"); };
+      const report = client.reportState.bind(client);
+      client.reportState = (async (id, body, ...args) => {
+        if (body.status === "credential_switch_failed") {
+          assert.equal(body.op_id, "current-op");
+          if (outcome === "failed_clear") return { applied: false };
+          pending = false;
+          return { applied: true };
+        }
+        return report(id, body, ...args);
+      }) as typeof client.reportState;
+      let worktree = "";
+      const executor: Executor = {
+        suspendCodexEpoch: async () => {
+          suspended++;
+          return {
+            reconcileA: async () => ({ kind: "ready" }),
+            persistRollout: async () => {
+              if (outcome === "persist_threw") throw new Error("save failed");
+              return outcome === "persist_failed" ? { kind: "failed" } : { kind: "usable", sessionId: "saved-A" };
+            },
+            reopenA: async () => { reopened++; },
+            teardown: async () => { teardown++; return true; },
+            publishB: async () => { throw new Error("B forbidden"); },
+            restartAndResume: async () => { throw new Error("B forbidden"); },
+            startFreshLineage: async () => { throw new Error("B forbidden"); },
+            finishB: async () => { throw new Error("B forbidden"); },
+          };
+        },
+        async run(ctx) {
+          worktree = ctx.worktreePath;
+          fs.writeFileSync(path.join(worktree, "retained.txt"), "A work");
+          pending = true;
+          const result = await ctx.attemptCodexCredentialSwitch!({ site: "implement_turn", laneSettled: true });
+          assert.equal(result, "continued_A");
+          continued = true;
+          throw new CredentialSwitchSignal();
+        },
+      };
+      const runner = runnerFor(executor);
+      (runner as unknown as { credentialSwitchLedger: unknown }).credentialSwitchLedger = {
+        stateOf: async () => undefined,
+      };
+      await runner.execute(claim);
+      const refusal = outcome === "policy_refusal" || outcome === "baseline_missing" || outcome === "persist_failed" || outcome === "persist_threw";
+      assert.equal(continued, refusal);
+      assert.equal(reopened, refusal ? 1 : 0);
+      assert.equal(suspended, outcome === "missing_negotiation" ? 0 : 1);
+      assert.equal(preflights, ["missing_negotiation", "persist_failed", "persist_threw"].includes(outcome) ? 0 : 1);
+      assert.equal(apply, 0);
+      assert.equal(teardown, 0);
+      assert.equal(fs.readFileSync(path.join(worktree, "retained.txt"), "utf8"), "A work");
+      assert.ok(!api.states.some(s => s.runId === claim.run_id && s.body.status === "credential_switch"));
+    });
+  }
+
   for (const entry of ["escaped", "claude_hook"] as const) {
     it(`M2 Codex ${entry} retains work without legacy release`, async () => {
       const claim = claimFor(2625, { secrets: CODEX_SECRETS });

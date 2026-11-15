@@ -349,6 +349,27 @@ describe("Codex switch wire contract", () => {
     } finally { await s.close(); }
   });
 
+  it("preflight bounds response-body reading with the transport signal", async () => {
+    const s = await server(() => json(200, {}), registration);
+    let finish!: () => void;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const c = await codexRegistered(s.url);
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) { finish = () => controller.close(); controller.enqueue(new TextEncoder().encode("{")); },
+      });
+      (c as unknown as { fetchRaw: () => Promise<Response> }).fetchRaw = async () => new Response(body);
+      const cancel = new AbortController();
+      const pending = c.preflightCodexCredentialSwitch("r", { ...REQ, targetSecretId: "target" }, cancel.signal);
+      await new Promise<void>(resolve => setImmediate(resolve));
+      cancel.abort();
+      const result = await Promise.race([pending, new Promise<string>(resolve => {
+        timer = setTimeout(() => resolve("body did not abort"), 100);
+      })]);
+      assert.deepEqual(result, { kind: "uncertain", detail: "preflight_unavailable" });
+    } finally { clearTimeout(timer); try { finish(); } catch {} await s.close(); }
+  });
+
   it("preflight sends explicit target and returns server current coordinates", async () => {
     const s = await server(() => json(200, { outcome: "ready", claim_generation: 8, register_nonce: "current", op_id: "current-op" }), registration);
     try {
