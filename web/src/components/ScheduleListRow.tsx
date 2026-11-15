@@ -76,7 +76,13 @@ export function ScheduleListRow({
   onAddRepo,
   onShowInCatalog,
   onEnableElsewhere,
+  revealed,
+  onRevealedBlur,
 }: {
+  // True while this row is the target of a deep-link reveal: the name block shows a ring
+  // and data-revealed until it loses focus (onRevealedBlur).
+  revealed?: boolean;
+  onRevealedBlur?: () => void;
   s: Schedule;
   // The display name (catalog entry name for a default row, target title for a user row).
   name: string;
@@ -210,7 +216,12 @@ export function ScheduleListRow({
               <div
                 id={scheduleNameId(s.id)}
                 tabIndex={-1}
-                className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded font-medium text-fg outline-hidden focus-visible:ring-2 focus-visible:ring-brand/60"
+                data-revealed={revealed ? "true" : undefined}
+                onBlur={revealed ? onRevealedBlur : undefined}
+                className={cx(
+                  "flex flex-wrap items-center gap-x-2 gap-y-1 rounded font-medium text-fg outline-hidden focus-visible:ring-2 focus-visible:ring-brand/60",
+                  revealed && "ring-2 ring-brand/60",
+                )}
               >
                 <span>{name}</span>
                 {isDefault && s.target !== "self_improve" && (

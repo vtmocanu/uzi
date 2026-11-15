@@ -3,7 +3,8 @@ import { expect, it } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { parseFrontmatter, resolveFromDocs } from "./docs";
+import { resolveFromDocs } from "./docs";
+import { parseFrontmatter } from "./docFrontmatter";
 import { rehypeHeadingIds } from "./rehypeHeadingIds";
 
 // Include README and repo-only docs as well as the routable docs.ts corpus.

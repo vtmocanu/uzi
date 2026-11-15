@@ -3,16 +3,15 @@ import {
   REPO_BLOB_BASE,
   isRoutableDoc,
   listOperatorDocs,
-  parseFrontmatter,
   resolveFromDocs,
   resolveHref,
   resolveImageSrc,
   rewriteHref,
   sortDocsForIndex,
   summarize,
-  type Audience,
   type Doc,
 } from "./docs";
+import { parseFrontmatter, type Audience } from "./docFrontmatter";
 
 function doc(slug: string, order: number | null, audience: Audience = "user"): Doc {
   return { slug, meta: { title: slug, order, audience }, body: "", summary: "" };

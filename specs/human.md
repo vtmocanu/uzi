@@ -1925,6 +1925,14 @@ Design record: issue #4345 (Overview epic #3873, TUI parity).
 - The floor's one state word and single-cell glyph show checking completion, reworking unmet milestones, a blocked completion hold, a live plan or code cross-check, and a plan-gate revise, block, or unavailable reason. Existing human stops, stalled health, account cooldown, and a revising plan keep precedence. Completion wins over a simultaneous advisory code check on the row; detail shows both. A completion-blocked hold belongs in NEEDS YOU and adds a distinct `‖ N` summary count (maintainer decision 2026-11-14). (AI-synced 2026-11-14)
 - The single-run API detail read carries the same live `cross_check_active` presence as the lists, so direct TUI entry and refresh do not depend on a board snapshot. The run detail names each applicable fact; `uzi run get` prints `CROSS_CHECK` while live. Unmet milestone ids are sanitized. (AI-synced 2026-11-14)
 
+## Feature #4373 — Command menu finds sections, named things and doc headings
+
+Design record: issue #4373 (extends PRD `prds/done/3875-command-menu.md`).
+
+- Typing in the command menu also finds Settings and Admin tabs (admin entries for admins only), the Admin Settings sections that always render after a normal load (never the config-conditional vault migration or SSO cards), agents, schedules, workers and skills by name, recent runs by `#N` or title (only runs inside the list cap), and viewer-readable docs by title and section heading. An empty query shows only the original groups. Choosing an item only navigates. (AI-synced 2026-11-15)
+- Ranking stays global (prefix, then word start, then substring); each new group shows at most five rows with a "+N more" note. Each list is read once per opening, never polled; a late response after close is dropped and a failed read hides only the groups built from it (a failed run-list read hides Needs you and Recent runs). API text is stripped of unsafe characters and repo paths are masked in demo mode. (AI-synced 2026-11-15)
+- Deep links reveal an item after load, on direct entry too: `/schedules?tab=schedules#schedule-name-<id>`, `/workers?tab=workers#worker-row-<id>` (scroll, focus, highlight) and `/skills?skill=<id>` (opens the skill). Admin Settings scrolls to any advertised section only after a successful load; a failed load stays at the top. Doc heading links use the doc page's own heading ids, computed at build time; untrusted markdown never gets heading ids. (AI-synced 2026-11-15)
+
 ## Demo mode branding
 
 - Web demo mode shows the stock uzi factory icon and wordmark, default tab title and favicon base, and hides all instance POWERED BY branding and the optional build-time license credit. Toggling it off restores the real branding live. This is per-device presentation only; server settings and the Admin Branding live preview stay real. (AI-synced 2026-11-01)

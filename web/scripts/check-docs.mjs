@@ -36,7 +36,7 @@ const warnings = [];
 const fail = (file, msg) => errors.push(`${file}: ${msg}`);
 const warn = (file, msg) => warnings.push(`${file}: ${msg}`);
 
-// Leading-fence frontmatter parser — a mirror of web/src/lib/docs.ts so the
+// Leading-fence frontmatter parser — a mirror of web/src/lib/docFrontmatter.ts (parseFrontmatter) so the
 // gate accepts exactly what the viewer parses. Returns meta:null when there is
 // no leading `---` fence at byte 0.
 function parseFrontmatter(raw) {

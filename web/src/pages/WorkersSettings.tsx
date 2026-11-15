@@ -4,7 +4,7 @@
 // (fleet status, upgrade rolls, the sidebar attention badge), not a preference.
 
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
-import { Link, useSearchParams } from "react-router-dom";
+import { Link, useLocation, useSearchParams } from "react-router-dom";
 
 import { api, type BindMode, type Worker } from "../lib/api";
 import { ApiError, errorMessage } from "../lib/apiError";
@@ -42,6 +42,7 @@ const deleteButtonId = (workerId: string) => `worker-delete-${workerId}`;
 // tabIndex={-1} so the at-quota "delete one to provision another" jump can focus the
 // first hosted row's CONTAINER after crossing tabs (D10) — never a Delete button.
 const rowId = (workerId: string) => `worker-row-${workerId}`;
+const WORKER_HASH_PREFIX = "#worker-row-";
 // Stable id for the row's worker-name <span>, mirroring rowId/deleteButtonId. The row
 // <li> points aria-labelledby here so a screen reader announces the worker's name when
 // the at-quota jump programmatically focuses the row — an aria-label would suppress the
@@ -531,6 +532,42 @@ export function WorkersSettings() {
     }
   }, [loading, workers.length, searchParams]);
 
+  // Deep link `#worker-row-<encodeURIComponent(id)>` (command menu, pasted URL): once per
+  // location.key, switch to Your workers (also from the Add tab of a mounted page) and queue
+  // a reveal. It sits after the landing-tab effect and takes the latch so that effect cannot
+  // overwrite the tab it sets. The reveal effect below waits for the load and for the panel
+  // to un-hide; an id the list does not hold is dropped without moving focus.
+  const location = useLocation();
+  const consumedLocationKey = useRef<string | null>(null);
+  const [pendingReveal, setPendingReveal] = useState<string | null>(null);
+  const [revealedId, setRevealedId] = useState<string | null>(null);
+  useEffect(() => {
+    if (!location.hash.startsWith(WORKER_HASH_PREFIX)) return;
+    if (consumedLocationKey.current === location.key) return;
+    consumedLocationKey.current = location.key;
+    let id: string;
+    try {
+      id = decodeURIComponent(location.hash.slice(WORKER_HASH_PREFIX.length));
+    } catch {
+      return;
+    }
+    if (!id) return;
+    initialTabApplied.current = true;
+    setTab("workers");
+    setRevealedId(null);
+    setPendingReveal(id);
+  }, [location.key, location.hash]);
+  useEffect(() => {
+    if (!pendingReveal || loading || tab !== "workers") return;
+    setPendingReveal(null);
+    if (!workers.some((w) => w.id === pendingReveal)) return;
+    const el = document.getElementById(rowId(pendingReveal));
+    if (!el) return;
+    el.scrollIntoView?.({ block: "nearest" });
+    el.focus();
+    setRevealedId(pendingReveal);
+  }, [pendingReveal, loading, tab, workers]);
+
   // Move focus to whatever we just announced. Deleting destroys the control the user
   // acted through — the row and its button both go — so focus would otherwise land on
   // <body>, and delete→provision is a LOOP: the user deletes in order to provision, so
@@ -770,6 +807,14 @@ export function WorkersSettings() {
                 // hosted row's container here (D10). Harmless on every row.
                 id={rowId(w.id)}
                 tabIndex={-1}
+                data-revealed={revealedId === w.id ? "true" : undefined}
+                onBlur={
+                  revealedId === w.id
+                    ? (e) => {
+                        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setRevealedId(null);
+                      }
+                    : undefined
+                }
                 // Named by its worker-name <span> (below) so a screen reader announces the
                 // worker when the at-quota jump focuses this row. aria-label would suppress
                 // the badges; aria-labelledby names the row without hiding them.
@@ -778,7 +823,10 @@ export function WorkersSettings() {
                 // focus-ring rule (index.css) excludes [tabindex="-1"], and this row is ONLY
                 // ever focused programmatically (never a tab stop), so a plain :focus ring —
                 // the app's ring convention — is safe: it can only appear right after the jump.
-                className="flex flex-col gap-2 rounded-lg border border-edge bg-raised/40 px-3 py-2.5 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring focus:ring-offset-2 focus:ring-offset-ink"
+                className={cx(
+                  "flex flex-col gap-2 rounded-lg border border-edge bg-raised/40 px-3 py-2.5 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring focus:ring-offset-2 focus:ring-offset-ink",
+                  revealedId === w.id && "ring-2 ring-brand/60 ring-offset-2 ring-offset-ink",
+                )}
               >
                 <WorkerCordonControls worker={w} disabled={rowBusy.has(w.id) || confirmingDelete === w.id}
                   hideAction={confirmingDelete === w.id}
