@@ -1,5 +1,5 @@
 // The default Overview at /dashboard (PRD #3877 M1): the same data as the classic page through
-// the shared useOverviewData hook, with a header that carries a status sentence (and, for an
+// the shared useOverviewData hook, with a compact header (and, for an
 // admin, the health chip) above the app-wide banner stack. The classic page stays linked
 // at /overview/classic until M2 retires it.
 
@@ -17,13 +17,11 @@ import { maskName } from "../lib/demoMask";
 import { useOverviewData } from "../lib/useOverviewData";
 import { issueLineModel, issueLineOtherRuns, issueWorkScope, type IssueStage } from "../lib/issueLine";
 import {
-  decisionCount,
   mergeOverviewRows,
   overviewCounts,
   overviewDecisions,
   ownRecoveryWaitCount,
   setupComplete,
-  statusSentence,
   workerJoined,
 } from "../lib/overview";
 import { OverviewUsageCard } from "../components/OverviewUsageCard";
@@ -106,8 +104,7 @@ function OverviewNextPage() {
   const decisions = overviewDecisions(ownRuns, holds);
   // The counts follow the viewer's scope: own runs, or for an admin every user's runs
   // while the admin list is readable. An unreadable admin list falls back to the viewer's
-  // own runs and the sentence says so.
-  const adminUnavailable = isAdmin && adminRuns.failed;
+  // own runs. The Runs card reports the fallback with its existing message.
   const factoryRows =
     isAdmin && adminRuns.runs != null && !adminRuns.failed
       ? mergeOverviewRows(ownRuns, adminRuns.runs, user.email)
@@ -121,16 +118,8 @@ function OverviewNextPage() {
         otherRuns: issueLineOtherRuns({ scope: lineScope, adminRuns, viewerEmail: user.email }),
       })
     : null;
-  const sentence = data
-    ? statusSentence({
-        decisions: decisionCount(decisions),
-        prs: decisions.filter((d) => d.kind === "pr").length,
-        counts: overviewCounts(factoryRows ?? ownRuns),
-        acrossFactory: factoryRows != null,
-        adminUnavailable,
-        executingPeople: factoryRows ? executingPeople(factoryRows, user.email) : undefined,
-      })
-    : undefined;
+  const runTotals = data ? overviewCounts(factoryRows ?? ownRuns) : null;
+  const calm = data !== null && holds !== null && !holdsFailed && decisions.length === 0;
   // The People chip's model: admins only, from the viewer's own runs plus the admin list, users
   // and usage. Each source degrades on its own (see peopleModel).
   const people = isAdmin
@@ -175,7 +164,12 @@ function OverviewNextPage() {
       <InShellHeader>
         <PageHeader
           title={`Welcome${user.display_name ? `, ${maskName(user.display_name, demo)}` : ""}`}
-          description={sentence}
+          actionsClassName="min-[1440px]:min-w-0 min-[1440px]:flex-1 min-[1440px]:basis-0 min-[1440px]:flex-nowrap min-[1440px]:justify-end min-[1440px]:gap-1 min-[1440px]:[&>div>button]:px-1.5 min-[1440px]:[&>div>button]:text-[11px] min-[1440px]:[&>button]:px-1.5 min-[1440px]:[&>button]:text-[11px]"
+          description={
+            <Link to="/overview/classic" className="font-medium text-brand hover:text-brand-hover">
+              Back to the old Overview
+            </Link>
+          }
           actions={
             <>
               {isAdmin && <HealthChip />}
@@ -194,9 +188,6 @@ function OverviewNextPage() {
                   </kbd>
                 </Button>
               )}
-              <Link to="/overview/classic" className="text-sm font-medium text-brand hover:text-brand-hover">
-                Back to the old Overview
-              </Link>
             </>
           }
         />
@@ -213,6 +204,12 @@ function OverviewNextPage() {
 
       {/* The viewer's own items only (decisions is computed from ownRuns). */}
       <NeedsDecisionCard items={decisions} now={now} demo={demo} />
+      {calm && (
+        <p role="status" className="flex items-center gap-2 text-sm text-muted">
+          <span aria-hidden="true" className="h-2 w-2 rounded-full bg-ok" />
+          Nothing needs you right now.
+        </p>
+      )}
 
       {lineModel && (
         <IssueLine
@@ -253,6 +250,9 @@ function OverviewNextPage() {
             stage={lineStage}
             scope={lineScope}
             prRuns={lineModel?.prs}
+            totals={runTotals}
+            acrossFactory={factoryRows != null}
+            executingPeople={factoryRows ? executingPeople(factoryRows, user.email) : undefined}
           />
         </div>
         {/* Below xl the rail is full width: Capacity and Held work sit side by side from lg. */}

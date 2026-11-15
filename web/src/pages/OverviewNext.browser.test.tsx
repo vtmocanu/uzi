@@ -113,6 +113,71 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
+describe("compact Overview header (#4366)", () => {
+  async function mountHeader(width: number) {
+    await page.viewport(width, 900);
+    render(
+      <MemoryRouter initialEntries={["/dashboard"]}>
+        <AppShell>
+          <OverviewNext />
+        </AppShell>
+      </MemoryRouter>,
+    );
+    const title = await screen.findByRole("heading", { name: /Welcome/ });
+    const back = screen.getByRole("link", { name: "Back to the old Overview" });
+    const health = await screen.findByRole("button", { name: /^System health:/ });
+    const people = await screen.findByRole("button", { name: /^People:/ });
+    const repos = await screen.findByRole("button", { name: /^Repos:/ });
+    const agents = await screen.findByRole("button", { name: /^Agents:/ });
+    const search = screen.getByRole("button", { name: /^Search/ });
+    await document.fonts.ready;
+    return { title, back, chips: [health, people, repos, agents, search] };
+  }
+
+  it("keeps all five chips on the title row at 1440px, with Back below the title and first in tab order", async () => {
+    const { title, back, chips } = await mountHeader(1440);
+    // The normal test fixture's unavailable People/Repos copy is short. Populate each chip
+    // with the long, real demo labels so this layout test catches a crowded header.
+    const labels = [
+      "1 check needs attention right now",
+      "9 people active now out of 14",
+      "3 repositories active now out of 6",
+      "9 agents in your runs out of 10",
+    ];
+    for (let i = 0; i < labels.length; i++) {
+      const text = chips[i].querySelector<HTMLElement>(".truncate");
+      expect(text).not.toBeNull();
+      text!.textContent = labels[i];
+    }
+    const titleRect = title.getBoundingClientRect();
+    const backRect = back.getBoundingClientRect();
+    expect(backRect.top).toBeGreaterThan(titleRect.top);
+    for (const chip of chips) {
+      const rect = chip.getBoundingClientRect();
+      expect(rect.top, chip.getAttribute("aria-label") ?? chip.textContent ?? "chip").toBeLessThan(titleRect.bottom + 2);
+    }
+    back.focus();
+    expect(document.activeElement).toBe(back);
+    for (const chip of chips) {
+      await userEvent.tab();
+      expect(document.activeElement).toBe(chip);
+    }
+  });
+
+  it("wraps the chips below the title at 400px without horizontal page overflow", async () => {
+    const { title, back, chips } = await mountHeader(400);
+    const backRect = back.getBoundingClientRect();
+    expect(backRect.top).toBeGreaterThan(title.getBoundingClientRect().top);
+    expect(chips[0].getBoundingClientRect().top).toBeGreaterThanOrEqual(backRect.bottom);
+    for (const chip of chips) {
+      const rect = chip.getBoundingClientRect();
+      expect(rect.left).toBeGreaterThanOrEqual(0);
+      expect(rect.right).toBeLessThanOrEqual(400);
+    }
+    expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(400);
+  });
+});
+
 describe("promoted Overview routes in the real shell (PRD #3877 M1)", () => {
   const follows = (a: Node, b: Node) => (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
 
@@ -1843,7 +1908,7 @@ describe("OverviewNext health chip popover", () => {
     await document.fonts.ready;
     const before = chip.getBoundingClientRect().left;
     // Wide enough that a stale chip-relative offset would push the panel past the right edge.
-    preceding.style.width = "720px";
+    preceding.style.width = "800px";
     await expect.poll(() => chip.getBoundingClientRect().left - before).toBeGreaterThan(400);
     // Re-placed against the chip's new position: attached to it and inside the viewport.
     await expect

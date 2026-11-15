@@ -88,14 +88,15 @@ async function mount(page: "next" | "classic" = "next") {
   return view;
 }
 
-const sentence = () => screen.getByText(/run(s are| is) executing/).textContent ?? "";
+const totals = () => screen.getByText(/\d+ executing/).textContent ?? "";
 
 describe("OverviewNext for a non-admin", () => {
-  it("shows the greeting, the calm sentence and the run, and calls no admin endpoint", async () => {
+  it("shows the greeting, calm notice and run totals, and calls no admin endpoint", async () => {
     await mount();
     await settle(30_000);
     expect(screen.getByRole("heading", { name: "Welcome, Admin" })).toBeTruthy();
-    expect(sentence()).toBe("Nothing needs you right now. 1 run is executing.");
+    expect(totals()).toBe("1 executing");
+    expect(screen.getByRole("status").textContent).toBe("Nothing needs you right now.");
     expect(screen.getByText("Live run row")).toBeTruthy();
     for (const call of adminEndpoints()) expect(call).not.toHaveBeenCalled();
     expect(screen.getByRole("region", { name: "Your usage" })).toBeTruthy();
@@ -161,7 +162,7 @@ describe("OverviewNext for an admin", () => {
     await mount();
     expect(mockApi.adminListRuns).toHaveBeenCalledWith({ view: "summary" });
     expect(mockApi.adminListRuns).toHaveBeenCalledTimes(1);
-    expect(sentence()).toBe("Nothing needs you right now. 2 runs are executing across the factory for 2 people and 1 queued.");
+    expect(totals()).toBe("2 executing for 2 people · 1 queued");
     expect(screen.getByRole("group", { name: "Usage scope" })).toBeTruthy();
     // The admin's own row is shown once, under Yours; the other users' rows under Other users.
     expect(within(screen.getByRole("list", { name: "Your runs" })).getAllByText("Live run row")).toHaveLength(1);
@@ -174,8 +175,8 @@ describe("OverviewNext for an admin", () => {
     mockApi.adminListRuns.mockRejectedValue(new Error("admin api down"));
     await mount();
     expect(screen.getByText("Live run row")).toBeTruthy();
-    expect(sentence()).toBe("Nothing needs you right now. 1 run is executing. Counting only your runs.");
-    expect(sentence()).not.toContain("across the factory");
+    expect(totals()).toBe("1 executing");
+    expect(screen.getByText("Other users' runs are unavailable")).toBeTruthy();
     expect(screen.getByRole("heading", { name: "Welcome, Admin" })).toBeTruthy();
   });
 
@@ -184,12 +185,12 @@ describe("OverviewNext for an admin", () => {
       runs: [aRun({ id: "x-1", status: "running", owner_email: "mira@uzi.local" })],
     });
     await mount();
-    expect(sentence()).toContain("2 runs are executing across the factory");
+    expect(totals()).toContain("2 executing");
     mockApi.adminListRuns.mockRejectedValueOnce(new Error("blip"));
     await settle(10_000);
-    expect(sentence()).toBe("Nothing needs you right now. 1 run is executing. Counting only your runs.");
+    expect(totals()).toBe("1 executing");
     await settle(10_000);
-    expect(sentence()).toContain("2 runs are executing across the factory");
+    expect(totals()).toContain("2 executing");
   });
 
   it("shows both run groups, and says so when the admin list becomes unavailable", async () => {
@@ -203,8 +204,9 @@ describe("OverviewNext for an admin", () => {
     expect(within(screen.getByRole("list", { name: "Other users' runs" })).getByText("Theirs")).toBeTruthy();
     mockApi.adminListRuns.mockRejectedValueOnce(new Error("blip"));
     await settle(10_000);
-    expect(screen.getByRole("status").textContent).toBe("Other users' runs are unavailable");
-    expect(screen.getByRole("status").parentElement?.textContent).toMatch(/unavailable \(last read/);
+    const unavailable = screen.getByText("Other users' runs are unavailable");
+    expect(unavailable.textContent).toBe("Other users' runs are unavailable");
+    expect(unavailable.parentElement?.textContent).toMatch(/unavailable \(last read/);
     expect(screen.queryByText("Theirs")).toBeNull();
     expect(screen.getByText("Mine")).toBeTruthy();
   });
@@ -361,7 +363,7 @@ describe("Held work card", () => {
     expect(within(card).getByText("holds need a decision")).toBeTruthy();
     expect(within(card).queryByRole("link", { name: /^Review held work/ })).toBeNull();
     expect(screen.queryByText("Needs your decision")).toBeNull();
-    expect(sentence()).toBe("Nothing needs you right now. 1 run is executing.");
+    expect(totals()).toBe("1 executing");
   });
 
   it("counts two decision holds as 2 decisions and lists one held row", async () => {
@@ -370,7 +372,8 @@ describe("Held work card", () => {
       holds: [decisionHold("run-a", "2026-07-05T10:00:00Z"), decisionHold("run-b", "2026-07-05T11:00:00Z")],
     });
     await mount();
-    expect(sentence()).toBe("2 decisions are waiting on you. 1 run is executing.");
+    expect(totals()).toBe("1 executing");
+    expect(screen.queryByText("Nothing needs you right now.")).toBeNull();
     const needs = screen.getByRole("region", { name: "Needs your decision" });
     expect(within(needs).getAllByRole("listitem")).toHaveLength(1);
     expect(within(needs).getByText("Held work needs 2 decisions")).toBeTruthy();
@@ -392,7 +395,8 @@ describe("Held work card", () => {
     });
     await mount();
     expect(screen.getByText(/Held work from run/).textContent).toBe("Held work from run a83c51f0 needs a decision");
-    expect(sentence()).toBe("1 decision is waiting on you. 1 run is executing.");
+    expect(totals()).toBe("1 executing");
+    expect(screen.queryByText("Nothing needs you right now.")).toBeNull();
   });
 
   it("keeps blocked runs a danger headline with no review link and no held row", async () => {
@@ -406,7 +410,7 @@ describe("Held work card", () => {
     expect(within(card).getByRole("heading", { level: 3 }).className).toContain("text-danger");
     expect(screen.queryByRole("link", { name: /^Review held work/ })).toBeNull();
     expect(screen.queryByText("Needs your decision")).toBeNull();
-    expect(sentence()).toBe("Nothing needs you right now. 1 run is executing.");
+    expect(totals()).toBe("1 executing");
   });
 
   it("says held work is unavailable when the holds request fails, and keeps the rest of the page", async () => {
@@ -414,6 +418,7 @@ describe("Held work card", () => {
     await mount();
     expect(within(heldCard()).getByText("Held work is unavailable right now.")).toBeTruthy();
     expect(screen.getByText("Live run row")).toBeTruthy();
+    expect(screen.queryByText("Nothing needs you right now.")).toBeNull();
   });
 
   it("says it is loading, not unavailable, until the first holds response", async () => {
@@ -421,6 +426,7 @@ describe("Held work card", () => {
     await mount();
     expect(within(heldCard()).getByText("Loading held work…")).toBeTruthy();
     expect(screen.queryByText(/Held work is unavailable/)).toBeNull();
+    expect(screen.queryByText("Nothing needs you right now.")).toBeNull();
   });
 
   it("still shows the danger headline and the held row when a first-load endpoint rejects", async () => {
@@ -444,6 +450,7 @@ describe("Held work card", () => {
     });
     await mount();
     expect([...heldCard().querySelectorAll("strong")].map((e) => e.textContent)).toEqual(["2 / 8", "2", "0"]);
+    expect(screen.queryByText("Nothing needs you right now.")).toBeNull();
   });
 
   it("does not fetch holds on Dashboard beyond its own alert", async () => {
@@ -461,17 +468,17 @@ describe("Needs your decision", () => {
     await mount();
     expect(screen.getByText("Needs your decision")).toBeTruthy();
     expect(screen.getByRole("link", { name: "Review plan" }).getAttribute("href")).toBe("/runs/plan-1");
-    expect(screen.getByText(/^1 decision is waiting on you\./)).toBeTruthy();
+    expect(screen.queryByText("Nothing needs you right now.")).toBeNull();
     mockApi.listRuns.mockResolvedValue({ runs: [aRun({ id: "plan-1", status: "running", issue_title: "Plan me" })] });
     await settle(10_000);
     expect(screen.queryByText("Needs your decision")).toBeNull();
     expect(screen.getByText(/^Nothing needs you right now\./)).toBeTruthy();
   });
 
-  it("counts a plan and an open pull request in the sentence", async () => {
+  it("shows a plan and an open pull request without a calm notice", async () => {
     mockApi.listRuns.mockResolvedValue({ runs: [aRun({ id: "plan-1", status: "awaiting_approval" }), prRun()] });
     await mount();
-    expect(screen.getByText(/^1 decision and 1 pull request are waiting on you\./)).toBeTruthy();
+    expect(screen.queryByText("Nothing needs you right now.")).toBeNull();
     // The PR sits in its group: its ref links to the forge, and so does its action once expanded.
     expect(screen.getByRole("link", { name: "vtmocanu/uzi #4" }).getAttribute("href")).toBe("https://github.com/o/r/pull/4");
     fireEvent.click(screen.getByRole("button", { name: "Review PRs" }));
@@ -892,7 +899,7 @@ describe("People chip (issue #4042)", () => {
     seedRoster();
     await mount();
     expect(chip().getAttribute("aria-label")).toBe("People: 4 active now of 9");
-    expect(sentence()).toContain("2 runs are executing across the factory for 2 people");
+    expect(totals()).toContain("2 executing for 2 people");
     await openChip();
     const rows = dialog().getAllByRole("listitem").map((li) => li.textContent ?? "");
     expect(rows).toHaveLength(5);
@@ -906,7 +913,7 @@ describe("People chip (issue #4042)", () => {
     expect(dialog().queryByText(/online/i)).toBeNull();
   });
 
-  it("keeps the sentence's people count within its executing count for a viewer run only the admin list has", async () => {
+  it("keeps the Runs line's people count within its executing count for a viewer run only the admin list has", async () => {
     vi.mocked(useAuth).mockReturnValue(authValue(admin));
     mockApi.listRuns.mockResolvedValue({ runs: [] });
     mockApi.adminListRuns.mockResolvedValue({
@@ -916,7 +923,7 @@ describe("People chip (issue #4042)", () => {
       ],
     });
     await mount();
-    const m = sentence().match(/(\d+) runs? (?:is|are) executing across the factory for (\d+) (?:person|people)/);
+    const m = totals().match(/(\d+) executing for (\d+) (?:person|people)/);
     expect(m).not.toBeNull();
     expect(Number(m![2])).toBeLessThanOrEqual(Number(m![1]));
     await openChip();
@@ -969,11 +976,11 @@ describe("People chip (issue #4042)", () => {
     expect(JSON.parse(localStorage.getItem(SCOPE_KEY)!)).toBe("all");
   });
 
-  it("gives a non-admin no chip, no 'for' in the sentence and no admin or user request", async () => {
+  it("gives a non-admin no chip, no people count and no admin or user request", async () => {
     await mount();
     await settle(30_000);
     expect(screen.queryByRole("button", { name: /^People:/ })).toBeNull();
-    expect(sentence()).not.toContain(" for ");
+    expect(totals()).not.toContain(" for ");
     for (const call of adminEndpoints()) expect(call).not.toHaveBeenCalled();
   });
 });
@@ -1041,7 +1048,7 @@ describe("Repos chip (issue #4334)", () => {
 
 // PRD #3875 M1: the Search button in the header opens the shell's command menu.
 describe("OverviewNext Search button", () => {
-  it("follows the health, People and Repos chips, before the Back link", async () => {
+  it("puts the Back link after the title and before the chips in reading order", async () => {
     vi.mocked(useAuth).mockReturnValue(authValue(admin));
     mockApi.getAdminHealth.mockResolvedValue(overviewNextDoc());
     render(
@@ -1063,7 +1070,8 @@ describe("OverviewNext Search button", () => {
     expect(before(health, people)).toBe(true);
     expect(before(people, repos)).toBe(true);
     expect(before(repos, search)).toBe(true);
-    expect(before(search, back)).toBe(true);
+    expect(before(screen.getByRole("heading", { name: "Welcome, Admin" }), back)).toBe(true);
+    expect(before(back, health)).toBe(true);
   });
 
   it("calls the shell's open() on click, with the shortcut shown on the button", async () => {

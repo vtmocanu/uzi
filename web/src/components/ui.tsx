@@ -780,6 +780,7 @@ export function PageHeader({
   titleNode,
   description,
   actions,
+  actionsClassName,
   actionsBesideTitle = false,
   backTo,
   backLabel,
@@ -788,6 +789,7 @@ export function PageHeader({
   titleNode?: ReactNode;
   description?: ReactNode;
   actions?: ReactNode;
+  actionsClassName?: string;
   // Run-detail headers reserve a desktop title row for their compact controls.
   actionsBesideTitle?: boolean;
   backTo?: string;
@@ -813,7 +815,7 @@ export function PageHeader({
           )}
         </div>
         {actions && (
-          <div className={cx("flex flex-wrap items-center gap-2", actionsBesideTitle && "lg:shrink-0 lg:pt-6")}>{actions}</div>
+          <div className={cx("flex flex-wrap items-center gap-2", actionsBesideTitle && "lg:shrink-0 lg:pt-6", actionsClassName)}>{actions}</div>
         )}
       </div>
     </div>

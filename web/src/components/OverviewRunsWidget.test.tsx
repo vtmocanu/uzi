@@ -34,6 +34,30 @@ function mount(props: Partial<React.ComponentProps<typeof OverviewRunsWidget>> =
 }
 
 describe("OverviewRunsWidget", () => {
+  it("shows all-kind totals at the top, dropping zero parts and the whole line when empty", () => {
+    mount({ totals: { executing: 2, queued: 0, parked: 1 } });
+    expect(screen.getByText("2 executing · 1 parked")).toBeTruthy();
+    cleanup();
+    mount({ totals: { executing: 0, queued: 0, parked: 0 } });
+    expect(screen.queryByText(/executing|queued|parked/)).toBeNull();
+  });
+
+  it("adds the people count for a readable factory list", () => {
+    mount({ isAdmin: true, adminRuns: good([]), totals: { executing: 3, queued: 1, parked: 0 }, acrossFactory: true, executingPeople: 2 });
+    expect(screen.getByText("3 executing for 2 people · 1 queued")).toBeTruthy();
+  });
+
+  it("falls back to own totals and the existing unavailable message when the admin read fails", () => {
+    mount({
+      isAdmin: true,
+      adminRuns: { runs: [], failed: true, lastOkAt: null },
+      totals: { executing: 1, queued: 0, parked: 0 },
+      acrossFactory: false,
+    });
+    expect(screen.getByText("1 executing")).toBeTruthy();
+    expect(screen.getByText("Other users' runs are unavailable")).toBeTruthy();
+  });
+
   it("titles the card and links to all runs", () => {
     mount();
     expect(screen.getByRole("heading", { name: "Runs" })).toBeTruthy();
