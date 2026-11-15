@@ -7,6 +7,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { GitCache, type CheckpointRange, type TerminalSnapshotOptions } from "../src/git.js";
 import { nullLogger } from "./helpers.js";
 
@@ -277,6 +278,48 @@ describe("captureTerminalSnapshot", () => {
     await f.write("new.txt", "x");
     assert.deepEqual(await f.capture({ seam: { beforeStaging: async () => { f.calls.push("staging"); } } }), { kind: "refused", reason: "config_refused" });
     assert.deepEqual(f.calls, []);
+  });
+
+  test("a config.worktree core.worktree decoy is refused, never reported clean", async (t) => {
+    const f = await fixture(t);
+    const decoy = path.join(f.dir, "decoy");
+    await fs.mkdir(decoy);
+    await fs.writeFile(path.join(decoy, "tracked.txt"), "original\n");
+    await fs.writeFile(path.join(decoy, "gone.txt"), "to be deleted\n");
+    await fs.writeFile(path.join(decoy, ".gitignore"), "ignored.log\n.uzi/scratch/\n");
+    await fs.appendFile(path.join(f.root, ".git", "config"), "[extensions]\n\tworktreeConfig = true\n");
+    await fs.writeFile(path.join(f.root, ".git", "config.worktree"), `[core]\n\tworktree = ${decoy}\n`);
+    await f.write("tracked.txt", "edited in the real clone\n");
+    await f.write("new.txt", "unpreserved\n");
+    const result = await f.capture({ seam: { beforeStaging: async () => { f.calls.push("staging"); } } });
+    assert.equal(result.kind, "refused", JSON.stringify(result));
+    assert.deepEqual(f.calls, []);
+  });
+
+  test("a config.worktree file alone (no extension key) is refused", async (t) => {
+    const f = await fixture(t);
+    await fs.writeFile(path.join(f.root, ".git", "config.worktree"), "[core]\n\tbare = false\n");
+    assert.deepEqual(await f.capture(), { kind: "refused", reason: "config_refused" });
+  });
+
+  test("a forged index (stat cache plus oid patched back to HEAD) is never reported clean", async (t) => {
+    const f = await fixture(t);
+    await f.write("tracked.txt", "ORIGINAL\n");
+    f.g("update-index", "tracked.txt");
+    await new Promise((r) => setTimeout(r, 1200));
+    const idx = await f.indexBytes();
+    const headOid = Buffer.from(f.g("rev-parse", "HEAD:tracked.txt"), "hex");
+    const needle = Buffer.concat([Buffer.from("tracked.txt"), Buffer.from([0])]);
+    const pathPos = idx.indexOf(needle);
+    assert.ok(pathPos > 22, "entry located");
+    headOid.copy(idx, pathPos - 2 - 20);
+    const body = idx.subarray(0, idx.length - 20);
+    const forged = Buffer.concat([body, createHash("sha1").update(body).digest()]);
+    await fs.writeFile(path.join(f.root, ".git", "index"), forged);
+    assert.equal(f.g("status", "--porcelain"), "", "the forgery hides the edit from status");
+    const result = await f.capture({ seam: { beforeStaging: async () => { f.calls.push("staging"); } } });
+    assert.notEqual(result.kind, "clean", JSON.stringify(result));
+    assert.deepEqual(await f.stray(), []);
   });
 
   test("a clone outside the runner root never reaches the transport", async (t) => {

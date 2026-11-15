@@ -20782,7 +20782,7 @@ try {
       let stderr = "";
       let out: string;
       try {
-        out = await this.runGitAsRunner(clonePath, [...TERMINAL_GIT_PINS, ...args], {
+        out = await this.runGitAsRunner(clonePath, [...TERMINAL_GIT_PINS, "-c", `core.worktree=${clonePath}`, ...args], {
           timeoutMs, env: { ...TERMINAL_GIT_ENV, ...extra.env },
           ...(extra.input === undefined ? {} : { input: extra.input }),
           ...(extra.strictStderr ? { onStderr: (text: string) => { stderr += text; } } : {}),
@@ -20896,12 +20896,14 @@ try {
       if (!dotGit?.isDirectory()) return refused("clone_shape");
       // A commondir file redirects every object and ref read to another store.
       if (await fs.lstat(path.join(clonePath, ".git", "commondir")).then(() => true, () => false)) return refused("clone_shape");
+      // A per-worktree config file (core.worktree, sparse and index keys) is read by git but not by `config --local`.
+      if (await fs.lstat(path.join(clonePath, ".git", "config.worktree")).then(() => true, () => false)) return refused("config_refused");
       if (!(await alternatesClean())) return refused("alternates_present");
       for (const row of rows(await git(["config", "--local", "--null", "--list"]), 100_000, "config_cap")) {
         // A valueless boolean key (`key\0` with no newline) is the whole row, never "".
         const nl = row.indexOf("\n");
         const key = (nl < 0 ? row : row.slice(0, nl)).toLowerCase();
-        if (key === "core.worktree" || key.startsWith("include.") || key.startsWith("includeif.") ||
+        if (key === "core.worktree" || key === "extensions.worktreeconfig" || key.startsWith("include.") || key.startsWith("includeif.") ||
             key === "core.sparsecheckout" || key === "core.splitindex" || key === "index.sparse" ||
             (key === "core.bare" && row.slice(key.length + 1) !== "false")) return refused("config_refused");
       }
@@ -20970,8 +20972,15 @@ try {
       }
       const ignored = { files: ignoredPaths.length, bytes: ignoredBytes };
 
-      // 3. Clean: no index or ref write.
+      // 3. Clean: the agent-writable real index (stat cache and entry oids) is never trusted for this verdict, so a
+      // private index is rebuilt from HEAD and the work tree and must reproduce HEAD's tree. No ref or real-index write.
       if (entries.size === 0) {
+        privateIndex = path.join(runnerTmpdir() || os.tmpdir(), `uzi-term-idx-${randomUUID()}`);
+        const cleanEnv = { GIT_INDEX_FILE: privateIndex };
+        await git(["read-tree", head], { env: cleanEnv, strictStderr: true });
+        await git(["add", "-A"], { env: cleanEnv, strictStderr: true });
+        const rebuilt = (await git(["write-tree"], { env: cleanEnv })).trim();
+        if (rebuilt !== headTree) return refused("index_mismatch");
         if (!sameInvariants(before, await invariants())) return refused("invariant_changed");
         return { kind: "clean", root: head, tree: headTree, ignored };
       }
@@ -21145,7 +21154,7 @@ try {
   async buildTerminalAggregate(barePath: string, input: {
     base: string; extraRoots: string[]; runId: string; generation: number; existingMerges?: number;
     /** Absolute `Date.now()` deadline and abort signal: child timeouts are clamped and killed, a queued lock wait forfeits
-     *  without running, and a lapse between links or before the pin refuses with `deadline` (no ref moves after it). */
+     *  without running, and a lapse between links or before the pin refuses with `deadline` (a lapse while the pin runs can still leave the ref moved; that result is kept, never adopted). */
     budget?: { signal: AbortSignal; deadline: number };
     /** Test-only: runs after each link commit (still under the lock), before the next budget check. */
     seam?: { afterLink?: (i: number) => Promise<void> };
