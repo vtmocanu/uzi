@@ -32428,6 +32428,8 @@ describe("M2 actualRunner credential replacement", () => {
         let failingPersist = false, persistFailures = 0, teardownAttempts = 0;
         let persistedCopies = 0, unavailableInspections = 0;
         const usableSaves: import("../src/executor.js").UsableSavedRollout[] = [];
+        const deliveredPreflightReplies: { kind: string; opId: string }[] = [];
+        let preflightStorePresence: string | undefined;
         const preflightRequests: { runId: string; claimGeneration: number; registerNonce: string; opId: string; targetSecretId: string }[] = [];
         const failedClearRequests: { generation?: number; opId?: string; reason?: string }[] = [];
         const reports: string[] = [];
@@ -32474,12 +32476,15 @@ describe("M2 actualRunner credential replacement", () => {
           if (preflightRefusal) {
             assert.equal(usableSaves.length, 1, "real lease saves before preflight");
             assert.equal(usableSaves[0]!.kind, "usable");
-            assert.equal(await CodexSessionStore.inspectSession(store, savedId), "present");
+            preflightStorePresence = await CodexSessionStore.inspectSession(store, savedId);
+            assert.equal(preflightStorePresence, "present");
           }
-          return targetMismatch ? { kind: "not_applied", reason: "target_mismatch",
+          const reply = targetMismatch ? { kind: "not_applied" as const, reason: "target_mismatch",
             claimGeneration: 7, registerNonce: "M2-original-nonce", opId: "M2-op" }
-            : { kind: "ready", claimGeneration: 7, registerNonce: "M2-original-nonce",
+            : { kind: "ready" as const, claimGeneration: 7, registerNonce: "M2-original-nonce",
               opId: publication === "preflight-foreign-op" ? "M2-FOREIGN-op" : "M2-op" };
+          if (preflightRefusal) deliveredPreflightReplies.push(reply);
+          return reply;
         };
         const applyRequests: { claimGeneration: number; opId: string }[] = [];
         client.applyCredentialSwitch = async (_id, req) => {
@@ -33144,6 +33149,10 @@ describe("M2 actualRunner credential replacement", () => {
           if (preflightRefusal) {
             await withTimeout(switchSettled.promise, 5000, "real preflight refusal settles");
             assert.equal(preflights, 1);
+            assert.equal(preflightStorePresence, "present", "usable rollout observed before delivering the reply");
+            assert.deepEqual(deliveredPreflightReplies, [{ kind: targetMismatch ? "not_applied" : "ready",
+              ...(targetMismatch ? { reason: "target_mismatch" } : {}), claimGeneration: 7,
+              registerNonce: "M2-original-nonce", opId: targetMismatch ? "M2-op" : "M2-FOREIGN-op" }]);
             assert.deepEqual(preflightRequests, [{ runId: claim.run_id, claimGeneration: 7,
               registerNonce: "M2-original-nonce", opId: "M2-op", targetSecretId: "M2-target" }]);
             assert.equal(usableSaves.length, 1);
