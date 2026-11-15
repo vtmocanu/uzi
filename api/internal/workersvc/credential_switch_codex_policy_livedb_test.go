@@ -7,6 +7,12 @@ import (
 	"github.com/google/uuid"
 )
 
+// Match runs_policy_hold_shape (00397): a fresh decision and a held decision
+// both require the complete outcome/continuation/claim tuple, not a lone flag.
+func setCodexSwitchPolicyEpisode(f applyFx, run uuid.UUID, fresh, held bool) {
+	f.env.exec("UPDATE runs SET policy_outcome_id=$2, policy_preserve_required=true, policy_continuation_mode='same_conversation', policy_applying_worker_id=worker_id, policy_applying_generation=claim_generation, policy_source_generation=claim_generation, policy_pending_fresh=$3, status=CASE WHEN $4 THEN 'paused' ELSE status END, hold_reason=CASE WHEN $4 THEN 'codex_policy_hold' ELSE hold_reason END WHERE id=$1", run, uuid.New(), fresh, held)
+}
+
 // Exercise the public owner request, not just its policy predicate. An existing
 // pending operation must survive a refused replacement unchanged.
 func TestOwnerCodexUnresolvedPolicyRefusesReplacementLiveDB(t *testing.T) {
@@ -14,14 +20,7 @@ func TestOwnerCodexUnresolvedPolicyRefusesReplacementLiveDB(t *testing.T) {
 		t.Run(episode, func(t *testing.T) {
 			f, run, _ := codexApplyFixture(t, false)
 			next := f.env.seedStaticAPIKey(t, f.o.userID, "policy-next", "policy-next-key")
-			switch episode {
-			case "fresh pending":
-				f.env.exec("UPDATE runs SET policy_pending_fresh=true WHERE id=$1", run)
-			case "unresolved outcome":
-				f.env.exec("UPDATE runs SET policy_outcome_id=$2, policy_preserve_required=true, policy_continuation_mode='same_conversation', policy_applying_worker_id=worker_id, policy_applying_generation=claim_generation, policy_source_generation=claim_generation WHERE id=$1", run, uuid.New())
-			case "policy hold":
-				f.env.exec("UPDATE runs SET status='paused', hold_reason='codex_policy_hold' WHERE id=$1", run)
-			}
+			setCodexSwitchPolicyEpisode(f, run, episode == "fresh pending", episode == "policy hold")
 			f.noWrite(t, run, func() {
 				_, err := f.svc.SetRunCredential(f.env.ctx, f.o.userID, run, BindModePinned, &next)
 				if episode == "policy hold" {
@@ -53,13 +52,8 @@ func TestCodexPolicyEpisodeBetweenPreflightAndApplyLiveDB(t *testing.T) {
 				t.Fatal("preflight not ready", preflight.Outcome, err)
 			}
 			want := ApplyOutcomeNotApplied
-			switch episode {
-			case "fresh pending":
-				f.env.exec("UPDATE runs SET policy_pending_fresh=true WHERE id=$1", run)
-			case "unresolved outcome":
-				f.env.exec("UPDATE runs SET policy_outcome_id=$2, policy_preserve_required=true, policy_continuation_mode='same_conversation', policy_applying_worker_id=worker_id, policy_applying_generation=claim_generation, policy_source_generation=claim_generation WHERE id=$1", run, uuid.New())
-			case "policy hold":
-				f.env.exec("UPDATE runs SET status='paused', hold_reason='codex_policy_hold' WHERE id=$1", run)
+			setCodexSwitchPolicyEpisode(f, run, episode == "fresh pending", episode == "policy hold")
+			if episode == "policy hold" {
 				want = ApplyOutcomeFenced
 			}
 			f.noWrite(t, run, func() {

@@ -417,7 +417,7 @@ func setTokenOverride(cmd *cobra.Command, args []string, c uzicli.Client) (uzicl
 	var disabled bool
 	var otherKind string
 	for _, secret := range secrets {
-		if strings.ToLower(secret.Label) != strings.ToLower(label) {
+		if !strings.EqualFold(secret.Label, label) {
 			continue
 		}
 		eligible := secret.Kind == kindAnthropicToken

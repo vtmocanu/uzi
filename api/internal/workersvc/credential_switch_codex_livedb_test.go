@@ -119,7 +119,7 @@ func TestCodexSwitchPreflightLiveDB(t *testing.T) {
 				f.restamp(t, run)
 				want = ApplyOutcomeSuperseded
 			case "policy refusal":
-				f.env.exec("UPDATE runs SET policy_pending_fresh = true WHERE id = $1", run)
+				setCodexSwitchPolicyEpisode(f, run, true, false)
 				want, reason = ApplyOutcomeNotApplied, "policy_refusal"
 			case "binding mismatch":
 				f.env.exec("UPDATE run_credential_epochs SET codex_material_revision = codex_material_revision + 1 WHERE run_id = $1", run)

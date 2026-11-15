@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -70,7 +71,7 @@ func TestRunSetTokenCodexNoModeFallback(t *testing.T) {
 
 func TestRunSetTokenGetErrorsNeverFallBack(t *testing.T) {
 	for _, exit := range []int{uzicli.ExitNotFound, uzicli.ExitConflict} {
-		t.Run(string(rune('0'+exit)), func(t *testing.T) {
+		t.Run(strconv.Itoa(exit), func(t *testing.T) {
 			for _, choice := range []string{"shared", "--auto"} {
 				fc := codexSwitchClient()
 				fc.GetRunHook = func(id string) (apitypes.RunDTO, error) {
