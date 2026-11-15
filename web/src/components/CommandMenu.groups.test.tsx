@@ -8,6 +8,7 @@ import { CommandMenu } from "./CommandMenu";
 import * as built from "./commandMenuItems";
 import { api, type AgentTemplate, type Repo, type RunSummaryItem, type Schedule, type Skill, type Worker } from "../lib/api";
 import { docsForIndex } from "../lib/docs";
+import { setDemoMode } from "../lib/demoMode";
 import type { DocHeading } from "../lib/docHeadingsPipeline";
 
 vi.mock("../lib/api", () => ({
@@ -349,6 +350,31 @@ describe("untrusted text", () => {
   });
 });
 
+describe("demo masking is live", () => {
+  it("re-masks schedule and run rows when demo mode toggles while the menu is open", async () => {
+    mockApi.listSchedules.mockResolvedValue([schedule({ id: "s1", labels: ["zorblax"], repo_path: "acme/secretrepo" })]);
+    listRunsMock.mockResolvedValue({ runs: [run({ id: "r1", title: "Zorblax chat", repo_path: "acme/secretrepo" } as never)] });
+    await search("zorblax");
+    expect(labels()).toContain("Sweep · label zorblax · acme/secretrepo");
+    expect(optionFor("Zorblax chat")?.textContent).toContain("Recent runs · acme/secretrepo");
+    act(() => setDemoMode(true));
+    expect(labels()).toContain("Sweep · label zorblax · demo/secretrepo");
+    expect(optionFor("Zorblax chat")?.textContent).toContain("Recent runs · demo/secretrepo");
+    expect(document.body.textContent).not.toContain("acme");
+    act(() => setDemoMode(false));
+  });
+});
+
+describe("real docs ranking", () => {
+  it("ranks the Board doc above 'Open board: acme/network' for 'board'", async () => {
+    mockApi.listRepos.mockResolvedValue({ repos: [repo("r1", "acme/network")] });
+    await search("board");
+    expect(labels()[0]).toBe("Board");
+    expect(optionFor("Board")?.textContent).toContain("Doc");
+    expect(labels()).toContain("Open board: acme/network");
+  });
+});
+
 describe("fetching", () => {
   it("calls each list once per opening, and never again", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "setInterval"] });
@@ -445,14 +471,17 @@ describe("fetching", () => {
   });
 
   it("does not store a heading index that lands after the menu closed", async () => {
+    const lookup = vi.spyOn(built, "headingLookup");
     // Control: while open, the index is used.
     mount();
     await flush();
     fireEvent.change(input(), { target: { value: "zorblax" } });
     await flush();
     await flush();
+    expect(lookup).toHaveBeenCalledTimes(1);
     expect(mocks.headingsFor).toHaveBeenCalled();
     cleanup();
+    lookup.mockClear();
     mocks.headingsFor.mockClear();
     // Closed in the same tick as the first query, before the import resolves.
     const view = mount();
@@ -461,6 +490,7 @@ describe("fetching", () => {
     view.unmount();
     await flush();
     await flush();
+    expect(lookup).not.toHaveBeenCalled();
     expect(mocks.headingsFor).not.toHaveBeenCalled();
   });
 });

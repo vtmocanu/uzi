@@ -36,11 +36,29 @@ export type CommandItem = {
   title?: string;
   // Extra words the item also matches on (never displayed).
   keywords?: string[];
+  // The raw forge repo path of a schedule or run. Builders leave it out of the label and hint;
+  // the menu applies withRepoPath at render time so demo masking follows the live toggle.
+  repoPath?: string;
 };
+
+// The item with its repo path appended (masked in demo mode): schedules in the label, runs
+// in the hint. Items without a repoPath come back unchanged.
+export function withRepoPath(item: CommandItem, demo: boolean): CommandItem {
+  if (!item.repoPath) return item;
+  const masked = maskRepoPath(item.repoPath, demo);
+  return item.group === "schedules"
+    ? { ...item, label: `${item.label} · ${masked}` }
+    : { ...item, hint: `${item.hint} · ${masked}` };
+}
+
+// The heading lookup of a loaded heading-index module.
+export function headingLookup(mod: { docHeadingsFor: (slug: string) => DocHeading[] }) {
+  return mod.docHeadingsFor;
+}
 
 export function sectionCommandItems(isAdmin: boolean): CommandItem[] {
   return visibleSectionItems(isAdmin).map((s): CommandItem => {
-    const admin = s.label.startsWith("Admin");
+    const admin = !!s.adminOnly;
     return {
       id: `section:${s.key}`,
       group: "sections",
@@ -64,16 +82,16 @@ export function agentCommandItems(templates: ReadonlyArray<AgentTemplate>): Comm
   }));
 }
 
-export function scheduleCommandItems(schedules: ReadonlyArray<Schedule>, demo: boolean): CommandItem[] {
+export function scheduleCommandItems(schedules: ReadonlyArray<Schedule>): CommandItem[] {
   return schedules.map((s) => {
     const name = scheduleDisplayName(s, new Map());
-    const repo = s.repo_path ? maskRepoPath(s.repo_path, demo) : "";
     const isDefault = s.origin === "default" && !!s.catalog_slug;
     return {
       id: `schedule:${s.id}`,
       group: "schedules",
-      label: repo ? `${name} · ${repo}` : name,
+      label: name,
       hint: "Schedule",
+      repoPath: s.repo_path || undefined,
       to: `/schedules?tab=schedules#schedule-name-${encodeURIComponent(s.id)}`,
       icon: <ClockIcon />,
       keywords: isDefault ? [(s.catalog_slug as string).replace(/-/g, " ")] : undefined,
@@ -105,7 +123,7 @@ export function skillCommandItems(skills: ReadonlyArray<Skill>): CommandItem[] {
     }));
 }
 
-export function runCommandItems(runs: ReadonlyArray<RunSummaryItem>, demo: boolean): CommandItem[] {
+export function runCommandItems(runs: ReadonlyArray<RunSummaryItem>): CommandItem[] {
   const seen = new Set<string>();
   const out: CommandItem[] = [];
   for (const r of runs) {
@@ -117,12 +135,12 @@ export function runCommandItems(runs: ReadonlyArray<RunSummaryItem>, demo: boole
           ? `#${r.issue_iid} · ${r.issue_title}`
           : `#${r.issue_iid}`
         : r.title || r.issue_title || r.id;
-    const repo = r.repo_path ? maskRepoPath(r.repo_path, demo) : "";
     out.push({
       id: `run:${r.id}`,
       group: "runs",
       label,
-      hint: repo ? `Recent runs · ${repo}` : "Recent runs",
+      hint: "Recent runs",
+      repoPath: r.repo_path || undefined,
       to: `/runs/${encodeURIComponent(r.id)}`,
       icon: <ActivityIcon />,
     });

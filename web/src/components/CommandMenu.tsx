@@ -8,7 +8,7 @@
 import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 import { useNavigate } from "react-router-dom";
 import { api, type Repo, type RecoveryCustodyHolds, type RunSummaryItem } from "../lib/api";
-import { isDemoMode, useDemoMode } from "../lib/demoMode";
+import { useDemoMode } from "../lib/demoMode";
 import { maskRepoPath } from "../lib/demoMask";
 import type { DocHeading } from "../lib/docHeadingsPipeline";
 import { docsForIndex } from "../lib/docs";
@@ -188,7 +188,7 @@ export function decisionCommandItems(decisions: ReadonlyArray<DecisionItem>): Co
 
 const okItems = (s: ItemsState): CommandItem[] => (s.status === "ok" ? s.items : []);
 
-type RepoState ={ status: "loading" } | { status: "error" } | { status: "ok"; repos: Repo[] };
+type RepoState = { status: "loading" } | { status: "error" } | { status: "ok"; repos: Repo[] };
 // A list of built items, loading until its one fetch settles; a failed read hides only its group.
 type ItemsState = { status: "loading" } | { status: "error" } | { status: "ok"; items: CommandItem[] };
 type DecisionState = ItemsState;
@@ -275,7 +275,7 @@ export function CommandMenu({
           return;
         }
         const runs: RunSummaryItem[] = runsResult.value.runs;
-        setRunState({ status: "ok", items: built.runCommandItems(runs, isDemoMode()) });
+        setRunState({ status: "ok", items: built.runCommandItems(runs) });
         if (holdsResult.status !== "fulfilled") {
           setDecisionState({ status: "error" });
           return;
@@ -295,7 +295,7 @@ export function CommandMenu({
   );
   const scheduleState = useOnceItems(
     () => api.listSchedules(),
-    (schedules) => built.scheduleCommandItems(schedules, isDemoMode()),
+    (schedules) => built.scheduleCommandItems(schedules),
   );
   const workerState = useOnceItems(
     async () => (await api.listWorkers()).workers,
@@ -313,7 +313,9 @@ export function CommandMenu({
     // A failed import leaves the doc titles; the heading rows just never appear.
     import("../lib/docHeadings")
       .then((mod) => {
-        if (mounted.current) setHeadingsFor(() => mod.docHeadingsFor);
+        if (!mounted.current) return;
+        const lookup = built.headingLookup(mod);
+        setHeadingsFor(() => lookup);
       })
       .catch(() => {});
   }, [searching]);
@@ -372,10 +374,10 @@ export function CommandMenu({
       ...goto,
       ...sectionItems,
       ...okItems(agentState),
-      ...okItems(scheduleState),
+      ...okItems(scheduleState).map((it) => built.withRepoPath(it, demo)),
       ...okItems(workerState),
       ...okItems(skillState),
-      ...okItems(runState),
+      ...okItems(runState).map((it) => built.withRepoPath(it, demo)),
       ...docItems,
     ];
   }, [
