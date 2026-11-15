@@ -472,9 +472,11 @@ describe("useOverviewData recovery holds", () => {
     await settle(10_000);
     expect(mockApi.getRecoveryHolds).toHaveBeenCalledTimes(2);
     expect(result.current.holds?.aggregate.open_holds).toBe(1);
+    expect(result.current.holdsRequestFailed).toBe(true);
     mockApi.getRecoveryHolds.mockResolvedValue(holdsWith(3));
     await settle(10_000);
     expect(result.current.holds?.aggregate.open_holds).toBe(3);
+    expect(result.current.holdsRequestFailed).toBe(false);
   });
 
   it("stays null when the first load fails, without touching the personal data", async () => {
@@ -534,6 +536,7 @@ describe("useOverviewData recovery holds", () => {
     await settle();
     expect(result.current.holds?.aggregate.open_holds).toBe(3);
     expect(result.current.holdsFailed).toBe(false);
+    expect(result.current.holdsRequestFailed).toBe(false); // newer request is pending, not failed
   });
 
   it("applies an older success that lands after a newer request failed, with no holds yet", async () => {
@@ -549,6 +552,7 @@ describe("useOverviewData recovery holds", () => {
     await settle();
     expect(result.current.holds?.aggregate.open_holds).toBe(3);
     expect(result.current.holdsFailed).toBe(false);
+    expect(result.current.holdsRequestFailed).toBe(true); // newer failed request remains latest
   });
 
   it("ignores an older failure that lands after a newer success", async () => {
@@ -593,6 +597,7 @@ describe("useOverviewData recovery holds", () => {
     await settle(10_000);
     expect(result.current.data).not.toBeNull();
     expect(result.current.holds?.aggregate.open_holds).toBe(1);
+    expect(result.current.runsRefreshFailed).toBe(true);
     mockApi.getRecoveryHolds.mockResolvedValue(holdsWith(6));
     await settle(10_000);
     expect(result.current.holds?.aggregate.open_holds).toBe(6);

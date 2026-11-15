@@ -93,6 +93,9 @@ export function useOverviewData(opts?: {
 }) {
   const { user } = useAuth();
   const [data, setData] = useState<Overview | null>(null);
+  // A failed volatile snapshot poll keeps last-good rows for every existing card, but the
+  // default Overview must not claim "nothing needs you" from those stale run decisions.
+  const [runsRefreshFailed, setRunsRefreshFailed] = useState(false);
   const [adminRuns, setAdminRuns] = useState<AdminRunsState>(NO_ADMIN_RUNS);
   const [usageWindow, setUsageWindow] = useState<UsageWindow>(readUsageWindow);
   const changeUsageWindow = useCallback((value: UsageWindow) => {
@@ -243,18 +246,27 @@ export function useOverviewData(opts?: {
   // arrive, while an older response never overwrites a newer one.
   const holdsRequestIdRef = useRef(0);
   const holdsAppliedIdRef = useRef(0);
+  const holdsLatestSettledIdRef = useRef(0);
   const loadHolds = useCallback(async () => {
     if (!holdsEnabled) return;
     const id = ++holdsRequestIdRef.current;
     try {
       const next = await api.getRecoveryHolds();
-      if (!pollAliveRef.current || id <= holdsAppliedIdRef.current) return;
-      holdsAppliedIdRef.current = id;
-      setHolds(next);
-      setHoldsRequestFailed(false);
+      if (!pollAliveRef.current) return;
+      if (id > holdsAppliedIdRef.current) {
+        holdsAppliedIdRef.current = id;
+        setHolds(next);
+      }
+      // An older success may supply last-good data after a newer failure, but it cannot
+      // make the latest request read as healthy for the calm notice.
+      if (id > holdsLatestSettledIdRef.current) {
+        holdsLatestSettledIdRef.current = id;
+        setHoldsRequestFailed(false);
+      }
     } catch {
       // keep the last-good holds
-      if (!pollAliveRef.current || id <= holdsAppliedIdRef.current) return;
+      if (!pollAliveRef.current || id <= holdsLatestSettledIdRef.current) return;
+      holdsLatestSettledIdRef.current = id;
       setHoldsRequestFailed(true);
     }
   }, [holdsEnabled]);
@@ -363,8 +375,10 @@ export function useOverviewData(opts?: {
             }
           : prev,
       );
+      setRunsRefreshFailed(false);
     } catch {
       // keep the last-good data
+      if (pollAliveRef.current) setRunsRefreshFailed(true);
     }
   }, []);
   usePollWhileVisible(poll, 10000);
@@ -394,5 +408,7 @@ export function useOverviewData(opts?: {
     adminAgentSource,
     holds,
     holdsFailed: holdsRequestFailed && holds === null,
+    holdsRequestFailed,
+    runsRefreshFailed,
   };
 }

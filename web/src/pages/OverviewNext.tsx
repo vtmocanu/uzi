@@ -55,7 +55,7 @@ function OverviewNextPage() {
   const commandMenu = useCommandMenu();
   const demo = useDemoMode();
   const { user } = useAuth();
-  const { data, usageWindow, changeUsageWindow, adminRuns, adminUsers, adminRepoActivity, adminAgentSource, holds, holdsFailed } =
+  const { data, usageWindow, changeUsageWindow, adminRuns, adminUsers, adminRepoActivity, adminAgentSource, holds, holdsFailed, holdsRequestFailed, runsRefreshFailed } =
     useOverviewData({
       includeAdminRuns: true,
       includeRecoveryHolds: true,
@@ -98,7 +98,7 @@ function OverviewNextPage() {
       })
     : null;
   const runTotals = data ? overviewCounts(factoryRows ?? ownRuns) : null;
-  const calm = data !== null && holds !== null && decisions.length === 0;
+  const calm = data !== null && holds !== null && !holdsRequestFailed && !runsRefreshFailed && decisions.length === 0;
   // The People chip's model: admins only, from the viewer's own runs plus the admin list, users
   // and usage. Each source degrades on its own (see peopleModel).
   const people = isAdmin

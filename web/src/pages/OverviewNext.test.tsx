@@ -110,6 +110,42 @@ describe("OverviewNext for a non-admin", () => {
     expect(screen.queryByRole("button", { name: /System health/ })).toBeNull();
   });
 
+  it("hides calm after a later holds poll fails, then restores it on recovery", async () => {
+    await mount();
+    expect(screen.getByText("Nothing needs you right now.")).toBeTruthy();
+    mockApi.getRecoveryHolds.mockRejectedValueOnce(new Error("holds down"));
+    await settle(10_000);
+    expect(screen.queryByText("Nothing needs you right now.")).toBeNull();
+    expect(screen.getByText("Live run row")).toBeTruthy();
+    mockApi.getRecoveryHolds.mockResolvedValue(noHolds());
+    await settle(10_000);
+    expect(screen.getByText("Nothing needs you right now.")).toBeTruthy();
+  });
+
+  it("hides calm after a later runs poll fails, then restores it on recovery", async () => {
+    await mount();
+    expect(screen.getByText("Nothing needs you right now.")).toBeTruthy();
+    mockApi.listRuns.mockRejectedValueOnce(new Error("runs down"));
+    await settle(10_000);
+    expect(screen.queryByText("Nothing needs you right now.")).toBeNull();
+    expect(screen.getByText("Live run row")).toBeTruthy();
+    mockApi.listRuns.mockResolvedValue({ runs: [aRun()] });
+    await settle(10_000);
+    expect(screen.getByText("Nothing needs you right now.")).toBeTruthy();
+  });
+
+  it("hides calm when the combined runs/workers poll cannot apply a fresh run snapshot", async () => {
+    await mount();
+    expect(screen.getByText("Nothing needs you right now.")).toBeTruthy();
+    mockApi.listWorkers.mockRejectedValueOnce(new Error("workers down"));
+    await settle(10_000);
+    expect(screen.queryByText("Nothing needs you right now.")).toBeNull();
+    expect(screen.getByText("Live run row")).toBeTruthy();
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
+    await settle(10_000);
+    expect(screen.getByText("Nothing needs you right now.")).toBeTruthy();
+  });
+
   it("links to the classic Overview, which links back to the new default", async () => {
     await mount();
     expect(screen.getByRole("link", { name: "Back to the old Overview" }).getAttribute("href")).toBe("/overview/classic");
