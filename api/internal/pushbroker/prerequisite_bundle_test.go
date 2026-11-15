@@ -85,7 +85,7 @@ func TestPrereqRestoreFetchDoesNotDetachMaintenance(t *testing.T) {
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("fetch prerequisite bundle: %v\n%s", err, out)
 	}
-	data, err := os.ReadFile(trace)
+	data, err := os.ReadFile(trace) //nolint:gosec // G304: test reads its Git trace under t.TempDir().
 	if err != nil {
 		t.Fatalf("read Git trace: %v", err)
 	}
