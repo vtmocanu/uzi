@@ -6,10 +6,15 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { GitCache, type CheckpointRange, type TerminalSnapshotOptions } from "../src/git.js";
-import { CheckpointUnsafeCleanupError } from "../src/checkpoint-stop.js";
+import { GitCache, TERMINAL_INDEX_HASH_SCRIPT, type CheckpointRange, type TerminalSnapshotOptions } from "../src/git.js";
+import { CheckpointUnsafeCleanupError, GitBoundaryAbortError } from "../src/checkpoint-stop.js";
+import { createCodexExecutionSafety } from "../src/codex/safety.js";
+import { boundaryProcessSpawnerForTest } from "../src/codex/codex-executor.js";
+import type { BoundaryProcessRequest } from "../src/harness.js";
+import type { CodexRootHandle } from "../src/codex/launcher.js";
+import { credentialFreeGitFixture } from "./credential-free-git-fixture.js";
 import { nullLogger } from "./helpers.js";
 
 const cleanEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_")));
@@ -1348,5 +1353,113 @@ describe("captureTerminalSnapshot: index-independent verdict, bounded cleanup, u
     const result = await f.capture();
     assert.equal(result.kind, "captured", JSON.stringify(result));
     if (result.kind === "captured") assert.equal(run(f.bare, "show", `${result.root}:new.txt`), "brand new");
+  });
+});
+
+describe("terminal index hash script", () => {
+  const hashOf = (target: string) => execFileSync(process.execPath, ["-e", TERMINAL_INDEX_HASH_SCRIPT, target],
+    { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+
+  test("matches the sha256 of a real git index", async (t) => {
+    const f = await fixture(t);
+    const index = path.join(f.root, ".git", "index");
+    assert.equal(hashOf(index), createHash("sha256").update(await fs.readFile(index)).digest("hex"));
+  });
+
+  test("a missing path reads as absent", async (t) => {
+    const f = await fixture(t);
+    assert.equal(hashOf(path.join(f.dir, "no-such-index")), "absent");
+  });
+
+  test("an unreadable path (a directory) reads as error", async (t) => {
+    const f = await fixture(t);
+    assert.equal(hashOf(f.dir), "error");
+  });
+
+  test("streams the file instead of reading it whole", () => {
+    assert.ok(!TERMINAL_INDEX_HASH_SCRIPT.includes("readFileSync"));
+    assert.ok(TERMINAL_INDEX_HASH_SCRIPT.includes("createReadStream"));
+  });
+});
+
+describe("unsafe cleanup identity through runner git", () => {
+  const unsafe = () => new CheckpointUnsafeCleanupError("x");
+  const causeChain = (err: unknown): unknown[] => {
+    const chain: unknown[] = [];
+    for (let e: unknown = err, i = 0; e !== undefined && i < 8; i++) {
+      chain.push(e);
+      e = (e as { cause?: unknown } | null)?.cause;
+    }
+    return chain;
+  };
+
+  test("(a) a live boundary spawn rejection keeps the typed identity", async () => {
+    const f = await credentialFreeGitFixture();
+    try {
+      const injected = unsafe();
+      const got = await f.git.withBoundaryProcessSpawner(async () => { throw injected; }, new AbortController().signal,
+        () => f.git.worktreeHead(f.clone)).then(() => undefined, (e: unknown) => e);
+      assert.equal(got, injected);
+      assert.equal((got as CheckpointUnsafeCleanupError).checkpointBoundary, "unsafe_cleanup");
+    } finally { await f.cleanup(); }
+  });
+
+  test("(b) a capture boundary child whose disposal fails keeps the typed identity", async () => {
+    const f = await credentialFreeGitFixture();
+    try {
+      let current!: BoundaryProcessRequest;
+      const adapter = boundaryProcessSpawnerForTest("required", async () => {
+        const request = current;
+        const child = spawn(request.argv[0]!, request.argv.slice(1), { cwd: request.cwd, env: request.env, stdio: ["pipe", "pipe", "pipe"] });
+        const exit = new Promise<{ event: "child_exit"; code: number }>((resolve, reject) => {
+          child.once("error", reject);
+          child.once("close", code => resolve({ event: "child_exit", code: code ?? 1 }));
+        });
+        return {
+          started: { event: "started", supervisorPid: 300, childPid: 301, subreaper: true,
+            nondumpable: true, uid: 10003, liveCapsZero: true, capBoundingSet: "0xc0", noNewPrivs: true },
+          supervisorPid: 300,
+          transport: { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr },
+          snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
+          observe: async () => ({ event: "observe", id: 1, state: "unavailable", reason: "unreadable" }),
+          waitChild: async () => exit,
+          dispose: async () => { await exit; throw new Error("disposal failed"); },
+          failed: undefined, whenFailed: new Promise<Error>(() => undefined),
+        } satisfies CodexRootHandle;
+      });
+      const safety = createCodexExecutionSafety(f.registry, async () => { throw new Error("unexpected generic spawn"); },
+        undefined, undefined, async (request, deadline, cleanup) => { current = request; return adapter(request, deadline, cleanup); });
+      const got = await safety.withCredentialFreeCapture(30_000,
+        context => f.git.withCredentialFreeCapture(context, () => f.git.worktreeHead(f.clone))).then(() => undefined, (e: unknown) => e);
+      const chain = causeChain(got);
+      const shape = chain.map(e => `${(e as Error)?.constructor?.name}:${(e as Error)?.message}`).join(" <- ");
+      assert.ok(chain.some(e => e instanceof CheckpointUnsafeCleanupError) ||
+        (got as { checkpointBoundary?: string } | undefined)?.checkpointBoundary === "unsafe_cleanup", shape);
+    } finally { await f.cleanup(); }
+  });
+
+  test("(c1) an already aborted boundary rejects as an abort without spawning", async () => {
+    const f = await credentialFreeGitFixture();
+    try {
+      let spawns = 0;
+      const ac = new AbortController();
+      ac.abort();
+      const got = await f.git.withBoundaryProcessSpawner(async () => { spawns++; throw unsafe(); }, ac.signal,
+        () => f.git.worktreeHead(f.clone)).then(() => undefined, (e: unknown) => e);
+      assert.ok(got instanceof GitBoundaryAbortError, String(got));
+      assert.equal(spawns, 0);
+    } finally { await f.cleanup(); }
+  });
+
+  test("(c2) an abort during a pending spawn wraps the typed error as the cause", async () => {
+    const f = await credentialFreeGitFixture();
+    try {
+      const injected = unsafe();
+      const ac = new AbortController();
+      const got = await f.git.withBoundaryProcessSpawner(async () => { ac.abort(); throw injected; }, ac.signal,
+        () => f.git.worktreeHead(f.clone)).then(() => undefined, (e: unknown) => e);
+      assert.ok(got instanceof GitBoundaryAbortError, String(got));
+      assert.ok(causeChain(got).includes(injected), "typed error reachable through .cause");
+    } finally { await f.cleanup(); }
   });
 });

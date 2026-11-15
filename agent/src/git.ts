@@ -1258,6 +1258,14 @@ export const RECOVERY_CHUNK_BYTES = 1024 * 1024;
 // checks out on `git clone recovered.bundle`, and that can never collide with a real run
 // branch or a stale bare mirror ref (it is created and deleted under the bare lock).
 export const RECOVERY_BUNDLE_REF = "refs/heads/recovered-source";
+// Node script (run as `node -e SCRIPT <path>`) that prints the sha256 hex of a file, streaming it so a large
+// `.git/index` is never held in memory whole. Prints "absent" for ENOENT and "error" for any other failure; it
+// writes only once, never writes to stderr and never throws.
+export const TERMINAL_INDEX_HASH_SCRIPT =
+  `const fs=require("fs"),c=require("crypto");let done=false;const out=(s)=>{if(!done){done=true;process.stdout.write(s)}};` +
+  `try{const h=c.createHash("sha256");const s=fs.createReadStream(process.argv[1]);` +
+  `s.on("data",(d)=>h.update(d));s.on("end",()=>out(h.digest("hex")));` +
+  `s.on("error",(e)=>out(e&&e.code==="ENOENT"?"absent":"error"))}catch(e){out(e&&e.code==="ENOENT"?"absent":"error")}`;
 
 /** Inspect at most 16 KiB of retained bytes; never load the pack to parse its header. */
 export async function readRecoveryBundleHeader(bundlePath: string, sourceSha: string): Promise<{
@@ -20880,9 +20888,7 @@ try {
       }
     };
     const indexHash = async (): Promise<string> => {
-      const out = await runnerNode(
-        `const fs=require("fs"),c=require("crypto");try{process.stdout.write(c.createHash("sha256").update(fs.readFileSync(process.argv[1])).digest("hex"))}catch(e){process.stdout.write(e.code==="ENOENT"?"absent":"error")}`,
-        path.join(clonePath, ".git", "index"));
+      const out = await runnerNode(TERMINAL_INDEX_HASH_SCRIPT, path.join(clonePath, ".git", "index"));
       if (!/^([0-9a-f]{64}|absent)$/.test(out)) return fail("index_unreadable");
       return out;
     };
