@@ -34,7 +34,7 @@ import { RecoveryClosureLimitError, recoveryClosureLimitDetail, formatRecoveryDe
 import { MaintenanceBudget, RetainedSwitchSettlement } from "./maintenance-budget.js";
 import { MaintenanceResources } from "./recovery-maintenance.js";
 import { AuthorityRefusal, AuthorityShutdownRefusal, SourceUseHeldRefusal } from "./authority-lock.js";
-import type { AuthorityRuntime, AuthorityWait } from "./authority-runtime.js";
+import { SOURCE_END_REASONS, type SourceEndReason, type AuthorityRuntime, type AuthorityWait } from "./authority-runtime.js";
 import { leaseEpoch, leaseHarness, processWorkerIncarnation, type SourceUseLease } from "./completion-authority.js";
 import { CacheTargetBinding } from "./cache-target.js";
 import { RestoreCompositeBlockedError, RestoreCompositeError, RestoreSeedError, restoreDigest } from "./restore-journal.js";
@@ -2591,6 +2591,7 @@ type SourceEndDiagnostics = {
   barrier: "not_attempted" | "joined" | "unconfirmed";
   publication: "not_attempted" | "published" | "ended" | "unpublished";
   outcome: "early_exit" | "no_authority" | "no_sources" | "tails_unjoined" | "remediation_held" | "ended" | "unconfirmed";
+  reasons: SourceEndReason[];
   sources: number; kept: number; foreign: boolean; no_lease: boolean; publication_epoch_mismatch: boolean;
 };
 const sourceEndDiagnostics = new WeakMap<RunFlight, SourceEndDiagnostics>();
@@ -4677,7 +4678,7 @@ export class RunRunner {
       state = { stage: "teardown", terminal: "skipped", executor: false, process: false,
         commands: false, steering: false, auxiliaries: false, memory: false, park_reap: false,
         remediation: "none", barrier: "not_attempted", publication: "not_attempted",
-        outcome: "early_exit", sources: 0, kept: 0, foreign: false, no_lease: false, publication_epoch_mismatch: false };
+        outcome: "early_exit", reasons: [], sources: 0, kept: 0, foreign: false, no_lease: false, publication_epoch_mismatch: false };
       sourceEndDiagnostics.set(flight, state);
     }
     return state;
@@ -4807,6 +4808,8 @@ export class RunRunner {
       }
       const outcome = await authority.endSourceUse(paths, { timeoutMs: this.sourceUseEndWaitMs, sink });
       if (outcome.kept.length > 0) warn("source use left active for some paths", { kept: Math.min(outcome.kept.length, 2048) });
+      // Older internal doubles may omit reasons. Never infer a queued retry from kept paths.
+      diagnostic.reasons = SOURCE_END_REASONS.filter(reason => outcome.reasons?.includes(reason));
       diagnostic.kept = Math.min(outcome.kept.length, 2048);
       diagnostic.outcome = outcome.kept.length ? "unconfirmed" : "ended";
       return { paths: allPaths, endedSlots: outcome.endedSlots, published, ownedEpochs };
@@ -7362,7 +7365,14 @@ export class RunRunner {
           const disposal = await terminalSafety.dispose({ boundary: "terminal", deadlineMs: this.codexBoundaryDeadlineMs });
           flight.terminalDisposal = Object.freeze({ source: terminalSource, result: disposal });
           terminalDisposeUnproven = !this.terminalProcessProof(flight);
-          terminalDisposition = disposal.kind === "incomplete" ? "incomplete" : "invalid";
+          // An incomplete result describes this attempt only when the current facade
+          // recorded that exact outcome; a foreign or malformed result is invalid.
+          const recordedOutcome = "terminalDisposalOutcome" in terminalSafety &&
+            typeof terminalSafety.terminalDisposalOutcome === "function"
+            ? terminalSafety.terminalDisposalOutcome() : undefined;
+          terminalDisposition = this.terminalSourceCurrent(flight, terminalSource) &&
+            recordedOutcome === disposal && disposal.kind === "incomplete" && Array.isArray(disposal.errors)
+            ? "incomplete" : "invalid";
           if (!terminalDisposeUnproven) flight.evidenceProcessJoined = terminalExecutor;
         } catch {
           terminalDisposition = "rejected";

@@ -367,7 +367,18 @@ for (const mode of ["ordinary", "upload-rejected", "upload-failed", "commands-un
       release.resolve();
       await running;
       await pass;
-      if (mode.startsWith("commands-")) assert.ok(commandFailures > 0, "actual command settlement failed AFTER upload acceptance");
+      const summaries = (log.lines as Array<Record<string, unknown>>)
+        .filter(line => line.msg === "source use teardown summary");
+      assert.equal(summaries.length, 1, "real teardown emits once after the steering join");
+      const summary = summaries[0]!;
+      assert.equal(summary.steering, mode !== "steering-rejected");
+      if (mode.startsWith("commands-")) {
+        assert.ok(commandFailures > 0, "actual command settlement failed AFTER upload acceptance");
+        assert.equal(summary.commands, false);
+      }
+      if (memoryMode && mode !== "memory-enrolled") assert.equal(summary.memory, false);
+      for (const secret of [claim.run_id, unique, "fixture command settlement rejection", "fixture steering join rejected"])
+        assert.equal(JSON.stringify({ ...summary, run_id: undefined, issue_iid: undefined }).includes(secret), false, "bounded summary excludes private data");
       if (mode === "executor-replaced") {
         assert.equal(replaced, true);
         assert.ok(disposals > 0, "the original runtime has a real disposal result");

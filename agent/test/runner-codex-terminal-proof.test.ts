@@ -176,6 +176,32 @@ for (const [index, mode] of modes.entries()) {
     }
     await execution;
     if (entryError !== undefined) throw entryError;
+    const summaries = (log.lines as Array<Record<string, unknown>>)
+      .filter(line => line.msg === "source use teardown summary");
+    assert.equal(summaries.length, 1, "real runner teardown emits exactly one summary");
+    const summary = summaries[0]!;
+    if (mode === "claude") assert.equal(summary.terminal, "not_required");
+    if (mode.startsWith("skipped")) assert.equal(summary.terminal, "skipped");
+    if (mode === "incomplete") assert.equal(summary.terminal, "incomplete");
+    if (mode === "rejected") assert.equal(summary.terminal, "rejected");
+    if (mode === "foreign-result") assert.equal(summary.terminal, "invalid");
+    if (mode === "healthy") {
+      assert.equal(summary.terminal, "joined");
+      assert.equal(summary.executor, true);
+      assert.equal(summary.process, true);
+      assert.equal(summary.commands, true);
+      assert.equal(summary.steering, true);
+      assert.equal(summary.auxiliaries, true);
+      assert.equal(summary.memory, true);
+      assert.equal(summary.park_reap, true);
+    }
+    if (mode === "swapped-executor" || mode === "skipped-identity-swap") assert.equal(summary.executor, false);
+    if (["skipped", "skipped-operation", "skipped-executor", "skipped-receipt"].includes(mode))
+      assert.equal(summary.memory, false);
+    // Assert privacy on the summary itself: ordinary runner logs legitimately identify a run.
+    const serialized = JSON.stringify({ ...summary, run_id: undefined, issue_iid: undefined });
+    for (const secret of [claim.run_id, flight?.worktreePath, "private-error-sentinel"])
+      if (secret) assert.equal(serialized.includes(secret), false, "summary excludes source identity/error");
     assert.equal(disposeInsideRegion, false, "terminal disposal runs outside A/B scopes");
     assert.ok(flight);
     if (mode === "claude") {

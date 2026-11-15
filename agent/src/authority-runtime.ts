@@ -48,6 +48,13 @@ export { AuthorityShutdownRefusal };
 // in-process queue and retried by the drain until applied or the process exits; a crash never reaches it, so
 // the slot stays active.
 
+/** Diagnostic facts only; never source identities or authority to relax a slot. */
+export const SOURCE_END_REASONS = [
+  "queued_retry", "pending_operation", "foreign_owner", "no_lease",
+  "transition_unconfirmed", "authority_unavailable", "not_current",
+] as const;
+export type SourceEndReason = typeof SOURCE_END_REASONS[number];
+
 /** How long, and until what signal, an outermost entry may wait for A. */
 export interface AuthorityWait { signal?: AbortSignal; timeoutMs?: number }
 
@@ -957,10 +964,11 @@ export class AuthorityRuntime implements AuthorityScope {
    */
   async endSourceUse(
     paths: Iterable<string>, options: AuthorityWait & { sink?: Set<string>; skipFlightOwned?: boolean } = {},
-  ): Promise<{ ended: string[]; kept: string[]; endedSlots: Array<EndedSlotReceipt & { path: string }> }> {
+  ): Promise<{ ended: string[]; kept: string[]; endedSlots: Array<EndedSlotReceipt & { path: string }>; reasons?: SourceEndReason[] }> {
     const keys = [...new Set([...paths].map((p) => path.resolve(p)))];
     const ended: string[] = [];
     const kept: string[] = [];
+    const reasons = new Set<SourceEndReason>();
     // A key another unreleased sink owns is not this caller's to end: reported kept, never queued, never released.
     // Computed before A is taken: a stale answer only keeps a key (fails closed). The `foreign` answer is stable
     // for a key that is already owned when it is computed, because another sink's admission of an owned key is
@@ -973,13 +981,14 @@ export class AuthorityRuntime implements AuthorityScope {
     const foreign = new Set(keys.filter((key) => options.skipFlightOwned === true && this.#owners.has(key) &&
         this.#discards.get(key) !== this.#leases.get(key) ||
       options.sink !== undefined && this.heldByOtherSink(key, options.sink)));
+    if (foreign.size) reasons.add("foreign_owner");
     for (const key of keys) if (!foreign.has(key)) this.#declinedEnds.delete(key);
     try {
       if (foreign.size > 0) this.#options.log?.warn("source use left active: another flight owns it", { sources: Math.min(foreign.size, 2048) });
     } catch { /* Preserve disposition. */ }
     // The durable identity of each slot this call moved to `ineligible` itself: the only positive end evidence.
     const endedSlots: Array<EndedSlotReceipt & { path: string }> = [];
-    if (keys.length === 0) return { ended, kept, endedSlots };
+    if (keys.length === 0) return { ended, kept, endedSlots, reasons: [] };
     const warn = (message: string, fields: Record<string, unknown>): void => {
       try { this.#options.log?.warn(message, fields); } catch { /* Diagnostics cannot change end disposition. */ }
     };
@@ -988,7 +997,10 @@ export class AuthorityRuntime implements AuthorityScope {
     for (const key of keys) { const lease = this.#leases.get(key); if (lease) captured.set(key, lease); }
     const queue = (key: string): void => {
       const lease = captured.get(key);
-      if (lease && this.#leases.get(key) === lease) this.#ends.set(key, lease);
+      if (lease && this.#leases.get(key) === lease) {
+        this.#ends.set(key, lease);
+        reasons.add("queued_retry");
+      } else reasons.add(lease ? "not_current" : "no_lease");
     };
     try {
       await this.withTransaction(async (tx) => {
@@ -996,12 +1008,14 @@ export class AuthorityRuntime implements AuthorityScope {
         for (const key of keys) {
           if (foreign.has(key)) { kept.push(key); continue; }
           const lease = captured.get(key);
-          if (!lease) { kept.push(key); await this.#recheckOwner(tx, store, key); continue; }
+          if (!lease) { reasons.add("no_lease"); kept.push(key); await this.#recheckOwner(tx, store, key); continue; }
           try {
             const result = await this.#endOne(tx, store, key, lease, (receipt) => endedSlots.push({ ...receipt, path: key }));
             if (result === "ended") ended.push(key);
-            else if (result === "kept") { kept.push(key); queue(key); }
+            else if (result === "kept") { reasons.add("pending_operation"); kept.push(key); queue(key); }
+            else reasons.add("not_current");
           } catch {
+            reasons.add("transition_unconfirmed");
             kept.push(key);
             queue(key);
             warn("source use left active: it could not be ended", { reason: "end_unconfirmed" });
@@ -1009,12 +1023,13 @@ export class AuthorityRuntime implements AuthorityScope {
         }
       }, options);
     } catch {
+      reasons.add("authority_unavailable");
       warn("source use left active: the authority transaction was unavailable", { reason: "authority_unavailable" });
       for (const key of keys) if (!ended.includes(key) && !foreign.has(key)) queue(key);
       this.#scheduleDrain();
-      return { ended, kept: keys.filter((key) => !ended.includes(key)), endedSlots };
+      return { ended, kept: keys.filter((key) => !ended.includes(key)), endedSlots, reasons: [...reasons] };
     }
-    return { ended, kept, endedSlots };
+    return { ended, kept, endedSlots, reasons: [...reasons] };
   }
 
   /**

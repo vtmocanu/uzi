@@ -443,9 +443,19 @@ describe("sink retirement and ownership at a flight's teardown", () => {
     // B (a retained-recovery flight refused with SourceUseHeldRefusal) still names the path as its worktree and
     // its tails were joined, but its sink never admitted it.
     const warnings: string[] = [];
-    const spy = Object.assign(nullLogger(), { warn: (message: string, fields?: Record<string, unknown>) => { warnings.push(message + " " + JSON.stringify(fields ?? {})); } });
+    const summaries: Record<string, unknown>[] = [];
+    const spy = Object.assign(nullLogger(), { warn: (message: string, fields?: Record<string, unknown>) => {
+      warnings.push(message + " " + JSON.stringify(fields ?? {}));
+      if (message === "source use teardown summary") summaries.push(fields!);
+    } });
     const flightB: Flight = { worktreePath: canonical, sourceUsePaths: sinkB, sourceTailsJoined: true };
     await internals.endFlightSourceUse(flightB, spy);
+    assert.equal(summaries.length, 1);
+    assert.equal(summaries[0]!.foreign, true);
+    assert.equal(summaries[0]!.outcome, "unconfirmed");
+    assert.equal(summaries[0]!.kept, 1);
+    assert.equal(JSON.stringify(summaries).includes(canonical), false);
+    assert.equal(JSON.stringify(summaries).includes(epoch!), false);
     const slot = await slotOf(r.rt, canonical);
     assert.equal(slot?.state, "active", "B's teardown did not end A's epoch");
     assert.equal(slot?.epoch, epoch);

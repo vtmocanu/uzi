@@ -3267,7 +3267,9 @@ export class WorkerClient {
     if (body.completion_final_head !== undefined && !this.hasFeature("recovery_completed_publication_v1")) ack.completedPublicationReason = "unsupported_feature";
     if (witness && ack.status === "running" && ack.registrationEvidence === "recorded" && !ack.staleClaim && !ack.credentialSwitch &&
         !this.registrationEvidenceDropped && this.registerNonce === witness.register_nonce) {
-      if (this.witnessedRunning.size >= 2048) this.witnessedRunning.clear();
+      // Witnesses remain valid for this registration, including while a hold ACK is in flight.
+      // Keep one per run until re-registration clears witnessedRunning; unrelated ACKs must
+      // never revoke an active run's exact-generation capability.
       this.witnessedRunning.set(runId, witness);
     }
     return ack;

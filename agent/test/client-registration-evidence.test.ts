@@ -72,6 +72,24 @@ describe("registration evidence on the running report", () => {
     assert.equal(c.sourceEndDeclinedRegistration("r1", GEN), NONCE);
   });
 
+  it("preserves active exact-generation witnesses across more than 2048 unrelated ACKs", async () => {
+    const ids = Array.from({ length: 2050 }, (_, i) => `boundary-${i}`);
+    const replies: Reply[] = ids.map(id => ({ status: 200, body: JSON.stringify({
+      run: { id, status: "running" }, registration_evidence: "recorded",
+    }) }));
+    const { c } = await make(replies, { features: [...FEATURES, "retained_source_end_hold_v1"] });
+    // Sequential ACKs bound the test's work and keep every witness active in one registration.
+    for (const id of ids) {
+      await c.reportState(id, { status: "running", claim_generation: GEN }, undefined, { registrationEpoch: EPOCH });
+    }
+    for (const id of [ids[0]!, ids[2047]!, ids[2048]!, ids[2049]!]) {
+      assert.equal(c.sourceEndDeclinedRegistration(id, GEN), NONCE, id);
+      assert.equal(c.sourceEndDeclinedRegistration(id, GEN + 1), undefined, id);
+    }
+    await c.register("fixture", "base", 1, undefined, ["credential_switch_v1"], undefined, 0);
+    assert.equal(c.sourceEndDeclinedRegistration(ids[0]!, GEN), undefined);
+  });
+
   it("a status-only running ACK is not a recorded witness", async () => {
     const { c } = await make(["ok"], { features: [...FEATURES, "retained_source_end_hold_v1"] });
     await c.reportState("r1", { status: "running", claim_generation: GEN }, undefined, { registrationEpoch: EPOCH });

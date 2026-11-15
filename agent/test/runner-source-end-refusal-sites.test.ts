@@ -21,9 +21,17 @@ installHarness();
 
 // These are runner/report regressions. FakeApi supplies wire ACKs, not PostgreSQL
 // transactions; source_end_declined_livedb_test.go owns the M1 server proof.
+const transports = ["exact", "missing-detail", "wrong-detail", "foreign-run", "foreign-worker",
+  "stale", "missing-generation", "wrong-generation", "registration-rotation", "409", "lost-ACK", "400",
+  "cancel-before-await", "current-ownership"] as const;
 for (const site of ["early", "later-race", "phaseClone-reseed"] as const) {
-  for (const evidence of ["exact-declined", "retirement-only", "queued-end"] as const) {
-    it(`source end refusal: ${site} / ${evidence}`, async t => {
+  // Transport negatives share the real early refusal fixture; the three call
+  // sites retain their independent admission coverage without a Cartesian suite.
+  const cases = (["exact-declined", "retirement-only", "queued-end"] as const).flatMap(evidence =>
+    transports.filter(transport => transport === "exact" || (site === "early" && evidence === "exact-declined"))
+      .map(transport => ({ evidence, transport })));
+  for (const { evidence, transport } of cases) {
+    it(`source end refusal: ${site} / ${evidence} / ${transport}`, async t => {
       const token = randomUUID();
       const rt = new AuthorityRuntime({
         lifetime: await acquireWorkerLifetime(fx.dataDir, testLockOptions()),
@@ -39,12 +47,30 @@ for (const site of ["early", "later-race", "phaseClone-reseed"] as const) {
       await client.register("refusal-sites", "test", 1, undefined, [], registry.buildRegisterSnapshot(), 0);
       api.modelCrossCheckRunningRule = true;
       api.modelOrdinaryRunningRule = true;
+      let holdSends = 0;
+      const wireBodies: string[] = [];
+      const fetch = globalThis.fetch;
+      t.mock.method(globalThis, "fetch", async (...args: Parameters<typeof fetch>) => {
+        const bytes = typeof args[1]?.body === "string" ? args[1].body : undefined;
+        if (bytes && JSON.parse(bytes).recovery_detail === "source_end_declined") {
+          wireBodies.push(bytes);
+          holdSends++;
+        }
+        return fetch(...args);
+      });
       api.stateAckWire = (body, run) => {
         if (body.status === "running" && body.registration_evidence)
           return { status: 200, body: { run, registration_evidence: "recorded" } };
-        if (body.status === "recovery_wait")
-          return { status: 200, body: { run: { ...run,
-            recovery_wait_cause: body.recovery_cause, recovery_wait_detail: body.recovery_detail } } };
+        if (body.status === "recovery_wait") {
+          if (transport === "400") return { status: 400, body: { error: "invalid request body" } };
+          const held = { ...run, recovery_wait_cause: body.recovery_cause,
+            ...(transport === "missing-detail" || transport === "current-ownership" ? {} : { recovery_wait_detail:
+              transport === "wrong-detail" ? "remediation_proof_unknown" : body.recovery_detail }),
+            ...(transport === "foreign-run" ? { id: randomUUID() } : {}),
+            ...(transport === "foreign-worker" ? { worker_id: randomUUID() } : {}) };
+          return { status: transport === "409" || transport === "stale" ? 409 : 200,
+            body: { run: held, ...(transport === "stale" ? { disposition: "stale_claim" } : {}) } };
+        }
         return undefined;
       };
       const iid = 436520;
@@ -194,12 +220,33 @@ for (const site of ["early", "later-race", "phaseClone-reseed"] as const) {
         });
       }
       let dispositions = 0;
+      let refusedFlight: Record<string, unknown> | undefined;
+      const report = client.reportState.bind(client);
+      t.mock.method(client, "reportState", async (...args: Parameters<typeof report>) => {
+        const ack = await report(...args);
+        if (args[1].recovery_detail === "source_end_declined") {
+          // Generation is local sent-attempt evidence, not a server row field.
+          if (transport === "missing-generation") delete ack.sentClaimGeneration;
+          if (transport === "wrong-generation") ack.sentClaimGeneration = 1;
+          if (transport === "registration-rotation") {
+            api.registerNonce = randomUUID();
+            await client.register("refusal-sites", "test", 1, undefined, [], registry.buildRegisterSnapshot(), 0);
+          }
+        }
+        return ack;
+      });
       const dispose = internals.disposeHeldSource.bind(runner);
       t.mock.method(internals, "disposeHeldSource", async (...args: unknown[]) => {
         dispositions++;
         assert.equal(args[2], source, "the disposition names the held source");
+        refusedFlight = args[1] as Record<string, unknown>;
+        if (transport === "cancel-before-await")
+          (refusedFlight.cancel as AbortController).abort(new Error("cancel before held await"));
+        if (transport === "current-ownership") api.setOwnershipStatus(claim.run_id, "running", 2);
         return dispose(...args);
       });
+      if (transport === "lost-ACK") api.afterPersistState(claim.run_id,
+        body => body.recovery_detail === "source_end_declined", "drop");
       const selectedBefore = await rt.peekSlot(source);
       api.setOwnershipStatus(claim.run_id, "claimed", 2);
       const crashStage = process.env.UZI_SOURCE_END_CRASH_STAGE;
@@ -242,7 +289,7 @@ for (const site of ["early", "later-race", "phaseClone-reseed"] as const) {
       }
       try {
         await runner.execute(gitlabClaim(iid, { ...claim, claim_generation: 2 }));
-        assert.equal(client.sourceEndDeclinedRegistration(claim.run_id, 2), nonce,
+        if (transport !== "registration-rotation") assert.equal(client.sourceEndDeclinedRegistration(claim.run_id, 2), nonce,
           "the refused generation recorded its own registration witness");
         if (site === "phaseClone-reseed") {
           const diagnostic = () => JSON.stringify({ admissionCalls, reclaimed, realHeldRefusals, dispositions,
@@ -256,7 +303,30 @@ for (const site of ["early", "later-race", "phaseClone-reseed"] as const) {
         }
         const reports = api.states.filter(s => s.runId === claim.run_id &&
           s.body.recovery_detail === "source_end_declined");
-        assert.equal(reports.length, evidence === "exact-declined" ? 1 : 0);
+        const noSend = evidence !== "exact-declined" || transport === "cancel-before-await";
+        if (noSend) assert.equal(holdSends, 0);
+        else assert.ok(holdSends >= 1 && holdSends <= 2, "bounded exact hold attempts");
+        if (transport === "exact") assert.equal(reports.length, evidence === "exact-declined" ? 1 : 0);
+        assert.ok(refusedFlight);
+        assert.equal(refusedFlight.parked === true, evidence === "exact-declined" &&
+          (transport === "exact" || transport === "lost-ACK" || transport === "409"), "only an exact current ACK adopts parked state");
+        for (const latch of ["retainedEpisodeCustody", "retainedLocalCustody", "preserveRecoveryClone",
+          "preserveSession", "keepGuardedInventoryOpen"])
+          assert.equal(refusedFlight[latch], true, latch);
+        for (const bytes of wireBodies) assert.equal(bytes, JSON.stringify({
+          status: "recovery_wait", recovery_cause: "retained_recovery_adoption_failed",
+          claim_generation: 2, register_nonce: nonce, recovery_detail: "source_end_declined",
+        }), "every send preserves exact detail, nonce and generation");
+        if (transport === "lost-ACK") assert.equal(holdSends, 2, "lost ACK replays byte-identical hold");
+        if (transport === "409" || transport === "400" || transport === "stale") assert.equal(holdSends, 1);
+        if (["missing-detail", "wrong-detail", "foreign-run", "foreign-worker", "missing-generation",
+          "wrong-generation", "current-ownership"].includes(transport)) assert.equal(holdSends, 2);
+        if (transport === "registration-rotation") assert.notEqual(
+          client.sourceEndDeclinedRegistration(claim.run_id, 2), nonce, "rotation invalidated the awaited witness");
+        assert.equal(api.states.some(s => s.runId === claim.run_id && s.body.status === "recovery_wait" &&
+          s.body.recovery_detail !== "source_end_declined"), false, "no generic recovery fallback");
+        if (site === "early") assert.deepEqual(await git.discoverRetainedRecovery(fx.originPath,
+          `agent/issue-${iid}`, `issue-${iid}`, claim.run_id), retained, "transport cannot consume retained journal");
         if (reports.length) {
           assert.equal(reports[0]?.body.status, "recovery_wait");
           assert.equal(reports[0]?.body.register_nonce, nonce);
