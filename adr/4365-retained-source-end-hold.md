@@ -104,6 +104,50 @@ Record the exact deployed image and commit, selected source, claim-generation an
 
 The client retains one acknowledged running witness per distinct run for its registration lifetime; re-registration clears the map. Terminal pruning is not implemented. This avoids revoking an active flight's evidence when unrelated reports cross an arbitrary size threshold, at the cost of registration-lifetime memory growth. It grants no end or reuse authority.
 
+## M4 completion evidence ledger
+
+The in-run criterion **M4 — `task test:forge-fake`** is **UNMET**.
+No waiver or partial completion decision has been recorded. The retained log is
+`.uzi/scratch/gate-log.0d58Kh`; its command header identifies the tested base
+`3fd2b948ab9a80254aaf195ecb37f2838e617c57`. The fake's code has not changed since
+that run. Exact failure output:
+
+```text
+[test:forge-fake] fatal: unable to access 'https://127.0.0.1:46337/group/restore45a.git/': The requested URL returned error: 500
+[test:forge-fake]   ✖ independent-restore fixtures advertise distinct projects and smart-HTTP bares (86.246304ms)
+task: Failed to run task "test:forge-fake": exit status 1
+EXIT=201
+```
+
+The worker's `git --exec-path` reported `/usr/libexec/git-core`, where
+`git-http-backend` was absent; no provisioned alternate was found. The earlier
+scratch-only package fetch failed to select the matching package. No package
+installation or binary fetch is authorized for the continuation.
+
+Every other M4 worker item has recorded evidence below. These logs are retained
+run-local evidence, not a substitute for exact-head CI:
+
+| M4 item | Implementation and verification |
+|---|---|
+| Decision/spec amendments and incident uncertainty | ADR-1783, ADR-2396, this record and dated human-spec amendments, committed in `c23138632`; reviewer and tester reviewed `3fd2b948a..c23138632`. |
+| Related-work classification | Source guards and issue records checked; dispositions below distinguish reuse from unresolved broader issues. |
+| User recovery docs and embedded mirror | Both recovery documents updated and `task docs:sync` executed; docs check `.uzi/scratch/gate-log.gGSs4R` exited 0. |
+| E2E literal/route inventory and assertions | Tracked search of phases, lib and fake consumers; canonical control now rejects the new detail and pins the SQL projection. Reviewer/tester reviewed `c23138632..761818592`; `task test:e2e-lib` and shell lint exited 0 in `gate-log.9HO6kJ` and `gate-log.xekk1n` under `.uzi/scratch/`. No fake route change was needed. |
+| Changelog and structural checks | Shipping UUID fragment committed; spec, migration additive/numbering, token-literal and changelog checks exited 0 in `gate-log.IulGqy`, `gate-log.tTXS2c`, `gate-log.V2fQsc`, `gate-log.Wmc3Dc`, `gate-log.lmlYVI` under `.uzi/scratch/`. |
+| Security validation | Lead-owned secrets and required Semgrep checks exited 0 with canaries detected: `.uzi/scratch/gate-log.rSyaiD`, `.uzi/scratch/gate-log.VO3lMd`. |
+| Final affected integration | At `761818592`, API check and full race/count=1 package tests for embedded docs and CLI exited 0: `gate-log.UpA8wz`, `gate-log.YBowea`, `gate-log.EAYLdr` under `.uzi/scratch/`. Web check exited 0 in `gate-log.flu0q5`; unchanged agent/server proofs retain the M1–M3 evidence above. |
+| Runtime measurement and scope limits | Recorded durations above; equivalent baseline and CI critical-path impact remain explicitly unmeasured. No timing export was created. |
+
+Full-stack phases `32-agent-mr-fix-crosskind`, `45-bounded-concurrency`,
+`52-api-outage-outbox` and `71-mr-rework` were not run.
+Only the required forge-fake in-run gate remains unmet; M4 itself is not complete.
+Full suites and LiveDB remain separate landing obligations, and the hosted
+two-source observation remains owner acceptance.
+
+`Taskfile.yml` includes `test:forge-fake` in `gate:repo`, and the PR
+workflow invokes `task gate:repo`. Exact-head PR CI must be green before merge.
+Whether that environment supplies the backend is unverified until it passes.
+
 ## Related-site dispositions
 
 - #3638 / ADR-2396: already accurate as the reused same-process memory source guard; the residual no-record restart wording is updated for #3644.
