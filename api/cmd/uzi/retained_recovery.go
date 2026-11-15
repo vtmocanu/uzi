@@ -12,9 +12,12 @@ const retainedRecoveryAdoptionFailedCause = "retained_recovery_adoption_failed"
 // Closed-set recovery_wait_detail values (issue #4177). A client renders only these and never
 // prints the raw string; nil or any other value selects the generic text and permits nothing new.
 const (
+	recoveryDetailSourceEndDeclined       = "source_end_declined"
 	recoveryDetailSecretRemediationActive = "secret_remediation_active"
 	recoveryDetailRemediationProofUnknown = "remediation_proof_unknown"
 )
+
+const sourceEndDeclinedGuidance = "An earlier flight declined source-use end. The agent did not start; local work and custody are protected. Resume with the unchanged worker registration is refused (409). A different worker registration only enables a guarded attempt; it does not establish that all retained sources are usable. Independently restore only from verified sources with prerequisite commits present; an archive may omit the latest work. Operator discard is separate and requires a verified backup. Cancel remains available."
 
 // adoptionFailedDetail returns the known detail of an adoption-failed park, else "".
 func adoptionFailedDetail(r apitypes.RunDTO) string {
@@ -22,7 +25,7 @@ func adoptionFailedDetail(r apitypes.RunDTO) string {
 		return ""
 	}
 	switch d := strOr(r.RecoveryWaitDetail, ""); d {
-	case recoveryDetailSecretRemediationActive, recoveryDetailRemediationProofUnknown:
+	case recoveryDetailSourceEndDeclined, recoveryDetailSecretRemediationActive, recoveryDetailRemediationProofUnknown:
 		return d
 	}
 	return ""
@@ -72,6 +75,8 @@ func recoveryDecisionLine(r apitypes.RunDTO) string {
 	guidance := idleStallResumeGuidance(r)
 	if strOr(r.RecoveryWaitCause, "") == retainedRecoveryAdoptionFailedCause {
 		switch adoptionFailedDetail(r) {
+		case recoveryDetailSourceEndDeclined:
+			guidance = sourceEndDeclinedGuidance
 		case recoveryDetailSecretRemediationActive:
 			guidance = "The retained source is held under an active secret-scan remediation. Resume cannot succeed unchanged and is refused. Export an available archive (`uzi run export " + cellText(r.ID) + " --output <path>`), which may omit later work kept on the worker; an operator can recover the retained work from worker storage. Cancel ends the run."
 		case recoveryDetailRemediationProofUnknown:
@@ -102,6 +107,16 @@ func recoveryDecisionTUILines(r apitypes.RunDTO) []string {
 	if strOr(r.RecoveryWaitCause, "") == retainedRecoveryAdoptionFailedCause {
 		var guidance []string
 		switch adoptionFailedDetail(r) {
+		case recoveryDetailSourceEndDeclined:
+			guidance = []string{
+				"An earlier flight declined source-use end.",
+				"Unchanged worker registration: Resume refused (409).",
+				"A different registration enables a guarded attempt;",
+				"not all retained sources may be usable.",
+				"Independent restore requires verified sources and",
+				"prerequisite commits. Archives may omit latest work.",
+				"Operator discard is separate: verify a backup first.",
+			}
 		case recoveryDetailSecretRemediationActive:
 			guidance = []string{
 				"The retained source is held under an active",

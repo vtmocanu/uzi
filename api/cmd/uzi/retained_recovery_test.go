@@ -630,3 +630,55 @@ func TestRetainedContinuationUnwitnessedTUI(t *testing.T) {
 		})
 	}
 }
+
+func TestSourceEndDeclinedConsumers(t *testing.T) {
+	old := logsPollInterval
+	logsPollInterval = time.Millisecond
+	t.Cleanup(func() { logsPollInterval = old })
+	for _, detail := range []string{"source_end_declined", "unknown-private-detail"} {
+		for _, args := range [][]string{
+			{"get", "r1"}, {"get", "r1", "--json"},
+			{"wait", "r1", "--interval", "1ms", "--timeout", "1s"},
+			{"logs", "r1", "--follow"}, {"logs", "r1", "--follow", "--json"},
+		} {
+			t.Run(detail+strings.Join(args, "/"), func(t *testing.T) {
+				r := retainedRecoveryRun("adoption/future")
+				r.RecoveryWaitDetail = &detail
+				polls, mutation := 0, false
+				srv := workerExhaustionServer(t, []apitypes.RunDTO{r}, &polls, &mutation)
+				defer srv.Close()
+				out, errout, code := runCLI(t, httpEnv(srv), append([]string{"run"}, args...)...)
+				if code != 0 || mutation || polls != 1 {
+					t.Fatalf("exit %d polls %d mutation %v: %s", code, polls, mutation, errout)
+				}
+				if args[0] == "get" && args[len(args)-1] == "--json" {
+					var got apitypes.RunDTO
+					if err := json.Unmarshal([]byte(out), &got); err != nil || strOr(got.RecoveryWaitDetail, "") != detail {
+						t.Fatalf("JSON detail lost: %s %v", out, err)
+					}
+					return
+				}
+				copy := out + errout
+				if detail == "source_end_declined" {
+					requireWorkerCopy(t, copy, "earlier flight declined source-use end", "unchanged worker registration", "409", "guarded attempt", "verified backup", "uzi run cancel r1", "no automatic resume")
+				} else {
+					requireWorkerCopy(t, copy, "another recovery episode")
+					if strings.Contains(copy, detail) {
+						t.Fatalf("private detail rendered: %s", copy)
+					}
+				}
+				if strings.Contains(copy, "2099-") {
+					t.Fatalf("hold showed timer: %s", copy)
+				}
+			})
+		}
+	}
+	r := retainedRecoveryRun("adoption/future")
+	detail := "source_end_declined"
+	r.RecoveryWaitDetail = &detail
+	m := tuiTestModel(t, &uzicli.FakeClient{}, r.ID)
+	m = applyDetail(m, r, nil)
+	m = step(m, tea.ColorProfileMsg{Profile: colorprofile.Ascii})
+	m = step(m, tea.WindowSizeMsg{Width: 100, Height: 100})
+	requireWorkerCopy(t, stripANSI(m.View().Content), "earlier flight declined source-use end", "Resume refused (409)", "guarded attempt", "verify a backup first", "uzi run cancel r1")
+}

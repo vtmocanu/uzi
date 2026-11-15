@@ -778,9 +778,11 @@ function badgeTitle(reason: string | null | undefined): string | undefined {
   return clean === "" ? undefined : clean;
 }
 
+export const sourceEndDeclinedCopy = "An earlier flight declined source-use end. The agent did not start; local work and custody are protected. Resume with the unchanged worker registration is refused (409). A different worker registration only enables a guarded attempt; it does not establish that all retained sources are usable. Independently restore only from verified sources with prerequisite commits present; an archive may omit the latest work. Operator discard is separate and requires a verified backup. Only the run owner can Resume or Cancel. Cancel remains available. There is no scheduled retry.";
+
 // runBadge maps a card's latest_run to its primary status pill. nowMs is passed in
 // (not read from Date.now) so the running elapsed is deterministic under test.
-export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause" | "recovery_retry_not_before" | "recovery_wait_phase" | "worker_recovery" | "requeue_count" | "memory_hold">>, nowMs: number, maintenanceReason?: string | null): RunBadge {
+export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_detail" | "recovery_wait_cause" | "recovery_retry_not_before" | "recovery_wait_phase" | "worker_recovery" | "requeue_count" | "memory_hold">>, nowMs: number, maintenanceReason?: string | null): RunBadge {
   // The stopped signal wins over the raw status so a cancel-shaped `failed`
   // never renders as breakage.
   if (isStoppedRun(run.status, run.stop_kind)) {
@@ -990,7 +992,7 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause
     case "retained_recovery_adoption_failed":
       return {
         kind: "badge", label: PARK_LABELS.retained_recovery_adoption_failed, tone: "warning", pulse: false,
-        title: "Integrity hold: retained adoption failed, a predecessor needs remediation review, or this release does not support the predecessor. The agent did not start. Local work and its custody are preserved. Only the run owner can Resume or Cancel; there is no scheduled retry.",
+        title: run.recovery_wait_detail === "source_end_declined" ? sourceEndDeclinedCopy : "Integrity hold: retained adoption failed, a predecessor needs remediation review, or this release does not support the predecessor. The agent did not start. Local work and its custody are preserved. Only the run owner can Resume or Cancel; there is no scheduled retry.",
       };
     case "retained_continuation_unwitnessed":
       return {

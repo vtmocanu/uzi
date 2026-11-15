@@ -4143,7 +4143,7 @@ export interface Run {
    *  unchanged (the server refuses it with a 409). "remediation_proof_unknown": the remediation
    *  proof could not be verified; a retry may help. Null, absent or any other value selects the
    *  generic adoption-failure copy and never permits adoption. Never render the raw string. */
-  recovery_wait_detail?: "secret_remediation_active" | "remediation_proof_unknown" | null;
+  recovery_wait_detail?: "source_end_declined" | "secret_remediation_active" | "remediation_proof_unknown" | null;
   /** Issue #1324: which part of the run a `recovery_wait` park interrupted. "publication"
    *  is a forge outage met while publishing: the run keeps its publication intent and
    *  resumes publication only. Null for every other park. Render an unrecognised value

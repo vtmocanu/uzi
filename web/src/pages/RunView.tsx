@@ -70,6 +70,7 @@ import {
   mrChipTitle,
   shadowSignal,
   shouldShowHealthFlag,
+  sourceEndDeclinedCopy,
 } from "../lib/runBadge";
 import { latestActivity } from "../lib/runActivity";
 import { stageForMessages } from "../lib/runStage";
@@ -1492,10 +1493,11 @@ function WorkerDecisionPanel({ run, ownerProof, busy, onResume, onCancel }: {
   onCancel: () => void;
 }) {
   const adoptionFailed = run.recovery_wait_cause === "retained_recovery_adoption_failed";
-  // Closed set: only the two known values change anything; null, absent or any other value
+  // Closed set: only known values change anything; null, absent or any other value
   // keeps the generic adoption-failure behaviour and the raw string is never rendered.
   const adoptionDetail = adoptionFailed ? run.recovery_wait_detail : null;
   const secretActive = adoptionDetail === "secret_remediation_active";
+  const sourceEndDeclined = adoptionDetail === "source_end_declined";
   const proofUnknown = adoptionDetail === "remediation_proof_unknown";
   const resumeReasonId = useId();
   const idleStall = run.recovery_wait_cause === "codex_idle_stall";
@@ -1535,10 +1537,11 @@ function WorkerDecisionPanel({ run, ownerProof, busy, onResume, onCancel }: {
         {memoryHeld && " Only the run owner can resume or cancel this run."}{" "}
         This hold has no scheduled retry. Credential changes, messages and capture expiry do not release it.</>}
       </p>
-      {adoptionFailed && !secretActive && <p className="mt-1.5 text-xs text-warn">
+      {adoptionFailed && !secretActive && !sourceEndDeclined && <p className="mt-1.5 text-xs text-warn">
         Resume starts another recovery episode. If the underlying block persists, the run can hold again. Each new claim adds a custody hold. Resolve the cause before resuming.
         {proofUnknown && ` ${ADOPTION_DETAIL_COPY.remediation_proof_unknown}`}
       </p>}
+      {sourceEndDeclined && <p className="mt-1.5 text-xs text-warn">{sourceEndDeclinedCopy}</p>}
       {secretActive && <p id={resumeReasonId} className="mt-1.5 text-xs text-warn">
         {ADOPTION_DETAIL_COPY.secret_remediation_active}
       </p>}
@@ -2548,7 +2551,7 @@ export function RunView() {
                   : run.recovery_wait_cause === "retained_recovery_adoption_failed"
                     ? // Issue #4177: the closed-set detail is part of the key so a detail change at
                       // the same cause re-announces; null or any other value adds no suffix.
-                      `retained_recovery_adoption_failed${run.recovery_wait_detail === "secret_remediation_active" || run.recovery_wait_detail === "remediation_proof_unknown" ? `:${run.recovery_wait_detail}` : ""}`
+                      `retained_recovery_adoption_failed${run.recovery_wait_detail === "source_end_declined" || run.recovery_wait_detail === "secret_remediation_active" || run.recovery_wait_detail === "remediation_proof_unknown" ? `:${run.recovery_wait_detail}` : ""}`
                   : (run.recovery_wait_cause === "retained_recovery_exhausted" || run.recovery_wait_cause === "codex_idle_stall" || run.recovery_wait_cause === "retained_continuation_unwitnessed")
                     ? effectiveRunStatus(run)
                   : run.recovery_wait_cause === "worker_requeue_exhausted"
@@ -2596,6 +2599,8 @@ export function RunView() {
           ? "The run is waiting for a pooled Anthropic token. Add a token to the pool and it resumes automatically."
           : parkKey === "retained_recovery_adoption_failed:secret_remediation_active"
             ? "Integrity hold: the retained source is held under an active secret-scan remediation. The agent did not start. Local work and its custody are preserved. Resume is unavailable. Only the run owner can Cancel. There is no scheduled retry."
+          : parkKey === "retained_recovery_adoption_failed:source_end_declined"
+            ? sourceEndDeclinedCopy
           : parkKey.startsWith("retained_recovery_adoption_failed")
             ? "Integrity hold: retained adoption failed, a predecessor needs remediation review, or this release does not support the predecessor. The agent did not start. Local work and its custody are preserved. Only the run owner can Resume or Cancel. There is no scheduled retry."
           : parkKey === "retained_continuation_unwitnessed"
