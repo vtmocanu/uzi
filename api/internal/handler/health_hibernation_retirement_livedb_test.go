@@ -4,11 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/vtmocanu/uzi/api/internal/clitoken"
 )
@@ -17,6 +20,54 @@ import (
 // endpoint and the real evaluator. One evaluation covers at most 50 workers, oldest first; a
 // 51st worker makes the check warn and is left out of the evidence, and 50 is the ok control.
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres (./e2e/run-store-it.sh).
+
+// Retirement health evaluates the entire fleet, not just this fixture's owner. Give each
+// test a fresh database rather than skipping or modifying unrelated shared-package workers.
+func retirementHealthLiveDB(t *testing.T) (*Handler, http.Handler, *pgxpool.Pool) {
+	t.Helper()
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via ./e2e/run-store-it.sh for live-DB coverage")
+	}
+	ctx := context.Background()
+	admin, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = admin.Close(context.Background()) })
+	name := "retirement_health_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	ident := pgx.Identifier{name}.Sanitize()
+	if _, err := admin.Exec(ctx, "CREATE DATABASE "+ident); err != nil {
+		t.Fatalf("create dedicated retirement health database: %v", err)
+	}
+	t.Cleanup(func() {
+		cleanup, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if _, err := admin.Exec(cleanup, "DROP DATABASE "+ident+" WITH (FORCE)"); err != nil {
+			t.Errorf("drop dedicated retirement health database: %v", err)
+		}
+	})
+	// Reuse the existing URL/keyword-DSN override, including query-string dbname handling.
+	dedicatedDSN := ephemeralPriorityDSN(t, dsn, name)
+	probe, err := pgx.Connect(ctx, dedicatedDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var actual string
+	err = probe.QueryRow(ctx, "SELECT current_database()").Scan(&actual)
+	_ = probe.Close(ctx)
+	if err != nil || actual != name {
+		t.Fatalf("retirement health database = %q, want %q: %v", actual, name, err)
+	}
+	t.Setenv("UZI_TEST_DATABASE_URL", dedicatedDSN)
+	// cliLiveDB migrates the new database and wires the real services and router. Its pool
+	// cleanup runs before DROP DATABASE because test cleanups run in reverse order.
+	h, router, pool := cliLiveDB(t)
+	if err := pool.QueryRow(ctx, "SELECT current_database()").Scan(&actual); err != nil || actual != name {
+		t.Fatalf("retirement health fixture connected to %q, want %q: %v", actual, name, err)
+	}
+	return h, router, pool
+}
 
 const retirementConditionalText = "would retire only after M2 verifies: actual PV reclaim policy; no intervening pod between observations (sampled only in M1)"
 
@@ -78,7 +129,7 @@ func fetchRetirementCheck(t *testing.T, router http.Handler, token string) retir
 }
 
 func TestAdminHealthHibernationRetirementCapLiveDB(t *testing.T) {
-	h, router, pool := cliLiveDB(t)
+	h, router, pool := retirementHealthLiveDB(t)
 	ctx := context.Background()
 	h.wsvc.SetTxBeginner(pool)
 	// The handler serves a cached evaluation for a few seconds; each fetch advances this clock past it.
@@ -95,7 +146,7 @@ func TestAdminHealthHibernationRetirementCapLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	if existing != 0 {
-		t.Skipf("%d unrelated hibernated workers share this database", existing)
+		t.Fatalf("fresh retirement health database contains %d unexpected hibernated/waking workers", existing)
 	}
 
 	// Nothing hibernated: not applicable.
@@ -143,7 +194,7 @@ func TestAdminHealthHibernationRetirementCapLiveDB(t *testing.T) {
 // receipt; example 3 is a waking worker whose older op's inventory was accepted; the third row is a
 // worker nothing blocks.
 func TestAdminHealthHibernationRetirementExamplesLiveDB(t *testing.T) {
-	h, router, pool := cliLiveDB(t)
+	h, router, pool := retirementHealthLiveDB(t)
 	ctx := context.Background()
 	h.wsvc.SetTxBeginner(pool)
 	clock := time.Now()
@@ -155,7 +206,7 @@ func TestAdminHealthHibernationRetirementExamplesLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	if existing != 0 {
-		t.Skipf("%d unrelated hibernated workers share this database", existing)
+		t.Fatalf("fresh retirement health database contains %d unexpected hibernated/waking workers", existing)
 	}
 
 	// ret-1 (newest) stays conditional, ret-2 is blocked, ret-3 (oldest) is waking.
