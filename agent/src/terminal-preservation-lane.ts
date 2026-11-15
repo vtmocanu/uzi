@@ -228,8 +228,6 @@ async function run(env: TerminalLaneEnv, flight: TerminalLaneFlight, body: Termi
       prepare: async (range: CheckpointRange | "resolve", expectDigests, tip): Promise<PrepareOutcome> => {
         let flagged: string[] = [];
         const ciTarget = defaultBranch ? await env.git.defaultBranchTip(barePath, defaultBranch) : undefined;
-        // The window can lapse during the tip read too: start nothing more (a claim-named branch lands here as well).
-        if (abort.signal.aborted || env.now() >= deadlineAt) return { reason: "deadline" };
         const out = await prepareFrozenHeldPinned({
           git: env.git, barePath, branch, sourceSha: tip, policy: env.policy(), deadlineMs: left(),
           ...(defaultBranch ? { defaultBranch } : {}),
