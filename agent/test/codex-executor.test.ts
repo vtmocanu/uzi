@@ -32342,10 +32342,15 @@ describe("M2 actualRunner credential replacement", () => {
   for (const [oldClaim, target] of [[SUBSCRIPTION, API_KEY], [API_KEY, SUBSCRIPTION],
     [SUBSCRIPTION, { ...SUBSCRIPTION, generation: 20, chatgpt_account_id: "M2-B-account" }]] as const) {
     for (const phase of ["factory", "already-running-body"] as const) {
-      for (const publication of ["baseline", "gated", "publish-failure", "now-publish-failure", "login-failure", "subscription-refresh", "api-key-refresh", "subscription-refresh-prepare-failure", "subscription-refresh-cancel", "crash-after-a-teardown-recovery", "crash-apply-reply-lost-recovery", "crash-apply-ack-recovery", "crash-login-recovery"] as const) {
+      for (const publication of ["baseline", "gated", "before-scope-clear", "after-scope-clear", "before-scope-install", "after-scope-install", "before-executor-publication", "before-Now-publication", "after-Now-publication", "before-B-preparation", "Now-finish-false", "publish-failure", "now-publish-failure", "login-failure", "subscription-refresh", "api-key-refresh", "subscription-refresh-prepare-failure", "subscription-refresh-cancel", "crash-after-a-teardown-recovery", "crash-apply-reply-lost-recovery", "crash-apply-ack-recovery", "crash-login-recovery"] as const) {
         if (publication !== "baseline" && (phase !== "factory" || (oldClaim !== API_KEY && target !== API_KEY))) continue;
         if (publication === "subscription-refresh" && target.auth_mode !== "subscription") continue;
         if (publication === "api-key-refresh" && target.auth_mode !== "api_key") continue;
+        const injectedStage = ["before-scope-clear", "after-scope-clear", "before-scope-install", "after-scope-install", "before-executor-publication", "before-Now-publication", "after-Now-publication", "before-B-preparation", "Now-finish-false"].includes(publication) ? publication : undefined;
+        const scopeClearFailure = injectedStage === "before-scope-clear" || injectedStage === "after-scope-clear";
+        if (injectedStage && (phase !== "factory" || (scopeClearFailure
+          ? oldClaim !== SUBSCRIPTION || target !== API_KEY
+          : oldClaim !== API_KEY || target !== SUBSCRIPTION))) continue;
         const positiveBChild = publication === "gated" && oldClaim === API_KEY && target === SUBSCRIPTION && phase === "factory";
         const queuedRefreshStop = publication === "subscription-refresh-prepare-failure" || publication === "subscription-refresh-cancel";
         const crashRecovery = publication === "crash-after-a-teardown-recovery" ||
@@ -32447,16 +32452,21 @@ describe("M2 actualRunner credential replacement", () => {
           ? ["before-apply", "apply-reply-lost", "before-publish", "after-publish", "before-prepare", "login", "prepared"] as const
           : ["before-publish", "after-publish", "before-prepare", "login", "prepared"] as const;
         const publicationBarriers = publicationStages.map(stage => ({ stage, entered: installerBarrier(), proceed: installerBarrier() }));
+        const injectedFailures: string[] = [];
         const publicationBoundary = async (stage: typeof publicationStages[number]) => {
           if (publication === "baseline") return;
           const barrier = publicationBarriers.find(candidate => candidate.stage === stage)!;
           barrier.entered.resolve();
           await barrier.proceed.promise;
-          if ((publication === "publish-failure" && stage === "after-publish") ||
+          if ((injectedStage === "before-executor-publication" && stage === "before-publish") ||
+              (injectedStage === "before-B-preparation" && stage === "before-prepare") ||
+              (publication === "publish-failure" && stage === "after-publish") ||
               (publication === "login-failure" && stage === "login") ||
               (crashRecovery && stage === crashStage) ||
-              (publication === "subscription-refresh-prepare-failure" && stage === "prepared"))
+              (publication === "subscription-refresh-prepare-failure" && stage === "prepared")) {
+            if (injectedStage) injectedFailures.push(injectedStage);
             throw new Error(`injected ${stage} failure`);
+          }
         };
         const cleanupEntered = installerBarrier(), cleanupContinue = installerBarrier();
         const events: string[] = [];
@@ -32731,7 +32741,7 @@ describe("M2 actualRunner credential replacement", () => {
             assert.equal(a.transport.requests.length, aSends, stage);
             assert.equal(b.transport.requests.length, bSends, stage);
             if (!assignment) nowPublicationProbes.push(stage);
-            if (publication === "gated") {
+            if (publication === "gated" || injectedStage) {
               const probeConsumers = async () => {
                 assert.equal(bFinished, false, stage);
                 assert.ok(retainedRootDispatch);
@@ -32767,10 +32777,36 @@ describe("M2 actualRunner credential replacement", () => {
           startPublicationProbe = probe;
           return { ...lease, publishB: (bundle: Parameters<ReturnType<typeof suspendNow>["publishB"]>[0]) => {
             probe("before-Now-publish");
+            if (injectedStage === "before-Now-publication") {
+              injectedFailures.push(injectedStage);
+              throw new Error("injected before Now publication");
+            }
             const published = lease.publishB(bundle);
             probe("after-Now-publish");
             assert.equal(published, true, "real Now lease publishes synchronously");
+            if (injectedStage === "after-Now-publication") {
+              injectedFailures.push(injectedStage);
+              throw new Error("injected after Now publication");
+            }
             return publication === "now-publish-failure" ? false : published;
+          }, finishB: () => {
+            if (injectedStage !== "Now-finish-false") return lease.finishB();
+            injectedFailures.push(injectedStage);
+            assert.equal(bFinished, true, "executor finish precedes Now finish refusal");
+            assert.ok(!reports.some(status => status.startsWith("credential_switch")), "probe precedes owner hold");
+            const prepare = context.prepareCodexRootDispatch;
+            assert.ok(prepare, "probe the real B context root guard");
+            const aSends = a.transport.requests.length, bSends = b.transport.requests.length;
+            const releases = credentialReleases, refreshes = credentialRefreshes;
+            nowConsumerProbes.push((async () => {
+              await assert.rejects(prepare(context.terminalLifecycleSignal!, () => {}, "root"),
+                "B context root stays closed after executor finish until Now finish and hold release");
+              assert.equal(a.transport.requests.length, aSends);
+              assert.equal(b.transport.requests.length, bSends);
+              assert.equal(credentialReleases, releases);
+              assert.equal(credentialRefreshes, refreshes);
+            })().then(() => ({}), error => ({ error })));
+            return false;
           } };
         });
         let retainedRootDispatch: import("../src/harness.js").RunTurnRequest["rootDispatch"];
@@ -32814,7 +32850,7 @@ describe("M2 actualRunner credential replacement", () => {
         const epochProbe = mock.method(epochBuilder, "startProviderEpoch", async (...args: unknown[]) => {
           const epoch = await startProviderEpoch(...args);
           const epochIndex = epochBuilds++;
-          if (publication === "gated") {
+          if (publication === "gated" || injectedStage) {
             // Read the actual auth owner retained by the returned harness. Its config
             // retains the same bridge object that the read-path auth interceptor calls.
             const auth = (epoch.harness as unknown as { appServerAuth?: {
@@ -32912,6 +32948,11 @@ describe("M2 actualRunner credential replacement", () => {
           assert.equal(rig.providerLaunches(), 1, `B provider work root absent at ${stage}`);
           assert.ok(startPublicationProbe, "retain the actual Now controller probe");
           startPublicationProbe(stage, true);
+          if (injectedStage === stage) {
+            injectedFailures.push(injectedStage);
+            scopeProbesArmed = false; // Cleanup must never inject a second assignment failure.
+            throw new Error(`injected ${stage} failure`);
+          }
         };
         const running = runner.execute(claim);
         const joinExecution = async () => {
@@ -32922,7 +32963,7 @@ describe("M2 actualRunner credential replacement", () => {
         };
         try {
           await withTimeout(aEntered.promise, 5000, "M2 A turn");
-          if (publication === "gated") {
+          if (publication === "gated" || injectedStage) {
             assert.ok(actualFlight, "capture the real run/generation/executor flight");
             scopeDescriptor = Object.getOwnPropertyDescriptor(actualFlight, "operationScope");
             assert.ok(!scopeDescriptor || ("value" in scopeDescriptor && scopeDescriptor.configurable),
@@ -32973,12 +33014,18 @@ describe("M2 actualRunner credential replacement", () => {
           assert.equal(b.transport.requests.length, 0, "B auth waits for A reap");
           cleanupContinue.resolve();
           if (publication !== "baseline") {
-            for (const barrier of publicationBarriers) {
+            const failureBoundaryCount = !injectedStage ? undefined
+              : scopeClearFailure || injectedStage === "before-scope-install" || injectedStage === "after-scope-install" ? 0
+              : injectedStage === "before-executor-publication" ? 1
+              : injectedStage === "before-Now-publication" || injectedStage === "after-Now-publication" ? 2
+              : injectedStage === "before-B-preparation" ? 3 : 5;
+            for (const barrier of publicationBarriers.slice(0, failureBoundaryCount)) {
               await withTimeout(barrier.entered.promise, 5000, barrier.stage);
               const builds = nowBuilds.length;
               const aRequests: number = a.transport.requests.length;
               const bRequests: number = b.transport.requests.length;
               try {
+                if (injectedStage) await joinNowConsumerProbes();
                 if (publication === "gated" && barrier.stage === "before-publish") {
                   await joinNowConsumerProbes();
                   assert.deepEqual(assignmentStages, expectedAssignmentStages);
@@ -33009,6 +33056,15 @@ describe("M2 actualRunner credential replacement", () => {
                   } else {
                     assert.equal(prepare, undefined, "API-key replacement installs no account admission dispatcher");
                   }
+                }
+                if (injectedStage) {
+                  const prepare = context.prepareCodexRootDispatch;
+                  assert.ok(prepare, "real subscription B context dispatcher installed");
+                  const releases = credentialReleases, refreshes = credentialRefreshes;
+                  await assert.rejects(prepare(context.terminalLifecycleSignal!, () => {}, "root"),
+                    "ordinary B context root stays closed throughout partial publication and preparation");
+                  assert.equal(credentialReleases, releases);
+                  assert.equal(credentialRefreshes, refreshes);
                 }
                 assert.throws(() => owners[0]!.guard(), /authority|aborted|admission|closed/i);
                 await triggerNow(`held-${barrier.stage}`);
@@ -33105,10 +33161,45 @@ describe("M2 actualRunner credential replacement", () => {
                   (queuedRefreshStop && barrier.stage === "prepared") ||
                   (publication === "now-publish-failure" && barrier.stage === "after-publish")) break;
             }
-            assert.equal(consumerProbes.length, crashRecovery ? publicationStages.findIndex(stage => stage === crashStage) + 1 : publication === "publish-failure" || publication === "now-publish-failure" ? 2 : (publication === "login-failure" || publication === "api-key-refresh" || crashRecovery) ? 4 : 5);
+            assert.equal(consumerProbes.length, injectedStage ? failureBoundaryCount : crashRecovery ? publicationStages.findIndex(stage => stage === crashStage) + 1 : publication === "publish-failure" || publication === "now-publish-failure" ? 2 : (publication === "login-failure" || publication === "api-key-refresh" || crashRecovery) ? 4 : 5);
             if (publication !== "gated" && publication !== "subscription-refresh") {
               await withTimeout(running, 5000, "failed publication retained stop");
+              await joinNowConsumerProbes();
               assert.equal(reopenAttempts, 0);
+              if (injectedStage) {
+                assert.deepEqual(injectedFailures, [injectedStage], "the requested real boundary failed exactly once");
+                assert.equal(committedCodex, next, "simulated committed row remains B after publication failure");
+                assert.equal(applyAcknowledgements, 1);
+                assert.deepEqual(assignmentStages, expectedAssignmentStages.slice(0,
+                  injectedStage === "before-scope-clear" ? 1 : injectedStage === "after-scope-clear" ? 2
+                    : injectedStage === "before-scope-install" ? 3 : expectedAssignmentStages.length));
+                assert.deepEqual(nowPublicationProbes,
+                  scopeClearFailure || injectedStage === "before-scope-install" || injectedStage === "after-scope-install" ||
+                  injectedStage === "before-executor-publication" ? []
+                  : injectedStage === "before-Now-publication" ? ["before-Now-publish"]
+                  : ["before-Now-publish", "after-Now-publish"]);
+                assert.equal(rig.providerLaunches(), injectedStage === "Now-finish-false" ? 2 : 1,
+                  "B auth initialization starts only after all publication stages");
+                assert.ok(dispositions.some(body => body.status === "credential_switch_uncertain" &&
+                  body.failure_reason === "initialization_failed"), "partial publication requires owner action");
+                assert.ok(!reports.includes("failed") && !reports.includes("completed"));
+                assert.equal(bFinished, injectedStage === "Now-finish-false");
+                assert.throws(() => owners[0]!.guard(), /authority|aborted|admission|closed/i);
+                assert.equal(b.transport.threadStartCount, 0, "no ordinary B child root");
+                for (const epoch of rig.epochs.slice(0, rig.providerLaunches())) {
+                  assert.ok(epoch.reaped() > 0, "every launched provider root reaped");
+                  assert.ok(epoch.disposed() > 0, "every launched provider root disposed");
+                }
+                assert.equal(disposedEffects.size, effects, "every launched effect root disposed");
+                for (const handle of fileops) assert.ok(handle.disposed() > 0);
+                for (const root of summaryRoots) {
+                  assert.equal(root.reaped(), 1);
+                  assert.equal(root.disposed(), 1);
+                }
+                assert.equal(nowBuilds.length, 1, "no half-published B Now harness");
+                assert.equal(nowRuns.length, 0, "factory A aborted and B Now never ran");
+                assert.equal(scopeProbesArmed, false, "assignment failure cannot recur in cleanup");
+              }
               assert.equal(applies, expectedApplies, "apply count matches the injected crash boundary");
               assert.equal(b.transport.turnStartCount, 0);
               assert.equal(ordinaryBRefreshes, 0);
@@ -33530,6 +33621,7 @@ describe("M2 actualRunner credential replacement", () => {
           assert.equal(b.transport.threadStartCount, positiveBChild ? 1 : 0);
           assert.equal(await fs.readFile(path.join(worktree, "M2-retained.txt"), "utf8"), "A work");
         } finally {
+          scopeProbesArmed = false;
           cancelled = true; pending = false; nowContinue.resolve(); summaryDisposeContinue.resolve(); cleanupContinue.resolve();
           for (const barrier of publicationBarriers) barrier.proceed.resolve();
           a.transport.push(turnCompleted("interrupted", savedId, "M2-A-turn"));
