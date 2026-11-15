@@ -98,7 +98,7 @@ function OverviewNextPage() {
       })
     : null;
   const runTotals = data ? overviewCounts(factoryRows ?? ownRuns) : null;
-  const calm = data !== null && holds !== null && !holdsFailed && decisions.length === 0;
+  const calm = data !== null && holds !== null && decisions.length === 0;
   // The People chip's model: admins only, from the viewer's own runs plus the admin list, users
   // and usage. Each source degrades on its own (see peopleModel).
   const people = isAdmin
@@ -145,7 +145,7 @@ function OverviewNextPage() {
         <PageHeader
           title={`Welcome${user.display_name ? `, ${maskName(user.display_name, demo)}` : ""}`}
           titleRef={titleRef}
-          actionsClassName="w-full min-[1440px]:min-w-0 min-[1440px]:flex-1 min-[1440px]:basis-0"
+          actionsClassName="max-w-full"
           description={
             <Link to="/overview/classic" className="font-medium text-brand hover:text-brand-hover">
               Back to the old Overview
@@ -185,12 +185,9 @@ function OverviewNextPage() {
 
       {/* The viewer's own items only (decisions is computed from ownRuns). */}
       <NeedsDecisionCard items={decisions} now={now} demo={demo} />
-      {calm && (
-        <p role="status" className="flex items-center gap-2 text-sm text-muted">
-          <span aria-hidden="true" className="h-2 w-2 rounded-full bg-ok" />
-          Nothing needs you right now.
-        </p>
-      )}
+      <p role="status" className={calm ? "flex items-center gap-2 text-sm text-muted" : "sr-only"}>
+        {calm && <><span aria-hidden="true" className="h-2 w-2 rounded-full bg-ok" />Nothing needs you right now.</>}
+      </p>
 
       {lineModel && (
         <IssueLine

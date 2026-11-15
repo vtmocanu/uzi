@@ -2,7 +2,7 @@
 // positioning would stop at the end of that slot. Once the title leaves the window,
 // the same row becomes fixed over the content column; its host keeps the flow height.
 
-import { useEffect, useRef, useState, type ReactNode, type RefObject } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode, type RefObject } from "react";
 import { cx } from "./ui";
 
 interface ColumnRect {
@@ -21,6 +21,8 @@ export function OverviewStickyActions({
   const rowRef = useRef<HTMLDivElement>(null);
   const [stuck, setStuck] = useState(false);
   const [flowHeight, setFlowHeight] = useState(0);
+  const [flowWidth, setFlowWidth] = useState(0);
+  const [barHeight, setBarHeight] = useState(0);
   const [column, setColumn] = useState<ColumnRect>({ left: 0, width: 0 });
 
   useEffect(() => {
@@ -59,7 +61,11 @@ export function OverviewStickyActions({
     const row = rowRef.current;
     if (!row) return;
     const measure = () => {
-      if (row.dataset.stuck === "false") setFlowHeight(row.getBoundingClientRect().height);
+      const rect = row.getBoundingClientRect();
+      if (row.dataset.stuck === "false") {
+        setFlowHeight(rect.height);
+        setFlowWidth(rect.width);
+      } else setBarHeight(rect.height);
     };
     measure();
     const resize = typeof ResizeObserver !== "undefined" ? new ResizeObserver(measure) : null;
@@ -67,22 +73,28 @@ export function OverviewStickyActions({
     return () => resize?.disconnect();
   }, []);
 
+  // Positioning adds padding and a border without changing the row's content box,
+  // so ResizeObserver alone does not observe the new outer height on the first stick.
+  useLayoutEffect(() => {
+    if (stuck && rowRef.current) setBarHeight(rowRef.current.getBoundingClientRect().height);
+  }, [stuck, column.width]);
+
   useEffect(() => {
     if (!stuck) return;
     const style = document.documentElement.style;
     const previous = style.scrollPaddingTop;
-    style.scrollPaddingTop = "56px";
+    style.scrollPaddingTop = `${Math.ceil(barHeight || flowHeight) + 12}px`;
     return () => { style.scrollPaddingTop = previous; };
-  }, [stuck]);
+  }, [stuck, barHeight, flowHeight]);
 
   return (
-    <div ref={hostRef} className="w-full" style={stuck ? { height: flowHeight } : undefined}>
+    <div ref={hostRef} className="w-full" style={stuck ? { height: flowHeight, width: flowWidth } : undefined}>
       <div
         ref={rowRef}
         data-overview-chip-row=""
         data-stuck={stuck ? "true" : "false"}
         className={cx(
-          "flex flex-wrap items-center gap-2 xl:flex-nowrap xl:justify-end",
+          "flex flex-wrap items-center gap-2 xl:justify-end",
           "min-[1440px]:gap-1 min-[1440px]:[&>div>button]:px-1.5 min-[1440px]:[&>div>button]:text-[11px] min-[1440px]:[&>button]:px-1.5 min-[1440px]:[&>button]:text-[11px]",
           stuck && "fixed top-0 z-20 border-b border-edge bg-ink py-1.5",
         )}

@@ -136,21 +136,29 @@ describe("compact Overview header (#4366)", () => {
     return { title, back, chips: [health, people, repos, agents, search] };
   }
 
-  it("keeps all five chips on the title row at 1440px, with Back below the title and first in tab order", async () => {
-    const { title, back, chips } = await mountHeader(1440);
-    // The normal test fixture's unavailable People/Repos copy is short. Populate each chip
-    // with the long, real demo labels so this layout test catches a crowded header.
-    const labels = [
-      "1 check needs attention right now",
-      "9 people active now out of 14",
-      "3 repositories active now out of 6",
-      "9 agents in your runs out of 10",
-    ];
-    for (let i = 0; i < labels.length; i++) {
+  const populatedLabels = [
+    "26 of 26 checks passing",
+    "3 active now of 5",
+    "3 repos active of 6",
+    "10 agents · 4 changes to review",
+  ];
+  function setPopulatedLabels(chips: HTMLElement[]) {
+    for (let i = 0; i < populatedLabels.length; i++) {
       const text = chips[i].querySelector<HTMLElement>(".truncate");
       expect(text).not.toBeNull();
-      text!.textContent = labels[i];
+      text!.textContent = populatedLabels[i];
     }
+  }
+  function expectFullLabels(chips: HTMLElement[]) {
+    for (const chip of chips) {
+      const text = chip.querySelector<HTMLElement>(".truncate");
+      if (text) expect(text.scrollWidth, text.textContent ?? "chip label").toBeLessThanOrEqual(text.clientWidth + 1);
+    }
+  }
+
+  it("keeps populated chips on the title row at 1440px without truncation, with Back first in tab order", async () => {
+    const { title, back, chips } = await mountHeader(1440);
+    setPopulatedLabels(chips);
     const titleRect = title.getBoundingClientRect();
     const backRect = back.getBoundingClientRect();
     expect(backRect.top).toBeGreaterThan(titleRect.top);
@@ -158,12 +166,36 @@ describe("compact Overview header (#4366)", () => {
       const rect = chip.getBoundingClientRect();
       expect(rect.top, chip.getAttribute("aria-label") ?? chip.textContent ?? "chip").toBeLessThan(titleRect.bottom + 2);
     }
+    expectFullLabels(chips);
     back.focus();
     expect(document.activeElement).toBe(back);
     for (const chip of chips) {
       await userEvent.tab();
       expect(document.activeElement).toBe(chip);
     }
+  });
+
+  it("wraps below a long greeting at 1440px instead of truncating chip labels", async () => {
+    vi.mocked(useAuth).mockReturnValue(authValue({ ...aUser, is_admin: true, display_name: "Alexandra-Margareta Constantinescu" }));
+    const { title, chips } = await mountHeader(1440);
+    setPopulatedLabels(chips);
+    expect(chips[0].getBoundingClientRect().top).toBeGreaterThanOrEqual(title.getBoundingClientRect().bottom);
+    expectFullLabels(chips);
+    expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(1440);
+  });
+
+  it("lets crowded status labels wrap at 1440px without clipping their text", async () => {
+    const { title, chips } = await mountHeader(1440);
+    const labels = [
+      "3 checks need attention",
+      "at least 123 active now of 456",
+      "at least 321 repos active of 500",
+      "150 agents · 20 changes to review",
+    ];
+    for (let i = 0; i < labels.length; i++) chips[i].querySelector<HTMLElement>(".truncate")!.textContent = labels[i];
+    expect(chips[0].getBoundingClientRect().top).toBeGreaterThanOrEqual(title.getBoundingClientRect().bottom);
+    expectFullLabels(chips);
+    expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(1440);
   });
 
   it("wraps the chips below the title at 400px without horizontal page overflow", async () => {
@@ -210,7 +242,8 @@ describe("sticky Overview chips (#4370)", () => {
       expect(row.getBoundingClientRect().top).toBe(0);
       expect(row.getBoundingClientRect().height).toBeLessThanOrEqual(50);
       expect(getComputedStyle(row).borderBottomWidth).toBe("1px");
-      expect(document.documentElement.style.scrollPaddingTop).toBe("56px");
+      await expect.poll(() => parseFloat(document.documentElement.style.scrollPaddingTop))
+        .toBeGreaterThanOrEqual(Math.ceil(row.getBoundingClientRect().height) + 12);
       expect(Math.abs(content.getBoundingClientRect().top + window.scrollY - contentDocumentTop)).toBeLessThanOrEqual(1);
       expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(width);
       window.scrollTo(0, 0);
@@ -218,6 +251,20 @@ describe("sticky Overview chips (#4370)", () => {
       expect(document.documentElement.style.scrollPaddingTop).toBe("");
     });
   }
+
+  it("keeps a wrapped pinned row and its focus clearance when chip labels grow", async () => {
+    const { row } = await mountAt(1280);
+    const chips = [...row.querySelectorAll<HTMLElement>("button[aria-haspopup='dialog']")];
+    expect(chips.length).toBeGreaterThanOrEqual(2);
+    for (const chip of chips.slice(0, 2)) chip.parentElement!.style.flex = "0 0 500px";
+    await expect.poll(() => row.getBoundingClientRect().height).toBeGreaterThan(50);
+    window.scrollTo(0, 650);
+    await expect.poll(() => row.dataset.stuck).toBe("true");
+    expect(row.getBoundingClientRect().height).toBeGreaterThan(50);
+    await expect.poll(() => parseFloat(document.documentElement.style.scrollPaddingTop))
+      .toBeGreaterThanOrEqual(Math.ceil(row.getBoundingClientRect().height) + 12);
+    expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(1280);
+  });
 
   for (const width of [1024, 400]) {
     it(`lets the chips scroll away at ${width}px`, async () => {
@@ -2008,7 +2055,8 @@ describe("OverviewNext health chip popover", () => {
     const dialog = await screen.findByRole("dialog", { name: "System health" });
     await document.fonts.ready;
     const before = chip.getBoundingClientRect().left;
-    // Wide enough that a stale chip-relative offset would push the panel past the right edge.
+    // #4366 moved Back under the title; 720px then moved this chip only 378px.
+    // 800px still forces the >400px reflow that discriminates a stale placement.
     preceding.style.width = "800px";
     await expect.poll(() => chip.getBoundingClientRect().left - before).toBeGreaterThan(400);
     // Re-placed against the chip's new position: attached to it and inside the viewport.

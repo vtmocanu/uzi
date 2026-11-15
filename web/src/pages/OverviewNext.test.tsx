@@ -471,10 +471,13 @@ describe("Needs your decision", () => {
     expect(screen.getByText("Needs your decision")).toBeTruthy();
     expect(screen.getByRole("link", { name: "Review plan" }).getAttribute("href")).toBe("/runs/plan-1");
     expect(screen.queryByText("Nothing needs you right now.")).toBeNull();
+    const live = screen.getByRole("status");
+    expect(live.textContent).toBe("");
     mockApi.listRuns.mockResolvedValue({ runs: [aRun({ id: "plan-1", status: "running", issue_title: "Plan me" })] });
     await settle(10_000);
     expect(screen.queryByText("Needs your decision")).toBeNull();
     expect(screen.getByText(/^Nothing needs you right now\./)).toBeTruthy();
+    expect(screen.getByRole("status")).toBe(live);
   });
 
   it("shows a plan and an open pull request without a calm notice", async () => {
@@ -485,6 +488,14 @@ describe("Needs your decision", () => {
     expect(screen.getByRole("link", { name: "vtmocanu/uzi #4" }).getAttribute("href")).toBe("https://github.com/o/r/pull/4");
     fireEvent.click(screen.getByRole("button", { name: "Review PRs" }));
     expect(screen.getByRole("link", { name: "Review PR" }).getAttribute("href")).toBe("https://github.com/o/r/pull/4");
+  });
+
+  it("does not show the calm notice when only an open pull request needs review", async () => {
+    mockApi.listRuns.mockResolvedValue({ runs: [prRun()] });
+    await mount();
+    expect(screen.getByRole("region", { name: "Needs your decision" })).toBeTruthy();
+    expect(screen.getByText("1 pull request is open for your review")).toBeTruthy();
+    expect(screen.queryByText("Nothing needs you right now.")).toBeNull();
   });
 
   it("never lists another user's item for an admin, and counts none", async () => {
@@ -523,7 +534,10 @@ describe("Issue work line", () => {
     mockApi.listRuns.mockResolvedValue({ runs: [aRun({ id: "plan-1", status: "awaiting_approval" })] });
     await mount();
     const needs = screen.getByRole("region", { name: "Needs your decision" });
-    expect(needs.nextElementSibling).toBe(line());
+    const live = needs.nextElementSibling;
+    expect(live?.getAttribute("role")).toBe("status");
+    expect(live?.textContent).toBe("");
+    expect(live?.nextElementSibling).toBe(line());
     cleanup();
     mockApi.listRuns.mockImplementation(() => new Promise(() => {}));
     await mount();
@@ -731,10 +745,10 @@ describe("Issue work line", () => {
       await mount();
       await click("review");
       expect(rows("Your runs")).toHaveLength(1);
-      expect(screen.getByRole("status").textContent).toBe("Other users' runs are unavailable");
+      expect(screen.getByText("Other users' runs are unavailable")).toBeTruthy();
       await click("review");
       await click("queued");
-      expect(screen.getByRole("status").textContent).toBe("Other users' runs are unavailable");
+      expect(screen.getByText("Other users' runs are unavailable")).toBeTruthy();
       expect(screen.getByText("No runs at this stage.")).toBeTruthy();
     });
   });
