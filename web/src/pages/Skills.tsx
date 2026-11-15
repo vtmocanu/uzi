@@ -3,7 +3,8 @@
 // read returns them; admins see all scopes). Everyone can author their own
 // "Mine" skills; only admins create Global or edit/reset Builtin & Global.
 
-import { useMemo, useState, type FormEvent, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { useLocation, useSearchParams } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import { api, type Skill, type SkillScope } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
@@ -81,6 +82,31 @@ export function Skills() {
     return { builtin, global, mine, others };
   }, [skills, user?.id]);
 
+  // Deep link `?skill=<encodeURIComponent(id)>` (command menu, pasted URL): once the list
+  // has loaded, open that skill's view, once per location.key so a reload or poll never
+  // reopens it after Back. Product-scope skills are never listed here, so they are not
+  // opened; an unknown id leaves the list in place. useSearchParams already decodes.
+  const location = useLocation();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const skillParam = searchParams.get("skill");
+  const consumedLocationKey = useRef<string | null>(null);
+  useEffect(() => {
+    if (!skillParam || loading || !data) return;
+    if (consumedLocationKey.current === location.key) return;
+    consumedLocationKey.current = location.key;
+    const target = data.skills.find((s) => s.id === skillParam && s.scope !== "product");
+    if (target) setEdit({ mode: "view", skill: target });
+  }, [skillParam, loading, data, location.key]);
+  // Back from a deep-linked view also drops `skill` so the URL no longer names it.
+  const closeView = () => {
+    setEdit(null);
+    if (searchParams.has("skill")) {
+      const next = new URLSearchParams(searchParams);
+      next.delete("skill");
+      setSearchParams(next, { replace: true });
+    }
+  };
+
   const afterSave = (msg: string) => {
     setEdit(null);
     setNotice(msg);
@@ -144,7 +170,7 @@ export function Skills() {
     );
   }
   if (edit?.mode === "view") {
-    return <SkillView skill={edit.skill} viewerId={user?.id} onBack={() => setEdit(null)} />;
+    return <SkillView skill={edit.skill} viewerId={user?.id} onBack={closeView} />;
   }
 
   return (

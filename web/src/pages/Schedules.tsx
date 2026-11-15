@@ -8,7 +8,7 @@
 // The "New schedule" button and each row's Edit open the shared modal.
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useSearchParams } from "react-router-dom";
+import { useLocation, useSearchParams } from "react-router-dom";
 import {
   api,
   ApiError,
@@ -53,7 +53,11 @@ import { ChevronRightIcon, ClockIcon, PlusIcon } from "../components/icons";
 type Tab = "schedules" | "catalog";
 
 // A pending D12 reveal (see `pendingReveal` in the page).
-type Reveal = { id: string; focus: boolean; afterSeq: number };
+// `fallbackFocus: false` makes the row-gone branch drop the request without moving focus
+// (a stale deep link is a no-op); `highlight` marks the revealed row (`revealedId`).
+type Reveal = { id: string; focus: boolean; afterSeq: number; fallbackFocus?: boolean; highlight?: boolean };
+
+const SCHEDULE_HASH_PREFIX = "#schedule-name-";
 
 // The tab order, for the APG roving-tabindex arrow-key handler.
 const TAB_ORDER: Tab[] = ["schedules", "catalog"];
@@ -134,6 +138,10 @@ export function Schedules() {
   // (an overlapping reload can supersede the awaited one, so `await reload()` returning
   // does not mean its list was applied). Consumed by the effect below.
   const [pendingReveal, setPendingReveal] = useState<Reveal | null>(null);
+  // The schedule a deep link just revealed: its row shows a ring until it loses focus.
+  const [revealedId, setRevealedId] = useState<string | null>(null);
+  const location = useLocation();
+  const consumedLocationKey = useRef<string | null>(null);
   // The cloned row whose name cell takes focus when the edit modal it opened closes (D12).
   const [focusAfterEdit, setFocusAfterEdit] = useState<{ id: string; afterSeq: number } | null>(null);
   // D5 filters: page-level state, so they survive switching tabs and back; not persisted
@@ -582,8 +590,30 @@ export function Schedules() {
       onAddRepo={(repoId) => addRepo(s, repoId)}
       onShowInCatalog={catalogLinkFor(s)}
       onEnableElsewhere={enableElsewhereFor(s)}
+      revealed={revealedId === s.id}
+      onRevealedBlur={() => setRevealedId((cur) => (cur === s.id ? null : cur))}
     />
   );
+
+  // Deep link `#schedule-name-<encodeURIComponent(id)>` (command menu, pasted URL): queue a
+  // focus reveal once per location.key. afterSeq is the load sequence already started when
+  // this runs (the hook's load effect precedes this one, so on direct entry it is the
+  // initial load; a mounted page's current list satisfies it at once), and the reveal also
+  // waits for `schedules` to be non-null. A stale id is dropped without moving focus.
+  useEffect(() => {
+    if (!location.hash.startsWith(SCHEDULE_HASH_PREFIX)) return;
+    if (consumedLocationKey.current === location.key) return;
+    consumedLocationKey.current = location.key;
+    let id: string;
+    try {
+      id = decodeURIComponent(location.hash.slice(SCHEDULE_HASH_PREFIX.length));
+    } catch {
+      return;
+    }
+    if (!id) return;
+    setRevealedId(null);
+    setPendingReveal({ id, focus: true, afterSeq: loadSeq.current, fallbackFocus: false, highlight: true });
+  }, [location.key, location.hash]);
 
   // D12 reveal: runs once the target row is in the loaded list (the list may still be
   // reloading, and the tab switch lands a render later). First it clears the filters in
@@ -612,11 +642,12 @@ export function Schedules() {
       // the request is dropped instead of lingering to steal focus later.
       if (!row && schedules && loadedSeq >= pendingReveal.afterSeq) {
         setPendingReveal(null);
-        if (pendingReveal.focus) tabRefs.current.schedules?.focus();
+        if (pendingReveal.focus && pendingReveal.fallbackFocus !== false) tabRefs.current.schedules?.focus();
       }
       return;
     }
     el.scrollIntoView?.({ block: "nearest" });
+    if (pendingReveal.highlight) setRevealedId(pendingReveal.id);
     if (pendingReveal.focus) el.focus();
     setPendingReveal(null);
   }, [pendingReveal, tab, schedules, loadedSeq, filter, foldExpanded]);
