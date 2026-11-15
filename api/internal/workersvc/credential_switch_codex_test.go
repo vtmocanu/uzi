@@ -76,6 +76,145 @@ func TestCodexSwitchHistoricalBaseline(t *testing.T) {
 	}
 }
 
+// TestCodexSwitchBaselineActiveBinding covers binding invariants without a database.
+func TestCodexSwitchBaselineActiveBinding(t *testing.T) {
+	type fixture struct {
+		run      store.Run
+		bases    []store.RunCredentialEpoch
+		children []store.RunCredentialSwitchEpoch
+	}
+	newFixture := func() fixture {
+		a := store.RunCredentialEpoch{
+			ClaimGeneration:       7,
+			SecretID:              pgtype.UUID{Bytes: uuid.New(), Valid: true},
+			CodexAuthMode:         pgtype.Text{String: codexAuthModeAPIKey, Valid: true},
+			CodexMaterialRevision: pgtype.Int8{Int64: 3, Valid: true},
+		}
+		b := store.RunCredentialSwitchEpoch{
+			ClaimGeneration:       7,
+			Ordinal:               1,
+			SecretID:              pgtype.UUID{Bytes: uuid.New(), Valid: true},
+			CodexAuthMode:         pgtype.Text{String: codexAuthModeSubscription, Valid: true},
+			CodexMaterialRevision: pgtype.Int8{Int64: 4, Valid: true},
+			CodexAccountKey:       pgtype.Text{String: `["provider","account-b"]`, Valid: true},
+			CodexClaimEpoch:       pgtype.Int8{Int64: 80, Valid: true},
+			CodexAccountID:        pgtype.Text{String: "account-b", Valid: true},
+		}
+		c := b
+		c.Ordinal = 2
+		c.SecretID = pgtype.UUID{Bytes: uuid.New(), Valid: true}
+		c.CodexMaterialRevision.Int64 = 5
+		c.CodexAccountKey.String = `["provider","account-c"]`
+		c.CodexClaimEpoch.Int64 = 42
+		c.CodexAccountID.String = "account-c"
+		return fixture{
+			run: store.Run{
+				ClaimGeneration:       7,
+				CodexSecretID:         c.SecretID,
+				CodexAuthMode:         c.CodexAuthMode,
+				CodexMaterialRevision: c.CodexMaterialRevision,
+				CodexAccountKey:       c.CodexAccountKey,
+				CodexClaimEpoch:       42,
+			},
+			bases:    []store.RunCredentialEpoch{a},
+			children: []store.RunCredentialSwitchEpoch{b, c},
+		}
+	}
+	for _, tc := range []struct {
+		name   string
+		change func(*fixture)
+		want   bool
+	}{
+		{"current_c_after_baseline_a_and_b_epoch_42_ordinal_2", func(*fixture) {}, true},
+		{"current_b_after_baseline_a", func(f *fixture) {
+			b := f.children[0]
+			f.children = f.children[:1]
+			f.run.CodexSecretID = b.SecretID
+			f.run.CodexMaterialRevision = b.CodexMaterialRevision
+			f.run.CodexAccountKey = b.CodexAccountKey
+			f.run.CodexClaimEpoch = 80
+		}, true},
+		{"older_child_cannot_authorize_current_binding", func(f *fixture) {
+			b := f.children[0]
+			f.run.CodexSecretID = b.SecretID
+			f.run.CodexMaterialRevision = b.CodexMaterialRevision
+			f.run.CodexAccountKey = b.CodexAccountKey
+			f.run.CodexClaimEpoch = 80
+		}, false},
+		{"baseline_required_with_children", func(f *fixture) {
+			f.bases = nil
+		}, false},
+		{"other_generation_baseline_is_insufficient", func(f *fixture) {
+			f.bases[0].ClaimGeneration = 6
+		}, false},
+		{"ignores_other_generation_bases_and_children", func(f *fixture) {
+			otherBase := f.bases[0]
+			otherBase.ClaimGeneration = 6
+			otherBase.SecretID = pgtype.UUID{Bytes: uuid.New(), Valid: true}
+			f.bases = append([]store.RunCredentialEpoch{otherBase}, f.bases...)
+			otherChild := f.children[0]
+			otherChild.ClaimGeneration = 6
+			otherChild.Ordinal = 99
+			f.children = append([]store.RunCredentialSwitchEpoch{otherChild}, f.children...)
+			otherChild.ClaimGeneration = 8
+			f.children = append(f.children, otherChild)
+		}, true},
+		{"highest_ordinal_first", func(f *fixture) {
+			f.children[0], f.children[1] = f.children[1], f.children[0]
+		}, true},
+		{"no_children_uses_baseline", func(f *fixture) {
+			a := f.bases[0]
+			f.children = nil
+			f.run.CodexSecretID = a.SecretID
+			f.run.CodexAuthMode = a.CodexAuthMode
+			f.run.CodexMaterialRevision = a.CodexMaterialRevision
+			f.run.CodexAccountKey = pgtype.Text{}
+			f.run.CodexClaimEpoch = 0
+		}, true},
+		{"no_children_rejects_nonbaseline_binding", func(f *fixture) {
+			f.children = nil
+		}, false},
+		{"child_secret_mismatch", func(f *fixture) {
+			f.children[1].SecretID = f.bases[0].SecretID
+		}, false},
+		{"child_mode_mismatch", func(f *fixture) {
+			f.children[1].CodexAuthMode.String = codexAuthModeAPIKey
+		}, false},
+		{"child_material_mismatch", func(f *fixture) {
+			f.children[1].CodexMaterialRevision.Int64++
+		}, false},
+		{"child_account_key_mismatch", func(f *fixture) {
+			f.children[1].CodexAccountKey.String = `["other-provider","account-c"]`
+		}, false},
+		{"child_claim_epoch_mismatch", func(f *fixture) {
+			f.children[1].CodexClaimEpoch.Int64 = 2
+		}, false},
+		{"child_account_id_tuple_mismatch", func(f *fixture) {
+			f.children[1].CodexAccountID.String = "other-account"
+		}, false},
+		{"child_account_id_requires_tuple", func(f *fixture) {
+			f.run.CodexAccountKey.Valid = false
+			f.children[1].CodexAccountKey.Valid = false
+		}, false},
+		{"child_account_id_rejects_malformed_tuple", func(f *fixture) {
+			f.run.CodexAccountKey.String = "invalid-json"
+			f.children[1].CodexAccountKey = f.run.CodexAccountKey
+		}, false},
+		{"child_account_id_rejects_short_tuple", func(f *fixture) {
+			f.run.CodexAccountKey.String = `["account-c"]`
+			f.children[1].CodexAccountKey = f.run.CodexAccountKey
+		}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture()
+			tc.change(&f)
+			if got := codexSwitchBaselineMatches(f.run, f.bases, f.children); got != tc.want {
+				t.Fatalf("baseline matches = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestCodexSwitchTargetShapes(t *testing.T) {
 	for _, tc := range []struct {
 		kind, status string
