@@ -26,7 +26,7 @@ import type { WorkerMemoryRuntime } from "./worker-memory-runtime.js";
 import { GUARDED_LANE_JOIN_MS } from "./claude-command/lane.js";
 import type { CapturedMemoryContext } from "./codex/broker.js";
 import type { BaseAttestationHoldOutcome, MemoryIncarnation, MemoryParkReference, WorkerMemoryPressureResult } from "./protocol.js";
-import { BASE_ATTESTATION_HOLD_REASON, CAPABILITY_INFERENCE_EVIDENCE_FEATURE, PLAN_AGENT_SOURCE_FEATURE, REPO_AGENT_SOURCE_FEATURE, REPO_AGENT_SOURCE_HOLD_REASON } from "./protocol.js";
+import { BASE_ATTESTATION_HOLD_REASON, CAPABILITY_INFERENCE_EVIDENCE_FEATURE, CHECKPOINT_PUBLICATION_WITHHELD_FEATURE, PLAN_AGENT_SOURCE_FEATURE, REPO_AGENT_SOURCE_FEATURE, REPO_AGENT_SOURCE_HOLD_REASON } from "./protocol.js";
 import { PublicationContextLatch, publicationContextReason } from "./publication-context.js";
 import { RequestError, ReportPreconditionError, SpendLimitParkUnsupportedError, StateReportUnappliedError, isRunOwnershipLost, isTransient, isTransientStatus, HELD_PUBLICATION_FEATURE, CHECKPOINT_PUBLISH_TIMEOUT_MS, CREDENTIAL_SWITCH_HOLD_FEATURE, CLARIFICATION_REVISION_SETTLEMENT_FEATURE } from "./client.js";
 import type { ClarificationSettlement } from "./protocol.js";
@@ -2699,6 +2699,20 @@ interface RunFlight {
    *  turns it into the registration_evidence of the flight's first `running` report, which clears
    *  it. Captured once at registration, never re-read from the registry at send time. */
   registrationEpoch?: number;
+  /** Issue #4257: the current "checkpoint publication withheld" episode, if any. `withheld` while a
+   *  secret-scan restriction holds checkpoints back; `clear_pending` once a later publication was
+   *  admitted and accepted, until a `cleared` ACK retires the episode. Content-free by construction:
+   *  nothing here names a finding, path, rule or SHA. */
+  checkpointWithheld?: { episode: number; since: string; phase: "withheld" | "clear_pending" };
+  /** Issue #4257: monotonic per flight. A new episode takes the next number. */
+  withheldEpisodeSeq?: number;
+  /** Issue #4257: monotonic per flight; every diagnostic send (retries included) takes the next one. */
+  withheldReportSeq?: number;
+  /** Issue #4257: the newest diagnostic send, so an ACK can tell whether it answers the latest one. */
+  withheldLastSent?: { episode: number; state: "withheld" | "cleared"; report_seq: number };
+  /** Issue #4257: the per-run running-report chain (enqueueRunningReport), so a class-level site
+   *  can queue a dedicated running report behind pending ones. Set once the chain exists. */
+  enqueueRunningReport?: <T>(task: () => Promise<T>, signal?: AbortSignal) => Promise<T>;
   /** Irrevocable local selection, independent of delivery ACK or source cleanup proof. */
   policyHold?: { readonly outcomeId: string; body?: Readonly<import("./protocol.js").PolicyHoldRequest> };
   policyAdmission?: boolean;
@@ -13874,12 +13888,20 @@ export class RunRunner {
           witnessEpoch = flight.registrationEpoch;
           flight.registrationEpoch = undefined;
         }
+        // Issue #4257: EVERY running report carries the diagnostic built from the CURRENT flight
+        // state here, at send time (after the barriers above, inside the serialized chain slot for
+        // chained reports), so a retried or reordered report never replays a stale fact.
+        const publication = !checked && body.status === "running" && body !== flight.iterationCancellationReport
+          ? this.buildCheckpointPublication(flight) : undefined;
         const transport = () => checked === "semantic"
           ? this.client.reportSemanticPlanGateState(runId, stamped, signal)
           : checked ? this.client.reportPlanCrossCheckGateState(runId, stamped, signal)
           : body === flight.iterationCancellationReport
             ? this.client.reportState(runId, stamped, signal, { iterationCancellation: true })
-            : this.client.reportState(runId, stamped, signal, witnessEpoch === undefined ? undefined : { registrationEpoch: witnessEpoch });
+            : this.client.reportState(runId, stamped, signal, witnessEpoch === undefined && publication === undefined ? undefined : {
+              ...(witnessEpoch === undefined ? {} : { registrationEpoch: witnessEpoch }),
+              ...(publication === undefined ? {} : { checkpointPublication: publication.input }),
+            });
         // Preservation expiry cannot prevent the honest terminal report. FINAL stays budgeted.
         const sending = body.status === "failed" || body.status === "completed"
           ? MaintenanceBudget.withoutAttempt(transport) : transport();
@@ -13889,6 +13911,8 @@ export class RunRunner {
         try { ack = await sending; }
         finally { senders.delete(sending); }
         if (diskSeq !== undefined) this.diskGovernor?.statusAcked(runId, diskSeq, ack.status);
+        if (publication !== undefined && ack.checkpointPublication !== undefined)
+          this.settleCheckpointPublication(flight, publication.sent, ack.checkpointPublication);
         // PRD #1247 M5b (MINOR-7): the held-state switch signal rides the state ACK too — the
         // advertised SECONDARY transport beside /inputs. Feed it into the SAME generation-checked,
         // idempotent, defer-aware trigger the inputs poll uses (tripCredentialSwitch), so a failing
@@ -15829,6 +15853,8 @@ export class RunRunner {
       return run;
     };
 
+    flight.enqueueRunningReport = enqueueRunningReport;
+
     // PRD #122 M6 / issue #1597 M2: the checkpoint BODY, un-gated. ctx.checkpoint (below) runs it
     // under the flight's sink gate; the mid-turn tick calls it DIRECTLY while it already holds the
     // gate via tryAcquire (so it can never self-deadlock), in QUIET mode (no `running` report) with
@@ -16152,6 +16178,7 @@ export class RunRunner {
         // issue #1597 M2 (round 3): a publish DEFERRED out of a Codex permit (below) is owed: the
         // next overlay-less checkpoint outside a permit publishes regardless of the time gate.
         if (remediationHold) {
+          this.noteCheckpointWithheld(flight, true);
           bodyOutcome = "secret_remediation_pending";
           this.reportPublishOutcome(
             flight,
@@ -20452,6 +20479,9 @@ export class RunRunner {
         if (scan.trusted) {
           this.latchRemediationFindings(flight, barePath, branch, scan.findings);
           this.recordFlaggedCommits((flight.secretRemediation ??= { attempts: 0 }), scan.findings, flight.runLog);
+          // Issue #4257: synchronous, ahead of the awaited trigger/persistence below, so a rejecting
+          // or blocking persistence cannot suppress it. Keyed on the TRUSTED scan, not the outcome.
+          this.noteCheckpointWithheld(flight, false);
           await this.noteMidRunTrigger(flight, barePath, range.tipSha, scan.findings, scanScope);
           await this.persistRemediationScan(flight, barePath, branch, range.tipSha, scan.findings, "checkpoint-pending");
         }
@@ -21851,6 +21881,66 @@ export class RunRunner {
     return flagged === null ? "unknown" : "blocked";
   }
 
+  /**
+   * Issue #4257: a secret-scan restriction is holding checkpoint publication back. Starts a new
+   * episode unless one is already `withheld`; a set while a clear is pending supersedes it (new
+   * episode, the obsolete clear is cancelled) and queues a dedicated running report. `gated` sites
+   * (hold outcomes) additionally require a restriction or remediation record on the flight.
+   * Content-free: only counters and a timestamp are kept.
+   */
+  private noteCheckpointWithheld(flight: RunFlight, gated: boolean): void {
+    if (gated && !flight.remediationRestrictions && !flight.secretRemediation) return;
+    if (flight.checkpointWithheld?.phase === "withheld") return;
+    const episode = flight.withheldEpisodeSeq = (flight.withheldEpisodeSeq ?? 0) + 1;
+    flight.checkpointWithheld = { episode, since: new Date(this.now()).toISOString(), phase: "withheld" };
+    this.queueCheckpointPublicationReport(flight);
+  }
+
+  /** Issue #4257: an accepted publication that was admitted under `admittedEpisode` clears that
+   *  episode only while it is still `withheld` (a newer episode is never cleared by an older call). */
+  private noteCheckpointPublished(flight: RunFlight, admittedEpisode: number | undefined): void {
+    const current = flight.checkpointWithheld;
+    if (admittedEpisode === undefined || current?.episode !== admittedEpisode || current.phase !== "withheld") return;
+    current.phase = "clear_pending";
+    this.queueCheckpointPublicationReport(flight);
+  }
+
+  /** Issue #4257: queue a dedicated running report behind the pending ones. Fire-and-forget (the
+   *  chain never rejects into the caller); a failure only logs, because any later running report
+   *  rebuilds the diagnostic from the then-current state and so re-sends a pending clear. */
+  private queueCheckpointPublicationReport(flight: RunFlight): void {
+    if (!this.client.hasFeature(CHECKPOINT_PUBLICATION_WITHHELD_FEATURE) || !flight.enqueueRunningReport) return;
+    void flight.enqueueRunningReport(() => flight.reportState({ status: "running" })).catch((e) =>
+      flight.runLog.warn("could not report checkpoint publication state", { run_id: flight.runId, error: errMessage(e) }));
+  }
+
+  /** Issue #4257: the diagnostic for one running send, from the CURRENT flight state; undefined
+   *  when there is no episode. Each build takes a strictly higher report_seq and is recorded as the
+   *  latest send. */
+  private buildCheckpointPublication(flight: RunFlight): {
+    input: { state: "withheld" | "cleared"; since?: string; report_seq: number };
+    sent: NonNullable<RunFlight["withheldLastSent"]>;
+  } | undefined {
+    const current = flight.checkpointWithheld;
+    if (!current) return undefined;
+    const report_seq = flight.withheldReportSeq = (flight.withheldReportSeq ?? 0) + 1;
+    const state = current.phase === "withheld" ? "withheld" : "cleared";
+    const sent = flight.withheldLastSent = { episode: current.episode, state, report_seq };
+    return { input: state === "withheld" ? { state, since: current.since, report_seq } : { state, report_seq }, sent };
+  }
+
+  /** Issue #4257: apply an ACK only to the (episode, state, report_seq) its own send carried, so a
+   *  delayed ACK for an older send can never retire a newer episode. `cleared` retires a
+   *  clear_pending episode; `refused` (the server's fence says this flight no longer owns the fact)
+   *  drops the episode only when it answers the LATEST send. `recorded`/`unrecorded`: no change. */
+  private settleCheckpointPublication(flight: RunFlight, sent: NonNullable<RunFlight["withheldLastSent"]>,
+    answer: "recorded" | "cleared" | "refused" | "unrecorded"): void {
+    const current = flight.checkpointWithheld;
+    if (current?.episode !== sent.episode) return;
+    if (answer === "cleared" && sent.state === "cleared" && current.phase === "clear_pending") flight.checkpointWithheld = undefined;
+    else if (answer === "refused" && flight.withheldLastSent?.report_seq === sent.report_seq) flight.checkpointWithheld = undefined;
+  }
+
   private async publishCheckpointBestEffort(
     flight: RunFlight,
     barePath: string,
@@ -21932,6 +22022,9 @@ export class RunRunner {
       if (await this.checkpointRemediationHold(flight, barePath, sourceSha, reap, sourceSha, signal, deadlineAt)) {
         throw new SecretRemediationPendingError();
       }
+      // Issue #4257: the episode that was active when THIS call's hold admitted the candidate; only
+      // an accepted publication of this call may clear that same episode.
+      const admittedEpisode = flight.checkpointWithheld?.episode;
       let guard: (candidate: string, context?: CheckpointPublicationContext) => Promise<void>;
       const produce = <T,>(start: (identity: RemediationRestrictionIdentity) => Promise<T>) =>
         this.withRemediationCandidateAdmission(flight, barePath, branch, async admission => {
@@ -22011,6 +22104,7 @@ export class RunRunner {
         // declared tip (the overlay `O_ov`, or realTip on the no-overlay path), so the NEXT
         // overlay carries it as parent[0] (base-first) and stays a fast-forward the broker takes.
         flight.lastCheckpointRefTip = packed.tipOid;
+        this.noteCheckpointPublished(flight, admittedEpisode);
         await this.reconcileConfirmedOwed(flight, barePath, packed.tipOid, onStep);
         // issue #1086 (F2): a confirmed publish reconciles the broker's ref, so clear any pending
         // attempted tip — the confirmed tip is now authoritative.
@@ -22048,6 +22142,7 @@ export class RunRunner {
     } catch (e) {
       if (isCheckpointBoundaryFailure(e)) throw e;
       if (e instanceof SecretRemediationPendingError) {
+        this.noteCheckpointWithheld(flight, true);
         this.reportPublishOutcome(flight, "secret:remediation", "checkpoint publish skipped: secret_remediation_pending");
         return { published: false, reason: "secret_remediation_pending" };
       }

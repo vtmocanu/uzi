@@ -3028,7 +3028,30 @@ export interface ClarificationSettlement {
   gate_revision: number;
 }
 
+/** Issue #4257: negotiated feature for the `running` report's checkpoint-publication diagnostic. */
+export const CHECKPOINT_PUBLICATION_WITHHELD_FEATURE = "checkpoint_publication_withheld_v1";
+
+/** Issue #4257: content-free diagnostic that checkpoint publication is withheld by a
+ *  secret-scan restriction (or that the withholding cleared). Carries no finding, path,
+ *  rule or SHA. `report_seq` orders writes within one worker/generation/nonce. */
+export interface CheckpointPublicationReport {
+  state: "withheld" | "cleared";
+  /** RFC3339; required iff `state` is `withheld`. */
+  since?: string;
+  claim_generation: number;
+  register_nonce: string;
+  report_seq: number;
+}
+
+/** What a caller hands the client: the client stamps `register_nonce` and `claim_generation`. */
+export type CheckpointPublicationInput = Pick<CheckpointPublicationReport, "state" | "since" | "report_seq">;
+
+export type CheckpointPublicationAck = "recorded" | "cleared" | "refused" | "unrecorded";
+
 export interface StateRequest {
+  /** Issue #4257: set by the client alone (from the caller's `checkpointPublication` option),
+   *  never read from a caller-supplied body. Content-free. */
+  checkpoint_publication?: CheckpointPublicationReport;
   /** Issue #3985: present only on a `clarification_settled` report. */
   clarification_settlement?: ClarificationSettlement;
   /** Issue #3859: set by the client alone, never by a caller. */
@@ -3481,6 +3504,8 @@ export interface StateAck {
   /** Issue #3859: the server's top-level answer to a report that carried registration_evidence.
    *  Logged only; no behavior branches on it. */
   registrationEvidence?: "recorded" | "refused";
+  /** Issue #4257: the server's top-level answer to a report that carried checkpoint_publication. */
+  checkpointPublication?: CheckpointPublicationAck;
   /** Whether the server applied the transition. Diagnostics and logging only —
    *  see the warning above before branching on it. */
   applied: boolean;
