@@ -1055,10 +1055,10 @@ export const settingsApi = {
       }
       if (key === "worker_hibernation_idle_after") {
         // PRD #4207: mirrors the server's Go time.ParseDuration + 1h..2160h bound: an
-        // optional sign, then "0" or unit-suffixed components (decimals allowed).
+        // optional sign (after the server's TrimSpace), then "0" or unit-suffixed components (decimals allowed).
         const units: Record<string, number> = { h: 3600, m: 60, s: 1, ms: 1e-3, us: 1e-6, "µs": 1e-6, ns: 1e-9 };
         const comp = "(\\d+(?:\\.\\d*)?|\\.\\d+)(ns|us|µs|ms|h|m|s)";
-        const m0 = new RegExp(`^([-+]?)(0|(?:${comp})+)$`).exec(value);
+        const m0 = new RegExp(`^([-+]?)(0|(?:${comp})+)$`).exec(value.trim());
         if (!m0) {
           throw new ApiError(400, 'worker_hibernation_idle_after: must be a duration like "336h"');
         }

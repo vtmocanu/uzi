@@ -72,11 +72,39 @@ func TestWorkerHibernationAutoMigrationLiveDB(t *testing.T) {
 	if err := store.MigrateTo(ctx, dsn, idxV); err != nil {
 		t.Fatal(err)
 	}
-	if n := scalarInt(ctx, t, pool, `SELECT count(*) FROM pg_indexes WHERE tablename='runs' AND indexname IN ('runs_worker_nonterminal_idx','runs_worker_finished_idx')`); n != 2 {
+	if n := scalarInt(ctx, t, pool, `SELECT count(*) FROM pg_indexes WHERE tablename='runs' AND indexname IN ('runs_worker_nonterminal_idx','runs_worker_terminal_end_idx')`); n != 2 {
 		t.Fatalf("%d runs indexes, want 2", n)
 	}
 	if n := scalarInt(ctx, t, pool, `SELECT count(*) FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid WHERE c.relname LIKE 'runs_worker_%_idx' AND NOT i.indisvalid`); n != 0 {
 		t.Fatalf("%d invalid runs indexes", n)
+	}
+
+	// The per-worker idleness probes can use their indexes. enable_seqscan is off, so this
+	// proves the index path exists for these predicates, not that the planner picks it by default.
+	_, workerID := hibWorker(ctx, t, pool)
+	for name, c := range map[string]struct{ query, index string }{
+		"terminal anchor": {
+			`SELECT max(COALESCE(r.finished_at, r.status_since)) FROM runs r WHERE r.worker_id = '` + workerID.String() + `' AND r.status IN ('completed', 'failed', 'cancelled')`,
+			"runs_worker_terminal_end_idx"},
+		"non-terminal count": {
+			`SELECT count(*) FROM runs r WHERE r.worker_id = '` + workerID.String() + `' AND r.status NOT IN ('completed', 'failed', 'cancelled')`,
+			"runs_worker_nonterminal_idx"},
+	} {
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(ctx, `SET LOCAL enable_seqscan = off`); err != nil {
+			t.Fatal(err)
+		}
+		var plan string
+		if err := tx.QueryRow(ctx, `EXPLAIN (FORMAT JSON) `+c.query).Scan(&plan); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		_ = tx.Rollback(ctx)
+		if !strings.Contains(plan, `"Index Name": "`+c.index+`"`) {
+			t.Fatalf("%s: plan does not use %s: %s", name, c.index, plan)
+		}
 	}
 
 	// Down drops everything it added; Up restores it.
@@ -86,7 +114,7 @@ func TestWorkerHibernationAutoMigrationLiveDB(t *testing.T) {
 	if n := scalarInt(ctx, t, pool, `SELECT count(*) FROM information_schema.columns WHERE table_name='workers' AND (column_name='last_wake_settled_at' OR column_name LIKE 'hibernation_blocked_%')`); n != 0 {
 		t.Fatalf("Down left %d columns", n)
 	}
-	if n := scalarInt(ctx, t, pool, `SELECT count(*) FROM pg_indexes WHERE tablename='runs' AND indexname IN ('runs_worker_nonterminal_idx','runs_worker_finished_idx')`); n != 0 {
+	if n := scalarInt(ctx, t, pool, `SELECT count(*) FROM pg_indexes WHERE tablename='runs' AND indexname IN ('runs_worker_nonterminal_idx','runs_worker_terminal_end_idx')`); n != 0 {
 		t.Fatalf("Down left %d indexes", n)
 	}
 	if err := store.MigrateTo(ctx, dsn, idxV); err != nil {

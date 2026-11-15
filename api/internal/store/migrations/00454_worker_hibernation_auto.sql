@@ -19,8 +19,9 @@ ALTER TABLE workers
 UPDATE workers SET last_wake_settled_at = wake_requested_at
  WHERE hibernation_state = 'none' AND wake_requested_at IS NOT NULL;
 
--- Staged CHECKs: NOT VALID so no workers scan runs under the ACCESS EXCLUSIVE lock; the next
--- migration validates them.
+-- Staged CHECKs: NOT VALID defers validating existing rows to the next migration, which does
+-- it under SHARE UPDATE EXCLUSIVE. The backfill UPDATE above is the only scan here, bounded
+-- by the fleet size (the workers table).
 ALTER TABLE workers
  ADD CONSTRAINT workers_hibernation_blocked_reason_bounds CHECK (
   hibernation_blocked_reason IS NULL OR char_length(hibernation_blocked_reason) BETWEEN 1 AND 64

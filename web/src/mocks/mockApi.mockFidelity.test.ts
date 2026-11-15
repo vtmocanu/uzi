@@ -154,7 +154,7 @@ describe("mockApi — F3 updateSettings accepts the nine missing AppSettings key
       worker_hibernation_idle_after: "336h",
     });
     await check("worker_hibernation_auto", { worker_hibernation_auto: "true" }, "true");
-    for (const ok of ["1h", "2160h", "60m", "3600s", "3600000ms", "+1h", "1h30m", "1.5h", "720h"]) {
+    for (const ok of ["1h", "2160h", "60m", "3600s", "3600000ms", "+1h", "1h30m", "1.5h", "720h", " 336h "]) {
       await check("worker_hibernation_idle_after", { worker_hibernation_idle_after: ok }, ok);
     }
   });

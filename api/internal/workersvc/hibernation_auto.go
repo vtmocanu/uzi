@@ -78,10 +78,13 @@ func refineIntakeFenced(w store.Worker) string {
 
 // autoHibernationReason is the hibernation_reason recorded for an automatic admission.
 func autoHibernationReason(idleAfter time.Duration) string {
-	if idleAfter%(24*time.Hour) == 0 {
+	switch {
+	case idleAfter%(24*time.Hour) == 0:
 		return fmt.Sprintf("automatic: no run activity for %dd", int64(idleAfter/(24*time.Hour)))
+	case idleAfter%time.Hour == 0:
+		return fmt.Sprintf("automatic: no run activity for %dh", int64(idleAfter/time.Hour))
 	}
-	return fmt.Sprintf("automatic: no run activity for %dh", int64(idleAfter/time.Hour))
+	return "automatic: no run activity for " + idleAfter.String()
 }
 
 // HibernationAutoPass is the sweeper pass that hibernates idle workers. It does nothing unless

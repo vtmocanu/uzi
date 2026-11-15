@@ -654,7 +654,10 @@ func (a *autoFx) heartbeatAt(id uuid.UUID, at time.Time) {
 }
 
 // L14a: an assignment that holds the worker lock wins. The pass lists the worker, blocks on the
-// lock, and after the claim commits sees a non-terminal run and writes nothing.
+// lock, and after the claim commits sees a non-terminal run and writes nothing. This proves the
+// row lock serializes the pass behind the claim (the pass is seen blocked by the holder's
+// backend); the zero-admission outcome is also guaranteed by the busy refusal, so it does not
+// by itself isolate the post-lock re-check.
 func TestHibernationAutoAssignmentWinsLiveDB(t *testing.T) {
 	a := newAutoFx(t)
 	id, _ := a.idle(400 * 24 * time.Hour)
@@ -665,6 +668,10 @@ func TestHibernationAutoAssignmentWinsLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = tx.Rollback(a.env.ctx) }()
+	var holder int
+	if err := tx.QueryRow(a.env.ctx, `SELECT pg_backend_pid()`).Scan(&holder); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := tx.Exec(a.env.ctx, `SELECT id FROM workers WHERE id = $1 FOR UPDATE`, id); err != nil {
 		t.Fatal(err)
 	}
@@ -687,7 +694,7 @@ func TestHibernationAutoAssignmentWinsLiveDB(t *testing.T) {
 	for {
 		var waiting int
 		if err := a.env.pool.QueryRow(a.env.ctx, `SELECT count(*) FROM pg_stat_activity
-			WHERE datname = current_database() AND pid <> pg_backend_pid() AND wait_event_type = 'Lock'`).Scan(&waiting); err != nil {
+			WHERE $1 = ANY(pg_blocking_pids(pid))`, holder).Scan(&waiting); err != nil {
 			t.Fatal(err)
 		}
 		if waiting > 0 {
@@ -736,6 +743,28 @@ func TestHibernationAutoAdmissionWinsLiveDB(t *testing.T) {
 		t.Fatalf("the run left the queue: status=%q worker=%v", status, assigned)
 	}
 
+	// A queued run PINNED to the hibernating worker (the resume-pinned case that bypasses the
+	// intake check) is fenced by ClaimRun's own hibernation_state guard: the unassigned run
+	// above is already excluded by the intake check, so only this case isolates that guard.
+	pinned := a.queuedRun()
+	defer a.env.exec(`DELETE FROM runs WHERE id = $1`, pinned)
+	a.env.exec(`UPDATE runs SET worker_id = $2 WHERE id = $1`, pinned, id)
+	if payload, err := a.svc.Claim(a.env.ctx, a.row(id), nil); err != nil || payload != nil {
+		t.Fatalf("Claim of a pinned run on a preparing worker = %v, %v", payload, err)
+	}
+	if err := a.env.pool.QueryRow(a.env.ctx, `SELECT status, worker_id FROM runs WHERE id = $1`, pinned).Scan(&status, &assigned); err != nil {
+		t.Fatal(err)
+	}
+	if status != "queued" || !assigned.Valid || assigned.Bytes != id {
+		t.Fatalf("the pinned run was touched: status=%q worker=%v", status, assigned)
+	}
+	// Control: the same pinned run on an awake worker is claimed.
+	a.env.exec(`DELETE FROM runs WHERE id = $1`, queued)
+	a.env.exec(`UPDATE runs SET worker_id = $2 WHERE id = $1`, pinned, other)
+	if payload, err := a.svc.Claim(a.env.ctx, a.row(other), nil); err != nil || payload == nil {
+		t.Fatalf("control: an awake worker did not claim its pinned run: %v, %v", payload, err)
+	}
+
 	// Chat continue with the hibernating worker as affinity gets no worker.
 	ended := a.runOf(runkind.Chat, "running", nil)
 	a.finish(ended, "completed", a.clock.Add(-time.Minute))
@@ -768,6 +797,9 @@ func TestHibernationAutoRecheckAfterListLiveDB(t *testing.T) {
 			run := a.runOf(runkind.Issue, "completed", &id)
 			a.finish(run, "completed", a.clock)
 		}},
+		// Guarded by both the post-lock re-check and hibernateRefusal's busy check, so it
+		// does not isolate the re-check; only "a run finished just now" does (the busy check
+		// ignores terminal runs).
 		{"a run was assigned", func(a *autoFx, id uuid.UUID) { a.runOf(runkind.Issue, "queued", &id) }},
 	}
 	for _, c := range cases {
