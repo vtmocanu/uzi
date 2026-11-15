@@ -58,6 +58,7 @@ import {
   codexAdmissionText,
   accountCooldownText,
   displayHealthReason,
+  healthHint,
   queuedBlockerPrecedesCodexAdmission,
   isStoppedRun,
   isRejectedRun,
@@ -380,6 +381,7 @@ export function HealthFlag({ run }: { run: Run }) {
   const primaryAdmission = !maintenance && !reserve && !queuedBlockerPrecedesCodexAdmission(run) ? admission : null;
   const cooldown = accountCooldownText(run, now);
   const reason = displayHealthReason(run);
+  const hint = healthHint(run);
   const show = !maintenance && !reserve && !primaryAdmission && shouldShowHealthFlag(run.health, run.status);
   const queueAdvice = !maintenance && !reserve && !primaryAdmission && !show && run.status === "queued" ? reason : null;
   const since = run.health_since ? Date.parse(run.health_since) : NaN;
@@ -447,6 +449,8 @@ export function HealthFlag({ run }: { run: Run }) {
           {reason && <span className="font-normal"> — {reason}</span>}
         </span>
       )}
+      {/* Issue #4257: the fixed owner hint for a withheld run, from the web's own copy. */}
+      {show && hint && <span data-health-hint className="text-xs text-muted">{hint}</span>}
       {/* ALWAYS MOUNTED, empty until a flag arrives — mirrors RunView's parkAnnounce
           region and Board.tsx's S5 pattern. This is what actually announces the flag: a
           region that already exists narrates its next content change, where one mounted

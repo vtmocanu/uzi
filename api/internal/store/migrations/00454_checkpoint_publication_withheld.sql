@@ -27,7 +27,7 @@ UPDATE runs SET health = 'ok', health_reason = NULL, health_since = NULL
  WHERE health = 'publication_withheld';
 ALTER TABLE runs DROP CONSTRAINT runs_health_check;
 ALTER TABLE runs ADD CONSTRAINT runs_health_check CHECK
- (health IN ('ok', 'stalled', 'looping', 'slow', 'waiting_worker', 'approval_idle', 'waiting_account_cooldown')) NOT VALID;
+ (health IN ('ok', 'stalled', 'looping', 'slow', 'waiting_worker', 'approval_idle', 'waiting_account_cooldown'));
 ALTER TABLE runs
  DROP COLUMN checkpoint_withheld_since,
  DROP COLUMN checkpoint_withheld_status_since,

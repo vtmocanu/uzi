@@ -224,6 +224,9 @@ func displayHealth(health string) string {
 	if health == "slow" {
 		return "near timeout"
 	}
+	if health == healthPublicationWithheld {
+		return "publication withheld"
+	}
 	return health
 }
 

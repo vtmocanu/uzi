@@ -3242,7 +3242,7 @@ export type StopKind =
 export type JudgeVerdict = "ideal" | "ok" | "issues";
 
 export type RunHealth =
-  "ok" | "stalled" | "looping" | "slow" | "waiting_worker" | "approval_idle" | "waiting_account_cooldown";
+  "ok" | "stalled" | "looping" | "slow" | "waiting_worker" | "approval_idle" | "waiting_account_cooldown" | "publication_withheld";
 
 // FixVerdict is a ci_fix run's outcome (PRD #6): verified/fix_failed are stamped
 // server-side from the post-fix pipeline; not_code is the agent's "not a code
