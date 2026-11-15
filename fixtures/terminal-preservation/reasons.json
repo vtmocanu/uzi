@@ -1,0 +1,74 @@
+{
+  "send_suppressed": {
+    "status_class": "409"
+  },
+  "create_refused": {
+    "status_class": "409"
+  },
+  "update_refused": {
+    "status_class": "409"
+  },
+  "hold_missing": {
+    "status_class": "409"
+  },
+  "identity_changed": {
+    "status_class": "409"
+  },
+  "excluded_origin": {
+    "status_class": "409"
+  },
+  "manifest_mismatch": {
+    "status_class": "409"
+  },
+  "generation_bound": {
+    "status_class": "409"
+  },
+  "prior_tip_mismatch": {
+    "status_class": "409"
+  },
+  "preservation_retired": {
+    "status_class": "409"
+  },
+  "publication_in_flight": {
+    "status_class": "409"
+  },
+  "ci_config_guard": {
+    "status_class": "409"
+  },
+  "foreign_tip": {
+    "status_class": "409"
+  },
+  "authority_changed": {
+    "status_class": "409"
+  },
+  "unsupported": {
+    "status_class": "422"
+  },
+  "manifest_invalid": {
+    "status_class": "422"
+  },
+  "pack_invalid": {
+    "status_class": "422"
+  },
+  "tip_missing": {
+    "status_class": "422"
+  },
+  "not_descendant": {
+    "status_class": "422"
+  },
+  "root_unreachable": {
+    "status_class": "422"
+  },
+  "tree_mismatch": {
+    "status_class": "422"
+  },
+  "walk_too_large": {
+    "status_class": "422"
+  },
+  "pack_too_large": {
+    "status_class": "413"
+  },
+  "forge_unavailable": {
+    "status_class": "503"
+  }
+}

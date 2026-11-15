@@ -1,6 +1,8 @@
 import type { RemediationRestrictionProgress, RetainedAdoptionRefusal } from "./git.js";
 import { policyOwnershipGeneration, type CurrentPolicyAuthority } from "./policy-resolve.js";
 import { RESUME_LINEAGE_BREAK_EVENT } from "./harness-messages.js";
+import { terminalPreservationActive, type TerminalPreservationTestHooks } from "./terminal-preservation.js";
+import { preserveInLane, terminalHeadAdmitted, type TerminalLaneResult } from "./terminal-preservation-lane.js";
 import { validatePolicyHoldRequest } from "./protocol.js";
 import { checkpointCoordinatesForClaim, type CheckpointCoordinates } from "./checkpoint-coordinates.js";
 import { prepareCIEvidence, validateCIRepairClaim, type PreparedCIEvidence } from "./ci-evidence.js";
@@ -2971,6 +2973,10 @@ interface RunFlight {
    *  checkpoint boundary reaped the OLD epoch and must NOT settle against the new provider. `undefined`
    *  for Claude/stub (no safety), which equals the live `executor.safety` and settles as before. */
   permanentFailureReapSafety?: unknown;
+  /** #4007 slice B (production-dark): the in-lane terminal operation's result for this flight (set once by
+   *  {@link RunRunner.preserveTerminalInLane}) and the local secret latch a secret finding raises. */
+  terminalPreservation?: TerminalLaneResult;
+  secretBlocked?: boolean;
   preserveSession: boolean;
   recoveryRetentionCause?: string;
   /** Captured support, not permission to downgrade a later source-bearing write. */
@@ -3354,6 +3360,9 @@ export interface CheckpointTestHooks {
 /** Tuning the runner needs beyond the collaborators (defaults keep M2/M3 tests terse). */
 export interface RunnerOptions {
   codexOperationWaitPolicy?: CodexOperationWaitPolicy;
+  /** TEST-ONLY, constructor-only (#4007 slice B): turns the production-dark terminal-preservation gate on for this
+   *  instance. Never passed by main.ts or worker.ts; see terminal-preservation.ts. */
+  terminalPreservationTestOverride?: TerminalPreservationTestHooks;
   /** issue #3404 M2 U3: the completion-authority runtime. Every runner path that reaches a hooked
    *  GitCache effect opens its transaction through it, BEFORE any C/S/J/B it takes; the flight's
    *  executor is bound to its clone through it. Absent (unit tests): legacy behaviour. */
@@ -3813,6 +3822,13 @@ export class RunRunner {
   private readonly shutdownSignal = new AbortController();
   /** PRD #1809 D6 (N3): see RunnerOptions.dataVolumeReclaimWaitMs. */
   private readonly dataVolumeReclaimWaitMs: number;
+  private readonly terminalPreservationTestOverride: TerminalPreservationTestHooks | undefined;
+
+  /** #4007 slice B production-dark gate: the first statement of every terminal-preservation entry point. Not private
+   *  only because no production caller exists yet (noUnusedLocals would reject an unread private member). */
+  terminalPreservationEnabled(): boolean {
+    return terminalPreservationActive(this.terminalPreservationTestOverride);
+  }
 
   constructor(
     private readonly client: WorkerClient,
@@ -3828,6 +3844,7 @@ export class RunRunner {
     opts: RunnerOptions = {},
   ) {
     this.authority = opts.authority;
+    this.terminalPreservationTestOverride = opts.terminalPreservationTestOverride;
     this.restoreIdentity = opts.restoreIdentity;
     this.independentRestore = opts.independentRestore !== false;
     this.restoreSkipExecutionComparison = opts.restoreSkipExecutionComparison === true;
@@ -3856,6 +3873,8 @@ export class RunRunner {
       opts.recovery ??
       new RecoveryCoordinator({
         ...(opts.authority ? { authority: opts.authority } : {}),
+        // #4007 slice B: one gate for the runner and its coordinator (test-only; main never sets it).
+        ...(opts.terminalPreservationTestOverride ? { terminalPreservationTestOverride: opts.terminalPreservationTestOverride } : {}),
         client: this.client,
         git: this.git,
         log: this.log,
@@ -4126,9 +4145,67 @@ export class RunRunner {
     const prior = this.publicationAdmissions.get(body);
     if (prior !== undefined) return prior;
     const admitted = this.eligiblePublicationCompletion(flight, body) &&
-      this.client.canStartPublicationCompletion?.(flight.runId, flight.claimGeneration) !== false;
+      this.client.canStartPublicationCompletion?.(flight.runId, flight.claimGeneration) !== false &&
+      this.terminalPreservationAdmits(flight, body);
     this.publicationAdmissions.set(body, admitted);
     return admitted;
+  }
+
+  /** #4007 slice B: with the gate on, a branch-source completion is admitted only when the in-lane terminal operation
+   *  published or recorded and the body's head is a declared manifest root. Gate off: always true. */
+  private terminalPreservationAdmits(flight: RunFlight, body: StateRequest | Record<string, unknown>): boolean {
+    if (!this.terminalPreservationEnabled()) return true;
+    const head = body.completion_final_head;
+    return typeof head === "string" && terminalHeadAdmitted(flight, head);
+  }
+
+  /** #4007 slice B: run the terminal operation in place for `body` (total: never throws). The caller has checked the
+   *  gate; `quiesce` is false only where the caller's own reap already proved quiescence. */
+  private async preserveTerminalInLane(
+    claim: ClaimResponse, flight: RunFlight, body: { status: string; fail_origin?: string; failure_reason?: string },
+    site: { quiesce: boolean; site: string; signal?: AbortSignal; deadlineAt?: number },
+  ): Promise<TerminalLaneResult> {
+    const hooks = this.terminalPreservationTestOverride;
+    const failureFirst = (): string | undefined => {
+      const mapped = typeof body.failure_reason === "string" ? failOriginForReason(body.failure_reason) : undefined;
+      if (mapped === "push_secret_blocked" || mapped === "worker_residue_blocked") return mapped;
+      // Defensive: the only writer of flight.secretBlocked is the terminal lane itself (a secret finding latches it); active
+      // remediation is refused by the lane's own policy().blocked gate, which also runs before any universe read.
+      if (flight.secretBlocked === true) return "secret_blocked";
+      if (residueQuarantine() !== undefined) return "residue_quarantined";
+      return undefined;
+    };
+    const skip = (): string | undefined => {
+      // journalAndSendTerminal's early-return predicates, then the already-attempted and permanent-failure-reap guards.
+      if (flight.policyHold || flight.iterationParkState !== "none") return "policy_or_park";
+      if (body.status === "failed" && flight.completionHoldOutcome === "unresolved") return "completion_hold";
+      if (flight.steering?.claimFence() !== undefined) return "claim_fence";
+      if (this.terminalDeps()?.outbox.hasPendingTerminal(flight.runId, flight.claimGeneration) ?? false) return "pending_terminal";
+      if (flight.completionSendAttempted ||
+          this.attemptedPublicationTerminals.has(this.completionKey(flight.runId, flight.claimGeneration))) return "previously_attempted";
+      if (flight.permanentFailureReap !== undefined) return "permanent_failure_reap";
+      return undefined;
+    };
+    // A claim without a default branch is resolved by the lane inside its own window and signal (never before it).
+    const claimBranch = claim.repo.default_branch?.trim() || undefined;
+    const lookupBare = claimBranch === undefined ? flight.barePath : undefined;
+    return preserveInLane({
+      git: this.git, recovery: this.recovery, client: this.client, hooks,
+      workerId: this.client.memoryIncarnation?.worker_id ?? hooks?.workerId,
+      defaultBranch: claimBranch ?? (lookupBare ? undefined : "main"),
+      ...(lookupBare ? { lookupDefaultBranch: (b: { signal: AbortSignal; deadline: number }) =>
+        this.git.withReportProofBudget(b, () => this.git.terminalDefaultBranch(lookupBare)) } : {}),
+      readDefaultBranchTip: (bare, branch, b) => this.git.withReportProofBudget(b, () => this.git.defaultBranchTip(bare, branch)),
+      egressBound: false,
+      skip, failureFirst, policy: () => this.frozenHeldPolicy(flight),
+      remediationHold: sha => this.checkpointRemediationHold(flight, flight.barePath!, sha, false),
+      ciHold: sha => this.ciConfigGuardVerdict(flight, flight.barePath!, sha, "terminal preservation"),
+      ...(site.quiesce ? { quiesce: ({ deadlineAt, signal }) => this.quiesceOrBlockSink(flight, flight.executor, site.site, { deadlineAt, stop: { signal } }) } : {}),
+      ...(site.signal ? { signal: site.signal } : {}),
+      ...(site.deadlineAt !== undefined ? { remainingMs: site.deadlineAt - Date.now() } : {}),
+      log: (step, fields) => flight.runLog.info(`terminal preservation: ${step}`, { run_id: flight.runId, ...fields }),
+      now: () => Date.now(),
+    }, flight, body);
   }
 
   private eligiblePublicationCompletion(flight: RunFlight, body: StateRequest | Record<string, unknown>): boolean {
@@ -8725,7 +8802,8 @@ export class RunRunner {
         ? false
         : flight.permanentFailureReap !== undefined
           ? this.permanentFailureReapValid(flight)
-          : await this.reapRecoveryProviderForSettle(claim, flight, runLog, "terminal");
+          : await this.reapRecoveryProviderForSettle(claim, flight, runLog, "terminal", undefined,
+            this.terminalPreservationEnabled() ? { fail_origin: failOrigin, failure_reason: reason } : undefined);
     if (flight.sourceNormalFailure && reaped && !opts.keepCustody)
       flight.sourceNormalFailure.providerReaped = true;
     if (reaped && (!opts.keepCustody || flight.completedRetainedSuccessor)) {
@@ -10450,6 +10528,8 @@ export class RunRunner {
     // completion ACK, and the settle itself runs only AFTER the terminal outcome resolved (the
     // outbox journal retired / terminalResolved latched), off the terminal send path.
     const journalTerminalReport = async (body: Parameters<RunFlight["reportState"]>[0]) => {
+      if (this.terminalPreservationEnabled())
+        await this.preserveTerminalInLane(claim, flight, body, { quiesce: true, site: "terminal_preservation", signal: publicationSignal, deadlineAt: heldCapture?.deadlineAt });
       // A report-only capped slice carries permit identity, but has no pushed settlement head.
       if (!(body as StateRequest).report_only) await this.persistSettlementPushedHead(claim, flight, body);
       await this.journalAndSendTerminal(flight, TERMINAL_JOURNAL_PHASE, body, reportState);
@@ -10462,10 +10542,15 @@ export class RunRunner {
     ): Promise<void> => {
       // Persist the source fence with the proof, including on boot-time replay.
       if (body.source_publication !== undefined) body = { ...body, claim_generation: flight.claimGeneration };
+      // #4007 slice B: preserve in place, inside this permit, before the head is frozen; the head is attached below only
+      // when that operation proved it.
+      if (this.terminalPreservationEnabled() && body.status === "completed")
+        await this.preserveTerminalInLane(claim, flight, body, { quiesce: true, site: "terminal_preservation", signal: publicationSignal, deadlineAt: heldCapture?.deadlineAt });
       // Freeze delivered identity before journal installation and before fallback can change HEAD.
       const finalHead = body.head ?? flight.successfulPushedSha;
       if (flight.inventoryGuarded && ["issue", "mr_rework", "self_improve"].includes(flight.runKind) &&
-          body.status === "completed" && typeof finalHead === "string" && /^[0-9a-f]{40}$/.test(finalHead))
+          body.status === "completed" && typeof finalHead === "string" && /^[0-9a-f]{40}$/.test(finalHead) &&
+          (!this.terminalPreservationEnabled() || terminalHeadAdmitted(flight, finalHead)))
         body = { ...body, completion_final_head: finalHead };
       if (deferCommittedTerminal) {
         deferCommittedTerminal(async () => {
@@ -18477,12 +18562,14 @@ export class RunRunner {
     flight: RunFlight,
     executor: Executor,
     site: string,
-    opts: { processOnly?: boolean; keepClone?: boolean } = {},
+    opts: { processOnly?: boolean; keepClone?: boolean; deadlineAt?: number; stop?: CheckpointStop } = {},
   ): Promise<void> {
     const q = await this.quiesceRun(flight, executor, {
       mode: "own",
       site: opts.processOnly ? `${site}:after_runner_git` : site,
       processOnly: opts.processOnly,
+      ...(opts.deadlineAt !== undefined ? { deadlineAt: opts.deadlineAt } : {}),
+      ...(opts.stop !== undefined ? { stop: opts.stop } : {}),
     });
     if (!q.blocked) return;
     // Keep the clone and its recovery journal: the terminal finally must not retire a tree a
@@ -18627,7 +18714,9 @@ export class RunRunner {
       /** issue #3644: `<run>:<attempt>` markers that must be neither killed nor ignored (an independent restore's predecessor). */
       protectedMarkers?: string[];
       /** issue #3980: absolute deadline of a bounded Claude gate checkpoint; absent = unchanged behaviour. */
-      deadlineAt?: number },
+      deadlineAt?: number;
+      /** Terminal preservation lane stop: aborted = refuse queued gate admission and start no further step; absent = unchanged behaviour. */
+      stop?: CheckpointStop },
   ): Promise<{ outcome: QuiesceRunOutcome; blocked: boolean }> {
     // issue #3644 plan 3.4 (a): until the restore's seed returns, P's processes, clone and HOME belong to the other incarnation.
     // Refuse before any kill, settle, scan or reap; every caller reads a blocked proof as "not quiescent" and keeps what it holds.
@@ -18661,9 +18750,10 @@ export class RunRunner {
     }
     try { return await flight.sinkGate.run(async () => {
       MaintenanceBudget.current()?.check();
-      const deadlineExpired = (): boolean => opts.deadlineAt !== undefined && Date.now() >= opts.deadlineAt;
+      const deadlineExpired = (): boolean =>
+        (opts.deadlineAt !== undefined && Date.now() >= opts.deadlineAt) || opts.stop?.signal.aborted === true;
       const deadlineBlocked = (reap?: RunProcessReap | { failure: string }): { outcome: QuiesceRunOutcome; blocked: boolean } => {
-        flight.runLog.warn("run quiescence not attempted: the gate checkpoint deadline is exhausted", { site: opts.site });
+        flight.runLog.warn("run quiescence not attempted: the gate checkpoint deadline is exhausted or its stop is aborted", { site: opts.site });
         if (!executor.safety) flight.evidenceJoinFailed = true;
         const base: QuiesceRunOutcome = {
           process: { state: "unverified", processes: [], killed: [], detail: "gate checkpoint deadline exhausted" },
@@ -18809,7 +18899,17 @@ export class RunRunner {
         });
       }
       return { outcome, blocked };
-    }); } catch (error) {
+    }, opts.stop); } catch (error) {
+      if (opts.stop?.signal.aborted && (error instanceof CheckpointSoftDeadlineError || error instanceof GitBoundaryAbortError)) {
+        // The stop refused or forfeited the gate wait, or fired during/after the gated body (whose result is then discarded):
+        // not proven quiescent, so blocked and unverified like deadlineBlocked.
+        flight.runLog.warn("run quiescence not completed: the terminal preservation stop is aborted", { site: opts.site });
+        if (!executor.safety) flight.evidenceJoinFailed = true;
+        return { outcome: {
+          process: { state: "unverified", processes: [], killed: [], detail: "terminal preservation stop" },
+          docker: { state: "not_wired", removed: [], detail: "terminal preservation stop" },
+        }, blocked: true };
+      }
       if (!this.cancellationExpired(flight) && !MaintenanceBudget.current()?.signal.aborted) throw error;
       flight.preserveRecoveryClone = true;
       flight.preserveSession = true;
@@ -23206,10 +23306,12 @@ export class RunRunner {
     runLog: Logger,
     boundary: BoundaryRequest["boundary"],
     held?: HeldAuthenticatedCapture,
+    /** #4007 slice B: the failed body reportGenericFailure is about to report; present only with the gate on. */
+    failure?: { fail_origin?: string; failure_reason?: string },
   ): Promise<boolean> {
     if (flight.cancellationBudget && this.cancellationExpired(flight)) return false;
     if (!MaintenanceBudget.current() && flight.cancellationBudget) {
-      return this.runCancellationMaintenance(flight, () => this.reapRecoveryProviderForSettle(claim, flight, runLog, boundary)).catch(() => false);
+      return this.runCancellationMaintenance(flight, () => this.reapRecoveryProviderForSettle(claim, flight, runLog, boundary, undefined, failure)).catch(() => false);
     }
     if (!this.recovery.enabled) return false; // token-less harness: no credentialed settle, no reap needed
     if (!isCodePublishingKind(resolveRunKind(claim.kind))) return false;
@@ -23224,12 +23326,18 @@ export class RunRunner {
       // reap + Docker teardown) before any credentialed settle may run. A surviving or
       // unattributable run-owned process throws RunResidueBlockedError: the settle is skipped, the
       // hold (custody) stays open and the clone + journal are kept (preserveRecoveryClone).
+      // The lane runs inside this boundary permit: it gets the permit's signal and the boundary's absolute deadline.
+      const reapDeadlineAt = Date.now() + this.codexBoundaryDeadlineMs;
       await this.reapForSink(
         flight.executor,
         { boundary, deadlineMs: this.codexBoundaryDeadlineMs },
-        async () => {
-          // Empty body: the reap itself is the point. The credentialed settle runs OUTSIDE the
+        async permit => {
+          // The reap itself is the point. The credentialed settle runs OUTSIDE the
           // boundary (mirroring the park path), after the provider root is reaped.
+          // #4007 slice B (production-dark): the reap proved quiescence, so the lane skips its own proof.
+          if (this.terminalPreservationEnabled() && failure !== undefined && flight.permanentFailureReap === undefined)
+            await this.preserveTerminalInLane(claim, flight, { status: "failed", ...failure },
+              { quiesce: false, site: "terminal_preservation", deadlineAt: reapDeadlineAt, ...(permit?.signal ? { signal: permit.signal } : {}) });
         },
         flight,
       );

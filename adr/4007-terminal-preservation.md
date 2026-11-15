@@ -1,6 +1,6 @@
 # ADR-4007: a run's terminal work is preserved under its own forge ref namespace, separate from held work and checkpoint retention
 
-**Status**: Accepted (slice A implemented API-side and dark: no shipped worker advertises the capability, so no ref is created, no gate fires and the sweep lists no rows; slices B to E and the retirement switch are deferred, see below)
+**Status**: Accepted (slice A implemented API-side and dark: no shipped worker advertises the capability, so no ref is created, no gate fires and the sweep lists no rows; slice B is partially built and dark: the worker producer exists behind a compile-time-off gate and runs nowhere in production, slices C to E and the retirement switch are deferred, see below)
 **Date**: 2026-11-13
 **Issue**: [vtmocanu/uzi#4007](https://github.com/vtmocanu/uzi/issues/4007)
 **Refs**: #4007, #2545, #1810, #1867, #2507, #1296
@@ -208,7 +208,8 @@ and the total. A race that reaches the RESTRICT FK maps to the same 409.
 
 - **B**: worker capture and publication (the caller of the route), omission
   detection, and teaching the agent decoders the two new completion reasons.
-  B must not advertise `recovery_terminal_preservation_v1` before D's owner
+  B is partially built and production-dark (see "Slice B (partially built,
+  production-dark)" below); the remainder is deferred. B must not advertise `recovery_terminal_preservation_v1` before D's owner
   escape for removal-blocking refs lands.
 - **C**: reclaim and custody.
 - **C/D**: retirement enablement: a consumer-admission fence, a complete
@@ -217,6 +218,245 @@ and the total. A race that reaches the RESTRICT FK maps to the same 409.
 - **D**: activation, and an owner escape for removal-blocking refs, with CLI.
 - **E**: fleet rollout.
 - **Purge** of finished rows.
+
+### Slice B (partially built, production-dark)
+
+Slice B is the worker half: the producer that calls the route. It is built
+partially and is production-dark: the code below exists and is tested with
+fakes and real Git, but it is behind a compile-time-off gate, so none of it
+runs in production and nothing here is shipped behaviour. This section
+supersedes the Deferred "B" bullet for the parts it scopes in. Passive decoding
+of the two new completion reasons is the one part that is not gated (see
+"Protocol decoding").
+
+- **Gate.** One compile-time constant, `TERMINAL_PRESERVATION_ENABLED = false`
+  in `agent/src/terminal-preservation.ts`, is the first check of every new
+  entry point, before any inventory, quiescence, Git, private ref, record,
+  HTTP or completion-head work. Only a constructor-only test option enables
+  it; `main` never passes it. No config, env, chart, server feature or agent
+  input reaches it, and the worker does not advertise
+  `recovery_terminal_preservation_v1`. `TERMINAL_ORIGIN_ADMISSION_ENABLED`
+  is untouched.
+- **Narrowed scope.** Only `branch_source` runs (issue, mr_rework and
+  self_improve without an egress profile) are preserved. Every other kind
+  gets an output-contract label and is kept unchanged. A label is not the
+  contract analysis: the report-ACK and no-push proofs for the kept kinds,
+  and the terminal sends with no in-lane seat (permanent failure,
+  rate-limited, cancel, iteration cancel, owner cancel), are deferred to the
+  named follow-up "#4007 slice B2-contracts".
+- **Kept, not proved.** A retained predecessor (writer exclusion is #4001's),
+  a present non-current attempt clone, a held replay root not reachable from
+  the frozen source, a clone-local ref that is not an ancestor of HEAD, a
+  stash, a linked worktree, and incomplete private refs after a crash. B
+  deletes nothing; removal of incomplete private refs is slice C's.
+- **Still deferred.** The T4 shared excluded-origin fence, D's owner escape
+  with CLI (including clearing a `localBlock`), one-worker activation and
+  startup disable (including upgrade-time pending journals), retirement (T3),
+  reclaim and custody (C, including G12), fleet rollout (E), hosted
+  acceptance, the named follow-up "#4007 slice B2-contracts" (the kept labels'
+  output-contract analysis and the G7 callers) and the #4001 predecessor
+  exclusion.
+
+#### Source universe and the feasibility gate (M3)
+
+`agent/src/terminal-inventory.ts` composes, read-only, the run's complete
+local source universe: every repo bare (`listRunBares`, strict), the clone
+inventory, the attempt ledger, journal, stopped-marker and protected
+attribution (`readTerminalAttribution`), owed roots, and the run's
+authenticated recovery records. It refuses (keep) on any unknown read,
+contradiction, duplicate, record or bundle outside the universe, foreign bare,
+cap or deadline, any present attempt clone other than the current flight's
+own, any retained predecessor, and any clone-local ref (`origin/*` included)
+that is not an ancestor of the clone HEAD, a stash or a linked worktree.
+Tracking state and reachability from bare refs are never evidence.
+
+The clone is agent-writable, so the clone-local ref ancestry read runs in the
+hardened proof-read view: grafts (`GIT_GRAFT_FILE=/dev/null`), replace objects,
+the commit-graph and the multi-pack-index are disabled, and any `rev-list`
+stderr refuses. A forged `info/grafts` file or commit-graph cannot fake
+ancestry. A ledger attempt of the run that is not retired or abandoned and
+whose clone is gone refuses (`ledger_attempt_clone_missing`); a retired or
+abandoned attempt may be gone and contributes only owed roots and its bare. The
+same attempt ID under two branch keys of one bare, a journal attempt ID that
+differs from the ledger attempt at the same clone path, and a duplicated
+abandoned manifest entry all refuse.
+
+Record binding. A record binds to the proved source (the current present
+attempt) when it is on the same branch and its `bareDir` equals the current
+bare's directory name. A record without a `bareDir` binds only when exactly one
+bare exists (it then cannot belong to another bare) and the branch matches. A
+record not bound to the current source is accepted only when its `sourceSha`
+is an explicit root of the universe (the head or an owed root) and it matches
+another ledger attempt of the run by branch and by the bare that attempt lives
+in; otherwise it is `record_outside_universe`. Only records bound to the
+current source contribute generations. The abandoned-entry duplicate check
+keys on class and source, so one source may carry both an `ignored` and a
+`cold_dirty` entry.
+
+The inventory and the attribution are read under separate bare-lock
+acquisitions, so the universe is two snapshots, not one. The later in-boundary
+recheck at freeze and before invocation (M5/M6) re-reads both.
+
+Known limits:
+
+- The attempt ledger carries no generation. A source's generation is parsed
+  from its attempt ID, and bound records report their own generations; a bound
+  record whose generation differs from the current attempt's is reported, not
+  refused.
+- Records carry no attempt ID or clone path. A record binds by branch, bare
+  and (for an absent attempt) an explicit root, as above.
+- The existing inventory reports any other run's attribution in the shared
+  bare as a foreign owner. The universe refuses on that, so in a bare shared
+  with other runs it is unproved. This is over-conservative (keep) and must be
+  revisited before any activation; it is not narrowed in slice B.
+
+Feasibility gate. The test "F-gate: an inventory-guarded single-attempt issue
+flight is proved end to end (clean tree; an untracked file does not change the
+universe)" in
+`agent/test/terminal-inventory.test.ts` runs real Git, a real `GitCache` and a
+real `RecoveryCoordinator`.
+
+- Fixture evidence: one bare found by `listRunBares`; one live ledger attempt
+  and its journal binding; one owed root; one authenticated inventory-guarded
+  recovery record bound to the attempt (generation 1); one proved source with
+  the clone HEAD and `dev:ino`; roots `current_head` and `owed`; label
+  `branch_source`; the omission check accepts the matching manifest and
+  refuses it with a root omitted.
+- Inferred, not yet evidenced: that the read happens at the joined boundary
+  before the terminal report, the capture limits and dirty capture (the
+  universe does not read dirty content), and egress binding (the claim carries
+  no egress marker, so it is a caller-supplied input).
+
+#### Protocol decoding
+
+The agent decodes `terminal_preservation_pending` and
+`terminal_preservation_refused` as completion-release refusals at three sites,
+and the strict route client (`publishTerminalPreservation` in
+`agent/src/client.ts`) decodes the route's responses. Decoding is passive: it
+needs no gate and starts no work. Retryable refusal reasons are unknown, not
+final; only `published` at the tip or `recorded` is a final outcome.
+
+#### Capture (`GitCache.captureTerminalSnapshot`)
+
+Capture runs bounded pre-staging refusals before any object is written. A
+credential-path denylist is defence in depth only; the control is the secret
+scan over the published range. Dirty work is committed through a private index
+(the clone's `.git/index`, HEAD, branch and other refs are untouched), and the
+staged tree is validated before the commit. Capture refuses a symlinked
+objects directory, a `commondir`, and foreign alternates (only a bare-pointing
+alternate is admitted). The snapshot's parent must be on
+`refs/uzi-runner/<branch>` in the bare. The result is fetched into the bare
+through a staging ref (`refs/uzi-incoming/<uuid>`) and then pinned at a
+private ref `refs/uzi-terminal-local/<run>/g<gen>` (in the clone while
+transient, in the bare once private), and a post-fetch reachable-object check
+runs. `buildTerminalAggregate` builds the aggregate over the captured roots.
+
+The clone's real index is agent-writable, so it never decides the verdict or
+stages anything. After the real-index enumeration and per-file checks, and
+before any `add`, a private index is built from HEAD (`read-tree` writes no
+object) and `status` runs on it with the same pins. Its changed-path set must
+equal the enumeration's, else the capture refuses `index_mismatch` (a forged
+stat cache or entry oid hiding an edit, even a credential or over-limit file,
+therefore refuses before its content is hashed into the object store). A clean
+tree is empty on both and returns with no `add` and no `write-tree`; a dirty
+tree stages into the same private index. A file can still change between its
+`lstat`, the preflight and the `add`; the staged-set, mode and size checks and
+the tree-diff backstop bound that, and the secret scan is the content control.
+The pins include `core.excludesFile=/dev/null`, so a global excludes file
+cannot hide untracked work.
+
+Cleanup is bounded. The staging-ref delete and the private-index removal share
+one allowance: the earlier of 2 s (`TERMINAL_CAPTURE_CLEANUP_MS`), the lane's
+`cleanupBound.deadlineAt` (when the lane has one; absent means no caller
+deadline) and the boundary's soft deadline, cancelled by
+`cleanupBound.signal` or the boundary signal. It is never bound to the
+capture's own signal or deadline, which have usually lapsed. Anything not
+confirmed removed is reported as `remnant` on the result: the staging ref as
+`retained` (confirmed present at the commit, no delete launched) or `unknown`
+(no read was possible, the ref was seen at a different oid, reported with both
+the observed and expected oid, or a launched delete was cancelled or failed
+unconfirmed), and the private index path when the index file's own removal did
+not run or was unconfirmed (a failed lock-file removal alone is only logged). Nothing retries after the call returns. An error the boundary
+marks `unsafe_cleanup` propagates from every internal handler and both public
+catches instead of becoming a refusal, after the remaining cleanup steps ran.
+
+#### Pinned preparation
+
+`prepareFrozenHeldPinned` (see ADR-2545 amendment) prepares over a frozen
+range: it takes an opt-in `perCommitCi` check (`changedCiPathsPerCommit`,
+under a cumulative budget) and returns the scan digest and transport digest
+(`terminalScanDigest`, `terminalTransportDigest`). The range is persisted with
+its presence preserved, and retries never re-resolve it.
+
+#### Operation records and the ordered engine
+
+Operation records (`agent/src/terminal-operation.ts`) live under
+`<dataDir>/terminal-preservation/<runId>/`, outside the recovery run directory.
+They are MAC-bound (the recovery key over a domain-separated MAC input), merge monotonically, append
+invocations only, grow a `localBlock`, and are immutable once closed. Every
+write is validated by the decoder before it lands, so a record stays decodable.
+One operation owner at a time, and the journal lock is never held across the
+network. Before any send, the engine scans all the run's records for a
+secret latch. A `generation_bound` or `prior_tip_mismatch` response appends a `conflict`
+invocation and adds the `server_conflict` local block. The secret latch is written
+before the flagged commits are. Rediscovery runs on the boot recovery pass
+(gated), never sends and never deletes: a
+`capturing` or `captured` record found on restart becomes `incomplete`, with
+its private refs retained. Its journal-lock waits are bounded by the remaining 30 s
+rediscovery budget and the caller's signal; a waiter that gives up forfeits its turn and
+never acquires later, while a write that already holds the lock completes. The invocation
+ledger admits an `invoked` entry only while room remains for it and its outcome (256
+entries), so a record left at 255 entries by a crash-dangling `invoked` stays prepared and
+is never resent (accepted limit).
+
+#### Callers
+
+All callers sit behind the gate. The in-lane send and the head decision run in
+`finishCommittedPublish`, and `journalTerminalReport` runs in place. The
+reap-body seat is bounded by its permit, with a proportional reserve (the
+lane's cap is 120 s, the reserve is 30 s or a quarter of the permit, whichever
+is smaller, and a window under 5 s starts nothing). The completion head is
+attached only for a `published` or `recorded` manifest root. A held V2
+replay/resume runs inside `inventorySourceBoundary` before any held FINAL; a
+non-final outcome keeps the hold and no hold is reopened.
+When the claim names no default branch, the lane resolves it inside its own window and signal; a lookup that ends after the lane window lapsed or its signal aborted keeps the output (`default_branch_unresolved`) rather than assuming `main`. The lookup is a terminal-only strict reader (`GitCache.terminalDefaultBranch`; the legacy `defaultBranchName`, which reads any failed git read as an absent ref, is unchanged for its other callers) with three results: a resolved name, proven absence, or unknown. Any read that fails, is killed, times out or overruns its output, a ref git reports as broken or unreadable (a failed read or a `for-each-ref` warning), a dangling `origin/HEAD` (legacy falls through to `main`), a dangling candidate symbolic ref, and a detached HEAD with no common branch are all unknown, and unknown (or a throw) keeps the output as `default_branch_unresolved` even when time remains; a lookup that ends outside the window keeps through the lane's window check above. Because git itself reads some broken storage as a missing ref without any error, the reader also checks the loose ref paths of `origin/HEAD` and every candidate: a symlink, an empty directory or other non-regular entry, an unreadable path, a non-directory ancestor directory (other than the `refs/heads` stub file of a repository that stores its refs in a `reftable/` directory; a live symlinked ancestor also keeps), an `origin/HEAD` that is not a symbolic ref (loose or packed), or a loose candidate file git neither listed nor read as symbolic is unknown too (the legacy lookup reads these as missing). A non-empty directory at a candidate path is a ref namespace and proves only that the candidate has no loose file. Only proven absence falls back to `main`: no `origin/HEAD` symref, a symbolic unborn HEAD, no symbolic candidate, no listed candidate, and every read an ordinary exit; the default branch's tip read in prepare runs under the same window and a read cut short by it keeps the output as a prepare `deadline` before the held-pack preparation starts.
+
+#### Failure model and what is not claimed
+
+The failure model is process crash only. No storage or power-loss durability
+is claimed.
+
+#### Named gaps and kept classes (not shipped)
+
+- **G5, G7 (excluded sends).** Permanent failure, `rate_limited`, cancel,
+  iteration cancel and owner cancel have no in-lane seat and are not
+  preserved. Deferred to "#4007 slice B2-contracts".
+- **G8.** The capture-scope allowlist is not defined.
+- **G9.** A present non-current attempt clone is kept, not proved.
+- **G10.** Held replay roots not reachable from the frozen source are kept.
+- **G11.** Clone-local refs that are not ancestors of HEAD, stashes and linked
+  worktrees are kept.
+- **G12.** Incomplete private refs are retained until slice C removes them.
+- **Foreign-owner over-conservatism.** See the known limits under the
+  feasibility gate.
+- **Unreferenced objects.** A malicious pack can leave unreferenced objects in
+  the bare. The shared fetch-back class is pre-existing in `fetchAgentBranch`
+  and is tracked separately.
+- **Untracked directories.** Replay refuses clones with untracked directories,
+  because dirty extents use plain status.
+- **Dirty snapshot not in the manifest.** The dirty snapshot is in the
+  published tip but is not declared in the manifest.
+- **Workers without attempt paths.** A non-Docker worker without attempt paths
+  skips with `source_unknown`, and would lose `completion_final_head` once the
+  gate is activated.
+- **Egress profile.** The worker does not see an egress-profile marker on the
+  claim, so the lane passes `egressBound: false`; the exclusion holds only
+  because egress-profile runs go to the isolated lane.
+- **Reap-body window.** At most about 22.5 s (the 30 s boundary deadline less a
+  quarter-of-remaining reserve), for Claude and Codex alike, after the reap and
+  quiesce time already spent.
+- **(a1)/(a2) without held capture.** These fall back to the 120 s cap and are
+  not bounded by the shutdown deadline.
 
 ### Review corrections: preparation and a proven local no-send
 
