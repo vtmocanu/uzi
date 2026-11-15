@@ -2,7 +2,7 @@
 // positioning would stop at the end of that slot. Once the title leaves the window,
 // the same row becomes fixed over the content column; its host keeps the flow height.
 
-import { useEffect, useLayoutEffect, useRef, useState, type ReactNode, type RefObject } from "react";
+import { useEffect, useRef, useState, type ReactNode, type RefObject } from "react";
 import { cx } from "./ui";
 
 interface ColumnRect {
@@ -19,6 +19,7 @@ export function OverviewStickyActions({
 }) {
   const hostRef = useRef<HTMLDivElement>(null);
   const rowRef = useRef<HTMLDivElement>(null);
+  const lastPinnedHeightRef = useRef<number | null>(null);
   const [stuck, setStuck] = useState(false);
   const [flowHeight, setFlowHeight] = useState(0);
   const [flowWidth, setFlowWidth] = useState(0);
@@ -63,21 +64,26 @@ export function OverviewStickyActions({
     const measure = () => {
       const rect = row.getBoundingClientRect();
       if (row.dataset.stuck === "false") {
+        lastPinnedHeightRef.current = null;
         setFlowHeight(rect.height);
         setFlowWidth(rect.width);
-      } else setBarHeight(rect.height);
+      } else {
+        const previous = lastPinnedHeightRef.current;
+        // Keep the flow placeholder in step with chip rows added or wrapped while pinned.
+        // The first pinned observation includes the new bar padding and border, so it is
+        // a baseline, not a content-height change.
+        if (previous !== null && rect.height !== previous) {
+          setFlowHeight((height) => height + rect.height - previous);
+        }
+        lastPinnedHeightRef.current = rect.height;
+        setBarHeight(rect.height);
+      }
     };
     measure();
     const resize = typeof ResizeObserver !== "undefined" ? new ResizeObserver(measure) : null;
-    resize?.observe(row);
+    resize?.observe(row, { box: "border-box" });
     return () => resize?.disconnect();
   }, []);
-
-  // Positioning adds padding and a border without changing the row's content box,
-  // so ResizeObserver alone does not observe the new outer height on the first stick.
-  useLayoutEffect(() => {
-    if (stuck && rowRef.current) setBarHeight(rowRef.current.getBoundingClientRect().height);
-  }, [stuck, column.width]);
 
   useEffect(() => {
     if (!stuck) return;

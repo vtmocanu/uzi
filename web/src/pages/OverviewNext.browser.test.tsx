@@ -280,6 +280,22 @@ describe("sticky Overview chips (#4370)", () => {
     expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(1280);
   });
 
+  it("updates the flow placeholder when chips wrap while pinned, then unsticks without a jump", async () => {
+    const { row } = await mountAt(1280);
+    const content = screen.getByRole("region", { name: "Issue work" });
+    window.scrollTo(0, 650);
+    await expect.poll(() => row.dataset.stuck).toBe("true");
+    const chips = [...row.querySelectorAll<HTMLElement>("button[aria-haspopup='dialog']")];
+    for (const chip of chips.slice(0, 2)) chip.parentElement!.style.flex = "0 0 500px";
+    await expect.poll(() => row.getBoundingClientRect().height).toBeGreaterThan(50);
+    await expect.poll(() => parseFloat(document.documentElement.style.scrollPaddingTop))
+      .toBeGreaterThanOrEqual(Math.ceil(row.getBoundingClientRect().height) + 12);
+    const afterGrowth = content.getBoundingClientRect().top + window.scrollY;
+    window.scrollTo(0, 0);
+    await expect.poll(() => row.dataset.stuck).toBe("false");
+    expect(Math.abs(content.getBoundingClientRect().top + window.scrollY - afterGrowth)).toBeLessThanOrEqual(1);
+  });
+
   for (const width of [1024, 400]) {
     it(`lets the chips scroll away at ${width}px`, async () => {
       const { row } = await mountAt(width);
@@ -331,12 +347,19 @@ describe("sticky Overview chips (#4370)", () => {
     const { row } = await mountAt(1440);
     window.scrollTo(0, 650);
     await expect.poll(() => row.dataset.stuck).toBe("true");
+    const probe = document.createElement("button");
+    probe.textContent = "Focus clearance probe";
+    probe.style.cssText = `position:absolute;left:320px;top:${window.scrollY + row.getBoundingClientRect().height / 2}px`;
+    const content = row.closest<HTMLElement>("[data-page-content-column]")!;
+    content.firstElementChild!.insertAdjacentElement("afterend", probe);
+    expect(probe.getBoundingClientRect().top).toBeGreaterThan(0);
+    expect(probe.getBoundingClientRect().top).toBeLessThan(row.getBoundingClientRect().bottom);
     const search = screen.getByRole("button", { name: /^Search/ });
     search.focus();
     await userEvent.tab();
-    const focused = document.activeElement as HTMLElement;
-    expect(focused).not.toBe(search);
-    expect(focused.getBoundingClientRect().top).toBeGreaterThanOrEqual(row.getBoundingClientRect().bottom);
+    expect(document.activeElement).toBe(probe);
+    expect(probe.getBoundingClientRect().top).toBeGreaterThanOrEqual(row.getBoundingClientRect().bottom);
+    probe.remove();
   });
 });
 
