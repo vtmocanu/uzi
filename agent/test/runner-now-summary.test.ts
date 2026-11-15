@@ -539,6 +539,7 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
       const probed: { opId: string; target: string }[] = [];
       const appliedOps: string[] = [];
       const holdReasons: string[] = [];
+      const heldOps: string[] = [];
       let ordinaryPause = 0;
       let heldReports = 0;
       let settledReports = 0;
@@ -608,7 +609,7 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
       client.reportState = (async (id, body, ...args) => {
         if (body.status === "credential_switch_uncertain") {
           uncertainReports++; order.push("hold"); holdReasons.push(body.failure_reason!);
-          assert.equal(body.op_id, ledgerFollow ? "latest-op" : successor && outcome !== "successor_cycle_after" ? "successor-op" : "current-op");
+          heldOps.push(body.op_id ?? "<missing>");
           if (outcome === "ack_after" && uncertainReports === 1) throw new Error("lost reply");
           if (outcome === "ack_after" && uncertainReports === 2) return { applied: true, status: "paused" };
           return { applied: true, credentialSwitchUncertain: true };
@@ -775,6 +776,7 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
       assert.equal(apply, outcome === "newop_after" ? 2 : post && !["unproven", "ledger_after"].includes(outcome) ? 1 : 0);
       assert.equal(teardown, post ? 1 : 0);
       assert.equal(uncertainReports, outcome === "ack_after" ? 3 : post && !["unproven", "fenced_after", "successor_fence_after", "successor_noop_after", "newop_after", "successor_teardown_after", "no_op_after", "applied_after", "key_to_sub_after", "applied_key_after", "fresh_after"].includes(outcome) ? 1 : 0);
+      assert.deepEqual(heldOps, Array(uncertainReports).fill(ledgerFollow ? "latest-op" : successor && outcome !== "successor_cycle_after" ? "successor-op" : "current-op"));
       assert.equal(ordinaryPause, outcome === "no_op_after" || outcome === "successor_noop_after" ? 1 : 0);
       assert.equal(heldReports, outcome === "unproven" ? 1 : 0);
       assert.equal(settledReports, outcome === "unproven" ? 1 : 0);
