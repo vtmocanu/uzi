@@ -1762,7 +1762,12 @@ export class RecoveryCoordinator {
         if (over()) { out.truncated = true; break; }
         const generation = Number(name.slice(1, -5));
         let res: TerminalReadResult;
-        try { res = await store.read(runId, generation, { signal: wait() }); } catch { out.truncated = true; stop = true; break; }
+        const rs = wait();
+        // Only a forfeited lock wait ends the pass as truncated; any other failure still reaches the caller's log.
+        try { res = await store.read(runId, generation, { signal: rs }); } catch (error) {
+          if (!rs.aborted) throw error;
+          out.truncated = true; stop = true; break;
+        }
         if (res.kind === "absent") continue;
         if (res.kind === "corrupt") {
           out.corrupt++;

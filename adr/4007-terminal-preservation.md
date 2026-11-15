@@ -406,7 +406,7 @@ its private refs retained. Its journal-lock waits are bounded by the remaining 3
 rediscovery budget and the caller's signal; a waiter that gives up forfeits its turn and
 never acquires later, while a write that already holds the lock completes. The invocation
 ledger admits an `invoked` entry only while room remains for it and its outcome (256
-entries), so a record whose last slot holds a crash-dangling `invoked` stays prepared and
+entries), so a record left at 255 entries by a crash-dangling `invoked` stays prepared and
 is never resent (accepted limit).
 
 #### Callers
