@@ -31191,6 +31191,7 @@ describe("CodexExecutor: replacement B boundary", () => {
         await fs.writeFile(path.join(source, "unapproved.txt"), "not a session");
         await CodexSessionStore.persist(source, store);
         const adoptedHomes: string[] = [];
+        const adoptedDestinations: string[] = [];
         const plan = epochResponder(savedId, "tn-plan", (t, th, tn) =>
           t.push(toolCall(98, "submit_plan", { plan_md: "Plan" }, th, tn, "plan"))
             .push(turnCompleted("completed", th, tn)));
@@ -31207,12 +31208,9 @@ describe("CodexExecutor: replacement B boundary", () => {
             // destination to exercise the production store's allowlist at the launch seam.
             const dest = path.join(dir, `adopted-${adoptedHomes.length}`);
             adoptedHomes.push(home);
+            adoptedDestinations.push(dest);
             await fs.mkdir(dest);
-            const result = await CodexSessionStore.adopt(store, dest);
-            assert.equal(await fs.readFile(path.join(dest, "sessions", `rollout-${savedId}.jsonl`), "utf8"), "{}\n");
-            await assert.rejects(fs.access(path.join(dest, "auth.json")));
-            await assert.rejects(fs.access(path.join(dest, "unapproved.txt")));
-            return result;
+            return CodexSessionStore.adopt(store, dest);
           },
         } };
         const release = rig.client.releaseCodex.bind(rig.client);
@@ -31398,6 +31396,14 @@ describe("CodexExecutor: replacement B boundary", () => {
           await assert.rejects(exec.run(ctx), error => error === stop);
           const constructed = outcome === "invalid-metadata" ? 1 : 2;
           assert.equal(fileops, constructed, "no extra constructed epoch");
+          assert.equal(adoptedDestinations.length, outcome === "post-construction-guard" ? 1 : constructed,
+            "admission loss before B adoption copies only A; other constructed epochs adopt sessions");
+          // Adoption errors are deliberately swallowed by production; assertions must live here.
+          for (const dest of adoptedDestinations) {
+            assert.equal(await fs.readFile(path.join(dest, "sessions", `rollout-${savedId}.jsonl`), "utf8"), "{}\n");
+            await assert.rejects(fs.access(path.join(dest, "auth.json")));
+            await assert.rejects(fs.access(path.join(dest, "unapproved.txt")));
+          }
           assert.ok(effectCleanup.length >= constructed, "constructed epochs own effect roots");
           for (const cleanup of effectCleanup)
             assert.ok(cleanup.disposes > 0, "finally disposes each constructed effect root");
@@ -31914,7 +31920,8 @@ describe("M2 actualRunner credential replacement", () => {
         const result = await reap(ms); events.push("A-reaped"); return result;
       };
       const launch = rig.deps.launchEffectRoot!;
-      let effects = 0, adoptions = 0;
+      let effects = 0;
+      const adoptedDestinations: string[] = [];
       rig.deps = { ...rig.deps,
         wireFileop: () => { const handle = fakeFileopHandle(); fileops.push(handle); return handle.handle; },
         launchEffectRoot: async (...args) => {
@@ -31933,15 +31940,10 @@ describe("M2 actualRunner credential replacement", () => {
           inspectSession: async (_dir, id) => CodexSessionStore.inspectSession(store, id),
           persist: async () => CodexSessionStore.persist(source, store),
           adopt: async () => {
-            const dest = path.join(dir, `adopted-${adoptions++}`);
+            const dest = path.join(dir, `adopted-${adoptedDestinations.length}`);
+            adoptedDestinations.push(dest);
             await fs.mkdir(dest);
-            const result = await CodexSessionStore.adopt(store, dest);
-            if (adoptions > 1) {
-              assert.equal(await fs.readFile(path.join(dest, "sessions", `rollout-${savedId}.jsonl`), "utf8"), "{}\n");
-              await assert.rejects(fs.access(path.join(dest, "auth.json")));
-              await assert.rejects(fs.access(path.join(dest, "unapproved.txt")));
-            }
-            return result;
+            return CodexSessionStore.adopt(store, dest);
           },
         },
       };
@@ -31994,7 +31996,13 @@ describe("M2 actualRunner credential replacement", () => {
         await withTimeout(running, 5000, "M2 B usage and ordinary cancellation");
         assert.equal(applies, 1);
         assert.equal(factories, 1, "no reclaim or second executor");
-        assert.ok(!reports.some(status => /credential_switch_(held|uncertain|hold_settled)/.test(status)));
+        assert.ok(!reports.some(status => status.startsWith("credential_switch")), "no switch hold or release transition");
+        assert.equal(adoptedDestinations.length, 2, "A and B both adopted sessions");
+        for (const dest of adoptedDestinations) {
+          assert.equal(await fs.readFile(path.join(dest, "sessions", `rollout-${savedId}.jsonl`), "utf8"), "{}\n");
+          await assert.rejects(fs.access(path.join(dest, "auth.json")));
+          await assert.rejects(fs.access(path.join(dest, "unapproved.txt")));
+        }
         const feed = api.messages(claim.run_id);
         const bMessage = feed.find(m => String(m.payload.text).startsWith("M2 B output"));
         assert.ok(bMessage, "B output reaches real Runner feed");
@@ -32010,6 +32018,8 @@ describe("M2 actualRunner credential replacement", () => {
         assert.equal(rec(usage[0]!.payload.usage).output_tokens, 100);
         assert.doesNotMatch(JSON.stringify({ feed, diagnostics: diagnostics.lines }), /M2-B-access|M2-B-capability|M2-A-auth-canary/);
         assert.ok(hooks > 0, "real Executor invoked Runner switch hook");
+        for (const method of ["account/login/start", "thread/resume", "turn/start"])
+          assert.ok(events.includes(method), `B sent ${method}`);
         assert.ok(events.indexOf("account/login/start") < events.indexOf("thread/resume"));
         assert.ok(events.indexOf("thread/resume") < events.indexOf("turn/start"));
         assert.equal(b.transport.threadStartCount, 0);
