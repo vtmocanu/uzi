@@ -5855,7 +5855,7 @@ export class GitCache {
       return { kind: "unknown", detail: `${ref} is not a safe ref path` };
     }
     try {
-      // Nit: this lstat does not observe the report-proof signal or window; the lane's post-lookup window check covers it.
+      // This lstat does not observe the report-proof signal or window; the lane's post-lookup window check covers it.
       const st = await fs.lstat(path.join(barePath, ref));
       if (st.isFile()) return { kind: "regular" };
       // A directory holding entries is a namespace (refs/heads/main/x), which can never be this ref; an empty one is
@@ -5873,8 +5873,10 @@ export class GitCache {
       try {
         const st = await fs.lstat(path.join(barePath, anc));
         if (st.isDirectory()) continue;
-        // The reftable layout keeps a stub regular file at refs/heads; nothing else non-directory is acceptable.
-        if (st.isFile() && anc === "refs/heads") return { kind: "none" };
+        // The reftable layout keeps a stub regular file at refs/heads; it is accepted only in a repository that actually
+        // stores its refs in a reftable/ directory. Nothing else non-directory is acceptable.
+        if (st.isFile() && anc === "refs/heads" &&
+            (await fs.lstat(path.join(barePath, "reftable")).then(r => r.isDirectory(), () => false))) return { kind: "none" };
         return { kind: "unknown", detail: `ancestor ${anc} of ${ref} is not a directory` };
       } catch (err) {
         const code = (err as { code?: unknown }).code;

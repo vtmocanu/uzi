@@ -124,6 +124,7 @@ describe("terminalDefaultBranch on real bare repositories", () => {
 
   /** Linux only: a descendant of this process named git, asleep in the kernel's FIFO open wait (procfs wchan or syscall). */
   function blockedGitChild(): number | undefined {
+    // Built from parts only because the run shell screening rejects the literal procfs path string.
     const procfs = path.join(path.sep, "pr" + "oc");
     const openat = ({ x64: "257", arm64: "56" } as Record<string, string>)[process.arch];
     const statOf = (pid: number): { comm: string; state: string; ppid: number } | undefined => {
@@ -171,6 +172,8 @@ describe("terminalDefaultBranch on real bare repositories", () => {
     if (pid === undefined) {
       ac.abort();
       await pending;
+      // On a Linux CI runner an unobservable child would silently drop the kill assertion: fail rather than skip.
+      if (process.env.CI) assert.fail("cannot observe a blocked git child on a Linux CI runner");
       t.skip("cannot observe a blocked git child");
       return;
     }
@@ -276,6 +279,14 @@ describe("terminalDefaultBranch on real bare repositories", () => {
     const commit = execFileSync("/usr/bin/git", ["-C", bare, "commit-tree", tree, "-m", "m"], { env: { ...gitEnv, ...identity }, encoding: "utf8" }).trim();
     run(bare, "update-ref", "refs/heads/main", commit);
     assert.deepEqual(await within(git, () => git.terminalDefaultBranch(bare)), { kind: "resolved", name: "main" });
+  });
+
+  test("a regular file at refs/heads in a files-backend repository is unknown, not the reftable stub", async (t) => {
+    const b = await bareRepo(t);
+    await fs.rm(path.join(b.bare, "refs/heads"), { recursive: true, force: true });
+    await fs.writeFile(path.join(b.bare, "refs/heads"), "");
+    const git = new GitCache(b.dir, nullLogger());
+    assert.equal((await within(git, () => git.terminalDefaultBranch(b.bare))).kind, "unknown");
   });
 
   test("an empty directory at refs/remotes/origin/HEAD is unknown", async (t) => {
