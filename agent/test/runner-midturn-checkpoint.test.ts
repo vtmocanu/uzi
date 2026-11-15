@@ -6170,6 +6170,8 @@ describe("issue #4313 real SdkExecutor + RunRunner: a stop during the stalled do
   const isEntry = (s: GateStop): boolean => s === "entry-cancel" || s === "entry-shutdown";
 
   interface GateObservation {
+    /** What RunRunner.execute() settled with: undefined on normal resolution, else the rejection. */
+    executeOutcome: unknown;
     elapsedMs: number;
     gateError: unknown;
     gateSettledWhileChildAlive: boolean;
@@ -6315,7 +6317,7 @@ describe("issue #4313 real SdkExecutor + RunRunner: a stop during the stalled do
       else if (o.stop === "cancel") api.setInputs(claim.run_id, [{ id: 1, kind: "cancel" }]);
       else if (o.stop === "shutdown") runner.shutdown();
       else (flight!.steering as { requestDiskStop: () => void }).requestDiskStop();
-      await bounded(settled, 20_000, "execute() settling after the stop", "run");
+      const executeOutcome = await bounded(settled, 20_000, "execute() settling after the stop", "run");
       if (turnErrors.length > 0) throw turnErrors.splice(0)[0];
       const f = flight as {
         secretRemediation?: Record<string, unknown>;
@@ -6323,6 +6325,7 @@ describe("issue #4313 real SdkExecutor + RunRunner: a stop during the stalled do
         sinkGate: { isHeld(): boolean };
       };
       return {
+        executeOutcome,
         elapsedMs: gateSettledAt - t0,
         gateError,
         gateSettledWhileChildAlive,
@@ -6350,8 +6353,13 @@ describe("issue #4313 real SdkExecutor + RunRunner: a stop during the stalled do
   }
 
   const REMEDIATION_PROMPT = /not published yet|rewrite the commit|history rewrite/i;
+  // Cancel and worker shutdown both end the executor with REASON_CANCELLED ("run cancelled").
+  const assertThrewCancelled = (thrown: unknown[], label: string): void => {
+    assert.ok(thrown.some((e) => e instanceof Error && e.message === "run cancelled"), `${label}: the executor threw run cancelled (${thrown.map(String).join("; ")})`);
+  };
   const assertQuietStop = async (obs: GateObservation, label: string): Promise<void> => {
     const { SecretRemediationStoppedError } = await import("../src/executor.js");
+    assert.equal(obs.executeOutcome, undefined, `${label}: execute() resolved normally (got ${String(obs.executeOutcome)})`);
     assert.ok(obs.gateError instanceof SecretRemediationStoppedError, `${label}: the gate threw SecretRemediationStoppedError, not a decision (${String(obs.gateError)})`);
     assert.ok(obs.elapsedMs < 15_000, `${label}: the gate ended ${obs.elapsedMs}ms after the stop`);
     assert.equal(obs.gateSettledWhileChildAlive, false, `${label}: the stalled child was gone before the gate settled`);
@@ -6378,6 +6386,7 @@ describe("issue #4313 real SdkExecutor + RunRunner: a stop during the stalled do
           const obs = await stalledGate({ iid: iidOf(kind, stage, stop), kind, stage, stop });
           await assertQuietStop(obs, `${kind}/${stage}/${stop}`);
           assert.equal(obs.turns, kind === "done" ? 2 : 0, "no provider turn was dispatched after the stalled gate");
+          assertThrewCancelled(obs.thrown, `${kind}/${stage}/${stop}`);
           if (stop === "cancel") {
             assert.equal(obs.end?.status, "failed");
             assert.equal(obs.end?.failure_reason, "run cancelled", "the executor's cancel route");
@@ -6396,6 +6405,7 @@ describe("issue #4313 real SdkExecutor + RunRunner: a stop during the stalled do
       it(`${kind} gate: ${stop} with a seeded blocked set: throws the stop, keeps blocked and the trigger, takes the control's route`, { timeout: 90_000 }, async () => {
         const obs = await stalledGate({ iid: iidOf(kind, "range", stop), kind, stage: "range", stop });
         const { SecretRemediationStoppedError } = await import("../src/executor.js");
+        assert.equal(obs.executeOutcome, undefined, `${kind}/${stop}: execute() resolved normally (got ${String(obs.executeOutcome)})`);
         assert.ok(obs.gateError instanceof SecretRemediationStoppedError, `the gate threw SecretRemediationStoppedError (${String(obs.gateError)})`);
         assert.ok(obs.seeded, "the state was seeded");
         assert.deepEqual(obs.state?.blocked, obs.seeded.blocked, "the blocked set was kept");
@@ -6406,8 +6416,9 @@ describe("issue #4313 real SdkExecutor + RunRunner: a stop during the stalled do
         if (stop === "entry-cancel") {
           assert.equal(obs.end?.status, "failed");
           assert.equal(obs.end?.failure_reason, "run cancelled", "the executor's cancel route");
-          assert.ok(obs.thrown.some((e) => e instanceof Error && e.message === "run cancelled"), `the executor threw run cancelled (${obs.thrown.map(String).join("; ")})`);
+          assertThrewCancelled(obs.thrown, `${kind}/${stop}`);
         } else {
+          assertThrewCancelled(obs.thrown, `${kind}/${stop}`);
           assert.equal(obs.final, undefined, "a worker shutdown leaves the run non-terminal for recovery");
           assert.notEqual(obs.end?.status, "failed", "no failed end state");
         }
@@ -6418,6 +6429,8 @@ describe("issue #4313 real SdkExecutor + RunRunner: a stop during the stalled do
   it("done gate: a trusted scan result, then a shutdown before any state write, still holds the unscanned shutdown-capture publish", { timeout: 90_000 }, async () => {
     const obs = await stalledGate({ iid: 4313_300, kind: "done", stage: "range", stop: "after-scan-shutdown" });
     const { SecretRemediationStoppedError } = await import("../src/executor.js");
+    assertThrewCancelled(obs.thrown, "after-scan-shutdown");
+    assert.equal(obs.executeOutcome, undefined, `execute() resolved normally (got ${String(obs.executeOutcome)})`);
     assert.ok(obs.gateError instanceof SecretRemediationStoppedError, String(obs.gateError));
     const state = obs.state as { attempts: number; flaggedCommits?: string[]; known?: unknown; blocked?: unknown; cleanTip?: unknown; everKnown?: unknown; withholdPaths?: unknown };
     // The trusted finding was held before the stop was thrown: negative knowledge only.
@@ -6500,6 +6513,8 @@ describe("issue #4313 real SdkExecutor + RunRunner: a pending wait for authority
   }
 
   interface LockObservation {
+    /** What RunRunner.execute() settled with: undefined on normal resolution, else the rejection. */
+    executeOutcome: unknown;
     gateError: unknown;
     decision: { action: string } | undefined;
     pendingAfterControl: boolean;
@@ -6670,11 +6685,11 @@ describe("issue #4313 real SdkExecutor + RunRunner: a pending wait for authority
         await bounded(waitFor(() => gateSettledAt > 0, 15_000), 16_000, "the gate to end after the stop", "gate");
         auth.disarm();
       }
-      await bounded(settled, 30_000, "execute() settling", "run");
+      const executeOutcome = await bounded(settled, 30_000, "execute() settling", "run");
       if (turnErrors.length > 0) throw turnErrors.splice(0)[0];
       const f = flight as { secretRemediation?: { attempts: unknown } };
       return {
-        gateError, decision, pendingAfterControl, elapsedMs: gateSettledAt - t0,
+        executeOutcome, gateError, decision, pendingAfterControl, elapsedMs: gateSettledAt - t0,
         attempts: f.secretRemediation?.attempts, thrown,
         states: api.states.filter((x) => x.runId === claim.run_id).map((x) => x.body as unknown as Record<string, unknown>),
         final: finalStatus(claim.run_id), flight: flight!,
@@ -6697,6 +6712,7 @@ describe("issue #4313 real SdkExecutor + RunRunner: a pending wait for authority
       it(`done gate, ${site} wait, ${control === "none" ? "no control (baseline)" : control}: waits for A and decides ${expected}${control === "none" ? "" : " like the baseline, not stopped"}`, { timeout: 120_000 }, async () => {
         const { SecretRemediationStoppedError } = await import("../src/executor.js");
         const obs = await lockedGate({ iid: iidOf("done", site, control), kind: "done", site, control });
+        assert.equal(obs.executeOutcome, undefined, `execute() resolved normally (got ${String(obs.executeOutcome)})`);
         assert.ok(!(obs.gateError instanceof SecretRemediationStoppedError), `not stopped (${String(obs.gateError)})`);
         assert.equal(obs.pendingAfterControl, true, "the gate was still waiting for A after the control arrived");
         assert.equal(obs.decision?.action, expected, `decision (${String(obs.gateError)})`);
@@ -6710,6 +6726,8 @@ describe("issue #4313 real SdkExecutor + RunRunner: a pending wait for authority
       it(`done gate, ${site} wait: ${control} aborts the pending acquisition promptly (SecretRemediationStoppedError)`, { timeout: 120_000 }, async () => {
         const { SecretRemediationStoppedError } = await import("../src/executor.js");
         const obs = await lockedGate({ iid: iidOf("done", site, control), kind: "done", site, control });
+        assert.equal(obs.executeOutcome, undefined, `execute() resolved normally (got ${String(obs.executeOutcome)})`);
+        assert.ok(obs.thrown.some((e) => e instanceof Error && e.message === "run cancelled"), `the executor threw run cancelled (${obs.thrown.map(String).join("; ")})`);
         assert.ok(obs.gateError instanceof SecretRemediationStoppedError, `stopped (${String(obs.gateError)})`);
         assert.ok(obs.elapsedMs < 15_000, `the gate ended ${obs.elapsedMs}ms after the ${control}`);
         assert.equal(obs.attempts, 0, "no attempt was spent");
@@ -6722,6 +6740,8 @@ describe("issue #4313 real SdkExecutor + RunRunner: a pending wait for authority
   it("attempt-path rig: a trusted scan result, then a shutdown before any state write, keeps the latch and withholds the shutdown-capture publish", { timeout: 120_000 }, async () => {
     const { SecretRemediationStoppedError } = await import("../src/executor.js");
     const obs = await lockedGate({ iid: iidOf("done", "persist", "scan-shutdown"), kind: "done", site: "persist", control: "scan-shutdown" });
+    assert.equal(obs.executeOutcome, undefined, `execute() resolved normally (got ${String(obs.executeOutcome)})`);
+    assert.ok(obs.thrown.some((e) => e instanceof Error && e.message === "run cancelled"), `the executor threw run cancelled (${obs.thrown.map(String).join("; ")})`);
     assert.ok(obs.gateError instanceof SecretRemediationStoppedError, String(obs.gateError));
     const f = obs.flight as {
       remediationRestrictions?: { pending?: { requiredOIDs: string[] } };
@@ -6740,6 +6760,7 @@ describe("issue #4313 real SdkExecutor + RunRunner: a pending wait for authority
   it("resume preflight, fetch-back wait, pause-now: waits for A and proceeds, not stopped", { timeout: 120_000 }, async () => {
     const { SecretRemediationStoppedError } = await import("../src/executor.js");
     const obs = await lockedGate({ iid: iidOf("resume", "fetch", "pause"), kind: "resume", site: "fetch", control: "pause" });
+    assert.equal(obs.executeOutcome, undefined, `execute() resolved normally (got ${String(obs.executeOutcome)})`);
     assert.ok(!(obs.gateError instanceof SecretRemediationStoppedError), String(obs.gateError));
     assert.equal(obs.pendingAfterControl, true, "the preflight was still waiting for A after the control arrived");
     assert.equal(obs.decision?.action, "proceed", "the decision is the no-pause one (a clean fetch-back proceeds)");
