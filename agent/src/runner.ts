@@ -16963,10 +16963,10 @@ export class RunRunner {
         const nonce = codexSwitchRegistrationNonce;
         const generation = claim.claim_generation;
         // One monotonic budget includes drains, persistence and every preflight successor.
-        const deadline = performance.now() + 10_000;
-        const timeout = new AbortController();
-        const timer = setTimeout(() => timeout.abort(), 10_000);
-        const signal = AbortSignal.any([timeout.signal, steering.terminalLifecycleSignal(), this.shutdownSignal.signal]);
+        let deadline = performance.now() + 10_000;
+        let timeout = new AbortController();
+        let timer = setTimeout(() => timeout.abort(), 10_000);
+        let signal = AbortSignal.any([timeout.signal, steering.terminalLifecycleSignal(), this.shutdownSignal.signal]);
         const guard = (): void => {
           if (steering.cancelCommittedUnderWithheldSwitch() || steering.isCancelled()) throw new Error("run cancelled");
           this.retainedTerminalGuard(flight);
@@ -16977,7 +16977,7 @@ export class RunRunner {
               flight.claimGeneration !== generation) throw new StaleClaimError();
           if (signal.aborted || performance.now() >= deadline) retain();
         };
-        const bounds = { signal, deadline, guard };
+        const bounds = { get signal() { return signal; }, get deadline() { return deadline; }, guard };
         const remaining = () => Math.max(0, Math.floor(deadline - performance.now()));
         const effect = async <T,>(fn: () => Promise<T>): Promise<T> => {
           guard();
@@ -16991,7 +16991,7 @@ export class RunRunner {
         };
         let revision = 0;
         let lastOp: string | undefined;
-        const reconcile = async (): Promise<CodexSwitchAuthority> => {
+        const reconcile = async (afterTeardown = false): Promise<CodexSwitchAuthority> => {
           const own = await effect(() => this.getObservedRunOwnership(flight,
             { signal, deadline: Date.now() + remaining() }));
           if (own.cancellation_requested) { this.observeCancellation(flight); guard(); }
@@ -17004,8 +17004,8 @@ export class RunRunner {
             if (p.generation !== generation || !p.op_id || !p.target_secret_id) retain();
             if (lastOp !== p.op_id) { revision++; lastOp = p.op_id; }
             // Recheck each successor too: a crash-left sending/apply record cannot be cleared.
-            if (!this.credentialSwitchLedger ||
-                await effect(() => this.credentialSwitchLedger!.stateOf(runId, p.op_id!))) retain();
+            if (!this.credentialSwitchLedger || (!afterTeardown &&
+                await effect(() => this.credentialSwitchLedger!.stateOf(runId, p.op_id!)))) retain();
             pending = { claimGeneration: p.generation, registerNonce: nonce!, opId: p.op_id!,
               targetSecretId: p.target_secret_id!, revision };
           }
@@ -17067,7 +17067,7 @@ export class RunRunner {
               retain();
             }
             const decision = await coordinateCodexSwitchPreflight({
-              initial: operation, signal, now: () => performance.now(), reconcile,
+              initial: operation, signal, now: () => performance.now(), reconcile: () => reconcile(),
               probe: op => effect(() => this.client.preflightCodexCredentialSwitch(runId, { ...op, oldCumulative }, signal)),
               confirmFailedClear: confirmClear,
               delay: ms => effect(() => new Promise<void>((resolve, reject) => {
@@ -17080,9 +17080,112 @@ export class RunRunner {
             guard();
             if (decision.kind === "continued_A") return await reopen(decision.operation, decision.reason);
             if (decision.kind === "fenced") throw new StaleClaimError();
-            // Temporary integration gate: READY retains A closed. Replace with the full
-            // coordinator adapter before apply, teardown or any B model turn.
-            return retain();
+            if (decision.kind !== "ready") return retain();
+            const selected = decision.operation;
+            const current = await reconcile();
+            if (!current.owned) throw new StaleClaimError();
+            if (current.pending?.opId !== selected.opId || current.registerNonce !== nonce ||
+                current.pending.targetSecretId !== selected.targetSecretId) return retain();
+            // Only a confirmed pass starts the separate cleanup/apply/hold budget.
+            // The same sink gate and terminal claim nonce remain held.
+            clearTimeout(timer);
+            deadline = performance.now() + this.codexBoundaryDeadlineMs;
+            timeout = new AbortController();
+            signal = AbortSignal.any([timeout.signal, steering.terminalLifecycleSignal(), this.shutdownSignal.signal]);
+            timer = setTimeout(() => timeout.abort(), this.codexBoundaryDeadlineMs);
+            let possibleApply = false;
+            const ownerHold = async (opId: string, reason: string): Promise<never> => {
+              if (possibleApply) this.releaseHoldPastPossibleApply(hold, flight, runLog);
+              else hold.cancel(); // Reporting only: A is never reopened after teardown.
+              // Identical reports retry serially within the cleanup deadline. No status-only proof.
+              for (let attempt = 0; ; attempt++) {
+                guard();
+                if (attempt) await effect(() => this.waitRecoveryRetry(flight, true,
+                  this.inPlaceReportBackoffMs(attempt), signal));
+                try {
+                  const ack = await effect(() => this.client.reportState(runId, {
+                    status: "credential_switch_uncertain", claim_generation: generation,
+                    op_id: opId, failure_reason: reason,
+                  }, signal));
+                  if (ack.credentialSwitchUncertain === true) {
+                    flight.parked = true;
+                    batcher.emit({ kind: "credential_switch_uncertain", agent: "worker",
+                      payload: { op_id: opId, generation, reason, text: reason === "not_applied_after_teardown"
+                        ? "Credential switch was not applied; the previous process is stopped. Owner action required."
+                        : "Credential switch outcome requires owner action; model execution remains stopped." } });
+                    return retain();
+                  }
+                  if (ack.applied === false) return retain();
+                } catch (error) {
+                  guard();
+                  if (error instanceof StaleClaimError || isCheckedLifecycleControl(error)) throw error;
+                  if (!this.inPlaceReportRetryable(error)) return retain();
+                }
+              }
+            };
+            const pauseCurrent = async (reason: string): Promise<never> => {
+              const latest = await reconcile(true);
+              if (!latest.owned) throw new StaleClaimError();
+              if (latest.pending) return await ownerHold(latest.pending.opId, reason);
+              if (possibleApply) this.releaseHoldPastPossibleApply(hold, flight, runLog);
+              else hold.cancel();
+              const ack = await effect(() => this.client.requestWorkerPause(runId, selected.claimGeneration, signal));
+              if (ack.applied === true) {
+                const own = await effect(() => this.getObservedRunOwnership(flight,
+                  { signal, deadline: Date.now() + remaining() }));
+                if (own.status === "paused" && own.claim_generation === generation &&
+                    own.claim_released === false && own.hold_reason == null) flight.parked = true;
+              }
+              return retain();
+            };
+            let reaped = false;
+            try { reaped = await effect(() => a.teardown(bounds)); } catch { guard(); }
+            if (!reaped) {
+              flight.retainedSwitchSettlement = "unproven";
+              hold.cancel();
+              await effect(() => this.holdRetainedSwitch(flight, runLog, signal, guard,
+                "codex_teardown_unproven", "unverified", { opId: selected.opId }));
+              return retain();
+            }
+            guard();
+            // Required Now/executor users drained before preflight, and teardown proved the root gone.
+            // Preflight refusal must never close this scope.
+            flight.operationScope?.close();
+            const beforeApply = await reconcile(true);
+            if (!beforeApply.owned) throw new StaleClaimError();
+            if (!beforeApply.routeAvailable || !beforeApply.ledgerAvailable)
+              return await ownerHold(selected.opId, "not_applied_after_teardown");
+            if (beforeApply.pending?.opId !== selected.opId ||
+                beforeApply.pending.targetSecretId !== selected.targetSecretId)
+              return await pauseCurrent("not_applied_after_teardown");
+            possibleApply = true;
+            let result: LedgerApplyResult;
+            try {
+              result = await effect(() => applyThroughLedger({
+                applyCredentialSwitch: (id, request) => {
+                  guard();
+                  return this.client.applyCredentialSwitch(id, request, signal);
+                },
+              }, this.credentialSwitchLedger!, runId, {
+                claimGeneration: selected.claimGeneration, registerNonce: nonce, opId: selected.opId, oldCumulative,
+              }));
+            } catch (error) {
+              guard();
+              if (error instanceof StaleClaimError || isCheckedLifecycleControl(error)) throw error;
+              return await ownerHold(selected.opId, "apply_uncertain");
+            }
+            if (result.kind === "fenced") throw new StaleClaimError();
+            if (result.kind === "superseded") {
+              // Supersession is checked after committed-op replay, so it proves no apply.
+              possibleApply = false;
+              return await pauseCurrent("not_applied_after_teardown");
+            }
+            const clean = !("priorAmbiguous" in result && result.priorAmbiguous) &&
+              ["not_applied", "route_absent", "ledger_unavailable"].includes(result.kind);
+            if (clean) possibleApply = false;
+            // Temporary partial-unit gate: even valid codex_applied requires owner pause.
+            // Full B publication and initialization remain required before any B authentication.
+            return await ownerHold(selected.opId, clean ? "not_applied_after_teardown" : "apply_uncertain");
           }, { stop: { signal }, deadlineAt: Date.now() + remaining() });
         } catch (error) {
           flight.preserveRecoveryClone = true;

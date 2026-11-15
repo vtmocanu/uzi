@@ -246,7 +246,7 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
     forge_pat: "fixture-forge-pat-000000",
     // Carries an Anthropic token too, so ONLY the Codex term of the claim gate decides.
     anthropic_oauth_token: "oauth-fixture-token",
-    codex: { auth_mode: "subscription", access_token: "claim-key", capability: "cap", generation: 3, chatgpt_account_id: "verified-account", chatgpt_plan_type: null },
+    codex: { auth_mode: "subscription" as const, access_token: "claim-key", capability: "cap", generation: 3, chatgpt_account_id: "verified-account", chatgpt_plan_type: null },
   };
 
   for (const stop of ["deadline", "lifecycle", "cancel"] as const) {
@@ -310,10 +310,19 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
 
   }
 
-  for (const outcome of ["policy_refusal", "baseline_missing", "failed_clear", "ready", "missing_negotiation", "persist_failed", "persist_threw", "released_after_clear"] as const) {
+  for (const outcome of ["policy_refusal", "baseline_missing", "failed_clear", "ready", "missing_negotiation", "persist_failed", "persist_threw", "released_after_clear", "unproven", "busy_after", "vault_after", "route_after", "refused_after", "lost_after", "fenced_after", "superseded_after", "applied_after", "ledger_after", "ack_after", "budget_after", "newop_after", "no_op_after"] as const) {
     it(`M2 firsthalf Codex Runner ${outcome}`, async (t) => {
       const claim = claimFor(2630, { secrets: CODEX_SECRETS, claim_generation: 1 });
       let pending = false;
+      let pendingId = "current-op";
+      let ordinaryPause = 0;
+      let heldReports = 0;
+      let settledReports = 0;
+      const order: string[] = [];
+      const post = outcome === "ready" || outcome.endsWith("_after") || outcome === "unproven";
+      let uncertainReports = 0;
+      let elapsed = 0;
+      let cleanupBudget = 0;
       let reopened = 0;
       let suspended = 0;
       let preflights = 0;
@@ -322,22 +331,59 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
       let continued = false;
       let probeBudget: number | undefined;
       let drainBound = false;
+      const feature = client.hasFeature.bind(client);
+      client.hasFeature = name => name === "credential_switch_hold" || feature(name);
       client.registrationNonce = () => "original-nonce";
       client.supportsInPlaceCodexCredentialSwitch = () => outcome !== "missing_negotiation";
       client.getRunOwnership = async () => ({ status: "running", claim_generation: 1,
         claim_released: outcome === "released_after_clear" && !pending, hold_reason: null });
       client.getInputs = async () => ({ inputs: [], ...(pending ? { credentialSwitch: {
-        generation: 1, op_id: "current-op", target_secret_id: "target",
+        generation: 1, op_id: pendingId, target_secret_id: "target",
       } } : {}) });
+      client.requestWorkerPause = async () => { ordinaryPause++; return { applied: false }; };
       client.preflightCodexCredentialSwitch = async () => {
-        preflights++;
+        preflights++; order.push("preflight");
+        if (outcome === "budget_after") elapsed = 9000;
         const coords = { claimGeneration: 1, registerNonce: "original-nonce", opId: "current-op" };
-        return outcome === "ready" ? { kind: "ready", ...coords } :
+        return post ? { kind: "ready", ...coords } :
           { kind: "not_applied", reason: outcome === "baseline_missing" ? outcome : "policy_refusal", ...coords };
       };
-      client.applyCredentialSwitch = async () => { apply++; throw new Error("apply forbidden"); };
+      client.applyCredentialSwitch = async (_id, req, signal) => {
+        apply++; order.push("apply");
+        assert.equal(req.opId, "current-op");
+        assert.equal(req.registerNonce, "original-nonce");
+        assert.equal(req.claimGeneration, 1);
+        assert.ok(signal && !signal.aborted);
+        if (outcome === "lost_after") return { kind: "uncertain", detail: "response_lost" };
+        if (outcome === "route_after") return { kind: "route_absent" };
+        if (outcome === "fenced_after") return { kind: "fenced" };
+        if (outcome === "newop_after") { pendingId = "successor-op"; return { kind: "superseded" }; }
+        if (outcome === "no_op_after") { pending = false; return { kind: "superseded" }; }
+        if (outcome === "superseded_after") return { kind: "superseded" };
+        if (outcome === "refused_after") return { kind: "refused_committed", reason: "committed" };
+        if (outcome === "applied_after") return { kind: "codex_applied", codex: CODEX_SECRETS.codex!,
+          ordinal: 1, capabilityEpoch: 2, messageSeq: 7, replay: false };
+        return { kind: "not_applied", reason: outcome === "busy_after" ? "busy" : "vault_locked" };
+      };
       const report = client.reportState.bind(client);
       client.reportState = (async (id, body, ...args) => {
+        if (body.status === "credential_switch_uncertain") {
+          uncertainReports++; order.push("hold");
+          assert.equal(body.op_id, outcome === "newop_after" ? "successor-op" : "current-op");
+          if (outcome === "ack_after" && uncertainReports === 1) throw new Error("lost reply");
+          if (outcome === "ack_after" && uncertainReports === 2) return { applied: true, status: "paused" };
+          return { applied: true, credentialSwitchUncertain: true };
+        }
+        if (body.status === "credential_switch_held") {
+          heldReports++; order.push("held");
+          assert.equal(body.op_id, "current-op");
+          return { applied: true, credentialSwitchHeld: true };
+        }
+        if (body.status === "credential_switch_hold_settled") {
+          settledReports++;
+          assert.ok(order.includes("join"));
+          return { applied: true };
+        }
         if (body.status === "credential_switch_failed") {
           assert.equal(body.op_id, "current-op");
           if (outcome === "failed_clear") return { applied: false };
@@ -348,16 +394,27 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
       }) as typeof client.reportState;
       let worktree = "";
       const executor: Executor = {
+        joinOwnedOperations: async () => { order.push("join"); },
         suspendCodexEpoch: async () => {
           suspended++;
           return {
             reconcileA: async (_bounds, remainingMs) => { probeBudget = remainingMs; return { kind: "ready" }; },
             persistRollout: async () => {
+              order.push("persist");
               if (outcome === "persist_threw") throw new Error("save failed");
               return outcome === "persist_failed" ? { kind: "failed" } : { kind: "usable", sessionId: "saved-A" };
             },
             reopenA: async () => { reopened++; },
-            teardown: async () => { teardown++; return true; },
+            teardown: async bounds => {
+              teardown++; order.push("reap");
+              if (outcome === "budget_after") {
+                cleanupBudget = bounds.deadline - performance.now();
+                elapsed = 11000; // Past the original admission deadline, without sleeping.
+                bounds.guard();
+                assert.equal(bounds.signal.aborted, false);
+              }
+              return outcome !== "unproven";
+            },
             publishB: async () => { throw new Error("B forbidden"); },
             restartAndResume: async () => { throw new Error("B forbidden"); },
             startFreshLineage: async () => { throw new Error("B forbidden"); },
@@ -369,13 +426,13 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
           fs.writeFileSync(path.join(worktree, "retained.txt"), "A work");
           pending = true;
           // Simulate six seconds spent draining under the gate, without waiting in real time.
-          let elapsed = 0;
-          const clock = outcome === "policy_refusal" ? t.mock.method(performance, "now", () => elapsed) : undefined;
+          elapsed = 0;
+          const clock = outcome === "policy_refusal" || outcome === "budget_after" ? t.mock.method(performance, "now", () => elapsed) : undefined;
           const internal = runner as unknown as {
             awaitTickSurvivorsGone(flight: unknown, deadlineAt?: number): Promise<"gone">;
           };
           const drain = internal.awaitTickSurvivorsGone.bind(runner);
-          if (clock) internal.awaitTickSurvivorsGone = async (_flight, deadlineAt) => {
+          if (outcome === "policy_refusal") internal.awaitTickSurvivorsGone = async (_flight, deadlineAt) => {
             drainBound = deadlineAt !== undefined && deadlineAt <= Date.now() + 10_000;
             elapsed = 6000;
             return "gone";
@@ -393,8 +450,11 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
         },
       };
       const runner = runnerFor(executor);
+      (runner as unknown as { waitRecoveryRetry: () => Promise<void> }).waitRecoveryRetry = async () => {};
       (runner as unknown as { credentialSwitchLedger: unknown }).credentialSwitchLedger = {
         stateOf: async () => undefined,
+        markSending: async () => { order.push("ledger"); if (outcome === "ledger_after") throw new Error("ledger unavailable"); return { wasAmbiguous: false }; },
+        record: async () => "settled",
       };
       await runner.execute(claim);
       const refusal = outcome === "policy_refusal" || outcome === "baseline_missing" || outcome === "persist_failed" || outcome === "persist_threw";
@@ -412,8 +472,14 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
       assert.equal(reopened, refusal ? 1 : 0);
       assert.equal(suspended, outcome === "missing_negotiation" ? 0 : 1);
       assert.equal(preflights, ["missing_negotiation", "persist_failed", "persist_threw"].includes(outcome) ? 0 : 1);
-      assert.equal(apply, 0);
-      assert.equal(teardown, 0);
+      assert.equal(apply, post && !["unproven", "ledger_after"].includes(outcome) ? 1 : 0);
+      assert.equal(teardown, post ? 1 : 0);
+      assert.equal(uncertainReports, outcome === "ack_after" ? 3 : post && !["unproven", "fenced_after", "no_op_after"].includes(outcome) ? 1 : 0);
+      assert.equal(ordinaryPause, outcome === "no_op_after" ? 1 : 0);
+      assert.equal(heldReports, outcome === "unproven" ? 1 : 0);
+      assert.equal(settledReports, outcome === "unproven" ? 1 : 0);
+      if (outcome === "budget_after") assert.equal(cleanupBudget, 30_000);
+      if (apply) assert.deepEqual(order.slice(0, 5), ["persist", "preflight", "reap", "ledger", "apply"]);
       assert.equal(fs.readFileSync(path.join(worktree, "retained.txt"), "utf8"), "A work");
       assert.ok(!api.states.some(s => s.runId === claim.run_id && s.body.status === "credential_switch"));
     });
