@@ -1,11 +1,39 @@
-import { useState, type FormEvent } from "react";
+import { useId, useState, type FormEvent } from "react";
 import { api, type AppSettings, type SettingsResponse } from "../../lib/api";
 import { errorMessage } from "../../lib/apiError";
-import { Alert, Button, Card, SectionTitle } from "../../components/ui";
+import { Alert, Button, Card, Field, Input, SectionTitle } from "../../components/ui";
 
-// WorkerHibernationCard is the admin surface for the worker hibernation instance switch
-// (PRD #4205). A single-bool card that saves independently of the label form, mirroring
-// EphemeralWorkersCard. The key round-trips through /admin/settings.
+const DEFAULT_IDLE_AFTER = "336h";
+
+// durationHours reads the Go-duration subset the admin is likely to type (h/m/s
+// components, decimals allowed) into hours, or null when it does not parse. It only
+// drives the plain-language readout beside the threshold; the server stays the
+// validator, so an unparsed value is still sent and its 400 is shown.
+function durationHours(v: string): number | null {
+  if (!/^(?:(?:\d+(?:\.\d*)?|\.\d+)[hms])+$/.test(v)) return null;
+  let seconds = 0;
+  for (const m of v.matchAll(/(\d+(?:\.\d*)?|\.\d+)([hms])/g)) {
+    seconds += Number(m[1]) * (m[2] === "h" ? 3600 : m[2] === "m" ? 60 : 1);
+  }
+  return seconds / 3600;
+}
+
+function readout(v: string): string {
+  const h = durationHours(v);
+  if (h === null || h <= 0) return "";
+  if (h >= 24 && Number.isInteger(h / 24)) {
+    const d = h / 24;
+    return `${d} ${d === 1 ? "day" : "days"} without run activity`;
+  }
+  const rounded = Math.round(h * 10) / 10;
+  return `${rounded} ${rounded === 1 ? "hour" : "hours"} without run activity`;
+}
+
+// WorkerHibernationCard is the admin surface for worker hibernation: the instance
+// switch (PRD #4205) plus automatic hibernation of idle workers and its idle threshold
+// (PRD #4207). One card, one Save: the three keys go in a single updateSettings call so
+// the automatic policy can never be stored half-edited. All round-trip through
+// /admin/settings.
 export function WorkerHibernationCard({
   settings,
   onSaved,
@@ -13,13 +41,23 @@ export function WorkerHibernationCard({
   settings: AppSettings;
   onSaved: (resp: SettingsResponse) => void;
 }) {
-  const current = settings.worker_hibernation_enabled ?? "false";
-  const [enabled, setEnabled] = useState(current === "true");
+  const currentEnabled = settings.worker_hibernation_enabled ?? "false";
+  const currentAuto = settings.worker_hibernation_auto ?? "false";
+  const currentIdle = settings.worker_hibernation_idle_after ?? DEFAULT_IDLE_AFTER;
+  const [enabled, setEnabled] = useState(currentEnabled === "true");
+  const [auto, setAuto] = useState(currentAuto === "true");
+  const [idleAfter, setIdleAfter] = useState(currentIdle);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const idleId = useId();
+  const idleHintId = useId();
+  const autoHintId = useId();
 
-  const dirty = (enabled ? "true" : "false") !== current;
+  const dirty =
+    (enabled ? "true" : "false") !== currentEnabled ||
+    (auto ? "true" : "false") !== currentAuto ||
+    idleAfter !== currentIdle;
 
   const save = async (e: FormEvent) => {
     e.preventDefault();
@@ -29,16 +67,23 @@ export function WorkerHibernationCard({
     try {
       const resp = await api.updateSettings({
         worker_hibernation_enabled: String(enabled),
+        worker_hibernation_auto: String(auto),
+        worker_hibernation_idle_after: idleAfter,
       });
       onSaved(resp);
       setEnabled(resp.settings.worker_hibernation_enabled === "true");
+      setAuto(resp.settings.worker_hibernation_auto === "true");
+      setIdleAfter(resp.settings.worker_hibernation_idle_after ?? DEFAULT_IDLE_AFTER);
       setNotice("Worker hibernation settings saved.");
     } catch (err) {
+      // The typed values stay in the form so the admin can correct them.
       setError(errorMessage(err, "Failed to save worker hibernation settings"));
     } finally {
       setBusy(false);
     }
   };
+
+  const spelled = readout(idleAfter);
 
   return (
     <Card className="space-y-5">
@@ -61,7 +106,7 @@ export function WorkerHibernationCard({
       {error && <Alert message={error} />}
       {notice && <Alert tone="success" message={notice} />}
 
-      <form onSubmit={save} className="space-y-4">
+      <form onSubmit={save} className="space-y-5">
         <label className="flex cursor-pointer select-none items-center gap-2 text-sm">
           <input
             type="checkbox"
@@ -71,6 +116,57 @@ export function WorkerHibernationCard({
           />
           Allow hibernating persistent hosted workers
         </label>
+
+        <fieldset className="space-y-4 border-l-2 border-edge pl-4">
+          <legend className="sr-only">Automatic hibernation</legend>
+          <div className="space-y-1.5">
+            <label className="flex cursor-pointer select-none items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={auto}
+                onChange={(e) => setAuto(e.target.checked)}
+                aria-describedby={autoHintId}
+                className="h-4 w-4 rounded border-edge accent-brand"
+              />
+              Automatically hibernate idle workers
+            </label>
+            <div id={autoHintId} className="space-y-1 pl-6 text-sm text-muted">
+              <p>
+                Hibernates every idle persistent hosted worker, including a
+                user's last one, once it has had no run activity of any kind
+                for the idle threshold. At most 10 workers per minute. Off by
+                default.
+              </p>
+              {!enabled && (
+                <p className="font-medium">
+                  Takes effect only while hibernation is allowed above.
+                </p>
+              )}
+            </div>
+          </div>
+
+          <Field label="Idle threshold" htmlFor={idleId}>
+            <Input
+              id={idleId}
+              value={idleAfter}
+              onChange={(e) => setIdleAfter(e.target.value)}
+              aria-describedby={idleHintId}
+              spellCheck={false}
+              autoComplete="off"
+              inputMode="text"
+              className="max-w-40 font-mono"
+            />
+            <p id={idleHintId} className="text-xs text-muted">
+              Go duration, e.g. 336h = 14 days; 1h–2160h
+              {spelled && (
+                <>
+                  <br />
+                  <span className="text-fg">{spelled}</span>
+                </>
+              )}
+            </p>
+          </Field>
+        </fieldset>
 
         <Button type="submit" disabled={busy || !dirty}>
           {busy ? "Saving…" : "Save worker hibernation settings"}

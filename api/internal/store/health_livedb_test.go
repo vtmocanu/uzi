@@ -335,6 +335,12 @@ func (rollHealthSettings) AgentSourceStatus(context.Context) (settings.AgentSour
 	return settings.AgentSourceStatus{}, nil
 }
 
+func (rollHealthSettings) WorkerHibernationEnabled(context.Context) (bool, error) { return false, nil }
+func (rollHealthSettings) WorkerHibernationAuto(context.Context) (bool, error)    { return false, nil }
+func (rollHealthSettings) WorkerHibernationIdleAfter(context.Context) (time.Duration, error) {
+	return 0, nil
+}
+
 func (rollHealthSettings) CustodyHoldLimit(context.Context) (int32, error)   { return 8, nil }
 func (rollHealthSettings) HealthEnabled(context.Context) (bool, error)       { return true, nil }
 func (rollHealthSettings) ReleaseCheckEnabled(context.Context) (bool, error) { return false, nil }

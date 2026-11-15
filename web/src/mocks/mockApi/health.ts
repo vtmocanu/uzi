@@ -3,10 +3,18 @@ import { ApiError } from "../../lib/apiError";
 import { confirmedDrainDoc, degradedDoc, healthySilentDoc, incidentDoc, maintenanceDoc, overviewNextDoc, ownerOnlyDoc } from "../data";
 import { delay, mockScenario, requireAdmin } from "./shared";
 import { agentSourceHealthCheck } from "./agentSource";
+import { appSettings } from "./settings";
 
 function withAgentSource(doc: HealthDoc): HealthDoc {
   const source = agentSourceHealthCheck();
-  const checks = doc.checks.map((c) => c.id === source.id ? source : c);
+  const autoEnabled = appSettings.worker_hibernation_enabled === "true" && appSettings.worker_hibernation_auto === "true";
+  const checks = doc.checks.map((c) => {
+    if (c.id === source.id) return source;
+    if (c.id !== "fleet.hibernation") return c;
+    // These routed scenarios all have hosted workers and model only off/healthy auto status.
+    return { ...c, severity: autoEnabled ? "ok" : "na", summary: autoEnabled
+      ? "No idle hosted worker is blocked from automatic hibernation." : "Automatic hibernation is off." };
+  });
   const counts = { ok: 0, warn: 0, danger: 0, unknown: 0, na: 0 };
   for (const c of checks) counts[c.severity as keyof typeof counts]++;
   return {
@@ -28,7 +36,7 @@ function withAgentSource(doc: HealthDoc): HealthDoc {
 //                            AND a non-admin viewer sees the platform line on Overview
 //   ?mock=health-owner-only → owner danger without an instance blocker or episode
 //   ?mock=health-confirmed-drain → orderly upgrade wait, all checks ok and no episode
-//   ?mock=health-silent    → every check passing (healthy/all-ok)
+//   ?mock=health-silent    → every applicable check passing (automatic hibernation is off)
 //   ?mock=overview-next    → one owner warning that raises the admin attention banner
 //                            (the default Overview scenario, PRD #3878 and #3877)
 //   ?mock=maintenance      → maintenance.active warns (PRD #3454; see mockApi/maintenance.ts)

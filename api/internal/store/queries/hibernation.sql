@@ -33,7 +33,11 @@ UPDATE workers SET
     cleanup_settled_at = sqlc.narg('cleanup_settled_at'),
     cleanup_cancel_requested = @cleanup_cancel_requested::boolean,
     cleanup_reconcile_seq = @cleanup_reconcile_seq::int,
-    cleanup_reconciled_at = sqlc.narg('cleanup_reconciled_at')
+    cleanup_reconciled_at = sqlc.narg('cleanup_reconciled_at'),
+    last_wake_settled_at = sqlc.narg('last_wake_settled_at'),
+    hibernation_blocked_reason = sqlc.narg('hibernation_blocked_reason'),
+    hibernation_blocked_at = sqlc.narg('hibernation_blocked_at'),
+    hibernation_blocked_since = sqlc.narg('hibernation_blocked_since')
 WHERE id = @id
 RETURNING *;
 
