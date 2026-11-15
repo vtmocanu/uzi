@@ -1376,7 +1376,7 @@ describe("terminal index hash script", () => {
     assert.equal(hashOf(f.dir), "error");
   });
 
-  test("streams the file instead of reading it whole", () => {
+  test("the script uses a read stream, not readFileSync", () => {
     assert.ok(!TERMINAL_INDEX_HASH_SCRIPT.includes("readFileSync"));
     assert.ok(TERMINAL_INDEX_HASH_SCRIPT.includes("createReadStream"));
   });
@@ -1404,7 +1404,7 @@ describe("unsafe cleanup identity through runner git", () => {
     } finally { await f.cleanup(); }
   });
 
-  test("(b) a capture boundary child whose disposal fails keeps the typed identity", async () => {
+  test("(b) a capture-scope disposal failure surfaces the typed unsafe cleanup as the boundary error's cause", async () => {
     const f = await credentialFreeGitFixture();
     try {
       let current!: BoundaryProcessRequest;
@@ -1433,8 +1433,10 @@ describe("unsafe cleanup identity through runner git", () => {
         context => f.git.withCredentialFreeCapture(context, () => f.git.worktreeHead(f.clone))).then(() => undefined, (e: unknown) => e);
       const chain = causeChain(got);
       const shape = chain.map(e => `${(e as Error)?.constructor?.name}:${(e as Error)?.message}`).join(" <- ");
-      assert.ok(chain.some(e => e instanceof CheckpointUnsafeCleanupError) ||
-        (got as { checkpointBoundary?: string } | undefined)?.checkpointBoundary === "unsafe_cleanup", shape);
+      assert.ok(got instanceof Error, shape);
+      assert.ok(!(got instanceof CheckpointUnsafeCleanupError), `top level is not itself unsafe-cleanup typed: ${shape}`);
+      assert.notEqual((got as { checkpointBoundary?: string }).checkpointBoundary, "unsafe_cleanup", shape);
+      assert.ok(chain[1] instanceof CheckpointUnsafeCleanupError, `direct cause is the typed unsafe cleanup: ${shape}`);
     } finally { await f.cleanup(); }
   });
 

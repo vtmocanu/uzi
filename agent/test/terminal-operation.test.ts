@@ -930,6 +930,19 @@ describe("terminal operation rediscovery", () => {
       await settle();
       assert.equal((await readRec(real)).phase, "capturing");
     });
+
+    it("a read failure that is not a forfeited wait rejects instead of reading as truncated", async () => {
+      const root = mkRoot();
+      const coord = mkCoord(root);
+      const real = coord.terminalOperationStore();
+      await real.create(rec());
+      coord.terminalOperationStore = () => ({
+        ...real,
+        read: async () => { throw new Error("injected lock failure"); },
+      });
+      await assert.rejects(() => coord.resumeTerminalOperations(), /injected lock failure/);
+      assert.equal((await readRec(real)).phase, "capturing");
+    });
   });
 });
 
