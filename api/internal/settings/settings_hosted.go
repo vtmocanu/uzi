@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // maxHostedWorkerQuota bounds the per-user hosted-worker quota (PRD #58). Each
@@ -35,6 +36,26 @@ func (c *Cache) EphemeralWorkersEnabled(ctx context.Context) (bool, error) {
 // compiled-in default (false).
 func (c *Cache) WorkerHibernationEnabled(ctx context.Context) (bool, error) {
 	return c.boolSetting(ctx, KeyWorkerHibernationEnabled)
+}
+
+// WorkerHibernationAuto reports whether the automatic idle-worker hibernation pass may run
+// (issue #4207). It acts only while WorkerHibernationEnabled is also on. A malformed value
+// falls back to the compiled-in default (false).
+func (c *Cache) WorkerHibernationAuto(ctx context.Context) (bool, error) {
+	return c.boolSetting(ctx, KeyWorkerHibernationAuto)
+}
+
+// WorkerHibernationIdleAfter returns how long a worker must show no run activity before the
+// automatic pass hibernates it (issue #4207). A missing, unparseable or out-of-range stored
+// value falls back to the compiled-in default (336h), so a bad row can never make the pass
+// hibernate workers sooner than validateWorkerHibernationIdleAfter allows.
+func (c *Cache) WorkerHibernationIdleAfter(ctx context.Context) (time.Duration, error) {
+	v, err := c.get(ctx, KeyWorkerHibernationIdleAfter)
+	d, perr := time.ParseDuration(strings.TrimSpace(v))
+	if perr != nil || d < workerHibernationIdleAfterMin || d > workerHibernationIdleAfterMax {
+		d, _ = time.ParseDuration(DefaultWorkerHibernationIdleAfter)
+	}
+	return d, err
 }
 
 // HostedWorkerQuota returns the per-user hosted-worker quota (PRD #58 Decision 8);
@@ -72,6 +93,24 @@ func validateHostedWorkerQuota(value string) error {
 	}
 	if n < 0 || n > maxHostedWorkerQuota {
 		return fmt.Errorf("must be 0 (self-service disabled) or between 1 and %d workers", maxHostedWorkerQuota)
+	}
+	return nil
+}
+
+const (
+	workerHibernationIdleAfterMin = time.Hour
+	workerHibernationIdleAfterMax = 2160 * time.Hour
+)
+
+// validateWorkerHibernationIdleAfter is the write-time gate for worker_hibernation_idle_after
+// (issue #4207): a Go duration between one hour and 90 days.
+func validateWorkerHibernationIdleAfter(value string) error {
+	d, err := time.ParseDuration(strings.TrimSpace(value))
+	if err != nil {
+		return errors.New(`must be a duration like "336h"`)
+	}
+	if d < workerHibernationIdleAfterMin || d > workerHibernationIdleAfterMax {
+		return errors.New("must be between 1h and 2160h")
 	}
 	return nil
 }

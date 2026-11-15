@@ -3028,7 +3028,30 @@ export interface ClarificationSettlement {
   gate_revision: number;
 }
 
+/** Issue #4257: negotiated feature for the `running` report's checkpoint-publication diagnostic. */
+export const CHECKPOINT_PUBLICATION_WITHHELD_FEATURE = "checkpoint_publication_withheld_v1";
+
+/** Issue #4257: content-free diagnostic that checkpoint publication is withheld by a
+ *  secret-scan restriction (or that the withholding cleared). Carries no finding, path,
+ *  rule or SHA. `report_seq` orders writes within one worker/generation/nonce. */
+export interface CheckpointPublicationReport {
+  state: "withheld" | "cleared";
+  /** RFC3339; required iff `state` is `withheld`. */
+  since?: string;
+  claim_generation: number;
+  register_nonce: string;
+  report_seq: number;
+}
+
+/** What a caller hands the client: the client stamps `register_nonce` and `claim_generation`. */
+export type CheckpointPublicationInput = Pick<CheckpointPublicationReport, "state" | "since" | "report_seq">;
+
+export type CheckpointPublicationAck = "recorded" | "cleared" | "refused" | "unrecorded";
+
 export interface StateRequest {
+  /** Issue #4257: set by the client alone (from the caller's `checkpointPublication` option),
+   *  never read from a caller-supplied body. Content-free. */
+  checkpoint_publication?: CheckpointPublicationReport;
   /** Issue #3985: present only on a `clarification_settled` report. */
   clarification_settlement?: ClarificationSettlement;
   /** Issue #3859: set by the client alone, never by a caller. */
@@ -3420,7 +3443,58 @@ export interface CompletedPublicationReceipt {
 export type CompletedPublicationReason =
   | "completion_identity_missing" | "not_completed" | "identity_changed"
   | "mr_missing" | "branch_missing" | "branch_mismatch" | "head_mismatch"
-  | "not_ancestor" | "ancestry_unknown" | "forge_timeout" | "unsupported_feature";
+  | "not_ancestor" | "ancestry_unknown" | "forge_timeout" | "unsupported_feature"
+  | "terminal_preservation_pending" | "terminal_preservation_refused";
+
+// Terminal preservation (issue #4007): TS mirrors of api/internal/apitypes/terminal_preservation.go.
+export type TerminalAbandonedClass = "ignored" | "cold_dirty";
+
+export interface TerminalPreservationRequest {
+  generation: number;
+  tip: string;
+  prior_tip?: string;
+  manifest: {
+    run_id: string;
+    generation: number;
+    worker_id: string;
+    roots: Array<{ source_id: string; attempt_id: string; commit: string; tree: string }>;
+    abandoned: Array<{ class: TerminalAbandonedClass; source_id: string; extents: { files: number; bytes: number } }>;
+  };
+  disposition: "preserve";
+  /** Standard-base64 raw (non-thin) packfile; omitted when the tip is already on the forge. */
+  pack?: string;
+}
+
+export const TERMINAL_CONTRIBUTION_STATES = [
+  "published", "invoked", "publish_unknown", "refused", "recorded", "prepared",
+] as const;
+export type TerminalContributionState = (typeof TERMINAL_CONTRIBUTION_STATES)[number];
+
+export const TERMINAL_REASONS = [
+  "send_suppressed", "create_refused", "update_refused",
+  "unsupported", "hold_missing", "identity_changed", "excluded_origin", "manifest_invalid",
+  "manifest_mismatch", "generation_bound", "prior_tip_mismatch", "preservation_retired",
+  "publication_in_flight", "forge_unavailable", "pack_invalid", "pack_too_large", "tip_missing",
+  "ci_config_guard", "not_descendant", "root_unreachable", "tree_mismatch", "walk_too_large",
+  "foreign_tip", "authority_changed",
+] as const;
+export type TerminalReason = (typeof TERMINAL_REASONS)[number];
+/** Reasons a non-200 can carry that the server never stores or lists in the vocabulary fixture. */
+export type TerminalWireOnlyReason = "busy" | "stale_claim" | "missing_claim_generation" | "invalid_request";
+export type TerminalWireReason = TerminalReason | TerminalWireOnlyReason;
+/** The stored run_terminal_contributions.disposition values; the request's "preserve" is never echoed. */
+export type TerminalResponseDisposition = "preserved" | "closed_issue_abandoned" | "closed_pr_abandoned";
+
+export interface TerminalPreservationResponse {
+  preservation_id: string;
+  contribution_id: string;
+  ref: string;
+  tip: string;
+  state: TerminalContributionState;
+  preservation_state: string;
+  disposition: TerminalResponseDisposition;
+  reason?: TerminalReason;
+}
 
 /**
  * What the server answered a state report with (PRD #35's park acknowledgement
@@ -3482,6 +3556,8 @@ export interface StateAck {
   /** Issue #3859: the server's top-level answer to a report that carried registration_evidence.
    *  Logged only; no behavior branches on it. */
   registrationEvidence?: "recorded" | "refused";
+  /** Issue #4257: the server's top-level answer to a report that carried checkpoint_publication. */
+  checkpointPublication?: CheckpointPublicationAck;
   /** Whether the server applied the transition. Diagnostics and logging only —
    *  see the warning above before branching on it. */
   applied: boolean;

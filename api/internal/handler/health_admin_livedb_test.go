@@ -72,22 +72,33 @@ func TestAdminHealthAuthLiveDB(t *testing.T) {
 		Checks []struct {
 			ID       string `json:"id"`
 			Severity string `json:"severity"`
+			Scope    string `json:"scope"`
 		} `json:"checks"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &doc); err != nil {
 		t.Fatalf("decode health doc: %v (body %s)", err, rec.Body.String())
 	}
-	if len(doc.Checks) != 26 {
-		t.Fatalf("health doc carries %d checks, want the 26 checks (fleet.hibernation_cleanup from PRD #4206 + fleet.hibernation_retirement from PRD #4208 M1 + fleet.hibernation_wake from PRD #4205 M6 + 11 M1 + controller.report, loops, forge.ciwatch from M2 + forge.sync from M3 + fleet.rundisk from PRD #1809 M6 + fleet.quarantine from issue #2213 + fleet.memory_authority from issue #3142 + pricing.codex from PRD #2560 + db.size from issue #2623 + recovery.storage + agentsource.update + maintenance.active from PRD #3454)\nbody: %s", len(doc.Checks), rec.Body.String())
+	if len(doc.Checks) != 27 {
+		t.Fatalf("health doc carries %d checks, want the 27 checks (fleet.hibernation_cleanup from PRD #4206 + fleet.hibernation from issue #4207 + fleet.hibernation_retirement from PRD #4208 M1 + fleet.hibernation_wake from PRD #4205 M6 + 11 M1 + controller.report, loops, forge.ciwatch from M2 + forge.sync from M3 + fleet.rundisk from PRD #1809 M6 + fleet.quarantine from issue #2213 + fleet.memory_authority from issue #3142 + pricing.codex from PRD #2560 + db.size from issue #2623 + recovery.storage + agentsource.update + maintenance.active from PRD #3454)\nbody: %s", len(doc.Checks), rec.Body.String())
 	}
+	foundAutomatic := false
 	foundUpdate := false
 	for i, c := range doc.Checks {
+		if c.ID == "fleet.hibernation" {
+			foundAutomatic = true
+			if c.Scope != "instance" {
+				t.Fatalf("fleet.hibernation scope = %q, want instance", c.Scope)
+			}
+		}
 		if c.ID == "agentsource.update" {
 			foundUpdate = true
 			if i == 0 || i+1 >= len(doc.Checks) || doc.Checks[i-1].ID != "release.check" || doc.Checks[i+1].ID != "pricing.codex" {
 				t.Fatalf("agent source update registry position: %+v", doc.Checks)
 			}
 		}
+	}
+	if !foundAutomatic {
+		t.Fatal("health doc missing fleet.hibernation")
 	}
 	if !foundUpdate {
 		t.Fatal("health doc missing agentsource.update")

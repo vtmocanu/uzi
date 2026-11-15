@@ -1,6 +1,6 @@
 # PRD #4207: Worker hibernation: automatic hibernation of idle workers
 
-**Epic**: #4204. **Status**: Draft. **Blocked by**: PRD #4205 and PRD #4206, both merged. The edge on #4206 is a release dependency, not a code one: automatic hibernation must not go live before the promised cleanup (user decision; see D5).
+**Epic**: #4204. **Status**: Done (M1, M2), 2026-11-15. **Blocked by**: PRD #4205 and PRD #4206, both merged. The edge on #4206 is a release dependency, not a code one: automatic hibernation must not go live before the promised cleanup (user decision; see D5).
 
 ## Problem
 
@@ -55,7 +55,7 @@ Acceptance examples:
 - It is bounded by the fleet size (≤512) and does at most N=10 admissions per pass, to pace scale-downs.
 - Candidates are ordered deterministically by `idle anchor` ascending, then id. A candidate refused within the last hour moves to the back of the order, so repeatedly blocked workers cannot starve the rest of the fleet.
 
-**Admin health.** A new **instance-scoped** `fleet.hibernation` check in `api/internal/healthsvc/checks.go`, with its `docs/admin-health.md` row and `apitypes/health.go` entry.
+**Admin health.** A new **instance-scoped** `fleet.hibernation` check in `api/internal/healthsvc/checks.go`, with its `docs/admin-health.md` row and `apitypes/health.go` entry (moot, see D10).
 
 - **What it warns about:** each worker idle past the threshold whose admission was refused, with the reason (custody, cordon, maintenance, roll, or a cleanup still in progress).
 - **Long-parked workers:** a worker whose only assigned run is parked (`recovery_wait`, `paused`, `limit_wait`) is non-idle by definition. Once the parked run is older than the threshold, it is listed as "blocked: assigned run parked (RUN, status)", so a long park is visible rather than silently keeping the worker awake.
@@ -99,3 +99,8 @@ Acceptance: example 3.
 - **D4. The pass is paced at 10 admissions per pass,** so a freshly enabled policy does not scale down the whole fleet in one tick.
 - **D5. Keep the edge on #4206.** The user asked for cleanup at hibernation. The architect review called the edge false as a code dependency, which is correct, but it is kept deliberately as a release dependency.
 - **D6. Derive idleness rather than storing it.** This keeps the claim path free of a new write and avoids a backfill, at the cost of one indexed aggregate per policy pass.
+- **D7. Every settled wake restarts the idle clock,** a withdrawn hibernation included. "A cleanup still in progress" never applies to a `none` worker (`workers_cleanup_fence_none`); an in-progress or stuck attempt is covered by recovery and `fleet.hibernation_cleanup`.
+- **D8. Refusal reasons are refined.** `intake_fenced` is split into `manual_cordon`, `maintenance`, `roll` and `draining`; `controller_refused` is recorded when the controller refuses before scale-down. A controller refusal excludes the worker for 1 hour; other refusals move it to the back of the queue for 1 hour.
+- **D9. Released claims do not count as activity** (`worker_id` is NULLed). Health lists only the three parked statuses: `recovery_wait`, `paused`, `limit_wait`.
+- **D10. Automatic hibernations write no `worker_hibernation_events` row,** because `actor_id` is NOT NULL. The `apitypes/health.go` entry this PRD named is moot: that file has no per-check entries.
+- **D11. Two runs indexes serve the idle clock:** a partial index on non-terminal runs by worker, and an end-time expression index on terminal runs.

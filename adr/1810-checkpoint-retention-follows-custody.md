@@ -445,6 +445,14 @@ completing generation is unfinished or refused. With no such row, behavior is
 unchanged, and the owner's discard is never gated. Slice A is dark. See
 [ADR-4007](4007-terminal-preservation.md).
 
+## Amendment (2026-11-14, #4007 slice B)
+
+The worker-local refs `refs/uzi-terminal-local/<run>/g<gen>` (transient in the
+clone, private in the bare) and the `refs/uzi-incoming/<uuid>` staging refs are
+neither checkpoint retention nor custody retention. Settlement never deletes
+them, and incomplete ones are retained until slice C. The producer that creates
+them is production-dark. See [ADR-4007](4007-terminal-preservation.md).
+
 ## References
 
 - [PRD #1810](../prds/done/1810-retain-failed-run-checkpoint-ref.md)

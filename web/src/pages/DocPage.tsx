@@ -24,7 +24,7 @@ export function DocPage() {
       return;
     }
     document.getElementById(id)?.scrollIntoView({ block: "start" });
-  }, [slug, location.hash]);
+  }, [slug, location.hash, location.key]);
 
   if (!doc || !isRoutableDoc(slug, isAdmin)) {
     return (

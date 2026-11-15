@@ -143,7 +143,7 @@ function warning(): HealthDoc {
     ? { ...check, severity: "warn", attention_banner: true,
         summary: "Synthetic pressure; 0 captures currently marked quota-refused." }
     : check);
-  doc.counts = { ok: 22, warn: 1, danger: 0, unknown: 0, na: 0 };
+  doc.counts = { ...doc.counts, ok: doc.counts.ok - 1, warn: doc.counts.warn + 1 };
   doc.status = "warn";
   return doc;
 }

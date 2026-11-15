@@ -29,6 +29,7 @@ import {
   Skeleton,
 } from "../components/ui";
 import { AdminShell } from "../components/AdminShell";
+import { ADMIN_SETTINGS_ANCHOR_IDS } from "../components/navSections";
 import { DocLink } from "../components/DocLink";
 import { DOC_ADMIN_SETTINGS } from "../lib/doclinks";
 import {
@@ -119,7 +120,7 @@ function resolveDarkDisplay(s: AppSettings): string {
 
 export function AdminSettings() {
   const { refresh } = useAuth();
-  const { hash } = useLocation();
+  const { hash, key } = useLocation();
   const [saved, setSaved] = useState<AppSettings | null>(null);
   // Per-key secret-configured flags and sources (PRD #25), consumed by the Slack
   // card for its "configured ✓" and env-greying behavior.
@@ -211,14 +212,26 @@ export function AdminSettings() {
     { fallback: "Failed to load settings" },
   );
 
+  // Keyed on "loaded", not the `saved` object: every card save replaces `saved`, and a
+  // save must not yank the page back to the URL's anchor.
+  const loaded = !loading && saved !== null;
+  const failed = !loading && saved === null;
+  // `key` changes on every navigation, so choosing the same section again re-scrolls.
+  useEffect(() => {
+    // SPA navigation keeps the previous page's scroll position, so a failed load that
+    // arrived via an advertised anchor resets to the top itself.
+    if (failed && ADMIN_SETTINGS_ANCHOR_IDS.has(hash.slice(1))) window.scrollTo?.(0, 0);
+  }, [failed, hash, key]);
   useEffect(() => {
     // Deep links that arrive before the cards render: the browser's own hash jump has
     // nothing to land on yet, so scroll once loading settles (the maintenance banner's
-    // "Manage maintenance" link is one).
-    if (!loading && (hash === "#agent-source" || hash === "#maintenance")) {
+    // "Manage maintenance" link and the command menu's section entries are examples).
+    // Most cards render only after a successful load (`saved`), so a FAILED load leaves
+    // the page at the top for every anchor, agent-source and maintenance included.
+    if (loaded && ADMIN_SETTINGS_ANCHOR_IDS.has(hash.slice(1))) {
       document.getElementById(hash.slice(1))?.scrollIntoView?.({ block: "start" });
     }
-  }, [loading, hash]);
+  }, [loaded, hash, key]);
 
   // Poll only the live Slack connection state so the chip reflects connecting →
   // connected without a manual reload. Uses the dedicated status endpoint (not the
@@ -361,7 +374,7 @@ export function AdminSettings() {
         </Card>
       )}
 
-      <Card id="vault-policy" className="space-y-4">
+      <Card id="vault-policy" className="scroll-mt-6 space-y-4">
         <SectionTitle>Credential protection</SectionTitle>
         <p className="text-sm text-muted">TL;DR: Password encryption protects personal credentials against theft of the database together with the server key. A compromised running server can still read credentials while unlocked. After a release or server restart, an eligible foreground request can re-unlock with a live browser grant. New runs still wait until the user opens or focuses uzi; expired grants require a password unlock. Off uses server-key encryption, like forge bot tokens. <a href="/docs/vault-threat-model">Learn more</a>.</p>
         <form className="space-y-2" onSubmit={async e => {

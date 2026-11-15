@@ -3471,6 +3471,40 @@ With no such record, completion behaves as before, and your own discard is
 never blocked. Since nothing creates a record yet, you should not see either
 reason today.
 
+### The worker side is built but switched off
+
+The worker code that captures a finished run's work and calls the terminal
+route is built, but it is behind a compile-time switch that is off. No shipped
+worker runs it or advertises the capability, so nothing changes for you today.
+Workers do already understand the two refusal reasons above, so a later
+activation needs no matching worker upgrade for that part.
+
+Once it is enabled in a later release, you may see the following on the worker.
+It applies to branch-based runs only (issue, rework and self-improve runs
+without an egress profile); other kinds are kept unchanged.
+
+- **Operation records.** A small record per run under a `terminal-preservation`
+  directory next to the recovery root in the worker's data directory. Each
+  records what was captured, prepared and sent. They are not deleted
+  automatically.
+- **Retained private refs.** A `refs/uzi-terminal-local/<run-id>/g<generation>`
+  ref in the run's bare repository, and sometimes a short-lived
+  `refs/uzi-incoming/<id>` staging ref. If a worker restarts mid-capture, the
+  record is marked incomplete and its refs are kept. Nothing removes them yet;
+  that is a later slice. A capture never deletes the staging ref past a short
+  fixed cleanup bound (2 seconds, or the caller's earlier bound); a staging ref
+  or private index file it could not confirm removed is reported on the
+  capture's result as a remnant and is not retried.
+- **The clean verdict does not trust the clone's own index.** The capture
+  rebuilds a private index from HEAD and compares it with the work tree; an
+  edit hidden by a forged real index is refused (`index_mismatch`) before any
+  content is written to the object store, and a clean tree writes nothing.
+- **The work is kept, not published, when proof is missing.** A run whose
+  local sources cannot be fully accounted for (for example an extra attempt
+  clone, a stash, or an unreachable local ref) is kept as it is.
+
+Failed, cancelled and rate-limited terminal sends are not covered by this work.
+
 ## Resuming an approved run in a fresh attempt
 
 When a run whose plan was already approved loses its session (for example a worker is replaced during a usage-limit wait) and continues in a fresh attempt, uzi can skip the plan gate for a plan that was already approved at the gate (by you, or automatically on an autopilot run). The new session is told what happened, so it does not mistake the plan for its own:

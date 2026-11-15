@@ -38,6 +38,10 @@ import {
   WORKER_API_PREFIX,
   CAPABILITY_INFERENCE_EVIDENCE_FEATURE,
   RUN_REGISTRATION_EVIDENCE_FEATURE,
+  CHECKPOINT_PUBLICATION_WITHHELD_FEATURE,
+  type CheckpointPublicationInput,
+  type CheckpointPublicationAck,
+  type CheckpointPublicationReport,
   type MemoryBinding,
   type MemoryPolicy,
   type MemoryOutcome,
@@ -96,6 +100,12 @@ import {
   type RunRegistrationEvidence,
   type CompletedPublicationReceipt,
   type CompletedPublicationReason,
+  TERMINAL_CONTRIBUTION_STATES,
+  TERMINAL_REASONS,
+  type TerminalPreservationRequest,
+  type TerminalPreservationResponse,
+  type TerminalWireReason,
+  type TerminalResponseDisposition,
   type PlanCrossCheckReconciliation,
   type StateRequest,
   type UserInput,
@@ -503,6 +513,14 @@ function hasRevisionSourceFields(body: StateRequest): boolean {
 
 // Internal per-attempt evidence, minted only after reading the authenticated response through EOF.
 class StateDecodeRefusalError extends RequestError {}
+
+/** Issue #4257: the same report without the checkpoint-publication diagnostic. */
+function withoutCheckpointPublication<T extends { checkpoint_publication?: unknown }>(b: T): T {
+  if (b.checkpoint_publication === undefined) return b;
+  const copy = { ...b };
+  delete copy.checkpoint_publication;
+  return copy;
+}
 interface StateAttemptEvidence {
   ambiguous: boolean; refusals: number; refusedAfterAmbiguity?: boolean;
   /** Any definite HTTP answer (any status) after an earlier ambiguous attempt. */
@@ -1690,6 +1708,8 @@ export class WorkerClient {
    *  not reopen it, which is why it is not simply dropFeature(). */
   private registrationEvidenceDropped = false;
   private readonly witnessedRunning = new Map<string, RunRegistrationEvidence>();
+  /** Issue #4257: same shape for `checkpoint_publication`; sticky until the next register(). */
+  private checkpointPublicationDropped = false;
 
   /**
    * The per-registration nonce the api minted on the last successful register (PRD #1390
@@ -2027,6 +2047,7 @@ export class WorkerClient {
     this.registerNonce = undefined;
     this.registrationEvidenceDropped = false;
     this.witnessedRunning.clear();
+    this.checkpointPublicationDropped = false;
     this.registrationReport = undefined;
     const originalCapabilities = Array.isArray(protocolCapabilities) ? [...protocolCapabilities] : undefined;
     const body: RegisterRequest = { name, version: this.version };
@@ -2960,7 +2981,7 @@ export class WorkerClient {
    * fail on real runs.
    */
   async reportState(runId: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal,
-    options?: { iterationCancellation?: true; registrationEpoch?: number }): Promise<StateAck> {
+    options?: { iterationCancellation?: true; registrationEpoch?: number; checkpointPublication?: CheckpointPublicationInput }): Promise<StateAck> {
     const path = `${WORKER_API_PREFIX}/runs/${runId}/state`;
     if (options?.iterationCancellation) {
       // Snapshot before any asynchronous work; only the iteration sink cancellation
@@ -3173,6 +3194,11 @@ export class WorkerClient {
     delete outbound.registration_evidence;
     const witness = this.registrationEvidenceFor(body, included, options?.registrationEpoch);
     if (witness) outbound.registration_evidence = witness;
+    // Issue #4257: the checkpoint-publication diagnostic, same discipline: a caller-set copy in
+    // the body is discarded and the client alone stamps nonce and generation.
+    delete outbound.checkpoint_publication;
+    const publication = this.checkpointPublicationFor(body, included, options?.checkpointPublication);
+    if (publication) outbound.checkpoint_publication = publication;
     // PRD #1795 M3: the api refuses an id-bearing awaiting_approval report without
     // claim_generation (400 claim_generation_required), and the strict-decode fallback exists for
     // an api that rolled back past the fields. So whenever claim_generation is NOT on the wire, the
@@ -3180,7 +3206,7 @@ export class WorkerClient {
     // allocating api still answers with its revision and an older api accepts unchanged.
     const evidence: StateAttemptEvidence = { ambiguous: false, refusals: 0 };
     let ack: StateAck;
-    const sendWith = (b: PlanCrossCheckStateRequest) => (includeField: boolean) =>
+    const sendOne = (b: PlanCrossCheckStateRequest, includeField: boolean) =>
       this.reportStateOnce(
         runId,
         path,
@@ -3193,6 +3219,21 @@ export class WorkerClient {
         undefined,
         b.claim_generation,
       );
+    // Issue #4257: checkpoint_publication is the NEWEST field, so its rollback is resolved first,
+    // at the innermost send, ahead of every older-field fallback below: on the exact strict-decode
+    // refusal (StateDecodeRefusalError) strip ONLY it, remember that for this registration and
+    // resend this same variant once. Later variants of the same report never carry it again.
+    const sendWith = (b: PlanCrossCheckStateRequest) => async (includeField: boolean): Promise<StateAck> => {
+      const base = this.checkpointPublicationDropped ? withoutCheckpointPublication(b) : b;
+      try {
+        return await sendOne(base, includeField);
+      } catch (err) {
+        if (base.checkpoint_publication === undefined || !isStrictDecodeError(err) || !(err instanceof StateDecodeRefusalError)) throw err;
+        this.checkpointPublicationDropped = true;
+        this.log.warn("checkpoint publication diagnostic rejected by an api that cannot decode it; re-sent without it and stopped sending it for this registration", { run_id: runId });
+        return sendOne(withoutCheckpointPublication(base), includeField);
+      }
+    };
     try {
       if (outbound.registration_evidence !== undefined) {
         // Issue #3859. Ordering with the older claim_generation fallback: the evidence strip comes
@@ -3288,6 +3329,24 @@ export class WorkerClient {
         !this.hasFeature(RUN_REGISTRATION_EVIDENCE_FEATURE) || !this.registerNonce ||
         witness?.register_nonce !== this.registerNonce || witness.claim_generation !== generation) return undefined;
     return this.registerNonce;
+  }
+
+  /** Issue #4257: the stamped checkpoint-publication diagnostic for a `running` report, or
+   *  undefined. Every guard is required: negotiated and not dropped for this registration, a
+   *  known register nonce, a claim generation that is a safe integer >= 1 really on the wire,
+   *  and a caller input with a positive integer report_seq (and `since` for `withheld`). */
+  private checkpointPublicationFor(body: StateRequest, included: boolean, input: CheckpointPublicationInput | undefined): CheckpointPublicationReport | undefined {
+    const generation = body.claim_generation;
+    if (input === undefined || body.status !== "running" || !included || this.checkpointPublicationDropped ||
+        !this.hasFeature(CHECKPOINT_PUBLICATION_WITHHELD_FEATURE) || !this.registerNonce ||
+        generation === undefined || !Number.isSafeInteger(generation) || generation < 1 ||
+        !Number.isSafeInteger(input.report_seq) || input.report_seq < 1) return undefined;
+    if (input.state === "withheld") {
+      if (typeof input.since !== "string" || input.since === "") return undefined;
+      return { state: "withheld", since: input.since, claim_generation: generation, register_nonce: this.registerNonce, report_seq: input.report_seq };
+    }
+    if (input.state !== "cleared") return undefined;
+    return { state: "cleared", claim_generation: generation, register_nonce: this.registerNonce, report_seq: input.report_seq };
   }
 
   /** Issue #3859: the registration witness for a `running` report, or undefined. Every guard is
@@ -3554,6 +3613,10 @@ export class WorkerClient {
             ack.registrationEvidence = fields.registrationEvidence;
             this.log.info("registration evidence answered", { run_id: runId, registration_evidence: fields.registrationEvidence });
           }
+          if (body.checkpoint_publication !== undefined && fields.checkpointPublication !== undefined) {
+            ack.checkpointPublication = fields.checkpointPublication;
+            this.log.info("checkpoint publication answered", { run_id: runId, checkpoint_publication: fields.checkpointPublication });
+          }
           if (!ack.applied) {
             this.log.info("state report not applied server-side", {
               run_id: runId,
@@ -3744,6 +3807,67 @@ export class WorkerClient {
       return { ok: false, httpStatus: res.status, reason: "malformed_response" };
     }
     return { ok: true, body: body as HeldPublicationResponse };
+  }
+
+  /**
+   * Issue #4007: ask the api to publish a terminal run's work to `refs/uzi-terminal/<run-id>`. Never throws
+   * for a transport, HTTP or decode outcome; see {@link TerminalPreservationResult}. Only a 200 whose strict
+   * decode passes and which proves the work published at `req.tip` (or durably recorded) is `final`. Sends
+   * nothing gate-related: the server refuses `unsupported` itself.
+   */
+  async publishTerminalPreservation(
+    runId: string,
+    req: TerminalPreservationRequest,
+    signal?: AbortSignal,
+  ): Promise<TerminalPreservationResult> {
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/terminal-preservation`;
+    let res: Response;
+    let text: string;
+    try {
+      const timeout = maintenanceSignal(TERMINAL_PRESERVATION_TIMEOUT_MS);
+      const init: RequestInit = {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${this.token}`,
+          "X-Client-Version": this.version,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(req),
+        signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+      };
+      res = await maintenanceFetch(this.transport ?? fetch, this.baseUrl + path, init);
+      try {
+        text = await readBoundedText(res, TERMINAL_PRESERVATION_RESPONSE_MAX_BYTES, true, init.signal ?? undefined);
+      } catch {
+        if (init.signal?.aborted) return { kind: "unknown", cause: "aborted", httpStatus: res.status };
+        return { kind: "unknown", cause: "malformed_response", httpStatus: res.status };
+      }
+    } catch (error) {
+      const aborted = (error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError")) ||
+        signal?.aborted === true;
+      return { kind: "unknown", cause: aborted ? "aborted" : "transport" };
+    }
+    let body: unknown;
+    try { body = JSON.parse(text); } catch { body = undefined; }
+    if (res.status !== 200) {
+      const reason = isRecord(body) && typeof body.reason === "string" ? terminalWireReason(body.reason) : undefined;
+      if (reason === undefined) return { kind: "unknown", cause: "http_status", httpStatus: res.status };
+      if (terminalReasonStatus(reason) !== res.status) return { kind: "unknown", cause: "malformed_response", httpStatus: res.status };
+      if (TERMINAL_RETRYABLE_REASONS.has(reason)) return { kind: "unknown", cause: "retryable", reason, httpStatus: res.status };
+      return { kind: "refused", reason, httpStatus: res.status };
+    }
+    const response = decodeTerminalPreservationResponse(body, runId);
+    if (!response) return { kind: "unknown", cause: "malformed_response", httpStatus: 200 };
+    if (response.state === "published" && response.tip === req.tip) return { kind: "final", outcome: "published", response };
+    if (response.state === "recorded") return { kind: "final", outcome: "recorded", response };
+    if (response.state === "refused") {
+      return response.reason
+        ? { kind: "refused", reason: response.reason, httpStatus: 200 }
+        : { kind: "unknown", cause: "malformed_response", httpStatus: 200 };
+    }
+    // published at a different tip is a contradiction, not a partial success.
+    if (response.state === "published") return { kind: "unknown", cause: "malformed_response", httpStatus: 200 };
+    return { kind: "unknown", cause: "not_final", httpStatus: 200 };
   }
 
   // ── Durable run recovery archive RPC (PRD #1296 M3, D3/D5) ─────────────────────
@@ -6153,6 +6277,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
   staleRevisionSource?: boolean;
   reconciliation?: PlanCrossCheckReconciliation;
   registrationEvidence?: "recorded" | "refused";
+  checkpointPublication?: CheckpointPublicationAck;
 }> {
   const pendingMarker = res.headers.get(COMPLETION_PENDING_HEADER);
   const ackCap = maxAckBytes === undefined ? undefined
@@ -6207,6 +6332,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
       superseded_revision_input_ids?: unknown;
       // Issue #3859: top-level answer to a report that carried registration_evidence.
       registration_evidence?: unknown;
+      checkpoint_publication?: unknown;
     };
     const run = parsed?.run;
     const out: {
@@ -6253,6 +6379,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
       staleRevisionSource?: boolean;
       reconciliation?: PlanCrossCheckReconciliation;
       registrationEvidence?: "recorded" | "refused";
+      checkpointPublication?: CheckpointPublicationAck;
     } = {};
     if (isRecord(parsed) && (Object.hasOwn(parsed, "semantic_presentation") || Object.hasOwn(parsed, "semantic_approval"))) {
       try {
@@ -6404,6 +6531,9 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
     }
     if (parsed?.registration_evidence === "recorded" || parsed?.registration_evidence === "refused")
       out.registrationEvidence = parsed.registration_evidence;
+    if (parsed?.checkpoint_publication === "recorded" || parsed?.checkpoint_publication === "cleared" ||
+        parsed?.checkpoint_publication === "refused" || parsed?.checkpoint_publication === "unrecorded")
+      out.checkpointPublication = parsed.checkpoint_publication;
     const gateRev = parsed?.gate_revision;
     if (typeof gateRev === "number" && Number.isSafeInteger(gateRev) && gateRev >= 1) out.gateRevision = gateRev;
     const reconciliation = readPlanCrossCheckReconciliation(parsed);
@@ -6500,9 +6630,76 @@ function decodeCompletedPublicationReason(value: unknown): CompletedPublicationR
   switch (value) {
     case "completion_identity_missing": case "not_completed": case "identity_changed":
     case "mr_missing": case "branch_missing": case "branch_mismatch": case "head_mismatch":
-    case "not_ancestor": case "ancestry_unknown": case "forge_timeout": return value;
+    case "not_ancestor": case "ancestry_unknown": case "forge_timeout":
+    case "terminal_preservation_pending": case "terminal_preservation_refused": return value;
     default: return undefined;
   }
+}
+
+const TERMINAL_PRESERVATION_TIMEOUT_MS = 330_000;
+const TERMINAL_PRESERVATION_RESPONSE_MAX_BYTES = 16 * 1024;
+const TERMINAL_WIRE_ONLY_REASONS: ReadonlySet<string> =
+  new Set(["busy", "stale_claim", "missing_claim_generation", "invalid_request"]);
+// Reasons the worker may retry as is; they are publish_unknown, never a refusal of the work.
+const TERMINAL_RETRYABLE_REASONS: ReadonlySet<string> =
+  new Set(["busy", "forge_unavailable", "publication_in_flight", "authority_changed"]);
+// The statuses writeTerminalError (api handler) pairs with each reason; anything else is a contradiction.
+const TERMINAL_422_REASONS: ReadonlySet<string> = new Set(["unsupported", "manifest_invalid", "pack_invalid",
+  "tip_missing", "not_descendant", "root_unreachable", "tree_mismatch", "walk_too_large"]);
+function terminalReasonStatus(reason: TerminalWireReason): number {
+  if (TERMINAL_422_REASONS.has(reason)) return 422;
+  switch (reason) {
+    case "pack_too_large": return 413;
+    case "forge_unavailable": return 503;
+    case "busy": return 429;
+    case "invalid_request": return 400;
+    default: return 409;
+  }
+}
+function terminalWireReason(value: string): TerminalWireReason | undefined {
+  return TERMINAL_REASONS.find(r => r === value) ??
+    (TERMINAL_WIRE_ONLY_REASONS.has(value) ? value as TerminalWireReason : undefined);
+}
+// The run_terminal_contributions.disposition CHECK (migration 00449) and its pairing with state.
+const TERMINAL_RESPONSE_DISPOSITIONS: readonly TerminalResponseDisposition[] =
+  ["preserved", "closed_issue_abandoned", "closed_pr_abandoned"];
+// The refusal_reason CHECK: the only reasons a 200 can carry, and only on a refused state.
+const TERMINAL_STORED_REFUSAL_REASONS: ReadonlySet<string> =
+  new Set(["create_refused", "update_refused", "foreign_tip", "send_suppressed"]);
+const TERMINAL_RESPONSE_KEYS: ReadonlySet<string> = new Set([
+  "preservation_id", "contribution_id", "ref", "tip", "state", "preservation_state", "disposition", "reason",
+]);
+
+/** Outcome of {@link WorkerClient.publishTerminalPreservation}. Only `final` means the work is on the forge
+ *  (`published`) or the server durably recorded it as abandoned (`recorded`); everything ambiguous is `unknown`. */
+export type TerminalPreservationResult =
+  | { kind: "final"; outcome: "published" | "recorded"; response: TerminalPreservationResponse }
+  | { kind: "refused"; reason: TerminalWireReason; httpStatus: number }
+  | { kind: "unknown"; cause: "malformed_response" | "transport" | "aborted" | "http_status" | "not_final"; httpStatus?: number }
+  | { kind: "unknown"; cause: "retryable"; reason: TerminalWireReason; httpStatus: number };
+
+/** Strict decode of the 200 body; undefined on any defect (unknown field, state, reason, bad tip or ref). */
+// The run_terminal_preservations state CHECK (migration 00448): a value outside it is malformed.
+const TERMINAL_PRESERVATION_STATES: ReadonlySet<string> = new Set(
+  ["bound", "publishing", "live", "retiring", "deleted", "abandoned", "not_published"]);
+function decodeTerminalPreservationResponse(value: unknown, runId: string): TerminalPreservationResponse | undefined {
+  if (!isRecord(value) || Object.keys(value).some(k => !TERMINAL_RESPONSE_KEYS.has(k))) return undefined;
+  const str = (k: string) => typeof value[k] === "string" && (value[k] as string).length > 0 ? value[k] as string : undefined;
+  const state = TERMINAL_CONTRIBUTION_STATES.find(s => s === value.state);
+  const reason = value.reason === undefined ? undefined : TERMINAL_REASONS.find(r => r === value.reason);
+  if (!state || (value.reason !== undefined && !reason) || typeof value.tip !== "string" || !/^[0-9a-f]{40}$/.test(value.tip)) return undefined;
+  if (value.ref !== `refs/uzi-terminal/${runId}`) return undefined;
+  const disposition = TERMINAL_RESPONSE_DISPOSITIONS.find(d => d === value.disposition);
+  // recorded <=> an abandonment disposition (run_terminal_contributions_recorded_check).
+  if (!disposition || (state === "recorded") !== (disposition !== "preserved")) return undefined;
+  // A reason belongs to a refused state and is one of the stored refusal reasons.
+  if (reason !== undefined && (state !== "refused" || !TERMINAL_STORED_REFUSAL_REASONS.has(reason))) return undefined;
+  const preservation_id = str("preservation_id"), contribution_id = str("contribution_id"),
+    preservation_state = str("preservation_state");
+  if (!preservation_id || !contribution_id || !preservation_state ||
+      !TERMINAL_PRESERVATION_STATES.has(preservation_state)) return undefined;
+  return { preservation_id, contribution_id, ref: value.ref, tip: value.tip as string, state,
+    preservation_state, disposition, ...(reason ? { reason } : {}) };
 }
 
 const TERMINAL_REJECTION_RESPONSE_MAX_BYTES = 128 * 1024;

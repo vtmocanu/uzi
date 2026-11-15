@@ -739,11 +739,18 @@ describe("scanSignals report_progress (PRD #122 M2)", () => {
     // PRD #390 D3: a completely empty call is NO SIGNAL — it must not persist a
     // misleading `[]`, so progress stays undefined.
     assert.strictEqual(scanSignals(toolUse(PROGRESS, {})).progress, undefined);
-    // Non-array sides parse to two empty arrays ⇒ still no signal ⇒ undefined.
+    // Non-array, non-string sides parse to two empty arrays ⇒ still no signal ⇒ undefined.
     assert.strictEqual(
-      scanSignals(toolUse(PROGRESS, { completed: "nope", in_progress: 42 })).progress,
+      scanSignals(toolUse(PROGRESS, { completed: {}, in_progress: 42 })).progress,
       undefined,
     );
+    // A bare string side is one id (the MCP schema accepts a string or an array).
+    assert.deepStrictEqual(
+      scanSignals(toolUse(PROGRESS, { completed: "m1", in_progress: " m2 " })).progress,
+      { completed: ["m1"], in_progress: ["m2"] },
+    );
+    // A blank bare string is still no signal.
+    assert.strictEqual(scanSignals(toolUse(PROGRESS, { in_progress: "  " })).progress, undefined);
     // Junk entries dropped, blanks removed, ids trimmed, numbers/booleans coerced, deduped.
     assert.deepStrictEqual(
       scanSignals(
@@ -951,6 +958,20 @@ describe("buildSignalMcpServer report_progress schema gate (PRD #122 M2)", () =>
     assert.ok("completed" in shape! && "in_progress" in shape!, `expected completed + in_progress; got ${Object.keys(shape!).join(", ")}`);
     // PRD #1224 M1: the optional per-milestone agent attribution field is on the schema.
     assert.ok("milestones_agents" in shape!, `expected milestones_agents; got ${Object.keys(shape!).join(", ")}`);
+  });
+
+  it("accepts a single id string (or an array) for completed and in_progress", () => {
+    const tools = registeredTools(buildSignalMcpServer({ progress: true }));
+    const progress = tools["report_progress"] as { inputSchema?: { shape?: Record<string, unknown> } };
+    const shape = progress.inputSchema?.shape;
+    assert.ok(shape, "expected a zod object schema with a shape");
+    for (const key of ["completed", "in_progress"]) {
+      const side = shape![key] as { safeParse(v: unknown): { success: boolean } };
+      assert.ok(side.safeParse("m1").success, `${key} must accept a bare string`);
+      assert.ok(side.safeParse(["m1"]).success, `${key} must still accept an array`);
+      assert.ok(side.safeParse(undefined).success, `${key} must stay optional`);
+      assert.ok(!side.safeParse(42).success, `${key} must still reject a number`);
+    }
   });
 });
 

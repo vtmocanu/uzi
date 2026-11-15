@@ -26,6 +26,9 @@ vi.mock("../lib/api", async (importOriginal) => ({
       .mockResolvedValue({ total: 0, todo: 0, filed: 0, done: 0, dismissed: 0, false_positives: 0 }),
     runsInProgressCount: vi.fn().mockResolvedValue({ count: 0 }),
     listSchedules: vi.fn().mockResolvedValue([]),
+    listAgentTemplates: vi.fn().mockResolvedValue({ templates: [] }),
+    listWorkers: vi.fn().mockResolvedValue({ workers: [] }),
+    listSkills: vi.fn().mockResolvedValue({ skills: [] }),
     getFindingsStats: vi
       .fn()
       .mockResolvedValue({ total: 0, todo: 0, filed: 0, done: 0, dismissed: 0, false_positives: 0 }),

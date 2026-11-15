@@ -1,12 +1,11 @@
 // The default Overview at /dashboard (PRD #3877 M1): the same data as the classic page through
-// the shared useOverviewData hook, with a header that carries a status sentence (and, for an
+// the shared useOverviewData hook, with a compact header (and, for an
 // admin, the health chip) above the app-wide banner stack. The classic page stays linked
 // at /overview/classic until M2 retires it.
 
-import { useEffect, useRef, useState } from "react";
+import { useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { api, type TemplateAllocation } from "../lib/api";
-import { agentCountModel } from "../lib/agentCounts";
+import { agentSourceChipModel } from "../lib/agentSourceChip";
 import { AgentsChip } from "../components/AgentsChip";
 import { overviewScope, ISSUE_WORK_SCOPE_KEY, USAGE_SCOPE_KEY } from "../lib/prefs";
 import { executingPeople, peopleModel } from "../lib/overviewPeople";
@@ -17,13 +16,11 @@ import { maskName } from "../lib/demoMask";
 import { useOverviewData } from "../lib/useOverviewData";
 import { issueLineModel, issueLineOtherRuns, issueWorkScope, type IssueStage } from "../lib/issueLine";
 import {
-  decisionCount,
   mergeOverviewRows,
   overviewCounts,
   overviewDecisions,
   ownRecoveryWaitCount,
   setupComplete,
-  statusSentence,
   workerJoined,
 } from "../lib/overview";
 import { OverviewUsageCard } from "../components/OverviewUsageCard";
@@ -31,6 +28,7 @@ import { OnboardingChecklist } from "../components/OnboardingChecklist";
 import { NeedsDecisionCard } from "../components/NeedsDecisionCard";
 import { IssueLine } from "../components/IssueLine";
 import { OverviewRunsWidget } from "../components/OverviewRunsWidget";
+import { OverviewStickyActions } from "../components/OverviewStickyActions";
 import { CapacityRail } from "../components/CapacityRail";
 import { HeldWorkCard } from "../components/HeldWorkCard";
 import { HealthPlatformLine } from "../components/HealthPlatformLine";
@@ -45,7 +43,7 @@ import { SearchIcon } from "../components/icons";
 import { commandShortcutKeys, commandShortcutLabel } from "../lib/platform";
 
 // Remounted per signed-in user: every read on the page (the core load, the admin reads and the
-// Agents chip's allocations) belongs to one viewer, so a different user never sees, or joins
+// Agents chip's source status) belongs to one viewer, so a different user never sees, or joins
 // against, the previous viewer's data. A same-user session refresh keeps the mount.
 export function OverviewNext() {
   const { user } = useAuth();
@@ -53,15 +51,17 @@ export function OverviewNext() {
 }
 
 function OverviewNextPage() {
+  const titleRef = useRef<HTMLHeadingElement>(null);
   const commandMenu = useCommandMenu();
   const demo = useDemoMode();
   const { user } = useAuth();
-  const { data, usageWindow, changeUsageWindow, adminRuns, adminUsers, adminRepoActivity, holds, holdsFailed } =
+  const { data, usageWindow, changeUsageWindow, adminRuns, adminUsers, adminRepoActivity, adminAgentSource, holds, holdsFailed, holdsRequestFailed, runsRefreshFailed } =
     useOverviewData({
       includeAdminRuns: true,
       includeRecoveryHolds: true,
       includeAdminUsers: true,
       includeAdminRepoActivity: true,
+      includeAdminAgentSource: true,
     });
   const now = useNow(30_000);
   // The Usage card's scope is owned here so the People chip's "Usage by user" can switch it to
@@ -74,29 +74,6 @@ function OverviewNextPage() {
   // forced to "you" while the admin list loads never overwrites the saved choice.
   const [issueScope, setIssueScope] = useState(() => overviewScope.get(ISSUE_WORK_SCOPE_KEY));
 
-  // The Agents chip's allocation read: once on mount, never polled, separate from
-  // useOverviewData so the Dashboard's requests are untouched. StrictMode (main.tsx) replays
-  // effects in development; the ref keeps that to one request. A failure, even a synchronous
-  // throw, resolves null and hides only the chip.
-  // One viewer per mount (see OverviewNext above), so this read never outlives its viewer.
-  const allocRequest = useRef<Promise<TemplateAllocation[] | null> | null>(null);
-  const [allocations, setAllocations] = useState<TemplateAllocation[] | null>(null);
-  useEffect(() => {
-    allocRequest.current ??= Promise.resolve()
-      .then(() => api.getTemplateAllocations())
-      .then(
-        (r) => r.templates,
-        () => null,
-      );
-    let cancelled = false;
-    void allocRequest.current.then((a) => {
-      if (!cancelled) setAllocations(a);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
   if (!user) return null;
 
   const isAdmin = user.is_admin === true;
@@ -106,8 +83,7 @@ function OverviewNextPage() {
   const decisions = overviewDecisions(ownRuns, holds);
   // The counts follow the viewer's scope: own runs, or for an admin every user's runs
   // while the admin list is readable. An unreadable admin list falls back to the viewer's
-  // own runs and the sentence says so.
-  const adminUnavailable = isAdmin && adminRuns.failed;
+  // own runs. The Runs card reports the fallback with its existing message.
   const factoryRows =
     isAdmin && adminRuns.runs != null && !adminRuns.failed
       ? mergeOverviewRows(ownRuns, adminRuns.runs, user.email)
@@ -121,16 +97,8 @@ function OverviewNextPage() {
         otherRuns: issueLineOtherRuns({ scope: lineScope, adminRuns, viewerEmail: user.email }),
       })
     : null;
-  const sentence = data
-    ? statusSentence({
-        decisions: decisionCount(decisions),
-        prs: decisions.filter((d) => d.kind === "pr").length,
-        counts: overviewCounts(factoryRows ?? ownRuns),
-        acrossFactory: factoryRows != null,
-        adminUnavailable,
-        executingPeople: factoryRows ? executingPeople(factoryRows, user.email) : undefined,
-      })
-    : undefined;
+  const runTotals = data ? overviewCounts(factoryRows ?? ownRuns) : null;
+  const calm = data !== null && holds !== null && !holdsRequestFailed && !runsRefreshFailed && decisions.length === 0;
   // The People chip's model: admins only, from the viewer's own runs plus the admin list, users
   // and usage. Each source degrades on its own (see peopleModel).
   const people = isAdmin
@@ -157,10 +125,11 @@ function OverviewNextPage() {
         demo,
       })
     : null;
-  // The Agents chip's model: every user. Needs both the mount-only allocations and the core
-  // templates read, so it appears once both have landed.
-  const agentCounts =
-    allocations && data ? agentCountModel(allocations, data.agentTemplates, { isAdmin, viewerId: user.id }) : null;
+  // The Agents chip counts the core template rows directly. The optional one-shot admin
+  // source read changes only its sync detail; a missing allocation can never hide it.
+  const agentCounts = data
+    ? agentSourceChipModel(data.agentTemplates, { isAdmin, viewerId: user.id, source: adminAgentSource, demo, now })
+    : null;
   const showUsageByUser = () => {
     setUsageScope("all");
     overviewScope.set(USAGE_SCOPE_KEY, "all");
@@ -175,9 +144,15 @@ function OverviewNextPage() {
       <InShellHeader>
         <PageHeader
           title={`Welcome${user.display_name ? `, ${maskName(user.display_name, demo)}` : ""}`}
-          description={sentence}
+          titleRef={titleRef}
+          actionsClassName="max-w-full"
+          description={
+            <Link to="/overview/classic" className="font-medium text-brand hover:text-brand-hover">
+              Back to the old Overview
+            </Link>
+          }
           actions={
-            <>
+            <OverviewStickyActions titleRef={titleRef}>
               {isAdmin && <HealthChip />}
               {people && <PeopleChip model={people} onShowUsageByUser={showUsageByUser} />}
               {repos && <RepoChip model={repos} />}
@@ -194,10 +169,7 @@ function OverviewNextPage() {
                   </kbd>
                 </Button>
               )}
-              <Link to="/overview/classic" className="text-sm font-medium text-brand hover:text-brand-hover">
-                Back to the old Overview
-              </Link>
-            </>
+            </OverviewStickyActions>
           }
         />
       </InShellHeader>
@@ -213,6 +185,9 @@ function OverviewNextPage() {
 
       {/* The viewer's own items only (decisions is computed from ownRuns). */}
       <NeedsDecisionCard items={decisions} now={now} demo={demo} />
+      <p role="status" className={calm ? "flex items-center gap-2 text-sm text-muted" : "sr-only"}>
+        {calm && <><span aria-hidden="true" className="h-2 w-2 rounded-full bg-ok" />Nothing needs you right now.</>}
+      </p>
 
       {lineModel && (
         <IssueLine
@@ -253,6 +228,9 @@ function OverviewNextPage() {
             stage={lineStage}
             scope={lineScope}
             prRuns={lineModel?.prs}
+            totals={runTotals}
+            acrossFactory={factoryRows != null}
+            executingPeople={factoryRows ? executingPeople(factoryRows, user.email) : undefined}
           />
         </div>
         {/* Below xl the rail is full width: Capacity and Held work sit side by side from lg. */}

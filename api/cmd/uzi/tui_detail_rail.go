@@ -123,6 +123,14 @@ const railWaitingMaxRows = 5
 // railWaitingLabel leads the waiting explanation and stays faint; the reason follows it.
 const railWaitingLabel = "queued ▸ "
 
+// railWithheldLabel leads the reason of a running run whose checkpoint publication is withheld
+// (issue #4257). The rail then draws apitypes.HintCheckpointPublicationWithheld, bounded to
+// railWithheldHintRows; the HEALTH_HINT row of `uzi run get` carries it in full.
+const (
+	railWithheldLabel    = "withheld ▸ "
+	railWithheldHintRows = 6
+)
+
 // railWaitingLine explains why a queued run is waiting (issue #2705: for example a stale-requeued
 // run held for its returning worker, with the deadline). Existing waiting-worker reasons occupy
 // at most railWaitingMaxRows; active typed admission gets up to eight additional rows, even
@@ -134,8 +142,13 @@ func (m tuiModel) railWaitingLine() string {
 
 func (m tuiModel) railWaitingLineAt(now time.Time) string {
 	run := m.detail.run
-	if run.Status != "queued" && accountCooldownLineAt(run, now) == "" {
+	withheld := run.Status == "running" && run.Health == healthPublicationWithheld
+	if run.Status != "queued" && !withheld && accountCooldownLineAt(run, now) == "" {
 		return ""
+	}
+	label := railWaitingLabel
+	if withheld {
+		label = railWithheldLabel
 	}
 	reason := runHealthReasonAt(run, now)
 	admission := codexAdmissionLineAt(run, now)
@@ -143,12 +156,20 @@ func (m tuiModel) railWaitingLineAt(now time.Time) string {
 		admission = cooldown
 	}
 	var rows []string
-	if run.Health == "waiting_worker" && reason != "" && reason != admission {
+	if withheld {
+		if reason != "" {
+			text := struct{ runHealthReason string }{runHealthReason: reason}
+			plain := m.renderer.Plain(text.runHealthReason, m.railWidth()*railWaitingMaxRows+railWaitingMaxRows)
+			rows = wrapWords(label+plain, m.railWidth(), railWaitingMaxRows)
+		}
+		hint := m.renderer.Plain(apitypes.HintCheckpointPublicationWithheld, m.railWidth()*railWithheldHintRows+railWithheldHintRows)
+		rows = append(rows, wrapWords(hint, m.railWidth(), railWithheldHintRows)...)
+	} else if run.Health == "waiting_worker" && reason != "" && reason != admission {
 		text := struct{ runHealthReason string }{runHealthReason: reason}
 		plain := m.renderer.Plain(text.runHealthReason, m.railWidth()*railWaitingMaxRows+railWaitingMaxRows)
-		rows = wrapWords(railWaitingLabel+plain, m.railWidth(), railWaitingMaxRows)
+		rows = wrapWords(label+plain, m.railWidth(), railWaitingMaxRows)
 	} else if queue := runQueueReason(run); queue != "" {
-		rows = wrapWords(railWaitingLabel+m.renderer.Plain(queue, m.railWidth()*railWaitingMaxRows), m.railWidth(), railWaitingMaxRows)
+		rows = wrapWords(label+m.renderer.Plain(queue, m.railWidth()*railWaitingMaxRows), m.railWidth(), railWaitingMaxRows)
 	}
 	if admission != "" {
 		// Eight rows retain the class and UTC nanosecond timestamp at the 26-column floor.
@@ -161,9 +182,9 @@ func (m tuiModel) railWaitingLineAt(now time.Time) string {
 		if i == 0 {
 			// TrimSpace: wrapWords drops the label's trailing space when the reason's first word
 			// does not fit beside it, and the label must stay faint either way.
-			label := strings.TrimSpace(railWaitingLabel)
-			if rest, ok := strings.CutPrefix(row, label); ok {
-				row = m.pal.faint.Render(label) + rest
+			lead := strings.TrimSpace(label)
+			if rest, ok := strings.CutPrefix(row, lead); ok {
+				row = m.pal.faint.Render(lead) + rest
 			}
 		}
 		sb.WriteString(row + "\n")

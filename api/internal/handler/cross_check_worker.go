@@ -360,6 +360,10 @@ type workerReconciledStateAck struct {
 	Run                        any      `json:"run"`
 	CredentialSwitch           any      `json:"credential_switch,omitempty"`
 	Disposition                any      `json:"disposition,omitempty"`
+	// Issue #4257: the checkpoint_publication outcome and the registration evidence the plain ACK
+	// carries; a plan-cross-check run answers this reconciled shape and must not lose them.
+	CheckpointPublication string `json:"checkpoint_publication,omitempty"`
+	RegistrationEvidence  string `json:"registration_evidence,omitempty"`
 	leadReconciliationResponse
 }
 

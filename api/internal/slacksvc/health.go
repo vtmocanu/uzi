@@ -41,6 +41,8 @@ const (
 	healthSlow          = "slow"
 	healthWaitingWorker = "waiting_worker"
 	healthApprovalIdle  = "approval_idle"
+	// healthPublicationWithheld mirrors workersvc's issue #4257 enum value.
+	healthPublicationWithheld = "publication_withheld"
 )
 
 // reasonPersistFailing mirrors workersvc's PRD #108 M4 reason string — the ONE
@@ -110,6 +112,8 @@ func healthRootLabel(health string) string {
 		return "waiting for a worker"
 	case healthApprovalIdle:
 		return "still needs approval"
+	case healthPublicationWithheld:
+		return "checkpoint publication withheld"
 	default:
 		return ""
 	}
@@ -175,6 +179,8 @@ func healthNudgeHead(health, reason string) string {
 		return "⏳ This run is still waiting for a worker to pick it up."
 	case healthApprovalIdle:
 		return "⏸️ This run is still waiting for your approval."
+	case healthPublicationWithheld:
+		return "🔒 This run's checkpoint publication is withheld by a secret-scan restriction."
 	default:
 		return "⚠️ This run needs a look."
 	}

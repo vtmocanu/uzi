@@ -1417,6 +1417,11 @@ export interface AppSettings {
   // Turning it off wakes every hibernated worker (at most 10 per pass); waking
   // never depends on it. Optional so older responses and fixtures still type-check.
   worker_hibernation_enabled?: string;
+  // Automatic hibernation of idle workers (PRD #4207): "true"/"false", default "false",
+  // effective only while worker_hibernation_enabled is "true". idle_after is a Go
+  // duration (default "336h", valid 1h..2160h). Optional for older responses.
+  worker_hibernation_auto?: string;
+  worker_hibernation_idle_after?: string;
   // Per-user persistent hosted-worker quota: integer 0..20, default 2. Zero disables provisioning.
   hosted_worker_quota: string;
   // Per-owner custody admission limit: whole number 1..1000, default "8". Lowering it blocks future claims only.
@@ -3260,7 +3265,7 @@ export type StopKind =
 export type JudgeVerdict = "ideal" | "ok" | "issues";
 
 export type RunHealth =
-  "ok" | "stalled" | "looping" | "slow" | "waiting_worker" | "approval_idle" | "waiting_account_cooldown";
+  "ok" | "stalled" | "looping" | "slow" | "waiting_worker" | "approval_idle" | "waiting_account_cooldown" | "publication_withheld";
 
 // FixVerdict is a ci_fix run's outcome (PRD #6): verified/fix_failed are stamped
 // server-side from the post-fix pipeline; not_code is the agent's "not a code

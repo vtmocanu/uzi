@@ -10,6 +10,12 @@
 declare module "node:fs" {
   export function readFileSync(path: URL | string, encoding: "utf8"): string;
   export function existsSync(path: URL | string): boolean;
+  export function realpathSync(path: string): string;
+  export function mkdtempSync(prefix: string): string;
+  export function mkdirSync(path: string, options?: { recursive?: boolean }): void;
+  export function writeFileSync(path: string, data: string): void;
+  export function symlinkSync(target: string, path: string): void;
+  export function rmSync(path: string, options?: { recursive?: boolean; force?: boolean }): void;
   // The mock-graph acyclic guard (mocks/api-acyclic.test.ts) enumerates every
   // non-test mock source by a recursive directory walk. Only the
   // withFileTypes+recursive overload is used; declared TYPE-only, as above.
@@ -50,6 +56,9 @@ declare module "node:path" {
   export function dirname(p: string): string;
   export function resolve(...segments: string[]): string;
   export function join(...segments: string[]): string;
+  export function relative(from: string, to: string): string;
+  export function isAbsolute(p: string): boolean;
+  export const sep: string;
   interface PathModule {
     dirname(p: string): string;
     resolve(...segments: string[]): string;
@@ -57,4 +66,8 @@ declare module "node:path" {
   }
   const path: PathModule;
   export default path;
+}
+
+declare module "node:os" {
+  export function tmpdir(): string;
 }

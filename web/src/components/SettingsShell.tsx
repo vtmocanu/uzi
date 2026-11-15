@@ -13,7 +13,7 @@ import { NavLink } from "react-router-dom";
 import type { ReactNode } from "react";
 import { cx, PageHeader } from "./ui";
 
-const TABS = [
+export const TABS = [
   { to: "/settings", label: "Account & tokens", end: true },
   { to: "/settings/appearance", label: "Appearance", end: false },
   { to: "/settings/run-defaults", label: "Run defaults", end: false },

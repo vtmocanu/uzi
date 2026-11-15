@@ -9,6 +9,7 @@ import {
   api,
   type AdminUsage,
   type AgentTemplate,
+  type AgentSourceView,
   type RecoveryCustodyHolds,
   type RepoActivity,
   type RunSummaryItem,
@@ -88,9 +89,13 @@ export function useOverviewData(opts?: {
   includeRecoveryHolds?: boolean;
   includeAdminUsers?: boolean;
   includeAdminRepoActivity?: boolean;
+  includeAdminAgentSource?: boolean;
 }) {
   const { user } = useAuth();
   const [data, setData] = useState<Overview | null>(null);
+  // A failed volatile snapshot poll keeps last-good rows for every existing card, but the
+  // default Overview must not claim "nothing needs you" from those stale run decisions.
+  const [runsRefreshFailed, setRunsRefreshFailed] = useState(false);
   const [adminRuns, setAdminRuns] = useState<AdminRunsState>(NO_ADMIN_RUNS);
   const [usageWindow, setUsageWindow] = useState<UsageWindow>(readUsageWindow);
   const changeUsageWindow = useCallback((value: UsageWindow) => {
@@ -241,18 +246,27 @@ export function useOverviewData(opts?: {
   // arrive, while an older response never overwrites a newer one.
   const holdsRequestIdRef = useRef(0);
   const holdsAppliedIdRef = useRef(0);
+  const holdsLatestSettledIdRef = useRef(0);
   const loadHolds = useCallback(async () => {
     if (!holdsEnabled) return;
     const id = ++holdsRequestIdRef.current;
     try {
       const next = await api.getRecoveryHolds();
-      if (!pollAliveRef.current || id <= holdsAppliedIdRef.current) return;
-      holdsAppliedIdRef.current = id;
-      setHolds(next);
-      setHoldsRequestFailed(false);
+      if (!pollAliveRef.current) return;
+      if (id > holdsAppliedIdRef.current) {
+        holdsAppliedIdRef.current = id;
+        setHolds(next);
+      }
+      // An older success may supply last-good data after a newer failure, but it cannot
+      // make the latest request read as healthy for the calm notice.
+      if (id > holdsLatestSettledIdRef.current) {
+        holdsLatestSettledIdRef.current = id;
+        setHoldsRequestFailed(false);
+      }
     } catch {
       // keep the last-good holds
-      if (!pollAliveRef.current || id <= holdsAppliedIdRef.current) return;
+      if (!pollAliveRef.current || id <= holdsLatestSettledIdRef.current) return;
+      holdsLatestSettledIdRef.current = id;
       setHoldsRequestFailed(true);
     }
   }, [holdsEnabled]);
@@ -324,6 +338,28 @@ export function useOverviewData(opts?: {
     void loadRepoActivity();
   }, [repoActivityEnabled, loadRepoActivity]);
 
+  // The Overview Agents chip reads the admin agent-source status once, independent of the
+  // core load and polls. A missing admin read affects only its optional sync details.
+  // The ref keeps StrictMode's effect replay to one request per viewer mount.
+  const agentSourceEnabled = opts?.includeAdminAgentSource === true && user?.is_admin === true;
+  const [adminAgentSource, setAdminAgentSource] = useState<AgentSourceView | null>(null);
+  const agentSourceRequestRef = useRef<Promise<AgentSourceView | null> | null>(null);
+  useEffect(() => {
+    if (!agentSourceEnabled) {
+      agentSourceRequestRef.current = null;
+      setAdminAgentSource(null);
+      return;
+    }
+    agentSourceRequestRef.current ??= Promise.resolve()
+      .then(() => api.getAgentSource())
+      .then((result) => result.agent_source, () => null);
+    let cancelled = false;
+    void agentSourceRequestRef.current.then((view) => {
+      if (!cancelled) setAdminAgentSource(view);
+    });
+    return () => { cancelled = true; };
+  }, [agentSourceEnabled]);
+
   const poll = useCallback(async () => {
     try {
       const [{ runs }, { workers }] = await Promise.all([api.listRuns({ view: "summary" }), api.listWorkers()]);
@@ -339,8 +375,10 @@ export function useOverviewData(opts?: {
             }
           : prev,
       );
+      setRunsRefreshFailed(false);
     } catch {
       // keep the last-good data
+      if (pollAliveRef.current) setRunsRefreshFailed(true);
     }
   }, []);
   usePollWhileVisible(poll, 10000);
@@ -367,7 +405,10 @@ export function useOverviewData(opts?: {
     adminRuns,
     adminUsers,
     adminRepoActivity,
+    adminAgentSource,
     holds,
     holdsFailed: holdsRequestFailed && holds === null,
+    holdsRequestFailed,
+    runsRefreshFailed,
   };
 }
