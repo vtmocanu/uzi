@@ -252,6 +252,20 @@ describe("sticky Overview chips (#4370)", () => {
     });
   }
 
+  it("pins without shifting content after a long greeting wraps the chips below the title", async () => {
+    vi.mocked(useAuth).mockReturnValue(authValue({ ...aUser, is_admin: true, display_name: "Alexandra-Margareta Constantinescu" }));
+    const { title, row } = await mountAt(1440);
+    expect(row.getBoundingClientRect().top).toBeGreaterThanOrEqual(title.getBoundingClientRect().bottom);
+    const content = screen.getByRole("region", { name: "Issue work" });
+    const before = content.getBoundingClientRect().top + window.scrollY;
+    window.scrollTo(0, 650);
+    await expect.poll(() => row.dataset.stuck).toBe("true");
+    expect(row.getBoundingClientRect().top).toBe(0);
+    expect(Math.abs(content.getBoundingClientRect().top + window.scrollY - before)).toBeLessThanOrEqual(1);
+    await expect.poll(() => parseFloat(document.documentElement.style.scrollPaddingTop))
+      .toBeGreaterThanOrEqual(Math.ceil(row.getBoundingClientRect().height) + 12);
+  });
+
   it("keeps a wrapped pinned row and its focus clearance when chip labels grow", async () => {
     const { row } = await mountAt(1280);
     const chips = [...row.querySelectorAll<HTMLElement>("button[aria-haspopup='dialog']")];
