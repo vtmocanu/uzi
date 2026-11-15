@@ -161,10 +161,10 @@ func (s *Service) ResolveCredentialOverrideOn(ctx context.Context, q *store.Quer
 	return validateCredentialOverrideOn(ctx, q, userID, kind, harness, mode, secretID)
 }
 
-// validateCredentialOverride is the pool-bound entry to the ONE validator every override
+// validateCredentialOverride is the pool-bound entry to the validator every Anthropic override
 // write runs through, validateCredentialOverrideOn (PRD #1247 M1) — at run create (which
 // calls validateCredentialOverrideOn directly on its transaction, issue #1626), run approve
-// --token, run set-token, and schedule create/edit (the handlers wire it in M2/M4/M6; M1 provides the function and its
+// --token, Claude run set-token, and schedule create/edit (the handlers wire it in M2/M4/M6; M1 provides the function and its
 // tests). It answers "may this run/schedule carry this override, and what columns does
 // it write?" and returns the resolved *CredentialOverride (nil = inherit ⇒ clear both
 // columns) or one of the typed refusals above.

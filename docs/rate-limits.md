@@ -220,7 +220,9 @@ a usage-meter GET returning 429 do not trigger this wait.
 
 The wait is shared by your saved aliases of the same verified account,
 including after refresh or re-import. Another authorized account remains
-independent; uzi never moves a run to another account. If you opted in to
+independent; this wait does not automatically move a run to another account.
+The separate [live owner switch](codex-credentials.md#switching-a-live-run)
+requires an explicit credential choice. If you opted in to
 [account auto-selection](#account-auto-selection), a wait only steers which
 account a *new* run is created on.
 
@@ -317,7 +319,8 @@ Retry-After use.
 These readings also steer which account a **new** run is created on, for users
 who turned on [Codex account auto-selection](codex-credentials.md#letting-uzi-pick-the-account)
 and pooled at least one login. Nothing here applies in the default mode, and a
-run never changes account after it is created.
+run is not moved by auto-selection after creation. An explicit
+[live owner switch](codex-credentials.md#switching-a-live-run) is separate.
 
 - **The order** follows `UZI_AUTOSELECT_ORDER`: by default the account whose
   weekly window resets soonest among those with enough headroom, or the most

@@ -247,14 +247,13 @@ A few things are specific to Codex:
   account live as long as another enabled login points at it: its meter
   keeps updating and the disabled row says so. The account goes quiet only
   when every login for it is disabled.
-- **A Codex run keeps the login it started with.** A Codex run that was
-  created with a login you later disable waits, showing **waiting:
-  credential disabled**, and resumes when you enable that login again. It
-  is never moved to another login or to Claude, and Codex runs have no
-  per-run token switch.
+- **Disabling does not select a replacement.** A Codex run bound to a login
+  you later disable waits, showing **waiting: credential disabled**, and
+  resumes when you enable that login again. Eligible live runs also have an
+  explicit owner switch; see [Switching a live run](#switching-a-live-run).
 - **An account reset fails queued Codex runs created before it.** An
   admin-issued [account reset](auth-design.md) deletes your Codex logins. A
-  Codex run created before the reset keeps its fixed login, which is now
+  Codex run created before the reset keeps its committed binding, whose login is now
   gone, so its next claim fails with "the bound Codex login is unavailable
   after your account reset; start a new run". A Codex run already executing
   when the reset lands is not stopped: it may finish on the credential its
@@ -269,6 +268,59 @@ A few things are specific to Codex:
   for a new paste (the **Credential action required** state above) if that
   fails. How long an unused login stays valid at OpenAI is outside uzi's
   control.
+
+## Switching a live run
+
+On an eligible live Codex run, the owner can choose an enabled, owner-owned
+**Codex subscription** or **OpenAI API key** in the web credential picker,
+or use its label from `uzi token list`:
+
+```sh
+uzi run set-token <run-id> <label>
+```
+
+This is an explicit choice: Codex does not accept `--auto`, `--default` or
+`--inherit` here, and does not use Anthropic pool or worker-binding rules.
+The server accepts `running` and worker-held `awaiting_approval`,
+`awaiting_input` or `awaiting_followup`, then applies at the next safe
+boundary. A claimed run returns 409. Queued runs and every park return 422,
+including worker-held `limit_wait` and `recovery_wait`. Lane eligibility
+is decided by the server. An unresolved policy episode rejects both request
+and apply; changing credentials cannot consent to a policy continuation.
+A busy refresh lease or refresh intent refuses the switch; retry as directed.
+
+A successful switch keeps the worker, claim generation and worktree, without
+an attempt, custody or reclaim transition. The new credential gets fresh
+worker-owned authority and a fresh `CODEX_HOME`; only session data is copied,
+not `auth.json`. The worker attempts the saved session ID. Only a confirmed
+provider refusal permits a fresh thread in the same directory, with
+`resume_lineage_break` / `credential_switch_resume_refused`; preservation
+requirements still hold and can refuse the fresh thread.
+
+If persistence fails before teardown, the old credential may continue only
+after an exact-operation acknowledgement confirms non-application and the worker
+proves it still owns the run. Unproven teardown keeps
+the work and custody under `credential_switch_settling`, then
+`credential_switch_unsettled`. An uncertain apply uses a plain owner pause
+with a `credential_switch_uncertain` feed message. Neither old nor new
+credential executes until the uncertainty is resolved. No release/reclaim
+fallback is added.
+
+### Recovery and acceptance limits
+
+Normal recovery after actual worker loss can create a new claim and checkout.
+It uses the database-committed Codex binding, a new capability and epoch ordinal
+0, rather than resolving the Anthropic selection ladder. The candidate saved
+session ID comes from `claim.session_id`; path, rollout and provider checks
+still decide whether it can resume. A fresh working directory has an explicit
+lineage break. Missing session IDs now produce an explicit notice on retained
+recovery. Preservation refuses a fresh directory or missing conversation
+instead of silently starting over.
+
+This is not a universal crash-resume or storage-durability guarantee.
+Cross-account provider acceptance is **unproven**: evidence uses fakes, and
+owner acceptance with two real accounts remains pending and non-closing.
+See [ADR-4201](../adr/4201-in-place-credential-switch.md#codex-live-owner-switch-2026-11-15).
 
 ## Letting uzi pick the account
 
@@ -391,12 +443,12 @@ on the one releasing soonest (`pool_exhausted`) and waits as any run does.
 
 ### What does not change
 
-- **A run never switches account after creation.** A resume, a usage-limit park
-  or a restart keeps the account it was created on, and the
+- **Auto-selection does not switch an existing run.** A resume, a usage-limit park
+  or a restart keeps its committed account binding, and the
   [admission wait](rate-limits.md#temporary-account-admission-waits) and
   [reserve](rate-limits.md#weekly-usage-reserve) apply to that account. A
   [disabled](#disabling-a-credential) login still makes its runs wait.
-- **Per-run token choices are unchanged.** Codex runs still have no per-run
-  token switch.
+- **Live switches require an explicit owner choice.** They do not use the pool;
+  see [Switching a live run](#switching-a-live-run).
 - **Out of scope:** pooling OpenAI API keys, and Codex chat. Neither is chosen
   by this mode.

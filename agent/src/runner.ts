@@ -28478,7 +28478,7 @@ export class RunRunner {
    * gets no proof and goes straight to the op-fenced hold, #3644 3.4(b)). Closed-route cases handled:
    * a restore-route predecessor, a completed retained successor, and a flight lacking a ledger, holder,
    * registration nonce or claim generation. `undefined` for: no negotiated capability, no pending op on this
-   * generation, an open route, and a Codex flight (Codex never switches in place and keeps its prior behaviour).
+   * generation, an open route, and a Codex flight (which uses its separate live-switch path).
    */
   private closedInPlaceSwitch(claim: ClaimResponse, flight: RunFlight): { opId: string; retained: boolean } | undefined {
     const pending = flight.steering.pendingCredentialSwitchOp();

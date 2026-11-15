@@ -642,7 +642,7 @@ issue, no branch and nobody's attention, and would silently pile up. Because
 the token rides the claim rather than the worker, re-pointing a worker is
 complete server-side — no restart, no re-minted join token. Since PRD #1247
 `claimSecretID` also consults, ahead of the worker's own bind mode, a
-per-run (or per-schedule) credential override the owner can set or change at
+per-run (or per-schedule) credential override that, for Claude, the owner can set or change at
 any time — queued, parked, at the plan gate, or mid-run. A mid-run switch
 reuses the same custody `runs.claim_generation` (below) as its fence. On a
 worker that negotiated `credential_switch_in_place_v1` (against an api serving
@@ -654,7 +654,7 @@ withdraws the switch stamp and appends the `credential_switch` feed message,
 and returns the token only after COMMIT. The worker, claim generation and
 working directory stay the same and the SDK restarts on the new token,
 resuming the same session where the provider allows (otherwise a fresh session
-in the same directory, with a notice). A worker without the capability still crosses an actual claim
+in the same directory, with a notice). A legacy Claude worker without the capability still crosses an actual claim
 boundary: it releases the claim (`claim_released_at` fence) and the next claim
 delivers the token. Where quiescence cannot be proven the run is held `paused`
 for the owner (`credential_switch_settling`, then `credential_switch_unsettled`)
@@ -663,6 +663,10 @@ pause (`credential_switch_uncertain`; the worker posts that feed line itself
 through its own message stream, not the server). See
 [adr/1247-per-run-token-selection.md](adr/1247-per-run-token-selection.md) and
 [adr/4201-in-place-credential-switch.md](adr/4201-in-place-credential-switch.md).
+Codex uses its separate owner-authorized fenced live-switch path: running or
+worker-held awaiting states only; claimed returns 409, queued and every park
+return 422. It changes the committed binding without a release/reclaim fallback;
+cross-account thread resume is attempted and remains unproven with real accounts.
 
 Since PRD #111 the bind mode is three-valued — `default`, `pinned` or `auto`
 — and `auto` ranks the owner's opted-in tokens, by default the soonest weekly

@@ -373,10 +373,12 @@ decisions, plain-resume refusal and version limits.
 
 ## Credential-switch holds
 
-This flow applies to Claude. Codex per-run credential overrides remain unsupported
-(D9); its direct and retained switch entries retain/refuse before capture or
-credential work. Only Claude invokes the switch callback; see
-[ADR-1247](../adr/1247-per-run-token-selection.md).
+The Claude flow below retains its legacy compatibility rules; see
+[ADR-1247](../adr/1247-per-run-token-selection.md). Codex has a separate
+[live owner switch](codex-credentials.md#switching-a-live-run), with no
+release/reclaim fallback. Unproven teardown keeps settling/unsettled custody;
+an uncertain apply uses the plain owner pause described below. Parked Codex
+runs cannot use set-token to select a replacement.
 
 When you switch the token of a Claude run that still carries retained recovery work
 ([Anthropic tokens](anthropic-token.md#where-you-can-pick-it)), the worker

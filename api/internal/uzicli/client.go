@@ -147,11 +147,10 @@ type Client interface {
 	ResumePolicyHold(ctx context.Context, id, mode, episodeID, guidance string) (apitypes.RunDTO, bool, error)
 	// SetRunCredential is the `uzi run set-token` verb (PRD #1247 M4, D4/D12): POST
 	// /api/runs/{id}/credential {mode, secret_id?}, RequireUser so a uzc_ CLI Bearer reaches
-	// it. It re-points which Anthropic token a queued or parked run spends (promoting a
-	// parked run to queued at once) and returns the updated run plus an optional D6 warning
-	// string. A held/claimed/terminal run is 409 → ExitConflict (5); a foreign/unknown run
-	// or token is 404 → ExitNotFound (4); a codex-harness run is 422; a bad mode is 400 →
-	// ExitUsage (2) — all via the shared status→exit mapping.
+	// it. Claude supports eligible queued, parked and live token changes. Codex requires
+	// an explicit credential on a live worker-held run; claimed is 409, queued and every
+	// park are 422. It returns the updated run and an optional warning. Foreign/unknown
+	// runs or credentials are 404. Errors use the shared status-to-exit mapping.
 	SetRunCredential(ctx context.Context, id string, override SetRunCredentialOverride) (apitypes.RunDTO, string, error)
 	// SetRunMrRework sets the per-run MR review-rework override (PRD #841 M3): PUT
 	// /api/runs/{id}/mr-rework {enabled: bool|null}, RequireUser so a CLI `uzc_` token can

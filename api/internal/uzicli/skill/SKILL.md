@@ -614,7 +614,8 @@ uzi version
   (with the `=`, since a bare bool flag consumes no following word) to force it off
   for this run only. A park holds its issue lock and worker disk, and can hold a
   run-bound hosted worker and PVC for up to `RUN_LIMIT_MAX_PARK` per park (8 days
-  by default). Codex keeps its frozen account; there is no Anthropic token switching.
+  by default). Codex keeps its committed account during the park; the live
+  owner switch does not accept parked runs or use Anthropic selection.
   Missing usable resets use the bounded fallback and can exhaust the wait budget
   before a weekly window reopens.
 
@@ -794,7 +795,20 @@ uzi version
   and nothing is written to the forge. Prints the updated run; `--json` emits the run
   object.
 - `uzi run set-token <run-id> <label>|--auto|--default|--inherit` — re-point which
-  Anthropic token this run spends (PRD #1247). A positional token **label** pins the run
+  credential this run spends. For Codex, use an explicit enabled owner-owned
+  Codex subscription or OpenAI API-key **label**; `--auto`, `--default` and
+  `--inherit` are refused. It accepts running or worker-held awaiting_approval,
+  awaiting_input and awaiting_followup runs, applying at the next safe boundary.
+  Claimed is 409; queued and every park (including worker-held limit_wait and
+  recovery_wait) are 422. Unresolved policy episodes refuse request and apply;
+  a busy refresh lease/intent refuses with retry guidance. Success keeps worker,
+  generation and worktree with no attempt, custody or reclaim transition.
+  It attempts the saved session; confirmed provider refusal alone permits a fresh
+  thread with lineage notice, subject to preservation holds. Uncertain apply
+  pauses with credential_switch_uncertain; neither credential executes until
+  resolved. Real cross-account provider acceptance remains unproven.
+  The following modes and park promotion rules apply to **Claude** (PRD #1247).
+  A positional token **label** pins the run
   to that token; `--auto` auto-selects from your pool, `--default` uses your default
   token, and `--inherit` clears the override back to the worker's binding. Exactly one of
   {label, `--auto`, `--default`, `--inherit`} is required and they are mutually exclusive
@@ -810,13 +824,16 @@ uzi version
   Cancel ends the run;
   **running, or held at a gate/question/follow-up, on a worker that
   advertises the `credential_switch` capability** — the switch is only **requested**, not
-  yet applied: the server signals it to the worker, which finishes quiescing and
-  **releases** its claim (banking the elapsed time like a pause) before the switch is
+  yet applied: a negotiated in-place worker proves quiescence and switches in
+  the same claim, attempting session resume; a confirmed refusal starts a fresh
+  session with a lineage notice. Unproven teardown holds custody; an uncertain
+  apply pauses for the owner without executing either token. An older Claude
+  worker finishes quiescing and **releases** its claim (banking the elapsed time like a pause) before the switch is
   **applied** at the next reclaim, so a live turn loses at most its in-flight step. It is
   refused (409, exit 5) when no live worker currently holds the run, or the holding worker
   predates the `credential_switch` capability (an old worker fleet) — set-token never
   silently no-ops on either. A foreign/unknown run or an unknown token label is refused
-  (404 / usage); a codex run is 422; the chat/judge/self_improve lanes are 409
+  (404 / usage); the chat/judge/self_improve lanes are 409
   ("lane not switchable") at every state; a review run (a `task` run reviewing another) is 409
   only while it is HELD (running or at a gate) — a queued or parked review run accepts the
   override and honours it on its next claim. It may print a warning (the token has no
