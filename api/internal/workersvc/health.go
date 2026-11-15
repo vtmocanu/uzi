@@ -96,7 +96,7 @@ type Settings interface {
 }
 
 // Health flag values. These mirror the CHECK constraint on runs.health; keep them
-// in sync with migrations 00057, 00377 and 00457.
+// in sync with migrations 00057, 00377 and 00460.
 const (
 	healthOK                     = "ok"
 	healthStalled                = "stalled"
