@@ -12,13 +12,15 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// sourceEndLockSeam signals immediately before the worker-lock query, or after
-// Scan has acquired its row lock. Each instance wraps exactly one operation.
+// sourceEndLockSeam signals immediately before the selected lock query (worker
+// by default), or after Scan acquires its row lock. Each wraps one operation.
 type sourceEndLockSeam struct {
 	*pgxpool.Pool
-	acquired bool
-	reached  chan struct{}
-	release  chan struct{}
+	acquired    bool
+	queryTarget string // Empty preserves the registration tests' worker-lock seam.
+	pid         chan uint32
+	reached     chan struct{}
+	release     chan struct{}
 }
 
 func (b sourceEndLockSeam) Begin(ctx context.Context) (pgx.Tx, error) {
@@ -30,6 +32,9 @@ func (b sourceEndLockSeam) BeginTx(ctx context.Context, opts pgx.TxOptions) (pgx
 	if err != nil {
 		return nil, err
 	}
+	if b.pid != nil {
+		b.pid <- tx.Conn().PgConn().PID()
+	}
 	return sourceEndSeamTx{Tx: tx, seam: b}, nil
 }
 
@@ -39,7 +44,11 @@ type sourceEndSeamTx struct {
 }
 
 func (tx sourceEndSeamTx) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
-	if !strings.Contains(sql, "-- name: GetWorkerForUpdate :one") {
+	target := tx.seam.queryTarget
+	if target == "" {
+		target = "-- name: GetWorkerForUpdate :one"
+	}
+	if !strings.Contains(sql, target) {
 		return tx.Tx.QueryRow(ctx, sql, args...)
 	}
 	if !tx.seam.acquired {
