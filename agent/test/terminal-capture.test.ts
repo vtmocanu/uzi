@@ -182,11 +182,11 @@ describe("terminalDefaultBranch on real bare repositories", () => {
     assert.equal((await within(git, () => git.terminalDefaultBranch(b.bare))).kind, "unknown");
   });
 
-  test("refs under refs/heads/main/ do not make refs/heads/main count; the real main wins when present", async (t) => {
+  test("refs under refs/heads/main/ do not make refs/heads/main count: the lookup stays proven absent", async (t) => {
     const b = await bareRepo(t);
     await b.ref("refs/heads/main/x", b.commit);
     const git = new GitCache(b.dir, nullLogger());
-    assert.notEqual((await within(git, () => git.terminalDefaultBranch(b.bare))).kind, "resolved");
+    assert.deepEqual(await within(git, () => git.terminalDefaultBranch(b.bare)), { kind: "absent" });
   });
 
   test("the HEAD rung alone resolves to HEAD, and a HEAD naming heads/main resolves main", async (t) => {

@@ -172,8 +172,10 @@ async function run(env: TerminalLaneEnv, flight: TerminalLaneFlight, body: Termi
       let found: TerminalDefaultBranch;
       try { found = await env.lookupDefaultBranch({ signal: abort.signal, deadline: deadlineAt }); } catch { found = { kind: "unknown", detail: "lookup threw" }; }
       if (abort.signal.aborted || env.now() >= deadlineAt) return result(label, "kept", "default_branch_unresolved");
-      if (found.kind === "unknown") return result(label, "kept", "default_branch_unresolved");
-      defaultBranch = found.kind === "resolved" && found.name ? found.name : "main";
+      // Closed mapping: only a proven absence becomes "main" and only a named resolution is used; anything else keeps.
+      if (found.kind === "absent") defaultBranch = "main";
+      else if (found.kind === "resolved" && found.name) defaultBranch = found.name;
+      else return result(label, "kept", "default_branch_unresolved");
     }
     const boundaryValid = (): boolean => !abort.signal.aborted && env.now() < deadlineAt && quiesced;
     const left = (): number => Math.max(1, deadlineAt - env.now());
