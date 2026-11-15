@@ -15459,6 +15459,16 @@ export class RunRunner {
           reason: "cwd_changed_attempt_path",
         },
       });
+    } else if (!sessionId && claim.secrets.codex && flight.retainedEpisode) {
+      // Retained work proves a predecessor existed, but its conversation id was
+      // never reported. Do not imply that the recovered work carries its context.
+      runLog.info("retained Codex conversation id unavailable; starting a fresh thread", {
+        event: RESUME_LINEAGE_BREAK_EVENT, reason: "session_id_unavailable",
+      });
+      batcher.emit({ kind: "status", agent: "worker", payload: {
+        text: "this run was picked up again without its earlier conversation id — continuing WITHOUT its earlier context; its retained work is preserved",
+        event: RESUME_LINEAGE_BREAK_EVENT, reason: "session_id_unavailable",
+      } });
     }
     if (
       sessionId &&

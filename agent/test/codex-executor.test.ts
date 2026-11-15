@@ -32302,7 +32302,13 @@ describe("M2 actualRunner credential replacement", () => {
           : publication === "crash-apply-ack-recovery" ? "before-publish" : "login";
         const expectedApplies = publication === "crash-after-a-teardown-recovery" ? 0 : 1;
         if ((queuedRefreshStop || crashRecovery) && (oldClaim !== API_KEY || target !== SUBSCRIPTION || phase !== "factory")) continue;
-      it(publication === "baseline"
+        for (const recoveryMode of ["normal", "ordinary missing persisted ID", "ordinary missing retained rollout",
+          "preserve saved conversation", "preserve missing persisted ID", "preserve missing retained rollout"] as const) {
+          if (!crashRecovery && recoveryMode !== "normal") continue;
+          const preservingRecovery = recoveryMode.startsWith("preserve");
+          const missingRecoveryId = recoveryMode.endsWith("missing persisted ID");
+          const missingRecoveryRollout = recoveryMode.endsWith("missing retained rollout");
+      it((publication === "baseline"
         ? `M2 actualRunner ${oldClaim.auth_mode} to ${target.auth_mode} ${phase} account resumes saved thread`
         : publication === "gated" ? `Codex ${oldClaim.auth_mode} to ${target.auth_mode} publication gates Now, retired A and B preparation children; finished B root dispatch admits work`
         : crashRecovery ? publication === "crash-after-a-teardown-recovery"
@@ -32316,7 +32322,8 @@ describe("M2 actualRunner credential replacement", () => {
         : publication === "subscription-refresh-prepare-failure" ? "Codex queued subscription refresh settles on B preparation failure"
         : publication === "subscription-refresh-cancel" ? "Codex queued subscription refresh settles on cancellation after B preparation"
         : publication === "api-key-refresh" ? "Codex API-key B refuses subscription refresh and retains the workspace"
-        : `Codex ${oldClaim.auth_mode} to ${target.auth_mode} partial B publication never reopens A (${publication})`, async () => {
+        : `Codex ${oldClaim.auth_mode} to ${target.auth_mode} partial B publication never reopens A (${publication})`) +
+        (recoveryMode === "normal" ? "" : `; recovery ${recoveryMode}`), async () => {
         const { api, client } = m2Runner;
         const next = { ...target, access_token: "M2-B-access", capability: "M2-B-capability" } as import("../src/protocol.js").ClaimCodexSecrets;
         if ("chatgpt_account_id" in oldClaim && next.auth_mode === "subscription")
@@ -32901,7 +32908,34 @@ describe("M2 actualRunner credential replacement", () => {
                 assert.throws(() => owners[0]!.guard(), /authority|aborted|admission|closed/i);
                 const predecessorSends = [a.transport.requests.length, b.transport.requests.length];
                 // Simulated claim/last_seq/remint projection only; no actual DB proof.
-                const recovered: ClaimResponse = { ...claim, claim_generation: 8, session_id: savedId,
+                const recoveryHead = spawnSync("git", ["-C", worktree, "rev-parse", "HEAD"],
+                  { env: gitEnv(), encoding: "utf8" }).stdout.trim();
+                assert.match(recoveryHead, /^[0-9a-f]{40}$/);
+                const recoveryBranch = spawnSync("git", ["-C", worktree, "symbolic-ref", "--short", "HEAD"],
+                  { env: gitEnv(), encoding: "utf8" }).stdout.trim();
+                assert.ok(recoveryBranch);
+                const recoveryBare = m2Runner.git.barePathFor(m2Runner.fx.originPath);
+                const readRecoveryJournal = () => spawnSync("git", ["-C", recoveryBare, "config",
+                  `uzi-recovery.${recoveryBranch}.clone`], { env: gitEnv(), encoding: "utf8" }).stdout.trim();
+                const recoveryJournal = readRecoveryJournal();
+                assert.ok(recoveryJournal, "the interrupted flight has a retained source journal");
+                const recoveryHolds: PolicyHoldRequest[] = [];
+                const recoveryRigs: ReturnType<typeof makeRig>[] = [];
+                const recoveryReportStart = dispositions.length;
+                if (preservingRecovery) {
+                  api.setRegisterProtocolFeatures(["provider_policy_hold_v1", "claim_generation_fence"]);
+                  await client.register("crash-preserve", "base", 1, [], ["provider_policy_hold_v1"], undefined, 0);
+                  client.reportPolicyHold = async (_id, body) => {
+                    recoveryHolds.push(structuredClone(body));
+                    return { disposition: "applied", outcome_id: body.outcome_id, source_generation: body.source_generation,
+                      observed_status: "paused", observed_generation: body.claim_generation, hold_reason: "codex_policy_hold" };
+                  };
+                }
+                const recovered: ClaimResponse = { ...claim, claim_generation: 8, session_id: missingRecoveryId ? null : savedId,
+                  // These are the wire claim fields used by the real preserving-continuation fixture.
+                  // A RunContext-only boolean would not exercise Runner admission.
+                  ...(preservingRecovery ? { policy_preserve_only: true, policy_expected_head: recoveryHead,
+                    plan_source: "agent" as const, auto_approve: true } : {}),
                   last_seq: api.messages(claim.run_id).reduce((seq, message) => Math.max(seq, message.seq), 0),
                   secrets: { ...claim.secrets, codex: { ...committedCodex, capability: "M3-reminted-capability" } } };
                 api.setOwnershipStatus(claim.run_id, "running", 8);
@@ -32912,6 +32946,15 @@ describe("M2 actualRunner credential replacement", () => {
                   ? { terminalCancelled: { run_id: recovered.run_id, generation: 8 } } : {}) });
                 client.applyCredentialSwitch = async () => { throw new Error("recovery must not replay apply"); };
                 await CodexSessionStore.persist(source, path.join(m2Runner.homeDir, "codex-session-store"));
+                if (missingRecoveryRollout) {
+                  // Remove only the retained transcript; unfinished source bytes and the journal stay intact.
+                  await fs.rm(path.join(source, "sessions"), { recursive: true, force: true });
+                  await fs.mkdir(path.join(source, "sessions"), { recursive: true });
+                  // Publish empty generations through the real store API, including its current pointer.
+                  await CodexSessionStore.persist(source, store);
+                  await CodexSessionStore.persist(source, path.join(m2Runner.homeDir, "codex-session-store"));
+                  assert.equal(await CodexSessionStore.inspectSession(store, savedId), "absent");
+                }
                 let executedRecoveryRig: ReturnType<typeof makeRig> | undefined;
                 let executedRecoveryExecutor: CodexExecutor | undefined;
                 let recoveryBodies = 0, recoveryFactories = 0;
@@ -32934,6 +32977,7 @@ describe("M2 actualRunner credential replacement", () => {
                     }
                     return {};
                   } });
+                  recoveryRigs.push(recoveryRig);
                   const adopted = path.join(dir, `recovery-adopted-${recoveryFactories++}`);
                   const launchRecoveryEffect = recoveryRig.deps.launchEffectRoot!;
                   recoveryRig.deps = { ...recoveryRig.deps, deferRegistryTeardown: true,
@@ -32959,12 +33003,18 @@ describe("M2 actualRunner credential replacement", () => {
                     assert.ok(readinessLaunches > 0, "retained readiness ran before model admission");
                     assert.equal(readinessWaits, readinessLaunches);
                     assert.equal(readinessDisposals, readinessLaunches, "readiness disposed before recovered executor body");
-                    assert.equal(recovered.session_id, savedId, "claim retains the saved conversation candidate");
+                    assert.equal(recovered.session_id, missingRecoveryId ? null : savedId, "claim carries the persisted availability fact");
                     assert.notEqual(ctx.worktreePath, worktree, "retained recovery selects a fresh checkout");
-                    assert.equal(ctx.sessionId, undefined, "normal recovery drops the persisted candidate when cwd changes");
+                    assert.equal(ctx.sessionId, undefined, "retained recovery drops the persisted candidate when cwd changes");
+                    if (preservingRecovery) {
+                      assert.equal(ctx.preserveConversation, true, "the wire policy claim must reach the executor as preserving");
+                      assert.equal(ctx.policyFreshAllowance, undefined, "recovery grants no owner Fresh authorization");
+                    }
                     assert.equal(await fs.readFile(path.join(ctx.worktreePath, "M2-retained.txt"), "utf8"), "A work");
                     const result = await recoveryRun(ctx);
-                    assert.equal(await fs.readFile(path.join(adopted, "sessions", `rollout-${savedId}.jsonl`), "utf8"), "{}\n");
+                    if (!missingRecoveryRollout)
+                      assert.equal(await fs.readFile(path.join(adopted, "sessions", `rollout-${savedId}.jsonl`), "utf8"), "{}\n");
+                    else await assert.rejects(fs.stat(path.join(adopted, "sessions", `rollout-${savedId}.jsonl`)), { code: "ENOENT" });
                     await assert.rejects(fs.access(path.join(adopted, "auth.json")));
                     return result;
                   };
@@ -32972,8 +33022,14 @@ describe("M2 actualRunner credential replacement", () => {
                 };
                 // A distinct Runner/flight and executor consume the recovered claim.
                 const recoveryLog = recordingLogger();
+                const recoveryOutbox = new Outbox({ root: path.join(dir, "recovery-outbox"), log: noopLog,
+                  runMaxBytes: 64 * 1024 * 1024, maxBytes: 128 * 1024 * 1024, retentionMs: 86400000 });
+                if (preservingRecovery) await recoveryOutbox.init();
                 const recoveryRunner = m2Runner.runnerWith(buildRecovery,
-                  m2Runner.fakeGitlab().gitlab, undefined, recoveryLog.logger);
+                  m2Runner.fakeGitlab().gitlab, undefined, recoveryLog.logger, preservingRecovery ? {
+                    outbox: recoveryOutbox,
+                    activeRuns: new ActiveRunRegistry(() => recoveryOutbox.listPendingTerminals(), () => 10),
+                  } : undefined);
                 // Fake UID metadata and supervisor lifecycle only: this is not a real
                 // abrupt crash or kernel confinement/security proof. The supplied helper
                 // runs unchanged against real descriptors, bytes, modes and alternates;
@@ -33059,6 +33115,46 @@ describe("M2 actualRunner credential replacement", () => {
                     readinessProbe.mock.restore();
                   }
                 }
+                assert.equal(await fs.readFile(path.join(worktree, "M2-retained.txt"), "utf8"), "A work",
+                  "recovery refusal/fallback retains unfinished source work");
+                assert.deepEqual([a.transport.requests.length, b.transport.requests.length], predecessorSends,
+                  "recovery never revives predecessor auth or sends");
+                assert.equal(applies, expectedApplies, "no recovery mode replays apply");
+                assert.equal(applyRequests.length, expectedApplies);
+                assert.equal(rig.providerLaunches(), launchedPredecessors.length);
+                if (preservingRecovery) {
+                  assert.equal(readinessWaits, readinessLaunches, "every launched readiness root was joined on refusal");
+                  assert.equal(readinessDisposals, readinessLaunches, "every launched readiness root was disposed on refusal");
+                  assert.equal(readinessResults.length, readinessLaunches);
+                  for (const output of readinessResults) assert.match(output, /^ok [1-9][0-9]* [0-9]+\n$/);
+                  const retainedJournal = JSON.parse(readRecoveryJournal()) as {
+                    retainedSources?: { runId: string; clonePath: string }[];
+                    recovery?: { source: { runId: string; clonePath: string } };
+                  };
+                  assert.equal(retainedJournal.recovery?.source.runId, claim.run_id);
+                  assert.equal(retainedJournal.recovery?.source.clonePath, worktree);
+                  assert.ok(retainedJournal.retainedSources?.some(source =>
+                    source.runId === claim.run_id && source.clonePath === worktree), "preservation refusal retains the original source in the advanced journal");
+                  assert.equal(recoveryWorkSent, false, "preservation refusal sends no provider turn");
+                  for (const recoveryRig of recoveryRigs) {
+                    assert.equal(recoveryRig.providerLaunches(), 0, "preservation refusal launches no provider root");
+                    assert.deepEqual(recoveryRig.transport.requests, [], "no login, fresh thread, resume or work on refusal");
+                  }
+                  assert.deepEqual(releases, [], "refusal consumes no auth capability, including stale A auth");
+                  assert.equal(recoveryHolds.length, 1, JSON.stringify(recoveryLog.lines.slice(-12)));
+                  const hold = recoveryHolds[0]!;
+                  assert.equal(hold.cause, "attempt_path", "retained recovery must refuse even when a saved ID and rollout exist");
+                  assert.equal(hold.detail, "resume_rejected");
+                  assert.equal(hold.continuation_mode, "fresh_from_saved_work");
+                  assert.equal(hold.published, false);
+                  assert.equal(dispositions.slice(recoveryReportStart).some(body => body.status === "failed" || body.status === "completed"), false,
+                    "a policy re-hold never terminalizes retained work");
+                  assert.equal(api.messages(claim.run_id).some(message => message.kind === "status" &&
+                    rec(message.payload).event === "resume_lineage_break"), false, "preserve refusal never takes ordinary lineage fallback");
+                  if (!missingRecoveryRollout)
+                    assert.equal(await CodexSessionStore.inspectSession(store, savedId), "present", "refusal retains the saved rollout");
+                  return;
+                }
                 assert.ok(readinessLaunches > 0);
                 assert.equal(readinessWaits, readinessLaunches);
                 assert.equal(readinessDisposals, readinessLaunches);
@@ -33085,7 +33181,7 @@ describe("M2 actualRunner credential replacement", () => {
                   .map(r => [r.method, rec(r.params).threadId]), [["thread/start", undefined]]);
                 assert.ok(api.messages(claim.run_id).some(message => message.kind === "status" &&
                   rec(message.payload).event === "resume_lineage_break" &&
-                  JSON.stringify(message.payload).includes("cwd_changed_attempt_path")),
+                  rec(message.payload).reason === (missingRecoveryId ? "session_id_unavailable" : "cwd_changed_attempt_path")),
                   "changed-cwd recovery visibly discloses the path lineage break");
                 assert.ok(requests.some(r => r.method === "turn/start"), "recovered executor actually sends work");
                 assert.deepEqual([a.transport.requests.length, b.transport.requests.length], predecessorSends,
@@ -33194,6 +33290,7 @@ describe("M2 actualRunner credential replacement", () => {
           }
         }
       });
+        }
       }
     }
   }
