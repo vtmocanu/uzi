@@ -3,7 +3,7 @@ import { Outbox } from "../src/outbox.js";
 import type { PolicyHoldRequest } from "../src/protocol.js";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import { describe, it } from "node:test";
 import { performance } from "node:perf_hooks";
@@ -456,6 +456,72 @@ describe("the ack state decides which episodes may re-park (issue #3638 D4)", ()
 });
 
 describe("every other refused continuation keeps today's behaviour (issue #3638 D4)", () => {
+  // Include Git metadata, dirty/untracked bytes and symlink targets; do not run Git on the source.
+  function sourceDigest(root: string): string {
+    const hash = createHash("sha256");
+    const walk = (dir: string): void => {
+      for (const name of fs.readdirSync(dir).sort()) {
+        const file = path.join(dir, name);
+        const stat = fs.lstatSync(file);
+        hash.update(JSON.stringify([path.relative(root, file), stat.mode, stat.mtimeMs, stat.size]));
+        if (stat.isDirectory()) walk(file);
+        else if (stat.isSymbolicLink()) hash.update(fs.readlinkSync(file));
+        else if (stat.isFile()) hash.update(fs.readFileSync(file));
+      }
+    };
+    walk(root);
+    return hash.digest("hex");
+  }
+  for (const mismatch of ["absent", "incarnation", "epoch"] as const) {
+    it(`SourceEndDeclinedRestartRequiresExactMemoryOrigin: ${mismatch}`, async () => {
+      const p = await predecessor("sent_unconfirmed");
+      rewriteJournal(j => {
+        if (mismatch === "absent") delete j.memoryPark;
+        else if (mismatch === "incarnation") j.memoryPark!.origin.authorityIncarnation = randomUUID();
+        else j.memoryPark!.origin.sourceEpoch = randomUUID();
+      });
+      const before = activeJournal()!;
+      const sourceBefore = sourceDigest(p.clone);
+      const homeBefore = sourceDigest(homeDir);
+      let admissions = 0;
+      const refusals: unknown[] = [];
+      // This fixture uses a successor runtime, not a new OS process. The separate
+      // source-end-restart test covers loss of module state across a real process boundary.
+      const c = await resume(p, { wrap: rt => {
+        const bind = rt.bindSource.bind(rt);
+        rt.bindSource = async (...args) => {
+          try {
+            const lease = await bind(...args);
+            admissions++;
+            return lease;
+          } catch (error) {
+            refusals.push(error);
+            throw error;
+          }
+        };
+      } });
+      assertToday(c);
+      assert.deepEqual({ ...c.counters, reports: 0 },
+        { reports: 0, reserve: 1, block: 1, capture: 0, admit: 1, preserve: 0, ran: 0 },
+        "legacy recovery reserves and blocks one attempt, but never captures, preserves or runs a model");
+      assert.equal(admissions, 0, "an attempted predecessor bind is not a successful source admission");
+      assert.equal(refusals.length, 1);
+      assert.match(String(refusals[0]), /active|foreign|held/i);
+      assert.deepEqual(await slotOf(p.r.rt, p.clone), p.slot, "no admission, epoch theft or source end");
+      assert.equal(sourceDigest(p.clone), sourceBefore, "clone and Git metadata are unchanged");
+      assert.equal(sourceDigest(homeDir), homeBefore, "predecessor HOME is unchanged");
+      const after = activeJournal()!;
+      const { recovery, ...rest } = after;
+      assert.deepEqual(rest, before, "only legacy recovery accounting changes; no synthetic park or rewritten origin");
+      assert.ok(recovery && typeof recovery === "object");
+      const progress = recovery as Record<string, unknown>;
+      assert.equal(progress.attempts, 1, "the refused admission still consumes a real recovery attempt");
+      assert.equal(progress.claimGeneration, c.claim.claim_generation);
+      assert.equal(progress.stage, "blocked");
+      assert.equal(progress.blocker, "preservation_failed");
+    });
+  }
+
   it("control: a SIGKILLed active slot with no witness and no record", async () => {
     const p = await predecessor("sent_unconfirmed");
     rewriteJournal(j => { delete j.memoryPark; });

@@ -56,7 +56,7 @@ export class AuthorityLockBusy extends AuthorityRefusal {
  * Nothing was written when it is thrown.
  */
 export class SourceUseHeldRefusal extends AuthorityRefusal {
-  constructor(message: string) {
+  constructor(message: string, readonly blockedSourceKey?: string) {
     super(message);
     this.name = "SourceUseHeldRefusal";
   }

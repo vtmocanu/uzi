@@ -632,6 +632,43 @@ describe("ending a source use", () => {
     await r.rt.assertLaunchable(r.clone, l2, undefined);
   });
 
+  it("a pending operation and queued end cannot supply declined evidence", async (t) => {
+    const r = await rig(t);
+    const sink = new Set<string>();
+    await r.rt.recordAdmissions(sink, () => r.rt.bindSource(r.clone));
+    const settlement = await r.rt.recordAdmissions(sink, () =>
+      r.rt.withTransaction(() => r.rt.hooks.beginDestructive([r.clone], "runner-uid-delete")));
+    r.rt.retireSink(sink);
+    r.rt.markSourceEndDeclined([r.clone], sink);
+    assert.equal(await r.rt.sourceEndDeclined(r.clone, new Set()), false, "pending operation");
+    await r.rt.endSourceUse([r.clone], { sink });
+    r.rt.markSourceEndDeclined([r.clone], sink);
+    assert.equal(await r.rt.sourceEndDeclined(r.clone, new Set()), false, "queued end");
+    await r.rt.withTransaction(() => settlement.settle({ ok: true }));
+  });
+
+  it("declined end witness binds exact key, sink and live lease, never retirement alone", async (t) => {
+    const r = await rig(t);
+    const sink = new Set<string>();
+    const other = new Set<string>();
+    await r.rt.recordAdmissions(sink, () => r.rt.bindSource(r.clone));
+    r.rt.markSourceEndDeclined([r.clone], sink);
+    assert.equal(await r.rt.sourceEndDeclined(r.clone, other), false, "live sink");
+    r.rt.retireSink(sink);
+    assert.equal(await r.rt.sourceEndDeclined(r.clone, other), false, "retirement alone");
+    r.rt.markSourceEndDeclined([r.clone], other);
+    assert.equal(await r.rt.sourceEndDeclined(r.clone, other), false, "wrong sink");
+    assert.equal(await r.rt.awaitSinkQuiescent(), true);
+    r.rt.markSourceEndDeclined([r.clone], sink);
+    assert.equal(await r.rt.sourceEndDeclined(r.clone, other), true);
+    assert.equal(await r.rt.sourceEndDeclined(r.clone, sink), false, "same sink");
+    assert.equal(await r.rt.sourceEndDeclined(r.clone + "-other", other), false, "different key");
+    await r.rt.endSourceUse([r.clone], { sink });
+    assert.equal(await r.rt.sourceEndDeclined(r.clone, other), false, "end attempt invalidates");
+    r.rt.markSourceEndDeclined([r.clone], sink);
+    assert.equal(await r.rt.sourceEndDeclined(r.clone, other), false, "no lease");
+  });
+
   it("recordAdmissions names every path an admission touched, including one that was refused", async (t) => {
     const r = await rig(t);
     const sink = new Set<string>();

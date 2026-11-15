@@ -272,6 +272,7 @@ export class AuthorityRuntime implements AuthorityScope {
    * epoch is confirmed (see {@link #releaseOwner}). A different sink (or none) cannot admit an owned key.
    */
   readonly #owners = new Map<string, { sink: Set<string>; epoch: string }>();
+  readonly #declinedEnds = new Map<string, { sink: Set<string>; lease: SourceUseLease }>();
   /** The operator-discard lease per normalized slot path: an end of that source use tombstones or releases it. */
   readonly #discards = new Map<string, SourceUseLease>();
   /** The footprint items that existed when the operator discard took the slot over, per normalized slot path. */
@@ -689,6 +690,34 @@ export class AuthorityRuntime implements AuthorityScope {
     this.#retiredSinks.add(sink);
   }
 
+  /** Record only a definitive no-end decision after the caller joined the admission barrier. */
+  markSourceEndDeclined(paths: Iterable<string>, sink: Set<string>): void {
+    if (!this.#retiredSinks.has(sink)) return;
+    for (const p of paths) {
+      const key = path.resolve(p);
+      const owner = this.#owners.get(key);
+      const lease = this.#leases.get(key);
+      if (owner?.sink === sink && lease && owner.epoch === leaseEpoch(lease) && !this.#ends.has(key))
+        this.#declinedEnds.set(key, { sink, lease });
+    }
+  }
+
+  /** Process-local exact identity only; retirement or a queued end is never a witness. */
+  async sourceEndDeclined(clonePath: string, requestingSink?: Set<string>): Promise<boolean> {
+    const key = path.resolve(clonePath);
+    const witness = this.#declinedEnds.get(key);
+    const owner = this.#owners.get(key);
+    if (!(witness !== undefined && owner?.sink === witness.sink && owner.sink !== requestingSink &&
+      this.#retiredSinks.has(witness.sink) && this.#leases.get(key) === witness.lease &&
+      owner.epoch === leaseEpoch(witness.lease) && !this.#ends.has(key))) return false;
+    try {
+      const slot = await this.peekSlot(key);
+      return slot?.state === "active" && slot.pending === null && slot.epoch === owner.epoch &&
+        slot.owner.worker === this.authorityIncarnation() && this.#declinedEnds.get(key) === witness &&
+        this.#leases.get(key) === witness.lease && !this.#ends.has(key);
+    } catch { return false; }
+  }
+
   /**
    * Barrier after {@link retireSink}: every admission runs under A, so taking A once (without the pre-callback drain
    * and without opening the store) proves that an admission which passed its entry check before the retirement has
@@ -885,17 +914,19 @@ export class AuthorityRuntime implements AuthorityScope {
   #assertNotOwnedByOther(key: string): void {
     const owner = this.#owners.get(key);
     if (owner && owner.sink !== this.#collector.getStore()) {
-      throw new SourceUseHeldRefusal("source use refused: an earlier flight's source use of this clone has no confirmed end");
+      throw new SourceUseHeldRefusal("source use refused: an earlier flight's source use of this clone has no confirmed end", key);
     }
   }
 
   #recordOwner(key: string, lease: SourceUseLease): void {
+    this.#declinedEnds.delete(key);
     const sink = this.#collector.getStore();
     if (sink) this.#owners.set(key, { sink, epoch: leaseEpoch(lease) });
   }
 
   /** The end of `key`'s recorded epoch is confirmed (or the slot is provably no longer that epoch): ownership ends. */
   #releaseOwner(key: string): void {
+    this.#declinedEnds.delete(key);
     this.#owners.delete(key);
   }
 
@@ -942,11 +973,16 @@ export class AuthorityRuntime implements AuthorityScope {
     const foreign = new Set(keys.filter((key) => options.skipFlightOwned === true && this.#owners.has(key) &&
         this.#discards.get(key) !== this.#leases.get(key) ||
       options.sink !== undefined && this.heldByOtherSink(key, options.sink)));
-    if (foreign.size > 0) this.#options.log?.warn("source use left active: another flight owns it", { sources: foreign.size });
+    for (const key of keys) if (!foreign.has(key)) this.#declinedEnds.delete(key);
+    try {
+      if (foreign.size > 0) this.#options.log?.warn("source use left active: another flight owns it", { sources: Math.min(foreign.size, 2048) });
+    } catch { /* Preserve disposition. */ }
     // The durable identity of each slot this call moved to `ineligible` itself: the only positive end evidence.
     const endedSlots: Array<EndedSlotReceipt & { path: string }> = [];
     if (keys.length === 0) return { ended, kept, endedSlots };
-    const warn = (message: string, fields: Record<string, unknown>): void => this.#options.log?.warn(message, fields);
+    const warn = (message: string, fields: Record<string, unknown>): void => {
+      try { this.#options.log?.warn(message, fields); } catch { /* Diagnostics cannot change end disposition. */ }
+    };
     // The leases are captured now: a later end applies only to exactly the epoch this call was asked to end.
     const captured = new Map<string, SourceUseLease>();
     for (const key of keys) { const lease = this.#leases.get(key); if (lease) captured.set(key, lease); }
@@ -965,15 +1001,15 @@ export class AuthorityRuntime implements AuthorityScope {
             const result = await this.#endOne(tx, store, key, lease, (receipt) => endedSlots.push({ ...receipt, path: key }));
             if (result === "ended") ended.push(key);
             else if (result === "kept") { kept.push(key); queue(key); }
-          } catch (error) {
+          } catch {
             kept.push(key);
             queue(key);
-            warn("source use left active: it could not be ended", { source: key, error: error instanceof Error ? error.message : String(error) });
+            warn("source use left active: it could not be ended", { reason: "end_unconfirmed" });
           }
         }
       }, options);
-    } catch (error) {
-      warn("source use left active: the authority transaction was unavailable", { error: error instanceof Error ? error.message : String(error) });
+    } catch {
+      warn("source use left active: the authority transaction was unavailable", { reason: "authority_unavailable" });
       for (const key of keys) if (!ended.includes(key) && !foreign.has(key)) queue(key);
       this.#scheduleDrain();
       return { ended, kept: keys.filter((key) => !ended.includes(key)), endedSlots };
@@ -1000,7 +1036,7 @@ export class AuthorityRuntime implements AuthorityScope {
     if (slot.state === "retiring" && this.#discards.get(key) === lease) return this.#endDiscard(tx, store, key, lease, slot);
     if (slot.state !== "active") { this.#leases.delete(key); await this.#recheckOwner(tx, store, key, slot); return "dropped"; }
     if (slot.pending?.status === "running") {
-      this.#options.log?.warn("source use left active: an operation on it is unresolved", { source: key, operation: slot.pending.operation });
+      try { this.#options.log?.warn("source use left active: an operation on it is unresolved", { reason: "operation_unresolved" }); } catch { /* Preserve disposition. */ }
       return "kept";
     }
     const receipt = await store.transition(tx, lease, "ineligible");
@@ -1298,6 +1334,7 @@ export class AuthorityRuntime implements AuthorityScope {
     this.#store = opened;
     this.#leases.clear();
     this.#owners.clear();
+    this.#declinedEnds.clear();
     this.#discards.clear();
     this.#discardPresent.clear();
     return opened;

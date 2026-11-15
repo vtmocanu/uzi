@@ -48,6 +48,36 @@ async function make(replies: Reply[], opts: { features?: string[]; nonce?: strin
 const parsed = (wires: string[]) => wires.map(w => JSON.parse(w) as Record<string, unknown>);
 
 describe("registration evidence on the running report", () => {
+  it("source end hold requires paired features and exact acknowledged witness; reset and drop close it", async () => {
+    const features = [...FEATURES, "retained_source_end_hold_v1"];
+    const recorded: Reply = { status: 200, body: JSON.stringify({
+      run: { id: "r1", status: "running" }, registration_evidence: "recorded",
+    }) };
+    const { c } = await make([recorded, "strict", "ok", recorded], { features });
+    assert.equal(c.sourceEndDeclinedRegistration("r1", GEN), undefined);
+    await c.reportState("r1", { status: "running", claim_generation: GEN }, undefined, { registrationEpoch: EPOCH });
+    assert.equal(c.sourceEndDeclinedRegistration("r1", GEN), NONCE);
+    assert.equal(c.sourceEndDeclinedRegistration("r2", GEN), undefined);
+    assert.equal(c.sourceEndDeclinedRegistration("r1", GEN + 1), undefined);
+    c.protocolFeatures = FEATURES;
+    assert.equal(c.sourceEndDeclinedRegistration("r1", GEN), undefined);
+    c.protocolFeatures = features;
+    await c.reportState("r1", { status: "running", claim_generation: GEN }, undefined, { registrationEpoch: EPOCH });
+    assert.equal(c.sourceEndDeclinedRegistration("r1", GEN), undefined);
+    c.protocolFeatures = features;
+    assert.equal(c.sourceEndDeclinedRegistration("r1", GEN), undefined, "drop is sticky");
+    await c.register("fixture", "base", 1, undefined, ["credential_switch_v1"], undefined, 0);
+    assert.equal(c.sourceEndDeclinedRegistration("r1", GEN), undefined, "old witness cleared");
+    await c.reportState("r1", { status: "running", claim_generation: GEN }, undefined, { registrationEpoch: EPOCH });
+    assert.equal(c.sourceEndDeclinedRegistration("r1", GEN), NONCE);
+  });
+
+  it("a status-only running ACK is not a recorded witness", async () => {
+    const { c } = await make(["ok"], { features: [...FEATURES, "retained_source_end_hold_v1"] });
+    await c.reportState("r1", { status: "running", claim_generation: GEN }, undefined, { registrationEpoch: EPOCH });
+    assert.equal(c.sourceEndDeclinedRegistration("r1", GEN), undefined);
+  });
+
   it("emits exactly the shared fixture body", async () => {
     const { c, wires } = await make(["ok"]);
     await c.reportState("r1", { status: "running", claim_generation: GEN }, undefined, { registrationEpoch: EPOCH });

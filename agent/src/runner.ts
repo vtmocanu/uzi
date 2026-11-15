@@ -2582,6 +2582,20 @@ type OwnMemoryPark = {
   attemptId?: string | null;
 };
 /** What {@link RunRunner.endFlightSourceUse} ended: the source paths of the flight and the confirmed ends among them. */
+type SourceEndDiagnostics = {
+  stage: "teardown" | "source_end";
+  terminal: "skipped" | "incomplete" | "rejected" | "invalid" | "joined" | "not_required";
+  executor: boolean; process: boolean; commands: boolean; steering: boolean;
+  auxiliaries: boolean; memory: boolean; park_reap: boolean;
+  remediation: "none" | "confirmed" | "denied" | "held" | "unconfirmed";
+  barrier: "not_attempted" | "joined" | "unconfirmed";
+  publication: "not_attempted" | "published" | "ended" | "unpublished";
+  outcome: "early_exit" | "no_authority" | "no_sources" | "tails_unjoined" | "remediation_held" | "ended" | "unconfirmed";
+  sources: number; kept: number; foreign: boolean; no_lease: boolean; publication_epoch_mismatch: boolean;
+};
+const sourceEndDiagnostics = new WeakMap<RunFlight, SourceEndDiagnostics>();
+const sourceEndDiagnosticsEmitted = new WeakSet<RunFlight>();
+
 type FlightSourceEnd = Readonly<{
   paths: readonly string[];
   endedSlots: ReadonlyArray<Readonly<{ path: string; key: string; epoch: string; seq: number; worker: string }>>;
@@ -4657,101 +4671,146 @@ export class RunRunner {
    * call itself moved to `ineligible` (`endedSlots`, the only positive end evidence) and whether a publication
    * handled the bound source (`published`, true also for a publication that only ended it).
    */
+  private sourceEndDiagnosticState(flight: RunFlight): SourceEndDiagnostics {
+    let state = sourceEndDiagnostics.get(flight);
+    if (!state) {
+      state = { stage: "teardown", terminal: "skipped", executor: false, process: false,
+        commands: false, steering: false, auxiliaries: false, memory: false, park_reap: false,
+        remediation: "none", barrier: "not_attempted", publication: "not_attempted",
+        outcome: "early_exit", sources: 0, kept: 0, foreign: false, no_lease: false, publication_epoch_mismatch: false };
+      sourceEndDiagnostics.set(flight, state);
+    }
+    return state;
+  }
+
+  private emitSourceEndDiagnostics(flight: RunFlight, runLog: Logger): void {
+    if (sourceEndDiagnosticsEmitted.has(flight)) return;
+    sourceEndDiagnosticsEmitted.add(flight);
+    try {
+      runLog.warn("source use teardown summary", { ...this.sourceEndDiagnosticState(flight) });
+    } catch { /* Logging cannot replace the original error or change source disposition. */ }
+  }
+
   private async endFlightSourceUse(flight: RunFlight, runLog: Logger): Promise<FlightSourceEnd> {
-    const authority = this.authority;
-    const none: FlightSourceEnd = { paths: [], endedSlots: [], published: false, ownedEpochs: {} };
-    if (!authority) return none;
-    const sink = flight.sourceUsePaths ??= new Set();
-    const retire = (): void => {
-      authority.retireSink(sink);
-      flight.sourceAdmissionRetired = true;
-    };
-    const remediation: { kind: "confirmed" | "denied" | "held" } = { kind: "confirmed" };
-    if (flight.remediationRestrictions && flight.sourceTailsJoined === true) {
-      remediation.kind = "held";
-      try {
-        // One bounded acquisition/confirmation attempt. Retire under the same owning A.
-        // A callback can latch synchronously while the Git proof awaits; changed knowledge
-        // keeps custody even if the earlier snapshot could be confirmed.
-        await this.inFlightAuthority(flight, async () => {
-          if (flight.remediationRestrictions?.clearable === true && this.remediationLatchIsEmpty(flight)) {
-            await this.bootstrapRemediationRestrictions(flight, flight.barePath, flight.branch, undefined,
-              Date.now() + this.sourceUseEndWaitMs);
+    const diagnostic = this.sourceEndDiagnosticState(flight);
+    diagnostic.stage = "source_end";
+    diagnostic.outcome = "unconfirmed";
+    try {
+      const warn = (message: string, fields?: Record<string, unknown>): void => {
+        try { runLog.warn(message, fields); } catch { /* Diagnostics cannot change teardown disposition. */ }
+      };
+      const authority = this.authority;
+      const none: FlightSourceEnd = { paths: [], endedSlots: [], published: false, ownedEpochs: {} };
+      if (!authority) { diagnostic.outcome = "no_authority"; return none; }
+      const sink = flight.sourceUsePaths ??= new Set();
+      const retire = (): void => {
+        authority.retireSink(sink);
+        flight.sourceAdmissionRetired = true;
+      };
+      const remediation: { kind: "confirmed" | "denied" | "held" } = { kind: "confirmed" };
+      if (flight.remediationRestrictions && flight.sourceTailsJoined === true) {
+        remediation.kind = "held";
+        try {
+          // One bounded acquisition/confirmation attempt. Retire under the same owning A.
+          // A callback can latch synchronously while the Git proof awaits; changed knowledge
+          // keeps custody even if the earlier snapshot could be confirmed.
+          await this.inFlightAuthority(flight, async () => {
+            if (flight.remediationRestrictions?.clearable === true && this.remediationLatchIsEmpty(flight)) {
+              await this.bootstrapRemediationRestrictions(flight, flight.barePath, flight.branch, undefined,
+                Date.now() + this.sourceUseEndWaitMs);
+              if (!flight.remediationRestrictions) {
+                remediation.kind = "confirmed";
+                retire();
+                return;
+              }
+            }
+            const pending = flight.remediationRestrictions?.pending;
             if (!flight.remediationRestrictions) {
               remediation.kind = "confirmed";
               retire();
               return;
             }
-          }
-          const pending = flight.remediationRestrictions?.pending;
-          if (!flight.remediationRestrictions) {
-            remediation.kind = "confirmed";
-            retire();
-            return;
-          }
-          if (!pending) {
-            // A latch with no pending entry (sticky, or a clearable one the re-read did not clear) cannot be
-            // confirmed here: stay held, no publication, slots stay active.
-            retire();
-            return;
-          }
-          const snapshot = canonicalJson(pending);
-          try {
-            remediation.kind = await this.withRemediationLifecycle(undefined, () => this.confirmPendingRemediation(flight));
-          }
-          finally {
-            retire();
-            if (canonicalJson(flight.remediationRestrictions?.pending) !== snapshot) remediation.kind = "held";
-          }
-        }, this.cleanupAuthorityWait(this.sourceUseEndWaitMs));
-      } catch {
-        remediation.kind = "held";
-        runLog.warn("source use left active: remediation durability unconfirmed");
-      } finally {
-        // Acquisition can fail before the callback runs.
+            if (!pending) {
+              // A latch with no pending entry (sticky, or a clearable one the re-read did not clear) cannot be
+              // confirmed here: stay held, no publication, slots stay active.
+              retire();
+              return;
+            }
+            const snapshot = canonicalJson(pending);
+            try {
+              remediation.kind = await this.withRemediationLifecycle(undefined, () => this.confirmPendingRemediation(flight));
+            }
+            finally {
+              retire();
+              if (canonicalJson(flight.remediationRestrictions?.pending) !== snapshot) remediation.kind = "held";
+            }
+          }, this.cleanupAuthorityWait(this.sourceUseEndWaitMs));
+        } catch {
+          remediation.kind = "held";
+          diagnostic.remediation = "unconfirmed";
+          warn("source use left active: remediation durability unconfirmed");
+        } finally {
+          // Acquisition can fail before the callback runs.
+          retire();
+        }
+      } else {
         retire();
       }
-    } else {
-      retire();
-    }
-    // Barrier: an admission that passed its entry check before the retirement may still be running under A. Taking A
-    // once proves it finished (its path is in the sink and its owner recorded) before the snapshot below.
-    const quiescent = await authority.awaitSinkQuiescent({ timeoutMs: this.sourceUseEndWaitMs });
-    const paths = new Set(flight.sourceUsePaths ?? []);
-    // Normalized like the authority's own keys (sourceUsePaths), so the publication check below compares like with like.
-    for (const clone of [flight.worktreePath, flight.runnerClone?.path]) if (clone) paths.add(resolvePath(clone));
-    if (paths.size === 0) return none;
-    const allPaths = [...paths];
-    const ownedEpochs: Record<string, string> = {};
-    for (const p of allPaths) { const epoch = authority.ownedSourceEpoch(p, sink); if (epoch !== undefined) ownedEpochs[p] = epoch; }
-    if (!quiescent) {
-      // Not fatal, and fail closed: every admission names its path before it writes, so the snapshot still covers it. An
-      // admission still running here is either before its lease (the end below keeps its key and never queues or ends it)
-      // or after it (ended only if the end gets A after the admission finished, else queued). Either way a key without an
-      // endedSlots entry blocks the settlement; the owned epochs may also be short, which leaves the park record unwritten.
-      runLog.warn("source use end: the admission barrier could not take the authority lock", { sources: paths.size });
-    }
-    if (flight.sourceTailsJoined !== true) {
-      runLog.warn("source use left active: this flight's source-capable tails were not positively joined", {
-        sources: paths.size });
-      return { paths: allPaths, endedSlots: [], published: false, ownedEpochs };
-    }
-    if (remediation.kind === "held")
-      return { paths: allPaths, endedSlots: [], published: false, ownedEpochs };
-    // U4: a flight whose completing source the journal durably bound publishes it (Codex: sealed; Claude:
-    // claude_ready) instead of ending it. Publication moves the slot out of `active` itself and returns its
-    // lease, so only the paths that did NOT publish still need the ineligible step below.
-    const bound = flight.completionSourceBound;
-    let published = false;
-    if (remediation.kind !== "denied" && bound && paths.has(resolvePath(bound.clonePath))) {
-      // "ended": a failed publication already moved the slot to ineligible under its own A.
-      const outcome = await this.publishFlightSource(flight, bound, runLog);
-      if (outcome !== "unpublished") { paths.delete(resolvePath(bound.clonePath)); published = true; }
-    }
-    if (paths.size === 0) return { paths: allPaths, endedSlots: [], published, ownedEpochs };
-    const outcome = await authority.endSourceUse(paths, { timeoutMs: this.sourceUseEndWaitMs, sink });
-    if (outcome.kept.length > 0) runLog.warn("source use left active for some paths", { kept: outcome.kept.length });
-    return { paths: allPaths, endedSlots: outcome.endedSlots, published, ownedEpochs };
+      // Barrier: an admission that passed its entry check before the retirement may still be running under A. Taking A
+      // once proves it finished (its path is in the sink and its owner recorded) before the snapshot below.
+      const quiescent = await authority.awaitSinkQuiescent({ timeoutMs: this.sourceUseEndWaitMs });
+      const paths = new Set(flight.sourceUsePaths ?? []);
+      // Normalized like the authority's own keys (sourceUsePaths), so the publication check below compares like with like.
+      for (const clone of [flight.worktreePath, flight.runnerClone?.path]) if (clone) paths.add(resolvePath(clone));
+      diagnostic.remediation = diagnostic.remediation === "unconfirmed" ? "unconfirmed" :
+        flight.remediationRestrictions ? remediation.kind : "none";
+      diagnostic.barrier = quiescent ? "joined" : "unconfirmed";
+      diagnostic.sources = Math.min(paths.size, 2048);
+      if (paths.size === 0) { diagnostic.outcome = "no_sources"; return none; }
+      const allPaths = [...paths];
+      const ownedEpochs: Record<string, string> = {};
+      for (const p of allPaths) { const epoch = authority.ownedSourceEpoch(p, sink); if (epoch !== undefined) ownedEpochs[p] = epoch; }
+      if (!quiescent) {
+        // Not fatal, and fail closed: every admission names its path before it writes, so the snapshot still covers it. An
+        // admission still running here is either before its lease (the end below keeps its key and never queues or ends it)
+        // or after it (ended only if the end gets A after the admission finished, else queued). Either way a key without an
+        // endedSlots entry blocks the settlement; the owned epochs may also be short, which leaves the park record unwritten.
+        warn("source use end: the admission barrier could not take the authority lock", { sources: Math.min(paths.size, 2048) });
+      }
+      if (flight.sourceTailsJoined !== true) {
+        diagnostic.outcome = "tails_unjoined";
+        if (quiescent) authority.markSourceEndDeclined(allPaths, sink);
+        warn("source use left active: this flight's source-capable tails were not positively joined", {
+          sources: Math.min(paths.size, 2048) });
+        return { paths: allPaths, endedSlots: [], published: false, ownedEpochs };
+      }
+      if (remediation.kind === "held") {
+        diagnostic.outcome = "remediation_held";
+        if (quiescent) authority.markSourceEndDeclined(allPaths, sink);
+        return { paths: allPaths, endedSlots: [], published: false, ownedEpochs };
+      }
+      // U4: a flight whose completing source the journal durably bound publishes it (Codex: sealed; Claude:
+      // claude_ready) instead of ending it. Publication moves the slot out of `active` itself and returns its
+      // lease, so only the paths that did NOT publish still need the ineligible step below.
+      const bound = flight.completionSourceBound;
+      let published = false;
+      if (remediation.kind !== "denied" && bound && paths.has(resolvePath(bound.clonePath))) {
+        // "ended": a failed publication already moved the slot to ineligible under its own A.
+        const outcome = await this.publishFlightSource(flight, bound, runLog);
+        diagnostic.publication = outcome;
+        if (outcome !== "unpublished") { paths.delete(resolvePath(bound.clonePath)); published = true; }
+      }
+      if (paths.size === 0) { diagnostic.outcome = "ended"; return { paths: allPaths, endedSlots: [], published, ownedEpochs }; }
+      for (const path of paths) {
+        diagnostic.foreign ||= authority.heldByOtherSink(path, sink);
+        diagnostic.no_lease ||= !authority.leaseFor(path);
+      }
+      const outcome = await authority.endSourceUse(paths, { timeoutMs: this.sourceUseEndWaitMs, sink });
+      if (outcome.kept.length > 0) warn("source use left active for some paths", { kept: Math.min(outcome.kept.length, 2048) });
+      diagnostic.kept = Math.min(outcome.kept.length, 2048);
+      diagnostic.outcome = outcome.kept.length ? "unconfirmed" : "ended";
+      return { paths: allPaths, endedSlots: outcome.endedSlots, published, ownedEpochs };
+    } finally { this.emitSourceEndDiagnostics(flight, runLog); }
   }
 
   /**
@@ -4768,7 +4827,7 @@ export class RunRunner {
     const authority = this.authority;
     const lease = flight.sourceLease;
     const unpublished = (reason: string): "unpublished" => {
-      runLog.warn("completion source not published; its source use ends ineligible", { reason });
+      try { runLog.warn("completion source not published; its source use ends ineligible", { reason }); } catch { /* Diagnostics only. */ }
       return "unpublished";
     };
     if (!authority || !lease) return "unpublished";
@@ -4781,7 +4840,10 @@ export class RunRunner {
       if (flight.sourceJoinFailed) return unpublished("a source-capable cleanup did not complete");
       if (codex !== (executor.executorIncarnation !== undefined)) return unpublished("the executor does not match the lease's harness");
       if (!codex && (flight.initiallyCodex || executor.safety || executor.sealLifetime)) return unpublished("a Codex flight cannot publish as Claude");
-      if (authority.leaseFor(bound.clonePath) !== lease) return unpublished("the flight's source lease is not the current lease for its clone");
+      if (authority.leaseFor(bound.clonePath) !== lease) {
+        this.sourceEndDiagnosticState(flight).publication_epoch_mismatch = true;
+        return unpublished("the flight's source lease is not the current lease for its clone");
+      }
       let seal: unknown;
       if (codex) {
         if (!executor.sealLifetime || !executor.acceptsLifetimeSeal) return unpublished("the executor cannot seal its lifetime");
@@ -4824,10 +4886,10 @@ export class RunRunner {
         });
       });
       if (outcome.published) return "published";
-      unpublished(outcome.reason);
+      unpublished("publication_refused");
       return outcome.ended ? "ended" : "unpublished";
-    } catch (error) {
-      return unpublished(errMessage(error));
+    } catch {
+      return unpublished("publication_unconfirmed");
     }
   }
 
@@ -7238,6 +7300,8 @@ export class RunRunner {
       flight.prologueSwitchHold?.close({ service: false });
       await dispatchFailure(err, true);
     } finally {
+      const diagnostic = this.sourceEndDiagnosticState(flight);
+      try {
       flight.prologueSwitchHold?.close({ service: false });
       if (flight.restoreExecutorSwapped) executor = flight.executor;
       flight.forgeCloneSuccess?.abort();
@@ -7304,12 +7368,13 @@ export class RunRunner {
           terminalDisposition = "rejected";
         }
       }
+      diagnostic.terminal = !terminalCodex ? "not_required" : terminalDisposeUnproven ? terminalDisposition : "joined";
       if (terminalDisposeUnproven) {
         flight.evidenceJoinFailed = true;
         flight.sourceJoinFailed = true;
         flight.preserveRecoveryClone = true;
         flight.keepGuardedInventoryOpen = true;
-        runLog.warn("codex terminal disposal unproven; retaining runner clone", { disposition: terminalDisposition });
+        try { runLog.warn("codex terminal disposal unproven; retaining runner clone", { disposition: terminalDisposition }); } catch { /* Diagnostics only. */ }
       }
       // Consume exactly once, before any later independent custody decision.
       const deferredRelease = flight.deferredTerminalRelease;
@@ -7357,6 +7422,7 @@ export class RunRunner {
       this.rearm?.delete(runId);
       let steeringJoined = false;
       await steering.stop().then(() => { steeringJoined = true; }).catch(() => { flight.sourceJoinFailed = true; });
+      diagnostic.steering = steeringJoined;
       // PRD #41: drop this run's plan-approval deadline + gate-tracking (normally cleared
       // when the gate resolves terminally, but a run that ends by any other path must not
       // leak either).
@@ -7749,6 +7815,14 @@ export class RunRunner {
         (flight.evidenceAuxiliaries === undefined || flight.evidenceAuxiliaries === "joined") &&
         (!executor.settleWorkerCommands || (commands === this.commandSettlements.get(executor) && commands?.confirmed === true && !commands.failed)) &&
         memorySettled && !this.memoryRuntime?.sinkReceipts.some(receipt => receipt.context.flight === flight);
+      diagnostic.executor = flight.executor === executor;
+      diagnostic.process = flight.evidenceProcessJoined === executor && !flight.evidenceJoinFailed;
+      diagnostic.commands = !executor.settleWorkerCommands ||
+        (commands === this.commandSettlements.get(executor) && commands?.confirmed === true && !commands.failed);
+      diagnostic.steering = steeringJoined;
+      diagnostic.auxiliaries = flight.evidenceAuxiliaries === undefined || flight.evidenceAuxiliaries === "joined";
+      diagnostic.memory = memorySettled && !this.memoryRuntime?.sinkReceipts.some(receipt => receipt.context.flight === flight);
+      diagnostic.park_reap = !parkReapIncomplete;
       flight.sourceTailsJoined = sourceTails && !parkReapIncomplete;
       flight.evidenceJoinsConfirmed = sourceTails && !flight.sourceJoinFailed &&
         !batcher.isTripped() && !batcher.isSpilled() && batcher.bufferedCount() === 0;
@@ -7758,6 +7832,7 @@ export class RunRunner {
       // issue #3638 D3: the cooperative memory-park record, after the source use ended. Never throws.
       await this.recordMemoryParkOutcome(flight, runLog, sourceEnd, {
         steeringJoined, parkReap: parkReapApplied ? "complete" : "not_applicable" });
+      } finally { this.emitSourceEndDiagnostics(flight, runLog); }
     }
   }
 
@@ -14987,15 +15062,8 @@ export class RunRunner {
     // did the preceding `running` report carry it, so the next snapshot that omits the run stamps a witnessed
     // departure charged against RUN_MAX_REQUEUES (the claimed-never-started charge), parking at
     // worker_requeue_exhausted. Otherwise the existing per-run custody bound (ADR-1751 D2a) is what stops the loop.
-    const stopOnHeldSource = (err: SourceUseHeldRefusal | AuthorityShutdownRefusal): never => {
-      this.retainedLifecycleGuard(flight);
-      // issue #4066: a shutdown refusal is the same nonterminal stop; it is never a verdict about the clone.
-      flight.runLog.warn(err instanceof AuthorityShutdownRefusal
-        ? "authority sealed for worker shutdown; stopping claim for retry"
-        : "clone path held by an earlier flight's unended source use; stopping claim for retry", {
-        error: errMessage(err), claim_generation: flight.claimGeneration });
-      throw new RetainedRecoveryStop({ cause: err });
-    };
+    const stopOnHeldSource = async (err: SourceUseHeldRefusal | AuthorityShutdownRefusal): Promise<never> =>
+      this.disposeHeldSource(claim, flight, err instanceof SourceUseHeldRefusal ? err.blockedSourceKey : undefined, err);
     // The re-seed after a reclaimed terminal orphan runs inside the loop's catch, which has no handler for a
     // refusal raised there, so it maps the refusal itself.
     const reseedAfterReclaim = async (): Promise<void> => {
@@ -15006,7 +15074,7 @@ export class RunRunner {
         flight.branch = runnerClone.branch;
         await this.bindFlightSource(flight, runnerClone.path);
       } catch (err) {
-        if (err instanceof SourceUseHeldRefusal || err instanceof AuthorityShutdownRefusal) stopOnHeldSource(err);
+        if (err instanceof SourceUseHeldRefusal || err instanceof AuthorityShutdownRefusal) await stopOnHeldSource(err);
         stopOnRetiringSlot(err);
         throw err;
       }
@@ -15109,7 +15177,7 @@ export class RunRunner {
         } else if (err instanceof SourceUseHeldRefusal || err instanceof AuthorityShutdownRefusal) {
           // The canonical clone path is shared by every run of the issue on this worker, so an earlier flight of
           // this process can still hold it with no confirmed end (held_unended).
-          stopOnHeldSource(err);
+          await stopOnHeldSource(err);
         } else {
           stopOnRetiringSlot(err);
           throw err;
@@ -27778,9 +27846,9 @@ export class RunRunner {
         }
       }
     } catch {
-      flight.runLog.warn(restore ? "owner cancel read at the restore stop did not complete; stopping without cancel"
+      try { flight.runLog.warn(restore ? "owner cancel read at the restore stop did not complete; stopping without cancel"
         : "owner cancel read at the held-predecessor refusal did not complete; stopping without cancel",
-      { claim_generation: flight.claimGeneration });
+      { claim_generation: flight.claimGeneration }); } catch { /* Preserve cancellation disposition. */ }
     }
     if (cause !== undefined) throw new RetainedRecoveryCancelled({ cause });
   }
@@ -28818,9 +28886,37 @@ export class RunRunner {
    * in the window went unwitnessed.
    * Ownership only authorizes replay: only the report ACK's exact status/cause confirms.
    * Any unresolved outcome stops this flight without terminal reporting or releasing custody. */
+  private async disposeHeldSource(
+    claim: ClaimResponse, flight: RunFlight, sourceKey?: string, cause?: unknown,
+  ): Promise<never> {
+    // Retain custody synchronously, before cancellation, ownership or network awaits.
+    flight.retainedLocalCustody = true;
+    flight.retainedEpisodeCustody = true;
+    flight.preserveRecoveryClone = true;
+    flight.preserveSession = true;
+    flight.keepGuardedInventoryOpen = true;
+    // One fixed-message warning per held disposition, including shutdown and holds
+    // without declined evidence. Logging cannot change the custody decision.
+    try {
+      flight.runLog.warn(cause instanceof AuthorityShutdownRefusal
+        ? "authority sealed for worker shutdown; stopping claim for retry"
+        : "clone path held by an earlier flight's unended source use; stopping claim for retry", {
+        claim_generation: flight.claimGeneration });
+    } catch { /* Preserve held disposition when the logger throws. */ }
+    this.retainedLifecycleGuard(flight);
+    await this.observeCancelAtHeldSeam(claim, flight);
+    this.retainedLifecycleGuard(flight);
+    const nonce = this.client.sourceEndDeclinedRegistration(flight.runId, flight.claimGeneration);
+    if (sourceKey && nonce && await this.authority?.sourceEndDeclined(sourceKey, flight.sourceUsePaths)) {
+      await this.parkRetainedRecoveryExhausted(flight, "retained_recovery_adoption_failed",
+        { detail: "source_end_declined", registerNonce: nonce });
+    }
+    throw new RetainedRecoveryStop({ cause });
+  }
+
   private async parkRetainedRecoveryExhausted(flight: RunFlight,
     cause: "retained_recovery_exhausted" | "retained_recovery_adoption_failed" = "retained_recovery_exhausted",
-    opts?: { capacityOnly?: boolean; detail?: RetainedAdoptionRefusal },
+    opts?: { capacityOnly?: boolean; detail?: RetainedAdoptionRefusal | "source_end_declined"; registerNonce?: string },
   ): Promise<boolean> {
     const deadline = Date.now() + this.codexBoundaryDeadlineMs;
     const timeout = new AbortController();
@@ -28835,9 +28931,11 @@ export class RunRunner {
       this.client.hasFeature(RETAINED_CAPACITY_HOLD_FEATURE);
     // Issue #4177: the adoption-refusal detail rides the one body object (a replay stays byte-identical), only on the
     // adoption cause and only to an api that advertised it. A 400 falls back to the same body without it.
+    const sourceDeclined = opts?.detail === "source_end_declined";
+    if (sourceDeclined) body.register_nonce = opts.registerNonce;
     const detailed = opts?.detail !== undefined && cause === "retained_recovery_adoption_failed" &&
       Number.isSafeInteger(flight.claimGeneration) && flight.claimGeneration > 0 &&
-      this.client.hasFeature(RETAINED_ADOPTION_DETAIL_FEATURE);
+      this.client.hasFeature(sourceDeclined ? "retained_source_end_hold_v1" : RETAINED_ADOPTION_DETAIL_FEATURE);
     // One pass of the two-report loop. A 400 under `rejectToFallback` leaves the pass (the api may not
     // understand the marker) and reports whether any earlier report in the pass was left unresolved.
     const pass = async (reqBody: StateRequest, rejectToFallback: boolean, priorUncertain: boolean):
@@ -28855,7 +28953,10 @@ export class RunRunner {
           if (cause === "retained_recovery_adoption_failed" && ack.status === "recovery_wait" &&
               ack.recoveryCause !== undefined && ack.recoveryCause !== cause)
             throw new RetainedRecoveryStop();
-          if (ack.status === "recovery_wait" && ack.recoveryCause === cause) {
+          if (ack.status === "recovery_wait" && ack.recoveryCause === cause &&
+              (!sourceDeclined || (ack.runId === flight.runId && ack.workerIdentityMatches === true &&
+                ack.sentClaimGeneration === flight.claimGeneration && ack.recoveryDetail === "source_end_declined" &&
+                this.client.sourceEndDeclinedRegistration(flight.runId, flight.claimGeneration) === opts?.registerNonce))) {
             flight.parked = true;
             return "confirmed";
           }
@@ -28896,9 +28997,11 @@ export class RunRunner {
     };
     try {
       let uncertain = false;
+      if (sourceDeclined && !detailed) throw new RetainedRecoveryStop();
       if (detailed) {
-        const outcome = await pass({ ...body, recovery_detail: opts!.detail }, true, false);
+        const outcome = await pass({ ...body, recovery_detail: opts!.detail }, !sourceDeclined, false);
         if (outcome === "confirmed") return true;
+        if (sourceDeclined) throw new RetainedRecoveryStop();
         if (typeof outcome === "object") uncertain = outcome.uncertain;
       }
       if (marked) {
@@ -29804,10 +29907,7 @@ export class RunRunner {
     // below remains the authoritative backstop if another flight acquires the source after this read.
     if (this.authority?.heldByOtherSink(source.clonePath, flight.sourceUsePaths ??= new Set())) {
       this.retainedLifecycleGuard(flight);
-      flight.runLog.warn("retained predecessor held by an earlier flight's unended source use; stopping claim for retry", {
-        claim_generation: flight.claimGeneration });
-      await this.observeCancelAtHeldSeam(claim, flight);
-      throw new RetainedRecoveryStop();
+      await this.disposeHeldSource(claim, flight, source.clonePath);
     }
     // issue #3644 m4a: both diagnostics read the predecessor's source tree (settlement sources, maintenance family), which the
     // restore route must never touch.
@@ -30102,10 +30202,7 @@ export class RunRunner {
               // (run_registration_evidence_v1) and it was negotiated and not dropped: then the witnessed departure
               // of this retained continuation is charged against RUN_MAX_REQUEUES and parks at
               // worker_requeue_exhausted. Otherwise the existing per-run custody bound (ADR-1751 D2a) stops it.
-              flight.runLog.warn("retained predecessor held by an earlier flight's unended source use; stopping claim for retry", {
-                error: errMessage(error), claim_generation: flight.claimGeneration });
-              await this.observeCancelAtHeldSeam(claim, flight);
-              throw new RetainedRecoveryStop({ cause: error });
+              await this.disposeHeldSource(claim, flight, error.blockedSourceKey, error);
             }
             if (error instanceof AuthorityShutdownRefusal) {
               // issue #4066: the authority is sealed because this worker is leaving. That says nothing about the

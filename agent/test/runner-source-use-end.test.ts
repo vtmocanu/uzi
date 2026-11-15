@@ -9,6 +9,8 @@ import { openAuthorityStore, type SlotSnapshot } from "../src/completion-authori
 import { StubExecutor, type Executor, type ExecutorResult, type RunContext } from "../src/executor.js";
 import { ForeignCaptureBlockedError, GitCache } from "../src/git.js";
 import { RunRunner } from "../src/runner.js";
+import { ActiveRunRegistry } from "../src/active-run-registry.js";
+import { RUN_REGISTRATION_EVIDENCE_FEATURE, type StateAck } from "../src/protocol.js";
 import { formatAttemptId } from "../src/attempt-path.js";
 import type { RemediationRecovery } from "../src/git.js";
 import { portableTeardownTestDeps } from "./teardown-fixtures.js";
@@ -90,6 +92,114 @@ function runnerOnHookedGit(r: Rig, makeExecutor: (runId: string) => { homeDir: s
 }
 
 describe("end of a flight's source use", () => {
+  it("SourceEndDeclinedFirstRefusalRedGreen: real wall park retains the source and the first same-worker reclaim parks for its owner", async t => {
+    const r = await rig();
+    const iid = 436501;
+    const nonce = randomUUID();
+    const registry = new ActiveRunRegistry();
+    registry.buildRegisterSnapshot();
+    api.registerNonce = nonce;
+    api.setRegisterProtocolFeatures([
+      "claim_generation_fence", RUN_REGISTRATION_EVIDENCE_FEATURE, "retained_source_end_hold_v1",
+      "recovery_cause_retained_recovery_adoption_failed",
+    ]);
+    await client.register("source-end-regression", "test", 1, undefined, [], registry.buildRegisterSnapshot(), 0);
+    api.modelCrossCheckRunningRule = true;
+    api.modelOrdinaryRunningRule = true;
+    const claim = gitlabClaim(iid, {
+      claim_generation: 1, plan_approved: true, plan_source: "seeded",
+      plan_md: "# Plan\nKeep the source at the wall", session_id: null,
+    });
+    const acknowledgments: StateAck[] = [];
+    const report = client.reportState.bind(client);
+    t.mock.method(client, "reportState", async (...args: Parameters<typeof client.reportState>) => {
+      const ack = await report(...args);
+      if (args[1].recovery_detail === "source_end_declined") acknowledgments.push(ack);
+      return ack;
+    });
+    api.stateAckWire = (body, run) => {
+      if (body.status === "running" && body.registration_evidence) {
+        return { status: 200, body: { run, registration_evidence: "recorded" } };
+      }
+      if (body.status === "recovery_wait") {
+        return { status: 200, body: { run: {
+          ...run, recovery_wait_cause: body.recovery_cause,
+          recovery_wait_detail: body.recovery_detail,
+        } } };
+      }
+      return undefined;
+    };
+    let starts = 0;
+    let sourcePath = "";
+    const runner = runnerWith(runId => ({
+      homeDir: path.join(homeDir, runId),
+      executor: { run: async (ctx: RunContext): Promise<ExecutorResult> => {
+        starts++;
+        sourcePath = ctx.worktreePath;
+        fs.writeFileSync(path.join(sourcePath, "wall-source.txt"), "retained source\n");
+        assert.equal(await ctx.parkForWall?.({ completedCount: 0 }), "parked");
+        return { branch: ctx.branch, walled: { reason: "run exceeded its wall-clock timeout" } };
+      } },
+    }), rawFakeGitlab({}).gitlab, undefined, undefined, { authority: r.rt, activeRuns: registry });
+    // Inject only the missing tail receipt, after the real wall capture/park and normal
+    // teardown. execute still owns the call to the real source-end implementation.
+    const teardown = runner as unknown as {
+      endFlightSourceUse(flight: { sourceTailsJoined?: boolean }, log: Logger): Promise<unknown>;
+    };
+    const end = teardown.endFlightSourceUse.bind(runner);
+    let ends = 0;
+    t.mock.method(teardown, "endFlightSourceUse", async (flight: { sourceTailsJoined?: boolean }, log: Logger) => {
+      if (ends++ === 0) flight.sourceTailsJoined = false;
+      return end(flight, log);
+    });
+    try {
+      await runner.execute(claim);
+      assert.equal(starts, 1);
+      assert.equal(client.sourceEndDeclinedRegistration(claim.run_id, 1), nonce,
+        "the real running report recorded the current registration witness");
+      assert.equal(api.wallParkRequests.filter(req => req.runId === claim.run_id).length, 1);
+      assert.ok(fs.existsSync(path.join(sourcePath, "wall-source.txt")));
+      assert.equal(await r.rt.sourceEndDeclined(sourcePath, new Set()), true);
+      const before = await slotOf(r.rt, sourcePath);
+      assert.equal(before?.state, "active");
+      const retained = await git.discoverRetainedRecovery(fx.originPath,
+        `agent/issue-${iid}`, `issue-${iid}`, claim.run_id);
+      assert.ok(retained, "the real wall park left a discoverable retained journal");
+      assert.equal(retained.journal.clonePath, sourcePath);
+      const resumed = gitlabClaim(iid, { ...claim, claim_generation: 2 });
+      api.setOwnershipStatus(claim.run_id, "claimed", 2);
+      await runner.execute(resumed);
+      assert.equal(client.sourceEndDeclinedRegistration(claim.run_id, 2), nonce,
+        "the reclaim recorded its own generation-bound running witness");
+      const refusals = () => api.states.filter(s =>
+        s.runId === claim.run_id && s.body.status === "recovery_wait");
+      assert.equal(refusals().length, 1, "the very first refusal reports exactly once");
+      assert.equal(refusals()[0]?.body.recovery_cause, "retained_recovery_adoption_failed");
+      assert.equal(refusals()[0]?.body.recovery_detail, "source_end_declined");
+      assert.equal(refusals()[0]?.body.register_nonce, nonce);
+      assert.equal(acknowledgments.length, 1);
+      assert.equal(acknowledgments[0]?.status, "recovery_wait");
+      assert.equal(acknowledgments[0]?.runId, claim.run_id);
+      assert.equal(acknowledgments[0]?.recoveryCause, "retained_recovery_adoption_failed");
+      assert.equal(acknowledgments[0]?.recoveryDetail, "source_end_declined");
+      assert.equal(acknowledgments[0]?.workerIdentityMatches, true);
+      assert.equal(acknowledgments[0]?.sentClaimGeneration, 2);
+      assert.equal(starts, 1, "the reclaim starts no model");
+      assert.deepEqual(await slotOf(r.rt, sourcePath), before, "the refused reclaim changes no source slot");
+      const held = await git.discoverRetainedRecovery(fx.originPath,
+        `agent/issue-${iid}`, `issue-${iid}`, claim.run_id);
+      assert.deepEqual(held, retained, "the first refusal consumes no recovery attempt or journal generation");
+      // The fixture has no server scheduler. M1 LiveDB tests supply the separate
+      // persisted no-new-claim and custody-count proof; do not fabricate another claim here.
+      assert.equal(api.states.some(s => s.runId === claim.run_id &&
+        (s.body.status === "failed" || s.body.status === "completed")), false);
+    } finally {
+      api.stateAckWire = undefined;
+      api.modelCrossCheckRunningRule = false;
+      api.modelOrdinaryRunningRule = false;
+    }
+  });
+
   it("a flight that ends normally lets a different worker incarnation seed the same canonical path", async () => {
     const r = await rig();
     const forge = rawFakeGitlab({});
@@ -287,6 +397,9 @@ describe("sink retirement and ownership at a flight's teardown", () => {
       const flight = flightOf(canonical, sink);
       await internals.endFlightSourceUse(flight, log);
       assert.equal(flight.sourceAdmissionRetired, true, "the latch is set on this return path");
+      assert.equal(await r.rt.sourceEndDeclined(canonical, new Set()), name === "not positively joined",
+        "only the definitive no-end branch supplies a declined witness");
+
 
       const before = JSON.stringify(await slotOf(r.rt, canonical));
       // The runtime-level callback a late git hook would make inside the flight's own sink.
@@ -310,12 +423,22 @@ describe("sink retirement and ownership at a flight's teardown", () => {
     });
   }
 
+  it("an uncertain admission barrier cannot create a declined witness", async (t) => {
+    const { r, canonical, internals, log } = await setup(364010);
+    const sink = new Set<string>();
+    await r.rt.recordAdmissions(sink, () => r.rt.bindSource(canonical));
+    t.mock.method(r.rt, "awaitSinkQuiescent", async () => false);
+    await internals.endFlightSourceUse({ worktreePath: canonical, sourceUsePaths: sink, sourceTailsJoined: false }, log);
+    assert.equal(await r.rt.sourceEndDeclined(canonical, new Set()), false);
+  });
+
   it("a flight that was refused a path another flight still owns cannot end or publish it", async () => {
     const { r, canonical, internals, log } = await setup(364004);
     const sinkA = new Set<string>();
     const sinkB = new Set<string>();
     const leaseA = await r.rt.recordAdmissions(sinkA, () => r.rt.bindSource(canonical));
     r.rt.retireSink(sinkA);
+    assert.equal(await r.rt.sourceEndDeclined(canonical, new Set()), false, "manual retirement is not declined evidence");
     const epoch = (await slotOf(r.rt, canonical))?.epoch;
     // B (a retained-recovery flight refused with SourceUseHeldRefusal) still names the path as its worktree and
     // its tails were joined, but its sink never admitted it.
@@ -352,6 +475,7 @@ describe("sink retirement and ownership at a flight's teardown", () => {
     const sinkA = new Set<string>();
     await r.rt.recordAdmissions(sinkA, () => r.rt.bindSource(canonical));
     r.rt.retireSink(sinkA);
+    assert.equal(await r.rt.sourceEndDeclined(canonical, new Set()), false, "manual retirement is not declined evidence");
     const epoch = (await slotOf(r.rt, canonical))?.epoch;
     let started = 0;
     const claim = gitlabClaim(iid, { run_id: randomUUID() });
@@ -392,6 +516,7 @@ describe("sink retirement and ownership at a flight's teardown", () => {
     const sinkA = new Set<string>();
     await r.rt.recordAdmissions(sinkA, () => r.rt.bindSource(canonical));
     r.rt.retireSink(sinkA);
+    assert.equal(await r.rt.sourceEndDeclined(canonical, new Set()), false, "manual retirement is not declined evidence");
     const epoch = (await slotOf(r.rt, canonical))?.epoch;
     const claim = gitlabClaim(iid, { run_id: randomUUID() });
     const ownerRunId = randomUUID();
