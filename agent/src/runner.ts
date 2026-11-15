@@ -2714,7 +2714,7 @@ interface RunFlight {
    *  secret-scan restriction holds checkpoints back; `clear_pending` once a later publication was
    *  admitted and accepted, until a `cleared` ACK retires the episode. Content-free by construction:
    *  nothing here names a finding, path, rule or SHA. */
-  checkpointWithheld?: { episode: number; since: string; phase: "withheld" | "clear_pending" };
+  checkpointWithheld?: { episode: number; since: string; phase: "withheld" | "clear_pending"; evidenceSeq: number };
   /** Issue #4257: the flight's trusted-finding provenance, the only thing that lets a hold outcome
    *  start a withheld episode. Set from a trusted scan finding, confirmed enrolled restriction facts
    *  or a matching recovery record; never from a latch alone (a failed facts read also latches).
@@ -2722,14 +2722,18 @@ interface RunFlight {
    *  accepted publication retires it (noteCheckpointPublished). Holds no OIDs or finding content. */
   trustedFindingEvidence?: { runId: string; barePath: string; branch: string };
   /** Issue #4257: monotonic version of the trusted-finding evidence, advanced only by a fresh scan
-   *  finding (noteTrustedFinding source "scan"); historical re-assertions never advance it. The
-   *  admission guard captures it, so an accepted publication retires only the evidence that existed
-   *  when it was admitted. */
+   *  finding that is newer (noteTrustedFinding); historical re-assertions and re-found commits never
+   *  advance it. An episode captures it when it opens and the admission guard when it admits, so an
+   *  accepted publication retires only evidence no newer than either. */
   trustedFindingSeq?: number;
   /** Issue #4257: set when an accepted publication retired the evidence; while set, historical
    *  re-assertions (confirmed enrolled facts, a journal record) cannot record it again. Only a fresh
    *  scan finding clears it. */
   trustedFindingRetired?: boolean;
+  /** Issue #4257: the flagged commits behind this flight's scan evidence, in memory only (never
+   *  reported, persisted or logged). A scan that re-finds only commits already here (e.g. the mid-run
+   *  remediation rescan of the same unresolved secret) is not a newer finding. */
+  trustedFindingCommits?: Set<string>;
   /** Issue #4257: monotonic per flight. A new episode takes the next number. */
   withheldEpisodeSeq?: number;
   /** Issue #4257: monotonic per flight; every diagnostic send (retries included) takes the next one. */
@@ -4384,7 +4388,7 @@ export class RunRunner {
       if (!record) return;
       const scan = await this.scanRemediationRange(flight, flight.barePath!, flight.branch!, record.ownedTip, { explicitTip: true });
       if (scan.trusted && scan.findings.length) {
-        this.noteTrustedFinding(flight, flight.barePath, flight.branch);
+        this.noteTrustedFinding(flight, flight.barePath, flight.branch, "scan", scan.findings);
         await this.persistRemediationRestrictions(flight, flight.barePath!, flight.branch!, scan.range.tipSha, scan.findings);
       }
       if (!scan.trusted || scan.findings.length) throw new Error("remediation continuation history unavailable");
@@ -4570,7 +4574,7 @@ export class RunRunner {
       // trusted scan with findings. Never from progress.observe or the catch below, which also latch
       // custody-only and failed-read states.
       if (facts.enrolled && facts.flaggedOIDs.length > 0 && flight.runId === runId)
-        this.noteTrustedFinding(flight, barePath, branch, "record");
+        this.noteTrustedFinding(flight, barePath, branch, "record", facts.flaggedOIDs);
       if (!facts.enrolled && initial && flight.remediationRestrictions === initial &&
           initial.clearable === true && initial.contributions === contributions && !flight.predecessorCapture &&
           (flight.remediationDenialRevision ?? 0) === revision &&
@@ -4644,7 +4648,7 @@ export class RunRunner {
       // Issue #4257: a journal record for this run and branch that names flagged OIDs is trusted-finding
       // provenance (see bootstrapRemediationRestrictions); never from the catch.
       if (record.flaggedOIDs.length > 0 && record.runId === flight.runId && record.branch === flight.branch)
-        this.noteTrustedFinding(flight, flight.barePath, flight.branch, "record");
+        this.noteTrustedFinding(flight, flight.barePath, flight.branch, "record", record.flaggedOIDs);
       return record;
     } catch (error) {
       const preAcquisition = !!progress && progress.cause === "pre_read_unavailable" && !progress.started && !progress.acquired;
@@ -10043,7 +10047,7 @@ export class RunRunner {
     // Issue #4257: a recorded flagged commit came from a trusted scan of the original flight. A
     // publication-only flight runs no executor, but a graceful-shutdown checkpoint still reaches
     // publishCheckpointOutcome, so its hold outcome needs this evidence to be reported.
-    if (sr.flagged_commits.length > 0) this.noteTrustedFinding(flight, flight.barePath, record.branch, "record");
+    if (sr.flagged_commits.length > 0) this.noteTrustedFinding(flight, flight.barePath, record.branch, "record", sr.flagged_commits);
 
     // The model-free publish inputs: the branch, and the lead's recorded claims (redacted, re-validated) for
     // the description ladder's lead_only rung. The scope flags and every closing directive come from the live
@@ -12111,7 +12115,7 @@ export class RunRunner {
       }
       if (trusted && findings.length > 0) {
         this.recordFlaggedCommits((flight.secretRemediation ??= { attempts: 0 }), findings, runLog);
-        this.noteTrustedFinding(flight, scanBare, result.branch);
+        this.noteTrustedFinding(flight, scanBare, result.branch, "scan", findings);
         // issue #1932: local-scan wording on every forge (no GH013 / GitHub Push Protection claim).
         const withholdPaths = await this.withholdPathsFor(findings);
         const reason = composeLocalScanBlockedReason(findings, { redact: redactText, withholdPaths });
@@ -19326,7 +19330,7 @@ export class RunRunner {
       onScan: scan => {
         if (scan.trusted && scan.findings.length) {
           this.recordFlaggedCommits((flight.secretRemediation ??= { attempts: 0 }), scan.findings, flight.runLog);
-          this.noteTrustedFinding(flight, flight.barePath, record.branch);
+          this.noteTrustedFinding(flight, flight.barePath, record.branch, "scan", scan.findings);
         }
       },
       remediationHold: () => this.checkpointRemediationHold(flight, flight.barePath!, record.sourceSha, true),
@@ -20528,7 +20532,7 @@ export class RunRunner {
           this.recordFlaggedCommits((flight.secretRemediation ??= { attempts: 0 }), scan.findings, flight.runLog);
           // Issue #4257: synchronous, ahead of the awaited trigger/persistence below, so a rejecting
           // or blocking persistence cannot suppress it. Keyed on the TRUSTED scan, not the outcome.
-          this.noteTrustedFinding(flight, barePath, branch);
+          this.noteTrustedFinding(flight, barePath, branch, "scan", scan.findings);
           this.noteCheckpointWithheld(flight, false);
           await this.noteMidRunTrigger(flight, barePath, range.tipSha, scan.findings, scanScope);
           await this.persistRemediationScan(flight, barePath, branch, range.tipSha, scan.findings, "checkpoint-pending");
@@ -20821,7 +20825,7 @@ export class RunRunner {
       // knowledge only: no turn, no attempt, no trigger change, and none of known/blocked/everKnown/cleanTip.
       if (scanned.trusted) {
         this.recordFlaggedCommits(state, scanned.findings, runLog);
-        if (scanned.findings.length > 0) this.noteTrustedFinding(flight, barePath, branch);
+        if (scanned.findings.length > 0) this.noteTrustedFinding(flight, barePath, branch, "scan", scanned.findings);
       }
       if (stop.aborted) return defer("aborted");
       if (!scanned.trusted) return scanned.publishedOnly ? clear() : defer(scanned.why);
@@ -21328,7 +21332,7 @@ export class RunRunner {
         if (e instanceof TrustedExecutionRefusal || e instanceof AuthorityRefusal) refusal = e;
       }
       this.recordFlaggedCommits(state, [...found], runLog);
-      if (found.length > 0) this.noteTrustedFinding(flight, barePath, runnerClone.branch);
+      if (found.length > 0) this.noteTrustedFinding(flight, barePath, runnerClone.branch, "scan", [...found]);
       if (refusal !== undefined) throw refusal;
       throw new SecretRemediationStoppedError();
     };
@@ -21422,7 +21426,7 @@ export class RunRunner {
       await this.persistRemediationRestrictions(flight, barePath, branch, range.tipSha, findings, wait);
       if (stopped()) stopHolding(findings);
       this.recordFlaggedCommits(state, findings, runLog);
-      if (findings.length > 0) this.noteTrustedFinding(flight, barePath, branch);
+      if (findings.length > 0) this.noteTrustedFinding(flight, barePath, branch, "scan", findings);
       if (state.overflow) {
         state.known = findings;
         state.blocked = findings;
@@ -21981,7 +21985,7 @@ export class RunRunner {
                 this.latchRemediationFindings(flight, barePath, branch, scan.findings);
                 // Issue #4257: the hold this throw becomes is gated on evidence, and
                 // recordFlaggedCommits is skipped here; a failing persist in the finally must not hide it.
-                this.noteTrustedFinding(flight, barePath, branch);
+                this.noteTrustedFinding(flight, barePath, branch, "scan", scan.findings);
                 throw new SecretRemediationPendingError();
               }
               check();
@@ -22101,19 +22105,35 @@ export class RunRunner {
     if (gated && !this.hasTrustedFindingEvidence(flight)) return;
     if (flight.checkpointWithheld?.phase === "withheld") return;
     const episode = flight.withheldEpisodeSeq = (flight.withheldEpisodeSeq ?? 0) + 1;
-    flight.checkpointWithheld = { episode, since: new Date(this.now()).toISOString(), phase: "withheld" };
+    flight.checkpointWithheld = { episode, since: new Date(this.now()).toISOString(), phase: "withheld",
+      evidenceSeq: flight.trustedFindingSeq ?? 0 };
     this.queueCheckpointPublicationReport(flight);
   }
 
   /** Issue #4257: record trusted-finding provenance, only for this flight's own run, bare and branch.
    *  Changes the diagnostic's eligibility and nothing else (no hold, latch or publish outcome).
-   *  `scan` is a fresh scan finding: it advances trustedFindingSeq and lifts a retirement. `record`
-   *  re-asserts historical provenance (enrolled facts, a journal record, a persisted remediation
-   *  record): it is ignored once an accepted publication retired the evidence, and never advances the seq. */
+   *  `scan` is a trusted scan finding: when it is NEWER (no `findings` given, a finding without a valid
+   *  commit, or a flagged commit not yet in trustedFindingCommits) it advances trustedFindingSeq and
+   *  lifts a retirement. A scan that only re-finds known commits, and every `record` call (enrolled
+   *  facts, a journal record, a persisted remediation record; its flagged commits become known), re-asserts historical provenance: it is
+   *  ignored once an accepted publication retired the evidence, and never advances the seq. */
   private noteTrustedFinding(flight: RunFlight, barePath: string | undefined, branch: string | undefined,
-    source: "scan" | "record" = "scan"): void {
+    source: "scan" | "record" = "scan", commits?: readonly (SecretFinding | string)[]): void {
     if (!flight.runId || !barePath || !branch || barePath !== flight.barePath || branch !== flight.branch) return;
-    if (source === "record") {
+    let newer = source === "scan";
+    if (commits) {
+      const known = flight.trustedFindingCommits ??= new Set();
+      let unseen = false;
+      for (const c of commits) {
+        const raw = typeof c === "string" ? c : c.commit;
+        const sha = typeof raw === "string" && /^[0-9a-f]{40}$/i.test(raw) ? raw.toLowerCase() : undefined;
+        if (!sha || !known.has(sha)) unseen = true;
+        if (sha) known.add(sha);
+      }
+      // A record call's commits are known history; a scan is newer only if it found an unseen one.
+      if (newer) newer = unseen;
+    }
+    if (!newer) {
       if (flight.trustedFindingRetired) return;
     } else {
       flight.trustedFindingSeq = (flight.trustedFindingSeq ?? 0) + 1;
@@ -22130,15 +22150,17 @@ export class RunRunner {
 
   /** Issue #4257: an accepted publication that was admitted under `admittedEpisode` clears that
    *  episode only while it is still `withheld` (a newer episode is never cleared by an older call).
-   *  On that transition it also retires the trusted-finding evidence the admission covered: only when
-   *  no fresh scan finding arrived after the publication was admitted (`admittedEvidenceSeq`, captured
-   *  by the last successful admission guard). A finding recorded later (e.g. during the upload) survives. */
+   *  On that transition it also retires the trusted-finding evidence, only when no newer scan finding
+   *  arrived after the episode opened (`evidenceSeq`) and none after the publication was admitted
+   *  (`admittedEvidenceSeq`, captured by the last successful admission guard). The admitted bound can
+   *  never be the tighter one (the episode exists before its admission), but it is the version the
+   *  accepted publication resolves. Retirement happens at acceptance, never on an ACK. */
   private noteCheckpointPublished(flight: RunFlight, admittedEpisode: number | undefined,
     admittedEvidenceSeq?: number): void {
     const current = flight.checkpointWithheld;
     if (admittedEpisode === undefined || current?.episode !== admittedEpisode || current.phase !== "withheld") return;
     if (admittedEvidenceSeq !== undefined &&
-        (flight.trustedFindingSeq ?? 0) <= admittedEvidenceSeq) {
+        (flight.trustedFindingSeq ?? 0) <= Math.min(current.evidenceSeq, admittedEvidenceSeq)) {
       flight.trustedFindingEvidence = undefined;
       flight.trustedFindingRetired = true;
     }
@@ -30475,7 +30497,7 @@ export class RunRunner {
                     if (scan.trusted && scan.findings.length) {
                       deferredRestrictions = { tip: input.sourceTip, findings: scan.findings };
                       this.latchRemediationFindings(flight, bare, branch, scan.findings);
-                      this.noteTrustedFinding(flight, bare, branch);
+                      this.noteTrustedFinding(flight, bare, branch, "scan", scan.findings);
                       return noteCallbackRefusal("secret_remediation_active");
                     }
                     this.retainedLifecycleGuard(flight);
