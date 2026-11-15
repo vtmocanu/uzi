@@ -1342,6 +1342,9 @@ type Run struct {
 	CredentialSwitchHoldGeneration    pgtype.Int8        `json:"credential_switch_hold_generation"`
 	CredentialSwitchHoldWorkerID      pgtype.UUID        `json:"credential_switch_hold_worker_id"`
 	CredentialSwitchHoldRegisterNonce pgtype.Text        `json:"credential_switch_hold_register_nonce"`
+	Effort                            pgtype.Text        `json:"effort"`
+	ModelSource                       pgtype.Text        `json:"model_source"`
+	EffortSource                      pgtype.Text        `json:"effort_source"`
 }
 
 type RunCompletionAttempt struct {

@@ -67,8 +67,14 @@ type Contract struct {
 type ServerInputs struct {
 	// Lane is the owner's model lane for the case's harness (users.default_*_model); null is unset.
 	Lane *string `json:"lane"`
-	// RunModel is the schedule-frozen runs.model; null is unset.
+	// RunModel is the create-time runs.model; null is unset.
 	RunModel *string `json:"run_model"`
+	// RunModelSource is runs.model_source (run_override or schedule_pin); absent is NULL, which
+	// reads as schedule_pin for a set RunModel.
+	RunModelSource *string `json:"run_model_source"`
+	// RunEffort and RunEffortSource are the start-time runs.effort and runs.effort_source; absent is NULL.
+	RunEffort       *string `json:"run_effort"`
+	RunEffortSource *string `json:"run_effort_source"`
 	// UserEffort is the owner's per-harness effort column; null is unset.
 	UserEffort *string `json:"user_effort"`
 	// TemplateClaude and TemplateCodex are the lead template's stored per-harness pins. The case's own

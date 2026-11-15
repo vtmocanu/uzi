@@ -590,7 +590,8 @@ func holdRow(r apitypes.RunDTO, now time.Time) []string {
 	// Resume retains this marker through queued/claimed until the running report.
 	// Only the paused state is still an owner hold.
 	if (*r.HoldReason == holdProviderUnavailable && !isProviderUnavailableHold(r)) ||
-		(*r.HoldReason == holdIterationExhausted && !isIterationHold(r)) {
+		(*r.HoldReason == holdIterationExhausted && !isIterationHold(r)) ||
+		(*r.HoldReason == holdRunOverrideUnavailable && !isRunOverrideHold(r)) {
 		return nil
 	}
 	if *r.HoldReason == holdCodexPolicy && !isCodexPolicyHold(r) {
@@ -620,7 +621,9 @@ func holdRow(r apitypes.RunDTO, now time.Time) []string {
 	case holdBaseAttestation:
 		clauses = append(clauses, baseAttestationAction(r))
 	case holdRepoAgentSource:
-		clauses = append(clauses, "resume once the repository can be fetched: uzi run resume "+cellText(r.ID))
+		clauses = append(clauses, repoAgentSourceAction(r))
+	case holdRunOverrideUnavailable:
+		clauses = append(clauses, runOverrideAction(r))
 	case holdWeeklyReserve:
 		clauses = append(clauses, weeklyReserveAction(r))
 	}
@@ -653,6 +656,8 @@ func holdReasonLabel(reason string) string {
 		return "base not attested"
 	case holdRepoAgentSource:
 		return "repo agents unreadable"
+	case holdRunOverrideUnavailable:
+		return "model choice unavailable"
 	case holdWeeklyReserve:
 		return "weekly usage reserve"
 	default:
@@ -660,17 +665,29 @@ func holdReasonLabel(reason string) string {
 	}
 }
 
+// repoAgentSourceAction is the owner's next step for a repo_agent_source_unavailable hold.
+func repoAgentSourceAction(r apitypes.RunDTO) string {
+	return "resume once the repository can be fetched: uzi run resume " + cellText(r.ID)
+}
+
+// isRunOverrideHold reports whether r is paused on a run_override_unavailable hold. Resume keeps
+// the marker through queued/claimed until the run starts, so only paused is an owner hold.
+func isRunOverrideHold(r apitypes.RunDTO) bool {
+	return r.Status == statusPaused && strOr(r.HoldReason, "") == holdRunOverrideUnavailable
+}
+
+// runOverrideAction is the owner's next step for a run_override_unavailable hold (issue #3250).
+func runOverrideAction(r apitypes.RunDTO) string {
+	id := cellText(r.ID)
+	return "the run's chosen model or effort cannot run on its harness; Resume retries only if the choice has become available on that harness, otherwise Cancel and start a new run with a different choice; Resume: uzi run resume " +
+		id + "; Cancel: uzi run cancel " + id
+}
+
 // weeklyReserveAction is the owner's next step for a weekly_reserve hold (PRD #3522): the run resumes
 // by itself when usage falls below the threshold, and `uzi run resume` overrides the reserve until the
 // next weekly reset.
 func weeklyReserveAction(r apitypes.RunDTO) string {
 	return "resumes when usage drops below the threshold; override: uzi run resume " + cellText(r.ID)
-}
-
-// isBaseAttestationHold reports whether r is held because its kept work carries no
-// `--require-base` attestation (issue #3194: status paused, hold_reason base_attestation_missing).
-func isBaseAttestationHold(r apitypes.RunDTO) bool {
-	return r.Status == statusPaused && strOr(r.HoldReason, "") == holdBaseAttestation
 }
 
 // baseAttestationAction is the owner's next step for a base_attestation_missing hold (issue
@@ -763,6 +780,8 @@ func pausedHoldNotice(r apitypes.RunDTO, origin ...string) string {
 		return "held, credential switch unsettled; " + credentialSwitchAction(r)
 	case holdBaseAttestation:
 		return "held, its kept work is not attested against the planned base (--require-base); " + baseAttestationAction(r)
+	case holdRunOverrideUnavailable:
+		return "held, " + holdReasonLabel(reason) + "; " + runOverrideAction(r)
 	case holdWeeklyReserve:
 		return "held by the weekly usage reserve; " + weeklyReserveAction(r)
 	default:

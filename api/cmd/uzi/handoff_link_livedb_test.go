@@ -179,7 +179,7 @@ func TestHandoffSharedConflictBridgeLiveDB(t *testing.T) {
 					var err error
 					iid := int64(42)
 					if winnerKind == "issue" {
-						run, err = winner.CreateRun(ctx, user, repo, iid, "body", nil, nil, false, nil, nil, nil, nil)
+						run, err = winner.CreateRun(ctx, user, repo, iid, "body", nil, nil, false, nil, nil, nil, nil, nil, nil)
 					} else {
 						run, err = winner.CreateTaskRun(ctx, user, repo, "winner", "main", false, false, false, false, &iid)
 					}

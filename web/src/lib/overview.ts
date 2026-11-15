@@ -10,7 +10,7 @@ import {
   type Worker,
 } from "./api";
 import { custodyHoldView } from "./recovery";
-import { effectiveRunStatus, isAccountCooldownWaiting, isReserveHeldPause } from "./runBadge";
+import { effectiveRunStatus, isAccountCooldownWaiting, isReserveHeldPause, NON_COMPLETION_HOLD_REASONS } from "./runBadge";
 import { stripUnsafeChars } from "./safeText";
 
 // Exhaustive over the wire status union; a new status needs an explicit bucket.
@@ -122,15 +122,9 @@ const PARK_TABLE: Record<string, "automatic" | "owner"> = {
   retained_recovery_retrying: "automatic",
   codex_idle_stall_retrying: "automatic",
   paused: "owner",
-  codex_policy_hold: "owner",
-  iteration_budget_exhausted: "owner",
-  provider_unavailable: "owner",
-  credential_switch_settling: "owner",
-  credential_switch_unsettled: "owner",
-  base_attestation_missing: "owner",
   completion_blocked: "owner",
-  credential_disabled: "owner",
-  credentials_reset: "owner",
+  // Every non-completion hold (NON_COMPLETION_HOLDS) waits on the owner.
+  ...Object.fromEntries(NON_COMPLETION_HOLD_REASONS.map((r) => [r, "owner" as const])),
   retained_recovery_adoption_failed: "owner",
   retained_recovery_held: "owner",
   retained_recovery_unknown: "owner",

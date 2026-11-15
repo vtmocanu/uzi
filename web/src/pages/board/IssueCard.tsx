@@ -1,10 +1,6 @@
 import { Link } from "react-router-dom";
-import { isHttpsUrl, preferForgeUrl, type Card as CardData, type Harness, type SecretMeta } from "../../lib/api";
+import { isHttpsUrl, preferForgeUrl, type Card as CardData } from "../../lib/api";
 import type { StartRunGate } from "../../lib/runStream";
-import { INHERIT_SELECTION, type CredentialSelection } from "../../lib/credentialOverride";
-import { effectiveHarnessIsCodex, INHERIT_HARNESS, type HarnessSelection } from "../../lib/harnessSelection";
-import { TokenPicker } from "../../components/TokenPicker";
-import { HarnessPicker } from "../../components/HarnessPicker";
 import {
   canOpenRunView,
   isAccountCooldownWaiting,
@@ -98,15 +94,7 @@ export function IssueCard({
   gate,
   starting,
   onStart,
-  tokens,
-  credential = INHERIT_SELECTION,
-  onCredentialChange,
-  showHarnessPicker = false,
-  harness = INHERIT_HARNESS,
-  onHarnessChange,
-  claudeUsable = true,
-  codexUsable = false,
-  defaultHarness = null,
+  onOptions,
   fixCiBusy,
   onFixCi,
   uziLabel,
@@ -163,33 +151,11 @@ export function IssueCard({
   gate: StartRunGate;
   starting: boolean;
   onStart: () => void;
-  // PRD #1247 M7: the per-card Anthropic token choice, shown beside Start run. All three
-  // are optional so the direct-render tests need not supply them — the picker is only
-  // rendered when onCredentialChange is wired (the board passes it), defaulting to inherit.
-  tokens?: SecretMeta[];
-  credential?: CredentialSelection;
-  onCredentialChange?: (next: CredentialSelection) => void;
-  // PRD #1429 M4a: the per-card harness choice, shown beside Start run ONLY when the
-  // board says both harnesses are usable (D2) — a single-harness user never sees a
-  // redundant picker. Defaults false/inherit so the direct-render tests need not supply
-  // them and a card outside the feature renders exactly as before.
-  showHarnessPicker?: boolean;
-  harness?: HarnessSelection;
-  onHarnessChange?: (next: HarnessSelection) => void;
-  // Fix 2 (M4a review): the board's harness-availability facts, used ONLY to gate the
-  // Anthropic TokenPicker on the EFFECTIVE harness (effectiveHarnessIsCodex) rather than
-  // the raw `harness` selection — a Codex-only card never shows the harness picker above
-  // (showHarnessPicker is false), so `harness` stays "inherit" even though the card WILL
-  // start on Codex. Default claudeUsable=true/codexUsable=false so every pre-existing
-  // direct-render test (which never sets these) keeps its old "hidden only when harness
-  // is explicitly codex" behavior byte-identical.
-  claudeUsable?: boolean;
-  codexUsable?: boolean;
-  // Fix 1 (M4a review follow-up): the viewer's own default_harness, threaded into the
-  // same effectiveHarnessIsCodex call so a both-usable viewer with a usable Codex/Claude
-  // default (D11 rule 2) gets the same hide/show as IssueView's start dialog. Defaults to
-  // null (no preference) so every pre-existing direct-render test keeps its old behavior.
-  defaultHarness?: Harness | null;
+  // PRD #3250 M2: opens the board's ONE Run options dialog for this card (harness, token,
+  // model, effort). The dialog is mounted at the Board level, never inside this draggable
+  // card (D9); Start run beside it stays one click with defaults. Optional so the
+  // direct-render tests need not supply it: without it no Options button renders.
+  onOptions?: () => void;
   fixCiBusy: boolean;
   onFixCi: () => void;
   // PRD #764. isEligible drives the treatment and the affordances: a card carrying the
@@ -563,47 +529,32 @@ export function IssueCard({
       ) : (
         !card.closed &&
         isEligible && (
-          <div className="mt-2.5 space-y-1.5">
-            {/* PRD #1429 M4a: choose the harness this card's run starts on, shown ONLY
-                when the board says both harnesses are usable (D2) AND it wires the
-                change handler — a single-harness user never sees this redundant
-                picker. */}
-            {showHarnessPicker && onHarnessChange && (
-              <HarnessPicker
-                label={`Harness for #${card.iid}`}
-                className="h-8 w-full text-xs"
-                value={harness}
-                onChange={onHarnessChange}
-                disabled={!gate.enabled || starting}
-              />
-            )}
-            {/* PRD #1247 M7: choose the token the run spends before starting it. Inherit
-                (the default, shown explicitly) follows the worker's binding. Rendered only
-                when the board wires the change handler, and hidden once this card will
-                EFFECTIVELY start on Codex — an explicit pick, OR (M4a review fix) a
-                Codex-only card whose picker is hidden but WILL resolve to Codex implicitly
-                — a Codex run never spends an Anthropic credential, so the picker would be
-                noise (and using it would 422). */}
-            {onCredentialChange && !effectiveHarnessIsCodex(harness, claudeUsable, codexUsable, defaultHarness) && (
-              <TokenPicker
-                label={`Anthropic token for #${card.iid}`}
-                className="h-8 w-full text-xs"
-                value={credential}
-                onChange={onCredentialChange}
-                tokens={tokens}
-                disabled={!gate.enabled || starting}
-              />
-            )}
+          // PRD #3250 M2 (user decision P1): Start run stays one click with defaults; the
+          // per-run choices moved from inline pickers into the board-level Run options
+          // dialog, opened by the secondary Options button under the same gate.
+          <div className="mt-2.5 flex gap-1.5">
             <Button
               variant={gate.enabled ? "primary" : "secondary"}
               size="sm"
               disabled={!gate.enabled || starting}
               title={gate.enabled ? "Queue an agent run for this issue" : gate.reason}
               onClick={onStart}
-              className="w-full"
+              className="min-w-0 flex-1"
             >
               {starting ? "Starting…" : gate.enabled ? "Start run" : "Start run (gated)"}
             </Button>
+            {onOptions && (
+              <Button
+                variant="secondary"
+                size="sm"
+                disabled={!gate.enabled || starting}
+                aria-label={`Run options for #${card.iid}`}
+                title={gate.enabled ? "Choose the harness, token, model or effort for this run" : gate.reason}
+                onClick={onOptions}
+              >
+                Options
+              </Button>
+            )}
           </div>
         )
       )}

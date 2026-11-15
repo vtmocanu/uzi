@@ -265,6 +265,9 @@ var runDTOKeys = []string{
 	// PRD #300: the per-schedule model a schedule froze onto the run at fire time (nil ⇒
 	// null ⇒ the run inherited the owner's per-user default). Always on the wire.
 	"model",
+	// PRD #3250: the start-time effort and the writers (run_override | schedule_pin) of the frozen
+	// model and effort, each nullable and always on the wire.
+	"effort", "model_source", "effort_source",
 	// PRD #305: the frozen "apply model also to agents" flag (bool NOT NULL ⇒ always
 	// present; false is the default for a run that did not opt in).
 	"override_subagent_model",
