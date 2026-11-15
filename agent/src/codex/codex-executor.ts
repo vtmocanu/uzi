@@ -2930,11 +2930,33 @@ export class CodexExecutor implements Executor {
     };
   }
 
-  /** Bind only the default intent/plan runner; other advice callers retain their policy. */
+  /** Runner Now calls share the same authority and cleanup ownership as internal summaries. */
+  bindCodexSummaryFactory(build: CodexAdviceHarnessFactory): CodexAdviceHarnessFactory {
+    return this.ownSummaryFactory(build);
+  }
+
+  /** Bind internal and external summaries; other advice callers retain their policy. */
   private ownSummaryFactory(build: CodexAdviceHarnessFactory): CodexAdviceHarnessFactory {
     const factory: CodexAdviceHarnessFactory = params => this.lifetime.admit(async () => {
       this.assertCaptureAdmission();
       const revision = this.captureRevision;
+      // Capture once at call admission: an A closure must never acquire B's authority.
+      const authority = this.currentCodexAuthority;
+      const assertAuthority = () => {
+        if (!authority || this.currentCodexAuthority !== authority)
+          throw new TrustedExecutionRefusal("summary credential authority changed");
+        authority.assertCurrent();
+        if (params.binding.capability !== authority.binding.capability ||
+            params.binding.authMode !== authority.binding.authMode ||
+            params.binding.accessToken !== authority.binding.accessToken ||
+            (params.binding.authMode === "subscription" && authority.binding.authMode === "subscription" &&
+              (params.binding.generation !== authority.binding.generation ||
+               params.binding.chatgptAccountId !== authority.binding.chatgptAccountId ||
+               params.binding.chatgptPlanType !== authority.binding.chatgptPlanType)))
+          throw new TrustedExecutionRefusal("summary credential authority mismatch");
+        this.assertSwitchAdmission();
+      };
+      assertAuthority();
       const deadlineAt = summaryCallDeadlines.get(params);
       if (deadlineAt === undefined) throw new TrustedExecutionRefusal("summary call deadline missing");
       const remaining = () => Math.max(0, Math.min(deadlineAt - Date.now(),
@@ -2953,6 +2975,7 @@ export class CodexExecutor implements Executor {
       const guard = () => {
         try {
           this.assertCaptureAdmission(revision);
+          assertAuthority();
           if (this.summaryLifecycleClosed) throw new TrustedExecutionRefusal("summary admission closed");
           params.signal?.throwIfAborted();
           if (remaining() <= 0) throw new TrustedExecutionRefusal("summary deadline expired");
@@ -2992,6 +3015,7 @@ export class CodexExecutor implements Executor {
             await finish();
             throw new TrustedExecutionRefusal("summary root admission rejected");
           }
+          guard();
           return ownedHandle;
         },
       };
@@ -3018,11 +3042,16 @@ export class CodexExecutor implements Executor {
       try {
         guard();
         const harness = await build(params);
+        guard();
         ownedSummaryHarnesses.set(harness, () => registry.markLaunchCleanupUnconfirmed());
         const run = harness.run.bind(harness);
         harness.run = (request, policy) => this.lifetime.admit(async () => {
-          try { return await run(request, policy); }
-          finally { await finish(); }
+          try {
+            guard();
+            const result = await run(request, policy);
+            guard();
+            return result;
+          } finally { await finish(); }
         });
         return harness;
       } catch (error) {

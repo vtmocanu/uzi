@@ -20,7 +20,9 @@ import type { Executor, RunContext } from "../src/executor.js";
 import { GitLabClient, type FetchFn } from "../src/forge.js";
 import { RunRunner } from "../src/runner.js";
 import type { SdkQueryFn } from "../src/sdk-executor.js";
-import type { CodexAdviceHarnessFactory } from "../src/codex/codex-executor.js";
+import { CodexExecutor, CODEX_PRODUCTION_PROVIDER, createCodexEpochAuthority, type CodexAdviceHarnessFactory } from "../src/codex/codex-executor.js";
+import { selectCodexBinding } from "../src/codex/select.js";
+import { ownedSummaryFactories, summaryOwnership } from "../src/codex/summary-ownership.js";
 import type { AdviceRequest, AdviceResult, AdviceResultPolicy } from "../src/harness.js";
 
 const TOKEN = "tkn-nowsummary-123456";
@@ -260,6 +262,44 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
       };
     }) as unknown as CodexAdviceHarnessFactory;
   }
+
+  it("M2 Runner composes the Codex Now factory through its executor", async () => {
+    const claim = claimFor(2619, { secrets: CODEX_SECRETS });
+    api.nowSummary.set(claim.run_id, true);
+    const rec = { builds: [] as unknown[], requests: [] as AdviceRequest[] };
+    const raw = lunaFactory(rec);
+    let bindings = 0, calls = 0;
+    const selection = selectCodexBinding(CODEX_SECRETS);
+    assert.equal(selection.kind, "codex");
+    if (selection.kind !== "codex") throw new Error("Codex fixture binding missing");
+    const executor = new CodexExecutor(nullLogger(), fx.dataDir, { binding: selection.binding, client, provider: CODEX_PRODUCTION_PROVIDER });
+    const compose = executor.bindCodexSummaryFactory.bind(executor);
+    executor.bindCodexSummaryFactory = build => {
+      assert.equal(build, raw);
+      bindings++;
+      const owned = compose(async params => {
+        assert.ok(summaryOwnership.has(params), "actual owner is attached before raw construction");
+        calls++;
+        return build(params);
+      });
+      assert.ok(ownedSummaryFactories.has(owned));
+      return owned;
+    };
+    const working = workingExecutor(() => notesOf(claim.run_id).length > 0);
+    executor.run = ctx => {
+      // Model the run-entry publication while retaining the production wrapper.
+      (executor as unknown as { currentCodexAuthority: ReturnType<typeof createCodexEpochAuthority> })
+        .currentCodexAuthority = createCodexEpochAuthority(selection.binding);
+      return working.run(ctx);
+    };
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "now-wiring-"));
+    try {
+      await runnerFor(executor, { homeRoot, queryFn: summaryQuery([]), codexAdviceHarnessFactory: raw }).execute(claim);
+    } finally { fs.rmSync(homeRoot, { recursive: true, force: true }); }
+    assert.equal(bindings, 1);
+    assert.equal(calls, 1);
+    assert.equal(notesOf(claim.run_id).length, 1);
+  });
 
   for (const kind of ["issue", "self_improve", "prompt"] as const) {
   it(`M1 Now runner Codex ${kind} eligibility`, async () => {

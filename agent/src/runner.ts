@@ -16609,7 +16609,12 @@ export class RunRunner {
             claim: {
               kind: resolveRunKind(claim.kind),
               claude: !claim.secrets.codex && !!claim.secrets.anthropic_oauth_token,
-              ...nowSummaryCodexClaim(runId, claim.secrets.codex, this.nowSummaryOpts.codexAdviceHarnessFactory, claim.claim_generation),
+              ...nowSummaryCodexClaim(runId, claim.secrets.codex,
+                claim.secrets.codex && this.nowSummaryOpts.codexAdviceHarnessFactory
+                  ? executor.bindCodexSummaryFactory?.(this.nowSummaryOpts.codexAdviceHarnessFactory)
+                    ?? this.nowSummaryOpts.codexAdviceHarnessFactory
+                  : this.nowSummaryOpts.codexAdviceHarnessFactory,
+                claim.claim_generation),
             },
             emit: (m) => batcher.emit(m),
             redact: flight.redactText,

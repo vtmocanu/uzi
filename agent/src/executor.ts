@@ -1,3 +1,4 @@
+import type { CodexAdviceHarnessFactory } from "./codex/codex-executor.js";
 import { execFile } from "node:child_process";
 import type { InterruptedCalls, InterruptedSnapshot } from "./interrupted-calls.js";
 import { promisify } from "node:util";
@@ -1087,6 +1088,8 @@ export interface CodexSuspendedEpoch {
  * work → report) with no AI in the loop.
  */
 export interface Executor {
+  /** Compose external Codex summaries with this executor's authority and cleanup owner. */
+  bindCodexSummaryFactory?(build: CodexAdviceHarnessFactory): CodexAdviceHarnessFactory;
   /** Strict credential-free save of the current live leg; does not stop or switch it. */
   saveUsableRollout?(): Promise<UsableSavedRollout>;
   suspendCodexEpoch?(bounds: import("./codex-switch-coordinator.js").SwitchBounds): Promise<CodexSuspendedEpoch>;

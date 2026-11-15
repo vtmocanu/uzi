@@ -1,5 +1,5 @@
 import { terminalSealMaterial } from "../src/codex/executor-lifetime.js";
-import { summaryOwnership } from "../src/codex/summary-ownership.js";
+import { ownedSummaryFactories, summaryCallDeadlines, summaryOwnership } from "../src/codex/summary-ownership.js";
 import { provisionNative } from "./codex-provision-fixture.js";
 import { provisionRunTools } from "../src/provision-run.js";
 import { nativeRootForTest, installerBarrier } from "./codex-installer-fixture.js";
@@ -24182,6 +24182,32 @@ describe("2833 Codex inline summaries", () => {
     };
   }
 
+  it("M2 external Now wrapper joins raw root disposal before its run settles", async () => {
+    const entered = m1Barrier(), release = m1Barrier();
+    const a = createCodexEpochAuthority(bindingOf(SUBSCRIPTION));
+    const executor = makeExecutor(makeRig(), a.binding);
+    (executor as unknown as { currentCodexAuthority: typeof a }).currentCodexAuthority = a;
+    const factory = executor.bindCodexSummaryFactory(ownedAdvice(true, entered, release));
+    assert.ok(ownedSummaryFactories.has(factory));
+    const params = { runId: "run-1", binding: a.binding };
+    summaryCallDeadlines.set(params, Date.now() + 10000);
+    const harness = await factory(params);
+    let settled = false;
+    const running = harness.run({
+      label: "now", systemPrompt: "", prompt: "Summarize", output: { kind: "text" },
+      signal: new AbortController().signal, timeoutMs: 10000,
+    }, { onTerminal() {} }).finally(() => { settled = true; });
+    try {
+      await entered.promise;
+      await drain();
+      assert.equal(settled, false, "raw disposal remains joined through the external wrapper");
+    } finally {
+      release.resolve();
+      await running;
+    }
+    assert.equal(settled, true);
+  });
+
   for (const primary of [undefined, new CodexCredentialDeferredError()]) {
     it(`A summary cleanup preserves ${primary ? "exact primary object and type" : "standalone cleanup refusal"}`, async () => {
       const entered = m1Barrier(), release = m1Barrier(), body = m1Barrier();
@@ -31719,4 +31745,84 @@ describe("CodexExecutor credential switch continuation", () => {
     });
   }
 
+});
+
+describe("M2 external Now owned composition", () => {
+  for (const phase of ["before run", "during run"] as const) {
+    it(`M2 external Now rejects retired authority ${phase}`, async () => {
+      const a = createCodexEpochAuthority(bindingOf(SUBSCRIPTION));
+      const executor = makeExecutor(makeRig(), a.binding);
+      const state = executor as unknown as { currentCodexAuthority: typeof a };
+      state.currentCodexAuthority = a;
+      let entered!: () => void, release!: () => void;
+      const ready = new Promise<void>(resolve => { entered = resolve; });
+      const held = new Promise<void>(resolve => { release = resolve; });
+      let runs = 0;
+      const factory = executor.bindCodexSummaryFactory(async () => ({
+        run: async () => { runs++; entered(); await held; return {}; },
+      }) as never);
+      const params = { runId: "run-1", binding: a.binding };
+      summaryCallDeadlines.set(params, Date.now() + 10000);
+      const harness = await factory(params);
+      const retire = () => {
+        a.retire();
+        state.currentCodexAuthority = createCodexEpochAuthority(bindingOf({ ...SUBSCRIPTION, capability: "next-capability" }));
+      };
+      if (phase === "before run") retire();
+      const running = harness.run({
+        label: "now", systemPrompt: "", prompt: "", output: { kind: "text" },
+        signal: new AbortController().signal, timeoutMs: 10000,
+      }, { onTerminal() {} });
+      const rejected = assert.rejects(running, /authority/);
+      try {
+        if (phase === "during run") { await ready; retire(); }
+      } finally { release(); await rejected; }
+      assert.equal(runs, phase === "during run" ? 1 : 0);
+    });
+  }
+
+  it("M2 external Now rejects a mismatched subscription generation", async () => {
+    const a = createCodexEpochAuthority(bindingOf(SUBSCRIPTION));
+    const executor = makeExecutor(makeRig(), a.binding);
+    (executor as unknown as { currentCodexAuthority: typeof a }).currentCodexAuthority = a;
+    let builds = 0;
+    const factory = executor.bindCodexSummaryFactory(async () => {
+      builds++;
+      return { run: async () => ({}) } as never;
+    });
+    const params = { runId: "run-1", binding: bindingOf({ ...SUBSCRIPTION, generation: SUBSCRIPTION.generation + 1 }) };
+    summaryCallDeadlines.set(params, Date.now() + 10000);
+    await assert.rejects(factory(params), /authority/);
+    assert.equal(builds, 0);
+  });
+
+  it("M2 external Now factory captures authority and denies old binding before and after await", async () => {
+    const executor = makeExecutor(makeRig(), bindingOf(SUBSCRIPTION));
+    const state = executor as unknown as { currentCodexAuthority?: ReturnType<typeof createCodexEpochAuthority> };
+    const a = createCodexEpochAuthority(bindingOf(SUBSCRIPTION));
+    const b = createCodexEpochAuthority(bindingOf({ ...SUBSCRIPTION, capability: "next-capability" }));
+    const barrier = () => {
+      let resolve!: () => void;
+      const promise = new Promise<void>(done => { resolve = done; });
+      return { resolve, promise };
+    };
+    const entered = barrier(), release = barrier();
+    let builds = 0;
+    const factory = executor.bindCodexSummaryFactory(async () => {
+      builds++; entered.resolve(); await release.promise;
+      return { run: async () => ({}) } as never;
+    });
+    assert.ok(ownedSummaryFactories.has(factory));
+    const params = { runId: "run-1", binding: a.binding };
+    summaryCallDeadlines.set(params, Date.now() + 10000);
+    await assert.rejects(factory(params), /authority/);
+    state.currentCodexAuthority = a;
+    const pending = factory(params);
+    await entered.promise;
+    a.retire(); state.currentCodexAuthority = b;
+    release.resolve();
+    await assert.rejects(pending, /authority/);
+    await assert.rejects(factory(params), /authority/);
+    assert.equal(builds, 1, "old binding never enters raw factory again");
+  });
 });
