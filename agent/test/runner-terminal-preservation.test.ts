@@ -1247,6 +1247,13 @@ describe("terminal preservation adapter: default branch read from real bare repo
     await keeps(t, b.bare);
   });
 
+  it("R7: a dangling symlink at refs/remotes/origin/HEAD, origin/main valid: kept", async t => {
+    const b = bareRepo(t);
+    b.ref("refs/remotes/origin/main", b.commit);
+    fs.symlinkSync("/nonexistent-target", path.join(b.bare, "refs/remotes/origin/HEAD"));
+    await keeps(t, b.bare);
+  });
+
   async function tipBranch(t: TestContext, barePath: string) {
     const { r, flight, branches } = realRig(t, barePath, true);
     const out = await r.preserveTerminalInLane({ repo: {} }, flight, { status: "completed" }, laneSite);

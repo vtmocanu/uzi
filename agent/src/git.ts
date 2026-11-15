@@ -5771,7 +5771,10 @@ export class GitCache {
    * failed read into "absent"), it separates three answers: `resolved` (a commit-bearing default ref was positively
    * read), `absent` (every read completed normally and proved there is no default ref at all) and `unknown` (any read
    * failed, was cut short, or met a shape it cannot classify: a dangling or broken ref, a detached HEAD, a throw).
-   * Only `absent` may fall back to "main"; `unknown` must keep the output.
+   * Only `absent` may fall back to "main"; `unknown` must keep the output. Because git treats a dangling symlink or an
+   * empty directory at a loose ref path as a missing ref, the loose storage of origin/HEAD and every candidate is
+   * lstat'ed too: a symlink, directory or other non-regular entry, an unreadable path, or a loose file git did not
+   * account for makes the answer `unknown`.
    */
   async terminalDefaultBranch(barePath: string): Promise<TerminalDefaultBranch> {
     const unknown = (detail: string): TerminalDefaultBranch => ({ kind: "unknown", detail });
@@ -5815,6 +5818,19 @@ export class GitCache {
       else return unknown(`${refname} does not name a commit`);
     }
 
+    // git reads a dangling symlink or an empty directory at a loose ref path as a missing ref without any error, so
+    // check the loose storage ourselves before any resolved/absent decision.
+    for (const ref of ["refs/remotes/origin/HEAD", ...candidates.map(c => c.ref)]) {
+      const state = await this.terminalLooseRefState(barePath, ref);
+      if (state.kind === "unknown") return unknown(state.detail);
+      if (state.kind !== "regular") continue;
+      if (ref === "refs/remotes/origin/HEAD") {
+        if (originHead.code === 1) return unknown("refs/remotes/origin/HEAD is a loose file git did not read as a symbolic ref");
+      } else if (!symbolic.has(ref) && !listed.has(ref)) {
+        return unknown(`${ref} is a loose ref file git did not list`);
+      }
+    }
+
     if (originTarget && !counted.has(originTarget)) return unknown(`origin/HEAD target ${originTarget} is not a readable commit ref`);
     for (const ref of symbolic) if (!listed.has(ref)) return unknown(`${ref} is a dangling symbolic ref`);
     const first = candidates.find(c => counted.has(c.ref));
@@ -5825,6 +5841,26 @@ export class GitCache {
     }
     if (originHead.code === 1 && head.code === 0 && symbolic.size === 0 && listed.size === 0) return { kind: "absent" };
     return unknown("no default branch could be proven absent");
+  }
+
+  /** Terminal-local lstat of a loose ref path: none (ENOENT/ENOTDIR), a regular file, or unknown (anything else). */
+  private async terminalLooseRefState(barePath: string, ref: string):
+    Promise<{ kind: "none" | "regular" } | { kind: "unknown"; detail: string }> {
+    if (!ref.startsWith("refs/") || ref.split("/").some(seg => seg === ".." || seg === "." || seg === "")) {
+      return { kind: "unknown", detail: `${ref} is not a safe ref path` };
+    }
+    try {
+      const st = await fs.lstat(path.join(barePath, ref));
+      if (st.isFile()) return { kind: "regular" };
+      // A directory holding entries is a namespace (refs/heads/main/x), which can never be this ref; an empty one is
+      // read by git as a missing ref, so it proves nothing.
+      if (st.isDirectory() && (await fs.readdir(path.join(barePath, ref))).length > 0) return { kind: "none" };
+      return { kind: "unknown", detail: `${ref} is not a regular loose ref file` };
+    } catch (err) {
+      const code = (err as { code?: unknown }).code;
+      if (code === "ENOENT" || code === "ENOTDIR") return { kind: "none" };
+      return { kind: "unknown", detail: `lstat ${ref} failed: ${String(code ?? err)}` };
+    }
   }
 
   /**

@@ -4,6 +4,7 @@
 import test, { describe } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
+import fsSync from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync, spawn } from "node:child_process";
@@ -124,16 +125,45 @@ describe("terminalDefaultBranch on real bare repositories", () => {
   test("S3: an abort while a read is in flight is unknown", async (t) => {
     const b = await bareRepo(t);
     // A FIFO with no writer blocks any git read of packed-refs until the child is killed.
-    execFileSync("mkfifo", [path.join(b.bare, "packed-refs")]);
+    const fifo = path.join(b.bare, "packed-refs");
+    execFileSync("mkfifo", [fifo]);
     const git = new GitCache(b.dir, nullLogger());
     const ac = new AbortController();
     const started = Date.now();
-    setTimeout(() => ac.abort(), 400);
-    const out = await answer(() => within(git, () => git.terminalDefaultBranch(b.bare), { signal: ac.signal }));
-    const elapsed = Date.now() - started;
-    assert.equal(out.kind, "unknown");
-    assert.ok(elapsed >= 350, `the read was in flight when aborted (${elapsed} ms)`);
-    assert.ok(elapsed < 10_000, `elapsed ${elapsed} ms`);
+    const pending = answer(() => within(git, () => git.terminalDefaultBranch(b.bare), { signal: ac.signal }));
+    // Opening a FIFO write-only and non-blocking throws ENXIO while no reader has it open: success means a git child
+    // is blocked reading it, which is the race this test claims to cover.
+    let fd: number | undefined;
+    const pollEnd = Date.now() + 10_000;
+    while (fd === undefined && Date.now() < pollEnd) {
+      try {
+        fd = fsSync.openSync(fifo, fsSync.constants.O_WRONLY | fsSync.constants.O_NONBLOCK);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENXIO") throw err;
+        await new Promise((r) => setTimeout(r, 20));
+      }
+    }
+    if (fd === undefined) ac.abort();
+    assert.notEqual(fd, undefined, "no git child ever opened the FIFO for reading: the abort never raced an in-flight read");
+    try {
+      ac.abort();
+      const out = await pending;
+      const elapsed = Date.now() - started;
+      assert.equal(out.kind, "unknown");
+      assert.ok(elapsed < 15_000, `elapsed ${elapsed} ms`);
+      // The reader must have settled: once the killed child's end closes, a write has no reader and fails with EPIPE.
+      let code: string | undefined;
+      const writeEnd = Date.now() + 5_000;
+      while (code === undefined && Date.now() < writeEnd) {
+        try {
+          fsSync.writeSync(fd!, "x");
+          await new Promise((r) => setTimeout(r, 20));
+        } catch (err) { code = (err as NodeJS.ErrnoException).code; }
+      }
+      assert.equal(code, "EPIPE", "the git reader was still attached to the FIFO after the answer settled");
+    } finally {
+      fsSync.closeSync(fd!);
+    }
   });
 
   test("S4: an empty bare repository is proven absent", async (t) => {
@@ -162,6 +192,29 @@ describe("terminalDefaultBranch on real bare repositories", () => {
     const b = await bareRepo(t);
     await b.ref("refs/remotes/origin/main", b.commit);
     run(b.bare, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/develop");
+    const git = new GitCache(b.dir, nullLogger());
+    assert.equal((await within(git, () => git.terminalDefaultBranch(b.bare))).kind, "unknown");
+  });
+
+  test("a dangling symlink at refs/remotes/origin/HEAD with a valid origin/main is unknown", async (t) => {
+    const b = await bareRepo(t);
+    await b.ref("refs/remotes/origin/main", b.commit);
+    await fs.symlink("/nonexistent-target", path.join(b.bare, "refs/remotes/origin/HEAD"));
+    const git = new GitCache(b.dir, nullLogger());
+    assert.equal((await within(git, () => git.terminalDefaultBranch(b.bare))).kind, "unknown");
+  });
+
+  test("a dangling symlink at refs/heads/main with an unborn symbolic HEAD is unknown", async (t) => {
+    const b = await bareRepo(t);
+    await fs.mkdir(path.join(b.bare, "refs/heads"), { recursive: true });
+    await fs.symlink("/nonexistent-target", path.join(b.bare, "refs/heads/main"));
+    const git = new GitCache(b.dir, nullLogger());
+    assert.equal((await within(git, () => git.terminalDefaultBranch(b.bare))).kind, "unknown");
+  });
+
+  test("an empty directory at refs/remotes/origin/HEAD is unknown", async (t) => {
+    const b = await bareRepo(t);
+    await fs.mkdir(path.join(b.bare, "refs/remotes/origin/HEAD"), { recursive: true });
     const git = new GitCache(b.dir, nullLogger());
     assert.equal((await within(git, () => git.terminalDefaultBranch(b.bare))).kind, "unknown");
   });
