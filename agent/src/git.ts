@@ -28421,6 +28421,8 @@ const TERMINAL_GIT_PINS: readonly string[] = [
   "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false",
   "-c", "core.ignoreStat=false", "-c", "core.checkStat=default",
   "-c", "core.trustctime=true", "-c", "core.fileMode=true", "-c", "core.ignoreCase=false",
+  // A symlink replaced by a regular file with the same bytes must read as a type change, never as unchanged.
+  "-c", "core.symlinks=true",
   "-c", "commit.gpgsign=false", "-c", "core.commitGraph=false", "-c", "core.multiPackIndex=false",
   "-c", `core.hooksPath=${EMPTY_GIT_HOOKS_DIR}`,
 ];

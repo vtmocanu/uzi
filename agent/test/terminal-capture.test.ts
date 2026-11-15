@@ -275,6 +275,21 @@ describe("captureTerminalSnapshot", () => {
     if (result.kind === "captured") assert.deepEqual(rawShow(f, result.root, "tracked.txt"), CRLF);
   });
 
+  test("core.symlinks=false never hides a symlink replaced by a regular file with the same bytes", async (t) => {
+    const f = await fixture(t);
+    await fs.symlink("tracked.txt", path.join(f.root, "link"));
+    f.g("add", "link"); f.g("commit", "-q", "-m", "adds link");
+    const head = f.g("rev-parse", "HEAD");
+    f.g("push", "-q", f.bare, `${head}:refs/uzi-runner/main`);
+    f.g("update-ref", "refs/uzi-runner/main", head);
+    f.g("config", "core.symlinks", "false");
+    await fs.rm(path.join(f.root, "link"));
+    await f.write("link", "tracked.txt");
+    const result = await f.capture();
+    assert.notEqual(result.kind, "clean", JSON.stringify(result));
+    if (result.kind === "captured") assert.equal(run(f.bare, "ls-tree", result.root, "link").split(" ")[0], "100644");
+  });
+
   test("a .git/info/attributes file alone is refused", async (t) => {
     const f = await fixture(t);
     await fs.writeFile(path.join(f.root, ".git", "info", "attributes"), "# nothing\n");
