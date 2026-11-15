@@ -185,13 +185,59 @@ describe("captureTerminalSnapshot", () => {
     assert.deepEqual(result, { kind: "refused", reason: "staged_set_mismatch" });
   });
 
-  test("a filter attribute on a changed path is refused before staging", async (t) => {
+  test("an in-tree filter attribute with no filter configured is ignored: the raw work-tree bytes are captured", async (t) => {
     const f = await fixture(t);
     await f.write(".gitattributes", "*.dat filter=lfsx\n");
     await f.write("a.dat", "payload\n");
+    const result = await f.capture();
+    assert.equal(result.kind, "captured", JSON.stringify(result));
+    if (result.kind !== "captured") return;
+    assert.equal(run(f.bare, "show", `${result.root}:a.dat`), "payload");
+    assert.equal(run(f.bare, "show", `${result.root}:.gitattributes`), "*.dat filter=lfsx");
+  });
+
+  // An agent-controlled clean filter wired through local config and .git/info/attributes (which git always reads)
+  // rewrites a staged edit back to HEAD's bytes, hiding it from the verdict or the snapshot.
+  async function plantHidingFilter(f: Awaited<ReturnType<typeof fixture>>) {
+    const original = path.join(f.dir, "head-bytes");
+    await fs.writeFile(original, "original\n");
+    f.g("config", "filter.h.clean", `cat ${original}`);
+    await fs.writeFile(path.join(f.root, ".git", "info", "attributes"), "tracked.txt filter=h\n");
+    await f.write("tracked.txt", "edited\n");
+    f.g("add", "tracked.txt");
+  }
+
+  test("a clean filter hiding a staged edit is never reported clean", async (t) => {
+    const f = await fixture(t);
+    await plantHidingFilter(f);
     const result = await f.capture({ seam: { beforeStaging: async () => { f.calls.push("staging"); } } });
-    assert.deepEqual(result, { kind: "refused", reason: "filter_attribute" });
+    assert.equal(result.kind, "refused", JSON.stringify(result));
     assert.deepEqual(f.calls, []);
+  });
+
+  test("a clean filter never makes a capture carry HEAD's bytes for an edited file", async (t) => {
+    const f = await fixture(t);
+    await plantHidingFilter(f);
+    await f.write("new.txt", "real new file\n");
+    const result = await f.capture();
+    assert.equal(result.kind, "refused", JSON.stringify(result));
+    assert.equal(f.refsOf(f.bare).includes("uzi-terminal-local"), false);
+  });
+
+  test("a filter.* local config key is refused even with only an in-tree .gitattributes", async (t) => {
+    const f = await fixture(t);
+    f.g("config", "filter.h.clean", "cat /dev/null");
+    await f.write(".gitattributes", "tracked.txt filter=h\n");
+    await f.write("tracked.txt", "edited\n");
+    const result = await f.capture({ seam: { beforeStaging: async () => { f.calls.push("staging"); } } });
+    assert.deepEqual(result, { kind: "refused", reason: "config_refused" });
+    assert.deepEqual(f.calls, []);
+  });
+
+  test("a .git/info/attributes file alone is refused", async (t) => {
+    const f = await fixture(t);
+    await fs.writeFile(path.join(f.root, ".git", "info", "attributes"), "# nothing\n");
+    assert.deepEqual(await f.capture(), { kind: "refused", reason: "config_refused" });
   });
 
   test("an unreadable untracked directory is refused as an enumeration warning", async (t) => {

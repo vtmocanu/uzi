@@ -20899,12 +20899,15 @@ try {
       // A per-worktree config file (core.worktree, sparse and index keys) is read by git but not by `config --local`.
       if (await fs.lstat(path.join(clonePath, ".git", "config.worktree")).then(() => true, () => false)) return refused("config_refused");
       if (!(await alternatesClean())) return refused("alternates_present");
+      // `.git/info/attributes` is read whatever --attr-source says, so any entry there (or any type of node) could
+      // select a filter driver: refuse it outright.
+      if (await fs.lstat(path.join(clonePath, ".git", "info", "attributes")).then(() => true, (err: NodeJS.ErrnoException) => err.code !== "ENOENT")) return refused("config_refused");
       for (const row of rows(await git(["config", "--local", "--null", "--list"]), 100_000, "config_cap")) {
         // A valueless boolean key (`key\0` with no newline) is the whole row, never "".
         const nl = row.indexOf("\n");
         const key = (nl < 0 ? row : row.slice(0, nl)).toLowerCase();
         if (key === "core.worktree" || key === "extensions.worktreeconfig" || key.startsWith("include.") || key.startsWith("includeif.") ||
-            key === "core.sparsecheckout" || key === "core.splitindex" || key === "index.sparse" ||
+            key.startsWith("filter.") || key === "core.sparsecheckout" || key === "core.splitindex" || key === "index.sparse" ||
             (key === "core.bare" && row.slice(key.length + 1) !== "false")) return refused("config_refused");
       }
       if ((await git(["rev-parse", "--shared-index-path"])).trim() !== "") return refused("config_refused");
@@ -20973,7 +20976,8 @@ try {
       const ignored = { files: ignoredPaths.length, bytes: ignoredBytes };
 
       // 3. Clean: the agent-writable real index (stat cache and entry oids) is never trusted for this verdict, so a
-      // private index is rebuilt from HEAD and the work tree and must reproduce HEAD's tree. No ref or real-index write.
+      // private index is rebuilt from HEAD and the work tree (raw bytes: attributes are pinned to the empty tree, and
+      // filter config and info/attributes were refused above) and must reproduce HEAD's tree. No ref or real-index write.
       if (entries.size === 0) {
         privateIndex = path.join(runnerTmpdir() || os.tmpdir(), `uzi-term-idx-${randomUUID()}`);
         const cleanEnv = { GIT_INDEX_FILE: privateIndex };
@@ -28402,6 +28406,10 @@ const TERMINAL_CREDENTIAL_TAILS = [".docker/config.json", ".kube/config", ".conf
 /** Pins every terminal-snapshot git carries (the captureMaintenanceWip set plus the proof-read walk pins). */
 const TERMINAL_GIT_PINS: readonly string[] = [
   "--no-replace-objects", "--no-optional-locks",
+  // Attributes come from the empty tree only (not the work-tree .gitattributes, no global or system file), so no
+  // attribute-selected filter, eol or ident conversion can apply to the verdict or the staging. `.git/info/attributes`
+  // is read regardless of these pins; captureTerminalSnapshot refuses a clone that has one, and any `filter.*` key.
+  `--attr-source=${EPOCH_EMPTY_TREE_OID}`, "-c", "core.attributesFile=/dev/null",
   // GIT_GRAFT_FILE=/dev/null (TERMINAL_GIT_ENV) makes newer Git print a deprecation hint on stderr; the strict stderr check
   // would otherwise refuse every capture, so silence only that advice (same pin as the ancestry proof reads).
   "-c", "advice.graftFileDeprecated=false",
@@ -28413,7 +28421,7 @@ const TERMINAL_GIT_PINS: readonly string[] = [
 ];
 /** Env for every terminal-snapshot git: no replace refs, no grafts, no shallow file, no optional locks. */
 const TERMINAL_GIT_ENV: NodeJS.ProcessEnv = {
-  ...PROOF_READ_ENV, GIT_OPTIONAL_LOCKS: "0", GIT_SHALLOW_FILE: "/dev/null",
+  ...PROOF_READ_ENV, GIT_OPTIONAL_LOCKS: "0", GIT_SHALLOW_FILE: "/dev/null", GIT_ATTR_NOSYSTEM: "1",
 };
 
 /** Whether a changed path names a credential a snapshot must never carry. */
