@@ -23,27 +23,68 @@ func (q *codexApplyNonceRecorder) StampWorkerCredentialSwitchApplyNonce(_ contex
 }
 
 func TestCodexSwitchDrainNegotiationKeepsHarnessesSeparate(t *testing.T) {
-	w := store.Worker{
-		ProtocolCapabilities:       []string{capability.CodexCredentialSwitchV1, capability.InputReceiptsV1},
-		SnapshotRegisterNonce:      pgtype.Text{String: "current", Valid: true},
-		CredentialSwitchApplyNonce: pgtype.Text{String: "current", Valid: true},
+	cases := []struct {
+		name       string
+		caps       []string
+		applyNonce string
+		harness    string
+		want       bool
+	}{
+		{
+			name:       "codex_only_matching_nonce_drains_codex",
+			caps:       []string{capability.CodexCredentialSwitchV1, capability.InputReceiptsV1},
+			applyNonce: "current",
+			harness:    harnessCodex,
+			want:       true,
+		},
+		{
+			name:       "codex_only_matching_nonce_does_not_drain_claude",
+			caps:       []string{capability.CodexCredentialSwitchV1, capability.InputReceiptsV1},
+			applyNonce: "current",
+			harness:    harnessClaude,
+			want:       false,
+		},
+		{
+			name:       "codex_only_stale_nonce_does_not_drain_codex",
+			caps:       []string{capability.CodexCredentialSwitchV1, capability.InputReceiptsV1},
+			applyNonce: "previous",
+			harness:    harnessCodex,
+			want:       false,
+		},
+		{
+			// Current legacy behavior drains Claude even with an old apply nonce.
+			name:       "claude_only_stale_nonce_still_drains_claude",
+			caps:       []string{capability.CredentialSwitchInPlaceV1, capability.InputReceiptsV1},
+			applyNonce: "previous",
+			harness:    harnessClaude,
+			want:       true,
+		},
+		{
+			name:       "claude_only_does_not_drain_codex",
+			caps:       []string{capability.CredentialSwitchInPlaceV1, capability.InputReceiptsV1},
+			applyNonce: "previous",
+			harness:    harnessCodex,
+			want:       false,
+		},
+		{
+			name:       "both_caps_stale_nonce_does_not_drain_codex",
+			caps:       []string{capability.CredentialSwitchInPlaceV1, capability.CodexCredentialSwitchV1, capability.InputReceiptsV1},
+			applyNonce: "previous",
+			harness:    harnessCodex,
+			want:       false,
+		},
 	}
-	if !inPlaceSwitchDrains(w, harnessCodex) {
-		t.Fatal("Codex receipt drain disabled")
-	}
-	if inPlaceSwitchDrains(w, harnessClaude) {
-		t.Fatal("Codex capability changed legacy Claude draining")
-	}
-	w.CredentialSwitchApplyNonce.String = "previous"
-	if inPlaceSwitchDrains(w, harnessCodex) {
-		t.Fatal("stale registration drained pending Codex controls")
-	}
-	w.ProtocolCapabilities = []string{capability.CredentialSwitchInPlaceV1, capability.InputReceiptsV1}
-	if !inPlaceSwitchDrains(w, harnessClaude) {
-		t.Fatal("Claude receipt drain changed")
-	}
-	if inPlaceSwitchDrains(w, harnessCodex) {
-		t.Fatal("Claude capability admitted Codex draining")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := store.Worker{
+				ProtocolCapabilities:       tc.caps,
+				SnapshotRegisterNonce:      pgtype.Text{String: "current", Valid: true},
+				CredentialSwitchApplyNonce: pgtype.Text{String: tc.applyNonce, Valid: true},
+			}
+			if got := inPlaceSwitchDrains(w, tc.harness); got != tc.want {
+				t.Fatalf("inPlaceSwitchDrains = %t, want %t", got, tc.want)
+			}
+		})
 	}
 }
 
