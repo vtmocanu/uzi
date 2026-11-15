@@ -32391,6 +32391,7 @@ describe("M2 actualRunner credential replacement", () => {
         let predecessorFenced = false, applyAcknowledgements = 0;
         let committedCodex = claim.secrets.codex!;
         let context!: RunContext;
+        let retainedPrepareRootDispatch: RunContext["prepareCodexRootDispatch"];
         let clockOffset = 0;
         const nowEntered = installerBarrier(), nowAborted = installerBarrier(), nowContinue = installerBarrier();
         const summaryDisposeEntered = installerBarrier(), summaryDisposeContinue = installerBarrier();
@@ -32634,6 +32635,7 @@ describe("M2 actualRunner credential replacement", () => {
             { name: "coder", description: "coder", prompt_body: "coder", tools: null, skills: [] },
           ];
           context = ctx;
+          retainedPrepareRootDispatch = ctx.prepareCodexRootDispatch;
           worktree = ctx.worktreePath;
           await fs.writeFile(path.join(worktree, "M2-retained.txt"), "A work");
           const attempt = ctx.attemptCodexCredentialSwitch!;
@@ -32704,6 +32706,14 @@ describe("M2 actualRunner credential replacement", () => {
         const { NowSummaryController } = await import("../src/now-summary.js");
         const suspendNow = NowSummaryController.prototype.suspendCodexSwitch;
         const nowPublicationProbes: string[] = [];
+        const nowConsumerProbes: Promise<{ error?: unknown }>[] = [];
+        const nowConsumerStages: string[] = [];
+        const joinNowConsumerProbes = async () => {
+          const results = await Promise.all(nowConsumerProbes);
+          for (const result of results) {
+            if ("error" in result) throw result.error;
+          }
+        };
         const nowProbe = mock.method(NowSummaryController.prototype, "suspendCodexSwitch", function (this: InstanceType<typeof NowSummaryController>, bounds: Parameters<typeof suspendNow>[0]) {
           const lease = suspendNow.call(this, bounds);
           const probe = (stage: string): void => {
@@ -32715,6 +32725,32 @@ describe("M2 actualRunner credential replacement", () => {
             assert.equal(a.transport.requests.length, aSends, stage);
             assert.equal(b.transport.requests.length, bSends, stage);
             nowPublicationProbes.push(stage);
+            if (publication === "gated") {
+              const probeConsumers = async () => {
+                assert.equal(bFinished, false, stage);
+                assert.ok(retainedRootDispatch);
+                assert.ok(retainedBroker);
+                const root = assert.rejects(retainedRootDispatch.prepare(),
+                  `retired A root dispatch refuses work at ${stage}`);
+                const child = retainedBroker.handleToolCall(
+                  { threadId: savedId, turnId: "M2-A-turn", callId: `Now-child-${stage}` },
+                  "spawn_agent", { role: "coder", prompt: "work" }, "root").then(result => {
+                    assert.equal(result.ok, false, `retired real A broker refuses child work at ${stage}`);
+                    assert.notEqual(result.ok ? undefined : result.code, "unknown_role", stage);
+                    assert.notEqual(result.ok ? undefined : result.code, "bad_args", stage);
+                  });
+                // Attach rejection handlers to both invocations before yielding.
+                const results = await Promise.allSettled([root, child]);
+                for (const result of results) {
+                  if (result.status === "rejected") throw result.reason;
+                }
+                assert.equal(a.transport.requests.length, aSends, `no A sends at ${stage}`);
+                assert.equal(b.transport.requests.length, bSends, `no B sends at ${stage}`);
+                nowConsumerStages.push(stage);
+              };
+              // Now publishB is synchronous; join these at the executor barrier.
+              nowConsumerProbes.push(probeConsumers().then(() => ({}), error => ({ error })));
+            }
           };
           return { ...lease, publishB: (bundle: Parameters<ReturnType<typeof suspendNow>["publishB"]>[0]) => {
             probe("before-Now-publish");
@@ -32826,6 +32862,24 @@ describe("M2 actualRunner credential replacement", () => {
               const aRequests: number = a.transport.requests.length;
               const bRequests: number = b.transport.requests.length;
               try {
+                if (publication === "gated" && barrier.stage === "before-prepare") {
+                  await joinNowConsumerProbes();
+                  assert.deepEqual([...nowConsumerStages].sort(), ["after-Now-publish", "before-Now-publish"]);
+                  assert.equal(nowConsumerProbes.length, 2, "both synchronous Now callbacks invoke retained A consumers");
+                }
+                if (publication === "gated" && barrier.stage === "before-publish") {
+                  assert.equal(bFinished, false);
+                  const prepare = context.prepareCodexRootDispatch;
+                  if (next.auth_mode === "subscription") {
+                    assert.ok(prepare, "replacement subscription scope installs a context dispatcher before executor publication");
+                    assert.notEqual(prepare, retainedPrepareRootDispatch, "probe uses the newly installed B dispatcher");
+                    assert.ok(context.terminalLifecycleSignal);
+                    await assert.rejects(prepare(context.terminalLifecycleSignal, () => {}, "root"),
+                      "new context dispatcher must refuse ordinary root admission before finishB");
+                  } else {
+                    assert.equal(prepare, undefined, "API-key replacement installs no account admission dispatcher");
+                  }
+                }
                 assert.throws(() => owners[0]!.guard(), /authority|aborted|admission|closed/i);
                 await triggerNow(`held-${barrier.stage}`);
                 assert.ok(retainedRootDispatch);
@@ -33354,12 +33408,15 @@ describe("M2 actualRunner credential replacement", () => {
             await running;
             await Promise.all(triggers);
           } finally {
-            preparationProbe.mock.restore();
-            epochProbe.mock.restore();
-            startTurnProbe.mock.restore();
-            brokerProbe.mock.restore();
-            nowProbe.mock.restore();
-            await fs.rm(dir, { recursive: true, force: true });
+            try { await joinNowConsumerProbes(); }
+            finally {
+              preparationProbe.mock.restore();
+              epochProbe.mock.restore();
+              startTurnProbe.mock.restore();
+              brokerProbe.mock.restore();
+              nowProbe.mock.restore();
+              await fs.rm(dir, { recursive: true, force: true });
+            }
           }
         }
       });

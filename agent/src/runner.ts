@@ -16722,9 +16722,10 @@ export class RunRunner {
         if ("dir" in prepared) flight.managedGoWorkDir = prepared.dir;
       }
     }
-    const prepareDispatch = (scope: RunFlight["operationScope"]): RunContext["prepareCodexRootDispatch"] => {
+    const prepareDispatch = (scope: RunFlight["operationScope"], assertAdmission?: () => void): RunContext["prepareCodexRootDispatch"] => {
       const controller = scope?.controller;
       return scope?.bind(async (signal, localCheck, kind = "root") => {
+        assertAdmission?.();
         if (!controller?.active())
           return () => !controller?.active();
         const source = revisionRecovery?.dispatchSource();
@@ -16733,6 +16734,7 @@ export class RunRunner {
           signal, control.signal, steering.terminalLifecycleSignal(), this.shutdownSignal.signal,
         ]);
         const check = (): void => {
+          assertAdmission?.();
           localCheck();
           operationSignal.throwIfAborted();
           if (steering.isCancelled()) throw new Error("run cancelled");
@@ -17408,7 +17410,11 @@ export class RunRunner {
                 flight.operationAdmission = scope.controller;
                 flight.releaseOperationAdmission = () => flight.operationScope?.close();
               }
-              ctx.prepareCodexRootDispatch = prepareDispatch(flight.operationScope);
+              let replacementAdmissionOpen = false;
+              ctx.prepareCodexRootDispatch = prepareDispatch(flight.operationScope, () => {
+                if (!replacementAdmissionOpen || flight.codexAuthority !== bundle)
+                  throw new Error("Codex replacement operation admission closed or retired");
+              });
               ctx.emit = epochEmitter(bundle.ordinal);
               await ownedEffect(() => a.publishB(bundle, bounds));
               if (nowLease && !nowLease.publishB(bundle)) throw new Error("Now publication refused");
@@ -17437,6 +17443,7 @@ export class RunRunner {
               flight.retainedSwitchSettlement = undefined;
               steering.settleCredentialSwitch(selected.opId, "applied");
               steering.rearmLifecycle();
+              replacementAdmissionOpen = true;
               return fresh ? "fresh_B" : "resumed_B";
             } catch (error) {
               guard();
