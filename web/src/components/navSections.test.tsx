@@ -41,7 +41,12 @@ describe("navSections", () => {
   });
 
   it("advertises exactly the 19 unconditional Admin Settings sections", () => {
-    expect(ADMIN_SETTINGS_ANCHOR_IDS.size).toBe(19);
+    expect([...ADMIN_SETTINGS_ANCHOR_IDS]).toEqual([
+      "vault-policy", "forge-labels", "run-judge", "run-summaries", "agent-source", "maintenance",
+      "updates", "slack", "run-health", "docker-allowlist", "review-bots", "hosted-worker-quota",
+      "custody-hold-limit", "ephemeral-workers", "worker-hibernation", "capability-scheduling",
+      "completion-interlock", "github-project-sync", "fetch-caps",
+    ]);
     expect(ADMIN_SETTINGS_ANCHOR_IDS.has("vault-migration")).toBe(false);
     expect(ADMIN_SETTINGS_ANCHOR_IDS.has("sso")).toBe(false);
     const anchors = admin.filter((i) => i.key.startsWith("admin-settings:"));

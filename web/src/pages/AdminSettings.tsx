@@ -212,16 +212,19 @@ export function AdminSettings() {
     { fallback: "Failed to load settings" },
   );
 
+  // Keyed on "loaded", not the `saved` object: every card save replaces `saved`, and a
+  // save must not yank the page back to the URL's anchor.
+  const loaded = !loading && saved !== null;
   useEffect(() => {
     // Deep links that arrive before the cards render: the browser's own hash jump has
     // nothing to land on yet, so scroll once loading settles (the maintenance banner's
     // "Manage maintenance" link and the command menu's section entries are examples).
     // Most cards render only after a successful load (`saved`), so a FAILED load leaves
     // the page at the top for every anchor, agent-source and maintenance included.
-    if (!loading && saved && ADMIN_SETTINGS_ANCHOR_IDS.has(hash.slice(1))) {
+    if (loaded && ADMIN_SETTINGS_ANCHOR_IDS.has(hash.slice(1))) {
       document.getElementById(hash.slice(1))?.scrollIntoView?.({ block: "start" });
     }
-  }, [loading, saved, hash]);
+  }, [loaded, hash]);
 
   // Poll only the live Slack connection state so the chip reflects connecting →
   // connected without a manual reload. Uses the dedicated status endpoint (not the

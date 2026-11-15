@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { AdminSettings } from "./AdminSettings";
 import { healthySilentDoc } from "../mocks/data/health";
@@ -165,6 +165,8 @@ describe("AdminSettings anchors", () => {
       expect(scroll).toHaveBeenCalledWith({ block: "start" });
     });
 
+    // #slack never renders on a failed load; agent-source and maintenance do, so those
+    // two are the real guards for "a failed load stays at the top".
     it(`does not scroll to #${id} after a failed load`, async () => {
       mockApi.getSettings.mockRejectedValue(new Error("boom"));
       renderAt(`#${id}`);
@@ -175,4 +177,24 @@ describe("AdminSettings anchors", () => {
       expect(scroll).not.toHaveBeenCalledWith({ block: "start" });
     });
   }
+
+  it("does not scroll to an unadvertised id even when it renders", async () => {
+    mockApi.getSettings.mockResolvedValue({ ...loadedResponse(), oidc_status: "enabled" });
+    renderAt("#sso");
+    await waitFor(() => expect(document.getElementById("sso")).not.toBeNull());
+    await act(async () => {});
+    expect(scroll).not.toHaveBeenCalledWith({ block: "start" });
+  });
+
+  it("does not re-scroll to the hash after a card save", async () => {
+    mockApi.updateSettings.mockResolvedValue({ ...loadedResponse(), settings: { ...loadedResponse().settings, vault_policy: "optional" } });
+    renderAt("#fetch-caps");
+    await waitFor(() => expect(scroll).toHaveBeenCalledWith({ block: "start" }));
+    scroll.mockClear();
+    fireEvent.change(screen.getByLabelText("Vault policy"), { target: { value: "optional" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save vault policy" }));
+    await waitFor(() => expect(mockApi.updateSettings).toHaveBeenCalled());
+    await act(async () => {});
+    expect(scroll).not.toHaveBeenCalledWith({ block: "start" });
+  });
 });
