@@ -150,17 +150,22 @@ echo "$CX_RUN_JSON" | jq -e '.run.usage.cost_status == "unreported" and .run.usa
 pass "codex run cost_status=unreported, cost_usd=0, tokens folded honestly (21400 in / 6100 out) -- never a metered \$0"
 
 # D4: a Codex claim never opens/records an Anthropic credential. codex_secret_id/auth
-# mode ARE bound; anthropic_secret_id stays NULL; no run_credential_epochs row (that
-# journal is Anthropic-only, PRD #1247).
+# mode ARE bound; anthropic_secret_id stays NULL. Since #4201 a Codex claim journals
+# its own run_credential_epochs row (recordCodexEpoch): it must name the frozen Codex
+# secret with select_reason codex_binding, never an Anthropic credential.
 [ "$(db_psql "SELECT (codex_secret_id IS NOT NULL) FROM runs WHERE id='$CX_RUN'")" = t ] \
   || fail "codex run $CX_RUN has no frozen codex_secret_id"
 [ "$(db_psql "SELECT codex_auth_mode FROM runs WHERE id='$CX_RUN'")" = api_key ] \
   || fail "codex run $CX_RUN codex_auth_mode is not 'api_key'"
 [ "$(db_psql "SELECT (anthropic_secret_id IS NULL) FROM runs WHERE id='$CX_RUN'")" = t ] \
   || fail "codex run $CX_RUN carries a non-null anthropic_secret_id -- Anthropic-before-harness regression"
-[ "$(db_psql "SELECT count(*) FROM run_credential_epochs WHERE run_id='$CX_RUN'")" = 0 ] \
-  || fail "codex run $CX_RUN wrote an Anthropic run_credential_epochs row"
-pass "codex run $CX_RUN: bound codex_secret_id/api_key, NO anthropic_secret_id, NO run_credential_epochs row"
+[ "$(db_psql "SELECT count(*) FROM run_credential_epochs WHERE run_id='$CX_RUN'")" -ge 1 ] \
+  || fail "codex run $CX_RUN journaled no run_credential_epochs row (#4201 records the Codex binding)"
+[ "$(db_psql "SELECT count(*) FROM run_credential_epochs e JOIN runs r ON r.id = e.run_id
+    WHERE e.run_id='$CX_RUN' AND (e.secret_id IS DISTINCT FROM r.codex_secret_id
+      OR e.select_reason IS DISTINCT FROM 'codex_binding')")" = 0 ] \
+  || fail "codex run $CX_RUN has a run_credential_epochs row not bound to its Codex secret (codex_binding): $(db_psql "SELECT json_agg(json_build_object('gen', claim_generation, 'secret', secret_id, 'reason', select_reason)) FROM run_credential_epochs WHERE run_id='$CX_RUN'")"
+pass "codex run $CX_RUN: bound codex_secret_id/api_key, NO anthropic_secret_id, epoch rows name only the Codex binding"
 
 # --- (4) a Claude CONTROL run, same worker, same (now dual-credential) admin -------
 # Proves no fallback / no cross-contamination the OTHER direction: adding a Codex
