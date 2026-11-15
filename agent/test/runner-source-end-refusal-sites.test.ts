@@ -25,11 +25,11 @@ const transports = ["exact", "missing-detail", "wrong-detail", "foreign-run", "f
   "stale", "missing-generation", "wrong-generation", "registration-rotation", "409", "lost-ACK", "400",
   "cancel-before-await", "current-ownership", "claimed-running", "hold-absent", "hold-dropped", "evidence-absent"] as const;
 for (const site of ["early", "later-race", "phaseClone-reseed"] as const) {
-  // Transport negatives share the real early refusal fixture; the three call
-  // sites retain their independent admission coverage without a Cartesian suite.
+  // ACK-shape negatives share the early fixture. Registration/capability cases
+  // run at every refusal seam so their prerequisite coverage is explicit.
   const cases = (["exact-declined", "retirement-only", "queued-end"] as const).flatMap(evidence =>
     transports.filter(transport => transport === "exact" ||
-      (transport === "hold-absent" && evidence === "exact-declined") ||
+      (["claimed-running", "hold-absent", "hold-dropped", "evidence-absent"].includes(transport) && evidence === "exact-declined") ||
       (site === "early" && evidence === "exact-declined"))
       .map(transport => ({ evidence, transport })));
   for (const { evidence, transport } of cases) {
