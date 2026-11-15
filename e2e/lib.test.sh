@@ -3080,7 +3080,7 @@ case "$SCENARIO" in
       "$1" > "$S/agentlog.txt"; printf '%s\n' "$2" > "$S/dbrow"; printf '%s\n' "$3" > "$S/feed.json"
       restore_assert_canonical_refusal R 2 1
     }
-    GOOD_ROW='recovery_wait|retained_recovery_adoption_failed||2'
+    GOOD_ROW='recovery_wait|retained_recovery_adoption_failed|||2'
     GOOD_FEED='{"messages":[{"kind":"status","payload":{"text":"this release does not support this predecessor; it is held"}}]}'
     ( try good_log "$GOOD_ROW" "$GOOD_FEED" >/dev/null )
     unconfirmed_log() { good_log | sed 's/restore unsupported predecessor held/restore unsupported predecessor hold unconfirmed/'; }
@@ -3095,8 +3095,9 @@ case "$SCENARIO" in
     ( expect_failure 'missing: held-log' try no_held_log "$GOOD_ROW" "$GOOD_FEED" )
     ( expect_failure 'feed-text' try good_log "$GOOD_ROW" '{"messages":[]}' )
     ( expect_failure 'run-state([recovery_wait|worker_requeue_exhausted||2])' try good_log 'recovery_wait|worker_requeue_exhausted||2' "$GOOD_FEED" )
-    ( expect_failure 'run-state([recovery_wait|retained_recovery_adoption_failed|2026-01-01 00:00:00+00|2])' try good_log 'recovery_wait|retained_recovery_adoption_failed|2026-01-01 00:00:00+00|2' "$GOOD_FEED" )
-    ( expect_failure 'run-state([recovery_wait|retained_recovery_adoption_failed||3])' try good_log 'recovery_wait|retained_recovery_adoption_failed||3' "$GOOD_FEED" )
+    ( expect_failure 'run-state([recovery_wait|retained_recovery_adoption_failed||2026-01-01 00:00:00+00|2])' try good_log 'recovery_wait|retained_recovery_adoption_failed||2026-01-01 00:00:00+00|2' "$GOOD_FEED" )
+    ( expect_failure 'run-state([recovery_wait|retained_recovery_adoption_failed|||3])' try good_log 'recovery_wait|retained_recovery_adoption_failed|||3' "$GOOD_FEED" )
+    ( expect_failure 'run-state([recovery_wait|retained_recovery_adoption_failed|source_end_declined||2])' try good_log 'recovery_wait|retained_recovery_adoption_failed|source_end_declined||2' "$GOOD_FEED" )
     echo "OK canonical refusal: exactly one successor claim, no seed, frozen log + feed text, recovery_wait/adoption-failed with no retry stamp" ;;
   *) echo "fail: unknown scenario $SCENARIO" >&2; exit 2 ;;
 esac
