@@ -31847,7 +31847,18 @@ describe("M2 actualRunner credential replacement", () => {
       }), claim_generation: 7 };
       claim.secrets = { ...claim.secrets, codex: oldClaim as import("../src/protocol.js").ClaimCodexSecrets };
       api.setOwnershipStatus(claim.run_id, "running", 7);
-      let pending = false, cancelled = false, applies = 0, hooks = 0, factories = 0;
+      let pending = false, cancelled = false, applies = 0, hooks = 0, factories = 0, preflights = 0;
+      let context: RunContext;
+      let clockOffset = 0;
+      const nowEntered = installerBarrier(), nowAborted = installerBarrier(), nowContinue = installerBarrier();
+      const nowBuilds: import("../src/codex/codex-executor.js").CodexAdviceHarnessBuildParams[] = [];
+      const nowRuns: string[] = [];
+      const owners: import("../src/codex/summary-ownership.js").SummaryOwnership[] = [];
+      let retiredADenied = false, liveBAdmitted = false;
+      const triggerNow = async (id: string) => {
+        await context.reportProgress!({ completed: [], in_progress: [id] }, [{ id, title: `Inspect ${id}` }] as never);
+        context.emit({ kind: "tool_use", agent: "lead", payload: { id, name: "Bash", input: { command: "true", description: `Inspect ${id}` } } });
+      };
       const reports: string[] = [];
       const report = client.reportState.bind(client);
       client.reportState = async (id, body, ...args) => {
@@ -31859,10 +31870,10 @@ describe("M2 actualRunner credential replacement", () => {
       client.hasFeature = name => name === "credential_switch_hold" || feature(name);
       client.getRunOwnership = async () => ({ status: "running", claim_generation: 7,
         claim_released: false, hold_reason: null });
-      client.getInputs = async () => ({ inputs: [], ...((cancelled || api.messages(claim.run_id).some(m => m.payload.event === "codex_response_usage")) ? { terminalCancelled: { run_id: claim.run_id, generation: 7 } } : {}),
+      client.getInputs = async () => ({ inputs: [], nowSummary: true, ...((cancelled || api.messages(claim.run_id).some(m => m.kind === "progress_note" && m.credential_epoch_ordinal === 1 && String(m.payload.text).startsWith("Inspecting B"))) ? { terminalCancelled: { run_id: claim.run_id, generation: 7 } } : {}),
         ...(pending ? { credentialSwitch: { generation: 7, op_id: "M2-op", target_secret_id: "M2-target" } } : {}) });
-      client.preflightCodexCredentialSwitch = async () => ({ kind: "ready",
-        claimGeneration: 7, registerNonce: "M2-original-nonce", opId: "M2-op" });
+      client.preflightCodexCredentialSwitch = async () => { preflights++; events.push("preflight"); return { kind: "ready",
+        claimGeneration: 7, registerNonce: "M2-original-nonce", opId: "M2-op" }; };
       client.applyCredentialSwitch = async (_id, req) => {
         assert.equal(req.claimGeneration, 7);
         assert.equal(req.opId, "M2-op");
@@ -31881,11 +31892,13 @@ describe("M2 actualRunner credential replacement", () => {
       const aEntered = installerBarrier(), bEntered = installerBarrier();
       const cleanupEntered = installerBarrier(), cleanupContinue = installerBarrier();
       const events: string[] = [];
+      let cleanupStarts = 0;
       const fileops: ReturnType<typeof fakeFileopHandle>[] = [];
       const aResponder = epochResponder(savedId, "M2-A-turn", () => {
-        pending = true; aEntered.resolve();
+        aEntered.resolve();
       });
       let bTurns = 0;
+      const triggers: Promise<void>[] = [];
       const rig = makeMultiEpochRig([
         c => {
           if (c.method === "turn/interrupt")
@@ -31906,6 +31919,8 @@ describe("M2 actualRunner credential replacement", () => {
               c.transport.push(agentMessage(`M2 B output ${next.access_token} ${next.capability}`, savedId));
               c.transport.push(tokenUsageUpdated(savedId, "M2-B-turn", { inputTokens: 200, outputTokens: 100, totalTokens: 300 }));
               c.transport.push(turnCompleted("completed", savedId, "M2-B-turn"));
+              clockOffset += 300001;
+              triggers.push(triggerNow("B"));
               bEntered.resolve();
             }
             return { turn: { id: bTurns === 1 ? "M2-B-turn" : "M2-B-idle" } };
@@ -31916,7 +31931,7 @@ describe("M2 actualRunner credential replacement", () => {
       const a = rig.epochs[0]!, b = rig.epochs[1]!;
       const reap = a.root.reap.bind(a.root);
       a.root.reap = async ms => {
-        cleanupEntered.resolve(); await cleanupContinue.promise;
+        cleanupStarts++; events.push("A-cleanup-start"); cleanupEntered.resolve(); await cleanupContinue.promise;
         const result = await reap(ms); events.push("A-reaped"); return result;
       };
       const launch = rig.deps.launchEffectRoot!;
@@ -31928,7 +31943,7 @@ describe("M2 actualRunner credential replacement", () => {
           const root = await launch(...args), epoch = effects++;
           const dispose = root.dispose.bind(root);
           root.dispose = async (...disposeArgs) => {
-            if (epoch === 0) { cleanupEntered.resolve(); await cleanupContinue.promise; }
+            if (epoch === 0) { cleanupStarts++; events.push("A-cleanup-start"); cleanupEntered.resolve(); await cleanupContinue.promise; }
             const result = await dispose(...disposeArgs);
             if (epoch === 0) events.push("A-effect-disposed");
             return result;
@@ -31973,6 +31988,7 @@ describe("M2 actualRunner credential replacement", () => {
       const run = executor.run.bind(executor);
       let worktree = "";
       executor.run = async ctx => {
+        context = ctx;
         worktree = ctx.worktreePath;
         await fs.writeFile(path.join(worktree, "M2-retained.txt"), "A work");
         const attempt = ctx.attemptCodexCredentialSwitch!;
@@ -31982,11 +31998,43 @@ describe("M2 actualRunner credential replacement", () => {
       const diagnostics = recordingLogger();
       const runner = m2Runner.runnerWith(() => { factories++; return { executor, homeDir: m2Runner.homeDir }; },
         m2Runner.fakeGitlab().gitlab, undefined, diagnostics.logger, {
+          now: () => Date.now() + clockOffset,
+          nowSummary: { homeRoot: dir, queryFn: (() => { throw new Error("Codex Now reached Claude"); }) as never,
+            codexAdviceHarnessFactory: (async (params: import("../src/codex/codex-executor.js").CodexAdviceHarnessBuildParams) => {
+              nowBuilds.push(params);
+              const owner = summaryOwnership.get(params)!;
+              owners.push(owner);
+              if (params.binding.capability === oldClaim.capability) {
+                params.signal!.addEventListener("abort", () => nowAborted.resolve(), { once: true });
+                nowEntered.resolve();
+                await nowContinue.promise;
+                events.push("A-Now-drained");
+              } else {
+                try { owners[0]!.guard(); } catch { retiredADenied = true; }
+                owner.guard(); liveBAdmitted = true;
+              }
+              return { kind: "codex", run: async (request: import("../src/harness.js").AdviceRequest) => {
+                nowRuns.push(params.binding.capability);
+                request.usageObserver?.({ "gpt-6-luna": { inputTokens: 90, outputTokens: 12, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, costStatus: "metered", costUSD: 0.000015 } });
+                return { text: `Inspecting B ${next.access_token} ${next.capability}`, end: { kind: "terminal", terminal: { outcome: "success" } } } as never;
+              } };
+            }) as unknown as import("../src/codex/codex-executor.js").CodexAdviceHarnessFactory,
+          },
           credentialSwitchLedger: new (await import("../src/credential-switch-op-ledger.js")).CredentialSwitchOpLedger(dir),
         });
       const running = runner.execute(claim);
       try {
         await withTimeout(aEntered.promise, 5000, "M2 A turn");
+        await triggerNow("A");
+        await withTimeout(nowEntered.promise, 5000, "M2 active A Now factory");
+        pending = true;
+        await withTimeout(nowAborted.promise, 5000, "M2 Now switch cancellation");
+        assert.equal(preflights, 0, "preflight waits for the raw A Now factory");
+        assert.equal(applies, 0);
+        assert.equal(cleanupStarts, 0, "A teardown waits for Now drain");
+        assert.equal(events.length, 0);
+        assert.equal(b.transport.requests.length, 0);
+        nowContinue.resolve();
         await withTimeout(cleanupEntered.promise, 5000, "M2 A teardown");
         assert.equal(b.transport.requests.length, 0, "B auth waits for A reap");
         cleanupContinue.resolve();
@@ -31994,6 +32042,19 @@ describe("M2 actualRunner credential replacement", () => {
           throw new Error(JSON.stringify({ events, applies, hooks, diagnostics: diagnostics.lines, messages: api.messages(claim.run_id) }), { cause: error });
         });
         await withTimeout(running, 5000, "M2 B usage and ordinary cancellation");
+        await Promise.all(triggers);
+        assert.equal(nowBuilds.length, 2, "real owned composition constructs A then B Now");
+        assert.equal(retiredADenied, true, "A guard rejected during live B construction");
+        assert.equal(liveBAdmitted, true, "B guard accepted before executor shutdown");
+        assert.deepEqual(nowRuns, [next.capability], "cancelled A cannot run after its delayed construction");
+        assert.equal(nowBuilds[1]!.binding.authMode, next.auth_mode);
+        assert.equal(nowBuilds[1]!.binding.capability, next.capability);
+        assert.throws(() => owners[0]!.guard(), /authority|aborted|admission|closed/i, "retired A callback cannot borrow B authority");
+        for (const event of ["A-cleanup-start", "preflight", "A-reaped"]) {
+          assert.ok(events.includes(event), `observed ${event}`);
+          assert.ok(events.indexOf("A-Now-drained") < events.indexOf(event), `raw Now drain precedes ${event}`);
+        }
+        assert.equal(preflights, 1);
         assert.equal(applies, 1);
         assert.equal(factories, 1, "no reclaim or second executor");
         assert.ok(!reports.some(status => status.startsWith("credential_switch")), "no switch hold or release transition");
@@ -32004,6 +32065,13 @@ describe("M2 actualRunner credential replacement", () => {
           await assert.rejects(fs.access(path.join(dest, "unapproved.txt")));
         }
         const feed = api.messages(claim.run_id);
+        const notes = feed.filter(m => m.kind === "progress_note" && String(m.payload.text).startsWith("Inspecting B"));
+        assert.equal(notes.length, 1, "future B Now emits one note through Runner");
+        assert.equal(notes[0]!.credential_epoch_ordinal, 1);
+        assert.deepEqual(rec(notes[0]!.payload.model_usage)["gpt-6-luna"], {
+          inputTokens: 90, outputTokens: 12, cacheReadInputTokens: 0,
+          cacheCreationInputTokens: 0, costStatus: "metered", costUSD: 0.000015,
+        });
         const bMessage = feed.find(m => String(m.payload.text).startsWith("M2 B output"));
         assert.ok(bMessage, "B output reaches real Runner feed");
         assert.equal(bMessage.credential_epoch_ordinal, 1);
@@ -32025,10 +32093,11 @@ describe("M2 actualRunner credential replacement", () => {
         assert.equal(b.transport.threadStartCount, 0);
         assert.equal(await fs.readFile(path.join(worktree, "M2-retained.txt"), "utf8"), "A work");
       } finally {
-        cancelled = true; pending = false; cleanupContinue.resolve();
+        cancelled = true; pending = false; nowContinue.resolve(); cleanupContinue.resolve();
         a.transport.push(turnCompleted("interrupted", savedId, "M2-A-turn"));
         b.transport.push(turnCompleted("interrupted", savedId, bTurns > 1 ? "M2-B-idle" : "M2-B-turn"));
         await running;
+        await Promise.all(triggers);
         await fs.rm(dir, { recursive: true, force: true });
       }
     });
