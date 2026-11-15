@@ -371,14 +371,35 @@ describe("terminal-preservation lane (#4007 slice B)", () => {
     assert.equal(r.store.record, undefined);
   });
 
-  it("a default-branch lookup that resolves nothing with the budget intact is not refused and proceeds", async () => {
-    // The rig's hooked prepare replaces the real one, so the observable is that the operation proceeds to its send.
+  // The rig's hooked prepare would hide the resolved branch, so these two drop it and let the lane's real prepare run; the
+  // observable is the branch the lane hands to git.defaultBranchTip. Whatever that real prepare then does with the stub
+  // git (it is not a real repository) is not under test.
+  async function resolvedBranch(lookup: TerminalLaneEnv["lookupDefaultBranch"]): Promise<{ branches: string[]; reason: string | undefined; looked: number }> {
+    const branches: string[] = [];
     let looked = 0;
-    const r = rig({ env: { defaultBranch: undefined, lookupDefaultBranch: async () => { looked++; return undefined; } } });
+    const r = rig({ env: {
+      defaultBranch: undefined,
+      git: { defaultBranchTip: async (_bare: string, b: string) => { branches.push(b); return undefined; } } as never,
+      lookupDefaultBranch: async b => { looked++; return lookup!(b); },
+    } });
+    const { prepare: _hooked, ...deps } = r.env.hooks!.deps!;
+    r.env.hooks = { ...r.env.hooks!, deps };
     const out = await preserveInLane(r.env, r.flight, body);
-    assert.equal(out.outcome, "published");
-    assert.equal(looked, 1);
-    assert.equal(r.sends, 1);
+    return { branches, reason: out.reason, looked };
+  }
+
+  it("a default-branch lookup that resolves nothing with the budget intact is not refused and falls back to main", async () => {
+    const o = await resolvedBranch(async () => undefined);
+    assert.equal(o.looked, 1);
+    assert.notEqual(o.reason, "default_branch_unresolved");
+    assert.deepEqual(o.branches, ["main"]);
+  });
+
+  it("a default-branch lookup that throws with the budget intact is not refused and falls back to main", async () => {
+    const o = await resolvedBranch(async () => { throw new Error("lookup failed"); });
+    assert.equal(o.looked, 1);
+    assert.notEqual(o.reason, "default_branch_unresolved");
+    assert.deepEqual(o.branches, ["main"]);
   });
 
   it("a cooperative quiesce that honours the deadlineAt it receives returns the lane kept within its budget", async () => {
