@@ -318,13 +318,14 @@ func codexSwitchFence(w store.Worker, r store.Run, req CredentialSwitchApplyRequ
 		applyLiveStatus(r.Status) && codexSwitchLaneEligible(r)
 }
 
-// These lanes have no worker coordinator for an in-place Codex switch.
+// codexSwitchLaneEligible excludes review targets and unsupported Codex lanes.
+// Self-improvement runs use the worker's Codex switch coordinator.
 func codexSwitchLaneEligible(r store.Run) bool {
 	if r.ReviewTargetRunID.Valid {
 		return false
 	}
 	switch r.Kind {
-	case "chat", "judge", "self_improve", "job", "cross_check":
+	case "chat", "judge", "job", "cross_check":
 		return false
 	}
 	return true

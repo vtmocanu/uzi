@@ -39,7 +39,7 @@ describe("Codex credential switch", () => {
     { canSteer: false }, { status: "queued" }, { status: "claimed" }, { status: "paused" },
     { status: "completed" }, { status: "failed" }, { status: "cancelled" },
     { status: "limit_wait" }, { status: "pool_wait" }, { status: "recovery_wait" },
-    { kind: "chat" }, { kind: "judge" }, { kind: "self_improve" }, { kind: "job" },
+    { kind: "chat" }, { kind: "judge" }, { kind: "job" },
     { kind: "cross_check" }, { trigger_source: "task_review" },
   ])("hides ineligible control without fetching: %j", over => {
     const { canSteer = true, ...fields } = over as Partial<Run> & { canSteer?: boolean };
@@ -47,13 +47,13 @@ describe("Codex credential switch", () => {
     expect(container.firstChild).toBeNull();
     expect(api.listSecrets).not.toHaveBeenCalled();
   });
-  it("seeds by committed ID, distinguishes same labels and sends only an explicit pinned ID", async () => {
+  it.each(["issue", "self_improve"] as const)("seeds by committed ID, distinguishes both auth kinds and sends only an explicit pinned ID for %s", async kind => {
     const current = secret({ label: "Same" });
     const other = { ...b, label: "Same" };
     const onSwitched = vi.fn();
-    const returned = run({ credential_switch: "requested" });
+    const returned = run({ kind, credential_switch: "requested" });
     vi.mocked(api.setRunCredential).mockResolvedValue({ run: returned });
-    render(<SwitchTokenAction run={run({ codex_secret_label: "Different snapshot" })} canSteer tokens={[other, current]} onSwitched={onSwitched} />);
+    render(<SwitchTokenAction run={run({ kind, codex_secret_label: "Different snapshot" })} canSteer tokens={[other, current]} onSwitched={onSwitched} />);
     open();
     const select = screen.getByLabelText("Codex credential") as HTMLSelectElement;
     expect(select.value).toBe(current.id);
@@ -141,10 +141,10 @@ describe("Codex credential switch", () => {
     open(); fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     expect(document.activeElement).toBe(screen.getByRole("button", { name: "Switch credential" }));
   });
-  it("keeps committed A through pending and displays B only from applied props", async () => {
-    const a = run();
-    const pending = run({ credential_switch: "requested" });
-    const applied = run({ codex_secret_id: b.id, codex_secret_label: b.label });
+  it.each(["issue", "self_improve"] as const)("keeps committed A through pending and displays B only from applied props for %s", async kind => {
+    const a = run({ kind });
+    const pending = run({ kind, credential_switch: "requested" });
+    const applied = run({ kind, codex_secret_id: b.id, codex_secret_label: b.label });
     vi.mocked(api.setRunCredential).mockResolvedValue({ run: pending });
     const onSwitched = vi.fn();
     function Header({ value }: { value: Run }) {

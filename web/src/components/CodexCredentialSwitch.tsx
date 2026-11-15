@@ -1,7 +1,6 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { api, type Run, type SecretMeta } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
-import { isCredentialSwitchRefusedLane } from "../lib/credentialOverride";
 import { sanitizeLabel } from "../lib/sanitizeLabel";
 import { Alert, Button, Select } from "./ui";
 
@@ -24,7 +23,8 @@ export function CodexCredentialSwitch(props: {
   // A concurrent state change or additional server refusal stays visible below.
   const eligible = canSteer && run.harness === "codex" &&
     ["running", "awaiting_approval", "awaiting_input", "awaiting_followup"].includes(run.status) &&
-    !isCredentialSwitchRefusedLane(run) && run.kind !== "cross_check";
+    run.trigger_source !== "task_review" &&
+    !["chat", "judge", "job", "cross_check"].includes(run.kind);
   // Unmounting the editor drops its fetch result and selection when eligibility changes.
   return eligible ? <CodexSwitchEditor key={run.id} {...props} /> : null;
 }

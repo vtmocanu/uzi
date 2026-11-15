@@ -32552,8 +32552,11 @@ describe("M2 actualRunner credential replacement", () => {
           },
         };
         const release = rig.client.releaseCodex.bind(rig.client);
-        rig.client.releaseCodex = async (id, req) => req.capability === next.capability
-          ? { access_token: next.access_token } : release(id, req);
+        let credentialReleases = 0, credentialRefreshes = 0;
+        rig.client.releaseCodex = async (id, req) => {
+          credentialReleases++;
+          return req.capability === next.capability ? { access_token: next.access_token } : release(id, req);
+        };
         const refresh = rig.client.refreshCodex.bind(rig.client);
         let ordinaryBRefreshes = 0, refreshDeliveries = 0, bFinished = false;
         const refreshDelivered = installerBarrier(), refreshResponded = installerBarrier();
@@ -32568,6 +32571,7 @@ describe("M2 actualRunner credential replacement", () => {
           if (id === 91) refreshResponded.resolve();
         };
         rig.client.refreshCodex = async (id, req) => {
+          credentialRefreshes++;
           if (req.capability !== next.capability) return refresh(id, req);
           ordinaryBRefreshes++;
           assert.equal(bFinished, true, "ordinary B refresh requires full initialization and finishB reopen");
@@ -32730,6 +32734,7 @@ describe("M2 actualRunner credential replacement", () => {
                 assert.equal(bFinished, false, stage);
                 assert.ok(retainedRootDispatch);
                 assert.ok(retainedBroker);
+                const refresh = probeRetiredRefresh(stage).then(() => ({}), error => ({ error }));
                 const root = assert.rejects(retainedRootDispatch.prepare(),
                   `retired A root dispatch refuses work at ${stage}`);
                 const child = retainedBroker.handleToolCall(
@@ -32739,11 +32744,13 @@ describe("M2 actualRunner credential replacement", () => {
                     assert.notEqual(result.ok ? undefined : result.code, "unknown_role", stage);
                     assert.notEqual(result.ok ? undefined : result.code, "bad_args", stage);
                   });
-                // Attach rejection handlers to both invocations before yielding.
-                const results = await Promise.allSettled([root, child]);
+                // Attach rejection handlers to every invocation before yielding.
+                const results = await Promise.allSettled([refresh, root, child]);
                 for (const result of results) {
                   if (result.status === "rejected") throw result.reason;
                 }
+                const refreshed = await refresh;
+                if ("error" in refreshed) throw refreshed.error;
                 assert.equal(a.transport.requests.length, aSends, `no A sends at ${stage}`);
                 assert.equal(b.transport.requests.length, bSends, `no B sends at ${stage}`);
                 nowConsumerStages.push(stage);
@@ -32769,6 +32776,30 @@ describe("M2 actualRunner credential replacement", () => {
         const epochBuilder = executor as unknown as { startProviderEpoch(...args: unknown[]): Promise<PreparationEpoch> };
         const startProviderEpoch = epochBuilder.startProviderEpoch.bind(executor);
         let epochBuilds = 0;
+        type RefreshBridge = import("../src/codex/appserver-auth.js").CodexSubscriptionRefreshBridge;
+        let retiredARefresh: RefreshBridge["refresh"] | undefined;
+        let bRefresh: RefreshBridge["refresh"] | undefined;
+        const refreshProbeStages: string[] = [];
+        const probeRetiredRefresh = async (stage: string) => {
+          const releases = credentialReleases, refreshes = credentialRefreshes;
+          const aSends = a.transport.requests.length, bSends = b.transport.requests.length;
+          assert.equal(bFinished, false, stage);
+          assert.equal(bRefresh, undefined, `B refresh bridge does not exist at ${stage}`);
+          assert.equal(bHarness, undefined, `B epoch has not been prepared at ${stage}`);
+          if (oldClaim.auth_mode === "subscription") {
+            assert.ok(retiredARefresh, "capture the real A auth bridge before teardown");
+            // Bypass the retired auth session delivery fence to exercise the worker
+            // callback itself, with a live signal rather than cancellation as the refusal.
+            await assert.rejects(retiredARefresh({ operationId: `retired-A-${stage}`,
+              signal: new AbortController().signal }), `retired A refresh refuses at ${stage}`);
+          } else assert.equal(retiredARefresh, undefined, "API-key A has no subscription refresh callback");
+          assert.equal(credentialReleases, releases, `no credential release at ${stage}`);
+          assert.equal(credentialRefreshes, refreshes, `no worker refresh API call at ${stage}`);
+          assert.equal(a.transport.requests.length, aSends, `no A sends at ${stage}`);
+          assert.equal(b.transport.requests.length, bSends, `no B sends at ${stage}`);
+          assert.equal(reopenAttempts, 0, `A authority stays retired at ${stage}`);
+          refreshProbeStages.push(stage);
+        };
         let bHarness: CodexHarness | undefined;
         let bPreparationBroker: import("../src/codex/broker.js").CodexCallbackBroker | undefined;
         let bPreparationObserved = false, bRootObserved = false;
@@ -32776,7 +32807,19 @@ describe("M2 actualRunner credential replacement", () => {
         const bChildProbes: string[] = [];
         const epochProbe = mock.method(epochBuilder, "startProviderEpoch", async (...args: unknown[]) => {
           const epoch = await startProviderEpoch(...args);
-          if (epochBuilds++ === 1) {
+          const epochIndex = epochBuilds++;
+          if (publication === "gated") {
+            // Read the actual auth owner retained by the returned harness. Its config
+            // retains the same bridge object that the read-path auth interceptor calls.
+            const auth = (epoch.harness as unknown as { appServerAuth?: {
+              config: import("../src/codex/appserver-auth.js").CodexAppServerAuthConfig;
+            } }).appServerAuth;
+            assert.ok(auth, "real provider epoch owns app-server auth");
+            const callback = auth.config.mode === "subscription" ? auth.config.bridge.refresh : undefined;
+            if (epochIndex === 0) retiredARefresh = callback;
+            else bRefresh = callback;
+          }
+          if (epochIndex === 1) {
             bHarness = epoch.harness;
             const buildPhaseBroker = epoch.buildPhaseBroker.bind(epoch);
             epoch.buildPhaseBroker = (...brokerArgs) => {
@@ -32866,6 +32909,13 @@ describe("M2 actualRunner credential replacement", () => {
                   await joinNowConsumerProbes();
                   assert.deepEqual([...nowConsumerStages].sort(), ["after-Now-publish", "before-Now-publish"]);
                   assert.equal(nowConsumerProbes.length, 2, "both synchronous Now callbacks invoke retained A consumers");
+                }
+                if (publication === "gated" && (barrier.stage === "before-publish" ||
+                    barrier.stage === "after-publish" || barrier.stage === "before-prepare")) {
+                  await probeRetiredRefresh(barrier.stage);
+                  if (barrier.stage === "before-prepare")
+                    assert.deepEqual([...refreshProbeStages].sort(), ["after-Now-publish", "after-publish",
+                      "before-Now-publish", "before-prepare", "before-publish"].sort());
                 }
                 if (publication === "gated" && barrier.stage === "before-publish") {
                   assert.equal(bFinished, false);

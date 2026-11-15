@@ -250,9 +250,24 @@ func TestCodexSwitchPolicyFence(t *testing.T) {
 	}
 }
 
+// This checks lane admission through request validation, not database persistence.
+func TestCodexSwitchSelfImproveLaneAdmission(t *testing.T) {
+	var svc Service
+	for _, status := range []string{"running", "awaiting_approval", "awaiting_input", "awaiting_followup"} {
+		t.Run(status, func(t *testing.T) {
+			run := store.Run{Harness: harnessCodex, Status: status, Kind: "self_improve"}
+			eligible := codexSwitchLaneEligible(run)
+			_, err := svc.requestCodexCredentialSwitch(context.Background(), run, BindModePinned, nil)
+			if !eligible || !errors.Is(err, ErrCredentialOverridePinnedNeedsSecret) {
+				t.Fatalf("eligible=%v, got %v, want pinned secret validation after lane admission", eligible, err)
+			}
+		})
+	}
+}
+
 func TestCodexSwitchOwnerLaneRefusals(t *testing.T) {
 	var svc Service
-	for _, kind := range []string{"chat", "judge", "self_improve", "job", "cross_check", "task"} {
+	for _, kind := range []string{"chat", "judge", "job", "cross_check", "task"} {
 		run := store.Run{Status: "running", Kind: kind}
 		if kind == "task" {
 			run.ReviewTargetRunID = pgtype.UUID{Bytes: uuid.New(), Valid: true}
