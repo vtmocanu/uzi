@@ -4182,7 +4182,7 @@ export class RunRunner {
       skip, failureFirst, policy: () => this.frozenHeldPolicy(flight),
       remediationHold: sha => this.checkpointRemediationHold(flight, flight.barePath!, sha, false),
       ciHold: sha => this.ciConfigGuardVerdict(flight, flight.barePath!, sha, "terminal preservation"),
-      ...(site.quiesce ? { quiesce: ({ deadlineAt }) => this.quiesceOrBlockSink(flight, flight.executor, site.site, { deadlineAt }) } : {}),
+      ...(site.quiesce ? { quiesce: ({ deadlineAt, signal }) => this.quiesceOrBlockSink(flight, flight.executor, site.site, { deadlineAt, stop: { signal } }) } : {}),
       ...(site.signal ? { signal: site.signal } : {}),
       ...(site.deadlineAt !== undefined ? { remainingMs: site.deadlineAt - Date.now() } : {}),
       log: (step, fields) => flight.runLog.info(`terminal preservation: ${step}`, { run_id: flight.runId, ...fields }),
@@ -18544,13 +18544,14 @@ export class RunRunner {
     flight: RunFlight,
     executor: Executor,
     site: string,
-    opts: { processOnly?: boolean; keepClone?: boolean; deadlineAt?: number } = {},
+    opts: { processOnly?: boolean; keepClone?: boolean; deadlineAt?: number; stop?: CheckpointStop } = {},
   ): Promise<void> {
     const q = await this.quiesceRun(flight, executor, {
       mode: "own",
       site: opts.processOnly ? `${site}:after_runner_git` : site,
       processOnly: opts.processOnly,
       ...(opts.deadlineAt !== undefined ? { deadlineAt: opts.deadlineAt } : {}),
+      ...(opts.stop !== undefined ? { stop: opts.stop } : {}),
     });
     if (!q.blocked) return;
     // Keep the clone and its recovery journal: the terminal finally must not retire a tree a
@@ -18695,7 +18696,9 @@ export class RunRunner {
       /** issue #3644: `<run>:<attempt>` markers that must be neither killed nor ignored (an independent restore's predecessor). */
       protectedMarkers?: string[];
       /** issue #3980: absolute deadline of a bounded Claude gate checkpoint; absent = unchanged behaviour. */
-      deadlineAt?: number },
+      deadlineAt?: number;
+      /** Terminal preservation lane stop: aborted = refuse queued gate admission and start no further step; absent = unchanged behaviour. */
+      stop?: CheckpointStop },
   ): Promise<{ outcome: QuiesceRunOutcome; blocked: boolean }> {
     // issue #3644 plan 3.4 (a): until the restore's seed returns, P's processes, clone and HOME belong to the other incarnation.
     // Refuse before any kill, settle, scan or reap; every caller reads a blocked proof as "not quiescent" and keeps what it holds.
@@ -18729,9 +18732,10 @@ export class RunRunner {
     }
     try { return await flight.sinkGate.run(async () => {
       MaintenanceBudget.current()?.check();
-      const deadlineExpired = (): boolean => opts.deadlineAt !== undefined && Date.now() >= opts.deadlineAt;
+      const deadlineExpired = (): boolean =>
+        (opts.deadlineAt !== undefined && Date.now() >= opts.deadlineAt) || opts.stop?.signal.aborted === true;
       const deadlineBlocked = (reap?: RunProcessReap | { failure: string }): { outcome: QuiesceRunOutcome; blocked: boolean } => {
-        flight.runLog.warn("run quiescence not attempted: the gate checkpoint deadline is exhausted", { site: opts.site });
+        flight.runLog.warn("run quiescence not attempted: the gate checkpoint deadline is exhausted or its stop is aborted", { site: opts.site });
         if (!executor.safety) flight.evidenceJoinFailed = true;
         const base: QuiesceRunOutcome = {
           process: { state: "unverified", processes: [], killed: [], detail: "gate checkpoint deadline exhausted" },
@@ -18877,7 +18881,17 @@ export class RunRunner {
         });
       }
       return { outcome, blocked };
-    }); } catch (error) {
+    }, opts.stop); } catch (error) {
+      if (opts.stop?.signal.aborted && (error instanceof CheckpointSoftDeadlineError || error instanceof GitBoundaryAbortError)) {
+        // The stop refused or forfeited the gate wait, or fired during/after the gated body (whose result is then discarded):
+        // not proven quiescent, so blocked and unverified like deadlineBlocked.
+        flight.runLog.warn("run quiescence not completed: the terminal preservation stop is aborted", { site: opts.site });
+        if (!executor.safety) flight.evidenceJoinFailed = true;
+        return { outcome: {
+          process: { state: "unverified", processes: [], killed: [], detail: "terminal preservation stop" },
+          docker: { state: "not_wired", removed: [], detail: "terminal preservation stop" },
+        }, blocked: true };
+      }
       if (!this.cancellationExpired(flight) && !MaintenanceBudget.current()?.signal.aborted) throw error;
       flight.preserveRecoveryClone = true;
       flight.preserveSession = true;

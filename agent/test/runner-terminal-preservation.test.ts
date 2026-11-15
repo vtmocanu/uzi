@@ -2,6 +2,7 @@ import { installSourcePublicationContext } from "./publication-fixture.js";
 import { describe, it, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { fixture as codexReapFixture } from "./codex-reap-fixture.js";
@@ -767,6 +768,7 @@ describe("terminal preservation through a full execute", { concurrency: false },
       assert.equal(forwarded.length, 1, "exactly the lane's call carries a deadline");
       const at = (forwarded[0]![3] as { deadlineAt: number }).deadlineAt;
       assert.ok(at > Date.now() - 600_000 && at <= Date.now() + 130_000, "an absolute epoch-ms deadline within the lane cap");
+      assert.ok((forwarded[0]![3] as { stop?: { signal?: unknown } }).stop?.signal instanceof AbortSignal, "the lane's abort signal rides along as the sink-gate stop");
     });
 
     it(`${harness}: the reap-body lane call carries the boundary deadline${codex ? " and the permit signal" : ""}`, async t => {
@@ -937,4 +939,68 @@ describe("terminal preservation adapter predicates (gate on, real RunRunner meth
       assert.equal(a.sends(), 0);
     });
   }
+});
+
+describe("terminal-preservation lane: snapshot cleanup bound and remnant (#4007)", () => {
+  /** A rig whose universe is the lane's own (a real clone dir and a fake git), so the lane builds the capture call itself. */
+  function snapRig(over: Partial<TerminalLaneEnv>, snap: unknown): { r: Rig; calls: Array<Record<string, unknown>>; logs: Array<[string, Record<string, unknown>]>; cleanup(): void } {
+    const clone = fs.mkdtempSync(path.join(os.tmpdir(), "lane-clone-"));
+    const st = fs.lstatSync(clone);
+    const calls: Array<Record<string, unknown>> = [];
+    const logs: Array<[string, Record<string, unknown>]> = [];
+    const r = rig({ env: over });
+    r.flight.worktreePath = clone;
+    r.env.hooks = { workerId: "w1", store: r.store, owner: fn => fn(), deps: { recheck: async () => undefined } };
+    r.env.git = {
+      listRunBares: async () => ["/bare"],
+      readInventoryCloneHeads: async () => ({
+        kind: "verified", foreignOwners: [],
+        clones: [{ clonePath: clone, head: A, identity: `${st.dev}:${st.ino}`, branch: "agent/issue-1" }],
+      }),
+      readTerminalAttribution: async () => ({
+        kind: "verified", journal: [], stoppedMarkers: [], protected: [], owedRoots: [],
+        attempts: [{ attemptId: "at1", clonePath: clone, branch: "agent/issue-1", state: "live" }],
+      }),
+      readTerminalCloneLocalRefs: async () => ({ ok: true }),
+      ancestry: async () => "ancestor",
+      captureTerminalSnapshot: async (_clone: string, opts: Record<string, unknown>) => { calls.push(opts); return snap; },
+    } as never;
+    r.env.recovery = { readTerminalRecords: async () => ({ kind: "records", records: [] }) } as never;
+    r.env.log = (step, fields) => { logs.push([step, fields]); };
+    return { r, calls, logs, cleanup: () => fs.rmSync(clone, { recursive: true, force: true }) };
+  }
+  const refused = { kind: "refused", reason: "x" };
+
+  it("passes cleanupBound from the permit deadline and the permit's own signal, not the window signal", async () => {
+    const permit = new AbortController();
+    const t0 = Date.now(); // the fake clock stays at or after the real one, so the universe's own wall-clock check never lapses
+    const s = snapRig({ now: () => t0, remainingMs: 60_000, signal: permit.signal }, refused);
+    try {
+      await preserveInLane(s.r.env, s.r.flight, body);
+      assert.equal(s.calls.length, 1);
+      const bound = s.calls[0]!.cleanupBound as { deadlineAt: number; signal?: AbortSignal };
+      assert.equal(bound.deadlineAt, t0 + 60_000);
+      assert.equal(bound.signal, permit.signal);
+      assert.notEqual(bound.signal, s.calls[0]!.signal, "the lane's own window signal is a different signal");
+    } finally { s.cleanup(); }
+  });
+
+  it("logs terminal_snapshot_remnant with the snapshot's remnant", async () => {
+    const remnant = { ref: "refs/uzi-terminal-local/x", expectedOid: A, state: "retained" };
+    const s = snapRig({}, { kind: "refused", reason: "x", remnant });
+    try {
+      await preserveInLane(s.r.env, s.r.flight, body);
+      assert.deepEqual(s.logs.filter(l => l[0] === "terminal_snapshot_remnant"), [["terminal_snapshot_remnant", { remnant }]]);
+    } finally { s.cleanup(); }
+  });
+
+  it("passes no cleanupBound without a permit remainder or signal, and logs no remnant", async () => {
+    const s = snapRig({}, refused);
+    try {
+      await preserveInLane(s.r.env, s.r.flight, body);
+      assert.equal(s.calls.length, 1);
+      assert.equal("cleanupBound" in s.calls[0]!, false);
+      assert.equal(s.logs.some(l => l[0] === "terminal_snapshot_remnant"), false);
+    } finally { s.cleanup(); }
+  });
 });

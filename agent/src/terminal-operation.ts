@@ -324,6 +324,10 @@ async function finalResult(deps: TerminalOperationDeps, record: TerminalOperatio
     // Head authority is run-wide: a block on any other generation of the run also withholds it.
     const run = await deps.store.runBlock(record.runId);
     if (run.kind !== "clear") return kept(run.reason);
+    // Re-check after the await, as the live path does: a failure or lapsed boundary during runBlock withholds head authority.
+    const blocked = deps.failureFirst();
+    if (blocked !== undefined) return kept(blocked);
+    if (!deps.boundaryValid()) return kept("boundary_lost");
     return { outcome, tip: record.tip, manifest: record.manifest };
   }
   return kept(record.closedReason ?? "closed");

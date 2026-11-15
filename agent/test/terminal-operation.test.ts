@@ -697,6 +697,23 @@ describe("terminal operation final authority", () => {
     assert.deepEqual((await readRec(real)).invocations.map(i => i.outcome), ["invoked", "published"]);
   });
 
+  for (const [label, flip, expected] of [
+    ["the boundary lapses", (h: H) => { h.boundary = false; }, { outcome: "kept", reason: "boundary_lost" }],
+    ["a failure latches", (h: H) => { h.failure = "secret_found"; }, { outcome: "kept", reason: "secret_found" }],
+  ] as const) {
+    it(`closed-record replay: ${label} while runBlock is pending returns no head authority`, async () => {
+      const coord = mkCoord(mkRoot());
+      const h = harness(coord);
+      assert.equal((await runTerminalOperation(h.deps, input())).outcome, "published");
+      const real = h.deps.store;
+      h.deps.store = { ...real, runBlock: async (id: string) => { const out = await real.runBlock(id); flip(h); return out; },
+        read: real.read.bind(real), create: real.create.bind(real), update: real.update.bind(real),
+        addLocalBlock: real.addLocalBlock.bind(real), invoke: real.invoke.bind(real) };
+      assert.deepEqual(await runTerminalOperation(h.deps, input()), expected);
+      assert.equal(h.sends.length, 1, "the replay never sends again");
+    });
+  }
+
   it("a boundary lost while invoke is in flight sends nothing, latches no block, and a later resume may send", async () => {
     let lapses = 1;
     const coord = mkCoord(mkRoot());

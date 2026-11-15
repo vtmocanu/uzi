@@ -78,7 +78,7 @@ export interface TerminalLaneEnv {
   remediationHold(sha: string): Promise<boolean>;
   ciHold(sha: string): Promise<"clear" | "blocked" | "unknown">;
   /** Direct quiescence proof (never a boundary); throws when not quiescent. Absent when the caller already proved it. */
-  quiesce?: (opts: { deadlineAt: number }) => Promise<void>;
+  quiesce?: (opts: { deadlineAt: number; signal: AbortSignal }) => Promise<void>;
   /** The caller's permit or abort signal, and the permit time left (undefined: unknown). */
   signal?: AbortSignal;
   remainingMs?: number;
@@ -137,6 +137,7 @@ async function run(env: TerminalLaneEnv, flight: TerminalLaneFlight, body: Termi
   const sub = permitMs === undefined ? cap : Math.min(cap, permitMs - reserve);
   if (!(sub > 0) || (permitMs !== undefined && sub < Math.min(TERMINAL_LANE_MIN_MS, cap))) return result(label, "kept", "deadline");
   const deadlineAt = env.now() + sub;
+  const permitDeadlineAt = permitMs === undefined ? undefined : env.now() + permitMs;
   const abort = new AbortController();
   const timer = setTimeout(() => abort.abort(), sub);
   timer.unref?.();
@@ -146,7 +147,7 @@ async function run(env: TerminalLaneEnv, flight: TerminalLaneFlight, body: Termi
     // Quiescence is proven directly (never through a boundary) before anything is read or written.
     let quiesced = env.quiesce === undefined;
     if (env.quiesce) {
-      try { await env.quiesce({ deadlineAt }); quiesced = true; } catch { return result(label, "kept", "not_quiescent"); }
+      try { await env.quiesce({ deadlineAt, signal: abort.signal }); quiesced = true; } catch { return result(label, "kept", "not_quiescent"); }
       // A proof that finished after the sub-deadline or a permit abort starts nothing: no store, universe or capture call.
       if (abort.signal.aborted || env.now() >= deadlineAt) return result(label, "kept", "deadline");
     }
@@ -177,7 +178,11 @@ async function run(env: TerminalLaneEnv, flight: TerminalLaneFlight, body: Termi
           runId: flight.runId, generation: flight.claimGeneration, deadlineMs: left(), signal: abort.signal, barePath,
           ...(env.workerTokenFile !== undefined ? { workerTokenFile: env.workerTokenFile } : {}),
           onPhase, reprove: async () => boundaryValid(),
+          // Cleanup after a lapsed window (at most 2 s, inside the reserve) never outlives the permit and stops on a permit abort.
+          ...(permitDeadlineAt !== undefined || env.signal
+            ? { cleanupBound: { deadlineAt: permitDeadlineAt ?? Infinity, ...(env.signal ? { signal: env.signal } : {}) } } : {}),
         });
+        if (snap.remnant) env.log("terminal_snapshot_remnant", { remnant: snap.remnant });
         if (snap.kind === "refused") return { kind: "refused", reason: snap.reason };
         // A clean tree transfers nothing, so the snapshot never reports a phase: the record is still written first.
         if (snap.kind === "clean") {
