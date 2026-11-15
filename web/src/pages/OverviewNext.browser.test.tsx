@@ -1582,6 +1582,15 @@ describe("OverviewNext Repos chip", () => {
       expect(within(dialog).getByText("org/disabled")).toBeTruthy();
       expect(within(dialog).getByText(/never ran/)).toBeTruthy();
       const r = dialog.getBoundingClientRect();
+      if (width === 641 || width === 650) {
+        // Wrapped desktop header: RepoChip switches the shared shell to left alignment.
+        // Measuring only viewport containment can miss a panel that drifts while still fitting.
+        expect.soft(Math.abs(r.left - chip.parentElement!.getBoundingClientRect().left), "left-aligned to the chip").toBeLessThanOrEqual(1);
+      }
+      if (width === 400) {
+        expect.soft(Math.abs(r.left - 16), "phone sheet left inset").toBeLessThanOrEqual(1);
+        expect.soft(Math.abs(r.right - 384), "phone sheet right inset").toBeLessThanOrEqual(1);
+      }
       expect.soft(r.left, "dialog left").toBeGreaterThanOrEqual(0);
       expect.soft(r.top, "dialog top").toBeGreaterThanOrEqual(0);
       expect.soft(r.right, "dialog right").toBeLessThanOrEqual(window.innerWidth);
