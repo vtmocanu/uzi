@@ -263,6 +263,47 @@ describe("IssueView — the forge title and description carry no format characte
   });
 });
 
+describe("IssueView run history — closed retained recovery detail", () => {
+  it.each(["source_end_declined", "private-unknown-detail", null, undefined] as const)(
+    "renders RunHistoryRow detail %s without exposing unknown values",
+    async detail => {
+      setAuth();
+      mockApi.getIssue.mockResolvedValue({ issue: anIssue() });
+      mockApi.listRuns.mockResolvedValue({
+        runs: [aRunItem({
+          status: "recovery_wait",
+          recovery_wait_cause: "retained_recovery_adoption_failed",
+          // Exercise a newer server's unknown value at the API boundary.
+          recovery_wait_detail: detail as RunListItem["recovery_wait_detail"],
+          recovery_retry_not_before: "2099-01-01T00:00:00Z",
+        })],
+      });
+      renderIssueView();
+      const link = await screen.findByRole("link", { name: "view →" });
+      expect(link.getAttribute("href")).toBe("/runs/run-1");
+      const row = link.closest("li");
+      expect(row).not.toBeNull();
+      const history = within(row!);
+      if (detail === "source_end_declined") {
+        expect(history.getByText("source-use end declined")).toBeTruthy();
+        const guidance = history.getByTitle(/earlier flight declined source-use end/).getAttribute("title")!;
+        expect(guidance).toContain("unchanged worker registration is refused (409)");
+        expect(guidance).toContain("different worker registration only enables a guarded attempt");
+        expect(guidance).toContain("verified backup");
+        expect(guidance).toContain("Only the run owner");
+        expect(guidance).toContain("Cancel remains available");
+        expect(guidance).toContain("no scheduled retry");
+      } else {
+        expect(history.getByText("retained recovery integrity hold")).toBeTruthy();
+        expect(history.queryByTitle(/earlier flight declined source-use end/)).toBeNull();
+      }
+      expect(row!.textContent).not.toContain("private-unknown-detail");
+      expect(row!.outerHTML).not.toContain("private-unknown-detail");
+      expect(row!.textContent).not.toContain("2099");
+    },
+  );
+});
+
 // issue #1486: a run-history row's MR/PR link is reconstructed from the issue's project
 // URL when the run has no persisted mr_web_url, and that reconstruction must be
 // forge-aware. A github issue + github run must produce a /pull/<n> link, not GitLab's

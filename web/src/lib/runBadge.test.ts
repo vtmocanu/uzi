@@ -1756,7 +1756,7 @@ describe("non-completion holds (fixtures/hold-reasons/presentation.json)", () =>
   });
 });
 
-it.each(["source_end_declined", "private-unknown-detail", null] as const)("history badge renders only closed source-end detail %s", detail => {
+it.each(["source_end_declined", "private-unknown-detail", null] as const)("board badge renders only closed source-end detail %s", detail => {
   const input = { ...run({ status: "recovery_wait" }), recovery_wait_cause: "retained_recovery_adoption_failed", recovery_wait_detail: detail, recovery_retry_not_before: "2099-01-01T00:00:00Z" };
   const badge = runBadge(input as unknown as Parameters<typeof runBadge>[0], NOW);
   expect(badge.kind).toBe("badge");

@@ -92,6 +92,10 @@ func recoveryDecisionLine(r apitypes.RunDTO) string {
 		// Issue #4177: the server refuses Resume (409) for this detail, so the CLI never offers it.
 		return state + guidance + " · Cancel: uzi run cancel " + cellText(r.ID) + " (terminal)"
 	}
+	if strOr(r.RecoveryWaitCause, "") == retainedRecoveryAdoptionFailedCause && adoptionFailedDetail(r) == recoveryDetailSourceEndDeclined {
+		return state + guidance + " · Only after a different worker registration, owner guarded attempt: uzi run resume " + cellText(r.ID) +
+			"; Cancel remains available: uzi run cancel " + cellText(r.ID) + " (terminal)"
+	}
 	return state + guidance + " · owner Resume now: uzi run resume " + cellText(r.ID) +
 		"; Cancel: uzi run cancel " + cellText(r.ID) + " (terminal)" +
 		" · Resume requests an attempt; success is not assured · source/archive availability and latest edits unverified"
@@ -152,6 +156,14 @@ func recoveryDecisionTUILines(r apitypes.RunDTO) []string {
 		lines = append(lines, guidance...)
 		if secretRemediationActiveDetail(r) {
 			lines = append(lines, "Cancel: uzi run cancel "+cellText(r.ID)+" (terminal)")
+			return append(lines, workerExhaustionEvidence(r)...)
+		}
+		if adoptionFailedDetail(r) == recoveryDetailSourceEndDeclined {
+			lines = append(lines,
+				"Only after a different worker registration:",
+				"Owner guarded attempt: uzi run resume "+cellText(r.ID),
+				"Cancel remains available: uzi run cancel "+cellText(r.ID)+" (terminal)",
+			)
 			return append(lines, workerExhaustionEvidence(r)...)
 		}
 		lines = append(lines,

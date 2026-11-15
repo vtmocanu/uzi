@@ -262,7 +262,8 @@ const PARK_LABELS = {
 // today's park wording"). It folds through effectiveRunStatus so a credential or
 // completion hold (raw status "paused") and an exhausted recovery read as they do on the
 // status pill. An unlisted status falls back to its de-underscored enum, never "".
-export function parkLabel(run: Parameters<typeof effectiveRunStatus>[0]): string {
+export function parkLabel(run: Parameters<typeof effectiveRunStatus>[0] & Pick<Run, "recovery_wait_detail">): string {
+  if (run.status === "recovery_wait" && run.recovery_wait_cause === "retained_recovery_adoption_failed" && run.recovery_wait_detail === "source_end_declined") return "source-use end declined";
   const disk = diskWaitLabel(run);
   if (disk) return disk;
   const forge = forgeWaitLabel(run);

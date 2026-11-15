@@ -4138,7 +4138,10 @@ export interface Run {
    *  rate_limit_type. */
   recovery_wait_cause: string | null;
   /** Issue #4177: closed-set classification of a `retained_recovery_adoption_failed` hold,
-   *  set only for status `recovery_wait` with that cause. "secret_remediation_active": the
+   *  set only for status `recovery_wait` with that cause. "source_end_declined": an earlier
+   *  flight declined source-use end; Resume with unchanged worker registration is refused (409).
+   *  Only after a different registration can the owner request a guarded attempt; Cancel remains
+   *  available. This does not establish source usability. "secret_remediation_active": the
    *  retained source is held under an active secret-scan remediation, so Resume cannot succeed
    *  unchanged (the server refuses it with a 409). "remediation_proof_unknown": the remediation
    *  proof could not be verified; a retry may help. Null, absent or any other value selects the

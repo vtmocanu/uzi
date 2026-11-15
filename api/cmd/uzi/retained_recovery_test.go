@@ -660,7 +660,10 @@ func TestSourceEndDeclinedConsumers(t *testing.T) {
 				}
 				copy := out + errout
 				if detail == "source_end_declined" {
-					requireWorkerCopy(t, copy, "earlier flight declined source-use end", "unchanged worker registration", "409", "guarded attempt", "verified backup", "uzi run cancel r1", "no automatic resume")
+					requireWorkerCopy(t, copy, "earlier flight declined source-use end", "unchanged worker registration", "409", "guarded attempt", "verified backup", "uzi run cancel r1", "no automatic resume", "Only after a different worker registration")
+					if strings.Contains(copy, "owner Resume now") {
+						t.Fatalf("unqualified Resume invitation: %s", copy)
+					}
 				} else {
 					requireWorkerCopy(t, copy, "another recovery episode")
 					if strings.Contains(copy, detail) {
@@ -680,5 +683,9 @@ func TestSourceEndDeclinedConsumers(t *testing.T) {
 	m = applyDetail(m, r, nil)
 	m = step(m, tea.ColorProfileMsg{Profile: colorprofile.Ascii})
 	m = step(m, tea.WindowSizeMsg{Width: 100, Height: 100})
-	requireWorkerCopy(t, stripANSI(m.View().Content), "earlier flight declined source-use end", "Resume refused (409)", "guarded attempt", "verify a backup first", "uzi run cancel r1")
+	view := stripANSI(m.View().Content)
+	requireWorkerCopy(t, view, "earlier flight declined source-use end", "Resume refused (409)", "guarded attempt", "verify a backup first", "uzi run cancel r1", "Only after a different worker registration")
+	if strings.Contains(view, "Owner Resume or Cancel:") || strings.Contains(view, "Resume: uzi run resume") {
+		t.Fatalf("unqualified TUI Resume invitation: %s", view)
+	}
 }
