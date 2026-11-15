@@ -2,6 +2,8 @@ package pushbroker_test
 
 import (
 	"context"
+	"encoding/json"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -70,6 +72,45 @@ func prereqGitFailure(t *testing.T, dir string, args ...string) string {
 		t.Fatalf("git %v unexpectedly succeeded: %s", args, out)
 	}
 	return string(out)
+}
+
+// A fetch of the prerequisite bundle must not leave detached Git maintenance
+// writing into a clone that t.TempDir removes as soon as the test returns.
+func TestPrereqRestoreFetchDoesNotDetachMaintenance(t *testing.T) {
+	x := newPrereqBundleFixture(t, false)
+	clone := x.cleanClone(t)
+	trace := filepath.Join(t.TempDir(), "fetch.trace")
+	cmd := exec.Command("git", "-C", clone, "fetch", x.bundle, "HEAD:refs/heads/restored") //nolint:gosec // Fixture-owned paths and literal Git arguments.
+	cmd.Env = append(cleanGitEnv(), "GIT_TRACE2_EVENT="+trace)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("fetch prerequisite bundle: %v\n%s", err, out)
+	}
+	data, err := os.ReadFile(trace)
+	if err != nil {
+		t.Fatalf("read Git trace: %v", err)
+	}
+	var sawFetch bool
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		var event struct {
+			Event string   `json:"event"`
+			Name  string   `json:"name"`
+			Argv  []string `json:"argv"`
+		}
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			t.Fatalf("parse Git trace: %v", err)
+		}
+		if event.Event == "cmd_name" && event.Name == "fetch" {
+			sawFetch = true
+		}
+		if event.Event == "child_start" && len(event.Argv) >= 5 &&
+			event.Argv[1] == "maintenance" && event.Argv[2] == "run" &&
+			event.Argv[len(event.Argv)-1] == "--detach" {
+			t.Fatalf("fixture fetch started detached Git maintenance: %v", event.Argv)
+		}
+	}
+	if !sawFetch {
+		t.Fatal("Git trace did not record the fixture fetch")
+	}
 }
 
 func TestPrereqNativeBundleRestore(t *testing.T) {
