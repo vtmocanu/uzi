@@ -244,7 +244,8 @@ function mountApp(start: string) {
         <Where />
         <Routes>
           <Route path="/start" element={<p>start page</p>} />
-          <Route path="/workers" element={pageFor("/workers")} />
+          <Route path="/tall" element={<div data-testid="tall" style={{ height: 4000 }}>tall start page</div>} />
+          <Route path="/workers"element={pageFor("/workers")} />
           <Route path="/admin/settings" element={pageFor("/admin/settings")} />
           <Route path="/docs/:slug" element={pageFor("/docs/:slug")} />
         </Routes>
@@ -301,6 +302,17 @@ describe("command menu reveals in a real browser (#4373)", () => {
     expect(document.documentElement.scrollHeight).toBeGreaterThan(window.innerHeight);
     expect(window.scrollY).toBe(0);
     expect(screen.getByTestId("where").textContent).toBe("/admin/settings#maintenance");
+  });
+
+  it("a failed settings load resets a scrolled page to the top", async () => {
+    mockApi.getSettings.mockRejectedValue(new Error("settings exploded"));
+    mountApp("/tall");
+    await vi.waitFor(() => expect(screen.queryByTestId("tall")).not.toBeNull());
+    window.scrollTo(0, 400);
+    await vi.waitFor(() => expect(window.scrollY).toBeGreaterThan(0));
+    await chooseFromMenu("slack", "Admin › Settings › Slack");
+    expect(await screen.findByText(/settings exploded|Failed to load settings/)).toBeTruthy();
+    await vi.waitFor(() => expect(window.scrollY).toBe(0));
   });
 
   it("Enter on a worker leaves its row focused", async () => {

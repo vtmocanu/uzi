@@ -9,6 +9,7 @@ import * as built from "./commandMenuItems";
 import { api, type AgentTemplate, type Repo, type RunSummaryItem, type Schedule, type Skill, type Worker } from "../lib/api";
 import { docsForIndex } from "../lib/docs";
 import { setDemoMode } from "../lib/demoMode";
+import { visibleSectionItems } from "./navSections";
 import type { DocHeading } from "../lib/docHeadingsPipeline";
 
 vi.mock("../lib/api", () => ({
@@ -97,7 +98,8 @@ function mount(isAdmin = false) {
 
 const flush = () => act(async () => void (await new Promise((r) => setTimeout(r, 0))));
 const input = () => screen.getByRole("combobox");
-const labels = () => screen.queryAllByRole("option").map((o) => o.querySelector("span.truncate")?.textContent ?? "");
+const labelOf = (o: HTMLElement) => o.querySelector("span.truncate")?.textContent ?? "";
+const labels = () => screen.queryAllByRole("option").map(labelOf);
 const optionFor = (label: string) =>
   screen.queryAllByRole("option").find((o) => o.querySelector("span.truncate")?.textContent === label);
 const here = () => screen.getByTestId("loc").textContent;
@@ -276,6 +278,49 @@ describe("overflow", () => {
     expect(note.closest('[role="listbox"]')).toBeNull();
     expect(note.getAttribute("role")).toBeNull();
     expect(within(screen.getByRole("dialog")).getByRole("status").textContent).toContain("+2 more workers");
+  });
+
+  // Seven matches per group: two prefix matches seeded LAST and five substring matches
+  // seeded first, so only a ranked cap keeps the prefix ones. Every capped group is here.
+  const hintOf = (o: HTMLElement) => o.querySelector("span.ml-auto")?.textContent ?? "";
+  const names = ["xkestrel-0", "xkestrel-1", "xkestrel-2", "xkestrel-3", "xkestrel-4", "kestrel-5", "kestrel-6"];
+  const keptNames = ["kestrel-5", "kestrel-6", "xkestrel-0", "xkestrel-1", "xkestrel-2"];
+  const docTitle = userDoc.meta.title;
+  const rankedCases: [string, string, string, (n: string) => string, () => void][] = [
+    ["agents", "Agent", "agents", (n) => n, () =>
+      mockApi.listAgentTemplates.mockResolvedValue({ templates: names.map((n, i) => agent(`a${i}`, n)) })],
+    ["schedules", "Schedule", "schedules", (n) => n, () =>
+      mockApi.listSchedules.mockResolvedValue(
+        names.map((n, i) => schedule({ id: `s${i}`, origin: "default", catalog_slug: n, repo_path: "" })),
+      )],
+    ["workers", "Worker", "workers", (n) => n, () =>
+      mockApi.listWorkers.mockResolvedValue({ workers: names.map((n, i) => worker(`w${i}`, n)) })],
+    ["skills", "Skill", "skills", (n) => n, () =>
+      mockApi.listSkills.mockResolvedValue({ skills: names.map((n, i) => skill(`k${i}`, n)) })],
+    ["runs", "Recent runs", "recent runs", (n) => n, () =>
+      listRunsMock.mockResolvedValue({ runs: names.map((n, i) => run({ id: `r${i}`, title: n })) })],
+    ["docs", "Doc section", "docs", (n) => `${docTitle} › ${n}`, () =>
+      mocks.headingsFor.mockImplementation((slug: string): DocHeading[] =>
+        slug === userDoc.slug ? names.map((n, i) => ({ depth: 2, text: n, id: `h${i}` })) : [],
+      )],
+  ];
+
+  it.each(rankedCases)("caps %s at 5 best matches and counts the rest", async (_g, hint, plural, label, seed) => {
+    seed();
+    await search("kestrel");
+    const rows = screen.getAllByRole("option").filter((o) => hintOf(o) === hint);
+    expect(rows.map(labelOf)).toEqual(keptNames.map(label));
+    expect(screen.getByText(`+2 more ${plural}`)).toBeTruthy();
+  });
+
+  it("caps sections at 5 in order and counts the rest", async () => {
+    const q = "admin › settings";
+    const matching = visibleSectionItems(true).filter((i) => i.label.toLowerCase().includes(q));
+    expect(matching.length).toBeGreaterThan(6);
+    await search(q, true);
+    const rows = screen.getAllByRole("option").filter((o) => hintOf(o) === "Admin");
+    expect(rows.map(labelOf)).toEqual(matching.slice(0, 5).map((i) => i.label));
+    expect(screen.getByText(`+${matching.length - 5} more sections`)).toBeTruthy();
   });
 
   it("joins several overflow counts", async () => {

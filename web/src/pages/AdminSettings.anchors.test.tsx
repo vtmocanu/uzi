@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useNavigate } from "react-router-dom";
 import { AdminSettings } from "./AdminSettings";
 import { healthySilentDoc } from "../mocks/data/health";
 import { api } from "../lib/api";
@@ -126,6 +126,11 @@ afterEach(() => {
   else Reflect.deleteProperty(HTMLElement.prototype, "scrollIntoView");
 });
 
+function GoTo({ to }: { to: string }) {
+  const navigate = useNavigate();
+  return <button onClick={() => navigate(to)}>go</button>;
+}
+
 function renderAt(hash: string) {
   return render(
     <MemoryRouter initialEntries={[`/admin/settings${hash}`]}>
@@ -184,6 +189,38 @@ describe("AdminSettings anchors", () => {
     await waitFor(() => expect(document.getElementById("sso")).not.toBeNull());
     await act(async () => {});
     expect(scroll).not.toHaveBeenCalledWith({ block: "start" });
+  });
+
+  it("re-scrolls when the same section is chosen again", async () => {
+    render(
+      <MemoryRouter initialEntries={["/admin/settings#slack"]}>
+        <GoTo to="/admin/settings#slack" />
+        <AdminSettings />
+      </MemoryRouter>,
+    );
+    const el = await waitFor(() => {
+      const found = document.getElementById("slack");
+      expect(found).not.toBeNull();
+      return found!;
+    });
+    await waitFor(() => expect(scroll.mock.contexts).toContain(el));
+    const startCalls = () => scroll.mock.calls.filter((c, i) => c[0]?.block === "start" && scroll.mock.contexts[i] === el).length;
+    expect(startCalls()).toBe(1);
+    fireEvent.click(screen.getByRole("button", { name: "go" }));
+    await waitFor(() => expect(startCalls()).toBe(2));
+  });
+
+  it("resets to the top when an advertised anchor's load fails", async () => {
+    const scrollTo = vi.fn();
+    vi.stubGlobal("scrollTo", scrollTo);
+    try {
+      mockApi.getSettings.mockRejectedValue(new Error("boom"));
+      renderAt("#slack");
+      await screen.findByText(/boom|Failed to load settings/);
+      await waitFor(() => expect(scrollTo).toHaveBeenCalledWith(0, 0));
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it("does not re-scroll to the hash after a card save", async () => {
