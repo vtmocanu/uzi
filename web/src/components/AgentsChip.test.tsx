@@ -18,6 +18,7 @@ const model: AgentSourceChipModel = {
   ],
   suffix: null,
   sourceMeta: null,
+  sourceAppliedSha: null,
   sourceNotice: null,
   reviewInSettings: false,
 };
@@ -58,10 +59,11 @@ describe("AgentsChip", () => {
 
   it("shows sanitized metadata in text and title and routes attention to Settings", () => {
     const meta = "https://forge.example.com@demo-ref, synced 2h ago";
-    mount({ ...model, suffix: { text: "sync failed", tone: "danger" }, sourceMeta: meta, sourceNotice: "The last agent-source sync failed.", reviewInSettings: true });
+    mount({ ...model, suffix: { text: "sync failed", tone: "danger" }, sourceMeta: meta, sourceAppliedSha: "a1b2c3d", sourceNotice: "The last agent-source sync failed.", reviewInSettings: true });
     fireEvent.click(chip());
-    const text = screen.getByText(meta);
-    expect(text.getAttribute("title")).toBe(meta);
+    const text = screen.getByText(meta).closest("p")!;
+    expect(text.getAttribute("title")).toBe(`${meta}, (a1b2c3d)`);
+    expect(screen.getByText(/a1b2c3d/).className).toContain("whitespace-nowrap");
     expect(screen.getByText("The last agent-source sync failed.")).toBeTruthy();
     expect(screen.getByRole("link", { name: "Review in Settings" }).getAttribute("href")).toBe("/admin/settings#agent-source");
   });
@@ -73,7 +75,7 @@ describe("AgentsChip", () => {
     const build = (demo: boolean) => agentSourceChipModel([], { viewerId: "owner", isAdmin: true, source, demo, now: Date.now() });
     const { unmount } = mount(build(false));
     fireEvent.click(chip());
-    const normal = screen.getByText(build(false).sourceMeta!);
+    const normal = screen.getByText(build(false).sourceMeta!).closest("p")!;
     expect(normal.textContent).not.toContain("\u202e");
     expect(normal.textContent).not.toContain("\u0007");
     expect(normal.getAttribute("title")).not.toContain("\u202e");
@@ -81,7 +83,7 @@ describe("AgentsChip", () => {
     unmount();
     mount(build(true));
     fireEvent.click(chip());
-    const demo = screen.getByText(build(true).sourceMeta!);
+    const demo = screen.getByText(build(true).sourceMeta!).closest("p")!;
     expect(demo.textContent).toContain("https://forge.example.com@demo-ref");
     expect(demo.textContent).not.toContain("private");
     expect(demo.getAttribute("title")).toContain("https://forge.example.com@demo-ref");
@@ -92,6 +94,15 @@ describe("AgentsChip", () => {
     fireEvent.click(chip());
     expect(screen.queryByText(/forge\.example\.com|sync failed|review pending/)).toBeNull();
     expect(screen.queryByRole("link", { name: "Review in Settings" })).toBeNull();
+  });
+
+  it("closes the popover when its footer link is used", () => {
+    mount();
+    fireEvent.click(chip());
+    const link = screen.getByRole("link", { name: "Manage agents" });
+    expect(link.getAttribute("href")).toBe("/agents");
+    fireEvent.click(link);
+    expect(screen.queryByRole("dialog", { name: "Agents configured" })).toBeNull();
   });
 
   it("closes on Escape and an outside click, restoring focus to the chip", () => {

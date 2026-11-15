@@ -1210,7 +1210,8 @@ describe("OverviewNext Agents chip", () => {
     expect(within(dialog).getByRole("heading", { name: "5 agents configured" })).toBeTruthy();
     expect(within(dialog).getByText("mine")).toBeTruthy();
     expect(within(dialog).queryByText("theirs")).toBeNull();
-    expect(within(dialog).queryByText("Agent source")).toBeNull();
+    expect(within(dialog).queryByText("From your agent source")).toBeNull();
+    expect(agentsChip().textContent).toBe("5 agents");
   });
 
   it("shows the admin-only source status and review action", async () => {

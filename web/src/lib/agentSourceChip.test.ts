@@ -56,11 +56,16 @@ describe("agentSourceChipModel", () => {
     expect(all.reviewInSettings).toBe(true);
     const review = agentSourceChipModel([], { ...options, source: { ...source, status: { ...source.status, update_available: true }, staged: pending } });
     expect(review.suffix).toEqual({ text: "3 changes to review", tone: "warn" });
+    const single = agentSourceChipModel([], { ...options, source: { ...source, staged: { ...pending, counts: { ...pending.counts, changed: 1 } } } });
+    expect(single.suffix?.text).toBe("1 change to review");
     const zero = agentSourceChipModel([], { ...options, source: { ...source, staged: { ...pending, counts: { ...pending.counts, changed: 0 } } } });
     expect(zero.suffix?.text).toBe("review pending");
     const update = agentSourceChipModel([], { ...options, source: { ...source, status: { ...source.status, update_available: true } } });
     expect(update.suffix?.text).toBe("update available");
-    expect(agentSourceChipModel([], options).suffix).toEqual({ text: "synced", tone: "muted" });
+    expect(update.reviewInSettings).toBe(true);
+    const synced = agentSourceChipModel([], options);
+    expect(synced.suffix).toEqual({ text: "synced", tone: "muted" });
+    expect(synced.reviewInSettings).toBe(false);
     expect(agentSourceChipModel([], { ...options, source: { ...source, status: {} } }).suffix).toBeNull();
   });
 
@@ -74,6 +79,7 @@ describe("agentSourceChipModel", () => {
       expect(model.total).toBe(1);
       expect(model.suffix).toBeNull();
       expect(model.sourceMeta).toBeNull();
+    expect(model.sourceAppliedSha).toBeNull();
       expect(model.reviewInSettings).toBe(false);
     }
   });
@@ -89,5 +95,11 @@ describe("agentSourceChipModel", () => {
     expect(demo).not.toContain("acme");
     expect(demo).not.toContain("\u202e");
     expect(demo).not.toContain("\u0007");
+  });
+
+  it("names only the seven-character applied commit, never an unapplied sync tip", () => {
+    expect(agentSourceChipModel([], options).sourceAppliedSha).toBe("a1b2c3d");
+    const withoutApply = { ...source, status: { ...source.status, last_applied_sha: undefined, last_sync_sha: "unapplied123" } };
+    expect(agentSourceChipModel([], { ...options, source: withoutApply }).sourceAppliedSha).toBeNull();
   });
 });

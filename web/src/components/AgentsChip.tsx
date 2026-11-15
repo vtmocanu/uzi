@@ -18,10 +18,11 @@ const SUFFIX_TONE = {
 
 export function AgentsChip({ model }: { model: AgentSourceChipModel }) {
   const { open, setOpen, hostRef, panelRef, triggerRef, panelId, close } = useChipPopover();
-  const { total, groups, suffix, sourceMeta, sourceNotice, reviewInSettings } = model;
+  const { total, groups, suffix, sourceMeta, sourceAppliedSha, sourceNotice, reviewInSettings } = model;
+  const sourceTitle = [sourceMeta, sourceAppliedSha && `(${sourceAppliedSha})`].filter(Boolean).join(", ");
   const displayGroups = groups.some((group) => group.key === "source")
     ? groups
-    : sourceMeta || sourceNotice
+    : sourceMeta || sourceAppliedSha || sourceNotice
       ? [{ key: "source" as const, label: "From your agent source", agents: [] }, ...groups]
       : groups;
 
@@ -61,7 +62,12 @@ export function AgentsChip({ model }: { model: AgentSourceChipModel }) {
             {displayGroups.map((group) => (
               <div key={group.key}>
                 <p className="mb-1 text-[11px] font-medium uppercase tracking-wide text-faint">{group.label}</p>
-                {group.key === "source" && sourceMeta && <p className="break-all text-xs text-muted" title={sourceMeta}>{sourceMeta}</p>}
+                {group.key === "source" && sourceTitle && (
+                  <p className="text-xs text-muted" title={sourceTitle}>
+                    {sourceMeta && <span className="break-all">{sourceMeta}</span>}
+                    {sourceAppliedSha && <span className="whitespace-nowrap">{sourceMeta ? ", " : ""}({sourceAppliedSha})</span>}
+                  </p>
+                )}
                 {group.key === "source" && sourceNotice && <p className={`mt-1 text-xs ${suffix ? SUFFIX_TONE[suffix.tone] : "text-muted"}`}>{sourceNotice}</p>}
                 {group.agents.length > 0 && (
                   <ul className="mt-1 space-y-1.5">

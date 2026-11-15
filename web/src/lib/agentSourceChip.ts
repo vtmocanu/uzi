@@ -20,6 +20,7 @@ export interface AgentSourceChipModel {
   groups: AgentSourceChipGroup[];
   suffix: { text: string; tone: "danger" | "warn" | "muted" } | null;
   sourceMeta: string | null;
+  sourceAppliedSha: string | null;
   sourceNotice: string | null;
   reviewInSettings: boolean;
 }
@@ -59,7 +60,7 @@ export function agentSourceChipModel(
     sourceNotice = "The last agent-source sync failed.";
   } else if (source?.staged?.pending) {
     const changed = source.staged.counts.changed;
-    suffix = { text: changed > 0 ? `${changed} changes to review` : "review pending", tone: "warn" };
+    suffix = { text: changed > 0 ? `${changed} ${changed === 1 ? "change" : "changes"} to review` : "review pending", tone: "warn" };
     sourceNotice = changed > 0
       ? `A fetched snapshot is waiting for review: ${changed} ${changed === 1 ? "change" : "changes"}.`
       : "A fetched snapshot is waiting for review.";
@@ -71,14 +72,16 @@ export function agentSourceChipModel(
   }
 
   let sourceMeta: string | null = null;
+  let sourceAppliedSha: string | null = null;
   if (source) {
     const url = stripUnsafeChars(maskHost(source.config.url, opts.demo));
     const ref = opts.demo ? "demo-ref" : stripUnsafeChars(source.config.ref);
     const target = [url, ref].filter(Boolean).join("@");
     const stamp = source.status.last_sync_at;
     const age = stamp && Number.isFinite(Date.parse(stamp)) ? `synced ${formatAgo(stamp, opts.now)}` : "";
-    const sha = stripUnsafeChars(source.status.last_applied_sha ?? source.status.last_sync_sha ?? "").slice(0, 8);
-    sourceMeta = [target, age, sha && `(${sha})`].filter(Boolean).join(", ") || null;
+    // This names the commit in force, never the latest fetched or unapplied commit.
+    sourceAppliedSha = stripUnsafeChars(source.status.last_applied_sha ?? "").slice(0, 7) || null;
+    sourceMeta = [target, age].filter(Boolean).join(", ") || null;
   }
 
   return {
@@ -86,6 +89,7 @@ export function agentSourceChipModel(
     groups,
     suffix,
     sourceMeta,
+    sourceAppliedSha,
     sourceNotice,
     reviewInSettings: suffix?.tone === "danger" || suffix?.tone === "warn",
   };
