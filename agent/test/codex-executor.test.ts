@@ -33007,9 +33007,12 @@ describe("M2 actualRunner credential replacement", () => {
                       recoveryBodies, recoveryFactories, releases: releases.length, logs: recoveryLog.lines.slice(-12) }), { cause: error });
                   });
                 } finally {
-                  recoveryRunner.shutdown();
-                  await recoveryFlight;
-                  readinessProbe.mock.restore();
+                  try {
+                    recoveryRunner.shutdown();
+                    await recoveryFlight;
+                  } finally {
+                    readinessProbe.mock.restore();
+                  }
                 }
                 assert.ok(readinessLaunches > 0);
                 assert.equal(readinessWaits, readinessLaunches);
