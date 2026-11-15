@@ -553,6 +553,86 @@ describe("buildTerminalAggregate", () => {
     assert.deepEqual(await f.git.buildTerminalAggregate(f.bare, { base, extraRoots: ["1".repeat(40)], runId: "run-1", generation: 2 }), { refused: "root_missing" });
   });
 
+  // Link commits carry "uzi terminal aggregate <run> g<gen> link <i>"; list every commit in the bare (reachable or not) that does.
+  function linkCommits(bare: string, runId: string): string[] {
+    const shas = run(bare, "cat-file", "--batch-all-objects", "--batch-check=%(objectname) %(objecttype)")
+      .split("\n").filter((l) => l.endsWith(" commit")).map((l) => l.split(" ")[0]!);
+    return shas.filter((sha) => run(bare, "cat-file", "-p", sha).includes(`uzi terminal aggregate ${runId} `));
+  }
+  const settle = () => new Promise<void>((res) => setTimeout(res, 150));
+
+  test("a budgeted call aborted while queued behind the bare lock never runs: refused deadline, no link, no ref", async (t) => {
+    const f = await fixture(t);
+    const base = run(f.bare, "rev-parse", "HEAD");
+    const [r1, r2] = await roots(f, 2);
+    let release!: () => void;
+    const held = new Promise<void>((res) => { release = res; });
+    let holding!: () => void;
+    const holdStarted = new Promise<void>((res) => { holding = res; });
+    // The first call owns the lock until afterLink(0) resolves.
+    const first = f.git.buildTerminalAggregate(f.bare, {
+      base, extraRoots: [r1!, r2!], runId: "run-a", generation: 1,
+      seam: { afterLink: async () => { holding(); await held; } },
+    });
+    await holdStarted;
+    const ac = new AbortController();
+    const second = f.git.buildTerminalAggregate(f.bare, {
+      base, extraRoots: [r1!, r2!], runId: "run-b", generation: 3,
+      budget: { signal: ac.signal, deadline: Date.now() + 60_000 },
+    });
+    await settle();
+    ac.abort();
+    assert.deepEqual(await second, { refused: "deadline" });
+    release();
+    assert.ok("tip" in await first);
+    await settle();
+    assert.equal(run(f.bare, "for-each-ref", "refs/uzi-terminal-local/run-b/g3"), "", "no ref for the aborted waiter");
+    assert.deepEqual(linkCommits(f.bare, "run-b"), [], "the aborted waiter wrote no link commit, even after the lock released");
+  });
+
+  test("a budget abort between links refuses with deadline and pins no ref", async (t) => {
+    const f = await fixture(t);
+    const base = run(f.bare, "rev-parse", "HEAD");
+    const [r1, r2] = await roots(f, 2);
+    const ac = new AbortController();
+    const out = await f.git.buildTerminalAggregate(f.bare, {
+      base, extraRoots: [r1!, r2!], runId: "run-1", generation: 2,
+      budget: { signal: ac.signal, deadline: Date.now() + 60_000 },
+      seam: { afterLink: async (i) => { if (i === 0) ac.abort(); } },
+    });
+    assert.deepEqual(out, { refused: "deadline" });
+    assert.equal(run(f.bare, "for-each-ref", f.ref), "");
+    assert.equal(linkCommits(f.bare, "run-1").length, 1, "only link 0 was built before the abort, never link 1");
+  });
+
+  test("a budget that lapses before the pin refuses with deadline", async (t) => {
+    const f = await fixture(t);
+    const base = run(f.bare, "rev-parse", "HEAD");
+    const [r1] = await roots(f, 1);
+    const out = await f.git.buildTerminalAggregate(f.bare, {
+      base, extraRoots: [r1!], runId: "run-1", generation: 2,
+      budget: { signal: new AbortController().signal, deadline: Date.now() + 80 },
+      seam: { afterLink: async () => { await new Promise<void>((res) => setTimeout(res, 200)); } },
+    });
+    assert.deepEqual(out, { refused: "deadline" });
+    assert.equal(run(f.bare, "for-each-ref", f.ref), "");
+  });
+
+  test("a cooperative budget with time to spare builds and pins the same tip as no budget", async (t) => {
+    const f = await fixture(t);
+    const base = run(f.bare, "rev-parse", "HEAD");
+    const [r1, r2] = await roots(f, 2);
+    const plain = await f.git.buildTerminalAggregate(f.bare, { base, extraRoots: [r1!, r2!], runId: "run-1", generation: 2 });
+    run(f.bare, "update-ref", "-d", f.ref);
+    const out = await f.git.buildTerminalAggregate(f.bare, {
+      base, extraRoots: [r1!, r2!], runId: "run-1", generation: 2,
+      budget: { signal: new AbortController().signal, deadline: Date.now() + 60_000 },
+    });
+    assert.deepEqual(out, plain);
+    assert.ok("tip" in out);
+    if ("tip" in out) assert.equal(run(f.bare, "rev-parse", f.ref), out.tip);
+  });
+
   test("a pin that holds other work is a conflict", async (t) => {
     const f = await fixture(t);
     const base = run(f.bare, "rev-parse", "HEAD");

@@ -326,6 +326,38 @@ describe("terminal-preservation lane (#4007 slice B)", () => {
     assert.equal((await preserveInLane(r.env, r.flight, body)).outcome, "published");
   });
 
+  it("quiesce receives the lane's own sub-deadline", async () => {
+    let seen: { deadlineAt: number } | undefined;
+    const r = rig({ env: { remainingMs: 20_000, quiesce: async o => { seen = o; } } });
+    const before = Date.now();
+    await preserveInLane(r.env, r.flight, body);
+    assert.ok(seen, "quiesce got an options argument");
+    // sub = min(cap, permit - min(reserve, permit/4)); never later than now + the permit remainder.
+    assert.ok(seen.deadlineAt > before && seen.deadlineAt <= Date.now() + 20_000, `deadlineAt ${seen.deadlineAt - before} ms ahead`);
+  });
+
+  it("a quiesce that returns after the sub-deadline keeps the work: deadline, nothing read, captured or stored", async () => {
+    const r = rig({ env: { quiesce: async () => { await new Promise(res => setTimeout(res, 120)); } } });
+    r.env.hooks = { ...r.env.hooks!, capMs: 40, deps: { ...r.env.hooks!.deps!, universe: async () => { r.order.push("universe"); throw new Error("must not run"); } } };
+    const out = await preserveInLane(r.env, r.flight, body);
+    assert.equal(out.outcome, "kept");
+    assert.equal(out.reason, "deadline");
+    assert.deepEqual(r.order, []);
+    assert.equal(r.sends, 0);
+    assert.equal(r.store.record, undefined);
+  });
+
+  it("a permit abort during quiesce keeps the work: deadline, nothing read, captured or stored", async () => {
+    const permit = new AbortController();
+    const r = rig({ env: { signal: permit.signal, quiesce: async () => { permit.abort(); } } });
+    const out = await preserveInLane(r.env, r.flight, body);
+    assert.equal(out.outcome, "kept");
+    assert.equal(out.reason, "deadline");
+    assert.deepEqual(r.order, []);
+    assert.equal(r.sends, 0);
+    assert.equal(r.store.record, undefined);
+  });
+
   it("direct quiescence runs before capture; a failed proof keeps the work and sends nothing", async () => {
     const ok = rig();
     ok.env.quiesce = async () => { ok.order.push("quiesce"); };
@@ -444,6 +476,8 @@ interface Driven {
   sends: number;
   withBoundaryCalls: string[];
   quiesced: number;
+  /** Arguments of every quiesceOrBlockSink call, in order. */
+  quiesceArgs: unknown[][];
   order: string[];
   lane: unknown[];
   sites: Array<{ signal?: AbortSignal; deadlineAt?: number; at: number }>;
@@ -474,7 +508,7 @@ async function drive(t: TestContext, d: Drive = {}): Promise<Driven> {
     ...(kind === "mr_rework" ? ["refresh_publication_context_v1"] : [])]);
   const registration = await client.register("tp-lane", undefined, undefined, undefined, ["claim_generation_fence", "recovery_inventory_v1", feature]);
   const out: Driven = {
-    completed: [], failed: [], finalHead: "", sends: 0, withBoundaryCalls: [], quiesced: 0, order: [], lane: [], sites: [],
+    completed: [], failed: [], finalHead: "", sends: 0, withBoundaryCalls: [], quiesced: 0, quiesceArgs: [], order: [], lane: [], sites: [],
     serverReleases: 0, refusals: [], warnings: [], unwindSignal: undefined as never,
     custodyReleasedByWorker: () => !open, journal: async () => undefined, replay: async () => undefined,
   };
@@ -624,6 +658,7 @@ async function drive(t: TestContext, d: Drive = {}): Promise<Driven> {
   };
   await r.execute(claim);
   out.quiesced = quiesce.mock.callCount();
+  out.quiesceArgs = quiesce.mock.calls.map(c => [...c.arguments]);
   return out;
 }
 
@@ -703,6 +738,14 @@ describe("terminal preservation through a full execute", { concurrency: false },
       assert.deepEqual(statuses(), ["running", "running", "failed"]);
       assert.equal(on.quiesced, 2, "the reap already proved quiescence: no extra proof");
       assert.deepEqual(on.withBoundaryCalls, BOUNDARIES.failed[h]);
+    });
+
+    it(`${harness}: the lane's quiesce closure forwards its sub-deadline into quiesceOrBlockSink`, async t => {
+      const on = await drive(t, { codex });
+      const forwarded = on.quiesceArgs.filter(a => (a[3] as { deadlineAt?: number } | undefined)?.deadlineAt !== undefined);
+      assert.equal(forwarded.length, 1, "exactly the lane's call carries a deadline");
+      const at = (forwarded[0]![3] as { deadlineAt: number }).deadlineAt;
+      assert.ok(at > Date.now() - 600_000 && at <= Date.now() + 130_000, "an absolute epoch-ms deadline within the lane cap");
     });
 
     it(`${harness}: the reap-body lane call carries the boundary deadline${codex ? " and the permit signal" : ""}`, async t => {

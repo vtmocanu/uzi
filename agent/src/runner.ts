@@ -4182,7 +4182,7 @@ export class RunRunner {
       skip, failureFirst, policy: () => this.frozenHeldPolicy(flight),
       remediationHold: sha => this.checkpointRemediationHold(flight, flight.barePath!, sha, false),
       ciHold: sha => this.ciConfigGuardVerdict(flight, flight.barePath!, sha, "terminal preservation"),
-      ...(site.quiesce ? { quiesce: () => this.quiesceOrBlockSink(flight, flight.executor, site.site) } : {}),
+      ...(site.quiesce ? { quiesce: ({ deadlineAt }) => this.quiesceOrBlockSink(flight, flight.executor, site.site, { deadlineAt }) } : {}),
       ...(site.signal ? { signal: site.signal } : {}),
       ...(site.deadlineAt !== undefined ? { remainingMs: site.deadlineAt - Date.now() } : {}),
       log: (step, fields) => flight.runLog.info(`terminal preservation: ${step}`, { run_id: flight.runId, ...fields }),
@@ -18544,12 +18544,13 @@ export class RunRunner {
     flight: RunFlight,
     executor: Executor,
     site: string,
-    opts: { processOnly?: boolean; keepClone?: boolean } = {},
+    opts: { processOnly?: boolean; keepClone?: boolean; deadlineAt?: number } = {},
   ): Promise<void> {
     const q = await this.quiesceRun(flight, executor, {
       mode: "own",
       site: opts.processOnly ? `${site}:after_runner_git` : site,
       processOnly: opts.processOnly,
+      ...(opts.deadlineAt !== undefined ? { deadlineAt: opts.deadlineAt } : {}),
     });
     if (!q.blocked) return;
     // Keep the clone and its recovery journal: the terminal finally must not retire a tree a

@@ -21144,7 +21144,13 @@ try {
    */
   async buildTerminalAggregate(barePath: string, input: {
     base: string; extraRoots: string[]; runId: string; generation: number; existingMerges?: number;
+    /** Absolute `Date.now()` deadline and abort signal: child timeouts are clamped and killed, a queued lock wait forfeits
+     *  without running, and a lapse between links or before the pin refuses with `deadline` (no ref moves after it). */
+    budget?: { signal: AbortSignal; deadline: number };
+    /** Test-only: runs after each link commit (still under the lock), before the next budget check. */
+    seam?: { afterLink?: (i: number) => Promise<void> };
   }): Promise<{ tip: string } | { refused: string }> {
+    const budget = input.budget;
     const existing = input.existingMerges ?? 0;
     if (!SHA40_RE.test(input.base) || !Array.isArray(input.extraRoots) || !input.extraRoots.every((r) => SHA40_RE.test(r)) ||
         !TERMINAL_RUN_ID_RE.test(input.runId) || !Number.isSafeInteger(input.generation) || input.generation < 1 ||
@@ -21153,15 +21159,19 @@ try {
     if (roots.length === 0) return { tip: input.base };
     if (roots.length > TERMINAL_AGGREGATE_MAX_ROOTS || existing + roots.length > TERMINAL_AGGREGATE_MAX_MERGES) return { refused: "merge_budget" };
     const ref = `refs/uzi-terminal-local/${input.runId}/g${input.generation}`;
-    try {
-      return await this.withLock(barePath, async () => {
-        const kind = async (sha: string): Promise<string> =>
-          (await this.runGit(barePath, ["--no-replace-objects", "cat-file", "-t", sha]).catch(() => "")).trim();
+    const body = (): Promise<{ tip: string } | { refused: string }> => this.withLock(barePath, async () => {
+        const kind = async (sha: string): Promise<string> => {
+          const out = (await this.runGit(barePath, ["--no-replace-objects", "cat-file", "-t", sha]).catch(() => "")).trim();
+          // A budget abort or lapse that the catch swallowed must surface, not read as a missing root.
+          if (out === "" && budget) this.checkReportProof();
+          return out;
+        };
         for (const sha of [input.base, ...roots]) if (await kind(sha) !== "commit") return { refused: "root_missing" };
         const tree = (await this.runGit(barePath, ["--no-replace-objects", "rev-parse", `${input.base}^{tree}`])).trim();
         if (!SHA40_RE.test(tree)) return { refused: "tree_unreadable" };
         let tip = input.base;
         for (let i = 0; i < roots.length; i++) {
+          if (budget) this.checkReportProof();
           tip = (await this.runSynthesisGit(barePath, [
             "--no-replace-objects", "-c", "commit.gpgsign=false", "commit-tree", tree, "-p", tip, "-p", roots[i]!,
             "-m", `uzi terminal aggregate ${input.runId} g${input.generation} link ${i}`,
@@ -21171,15 +21181,24 @@ try {
             GIT_AUTHOR_DATE: "2000-01-01T00:00:00Z", GIT_COMMITTER_DATE: "2000-01-01T00:00:00Z",
           })).trim();
           if (!SHA40_RE.test(tip)) return { refused: "commit_unreadable" };
+          await input.seam?.afterLink?.(i);
+          if (budget) this.checkReportProof();
         }
+        if (budget) this.checkReportProof();
         const current = (await this.runGit(barePath, ["for-each-ref", "--format=%(objectname)", ref])).trim();
         if (current === tip) return { tip };
         if (current !== "" && current !== input.base) return { refused: "ref_conflict" };
         await this.runGit(barePath, ["update-ref", ref, tip, current === "" ? "" : current]);
         if ((await this.runGit(barePath, ["for-each-ref", "--format=%(objectname)", ref])).trim() !== tip) return { refused: "pin_mismatch" };
         return { tip };
-      });
+    });
+    try {
+      return budget ? await this.withReportProofBudget(budget, body) : await body();
     } catch (err) {
+      // The outer boundary's own abort is rethrown below; a lapse of this call's budget alone is a refusal.
+      if (budget && !this.boundaryProcesses.getStore()?.signal.aborted && (budget.signal.aborted || Date.now() >= budget.deadline)) {
+        return { refused: "deadline" };
+      }
       if (err instanceof GitBoundaryAbortError || err instanceof CheckpointSoftDeadlineError || isCheckpointBoundaryFailure(err)) throw err;
       this.log.warn("terminal aggregate failed (refused)", { barePath, error: gitErrorMessage(err) });
       return { refused: "error" };
