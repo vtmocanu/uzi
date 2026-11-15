@@ -17237,7 +17237,8 @@ export class RunRunner {
             let priorAmbiguous = false;
             let result: LedgerApplyResult;
             // Successors run serially under the existing cleanup deadline, with at most
-            // 32 attempts. A refusal stops the chain; A remains reaped throughout.
+            // 32 outer iterations (the preflight helper also probes internally).
+            // A refusal stops the chain; A remains reaped throughout.
             for (let attempt = 0; ; attempt++) {
               const beforeApply = await reconcile(true);
               if (!beforeApply.owned || beforeApply.claimGeneration !== generation ||
@@ -17258,6 +17259,7 @@ export class RunRunner {
                 const successor = await coordinateCodexSwitchPreflight({
                   initial: selected, signal, now: () => performance.now(),
                   reconcile: async () => {
+                    if (priorAmbiguous) throw new Error("successor ledger uncertain");
                     const authority = await reconcile(true);
                     const p = authority.pending;
                     if (p && p.opId !== selected.opId && seenSuccessors.has(p.opId))
@@ -17266,9 +17268,12 @@ export class RunRunner {
                     return authority;
                   },
                   probe: async op => {
-                    if (await effect(() => this.credentialSwitchLedger!.stateOf(runId, op.opId))) {
-                      possibleApply = true;
-                      throw new Error("successor ledger already contains an operation");
+                    try {
+                      if (await effect(() => this.credentialSwitchLedger!.stateOf(runId, op.opId)))
+                        throw new Error("successor ledger already contains an operation");
+                    } catch (error) {
+                      possibleApply = priorAmbiguous = true;
+                      throw error;
                     }
                     return effect(() => this.client.preflightCodexCredentialSwitch(runId, { ...op, oldCumulative }, signal));
                   },
@@ -17282,6 +17287,7 @@ export class RunRunner {
                   })),
                 });
                 guard();
+                if (priorAmbiguous) return await pauseCurrent("apply_uncertain");
                 if (successor.kind === "fenced") throw new StaleClaimError();
                 if (successor.kind !== "ready")
                   return await pauseCurrent(possibleApply ? "apply_uncertain" : "not_applied_after_teardown");

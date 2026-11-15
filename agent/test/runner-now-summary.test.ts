@@ -524,7 +524,7 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
   }
 
 
-  for (const outcome of ["policy_refusal", "baseline_missing", "failed_clear", "ready", "missing_negotiation", "persist_failed", "persist_threw", "released_after_clear", "unproven", "busy_after", "vault_after", "route_after", "refused_after", "lost_after", "fenced_after", "superseded_after", "applied_after", "key_to_sub_after", "applied_key_after", "init_after", "publish_after", "fresh_after", "invalid_after", "replay_after", "ledger_after", "ack_after", "budget_after", "newop_after", "successor_refusal_after", "successor_fence_after", "successor_route_after", "successor_ledger_after", "successor_noop_after", "successor_teardown_after", "successor_cycle_after", "no_op_after"] as const) {
+  for (const outcome of ["policy_refusal", "baseline_missing", "failed_clear", "ready", "missing_negotiation", "persist_failed", "persist_threw", "released_after_clear", "unproven", "busy_after", "vault_after", "route_after", "refused_after", "lost_after", "fenced_after", "superseded_after", "applied_after", "key_to_sub_after", "applied_key_after", "init_after", "publish_after", "fresh_after", "invalid_after", "replay_after", "ledger_after", "ack_after", "budget_after", "newop_after", "successor_refusal_after", "successor_fence_after", "successor_route_after", "successor_ledger_after", "successor_ledger_follow_after", "successor_ledger_unreadable_after", "successor_noop_after", "successor_teardown_after", "successor_cycle_after", "no_op_after"] as const) {
     it(`M2 firsthalf Codex Runner ${outcome}`, async (t) => {
       const claim = claimFor(2630, { secrets: outcome === "key_to_sub_after"
         ? { ...CODEX_SECRETS, codex: { auth_mode: "api_key", access_token: "A-key", capability: "A-capability" } }
@@ -532,6 +532,7 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
       let bDispatch: Parameters<Executor["run"]>[0]["prepareCodexRootDispatch"];
       let pending = false;
       let pendingId = "current-op";
+      const ledgerFollow = outcome === "successor_ledger_follow_after" || outcome === "successor_ledger_unreadable_after";
       const successor = outcome === "newop_after" || outcome.startsWith("successor_");
       let pendingTarget = "target";
       let failedClears = 0;
@@ -583,7 +584,7 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
       };
       client.applyCredentialSwitch = async (_id, req, signal) => {
         apply++; order.push("apply"); appliedOps.push(req.opId);
-        assert.equal(req.opId, successor && (apply > 1 || outcome === "successor_teardown_after") ? "successor-op" : "current-op");
+        assert.equal(req.opId, ledgerFollow && apply > 1 ? "latest-op" : successor && (apply > 1 || outcome === "successor_teardown_after") ? "successor-op" : "current-op");
         assert.equal(req.registerNonce, "original-nonce");
         assert.equal(req.claimGeneration, 1);
         assert.ok(signal && !signal.aborted);
@@ -607,7 +608,7 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
       client.reportState = (async (id, body, ...args) => {
         if (body.status === "credential_switch_uncertain") {
           uncertainReports++; order.push("hold"); holdReasons.push(body.failure_reason!);
-          assert.equal(body.op_id, successor && outcome !== "successor_cycle_after" ? "successor-op" : "current-op");
+          assert.equal(body.op_id, ledgerFollow ? "latest-op" : successor && outcome !== "successor_cycle_after" ? "successor-op" : "current-op");
           if (outcome === "ack_after" && uncertainReports === 1) throw new Error("lost reply");
           if (outcome === "ack_after" && uncertainReports === 2) return { applied: true, status: "paused" };
           return { applied: true, credentialSwitchUncertain: true };
@@ -713,7 +714,14 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
       const runner = runnerFor(executor);
       (runner as unknown as { waitRecoveryRetry: () => Promise<void> }).waitRecoveryRetry = async () => {};
       (runner as unknown as { credentialSwitchLedger: unknown }).credentialSwitchLedger = {
-        stateOf: async (_runId: string, opId: string) => outcome === "successor_ledger_after" && opId === "successor-op" ? "ambiguous" : undefined,
+        stateOf: async (_runId: string, opId: string) => {
+          if (ledgerFollow && opId === "successor-op") {
+            pendingId = "latest-op"; pendingTarget = "latest-target";
+            if (outcome === "successor_ledger_unreadable_after") throw new Error("ledger unreadable");
+            return "ambiguous";
+          }
+          return outcome === "successor_ledger_after" && opId === "successor-op" ? "ambiguous" : undefined;
+        },
         markSending: async () => { order.push("ledger"); if (outcome === "ledger_after") throw new Error("ledger unavailable"); return { wasAmbiguous: false }; },
         record: async () => "settled",
       };
@@ -756,13 +764,14 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
         assert.equal(failedClears, 0, "never clear a successor after teardown");
         assert.deepEqual(appliedOps, outcome === "newop_after" ? ["current-op", "successor-op"] :
           outcome === "successor_teardown_after" ? ["successor-op"] : ["current-op"]);
-        assert.deepEqual(probed, ["successor_route_after", "successor_ledger_after"].includes(outcome)
+        assert.deepEqual(probed, (ledgerFollow || ["successor_route_after", "successor_ledger_after"].includes(outcome))
           ? [{ opId: "current-op", target: "target" }]
           : [{ opId: "current-op", target: "target" }, { opId: "successor-op", target: "new-target" }]);
-        assert.ok(holdReasons.every(reason => reason === (outcome === "successor_ledger_after" ? "apply_uncertain" : "not_applied_after_teardown")));
+        assert.ok(holdReasons.every(reason => reason === (ledgerFollow || outcome === "successor_ledger_after" ? "apply_uncertain" : "not_applied_after_teardown")));
         if (!success) assert.ok(!order.includes("publish"), "refused successor cannot publish");
+        if (ledgerFollow) assert.ok(!order.includes("login-resume"), "uncertain ledger cannot authenticate B");
       }
-      assert.equal(preflights, successor && !["successor_route_after", "successor_ledger_after"].includes(outcome) ? 2 : ["missing_negotiation", "persist_failed", "persist_threw"].includes(outcome) ? 0 : 1);
+      assert.equal(preflights, successor && !(ledgerFollow || ["successor_route_after", "successor_ledger_after"].includes(outcome)) ? 2 : ["missing_negotiation", "persist_failed", "persist_threw"].includes(outcome) ? 0 : 1);
       assert.equal(apply, outcome === "newop_after" ? 2 : post && !["unproven", "ledger_after"].includes(outcome) ? 1 : 0);
       assert.equal(teardown, post ? 1 : 0);
       assert.equal(uncertainReports, outcome === "ack_after" ? 3 : post && !["unproven", "fenced_after", "successor_fence_after", "successor_noop_after", "newop_after", "successor_teardown_after", "no_op_after", "applied_after", "key_to_sub_after", "applied_key_after", "fresh_after"].includes(outcome) ? 1 : 0);
