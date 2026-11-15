@@ -42,6 +42,22 @@ func TestTUIPublicationWithheldIsAWarnToken(t *testing.T) {
 	}
 }
 
+// Precedence decision: a WARN health flag outranks the completion-phase token, like every other
+// WARN flag (checkRunState returns empty for them), so a run mid-check still shows pub withheld.
+func TestTUIPublicationWithheldBeatsCompletionPhase(t *testing.T) {
+	p := newPalette(true)
+	for _, phase := range []string{"checking", "reworking"} {
+		run := apitypes.RunDTO{ID: "r1", Status: "running", Health: healthPublicationWithheld, CompletionPhase: phase}
+		if g, w, tone := checkRunState(run, false); g != "" || w != "" || tone != "" {
+			t.Errorf("%s: checkRunState = (%q, %q, %q), want empty", phase, g, w, tone)
+		}
+		tok := p.runStateToken(run, false)
+		if tok.glyph != "▲" || tok.word != "pub withheld" {
+			t.Errorf("%s: runStateToken = (%q, %q), want (▲, pub withheld)", phase, tok.glyph, tok.word)
+		}
+	}
+}
+
 func TestTUIPublicationWithheldCountsInBoardSummary(t *testing.T) {
 	m := tuiModel{}
 	m.pal = newPalette(true)

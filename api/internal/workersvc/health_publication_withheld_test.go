@@ -195,6 +195,56 @@ func TestHealthPublicationWithheldThenStalledNudges(t *testing.T) {
 	if !w.HealthNotifiedAt.Valid || !w.HealthNotifiedAt.Time.Equal(t0) {
 		t.Fatalf("health_notified_at = %v, want %v", w.HealthNotifiedAt, t0)
 	}
+	// The enum changed, so health_since is restamped to this tick, not the old withheld since.
+	if !w.HealthSince.Valid || !w.HealthSince.Time.Equal(t0) {
+		t.Fatalf("health_since = %+v, want %v", w.HealthSince, t0)
+	}
+}
+
+// Leaving publication_withheld into any real fault (or the near-timeout slow) is a new episode
+// and nudges; leaving it into an account cooldown does not.
+func TestHealthPublicationWithheldLeavingNudgeTable(t *testing.T) {
+	cases := []struct {
+		name      string
+		stage     func(r *store.ListActiveRunsForHealthRow, fs *healthFakeStore, svc *Service)
+		want      string
+		wantNudge bool
+	}{
+		{"looping", func(r *store.ListActiveRunsForHealthRow, fs *healthFakeStore, _ *Service) {
+			r.LastActivityAt = ago(time.Minute)
+			fs.window = map[uuid.UUID][]store.ListRunToolWindowRow{r.ID: loopPairs(t, 8)}
+		}, healthLooping, true},
+		{"persist failing", func(r *store.ListActiveRunsForHealthRow, _ *healthFakeStore, svc *Service) {
+			r.LastActivityAt = ago(time.Minute)
+			wedge(svc, r.ID, persistFlagStreak, persistFlagWindow+time.Second)
+		}, healthLooping, true},
+		{"slow after the fact clears", func(r *store.ListActiveRunsForHealthRow, _ *healthFakeStore, _ *Service) {
+			r.LastActivityAt = ago(time.Minute)
+			r.PublicationWithheldSince = pgtype.Timestamptz{}
+			r.StartedAt = ago(95 * time.Second)
+			r.BudgetWallSeconds = pgtype.Int4{Int32: 100, Valid: true}
+		}, healthSlow, true},
+		{"account cooldown", func(r *store.ListActiveRunsForHealthRow, _ *healthFakeStore, _ *Service) {
+			r.LastActivityAt = ago(time.Minute)
+			r.AccountCooldownClass = pgconv.TextOrNull("rate_limit")
+			r.AccountCooldownEligibleAt = pgconv.Time(t0.Add(time.Minute))
+		}, healthWaitingAccountCooldown, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			r := pwLeaving(pgtype.Timestamptz{})
+			fs, svc, b := nudgeSvc(t, r, defaultHealthSettings())
+			c.stage(&fs.active[0], fs, svc)
+			svc.detectRunHealth(context.Background(), t0)
+			w := lastWrite(t, fs, r.ID)
+			if w.Health != c.want {
+				t.Fatalf("health = %q, want %q", w.Health, c.want)
+			}
+			if len(b.healthNudges) != 1 || b.healthNudges[0] != c.wantNudge {
+				t.Fatalf("nudges = %v, want [%v]", b.healthNudges, c.wantNudge)
+			}
+		})
+	}
 }
 
 func TestHealthPublicationWithheldThenStalledHonoursCooldown(t *testing.T) {

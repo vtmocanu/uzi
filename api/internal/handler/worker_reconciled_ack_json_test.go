@@ -8,7 +8,7 @@ import (
 // Issue #4257: the reconciled worker state ACK carries checkpoint_publication and
 // registration_evidence when set, and omits both when empty.
 func TestWorkerReconciledStateAckCarriesPublicationAndEvidence(t *testing.T) {
-	raw, err := json.Marshal(workerReconciledStateAck{Run: map[string]any{}, CheckpointPublication: "recorded", RegistrationEvidence: "ok"})
+	raw, err := json.Marshal(workerReconciledStateAck{Run: map[string]any{}, CheckpointPublication: "recorded", RegistrationEvidence: "recorded"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -16,7 +16,7 @@ func TestWorkerReconciledStateAckCarriesPublicationAndEvidence(t *testing.T) {
 	if err := json.Unmarshal(raw, &got); err != nil {
 		t.Fatal(err)
 	}
-	if got["checkpoint_publication"] != "recorded" || got["registration_evidence"] != "ok" {
+	if got["checkpoint_publication"] != "recorded" || got["registration_evidence"] != "recorded" {
 		t.Fatalf("keys missing from %s", raw)
 	}
 	raw, _ = json.Marshal(workerReconciledStateAck{Run: map[string]any{}})
