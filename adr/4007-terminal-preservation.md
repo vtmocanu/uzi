@@ -402,7 +402,12 @@ invocation and adds the `server_conflict` local block. The secret latch is writt
 before the flagged commits are. Rediscovery runs on the boot recovery pass
 (gated), never sends and never deletes: a
 `capturing` or `captured` record found on restart becomes `incomplete`, with
-its private refs retained.
+its private refs retained. Its journal-lock waits are bounded by the remaining 30 s
+rediscovery budget and the caller's signal; a waiter that gives up forfeits its turn and
+never acquires later, while a write that already holds the lock completes. The invocation
+ledger admits an `invoked` entry only while room remains for it and its outcome (256
+entries), so a record whose last slot holds a crash-dangling `invoked` stays prepared and
+is never resent (accepted limit).
 
 #### Callers
 

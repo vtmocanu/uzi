@@ -861,6 +861,76 @@ describe("terminal operation rediscovery", () => {
     lane.open();
     await held;
   });
+
+  describe("journal-lock waits are bounded", () => {
+    const mkNowCoord = (root: string, now: () => number): RecoveryCoordinator => new RecoveryCoordinator({
+      client: new FakeRecoveryClient(), git: new FakeRecoveryGit(), log: nullLogger(), recoveryRoot: path.join(root, "recovery"),
+      workerToken: TOKEN, terminalPreservationTestOverride: {}, now,
+    });
+    const settle = () => new Promise<void>(r => setTimeout(r, 100));
+
+    it("a read blocked behind the journal lock gives up when the caller signal fires, and nothing is written after release", async () => {
+      const root = mkRoot();
+      const coord = mkCoord(root);
+      await coord.terminalOperationStore().create(rec());
+      const g = gate();
+      const held = coord.withRestoreJournalLock(RUN, () => g.p);
+      try {
+        await tick();
+        const t0 = Date.now();
+        const res = await coord.resumeTerminalOperations(AbortSignal.timeout(200));
+        assert.ok(Date.now() - t0 < 2000, "returned promptly");
+        assert.equal(res.truncated, true);
+        assert.equal(res.incomplete, 0);
+      } finally { g.open(); await held; }
+      await settle();
+      assert.equal((await readRec(coord.terminalOperationStore())).phase, "capturing");
+    });
+
+    it("the remaining 30 s budget bounds the wait when the caller passes no signal", async () => {
+      const root = mkRoot();
+      let calls = 0;
+      const coord = mkNowCoord(root, () => (calls++ === 0 ? Date.now() : Date.now() + 29_900));
+      await coord.terminalOperationStore().create(rec());
+      const g = gate();
+      const held = coord.withRestoreJournalLock(RUN, () => g.p);
+      try {
+        await tick();
+        const t0 = Date.now();
+        const res = await coord.resumeTerminalOperations();
+        assert.ok(Date.now() - t0 < 2000, "returned promptly");
+        assert.equal(res.truncated, true);
+      } finally { g.open(); await held; }
+      await settle();
+      assert.equal((await readRec(coord.terminalOperationStore())).phase, "capturing");
+    });
+
+    it("an update blocked behind the journal lock gives up and never writes after release", async () => {
+      const root = mkRoot();
+      const coord = mkCoord(root);
+      const real = coord.terminalOperationStore();
+      await real.create(rec());
+      const g = gate();
+      let held: Promise<unknown> | undefined;
+      coord.terminalOperationStore = () => ({
+        ...real,
+        read: async (runId, generation, opts) => {
+          const r = await real.read(runId, generation, opts);
+          held = coord.withRestoreJournalLock(RUN, () => g.p);
+          return r;
+        },
+      });
+      try {
+        const t0 = Date.now();
+        const res = await coord.resumeTerminalOperations(AbortSignal.timeout(200));
+        assert.ok(Date.now() - t0 < 2000, "returned promptly");
+        assert.equal(res.truncated, true);
+        assert.equal(res.incomplete, 0);
+      } finally { g.open(); await held; }
+      await settle();
+      assert.equal((await readRec(real)).phase, "capturing");
+    });
+  });
 });
 
 describe("terminal record byte bound on write", () => {

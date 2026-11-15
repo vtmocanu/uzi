@@ -1648,7 +1648,7 @@ export class RecoveryCoordinator {
     const readable = (record: TerminalOperationRecord): boolean => decodeTerminalRecord(JSON.parse(JSON.stringify(record))) !== undefined;
     const failure = (error: unknown): { kind: "error"; reason: string } =>
       ({ kind: "error", reason: error instanceof PredecessorAuthorityLost ? "authority_lost" : error instanceof Error ? error.message.slice(0, 120) : "write_failed" });
-    const mutate = async (runId: string, generation: number, delta: TerminalDelta): Promise<TerminalUpdateResult> => {
+    const mutate = async (runId: string, generation: number, delta: TerminalDelta, opts?: { signal?: AbortSignal }): Promise<TerminalUpdateResult> => {
       if (!this.terminalPreservationEnabled()) return { kind: "disabled" };
       if (!valid(runId, generation)) return { kind: "error", reason: "invalid_id" };
       try {
@@ -1660,15 +1660,15 @@ export class RecoveryCoordinator {
           if (!readable(merged.record)) return { kind: "rejected", reason: "bound" };
           await this.terminalWriteUnlocked(merged.record);
           return { kind: "ok", record: merged.record };
-        });
+        }, opts?.signal);
       } catch (error) {
         return failure(error);
       }
     };
     return {
-      read: async (runId, generation) => {
+      read: async (runId, generation, opts) => {
         if (!this.terminalPreservationEnabled() || !valid(runId, generation)) return { kind: "absent" };
-        return this.withJournalLock(runId, () => this.terminalReadUnlocked(runId, generation));
+        return this.withJournalLock(runId, () => this.terminalReadUnlocked(runId, generation), opts?.signal);
       },
       create: async (record) => {
         if (!this.terminalPreservationEnabled()) return { kind: "disabled" };
@@ -1739,6 +1739,12 @@ export class RecoveryCoordinator {
     if (!this.terminalPreservationEnabled() || !this.key) return out;
     const deadline = this.now() + 30_000;
     const over = () => signal?.aborted === true || this.now() > deadline;
+    // Bounds only the wait for a run's journal lock: a waiter that gives up never acquires later.
+    const wait = (): AbortSignal => {
+      const t = AbortSignal.timeout(Math.max(0, deadline - this.now()));
+      return signal ? AbortSignal.any([signal, t]) : t;
+    };
+    let stop = false;
     let runs: string[];
     try { runs = (await fs.readdir(this.terminalRoot())).filter(isTerminalRunId).sort(); } catch { return out; }
     if (runs.length > 4096) { runs = runs.slice(0, 4096); out.truncated = true; }
@@ -1755,7 +1761,8 @@ export class RecoveryCoordinator {
       for (const name of files) {
         if (over()) { out.truncated = true; break; }
         const generation = Number(name.slice(1, -5));
-        const res = await store.read(runId, generation);
+        let res: TerminalReadResult;
+        try { res = await store.read(runId, generation, { signal: wait() }); } catch { out.truncated = true; stop = true; break; }
         if (res.kind === "absent") continue;
         if (res.kind === "corrupt") {
           out.corrupt++;
@@ -1765,13 +1772,16 @@ export class RecoveryCoordinator {
         const rec = res.record;
         if (rec.phase === "capturing" || rec.phase === "captured") {
           // A live operation holds the lane; only an idle one is restart residue.
+          const w = wait();
           const cycle = await runCaptureCycle(`terminal:${runId}:g${generation}`, "skip",
-            () => store.update(runId, generation, { phase: "incomplete", closedReason: "restart_incomplete" }));
+            () => store.update(runId, generation, { phase: "incomplete", closedReason: "restart_incomplete" }, { signal: w }));
           if (cycle.ran && cycle.value.kind === "ok") out.incomplete++;
+          else if (cycle.ran && cycle.value.kind === "error" && w.aborted) { out.truncated = true; stop = true; break; }
         } else if (rec.phase === "prepared" && rec.localBlock.length === 0) {
           out.resumePending.push({ runId, generation, record: rec });
         }
       }
+      if (stop) break;
     }
     return out;
   }

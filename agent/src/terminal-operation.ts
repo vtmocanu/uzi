@@ -161,7 +161,8 @@ export type TerminalMergeResult = { ok: true; record: TerminalOperationRecord } 
  * grow; identity fields are set-once; the phase never moves backward (capturing < captured < prepared < closed, with
  * `incomplete` reachable only from capturing/captured, and `closed` terminal); `invoked` can never be appended while any
  * local block exists or after close; `closed` needs a final outcome, or no `invoked` entry at all; a `conflict` outcome
- * always adds the `server_conflict` block.
+ * always adds the `server_conflict` block. The last ledger slot is reserved for an outcome: an `invoked` append is
+ * refused (`bound`) once fewer than two slots remain, while outcome appends are accepted up to MAX_INVOCATIONS.
  */
 export function mergeTerminalRecord(current: TerminalOperationRecord, delta: TerminalDelta): TerminalMergeResult {
   const no = (reason: string): TerminalMergeResult => ({ ok: false, reason });
@@ -237,11 +238,12 @@ export type TerminalInvokeResult =
   | { kind: "rejected"; reason: string } | { kind: "absent" } | { kind: "corrupt" } | { kind: "disabled" } | { kind: "error"; reason: string };
 
 export interface TerminalOperationStore {
-  read(runId: string, generation: number): Promise<TerminalReadResult>;
+  /** `opts.signal` bounds only the wait for the run's journal lock; a read that already holds it completes. */
+  read(runId: string, generation: number, opts?: { signal?: AbortSignal }): Promise<TerminalReadResult>;
   /** Create the record when absent; `exists` carries the winner. */
   create(record: TerminalOperationRecord): Promise<{ kind: "created"; record: TerminalOperationRecord } | { kind: "exists" } | { kind: "disabled" } | { kind: "error"; reason: string }>;
   /** Read-merge-write under the run's journal lock. Safe to call while the operation owner holds the lane. */
-  update(runId: string, generation: number, delta: TerminalDelta): Promise<TerminalUpdateResult>;
+  update(runId: string, generation: number, delta: TerminalDelta, opts?: { signal?: AbortSignal }): Promise<TerminalUpdateResult>;
   /** Latch writer: only the journal lock, so it lands while a send is in flight. */
   addLocalBlock(runId: string, generation: number, reasons: string[], flaggedCommits?: string[]): Promise<TerminalUpdateResult>;
   /** The pre-send step, atomic under the journal lock: refuse when any local block or secret record exists for the run,
@@ -506,7 +508,8 @@ async function finishAndSend(deps: TerminalOperationDeps, input: TerminalOperati
   if (result.kind === "refused") {
     const conflict = result.reason === "generation_bound" || result.reason === "prior_tip_mismatch";
     // A non-conflict server refusal after `invoke` leaves the record prepared and resumable (the next resume may send
-    // again); the loop is bounded by MAX_INVOCATIONS, after which every append is rejected as `bound`.
+    // again); the loop is bounded: an `invoked` append is refused once fewer than two ledger slots remain (room for its
+    // outcome), while outcome appends are accepted up to MAX_INVOCATIONS.
     await store.update(input.runId, input.generation, {
       appendInvocations: [{ at, outcome: conflict ? "conflict" : "refused", reason: reasonToken(result.reason) }],
       ...(conflict ? { addLocalBlock: ["server_conflict"] } : {}),
