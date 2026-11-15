@@ -16,7 +16,7 @@ import { SeverityShape } from "./healthSeverity";
 // Health is last (PRD #1484 D1); its entry points are the sidebar pip
 // (M5) and the Overview card (M5), not tab position. `pip: true` marks the aggregate
 // health severity pip; Instance separately carries the agent-source advisory mark.
-const TABS = [
+export const TABS = [
   { to: "/admin/users", label: "Users" },
   { to: "/admin/rate-limits", label: "Rate limits" },
   { to: "/admin/tool-allowlist", label: "Tool allowlist" },
