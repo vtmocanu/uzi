@@ -16952,7 +16952,7 @@ export class RunRunner {
       // place and must KEEP the flags to leave the run non-terminal for a requeue.
       // issue #1597 M2: gated end to end — from the wip marker captureRecoveryRestorePoint commits to
       // the give-up's undoWipMarker — so a mid-turn tick can never publish that throwaway marker.
-      attemptCodexCredentialSwitch: async (opts) => this.runGatedSink(flight, async () => {
+      attemptCodexCredentialSwitch: async (opts) => {
         const retain = (): never => {
           flight.preserveRecoveryClone = true;
           flight.preserveSession = true;
@@ -17029,56 +17029,61 @@ export class RunRunner {
           return after.owned && after.registerNonce === nonce && !after.pending;
         };
         try {
-          guard();
-          if (!claim.secrets.codex || !Number.isSafeInteger(generation) || !generation || generation < 0 ||
-              !nonce || !opts.laneSettled || !this.client.supportsInPlaceCodexCredentialSwitch() ||
-              !this.credentialSwitchLedger || !executor.suspendCodexEpoch) retain();
-          const initial = await reconcile();
-          if (!initial.owned) throw new StaleClaimError();
-          if (!initial.pending) retain();
-          const operation = initial.pending!;
-          guard();
-          const nowLease = nowSummary?.suspendCodexSwitch({ signal, remainingMs: remaining() });
-          if (nowLease && (await effect(() => nowLease.drained)).kind !== "drained") retain();
-          const a = await effect(() => executor.suspendCodexEpoch!(bounds));
-          if ((await effect(() => a.reconcileA(bounds, remaining()))).kind !== "ready") retain();
-          guard();
-          const hold = batcher.holdForCredentialSwitch();
-          if (!(await effect(() => hold.prepare(remaining(), signal))).prepared) retain();
-          const oldCumulative = batcher.lastSessionCumulative();
-          const reopen = async (op: CodexSwitchOperation): Promise<"continued_A"> => {
-            guard(); hold.cancel(); guard();
-            await effect(() => a.reopenA(bounds));
+          return await this.runGatedSink(flight, async () => {
             guard();
-            if (nowLease && !nowLease.reopenA()) retain();
-            guard(); steering.settleCredentialSwitch(op.opId, "gave_up"); guard();
-            steering.rearmLifecycle(); guard();
-            return "continued_A";
-          };
-          let saved: import("./executor.js").UsableSavedRollout;
-          try { saved = await effect(() => a.persistRollout(bounds)); }
-          catch { guard(); saved = { kind: "failed" }; }
-          if (saved.kind !== "usable" || !saved.sessionId) {
-            if (await confirmClear(operation, "rollout_persist_failed")) return await reopen(operation);
-            retain();
-          }
-          const decision = await coordinateCodexSwitchPreflight({
-            initial: operation, signal, now: () => performance.now(), reconcile,
-            probe: op => effect(() => this.client.preflightCodexCredentialSwitch(runId, { ...op, oldCumulative }, signal)),
-            confirmFailedClear: confirmClear,
-            delay: ms => effect(() => new Promise<void>((resolve, reject) => {
-              const done = () => { clearTimeout(wait); signal.removeEventListener("abort", aborted); };
-              const aborted = () => { done(); reject(new CredentialSwitchRetainedStop()); };
-              const wait = setTimeout(() => { done(); resolve(); }, Math.min(ms, remaining()));
-              signal.addEventListener("abort", aborted, { once: true });
-            })),
-          });
-          guard();
-          if (decision.kind === "continued_A") return await reopen(decision.operation);
-          if (decision.kind === "fenced") throw new StaleClaimError();
-          // Temporary integration gate: READY retains A closed. Replace with the full
-          // coordinator adapter before apply, teardown or any B model turn.
-          return retain();
+            if (!claim.secrets.codex || !Number.isSafeInteger(generation) || !generation || generation < 0 ||
+                !nonce || !opts.laneSettled || !this.client.supportsInPlaceCodexCredentialSwitch() ||
+                !this.credentialSwitchLedger || !executor.suspendCodexEpoch) retain();
+            const initial = await reconcile();
+            if (!initial.owned) throw new StaleClaimError();
+            if (!initial.pending) retain();
+            const operation = initial.pending!;
+            guard();
+            const nowLease = nowSummary?.suspendCodexSwitch({ signal, remainingMs: remaining() });
+            if (nowLease && (await effect(() => nowLease.drained)).kind !== "drained") retain();
+            const a = await effect(() => executor.suspendCodexEpoch!(bounds));
+            if ((await effect(() => a.reconcileA(bounds, remaining()))).kind !== "ready") retain();
+            guard();
+            const hold = batcher.holdForCredentialSwitch();
+            if (!(await effect(() => hold.prepare(remaining(), signal))).prepared) retain();
+            const oldCumulative = batcher.lastSessionCumulative();
+            const reopen = async (op: CodexSwitchOperation, reason: Extract<import("./codex-switch-preflight.js").CodexSwitchPreflightDecision, { kind: "continued_A" }>["reason"] | "rollout_persist_failed"): Promise<"continued_A"> => {
+              guard(); hold.cancel(); guard();
+              await effect(() => a.reopenA(bounds));
+              guard();
+              if (nowLease && !nowLease.reopenA()) retain();
+              guard(); steering.settleCredentialSwitch(op.opId, "gave_up"); guard();
+              steering.rearmLifecycle(); guard();
+              batcher.emit({ kind: "status", agent: "worker", payload: {
+                event: "credential_switch_failed", reason, text: `Credential switch declined (${reason}); continuing with the current credential.`,
+              } });
+              return "continued_A";
+            };
+            let saved: import("./executor.js").UsableSavedRollout;
+            try { saved = await effect(() => a.persistRollout(bounds)); }
+            catch { guard(); saved = { kind: "failed" }; }
+            if (saved.kind !== "usable" || !saved.sessionId) {
+              if (await confirmClear(operation, "rollout_persist_failed")) return await reopen(operation, "rollout_persist_failed");
+              retain();
+            }
+            const decision = await coordinateCodexSwitchPreflight({
+              initial: operation, signal, now: () => performance.now(), reconcile,
+              probe: op => effect(() => this.client.preflightCodexCredentialSwitch(runId, { ...op, oldCumulative }, signal)),
+              confirmFailedClear: confirmClear,
+              delay: ms => effect(() => new Promise<void>((resolve, reject) => {
+                const done = () => { clearTimeout(wait); signal.removeEventListener("abort", aborted); };
+                const aborted = () => { done(); reject(new CredentialSwitchRetainedStop()); };
+                const wait = setTimeout(() => { done(); resolve(); }, Math.min(ms, remaining()));
+                signal.addEventListener("abort", aborted, { once: true });
+              })),
+            });
+            guard();
+            if (decision.kind === "continued_A") return await reopen(decision.operation, decision.reason);
+            if (decision.kind === "fenced") throw new StaleClaimError();
+            // Temporary integration gate: READY retains A closed. Replace with the full
+            // coordinator adapter before apply, teardown or any B model turn.
+            return retain();
+          }, { stop: { signal }, deadlineAt: Date.now() + remaining() });
         } catch (error) {
           flight.preserveRecoveryClone = true;
           flight.preserveSession = true;
@@ -17088,7 +17093,7 @@ export class RunRunner {
           if (error instanceof StaleClaimError || isCheckedLifecycleControl(error)) throw error;
           return retain();
         } finally { clearTimeout(timer); }
-      }),
+      },
       attemptCredentialSwitch: async (opts) => {
         // Issue #3974: an owner cancel was committed while the switch was withheld. Do not enter the
         // switch (no capture, no credential_switch* report): throw the ordinary cancel error so the

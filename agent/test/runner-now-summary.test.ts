@@ -249,8 +249,69 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
     codex: { auth_mode: "subscription", access_token: "claim-key", capability: "cap", generation: 3, chatgpt_account_id: "verified-account", chatgpt_plan_type: null },
   };
 
+  for (const stop of ["deadline", "lifecycle", "cancel"] as const) {
+    it(`M2 Codex gate wait ${stop} before admission retains A`, async (t) => {
+      const claim = claimFor(2631, { secrets: CODEX_SECRETS, claim_generation: 1 });
+      let bounded = false;
+      let aborted = false;
+      let heldAfterStop = false;
+      let worktree = "";
+      let continued = false;
+      let deadlineFire: (() => void) | undefined;
+      const runner = runnerFor({
+        async run(ctx) {
+          worktree = ctx.worktreePath;
+          fs.writeFileSync(path.join(worktree, "retained.txt"), "waiting A work");
+          const internal = runner as unknown as {
+            runGatedSink(flight: { sinkGate: import("../src/sink-gate.js").SinkGate; steering: SteeringChannel }, fn: () => Promise<unknown>,
+              bound?: { stop: { signal: AbortSignal }; deadlineAt: number }): Promise<unknown>;
+          };
+          const original = internal.runGatedSink.bind(runner);
+          const timer = globalThis.setTimeout;
+          const mocked = t.mock.method(globalThis, "setTimeout", ((fn: () => void, ms: number, ...args: unknown[]) => {
+            if (ms === 10_000) {
+              deadlineFire = fn;
+              return { unref() { return this; } } as unknown as ReturnType<typeof setTimeout>;
+            }
+            return Reflect.apply(timer, globalThis, [fn, ms, ...args]) as ReturnType<typeof setTimeout>;
+          }) as typeof setTimeout);
+          internal.runGatedSink = async (flight, fn, bound) => {
+            bounded = !!bound && bound.deadlineAt <= Date.now() + 10_000;
+            const release = flight.sinkGate.tryAcquire(() => {
+              if (stop === "deadline") deadlineFire?.();
+              else if (stop === "cancel") (flight.steering as unknown as { commitCancel(): void }).commitCancel();
+            else (runner as unknown as { shutdownSignal: AbortController }).shutdownSignal.abort();
+              aborted = bound?.stop.signal.aborted === true;
+              if (!bound) release!();
+            });
+            assert.ok(release);
+            try { return await original(flight, fn, bound); }
+            finally { heldAfterStop = flight.sinkGate.isHeld(); release(); }
+          };
+          try {
+            await ctx.attemptCodexCredentialSwitch!({ site: "implement_turn", laneSettled: true });
+            continued = true;
+          } finally {
+            internal.runGatedSink = original;
+            mocked.mock.restore();
+          }
+          throw new Error("switch unexpectedly continued past gate stop");
+        },
+      });
+      await runner.execute(claim);
+      assert.equal(bounded, true);
+      assert.equal(aborted, true);
+      assert.equal(heldAfterStop, true, "waiting switch must not release tick custody");
+      assert.equal(continued, false);
+      assert.equal(fs.readFileSync(path.join(worktree, "retained.txt"), "utf8"), "waiting A work");
+      const failures = api.states.filter(s => s.runId === claim.run_id && s.body.status === "failed");
+      assert.deepEqual(failures.map(s => s.body.failure_reason), stop === "cancel" ? ["run cancelled"] : []);
+    });
+
+  }
+
   for (const outcome of ["policy_refusal", "baseline_missing", "failed_clear", "ready", "missing_negotiation", "persist_failed", "persist_threw", "released_after_clear"] as const) {
-    it(`M2 firsthalf Codex Runner ${outcome}`, async () => {
+    it(`M2 firsthalf Codex Runner ${outcome}`, async (t) => {
       const claim = claimFor(2630, { secrets: CODEX_SECRETS, claim_generation: 1 });
       let pending = false;
       let reopened = 0;
@@ -259,6 +320,8 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
       let apply = 0;
       let teardown = 0;
       let continued = false;
+      let probeBudget: number | undefined;
+      let drainBound = false;
       client.registrationNonce = () => "original-nonce";
       client.supportsInPlaceCodexCredentialSwitch = () => outcome !== "missing_negotiation";
       client.getRunOwnership = async () => ({ status: "running", claim_generation: 1,
@@ -288,7 +351,7 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
         suspendCodexEpoch: async () => {
           suspended++;
           return {
-            reconcileA: async () => ({ kind: "ready" }),
+            reconcileA: async (_bounds, remainingMs) => { probeBudget = remainingMs; return { kind: "ready" }; },
             persistRollout: async () => {
               if (outcome === "persist_threw") throw new Error("save failed");
               return outcome === "persist_failed" ? { kind: "failed" } : { kind: "usable", sessionId: "saved-A" };
@@ -305,7 +368,25 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
           worktree = ctx.worktreePath;
           fs.writeFileSync(path.join(worktree, "retained.txt"), "A work");
           pending = true;
-          const result = await ctx.attemptCodexCredentialSwitch!({ site: "implement_turn", laneSettled: true });
+          // Simulate six seconds spent draining under the gate, without waiting in real time.
+          let elapsed = 0;
+          const clock = outcome === "policy_refusal" ? t.mock.method(performance, "now", () => elapsed) : undefined;
+          const internal = runner as unknown as {
+            awaitTickSurvivorsGone(flight: unknown, deadlineAt?: number): Promise<"gone">;
+          };
+          const drain = internal.awaitTickSurvivorsGone.bind(runner);
+          if (clock) internal.awaitTickSurvivorsGone = async (_flight, deadlineAt) => {
+            drainBound = deadlineAt !== undefined && deadlineAt <= Date.now() + 10_000;
+            elapsed = 6000;
+            return "gone";
+          };
+          let result;
+          try {
+            result = await ctx.attemptCodexCredentialSwitch!({ site: "implement_turn", laneSettled: true });
+          } finally {
+            internal.awaitTickSurvivorsGone = drain;
+            clock?.mock.restore();
+          }
           assert.equal(result, "continued_A");
           continued = true;
           throw new CredentialSwitchSignal();
@@ -317,6 +398,16 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
       };
       await runner.execute(claim);
       const refusal = outcome === "policy_refusal" || outcome === "baseline_missing" || outcome === "persist_failed" || outcome === "persist_threw";
+      const notices = api.messages(claim.run_id).filter(m => m.kind === "status" && (m.payload as { event?: string }).event === "credential_switch_failed");
+      assert.equal(notices.length, refusal ? 1 : 0);
+      if (refusal) {
+        assert.equal((notices[0]!.payload as { reason: string }).reason,
+          outcome === "policy_refusal" || outcome === "baseline_missing" ? outcome : "rollout_persist_failed");
+      }
+      if (outcome === "policy_refusal") {
+        assert.equal(drainBound, true);
+        assert.equal(probeBudget, 4000, "drain and epoch probes share the original budget");
+      }
       assert.equal(continued, refusal);
       assert.equal(reopened, refusal ? 1 : 0);
       assert.equal(suspended, outcome === "missing_negotiation" ? 0 : 1);
