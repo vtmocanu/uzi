@@ -49,6 +49,80 @@ func (q *Queries) GetWorkerIdleness(ctx context.Context, workerID uuid.UUID) (Ge
 	return i, err
 }
 
+const listAutoHibernationBlockedIdle = `-- name: ListAutoHibernationBlockedIdle :many
+SELECT w.id, w.name, a.anchor::timestamptz AS anchor,
+       w.hibernation_blocked_reason::text AS reason,
+       w.hibernation_blocked_since AS blocked_since,
+       (count(*) OVER ())::bigint AS total
+FROM workers w
+CROSS JOIN LATERAL (
+    SELECT GREATEST(
+        (SELECT max(COALESCE(r.finished_at, r.status_since)) FROM runs r
+          WHERE r.worker_id = w.id AND r.status IN ('completed', 'failed', 'cancelled')),
+        w.last_wake_settled_at,
+        w.created_at
+    ) AS anchor
+) a
+WHERE w.kind = 'hosted' AND NOT w.ephemeral AND w.hibernation_state = 'none'
+  AND NOT EXISTS (
+      SELECT 1 FROM runs r
+      WHERE r.worker_id = w.id AND r.status NOT IN ('completed', 'failed', 'cancelled'))
+  AND a.anchor <= $1::timestamptz
+  AND w.hibernation_blocked_reason IS NOT NULL
+  AND w.hibernation_blocked_at >= a.anchor
+ORDER BY a.anchor ASC, w.id ASC
+LIMIT $2::int
+`
+
+type ListAutoHibernationBlockedIdleParams struct {
+	Cutoff  pgtype.Timestamptz `json:"cutoff"`
+	MaxRows int32              `json:"max_rows"`
+}
+
+type ListAutoHibernationBlockedIdleRow struct {
+	ID           uuid.UUID          `json:"id"`
+	Name         string             `json:"name"`
+	Anchor       pgtype.Timestamptz `json:"anchor"`
+	Reason       string             `json:"reason"`
+	BlockedSince pgtype.Timestamptz `json:"blocked_since"`
+	Total        int64              `json:"total"`
+}
+
+// fleet.hibernation (admin health): idle persistent hosted workers the automatic pass could
+// not hibernate. The worker and idleness predicates repeat ListAutoHibernationCandidates
+// (same non-terminal NOT EXISTS text, so runs_worker_nonterminal_idx serves it). A recorded
+// block counts only when it was seen at or after the anchor (hibernation_blocked_at >= anchor),
+// so a stale reason from before the worker's latest activity is ignored. total is the exact
+// number of matching workers across the window, not the LIMIT row count. The set is disjoint
+// from ListAutoHibernationParkedBlockers (this one has no non-terminal run, that one has at
+// least one). @cutoff comes from Go (the injectable clock).
+func (q *Queries) ListAutoHibernationBlockedIdle(ctx context.Context, arg ListAutoHibernationBlockedIdleParams) ([]ListAutoHibernationBlockedIdleRow, error) {
+	rows, err := q.db.Query(ctx, listAutoHibernationBlockedIdle, arg.Cutoff, arg.MaxRows)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListAutoHibernationBlockedIdleRow{}
+	for rows.Next() {
+		var i ListAutoHibernationBlockedIdleRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Name,
+			&i.Anchor,
+			&i.Reason,
+			&i.BlockedSince,
+			&i.Total,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listAutoHibernationCandidates = `-- name: ListAutoHibernationCandidates :many
 SELECT w.id, a.anchor::timestamptz AS anchor
 FROM workers w
@@ -101,6 +175,73 @@ func (q *Queries) ListAutoHibernationCandidates(ctx context.Context, arg ListAut
 	for rows.Next() {
 		var i ListAutoHibernationCandidatesRow
 		if err := rows.Scan(&i.ID, &i.Anchor); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listAutoHibernationParkedBlockers = `-- name: ListAutoHibernationParkedBlockers :many
+SELECT w.id, w.name, p.run_id, p.status::text AS status, p.status_since::timestamptz AS status_since,
+       (count(*) OVER ())::bigint AS total
+FROM workers w
+CROSS JOIN LATERAL (
+    SELECT r.id AS run_id, r.status, r.status_since
+    FROM runs r
+    WHERE r.worker_id = w.id AND r.status NOT IN ('completed', 'failed', 'cancelled')
+    ORDER BY r.status_since ASC NULLS LAST, r.id ASC
+    LIMIT 1
+) p
+WHERE w.kind = 'hosted' AND NOT w.ephemeral AND w.hibernation_state = 'none'
+  AND NOT EXISTS (
+      SELECT 1 FROM runs r
+      WHERE r.worker_id = w.id AND r.status NOT IN ('completed', 'failed', 'cancelled')
+        AND r.status NOT IN ('recovery_wait', 'paused', 'limit_wait'))
+  AND p.status_since <= $1::timestamptz
+ORDER BY p.status_since ASC, w.id ASC
+LIMIT $2::int
+`
+
+type ListAutoHibernationParkedBlockersParams struct {
+	Cutoff  pgtype.Timestamptz `json:"cutoff"`
+	MaxRows int32              `json:"max_rows"`
+}
+
+type ListAutoHibernationParkedBlockersRow struct {
+	ID          uuid.UUID          `json:"id"`
+	Name        string             `json:"name"`
+	RunID       uuid.UUID          `json:"run_id"`
+	Status      string             `json:"status"`
+	StatusSince pgtype.Timestamptz `json:"status_since"`
+	Total       int64              `json:"total"`
+}
+
+// fleet.hibernation (admin health): persistent hosted workers whose every assigned run is
+// parked (recovery_wait, paused or limit_wait), with the oldest parked run past @cutoff. The
+// automatic pass cannot hibernate them while a run is assigned. One row per worker: the
+// oldest parked run (status_since, then id). total is the exact number of matching workers
+// across the window, not the LIMIT row count. Disjoint from ListAutoHibernationBlockedIdle.
+func (q *Queries) ListAutoHibernationParkedBlockers(ctx context.Context, arg ListAutoHibernationParkedBlockersParams) ([]ListAutoHibernationParkedBlockersRow, error) {
+	rows, err := q.db.Query(ctx, listAutoHibernationParkedBlockers, arg.Cutoff, arg.MaxRows)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListAutoHibernationParkedBlockersRow{}
+	for rows.Next() {
+		var i ListAutoHibernationParkedBlockersRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Name,
+			&i.RunID,
+			&i.Status,
+			&i.StatusSince,
+			&i.Total,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)

@@ -1150,6 +1150,10 @@ var queryInventory = []queryPin{
 		"issue #4207; reached through svc.HibernationAutoPass (../workersvc); the test asserts a pile of recently blocked workers cannot starve a clean one"},
 	{"SetWorkerHibernationBlocked", "hibernation_auto.sql", "TestHibernationAutoRefusalRecordedLiveDB",
 		"issue #4207; reached through svc.HibernationAutoPass (../workersvc); the test asserts the recorded reason, the since-on-change rule and the clear on admission"},
+	{"ListAutoHibernationBlockedIdle", "hibernation_auto.sql", "TestAdminHealthHibernationAutoLiveDB",
+		"issue #4207; reached through GET /api/admin/health (../handler health_hibernation_auto_livedb_test.go), which asserts the listed idle workers, their recorded blocker and the exact total"},
+	{"ListAutoHibernationParkedBlockers", "hibernation_auto.sql", "TestAdminHealthHibernationAutoLiveDB",
+		"issue #4207; reached through GET /api/admin/health (../handler health_hibernation_auto_livedb_test.go), which asserts a worker whose only run is paused is listed as a parked blocker"},
 }
 
 var sqlQueryNameRe = regexp.MustCompile(`(?m)^-- name: (\w+) `)

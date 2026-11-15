@@ -77,6 +77,11 @@ type fakeStore struct {
 	ciwatchErr             error
 	runDisk                []store.WorkerRunDisk
 	runDiskErr             error
+	hibIdle                []store.ListAutoHibernationBlockedIdleRow
+	hibIdleErr             error
+	hibParked              []store.ListAutoHibernationParkedBlockersRow
+	hibParkedErr           error
+	hibParams              []store.ListAutoHibernationBlockedIdleParams
 }
 
 func (f *fakeStore) RecoveryStorageHealth(ctx context.Context, p store.RecoveryStorageHealthParams) ([]store.RecoveryStorageHealthRow, error) {
@@ -160,6 +165,14 @@ func (f *fakeStore) ListLargestRunDiskForWorkers(context.Context, store.ListLarg
 	return f.runDisk, f.runDiskErr
 }
 
+func (f *fakeStore) ListAutoHibernationBlockedIdle(_ context.Context, p store.ListAutoHibernationBlockedIdleParams) ([]store.ListAutoHibernationBlockedIdleRow, error) {
+	f.hibParams = append(f.hibParams, p)
+	return f.hibIdle, f.hibIdleErr
+}
+func (f *fakeStore) ListAutoHibernationParkedBlockers(context.Context, store.ListAutoHibernationParkedBlockersParams) ([]store.ListAutoHibernationParkedBlockersRow, error) {
+	return f.hibParked, f.hibParkedErr
+}
+
 type fakeSettings struct {
 	sourceEnabled  bool
 	sourceURL      string
@@ -176,6 +189,20 @@ type fakeSettings struct {
 	// in this fake, so tests that exercise custody.holds set it explicitly.
 	custodyLimit int32
 	custodyErr   error
+	// hibernation (issue #4207) backs WorkerHibernationEnabled/Auto/IdleAfter.
+	hibEnabled, hibAuto bool
+	hibIdleAfter        time.Duration
+	hibErr              error
+}
+
+func (f *fakeSettings) WorkerHibernationEnabled(context.Context) (bool, error) {
+	return f.hibEnabled, f.hibErr
+}
+func (f *fakeSettings) WorkerHibernationAuto(context.Context) (bool, error) {
+	return f.hibAuto, f.hibErr
+}
+func (f *fakeSettings) WorkerHibernationIdleAfter(context.Context) (time.Duration, error) {
+	return f.hibIdleAfter, f.hibErr
 }
 
 func (f *fakeSettings) HealthEnabled(context.Context) (bool, error) {
@@ -1192,9 +1219,9 @@ func TestEvaluateRollupAndRegistry(t *testing.T) {
 	// (integrations), so it is 14, not 11; PRD #1809 M6 added fleet.rundisk
 	// (workers), issue #2203 adds forge.sync (integrations), and issue #2213 adds
 	// fleet.quarantine and issue #3142 adds fleet.memory_authority (workers); pricing.codex follows release.check, db.size follows db and
-	// recovery.storage follows custody.holds, fleet.hibernation_wake (PRD #4205 M6) follows fleet.memory_authority, fleet.hibernation_cleanup (PRD #4206) follows it, making 25 with agentsource.update after release.check and maintenance.active after schedules.paused (PRD #3454).
+	// recovery.storage follows custody.holds, fleet.hibernation_wake (PRD #4205 M6) follows fleet.memory_authority, fleet.hibernation_cleanup (PRD #4206) follows it, fleet.hibernation (issue #4207) follows that, making 26 with agentsource.update after release.check and maintenance.active after schedules.paused (PRD #3454).
 	wantIDs := []string{
-		"fleet.roll", "fleet.capacity", "fleet.disk", "fleet.rundisk", "fleet.quarantine", "fleet.memory_authority", "fleet.hibernation_wake", "fleet.hibernation_cleanup", "queue.waiting", "queue.undispatched",
+		"fleet.roll", "fleet.capacity", "fleet.disk", "fleet.rundisk", "fleet.quarantine", "fleet.memory_authority", "fleet.hibernation_wake", "fleet.hibernation_cleanup", "fleet.hibernation", "queue.waiting", "queue.undispatched",
 		"controller.report", "db", "db.size", "loops", "forge.ciwatch", "forge.sync", "slack.socket",
 		"schedules.paused", "maintenance.active", "board.drift", "custody.holds", "recovery.storage", "release.check", "agentsource.update", "pricing.codex",
 	}

@@ -63,3 +63,60 @@ UPDATE workers SET
     hibernation_blocked_reason = @reason::text,
     hibernation_blocked_at = @at::timestamptz
 WHERE id = @id;
+
+-- name: ListAutoHibernationBlockedIdle :many
+-- fleet.hibernation (admin health): idle persistent hosted workers the automatic pass could
+-- not hibernate. The worker and idleness predicates repeat ListAutoHibernationCandidates
+-- (same non-terminal NOT EXISTS text, so runs_worker_nonterminal_idx serves it). A recorded
+-- block counts only when it was seen at or after the anchor (hibernation_blocked_at >= anchor),
+-- so a stale reason from before the worker's latest activity is ignored. total is the exact
+-- number of matching workers across the window, not the LIMIT row count. The set is disjoint
+-- from ListAutoHibernationParkedBlockers (this one has no non-terminal run, that one has at
+-- least one). @cutoff comes from Go (the injectable clock).
+SELECT w.id, w.name, a.anchor::timestamptz AS anchor,
+       w.hibernation_blocked_reason::text AS reason,
+       w.hibernation_blocked_since AS blocked_since,
+       (count(*) OVER ())::bigint AS total
+FROM workers w
+CROSS JOIN LATERAL (
+    SELECT GREATEST(
+        (SELECT max(COALESCE(r.finished_at, r.status_since)) FROM runs r
+          WHERE r.worker_id = w.id AND r.status IN ('completed', 'failed', 'cancelled')),
+        w.last_wake_settled_at,
+        w.created_at
+    ) AS anchor
+) a
+WHERE w.kind = 'hosted' AND NOT w.ephemeral AND w.hibernation_state = 'none'
+  AND NOT EXISTS (
+      SELECT 1 FROM runs r
+      WHERE r.worker_id = w.id AND r.status NOT IN ('completed', 'failed', 'cancelled'))
+  AND a.anchor <= @cutoff::timestamptz
+  AND w.hibernation_blocked_reason IS NOT NULL
+  AND w.hibernation_blocked_at >= a.anchor
+ORDER BY a.anchor ASC, w.id ASC
+LIMIT @max_rows::int;
+
+-- name: ListAutoHibernationParkedBlockers :many
+-- fleet.hibernation (admin health): persistent hosted workers whose every assigned run is
+-- parked (recovery_wait, paused or limit_wait), with the oldest parked run past @cutoff. The
+-- automatic pass cannot hibernate them while a run is assigned. One row per worker: the
+-- oldest parked run (status_since, then id). total is the exact number of matching workers
+-- across the window, not the LIMIT row count. Disjoint from ListAutoHibernationBlockedIdle.
+SELECT w.id, w.name, p.run_id, p.status::text AS status, p.status_since::timestamptz AS status_since,
+       (count(*) OVER ())::bigint AS total
+FROM workers w
+CROSS JOIN LATERAL (
+    SELECT r.id AS run_id, r.status, r.status_since
+    FROM runs r
+    WHERE r.worker_id = w.id AND r.status NOT IN ('completed', 'failed', 'cancelled')
+    ORDER BY r.status_since ASC NULLS LAST, r.id ASC
+    LIMIT 1
+) p
+WHERE w.kind = 'hosted' AND NOT w.ephemeral AND w.hibernation_state = 'none'
+  AND NOT EXISTS (
+      SELECT 1 FROM runs r
+      WHERE r.worker_id = w.id AND r.status NOT IN ('completed', 'failed', 'cancelled')
+        AND r.status NOT IN ('recovery_wait', 'paused', 'limit_wait'))
+  AND p.status_since <= @cutoff::timestamptz
+ORDER BY p.status_since ASC, w.id ASC
+LIMIT @max_rows::int;
