@@ -18,6 +18,22 @@ func crossCheckPlain(s string) string {
 	return (&tuiRenderer{}).Plain(s, 200)
 }
 
+// crossCheckActiveLabel is shared by run get and the TUI detail. The server's
+// presence field is a closed enum; unknown future values add no misleading line.
+func crossCheckActiveLabel(active *string) string {
+	if active == nil {
+		return ""
+	}
+	switch *active {
+	case "plan":
+		return "Plan cross-check in progress"
+	case "code":
+		return "Code cross-check in progress (advisory, does not block)"
+	default:
+		return ""
+	}
+}
+
 // crossCheckSource renders only the closed provenance vocabulary. Older
 // records and unfamiliar server values cannot assert a known source.
 func crossCheckSource(source *string) string {
@@ -42,11 +58,7 @@ func crossCheckEffortSource(source *string) string {
 // maxCrossCheckRounds bounds the rounds a client renders, matching the server's cap.
 const maxCrossCheckRounds = 5
 
-func planCrossCheckRows(r apitypes.RunDTO) [][]string {
-	var rows [][]string
-	if r.PlanCrossCheckGated {
-		rows = append(rows, []string{"PLAN_CHECK_MODE", "checked before your review"})
-	}
+func planCrossCheckGateText(r apitypes.RunDTO) string {
 	if r.Status == "awaiting_approval" && (r.PlanCrossCheckRequired || r.PlanCrossCheckGated) && r.PlanCrossCheckGateReason != nil {
 		if reason := crossCheckPlain(*r.PlanCrossCheckGateReason); strings.TrimSpace(reason) != "" {
 			text := "plan cross-check: " + strings.ReplaceAll(reason, "_", " ")
@@ -58,8 +70,19 @@ func planCrossCheckRows(r apitypes.RunDTO) [][]string {
 					text += " (" + strings.ReplaceAll(sub, "_", " ") + ")"
 				}
 			}
-			rows = append(rows, []string{"PLAN_CROSS_CHECK", text})
+			return text
 		}
+	}
+	return ""
+}
+
+func planCrossCheckRows(r apitypes.RunDTO) [][]string {
+	var rows [][]string
+	if r.PlanCrossCheckGated {
+		rows = append(rows, []string{"PLAN_CHECK_MODE", "checked before your review"})
+	}
+	if text := planCrossCheckGateText(r); text != "" {
+		rows = append(rows, []string{"PLAN_CROSS_CHECK", text})
 	}
 	s := r.PlanCrossCheckSummary
 	if s == nil {

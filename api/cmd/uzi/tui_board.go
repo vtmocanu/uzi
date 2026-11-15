@@ -226,6 +226,10 @@ func runBand(status string, isRevising bool) int {
 	return bandFloor
 }
 
+func isCompletionBlockedTUI(r apitypes.RunDTO) bool {
+	return r.Status == statusPaused && r.CompletionPhase == "blocked"
+}
+
 // runBandOf is runBand over a list row, plus the one band decision the status cannot make
 // alone: a run held on its Codex account that needs the owner to re-log in (PRD #1590
 // relogin_required) is the owner's turn, so it bands into NEEDS YOU. Every other Codex hold
@@ -233,8 +237,9 @@ func runBand(status string, isRevising bool) int {
 // (PRD #1732 D14) resumes only on the owner's Enable or token switch. Provider unavailable
 // holds also require the owner to Resume, Stop or Cancel. Both are NEEDS YOU. Every band decision on the board
 // (the ordering, the eyebrow counts, the row's title ink) goes through here so they agree.
+// Issue #4345: a paused completion hold needs an owner decision, so it also belongs here.
 func runBandOf(r apitypes.RunListItemDTO) int {
-	if isDiskOwnerHold(r.RunDTO) || isForgeOwnerHold(r.RunDTO) || codexReloginHold(r.RunDTO) || isOwnerRequiredWorkerHold(r.RunDTO) || isSpendLimitHold(r.RunDTO) || isBoardOwnerHold(r.RunDTO) {
+	if isCompletionBlockedTUI(r.RunDTO) || isDiskOwnerHold(r.RunDTO) || isForgeOwnerHold(r.RunDTO) || codexReloginHold(r.RunDTO) || isOwnerRequiredWorkerHold(r.RunDTO) || isSpendLimitHold(r.RunDTO) || isBoardOwnerHold(r.RunDTO) {
 		return bandNeedsYou
 	}
 	return runBand(r.Status, r.IsRevising)
@@ -284,6 +289,9 @@ func runStateWord(r apitypes.RunListItemDTO) string {
 	}
 	if isCredentialSwitchUnsettledHold(r.RunDTO) {
 		return credSwitchUnsettledWord
+	}
+	if _, word, _ := checkRunState(r.RunDTO, r.IsRevising); word != "" {
+		return word
 	}
 	_, word := stateGlyphWord(r.Status, r.Health, r.IsPlanning, r.IsRevising, r.LandingState, strOr(r.StopKind, ""), strOr(r.RecoveryWaitCause, ""))
 	return word
@@ -1276,14 +1284,17 @@ func (m tuiModel) syncedScrollAt(capacity int) int {
 	return start
 }
 
-// boardSummary is the top-right glyph cluster: ⚑ N · ✎ N · ➤ N · ⚿ N · ⊘ N · ▲ N · <total> runs.
+// boardSummary is the top-right glyph cluster: ⚑ N · ✎ N · ➤ N · ⚿ N · ‖ N · ⊘ N · ▲ N · <total> runs.
 // Zero-count segments are dropped, so a healthy factory reads simply "N runs". Computed
 // over m.board.runs so it does not shrink under a filter. Approval, input, follow-up
-// and Codex relogin each have a segment. The ⊘ segment counts credential-disabled
+// Codex relogin and completion-blocked holds each have a segment. The ⊘ segment counts credential-disabled
 // provider-unavailable and iteration owner holds; their rows distinguish the typed reason.
 func (m tuiModel) boardSummary() string {
-	approvals, inputs, followups, relogins, ownerHolds, warn := 0, 0, 0, 0, 0, 0
+	approvals, inputs, followups, relogins, completionBlocks, ownerHolds, warn := 0, 0, 0, 0, 0, 0, 0
 	for _, r := range m.board.runs {
+		if isCompletionBlockedTUI(r.RunDTO) {
+			completionBlocks++
+		}
 		if codexReloginHold(r.RunDTO) {
 			relogins++
 		}
@@ -1321,6 +1332,9 @@ func (m tuiModel) boardSummary() string {
 	}
 	if relogins > 0 {
 		segs = append(segs, paintSeg(m.pal.amber, nil, false, codexReloginGlyph+" "+itoa(relogins)))
+	}
+	if completionBlocks > 0 {
+		segs = append(segs, paintSeg(m.pal.alarm, nil, false, "‖ "+itoa(completionBlocks)))
 	}
 	if ownerHolds > 0 {
 		segs = append(segs, paintSeg(m.pal.amber, nil, false, credDisabledGlyph+" "+itoa(ownerHolds)))

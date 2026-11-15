@@ -116,6 +116,9 @@ var d7UntrustedFields = []string{
 	"AgentLabel",
 	"HealthReason",
 	"FailureReason",
+	// Structural completion's unmet milestone ids are model-authored and now render below
+	// the detail header through renderer.Plain (issue #4345).
+	"CompletionUnmet",
 	// Detail and Tool are model-authored fields on apitypes.RunActivity AND apitypes.MilestoneLane.
 	// Detail (a file path, an Agent/Bash description) is surfaced on the crew rail's now line
 	// (railNowLines, via activityLabel's fallback), the board's selected-row second line

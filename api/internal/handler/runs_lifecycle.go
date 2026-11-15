@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
@@ -508,6 +509,40 @@ func (h *Handler) writeStartRunError(w http.ResponseWriter, r *http.Request, err
 	}
 }
 
+// detailCrossCheckActive reuses the live probes mirrored by the list query. It is
+// called only after GetRun's viewer gate, so the unscoped probes disclose nothing.
+func (h *Handler) detailCrossCheckActive(ctx context.Context, run store.Run) (*string, error) {
+	if h.q == nil { // unit handlers without a store have no live-check rows to read
+		return nil, nil
+	}
+	if run.Status != "claimed" && run.Status != "running" {
+		return nil, nil
+	}
+	if runkind.PlanCrossCheckable(run.Kind) && (run.PlanCrossCheckRequired || run.PlanCrossCheckGated) {
+		plan, err := h.q.HasLivePlanCrossCheck(ctx, run.ID)
+		if err != nil {
+			return nil, err
+		}
+		if plan {
+			return crossCheckActive(true, false), nil
+		}
+	}
+	if run.Status != "running" || !run.CodeCrossCheckRequired || run.ReportOnly {
+		return nil, nil
+	}
+	_, err := h.q.GetLiveCodeCrossCheckDeadline(ctx, store.GetLiveCodeCrossCheckDeadlineParams{
+		LeadRunID: run.ID,
+		ServerNow: pgtype.Timestamptz{Time: h.clock(), Valid: true},
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return crossCheckActive(false, true), nil
+}
+
 // GetRun returns one run visible to the viewer (owner, or any run for an admin).
 func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 	user, ok := mw.UserFromContext(r.Context())
@@ -587,6 +622,14 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 		applyRevising(&dto, revising[run.ID])
 	}
 	h.overlayPlanCrossCheckSummary(r.Context(), user.ID, run, &dto)
+	// The detail read needs the same live presence signal as the run lists. Reuse the
+	// health probes that the list SQL mirrors, after the viewer gate above, so direct
+	// TUI entry and its metadata refresh do not depend on an older board row.
+	if active, activeErr := h.detailCrossCheckActive(r.Context(), run); activeErr != nil {
+		slog.Error("get run cross-check state", "run_id", run.ID, "error", activeErr)
+	} else {
+		dto.CrossCheckActive = active
+	}
 	// PRD #1064 M2: the server-derived "now" line. runToDTO stays pure, so the field is
 	// set here in the caller from the batched lookup (one run this time). null for a
 	// terminal run (no "now") and, via the batched query, for a run with no tool_use
