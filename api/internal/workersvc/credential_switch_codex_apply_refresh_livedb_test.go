@@ -12,7 +12,8 @@ func TestCodexRefreshAdmittedBeforeApplyLiveDB(t *testing.T) {
 	acct := f.env.mustAccount(t, f.o.userID, account)
 	checked := false
 	refreshToken := codexToken("admitted-refresh")
-	fake := &fakeRefreshClient{result: codexauth.RefreshResult{AccessToken: codexToken("admitted-new"), RefreshToken: &refreshToken}}
+	accessToken := codexToken("admitted-new")
+	fake := &fakeRefreshClient{result: codexauth.RefreshResult{AccessToken: accessToken, RefreshToken: &refreshToken}}
 	setFakeMatchIdentity(fake, codexauth.Identity{ProviderUserID: acct.ProviderUserID, WorkspaceAccountID: acct.WorkspaceAccountID})
 	fake.onRefresh = func() {
 		checked = true
@@ -30,7 +31,7 @@ func TestCodexRefreshAdmittedBeforeApplyLiveDB(t *testing.T) {
 	}
 	f.svc.codexRefresh = fake
 	res, err := f.svc.CoordinatedCodexRefresh(f.env.ctx, f.worker(t), run, capability, uuid.New(), 0)
-	if err != nil || !checked || fake.calls != 1 || res.AccessToken != codexToken("admitted-new") {
+	if err != nil || !checked || fake.calls != 1 || res.AccessToken != accessToken {
 		t.Fatalf("admitted refresh failed: checked=%t calls=%d err=%v", checked, fake.calls, err)
 	}
 }

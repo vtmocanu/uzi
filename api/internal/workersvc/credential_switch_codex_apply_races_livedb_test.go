@@ -169,7 +169,8 @@ func TestCodexApplyAccountLockOrderLiveDB(t *testing.T) {
 	f, run, accountA, _ := codexApplyFromSubscription(t)
 	aRun := mustRun(t, f.env, run)
 	aliasA := uuid.UUID(aRun.CodexSecretID.Bytes)
-	aliasB := f.env.seedLinkedSubscription(t, f.o.userID, "lock-order-B", codexToken("lock-B-access"), codexToken("lock-B-refresh"))
+	accessTokenB := codexToken("lock-B-access")
+	aliasB := f.env.seedLinkedSubscription(t, f.o.userID, "lock-order-B", accessTokenB, codexToken("lock-B-refresh"))
 	stateB, err := f.env.q.GetCodexCredentialState(f.env.ctx, store.GetCodexCredentialStateParams{UserSecretID: aliasB, UserID: f.o.userID})
 	if err != nil || !stateB.ProviderAccountID.Valid {
 		t.Fatal("B account unavailable")
@@ -223,12 +224,12 @@ func TestCodexApplyAccountLockOrderLiveDB(t *testing.T) {
 			t.Fatal("account locks did not follow exact old-to-target order")
 		}
 	}
-	check(aliasA, aliasB, accountA, accountB, codexToken("lock-B-access"))
+	check(aliasA, aliasB, accountA, accountB, accessTokenB)
 	if _, err := f.svc.SetRunCredential(f.env.ctx, f.o.userID, run, BindModePinned, &aliasA); err != nil {
 		t.Fatal("request A failed")
 	}
 	observer.events = nil
-	check(aliasB, aliasA, accountB, accountA, codexToken("target-access"))
+	check(aliasB, aliasA, accountB, accountA, codexApplyTargetAccess)
 }
 
 func TestCodexApplyBusyOldAccountLiveDB(t *testing.T) {
