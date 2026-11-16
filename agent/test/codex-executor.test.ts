@@ -32469,6 +32469,7 @@ describe("M2 actualRunner credential replacement", () => {
           : oldClaim !== API_KEY || target !== SUBSCRIPTION))) continue;
         const positiveBChild = publication === "gated" && oldClaim === API_KEY && target === SUBSCRIPTION && phase === "factory";
         const probeEpochConsumers = publication === "baseline" && oldClaim === API_KEY && phase === "factory";
+        const probeBInitialCredential = publication === "baseline" && phase === "factory";
         const queuedRefreshStop = publication === "subscription-refresh-prepare-failure" || publication === "subscription-refresh-cancel";
         const crashRecovery = publication === "crash-after-a-teardown-recovery" ||
           publication === "crash-apply-reply-lost-recovery" || publication === "crash-apply-ack-recovery" ||
@@ -33120,7 +33121,25 @@ describe("M2 actualRunner credential replacement", () => {
         let retainedBoundaryActive = false, retainedBoundaryReleasedA = false;
         const retiredBoundaries: { result: string; releaseCalls: number; releasedA: boolean }[] = [];
         let staleSummaryCapture: string | undefined;
-        rig.client.releaseCodex = async (id, req) => {
+        const bInitialCredentialObserved = installerBarrier();
+        let bInitialCredentialRequest: { capability: boolean; mode: boolean; account: boolean; floor: boolean;
+          rootReaped: boolean; effectDisposed: boolean; fileopDisposed: boolean } | undefined;
+        rig.client.releaseCodex = async (id, req, expected?: Parameters<WorkerClient["releaseCodex"]>[2]) => {
+          if (probeBInitialCredential && applies > 0 && !retainedBoundaryActive && !bInitialCredentialRequest) {
+            bInitialCredentialRequest = {
+              capability: req.capability === next.capability,
+              mode: expected?.authMode === next.auth_mode,
+              account: next.auth_mode === "subscription"
+                ? expected?.authMode === "subscription" && expected.chatgptAccountId === next.chatgpt_account_id
+                : expected?.authMode === "api_key" && !("chatgptAccountId" in expected),
+              floor: next.auth_mode === "subscription"
+                ? expected?.authMode === "subscription" && expected.minimumGeneration === next.generation
+                : expected?.authMode === "api_key" && !("minimumGeneration" in expected),
+              rootReaped: events.includes("A-reaped"), effectDisposed: events.includes("A-effect-disposed"),
+              fileopDisposed: (fileops[0]?.disposed() ?? 0) > 0,
+            };
+            bInitialCredentialObserved.resolve();
+          }
           if (resumeVariant && applies > 0) assert.equal(req.capability, next.capability, "A auth never revives after apply");
           credentialReleases++;
           if (retainedBoundaryActive && req.capability === oldClaim.capability) retainedBoundaryReleasedA = true;
@@ -34983,6 +35002,12 @@ describe("M2 actualRunner credential replacement", () => {
               }
               return;
             }
+          }
+          if (probeBInitialCredential) {
+            await withTimeout(bInitialCredentialObserved.promise, 5000, "B initial credential request observed");
+            assert.deepEqual(bInitialCredentialRequest, { capability: true, mode: true, account: true, floor: true,
+              rootReaped: true, effectDisposed: true, fileopDisposed: true },
+            "B provider credential release uses replacement authority after A reap");
           }
           await withTimeout(bEntered.promise, 5000, "M2 B turn").catch(error => {
             throw new Error(JSON.stringify({ events, applies, hooks, diagnostics: diagnostics.lines, messages: api.messages(claim.run_id) }), { cause: error });
