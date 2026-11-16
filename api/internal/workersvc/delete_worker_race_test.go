@@ -14,7 +14,8 @@ import (
 
 // #4389: a hibernation cache prune can settle (or a new one start) between a worker DELETE that
 // matched no row and the re-read. raceStore sequences the delete path per call so each race is
-// deterministic; past the end of a sequence the last value repeats.
+// deterministic. Past the end of deletes, rereads, activeRuns or custody the last value
+// repeats; a rereadErrs entry applies only at its own call index.
 type raceStore struct {
 	*fakeStore
 	deletes     []int64
@@ -48,8 +49,8 @@ func (r *raceStore) DeleteWorkerForUser(context.Context, store.DeleteWorkerForUs
 func (r *raceStore) GetWorkerByIDForUser(context.Context, store.GetWorkerByIDForUserParams) (store.Worker, error) {
 	i := r.rereadCalls
 	r.rereadCalls++
-	if err := seqAt(r.rereadErrs, i); err != nil && i < len(r.rereadErrs) {
-		return store.Worker{}, err
+	if i < len(r.rereadErrs) && r.rereadErrs[i] != nil {
+		return store.Worker{}, r.rereadErrs[i]
 	}
 	w := seqAt(r.rereads, i)
 	if w == nil {
@@ -178,7 +179,7 @@ func TestDeleteWorkerRereadErrorsAndAbsence(t *testing.T) {
 	boom := errors.New("db down")
 	t.Run("first reread error", func(t *testing.T) {
 		rs := &raceStore{deletes: []int64{0}, rereadErrs: []error{boom}}
-		if err := newRaceSvc(t, rs).DeleteWorker(context.Background(), uuid.New(), uuid.New()); !errors.Is(err, boom) || errors.Is(err, ErrWorkerNotFound) {
+		if err := newRaceSvc(t, rs).DeleteWorker(context.Background(), uuid.New(), uuid.New()); err != boom {
 			t.Fatalf("err = %v, want the lookup error unchanged", err)
 		}
 		if rs.deleteCalls != 1 {
@@ -187,7 +188,7 @@ func TestDeleteWorkerRereadErrorsAndAbsence(t *testing.T) {
 	})
 	t.Run("second reread error", func(t *testing.T) {
 		rs := &raceStore{deletes: []int64{0, 0}, rereads: []*store.Worker{phaseRow(CleanupPhaseSettled)}, rereadErrs: []error{nil, boom}}
-		if err := newRaceSvc(t, rs).DeleteWorker(context.Background(), uuid.New(), uuid.New()); !errors.Is(err, boom) {
+		if err := newRaceSvc(t, rs).DeleteWorker(context.Background(), uuid.New(), uuid.New()); err != boom {
 			t.Fatalf("err = %v, want the lookup error unchanged", err)
 		}
 		if rs.deleteCalls != 2 {

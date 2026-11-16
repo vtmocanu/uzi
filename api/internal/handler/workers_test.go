@@ -360,10 +360,11 @@ func TestDeleteWorkerCleanupRaceStatusMapping(t *testing.T) {
 		name   string
 		reread *store.Worker
 		want   int
+		body   string
 	}{
-		{"unsettled", &store.Worker{CleanupPhase: workersvc.CleanupPhaseStarted}, http.StatusConflict},
-		{"raced twice, present and settled", &store.Worker{CleanupPhase: workersvc.CleanupPhaseSettled}, http.StatusConflict},
-		{"absent", nil, http.StatusNotFound},
+		{"unsettled", &store.Worker{CleanupPhase: workersvc.CleanupPhaseStarted}, http.StatusConflict, "wait for the cleanup to settle"},
+		{"raced twice, present and settled", &store.Worker{CleanupPhase: workersvc.CleanupPhaseSettled}, http.StatusConflict, "retry the delete"},
+		{"absent", nil, http.StatusNotFound, "worker not found"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			st := &deleteWorkerStore{deleteRows: 0, reread: tc.reread}
@@ -372,6 +373,9 @@ func TestDeleteWorkerCleanupRaceStatusMapping(t *testing.T) {
 			h.DeleteWorker(rec, deleteWorkerReq(store.User{ID: uuid.New()}, uuid.New()))
 			if rec.Code != tc.want {
 				t.Fatalf("status = %d, want %d\nbody: %s", rec.Code, tc.want, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), tc.body) {
+				t.Fatalf("body = %s, want it to contain %q", rec.Body.String(), tc.body)
 			}
 		})
 	}
