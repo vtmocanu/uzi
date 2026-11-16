@@ -216,6 +216,15 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **Chart and packaged-proof PostgreSQL images use the tested digest ([#4275](https://github.com/vtmocanu/uzi/pull/4275), [#4285](https://github.com/vtmocanu/uzi/pull/4285)).**
   Keep the simple chart, both compose stacks, LiveDB CI and packaged-proof defaults in one Renovate group, with parity checks rejecting partial updates; explicit image overrides remain available.
 
+- **A worker shutdown or cancel no longer waits on a pre-exit secret scan ([#4313](https://github.com/vtmocanu/uzi/pull/4313), [#4358](https://github.com/vtmocanu/uzi/pull/4358)).**
+  The done-point gate and resume preflight now stop their fetch-back, gitleaks and git children on cancel, claim fence, terminal fence, worker shutdown or (Claude) disk stop, so the shutdown checkpoint is no longer held behind a full scan.
+
+- **Definitively declined retained source ends hold for their owner ([#4365](https://github.com/vtmocanu/uzi/pull/4365), [#4378](https://github.com/vtmocanu/uzi/pull/4378)).**
+  Exact process-local source evidence stops futile retries; Resume requires a changed current worker registration on upgraded APIs and still grants no source reuse or custody release proof.
+
+- **A lead's report_progress call may name a single milestone id ([#4361](https://github.com/vtmocanu/uzi/pull/4361)).**
+  The Claude harness accepts a bare string for `completed` or `in_progress` and records it as one id instead of rejecting the call.
+
 ### Added
 
 - **A preview of the new Overview at /overview/next, decisions first ([#3878](https://github.com/vtmocanu/uzi/pull/3878), [#3952](https://github.com/vtmocanu/uzi/pull/3952)).**
@@ -343,6 +352,18 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 - **Hosted workers can trust an extra CA bundle ([#4236](https://github.com/vtmocanu/uzi/pull/4236)).**
   The chart's `workers.extraCA` (inline PEM or an existing ConfigMap) is appended after the api's CA in each worker's Secret, so the worker and, without `workers.uidSplit`, the Claude Code CLI can reach a private-CA LLM gateway or self-hosted forge API over HTTPS. Workers also trust it for their own connection to the api. Under `workers.uidSplit` the CLI does not get it (isolated-lane workers excepted: they never take the split), and it does not change git's or the toolchain's trust, so `git clone` from a private-CA forge still fails.
+
+- **The command menu finds tabs, sections, named things and doc headings ([#4373](https://github.com/vtmocanu/uzi/pull/4373), [#4375](https://github.com/vtmocanu/uzi/pull/4375)).**
+  Typing now also finds Settings and Admin tabs and Admin Settings sections, agents, schedules, workers, skills, recent runs by number or title, and docs by title or heading; schedule, worker and skill links reveal the item on its page.
+
+- **Run health shows when a secret-scan finding withholds checkpoint publication ([#4257](https://github.com/vtmocanu/uzi/pull/4257), [#4364](https://github.com/vtmocanu/uzi/pull/4364)).**
+  The CLI, TUI and web flag the run with a fixed owner hint until a later admitted and accepted checkpoint publication clears it (a trusted finding that arrives after that publication's admission keeps it up).
+
+- **Worker-side groundwork for preserving a finished run's terminal work is in place but switched off ([#4007](https://github.com/vtmocanu/uzi/pull/4007), [#4354](https://github.com/vtmocanu/uzi/pull/4354)).**
+  The worker code sits behind a compile-time-off gate and advertises no capability, so there is no behaviour change for users yet.
+
+- **Admins can turn on automatic hibernation of idle hosted workers ([#4207](https://github.com/vtmocanu/uzi/pull/4207), [#4363](https://github.com/vtmocanu/uzi/pull/4363)).**
+  Off by default behind `worker_hibernation_auto` (effective only with `worker_hibernation_enabled`); a persistent hosted worker with no run activity of any kind for `worker_hibernation_idle_after` (default 14 days) is hibernated, at most 10 per minute, and every completed wake restarts the idle clock; refusals are recorded and a controller refusal pauses retries for 1 hour; enable it only after the #4206 cache cleanup and its worker support are deployed; a new instance-scoped `fleet.hibernation` Admin health check names blocked idle workers and long-parked runs; downgrading needs `worker_hibernation_auto` off, then the three #4207 migrations rolled back before an older api starts; they add worker columns, two CHECK constraints (validated in the next migration), a backfill of the wake anchor and two runs indexes, and rolling them back drops the recorded refusal markers and wake anchors. Automatic mode is rechecked for each locked candidate; an off or unreadable result prevents admission.
 
 ### Changed
 
@@ -474,6 +495,18 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 - **Overview Issue work shows completion checks on Building chips ([#4283](https://github.com/vtmocanu/uzi/pull/4283)).**
   Building chips and the station caption distinguish runs checking completion or reworking unmet milestones, including when a code cross-check runs alongside them.
+
+- **Overview status chips stay visible on wide screens ([#4370](https://github.com/vtmocanu/uzi/pull/4370)).**
+  The chip row pins to the content column during a scroll and keeps its popovers and keyboard focus usable.
+
+- **The Overview Agents chip shows configured definitions ([#4367](https://github.com/vtmocanu/uzi/pull/4367)).**
+  Its popover groups agent origins and shows admin-only source sync attention without depending on allocation reads.
+
+- **The new Overview header is compact ([#4366](https://github.com/vtmocanu/uzi/pull/4366)).**
+  Run totals now appear in the Runs card, and an empty decision area shows a calm notice after its data loads.
+
+- **A publication-context snapshot deadline error is now logged ([#4302](https://github.com/vtmocanu/uzi/pull/4302), [#4371](https://github.com/vtmocanu/uzi/pull/4371)).**
+  When either snapshot read in a refresh publication check encounters a deadline error (its context is capped at five seconds), the api logs `publication_context_snapshot_deadline` with the phase, elapsed time and starting budget; the unknown reason returned to the worker is unchanged.
 
 ### Security
 
