@@ -40,14 +40,21 @@ type importProbe struct {
 	gate        map[int64]chan struct{} // listings block until closed
 	status      map[int64]int           // non-zero answers with this HTTP status
 	onListing   func(project int64, n int)
+	aborted     map[int64]int // listings whose HTTP request context was cancelled mid-flight
 }
 
 func newImportProbe() *importProbe {
 	return &importProbe{
 		listings: map[int64]int{}, inflight: map[int64]int{}, maxInflight: map[int64]int{},
 		issues: map[int64][]int64{}, delayFirst: map[int64]time.Duration{},
-		gate: map[int64]chan struct{}{}, status: map[int64]int{},
+		gate: map[int64]chan struct{}{}, status: map[int64]int{}, aborted: map[int64]int{},
 	}
+}
+
+func (p *importProbe) abortedCount(project int64) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.aborted[project]
 }
 
 func (p *importProbe) set(f func()) {
@@ -97,6 +104,12 @@ func (p *importProbe) serve(w http.ResponseWriter, r *http.Request) bool {
 		p.inflight[project]--
 		p.mu.Unlock()
 	}()
+	abort := func() bool {
+		p.mu.Lock()
+		p.aborted[project]++
+		p.mu.Unlock()
+		return true
+	}
 
 	if cb != nil {
 		cb(project, n)
@@ -105,14 +118,14 @@ func (p *importProbe) serve(w http.ResponseWriter, r *http.Request) bool {
 		select {
 		case <-gate:
 		case <-r.Context().Done():
-			return true
+			return abort()
 		}
 	}
 	if delay > 0 {
 		select {
 		case <-time.After(delay):
 		case <-r.Context().Done():
-			return true
+			return abort()
 		}
 	}
 	if status != 0 {
@@ -283,24 +296,50 @@ func TestSetRepoEnableReturnsBeforeSlowImportLiveDB(t *testing.T) {
 	}
 }
 
-// A client that disconnects (or a gateway that cancels) right after the response must
-// not cancel the import: the poller owns it.
+// Cancelling the enable request's context while the import's first issue listing is
+// in flight must not cancel the import: the poller owns it. The listing hook cancels
+// the request context the moment the first listing starts, and the fake counts any
+// listing whose own HTTP request was cancelled mid-flight. An import that ran on the
+// request context would see such an abort; the poller's import must see none.
 func TestSetRepoEnableImportSurvivesRequestCancelLiveDB(t *testing.T) {
 	ctx := context.Background()
 	f := newEnableGuardFixture(ctx, t)
 	probe := f.useProbe()
 	const project = 202
-	probe.set(func() { probe.delayFirst[project] = time.Second })
+	probe.set(func() { probe.delayFirst[project] = 500 * time.Millisecond })
 	probe.setIssues(project, 5, 6)
 	repoID := f.seedRepo(ctx, t, project, false, protClean)
-	f.runPoller(t, f.newPoller(100*time.Millisecond))
 
 	reqCtx, cancel := context.WithCancel(ctx)
-	w := f.setEnabledCtx(reqCtx, t, repoID, true)
-	cancel()
-	f.requireOK(t, w)
+	defer cancel()
+	var once sync.Once
+	probe.set(func() {
+		probe.onListing = func(p int64, n int) {
+			if p == project {
+				once.Do(cancel) // the first listing is now in progress
+			}
+		}
+	})
+	f.runPoller(t, f.newPoller(100*time.Millisecond))
+
+	// The handler runs in a goroutine so that an implementation importing on the
+	// request context cannot wedge the test; every wait below is bounded.
+	resp := make(chan *httptest.ResponseRecorder, 1)
+	go func() { resp <- f.setEnabledCtx(reqCtx, t, repoID, true) }()
+	select {
+	case w := <-resp:
+		f.requireOK(t, w)
+	case <-time.After(20 * time.Second):
+		t.Fatal("the enable request did not return within 20s")
+	}
 
 	f.waitImport(ctx, t, repoID, "succeeded")
+	if reqCtx.Err() == nil {
+		t.Fatal("the request context was never cancelled: the first listing did not start")
+	}
+	if n := probe.abortedCount(project); n != 0 {
+		t.Errorf("%d issue listing(s) were cancelled mid-flight by the request cancellation, want 0", n)
+	}
 	if got := f.cachedIIDs(ctx, t, repoID); fmt.Sprint(got) != "[5 6]" {
 		t.Errorf("cached issues = %v, want [5 6] after the request was cancelled", got)
 	}

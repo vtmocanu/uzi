@@ -521,10 +521,15 @@ func TestInitialImportWakePassIsScopedAndKeepsOtherStateLiveDB(t *testing.T) {
 	if r := e.row(requestedFailed); r.state != "failed" {
 		t.Fatalf("failed repo row = %+v, want left for the regular tick", r)
 	}
-	// The request set was drained: a second wake does nothing.
+	// The request set was drained: put the requested repo back to waiting (it owes an
+	// import again) and wake with no new request. It must not be synced.
+	e.exec(`UPDATE repos SET initial_import_state='waiting' WHERE id=$1`, requested)
 	before := e.fake.listCalls(requestedProject)
 	en.importRequested(e.ctx)
 	if e.fake.listCalls(requestedProject) != before {
 		t.Fatal("a second wake re-synced a repo that was no longer requested")
+	}
+	if r := e.row(requested); r.state != "waiting" {
+		t.Fatalf("repo row after an unrequested wake = %+v, want still waiting", r)
 	}
 }
