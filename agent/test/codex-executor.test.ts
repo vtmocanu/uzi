@@ -32822,6 +32822,7 @@ describe("M2 actualRunner credential replacement", () => {
           }
           applyRequests.push({ claimGeneration: req.claimGeneration, opId: req.opId });
           applies++;
+          if (publication === "baseline") events.push("apply");
           if (successorEpochAdvance) {
             if (applies > 1) forbiddenSuccessorApply.resolve();
             assert.equal(applies, 1, "successor apply is forbidden after READY advances the latched epoch");
@@ -33220,13 +33221,37 @@ describe("M2 actualRunner credential replacement", () => {
           });
         }
         let reopenAttempts = 0, publishAttempts = 0, restartAttempts = 0;
+        let aReconcileCalls = 0;
+        const aReconcileOutcomes: string[] = [];
+        const aTeardownEntered = installerBarrier();
+        let aReconcileAtTeardown: { calls: number; outcomes: string[] } | undefined;
+        const assertAReconcileBeforeTeardown = () => {
+          assert.deepEqual(aReconcileAtTeardown, { calls: 1, outcomes: ["ready"] },
+            "real A credential reconcile completes ready exactly once before teardown can revoke A");
+          const order = ["A-reconcile-start", "A-reconcile-ready", "A-persist", "preflight", "A-teardown-entry"];
+          for (const [index, event] of order.entries()) {
+            assert.ok(events.includes(event), `observed ${event}`);
+            if (index > 0) assert.ok(events.indexOf(order[index - 1]!) < events.indexOf(event),
+              `${order[index - 1]} precedes ${event}`);
+          }
+        };
         const suspend = executor.suspendCodexEpoch.bind(executor);
         executor.suspendCodexEpoch = async bounds => {
           executorSuspensionEntered.resolve();
           executorEntryNowDrain.push({ completed: nowDrainCompleted, raw: events.includes("A-Now-drained") });
           const lease = await suspend(bounds);
           return { ...lease,
+            // Observe only the real switch lease, never the separate retained-A stale probe in B.
+            reconcileA: publication === "baseline" ? async function (this: unknown, ...args: Parameters<typeof lease.reconcileA>) {
+              aReconcileCalls++;
+              events.push("A-reconcile-start");
+              const result = await Reflect.apply(lease.reconcileA, this, args);
+              aReconcileOutcomes.push(result.kind);
+              events.push(`A-reconcile-${result.kind}`);
+              return result;
+            } : lease.reconcileA,
             persistRollout: async bounds => {
+              if (publication === "baseline") events.push("A-persist");
               failingPersist = persistFailure;
               try {
                 const saved = await lease.persistRollout(bounds);
@@ -33240,6 +33265,12 @@ describe("M2 actualRunner credential replacement", () => {
               }
             },
             teardown: async bounds => {
+              if (publication === "baseline") {
+                // Snapshot before the production lease retires authority; assert outside Runner's catch paths.
+                aReconcileAtTeardown = { calls: aReconcileCalls, outcomes: [...aReconcileOutcomes] };
+                events.push("A-teardown-entry");
+                aTeardownEntered.resolve();
+              }
               teardownAttempts++;
               const result = await lease.teardown(bounds);
               teardownResults.push(result);
@@ -33945,6 +33976,10 @@ describe("M2 actualRunner credential replacement", () => {
               assert.equal(await fs.readFile(path.join(worktree, "M2-retained.txt"), "utf8"), "A work");
             }
             return;
+          }
+          if (publication === "baseline") {
+            await withTimeout(aTeardownEntered.promise, 5000, "M2 real lease teardown entry");
+            assertAReconcileBeforeTeardown();
           }
           await withTimeout(cleanupEntered.promise, 5000, "M2 A teardown");
           if (preflightRetry) {
@@ -35013,6 +35048,12 @@ describe("M2 actualRunner credential replacement", () => {
             throw new Error(JSON.stringify({ events, applies, hooks, diagnostics: diagnostics.lines, messages: api.messages(claim.run_id) }), { cause: error });
           });
           if (publication === "baseline") {
+            assertAReconcileBeforeTeardown();
+            assert.equal(aReconcileCalls, 1, "B stale-boundary probe does not count as switch reconciliation");
+            assert.deepEqual(aReconcileOutcomes, ["ready"]);
+            assert.ok(events.includes("apply"));
+            assert.ok(events.indexOf("A-teardown-entry") < events.indexOf("apply"));
+            assert.ok(events.indexOf("apply") < events.indexOf("account/login/start"));
             await withTimeout(Promise.all(triggers), 5000, "B ordinary work before allocation proof");
             if (probeEpochConsumers) {
               assert.deepEqual(retiredBoundaries, [{ result: "retired", releaseCalls: 0, releasedA: false }],
