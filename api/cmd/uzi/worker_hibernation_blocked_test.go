@@ -23,7 +23,7 @@ func blockedWorker(reason string) apitypes.WorkerDTO {
 // The detail line names the blocker, since when and the last observation, in RFC3339 UTC, on
 // every worker listing surface.
 func TestWorkerHibernationBlockedDetail(t *testing.T) {
-	const want = "Hibernation blocked worker w1: recovery custody hold (since 2026-03-01T08:00:00Z, last observed 2026-03-04T08:30:00Z)"
+	const want = "Hibernation blocker (last recorded) worker w1: recovery custody hold (since 2026-03-01T08:00:00Z, last observed 2026-03-04T08:30:00Z)"
 	w := blockedWorker("custody_hold")
 
 	out, _, code := runCLI(t, fakeEnv(&uzicli.FakeClient{Workers: []apitypes.WorkerDTO{w}}), "worker", "list")
@@ -37,7 +37,7 @@ func TestWorkerHibernationBlockedDetail(t *testing.T) {
 
 	none := apitypes.WorkerDTO{ID: "w2", Name: "idle", Status: "online", Kind: "hosted"}
 	out, _, _ = runCLI(t, fakeEnv(&uzicli.FakeClient{Workers: []apitypes.WorkerDTO{none}}), "worker", "list")
-	if strings.Contains(out, "Hibernation blocked") {
+	if strings.Contains(out, "Hibernation blocker") {
 		t.Fatalf("unset reason printed a detail line:\n%s", out)
 	}
 }
@@ -56,7 +56,7 @@ func TestWorkerHibernationBlockedLabels(t *testing.T) {
 	if strings.Contains(out, "\x1b") || strings.Contains(out, "\nFORGED ROW") {
 		t.Fatalf("unsanitized reason:\n%q", out)
 	}
-	if !strings.Contains(out, "Hibernation blocked worker w1: weird") {
+	if !strings.Contains(out, "Hibernation blocker (last recorded) worker w1: weird") {
 		t.Fatalf("unknown code not shown:\n%s", out)
 	}
 }
@@ -80,5 +80,40 @@ func TestWorkerHibernationBlockedJSON(t *testing.T) {
 		if v, ok := got[1][k]; !ok || v != nil {
 			t.Fatalf("unset %s = %v (present %v), want null", k, v, ok)
 		}
+	}
+}
+
+func rollMarkerWorker(m *apitypes.RollMarkerDTO) apitypes.WorkerDTO {
+	return apitypes.WorkerDTO{ID: "w1", Name: "prod-1", Status: "online", Kind: "hosted", RollMarker: m}
+}
+
+// The roll-marker line shows every populated field and is sanitized.
+func TestWorkerRollMarkerLine(t *testing.T) {
+	yes := true
+	ver, grp, blocked := "0.11.7", "0123456789abcdef", "waiting\x1b[31m_for\nFORGED ROW"
+	at := time.Date(2026, 3, 4, 9, 30, 0, 0, time.FixedZone("x", 3600))
+	m := &apitypes.RollMarkerDTO{State: "present", Canary: &yes, Completed: &yes, TargetVersion: &ver,
+		CoverageGroup: &grp, Reservation: &yes, Blocked: &blocked, ObservedAt: &at}
+	out, _, code := runCLI(t, fakeEnv(&uzicli.FakeClient{Workers: []apitypes.WorkerDTO{rollMarkerWorker(m)}}), "worker", "list")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit %d", code)
+	}
+	if strings.Contains(out, "\x1b") || strings.Contains(out, "\nFORGED ROW") {
+		t.Fatalf("unsanitized marker:\n%q", out)
+	}
+	const want = "  Roll marker: present · canary · completed · target 0.11.7 · group 0123456789abcdef · reservation · blocked: waiting_for FORGED ROW · observed 2026-03-04T08:30:00Z"
+	if !strings.Contains(out, want) {
+		t.Fatalf("missing %q in:\n%s", want, out)
+	}
+
+	out, _, _ = runCLI(t, fakeEnv(&uzicli.FakeClient{Workers: []apitypes.WorkerDTO{rollMarkerWorker(&apitypes.RollMarkerDTO{State: "unknown"})}}), "worker", "list")
+	if !strings.Contains(out, "  Roll marker: unknown\n") {
+		t.Fatalf("unknown marker line missing:\n%s", out)
+	}
+	ext := rollMarkerWorker(m)
+	ext.Kind = "external"
+	out, _, _ = runCLI(t, fakeEnv(&uzicli.FakeClient{Workers: []apitypes.WorkerDTO{ext}}), "worker", "list")
+	if strings.Contains(out, "Roll marker") {
+		t.Fatalf("external worker printed a marker:\n%s", out)
 	}
 }

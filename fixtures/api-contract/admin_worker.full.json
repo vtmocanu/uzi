@@ -30,6 +30,16 @@
     "reason": "x"
   },
   "roll_pacing": {},
+  "roll_marker": {
+    "state": "x",
+    "canary": true,
+    "completed": true,
+    "target_version": "x",
+    "coverage_group": "x",
+    "reservation": true,
+    "blocked": "x",
+    "observed_at": "2020-01-02T03:04:05Z"
+  },
   "id": "x",
   "name": "x",
   "status": "x",

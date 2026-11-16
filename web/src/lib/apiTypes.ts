@@ -2851,6 +2851,23 @@ export interface WorkerRunDisk {
 
 // Fresh, read-only controller diagnostics. The Go DTO carries opaque JSON;
 // members are optional for skew and its recorded empty-object contract fixture.
+/**
+ * Controller's retained uzi.dev/image-roll evidence for one hosted worker (issue #4385).
+ * state "unknown" means no fresh report (older controller, expired, or not reported, e.g. while
+ * hibernating); "unavailable" means the controller's cluster snapshot failed; "absent" is a
+ * positively observed "no marker". observed_at is the API's receipt time ("last observed").
+ */
+export interface WorkerRollMarker {
+  state: "present" | "unreadable" | "absent" | "unavailable" | "unknown" | (string & {});
+  canary: boolean | null;
+  completed: boolean | null;
+  target_version: string | null;
+  coverage_group: string | null;
+  reservation: boolean | null;
+  blocked: string | null;
+  observed_at: string | null;
+}
+
 export interface WorkerRollPacing {
   state?: "active" | "held" | "waiting_evidence" | "override";
   target_image?: string;
@@ -2906,6 +2923,9 @@ export interface Worker {
   hibernation_cleanup?: WorkerHibernationCleanup | null;
   // Omitted when absent, invalid or older than the API's independent receipt TTL.
   roll_pacing?: WorkerRollPacing;
+  // Controller's retained roll-marker evidence (issue #4385), hosted workers only; absent for
+  // external workers and older APIs. Display-only.
+  roll_marker?: WorkerRollMarker;
   id: string;
   name: string;
   status: string; // "offline" | "online"

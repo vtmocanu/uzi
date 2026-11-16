@@ -292,8 +292,10 @@ type StatusReport struct {
 // and "never terminated" are different facts.
 type WorkerStatus struct {
 	// Raw JSON keeps an optional, unrecognized cause from failing fleet decoding.
-	BlockingKind      json.RawMessage `json:"blocking_kind,omitempty"`
-	Pacing            *Pacing         `json:"pacing,omitempty"`
+	BlockingKind json.RawMessage `json:"blocking_kind,omitempty"`
+	Pacing       *Pacing         `json:"pacing,omitempty"`
+	// RollMarker stays raw so a mistyped display-only marker cannot fail the entry's decode.
+	RollMarker        json.RawMessage `json:"roll_marker,omitempty"`
 	ID                string          `json:"id"`
 	Phase             string          `json:"phase"`
 	PhaseSince        *time.Time      `json:"phase_since"`

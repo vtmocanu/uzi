@@ -70,9 +70,11 @@ var hibernationBlockedLabels = map[string]string{
 	"intake_fenced":              "intake fenced",
 }
 
-// printWorkerHibernationDetail prints why the automatic hibernation pass cannot hibernate an
-// idle worker, when the api recorded a blocker: the reason, since when, and when the pass last
-// observed it. Nothing prints without a recorded reason.
+// printWorkerHibernationDetail prints the last recorded reason the automatic hibernation pass
+// could not hibernate an idle worker, when the api recorded one: the reason, since when, and
+// when the pass last observed it. The blocked columns are not cleared when a worker returns to
+// work, so the line is labeled "last recorded" and never reads as current. It then prints the
+// roll-marker line for a hosted worker that carries one.
 func printWorkerHibernationDetail(p *uzicli.Printer, w apitypes.WorkerDTO) {
 	if w.HibernationBlockedReason != nil && strings.TrimSpace(*w.HibernationBlockedReason) != "" {
 		code := *w.HibernationBlockedReason
@@ -80,10 +82,41 @@ func printWorkerHibernationDetail(p *uzicli.Printer, w apitypes.WorkerDTO) {
 		if !ok {
 			label = manualWorkerField(code)
 		}
-		p.Printf("Hibernation blocked worker %s: %s (since %s, last observed %s)\n",
+		p.Printf("Hibernation blocker (last recorded) worker %s: %s (since %s, last observed %s)\n",
 			manualWorkerField(w.ID), label, workerBlockedTime(w.HibernationBlockedSince), workerBlockedTime(w.HibernationBlockedAt))
 	}
-	// m3: the roll-marker line for this worker is added here, after the blocker line.
+	if w.Kind == "hosted" && w.RollMarker != nil {
+		p.Printf("%s\n", rollMarkerLine(w.RollMarker))
+	}
+}
+
+// rollMarkerLine renders the display-only roll marker; every controller-supplied value is
+// sanitized through manualWorkerField.
+func rollMarkerLine(m *apitypes.RollMarkerDTO) string {
+	var b strings.Builder
+	b.WriteString("  Roll marker: " + manualWorkerField(m.State))
+	if m.Canary != nil && *m.Canary {
+		b.WriteString(" · canary")
+	}
+	if m.Completed != nil && *m.Completed {
+		b.WriteString(" · completed")
+	}
+	if m.TargetVersion != nil && *m.TargetVersion != "" {
+		b.WriteString(" · target " + manualWorkerField(*m.TargetVersion))
+	}
+	if m.CoverageGroup != nil && *m.CoverageGroup != "" {
+		b.WriteString(" · group " + manualWorkerField(*m.CoverageGroup))
+	}
+	if m.Reservation != nil && *m.Reservation {
+		b.WriteString(" · reservation")
+	}
+	if m.Blocked != nil && strings.TrimSpace(*m.Blocked) != "" {
+		b.WriteString(" · blocked: " + manualWorkerField(*m.Blocked))
+	}
+	if m.ObservedAt != nil {
+		b.WriteString(" · observed " + m.ObservedAt.UTC().Format(time.RFC3339))
+	}
+	return b.String()
 }
 
 // workerBlockedTime renders a blocker timestamp as RFC3339 UTC, "-" when absent.

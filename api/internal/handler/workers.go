@@ -252,6 +252,7 @@ func workerDTOFromRow(w store.ListWorkersByUserRow, cpVersion, pinnedWorkerVersi
 		WakeRequestedAt:          timePtr(w.WakeRequestedAt.Valid, w.WakeRequestedAt.Time),
 		WakeError:                textPtrValue(w.WakeError.Valid, w.WakeError.String),
 		RollPacing:               freshPacingJSON(w.RollPacing, w.RollPacingObservedAt, now),
+		RollMarker:               rollMarkerDTO(w.Kind, w.RollMarker, w.RollMarkerObservedAt, now),
 		UpgradeStatus:            upgradeStatus,
 		UpgradeDetail:            textPtrValue(upgradeDetail != "", upgradeDetail),
 		UpgradeTarget:            upgradeTarget,
@@ -427,6 +428,7 @@ func rollSignalFromAdminRow(w store.ListAllWorkersRow) *workersvc.RollSignal {
 func workerDTOFromAdminRow(row store.ListAllWorkersRow, cpVersion, pinnedWorkerVersion string, now, apiStartedAt time.Time) apitypes.WorkerDTO {
 	dto := workerDTOFromWorker(row.Worker, int(row.ActiveRuns), row.Busy, "", cpVersion, pinnedWorkerVersion, now, apiStartedAt)
 	dto.RollPacing = freshPacingJSON(row.RollPacing, row.RollPacingObservedAt, now)
+	dto.RollMarker = rollMarkerDTO(row.Worker.Kind, row.RollMarker, row.RollMarkerObservedAt, now)
 	dto.ActiveCrossChecks = int(row.ActiveCrossChecks)
 	sig := rollSignalFromAdminRow(row)
 	if sig == nil {
@@ -1141,4 +1143,39 @@ func freshPacingJSON(data []byte, receipt pgtype.Timestamptz, now time.Time) jso
 		return nil
 	}
 	return out
+}
+
+// rollMarkerDTO builds the display-only roll-marker summary for a hosted worker. A
+// missing, stale, future-dated or invalid marker reads as state "unknown"; the receipt
+// time is still exposed so an admin can see when it was last observed.
+func rollMarkerDTO(kind string, data []byte, receipt pgtype.Timestamptz, now time.Time) *apitypes.RollMarkerDTO {
+	if kind != "hosted" {
+		return nil
+	}
+	dto := &apitypes.RollMarkerDTO{State: "unknown"}
+	if receipt.Valid && receipt.InfinityModifier == pgtype.Finite {
+		t := receipt.Time
+		dto.ObservedAt = &t
+	}
+	m := workersvc.ParseFreshRollMarker(data, receipt, now)
+	if m == nil {
+		return dto
+	}
+	dto.State = m.State
+	reservation := m.Reservation
+	dto.Reservation = &reservation
+	dto.Blocked = m.Blocked
+	if m.State == "present" {
+		canary, completed := m.Canary, m.Completed
+		dto.Canary, dto.Completed = &canary, &completed
+		if m.TargetVersion != "" {
+			v := m.TargetVersion
+			dto.TargetVersion = &v
+		}
+		if m.CoverageGroup != "" {
+			g := m.CoverageGroup
+			dto.CoverageGroup = &g
+		}
+	}
+	return dto
 }

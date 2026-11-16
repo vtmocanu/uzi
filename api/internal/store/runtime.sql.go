@@ -9673,6 +9673,8 @@ SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.v
        rh.upgrading_since    AS roll_upgrading_since,
        rh.pacing             AS roll_pacing,
        rh.pacing_observed_at AS roll_pacing_observed_at,
+       rh.roll_marker        AS roll_marker,
+       rh.roll_marker_observed_at AS roll_marker_observed_at,
        rh.worker_image_tag   AS roll_worker_image_tag
 FROM workers w
 LEFT JOIN user_secrets s ON s.id = w.anthropic_secret_id AND s.user_id = w.user_id
@@ -9809,6 +9811,8 @@ type GetWorkerProjectionForOwnerRow struct {
 	RollUpgradingSince         pgtype.Timestamptz `json:"roll_upgrading_since"`
 	RollPacing                 []byte             `json:"roll_pacing"`
 	RollPacingObservedAt       pgtype.Timestamptz `json:"roll_pacing_observed_at"`
+	RollMarker                 []byte             `json:"roll_marker"`
+	RollMarkerObservedAt       pgtype.Timestamptz `json:"roll_marker_observed_at"`
 	RollWorkerImageTag         pgtype.Text        `json:"roll_worker_image_tag"`
 }
 
@@ -9940,6 +9944,8 @@ func (q *Queries) GetWorkerProjectionForOwner(ctx context.Context, arg GetWorker
 		&i.RollUpgradingSince,
 		&i.RollPacing,
 		&i.RollPacingObservedAt,
+		&i.RollMarker,
+		&i.RollMarkerObservedAt,
 		&i.RollWorkerImageTag,
 	)
 	return i, err
@@ -12286,6 +12292,8 @@ SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.v
        rh.upgrading_since    AS roll_upgrading_since,
        rh.pacing             AS roll_pacing,
        rh.pacing_observed_at AS roll_pacing_observed_at,
+       rh.roll_marker        AS roll_marker,
+       rh.roll_marker_observed_at AS roll_marker_observed_at,
        rh.worker_image_tag   AS roll_worker_image_tag
 FROM workers w
 JOIN users u ON u.id = w.user_id
@@ -12311,6 +12319,8 @@ type ListAllWorkersRow struct {
 	RollUpgradingSince    pgtype.Timestamptz `json:"roll_upgrading_since"`
 	RollPacing            []byte             `json:"roll_pacing"`
 	RollPacingObservedAt  pgtype.Timestamptz `json:"roll_pacing_observed_at"`
+	RollMarker            []byte             `json:"roll_marker"`
+	RollMarkerObservedAt  pgtype.Timestamptz `json:"roll_marker_observed_at"`
 	RollWorkerImageTag    pgtype.Text        `json:"roll_worker_image_tag"`
 }
 
@@ -12465,6 +12475,8 @@ func (q *Queries) ListAllWorkers(ctx context.Context) ([]ListAllWorkersRow, erro
 			&i.RollUpgradingSince,
 			&i.RollPacing,
 			&i.RollPacingObservedAt,
+			&i.RollMarker,
+			&i.RollMarkerObservedAt,
 			&i.RollWorkerImageTag,
 		); err != nil {
 			return nil, err
@@ -15874,6 +15886,8 @@ SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.v
        rh.upgrading_since    AS roll_upgrading_since,
        rh.pacing             AS roll_pacing,
        rh.pacing_observed_at AS roll_pacing_observed_at,
+       rh.roll_marker        AS roll_marker,
+       rh.roll_marker_observed_at AS roll_marker_observed_at,
        rh.worker_image_tag   AS roll_worker_image_tag
 FROM workers w
 LEFT JOIN user_secrets s ON s.id = w.anthropic_secret_id AND s.user_id = w.user_id
@@ -16006,6 +16020,8 @@ type ListWorkersByUserRow struct {
 	RollUpgradingSince         pgtype.Timestamptz `json:"roll_upgrading_since"`
 	RollPacing                 []byte             `json:"roll_pacing"`
 	RollPacingObservedAt       pgtype.Timestamptz `json:"roll_pacing_observed_at"`
+	RollMarker                 []byte             `json:"roll_marker"`
+	RollMarkerObservedAt       pgtype.Timestamptz `json:"roll_marker_observed_at"`
 	RollWorkerImageTag         pgtype.Text        `json:"roll_worker_image_tag"`
 }
 
@@ -16164,6 +16180,8 @@ func (q *Queries) ListWorkersByUser(ctx context.Context, userID uuid.UUID) ([]Li
 			&i.RollUpgradingSince,
 			&i.RollPacing,
 			&i.RollPacingObservedAt,
+			&i.RollMarker,
+			&i.RollMarkerObservedAt,
 			&i.RollWorkerImageTag,
 		); err != nil {
 			return nil, err

@@ -186,7 +186,8 @@ INSERT INTO worker_upgrade_reports (
     worker_id, phase, phase_since, target_image, pod_phase,
     blocking_container, blocking_reason, restart_count, last_exit_code, blocking_kind,
     controller_reported_at, observed_at, upgrading_since,
-    poll_interval_seconds, worker_image_tag, pacing, pacing_observed_at
+    poll_interval_seconds, worker_image_tag, pacing, pacing_observed_at,
+    roll_marker, roll_marker_observed_at
 )
 SELECT
     w.id, $1, $2, $3, $4,
@@ -234,12 +235,17 @@ SELECT
     $14, $13,
     CASE WHEN $15::boolean THEN $16::jsonb ELSE NULL END,
     CASE WHEN $15::boolean AND $16::jsonb IS NOT NULL
+         THEN $11::timestamptz ELSE NULL END,
+    CASE WHEN $17::boolean THEN $18::jsonb ELSE NULL END,
+    CASE WHEN $17::boolean AND $18::jsonb IS NOT NULL
          THEN $11::timestamptz ELSE NULL END
 FROM workers w
-WHERE w.id = $17 AND w.kind = 'hosted'
+WHERE w.id = $19 AND w.kind = 'hosted'
 ON CONFLICT (worker_id) DO UPDATE SET
     pacing = CASE WHEN $15::boolean THEN EXCLUDED.pacing ELSE worker_upgrade_reports.pacing END,
     pacing_observed_at = CASE WHEN $15::boolean THEN EXCLUDED.pacing_observed_at ELSE worker_upgrade_reports.pacing_observed_at END,
+    roll_marker = CASE WHEN $17::boolean THEN EXCLUDED.roll_marker ELSE worker_upgrade_reports.roll_marker END,
+    roll_marker_observed_at = CASE WHEN $17::boolean THEN EXCLUDED.roll_marker_observed_at ELSE worker_upgrade_reports.roll_marker_observed_at END,
     phase                  = EXCLUDED.phase,
     phase_since            = EXCLUDED.phase_since,
     target_image           = EXCLUDED.target_image,
@@ -419,6 +425,8 @@ type UpsertWorkerRollHealthParams struct {
 	PollIntervalSeconds  pgtype.Int4        `json:"poll_interval_seconds"`
 	UpdatePacing         bool               `json:"update_pacing"`
 	Pacing               []byte             `json:"pacing"`
+	UpdateRollMarker     bool               `json:"update_roll_marker"`
+	RollMarker           []byte             `json:"roll_marker"`
 	WorkerID             uuid.UUID          `json:"worker_id"`
 }
 
@@ -461,6 +469,8 @@ func (q *Queries) UpsertWorkerRollHealth(ctx context.Context, arg UpsertWorkerRo
 		arg.PollIntervalSeconds,
 		arg.UpdatePacing,
 		arg.Pacing,
+		arg.UpdateRollMarker,
+		arg.RollMarker,
 		arg.WorkerID,
 	)
 	if err != nil {

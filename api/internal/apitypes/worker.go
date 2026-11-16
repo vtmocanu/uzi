@@ -48,9 +48,13 @@ type WorkerDTO struct {
 	// no outcome is recorded.
 	HibernationCleanup *HibernationCleanupDTO `json:"hibernation_cleanup"`
 	RollPacing         json.RawMessage        `json:"roll_pacing,omitempty"`
-	ID                 string                 `json:"id"`
-	Name               string                 `json:"name"`
-	Status             string                 `json:"status"`
+	// RollMarker (issue #4385) is the controller's display-only summary of the retained
+	// image-roll marker for a hosted worker. Absent for external workers and where no
+	// roll join exists; state "unknown" when the stored marker is missing or stale.
+	RollMarker *RollMarkerDTO `json:"roll_marker,omitempty"`
+	ID         string         `json:"id"`
+	Name       string         `json:"name"`
+	Status     string         `json:"status"`
 	// Kind is "external" (a worker its owner runs by hand) or "hosted" (one the
 	// controller runs in the cluster, PRD #58). HostedSize is the preset name (s/m/l/l-highmem),
 	// null for an external worker. Together they are what lets the UI mark hosted
@@ -359,4 +363,19 @@ type WorkerReportedRunDTO struct {
 	ClaimGeneration      int64      `json:"claim_generation"`
 	TerminalPending      bool       `json:"terminal_pending"`
 	TerminalPendingSince *time.Time `json:"terminal_pending_since"`
+}
+
+// RollMarkerDTO is the display-only roll-marker summary. State is one of present,
+// unreadable, absent, unavailable or unknown. Canary, Completed, TargetVersion and
+// CoverageGroup are non-nil only for present; Reservation and Blocked only when fresh.
+// ObservedAt is the api receipt time of the last stored marker, kept even when stale.
+type RollMarkerDTO struct {
+	State         string     `json:"state"`
+	Canary        *bool      `json:"canary"`
+	Completed     *bool      `json:"completed"`
+	TargetVersion *string    `json:"target_version"`
+	CoverageGroup *string    `json:"coverage_group"`
+	Reservation   *bool      `json:"reservation"`
+	Blocked       *string    `json:"blocked"`
+	ObservedAt    *time.Time `json:"observed_at"`
 }
