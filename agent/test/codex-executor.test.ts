@@ -32372,7 +32372,7 @@ describe("M2 actualRunner credential replacement", () => {
   for (const [oldClaim, target] of [[SUBSCRIPTION, API_KEY], [API_KEY, SUBSCRIPTION],
     [SUBSCRIPTION, { ...SUBSCRIPTION, generation: 20, chatgpt_account_id: "M2-B-account" }]] as const) {
     for (const phase of ["factory", "already-running-body"] as const) {
-      for (const publication of ["resume-preserve-pending", "resume-preserve-nonce", "resume-preserve-sequence-refused", "resume-refuse-preserve", "resume-refuse-fresh", "resume-uncertain", "baseline", "clean-apply-uncertain", "clean-successor-epoch-advance", "clean-pending-disappears", "clean-stopped-lost-reply", "clean-stopped-unconfirmed", "clean-stopped-unsupported", "clean-stopped-withdrawn", "clean-stopped-already-paused", "root-reap-unproven", "preflight-target-mismatch", "preflight-foreign-op", "preflight-busy-ready", "preflight-transport-ready", "persist-clear-confirmed", "persist-clear-owner-lost", "persist-clear-nonce-changed", "persist-clear-rejected", "persist-clear-lost-reply", "persist-clear-empty-reply", "persist-clear-pending", "inspect-missing-clear-confirmed", "inspect-unknown-clear-confirmed", "gated", "before-scope-clear", "after-scope-clear", "before-scope-install", "after-scope-install", "before-executor-publication", "before-Now-publication", "after-Now-publication", "before-B-preparation", "Now-finish-false", "publish-failure", "now-publish-failure", "login-failure", "subscription-refresh", "api-key-refresh", "subscription-refresh-prepare-failure", "subscription-refresh-cancel", "crash-after-a-teardown-recovery", "crash-apply-reply-lost-recovery", "crash-apply-ack-recovery", "crash-login-recovery"] as const) {
+      for (const publication of ["resume-policy-ack-lost", "resume-policy-ack-pending", "resume-preserve-pending", "resume-preserve-nonce", "resume-preserve-sequence-refused", "resume-refuse-preserve", "resume-refuse-fresh", "resume-uncertain", "baseline", "clean-apply-uncertain", "clean-successor-epoch-advance", "clean-pending-disappears", "clean-stopped-lost-reply", "clean-stopped-unconfirmed", "clean-stopped-unsupported", "clean-stopped-withdrawn", "clean-stopped-already-paused", "root-reap-unproven", "preflight-target-mismatch", "preflight-foreign-op", "preflight-busy-ready", "preflight-transport-ready", "persist-clear-confirmed", "persist-clear-owner-lost", "persist-clear-nonce-changed", "persist-clear-rejected", "persist-clear-lost-reply", "persist-clear-empty-reply", "persist-clear-pending", "inspect-missing-clear-confirmed", "inspect-unknown-clear-confirmed", "gated", "before-scope-clear", "after-scope-clear", "before-scope-install", "after-scope-install", "before-executor-publication", "before-Now-publication", "after-Now-publication", "before-B-preparation", "Now-finish-false", "publish-failure", "now-publish-failure", "login-failure", "subscription-refresh", "api-key-refresh", "subscription-refresh-prepare-failure", "subscription-refresh-cancel", "crash-after-a-teardown-recovery", "crash-apply-reply-lost-recovery", "crash-apply-ack-recovery", "crash-login-recovery"] as const) {
         if (publication !== "baseline" && (phase !== "factory" || (oldClaim !== API_KEY && target !== API_KEY))) continue;
         if (publication === "subscription-refresh" && target.auth_mode !== "subscription") continue;
         if (publication === "api-key-refresh" && target.auth_mode !== "api_key") continue;
@@ -32382,7 +32382,10 @@ describe("M2 actualRunner credential replacement", () => {
         const preserveNonce = publication === "resume-preserve-nonce";
         const preserveSequenceRefused = publication === "resume-preserve-sequence-refused";
         const preserveNegative = preservePending || preserveNonce || preserveSequenceRefused;
-        const resumePreserve = publication === "resume-refuse-preserve" || preserveNegative;
+        const policyAckLost = publication === "resume-policy-ack-lost";
+        const policyAckPending = publication === "resume-policy-ack-pending";
+        const policyDeliveryUnknown = policyAckLost || policyAckPending;
+        const resumePreserve = publication === "resume-refuse-preserve" || preserveNegative || policyDeliveryUnknown;
         const resumeVariant = resumeRefusal || resumeUncertain || resumePreserve;
         if (resumeVariant && (oldClaim !== API_KEY || target !== SUBSCRIPTION || phase !== "factory")) continue;
         const successorEpochAdvance = publication === "clean-successor-epoch-advance";
@@ -32431,6 +32434,7 @@ describe("M2 actualRunner credential replacement", () => {
         ? `M2 actualRunner ${oldClaim.auth_mode} to ${target.auth_mode} ${phase} account resumes saved thread`
         : resumeRefusal ? "Codex real Runner confirmed B resume refusal starts exactly one fresh lineage"
         : preserveNegative ? `Codex real Runner preserve-only B resume fences handoff (${publication})`
+        : policyDeliveryUnknown ? `Codex real Runner preserves B resume refusal with unknown policy delivery (${publication})`
         : resumePreserve ? "Codex real Runner wire preserve-only claim re-holds confirmed B saved-thread resume refusal"
         : resumeUncertain ? "Codex real Runner uncertain B resume failure pauses without fresh fallback"
         : successorEpochAdvance ? "Codex real Runner rejects successor READY epoch 12 after latching epoch 11"
@@ -32761,6 +32765,8 @@ describe("M2 actualRunner credential replacement", () => {
         await fs.writeFile(path.join(source, "unapproved.txt"), "not a session");
         await CodexSessionStore.persist(source, store);
         const policyHolds: PolicyHoldRequest[] = [];
+        const policyAttempts: PolicyHoldRequest[] = [];
+        let policyTransportReached = 0;
         let custodyReleases = 0, sourceJournal: string | undefined, sourceBranch: string | undefined;
         let releasesAtResume = 0, refreshesAtResume = 0;
         const policyOutbox = resumePreserve ? new Outbox({ root: path.join(dir, "policy-outbox"), log: noopLog,
@@ -32777,6 +32783,7 @@ describe("M2 actualRunner credential replacement", () => {
           api.setRegisterProtocolFeatures(["provider_policy_hold_v1", "claim_generation_fence"]);
           await client.register("live-preserve", "base", 1, [], ["provider_policy_hold_v1"], undefined, 0);
           client.reportPolicyHold = async (id, body) => {
+            policyAttempts.push(structuredClone(body));
             assert.equal(preserveNegative, false, "fenced preserve handoff must never POST policy");
             assert.equal(id, claim.run_id);
             assert.equal(cleanOwnership.status, "running", "policy POST requires server-eligible ownership");
@@ -32791,6 +32798,11 @@ describe("M2 actualRunner credential replacement", () => {
             }
             assert.equal(disposedEffects.size, effects, "effect roots join before policy POST");
             for (const handle of fileops) assert.ok(handle.disposed() > 0, "file operations join before policy POST");
+            policyTransportReached++;
+            // Unknown policy delivery after the known B credential commit; no policy DB commit is modeled.
+            if (policyAckLost) throw new Error("policy acknowledgement transport lost");
+            if (policyAckPending) return { disposition: "pending", outcome_id: body.outcome_id,
+              source_generation: body.source_generation, reason: "ownership_unconfirmed" };
             policyHolds.push(structuredClone(body));
             return { disposition: "applied", outcome_id: body.outcome_id, source_generation: body.source_generation,
               observed_status: "paused", observed_generation: body.claim_generation, hold_reason: "codex_policy_hold" };
@@ -33984,6 +33996,7 @@ describe("M2 actualRunner credential replacement", () => {
               await joinNowConsumerProbes();
               assert.ok(switchError instanceof Error);
               assert.equal(switchError instanceof PolicyContinuationRejected, false);
+              assert.equal(policyAttempts.length, 0, "negative handoff never attempts policy delivery outside production catch");
               assert.equal(policyHolds.length, 0, "negative handoff never reaches the policy callback");
               assert.equal(preserveCaptures, 0, "no policy source capture after the fenced refusal");
               assert.equal(actualFlight!.policyHold, undefined, "no false policy ACK");
@@ -34069,6 +34082,102 @@ describe("M2 actualRunner credential replacement", () => {
               assert.ok(switchError instanceof PolicyContinuationRejected);
               assert.equal(switchError.cause, "provider_resume_rejected");
               const policyFlight = actualFlight as unknown as { policyReservation?: symbol; cancel: AbortController; steering: SteeringChannel };
+              const assertRetainedPolicy = async (held: PolicyHoldRequest) => {
+                assert.equal(held.cause, "provider_resume_rejected");
+                assert.equal(held.detail, "resume_rejected");
+                assert.equal(held.continuation_mode, "same_conversation");
+                assert.equal(held.claim_generation, 7);
+                assert.equal(held.session_id, savedId);
+                assert.equal(actualFlight!.policyHold?.outcomeId, held.outcome_id);
+                assert.equal(actualFlight!.preserveRecoveryClone, true);
+                assert.equal(actualFlight!.preserveSession, true);
+                assert.equal(actualFlight!.keepGuardedInventoryOpen, true);
+                assert.equal(actualFlight!.retainedLocalCustody, true);
+                assert.equal(actualFlight!.worktreePath, worktree);
+                assert.equal(actualFlight!.runId, claim.run_id);
+                assert.equal(actualFlight!.claimGeneration, 7);
+                assert.equal(custodyReleases, 0);
+                assert.equal(credentialReleases, releasesAtResume, "re-hold cannot release more credentials");
+                assert.equal(credentialRefreshes, refreshesAtResume);
+                assert.ok(sourceJournal, "real source journal was seeded before A admission");
+                assert.equal(spawnSync("git", ["-C", m2Runner.git.barePathFor(m2Runner.fx.originPath), "config",
+                  `uzi-recovery.${sourceBranch}.clone`], { env: gitEnv(), encoding: "utf8" }).stdout.trim(), sourceJournal);
+                assert.ok(context.prepareCodexRootDispatch);
+                await assert.rejects(context.prepareCodexRootDispatch(context.terminalLifecycleSignal!, () => {}, "root"),
+                  "B ordinary preparation remains closed after policy hold");
+                assert.ok(retainedRootDispatch);
+                await assert.rejects(retainedRootDispatch.prepare(), "A remains retired after policy hold");
+                assert.equal(credentialReleases, releasesAtResume);
+                assert.equal(credentialRefreshes, refreshesAtResume);
+                assert.equal(await fs.readFile(path.join(worktree, "M2-retained.txt"), "utf8"), "A work");
+                assert.equal(await CodexSessionStore.inspectSession(store, savedId), "present");
+                assert.equal(await CodexSessionStore.inspectSession(path.join(m2Runner.homeDir, "codex-session-store"), savedId), "present");
+                assert.equal(committedCodex, next);
+                assert.equal(applies, 1);
+                assert.equal(applyAcknowledgements, 1);
+                assert.deepEqual(teardownResults, [true]);
+                assert.equal(reopenAttempts, 0);
+                assert.equal(factories, 1, "no new claim/executor flight");
+                assert.equal(rig.providerLaunches(), 2);
+                assert.equal(a.transport.threadStartCount, 0, "A resumed the persisted CLAIM session");
+                assert.equal(a.transport.turnStartCount, 1, "A work ran and never revived");
+                assert.deepEqual(resumedThreads, [savedId]);
+                assert.equal(b.transport.threadStartCount, 0);
+                assert.equal(b.transport.turnStartCount, 0);
+                assert.equal(bFinished, false);
+                assert.deepEqual(bChildProbes, ["login", "resume"]);
+                assert.equal(loginObservations.length, 1);
+                const login = loginObservations[0]!;
+                assert.equal(login.params.accessToken, next.access_token);
+                assert.equal(login.reaped, true);
+                assert.equal(login.effectDisposed, true);
+                assert.ok(login.fileopDisposed > 0);
+                assert.equal(ordinaryBRefreshes, 0);
+                assert.deepEqual(reports.filter(status => status.startsWith("credential_switch")), []);
+                assert.ok(!reports.some(status => ["failed", "completed", "cancelled"].includes(status)));
+                assert.equal(api.messages(claim.run_id).some(message => rec(message.payload).event === "resume_lineage_break"), false);
+                for (const epoch of rig.epochs) {
+                  assert.ok(epoch.reaped() > 0);
+                  assert.ok(epoch.disposed() > 0);
+                }
+                assert.equal(disposedEffects.size, effects);
+                for (const handle of fileops) assert.ok(handle.disposed() > 0);
+              };
+              if (policyDeliveryUnknown) {
+                assert.equal(policyAttempts.length, 1, "one bounded policy delivery attempt");
+                assert.equal(policyTransportReached, 1, "ownership and join assertions reached the transport outcome");
+                assert.equal(policyHolds.length, 0, "no confirmed policy ACK");
+                const attempted = policyAttempts[0]!;
+                const journal = await policyOutbox!.readTerminalJournal(claim.run_id, 7);
+                assert.ok(journal);
+                assert.equal(journal.outcome_kind, "policy_hold");
+                assert.notEqual(journal.server_settled, true);
+                assert.deepEqual(journal.body, attempted);
+                assert.equal(attempted.source_generation, 7);
+                assert.equal(attempted.session_id, savedId);
+                // Process-memory-loss model with retained local data only; not power-loss proof.
+                const reloaded = new Outbox({ root: path.join(dir, "policy-outbox"), log: noopLog,
+                  runMaxBytes: 64 * 1024 * 1024, maxBytes: 128 * 1024 * 1024, retentionMs: 86400000 });
+                await reloaded.init();
+                const pendingEntries = reloaded.listPendingTerminals();
+                assert.equal(pendingEntries.length, 1);
+                assert.equal(pendingEntries[0]!.run_id, claim.run_id);
+                assert.equal(pendingEntries[0]!.claim_generation, 7);
+                assert.equal(pendingEntries[0]!.outcome_kind, "policy_hold");
+                assert.notEqual(pendingEntries[0]!.server_settled, true);
+                const persisted = await reloaded.readTerminalJournal(claim.run_id, 7);
+                assert.ok(persisted);
+                assert.equal(persisted.outcome_kind, "policy_hold");
+                assert.notEqual(persisted.server_settled, true);
+                assert.deepEqual(persisted.body, attempted);
+                assert.equal(persisted.body.outcome_id, attempted.outcome_id);
+                assert.equal(persisted.body.source_generation, attempted.source_generation);
+                assert.equal(persisted.body.session_id, savedId);
+                assert.doesNotMatch(JSON.stringify({ journal, pendingEntries, persisted, attempted }),
+                  /M2-B-access|M2-B-capability|M2-A-auth-canary/);
+                await assertRetainedPolicy(attempted);
+                return;
+              }
               assert.equal(policyHolds.length, 1, JSON.stringify({ expected: "policy reporting, not only the generic owner pause",
                 negotiated: client.supportsPolicyHold, reservation: !!policyFlight.policyReservation,
                 cancelAborted: policyFlight.cancel.signal.aborted, cancelReason: policyFlight.cancel.signal.reason?.name,
@@ -34076,65 +34185,7 @@ describe("M2 actualRunner credential replacement", () => {
                 lifecycleReason: policyFlight.steering.lifecycleSignal().reason?.name,
                 logs: diagnostics.lines.slice(-4) }));
               const held = policyHolds[0]!;
-              assert.equal(held.cause, "provider_resume_rejected");
-              assert.equal(held.detail, "resume_rejected");
-              assert.equal(held.continuation_mode, "same_conversation");
-              assert.equal(held.claim_generation, 7);
-              assert.equal(held.session_id, savedId);
-              assert.equal(actualFlight!.policyHold?.outcomeId, held.outcome_id);
-              assert.equal(actualFlight!.preserveRecoveryClone, true);
-              assert.equal(actualFlight!.preserveSession, true);
-              assert.equal(actualFlight!.keepGuardedInventoryOpen, true);
-              assert.equal(actualFlight!.retainedLocalCustody, true);
-              assert.equal(actualFlight!.worktreePath, worktree);
-              assert.equal(actualFlight!.runId, claim.run_id);
-              assert.equal(actualFlight!.claimGeneration, 7);
-              assert.equal(custodyReleases, 0);
-              assert.equal(credentialReleases, releasesAtResume, "re-hold cannot release more credentials");
-              assert.equal(credentialRefreshes, refreshesAtResume);
-              assert.ok(sourceJournal, "real source journal was seeded before A admission");
-              assert.equal(spawnSync("git", ["-C", m2Runner.git.barePathFor(m2Runner.fx.originPath), "config",
-                `uzi-recovery.${sourceBranch}.clone`], { env: gitEnv(), encoding: "utf8" }).stdout.trim(), sourceJournal);
-              assert.ok(context.prepareCodexRootDispatch);
-              await assert.rejects(context.prepareCodexRootDispatch(context.terminalLifecycleSignal!, () => {}, "root"),
-                "B ordinary preparation remains closed after policy hold");
-              assert.ok(retainedRootDispatch);
-              await assert.rejects(retainedRootDispatch.prepare(), "A remains retired after policy hold");
-              assert.equal(credentialReleases, releasesAtResume);
-              assert.equal(credentialRefreshes, refreshesAtResume);
-              assert.equal(await fs.readFile(path.join(worktree, "M2-retained.txt"), "utf8"), "A work");
-              assert.equal(await CodexSessionStore.inspectSession(store, savedId), "present");
-              assert.equal(await CodexSessionStore.inspectSession(path.join(m2Runner.homeDir, "codex-session-store"), savedId), "present");
-              assert.equal(committedCodex, next);
-              assert.equal(applies, 1);
-              assert.equal(applyAcknowledgements, 1);
-              assert.deepEqual(teardownResults, [true]);
-              assert.equal(reopenAttempts, 0);
-              assert.equal(factories, 1, "no new claim/executor flight");
-              assert.equal(rig.providerLaunches(), 2);
-              assert.equal(a.transport.threadStartCount, 0, "A resumed the persisted CLAIM session");
-              assert.equal(a.transport.turnStartCount, 1, "A work ran and never revived");
-              assert.deepEqual(resumedThreads, [savedId]);
-              assert.equal(b.transport.threadStartCount, 0);
-              assert.equal(b.transport.turnStartCount, 0);
-              assert.equal(bFinished, false);
-              assert.deepEqual(bChildProbes, ["login", "resume"]);
-              assert.equal(loginObservations.length, 1);
-              const login = loginObservations[0]!;
-              assert.equal(login.params.accessToken, next.access_token);
-              assert.equal(login.reaped, true);
-              assert.equal(login.effectDisposed, true);
-              assert.ok(login.fileopDisposed > 0);
-              assert.equal(ordinaryBRefreshes, 0);
-              assert.deepEqual(reports.filter(status => status.startsWith("credential_switch")), []);
-              assert.ok(!reports.some(status => ["failed", "completed", "cancelled"].includes(status)));
-              assert.equal(api.messages(claim.run_id).some(message => rec(message.payload).event === "resume_lineage_break"), false);
-              for (const epoch of rig.epochs) {
-                assert.ok(epoch.reaped() > 0);
-                assert.ok(epoch.disposed() > 0);
-              }
-              assert.equal(disposedEffects.size, effects);
-              for (const handle of fileops) assert.ok(handle.disposed() > 0);
+              await assertRetainedPolicy(held);
               return;
             }
             if (publication !== "gated" && publication !== "subscription-refresh" && !resumeRefusal && !preflightRetry) {
