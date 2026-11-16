@@ -34854,15 +34854,16 @@ describe("M2 actualRunner credential replacement", () => {
             assert.equal(bRootObserved, true, "ordinary B work precedes the allocation proof");
             assert.ok(bRootPrepares > 0);
             assert.ok(bRootChecks > 0);
-            assert.equal(actualFlight, admission.flight);
+            assert.ok(actualFlight === admission.flight, "same observed flight identity");
             assert.equal(runFlights.length, admission.flightCount, "no new flight at any generation/executor");
-            assert.deepEqual(runFlights, [admission.flight]);
+            assert.equal(runFlights.length, 1);
+            assert.ok(runFlights[0] === admission.flight, "same original flight identity");
             assert.equal(actualFlight!.claimGeneration, admission.generation);
             assert.equal(actualFlight!.claimGeneration, 7);
             assert.equal(actualFlight!.worktreePath, admission.worktree);
             assert.equal(context.worktreePath, admission.worktree);
             assert.equal(actualFlight!.attemptId, admission.attemptId);
-            assert.equal(actualFlight!.runnerClone, admission.clone);
+            assert.ok(actualFlight!.runnerClone === admission.clone, "same original clone identity");
             assert.equal(actualFlight!.runnerClone?.attemptId, admission.cloneAttemptId);
             assert.equal(actualFlight!.runnerClone?.path, admission.worktree);
             assert.deepEqual(custodySnapshot(actualFlight!), admission.custody, "same custody state before cleanup");
@@ -35581,5 +35582,427 @@ describe("issue #4313 real CodexExecutor + RunRunner over the done gate and resu
     assert.ok(!(obs.gateError instanceof SecretRemediationStoppedError), String(obs.gateError));
     assert.equal(obs.pendingAfterControl, true, "the preflight was still waiting for A after the control arrived");
     assert.equal(obs.decision?.action, "proceed", "the decision is the no-pause one (a clean fetch-back proceeds)");
+  });
+});
+
+describe("Codex repeated actualRunner switching", () => {
+  m2Runner.installHarness();
+
+  it("Codex real Runner switches A to B to C without a new claim or attempt", async t => {
+    const { api, client } = m2Runner;
+    const aClaim = { ...API_KEY, auth_mode: "api_key" as const, capability: "repeat-A-capability" };
+    const bClaim = { ...SUBSCRIPTION, auth_mode: "subscription" as const, generation: 52, capability: "repeat-B-capability",
+      access_token: "repeat-" + "B-access", chatgpt_account_id: "repeat-B-account" };
+    const cClaim = { ...API_KEY, auth_mode: "api_key" as const, capability: "repeat-C-capability",
+      access_token: "repeat-" + "C-access" };
+    const claim: ClaimResponse = { ...m2Runner.gitlabClaim(4202, {
+      plan_md: "Approved repeated-switch proof", plan_approved: true, plan_source: "seeded",
+    }), claim_generation: 7 };
+    claim.secrets = { ...claim.secrets, codex: aClaim };
+    api.setOwnershipStatus(claim.run_id, "running", 7);
+    const savedId = "12345678-1234-1234-1234-123456789abc";
+    const dir = await fs.mkdtemp(path.resolve("../.uzi/scratch/M3-repeat-"));
+    const source = path.join(dir, "source"), store = path.join(dir, "store");
+    await fs.mkdir(path.join(source, "sessions"), { recursive: true });
+    await fs.writeFile(path.join(source, "sessions", `rollout-${savedId}.jsonl`), "{}\n");
+    await CodexSessionStore.persist(source, store);
+
+    const aEntered = installerBarrier(), bObserved = installerBarrier(), cObserved = installerBarrier();
+    const ySeen = installerBarrier(), allowBEnd = installerBarrier(), allowCEnd = installerBarrier();
+    const jobs: Promise<void>[] = [];
+    let cancelled = false;
+    let pending: "opX" | "opY" | undefined;
+    let applies = 0, factories = 0, hooks = 0, reconciledB = 0, fresh = 0;
+    const reports: string[] = [];
+    const report = client.reportState.bind(client);
+    t.mock.method(client, "reportState", async (...args: Parameters<typeof report>) => {
+      reports.push(args[1].status);
+      return report(...args);
+    });
+    const preflights: { op: string; epoch: number }[] = [];
+    const results: { ordinal: number; epoch: number; seq: number }[] = [];
+    const releases: { seq: number; ok: boolean }[] = [];
+    const switches: string[] = [];
+    const files: ReturnType<typeof fakeFileopHandle>[] = [];
+    const disposedEffects = new Set<number>();
+    const admissions: { cwd: string; home: string }[] = [];
+    const adopted: string[] = [];
+    const rig = makeMultiEpochRig(["A", "B", "C"].map((label, index): Responder => c => {
+      const turn = `repeat-${label}-turn`;
+      if (c.method === "thread/start" || c.method === "thread/resume")
+        return { thread: { id: savedId } };
+      if (c.method === "turn/interrupt") {
+        if (index === 1) {
+          // A steering interrupt may arrive before the outer assertion releases B.
+          // Keep the safe boundary closed until opY is actually pending.
+          jobs.push((async () => {
+            await allowBEnd.promise;
+            c.transport.push(turnCompleted("interrupted", savedId, turn));
+          })());
+        } else c.transport.push(turnCompleted("interrupted", savedId, turn));
+      }
+      if (c.method === "turn/start") {
+        if (index === 0) {
+          c.transport.push(threadStarted(savedId));
+          aEntered.resolve();
+        } else {
+          // Cold-resume historical usage is followed by a matching live turn.
+          c.transport.push(tokenUsageUpdated(savedId, "repeat-historical", { totalTokens: 0 }));
+          c.transport.push({ kind: "turn_started", method: "turn/started", threadId: savedId,
+            turnId: turn, params: { threadId: savedId, turn: { id: turn } } });
+          c.transport.push(agentMessage(`repeat ${label} output`, savedId));
+          c.transport.push(tokenUsageUpdated(savedId, turn,
+            { inputTokens: index * 200, outputTokens: index * 100, totalTokens: index * 300 }));
+          // Neither successor naturally completes before the proof window closes.
+          if (index === 2) jobs.push((async () => {
+            await allowCEnd.promise;
+            c.transport.push(turnCompleted("completed", savedId, turn));
+          })());
+        }
+        return { turn: { id: turn } };
+      }
+      return {};
+    }));
+    const launchProvider = rig.deps.launchProviderRoot!;
+    const launchEffect = rig.deps.launchEffectRoot!;
+    let effectIndex = 0;
+    rig.deps = { ...rig.deps,
+      launchProviderRoot: async (spec, mode) => {
+        if (admissions.length === 2) {
+          assert.equal(reconciledB, 1);
+          assert.ok(rig.epochs[1]!.reaped() > 0, "B root joined before C provider/auth");
+          assert.ok(rig.epochs[1]!.disposed() > 0);
+          assert.ok(files[1]!.disposed() > 0, "B file operations joined before C auth");
+          assert.ok(disposedEffects.has(1), "B effects joined before C auth");
+          assert.equal(mode, "api_key");
+        }
+        admissions.push({ cwd: spec.cwd, home: spec.ownedDataRoot });
+        return launchProvider(spec, mode);
+      },
+      wireFileop: () => { const f = fakeFileopHandle(); files.push(f); return f.handle; },
+      launchEffectRoot: async (...args) => {
+        const root = await launchEffect(...args), index = effectIndex++;
+        const dispose = root.dispose.bind(root);
+        root.dispose = async (...rest) => {
+          const result = await dispose(...rest);
+          if (result.clean) disposedEffects.add(index);
+          return result;
+        };
+        return root;
+      },
+      sessionStore: { ...rig.deps.sessionStore!,
+        inspect: async () => "present",
+        inspectSession: async (_dir, id) => CodexSessionStore.inspectSession(store, id),
+        persist: async () => CodexSessionStore.persist(source, store),
+        adopt: async () => {
+          const dest = path.join(dir, `adopted-${adopted.length}`);
+          adopted.push(dest);
+          await fs.mkdir(dest);
+          return CodexSessionStore.adopt(store, dest);
+        },
+      },
+    };
+    const releaseCodex = rig.client.releaseCodex.bind(rig.client);
+    rig.client.releaseCodex = async (id, req) => {
+      if (req.capability === cClaim.capability) {
+        assert.equal(applies, 2);
+        return { access_token: cClaim.access_token };
+      }
+      if (req.capability === bClaim.capability) return { access_token: bClaim.access_token };
+      return releaseCodex(id, req);
+    };
+    const refreshCodex = rig.client.refreshCodex.bind(rig.client);
+    rig.client.refreshCodex = async (id, req) => {
+      if (req.capability !== bClaim.capability) return refreshCodex(id, req);
+      return { access_token: bClaim.access_token, generation: req.observed_generation + 1,
+        chatgpt_account_id: bClaim.chatgpt_account_id, outcome: "advanced" };
+    };
+
+    type Flight = {
+      runId: string; claimGeneration: number; executor: CodexExecutor;
+      worktreePath?: string; attemptId?: string;
+      runnerClone?: { path: string; attemptId?: string };
+      operationScope?: { prepare(kind: "root", signal: AbortSignal, check: () => void): Promise<() => boolean | void> };
+      batcher: MessageBatcher; steering: SteeringChannel;
+    };
+    let flight: Flight | undefined, worktree = "";
+    const flights: Flight[] = [];
+    const executor = makeExecutor(rig, bindingOf(aClaim), noopLog, undefined, provider, m2Runner.homeDir);
+    const suspend = executor.suspendCodexEpoch.bind(executor);
+    executor.suspendCodexEpoch = async bounds => {
+      const lease = await suspend(bounds), index = applies;
+      return { ...lease,
+        reconcileA: async (...args) => {
+          const before = bRefreshCalls;
+          const result = await lease.reconcileA(...args);
+          if (index === 1) {
+            assert.equal(result.kind, "ready");
+            assert.equal(applies, 1, "B reconciliation precedes C apply");
+            assert.equal(bRefreshCalls, before + 1, "real reconcile invokes B subscription refresh");
+            reconciledB++;
+          }
+          return result;
+        },
+        startFreshLineage: async (...args) => { fresh++; return lease.startFreshLineage(...args); },
+      };
+    };
+    let bRefreshCalls = 0;
+    const refreshBridge = rig.client.refreshCodex.bind(rig.client);
+    rig.client.refreshCodex = async (id, req) => {
+      if (req.capability === bClaim.capability) bRefreshCalls++;
+      return refreshBridge(id, req);
+    };
+    const run = executor.run.bind(executor);
+    executor.run = async ctx => {
+      ctx.agents = [{ name: "lead", description: "lead", prompt_body: "lead", tools: null, skills: [] }];
+      worktree = ctx.worktreePath;
+      await fs.writeFile(path.join(worktree, "repeat-retained.txt"), "A retained work");
+      const attempt = ctx.attemptCodexCredentialSwitch!;
+      ctx.attemptCodexCredentialSwitch = async (...args) => {
+        hooks++;
+        const result = await attempt(...args);
+        switches.push(result);
+        return result;
+      };
+      return run(ctx);
+    };
+    const runner = m2Runner.runnerWith(() => {
+      factories++;
+      return { executor, homeDir: m2Runner.homeDir };
+    }, m2Runner.fakeGitlab().gitlab, undefined, noopLog, {
+      credentialSwitchLedger: new (await import("../src/credential-switch-op-ledger.js")).CredentialSwitchOpLedger(dir),
+    });
+    const builder = runner as unknown as { buildFlight(...args: unknown[]): Flight };
+    const build = builder.buildFlight;
+    t.mock.method(builder, "buildFlight", function (this: typeof builder, ...args: unknown[]) {
+      const built = build.apply(this, args);
+      if (built.runId === claim.run_id) {
+        flights.push(built); flight = built;
+        const take = built.batcher.holdForCredentialSwitch.bind(built.batcher);
+        t.mock.method(built.batcher, "holdForCredentialSwitch", () => {
+          const hold = take();
+          return { ...hold, release: (opts: Parameters<typeof hold.release>[0]) => {
+            const ok = hold.release(opts);
+            releases.push({ seq: opts.messageSeq, ok });
+            return ok;
+          } };
+        });
+        const steering = built.steering as unknown as {
+          maybeTripCredentialSwitch(generation: number, op?: string, target?: string): void;
+        };
+        const trip = steering.maybeTripCredentialSwitch.bind(steering);
+        t.mock.method(steering, "maybeTripCredentialSwitch", (...args: Parameters<typeof trip>) => {
+          trip(...args);
+          if (built.steering.pendingCredentialSwitchOp()?.opId === "opY") ySeen.resolve();
+        });
+      }
+      return built;
+    });
+
+    // All probes delegate to production methods; admission must prove clone probes fire.
+    const calls = { claim: 0, reserve: 0, release: 0, settle: 0, settleLive: 0,
+      attach: 0, branch: 0, seed: 0 };
+    const claimRun = client.claimRun.bind(client);
+    t.mock.method(client, "claimRun", (...args: Parameters<typeof claimRun>) => { calls.claim++; return claimRun(...args); });
+    const reserve = client.reserveRecoveryCapture.bind(client);
+    t.mock.method(client, "reserveRecoveryCapture", (...args: Parameters<typeof reserve>) => { calls.reserve++; return reserve(...args); });
+    const release = client.releaseRecoveryCustody.bind(client);
+    t.mock.method(client, "releaseRecoveryCustody", (...args: Parameters<typeof release>) => { calls.release++; return release(...args); });
+    const settle = client.settleRecoveryHold.bind(client);
+    t.mock.method(client, "settleRecoveryHold", (...args: Parameters<typeof settle>) => { calls.settle++; return settle(...args); });
+    const settleLive = client.settleRecoveryHoldLive.bind(client);
+    t.mock.method(client, "settleRecoveryHoldLive", (...args: Parameters<typeof settleLive>) => { calls.settleLive++; return settleLive(...args); });
+    const attach = m2Runner.git.createOrAttachRunnerClone.bind(m2Runner.git);
+    t.mock.method(m2Runner.git, "createOrAttachRunnerClone", (...args: Parameters<typeof attach>) => { calls.attach++; return attach(...args); });
+    const branch = m2Runner.git.runnerCloneForBranch.bind(m2Runner.git);
+    t.mock.method(m2Runner.git, "runnerCloneForBranch", (...args: Parameters<typeof branch>) => { calls.branch++; return branch(...args); });
+    const seedOwner = m2Runner.git as unknown as { seedRunnerClone(...args: unknown[]): Promise<unknown> };
+    const seed = seedOwner.seedRunnerClone.bind(seedOwner);
+    t.mock.method(seedOwner, "seedRunnerClone", (...args: unknown[]) => { calls.seed++; return seed(...args); });
+
+    t.mock.method(client, "registrationNonce", () => "repeat-registration");
+    t.mock.method(client, "supportsInPlaceCodexCredentialSwitch", () => true);
+    t.mock.method(client, "supportsCodexSwitchStopped", () => true);
+    const hasFeature = client.hasFeature.bind(client);
+    t.mock.method(client, "hasFeature", (name: string) => name === "credential_switch_hold" || hasFeature(name));
+    t.mock.method(client, "getRunOwnership", async () => ({
+      status: "running", claim_generation: 7, claim_released: false, hold_reason: null,
+    }));
+    t.mock.method(client, "getInputs", async () => ({ inputs: [], nowSummary: false,
+      ...(pending ? { credentialSwitch: { generation: 7, op_id: pending,
+        target_secret_id: pending === "opX" ? "repeat-B-target" : "repeat-C-target" } } : {}),
+      ...(cancelled ? { terminalCancelled: { run_id: claim.run_id, generation: 7 } } : {}),
+    }));
+    t.mock.method(client, "preflightCodexCredentialSwitch", async (...args: Parameters<WorkerClient["preflightCodexCredentialSwitch"]>) => {
+      const [id, req] = args;
+      const ordinal = applies + 1;
+      assert.equal(id, claim.run_id);
+      assert.equal(req.claimGeneration, 7);
+      assert.equal(req.registerNonce, "repeat-registration");
+      assert.equal(req.opId, ordinal === 1 ? "opX" : "opY");
+      assert.equal(req.targetSecretId, ordinal === 1 ? "repeat-B-target" : "repeat-C-target");
+      const epoch = 40 + ordinal;
+      preflights.push({ op: req.opId, epoch });
+      return { kind: "ready", expectedEpoch: epoch, claimGeneration: 7,
+        registerNonce: req.registerNonce, opId: req.opId };
+    });
+    // Reuse FakeAPI's actual feed insertion and ordinal accounting, without
+    // pretending its token-only HTTP apply route returns Codex credentials.
+    const applyServer = api as unknown as {
+      applySwitch(id: string, op: string, token: string): { ordinal: number; messageSeq: number; replay: boolean };
+    };
+    t.mock.method(client, "applyCredentialSwitch", async (...args: Parameters<WorkerClient["applyCredentialSwitch"]>) => {
+      const [id, req] = args;
+      const ordinal = applies + 1;
+      assert.equal(req.claimGeneration, 7);
+      assert.equal(req.registerNonce, "repeat-registration");
+      assert.equal(req.opId, ordinal === 1 ? "opX" : "opY");
+      if (ordinal === 2) {
+        assert.equal(reconciledB, 1);
+        assert.ok(bRefreshCalls > 0, "subscription B bridge reconciled before C apply");
+      }
+      const predecessor = rig.epochs[ordinal - 1]!;
+      assert.ok(predecessor.reaped() > 0);
+      assert.ok(predecessor.disposed() > 0);
+      assert.ok(files[ordinal - 1]!.disposed() > 0);
+      assert.ok(disposedEffects.has(ordinal - 1));
+      const ack = applyServer.applySwitch(id, req.opId, "");
+      assert.equal(ack.ordinal, ordinal);
+      assert.equal(ack.replay, false);
+      pending = undefined;
+      applies++;
+      results.push({ ordinal, epoch: 41 + ordinal, seq: ack.messageSeq });
+      return { kind: "codex_applied", codex: ordinal === 1 ? bClaim : cClaim,
+        ordinal: ack.ordinal, capabilityEpoch: 41 + ordinal, messageSeq: ack.messageSeq, replay: false };
+    });
+    const post = client.postMessages.bind(client);
+    t.mock.method(client, "postMessages", async (...args: Parameters<typeof post>) => {
+      const reply = await post(...args);
+      const feed = api.messages(claim.run_id);
+      for (const [label, ordinal, barrier] of [["B", 1, bObserved], ["C", 2, cObserved]] as const) {
+        if (feed.some(m => m.payload.text === `repeat ${label} output` && m.credential_epoch_ordinal === ordinal) &&
+            feed.some(m => m.payload.event === "codex_response_usage" && m.credential_epoch_ordinal === ordinal))
+          barrier.resolve();
+      }
+      return reply;
+    });
+
+    const running = runner.execute(claim);
+    // Attach a rejection handler immediately; finally still joins the original promise.
+    void running.catch(() => undefined);
+    let cleanupResults: PromiseSettledResult<unknown>[] = [];
+    try {
+      await withTimeout(aEntered.promise, 5000, "repeat A admission");
+      assert.ok(flight);
+      const admitted = flight;
+      const identity = { attempt: admitted.attemptId, clone: admitted.runnerClone };
+      assert.ok(identity.clone, "real admitted clone has a physical identity");
+      assert.equal(identity.clone.path, worktree);
+      const allocation = { ...calls }, reportStart = reports.length;
+      assert.ok(allocation.attach > 0 && allocation.branch > 0 && allocation.seed > 0);
+      const directory = path.dirname(worktree), members = (await fs.readdir(directory)).sort();
+      pending = "opX";
+      await withTimeout(bObserved.promise, 5000, "B output and live usage delivered before Y").catch(error => {
+        throw new Error(JSON.stringify({ applies, hooks, switches, preflights, releases,
+          launches: rig.providerLaunches(), reports, pending,
+          methods: rig.epochs.map(epoch => epoch.transport.requests.slice(-10).map(request => request.method)),
+          messages: api.messages(claim.run_id).slice(-8).map(message => ({ kind: message.kind,
+            ordinal: message.credential_epoch_ordinal, event: rec(message.payload).event })),
+        }), { cause: error });
+      });
+      assert.equal(applies, 1);
+      assert.deepEqual(releases, [{ seq: results[0]!.seq, ok: true }],
+        "first result really releases the held B publication");
+      assert.equal(results[0]!.epoch, 42);
+      const bAuthority = (executor as unknown as {
+        currentCodexAuthority: ReturnType<typeof createCodexEpochAuthority>;
+      }).currentCodexAuthority;
+      assert.equal(bAuthority.ordinal, 1);
+      assert.equal(bAuthority.capabilityEpoch, 42);
+      assert.equal(bAuthority.binding.capability, bClaim.capability);
+      const bScope = flight.operationScope;
+      assert.ok(bScope, "subscription B owns an operation scope");
+      pending = "opY";
+      await withTimeout(ySeen.promise, 5000, "production steering records Y before B ends");
+      assert.equal(flight.steering.pendingCredentialSwitchOp()?.opId, "opY");
+      allowBEnd.resolve();
+      await withTimeout(cObserved.promise, 5000, "C output and live usage delivered").catch(error => {
+        throw new Error(JSON.stringify({ applies, hooks, switches, preflights, releases, reconciledB, bRefreshCalls,
+          launches: rig.providerLaunches(), reports, pending,
+          methods: rig.epochs.map(epoch => epoch.transport.requests.slice(-10).map(request => request.method)),
+          messages: api.messages(claim.run_id).slice(-8).map(message => ({ kind: message.kind,
+            ordinal: message.credential_epoch_ordinal, event: rec(message.payload).event })),
+        }), { cause: error });
+      });
+      assert.equal(cancelled, false, "owner cancellation stays disabled throughout the proof");
+      assert.deepEqual(preflights, [{ op: "opX", epoch: 41 }, { op: "opY", epoch: 42 }]);
+      assert.deepEqual(results.map(r => [r.ordinal, r.epoch]), [[1, 42], [2, 43]]);
+      assert.equal(releases.length, 2);
+      assert.ok(releases.every((r, i) => r.ok && r.seq === results[i]!.seq));
+      assert.ok(results[1]!.seq > results[0]!.seq);
+      assert.equal(factories, 1);
+      assert.equal(applies, 2);
+      assert.equal(hooks, 2);
+      assert.equal(switches.length, 2);
+      assert.equal(fresh, 0);
+      assert.equal(flights.length, 1);
+      assert.ok(flights[0] === admitted, "same original flight identity");
+      assert.ok(flight === admitted, "same observed flight identity");
+      assert.equal(flight.claimGeneration, 7);
+      assert.equal(flight.attemptId, identity.attempt);
+      assert.ok(flight.runnerClone === identity.clone, "same original clone identity");
+      assert.equal(flight.runnerClone?.path, worktree);
+      assert.deepEqual(calls, allocation, "no extra claim, clone, custody or settlement in the window");
+      assert.equal(reports.slice(reportStart).some(status => status.startsWith("credential_switch") ||
+        ["queued", "claimed", "paused"].includes(status)), false, "no release/reclaim/hold state transition");
+      assert.deepEqual((await fs.readdir(directory)).sort(), members);
+      assert.equal(await fs.readFile(path.join(worktree, "repeat-retained.txt"), "utf8"), "A retained work");
+      assert.equal(rig.providerLaunches(), 3);
+      assert.deepEqual(admissions.map(a => a.cwd), [worktree, worktree, worktree]);
+      assert.equal(new Set(admissions.map(a => a.home)).size, 3);
+      assert.equal(adopted.length, 3);
+      assert.equal(new Set(adopted).size, 3);
+      for (const index of [1, 2]) {
+        const requests = rig.epochs[index]!.transport.requests;
+        assert.deepEqual(requests.filter(r => r.method === "thread/resume").map(r => rec(r.params).threadId), [savedId]);
+        assert.equal(requests.some(r => r.method === "thread/start"), false);
+        const login = requests.find(r => r.method === "account/login/start");
+        assert.ok(login);
+        assert.equal(rec(login.params).type, index === 1 ? "chatgptAuthTokens" : "apiKey");
+        assert.equal(rec(login.params)[index === 1 ? "accessToken" : "apiKey"],
+          index === 1 ? bClaim.access_token : cClaim.access_token);
+        assert.equal(rec(login.params).chatgptAccountId, index === 1 ? bClaim.chatgpt_account_id : undefined);
+      }
+      const feed = api.messages(claim.run_id);
+      for (const ordinal of [1, 2]) {
+        const usage = feed.filter(m => m.payload.event === "codex_response_usage" && m.credential_epoch_ordinal === ordinal);
+        assert.equal(usage.length, 1);
+        assert.equal(rec(usage[0]!.payload.usage).input_tokens, ordinal * 200);
+        assert.equal(rec(usage[0]!.payload.usage).output_tokens, ordinal * 100);
+      }
+      assert.equal(feed.some(m => m.payload.event === "resume_lineage_break"), false);
+      const authority = (executor as unknown as {
+        currentCodexAuthority: ReturnType<typeof createCodexEpochAuthority>;
+      }).currentCodexAuthority;
+      assert.equal(authority.ordinal, 2);
+      assert.equal(authority.capabilityEpoch, 43);
+      assert.equal(authority.binding.capability, cClaim.capability);
+      assert.ok(authority !== bAuthority, "C has a distinct immutable authority");
+      assert.throws(() => bAuthority.assertCurrent(), /retired/);
+      await assert.rejects(bScope.prepare("root", new AbortController().signal, () => {}), /closed/,
+        "retained B scope refuses dispatch after C publication");
+      assert.equal(flight.operationScope, undefined, "API-key C carries no subscription scope");
+    } finally {
+      pending = undefined;
+      cancelled = true;
+      allowBEnd.resolve();
+      allowCEnd.resolve();
+      // Release queued responder continuations even if an assertion failed.
+      for (let i = 0; i < rig.epochs.length; i++)
+        rig.epochs[i]!.transport.push(turnCompleted("interrupted", savedId, `repeat-${["A", "B", "C"][i]}-turn`));
+      cleanupResults = await withTimeout(Promise.allSettled([running, ...jobs]), 10000, "repeat runner cleanup join");
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+    for (const result of cleanupResults) if (result.status === "rejected") throw result.reason;
   });
 });
