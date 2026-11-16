@@ -114,7 +114,8 @@ it.each([
 });
 
 it.each([
-  [422, "Worker does not support switching"],
+  [409, "Worker does not support switching"],
+  [422, "Queued runs cannot switch credentials"],
   [409, "Policy refuses this switch"],
 ] as const)("shows server refusal %s: %s and preserves the selection", async (status, message) => {
   await page.viewport(390, 900);

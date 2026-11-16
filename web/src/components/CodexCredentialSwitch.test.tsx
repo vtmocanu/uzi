@@ -117,7 +117,7 @@ describe("Codex credential switch", () => {
     expect(api.listSecrets).toHaveBeenCalledTimes(2);
     expect(confirm().disabled).toBe(true);
   });
-  it.each([[409, "Run is now claimed"], [409, "Policy refuses this switch"], [422, "Worker does not support switching"]])(
+  it.each([[409, "Run is now claimed"], [409, "Policy refuses this switch"], [409, "Worker does not support switching"], [422, "Queued runs cannot switch credentials"]])(
     "shows server refusal %s %s and preserves the editor", async (status, message) => {
       vi.mocked(api.setRunCredential).mockRejectedValue(new ApiError(Number(status), String(message)));
       const onSwitched = vi.fn();
