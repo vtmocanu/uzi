@@ -21,6 +21,17 @@ func codexApplyFixture(t *testing.T, subscription bool) (applyFx, uuid.UUID, uui
 
 func codexApplyFixtureWithRegistration(t *testing.T, subscription, register bool) (applyFx, uuid.UUID, uuid.UUID) {
 	t.Helper()
+	f, run, target, _ := codexUnrequestedFixture(t, false, subscription, register)
+	_, err := f.svc.SetRunCredential(f.env.ctx, f.o.userID, run, BindModePinned, &target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return f, run, target
+}
+
+// Freeze initial authority and record ordinal zero without making an owner request.
+func codexUnrequestedFixture(t *testing.T, oldSubscription, targetSubscription, register bool) (applyFx, uuid.UUID, uuid.UUID, string) {
+	t.Helper()
 	f := newApplyFx(t)
 	if register {
 		f.register(t, []string{capability.CodexCredentialSwitchV1, capability.CodexSwitchStoppedV1})
@@ -28,24 +39,27 @@ func codexApplyFixtureWithRegistration(t *testing.T, subscription, register bool
 		f.env.exec("UPDATE workers SET credential_switch_apply_nonce=snapshot_register_nonce, protocol_capabilities=ARRAY[$2,'codex_switch_stopped_v1']::text[] WHERE id=$1", f.o.workerID, capability.CodexCredentialSwitchV1)
 	}
 	run, _ := f.run(t, "running")
-	old := f.env.seedStaticAPIKey(t, f.o.userID, "apply-old", "apply-old-key")
-	if err := f.svc.FreezeCodexBinding(f.env.ctx, f.o.userID, run, old, codexAuthModeAPIKey); err != nil {
+	var old uuid.UUID
+	authMode := codexAuthModeAPIKey
+	if oldSubscription {
+		old = f.env.seedLinkedSubscription(t, f.o.userID, "apply-old-subscription", codexToken("old-access"), codexToken("old-refresh"))
+		authMode = codexAuthModeSubscription
+	} else {
+		old = f.env.seedStaticAPIKey(t, f.o.userID, "apply-old", "apply-old-key")
+	}
+	if err := f.svc.FreezeCodexBinding(f.env.ctx, f.o.userID, run, old, authMode); err != nil {
 		t.Fatal(err)
 	}
-	_, hash := mintCodexCapability()
+	plain, hash := mintCodexCapability()
 	f.env.exec("UPDATE runs SET codex_claim_epoch=41, codex_cap_hash=$2 WHERE id=$1", run, hash)
 	if err := f.svc.recordCodexEpoch(f.env.ctx, mustRun(t, f.env, run)); err != nil {
 		t.Fatal(err)
 	}
 	target := f.env.seedStaticAPIKey(t, f.o.userID, "apply-target", "apply-target-key")
-	if subscription {
+	if targetSubscription {
 		target = f.env.seedLinkedSubscription(t, f.o.userID, "apply-subscription", codexApplyTargetAccess, codexToken("target-refresh"))
 	}
-	_, err := f.svc.SetRunCredential(f.env.ctx, f.o.userID, run, BindModePinned, &target)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return f, run, target
+	return f, run, target, formatCodexCapability(41, plain)
 }
 
 func TestCodexTransactionalApplyBundleLiveDB(t *testing.T) {

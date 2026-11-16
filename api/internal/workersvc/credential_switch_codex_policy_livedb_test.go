@@ -38,6 +38,24 @@ func TestOwnerCodexUnresolvedPolicyRefusesReplacementLiveDB(t *testing.T) {
 	}
 }
 
+// Prepare the pending snapshot through the locked resolver so public owner-route
+// refusals are exercised in the assertion rather than during fixture setup.
+func TestOwnerCodexPolicyRefusalFromPreparedBindingLiveDB(t *testing.T) {
+	f, run, target, _ := codexUnrequestedFixture(t, false, false, false)
+	if _, err := f.svc.requestCodexCredentialSwitch(f.env.ctx, mustRun(t, f.env, run), BindModePinned, &target); err != nil {
+		t.Fatal(err)
+	}
+	setCodexSwitchPolicyEpisode(f, run, false, false)
+	next := f.env.seedStaticAPIKey(t, f.o.userID, "prepared-policy-next", "prepared-policy-next-key")
+	f.noWrite(t, run, func() {
+		_, err := f.svc.SetRunCredential(f.env.ctx, f.o.userID, run, BindModePinned, &next)
+		var held *RunOwnerHeldError
+		if !errors.As(err, &held) {
+			t.Fatal("public policy replacement was not owner-held", err)
+		}
+	})
+}
+
 // A ready preflight is advisory: a policy episode can start after it and must
 // still prevent the locked apply from changing the binding, capability or journal.
 func TestCodexPolicyEpisodeBetweenPreflightAndApplyLiveDB(t *testing.T) {

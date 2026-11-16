@@ -1,14 +1,31 @@
 package workersvc
 
 import (
-	"github.com/google/uuid"
 	"testing"
 
+	"github.com/google/uuid"
 	"github.com/vtmocanu/uzi/api/internal/codexauth"
 )
 
 func TestCodexRefreshAdmittedBeforeApplyLiveDB(t *testing.T) {
 	f, run, account, capability := codexApplyFromSubscription(t)
+	assertCodexRefreshAdmittedBeforeApply(t, f, run, account, capability)
+}
+
+func TestCodexInitialSubscriptionRefreshAdmissionLiveDB(t *testing.T) {
+	f, run, target, capability := codexUnrequestedFixture(t, true, false, false)
+	if _, err := f.svc.SetRunCredential(f.env.ctx, f.o.userID, run, BindModePinned, &target); err != nil {
+		t.Fatal(err)
+	}
+	authority, err := f.svc.AuthorizeCodexCredentialOp(f.env.ctx, f.worker(t), run, capability, ScopeStartRefresh)
+	if err != nil || authority.AccountID == uuid.Nil {
+		t.Fatal("initial subscription refresh was not authorized", err)
+	}
+	assertCodexRefreshAdmittedBeforeApply(t, f, run, authority.AccountID, capability)
+}
+
+func assertCodexRefreshAdmittedBeforeApply(t *testing.T, f applyFx, run, account uuid.UUID, capability string) {
+	t.Helper()
 	acct := f.env.mustAccount(t, f.o.userID, account)
 	checked := false
 	refreshToken := codexToken("admitted-refresh")
