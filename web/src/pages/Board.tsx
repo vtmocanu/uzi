@@ -8,7 +8,7 @@
 // meta, badges. Live behavior (latest_run badges, 10s visibility-gated polling,
 // auto-move toasts, the attention strip, in-app issue links) is PRD #12 M2/M3.
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { useParams, Link, useNavigate } from "react-router-dom";
 import {
   api,
@@ -1095,6 +1095,19 @@ export function Board() {
     [cardsByColumn, applyDrop, pushToast],
   );
 
+  const toolbarRef = useRef<HTMLDivElement>(null);
+  const [toolbarH, setToolbarH] = useState(0);
+  useLayoutEffect(() => {
+    const el = toolbarRef.current;
+    if (!el) return;
+    const measure = () => setToolbarH(el.offsetHeight);
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [loading]);
+
   if (loading) {
     return (
       <div className="space-y-5">
@@ -1147,7 +1160,7 @@ export function Board() {
           transparent). On mobile the shell's own bar is a 49px-tall sticky top-0 z-20
           strip, so offset below it; on lg the shell bar is hidden and we pin at 0.
           Verified in a browser pass. */}
-      <div className="sticky top-[49px] z-10 bg-ink lg:top-0">
+      <div ref={toolbarRef} className="sticky top-[49px] z-10 bg-ink lg:top-0">
       <PageHeader
         backTo="/repos"
         backLabel="Repos"
@@ -1324,7 +1337,7 @@ export function Board() {
         <div
           role="status"
           aria-live="polite"
-          className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded-lg border border-warn/40 bg-warn/10 px-4 py-2.5 text-sm text-warn"
+          className="isolate flex flex-wrap items-center gap-x-2 gap-y-1 rounded-lg border border-warn/40 bg-warn/10 px-4 py-2.5 text-sm text-warn"
         >
           <span className="font-medium">
             {[
@@ -1406,11 +1419,10 @@ export function Board() {
         />
       )}
 
-      {/* Issue #367 → #373: columns scroll HORIZONTALLY in one row (overflow-x-auto)
-          again; the page still scrolls vertically for tall columns. Reverts the
-          flex-wrap of Decision 2 (Option A), which stacked columns onto new rows when
-          they exceeded the width and killed horizontal card scroll. */}
-      <div className="flex items-start gap-4 overflow-x-auto pb-4">
+      <div
+        style={{ "--board-toolbar-h": `${toolbarH}px` } as CSSProperties}
+        className="flex items-start gap-4 overflow-x-auto pb-4 lg:grid lg:max-h-[calc(100dvh-var(--board-toolbar-h)-2rem)] lg:auto-cols-[18rem] lg:grid-flow-col lg:items-stretch lg:overflow-y-auto lg:scroll-pt-12"
+      >
         {visible.map((col) => {
           const cards = cardsByColumn.get(col.key) ?? [];
           // Per-lane paging (PRD #304 M1/M2). `cards` stays FULL — it drives the count
@@ -1450,8 +1462,6 @@ export function Board() {
                 if (iid) applyDrop(iid, col.key, null);
               }}
               className={cx(
-                // Fixed-width, non-shrinking columns in one row; the row's overflow-x-auto
-                // gives back horizontal card scroll (#373, reverting Decision 2's grow-wrap).
                 "flex w-72 shrink-0 flex-col rounded-xl border p-2.5 transition-colors",
                 dragRevealed && "opacity-60",
                 isTarget
@@ -1461,11 +1471,15 @@ export function Board() {
                     : "border-edge bg-surface/60",
               )}
             >
-              {/* Static header (#373): sticky pinning is incompatible with the row's
-                  overflow-x-auto (a non-visible overflow-x forces overflow-y:auto, which
-                  makes the row — not the viewport — the sticky scroll context). We chose
-                  horizontal card scroll over pinned headers, so the header is plain again. */}
-              <div className="mb-2.5 flex items-center gap-2 px-1">
+              <div
+                className={cx(
+                  "mb-2.5 flex items-center gap-2 px-1",
+                  "lg:sticky lg:top-0 lg:z-[1] lg:-mx-2.5 lg:-mt-2.5 lg:mb-0 lg:rounded-t-xl lg:bg-ink lg:px-3.5 lg:py-2.5",
+                  isTarget
+                    ? "lg:bg-gradient-to-b lg:from-brand/5 lg:to-brand/5"
+                    : !closedCol && "lg:bg-gradient-to-b lg:from-surface/60 lg:to-surface/60",
+                )}
+              >
                 <span aria-hidden="true" className={cx("h-2 w-2 rounded-full", col.accent)} />
                 <span className={cx("text-sm font-semibold", closedCol ? "text-faint" : "text-fg")}>
                   {col.label}
@@ -1476,11 +1490,6 @@ export function Board() {
                   {paging.countLabel || String(cards.length)}
                 </span>
               </div>
-              {/* Issue #367 (Decision 1): the per-lane max-h/overflow box is gone —
-                  the lane grows to fit its cards and the page scrolls as one plane, so
-                  an expanded lane ("Show N more") grows the page rather than opening an
-                  inner scrollbar. `paging.canCollapse` still drives the Show-more/Collapse
-                  controls; it just no longer gates a scroll box. */}
               <div className="flex flex-col gap-2">
                 {shown.map((card, i) => {
                   // Runnability is the single `uzi` label (PRD #764): a card carrying it
