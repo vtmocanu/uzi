@@ -159,9 +159,15 @@ Hibernate is refused, with a reason, when the worker:
   run is never stranded);
 - or the controller has not advertised hibernation support recently.
 
-The controller can still refuse after the request is accepted (a roll marker or
-reservation, a disk-pressure recycle, DinD maintenance, a busy worker, or a layout
-migration). If nothing was scaled down, a refusal returns the worker to normal.
+The controller can still refuse after the request is accepted (an open, unreadable
+or retained-claim roll reservation (`roll_reservation`), a finished roll whose
+same-owner or unverified-owner peers still carry roll metadata
+(`roll_cohort_cleanup_pending`), a disk-pressure recycle, DinD maintenance, a busy
+worker, or a layout migration). Completed roll history from a finished roll is
+retired before sleep, so it does not block hibernation by itself; with
+`roll_cohort_cleanup_pending` nothing is written and the hibernation can be retried
+later (the automatic pass retries after its cooldown, or an admin retries). If
+nothing was scaled down, a refusal returns the worker to normal.
 Preparation that does not finish within 10 minutes is withdrawn into a wake.
 
 A wake completes only when the new pod registers (or the original pod is still
