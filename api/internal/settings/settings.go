@@ -472,7 +472,7 @@ func Validate(key, value string) error {
 		return validateTypeface(value)
 	case KeySlackEnabled, KeyJudgeEnabled, KeyJudgeEnforceAll, KeyHealthEnabled,
 		KeyCapabilityAwareScheduling, KeyCompletionInterlockRollout, KeyGithubProjectSyncEnabled,
-		KeyEphemeralWorkersEnabled, KeyWorkerHibernationEnabled, KeyWorkerHibernationAuto, KeyAgentSourceEnabled, KeyMrReworkEnabled, KeyDecisionsMemoEnabled, KeyNowSummaryEnabled,
+		KeyEphemeralWorkersEnabled, KeyWorkerHibernationEnabled, KeyWorkerHibernationAuto, KeyWorkerHibernationSurplus, KeyAgentSourceEnabled, KeyMrReworkEnabled, KeyDecisionsMemoEnabled, KeyNowSummaryEnabled,
 		KeyCiAutofixEnabled,
 		KeyReleaseCheckEnabled, KeyReleaseCheckBannerEnabled,
 		KeyAppLogoKeepName, KeyBrandPlaque:
@@ -553,6 +553,8 @@ func Validate(key, value string) error {
 		return validateReleaseCheckInterval(value)
 	case KeyWorkerHibernationIdleAfter:
 		return validateWorkerHibernationIdleAfter(value)
+	case KeyWorkerHibernationSurplusIdleAfter:
+		return validateWorkerHibernationSurplusIdleAfter(value)
 	case KeyReleaseCheckToken:
 		return validateReleaseCheckToken(value)
 	default:

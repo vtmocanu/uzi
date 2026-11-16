@@ -2087,6 +2087,7 @@ type Worker struct {
 	HibernationBlockedReason   pgtype.Text        `json:"hibernation_blocked_reason"`
 	HibernationBlockedAt       pgtype.Timestamptz `json:"hibernation_blocked_at"`
 	HibernationBlockedSince    pgtype.Timestamptz `json:"hibernation_blocked_since"`
+	MemoryAuthorityLostAt      pgtype.Timestamptz `json:"memory_authority_lost_at"`
 }
 
 type WorkerActiveRun struct {

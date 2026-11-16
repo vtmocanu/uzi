@@ -30,6 +30,11 @@ func (*autoModeSettings) WorkerHibernationIdleAfter(context.Context) (time.Durat
 	return 336 * time.Hour, nil
 }
 
+func (*autoModeSettings) WorkerHibernationSurplus(context.Context) (bool, error) { return false, nil }
+func (*autoModeSettings) WorkerHibernationSurplusIdleAfter(context.Context) (time.Duration, error) {
+	return 2 * time.Hour, nil
+}
+
 type autoModeDB struct {
 	anchor        time.Time
 	reads, writes int

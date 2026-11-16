@@ -3740,6 +3740,13 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 	if !valid {
 		return nil, ErrActiveSnapshotInvalid
 	}
+	// Issue #4395: persist the memory-authority report on the locked worker row, fenced by the
+	// register nonce the snapshot was just validated against. It precedes the overflow refusal
+	// and the claim, so an idle or refused poll still persists it, and it only touches the
+	// worker row this transaction already holds.
+	if err := s.persistMemoryAuthority(ctx, qtx, locked, snapshot, lane, report); err != nil {
+		return nil, err
+	}
 	pending := s.validatePendingAll(locked, snapshot)
 	pending.scoped = &scopedPendingClaim{}
 	locks, err := captureWorkerRecoveryLocks(ctx, qtx, locked.ID, entries, pending.ids)

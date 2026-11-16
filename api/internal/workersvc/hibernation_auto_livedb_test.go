@@ -36,6 +36,11 @@ func (a *autoSettings) WorkerHibernationIdleAfter(context.Context) (time.Duratio
 	return a.idle, a.err
 }
 
+func (a *autoSettings) WorkerHibernationSurplus(context.Context) (bool, error) { return false, nil }
+func (a *autoSettings) WorkerHibernationSurplusIdleAfter(context.Context) (time.Duration, error) {
+	return 2 * time.Hour, nil
+}
+
 const autoIdleAfter = 336 * time.Hour
 
 type autoFx struct {

@@ -200,6 +200,11 @@ func (f *fakeSettings) WorkerHibernationIdleAfter(context.Context) (time.Duratio
 	return f.hibIdleAfter, f.hibErr
 }
 
+func (f *fakeSettings) WorkerHibernationSurplus(context.Context) (bool, error) { return false, nil }
+func (f *fakeSettings) WorkerHibernationSurplusIdleAfter(context.Context) (time.Duration, error) {
+	return 2 * time.Hour, nil
+}
+
 func (f *fakeSettings) HealthEnabled(context.Context) (bool, error) {
 	return f.healthEnabled, f.healthErr
 }

@@ -1,0 +1,47 @@
+package workersvc
+
+import (
+	"context"
+
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
+	"github.com/vtmocanu/uzi/api/internal/store"
+)
+
+// persistMemoryAuthority records a run-lane claim's memory-authority report on the worker row
+// (issue #4395, workers.memory_authority_lost_at), so a keeper whose memory authority is lost is
+// not counted as ready by the warm-reserve policy.
+//
+// It runs inside the claim transaction, with locked the row as locked by GetWorkerForUpdate and
+// after the claim snapshot was validated against it. A lost report sets the column when it is
+// NULL (the first-lost time is kept); a held report clears it when set. It writes only on a
+// state change, so the common held-to-held claim does no write. An absent report from a worker
+// without both capabilities is neither lost nor held and writes nothing. It does not depend on a
+// run being claimed: the caller invokes it before the claim, so an idle or refused poll
+// persists too.
+//
+// The registration fence is the snapshot's register nonce, repeated in the UPDATE's WHERE. A
+// claim without a snapshot carries no registration identity, so it persists nothing.
+func (s *Service) persistMemoryAuthority(ctx context.Context, qtx *store.Queries, locked store.Worker, snapshot *ActiveSnapshot, lane string, report MemoryAuthorityReport) error {
+	if lane == "cross_check" || snapshot == nil || snapshot.RegisterNonce == "" {
+		return nil
+	}
+	switch {
+	case memoryAuthorityLost(locked.ProtocolCapabilities, report):
+		if locked.MemoryAuthorityLostAt.Valid {
+			return nil
+		}
+		_, err := qtx.SetWorkerMemoryAuthorityLost(ctx, store.SetWorkerMemoryAuthorityLostParams{
+			ID: locked.ID, RegisterNonce: pgconv.TextOrNull(snapshot.RegisterNonce), LostAt: pgconv.Time(s.now()),
+		})
+		return err
+	case report.held():
+		if !locked.MemoryAuthorityLostAt.Valid {
+			return nil
+		}
+		_, err := qtx.ClearWorkerMemoryAuthorityLost(ctx, store.ClearWorkerMemoryAuthorityLostParams{
+			ID: locked.ID, RegisterNonce: pgconv.TextOrNull(snapshot.RegisterNonce),
+		})
+		return err
+	}
+	return nil
+}

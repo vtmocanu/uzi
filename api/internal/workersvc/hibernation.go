@@ -137,6 +137,9 @@ type HibernationAutoSettings interface {
 	HibernationSettings
 	WorkerHibernationAuto(ctx context.Context) (bool, error)
 	WorkerHibernationIdleAfter(ctx context.Context) (time.Duration, error)
+	// Warm-reserve surplus hibernation (issue #4395).
+	WorkerHibernationSurplus(ctx context.Context) (bool, error)
+	WorkerHibernationSurplusIdleAfter(ctx context.Context) (time.Duration, error)
 }
 
 // SetHibernationAutoSettings wires the automatic pass's settings reader. Call once at startup.

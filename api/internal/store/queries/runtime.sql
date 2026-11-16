@@ -335,6 +335,9 @@ WITH prev AS (
         registered_pod_uid = sqlc.narg('registered_pod_uid')::uuid,
         roll_heartbeat_at = NULL,
         draining_reason = NULL,
+        -- Issue #4395: a fresh registration starts with no persisted memory-authority loss; the
+        -- next run-lane claim of THIS registration re-establishes it if it is still lost.
+        memory_authority_lost_at = NULL,
         snapshot_register_nonce = @snapshot_register_nonce,
         snapshot_epoch      = 0,
         last_heartbeat_at   = now(),

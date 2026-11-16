@@ -128,6 +128,9 @@ type Settings interface {
 	WorkerHibernationEnabled(context.Context) (bool, error)
 	WorkerHibernationAuto(context.Context) (bool, error)
 	WorkerHibernationIdleAfter(context.Context) (time.Duration, error)
+	// Warm-reserve surplus hibernation (issue #4395).
+	WorkerHibernationSurplus(context.Context) (bool, error)
+	WorkerHibernationSurplusIdleAfter(context.Context) (time.Duration, error)
 }
 
 // dbStat is the db check's raw probe result. Separating it from the severity logic is what
