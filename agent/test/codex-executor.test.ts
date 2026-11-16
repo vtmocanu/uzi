@@ -32468,6 +32468,7 @@ describe("M2 actualRunner credential replacement", () => {
           ? oldClaim !== SUBSCRIPTION || target !== API_KEY
           : oldClaim !== API_KEY || target !== SUBSCRIPTION))) continue;
         const positiveBChild = publication === "gated" && oldClaim === API_KEY && target === SUBSCRIPTION && phase === "factory";
+        const probeEpochConsumers = publication === "baseline" && oldClaim === API_KEY && phase === "factory";
         const queuedRefreshStop = publication === "subscription-refresh-prepare-failure" || publication === "subscription-refresh-cancel";
         const crashRecovery = publication === "crash-after-a-teardown-recovery" ||
           publication === "crash-apply-reply-lost-recovery" || publication === "crash-apply-ack-recovery" ||
@@ -33106,9 +33107,14 @@ describe("M2 actualRunner credential replacement", () => {
         };
         const release = rig.client.releaseCodex.bind(rig.client);
         let credentialReleases = 0, credentialRefreshes = 0, bCredentialReleases = 0;
+        let retainedAReconcile: import("../src/codex/safety.js").ReconcileBeforeBoundary | undefined;
+        let retainedBoundaryActive = false, retainedBoundaryReleasedA = false;
+        const retiredBoundaries: { result: string; releaseCalls: number; releasedA: boolean }[] = [];
+        let staleSummaryCapture: string | undefined;
         rig.client.releaseCodex = async (id, req) => {
           if (resumeVariant && applies > 0) assert.equal(req.capability, next.capability, "A auth never revives after apply");
           credentialReleases++;
+          if (retainedBoundaryActive && req.capability === oldClaim.capability) retainedBoundaryReleasedA = true;
           if (req.capability === next.capability) bCredentialReleases++;
           return req.capability === next.capability ? { access_token: next.access_token } : release(id, req);
         };
@@ -33140,6 +33146,24 @@ describe("M2 actualRunner credential replacement", () => {
         b.transport.request = async (method, params, opts) => {
           events.push(method);
           if (method === "account/login/start") {
+            if (probeEpochConsumers) {
+              const before = credentialReleases;
+              let result = "missing";
+              retainedBoundaryActive = true;
+              try {
+                if (retainedAReconcile) {
+                  const outcome = await withTimeout(retainedAReconcile(
+                    { boundary: "checkpoint", deadlineMs: 5000 }, new AbortController().signal),
+                  5000, "retained A boundary probe");
+                  result = outcome.kind;
+                }
+              } catch (error) {
+                result = error instanceof TrustedExecutionRefusal && error.message === "codex credential authority retired"
+                  ? "retired" : error instanceof Error && error.message.includes("retained A boundary probe")
+                    ? "timeout" : "unexpected-error";
+              } finally { retainedBoundaryActive = false; }
+              retiredBoundaries.push({ result, releaseCalls: credentialReleases - before, releasedA: retainedBoundaryReleasedA });
+            }
             loginObservations.push({ params: rec(params), reaped: events.includes("A-reaped"),
               effectDisposed: events.includes("A-effect-disposed"), fileopDisposed: fileops[0]!.disposed() });
             await publicationBoundary("login");
@@ -33159,6 +33183,14 @@ describe("M2 actualRunner credential replacement", () => {
           return request(method, params, opts);
         };
         const executor = makeExecutor(rig, bindingOf(oldClaim), noopLog, undefined, provider, m2Runner.homeDir);
+        if (probeEpochConsumers) {
+          // Retain the production-created A credential boundary, not its retired safety facade.
+          const original = Reflect.get(executor, "startProviderEpoch") as (...args: unknown[]) => unknown;
+          Reflect.set(executor, "startProviderEpoch", function (this: CodexExecutor, ...args: unknown[]) {
+            retainedAReconcile ??= (args[1] as { reconcile: import("../src/codex/safety.js").ReconcileBeforeBoundary }).reconcile;
+            return Reflect.apply(original, this, args);
+          });
+        }
         let reopenAttempts = 0, publishAttempts = 0, restartAttempts = 0;
         const suspend = executor.suspendCodexEpoch.bind(executor);
         executor.suspendCodexEpoch = async bounds => {
@@ -33280,6 +33312,18 @@ describe("M2 actualRunner credential replacement", () => {
                   events.push("A-Now-drained");
                 } else if (!isA) {
                   try { owners[0]!.guard(); } catch { retiredADenied = true; }
+                  if (probeEpochConsumers) {
+                    // Seed only a stale revision while exercising the actual B factory guard.
+                    // Restore synchronously before any other producer can observe the test input.
+                    const state = executor as unknown as { captureRevision: number };
+                    const revision = state.captureRevision;
+                    state.captureRevision = revision + 1;
+                    try { owner.guard(); staleSummaryCapture = "admitted"; }
+                    catch (error) {
+                      staleSummaryCapture = error instanceof TrustedExecutionRefusal && error.message === "codex epoch admission closed for capture"
+                        ? "capture-refused" : "unexpected-error";
+                    } finally { state.captureRevision = revision; }
+                  }
                   owner.guard(); liveBAdmitted = true;
                 }
                 return { kind: "codex", run: async (request: import("../src/harness.js").AdviceRequest) => {
@@ -34928,6 +34972,10 @@ describe("M2 actualRunner credential replacement", () => {
           });
           if (publication === "baseline") {
             await withTimeout(Promise.all(triggers), 5000, "B ordinary work before allocation proof");
+            if (probeEpochConsumers) {
+              assert.deepEqual(retiredBoundaries, [{ result: "retired", releaseCalls: 0, releasedA: false }],
+                "retained A credential boundary rejects before credential release");
+            }
             assert.ok(admission);
             assert.equal(bRootObserved, true, "ordinary B work precedes the allocation proof");
             assert.ok(bRootPrepares > 0);
@@ -34969,6 +35017,7 @@ describe("M2 actualRunner credential replacement", () => {
           assert.equal(nowBuilds.length, 2, "real owned composition constructs A then B Now");
           assert.equal(retiredADenied, true, "A guard rejected during live B construction");
           assert.equal(liveBAdmitted, true, "B guard accepted before executor shutdown");
+          if (probeEpochConsumers) assert.equal(staleSummaryCapture, "capture-refused", "B summary rejects stale capture revision");
           assert.deepEqual(nowRuns, phase === "factory" ? [next.capability] : [oldClaim.capability, next.capability]);
           assert.equal(summaryRoots.length, phase === "factory" ? 1 : 2);
           assert.equal(summaryDisposeCalls, summaryRoots.length, "each actual owned summary handle disposed once");
