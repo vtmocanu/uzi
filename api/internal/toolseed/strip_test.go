@@ -81,10 +81,22 @@ func TestBuildSeedSetReadsCommentedManifest(t *testing.T) {
 }
 
 // TestBuildSeedSetFailsClosedOnMalformedManifest: a manifest that does not parse
-// yields an empty coverage set instead of panicking in package init.
+// yields an empty coverage set instead of panicking in package init. Rebuilding from
+// malformed input returns a fresh set and leaves the live, init-time coverage behind
+// Covered intact: a baked package and a documented exception stay covered, and an
+// un-baked package stays uncovered.
 func TestBuildSeedSetFailsClosedOnMalformedManifest(t *testing.T) {
 	swapSeedManifest(t, "{not json")
 	if got := buildSeedSet(); !maps.Equal(got, map[string]bool{}) {
 		t.Fatalf("buildSeedSet() on a malformed manifest = %v, want an empty set", got)
+	}
+	if !Covered("jq") {
+		t.Error(`Covered("jq") = false after a malformed rebuild, want true (baked in the live manifest)`)
+	}
+	if !Covered("kubectl") {
+		t.Error(`Covered("kubectl") = false after a malformed rebuild, want true (a documented exception)`)
+	}
+	if Covered("cowsay") {
+		t.Error(`Covered("cowsay") = true after a malformed rebuild, want false (neither baked nor an exception)`)
 	}
 }
