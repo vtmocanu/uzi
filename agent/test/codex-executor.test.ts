@@ -32454,6 +32454,7 @@ describe("M2 actualRunner credential replacement", () => {
         api.setOwnershipStatus(claim.run_id, "running", 7);
         let pending = false, cancelled = false, applies = 0, hooks = 0, factories = 0, preflights = 0;
         let pendingOp = "M2-op";
+        const forbiddenSuccessorApply = installerBarrier();
         let predecessorFenced = false, applyAcknowledgements = 0;
         let committedCodex = claim.secrets.codex!;
         let context!: RunContext;
@@ -32691,6 +32692,7 @@ describe("M2 actualRunner credential replacement", () => {
           applyRequests.push({ claimGeneration: req.claimGeneration, opId: req.opId });
           applies++;
           if (successorEpochAdvance) {
+            if (applies > 1) forbiddenSuccessorApply.resolve();
             assert.equal(applies, 1, "successor apply is forbidden after READY advances the latched epoch");
             assert.equal(req.opId, "M2-op");
             assert.equal(pending, true);
@@ -33577,7 +33579,10 @@ describe("M2 actualRunner credential replacement", () => {
           }
           cleanupContinue.resolve();
           if (cleanRetainedStop) {
-            await withTimeout(switchSettled.promise, 5000, "clean real lease switch retains execution");
+            await withTimeout(successorEpochAdvance
+              ? Promise.race([switchSettled.promise, forbiddenSuccessorApply.promise])
+              : switchSettled.promise, 5000, "clean real lease switch retains execution");
+            if (successorEpochAdvance) assert.equal(applies, 1, "advanced successor epoch reached a forbidden second apply");
             await withTimeout(running, 5000, "clean real lease retained execution joins");
             assert.deepEqual(teardownResults, [true]);
             assert.equal(teardownAttempts, 1);
