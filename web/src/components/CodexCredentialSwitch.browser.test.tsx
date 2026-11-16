@@ -1,9 +1,12 @@
 import "../index.css";
 import { afterEach, expect, it, vi } from "vitest";
 import { page, userEvent } from "vitest/browser";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import { api, type Run, type SecretMeta } from "../lib/api";
-import { SwitchTokenAction } from "./RunCredentialOverride";
+import { ApiError } from "../lib/apiError";
+import { RunCredentialOverride, SwitchTokenAction } from "./RunCredentialOverride";
+import { RunCredential } from "./RunCredential";
 
 vi.mock("../lib/api", () => ({ api: { listSecrets: vi.fn(), setRunCredential: vi.fn() } }));
 const originalTheme = document.documentElement.getAttribute("data-theme");
@@ -61,22 +64,87 @@ it.each([
   expect(api.setRunCredential).not.toHaveBeenCalled();
 });
 
-it("returns keyboard focus after success and forwards the server result", async () => {
+it.each([
+  ["credential-a", "Codex subscription"],
+  ["credential-b", "OpenAI API key"],
+] as const)("pins an explicit %s (%s), returns focus and displays only committed bindings", async (targetId, authKind) => {
   await page.viewport(390, 900);
-  const returned = { ...run, credential_switch: "requested" } as Run;
-  vi.mocked(api.listSecrets).mockResolvedValue({ secrets: choices });
+  const secrets = choices.map((s, i) => ({ ...s, label: `Account ${i === 0 ? "A" : "B"}` + String.fromCodePoint(0x202e) }));
+  const target = secrets.find(s => s.id === targetId)!;
+  const current = secrets.find(s => s.id !== targetId)!;
+  const currentLabel = current.id === "credential-a" ? "Account A" : "Account B";
+  const targetLabel = targetId === "credential-a" ? "Account A" : "Account B";
+  const committed = { ...run, codex_secret_id: current.id, codex_secret_label: current.label, credential_switch: null } as Run;
+  const returned = { ...committed, credential_switch: "requested" } as Run;
+  vi.mocked(api.listSecrets).mockResolvedValue({ secrets });
   vi.mocked(api.setRunCredential).mockResolvedValue({ run: returned });
   const onSwitched = vi.fn();
-  render(<SwitchTokenAction run={run} canSteer onSwitched={onSwitched} />);
+  function Header({ value }: { value: Run }) {
+    return <MemoryRouter><RunCredential run={value} /><RunCredentialOverride run={value} />
+      <SwitchTokenAction run={value} canSteer onSwitched={onSwitched} /></MemoryRouter>;
+  }
+  const { container, rerender } = render(<Header value={committed} />);
+  expect(screen.getByText(currentLabel)).toBeTruthy();
   const trigger = screen.getByRole("button", { name: "Switch credential" });
-  fireEvent.click(trigger);
+  await userEvent.click(trigger);
   const select = screen.getByLabelText("Codex credential") as HTMLSelectElement;
   await waitFor(() => expect(select.disabled).toBe(false));
-  await userEvent.selectOptions(select, "credential-b");
+  expect(select.value).toBe(current.id);
+  expect((screen.getByRole("button", { name: "Switch to this credential" }) as HTMLButtonElement).disabled).toBe(true);
+  expect(screen.getByRole("option", { name: new RegExp(`${targetLabel} — ${authKind}`) })).toBeTruthy();
+  await userEvent.selectOptions(select, targetId);
+  expect(select.title).toBe(targetLabel);
+  expect(container.innerHTML).not.toContain(String.fromCodePoint(0x202e));
   const confirm = screen.getByRole("button", { name: "Switch to this credential" });
   confirm.focus();
   await userEvent.type(page.elementLocator(confirm), "{Enter}", { skipClick: true });
   await waitFor(() => expect(onSwitched).toHaveBeenCalledWith(returned));
-  expect(api.setRunCredential).toHaveBeenCalledExactlyOnceWith(run.id, { mode: "pinned", secret_id: "credential-b" });
+  expect(api.setRunCredential).toHaveBeenCalledExactlyOnceWith(run.id, { mode: "pinned", secret_id: targetId });
   expect(document.activeElement).toBe(trigger);
+  expect(screen.getByText(currentLabel)).toBeTruthy();
+  rerender(<Header value={returned} />);
+  expect(screen.getByText("switch pending")).toBeTruthy();
+  expect(screen.getByText(currentLabel)).toBeTruthy();
+  expect(screen.queryByText(targetLabel)).toBeNull();
+  rerender(<Header value={{ ...committed, codex_secret_id: targetId, codex_secret_label: target.label }} />);
+  expect(screen.getByText(targetLabel)).toBeTruthy();
+  expect(screen.queryByText(currentLabel)).toBeNull();
+  expect(screen.queryByText("switch pending")).toBeNull();
+  expect(container.innerHTML).not.toContain(String.fromCodePoint(0x202e));
+});
+
+it.each([
+  [422, "Worker does not support switching"],
+  [409, "Policy refuses this switch"],
+] as const)("shows server refusal %s: %s and preserves the selection", async (status, message) => {
+  await page.viewport(390, 900);
+  vi.mocked(api.listSecrets).mockResolvedValue({ secrets: choices });
+  vi.mocked(api.setRunCredential).mockRejectedValue(new ApiError(status, message));
+  const onSwitched = vi.fn();
+  render(<SwitchTokenAction run={run} canSteer onSwitched={onSwitched} />);
+  await userEvent.click(screen.getByRole("button", { name: "Switch credential" }));
+  const select = screen.getByLabelText("Codex credential") as HTMLSelectElement;
+  await waitFor(() => expect(select.disabled).toBe(false));
+  await userEvent.selectOptions(select, "credential-b");
+  await userEvent.click(screen.getByRole("button", { name: "Switch to this credential" }));
+  await screen.findByText(message);
+  expect(api.setRunCredential).toHaveBeenCalledExactlyOnceWith(run.id, { mode: "pinned", secret_id: "credential-b" });
+  expect(onSwitched).not.toHaveBeenCalled();
+  expect(select.value).toBe("credential-b");
+  expect(select.disabled).toBe(false);
+  expect((screen.getByRole("button", { name: "Cancel" }) as HTMLButtonElement).disabled).toBe(false);
+});
+
+it("hides the nonowner switch without fetching credentials", async () => {
+  vi.mocked(api.listSecrets).mockResolvedValue({ secrets: choices });
+  const { rerender } = render(<SwitchTokenAction run={run} canSteer={false} />);
+  expect(screen.queryByRole("button", { name: "Switch credential" })).toBeNull();
+  expect(screen.queryByLabelText("Codex credential")).toBeNull();
+  expect(api.listSecrets).not.toHaveBeenCalled();
+  expect(api.setRunCredential).not.toHaveBeenCalled();
+  // The same run exposes the control and loads choices for its owner.
+  rerender(<SwitchTokenAction run={run} canSteer />);
+  await userEvent.click(screen.getByRole("button", { name: "Switch credential" }));
+  await waitFor(() => expect((screen.getByLabelText("Codex credential") as HTMLSelectElement).disabled).toBe(false));
+  expect(api.listSecrets).toHaveBeenCalledTimes(1);
 });

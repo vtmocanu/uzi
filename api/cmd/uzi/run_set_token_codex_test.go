@@ -57,6 +57,20 @@ func TestRunSetTokenHarnessKindsAndAmbiguity(t *testing.T) {
 	}
 }
 
+func TestRunSetTokenCodexLiveKindsReachServer(t *testing.T) {
+	for _, kind := range []string{"issue", "ci_fix", "self_improve", "prompt", "task", "mr_rework"} {
+		t.Run(kind, func(t *testing.T) {
+			fc := codexSwitchClient()
+			fc.RunByID["run-9"] = apitypes.RunDTO{ID: "run-9", Harness: "codex", Status: "running", Kind: kind}
+			fc.Secrets = []apitypes.SecretDTO{{ID: "selected", Label: "Account B", Kind: "openai_api_key"}}
+			_, _, code := runCLI(t, fakeEnv(fc), "run", "set-token", "run-9", "Account B")
+			if code != uzicli.ExitOK || fc.LastSetTokenOverride == nil || *fc.LastSetTokenOverride != (uzicli.SetRunCredentialOverride{Mode: "pinned", SecretID: "selected"}) {
+				t.Fatalf("exit=%d override=%+v", code, fc.LastSetTokenOverride)
+			}
+		})
+	}
+}
+
 func TestRunSetTokenCodexNoModeFallback(t *testing.T) {
 	for _, mode := range []string{"auto", "default", "inherit"} {
 		t.Run(mode, func(t *testing.T) {

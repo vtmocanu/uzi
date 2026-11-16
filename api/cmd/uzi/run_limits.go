@@ -290,12 +290,12 @@ func newRunResumeCmd(env Env, gf *globalFlags) *cobra.Command {
 
 // newRunSetTokenCmd builds `uzi run set-token` (PRD #1247 M4, D12).
 //
-// `uzi run set-token <run-id> <label>|--auto|--default|--inherit` re-points which Anthropic
-// token ONE run spends: the positional LABEL pins the run to that token; the three flags
-// force a mode. Exactly one of {label, --auto, --default, --inherit} is required and they
-// are mutually exclusive (mirroring `--token` on `run create`, D12). A label is resolved to
-// an anthropic_token id CLIENT-SIDE (ListSecrets + findSecretByLabel), so an unknown or
-// wrong-kind label is refused before any request; the keywords need no round-trip.
+// `uzi run set-token <run-id> <label>|--auto|--default|--inherit` selects a credential
+// for ONE run. Claude accepts the three mode flags or an Anthropic token label;
+// Codex requires an explicit subscription or API-key label. Exactly one label or
+// mode is required. The owner-scoped run selects the harness before ListSecrets
+// resolves a matching credential kind, so unknown, wrong-kind and ambiguous labels
+// are refused before any write.
 //
 // Claude supports queued/parked rebinding and live switch requests. Codex requests
 // pin a target for a safe-boundary resume attempt in the same claim and worktree;
