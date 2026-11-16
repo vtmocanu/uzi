@@ -25918,8 +25918,19 @@ describe("2833 Codex inline summaries", () => {
       const teardown: { aborted: boolean; abandoned: boolean }[] = [];
       const disposal: { aborted: boolean; abandoned: boolean }[] = [];
       const effectCleanup: { aborted: boolean; abandoned: boolean }[] = [];
+      const fileopCleanup: { aborted: boolean; abandoned: boolean }[] = [];
+      const wireFileop = rig.deps.wireFileop!;
       const launchEffect = rig.deps.launchEffectRoot!;
-      rig.deps = { ...rig.deps, launchEffectRoot: async (...args) => {
+      rig.deps = { ...rig.deps, wireFileop: spec => {
+        const handle = wireFileop(spec);
+        const dispose = handle.dispose.bind(handle);
+        handle.dispose = async (...args) => {
+          fileopCleanup.push({ aborted: input?.signal?.aborted === true, abandoned });
+          input?.onUsage?.(usage);
+          return dispose(...args);
+        };
+        return handle;
+      }, launchEffectRoot: async (...args) => {
         const root = await launchEffect(...args);
         const dispose = root.dispose.bind(root);
         root.dispose = async (...rest) => {
@@ -25990,6 +26001,9 @@ describe("2833 Codex inline summaries", () => {
         assert.ok(effectCleanup.length > 0, "existing effect roots clean up after the advisory");
         assert.ok(effectCleanup.every(observed => observed.aborted && observed.abandoned),
           "abort and bounded abandonment precede effect cleanup");
+        assert.ok(fileopCleanup.length > 0);
+        assert.ok(fileopCleanup.every(observed => observed.aborted && observed.abandoned),
+          "abort and bounded abandonment precede fileop client disposal");
         assert.ok(rig.fileopDisposed() > 0);
       }
     });
@@ -26128,8 +26142,8 @@ describe("2833 Codex inline summaries", () => {
         assert.equal(result.summaryPlan, invalidation === "none" ? "accepted summary" : undefined);
       }
       accept(); await pendingHook;
-      // A late HTTP acceptance after terminal cleanup cannot affect a reused executor.
-      if (invalidation === "obsolete") {
+      // Late or fenced HTTP acceptance cannot contaminate a reused executor.
+      if (invalidation === "obsolete" || invalidation === "fence") {
         const result = await executor.run(makeCtx({ summaryIntentPresent: true }).ctx);
         assert.equal(result.summaryPlan, undefined);
       }
