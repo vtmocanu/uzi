@@ -1741,9 +1741,14 @@ web:
     # Recommended: {request: "300s", backendRequest: "300s"}. 300s covers the api's own budget
     # for a maximum-size (25 MiB) upload on a slow link: its upload deadline is the larger of
     # the request deadline (UZI_RECOVERY_REQUEST_DEADLINE, 120s) and the declared size at
-    # 100 KiB/s (256s at 25 MiB), plus a 15s response grace, 271s in all. It is NOT a
-    # guaranteed cap on total upload duration: Gateway API lets an implementation start the
-    # request timer after the request body is received.
+    # 100 KiB/s (256s at 25 MiB), plus a 15s response grace, 271s in all. Web nginx buffers
+    # the whole request body before the api sees any of it, so the client's upload time comes
+    # first. On a gateway whose request timer starts when the request starts, 300s is the
+    # supported TOTAL: client upload + nginx-to-api forwarding + api processing; a 25 MiB
+    # upload at the api's assumed 100 KiB/s floor (256s) then leaves ~44s for the rest. On a
+    # gateway that starts the timer after the body is received, upload time is not counted,
+    # so 300s bounds only forwarding and processing. Either way it is NOT a guaranteed cap on
+    # total upload duration, and a raised UZI_JOB_INPUT_FILE_MAX_BYTES needs a larger value.
     # This value must cover web nginx's /api/v1/files budgets, as web.ingress.annotations do
     # for Ingress; size it as a TOTAL budget, not by copying nginx's numbers, because nginx's
     # client_body/proxy_send/proxy_read timeouts (120s/150s/150s) bound inactivity between
