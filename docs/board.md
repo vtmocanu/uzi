@@ -344,6 +344,30 @@ without a manual **Refresh** — a brief toast ("#42 → Human Review")
 announces each one. **Refresh** still triggers an immediate full sync if you
 don't want to wait.
 
+### First import after enabling a repo
+
+Turning a repo on (the web **Enable** button, `PUT /api/repos/<id>`, or
+`uzi server setup`) returns as soon as the enable is saved. The guardrail
+checks and the creation of the column labels still run before it returns, and
+a failure there refuses the enable. The first import of the repo's issues does
+not: uzi's background poller runs it right after, so a large repo no longer
+holds the request open. Until it finishes, the board shows a banner and keeps
+showing any cards it already has:
+
+- **Waiting to import issues**: the import is queued.
+- **Importing issues…**: the poller is fetching the issues now.
+- **Issue import failed; retrying on the next poll**: the fetch failed (for
+  example a timeout or a forge error). The poller retries on its next pass, so
+  there is nothing to click.
+
+The banner goes away once the import succeeds, including for a repo with no
+issues. A repo turned on by an older release shows no banner. If the server
+restarts mid-import, the poller picks it up again on its first pass. One pass
+is bounded by the poller's time budget, so a repo too large to import within
+it keeps showing the failed banner and retrying. The board's **Refresh**
+button and the first read of a board with no columns still sync inside their
+own request.
+
 One exception, and it looks like a bug if you do not know about it. Issues
 without the `uzi` label are synced **open-only**, so closing one on the forge
 is not something the frequent poll can see. The card keeps looking open until
