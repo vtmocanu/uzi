@@ -9,6 +9,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/vtmocanu/uzi/controller/internal/protocol"
@@ -182,8 +183,16 @@ func TestCleaningNoProofWhenPodListIncomplete(t *testing.T) {
 	}
 }
 
+// cleaningStopProofReport is the full cleanup_stopped report a cleaningW("pod-uid-1", seq)
+// tick sends for the worker's Deployment; the reconcile seq is a dedup key, not a field.
+func cleaningStopProofReport(t *testing.T, client *fake.Clientset) protocol.HibernationTransition {
+	t.Helper()
+	return protocol.HibernationTransition{OpID: "op-1", Transition: protocol.TransitionCleanupStopped,
+		DeploymentUID: string(hibGet(t, client).UID), PodUID: "pod-uid-1", CleanupOpID: "clean-1"}
+}
+
 func TestCleaningStopProofReportedOncePerSeq(t *testing.T) {
-	m, _, rec := hibEnv(t, hibDeployment(0, "op-0"), stoppedHibPod("pod-uid-1", "Error"))
+	m, client, rec := hibEnv(t, hibDeployment(0, "op-0"), stoppedHibPod("pod-uid-1", "Error"))
 	for i := 0; i < 3; i++ {
 		if err := hibTick(t, m, cleaningW("pod-uid-1", 1)); err != nil {
 			t.Fatal(err)
@@ -192,16 +201,23 @@ func TestCleaningStopProofReportedOncePerSeq(t *testing.T) {
 	if len(rec.calls) != 1 {
 		t.Fatalf("seq 1 reports = %d, want 1", len(rec.calls))
 	}
+	want := cleaningStopProofReport(t, client)
+	if got := rec.calls; !reflect.DeepEqual(got, []protocol.HibernationTransition{want}) {
+		t.Fatalf("seq 1 reports = %+v, want [%+v]", got, want)
+	}
 	if err := hibTick(t, m, cleaningW("pod-uid-1", 2)); err != nil {
 		t.Fatal(err)
 	}
 	if len(rec.calls) != 2 {
 		t.Fatalf("a new seq did not re-report: %d", len(rec.calls))
 	}
+	if got := rec.calls; !reflect.DeepEqual(got, []protocol.HibernationTransition{want, want}) {
+		t.Fatalf("reports = %+v, want [%+v %+v]", got, want, want)
+	}
 }
 
 func TestCleaningFailedReportIsRetried(t *testing.T) {
-	m, _, rec := hibEnv(t, hibDeployment(0, "op-0"), stoppedHibPod("pod-uid-1", "Error"))
+	m, client, rec := hibEnv(t, hibDeployment(0, "op-0"), stoppedHibPod("pod-uid-1", "Error"))
 	rec.err = context.DeadlineExceeded
 	if err := hibTick(t, m, cleaningW("pod-uid-1", 1)); err == nil {
 		t.Fatal("expected the report error")
@@ -212,6 +228,11 @@ func TestCleaningFailedReportIsRetried(t *testing.T) {
 	}
 	if len(rec.calls) != 2 {
 		t.Fatalf("calls = %d, want the failed one then a retry", len(rec.calls))
+	}
+	// The retry resends the same report the failed call carried.
+	want := cleaningStopProofReport(t, client)
+	if got := rec.calls; !reflect.DeepEqual(got, []protocol.HibernationTransition{want, want}) {
+		t.Fatalf("reports = %+v, want [%+v %+v]", got, want, want)
 	}
 }
 
