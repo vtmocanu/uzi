@@ -32537,6 +32537,8 @@ describe("M2 actualRunner credential replacement", () => {
         const nowEntered = installerBarrier(), nowAborted = installerBarrier(), nowContinue = installerBarrier();
         const executorSuspensionEntered = installerBarrier();
         const nowSuspensionEntered = installerBarrier();
+        let nowDrainCompleted = false;
+        const executorEntryNowDrain: { completed: boolean; raw: boolean }[] = [];
         const summaryDisposeEntered = installerBarrier(), summaryDisposeContinue = installerBarrier();
         const summaryRoots: ReturnType<typeof trackedRoot>[] = [];
         let summaryDisposeCalls = 0;
@@ -33160,6 +33162,7 @@ describe("M2 actualRunner credential replacement", () => {
         const suspend = executor.suspendCodexEpoch.bind(executor);
         executor.suspendCodexEpoch = async bounds => {
           executorSuspensionEntered.resolve();
+          executorEntryNowDrain.push({ completed: nowDrainCompleted, raw: events.includes("A-Now-drained") });
           const lease = await suspend(bounds);
           return { ...lease,
             persistRollout: async bounds => {
@@ -33379,7 +33382,10 @@ describe("M2 actualRunner credential replacement", () => {
             }
           };
           startPublicationProbe = probe;
-          return { ...lease, publishB: (bundle: Parameters<ReturnType<typeof suspendNow>["publishB"]>[0]) => {
+          return { ...lease, drained: lease.drained.then(result => {
+            nowDrainCompleted = result.kind === "drained";
+            return result;
+          }), publishB: (bundle: Parameters<ReturnType<typeof suspendNow>["publishB"]>[0]) => {
             probe("before-Now-publish");
             if (injectedStage === "before-Now-publication") {
               injectedFailures.push(injectedStage);
@@ -33708,6 +33714,9 @@ describe("M2 actualRunner credential replacement", () => {
             assert.equal(b.transport.requests.length, 0);
             summaryDisposeContinue.resolve();
           }
+          await withTimeout(executorSuspensionEntered.promise, 5000, "M2 executor after Now drain");
+          assert.deepEqual(executorEntryNowDrain, [{ completed: true, raw: true }],
+            "executor suspension begins only after Now joins its raw work");
           if (persistFailure) {
             await withTimeout(switchSettled.promise, 5000, "real pre-teardown persist refusal settles");
             assert.equal(failingPersist, false, "persistRollout injection is restored before continuation or final cleanup");
@@ -34991,6 +35000,7 @@ describe("M2 actualRunner credential replacement", () => {
           assert.deepEqual(resumedThreads, [savedId]);
           assert.equal(factories, 1, "no reclaim or second executor");
           assert.ok(!reports.some(status => status.startsWith("credential_switch")), "no switch hold or release transition");
+
           assert.equal(adoptedDestinations.length, 2, "A and B both adopted sessions");
           for (const dest of adoptedDestinations) {
             assert.equal(await fs.readFile(path.join(dest, "sessions", `rollout-${savedId}.jsonl`), "utf8"), "{}\n");
