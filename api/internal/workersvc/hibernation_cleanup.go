@@ -90,6 +90,11 @@ var ErrHibernationCleanupConflict = errors.New("hibernation cache prune precondi
 // unsettled (HTTP 409).
 var ErrWorkerHibernationCleanupUnsettled = errors.New("worker hibernation cache prune is not settled")
 
+// ErrWorkerDeleteRaced is a worker delete whose guarded attempt and its one retry both matched no
+// row while the worker stayed present with a settled cache prune: each attempt lost a cleanup
+// start/settle race (#4389). Retryable (HTTP 409), never a not-found.
+var ErrWorkerDeleteRaced = errors.New("worker delete raced a hibernation cache prune; retry")
+
 // WorkerHibernationCleanupUnsettledError carries the phase that blocks a worker delete.
 type WorkerHibernationCleanupUnsettledError struct{ Phase string }
 

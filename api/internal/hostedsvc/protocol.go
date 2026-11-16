@@ -139,8 +139,8 @@ type DesiredWorker struct {
 	// recovery is a rotation. Both are the controller's cue to reconcile the worker
 	// WITHOUT touching its Secret, never to invent or clear one.
 	JoinToken *string `json:"join_token"`
-	// Hibernation is set only while the worker is preparing, hibernated or waking
-	// (PRD #4205); omitted for an awake worker.
+	// Hibernation is set only while the worker is preparing, hibernated, waking or
+	// cleaning (PRD #4205, #4206); omitted for an awake worker.
 	Hibernation *Hibernation `json:"hibernation,omitempty"`
 }
 

@@ -11,6 +11,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
@@ -19,8 +20,9 @@ import (
 )
 
 // deleteWorkerStore is a minimal workersvc.Store for the DeleteWorker handler tests:
-// it answers only the five queries wsvc.DeleteWorker reaches (active-run count, active-run
-// listing, open custody count, open custody listing, the delete itself) and panics on
+// it answers only the six queries wsvc.DeleteWorker reaches (active-run count, active-run
+// listing, open custody count, open custody listing, the delete itself, and the 0-row
+// re-read; #4389) and panics on
 // anything else (embedded interface), so a mapping test cannot pass silently through an
 // unexercised path.
 type deleteWorkerStore struct {
@@ -31,6 +33,15 @@ type deleteWorkerStore struct {
 	listHolds  []store.ListOpenCustodyHoldsForWorkerRow
 	deleteRows int64
 	deleted    bool
+	// reread is what the 0-row re-read finds; nil reads as absent (pgx.ErrNoRows).
+	reread *store.Worker
+}
+
+func (s *deleteWorkerStore) GetWorkerByIDForUser(context.Context, store.GetWorkerByIDForUserParams) (store.Worker, error) {
+	if s.reread == nil {
+		return store.Worker{}, pgx.ErrNoRows
+	}
+	return *s.reread, nil
 }
 
 func (s *deleteWorkerStore) ListOpenCustodyHoldsForWorker(context.Context, store.ListOpenCustodyHoldsForWorkerParams) ([]store.ListOpenCustodyHoldsForWorkerRow, error) {
@@ -339,4 +350,29 @@ func TestWorkerDTOCarriesDrainingSince(t *testing.T) {
 			t.Fatalf("DrainingSince = %v, want nil for a NULL draining_since column", *dto.DrainingSince)
 		}
 	})
+}
+
+// TestDeleteWorkerCleanupRaceStatusMapping pins the #4389 / PRD #4206 0-row outcomes: an
+// unsettled cache prune and a delete that lost both attempts to a cleanup start/settle race
+// are 409s (the second retryable), never a 404 or 500; an absent worker stays a 404.
+func TestDeleteWorkerCleanupRaceStatusMapping(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		reread *store.Worker
+		want   int
+	}{
+		{"unsettled", &store.Worker{CleanupPhase: workersvc.CleanupPhaseStarted}, http.StatusConflict},
+		{"raced twice, present and settled", &store.Worker{CleanupPhase: workersvc.CleanupPhaseSettled}, http.StatusConflict},
+		{"absent", nil, http.StatusNotFound},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := &deleteWorkerStore{deleteRows: 0, reread: tc.reread}
+			h := &Handler{wsvc: workersvc.New(st, nil, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})}
+			rec := httptest.NewRecorder()
+			h.DeleteWorker(rec, deleteWorkerReq(store.User{ID: uuid.New()}, uuid.New()))
+			if rec.Code != tc.want {
+				t.Fatalf("status = %d, want %d\nbody: %s", rec.Code, tc.want, rec.Body.String())
+			}
+		})
+	}
 }
