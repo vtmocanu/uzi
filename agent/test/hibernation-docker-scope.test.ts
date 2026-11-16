@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { DOCKER_DAEMON_PRUNE_GAP } from "../src/hibernation-inventory.js";
-import { hibernationDockerScope, hibernationParticipates } from "../src/main.js";
+import { hibernationControllerWiring, hibernationDockerScope, hibernationParticipates } from "../src/main.js";
 
 // #4369: which workers have Docker daemon storage in their hibernation inventory scope.
 describe("hibernationDockerScope", () => {
@@ -34,5 +34,33 @@ describe("hibernationDockerScope", () => {
     assert.equal(hibernationDockerScope(dind, {}), true);
     assert.equal(hibernationParticipates(dind, "unsupported"), false);
     assert.equal(hibernationParticipates(dind, undefined), false);
+  });
+});
+
+describe("hibernationControllerWiring", () => {
+  const dind = { dockerWiring: { dockerHost: "tcp://dind:2375" } };
+
+  it("wires a supported DinD lane with exclusion and Docker storage", () => {
+    for (const mode of ["shared", "exclusive"]) {
+      assert.deepEqual(hibernationControllerWiring(dind, {}, mode), { laneSupported: true, dockerStorage: true }, mode);
+    }
+  });
+
+  it("wires a degraded worker (sidecar expected, no daemon) without exclusion but with Docker storage", () => {
+    for (const env of [{ DOCKER_HOST: "tcp://x:2375" }, { UZI_DIND_SOCKET: "/run/dind/docker.sock" }]) {
+      assert.deepEqual(hibernationControllerWiring({ dockerWiring: {} }, env, "shared"), { laneSupported: false, dockerStorage: true });
+    }
+  });
+
+  it("wires an unsupported or absent epoch mode without exclusion but with Docker storage", () => {
+    for (const mode of ["unsupported", undefined]) {
+      assert.deepEqual(hibernationControllerWiring(dind, {}, mode), { laneSupported: false, dockerStorage: true }, String(mode));
+    }
+  });
+
+  it("builds no controller on the isolated lane or without Docker", () => {
+    const isolated = { ...dind, fetcherUrl: "https://f", fetcherCaFile: "/ca" };
+    assert.equal(hibernationControllerWiring(isolated, { DOCKER_HOST: "tcp://x:2375" }, "shared"), undefined);
+    assert.equal(hibernationControllerWiring({ dockerWiring: {} }, {}, "shared"), undefined);
   });
 });

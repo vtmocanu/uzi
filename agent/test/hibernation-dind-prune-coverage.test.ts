@@ -13,6 +13,9 @@ import { nullLogger } from "./helpers.js";
 // #4369 (PRD #4208 D16): at Docker storage scope the inventory always names `dind_prune` uncovered.
 // A client-side close of a prune step is not daemon settlement, so no prune outcome (failure, kill,
 // abort, later success), restart, empty registry or unwired leg may yield a complete inventory.
+// The gap is unconditional at Docker storage scope, so driving the real prune loop only shows
+// that no prune outcome (kill, abort, success, daemon error) clears it; the verdict comes from
+// the inventory side, not from the prune controller.
 // These cases drive the real DindPruneController through its public loop on the shared
 // `hibernationWriters`, then run the real inventory controller. The literal name is used on purpose.
 

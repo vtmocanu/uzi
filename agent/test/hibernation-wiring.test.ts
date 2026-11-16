@@ -99,7 +99,7 @@ describe("hibernation wiring", () => {
     assert.equal(without.registrations[0]?.[4]?.includes("hibernation_inventory_v1"), false);
   });
 
-  it("builds the controller only on the DinD lane with a supported epoch ownership", () => {
+  it("the lane supports exclusion only on the DinD lane with a supported epoch ownership", () => {
     const dind = { dockerWiring: { dockerHost: "tcp://dind:2375" } };
     assert.equal(hibernationParticipates(dind, "shared"), true);
     assert.equal(hibernationParticipates(dind, "exclusive"), true);
