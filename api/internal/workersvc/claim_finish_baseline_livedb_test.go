@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 // The real Claim path must persist its required baseline before delivering the mint.
@@ -48,14 +49,21 @@ func TestFinishRunClaimCodexBaselineLiveDB(t *testing.T) {
 	assertBaseline := func() {
 		t.Helper()
 		var got baseline
+		var mode, accountKey, accountID pgtype.Text
+		var revision, epoch pgtype.Int8
 		var count int
 		if err := env.pool.QueryRow(env.ctx, `SELECT secret_id,label,select_reason,codex_auth_mode,
  codex_material_revision,codex_claim_epoch,codex_account_key,codex_account_id,count(*) OVER ()
  FROM run_credential_epochs WHERE run_id=$1 AND claim_generation=$2`, run.ID, run.ClaimGeneration).
-			Scan(&got.secret, &got.label, &got.reason, &got.mode, &got.revision, &got.epoch,
-				&got.accountKey, &got.accountID, &count); err != nil {
+			Scan(&got.secret, &got.label, &got.reason, &mode, &revision, &epoch,
+				&accountKey, &accountID, &count); err != nil {
 			t.Fatal(err)
 		}
+		if !mode.Valid || !revision.Valid || !epoch.Valid || !accountKey.Valid || !accountID.Valid {
+			t.Fatal("claimed baseline snapshot missing metadata")
+		}
+		got.mode, got.revision, got.epoch = mode.String, revision.Int64, epoch.Int64
+		got.accountKey, got.accountID = accountKey.String, accountID.String
 		if count != 1 || got != want {
 			t.Fatalf("baseline count=%d got=%+v want=%+v", count, got, want)
 		}

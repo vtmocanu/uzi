@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/vtmocanu/uzi/api/internal/capability"
 )
 
@@ -105,14 +106,17 @@ func TestCodexTransactionalApplyBundleLiveDB(t *testing.T) {
 			if err != nil || !strings.Contains(string(wire), expected) {
 				t.Fatal("auth response missing material", err)
 			}
-			var epoch int64
+			var epoch pgtype.Int8
 			var ordinal int32
 			var secret uuid.UUID
 			var persisted string
 			if err := f.env.pool.QueryRow(f.env.ctx, "SELECT codex_claim_epoch,ordinal,secret_id,to_jsonb(e)::text FROM run_credential_switch_epochs e WHERE op_id=$1", op).Scan(&epoch, &ordinal, &secret, &persisted); err != nil {
 				t.Fatal(err)
 			}
-			if epoch != 42 || ordinal != 1 || secret != target {
+			if !epoch.Valid {
+				t.Fatal("committed switch journal missing capability epoch metadata")
+			}
+			if epoch.Int64 != 42 || ordinal != 1 || secret != target {
 				t.Fatal("journal used ordinal as capability epoch")
 			}
 			if strings.Contains(persisted, expected) || strings.Contains(persisted, res.Codex.Capability) {
