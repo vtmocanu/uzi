@@ -118,11 +118,14 @@ func TestWorkerRunStateCodexSwitchStoppedRoute(t *testing.T) {
 		accepted   bool
 		commitErr  error
 		wantStatus int
+		planBytes  int
 	}{
-		{"fresh_accepted", "running", true, nil, http.StatusOK},
-		{"fully_accepted_paused_replay", "paused", true, nil, http.StatusOK},
-		{"refused_paused_reply", "paused", false, nil, http.StatusConflict},
-		{"commit_error", "running", true, errors.New("commit outcome unknown"), http.StatusInternalServerError},
+		{"fresh_accepted", "running", true, nil, http.StatusOK, 0},
+		{"fully_accepted_paused_replay", "paused", true, nil, http.StatusOK, 0},
+		{"fresh_large_plan", "running", true, nil, http.StatusOK, 64 << 10},
+		{"large_plan_paused_replay", "paused", true, nil, http.StatusOK, 64 << 10},
+		{"refused_paused_reply", "paused", false, nil, http.StatusConflict, 0},
+		{"commit_error", "running", true, errors.New("commit outcome unknown"), http.StatusInternalServerError, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			// Exactly the stopped-report fields: no ordinary pause inputs or op_id.
@@ -141,6 +144,7 @@ func TestWorkerRunStateCodexSwitchStoppedRoute(t *testing.T) {
 					WorkerID: pgtype.UUID{Bytes: worker.ID, Valid: true},
 					Kind:     "issue", Status: tc.status, Harness: "codex",
 					ClaimGeneration: 7, CodexClaimEpoch: 41,
+					PlanMd:        pgtype.Text{String: strings.Repeat("p", tc.planBytes), Valid: tc.planBytes != 0},
 					CodexAuthMode: pgtype.Text{String: "api_key", Valid: true},
 					CodexSecretID: pgtype.UUID{Bytes: uuid.New(), Valid: true},
 					CodexCapHash:  []byte("fixture-capability-hash"),
@@ -155,6 +159,12 @@ func TestWorkerRunStateCodexSwitchStoppedRoute(t *testing.T) {
 			h.WorkerRunState(rec, req)
 			if rec.Code != tc.wantStatus {
 				t.Fatalf("status=%d, want %d; body=%s", rec.Code, tc.wantStatus, rec.Body.String())
+			}
+			if tc.wantStatus == http.StatusOK && rec.Body.Len() > 16*1024 {
+				t.Fatalf("stopped acknowledgement exceeds worker response bound: %d bytes", rec.Body.Len())
+			}
+			if tx.run.PlanMd.String != strings.Repeat("p", tc.planBytes) {
+				t.Fatal("stopped acknowledgement changed the stored plan")
 			}
 			var got struct {
 				Applied     *bool   `json:"applied"`
