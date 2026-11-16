@@ -32530,6 +32530,7 @@ describe("M2 actualRunner credential replacement", () => {
         const teardownResults: boolean[] = [];
         const failedRootReaps: Awaited<ReturnType<ReturnType<typeof trackedRoot>["root"]["reap"]>>[] = [];
         const dispositions: { status: string; failure_reason?: string }[] = [];
+        const unexpectedPreservePause = installerBarrier();
         const report = client.reportState.bind(client);
         client.reportState = async (id, body, ...args) => {
           reports.push(body.status);
@@ -32551,8 +32552,11 @@ describe("M2 actualRunner credential replacement", () => {
             api.setOwnershipStatus(id, "paused", 7);
             return { applied: true, credentialSwitchUncertain: true };
           }
-          if (resumePreserve && !preserveNegative && body.status === "credential_switch_uncertain")
+          if (resumePreserve && !preserveNegative && body.status === "credential_switch_uncertain") {
+            // Observe outside the callback too: Runner may catch the tripwire assertion.
+            unexpectedPreservePause.resolve();
             assert.fail("preserving refusal cannot pause before the policy endpoint");
+          }
           if (resumeUncertain && body.status === "credential_switch_uncertain") {
             assert.equal(id, claim.run_id);
             assert.equal(body.claim_generation, 7);
@@ -34318,6 +34322,10 @@ describe("M2 actualRunner credential replacement", () => {
               }
             }
             if (resumePreserve) {
+              await withTimeout(Promise.race([running, unexpectedPreservePause.promise]), 5000,
+                "preserving refusal reaches policy retention or a forbidden pause");
+              assert.equal(reports.includes("credential_switch_uncertain"), false,
+                "preserving refusal never sends an ordinary owner pause before policy retention");
               await withTimeout(running, 5000, "confirmed B refusal reaches policy re-hold").catch(error => {
                 throw new Error(JSON.stringify({ switchError: switchError instanceof Error ? { name: switchError.name, message: switchError.message } : switchError,
                   policyHoldCount: policyHolds.length, reports, dispositions,
