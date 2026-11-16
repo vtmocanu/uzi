@@ -86,15 +86,15 @@ func printWorkerHibernationDetail(p *uzicli.Printer, w apitypes.WorkerDTO) {
 			manualWorkerField(w.ID), label, workerBlockedTime(w.HibernationBlockedSince), workerBlockedTime(w.HibernationBlockedAt))
 	}
 	if w.Kind == "hosted" && w.RollMarker != nil {
-		p.Printf("%s\n", rollMarkerLine(w.RollMarker))
+		p.Printf("%s\n", rollMarkerLine(w.ID, w.RollMarker))
 	}
 }
 
 // rollMarkerLine renders the display-only roll marker; every controller-supplied value is
 // sanitized through manualWorkerField.
-func rollMarkerLine(m *apitypes.RollMarkerDTO) string {
+func rollMarkerLine(id string, m *apitypes.RollMarkerDTO) string {
 	var b strings.Builder
-	b.WriteString("  Roll marker: " + manualWorkerField(m.State))
+	b.WriteString("Roll marker worker " + manualWorkerField(id) + ": " + manualWorkerField(m.State))
 	if m.Canary != nil && *m.Canary {
 		b.WriteString(" · canary")
 	}

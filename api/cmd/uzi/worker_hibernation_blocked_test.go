@@ -101,14 +101,21 @@ func TestWorkerRollMarkerLine(t *testing.T) {
 	if strings.Contains(out, "\x1b") || strings.Contains(out, "\nFORGED ROW") {
 		t.Fatalf("unsanitized marker:\n%q", out)
 	}
-	const want = "  Roll marker: present · canary · completed · target 0.11.7 · group 0123456789abcdef · reservation · blocked: waiting_for FORGED ROW · observed 2026-03-04T08:30:00Z"
+	const want = "Roll marker worker w1: present · canary · completed · target 0.11.7 · group 0123456789abcdef · reservation · blocked: waiting_for FORGED ROW · observed 2026-03-04T08:30:00Z"
 	if !strings.Contains(out, want) {
 		t.Fatalf("missing %q in:\n%s", want, out)
 	}
 
 	out, _, _ = runCLI(t, fakeEnv(&uzicli.FakeClient{Workers: []apitypes.WorkerDTO{rollMarkerWorker(&apitypes.RollMarkerDTO{State: "unknown"})}}), "worker", "list")
-	if !strings.Contains(out, "  Roll marker: unknown\n") {
+	if !strings.Contains(out, "Roll marker worker w1: unknown\n") {
 		t.Fatalf("unknown marker line missing:\n%s", out)
+	}
+	// With several hosted workers each marker line names its own worker.
+	w2 := rollMarkerWorker(&apitypes.RollMarkerDTO{State: "absent"})
+	w2.ID, w2.Name = "w2", "prod-2"
+	out, _, _ = runCLI(t, fakeEnv(&uzicli.FakeClient{Workers: []apitypes.WorkerDTO{rollMarkerWorker(m), w2}}), "worker", "list")
+	if !strings.Contains(out, "Roll marker worker w1: present") || !strings.Contains(out, "Roll marker worker w2: absent\n") {
+		t.Fatalf("marker lines not attributed per worker:\n%s", out)
 	}
 	ext := rollMarkerWorker(m)
 	ext.Kind = "external"

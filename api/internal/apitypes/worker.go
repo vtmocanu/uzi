@@ -49,8 +49,9 @@ type WorkerDTO struct {
 	HibernationCleanup *HibernationCleanupDTO `json:"hibernation_cleanup"`
 	RollPacing         json.RawMessage        `json:"roll_pacing,omitempty"`
 	// RollMarker (issue #4385) is the controller's display-only summary of the retained
-	// image-roll marker for a hosted worker. Absent for external workers and where no
-	// roll join exists; state "unknown" when the stored marker is missing or stale.
+	// image-roll marker for a hosted worker. Absent for external workers and on responses not
+	// built from the roll-joined projection (register/heartbeat); for a hosted worker with no
+	// report row, or a stored marker that is stale, future-dated or invalid, state is "unknown".
 	RollMarker *RollMarkerDTO `json:"roll_marker,omitempty"`
 	ID         string         `json:"id"`
 	Name       string         `json:"name"`

@@ -2849,8 +2849,6 @@ export interface WorkerRunDisk {
   sampled_at: string;
 }
 
-// Fresh, read-only controller diagnostics. The Go DTO carries opaque JSON;
-// members are optional for skew and its recorded empty-object contract fixture.
 /**
  * Controller's retained uzi.dev/image-roll evidence for one hosted worker (issue #4385).
  * state "unknown" means no fresh report (older controller, expired, or not reported, e.g. while
@@ -2868,6 +2866,8 @@ export interface WorkerRollMarker {
   observed_at: string | null;
 }
 
+// Fresh, read-only controller diagnostics. The Go DTO carries opaque JSON;
+// members are optional for skew and its recorded empty-object contract fixture.
 export interface WorkerRollPacing {
   state?: "active" | "held" | "waiting_evidence" | "override";
   target_image?: string;

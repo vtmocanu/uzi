@@ -11,7 +11,7 @@ import (
 
 func TestNormalizeRollMarkerReport(t *testing.T) {
 	long := strings.Repeat("x", 193)
-	okBlocked := "waiting\x1b_for‮reg"
+	okBlocked := "waiting\x1b_for\u202ereg"
 	for _, tc := range []struct {
 		name string
 		in   RollMarkerReport
