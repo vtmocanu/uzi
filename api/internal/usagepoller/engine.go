@@ -60,8 +60,11 @@ const pokeBuffer = 64
 // pass; only an exact stale crypto epoch permits one same-ID refetch.
 // GetAnthropicTokenToPoll is its single-token sibling
 // for the poke path, which polls the token a save or re-enable just touched.
+// ListAnthropicTokensToPollForUser is the owner-scoped listing for the vault-ready
+// poke (#4406), which refreshes every enabled token of one user.
 type Store interface {
 	ListAnthropicTokensToPoll(ctx context.Context) ([]store.ListAnthropicTokensToPollRow, error)
+	ListAnthropicTokensToPollForUser(ctx context.Context, userID uuid.UUID) ([]store.ListAnthropicTokensToPollForUserRow, error)
 	GetAnthropicTokenToPoll(ctx context.Context, arg store.GetAnthropicTokenToPollParams) (store.GetAnthropicTokenToPollRow, error)
 	// UpsertRateLimits is the revision-fenced write (PRD #1732 D13): it returns the
 	// rows written, 0 when the token was disabled or its enablement revision moved
@@ -165,10 +168,16 @@ func (e *Engine) PokeSecret(userID, secretID uuid.UUID) {
 	e.send(pokeRequest{userID: userID, secretID: secretID})
 }
 
-// pokeRequest names the token a poke polls: secretID when set, else the owner's
-// default.
+// PokeUserAll requests an out-of-band poll of EVERY enabled token of one user (the
+// vault-ready poke, #4406). Unlike Poke and PokeSecret it honours backoff: unlocking
+// changes decryptability, not the credential. Non-blocking like Poke.
+func (e *Engine) PokeUserAll(userID uuid.UUID) { e.send(pokeRequest{userID: userID, all: true}) }
+
+// pokeRequest names what a poke polls: every enabled token of userID when all is
+// set, else secretID when set, else the owner's default.
 type pokeRequest struct {
 	userID, secretID uuid.UUID
+	all              bool
 }
 
 func (e *Engine) send(p pokeRequest) {
@@ -193,19 +202,29 @@ func (e *Engine) Run(ctx context.Context) {
 			e.logger.Info("usage poller stopped")
 			return
 		case p := <-e.poke:
-			// An out-of-band poll of ONE token, ignoring any prior backoff (the new or
-			// re-enabled credential may work where the old one refused). Poke (a token
-			// save or default change, handler/secrets.go) names only the user and polls
-			// their enabled DEFAULT token; PokeSecret (a re-enable, PRD #1732 M3a) names
-			// its token, because a re-enabled token is usually not the default. Either
-			// way pokeUser resolves the row first and opens exactly that row. A poke
-			// refreshes one meter, not all of the user's; the rest are covered by the
-			// next tick.
-			e.pokeUser(ctx, p.userID, p.secretID)
+			// Pokes run inline like a tick; handlePoke documents the single-token
+			// (Poke, PokeSecret) versus user-wide (PokeUserAll, #4406) semantics.
+			e.handlePoke(ctx, p)
 		case <-ticker.C:
 			e.tickAll(ctx)
 		}
 	}
+}
+
+// handlePoke services one poke inline, like a tick. Poke (a token save or default
+// change, handler/secrets.go) and PokeSecret (a re-enable, PRD #1732 M3a) refresh ONE
+// token and ignore any prior backoff, because the new or re-enabled credential may
+// work where the old one refused; Poke names only the user and polls their enabled
+// default, PokeSecret names its token. PokeUserAll (vault ready, #4406) refreshes
+// EVERY enabled token of the user and honours backoff: unlock changes decryptability,
+// not the credential, and a locked-vault skip arms no backoff. It runs under an
+// interval-scoped deadline.
+func (e *Engine) handlePoke(ctx context.Context, p pokeRequest) {
+	if p.all {
+		e.pokeUserAll(ctx, p.userID)
+		return
+	}
+	e.pokeUser(ctx, p.userID, p.secretID)
 }
 
 // tickAll polls every anthropic_token in the factory once, with bounded concurrency
@@ -225,6 +244,30 @@ func (e *Engine) tickAll(ctx context.Context) {
 		return
 	}
 
+	e.pollRows(tickCtx, rows)
+}
+
+// pokeUserAll polls every enabled token of one user, honouring backoff, under its own
+// deadline of one interval so a slow provider call cannot hold the poke loop (and the
+// pokes queued behind it) past the next tick (#4406).
+func (e *Engine) pokeUserAll(ctx context.Context, userID uuid.UUID) {
+	pokeCtx, cancel := context.WithTimeout(ctx, e.interval)
+	defer cancel()
+
+	userRows, err := e.store.ListAnthropicTokensToPollForUser(pokeCtx, userID)
+	if err != nil {
+		e.logger.Error("usage poller: list tokens for user poke", "user", userID.String(), "error", err)
+		return
+	}
+	rows := make([]store.ListAnthropicTokensToPollRow, 0, len(userRows))
+	for _, r := range userRows {
+		rows = append(rows, store.ListAnthropicTokensToPollRow(r))
+	}
+	e.pollRows(pokeCtx, rows)
+}
+
+// pollRows polls the listed tokens with bounded concurrency, honouring backoff.
+func (e *Engine) pollRows(ctx context.Context, rows []store.ListAnthropicTokensToPollRow) {
 	sem := make(chan struct{}, e.maxConc)
 	var wg sync.WaitGroup
 	for _, row := range rows {
@@ -239,8 +282,8 @@ func (e *Engine) tickAll(ctx context.Context) {
 			// ListAnthropicTokensToPoll), so detection needs no second lookup here.
 			// The listing holds enabled tokens only (PRD #1732 D1) and carries the
 			// enablement revision this poll is fenced on (D13).
-			e.pollToken(tickCtx, row.UserID, row.ID, row.EnablementRev, row.AnthropicSuccessGeneration, false, row.NotifyEarlyLimitReset, func() ([]byte, error) {
-				return e.openToken(tickCtx, store.GetAnthropicTokenToPollRow(row))
+			e.pollToken(ctx, row.UserID, row.ID, row.EnablementRev, row.AnthropicSuccessGeneration, false, row.NotifyEarlyLimitReset, func() ([]byte, error) {
+				return e.openToken(ctx, store.GetAnthropicTokenToPollRow(row))
 			})
 		}(row)
 	}
@@ -308,7 +351,8 @@ func (e *Engine) openToken(ctx context.Context, row store.GetAnthropicTokenToPol
 // pollToken polls ONE token, applying the D2 (usage-first, probe fallback) and D5
 // (fail-closed / backoff) rules. open decrypts that token's already-fetched row via
 // the vault path (OpenSealedAtEpoch on both the tick's listing row and the poke's resolved
-// row); ignoreBackoff is set on the poke path so a just-saved credential is polled even if the one it replaced was
+// row); ignoreBackoff is set on the single-token Poke/PokeSecret path (not the tick, nor the user-wide
+// vault-ready PokeUserAll) so a just-saved credential is polled even if the one it replaced was
 // backed off. rev is the token's enablement revision captured when the poll
 // started; the write is fenced on it (PRD #1732 D13). successGeneration is
 // captured before the provider call and fences a later rejection write.

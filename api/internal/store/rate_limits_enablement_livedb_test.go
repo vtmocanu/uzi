@@ -132,6 +132,62 @@ func TestPollListingSkipsDisabledTokensLiveDB(t *testing.T) {
 	}
 }
 
+// TestPollListingForUserLiveDB: the owner-scoped listing behind the vault-ready poke
+// (#4406) returns exactly the owner's enabled anthropic tokens, ordered by id, with the
+// enablement revision the poll is fenced on, and nothing of another owner's.
+func TestPollListingForUserLiveDB(t *testing.T) {
+	ctx, pool, q, user := rateLimitEnablementDB(t)
+	def := enablementToken(ctx, t, q, user, "default", true)
+	spare := enablementToken(ctx, t, q, user, "spare", false)
+	off := enablementToken(ctx, t, q, user, "off", false)
+	setEnabled(ctx, t, q, user, off, false)
+	// Bump the spare's revision so a hard-coded 0 cannot satisfy the revision check.
+	setEnabled(ctx, t, q, user, spare, false)
+	spareRev := setEnabled(ctx, t, q, user, spare, true)
+	if _, err := q.InsertUserSecret(ctx, store.InsertUserSecretParams{
+		UserID: user, Kind: store.KindOpenAIAPIKey, Label: "openai", WantDefault: true,
+		Ciphertext: []byte("ct-openai"), SealedWith: store.SealedWithMaster,
+	}); err != nil {
+		t.Fatalf("insert openai key: %v", err)
+	}
+
+	other := uuid.New()
+	mustExec(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
+		other, fmt.Sprintf("rl-enable-%s@e2e", other))
+	theirs := enablementToken(ctx, t, q, other, "theirs", true)
+
+	rows, err := q.ListAnthropicTokensToPollForUser(ctx, user)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []uuid.UUID{def, spare}
+	if want[0].String() > want[1].String() {
+		want[0], want[1] = want[1], want[0]
+	}
+	if len(rows) != len(want) {
+		t.Fatalf("listing returned %d rows, want %d (default + spare only): %+v", len(rows), len(want), rows)
+	}
+	for i, r := range rows {
+		if r.ID != want[i] {
+			t.Fatalf("row %d = %s, want %s (ordered by id)", i, r.ID, want[i])
+		}
+		if r.UserID != user {
+			t.Fatalf("row %d owner = %s, want %s", i, r.UserID, user)
+		}
+		if r.ID == spare && r.EnablementRev != spareRev {
+			t.Fatalf("spare rev = %d, want %d", r.EnablementRev, spareRev)
+		}
+	}
+
+	rows, err = q.ListAnthropicTokensToPollForUser(ctx, other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].ID != theirs || rows[0].UserID != other {
+		t.Fatalf("other owner's listing = %+v, want only %s", rows, theirs)
+	}
+}
+
 // TestRateLimitRevisionFenceLiveDB: the D13 fence on the reading upsert. A poll
 // that started before a disable writes nothing while disabled, and nothing after
 // the re-enable either; the pre-disable reading it would have replaced is hidden
