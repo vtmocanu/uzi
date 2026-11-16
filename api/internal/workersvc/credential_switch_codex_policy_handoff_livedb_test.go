@@ -31,11 +31,18 @@ policy_pending_fresh=false, policy_resolved_at=now(), session_id=$3 WHERE id=$1`
 			if UnresolvedPolicyEpisode(mustRun(t, f.env, run)) {
 				t.Fatal("fixture did not resolve the previous preserving episode")
 			}
-			applied := f.apply(t, run, f.req(f.opOf(t, run)))
+			op := f.opOf(t, run)
+			applied := f.apply(t, run, f.req(op))
 			if applied.Outcome != ApplyOutcomeApplied || applied.Codex == nil {
 				t.Fatal("preserving fixture did not commit B")
 			}
 			committed := mustRun(t, f.env, run)
+			var committedJournal string
+			if err := f.env.pool.QueryRow(f.env.ctx,
+				"SELECT to_jsonb(e)::text FROM run_credential_switch_epochs e WHERE run_id=$1 AND op_id=$2",
+				run, op).Scan(&committedJournal); err != nil {
+				t.Fatal(err)
+			}
 			if !committed.CodexSecretID.Valid || uuid.UUID(committed.CodexSecretID.Bytes) != target {
 				t.Fatal("fixture did not bind B")
 			}
@@ -92,7 +99,16 @@ policy_pending_fresh=false, policy_resolved_at=now(), session_id=$3 WHERE id=$1`
 				t.Fatal(err)
 			}
 			if children != 1 {
-				t.Fatal("policy handoff rewrote the switch journal")
+				t.Fatal("policy handoff changed switch journal cardinality")
+			}
+			var afterJournal string
+			if err := f.env.pool.QueryRow(f.env.ctx,
+				"SELECT to_jsonb(e)::text FROM run_credential_switch_epochs e WHERE run_id=$1 AND op_id=$2",
+				run, op).Scan(&afterJournal); err != nil {
+				t.Fatal(err)
+			}
+			if afterJournal != committedJournal {
+				t.Fatal("policy handoff changed the committed switch journal row")
 			}
 		})
 	}
