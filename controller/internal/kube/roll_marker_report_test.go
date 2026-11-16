@@ -111,8 +111,8 @@ func TestRollMarkerReportListErrorIsUnavailable(t *testing.T) {
 	}
 }
 
-// A blocker assigned after the snapshot must be the one reported.
-func TestRollMarkerReportCarriesFinalBlocker(t *testing.T) {
+// A blocker assigned during planning, after the snapshot, must be the one reported.
+func TestRollMarkerReportCarriesPlanningBlocker(t *testing.T) {
 	w := evidence(desired("w1"), m5Now)
 	m, _ := newMat(t, markedDeployment(t, testConfig(), w, true))
 	m.cfg.RollTargetVersion = ""

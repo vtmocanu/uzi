@@ -342,9 +342,12 @@ type RollMarker struct {
 	Completed     bool   `json:"completed,omitempty"`
 	TargetVersion string `json:"target_version,omitempty"`
 	// CoverageGroup is 16 lowercase hex characters of sha256(coverage key).
-	CoverageGroup string  `json:"coverage_group,omitempty"`
-	Reservation   bool    `json:"reservation"`
-	Blocked       *string `json:"blocked,omitempty"`
+	CoverageGroup string `json:"coverage_group,omitempty"`
+	Reservation   bool   `json:"reservation"`
+	// Blocked is the roll entry's blocker as of the end of roll planning, so it
+	// includes blockers assigned after the snapshot. A pass-2 failure recorded only on
+	// the pacing outcome appears in the next tick's report.
+	Blocked *string `json:"blocked,omitempty"`
 }
 
 // DindMaintenance binds controller transitions to one operation and incarnation.
