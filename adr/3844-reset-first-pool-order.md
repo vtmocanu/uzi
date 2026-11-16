@@ -44,8 +44,9 @@ week is further away, because its allowance carries on.
 - **`best_of_pool` is unchanged.** When every measured token is under the floor
   nothing "expires first" in a useful sense, so that pick keeps the headroom
   ranking, tie band and in-flight penalty under either order. `pool_stale`,
-  `pool_exhausted`, `pool_empty`, the floor, resume exclusion and the weekly
-  reserve pre-filter are unchanged.
+  `pool_exhausted`, `pool_empty`, resume exclusion and the weekly reserve
+  pre-filter are unchanged. The floor kept its order here; #4405 later revised
+  it (see the amendment below).
 - **`headroom_first` reproduces the previous ranking exactly**: most headroom,
   near-ties to the soonest binding-window reset, then id.
 - **Codex release timing is unchanged.** `ResetAt` on the Codex candidate (which
@@ -83,3 +84,35 @@ week is further away, because its allowance carries on.
   `auto (picked from pool)` and the web Codex mode option reads
   `Pick from pool`. See [Auto-selecting an Anthropic token](../docs/configuration.md#auto-selecting-an-anthropic-token-prd-111)
   and [How it chooses](../docs/anthropic-token.md#how-it-chooses).
+
+## Amendment: the floor demotes a known-exhausted reading (#4405, 2026-11-16)
+
+**Rule.** `autoselect.Floor`, the last-resort pooled pick (#754), now orders
+the eligible pooled set in two groups and picks from the first non-empty one:
+tokens that are not known-exhausted, then tokens that are. A token is
+known-exhausted when its stored reading, fresh or stale, has either window at
+100% with that window's own reset strictly after now. Each window is tested on
+its own, not through the binding-window choice. Within a group the order is
+unchanged (soonest binding-window reset, then secret id). Pooled-only,
+exclusion, rejection and last-resort liveness are unchanged: when every pooled
+token is known-exhausted the floor still spends one. `Select` and the
+`reset_first` order of the measured set are unchanged.
+
+**Evidence.** After an api restart a user's vault-sealed pooled tokens stopped
+refreshing. A claim found no fresh reading and floored. The floor's
+soonest-reset order chose the token whose last reading was the 7-day window at
+100% with its reset about 19 hours out, over a token with about 33% headroom
+whose reset was later. The first model turn hit the weekly limit and the run
+parked until the reset.
+
+**Scope.** Two floors spend the returned token: the `pool_stale` floor at
+claim time and the `open_failed` re-floor after a pick will not decrypt. The
+`open_failed` path floors over fresh, measured tokens too, so it is reordered
+as well. Callers that only ask whether a spendable pooled token exists (the
+pool-wait warning, limit-park resume, the weekly-reserve hold) are unaffected.
+
+**Limit.** A nil reset, a reset already past or a reset exactly at now counts
+as unknown, not exhausted. Limit-park writes
+(`MarkFiveHourExhausted`, `MarkSevenDayExhausted`) set the percentage to 100
+but keep the last polled reset, so a stale row whose stored reset has already
+passed is not demoted.

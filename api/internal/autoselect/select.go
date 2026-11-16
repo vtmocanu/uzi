@@ -347,8 +347,18 @@ func Select(cands []Candidate, exclude uuid.UUID, p Policy, now time.Time) Outco
 // when no token is measurable (ReasonPoolStale) or below MinHeadroom-with-no-best;
 // Floor ranks the WHOLE pooled set — including stale, unmeasured, and
 // below-threshold tokens — because a last resort has no headroom to rank on. There
-// being no headroom, the order is tieLess alone: soonest BINDING-window reset, then
-// lowest secret id. That order is total over the per-row-unique secret ids, so the
+// being no headroom, the order is floorLess: first the group, then tieLess.
+//
+// The group (#4405) separates "we don't know" from "the last thing we knew was a
+// window at 100% whose reset is still ahead". A token whose stored reading is
+// knownExhausted is DEMOTED behind every token that is not, because tieLess's
+// soonest-reset order would otherwise prefer it (an exhausted window is often the
+// one resetting soonest) and the first model turn would hit the usage limit. The
+// demotion never drops a token: if every pooled token is known-exhausted, Floor
+// still returns one, ordered by tieLess (#754's last-resort liveness).
+//
+// Within a group the order is tieLess: soonest BINDING-window reset, then lowest
+// secret id. Group-then-tieLess is total over the per-row-unique secret ids, so the
 // choice is deterministic and order-independent (running Floor over any permutation
 // of cands returns the same id). resetKey returns +∞ for an unmeasured or
 // NULL-reset token, so such tokens fall through to the secret-id leg rather than
@@ -373,7 +383,7 @@ func Floor(cands []Candidate, exclude uuid.UUID, now time.Time) (secretID uuid.U
 		if exclude != uuid.Nil && c.SecretID == exclude {
 			continue
 		}
-		if !ok || tieLess(c, best) {
+		if !ok || floorLess(c, best, now) {
 			best = c
 			ok = true
 		}
@@ -382,6 +392,30 @@ func Floor(cands []Candidate, exclude uuid.UUID, now time.Time) (secretID uuid.U
 		return uuid.Nil, false
 	}
 	return best.SecretID, true
+}
+
+// floorLess is Floor's order: a token that is not knownExhausted beats one that is;
+// within the same group, tieLess decides.
+func floorLess(a, b Candidate, now time.Time) bool {
+	if ea, eb := knownExhausted(a, now), knownExhausted(b, now); ea != eb {
+		return !ea
+	}
+	return tieLess(a, b)
+}
+
+// knownExhausted reports whether the token's STORED reading (fresh or stale; SyncedAt
+// is deliberately not read) shows a window at 100% whose OWN reset is strictly after
+// now. Each window is tested independently, not through resetKey's binding-window
+// choice: with both windows at 100%, a past five-hour reset and a future weekly reset,
+// the token is still exhausted. A nil reset, a past reset, or a reset exactly at now
+// is "unknown", not exhausted — the window may already have replenished.
+func knownExhausted(c Candidate, now time.Time) bool {
+	return windowExhausted(c.FiveHourPct, c.FiveResetsAt, now) ||
+		windowExhausted(c.SevenDayPct, c.SevenResetsAt, now)
+}
+
+func windowExhausted(pct *int16, reset *time.Time, now time.Time) bool {
+	return pct != nil && *pct >= 100 && reset != nil && reset.After(now)
 }
 
 // scored is one pooled, measurable candidate with the two numbers that decide its
