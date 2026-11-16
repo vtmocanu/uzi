@@ -826,7 +826,6 @@ func (h *Handler) SetRepoEnabled(w http.ResponseWriter, r *http.Request) {
 			writeProvisionError(w, err)
 			return
 		}
-		h.importAfterEnable(r.Context(), user.ID, id)
 	} else {
 		var err error
 		repo, err = h.q.SetRepoEnabledForUser(r.Context(), store.SetRepoEnabledForUserParams{ID: id, Enabled: false, UserID: user.ID})
@@ -845,31 +844,15 @@ func (h *Handler) SetRepoEnabled(w http.ResponseWriter, r *http.Request) {
 		h.invalidateRepoSync(id)
 	}
 
-	httpx.JSON(w, http.StatusOK, map[string]any{"repo": repoToDTO(repo)})
-}
+	// The enable committed a waiting first import (EnableRepoForUser); wake the
+	// poller to run it instead of importing on this request, which a large repo
+	// would stretch past the gateway timeout and have cancelled (issue #4399). The
+	// request is a hint: the poller's regular ticks run an owed import regardless.
+	if req.Enabled && h.requestInitialImport != nil {
+		h.requestInitialImport(id)
+	}
 
-// importAfterEnable imports the issues of a repo that was just enabled. The
-// enable creates the board columns, so GetBoard's first-open seed, which used
-// to run this import, no longer fires; without it a new board stays empty
-// until the poller's first tick. Best effort: the enable already succeeded,
-// and the poller or Refresh retries a failed import.
-func (h *Handler) importAfterEnable(ctx context.Context, userID, repoID uuid.UUID) {
-	if h.svc == nil {
-		return
-	}
-	row, err := h.q.GetRepoForUser(ctx, store.GetRepoForUserParams{ID: repoID, UserID: userID})
-	if err != nil {
-		slog.Warn("import after enable: read repo", "error", err)
-		return
-	}
-	tr, err := h.issueTrackerForRepo(ctx, row.ID, row.ForgeType, row.BaseUrl, row.TokenCiphertext)
-	if err != nil {
-		slog.Warn("import after enable: build forge", "error", err)
-		return
-	}
-	if _, err := h.svc.FullSync(ctx, row.ID, row.ForgeProjectID, tr); err != nil {
-		slog.Warn("import after enable failed; the poller retries", "repo", row.PathWithNamespace, "error", err)
-	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"repo": repoToDTO(repo)})
 }
 
 // DeleteRepo removes a single repo row (PRD #357), cascading its derived data

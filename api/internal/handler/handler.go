@@ -267,11 +267,15 @@ type Handler struct {
 	// healthCacheMu so a fleet of open admin tabs polling every 10 s cost one evaluation
 	// per window rather than one per request.
 	invalidateRepoSync func(uuid.UUID)
-	healthSvc          *healthsvc.Service
-	healthSvcOnce      sync.Once
-	healthCacheMu      sync.Mutex
-	healthCachedAt     time.Time
-	healthCached       *apitypes.HealthDocDTO
+	// requestInitialImport asks the poller to run a just-enabled repo's recorded
+	// first import now (issue #4399). Optional and nil-safe: without it the poller's
+	// regular ticks still run the owed import. It must not block.
+	requestInitialImport func(uuid.UUID)
+	healthSvc            *healthsvc.Service
+	healthSvcOnce        sync.Once
+	healthCacheMu        sync.Mutex
+	healthCachedAt       time.Time
+	healthCached         *apitypes.HealthDocDTO
 }
 
 // ReleaseCheckReconciler is the slice of *releasecheck.Reconciler the admin
@@ -365,6 +369,12 @@ func (h *Handler) SetHealthService(s *healthsvc.Service) { h.healthSvc = s }
 // SetRepoSyncInvalidator wires health-history reset after a successful enabled write.
 func (h *Handler) SetRepoSyncInvalidator(invalidate func(uuid.UUID)) {
 	h.invalidateRepoSync = invalidate
+}
+
+// SetInitialImportRequester wires the non-blocking poller wake (poller.Engine.RequestImport)
+// that SetRepoEnabled calls after a committed enable. Call before serving requests.
+func (h *Handler) SetInitialImportRequester(request func(uuid.UUID)) {
+	h.requestInitialImport = request
 }
 
 // clock reads the classification clock seam, nil-safe.

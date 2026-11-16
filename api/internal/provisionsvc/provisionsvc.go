@@ -64,7 +64,7 @@ type Store interface {
 	GetForgeConnectionForUser(ctx context.Context, arg store.GetForgeConnectionForUserParams) (store.ForgeConnection, error)
 	UpsertRepo(ctx context.Context, arg store.UpsertRepoParams) (store.Repo, error)
 	GetRepoForUser(ctx context.Context, arg store.GetRepoForUserParams) (store.GetRepoForUserRow, error)
-	SetRepoEnabledForUser(ctx context.Context, arg store.SetRepoEnabledForUserParams) (store.Repo, error)
+	EnableRepoForUser(ctx context.Context, arg store.EnableRepoForUserParams) (store.Repo, error)
 	DeletePendingGuardrailOverrideRequestsForRepo(ctx context.Context, repoID uuid.UUID) error
 	forgesvc.BoardColumnStore
 }
@@ -321,7 +321,9 @@ func (s *Service) EnableRepo(ctx context.Context, userID, repoID uuid.UUID) (sto
 		return store.Repo{}, internal()
 	}
 
-	repo, err := s.q.SetRepoEnabledForUser(ctx, store.SetRepoEnabledForUserParams{ID: repoID, Enabled: true, UserID: userID})
+	// EnableRepoForUser also records the first-import intent (a 'waiting' import the
+	// poller runs; issue #4399), so the enable never imports issues itself.
+	repo, err := s.q.EnableRepoForUser(ctx, store.EnableRepoForUserParams{ID: repoID, UserID: userID})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return store.Repo{}, &Error{Kind: KindNotFound, Message: "repo not found"}
