@@ -2895,6 +2895,12 @@ export interface Worker {
   hibernated_at: string | null;
   wake_requested_at: string | null;
   wake_error: string | null;
+  // The automatic hibernation pass's recorded blocker (issue #4385): the workersvc reason code,
+  // when this reason started holding (restarts only when the reason changes) and when it was
+  // last observed. Null when unset; optional for older APIs.
+  hibernation_blocked_reason?: string | null;
+  hibernation_blocked_since?: string | null;
+  hibernation_blocked_at?: string | null;
   // Hibernation cache cleanup (PRD #4206). The key is always sent by a current api, null when
   // no attempt was made; optional here for older APIs and bare fixtures.
   hibernation_cleanup?: WorkerHibernationCleanup | null;

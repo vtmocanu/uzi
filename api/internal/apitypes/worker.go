@@ -31,10 +31,18 @@ type WorkerDTO struct {
 	// HibernationReason is the admin's sanitized reason; HibernatedAt is when the pod was
 	// confirmed absent; WakeRequestedAt is when a wake began; WakeError is the bounded
 	// reason a wake past worker_wake_timeout has not completed. All null when not set.
-	HibernationReason *string    `json:"hibernation_reason"`
-	HibernatedAt      *time.Time `json:"hibernated_at"`
-	WakeRequestedAt   *time.Time `json:"wake_requested_at"`
-	WakeError         *string    `json:"wake_error"`
+	HibernationReason *string `json:"hibernation_reason"`
+	// HibernationBlockedReason is the automatic pass's blocker: the closed code that keeps an
+	// idle worker from hibernating (workersvc Blocked* values, an unknown code possible from a
+	// newer api), sanitized and bounded. HibernationBlockedSince is when that reason began (it
+	// restarts only when the reason changes); HibernationBlockedAt is the latest sighting, shown
+	// as "last observed". All null when no blocker is recorded.
+	HibernationBlockedReason *string    `json:"hibernation_blocked_reason"`
+	HibernationBlockedSince  *time.Time `json:"hibernation_blocked_since"`
+	HibernationBlockedAt     *time.Time `json:"hibernation_blocked_at"`
+	HibernatedAt             *time.Time `json:"hibernated_at"`
+	WakeRequestedAt          *time.Time `json:"wake_requested_at"`
+	WakeError                *string    `json:"wake_error"`
 	// HibernationCleanup (PRD #4206) is the Docker cache cleanup attempt that ran, or is
 	// running, at hibernation. The key is always present; null when no attempt was made and
 	// no outcome is recorded.

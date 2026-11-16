@@ -222,4 +222,89 @@ func TestFleetHibernationAuto(t *testing.T) {
 			}
 		}
 	})
+	t.Run("a controller refusal names the controller reason", func(t *testing.T) {
+		row := idleRow("w", workersvc.BlockedControllerRefused, 20*24*time.Hour, 1)
+		row.ControllerReason = "roll_reservation"
+		c := eval(&fakeStore{hibRows: []store.ListAutoHibernationBlockersRow{row}}, on(), hostedRows)
+		if got := c.Evidence[1].Value; !strings.Contains(got, "hibernation blocked: controller refused (roll reservation)") {
+			t.Fatalf("got %q", got)
+		}
+	})
+	t.Run("every known controller reason has its label", func(t *testing.T) {
+		want := map[string]string{
+			"roll_reservation":          "roll reservation",
+			"roll_blocked":              "roll blocked",
+			"disk_pressure":             "disk pressure",
+			"dind_maintenance":          "DinD maintenance",
+			"busy":                      "busy",
+			"layout_migration_held":     "layout migration held",
+			"roll_evidence_unavailable": "roll evidence unavailable",
+		}
+		for code, label := range want {
+			if got := controllerRefusalLabel(code); got != label {
+				t.Errorf("%s: got %q, want %q", code, got, label)
+			}
+		}
+	})
+	t.Run("a refusal without a controller reason, and other reasons, keep the plain label", func(t *testing.T) {
+		plain := idleRow("w", workersvc.BlockedControllerRefused, 20*24*time.Hour, 1)
+		other := idleRow("w", workersvc.BlockedManualCordon, 20*24*time.Hour, 1)
+		other.ControllerReason = "roll_reservation" // only a controller refusal reads it
+		c := eval(&fakeStore{hibRows: []store.ListAutoHibernationBlockersRow{plain, other}}, on(), hostedRows)
+		if got := c.Evidence[1].Value; got != "worker w idle 20d, hibernation blocked: controller refused" {
+			t.Fatalf("plain refusal: %q", got)
+		}
+		if got := c.Evidence[2].Value; got != "worker w idle 20d, hibernation blocked: manual cordon" {
+			t.Fatalf("other reason: %q", got)
+		}
+	})
+	t.Run("an unknown controller reason is sanitized and bounded", func(t *testing.T) {
+		row := idleRow("w", workersvc.BlockedControllerRefused, 20*24*time.Hour, 1)
+		row.ControllerReason = "x\x1b[31m" + strings.Repeat("世", 30) + strings.Repeat("a", 40)
+		c := eval(&fakeStore{hibRows: []store.ListAutoHibernationBlockersRow{row}}, on(), hostedRows)
+		got := c.Evidence[1].Value
+		if strings.ContainsRune(got, 0x1b) || !utf8.ValidString(got) || len(got) > maxEvidenceBytes {
+			t.Fatalf("invalid value (%d bytes): %q", len(got), got)
+		}
+		if !strings.Contains(got, "controller refused (x") {
+			t.Fatalf("controller reason not shown: %q", got)
+		}
+		if lbl := controllerRefusalLabel(row.ControllerReason); len(lbl) > hibernationControllerReasonBytes {
+			t.Fatalf("label %q is %d bytes", lbl, len(lbl))
+		}
+	})
+	t.Run("long names, unknown reasons and huge idle durations stay bounded with a name part", func(t *testing.T) {
+		names := []string{strings.Repeat("w", 200), strings.Repeat("é世", 60), "x\x1b[31m" + strings.Repeat("n", 100)}
+		reasons := []string{workersvc.BlockedControllerRefused, strings.Repeat("世", 80), "weird\x1b[31m" + strings.Repeat("z", 90)}
+		ctrl := []string{"", "roll_evidence_unavailable", strings.Repeat("世", 40), "q\x1b[0m" + strings.Repeat("c", 90)}
+		for _, name := range names {
+			for _, reason := range reasons {
+				for _, cr := range ctrl {
+					row := idleRow(name, reason, 100000*24*time.Hour, 1)
+					row.ControllerReason = cr
+					c := eval(&fakeStore{hibRows: []store.ListAutoHibernationBlockersRow{row}}, on(), hostedRows)
+					v := c.Evidence[1].Value
+					if len(v) > maxEvidenceBytes || !utf8.ValidString(v) || strings.ContainsRune(v, 0x1b) {
+						t.Fatalf("invalid value (%d bytes): %q", len(v), v)
+					}
+					namePart := strings.TrimPrefix(v, "worker ")
+					namePart, _, _ = strings.Cut(namePart, " idle ")
+					if len(namePart) < hibernationMinNameBytes-3 || namePart == "" { // -3: a cut may drop one 3-byte rune
+						t.Fatalf("name part %q too short in %q", namePart, v)
+					}
+				}
+			}
+		}
+	})
+	t.Run("hibernationEvidenceValue bounds an oversized suffix", func(t *testing.T) {
+		for _, suffix := range []string{strings.Repeat("s", 500), strings.Repeat("世", 100)} {
+			v := hibernationEvidenceValue(strings.Repeat("n", 100), suffix)
+			if len(v) > maxEvidenceBytes || !utf8.ValidString(v) {
+				t.Fatalf("value %d bytes valid=%v", len(v), utf8.ValidString(v))
+			}
+			if !strings.HasPrefix(v, "worker nnnnnnn") {
+				t.Fatalf("name part lost: %q", v)
+			}
+		}
+	})
 }

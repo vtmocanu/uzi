@@ -53,6 +53,47 @@ func printWorkerDrainDetail(p *uzicli.Printer, w apitypes.WorkerDTO) {
 	}
 }
 
+// hibernationBlockedLabels maps the closed set of hibernation_blocked_reason codes to a human
+// label. The keys mirror workersvc.Blocked* (a test pins them to workersvc.HibernationBlockedReasons;
+// the CLI does not import the server package) and the wording mirrors healthsvc's
+// hibernationBlockedLabel. An unknown code (a newer api) renders sanitized via manualWorkerField.
+var hibernationBlockedLabels = map[string]string{
+	"custody_hold":               "recovery custody hold",
+	"manual_cordon":              "manual cordon",
+	"maintenance":                "maintenance",
+	"roll":                       "image roll",
+	"draining":                   "draining",
+	"pending_wake_demand":        "a queued run is waking it",
+	"controller_not_advertising": "controller not advertising hibernation",
+	"no_pod_identity":            "no pod identity",
+	"controller_refused":         "controller refused",
+	"intake_fenced":              "intake fenced",
+}
+
+// printWorkerHibernationDetail prints why the automatic hibernation pass cannot hibernate an
+// idle worker, when the api recorded a blocker: the reason, since when, and when the pass last
+// observed it. Nothing prints without a recorded reason.
+func printWorkerHibernationDetail(p *uzicli.Printer, w apitypes.WorkerDTO) {
+	if w.HibernationBlockedReason != nil && strings.TrimSpace(*w.HibernationBlockedReason) != "" {
+		code := *w.HibernationBlockedReason
+		label, ok := hibernationBlockedLabels[code]
+		if !ok {
+			label = manualWorkerField(code)
+		}
+		p.Printf("Hibernation blocked worker %s: %s (since %s, last observed %s)\n",
+			manualWorkerField(w.ID), label, workerBlockedTime(w.HibernationBlockedSince), workerBlockedTime(w.HibernationBlockedAt))
+	}
+	// m3: the roll-marker line for this worker is added here, after the blocker line.
+}
+
+// workerBlockedTime renders a blocker timestamp as RFC3339 UTC, "-" when absent.
+func workerBlockedTime(t *time.Time) string {
+	if t == nil {
+		return "-"
+	}
+	return t.UTC().Format(time.RFC3339)
+}
+
 // manualWorkerField bounds a sanitized single-line field by Unicode code points.
 func manualWorkerField(s string) string {
 	r := []rune(strings.Join(strings.Fields(uzicli.CellText(ansi.Strip(s))), " "))
@@ -87,6 +128,7 @@ func printWorkerManualResult(env Env, gf *globalFlags, w apitypes.WorkerDTO) err
 		}
 		printWorkerManualDetail(p, w)
 		printWorkerDrainDetail(p, w)
+		printWorkerHibernationDetail(p, w)
 		p.Printf("Held work continues; automatic drains and other fences can remain.\n")
 	}
 	return nil
@@ -184,6 +226,7 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 			for _, w := range workers {
 				printWorkerManualDetail(p, w)
 				printWorkerDrainDetail(p, w)
+				printWorkerHibernationDetail(p, w)
 				for _, line := range workerForgeLines(w) {
 					p.Printf("Worker %s: %s\n", cellText(w.ID), line)
 				}
@@ -457,6 +500,7 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 				}
 				printWorkerManualDetail(p, w)
 				printWorkerDrainDetail(p, w)
+				printWorkerHibernationDetail(p, w)
 				for _, line := range workerForgeLines(w) {
 					p.Printf("%s\n", line)
 				}

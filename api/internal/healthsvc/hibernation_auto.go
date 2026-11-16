@@ -23,7 +23,34 @@ const (
 	hibernationNameBytes = 32
 	// hibernationReasonBytes bounds an unrecognised blocked-reason code shown verbatim.
 	hibernationReasonBytes = 32
+	// hibernationControllerReasonBytes bounds an unrecognised controller refusal code.
+	hibernationControllerReasonBytes = 20
+	// hibernationMinNameBytes is the least the worker-name part keeps once the suffix is bounded.
+	hibernationMinNameBytes = 8
 )
+
+// controllerRefusalLabel renders the controller's refusal code (the worker's hibernation_reason
+// after a controller_refused block). The codes mirror the refuse* constants in
+// controller/internal/kube/hibernation.go; an unknown code shows sanitized and bounded.
+func controllerRefusalLabel(code string) string {
+	switch code {
+	case "roll_reservation":
+		return "roll reservation"
+	case "roll_blocked":
+		return "roll blocked"
+	case "disk_pressure":
+		return "disk pressure"
+	case "dind_maintenance":
+		return "DinD maintenance"
+	case "busy":
+		return "busy"
+	case "layout_migration_held":
+		return "layout migration held"
+	case "roll_evidence_unavailable":
+		return "roll evidence unavailable"
+	}
+	return cutBytes(orDash(safe(code)), hibernationControllerReasonBytes)
+}
 
 // hibernationBlockedLabel renders a recorded hibernation_blocked_reason for an admin. The
 // codes are the workersvc.Blocked* closed set; an unknown code (a newer api wrote it) shows
@@ -68,10 +95,12 @@ func cutBytes(s string, n int) string {
 	return s[:n]
 }
 
-// hibernationEvidenceValue joins prefix, the worker name and suffix, cutting only the name so
-// the value stays within maxEvidenceBytes and the suffix (the blocker) is intact.
+// hibernationEvidenceValue joins prefix, the worker name and suffix within maxEvidenceBytes.
+// The suffix (the blocker) is bounded first so the name always keeps at least
+// hibernationMinNameBytes; the name then takes what remains, up to hibernationNameBytes.
 func hibernationEvidenceValue(name, suffix string) string {
 	const prefix = "worker "
+	suffix = cutBytes(suffix, maxEvidenceBytes-len(prefix)-hibernationMinNameBytes)
 	budget := maxEvidenceBytes - len(prefix) - len(suffix)
 	if budget > hibernationNameBytes {
 		budget = hibernationNameBytes
@@ -161,7 +190,11 @@ func (s *Service) checkFleetHibernation(ctx context.Context, now time.Time, work
 			}
 			suffix = fmt.Sprintf(" blocked: assigned run parked (%s, %s)", runRef, cutBytes(safe(r.Status.String), 16))
 		} else {
-			suffix = fmt.Sprintf(" idle %s, hibernation blocked: %s", hibernationIdleFor(now.Sub(r.Anchor.Time)), hibernationBlockedLabel(r.Reason))
+			label := hibernationBlockedLabel(r.Reason)
+			if r.Reason == workersvc.BlockedControllerRefused && r.ControllerReason != "" {
+				label += " (" + controllerRefusalLabel(r.ControllerReason) + ")"
+			}
+			suffix = fmt.Sprintf(" idle %s, hibernation blocked: %s", hibernationIdleFor(now.Sub(r.Anchor.Time)), label)
 		}
 		c.Evidence = append(c.Evidence, apitypes.HealthEvidenceDTO{Label: "Worker", Value: hibernationEvidenceValue(r.Name, suffix)})
 	}

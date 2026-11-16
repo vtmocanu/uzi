@@ -192,6 +192,7 @@ func newAdminCmd(env Env, gf *globalFlags) *cobra.Command {
 			for _, w := range ws {
 				printWorkerManualDetail(p, w.WorkerDTO)
 				printWorkerDrainDetail(p, w.WorkerDTO)
+				printWorkerHibernationDetail(p, w.WorkerDTO)
 			}
 			return nil
 		},
