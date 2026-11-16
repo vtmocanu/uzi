@@ -18,6 +18,8 @@ func TestCodexPendingSwitchReceiptDrainLiveDB(t *testing.T) {
 	if err := f.svc.FreezeCodexBinding(f.env.ctx, f.o.userID, run, old, codexAuthModeAPIKey); err != nil {
 		t.Fatal(err)
 	}
+	_, hash := mintCodexCapability()
+	f.env.exec("UPDATE runs SET codex_claim_epoch=41, codex_cap_hash=$2 WHERE id=$1", run, hash)
 	if err := f.svc.recordCodexEpoch(f.env.ctx, mustRun(t, f.env, run)); err != nil {
 		t.Fatal(err)
 	}
@@ -64,7 +66,7 @@ func TestCodexPendingSwitchReceiptDrainLiveDB(t *testing.T) {
 	req.RegisterNonce = nonce
 	applied, err := f.svc.ApplyCredentialSwitch(f.env.ctx, f.worker(t), run, req)
 	if err != nil || applied.Outcome != ApplyOutcomeApplied {
-		t.Fatal("switch did not settle", err)
+		t.Fatalf("switch did not settle: outcome=%.64s reason=%.128s err=%.256v", applied.Outcome, applied.Reason, err)
 	}
 	result, err := f.svc.ApplyInputs(f.env.ctx, f.worker(t), run, f.gen, []int64{id})
 	if err != nil || !result.Active || replayed() {
