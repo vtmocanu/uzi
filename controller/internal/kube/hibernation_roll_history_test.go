@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -450,8 +451,17 @@ func TestHibernationOwnRollEvidenceStillRefuses(t *testing.T) {
 		"completed marker and identical claim mirror": {reason: refuseRollReservation, objs: func(t *testing.T) []runtime.Object {
 			return []runtime.Object{rhCanaryDep(t, true), pvcNix("w1", "20Gi"), rhClaim("w1", "data", completed(t)), pod()}
 		}},
-		"completed marker and different incomplete claim mirror": {reason: refuseRollReservation, objs: func(t *testing.T) []runtime.Object {
+		// The mirror's 9-byte hash is not a valid marker, so the snapshot blocks the entry
+		// ("retained reservation invalid") with the completed marker still decoded.
+		"completed marker and an undecodable claim mirror (snapshot-blocked)": {reason: refuseRollReservation, objs: func(t *testing.T) []runtime.Object {
 			return []runtime.Object{rhCanaryDep(t, true), pvcNix("w1", "20Gi"), rhClaim("w1", "data", different(t)), pod()}
+		}},
+		// A decodable, valid-owner mirror that differs from the marker blocks nothing in
+		// the snapshot; the claim annotation alone refuses.
+		"completed marker and a different decodable incomplete claim mirror": {reason: refuseRollReservation, objs: func(t *testing.T) []runtime.Object {
+			d := rhCanaryDep(t, false)
+			rhEdit(t, d, func(r *rollMarker) { r.Hash = strings.Repeat("a", 64) })
+			return []runtime.Object{rhCanaryDep(t, true), pvcNix("w1", "20Gi"), rhClaim("w1", "data", d.Annotations[annotationRoll]), pod()}
 		}},
 		"raw annotation on the nix claim": {reason: refuseRollReservation, objs: func(t *testing.T) []runtime.Object {
 			return []runtime.Object{rhCanaryDep(t, true), rhClaim("w1", "nix", "x"), pvcFor("w1", "data"), pod()}
@@ -623,6 +633,99 @@ func TestHibernationPeerEvidenceRefusesCohortPending(t *testing.T) {
 	})
 }
 
+// 5b: a candidate whose own snapshot is blocked keeps its decoded completed marker; the
+// refusal is the reservation one (marker plus blocked), not the plain blocked one.
+func TestHibernationBlockedCandidateKeepsCompletedMarker(t *testing.T) {
+	w := rhW(protocol.HibernationPreparing, "op-1")
+	// The marker names owner-A; the API evidence now names another owner, so the
+	// snapshot blocks the entry while the completed marker still decodes.
+	w.RollEvidence.OwnerID = "owner-Z"
+	canary := rhCanaryDep(t, true)
+	orig := canary.Annotations[annotationRoll]
+	m, client, rec := hibEnv(t, canary, hibPod("pod-uid-1", "x", true, false))
+	if err := hibTick(t, m, w); err != nil {
+		t.Fatal(err)
+	}
+	rhAssertRefused(t, rec, refuseRollReservation)
+	if got := rhGet(t, client, "w1").Annotations[annotationRoll]; got != orig {
+		t.Fatalf("marker changed: %q", got)
+	}
+	if replicaPatches(client) != 0 || rhRollWrites(client, "uzi-hw-w1") != 0 {
+		t.Fatalf("unexpected writes: %+v", rhWorkerPatches(client, "uzi-hw-w1"))
+	}
+}
+
+// 5c: peer evidence outranks the worker's own busy and disk-pressure refusals, and the
+// marker stays intact.
+func TestHibernationPeerEvidenceOutranksBusyAndDiskPressure(t *testing.T) {
+	for name, set := range map[string]func(*protocol.DesiredWorker){
+		"busy":          func(w *protocol.DesiredWorker) { w.Busy = true },
+		"disk pressure": func(w *protocol.DesiredWorker) { w.DiskPressure = true },
+		"both":          func(w *protocol.DesiredWorker) { w.Busy, w.DiskPressure = true, true },
+	} {
+		t.Run(name, func(t *testing.T) {
+			w := rhW(protocol.HibernationPreparing, "op-1")
+			set(&w)
+			w2, peerObjs := rhPeer(t, "w2", false, nil)
+			canary := rhCanaryDep(t, true)
+			orig := canary.Annotations[annotationRoll]
+			m, client, rec := hibEnv(t, rhObjs([]runtime.Object{canary, hibPod("pod-uid-1", "x", true, false)}, peerObjs)...)
+			if err := hibTick(t, m, w, w2); err != nil {
+				t.Fatal(err)
+			}
+			rhAssertRefused(t, rec, refuseRollCohortPending)
+			if got := rhGet(t, client, "w1").Annotations[annotationRoll]; got != orig {
+				t.Fatalf("canary marker changed: %q", got)
+			}
+			if replicaPatches(client) != 0 || rhRollWrites(client, "uzi-hw-w1") != 0 {
+				t.Fatalf("unexpected writes: %+v", rhWorkerPatches(client, "uzi-hw-w1"))
+			}
+		})
+	}
+}
+
+// 5d: a peer that is blocked only by its snapshot (the Deployment the observation saw is
+// gone from the roll snapshot), with no marker and no roll annotation anywhere, is still
+// peer evidence, whatever owner its coverage names.
+func TestHibernationSnapshotBlockedPeerRefusesCohortPending(t *testing.T) {
+	for name, owner := range map[string]string{"same owner": "owner-A", "different owner": "owner-B"} {
+		t.Run(name, func(t *testing.T) {
+			w := rhW(protocol.HibernationPreparing, "op-1")
+			w2 := evidence(desired("w2"), m5Now)
+			w2.RollEvidence.OwnerID = owner
+			canary := rhCanaryDep(t, true)
+			orig := canary.Annotations[annotationRoll]
+			m, client, rec := hibEnv(t, canary, hibPod("pod-uid-1", "x", true, false), rhPlainDep(t, w2), pvcNix("w2", "20Gi"), pvcFor("w2", "data"))
+			ctx := context.Background()
+			o, err := m.Observe(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			seen := false
+			for _, ow := range o {
+				seen = seen || (ow.ID == "w2" && ow.HasDeployment)
+			}
+			if !seen {
+				t.Fatal("the observation did not see the peer Deployment")
+			}
+			// The Deployment disappears between the observation and the roll snapshot.
+			if err := client.Tracker().Delete(appsv1.SchemeGroupVersion.WithResource("deployments"), testConfig().Namespace, deploymentName("w2")); err != nil {
+				t.Fatal(err)
+			}
+			if err := m.Reconcile(ctx, []protocol.DesiredWorker{w, w2}, o); err != nil {
+				t.Fatal(err)
+			}
+			rhAssertRefused(t, rec, refuseRollCohortPending)
+			if got := rhGet(t, client, "w1").Annotations[annotationRoll]; got != orig {
+				t.Fatalf("canary marker changed: %q", got)
+			}
+			if replicaPatches(client) != 0 || rhRollWrites(client, "uzi-hw-w1") != 0 {
+				t.Fatalf("unexpected writes: %+v", rhWorkerPatches(client, "uzi-hw-w1"))
+			}
+		})
+	}
+}
+
 // 6: a hibernated worker supplies nothing to pacing, coverage or slots.
 func TestHibernatedWorkerWithCompletedCanaryMarkerSuppliesNothing(t *testing.T) {
 	t.Run("hibernated holder", func(t *testing.T) {
@@ -669,21 +772,81 @@ func TestHibernatedWorkerWithCompletedCanaryMarkerSuppliesNothing(t *testing.T) 
 		}
 	})
 
-	t.Run("anchored candidate", func(t *testing.T) {
+	// The refused candidate anchors its pool as a read-only completed-canary closure.
+	// Only the anchor lets the dependent peer read "completed cohort cleanup pending";
+	// without it the peer would read as a participant without a canary. The anchor itself
+	// is excluded from admission, outcome changes and hold release.
+	anchored := func(t *testing.T, edit func(w1 *protocol.DesiredWorker, d *appsv1.Deployment)) (*Materializer, *fake.Clientset, *hibRec, protocol.DesiredWorker, protocol.DesiredWorker) {
+		t.Helper()
 		w1 := rhW(protocol.HibernationPreparing, "op-1")
 		w2, peerObjs := rhPeer(t, "w2", false, nil)
-		m, client, rec := hibEnv(t, rhObjs([]runtime.Object{rhCanaryDep(t, true), hibPod("pod-uid-1", "x", true, false)}, peerObjs)...)
-		if err := hibTick(t, m, w1, w2); err != nil {
-			t.Fatal(err)
+		d := rhCanaryDep(t, true)
+		if edit != nil {
+			edit(&w1, d)
 		}
+		m, client, rec := hibEnv(t, rhObjs([]runtime.Object{d}, peerObjs)...)
+		return m, client, rec, w1, w2
+	}
+	assertPeerHeldByAnchor := func(t *testing.T, m *Materializer, client *fake.Clientset, rec *hibRec) {
+		t.Helper()
 		rhAssertRefused(t, rec, refuseRollCohortPending)
-		for _, id := range templatePatches(client) {
-			t.Fatalf("template patch on %s", id)
+		out := m.PacingOutcomes()
+		p := out["w2"]
+		if p == nil || p.BlockingReason == nil || !strings.HasPrefix(*p.BlockingReason, "completed cohort cleanup pending") {
+			t.Fatalf("peer pacing = %+v, want completed cohort cleanup pending (the anchor's closure)", p)
 		}
-		for id, o := range m.PacingOutcomes() {
+		for id, o := range out {
+			if o.BlockingReason != nil && strings.Contains(*o.BlockingReason, "participant reservation without canary") {
+				t.Fatalf("%s reads without canary: %s", id, *o.BlockingReason)
+			}
 			if o.CanaryID != nil && *o.CanaryID == "w1" {
 				t.Fatalf("%s: anchored candidate is the canary: %+v", id, o)
 			}
+		}
+		if _, ok := out["w1"]; ok {
+			t.Fatalf("the anchored candidate exported a pacing outcome: %+v", out["w1"])
+		}
+		if ids := templatePatches(client); len(ids) != 0 {
+			t.Fatalf("template patches on %v", ids)
+		}
+	}
+
+	t.Run("anchored candidate", func(t *testing.T) {
+		m, client, rec, w1, w2 := anchored(t, nil)
+		if err := hibTick(t, m, w1, w2); err != nil {
+			t.Fatal(err)
+		}
+		assertPeerHeldByAnchor(t, m, client, rec)
+	})
+
+	t.Run("anchored candidate with template drift is not held or reported", func(t *testing.T) {
+		m, client, rec, w1, w2 := anchored(t, func(_ *protocol.DesiredWorker, d *appsv1.Deployment) {
+			d.Spec.Template.Annotations[AnnotationGeneration] = "99"
+		})
+		if err := hibTick(t, m, w1, w2); err != nil {
+			t.Fatal(err)
+		}
+		assertPeerHeldByAnchor(t, m, client, rec)
+	})
+
+	t.Run("anchored candidate keeps its roll-owned drain", func(t *testing.T) {
+		w1 := rhW(protocol.HibernationPreparing, "op-1")
+		w2, peerObjs := rhPeer(t, "w2", false, nil)
+		m, client, rec := hibEnv(t, rhObjs([]runtime.Object{rhCanaryDep(t, true)}, peerObjs)...)
+		// The candidate's current incarnation is proven and it carries an image-roll
+		// drain, so an ordinary pool member would have its hold released here.
+		currentProof(t, client, &w1, m5Now)
+		since, reason := m5Now.Add(-time.Minute), "image_roll"
+		w1.DrainingSince, w1.DrainingReason = &since, &reason
+		if err := hibTick(t, m, w1, w2); err != nil {
+			t.Fatal(err)
+		}
+		assertPeerHeldByAnchor(t, m, client, rec)
+		if got := rec.clearCalls; len(got) != 0 {
+			t.Fatalf("ClearDrain calls = %v, want none for a read-only anchor", got)
+		}
+		if got := rhRollWrites(client, "uzi-hw-w1"); got != 0 {
+			t.Fatalf("roll writes on the anchor = %d", got)
 		}
 	})
 }
@@ -839,19 +1002,60 @@ func TestHibernationWithdrawnPreparationWakesWithoutRetiredHistory(t *testing.T)
 }
 
 // 8: the controller sees no reason text, so the same inputs behave the same way run
-// after run, whatever op ids the api assigns.
-func TestHibernationHistoryRetirementIsDeterministicAcrossRuns(t *testing.T) {
-	var runs [][]string
-	for _, op := range []string{"op-a", "op-b"} {
-		w := rhW(protocol.HibernationPreparing, op)
-		m, client, rec := hibEnv(t, rhCanaryDep(t, true), hibPod("pod-uid-1", "x", true, false))
-		if err := hibTick(t, m, w); err != nil {
-			t.Fatal(err)
+// after run, whatever op id the api assigns. Each scenario (one worker, and a canary
+// beside an incomplete peer) is run under several op ids on fresh clusters, and the
+// transitions, refusal reasons, patch count and pacing outcomes must be identical.
+func TestHibernationRetirementOutcomeIsIndependentOfOpID(t *testing.T) {
+	scenarios := map[string]func(t *testing.T, op string) string{
+		"sole completed canary sleeps": func(t *testing.T, op string) string {
+			w := rhW(protocol.HibernationPreparing, op)
+			m, client, rec := hibEnv(t, rhCanaryDep(t, true), hibPod("pod-uid-1", "x", true, false))
+			if err := hibTick(t, m, w); err != nil {
+				t.Fatal(err)
+			}
+			rhAssertSlept(t, client, rec)
+			return rhSummary(client, rec, m)
+		},
+		"canary with an incomplete peer is refused": func(t *testing.T, op string) string {
+			w := rhW(protocol.HibernationPreparing, op)
+			w2, peerObjs := rhPeer(t, "w2", false, nil)
+			m, client, rec := hibEnv(t, rhObjs([]runtime.Object{rhCanaryDep(t, true), hibPod("pod-uid-1", "x", true, false)}, peerObjs)...)
+			if err := hibTick(t, m, w, w2); err != nil {
+				t.Fatal(err)
+			}
+			rhAssertRefused(t, rec, refuseRollCohortPending)
+			return rhSummary(client, rec, m)
+		},
+	}
+	for name, run := range scenarios {
+		t.Run(name, func(t *testing.T) {
+			var want string
+			for i, op := range []string{"op-a", "op-b", "op-c", "9f2e"} {
+				got := run(t, op)
+				if i == 0 {
+					want = got
+				} else if got != want {
+					t.Fatalf("op %q: %s, want %s", op, got, want)
+				}
+			}
+		})
+	}
+}
+
+// rhSummary renders the observable outcome of one tick without any op id.
+func rhSummary(c *fake.Clientset, rec *hibRec, m *Materializer) string {
+	var reasons []string
+	for _, call := range rec.calls {
+		reasons = append(reasons, call.Transition+"/"+call.Reason)
+	}
+	var pacing []string
+	for id, p := range m.PacingOutcomes() {
+		r := ""
+		if p.BlockingReason != nil {
+			r = *p.BlockingReason
 		}
-		rhAssertSlept(t, client, rec)
-		runs = append(runs, append(rec.transitions(), strconv.Itoa(len(rhPatches(client)))))
+		pacing = append(pacing, id+"="+p.State+":"+r)
 	}
-	if strings.Join(runs[0], ",") != strings.Join(runs[1], ",") {
-		t.Fatalf("runs differ: %v vs %v", runs[0], runs[1])
-	}
+	sort.Strings(pacing)
+	return strings.Join(reasons, ",") + " patches=" + strconv.Itoa(len(rhPatches(c))) + " pacing=" + strings.Join(pacing, ";")
 }
