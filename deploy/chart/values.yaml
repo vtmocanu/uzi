@@ -1749,14 +1749,16 @@ web:
     #   `request`, and 300s covers the api's own budget for the buffered body: its upload
     #   deadline is the larger of the request deadline (UZI_RECOVERY_REQUEST_DEADLINE, 120s)
     #   and the declared size at 100 KiB/s (256s at 25 MiB), plus a 15s response grace, 271s.
+    #   On a gateway that streams the request body upstream, upload time can still count
+    #   against `backendRequest` even when `request` starts after the body is received.
     # So 300s is not a portable cap on total upload duration. Raising the per-file cap
     # (UZI_JOB_INPUT_FILE_MAX_BYTES) needs a larger value.
     # This value must cover web nginx's /api/v1/files budgets, as web.ingress.annotations do
     # for Ingress; size it as a TOTAL budget, not by copying nginx's numbers, because nginx's
     # client_body/proxy_send/proxy_read timeouts (120s/150s/150s) bound inactivity between
     # operations, not total duration. Set backendRequest too: omitted, the implementation
-    # applies its own backend timeout, which may be shorter. The render fails on an unknown
-    # key, a malformed duration, or backendRequest longer than request (compared as parsed
+    # applies its own backend timeout, which may be shorter. The render fails on a value that
+    # is not a map (false, [], "", 0), an unknown key, a malformed duration, or backendRequest longer than request (compared as parsed
     # durations, so 300s == 5m; request "0s" disables that timeout and allows any
     # backendRequest). /api/ws stays on the general rule below, untouched by this value.
     timeouts: {}

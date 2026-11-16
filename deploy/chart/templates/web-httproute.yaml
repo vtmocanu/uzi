@@ -5,11 +5,13 @@
 {{- if not .Values.web.httpRoute.parentRefs }}
 {{- fail "web.httpRoute.enabled is true but web.httpRoute.parentRefs is empty. An HTTPRoute attached to no Gateway serves nothing; name the Gateway, e.g. [{name: shared, namespace: gateway-system}]." }}
 {{- end }}
-{{- with .Values.web.httpRoute.timeouts }}
-{{- include "uzi.httpRouteTimeouts" (dict "path" "web.httpRoute.timeouts" "t" .) }}
+{{- /* Validate before any truthiness-based `with`: a falsy non-map (false, [], "", 0) must
+fail, not silently render no timeouts. Only nil (unset, or deleted with null) skips. */}}
+{{- if not (kindIs "invalid" .Values.web.httpRoute.timeouts) }}
+{{- include "uzi.httpRouteTimeouts" (dict "path" "web.httpRoute.timeouts" "t" .Values.web.httpRoute.timeouts) }}
 {{- end }}
-{{- with .Values.web.httpRoute.rootTimeouts }}
-{{- include "uzi.httpRouteTimeouts" (dict "path" "web.httpRoute.rootTimeouts" "t" .) }}
+{{- if not (kindIs "invalid" .Values.web.httpRoute.rootTimeouts) }}
+{{- include "uzi.httpRouteTimeouts" (dict "path" "web.httpRoute.rootTimeouts" "t" .Values.web.httpRoute.rootTimeouts) }}
 {{- end }}
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute

@@ -181,6 +181,14 @@ for f in rt-empty rt-files rt-req rt-root; do
 done
 ok "no render adds an /api/ws rule (WebSocket stays on PathPrefix /)"
 
+# Validation (#4404): a falsy non-map must fail with its value path, not be skipped by a
+# truthiness guard and silently render no timeouts. {} stays "off" (checked above).
+for k in timeouts rootTimeouts; do
+  for v in false '[]' '""' 0; do
+    refuse "web.httpRoute.$k must be a map" $ROUTE_ARGS --set-json "web.httpRoute.$k=$v"
+  done
+done
+
 # Validation: backendRequest <= request on parsed durations; request "0s" disables it.
 refuse "web.httpRoute.timeouts.backendRequest (301s) is longer than web.httpRoute.timeouts.request (300s)" \
   $ROUTE_ARGS --set-json 'web.httpRoute.timeouts={"request":"300s","backendRequest":"301s"}'

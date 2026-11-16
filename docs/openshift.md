@@ -70,6 +70,8 @@ web:
     `request`, and 300s covers the api's own budget for the buffered body. Its upload
     deadline is the larger of its request deadline (`UZI_RECOVERY_REQUEST_DEADLINE`, 120s)
     and the declared size at 100 KiB/s (256s at 25 MiB), plus a 15s response grace: 271s.
+    On a gateway that streams the request body upstream, upload time can still count
+    against `backendRequest` even when `request` starts after the body is received.
 
   So 300s is not a portable cap on total upload duration. Raising the per-file cap
   (`UZI_JOB_INPUT_FILE_MAX_BYTES`) needs a larger value.
@@ -79,7 +81,8 @@ web:
   budget that covers them rather than copying their numbers.
 - **Set `backendRequest` too:** left out, the implementation applies its own backend
   timeout, which may be shorter than `request`.
-- **Validation:** the render fails on a key other than `request` or `backendRequest`, on a
+- **Validation:** the render fails on a value that is not a map (`false`, `[]`, `""`, `0`;
+  leave it `{}` to turn it off), on a key other than `request` or `backendRequest`, on a
   value that is not a Gateway API duration (`300s`, `5m`, `1h30m`), and when
   `backendRequest` is longer than `request`. Durations compare by value, so `300s` and `5m`
   are equal, and `request: "0s"` disables that timeout and allows any `backendRequest`.
