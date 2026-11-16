@@ -32517,7 +32517,9 @@ describe("M2 actualRunner credential replacement", () => {
         client.reportState = async (id, body, ...args) => {
           reports.push(body.status);
           dispositions.push({ status: body.status, failure_reason: body.failure_reason });
-          if ((resumeUncertain || resumePreserve) && body.status === "credential_switch_uncertain") {
+          if (resumePreserve && body.status === "credential_switch_uncertain")
+            assert.fail("preserving refusal cannot pause before the policy endpoint");
+          if (resumeUncertain && body.status === "credential_switch_uncertain") {
             assert.equal(id, claim.run_id);
             assert.equal(body.claim_generation, 7);
             assert.equal(body.op_id, "M2-op");
@@ -32754,7 +32756,18 @@ describe("M2 actualRunner credential replacement", () => {
           await client.register("live-preserve", "base", 1, [], ["provider_policy_hold_v1"], undefined, 0);
           client.reportPolicyHold = async (id, body) => {
             assert.equal(id, claim.run_id);
+            assert.equal(cleanOwnership.status, "running", "policy POST requires server-eligible ownership");
+            const serverOwnership = await WorkerClient.prototype.getRunOwnership.call(client, id);
+            assert.equal(serverOwnership.status, "running", "the fake server has not accepted an ordinary pause");
+            assert.equal(serverOwnership.claim_generation, 7);
+            assert.ok(!reports.includes("credential_switch_uncertain"));
             assert.ok(switchError instanceof PolicyContinuationRejected, "actual switch rejection reaches policy reporting");
+            for (const epoch of rig.epochs) {
+              assert.ok(epoch.reaped() > 0, "provider root joins before policy POST");
+              assert.ok(epoch.disposed() > 0, "provider transport joins before policy POST");
+            }
+            assert.equal(disposedEffects.size, effects, "effect roots join before policy POST");
+            for (const handle of fileops) assert.ok(handle.disposed() > 0, "file operations join before policy POST");
             policyHolds.push(structuredClone(body));
             return { disposition: "applied", outcome_id: body.outcome_id, source_generation: body.source_generation,
               observed_status: "paused", observed_generation: body.claim_generation, hold_reason: "codex_policy_hold" };
@@ -33962,7 +33975,7 @@ describe("M2 actualRunner credential replacement", () => {
               assert.equal(login.effectDisposed, true);
               assert.ok(login.fileopDisposed > 0);
               assert.equal(ordinaryBRefreshes, 0);
-              assert.deepEqual(reports.filter(status => status.startsWith("credential_switch")), ["credential_switch_uncertain"]);
+              assert.deepEqual(reports.filter(status => status.startsWith("credential_switch")), []);
               assert.ok(!reports.some(status => ["failed", "completed", "cancelled"].includes(status)));
               assert.equal(api.messages(claim.run_id).some(message => rec(message.payload).event === "resume_lineage_break"), false);
               for (const epoch of rig.epochs) {

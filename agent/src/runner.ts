@@ -17686,11 +17686,20 @@ export class RunRunner {
               let fresh = false;
               if (started.kind === "confirmed_resume_refusal") {
                 if (ctx.preserveConversation) {
-                  try { await ownerHold(selected.opId, "initialization_failed"); }
-                  catch (error) {
-                    if (!(error instanceof CredentialSwitchRetainedStop)) throw error;
-                    throw new PolicyContinuationRejected("provider_resume_rejected");
-                  }
+                  // The credential operation committed, but B must never admit model work.
+                  // Revalidate after provider I/O, then retire only this operation's stop
+                  // so the existing policy capture can run. An ordinary pause here would
+                  // make the policy endpoint ineligible; other stop causes stay sticky.
+                  await appliedAuthority();
+                  guard();
+                  if (!hold.release({ messageSeq: bundle.messageSeq }) &&
+                      !hold.release({ messageSeq: Math.max(bundle.messageSeq, batcher.currentSeq()) }))
+                    throw new Error("Codex preserving resume sequence hold release refused");
+                  steering.settleCredentialSwitch(selected.opId, "applied");
+                  steering.rearmLifecycle();
+                  // No await or admission opening between settlement and rejection.
+                  // Keep the separate retained process-join obligation through cleanup.
+                  throw new PolicyContinuationRejected("provider_resume_rejected");
                 }
                 await appliedAuthority();
                 await ownedEffect(() => a.startFreshLineage(bounds));
