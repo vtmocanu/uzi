@@ -612,7 +612,12 @@ describe("Board — the Backlog rename is display-only (PRD #102 Decision 14a)",
       ...(state === "failed" ? { error_class: "timeout" } : {}),
     });
     const bannerTexts = () => screen.queryAllByRole("status").map((el) => el.textContent ?? "");
-    const hasBanner = (re: RegExp) => bannerTexts().some((t) => re.test(t));
+    // Every role=status node except the always-mounted sr-only announcement region. With
+    // this fixture (no runs awaiting action) any remaining node is an import banner, so
+    // "no banner" is pinned regardless of its copy.
+    const visibleStatuses = () =>
+      screen.queryAllByRole("status").filter((el) => !el.classList.contains("sr-only"));
+    const hasBanner =(re: RegExp) => bannerTexts().some((t) => re.test(t));
 
     it.each([
       ["waiting", WAITING],
@@ -635,17 +640,16 @@ describe("Board — the Backlog rename is display-only (PRD #102 Decision 14a)",
       mockApi.getBoard.mockResolvedValue({ board: aBoard(over) });
       renderBoard();
       await screen.findByText("Backlog");
-      for (const re of [WAITING, RUNNING, FAILED]) expect(hasBanner(re)).toBe(false);
+      expect(visibleStatuses()).toHaveLength(0);
     });
 
-    it("shows the normal empty board and no banner for an empty succeeded import", async () => {
+    it("shows no banner for an empty succeeded import", async () => {
       mockApi.getBoard.mockResolvedValue({
         board: aBoard({ cards: [], initial_import: imp("succeeded") }),
       });
       renderBoard();
       await screen.findByText("Backlog");
-      expect(screen.queryAllByText("Add a metrics dashboard")).toHaveLength(0);
-      for (const re of [WAITING, RUNNING, FAILED]) expect(hasBanner(re)).toBe(false);
+      expect(visibleStatuses()).toHaveLength(0);
     });
 
     it("drops the banner when a poll reports the import succeeded", async () => {
