@@ -32470,6 +32470,8 @@ describe("M2 actualRunner credential replacement", () => {
         const positiveBChild = publication === "gated" && oldClaim === API_KEY && target === SUBSCRIPTION && phase === "factory";
         const probeEpochConsumers = publication === "baseline" && oldClaim === API_KEY && phase === "factory";
         const probeBInitialCredential = publication === "baseline" && phase === "factory";
+        const aRefreshSubscription = "generation" in oldClaim ? oldClaim : undefined;
+        const probeARefreshDrain = publication === "baseline" && phase === "factory" && oldClaim.auth_mode === "subscription";
         const queuedRefreshStop = publication === "subscription-refresh-prepare-failure" || publication === "subscription-refresh-cancel";
         const crashRecovery = publication === "crash-after-a-teardown-recovery" ||
           publication === "crash-apply-reply-lost-recovery" || publication === "crash-apply-ack-recovery" ||
@@ -33148,6 +33150,24 @@ describe("M2 actualRunner credential replacement", () => {
           return req.capability === next.capability ? { access_token: next.access_token } : release(id, req);
         };
         const refresh = rig.client.refreshCodex.bind(rig.client);
+        const aRefreshEntered = installerBarrier(), aRefreshRelease = installerBarrier();
+        const aRefreshCheckpoint = installerBarrier(), aRefreshContinue = installerBarrier();
+        const aRefreshReturned = installerBarrier();
+        let aRefreshArmed = false, aRefreshWindow = false, aRefreshTaken = false;
+        let aRefreshExchanges = 0, aRefreshRawCompleted = false, aSuspendReturned = false;
+        let aRefreshRequest: { runId: string; capability: string; generation: number;
+          expected: Parameters<WorkerClient["refreshCodex"]>[2] | undefined } | undefined;
+        const aRefreshResponses: { id: number | string; response: Parameters<FakeTransport["respond"]>[1] }[] = [];
+        const aRespond = a.transport.respond.bind(a.transport);
+        a.transport.respond = (id, response) => {
+          aRespond(id, response);
+          if (id === 191 || id === 193) aRefreshResponses.push({ id, response });
+        };
+        const aRefreshSnapshot = () => ({ returned: aSuspendReturned, raw: aRefreshRawCompleted,
+          exchanges: aRefreshExchanges, responses: [...aRefreshResponses] });
+        let aRefreshHeldSnapshot: ReturnType<typeof aRefreshSnapshot> | undefined;
+        let aRefreshReturnSnapshot: ReturnType<typeof aRefreshSnapshot> | undefined;
+        let aSuspendOwned: ReturnType<CodexExecutor["suspendCodexEpoch"]> | undefined;
         let ordinaryBRefreshes = 0, refreshDeliveries = 0, bFinished = false;
         const refreshDelivered = installerBarrier(), refreshResponded = installerBarrier();
         const respond = b.transport.respond.bind(b.transport);
@@ -33160,7 +33180,18 @@ describe("M2 actualRunner credential replacement", () => {
           respond(id, response);
           if (id === 91) refreshResponded.resolve();
         };
-        rig.client.refreshCodex = async (id, req) => {
+        rig.client.refreshCodex = async (id, req, expected?: Parameters<WorkerClient["refreshCodex"]>[2]) => {
+          if (aRefreshWindow && req.capability === oldClaim.capability) aRefreshExchanges++;
+          if (aRefreshArmed && !aRefreshTaken && req.capability === oldClaim.capability) {
+            aRefreshTaken = true;
+            aRefreshRequest = { runId: id, capability: req.capability, generation: req.observed_generation, expected };
+            aRefreshEntered.resolve();
+            await aRefreshRelease.promise;
+            aRefreshRawCompleted = true;
+            return { access_token: "M2-A-refresh-access", generation: req.observed_generation + 1,
+              chatgpt_account_id: aRefreshSubscription?.chatgpt_account_id ?? "unused",
+              outcome: "advanced" };
+          }
           if (resumeVariant && applies > 0) assert.equal(req.capability, next.capability, "no A refresh after apply");
           credentialRefreshes++;
           if (req.capability !== next.capability) return refresh(id, req);
@@ -33239,7 +33270,32 @@ describe("M2 actualRunner credential replacement", () => {
         executor.suspendCodexEpoch = async bounds => {
           executorSuspensionEntered.resolve();
           executorEntryNowDrain.push({ completed: nowDrainCompleted, raw: events.includes("A-Now-drained") });
-          const lease = await suspend(bounds);
+          if (probeARefreshDrain) {
+            aRefreshArmed = true; aRefreshWindow = true;
+            a.transport.deliverServerRequest({ kind: "activity", method: "account/chatgptAuthTokens/refresh",
+              requestId: 191, params: { reason: "unauthorized", previousAccountId: null } });
+            await withTimeout(aRefreshEntered.promise, 5000, "armed A worker refresh entry");
+          }
+          const suspension = suspend(bounds);
+          aSuspendOwned = suspension;
+          // Keep assertions outside Runner's switch catch paths.
+          void suspension.then(() => { aSuspendReturned = true; }, () => {});
+          if (probeARefreshDrain) {
+            try {
+              a.transport.deliverServerRequest({ kind: "activity", method: "account/chatgptAuthTokens/refresh",
+                requestId: 193, params: { reason: "unauthorized", previousAccountId: null } });
+              await new Promise<void>(resolve => setImmediate(resolve));
+              aRefreshHeldSnapshot = aRefreshSnapshot();
+              aRefreshCheckpoint.resolve();
+              await aRefreshContinue.promise;
+            } finally { aRefreshRelease.resolve(); }
+          }
+          const lease = await suspension;
+          if (probeARefreshDrain) {
+            aRefreshReturnSnapshot = aRefreshSnapshot();
+            aRefreshWindow = false; aRefreshArmed = false;
+            aRefreshReturned.resolve();
+          }
           return { ...lease,
             // Observe only the real switch lease, never the separate retained-A stale probe in B.
             reconcileA: publication === "baseline" ? async function (this: unknown, ...args: Parameters<typeof lease.reconcileA>) {
@@ -33825,6 +33881,29 @@ describe("M2 actualRunner credential replacement", () => {
           await withTimeout(executorSuspensionEntered.promise, 5000, "M2 executor after Now drain");
           assert.deepEqual(executorEntryNowDrain, [{ completed: true, raw: true }],
             "executor suspension begins only after Now joins its raw work");
+          if (probeARefreshDrain) {
+            assert.ok(aRefreshSubscription);
+            try {
+              await withTimeout(aRefreshCheckpoint.promise, 5000, "A refresh suspension checkpoint");
+              assert.deepEqual(aRefreshHeldSnapshot, { returned: false, raw: false, exchanges: 1, responses: [] },
+                "suspension joins the admitted raw exchange while the second valid request stays queued");
+              assert.ok(aRefreshRequest);
+              assert.equal(aRefreshRequest.runId, claim.run_id);
+              assert.equal(aRefreshRequest.capability, oldClaim.capability);
+              assert.ok(oldClaim.auth_mode === "subscription");
+              assert.ok(aRefreshRequest.generation >= aRefreshSubscription.generation,
+                "bridge generation includes any startup advance");
+              assert.deepEqual(aRefreshRequest.expected,
+                { authMode: "subscription", chatgptAccountId: aRefreshSubscription.chatgpt_account_id });
+            } finally { aRefreshRelease.resolve(); aRefreshContinue.resolve(); }
+            await withTimeout(aRefreshReturned.promise, 5000, "healthy A suspension returns after refresh");
+            assert.deepEqual(aRefreshReturnSnapshot, { returned: true, raw: true, exchanges: 1,
+              // The raw worker succeeds, but the existing post-response admission guard
+              // refuses A delivery after closure without poisoning this healthy auth owner.
+              responses: [{ id: 191, response: { error: { code: -32001,
+                message: "codex authentication refresh unavailable" } } }] },
+            "suspend return joins successful worker completion and fenced delivery; queued 193 stays unstarted");
+          }
           if (persistFailure) {
             if (publication === "persist-clear-confirmed") {
               await withTimeout(persistBoundObserved.promise, 5000, "real bounded rollout persistence returns");
@@ -35192,6 +35271,7 @@ describe("M2 actualRunner credential replacement", () => {
           assert.equal(await fs.readFile(path.join(worktree, "M2-retained.txt"), "utf8"), "A work");
         } finally {
           scopeProbesArmed = false;
+          aRefreshRelease.resolve(); aRefreshContinue.resolve();
           releaseRetry?.();
           retryTimer?.mock.restore();
           cancelled = true; pending = false; nowContinue.resolve(); summaryDisposeContinue.resolve(); cleanupContinue.resolve();
@@ -35202,6 +35282,7 @@ describe("M2 actualRunner credential replacement", () => {
           try {
             await joinExecution();
           } finally {
+            await aSuspendOwned?.catch(() => {});
             try { await joinNowConsumerProbes(); }
             finally {
               scopeProbesArmed = false;
