@@ -127,8 +127,8 @@ If your protected vault is locked, uzi can't open your tokens to poll them: your
 last known reading stays on screen but greys out and is marked **stale**
 (or explicitly **vault locked** on the admin page) until you unlock again.
 Nothing is lost, and nothing renders as a false zero. When you unlock, uzi
-refreshes every enabled token's meter right away rather than waiting for the
-next poll, except a token still in its refusal backoff. Off accounts do not need
+requests an asynchronous refresh of every enabled token's meter rather than
+waiting for the next poll, except a token still in its refusal backoff. Off accounts do not need
 an unlock for polling; see [Vault choice](./anthropic-token.md#vault-choice).
 
 ## Choosing a token near its limit

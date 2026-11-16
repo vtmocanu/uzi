@@ -247,9 +247,9 @@ func (e *Engine) tickAll(ctx context.Context) {
 	e.pollRows(tickCtx, rows)
 }
 
-// pokeUserAll polls every enabled token of one user, honouring backoff, under its own
-// deadline of one interval so a slow provider call cannot hold the poke loop (and the
-// pokes queued behind it) past the next tick (#4406).
+// pokeUserAll polls every enabled token of one user, honouring backoff, under an
+// interval-scoped context deadline (#4406). The deadline bounds this batch only; it can
+// still overlap the next scheduled tick.
 func (e *Engine) pokeUserAll(ctx context.Context, userID uuid.UUID) {
 	pokeCtx, cancel := context.WithTimeout(ctx, e.interval)
 	defer cancel()
