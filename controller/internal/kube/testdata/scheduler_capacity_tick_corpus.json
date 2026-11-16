@@ -9,6 +9,11 @@
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
       },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
+      },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
       "phase_since": "2026-06-01T11:00:00Z",
@@ -32,6 +37,11 @@
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
       },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
+      },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
       "phase_since": "2026-06-01T11:00:00Z",
@@ -53,6 +63,11 @@
         "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
       },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
@@ -77,6 +92,11 @@
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
       },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
+      },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
       "phase_since": "2026-06-01T11:00:00Z",
@@ -100,6 +120,11 @@
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
       },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
+      },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
       "phase_since": "2026-06-01T11:00:00Z",
@@ -122,6 +147,11 @@
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
       },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
+      },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
       "phase_since": "2026-06-01T11:00:00Z",
@@ -142,6 +172,11 @@
         "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
       },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
@@ -164,6 +199,11 @@
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
       },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
+      },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
       "phase_since": "2026-06-01T11:00:00Z",
@@ -184,6 +224,11 @@
         "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
       },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
@@ -206,6 +251,11 @@
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
       },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
+      },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
       "phase_since": "2026-06-01T11:00:00Z",
@@ -227,6 +277,11 @@
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
       },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
+      },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
       "phase_since": "2026-06-01T11:00:00Z",
@@ -247,6 +302,11 @@
         "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
       },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
@@ -271,6 +331,11 @@
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
       },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
+      },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
       "phase_since": "2026-06-01T11:00:00Z",
@@ -293,6 +358,11 @@
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
       },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
+      },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
       "phase_since": "2026-06-01T11:00:00Z",
@@ -313,6 +383,11 @@
         "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
       },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
@@ -335,6 +410,11 @@
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
       },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
+      },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
       "phase_since": "2026-06-01T11:00:00Z",
@@ -355,6 +435,11 @@
         "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
       },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
@@ -377,6 +462,11 @@
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
       },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
+      },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
       "phase_since": "2026-06-01T11:00:00Z",
@@ -397,6 +487,11 @@
         "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
       },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
@@ -419,6 +514,11 @@
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
       },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
+      },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
       "phase_since": "2026-06-01T11:00:00Z",
@@ -439,6 +539,11 @@
         "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
       },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
@@ -461,6 +566,11 @@
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
       },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
+      },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
       "phase_since": "2026-06-01T11:00:00Z",
@@ -481,6 +591,11 @@
         "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
       },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
@@ -503,6 +618,11 @@
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
       },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
+      },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
       "phase_since": "2026-06-01T11:00:00Z",
@@ -523,6 +643,11 @@
         "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
       },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
@@ -545,6 +670,11 @@
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
       },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
+      },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "settled",
       "phase_since": "2026-06-01T12:00:00Z",
@@ -565,6 +695,11 @@
         "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
       },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
@@ -589,6 +724,11 @@
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
       },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
+      },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
       "phase_since": "2026-06-01T11:00:00Z",
@@ -611,6 +751,11 @@
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
       },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
+      },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
       "phase_since": "2026-06-01T11:00:00Z",
@@ -631,6 +776,11 @@
         "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
       },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
@@ -653,6 +803,11 @@
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
       },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
+      },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
       "phase_since": "2026-06-01T11:00:00Z",
@@ -673,6 +828,11 @@
         "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
       },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
@@ -695,6 +855,11 @@
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
       },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
+      },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
       "phase_since": "2026-06-01T11:00:00Z",
@@ -715,6 +880,11 @@
         "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
       },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
@@ -737,6 +907,11 @@
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
       },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
+      },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
       "phase_since": "2026-06-01T11:00:00Z",
@@ -757,6 +932,11 @@
         "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
         "target_version": "1.0.0",
         "blocking_reason": "incomplete deployment/pod/ancestry snapshot"
+      },
+      "roll_marker": {
+        "state": "unavailable",
+        "reservation": false,
+        "blocked": "incomplete deployment/pod/ancestry snapshot"
       },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "rolling",
@@ -779,6 +959,11 @@
         "target_version": "1.0.0",
         "blocking_reason": "incomplete deployment/pod/ancestry snapshot"
       },
+      "roll_marker": {
+        "state": "unavailable",
+        "reservation": false,
+        "blocked": "incomplete deployment/pod/ancestry snapshot"
+      },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
       "phase_since": "2026-06-01T11:00:00Z",
@@ -799,6 +984,11 @@
         "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
       },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
@@ -821,6 +1011,11 @@
         "target_version": "1.0.0",
         "blocking_reason": "deployment missing from snapshot"
       },
+      "roll_marker": {
+        "state": "unavailable",
+        "reservation": false,
+        "blocked": "deployment missing from snapshot"
+      },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
       "phase_since": "2026-06-01T11:00:00Z",
@@ -841,6 +1036,11 @@
         "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
       },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
@@ -863,6 +1063,11 @@
         "target_version": "1.0.0",
         "blocking_reason": "deployment missing from snapshot"
       },
+      "roll_marker": {
+        "state": "unavailable",
+        "reservation": false,
+        "blocked": "deployment missing from snapshot"
+      },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
       "phase_since": "2026-06-01T11:00:00Z",
@@ -883,6 +1088,11 @@
         "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
       },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
@@ -905,6 +1115,11 @@
         "target_version": "1.0.0",
         "blocking_reason": "deployment missing from snapshot"
       },
+      "roll_marker": {
+        "state": "unavailable",
+        "reservation": false,
+        "blocked": "deployment missing from snapshot"
+      },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "rolling",
       "phase_since": null,
@@ -925,6 +1140,11 @@
         "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
       },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
@@ -947,6 +1167,11 @@
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
       },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
+      },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
       "phase_since": "2026-06-01T11:00:00Z",
@@ -967,6 +1192,11 @@
         "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
       },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "rolling",
@@ -989,6 +1219,11 @@
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
       },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
+      },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "rolling",
       "phase_since": null,
@@ -1010,6 +1245,11 @@
         "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
       },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
@@ -1034,6 +1274,11 @@
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
       },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
+      },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
       "phase_since": "2026-06-01T11:00:00Z",
@@ -1056,6 +1301,11 @@
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
       },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
+      },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
       "phase_since": "2026-06-01T11:00:00Z",
@@ -1076,6 +1326,11 @@
         "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
       },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
@@ -1098,6 +1353,11 @@
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
       },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
+      },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
       "phase_since": "2026-06-01T11:00:00Z",
@@ -1118,6 +1378,11 @@
         "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
       },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
@@ -1140,6 +1405,11 @@
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
       },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
+      },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
       "phase_since": "2026-06-01T11:00:00Z",
@@ -1160,6 +1430,11 @@
         "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
       },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "settled",
@@ -1182,6 +1457,11 @@
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
       },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
+      },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
       "phase_since": "2026-06-01T11:00:00Z",
@@ -1202,6 +1482,11 @@
         "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
       },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
@@ -1224,6 +1509,11 @@
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
       },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
+      },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
       "phase_since": "2026-06-01T11:00:00Z",
@@ -1244,6 +1534,11 @@
         "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
       },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
@@ -1268,6 +1563,11 @@
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
       },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
+      },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
       "phase_since": "2026-06-01T11:00:00Z",
@@ -1290,6 +1590,11 @@
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
       },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
+      },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
       "phase_since": "2026-06-01T11:00:00Z",
@@ -1310,6 +1615,11 @@
         "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
       },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
@@ -1332,6 +1642,11 @@
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
       },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
+      },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
       "phase_since": "2026-06-01T11:00:00Z",
@@ -1352,6 +1667,11 @@
         "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
       },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
@@ -1374,6 +1694,11 @@
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
       },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
+      },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
       "phase_since": "2026-06-01T11:00:00Z",
@@ -1394,6 +1719,11 @@
         "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
       },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
@@ -1416,6 +1746,11 @@
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
       },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
+      },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
       "phase_since": "2026-06-01T11:00:00Z",
@@ -1436,6 +1771,11 @@
         "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
       },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
@@ -1458,6 +1798,11 @@
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
       },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
+      },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
       "phase_since": "2026-06-01T11:00:00Z",
@@ -1478,6 +1823,11 @@
         "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
       },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
@@ -1500,6 +1850,11 @@
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
       },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
+      },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
       "phase_since": "2026-06-01T11:00:00Z",
@@ -1521,6 +1876,11 @@
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
       },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
+      },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
       "phase_since": "2026-06-01T11:00:00Z",
@@ -1541,6 +1901,11 @@
         "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
       },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
@@ -1565,6 +1930,11 @@
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
       },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
+      },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
       "phase_since": "2026-06-01T11:00:00Z",
@@ -1587,6 +1957,11 @@
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
       },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
+      },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
       "phase_since": "2026-06-01T11:00:00Z",
@@ -1607,6 +1982,11 @@
         "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
       },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
@@ -1629,6 +2009,11 @@
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
       },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
+      },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
       "phase_since": "2026-06-01T11:00:00Z",
@@ -1649,6 +2034,11 @@
         "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
       },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
@@ -1671,6 +2061,11 @@
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
       },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
+      },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
       "phase_since": "2026-06-01T11:00:00Z",
@@ -1691,6 +2086,11 @@
         "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
       },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "rolling",
@@ -1713,6 +2113,11 @@
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
       },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
+      },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
       "phase_since": "2026-06-01T11:00:00Z",
@@ -1733,6 +2138,11 @@
         "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
       },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "rolling",
@@ -1757,6 +2167,11 @@
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
       },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
+      },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
       "phase_since": "2026-06-01T11:00:00Z",
@@ -1779,6 +2194,11 @@
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
       },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
+      },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
       "phase_since": "2026-06-01T11:00:00Z",
@@ -1800,6 +2220,11 @@
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
       },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
+      },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
       "phase_since": "2026-06-01T11:00:00Z",
@@ -1820,6 +2245,11 @@
         "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
         "target_version": "1.0.0",
         "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "roll_marker": {
+        "state": "absent",
+        "reservation": false,
+        "blocked": "API coverage evidence unavailable; explicit recovery required"
       },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",

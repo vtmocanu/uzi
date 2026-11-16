@@ -272,6 +272,60 @@ threshold before it is considered again.
 hibernation reason reads "automatic: no run activity for ..." (for example
 "automatic: no run activity for 14d").
 
+#### Diagnosing a blocked hibernation or a stuck roll
+
+The worker JSON carries the pass's last recorded blocker and, for a hosted
+worker, the controller's retained image-roll marker. Both are evidence for an
+admin to read; neither changes behavior, and the controller stays the authority
+for refusing hibernation and for rolls.
+
+```sh
+uzi admin workers --json
+```
+
+Per worker, `uzi admin workers --json` (and `uzi worker list --json` / `uzi worker get --json`
+for the owner's own workers) carries:
+
+- `hibernation_blocked_reason`: the workersvc code of the last recorded blocker of the
+  automatic pass (for example `controller_refused`), or null. For
+  `controller_refused`, `hibernation_reason` holds the controller's refusal code.
+- `hibernation_blocked_since`: when this reason started holding. It restarts only when the
+  reason changes.
+- `hibernation_blocked_at`: when the pass last observed it.
+
+These are the **last recorded** blocker, not the current state: they are not cleared when
+the worker returns to work, so read them with the worker's status and
+`hibernation_state`.
+
+- `roll_marker` (hosted workers only; display-only): `state`, `canary`, `completed`,
+  `target_version`, `coverage_group` (an opaque 16-hex id that tells coverage groups apart
+  and never carries the raw annotation or nonce), `reservation` (whether the controller sees
+  a roll reservation, the fact that makes it refuse hibernation with `roll_reservation`),
+  `blocked` (the controller's roll blocker) and `observed_at` (when the api received the
+  report). `canary`, `completed`, `target_version` and `coverage_group` are set only when
+  `state` is `present`; `reservation` and `blocked` only when the report is fresh.
+
+`roll_marker.state` tells apart what the controller could and could not see:
+
+| State | Meaning |
+|---|---|
+| `present` | a roll marker exists and was decoded |
+| `unreadable` | a roll annotation exists but could not be decoded |
+| `absent` | positively no marker |
+| `unavailable` | the controller's cluster snapshot failed or was incomplete, so it cannot say whether a marker exists |
+| `unknown` | no fresh report: an older controller, evidence older than the 60 second receipt TTL, an invalid value, or a worker not reported while preparing, hibernated or cleaning |
+
+Read `absent` as a fact and `unavailable` and `unknown` as missing evidence: neither
+shows that no roll is held. `roll_pacing` is unchanged; completed history now shows
+through `roll_marker`.
+
+`uzi worker list`, `uzi worker get` and `uzi admin workers` print the same facts after
+the table as `Hibernation blocker (last recorded)` and `Roll marker` lines, see
+[CLI](./cli.md#hibernated-workers). The web **Admin → Health** Fleet card shows a
+"Hibernation blocker (last recorded)" line and a "Roll marker:" line per worker. The
+`fleet.hibernation` evidence names the same refusal; see
+[Admin health](./admin-health.md).
+
 ### Cache cleanup before sleep
 
 A [Docker-capable](worker-docker.md) worker runs one cache prune while it is

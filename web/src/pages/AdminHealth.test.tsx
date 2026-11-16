@@ -974,3 +974,81 @@ describe("AdminHealth — Fleet card hibernation (PRD #4205)", () => {
     await waitFor(() => expect(mockApi.adminWakeWorker).toHaveBeenCalledWith("w-z"));
   });
 });
+
+describe("AdminHealth — Fleet card blocker and roll marker (issue #4385)", () => {
+  const hosted = (over: Partial<AdminWorker>) => fleetWorker({ kind: "hosted", ephemeral: false, busy: false, active_runs: 0, draining_since: null, manual_cordoned_at: null, ...over });
+  const agoIso = (ms: number) => new Date(Date.now() - ms).toISOString();
+  const marker = (over: Partial<NonNullable<AdminWorker["roll_marker"]>>): NonNullable<AdminWorker["roll_marker"]> => ({
+    state: "present", canary: null, completed: null, target_version: null, coverage_group: null, reservation: null, blocked: null, observed_at: null, ...over,
+  });
+
+  it("names the controller refusal, how long, and when last observed", async () => {
+    await renderHealth(healthySilentDoc(), [hosted({
+      name: "refused-w", hibernation_reason: "roll_reservation", hibernation_blocked_reason: "controller_refused",
+      hibernation_blocked_since: agoIso(42 * 60_000), hibernation_blocked_at: agoIso(2 * 60_000),
+    })]);
+    const row = await fleetRow("refused-w");
+    expect(within(row).getByText("Hibernation blocker (last recorded): controller refused (roll reservation) for 42m, last observed 2m ago")).toBeTruthy();
+  });
+
+  it("renders an unknown blocker code and refusal code stripped, as text", async () => {
+    await renderHealth(healthySilentDoc(), [hosted({
+      name: "odd-w", hibernation_reason: "<i>weird‮</i>", hibernation_blocked_reason: "controller_refused",
+      hibernation_blocked_at: agoIso(60_000),
+    }), hosted({ id: "w-2", name: "odd-2", hibernation_blocked_reason: "<b>new‮</b>" })]);
+    const odd = await fleetRow("odd-w");
+    expect(within(odd).getByText("Hibernation blocker (last recorded): controller refused (<i>weird</i>), last observed 1m ago")).toBeTruthy();
+    expect(odd.querySelector("i")).toBeNull();
+    const odd2 = await fleetRow("odd-2");
+    expect(within(odd2).getByText("Hibernation blocker (last recorded): <b>new</b>")).toBeTruthy();
+    expect(odd2.querySelector("b")).toBeNull();
+  });
+
+  it("omits the controller label for a non-refusal blocker and renders no blocker line without fields", async () => {
+    await renderHealth(healthySilentDoc(), [
+      hosted({ name: "cord-w", hibernation_reason: "roll_reservation", hibernation_blocked_reason: "manual_cordon" }),
+      hosted({ id: "w-3", name: "plain-w" }),
+    ]);
+    expect(within(await fleetRow("cord-w")).getByText("Hibernation blocker (last recorded): manual cordon")).toBeTruthy();
+    expect((await fleetRow("plain-w")).textContent).not.toContain("Hibernation blocker");
+  });
+
+  it("renders a present canary completed marker with target, group and last observed", async () => {
+    await renderHealth(healthySilentDoc(), [hosted({
+      name: "mark-w", roll_marker: marker({ canary: true, completed: true, target_version: "0.9.0", coverage_group: "base", observed_at: agoIso(5 * 60_000) }),
+    })]);
+    const row = await fleetRow("mark-w");
+    expect(within(row).getByText("Roll marker: present · canary · completed · target 0.9.0 · group base, last observed 5m ago")).toBeTruthy();
+  });
+
+  it("renders reservation and a stripped blocked text", async () => {
+    await renderHealth(healthySilentDoc(), [hosted({
+      name: "res-w", roll_marker: marker({ reservation: true, blocked: "<u>held‮</u>" }),
+    })]);
+    const row = await fleetRow("res-w");
+    expect(within(row).getByText("Roll marker: present · reservation · blocked: <u>held</u>")).toBeTruthy();
+    expect(row.querySelector("u")).toBeNull();
+  });
+
+  it.each([
+    ["unknown", "Roll marker: unknown"],
+    ["absent", "Roll marker: none"],
+    ["unavailable", "Roll marker: snapshot unavailable"],
+    ["unreadable", "Roll marker: unreadable"],
+    ["<s>new‮</s>", "Roll marker: <s>new</s>"],
+  ])("renders marker state %s as distinct text", async (state, text) => {
+    await renderHealth(healthySilentDoc(), [hosted({ name: "st-w", roll_marker: marker({ state }) })]);
+    const row = await fleetRow("st-w");
+    expect(within(row).getByText(text)).toBeTruthy();
+    expect(row.querySelector("s")).toBeNull();
+  });
+
+  it("renders no roll marker line for an external worker or a worker without a marker", async () => {
+    await renderHealth(healthySilentDoc(), [
+      fleetWorker({ name: "ext-m", kind: "external", roll_marker: marker({}) }),
+      hosted({ id: "w-4", name: "nomark-w" }),
+    ]);
+    expect((await fleetRow("ext-m")).textContent).not.toContain("Roll marker");
+    expect((await fleetRow("nomark-w")).textContent).not.toContain("Roll marker");
+  });
+});

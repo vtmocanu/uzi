@@ -1,9 +1,11 @@
 package workersvc
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -632,6 +634,90 @@ func ParseFreshPacingReport(data []byte, receipt pgtype.Timestamptz, now time.Ti
 	return reportCopy
 }
 
+// RollMarkerReport is the controller's display-only summary of its retained
+// uzi.dev/image-roll evidence for one worker (issue #4385). It is never an input to
+// scheduling, claim or readiness.
+type RollMarkerReport struct {
+	State         string  `json:"state"`
+	Canary        bool    `json:"canary,omitempty"`
+	Completed     bool    `json:"completed,omitempty"`
+	TargetVersion string  `json:"target_version,omitempty"`
+	CoverageGroup string  `json:"coverage_group,omitempty"`
+	Reservation   bool    `json:"reservation"`
+	Blocked       *string `json:"blocked,omitempty"`
+}
+
+var rollMarkerGroupRE = regexp.MustCompile(`^[0-9a-f]{16}$`)
+
+// ParseRollMarkerReport decodes a raw wire marker. An empty or JSON null value is
+// "no marker" and returns (nil, nil); anything else must decode and normalize.
+// Errors carry no controller-supplied values.
+func ParseRollMarkerReport(raw json.RawMessage) (*RollMarkerReport, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil, nil
+	}
+	var in RollMarkerReport
+	if err := json.Unmarshal(trimmed, &in); err != nil {
+		return nil, fmt.Errorf("invalid roll marker encoding")
+	}
+	return NormalizeRollMarkerReport(&in)
+}
+
+// NormalizeRollMarkerReport validates a whole marker and strips unsafe runes from its
+// display strings. Errors contain no controller-supplied values.
+func NormalizeRollMarkerReport(in *RollMarkerReport) (*RollMarkerReport, error) {
+	if in == nil {
+		return nil, nil
+	}
+	out := *in
+	switch out.State {
+	case "present", "unreadable", "absent", "unavailable":
+	default:
+		return nil, fmt.Errorf("invalid roll marker state")
+	}
+	if out.CoverageGroup != "" && !rollMarkerGroupRE.MatchString(out.CoverageGroup) {
+		return nil, fmt.Errorf("invalid roll marker coverage group")
+	}
+	if !utf8.ValidString(out.TargetVersion) || len(out.TargetVersion) > 128 ||
+		(out.Blocked != nil && (!utf8.ValidString(*out.Blocked) || len(*out.Blocked) > 192)) {
+		return nil, fmt.Errorf("invalid roll marker field bounds")
+	}
+	clean := func(s string) string {
+		return strings.Map(func(r rune) rune {
+			if termsafe.Unsafe(r) {
+				return -1
+			}
+			return r
+		}, s)
+	}
+	out.TargetVersion = clean(out.TargetVersion)
+	if out.Blocked != nil {
+		v := clean(*out.Blocked)
+		out.Blocked = &v
+	}
+	return &out, nil
+}
+
+// ParseFreshRollMarker reads a stored marker using only the API receipt time, with the
+// same guard as ParseFreshPacingReport.
+func ParseFreshRollMarker(data []byte, receipt pgtype.Timestamptz, now time.Time) *RollMarkerReport {
+	if !receipt.Valid || receipt.InfinityModifier != pgtype.Finite || receipt.Time.After(now) ||
+		now.Sub(receipt.Time) > DefaultControllerSignalTTL || len(data) == 0 || len(data) > 1024 {
+		return nil
+	}
+	report, err := ParseRollMarkerReport(data)
+	if err != nil || report == nil {
+		return nil
+	}
+	report.TargetVersion = termsafe.CellText(report.TargetVersion)
+	if report.Blocked != nil {
+		v := termsafe.CellText(*report.Blocked)
+		report.Blocked = &v
+	}
+	return report
+}
+
 // RollHealthReport is one validated, sanitized entry from a controller report, ready
 // to persist. The handler does the decoding, enum validation and sanitizing; this
 // layer also validates pacing for callers that do not use the handler.
@@ -639,6 +725,7 @@ type RollHealthReport struct {
 	BlockingKind string
 	Kind         string
 	Pacing       *PacingReport
+	RollMarker   *RollMarkerReport
 	WorkerID     uuid.UUID
 	Phase        string
 	PhaseSince   *time.Time
@@ -688,10 +775,25 @@ func (s *Service) RecordRollHealth(ctx context.Context, rep RollHealthReport) (i
 		}
 	}
 	updatePacing := rep.Kind == "fleet" || (rep.Kind == "" && pacing != nil)
+	marker, err := NormalizeRollMarkerReport(rep.RollMarker)
+	if err != nil {
+		return 0, err
+	}
+	// A nil []byte is SQL NULL; a JSON null is never sent.
+	var markerJSON []byte
+	if marker != nil {
+		markerJSON, err = json.Marshal(marker)
+		if err != nil {
+			return 0, fmt.Errorf("encoding roll marker")
+		}
+	}
+	updateRollMarker := rep.Kind == "fleet" || (rep.Kind == "" && marker != nil)
 	tagValid := semver.IsValid(normSemver(rep.WorkerImageTag))
 	return s.q.UpsertWorkerRollHealth(ctx, store.UpsertWorkerRollHealthParams{
 		Pacing:               pacingJSON,
 		UpdatePacing:         updatePacing,
+		RollMarker:           markerJSON,
+		UpdateRollMarker:     updateRollMarker,
 		WorkerID:             rep.WorkerID,
 		Phase:                rep.Phase,
 		PhaseSince:           pgconv.TimePtr(rep.PhaseSince),

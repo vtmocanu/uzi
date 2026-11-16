@@ -3,6 +3,8 @@ package kube
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -60,6 +62,12 @@ type rollEntry struct {
 	claim              *corev1.PersistentVolumeClaim
 	rawReservation     bool
 	migrationHeldDrift bool
+	// snapshotIncomplete is set when the roll snapshot could not read this worker's
+	// deployment/pod/claim evidence; display-only (RollMarkerReports), never read by planning.
+	snapshotIncomplete bool
+	// markerReport is the snapshot-time display summary, captured before planning
+	// rewrites e.marker in memory. Display-only.
+	markerReport *protocol.RollMarker
 	// hibernation marks a worker whose desired hibernation state is set (PRD #4205).
 	// It stays in rollTick.entries so its snapshot evidence (marker, reservation,
 	// blocked) is readable through rollFrom, but it takes no part in pool grouping,
@@ -108,6 +116,63 @@ type unplannedWorker struct {
 	nsKnown bool
 }
 type rollTickKey struct{}
+
+// RollMarkerReports returns a copy of the per-worker display-only roll marker
+// summaries from the last reconcile (issue #4385). It is replaced on every
+// synchronous reconcile and never used to admit or hibernate. Unlike PacingOutcomes it
+// includes completed markers.
+func (m *Materializer) RollMarkerReports() map[string]*protocol.RollMarker {
+	out := make(map[string]*protocol.RollMarker, len(m.rollMarkers))
+	for id, r := range m.rollMarkers {
+		c := *r
+		if r.Blocked != nil {
+			b := *r.Blocked
+			c.Blocked = &b
+		}
+		out[id] = &c
+	}
+	return out
+}
+
+// captureRollMarkerReport summarises the retained cluster evidence as the snapshot
+// read it, before any planning mutation rewrites e.marker.
+func captureRollMarkerReport(e *rollEntry) *protocol.RollMarker {
+	r := &protocol.RollMarker{
+		State:       protocol.RollMarkerAbsent,
+		Reservation: e.marker != nil || e.rawReservation || hasOpenReservation(e),
+	}
+	switch {
+	case e.snapshotIncomplete:
+		r.State = protocol.RollMarkerUnavailable
+	case e.marker != nil:
+		sum := sha256.Sum256([]byte(coverageKey(e.marker.Coverage)))
+		r.State = protocol.RollMarkerPresent
+		r.Canary = e.marker.Canary
+		r.Completed = e.marker.Completed
+		r.TargetVersion = boundedText(e.marker.TargetVersion, 128)
+		r.CoverageGroup = hex.EncodeToString(sum[:])[:16]
+	case e.rawReservation || (e.dep != nil && e.dep.Annotations[annotationRoll] != "") || (e.claim != nil && e.claim.Annotations[annotationRoll] != ""):
+		r.State = protocol.RollMarkerUnreadable
+	}
+	return r
+}
+
+// boundedText replaces control bytes and truncates to n bytes on a rune boundary.
+func boundedText(s string, n int) string {
+	s = strings.Map(func(r rune) rune {
+		if r < 32 || r == 127 {
+			return ' '
+		}
+		return r
+	}, s)
+	if len(s) > n {
+		s = s[:n]
+		for !utf8.ValidString(s) {
+			s = s[:len(s)-1]
+		}
+	}
+	return s
+}
 
 // PacingOutcomes is replaced on every synchronous reconcile, never used to admit.
 func (m *Materializer) PacingOutcomes() map[string]*protocol.Pacing {
@@ -160,8 +225,14 @@ func (m *Materializer) planRoll(ctx context.Context, desired []protocol.DesiredW
 		if err := m.rollSnapshot(ctx, ns, entries); err != nil {
 			for _, e := range entries {
 				e.blocked = "incomplete deployment/pod/ancestry snapshot"
+				e.snapshotIncomplete = true
 			}
 		}
+	}
+	// Capture the retained evidence before prepareMigrationDrains or any planning
+	// mutation rewrites e.marker (display-only; hibernation entries included).
+	for _, e := range t.entries {
+		e.markerReport = captureRollMarkerReport(e)
 	}
 	// Account for drained held workers using the newer pod snapshot before any
 	// ordinary admission can count them as serving coverage.
@@ -327,6 +398,15 @@ func (m *Materializer) planRoll(ctx context.Context, desired []protocol.DesiredW
 	}
 	m.selectMigrationDrains(ctx, t, desired, observed, pools)
 	m.pacing = t.outcomes
+	markers := make(map[string]*protocol.RollMarker, len(t.entries))
+	for id, e := range t.entries {
+		if e.markerReport == nil {
+			continue
+		}
+		e.markerReport.Blocked = pacingText(e.blocked)
+		markers[id] = e.markerReport
+	}
+	m.rollMarkers = markers
 	return t, order
 }
 
@@ -1510,6 +1590,7 @@ func (m *Materializer) rollSnapshot(ctx context.Context, ns string, entries []*r
 			}
 		} else if e.o.HasDeployment {
 			e.blocked = "deployment missing from snapshot"
+			e.snapshotIncomplete = true
 		}
 		if e.dep != nil && e.marker != nil && e.dep.Spec.Replicas != nil && *e.dep.Spec.Replicas == 0 {
 			e.recovery = true

@@ -111,35 +111,38 @@ func workerDTOFromWorker(w store.Worker, activeRuns int, busy bool, secretLabel,
 	}, workersvc.UpgradeParams{})
 	bindingID, bindingLabel := bindingForMode(w.AnthropicBindMode, w.AnthropicSecretID, secretLabel)
 	return apitypes.WorkerDTO{
-		ManualCordonedAt:      timePtr(w.ManualCordonedAt.Valid, w.ManualCordonedAt.Time),
-		ManualCordonedBy:      uuidPtrValue(w.ManualCordonedBy),
-		ManualCordonedByLabel: textPtrValue(w.ManualCordonedByLabel.Valid, w.ManualCordonedByLabel.String),
-		ManualCordonReason:    textPtrValue(w.ManualCordonReason.Valid, w.ManualCordonReason.String),
-		EffectiveCordoned:     !store.WorkerAcceptsNewIntake(store.Worker{ManualCordonedAt: w.ManualCordonedAt, DrainingSince: w.DrainingSince, MaintenanceFenced: w.MaintenanceFenced, MaintenancePhase: w.MaintenancePhase, HibernationState: w.HibernationState}),
-		HibernationState:      hibernationStateWire(w.HibernationState),
-		HibernationReason:     textPtrValue(w.HibernationReason.Valid, w.HibernationReason.String),
-		HibernationCleanup:    hibernationCleanupDTO(w.CleanupPhase, w.HibernationCleanup, w.HibernationCleanupReason),
-		HibernatedAt:          timePtr(w.HibernatedAt.Valid, w.HibernatedAt.Time),
-		WakeRequestedAt:       timePtr(w.WakeRequestedAt.Valid, w.WakeRequestedAt.Time),
-		WakeError:             textPtrValue(w.WakeError.Valid, w.WakeError.String),
-		UpgradeStatus:         upgradeStatus,
-		UpgradeDetail:         textPtrValue(upgradeDetail != "", upgradeDetail),
-		UpgradeTarget:         upgradeTarget,
-		AnthropicSecretID:     bindingID,
-		AnthropicSecretLabel:  bindingLabel,
-		AnthropicBindMode:     effectiveBindMode(w.AnthropicBindMode, w.AnthropicSecretID),
-		ID:                    w.ID.String(),
-		Name:                  w.Name,
-		Status:                w.Status,
-		Kind:                  w.Kind,
-		HostedSize:            textPtrValue(w.HostedSize.Valid, w.HostedSize.String),
-		Docker:                boolPtrValue(w.DockerEnabled),
-		Ephemeral:             w.Ephemeral,
-		Capabilities:          w.Capabilities,
-		Busy:                  busy,
-		ActiveRuns:            activeRuns,
-		MaxConcurrentRuns:     intPtrValue(w.MaxConcurrentRuns),
-		MaxCrossCheckSlots:    intPtrValue(w.MaxCrossCheckSlots),
+		ManualCordonedAt:         timePtr(w.ManualCordonedAt.Valid, w.ManualCordonedAt.Time),
+		ManualCordonedBy:         uuidPtrValue(w.ManualCordonedBy),
+		ManualCordonedByLabel:    textPtrValue(w.ManualCordonedByLabel.Valid, w.ManualCordonedByLabel.String),
+		ManualCordonReason:       textPtrValue(w.ManualCordonReason.Valid, w.ManualCordonReason.String),
+		EffectiveCordoned:        !store.WorkerAcceptsNewIntake(store.Worker{ManualCordonedAt: w.ManualCordonedAt, DrainingSince: w.DrainingSince, MaintenanceFenced: w.MaintenanceFenced, MaintenancePhase: w.MaintenancePhase, HibernationState: w.HibernationState}),
+		HibernationState:         hibernationStateWire(w.HibernationState),
+		HibernationReason:        textPtrValue(w.HibernationReason.Valid, w.HibernationReason.String),
+		HibernationBlockedReason: hibernationBlockedReasonDTO(w.HibernationBlockedReason),
+		HibernationBlockedSince:  timePtr(w.HibernationBlockedSince.Valid, w.HibernationBlockedSince.Time),
+		HibernationBlockedAt:     timePtr(w.HibernationBlockedAt.Valid, w.HibernationBlockedAt.Time),
+		HibernationCleanup:       hibernationCleanupDTO(w.CleanupPhase, w.HibernationCleanup, w.HibernationCleanupReason),
+		HibernatedAt:             timePtr(w.HibernatedAt.Valid, w.HibernatedAt.Time),
+		WakeRequestedAt:          timePtr(w.WakeRequestedAt.Valid, w.WakeRequestedAt.Time),
+		WakeError:                textPtrValue(w.WakeError.Valid, w.WakeError.String),
+		UpgradeStatus:            upgradeStatus,
+		UpgradeDetail:            textPtrValue(upgradeDetail != "", upgradeDetail),
+		UpgradeTarget:            upgradeTarget,
+		AnthropicSecretID:        bindingID,
+		AnthropicSecretLabel:     bindingLabel,
+		AnthropicBindMode:        effectiveBindMode(w.AnthropicBindMode, w.AnthropicSecretID),
+		ID:                       w.ID.String(),
+		Name:                     w.Name,
+		Status:                   w.Status,
+		Kind:                     w.Kind,
+		HostedSize:               textPtrValue(w.HostedSize.Valid, w.HostedSize.String),
+		Docker:                   boolPtrValue(w.DockerEnabled),
+		Ephemeral:                w.Ephemeral,
+		Capabilities:             w.Capabilities,
+		Busy:                     busy,
+		ActiveRuns:               activeRuns,
+		MaxConcurrentRuns:        intPtrValue(w.MaxConcurrentRuns),
+		MaxCrossCheckSlots:       intPtrValue(w.MaxCrossCheckSlots),
 		// Seed reported_runs to a non-nil [] (PRD #1390 M2c): the DB overlay only runs on the
 		// list/patch surfaces, so this keeps every OTHER WorkerDTO producer (register, heartbeat,
 		// create, hosted-provision) marshaling an array rather than null.
@@ -193,6 +196,23 @@ func hibernationCleanupDTO(phase string, outcome, reason pgtype.Text) *apitypes.
 	}
 }
 
+// workerBlockedReasonBytes bounds hibernation_blocked_reason on the wire.
+const workerBlockedReasonBytes = 64
+
+// hibernationBlockedReasonDTO projects the automatic pass's recorded blocker code: the closed
+// workersvc.Blocked* set passes through unchanged, and anything else (a newer api's code) is
+// sanitized, folded to one line and cut to workerBlockedReasonBytes. Null when unset or empty.
+func hibernationBlockedReasonDTO(t pgtype.Text) *string {
+	if !t.Valid {
+		return nil
+	}
+	s := capUTF8(termsafe.CellText(termsafe.SanitizeBounded(t.String, workerBlockedReasonBytes)), workerBlockedReasonBytes)
+	if s == "" {
+		return nil
+	}
+	return &s
+}
+
 // hibernationStateWire maps the column to the wire enum; an empty value reads as "none".
 func hibernationStateWire(state string) string {
 	if state == "" {
@@ -217,21 +237,25 @@ func workerDTOFromRow(w store.ListWorkersByUserRow, cpVersion, pinnedWorkerVersi
 	rowBindingID, rowBindingLabel := bindingForMode(
 		w.AnthropicBindMode, w.AnthropicSecretID, w.AnthropicSecretLabel.String)
 	return apitypes.WorkerDTO{
-		ManualCordonedAt:      timePtr(w.ManualCordonedAt.Valid, w.ManualCordonedAt.Time),
-		ManualCordonedBy:      uuidPtrValue(w.ManualCordonedBy),
-		ManualCordonedByLabel: textPtrValue(w.ManualCordonedByLabel.Valid, w.ManualCordonedByLabel.String),
-		ManualCordonReason:    textPtrValue(w.ManualCordonReason.Valid, w.ManualCordonReason.String),
-		EffectiveCordoned:     !store.WorkerAcceptsNewIntake(store.Worker{ManualCordonedAt: w.ManualCordonedAt, DrainingSince: w.DrainingSince, MaintenanceFenced: w.MaintenanceFenced, MaintenancePhase: w.MaintenancePhase, HibernationState: w.HibernationState}),
-		HibernationState:      hibernationStateWire(w.HibernationState),
-		HibernationReason:     textPtrValue(w.HibernationReason.Valid, w.HibernationReason.String),
-		HibernationCleanup:    hibernationCleanupDTO(w.CleanupPhase, w.HibernationCleanup, w.HibernationCleanupReason),
-		HibernatedAt:          timePtr(w.HibernatedAt.Valid, w.HibernatedAt.Time),
-		WakeRequestedAt:       timePtr(w.WakeRequestedAt.Valid, w.WakeRequestedAt.Time),
-		WakeError:             textPtrValue(w.WakeError.Valid, w.WakeError.String),
-		RollPacing:            freshPacingJSON(w.RollPacing, w.RollPacingObservedAt, now),
-		UpgradeStatus:         upgradeStatus,
-		UpgradeDetail:         textPtrValue(upgradeDetail != "", upgradeDetail),
-		UpgradeTarget:         upgradeTarget,
+		ManualCordonedAt:         timePtr(w.ManualCordonedAt.Valid, w.ManualCordonedAt.Time),
+		ManualCordonedBy:         uuidPtrValue(w.ManualCordonedBy),
+		ManualCordonedByLabel:    textPtrValue(w.ManualCordonedByLabel.Valid, w.ManualCordonedByLabel.String),
+		ManualCordonReason:       textPtrValue(w.ManualCordonReason.Valid, w.ManualCordonReason.String),
+		EffectiveCordoned:        !store.WorkerAcceptsNewIntake(store.Worker{ManualCordonedAt: w.ManualCordonedAt, DrainingSince: w.DrainingSince, MaintenanceFenced: w.MaintenanceFenced, MaintenancePhase: w.MaintenancePhase, HibernationState: w.HibernationState}),
+		HibernationState:         hibernationStateWire(w.HibernationState),
+		HibernationReason:        textPtrValue(w.HibernationReason.Valid, w.HibernationReason.String),
+		HibernationBlockedReason: hibernationBlockedReasonDTO(w.HibernationBlockedReason),
+		HibernationBlockedSince:  timePtr(w.HibernationBlockedSince.Valid, w.HibernationBlockedSince.Time),
+		HibernationBlockedAt:     timePtr(w.HibernationBlockedAt.Valid, w.HibernationBlockedAt.Time),
+		HibernationCleanup:       hibernationCleanupDTO(w.CleanupPhase, w.HibernationCleanup, w.HibernationCleanupReason),
+		HibernatedAt:             timePtr(w.HibernatedAt.Valid, w.HibernatedAt.Time),
+		WakeRequestedAt:          timePtr(w.WakeRequestedAt.Valid, w.WakeRequestedAt.Time),
+		WakeError:                textPtrValue(w.WakeError.Valid, w.WakeError.String),
+		RollPacing:               freshPacingJSON(w.RollPacing, w.RollPacingObservedAt, now),
+		RollMarker:               rollMarkerDTO(w.Kind, w.RollMarker, w.RollMarkerObservedAt, now),
+		UpgradeStatus:            upgradeStatus,
+		UpgradeDetail:            textPtrValue(upgradeDetail != "", upgradeDetail),
+		UpgradeTarget:            upgradeTarget,
 		// Blocking diagnostics are meaningful for failed statuses; this list path has the join that
 		// carries them at all.
 		UpgradeBlockingKind:      textPtrValue(upgradeStatus == workersvc.UpgradeStatusCapacityBlocked, workersvc.EffectiveBlockingKind(sig)),
@@ -404,6 +428,7 @@ func rollSignalFromAdminRow(w store.ListAllWorkersRow) *workersvc.RollSignal {
 func workerDTOFromAdminRow(row store.ListAllWorkersRow, cpVersion, pinnedWorkerVersion string, now, apiStartedAt time.Time) apitypes.WorkerDTO {
 	dto := workerDTOFromWorker(row.Worker, int(row.ActiveRuns), row.Busy, "", cpVersion, pinnedWorkerVersion, now, apiStartedAt)
 	dto.RollPacing = freshPacingJSON(row.RollPacing, row.RollPacingObservedAt, now)
+	dto.RollMarker = rollMarkerDTO(row.Worker.Kind, row.RollMarker, row.RollMarkerObservedAt, now)
 	dto.ActiveCrossChecks = int(row.ActiveCrossChecks)
 	sig := rollSignalFromAdminRow(row)
 	if sig == nil {
@@ -1118,4 +1143,39 @@ func freshPacingJSON(data []byte, receipt pgtype.Timestamptz, now time.Time) jso
 		return nil
 	}
 	return out
+}
+
+// rollMarkerDTO builds the display-only roll-marker summary for a hosted worker. A
+// missing, stale, future-dated or invalid marker reads as state "unknown"; the receipt
+// time is still exposed so an admin can see when it was last observed.
+func rollMarkerDTO(kind string, data []byte, receipt pgtype.Timestamptz, now time.Time) *apitypes.RollMarkerDTO {
+	if kind != "hosted" {
+		return nil
+	}
+	dto := &apitypes.RollMarkerDTO{State: "unknown"}
+	if receipt.Valid && receipt.InfinityModifier == pgtype.Finite {
+		t := receipt.Time
+		dto.ObservedAt = &t
+	}
+	m := workersvc.ParseFreshRollMarker(data, receipt, now)
+	if m == nil {
+		return dto
+	}
+	dto.State = m.State
+	reservation := m.Reservation
+	dto.Reservation = &reservation
+	dto.Blocked = m.Blocked
+	if m.State == "present" {
+		canary, completed := m.Canary, m.Completed
+		dto.Canary, dto.Completed = &canary, &completed
+		if m.TargetVersion != "" {
+			v := m.TargetVersion
+			dto.TargetVersion = &v
+		}
+		if m.CoverageGroup != "" {
+			g := m.CoverageGroup
+			dto.CoverageGroup = &g
+		}
+	}
+	return dto
 }

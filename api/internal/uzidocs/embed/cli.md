@@ -3103,6 +3103,24 @@ cordon keeps its ` · cordoned (manual)` marker after the state.
 [cache cleanup](hosted-workers.md#cache-cleanup-before-sleep) before sleep). `uzi tui` shows the state too. There is no
 write verb: hibernating and waking are web-only admin actions.
 
+`--json` also carries the automatic pass's last recorded blocker as
+`hibernation_blocked_reason`, `hibernation_blocked_since` and `hibernation_blocked_at`
+(each null when unset; the same scoping as `hibernation_reason`), and, for a hosted worker,
+the display-only `roll_marker`. After the table, `uzi worker list`, `uzi worker get` and
+`uzi admin workers` print, when set:
+
+```text
+Hibernation blocker (last recorded) worker <id>: <label> (since <RFC3339>, last observed <RFC3339>)
+Roll marker worker <id>: <state> · canary · completed · target <v> · group <g> · reservation · blocked: <text> · observed <RFC3339>
+```
+
+The blocker line is the last recorded blocker, not the current state: it is not cleared
+when the worker returns to work. In the roll marker line only the state is always shown;
+`canary`, `completed`, `target`, `group`, `reservation`, `blocked` and `observed` appear
+only when set. See
+[Diagnosing a blocked hibernation or a stuck roll](hosted-workers.md#diagnosing-a-blocked-hibernation-or-a-stuck-roll)
+for the fields and the `unknown`, `unavailable` and `absent` states.
+
 `uzi run get` gains four rows, each emitted only when the server has
 something to say:
 

@@ -15,6 +15,15 @@
         "retained_image": "0.11.6",
         "retained_version": "0.11.6"
       },
+      "roll_marker": {
+        "state": "present",
+        "canary": true,
+        "completed": true,
+        "target_version": "0.11.7",
+        "coverage_group": "0123456789abcdef",
+        "reservation": true,
+        "blocked": "waiting_for_registration"
+      },
       "id": "11111111-1111-1111-1111-111111111111",
       "phase": "stuck",
       "phase_since": "2026-07-26T09:46:00Z",

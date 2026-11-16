@@ -165,10 +165,18 @@ func (h *Handler) ControllerStatus(w http.ResponseWriter, r *http.Request) {
 			dropped++
 			continue
 		}
+		// The marker is display-only: an invalid one is logged (without its raw value)
+		// and discarded, never a reason to drop the entry.
+		marker, err := workersvc.ParseRollMarkerReport(ws.RollMarker)
+		if err != nil {
+			slog.Warn("controller status: ignoring invalid roll marker", "worker_id", ws.ID, "error", err)
+			marker = nil
+		}
 		n, err := h.wsvc.RecordRollHealth(r.Context(), workersvc.RollHealthReport{
 			BlockingKind:         rawBlockingKind(ws, row),
 			Kind:                 req.Kind,
 			Pacing:               pacing,
+			RollMarker:           marker,
 			WorkerID:             id,
 			Phase:                ws.Phase,
 			PhaseSince:           ws.PhaseSince,

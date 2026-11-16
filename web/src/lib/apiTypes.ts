@@ -2849,6 +2849,23 @@ export interface WorkerRunDisk {
   sampled_at: string;
 }
 
+/**
+ * Controller's retained uzi.dev/image-roll evidence for one hosted worker (issue #4385).
+ * state "unknown" means no fresh report (older controller, expired, or not reported, e.g. while
+ * hibernating); "unavailable" means the controller's cluster snapshot failed; "absent" is a
+ * positively observed "no marker". observed_at is the API's receipt time ("last observed").
+ */
+export interface WorkerRollMarker {
+  state: "present" | "unreadable" | "absent" | "unavailable" | "unknown" | (string & {});
+  canary: boolean | null;
+  completed: boolean | null;
+  target_version: string | null;
+  coverage_group: string | null;
+  reservation: boolean | null;
+  blocked: string | null;
+  observed_at: string | null;
+}
+
 // Fresh, read-only controller diagnostics. The Go DTO carries opaque JSON;
 // members are optional for skew and its recorded empty-object contract fixture.
 export interface WorkerRollPacing {
@@ -2895,11 +2912,20 @@ export interface Worker {
   hibernated_at: string | null;
   wake_requested_at: string | null;
   wake_error: string | null;
+  // The automatic hibernation pass's recorded blocker (issue #4385): the workersvc reason code,
+  // when this reason started holding (restarts only when the reason changes) and when it was
+  // last observed. Null when unset; optional for older APIs.
+  hibernation_blocked_reason?: string | null;
+  hibernation_blocked_since?: string | null;
+  hibernation_blocked_at?: string | null;
   // Hibernation cache cleanup (PRD #4206). The key is always sent by a current api, null when
   // no attempt was made; optional here for older APIs and bare fixtures.
   hibernation_cleanup?: WorkerHibernationCleanup | null;
   // Omitted when absent, invalid or older than the API's independent receipt TTL.
   roll_pacing?: WorkerRollPacing;
+  // Controller's retained roll-marker evidence (issue #4385), hosted workers only; absent for
+  // external workers and older APIs. Display-only.
+  roll_marker?: WorkerRollMarker;
   id: string;
   name: string;
   status: string; // "offline" | "online"
