@@ -66,6 +66,15 @@ type rollEntry struct {
 	// admission, canary, slots or coverage: a parked worker is neither a roll
 	// participant nor a coverage provider.
 	hibernation bool
+	// historyDependents marks a hibernation candidate whose completed-canary marker
+	// could not be retired because an in-scope peer still carries roll evidence.
+	historyDependents bool
+	// historyAnchor marks such a candidate (or one whose retirement is unconfirmed) as
+	// a read-only completed-canary closure for its own coverage pool.
+	historyAnchor bool
+	// historyRetireUnknown marks a candidate whose marker retirement write is unconfirmed;
+	// reconcileHibernation writes nothing for it this tick.
+	historyRetireUnknown bool
 }
 type rollTick struct {
 	entries   map[string]*rollEntry
@@ -152,6 +161,7 @@ func (m *Materializer) planRoll(ctx context.Context, desired []protocol.DesiredW
 				e.dep.Spec.Template.Annotations[AnnotationGeneration] != e.target.Spec.Template.Annotations[AnnotationGeneration]
 		}
 	}
+	m.retireHibernationHistory(ctx, t)
 	for _, e := range t.entries {
 		if e.hibernation || e.blocked != "" || e.marker == nil || !e.marker.Completed || e.dep == nil {
 			continue
@@ -181,8 +191,13 @@ func (m *Materializer) planRoll(ctx context.Context, desired []protocol.DesiredW
 		}
 	}
 	pools := map[string][]*rollEntry{}
+	anchors := map[string][]*rollEntry{}
 	for _, e := range t.entries {
 		if e.hibernation {
+			if e.historyAnchor && e.marker != nil {
+				key := coverageKey(e.marker.Coverage)
+				anchors[key] = append(anchors[key], e)
+			}
 			continue
 		}
 		m.releasePressureHold(ctx, t, e)
@@ -266,7 +281,7 @@ func (m *Materializer) planRoll(ctx context.Context, desired []protocol.DesiredW
 	}
 	sort.Strings(keys)
 	for _, key := range keys {
-		m.planPool(ctx, t, pools[key])
+		m.planPool(ctx, t, append(append([]*rollEntry{}, pools[key]...), anchors[key]...))
 	}
 	order := append([]protocol.DesiredWorker{}, desired...)
 	sort.SliceStable(order, func(i, j int) bool {
@@ -388,7 +403,7 @@ func pacingText(s string) *string {
 }
 func (m *Materializer) planPool(ctx context.Context, t *rollTick, pool []*rollEntry) {
 	for _, e := range pool {
-		if e.blocked == "" && m.incarnationComplete(t, e) {
+		if !e.hibernation && e.blocked == "" && m.incarnationComplete(t, e) {
 			m.releaseRollHold(ctx, t, e)
 		}
 	}
@@ -406,6 +421,9 @@ func (m *Materializer) planPool(ctx context.Context, t *rollTick, pool []*rollEn
 			continue
 		}
 		for _, peer := range pool {
+			if peer.hibernation {
+				continue // a read-only anchor: no cleanup, outcome or admission
+			}
 			// Current-incarnation proof retires completed pacing metadata only;
 			// this does not release source custody or mutate protected storage.
 			if peer.blocked == "" && peer.marker != nil && !peer.marker.Canary && m.incarnationComplete(t, peer) {

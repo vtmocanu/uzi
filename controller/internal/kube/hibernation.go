@@ -67,11 +67,14 @@ func refusalFenceValue(op string) string {
 const (
 	refuseRollReservation = "roll_reservation"
 	refuseRollBlocked     = "roll_blocked"
-	refuseDiskPressure    = "disk_pressure"
-	refuseDinDMaintenance = "dind_maintenance"
-	refuseBusy            = "busy"
-	refuseLayoutHeld      = "layout_migration_held"
-	refuseNoRollEvidence  = "roll_evidence_unavailable"
+	// refuseRollCohortPending: the worker's completed canary marker could not be retired
+	// because a peer in its scope still carries roll evidence.
+	refuseRollCohortPending = "roll_cohort_cleanup_pending"
+	refuseDiskPressure      = "disk_pressure"
+	refuseDinDMaintenance   = "dind_maintenance"
+	refuseBusy              = "busy"
+	refuseLayoutHeld        = "layout_migration_held"
+	refuseNoRollEvidence    = "roll_evidence_unavailable"
 )
 
 // hibernationReporter is the api channel for transitions; *apiclient.Client satisfies
@@ -217,6 +220,10 @@ func (m *Materializer) reconcileHibernation(ctx context.Context, w protocol.Desi
 		m.log.Warn("hibernation state without an op id; doing nothing (fail closed)", "worker_id", w.ID)
 		return nil
 	}
+	if e := rollFrom(ctx, w.ID); e != nil && e.historyRetireUnknown {
+		// The historic marker retirement is unconfirmed this tick: write nothing.
+		return nil
+	}
 	switch h.State {
 	case protocol.HibernationPreparing:
 		return m.hibernatePreparing(ctx, w, obs, ns, spec)
@@ -319,8 +326,12 @@ func (m *Materializer) hibernationRefusal(ctx context.Context, w protocol.Desire
 	switch {
 	case e == nil:
 		return refuseNoRollEvidence
-	case e.marker != nil || e.rawReservation || hasOpenReservation(e):
+	case e.rawReservation || hasOpenReservation(e) || (e.claim != nil && e.claim.Annotations[annotationRoll] != ""):
 		return refuseRollReservation
+	case e.marker != nil && e.blocked != "":
+		return refuseRollReservation
+	case e.marker != nil && e.historyDependents:
+		return refuseRollCohortPending
 	case e.blocked != "":
 		return refuseRollBlocked
 	case w.DiskPressure:
@@ -331,8 +342,72 @@ func (m *Materializer) hibernationRefusal(ctx context.Context, w protocol.Desire
 		return refuseLayoutHeld
 	case w.Busy:
 		return refuseBusy
+	case e.marker != nil:
+		return refuseRollReservation
 	}
 	return ""
+}
+
+// retireHibernationHistory retires the completed canary marker of a worker that is
+// preparing to hibernate, so a stale {canary, completed} history does not refuse
+// every sleep attempt. It runs after drift is computed and before the ordinary
+// completed-history retirement in planRoll.
+//
+// Invariant: a worker that successfully sleeps through this path has no roll
+// metadata at sleep completion. Its marker was retired by a verified conditioned
+// write, and a worker carrying a claim mirror is not a candidate, so its later wake
+// cannot resurrect the retired history.
+//
+// The marker is retired only when no in-scope peer (same namespace, hibernating or
+// not) carries roll evidence. A peer is out of scope only when its validated
+// coverage names a different owner and it carries no evidence that contradicts that.
+// Otherwise the candidate keeps its marker (historyDependents) and, when its own
+// coverage matches, anchors its pool as a read-only completed-canary closure.
+func (m *Materializer) retireHibernationHistory(ctx context.Context, t *rollTick) {
+	ids := make([]string, 0, len(t.entries))
+	for id := range t.entries {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		e := t.entries[id]
+		if !e.hibernation || e.w.Hibernation == nil || e.w.Hibernation.State != protocol.HibernationPreparing ||
+			e.blocked != "" || e.marker == nil || !e.marker.Completed || !e.marker.Canary ||
+			e.dep == nil || e.dep.DeletionTimestamp != nil || e.rawReservation ||
+			(e.claim != nil && e.claim.Annotations[annotationRoll] != "") {
+			continue
+		}
+		dependents := false
+		for _, p := range t.entries {
+			if p == e || p.ns != e.ns {
+				continue
+			}
+			c, ok := coverageOf(p.w, p.ns)
+			outOfScope := ok && c.Owner != e.marker.Coverage.Owner && p.blocked == "" && !p.rawReservation &&
+				(p.claim == nil || p.claim.Annotations[annotationRoll] == "") &&
+				(p.marker == nil || p.marker.Coverage.Owner == c.Owner)
+			if outOfScope {
+				continue
+			}
+			if p.marker != nil || p.rawReservation || (p.claim != nil && p.claim.Annotations[annotationRoll] != "") ||
+				hasOpenReservation(p) || p.blocked != "" {
+				dependents = true
+				break
+			}
+		}
+		if dependents {
+			e.historyDependents = true
+		} else if err := m.reserveRoll(ctx, e, nil); err != nil {
+			e.historyRetireUnknown = true
+			t.errors = append(t.errors, fmt.Errorf("worker %s: historic roll marker retirement unconfirmed: %w", e.w.ID, err))
+		}
+		if e.marker != nil && (e.historyDependents || e.historyRetireUnknown) {
+			if c, ok := coverageOf(e.w, e.ns); ok && c.Owner == e.marker.Coverage.Owner && e.marker.Coverage.Lane == e.ns {
+				e.historyAnchor = true
+				e.coverage = e.marker.Coverage
+			}
+		}
+	}
 }
 
 func (m *Materializer) hibernatePreparing(ctx context.Context, w protocol.DesiredWorker, obs reconcile.ObservedWorker, ns string, spec preset.Spec) error {
