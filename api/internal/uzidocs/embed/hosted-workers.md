@@ -270,7 +270,8 @@ threshold before it is considered again.
 
 **Record.** Automatic hibernations write no hibernation audit event. The worker's
 hibernation reason reads "automatic: no run activity for ..." (for example
-"automatic: no run activity for 14d").
+"automatic: no run activity for 14d"); a surplus admission (below) reads
+"automatic: surplus in pool, idle ..." (for example "automatic: surplus in pool, idle 2h").
 
 #### Surplus warm reserve
 
@@ -283,7 +284,8 @@ threshold, `worker_hibernation_surplus_idle_after` (default `2h`, between `15m` 
 `336h`). The pass uses the shorter of that and `worker_hibernation_idle_after`; the
 settings card shows a hint when the surplus threshold is longer. See
 [Admin settings](./admin-settings.md#worker-hibernation). The long
-`worker_hibernation_idle_after` rule still applies as before.
+`worker_hibernation_idle_after` rule still applies, within the same per-pass budget
+and one-change-per-owner limit.
 
 **Equivalence pool.** Workers are interchangeable when they share the same owner,
 template, size, isolated lane, Docker setting, effective capabilities, protocol
@@ -306,8 +308,10 @@ today (see the refusal list above and
 If the api runs with `UZI_ACTIVE_SNAPSHOT_DISABLED`, memory authority is unknown, so
 memory-capable pools are not surplus-hibernated.
 
-**Docker workers.** The [cache cleanup before sleep](#cache-cleanup-before-sleep) runs on
-every surplus sleep, so a re-woken Docker worker starts with a pruned build cache.
+**Docker workers.** A surplus sleep goes through the same
+[cache cleanup before sleep](#cache-cleanup-before-sleep) as any hibernation, so a
+worker advertising `hibernation_cache_prune_v1` whose cleanup completes re-wakes with a
+pruned build cache.
 
 #### Diagnosing a blocked hibernation or a stuck roll
 

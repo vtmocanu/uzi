@@ -232,8 +232,8 @@ func TestDecideSurplus(t *testing.T) {
 	// The candidate must itself be idle past the cutoff, awake and pooled.
 	young := cand
 	young.Anchor = pgconv.Time(cutoff.Add(time.Minute))
-	if d := decideSurplus([]poolRow{young, keeper}, young.ID, poolNow, poolStale, cutoff, true); d.Action != decisionNone {
-		t.Fatalf("a candidate idle less than the threshold: %+v", d)
+	if d := decideSurplus([]poolRow{young, keeper}, young.ID, poolNow, poolStale, cutoff, true); d.Action != decisionNone || d.Why != noneNotCandidate {
+		t.Fatalf("a candidate idle less than the threshold must be refused as not a candidate: %+v", d)
 	}
 	atCutoff := cand
 	atCutoff.Anchor = pgconv.Time(cutoff)
