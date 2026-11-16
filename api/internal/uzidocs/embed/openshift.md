@@ -41,6 +41,53 @@ web:
   whatever sits in front of the Gateway. The web client reconnects and replays missed
   messages after a cut, but a short timeout causes needless churn.
 
+### Gateway request timeouts
+
+The Gateway API leaves the default request timeout to the implementation, and Envoy-based
+gateways commonly default to 15s. That is shorter than the budget web nginx gives an
+input-file upload (`POST /api/v1/files`), so a slow upload can end in a gateway 504. On a
+gateway that supports HTTPRoute timeouts (an Extended Gateway API feature), give that route
+its own budget:
+
+```yaml
+web:
+  httpRoute:
+    timeouts:
+      request: "300s"
+      backendRequest: "300s"
+```
+
+- **Off by default:** with `timeouts` empty, the rendered `HTTPRoute` is unchanged. Set, it
+  adds an `Exact` `/api/v1/files` rule carrying the timeouts you give; every other path,
+  `/api/ws` included, stays on the `PathPrefix /` rule.
+- **Why 300s:** it is sized for a 25 MiB upload on a slow link. Web nginx buffers the whole
+  request body before the api sees any of it, so what 300s bounds depends on when the
+  gateway starts its request timer, which Gateway API leaves to the implementation:
+  - *Timer from request start:* 300s caps the whole transaction, client upload included.
+    A 25 MiB upload at the api's assumed 100 KiB/s floor takes 256s and leaves about 44s
+    for forwarding and api processing; a client averaging under about 85 KiB/s is cut off.
+  - *Timer after the body is received:* the client upload is not counted against
+    `request`, and 300s covers the api's own budget for the buffered body. Its upload
+    deadline is the larger of its request deadline (`UZI_RECOVERY_REQUEST_DEADLINE`, 120s)
+    and the declared size at 100 KiB/s (256s at 25 MiB), plus a 15s response grace: 271s.
+
+  So 300s is not a portable cap on total upload duration. Raising the per-file cap
+  (`UZI_JOB_INPUT_FILE_MAX_BYTES`) needs a larger value.
+
+- **Total, not idle:** web nginx's send, read and client-body timeouts for this route bound
+  inactivity between operations, not total duration, so size the gateway value as a total
+  budget that covers them rather than copying their numbers.
+- **Set `backendRequest` too:** left out, the implementation applies its own backend
+  timeout, which may be shorter than `request`.
+- **Validation:** the render fails on a key other than `request` or `backendRequest`, on a
+  value that is not a Gateway API duration (`300s`, `5m`, `1h30m`), and when
+  `backendRequest` is longer than `request`. Durations compare by value, so `300s` and `5m`
+  are equal, and `request: "0s"` disables that timeout and allows any `backendRequest`.
+- **The general rule:** `web.httpRoute.rootTimeouts` takes the same shape for the
+  `PathPrefix /` rule, which also carries the `/api/ws` WebSocket. Leave it empty unless you
+  need to override the gateway default for all traffic, and check how your implementation
+  applies a request timeout to WebSocket upgrades first.
+
 ## Letting OpenShift assign pod ids
 
 The default `restricted-v2` SCC assigns every pod a UID and fsGroup from its namespace's

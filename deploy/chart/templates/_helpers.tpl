@@ -980,3 +980,47 @@ true
 true
 {{- end -}}
 {{- end -}}
+
+{{/*
+Gateway API Duration (GEP-2257, ^([0-9]{1,5}(h|m|s|ms)){1,4}$) to milliseconds, as a
+decimal string. The caller has already checked the format with uzi.httpRouteTimeouts.
+*/}}
+{{- define "uzi.gatewayDurationMs" -}}
+{{- $ms := 0 -}}
+{{- range regexFindAll "[0-9]+(ms|h|m|s)" . -1 -}}
+{{- $n := atoi (regexFind "^[0-9]+" .) -}}
+{{- $u := regexFind "(ms|h|m|s)$" . -}}
+{{- if eq $u "h" }}{{ $ms = add $ms (mul $n 3600000) }}{{ else if eq $u "m" }}{{ $ms = add $ms (mul $n 60000) }}{{ else if eq $u "s" }}{{ $ms = add $ms (mul $n 1000) }}{{ else }}{{ $ms = add $ms $n }}{{ end -}}
+{{- end -}}
+{{- $ms -}}
+{{- end -}}
+
+{{/*
+Validate one Gateway API HTTPRouteTimeouts value (web.httpRoute.timeouts / rootTimeouts),
+failing the render on: a key other than request/backendRequest, a value that is not a
+Gateway API Duration, or backendRequest longer than request. Durations compare parsed
+(300s == 5m), and a zero request ("0s") disables that timeout, so any backendRequest passes,
+mirroring the HTTPRoute CRD's own rule. Call with (dict "path" "web.httpRoute.timeouts" "t" $t).
+*/}}
+{{- define "uzi.httpRouteTimeouts" -}}
+{{- $path := .path -}}
+{{- $t := .t -}}
+{{- if not (kindIs "map" $t) -}}
+{{- fail (printf "%s must be a map with request and/or backendRequest (Gateway API HTTPRouteTimeouts), got %v" $path $t) -}}
+{{- end -}}
+{{- range $k, $v := $t -}}
+{{- if not (has $k (list "request" "backendRequest")) -}}
+{{- fail (printf "%s.%s is not a Gateway API HTTPRouteTimeouts field: only request and backendRequest are allowed" $path $k) -}}
+{{- end -}}
+{{- if not (and (kindIs "string" $v) (regexMatch "^([0-9]{1,5}(h|m|s|ms)){1,4}$" $v)) -}}
+{{- fail (printf "%s.%s is %v, not a Gateway API Duration (e.g. \"300s\", \"5m\", \"1h30m\"; quote it)" $path $k $v) -}}
+{{- end -}}
+{{- end -}}
+{{- if and (hasKey $t "request") (hasKey $t "backendRequest") -}}
+{{- $req := atoi (include "uzi.gatewayDurationMs" $t.request) -}}
+{{- $be := atoi (include "uzi.gatewayDurationMs" $t.backendRequest) -}}
+{{- if and (ne $req 0) (gt $be $req) -}}
+{{- fail (printf "%s.backendRequest (%s) is longer than %s.request (%s): Gateway API requires backendRequest <= request (a request of \"0s\" disables that timeout)" $path $t.backendRequest $path $t.request) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
