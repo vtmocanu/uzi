@@ -32557,6 +32557,8 @@ describe("M2 actualRunner credential replacement", () => {
         let failingPersist = false, persistFailures = 0, teardownAttempts = 0;
         let persistedCopies = 0, unavailableInspections = 0;
         const usableSaves: import("../src/executor.js").UsableSavedRollout[] = [];
+        const persistBoundObserved = installerBarrier();
+        let persistBoundKind: string | undefined;
         const deliveredPreflightReplies: import("../src/client.js").CodexSwitchPreflightResult[] = [];
         const retryScheduled = installerBarrier();
         let retryArmed = false, retryCallbacks = 0;
@@ -33092,7 +33094,14 @@ describe("M2 actualRunner credential replacement", () => {
               return CodexSessionStore.inspectSession(store, id);
             },
             persist: async () => {
-              if (failingPersist && !inspectFailure) { persistFailures++; throw new Error("injected real rollout persist failure"); }
+              if (failingPersist && !inspectFailure) {
+                persistFailures++;
+                if (publication === "persist-clear-confirmed") {
+                  return CodexSessionStore.persist(source, store,
+                    { bounds: { ...DEFAULT_SESSION_STORE_BOUNDS, maxFileBytes: 1 } });
+                }
+                throw new Error("injected real rollout persist failure");
+              }
               const result = await CodexSessionStore.persist(source, store);
               if (failingPersist) persistedCopies++;
               return result;
@@ -33202,10 +33211,14 @@ describe("M2 actualRunner credential replacement", () => {
               failingPersist = persistFailure;
               try {
                 const saved = await lease.persistRollout(bounds);
+                if (publication === "persist-clear-confirmed") persistBoundKind = saved.kind;
                 if (preflightRefusal || preflightRetry || rootReapUnproven) usableSaves.push(saved);
                 return saved;
               }
-              finally { failingPersist = false; }
+              finally {
+                failingPersist = false;
+                if (publication === "persist-clear-confirmed") persistBoundObserved.resolve();
+              }
             },
             teardown: async bounds => {
               teardownAttempts++;
@@ -33763,6 +33776,10 @@ describe("M2 actualRunner credential replacement", () => {
           assert.deepEqual(executorEntryNowDrain, [{ completed: true, raw: true }],
             "executor suspension begins only after Now joins its raw work");
           if (persistFailure) {
+            if (publication === "persist-clear-confirmed") {
+              await withTimeout(persistBoundObserved.promise, 5000, "real bounded rollout persistence returns");
+              assert.equal(persistBoundKind, "failed", "oversized rollout fails before switch teardown");
+            }
             await withTimeout(switchSettled.promise, 5000, "real pre-teardown persist refusal settles");
             assert.equal(failingPersist, false, "persistRollout injection is restored before continuation or final cleanup");
             assert.equal(persistFailures, inspectFailure ? 0 : 1, "real lease reaches the session-store copy");
