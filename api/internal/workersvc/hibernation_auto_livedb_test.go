@@ -579,9 +579,16 @@ func TestHibernationAutoMatchesManualAdmissionLiveDB(t *testing.T) {
 		w.ID, w.Name, w.TokenHash = uuid.Nil, "", nil
 		w.HibernationOpID, w.HibernationAdmissionPodUid, w.RegisteredPodUid = pgtype.UUID{Bytes: [16]byte{1}, Valid: w.HibernationOpID.Valid}, pgtype.UUID{Bytes: [16]byte{1}, Valid: w.HibernationAdmissionPodUid.Valid}, pgtype.UUID{}
 		w.CleanupOpID = pgtype.UUID{Bytes: [16]byte{1}, Valid: w.CleanupOpID.Valid}
+		// Origin markers are op-bound; the admit origin differs by design (asserted below).
+		w.HibernationOriginOpID = pgtype.UUID{Bytes: [16]byte{1}, Valid: w.HibernationOriginOpID.Valid}
+		w.HibernationAdmitOrigin = pgtype.Text{}
 		w.CleanupRegisterNonce, w.SnapshotRegisterNonce = pgtype.Text{}, pgtype.Text{}
 		w.HibernationReason = pgtype.Text{}
 		return w
+	}
+	if m.HibernationAdmitOrigin.String != AdmitOriginManual || u.HibernationAdmitOrigin.String != AdmitOriginAutoLong ||
+		!originMarkersValid(&m) || !originMarkersValid(&u) {
+		t.Fatalf("admit origins: manual=%v auto=%v", m.HibernationAdmitOrigin, u.HibernationAdmitOrigin)
 	}
 	mn, un := norm(m), norm(u)
 	mv, uv := reflect.ValueOf(mn), reflect.ValueOf(un)

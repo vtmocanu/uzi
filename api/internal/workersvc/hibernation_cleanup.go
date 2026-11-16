@@ -340,7 +340,7 @@ func (s *Service) cleanupServerCheck(ctx context.Context, q *store.Queries, w st
 // withdrawForCleanup moves a preparing row to waking because the cache prune showed the
 // hibernation is no longer safe. A row already waking is left as it is.
 func withdrawForCleanup(w *store.Worker, now time.Time, reason string) {
-	moveToWaking(w, now, "hibernation cache cleanup: "+reason)
+	moveToWaking(w, now, "hibernation cache cleanup: "+reason, WakeOriginSystem)
 }
 
 // ReportHibernationCachePrune applies one agent report in its own transaction, under the worker

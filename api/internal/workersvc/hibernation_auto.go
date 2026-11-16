@@ -245,7 +245,11 @@ func (s *Service) admitAutomatic(ctx context.Context, q *store.Queries, w store.
 	}
 	switch code {
 	case "":
-		admitHibernation(&w, now, reason)
+		origin := AdmitOriginAutoLong
+		if surplus {
+			origin = AdmitOriginAutoSurplus
+		}
+		admitHibernation(&w, now, reason, origin)
 		if _, err := writeHibernation(ctx, q, w); err != nil {
 			return false, false, err
 		}
