@@ -96,8 +96,10 @@ func TestCarryManualGrace(t *testing.T) {
 	}
 }
 
-// TestOriginStampedAtEverySite pins, per call site, the origin the site passes and that the
-// primitive both stamps it against the new op and carries the earlier settle's grace forward first.
+// TestOriginStampedAtEverySite pins, for the origin each call site is meant to pass, that the
+// primitive stamps it against the new op and carries the earlier settle's grace forward first. It
+// calls the primitives directly, so it does not pin which origin a real call site passes: that is
+// TestHibernationOriginsAtCallSitesLiveDB.
 func TestOriginStampedAtEverySite(t *testing.T) {
 	settled := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
 	now := settled.Add(24 * time.Hour)

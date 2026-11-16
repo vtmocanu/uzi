@@ -151,7 +151,7 @@ func TestHibernationOriginsAtCallSitesLiveDB(t *testing.T) {
 		at := a.clock.Add(-399 * 24 * time.Hour).UTC()
 		a.env.exec(`UPDATE workers SET last_wake_settled_at = $2 WHERE id = $1`, id, at)
 		a.mustPass(1)
-		a.hibFx.wantOrigins(id, AdmitOriginAutoLong, "")
+		a.wantOrigins(id, AdmitOriginAutoLong, "")
 		wantCarried(t, a.hibFx, id, at)
 	})
 	t.Run("surplus admission is auto_surplus", func(t *testing.T) {
@@ -160,7 +160,7 @@ func TestHibernationOriginsAtCallSitesLiveDB(t *testing.T) {
 		newer := p.member(poolSurplusIdle - 62*time.Minute)
 		p.pass(older, newer)
 		p.wantStates(map[uuid.UUID]string{older: "preparing", newer: "none"})
-		p.hibFx.wantOrigins(older, AdmitOriginAutoSurplus, "")
+		p.wantOrigins(older, AdmitOriginAutoSurplus, "")
 	})
 }
 
