@@ -32535,6 +32535,8 @@ describe("M2 actualRunner credential replacement", () => {
         let retainedPrepareRootDispatch: RunContext["prepareCodexRootDispatch"];
         let clockOffset = 0;
         const nowEntered = installerBarrier(), nowAborted = installerBarrier(), nowContinue = installerBarrier();
+        const executorSuspensionEntered = installerBarrier();
+        const nowSuspensionEntered = installerBarrier();
         const summaryDisposeEntered = installerBarrier(), summaryDisposeContinue = installerBarrier();
         const summaryRoots: ReturnType<typeof trackedRoot>[] = [];
         let summaryDisposeCalls = 0;
@@ -33157,6 +33159,7 @@ describe("M2 actualRunner credential replacement", () => {
         let reopenAttempts = 0, publishAttempts = 0, restartAttempts = 0;
         const suspend = executor.suspendCodexEpoch.bind(executor);
         executor.suspendCodexEpoch = async bounds => {
+          executorSuspensionEntered.resolve();
           const lease = await suspend(bounds);
           return { ...lease,
             persistRollout: async bounds => {
@@ -33330,6 +33333,7 @@ describe("M2 actualRunner credential replacement", () => {
           }
         };
         const nowProbe = mock.method(NowSummaryController.prototype, "suspendCodexSwitch", function (this: InstanceType<typeof NowSummaryController>, bounds: Parameters<typeof suspendNow>[0]) {
+          nowSuspensionEntered.resolve();
           const lease = suspendNow.call(this, bounds);
           const probe = (stage: string, assignment = false): void => {
             const builds = nowBuilds.length;
@@ -33680,6 +33684,11 @@ describe("M2 actualRunner credential replacement", () => {
             assert.ok(admission.calls.seedRunnerClone > 0, "real admission reached the production seed observer");
           }
           pending = true;
+          const firstSuspension = await withTimeout(Promise.race([
+            nowSuspensionEntered.promise.then(() => "Now suspension"),
+            executorSuspensionEntered.promise.then(() => "executor suspension"),
+          ]), 5000, "M2 Now switch cancellation or executor entry");
+          assert.equal(firstSuspension, "Now suspension", "Now switch suspension precedes executor suspension");
           await withTimeout(nowAborted.promise, 5000, "M2 Now switch cancellation");
           assert.equal(preflights, 0, "preflight waits for the raw A Now factory");
           assert.equal(applies, 0);
