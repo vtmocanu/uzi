@@ -15,7 +15,7 @@ function fixture() {
     initial, signal: controller.signal, now: () => time,
     delay: async (ms, b) => { assert.equal(b.deadline, 10000); waits.push(ms); time += ms; },
     reconcile: async () => authority,
-    probe: async () => ({ kind: "ready", ...initial }),
+    probe: async () => ({ kind: "ready", expectedEpoch: 11, ...initial }),
     confirmFailedClear: async () => { clears++; return true; },
   };
   const run = () => {
@@ -40,7 +40,7 @@ for (const reason of ["policy_refusal", "vault_locked", "baseline_missing", "bas
 }
 test("ready returns current target without clearing", async () => {
   const f = fixture();
-  assert.deepEqual(await f.run(), { kind: "ready", operation: initial });
+  assert.deepEqual(await f.run(), { kind: "ready", expectedEpoch: 11, operation: initial });
   assert.equal(f.counts().clears, 0);
 });
 for (const field of ["claimGeneration", "registerNonce", "opId"] as const) {
@@ -66,7 +66,7 @@ test("six busy observations clear after exact backoffs", async () => {
 });
 test("contention can clear to ready", async () => {
   const f = fixture(); let n = 0;
-  f.options.probe = async () => ++n < 3 ? refusal("credential_busy") : { kind: "ready", ...initial };
+  f.options.probe = async () => ++n < 3 ? refusal("credential_busy") : { kind: "ready", expectedEpoch: 11, ...initial };
   assert.equal((await f.run()).kind, "ready");
   assert.deepEqual(f.waits, [250, 500]); assert.equal(f.counts().clears, 0);
 });
@@ -119,9 +119,9 @@ test("supersession follows authoritative newer op through preflight", async () =
   const newer = { ...initial, opId: "op2", targetSecretId: "target2", revision: 2 };
   f.options.probe = async op => {
     if (++n === 1) { f.authority.pending = newer; return { kind: "superseded", ...newer }; }
-    assert.deepEqual(op, newer); return { kind: "ready", ...newer };
+    assert.deepEqual(op, newer); return { kind: "ready", expectedEpoch: 11, ...newer };
   };
-  assert.deepEqual(await f.run(), { kind: "ready", operation: newer }); assert.equal(f.counts().clears, 0);
+  assert.deepEqual(await f.run(), { kind: "ready", expectedEpoch: 11, operation: newer }); assert.equal(f.counts().clears, 0);
 });
 test("superseded without valid newer pending stops", async () => {
   const f = fixture(); f.options.probe = async () => ({ kind: "superseded", ...initial });
@@ -142,7 +142,7 @@ test("new op cannot inherit five busy observations", async () => {
   f.options.probe = async op => {
     n++;
     if (n === 6) { f.authority.pending = newer; return { kind: "superseded", ...newer }; }
-    if (n === 8) return { kind: "ready", ...op };
+    if (n === 8) return { kind: "ready", expectedEpoch: 11, ...op };
     return { kind: "not_applied", reason: "credential_busy", ...op };
   };
   assert.equal((await f.run()).kind, "ready");
@@ -179,5 +179,14 @@ for (const result of [{ kind: "refused_committed", reason: "credential_changed",
   test("committed or unknown refusal retains A gate", async () => {
     const f = fixture(); f.options.probe = async () => result;
     assert.equal((await f.run()).kind, "retained_stop"); assert.equal(f.counts().clears, 0);
+  });
+}
+
+for (const expectedEpoch of [undefined, 0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+  test(`READY with invalid epoch ${expectedEpoch} retains A`, async () => {
+    const f = fixture();
+    f.options.probe = async () => ({ kind: "ready", expectedEpoch, ...initial } as CodexSwitchPreflightResult);
+    assert.deepEqual(await f.run(), { kind: "retained_stop", reason: "uncertain" });
+    assert.equal(f.counts().clears, 0);
   });
 }

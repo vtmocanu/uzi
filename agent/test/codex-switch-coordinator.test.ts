@@ -23,7 +23,7 @@ function fixture() {
     preserveConversation: false,
     reconcile: async () => ({ ...authority }),
     preflight: {
-      probe: async p => { event("probe"); return { kind: "ready", ...p }; },
+      probe: async p => { event("probe"); return { kind: "ready", expectedEpoch: 11, ...p }; },
       delay: async ms => { time += ms; },
       confirmFailedClear: async () => { event("clear"); authority.pending = undefined; return true; },
     },
@@ -271,13 +271,14 @@ for (const stage of ["registerSecrets", "publish", "restartAndResume"] as const)
     assert.equal(f.holds[0]?.reason, stage === "restartAndResume" ? "initialization_failed" : "apply_uncertain");
   });
 
-test("committed report refusal permits only confirmed ordinary fallback", async () => {
+test("committed report refusal never uses clean stopped settlement", async () => {
   const f = fixture(); const apply = f.o.apply;
   f.o.apply = async (p, b) => { await apply(p, b); throw Error("lost"); };
   f.o.uncertainHold = async p => { assert.equal(p.opId, "op"); f.events.push("journal-refused"); return false; };
   f.o.requestAndConfirmOwnerPause = async () => { f.events.push("ordinary-pause"); return false; };
   assert.equal((await coordinateCodexSwitch(f.o)).kind, "codex_retained_stop");
-  assert.ok(f.events.indexOf("journal-refused") < f.events.indexOf("ordinary-pause"));
+  assert.ok(f.events.includes("journal-refused"));
+  assert.ok(!f.events.includes("ordinary-pause"));
 });
 
 test("preflight reconciliation gets clipped outer bounds", async () => {
@@ -321,7 +322,7 @@ for (const change of ["pending", "owned", "nonce", "generation"] as const)
   test("clear response reconciles " + change + " before any A turn", async () => {
     const f = fixture();
     f.o.preflight.probe = async p => p.opId === "op"
-      ? { kind: "not_applied", reason: "vault_locked", ...p } : { kind: "ready", ...p };
+      ? { kind: "not_applied", reason: "vault_locked", ...p } : { kind: "ready", expectedEpoch: 11, ...p };
     f.o.preflight.confirmFailedClear = async () => {
       f.authority.pending = change === "pending" ? { ...f.o.initial, opId: "new", revision: 2 } : undefined;
       if (change === "owned") f.authority.owned = false;
@@ -355,13 +356,13 @@ for (const barrier of ["before-teardown", "after-teardown", "after-clear"] as co
       deadlines.push(b.deadline);
       if (p.opId === "op") {
         time += 9000;
-        return barrier === "after-clear" ? { kind: "not_applied", reason: "vault_locked", ...p } : { kind: "ready", ...p };
+        return barrier === "after-clear" ? { kind: "not_applied", reason: "vault_locked", ...p } : { kind: "ready", expectedEpoch: 11, ...p };
       }
       assert.equal(b.deadline - time, 1000);
       time += 1000;
       b.signal.throwIfAborted();
       if (time >= b.deadline) throw new Error("deadline");
-      return { kind: "ready", ...p };
+      return { kind: "ready", expectedEpoch: 11, ...p };
     };
     assert.equal((await coordinateCodexSwitch(f.o)).kind,
       barrier === "after-teardown" ? "codex_owner_paused" : "codex_retained_stop");
@@ -398,7 +399,30 @@ for (const mode of ["transport", "busy", "clear-transport"] as const)
 test("deadline exhausted by old probe retains A before teardown", async () => {
   const f = fixture(); let time = 0;
   f.o.now = () => time;
-  f.o.preflight.probe = async p => { time = 10000; return { kind: "ready", ...p }; };
+  f.o.preflight.probe = async p => { time = 10000; return { kind: "ready", expectedEpoch: 11, ...p }; };
   assert.equal((await coordinateCodexSwitch(f.o)).kind, "codex_retained_stop");
   assert.ok(!f.events.includes("reap") && !f.events.includes("apply") && !f.events.includes("A"));
+});
+
+test("successor epoch advance cannot relatch the stopped settlement tuple", async () => {
+  const f = fixture();
+  let probes = 0;
+  let applies = 0;
+  f.o.preflight.probe = async p => ({ kind: "ready", expectedEpoch: ++probes === 1 ? 11 : 12, ...p });
+  f.o.apply = async p => {
+    applies++;
+    f.authority.pending = { ...p, opId: "successor", revision: 2 };
+    return { kind: "superseded" };
+  };
+  f.o.uncertainHold = async () => { f.authority.pending = undefined; return false; };
+  f.o.requestAndConfirmOwnerPause = async tuple => {
+    assert.deepEqual(tuple, { claimGeneration: 7, registerNonce: "nonce", expectedEpoch: 11 });
+    assert.ok(Object.isFrozen(tuple));
+    return false;
+  };
+  assert.equal((await coordinateCodexSwitch(f.o)).kind, "codex_retained_stop");
+  assert.equal(applies, 1);
+  assert.equal(probes, 2);
+  assert.equal(f.events.filter(e => e === "reap").length, 1);
+  assert.ok(!f.events.includes("A") && !f.events.includes("publish") && !f.events.includes("root"));
 });

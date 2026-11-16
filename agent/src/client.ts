@@ -1409,6 +1409,7 @@ export const CREDENTIAL_SWITCH_HOLD_FEATURE = "credential_switch_hold";
 /** Issue #4201: the api serves the in-place credential switch apply route and op-fenced reports. */
 const CREDENTIAL_SWITCH_APPLY_FEATURE = "credential_switch_apply_v1";
 const CODEX_CREDENTIAL_SWITCH_APPLY_FEATURE = "codex_credential_switch_apply_v1";
+const CODEX_SWITCH_STOPPED_FEATURE = "codex_switch_stopped_v1";
 const CODEX_CREDENTIAL_SWITCH_CAPABILITY = "codex_credential_switch_v1";
 /** Issue #4201: the protocol capability a worker advertises to use the in-place apply route. */
 const CREDENTIAL_SWITCH_IN_PLACE_CAPABILITY = "credential_switch_in_place_v1";
@@ -1429,7 +1430,8 @@ export interface CodexSwitchPreflightRequest extends CredentialSwitchApplyReques
 
 /** Server's current coordinates; ready is an observation, never apply authority. */
 export type CodexSwitchPreflightResult =
-  | { kind: "ready" | "superseded" | "fenced"; claimGeneration: number; registerNonce: string; opId: string }
+  | { kind: "ready"; expectedEpoch: number; claimGeneration: number; registerNonce: string; opId: string }
+  | { kind: "superseded" | "fenced"; claimGeneration: number; registerNonce: string; opId: string }
   | { kind: "not_applied" | "refused_committed"; reason: string; claimGeneration: number; registerNonce: string; opId: string }
   | { kind: "uncertain"; detail: string };
 
@@ -1735,6 +1737,7 @@ export class WorkerClient {
   /** Issue #4201: whether THIS registration advertised credential_switch_in_place_v1. */
   private hasInPlaceCredentialSwitchCapability = false;
   private hasCodexCredentialSwitchCapability = false;
+  private hasCodexSwitchStoppedCapability = false;
   /** Issue #3859: set when this registration's api proved (strict-decode 400) it cannot decode
    *  `registration_evidence`. Sticky until the next register(); a heartbeat feature refresh does
    *  not reopen it, which is why it is not simply dropFeature(). */
@@ -2147,6 +2150,7 @@ export class WorkerClient {
     this.hibernationPruneAdvertised = originalCapabilities?.includes("hibernation_cache_prune_v1") ?? false;
     this.hasCredentialSwitchCapability = originalCapabilities?.includes("credential_switch_v1") ?? false;
     this.hasInPlaceCredentialSwitchCapability = originalCapabilities?.includes(CREDENTIAL_SWITCH_IN_PLACE_CAPABILITY) ?? false;
+    this.hasCodexSwitchStoppedCapability = originalCapabilities?.includes(CODEX_SWITCH_STOPPED_FEATURE) ?? false;
     this.hasCodexCredentialSwitchCapability = originalCapabilities?.includes(CODEX_CREDENTIAL_SWITCH_CAPABILITY) ?? false;
     this.hasExactHoldCapability = originalCapabilities?.includes("recovery_held_publication_v2") ?? false;
     this.hasBindinglessHoldCapability = originalCapabilities?.includes("recovery_bindingless_closed_v1") ?? false;
@@ -2201,6 +2205,40 @@ export class WorkerClient {
     return this.hasCodexCredentialSwitchCapability && this.hasFeature(CODEX_CREDENTIAL_SWITCH_APPLY_FEATURE);
   }
 
+  /** Admission requires both apply and stopped settlement negotiation. */
+  supportsCodexSwitchStopped(): boolean {
+    return this.supportsInPlaceCodexCredentialSwitch() &&
+      this.hasCodexSwitchStoppedCapability && this.hasFeature(CODEX_SWITCH_STOPPED_FEATURE);
+  }
+
+  /** One bounded settlement attempt using the admitted tuple, even after feature withdrawal. */
+  async settleCodexSwitchStopped(runId: string, req: {
+    claimGeneration: number; registerNonce: string; expectedEpoch: number;
+  }, signal?: AbortSignal): Promise<{ kind: "confirmed" | "unconfirmed" | "fenced" }> {
+    const { claimGeneration, registerNonce, expectedEpoch } = req;
+    if (this.registerNonce !== registerNonce) return { kind: "fenced" };
+    if (!validGeneration(claimGeneration) || !Number.isSafeInteger(expectedEpoch) || expectedEpoch <= 0 ||
+        !registerNonce || signal?.aborted) return { kind: "unconfirmed" };
+    let res: Response;
+    let raw: Buffer;
+    try {
+      res = await this.fetchRaw("POST", `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/state`, {
+        status: "codex_switch_stopped", claim_generation: claimGeneration,
+        register_nonce: registerNonce, expected_epoch: expectedEpoch,
+      }, this.httpTimeoutMs, signal);
+      raw = await readBoundedBytes(res, APPLY_RESPONSE_MAX_BYTES, true, signal);
+    } catch {
+      return { kind: this.registerNonce !== registerNonce ? "fenced" : "unconfirmed" };
+    }
+    if (this.registerNonce !== registerNonce) return { kind: "fenced" };
+    if (signal?.aborted || res.status !== 200) return { kind: "unconfirmed" };
+    const out = parseJSONRecord(raw.toString("utf8"));
+    const run = out?.run;
+    return { kind: out?.applied === true && out.disposition === "codex_switch_stopped" &&
+      isRecord(run) && run.id === runId && run.claim_generation === claimGeneration &&
+      run.status === "paused" && run.hold_reason === null ? "confirmed" : "unconfirmed" };
+  }
+
   /** One read-only attempt. No response body or auth is retained on failure. */
   async preflightCodexCredentialSwitch(runId: string, req: CodexSwitchPreflightRequest, signal?: AbortSignal): Promise<CodexSwitchPreflightResult> {
     if (!this.supportsInPlaceCodexCredentialSwitch())
@@ -2225,6 +2263,9 @@ export class WorkerClient {
     const keys = ["outcome", "claim_generation", "register_nonce", "op_id"];
     switch (out.outcome) {
       case "ready":
+        return hasExactKeys(out, [...keys, "expected_epoch"]) &&
+          typeof out.expected_epoch === "number" && Number.isSafeInteger(out.expected_epoch) && out.expected_epoch > 0
+          ? { kind: "ready", expectedEpoch: out.expected_epoch, ...coords } : invalid();
       case "superseded":
       case "fenced":
         return hasExactKeys(out, keys) ? { kind: out.outcome, ...coords } : invalid();

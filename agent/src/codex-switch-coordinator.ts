@@ -40,7 +40,7 @@ export interface CodexSwitchCoordinatorOptions {
   apply(operation: CodexSwitchOperation, bounds: SwitchBounds): Promise<LedgerApplyResult>;
   /** Repeating this op-fenced report is the confirmation mechanism; status alone is insufficient. */
   uncertainHold(operation: CodexSwitchOperation, reason: "not_applied_after_teardown" | "apply_uncertain" | "initialization_failed", bounds: SwitchBounds): Promise<boolean>;
-  requestAndConfirmOwnerPause(reason: "not_applied_after_teardown" | "apply_uncertain" | "initialization_failed", bounds: SwitchBounds): Promise<boolean>;
+  requestAndConfirmOwnerPause(tuple: Readonly<{ claimGeneration: number; registerNonce: string; expectedEpoch: number }>, bounds: SwitchBounds): Promise<boolean>;
   registerSecrets(bundle: Readonly<CodexSwitchBundle>, bounds: SwitchBounds): Promise<void>;
   publish(bundle: Readonly<CodexSwitchBundle>, operation: CodexSwitchOperation, bounds: SwitchBounds): Promise<void>;
   /** Create fresh root, login B, then resume savedSessionId, in that order. */
@@ -54,6 +54,7 @@ export interface CodexSwitchCoordinatorOptions {
  * before returning; this coordinator never races or detaches an effect.
  */
 export async function coordinateCodexSwitch(o: CodexSwitchCoordinatorOptions): Promise<CodexCoordinatorOutcome> {
+  let expectedEpoch: number | undefined;
   let teardownBegan = false;
   let reaped = false;
   let stale = false;
@@ -99,7 +100,9 @@ export async function coordinateCodexSwitch(o: CodexSwitchCoordinatorOptions): P
       // A refused op report cannot justify an ordinary pause over a pending operation.
       if (a.pending !== undefined) return outcome("codex_retained_stop");
     } else if (a.pending !== undefined) return outcome("codex_retained_stop");
-    return outcome(await call(() => o.requestAndConfirmOwnerPause(priorAmbiguous ? "apply_uncertain" : holdReason, b)) ? "codex_owner_paused" : "codex_retained_stop");
+    if (!reaped || committed || priorAmbiguous || expectedEpoch === undefined) return outcome("codex_retained_stop");
+    const tuple = Object.freeze({ claimGeneration: o.initial.claimGeneration, registerNonce: o.initial.registerNonce, expectedEpoch });
+    return outcome(await call(() => o.requestAndConfirmOwnerPause(tuple, b)) ? "codex_owner_paused" : "codex_retained_stop");
   }
   try {
     await call(() => o.drainAndSuspend(b));
@@ -160,6 +163,8 @@ export async function coordinateCodexSwitch(o: CodexSwitchCoordinatorOptions): P
         if (pre.kind === "retained_stop" && ["uncertain", "committed"].includes(pre.reason)) holdReason = "apply_uncertain";
         return teardownBegan ? await pause() : outcome("codex_retained_stop");
       }
+      if (expectedEpoch !== undefined && expectedEpoch !== pre.expectedEpoch) return await pause();
+      expectedEpoch ??= pre.expectedEpoch;
       current = Object.freeze({ ...pre.operation });
       const atBarrier = await authority();
       if (!valid(atBarrier.pending) || !same(atBarrier.pending)) continue;

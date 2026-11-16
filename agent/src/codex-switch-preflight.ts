@@ -29,7 +29,7 @@ type SafeReason = typeof reasons[number];
 type StopReason = "cancelled" | "deadline" | "unavailable" | "uncertain" | "clear_unconfirmed" | "committed" | "invalid_pending" | "safety_limit";
 
 export type CodexSwitchPreflightDecision =
-  | { kind: "ready"; operation: CodexSwitchOperation }
+  | { kind: "ready"; expectedEpoch: number; operation: CodexSwitchOperation }
   | { kind: "continued_A"; operation: CodexSwitchOperation; reason: SafeReason }
   | { kind: "retained_stop"; reason: StopReason }
   | { kind: "fenced" };
@@ -116,7 +116,10 @@ export async function coordinateCodexSwitchPreflight(o: CodexSwitchPreflightOpti
       if (requested.opId !== current.opId) continue;
       if (result.kind === "superseded") return stop("invalid_pending");
       if (!exact(result)) return stop("uncertain");
-      if (result.kind === "ready") return { kind: "ready", operation: { ...current } };
+      if (result.kind === "ready") {
+        if (!Number.isSafeInteger(result.expectedEpoch) || result.expectedEpoch <= 0) return stop("uncertain");
+        return { kind: "ready", expectedEpoch: result.expectedEpoch, operation: { ...current } };
+      }
       if (result.kind === "refused_committed") return stop("committed");
       if (result.kind !== "not_applied") return stop("uncertain");
       if (!reasons.includes(result.reason as SafeReason)) return stop("uncertain");

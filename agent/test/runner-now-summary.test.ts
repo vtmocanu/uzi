@@ -337,11 +337,12 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
       }) as typeof setTimeout);
       client.registrationNonce = () => "original-nonce";
       client.supportsInPlaceCodexCredentialSwitch = () => true;
+      client.supportsCodexSwitchStopped = () => true;
       client.getRunOwnership = async () => ({ status: "running", claim_generation: 1, claim_released: false, hold_reason: null });
       const operation = { generation: 1, op_id: "current-op", target_secret_id: "target" };
       client.getInputs = async () => ({ inputs: [], ...(pending ? { credentialSwitch: operation } : {}) });
       client.preflightCodexCredentialSwitch = async () => ({
-        kind: "ready", claimGeneration: 1, registerNonce: "original-nonce", opId: "current-op",
+        kind: "ready", expectedEpoch: 11, claimGeneration: 1, registerNonce: "original-nonce", opId: "current-op",
       });
       client.applyCredentialSwitch = async () => { assert.fail("apply after interruption"); };
       const report = client.reportState.bind(client);
@@ -435,11 +436,12 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
           }) as typeof setTimeout);
           client.registrationNonce = () => "original-nonce";
           client.supportsInPlaceCodexCredentialSwitch = () => true;
+          client.supportsCodexSwitchStopped = () => true;
           client.getRunOwnership = async () => ({ status: "running", claim_generation: 1, claim_released: false, hold_reason: null });
           const operation = { generation: 1, op_id: "current-op", target_secret_id: "target" };
           client.getInputs = async () => ({ inputs: [], ...(pending ? { credentialSwitch: operation } : {}) });
           client.preflightCodexCredentialSwitch = async () => ({
-            kind: "ready", claimGeneration: 1, registerNonce: "original-nonce", opId: "current-op",
+            kind: "ready", expectedEpoch: 11, claimGeneration: 1, registerNonce: "original-nonce", opId: "current-op",
           });
           client.applyCredentialSwitch = async () => {
             pending = false;
@@ -561,12 +563,13 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
       client.hasFeature = name => name === "credential_switch_hold" || feature(name);
       client.registrationNonce = () => "original-nonce";
       client.supportsInPlaceCodexCredentialSwitch = () => outcome !== "missing_negotiation" && !(outcome === "successor_route_after" && pendingId === "successor-op");
+      client.supportsCodexSwitchStopped = () => client.supportsInPlaceCodexCredentialSwitch();
       client.getRunOwnership = async () => ({ status: "running", claim_generation: 1,
         claim_released: outcome === "released_after_clear" && !pending, hold_reason: null });
       client.getInputs = async () => ({ inputs: [], ...(pending ? { credentialSwitch: {
         generation: 1, op_id: pendingId, target_secret_id: pendingTarget,
       } } : {}) });
-      client.requestWorkerPause = async () => { ordinaryPause++; return { applied: false }; };
+      client.settleCodexSwitchStopped = async () => { ordinaryPause++; return { kind: "unconfirmed" }; };
       client.preflightCodexCredentialSwitch = async (_id, request) => {
         probed.push({ opId: request.opId, target: request.targetSecretId });
         assert.equal(request.opId, pendingId);
@@ -580,7 +583,7 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
           if (outcome === "successor_noop_after") { pending = false; return { kind: "superseded", ...coords }; }
           if (outcome === "successor_cycle_after") { pendingId = "current-op"; pendingTarget = "target"; return { kind: "superseded", ...coords }; }
         }
-        return post ? { kind: "ready", ...coords } :
+        return post ? { kind: "ready", expectedEpoch: 11, ...coords } :
           { kind: "not_applied", reason: outcome === "baseline_missing" ? outcome : "policy_refusal", ...coords };
       };
       client.applyCredentialSwitch = async (_id, req, signal) => {
@@ -777,7 +780,7 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
       assert.equal(teardown, post ? 1 : 0);
       assert.equal(uncertainReports, outcome === "ack_after" ? 3 : post && !["unproven", "fenced_after", "successor_fence_after", "successor_noop_after", "newop_after", "successor_teardown_after", "no_op_after", "applied_after", "key_to_sub_after", "applied_key_after", "fresh_after"].includes(outcome) ? 1 : 0);
       assert.deepEqual(heldOps, Array(uncertainReports).fill(ledgerFollow ? "latest-op" : successor && outcome !== "successor_cycle_after" ? "successor-op" : "current-op"));
-      assert.equal(ordinaryPause, outcome === "no_op_after" || outcome === "successor_noop_after" ? 1 : 0);
+      assert.equal(ordinaryPause, outcome === "no_op_after" || outcome === "successor_noop_after" ? 3 : 0);
       assert.equal(heldReports, outcome === "unproven" ? 1 : 0);
       assert.equal(settledReports, outcome === "unproven" ? 1 : 0);
       if (outcome === "budget_after") assert.equal(cleanupBudget, 30_000);

@@ -32577,9 +32577,12 @@ describe("M2 actualRunner credential replacement", () => {
           return registrationNonce;
         };
         client.supportsInPlaceCodexCredentialSwitch = () => true;
+        client.supportsCodexSwitchStopped = () => true;
         const feature = client.hasFeature.bind(client);
         client.hasFeature = name => name === "credential_switch_hold" || feature(name);
-        if (cleanRetainedStop) t.mock.method(client, "requestWorkerPause", async (runId: string, generation: number) => {
+        if (cleanRetainedStop) t.mock.method(client, "settleCodexSwitchStopped", async (runId: string, tuple: { claimGeneration: number; registerNonce: string; expectedEpoch: number }) => {
+          const generation = tuple.claimGeneration;
+          assert.deepEqual(tuple, { claimGeneration: 7, registerNonce: "M2-original-nonce", expectedEpoch: 11 });
           cleanPauseRequests.push({ runId, generation });
           assert.equal(cleanPendingDisappears, true);
           assert.deepEqual(cleanPauseRequests, [{ runId: claim.run_id, generation: 7 }]);
@@ -32589,11 +32592,11 @@ describe("M2 actualRunner credential replacement", () => {
           assert.ok(events.includes("A-effect-disposed"));
           assert.equal(pending, false);
           assert.equal(applies, 0);
-          // The real RPC requests an ordinary pause; SetRunPaused performs the transition.
-          // Keep the server truthfully running until production acknowledges that transition.
-          api.setOwnershipStatus(runId, "running", generation);
+          // The dedicated acknowledgement proves the committed transition.
+          cleanOwnership.status = "paused";
+          api.setOwnershipStatus(runId, "paused", generation);
           events.push("clean-pause-ACK");
-          return { applied: true, status: "running" };
+          return { kind: "confirmed" as const };
         });
         client.getRunOwnership = async () => {
           if (cleanRetainedStop) {
@@ -32624,7 +32627,7 @@ describe("M2 actualRunner credential replacement", () => {
           }
           const reply = targetMismatch ? { kind: "not_applied" as const, reason: "target_mismatch",
             claimGeneration: 7, registerNonce: "M2-original-nonce", opId: "M2-op" }
-            : { kind: "ready" as const, claimGeneration: 7, registerNonce: "M2-original-nonce",
+            : { kind: "ready" as const, expectedEpoch: 11, claimGeneration: 7, registerNonce: "M2-original-nonce",
               opId: publication === "preflight-foreign-op" ? "M2-FOREIGN-op" : "M2-op" };
           if (preflightRefusal || preflightRetry || rootReapUnproven) deliveredPreflightReplies.push(reply);
           return reply;
@@ -33431,7 +33434,7 @@ describe("M2 actualRunner credential replacement", () => {
             assert.equal(preflights, 2);
             assert.deepEqual(preflightRequests, Array.from({ length: 2 }, () => ({ runId: claim.run_id,
               claimGeneration: 7, registerNonce: "M2-original-nonce", opId: "M2-op", targetSecretId: "M2-target" })));
-            assert.deepEqual(deliveredPreflightReplies[1], { kind: "ready", claimGeneration: 7,
+            assert.deepEqual(deliveredPreflightReplies[1], { kind: "ready", expectedEpoch: 11, claimGeneration: 7,
               registerNonce: "M2-original-nonce", opId: "M2-op" });
             assert.equal(deliveredPreflightReplies.length, 2);
             assert.deepEqual(failedClearRequests, []);
@@ -33454,7 +33457,7 @@ describe("M2 actualRunner credential replacement", () => {
             if (usableSaves[0]!.kind === "usable") assert.equal(usableSaves[0]!.sessionId, savedId);
             assert.deepEqual(preflightRequests, [{ runId: claim.run_id, claimGeneration: 7,
               registerNonce: "M2-original-nonce", opId: "M2-op", targetSecretId: "M2-target" }]);
-            assert.deepEqual(deliveredPreflightReplies, [{ kind: "ready", claimGeneration: 7,
+            assert.deepEqual(deliveredPreflightReplies, [{ kind: "ready", expectedEpoch: 11, claimGeneration: 7,
               registerNonce: "M2-original-nonce", opId: "M2-op" }]);
             assert.equal(holdReason, null);
             cleanupContinue.resolve();
@@ -33511,7 +33514,7 @@ describe("M2 actualRunner credential replacement", () => {
             const expectedOwnership = { status: "paused", claim_generation: 7, claim_released: false, hold_reason: null };
             assert.deepEqual(cleanOwnership, expectedOwnership, "ACK changes externally observed fake ownership");
             if (cleanPendingDisappears) {
-              assert.ok(cleanPausedObservations.length > 0, "Runner observes truthful paused ownership after pause ACK");
+              assert.equal(cleanOwnership.status, "paused", "dedicated ACK proves paused ownership");
               for (const observed of cleanPausedObservations) assert.deepEqual(observed, expectedOwnership);
             }
             assert.deepEqual(await client.getRunOwnership(claim.run_id), expectedOwnership);

@@ -371,10 +371,10 @@ describe("Codex switch wire contract", () => {
   });
 
   it("preflight sends explicit target and returns server current coordinates", async () => {
-    const s = await server(() => json(200, { outcome: "ready", claim_generation: 8, register_nonce: "current", op_id: "current-op" }), registration);
+    const s = await server(() => json(200, { outcome: "ready", expected_epoch: 11, claim_generation: 8, register_nonce: "current", op_id: "current-op" }), registration);
     try {
       const got = await (await codexRegistered(s.url)).preflightCodexCredentialSwitch("run/1", { ...REQ, targetSecretId: "target" });
-      assert.deepEqual(got, { kind: "ready", claimGeneration: 8, registerNonce: "current", opId: "current-op" });
+      assert.deepEqual(got, { kind: "ready", expectedEpoch: 11, claimGeneration: 8, registerNonce: "current", opId: "current-op" });
       assert.deepEqual(s.posts, [{ path: "/api/worker/runs/run%2F1/credential-switch/codex/preflight",
         body: { claim_generation: 7, register_nonce: "nonce-1", op_id: "op-1", target_secret_id: "target" } }]);
     } finally { await s.close(); }
@@ -419,6 +419,8 @@ describe("Codex switch wire contract", () => {
   it("strict preflight rejects auth and partial or invalid decisions without leaking", async () => {
     const base = { outcome: "ready", claim_generation: 7, register_nonce: "n", op_id: "op" };
     for (const body of [
+      ...[undefined, null, 0, -1, 1.5, "11", Number.MAX_SAFE_INTEGER + 1].map(expected_epoch => ({ ...base, expected_epoch })),
+      { ...base, expected_epoch: 11, token: SECRET },
       { ...base, codex: subscription }, { ...base, token: SECRET },
       { ...base, claim_generation: -1 }, { ...base, op_id: undefined },
       { ...base, outcome: "applied" }, { ...base, outcome: "not_applied", reason: "" },
@@ -533,4 +535,93 @@ describe("independent Codex switch negotiation", () => {
       } finally { await s.close(); }
     });
   }
+});
+
+describe("Codex stopped settlement", () => {
+  const tuple = Object.freeze({ claimGeneration: 7, registerNonce: "nonce-1", expectedEpoch: 11 });
+  const ack = { applied: true, disposition: "codex_switch_stopped",
+    run: { id: "run/1", status: "paused", claim_generation: 7, hold_reason: null, worker_id: "w" } };
+  const caps = ["codex_credential_switch_v1", "codex_switch_stopped_v1"];
+  const features = ["codex_credential_switch_apply_v1", "codex_switch_stopped_v1"];
+  const cases: Array<[string, Reply, string]> = [
+    ["explicit ack", json(200, ack), "confirmed"],
+    ["status only", json(200, { run: ack.run }), "unconfirmed"],
+    ["not applied", json(200, { ...ack, applied: false }), "unconfirmed"],
+    ["wrong disposition", json(200, { ...ack, disposition: "uncertain" }), "unconfirmed"],
+    ["wrong id", json(200, { ...ack, run: { ...ack.run, id: "other" } }), "unconfirmed"],
+    ["wrong generation", json(200, { ...ack, run: { ...ack.run, claim_generation: 8 } }), "unconfirmed"],
+    ["held", json(200, { ...ack, run: { ...ack.run, hold_reason: "wall" } }), "unconfirmed"],
+    ["missing hold", json(200, { ...ack, run: { id: "run/1", status: "paused", claim_generation: 7 } }), "unconfirmed"],
+    ["ordinary conflict", json(409, ack), "unconfirmed"],
+    ["unsupported", json(400, { error: "invalid request body" }), "unconfirmed"],
+    ["malformed", { status: 200, body: "{" }, "unconfirmed"],
+    ["oversize", { status: 200, body: " ".repeat(16385) }, "unconfirmed"],
+    ["server error", json(500, ack), "unconfirmed"],
+  ];
+  for (const [name, reply, kind] of cases) it(name, async () => {
+    const s = await server(() => reply);
+    try {
+      const c = await registered(s.url);
+      assert.deepEqual(await c.settleCodexSwitchStopped("run/1", tuple), { kind });
+      assert.deepEqual(s.posts, [{ path: "/api/worker/runs/run%2F1/state",
+        body: { status: "codex_switch_stopped", claim_generation: 7, register_nonce: "nonce-1", expected_epoch: 11 } }]);
+    } finally { await s.close(); }
+  });
+
+  for (const stoppedCap of [false, true]) for (const stoppedFeature of [false, true]) {
+    it(`admission requires stopped capability=${stoppedCap} feature=${stoppedFeature}`, async () => {
+      const s = await server(() => json(200, ack), { worker_id: "w", register_nonce: "nonce-1",
+        protocol_features: ["codex_credential_switch_apply_v1", ...(stoppedFeature ? ["codex_switch_stopped_v1"] : [])] });
+      try {
+        const c = await registered(s.url, ["codex_credential_switch_v1", ...(stoppedCap ? ["codex_switch_stopped_v1"] : [])]);
+        assert.equal(c.supportsInPlaceCodexCredentialSwitch(), true);
+        assert.equal(c.supportsCodexSwitchStopped(), stoppedCap && stoppedFeature);
+      } finally { await s.close(); }
+    });
+  }
+
+  it("requires stopped negotiation for admission and preserves admitted settlement after withdrawal", async () => {
+    const registration = { worker_id: "w", register_nonce: "nonce-1", protocol_features: features };
+    const s = await server(() => json(200, ack), registration);
+    try {
+      const c = await registered(s.url, caps);
+      assert.equal(c.supportsCodexSwitchStopped(), true);
+      registration.protocol_features = [];
+      await c.register("t", undefined, undefined, undefined, caps);
+      assert.equal(c.supportsCodexSwitchStopped(), false);
+      assert.deepEqual(await c.settleCodexSwitchStopped("run/1", tuple), { kind: "confirmed" });
+      registration.register_nonce = "nonce-2";
+      await c.register("t", undefined, undefined, undefined, caps);
+      assert.deepEqual(await c.settleCodexSwitchStopped("run/1", tuple), { kind: "fenced" });
+      assert.equal(s.posts.length, 1);
+    } finally { await s.close(); }
+  });
+
+  it("fences a nonce change while the response is pending", async () => {
+    const registration = { worker_id: "w", register_nonce: "nonce-1", protocol_features: features };
+    let finish!: () => void;
+    let arrived!: () => void;
+    const received = new Promise<void>(resolve => { arrived = resolve; });
+    const srv = http.createServer((req, res) => {
+      req.resume();
+      req.on("end", () => {
+        if (req.url === "/api/worker/register") { res.end(JSON.stringify(registration)); return; }
+        finish = () => res.end(JSON.stringify(ack));
+        arrived();
+      });
+    });
+    await new Promise<void>(resolve => srv.listen(0, "127.0.0.1", resolve));
+    try {
+      const c = await registered(`http://127.0.0.1:${(srv.address() as AddressInfo).port}`, caps);
+      const pending = c.settleCodexSwitchStopped("run/1", tuple);
+      await received;
+      registration.register_nonce = "nonce-2";
+      await c.register("t", undefined, undefined, undefined, caps);
+      finish();
+      assert.deepEqual(await pending, { kind: "fenced" });
+    } finally {
+      srv.closeAllConnections();
+      await new Promise<void>(resolve => srv.close(() => resolve()));
+    }
+  });
 });

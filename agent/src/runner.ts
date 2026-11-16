@@ -2874,8 +2874,10 @@ interface RunFlight {
    *  `held`: the server confirmed the switch hold, so the finally joins this executor's owned
    *  operations and then acknowledges the hold settled. `hold_pending`: a report may have applied
    *  without local confirmation, so the same post-join acknowledgement is owed (a server no-op if
-   *  no hold applied). `unproven`: no hold report is outstanding; join without acknowledging. */
-  retainedSwitchSettlement?: "held" | "hold_pending" | "unproven";
+   *  no hold applied). `unproven`: no hold report is outstanding; join without acknowledging.
+   *  `stopped_unconfirmed`: A is reaped, but the captured stopped tuple is not acknowledged;
+   *  retain custody and join without sending a hold-settled acknowledgement. */
+  retainedSwitchSettlement?: "held" | "hold_pending" | "unproven" | "stopped_unconfirmed";
   completedRetainedSuccessor?: RecoveryJournalEntry;
   retainedLocalCustody?: boolean;
   /** Retries spent by discoverRetained on confirmed operational errors; in-memory, per claim. */
@@ -17352,10 +17354,10 @@ export class RunRunner {
               targetSecretId: p.target_secret_id!, revision };
           }
           // Separate reads are not a DB snapshot; preflight/clear supply the final locked fences.
-          return { owned: own.claim_generation === generation && own.claim_released === false &&
+          return { owned: own.claim_generation === generation && own.claim_released === false && own.hold_reason == null &&
               ["running", "awaiting_approval", "awaiting_input", "awaiting_followup"].includes(own.status),
             claimGeneration: own.claim_generation ?? 0, registerNonce: this.client.registrationNonce() ?? "",
-            routeAvailable: this.client.supportsInPlaceCodexCredentialSwitch(),
+            routeAvailable: this.client.supportsCodexSwitchStopped(),
             ledgerAvailable: !!this.credentialSwitchLedger, pending };
         };
         const confirmClear = async (operation: CodexSwitchOperation, reason: string): Promise<boolean> => {
@@ -17374,7 +17376,7 @@ export class RunRunner {
           return await this.runGatedSink(flight, async () => {
             guard();
             if (!claim.secrets.codex || !Number.isSafeInteger(generation) || !generation || generation < 0 ||
-                !nonce || !opts.laneSettled || !this.client.supportsInPlaceCodexCredentialSwitch() ||
+                !nonce || !opts.laneSettled || !this.client.supportsCodexSwitchStopped() ||
                 !this.credentialSwitchLedger || !executor.suspendCodexEpoch) retain();
             const initial = await reconcile();
             if (!initial.owned) throw new StaleClaimError();
@@ -17424,10 +17426,11 @@ export class RunRunner {
             if (decision.kind === "continued_A") return await reopen(decision.operation, decision.reason);
             if (decision.kind === "fenced") throw new StaleClaimError();
             if (decision.kind !== "ready") return retain();
+            const expectedEpoch = decision.expectedEpoch;
             let selected = decision.operation;
             const current = await reconcile();
             if (!current.owned) throw new StaleClaimError();
-            if (current.pending?.opId !== selected.opId || current.registerNonce !== nonce ||
+            if (!current.routeAvailable || current.pending?.opId !== selected.opId || current.registerNonce !== nonce ||
                 current.pending.targetSecretId !== selected.targetSecretId) return retain();
             // Only a confirmed pass starts the separate cleanup/apply/hold budget.
             // The same sink gate and terminal claim nonce remain held.
@@ -17468,17 +17471,38 @@ export class RunRunner {
             };
             const pauseCurrent = async (reason: string): Promise<never> => {
               const latest = await reconcile(true);
-              if (!latest.owned || latest.claimGeneration !== generation || latest.registerNonce !== nonce)
+              if (latest.claimGeneration !== generation || latest.registerNonce !== nonce)
                 throw new StaleClaimError();
-              if (latest.pending) return await ownerHold(latest.pending.opId, reason);
+              if (latest.pending) {
+                if (!latest.owned) throw new StaleClaimError();
+                return await ownerHold(latest.pending.opId, reason);
+              }
+              if (!latest.owned) {
+                if (possibleApply) throw new StaleClaimError();
+                // Private stopped-only replay observation. Never grants B publication authority.
+                const stopped = await effect(() => this.getObservedRunOwnership(flight,
+                  { signal, deadline: Date.now() + remaining() }));
+                if (stopped.status !== "paused" || stopped.claim_generation !== generation ||
+                    stopped.claim_released !== false || stopped.hold_reason != null)
+                  throw new StaleClaimError();
+              }
               if (possibleApply) this.releaseHoldPastPossibleApply(hold, flight, runLog);
               else hold.cancel();
-              const ack = await effect(() => this.client.requestWorkerPause(runId, selected.claimGeneration, signal));
-              if (ack.applied === true) {
-                const own = await effect(() => this.getObservedRunOwnership(flight,
-                  { signal, deadline: Date.now() + remaining() }));
-                if (own.status === "paused" && own.claim_generation === generation &&
-                    own.claim_released === false && own.hold_reason == null) flight.parked = true;
+              // Possible commits require op evidence; a stopped report cannot settle them.
+              if (possibleApply) return await ownerHold(selected.opId, "apply_uncertain");
+              const stoppedTuple = Object.freeze({
+                claimGeneration: generation!, registerNonce: nonce!, expectedEpoch,
+              });
+              // Three serial attempts share the cleanup deadline; every refusal retains the
+              // same tuple. A lost successful response can only settle through an explicit replay ACK.
+              for (let attempt = 0; attempt < 3; attempt++) {
+                const ack = await effect(() => this.client.settleCodexSwitchStopped(runId, stoppedTuple, signal));
+                if (ack.kind === "fenced") throw new StaleClaimError();
+                if (ack.kind === "confirmed") {
+                  flight.parked = true;
+                  flight.retainedSwitchSettlement = undefined;
+                  return retain();
+                }
               }
               return retain();
             };
@@ -17504,6 +17528,7 @@ export class RunRunner {
                 "codex_teardown_unproven", "unverified", { opId: selected.opId }));
               return retain();
             }
+            flight.retainedSwitchSettlement = "stopped_unconfirmed";
             guard();
             // Required Now/executor users drained before preflight, and teardown proved the root gone.
             // Preflight refusal must never close this scope.
@@ -17516,6 +17541,8 @@ export class RunRunner {
             // A refusal stops the chain; A remains reaped throughout.
             for (let attempt = 0; ; attempt++) {
               const beforeApply = await reconcile(true);
+              if (!beforeApply.owned && !possibleApply && !beforeApply.pending)
+                return await pauseCurrent("not_applied_after_teardown");
               if (!beforeApply.owned || beforeApply.claimGeneration !== generation ||
                   beforeApply.registerNonce !== nonce) throw new StaleClaimError();
               if (attempt >= 32 || !beforeApply.routeAvailable || !beforeApply.ledgerAvailable)
@@ -17564,7 +17591,7 @@ export class RunRunner {
                 guard();
                 if (priorAmbiguous) return await pauseCurrent("apply_uncertain");
                 if (successor.kind === "fenced") throw new StaleClaimError();
-                if (successor.kind !== "ready")
+                if (successor.kind !== "ready" || successor.expectedEpoch !== expectedEpoch)
                   return await pauseCurrent(possibleApply ? "apply_uncertain" : "not_applied_after_teardown");
                 if (successor.operation.opId !== selected.opId) {
                   if (seenSuccessors.has(successor.operation.opId) ||
