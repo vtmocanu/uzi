@@ -32472,6 +32472,7 @@ describe("M2 actualRunner credential replacement", () => {
         claim.secrets = { ...claim.secrets, codex: oldClaim as import("../src/protocol.js").ClaimCodexSecrets };
         api.setOwnershipStatus(claim.run_id, "running", 7);
         let pending = false, cancelled = false, applies = 0, hooks = 0, factories = 0, preflights = 0;
+        let baselineProofFinished = publication !== "baseline";
         let pendingOp = "M2-op";
         const forbiddenSuccessorApply = installerBarrier();
         let predecessorFenced = false, applyAcknowledgements = 0;
@@ -32697,7 +32698,7 @@ describe("M2 actualRunner credential replacement", () => {
           if (clearAcknowledged) postAckOwnership.push({ claim_generation: ownership.claim_generation ?? 0, claim_released: ownership.claim_released === true });
           return ownership;
         };
-        client.getInputs = async () => ({ inputs: [], nowSummary: true, ...((cancelled || api.messages(claim.run_id).some(m => m.kind === "progress_note" && m.credential_epoch_ordinal === 1 && String(m.payload.text).startsWith("Inspecting B"))) ? { terminalCancelled: { run_id: claim.run_id, generation: 7 } } : {}),
+        client.getInputs = async () => ({ inputs: [], nowSummary: true, ...((cancelled || (baselineProofFinished && api.messages(claim.run_id).some(m => m.kind === "progress_note" && m.credential_epoch_ordinal === 1 && String(m.payload.text).startsWith("Inspecting B")))) ? { terminalCancelled: { run_id: claim.run_id, generation: 7 } } : {}),
           ...(pending ? { credentialSwitch: { generation: 7, op_id: pendingOp, target_secret_id: "M2-target" } } : {}) });
         client.preflightCodexCredentialSwitch = async (runId, req) => {
           preflights++; events.push("preflight");
@@ -32826,6 +32827,51 @@ describe("M2 actualRunner credential replacement", () => {
             return clone;
           });
         }
+        // Observe production entrypoints and delegate to their current implementations.
+        const allocationCalls = { claimRun: 0, reserveRecoveryCapture: 0, releaseRecoveryCustody: 0, settleRecoveryHold: 0, settleRecoveryHoldLive: 0, createOrAttachRunnerClone: 0, runnerCloneForBranch: 0, seedRunnerClone: 0 };
+        if (publication === "baseline") {
+          const claimRun = client.claimRun.bind(client);
+          t.mock.method(client, "claimRun", (...args: Parameters<typeof claimRun>) => {
+            allocationCalls.claimRun++;
+            return claimRun(...args);
+          });
+          const reserveRecoveryCapture = client.reserveRecoveryCapture.bind(client);
+          t.mock.method(client, "reserveRecoveryCapture", (...args: Parameters<typeof reserveRecoveryCapture>) => {
+            allocationCalls.reserveRecoveryCapture++;
+            return reserveRecoveryCapture(...args);
+          });
+          const releaseRecoveryCustody = client.releaseRecoveryCustody.bind(client);
+          t.mock.method(client, "releaseRecoveryCustody", (...args: Parameters<typeof releaseRecoveryCustody>) => {
+            allocationCalls.releaseRecoveryCustody++;
+            return releaseRecoveryCustody(...args);
+          });
+          const settleRecoveryHold = client.settleRecoveryHold.bind(client);
+          t.mock.method(client, "settleRecoveryHold", (...args: Parameters<typeof settleRecoveryHold>) => {
+            allocationCalls.settleRecoveryHold++;
+            return settleRecoveryHold(...args);
+          });
+          const settleRecoveryHoldLive = client.settleRecoveryHoldLive.bind(client);
+          t.mock.method(client, "settleRecoveryHoldLive", (...args: Parameters<typeof settleRecoveryHoldLive>) => {
+            allocationCalls.settleRecoveryHoldLive++;
+            return settleRecoveryHoldLive(...args);
+          });
+          const createOrAttachRunnerClone = m2Runner.git.createOrAttachRunnerClone.bind(m2Runner.git);
+          t.mock.method(m2Runner.git, "createOrAttachRunnerClone", (...args: Parameters<typeof createOrAttachRunnerClone>) => {
+            allocationCalls.createOrAttachRunnerClone++;
+            return createOrAttachRunnerClone(...args);
+          });
+          const runnerCloneForBranch = m2Runner.git.runnerCloneForBranch.bind(m2Runner.git);
+          t.mock.method(m2Runner.git, "runnerCloneForBranch", (...args: Parameters<typeof runnerCloneForBranch>) => {
+            allocationCalls.runnerCloneForBranch++;
+            return runnerCloneForBranch(...args);
+          });
+          const seedOwner = m2Runner.git as unknown as { seedRunnerClone(...args: unknown[]): Promise<unknown> };
+          const seed = seedOwner.seedRunnerClone.bind(seedOwner);
+          t.mock.method(seedOwner, "seedRunnerClone", (...args: unknown[]) => {
+            allocationCalls.seedRunnerClone++;
+            return seed(...args);
+          });
+        }
         const aEntered = installerBarrier(), bEntered = installerBarrier();
         const publicationStages = crashRecovery
           ? ["before-apply", "apply-reply-lost", "before-publish", "after-publish", "before-prepare", "login", "prepared"] as const
@@ -32927,10 +32973,16 @@ describe("M2 actualRunner credential replacement", () => {
           const result = await reap(ms); events.push("A-reaped"); return result;
         };
         const launch = rig.deps.launchEffectRoot!;
+        const launchProvider = rig.deps.launchProviderRoot!;
+        const providerAdmissions: { cwd: string; ownedDataRoot: string }[] = [];
         let effects = 0;
         const disposedEffects = new Set<number>();
         const adoptedDestinations: string[] = [];
         rig.deps = { ...rig.deps,
+          launchProviderRoot: async (spec, mode) => {
+            providerAdmissions.push({ cwd: spec.cwd, ownedDataRoot: spec.ownedDataRoot });
+            return launchProvider(spec, mode);
+          },
           wireFileop: () => { const handle = fakeFileopHandle(); fileops.push(handle); return handle.handle; },
           launchEffectRoot: async (...args) => {
             const root = await launch(...args), epoch = effects++;
@@ -33389,6 +33441,8 @@ describe("M2 actualRunner credential replacement", () => {
           claimGeneration: number;
           executor: typeof executor;
           worktreePath?: string;
+          attemptId?: string;
+          runnerClone?: { path: string; attemptId?: string };
           operationScope?: object;
           parked: boolean;
           keepGuardedInventoryOpen: boolean;
@@ -33402,6 +33456,17 @@ describe("M2 actualRunner credential replacement", () => {
         const flightBuilder = runner as unknown as { buildFlight(...args: unknown[]): ObservedFlight };
         const buildFlight = flightBuilder.buildFlight;
         let actualFlight: ObservedFlight | undefined;
+        const runFlights: ObservedFlight[] = [];
+        let admission: { flight: ObservedFlight; generation: number; worktree: string; attemptId?: string;
+          clone?: ObservedFlight["runnerClone"]; cloneAttemptId?: string; directory: string; members: string[];
+          calls: typeof allocationCalls; flightCount: number; reportCount: number;
+          custody: { parked: boolean; keepGuardedInventoryOpen: boolean; preserveRecoveryClone: boolean;
+            preserveSession: boolean; retainedLocalCustody: boolean; policyHold?: { outcomeId: string } } } | undefined;
+        const custodySnapshot = (flight: ObservedFlight) => ({
+          parked: flight.parked, keepGuardedInventoryOpen: flight.keepGuardedInventoryOpen,
+          preserveRecoveryClone: flight.preserveRecoveryClone, preserveSession: flight.preserveSession,
+          retainedLocalCustody: flight.retainedLocalCustody, policyHold: flight.policyHold,
+        });
         let resumeFenceArmed = false;
         const preserveReleases: { messageSeq: number; currentSeq: number }[] = [];
         const preserveSettlements: string[] = [];
@@ -33418,6 +33483,7 @@ describe("M2 actualRunner credential replacement", () => {
         }
         const flightProbe = mock.method(flightBuilder, "buildFlight", function (this: typeof flightBuilder, ...args: unknown[]) {
           const flight = buildFlight.apply(this, args);
+          if (flight.runId === claim.run_id) runFlights.push(flight);
           if (flight.runId === claim.run_id && flight.claimGeneration === claim.claim_generation &&
               flight.executor === executor) {
             assert.equal(actualFlight, undefined, "capture exactly one matching real flight");
@@ -33521,6 +33587,21 @@ describe("M2 actualRunner credential replacement", () => {
           }
           await triggerNow("A");
           await withTimeout(nowEntered.promise, 5000, "M2 active A Now factory");
+          if (publication === "baseline") {
+            assert.ok(actualFlight);
+            assert.equal(actualFlight.worktreePath, worktree);
+            const directory = path.dirname(actualFlight.worktreePath);
+            const runnerRoot = (m2Runner.git as unknown as { runnerRoot: string }).runnerRoot;
+            assert.equal(path.dirname(directory), path.resolve(runnerRoot), "snapshot the actual runner repo directory");
+            admission = { flight: actualFlight, generation: actualFlight.claimGeneration, worktree,
+              attemptId: actualFlight.attemptId, clone: actualFlight.runnerClone,
+              cloneAttemptId: actualFlight.runnerClone?.attemptId, directory,
+              members: (await fs.readdir(directory)).sort(), calls: { ...allocationCalls },
+              flightCount: runFlights.length, reportCount: reports.length, custody: custodySnapshot(actualFlight) };
+            assert.ok(admission.calls.createOrAttachRunnerClone > 0, "real admission reached the clone observer");
+            assert.ok(admission.calls.runnerCloneForBranch > 0, "real admission reached the branch clone observer");
+            assert.ok(admission.calls.seedRunnerClone > 0, "real admission reached the production seed observer");
+          }
           pending = true;
           await withTimeout(nowAborted.promise, 5000, "M2 Now switch cancellation");
           assert.equal(preflights, 0, "preflight waits for the raw A Now factory");
@@ -34681,6 +34762,39 @@ describe("M2 actualRunner credential replacement", () => {
           await withTimeout(bEntered.promise, 5000, "M2 B turn").catch(error => {
             throw new Error(JSON.stringify({ events, applies, hooks, diagnostics: diagnostics.lines, messages: api.messages(claim.run_id) }), { cause: error });
           });
+          if (publication === "baseline") {
+            await withTimeout(Promise.all(triggers), 5000, "B ordinary work before allocation proof");
+            assert.ok(admission);
+            assert.equal(bRootObserved, true, "ordinary B work precedes the allocation proof");
+            assert.ok(bRootPrepares > 0);
+            assert.ok(bRootChecks > 0);
+            assert.equal(actualFlight, admission.flight);
+            assert.equal(runFlights.length, admission.flightCount, "no new flight at any generation/executor");
+            assert.deepEqual(runFlights, [admission.flight]);
+            assert.equal(actualFlight!.claimGeneration, admission.generation);
+            assert.equal(actualFlight!.claimGeneration, 7);
+            assert.equal(actualFlight!.worktreePath, admission.worktree);
+            assert.equal(context.worktreePath, admission.worktree);
+            assert.equal(actualFlight!.attemptId, admission.attemptId);
+            assert.equal(actualFlight!.runnerClone, admission.clone);
+            assert.equal(actualFlight!.runnerClone?.attemptId, admission.cloneAttemptId);
+            assert.equal(actualFlight!.runnerClone?.path, admission.worktree);
+            assert.deepEqual(custodySnapshot(actualFlight!), admission.custody, "same custody state before cleanup");
+            assert.deepEqual((await fs.readdir(admission.directory)).sort(), admission.members,
+              "no new attempt directory in the actual runner repo directory");
+            assert.deepEqual(allocationCalls, admission.calls,
+              "no clone seed, claim, custody reservation/release or hold settlement during switch");
+            assert.ok(!reports.slice(admission.reportCount).some(status =>
+              status.startsWith("credential_switch") || ["queued", "claimed", "paused"].includes(status)),
+              "no release/reclaim/hold transition before terminal cleanup");
+            assert.deepEqual(providerAdmissions.map(entry => entry.cwd), [admission.worktree, admission.worktree],
+              "actual A and B provider launch seams receive the same worktree");
+            assert.notEqual(providerAdmissions[0]!.ownedDataRoot, providerAdmissions[1]!.ownedDataRoot,
+              "B provider uses a distinct owned HOME root");
+            assert.equal(adoptedDestinations.length, 2);
+            assert.notEqual(adoptedDestinations[0], adoptedDestinations[1]);
+            baselineProofFinished = true;
+          }
           await withTimeout(running, 5000, "M2 B usage and ordinary cancellation");
           await Promise.all(triggers);
           assert.equal(bRootObserved, true, "actual B root dispatch reached the first post-finish work turn");
