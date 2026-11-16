@@ -244,21 +244,12 @@ func TestFloorDemotesFiveHourExhaustion(t *testing.T) {
 	}
 }
 
-// TestFloorDemotesSevenDayOnlyExhaustion: the 7-day window is at 100% with its reset
-// ahead while the five-hour window (also 100%, reset already past) binds resetKey.
-// Exhaustion is tested per window, not through the binding-window choice.
+// TestFloorDemotesSevenDayOnlyExhaustion: only the 7-day window is at 100% (reset
+// ahead, the soonest binding reset); the five-hour window is below 100%.
 func TestFloorDemotesSevenDayOnlyExhaustion(t *testing.T) {
-	a := staleReading(1, i16(100), i16(100), at(-time.Minute), at(10*time.Hour))
+	a := staleReading(1, i16(90), i16(100), at(time.Hour), at(10*time.Hour))
 	b := staleReading(2, i16(30), i16(60), at(3*time.Hour), at(50*time.Hour))
 	if sid, ok := Floor([]Candidate{a, b}, uuid.Nil, now); !ok || sid != id(2) {
-		t.Fatalf("Floor = (%v, %v), want (%v, true) — a past five-hour reset does not clear a future "+
-			"weekly one", sid, ok, id(2))
-	}
-	// Same shape with the weekly reset only a minute out: A's binding (five-hour)
-	// reset is in the past, the soonest of all, so only the demotion saves B.
-	a2 := staleReading(1, i16(100), i16(100), at(-time.Minute), at(time.Minute))
-	b2 := staleReading(2, i16(30), i16(60), at(3*time.Hour), at(50*time.Hour))
-	if sid, ok := Floor([]Candidate{a2, b2}, uuid.Nil, now); !ok || sid != id(2) {
 		t.Fatalf("Floor = (%v, %v), want (%v, true)", sid, ok, id(2))
 	}
 }
@@ -313,9 +304,8 @@ func TestFloorResetBoundariesNotDemoted(t *testing.T) {
 func TestFloorAllExhaustedStillPicks(t *testing.T) {
 	a := staleReading(1, i16(0), i16(100), nil, at(40*time.Hour))
 	b := staleReading(2, i16(0), i16(100), nil, at(20*time.Hour)) // soonest ⇒ tieLess winner
-	c := staleReading(3, i16(100), i16(50), at(time.Hour), at(60*time.Hour))
-	c.FiveHourPct, c.SevenDayPct = i16(100), i16(100)
-	c.SevenResetsAt = at(30 * time.Hour) // binding is five-hour (equal pct ⇒ five), reset +1h ⇒ soonest
+	// Both windows at 100%; equal pct ⇒ five-hour binds, reset +1h ⇒ the soonest.
+	c := staleReading(3, i16(100), i16(100), at(time.Hour), at(30*time.Hour))
 	sid, ok := Floor([]Candidate{a, b, c}, uuid.Nil, now)
 	if !ok {
 		t.Fatal("Floor ok = false over an all-exhausted pool; the last resort must still return a token")
@@ -340,26 +330,31 @@ func TestFloorExcludeLeavesOnlyExhausted(t *testing.T) {
 }
 
 // TestFloorOrderIndependentAcrossGroups: a fixture mixing exhausted and non-exhausted
-// tokens, with collisions inside each group, picks the same id under any permutation.
+// tokens, with an equal-reset collision inside EACH group, picks the same id under
+// any permutation. The exhausted tokens hold the soonest resets, so tieLess alone
+// would pick token 1; the grouping must pick token 3 (usable, ties with 4 on the
+// reset and wins on id).
 func TestFloorOrderIndependentAcrossGroups(t *testing.T) {
 	shared := at(2 * time.Hour)
 	cands := []Candidate{
-		staleReading(1, i16(0), i16(100), nil, at(time.Hour)),                 // exhausted, soonest
-		staleReading(2, i16(100), i16(10), shared, at(90*time.Hour)),          // exhausted (5h)
-		staleReading(3, i16(0), i16(70), nil, shared),                         // usable
-		staleReading(4, i16(0), i16(70), nil, shared),                         // usable, same reset ⇒ id leg
-		staleReading(5, nil, nil, nil, nil),                                   // unmeasured
-		staleReading(6, i16(100), i16(100), at(-time.Hour), at(-time.Minute)), // 100% but both resets past
+		staleReading(1, i16(0), i16(100), nil, at(time.Hour)),        // exhausted, soonest
+		staleReading(7, i16(0), i16(100), nil, at(time.Hour)),        // exhausted, same reset ⇒ id leg
+		staleReading(2, i16(100), i16(10), shared, at(90*time.Hour)), // exhausted (5h), same reset as 3/4
+		staleReading(3, i16(0), i16(70), nil, shared),                // usable ⇒ the pick
+		staleReading(4, i16(0), i16(70), nil, shared),                // usable, same reset ⇒ id leg
+		staleReading(5, nil, nil, nil, nil),                          // unmeasured
+		staleReading(6, i16(100), i16(100), nil, nil),                // 100% but no reset ⇒ not demoted, +∞
 	}
 	want, ok := Floor(cands, uuid.Nil, now)
 	if !ok {
 		t.Fatal("baseline Floor found nothing")
 	}
-	if !knownExhausted(cands[0], now) || !knownExhausted(cands[1], now) {
-		t.Fatal("fixture: tokens 1 and 2 must be known-exhausted")
+	if !knownExhausted(cands[0], now) || !knownExhausted(cands[1], now) || !knownExhausted(cands[2], now) {
+		t.Fatal("fixture: tokens 1, 7 and 2 must be known-exhausted")
 	}
-	if knownExhausted(pickOf(cands, want), now) {
-		t.Fatalf("Floor picked known-exhausted %v while usable tokens exist", want)
+	if want != id(3) {
+		t.Fatalf("Floor = %v, want %v — the exhausted tokens 1/7/2 must be demoted behind the usable ones",
+			want, id(3))
 	}
 	rng := rand.New(rand.NewSource(4405)) //nolint:gosec // G404: deterministic seed; asserting order independence, not security
 	for i := 0; i < 200; i++ {
@@ -370,14 +365,4 @@ func TestFloorOrderIndependentAcrossGroups(t *testing.T) {
 			t.Fatalf("permutation %d changed Floor: (%v,%v) != (%v,true)", i, got, gotOK, want)
 		}
 	}
-}
-
-// pickOf returns the candidate with the given id.
-func pickOf(cands []Candidate, sid uuid.UUID) Candidate {
-	for _, c := range cands {
-		if c.SecretID == sid {
-			return c
-		}
-	}
-	return Candidate{}
 }
