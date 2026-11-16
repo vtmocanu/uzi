@@ -310,8 +310,22 @@ test("runner human revise keeps the original phase context without a premature R
   } finally { await f.memory.stop(); }
 });
 
-for (const verdict of ["empty", "capture_failure", "ambiguous", "rotated", "deadline"] as const) {
-  test(`runner exhausted memory ${verdict}: retained owner hold keeps clone/session and never reports model failure`, async () => {
+const exhaustedCases = [
+  ...(["empty", "capture_failure", "ambiguous", "rotated", "deadline"] as const)
+    .map(verdict => ({ verdict, slowRemediationMs: 0 })),
+  { verdict: "deadline" as const, slowRemediationMs: 230 },
+];
+for (const { verdict, slowRemediationMs } of exhaustedCases) {
+  test(`runner exhausted memory ${verdict}${slowRemediationMs ? " (slow remediation control)" : ""}: retained owner hold keeps clone/session and never reports model failure`, async t => {
+    if (slowRemediationMs) {
+      // A loaded host can make the pre-executor clone remediation read slow; it must not consume the narrow hold budget.
+      const target = git as unknown as { remediationRestrictionFactsUnderLock: (...args: unknown[]) => Promise<unknown> };
+      const real = target.remediationRestrictionFactsUnderLock.bind(target);
+      t.mock.method(target, "remediationRestrictionFactsUnderLock", async (...args: unknown[]) => {
+        await new Promise(resolve => setTimeout(resolve, slowRemediationMs));
+        return real(...args);
+      });
+    }
     const f = await setup(1);
     const monitoring = f.memory.run();
     let delivered = false, prepared = false, captureAttempts = 0, captureAttemptsAtPark = -1;
@@ -324,6 +338,7 @@ for (const verdict of ["empty", "capture_failure", "ambiguous", "rotated", "dead
       if (body.recovery_cause === "worker_memory_pressure") captureAttemptsAtPark = captureAttempts;
     });
     const transportRescue = new AbortController();
+    let teardownStartedAt: number | undefined;
     let rescueTimer: ReturnType<typeof setTimeout> | undefined;
     fs.writeFileSync(homeDir + "/session-proof", "original session");
     const executor: Executor = {
@@ -335,6 +350,10 @@ for (const verdict of ["empty", "capture_failure", "ambiguous", "rotated", "dead
         assert.equal(fs.existsSync(homeDir + "/session-proof"), true);
       }),
       run: async ctx => {
+        // The 1500 ms oracle bounds the memory teardown under the narrow hold budget. Launch remediation before the
+        // executor now runs under the generous boundary budget (and the slow-remediation control delays it), so the
+        // teardown clock starts at executor entry, before the pressure trigger.
+        teardownStartedAt = performance.now();
         const recoveryOperation = git.withRecoveryOperation.bind(git);
         git.withRecoveryOperation = (signal, deadline, action) => recoveryOperation(signal, deadline,
           ownedSignal => captureScope.run({ ownerCapture: false }, () => action(ownedSignal)));
@@ -370,8 +389,10 @@ for (const verdict of ["empty", "capture_failure", "ambiguous", "rotated", "dead
       const started = performance.now();
       await runnerWith(() => ({ executor, homeDir }), fakeGitlab().gitlab, undefined, undefined,
         { memoryRuntime: f.memory,
-          codexBoundaryDeadlineMs: verdict === "deadline" ? deadlineBudgetMs : positiveCaptureBudgetMs }).execute(f.claim);
-      if (verdict === "deadline") assert.ok(performance.now() - started < deadlineElapsedBoundMs,
+          // Only the memory hold is narrowed: launch remediation rounds keep the generous boundary budget.
+          codexBoundaryDeadlineMs: positiveCaptureBudgetMs,
+          ...(verdict === "deadline" ? { memoryHoldDeadlineMs: deadlineBudgetMs } : {}) }).execute(f.claim);
+      if (verdict === "deadline") assert.ok(performance.now() - (teardownStartedAt ?? started) < deadlineElapsedBoundMs,
         "memory teardown must finish within 1500ms, well before the 120000ms test timeout");
       assert.equal(delivered, true, "matching pressure tool result delivered");
       assert.equal(fs.existsSync(homeDir + "/session-proof"), true, "memory preservation integration must keep original session");
@@ -678,7 +699,9 @@ const memoryCloseBudgetMs = 5000;
 
 // Probe: expiry timers are captured instead of armed, and a held tail-segment write is released only after a
 // SIMULATED elapsed point (not a real delay) so the budget outcome is deterministic.
-type TailProbe = { simulatedMs: number; expectDurable: boolean };
+// slowPreCloseMs injects a loaded-host interleaving: the executor reaches close() that long after the hold, and
+// every non-segment outbox write is slowed by the same amount.
+type TailProbe = { simulatedMs: number; expectDurable: boolean; slowPreCloseMs?: number };
 
 async function runMemoryCloseTail(fail: boolean, budget: number, probe?: TailProbe) {
   const root = memoryOutboxRoot();
@@ -687,7 +710,10 @@ async function runMemoryCloseTail(fail: boolean, budget: number, probe?: TailPro
   const gateReached = new Promise<void>(resolve => { reached = resolve; });
   const gateOpen = new Promise<void>(resolve => { release = resolve; });
   const outbox = memoryOutbox(root, fail, probe ? async context => {
-    if (context.kind !== "segment") return;
+    if (context.kind !== "segment") {
+      if (probe.slowPreCloseMs) await new Promise(resolve => setTimeout(resolve, probe.slowPreCloseMs));
+      return;
+    }
     gateHits++;
     reached();
     await gateOpen;
@@ -698,17 +724,26 @@ async function runMemoryCloseTail(fail: boolean, budget: number, probe?: TailPro
   let original: { workerMemory?: { feedback: Map<string, { operation?: Promise<boolean> }>;
     tailPreservation?: Promise<boolean>; tailDurable?: boolean; closing?: Promise<void> };
     retainedLocalCustody?: boolean; batcher: MessageBatcher } | undefined;
+  let runner: ReturnType<typeof runnerWith> | undefined;
   const executor: Executor = { run: async ctx => {
     const command = enroll(ctx);
     original = command.captured.flight as typeof original;
     client.postMessages = async () => { throw new Error("offline before spill threshold"); };
     f.pressure(950);
     await command.captured.commands.watchOutcome(command.entry);
+    if (probe?.slowPreCloseMs) await new Promise(resolve => setTimeout(resolve, probe.slowPreCloseMs));
     // The feedback/capture signal may already be expired: cleanup gets its own budget.
     const closeOriginal = () => original!.batcher.close(AbortSignal.abort(new Error("prior boundary expired")));
     let closed: Promise<void>;
     if (!probe) closed = closeOriginal();
     else {
+      // The hold above ran under the generous fixture budget, so a loaded host cannot make the runner abandon this
+      // executor and close the feed itself with a real timer. Only the close budget is narrowed to the probed
+      // value. Production never splits the hold budget from the close budget; this test-only split reaches the
+      // runner's private field and the assertion keeps it from silently drifting.
+      assert.equal((runner as unknown as { memoryHoldDeadlineMs: number }).memoryHoldDeadlineMs, memoryCloseBudgetMs,
+        "private close-budget field exists");
+      (runner as unknown as { memoryHoldDeadlineMs: number }).memoryHoldDeadlineMs = budget;
       // The runner arms its expiry synchronously inside close(): capture it and freeze the clock for that window only.
       const realTimeout = AbortSignal.timeout, realNow = Date.now, fixed = realNow();
       (AbortSignal as { timeout: (ms: number) => AbortSignal }).timeout = ms => {
@@ -731,8 +766,9 @@ async function runMemoryCloseTail(fail: boolean, budget: number, probe?: TailPro
     release();
   }) : undefined;
   try {
-    await runnerWith(() => ({ executor }), fakeGitlab().gitlab, undefined, undefined,
-      { memoryRuntime: f.memory, outbox, codexBoundaryDeadlineMs: budget }).execute(f.claim);
+    runner = runnerWith(() => ({ executor }), fakeGitlab().gitlab, undefined, undefined,
+      { memoryRuntime: f.memory, outbox, codexBoundaryDeadlineMs: probe ? memoryCloseBudgetMs : budget });
+    await runner.execute(f.claim);
     await driver;
     const memory = original!.workerMemory!;
     await bounded(memory.closing as Promise<void>, "memory closing");
@@ -785,6 +821,11 @@ for (const { budget, expectDurable } of [{ budget: memoryCloseBudgetMs, expectDu
     await runMemoryCloseTail(false, budget, { simulatedMs: 250, expectDurable });
   });
 }
+
+test("runner memory close tail probe: budget=200 at simulated 250 ms (slow pre-close control)", async () => {
+  // Same probe with the executor reaching close() 250 ms late and non-segment outbox writes slowed by 250 ms.
+  await runMemoryCloseTail(false, 200, { simulatedMs: 250, expectDurable: false, slowPreCloseMs: 250 });
+});
 
 for (const primaryError of [new Error("exact owner failure"), undefined]) {
   test(`execution owner forwards exact primary rejection with pending completion error=${primaryError !== undefined}`, async () => {
