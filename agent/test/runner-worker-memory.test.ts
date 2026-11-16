@@ -354,6 +354,9 @@ for (const { verdict, slowRemediationMs } of exhaustedCases) {
         // executor now runs under the generous boundary budget (and the slow-remediation control delays it), so the
         // teardown clock starts at executor entry, before the pressure trigger.
         teardownStartedAt = performance.now();
+        // Rescue the unfixed transport so RED is an elapsed assertion, never the test timeout. It is armed on the
+        // same clock as the 1500 ms oracle, so slow launch work cannot shrink the 2000 ms vs 1500 ms margin.
+        if (verdict === "deadline") rescueTimer = setTimeout(() => transportRescue.abort(), transportRescueAfterMs);
         const recoveryOperation = git.withRecoveryOperation.bind(git);
         git.withRecoveryOperation = (signal, deadline, action) => recoveryOperation(signal, deadline,
           ownedSignal => captureScope.run({ ownerCapture: false }, () => action(ownedSignal)));
@@ -384,8 +387,6 @@ for (const { verdict, slowRemediationMs } of exhaustedCases) {
     if (verdict === "empty" || verdict === "ambiguous") git.worktreeStatus = async () => [];
     if (verdict === "ambiguous") api.overrideStateStatus(f.claim.run_id, "running");
     try {
-      // Rescue the unfixed transport so RED is an elapsed assertion, never the test timeout.
-      if (verdict === "deadline") rescueTimer = setTimeout(() => transportRescue.abort(), transportRescueAfterMs);
       const started = performance.now();
       await runnerWith(() => ({ executor, homeDir }), fakeGitlab().gitlab, undefined, undefined,
         { memoryRuntime: f.memory,
@@ -740,9 +741,7 @@ async function runMemoryCloseTail(fail: boolean, budget: number, probe?: TailPro
       // The hold above ran under the generous fixture budget, so a loaded host cannot make the runner abandon this
       // executor and close the feed itself with a real timer. Only the close budget is narrowed to the probed
       // value. Production never splits the hold budget from the close budget; this test-only split reaches the
-      // runner's private field and the assertion keeps it from silently drifting.
-      assert.equal((runner as unknown as { memoryHoldDeadlineMs: number }).memoryHoldDeadlineMs, memoryCloseBudgetMs,
-        "private close-budget field exists");
+      // runner's private field; the assertion before execute() keeps it from silently drifting.
       (runner as unknown as { memoryHoldDeadlineMs: number }).memoryHoldDeadlineMs = budget;
       // The runner arms its expiry synchronously inside close(): capture it and freeze the clock for that window only.
       const realTimeout = AbortSignal.timeout, realNow = Date.now, fixed = realNow();
@@ -768,6 +767,8 @@ async function runMemoryCloseTail(fail: boolean, budget: number, probe?: TailPro
   try {
     runner = runnerWith(() => ({ executor }), fakeGitlab().gitlab, undefined, undefined,
       { memoryRuntime: f.memory, outbox, codexBoundaryDeadlineMs: probe ? memoryCloseBudgetMs : budget });
+    if (probe) assert.equal((runner as unknown as { memoryHoldDeadlineMs: number }).memoryHoldDeadlineMs,
+      memoryCloseBudgetMs, "private close-budget field exists");
     await runner.execute(f.claim);
     await driver;
     const memory = original!.workerMemory!;
