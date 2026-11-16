@@ -161,12 +161,17 @@ Hibernate is refused, with a reason, when the worker:
 
 The controller can still refuse after the request is accepted (an open, unreadable
 or retained-claim roll reservation (`roll_reservation`), a finished roll whose
-same-owner or unverified-owner peers still carry roll metadata
+other workers in the namespace not positively attributed to a different owner still carry roll metadata
 (`roll_cohort_cleanup_pending`), a disk-pressure recycle, DinD maintenance, a busy
 worker, or a layout migration). Completed roll history from a finished roll is
 retired before sleep, so it does not block hibernation by itself; with
-`roll_cohort_cleanup_pending` nothing is written and the hibernation can be retried
-later (the automatic pass retries after its cooldown, or an admin retries). If
+`roll_cohort_cleanup_pending` the roll history is left in place and the hibernation
+can be retried later (the automatic pass retries after its cooldown, or an admin
+retries). Known limit: peer evidence is not filtered by coverage pool, so when one
+owner has two or more coverage pools (different capability sets) in a namespace,
+each finished roll leaves every pool's canary with a completed marker, and those
+canaries keep refusing each other with `roll_cohort_cleanup_pending` until the next
+image roll in that pool retires it; retries alone do not clear it. If
 nothing was scaled down, a refusal returns the worker to normal.
 Preparation that does not finish within 10 minutes is withdrawn into a wake.
 
