@@ -32372,12 +32372,13 @@ describe("M2 actualRunner credential replacement", () => {
   for (const [oldClaim, target] of [[SUBSCRIPTION, API_KEY], [API_KEY, SUBSCRIPTION],
     [SUBSCRIPTION, { ...SUBSCRIPTION, generation: 20, chatgpt_account_id: "M2-B-account" }]] as const) {
     for (const phase of ["factory", "already-running-body"] as const) {
-      for (const publication of ["baseline", "clean-apply-uncertain", "clean-pending-disappears", "root-reap-unproven", "preflight-target-mismatch", "preflight-foreign-op", "preflight-busy-ready", "preflight-transport-ready", "persist-clear-confirmed", "persist-clear-owner-lost", "persist-clear-nonce-changed", "persist-clear-rejected", "persist-clear-lost-reply", "persist-clear-empty-reply", "persist-clear-pending", "inspect-missing-clear-confirmed", "inspect-unknown-clear-confirmed", "gated", "before-scope-clear", "after-scope-clear", "before-scope-install", "after-scope-install", "before-executor-publication", "before-Now-publication", "after-Now-publication", "before-B-preparation", "Now-finish-false", "publish-failure", "now-publish-failure", "login-failure", "subscription-refresh", "api-key-refresh", "subscription-refresh-prepare-failure", "subscription-refresh-cancel", "crash-after-a-teardown-recovery", "crash-apply-reply-lost-recovery", "crash-apply-ack-recovery", "crash-login-recovery"] as const) {
+      for (const publication of ["baseline", "clean-apply-uncertain", "clean-pending-disappears", "clean-stopped-lost-reply", "clean-stopped-unconfirmed", "clean-stopped-unsupported", "clean-stopped-withdrawn", "clean-stopped-already-paused", "root-reap-unproven", "preflight-target-mismatch", "preflight-foreign-op", "preflight-busy-ready", "preflight-transport-ready", "persist-clear-confirmed", "persist-clear-owner-lost", "persist-clear-nonce-changed", "persist-clear-rejected", "persist-clear-lost-reply", "persist-clear-empty-reply", "persist-clear-pending", "inspect-missing-clear-confirmed", "inspect-unknown-clear-confirmed", "gated", "before-scope-clear", "after-scope-clear", "before-scope-install", "after-scope-install", "before-executor-publication", "before-Now-publication", "after-Now-publication", "before-B-preparation", "Now-finish-false", "publish-failure", "now-publish-failure", "login-failure", "subscription-refresh", "api-key-refresh", "subscription-refresh-prepare-failure", "subscription-refresh-cancel", "crash-after-a-teardown-recovery", "crash-apply-reply-lost-recovery", "crash-apply-ack-recovery", "crash-login-recovery"] as const) {
         if (publication !== "baseline" && (phase !== "factory" || (oldClaim !== API_KEY && target !== API_KEY))) continue;
         if (publication === "subscription-refresh" && target.auth_mode !== "subscription") continue;
         if (publication === "api-key-refresh" && target.auth_mode !== "api_key") continue;
         const cleanApplyUncertain = publication === "clean-apply-uncertain";
-        const cleanPendingDisappears = publication === "clean-pending-disappears";
+        const cleanAllUnconfirmed = publication === "clean-stopped-unconfirmed" || publication === "clean-stopped-unsupported";
+        const cleanPendingDisappears = publication === "clean-pending-disappears" || publication.startsWith("clean-stopped-");
         const cleanRetainedStop = cleanApplyUncertain || cleanPendingDisappears;
         if (cleanRetainedStop && (oldClaim !== API_KEY || target !== SUBSCRIPTION || phase !== "factory")) continue;
         const rootReapUnproven = publication === "root-reap-unproven";
@@ -32419,7 +32420,7 @@ describe("M2 actualRunner credential replacement", () => {
       it((publication === "baseline"
         ? `M2 actualRunner ${oldClaim.auth_mode} to ${target.auth_mode} ${phase} account resumes saved thread`
         : cleanApplyUncertain ? "Codex real Runner clean A teardown then uncertain apply parks ownership without custody hold"
-        : cleanPendingDisappears ? "Codex real Runner pending op disappears after clean A teardown then truthfully pauses without apply"
+        : cleanPendingDisappears ? `Codex real Runner pending op disappears after clean A teardown (${publication})`
         : rootReapUnproven ? "Codex real Runner holds API-key A to subscription B when the registered A root reap is unproven"
         : publication === "preflight-busy-ready" ? "Codex real Runner retries credential_busy then exact ready for the same operation"
         : publication === "preflight-transport-ready" ? "Codex real Runner retries uncertain transport then exact ready for the same operation"
@@ -32493,6 +32494,9 @@ describe("M2 actualRunner credential replacement", () => {
         const cleanOwnership = { status: "running", claim_generation: 7, claim_released: false, hold_reason: null };
         const cleanReports: { runId: string; generation?: number; opId?: string; reason?: string }[] = [];
         const cleanPauseRequests: { runId: string; generation: number }[] = [];
+        const stoppedTuples: { claimGeneration: number; registerNonce: string; expectedEpoch: number }[] = [];
+        let switchAdvertised = true;
+        let releasesAtCleanTeardown = 0;
         const cleanPausedObservations: typeof cleanOwnership[] = [];
         const teardownResults: boolean[] = [];
         const failedRootReaps: Awaited<ReturnType<ReturnType<typeof trackedRoot>["root"]["reap"]>>[] = [];
@@ -32576,8 +32580,8 @@ describe("M2 actualRunner credential replacement", () => {
           if (clearAcknowledged) postAckNonces.push(registrationNonce);
           return registrationNonce;
         };
-        client.supportsInPlaceCodexCredentialSwitch = () => true;
-        client.supportsCodexSwitchStopped = () => true;
+        client.supportsInPlaceCodexCredentialSwitch = () => switchAdvertised;
+        client.supportsCodexSwitchStopped = () => switchAdvertised;
         const feature = client.hasFeature.bind(client);
         client.hasFeature = name => name === "credential_switch_hold" || feature(name);
         if (cleanRetainedStop) t.mock.method(client, "settleCodexSwitchStopped", async (runId: string, tuple: { claimGeneration: number; registerNonce: string; expectedEpoch: number }) => {
@@ -32585,16 +32589,37 @@ describe("M2 actualRunner credential replacement", () => {
           assert.deepEqual(tuple, { claimGeneration: 7, registerNonce: "M2-original-nonce", expectedEpoch: 11 });
           cleanPauseRequests.push({ runId, generation });
           assert.equal(cleanPendingDisappears, true);
-          assert.deepEqual(cleanPauseRequests, [{ runId: claim.run_id, generation: 7 }]);
+          assert.ok(cleanPauseRequests.length <= (cleanAllUnconfirmed ? 3 : publication === "clean-stopped-lost-reply" ? 2 : 1));
+          assert.ok(Object.isFrozen(tuple));
+          stoppedTuples.push(tuple);
+          assert.equal(tuple, stoppedTuples[0], "replay uses the identical frozen tuple");
+          assert.ok(actualFlight);
+          assert.equal(actualFlight.parked, false, "status alone never proves a park");
+          assert.equal(actualFlight.executor, executor);
+          assert.equal(actualFlight.runId, claim.run_id);
+          assert.equal(actualFlight.claimGeneration, 7);
+          if (publication === "clean-stopped-already-paused") {
+            assert.equal(cleanOwnership.status, "paused");
+            assert.ok(cleanPausedObservations.length > 0);
+          }
+          if (publication === "clean-stopped-withdrawn") assert.equal(switchAdvertised, false);
           assert.deepEqual(teardownResults, [true], "pause ACK follows the joined real teardown");
           assert.ok(events.includes("lease-teardown-returned"));
           assert.ok(events.includes("A-reaped"));
           assert.ok(events.includes("A-effect-disposed"));
           assert.equal(pending, false);
           assert.equal(applies, 0);
-          // The dedicated acknowledgement proves the committed transition.
-          cleanOwnership.status = "paused";
-          api.setOwnershipStatus(runId, "paused", generation);
+          // Simulate a committed pause with a lost reply separately from refusals.
+          // This fake exercises Runner settlement; it does not prove DB predicates.
+          if (!cleanAllUnconfirmed) {
+            cleanOwnership.status = "paused";
+            api.setOwnershipStatus(runId, "paused", generation);
+          }
+          // Model the client result for a lost reply or unsupported response.
+          if (cleanAllUnconfirmed || (publication === "clean-stopped-lost-reply" && cleanPauseRequests.length === 1)) {
+            events.push("clean-pause-unconfirmed");
+            return { kind: "unconfirmed" as const };
+          }
           events.push("clean-pause-ACK");
           return { kind: "confirmed" as const };
         });
@@ -32853,7 +32878,18 @@ describe("M2 actualRunner credential replacement", () => {
               teardownResults.push(result);
               if (rootReapUnproven || cleanRetainedStop) events.push("lease-teardown-returned");
               // Remove only the pending target after the real lease joins; A remains committed.
-              if (cleanPendingDisappears) pending = false;
+              if (cleanPendingDisappears) {
+                pending = false;
+                releasesAtCleanTeardown = credentialReleases;
+                if (publication === "clean-stopped-withdrawn" || publication === "clean-stopped-unsupported") {
+                  assert.equal(switchAdvertised, true, "withdraw only after admission and joined teardown");
+                  switchAdvertised = false;
+                }
+                if (publication === "clean-stopped-already-paused") {
+                  cleanOwnership.status = "paused";
+                  api.setOwnershipStatus(claim.run_id, "paused", 7);
+                }
+              }
               return result;
             },
             reopenA: async nextBounds => { reopenAttempts++; return lease.reopenA(nextBounds); },
@@ -33171,6 +33207,8 @@ describe("M2 actualRunner credential replacement", () => {
           claimGeneration: number;
           executor: typeof executor;
           operationScope?: object;
+          parked: boolean;
+          keepGuardedInventoryOpen: boolean;
         };
         const flightBuilder = runner as unknown as { buildFlight(...args: unknown[]): ObservedFlight };
         const buildFlight = flightBuilder.buildFlight;
@@ -33380,7 +33418,7 @@ describe("M2 actualRunner credential replacement", () => {
             assert.equal(preflights, 1);
             assert.equal(preflightStorePresence, "present", "usable rollout observed before delivering the reply");
             assert.deepEqual(deliveredPreflightReplies, [{ kind: targetMismatch ? "not_applied" : "ready",
-              ...(targetMismatch ? { reason: "target_mismatch" } : {}), claimGeneration: 7,
+              ...(targetMismatch ? { reason: "target_mismatch" } : { expectedEpoch: 11 }), claimGeneration: 7,
               registerNonce: "M2-original-nonce", opId: targetMismatch ? "M2-op" : "M2-FOREIGN-op" }]);
             assert.deepEqual(preflightRequests, [{ runId: claim.run_id, claimGeneration: 7,
               registerNonce: "M2-original-nonce", opId: "M2-op", targetSecretId: "M2-target" }]);
@@ -33511,15 +33549,22 @@ describe("M2 actualRunner credential replacement", () => {
             assert.equal(switchResult, undefined);
             assert.ok(switchError instanceof Error);
             assert.equal(switchError.name, "CredentialSwitchRetainedStop");
-            const expectedOwnership = { status: "paused", claim_generation: 7, claim_released: false, hold_reason: null };
-            assert.deepEqual(cleanOwnership, expectedOwnership, "ACK changes externally observed fake ownership");
+            const expectedOwnership = { status: cleanAllUnconfirmed ? "running" : "paused", claim_generation: 7, claim_released: false, hold_reason: null };
+            assert.deepEqual(cleanOwnership, expectedOwnership, "fake ownership is independent of local park evidence");
             if (cleanPendingDisappears) {
-              assert.equal(cleanOwnership.status, "paused", "dedicated ACK proves paused ownership");
+              assert.equal(cleanOwnership.status, expectedOwnership.status);
               for (const observed of cleanPausedObservations) assert.deepEqual(observed, expectedOwnership);
             }
             assert.deepEqual(await client.getRunOwnership(claim.run_id), expectedOwnership);
             assert.ok(a.reaped() > 0);
-            assert.ok(events.indexOf("lease-teardown-returned") < events.indexOf(cleanApplyUncertain ? "clean-owner-ACK" : "clean-pause-ACK"));
+            assert.ok(events.indexOf("lease-teardown-returned") < events.indexOf(cleanApplyUncertain ? "clean-owner-ACK"
+              : cleanAllUnconfirmed ? "clean-pause-unconfirmed" : "clean-pause-ACK"));
+            if (cleanPendingDisappears) {
+              assert.ok(actualFlight);
+              assert.equal(actualFlight.parked, !cleanAllUnconfirmed);
+              if (cleanAllUnconfirmed) assert.equal(actualFlight.keepGuardedInventoryOpen, true);
+              assert.equal(credentialReleases, releasesAtCleanTeardown);
+            }
             assert.equal(holdReason, null);
             assert.equal(pending, false);
             assert.equal(committedCodex, cleanApplyUncertain ? next : claim.secrets.codex,
@@ -33529,7 +33574,12 @@ describe("M2 actualRunner credential replacement", () => {
             assert.equal(applyAcknowledgements, 0);
             assert.deepEqual(cleanReports, cleanApplyUncertain
               ? [{ runId: claim.run_id, generation: 7, opId: "M2-op", reason: "apply_uncertain" }] : []);
-            assert.deepEqual(cleanPauseRequests, cleanPendingDisappears ? [{ runId: claim.run_id, generation: 7 }] : []);
+            const expectedStoppedAttempts = !cleanPendingDisappears ? 0 : cleanAllUnconfirmed ? 3
+              : publication === "clean-stopped-lost-reply" ? 2 : 1;
+            assert.deepEqual(cleanPauseRequests, Array.from({ length: expectedStoppedAttempts },
+              () => ({ runId: claim.run_id, generation: 7 })));
+            assert.equal(events.filter(event => event === "clean-pause-ACK").length,
+              cleanPendingDisappears && !cleanAllUnconfirmed ? 1 : 0);
             assert.deepEqual(holdReports, []);
             assert.deepEqual(reports.filter(status => status.startsWith("credential_switch")),
               cleanApplyUncertain ? ["credential_switch_uncertain"] : []);
