@@ -896,8 +896,32 @@ test("execution owner ordinary observation follows tail deletion", async () => {
   await tail;
 });
 
+// Slow-transport control: holds the response of the FIRST matching request for 400 ms (beyond
+// the 200 ms owner budget), rejecting with the signal's reason if the request's own signal aborts.
+// Installed just before runner.execute and restored in finally.
+function holdFirstPost(suffix: string, marker: string): { restore: () => void; held: () => number } {
+  const realFetch = globalThis.fetch;
+  let held = 0;
+  globalThis.fetch = (async (input: any, init?: any) => {
+    const url = String(input?.url ?? input);
+    const body = typeof init?.body === "string" ? init.body : "";
+    if (held === 0 && url.endsWith(suffix) && body.includes(marker)) {
+      held++;
+      await new Promise<void>((resolve, reject) => {
+        const s: AbortSignal | undefined = init?.signal;
+        const t = setTimeout(resolve, 400);
+        const fail = () => { clearTimeout(t); reject(s?.reason ?? new DOMException("held response aborted", "AbortError")); };
+        if (s?.aborted) fail(); else s?.addEventListener("abort", fail, { once: true });
+      });
+    }
+    return realFetch(input, init);
+  }) as typeof fetch;
+  return { restore: () => { globalThis.fetch = realFetch; }, held: () => held };
+}
+
+for (const slow of [false, true]) {
 for (const claimCredential of [true, false]) {
-test(`M3 late native park ACK stays owned after deadline and cannot mutate a reclaimed successor credential=${claimCredential}`, async t => {
+test(`M3 late native park ACK stays owned after deadline and cannot mutate a reclaimed successor credential=${claimCredential}${slow ? " (slow transport control)" : ""}`, async t => {
   const f = await setup(1);
   // This source is unenrolled. Keep unrelated remediation I/O out of the 200 ms
   // late-ACK budget; the drained capture scope, native ACK and stale-owner fences remain real.
@@ -932,21 +956,22 @@ test(`M3 late native park ACK stays owned after deadline and cannot mutate a rec
   let readiness = 0;
   let original: MemoryFlightProof | undefined;
   let successor: ReturnType<NonNullable<RunContext["capturedMemory"]>>;
-  let nativeAck: StateAck | undefined, parkSignal: AbortSignal | undefined;
+  let nativeAck: StateAck | undefined, parkSignal: AbortSignal | undefined, liveAtSend: boolean | undefined;
   let successorWork: Promise<void> | undefined;
   let started: number | undefined, rescue: ReturnType<typeof setTimeout> | undefined;
   const report = client.reportState.bind(client);
   client.reportState = async (...args) => {
-    const ack = await report(...args);
-    if (args[1].recovery_cause === "worker_memory_pressure") {
-      nativeAck = ack;
-      parkSignal = args[2];
-      // Start rescue at the blocked port, leaving room for the original 200ms stop,
-      // successor's 5000ms local capture and intervening fixture work. Finally releases and joins it.
-      rescue = setTimeout(() => release.resolve(), 10000);
-      // Intentionally ignore abort after a REAL client-validated receipt.
-      await release.promise;
-    }
+    if (args[1].recovery_cause !== "worker_memory_pressure") return report(...args);
+    parkSignal = args[2];
+    liveAtSend = !args[2]?.aborted;
+    // Start rescue at the blocked port, leaving room for the original 200ms stop,
+    // successor's 5000ms local capture and intervening fixture work. Finally releases and joins it.
+    rescue = setTimeout(() => release.resolve(), 10000);
+    // The uncooperative adapter ignores the owner abort, so the REAL client-validated receipt
+    // is obtained even when the post outlives the deadline; abort is observed on parkSignal above.
+    const ack = await report(args[0], args[1], undefined, args[3]);
+    nativeAck = ack;
+    await release.promise;
     return ack;
   };
   fs.writeFileSync(homeDir + "/session-proof", "original session");
@@ -983,9 +1008,12 @@ test(`M3 late native park ACK stays owned after deadline and cannot mutate a rec
   };
   const runner = runnerWith(() => ({ executor, homeDir }), fakeGitlab().gitlab, undefined, undefined,
     { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 200 });
+  const hold = slow ? holdFirstPost("/state", "worker_memory_pressure") : undefined;
   const work = runner.execute(f.claim);
   try {
     await until(() => nativeAck !== undefined);
+    assert.equal(liveAtSend, true, "original park send starts before its owner deadline");
+    if (hold) assert.equal(hold.held(), 1, "control: first park POST response was held");
     assert.ok(nativeAck!.memoryParkAccepted, "receipt derives from the native public memory-hold DTO");
     await work;
     assert.ok(started !== undefined, "elapsed clock anchored at the pressure trigger");
@@ -1076,6 +1104,7 @@ test(`M3 late native park ACK stays owned after deadline and cannot mutate a rec
     assert.equal(successor!.commands.admitsCommands(successor!.context), true);
     assert.equal(successor!.commands.remaining(successor!.context), 1);
   } finally {
+    hold?.restore();
     clearTimeout(rescue);
     release.resolve();
     cleanupRelease.resolve();
@@ -1092,6 +1121,7 @@ test(`M3 late native park ACK stays owned after deadline and cannot mutate a rec
   }
   verifyUnenrolledReads();
 });
+}
 }
 
 for (const interruption of ["registration", "generation", "shutdown", "cancel"] as const) {
@@ -1164,21 +1194,29 @@ for (const interruption of ["registration", "generation", "shutdown", "cancel"] 
   });
 }
 
-test("M3 delayed feedback beyond deadline retains original send and sink receipt without parking", async () => {
+for (const slow of [false, true]) {
+test(`M3 delayed feedback beyond deadline retains original send and sink receipt without parking${slow ? " (slow transport control)" : ""}`, async () => {
   const f = await setup(1);
   const monitoring = f.memory.run();
   const release = releaseGate();
   let original: MemoryFlightProof | undefined, sending = false, sendSignal: AbortSignal | undefined;
+  let liveAtSend: boolean | undefined;
   let started: number | undefined, rescue: ReturnType<typeof setTimeout> | undefined;
   const post = client.postMessages.bind(client);
   client.postMessages = async (...args) => {
-    await post(...args);
     if (args[1].some(message => message.payload.event === "worker_memory_pressure")) {
+      // Observe the owned send before the real post can return: its latency is not part of the contract.
       sending = true;
       sendSignal = args[3];
+      liveAtSend = !args[3]?.aborted;
       rescue = setTimeout(() => release.resolve(), 2000);
-      await release.promise; // Native feed ACK is withheld by an intentionally uncooperative adapter.
+      // The uncooperative adapter ignores the owner abort, so the real post lands even when it
+      // outlives the deadline; its native feed ACK is then withheld.
+      await post(args[0], args[1], args[2]);
+      await release.promise;
+      return;
     }
+    await post(...args);
   };
   fs.writeFileSync(homeDir + "/session-proof", "original session");
   const executor: Executor = { run: async ctx => {
@@ -1189,10 +1227,12 @@ test("M3 delayed feedback beyond deadline retains original send and sink receipt
     await command.captured.commands.watchOutcome(command.entry);
     throw new Error("quiet retained stop");
   } };
+  const hold = slow ? holdFirstPost("/messages", "worker_memory_pressure") : undefined;
   const work = runnerWith(() => ({ executor, homeDir }), fakeGitlab().gitlab, undefined, undefined,
     { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 200 }).execute(f.claim);
   try {
     await until(() => sending);
+    assert.equal(liveAtSend, true, "original feedback send starts before its owner deadline");
     const receipt = f.memory.sinkReceipts.find(r => r.kind === "feedback" && r.context.flight === original);
     assert.ok(receipt, "original feedback sink owns its completion receipt");
     const pending = [...original!.workerMemory!.feedback.values()][0]!;
@@ -1204,6 +1244,7 @@ test("M3 delayed feedback beyond deadline retains original send and sink receipt
     assert.ok(started !== undefined, "elapsed clock anchored at the pressure trigger");
     assert.ok(performance.now() - started < 1500, "uncooperative feedback does not defeat owner deadline");
     assert.equal(settled, false);
+    if (hold) assert.equal(hold.held(), 1, "control: first feedback POST response was held");
     assert.equal(sendSignal!.aborted, true);
     assert.ok(f.memory.sinkReceipts.includes(receipt), "timeout does not discard uncompleted sink receipt");
     assert.equal(original!.retainedLocalCustody, true);
@@ -1219,6 +1260,7 @@ test("M3 delayed feedback beyond deadline retains original send and sink receipt
     assert.notEqual(original!.parked, true);
     assert.equal(api.messages(f.claim.run_id).filter(m => m.payload.event === "worker_memory_pressure").length, 1);
   } finally {
+    hold?.restore();
     clearTimeout(rescue); release.resolve();
     await work;
     await original?.workerMemory?.operation;
@@ -1227,6 +1269,7 @@ test("M3 delayed feedback beyond deadline retains original send and sink receipt
     await Promise.allSettled(f.memory.sinkReceipts.map(receipt => receipt.completion));
   }
 });
+}
 
 test("M3 late mocked historical outcome resolves only the original ticket after expired wait", async () => {
   const f = await setup();
