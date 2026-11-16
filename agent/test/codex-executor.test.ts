@@ -32372,14 +32372,15 @@ describe("M2 actualRunner credential replacement", () => {
   for (const [oldClaim, target] of [[SUBSCRIPTION, API_KEY], [API_KEY, SUBSCRIPTION],
     [SUBSCRIPTION, { ...SUBSCRIPTION, generation: 20, chatgpt_account_id: "M2-B-account" }]] as const) {
     for (const phase of ["factory", "already-running-body"] as const) {
-      for (const publication of ["baseline", "clean-apply-uncertain", "clean-pending-disappears", "clean-stopped-lost-reply", "clean-stopped-unconfirmed", "clean-stopped-unsupported", "clean-stopped-withdrawn", "clean-stopped-already-paused", "root-reap-unproven", "preflight-target-mismatch", "preflight-foreign-op", "preflight-busy-ready", "preflight-transport-ready", "persist-clear-confirmed", "persist-clear-owner-lost", "persist-clear-nonce-changed", "persist-clear-rejected", "persist-clear-lost-reply", "persist-clear-empty-reply", "persist-clear-pending", "inspect-missing-clear-confirmed", "inspect-unknown-clear-confirmed", "gated", "before-scope-clear", "after-scope-clear", "before-scope-install", "after-scope-install", "before-executor-publication", "before-Now-publication", "after-Now-publication", "before-B-preparation", "Now-finish-false", "publish-failure", "now-publish-failure", "login-failure", "subscription-refresh", "api-key-refresh", "subscription-refresh-prepare-failure", "subscription-refresh-cancel", "crash-after-a-teardown-recovery", "crash-apply-reply-lost-recovery", "crash-apply-ack-recovery", "crash-login-recovery"] as const) {
+      for (const publication of ["baseline", "clean-apply-uncertain", "clean-successor-epoch-advance", "clean-pending-disappears", "clean-stopped-lost-reply", "clean-stopped-unconfirmed", "clean-stopped-unsupported", "clean-stopped-withdrawn", "clean-stopped-already-paused", "root-reap-unproven", "preflight-target-mismatch", "preflight-foreign-op", "preflight-busy-ready", "preflight-transport-ready", "persist-clear-confirmed", "persist-clear-owner-lost", "persist-clear-nonce-changed", "persist-clear-rejected", "persist-clear-lost-reply", "persist-clear-empty-reply", "persist-clear-pending", "inspect-missing-clear-confirmed", "inspect-unknown-clear-confirmed", "gated", "before-scope-clear", "after-scope-clear", "before-scope-install", "after-scope-install", "before-executor-publication", "before-Now-publication", "after-Now-publication", "before-B-preparation", "Now-finish-false", "publish-failure", "now-publish-failure", "login-failure", "subscription-refresh", "api-key-refresh", "subscription-refresh-prepare-failure", "subscription-refresh-cancel", "crash-after-a-teardown-recovery", "crash-apply-reply-lost-recovery", "crash-apply-ack-recovery", "crash-login-recovery"] as const) {
         if (publication !== "baseline" && (phase !== "factory" || (oldClaim !== API_KEY && target !== API_KEY))) continue;
         if (publication === "subscription-refresh" && target.auth_mode !== "subscription") continue;
         if (publication === "api-key-refresh" && target.auth_mode !== "api_key") continue;
+        const successorEpochAdvance = publication === "clean-successor-epoch-advance";
         const cleanApplyUncertain = publication === "clean-apply-uncertain";
         const cleanAllUnconfirmed = publication === "clean-stopped-unconfirmed" || publication === "clean-stopped-unsupported";
         const cleanPendingDisappears = publication === "clean-pending-disappears" || publication.startsWith("clean-stopped-");
-        const cleanRetainedStop = cleanApplyUncertain || cleanPendingDisappears;
+        const cleanRetainedStop = cleanApplyUncertain || cleanPendingDisappears || successorEpochAdvance;
         if (cleanRetainedStop && (oldClaim !== API_KEY || target !== SUBSCRIPTION || phase !== "factory")) continue;
         const rootReapUnproven = publication === "root-reap-unproven";
         if (rootReapUnproven && (oldClaim !== API_KEY || target !== SUBSCRIPTION || phase !== "factory")) continue;
@@ -32419,6 +32420,7 @@ describe("M2 actualRunner credential replacement", () => {
           const missingRecoveryRollout = recoveryMode.endsWith("missing retained rollout");
       it((publication === "baseline"
         ? `M2 actualRunner ${oldClaim.auth_mode} to ${target.auth_mode} ${phase} account resumes saved thread`
+        : successorEpochAdvance ? "Codex real Runner rejects successor READY epoch 12 after latching epoch 11"
         : cleanApplyUncertain ? "Codex real Runner clean A teardown then uncertain apply parks ownership without custody hold"
         : cleanPendingDisappears ? `Codex real Runner pending op disappears after clean A teardown (${publication})`
         : rootReapUnproven ? "Codex real Runner holds API-key A to subscription B when the registered A root reap is unproven"
@@ -32451,6 +32453,7 @@ describe("M2 actualRunner credential replacement", () => {
         claim.secrets = { ...claim.secrets, codex: oldClaim as import("../src/protocol.js").ClaimCodexSecrets };
         api.setOwnershipStatus(claim.run_id, "running", 7);
         let pending = false, cancelled = false, applies = 0, hooks = 0, factories = 0, preflights = 0;
+        let pendingOp = "M2-op";
         let predecessorFenced = false, applyAcknowledgements = 0;
         let committedCodex = claim.secrets.codex!;
         let context!: RunContext;
@@ -32506,13 +32509,24 @@ describe("M2 actualRunner credential replacement", () => {
           reports.push(body.status);
           dispositions.push({ status: body.status, failure_reason: body.failure_reason });
           if (cleanRetainedStop && body.status === "credential_switch_uncertain") {
-            assert.equal(cleanApplyUncertain, true);
+            assert.ok(cleanApplyUncertain || successorEpochAdvance);
             assert.deepEqual(teardownResults, [true], "owner ACK follows the joined real teardown");
             assert.ok(events.includes("A-reaped"));
             assert.ok(events.includes("A-effect-disposed"));
             assert.ok(events.includes("lease-teardown-returned"));
             cleanReports.push({ runId: id, generation: body.claim_generation, opId: body.op_id, reason: body.failure_reason });
-            assert.deepEqual(cleanReports, [{ runId: claim.run_id, generation: 7, opId: "M2-op", reason: "apply_uncertain" }]);
+            assert.deepEqual(cleanReports, [{ runId: claim.run_id, generation: 7,
+              opId: successorEpochAdvance ? "M2-successor" : "M2-op",
+              reason: successorEpochAdvance ? "not_applied_after_teardown" : "apply_uncertain" }]);
+            if (successorEpochAdvance) {
+              assert.equal(applies, 1, "advanced successor epoch never reaches a second apply");
+              assert.equal(pending, true, "keep successor pending through the actual Runner epoch comparison");
+              assert.equal(committedCodex, claim.secrets.codex);
+              assert.deepEqual(deliveredPreflightReplies, [
+                { kind: "ready", expectedEpoch: 11, claimGeneration: 7, registerNonce: "M2-original-nonce", opId: "M2-op" },
+                { kind: "ready", expectedEpoch: 12, claimGeneration: 7, registerNonce: "M2-original-nonce", opId: "M2-successor" },
+              ]);
+            }
             cleanOwnership.status = "paused";
             api.setOwnershipStatus(id, "paused", 7);
             events.push("clean-owner-ACK");
@@ -32634,7 +32648,7 @@ describe("M2 actualRunner credential replacement", () => {
           return ownership;
         };
         client.getInputs = async () => ({ inputs: [], nowSummary: true, ...((cancelled || api.messages(claim.run_id).some(m => m.kind === "progress_note" && m.credential_epoch_ordinal === 1 && String(m.payload.text).startsWith("Inspecting B"))) ? { terminalCancelled: { run_id: claim.run_id, generation: 7 } } : {}),
-          ...(pending ? { credentialSwitch: { generation: 7, op_id: "M2-op", target_secret_id: "M2-target" } } : {}) });
+          ...(pending ? { credentialSwitch: { generation: 7, op_id: pendingOp, target_secret_id: "M2-target" } } : {}) });
         client.preflightCodexCredentialSwitch = async (runId, req) => {
           preflights++; events.push("preflight");
           preflightRequests.push({ runId, claimGeneration: req.claimGeneration, registerNonce: req.registerNonce,
@@ -32652,9 +32666,18 @@ describe("M2 actualRunner credential replacement", () => {
           }
           const reply = targetMismatch ? { kind: "not_applied" as const, reason: "target_mismatch",
             claimGeneration: 7, registerNonce: "M2-original-nonce", opId: "M2-op" }
-            : { kind: "ready" as const, expectedEpoch: 11, claimGeneration: 7, registerNonce: "M2-original-nonce",
-              opId: publication === "preflight-foreign-op" ? "M2-FOREIGN-op" : "M2-op" };
-          if (preflightRefusal || preflightRetry || rootReapUnproven) deliveredPreflightReplies.push(reply);
+            : { kind: "ready" as const, expectedEpoch: successorEpochAdvance && pendingOp === "M2-successor" ? 12 : 11,
+              claimGeneration: 7, registerNonce: "M2-original-nonce",
+              opId: publication === "preflight-foreign-op" ? "M2-FOREIGN-op" : pendingOp };
+          if (successorEpochAdvance) {
+            assert.equal(runId, claim.run_id);
+            assert.equal(req.claimGeneration, 7);
+            assert.equal(req.registerNonce, "M2-original-nonce");
+            assert.equal(req.opId, pendingOp);
+            assert.equal(req.targetSecretId, "M2-target");
+            assert.equal(preflights, pendingOp === "M2-op" ? 1 : 2);
+          }
+          if (preflightRefusal || preflightRetry || rootReapUnproven || successorEpochAdvance) deliveredPreflightReplies.push(reply);
           return reply;
         };
         const applyRequests: { claimGeneration: number; opId: string }[] = [];
@@ -32666,7 +32689,16 @@ describe("M2 actualRunner credential replacement", () => {
             assert.ok(events.includes("lease-teardown-returned"));
           }
           applyRequests.push({ claimGeneration: req.claimGeneration, opId: req.opId });
-          applies++; pending = false;
+          applies++;
+          if (successorEpochAdvance) {
+            assert.equal(applies, 1, "successor apply is forbidden after READY advances the latched epoch");
+            assert.equal(req.opId, "M2-op");
+            assert.equal(pending, true);
+            pendingOp = "M2-successor";
+            events.push("apply-superseded");
+            return { kind: "superseded" };
+          }
+          pending = false;
           committedCodex = next; // Simulated committed row, not evidence of DB durability.
           if (cleanApplyUncertain) return { kind: "uncertain", detail: "transport" };
           if (crashRecovery) await publicationBoundary("apply-reply-lost");
@@ -32858,7 +32890,7 @@ describe("M2 actualRunner credential replacement", () => {
           return request(method, params, opts);
         };
         const executor = makeExecutor(rig, bindingOf(oldClaim), noopLog, undefined, provider, m2Runner.homeDir);
-        let reopenAttempts = 0;
+        let reopenAttempts = 0, publishAttempts = 0, restartAttempts = 0;
         const suspend = executor.suspendCodexEpoch.bind(executor);
         executor.suspendCodexEpoch = async bounds => {
           const lease = await suspend(bounds);
@@ -32894,11 +32926,13 @@ describe("M2 actualRunner credential replacement", () => {
             },
             reopenA: async nextBounds => { reopenAttempts++; return lease.reopenA(nextBounds); },
             publishB: async (...args) => {
+              publishAttempts++;
               await publicationBoundary("before-publish");
               await lease.publishB(...args);
               await publicationBoundary("after-publish");
             },
             restartAndResume: async (...args) => {
+              restartAttempts++;
               await publicationBoundary("before-prepare");
               const result = await lease.restartAndResume(...args);
               await publicationBoundary("prepared");
@@ -33206,6 +33240,7 @@ describe("M2 actualRunner credential replacement", () => {
           runId: string;
           claimGeneration: number;
           executor: typeof executor;
+          worktreePath?: string;
           operationScope?: object;
           parked: boolean;
           keepGuardedInventoryOpen: boolean;
@@ -33557,7 +33592,7 @@ describe("M2 actualRunner credential replacement", () => {
             }
             assert.deepEqual(await client.getRunOwnership(claim.run_id), expectedOwnership);
             assert.ok(a.reaped() > 0);
-            assert.ok(events.indexOf("lease-teardown-returned") < events.indexOf(cleanApplyUncertain ? "clean-owner-ACK"
+            assert.ok(events.indexOf("lease-teardown-returned") < events.indexOf(cleanApplyUncertain || successorEpochAdvance ? "clean-owner-ACK"
               : cleanAllUnconfirmed ? "clean-pause-unconfirmed" : "clean-pause-ACK"));
             if (cleanPendingDisappears) {
               assert.ok(actualFlight);
@@ -33566,14 +33601,32 @@ describe("M2 actualRunner credential replacement", () => {
               assert.equal(credentialReleases, releasesAtCleanTeardown);
             }
             assert.equal(holdReason, null);
-            assert.equal(pending, false);
+            assert.equal(pending, successorEpochAdvance);
+            if (successorEpochAdvance) {
+              assert.equal(pendingOp, "M2-successor");
+              assert.equal(preflights, 2);
+              assert.ok(actualFlight);
+              assert.equal(actualFlight.parked, true, "explicit owner ACK confirms retained pause");
+              assert.equal(actualFlight.worktreePath, worktree, "retain the same claim worktree");
+              assert.equal(publishAttempts, 0);
+              assert.equal(restartAttempts, 0);
+              assert.equal(actualFlight.executor, executor);
+              assert.equal(actualFlight.runId, claim.run_id);
+              assert.equal(actualFlight.claimGeneration, 7);
+              assert.ok(events.indexOf("lease-teardown-returned") < events.indexOf("apply-superseded"));
+              assert.ok(events.indexOf("apply-superseded") < events.lastIndexOf("preflight"));
+              assert.equal(bFinished, false);
+              assert.deepEqual(resumedThreads, []);
+              assert.deepEqual(loginObservations, []);
+            }
             assert.equal(committedCodex, cleanApplyUncertain ? next : claim.secrets.codex,
               "simulated committed binding is independent of pending target; not DB proof");
-            assert.deepEqual(applyRequests, cleanApplyUncertain ? [{ claimGeneration: 7, opId: "M2-op" }] : []);
-            assert.equal(applies, cleanApplyUncertain ? 1 : 0);
+            assert.deepEqual(applyRequests, cleanApplyUncertain || successorEpochAdvance ? [{ claimGeneration: 7, opId: "M2-op" }] : []);
+            assert.equal(applies, cleanApplyUncertain || successorEpochAdvance ? 1 : 0);
             assert.equal(applyAcknowledgements, 0);
-            assert.deepEqual(cleanReports, cleanApplyUncertain
-              ? [{ runId: claim.run_id, generation: 7, opId: "M2-op", reason: "apply_uncertain" }] : []);
+            assert.deepEqual(cleanReports, successorEpochAdvance
+              ? [{ runId: claim.run_id, generation: 7, opId: "M2-successor", reason: "not_applied_after_teardown" }]
+              : cleanApplyUncertain ? [{ runId: claim.run_id, generation: 7, opId: "M2-op", reason: "apply_uncertain" }] : []);
             const expectedStoppedAttempts = !cleanPendingDisappears ? 0 : cleanAllUnconfirmed ? 3
               : publication === "clean-stopped-lost-reply" ? 2 : 1;
             assert.deepEqual(cleanPauseRequests, Array.from({ length: expectedStoppedAttempts },
@@ -33582,7 +33635,7 @@ describe("M2 actualRunner credential replacement", () => {
               cleanPendingDisappears && !cleanAllUnconfirmed ? 1 : 0);
             assert.deepEqual(holdReports, []);
             assert.deepEqual(reports.filter(status => status.startsWith("credential_switch")),
-              cleanApplyUncertain ? ["credential_switch_uncertain"] : []);
+              cleanApplyUncertain || successorEpochAdvance ? ["credential_switch_uncertain"] : []);
             assert.ok(!reports.some(status => ["completed", "failed", "cancelled"].includes(status)));
             assert.equal(reopenAttempts, 0);
             assert.equal(a.transport.turnStartCount, 1);
