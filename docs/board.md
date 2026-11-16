@@ -350,7 +350,8 @@ Turning a repo on (the web **Enable** button, `PUT /api/repos/<id>`, or
 `uzi server setup`) returns as soon as the enable is saved. The guardrail
 checks and the creation of the column labels still run before it returns, and
 a failure there refuses the enable. The first import of the repo's issues does
-not: uzi's background poller runs it right after, so a large repo no longer
+not: uzi's background poller runs it right after a web or API enable (after
+`uzi server setup`, on the poller's next pass), so a large repo no longer
 holds the request open. Until it finishes, the board shows a banner and keeps
 showing any cards it already has:
 
@@ -361,12 +362,14 @@ showing any cards it already has:
   there is nothing to click.
 
 The banner goes away once the import succeeds, including for a repo with no
-issues. A repo turned on by an older release shows no banner. If the server
+issues. A repo turned on by an older release shows no banner until it is
+enabled again. If the server
 restarts mid-import, the poller picks it up again on its first pass. One pass
 is bounded by the poller's time budget, so a repo too large to import within
 it keeps showing the failed banner and retrying. The board's **Refresh**
 button and the first read of a board with no columns still sync inside their
-own request.
+own request, and neither changes the banner: it updates on the poller's next
+pass.
 
 One exception, and it looks like a bug if you do not know about it. Issues
 without the `uzi` label are synced **open-only**, so closing one on the forge
