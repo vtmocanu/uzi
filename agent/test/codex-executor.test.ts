@@ -21298,7 +21298,8 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
           assert.equal(parks, 1);
         } else await assert.rejects(running, (error: unknown) => {
           if (control === "source") assert.equal(error, sourceError);
-          else if (control === "claim") assert.ok(error instanceof CodexRequestFailure && error.kind === "parent_abort");
+          else if (control === "claim" && (boundary === "credential" || boundary === "effect"))
+            assert.ok(error instanceof CodexRequestFailure && error.kind === "parent_abort");
           else if (control === "pause") assert.ok(error instanceof PauseNowSignal);
           else assert.equal((error as Error).message, "run cancelled");
           return true;
@@ -21306,7 +21307,7 @@ describe("CodexExecutor: zero-evidence idle recovery (#3462)", () => {
         assert.equal(rig.providerLaunches(), 1);
         assert.equal(released, boundary === "credential" || boundary === "effect" ? 2 : 1);
         assert.equal(effects, 1, "no replacement effect root after lost authority");
-        assert.equal(retries, boundary === "teardown" && control !== "source" && control !== "claim" ? 0 : 1);
+        assert.equal(retries, boundary === "teardown" && control !== "source" ? 0 : 1);
       } finally { for (const epoch of rig.epochs) epoch.transport.end(); t.mock.timers.reset(); }
     });
 
@@ -25915,11 +25916,30 @@ describe("2833 Codex inline summaries", () => {
       let fenced = false;
       let abandoned = false;
       const teardown: { aborted: boolean; abandoned: boolean }[] = [];
+      const disposal: { aborted: boolean; abandoned: boolean }[] = [];
+      const effectCleanup: { aborted: boolean; abandoned: boolean }[] = [];
+      const launchEffect = rig.deps.launchEffectRoot!;
+      rig.deps = { ...rig.deps, launchEffectRoot: async (...args) => {
+        const root = await launchEffect(...args);
+        const dispose = root.dispose.bind(root);
+        root.dispose = async (...rest) => {
+          effectCleanup.push({ aborted: input?.signal?.aborted === true, abandoned });
+          input?.onUsage?.(usage);
+          return dispose(...rest);
+        };
+        return root;
+      } };
       const reap = rig.root.reap.bind(rig.root);
       rig.root.reap = async (...args) => {
         teardown.push({ aborted: input?.signal?.aborted === true, abandoned });
         input?.onUsage?.(usage);
         return reap(...args);
+      };
+      const dispose = rig.root.dispose.bind(rig.root);
+      rig.root.dispose = async (...args) => {
+        disposal.push({ aborted: input?.signal?.aborted === true, abandoned });
+        input?.onUsage?.(usage);
+        return dispose(...args);
       };
       const log = { ...noopLog, warn: (message: string) => {
         if (message === "intent summary did not settle within the bound") abandoned = true;
@@ -25947,6 +25967,7 @@ describe("2833 Codex inline summaries", () => {
         },
       });
       if (close === "capture" || close === "cancel") await assert.rejects(executor.run(ctx), /capture-ended-run/);
+      else if (close === "fence") await assert.rejects(executor.run(ctx), /run cancelled/);
       else assert.equal((await executor.run(ctx)).branch, ctx.branch);
       assert.equal(input?.signal?.aborted, true);
       input?.onUsage?.(usage);
@@ -25955,8 +25976,21 @@ describe("2833 Codex inline summaries", () => {
       assert.equal(emitted.filter(m => m.kind === "summary_usage").length, 0);
       assert.equal(abandoned, true, "intent reached bounded abandonment");
       if (close === "terminal" || close === "fence") {
-        assert.deepEqual(teardown, [{ aborted: true, abandoned: true }], "abort and bounded abandonment precede provider reap");
-        assert.ok(rig.disposed() > 0);
+        if (close === "fence") {
+          // The iteration fence precedes the lazy provider launch. Existing
+          // effect roots still clean up only after advisory abandonment.
+          assert.equal(rig.providerLaunches(), 0);
+          assert.deepEqual(teardown, []);
+          assert.deepEqual(disposal, []);
+        } else {
+          assert.deepEqual(teardown, [{ aborted: true, abandoned: true }]);
+          assert.deepEqual(disposal, [{ aborted: true, abandoned: true }]);
+          assert.ok(rig.disposed() > 0);
+        }
+        assert.ok(effectCleanup.length > 0, "existing effect roots clean up after the advisory");
+        assert.ok(effectCleanup.every(observed => observed.aborted && observed.abandoned),
+          "abort and bounded abandonment precede effect cleanup");
+        assert.ok(rig.fileopDisposed() > 0);
       }
     });
   }
@@ -26088,6 +26122,7 @@ describe("2833 Codex inline summaries", () => {
         },
       });
       if (invalidation === "cancel") await assert.rejects(executor.run(ctx));
+      else if (invalidation === "fence") await assert.rejects(executor.run(ctx), /run cancelled/);
       else {
         const result = await executor.run(ctx);
         assert.equal(result.summaryPlan, invalidation === "none" ? "accepted summary" : undefined);
