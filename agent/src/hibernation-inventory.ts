@@ -3,8 +3,10 @@
 // The api puts a `hibernation_inventory` member in the heartbeat response; this worker quiesces its
 // own data-volume writers, upgrades the pod-epoch lock to exclusive, takes a census and reports it
 // (with the identity echo the api binds) under writer exclusion held until the pod terminates.
-// Only the DinD lane participates (the capability `hibernation_inventory_v1` is advertised nowhere
-// else); every other lane has no proven exclusion mechanism and keeps its volumes.
+// Only Docker-scoped workers outside the isolated lane advertise `hibernation_inventory_v1`
+// (main.ts hibernationControllerWiring). Of those, only the DinD lane with supported epoch
+// ownership runs the exclusion; a degraded or epoch-unsupported one answers `unsupported` naming
+// `dind_prune` (#4369). Every other lane has no proven exclusion mechanism and keeps its volumes.
 //
 // Exclusion = epoch lock EX + writer latch + quiescence:
 //   - the claim gate is closed under the `hibernation_inventory` owner (no new run/chat/cross-check claim);
