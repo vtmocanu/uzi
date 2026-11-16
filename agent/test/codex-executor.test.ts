@@ -32372,13 +32372,14 @@ describe("M2 actualRunner credential replacement", () => {
   for (const [oldClaim, target] of [[SUBSCRIPTION, API_KEY], [API_KEY, SUBSCRIPTION],
     [SUBSCRIPTION, { ...SUBSCRIPTION, generation: 20, chatgpt_account_id: "M2-B-account" }]] as const) {
     for (const phase of ["factory", "already-running-body"] as const) {
-      for (const publication of ["resume-refuse-fresh", "resume-uncertain", "baseline", "clean-apply-uncertain", "clean-successor-epoch-advance", "clean-pending-disappears", "clean-stopped-lost-reply", "clean-stopped-unconfirmed", "clean-stopped-unsupported", "clean-stopped-withdrawn", "clean-stopped-already-paused", "root-reap-unproven", "preflight-target-mismatch", "preflight-foreign-op", "preflight-busy-ready", "preflight-transport-ready", "persist-clear-confirmed", "persist-clear-owner-lost", "persist-clear-nonce-changed", "persist-clear-rejected", "persist-clear-lost-reply", "persist-clear-empty-reply", "persist-clear-pending", "inspect-missing-clear-confirmed", "inspect-unknown-clear-confirmed", "gated", "before-scope-clear", "after-scope-clear", "before-scope-install", "after-scope-install", "before-executor-publication", "before-Now-publication", "after-Now-publication", "before-B-preparation", "Now-finish-false", "publish-failure", "now-publish-failure", "login-failure", "subscription-refresh", "api-key-refresh", "subscription-refresh-prepare-failure", "subscription-refresh-cancel", "crash-after-a-teardown-recovery", "crash-apply-reply-lost-recovery", "crash-apply-ack-recovery", "crash-login-recovery"] as const) {
+      for (const publication of ["resume-refuse-preserve", "resume-refuse-fresh", "resume-uncertain", "baseline", "clean-apply-uncertain", "clean-successor-epoch-advance", "clean-pending-disappears", "clean-stopped-lost-reply", "clean-stopped-unconfirmed", "clean-stopped-unsupported", "clean-stopped-withdrawn", "clean-stopped-already-paused", "root-reap-unproven", "preflight-target-mismatch", "preflight-foreign-op", "preflight-busy-ready", "preflight-transport-ready", "persist-clear-confirmed", "persist-clear-owner-lost", "persist-clear-nonce-changed", "persist-clear-rejected", "persist-clear-lost-reply", "persist-clear-empty-reply", "persist-clear-pending", "inspect-missing-clear-confirmed", "inspect-unknown-clear-confirmed", "gated", "before-scope-clear", "after-scope-clear", "before-scope-install", "after-scope-install", "before-executor-publication", "before-Now-publication", "after-Now-publication", "before-B-preparation", "Now-finish-false", "publish-failure", "now-publish-failure", "login-failure", "subscription-refresh", "api-key-refresh", "subscription-refresh-prepare-failure", "subscription-refresh-cancel", "crash-after-a-teardown-recovery", "crash-apply-reply-lost-recovery", "crash-apply-ack-recovery", "crash-login-recovery"] as const) {
         if (publication !== "baseline" && (phase !== "factory" || (oldClaim !== API_KEY && target !== API_KEY))) continue;
         if (publication === "subscription-refresh" && target.auth_mode !== "subscription") continue;
         if (publication === "api-key-refresh" && target.auth_mode !== "api_key") continue;
         const resumeRefusal = publication === "resume-refuse-fresh";
         const resumeUncertain = publication === "resume-uncertain";
-        const resumeVariant = resumeRefusal || resumeUncertain;
+        const resumePreserve = publication === "resume-refuse-preserve";
+        const resumeVariant = resumeRefusal || resumeUncertain || resumePreserve;
         if (resumeVariant && (oldClaim !== API_KEY || target !== SUBSCRIPTION || phase !== "factory")) continue;
         const successorEpochAdvance = publication === "clean-successor-epoch-advance";
         const cleanApplyUncertain = publication === "clean-apply-uncertain";
@@ -32425,6 +32426,7 @@ describe("M2 actualRunner credential replacement", () => {
       it((publication === "baseline"
         ? `M2 actualRunner ${oldClaim.auth_mode} to ${target.auth_mode} ${phase} account resumes saved thread`
         : resumeRefusal ? "Codex real Runner confirmed B resume refusal starts exactly one fresh lineage"
+        : resumePreserve ? "Codex real Runner wire preserve-only claim re-holds confirmed B saved-thread resume refusal"
         : resumeUncertain ? "Codex real Runner uncertain B resume failure pauses without fresh fallback"
         : successorEpochAdvance ? "Codex real Runner rejects successor READY epoch 12 after latching epoch 11"
         : cleanApplyUncertain ? "Codex real Runner clean A teardown then uncertain apply parks ownership without custody hold"
@@ -32515,7 +32517,7 @@ describe("M2 actualRunner credential replacement", () => {
         client.reportState = async (id, body, ...args) => {
           reports.push(body.status);
           dispositions.push({ status: body.status, failure_reason: body.failure_reason });
-          if (resumeUncertain && body.status === "credential_switch_uncertain") {
+          if ((resumeUncertain || resumePreserve) && body.status === "credential_switch_uncertain") {
             assert.equal(id, claim.run_id);
             assert.equal(body.claim_generation, 7);
             assert.equal(body.op_id, "M2-op");
@@ -32656,7 +32658,7 @@ describe("M2 actualRunner credential replacement", () => {
           return { kind: "confirmed" as const };
         });
         client.getRunOwnership = async () => {
-          if (cleanRetainedStop || resumeUncertain) {
+          if (cleanRetainedStop || resumeUncertain || resumePreserve) {
             if (cleanOwnership.status === "paused") cleanPausedObservations.push({ ...cleanOwnership });
             return { ...cleanOwnership };
           }
@@ -32734,6 +32736,46 @@ describe("M2 actualRunner credential replacement", () => {
         await fs.writeFile(path.join(source, "auth.json"), "M2-A-auth-canary");
         await fs.writeFile(path.join(source, "unapproved.txt"), "not a session");
         await CodexSessionStore.persist(source, store);
+        const policyHolds: PolicyHoldRequest[] = [];
+        let custodyReleases = 0, sourceJournal: string | undefined, sourceBranch: string | undefined;
+        let releasesAtResume = 0, refreshesAtResume = 0;
+        const policyOutbox = resumePreserve ? new Outbox({ root: path.join(dir, "policy-outbox"), log: noopLog,
+          runMaxBytes: 64 * 1024 * 1024, maxBytes: 128 * 1024 * 1024, retentionMs: 86400000 }) : undefined;
+        if (resumePreserve) {
+          // A preserve-only CLAIM with no held-head requirement still requires a real saved ID and
+          // retained transcript at phaseResume admission; no owner Fresh allowance is supplied.
+          claim.session_id = savedId;
+          claim.policy_preserve_only = true;
+          claim.plan_source = "agent";
+          claim.auto_approve = true;
+          await CodexSessionStore.persist(source, path.join(m2Runner.homeDir, "codex-session-store"));
+          await policyOutbox!.init();
+          api.setRegisterProtocolFeatures(["provider_policy_hold_v1", "claim_generation_fence"]);
+          await client.register("live-preserve", "base", 1, [], ["provider_policy_hold_v1"], undefined, 0);
+          client.reportPolicyHold = async (id, body) => {
+            assert.equal(id, claim.run_id);
+            assert.ok(switchError instanceof PolicyContinuationRejected, "actual switch rejection reaches policy reporting");
+            policyHolds.push(structuredClone(body));
+            return { disposition: "applied", outcome_id: body.outcome_id, source_generation: body.source_generation,
+              observed_status: "paused", observed_generation: body.claim_generation, hold_reason: "codex_policy_hold" };
+          };
+          t.mock.method(client, "releaseRecoveryCustody", async () => {
+            custodyReleases++;
+            return { run_id: claim.run_id, released: true, holds_released: 1 };
+          });
+          const attach = m2Runner.git.createOrAttachRunnerClone.bind(m2Runner.git);
+          t.mock.method(m2Runner.git, "createOrAttachRunnerClone", async (...args: Parameters<typeof attach>) => {
+            const clone = await attach(...args);
+            // Keep the real clone's source journal before Runner admission, without fabricating
+            // clone recovery results or changing the executor's preserveConversation context.
+            await m2Runner.git.markRecoveryCapture(args[0], clone.path, clone.branch, claim.run_id, clone.attemptId);
+            sourceBranch = clone.branch;
+            sourceJournal = spawnSync("git", ["-C", args[0], "config", `uzi-recovery.${clone.branch}.clone`],
+              { env: gitEnv(), encoding: "utf8" }).stdout.trim();
+            assert.ok(sourceJournal);
+            return clone;
+          });
+        }
         const aEntered = installerBarrier(), bEntered = installerBarrier();
         const publicationStages = crashRecovery
           ? ["before-apply", "apply-reply-lost", "before-publish", "after-publish", "before-prepare", "login", "prepared"] as const
@@ -32913,8 +32955,10 @@ describe("M2 actualRunner credential replacement", () => {
           if (method === "thread/resume") {
             resumedThreads.push(rec(params).threadId);
             if (resumeVariant) {
+              releasesAtResume = credentialReleases;
+              refreshesAtResume = credentialRefreshes;
               await publicationBoundary("resume");
-              throw new CodexTransportError({ category: "protocol", message: resumeRefusal
+              throw new CodexTransportError({ category: "protocol", message: resumeRefusal || resumePreserve
                 ? "codex app-server returned a JSON-RPC error (code -32602)"
                 : "codex app-server returned an unclassifiable protocol failure" });
             }
@@ -32968,7 +33012,7 @@ describe("M2 actualRunner credential replacement", () => {
               restartAttempts++;
               await publicationBoundary("before-prepare");
               const result = await lease.restartAndResume(...args);
-              if (!resumeRefusal) await publicationBoundary("prepared");
+              if (!resumeRefusal && !resumePreserve) await publicationBoundary("prepared");
               return result;
             },
             startFreshLineage: async (...args) => {
@@ -33004,6 +33048,12 @@ describe("M2 actualRunner credential replacement", () => {
             { name: "lead", description: "lead", prompt_body: "lead", tools: null, skills: [] },
             { name: "coder", description: "coder", prompt_body: "coder", tools: null, skills: [] },
           ];
+          if (resumePreserve) {
+            assert.equal(claim.policy_preserve_only, true);
+            assert.equal(ctx.preserveConversation, true, "Runner maps the CLAIM policy before executor entry");
+            assert.equal(ctx.policyFreshAllowance, undefined);
+            assert.equal(ctx.sessionId, savedId, "initial A admission retained the persisted conversation");
+          }
           context = ctx;
           retainedPrepareRootDispatch = ctx.prepareCodexRootDispatch;
           worktree = ctx.worktreePath;
@@ -33020,6 +33070,8 @@ describe("M2 actualRunner credential replacement", () => {
         const diagnostics = recordingLogger();
         const runner = m2Runner.runnerWith(() => { factories++; return { executor, homeDir: m2Runner.homeDir }; },
           m2Runner.fakeGitlab().gitlab, undefined, diagnostics.logger, {
+            ...(policyOutbox ? { outbox: policyOutbox,
+              activeRuns: new ActiveRunRegistry(() => policyOutbox.listPendingTerminals(), () => 10) } : {}),
             now: () => Date.now() + clockOffset,
             nowSummary: { homeRoot: dir, queryFn: (() => { throw new Error("Codex Now reached Claude"); }) as never,
               codexAdviceHarnessFactory: (async (params: import("../src/codex/codex-executor.js").CodexAdviceHarnessBuildParams) => {
@@ -33281,6 +33333,10 @@ describe("M2 actualRunner credential replacement", () => {
           operationScope?: object;
           parked: boolean;
           keepGuardedInventoryOpen: boolean;
+          preserveRecoveryClone: boolean;
+          preserveSession: boolean;
+          retainedLocalCustody: boolean;
+          policyHold?: { outcomeId: string };
         };
         const flightBuilder = runner as unknown as { buildFlight(...args: unknown[]): ObservedFlight };
         const buildFlight = flightBuilder.buildFlight;
@@ -33834,11 +33890,89 @@ describe("M2 actualRunner credential replacement", () => {
               if ((publication === "publish-failure" && barrier.stage === "after-publish") ||
                   ((publication === "login-failure" || publication === "api-key-refresh") && barrier.stage === "login") ||
                   (crashRecovery && barrier.stage === crashStage) ||
-                  (resumeUncertain && barrier.stage === "resume") ||
+                  ((resumeUncertain || resumePreserve) && barrier.stage === "resume") ||
                   (queuedRefreshStop && barrier.stage === "prepared") ||
                   (publication === "now-publish-failure" && barrier.stage === "after-publish")) break;
             }
-            assert.equal(consumerProbes.length, resumeVariant ? resumeUncertain ? 5 : 7 : injectedStage ? failureBoundaryCount : crashRecovery ? publicationStages.findIndex(stage => stage === crashStage) + 1 : publication === "publish-failure" || publication === "now-publish-failure" ? 2 : (publication === "login-failure" || publication === "api-key-refresh" || crashRecovery) ? 4 : 5);
+            assert.equal(consumerProbes.length, resumeVariant ? resumeUncertain || resumePreserve ? 5 : 7 : injectedStage ? failureBoundaryCount : crashRecovery ? publicationStages.findIndex(stage => stage === crashStage) + 1 : publication === "publish-failure" || publication === "now-publish-failure" ? 2 : (publication === "login-failure" || publication === "api-key-refresh" || crashRecovery) ? 4 : 5);
+            if (resumePreserve) {
+              await withTimeout(running, 5000, "confirmed B refusal reaches policy re-hold").catch(error => {
+                throw new Error(JSON.stringify({ switchError: switchError instanceof Error ? { name: switchError.name, message: switchError.message } : switchError,
+                  policyHoldCount: policyHolds.length, reports, dispositions,
+                  diagnostics: diagnostics.lines.slice(-8).map(line => JSON.stringify(line).slice(0, 1200)) }), { cause: error });
+              });
+              await joinNowConsumerProbes();
+              assert.ok(switchError instanceof PolicyContinuationRejected);
+              assert.equal(switchError.cause, "provider_resume_rejected");
+              const policyFlight = actualFlight as unknown as { policyReservation?: symbol; cancel: AbortController; steering: SteeringChannel };
+              assert.equal(policyHolds.length, 1, JSON.stringify({ expected: "policy reporting, not only the generic owner pause",
+                negotiated: client.supportsPolicyHold, reservation: !!policyFlight.policyReservation,
+                cancelAborted: policyFlight.cancel.signal.aborted, cancelReason: policyFlight.cancel.signal.reason?.name,
+                lifecycleAborted: policyFlight.steering.lifecycleSignal().aborted,
+                lifecycleReason: policyFlight.steering.lifecycleSignal().reason?.name,
+                logs: diagnostics.lines.slice(-4) }));
+              const held = policyHolds[0]!;
+              assert.equal(held.cause, "provider_resume_rejected");
+              assert.equal(held.detail, "resume_rejected");
+              assert.equal(held.continuation_mode, "same_conversation");
+              assert.equal(held.claim_generation, 7);
+              assert.equal(held.session_id, savedId);
+              assert.equal(actualFlight!.policyHold?.outcomeId, held.outcome_id);
+              assert.equal(actualFlight!.preserveRecoveryClone, true);
+              assert.equal(actualFlight!.preserveSession, true);
+              assert.equal(actualFlight!.keepGuardedInventoryOpen, true);
+              assert.equal(actualFlight!.retainedLocalCustody, true);
+              assert.equal(actualFlight!.worktreePath, worktree);
+              assert.equal(actualFlight!.runId, claim.run_id);
+              assert.equal(actualFlight!.claimGeneration, 7);
+              assert.equal(custodyReleases, 0);
+              assert.equal(credentialReleases, releasesAtResume, "re-hold cannot release more credentials");
+              assert.equal(credentialRefreshes, refreshesAtResume);
+              assert.ok(sourceJournal, "real source journal was seeded before A admission");
+              assert.equal(spawnSync("git", ["-C", m2Runner.git.barePathFor(m2Runner.fx.originPath), "config",
+                `uzi-recovery.${sourceBranch}.clone`], { env: gitEnv(), encoding: "utf8" }).stdout.trim(), sourceJournal);
+              assert.ok(context.prepareCodexRootDispatch);
+              await assert.rejects(context.prepareCodexRootDispatch(context.terminalLifecycleSignal!, () => {}, "root"),
+                "B ordinary preparation remains closed after policy hold");
+              assert.ok(retainedRootDispatch);
+              await assert.rejects(retainedRootDispatch.prepare(), "A remains retired after policy hold");
+              assert.equal(credentialReleases, releasesAtResume);
+              assert.equal(credentialRefreshes, refreshesAtResume);
+              assert.equal(await fs.readFile(path.join(worktree, "M2-retained.txt"), "utf8"), "A work");
+              assert.equal(await CodexSessionStore.inspectSession(store, savedId), "present");
+              assert.equal(await CodexSessionStore.inspectSession(path.join(m2Runner.homeDir, "codex-session-store"), savedId), "present");
+              assert.equal(committedCodex, next);
+              assert.equal(applies, 1);
+              assert.equal(applyAcknowledgements, 1);
+              assert.deepEqual(teardownResults, [true]);
+              assert.equal(reopenAttempts, 0);
+              assert.equal(factories, 1, "no new claim/executor flight");
+              assert.equal(rig.providerLaunches(), 2);
+              assert.equal(a.transport.threadStartCount, 0, "A resumed the persisted CLAIM session");
+              assert.equal(a.transport.turnStartCount, 1, "A work ran and never revived");
+              assert.deepEqual(resumedThreads, [savedId]);
+              assert.equal(b.transport.threadStartCount, 0);
+              assert.equal(b.transport.turnStartCount, 0);
+              assert.equal(bFinished, false);
+              assert.deepEqual(bChildProbes, ["login", "resume"]);
+              assert.equal(loginObservations.length, 1);
+              const login = loginObservations[0]!;
+              assert.equal(login.params.accessToken, next.access_token);
+              assert.equal(login.reaped, true);
+              assert.equal(login.effectDisposed, true);
+              assert.ok(login.fileopDisposed > 0);
+              assert.equal(ordinaryBRefreshes, 0);
+              assert.deepEqual(reports.filter(status => status.startsWith("credential_switch")), ["credential_switch_uncertain"]);
+              assert.ok(!reports.some(status => ["failed", "completed", "cancelled"].includes(status)));
+              assert.equal(api.messages(claim.run_id).some(message => rec(message.payload).event === "resume_lineage_break"), false);
+              for (const epoch of rig.epochs) {
+                assert.ok(epoch.reaped() > 0);
+                assert.ok(epoch.disposed() > 0);
+              }
+              assert.equal(disposedEffects.size, effects);
+              for (const handle of fileops) assert.ok(handle.disposed() > 0);
+              return;
+            }
             if (publication !== "gated" && publication !== "subscription-refresh" && !resumeRefusal && !preflightRetry) {
               await withTimeout(running, 5000, "failed publication retained stop");
               await joinNowConsumerProbes();
