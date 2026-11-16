@@ -272,6 +272,43 @@ threshold before it is considered again.
 hibernation reason reads "automatic: no run activity for ..." (for example
 "automatic: no run activity for 14d").
 
+#### Surplus warm reserve
+
+With `worker_hibernation_surplus` on (default off; effective only while
+`worker_hibernation_enabled` and `worker_hibernation_auto` are both on), the pass
+also hibernates surplus workers sooner than the long idle rule. Among an owner's
+interchangeable workers, one idle, ready worker stays awake and the pool's other
+idle workers are hibernated once they have shown no run activity for the surplus
+threshold, `worker_hibernation_surplus_idle_after` (default `2h`, between `15m` and
+`336h`). The pass uses the shorter of that and `worker_hibernation_idle_after`; the
+settings card shows a hint when the surplus threshold is longer. See
+[Admin settings](./admin-settings.md#worker-hibernation). The long
+`worker_hibernation_idle_after` rule still applies as before.
+
+**Equivalence pool.** Workers are interchangeable when they share the same owner,
+template, size, isolated lane, Docker setting, effective capabilities, protocol
+capabilities, max concurrent runs and cross-check slots. Ephemeral and unregistered
+workers are in no pool, so the rule never touches them.
+
+**Ready.** A worker counts as ready when it is online with a fresh heartbeat, awake,
+accepting new work (not cordoned, draining or in maintenance), has no assigned run, has
+no pending-outcome overflow, its cache cleanup has settled, and its memory authority is
+not lost. A worker that reported losing memory authority is not counted as ready.
+
+**Which worker stays.** The kept worker is the most recently used ready one in the
+pool. A locked owner vault, the owner's custody-hold limit and an instance intake
+pause do not affect which worker is kept.
+
+**Limits.** The pass makes at most 10 state changes, and at most one per owner per pass,
+oldest first. A worker the usual admission checks refuse records its blocker as it does
+today (see the refusal list above and
+[Diagnosing a blocked hibernation](#diagnosing-a-blocked-hibernation-or-a-stuck-roll)).
+If the api runs with `UZI_ACTIVE_SNAPSHOT_DISABLED`, memory authority is unknown, so
+memory-capable pools are not surplus-hibernated.
+
+**Docker workers.** The [cache cleanup before sleep](#cache-cleanup-before-sleep) runs on
+every surplus sleep, so a re-woken Docker worker starts with a pruned build cache.
+
 #### Diagnosing a blocked hibernation or a stuck roll
 
 The worker JSON carries the pass's last recorded blocker and, for a hosted
