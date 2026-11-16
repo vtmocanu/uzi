@@ -1774,8 +1774,12 @@ effect on the next request. Each newly authorized cross-user read writes one aud
   api.adminRunDebug.enabled) and an admin_ro (uza_) token` on stderr, at most once per command.
   `uzi run recovery <run-id>` prints it only when you hold nothing on the run and one of its per-run
   reads (the run's holds or its capture metadata) returns 404, the answer a refused foreign read
-  gets; its other per-run read failures (401, 403, server errors) stay silent and leave the normal
-  empty result with exit 0, and a cancelled or timed-out read fails the command. The CLI cannot tell
+  gets. Other per-run read failures (401, 403, server errors) stay silent with exit 0. A failed
+  scoped-holds read can still show captures from a successful archives read that the server marked
+  as an admin debug read; the result is empty only when neither read supplies admissible data.
+  A cancelled or expired command context fails the command. A read that hits the 30-second HTTP
+  client timeout while the context is still active follows the other per-run failures: it stays
+  silent with exit 0. The CLI cannot tell
   a refusal from a missing run or an expired token, so the hint is advisory. It never changes the
   exit code: commands that fail on the error still fail with it. When one of your own holds lists
   the run, `run recovery <run-id>` prints no hint (a hold can outlive its run), and with `--json` a
