@@ -32,9 +32,12 @@ func TestAutoAdmitReadsIdlenessOnce(t *testing.T) {
 
 // TestSurplusDecisionReadsIdlenessOnce is the surplus-mode half (issue #4395): a surplus decision
 // takes every member's non-terminal count and anchor from the ONE GetOwnerHibernationPoolInput
-// statement read after both locks, never from GetWorkerIdleness or a separate count; and the
-// pure decision reads exactly those two row fields. Its long-rule fallback goes through autoAdmit,
-// which reads idleness once (TestAutoAdmitReadsIdlenessOnce), so the per-mode count is one.
+// statement read after both locks, never from GetWorkerIdleness or a separate idleness read; and
+// the pure decision reads exactly those two row fields. The admission itself still goes through
+// hibernateRefusal, which counts the candidate's non-terminal runs again under its row lock as the
+// same refusal gate every hibernation uses; that count is a recheck, not a decision input. The
+// long-rule fallback goes through autoAdmit, which reads idleness once
+// (TestAutoAdmitReadsIdlenessOnce).
 func TestSurplusDecisionReadsIdlenessOnce(t *testing.T) {
 	body := funcBody(t, "hibernation_pool.go", "func (s *Service) poolAttempt(")
 	if n := strings.Count(body, ".GetOwnerHibernationPoolInput("); n != 1 {
@@ -56,7 +59,7 @@ func TestSurplusDecisionReadsIdlenessOnce(t *testing.T) {
 // funcBody returns the source of the function that starts with header in file.
 func funcBody(t *testing.T, file, header string) string {
 	t.Helper()
-	src, err := os.ReadFile(file)
+	src, err := os.ReadFile(file) //nolint:gosec // G304: callers pass fixed repo-relative source file names in a test, not user input
 	if err != nil {
 		t.Fatal(err)
 	}

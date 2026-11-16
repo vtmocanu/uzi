@@ -237,7 +237,9 @@ func TestDecideSurplus(t *testing.T) {
 	}
 	atCutoff := cand
 	atCutoff.Anchor = pgconv.Time(cutoff)
-	if d := decideSurplus([]poolRow{atCutoff, keeper}, atCutoff.ID, poolNow, poolStale, cutoff, true); d.Action != decisionAutoSurplus {
+	recentKeeper := keeper
+	recentKeeper.Anchor = pgconv.Time(cutoff.Add(time.Hour)) // ranks above the candidate
+	if d := decideSurplus([]poolRow{atCutoff, recentKeeper}, atCutoff.ID, poolNow, poolStale, cutoff, true); d.Action != decisionAutoSurplus {
 		t.Fatalf("a candidate idle exactly the threshold: %+v", d)
 	}
 	unpooled := cand
@@ -252,6 +254,22 @@ func TestDecideSurplus(t *testing.T) {
 	// keeper that is ready is the keeper regardless of them (PRD D17).
 }
 
+// The candidate is never the keeper: when it ranks first among all ready idle members it is not
+// admitted with the next member standing in as keeper.
+func TestDecideSurplusCandidateRankingFirstIsNone(t *testing.T) {
+	cutoff := poolNow.Add(-2 * time.Hour)
+	recent, older := readyRow(1), readyRow(2)
+	recent.Anchor = pgconv.Time(poolNow.Add(-3 * time.Hour))
+	older.Anchor = pgconv.Time(poolNow.Add(-9 * time.Hour))
+	rows := []poolRow{recent, older}
+	if d := decideSurplus(rows, recent.ID, poolNow, poolStale, cutoff, true); d.Action != decisionNone || d.Why != noneNoKeeper {
+		t.Fatalf("the top-ranked candidate must stay: %+v", d)
+	}
+	if d := decideSurplus(rows, older.ID, poolNow, poolStale, cutoff, true); d.Action != decisionAutoSurplus || d.Keeper != recent.ID {
+		t.Fatalf("the older member is surplus with the recent one as keeper: %+v", d)
+	}
+}
+
 // TestDecideSurplusMemoryAuthorityUnknown: with the active-snapshot kill switch on, memory
 // authority is never persisted, so a pool of memory-capable members has unknown readiness and no
 // decision is made; a pool without the capabilities is decided as usual.
@@ -259,6 +277,7 @@ func TestDecideSurplusMemoryAuthorityUnknown(t *testing.T) {
 	cutoff := poolNow.Add(-2 * time.Hour)
 	cand, keeper := readyRow(1), readyRow(2)
 	cand.Anchor = pgconv.Time(poolNow.Add(-5 * time.Hour))
+	keeper.Anchor = pgconv.Time(poolNow.Add(-3 * time.Hour)) // ranks first, so the candidate is not the keeper
 	caps := []string{capability.WorkerMemoryPressureV1, capability.WorkerMemoryAuthorityClaimV1}
 	cand.ProtocolCapabilities, keeper.ProtocolCapabilities = caps, caps
 	if d := decideSurplus([]poolRow{cand, keeper}, cand.ID, poolNow, poolStale, cutoff, false); d.Action != decisionNone || d.Why != noneMemoryAuthUnsure {

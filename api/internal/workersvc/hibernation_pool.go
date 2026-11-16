@@ -218,8 +218,10 @@ func decideSurplus(rows []poolRow, candidate uuid.UUID, now time.Time, stale tim
 			members = append(members, r)
 		}
 	}
-	keeper, ok := pickKeeper(members, candidate, now, stale)
-	if !ok {
+	// Rank every ready idle member, the candidate included: the candidate is never the keeper,
+	// so when it ranks first no other member is the deterministic keeper and nothing is decided.
+	keeper, ok := pickKeeper(members, uuid.Nil, now, stale)
+	if !ok || keeper == candidate {
 		return poolDecision{Action: decisionNone, Why: noneNoKeeper}
 	}
 	return poolDecision{Action: decisionAutoSurplus, Keeper: keeper}

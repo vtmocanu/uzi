@@ -16,8 +16,10 @@ import (
 )
 
 // Issue #4395 M1: surplus hibernation over a real database. Skipped without
-// UZI_TEST_DATABASE_URL (run via ./e2e/run-store-it.sh). Every assertion is per seeded worker,
-// never a global count, because the database is shared with other packages' fixtures.
+// UZI_TEST_DATABASE_URL (run via ./e2e/run-store-it.sh). Outcomes are asserted per seeded worker
+// (state, reason, blocker). A test also asserts HibernationAutoPass's returned count where that
+// count is the property under test (the shared per-pass cap) or a cheap cross-check beside the
+// per-worker assertions; the count is never the only evidence.
 
 // poolSettings is autoSettings with the surplus switches under test's control.
 type poolSettings struct {
@@ -317,6 +319,27 @@ func TestHibernationSurplusRefusalRecordedLiveDB(t *testing.T) {
 	p.wantStates(map[uuid.UUID]string{second: "preparing", keeper: "none"})
 }
 
+// The candidate is never the keeper: when the most recently used member is itself a candidate and
+// ranks first, it stays awake even though the older member refuses. The older member is tried
+// first (oldest anchor), is refused by an open custody hold (custody does not affect readiness)
+// and records its blocker; the recent one is decided none, never hibernated with the older one as
+// "keeper".
+func TestHibernationSurplusCandidateNeverKeeperLiveDB(t *testing.T) {
+	p := newPoolFx(t)
+	older, recent := p.member(9*time.Hour), p.member(5*time.Hour)
+	p.seedOpenCustodyHold(older)
+	p.pass(older, recent)
+	w := p.row(older)
+	if w.HibernationState != "none" || w.HibernationBlockedReason.String != BlockedCustodyHold {
+		t.Fatalf("older: state %q blocked %+v, want none/custody_hold", w.HibernationState, w.HibernationBlockedReason)
+	}
+	r := p.row(recent)
+	if r.HibernationState != "none" || r.HibernationReason.Valid {
+		t.Fatalf("recent: state %q reason %+v, want untouched awake", r.HibernationState, r.HibernationReason)
+	}
+	wantNotBlocked(t, r)
+}
+
 // Budgets: one state change per owner per pass; the shared cap; owners served oldest-first.
 func TestHibernationSurplusBudgetsLiveDB(t *testing.T) {
 	t.Run("one change per owner per pass", func(t *testing.T) {
@@ -421,7 +444,7 @@ func TestHibernationSurplusLockTimeoutLiveDB(t *testing.T) {
 	if n := p.pass(busyKeep, freeCand, freeKeep); n != 0 { // busyCand is row-locked: no heartbeat write
 		t.Fatalf("pass with a row lock held = %d, want 0", n)
 	}
-	p.wantStates(map[uuid.UUID]string{busyCand: "none"})
+	p.wantStates(map[uuid.UUID]string{busyCand: "none", busyKeep: "none", freeCand: "preparing", freeKeep: "none"})
 	_ = rowTx.Rollback(p.env.ctx)
 	if n := p.pass(all...); n != 1 {
 		t.Fatalf("pass after release = %d, want 1", n)
@@ -442,7 +465,7 @@ func TestHibernationSurplusOwnerLockConcurrencyLiveDB(t *testing.T) {
 	p := newPoolFx(t)
 	hb := p.clock // heartbeat of A; B's is a stale window later
 	stale := testParams().WorkerHeartbeatStale
-	a := p.member(6 * time.Hour)
+	a := p.member(5 * time.Hour) // more recent anchor: the keeper whenever it is ready
 	b := p.member(6 * time.Hour)
 	p.env.exec(`UPDATE workers SET last_heartbeat_at = $2 WHERE id = $1`, a, hb)
 	p.env.exec(`UPDATE workers SET last_heartbeat_at = $2 WHERE id = $1`, b, hb.Add(stale))
