@@ -378,7 +378,20 @@ func (m *Materializer) retireHibernationHistory(ctx context.Context, t *rollTick
 			continue
 		}
 		dependents := false
+		// A desired peer the controller could not render keeps its Deployment and claims
+		// but never reached the roll snapshot, so its roll evidence was never observed
+		// and cannot be positively attributed to another owner. It stays in scope unless
+		// its placement is known to be another namespace.
+		for _, u := range t.unplanned {
+			if !u.nsKnown || u.ns == e.ns {
+				dependents = true
+				break
+			}
+		}
 		for _, p := range t.entries {
+			if dependents {
+				break
+			}
 			if p == e || p.ns != e.ns {
 				continue
 			}

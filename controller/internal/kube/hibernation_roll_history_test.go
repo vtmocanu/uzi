@@ -640,6 +640,68 @@ func TestHibernationPeerEvidenceRefusesCohortPending(t *testing.T) {
 	})
 }
 
+// 5b: a desired non-ephemeral peer the controller cannot render (its template/size does
+// not resolve, or its placement fails) keeps its Deployment and claims but never reaches
+// the roll snapshot, so its roll evidence is unknown. It must keep the candidate in
+// scope unless its placement is known to be another namespace.
+func TestHibernationUnrenderablePeerRefusesCohortPending(t *testing.T) {
+	cases := map[string]struct {
+		build func(t *testing.T) (protocol.DesiredWorker, []runtime.Object)
+	}{
+		"unresolvable template with an incomplete marker": {func(t *testing.T) (protocol.DesiredWorker, []runtime.Object) {
+			w, objs := rhPeer(t, "w2", false, nil)
+			w.Template = "no-such-template"
+			return w, objs
+		}},
+		"unresolvable size with no roll metadata": {func(t *testing.T) (protocol.DesiredWorker, []runtime.Object) {
+			w := evidence(desired("w2"), m5Now)
+			objs := []runtime.Object{rhPlainDep(t, w), pvcNix("w2", "20Gi"), pvcFor("w2", "data")}
+			w.Size = "no-such-size"
+			return w, objs
+		}},
+		"unresolvable template with no roll metadata": {func(t *testing.T) (protocol.DesiredWorker, []runtime.Object) {
+			w := evidence(desired("w2"), m5Now)
+			objs := []runtime.Object{rhPlainDep(t, w), pvcNix("w2", "20Gi"), pvcFor("w2", "data")}
+			w.Template = "no-such-template"
+			return w, objs
+		}},
+		"placement fails (docker worker, no docker namespace configured)": {func(t *testing.T) (protocol.DesiredWorker, []runtime.Object) {
+			w, objs := rhPeer(t, "w2", false, nil)
+			w.Docker = true
+			return w, objs
+		}},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			w := rhW(protocol.HibernationPreparing, "op-1")
+			w2, peerObjs := c.build(t)
+			canary := rhCanaryDep(t, true)
+			orig := canary.Annotations[annotationRoll]
+			m, client, rec := hibEnv(t, rhObjs([]runtime.Object{canary, hibPod("pod-uid-1", "x", true, false)}, peerObjs)...)
+			// The unrenderable peer makes Reconcile report an error for it; the refusal
+			// is what is under test.
+			_ = hibTick(t, m, w, w2)
+			rhAssertRefused(t, rec, refuseRollCohortPending)
+			if got := rhGet(t, client, "w1").Annotations[annotationRoll]; got != orig {
+				t.Fatalf("canary marker changed: %q", got)
+			}
+			if replicaPatches(client) != 0 || rhRollWrites(client, "uzi-hw-w1") != 0 {
+				t.Fatalf("unexpected writes on the candidate: %+v", rhWorkerPatches(client, "uzi-hw-w1"))
+			}
+		})
+	}
+
+	t.Run("control: an unrenderable peer placed in another namespace does not block", func(t *testing.T) {
+		w := rhW(protocol.HibernationPreparing, "op-1")
+		w2 := evidence(desired("w2"), m5Now)
+		w2.Docker, w2.Template = true, "no-such-template"
+		m, client, rec := hibEnv(t, rhCanaryDep(t, true), hibPod("pod-uid-1", "x", true, false))
+		m.cfg.DockerNamespace = "uzi-workers-docker"
+		_ = hibTick(t, m, w, w2)
+		rhAssertSlept(t, client, rec)
+	})
+}
+
 // 5a: a terminating candidate Deployment is never retired or scaled down by this path.
 func TestHibernationTerminatingCandidateIsNotRetired(t *testing.T) {
 	w := rhW(protocol.HibernationPreparing, "op-1")
@@ -911,13 +973,56 @@ func TestHibernationSleepTargetChangeWakeLeavesNoRollHistory(t *testing.T) {
 		}
 	}
 
-	t.Run("existing Deployment wake", func(t *testing.T) {
-		client, rec, m := sleep(t)
-		assertClean(t, client)
-		// The target changes while asleep.
+	// changedTarget is a fresh materializer carrying the changed target (config stamp and
+	// resolver pin), as the controller has after a release moved the pin while asleep.
+	changedTarget := func(t *testing.T, client *fake.Clientset, rec *hibRec) *Materializer {
+		t.Helper()
+		m := rhFresh(t, client, rec)
 		m.cfg.RollTargetVersion = "2.0.0+g123"
+		var err error
+		if m.resolver, err = preset.NewResolver("harbor.example.com/uzi", "v2.0.0"); err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}
+	// assertNewTarget checks that the woken Deployment renders the changed target (the
+	// old and new hashes differ, so a retained old template fails) and has no roll
+	// annotation.
+	assertNewTarget := func(t *testing.T, client *fake.Clientset, m *Materializer, oldHash string) {
+		t.Helper()
+		d := rhGet(t, client, "w1")
+		target := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m"}
+		spec, err := m.resolver.Resolve(target.Template, target.Size)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := RenderDeployment(m.cfg, target, spec)
+		wantHash := want.Spec.Template.Annotations[AnnotationSpecHash]
+		if wantHash == oldHash {
+			t.Fatalf("test setup: the changed target renders the old hash %q", oldHash)
+		}
+		if got := d.Spec.Template.Annotations[AnnotationSpecHash]; got != wantHash {
+			t.Fatalf("woken template hash = %q, want the new target's %q (old %q)", got, wantHash, oldHash)
+		}
+		if got := workerImage(d); got != workerImage(want) || !strings.Contains(got, "v2.0.0") {
+			t.Fatalf("woken image = %q, want %q", got, workerImage(want))
+		}
+		if _, ok := d.Annotations[annotationRoll]; ok {
+			t.Fatalf("woken deployment carries a roll annotation: %q", d.Annotations[annotationRoll])
+		}
+	}
+
+	t.Run("existing Deployment wake", func(t *testing.T) {
+		client, rec, _ := sleep(t)
+		assertClean(t, client)
+		oldHash := rhGet(t, client, "w1").Spec.Template.Annotations[AnnotationSpecHash]
+		// The wake is held while the slept pod still exists; its exit releases it.
+		if err := client.CoreV1().Pods(testConfig().Namespace).Delete(context.Background(), "pod-pod-uid-1", metav1.DeleteOptions{}); err != nil {
+			t.Fatal(err)
+		}
 		rec.calls = nil
-		if err := hibTick(t, rhFresh(t, client, rec), rhW(protocol.HibernationWaking, "wake-op")); err != nil {
+		m := changedTarget(t, client, rec)
+		if err := hibTick(t, m, rhW(protocol.HibernationWaking, "wake-op")); err != nil {
 			t.Fatal(err)
 		}
 		assertClean(t, client)
@@ -926,10 +1031,12 @@ func TestHibernationSleepTargetChangeWakeLeavesNoRollHistory(t *testing.T) {
 				t.Fatalf("wake wrote roll history: %+v", p.body)
 			}
 		}
+		assertNewTarget(t, client, m, oldHash)
 	})
 
 	t.Run("missing Deployment wake", func(t *testing.T) {
 		client, rec, _ := sleep(t)
+		oldHash := rhGet(t, client, "w1").Spec.Template.Annotations[AnnotationSpecHash]
 		if err := client.AppsV1().Deployments(testConfig().Namespace).Delete(context.Background(), "uzi-hw-w1", metav1.DeleteOptions{}); err != nil {
 			t.Fatal(err)
 		}
@@ -937,7 +1044,8 @@ func TestHibernationSleepTargetChangeWakeLeavesNoRollHistory(t *testing.T) {
 			t.Fatal(err)
 		}
 		rec.calls = nil
-		if err := hibTick(t, rhFresh(t, client, rec), rhW(protocol.HibernationWaking, "wake-op")); err != nil {
+		m := changedTarget(t, client, rec)
+		if err := hibTick(t, m, rhW(protocol.HibernationWaking, "wake-op")); err != nil {
 			t.Fatal(err)
 		}
 		d := rhGet(t, client, "w1")
@@ -945,6 +1053,112 @@ func TestHibernationSleepTargetChangeWakeLeavesNoRollHistory(t *testing.T) {
 			t.Fatalf("the wake did not create the Deployment: %+v", d.Annotations)
 		}
 		assertClean(t, client)
+		assertNewTarget(t, client, m, oldHash)
+	})
+
+	// A worker that sleeps, changes target and wakes, then settles into ordinary pacing
+	// beside an unfinished old cohort (an old canary serving and a peer without proof):
+	// it is never admitted into the stale cohort, the peer never reads "without canary",
+	// the cohort is not closed early, and after the peer's proof the history retires on
+	// drift and a new canary is admitted.
+	t.Run("woken worker beside an unfinished old cohort", func(t *testing.T) {
+		w1 := rhW(protocol.HibernationPreparing, "op-1")
+		w2, peerObjs2 := rhPeer(t, "w2", false, nil)
+		w3, peerObjs3 := rhPeer(t, "w3", true, func(r *rollMarker) { r.Completed = true })
+		// rhPeer shares one Deployment UID across peers; ancestry proof keys on it.
+		peerObjs2[0].(*appsv1.Deployment).UID = "uid-w2"
+		peerObjs3[0].(*appsv1.Deployment).UID = "uid-w3"
+		w1Dep := rhPlainDep(t, w1)
+		m, client, rec := hibEnv(t, rhObjs([]runtime.Object{w1Dep, hibPod("pod-uid-1", "x", true, false)}, peerObjs2, peerObjs3)...)
+		all := func(w1 protocol.DesiredWorker) []protocol.DesiredWorker {
+			return []protocol.DesiredWorker{w1, w2, w3}
+		}
+		if err := hibTick(t, m, all(w1)...); err != nil {
+			t.Fatal(err)
+		}
+		rhAssertSlept(t, client, rec)
+		oldHash := rhGet(t, client, "w1").Spec.Template.Annotations[AnnotationSpecHash]
+		if err := client.CoreV1().Pods(testConfig().Namespace).Delete(context.Background(), "pod-pod-uid-1", metav1.DeleteOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		// The target changes while asleep; the wake renders it.
+		m2 := changedTarget(t, client, rec)
+		if err := hibTick(t, m2, all(rhW(protocol.HibernationWaking, "wake-op"))...); err != nil {
+			t.Fatal(err)
+		}
+		assertNewTarget(t, client, m2, oldHash)
+		// Wake settles: hibernation is cleared and the worker is an ordinary awake one.
+		woken := rhW(protocol.HibernationWaking, "wake-op")
+		woken.Hibernation = nil
+		othersPatched := func() []string {
+			var ids []string
+			for _, id := range templatePatches(client) {
+				if id != "uzi-hw-w1" {
+					ids = append(ids, id)
+				}
+			}
+			return ids
+		}
+		assertWokenOutside := func(t *testing.T) {
+			t.Helper()
+			assertNewTarget(t, client, m2, oldHash)
+			for id, o := range m2.PacingOutcomes() {
+				if o.BlockingReason != nil && strings.Contains(*o.BlockingReason, "without canary") {
+					t.Fatalf("%s reads without canary: %s", id, *o.BlockingReason)
+				}
+				if o.CanaryID != nil && *o.CanaryID == "w1" {
+					t.Fatalf("the woken worker is a canary: %+v", o)
+				}
+			}
+			if n := rhRollWrites(client, "uzi-hw-w1"); n != 0 {
+				t.Fatalf("the woken worker was written a roll annotation %d times", n)
+			}
+		}
+		for i := 0; i < 2; i++ {
+			rollTickTest(t, m2, all(woken))
+			assertWokenOutside(t)
+			if ids := othersPatched(); len(ids) != 0 {
+				t.Fatalf("the unfinished cohort was closed or a new roll admitted early: %v", ids)
+			}
+		}
+		if _, ok := rhGet(t, client, "w2").Annotations[annotationRoll]; !ok {
+			t.Fatal("the unproven peer's reservation was cleaned without proof")
+		}
+		if raw := rhGet(t, client, "w3").Annotations[annotationRoll]; raw == "" {
+			t.Fatal("the old canary's history was dropped before the cohort finished")
+		}
+		// The woken worker (an awake, current-target, unmarked pool member) and the peer
+		// both prove their current incarnation.
+		currentProof(t, client, &w2, m5Now)
+		currentProof(t, client, &woken, m5Now)
+		newVersion := m2.cfg.RollTargetVersion
+		woken.RollEvidence.RegisteredVersion = &newVersion
+		for i := 0; i < 4; i++ {
+			rollTickTest(t, m2, all(woken))
+		}
+		// The old cohort finished: the peer's old reservation is gone, replaced by the
+		// new cohort's canary marker for the changed target.
+		var peerMarker rollMarker
+		if raw := rhGet(t, client, "w2").Annotations[annotationRoll]; raw != "" {
+			_ = json.Unmarshal([]byte(raw), &peerMarker)
+		}
+		if peerMarker.TargetVersion != newVersion || !peerMarker.Canary || peerMarker.Completed {
+			t.Fatalf("the peer is not the new cohort's canary after the old cohort finished: %+v", peerMarker)
+		}
+		if raw, ok := rhGet(t, client, "w3").Annotations[annotationRoll]; ok {
+			var r rollMarker
+			_ = json.Unmarshal([]byte(raw), &r)
+			if r.Completed {
+				t.Fatalf("old history was not retired on drift: %+v", r)
+			}
+		}
+		if ids := othersPatched(); len(ids) == 0 {
+			t.Fatal("no new canary was admitted after the old cohort finished")
+		}
+		if _, ok := rhGet(t, client, "w1").Annotations[annotationRoll]; ok {
+			t.Fatal("the woken worker carries a roll annotation after the new canary was admitted")
+		}
+		assertNewTarget(t, client, m2, oldHash)
 	})
 
 	// An unfinished old cohort beside the old canary: the peer never reads "without

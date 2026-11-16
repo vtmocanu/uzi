@@ -83,8 +83,11 @@ type rollTick struct {
 	uncertain map[string]bool
 	// layoutUncertain names, per coverage key, the held worker whose own reservation
 	// could not be shown withdrawn (see holdForLayoutMigration).
-	layoutUncertain   map[string]string
-	errors            []error
+	layoutUncertain map[string]string
+	errors          []error
+	// unplanned lists the non-ephemeral desired workers planRoll could not render
+	// (placement or template/size resolution failed). They never reach the roll snapshot.
+	unplanned         []unplannedWorker
 	unavailable       map[string]bool
 	migrationFences   map[string]bool
 	migrationMultiple bool
@@ -95,6 +98,14 @@ type rollTick struct {
 	// reclaimPolicies memoises this tick's StorageClass reclaim-policy reads for the
 	// hibernation volume inventory (classReclaimPolicy).
 	reclaimPolicies map[string]string
+}
+
+// unplannedWorker is a desired worker outside the roll snapshot. nsKnown is false when
+// its placement failed, so the namespace it keeps its objects in is unknown.
+type unplannedWorker struct {
+	id      string
+	ns      string
+	nsKnown bool
 }
 type rollTickKey struct{}
 
@@ -124,10 +135,12 @@ func (m *Materializer) planRoll(ctx context.Context, desired []protocol.DesiredW
 		}
 		ns, err := m.cfg.Placement(w)
 		if err != nil {
+			t.unplanned = append(t.unplanned, unplannedWorker{id: w.ID})
 			continue
 		}
 		spec, err := m.resolver.Resolve(w.Template, w.Size)
 		if err != nil {
+			t.unplanned = append(t.unplanned, unplannedWorker{id: w.ID, ns: ns, nsKnown: true})
 			continue
 		}
 		target := RenderDeployment(m.cfg, w, spec)
