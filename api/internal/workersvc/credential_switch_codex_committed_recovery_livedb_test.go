@@ -12,6 +12,7 @@ import (
 // Ordinary recovery must claim the committed B binding, never replay the old op.
 func TestCodexCommittedSwitchFreshClaimLiveDB(t *testing.T) {
 	x := newOutageCodexFlight(t, codexAuthModeAPIKey)
+	initialACap := x.p.Secrets.Codex.Capability
 	id := x.f.runID
 	x.env.exec("UPDATE workers SET protocol_capabilities=array_append(array_append(protocol_capabilities,'codex_switch_stopped_v1'),$2), credential_switch_apply_nonce=snapshot_register_nonce WHERE id=$1", x.f.workerID, capability.CodexCredentialSwitchV1)
 	const savedSessionID = "12345678-1234-1234-1234-123456789abc"
@@ -51,6 +52,8 @@ func TestCodexCommittedSwitchFreshClaimLiveDB(t *testing.T) {
 		t.Fatal("fresh claim did not remint the committed B binding")
 	}
 	x.assertAuthority(t, hbWorker(t, x.env, x.f.workerID), applied.Codex.Capability, ErrCodexCapabilityEpoch)
+	x.assertAuthority(t, hbWorker(t, x.env, x.f.workerID), initialACap, ErrCodexCapabilityEpoch)
+	x.assertAuthority(t, hbWorker(t, x.env, x.f.workerID), fresh.Secrets.Codex.Capability, nil)
 	baseline, err := x.env.q.GetCodexClaimBaseline(x.env.ctx, store.GetCodexClaimBaselineParams{RunID: id, UserID: x.f.userID, ClaimGeneration: after.ClaimGeneration})
 	if err != nil || baseline.SecretID != after.CodexSecretID || !baseline.CodexClaimEpoch.Valid ||
 		baseline.CodexClaimEpoch.Int64 != after.CodexClaimEpoch {
