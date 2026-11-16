@@ -1,0 +1,372 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Overview header ideas</title>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  .ember { --bg: 8 10 15; --surface: 15 18 26; --raised: 23 27 38; --edge: 39 45 60; --edge-strong: 58 66 86;
+           --fg: 228 232 240; --muted: 148 158 176; --faint: 122 133 154; --brand: 251 146 60; --warn: 251 191 36; --ok: 52 211 153; --danger: 248 113 113; --accent: 96 165 250; }
+  .dawn  { --bg: 242 244 247; --surface: 255 255 255; --raised: 235 238 243; --edge: 214 219 228; --edge-strong: 174 182 196;
+           --fg: 21 26 34; --muted: 74 85 103; --faint: 95 106 130; --brand: 185 60 11; --warn: 154 74 5; --ok: 4 120 87; --danger: 185 28 28; --accent: 37 99 235; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: "IBM Plex Sans", system-ui, sans-serif; background: #111; color: #ddd; }
+  .intro { padding: 20px 24px 8px; }
+  .intro h1 { font-size: 18px; margin: 0 0 6px; color: #eee; }
+  .intro p { margin: 0 0 6px; font-size: 13px; color: #aaa; line-height: 1.5; max-width: 1100px; }
+  .wbtn { font: inherit; font-size: 12px; margin-right: 6px; padding: 3px 9px; border-radius: 6px; border: 1px solid #555; background: #222; color: #ddd; cursor: pointer; }
+  .wbtn.on { border-color: #fb923c; color: #fb923c; }
+  .stage { padding: 18px 24px 40px; background: rgb(var(--bg)); color: rgb(var(--fg)); }
+  .variant-title { font-size: 15px; font-weight: 600; margin: 34px 0 4px; }
+  .variant-title:first-child { margin-top: 6px; }
+  .tag { font-weight: 500; font-size: 11px; padding: 1px 6px; border-radius: 4px; margin-left: 6px; border: 1px solid rgb(var(--edge)); color: rgb(var(--muted)); }
+  .tag.rec { color: rgb(var(--brand)); border-color: rgb(var(--brand) / .5); }
+  .tag.no { color: rgb(var(--danger)); border-color: rgb(var(--danger) / .5); }
+  .variant-note { font-size: 13px; color: rgb(var(--muted)); margin: 0 0 10px; max-width: 1080px; line-height: 1.55; }
+  .variant-note b { color: rgb(var(--fg)); font-weight: 600; }
+  .screen { display: flex; max-width: 1340px; border: 1px solid rgb(var(--edge)); border-radius: 8px; overflow: hidden; }
+  .sidebar { width: 200px; flex: none; background: rgb(var(--surface)); border-right: 1px solid rgb(var(--edge)); padding: 16px; font-size: 13px; color: rgb(var(--muted)); }
+  .sidebar div { padding: 6px 8px; border-radius: 6px; }
+  .sidebar div.on { background: rgb(var(--raised)); color: rgb(var(--fg)); }
+  main { flex: 1; min-width: 0; padding: 24px; }
+  .hdr { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: 12px 24px; margin-bottom: 18px; }
+  .hdr b.h { display: block; font-size: 22px; font-weight: 600; }
+  .hdr .desc { display: block; margin-top: 4px; font-size: 14px; color: rgb(var(--muted)); }
+  .actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; position: relative; }
+  .chip, .btn { display: inline-flex; align-items: center; gap: 6px; height: 32px; padding: 0 10px; border-radius: 999px; border: 1px solid rgb(var(--edge)); background: rgb(var(--surface)); font-size: 13px; white-space: nowrap; color: rgb(var(--fg)); }
+  .btn { border-radius: 8px; font-weight: 500; }
+  .chip.open { outline: 2px solid rgb(var(--accent) / .5); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: rgb(var(--ok)); display: inline-block; }
+  kbd { font-family: "IBM Plex Mono", monospace; font-size: 11px; color: rgb(var(--muted)); border: 1px solid rgb(var(--edge)); border-radius: 4px; padding: 0 4px; }
+  .back { font-size: 13px; font-weight: 500; color: rgb(var(--brand)); white-space: nowrap; }
+  .card { background: rgb(var(--surface)); border: 1px solid rgb(var(--edge)); border-radius: 14px; padding: 16px 20px; margin-bottom: 16px; }
+  .card h4 { margin: 0 0 10px; font-size: 15px; display: flex; justify-content: space-between; align-items: baseline; }
+  .card h4 small { font-weight: 400; color: rgb(var(--muted)); font-size: 13px; }
+  .card h4 a, .card a.more { font-weight: 500; font-size: 13px; color: rgb(var(--brand)); text-decoration: none; }
+  .row { display: flex; justify-content: space-between; gap: 12px; padding: 8px 0; border-top: 1px solid rgb(var(--edge)); font-size: 14px; }
+  .row .m { color: rgb(var(--muted)); font-size: 13px; }
+  .mono { font-family: "IBM Plex Mono", monospace; font-size: 13px; }
+  .stub { color: rgb(var(--faint)); font-size: 13px; }
+  .grid2 { display: grid; grid-template-columns: minmax(0, 1fr) 22.5rem; gap: 24px; align-items: start; }
+  .healthline { display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 13px; color: rgb(var(--muted)); margin: 0 0 16px; padding: 10px 14px; border: 1px solid rgb(var(--edge)); border-radius: 10px; background: rgb(var(--surface)); }
+  .healthline b { color: rgb(var(--fg)); font-weight: 600; }
+  /* proposal-specific */
+  .new { outline: 2px dashed rgb(var(--brand) / .7); outline-offset: 3px; border-radius: 8px; }
+  .inv { display: flex; flex-wrap: wrap; gap: 4px 6px; align-items: center; margin-top: 8px; font-size: 13px; color: rgb(var(--muted)); }
+  .inv a { color: rgb(var(--fg)); text-decoration: none; border-bottom: 1px dotted rgb(var(--faint)); }
+  .inv a b { font-weight: 600; }
+  .inv .sep { color: rgb(var(--faint)); }
+  .inv .yours { color: rgb(var(--faint)); }
+  .pop { position: absolute; z-index: 5; top: 40px; right: 120px; width: 360px; background: rgb(var(--raised)); border: 1px solid rgb(var(--edge)); border-radius: 12px; box-shadow: 0 20px 50px rgb(0 0 0 / .35); padding: 12px 16px; font-size: 13px; }
+  .pop h5 { margin: 0 0 6px; font-size: 14px; display: flex; justify-content: space-between; }
+  .pop h5 small { font-weight: 400; color: rgb(var(--faint)); }
+  .pop .r { display: flex; justify-content: space-between; padding: 6px 0; border-top: 1px solid rgb(var(--edge)); }
+  .pop .r .c { color: rgb(var(--muted)); }
+  .pop .foot { padding-top: 8px; border-top: 1px solid rgb(var(--edge)); display: flex; justify-content: space-between; }
+  .pop .foot a { color: rgb(var(--accent)); text-decoration: none; }
+  .badge { border-radius: 6px; padding: 0 6px; font-weight: 500; font-size: 12px; border: 1px solid; }
+  .b-ok { color: rgb(var(--ok)); border-color: rgb(var(--ok) / .5); background: rgb(var(--ok) / .12); }
+  .b-mut { color: rgb(var(--muted)); border-color: rgb(var(--edge-strong)); }
+  .tiles { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 16px; }
+  .tile { background: rgb(var(--surface)); border: 1px solid rgb(var(--edge)); border-radius: 12px; padding: 14px 16px; }
+  .tile .n { font-size: 26px; font-weight: 600; }
+  .tile .l { font-size: 13px; color: rgb(var(--muted)); }
+  .qs { margin: 28px 0 0; padding: 14px 18px; border: 1px solid rgb(var(--edge)); border-radius: 10px; background: rgb(var(--surface)); font-size: 13px; line-height: 1.6; color: rgb(var(--muted)); max-width: 1080px; }
+  .qs b { color: rgb(var(--fg)); }
+  .qs ol { margin: 6px 0 0; padding-left: 20px; }
+</style>
+</head>
+<body>
+<div class="intro">
+  <h1>New Overview: (1) compact header, (2) live Agents chip</h1>
+  <p>Sample data only; names and counts are not a spec. Dashed outline = changed.</p>
+  <p>Theme: <button class="wbtn on" data-theme="ember">Ember (dark)</button><button class="wbtn" data-theme="dawn">Dawn (light)</button></p>
+</div>
+<div class="stage ember" id="stage">
+<!-- ============ B ============ -->
+<style>
+  .pchip { display: inline-flex; align-items: center; gap: 8px; height: 30px; padding: 0 10px; border-radius: 999px; border: 1px solid rgb(var(--edge)); background: rgb(var(--surface)); font-size: 12px; white-space: nowrap; color: rgb(var(--fg)); }
+  .pchip b { font-weight: 600; }
+  .pchip .of { color: rgb(var(--muted)); }
+  .stack { display: inline-flex; align-items: center; }
+  .stack i { font-style: normal; width: 20px; height: 20px; border-radius: 50%; display: inline-grid; place-items: center; font-size: 9px; font-weight: 600; background: rgb(var(--raised)); border: 1px solid rgb(var(--edge)); color: rgb(var(--muted)); margin-left: -3px; box-shadow: 0 0 0 1px rgb(var(--surface)); }
+  .stack i:first-child { margin-left: 0; }
+  .stack.sq i { border-radius: 5px; }
+  .rpop { position: absolute; z-index: 5; top: 40px; right: 0; width: 360px; background: rgb(var(--raised)); border: 1px solid rgb(var(--edge)); border-radius: 12px; box-shadow: 0 20px 50px rgb(0 0 0 / .35); font-size: 13px; }
+  .rpop .in { padding: 12px; }
+  .rpop h3 { margin: 0; font-size: 14px; font-weight: 600; display: flex; justify-content: space-between; align-items: center; }
+  .rpop .help { width: 16px; height: 16px; border-radius: 50%; border: 1px solid rgb(var(--edge)); display: inline-grid; place-items: center; font-size: 10px; color: rgb(var(--faint)); font-weight: 600; }
+  .glabel { margin: 12px 0 4px; font-size: 11px; font-weight: 500; text-transform: uppercase; letter-spacing: .06em; color: rgb(var(--faint)); }
+  .rli { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 8px; align-items: center; padding: 3px 0; }
+  .rli .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: "IBM Plex Mono", monospace; font-size: 12px; }
+  .tpill { border-radius: 12px; padding: 1px 8px; font-size: 12px; }
+  .t-ok { color: rgb(var(--ok)); background: rgb(var(--ok) / .14); }
+  .t-warn { color: rgb(var(--warn)); background: rgb(var(--warn) / .14); }
+  .t-acc { color: rgb(var(--accent)); background: rgb(var(--accent) / .14); }
+  .ago { font-size: 12px; color: rgb(var(--muted)); }
+  .rfoot { display: flex; justify-content: space-between; gap: 12px; border-top: 1px solid rgb(var(--edge)); padding: 8px 12px; font-size: 12px; color: rgb(var(--muted)); }
+  .rfoot a { color: rgb(var(--brand)); font-weight: 500; text-decoration: none; }
+  .cmp { display: grid; grid-template-columns: repeat(3, max-content); gap: 10px 18px; align-items: center; font-size: 13px; color: rgb(var(--muted)); margin: 6px 0 14px; }
+</style>
+<style>
+  .hdr2 { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px 24px; flex-wrap: wrap; margin-bottom: 18px; }
+  .hdr2 .tt b.h { display: block; font-size: 22px; font-weight: 600; }
+  .hdr2 .tt .back2 { display: inline-block; margin-top: 4px; font-size: 12px; color: rgb(var(--brand)); font-weight: 500; }
+  .hdr2 .actions { justify-content: flex-end; padding-top: 2px; }
+  .glyph { width: 20px; height: 20px; border-radius: 5px; display: inline-grid; place-items: center; background: rgb(var(--raised)); border: 1px solid rgb(var(--edge)); color: rgb(var(--muted)); font-size: 11px; }
+  .rpop.ag { right: 120px; }
+  .pc { display: grid; grid-template-columns: auto minmax(0,1fr) auto; gap: 4px 10px; padding: 3px 0; align-items: center; }
+  .pc .k { font-family: "IBM Plex Mono", monospace; font-size: 12px; }
+  .pc .c { color: rgb(var(--muted)); font-size: 12px; }
+  .dotlive { width: 7px; height: 7px; border-radius: 50%; background: rgb(var(--ok)); display: inline-block; }
+  .phone { width: 400px; border: 1px solid rgb(var(--edge)); border-radius: 8px; padding: 16px; background: rgb(var(--bg)); }
+  .phone .actions { justify-content: flex-start; margin-top: 10px; }
+  .two { display: grid; grid-template-columns: minmax(0,1fr) 400px; gap: 24px; align-items: start; max-width: 1340px; }
+  .lbl { font-size: 12px; color: rgb(var(--faint)); margin: 4px 0 6px; text-transform: uppercase; letter-spacing: .06em; }
+  .note { font-size: 12px; color: rgb(var(--muted)); margin-top: 8px; line-height: 1.5; }
+</style>
+
+<!-- ============ 1 ============ -->
+<div class="variant-title">1. Compact header: no status sentence, chips on the title row, back link under the title</div>
+<p class="variant-note"><b>Today</b> (top): the title, a status sentence, then the chips wrapping onto their own row. <b>Proposed</b> (below): the chips sit right of the title on the same row; the sentence goes; "Back to the old Overview" becomes a small link under the title. What the sentence said is already on the page: decisions and PRs head the <b>Needs your decision</b> card, people and live work are in the <b>People</b> chip and the <b>Issue work</b> line. The one figure with no other home is the executing / queued / parked split; it could live in the Health or People tooltip if you want it kept.</p>
+<div class="lbl">Today</div>
+<div class="screen">
+  <div class="sidebar"><div class="on">Overview</div><div>Board</div><div>Runs</div><div>Repos</div><div>Agents</div><div>Workers</div><div>Settings</div></div>
+  <main>
+    <div class="hdr">
+      <div>
+        <b class="h">Welcome, Robin Diaz</b>
+        <span class="desc">2 decisions and 3 pull requests are waiting on you. 12 runs are executing across the factory for 2 people, 7 queued and 4 parked.</span>
+      </div>
+      <div class="actions">
+        <span class="chip"><span class="dot"></span>OK · 25 of 25</span>
+        <span class="pchip"><span class="stack"><i>RD</i><i>AR</i></span><span><b>2 active now</b> <span class="of">of 5</span></span></span>
+        <span class="pchip"><span class="stack sq"><i>uz</i><i>at</i><i>+1</i></span><span><b>3 repos active</b> <span class="of">of 6</span></span></span>
+        <span class="pchip"><span class="glyph">◫</span><span><b>9 agents in your runs</b> <span class="of">of 14</span></span></span>
+        <span class="btn">Search <kbd>⌘K</kbd></span>
+        <span class="back">Back to the old Overview</span>
+      </div>
+    </div>
+    <div class="card"><h4>Needs your decision <small>2 decisions, 3 PR reviews</small></h4><div class="stub">(unchanged)</div></div>
+  </main>
+</div>
+
+<style>
+  .runsum { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 13px; color: rgb(var(--muted)); margin: -2px 0 10px; }
+  .runsum b { color: rgb(var(--fg)); font-weight: 600; }
+  .warnline { font-size: 12px; color: rgb(var(--warn)); margin: -4px 0 10px; }
+  .calm { display: flex; align-items: center; gap: 8px; font-size: 14px; color: rgb(var(--muted)); padding: 12px 16px; border: 1px dashed rgb(var(--edge)); border-radius: 12px; margin-bottom: 16px; }
+  .calm .ok { width: 8px; height: 8px; border-radius: 50%; background: rgb(var(--ok)); }
+  .q { margin: 26px 0 0; padding: 14px 18px; border: 1px solid rgb(var(--brand) / .5); border-radius: 10px; background: rgb(var(--surface)); font-size: 14px; line-height: 1.6; max-width: 1080px; }
+  .q b { color: rgb(var(--fg)); }
+</style>
+<div class="lbl" style="margin-top:22px">Proposed A: something needs you (desktop)</div>
+<div class="screen">
+  <div class="sidebar"><div class="on">Overview</div><div>Board</div><div>Runs</div><div>Repos</div><div>Agents</div><div>Workers</div><div>Settings</div></div>
+  <main>
+    <div class="hdr2 new">
+      <div class="tt">
+        <b class="h">Welcome, Robin Diaz</b>
+        <span class="back2">← Back to the old Overview</span>
+      </div>
+      <div class="actions">
+        <span class="chip"><span class="dot"></span>OK · 25 of 25</span>
+        <span class="pchip"><span class="stack"><i>RD</i><i>AR</i></span><span><b>2 active now</b> <span class="of">of 5</span></span></span>
+        <span class="pchip"><span class="stack sq"><i>uz</i><i>at</i><i>+1</i></span><span><b>3 repos active</b> <span class="of">of 6</span></span></span>
+        <span class="pchip"><span class="glyph">◫</span><span><b>9 agents in your runs</b> <span class="of">of 14</span></span></span>
+        <span class="btn">Search <kbd>⌘K</kbd></span>
+      </div>
+    </div>
+    <div class="card"><h4>Needs your decision <small>2 decisions, 3 PR reviews</small></h4><div class="stub">(unchanged)</div></div>
+    <div class="card"><h4>Runs <a href="#">All runs</a></h4>
+      <div class="runsum new"><span><b>12</b> executing for 2 people</span><span><b>7</b> queued</span><span><b>4</b> parked</span></div>
+      <div class="warnline new">Admin only, when the factory list could not be read: "Other users' runs are unavailable; showing yours."</div>
+      <div class="stub">(run rows unchanged)</div></div>
+  </main>
+</div>
+<p class="note">The sentence's run totals move to one line at the top of the <b>Runs</b> card (all run kinds, the whole factory for an admin). The admin partial-read warning sits under it.</p>
+
+<div class="lbl" style="margin-top:22px">Proposed B: nothing needs you</div>
+<div class="screen">
+  <div class="sidebar"><div class="on">Overview</div><div>Board</div><div>Runs</div><div>Repos</div><div>Agents</div><div>Workers</div><div>Settings</div></div>
+  <main>
+    <div class="hdr2">
+      <div class="tt"><b class="h">Welcome, Robin Diaz</b><span class="back2">← Back to the old Overview</span></div>
+      <div class="actions">
+        <span class="chip"><span class="dot"></span>OK · 25 of 25</span>
+        <span class="pchip"><span><b>0 active now</b> <span class="of">of 5</span></span></span>
+        <span class="btn">Search <kbd>⌘K</kbd></span>
+      </div>
+    </div>
+    <div class="calm new"><span class="ok"></span>Nothing needs you right now.</div>
+    <div class="card"><h4>Runs <a href="#">All runs</a></h4>
+      <div class="runsum"><span><b>0</b> executing</span><span><b>1</b> queued</span></div>
+      <div class="stub">(run rows unchanged)</div></div>
+  </main>
+</div>
+<p class="note">When the <b>Needs your decision</b> card hides, a one-line calm notice takes its place, so the page still says it out loud.</p>
+
+<div class="lbl" style="margin-top:22px">Proposed, 400 px</div>
+<div class="phone">
+  <div class="tt"><b style="font-size:20px;font-weight:600;display:block">Welcome, Robin Diaz</b><span class="back2" style="font-size:12px;color:rgb(var(--brand));font-weight:500">← Back to the old Overview</span></div>
+  <div class="actions new" style="display:flex;flex-wrap:wrap;gap:8px">
+    <span class="chip"><span class="dot"></span>OK</span>
+    <span class="pchip"><span><b>2 active now</b> <span class="of">of 5</span></span></span>
+    <span class="pchip"><span><b>3 repos active</b> <span class="of">of 6</span></span></span>
+    <span class="pchip"><span><b>9 agents in your runs</b> <span class="of">of 14</span></span></span>
+    <span class="btn">Search</span>
+  </div>
+  <div class="card" style="margin-top:14px"><h4>Needs your decision <small>2 · 3</small></h4><div class="stub">(unchanged)</div></div>
+  <div class="card"><h4>Runs</h4><div class="runsum"><span><b>12</b> executing</span><span><b>7</b> queued</span><span><b>4</b> parked</span></div></div>
+</div>
+<p class="note">On a phone the chips wrap below the title. Reading and keyboard order: title, back link, chips.</p>
+
+<div class="q"><b>Question 1:</b> go with this header: chips on the title row, no sentence, the run totals and admin warning at the top of the Runs card, and the calm "Nothing needs you right now" line when the decisions card hides? Part 2 below (the Agents chip) is the next question; its chip is left as today in part 1.</div>
+
+<!-- ============ 2 ============ -->
+<style>
+  .opt3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px; max-width: 1340px; align-items: start; }
+  .optc { border: 1px solid rgb(var(--edge)); border-radius: 10px; padding: 14px; background: rgb(var(--bg)); }
+  .optc h5 { margin: 0 0 4px; font-size: 14px; }
+  .optc .tag { margin-left: 4px; }
+  .optc .why { font-size: 12px; color: rgb(var(--muted)); line-height: 1.5; margin: 6px 0 10px; }
+  .popin { background: rgb(var(--raised)); border: 1px solid rgb(var(--edge)); border-radius: 12px; font-size: 13px; margin-top: 10px; }
+  .popin .in { padding: 12px; }
+  .popin h3 { margin: 0; font-size: 14px; font-weight: 600; display: flex; justify-content: space-between; }
+  @media (max-width: 900px) { .opt3 { grid-template-columns: 1fr; } }
+</style>
+<div class="variant-title">2. The Agents chip: three options</div>
+<p class="variant-note">The idea I drew first ("3 agents active of 16" from each run's latest step) is <b>dropped</b>: the run list shows only the agent behind each run's latest step, so it misses subagents working in parallel and reads low; "of 16" (your templates) does not match factory-wide activity; and the admin run list stops at 500. The honest choices are below.</p>
+<div class="opt3">
+  <div class="optc">
+    <h5>A. Live agents, server-counted <span class="tag">bigger</span></h5>
+    <span class="pchip"><span class="glyph"><span class="dotlive"></span></span><span><b>5 agents working</b> <span class="of">in 4 runs</span></span></span>
+    <div class="popin"><div class="in">
+      <h3>5 agents working now <span class="help">i</span></h3>
+      <div class="glabel">By role</div>
+      <div class="pc"><span class="dotlive"></span><span class="k">lead</span><span class="c">4 runs</span></div>
+      <div class="pc"><span class="dotlive"></span><span class="k">coder</span><span class="c">3 runs</span></div>
+      <div class="pc"><span class="dotlive"></span><span class="k">tester</span><span class="c">2 runs</span></div>
+      <div class="pc"><span class="dotlive"></span><span class="k">reviewer</span><span class="c">1 run</span></div>
+      <div class="pc"><span class="dotlive"></span><span class="k">architect</span><span class="c">1 run</span></div>
+      <div class="ago" style="margin-top:6px">Seen in the last 2 minutes, parallel subagents included.</div>
+    </div><div class="rfoot"><span></span><a href="#">Manage agents</a></div></div>
+    <p class="why">Exact: the server counts every live subagent per run (the same data the run page uses), within a short time window. Needs a new read on the server, tests and a CLI view. No "of N": factory activity has no fixed total.</p>
+  </div>
+  <div class="optc">
+    <h5>B. Keep today's chip <span class="tag rec">recommended now</span></h5>
+    <span class="pchip"><span class="glyph">◫</span><span><b>9 agents in your runs</b> <span class="of">of 14</span></span></span>
+    <div class="popin"><div class="in">
+      <h3>9 of 14 agents ride your runs <span class="help">i</span></h3>
+      <div class="glabel">By scope</div>
+      <div class="pc"><span></span><span class="k">Builtin</span><span class="c">12 · 8 on</span></div>
+      <div class="pc"><span></span><span class="k">Global</span><span class="c">1 · 0 on</span></div>
+      <div class="pc"><span></span><span class="k">Mine</span><span class="c">1 · 1 on</span></div>
+    </div><div class="rfoot"><span></span><a href="#">Manage agents</a></div></div>
+    <p class="why">What shipped tonight (#4335): a configuration count, accurate. Costs nothing. A can still be added later as its own issue.</p>
+  </div>
+  <div class="optc">
+    <h5>C. Cheap live hint <span class="tag">weak</span></h5>
+    <span class="pchip"><span class="glyph"><span class="dotlive"></span></span><span><b>at least 3 roles working</b></span></span>
+    <div class="popin"><div class="in">
+      <h3>At least 3 roles working <span class="help">i</span></h3>
+      <div class="pc"><span class="dotlive"></span><span class="k">lead</span><span class="c">latest step in 4 runs</span></div>
+      <div class="pc"><span class="dotlive"></span><span class="k">coder</span><span class="c">in 3 runs</span></div>
+      <div class="pc"><span class="dotlive"></span><span class="k">tester</span><span class="c">in 1 run</span></div>
+      <div class="ago" style="margin-top:6px">From each run's latest step only; parallel subagents are not counted.</div>
+    </div><div class="rfoot"><span></span><a href="#">Manage agents</a></div></div>
+    <p class="why">No new API, but only a lower bound ("at least") with no total, and it needs the caveat to stay honest.</p>
+  </div>
+</div>
+<div class="variant-title" style="margin-top:26px">D. Your idea: how many agents are configured, and where each comes from <span class="tag rec">new recommendation</span></div>
+<p class="variant-note">The chip counts the agents configured in uzi (the shared builtin and global ones, plus your own private ones). The popover splits them by where the definition comes from, so an overridden agent stands out from the shipped defaults. Every template already carries this (its origin), and the Overview already loads the list: no new API, always accurate.</p>
+<div class="screen">
+  <div class="sidebar"><div class="on">Overview</div><div>Board</div><div>Runs</div><div>Repos</div><div>Agents</div><div>Workers</div><div>Settings</div></div>
+  <main>
+    <div class="hdr2">
+      <div class="tt"><b class="h">Welcome, Robin Diaz</b><span class="back2">← Back to the old Overview</span></div>
+      <div class="actions">
+        <span class="chip"><span class="dot"></span>OK · 25 of 25</span>
+        <span class="pchip"><span class="stack"><i>RD</i><i>AR</i></span><span><b>2 active now</b> <span class="of">of 5</span></span></span>
+        <span class="pchip"><span class="stack sq"><i>uz</i><i>at</i><i>+1</i></span><span><b>3 repos active</b> <span class="of">of 6</span></span></span>
+        <span class="pchip open new"><span class="glyph">◫</span><span><b>16 agents</b> <span class="of">· 3 overridden</span></span></span>
+        <span class="btn">Search <kbd>⌘K</kbd></span>
+        <div class="rpop ag">
+          <div class="in">
+            <h3>16 agents configured <span class="help" title="The agents uzi can use: the shared builtin and global ones, plus your own. Grouped by where each definition comes from.">i</span></h3>
+            <div class="glabel">Overridden</div>
+            <div class="pc"><span class="glyph" style="width:16px;height:16px;font-size:9px">↻</span><span class="k">reviewer</span><span class="c">synced from the agent source</span></div>
+            <div class="pc"><span class="glyph" style="width:16px;height:16px;font-size:9px">↻</span><span class="k">tester</span><span class="c">synced from the agent source</span></div>
+            <div class="pc"><span class="glyph" style="width:16px;height:16px;font-size:9px">✎</span><span class="k">coder</span><span class="c">edited by an admin</span></div>
+            <div class="glabel">Shipped defaults</div>
+            <div class="ago">9 unchanged: lead, architect, dba, +6</div>
+            <div class="glabel">Added</div>
+            <div class="pc"><span></span><span class="k">release</span><span class="c">global, synced role</span></div>
+            <div class="pc"><span></span><span class="k">ui-copy</span><span class="c">global</span></div>
+            <div class="pc"><span></span><span class="k">mine</span><span class="c">yours, private</span></div>
+          </div>
+          <div class="rfoot"><span></span><a href="#">Manage agents</a></div>
+        </div>
+      </div>
+    </div>
+    <div class="card" style="margin-top: 330px"><h4>Needs your decision <small>2</small></h4><div class="stub">(unchanged)</div></div>
+  </main>
+</div>
+<p class="note">With no overrides the chip reads just "16 agents". "Overridden" = a shipped builtin whose definition now comes from the agent-source repo (synced) or was edited by an admin. "Added" = roles uzi does not ship (an admin's global, a synced-only role, your own). Groups with nothing in them are omitted.</p>
+<div class="variant-title" style="margin-top:26px">D for a synced install (your setup): count by source, plus the sync status <span class="tag rec">revised</span></div>
+<p class="variant-note">With agent sync on, every builtin your source repo also defines comes back as <b>synced</b>, so "overridden" would cover almost everything and say nothing. Instead the popover groups agents by <b>where they come from</b>, and, for admins, adds the agent-source sync status uzi already tracks (last sync, the commit, a newer version, changes waiting for your approval, a failed sync). The chip's suffix shows only what needs attention: nothing, "update available", "3 changes to review", or "sync failed". Sample numbers; your real mix is not visible to me from the CLI.</p>
+<div class="opt3">
+  <div class="optc">
+    <h5>All in sync</h5>
+    <span class="pchip"><span class="glyph">◫</span><span><b>16 agents</b> <span class="of">· synced</span></span></span>
+    <div class="popin"><div class="in">
+      <h3>16 agents configured <span class="help">i</span></h3>
+      <div class="glabel">From your agent source</div>
+      <div class="ago">14 roles · acme/agents@v1.4, synced 2h ago (a1b2c3d)</div>
+      <div class="glabel">Shipped with uzi</div>
+      <div class="ago">1 · lead (not in your source)</div>
+      <div class="glabel">Yours</div>
+      <div class="ago">1 private · ui-copy</div>
+    </div><div class="rfoot"><span>Up to date</span><a href="#">Manage agents</a></div></div>
+  </div>
+  <div class="optc">
+    <h5>Something to act on</h5>
+    <span class="pchip"><span class="glyph">◫</span><span><b>16 agents</b> <span class="of" style="color:rgb(var(--warn))">· 3 changes to review</span></span></span>
+    <div class="popin"><div class="in">
+      <h3>16 agents configured <span class="help">i</span></h3>
+      <div class="glabel">From your agent source</div>
+      <div class="ago">14 roles · acme/agents@v1.4, synced 2h ago</div>
+      <div class="ago" style="color:rgb(var(--warn))">A newer snapshot is fetched: 2 changed, 1 added. Waiting for your approval.</div>
+      <div class="glabel">Shipped with uzi</div>
+      <div class="ago">1 · lead</div>
+    </div><div class="rfoot"><span></span><a href="#">Review in Settings</a></div></div>
+  </div>
+  <div class="optc">
+    <h5>Not admin, or sync off</h5>
+    <span class="pchip"><span class="glyph">◫</span><span><b>16 agents</b></span></span>
+    <div class="popin"><div class="in">
+      <h3>16 agents configured <span class="help">i</span></h3>
+      <div class="glabel">Shipped with uzi</div>
+      <div class="ago">12 · 11 unchanged, 1 edited by an admin (coder)</div>
+      <div class="glabel">Added by an admin</div>
+      <div class="ago">2 · release, ui-copy</div>
+      <div class="glabel">Yours</div>
+      <div class="ago">1 private · mine</div>
+    </div><div class="rfoot"><span></span><a href="#">Manage agents</a></div></div>
+    <p class="why">Non-admins never see sync status (it is an admin read); they see only where the agents come from.</p>
+  </div>
+</div>
+<div class="q"><b>Question 2:</b> A (exact live agents, a new server read), B (keep today's chip), C (cheap "at least" hint), or D (configured agents by source, plus sync status for admins)? My pick now: <b>D as revised for a synced install</b>, replacing today&rsquo;s chip; A stays a separate idea if you ever want a live view.</div>
+</div>
+<script>
+  document.querySelectorAll('.wbtn').forEach(function (b) {
+    b.addEventListener('click', function () {
+      document.querySelectorAll('.wbtn').forEach(function (x) { x.classList.remove('on'); });
+      b.classList.add('on');
+      document.getElementById('stage').className = 'stage ' + b.dataset.theme;
+    });
+  });
+</script>
+</body>
+</html>

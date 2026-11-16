@@ -265,10 +265,17 @@ test("proof 1 control: a normally joined, fully accounted delete lets the succes
     branch: BR_A, key: "issue-5101", runId: RUN_A });
   assert.equal(await worker.line(), "W");
   const finished = await worker.line();
-  assert.match(finished, /^DONE:\{"ended":\["[^"]*issue-5101"\],"kept":\[\],"endedSlots":\[\{[^\]]*"path":"[^"]*issue-5101"\}\]\}$/);
+  assert.ok(finished.startsWith("DONE:"));
+  const result: unknown = JSON.parse(finished.slice("DONE:".length));
   await worker.kill();
   const { rt, git } = await successor(dataDir);
   const slot = await slotOf(rt, a);
+  assert.ok(slot);
+  assert.deepEqual(result, {
+    ended: [a], kept: [],
+    endedSlots: [{ key: slot.key, epoch: slot.epoch, seq: slot.seq, worker: slot.owner.worker, path: a }],
+    reasons: [],
+  });
   assert.equal(slot?.pending, null, "the delete settled ok and left no pending record");
   assert.equal(slot?.state, "ineligible");
   const reseeded = await rt.withTransaction(() => reseedA(git, bare));

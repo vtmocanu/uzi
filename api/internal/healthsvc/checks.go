@@ -49,6 +49,7 @@ var checkMeta = map[string]struct {
 	"fleet.memory_authority":       {"owner", groupWorkers, "Worker memory authority", "hosted-workers"},
 	"fleet.hibernation_wake":       {"instance", groupWorkers, "Hibernation wakes", "hosted-workers"},
 	"fleet.hibernation_cleanup":    {"instance", groupWorkers, "Hibernation cache cleanup", "hosted-workers"},
+	"fleet.hibernation":            {"instance", groupWorkers, "Automatic hibernation", "hosted-workers"},
 	"fleet.hibernation_retirement": {"instance", groupWorkers, "Hibernation volume retirement (dry run)", "hosted-workers"},
 	"queue.waiting":                {"owner", groupQueue, "Runs waiting for a worker", ""},
 	"queue.undispatched":           {"owner", groupQueue, "Undispatched task runs", ""},

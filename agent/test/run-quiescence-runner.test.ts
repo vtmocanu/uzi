@@ -216,6 +216,7 @@ describe("issue #1783: terminal retire fails closed", () => {
 describe("issue #1856: terminal Codex disposal gates clone retirement", () => {
   for (const [name, outcome] of [
     ["incomplete", { kind: "incomplete", errors: [{ category: "timeout", message: "writer survived disposal" }] }],
+    ["foreign-incomplete", { kind: "incomplete", errors: [{ category: "timeout", message: "writer survived disposal" }] }],
     ["disposed", { kind: "disposed" }],
     ["unaccepted-disposed", { kind: "disposed" }],
     ["copied-disposed", { kind: "disposed" }],
@@ -224,12 +225,13 @@ describe("issue #1856: terminal Codex disposal gates clone retirement", () => {
   ] as const) {
     it(`${name}: retains only when terminal disposal is unproven`, async () => {
       const { gitlab } = fakeGitlab();
-      const iid = 18560 + ["incomplete", "disposed", "legacy_in_process", "rejected", "unaccepted-disposed", "copied-disposed"].indexOf(name);
+      const iid = 18560 + ["incomplete", "disposed", "legacy_in_process", "rejected", "unaccepted-disposed", "copied-disposed", "foreign-incomplete"].indexOf(name);
       const { logger, lines } = recordingLogger();
       const { calls, quiesceRun } = scriptedQuiescer(["quiescent"]);
       let clone = "";
       let issued: ToolDisposal | undefined;
-      const safety: CodexExecutionSafety = {
+      const safety: CodexExecutionSafety & { terminalDisposalOutcome(): ToolDisposal | undefined } = {
+        terminalDisposalOutcome: () => issued,
         kind: "codex",
         // Model the facade contract: only its own exact successful result is proof.
         acceptsTerminalDisposal: result => name !== "unaccepted-disposed" && result === issued && result.kind === "disposed",
@@ -238,7 +240,7 @@ describe("issue #1856: terminal Codex disposal gates clone retirement", () => {
         dispose: async () => {
           if (outcome === undefined) throw new Error("disposal rejected");
           issued = outcome as ToolDisposal;
-          return name === "copied-disposed" ? { ...issued } : issued;
+          return name === "copied-disposed" || name === "foreign-incomplete" ? { ...issued } : issued;
         },
       };
       const factory: ExecutorFactory = (runId) => ({

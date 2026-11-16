@@ -1046,7 +1046,7 @@ func recoveryWaitDetailDTO(r store.Run) *string {
 		return nil
 	}
 	switch r.RecoveryWaitDetail.String {
-	case workersvc.RecoveryDetailSecretRemediationActive, workersvc.RecoveryDetailRemediationProofUnknown:
+	case workersvc.RecoveryDetailSecretRemediationActive, workersvc.RecoveryDetailRemediationProofUnknown, workersvc.RecoveryDetailSourceEndDeclined:
 		d := r.RecoveryWaitDetail.String
 		return &d
 	}

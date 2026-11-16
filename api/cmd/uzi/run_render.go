@@ -201,6 +201,9 @@ func renderRunDetailAt(p *uzicli.Printer, r apitypes.RunDTO, now time.Time, orig
 	if reason := runHealthReasonAt(r, now); reason != "" {
 		rows = append(rows, []string{"HEALTH_REASON", sanitizeTTY(reason)})
 	}
+	if hint := runHealthHint(r); hint != "" {
+		rows = append(rows, []string{"HEALTH_HINT", hint})
+	}
 	if reason := runQueueReason(r); reason != "" {
 		rows = append(rows, []string{"QUEUE_REASON", reason})
 	}
@@ -2707,6 +2710,26 @@ func runHealthReasonAt(r apitypes.RunDTO, now time.Time) string {
 		return codexAdmissionLineAt(r, now)
 	}
 	return reason
+}
+
+// healthPublicationWithheld is the run health enum value for a running run whose checkpoint
+// publication is withheld by a secret-scan restriction (issue #4257).
+const healthPublicationWithheld = "publication_withheld"
+
+// isPublicationWithheld reports the withheld state from the closed health enum, or the fixed
+// server reason when a surface only carries that.
+func isPublicationWithheld(r apitypes.RunDTO) bool {
+	return r.Health == healthPublicationWithheld || strOr(r.HealthReason, "") == apitypes.ReasonCheckpointPublicationWithheld
+}
+
+// runHealthHint is the fixed, content-free owner hint for a withheld run. The hint is not on
+// the wire; it is this binary's own copy of apitypes.HintCheckpointPublicationWithheld, so no
+// server text reaches the row.
+func runHealthHint(r apitypes.RunDTO) string {
+	if isPublicationWithheld(r) {
+		return apitypes.HintCheckpointPublicationWithheld
+	}
+	return ""
 }
 
 func runQueueReason(r apitypes.RunDTO) string {

@@ -319,8 +319,10 @@ deployment (see [Configuration](./configuration.md#hosted-k8s-workers-prd-58)).
 | Setting | Default | Controls |
 |---|---|---|
 | `worker_hibernation_enabled` | `false` | Whether admins may [hibernate](./hosted-workers.md#hibernation) idle persistent hosted workers (Deployment scaled to 0, worker row, join-token Secret and volumes kept). Turning it off wakes every hibernated or still-hibernating worker, at most 10 per sweeper pass. Waking is never gated by this setting. |
+| `worker_hibernation_auto` | `false` | Whether the api [hibernates idle workers automatically](./hosted-workers.md#automatic-hibernation). Effective only while `worker_hibernation_enabled` is on. Enable it only once the [PRD #4206](../prds/4206-worker-hibernation-cache-cleanup.md) cache cleanup is deployed, including the worker support it needs: a worker image that advertises the `hibernation_cache_prune_v1` capability (see [Cache cleanup before sleep](./hosted-workers.md#cache-cleanup-before-sleep)). |
+| `worker_hibernation_idle_after` | `336h` | How long a worker must show no run activity before automatic hibernation considers it. A Go duration from `1h` to `2160h`. |
 
-Edit it in the **Worker hibernation** card on **Admin → Settings**. Hibernate and
+Edit them in the **Worker hibernation** card on **Admin → Settings**. Hibernate and
 Wake are per-worker buttons in **Admin → Health**. Roll back migrations before an
 older api if you downgrade; see
 [Downgrading](./hosted-workers.md#downgrading).

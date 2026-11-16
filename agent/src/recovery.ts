@@ -1,6 +1,12 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { ProcessQuiescence } from "./run-quiescence.js";
 import { MaintenanceBudget } from "./maintenance-budget.js";
+import { terminalPreservationActive, type TerminalPreservationTestHooks } from "./terminal-preservation.js";
+import {
+  canonicalTerminalJson, decodeTerminalRecord, isTerminalGeneration, isTerminalRunId, mergeTerminalRecord, runTerminalOperation, TERMINAL_RECORD_MAX_BYTES,
+  type TerminalDelta, type TerminalManifest, type TerminalOperationDeps, type TerminalOperationResult, type TerminalInvokeResult, type TerminalOperationRecord, type TerminalOperationStore,
+  type TerminalReadResult, type TerminalRediscovery, type TerminalUpdateResult,
+} from "./terminal-operation.js";
 import { hibernationWriters } from "./hibernation-inventory.js";
 import { AuthorityLockBusy, AuthorityRefusal } from "./authority-lock.js";
 import type { AuthorityScope, AuthorityWait, RetirementHandle, RetirementView } from "./authority-runtime.js";
@@ -10,7 +16,8 @@ import {
 import type { ExclusionRefusal, MaintenanceExclusion, MaintenanceWriterExclusion } from "./maintenance-exclusion.js";
 import { MaintenanceResources as M1MaintenanceResources, RecoveryMaintenance, type MaintenanceAdmission } from "./recovery-maintenance.js";
 import { classifyRecoveryOrigin } from "./recovery-origin.js";
-import { prepareFrozenHeld, validFrozenHeldPolicy, type FrozenHeldPolicy, type HeldGit } from "./frozen-held.js";
+import { prepareFrozenHeld, prepareFrozenHeldPinned, validFrozenHeldPolicy, type FrozenHeldPolicy, type HeldGit, type TerminalDigestGit } from "./frozen-held.js";
+import { checkManifestCoverage, classifyTerminalOutput, readTerminalSourceUniverse, type TerminalUniverse } from "./terminal-inventory.js";
 // Durable run recovery: worker capture, authenticated journal, and model-free
 // restart-safe upload (PRD #1296 M3, decisions D1/D3/D5/D6/D9).
 //
@@ -385,6 +392,14 @@ export class PredecessorAuthorityLost extends Error {
   constructor() {
     super("predecessor authority lost");
     this.name = "PredecessorAuthorityLost";
+  }
+}
+
+/** A terminal record whose serialized bytes exceed what the strict reader accepts; thrown before any file operation. */
+class TerminalRecordOversized extends Error {
+  constructor() {
+    super("terminal record oversized");
+    this.name = "TerminalRecordOversized";
   }
 }
 
@@ -952,6 +967,9 @@ function receiptMatches(observed: RecoveryExactHold, request: NonNullable<Recove
 }
 
 export interface RecoveryCoordinatorOptions {
+  /** TEST-ONLY, constructor-only (#4007 slice B): turns the production-dark terminal-preservation gate on for this
+   *  instance. Never passed by main.ts or worker.ts; see terminal-preservation.ts. */
+  terminalPreservationTestOverride?: TerminalPreservationTestHooks;
   /** Test seam (never set in production): awaited inside the journal lock of an operator resolution, before its expectation. */
   onForgetJournalLockedForTest?: () => void | Promise<void>;
   /** Test seam (never set in production): awaited immediately before and after every unlink and the final rmdir of an
@@ -1491,6 +1509,10 @@ export function canonicalJson(value: unknown): string {
 // keyed FIFO mutex for local journal IO only; one worker process owns each data directory.
 const recoveryJournalLocks = new RunDiskLocks();
 
+/** The optional git seams a terminal-preservation replay needs; a producer without them refuses (no send). */
+type TerminalReplayGit = RecoveryBundleProducer & TerminalDigestGit & Partial<Pick<GitCache, "listRunBares" |
+  "readTerminalAttribution" | "readTerminalCloneLocalRefs" | "commitTreeOid" | "worktreeStatus">>;
+
 /**
  * The persistent, authenticated durable-recovery coordinator (PRD #1296 M3).
  *
@@ -1501,6 +1523,452 @@ const recoveryJournalLocks = new RunDiskLocks();
  */
 export class RecoveryCoordinator {
   private readonly authority: AuthorityScope | undefined;
+  private readonly terminalPreservationTestOverride: TerminalPreservationTestHooks | undefined;
+
+  /** #4007 slice B production-dark gate: the first statement of every terminal-preservation entry point. Not private
+   *  only because no production caller exists yet (noUnusedLocals would reject an unread private member). */
+  terminalPreservationEnabled(): boolean {
+    return terminalPreservationActive(this.terminalPreservationTestOverride);
+  }
+
+  // ── #4007 slice B: terminal operation records (production-dark; every entry point checks the gate first) ──
+
+  private terminalRoot(): string { return path.join(path.dirname(this.recoveryRoot), "terminal-preservation"); }
+  private terminalRunDir(runId: string): string { return path.join(this.terminalRoot(), runId); }
+  private terminalFile(runId: string, generation: number): string { return path.join(this.terminalRunDir(runId), `g${generation}.json`); }
+
+  private terminalMac(record: TerminalOperationRecord): string {
+    if (!this.key) throw new Error("recovery: MAC key unavailable");
+    return createHmac("sha256", this.key).update("terminal-operation-v1\n" + canonicalTerminalJson(record)).digest("hex");
+  }
+
+  /** Authenticated read of one record; the caller holds the run's journal lock. Distinguishes absent from corrupt. */
+  private async terminalReadUnlocked(runId: string, generation: number): Promise<TerminalReadResult> {
+    if (!this.key) return { kind: "corrupt" };
+    for (const dir of [this.terminalRoot(), this.terminalRunDir(runId)]) {
+      try {
+        const st = await fs.lstat(dir);
+        if (!st.isDirectory()) return { kind: "corrupt" };
+      } catch (error) {
+        return (error as NodeJS.ErrnoException).code === "ENOENT" ? { kind: "absent" } : { kind: "corrupt" };
+      }
+    }
+    let handle: FileHandle;
+    try {
+      handle = await fs.open(this.terminalFile(runId, generation), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === "ENOENT" ? { kind: "absent" } : { kind: "corrupt" };
+    }
+    try {
+      const st = await handle.stat();
+      if (!st.isFile() || st.size > TERMINAL_RECORD_MAX_BYTES || st.size === 0) return { kind: "corrupt" };
+      const buf = Buffer.alloc(st.size);
+      const { bytesRead } = await handle.read(buf, 0, st.size, 0);
+      if (bytesRead !== st.size) return { kind: "corrupt" };
+      const parsed: unknown = JSON.parse(buf.toString("utf8"));
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return { kind: "corrupt" };
+      const { mac, ...body } = parsed as Record<string, unknown>;
+      const record = decodeTerminalRecord(body);
+      if (!record || typeof mac !== "string" || record.runId !== runId || record.generation !== generation) return { kind: "corrupt" };
+      const want = Buffer.from(this.terminalMac(record), "hex"), got = Buffer.from(mac, "hex");
+      if (want.length !== got.length || !timingSafeEqual(want, got)) return { kind: "corrupt" };
+      return { kind: "ok", record };
+    } catch {
+      return { kind: "corrupt" };
+    } finally {
+      await handle.close().catch(() => undefined);
+    }
+  }
+
+  /** Durable write: parents created 0700 with the new dir and its parent synced, temp O_EXCL|O_NOFOLLOW 0600, file
+   *  fsync, rename, directory fsync. The caller holds the run's journal lock. */
+  private async terminalWriteUnlocked(record: TerminalOperationRecord): Promise<void> {
+    // Same authority chokepoint as writeRecordUnlocked: a lost predecessor scope writes nothing.
+    this.assertPredecessorAuthority();
+    const raw = JSON.stringify({ ...record, mac: this.terminalMac(record) });
+    // The strict reader refuses a file over the byte bound, so an oversized record must never reach the disk (the
+    // decoder bounds UTF-16 length, which can serialize to several times as many bytes).
+    if (Buffer.byteLength(raw, "utf8") > TERMINAL_RECORD_MAX_BYTES) throw new TerminalRecordOversized();
+    const sync = async (dir: string) => {
+      const h = await fs.open(dir, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+      try { await h.sync(); } finally { await h.close(); }
+    };
+    let parent = path.dirname(this.terminalRoot());
+    for (const dir of [this.terminalRoot(), this.terminalRunDir(record.runId)]) {
+      try {
+        if (!(await fs.lstat(dir)).isDirectory()) throw new Error("terminal operation: unsafe directory");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        // The shared root is created by whichever run writes first: losing that race (EEXIST) is success, provided
+        // the winner left a real directory, never a symlink or file.
+        try { await fs.mkdir(dir, { mode: 0o700 }); } catch (mkdirError) {
+          if ((mkdirError as NodeJS.ErrnoException).code !== "EEXIST") throw mkdirError;
+        }
+        if (!(await fs.lstat(dir)).isDirectory()) throw new Error("terminal operation: unsafe directory");
+        await sync(dir); await sync(parent);
+      }
+      parent = dir;
+    }
+    const dst = this.terminalFile(record.runId, record.generation), tmp = `${dst}.${randomUUID()}.tmp`;
+    const file = await fs.open(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+    try {
+      try { await file.writeFile(raw); await file.sync(); } finally { await file.close(); }
+      // The scope can die during the awaited IO above: recheck immediately before publishing.
+      await ownedRecoveryIO(async () => { this.assertPredecessorAuthority(); await fs.rename(tmp, dst); });
+    } catch (error) {
+      await fs.unlink(tmp).catch(() => undefined);
+      throw error;
+    }
+    await sync(this.terminalRunDir(record.runId));
+  }
+
+  /** Whether any record of the run carries a local block, a flagged commit or a secret closure; corrupt or excessive
+   *  state counts as blocked. The caller holds the run's journal lock. */
+  private async terminalRunBlockedUnlocked(runId: string): Promise<string | undefined> {
+    let names: string[];
+    try { names = await fs.readdir(this.terminalRunDir(runId)); } catch (error) {
+      return (error as NodeJS.ErrnoException).code === "ENOENT" ? undefined : "record_unreadable";
+    }
+    const files = names.filter(n => /^g[1-9][0-9]*\.json$/.test(n));
+    if (files.length > 64) return "too_many_records";
+    for (const name of files) {
+      const res = await this.terminalReadUnlocked(runId, Number(name.slice(1, -5)));
+      if (res.kind === "corrupt") return "record_corrupt";
+      if (res.kind === "ok" && (res.record.localBlock.length > 0 || res.record.flaggedCommits.length > 0 ||
+          res.record.closedReason === "secret_found")) return res.record.localBlock[0] ?? "secret_found";
+    }
+    return undefined;
+  }
+
+  /** The durable terminal operation records. Reads and writes are brief and take only the run's journal lock; with the
+   *  gate off every method does nothing and creates nothing. */
+  terminalOperationStore(): TerminalOperationStore {
+    const valid = (runId: string, generation: number) => isTerminalRunId(runId) && isTerminalGeneration(generation);
+    /** Nothing is written unless the record passes the strict reader's decoder (so a write can never wedge the run). */
+    const readable = (record: TerminalOperationRecord): boolean => decodeTerminalRecord(JSON.parse(JSON.stringify(record))) !== undefined;
+    const failure = (error: unknown): { kind: "error"; reason: string } =>
+      ({ kind: "error", reason: error instanceof PredecessorAuthorityLost ? "authority_lost" : error instanceof Error ? error.message.slice(0, 120) : "write_failed" });
+    const mutate = async (runId: string, generation: number, delta: TerminalDelta, opts?: { signal?: AbortSignal }): Promise<TerminalUpdateResult> => {
+      if (!this.terminalPreservationEnabled()) return { kind: "disabled" };
+      if (!valid(runId, generation)) return { kind: "error", reason: "invalid_id" };
+      try {
+        return await this.withJournalLock(runId, async (): Promise<TerminalUpdateResult> => {
+          const cur = await this.terminalReadUnlocked(runId, generation);
+          if (cur.kind !== "ok") return cur;
+          const merged = mergeTerminalRecord(cur.record, delta);
+          if (!merged.ok) return { kind: "rejected", reason: merged.reason };
+          if (!readable(merged.record)) return { kind: "rejected", reason: "bound" };
+          await this.terminalWriteUnlocked(merged.record);
+          return { kind: "ok", record: merged.record };
+        }, opts?.signal);
+      } catch (error) {
+        return failure(error);
+      }
+    };
+    return {
+      read: async (runId, generation, opts) => {
+        if (!this.terminalPreservationEnabled() || !valid(runId, generation)) return { kind: "absent" };
+        return this.withJournalLock(runId, () => this.terminalReadUnlocked(runId, generation), opts?.signal);
+      },
+      create: async (record) => {
+        if (!this.terminalPreservationEnabled()) return { kind: "disabled" };
+        if (!valid(record.runId, record.generation) || !readable(record)) return { kind: "error", reason: "invalid_record" };
+        try {
+          return await this.withJournalLock(record.runId, async () => {
+            if ((await this.terminalReadUnlocked(record.runId, record.generation)).kind !== "absent") return { kind: "exists" as const };
+            await this.terminalWriteUnlocked(record);
+            return { kind: "created" as const, record };
+          });
+        } catch (error) {
+          return failure(error);
+        }
+      },
+      update: mutate,
+      addLocalBlock: (runId, generation, reasons, flaggedCommits) =>
+        mutate(runId, generation, { addLocalBlock: reasons, ...(flaggedCommits?.length ? { addFlaggedCommits: flaggedCommits } : {}) }),
+      runBlock: async (runId) => {
+        if (!this.terminalPreservationEnabled()) return { kind: "blocked", reason: "disabled" };
+        if (!isTerminalRunId(runId)) return { kind: "error", reason: "invalid_id" };
+        try {
+          return await this.withJournalLock(runId, async () => {
+            const blocked = await this.terminalRunBlockedUnlocked(runId);
+            return blocked === undefined ? { kind: "clear" as const } : { kind: "blocked" as const, reason: blocked };
+          });
+        } catch (error) {
+          return failure(error);
+        }
+      },
+      invoke: async (runId, generation, at): Promise<TerminalInvokeResult> => {
+        if (!this.terminalPreservationEnabled()) return { kind: "disabled" };
+        if (!valid(runId, generation)) return { kind: "error", reason: "invalid_id" };
+        try {
+          return await this.withJournalLock(runId, async (): Promise<TerminalInvokeResult> => {
+            this.assertPredecessorAuthority();
+            const cur = await this.terminalReadUnlocked(runId, generation);
+            if (cur.kind !== "ok") return cur;
+            const blocked = await this.terminalRunBlockedUnlocked(runId);
+            if (blocked !== undefined) return { kind: "blocked", reason: blocked };
+            const merged = mergeTerminalRecord(cur.record, { appendInvocations: [{ at, outcome: "invoked" }] });
+            if (!merged.ok) return { kind: "rejected", reason: merged.reason };
+            if (!readable(merged.record)) return { kind: "rejected", reason: "bound" };
+            await this.terminalWriteUnlocked(merged.record);
+            return { kind: "invoked", record: merged.record };
+          });
+        } catch (error) {
+          return failure(error);
+        }
+      },
+    };
+  }
+
+  /** The operation owner lane for one run generation: held by the producer across its whole operation. Latch writers
+   *  never take it (they use the journal lock only), so they can land while a send is in flight. */
+  terminalOperationOwner(runId: string, generation: number): <T>(fn: () => Promise<T>) => Promise<T> {
+    return <T>(fn: () => Promise<T>): Promise<T> => {
+      if (!this.terminalPreservationEnabled()) throw new Error("terminal preservation disabled");
+      return runCaptureCycle(`terminal:${runId}:g${generation}`, "wait", fn);
+    };
+  }
+
+  /**
+   * Restart rediscovery from disk only: capturing/captured records become `incomplete` (record and refs retained);
+   * prepared records are returned for a later caller to resume. Never sends, never touches git or the source.
+   */
+  async resumeTerminalOperations(signal?: AbortSignal): Promise<TerminalRediscovery> {
+    const out: TerminalRediscovery = { resumePending: [], incomplete: 0, corrupt: 0, truncated: false };
+    if (!this.terminalPreservationEnabled() || !this.key) return out;
+    const deadline = this.now() + 30_000;
+    const over = () => signal?.aborted === true || this.now() > deadline;
+    // Bounds only the wait for a run's journal lock: a waiter that gives up never acquires later.
+    const wait = (): AbortSignal => {
+      const t = AbortSignal.timeout(Math.max(0, deadline - this.now()));
+      return signal ? AbortSignal.any([signal, t]) : t;
+    };
+    let stop = false;
+    let runs: string[];
+    try { runs = (await fs.readdir(this.terminalRoot())).filter(isTerminalRunId).sort(); } catch { return out; }
+    if (runs.length > 4096) { runs = runs.slice(0, 4096); out.truncated = true; }
+    const store = this.terminalOperationStore();
+    for (const runId of runs) {
+      if (over()) { out.truncated = true; break; }
+      let files: string[];
+      try {
+        if (!(await fs.lstat(this.terminalRunDir(runId))).isDirectory()) { out.corrupt++; continue; }
+        files = (await fs.readdir(this.terminalRunDir(runId))).filter(n => /^g[1-9][0-9]*\.json$/.test(n));
+      } catch { out.corrupt++; continue; }
+      files.sort((a, b) => Number(a.slice(1, -5)) - Number(b.slice(1, -5)));
+      if (files.length > 64) { files = files.slice(0, 64); out.truncated = true; }
+      for (const name of files) {
+        if (over()) { out.truncated = true; break; }
+        const generation = Number(name.slice(1, -5));
+        let res: TerminalReadResult;
+        const rs = wait();
+        // Only a forfeited lock wait ends the pass as truncated; any other failure still reaches the caller's log.
+        try { res = await store.read(runId, generation, { signal: rs }); } catch (error) {
+          if (!rs.aborted) throw error;
+          out.truncated = true; stop = true; break;
+        }
+        if (res.kind === "absent") continue;
+        if (res.kind === "corrupt") {
+          out.corrupt++;
+          this.log.warn("terminal preservation: corrupt operation record kept", { runId, generation });
+          continue;
+        }
+        const rec = res.record;
+        if (rec.phase === "capturing" || rec.phase === "captured") {
+          // A live operation holds the lane; only an idle one is restart residue.
+          const w = wait();
+          const cycle = await runCaptureCycle(`terminal:${runId}:g${generation}`, "skip",
+            () => store.update(runId, generation, { phase: "incomplete", closedReason: "restart_incomplete" }, { signal: w }));
+          if (cycle.ran && cycle.value.kind === "ok") out.incomplete++;
+          else if (cycle.ran && cycle.value.kind === "error" && w.aborted) { out.truncated = true; stop = true; break; }
+        } else if (rec.phase === "prepared" && rec.localBlock.length === 0) {
+          out.resumePending.push({ runId, generation, record: rec });
+        }
+      }
+      if (stop) break;
+    }
+    return out;
+  }
+
+  // ── #4007 slice B M6-V: guarded replay of a frozen open held record (production-dark) ──
+
+  /** The frozen attempt this replay is about: the completing source when the record names one, else the single present
+   *  clone of the record's branch. Undefined when no usable binding exists. */
+  private async terminalReplayCurrent(record: RecoveryRecord, barePath: string, git: TerminalReplayGit,
+    signal: AbortSignal): Promise<{ attemptId: string; clonePath: string; identity: string } | undefined> {
+    let clonePath: string | undefined, attemptId: string | undefined;
+    const source = record.completionSource;
+    if (source?.clonePath !== undefined && source.attemptId !== undefined) {
+      clonePath = source.clonePath; attemptId = source.attemptId;
+    } else {
+      const inv = await git.readInventoryCloneHeads!(barePath, record.runId, { cloneIdentity: true });
+      if (inv.kind !== "verified") return undefined;
+      const mine = inv.clones.filter(c => c.branch === record.branch);
+      if (mine.length !== 1) return undefined;
+      const attr = await git.readTerminalAttribution!(barePath, record.runId, { signal, deadline: Date.now() + 30_000 });
+      if (attr.kind !== "verified") return undefined;
+      const hits = attr.attempts.filter(a => a.clonePath === mine[0]!.clonePath);
+      if (hits.length !== 1) return undefined;
+      clonePath = hits[0]!.clonePath; attemptId = hits[0]!.attemptId;
+    }
+    try {
+      const st = await fs.lstat(clonePath);
+      if (!st.isDirectory() || st.isSymbolicLink()) return undefined;
+      return { attemptId, clonePath, identity: `${st.dev}:${st.ino}` };
+    } catch { return undefined; }
+  }
+
+  /** Bounded measure of the frozen clone's uncommitted bytes for a `cold_dirty` extent; undefined when unmeasurable. */
+  private async terminalReplayDirtyExtents(clonePath: string, git: TerminalReplayGit): Promise<{ files: number; bytes: number } | undefined> {
+    const lines = await git.worktreeStatus!(clonePath);
+    if (lines === null || lines.length > 4096) return undefined;
+    let bytes = 0;
+    for (const line of lines) {
+      const rel = line.slice(3);
+      if (line.length < 4 || rel.startsWith("\"") || rel.includes(" -> ") || rel.split("/").some(s => s === ".." || s === "")) return undefined;
+      try {
+        const st = await fs.lstat(path.join(clonePath, rel));
+        if (st.isDirectory()) return undefined;
+        bytes += st.size;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") return undefined;
+      }
+    }
+    return Number.isSafeInteger(bytes) ? { files: lines.length, bytes } : undefined;
+  }
+
+  /** The newest tip this worker durably recorded for an earlier generation of the run; "unknown" refuses. */
+  private async terminalReplayPriorTip(runId: string, generation: number,
+    store: TerminalOperationStore): Promise<{ tip?: string } | "unknown"> {
+    if (generation > 65) return "unknown";
+    let tip: string | undefined;
+    for (let g = 1; g < generation; g++) {
+      const res = await store.read(runId, g);
+      if (res.kind === "absent") continue;
+      if (res.kind !== "ok") return "unknown";
+      const rec = res.record;
+      const final = rec.invocations.some(i => i.outcome === "published" || i.outcome === "recorded");
+      if (final && rec.tip) tip = rec.tip;
+      else if (rec.invocations.length > 0) return "unknown";
+    }
+    return { tip };
+  }
+
+  /**
+   * One terminal preservation operation for a frozen OPEN guarded hold, run inside the inventory source boundary
+   * (`prove` is that boundary's proof). It never reopens a hold and never captures new work: the frozen sourceSha is
+   * the tip, the universe must be exactly the frozen attempt with every root reachable from it, and the only abandoned
+   * extent is the frozen clone's measurable uncommitted bytes.
+   */
+  private async runGuardedTerminalPreservation(record: RecoveryRecord, input: { barePath: string; signal?: AbortSignal },
+    ctx: { failOrigin?: string; prove: () => Promise<boolean> }): Promise<TerminalOperationResult> {
+    const kept = (reason: string): TerminalOperationResult => ({ outcome: "kept", reason });
+    if (!this.terminalPreservationEnabled()) return kept("disabled");
+    const { runId, generation, heldPolicy: policy, exactHoldBinding: binding, coverageContext } = record;
+    const git = this.git as TerminalReplayGit;
+    const client = this.client as RecoveryArchiveClient & { publishTerminalPreservation?: WorkerClient["publishTerminalPreservation"] };
+    if (generation === undefined || !policy || !binding || !coverageContext || !client.publishTerminalPreservation ||
+        !client.getExactRecoveryHold || !git.listRunBares || !git.readInventoryCloneHeads || !git.readTerminalAttribution ||
+        !git.readTerminalCloneLocalRefs || !git.commitTreeOid || !git.worktreeStatus || !git.ancestry) return kept("seams_unavailable");
+    const signal = input.signal ?? new AbortController().signal;
+    const barePath = input.barePath;
+    let workerId: string;
+    try {
+      const exact = await this.recoveryRPC(() => client.getExactRecoveryHold!(runId, generation, binding, maintenanceSignal(input.signal)));
+      if (!exact || exact.run_id !== runId || exact.generation !== generation || exact.hold_id !== binding.holdId ||
+          exact.repo_id !== binding.repoId || exact.inventory_guarded !== true || exact.state !== "open" ||
+          typeof exact.original_worker_id !== "string" || exact.original_worker_id.length === 0) return kept("hold_unproved");
+      workerId = exact.original_worker_id;
+    } catch { MaintenanceBudget.current()?.check(); return kept("hold_unproved"); }
+    const current0 = await this.terminalReplayCurrent(record, barePath, git, signal).catch(() => undefined);
+    if (!current0) return kept("universe_current_missing");
+    const store = this.terminalOperationStore();
+    const prior = await this.terminalReplayPriorTip(runId, generation, store);
+    if (prior === "unknown") return kept("prior_tip_unknown");
+    const existing = await store.read(runId, generation);
+    const mode = existing.kind === "ok" && existing.record.phase === "prepared" ? "resume" : "initial";
+    const boundary = { open: true };
+    let proved: Extract<TerminalUniverse, { kind: "proved" }> | undefined;
+    const pinned = git as HeldGit & TerminalDigestGit;
+    const deps: TerminalOperationDeps = {
+      enabled: () => this.terminalPreservationEnabled(),
+      store,
+      owner: this.terminalOperationOwner(runId, generation),
+      failureFirst: () => policy.blocked ? "secret_remediation_pending"
+        : ctx.failOrigin === "push_secret_blocked" || ctx.failOrigin === "worker_residue_blocked" ? ctx.failOrigin
+        : residueQuarantine() !== undefined ? "residue_quarantine" : undefined,
+      universe: async () => {
+        proved = undefined;
+        const current = await this.terminalReplayCurrent(record, barePath, git, signal).catch(() => undefined);
+        if (!current) return { kind: "unproved", reason: "current_missing" };
+        const universe = await readTerminalSourceUniverse({ git: git as unknown as Parameters<typeof readTerminalSourceUniverse>[0]["git"], recovery: this, runId, current, signal, deadline: Date.now() + 30_000 });
+        if (universe.kind !== "proved") return universe;
+        if (universe.sources.length !== 1 || universe.sources[0]!.attemptId !== current.attemptId) {
+          return { kind: "unproved", reason: "non_current_clone_present" };
+        }
+        for (const root of universe.roots) {
+          if (root.commit !== record.sourceSha && await ownedRecoveryIO(() => git.ancestry!(barePath, root.commit, record.sourceSha)) !== "ancestor") {
+            // G10: a root the frozen tip does not contain would be left out of the pack.
+            return { kind: "unproved", reason: "g10_unreachable_root" };
+          }
+        }
+        proved = universe;
+        return universe;
+      },
+      capture: async onPhase => {
+        const universe = proved;
+        if (!universe) return { kind: "refused", reason: "universe_unavailable" };
+        const source = universe.sources[0]!;
+        const roots: TerminalManifest["roots"] = [];
+        for (const root of universe.roots) {
+          const tree = await git.commitTreeOid!(barePath, root.commit);
+          if (!tree) return { kind: "refused", reason: "tree_unreadable" };
+          roots.push({ source_id: source.sourceId, attempt_id: source.attemptId, commit: root.commit, tree });
+        }
+        const refs = { cloneRef: `clone:${path.basename(source.clonePath)}@${source.head}`, bareRef: `bare:${path.basename(barePath)}@${record.sourceSha}` };
+        await onPhase("capturing", refs);
+        const extents = await this.terminalReplayDirtyExtents(source.clonePath, git);
+        if (!extents) return { kind: "refused", reason: "dirty_unmeasurable" };
+        await onPhase("captured", { ...refs, commit: source.head });
+        return { kind: "ok", base: record.sourceSha, extraRoots: [], manifest: {
+          run_id: runId, generation, worker_id: workerId, roots,
+          abandoned: extents.files > 0 ? [{ class: "cold_dirty", source_id: source.sourceId, extents }] : [],
+        } };
+      },
+      aggregate: async ({ base, extraRoots }) => extraRoots.length === 0 ? { tip: base } : { refused: "extra_roots" },
+      prepare: async (range, expectDigests, tip) => {
+        if (tip !== record.sourceSha) return { reason: "tip_mismatch" };
+        if (!pinned.resolveCheckpointRange || !pinned.secretScanCheckpointRange || !pinned.ancestry ||
+            !pinned.rangeTouchesWorkflows || !pinned.changedFilesNoRenames || !pinned.checkpointPack) return { reason: "preparation_unavailable" };
+        try {
+          return await prepareFrozenHeldPinned({
+            git: pinned, barePath, branch: record.branch, sourceSha: record.sourceSha, policy, deadlineMs: 30_000,
+            perCommitCi: true, ciTarget: coverageContext.defaultIdentity.sha, expectDigests,
+            remediationHold: async () => !await this.restrictionsAllowCapturedC(record),
+          }, range);
+        } catch { MaintenanceBudget.current()?.check(); return { reason: "preparation_failed" }; }
+      },
+      coverage: (universe, manifest, snapshot) => checkManifestCoverage(universe, manifest, { currentFlight: false, ...(snapshot ? { snapshot } : {}) }),
+      recheck: async () => {
+        if (!await ctx.prove()) return "boundary_unproved";
+        if (!await this.restrictionsAllowCapturedC(record)) return "restrictions";
+        const latest = await this.readLatest(record);
+        if (latest.kind !== "ok" || latest.record.heldPolicy?.blocked !== false) return "secret_remediation_pending";
+        return residueQuarantine() !== undefined ? "residue_quarantine" : undefined;
+      },
+      boundaryValid: () => boundary.open && !input.signal?.aborted,
+      send: (req, sendSignal) => client.publishTerminalPreservation!(runId, req, sendSignal),
+      now: () => this.now(),
+    };
+    try {
+      return await runTerminalOperation(deps, {
+        runId, workerId, generation, authorityClass: "open_guarded_hold", clonePath: current0.clonePath,
+        ...(prior.tip !== undefined ? { priorTip: prior.tip } : {}), mode, signal: input.signal,
+      });
+    } finally { boundary.open = false; }
+  }
+
   private readonly onForgetJournalLockedForTest: RecoveryCoordinatorOptions["onForgetJournalLockedForTest"];
   private readonly onOperatorDisposeStepForTest: RecoveryCoordinatorOptions["onOperatorDisposeStepForTest"];
   private readonly operatorSourceEvidence: RecoveryCoordinatorOptions["operatorSourceEvidence"];
@@ -1712,6 +2180,7 @@ export class RecoveryCoordinator {
 
   constructor(opts: RecoveryCoordinatorOptions) {
     this.authority = opts.authority;
+    this.terminalPreservationTestOverride = opts.terminalPreservationTestOverride;
     this.onForgetJournalLockedForTest = opts.onForgetJournalLockedForTest;
     this.onOperatorDisposeStepForTest = opts.onOperatorDisposeStepForTest;
     this.operatorSourceEvidence = opts.operatorSourceEvidence;
@@ -3536,6 +4005,17 @@ export class RecoveryCoordinator {
       hold = await this.heldOperationState(record, input.signal);
       if (hold !== "open") { result = hold === "settled" ? "settled" : "kept"; return; }
       if (input.signal?.aborted || residueQuarantine() !== undefined) { result = "kept"; return; }
+      // #4007 slice B M6-V: with the gate on, the work is preserved before any held FINAL can be minted this pass.
+      // Only branch-source kinds enter it; every other kind keeps the shipped held flow, as with the gate off.
+      if (this.terminalPreservationEnabled() &&
+          classifyTerminalOutput({ kind: record.kind, adoptedSource: true }) === "branch_source") {
+        if (!await this.restrictionsAllowCapturedC(record)) { result = "kept"; return; }
+        const tp = await this.runGuardedTerminalPreservation(record, input, { failOrigin: terminal?.fail_origin, prove });
+        if (tp.outcome === "kept" && (tp.reason === "secret_found" || tp.reason === "secret_found_unlatched")) {
+          record = await this.writeExistingRecord(record, cur => ({ ...cur, heldPolicy: { ...cur.heldPolicy!, blocked: true } }));
+        }
+        if (tp.outcome !== "published" && tp.outcome !== "recorded") { result = "kept"; return; }
+      }
       // V2 reconciles lost create answers before any retry. V1 retains its legacy
       // archive fallback, whose FINAL supplies the generation settlement authority.
       if (v2) record = await this.writeExistingRecord(record, cur => ({ ...cur, heldCreateUncertain: true }));
@@ -5229,6 +5709,14 @@ export class RecoveryCoordinator {
 
   private async resumePendingPass(signal?: AbortSignal, snapshot?: RecoveryRecord[], discover = false): Promise<void> {
     const attempts = new Map<string, MaintenanceBudget>();
+    // #4007 slice B: gated, non-sending, non-mutating rediscovery of terminal-preservation records on the boot
+    // pass (capturing/captured -> incomplete). It never fails the pass; a resumable record sends only later,
+    // through the held V2 publish closure. With the gate off nothing runs.
+    if (this.terminalPreservationEnabled()) {
+      await this.resumeTerminalOperations(signal).catch((err: unknown) => {
+        this.log.warn("recovery: terminal preservation rediscovery failed", { error: errText(err) });
+      });
+    }
     try {
       const records = [...(snapshot ?? await this.snapshotBootRecords())];
       if (discover) {
@@ -7899,6 +8387,21 @@ export class RecoveryCoordinator {
       if (record) out.push(record);
     }
     return out;
+  }
+
+  /**
+   * issue #4007 M3 (read-only): this run's authenticated recovery records, or `unknown`. It is the strict
+   * {@link checkedRecords} pass: every `.json` entry must authenticate as a record of this run and every other entry
+   * must be a bundle of one of them (or this coordinator's own crash-era temp), so an unreadable, foreign or
+   * unattributed entry is `unknown`, never an empty or partial list. A run with no directory has no records.
+   */
+  async readTerminalRecords(runId: string, budget: { signal: AbortSignal; deadline: number }):
+    Promise<{ kind: "records"; records: RecoveryRecord[] } | { kind: "unknown" }> {
+    try {
+      return { kind: "records", records: await this.checkedRecords(runId, budget, true, true) };
+    } catch {
+      return { kind: "unknown" };
+    }
   }
 
   private async findRecord(

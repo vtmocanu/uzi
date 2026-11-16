@@ -1053,6 +1053,8 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
     "agent_source_request_v1",
     ...(process.platform === "linux" ? ["ci_artifacts_v1"] : []),
   ];
+  // #4007 slice B is production-dark: its capability is never advertised in any permutation below.
+  const TERMINAL_PRESERVATION_CAP = "recovery_terminal_preservation_v1";
   // A client whose register() captures the protocol-capabilities argument (5th param) so a
   // test can assert exactly what the worker advertised, then idles both claim lanes.
   function capturingClient(): { client: WorkerClient; captured: () => string[] | undefined } {
@@ -1093,6 +1095,7 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
     for (let i = 0; i < 300 && captured() === undefined; i++) await tick();
     controller.abort();
     await done;
+    assert.ok(!captured()?.includes(TERMINAL_PRESERVATION_CAP), `${TERMINAL_PRESERVATION_CAP} must never be advertised (#4007 slice B is production-dark)`);
     return captured();
   }
 

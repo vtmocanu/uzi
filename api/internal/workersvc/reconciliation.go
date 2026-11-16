@@ -88,6 +88,7 @@ func (s *Service) recordRegistrationEvidence(ctx context.Context, worker store.W
 
 type StateReportResult struct {
 	RegistrationEvidence        string                                `json:"-"`
+	CheckpointPublication       string                                `json:"-"`
 	RevisionInputID             *int64                                `json:"-"`
 	SupersededRevisionInputIDs  []int64                               `json:"-"`
 	CompletedPublicationReceipt *apitypes.CompletedPublicationReceipt `json:"-"`
@@ -155,6 +156,9 @@ func (s *Service) SetStateReportWithReconciliation(ctx context.Context, worker s
 	if err := validateRegistrationEvidence(req); err != nil {
 		return result, err
 	}
+	if err := validateCheckpointPublication(req); err != nil {
+		return result, err
+	}
 	if err := validateReportOnlyShape(req); err != nil {
 		return result, err
 	}
@@ -187,6 +191,9 @@ func (s *Service) SetStateReportWithReconciliation(ctx context.Context, worker s
 		return StateReportResult{Run: run, RegistrationEvidence: evidence}, err
 	}
 	result.Run, result.Applied = run, applied
+	// Issue #4257: the fact is recorded only after the status write, as its own statement, and a
+	// failure of that statement is logged and ACKed "unrecorded" without failing the report.
+	result.CheckpointPublication = s.recordCheckpointPublication(ctx, worker, runID, req)
 	if applied && result.GateRevision > 0 && req.RevisionInputID != nil {
 		result.RevisionInputID = req.RevisionInputID
 		result.SupersededRevisionInputIDs = req.SupersededRevisionInputIDs

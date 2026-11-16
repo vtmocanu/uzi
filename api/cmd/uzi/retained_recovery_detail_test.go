@@ -18,6 +18,9 @@ func TestAdoptionFailedDetailGuidance(t *testing.T) {
 		want   []string
 		deny   []string
 	}{
+		{"source end declined", strPtrT(recoveryDetailSourceEndDeclined),
+			[]string{"409", "Only after a different worker registration", "guarded attempt: uzi run resume", "Cancel remains available: uzi run cancel"},
+			[]string{generic, "owner Resume now", "Owner Resume or Cancel:", "Resume: uzi run resume"}},
 		{"active", strPtrT(recoveryDetailSecretRemediationActive),
 			[]string{"active secret-scan remediation", "Resume cannot succeed unchanged", "uzi run export", "--output <path>", "operator can recover the retained work from worker storage", "Cancel ends the run", "uzi run cancel"},
 			[]string{generic, "remediation proof could not be verified", "uzi run resume", "success is not assured"}},

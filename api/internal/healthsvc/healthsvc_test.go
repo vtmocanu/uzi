@@ -77,6 +77,9 @@ type fakeStore struct {
 	ciwatchErr             error
 	runDisk                []store.WorkerRunDisk
 	runDiskErr             error
+	hibRows                []store.ListAutoHibernationBlockersRow
+	hibErr                 error
+	hibParams              []store.ListAutoHibernationBlockersParams
 }
 
 func (f *fakeStore) RecoveryStorageHealth(ctx context.Context, p store.RecoveryStorageHealthParams) ([]store.RecoveryStorageHealthRow, error) {
@@ -160,6 +163,11 @@ func (f *fakeStore) ListLargestRunDiskForWorkers(context.Context, store.ListLarg
 	return f.runDisk, f.runDiskErr
 }
 
+func (f *fakeStore) ListAutoHibernationBlockers(_ context.Context, p store.ListAutoHibernationBlockersParams) ([]store.ListAutoHibernationBlockersRow, error) {
+	f.hibParams = append(f.hibParams, p)
+	return f.hibRows, f.hibErr
+}
+
 type fakeSettings struct {
 	sourceEnabled  bool
 	sourceURL      string
@@ -176,6 +184,20 @@ type fakeSettings struct {
 	// in this fake, so tests that exercise custody.holds set it explicitly.
 	custodyLimit int32
 	custodyErr   error
+	// hibernation (issue #4207) backs WorkerHibernationEnabled/Auto/IdleAfter.
+	hibEnabled, hibAuto bool
+	hibIdleAfter        time.Duration
+	hibErr              error
+}
+
+func (f *fakeSettings) WorkerHibernationEnabled(context.Context) (bool, error) {
+	return f.hibEnabled, f.hibErr
+}
+func (f *fakeSettings) WorkerHibernationAuto(context.Context) (bool, error) {
+	return f.hibAuto, f.hibErr
+}
+func (f *fakeSettings) WorkerHibernationIdleAfter(context.Context) (time.Duration, error) {
+	return f.hibIdleAfter, f.hibErr
 }
 
 func (f *fakeSettings) HealthEnabled(context.Context) (bool, error) {
@@ -1192,9 +1214,9 @@ func TestEvaluateRollupAndRegistry(t *testing.T) {
 	// (integrations), so it is 14, not 11; PRD #1809 M6 added fleet.rundisk
 	// (workers), issue #2203 adds forge.sync (integrations), and issue #2213 adds
 	// fleet.quarantine and issue #3142 adds fleet.memory_authority (workers); pricing.codex follows release.check, db.size follows db and
-	// Both fleet.hibernation_cleanup and fleet.hibernation_retirement follow fleet.hibernation_wake; there are 26 checks.
+	// Hibernation checks follow memory authority: wake, cleanup, automatic policy, retirement; 27 checks total.
 	wantIDs := []string{
-		"fleet.roll", "fleet.capacity", "fleet.disk", "fleet.rundisk", "fleet.quarantine", "fleet.memory_authority", "fleet.hibernation_wake", "fleet.hibernation_cleanup", "fleet.hibernation_retirement", "queue.waiting", "queue.undispatched",
+		"fleet.roll", "fleet.capacity", "fleet.disk", "fleet.rundisk", "fleet.quarantine", "fleet.memory_authority", "fleet.hibernation_wake", "fleet.hibernation_cleanup", "fleet.hibernation", "fleet.hibernation_retirement", "queue.waiting", "queue.undispatched",
 		"controller.report", "db", "db.size", "loops", "forge.ciwatch", "forge.sync", "slack.socket",
 		"schedules.paused", "maintenance.active", "board.drift", "custody.holds", "recovery.storage", "release.check", "agentsource.update", "pricing.codex",
 	}

@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/vtmocanu/uzi/api/internal/forge"
@@ -259,6 +261,24 @@ type publicationSnapshotReader interface {
 	PublicationContextSnapshot(context.Context, store.PublicationContextSnapshotParams) ([]byte, error)
 }
 
+// readPublicationSnapshot runs one snapshot read and logs a deadline failure (#4302).
+// The warning is a deadline signal, not proof of a slow plan: the recheck's context also
+// covers transaction setup and the row locks, so it may start with little budget left.
+// The caller's unknown reason is unchanged.
+func readPublicationSnapshot(ctx context.Context, q publicationSnapshotReader, params store.PublicationContextSnapshotParams, phase string) ([]byte, error) {
+	start := time.Now()
+	remaining := int64(-1)
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining = time.Until(deadline).Milliseconds()
+	}
+	snapshot, err := q.PublicationContextSnapshot(ctx, params)
+	if err != nil && (errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded)) {
+		slog.Warn("publication context: snapshot read hit its deadline", "event", "publication_context_snapshot_deadline",
+			"phase", phase, "run", params.RunID.String(), "elapsed_ms", time.Since(start).Milliseconds(), "budget_at_start_ms", remaining)
+	}
+	return snapshot, err
+}
+
 // ResolvePublicationContext performs bounded reads and one forge summary call with no
 // database locks. A short final transaction locks worker -> requesting run, then
 // rechecks the entire authority graph in one READ COMMITTED statement.
@@ -276,7 +296,7 @@ func (s *Service) ResolvePublicationContext(ctx context.Context, w store.Worker,
 	params := store.PublicationContextSnapshotParams{RunID: id, UserID: w.UserID}
 	readCtx, cancel := context.WithTimeout(ctx, completedPublicationDeadline)
 	defer cancel()
-	before, err := q.PublicationContextSnapshot(readCtx, params)
+	before, err := readPublicationSnapshot(readCtx, q, params, "read")
 	if err != nil {
 		return publicationUnknown("association_unknown")
 	}
@@ -318,7 +338,7 @@ func (s *Service) ResolvePublicationContext(ctx context.Context, w store.Worker,
 		run.ClaimReleasedAt.Valid || (run.Status != "claimed" && run.Status != "running") {
 		return publicationUnknown("claim_changed")
 	}
-	after, err := qt.PublicationContextSnapshot(txCtx, params)
+	after, err := readPublicationSnapshot(txCtx, qt, params, "recheck")
 	if err != nil || !bytes.Equal(before, after) {
 		return publicationUnknown("authority_changed")
 	}

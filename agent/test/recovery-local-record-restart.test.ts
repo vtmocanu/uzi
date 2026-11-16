@@ -290,6 +290,42 @@ test("kill 1: inside the source boundary, before the POST: bytes unchanged, the 
   assertBoundary(before, await snapshot(w), 1);
 });
 
+// issue #4377: runChild polls existsSync(marker) and then asserts its content, so the child must never expose a
+// created-but-unwritten marker (main CI read '' for 'case-b-step:10'). The gate holds the child after it created the
+// marker's file and before it wrote it; while held, a non-atomic write leaves an empty marker, an atomic one none.
+test("the seam marker is never visible before its content is written", async () => {
+  const w = await seed();
+  const gate = path.join(w.ctl, "marker-gate");
+  let markerWhileHeld: boolean | undefined;
+  let failure: unknown;
+  let stop = false;
+  // The observer settles on its own (never rejects): its errors are kept as the first failure, and it stops
+  // when told, so an early child exit cannot leave it polling past the test.
+  const observer = (async () => {
+    const deadline = Date.now() + SEAM_WAIT_MS;
+    while (!fsSync.existsSync(`${gate}.opened`)) {
+      if (stop) return;
+      if (Date.now() > deadline) throw new Error("the child never reached the held marker write");
+      await sleep(10);
+    }
+    markerWhileHeld = fsSync.readdirSync(w.ctl).some((f) => f.endsWith(".marker"));
+    fsSync.writeFileSync(gate, "");
+  })().catch((error: unknown) => { failure ??= error; });
+  let killed: ChildOutcome | undefined;
+  try {
+    killed = await runChild(w, "resolve", "pre-post", { markerGate: gate });
+  } catch (error) {
+    failure ??= error;
+  } finally {
+    stop = true;
+    if (!fsSync.existsSync(gate)) fsSync.writeFileSync(gate, ""); // never leave a held child waiting
+    await observer;
+  }
+  if (failure !== undefined) throw failure;
+  assert.equal(markerWhileHeld, false, "the marker was visible before its content was written");
+  assert.equal(killed?.exit.signal, "SIGKILL");
+});
+
 test("kill 2: after the server answered the POST, before the ACK write: the fresh process replays the identical request", async () => {
   const w = await seed();
   const before = await snapshot(w);

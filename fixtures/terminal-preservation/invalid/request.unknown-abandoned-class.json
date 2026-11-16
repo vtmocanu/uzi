@@ -1,0 +1,36 @@
+{
+  "generation": 3,
+  "tip": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "prior_tip": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "manifest": {
+    "run_id": "11111111-1111-4111-8111-111111111111",
+    "generation": 3,
+    "worker_id": "22222222-2222-4222-8222-222222222222",
+    "roots": [
+      {
+        "source_id": "primary",
+        "attempt_id": "33333333-3333-4333-8333-333333333333",
+        "commit": "cccccccccccccccccccccccccccccccccccccccc",
+        "tree": "dddddddddddddddddddddddddddddddddddddddd"
+      },
+      {
+        "source_id": "secondary",
+        "attempt_id": "44444444-4444-4444-8444-444444444444",
+        "commit": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "tree": "ffffffffffffffffffffffffffffffffffffffff"
+      }
+    ],
+    "abandoned": [
+      {
+        "class": "mystery",
+        "source_id": "primary",
+        "extents": {
+          "files": 2,
+          "bytes": 1024
+        }
+      }
+    ]
+  },
+  "disposition": "preserve",
+  "pack": "UEFDSw=="
+}

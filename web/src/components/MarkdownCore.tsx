@@ -1,5 +1,5 @@
 import Markdown, { type Components, type Options } from "react-markdown";
-import remarkGfm from "remark-gfm";
+import { DOC_REMARK_PLUGINS } from "../lib/docMarkdownPlugins";
 
 // Policy-free markdown core shared by every renderer in the app. It fixes the
 // pipeline (react-markdown + remark-gfm, no rehype-raw — raw HTML stays inert
@@ -36,7 +36,7 @@ export function MarkdownCore({
   const merged = components ? { ...baseComponents, ...components } : baseComponents;
   return (
     <div className={className}>
-      <Markdown remarkPlugins={[remarkGfm]} rehypePlugins={rehypePlugins} components={merged}>
+      <Markdown remarkPlugins={DOC_REMARK_PLUGINS} rehypePlugins={rehypePlugins} components={merged}>
         {content}
       </Markdown>
     </div>

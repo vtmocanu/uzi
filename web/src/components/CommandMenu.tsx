@@ -10,45 +10,63 @@ import { useNavigate } from "react-router-dom";
 import { api, type Repo, type RecoveryCustodyHolds, type RunSummaryItem } from "../lib/api";
 import { useDemoMode } from "../lib/demoMode";
 import { maskRepoPath } from "../lib/demoMask";
+import type { DocHeading } from "../lib/docHeadingsPipeline";
+import { docsForIndex } from "../lib/docs";
 import { mrRefSymbol } from "../lib/forgeNoun";
 import { overviewDecisions, type DecisionItem } from "../lib/overview";
 import { stripUnsafeChars } from "../lib/safeText";
+// Namespace import: the builders are called through it so a test can spy on them.
+import * as built from "./commandMenuItems";
+import type { CommandGroup, CommandItem } from "./commandMenuItems";
 import { HELD_WORK_HREF } from "./HeldWorkCard";
 import { Modal } from "./Modal";
 import { BoardIcon, ChatIcon, SearchIcon } from "./icons";
 import { visibleNavItems } from "./navItems";
 import { KindIcon } from "./NeedsDecisionCard";
 
-export type CommandGroup = "needs" | "actions" | "goto";
+type BrowseGroup = Extract<CommandGroup, "needs" | "actions" | "goto">;
 
-export type CommandItem = {
-  id: string;
-  group: CommandGroup;
-  label: string;
-  hint: string;
-  // An in-app path; choosing the item navigates here.
-  to: string;
-  icon: ReactNode;
-  title?: string;
-};
-
-const GROUP_TITLES: Record<CommandGroup, string> = {
+const GROUP_TITLES: Record<BrowseGroup, string> = {
   needs: "Needs you",
   actions: "Actions",
   goto: "Go to",
 };
 
-// Without a query the menu reads in the mock's order; with one, ties keep the order the
-// sidebar-first reader expects (destinations before actions before decisions).
-const DISPLAY_ORDER: CommandGroup[] = ["needs", "actions", "goto"];
-const QUERY_ORDER: CommandGroup[] = ["goto", "actions", "needs"];
+// Without a query the menu reads in the mock's order and shows only these three groups; with
+// one, ties keep the order the sidebar-first reader expects (destinations before actions
+// before decisions), then the search-only groups.
+const DISPLAY_ORDER: BrowseGroup[] = ["needs", "actions", "goto"];
+const QUERY_ORDER: CommandGroup[] = [
+  "goto",
+  "actions",
+  "needs",
+  "sections",
+  "agents",
+  "schedules",
+  "workers",
+  "skills",
+  "runs",
+  "docs",
+];
+
+// Each search-only group keeps its best few matches; the rest are counted in a note.
+const NEW_GROUP_CAP = 5;
+const CAPPED_NOUNS: Partial<Record<CommandGroup, [string, string]>> = {
+  sections: ["section", "sections"],
+  agents: ["agent", "agents"],
+  schedules: ["schedule", "schedules"],
+  workers: ["worker", "workers"],
+  skills: ["skill", "skills"],
+  runs: ["recent run", "recent runs"],
+  docs: ["doc", "docs"],
+};
 
 const ALNUM = /[\p{L}\p{N}]/u;
 
-// 0: label starts with the query; 1: the query starts a word; 2: any other substring;
+// 0: text starts with the query; 1: the query starts a word; 2: any other substring;
 // null: no match.
-function matchRank(label: string, query: string): 0 | 1 | 2 | null {
-  const l = label.toLowerCase();
+function textRank(text: string, query: string): 0 | 1 | 2 | null {
+  const l = text.toLowerCase();
   const first = l.indexOf(query);
   if (first < 0) return null;
   if (first === 0) return 0;
@@ -58,22 +76,68 @@ function matchRank(label: string, query: string): 0 | 1 | 2 | null {
   return 2;
 }
 
-// The visible items for a query, in display order. Pure so the ranking is unit-testable.
-export function filterCommandItems(items: CommandItem[], query: string): CommandItem[] {
+// The best rank over the label, its last " › " segment and each keyword.
+function matchRank(item: CommandItem, query: string): 0 | 1 | 2 | null {
+  const sep = item.label.lastIndexOf(" › ");
+  const candidates = [item.label, ...(sep >= 0 ? [item.label.slice(sep + 3)] : []), ...(item.keywords ?? [])];
+  let best: 0 | 1 | 2 | null = null;
+  for (const c of candidates) {
+    const r = textRank(c, query);
+    if (r !== null && (best === null || r < best)) best = r;
+  }
+  return best;
+}
+
+type CommandResult = {
+  items: CommandItem[];
+  // How many matches each capped group dropped.
+  overflow: Partial<Record<CommandGroup, number>>;
+};
+
+// The visible items for a query, in display order, plus the per-group overflow while
+// searching. Pure so the ranking is unit-testable.
+function filterCommandResult(items: CommandItem[], query: string): CommandResult {
   const q = query.trim().toLowerCase();
   if (!q) {
-    return DISPLAY_ORDER.flatMap((g) => items.filter((it) => it.group === g));
+    return { items: DISPLAY_ORDER.flatMap((g) => items.filter((it) => it.group === g)), overflow: {} };
   }
-  return items
-    .map((item, index) => ({ item, index, rank: matchRank(item.label, q) }))
+  const ranked = items
+    .map((item, index) => ({ item, index, rank: matchRank(item, q) }))
     .filter((r): r is { item: CommandItem; index: number; rank: 0 | 1 | 2 } => r.rank !== null)
     .sort(
       (a, b) =>
         a.rank - b.rank ||
         QUERY_ORDER.indexOf(a.item.group) - QUERY_ORDER.indexOf(b.item.group) ||
         a.index - b.index,
-    )
-    .map((r) => r.item);
+    );
+  const taken: Partial<Record<CommandGroup, number>> = {};
+  const overflow: Partial<Record<CommandGroup, number>> = {};
+  const kept: CommandItem[] = [];
+  for (const r of ranked) {
+    const g = r.item.group;
+    if (CAPPED_NOUNS[g]) {
+      const n = taken[g] ?? 0;
+      if (n >= NEW_GROUP_CAP) {
+        overflow[g] = (overflow[g] ?? 0) + 1;
+        continue;
+      }
+      taken[g] = n + 1;
+    }
+    kept.push(r.item);
+  }
+  return { items: kept, overflow };
+}
+
+export function filterCommandItems(items: CommandItem[], query: string): CommandItem[] {
+  return filterCommandResult(items, query).items;
+}
+
+function overflowText(overflow: Partial<Record<CommandGroup, number>>): string {
+  return QUERY_ORDER.flatMap((g) => {
+    const n = overflow[g];
+    const nouns = CAPPED_NOUNS[g];
+    return n && nouns ? [`+${n} more ${n === 1 ? nouns[0] : nouns[1]}`] : [];
+  }).join(" · ");
 }
 
 const RUN_DECISION_VIEW = {
@@ -122,8 +186,37 @@ export function decisionCommandItems(decisions: ReadonlyArray<DecisionItem>): Co
   });
 }
 
+const okItems = (s: ItemsState): CommandItem[] => (s.status === "ok" ? s.items : []);
+
 type RepoState = { status: "loading" } | { status: "error" } | { status: "ok"; repos: Repo[] };
-type DecisionState = { status: "loading" } | { status: "error" } | { status: "ok"; items: CommandItem[] };
+// A list of built items, loading until its one fetch settles; a failed read hides only its group.
+type ItemsState = { status: "loading" } | { status: "error" } | { status: "ok"; items: CommandItem[] };
+type DecisionState = ItemsState;
+const LOADING: ItemsState = { status: "loading" };
+
+// Fetches one list once on mount (no poll, no subscription). `build` runs only while the
+// menu is still open, so a late response never does the work; `load` and `build` are read on
+// the first render only, which is the whole lifetime of the fetch.
+function useOnceItems<T>(load: () => Promise<T>, build: (value: T) => CommandItem[]): ItemsState {
+  const [state, setState] = useState<ItemsState>(LOADING);
+  const fns = useRef({ load, build });
+  useEffect(() => {
+    let alive = true;
+    // Promise.resolve().then(...) turns a synchronous throw from `load` into a rejection.
+    Promise.resolve()
+      .then(() => fns.current.load())
+      .then((value) => {
+        if (alive) setState({ status: "ok", items: fns.current.build(value) });
+      })
+      .catch(() => {
+        if (alive) setState({ status: "error" });
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
+  return state;
+}
 
 export function CommandMenu({
   onClose,
@@ -150,24 +243,44 @@ export function CommandMenu({
   const [activeId, setActiveId] = useState<string | null>(null);
   const [repoState, setRepoState] = useState<RepoState>({ status: "loading" });
   const [decisionState, setDecisionState] = useState<DecisionState>({ status: "loading" });
+  const [runState, setRunState] = useState<ItemsState>(LOADING);
+  // The doc heading index is a build-time module that is heavy to parse: loaded on the first
+  // non-empty query only.
+  const [headingsFor, setHeadingsFor] = useState<((slug: string) => DocHeading[]) | null>(null);
+  const headingsRequested = useRef(false);
+  const mounted = useRef(false);
 
   useEffect(() => {
     inputRef.current?.focus();
   }, []);
 
-  // The viewer's decisions are fetched once when the menu opens, like the repos: no poll,
-  // no subscription. Either request failing hides the whole group (never a partial list);
-  // a response that lands after unmount is dropped.
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+
+  // The viewer's decisions and recent runs come from one read of the run list, fetched once
+  // when the menu opens, like the repos: no poll, no subscription. Decisions need the runs
+  // and the custody holds, so either failing hides that group (never a partial list); the
+  // recent runs need only the run list. A response that lands after unmount is dropped.
   useEffect(() => {
     let alive = true;
     void Promise.allSettled([api.listRuns({ view: "summary" }), api.getRecoveryHolds()]).then(
       ([runsResult, holdsResult]) => {
         if (!alive) return; // defensive: setState after unmount is a no-op in React 19
-        if (runsResult.status !== "fulfilled" || holdsResult.status !== "fulfilled") {
+        if (runsResult.status !== "fulfilled") {
+          setRunState({ status: "error" });
           setDecisionState({ status: "error" });
           return;
         }
         const runs: RunSummaryItem[] = runsResult.value.runs;
+        setRunState({ status: "ok", items: built.runCommandItems(runs) });
+        if (holdsResult.status !== "fulfilled") {
+          setDecisionState({ status: "error" });
+          return;
+        }
         const holds: RecoveryCustodyHolds = holdsResult.value;
         setDecisionState({ status: "ok", items: decisionCommandItems(overviewDecisions(runs, holds)) });
       },
@@ -176,6 +289,37 @@ export function CommandMenu({
       alive = false;
     };
   }, []);
+
+  const agentState = useOnceItems(
+    async () => (await api.listAgentTemplates()).templates,
+    (templates) => built.agentCommandItems(templates),
+  );
+  const scheduleState = useOnceItems(
+    () => api.listSchedules(),
+    (schedules) => built.scheduleCommandItems(schedules),
+  );
+  const workerState = useOnceItems(
+    async () => (await api.listWorkers()).workers,
+    (workers) => built.workerCommandItems(workers),
+  );
+  const skillState = useOnceItems(
+    async () => (await api.listSkills()).skills,
+    (skills) => built.skillCommandItems(skills),
+  );
+
+  const searching = query.trim() !== "";
+  useEffect(() => {
+    if (!searching || headingsRequested.current) return;
+    headingsRequested.current = true;
+    // A failed import leaves the doc titles; the heading rows just never appear.
+    import("../lib/docHeadings")
+      .then((mod) => {
+        if (!mounted.current) return;
+        const lookup = built.headingLookup(mod);
+        setHeadingsFor(() => lookup);
+      })
+      .catch(() => {});
+  }, [searching]);
 
   // Repos are fetched once when the menu opens: no subscription, no poll. A response that
   // lands after unmount is dropped.
@@ -193,6 +337,9 @@ export function CommandMenu({
       alive = false;
     };
   }, []);
+
+  const sectionItems = useMemo(() => built.sectionCommandItems(isAdmin), [isAdmin]);
+  const docItems = useMemo(() => built.docCommandItems(docsForIndex(isAdmin), headingsFor), [isAdmin, headingsFor]);
 
   const items = useMemo<CommandItem[]>(() => {
     const actions: CommandItem[] = [
@@ -221,10 +368,36 @@ export function CommandMenu({
       icon: n.icon,
     }));
     const needs = decisionState.status === "ok" ? decisionState.items : [];
-    return [...needs, ...(extraItems ?? []), ...actions, ...goto];
-  }, [repoState, decisionState, demo, isAdmin, extraItems]);
+    return [
+      ...needs,
+      ...(extraItems ?? []),
+      ...actions,
+      ...goto,
+      ...sectionItems,
+      ...okItems(agentState),
+      ...okItems(scheduleState).map((it) => built.withRepoPath(it, demo)),
+      ...okItems(workerState),
+      ...okItems(skillState),
+      ...okItems(runState).map((it) => built.withRepoPath(it, demo)),
+      ...docItems,
+    ];
+  }, [
+    repoState,
+    decisionState,
+    demo,
+    isAdmin,
+    extraItems,
+    sectionItems,
+    agentState,
+    scheduleState,
+    workerState,
+    skillState,
+    runState,
+    docItems,
+  ]);
 
-  const visible = useMemo(() => filterCommandItems(items, query), [items, query]);
+  const { items: visible, overflow } = useMemo(() => filterCommandResult(items, query), [items, query]);
+  const overflowNote = overflowText(overflow);
   const activeIndex = visible.length === 0 ? -1 : Math.max(0, visible.findIndex((it) => it.id === activeId));
 
   // Re-runs on a new result list too: filtering can keep index 0 active while the list keeps a
@@ -253,7 +426,6 @@ export function CommandMenu({
     }
   };
 
-  const searching = query.trim() !== "";
   const boardsUnavailable = repoState.status === "error";
   const decisionsUnavailable = decisionState.status === "error";
 
@@ -279,7 +451,7 @@ export function CommandMenu({
         {item.icon}
       </span>
       <span className="min-w-0 truncate">{stripUnsafeChars(item.label)}</span>
-      {item.hint && <span className="ml-auto shrink-0 text-xs text-faint">{item.hint}</span>}
+      {item.hint && <span className="ml-auto shrink-0 text-xs text-faint">{stripUnsafeChars(item.hint)}</span>}
     </div>
   );
 
@@ -313,7 +485,7 @@ export function CommandMenu({
     .join(". ");
   const count =
     visible.length === 0 ? "No matches" : `${visible.length} ${visible.length === 1 ? "result" : "results"}`;
-  const announcement = !searching ? "" : notes ? `${count}. ${notes}` : count;
+  const announcement = !searching ? "" : [count, notes, overflowNote].filter(Boolean).join(". ");
 
   return (
     <Modal
@@ -371,6 +543,7 @@ export function CommandMenu({
             No matches
           </div>
         )}
+        {overflowNote && <div className="px-5 pb-3 pt-1 text-xs text-faint">{overflowNote}</div>}
         {boardsUnavailable && <div className="px-5 pb-3 text-xs text-faint">Boards unavailable</div>}
         {decisionsUnavailable && <div className="px-5 pb-3 text-xs text-faint">Decisions unavailable</div>}
         <div role="status" aria-live="polite" className="sr-only">

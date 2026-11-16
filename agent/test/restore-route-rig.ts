@@ -311,7 +311,8 @@ export function peekOnceFrom(r: Rig, marker: string, impl: () => SlotSnapshot | 
 export const ownLedger = (r: Rig): Record<string, unknown> => JSON.parse(cfgAll(r, r.ledgerKey)[0]!) as Record<string, unknown>;
 export const olderLedgerEntry = (r: Rig, state: string): string => {
   const id = mintAttemptId(0);
-  return JSON.stringify({ attemptId: id, runId: r.runId, clonePath: `${r.pPath.replace(/\.attempt-.*$/, "")}.attempt-${id}`, state });
+  const canonical = path.join(path.dirname(r.pPath), path.basename(r.pPath).replace(/\.attempt-.*$/, ""));
+  return JSON.stringify({ attemptId: id, runId: r.runId, clonePath: `${canonical}.attempt-${id}`, state });
 };
 
 // ---- traps: nothing may reach P's path or the legacy P-touching steps ------------------------------------------------

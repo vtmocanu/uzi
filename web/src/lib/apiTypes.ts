@@ -1417,6 +1417,11 @@ export interface AppSettings {
   // Turning it off wakes every hibernated worker (at most 10 per pass); waking
   // never depends on it. Optional so older responses and fixtures still type-check.
   worker_hibernation_enabled?: string;
+  // Automatic hibernation of idle workers (PRD #4207): "true"/"false", default "false",
+  // effective only while worker_hibernation_enabled is "true". idle_after is a Go
+  // duration (default "336h", valid 1h..2160h). Optional for older responses.
+  worker_hibernation_auto?: string;
+  worker_hibernation_idle_after?: string;
   // Per-user persistent hosted-worker quota: integer 0..20, default 2. Zero disables provisioning.
   hosted_worker_quota: string;
   // Per-owner custody admission limit: whole number 1..1000, default "8". Lowering it blocks future claims only.
@@ -3260,7 +3265,7 @@ export type StopKind =
 export type JudgeVerdict = "ideal" | "ok" | "issues";
 
 export type RunHealth =
-  "ok" | "stalled" | "looping" | "slow" | "waiting_worker" | "approval_idle" | "waiting_account_cooldown";
+  "ok" | "stalled" | "looping" | "slow" | "waiting_worker" | "approval_idle" | "waiting_account_cooldown" | "publication_withheld";
 
 // FixVerdict is a ci_fix run's outcome (PRD #6): verified/fix_failed are stamped
 // server-side from the post-fix pipeline; not_code is the agent's "not a code
@@ -4138,12 +4143,15 @@ export interface Run {
    *  rate_limit_type. */
   recovery_wait_cause: string | null;
   /** Issue #4177: closed-set classification of a `retained_recovery_adoption_failed` hold,
-   *  set only for status `recovery_wait` with that cause. "secret_remediation_active": the
+   *  set only for status `recovery_wait` with that cause. "source_end_declined": an earlier
+   *  flight declined source-use end; Resume with unchanged worker registration is refused (409).
+   *  Only after a different registration can the owner request a guarded attempt; Cancel remains
+   *  available. This does not establish source usability. "secret_remediation_active": the
    *  retained source is held under an active secret-scan remediation, so Resume cannot succeed
    *  unchanged (the server refuses it with a 409). "remediation_proof_unknown": the remediation
    *  proof could not be verified; a retry may help. Null, absent or any other value selects the
    *  generic adoption-failure copy and never permits adoption. Never render the raw string. */
-  recovery_wait_detail?: "secret_remediation_active" | "remediation_proof_unknown" | null;
+  recovery_wait_detail?: "source_end_declined" | "secret_remediation_active" | "remediation_proof_unknown" | null;
   /** Issue #1324: which part of the run a `recovery_wait` park interrupted. "publication"
    *  is a forge outage met while publishing: the run keeps its publication intent and
    *  resumes publication only. Null for every other park. Render an unrecognised value

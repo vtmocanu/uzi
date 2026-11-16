@@ -208,3 +208,37 @@ it.each([320, 390, 768, 1024, 1280])("keeps production RunView disclosures withi
   expect(document.activeElement).toBe(settings);
   expect(settings.getAttribute("aria-expanded")).toBe("false");
 });
+
+it.each([320, 768])("source-end hold keeps guarded Resume and Cancel usable at %ipx", async width => {
+  await page.viewport(width, 1000);
+  const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ error: "Resume refused: unchanged worker registration" }), {
+    status: 409, headers: { "Content-Type": "application/json" },
+  }));
+  vi.stubGlobal("fetch", fetchMock);
+  const submit = vi.fn().mockResolvedValue(undefined);
+  mockUseRunStream.mockReturnValue({
+    run: { ...diskIssue, recovery_wait_cause: "retained_recovery_adoption_failed", recovery_wait_detail: "source_end_declined" },
+    messages: [], connected: true, error: "", submit, refreshRun: vi.fn(), inputs: [], canSteer: true, confirmedOwner: true,
+  } as unknown as ReturnType<typeof useRunStream>);
+  render(<MemoryRouter initialEntries={[`/runs/${diskIssue.id}`]}>
+    <div className="p-4"><Routes><Route path="/runs/:id" element={<RunView />} /></Routes></div>
+  </MemoryRouter>);
+  await document.fonts.ready;
+  const resume = screen.getByRole("button", { name: "Resume" }) as HTMLButtonElement;
+  const cancel = screen.getByRole("button", { name: "Cancel" }) as HTMLButtonElement;
+  const panel = resume.closest(".rounded-xl")!;
+  expect(panel.getBoundingClientRect().width).toBeGreaterThan(0);
+  expect(panel.getBoundingClientRect().right).toBeLessThanOrEqual(width);
+  expect(panel.scrollWidth).toBeLessThanOrEqual(panel.clientWidth);
+  expect(screen.getAllByText(/A different worker registration only enables a guarded attempt/).length).toBeGreaterThan(0);
+  for (const button of [resume, cancel]) {
+    expect(button.getBoundingClientRect().width).toBeGreaterThan(0);
+    expect(button.getBoundingClientRect().right).toBeLessThanOrEqual(width);
+  }
+  await page.getByRole("button", { name: "Resume", exact: true }).click();
+  await waitFor(() => expect(screen.getByText(/Resume refused: unchanged worker registration/)).toBeTruthy());
+  expect(fetchMock).toHaveBeenCalledOnce();
+  expect(cancel.disabled).toBe(false);
+  await page.getByRole("button", { name: "Cancel", exact: true }).click();
+  await waitFor(() => expect(submit).toHaveBeenCalledWith("cancel", "", undefined, undefined, false));
+});

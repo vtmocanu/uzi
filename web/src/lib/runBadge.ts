@@ -262,7 +262,8 @@ const PARK_LABELS = {
 // today's park wording"). It folds through effectiveRunStatus so a credential or
 // completion hold (raw status "paused") and an exhausted recovery read as they do on the
 // status pill. An unlisted status falls back to its de-underscored enum, never "".
-export function parkLabel(run: Parameters<typeof effectiveRunStatus>[0]): string {
+export function parkLabel(run: Parameters<typeof effectiveRunStatus>[0] & Pick<Run, "recovery_wait_detail">): string {
+  if (run.status === "recovery_wait" && run.recovery_wait_cause === "retained_recovery_adoption_failed" && run.recovery_wait_detail === "source_end_declined") return "source-use end declined";
   const disk = diskWaitLabel(run);
   if (disk) return disk;
   const forge = forgeWaitLabel(run);
@@ -523,7 +524,20 @@ const HEALTH_FLAG_LABELS: Record<Exclude<RunHealth, "ok">, string> = {
   waiting_worker: "waiting for worker",
   approval_idle: "needs approval",
   waiting_account_cooldown: "waiting for account cooldown",
+  // Issue #4257: a running run whose checkpoint publication a secret-scan restriction withholds.
+  publication_withheld: "publication withheld",
 };
+
+// The fixed owner hint for health "publication_withheld". The api does not send it: this is a
+// mirrored copy of apitypes.HintCheckpointPublicationWithheld
+// (api/internal/apitypes/checkpoint_publication.go); a test pins it to the literal.
+export const PUBLICATION_WITHHELD_HINT =
+  "an eligible finding reaches the lead at its next work-turn boundary, subject to the existing safety checks and the shared attempt cap; the done-point fallback remains subject to its safety checks and the same cap; `uzi run follow-up` can give the agent owner guidance";
+
+// healthHint returns the fixed hint for a withheld run and null for every other health value.
+export function healthHint(run: Pick<HealthFlaggable, "health">): string | null {
+  return run.health === "publication_withheld" ? PUBLICATION_WITHHELD_HINT : null;
+}
 
 // HEALTH_FLAGGABLE_STATUSES mirrors the server's flaggable set: a health flag is
 // only ever rendered while a run is in one of these (belt-and-braces with the
@@ -778,9 +792,11 @@ function badgeTitle(reason: string | null | undefined): string | undefined {
   return clean === "" ? undefined : clean;
 }
 
+export const sourceEndDeclinedCopy = "An earlier flight declined source-use end. The agent did not start; local work and custody are protected. Resume with the unchanged worker registration is refused (409). A different worker registration only enables a guarded attempt; it does not establish that all retained sources are usable. Independently restore only from verified sources with prerequisite commits present; an archive may omit the latest work. Operator discard is separate and requires a verified backup. Only the run owner can Resume or Cancel. Cancel remains available. There is no scheduled retry.";
+
 // runBadge maps a card's latest_run to its primary status pill. nowMs is passed in
 // (not read from Date.now) so the running elapsed is deterministic under test.
-export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause" | "recovery_retry_not_before" | "recovery_wait_phase" | "worker_recovery" | "requeue_count" | "memory_hold">>, nowMs: number, maintenanceReason?: string | null): RunBadge {
+export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_detail" | "recovery_wait_cause" | "recovery_retry_not_before" | "recovery_wait_phase" | "worker_recovery" | "requeue_count" | "memory_hold">>, nowMs: number, maintenanceReason?: string | null): RunBadge {
   // The stopped signal wins over the raw status so a cancel-shaped `failed`
   // never renders as breakage.
   if (isStoppedRun(run.status, run.stop_kind)) {
@@ -990,7 +1006,7 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause
     case "retained_recovery_adoption_failed":
       return {
         kind: "badge", label: PARK_LABELS.retained_recovery_adoption_failed, tone: "warning", pulse: false,
-        title: "Integrity hold: retained adoption failed, a predecessor needs remediation review, or this release does not support the predecessor. The agent did not start. Local work and its custody are preserved. Only the run owner can Resume or Cancel; there is no scheduled retry.",
+        title: run.recovery_wait_detail === "source_end_declined" ? sourceEndDeclinedCopy : "Integrity hold: retained adoption failed, a predecessor needs remediation review, or this release does not support the predecessor. The agent did not start. Local work and its custody are preserved. Only the run owner can Resume or Cancel; there is no scheduled retry.",
       };
     case "retained_continuation_unwitnessed":
       return {

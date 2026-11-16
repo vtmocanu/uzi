@@ -91,8 +91,8 @@ export function peopleRows(
   return rows;
 }
 
-// Distinct owners with a run the status sentence counts as executing. Feed it the SAME rows
-// the sentence counts (mergeOverviewRows output), never peopleRows, so "for N people" can
+// Distinct owners with a run the Runs-card line counts as executing. Feed it the SAME rows
+// the line counts (mergeOverviewRows output), never peopleRows, so "for N people" can
 // never exceed the executing count beside it. A row without owner_email is a personal row
 // (only the admin list carries it), so it is the viewer's.
 export function executingPeople(rows: ReadonlyArray<RunSummaryItem>, viewerEmail: string): number {

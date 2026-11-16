@@ -214,6 +214,46 @@ Status shows in `uzi worker list` and `uzi admin workers`; see
 [CLI](./cli.md#hibernated-workers). The design is in
 [PRD #4205](../prds/4205-worker-hibernation-sleep-wake.md).
 
+### Automatic hibernation
+
+With `worker_hibernation_auto` on (and `worker_hibernation_enabled` on), the api
+hibernates idle workers itself; see
+[Admin settings](./admin-settings.md#worker-hibernation). Enable it only once the
+[cache cleanup before sleep](#cache-cleanup-before-sleep) ([PRD #4206](../prds/4206-worker-hibernation-cache-cleanup.md))
+is deployed, including the worker support it needs: a worker image that advertises
+the `hibernation_cache_prune_v1` capability. Otherwise workers sleep without their
+Docker cache pruned.
+
+**Idle.** A worker is idle when no run of any kind is assigned to it and nothing has
+finished on it for `worker_hibernation_idle_after` (default `336h`, between `1h` and
+`2160h`). The idle clock starts from the latest of the worker's last finished run,
+its last completed wake, and its creation. Logins and heartbeats do not count. A
+user's last or only worker is included, and there is no per-user opt-out.
+
+**The pass.** The sweeper runs the pass at most once per minute and hibernates at
+most 10 workers per pass, oldest idle first. Each worker goes through the same
+admission checks as a manual hibernation (see the refusal list above) and the same
+[cache cleanup](#cache-cleanup-before-sleep). The idleness is re-checked on the
+locked worker row, so a run assigned or finished in the meantime wins. At that
+point the pass also re-reads the automatic-mode switch: off ends the pass, and a
+read failure prevents that candidate from being admitted.
+
+**Refusals.** A worker the pass could not admit is recorded with a reason and moves
+to the back of the queue for an hour (`HibernationAutoRefusalCooldown`; the order
+puts workers refused in the last hour after the rest), so blocked workers do not
+starve clean ones. When the controller refuses before scaling down, the worker is
+not tried again for at least 1 hour. Admin health's `fleet.hibernation` check names
+idle workers that are blocked this way and runs that have been parked past the
+threshold; see [Admin health](./admin-health.md).
+
+**Waking.** Every completed wake restarts the idle clock: a manual wake, a demand
+wake, turning the setting off, or a withdrawn hibernation. A woken worker gets a full
+threshold before it is considered again.
+
+**Record.** Automatic hibernations write no hibernation audit event. The worker's
+hibernation reason reads "automatic: no run activity for ..." (for example
+"automatic: no run activity for 14d").
+
 ### Cache cleanup before sleep
 
 A [Docker-capable](worker-docker.md) worker runs one cache prune while it is

@@ -21,6 +21,7 @@ func TestRecoveryWaitDetailDTOGate(t *testing.T) {
 	}{
 		{"active", store.Run{Status: "recovery_wait", RecoveryWaitCause: txt("retained_recovery_adoption_failed"), RecoveryWaitDetail: txt("secret_remediation_active")}, "secret_remediation_active"},
 		{"unknown proof", store.Run{Status: "recovery_wait", RecoveryWaitCause: txt("retained_recovery_adoption_failed"), RecoveryWaitDetail: txt("remediation_proof_unknown")}, "remediation_proof_unknown"},
+		{"source end declined", store.Run{Status: "recovery_wait", RecoveryWaitCause: txt("retained_recovery_adoption_failed"), RecoveryWaitDetail: txt("source_end_declined")}, "source_end_declined"},
 		{"null detail", store.Run{Status: "recovery_wait", RecoveryWaitCause: txt("retained_recovery_adoption_failed")}, ""},
 		{"non-enum detail", store.Run{Status: "recovery_wait", RecoveryWaitCause: txt("retained_recovery_adoption_failed"), RecoveryWaitDetail: txt("leak-me")}, ""},
 		{"other cause", store.Run{Status: "recovery_wait", RecoveryWaitCause: txt("retained_recovery_exhausted"), RecoveryWaitDetail: txt("secret_remediation_active")}, ""},

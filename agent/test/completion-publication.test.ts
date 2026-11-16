@@ -301,10 +301,27 @@ describe("durable publication at the end of source use", () => {
       assert.equal((await slotOf(r))?.state, "ineligible");
       assert.equal(fenceOf(r), undefined);
       assert.deepEqual(snapshotFiles(r), before);
-      assert.match(r.warnings.join("\n"), new RegExp(`${change} changed`, "i"));
+      assert.deepEqual(r.warnings, [
+        `completion source not published; its source use ends ineligible {"reason":"${change}_changed"}`,
+      ]);
       assert.doesNotMatch(r.warnings.join("\n"), /left active/, "the failed publication already ended the slot");
     });
   }
+
+  it("untyped predicate errors keep the generic publication fallback without raw text", async t => {
+    const r = await rig(t, { codex: false, cohort: 2 });
+    t.mock.method(git, "worktreeHead", async () => {
+      throw new Error(`head changed roots changed different fence unresolved ${r.clone}`);
+    });
+    const before = snapshotFiles(r);
+    await r.end();
+    assert.equal((await slotOf(r))?.state, "ineligible");
+    assert.equal(fenceOf(r), undefined);
+    assert.deepEqual(snapshotFiles(r), before);
+    assert.deepEqual(r.warnings, [
+      'completion source not published; its source use ends ineligible {"reason":"publication_refused"}',
+    ]);
+  });
 
   it("a cohort record that no longer carries the bound source refuses the whole publication", async t => {
     const r = await rig(t, { codex: false, cohort: 2 });
@@ -369,7 +386,9 @@ describe("durable publication at the end of source use", () => {
     assert.equal((await slotOf(r))?.state, "ineligible");
     assert.deepEqual(fenceOf(r), live, "the foreign fence is untouched");
     assert.deepEqual(snapshotFiles(r), before);
-    assert.match(r.warnings.join("\n"), /different fence/);
+    assert.deepEqual(r.warnings, [
+      'completion source not published; its source use ends ineligible {"reason":"fence_conflict"}',
+    ]);
   });
 });
 
@@ -717,7 +736,9 @@ describe("publication preconditions", () => {
     assert.equal((await slotOf(r))?.state, "ineligible");
     assert.equal(fenceOf(r), undefined);
     assert.deepEqual(snapshotFiles(r), before);
-    assert.match(r.warnings.join("\n"), /unresolved/);
+    assert.deepEqual(r.warnings, [
+      'completion source not published; its source use ends ineligible {"reason":"bare_unresolved"}',
+    ]);
   });
 
   it("source-use paths in a non-normalized form still publish", async t => {

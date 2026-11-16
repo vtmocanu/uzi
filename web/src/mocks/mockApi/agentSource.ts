@@ -20,6 +20,16 @@ let agentSourceRemote: { latestRef: string; tipSha: string; checkedAt: string } 
 // Seed before either consumer can read, once per module lifetime. Later reads never
 // overwrite a saved config or persisted update-check facts.
 const scenario = mockScenario() ?? "";
+if (scenario === "overview-agents-synced") {
+  // #4367 mock parity: an applied, healthy source with nothing awaiting review.
+  agentSource.staged = null;
+  agentSource.status.last_sync_status = "ok";
+  agentSource.status.last_applied_sha = agentSource.status.last_sync_sha;
+} else if (scenario === "overview-agents-off") {
+  // The third selected mock state: the count remains, with no admin sync suffix.
+  agentSource.config.enabled = false;
+  agentSource.staged = null;
+}
 if (scenario === "agent-source-update") {
   agentSource.config.enabled = true;
   agentSource.config.ref = "v1.2.0";

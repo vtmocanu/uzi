@@ -104,6 +104,9 @@ type Store interface {
 	// eligible branch), compared to CIWatchMaxRefs. finishedAfter = now - CIWatchRunWindow.
 	CountEligibleCIWatchRefsPerRepo(ctx context.Context, finishedAfter pgtype.Timestamptz) ([]store.CountEligibleCIWatchRefsPerRepoRow, error)
 	ListRecentUnpricedCodexModels(context.Context, store.ListRecentUnpricedCodexModelsParams) ([]store.ListRecentUnpricedCodexModelsRow, error)
+	// fleet.hibernation (issue #4207): idle workers the automatic pass could not hibernate, and
+	// workers whose only runs are parked; each row carries the exact window total.
+	ListAutoHibernationBlockers(context.Context, store.ListAutoHibernationBlockersParams) ([]store.ListAutoHibernationBlockersRow, error)
 }
 
 // Settings is the slice of the settings cache healthsvc reads: the run-health kill switch
@@ -120,6 +123,11 @@ type Settings interface {
 	AgentSourceRepoURL(context.Context) (string, error)
 	AgentSourceRef(context.Context) (string, error)
 	AgentSourceStatus(context.Context) (settings.AgentSourceStatus, error)
+	// fleet.hibernation (issue #4207): the check is live only while hibernation and its
+	// automatic pass are both on; idleAfter is the threshold a blocker is measured against.
+	WorkerHibernationEnabled(context.Context) (bool, error)
+	WorkerHibernationAuto(context.Context) (bool, error)
+	WorkerHibernationIdleAfter(context.Context) (time.Duration, error)
 }
 
 // dbStat is the db check's raw probe result. Separating it from the severity logic is what
@@ -313,6 +321,7 @@ func (s *Service) Evaluate(ctx context.Context) (Doc, error) {
 		s.checkFleetMemoryAuthority(now, workers),
 		s.checkFleetHibernationWake(now, workers),
 		s.checkFleetHibernationCleanup(workers),
+		s.checkFleetHibernation(ctx, now, workers),
 		s.checkFleetHibernationRetirement(ctx),
 		waiting,
 		s.checkQueueUndispatched(ctx, now),

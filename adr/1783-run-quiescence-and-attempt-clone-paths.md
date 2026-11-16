@@ -1,8 +1,21 @@
 # ADR-1783: Confirmed run quiescence and attempt-unique clone paths
 
+
 **Status**: Accepted and implemented (M1-M3)
 **Date**: 2026-09-27
 **Related**: GitHub issue vtmocanu/uzi#1783
+
+## Amendment 2026-11-15 — #4365: definitive declined source end
+
+A retired source-owner sink whose admission barrier has joined can record a
+process-local definitive no-end witness for its exact key and lease epoch when
+unjoined tails or remediation prevent ending source use. The owner-held detail
+`source_end_declined` requires that positive evidence; retirement alone, queued
+ends, pending operations and unconfirmed ends keep transient bounded retry.
+This witness grants no reuse, quiescence, publication or disposal authority and
+is lost on restart. The existing bare-writer and independent-restore guards
+remain in force. See [ADR-4365](4365-retained-source-end-hold.md) for registration
+fences, mixed-version Resume behavior, incident uncertainty and verification.
 
 ## Context
 

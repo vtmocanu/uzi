@@ -130,6 +130,14 @@ func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 				})
 			}
 		default:
+			if sourceEndDeclined(run) {
+				if h.wsvc == nil {
+					resumeErr = pgx.ErrNoRows
+					break
+				}
+				resumeErr = h.wsvc.ResumeSourceEndHold(r.Context(), user.ID, run, int32(h.cfg.RunTimeout.Seconds()))
+				break
+			}
 			_, resumeErr = h.q.ResumeWorkerRecoveryEpisode(r.Context(), store.ResumeWorkerRecoveryEpisodeParams{
 				ID: runID, UserID: user.ID, GlobalTimeoutSeconds: int32(h.cfg.RunTimeout.Seconds()),
 			})
@@ -141,6 +149,10 @@ func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 				if run.RecoveryWaitCause.String == "retained_recovery_adoption_failed" {
 					if cur, err := h.q.GetRunByIDForUser(r.Context(), store.GetRunByIDForUserParams{ID: runID, UserID: user.ID}); err == nil && secretRemediationActive(cur) {
 						httpx.Error(w, http.StatusConflict, secretRemediationResumeRefusal(runID))
+						return
+					}
+					if cur, err := h.q.GetRunByIDForUser(r.Context(), store.GetRunByIDForUserParams{ID: runID, UserID: user.ID}); err == nil && sourceEndDeclined(cur) {
+						httpx.Error(w, http.StatusConflict, sourceEndResumeRefusal)
 						return
 					}
 				}
@@ -376,3 +388,10 @@ func secretRemediationActive(run store.Run) bool {
 func secretRemediationResumeRefusal(runID uuid.UUID) string {
 	return fmt.Sprintf("The retained source is held under an active secret-scan remediation; Resume cannot succeed unchanged. An available recovery archive (uzi run export %s) may omit later work kept on the worker; an operator can recover the retained work from worker storage. Cancel ends the run.", runID)
 }
+
+func sourceEndDeclined(run store.Run) bool {
+	return run.Status == "recovery_wait" && run.RecoveryWaitCause.String == "retained_recovery_adoption_failed" &&
+		run.RecoveryWaitDetail.String == workersvc.RecoveryDetailSourceEndDeclined
+}
+
+const sourceEndResumeRefusal = "The retained source could not end safely. Resume requires the owning worker to register again; a stale heartbeat alone does not release this hold. Ask an operator to recover retained work from worker storage before restarting the worker. Re-registration permits only a new recovery attempt: every retained source still needs its own verified recovery proof. An available recovery archive may omit later retained work. Cancel ends the run."

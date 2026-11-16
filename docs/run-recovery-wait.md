@@ -517,6 +517,32 @@ Resume. Downgrading workers during pending recovery is unsupported: older
 workers may drop its durable recovery fields. See
 [Recovering unpublished work](./run-recovery.md#retained-source-failure-and-local-proof).
 
+### Source-end declined hold
+
+A retained continuation may stop at `retained_recovery_adoption_failed` with
+detail `source_end_declined`: the previous flight definitively could not end
+its source use. It is owner-held, with no automatic retry. Pending work,
+queued source ends and uncertain end reports keep their existing bounded retry;
+they do not establish this detail.
+
+1. Read `uzi run recovery <id>`. Export an available archive and verify your
+   backup before considering discard; it may omit the latest work.
+2. On an upgraded API, **Resume** requires a different, nonempty current
+   registration for the retained worker. An unchanged or missing registration
+   or unavailable worker is refused even while heartbeats continue. A new
+   registration permits one explicit guarded attempt; it does not prove that
+   the old process died or its sources are usable. Nothing restarts the worker
+   or resumes the run automatically.
+3. **Cancel** remains available and keeps source custody. If the worker cannot
+   return, Resume may remain refused permanently. Arrange separately authorized
+   recovery from retained storage, an available archive or eligible verified
+   restore. Discard is a separate decision after backup verification.
+
+The CLI/TUI and web show the source-end hold and conditional Resume guidance.
+An older API may clear the detail and requeue on Resume under the existing cap;
+the worker's source guards still apply. Upgrade serving APIs before relying on
+the new refusal. See [the implementation boundary](../adr/4365-retained-source-end-hold.md).
+
 ### Unwitnessed continuation hold
 
 A retained continuation is a run with an open custody hold from an earlier claim

@@ -1473,6 +1473,29 @@ it("HealthFlag renders manual attribution as escaped single-cell text", () => {
   expect(container.textContent).not.toContain("[object Object]");
 });
 
+describe("HealthFlag — publication withheld (issue #4257)", () => {
+  const reason = "checkpoint publication is withheld by a secret-scan restriction; new work stays on the worker until it is resolved";
+  const hint = "an eligible finding reaches the lead at its next work-turn boundary, subject to the existing safety checks and the shared attempt cap; the done-point fallback remains subject to its safety checks and the same cap; `uzi run follow-up` can give the agent owner guidance";
+  const withheld = { status: "running" as const, health: "publication_withheld" as const, health_reason: reason, health_since: "2026-11-14T09:10:00Z" };
+
+  it("shows the label, reason and fixed hint, and nothing else", () => {
+    const { container } = render(<HealthFlag run={run(withheld)} />);
+    const pill = container.querySelector(".text-warn")!;
+    expect(pill.textContent).toContain("⚠ publication withheld");
+    expect(pill.textContent).toContain(` — ${reason}`);
+    expect(container.querySelector("[data-health-hint]")!.textContent).toBe(hint);
+    // Only the fixed strings render: no path, rule or SHA can arrive through this flag.
+    const rest = (container.textContent ?? "").replace(reason, "").replace(hint, "")
+      .replace(/stuck for (\d+h )?\d+[smh]/, "").replace(/publication withheld/g, "").replace(/[\s—·⚠]/g, "");
+    expect(rest).toBe("");
+  });
+  it.each(["ok", "stalled", "looping", "slow", "approval_idle"] as const)("renders no hint for %s", (health) => {
+    const { container } = render(<HealthFlag run={run({ status: "running", health, health_reason: null })} />);
+    expect(container.querySelector("[data-health-hint]")).toBeNull();
+    expect(container.textContent).not.toContain("follow-up");
+  });
+});
+
 describe("HealthFlag — maintenance queue reason (PRD #3454)", () => {
   const held = { status: "queued" as const, queue_reason: "maintenance" as const, health: "waiting_worker" as const,
     health_since: "2026-10-25T12:00:00Z", health_reason: "waiting for a worker to pick up this run" };

@@ -731,7 +731,8 @@ restore_check_p_shape() {
 # restore_assert_canonical_refusal RUN GEN [TIMEOUT] — a canonical-shaped predecessor killed and re-claimed at
 # generation GEN is refused, not restored: exactly one successor claim, no `independent restore seeded`, the
 # frozen refusal line (unsupported canonical) and the held-or-unconfirmed line in the agent log, the
-# frozen feed text, and the run at recovery_wait / retained_recovery_adoption_failed with no retry stamp.
+# frozen feed text, and recovery_wait / retained_recovery_adoption_failed with no detail or retry stamp.
+# A source_end_declined hold must not satisfy this unsupported-predecessor control.
 restore_assert_canonical_refusal() {
   local run="$1" gen="$2" timeout="${3:-90}" deadline=$((SECONDS + ${3:-90}))
   local log_file="$RUNROOT/.restore-3644-canonical.log" counts claims seeded refused held unconfirmed missing row feed
@@ -755,8 +756,8 @@ restore_assert_canonical_refusal() {
     [ $((${held:-0} + ${unconfirmed:-0})) -ge 1 ] || missing="$missing held-log"
     feed="$(apiget "/api/runs/$run/messages" | jq -r --arg s 'this release does not support this predecessor' '[.messages[] | tojson | contains($s)] | any')" || feed=unreadable
     [ "$feed" = true ] || missing="$missing feed-text"
-    row="$(db_psql "SELECT status||'|'||COALESCE(recovery_wait_cause,'')||'|'||COALESCE(recovery_retry_not_before::text,'')||'|'||claim_generation FROM runs WHERE id = '$run'")" || row=unreadable
-    [ "$row" = "recovery_wait|retained_recovery_adoption_failed||$gen" ] || missing="$missing run-state([$row])"
+    row="$(db_psql "SELECT status||'|'||COALESCE(recovery_wait_cause,'')||'|'||COALESCE(recovery_wait_detail,'')||'|'||COALESCE(recovery_retry_not_before::text,'')||'|'||claim_generation FROM runs WHERE id = '$run'")" || row=unreadable
+    [ "$row" = "recovery_wait|retained_recovery_adoption_failed|||$gen" ] || missing="$missing run-state([$row])"
     if [ -z "$missing" ]; then
       pass "run $run: canonical predecessor refused at generation $gen (one successor claim, refusal $refused, held $held, unconfirmed $unconfirmed, feed text, recovery_wait/retained_recovery_adoption_failed, no retry stamp)"
       return 0

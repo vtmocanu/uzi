@@ -700,6 +700,8 @@ func writeFile(t *testing.T, path, content string) {
 }
 
 // cleanGitEnv isolates fixture Git from worker checkout/configuration variables.
+// Fetch can detach automatic maintenance and leave a repack writing into a clone
+// after the command returns, racing t.TempDir cleanup.
 func cleanGitEnv() []string {
 	var env []string
 	for _, entry := range os.Environ() {
@@ -708,5 +710,10 @@ func cleanGitEnv() []string {
 			env = append(env, entry)
 		}
 	}
-	return append(env, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0")
+	return append(env,
+		"GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0",
+		"GIT_CONFIG_COUNT=2",
+		"GIT_CONFIG_KEY_0=maintenance.auto", "GIT_CONFIG_VALUE_0=false",
+		"GIT_CONFIG_KEY_1=gc.auto", "GIT_CONFIG_VALUE_1=0",
+	)
 }

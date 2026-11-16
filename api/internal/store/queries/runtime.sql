@@ -11299,6 +11299,10 @@ WHERE id = @id;
 -- owner row is gone (COALESCE keeps the scan target a plain string).
 -- #3000: owner_hold_pinnable projects ClaimRun's independent draining/maintenance
 -- hold; Go applies the inclusive updated_at + affinity ceiling and reuses the owner name.
+-- Issue #4257: publication_withheld_since is the worker-reported checkpoint-publication-withheld
+-- since, projected only while the fact is still fenced to this run's current owner, claim generation,
+-- register nonce and running episode (status_since); NULL otherwise. Pure column compares plus one
+-- workers primary-key probe, and only for a run that carries a fact.
 WITH checker_template_pins AS MATERIALIZED (
     SELECT owners.user_id,
            (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol') THEN t.codex_model END
@@ -11402,7 +11406,14 @@ SELECT id, runs.user_id, status, auto_approve,
            WHERE rel.run_id = runs.id AND rel.claim_generation = runs.claim_generation
              AND rel.worker_id = runs.released_worker_id
              AND rel.register_nonce = runs.released_worker_nonce
-             AND rel.released_at = runs.claim_released_at))::boolean AS released_by_memory_park
+             AND rel.released_at = runs.claim_released_at))::boolean AS released_by_memory_park,
+       (CASE WHEN runs.status = 'running' AND runs.checkpoint_withheld_since IS NOT NULL
+                  AND runs.checkpoint_withheld_worker_id = runs.worker_id
+                  AND runs.checkpoint_withheld_generation = runs.claim_generation
+                  AND runs.claim_released_at IS NULL
+                  AND runs.checkpoint_withheld_status_since = runs.status_since
+                  AND EXISTS (SELECT 1 FROM workers pw WHERE pw.id = runs.worker_id AND pw.snapshot_register_nonce = runs.checkpoint_withheld_nonce)
+             THEN runs.checkpoint_withheld_since END)::timestamptz AS publication_withheld_since
 FROM runs
 LEFT JOIN codex_active_run_cooldown cooldown ON cooldown.run_id = runs.id
 LEFT JOIN codex_queued_run_admission admission
@@ -13395,11 +13406,28 @@ WHERE lead.id = @lead_run_id AND cc.stage = 'plan'
 -- name: ResumeWorkerRecoveryEpisode :one
 -- Explicit owner release of an exhaustion hold is the only episode-renewal writer.
 -- Keep the wall budget, custody and released incarnation; bank the hold only after execution started.
-WITH candidates AS MATERIALIZED (
-    SELECT runs.id, runs.kind FROM runs
-    WHERE runs.id = @id AND runs.user_id = @user_id
+WITH locked_source_workers AS MATERIALIZED (
+    -- Consume this lock before any run/parent lock, including a hold changing after the
+    -- handler's initial read. A source hold absent from this snapshot fails closed below.
+    SELECT w.* FROM workers w
+    WHERE w.id IN (SELECT r.worker_id FROM runs r WHERE r.id = @id AND r.user_id = @user_id
+        AND r.recovery_wait_detail = 'source_end_declined')
+    ORDER BY w.id
+    FOR UPDATE OF w
+), source_worker_lock_set AS MATERIALIZED (
+    SELECT count(*) AS locked_count FROM locked_source_workers
+), candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs CROSS JOIN source_worker_lock_set
+    WHERE source_worker_lock_set.locked_count >= 0 AND runs.id = @id AND runs.user_id = @user_id
   AND runs.status = 'recovery_wait' AND runs.recovery_wait_cause IN ('worker_requeue_exhausted', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed', 'retained_continuation_unwitnessed')
   AND NOT (runs.recovery_wait_cause = 'retained_recovery_adoption_failed' AND runs.recovery_wait_detail IS NOT DISTINCT FROM 'secret_remediation_active')
+  AND (runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_adoption_failed'
+      OR runs.recovery_wait_detail IS DISTINCT FROM 'source_end_declined' OR (
+      runs.claim_released_at IS NOT NULL AND runs.released_worker_id = runs.worker_id
+      AND NULLIF(runs.released_worker_nonce, '') IS NOT NULL
+      AND EXISTS (SELECT 1 FROM locked_source_workers w WHERE w.id = runs.worker_id AND w.user_id = runs.user_id
+          AND NULLIF(w.snapshot_register_nonce, '') IS NOT NULL
+          AND w.snapshot_register_nonce <> runs.released_worker_nonce)))
   AND (runs.kind IN ('chat', 'judge') OR runs.interactive OR runs.started_at IS NULL
        OR (COALESCE(runs.budget_wall_seconds, @global_timeout_seconds::int) + runs.budget_extension_seconds + runs.budget_finalize_seconds)
           - (GREATEST(0, EXTRACT(EPOCH FROM (runs.status_since - runs.started_at))::int) - runs.budget_paused_seconds) > 0)
@@ -13463,6 +13491,13 @@ UPDATE runs SET
 WHERE runs.id = @id AND runs.user_id = @user_id
   AND runs.status = 'recovery_wait' AND runs.recovery_wait_cause IN ('worker_requeue_exhausted', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed', 'retained_continuation_unwitnessed')
   AND NOT (runs.recovery_wait_cause = 'retained_recovery_adoption_failed' AND runs.recovery_wait_detail IS NOT DISTINCT FROM 'secret_remediation_active')
+  AND (runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_adoption_failed'
+      OR runs.recovery_wait_detail IS DISTINCT FROM 'source_end_declined' OR (
+      runs.claim_released_at IS NOT NULL AND runs.released_worker_id = runs.worker_id
+      AND NULLIF(runs.released_worker_nonce, '') IS NOT NULL
+      AND EXISTS (SELECT 1 FROM locked_source_workers w WHERE w.id = runs.worker_id AND w.user_id = runs.user_id
+          AND NULLIF(w.snapshot_register_nonce, '') IS NOT NULL
+          AND w.snapshot_register_nonce <> runs.released_worker_nonce)))
   -- Honor the wall sweep's chat/judge/interactive exemptions; timed runs still need remaining budget.
   -- Extending does not itself release this hold; checker parent/deadline guards below still apply.
   AND (runs.kind IN ('chat', 'judge') OR runs.interactive OR runs.started_at IS NULL
@@ -13561,12 +13596,15 @@ UPDATE runs SET status='recovery_wait', status_since=now(), updated_at=now(),
  session_id=COALESCE(sqlc.narg('session_id')::text, session_id),
  checkpoint_contains_latest=sqlc.narg('checkpoint_contains_latest')::boolean,
  claim_released_at=now(),
+ released_worker_id=CASE WHEN sqlc.narg('recovery_detail')::text = 'source_end_declined' THEN worker_id ELSE released_worker_id END,
+ released_worker_nonce=CASE WHEN sqlc.narg('recovery_detail')::text = 'source_end_declined'
+     THEN (SELECT workers.snapshot_register_nonce FROM workers WHERE workers.id = runs.worker_id) ELSE released_worker_nonce END,
  health='ok', health_reason=NULL, health_since=NULL
-WHERE id = @id AND worker_id = @worker_id AND status='running'
+WHERE runs.id = @id AND runs.worker_id = @worker_id AND (status='running' OR (status='claimed' AND sqlc.narg('recovery_detail')::text = 'source_end_declined'))
  AND claim_generation = @claim_generation::bigint AND @claim_generation::bigint > 0
  AND claim_released_at IS NULL AND COALESCE(stop_kind, '')=''
  AND kind IN ('issue','ci_fix','self_improve','prompt','task','mr_rework')
-RETURNING *;
+RETURNING runs.*;
 
 -- name: ResumeCodexIdleStall :one
 UPDATE runs SET

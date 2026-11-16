@@ -214,15 +214,23 @@ func (p palette) state(s crewState) lipgloss.Style {
 	return p.faint
 }
 
-// displayHealth maps a health enum to its human DISPLAY word. Only `slow` is remapped:
-// PRD #1170 kept the enum value (D1) but relabels every human surface "near timeout", so
-// the token, the board strip and the CLI HEALTH row all read the same word through this one
-// map. Every other value (stalled, looping, ok, waiting_worker, …) passes through unchanged.
-// "near timeout" is 12 cells, tying the existing longest word ("rate-limited"), so no column
-// widens. Logic, filtering and sorting still key off the raw enum; this only changes display.
+// displayHealth maps a health enum to its human DISPLAY word. Two values are remapped:
+// `slow` (PRD #1170 kept the enum value (D1) but relabels every human surface "near
+// timeout") and `publication_withheld` (issue #4257, "publication withheld"), so the token,
+// the board strip and the CLI HEALTH row all read the same word through this one map. Every
+// other value (stalled, looping, ok, waiting_worker, …) passes through unchanged. "near
+// timeout" is 12 cells, tying the existing longest word ("rate-limited"); "publication
+// withheld" is 20 cells and is wider than that, so a surface sized to the old longest word
+// must allow for it. The CLI HEALTH row reads this long label; the run token and board strip go
+// through stateGlyphWord, which substitutes the compact "pub withheld" for publication_withheld
+// before reaching this map. Logic, filtering and sorting still key off the raw enum; this only
+// changes display.
 func displayHealth(health string) string {
 	if health == "slow" {
 		return "near timeout"
+	}
+	if health == healthPublicationWithheld {
+		return "publication withheld"
 	}
 	return health
 }
@@ -234,11 +242,13 @@ func displayHealth(health string) string {
 // sorting; this only changes what is shown.
 //
 // HEALTH OVERRIDE: except for human stops and recovery_wait, a WARN health flag
-// (stalled/looping/slow) replaces the status token entirely with ▲ + the health word,
-// because a run that needs attention is what the board
+// (stalled/looping/slow/publication_withheld) replaces the status token entirely with ▲ + the
+// health word, because a run that needs attention is what the board
 // is FOR. ok/empty health shows the status token. The word is the DISPLAY word from
 // displayHealth, so the `slow` enum PRD #1170 kept (D1) reads as "near timeout" here while
-// every logic path still keys off the raw enum.
+// every logic path still keys off the raw enum. The one exception is publication_withheld,
+// whose displayHealth label is too wide for the board status column, so it reads the compact
+// "pub withheld" here instead.
 //
 // PRD #1392 M5: cause is the optional RecoveryWaitCause of a recovery_wait run — a variadic
 // tail so the many existing call sites without it stay valid. When it is "forge_unreachable"
@@ -264,6 +274,10 @@ func stateGlyphWord(status, health string, isPlanning, isRevising bool, landingS
 	}
 	// Recovery does no work while parked; stale health must not hide its wait state.
 	if status != statusRecoveryWait && stalledHealth[health] {
+		if health == healthPublicationWithheld {
+			// displayHealth's 20-cell label overflows the board status column (boardStatusWordWidth).
+			return "▲", "pub withheld"
+		}
 		return "▲", displayHealth(health)
 	}
 	if health == "waiting_account_cooldown" && (status == "claimed" || status == "running" || status == "awaiting_approval") {
