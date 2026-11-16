@@ -10,6 +10,8 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/capability"
 )
 
+const codexApplyTargetAccess = "apply-target-access-fixture"
+
 // Preparation uses the public owner request so pending snapshots are captured
 // under the same locks as production; ordinal zero is recorded before requesting.
 func codexApplyFixture(t *testing.T, subscription bool) (applyFx, uuid.UUID, uuid.UUID) {
@@ -37,7 +39,7 @@ func codexApplyFixtureWithRegistration(t *testing.T, subscription, register bool
 	}
 	target := f.env.seedStaticAPIKey(t, f.o.userID, "apply-target", "apply-target-key")
 	if subscription {
-		target = f.env.seedLinkedSubscription(t, f.o.userID, "apply-subscription", codexToken("target-access"), codexToken("target-refresh"))
+		target = f.env.seedLinkedSubscription(t, f.o.userID, "apply-subscription", codexApplyTargetAccess, codexToken("target-refresh"))
 	}
 	_, err := f.svc.SetRunCredential(f.env.ctx, f.o.userID, run, BindModePinned, &target)
 	if err != nil {
@@ -64,7 +66,7 @@ func TestCodexTransactionalApplyBundleLiveDB(t *testing.T) {
 			}
 			expected := "apply-target-key"
 			if subscription {
-				expected = codexToken("target-access")
+				expected = codexApplyTargetAccess
 			}
 			if res.Codex.AccessToken != expected || res.Codex.Capability == "" ||
 				(res.Codex.Generation != nil) != subscription ||
