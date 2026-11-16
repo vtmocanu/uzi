@@ -470,6 +470,90 @@ func TestSetRepoEnableDuringInFlightImportLiveDB(t *testing.T) {
 	}
 }
 
+// An enable arriving while an ORDINARY periodic tick is blocked in the repo's issue
+// sync (the repo was already enabled with a succeeded import and no request was made,
+// so the blocked listing cannot be an import claim): the tick must not overwrite the
+// newer generation, and the newer import must not run concurrently with the tick.
+func TestSetRepoEnableDuringPeriodicTickLiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := newEnableGuardFixture(ctx, t)
+	probe := f.useProbe()
+	const project = 207
+	const startGen = 5
+	probe.setIssues(project, 5, 6, 7)
+	gate := make(chan struct{})
+	probe.set(func() { probe.gate[project] = gate })
+	repoID := f.seedRepo(ctx, t, project, true, protClean)
+	mustExecT(ctx, t, f.pool, `INSERT INTO board_columns (repo_id, label_name, position) VALUES ($1, 'Planned', 0)`, repoID)
+	mustExecT(ctx, t, f.pool, `UPDATE repos SET initial_import_state='succeeded', initial_import_generation=$2 WHERE id=$1`, repoID, startGen)
+	if row := f.importRow(ctx, t, repoID); row.state != "succeeded" || row.gen != startGen {
+		t.Fatalf("precondition row = %+v, want succeeded at generation %d", row, startGen)
+	}
+
+	// Listings 1-3 are the blocked tick's FullSync; listing 4 is the first listing of
+	// the import that follows. Capture the row there.
+	var atFourth handlerImportRow
+	var captured bool
+	var capMu sync.Mutex
+	probe.set(func() {
+		probe.onListing = func(p int64, n int) {
+			if p != project || n != 4 {
+				return
+			}
+			var st string
+			var gen int64
+			if err := f.pool.QueryRow(context.Background(), `SELECT initial_import_state, initial_import_generation FROM repos WHERE id=$1`, repoID).Scan(&st, &gen); err == nil {
+				capMu.Lock()
+				atFourth, captured = handlerImportRow{state: st, gen: gen}, true
+				capMu.Unlock()
+			}
+		}
+	})
+	f.runPoller(t, f.newPoller(100*time.Millisecond))
+
+	// No enable or request was made, so this listing can only be a periodic tick.
+	deadline := time.Now().Add(15 * time.Second)
+	for probe.listingCount(project) < 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("the periodic tick never listed issues")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if row := f.importRow(ctx, t, repoID); row.state != "succeeded" || row.gen != startGen {
+		t.Fatalf("row during the periodic tick = %+v, want still succeeded at generation %d (not claimed)", row, startGen)
+	}
+
+	f.requireOK(t, f.setEnabled(t, repoID, false))
+	f.requireOK(t, f.setEnabled(t, repoID, true))
+	// The poller goroutine is blocked in the tick, so nothing claims yet.
+	if row := f.importRow(ctx, t, repoID); row.state != "waiting" || row.gen != startGen+1 {
+		t.Fatalf("after disable + enable mid-tick = %+v, want waiting at generation %d", row, startGen+1)
+	}
+
+	close(gate)
+	done := f.waitImport(ctx, t, repoID, "succeeded")
+	if done.gen != startGen+1 {
+		t.Fatalf("settled row = %+v, want succeeded at generation %d", done, startGen+1)
+	}
+	if got := f.cachedIIDs(ctx, t, repoID); fmt.Sprint(got) != "[5 6 7]" {
+		t.Errorf("cached issues = %v, want [5 6 7]", got)
+	}
+	if m := probe.maxConcurrent(project); m != 1 {
+		t.Errorf("max concurrent issue listings for the repo = %d, want 1 (the tick and the import must not overlap)", m)
+	}
+	capMu.Lock()
+	defer capMu.Unlock()
+	if !captured {
+		t.Fatal("the newer import never listed issues")
+	}
+	if atFourth.state != "running" || atFourth.gen != startGen+1 {
+		t.Errorf("row when the newer import began = %+v, want running at generation %d (the tick overwrote it)", atFourth, startGen+1)
+	}
+	if final := f.importRow(ctx, t, repoID); final.state != "succeeded" || final.gen != startGen+1 {
+		t.Errorf("final row = %+v, want succeeded at generation %d", final, startGen+1)
+	}
+}
+
 type boardImport struct {
 	State      string    `json:"state"`
 	UpdatedAt  time.Time `json:"updated_at"`
