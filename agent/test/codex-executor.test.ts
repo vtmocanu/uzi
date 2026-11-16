@@ -32372,10 +32372,14 @@ describe("M2 actualRunner credential replacement", () => {
   for (const [oldClaim, target] of [[SUBSCRIPTION, API_KEY], [API_KEY, SUBSCRIPTION],
     [SUBSCRIPTION, { ...SUBSCRIPTION, generation: 20, chatgpt_account_id: "M2-B-account" }]] as const) {
     for (const phase of ["factory", "already-running-body"] as const) {
-      for (const publication of ["baseline", "clean-apply-uncertain", "clean-successor-epoch-advance", "clean-pending-disappears", "clean-stopped-lost-reply", "clean-stopped-unconfirmed", "clean-stopped-unsupported", "clean-stopped-withdrawn", "clean-stopped-already-paused", "root-reap-unproven", "preflight-target-mismatch", "preflight-foreign-op", "preflight-busy-ready", "preflight-transport-ready", "persist-clear-confirmed", "persist-clear-owner-lost", "persist-clear-nonce-changed", "persist-clear-rejected", "persist-clear-lost-reply", "persist-clear-empty-reply", "persist-clear-pending", "inspect-missing-clear-confirmed", "inspect-unknown-clear-confirmed", "gated", "before-scope-clear", "after-scope-clear", "before-scope-install", "after-scope-install", "before-executor-publication", "before-Now-publication", "after-Now-publication", "before-B-preparation", "Now-finish-false", "publish-failure", "now-publish-failure", "login-failure", "subscription-refresh", "api-key-refresh", "subscription-refresh-prepare-failure", "subscription-refresh-cancel", "crash-after-a-teardown-recovery", "crash-apply-reply-lost-recovery", "crash-apply-ack-recovery", "crash-login-recovery"] as const) {
+      for (const publication of ["resume-refuse-fresh", "resume-uncertain", "baseline", "clean-apply-uncertain", "clean-successor-epoch-advance", "clean-pending-disappears", "clean-stopped-lost-reply", "clean-stopped-unconfirmed", "clean-stopped-unsupported", "clean-stopped-withdrawn", "clean-stopped-already-paused", "root-reap-unproven", "preflight-target-mismatch", "preflight-foreign-op", "preflight-busy-ready", "preflight-transport-ready", "persist-clear-confirmed", "persist-clear-owner-lost", "persist-clear-nonce-changed", "persist-clear-rejected", "persist-clear-lost-reply", "persist-clear-empty-reply", "persist-clear-pending", "inspect-missing-clear-confirmed", "inspect-unknown-clear-confirmed", "gated", "before-scope-clear", "after-scope-clear", "before-scope-install", "after-scope-install", "before-executor-publication", "before-Now-publication", "after-Now-publication", "before-B-preparation", "Now-finish-false", "publish-failure", "now-publish-failure", "login-failure", "subscription-refresh", "api-key-refresh", "subscription-refresh-prepare-failure", "subscription-refresh-cancel", "crash-after-a-teardown-recovery", "crash-apply-reply-lost-recovery", "crash-apply-ack-recovery", "crash-login-recovery"] as const) {
         if (publication !== "baseline" && (phase !== "factory" || (oldClaim !== API_KEY && target !== API_KEY))) continue;
         if (publication === "subscription-refresh" && target.auth_mode !== "subscription") continue;
         if (publication === "api-key-refresh" && target.auth_mode !== "api_key") continue;
+        const resumeRefusal = publication === "resume-refuse-fresh";
+        const resumeUncertain = publication === "resume-uncertain";
+        const resumeVariant = resumeRefusal || resumeUncertain;
+        if (resumeVariant && (oldClaim !== API_KEY || target !== SUBSCRIPTION || phase !== "factory")) continue;
         const successorEpochAdvance = publication === "clean-successor-epoch-advance";
         const cleanApplyUncertain = publication === "clean-apply-uncertain";
         const cleanAllUnconfirmed = publication === "clean-stopped-unconfirmed" || publication === "clean-stopped-unsupported";
@@ -32420,6 +32424,8 @@ describe("M2 actualRunner credential replacement", () => {
           const missingRecoveryRollout = recoveryMode.endsWith("missing retained rollout");
       it((publication === "baseline"
         ? `M2 actualRunner ${oldClaim.auth_mode} to ${target.auth_mode} ${phase} account resumes saved thread`
+        : resumeRefusal ? "Codex real Runner confirmed B resume refusal starts exactly one fresh lineage"
+        : resumeUncertain ? "Codex real Runner uncertain B resume failure pauses without fresh fallback"
         : successorEpochAdvance ? "Codex real Runner rejects successor READY epoch 12 after latching epoch 11"
         : cleanApplyUncertain ? "Codex real Runner clean A teardown then uncertain apply parks ownership without custody hold"
         : cleanPendingDisappears ? `Codex real Runner pending op disappears after clean A teardown (${publication})`
@@ -32509,6 +32515,17 @@ describe("M2 actualRunner credential replacement", () => {
         client.reportState = async (id, body, ...args) => {
           reports.push(body.status);
           dispositions.push({ status: body.status, failure_reason: body.failure_reason });
+          if (resumeUncertain && body.status === "credential_switch_uncertain") {
+            assert.equal(id, claim.run_id);
+            assert.equal(body.claim_generation, 7);
+            assert.equal(body.op_id, "M2-op");
+            assert.equal(body.failure_reason, "initialization_failed");
+            assert.deepEqual(teardownResults, [true]);
+            assert.ok(a.reaped() > 0, "owner pause follows joined A teardown");
+            cleanOwnership.status = "paused";
+            api.setOwnershipStatus(id, "paused", 7);
+            return { applied: true, credentialSwitchUncertain: true };
+          }
           if (cleanRetainedStop && body.status === "credential_switch_uncertain") {
             assert.ok(cleanApplyUncertain || successorEpochAdvance);
             assert.deepEqual(teardownResults, [true], "owner ACK follows the joined real teardown");
@@ -32639,7 +32656,7 @@ describe("M2 actualRunner credential replacement", () => {
           return { kind: "confirmed" as const };
         });
         client.getRunOwnership = async () => {
-          if (cleanRetainedStop) {
+          if (cleanRetainedStop || resumeUncertain) {
             if (cleanOwnership.status === "paused") cleanPausedObservations.push({ ...cleanOwnership });
             return { ...cleanOwnership };
           }
@@ -32709,6 +32726,7 @@ describe("M2 actualRunner credential replacement", () => {
             capabilityEpoch: 42, messageSeq: 7, replay: false };
         };
         const savedId = "12345678-1234-1234-1234-123456789abc";
+        const bThreadId = resumeRefusal ? "M2-B-fresh-thread" : savedId;
         const dir = await fs.mkdtemp(path.resolve("../.uzi/scratch/M2-actualRunner-"));
         const source = path.join(dir, "source"), store = path.join(dir, "store");
         await fs.mkdir(path.join(source, "sessions"), { recursive: true });
@@ -32719,6 +32737,8 @@ describe("M2 actualRunner credential replacement", () => {
         const aEntered = installerBarrier(), bEntered = installerBarrier();
         const publicationStages = crashRecovery
           ? ["before-apply", "apply-reply-lost", "before-publish", "after-publish", "before-prepare", "login", "prepared"] as const
+          : resumeVariant
+          ? ["before-publish", "after-publish", "before-prepare", "login", "resume", ...(resumeRefusal ? ["fresh"] as const : []), "prepared"] as const
           : ["before-publish", "after-publish", "before-prepare", "login", "prepared"] as const;
         const publicationBarriers = publicationStages.map(stage => ({ stage, entered: installerBarrier(), proceed: installerBarrier() }));
         const injectedFailures: string[] = [];
@@ -32760,9 +32780,9 @@ describe("M2 actualRunner credential replacement", () => {
               c.transport.push(turnCompleted("completed", "M3-B-child", "M3-B-child-turn"));
               return { turn: { id: "M3-B-child-turn" } };
             }
-            if (c.method === "thread/resume" || c.method === "thread/start") return { thread: { id: savedId } };
+            if (c.method === "thread/resume" || c.method === "thread/start") return { thread: { id: bThreadId } };
             if (c.method === "turn/interrupt")
-              c.transport.push(turnCompleted("interrupted", savedId, bTurns > 1 ? "M2-B-idle" : "M2-B-turn"));
+              c.transport.push(turnCompleted("interrupted", bThreadId, bTurns > 1 ? "M2-B-idle" : "M2-B-turn"));
             if (c.method === "turn/start") {
               bTurns++;
               if (bTurns === 1) {
@@ -32771,19 +32791,19 @@ describe("M2 actualRunner credential replacement", () => {
                     assert.equal(bFinished, true);
                     assert.ok(bPreparationBroker);
                     const child = await bPreparationBroker.handleToolCall(
-                      { threadId: savedId, turnId: "M2-B-turn", callId: "finished-B-child" },
+                      { threadId: bThreadId, turnId: "M2-B-turn", callId: "finished-B-child" },
                       "spawn_agent", { role: "coder", prompt: "work after finishB" }, "root");
                     assert.equal(child.ok, true, "real B preparation broker and child runner admit valid work after finishB");
                     assert.equal(b.transport.requests.filter(r => r.method === "thread/start").length, 1);
                     assert.equal(b.transport.requests.filter(r => r.method === "turn/start" && rec(r.params).threadId === "M3-B-child").length, 1);
                   }
                   // Pinned cold-resume replay precedes the matching inbound turn boundary.
-                  c.transport.push(tokenUsageUpdated(savedId, "M2-historical", { totalTokens: 0 }));
-                  c.transport.push({ kind: "turn_started", method: "turn/started", threadId: savedId,
-                    turnId: "M2-B-turn", params: { threadId: savedId, turn: { id: "M2-B-turn" } } });
-                  c.transport.push(agentMessage(`M2 B output ${next.access_token} ${next.capability}`, savedId));
-                  c.transport.push(tokenUsageUpdated(savedId, "M2-B-turn", { inputTokens: 200, outputTokens: 100, totalTokens: 300 }));
-                  c.transport.push(turnCompleted("completed", savedId, "M2-B-turn"));
+                  if (!resumeRefusal) c.transport.push(tokenUsageUpdated(bThreadId, "M2-historical", { totalTokens: 0 }));
+                  c.transport.push({ kind: "turn_started", method: "turn/started", threadId: bThreadId,
+                    turnId: "M2-B-turn", params: { threadId: bThreadId, turn: { id: "M2-B-turn" } } });
+                  c.transport.push(agentMessage(`M2 B output ${next.access_token} ${next.capability}`, bThreadId));
+                  c.transport.push(tokenUsageUpdated(bThreadId, "M2-B-turn", { inputTokens: 200, outputTokens: 100, totalTokens: 300 }));
+                  c.transport.push(turnCompleted("completed", bThreadId, "M2-B-turn"));
                   clockOffset += 300001;
                   triggers.push(triggerNow("B"));
                   bEntered.resolve();
@@ -32853,6 +32873,7 @@ describe("M2 actualRunner credential replacement", () => {
         const release = rig.client.releaseCodex.bind(rig.client);
         let credentialReleases = 0, credentialRefreshes = 0, bCredentialReleases = 0;
         rig.client.releaseCodex = async (id, req) => {
+          if (resumeVariant && applies > 0) assert.equal(req.capability, next.capability, "A auth never revives after apply");
           credentialReleases++;
           if (req.capability === next.capability) bCredentialReleases++;
           return req.capability === next.capability ? { access_token: next.access_token } : release(id, req);
@@ -32871,6 +32892,7 @@ describe("M2 actualRunner credential replacement", () => {
           if (id === 91) refreshResponded.resolve();
         };
         rig.client.refreshCodex = async (id, req) => {
+          if (resumeVariant && applies > 0) assert.equal(req.capability, next.capability, "no A refresh after apply");
           credentialRefreshes++;
           if (req.capability !== next.capability) return refresh(id, req);
           ordinaryBRefreshes++;
@@ -32888,7 +32910,16 @@ describe("M2 actualRunner credential replacement", () => {
               effectDisposed: events.includes("A-effect-disposed"), fileopDisposed: fileops[0]!.disposed() });
             await publicationBoundary("login");
           }
-          if (method === "thread/resume") resumedThreads.push(rec(params).threadId);
+          if (method === "thread/resume") {
+            resumedThreads.push(rec(params).threadId);
+            if (resumeVariant) {
+              await publicationBoundary("resume");
+              throw new CodexTransportError({ category: "protocol", message: resumeRefusal
+                ? "codex app-server returned a JSON-RPC error (code -32602)"
+                : "codex app-server returned an unclassifiable protocol failure" });
+            }
+          }
+          if (resumeRefusal && method === "thread/start") await publicationBoundary("fresh");
           return request(method, params, opts);
         };
         const executor = makeExecutor(rig, bindingOf(oldClaim), noopLog, undefined, provider, m2Runner.homeDir);
@@ -32937,8 +32968,12 @@ describe("M2 actualRunner credential replacement", () => {
               restartAttempts++;
               await publicationBoundary("before-prepare");
               const result = await lease.restartAndResume(...args);
-              await publicationBoundary("prepared");
+              if (!resumeRefusal) await publicationBoundary("prepared");
               return result;
+            },
+            startFreshLineage: async (...args) => {
+              await lease.startFreshLineage(...args);
+              if (resumeRefusal) await publicationBoundary("prepared");
             },
             finishB: async (...args) => {
               assert.equal(ordinaryBRefreshes, 0, "no ordinary refresh before finishB");
@@ -33698,7 +33733,7 @@ describe("M2 actualRunner credential replacement", () => {
                     assert.equal(prepare, undefined, "API-key replacement installs no account admission dispatcher");
                   }
                 }
-                if (injectedStage) {
+                if (injectedStage || resumeVariant) {
                   const prepare = context.prepareCodexRootDispatch;
                   assert.ok(prepare, "real subscription B context dispatcher installed");
                   const releases = credentialReleases, refreshes = credentialRefreshes;
@@ -33717,7 +33752,7 @@ describe("M2 actualRunner credential replacement", () => {
                 assert.equal(child.ok, false, "retired real broker denies child work");
                 consumerProbes.push(barrier.stage);
                 assert.equal(bRootObserved, false, "no B work-turn root dispatcher exists during preparation");
-                if (barrier.stage === "login" || barrier.stage === "prepared") {
+                if (barrier.stage === "login" || barrier.stage === "prepared" || barrier.stage === "resume" || barrier.stage === "fresh") {
                   assert.ok(bPreparationObserved);
                   assert.ok(bPreparationBroker, "returned B epoch builder constructed the preparation broker");
                   const child = await withTimeout(bPreparationBroker.handleToolCall(
@@ -33799,14 +33834,41 @@ describe("M2 actualRunner credential replacement", () => {
               if ((publication === "publish-failure" && barrier.stage === "after-publish") ||
                   ((publication === "login-failure" || publication === "api-key-refresh") && barrier.stage === "login") ||
                   (crashRecovery && barrier.stage === crashStage) ||
+                  (resumeUncertain && barrier.stage === "resume") ||
                   (queuedRefreshStop && barrier.stage === "prepared") ||
                   (publication === "now-publish-failure" && barrier.stage === "after-publish")) break;
             }
-            assert.equal(consumerProbes.length, injectedStage ? failureBoundaryCount : crashRecovery ? publicationStages.findIndex(stage => stage === crashStage) + 1 : publication === "publish-failure" || publication === "now-publish-failure" ? 2 : (publication === "login-failure" || publication === "api-key-refresh" || crashRecovery) ? 4 : 5);
-            if (publication !== "gated" && publication !== "subscription-refresh" && !preflightRetry) {
+            assert.equal(consumerProbes.length, resumeVariant ? resumeUncertain ? 5 : 7 : injectedStage ? failureBoundaryCount : crashRecovery ? publicationStages.findIndex(stage => stage === crashStage) + 1 : publication === "publish-failure" || publication === "now-publish-failure" ? 2 : (publication === "login-failure" || publication === "api-key-refresh" || crashRecovery) ? 4 : 5);
+            if (publication !== "gated" && publication !== "subscription-refresh" && !resumeRefusal && !preflightRetry) {
               await withTimeout(running, 5000, "failed publication retained stop");
               await joinNowConsumerProbes();
               assert.equal(reopenAttempts, 0);
+              if (resumeUncertain) {
+                assert.deepEqual(resumedThreads, [savedId]);
+                assert.equal(b.transport.threadStartCount, 0, "unclassified failure cannot start a fresh lineage");
+                assert.equal(bFinished, false);
+                assert.equal(b.transport.turnStartCount, 0);
+                assert.equal(a.transport.turnStartCount, 1, "A never revives");
+                assert.equal(factories, 1);
+                assert.equal(actualFlight!.runId, claim.run_id);
+                assert.equal(actualFlight!.claimGeneration, 7);
+                assert.equal(actualFlight!.worktreePath, worktree);
+                assert.equal(actualFlight!.parked, true, "owner acknowledged the op-fenced pause");
+                assert.equal(actualFlight!.keepGuardedInventoryOpen, true);
+                assert.deepEqual(bChildProbes, ["login", "resume"]);
+                assert.equal(loginObservations.length, 1);
+                assert.equal(loginObservations[0]!.params.accessToken, next.access_token);
+                assert.ok(dispositions.some(body => body.status === "credential_switch_uncertain" && body.failure_reason === "initialization_failed"));
+                assert.ok(!reports.some(status => ["failed", "completed", "cancelled"].includes(status)));
+                assert.equal(api.messages(claim.run_id).some(message => message.kind === "status" &&
+                  rec(message.payload).event === "resume_lineage_break"), false);
+                for (const epoch of rig.epochs) {
+                  assert.ok(epoch.reaped() > 0);
+                  assert.ok(epoch.disposed() > 0);
+                }
+                assert.equal(disposedEffects.size, effects);
+                for (const handle of fileops) assert.ok(handle.disposed() > 0);
+              }
               if (injectedStage) {
                 assert.deepEqual(injectedFailures, [injectedStage], "the requested real boundary failed exactly once");
                 assert.equal(committedCodex, next, "simulated committed row remains B after publication failure");
@@ -34190,7 +34252,7 @@ describe("M2 actualRunner credential replacement", () => {
           assert.equal(bRootObserved, true, "actual B root dispatch reached the first post-finish work turn");
           assert.ok(bRootPrepares > 0, "actual B root prepare succeeded after finishB");
           assert.ok(bRootChecks > 0, "actual B root check succeeded after finishB");
-          if (publication !== "baseline") assert.deepEqual(bChildProbes, ["login", "prepared"]);
+          if (publication !== "baseline") assert.deepEqual(bChildProbes, resumeRefusal ? ["login", "resume", "fresh", "prepared"] : ["login", "prepared"]);
           assert.equal(nowBuilds.length, 2, "real owned composition constructs A then B Now");
           assert.equal(retiredADenied, true, "A guard rejected during live B construction");
           assert.equal(liveBAdmitted, true, "B guard accepted before executor shutdown");
@@ -34233,6 +34295,20 @@ describe("M2 actualRunner credential replacement", () => {
             await assert.rejects(fs.access(path.join(dest, "unapproved.txt")));
           }
           const feed = api.messages(claim.run_id);
+          if (resumeRefusal) {
+            assert.equal(feed.filter(message => message.kind === "status" &&
+              rec(message.payload).event === "resume_lineage_break").length, 1);
+            assert.equal(reopenAttempts, 0);
+            assert.equal(a.transport.turnStartCount, 1);
+            assert.equal(actualFlight!.runId, claim.run_id);
+            assert.equal(actualFlight!.claimGeneration, 7);
+            assert.equal(actualFlight!.worktreePath, worktree);
+            const threadStarts = b.transport.requests.filter(r => r.method === "thread/start");
+            assert.equal(threadStarts.length, 1);
+            const turns = b.transport.requests.filter(r => r.method === "turn/start");
+            assert.ok(turns.length > 0);
+            for (const turn of turns) assert.equal(rec(turn.params).threadId, bThreadId);
+          }
           assert.ok(!feed.some(m => String(m.payload.text).includes("Late A advice")), "aborted body never publishes late A advice");
           const notes = feed.filter(m => m.kind === "progress_note" && String(m.payload.text).startsWith("Inspecting B"));
           assert.equal(notes.length, 1, "future B Now emits one note through Runner");
@@ -34259,7 +34335,7 @@ describe("M2 actualRunner credential replacement", () => {
             assert.ok(events.includes(method), `B sent ${method}`);
           assert.ok(events.indexOf("account/login/start") < events.indexOf("thread/resume"));
           assert.ok(events.indexOf("thread/resume") < events.indexOf("turn/start"));
-          assert.equal(b.transport.threadStartCount, positiveBChild ? 1 : 0);
+          assert.equal(b.transport.threadStartCount, positiveBChild || resumeRefusal ? 1 : 0);
           assert.equal(await fs.readFile(path.join(worktree, "M2-retained.txt"), "utf8"), "A work");
         } finally {
           scopeProbesArmed = false;
@@ -34268,7 +34344,7 @@ describe("M2 actualRunner credential replacement", () => {
           cancelled = true; pending = false; nowContinue.resolve(); summaryDisposeContinue.resolve(); cleanupContinue.resolve();
           for (const barrier of publicationBarriers) barrier.proceed.resolve();
           a.transport.push(turnCompleted("interrupted", savedId, "M2-A-turn"));
-          b.transport.push(turnCompleted("interrupted", savedId, bTurns > 1 ? "M2-B-idle" : "M2-B-turn"));
+          b.transport.push(turnCompleted("interrupted", bThreadId, bTurns > 1 ? "M2-B-idle" : "M2-B-turn"));
           try {
             await joinExecution();
           } finally {
