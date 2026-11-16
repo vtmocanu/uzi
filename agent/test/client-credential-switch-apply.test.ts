@@ -540,11 +540,12 @@ describe("independent Codex switch negotiation", () => {
 describe("Codex stopped settlement", () => {
   const tuple = Object.freeze({ claimGeneration: 7, registerNonce: "nonce-1", expectedEpoch: 11 });
   const ack = { applied: true, disposition: "codex_switch_stopped",
-    run: { id: "run/1", status: "paused", claim_generation: 7, hold_reason: null, worker_id: "w" } };
+    run: { id: "run/1", status: "paused", claim_generation: 7, hold_reason: null } };
   const caps = ["codex_credential_switch_v1", "codex_switch_stopped_v1"];
   const features = ["codex_credential_switch_apply_v1", "codex_switch_stopped_v1"];
   const cases: Array<[string, Reply, string]> = [
-    ["explicit ack", json(200, ack), "confirmed"],
+    ["explicit minimal ack", json(200, ack), "confirmed"],
+    ["legacy bounded full run ack", json(200, { ...ack, run: { ...ack.run, worker_id: "w", plan_md: "legacy plan" } }), "confirmed"],
     ["status only", json(200, { run: ack.run }), "unconfirmed"],
     ["not applied", json(200, { ...ack, applied: false }), "unconfirmed"],
     ["wrong disposition", json(200, { ...ack, disposition: "uncertain" }), "unconfirmed"],
@@ -555,7 +556,7 @@ describe("Codex stopped settlement", () => {
     ["ordinary conflict", json(409, ack), "unconfirmed"],
     ["unsupported", json(400, { error: "invalid request body" }), "unconfirmed"],
     ["malformed", { status: 200, body: "{" }, "unconfirmed"],
-    ["oversize", { status: 200, body: " ".repeat(16385) }, "unconfirmed"],
+    ["oversize valid ack", json(200, { ...ack, run: { ...ack.run, plan_md: "p".repeat(16 * 1024) } }), "unconfirmed"],
     ["server error", json(500, ack), "unconfirmed"],
   ];
   for (const [name, reply, kind] of cases) it(name, async () => {

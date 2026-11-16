@@ -1784,7 +1784,7 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 		// credential_switch_unsettled and the owner's Resume is open.
 		ack["disposition"] = "hold_settled"
 	case "codex_switch_stopped":
-		stoppedSettlementAck(ack)
+		ack = stoppedSettlementAck(run)
 	case "credential_switch_uncertain":
 		// Issue #4201: the uncertain-apply park applied (or replayed): the run is paused for the
 		// owner with its claim, worker and session kept. The worker keys on this.
@@ -2809,7 +2809,8 @@ func (h *Handler) WorkerRunPublish(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, out)
 }
 
-// workerRunDTO is the run body every worker-facing response carries. It is runToDTO with the hold
+// workerRunDTO supplies ordinary worker-facing run bodies. The stopped-settlement
+// acknowledgement instead uses a bounded identity/status snapshot. This is runToDTO with the hold
 // reason passed through workersvc.WorkerVisibleHoldReason and the pending pause mode through
 // workersvc.WorkerVisiblePauseMode, so the weekly usage reserve's request reads as an ordinary
 // 'milestone' request and its park as an ordinary pause (null hold) to the agent; owner-facing DTOs
@@ -2822,7 +2823,18 @@ func (h *Handler) workerRunDTO(ctx context.Context, run store.Run) apitypes.RunD
 }
 
 // stoppedSettlementAck is used only after a stopped report applies or replays.
-func stoppedSettlementAck(ack map[string]any) {
-	ack["applied"] = true
-	ack["disposition"] = "codex_switch_stopped"
+// Do not include the full run DTO: its plan and other detail fields can exceed
+// the worker's bounded confirmation response. Use the committed row snapshot.
+func stoppedSettlementAck(run store.Run) map[string]any {
+	var holdReason *string
+	if run.HoldReason.Valid {
+		holdReason = &run.HoldReason.String
+	}
+	return map[string]any{
+		"applied": true, "disposition": "codex_switch_stopped",
+		"run": map[string]any{
+			"id": run.ID, "status": run.Status,
+			"claim_generation": run.ClaimGeneration, "hold_reason": holdReason,
+		},
+	}
 }

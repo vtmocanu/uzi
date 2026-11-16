@@ -163,7 +163,7 @@ func TestWorkerRunStateCodexSwitchStoppedRoute(t *testing.T) {
 			if tc.wantStatus == http.StatusOK && rec.Body.Len() > 16*1024 {
 				t.Fatalf("stopped acknowledgement exceeds worker response bound: %d bytes", rec.Body.Len())
 			}
-			if tx.run.PlanMd.String != strings.Repeat("p", tc.planBytes) {
+			if tx.run.PlanMd.String != strings.Repeat("p", tc.planBytes) || tx.run.PlanMd.Valid != (tc.planBytes != 0) {
 				t.Fatal("stopped acknowledgement changed the stored plan")
 			}
 			var got struct {

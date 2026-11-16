@@ -8,6 +8,8 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
@@ -50,24 +52,45 @@ func TestWorkerStateStoppedStrictBody(t *testing.T) {
 }
 
 func TestStoppedSettlementAck(t *testing.T) {
-	ack := map[string]any{"run": map[string]any{"status": "paused"}}
-	stoppedSettlementAck(ack)
-	wire, err := json.Marshal(ack)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var got struct {
-		Applied     bool   `json:"applied"`
-		Disposition string `json:"disposition"`
-		Run         struct {
-			Status string `json:"status"`
-		} `json:"run"`
-	}
-	if err := json.Unmarshal(wire, &got); err != nil {
-		t.Fatal(err)
-	}
-	if !got.Applied || got.Disposition != "codex_switch_stopped" || got.Run.Status != "paused" {
-		t.Fatal("stopped success acknowledgement lost explicit disposition")
+	for _, hold := range []pgtype.Text{{}, {String: "codex_policy_hold", Valid: true}} {
+		run := store.Run{ID: uuid.New(), Status: "paused", ClaimGeneration: 7, HoldReason: hold,
+			PlanMd: pgtype.Text{String: strings.Repeat("p", 64<<10), Valid: true}}
+		ack := stoppedSettlementAck(run)
+		wire, err := json.Marshal(ack)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(ack) != 3 || len(wire) > 16*1024 {
+			t.Fatal("stopped acknowledgement is not a bounded minimal envelope")
+		}
+		fields, ok := ack["run"].(map[string]any)
+		if !ok || len(fields) != 4 {
+			t.Fatal("stopped run acknowledgement has unrelated fields")
+		}
+		var got struct {
+			Applied     bool   `json:"applied"`
+			Disposition string `json:"disposition"`
+			Run         struct {
+				ID              uuid.UUID `json:"id"`
+				Status          string    `json:"status"`
+				ClaimGeneration int64     `json:"claim_generation"`
+				HoldReason      *string   `json:"hold_reason"`
+			} `json:"run"`
+		}
+		if err := json.Unmarshal(wire, &got); err != nil {
+			t.Fatal(err)
+		}
+		if !got.Applied || got.Disposition != "codex_switch_stopped" || got.Run.ID != run.ID ||
+			got.Run.Status != run.Status || got.Run.ClaimGeneration != run.ClaimGeneration {
+			t.Fatal("stopped success acknowledgement lost its committed coordinates")
+		}
+		if hold.Valid {
+			if got.Run.HoldReason == nil || *got.Run.HoldReason != hold.String {
+				t.Fatal("stopped acknowledgement masked a non-null hold")
+			}
+		} else if got.Run.HoldReason != nil {
+			t.Fatal("stopped acknowledgement did not preserve null hold")
+		}
 	}
 }
 
