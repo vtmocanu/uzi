@@ -35039,14 +35039,15 @@ describe("M2 actualRunner credential replacement", () => {
           });
           const bMessage = feed.find(m => String(m.payload.text).startsWith("M2 B output"));
           assert.ok(bMessage, "B output reaches real Runner feed");
-          assert.equal(bMessage.credential_epoch_ordinal, 1);
+
           const authority = (executor as unknown as { currentCodexAuthority: ReturnType<typeof createCodexEpochAuthority> }).currentCodexAuthority;
           assert.equal(authority.ordinal, 1);
           assert.equal(authority.capabilityEpoch, 42, "capability counter is distinct from the usage ordinal");
           assert.equal(authority.binding.capability, next.capability);
           const usage = feed.filter(m => m.payload.event === "codex_response_usage");
           assert.equal(usage.length, 1, "only B emitted provider usage");
-          assert.equal(usage[0]!.credential_epoch_ordinal, authority.ordinal);
+          assert.deepEqual({ output: bMessage.credential_epoch_ordinal, usage: usage[0]!.credential_epoch_ordinal },
+            { output: authority.ordinal, usage: authority.ordinal }, "B output and usage carry the replacement ordinal");
           assert.equal(rec(usage[0]!.payload.usage).input_tokens, 200);
           assert.equal(rec(usage[0]!.payload.usage).output_tokens, 100);
           assert.doesNotMatch(JSON.stringify({ feed, diagnostics: diagnostics.lines }), /M2-B-access|M2-B-capability|M2-A-auth-canary/);
