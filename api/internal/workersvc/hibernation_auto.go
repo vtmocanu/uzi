@@ -76,15 +76,21 @@ func refineIntakeFenced(w store.Worker) string {
 	return BlockedIntakeFenced
 }
 
+// idleSpan renders a threshold in the largest whole unit (days, then hours), else as a Go
+// duration. It is the unit logic shared by every automatic hibernation reason.
+func idleSpan(d time.Duration) string {
+	switch {
+	case d%(24*time.Hour) == 0:
+		return fmt.Sprintf("%dd", int64(d/(24*time.Hour)))
+	case d%time.Hour == 0:
+		return fmt.Sprintf("%dh", int64(d/time.Hour))
+	}
+	return d.String()
+}
+
 // autoHibernationReason is the hibernation_reason recorded for an automatic admission.
 func autoHibernationReason(idleAfter time.Duration) string {
-	switch {
-	case idleAfter%(24*time.Hour) == 0:
-		return fmt.Sprintf("automatic: no run activity for %dd", int64(idleAfter/(24*time.Hour)))
-	case idleAfter%time.Hour == 0:
-		return fmt.Sprintf("automatic: no run activity for %dh", int64(idleAfter/time.Hour))
-	}
-	return "automatic: no run activity for " + idleAfter.String()
+	return "automatic: no run activity for " + idleSpan(idleAfter)
 }
 
 // HibernationAutoPass is the sweeper pass that hibernates idle workers. It does nothing unless
@@ -107,6 +113,18 @@ func (s *Service) HibernationAutoPass(ctx context.Context) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
+	// Surplus mode (issue #4395) is effective only while both switches above are on. With it
+	// off every decision below is exactly the PRD #4207 pass.
+	surplus, err := s.hibernationAuto.WorkerHibernationSurplus(ctx)
+	if err != nil {
+		return 0, err
+	}
+	var surplusAfter time.Duration
+	if surplus {
+		if surplusAfter, err = s.hibernationAuto.WorkerHibernationSurplusIdleAfter(ctx); err != nil {
+			return 0, err
+		}
+	}
 
 	now := s.now()
 	s.autoPassMu.Lock()
@@ -119,6 +137,13 @@ func (s *Service) HibernationAutoPass(ctx context.Context) (int64, error) {
 
 	cutoff := now.Add(-idleAfter)
 	recentCutoff := now.Add(-HibernationAutoRefusalCooldown)
+	if surplus {
+		threshold := surplusThreshold(surplusAfter, idleAfter)
+		return s.hibernationSurplusPass(ctx, surplusPassParams{
+			now: now, idleAfter: idleAfter, threshold: threshold,
+			surplusCutoff: now.Add(-threshold), longCutoff: cutoff, recentCutoff: recentCutoff,
+		})
+	}
 	candidates, err := s.listAutoHibernationCandidates(ctx, cutoff, recentCutoff)
 	if err != nil {
 		return 0, err
@@ -188,6 +213,14 @@ func (s *Service) autoAdmit(ctx context.Context, q *store.Queries, w store.Worke
 	if idle.Nonterminal > 0 || !idle.Anchor.Valid || idle.Anchor.Time.After(cutoff) {
 		return false, false, nil
 	}
+	return s.admitAutomatic(ctx, q, w, now, autoHibernationReason(idleAfter), false)
+}
+
+// admitAutomatic is the shared tail of an automatic admission on a locked row that was judged
+// idle (and, for a surplus admission, surplus): it re-reads the settings, runs the unchanged
+// refusal path and either admits with reason or records the blocker. stop reports that a setting
+// was switched off, which ends the pass.
+func (s *Service) admitAutomatic(ctx context.Context, q *store.Queries, w store.Worker, now time.Time, reason string, surplus bool) (admitted, stop bool, err error) {
 	// Automatic mode may have changed since enumeration or while the row lock was pending.
 	// The manual admission check below re-reads only the separate main hibernation switch.
 	auto, err := s.hibernationAuto.WorkerHibernationAuto(ctx)
@@ -197,13 +230,22 @@ func (s *Service) autoAdmit(ctx context.Context, q *store.Queries, w store.Worke
 	if !auto {
 		return false, true, nil
 	}
+	if surplus {
+		on, err := s.hibernationAuto.WorkerHibernationSurplus(ctx)
+		if err != nil {
+			return false, false, err
+		}
+		if !on {
+			return false, true, nil
+		}
+	}
 	code, err := s.hibernateRefusal(ctx, q, w, now)
 	if err != nil {
 		return false, false, err
 	}
 	switch code {
 	case "":
-		admitHibernation(&w, now, autoHibernationReason(idleAfter))
+		admitHibernation(&w, now, reason)
 		if _, err := writeHibernation(ctx, q, w); err != nil {
 			return false, false, err
 		}

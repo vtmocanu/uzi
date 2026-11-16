@@ -2031,6 +2031,20 @@ type Service struct {
 	autoPassMu        sync.Mutex
 	lastAutoPass      time.Time
 	autoPassAfterList func()
+	// ownerLockTimeout overrides HibernationOwnerLockTimeout, the lock_timeout of one surplus
+	// decision's owner and candidate locks (issue #4395). TEST-ONLY: zero in production.
+	ownerLockTimeout time.Duration
+	// poolPassBeforeOwnerLock runs inside a surplus decision's transaction right before the owner
+	// advisory lock is requested, with the transaction's backend pid. TEST-ONLY: nil in production
+	// (the pid is then not even queried).
+	poolPassBeforeOwnerLock func(backendPID int32)
+	// poolPassAfterDecide runs after a surplus decision was made and before it is written, with
+	// the owner lock and the candidate row lock held. TEST-ONLY: nil in production.
+	poolPassAfterDecide func()
+	// memoryAuthorityUnpersisted is true when the api runs with the active-snapshot kill switch,
+	// so workers.memory_authority_lost_at is never written and memory authority is unknown to the
+	// pool policy; set via SetActiveSnapshotDisabled.
+	memoryAuthorityUnpersisted bool
 	// isolatedLaneDisabled is true when the deployment did not enable the isolated research
 	// lane (issue #1965); set via SetIsolatedLaneEnabled. Stored negated so a Service that never
 	// calls the setter (tests, other wiring) keeps the pre-#1965 queued reasons.
