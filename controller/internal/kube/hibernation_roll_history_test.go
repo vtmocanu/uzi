@@ -561,6 +561,13 @@ func TestHibernationPeerEvidenceRefusesCohortPending(t *testing.T) {
 			inc := markedDeployment(t, testConfig(), w, false).Annotations[annotationRoll]
 			return w, []runtime.Object{rhPlainDep(t, w), pvcNix("w2", "20Gi"), rhClaim("w2", "data", inc)}
 		}},
+		// Out-of-scope by owner and marker, but the raw annotation on its nix claim is
+		// still unreadable roll evidence, so the peer must not be skipped.
+		"other-owner completed canary with a raw annotation on its nix claim": {func(t *testing.T) (protocol.DesiredWorker, []runtime.Object) {
+			w, objs := rhPeer(t, "w2", true, func(r *rollMarker) { r.Completed = true; r.Coverage.Owner = "owner-B" })
+			w.RollEvidence.OwnerID = "owner-B"
+			return w, []runtime.Object{objs[0], rhClaim("w2", "nix", "x"), objs[2]}
+		}},
 		"blocked peer with no marker": {func(t *testing.T) (protocol.DesiredWorker, []runtime.Object) {
 			w := evidence(desired("w2"), m5Now)
 			d := rhPlainDep(t, w)
@@ -631,6 +638,30 @@ func TestHibernationPeerEvidenceRefusesCohortPending(t *testing.T) {
 			t.Fatal("the other owner's marker was touched")
 		}
 	})
+}
+
+// 5a: a terminating candidate Deployment is never retired or scaled down by this path.
+func TestHibernationTerminatingCandidateIsNotRetired(t *testing.T) {
+	w := rhW(protocol.HibernationPreparing, "op-1")
+	d := rhCanaryDep(t, true)
+	now := metav1.Now()
+	d.DeletionTimestamp = &now
+	d.Finalizers = []string{"test/hold"}
+	m, client, rec := hibEnv(t, d, hibPod("pod-uid-1", "x", true, false))
+	if err := hibTick(t, m, w); err != nil {
+		t.Fatal(err)
+	}
+	if rhRollWrites(client, "uzi-hw-w1") != 0 {
+		t.Fatalf("a terminating Deployment's marker was retired: %+v", rhWorkerPatches(client, "uzi-hw-w1"))
+	}
+	if replicaPatches(client) != 0 {
+		t.Fatalf("a terminating Deployment was scaled down: %+v", rhPatches(client))
+	}
+	for _, tr := range rec.transitions() {
+		if tr == protocol.TransitionScalingDown {
+			t.Fatalf("transitions = %v", rec.transitions())
+		}
+	}
 }
 
 // 5b: a candidate whose own snapshot is blocked keeps its decoded completed marker; the
@@ -776,13 +807,13 @@ func TestHibernatedWorkerWithCompletedCanaryMarkerSuppliesNothing(t *testing.T) 
 	// Only the anchor lets the dependent peer read "completed cohort cleanup pending";
 	// without it the peer would read as a participant without a canary. The anchor itself
 	// is excluded from admission, outcome changes and hold release.
-	anchored := func(t *testing.T, edit func(w1 *protocol.DesiredWorker, d *appsv1.Deployment)) (*Materializer, *fake.Clientset, *hibRec, protocol.DesiredWorker, protocol.DesiredWorker) {
+	anchored := func(t *testing.T, edit func(d *appsv1.Deployment)) (*Materializer, *fake.Clientset, *hibRec, protocol.DesiredWorker, protocol.DesiredWorker) {
 		t.Helper()
 		w1 := rhW(protocol.HibernationPreparing, "op-1")
 		w2, peerObjs := rhPeer(t, "w2", false, nil)
 		d := rhCanaryDep(t, true)
 		if edit != nil {
-			edit(&w1, d)
+			edit(d)
 		}
 		m, client, rec := hibEnv(t, rhObjs([]runtime.Object{d}, peerObjs)...)
 		return m, client, rec, w1, w2
@@ -820,7 +851,7 @@ func TestHibernatedWorkerWithCompletedCanaryMarkerSuppliesNothing(t *testing.T) 
 	})
 
 	t.Run("anchored candidate with template drift is not held or reported", func(t *testing.T) {
-		m, client, rec, w1, w2 := anchored(t, func(_ *protocol.DesiredWorker, d *appsv1.Deployment) {
+		m, client, rec, w1, w2 := anchored(t, func(d *appsv1.Deployment) {
 			d.Spec.Template.Annotations[AnnotationGeneration] = "99"
 		})
 		if err := hibTick(t, m, w1, w2); err != nil {
