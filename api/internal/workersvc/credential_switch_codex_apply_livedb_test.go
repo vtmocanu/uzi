@@ -57,12 +57,21 @@ func TestCodexTransactionalApplyBundleLiveDB(t *testing.T) {
 			oldCapability := formatCodexCapability(41, oldPlain)
 			op := f.opOf(t, run)
 			res := f.apply(t, run, f.req(op))
-			if res.Outcome != ApplyOutcomeApplied || res.Codex == nil || res.Token != "" ||
-				res.Ordinal != 1 || res.MessageSeq != 6 || res.CapabilityEpoch != 42 {
+			if res.Outcome != ApplyOutcomeApplied || res.Codex == nil || res.Token != "" {
 				t.Fatalf("incomplete result: %v", res)
 			}
 			if _, err := f.svc.AuthorizeCodexCredentialOp(f.env.ctx, f.worker(t), run, oldCapability, ScopeReleaseAccessToken); err == nil {
 				t.Fatal("old capability still authorized")
+			}
+			authority, err := f.svc.AuthorizeCodexCredentialOp(f.env.ctx, f.worker(t), run, res.Codex.Capability, ScopeReleaseAccessToken)
+			if err != nil {
+				t.Fatal("replacement capability cannot authorize credential release", err)
+			}
+			if authority.SecretID != target || authority.AuthMode != res.Codex.AuthMode || authority.Scope != ScopeReleaseAccessToken {
+				t.Fatal("replacement capability resolved a different authority")
+			}
+			if res.Ordinal != 1 || res.MessageSeq != 6 || res.CapabilityEpoch != 42 {
+				t.Fatal("incorrect replacement coordinates")
 			}
 			expected := "apply-target-key"
 			if subscription {
