@@ -1738,10 +1738,12 @@ web:
     # implementation, which for Envoy-based gateways is commonly 15s. Set, it renders a
     # dedicated `Exact /api/v1/files` rule carrying exactly the keys given. HTTPRoute timeouts
     # are a Gateway API Extended feature: set this only on a gateway that supports them.
-    # Recommended: {request: "300s", backendRequest: "300s"}. 300s covers a 25 MiB upload on a
-    # slow link plus the api's request deadline (UZI_RECOVERY_REQUEST_DEADLINE, 120s) and its
-    # 15s response grace. It is NOT a guaranteed cap on total upload duration: Gateway API
-    # lets an implementation start the request timer after the request body is received.
+    # Recommended: {request: "300s", backendRequest: "300s"}. 300s covers the api's own budget
+    # for a maximum-size (25 MiB) upload on a slow link: its upload deadline is the larger of
+    # the request deadline (UZI_RECOVERY_REQUEST_DEADLINE, 120s) and the declared size at
+    # 100 KiB/s (256s at 25 MiB), plus a 15s response grace, 271s in all. It is NOT a
+    # guaranteed cap on total upload duration: Gateway API lets an implementation start the
+    # request timer after the request body is received.
     # This value must cover web nginx's /api/v1/files budgets, as web.ingress.annotations do
     # for Ingress; size it as a TOTAL budget, not by copying nginx's numbers, because nginx's
     # client_body/proxy_send/proxy_read timeouts (120s/150s/150s) bound inactivity between

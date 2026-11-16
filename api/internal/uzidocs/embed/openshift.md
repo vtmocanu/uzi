@@ -60,10 +60,12 @@ web:
 - **Off by default:** with `timeouts` empty, the rendered `HTTPRoute` is unchanged. Set, it
   adds an `Exact` `/api/v1/files` rule carrying the timeouts you give; every other path,
   `/api/ws` included, stays on the `PathPrefix /` rule.
-- **Why 300s:** it covers a 25 MiB upload on a slow link plus the api's 120s request
-  deadline (`UZI_RECOVERY_REQUEST_DEADLINE`) and its 15s response grace. It is not a
-  guaranteed cap on total upload duration: an implementation may start the request timer
-  only after the request body is received.
+- **Why 300s:** it covers the api's own budget for a maximum-size (25 MiB) upload on a slow
+  link. The api's upload deadline is the larger of its request deadline
+  (`UZI_RECOVERY_REQUEST_DEADLINE`, 120s) and the declared size at 100 KiB/s (256s at
+  25 MiB), plus a 15s response grace: 271s in all. It is not a guaranteed cap on total
+  upload duration: an implementation may start the request timer only after the request
+  body is received.
 - **Total, not idle:** web nginx's send, read and client-body timeouts for this route bound
   inactivity between operations, not total duration, so size the gateway value as a total
   budget that covers them rather than copying their numbers.

@@ -196,6 +196,10 @@ routespec "$WORK/rt-zero" --set-json 'web.httpRoute.timeouts={"request":"0s","ba
 ok "request 0s (disabled) allows a finite backendRequest"
 routespec "$WORK/rt-multi" --set-json 'web.httpRoute.timeouts={"request":"1h2m","backendRequest":"3700s"}'
 ok "multi-part durations compare parsed (request 1h2m >= backendRequest 3700s)"
+routespec "$WORK/rt-ms" --set-json 'web.httpRoute.timeouts={"request":"1s","backendRequest":"500ms"}'
+ok "millisecond durations parse as ms, not minutes (request 1s >= backendRequest 500ms)"
+refuse "web.httpRoute.timeouts.backendRequest (1s) is longer than web.httpRoute.timeouts.request (500ms)" \
+  $ROUTE_ARGS --set-json 'web.httpRoute.timeouts={"request":"500ms","backendRequest":"1s"}'
 
 # --- (c) nulled pod ids are omitted, the rest of the posture stays -----------------------
 cat > "$WORK/nullids.yaml" <<'EOF'
