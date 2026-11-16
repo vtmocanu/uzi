@@ -60,17 +60,20 @@ web:
 - **Off by default:** with `timeouts` empty, the rendered `HTTPRoute` is unchanged. Set, it
   adds an `Exact` `/api/v1/files` rule carrying the timeouts you give; every other path,
   `/api/ws` included, stays on the `PathPrefix /` rule.
-- **Why 300s:** it covers the api's own budget for a maximum-size (25 MiB) upload on a slow
-  link. The api's upload deadline is the larger of its request deadline
-  (`UZI_RECOVERY_REQUEST_DEADLINE`, 120s) and the declared size at 100 KiB/s (256s at
-  25 MiB), plus a 15s response grace: 271s in all. Web nginx buffers the whole request
-  body before the api sees any of it, so the client's upload comes first. On a gateway
-  whose request timer starts when the request starts, 300s is the supported total for
-  client upload, forwarding and api processing: a 25 MiB upload at the api's assumed
-  100 KiB/s floor takes 256s and leaves about 44s for the rest. On a gateway that starts
-  the timer only after the body is received, upload time is not counted at all. Either way
-  300s is not a guaranteed cap on total upload duration, and raising the per-file cap
+- **Why 300s:** it is sized for a 25 MiB upload on a slow link. Web nginx buffers the whole
+  request body before the api sees any of it, so what 300s bounds depends on when the
+  gateway starts its request timer, which Gateway API leaves to the implementation:
+  - *Timer from request start:* 300s caps the whole transaction, client upload included.
+    A 25 MiB upload at the api's assumed 100 KiB/s floor takes 256s and leaves about 44s
+    for forwarding and api processing; a client averaging under about 85 KiB/s is cut off.
+  - *Timer after the body is received:* the client upload is not counted against
+    `request`, and 300s covers the api's own budget for the buffered body. Its upload
+    deadline is the larger of its request deadline (`UZI_RECOVERY_REQUEST_DEADLINE`, 120s)
+    and the declared size at 100 KiB/s (256s at 25 MiB), plus a 15s response grace: 271s.
+
+  So 300s is not a portable cap on total upload duration. Raising the per-file cap
   (`UZI_JOB_INPUT_FILE_MAX_BYTES`) needs a larger value.
+
 - **Total, not idle:** web nginx's send, read and client-body timeouts for this route bound
   inactivity between operations, not total duration, so size the gateway value as a total
   budget that covers them rather than copying their numbers.
