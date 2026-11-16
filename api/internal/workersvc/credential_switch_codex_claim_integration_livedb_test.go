@@ -14,10 +14,12 @@ import (
 // These regressions enter through Service.Claim and Heartbeat, not the expiry
 // helper. Removing expiry from claimCheckpointRun must fail the fresh-claim case.
 func TestCodexSwitchWorkerLossClaimIntegrationLiveDB(t *testing.T) {
-	for _, scenario := range []string{"fresh claim", "notice failure", "same generation readoption"} {
+	for _, scenario := range []string{"fresh claim", "notice failure", "same generation readoption", "loss after joined A teardown before apply"} {
 		t.Run(scenario, func(t *testing.T) {
 			x := newOutageCodexFlight(t, codexAuthModeAPIKey)
 			id := x.f.runID
+			postTeardown := scenario == "loss after joined A teardown before apply"
+			const savedSessionID = "12345678-1234-1234-1234-123456789abc"
 			x.env.exec("UPDATE workers SET credential_switch_apply_nonce=snapshot_register_nonce, protocol_capabilities=array_append(array_append(protocol_capabilities,'codex_switch_stopped_v1'),$2) WHERE id=$1", x.f.workerID, capability.CodexCredentialSwitchV1)
 			target := x.env.seedStaticAPIKey(t, x.f.userID, "unused-switch-target", "unused-target-key")
 			x.env.exec("UPDATE runs SET credential_switch_requested_at=now(), credential_switch_generation=claim_generation WHERE id=$1", id)
@@ -27,6 +29,12 @@ func TestCodexSwitchWorkerLossClaimIntegrationLiveDB(t *testing.T) {
      codex_switch_target_auth_mode='api_key',
      codex_switch_target_material_revision=(SELECT material_revision FROM codex_credential_state WHERE user_secret_id=$2)
      WHERE id=$1`, id, target)
+			if postTeardown {
+				// Supplied boundary: the companion actual Runner crash-after-A-teardown
+				// case joins root/tool teardown before loss. This DB fixture cannot prove
+				// OS process death; the persisted ID is only a conversation candidate.
+				x.env.exec("UPDATE runs SET session_id=$2 WHERE id=$1", id, savedSessionID)
+			}
 			requested := mustRun(t, x.env, id)
 			if !requested.CredentialSwitchOpID.Valid {
 				t.Fatal("fixture has no pending operation")
@@ -83,6 +91,19 @@ func TestCodexSwitchWorkerLossClaimIntegrationLiveDB(t *testing.T) {
 			observed := false
 			x.f.svc.claimHooks = &claimTestHooks{beforeAssembly: func(_ context.Context, run store.Run) {
 				observed = true
+				if postTeardown {
+					if !run.SessionID.Valid || run.SessionID.String != savedSessionID {
+						t.Fatal("post-teardown saved candidate lost before assembly")
+					}
+					var reason, op string
+					var generation int64
+					if err := x.env.pool.QueryRow(x.env.ctx, `SELECT payload->>'reason',payload->>'op_id',claim_generation
+FROM run_messages WHERE run_id=$1 AND seq=$2`, id, run.LastSeq).Scan(&reason, &op, &generation); err != nil ||
+						reason != "expired_by_worker_loss" || op != uuid.UUID(requested.CredentialSwitchOpID.Bytes).String() ||
+						generation != run.ClaimGeneration {
+						t.Fatal("post-teardown expiry notice was not committed before assembly", err)
+					}
+				}
 				if run.ClaimGeneration != before.ClaimGeneration+1 || run.CredentialSwitchOpID.Valid ||
 					run.CredentialSwitchRequestedAt.Valid || run.CodexSwitchTargetSecretID.Valid ||
 					run.CodexSwitchTargetAuthMode.Valid || run.CodexSwitchTargetMaterialRevision.Valid ||
@@ -97,6 +118,10 @@ func TestCodexSwitchWorkerLossClaimIntegrationLiveDB(t *testing.T) {
 				t.Fatalf("fresh production claim failed: payload=%t observed=%t error=%v", fresh != nil, observed, err)
 			}
 			after := mustRun(t, x.env, id)
+			if postTeardown && (fresh.SessionID == nil || *fresh.SessionID != savedSessionID ||
+				!after.SessionID.Valid || after.SessionID.String != savedSessionID) {
+				t.Fatal("post-teardown claim did not retain the persisted conversation candidate")
+			}
 			if fresh.Secrets.Codex.AccessToken != x.f.accessToken ||
 				fresh.Secrets.Codex.Capability == x.p.Secrets.Codex.Capability ||
 				after.CodexSecretID != before.CodexSecretID || after.CodexClaimEpoch != before.CodexClaimEpoch+2 {

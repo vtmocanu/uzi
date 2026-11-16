@@ -11,10 +11,17 @@ import (
 // Exercise the expiry transaction used by claimCheckpointRun. Full claim
 // admission and outer payload delivery still require the exact-head LiveDB sweep.
 func TestCodexFreshClaimPendingExpiryLiveDB(t *testing.T) {
-	for _, scenario := range []string{"expires", "same generation", "rollback", "notice failure"} {
+	for _, scenario := range []string{"expires", "same generation", "rollback", "notice failure", "loss after joined A teardown before apply"} {
 		t.Run(scenario, func(t *testing.T) {
 			f := newApplyFx(t)
 			id, op := f.run(t, "running")
+			postTeardown := scenario == "loss after joined A teardown before apply"
+			const savedSessionID = "12345678-1234-1234-1234-123456789abc"
+			if postTeardown {
+				// Joined teardown is the worker companion fixture precondition, not
+				// a new API phase or a DB assertion about OS root death.
+				f.env.exec("UPDATE runs SET session_id=$2 WHERE id=$1", id, savedSessionID)
+			}
 			old := f.env.seedStaticAPIKey(t, f.o.userID, "expiry-old", "old-test-key")
 			target := f.env.seedStaticAPIKey(t, f.o.userID, "expiry-target", "target-test-key")
 			if err := f.svc.FreezeCodexBinding(f.env.ctx, f.o.userID, id, old, codexAuthModeAPIKey); err != nil {
@@ -64,6 +71,9 @@ func TestCodexFreshClaimPendingExpiryLiveDB(t *testing.T) {
 				got.CodexMaterialRevision != before.CodexMaterialRevision || got.CodexClaimEpoch != before.CodexClaimEpoch {
 				t.Fatal("expiry changed committed binding")
 			}
+			if postTeardown && (!got.SessionID.Valid || got.SessionID.String != savedSessionID) {
+				t.Fatal("expiry lost the saved post-teardown conversation candidate")
+			}
 			if scenario == "same generation" {
 				if got.CredentialSwitchOpID != before.CredentialSwitchOpID || got.LastSeq != before.LastSeq ||
 					got.CodexSwitchTargetSecretID != before.CodexSwitchTargetSecretID {
@@ -106,6 +116,14 @@ func TestCodexFreshClaimPendingExpiryLiveDB(t *testing.T) {
 			}
 			if err := tx.Commit(f.env.ctx); err != nil {
 				t.Fatal(err)
+			}
+			if postTeardown {
+				after := mustRun(t, f.env, id)
+				if !after.SessionID.Valid || after.SessionID.String != savedSessionID ||
+					after.CodexSecretID != before.CodexSecretID || after.CodexClaimEpoch != before.CodexClaimEpoch ||
+					after.CredentialSwitchOpID.Valid || after.CodexSwitchTargetSecretID.Valid {
+					t.Fatal("committed post-teardown expiry changed A or its saved candidate")
+				}
 			}
 		})
 	}
