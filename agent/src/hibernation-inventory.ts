@@ -55,6 +55,11 @@
 //   retained-source reportRetained.
 //   UNCOVERED: dind_builder when the pressure-only builder leg is configured. Its daemon
 //   operation can outlive client settlement; the constructor marks it uncovered for the process.
+//   UNCOVERED: dind_prune at Docker storage scope (DOCKER_DAEMON_PRUNE_GAP). It stays registry-wrapped
+//   (latch/settle cover its local in-flight steps only), but a client close is not daemon settlement:
+//   BuildKit finishes its current batch, containerd GC adds a separately scheduled tail, and there is
+//   no recoverable submission-bound join. So neither a later success, a restart, an empty registry, a
+//   disabled or unwired leg, nor a new registration, pod UID or daemon ID clears it (PRD #4208 D16, #4369).
 //   A class that cannot be wrapped must call
 //   HibernationWriterRegistry.markUncovered(name); the inventory then reports it, this worker
 //   posts it with complete=false, and the api also refuses to treat such an inventory as complete.
@@ -62,6 +67,9 @@ import type { DindPruneGate } from "./dind-prune.js";
 import type { Logger } from "./log.js";
 import type { PodEpochOwnership } from "./pod-epoch-lock.js";
 import { errMessage } from "./util.js";
+
+/** The writer class named uncovered on every worker whose inventory scope includes Docker daemon storage. */
+export const DOCKER_DAEMON_PRUNE_GAP = "dind_prune";
 
 // ---- wire types (fixtures/hibernation-inventory/wire.json) ------------------------------------
 
@@ -309,6 +317,11 @@ export interface HibernationDeps {
   ownership: Pick<PodEpochOwnership, "mode" | "reacquireShared" | "upgradeExclusive"> | undefined;
   /** True only on the DinD lane with epoch participation. */
   laneSupported: boolean;
+  /**
+   * The inventory scope includes Docker daemon storage. When true the `dind_prune` gap is always
+   * named (PRD #4208 D16, #4369), whatever the registry, census or lane state.
+   */
+  dockerStorage: boolean;
   podUid: () => string | undefined;
   /** Worker.isIdle. */
   isIdle: () => boolean;
@@ -438,7 +451,10 @@ export class HibernationInventoryController {
     const d = this.deps;
     if (!d.laneSupported) {
       this.failure = { opId: m.op_id, at: this.now() };
-      await this.postStatus(m, "unsupported", "lane has no proven exclusion mechanism");
+      const reason = d.dockerStorage
+        ? `lane has no proven exclusion mechanism; uncovered writer: ${DOCKER_DAEMON_PRUNE_GAP}`
+        : "lane has no proven exclusion mechanism";
+      await this.postStatus(m, "unsupported", reason);
       return;
     }
     // (a) latch writers and close the claim gate.
@@ -494,7 +510,10 @@ export class HibernationInventoryController {
   }
 
   private buildInventory(m: HibernationInventoryMember, census: CensusResult): InventoryRequest {
-    const uncovered = [...this.deps.registry.uncovered(), ...census.uncovered];
+    const registryUncovered = this.deps.registry.uncovered();
+    const gap = this.deps.dockerStorage && !registryUncovered.includes(DOCKER_DAEMON_PRUNE_GAP)
+      ? [DOCKER_DAEMON_PRUNE_GAP] : [];
+    const uncovered = [...registryUncovered, ...gap, ...census.uncovered];
     // An uncovered writer class means the inventory cannot be proven complete (the api enforces it too).
     let complete = census.complete && uncovered.length === 0;
     let entries = census.entries;

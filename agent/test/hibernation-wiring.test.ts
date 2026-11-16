@@ -57,7 +57,7 @@ function controller(registry = new HibernationWriterRegistry(), overrides: Parti
       hasFeature: () => true, currentRegisterNonce: () => "n",
       postHibernationInventory: async () => {}, postHibernationExclusionFinal: async () => {},
     },
-    ownership: undefined, laneSupported: true, podUid: () => undefined, isIdle: () => true,
+    ownership: undefined, laneSupported: true, dockerStorage: true, podUid: () => undefined, isIdle: () => true,
     proof: async () => true,
     census: async () => ({ complete: false, entries: [], fingerprint: "", digest: "", docker: null, uncovered: [] }),
     recomputeFingerprint: async () => ({ digest: "", fingerprint: "" }),
