@@ -49,6 +49,20 @@ function classifyGuardrailFindings(messages: string[]): {
   return { findings, waivable: messages.length > 0 && !messages.some(unreadable) };
 }
 
+// normalizeForgeBaseUrl mirrors config.NormalizeForgeBaseURL: https + lowercased
+// host, any path/query/fragment dropped. The mock compares connection targets in
+// this form so a trailing slash or a capital letter still collides, exactly as the
+// server's create-only insert does. An unparseable value is returned trimmed, which
+// is what the server's validation rejects with a 400 rather than a 409.
+function normalizeForgeBaseUrl(raw: string): string {
+  try {
+    const u = new URL(raw.trim());
+    return `https://${u.host.toLowerCase()}`;
+  } catch {
+    return raw.trim();
+  }
+}
+
 let connections = [{ ...mockConnection }];
 export let repos = mockRepos.map((r) => ({ ...r }));
 // PRD #534: a GitHub connection plus two GitHub repos so the Repos "Project
@@ -160,20 +174,40 @@ export const forgeApi = {
   // ── Forge ───────────────────────────────────────────────────────────────────
   forgeConfig: async () => delay({ ...mockForgeConfig, allowed_base_urls: [...mockForgeConfig.allowed_base_urls] }),
   listConnections: async () => delay({ connections: connections.map((c) => ({ ...c })) }),
-  createConnection: async (baseUrl: string, _token: string, forgeType = "gitlab") => {
+  // Mirrors the real create path: a create that targets an already-connected
+  // (forge type, base URL) is refused with 409 forge_connection_exists unless the
+  // caller passes replace=true, which rotates that connection's credential in
+  // place. The target is compared NORMALIZED (https + lowercased host, path
+  // dropped), because that is the form the server stores and looks up — a mock
+  // comparing the raw string would let a trailing slash or a capital letter
+  // through and hide the very duplicate the guard exists to catch.
+  createConnection: async (baseUrl: string, _token: string, forgeType = "gitlab", replace = false) => {
+    const target = normalizeForgeBaseUrl(baseUrl);
+    const existing = connections.find(
+      (c) => c.forge_type === forgeType && normalizeForgeBaseUrl(c.base_url) === target,
+    );
+    if (existing && !replace) {
+      throw new ApiError(
+        409,
+        "a connection to this forge already exists; enable a repository on it, or resend with replace=true to rotate its credential",
+        { code: "forge_connection_exists", connection_id: existing.id },
+      );
+    }
     const conn = {
       ...mockConnection,
-      id: `conn-${Date.now()}`,
-      base_url: baseUrl,
+      id: existing?.id ?? `conn-${Date.now()}`,
+      base_url: target,
       forge_type: forgeType,
-      created_at: new Date().toISOString(),
+      created_at: existing?.created_at ?? new Date().toISOString(),
       last_verified_at: new Date().toISOString(),
       // A freshly connected bot is unchecked until the first privilege check.
       privilege_status: null,
       privilege_checked_at: null,
       privilege_report: null,
     };
-    connections = [conn];
+    connections = existing
+      ? connections.map((c) => (c.id === existing.id ? conn : c))
+      : [conn];
     return delay({ connection: { ...conn } }, 600);
   },
   verifyConnection: async (id: string) => {
