@@ -35609,6 +35609,8 @@ describe("Codex repeated actualRunner switching", () => {
 
     const aEntered = installerBarrier(), bObserved = installerBarrier(), cObserved = installerBarrier();
     const ySeen = installerBarrier(), allowBEnd = installerBarrier(), allowCEnd = installerBarrier();
+    const bReapEntered = installerBarrier(), finishBReap = installerBarrier();
+    let bReapCompleted = false, bDisposeCompleted = false, cMaterialReads = 0;
     const jobs: Promise<void>[] = [];
     let cancelled = false;
     let pending: "opX" | "opY" | undefined;
@@ -35663,6 +35665,19 @@ describe("Codex repeated actualRunner switching", () => {
       }
       return {};
     }));
+    const bReap = rig.epochs[1]!.root.reap.bind(rig.epochs[1]!.root);
+    rig.epochs[1]!.root.reap = async (...args) => {
+      bReapEntered.resolve();
+      await finishBReap.promise;
+      const result = await bReap(...args);
+      bReapCompleted = true;
+      return result;
+    };
+    const bDispose = rig.epochs[1]!.root.dispose.bind(rig.epochs[1]!.root);
+    rig.epochs[1]!.root.dispose = async (...args) => {
+      await bDispose(...args);
+      bDisposeCompleted = true;
+    };
     const launchProvider = rig.deps.launchProviderRoot!;
     const launchEffect = rig.deps.launchEffectRoot!;
     let effectIndex = 0;
@@ -35705,6 +35720,9 @@ describe("Codex repeated actualRunner switching", () => {
     const releaseCodex = rig.client.releaseCodex.bind(rig.client);
     rig.client.releaseCodex = async (id, req) => {
       if (req.capability === cClaim.capability) {
+        cMaterialReads++;
+        assert.equal(bReapCompleted, true, "C material follows completed B reap");
+        assert.equal(bDisposeCompleted, true, "C material follows completed B transport disposal");
         assert.equal(applies, 2);
         return { access_token: cClaim.access_token };
       }
@@ -35712,8 +35730,11 @@ describe("Codex repeated actualRunner switching", () => {
       return releaseCodex(id, req);
     };
     const refreshCodex = rig.client.refreshCodex.bind(rig.client);
-    rig.client.refreshCodex = async (id, req) => {
+    rig.client.refreshCodex = async (id, req, expected?: Parameters<WorkerClient["refreshCodex"]>[2]) => {
       if (req.capability !== bClaim.capability) return refreshCodex(id, req);
+      assert.equal(id, claim.run_id);
+      assert.equal(req.observed_generation, bClaim.generation, "B reconcile uses its committed generation");
+      assert.deepEqual(expected, { authMode: "subscription", chatgptAccountId: bClaim.chatgpt_account_id });
       return { access_token: bClaim.access_token, generation: req.observed_generation + 1,
         chatgpt_account_id: bClaim.chatgpt_account_id, outcome: "advanced" };
     };
@@ -35747,10 +35768,11 @@ describe("Codex repeated actualRunner switching", () => {
       };
     };
     let bRefreshCalls = 0;
-    const refreshBridge = rig.client.refreshCodex.bind(rig.client);
-    rig.client.refreshCodex = async (id, req) => {
+    const refreshBridge = rig.client.refreshCodex.bind(rig.client) as (id: string,
+      req: Parameters<WorkerClient["refreshCodex"]>[1], expected?: Parameters<WorkerClient["refreshCodex"]>[2]) => ReturnType<WorkerClient["refreshCodex"]>;
+    rig.client.refreshCodex = async (id, req, expected?: Parameters<WorkerClient["refreshCodex"]>[2]) => {
       if (req.capability === bClaim.capability) bRefreshCalls++;
-      return refreshBridge(id, req);
+      return refreshBridge(id, req, expected);
     };
     const run = executor.run.bind(executor);
     executor.run = async ctx => {
@@ -35887,12 +35909,22 @@ describe("Codex repeated actualRunner switching", () => {
       return reply;
     });
 
+    const stopOwnedRun = () => {
+      pending = undefined;
+      cancelled = true;
+      allowBEnd.resolve(); finishBReap.resolve(); allowCEnd.resolve();
+      runner.shutdown();
+      for (let i = 0; i < rig.epochs.length; i++)
+        rig.epochs[i]!.transport.push(turnCompleted("interrupted", savedId, `repeat-${["A", "B", "C"][i]}-turn`));
+    };
+    t.signal.addEventListener("abort", stopOwnedRun, { once: true });
     const running = runner.execute(claim);
     // Attach a rejection handler immediately; finally still joins the original promise.
     void running.catch(() => undefined);
     let cleanupResults: PromiseSettledResult<unknown>[] = [];
     try {
-      await withTimeout(aEntered.promise, 5000, "repeat A admission");
+      await awaitOwnerExecutorEntry(aEntered.promise, running, t.signal,
+        () => JSON.stringify({ applies, factories, launches: rig.providerLaunches() }));
       assert.ok(flight);
       const admitted = flight;
       const identity = { attempt: admitted.attemptId, clone: admitted.runnerClone };
@@ -35926,6 +35958,13 @@ describe("Codex repeated actualRunner switching", () => {
       await withTimeout(ySeen.promise, 5000, "production steering records Y before B ends");
       assert.equal(flight.steering.pendingCredentialSwitchOp()?.opId, "opY");
       allowBEnd.resolve();
+      await withTimeout(bReapEntered.promise, 5000, "B reap begins before C apply");
+      await tick(); // Let already-runnable continuations observe the held reap, without a clock wait.
+      assert.equal(bReapCompleted, false);
+      assert.equal(applies, 1, "C apply stays gated while B reap is unresolved");
+      assert.equal(cMaterialReads, 0, "C material stays gated while B reap is unresolved");
+      assert.equal(rig.providerLaunches(), 2);
+      finishBReap.resolve();
       await withTimeout(cObserved.promise, 5000, "C output and live usage delivered").catch(error => {
         throw new Error(JSON.stringify({ applies, hooks, switches, preflights, releases, reconciledB, bRefreshCalls,
           launches: rig.providerLaunches(), reports, pending,
@@ -35993,15 +36032,20 @@ describe("Codex repeated actualRunner switching", () => {
         "retained B scope refuses dispatch after C publication");
       assert.equal(flight.operationScope, undefined, "API-key C carries no subscription scope");
     } finally {
-      pending = undefined;
-      cancelled = true;
-      allowBEnd.resolve();
-      allowCEnd.resolve();
-      // Release queued responder continuations even if an assertion failed.
-      for (let i = 0; i < rig.epochs.length; i++)
-        rig.epochs[i]!.transport.push(turnCompleted("interrupted", savedId, `repeat-${["A", "B", "C"][i]}-turn`));
-      cleanupResults = await withTimeout(Promise.allSettled([running, ...jobs]), 10000, "repeat runner cleanup join");
-      await fs.rm(dir, { recursive: true, force: true });
+      stopOwnedRun();
+      try {
+        cleanupResults = await Promise.allSettled([running]);
+        // The run has joined: consume every continuation, including jobs appended during shutdown.
+        let joinedJobs = 0;
+        while (joinedJobs < jobs.length) {
+          const batch = jobs.slice(joinedJobs);
+          joinedJobs += batch.length;
+          cleanupResults.push(...await Promise.allSettled(batch));
+        }
+      } finally {
+        t.signal.removeEventListener("abort", stopOwnedRun);
+        await fs.rm(dir, { recursive: true, force: true });
+      }
     }
     for (const result of cleanupResults) if (result.status === "rejected") throw result.reason;
   });
