@@ -32839,6 +32839,7 @@ describe("M2 actualRunner credential replacement", () => {
         await fs.mkdir(path.join(source, "sessions"), { recursive: true });
         await fs.writeFile(path.join(source, "sessions", `rollout-${savedId}.jsonl`), "{}\n");
         await fs.writeFile(path.join(source, "auth.json"), "M2-A-auth-canary");
+        await fs.writeFile(path.join(source, "sessions", "auth-canary.jsonl"), "M2-session-name-canary");
         await fs.writeFile(path.join(source, "unapproved.txt"), "not a session");
         await CodexSessionStore.persist(source, store);
         const policyHolds: PolicyHoldRequest[] = [];
@@ -34985,6 +34986,8 @@ describe("M2 actualRunner credential replacement", () => {
             assert.equal(await fs.readFile(path.join(dest, "sessions", `rollout-${savedId}.jsonl`), "utf8"), "{}\n");
             await assert.rejects(fs.access(path.join(dest, "auth.json")));
             await assert.rejects(fs.access(path.join(dest, "unapproved.txt")));
+            await assert.rejects(fs.access(path.join(dest, "sessions", "auth-canary.jsonl")),
+              "switch adoption excludes auth-named session artifacts");
           }
           const feed = api.messages(claim.run_id);
           if (resumeRefusal) {
