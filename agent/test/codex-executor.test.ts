@@ -32372,7 +32372,7 @@ describe("M2 actualRunner credential replacement", () => {
   for (const [oldClaim, target] of [[SUBSCRIPTION, API_KEY], [API_KEY, SUBSCRIPTION],
     [SUBSCRIPTION, { ...SUBSCRIPTION, generation: 20, chatgpt_account_id: "M2-B-account" }]] as const) {
     for (const phase of ["factory", "already-running-body"] as const) {
-      for (const publication of ["resume-cleanup-cancel", "resume-policy-ack-lost", "resume-policy-ack-pending", "resume-preserve-pending", "resume-preserve-nonce", "resume-preserve-sequence-refused", "resume-refuse-preserve", "resume-refuse-fresh", "resume-uncertain", "baseline", "clean-apply-uncertain", "clean-successor-epoch-advance", "clean-pending-disappears", "clean-stopped-lost-reply", "clean-stopped-unconfirmed", "clean-stopped-unsupported", "clean-stopped-withdrawn", "clean-stopped-already-paused", "root-reap-unproven", "preflight-target-mismatch", "preflight-foreign-op", "preflight-busy-ready", "preflight-transport-ready", "persist-clear-confirmed", "persist-clear-owner-lost", "persist-clear-nonce-changed", "persist-clear-rejected", "persist-clear-lost-reply", "persist-clear-empty-reply", "persist-clear-pending", "inspect-missing-clear-confirmed", "inspect-unknown-clear-confirmed", "gated", "before-scope-clear", "after-scope-clear", "before-scope-install", "after-scope-install", "before-executor-publication", "before-Now-publication", "after-Now-publication", "before-B-preparation", "Now-finish-false", "publish-failure", "now-publish-failure", "login-failure", "subscription-refresh", "api-key-refresh", "subscription-refresh-prepare-failure", "subscription-refresh-cancel", "crash-after-a-teardown-recovery", "crash-apply-reply-lost-recovery", "crash-apply-ack-recovery", "crash-login-recovery"] as const) {
+      for (const publication of ["resume-cleanup-cancel", "resume-cleanup-shutdown", "resume-cleanup-followup", "resume-policy-ack-lost", "resume-policy-ack-pending", "resume-preserve-pending", "resume-preserve-nonce", "resume-preserve-sequence-refused", "resume-refuse-preserve", "resume-refuse-fresh", "resume-uncertain", "baseline", "clean-apply-uncertain", "clean-successor-epoch-advance", "clean-pending-disappears", "clean-stopped-lost-reply", "clean-stopped-unconfirmed", "clean-stopped-unsupported", "clean-stopped-withdrawn", "clean-stopped-already-paused", "root-reap-unproven", "preflight-target-mismatch", "preflight-foreign-op", "preflight-busy-ready", "preflight-transport-ready", "persist-clear-confirmed", "persist-clear-owner-lost", "persist-clear-nonce-changed", "persist-clear-rejected", "persist-clear-lost-reply", "persist-clear-empty-reply", "persist-clear-pending", "inspect-missing-clear-confirmed", "inspect-unknown-clear-confirmed", "gated", "before-scope-clear", "after-scope-clear", "before-scope-install", "after-scope-install", "before-executor-publication", "before-Now-publication", "after-Now-publication", "before-B-preparation", "Now-finish-false", "publish-failure", "now-publish-failure", "login-failure", "subscription-refresh", "api-key-refresh", "subscription-refresh-prepare-failure", "subscription-refresh-cancel", "crash-after-a-teardown-recovery", "crash-apply-reply-lost-recovery", "crash-apply-ack-recovery", "crash-login-recovery"] as const) {
         if (publication !== "baseline" && (phase !== "factory" || (oldClaim !== API_KEY && target !== API_KEY))) continue;
         if (publication === "subscription-refresh" && target.auth_mode !== "subscription") continue;
         if (publication === "api-key-refresh" && target.auth_mode !== "api_key") continue;
@@ -32386,7 +32386,10 @@ describe("M2 actualRunner credential replacement", () => {
         const policyAckPending = publication === "resume-policy-ack-pending";
         const policyDeliveryUnknown = policyAckLost || policyAckPending;
         const preserveCleanupCancel = publication === "resume-cleanup-cancel";
-        const resumePreserve = publication === "resume-refuse-preserve" || preserveNegative || policyDeliveryUnknown || preserveCleanupCancel;
+        const preserveCleanupShutdown = publication === "resume-cleanup-shutdown";
+        const preserveCleanupFollowup = publication === "resume-cleanup-followup";
+        const preserveCleanup = preserveCleanupCancel || preserveCleanupShutdown || preserveCleanupFollowup;
+        const resumePreserve = publication === "resume-refuse-preserve" || preserveNegative || policyDeliveryUnknown || preserveCleanup;
         const resumeVariant = resumeRefusal || resumeUncertain || resumePreserve;
         if (resumeVariant && (oldClaim !== API_KEY || target !== SUBSCRIPTION || phase !== "factory")) continue;
         const successorEpochAdvance = publication === "clean-successor-epoch-advance";
@@ -32434,6 +32437,8 @@ describe("M2 actualRunner credential replacement", () => {
       it((publication === "baseline"
         ? `M2 actualRunner ${oldClaim.auth_mode} to ${target.auth_mode} ${phase} account resumes saved thread`
         : preserveCleanupCancel ? "Codex real Runner cancellation during B cleanup takes precedence over preserve-only policy hold"
+        : preserveCleanupShutdown ? "Codex real Runner shutdown during B cleanup retains a nonterminal preserve-only source"
+        : preserveCleanupFollowup ? "Codex real Runner follow-up during B cleanup routes without model delivery before policy re-hold"
         : resumeRefusal ? "Codex real Runner confirmed B resume refusal starts exactly one fresh lineage"
         : preserveNegative ? `Codex real Runner preserve-only B resume fences handoff (${publication})`
         : policyDeliveryUnknown ? `Codex real Runner preserves B resume refusal with unknown policy delivery (${publication})`
@@ -32698,7 +32703,22 @@ describe("M2 actualRunner credential replacement", () => {
           if (clearAcknowledged) postAckOwnership.push({ claim_generation: ownership.claim_generation ?? 0, claim_released: ownership.claim_released === true });
           return ownership;
         };
-        client.getInputs = async () => ({ inputs: [], nowSummary: true, ...((cancelled || (baselineProofFinished && api.messages(claim.run_id).some(m => m.kind === "progress_note" && m.credential_epoch_ordinal === 1 && String(m.payload.text).startsWith("Inspecting B")))) ? { terminalCancelled: { run_id: claim.run_id, generation: 7 } } : {}),
+        const originalGetInputs = client.getInputs.bind(client);
+        const followupId = 4202001;
+        const followupApplied = installerBarrier();
+        let followupDeliveredBefore: number | undefined;
+        if (preserveCleanupFollowup) {
+          api.setInputClaimGeneration(claim.run_id, 7);
+          const applyInputs = client.applyInputs.bind(client);
+          t.mock.method(client, "applyInputs", async (...args: Parameters<typeof applyInputs>) => {
+            const receipt = await applyInputs(...args);
+            if (args[0] === claim.run_id && args[1].includes(followupId) && receipt.active &&
+                receipt.inputs.some(input => input.id === followupId)) followupApplied.resolve();
+            return receipt;
+          });
+        }
+        client.getInputs = async (...args) => ({ ...(preserveCleanupFollowup
+          ? await originalGetInputs(...args) : { inputs: [] }), nowSummary: true, ...((cancelled || (baselineProofFinished && api.messages(claim.run_id).some(m => m.kind === "progress_note" && m.credential_epoch_ordinal === 1 && String(m.payload.text).startsWith("Inspecting B")))) ? { terminalCancelled: { run_id: claim.run_id, generation: 7 } } : {}),
           ...(pending ? { credentialSwitch: { generation: 7, op_id: pendingOp, target_secret_id: "M2-target" } } : {}) });
         client.preflightCodexCredentialSwitch = async (runId, req) => {
           preflights++; events.push("preflight");
@@ -32751,6 +32771,7 @@ describe("M2 actualRunner credential replacement", () => {
             return { kind: "superseded" };
           }
           pending = false;
+          if (preserveCleanupFollowup) api.clearCredentialSwitch(claim.run_id);
           committedCodex = next; // Simulated committed row, not evidence of DB durability.
           if (cleanApplyUncertain) return { kind: "uncertain", detail: "transport" };
           if (crashRecovery) await publicationBoundary("apply-reply-lost");
@@ -32957,7 +32978,7 @@ describe("M2 actualRunner credential replacement", () => {
         const a = rig.epochs[0]!, b = rig.epochs[1]!;
         const bReap = b.root.reap.bind(b.root);
         b.root.reap = async ms => {
-          if (preserveCleanupCancel) {
+          if (preserveCleanup) {
             bCleanupEntered.resolve();
             await bCleanupContinue.promise;
           }
@@ -33374,7 +33395,7 @@ describe("M2 actualRunner credential replacement", () => {
         const epochProbe = mock.method(epochBuilder, "startProviderEpoch", async (...args: unknown[]) => {
           const epoch = await startProviderEpoch(...args);
           const epochIndex = epochBuilds++;
-          if (publication === "gated" || injectedStage || preserveCleanupCancel) {
+          if (publication === "gated" || injectedStage || preserveCleanup) {
             // Read the actual auth owner retained by the returned harness. Its config
             // retains the same bridge object that the read-path auth interceptor calls.
             const auth = (epoch.harness as unknown as { appServerAuth?: {
@@ -33452,6 +33473,7 @@ describe("M2 actualRunner credential replacement", () => {
           policyHold?: { outcomeId: string };
           batcher: MessageBatcher;
           steering: SteeringChannel;
+          active?: { shuttingDown: boolean };
         };
         const flightBuilder = runner as unknown as { buildFlight(...args: unknown[]): ObservedFlight };
         const buildFlight = flightBuilder.buildFlight;
@@ -34164,7 +34186,7 @@ describe("M2 actualRunner credential replacement", () => {
               for (const handle of fileops) assert.ok(handle.disposed() > 0);
               return;
             }
-            if (preserveCleanupCancel) {
+            if (preserveCleanup) {
               await withTimeout(switchSettled.promise, 5000, "preserving switch rejection observed");
               assert.ok(switchError instanceof PolicyContinuationRejected);
               assert.equal(switchError.cause, "provider_resume_rejected");
@@ -34200,43 +34222,100 @@ describe("M2 actualRunner credential replacement", () => {
               assert.equal(credentialReleases, releasesAtResume, "dispatch/Now probes release no material");
               assert.deepEqual([a.transport.requests.length, b.transport.requests.length], sends);
               assert.ok(context.terminalLifecycleSignal);
-              const signal = context.terminalLifecycleSignal;
-              const stopped = installerBarrier();
-              signal.addEventListener("abort", () => stopped.resolve(), { once: true });
-              cancelled = true; // getInputs delivers the committed terminal cancellation.
-              if (signal.aborted) stopped.resolve();
-              await withTimeout(stopped.promise, 5000, "Runner observes cancellation during B cleanup");
-              assert.equal(actualFlight.steering.claimFence(), "terminal_cancelled");
-              assert.equal(signal.aborted, true);
-              bCleanupContinue.resolve();
-              await withTimeout(running, 5000, "cancelled preserving refusal joins cleanup");
-              await joinNowConsumerProbes();
-              assert.deepEqual(policyAttempts, [], "cancellation wins before policy selection");
-              assert.equal(actualFlight.policyHold, undefined);
-              assert.ok(!reports.some(status => ["completed", "failed"].includes(status)));
-              assert.deepEqual(reports.filter(status => status.startsWith("credential_switch")), []);
-              assert.equal(custodyReleases, 0);
-              assert.equal(credentialReleases, releasesAtResume);
-              assert.equal(credentialRefreshes, refreshesAtResume);
-              assert.equal(ordinaryBRefreshes, 0);
-              assert.equal(reopenAttempts, 0);
-              assert.equal(bFinished, false);
-              assert.equal(factories, 1);
-              assert.equal(rig.providerLaunches(), 2);
-              assert.equal(a.transport.turnStartCount, 1);
-              assert.equal(b.transport.turnStartCount, 0);
-              assert.equal(a.transport.threadStartCount, 0);
-              assert.equal(b.transport.threadStartCount, 0);
-              assert.deepEqual(resumedThreads, [savedId]);
-              assert.equal(nowBuilds.length, 1);
-              assert.equal(nowRuns.length, 0);
-              for (const epoch of rig.epochs) {
-                assert.ok(epoch.reaped() > 0, "provider root joined after cancellation");
-                assert.ok(epoch.disposed() > 0, "provider transport joined after cancellation");
+              if (preserveCleanupFollowup) {
+                followupDeliveredBefore = actualFlight.steering.getLastDeliveredFollowUpId();
+                api.appendInputs(claim.run_id, [{ id: followupId, kind: "follow_up", body: "Keep the saved conversation and inspect the retained work." }]);
+                await withTimeout(followupApplied.promise, 5000, "real follow-up ACK routes before active APPLIED");
+                assert.equal(api.isAcked(claim.run_id, followupId), true);
+                assert.equal(api.isApplied(claim.run_id, followupId), true);
+                for (const kind of ["ack", "applied"] as const)
+                  assert.ok(api.inputReceiptCalls.some(call => call.runId === claim.run_id &&
+                    call.kind === kind && call.generation === 7 && call.ids.includes(followupId)));
+                assert.ok(actualFlight.steering.operatorConstraints()?.includes("Keep the saved conversation and inspect the retained work."),
+                  "active ACK routed the actual follow-up body");
+                assert.equal(actualFlight.steering.getLastDeliveredFollowUpId(), followupDeliveredBefore,
+                  "routing and APPLIED do not prove model delivery");
+                assert.equal(api.inclusionCalls.some(call => call.runId === claim.run_id && call.ids.includes(followupId)), false);
+                assert.equal(b.transport.turnStartCount, 0);
+                assert.equal(policyAttempts.length, 0);
+                assert.equal(credentialReleases, releasesAtResume);
+                assert.equal(credentialRefreshes, refreshesAtResume);
+                bCleanupContinue.resolve();
+              } else {
+                const signal = context.terminalLifecycleSignal;
+                const stopped = installerBarrier();
+                signal.addEventListener("abort", () => stopped.resolve(), { once: true });
+                if (preserveCleanupShutdown) {
+                  assert.ok(actualFlight.active, "observe the active record installed by buildContext");
+                  assert.equal(actualFlight.active.shuttingDown, false);
+                  runner.shutdown();
+                  assert.equal(actualFlight.active.shuttingDown, true);
+                  assert.equal(actualFlight.steering.isCancelled(), false);
+                  assert.equal(actualFlight.steering.claimFence(), undefined);
+                  const checkpoint = actualFlight.steering.workerShutdownCheckpoint();
+                  assert.ok(checkpoint);
+                  const lifecycle = actualFlight.steering.lifecycleSignal();
+                  assert.equal(lifecycle.aborted, true);
+                  assert.equal(actualFlight.steering.terminalLifecycleSignal().aborted, true);
+                  actualFlight.steering.rearmLifecycle();
+                  assert.equal(actualFlight.steering.lifecycleSignal(), lifecycle);
+                  assert.equal(actualFlight.steering.workerShutdownCheckpoint(), checkpoint);
+                } else {
+                  cancelled = true; // getInputs delivers the committed terminal cancellation.
+                }
+                if (signal.aborted) stopped.resolve();
+                await withTimeout(stopped.promise, 5000, "Runner observes stop during B cleanup");
+                assert.equal(actualFlight.steering.claimFence(), preserveCleanupShutdown ? undefined : "terminal_cancelled");
+                assert.equal(signal.aborted, true);
+                bCleanupContinue.resolve();
+                await withTimeout(running, 5000, "stopped preserving refusal joins cleanup");
+                await joinNowConsumerProbes();
+                assert.deepEqual(policyAttempts, [], "stop wins before policy selection");
+                assert.equal(actualFlight.policyHold, undefined);
+                assert.ok(!reports.some(status => ["completed", "failed", ...(preserveCleanupShutdown ? ["cancelled", "paused"] : [])].includes(status)));
+                if (preserveCleanupShutdown) {
+                  assert.equal(actualFlight.steering.isCancelled(), false);
+                  assert.equal(actualFlight.preserveRecoveryClone, true);
+                  assert.equal(actualFlight.preserveSession, true);
+                  assert.equal(actualFlight.keepGuardedInventoryOpen, true);
+                  assert.equal(actualFlight.worktreePath, worktree);
+                  assert.equal(cleanOwnership.status, "running");
+                  assert.deepEqual(policyHolds, []);
+                  assert.ok(sourceJournal);
+                  assert.equal(spawnSync("git", ["-C", m2Runner.git.barePathFor(m2Runner.fx.originPath), "config",
+                    `uzi-recovery.${sourceBranch}.clone`], { env: gitEnv(), encoding: "utf8" }).stdout.trim(), sourceJournal);
+                  assert.equal(await fs.readFile(path.join(worktree, "M2-retained.txt"), "utf8"), "A work");
+                  assert.equal(await CodexSessionStore.inspectSession(store, savedId), "present");
+                  assert.equal(await CodexSessionStore.inspectSession(path.join(m2Runner.homeDir, "codex-session-store"), savedId), "present");
+                  assert.equal(committedCodex, next);
+                  assert.equal(applies, 1);
+                  assert.equal(applyAcknowledgements, 1);
+                  assert.deepEqual(teardownResults, [true]);
+                }
+                assert.deepEqual(reports.filter(status => status.startsWith("credential_switch")), []);
+                assert.equal(custodyReleases, 0);
+                assert.equal(credentialReleases, releasesAtResume);
+                assert.equal(credentialRefreshes, refreshesAtResume);
+                assert.equal(ordinaryBRefreshes, 0);
+                assert.equal(reopenAttempts, 0);
+                assert.equal(bFinished, false);
+                assert.equal(factories, 1);
+                assert.equal(rig.providerLaunches(), 2);
+                assert.equal(a.transport.turnStartCount, 1);
+                assert.equal(b.transport.turnStartCount, 0);
+                assert.equal(a.transport.threadStartCount, 0);
+                assert.equal(b.transport.threadStartCount, 0);
+                assert.deepEqual(resumedThreads, [savedId]);
+                assert.equal(nowBuilds.length, 1);
+                assert.equal(nowRuns.length, 0);
+                for (const epoch of rig.epochs) {
+                  assert.ok(epoch.reaped() > 0, "provider root joined after stop");
+                  assert.ok(epoch.disposed() > 0, "provider transport joined after stop");
+                }
+                assert.equal(disposedEffects.size, effects, "all effect roots joined");
+                for (const handle of fileops) assert.ok(handle.disposed() > 0);
+                return;
               }
-              assert.equal(disposedEffects.size, effects, "all effect roots joined");
-              for (const handle of fileops) assert.ok(handle.disposed() > 0);
-              return;
             }
             if (resumePreserve) {
               await withTimeout(running, 5000, "confirmed B refusal reaches policy re-hold").catch(error => {
@@ -34249,6 +34328,13 @@ describe("M2 actualRunner credential replacement", () => {
               assert.equal(switchError.cause, "provider_resume_rejected");
               const policyFlight = actualFlight as unknown as { policyReservation?: symbol; cancel: AbortController; steering: SteeringChannel };
               const assertRetainedPolicy = async (held: PolicyHoldRequest) => {
+                if (preserveCleanupFollowup) {
+                  assert.notEqual(followupDeliveredBefore, undefined);
+                  assert.equal(actualFlight!.steering.getLastDeliveredFollowUpId(), followupDeliveredBefore);
+                  assert.equal(api.inclusionCalls.some(call => call.runId === claim.run_id && call.ids.includes(followupId)), false);
+                  assert.equal(api.isAcked(claim.run_id, followupId), true);
+                  assert.equal(api.isApplied(claim.run_id, followupId), true);
+                }
                 assert.equal(held.cause, "provider_resume_rejected");
                 assert.equal(held.detail, "resume_rejected");
                 assert.equal(held.continuation_mode, "same_conversation");
