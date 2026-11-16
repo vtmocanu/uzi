@@ -839,6 +839,11 @@ describe("a FIRST-read Git inventory stdout overflow is a settled keep; its repe
     });
   }
   it("the final topology snapshot, when the store grows past the directory entry limit between the reads", async t => {
+    // Force the formerly hard-coded fan-out to contain a real loose object.
+    const collision = execFileSync("git", ["-C", bare, "hash-object", "-w", "--stdin"], {
+      env: ENV, input: "fanout collision 58\n", encoding: "utf8",
+    }).trim();
+    assert.match(collision, /^ee/);
     let limit = 0;
     for (let n = 5; n < 400 && !limit; n++) {
       try { await observeStores({ maxDirectoryEntries: n }); limit = n; } catch { /* below the store's own size */ }
@@ -849,7 +854,14 @@ describe("a FIRST-read Git inventory stdout overflow is a settled keep; its repe
     let inventories = 0;
     t.mock.method(git as unknown as { runGitAsRunner: typeof original }, "runGitAsRunner", async (...args: Parameters<typeof original>) => {
       // An empty fan-out directory is invisible to Git and counts as two entries in the next snapshot.
-      if (args[1].includes("--batch-all-objects") && ++inventories === 2) fs.mkdirSync(path.join(objectDir(bare), "ee"));
+      if (args[1].includes("--batch-all-objects") && ++inventories === 2) {
+        const objects = objectDir(bare);
+        const occupied = new Set(fs.readdirSync(objects));
+        const unused = Array.from({ length: 256 }, (_, n) => n.toString(16).padStart(2, "0"))
+          .find(name => !occupied.has(name));
+        assert.ok(unused, "fixture requires an unused two-hex object fan-out directory");
+        fs.mkdirSync(path.join(objects, unused));
+      }
       return original(...args);
     });
     // The repeat is a topology read like the first: past the limit it is UNKNOWN by the same rule.
