@@ -679,6 +679,17 @@ wf "$REPOC/docs/unrelated.md" <<'MD'
 # Unrelated notes
 This file mentions no migration number and must be left alone.
 MD
+wf "$REPOC/api/internal/store/pins_test.go" <<'GO'
+package store
+
+func migrationPins() {
+    MigrateTo(ctx, dsn, 230)
+    MigrateDownTo(ctx, dsn,
+        231,
+    )
+    MigrateTo(ctx, dsn, 1230)
+}
+GO
 git -C "$REPOC" add -A
 git -C "$REPOC" commit -q -m "branch: docs referencing old draft numbers"
 
@@ -715,6 +726,10 @@ assert_contains "C: postflight suggests 00231 -> 00233" "00231 -> 00233" "$C_OUT
 assert_eq     "C: docs/x.md content UNCHANGED (not auto-edited)" "$DOCS_X_BEFORE" "$(cat "$REPOC/docs/x.md")"
 assert_eq     "C: unrelated file UNCHANGED"                      "$UNREL_BEFORE"  "$(cat "$REPOC/docs/unrelated.md")"
 assert_absent "C: unrelated file NOT in the postflight report"   "unrelated.md"   "$C_OUT"
+assert_contains "C: plain MigrateTo pin reported" "pins_test.go:4  230 -> 232" "$C_OUT"
+assert_contains "C: multiline MigrateDownTo pin reported" "pins_test.go:6  231 -> 233" "$C_OUT"
+assert_absent "C: longer integer is not a matching pin" "1230 ->" "$C_OUT"
+assert_contains "C: ambiguous integer pins left for manual review" "MigrateTo(ctx, dsn, 230)" "$(cat "$REPOC/api/internal/store/pins_test.go")"
 
 # the numbering self-check is GREEN in the renumbered tree (rc 0).
 ( cd "$REPOC" && ./scripts/check-migration-numbering.sh scripts/migration-numbering-canary "$MIGDIR" ) >/dev/null 2>&1

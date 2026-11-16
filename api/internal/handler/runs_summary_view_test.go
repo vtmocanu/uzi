@@ -14,15 +14,15 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// Issue #2661: GET /api/runs and /api/admin/runs accept ?view=summary, which drops the four
-// heavy detail keys from every row and changes nothing else.
+// Issue #2661: GET /api/runs and /api/admin/runs accept ?view=summary, which omits
+// the detail and run-start choice keys listed below from every row.
 
 // The run-start choice keys (PRD #3250) are omitted from the summary too: a deliberate wire
 // decision pinned by apitypes.summaryOmitted, not a size cut.
 var summaryHeavyKeys = []string{"plan_md", "repo_agents", "repo_agent_source_commit", "issue_description", "preserved_patch",
 	"effort", "model_source", "effort_source"}
 
-// heavyRun is a store.Run with all four heavy fields populated, so the default view really
+// heavyRun populates the fields omitted from the summary, so the default view
 // carries them and a leaked key in the summary view is detectable.
 func heavyRun(ownerID uuid.UUID) store.Run {
 	return store.Run{
