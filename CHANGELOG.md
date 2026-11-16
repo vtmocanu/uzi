@@ -225,6 +225,15 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **A lead's report_progress call may name a single milestone id ([#4361](https://github.com/vtmocanu/uzi/pull/4361)).**
   The Claude harness accepts a bare string for `completed` or `in_progress` and records it as one id instead of rejecting the call.
 
+- **Docker worker hibernation inventories no longer count the DinD cache prune as covered ([#4369](https://github.com/vtmocanu/uzi/pull/4369), [#4391](https://github.com/vtmocanu/uzi/pull/4391)).**
+  A cache prune's client can exit before the daemon finishes, so every Docker worker's inventory now names `dind_prune` as an uncovered writer and stays incomplete.
+
+- **Board column headers stay visible while you scroll ([#4315](https://github.com/vtmocanu/uzi/pull/4315), [#4390](https://github.com/vtmocanu/uzi/pull/4390)).**
+  On wide screens the board scrolls in its own area below the toolbar, so every column header stays pinned while horizontal column scroll still works.
+
+- **A hosted worker that was the canary of a finished image roll can be hibernated again (Refs #4384) ([#4393](https://github.com/vtmocanu/uzi/pull/4393)).**
+  The controller retires the worker's completed roll history before sleep when no other worker in the namespace that is not positively attributed to a different owner carries roll metadata; otherwise it refuses with `roll_cohort_cleanup_pending` and can be retried.
+
 ### Added
 
 - **A preview of the new Overview at /overview/next, decisions first ([#3878](https://github.com/vtmocanu/uzi/pull/3878), [#3952](https://github.com/vtmocanu/uzi/pull/3952)).**
@@ -364,6 +373,9 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 - **Admins can turn on automatic hibernation of idle hosted workers ([#4207](https://github.com/vtmocanu/uzi/pull/4207), [#4363](https://github.com/vtmocanu/uzi/pull/4363)).**
   Off by default behind `worker_hibernation_auto` (effective only with `worker_hibernation_enabled`); a persistent hosted worker with no run activity of any kind for `worker_hibernation_idle_after` (default 14 days) is hibernated, at most 10 per minute, and every completed wake restarts the idle clock; refusals are recorded and a controller refusal pauses retries for 1 hour; enable it only after the #4206 cache cleanup and its worker support are deployed; a new instance-scoped `fleet.hibernation` Admin health check names blocked idle workers and long-parked runs; downgrading needs `worker_hibernation_auto` off, then the three #4207 migrations rolled back before an older api starts; they add worker columns, two CHECK constraints (validated in the next migration), a backfill of the wake anchor and two runs indexes, and rolling them back drops the recorded refusal markers and wake anchors. Automatic mode is rechecked for each locked candidate; an off or unreadable result prevents admission.
+
+- **Admins can see why an idle hosted worker is not hibernating and what the controller holds for a roll ([#4385](https://github.com/vtmocanu/uzi/pull/4385), [#4394](https://github.com/vtmocanu/uzi/pull/4394)).**
+  `fleet.hibernation` names the controller's refusal, worker JSON carries `hibernation_blocked_reason`, `hibernation_blocked_since` and `hibernation_blocked_at` (the last recorded blocker, not cleared when the worker returns to work) and a display-only `roll_marker` for hosted workers, and the CLI and admin health card print them; the controller stays the authority.
 
 ### Changed
 
@@ -524,6 +536,9 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 - **Release reference for the credential redaction change (3cec5121f).**
   The same change as the entry above, listed under its current short commit ID.
+
+- **Agent dependencies include patched Hono packages (Refs #4378) ([#4381](https://github.com/vtmocanu/uzi/pull/4381)).**
+  Update the transitive hono and @hono/node-server lockfile entries to 4.13.18 and 2.1.8, clearing their reported advisories.
 
 ## [0.86.1] - 2026-11-05
 
