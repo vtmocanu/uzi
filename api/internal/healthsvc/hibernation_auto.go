@@ -48,6 +48,8 @@ func controllerRefusalLabel(code string) string {
 		return "layout migration held"
 	case "roll_evidence_unavailable":
 		return "roll evidence unavailable"
+	case "roll_cohort_cleanup_pending":
+		return "roll cohort cleanup pending"
 	}
 	return cutBytes(orDash(safe(code)), hibernationControllerReasonBytes)
 }

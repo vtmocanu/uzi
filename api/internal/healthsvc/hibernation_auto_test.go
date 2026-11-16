@@ -232,13 +232,14 @@ func TestFleetHibernationAuto(t *testing.T) {
 	})
 	t.Run("every known controller reason has its label", func(t *testing.T) {
 		want := map[string]string{
-			"roll_reservation":          "roll reservation",
-			"roll_blocked":              "roll blocked",
-			"disk_pressure":             "disk pressure",
-			"dind_maintenance":          "DinD maintenance",
-			"busy":                      "busy",
-			"layout_migration_held":     "layout migration held",
-			"roll_evidence_unavailable": "roll evidence unavailable",
+			"roll_reservation":            "roll reservation",
+			"roll_blocked":                "roll blocked",
+			"disk_pressure":               "disk pressure",
+			"dind_maintenance":            "DinD maintenance",
+			"busy":                        "busy",
+			"layout_migration_held":       "layout migration held",
+			"roll_evidence_unavailable":   "roll evidence unavailable",
+			"roll_cohort_cleanup_pending": "roll cohort cleanup pending",
 		}
 		for code, label := range want {
 			if got := controllerRefusalLabel(code); got != label {

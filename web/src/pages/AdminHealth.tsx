@@ -605,6 +605,7 @@ const CONTROLLER_REFUSAL_LABELS: Record<string, string> = {
   busy: "busy",
   layout_migration_held: "layout migration held",
   roll_evidence_unavailable: "roll evidence unavailable",
+  roll_cohort_cleanup_pending: "roll cohort cleanup pending",
 };
 
 const ROLL_MARKER_STATE_TEXT: Record<string, string> = {
