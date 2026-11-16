@@ -1131,11 +1131,15 @@ async function mainBody(): Promise<void> {
     isIdle: () => worker?.isIdle() ?? false,
   });
   notifyRetained = () => { void retainedSource.reportRetained(); };
-  // PRD #4208 M1: the hibernation inventory participates only where an exclusion mechanism is
+  // PRD #4208 M1: the hibernation inventory runs its exclusion only where a mechanism is
   // proven: the DinD lane (Docker wired, not the isolated lane) holding the pod-epoch lock in a
-  // supported mode. Its presence is what advertises `hibernation_inventory_v1`. The census seam walks the
+  // supported mode (`laneSupported`). Its presence is what advertises `hibernation_inventory_v1`.
+  // A Docker-scoped worker without that mechanism (degraded wiring: sidecar expected but no daemon
+  // reachable, or epoch mode unsupported/undefined) still builds the controller and answers
+  // `unsupported` naming dind_prune (#4369), taking no gate, latch or EX. The census seam walks the
   // whole data volume (hibernation-census.ts); the shutdown seam recomputes only the walk fingerprint.
-  if (hibernationParticipates(config, epochOwnership?.mode)) {
+  const hibWiring = hibernationControllerWiring(config, process.env, epochOwnership?.mode);
+  if (hibWiring) {
     // The volume census (hibernation-census.ts): top-level names come from the same config the writers use, the worker's
     // own TMPDIR is walked like everything else (a non-empty one is unknown), and the scratch root is the shipped layout's.
     const scratch = scratchLayout(process.env);
@@ -1152,7 +1156,8 @@ async function mainBody(): Promise<void> {
       gate: dindGate,
       client,
       ownership: epochOwnership,
-      laneSupported: true,
+      laneSupported: hibWiring.laneSupported,
+      dockerStorage: hibWiring.dockerStorage,
       podUid: () => process.env.UZI_POD_UID,
       isIdle: () => worker?.isIdle() ?? false,
       proof: () => terminalMaintenanceProof(3, config.dockerWiring.dockerHost),
@@ -1312,9 +1317,10 @@ async function mainBody(): Promise<void> {
 }
 
 /**
- * Whether this worker builds the hibernation inventory controller (and so advertises
- * `hibernation_inventory_v1`): the DinD lane only (Docker wired, not the isolated fetcher lane)
- * holding the pod-epoch lock in a supported mode (`ownershipMode` undefined = no epoch ownership).
+ * Whether the hibernation lane supports exclusion (`laneSupported`): the DinD lane only (Docker
+ * wired, not the isolated fetcher lane) holding the pod-epoch lock in a supported mode
+ * (`ownershipMode` undefined = no epoch ownership). It does not decide whether the controller is
+ * built or the capability advertised; that is `hibernationDockerScope`.
  */
 export function hibernationParticipates(
   config: { dockerWiring: { dockerHost?: string }; fetcherUrl?: string; fetcherCaFile?: string },
@@ -1322,6 +1328,32 @@ export function hibernationParticipates(
 ): boolean {
   return config.dockerWiring.dockerHost !== undefined && !(config.fetcherUrl && config.fetcherCaFile) &&
     ownershipMode !== undefined && ownershipMode !== "unsupported";
+}
+
+/**
+ * The controller deps decision for mainBody: undefined when no controller is built (outside
+ * Docker scope), else whether exclusion can run on this lane and that Docker storage is in scope.
+ */
+export function hibernationControllerWiring(
+  config: { dockerWiring: { dockerHost?: string }; fetcherUrl?: string; fetcherCaFile?: string },
+  env: NodeJS.ProcessEnv,
+  ownershipMode: string | undefined,
+): { laneSupported: boolean; dockerStorage: true } | undefined {
+  if (!hibernationDockerScope(config, env)) return undefined;
+  return { laneSupported: hibernationParticipates(config, ownershipMode), dockerStorage: true };
+}
+
+/**
+ * Whether the worker's inventory scope includes Docker daemon storage: a daemon is wired or the
+ * DinD sidecar is expected, outside the isolated fetcher lane. Such a worker always builds the
+ * hibernation controller so it can name `dind_prune` uncovered (or answer `unsupported`).
+ */
+export function hibernationDockerScope(
+  config: { dockerWiring: { dockerHost?: string }; fetcherUrl?: string; fetcherCaFile?: string },
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return (config.dockerWiring.dockerHost !== undefined || dockerSidecarExpected(env)) &&
+    !(config.fetcherUrl && config.fetcherCaFile);
 }
 
 /**

@@ -366,6 +366,11 @@ first step, a **dry run**: **no volume is deleted**, and no setting turns deleti
   Docker prune configuration. Its client can close before the daemon has finished
   pruning, so local child settlement cannot prove writer exclusion. Pressure
   cleanup continues with its existing behavior; the volumes remain protected.
+- **Idle cache prune.** Every Docker worker's inventory also reports the uncovered
+  writer `dind_prune` (the idle cache prune) and is incomplete, whether or not the
+  prune is enabled. A Docker worker whose daemon socket never came up, or whose
+  pod-epoch lock mode is unsupported, answers `unsupported` naming it. The prune
+  client can close before the daemon finishes, so retirement stays blocked.
 - **Conditional only.** A worker that nothing blocks is reported as "would retire
   only after M2 verifies": the volumes' actual PV reclaim policy, and that no
   other pod mounted them between the controller's observations (only sampled in

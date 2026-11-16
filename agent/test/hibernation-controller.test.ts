@@ -57,6 +57,7 @@ function rig(over: Partial<HibernationDeps> = {}) {
     },
     ownership: ownership as never,
     laneSupported: true,
+    dockerStorage: true,
     podUid: () => AWAITING.pod_uid,
     isIdle: () => true,
     proof: async () => {
@@ -98,8 +99,8 @@ describe("HibernationInventoryController", () => {
     assert.equal(body.pod_uid, AWAITING.pod_uid);
     assert.equal(body.deployment_resource_version, AWAITING.deployment_resource_version);
     assert.deepEqual(body.pvcs, AWAITING.pvcs);
-    assert.deepEqual(body.exclusion, { lane: "dind", mechanism: "epoch_ex+latch+quiescence", uncovered: [] });
-    assert.equal(body.complete, true);
+    assert.deepEqual(body.exclusion, { lane: "dind", mechanism: "epoch_ex+latch+quiescence", uncovered: ["dind_prune"] });
+    assert.equal(body.complete, false, "a Docker-scoped inventory is never complete: dind_prune is uncovered");
     assert.equal(r.gate.claimsClosed(), true);
     assert.equal(r.registry.isLatched(), true);
     assert.deepEqual(r.c.exclusionReport(), { op_id: AWAITING.op_id, held: true });
@@ -129,7 +130,7 @@ describe("HibernationInventoryController", () => {
     r.registry.markUncovered("w1");
     await feed(r, AWAITING);
     const body = r.posts[0] as unknown as { complete: boolean; exclusion: { uncovered: string[] } };
-    assert.deepEqual(body.exclusion.uncovered, ["w1", "c1"]);
+    assert.deepEqual(body.exclusion.uncovered, ["w1", "dind_prune", "c1"]);
     assert.equal(body.complete, false, "an otherwise complete census is incomplete with uncovered writers");
   });
 
