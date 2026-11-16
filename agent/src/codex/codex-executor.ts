@@ -5741,10 +5741,15 @@ export class CodexExecutor implements Executor {
             assertRefreshAdmission: () => { authority.assertCurrent(); this.assertCaptureAdmission(revision); },
             bridge: this.lifetimeBoundRefreshBridge(buildAppServerRefreshBridge(ctx.runId, {
               refreshCodex: async (...args) => {
+                // Ordinary refresh cannot borrow B's preparation authority while
+                // the complete replacement bundle remains closed to consumers.
+                this.assertSwitchAdmission();
                 await this.settleOwnedSummariesBeforeCredentials();
+                this.assertSwitchAdmission();
                 this.assertCaptureAdmission(revision);
                 authority.assertCurrent();
                 const result = await this.lifetime.admit(() => this.opts.client.refreshCodex(...args));
+                this.assertSwitchAdmission();
                 this.assertCaptureAdmission(revision);
                 authority.assertCurrent();
                 return result;
