@@ -32,7 +32,8 @@ const PROBE_TIMEOUT_MS = 30_000;
 const ACQUIRE_BOUND_MS = 60_000;
 /** A started projection older than this since ready was sent is not trusted to start work. */
 const START_WINDOW_MS = 45_000;
-/** The api's bound on the age of the custody evidence in a ready report. */
+/** The worker's own bound on the age of the custody evidence in a ready report: a tighter margin
+ *  below the api's 45 s bound (hibernationCleanupEvidenceFresh). */
 const CUSTODY_MAX_AGE_MS = 40_000;
 
 /** The only two commands a step may run, in order. */

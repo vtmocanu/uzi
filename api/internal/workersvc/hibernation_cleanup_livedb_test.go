@@ -1,11 +1,13 @@
 package workersvc
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/vtmocanu/uzi/api/internal/capability"
@@ -697,6 +699,46 @@ func TestHibernationCleanupDeleteRefusedLiveDB(t *testing.T) {
 	}
 	if err := f.svc.DeleteWorker(f.env.ctx, f.user, id); !errors.Is(err, ErrWorkerNotFound) {
 		t.Fatalf("second delete = %v, want not found", err)
+	}
+}
+
+// settleRaceStore runs the real DELETE, then lets a hook act right after the first one: the
+// window between a DELETE that matched no row and DeleteWorker's re-read (#4389).
+type settleRaceStore struct {
+	*store.Queries
+	calls      int
+	afterFirst func()
+}
+
+func (s *settleRaceStore) DeleteWorkerForUser(ctx context.Context, arg store.DeleteWorkerForUserParams) (int64, error) {
+	n, err := s.Queries.DeleteWorkerForUser(ctx, arg)
+	s.calls++
+	if s.calls == 1 && s.afterFirst != nil {
+		s.afterFirst()
+	}
+	return n, err
+}
+
+// #4389: the attempt settles between the first DELETE (refused by the unsettled predicate) and
+// the re-read. The worker is deletable, so the retry deletes it instead of answering 404.
+func TestHibernationCleanupDeleteSettleRaceLiveDB(t *testing.T) {
+	f := newHibFx(t)
+	id, _ := f.started()
+	rs := &settleRaceStore{Queries: f.env.q}
+	rs.afterFirst = func() {
+		f.wantPhase(id, CleanupPhaseStarted)
+		f.mustReport(id, f.resultRep(id, true, okSteps()))
+		f.wantPhase(id, CleanupPhaseSettled)
+	}
+	svc := New(rs, f.env.box, testParams())
+	if err := svc.DeleteWorker(f.env.ctx, f.user, id); err != nil {
+		t.Fatalf("delete racing a settle = %v, want nil", err)
+	}
+	if rs.calls != 2 {
+		t.Fatalf("DELETE calls = %d, want 2", rs.calls)
+	}
+	if _, err := f.env.q.GetWorkerByID(f.env.ctx, id); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("worker still present after the retried delete: %v", err)
 	}
 }
 
