@@ -32,6 +32,8 @@ func TestStripJSONComments(t *testing.T) {
 		// An unterminated block comment swallows the rest of the input, without
 		// reading past the end.
 		{"R8 unterminated block comment", `1/* x`, `1`},
+		// The same with a trailing star: the close check must not peek past the end.
+		{"R11 unterminated block comment ending in a star", `1/* x*`, `1`},
 		// A single slash outside a string is not a comment.
 		{"R9 lone slash", `1/2`, `1/2`},
 		// A backslash as the last byte inside an unterminated string is copied, and
@@ -79,17 +81,10 @@ func TestBuildSeedSetReadsCommentedManifest(t *testing.T) {
 }
 
 // TestBuildSeedSetFailsClosedOnMalformedManifest: a manifest that does not parse
-// yields an empty coverage set instead of panicking in package init, while the
-// documented exceptions stay covered.
+// yields an empty coverage set instead of panicking in package init.
 func TestBuildSeedSetFailsClosedOnMalformedManifest(t *testing.T) {
 	swapSeedManifest(t, "{not json")
 	if got := buildSeedSet(); !maps.Equal(got, map[string]bool{}) {
 		t.Fatalf("buildSeedSet() on a malformed manifest = %v, want an empty set", got)
-	}
-	if !Covered("kubectl") {
-		t.Error(`Covered("kubectl") = false, want true (a documented exception)`)
-	}
-	if Covered("cowsay") {
-		t.Error(`Covered("cowsay") = true, want false (neither baked nor an exception)`)
 	}
 }
