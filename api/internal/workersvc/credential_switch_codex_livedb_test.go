@@ -23,7 +23,7 @@ func TestCodexSwitchPreflightLiveDB(t *testing.T) {
 	} {
 		t.Run(scenario, func(t *testing.T) {
 			f := newApplyFx(t)
-			f.env.exec("UPDATE workers SET credential_switch_apply_nonce=snapshot_register_nonce, protocol_capabilities = array_append(protocol_capabilities, $2) WHERE id = $1", f.o.workerID, capability.CodexCredentialSwitchV1)
+			f.env.exec("UPDATE workers SET credential_switch_apply_nonce=snapshot_register_nonce, protocol_capabilities = array_append(array_append(protocol_capabilities, 'codex_switch_stopped_v1'), $2) WHERE id = $1", f.o.workerID, capability.CodexCredentialSwitchV1)
 			run, _ := f.run(t, "running")
 			old := f.env.seedStaticAPIKey(t, f.o.userID, "old-api", "old-test-key")
 			target := f.env.seedStaticAPIKey(t, f.o.userID, "new-api", "new-test-key")
@@ -33,6 +33,7 @@ func TestCodexSwitchPreflightLiveDB(t *testing.T) {
 			if err := f.svc.FreezeCodexBinding(f.env.ctx, f.o.userID, run, old, codexAuthModeAPIKey); err != nil {
 				t.Fatal(err)
 			}
+			f.env.exec("UPDATE runs SET codex_claim_epoch=41 WHERE id=$1", run)
 			if scenario != "missing baseline" {
 				if err := f.svc.recordCodexEpoch(context.Background(), mustRun(t, f.env, run)); err != nil {
 					t.Fatal(err)
@@ -132,6 +133,9 @@ func TestCodexSwitchPreflightLiveDB(t *testing.T) {
 			got, err := f.svc.PreflightCodexCredentialSwitch(f.env.ctx, f.worker(t), run, req)
 			if err != nil || got.Outcome != want || got.Reason != reason {
 				t.Fatalf("preflight = %+v, %v; want %s/%s", got, err, want, reason)
+			}
+			if got.Outcome == "ready" && got.ExpectedEpoch != mustRun(t, f.env, run).CodexClaimEpoch {
+				t.Fatal("READY omitted the locked claim epoch")
 			}
 			if got.ClaimGeneration != f.gen || got.RegisterNonce != applyFixtureNonce || got.OpID != f.opOf(t, run).String() {
 				t.Fatalf("missing authoritative fence: %+v", got)

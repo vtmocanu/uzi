@@ -11,7 +11,7 @@ import (
 // predicate. A default/incorrect harness projection must fail this regression.
 func TestCodexPendingSwitchReceiptDrainLiveDB(t *testing.T) {
 	f := newApplyFx(t)
-	nonce := f.register(t, []string{capability.CodexCredentialSwitchV1, capability.InputReceiptsV1})
+	nonce := f.register(t, []string{capability.CodexSwitchStoppedV1, capability.CodexCredentialSwitchV1, capability.InputReceiptsV1})
 	run, _ := f.run(t, "running")
 	old := f.env.seedStaticAPIKey(t, f.o.userID, "receipt-old", "receipt-old-key")
 	target := f.env.seedStaticAPIKey(t, f.o.userID, "receipt-target", "receipt-target-key")

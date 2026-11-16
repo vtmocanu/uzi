@@ -27,6 +27,7 @@ type CodexSwitchPreflightRequest struct {
 // CodexSwitchPreflightResult contains decisions only, never auth material or
 // provider identity. Ready is a point-in-time observation, not apply authority.
 type CodexSwitchPreflightResult struct {
+	ExpectedEpoch   int64  `json:"expected_epoch,omitempty"`
 	Outcome         string `json:"outcome"`
 	Reason          string `json:"reason,omitempty"`
 	ClaimGeneration int64  `json:"claim_generation"`
@@ -74,6 +75,9 @@ func (s *Service) PreflightCodexCredentialSwitch(ctx context.Context, wkr store.
 	if err != nil {
 		return CodexSwitchPreflightResult{}, errCodexSwitchRead
 	}
+	if !slices.Contains(w.ProtocolCapabilities, capability.CodexSwitchStoppedV1) {
+		return CodexSwitchPreflightResult{Outcome: ApplyOutcomeNotApplied, Reason: "worker_upgrade_required"}, nil
+	}
 	return s.validateCodexSwitchLocked(ctx, q, w, run, req)
 }
 
@@ -90,6 +94,9 @@ func (s *Service) validateCodexSwitchLocked(ctx context.Context, q *store.Querie
 	gen, runID := req.ClaimGeneration, run.ID
 	defer func() {
 		if retErr == nil {
+			if result.Outcome == "ready" {
+				result.ExpectedEpoch = run.CodexClaimEpoch
+			}
 			result.ClaimGeneration = run.ClaimGeneration
 			result.RegisterNonce = w.SnapshotRegisterNonce.String
 			result.OpID = uuid.UUID(run.CredentialSwitchOpID.Bytes).String()
@@ -288,6 +295,9 @@ func (s *Service) validateCodexSwitchLocked(ctx context.Context, q *store.Querie
 	}
 	if len(material) > 0 && material[0] != nil {
 		*material[0] = target
+	}
+	if run.CodexClaimEpoch <= 0 {
+		return refuse("baseline_mismatch")
 	}
 	return CodexSwitchPreflightResult{Outcome: "ready"}, nil
 }

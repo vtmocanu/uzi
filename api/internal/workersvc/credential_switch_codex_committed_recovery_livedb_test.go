@@ -13,7 +13,7 @@ import (
 func TestCodexCommittedSwitchFreshClaimLiveDB(t *testing.T) {
 	x := newOutageCodexFlight(t, codexAuthModeAPIKey)
 	id := x.f.runID
-	x.env.exec("UPDATE workers SET protocol_capabilities=array_append(protocol_capabilities,$2), credential_switch_apply_nonce=snapshot_register_nonce WHERE id=$1", x.f.workerID, capability.CodexCredentialSwitchV1)
+	x.env.exec("UPDATE workers SET protocol_capabilities=array_append(array_append(protocol_capabilities,'codex_switch_stopped_v1'),$2), credential_switch_apply_nonce=snapshot_register_nonce WHERE id=$1", x.f.workerID, capability.CodexCredentialSwitchV1)
 	const savedSessionID = "12345678-1234-1234-1234-123456789abc"
 	x.env.exec("UPDATE runs SET status='running', session_id=$2 WHERE id=$1", id, savedSessionID)
 	target := x.env.seedStaticAPIKey(t, x.f.userID, "committed-target", "committed-target-key")

@@ -14,14 +14,24 @@ import (
 // under the same locks as production; ordinal zero is recorded before requesting.
 func codexApplyFixture(t *testing.T, subscription bool) (applyFx, uuid.UUID, uuid.UUID) {
 	t.Helper()
+	return codexApplyFixtureWithRegistration(t, subscription, false)
+}
+
+func codexApplyFixtureWithRegistration(t *testing.T, subscription, register bool) (applyFx, uuid.UUID, uuid.UUID) {
+	t.Helper()
 	f := newApplyFx(t)
-	f.env.exec("UPDATE workers SET credential_switch_apply_nonce=snapshot_register_nonce, protocol_capabilities=ARRAY[$2]::text[] WHERE id=$1", f.o.workerID, capability.CodexCredentialSwitchV1)
+	if register {
+		f.register(t, []string{capability.CodexCredentialSwitchV1, capability.CodexSwitchStoppedV1})
+	} else {
+		f.env.exec("UPDATE workers SET credential_switch_apply_nonce=snapshot_register_nonce, protocol_capabilities=ARRAY[$2,'codex_switch_stopped_v1']::text[] WHERE id=$1", f.o.workerID, capability.CodexCredentialSwitchV1)
+	}
 	run, _ := f.run(t, "running")
 	old := f.env.seedStaticAPIKey(t, f.o.userID, "apply-old", "apply-old-key")
 	if err := f.svc.FreezeCodexBinding(f.env.ctx, f.o.userID, run, old, codexAuthModeAPIKey); err != nil {
 		t.Fatal(err)
 	}
-	f.env.exec("UPDATE runs SET codex_claim_epoch=41 WHERE id=$1", run)
+	_, hash := mintCodexCapability()
+	f.env.exec("UPDATE runs SET codex_claim_epoch=41, codex_cap_hash=$2 WHERE id=$1", run, hash)
 	if err := f.svc.recordCodexEpoch(f.env.ctx, mustRun(t, f.env, run)); err != nil {
 		t.Fatal(err)
 	}

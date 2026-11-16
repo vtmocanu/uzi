@@ -632,7 +632,7 @@ func (s *Service) requestCodexCredentialSwitch(ctx context.Context, observed sto
 	if codexSwitchPolicyBlocked(run) {
 		return SetRunCredentialResult{}, &RunOwnerHeldError{Label: "policy hold"}
 	}
-	if !codexSwitchNegotiated(w) || !w.LastHeartbeatAt.Valid || w.LastHeartbeatAt.Time.Before(s.staleWorkerCutoff().Time) {
+	if !codexSwitchNegotiated(w) || !slices.Contains(w.ProtocolCapabilities, capability.CodexSwitchStoppedV1) || !w.LastHeartbeatAt.Valid || w.LastHeartbeatAt.Time.Before(s.staleWorkerCutoff().Time) {
 		return SetRunCredentialResult{}, &CredentialSwitchWorkerUnsupportedError{WorkerID: w.ID, WorkerName: w.Name}
 	}
 	// Lock enablement and alias before writing the stamp. No provider call or

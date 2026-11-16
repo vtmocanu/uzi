@@ -9,7 +9,7 @@ import (
 
 func TestCodexRegisteredSwitchRefusesLegacyReleaseLiveDB(t *testing.T) {
 	f := newApplyFx(t)
-	nonce := f.register(t, []string{capability.CodexCredentialSwitchV1})
+	nonce := f.register(t, []string{capability.CodexSwitchStoppedV1, capability.CodexCredentialSwitchV1})
 	run, _ := f.run(t, "running")
 	old := f.env.seedStaticAPIKey(t, f.o.userID, "negotiation-old", "old-test-key")
 	target := f.env.seedStaticAPIKey(t, f.o.userID, "negotiation-target", "target-test-key")
@@ -46,7 +46,7 @@ func TestCodexRegisteredSwitchRefusesLegacyReleaseLiveDB(t *testing.T) {
 
 func TestCodexNegotiationPreservesLegacyClaudeReleaseLiveDB(t *testing.T) {
 	f := newApplyFx(t)
-	f.register(t, []string{capability.CredentialSwitchV1, capability.CodexCredentialSwitchV1})
+	f.register(t, []string{capability.CodexSwitchStoppedV1, capability.CredentialSwitchV1, capability.CodexCredentialSwitchV1})
 	// The worker supports new Codex switching but only legacy Claude switching.
 	run := f.heldV1Run(t)
 	if applied, err := f.release(t, run); err != nil || !applied {

@@ -521,6 +521,7 @@ func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled, publication
 		// the route and 400s the unknown fields and state.
 		{workersvc.CredentialSwitchApplyFeature},
 		{workersvc.CodexCredentialSwitchApplyFeature},
+		{workersvc.CodexSwitchStoppedFeature},
 		// Issue #3985: this api accepts {status:"clarification_settled", claim_generation,
 		// clarification_settlement:{question_id, revision_input_id, gate_revision}} and answers it
 		// with disposition "clarification_settled". It returns a plan cross-check run parked at
@@ -1548,7 +1549,7 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req workersvc.StateRequest
-	if err := httpx.DecodeJSON(r, &req); err != nil {
+	if err := decodeWorkerState(r, &req); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
@@ -1675,7 +1676,7 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 			// The service error text already reads "invalid run state: a job run never parks (<state>)".
 			httpx.Error(w, http.StatusBadRequest, err.Error())
 		case errors.Is(err, workersvc.ErrInvalidState):
-			httpx.Error(w, http.StatusBadRequest, "state must be one of running, awaiting_approval, awaiting_input, awaiting_followup, limit_wait, recovery_wait, paused, pause_failed, credential_switch, credential_switch_failed, credential_switch_held, credential_switch_hold_settled, credential_switch_uncertain, clarification_settled, completed, failed")
+			httpx.Error(w, http.StatusBadRequest, "state must be one of running, awaiting_approval, awaiting_input, awaiting_followup, limit_wait, recovery_wait, paused, pause_failed, credential_switch, credential_switch_failed, credential_switch_held, credential_switch_hold_settled, credential_switch_uncertain, codex_switch_stopped, clarification_settled, completed, failed")
 		default:
 			slog.Error("worker run state", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -1782,6 +1783,8 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 		// Issue #3181: the settlement acknowledgement applied (or replayed): the hold is now
 		// credential_switch_unsettled and the owner's Resume is open.
 		ack["disposition"] = "hold_settled"
+	case "codex_switch_stopped":
+		stoppedSettlementAck(ack)
 	case "credential_switch_uncertain":
 		// Issue #4201: the uncertain-apply park applied (or replayed): the run is paused for the
 		// owner with its claim, worker and session kept. The worker keys on this.
@@ -2816,4 +2819,10 @@ func (h *Handler) workerRunDTO(ctx context.Context, run store.Run) apitypes.RunD
 	dto.HoldReason = workersvc.WorkerVisibleHoldReason(dto.HoldReason)
 	dto.PauseMode = workersvc.WorkerVisiblePauseMode(dto.PauseMode)
 	return dto
+}
+
+// stoppedSettlementAck is used only after a stopped report applies or replays.
+func stoppedSettlementAck(ack map[string]any) {
+	ack["applied"] = true
+	ack["disposition"] = "codex_switch_stopped"
 }
