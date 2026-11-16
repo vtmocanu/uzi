@@ -96,6 +96,8 @@ refuse() {
 
 # q <file> <yq expression>: evaluate across every document.
 q() { yq ea "$2" "$1"; }
+# qj <file> <yq expression>: the same, as one-line JSON (for exact-structure comparisons).
+qj() { yq ea -o=json -I=0 "$2" "$1"; }
 
 # count <file> <kind> [name]: number of rendered objects of that kind (and name).
 count() {
@@ -132,6 +134,68 @@ render "$WORK/route.yaml" --set web.httpRoute.enabled=true --set web.ingress.ena
 got=$(q "$WORK/route.yaml" 'select(.kind == "HTTPRoute") | [.spec.hostnames[0], .spec.parentRefs[0].name, .spec.parentRefs[0].namespace, .spec.rules[0].matches[0].path.type, .spec.rules[0].matches[0].path.value, .spec.rules[0].backendRefs[0].name, .spec.rules[0].backendRefs[0].port] | join(" ")')
 want="uzi.example.com shared gateway-system PathPrefix / uzi-web 80"
 [ "$got" = "$want" ] && ok "HTTPRoute routes uzi.example.com / to uzi-web:80 via gateway-system/shared" || bad "HTTPRoute renders '$got', expected '$want'"
+
+# web.httpRoute.timeouts / rootTimeouts (#4401): opt-in Gateway API HTTPRouteTimeouts.
+# Empty (the default) must render exactly today's route: one PathPrefix / rule, no timeouts.
+ROUTE_ARGS="--set web.httpRoute.enabled=true --set web.ingress.enabled=false --set web.httpRoute.parentRefs[0].name=shared --set web.httpRoute.parentRefs[0].namespace=gateway-system --set web.httpRoute.hostnames[0]=uzi.example.com"
+# routespec <out> [helm args...]: render the route args plus extras, keep the HTTPRoute .spec as JSON.
+routespec() {
+  _o="$1"; shift
+  # shellcheck disable=SC2086 # ROUTE_ARGS is a word list of fixed helm flags
+  render "$_o.yaml" $ROUTE_ARGS "$@"
+  [ "$(count "$_o.yaml" HTTPRoute uzi-web)" = 1 ] || { echo "BROKEN: HTTPRoute uzi-web absent ($*)" >&2; exit 2; }
+  qj "$_o.yaml" 'select(.kind == "HTTPRoute") | .spec' > "$_o.json"
+}
+routespec "$WORK/rt-empty"
+want='{"parentRefs":[{"name":"shared","namespace":"gateway-system"}],"hostnames":["uzi.example.com"],"rules":[{"matches":[{"path":{"type":"PathPrefix","value":"/"}}],"backendRefs":[{"name":"uzi-web","port":80}]}]}'
+[ "$(cat "$WORK/rt-empty.json")" = "$want" ] && ok "empty web.httpRoute.timeouts renders today's route spec (one PathPrefix / rule, no timeouts)" \
+  || bad "empty timeouts renders spec '$(cat "$WORK/rt-empty.json")', expected '$want'"
+q "$WORK/rt-empty.yaml" 'select(.kind == "HTTPRoute")' > "$WORK/rt-empty.route"
+routespec "$WORK/rt-explicit" --set-json 'web.httpRoute.timeouts={}' --set-json 'web.httpRoute.rootTimeouts={}'
+q "$WORK/rt-explicit.yaml" 'select(.kind == "HTTPRoute")' > "$WORK/rt-explicit.route"
+cmp -s "$WORK/rt-empty.route" "$WORK/rt-explicit.route" && ok "explicit {} timeouts render the HTTPRoute byte-identical to the default" \
+  || bad "explicit {} timeouts change the HTTPRoute render"
+
+routespec "$WORK/rt-files" --set-json 'web.httpRoute.timeouts={"request":"300s","backendRequest":"300s"}'
+got=$(q "$WORK/rt-files.yaml" 'select(.kind == "HTTPRoute") | .spec.rules | length')
+[ "$got" = 2 ] && ok "set timeouts render a second route rule" || bad "set timeouts render $got rules, expected 2"
+got=$(qj "$WORK/rt-files.yaml" 'select(.kind == "HTTPRoute") | .spec.rules[0]')
+want='{"matches":[{"path":{"type":"PathPrefix","value":"/"}}],"backendRefs":[{"name":"uzi-web","port":80}]}'
+[ "$got" = "$want" ] && ok "the PathPrefix / rule stays unchanged, without timeouts" || bad "rules[0] renders '$got', expected '$want'"
+got=$(q "$WORK/rt-files.yaml" 'select(.kind == "HTTPRoute") | .spec.rules[1] | [.matches[0].path.type, .matches[0].path.value, .backendRefs[0].name, .backendRefs[0].port, .timeouts.request, .timeouts.backendRequest, (.timeouts | keys | length)] | join(" ")')
+want="Exact /api/v1/files uzi-web 80 300s 300s 2"
+[ "$got" = "$want" ] && ok "timeouts render on an Exact /api/v1/files rule to uzi-web:80" || bad "files rule renders '$got', expected '$want'"
+
+routespec "$WORK/rt-req" --set-json 'web.httpRoute.timeouts={"request":"300s"}'
+got=$(qj "$WORK/rt-req.yaml" 'select(.kind == "HTTPRoute") | .spec.rules[1].timeouts')
+[ "$got" = '{"request":"300s"}' ] && ok "request alone renders no backendRequest" || bad "request-only timeouts render '$got'"
+
+routespec "$WORK/rt-root" --set-json 'web.httpRoute.rootTimeouts={"request":"60s"}'
+got=$(q "$WORK/rt-root.yaml" 'select(.kind == "HTTPRoute") | [(.spec.rules | length), .spec.rules[0].matches[0].path.value, .spec.rules[0].timeouts.request] | join(" ")')
+[ "$got" = "1 / 60s" ] && ok "rootTimeouts render on the PathPrefix / rule only" || bad "rootTimeouts render '$got', expected '1 / 60s'"
+
+# /api/ws routing is unchanged: no render grows a rule of its own for it.
+for f in rt-empty rt-files rt-req rt-root; do
+  n=$(q "$WORK/$f.yaml" '[select(.kind == "HTTPRoute") | .spec.rules[].matches[].path.value | select(test("^/api/ws"))] | length')
+  [ "$n" = 0 ] || bad "$f renders an /api/ws rule"
+done
+ok "no render adds an /api/ws rule (WebSocket stays on PathPrefix /)"
+
+# Validation: backendRequest <= request on parsed durations; request "0s" disables it.
+refuse "web.httpRoute.timeouts.backendRequest (301s) is longer than web.httpRoute.timeouts.request (300s)" \
+  $ROUTE_ARGS --set-json 'web.httpRoute.timeouts={"request":"300s","backendRequest":"301s"}'
+refuse "web.httpRoute.rootTimeouts.backendRequest (2m) is longer than web.httpRoute.rootTimeouts.request (90s)" \
+  $ROUTE_ARGS --set-json 'web.httpRoute.rootTimeouts={"request":"90s","backendRequest":"2m"}'
+refuse "web.httpRoute.timeouts.request is 5 minutes, not a Gateway API Duration" \
+  $ROUTE_ARGS --set-json 'web.httpRoute.timeouts={"request":"5 minutes"}'
+refuse "web.httpRoute.timeouts.idle is not a Gateway API HTTPRouteTimeouts field" \
+  $ROUTE_ARGS --set-json 'web.httpRoute.timeouts={"idle":"5s"}'
+routespec "$WORK/rt-units" --set-json 'web.httpRoute.timeouts={"request":"5m","backendRequest":"300s"}'
+ok "equivalent units pass (request 5m, backendRequest 300s)"
+routespec "$WORK/rt-zero" --set-json 'web.httpRoute.timeouts={"request":"0s","backendRequest":"600s"}'
+ok "request 0s (disabled) allows a finite backendRequest"
+routespec "$WORK/rt-multi" --set-json 'web.httpRoute.timeouts={"request":"1h2m","backendRequest":"3700s"}'
+ok "multi-part durations compare parsed (request 1h2m >= backendRequest 3700s)"
 
 # --- (c) nulled pod ids are omitted, the rest of the posture stays -----------------------
 cat > "$WORK/nullids.yaml" <<'EOF'

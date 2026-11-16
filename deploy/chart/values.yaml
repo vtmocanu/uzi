@@ -1732,6 +1732,30 @@ web:
     # e.g. [{name: shared, namespace: gateway-system}] (Gateway API parentRefs, verbatim)
     parentRefs: []
     annotations: {}
+    # Gateway API HTTPRouteTimeouts for POST /api/v1/files (input-file upload): {request,
+    # backendRequest}, each a Gateway API Duration ("300s", "5m", "1h30m"; quote it). Empty
+    # (the default) renders today's route unchanged and leaves the timeout to the Gateway
+    # implementation, which for Envoy-based gateways is commonly 15s. Set, it renders a
+    # dedicated `Exact /api/v1/files` rule carrying exactly the keys given. HTTPRoute timeouts
+    # are a Gateway API Extended feature: set this only on a gateway that supports them.
+    # Recommended: {request: "300s", backendRequest: "300s"}. 300s covers a 25 MiB upload on a
+    # slow link plus the api's request deadline (UZI_RECOVERY_REQUEST_DEADLINE, 120s) and its
+    # 15s response grace. It is NOT a guaranteed cap on total upload duration: Gateway API
+    # lets an implementation start the request timer after the request body is received.
+    # This value must cover web nginx's /api/v1/files budgets, as web.ingress.annotations do
+    # for Ingress; size it as a TOTAL budget, not by copying nginx's numbers, because nginx's
+    # client_body/proxy_send/proxy_read timeouts (120s/150s/150s) bound inactivity between
+    # operations, not total duration. Set backendRequest too: omitted, the implementation
+    # applies its own backend timeout, which may be shorter. The render fails on an unknown
+    # key, a malformed duration, or backendRequest longer than request (compared as parsed
+    # durations, so 300s == 5m; request "0s" disables that timeout and allows any
+    # backendRequest). /api/ws stays on the general rule below, untouched by this value.
+    timeouts: {}
+    # The same HTTPRouteTimeouts shape and validation for the general `PathPrefix /` rule
+    # (SPA, every other /api/ route, and the /api/ws WebSocket). Empty by default; set it only
+    # to override the gateway's default for all of that traffic, and check how your
+    # implementation applies a request timeout to WebSocket upgrades first.
+    rootTimeouts: {}
 
 # --- Runtime secrets via Infisical (opt-in; used only when secrets.mode: infisical) ---
 # When selected, the chart renders InfisicalSecret CRs (from infisicalList) so a cluster
