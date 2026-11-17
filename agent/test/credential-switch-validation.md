@@ -831,3 +831,24 @@ Lead spot-checks verified actual HTTP assertion frames and reconstructed the
 mutant hash. Export removed, owned fixture cleanup exit 0, primary unchanged.
 Only request availability is credited; preservation checks are positive evidence.
 Negative admission/ownership/policy controls and broader m3/m4 remain pending.
+
+
+## Isolated owner policy guards
+
+D74/D75 at e37fb6ca547800f99061b167b805fa2767106fb9 are separate class (d)
+controls through the real authenticated owner route and store transaction.
+One neutralizes pending-fresh only; one neutralizes unresolved-outcome only.
+The opposite arm and hold condition remain intact. Each fails at the HTTP
+assertion (200 versus 409); unchanged before/after pass both cases, including
+resolved preserving companions. Existing predicate code does not supply a
+historical allowed owner seam: a233 rejected Codex overrides wholesale.
+
+Scratch owner-policy-results.json and owner-policy-lead-audit.json retain
+exact diff/source hashes, verified raw actions and commands. Logs PMrcTX,
+308UIB, Q6yexN, 2Gi9w5 (gate-log. prefix) exit 0/1/1/0 with no skips or credited
+setup/build/SQL failures. Runs are serial handler-only, -race -count=1 -json
+-timeout=4m, GOFLAGS=-p=1 and GOMAXPROCS=4. Exports removed, exact owned fixture
+cleanup exits 0, primary fingerprints and prior receipts unchanged.
+Source review found no findings. Snapshot preservation is positive evidence;
+apply-time policy, paused hold admission, security and other m3/m4 checks are
+not discharged by these two controls.

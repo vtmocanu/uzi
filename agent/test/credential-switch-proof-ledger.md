@@ -415,7 +415,7 @@ control is still absent, not that the functional criterion was deferred.
 | Proven A root/tool reap before B material, login and model work; fresh CODEX_HOME | R5 credits unproven registered root pre-apply only; tool-only, other modes/phases and HOME clauses unvalidated |
 | Whole operation-scope/refresh/identity/capability/summary replacement and retired-A rejection | A2 credits one reader; A3 retained-A/Sub→Sub B-scope namespace isolation; R7 B dispatcher publication readiness; R8 retired API-key A reconcile release-request fence during B login; remaining mixed clauses unvalidated |
 | Exact saved-ID resume; confirmed-refusal-only fresh fallback and lineage; preservation re-hold | R6 credits uncertain-error classification only; confirmed-refusal/preserve companions positive, independent preservation and other clauses unvalidated |
-| Policy episode rejection at request and under apply lock | Unvalidated |
+| Policy episode rejection at request and under apply lock | D74/D75 credit isolated owner pending-fresh and unresolved-outcome cases; paused hold, apply-time changes and other policy clauses unvalidated |
 | Refresh lease/intent exclusion, account lock ordering and boundary reconciliation before revoke | Unvalidated |
 | Post-switch release epoch and secret-hash authorization | B5/B6 preservation sensitivity controls below, through real worker apply and release routes; final reauthorization timing unvalidated |
 | Transactional frozen binding rewrite, capability revoke/remint and post-commit material response | Unvalidated; B5/B6 do not establish transaction atomicity or mint/revoke implementation |
@@ -1542,3 +1542,77 @@ Credit is only authenticated request availability in these four live states.
 Negative statuses, wrong owners/targets, policy fences, transaction safety and
 other m3 requirements remain unvalidated unless separately credited above.
 No full suite or m4 security gate is claimed; m3/m4 are incomplete.
+
+
+### D74/D75 — isolated owner-request policy guards
+
+Candidate e37fb6ca547800f99061b167b805fa2767106fb9. These are two separate
+class (d) guard controls on the new owner-request seam, not baseline regression
+evidence. The shared predicate body predates this request path; its existence
+alone does not prove the new caller. Baseline-absence command:
+
+```sh
+git show a233883de3c36bae2e940f999cd9d582889dad00:api/internal/workersvc/credential_override.go
+```
+
+Lines 202–205 describe the harness refusal and execute:
+
+```go
+if harness == harnessCodex {
+    return nil, ErrCredentialOverrideHarnessUnsupported
+}
+```
+
+At that same baseline, run_credential.go:185–190 unconditionally calls the
+validator before status dispatch (exact git-show command in A4). Thus neither
+negative has a historical allowed Codex owner-request policy seam to restore.
+
+Current owner POST reaches requestCodexCredentialSwitch's single policy call
+at run_credential.go:632 under worker-then-run locks. codexSwitchPolicyBlocked
+at credential_switch_codex.go:404 delegates to UnresolvedPolicyEpisode and
+policy_hold.go:189–195. The source census covered that owner branch, transaction
+helpers, both pending-write queries and effective migration triggers through
+466. StampHeldCodexCredentialSwitch and SetPendingCodexSwitchTarget
+(runtime.sql:13626, :13637) have no policy predicate; operation/hold identity
+and pending-target triggers do not substitute a policy check. The separate
+preflight/apply caller at credential_switch_codex.go:136 is not exercised by
+this POST. DBA source review confirmed both fixture shapes satisfy effective
+policy constraints; this does not claim concurrent lock-order or apply proof.
+
+TestWorkerCodexOwnerPolicyRouteLiveDB independently seeds X through the store,
+preflights and withdraws it through worker routes, then installs one complete
+policy tuple on a running unheld claim. pending_fresh has fresh=true and a
+nonnull resolution timestamp, disabling the outcome condition. unresolved_outcome
+has fresh=false and a null resolution timestamp. Both assert these stored
+facts and the remaining claim identity before making the real CLI Bearer
+owner POST. Each requires HTTP 409 with the policy-hold diagnostic and exact
+preservation of the six snapshot sections. Clearing fresh and resolving the
+episode, while keeping its preserving tuple, is a positive companion: the
+request must return 200 with a new pending B operation and the tested A
+capability/claim and policy fields unchanged. Preservation here is positive
+assertion evidence, not separate effect-injection sensitivity credit.
+
+D74 removes only the PolicyPendingFresh disjunct at policy_hold.go:190.
+D75 independently replaces only the unresolved-outcome disjunct at :191 with
+false. Both keep the hold condition and the other policy arm intact. Only the
+selected negative runs on each exact candidate export. Both compiling mutants
+fail at the actual owner-route assertion, test :83: HTTP 200 instead of 409.
+No setup, SQL or build failure supplies the red. No combined-arm mutation is
+credited, and paused codex_policy_hold admission is not covered.
+
+Receipt .uzi/scratch/owner-policy-results.json and script owner-policy-controls.py
+record the single serial invocation; owner-policy-lead-audit.json records the
+lead's independent raw-action/log-hash and exact mutant-hash reconstruction.
+All commands use GOFLAGS=-p=1 GOMAXPROCS=4 and, from api:
+go test -buildvcs=false -race -count=1 -json -timeout=4m ./internal/handler -run
+<selection>. Before/after select the whole exact test; each mutant selects only
+its named subcase. Logs under .uzi/scratch/: PMrcTX before exit 0, 308UIB D74
+exit 1, Q6yexN D75 exit 1, 2Gi9w5 after exit 0 (all use gate-log. prefix).
+Both greens pass both leaves without skips. Fixture cleanup 27S9NQ exits 0;
+each export was removed immediately and primary fingerprints are unchanged.
+Prior receipts remain unchanged. Cheap checks were gofmt and git diff --check
+HEAD; immutable source review 949ec8ebc..e37fb6ca5 found no findings.
+
+This credits only the two named owner policy cases. Apply-time policy races,
+paused holds, other policy tuples, full suites, security gates and broader
+m3/m4 requirements remain separate and incomplete.
