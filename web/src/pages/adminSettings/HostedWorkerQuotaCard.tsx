@@ -1,7 +1,8 @@
 import { useState, type FormEvent } from "react";
-import { api, type AppSettings, type SettingsResponse } from "../../lib/api";
+import { api, type AppSettings, type SettingSource, type SettingsResponse } from "../../lib/api";
 import { errorMessage } from "../../lib/apiError";
 import { Alert, Button, Card, Field, Input, SectionTitle } from "../../components/ui";
+import { SettingControl } from "./SettingControl";
 
 // Mirrors validateHostedWorkerQuota in settings_hosted.go; the API rechecks every write.
 function quotaError(value: string): string | null {
@@ -16,8 +17,10 @@ function displayQuota(value: string): string {
   return quotaError(value) === null ? String(Number(value.trim())) : value;
 }
 
-export function HostedWorkerQuotaCard({ settings, onSaved }: {
+export function HostedWorkerQuotaCard({ settings, sources = {}, defaults, onSaved }: {
   settings: AppSettings;
+  sources?: Record<string, SettingSource>;
+  defaults?: Record<string, string>;
   onSaved: (resp: SettingsResponse) => void;
 }) {
   const savedValue = displayQuota(settings.hosted_worker_quota);
@@ -75,6 +78,16 @@ export function HostedWorkerQuotaCard({ settings, onSaved }: {
           {busy ? "Saving…" : "Save hosted worker quota"}
         </Button>
       </form>
+      <SettingControl
+        settingKey="hosted_default_size"
+        label="Default size for new workers"
+        kind="size"
+        helper="Size the provision form preselects, and the size used when a request names none. Existing workers keep their size."
+        value={settings.hosted_default_size ?? ""}
+        source={sources["hosted_default_size"]}
+        defaultValue={defaults?.["hosted_default_size"]}
+        onSaved={onSaved}
+      />
     </Card>
   );
 }

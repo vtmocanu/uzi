@@ -24,11 +24,13 @@ export function AdminWorkers() {
   const { hash, key } = useLocation();
   const [saved, setSaved] = useState<AppSettings | null>(null);
   const [sources, setSources] = useState<Record<string, SettingSource>>({});
+  const [defaults, setDefaults] = useState<Record<string, string> | undefined>(undefined);
 
   // Same load shape as AdminSettings: every card save returns the full settings map.
   const applyResponse = useCallback((resp: SettingsResponse) => {
     setSaved(resp.settings);
     setSources(resp.sources ?? {});
+    setDefaults(resp.defaults);
   }, []);
 
   const { loading, error: loadError } = useAsyncData(
@@ -105,13 +107,13 @@ export function AdminWorkers() {
             <DockerAllowlistCard settings={saved} sources={sources} onSaved={applyResponse} />
           </section>
           <section id="hosted-worker-quota" className="scroll-mt-6">
-            <HostedWorkerQuotaCard settings={saved} onSaved={applyResponse} />
+            <HostedWorkerQuotaCard settings={saved} sources={sources} defaults={defaults} onSaved={applyResponse} />
           </section>
           <section id="custody-hold-limit" className="scroll-mt-6">
             <CustodyHoldLimitCard settings={saved} onSaved={applyResponse} />
           </section>
           <section id="ephemeral-workers" className="scroll-mt-6">
-            <EphemeralWorkersCard settings={saved} onSaved={applyResponse} />
+            <EphemeralWorkersCard settings={saved} sources={sources} defaults={defaults} onSaved={applyResponse} />
           </section>
           <section id="worker-hibernation" className="scroll-mt-6">
             <WorkerHibernationCard settings={saved} onSaved={applyResponse} />

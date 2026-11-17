@@ -33,7 +33,7 @@ function readout(v: string): string {
 // switch (PRD #4205) plus automatic hibernation of idle workers and its idle threshold
 // (PRD #4207). One card, one Save: the three keys go in a single updateSettings call so
 // the automatic policy can never be stored half-edited. All round-trip through
-// /admin/settings.
+// the Admin → Workers page (the settings API is still /admin/settings).
 export function WorkerHibernationCard({
   settings,
   onSaved,

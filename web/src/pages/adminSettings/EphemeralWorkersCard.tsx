@@ -1,20 +1,26 @@
 import { useState, type FormEvent } from "react";
-import { api, type AppSettings, type SettingsResponse } from "../../lib/api";
+import { api, type AppSettings, type SettingSource, type SettingsResponse } from "../../lib/api";
 import { errorMessage } from "../../lib/apiError";
 import { Alert, Button, Card, SectionTitle } from "../../components/ui";
+import { SettingControl } from "./SettingControl";
 
 // EphemeralWorkersCard is the admin surface for the ephemeral worker
 // auto-provisioning instance kill-switch (PRD #529 / #649 M1). A single-bool card
 // that saves independently of the label form, mirroring JudgeSettingsCard. It is an
 // INSTANCE kill-switch: when off, no run ever auto-provisions a throwaway hosted
 // worker regardless of a user's per-account opt-in; when on, users can still opt in
-// individually on the Workers page. Web-only — the key already round-trips through
-// /admin/settings.
+// individually on the Workers page. Below the switch are the per-key tuning controls
+// (PRD #4212): per-user cap, default size and idle lease, each saved and reset on its own.
+// Shown on Admin → Workers; the keys round-trip through the /admin/settings API.
 export function EphemeralWorkersCard({
   settings,
+  sources = {},
+  defaults,
   onSaved,
 }: {
   settings: AppSettings;
+  sources?: Record<string, SettingSource>;
+  defaults?: Record<string, string>;
   onSaved: (resp: SettingsResponse) => void;
 }) {
   const [enabled, setEnabled] = useState(settings.ephemeral_workers_enabled === "true");
@@ -49,9 +55,10 @@ export function EphemeralWorkersCard({
           When on, a queued run that needs a capability no online worker has can auto-provision a
           throwaway hosted worker on demand. It is removed once the run finishes, or, when the
           run qualifies for a lease, once that lease ends: during the lease it stays idle so a
-          follow-up run on the same repository and branch can reuse it. The lease length is
-          set by <code className="font-mono text-fg">UZI_EPHEMERAL_LEASE</code> (chart: <code className="font-mono text-fg">workers.ephemeralLease</code>),
-          default 2h; 0 disables leasing. This switch is the
+          follow-up run on the same repository and branch can reuse it. The idle lease length is an
+          admin setting below, default 2h; 0s disables leasing. An environment or chart value
+          (<code className="font-mono text-fg">UZI_EPHEMERAL_LEASE</code>, <code className="font-mono text-fg">workers.ephemeralLease</code>)
+          locks it. This switch is the
           instance <strong className="text-fg">kill-switch</strong>: while it is off, no worker is ever
           auto-provisioned regardless of any per-user opt-in. With it on, users can still individually opt
           in per account on the Workers page. Off by default.
@@ -76,6 +83,39 @@ export function EphemeralWorkersCard({
           {busy ? "Saving…" : "Save ephemeral workers settings"}
         </Button>
       </form>
+
+      <SettingControl
+        settingKey="ephemeral_max_per_user"
+        label="Per-user cap"
+        kind="number"
+        min={0}
+        max={20}
+        helper="Most ephemeral workers one user can have at once, from 0 to 20."
+        value={settings.ephemeral_max_per_user ?? ""}
+        source={sources["ephemeral_max_per_user"]}
+        defaultValue={defaults?.["ephemeral_max_per_user"]}
+        onSaved={onSaved}
+      />
+      <SettingControl
+        settingKey="ephemeral_default_size"
+        label="Default size"
+        kind="size"
+        helper="Size every auto-provisioned ephemeral worker starts at."
+        value={settings.ephemeral_default_size ?? ""}
+        source={sources["ephemeral_default_size"]}
+        defaultValue={defaults?.["ephemeral_default_size"]}
+        onSaved={onSaved}
+      />
+      <SettingControl
+        settingKey="ephemeral_lease"
+        label="Idle lease"
+        kind="text"
+        helper="A Go duration such as 30m or 2h. 0s disables; maximum 2h."
+        value={settings.ephemeral_lease ?? ""}
+        source={sources["ephemeral_lease"]}
+        defaultValue={defaults?.["ephemeral_lease"]}
+        onSaved={onSaved}
+      />
     </Card>
   );
 }

@@ -214,6 +214,21 @@ describe("AdminWorkers recreated cases", () => {
     expect(toggle.checked).toBe(true);
   });
 
+  it("passes the settings sources to the worker size, cap and lease controls (PRD #4212)", async () => {
+    mockApi.getSettings.mockResolvedValue(
+      response(
+        { ephemeral_lease: "30m", ephemeral_default_size: "m", hosted_default_size: "s" },
+        { ephemeral_lease: "env", hosted_default_size: "db" },
+      ),
+    );
+    renderPage();
+    const lease = (await screen.findByLabelText("Idle lease")) as HTMLInputElement;
+    expect(lease.value).toBe("30m");
+    expect(lease.disabled).toBe(true);
+    expect((screen.getByLabelText("Default size for new workers") as HTMLSelectElement).value).toBe("s");
+    expect(screen.getByRole("button", { name: "Reset Default size for new workers to default" })).toBeTruthy();
+  });
+
   it("keeps the docker allowlist Save disabled until the selection changes (dirty-check)", async () => {
     mockApi.getSettings.mockResolvedValue(response({ docker_repo_allowlist: "repo-uzi" }));
     renderPage();

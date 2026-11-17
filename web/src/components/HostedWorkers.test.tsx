@@ -341,6 +341,38 @@ describe("HostedWorkers provisioning", () => {
     await waitFor(() => expect((screen.getByLabelText("Hosted worker size") as HTMLSelectElement).value).toBe("l"));
   });
 
+  it("preselects the admin default size once the config arrives", async () => {
+    mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 2, ephemeral_enabled: false, default_size: "m" });
+    mockApi.provisionHostedWorker.mockResolvedValue({ worker: provisioned });
+    renderCard(0);
+    expect((await screen.findByLabelText("Hosted worker size") as HTMLSelectElement).value).toBe("m");
+    fireEvent.click(await provisionButton());
+    // The request still carries an explicit size.
+    await waitFor(() => expect(mockApi.provisionHostedWorker).toHaveBeenCalledWith("base", "m", false));
+  });
+
+  it("resets to the admin default size after a successful provision", async () => {
+    mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 2, ephemeral_enabled: false, default_size: "m" });
+    mockApi.provisionHostedWorker.mockResolvedValue({ worker: provisioned });
+    renderCard(0);
+    fireEvent.change(await screen.findByLabelText("Hosted worker size"), { target: { value: "s" } });
+    fireEvent.click(await provisionButton());
+    await waitFor(() => expect(mockApi.provisionHostedWorker).toHaveBeenCalledWith("base", "s", false));
+    await waitFor(() => expect((screen.getByLabelText("Hosted worker size") as HTMLSelectElement).value).toBe("m"));
+  });
+
+  it("falls back to l when default_size is missing", async () => {
+    mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 2, ephemeral_enabled: false });
+    renderCard(0);
+    expect((await screen.findByLabelText("Hosted worker size") as HTMLSelectElement).value).toBe("l");
+  });
+
+  it("falls back to l when default_size names an unknown size", async () => {
+    mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 2, ephemeral_enabled: false, default_size: "xl" });
+    renderCard(0);
+    expect((await screen.findByLabelText("Hosted worker size") as HTMLSelectElement).value).toBe("l");
+  });
+
   it("shows the 409 quota refusal verbatim (the server's words, not ours)", async () => {
     mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 2, ephemeral_enabled: false });
     // The client-side gate is a hint, not the rule: a stale count gets here and the
