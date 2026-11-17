@@ -294,11 +294,12 @@ and api/internal/handler respectively. Other agent files are under agent/test.
 
 Transactional and LiveDB evidence has been re-observed, including the 50-test
 c17 result above. The behavior map and later focused results do not establish
-m3 or m4 completion. The preserved owner amendment defines class (c) and
-references earlier classes (a)/(b), whose exact definitions have not been
-recovered. Those definitions are needed to classify the remaining regression
-evidence against the frozen m3 requirements. The behavior map does not
-establish that every required control has run; no acceptance waiver is proposed.
+m3 or m4 completion. The full (a)/(b)/(c) method has now been restored in the
+[per-seam proof ledger](credential-switch-proof-ledger.md). That ledger records
+six additional executed controls and retains the two earlier ordering controls.
+Several mandatory clauses, including new non-ordering stopped-settlement
+fences, remain required and unvalidated. A proof-method decision is pending;
+no functional criterion is accepted, waived or deferred.
 
 `task test:codex-m4` and lead-owned m4 security, contracts, sqlc regeneration
 and integration checks remain pending. Full suites remain pending exact-head

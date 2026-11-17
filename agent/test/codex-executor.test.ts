@@ -35214,7 +35214,8 @@ describe("M2 actualRunner credential replacement", () => {
           assert.ok(!reports.some(status => status.startsWith("credential_switch")), "no switch hold or release transition");
 
           assert.equal(adoptedDestinations.length, 2, "A and B both adopted sessions");
-          for (const dest of adoptedDestinations) {
+          // Check the replacement first so sensitivity failures name the switch transfer.
+          for (const dest of [adoptedDestinations[1]!, adoptedDestinations[0]!]) {
             assert.equal(await fs.readFile(path.join(dest, "sessions", `rollout-${savedId}.jsonl`), "utf8"), "{}\n");
             await assert.rejects(fs.access(path.join(dest, "auth.json")));
             await assert.rejects(fs.access(path.join(dest, "unapproved.txt")));
