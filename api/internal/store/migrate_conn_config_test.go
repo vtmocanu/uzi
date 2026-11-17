@@ -35,3 +35,16 @@ func TestMigrateConnConfigRejectsInvalidPoolParam(t *testing.T) {
 		t.Fatal("migrateConnConfig accepted an invalid pool_max_conns")
 	}
 }
+
+// TestRegisterMigrationDSN pins the boot wiring's seam: a DSN carrying pool settings registers
+// (Migrate then opens the stripped config by name), and an invalid pool setting fails boot.
+func TestRegisterMigrationDSN(t *testing.T) {
+	name, release, err := RegisterMigrationDSN("postgres://u:p@db:5432/uzi?pool_max_conns=5")
+	if err != nil || name == "" {
+		t.Fatalf("RegisterMigrationDSN = (%q, %v), want a registered name", name, err)
+	}
+	release()
+	if _, _, err := RegisterMigrationDSN("postgres://u:p@db:5432/uzi?pool_max_conns=zero"); err == nil {
+		t.Fatal("RegisterMigrationDSN accepted an invalid pool_max_conns")
+	}
+}

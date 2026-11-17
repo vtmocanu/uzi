@@ -392,15 +392,28 @@ func migrateConnConfig(dsn string) (*pgx.ConnConfig, error) {
 	return cfg.ConnConfig, nil
 }
 
+// RegisterMigrationDSN turns an operator connection string (DATABASE_URL) into one Migrate
+// can use: it parses dsn with migrateConnConfig (rejecting an invalid pool setting, stripping
+// the valid ones) and registers the result with the pgx database/sql driver. Migrate's own
+// sql.Open would otherwise keep pool_max_conns and friends as runtime parameters, which
+// Postgres rejects. The returned name is valid until release is called.
+func RegisterMigrationDSN(dsn string) (name string, release func(), err error) {
+	cc, err := migrateConnConfig(dsn)
+	if err != nil {
+		return "", nil, fmt.Errorf("parse database url: %w", err)
+	}
+	name = stdlib.RegisterConnConfig(cc)
+	return name, func() { stdlib.UnregisterConnConfig(name) }, nil
+}
+
 // openForMigrate opens the sql.DB at dsn, waits for it to become reachable, and
 // prepares goose (base FS + dialect). The caller owns the returned db and must
 // Close it.
 func openForMigrate(ctx context.Context, dsn string) (*sql.DB, error) {
-	cc, err := migrateConnConfig(dsn)
+	db, err := sql.Open("pgx", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sql db: %w", err)
 	}
-	db := stdlib.OpenDB(*cc)
 
 	if err := waitForDB(ctx, db); err != nil {
 		_ = db.Close()

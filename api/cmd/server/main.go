@@ -203,7 +203,13 @@ func run() error {
 	defer stop()
 
 	slog.Info("running migrations")
-	if err := store.Migrate(ctx, cfg.DatabaseURL); err != nil {
+	migrationDSN, releaseMigrationDSN, err := store.RegisterMigrationDSN(cfg.DatabaseURL)
+	if err != nil {
+		return err
+	}
+	err = store.Migrate(ctx, migrationDSN)
+	releaseMigrationDSN()
+	if err != nil {
 		return err
 	}
 
