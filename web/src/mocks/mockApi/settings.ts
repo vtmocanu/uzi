@@ -1101,8 +1101,9 @@ export const settingsApi = {
         continue;
       }
       if (EPHEMERAL_WORKER_KEYS.has(key)) {
-        // PRD #4212: "" resets to the default; otherwise mirror the server validators.
-        if (value === "") {
+        // PRD #4212: "" (or whitespace, trimmed like the server's NormalizeForStorage) resets
+        // to the default; otherwise mirror the server validators.
+        if (value.trim() === "") {
           explicitWorkerKeys.delete(key);
           (nonSecret as Record<string, string>)[key] = SEED_APP_SETTINGS[key as keyof AppSettings] as string;
           continue;

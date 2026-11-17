@@ -69,6 +69,19 @@ describe("mock worker size, cap and lease settings (PRD #4212)", () => {
   });
 
   it.each([
+    ["ephemeral_max_per_user", "5", "2"],
+    ["ephemeral_default_size", "s", "m"],
+    ["hosted_default_size", "s", "l"],
+    ["ephemeral_lease", "30m", "2h"],
+  ])("a whitespace-only %s resets it to the default like the server", async (key, saved, def) => {
+    const api = await reload();
+    await api.updateSettings({ [key]: saved });
+    const reset = await api.updateSettings({ [key]: "   " });
+    expect((reset.settings as Record<string, string>)[key]).toBe(def);
+    expect(reset.sources[key]).toBe("default");
+  });
+
+  it.each([
     ["ephemeral_max_per_user", "21"],
     ["ephemeral_max_per_user", "abc"],
     ["ephemeral_default_size", "xl"],
