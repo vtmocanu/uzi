@@ -648,7 +648,7 @@ was assertion-red but is not credited as the individual controls; compilation
 failures and timeouts are not assertion-red proofs. Raw failed-attempt manifests are retained. No overall failed
 attempt script is credited as PASS; credit is individual with before/after green.
 
-## PENDING method clarification — preservation effects
+## Preservation effects — source census and subsequent method amendment
 
 Architect source analysis distinguishes a closed RUN six-column write
 projection from preservation of other tables (no journal/input/custody writes).
@@ -690,12 +690,66 @@ kind=question. No separate questions table is invented. Complete trigger,
 accounting and presentation behavior remains a worker validation obligation;
 this source census is not new red/green evidence or a database-effects waiver.
 
-Pending proposal, **not approved**: one compiling mutant per named
+Proposal at 4db59ee48, **not approved at that revision**: one compiling mutant per named
 preservation seam introduces exactly one narrow forbidden effect through the
 real route/store or Runner, leaving other fences/effects intact; the relevant
 preservation assertion must turn red and the candidate stay green. This is
 not guard removal authorized by the current methods. Formal owner method
-clarification is required for that proposal; no functional waiver is sought.
+clarification was requested for that proposal; no functional waiver is sought.
 The conclusion is bounded to the traced accepted route, trigger closure and
 configured consumers, not every code path or deployed schema. Preservation
 rows stay unvalidated and m3/m4 remain **INCOMPLETE**.
+
+
+### E1 — base-journal deletion effect-injection sensitivity control
+
+The subsequent owner amendment permits one narrow forbidden effect per named
+preservation seam where the traced route has no existing write guard to remove.
+This changes the proof method only: no functional criterion is waived or deferred.
+Label this evidence **effect-injection sensitivity control**, not historical
+restoration, guard removal or proof of absence of every other effect.
+
+Candidate: 4db59ee485d42b251e438fa63c5315aa17991ec0. Named seam:
+first accepted stopped settlement's base credential journal preservation.
+The sole injected effect is deletion from run_credential_epochs for the run
+returned by the existing changed CTE. Source query :40 and generated query :50
+both add the same one data-modifying CTE; this is one executing effect, not two:
+
+```sql
+), forbidden_effect AS (
+    DELETE FROM run_credential_epochs WHERE run_id IN (SELECT id FROM changed) RETURNING run_id
+```
+
+All eligibility guards, six RUN assignments and response expressions remain
+unchanged. The existing fixture records a base epoch at
+codex_switch_stopped_guards_livedb_test.go:83–88. The real authenticated state
+route reaches stopCodexSwitch, then SetCodexSwitchStopped under worker/run locks;
+its accepted first transition populates changed, so the deletion executes before
+transaction commit. The whole-row base snapshot at :133 is compared after the
+route response. The deletion control does not execute on an already-paused replay.
+
+Receipt: .uzi/scratch/stopped-journal-effect-results.json, including exact diffs,
+source/mutant hashes, command, leaf actions and PostgreSQL execution trace.
+Unchanged before gate-log.5OuGIS exited 0; mutant gate-log.AJJe8D exited 1 at
+:217, `snapshot changed in base`; unchanged after gate-log.QnDTeg exited 0.
+All log names are under .uzi/scratch/. The selected leaf was
+TestWorkerCodexStoppedGuardsRouteLiveDB/fresh_and_replay with no skips.
+Command, from api, with GOFLAGS=-p=1 and GOMAXPROCS=4:
+
+```sh
+go test -buildvcs=false -race -count=1 -json -timeout=4m ./internal/handler -run '^TestWorkerCodexStoppedGuardsRouteLiveDB$/^fresh_and_replay$'
+```
+
+The compiling mutant failed the preservation assertion, not a SQLSTATE, timeout
+or build failure. Database trace gate-log.51NJff records the base insertion,
+mutant statement and subsequent unchanged settlement/replay statements. The
+lead checked the receipt and corresponding log events. Two preparation errors
+(query terminator comparison and catalog query before migration) preceded mutant
+execution and are excluded from proof. One export was used at a time and removed;
+the exact recreated PostgreSQL fixture was removed with exit 0. No primary source
+mutation, installs or base builds occurred.
+
+E1 proves this assertion detects this journal deletion at this first-settlement
+seam only. It does not discharge switch-journal, input, custody, accounting,
+canonical gate, question or replay-effect preservation. Those clauses and all
+other unvalidated rows remain required; m3 and m4 remain **INCOMPLETE**.

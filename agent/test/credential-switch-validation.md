@@ -470,10 +470,10 @@ uIV7Ng timeout, resume attempt3/4 timeouts, and the mixed persist run
 superseded by separate controls. Raw failed-attempt manifests remain retained;
 no overall failed script receives PASS credit.
 
-### PENDING preservation-method clarification
+### Preservation-method clarification history
 
 The [bounded source analysis and proposal](credential-switch-proof-ledger.md#pending-method-clarification--preservation-effects)
-remain an unapproved method proposal after the bounded writer/trigger census below. A closed RUN
+were an unapproved method proposal at 4db59ee48 after the bounded writer/trigger census below. A closed RUN
 six-column projection might support class (d) allowlist widening like B3;
 none has executed. At the direct-query seam, preservation of other tables has no existing write guard to
 remove: direct STOP SQL writes RUN only and the service then rereads,
@@ -498,8 +498,9 @@ can change presentation anchors. Canonical gates are runs.gate_* plus
 run_gate_presentations; question identity is runs.open_question_id and content
 is kind=question run_messages. The ledger records this scope and its limits.
 Accounting, trigger and presentation coverage remains a worker obligation,
-not a deferred criterion. Formal owner method clarification is required for
-the proposed new forbidden-effect control, not a functional waiver.
+not a deferred criterion. Formal owner method clarification was requested for
+the proposed new forbidden-effect control, not a functional waiver. The subsequent
+method amendment and first executed control are recorded below.
 
 ## Outstanding evidence
 
@@ -527,3 +528,27 @@ PR CI under the approved boundary (full agent suite: exact-head PR CI).
 Live cross-account thread resume with two real accounts remains owner acceptance,
 unverified and non-closing. Existing optional review notes above remain optional;
 this record creates no new acceptance gates.
+
+
+## First authorized effect-injection sensitivity control
+
+The owner subsequently permitted one narrow forbidden effect per named
+preservation seam implemented by absence of writes. No functional criterion
+was waived or deferred. E1 in the proof ledger records a single base-journal
+deletion tied to changed run IDs during the first accepted stopped settlement,
+through the real authenticated API route and store transaction at 4db59ee48.
+Source and generated SQL add the same CTE; all fences and other effects remain
+intact. The existing fixture and comparator were unchanged.
+
+Receipt .uzi/scratch/stopped-journal-effect-results.json records unchanged
+before exit 0 (gate-log.5OuGIS), compiling mutant exit 1 at
+`snapshot changed in base` (gate-log.AJJe8D), and unchanged after exit 0
+(gate-log.QnDTeg), under the serial handler race command quoted in E1. No skips,
+SQLSTATE, build failure or timeout supplied the red. PostgreSQL trace and hashes
+are recorded; the lead inspected receipt and log events. Preparation errors
+before mutant execution are excluded. Export and exact owned fixture were
+removed, primary unchanged. No new full-suite or security-gate claim is made.
+
+Credit is only detection of this particular first-settlement journal deletion.
+Other preservation seams, replay effects, transactional/runtime clauses and m4
+remain required and unvalidated as listed. m3/m4 remain **INCOMPLETE**.
