@@ -242,7 +242,7 @@ func TestReapLaneMismatchLiveDB(t *testing.T) {
 	plainOnUnbound := seed(unbound2, false)
 
 	// A long deadline, so only the mismatch arm can fire on these just-created workers.
-	prov := hostedsvc.NewEphemeralProvisioner(fx.pool, fx.q, fx.box, nil, hostedsvc.EphemeralConfig{BackgroundGrace: 5 * time.Minute, ProvisionDeadline: time.Hour})
+	prov := hostedsvc.NewEphemeralProvisioner(fx.pool, fx.q, fx.box, ephemeralLeaseSettings(0), hostedsvc.EphemeralConfig{BackgroundGrace: 5 * time.Minute, ProvisionDeadline: time.Hour})
 	if _, err := prov.ReapPass(fx.ctx); err != nil {
 		t.Fatalf("ReapPass: %v", err)
 	}
@@ -402,7 +402,7 @@ func TestReapLaneWorkerWithoutFetchProtocolLiveDB(t *testing.T) {
 	}
 
 	// A long deadline, so only the no-protocol arm can fire on these just-created workers.
-	prov := hostedsvc.NewEphemeralProvisioner(fx.pool, fx.q, fx.box, nil, hostedsvc.EphemeralConfig{BackgroundGrace: 5 * time.Minute, ProvisionDeadline: time.Hour})
+	prov := hostedsvc.NewEphemeralProvisioner(fx.pool, fx.q, fx.box, ephemeralLeaseSettings(0), hostedsvc.EphemeralConfig{BackgroundGrace: 5 * time.Minute, ProvisionDeadline: time.Hour})
 	if _, err := prov.ReapPass(fx.ctx); err != nil {
 		t.Fatalf("ReapPass: %v", err)
 	}

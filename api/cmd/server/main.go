@@ -611,8 +611,8 @@ func run() error {
 	wsvc.SetHibernationAutoSettings(settingsCache)
 	// Issue #1965: a profile-bound run on a deployment without the lane says so instead of waiting.
 	wsvc.SetIsolatedLaneEnabled(cfg.IsolatedLaneEnabled())
-	// PRD #2006: lease entry on a worker-reported terminal and lease-arm claims (0 disables).
-	wsvc.SetEphemeralLease(cfg.EphemeralLease)
+	// PRD #2006 / #4212: the lease (lease entry on a worker-reported terminal, lease-arm claims; 0
+	// disables) is read per decision from the settings cache set just above, never snapshotted.
 
 	// Completion-interlock rollout switch (PRD #1226 M1, D1): createRun reads it from the
 	// same settings cache to decide whether to stamp completion_contract_version=1 on a new
@@ -810,14 +810,11 @@ func run() error {
 		// Issue #1965: lane workers are provisioned only where the chart enabled the lane.
 		IsolatedLaneEnabled: cfg.IsolatedLaneEnabled(),
 		DockerEnabled:       cfg.WorkerDockerEnabled,
-		MaxPerUser:          cfg.EphemeralMaxPerUser,
-		DefaultSize:         cfg.EphemeralDefaultSize,
 		ProvisionDeadline:   cfg.EphemeralProvisionDeadline,
 		SaturationDelay:     cfg.EphemeralSaturationDelay,
 		BackgroundGrace:     cfg.WorkerBackgroundGrace,
-		// PRD #2006: a finished ephemeral worker's lease (0 disables). The reaper spares a
-		// live lease and provisioning evicts the oldest releasable one at the cap.
-		Lease: cfg.EphemeralLease,
+		// PRD #4212: the per-user cap, default size and lease are admin settings the provisioner
+		// reads per pass from settingsCache (env overlay included), not config here.
 	})
 
 	// PRD #4205 M5: the demand-wake pass. Shares the claim knobs ClaimRun uses so its demand query
@@ -828,7 +825,6 @@ func run() error {
 		WorkerAffinityCeiling:   cfg.WorkerAffinityCeiling,
 		WorkerHeartbeatStale:    cfg.WorkerHeartbeatStale,
 		BackgroundGrace:         cfg.WorkerBackgroundGrace,
-		Lease:                   cfg.EphemeralLease,
 	})
 
 	sweep := sweeper.New(wsvc, cfg.SweepInterval,

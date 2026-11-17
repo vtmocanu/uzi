@@ -42,18 +42,25 @@ func (fx *ephemeralFixture) dockerProvisioner(preference, tier, member bool, max
 	if member {
 		list = fx.repoID.String()
 	}
-	sc := settings.New(&settingsStore{rows: []store.AppSetting{
-		{Key: settings.KeyEphemeralWorkersEnabled, Value: "true"},
-		{Key: settings.KeyDockerRepoAllowlist, Value: list},
-	}}, time.Minute)
+	sc := settings.New(&settingsStore{rows: dockerSettingRows(list, max, 0)}, time.Minute)
 	values := []uuid.UUID{}
 	if member {
 		values = append(values, fx.repoID)
 	}
 	probe := &dockerAllowlistProbe{Cache: sc, values: values, fail: fail}
 	return hostedsvc.NewEphemeralProvisioner(fx.pool, fx.q, fx.box, probe, hostedsvc.EphemeralConfig{BackgroundGrace: 5 * time.Minute,
-		DockerEnabled: tier, MaxPerUser: max, DefaultSize: "m",
+		DockerEnabled: tier,
 	}), probe
+}
+
+// dockerSettingRows is the settings snapshot of a Docker provisioning test: the kill-switch on, the
+// given Docker repository allowlist value, and the cap and lease the provisioner now reads from
+// settings (PRD #4212).
+func dockerSettingRows(allowlist string, maxPerUser int, lease time.Duration) []store.AppSetting {
+	return append([]store.AppSetting{
+		{Key: settings.KeyEphemeralWorkersEnabled, Value: "true"},
+		{Key: settings.KeyDockerRepoAllowlist, Value: allowlist},
+	}, ephemeralSettingRows(maxPerUser, lease)...)
 }
 
 func TestEphemeralDockerProvisionPassLiveDB(t *testing.T) {
@@ -256,12 +263,9 @@ func TestEphemeralDockerExcludedCandidatesLiveDB(t *testing.T) {
 		run := fx.boundQueuedRun(profile, nil)
 		// Use the real settings cache, with both the preference and admin scope on.
 		cliMustExec(t, fx.pool, "UPDATE users SET ephemeral_docker_enabled=true WHERE id=$1", fx.userID)
-		sc := settings.New(&settingsStore{rows: []store.AppSetting{
-			{Key: settings.KeyEphemeralWorkersEnabled, Value: "true"},
-			{Key: settings.KeyDockerRepoAllowlist, Value: fx.repoID.String()},
-		}}, time.Minute)
+		sc := settings.New(&settingsStore{rows: dockerSettingRows(fx.repoID.String(), 2, 0)}, time.Minute)
 		p := hostedsvc.NewEphemeralProvisioner(fx.pool, fx.q, fx.box, sc, hostedsvc.EphemeralConfig{BackgroundGrace: 5 * time.Minute,
-			DockerEnabled: true, IsolatedLaneEnabled: true, MaxPerUser: 2, DefaultSize: "m",
+			DockerEnabled: true, IsolatedLaneEnabled: true,
 		})
 		if _, err := p.ProvisionPass(fx.ctx); err != nil {
 			t.Fatal(err)
@@ -303,7 +307,12 @@ func TestEphemeralDockerFinalPlacementLiveDB(t *testing.T) {
 			run := fx.followUp(warm)
 			_, probe := fx.dockerProvisioner(tc.pref, tc.tier, tc.member, 2, tc.fail)
 			// Use the same settings snapshot with a live lease.
-			p := hostedsvc.NewEphemeralProvisioner(fx.pool, fx.q, fx.box, probe, hostedsvc.EphemeralConfig{BackgroundGrace: 5 * time.Minute, DockerEnabled: tc.tier, MaxPerUser: 2, DefaultSize: "m", Lease: 2 * time.Hour})
+			list := ""
+			if tc.member {
+				list = fx.repoID.String()
+			}
+			probe.Cache = settings.New(&settingsStore{rows: dockerSettingRows(list, 2, 2*time.Hour)}, time.Minute)
+			p := hostedsvc.NewEphemeralProvisioner(fx.pool, fx.q, fx.box, probe, hostedsvc.EphemeralConfig{BackgroundGrace: 5 * time.Minute, DockerEnabled: tc.tier})
 			if _, err := p.ProvisionPass(fx.ctx); err != nil {
 				t.Fatal(err)
 			}
@@ -338,11 +347,12 @@ func TestEphemeralDockerWarmStepAsideLiveDB(t *testing.T) {
 	cliMustExec(t, fx.pool, "UPDATE workers SET docker_enabled=false WHERE id=$1", warm.id)
 	run := fx.followUp(warm)
 	_, probe := fx.dockerProvisioner(true, true, true, 2, false)
-	p := hostedsvc.NewEphemeralProvisioner(fx.pool, fx.q, fx.box, probe, hostedsvc.EphemeralConfig{BackgroundGrace: 5 * time.Minute, DockerEnabled: true, MaxPerUser: 2, DefaultSize: "m", Lease: 2 * time.Hour})
+	probe.Cache = settings.New(&settingsStore{rows: dockerSettingRows(fx.repoID.String(), 2, 2*time.Hour)}, time.Minute)
+	p := hostedsvc.NewEphemeralProvisioner(fx.pool, fx.q, fx.box, probe, hostedsvc.EphemeralConfig{BackgroundGrace: 5 * time.Minute, DockerEnabled: true})
 	svc := workersvc.New(fx.q, fx.box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit(), WorkerHeartbeatStale: time.Minute, WorkerAffinityCeiling: time.Minute})
 	svc.SetVault(vault.NewPostgres(fx.box, fx.pool))
 	svc.SetTxBeginner(fx.pool)
-	svc.SetEphemeralLease(2 * time.Hour)
+	svc.SetEphemeralSettings(ephemeralLeaseSettings(2 * time.Hour))
 	svc.SetDockerAllowlist(probe)
 	svc.SetEffectiveDockerTier(true)
 	svc.SetBackground(func(func()) {})

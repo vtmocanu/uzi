@@ -19,12 +19,22 @@ import (
 // PRD #4205 M5: the demand-wake pass and its suppression of ephemeral provisioning, over a real
 // database. Skipped without UZI_TEST_DATABASE_URL; run via ./e2e/run-store-it.sh.
 
-type wakeSettings struct{ ephemeralOn bool }
+// wakeSettings is the settings view of a wake test; lease is settable per test through wakeEnv.settings.
+type wakeSettings struct {
+	ephemeralOn bool
+	lease       time.Duration
+}
 
-func (s wakeSettings) EphemeralWorkersEnabled(context.Context) (bool, error) {
+func (s *wakeSettings) EphemeralWorkersEnabled(context.Context) (bool, error) {
 	return s.ephemeralOn, nil
 }
-func (wakeSettings) DockerRepoAllowlist(context.Context) ([]uuid.UUID, error) {
+
+// The cap, size and lease the provisioner and the waker read per pass (PRD #4212); they replaced the
+// EphemeralConfig MaxPerUser and DefaultSize fields and the zero Lease these tests ran with.
+func (*wakeSettings) EphemeralMaxPerUser(context.Context) (int, error)        { return 5, nil }
+func (*wakeSettings) EphemeralDefaultSize(context.Context) (string, error)    { return "m", nil }
+func (s *wakeSettings) EphemeralLease(context.Context) (time.Duration, error) { return s.lease, nil }
+func (*wakeSettings) DockerRepoAllowlist(context.Context) ([]uuid.UUID, error) {
 	return []uuid.UUID{}, nil
 }
 
@@ -33,15 +43,16 @@ type hibSettingsOff struct{}
 func (hibSettingsOff) WorkerHibernationEnabled(context.Context) (bool, error) { return false, nil }
 
 type wakeEnv struct {
-	t     *testing.T
-	ctx   context.Context
-	pool  *pgxpool.Pool
-	q     *store.Queries
-	svc   *workersvc.Service
-	waker *HibernationWaker
-	prov  *EphemeralProvisioner
-	user  uuid.UUID
-	repo  uuid.UUID
+	t        *testing.T
+	ctx      context.Context
+	pool     *pgxpool.Pool
+	q        *store.Queries
+	svc      *workersvc.Service
+	waker    *HibernationWaker
+	settings *wakeSettings
+	prov     *EphemeralProvisioner
+	user     uuid.UUID
+	repo     uuid.UUID
 }
 
 var wakeIID atomic.Int64
@@ -76,22 +87,21 @@ func newWakeEnv(t *testing.T, ephemeralOn bool) *wakeEnv {
 	e.exec(`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
 	        VALUES ($1, $2, 1, $3, $4, 'main', true)`, e.repo, conn, "g/"+e.repo.String(), "https://forge.e2e/g/"+e.repo.String())
 
+	e.settings = &wakeSettings{ephemeralOn: ephemeralOn}
 	e.svc = workersvc.New(q, box, workersvc.Params{WorkerHeartbeatStale: 45 * time.Second})
 	e.svc.SetTxBeginner(pool)
 	// Both settings are OFF in every test: the wake pass must not depend on either (D7).
 	e.svc.SetHibernationSettings(hibSettingsOff{})
-	e.waker = NewHibernationWaker(q, e.svc, wakeSettings{ephemeralOn: ephemeralOn}, HibernationWakerConfig{
+	e.waker = NewHibernationWaker(q, e.svc, e.settings, HibernationWakerConfig{
 		WorkerAffinityGrace:   2 * time.Minute,
 		WorkerAffinityCeiling: 2 * time.Hour,
 		WorkerHeartbeatStale:  45 * time.Second,
 		BackgroundGrace:       15 * time.Minute,
 	})
-	e.prov = NewEphemeralProvisioner(pool, q, box, wakeSettings{ephemeralOn: ephemeralOn}, EphemeralConfig{
+	e.prov = NewEphemeralProvisioner(pool, q, box, e.settings, EphemeralConfig{
 		WorkerAffinityGrace:   2 * time.Minute,
 		WorkerAffinityCeiling: 2 * time.Hour,
 		BackgroundGrace:       15 * time.Minute,
-		MaxPerUser:            5,
-		DefaultSize:           "m",
 		ProvisionDeadline:     10 * time.Minute,
 	})
 	return e
@@ -470,7 +480,7 @@ func (e *wakeEnv) leasedEphemeral(run uuid.UUID) uuid.UUID {
 func TestHibernationWakePassHonoursTheConfiguredLeaseLiveDB(t *testing.T) {
 	t.Run("a leased ephemeral worker that can take the run through its lease: no sleeper is woken", func(t *testing.T) {
 		e := newWakeEnv(t, false)
-		e.waker.cfg.Lease = time.Hour
+		e.settings.lease = time.Hour
 		sleeper := e.sleeper(nil, nil, time.Hour)
 		run := e.queuedRun()
 		e.leasedEphemeral(run)

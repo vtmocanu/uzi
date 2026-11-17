@@ -8,7 +8,6 @@ import (
 
 	"github.com/jackc/pgx/v5/pgtype"
 
-	"github.com/vtmocanu/uzi/api/internal/config"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -51,19 +50,19 @@ func ptrTime(t time.Time) *time.Time { return &t }
 // cordon (draining_since) removes it.
 func TestWorkerDTOEphemeralLeaseJSON(t *testing.T) {
 	now := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
-	h := &Handler{cfg: config.Config{EphemeralLease: 2 * time.Hour}, now: func() time.Time { return now }}
+	h := &Handler{now: func() time.Time { return now }}
 	since := pgtype.Timestamptz{Time: now.Add(-30 * time.Minute), Valid: true}
 	drain := pgtype.Timestamptz{Time: now.Add(-time.Minute), Valid: true}
 
 	live := workerDTOFromWorker(store.Worker{LeaseSince: since}, 0, false, "", "", "", now, now)
-	h.overlayEphemeralLease(&live, since, pgtype.Timestamptz{})
+	h.overlayEphemeralLease(&live, since, pgtype.Timestamptz{}, 2*time.Hour)
 	b, _ := json.Marshal(live)
 	if !strings.Contains(string(b), `"ephemeral_lease_expires_at":"2026-10-01T13:30:00Z"`) {
 		t.Fatalf("live lease missing from JSON: %s", b)
 	}
 
 	cordoned := workerDTOFromWorker(store.Worker{LeaseSince: since}, 0, false, "", "", "", now, now)
-	h.overlayEphemeralLease(&cordoned, since, drain)
+	h.overlayEphemeralLease(&cordoned, since, drain, 2*time.Hour)
 	b, _ = json.Marshal(cordoned)
 	if strings.Contains(string(b), "ephemeral_lease_expires_at") {
 		t.Fatalf("cordoned worker must omit the lease: %s", b)

@@ -15,7 +15,7 @@ func TestCrossCheckEphemeralBindingLiveDB(t *testing.T) {
 			for _, snapshot := range []bool{false, true} {
 				t.Run(fmt.Sprintf("%s/%s/snapshot=%v", lane, binding, snapshot), func(t *testing.T) {
 					f := laneFixture(t)
-					f.svc.SetEphemeralLease(2 * time.Hour)
+					f.svc.SetEphemeralSettings(fakeEphemeralSettings{lease: 2 * time.Hour})
 					f.env.exec(`UPDATE runs SET worker_id=$2 WHERE id=$1`, f.lead, f.workerID)
 					bound := f.lead
 					switch binding {
@@ -68,7 +68,7 @@ func TestCrossCheckEphemeralLifecycleLiveDB(t *testing.T) {
 	for _, lane := range []string{"cross_check", "run"} {
 		t.Run(lane, func(t *testing.T) {
 			f := laneFixture(t)
-			f.svc.SetEphemeralLease(2 * time.Hour)
+			f.svc.SetEphemeralSettings(fakeEphemeralSettings{lease: 2 * time.Hour})
 			f.env.exec(`UPDATE runs SET worker_id=$2 WHERE id=$1`, f.lead, f.workerID)
 			f.env.exec(`UPDATE workers SET ephemeral=true,ephemeral_run_id=$2,kind='hosted',
 				hosted_size='s',template_declared='{}',online_since=now(),created_at=now() WHERE id=$1`, f.workerID, f.lead)

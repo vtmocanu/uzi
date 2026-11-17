@@ -27,14 +27,10 @@ import (
 
 // leaseProvisioner builds the real provisioner with the lease configured.
 func (fx *ephemeralFixture) leaseProvisioner(maxPerUser int, lease time.Duration) *hostedsvc.EphemeralProvisioner {
-	sc := settings.New(&settingsStore{rows: []store.AppSetting{
+	sc := settings.New(&settingsStore{rows: append([]store.AppSetting{
 		{Key: settings.KeyEphemeralWorkersEnabled, Value: "true"},
-	}}, time.Minute)
-	return hostedsvc.NewEphemeralProvisioner(fx.pool, fx.q, fx.box, sc, hostedsvc.EphemeralConfig{BackgroundGrace: 5 * time.Minute,
-		MaxPerUser:  maxPerUser,
-		DefaultSize: "m",
-		Lease:       lease,
-	})
+	}, ephemeralSettingRows(maxPerUser, lease)...)}, time.Minute)
+	return hostedsvc.NewEphemeralProvisioner(fx.pool, fx.q, fx.box, sc, hostedsvc.EphemeralConfig{BackgroundGrace: 5 * time.Minute})
 }
 
 // leasedIdle is an ephemeral worker that served `served` and entered its lease through the real
@@ -285,9 +281,9 @@ func TestEphemeralLeaseReapPassLiveDB(t *testing.T) {
 
 	reap := func(lease time.Duration) {
 		t.Helper()
-		sc := settings.New(&settingsStore{}, time.Minute)
+		sc := settings.New(&settingsStore{rows: ephemeralSettingRows(2, lease)}, time.Minute)
 		p := hostedsvc.NewEphemeralProvisioner(fx.pool, fx.q, fx.box, sc, hostedsvc.EphemeralConfig{BackgroundGrace: 5 * time.Minute,
-			MaxPerUser: 2, DefaultSize: "m", ProvisionDeadline: deadline, Lease: lease,
+			ProvisionDeadline: deadline,
 		})
 		if _, err := p.ReapPass(fx.ctx); err != nil {
 			t.Fatalf("ReapPass: %v", err)

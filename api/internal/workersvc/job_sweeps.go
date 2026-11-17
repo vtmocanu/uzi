@@ -76,7 +76,9 @@ func (s *Service) FailJobsWithUnservableEphemeral(ctx context.Context, provision
 		failed = append(failed, out...)
 		// Delete in every case: when the job was failed the worker is dead weight, and when a
 		// capable worker claimed the job first only the stale ephemeral row goes. The delete
-		// keeps the busy and custody guards, so a held worker survives to a later tick.
+		// keeps the busy and custody guards, so a held worker survives to a later tick. The lease is
+		// deliberately left NULL (no lease): this worker's run is unservable, so a lease must never
+		// keep the row alive, whatever the ephemeral_lease setting currently is.
 		if _, err := qtx.DeleteEphemeralWorkerForRun(ctx, store.DeleteEphemeralWorkerForRunParams{RunID: r.RunID}); err != nil {
 			return 0, fmt.Errorf("delete unservable ephemeral worker %s: %w", r.WorkerID, err)
 		}

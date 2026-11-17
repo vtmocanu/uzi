@@ -311,7 +311,16 @@ func (s *Service) ReportPolicyHold(ctx context.Context, worker store.Worker, run
 			}
 		}
 		s.retainOrDeleteCheckpoint(ctx, runID, updated.Kind, updated.IssueIid)
-		s.maybeTeardownEphemeral(ctx, currentWorker, updated, false)
+		// PRD #4212: the live lease, read only for an ephemeral worker. A failed read skips the delete;
+		// the ephemeral reaper is the backstop, and deleting against a guessed lease could remove a
+		// worker whose lease is live.
+		if currentWorker.Ephemeral {
+			if lease, lerr := s.currentEphemeralLease(ctx); lerr != nil {
+				slog.Warn("policy cancel: read ephemeral lease; leaving the worker to the reaper", "run", runID, "worker", currentWorker.ID, "error", lerr)
+			} else {
+				s.maybeTeardownEphemeral(ctx, currentWorker, updated, false, lease)
+			}
+		}
 		reply.Disposition = "terminal"
 		reply.ObservedStatus = updated.Status
 		reply.HoldReason = updated.HoldReason.String
