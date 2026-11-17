@@ -1,7 +1,8 @@
 # Live Codex switching: per-seam proof ledger
 
 Base: a233883de3c36bae2e940f999cd9d582889dad00.
-Latest stopped-guard source/test revision: 76cc31aee1b0dafd644e9fa3fb7593442dc7ed6b.
+Latest stopped-authority control candidate: 2de82eafb2ace6b0a03c10de8f7a582b7b1d97bd.
+Earlier stopped-guard controls: 76cc31aee1b0dafd644e9fa3fb7593442dc7ed6b.
 Earlier Runner controls below used 6a7e7ae11b43c8fbf658d8b2fdcc557441c699c8
 and the replacement-first adoption assertion as specified per control.
 Results belong to their recorded revisions; this is not an exact-head full-suite claim.
@@ -32,7 +33,8 @@ criterion is accepted, waived or deferred.
   Runner/switch path, or the real API route and store transaction for server
   fences, with unchanged-candidate green. Label it a **guard control**, not
   pre-feature baseline evidence. Each negative case needs its own control;
-  removing several guards together does not discharge them individually.
+  neutralizing more than one semantic fence together is invalid. The resolved
+  redundant-fence method below permits enumerated copies of one fence.
 
 Mixed clauses are split. An old helper does not establish historical
 provenance for new callers, ordering or authority fences. Each required
@@ -276,6 +278,119 @@ This credits five epoch cases, sixteen pending-kind/state cases and three
 budget/clock/write cases. It does not credit the other stopped guards or
 broader preservation and strict-wire clauses below.
 
+### D25–D56 — stopped authority and wire guard controls, class (d)
+
+The lead completed `.uzi/scratch/stopped-authority-controls.py`, exit 0, at
+2de82eafb2ace6b0a03c10de8f7a582b7b1d97bd. The manifest
+`.uzi/scratch/stopped-authority-results.json` records 32 individual
+**guard controls**: 28 SQL running/paused cases and four wire cases.
+The shared baseline refusal/absence quotes below apply; these are not
+pre-feature baseline evidence. The matrix previously recorded as positive
+at dda69dd2d now has qualifying evidence for these 32 seams only.
+
+The authority fixture uses the existing authenticated WorkerRoutes and
+pool-backed store transaction fixture. Generation/release cases require
+no milestone reconciliation so the outer reconciliation check cannot mask
+the SQL guard. Each mutant ran `fresh_and_replay`, which passed as an
+independent SQL-prepare control. Each selected negative compiled and exited
+1 at its intended assertion: SQL cases reported
+`refusal mismatch: status=200 applied=true`; wire cases reported
+`wire refusal status=200; want 400`. Unchanged before
+`.uzi/scratch/gate-log.6TaSyI` and after `.uzi/scratch/gate-log.XaxRVc`
+each exited 0 with 32 passes and no skips. The lead independently parsed
+all logs and verified these counts; this documentation edit did not rerun
+or independently parse those logs.
+
+Each mutant used one serial candidate export, removed immediately. There
+was no base build or installation. The owned database container was removed
+by exact name with `docker rm -fv`. SQL controls changed
+api/internal/store/queries/codex_switch_stopped.sql and
+api/internal/store/codex_switch_stopped.sql.go together; wire controls
+changed one condition in api/internal/handler/worker_state_decode.go.
+
+From the export's api directory, each control used:
+
+```sh
+GOFLAGS=-p=1 GOMAXPROCS=4 go test -buildvcs=false -race -count=1 -json -timeout=5m \
+  ./internal/handler -run '^(<target-top>|TestWorkerCodexStoppedGuardsRouteLiveDB)$/^(fresh_and_replay|<case>)$'
+```
+
+`<target-top>` is TestWorkerCodexStoppedAuthorityRouteLiveDB or
+TestWorkerCodexStoppedWireAuthorityRouteLiveDB for the selected case.
+
+Guard mapping (each change is limited to the named condition):
+
+- `registration_nonce_mismatch`: `AND w.snapshot_register_nonce = sqlc.arg(register_nonce)::text` → `AND (sqlc.arg(register_nonce)::text IS NULL OR sqlc.arg(register_nonce)::text IS NOT NULL)`; generated: `AND w.snapshot_register_nonce = $5::text` → `AND ($5::text IS NULL OR $5::text IS NOT NULL)` (source/generated pair).
+
+- `claim_generation_mismatch_no_reconciliation`: `AND r.claim_generation = sqlc.arg(claim_generation)::bigint` → `AND (sqlc.arg(claim_generation)::bigint IS NULL OR sqlc.arg(claim_generation)::bigint IS NOT NULL)`; generated: `AND r.claim_generation = $4::bigint` → `AND ($4::bigint IS NULL OR $4::bigint IS NOT NULL)` (source/generated pair).
+
+- `claim_released_no_reconciliation`: `AND r.claim_released_at IS NULL` → removed (source/generated pair).
+
+- `missing_frozen_secret`: `r.codex_secret_id IS NOT NULL AND` → removed (source/generated pair).
+
+- `missing_capability_hash`: `AND r.codex_cap_hash IS NOT NULL` → removed (source/generated pair).
+
+- `switch_requested_marker_only`: `r.credential_switch_requested_at IS NULL AND` → removed (source/generated pair).
+
+- `switch_generation_marker_only`: `AND r.credential_switch_generation IS NULL` → removed (source/generated pair).
+
+- `ordinary_hold_reason`: `r.hold_reason IS NULL AND` → removed (source/generated pair).
+
+- `pause_requested_marker_only`: `r.pause_requested_at IS NULL AND` → removed (source/generated pair).
+
+- `pause_mode_marker_only`: `AND r.pause_mode IS NULL` → removed (source/generated pair).
+
+- `stop_kind_marker_only`: `r.stop_kind IS NULL AND` → removed (source/generated pair).
+
+- `stop_reason_marker_only`: `AND r.stop_reason IS NULL` → removed (source/generated pair).
+
+- `reserve_hold_marker_only`: `AND r.reserve_hold_reason IS NULL` → removed (source/generated pair).
+
+- `status_claimed`: `AND r.status IN ('running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup', 'paused')` → removed (source/generated pair).
+
+- `extra_known_typed_member`: `if len(fields) != 4 {` → `if len(fields) < 4 {` (Go decoder).
+
+- `register_nonce_alias`: `if !ok || bytes.Equal(bytes.TrimSpace(value), []byte("null")) {` → `if (!ok && key != "register_nonce") || bytes.Equal(bytes.TrimSpace(value), []byte("null")) {` (Go decoder).
+
+| Case | Guard mapping | Individual log |
+| --- | --- | --- |
+| `running_registration_nonce_mismatch` | `registration_nonce_mismatch` | `.uzi/scratch/gate-log.6boj2O` |
+| `running_claim_generation_mismatch_no_reconciliation` | `claim_generation_mismatch_no_reconciliation` | `.uzi/scratch/gate-log.f1nAhn` |
+| `running_claim_released_no_reconciliation` | `claim_released_no_reconciliation` | `.uzi/scratch/gate-log.gL1zDh` |
+| `running_missing_frozen_secret` | `missing_frozen_secret` | `.uzi/scratch/gate-log.IeuXis` |
+| `running_missing_capability_hash` | `missing_capability_hash` | `.uzi/scratch/gate-log.styewM` |
+| `running_switch_requested_marker_only` | `switch_requested_marker_only` | `.uzi/scratch/gate-log.YkxFQN` |
+| `running_switch_generation_marker_only` | `switch_generation_marker_only` | `.uzi/scratch/gate-log.JG7UIe` |
+| `running_ordinary_hold_reason` | `ordinary_hold_reason` | `.uzi/scratch/gate-log.tzPIL4` |
+| `running_pause_requested_marker_only` | `pause_requested_marker_only` | `.uzi/scratch/gate-log.xQtPMM` |
+| `running_pause_mode_marker_only` | `pause_mode_marker_only` | `.uzi/scratch/gate-log.dnXwC9` |
+| `running_stop_kind_marker_only` | `stop_kind_marker_only` | `.uzi/scratch/gate-log.YUGXPk` |
+| `running_stop_reason_marker_only` | `stop_reason_marker_only` | `.uzi/scratch/gate-log.3pOAZu` |
+| `running_reserve_hold_marker_only` | `reserve_hold_marker_only` | `.uzi/scratch/gate-log.jDkcyp` |
+| `running_status_claimed` | `status_claimed` | `.uzi/scratch/gate-log.4mRH00` |
+| `paused_registration_nonce_mismatch` | `registration_nonce_mismatch` | `.uzi/scratch/gate-log.x40v0L` |
+| `paused_claim_generation_mismatch_no_reconciliation` | `claim_generation_mismatch_no_reconciliation` | `.uzi/scratch/gate-log.nMElyG` |
+| `paused_claim_released_no_reconciliation` | `claim_released_no_reconciliation` | `.uzi/scratch/gate-log.pA0xe8` |
+| `paused_missing_frozen_secret` | `missing_frozen_secret` | `.uzi/scratch/gate-log.DAChl9` |
+| `paused_missing_capability_hash` | `missing_capability_hash` | `.uzi/scratch/gate-log.c4CEhL` |
+| `paused_switch_requested_marker_only` | `switch_requested_marker_only` | `.uzi/scratch/gate-log.afHy5F` |
+| `paused_switch_generation_marker_only` | `switch_generation_marker_only` | `.uzi/scratch/gate-log.Vsbxdw` |
+| `paused_ordinary_hold_reason` | `ordinary_hold_reason` | `.uzi/scratch/gate-log.MutQ16` |
+| `paused_pause_requested_marker_only` | `pause_requested_marker_only` | `.uzi/scratch/gate-log.JXtsMD` |
+| `paused_pause_mode_marker_only` | `pause_mode_marker_only` | `.uzi/scratch/gate-log.bkdWPu` |
+| `paused_stop_kind_marker_only` | `stop_kind_marker_only` | `.uzi/scratch/gate-log.TSyNjf` |
+| `paused_stop_reason_marker_only` | `stop_reason_marker_only` | `.uzi/scratch/gate-log.krvMMU` |
+| `paused_reserve_hold_marker_only` | `reserve_hold_marker_only` | `.uzi/scratch/gate-log.4e2tu9` |
+| `paused_status_claimed` | `status_claimed` | `.uzi/scratch/gate-log.y97Jrq` |
+| `running_extra_known_typed_member` | `extra_known_typed_member` | `.uzi/scratch/gate-log.0OUEmN` |
+| `running_register_nonce_alias` | `register_nonce_alias` | `.uzi/scratch/gate-log.mYA3cG` |
+| `paused_extra_known_typed_member` | `extra_known_typed_member` | `.uzi/scratch/gate-log.KM3efC` |
+| `paused_register_nonce_alias` | `register_nonce_alias` | `.uzi/scratch/gate-log.J9FvFc` |
+
+These controls do not establish the whole stopped predicate, ownership,
+lane/policy exclusions, worker-latched bounds, other statuses, op_id,
+minimal acknowledgement or broader preservation.
+
 ## Clause accounting
 
 The rows below split mixed requirements. Positive coverage is recorded in
@@ -307,11 +422,16 @@ control is still absent, not that the functional criterion was deferred.
 | Stopped pending-input exclusion for eight named kinds in running and paused states | D controls: sixteen individually executed cases above; other control flags/cutoffs unvalidated |
 | Paused replay rejects expired wall budget | D: paused_expired_budget; other wall-budget branches unvalidated |
 | Paused replay uses original pause clock and performs no run update | D: paused_replay_original_clock and paused_replay_no_write |
-| Stopped registration/claim ownership and incarnation fences | Unvalidated |
-| Stopped policy/reserve and other competing-control fences | Unvalidated |
+| Stopped registration nonce equality | D25–D56: running/paused registration_nonce_mismatch only; worker-latched bounds and other incarnation clauses unvalidated |
+| Stopped claim generation and unreleased claim | D25–D56: running/paused generation/release without reconciliation; ownership and other reconciliation paths unvalidated |
+| Stopped frozen secret and capability hash presence | D25–D56: running/paused missing_frozen_secret and missing_capability_hash; binding identity/ownership unvalidated |
+| Stopped switch-request/generation, ordinary hold, pause-request/mode, stop-kind/reason and reserve-hold markers | D25–D56: individual running/paused marker cases; policy and other competing controls unvalidated |
+| Stopped refusal of claimed status | D25–D56: running/paused status_claimed; other statuses unvalidated |
+| Stopped ownership, lane and policy fences | Unvalidated; redundant-fence controls remain required |
 | Stopped replay after withdrawn X/Y; resume/reclaim and incarnation changes | Unvalidated; the fixture's single HTTP withdrawal does not discharge X/Y |
 | Stopped preservation of binding, journals, session, gates, questions and custody without input consumption/time banking | Unvalidated |
-| Bounded strict stopped request, forbidden op_id/combinations and minimal acknowledgement | Unvalidated |
+| Stopped known extra typed member and register_nonce case alias | D25–D56: four running/paused wire cases only |
+| Bounded strict stopped request, other forbidden combinations, op_id and minimal acknowledgement | Unvalidated |
 | Tokens absent from all inputs/acknowledgements/messages/logs | Targeted positive assertions present; qualifying controls and m4 security gates remain required |
 
 ## Baseline absence and the class (d) method boundary
@@ -353,7 +473,7 @@ The stopped numeric epoch equality, pending-input anti-join and paused-replay
 eligibility/accounting are new non-ordering predicates. Whole-operation
 refusal cannot discriminate those negative fences; their guards are not
 historically identical, and they are not call-order requirements. The subsequent owner class (d) extension resolves this method boundary.
-The 24 individual real-route guard controls above now discharge the precise
+The 24 earlier and 32 authority/wire real-route guard controls above discharge the precise
 credited seams, not this entire predicate. Other clauses remain required and
 unvalidated; no functional criterion is accepted, waived or deferred.
 
@@ -405,12 +525,22 @@ evidence only: no duplicate-guard mutant has been executed or credited.
 Whole-operation historical refusal does not isolate these negative fences,
 and the duplicated checks are not an ordering relocation.
 
-Class (d) does not expressly define whether a guard is an enforcing
-occurrence or a semantic fence with multiple copies. Its exact-one-guard
-and no-combined-removal requirements cannot silently authorize deleting
-both copies. Owner method clarification is required before counting a
-control that neutralizes all and only the enumerated copies of one semantic
-fence. Each negative case would still need its own compiling, real-path
-red/green control with every other fence intact. This is a proposed method
-clarification, not accepted evidence or a functional waiver. The affected
-clauses remain required and unvalidated; m3/m4 remain incomplete.
+The owner has resolved the method question: one redundant-fence guard
+control per negative case may neutralize **all and only the enumerated
+copies of one semantic fence**. Record a copy census with file/line anchors,
+the search scope, and the lock trace connecting the real route/Runner to
+each enforcing copy. Unresolved copy coverage remains unvalidated.
+The exact mutant diff must leave every other semantic fence intact;
+neutralizing more than one semantic fence in a mutant remains invalid.
+
+Each required control must compile and make the real route plus store
+transaction, or real Runner assertion, red, with the unchanged candidate
+green. Per-copy sufficiency controls are optional unless a frozen criterion
+requires independent enforcement. Do not infer independent sufficiency from
+a redundant-fence control. A single-copy mutant staying green is expected
+redundancy, not proof of a defect.
+
+No new redundant-fence control has executed. The source investigation and
+anchors above are starting points, not a completed copy census or executed
+proof. The affected controls remain required and unvalidated; no functional
+criterion is waived or deferred. m3 and m4 remain **INCOMPLETE**.

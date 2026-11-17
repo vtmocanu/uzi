@@ -4,7 +4,8 @@ This is a partial evidence ledger for issue #4202, recorded on 2026-11-17.
 It does not declare m3 or m4 complete. Earlier scratch logs were absent after
 recovery; historical commit messages are not treated as passing checks.
 
-Latest stopped-guard source/test revision: 76cc31aee1b0dafd644e9fa3fb7593442dc7ed6b.
+Latest stopped-authority control candidate: 2de82eafb2ace6b0a03c10de8f7a582b7b1d97bd.
+Earlier stopped-guard controls: 76cc31aee1b0dafd644e9fa3fb7593442dc7ed6b.
 Earlier Runner ordering candidate: 73e662c846ac9df92356dd61831967167c44d8ae.
 The primary worktree remained unchanged during those ordering controls. Both mutants
 were applied only to disposable exports of this exact candidate, with provisioned
@@ -351,15 +352,56 @@ exercise a known extra typed field and a case alias for register_nonce.
 Independent reviewer inspection at dda69dd2d found no blocking code defect.
 Its one non-blocking note was unmeasured before/after CI job and critical-path
 timing; the focused package duration above is not that measurement. No base
-build or CI timing comparison was performed. The prepared
-`.uzi/scratch/stopped-authority-controls.py` has **not** executed. These 32
-positive cases do not yet carry qualifying mutation evidence and do not
-change the unvalidated clause accounting.
+build or CI timing comparison was performed for that review.
 
-The duplicated-policy/lane proof-method boundary is recorded in the
-[proof ledger](credential-switch-proof-ledger.md#duplicated-enforcement-method-boundary).
-This is a pending method clarification, not an accepted proof or functional
-waiver. The production guards are unchanged.
+### Qualifying authority controls at 2de82eaf
+
+The lead subsequently completed `.uzi/scratch/stopped-authority-controls.py`,
+exit 0, at 2de82eafb2ace6b0a03c10de8f7a582b7b1d97bd.
+`.uzi/scratch/stopped-authority-results.json` records 32 individual class (d)
+**guard controls**, each compiled, exited 1 and failed its intended assertion.
+The [per-case ledger](credential-switch-proof-ledger.md#d25d56--stopped-authority-and-wire-guard-controls-class-d)
+records every exact log path and guard mapping, including source/generated
+SQL pair changes for 28 running/paused cases and one Go decoder condition
+per wire mutant. Shared existing baseline refusal/absence quotes apply;
+these are not pre-feature baseline proofs.
+
+The real authenticated WorkerRoutes/pool-transaction fixture is the primary
+negative-control path. Generation/release cases require an audit-free fixture
+to avoid masking by outer reconciliation. Each mutant also ran
+`fresh_and_replay`, which passed as an independent SQL-prepare control.
+SQL negatives failed with `refusal mismatch: status=200 applied=true`;
+wire negatives failed with `wire refusal status=200; want 400`.
+Unchanged before `.uzi/scratch/gate-log.6TaSyI` and after
+`.uzi/scratch/gate-log.XaxRVc` each exited 0, 32 passes, no skips.
+The lead independently parsed all logs and verified counts. This edit read
+the manifest, control script, authority fixture, SQL and decoder; it did not
+execute controls or independently parse their logs.
+
+One candidate export at a time was used serially and removed immediately;
+no base build or installation was performed. The owned database container
+was removed by exact name with `docker rm -fv`.
+
+These qualify only nonce equality, claim generation/released checks without
+reconciliation, frozen binding presence, the individually named markers,
+claimed-status refusal, and the narrow known-extra-field/nonce-alias cases
+listed in the ledger. Other statuses, ownership, lane/policy, worker-latched
+bounds, op_id, minimal acknowledgement and broader preservation remain
+unvalidated. The positive dda matrix is not proof of the whole predicate.
+
+The owner resolved the
+[duplicated-enforcement method](credential-switch-proof-ledger.md#duplicated-enforcement-method-boundary):
+one control per negative case may neutralize all and only enumerated copies
+of one semantic fence. Required evidence includes the copy census with
+file/line anchors, search scope and lock trace, exact diff leaving every
+other fence intact, compiling real route/store or Runner assertion red and
+unchanged green. Unresolved copy coverage remains unvalidated; more than
+one semantic fence per mutant remains invalid. Per-copy sufficiency controls
+are optional unless the frozen criterion requires independent enforcement;
+no independent sufficiency is claimed. Single-copy green is expected
+redundancy, not proof of a defect. No new redundant-fence control has
+executed. Controls remain required; no functional criterion is waived or
+deferred, and m3/m4 remain **INCOMPLETE**.
 
 ## Outstanding evidence
 
@@ -371,9 +413,12 @@ six additional executed controls and retains the two earlier ordering controls.
 The owner subsequently supplied class (d) for new guards without an a233
 seam: one compiling guard-removal control per negative case, through the real
 switch path or real API route and store transaction. This resolves the prior
-method question only. The 24 stopped controls above have now executed and credit only their
-specific seams. Registration/claim/incarnation, policy/reserve/other controls,
-withdrawn X/Y, broader preservation and strict-wire clauses remain unvalidated.
+method question only. The 24 earlier stopped controls and 32 authority/wire controls above have
+executed and credit only their specific seams. The ledger splits credited
+nonce, claim generation/release, binding presence, markers, claimed status
+and narrow wire cases from remaining ownership/incarnation, other statuses,
+lane/policy, worker-latched bounds, withdrawn X/Y, broader preservation,
+op_id, bounds and minimal-acknowledgement obligations.
 m3 and m4 are **INCOMPLETE**; no functional criterion is accepted, waived or
 deferred.
 
