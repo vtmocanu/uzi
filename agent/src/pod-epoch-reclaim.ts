@@ -107,7 +107,7 @@ export interface PodEpochScratchDeps {
   /** Issue #4420: the read-only authority slot accessor (AuthorityRuntime.peekSlot). Absent keeps a retired attempt (`authority_slot`). */
   authority?: { peekSlot(clonePath: string): Promise<SlotSnapshot | null> };
   /** Issue #4420: the worker's outbox (initialised before this pass). Absent or unusable keeps every `run-<uuid>` leaf (`outbox`). */
-  outbox?: Pick<Outbox, "isDisabled" | "unusableRootReason" | "hasPhysicalTerminalProtection" | "listPendingFinalizes" |
+  outbox?: Pick<Outbox, "isDisabled" | "unusableRootReason" | "hasPhysicalTerminalProtection" | "listPendingFinalizeGenerations" |
     "listPublicationRecords" | "depthFor" | "uncleanRuns">;
   /** Worker-wide exclusive-idle proof (bound to terminalMaintenanceProof). */
   quiesce: () => Promise<boolean>;
@@ -325,6 +325,8 @@ interface ScratchContext {
   client: Options["client"];
   /** The pass-scoped retained census memo shared by every run leaf's classification. */
   runDiscovery: { value?: Promise<EpochRetainedDiscoveryResult> };
+  /** The pass-scoped memo of each bare's config listing, shared by every run leaf's classification. */
+  runMemo: { bareConfigs?: Map<string, Promise<string>> };
   podUid: string;
   guard: PodEpochDaemonGuard;
   controller: AbortController;
@@ -387,10 +389,14 @@ async function outboxRetention(outbox: PodEpochScratchDeps["outbox"], runId: str
     if (outbox.isDisabled() || outbox.unusableRootReason() !== undefined) return unknownRetention("outbox");
     const id = runId.toLowerCase();
     if (await outbox.hasPhysicalTerminalProtection(runId)) return activeRetention("outbox");
-    if (outbox.listPendingFinalizes().some(p => p.run_id.toLowerCase() === id)) return activeRetention("outbox");
+    // The complete listing (every generation, terminal-holding runs included), not the register's capped view
+    // (listPendingFinalizes truncates at its entry cap and would omit a record past it).
+    if (outbox.listPendingFinalizeGenerations(true).some(p => p.run_id.toLowerCase() === id)) return activeRetention("outbox");
     if (outbox.listPublicationRecords().some(p => p.run_id.toLowerCase() === id)) return activeRetention("outbox");
     for (const key of new Set([runId, id])) {
       const depth = outbox.depthFor(key);
+      // staleRetired counts records the drainer already retired and blockedReason only labels a blocked terminal,
+      // which pendingTerminal already counts; neither is a pending record, so neither is consulted.
       if (depth && (depth.pendingMessages > 0 || depth.pendingTerminal > 0)) return activeRetention("outbox");
     }
     if (outbox.uncleanRuns().some(r => r.toLowerCase() === id)) return activeRetention("outbox");
@@ -439,7 +445,7 @@ async function runLeafKeep(ctx: ScratchContext, name: string): Promise<(typeof R
     try {
       const peek = deps.authority;
       local = normalizeRetention(await ctx.owned(() => classify.call(deps.git, runId, {
-        lifecycle, holds, signal: controller.signal, deadline: ctx.deadlineAt(), discovery: ctx.runDiscovery,
+        lifecycle, holds, signal: controller.signal, deadline: ctx.deadlineAt(), discovery: ctx.runDiscovery, memo: ctx.runMemo,
         ...(peek ? { peekSlot: (clonePath: string) => peek.peekSlot(clonePath) } : {}),
       }), ctx.hardPass));
     } catch (error) { rethrow(error); local = unknownRetention("classifier"); }
@@ -981,7 +987,7 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
       settleGits.add(scratchDeps.git);
       await runScratchPhase({
         deps: scratchDeps, seams: scratchDeps.scratchTestGate === TEST_SCRATCH_GATE ? scratchDeps.seams ?? {} : {},
-        client: options.client, runDiscovery: {},
+        client: options.client, runDiscovery: {}, runMemo: {},
         podUid: boot.podUid, guard: guard!, controller, owned, check, entry, now, hardPass, deadlineAt, out: result.scratch,
         openScope,
         interrupted: () => fatal || controller.signal.aborted,

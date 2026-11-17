@@ -2702,6 +2702,8 @@ export interface EpochScratchRunRetentionOptions {
   peekSlot?: (clonePath: string) => Promise<SlotSnapshot | null>;
   /** Pass-scoped memo of the worker-wide retained census, so N run leaves cost one census. */
   discovery?: { value?: Promise<EpochRetainedDiscoveryResult> };
+  /** Pass-scoped memo of each bare's `config --local --null --list` text (keyed by bare path), so N run leaves read each bare once. */
+  memo?: { bareConfigs?: Map<string, Promise<string>> };
 }
 
 /** The server's lifecycle verdict for a run, read by the caller (never by GitCache) before it
@@ -4935,7 +4937,14 @@ export class GitCache {
       this.checkRecoveryInterruption();
       const found = await this.withLock(bare, async (): Promise<RunRetention | { ledger: AttemptLedgerEntry[] }> => {
         await this.assertRecoveryBare(bare);
-        const config = await this.runGit(bare, ["config", "--local", "--null", "--list"]);
+        // Pass-scoped memo: each bare's config listing is read once per pass; a memoized failure re-throws for every leaf
+        // (unknown through the caller's catch). The byte cap is still charged per leaf against the memoized length.
+        let pending = opts.memo?.bareConfigs?.get(bare);
+        if (!pending) {
+          pending = this.runGit(bare, ["config", "--local", "--null", "--list"]);
+          if (opts.memo) (opts.memo.bareConfigs ??= new Map()).set(bare, pending);
+        }
+        const config = await pending;
         if ((configBytes += config.length) > limits.maxMetadataBytes) return unknownRetention("bare_config");
         const scanned = this.scanRunBareConfig(config, id);
         if ("state" in scanned) return scanned;
@@ -4963,7 +4972,7 @@ export class GitCache {
       let slot: SlotSnapshot | null;
       try { slot = await this.retainedIO(() => opts.peekSlot!(entry.clonePath)); }
       catch { this.checkRecoveryInterruption(); return unknownRetention("authority_slot"); }
-      const judged = judgeAuthoritySlot(slot);
+      const judged = judgeAuthoritySlot(footprint, slot);
       if (judged.state !== "ended") return judged;
     }
     // custodyHeld folds an unreadable store into "held" (fail closed), so that case reads as active here.

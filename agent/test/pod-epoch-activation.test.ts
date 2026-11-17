@@ -79,7 +79,7 @@ test("scratch activation is parsed once before runtime creation, wired and logge
   const main = await readFile(new URL("../src/main.ts", import.meta.url), "utf8");
   assert.equal(main.match(/readEpochScratchDeletionActivation\(process\.env\)/g)?.length, 1);
   assert.ok(main.indexOf("readEpochScratchDeletionActivation(process.env)") < main.indexOf("createPodEpoch("));
-  assert.match(main, /scratch: buildPodEpochScratchDeps\(\{ git, dockerHost: config.dockerWiring.dockerHost, activation: epochScratchDeletion \}\)/);
+  assert.match(main, /scratch: buildPodEpochScratchDeps\(\{\s*git, dockerHost: config.dockerWiring.dockerHost, activation: epochScratchDeletion,\s*authority: \{ peekSlot: clonePath => authority\.peekSlot\(clonePath\) \}, outbox,\s*\}\)/);
   assert.match(main, /"pod_epoch_reclaim_activation", \{ deletion_requested: epochReclaimDeletion, scratch_requested: epochScratchDeletion \}/);
   for (const attempt of ["0", "1"]) {
     assert.equal(readEpochScratchDeletionActivation({ UZI_EPOCH_SCRATCH_DELETION: "0", UZI_EPOCH_RECLAIM_DELETION: attempt }), false);

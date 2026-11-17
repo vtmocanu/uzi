@@ -74,7 +74,11 @@ export function judgeRetainedEvidence(s: RetainedEvidenceShape): RunRetention {
  * pending footprint, retiring record or publication is ended; any other state or any non-null field is a live
  * authority record (active); a malformed slot is unknown.
  */
-export function judgeAuthoritySlot(slot: Pick<SlotSnapshot, "state" | "pending" | "retiring" | "publication"> | null): RunRetention {
+export function judgeAuthoritySlot(footprint: "missing" | "present" | "unknown",
+    slot: Pick<SlotSnapshot, "state" | "pending" | "retiring" | "publication"> | null): RunRetention {
+  // The footprint verdict is a required input: `ended` is only reachable once the footprint is observed missing.
+  if (footprint === "present") return activeRetention("attempt_footprint");
+  if (footprint !== "missing") return unknownRetention("attempt_footprint");
   if (slot === null) return ENDED;
   if (typeof slot !== "object" || typeof slot.state !== "string") return unknownRetention("authority_slot");
   for (const field of [slot.pending, slot.retiring, slot.publication]) {

@@ -617,6 +617,20 @@ test("admission is capped at 512 leaves in name order and the rest are kept as c
   assert.equal(result.admitted.at(-1)!.name, "leaf-0511");
 });
 
+test("run-<uuid> leaves cannot starve other leaves of the 512 admission slots", () => {
+  const uuid = (n: number) => `${String(n).padStart(8, "0")}-0000-4000-8000-000000000000`;
+  const runs = Array.from({ length: MAX_ADMITTED_LEAVES }, (_, n) => entry(`run-${uuid(n)}`));
+  const result = classifyScratchCensus({ census: census([...runs, entry("tmp.bbb"), entry("tmp.aaa")]), t0Ms: 5000, mountedLeaves: NONE,
+    boundLeaves: NONE, protectedLeaves: NONE, heldLeaves: NONE });
+  const names = result.admitted.map(l => l.name);
+  assert.equal(names.length, MAX_ADMITTED_LEAVES);
+  assert.ok(names.includes("tmp.aaa") && names.includes("tmp.bbb"), "both non-run leaves are admitted");
+  assert.equal(names.filter(n => n.startsWith("run-")).length, MAX_ADMITTED_LEAVES - 2, "run leaves fill the remaining slots");
+  assert.ok(!names.includes(`run-${uuid(MAX_ADMITTED_LEAVES - 1)}`) && !names.includes(`run-${uuid(MAX_ADMITTED_LEAVES - 2)}`), "the last run leaves in name order are cut");
+  assert.equal(result.kept.cap, 2);
+  assert.deepEqual(names, [...names].sort(), "the admitted list stays in name order");
+});
+
 test("censusEntryUnchanged flags any difference from the admitted measurement", () => {
   const leaf = { name: "x", devIno: "1:1", bytes: 4096, sharedBytes: 0, maxCtimeMs: 10 };
   const same = entry("x", { devIno: "1:1", maxCtimeMs: 10 });

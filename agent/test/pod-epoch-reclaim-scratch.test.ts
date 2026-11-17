@@ -1425,12 +1425,13 @@ test("#4420 an unreadable local store is run_local_unknown for run leaves while 
 test("#4420 an outbox that is missing, disabled or throwing keeps the leaf as run_local_unknown(outbox); an outbox with a record of the run keeps it active", FD_ONLY, async () => {
   const stub = (over: Record<string, unknown>) => ({
     isDisabled: () => false, unusableRootReason: () => undefined, hasPhysicalTerminalProtection: async () => false,
-    listPendingFinalizes: () => [], listPublicationRecords: () => [], depthFor: () => undefined, uncleanRuns: () => [], ...over }) as never;
+    // listPendingFinalizes (the register's view, capped at 256 entries) is deliberately a truncated empty list here.
+    listPendingFinalizes: () => [], listPendingFinalizeGenerations: () => [], listPublicationRecords: () => [], depthFor: () => undefined, uncleanRuns: () => [], ...over }) as never;
   const unknownCases: Array<[string, unknown]> = [
     ["no outbox dependency", undefined],
     ["disabled", stub({ isDisabled: () => true })],
     ["unusable root", stub({ unusableRootReason: () => "symlink" })],
-    ["a listing that throws", stub({ listPendingFinalizes: () => { throw new Error("boom"); } })],
+    ["a listing that throws", stub({ listPendingFinalizeGenerations: () => { throw new Error("boom"); } })],
   ];
   for (const [label, outbox] of unknownCases) {
     await withRunWorld([leafOf(RUN_A)], async (w, _rw) => {
@@ -1444,7 +1445,12 @@ test("#4420 an outbox that is missing, disabled or throwing keeps the leaf as ru
   const depth = (pendingMessages: number, pendingTerminal: number) =>
     (id: string) => id === RUN_A ? { runId: id, pendingMessages, pendingTerminal, staleRetired: 0, since: 0 } : undefined;
   const activeCases: Array<[string, unknown]> = [
-    ["a pending finalize (case-insensitive)", stub({ listPendingFinalizes: () => [{ run_id: RUN_A.toUpperCase(), claim_generation: 1 }] })],
+    ["a pending finalize (case-insensitive)", stub({ listPendingFinalizeGenerations: () => [{ run_id: RUN_A.toUpperCase(), claim_generation: 1 }] })],
+    ["a pending finalize beyond the register's 256-entry truncation", stub({
+      listPendingFinalizeGenerations: () => [
+        ...Array.from({ length: 300 }, (_, n) => ({ run_id: `other-${n}`, claim_generation: 1 })),
+        { run_id: RUN_A, claim_generation: 2 }],
+    })],
     ["a publication record", stub({ listPublicationRecords: () => [{ run_id: RUN_A, claim_generation: 1 }] })],
     ["pending messages", stub({ depthFor: depth(2, 0) })],
     ["a pending terminal", stub({ depthFor: depth(0, 1) })],
@@ -1513,6 +1519,9 @@ test("#4420 server holds: an open hold, a run-wide open count, a missing run_ope
     ["no run_open_holds (unknown, never zero)", run_id => ({ run_id, holds: [] }), "run_unreadable"],
     ["run_open_holds for another run", run_id => ({ run_id, holds: [], run_open_holds: { run_id: "other", count: 0 } }), "run_unreadable"],
     ["a response for another run", () => ({ run_id: "other", holds: [], run_open_holds: { run_id: "other", count: 0 } }), "run_unreadable"],
+    ["a negative run-wide count", run_id => ({ run_id, holds: [], run_open_holds: { run_id, count: -1 } }), "run_unreadable"],
+    ["a fractional run-wide count", run_id => ({ run_id, holds: [], run_open_holds: { run_id, count: 1.5 } }), "run_unreadable"],
+    ["a non-number run-wide count", run_id => ({ run_id, holds: [], run_open_holds: { run_id, count: "0" as never } }), "run_unreadable"],
     ["a read that throws", () => { throw new Error("holds unreachable"); }, "run_unreadable"],
   ];
   for (const [label, holds, reason] of cases) {

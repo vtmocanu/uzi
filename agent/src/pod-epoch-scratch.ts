@@ -633,13 +633,22 @@ export function classifyScratchCensus(input: {
     if (input.heldLeaves.has(e.name)) return "held_open";
     return undefined;
   };
-  // Name order makes the 512 cut deterministic.
-  for (const e of [...input.census.entries].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))) {
+  // Name order makes the 512 cut deterministic. Issue #4420: kept `run-<uuid>` leaves sort before `tmp.` ones and
+  // can be permanent, so non-run leaves are offered the slots first and run leaves take what remains; the result
+  // is returned in name order.
+  const byName = [...input.census.entries].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  const eligible: CensusEntry[] = [];
+  for (const e of byName) {
     const reason = reasonOf(e);
     if (reason) kept[reason]++;
-    else if (admitted.length >= MAX_ADMITTED_LEAVES) kept.cap++;
+    else eligible.push(e);
+  }
+  const ordered = [...eligible.filter(e => !RUN_SCRATCH_LEAF_RE.test(e.name)), ...eligible.filter(e => RUN_SCRATCH_LEAF_RE.test(e.name))];
+  for (const e of ordered) {
+    if (admitted.length >= MAX_ADMITTED_LEAVES) kept.cap++;
     else admitted.push({ name: e.name, devIno: e.devIno, bytes: e.bytes, sharedBytes: e.sharedBytes, maxCtimeMs: e.maxCtimeMs });
   }
+  admitted.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
   return { examined: input.census.entries.length, admitted, kept,
     eligibleBytes: admitted.reduce((n, l) => n + l.bytes, 0), sharedBytes: admitted.reduce((n, l) => n + l.sharedBytes, 0) };
 }

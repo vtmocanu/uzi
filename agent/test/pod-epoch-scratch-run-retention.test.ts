@@ -282,6 +282,40 @@ describe("custody and the retained groups", () => {
     assert.equal(scans, 1);
   });
 
+  it("with a pass memo each bare's config is read once across run leaves; without one each leaf reads it", async t => {
+    const original = (git as unknown as { runGit: (cwd: string, args: string[]) => Promise<string> }).runGit.bind(git);
+    let configReads = 0;
+    t.mock.method(git as unknown as { runGit: typeof original }, "runGit", async (cwd: string, args: string[]) => {
+      if (args.join(" ") === "config --local --null --list") configReads++;
+      return original(cwd, args);
+    });
+    const memo: NonNullable<EpochScratchRunRetentionOptions["memo"]> = {};
+    const discovery: NonNullable<EpochScratchRunRetentionOptions["discovery"]> = {};
+    assert.deepEqual(await classify({ memo, discovery }), ENDED);
+    const afterFirst = configReads;
+    assert.ok(afterFirst >= 1);
+    assert.deepEqual(await classify({ memo, discovery }, OTHER), ENDED);
+    assert.equal(configReads, afterFirst, "a second leaf reads no bare config again");
+    cfg(`uzi-stopped.${OTHER}.entry`, "{}");
+    assert.deepEqual(await classify({ memo, discovery }, OTHER), ENDED, "the memoised listing is the pass's snapshot");
+    assert.equal(configReads, afterFirst);
+    assert.deepEqual(await classify({ discovery }, OTHER), active("stopped_marker"));
+    assert.equal(configReads, afterFirst + 1, "without a memo the leaf reads the bare's config itself");
+  });
+
+  it("a memoised config read failure stays unknown for every leaf", async t => {
+    const original = (git as unknown as { runGit: (cwd: string, args: string[]) => Promise<string> }).runGit.bind(git);
+    let configReads = 0;
+    t.mock.method(git as unknown as { runGit: typeof original }, "runGit", async (cwd: string, args: string[]) => {
+      if (args.join(" ") === "config --local --null --list") { configReads++; throw new Error("boom"); }
+      return original(cwd, args);
+    });
+    const memo: NonNullable<EpochScratchRunRetentionOptions["memo"]> = {};
+    assert.deepEqual(await classify({ memo }), unknown("classifier"));
+    assert.deepEqual(await classify({ memo }, OTHER), unknown("classifier"));
+    assert.equal(configReads, 1);
+  });
+
   it("an inventory that is incomplete or overflowing may hide the run's groups: unknown", async () => {
     for (const census of [{ inventoryComplete: false, unreadable: 0, overflow: 0 }, { inventoryComplete: true, unreadable: 1, overflow: 0 },
       { inventoryComplete: true, unreadable: 0, overflow: 2 }]) {
@@ -338,9 +372,14 @@ describe("judgeRetainedEvidence: no disposition alone yields ended", () => {
 
 describe("judgeAuthoritySlot and normalizeRetention", () => {
   it("an absent slot is ended; a malformed one is unknown", () => {
-    assert.deepEqual(judgeAuthoritySlot(null), ENDED);
-    assert.deepEqual(judgeAuthoritySlot("slot" as never), unknown("authority_slot"));
-    assert.deepEqual(judgeAuthoritySlot({ state: "ineligible", pending: null, retiring: null } as never), unknown("authority_slot"));
+    assert.deepEqual(judgeAuthoritySlot("missing", null), ENDED);
+    assert.deepEqual(judgeAuthoritySlot("missing", "slot" as never), unknown("authority_slot"));
+    assert.deepEqual(judgeAuthoritySlot("missing", { state: "ineligible", pending: null, retiring: null } as never), unknown("authority_slot"));
+  });
+  it("ended requires the footprint verdict to be missing, whatever the slot says", () => {
+    assert.deepEqual(judgeAuthoritySlot("present", null), active("attempt_footprint"));
+    assert.deepEqual(judgeAuthoritySlot("unknown", null), unknown("attempt_footprint"));
+    assert.deepEqual(judgeAuthoritySlot("bogus" as never, null), unknown("attempt_footprint"));
   });
   it("a classifier result that is not a fixed-token verdict never reads as ended", () => {
     assert.deepEqual(normalizeRetention(undefined), unknown("classifier"));
