@@ -308,7 +308,7 @@ single setting bounds self-service provisioning:
 
 Edit them in the **Hosted worker quota** card on **Admin → Workers**. The quota
 must be an integer from `0` to `20`; each setting saves independently of the other cards.
-Saving an empty value resets a setting to its default.
+Saving an empty default size (**Reset to default**) restores `l`; the quota itself has no reset and needs a number.
 
 Every size counts the same 1 against this quota; see
 [Hosted workers](./hosted-workers.md#type-and-size). This setting exists (and
@@ -335,12 +335,12 @@ unchanged. Saving an empty or whitespace-only value resets the setting to its de
 surrounding whitespace is trimmed otherwise.
 
 **Environment wins.** When the environment variable in the last column is set to a
-non-empty value, it takes precedence over the saved value: the field shows
+non-blank value, it takes precedence over the saved value: the field shows
 **Set by environment** and is disabled, and `PUT /api/admin/settings` for that key is
 refused with `409`. The environment value is interpreted as it always was, so an install
 that already sets one behaves the same after upgrading:
 
-- The cap is read leniently: a malformed value or `0` becomes `2`, and a value above
+- The cap is read leniently: a non-numeric value or `0` becomes `2` (a leading number is kept), and a value above
   `20` is honoured. So `UZI_EPHEMERAL_MAX_PER_USER=0` still means `2` and locks the field.
   To stop ephemeral provisioning, unset the variable and save `0` here, or turn the
   ephemeral workers switch off.
@@ -351,8 +351,8 @@ that already sets one behaves the same after upgrading:
 Unset the variable (on the chart, leave `workers.ephemeralLease` and
 `workers.ephemeralDefaultSize` unset) to edit the field again.
 
-**Changes take effect without a restart.** The provisioner, reaper and hibernation
-wake pass read the cap, size and lease on every pass; run claims, the lease started when a
+**Changes take effect without a restart.** The provisioner reads the cap, size and
+lease on every pass, and the reaper and hibernation wake pass read the lease on every pass; run claims, the lease started when a
 run completes, worker health and the worker list's lease expiry read the current lease.
 Other api replicas see a change within the settings cache TTL.
 
