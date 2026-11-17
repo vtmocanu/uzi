@@ -89,6 +89,81 @@ git diff --check HEAD
 Both exited 0. The task's observed stages were dependency check, lint,
 deadcode and TypeScript checks.
 
+## Transactional recovery and compatibility repair
+
+On 2026-11-17, the lead recreated a unique throwaway PostgreSQL 17 container
+using the already available image, with no persistent volumes and a loopback
+port. The container was removed by exact name after the command exited.
+With its database URL in UZI_TEST_DATABASE_URL, the lead ran from api:
+
+```sh
+GOFLAGS=-p=1 GOMAXPROCS=4 go test -race -count=1 -v ./internal/workersvc \
+  -run 'Test(Codex.*(Switch|Apply|Transactional|RefreshAdmitted|InitialSubscription)|OwnerCodex|SetRunCredentialCodex)'
+```
+
+At 2f1808dbadc98a3d7980c5d75af6fc08333d7de7 this passed, exit 0:
+49 top-level tests, no skips, package execution 64.278 seconds.
+This includes apply rollback, lost replies, account-lock ordering, refresh
+admission, policy races, stopped settlement and replay fences. It is not the
+full API suite.
+
+Independent DBA review then found that migration 00464 had replaced the
+supplied default branch's worker-roll migration. Commit 7cd40f3b1 had renamed
+the Codex additions into the occupied version instead of preserving it.
+The repair restores the default branch's 00464_worker_roll_marker.sql
+byte-for-byte and moves the Codex snapshot and pending-target additions to
+465 and 466 respectively. Final landing-time renumbering is still required
+if the default branch advances.
+
+The same focused command passed again with this repair and the following
+test changes present, exit 0, package execution 72.306 seconds:
+
+- The transaction snapshot compares complete ordered base/switch journal
+  rows, rather than row counts.
+- The spend join requires the exact original A credential at ordinal zero.
+- TestCodexSwitchMigrationUpgradeLiveDB checks a fresh schema, downgrades
+  only its independently created fixture database to version 464, confirms
+  the preserved worker-roll columns and absent Codex additions, then upgrades
+  and checks both sets of columns. Migrations at or below 464 match the
+  supplied default-branch schema after the repair.
+
+The same new migration test was copied into a disposable export of pre-repair
+2f1808dbadc98a3d7980c5d75af6fc08333d7de7, leaving that revision's defective
+migration set intact. With a separate fresh PostgreSQL fixture, the focused
+command was:
+
+```sh
+GOFLAGS=-p=1 GOMAXPROCS=4 go test -race -count=1 -v ./internal/workersvc \
+  -run '^TestCodexSwitchMigrationUpgradeLiveDB$'
+```
+
+It failed with exit 1 at
+`worker_upgrade_reports: found 0 migration columns, want 2`.
+The export and container were removed after the command exited.
+The repaired candidate passed that test in the repeated focused run above
+(7.93 seconds for this test). This is pre-repair regression evidence for the
+migration collision; it is not a live-switch ordering control or evidence
+against a233883de.
+
+### Review scope and remaining merge regressions
+
+Read-only reviewer, tester and DBA inspected the supplied-base range
+9d62bc7925371e10d6e2833b43d469367842f8d7..2f1808dbadc98a3d7980c5d75af6fc08333d7de7.
+The tester's two assertion findings are addressed by the changes above.
+The DBA's migration blocker is addressed at the schema level, but broader
+compatibility remains unresolved: the branch also removes the default branch's
+roll-marker API/controller reporting path and its tests. Other deleted
+default-branch tests include hibernation roll history, usage-poller refresh
+and Board sticky-header coverage. These removals are not justified by the
+Codex-switch feature and require explicit reconciliation before completion.
+
+Non-blocking notes from those reviews remain recorded for disposition:
+the reviewer identified coordinator orchestration called only from tests,
+and no comparable CI before/after critical-path measurement; the DBA noted
+that interrupted post-refresh cleanup may leave switching busy until another
+refresh recovers the committed account. No production failure was executed
+for these notes, and no new cleanup subsystem is introduced by this repair.
+
 ## Outstanding evidence
 
 This ledger is deliberately limited to checks re-observed after recovery.

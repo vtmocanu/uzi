@@ -115,8 +115,8 @@ func (f applyFx) snap(t *testing.T, run uuid.UUID) string {
 	var s string
 	if err := f.env.pool.QueryRow(f.env.ctx, `SELECT jsonb_build_object(
 	    'run', (SELECT to_jsonb(r) FROM runs r WHERE r.id = $1),
-	    'switch_epochs', (SELECT count(*) FROM run_credential_switch_epochs WHERE run_id = $1),
-	    'base_epochs', (SELECT count(*) FROM run_credential_epochs WHERE run_id = $1),
+	    'switch_epochs', (SELECT coalesce(jsonb_agg(to_jsonb(e) ORDER BY e.claim_generation, e.ordinal), '[]'::jsonb) FROM run_credential_switch_epochs e WHERE e.run_id = $1),
+	    'base_epochs', (SELECT coalesce(jsonb_agg(to_jsonb(e) ORDER BY e.claim_generation), '[]'::jsonb) FROM run_credential_epochs e WHERE e.run_id = $1),
 	    'messages', (SELECT coalesce(jsonb_agg(to_jsonb(m) ORDER BY m.seq), '[]'::jsonb) FROM run_messages m WHERE m.run_id = $1)
 	)::text`, run).Scan(&s); err != nil {
 		t.Fatal(err)

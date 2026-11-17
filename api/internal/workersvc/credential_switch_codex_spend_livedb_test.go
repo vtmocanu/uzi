@@ -8,6 +8,7 @@ import (
 func TestCodexSwitchSpendJoinsAuthorityEpochLiveDB(t *testing.T) {
 	f, run, target := codexApplyFixture(t, false)
 	generation := f.gen
+	original := uuid.UUID(mustRun(t, f.env, run).CodexSecretID.Bytes)
 	appendFrames := func(messages ...IncomingMessage) {
 		t.Helper()
 		if err := f.svc.AppendMessagesForClaim(f.env.ctx, f.worker(t), run, messages, &generation); err != nil {
@@ -43,7 +44,7 @@ func TestCodexSwitchSpendJoinsAuthorityEpochLiveDB(t *testing.T) {
 			}
 			switch ordinal {
 			case 0:
-				if input != 11 || output != 2 || epoch != 41 || secret == target {
+				if input != 11 || output != 2 || epoch != 41 || secret != original {
 					t.Fatal("A spend lost baseline attribution")
 				}
 			case 1:
