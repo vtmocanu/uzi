@@ -721,7 +721,22 @@ func TestHibernationSurplusAmbiguousCommitBudgetLiveDB(t *testing.T) {
 func TestHibernationCommitUncertainBodyLockTimeoutLiveDB(t *testing.T) {
 	p := newPoolFx(t)
 	id := p.member(10 * time.Hour)
+	readBlocked := func() pgtype.Text {
+		t.Helper()
+		var reason pgtype.Text
+		if err := p.env.pool.QueryRow(p.env.ctx, `SELECT hibernation_blocked_reason FROM workers WHERE id = $1`, id).Scan(&reason); err != nil {
+			t.Fatal(err)
+		}
+		return reason
+	}
+	before := readBlocked()
 	err := p.svc.hibernationOwnerTx(p.env.ctx, p.user, id, func(q *store.Queries, w store.Worker) error {
+		// A mutating statement runs first, then the body fails with a lock timeout.
+		if err := q.SetWorkerHibernationBlocked(p.env.ctx, store.SetWorkerHibernationBlockedParams{
+			ID: w.ID, Reason: "probe_body_write", At: pgtype.Timestamptz{Time: time.Now(), Valid: true},
+		}); err != nil {
+			return err
+		}
 		return &pgconn.PgError{Code: "55P03"}
 	})
 	var unc *hibernationCommitUncertainError
@@ -730,6 +745,9 @@ func TestHibernationCommitUncertainBodyLockTimeoutLiveDB(t *testing.T) {
 	}
 	if errors.Is(err, errHibernationOwnerBusy) {
 		t.Fatal("a 55P03 raised inside the body must not read as busy")
+	}
+	if after := readBlocked(); after != before {
+		t.Fatalf("hibernation_blocked_reason = %+v after a failed body, want %+v (the body's write must roll back)", after, before)
 	}
 }
 
