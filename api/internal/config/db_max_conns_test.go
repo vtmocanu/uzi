@@ -56,9 +56,7 @@ func TestResolveDBMaxConns(t *testing.T) {
 			if got != tc.want || src != tc.wantSource {
 				t.Errorf("resolveDBMaxConns(%q) = (%d, %q), want (%d, %q)", tc.env, got, src, tc.want, tc.wantSource)
 			}
-			if n := strings.Count(logs.String(), "DB_MAX_CONNS"); n != tc.wantWarn {
-				t.Errorf("DB_MAX_CONNS warnings = %d, want %d; log: %s", n, tc.wantWarn, logs.String())
-			}
+			assertDBMaxConnsWarning(t, logs.String(), tc.env, tc.wantWarn)
 		})
 	}
 }
@@ -106,9 +104,7 @@ func TestLoadDBMaxConns(t *testing.T) {
 			if cfg.DBMaxConns != tc.want || cfg.DBMaxConnsSource != tc.wantSource {
 				t.Errorf("DBMaxConns = (%d, %q), want (%d, %q)", cfg.DBMaxConns, cfg.DBMaxConnsSource, tc.want, tc.wantSource)
 			}
-			if n := strings.Count(logs.String(), "DB_MAX_CONNS"); n != tc.wantWarn {
-				t.Errorf("DB_MAX_CONNS warnings = %d, want %d; log: %s", n, tc.wantWarn, logs.String())
-			}
+			assertDBMaxConnsWarning(t, logs.String(), tc.env, tc.wantWarn)
 		})
 	}
 }
@@ -132,5 +128,20 @@ func TestLoadDBMaxConnsUnparseableDSNDoesNotLeak(t *testing.T) {
 		if strings.Contains(logs.String(), leak) {
 			t.Errorf("log output leaks %q: %s", leak, logs.String())
 		}
+	}
+}
+
+// assertDBMaxConnsWarning checks the invalid-value warning by content: a WARN record carrying
+// the rejection message and the offending value, exactly wantWarn times, and nothing else
+// mentioning DB_MAX_CONNS.
+func assertDBMaxConnsWarning(t *testing.T, log, raw string, wantWarn int) {
+	t.Helper()
+	const msg = `msg="DB_MAX_CONNS is not a positive 32-bit integer; ignoring it"`
+	want := "level=WARN " + msg + " value=" + raw
+	if n := strings.Count(log, want); n != wantWarn {
+		t.Errorf("invalid DB_MAX_CONNS warnings = %d, want %d (looking for %q); log: %s", n, wantWarn, want, log)
+	}
+	if n := strings.Count(log, "DB_MAX_CONNS"); n != wantWarn {
+		t.Errorf("log lines naming DB_MAX_CONNS = %d, want %d; log: %s", n, wantWarn, log)
 	}
 }

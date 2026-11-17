@@ -15,7 +15,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	_ "github.com/jackc/pgx/v5/stdlib" // registers the "pgx" database/sql driver
+	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/pressly/goose/v3"
 )
 
@@ -381,14 +381,26 @@ func MigrateDownTo(ctx context.Context, dsn string, version int64) error {
 	return nil
 }
 
+// migrateConnConfig parses dsn for the migration connection through pgxpool.ParseConfig, the
+// parser OpenPool uses: it validates the pgxpool-only settings (pool_max_conns etc.) and strips
+// them, so they are never sent to Postgres as runtime parameters, which the server rejects.
+func migrateConnConfig(dsn string) (*pgx.ConnConfig, error) {
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, err
+	}
+	return cfg.ConnConfig, nil
+}
+
 // openForMigrate opens the sql.DB at dsn, waits for it to become reachable, and
 // prepares goose (base FS + dialect). The caller owns the returned db and must
 // Close it.
 func openForMigrate(ctx context.Context, dsn string) (*sql.DB, error) {
-	db, err := sql.Open("pgx", dsn)
+	cc, err := migrateConnConfig(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sql db: %w", err)
 	}
+	db := stdlib.OpenDB(*cc)
 
 	if err := waitForDB(ctx, db); err != nil {
 		_ = db.Close()
