@@ -33,28 +33,6 @@ func (q *Queries) ClearWorkerMemoryAuthorityLost(ctx context.Context, arg ClearW
 	return result.RowsAffected(), nil
 }
 
-const markWorkerMemoryAuthorityLostUnfenced = `-- name: MarkWorkerMemoryAuthorityLostUnfenced :execrows
-UPDATE workers
-   SET memory_authority_lost_at = $1
- WHERE id = $2
-   AND memory_authority_lost_at IS NULL
-`
-
-type MarkWorkerMemoryAuthorityLostUnfencedParams struct {
-	LostAt pgtype.Timestamptz `json:"lost_at"`
-	ID     uuid.UUID          `json:"id"`
-}
-
-// The bodyless (snapshotless) claim path: no registration identity to fence on, so this can only
-// SET (fail closed), never clear. The row is already locked by the claim transaction.
-func (q *Queries) MarkWorkerMemoryAuthorityLostUnfenced(ctx context.Context, arg MarkWorkerMemoryAuthorityLostUnfencedParams) (int64, error) {
-	result, err := q.db.Exec(ctx, markWorkerMemoryAuthorityLostUnfenced, arg.LostAt, arg.ID)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
-}
-
 const setWorkerMemoryAuthorityLost = `-- name: SetWorkerMemoryAuthorityLost :execrows
 
 UPDATE workers

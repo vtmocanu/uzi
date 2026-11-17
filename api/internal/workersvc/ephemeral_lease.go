@@ -293,11 +293,6 @@ func (s *Service) claimRunLeasedNoSnapshot(ctx context.Context, wkr store.Worker
 	if err != nil {
 		return nil, err
 	}
-	// Issue #4395: the loss claimRunInTxCore enforces is persisted too (set only; see
-	// persistMemoryAuthority), before the claim, so an idle poll persists it as well.
-	if err := s.persistMemoryAuthority(ctx, qtx, locked, nil, params.Lane, report); err != nil {
-		return nil, err
-	}
 	run, ref, claimed, err := s.claimRunInTx(ctx, tx, qtx, wkr.ID, locked, params, report)
 	if err != nil {
 		return nil, err

@@ -229,10 +229,11 @@ func TestMemoryAuthorityStaleRegistrationReportsChangeNothingLiveDB(t *testing.T
 	})
 }
 
-// The bodyless (snapshotless) claim path enforces a lost report, so it persists it too, but it can
-// only set: a held bodyless report cannot be fenced and writes nothing. The next snapshot-carrying
-// held claim clears it.
-func TestMemoryAuthorityBodylessClaimSetsButNeverClearsLiveDB(t *testing.T) {
+// The bodyless (snapshotless) claim path carries no registration identity, so it persists
+// nothing (PRD #4395: the column is set or cleared only for the current registration, and a
+// delayed report from an older registration changes nothing). A bodyless lost report must not
+// set the column, and a bodyless held report must not clear one a fenced claim set.
+func TestMemoryAuthorityBodylessClaimWritesNothingLiveDB(t *testing.T) {
 	m := newMemAuthFix(t)
 	bodyless := func(report string) *ClaimPayload {
 		t.Helper()
@@ -246,25 +247,21 @@ func TestMemoryAuthorityBodylessClaimSetsButNeverClearsLiveDB(t *testing.T) {
 		}
 		return p
 	}
+	before := m.writeCount(t)
 	if p := bodyless("lost"); p != nil {
 		t.Fatalf("bodyless lost claim returned %s, want idle", p.RunID)
 	}
+	if _, ok := m.lostAt(t); ok || m.writeCount(t) != before {
+		t.Fatal("a bodyless lost report wrote memory_authority_lost_at; it cannot be fenced and must write nothing")
+	}
+	m.claim(t, "lost")
 	first, ok := m.lostAt(t)
 	if !ok {
-		t.Fatal("a bodyless lost report did not set memory_authority_lost_at")
-	}
-	before := m.writeCount(t)
-	bodyless("lost")
-	if again, _ := m.lostAt(t); !again.Equal(first) || m.writeCount(t) != before {
-		t.Fatal("a repeated bodyless lost report rewrote the column")
+		t.Fatal("a snapshot-carrying lost claim did not set the column")
 	}
 	bodyless("held")
-	if _, ok := m.lostAt(t); !ok {
-		t.Fatal("a bodyless held report cleared the column; it cannot be fenced and must write nothing")
-	}
-	m.claim(t, "held")
-	if _, ok := m.lostAt(t); ok {
-		t.Fatal("a snapshot-carrying held claim did not clear the column")
+	if again, ok := m.lostAt(t); !ok || !again.Equal(first) {
+		t.Fatal("a bodyless held report changed the column; it cannot be fenced and must write nothing")
 	}
 }
 
