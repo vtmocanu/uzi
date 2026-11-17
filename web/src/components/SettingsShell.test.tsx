@@ -72,8 +72,9 @@ describe("SettingsShell tabs", () => {
     renderAt("/settings");
     const row = screen.getByRole("link", { name: "Forge" }).parentElement as HTMLElement;
     expect(row.className).toContain("overflow-x-auto");
-    // The underline still spans the row.
-    expect(row.className).toMatch(/\bborder-b\b/);
+    // The underline still spans the row, drawn as an inset line (#4419) so the row box
+    // never overflows by a pixel and grows a vertical scrollbar.
+    expect(row.className).toContain("shadow-[inset_0_-1px_0_rgb(var(--edge))]");
     for (const name of ["Account & tokens", "Appearance", "Run defaults", "Forge", "Access", "Memory"]) {
       const tab = screen.getByRole("link", { name });
       expect(tab.className).toMatch(/\bshrink-0\b/);
