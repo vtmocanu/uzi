@@ -18,6 +18,13 @@ export const ENABLE_DELETION_FOR_TEST: symbol = Symbol.for("uzi.test.pod-epoch-r
  */
 export const ENABLE_SCRATCH_FOR_TEST: symbol = Symbol.for("uzi.test.pod-epoch-reclaim.scratch-gate");
 
+/**
+ * Test-only gate for runPodEpochShadow's retire-scratch phase seams (issue #4263), passed as `retire.retireTestGate`.
+ * Defined here, in a module nothing under agent/src imports; the literal is the one pod-epoch-reclaim.ts compares
+ * against, and test/pod-epoch-retire-scratch.test.ts asserts that no other agent/src file references it.
+ */
+export const ENABLE_RETIRE_FOR_TEST: symbol = Symbol.for("uzi.test.pod-epoch-reclaim.retire-gate");
+
 type BatchInspect = GitCache["inspectEpochRetainedGroups"];
 
 /**

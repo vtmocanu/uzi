@@ -33,7 +33,7 @@ import { syncDirectory } from "./authority-lock.js";
 import { RUNNER_UID, WORKER_UID, killRunnerGroupOnly, killRunnerGroup, runnerCommand, runnerPath, runnerTmpdir, uidSplitActive } from "./runner-uid.js";
 import { unmarkedSpawnEnv, workerSpawnEnv } from "./worker-spawn-mark.js";
 import { PINNED_SUBTREE_SCRIPT, SCRATCH_DELETE_LIMITS, TREE_NAME_RE, censusScratchRoot, rmRunnerTeardownTree } from "./rmtree.js";
-import { absorbBareConfigValue, classifyScratchSettlement, isNeverRemovedScratchName, newPathSink, parseScratchCensus, postCensusOf, readProtectedStores, type ProtectedPathsRead, type Settlement } from "./pod-epoch-scratch.js";
+import { absorbBareConfigValue, classifyScratchSettlement, isNeverRemovedScratchName, newPathSink, parseScratchCensus, postCensusOf, protectedLeaves, readProtectedStores, type ProtectedPathsRead, type Settlement } from "./pod-epoch-scratch.js";
 import { classifyForgeError, withForgeRetry } from "./forge-retry.js";
 import { RunDiskLocks } from "./run-disk-locks.js";
 import {
@@ -2558,7 +2558,8 @@ export type RetireBindingStep =
   | "settle-write" | "settle-sync" | "settled"
   | "removing-write" | "removing-sync" | "removing-written"
   | "removed" | "root-synced-after-rm" | "unset" | "unset-sync" | "unset-done"
-  | "unmoved-unset" | "unmoved-unset-sync" | "unmoved-unset-done";
+  | "unmoved-unset" | "unmoved-unset-sync" | "unmoved-unset-done"
+  | "recover-clone-dir-sync" | "recover-root-sync";
 
 export interface RetireBinding {
   v: 1;
@@ -2635,6 +2636,127 @@ export function parseRetireBinding(keyUuid: string, raw: string): { ok: true; bi
  *  binding key, and `parsed` is undefined for a malformed, valueless or duplicated entry. */
 export interface RetireBindingRead { key: string; uuid?: string; raw: string; parsed?: RetireBinding }
 export type RetireBindingsRead = { state: "read"; bindings: RetireBindingRead[] } | { state: "unknown" };
+
+// ─── issue #4263 M4 — bound-parent evidence and decisions ────────────────────────────────────
+
+/** Why a bound retire-scratch parent is kept; fixed tokens only. */
+export type RetireKeepReason =
+  | "conflict" | "malformed_binding" | "bound_intent" | "interrupted_removal" | "class_ineligible"
+  | "ledger_missing" | "ledger_mismatch" | "protected_by_retained_source" | "custody" | "canonical_present";
+
+/** One bare's raw metadata as the retire-scratch reclaim reads it under that bare's lock. */
+export interface RetireScratchBareEvidence {
+  barePath: string;
+  bindings: RetireBindingRead[];
+  /** Every raw attempt-ledger value in config order. */
+  ledger: Array<{ branch: string; raw: string }>;
+  /** Every absolute path any `uzi-*` value names, except the attempt ledger and the bindings themselves. */
+  protectedPaths: string[];
+  /** Branches that carry a non-empty restore entry. */
+  restoreBranches: string[];
+  /** Non-empty recovery journals, raw. */
+  recovery: Array<{ branch: string; raw: string }>;
+  /** Run ids with a stopped-canonical marker. */
+  stoppedRuns: string[];
+}
+
+export type RetireScratchEvidenceRead = { state: "read"; bares: RetireScratchBareEvidence[] } | { state: "unknown"; reason: string };
+
+export type RetireBindingExam = { kind: "keep"; reason: RetireKeepReason } | { kind: "ready"; binding: RetireBinding; raw: string };
+
+const RETIRE_RECLAIM_CLASSES: ReadonlySet<string> = new Set(["verified_successor", "owner_terminal"]);
+
+function retireCanonicalRetired(b: RetireBinding): string {
+  return attemptLedgerValue({ attemptId: b.attemptId, runId: b.runId, clonePath: b.clonePath, state: "retired" });
+}
+
+/** The last canonical ledger value for the binding's attempt across the bare's branches, or undefined. */
+function retireLedgerLast(evidence: RetireScratchBareEvidence, attemptId: string): { branch: string; raw: string; entry: AttemptLedgerEntry } | undefined {
+  let last: { branch: string; raw: string; entry: AttemptLedgerEntry } | undefined;
+  for (const { branch, raw } of evidence.ledger) {
+    const entry = parseAttemptLedgerEntry(raw);
+    if (entry && raw === attemptLedgerValue(entry) && entry.attemptId === attemptId) last = { branch, raw, entry };
+  }
+  return last;
+}
+
+/** Does any recorded path equal, lie under, or contain the parent or the binding's clone path? Alias-aware for the parent. */
+function retireNamed(evidence: RetireScratchBareEvidence, runnerRoot: string, parentName: string, clonePath: string): boolean {
+  if (protectedLeaves(evidence.protectedPaths, runnerRoot, [parentName]).has(parentName)) return true;
+  return evidence.protectedPaths.some(p => isWithinPath(p, clonePath) || isWithinPath(clonePath, p));
+}
+
+function retireJournalOf(evidence: RetireScratchBareEvidence, branch: string): RecoveryJournalEntry | "unparseable" | undefined {
+  const raw = evidence.recovery.find(r => r.branch === branch)?.raw;
+  if (raw === undefined) return undefined;
+  try { return parseRecoveryJournal(raw); } catch { return "unparseable"; }
+}
+
+/**
+ * Pure decision over one bare's evidence for the binding `uuid`: the metadata half of every keep reason. It reads no
+ * filesystem and writes nothing; the async half (custody stores, quarantine, canonical footprint) is checked by the locked
+ * context. `acrossBares` is the number of bindings that name the uuid over all bares (the nomination pass supplies it).
+ */
+export function evaluateRetireBinding(input: {
+  evidence: RetireScratchBareEvidence; uuid: string; runnerRoot: string; expectRaw?: string; acrossBares?: number;
+}): RetireBindingExam {
+  const keep = (reason: RetireKeepReason): RetireBindingExam => ({ kind: "keep", reason });
+  const { evidence, uuid } = input;
+  const own = evidence.bindings.filter(b => b.key === retireBindingKey(uuid));
+  if (own.length !== 1 || (input.acrossBares ?? 1) !== 1) return keep("conflict");
+  const entry = own[0]!;
+  if (input.expectRaw !== undefined && entry.raw !== input.expectRaw) return keep("conflict");
+  const b = entry.parsed;
+  if (!b) return keep("malformed_binding");
+  if (b.phase === "intent") return keep("bound_intent");
+  if (b.phase === "removing") return keep("interrupted_removal");
+  if (!RETIRE_RECLAIM_CLASSES.has(b.class)) return keep("class_ineligible");
+  const last = retireLedgerLast(evidence, b.attemptId);
+  if (!last) return keep("ledger_missing");
+  if (last.branch !== b.branch || last.raw !== retireCanonicalRetired(b)) return keep("ledger_mismatch");
+  const parentName = `.retire-${uuid}`;
+  const journal = retireJournalOf(evidence, b.branch);
+  if (journal === "unparseable" || evidence.restoreBranches.includes(b.branch) ||
+      retireNamed(evidence, input.runnerRoot, parentName, b.clonePath)) return keep("protected_by_retained_source");
+  if (evidence.stoppedRuns.includes(b.runId) || journal?.remediationRecovery !== undefined) return keep("custody");
+  return { kind: "ready", binding: b, raw: entry.raw };
+}
+
+/** The two metadata-only resolutions of a binding whose parent directory is gone (see {@link RetireScratchLocked.recoverGone}). */
+export function evaluateRetireRecovery(input: {
+  evidence: RetireScratchBareEvidence; uuid: string; runnerRoot: string; expectRaw: string;
+  canonical: { present: boolean; ino?: string };
+}): "case1" | "case2" | "unresolved" {
+  const { evidence, uuid } = input;
+  const own = evidence.bindings.filter(b => b.key === retireBindingKey(uuid));
+  const b = own.length === 1 && own[0]!.raw === input.expectRaw ? own[0]!.parsed : undefined;
+  if (!b) return "unresolved";
+  const last = retireLedgerLast(evidence, b.attemptId);
+  if (!last || last.branch !== b.branch || last.entry.runId !== b.runId || last.entry.clonePath !== b.clonePath) return "unresolved";
+  const journal = retireJournalOf(evidence, b.branch);
+  if (journal === "unparseable" || evidence.restoreBranches.includes(b.branch)) return "unresolved";
+  const named = evidence.protectedPaths.some(p => isWithinPath(p, b.clonePath) || isWithinPath(b.clonePath, p));
+  if (last.raw === retireCanonicalRetired(b)) {
+    return !input.canonical.present && !named && journal?.completionSourceFence === undefined ? "case1" : "unresolved";
+  }
+  if (b.phase === "intent" && input.canonical.present && input.canonical.ino === b.cloneIno && named &&
+      journal !== undefined && journal.clonePath === b.clonePath) return "case2";
+  return "unresolved";
+}
+
+/** What the retire-scratch reclaim may do to one bare while it holds that bare's lock. */
+export interface RetireScratchLocked {
+  /** Fresh evidence of this bare. */
+  evidence(): Promise<RetireScratchBareEvidence>;
+  /** The full keep/ready decision for `uuid` (metadata, custody stores, quarantine, canonical footprint). */
+  examine(uuid: string, expectRaw: string, acrossBares?: number): Promise<RetireBindingExam>;
+  /** Durably write the `removing` phase; the binding must still read exactly `settledRaw`. Returns the written value. */
+  markRemoving(uuid: string, settledRaw: string): Promise<string>;
+  /** Durably unset a binding that still reads exactly `expectRaw`. */
+  unset(uuid: string, expectRaw: string): Promise<void>;
+  /** Metadata-only resolution of a binding whose parent is gone; `unresolved` leaves the binding untouched. */
+  recoverGone(uuid: string, expectRaw: string): Promise<"recovered" | "metadata_unresolved">;
+}
 
 /** The live binding of one retireRunnerClone call (issue #4263): the scratch parent, its pin until the move is verified,
  *  and the last value durably written under the bare lock. */
@@ -3353,9 +3475,36 @@ export function readRetireScratchOutcomesActivation(env: NodeJS.ProcessEnv): boo
   throw new Error("UZI_RETIRE_SCRATCH_OUTCOMES must be unset, empty, 0 or 1");
 }
 
+/** Reads `UZI_RETIRE_SCRATCH_RECLAIM` (issue #4263): whether the verified pod-epoch pass may reclaim bound
+ *  retire-scratch parents. On by default; `0` restores observation only. Anything else refuses startup. The
+ *  switch permits the phase and proves nothing: every gate in the pass still applies. */
+export function readRetireScratchReclaimActivation(env: NodeJS.ProcessEnv): boolean {
+  const raw = env.UZI_RETIRE_SCRATCH_RECLAIM;
+  if (raw === undefined || raw === "" || raw === "1") return true;
+  if (raw === "0") return false;
+  throw new Error("UZI_RETIRE_SCRATCH_RECLAIM must be unset, empty, 0 or 1");
+}
+
 type RetireScratchWalkReason = "entry_cap" | "time_cap" | "unreadable" | "cross_device" | "changed" | "vanished";
 type RetireScratchBytesState = "measured" | "partial" | "unknown";
-type RetireScratchSources = { state: "read"; paths: string[] } | { state: "unknown" } | { state: "not_attempted" };
+/** `bindings` are the decoded phase of every `uzi-retire-scratch.*` entry by uuid (`malformed` when undecodable); undefined or
+ *  `unknown` when they could not be read. */
+type RetireScratchBindingPhase = "intent" | "settled" | "removing" | "malformed";
+type RetireScratchSources = {
+  state: "read"; paths: string[]; bindings?: Map<string, RetireScratchBindingPhase> | "unknown";
+} | { state: "unknown" } | { state: "not_attempted" };
+
+/** One parent's outcome as the verified pod-epoch pass reports it to the startup inspector (issue #4263). */
+export interface RetireScratchParentOutcome {
+  name: string;
+  outcome: "reclaimed" | "kept";
+  /** Fixed token; for `reclaimed` always `reclaimed`. */
+  reason: string;
+  bytes: number;
+  bytesState: "measured" | "partial" | "unknown";
+}
+/** The retire-scratch phase as the pass reports it; `parents` holds one entry per parent the phase examined. */
+export interface RetireScratchPassReport { state: string; reason: string; parents: RetireScratchParentOutcome[] }
 
 interface RetireScratchWalkCtx {
   now: () => number;
@@ -3557,7 +3706,11 @@ export interface RetireScratchDiscardInput {
   signal: AbortSignal;
   /** Synchronous liveness check; throws to deny. Called before, and again after, the helper. */
   live: () => void;
-  /** The caller's final pre-effect observation; rejects to deny. */
+  /**
+   * The caller's final pre-effect observation; rejects to deny. Every identity, posture and budget refusal precedes it,
+   * so the M4 caller records its durable `removing` phase here: a refusal after this callback returned is `not_live`
+   * only, and the caller must then treat the binding as `removing`.
+   */
   beforeEffect: () => Promise<void>;
 }
 
@@ -3568,8 +3721,9 @@ export type RetireScratchDiscardResult =
   /**
    * The tree (or part of it) is kept; the binding must stay. `stderrBytes` is a bounded length, never content.
    * Residue after the clone `rmdir` (for example `rmdir_parent_failed`, `parent_unverified`, `parent_still_linked`,
-   * `parent_identity_changed`, `removal_error`, `fsync_failed`; not exhaustive) is permanent: the clone is already gone,
-   * so the M4 caller keeps the binding at `removing` permanently (owner decision) and never retries it.
+   * `parent_identity_changed`, `fsync_failed`; not exhaustive) is permanent: the clone is already gone, so the M4 caller
+   * keeps the binding at `removing` permanently (owner decision) and never retries it. `removal_error` (an unexpected
+   * throw in the worker's own removal) can occur on either side of the clone `rmdir`; it is residue all the same.
    * The parent is removed by name, so a rename-and-replace of that name between the final identity check and the
    * `rmdir` can remove only an EMPTY directory planted there (`rmdir` never removes content); it is then reported as
    * `parent_unverified`, never `removed`, because the pinned parent still has links. The root is a sticky, worker-owned
@@ -15117,7 +15271,11 @@ export class GitCache {
   /** At most the path depth plus two leaves, charged to the epoch read budget; no retry.
    * Missing ancestors and symlinks cannot prove an absent footprint. */
   private async epochMissingFootprint(rec: GatheredRecord): Promise<boolean> {
-    const clone = rec.parts[0]!.clonePath;
+    return this.missingFootprintOf(rec.parts[0]!.clonePath);
+  }
+
+  /** The footprint rule of {@link epochMissingFootprint} for one clone path. */
+  private async missingFootprintOf(clone: string): Promise<boolean> {
     const parent = path.dirname(clone);
     const root = path.parse(parent).root;
     let current = root;
@@ -17039,6 +17197,160 @@ export class GitCache {
   /** {@link readRetireBindingsUnderLock} under the bare lock. */
   readRetireBindings(barePath: string): Promise<RetireBindingsRead> {
     return this.withLock(barePath, () => this.readRetireBindingsUnderLock(barePath));
+  }
+
+  /**
+   * issue #4263 M4: one bare's evidence from its config listing, under the caller's bare lock. A valueless `uzi-*` key
+   * outside the attempt ledger and the binding family, an undecodable record family value or a path overflow throws (the
+   * caller maps that to `unknown`); the bindings family and the ledger never throw on a bad value (they are returned raw).
+   */
+  private async retireEvidenceOf(barePath: string, entries: readonly string[]): Promise<RetireScratchBareEvidence> {
+    const sink = newPathSink();
+    const ledger: RetireScratchBareEvidence["ledger"] = [], recovery: RetireScratchBareEvidence["recovery"] = [];
+    const restoreBranches = new Set<string>(), stoppedRuns = new Set<string>();
+    for (const item of entries) {
+      const nl = item.indexOf("\n");
+      const key = nl < 0 ? item : item.slice(0, nl);
+      if (!key.startsWith("uzi-")) continue;
+      const value = nl < 0 ? "" : item.slice(nl + 1);
+      const attempts = /^uzi-attempts\.(.+)\.entry$/.exec(key);
+      if (attempts) { ledger.push({ branch: attempts[1]!, raw: value }); continue; }
+      if (key.startsWith(RETIRE_BINDING_PREFIX)) continue;
+      if (nl < 0) throw new Error("valueless uzi key");
+      const restore = restoreKeyBranch(key);
+      if (restore !== undefined && value !== "") restoreBranches.add(restore);
+      const rec = /^uzi-recovery\.(.+)\.clone$/.exec(key);
+      if (rec && value !== "") recovery.push({ branch: rec[1]!, raw: value });
+      const stopped = /^uzi-stopped\.(.+)\.entry$/.exec(key);
+      if (stopped) stoppedRuns.add(stopped[1]!);
+      if (absorbBareConfigValue(key, value, sink) !== "ok") throw new Error("uzi value unparseable");
+    }
+    const read = await this.readRetireBindingsUnderLock(barePath, entries);
+    if (read.state !== "read") throw new Error("retire bindings over the cap");
+    return { barePath, bindings: read.bindings, ledger, protectedPaths: [...sink.paths].sort(), restoreBranches: [...restoreBranches].sort(),
+      recovery, stoppedRuns: [...stoppedRuns].sort() };
+  }
+
+  /**
+   * issue #4263 M4: every bare's evidence in ONE all-or-nothing pass, each bare read under its own lock inside one
+   * recovery operation (bounded by `deadline`, cancellable by `signal`). Any bare that cannot be read, any record cap and
+   * any undecodable protected value makes the whole read `unknown` with a fixed reason; nothing is partial.
+   */
+  async readRetireScratchEvidence(opts: { signal: AbortSignal; deadline: number }): Promise<RetireScratchEvidenceRead> {
+    const limits = this.epochLimits();
+    const bares: RetireScratchBareEvidence[] = [];
+    try {
+      let bytes = 0, records = 0;
+      await this.epochRetained.run(limits, () => this.withRecoveryOperation(opts.signal, opts.deadline, async (combined) => {
+        for (const bare of await this.retainedBares(undefined, { strict: true })) {
+          this.checkRecoveryInterruption();
+          await this.withLock(bare, async () => {
+            await this.assertRecoveryBare(bare);
+            const entries = await this.configEntries(bare);
+            for (const item of entries) bytes += Buffer.byteLength(item) + 1;
+            records += entries.length;
+            if (bytes > limits.maxMetadataBytes || records > limits.maxMetadataRecords) throw new Error("retire evidence limit");
+            bares.push(await this.retireEvidenceOf(bare, entries));
+          }, combined);
+        }
+      }));
+      return { state: "read", bares };
+    } catch {
+      return { state: "unknown", reason: opts.signal.aborted ? "aborted" : "unreadable" };
+    }
+  }
+
+  /**
+   * issue #4263 M4: run `fn` holding `barePath`'s lock inside one bounded recovery operation. The locked context is the
+   * ONLY way the retire-scratch reclaim reads or writes a binding after nomination: every decision it returns was made
+   * under the lock, and its two writes (`markRemoving`, `unset`) require the binding to still read exactly the value the
+   * caller last saw.
+   */
+  withRetireScratchBare<T>(barePath: string, opts: { signal: AbortSignal; deadline: number },
+    fn: (locked: RetireScratchLocked) => Promise<T>): Promise<T> {
+    const limits = this.epochLimits();
+    const runnerRoot = path.resolve(this.runnerRoot);
+    const locked: RetireScratchLocked = {
+      evidence: async () => this.retireEvidenceOf(barePath, await this.configEntries(barePath)),
+      examine: async (uuid, expectRaw, acrossBares) => {
+        const evidence = await locked.evidence();
+        const pure = evaluateRetireBinding({ evidence, uuid, runnerRoot, expectRaw, ...(acrossBares === undefined ? {} : { acrossBares }) });
+        if (pure.kind !== "ready") return pure;
+        const b = pure.binding, parent = path.join(runnerRoot, `.retire-${uuid}`);
+        const stores = await readProtectedStores(
+          [this.recoveryRoot, this.recoveryMaintenanceRoot, this.recoverySettlementRoot, this.recoveryArchiveRoot],
+          { interrupt: () => this.checkRecoveryInterruption() });
+        if (stores.state !== "read" || stores.paths.some(p => isWithinPath(p, parent) || isWithinPath(parent, p) ||
+            isWithinPath(p, b.clonePath) || isWithinPath(b.clonePath, p))) return { kind: "keep", reason: "protected_by_retained_source" };
+        if (residueQuarantine() !== undefined || await this.custodyHeld(b.runId) || (await this.listLocalRecords(b.runId)).length > 0)
+          return { kind: "keep", reason: "custody" };
+        if (!await this.missingFootprintOf(b.clonePath)) return { kind: "keep", reason: "canonical_present" };
+        return pure;
+      },
+      markRemoving: async (uuid, settledRaw) => {
+        const read = await this.readRetireBindingsUnderLock(barePath);
+        const entry = read.state === "read" ? read.bindings.filter(b => b.key === retireBindingKey(uuid)) : [];
+        const parsed = entry.length === 1 && entry[0]!.raw === settledRaw ? entry[0]!.parsed : undefined;
+        if (!parsed || parsed.phase !== "settled") throw new Error("retire binding changed");
+        const bound: RetireBound = { uuid, parent: path.join(runnerRoot, `.retire-${uuid}`), binding: parsed, raw: settledRaw,
+          pin: undefined, cloneDev: 0n, moveVerified: true, durable: true };
+        await this.advanceRetireBindingUnderLock(barePath, bound, "removing", async () => {
+          const raws = await this.retireBindingRaws(barePath, retireBindingKey(uuid));
+          if (raws.length !== 1 || raws[0] !== settledRaw) throw new Error("retire binding changed");
+        });
+        return bound.raw;
+      },
+      unset: (uuid, expectRaw) => this.unsetRetireBindingUnderLock(barePath, uuid, expectRaw),
+      recoverGone: async (uuid, expectRaw) => {
+        try {
+          const evidence = await locked.evidence();
+          const entry = evidence.bindings.find(b => b.key === retireBindingKey(uuid));
+          const b = entry?.parsed;
+          if (!b || entry?.raw !== expectRaw) return "metadata_unresolved";
+          const parentGone = await fs.lstat(path.join(runnerRoot, `.retire-${uuid}`)).then(() => false,
+            (err: NodeJS.ErrnoException) => err.code === "ENOENT");
+          if (!parentGone) return "metadata_unresolved";
+          const st = await fs.lstat(b.clonePath, { bigint: true }).catch((err: NodeJS.ErrnoException) => err.code === "ENOENT" ? null : undefined);
+          if (st === undefined || (st !== null && (st.isSymbolicLink() || !st.isDirectory()))) return "metadata_unresolved";
+          const canonical = st === null ? { present: false } : { present: true, ino: st.ino.toString() };
+          if (st === null && !await this.missingFootprintOf(b.clonePath)) return "metadata_unresolved";
+          const verdict = evaluateRetireRecovery({ evidence, uuid, runnerRoot, expectRaw, canonical });
+          if (verdict === "unresolved") return "metadata_unresolved";
+          if (verdict === "case2") { await this.retireStep("recover-clone-dir-sync"); await syncDirectory(path.dirname(b.clonePath)); }
+          await this.retireStep("recover-root-sync");
+          await syncDirectory(runnerRoot);
+          await this.unsetRetireBindingUnderLock(barePath, uuid, expectRaw);
+          return "recovered";
+        } catch (err) {
+          this.checkRecoveryInterruption();
+          this.log.warn("retire scratch binding recovery left the binding", { bare: barePath, error: gitErrorMessage(err) });
+          return "metadata_unresolved";
+        }
+      },
+    };
+    return this.epochRetained.run(limits, () => this.withRecoveryOperation(opts.signal, opts.deadline,
+      (combined) => this.withLock(barePath, () => fn(locked), combined)));
+  }
+
+  /**
+   * issue #4263 M4: read-only allocated-bytes walk of one scratch parent as the worker uid, the inspector's own walk. Best
+   * effort: any failure is `unknown`. `entries` is what the walk listed, for the caller's entry budget.
+   */
+  async measureRetireScratchParent(name: string, opts: { signal: AbortSignal; deadline: number }):
+      Promise<{ bytes: number; bytesState: "measured" | "partial" | "unknown"; entries: number }> {
+    const unknown = { bytes: 0, bytesState: "unknown" as const, entries: 0 };
+    let rootHandle: FileHandle | undefined;
+    try {
+      const root = path.resolve(this.runnerRoot);
+      rootHandle = await fs.open(root, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
+      const rootDev = (await rootHandle.stat({ bigint: true })).dev;
+      const ctx: RetireScratchWalkCtx = { now: Date.now, deadline: opts.deadline, signal: opts.signal, entries: 0,
+        maxEntries: RETIRE_SCRATCH_WALK_MAX_ENTRIES, seen: new Set() };
+      const r = await retireWalkParent(ctx, rootHandle.fd, rootDev, root, { name, recent: false, kind: "dir" });
+      const bytes = r.bytes > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(r.bytes);
+      return { bytes, bytesState: r.bytesState, entries: ctx.entries };
+    } catch { return unknown; }
+    finally { await rootHandle?.close().catch(() => undefined); }
   }
 
   /** {@link resolveBranchJournalUnderLock} under the bare lock, for callers that do not already hold it. */
@@ -20306,7 +20618,8 @@ export class GitCache {
    *  rename targets of {@link createRetireScratchParent}). `<runnerRoot>` persists across pod
    *  replacements now, so a crash between the rename and the disposal leaves one behind that no
    *  retire context remembers. It runs ONCE at worker startup, strictly before the claim loop and
-   *  before any retire or recovery path is reachable, and REMOVES NOTHING: reclaim needs the
+   *  before any retire or recovery path is reachable, and REMOVES NOTHING (issue #4263: the verified pod-epoch pass, which runs just before it, is the only
+   *  thing that reclaims a bound parent; this inspection runs after it, still before the claim loop): reclaim needs the
    *  retirement/custody/writer-exclusion proofs, and a surviving daemon container can still bind-mount
    *  or hold its cwd in even an EMPTY parent, so emptiness is no evidence it is unused.
    *    - a parent whose mtime is at or after `processStartMs` is skipped (this process made it);
@@ -20320,13 +20633,16 @@ export class GitCache {
    *  issue #4143 — with `opts.outcomes` (the default in main.ts; `UZI_RETIRE_SCRATCH_OUTCOMES=0`
    *  turns it off and leaves exactly the warning above, with no journal read and no walk), the
    *  warning is followed by OBSERVATION records only: at most RETIRE_SCRATCH_REPORTED_PATHS
-   *  `runner retire scratch outcome` rows (every one `kept`, only for parents) and exactly one
+   *  `runner retire scratch outcome` rows (`kept`, or since issue #4263 `reclaimed` from the pass's own report
+   *  `opts.reclaim.report`; a kept bound parent carries a binding-aware reason: `bound_intent`, `interrupted_removal`,
+   *  `malformed_binding`, `disabled`, `epoch_not_eligible`, `budget_deferred` or the pass's own, while an unbound one keeps
+   *  `protected_by_retained_source` / `no_disposition_evidence`) and exactly one
    *  `runner retire scratch total` per startup whenever outcomes are on and the runner root was
    *  listed (it exists and is a real directory), including with zero parents. A missing,
    *  non-directory or symlink runner root emits no lines; if the step throws,
    *  `runner retire scratch outcomes failed` replaces the total. With zero parents no journal
-   *  read or walk happens and `retained_source_read` is `not_attempted`. They never remove,
-   *  change the owner of or reclaim anything.
+   *  read or walk happens and `retained_source_read` is `not_attempted`. The inspection itself never removes,
+   *  changes the owner of or reclaims anything; the binding phases it reads come from the same journal read.
    *    - No ordinary durable disposition binding proves this moved footprint: rollback repair can
    *      persist a protected moved-clone pointer, but the rename precedes the journal clear and the
    *      retired-ledger write, so a parent can exist with nothing naming it. A retired ledger,
@@ -20352,6 +20668,8 @@ export class GitCache {
   async inspectRetireScratchAtStartup(processStartMs: number, opts: {
     outcomes?: boolean;
     signal?: AbortSignal;
+    /** Issue #4263: the reclaim switch and the verified pass's report (undefined when no pass ran); outcome rows only. */
+    reclaim?: { enabled: boolean; report?: RetireScratchPassReport };
     /** Test hooks, never passed by main.ts. */
     now?: () => number;
     limits?: EpochRetainedLimits;
@@ -20444,6 +20762,8 @@ export class GitCache {
     try {
       const limits = this.epochLimits(limitsOverride);
       const paths = new Set<string>();
+      const bindings = new Map<string, RetireScratchBindingPhase>();
+      let bindingsUnknown = false;
       let configBytes = 0;
       let records = 0;
       await this.epochRetained.run(limits, () => this.withRecoveryOperation(signal, deadline, async (combined) => {
@@ -20456,6 +20776,14 @@ export class GitCache {
             if (configBytes > limits.maxMetadataBytes) throw new Error("retire scratch metadata byte limit");
             records += entries.length;
             if (records > limits.maxMetadataRecords) throw new Error("retire scratch metadata record limit");
+            const bindingRead = await this.readRetireBindingsUnderLock(bare, entries);
+            if (bindingRead.state !== "read") bindingsUnknown = true;
+            else for (const b of bindingRead.bindings) {
+              if (b.uuid === undefined) continue;
+              const phase: RetireScratchBindingPhase = b.parsed?.phase ?? "malformed";
+              // A uuid seen twice (two bares or a duplicated key) is never a clean phase.
+              bindings.set(b.uuid, bindings.has(b.uuid) ? "malformed" : phase);
+            }
             const branches = new Set<string>();
             // Last recovery raw value per branch, one pass, for the closure pre-charge below.
             const lastRecoveryRaw = new Map<string, string>();
@@ -20504,7 +20832,7 @@ export class GitCache {
           }, combined);
         }
       }));
-      return { state: "read", paths: [...paths].sort() };
+      return { state: "read", paths: [...paths].sort(), bindings: bindingsUnknown ? "unknown" : bindings };
     } catch {
       return { state: "unknown" };
     }
@@ -20513,7 +20841,7 @@ export class GitCache {
   /** issue #4143 — the observation records. Every parent is `kept`; nothing here can change disk. */
   private async emitRetireScratchOutcomes(root: string, parents: Array<{ name: string; recent: boolean; kind: "dir" | "symlink" | "other" }>,
     incomplete: boolean, deadline: number, opts: {
-      outcomes?: boolean; signal?: AbortSignal; now?: () => number; limits?: EpochRetainedLimits; walkLimits?: { maxEntries?: number };
+      outcomes?: boolean; signal?: AbortSignal; reclaim?: { enabled: boolean; report?: RetireScratchPassReport }; now?: () => number; limits?: EpochRetainedLimits; walkLimits?: { maxEntries?: number };
       readRetainedSources?: () => Promise<RetireScratchSources>; beforeEntry?: (dirPath: string, name: string) => Promise<void>;
       beforeOpen?: (dirPath: string) => Promise<void>;
     }): Promise<void> {
@@ -20567,30 +20895,59 @@ export class GitCache {
     } finally {
       await rootHandle?.close().catch(() => undefined);
     }
-    const row = (r: RetireScratchParentResult): {
-      retained_source: "named" | "not_named" | "unknown"; reason: "protected_by_retained_source" | "no_disposition_evidence";
-    } => {
-      if (sources.state !== "read") return { retained_source: "unknown", reason: "no_disposition_evidence" };
-      return namedParents.has(r.name) ? { retained_source: "named", reason: "protected_by_retained_source" }
-        : { retained_source: "not_named", reason: "no_disposition_evidence" };
+    const report = opts.reclaim?.report;
+    const reported = new Map((report?.parents ?? []).map(p => [p.name, p]));
+    const bindingOf = (name: string): "unbound" | RetireScratchBindingPhase | "unknown" => {
+      if (sources.state !== "read" || sources.bindings === undefined || sources.bindings === "unknown") return "unknown";
+      return sources.bindings.get(name.startsWith(".retire-") ? name.slice(".retire-".length) : name) ?? "unbound";
     };
-    for (const r of results.slice(0, RETIRE_SCRATCH_REPORTED_PATHS)) {
-      this.log.info("runner retire scratch outcome", {
+    // The first-listed reason is the row's `reason`: the pass's own for a parent it examined, else the binding-aware one.
+    const row = (r: RetireScratchParentResult): {
+      retained_source: "named" | "not_named" | "unknown"; binding: string; reason: string;
+    } => {
+      const retained_source = sources.state !== "read" ? "unknown" : namedParents.has(r.name) ? "named" : "not_named";
+      const binding = bindingOf(r.name);
+      const legacy = retained_source === "named" ? "protected_by_retained_source" : "no_disposition_evidence";
+      const examined = reported.get(r.name);
+      if (examined && examined.outcome === "kept") return { retained_source, binding, reason: examined.reason };
+      if (binding === "intent") return { retained_source, binding, reason: "bound_intent" };
+      if (binding === "removing") return { retained_source, binding, reason: "interrupted_removal" };
+      if (binding === "malformed") return { retained_source, binding, reason: "malformed_binding" };
+      if (binding === "settled") {
+        const reason = opts.reclaim?.enabled === false ? "disabled" : report?.reason === "budget_deferred" ? "budget_deferred" : "epoch_not_eligible";
+        return { retained_source, binding, reason };
+      }
+      return { retained_source, binding, reason: legacy };
+    };
+    // Parents the pass reclaimed are gone from the listing, so their rows come from its report.
+    const reclaimed = (report?.parents ?? []).filter(p => p.outcome === "reclaimed");
+    type Entry = { name: string; line: Record<string, unknown> };
+    const entries: Entry[] = [
+      ...results.map((r): Entry => ({ name: r.name, line: {
         name: sanitizeForLog(r.name, 157), kind: r.kind, outcome: "kept", ...row(r),
-        empty: r.empty, recent: r.recent, bytes: Number(r.bytes), bytes_state: r.bytesState, partial_reasons: r.reasons,
-      });
-    }
+        empty: r.empty, recent: r.recent, bytes: Number(r.bytes), bytes_state: r.bytesState, partial_reasons: r.reasons } })),
+      ...reclaimed.map((p): Entry => ({ name: p.name, line: {
+        name: sanitizeForLog(p.name, 157), kind: "dir", outcome: "reclaimed", reason: "reclaimed", binding: "settled",
+        retained_source: "not_named", empty: false, recent: false, bytes: p.bytes, bytes_state: p.bytesState, partial_reasons: [] } })),
+    ].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    for (const e of entries.slice(0, RETIRE_SCRATCH_REPORTED_PATHS)) this.log.info("runner retire scratch outcome", e.line);
     const totalReasons = new Set<RetireScratchWalkReason>();
     for (const r of results) for (const reason of r.reasons) totalReasons.add(reason);
-    const protectedCount = results.filter((r) => row(r).reason === "protected_by_retained_source").length;
+    const rows = results.map(row);
+    const protectedCount = rows.filter(r => r.reason === "protected_by_retained_source").length;
+    const keptByReason: Record<string, number> = {};
+    for (const r of rows) keptByReason[r.reason] = (keptByReason[r.reason] ?? 0) + 1;
     const allMeasured = results.every((r) => r.bytesState === "measured");
     this.log.info("runner retire scratch total", {
-      parents_enumerated: results.length,
-      outcomes_omitted: results.length - Math.min(results.length, RETIRE_SCRATCH_REPORTED_PATHS),
+      parents_enumerated: entries.length,
+      outcomes_omitted: entries.length - Math.min(entries.length, RETIRE_SCRATCH_REPORTED_PATHS),
       kept: results.length,
-      reclaimed: 0,
+      reclaimed: reclaimed.length,
+      reclaimed_bytes: reclaimed.reduce((n, p) => n + p.bytes, 0),
       protected_by_retained_source: protectedCount,
-      no_disposition_evidence: results.length - protectedCount,
+      no_disposition_evidence: rows.filter(r => r.reason === "no_disposition_evidence").length,
+      kept_by_reason: keptByReason,
+      removing_bindings: rows.filter(r => r.binding === "removing").length,
       bytes: Number(results.reduce((n, r) => n + r.bytes, 0n)),
       bytes_state: allMeasured && !incomplete ? "measured" : results.every((r) => r.bytesState === "unknown") ? "unknown" : "partial",
       partial_reasons: [...totalReasons].sort(),
