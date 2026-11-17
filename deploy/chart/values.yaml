@@ -1082,12 +1082,14 @@ workers:
     # Supplies no attestation; empty runtime below keeps scratch. Attempt deletion stays canary-only.
     scratchDeletion: true
     # Default-on per-startup observation records for `.retire-*` retirement scratch parents
-    # (kept only; no reclaim). false renders worker UZI_RETIRE_SCRATCH_OUTCOMES=0 after
-    # controller reconciliation; takes effect at the next worker startup.
+    # (they delete nothing; retireScratchReclaim below decides what is removed). false renders
+    # worker UZI_RETIRE_SCRATCH_OUTCOMES=0 after controller reconciliation; takes effect at the
+    # next worker startup.
     retireScratchOutcomes: true
-    # Default-on verified-epoch reclaim of bound `.retire-*` parents; binding writes continue
-    # either way. false renders worker UZI_RETIRE_SCRATCH_RECLAIM=0 after controller
-    # reconciliation; takes effect at the next worker startup.
+    # Default-on verified-epoch reclaim of bound `.retire-*` parents (uid-split Docker workers
+    # only; unbound parents stay kept); binding writes continue either way. false renders worker
+    # UZI_RETIRE_SCRATCH_RECLAIM=0 after controller reconciliation (a no-op on older worker
+    # images); takes effect at the next worker startup.
     retireScratchReclaim: true
     deletionCanaryWorkerId: ""
   docker:

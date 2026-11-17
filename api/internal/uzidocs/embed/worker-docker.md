@@ -635,35 +635,50 @@ privileged reclaim and no per-run byte accounting, and no admission headroom
 is promised: run admission fails open when a disk sample is unknown and
 reopens after `UZI_DISK_ADMISSION_MAX_WAIT` (default 15 minutes).
 
-**`.retire-*` retirement scratch (observation only).** Each worker startup
-observes every `.retire-*` scratch parent the bounded root listing reaches
-(4096-entry budget; `enumeration_incomplete` marks a truncated listing) under
-`<dataDir>/runner` and keeps all of them: nothing is deleted, chowned or moved.
-The existing `runner retire scratch retained` warning is unchanged. Two further
-log lines are added:
+**`.retire-*` retirement scratch (bound parents are reclaimed by a verified
+epoch; everything else is kept).** Each worker startup observes every
+`.retire-*` scratch parent the bounded root listing reaches (4096-entry budget;
+`enumeration_incomplete` marks a truncated listing) under `<dataDir>/runner`.
+Nothing is deleted, chowned or moved by the observation itself. Since #4263, one
+narrow, gated exception exists (below): a **bound** parent can be emptied and
+removed by the verified pod-epoch pass. The existing `runner retire scratch
+retained` warning is unchanged. Three log lines describe the result:
 
 - `runner retire scratch outcome`: per-parent rows only, up to 10 per startup,
-  sorted. Fields are name, kind, outcome (`kept`), reason, retained_source,
-  empty, recent, bytes, bytes_state and partial_reasons. `reason` is
-  `protected_by_retained_source` when a decoded recovery or restore journal's
-  `clonePath` (predecessor, successor or tombstone) or
-  `retainedSources[].clonePath` names the parent or a path under it (a
-  rollback-repair pointer), otherwise `no_disposition_evidence`.
-  `retained_source` is `named`, `not_named` or `unknown`; `unknown` means the
-  journal read failed or hit a cap, the deadline or an abort.
+  sorted. Fields are name, kind, outcome (`kept` or `reclaimed`), reason,
+  binding, retained_source, empty, recent, bytes, bytes_state and
+  partial_reasons. `retained_source` is `named`, `not_named` or `unknown`;
+  `unknown` means the journal read failed or hit a cap, the deadline or an abort.
+  `binding` is `unbound`, `intent`, `settled`, `removing`, `malformed` or
+  `unknown`. For an unbound parent `reason` is `protected_by_retained_source`
+  when a decoded recovery or restore journal's `clonePath` (predecessor,
+  successor or tombstone) or `retainedSources[].clonePath` names the parent or a
+  path under it (a rollback-repair pointer), otherwise `no_disposition_evidence`.
+  A bound parent reports the binding-aware reasons below.
 - `runner retire scratch total`: exactly one per startup (one per pod epoch on
   epoch workers) whenever records are on and the runner root exists, is a
   directory and was listed, including with zero parents. None is logged when the
   runner root is missing, not a directory or a symlink. If the step throws, a
   `runner retire scratch outcomes failed` warning replaces it. Fields are
-  parents_enumerated, outcomes_omitted, kept, reclaimed (always 0),
-  protected_by_retained_source, no_disposition_evidence, bytes, bytes_state,
-  partial_reasons, enumeration_incomplete and retained_source_read.
-  `retained_source_read` is `read`, `unknown` (the read was attempted and
-  failed) or `not_attempted` (no parents, so no journal read or walk happened).
-  With zero parents the total is `parents_enumerated: 0`, `kept: 0`, `bytes: 0`
-  and `bytes_state: measured` (a sum over zero parents is exact) unless
-  `enumeration_incomplete` is set, when it is `unknown`.
+  parents_enumerated, outcomes_omitted, kept, reclaimed, reclaimed_bytes,
+  protected_by_retained_source, no_disposition_evidence, kept_by_reason,
+  removing_bindings, bytes, bytes_state, partial_reasons, enumeration_incomplete
+  and retained_source_read. `retained_source_read` is `read`, `unknown` (the read
+  was attempted and failed) or `not_attempted` (no parents, so no journal read or
+  walk happened). With zero parents the total is `parents_enumerated: 0`,
+  `kept: 0`, `bytes: 0` and `bytes_state: measured` (a sum over zero parents is
+  exact) unless `enumeration_incomplete` is set, when it is `unknown`.
+- `pod_epoch_reclaim`: the verified pass's own line gains a `retire_scratch`
+  block (`state`, `reason`, `examined`, `reclaimed`, `recovered`, `kept`,
+  `deferred`, `unbound`, `residue`, `unset_failed`, `bytes`, `bytes_state`,
+  `kept_by_reason`) and `retire_scratch_phase_ms`. `deferred` counts candidates
+  left untouched because the phase budget ended or a whole-phase refusal stopped
+  it; it is never part of `kept`. `unbound` counts listed parents no binding
+  names, which are not examined.
+
+The startup inspector runs after the verified pass (still before the worker
+claims runs) so that it can report what the pass reclaimed and why it kept the
+rest.
 
 Bytes are allocated bytes (blocks x 512, hard links counted once) from a
 read-only, descriptor-relative walk as the worker uid that never follows
@@ -682,19 +697,67 @@ bares) took a median of 970 ms (max 1639) with records on, against 13 ms off;
 with 0 parents or 4096 mostly unrelated names the difference was within a few
 ms. This is not a production measurement.
 
-Disable with the chart value `workers.epochReclaim.retireScratchOutcomes:
-false` (controller `UZI_WORKER_RETIRE_SCRATCH_OUTCOMES`, worker
-`UZI_RETIRE_SCRATCH_OUTCOMES=0`; see [configuration](./configuration.md)).
-Off restores the count-only inspector exactly.
+**What is bound and what can be reclaimed.** A retire that moves a clone into a
+scratch parent (the cross-device fallback) and carries an attempt id writes a
+durable binding in the bare config, `uzi-retire-scratch.<uuid>.binding`: the
+class, attempt id, run id, branch, clone path, inodes and a phase (`intent`,
+`settled`, `removing`). It is a separate record in the same config store, not a
+field of the recovery journal or the attempt ledger. At most 64 are kept per
+bare; past that a new parent is simply unbound and kept. Only two classes can
+settle, and only on a uid-split pod: `owner_terminal` and `verified_successor`.
+Completion, covered-lift terminal, foreign-orphan and attempt-less retires never
+become eligible. See [ADR-3153](../adr/3153-runner-shared-pvc-subpath.md) for the
+full table and reasons.
 
-Nothing is reclaimed: no ordinary durable disposition binding proves this
-moved footprint (rollback repair can persist a protected moved-clone pointer),
-the rename into the scratch parent precedes the journal clear and the
-retired-ledger write, and the ledger names only the canonical clone path. A
-retired ledger, emptiness, age or the parent name grant nothing. The legacy
-stderr-proof repair (#4141, landed via #4152) does not certify remnants
-created by older code retroactively; #4137 is a distinct residual. Reclaim
-remains open on #4143 pending a durable parent-binding design.
+**Verified-epoch reclaim.** On a uid-split Docker worker the verified pod-epoch
+pass has a last phase for `settled` parents. It re-proves every candidate before
+touching it: a matching attempt-ledger `retired` entry, no journal, retained
+source, restore, custody, quarantine or stopped marker naming it (alias-aware for
+`/data/runner-shared`), a terminal run with no server holds, no source-use lease,
+a worker-owned 0700 parent holding only `clone` with the bound inodes, older than
+the pod-entry fence, no mount or bind at or under it, an idle worker and no
+process holding it. The phase is bounded: 30 s of headroom to start, a 120 s cap,
+20 s minimum per candidate, at most 64 candidates and 2,000,000 helper entries. A
+deferral never changes the pass verdict.
+
+Removal runs the strict pinned helper (`empty-fd`) as the runner uid only: no
+chmod, no chown, no privilege increase and no raw fallback. The worker then
+removes `clone` and the parent with its own `rmdir`, which is the proof that
+nothing was left. A removal that leaves anything behind marks the binding
+`removing`; **a `removing` binding is never retried or reclaimed** (it reads
+`interrupted_removal`, and `removing_bindings` in the total counts them). A
+binding whose parent is already gone is cleared by a metadata-only recovery
+step.
+
+Kept reasons for bound parents include `bound_intent`, `interrupted_removal`,
+`malformed_binding`, `conflict`, `class_ineligible`, `ledger_missing`,
+`ledger_mismatch`, `protected_by_retained_source`, `custody`,
+`canonical_present`, `source_use_held`, `newer_than_predecessor`,
+`unexpected_entries`, `identity_changed`, `mount_changed`, `held`,
+`epoch_not_eligible`, `budget_deferred` and `disabled`. A whole-phase refusal
+(`retire_scratch.state: refused`) names one token, for example `split_inactive`,
+`not_idle`, `mount_unexpected`, `fs_unsupported`, `bind_unknown` or
+`evidence_unknown`, and keeps every parent.
+
+Still kept: legacy parents created before bindings, attempt-less retires,
+anything unbound, every non-eligible class, any parent on a single-uid worker
+(whose in-process removal is unchanged), a parent in `intent` or `removing`, and
+a parent that any check refuses. The legacy stderr-proof repair (#4141, landed
+via #4152) does not certify remnants created by older code retroactively; #4137
+is a distinct residual.
+
+Switches. Reclaim is on by default. Disable it with the chart value
+`workers.epochReclaim.retireScratchReclaim: false` (controller
+`UZI_WORKER_RETIRE_SCRATCH_RECLAIM`, worker `UZI_RETIRE_SCRATCH_RECLAIM=0`; see
+[configuration](./configuration.md)): the pass then reads and removes no binding,
+while binding writes continue. Disable the observation records with
+`workers.epochReclaim.retireScratchOutcomes: false` (controller
+`UZI_WORKER_RETIRE_SCRATCH_OUTCOMES`, worker `UZI_RETIRE_SCRATCH_OUTCOMES=0`);
+off restores the count-only inspector exactly. Both take effect at the next
+worker startup.
+
+Hosted rollout observation and the owner's keep-default decision for reclaim are
+not recorded here and stay on #4143.
 
 A worker holding custody can therefore fill its data volume, which impairs
 recovery bookkeeping, and then needs an operator. Use the supported inspect

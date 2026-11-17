@@ -1123,7 +1123,7 @@ for retire_bad in 0 1 null '{a,b}'; do
   fi
   grep -F 'workers.epochReclaim.retireScratchOutcomes must be a boolean' "$WORK/retire-invalid.log" >/dev/null
 done
-# Retirement-scratch reclaim are a real boolean; explicit false must survive rendering.
+# Retirement-scratch reclaim is a real boolean; explicit false must survive rendering.
 for reclaim_state in default true false; do
   if [ "$reclaim_state" = default ]; then
     helm template uzi "$STRIPPED" --set workers.enabled=true --set api.tls.enabled=true > "$WORK/retire-reclaim.yaml"
