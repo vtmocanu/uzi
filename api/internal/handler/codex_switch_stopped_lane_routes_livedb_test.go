@@ -34,7 +34,7 @@ func TestWorkerCodexStoppedLaneRouteLiveDB(t *testing.T) {
 					// No copied claim, credentials, tokens, or review relationship.
 					stoppedRouteExec(t, e, `INSERT INTO runs
  (id,user_id,repo_id,kind,branch,issue_title,issue_description,status,harness)
- SELECT $2,user_id,repo_id,'task','uzi/task/' || $2::text,
+ SELECT $2::uuid,user_id,repo_id,'task','uzi/task/' || $2::uuid::text,
  'stopped lane target','', 'queued',harness FROM runs WHERE id=$1`, e.run, target)
 				}
 
@@ -55,7 +55,7 @@ func TestWorkerCodexStoppedLaneRouteLiveDB(t *testing.T) {
 				case "reviewtarget":
 					wantKind = "task"
 					stoppedRouteExec(t, e, `UPDATE runs SET kind='task',
- issue_iid=NULL,branch='uzi/task/' || $2::text,review_target_run_id=$2 WHERE id=$1`, e.run, target)
+ issue_iid=NULL,branch='uzi/task/' || $2::uuid::text,review_target_run_id=$2::uuid WHERE id=$1`, e.run, target)
 				}
 
 				// Check the actual lane and preserve the live Codex authority.
