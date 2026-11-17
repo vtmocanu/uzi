@@ -185,6 +185,27 @@ describe("Judge chips and tabs pin (#4419)", () => {
     expect(c.right, "toggled chip inside the row").toBeLessThanOrEqual(r.right + 0.5);
   });
 
+  it("at 1024px Clear with the row scrolled to the end focuses the first chip, in view, without moving the page", async () => {
+    const last = JUDGE_CATEGORIES[JUDGE_CATEGORIES.length - 1];
+    await mount(1024, `/judge?category=${last}`);
+    await scrollDeep();
+    const row = scroller();
+    expect(row.scrollWidth).toBeGreaterThan(row.clientWidth);
+    row.scrollLeft = row.scrollWidth;
+    await nextFrame();
+    const first = row.querySelector<HTMLElement>("button")!;
+    expect(first.getBoundingClientRect().right, "first chip starts scrolled out").toBeLessThanOrEqual(row.getBoundingClientRect().left);
+    const y = window.scrollY;
+    within(chipGroup()).getByRole("button", { name: /Clear/ }).click();
+    await waitFor(() => expect(document.activeElement).toBe(first));
+    await nextFrame();
+    const r = row.getBoundingClientRect();
+    const c = first.getBoundingClientRect();
+    expect(c.left, "first chip inside the row").toBeGreaterThanOrEqual(r.left - 0.5);
+    expect(c.right, "first chip inside the row").toBeLessThanOrEqual(r.right + 0.5);
+    expect(window.scrollY).toBe(y);
+  });
+
   it("at 400px the chips scroll away; an active filter shows a Filtered marker in the pinned block, and Clear clears it", async () => {
     await mount(400, "/judge?category=improve_uzi");
     const block = blockEl();

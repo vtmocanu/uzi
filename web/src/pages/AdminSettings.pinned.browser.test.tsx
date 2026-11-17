@@ -2,8 +2,9 @@
 import "../index.css";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { page, userEvent } from "vitest/browser";
+import { useEffect } from "react";
 import { cleanup, render, screen } from "@testing-library/react";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useNavigate } from "react-router-dom";
 import { AppShell } from "../components/AppShell";
 import { AdminSettings } from "./AdminSettings";
 import { api, type AppSettings } from "../lib/api";
@@ -130,10 +131,20 @@ afterEach(() => {
 
 const nextFrame = () => new Promise((r) => requestAnimationFrame(() => r(null)));
 
-async function mount(width: number, height = 700) {
+let navigateTo: ((to: string) => void) | null = null;
+function CaptureNavigate() {
+  const navigate = useNavigate();
+  useEffect(() => {
+    navigateTo = navigate;
+  }, [navigate]);
+  return null;
+}
+
+async function mount(width: number, height = 700, hash = "") {
   await page.viewport(width, height);
   render(
-    <MemoryRouter initialEntries={["/admin/settings"]}>
+    <MemoryRouter initialEntries={[`/admin/settings${hash}`]}>
+      <CaptureNavigate />
       <AppShell>
         <Routes>
           <Route path="/admin/settings" element={<AdminSettings />} />
@@ -288,24 +299,62 @@ for (const width of [1440, 400]) {
 }
 
 describe("Admin -> Instance wheel-style scrolling from the top (#4419)", () => {
-  it("1440x700: the lit pill follows the reading line in 20px steps, across several sections", async () => {
+  it("1440x700: the lit pill follows the reading line in 20px steps, past the second pill change", async () => {
     await mount(1440, 700);
     expect(window.scrollY).toBe(0);
     // The observer band is built while the block is still unstuck; it must match the stuck geometry.
-    const limit = Math.min(4000, document.documentElement.scrollHeight - 2 * window.innerHeight);
+    // Fixed short waits on purpose: a long poll would ride out a later band rebuild and mask a stale band.
+    const limit = Math.min(1800, document.documentElement.scrollHeight - 2 * window.innerHeight);
     const seen: string[] = [];
+    let last = "";
     for (let y = 20; y <= limit; y += 20) {
       window.scrollTo(0, y);
       await expect.poll(() => Math.abs(window.scrollY - y)).toBeLessThanOrEqual(1);
-      // A few frames for the observers' async callbacks, then the highlight must already be right
-      // (a stale observer band would leave it lagging until some unrelated callback).
       for (let i = 0; i < 3; i++) await nextFrame();
-      expect(currentPills().map(idOf), `at scrollY ${y}`).toEqual([sectionAtLine().id]);
       const id = currentPills().map(idOf)[0];
-      if (seen[seen.length - 1] !== id) seen.push(id);
+      expect(currentPills().map(idOf), `at scrollY ${y}`).toEqual([sectionAtLine().id]);
+      if (id !== last) seen.push(id);
+      last = id;
+      // Stop just past the second pill change once the block is stuck.
+      if (blockEl().dataset.stuck === "true" && seen.length >= 3) break;
     }
     expect(seen.length, `sections lit in order: ${seen.join(",")}`).toBeGreaterThanOrEqual(3);
-  }, 90_000);
+  });
+
+  it("1440x700: a deep link to a pill section lights its own pill", async () => {
+    await mount(1440, 700, "#completion-interlock");
+    await expect
+      .poll(() => currentPills().map(idOf), { timeout: 2000 })
+      .toEqual(["completion-interlock"]);
+    await holdsFrames("completion-interlock");
+  });
+
+  it("1440x1000: a deep link to a pill-less card lights the preceding pill, never the first", async () => {
+    await mount(1440, 1000, "#github-project-sync");
+    expect(
+      pills().some((a) => idOf(a) === "github-project-sync"),
+      "github-project-sync has no pill",
+    ).toBe(false);
+    await expect
+      .poll(() => currentPills().map(idOf), { timeout: 2000 })
+      .toEqual(["completion-interlock"]);
+    await holdsFrames("completion-interlock");
+  });
+
+  it("1440x1000: navigating to another hash from the page end updates the pill", async () => {
+    await mount(1440, 1000, "#github-project-sync");
+    await expect
+      .poll(() => currentPills().map(idOf), { timeout: 2000 })
+      .toEqual(["completion-interlock"]);
+    navigateTo!("/admin/settings#fetch-caps");
+    await expect
+      .poll(() => currentPills().map(idOf), { timeout: 2000 })
+      .toEqual(["fetch-caps"]);
+    navigateTo!("/admin/settings#github-project-sync");
+    await expect
+      .poll(() => currentPills().map(idOf), { timeout: 2000 })
+      .toEqual(["completion-interlock"]);
+  });
 });
 
 describe("Admin -> Instance pill edge fade (#4419)", () => {

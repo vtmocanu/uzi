@@ -237,6 +237,9 @@ export function AdminSettings() {
       // evaluate() lights its own pill.
       pendingRef.current = hash.slice(1);
       document.getElementById(hash.slice(1))?.scrollIntoView?.({ block: "start" });
+      // A page already at its end does not move, so no observer fires: evaluate once.
+      const raf = requestAnimationFrame(() => evaluateRef.current?.());
+      return () => cancelAnimationFrame(raf);
     }
   }, [loaded, hash, key]);
 
@@ -339,6 +342,7 @@ export function AdminSettings() {
   const [currentId, setCurrentId] = useState<string | null>(null);
   const currentRef = useRef<string | null>(null);
   const pendingRef = useRef<string | null>(null);
+  const evaluateRef = useRef<(() => void) | null>(null);
   const current = sectionKey.split(",").includes(currentId ?? "") ? currentId : (sections[0]?.id ?? null);
 
   const choose = useCallback((id: string) => {
@@ -368,7 +372,8 @@ export function AdminSettings() {
       .filter((el): el is HTMLElement => el !== null);
     // Stuck geometry: the block's sticky top + height, independent of whether it is stuck
     // right now, so the observer band matches where evaluate() reads once scrolled.
-    const stuckLineY = () => parseFloat(getComputedStyle(block).top) + block.offsetHeight + LANDING;
+    const stuckLineY = () =>
+      (parseFloat(getComputedStyle(block).top) || 0) + block.getBoundingClientRect().height + LANDING;
     // Live position, used by evaluate() against fresh rects.
     const lineY = () => block.getBoundingClientRect().bottom + LANDING;
     const observed = [...new Set([...ADMIN_SETTINGS_ANCHOR_IDS, ...ids])]
@@ -382,8 +387,17 @@ export function AdminSettings() {
       if (atEnd) {
         const pending = pendingRef.current;
         const target = pending ? document.getElementById(pending) : null;
-        if (pending && target && target.getBoundingClientRect().top >= line - 6) choose(pending);
-        else choose(els[els.length - 1].id);
+        if (pending && target && target.getBoundingClientRect().top >= line - 6) {
+          // Only pill ids may be chosen: a pill-less card maps to the nearest pill section
+          // before it in document order (the last pill when none precedes it).
+          let pill = els[els.length - 1];
+          let before: HTMLElement | null = null;
+          for (const el of els) {
+            if (el === target || el.compareDocumentPosition(target) & Node.DOCUMENT_POSITION_FOLLOWING) before = el;
+          }
+          if (before) pill = before;
+          choose(pill.id);
+        } else choose(els[els.length - 1].id);
         return;
       }
       pendingRef.current = null;
@@ -395,12 +409,15 @@ export function AdminSettings() {
     let lineIO: IntersectionObserver | null = null;
     const build = () => {
       lineIO?.disconnect();
+      // Whole-pixel 1px band: an unrounded edge let a card top land on a sub-pixel edge and
+      // miss its crossing (the 20px-step browser test pins this).
       const y = Math.round(stuckLineY());
       const below = Math.max(0, window.innerHeight - y - 1);
       lineIO = new IntersectionObserver(evaluate, { root: document, rootMargin: `-${y}px 0px -${below}px 0px` });
       for (const el of observed) lineIO.observe(el);
     };
     build();
+    evaluateRef.current = evaluate;
 
     // The block's stuck flip moves its live bottom (and so evaluate()'s line) without any
     // observed card crossing the band: re-evaluate once when it changes.
@@ -415,6 +432,7 @@ export function AdminSettings() {
     window.addEventListener("resize", build);
     window.addEventListener("uzi:app-bar-h", build);
     return () => {
+      evaluateRef.current = null;
       lineIO?.disconnect();
       mo.disconnect();
       endIO.disconnect();

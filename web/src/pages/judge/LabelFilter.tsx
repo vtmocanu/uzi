@@ -119,7 +119,11 @@ export function LabelFilter({
           onClear();
           // Clear turns invisible and non-focusable once the filter empties: hand focus to
           // the first chip rather than dropping it to the body.
-          scrollerRef.current?.querySelector<HTMLElement>("button")?.focus({ preventScroll: true });
+          // The first chip may be scrolled out of the row: bring the row back to its start
+          // (the page's scrollY is untouched).
+          const scroller = scrollerRef.current;
+          if (scroller) scroller.scrollLeft = 0;
+          scroller?.querySelector<HTMLElement>("button")?.focus({ preventScroll: true });
         }}
         aria-hidden={active.size === 0}
         tabIndex={active.size === 0 ? -1 : 0}
