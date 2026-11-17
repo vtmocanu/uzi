@@ -290,10 +290,7 @@ func (s *Service) hibernationTx(ctx context.Context, workerID uuid.UUID, fn func
 	if err != nil {
 		return err
 	}
-	if err := fn(q, w); err != nil {
-		return err
-	}
-	return tx.Commit(ctx)
+	return finishHibernationTx(ctx, tx, func() error { return fn(q, w) }, s.hibernationAfterCommit, workerID)
 }
 
 // sanitizeHibernationText strips terminal sequences and flattens raw, then reports

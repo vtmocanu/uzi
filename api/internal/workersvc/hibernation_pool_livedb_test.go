@@ -2,12 +2,15 @@ package workersvc
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/capability"
@@ -615,4 +618,148 @@ func TestHibernationSurplusRecheckLiveDB(t *testing.T) {
 		t.Fatalf("control pass = %d, want 1", n)
 	}
 	p.wantStates(map[uuid.UUID]string{cand: "preparing", keeper: "none"})
+}
+
+// ambiguousCommitHook fails the after-commit hook for every seeded worker: the commit really
+// landed, the caller saw an error (a lost commit reply). It counts its invocations.
+func ambiguousCommitHook(seeded []uuid.UUID, calls *atomic.Int64) func(uuid.UUID) error {
+	set := map[uuid.UUID]bool{}
+	for _, id := range seeded {
+		set[id] = true
+	}
+	return func(id uuid.UUID) error {
+		if !set[id] {
+			return nil
+		}
+		calls.Add(1)
+		return errors.New("injected lost commit reply")
+	}
+}
+
+// Issue #4395 D21: a commit whose reply is lost may have landed, so one owner never gets a second
+// change in the same pass.
+func TestHibernationSurplusAmbiguousCommitOwnerStopsLiveDB(t *testing.T) {
+	p := newPoolFx(t)
+	cand1, cand2 := p.member(10*time.Hour), p.member(9*time.Hour)
+	keeper := p.member(5 * time.Hour)
+	all := []uuid.UUID{cand1, cand2, keeper}
+	var calls atomic.Int64
+	p.svc.hibernationAfterCommit = ambiguousCommitHook(all, &calls)
+
+	p.advance(2 * time.Minute)
+	p.beat(all...)
+	n, err := p.runPass()
+	if err == nil {
+		t.Fatal("pass error = nil, want the uncertain commit recorded")
+	}
+	if n != 0 {
+		t.Fatalf("pass count = %d, want 0: an uncertain outcome is not a confirmed change", n)
+	}
+	changed := 0
+	for _, id := range []uuid.UUID{cand1, cand2} {
+		if p.state(id) != "none" {
+			changed++
+		}
+	}
+	if changed != 1 {
+		t.Fatalf("%d candidates left state none, want exactly 1 (the commit landed, the owner stops)", changed)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("commit hook calls = %d, want 1", got)
+	}
+	p.wantStates(map[uuid.UUID]string{keeper: "none"})
+}
+
+// Issue #4395 D21: uncertain outcomes spend the shared pass budget.
+func TestHibernationSurplusAmbiguousCommitBudgetLiveDB(t *testing.T) {
+	p := newPoolFx(t)
+	const owners = HibernationAutoAdmissionsPerPass + 1
+	var all []uuid.UUID
+	for range owners {
+		o := p.owner()
+		all = append(all, p.memberOf(o, 20*time.Hour), p.memberOf(o, 5*time.Hour))
+	}
+	var calls atomic.Int64
+	p.svc.hibernationAfterCommit = ambiguousCommitHook(all, &calls)
+
+	p.advance(2 * time.Minute)
+	p.beat(all...)
+	if _, err := p.runPass(); err == nil {
+		t.Fatal("pass error = nil, want the uncertain commits recorded")
+	}
+	if got := calls.Load(); got > HibernationAutoAdmissionsPerPass {
+		t.Fatalf("%d commits in one pass, want at most %d", got, HibernationAutoAdmissionsPerPass)
+	}
+	changed := 0
+	for _, id := range all {
+		if p.state(id) != "none" {
+			changed++
+		}
+	}
+	if changed > HibernationAutoAdmissionsPerPass {
+		t.Fatalf("%d workers changed state in one pass, want at most %d", changed, HibernationAutoAdmissionsPerPass)
+	}
+	if changed == 0 {
+		t.Fatal("no worker changed state: the fixture did not exercise the landed commit")
+	}
+}
+
+func TestHibernationCommitUncertainBodyLockTimeoutLiveDB(t *testing.T) {
+	p := newPoolFx(t)
+	id := p.member(10 * time.Hour)
+	err := p.svc.hibernationOwnerTx(p.env.ctx, p.user, id, func(q *store.Queries, w store.Worker) error {
+		return &pgconn.PgError{Code: "55P03"}
+	})
+	var unc *hibernationCommitUncertainError
+	if !errors.As(err, &unc) {
+		t.Fatalf("err = %v, want an uncertain error", err)
+	}
+	if errors.Is(err, errHibernationOwnerBusy) {
+		t.Fatal("a 55P03 raised inside the body must not read as busy")
+	}
+}
+
+// probeBeginner runs a deferred-unique violation inside the transaction right before the real
+// COMMIT, so Commit itself fails with SQLSTATE 23505.
+type probeBeginner struct{ TxBeginner }
+
+type probeTx struct{ pgx.Tx }
+
+func (b probeBeginner) Begin(ctx context.Context) (pgx.Tx, error) {
+	tx, err := b.TxBeginner.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return probeTx{tx}, nil
+}
+
+func (t probeTx) Commit(ctx context.Context) error {
+	for _, sql := range []string{
+		`CREATE TEMP TABLE hib_commit_probe (id int, UNIQUE (id) DEFERRABLE INITIALLY DEFERRED) ON COMMIT DROP`,
+		`INSERT INTO hib_commit_probe VALUES (1)`,
+		`INSERT INTO hib_commit_probe VALUES (1)`,
+	} {
+		if _, err := t.Tx.Exec(ctx, sql); err != nil {
+			return err
+		}
+	}
+	return t.Tx.Commit(ctx)
+}
+
+func TestHibernationCommitUncertainRealCommitErrorLiveDB(t *testing.T) {
+	p := newPoolFx(t)
+	id := p.member(10 * time.Hour)
+	p.svc.txBeginner = probeBeginner{p.env.pool}
+	body := func(*store.Queries, store.Worker) error { return nil }
+	runs := map[string]error{
+		"hibernationOwnerTx": p.svc.hibernationOwnerTx(p.env.ctx, p.user, id, body),
+		"hibernationTx":      p.svc.hibernationTx(p.env.ctx, id, body),
+	}
+	for name, err := range runs {
+		var unc *hibernationCommitUncertainError
+		var pe *pgconn.PgError
+		if !errors.As(err, &unc) || !errors.As(err, &pe) || pe.Code != "23505" {
+			t.Fatalf("%s: err = %v, want an uncertain error wrapping SQLSTATE 23505", name, err)
+		}
+	}
 }

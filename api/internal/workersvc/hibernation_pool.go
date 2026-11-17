@@ -263,6 +263,13 @@ type surplusPassParams struct {
 // most one state change per pass (an admission or a warm wake) and the whole pass at most
 // HibernationAutoAdmissionsPerPass, shared by every kind of change. A refused or skipped candidate
 // is not a state change, so the owner's next candidate is tried. The result counts state changes.
+//
+// Uncertain outcomes: any non-nil Commit error, and any error returned from the attempt body (a
+// 55P03 raised inside the body included), may have landed server-side, so the attempt is
+// *hibernationCommitUncertainError. Such an attempt consumes one unit of the budget, is recorded
+// in the joined error, is not counted as a change, and ends that owner for the pass. Errors from
+// steps before the body (begin, SET LOCAL, the owner advisory lock, GetWorkerForUpdate) keep
+// skipping the candidate and spend nothing.
 func (s *Service) hibernationSurplusPass(ctx context.Context, p surplusPassParams) (int64, error) {
 	work, err := s.listSurplusWork(ctx, p)
 	if err != nil {
@@ -282,6 +289,16 @@ owners:
 		for _, w := range g {
 			res, err := s.surplusWork(ctx, w, p)
 			if err != nil {
+				var unc *hibernationCommitUncertainError
+				if errors.As(err, &unc) {
+					// The write may or may not have landed: count it against the budget, record it,
+					// and stop this owner for the pass so it cannot get a second change.
+					errs = append(errs, fmt.Errorf("worker %s: %w", w.id, err))
+					budget--
+					slog.Warn("worker hibernation: uncertain outcome, budget consumed", "worker_id", w.id,
+						"owner_id", w.owner, "error", err)
+					continue owners
+				}
 				if !errors.Is(err, pgx.ErrNoRows) { // the worker was deleted since the list
 					errs = append(errs, fmt.Errorf("worker %s: %w", w.id, err))
 				}
@@ -577,10 +594,36 @@ func (s *Service) hibernationOwnerTx(ctx context.Context, owner, candidate uuid.
 	if err != nil {
 		return ownerLockErr(err)
 	}
-	if err := fn(q, w); err != nil {
-		return ownerLockErr(err)
+	return finishHibernationTx(ctx, tx, func() error { return fn(q, w) }, s.hibernationAfterCommit, candidate)
+}
+
+// hibernationCommitUncertainError wraps an error from the attempt body or from Commit of a
+// hibernation transaction: the outcome of the write is unknown (a commit can succeed on the server
+// and still return an error), so the caller must not treat it as "nothing changed". It never
+// matches errHibernationOwnerBusy.
+type hibernationCommitUncertainError struct{ err error }
+
+func (e *hibernationCommitUncertainError) Error() string {
+	return "hibernation write outcome uncertain: " + e.err.Error()
+}
+
+func (e *hibernationCommitUncertainError) Unwrap() error { return e.err }
+
+// finishHibernationTx runs the attempt body, then commits. Any error from the body or from Commit,
+// and any error from the test-only afterCommit hook, is returned as *hibernationCommitUncertainError.
+func finishHibernationTx(ctx context.Context, tx pgx.Tx, body func() error, afterCommit func(uuid.UUID) error, id uuid.UUID) error {
+	if err := body(); err != nil {
+		return &hibernationCommitUncertainError{err: err}
 	}
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return &hibernationCommitUncertainError{err: err}
+	}
+	if afterCommit != nil {
+		if err := afterCommit(id); err != nil {
+			return &hibernationCommitUncertainError{err: err}
+		}
+	}
+	return nil
 }
 
 // ownerLockErr maps a lock_timeout failure (SQLSTATE 55P03) to errHibernationOwnerBusy.

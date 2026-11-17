@@ -2044,6 +2044,10 @@ type Service struct {
 	// poolPassAfterDecide runs after a surplus decision was made and before it is written, with
 	// the owner lock and the candidate row lock held. TEST-ONLY: nil in production.
 	poolPassAfterDecide func()
+	// hibernationAfterCommit runs after a hibernation transaction committed, with the worker id
+	// (the candidate for hibernationOwnerTx); a non-nil result is returned as an uncertain commit.
+	// TEST-ONLY: nil in production.
+	hibernationAfterCommit func(workerID uuid.UUID) error
 	// memoryAuthorityUnpersisted is true when the api runs with the active-snapshot kill switch,
 	// so workers.memory_authority_lost_at is never written and memory authority is unknown to the
 	// pool policy; set via SetActiveSnapshotDisabled.

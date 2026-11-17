@@ -1,11 +1,14 @@
 package workersvc
 
 import (
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/capability"
@@ -362,5 +365,22 @@ func TestGroupByOwnerFairnessOrder(t *testing.T) {
 	// o3 waited longest, then o1 (oldest 9h), then o2 (oldest 8h); within an owner oldest first.
 	if got, want := strings.Join(order, " | "), "30 | 11,10 | 20,21"; got != want {
 		t.Fatalf("group order = %q, want %q", got, want)
+	}
+}
+
+func TestHibernationCommitUncertainClassification(t *testing.T) {
+	var unc *hibernationCommitUncertainError
+	for name, err := range map[string]error{"busy": errHibernationOwnerBusy, "missing row": pgx.ErrNoRows} {
+		if errors.As(err, &unc) {
+			t.Fatalf("%s must not be uncertain", name)
+		}
+	}
+	wrapped := fmt.Errorf("worker x: %w", &hibernationCommitUncertainError{err: errors.New("commit failed")})
+	if !errors.As(wrapped, &unc) || errors.Is(wrapped, errHibernationOwnerBusy) {
+		t.Fatal("a wrapped commit error must be uncertain and never busy")
+	}
+	inner := &hibernationCommitUncertainError{err: pgx.ErrNoRows}
+	if !errors.Is(inner, pgx.ErrNoRows) {
+		t.Fatal("Unwrap must expose the cause")
 	}
 }
