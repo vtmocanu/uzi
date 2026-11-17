@@ -14,10 +14,10 @@ import (
 )
 
 const (
-	dsnURL5     = "postgres://uzi:pw@db:5432/uzi?sslmode=disable&pool_max_conns=5"
+	dsnURL5     = "postgres://uzi@db:5432/uzi?sslmode=disable&pool_max_conns=5"
 	dsnKV5      = "host=db user=uzi password=pw dbname=uzi sslmode=disable pool_max_conns=5"
-	dsnPlain    = "postgres://uzi:pw@db:5432/uzi?sslmode=disable"
-	dsnBadParam = "postgres://uzi:pw@db:5432/uzi?sslmode=disable&pool_max_conns=zero"
+	dsnPlain    = "postgres://uzi@db:5432/uzi?sslmode=disable"
+	dsnBadParam = "postgres://uzi@db:5432/uzi?sslmode=disable&pool_max_conns=zero"
 )
 
 type dbMaxConnsCase struct {

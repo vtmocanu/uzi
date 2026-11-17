@@ -120,6 +120,13 @@ func TestDBPoolWaitWindowThreshold(t *testing.T) {
 	if c := run(100 * time.Millisecond); c.Severity != sevOK {
 		t.Fatalf("100ms: severity = %q (%q)", c.Severity, c.Summary)
 	}
+	// The budget is inclusive: exactly 250ms over 60s warns, 249ms does not.
+	if c := run(250 * time.Millisecond); c.Severity != sevWarn {
+		t.Fatalf("250ms: severity = %q (%q), want warn at the boundary", c.Severity, c.Summary)
+	}
+	if c := run(249 * time.Millisecond); c.Severity != sevOK {
+		t.Fatalf("249ms: severity = %q (%q), want ok below the boundary", c.Severity, c.Summary)
+	}
 }
 
 func TestDBPoolWaitBudgetScalesWithElapsed(t *testing.T) {
@@ -187,9 +194,13 @@ func TestDBPoolConcurrentEvaluationsInsideWindowAgree(t *testing.T) {
 	f := newPoolFixture()
 	t0 := fixedNow
 	f.check(t0)
+	// The first window (t0..+60s) is quiet; the waits land in the second window, and every
+	// goroutine evaluates exactly at its boundary, so they race to compute and cache it.
+	if c := f.check(t0.Add(60 * time.Second)); c.Severity != sevOK {
+		t.Fatalf("quiet first window: severity = %q (%q)", c.Severity, c.Summary)
+	}
 	f.set(func(s *dbStat) { s.emptyAcquireCount = 5; s.emptyAcquireWait = 300 * time.Millisecond })
-	f.check(t0.Add(60 * time.Second))
-	now := t0.Add(90 * time.Second)
+	now := t0.Add(120 * time.Second)
 	const n = 16
 	out := make([]apitypes.HealthCheckDTO, n)
 	var wg sync.WaitGroup
@@ -208,6 +219,15 @@ func TestDBPoolConcurrentEvaluationsInsideWindowAgree(t *testing.T) {
 	}
 	if out[0].Severity != sevWarn {
 		t.Fatalf("severity = %q", out[0].Severity)
+	}
+	wantEvidence(t, out[0], "Waits", "5")
+	wantEvidence(t, out[0], "Interval", "60s")
+	// Exactly one goroutine consumed the delta: later waits inside the new window do not
+	// change the cached verdict.
+	f.set(func(s *dbStat) { s.emptyAcquireCount = 50; s.emptyAcquireWait = 5 * time.Second })
+	later := f.check(t0.Add(150 * time.Second))
+	if later.Summary != out[0].Summary {
+		t.Fatalf("+150s summary %q, want cached %q", later.Summary, out[0].Summary)
 	}
 }
 
@@ -232,6 +252,8 @@ func TestDBPoolCounterResetClampsToZero(t *testing.T) {
 	if c.Severity != sevOK {
 		t.Fatalf("severity = %q (%q)", c.Severity, c.Summary)
 	}
+	wantEvidence(t, c, "Waits", "0")
+	wantEvidence(t, c, "Wait time", "0ms")
 }
 
 func TestDBPoolWaitSaturatingMultiply(t *testing.T) {
