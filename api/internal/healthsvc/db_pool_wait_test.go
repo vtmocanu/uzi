@@ -298,6 +298,13 @@ func TestDBPoolWarnDoesNotMaskPrecedence(t *testing.T) {
 			t.Fatalf("%q / %q", c.Severity, c.Summary)
 		}
 	})
+	t.Run("schema read error", func(t *testing.T) {
+		f, now := setup()
+		f.set(func(s *dbStat) { s.schemaAtHead = false; s.schemaErr = errors.New("no goose") })
+		if c := f.check(now); c.Severity != sevDanger || !strings.Contains(c.Summary, "Could not read the applied migration") {
+			t.Fatalf("%q / %q", c.Severity, c.Summary)
+		}
+	})
 	t.Run("disk full", func(t *testing.T) {
 		f, now := setup()
 		sig := dbdiskfull.New(func() time.Time { return now })
