@@ -33361,7 +33361,8 @@ describe("M2 actualRunner credential replacement", () => {
               restartAttempts++;
               await publicationBoundary("before-prepare");
               const result = await lease.restartAndResume(...args);
-              if (!resumeRefusal && !resumePreserve) await publicationBoundary("prepared");
+              // Failure fixtures must expose fallback instead of waiting on a success-only latch.
+              if (!resumeVariant) await publicationBoundary("prepared");
               return result;
             },
             startFreshLineage: async (...args) => {
