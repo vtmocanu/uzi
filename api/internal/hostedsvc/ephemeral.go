@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"time"
 
 	"github.com/google/uuid"
@@ -67,7 +68,7 @@ type EphemeralSettings interface {
 // at the top of ProvisionPass and threaded through every query and provisionOne call of that pass,
 // so one pass never mixes two values of a setting that an admin changes mid-pass.
 type ephemeralKnobs struct {
-	maxPerUser  int
+	maxPerUser  int32
 	defaultSize string
 	lease       time.Duration
 }
@@ -87,7 +88,20 @@ func (p *EphemeralProvisioner) readKnobs(ctx context.Context) (ephemeralKnobs, e
 	if err != nil {
 		return ephemeralKnobs{}, fmt.Errorf("read ephemeral lease: %w", err)
 	}
-	return ephemeralKnobs{maxPerUser: maxPerUser, defaultSize: size, lease: lease}, nil
+	return ephemeralKnobs{maxPerUser: clampMaxPerUser(maxPerUser), defaultSize: size, lease: lease}, nil
+}
+
+// clampMaxPerUser narrows the cap to the int32 the trigger queries take. The settings
+// accessor honours any non-negative env value, so a value past math.MaxInt32 must saturate
+// rather than wrap negative, which would make every owner read as over the cap.
+func clampMaxPerUser(n int) int32 {
+	if n < 0 {
+		return 0
+	}
+	if n > math.MaxInt32 {
+		return math.MaxInt32
+	}
+	return int32(n)
 }
 
 // EphemeralConfig carries the tuning knobs the provisioner needs (PRD #529 M2), lifted
@@ -241,7 +255,7 @@ func (p *EphemeralProvisioner) ProvisionPass(ctx context.Context) (int64, error)
 		StaleRequeueCutoff:       staleRequeueCutoff,
 		AffinityCutoff:           claimAffinityCutoff,
 		MaxRows:                  ephemeralProvisionBatch,
-		MaxPerUser:               int32(knobs.maxPerUser), //nolint:gosec // small configured cap, never near int32 range
+		MaxPerUser:               knobs.maxPerUser,
 		EphemeralLease:           workersvc.LeaseInterval(knobs.lease),
 		// PRD #2006: the lease arm mirrors ClaimRun's custom-Codex-model gate.
 		CodexCuratedModels:  workersvc.CodexCuratedModels(),
@@ -259,7 +273,7 @@ func (p *EphemeralProvisioner) ProvisionPass(ctx context.Context) (int64, error)
 		AffinityCutoff:           claimAffinityCutoff,
 		SaturationDelay:          durationToInterval(p.cfg.SaturationDelay),
 		MaxRows:                  ephemeralProvisionBatch,
-		MaxPerUser:               int32(knobs.maxPerUser), //nolint:gosec // small configured cap, never near int32 range
+		MaxPerUser:               knobs.maxPerUser,
 		EphemeralLease:           workersvc.LeaseInterval(knobs.lease),
 		// PRD #2006: the lease arm mirrors ClaimRun's custom-Codex-model gate.
 		CodexCuratedModels:  workersvc.CodexCuratedModels(),
@@ -279,7 +293,7 @@ func (p *EphemeralProvisioner) ProvisionPass(ctx context.Context) (int64, error)
 		laneRuns, err = p.q.ListIsolatedQueuedRunsForEphemeral(ctx, store.ListIsolatedQueuedRunsForEphemeralParams{
 			BackgroundGraceCutoff: backgroundGraceCutoff,
 			MaxRows:               ephemeralProvisionBatch,
-			MaxPerUser:            int32(knobs.maxPerUser), //nolint:gosec // small configured cap, never near int32 range
+			MaxPerUser:            knobs.maxPerUser,
 		})
 		if err != nil {
 			return 0, fmt.Errorf("hostedsvc: list isolated-lane queued runs: %w", err)

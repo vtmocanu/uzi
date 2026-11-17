@@ -77,7 +77,7 @@ describe("mock worker size, cap and lease settings (PRD #4212)", () => {
     const api = await reload();
     await api.updateSettings({ [key]: saved });
     const reset = await api.updateSettings({ [key]: "   " });
-    expect((reset.settings as Record<string, string>)[key]).toBe(def);
+    expect((reset.settings as unknown as Record<string, string>)[key]).toBe(def);
     expect(reset.sources[key]).toBe("default");
   });
 
