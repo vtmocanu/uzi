@@ -1736,8 +1736,8 @@ D78 selectively relaxes only the three-field coordination-idle group:
   OR (in_progress && operationValid && deadlineValid)
 ```
 
-The original idle branch remains, and committed/quarantined/malformed tuples
-remain rejected. The unchanged unresolved==0, !reauthRequired and empty
+The original idle branch remains; committed/quarantined states and partial
+operation/deadline coordination tuples remain rejected. The unchanged unresolved==0, !reauthRequired and empty
 RecoverySealed checks still follow the group. This neutralizes the coordination
 fence for the valid coordinating tuple rather than replacing the whole helper
 or globally discarding its three checks. D79 independently changes only
