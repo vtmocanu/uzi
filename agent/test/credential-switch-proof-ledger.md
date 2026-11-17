@@ -814,3 +814,50 @@ Credit is limited to detecting these particular effects at these first-settlemen
 seams. It is not proof of every input mutation, actual custody release, switch
 journal preservation, replay effects, accounting, gates or questions. Remaining
 worker obligations stay unvalidated; m3 and m4 remain **INCOMPLETE**.
+
+
+### D61 — paused policy hold redundant-fence guard control, class (d)
+
+Candidate 096f614d7cd9cf6bd7adfbd8750eacb2888d0b4c. Receipt:
+.uzi/scratch/stopped-hold-results.json. The new real-route fixture seeds an
+already-paused row with a resolved policy outcome and pending_fresh=false,
+then supplies either codex_policy_hold or ordinary completion_blocked hold.
+It reads back the tuple and requires HTTP 409 with full unchanged snapshots.
+The shared exact a233 STOP refusal/absence evidence above applies: the new
+stopped-route fence has no historical request seam to restore.
+
+This is a **redundant-fence guard control**, not per-copy sufficiency proof.
+Two executing copies on this path are policy_hold.go:190's hold arm and
+codex_switch_stopped.sql.go:29's hold predicate, mirrored by source SQL :19.
+The mutant removes only the Go hold arm and changes the SQL accepted hold set
+from NULL to NULL-or-codex_policy_hold. Ordinary holds remain excluded; pending
+fresh, unresolved outcome, lane, authority, input and budget checks stay intact.
+The receipt carries the exact three-file diff and before/after hashes.
+
+Search scope and trace: WorkerRunState (worker_protocol.go:1541), reconciliation
+wrapper, service.go:4675–4676 early STOP dispatch, stopCodexSwitch, policy helper,
+beginClaimMutation, source and generated stopped query. Under READ COMMITTED,
+worker then owned-run FOR UPDATE locks remain held through helper/query, reread
+and commit. The generic policy check at service.go:4762 is bypassed by the early
+return, not a third executing copy. The receipt's final source census exits 0.
+
+With GOFLAGS=-p=1 and GOMAXPROCS=4, from api:
+
+```sh
+go test -buildvcs=false -race -count=1 -json -timeout=5m ./internal/handler -run '^TestWorkerCodexStoppedHoldRouteLiveDB$'
+```
+
+Unchanged before gate-log.KW7aQb exits 0 (455.917s). Mutant gate-log.oxnx8K
+exits 1 (191.668s) at :47, `refusal mismatch: status=200 applied=true`, for
+policy_hold; ordinary_hold still passes. Unchanged after gate-log.PJ29cW exits
+0 (8.849s), both leaves passing. No skips, build failures or SQLSTATE supplied
+the red. All logs are under .uzi/scratch/. These wall durations include compile
+and cache costs, not measured CI before/after or critical-path impact.
+
+The lead checked individual log events, source hashes and receipt diffs. Fixture
+review found no findings. Export removed, primary clean and candidate hashes
+unchanged; exact owned fixture cleanup exit 0. No install or base build.
+Security-gate credit is not supplied by this control or by the tester's template
+slot labels; m4 security remains required worker work. This proves the paused
+policy-hold fence only, not running-policy-hold, owner-request/apply policy,
+lane/ownership or remaining preservation clauses. m3/m4 remain **INCOMPLETE**.

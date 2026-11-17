@@ -579,3 +579,22 @@ sensitivity only to the named effects during first settlement. Positive replay
 checks do not independently validate replay-effect sensitivity. Actual custody
 release, other preservation and transactional/runtime criteria, and m4 remain
 required. m3/m4 remain **INCOMPLETE**.
+
+
+## Paused policy-hold redundant-fence evidence
+
+D61 in the proof ledger records candidate 096f614d7, with separate resolved-policy
+and ordinary-hold cases through the real stopped route. Both unchanged cases pass
+before and after; a narrow mutant admits only codex_policy_hold while preserving
+ordinary-hold refusal, and the policy case assertion fails with status=200,
+applied=true. It neutralizes the Go helper hold arm and matching SQL hold value
+restriction, leaving fresh/outcome and all other fences intact.
+
+Receipt .uzi/scratch/stopped-hold-results.json and logs under .uzi/scratch:
+KW7aQb before exit 0; oxnx8K mutant exit 1; PJ29cW after exit 0. The real handler
+race command, durations, copy census, exact diff/hash checks, and cleanup are
+recorded in D61. The lead inspected these logs and original source hashes.
+Fixture review found no findings. No installs, base build or skipped target cases.
+CI timing impact remains unmeasured; full suites and m4 security are not credited.
+Only paused policy-hold refusal is newly credited; other policy, lane, ownership,
+preservation and runtime/transaction obligations remain required. m3/m4 incomplete.
