@@ -628,7 +628,10 @@ test("run-<uuid> leaves cannot starve other leaves of the 512 admission slots", 
   assert.equal(names.filter(n => n.startsWith("run-")).length, MAX_ADMITTED_LEAVES - 2, "run leaves fill the remaining slots");
   assert.ok(!names.includes(`run-${uuid(MAX_ADMITTED_LEAVES - 1)}`) && !names.includes(`run-${uuid(MAX_ADMITTED_LEAVES - 2)}`), "the last run leaves in name order are cut");
   assert.equal(result.kept.cap, 2);
-  assert.deepEqual(names, [...names].sort(), "the admitted list stays in name order");
+  assert.deepEqual(names.slice(0, 2), ["tmp.aaa", "tmp.bbb"], "non-run leaves are processed first, in name order");
+  const runNames = names.slice(2);
+  assert.ok(runNames.every(n => n.startsWith("run-")), "every run leaf follows the non-run leaves");
+  assert.deepEqual(runNames, [...runNames].sort(), "run leaves follow in name order");
 });
 
 test("censusEntryUnchanged flags any difference from the admitted measurement", () => {

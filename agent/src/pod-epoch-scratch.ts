@@ -634,8 +634,9 @@ export function classifyScratchCensus(input: {
     return undefined;
   };
   // Name order makes the 512 cut deterministic. Issue #4420: kept `run-<uuid>` leaves sort before `tmp.` ones and
-  // can be permanent, so non-run leaves are offered the slots first and run leaves take what remains; the result
-  // is returned in name order.
+  // can be permanent, so non-run leaves are offered the slots first and run leaves take what remains. `admitted` is
+  // returned in that admission order (non-run leaves in name order, then run leaves in name order) so the delete loop
+  // processes the cheap non-run leaves before any run leaf, whose keep check costs server reads.
   const byName = [...input.census.entries].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
   const eligible: CensusEntry[] = [];
   for (const e of byName) {
@@ -648,7 +649,6 @@ export function classifyScratchCensus(input: {
     if (admitted.length >= MAX_ADMITTED_LEAVES) kept.cap++;
     else admitted.push({ name: e.name, devIno: e.devIno, bytes: e.bytes, sharedBytes: e.sharedBytes, maxCtimeMs: e.maxCtimeMs });
   }
-  admitted.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
   return { examined: input.census.entries.length, admitted, kept,
     eligibleBytes: admitted.reduce((n, l) => n + l.bytes, 0), sharedBytes: admitted.reduce((n, l) => n + l.sharedBytes, 0) };
 }

@@ -11,7 +11,7 @@ import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeF
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { runPodEpochShadow, PodEpochSettlementError } from "../src/pod-epoch-reclaim.js";
+import { runPodEpochShadow, PodEpochSettlementError, RUN_LEAF_READ_MAX_MS } from "../src/pod-epoch-reclaim.js";
 import { PodEpochDaemonError, type PodEpochDaemonGuard } from "../src/pod-epoch-daemon.js";
 import { GitCache, type EpochScratchDiscardInput, type RetainedSourceEvidence, type RetainedInspectResult } from "../src/git.js";
 import { censusScratchRoot } from "../src/rmtree.js";
@@ -1426,7 +1426,7 @@ test("#4420 an outbox that is missing, disabled or throwing keeps the leaf as ru
   const stub = (over: Record<string, unknown>) => ({
     isDisabled: () => false, unusableRootReason: () => undefined, hasPhysicalTerminalProtection: async () => false,
     // listPendingFinalizes (the register's view, capped at 256 entries) is deliberately a truncated empty list here.
-    listPendingFinalizes: () => [], listPendingFinalizeGenerations: () => [], listPublicationRecords: () => [], depthFor: () => undefined, uncleanRuns: () => [], ...over }) as never;
+    listPendingFinalizes: () => [], listPendingFinalizeGenerations: (_includeTerminal?: boolean) => [], listPublicationRecords: () => [], depthFor: () => undefined, uncleanRuns: () => [], ...over }) as never;
   const unknownCases: Array<[string, unknown]> = [
     ["no outbox dependency", undefined],
     ["disabled", stub({ isDisabled: () => true })],
@@ -1450,6 +1450,9 @@ test("#4420 an outbox that is missing, disabled or throwing keeps the leaf as ru
       listPendingFinalizeGenerations: () => [
         ...Array.from({ length: 300 }, (_, n) => ({ run_id: `other-${n}`, claim_generation: 1 })),
         { run_id: RUN_A, claim_generation: 2 }],
+    })],
+    ["a pending finalize visible only in the complete (includeTerminal) listing", stub({
+      listPendingFinalizeGenerations: (includeTerminal?: boolean) => includeTerminal ? [{ run_id: RUN_A, claim_generation: 1 }] : [],
     })],
     ["a publication record", stub({ listPublicationRecords: () => [{ run_id: RUN_A, claim_generation: 1 }] })],
     ["pending messages", stub({ depthFor: depth(2, 0) })],
@@ -1537,12 +1540,90 @@ test("#4420 server holds: an open hold, a run-wide open count, a missing run_ope
 });
 
 test("#4420 an aborted pass is not swallowed as a keep: an abort during the lifecycle read stops the phase", FD_ONLY, async () => {
-  // "zplain" sorts after the run leaf, so the abort lands before any leaf is deleted.
+  // Run leaves are processed after the plain ones, so "zplain" is already deleted when the run leaf's read aborts.
   await withRunWorld([leafOf(RUN_A), "zplain"], async (w, rw) => {
     w.options.client.getRunOwnership = async () => { rw.calls.push("ownership"); w.parent.abort(); throw new Error("aborted mid-read"); };
     const result = (await runPodEpochShadow(w.options))!;
     assert.equal(result.scratch.state, "stopped");
-    assert.deepEqual(w.calls.discards, []);
-    await untouched(w, [leafOf(RUN_A), "zplain"]);
+    assert.deepEqual(w.calls.discards, ["zplain"]);
+    await untouched(w, [leafOf(RUN_A)]);
+  });
+});
+
+/** A stepped fake clock: `advance` moves time and runs the timers that fell due (no real-time wait). */
+function steppedClock(w: World) {
+  let t = 0;
+  const timers: Array<{ at: number; cb: () => void; live: boolean }> = [];
+  w.options.now = () => t;
+  w.options.schedule = (cb, ms) => {
+    const entry = { at: t + ms, cb, live: true };
+    timers.push(entry);
+    return () => { entry.live = false; };
+  };
+  return {
+    advance: (ms: number) => {
+      t += ms;
+      for (;;) {
+        const due = timers.find(x => x.live && x.at <= t);
+        if (!due) break;
+        due.live = false; due.cb();
+      }
+    },
+  };
+}
+const hangUntilAborted = (signal: AbortSignal | undefined) => new Promise<never>((_resolve, reject) => {
+  signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+});
+
+test("#4420 hung ownership reads: plain leaves are processed first and each hung run leaf is run_unreadable after its own bound", FD_ONLY, async () => {
+  const runs = [RUN_A, RUN_B, "0c0c0c0c-1111-4222-8333-444444444444"];
+  await withRunWorld([...runs.map(leafOf), "tmp.aaa", "tmp.bbb"], async (w, rw) => {
+    const clock = steppedClock(w);
+    const seenAtFirstRead: string[][] = [];
+    w.options.client.getRunOwnership = async (_id, options) => {
+      rw.calls.push("ownership");
+      seenAtFirstRead.push([...w.calls.discards]);
+      setImmediate(() => clock.advance(RUN_LEAF_READ_MAX_MS));
+      return hangUntilAborted(options.signal);
+    };
+    const result = await run(w);
+    assert.equal(result.scratch.state, "ran");
+    assert.deepEqual(seenAtFirstRead[0], ["tmp.aaa", "tmp.bbb"], "both plain leaves were deleted before any run leaf read began");
+    assert.equal(rw.calls.filter(c => c === "ownership").length, runs.length, "every hung read ended on its own bound and the pass went on");
+    assert.deepEqual(keptRun(result), { run_unreadable: runs.length });
+    assert.deepEqual(w.calls.discards, ["tmp.aaa", "tmp.bbb"]);
+    await untouched(w, runs.map(leafOf));
+  });
+});
+
+test("#4420 a hung holds read is run_unreadable after its own bound and does not stop the pass", FD_ONLY, async () => {
+  await withRunWorld([leafOf(RUN_A), "tmp.aaa"], async (w, rw) => {
+    const clock = steppedClock(w);
+    w.options.client.listRecoveryHolds = async (_id, signal) => {
+      rw.calls.push("holds");
+      setImmediate(() => clock.advance(RUN_LEAF_READ_MAX_MS));
+      return hangUntilAborted(signal);
+    };
+    const result = await run(w);
+    assert.equal(result.scratch.state, "ran");
+    assert.deepEqual(keptRun(result), { run_unreadable: 1 });
+    assert.deepEqual(w.calls.discards, ["tmp.aaa"]);
+    assert.deepEqual(rw.classified, []);
+    await untouched(w, [leafOf(RUN_A)]);
+  });
+});
+
+test("#4420 an abort of the pass during a hung run-leaf read still propagates as a stop, not a keep", FD_ONLY, async () => {
+  await withRunWorld([leafOf(RUN_A), leafOf(RUN_B)], async (w, rw) => {
+    w.options.client.getRunOwnership = async (_id, options) => {
+      rw.calls.push("ownership");
+      setImmediate(() => w.parent.abort());
+      return hangUntilAborted(options.signal);
+    };
+    const result = (await runPodEpochShadow(w.options))!;
+    assert.equal(result.scratch.state, "stopped");
+    assert.equal(rw.calls.filter(c => c === "ownership").length, 1, "no further run leaf is read after the abort");
+    assert.deepEqual(keptRun(result), {});
+    await untouched(w, [leafOf(RUN_A), leafOf(RUN_B)]);
   });
 });

@@ -334,6 +334,8 @@ interface ScratchContext {
   check(): void;
   entry(): void;
   now(): number;
+  /** The pass's injectable timer; returns its cancel. */
+  schedule(fn: () => void, ms: number): () => void;
   hardPass: number;
   deadlineAt(): number;
   out: ScratchVerdict;
@@ -404,6 +406,25 @@ async function outboxRetention(outbox: PodEpochScratchDeps["outbox"], runId: str
   } catch { return unknownRetention("outbox"); }
 }
 
+/** Upper bound on one run-leaf server read (matches the client's HTTP timeout scale). Exported for the tests. */
+export const RUN_LEAF_READ_MAX_MS = 30_000;
+
+/**
+ * One run-leaf server read under its own deadline: `min(hardPass - 5000, now + RUN_LEAF_READ_MAX_MS)`. The read gets a
+ * signal that follows the pass's abort and also fires at that deadline, so a hung read fails only this leaf (the caller
+ * keeps it as unreadable) while an aborted pass still propagates as interrupted.
+ */
+async function boundedRunLeafRead<T>(ctx: ScratchContext, read: (signal: AbortSignal, deadline: number) => Promise<T>): Promise<T> {
+  const deadline = Math.min(ctx.hardPass - 5000, ctx.now() + RUN_LEAF_READ_MAX_MS);
+  const local = new AbortController();
+  const follow = () => local.abort(ctx.controller.signal.reason);
+  ctx.controller.signal.addEventListener("abort", follow, { once: true });
+  if (ctx.controller.signal.aborted) follow();
+  const cancel = ctx.schedule(() => local.abort(new Error("run_leaf_read_timeout")), Math.max(0, deadline - ctx.now()));
+  try { return await MaintenanceBudget.runOwned(local.signal, () => read(local.signal, deadline)); }
+  finally { cancel(); ctx.controller.signal.removeEventListener("abort", follow); }
+}
+
 /**
  * Issue #4420: why a `run-<uuid>` leaf must be kept, or undefined when its run has ended everywhere. Server first
  * (lifecycle terminal, then zero holds by the deletion-side rule), then local retention (GitCache) and the outbox.
@@ -416,8 +437,8 @@ async function runLeafKeep(ctx: ScratchContext, name: string): Promise<(typeof R
   const rethrow = (error: unknown): void => { if (error instanceof PodEpochSettlementError || ctx.interrupted()) throw error; };
   let row: RunOwnershipResponse | undefined;
   try {
-    row = await ctx.owned(() => MaintenanceBudget.runOwned(controller.signal,
-      () => client.getRunOwnership(runId, { signal: controller.signal, deadline: ctx.hardPass - 5000 })), ctx.hardPass);
+    row = await ctx.owned(() => boundedRunLeafRead(ctx,
+      (signal, deadline) => client.getRunOwnership(runId, { signal, deadline })), ctx.hardPass);
   } catch (error) {
     rethrow(error);
     // Only the exact ownership 404 is "unknown to the server"; every other failure is unreadable.
@@ -429,8 +450,8 @@ async function runLeafKeep(ctx: ScratchContext, name: string): Promise<(typeof R
   const lifecycle: RetainedLifecycleSnapshot = { state: "terminal", status: row.status };
   let response: RecoveryHoldsResponse | undefined;
   try {
-    response = await ctx.owned(() => MaintenanceBudget.runOwned(controller.signal,
-      () => client.listRecoveryHolds(runId, controller.signal)), ctx.hardPass);
+    response = await ctx.owned(() => boundedRunLeafRead(ctx,
+      signal => client.listRecoveryHolds(runId, signal)), ctx.hardPass);
   } catch (error) { rethrow(error); return "run_unreadable"; }
   const snapshot = holdsSnapshot(response!, runId);
   const open = response?.run_open_holds;
@@ -988,7 +1009,7 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
       await runScratchPhase({
         deps: scratchDeps, seams: scratchDeps.scratchTestGate === TEST_SCRATCH_GATE ? scratchDeps.seams ?? {} : {},
         client: options.client, runDiscovery: {}, runMemo: {},
-        podUid: boot.podUid, guard: guard!, controller, owned, check, entry, now, hardPass, deadlineAt, out: result.scratch,
+        podUid: boot.podUid, guard: guard!, controller, owned, check, entry, now, schedule, hardPass, deadlineAt, out: result.scratch,
         openScope,
         interrupted: () => fatal || controller.signal.aborted,
         failFatal: () => { fatal = true; throw new PodEpochSettlementError(); },

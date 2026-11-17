@@ -4937,7 +4937,9 @@ export class GitCache {
       this.checkRecoveryInterruption();
       const found = await this.withLock(bare, async (): Promise<RunRetention | { ledger: AttemptLedgerEntry[] }> => {
         await this.assertRecoveryBare(bare);
-        // Pass-scoped memo: each bare's config listing is read once per pass; a memoized failure re-throws for every leaf
+        // Pass-scoped memo: each bare's config listing is read once per pass. This is safe only because the pass holds
+        // exclusive pod-epoch ownership before admission and no other writer runs during it, so the config cannot change
+        // under the memo. A memoized failure re-throws for every leaf
         // (unknown through the caller's catch). The byte cap is still charged per leaf against the memoized length.
         let pending = opts.memo?.bareConfigs?.get(bare);
         if (!pending) {
