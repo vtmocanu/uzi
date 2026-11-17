@@ -67,6 +67,27 @@ data:
     would emit a DUPLICATE ConfigMap key (the range above already emitted the api.config
     one), so that combination is a hard render failure, like FORGE_ALLOWED_BASE_URLS.
   */ -}}
+  {{- /*
+    UZI_PROVIDER_ALLOWED_BASE_URLS rendered EXPLICITLY from the first-class
+    providers.allowedBaseURLs value (PRD #4320): the exact model-provider base URLs, WITH
+    path, that users may point a provider at. Every entry is validated by
+    uzi.providerAllowedBaseURLs (https only; no userinfo, query, fragment, percent-encoding,
+    semicolon, backslash, dot or empty segment, comma or whitespace) before it is rendered;
+    the api re-validates at boot and refuses to start on a bad entry. Empty (the default)
+    renders no key: the feature is off. Loopback (UZI_PROVIDER_ALLOW_LOOPBACK) is a compose
+    development flag and deliberately has no chart value.
+
+    Setting BOTH providers.allowedBaseURLs AND api.config.UZI_PROVIDER_ALLOWED_BASE_URLS would
+    emit a DUPLICATE ConfigMap key (the range above already emitted the api.config one), so
+    that combination is a hard render failure, like FORGE_ALLOWED_BASE_URLS.
+  */ -}}
+  {{- $providerURLs := fromJsonArray (include "uzi.providerAllowedBaseURLs" .) }}
+  {{- if $providerURLs }}
+  {{- if hasKey .Values.api.config "UZI_PROVIDER_ALLOWED_BASE_URLS" }}
+  {{- fail "Set the provider allowlist in EITHER providers.allowedBaseURLs OR api.config.UZI_PROVIDER_ALLOWED_BASE_URLS, not both: both set would emit a duplicate UZI_PROVIDER_ALLOWED_BASE_URLS ConfigMap key. Prefer providers.allowedBaseURLs." }}
+  {{- end }}
+  UZI_PROVIDER_ALLOWED_BASE_URLS: {{ join "," $providerURLs | quote }}
+  {{- end }}
   {{- $issueTrackerURLs := fromJsonArray (include "uzi.issueTrackerAllowedBaseURLs" .) }}
   {{- if $issueTrackerURLs }}
   {{- if hasKey .Values.api.config "ISSUE_TRACKER_ALLOWED_BASE_URLS" }}

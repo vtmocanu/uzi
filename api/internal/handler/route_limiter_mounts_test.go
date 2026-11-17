@@ -789,6 +789,7 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/me/effective-settings/schedule-preview", noLimiter},
 	{"POST", "/api/me/providers/", noLimiter},
 	{"POST", "/api/me/providers/{id}/retire", noLimiter},
+	{"POST", "/api/me/providers/{id}/test", noLimiter},
 	// PRD #1907 M5: the product-token MINT rides the credential-surface limiter per user
 	// (a (pattern, user) bucket), on top of the handler's per-product cap (D15).
 	{"POST", "/api/me/product-tokens/", limAuth},

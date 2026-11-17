@@ -1723,6 +1723,10 @@ tasks:
       # renders UZI_ADMIN_RUN_DEBUG, reserved against api.config/api.secretEnv), same
       # no-workflow-edit wiring.
       - ./scripts/assert-admin-run-debug-render.sh
+      # Also runs the provider render check (PRD #4320: providers.allowedBaseURLs renders
+      # UZI_PROVIDER_ALLOWED_BASE_URLS, workers.extraCA reaches the api pod for the provider
+      # Test probe), same no-workflow-edit wiring.
+      - ./scripts/assert-provider-chart-render.sh
 
   render:pvc-expansion-check:
     desc: assert the chart renders the PVC expansion surface (DinD data-size env, ceiling guards, the get-only StorageClass ClusterRole)
@@ -1784,6 +1788,14 @@ tasks:
       # Not in gate:repo (the lint job lacks helm); CI's helm-chart job runs it. Offline +
       # non-vacuous, see the script header.
       - ./scripts/assert-worker-extra-ca-render.sh
+
+  render:provider-check:
+    desc: assert providers.allowedBaseURLs renders (off by default, path kept, bad entries refused) and workers.extraCA reaches the api pod
+    cmds:
+      # Standalone, NOT wired into gate:repo/gate: the lint job lacks helm. Offline
+      # (CNPG subchart stripped), non-vacuous. Also run by render:openshift-check, which
+      # CI's helm-chart job runs.
+      - ./scripts/assert-provider-chart-render.sh
 
   render:ephemeral-docker-check:
     desc: assert effective Docker tier availability reaches the api Deployment

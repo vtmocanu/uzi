@@ -204,6 +204,12 @@ type Config struct {
 	// ProviderAllowLoopback (UZI_PROVIDER_ALLOW_LOOPBACK, default false) is the explicit dev flag
 	// that lets a loopback host, and http for it, appear in the allowlist and in a provider URL.
 	ProviderAllowLoopback bool
+	// ProviderExtraCAFile (UZI_PROVIDER_EXTRA_CA_FILE) is the path of an extra PEM CA bundle the
+	// provider Test probe trusts in addition to the system roots; empty means system roots only.
+	// ProviderExtraCAPEM is that file's content, read and parsed at boot (an unreadable file or
+	// one with no certificate refuses boot). Only the probe client uses it.
+	ProviderExtraCAFile string
+	ProviderExtraCAPEM  []byte
 	// ForgePollInterval is the per-enabled-repo incremental poll cadence.
 	ForgePollInterval time.Duration
 	// ForgeReconcileEvery is the number of incremental polls between full
@@ -1067,6 +1073,13 @@ func Load() (Config, error) {
 	cfg.ProviderAllowedBaseURLs, err = parseProviderAllowlist(getenv("UZI_PROVIDER_ALLOWED_BASE_URLS", ""), cfg.ProviderAllowLoopback)
 	if err != nil {
 		return Config{}, err
+	}
+	cfg.ProviderExtraCAFile = strings.TrimSpace(getenv("UZI_PROVIDER_EXTRA_CA_FILE", ""))
+	if cfg.ProviderExtraCAFile != "" {
+		cfg.ProviderExtraCAPEM, err = loadProviderExtraCA(cfg.ProviderExtraCAFile)
+		if err != nil {
+			return Config{}, err
+		}
 	}
 	cfg.ForgePollInterval = parseDuration("FORGE_POLL_INTERVAL", time.Minute)
 	cfg.ForgeReconcileEvery = parseInt("FORGE_RECONCILE_EVERY", 10)
@@ -2353,6 +2366,20 @@ func parseProviderAllowlist(raw string, allowLoopback bool) ([]string, error) {
 		out = append(out, norm)
 	}
 	return out, nil
+}
+
+// loadProviderExtraCA reads the UZI_PROVIDER_EXTRA_CA_FILE bundle and requires it to hold at
+// least one parseable certificate, so a typo or a truncated mount refuses boot instead of leaving
+// every private-CA gateway probing "inconclusive". The error names the variable, never the content.
+func loadProviderExtraCA(path string) ([]byte, error) {
+	pem, err := os.ReadFile(path) //nolint:gosec // G304: an operator-set path, read once at boot
+	if err != nil {
+		return nil, fmt.Errorf("UZI_PROVIDER_EXTRA_CA_FILE is unreadable: %w", err)
+	}
+	if err := providers.CheckCABundle(pem); err != nil {
+		return nil, fmt.Errorf("UZI_PROVIDER_EXTRA_CA_FILE: %w", err)
+	}
+	return pem, nil
 }
 
 // ProviderBaseURLAllowed reports the allowlist entry candidate matches exactly (PRD #4320), and

@@ -487,3 +487,38 @@ func (q *Queries) RetireModelProvider(ctx context.Context, arg RetireModelProvid
 	}
 	return result.RowsAffected(), nil
 }
+
+const upsertModelProviderProbeResult = `-- name: UpsertModelProviderProbeResult :execrows
+INSERT INTO model_provider_probe_results (provider_id, revision, auth_result, tool_result, probed_at)
+SELECT p.id, p.current_revision, $1, $2, now()
+FROM model_providers p
+WHERE p.id = $3 AND p.owner_user_id = $4 AND p.current_revision = $5
+ON CONFLICT (provider_id, revision) DO UPDATE
+SET auth_result = EXCLUDED.auth_result, tool_result = EXCLUDED.tool_result, probed_at = EXCLUDED.probed_at
+`
+
+type UpsertModelProviderProbeResultParams struct {
+	AuthResult  string      `json:"auth_result"`
+	ToolResult  pgtype.Text `json:"tool_result"`
+	ProviderID  uuid.UUID   `json:"provider_id"`
+	OwnerUserID uuid.UUID   `json:"owner_user_id"`
+	Revision    int32       `json:"revision"`
+}
+
+// Stores the latest Test probe result for the provider's CURRENT revision only (PRD #4320 section
+// 8): the row is written only while the owner's provider still has that revision as its current
+// one, so a probe that raced an edit (or a retire/delete) writes nothing and returns 0 rows. One
+// row per (provider, revision); a later probe replaces it.
+func (q *Queries) UpsertModelProviderProbeResult(ctx context.Context, arg UpsertModelProviderProbeResultParams) (int64, error) {
+	result, err := q.db.Exec(ctx, upsertModelProviderProbeResult,
+		arg.AuthResult,
+		arg.ToolResult,
+		arg.ProviderID,
+		arg.OwnerUserID,
+		arg.Revision,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}

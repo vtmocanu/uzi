@@ -102,6 +102,10 @@ func (h *Handler) mountMeRoutes(r chi.Router, authLimiter *mw.Limiter) {
 			r.Get("/{id}", h.GetMyProvider)
 			r.Patch("/{id}", h.PatchMyProvider)
 			r.Post("/{id}/retire", h.RetireMyProvider)
+			// The Test probe sends the stored key to the stored (allowlisted) destination and
+			// returns only two outcome words, so a Bearer caller can run it but cannot read the
+			// key or move the destination. Rate-limited by its own in-memory admission limiter.
+			r.Post("/{id}/test", h.TestMyProvider)
 		})
 		r.Group(func(r chi.Router) {
 			r.Use(h.requireAuth())

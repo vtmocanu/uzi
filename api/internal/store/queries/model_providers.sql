@@ -109,6 +109,18 @@ LEFT JOIN user_secrets k ON k.user_id = p.owner_user_id AND k.provider_id = p.id
 LEFT JOIN model_provider_probe_results pr ON pr.provider_id = p.id AND pr.revision = p.current_revision
 WHERE p.id = $1 AND p.owner_user_id = $2;
 
+-- name: UpsertModelProviderProbeResult :execrows
+-- Stores the latest Test probe result for the provider's CURRENT revision only (PRD #4320 section
+-- 8): the row is written only while the owner's provider still has that revision as its current
+-- one, so a probe that raced an edit (or a retire/delete) writes nothing and returns 0 rows. One
+-- row per (provider, revision); a later probe replaces it.
+INSERT INTO model_provider_probe_results (provider_id, revision, auth_result, tool_result, probed_at)
+SELECT p.id, p.current_revision, @auth_result, @tool_result, now()
+FROM model_providers p
+WHERE p.id = @provider_id AND p.owner_user_id = @owner_user_id AND p.current_revision = @revision
+ON CONFLICT (provider_id, revision) DO UPDATE
+SET auth_result = EXCLUDED.auth_result, tool_result = EXCLUDED.tool_result, probed_at = EXCLUDED.probed_at;
+
 -- name: InsertProviderKeySecret :one
 -- Stores a provider's gateway key (kind anthropic_compatible_key), the ONLY writer of that kind.
 -- Deliberately NOT InsertUserSecret: that statement forces the first secret of a kind to be the

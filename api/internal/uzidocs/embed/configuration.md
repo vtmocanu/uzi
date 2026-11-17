@@ -239,13 +239,45 @@ possible with an allowlist that is **separate** from every other allowlist on th
 
 | Var | Default | Notes |
 |---|---|---|
-| `UZI_PROVIDER_ALLOWED_BASE_URLS` | *(empty)* | Comma-separated list of exact provider base URLs, **path included** (for example `https://gw.example.com/anthropic`). A provider's base URL must equal one entry after normalization; there is no host, prefix or path-segment matching, so one tenant's path on a shared gateway cannot be repointed to another's. Entries are normalized (lowercase scheme and host, default port elided, one trailing `/` removed). An entry with a query, fragment, userinfo, a `.` or `..` path segment, any `%` encoding (`%2e`, `%2f`, ...), `;`, `\`, non-ASCII characters or more than 2048 bytes fails boot, naming the variable and the entry's position. **Empty or unset turns the feature off:** no provider can be created and the API reports `enabled: false`. |
-| `UZI_PROVIDER_ALLOW_LOOPBACK` | `false` | Dev flag. Only when `true` may the list hold a loopback host (`localhost`, `127.0.0.0/8`, `::1`) and plain `http` for it, so a local fake gateway works under compose. Never set it in production: the probe would be able to reach the api's own local ports. |
+| `UZI_PROVIDER_ALLOWED_BASE_URLS` | *(empty)* | Comma-separated list of exact provider base URLs, **path included** (for example `https://gw.example.com/anthropic`). A provider's base URL must equal one entry after normalization; there is no host, prefix or path-segment matching, so one tenant's path on a shared gateway cannot be repointed to another's. Entries are normalized (lowercase scheme and host, default port elided, one trailing `/` removed). An entry with a query, fragment, userinfo, a `.` or `..` path segment, any `%` encoding (`%2e`, `%2f`, ...), `;`, `\`, non-ASCII characters, more than 2048 bytes, a host with a trailing dot (`gw.example.com.`), a numeric-shorthand IPv4 host (`127.1`, `2130706433`, `0x7f.1`) or an unspecified or link-local IP literal (`0.0.0.0`, `::`, `169.254.169.254`, `fe80::1`) fails boot, naming the variable and the entry's position. **Empty or unset turns the feature off:** no provider can be created and the API reports `enabled: false`. |
+| `UZI_PROVIDER_ALLOW_LOOPBACK` | `false` | Dev flag. Only when `true` may the list hold a loopback host (`localhost`, any `*.localhost` name, `127.0.0.0/8`, `::1`) and plain `http` for it, and only then may the Test probe connect to a loopback address, so a local fake gateway works under compose. Never set it in production: the probe would be able to reach the api's own local ports. |
+| `UZI_PROVIDER_EXTRA_CA_FILE` | *(empty)* | Path to a PEM bundle the provider **Test** probe trusts **in addition to** the system roots, for a gateway behind a private CA. Unset means system roots only. The file is read once at boot; an unreadable file, or one with no certificate, refuses boot (the message names the variable, never the content). Only the probe's HTTP client uses it: the api's other outbound calls (forge, Anthropic, OIDC, ...) keep the system roots. Compose has no equivalent mount, so there set the variable to a file you bind-mount into the api container. Helm sets it for you, see below. |
 
 The api is the destination authority: it checks the list when a provider is saved or its endpoint
 edited, and a saved URL is stored as the matching list entry. Removing an entry stops later saves and
-tests of providers that used it (every save re-checks the URL it carries, a key save included) and,
-once providers can run, their run claims. Helm: set the variables through `api.config`.
+tests of providers that used it (every save re-checks the URL it carries, a key save included, and
+so does every Test, right before it connects) and, once providers can run, their run claims.
+
+**Helm.** Set the allowlist with the first-class value `providers.allowedBaseURLs` (a list of exact
+URLs, rendered into `UZI_PROVIDER_ALLOWED_BASE_URLS`; setting the variable in `api.config` as well
+fails the render). The chart checks every entry's shape (https only; no userinfo, query, fragment,
+`%`, `;`, `\`, dot or empty path segments, comma or whitespace) and the api re-validates at boot.
+`UZI_PROVIDER_ALLOW_LOOPBACK` is a compose development flag and has no chart value. For a gateway
+behind a private CA, set `workers.extraCA` (it needs `api.tls.enabled`): the chart mounts the same
+bundle read-only into the api pod, sets `UZI_PROVIDER_EXTRA_CA_FILE` to it and rolls the pod when the
+inline `pem` changes (an in-place edit of an existing ConfigMap needs an api restart). Without it, a
+private-CA gateway always tests as inconclusive while runs may still reach it.
+
+### The Test probe
+
+**Test** on a provider sends two small requests from the **api** to `<base_url>/v1/messages` with the
+provider's key: a one-token request (does the key authenticate and the endpoint speak the Messages
+protocol) and, only if that succeeds, a forced single-tool request (does the gateway return a
+`tool_use` block). Neither certifies full compatibility. The api must therefore be able to reach the
+gateway on the network, which is separate from any worker egress rule.
+
+- **Direct connections.** The probe ignores `HTTPS_PROXY`, `HTTP_PROXY` and `NO_PROXY`: it resolves the
+  host itself, checks every answer, and connects only to the checked addresses.
+- **Addresses.** Private gateway addresses are admitted: RFC 1918 (`10/8`, `172.16/12`, `192.168/16`),
+  IPv6 unique-local (`fc00::/7`) and carrier-grade NAT (`100.64/10`). Always refused: unspecified
+  (`0.0.0.0/8`, `::`), link-local (`169.254/16`, `fe80::/10`, which includes cloud metadata
+  `169.254.169.254`), `fd00:ec2::254`, multicast and broadcast. Loopback is refused unless
+  `UZI_PROVIDER_ALLOW_LOOPBACK=true`. If any answer for a host is refused, the whole host is refused.
+- **Bounds.** No redirects are followed (a redirect is "inconclusive"); 20 s per request; request body at
+  most 4 KiB; at most 64 KiB of the response is read; nothing from a response body is logged or
+  returned. Per user: one probe in flight and 30 per hour (create and retire do not reset it); four in
+  flight instance-wide. Over a limit the route answers 429 `provider_probe_rate_limited` with
+  `Retry-After`. The counters are in memory per api process.
 
 Network reach is a separate control. `workers.fqdnEgress.allowFQDNs` is **namespace-wide** (see
 ADR-0285): once an operator admits a gateway host there, every restricted-tier run in the worker

@@ -99,6 +99,26 @@ forge:
 issueTracker:
   allowedBaseURLs: []
 
+# --- providers: the operator allowlist for user-defined model providers (PRD #4320) -----
+#
+# Renders into the api's UZI_PROVIDER_ALLOWED_BASE_URLS env. A user may create a provider
+# (an Anthropic-compatible gateway with its own key) only at a base URL that EQUALS one
+# of these entries exactly, path included: https://gateway.example.com/anthropic allows
+# that URL (and the same with a trailing slash) and nothing under or beside it. Each entry
+# must be https; userinfo, a query, a fragment, percent-encoding, a semicolon, a backslash,
+# dot or empty path segments, a comma or whitespace fail the render (the message never
+# echoes the entry); the api re-validates at boot. Empty (the default) turns the feature
+# off. It never feeds the worker egress lists: a worker's network access to the gateway is
+# yours to open, and the api itself must reach the gateway (the Test button dials from the
+# api, directly, ignoring HTTPS_PROXY/HTTP_PROXY, and admits private gateway addresses).
+# The compose-only loopback dev flag (UZI_PROVIDER_ALLOW_LOOPBACK) has no chart value on
+# purpose: in a cluster it would let the probe reach the api's own local ports. Set this
+# per-cluster instead of api.config.UZI_PROVIDER_ALLOWED_BASE_URLS (setting BOTH fails the
+# render, see api-configmap.yaml). A gateway behind a private CA also needs
+# workers.extraCA, which the provider Test probe trusts too (see there).
+providers:
+  allowedBaseURLs: []
+
 # --- releaseCheck: the periodic GitHub release-availability check (PRD #836) -------
 #
 # The api periodically polls GitHub's releases API for vtmocanu/uzi and surfaces an
@@ -509,6 +529,10 @@ workers:
   # turning it on also adds UZI_CLI_CA_FILE to the worker pod template, which can start
   # paced worker rolls; a roll does not rewrite an existing worker's Secret, so
   # reprovisioning is still what delivers the CA to it.
+  # The same bundle is also mounted read-only into the api pod (UZI_PROVIDER_EXTRA_CA_FILE)
+  # and trusted, on top of the system roots, by the provider Test probe (providers.*) and by
+  # no other api client; the api refuses to boot if the file is unreadable or holds no
+  # certificate, and rolls when the inline pem changes.
   extraCA:
     pem: ""
     configMap:
