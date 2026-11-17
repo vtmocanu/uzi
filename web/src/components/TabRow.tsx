@@ -7,7 +7,7 @@
 // rows grow a stray vertical scrollbar). The active tab's 2px bottom border paints over
 // the 1px inset line because a child's border is drawn above its parent's inset shadow.
 
-import { forwardRef, useEffect, useRef, type HTMLAttributes, type ReactNode } from "react";
+import { forwardRef, useEffect, useRef, type HTMLAttributes, type ReactNode, type RefObject } from "react";
 import { cx } from "./ui";
 
 type TabRowVariant = "scroll" | "wrap";
@@ -53,14 +53,51 @@ export function tabClass(active: boolean, tone: TabTone = "default"): string {
 /**
  * Adjust `row.scrollLeft` so `el` is fully visible inside `row`. Only the row scrolls:
  * unlike `scrollIntoView` this never moves the window (which, under a pinned block's
- * scroll-padding, would shift the page).
+ * scroll-padding, would shift the page). `inset` (px) keeps `el` that far inside each edge,
+ * so a faded row (`data-fade-row`, 24px fades) leaves the element clear of the fade. The
+ * scroll is instant: it assigns scrollLeft, and no CSS sets `scroll-behavior`.
  */
-export function keepInRowView(row: HTMLElement | null | undefined, el: HTMLElement | null | undefined): void {
+export function keepInRowView(
+  row: HTMLElement | null | undefined,
+  el: HTMLElement | null | undefined,
+  inset = 0,
+): void {
   if (!row || !el) return;
   const r = row.getBoundingClientRect();
   const e = el.getBoundingClientRect();
-  if (e.left < r.left) row.scrollLeft += e.left - r.left;
-  else if (e.right > r.right) row.scrollLeft += e.right - r.right;
+  if (e.left < r.left + inset) row.scrollLeft += e.left - r.left - inset;
+  else if (e.right > r.right - inset) row.scrollLeft += e.right - r.right + inset;
+}
+
+/**
+ * Edge fade for a sideways-scrolling row (IntersectionObserver rooted at the row, no scroll
+ * listener): `data-fade-start` / `data-fade-end` are set on the row only while its first /
+ * last child is not fully visible. Re-runs when `key` changes (the children changed).
+ */
+export function useEdgeFade(rowRef: RefObject<HTMLElement | null>, key: string): void {
+  useEffect(() => {
+    const row = rowRef.current;
+    if (!row || typeof IntersectionObserver === "undefined") return;
+    const first = row.firstElementChild;
+    const last = row.lastElementChild;
+    const io = new IntersectionObserver(
+      (entries) => {
+        for (const e of entries) {
+          const attr = e.target === first ? "data-fade-start" : "data-fade-end";
+          if (e.intersectionRatio < 0.99) row.setAttribute(attr, "");
+          else row.removeAttribute(attr);
+        }
+      },
+      { root: row, threshold: 0.99 },
+    );
+    if (first) io.observe(first);
+    if (last && last !== first) io.observe(last);
+    return () => {
+      io.disconnect();
+      row.removeAttribute("data-fade-start");
+      row.removeAttribute("data-fade-end");
+    };
+  }, [rowRef, key]);
 }
 
 // Owner token for the <html> attributes: the latest mounted block owns them, and an

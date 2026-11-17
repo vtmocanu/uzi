@@ -157,20 +157,33 @@ const sectionEls = () =>
     .map((a) => document.getElementById(idOf(a)))
     .filter((el): el is HTMLElement => el !== null);
 
-function expectInRowView(pill: HTMLElement) {
-  const row = navEl().getBoundingClientRect();
-  const r = pill.getBoundingClientRect();
-  expect(r.left, "pill left inside row").toBeGreaterThanOrEqual(row.left - 1);
-  expect(r.right, "pill right inside row").toBeLessThanOrEqual(row.right + 1);
+// The pill is kept 24px clear of each edge (the row's fade width); allow 1px of rounding.
+// Polled: the keep-in-view scroll lands a frame after the highlight changes.
+async function expectInRowView(pill: HTMLElement) {
+  await vi.waitFor(() => {
+    const row = navEl().getBoundingClientRect();
+    const r = pill.getBoundingClientRect();
+    expect(r.left, "pill left inside row").toBeGreaterThanOrEqual(row.left - 1);
+    expect(r.right, "pill right inside row").toBeLessThanOrEqual(row.right + 1);
+  });
 }
 
-/** The section whose box contains the reading line, or null in a gap. */
-function sectionAtLine(): HTMLElement | null {
-  const y = lineY();
-  return sectionEls().find((el) => {
-    const r = el.getBoundingClientRect();
-    return r.top <= y && r.bottom > y;
-  }) ?? null;
+/** Reading line: the root scroll-padding gap 12 + the cards' scroll-mt-6 24 + 4 slack. */
+const readingLine = () => lineY() + 40;
+
+/** The last pill section, in page order, whose top is at or above the reading line (else the first). */
+function sectionAtLine(): HTMLElement {
+  const y = readingLine();
+  const els = sectionEls();
+  let cur = els[0];
+  for (const el of els) if (el.getBoundingClientRect().top <= y) cur = el;
+  return cur;
+}
+
+/** The highlight must still hold a few frames later (no late flip). */
+async function holdsFrames(expected: string) {
+  for (let i = 0; i < 5; i++) await nextFrame();
+  expect(currentPills().map(idOf)).toEqual([expected]);
 }
 
 for (const width of [1440, 400]) {
@@ -182,6 +195,7 @@ for (const width of [1440, 400]) {
       expect(block.contains(nav)).toBe(true);
       expect(block.querySelector('a[href="/admin/users"]')).not.toBeNull();
       expect(nav.scrollHeight).toBe(nav.clientHeight);
+      // scrollHeight === clientHeight also holds for a wrapped, clipped row: assert one line.
       const tops = new Set(pills().map((a) => Math.round(a.getBoundingClientRect().top)));
       expect(tops.size, "every pill on the same line").toBe(1);
 
@@ -204,7 +218,17 @@ for (const width of [1440, 400]) {
       const section = document.getElementById(idOf(pill))!;
       await expect.poll(() => section.getBoundingClientRect().top >= lineY() - 0.5).toBe(true);
       await expect.poll(() => currentPills().map(idOf)).toEqual([idOf(pill)]);
-      expectInRowView(pill);
+      await expectInRowView(pill);
+      await holdsFrames(idOf(pill));
+    });
+
+    it("clicking the second-to-last pill highlights it", async () => {
+      await mount(width);
+      const pill = pills()[pills().length - 2];
+      await userEvent.click(pill);
+      await expect.poll(() => currentPills().map(idOf)).toEqual([idOf(pill)]);
+      await expectInRowView(pill);
+      await holdsFrames(idOf(pill));
     });
 
     it("clicking the last pill highlights it", async () => {
@@ -212,7 +236,8 @@ for (const width of [1440, 400]) {
       const last = pills()[pills().length - 1];
       await userEvent.click(last);
       await expect.poll(() => currentPills().map(idOf)).toEqual([idOf(last)]);
-      expectInRowView(last);
+      await expectInRowView(last);
+      await holdsFrames(idOf(last));
     });
 
     it("tracks the section under the reading line by scrolling alone", async () => {
@@ -227,19 +252,32 @@ for (const width of [1440, 400]) {
         .slice(1)
         .map((el) => {
           const top = el.getBoundingClientRect().top + window.scrollY;
-          return { el, y: top + el.offsetHeight / 2 - lineY() };
+          return { el, y: top + el.offsetHeight / 2 - readingLine() };
         })
         .filter((t) => t.y > 0 && t.y < docH() - 2 * window.innerHeight);
       expect(targets.length, "enough scrollable sections").toBeGreaterThanOrEqual(3);
       const down = targets.slice(0, 4);
-      const steps = [...down, ...down.slice(0, -1).reverse()];
-      for (const step of steps) {
+      // A pill-less card (no pill of its own) spanning the line leaves the preceding pill lit.
+      const gap = document.getElementById("run-summaries")!;
+      expect(pills().some((a) => idOf(a) === "run-summaries"), "run-summaries has no pill").toBe(false);
+      const gapY = gap.getBoundingClientRect().top + window.scrollY + gap.offsetHeight / 2 - readingLine();
+      const steps = [
+        ...down.map((t) => ({ y: t.y, id: t.el.id })),
+        { y: gapY, id: "run-judge" },
+      ].sort((p, q) => p.y - q.y);
+      const path = [...steps, ...steps.slice(0, -1).reverse()];
+      for (const step of path) {
         window.scrollTo(0, step.y);
         await expect.poll(() => Math.abs(window.scrollY - step.y)).toBeLessThanOrEqual(1);
-        await expect.poll(() => sectionAtLine()?.id).toBe(step.el.id);
-        await expect.poll(() => currentPills().map(idOf), { timeout: 3000 }).toEqual([step.el.id]);
-        expectInRowView(currentPills()[0]);
+        await expect.poll(() => currentPills().map(idOf), { timeout: 3000 }).toEqual([step.id]);
+        expect(sectionAtLine().id, "the test's own reading-line rule agrees").toBe(step.id);
+        await expectInRowView(currentPills()[0]);
       }
+      // Back at the top the first pill is lit, not whichever section was left last.
+      window.scrollTo(0, 0);
+      await expect.poll(() => window.scrollY).toBe(0);
+      await expect.poll(() => currentPills().map(idOf), { timeout: 3000 }).toEqual([idOf(pills()[0])]);
+      await holdsFrames(idOf(pills()[0]));
     });
   });
 }

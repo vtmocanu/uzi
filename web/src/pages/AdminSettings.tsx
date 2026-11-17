@@ -30,7 +30,7 @@ import {
   Skeleton,
 } from "../components/ui";
 import { AdminShell } from "../components/AdminShell";
-import { keepInRowView } from "../components/TabRow";
+import { keepInRowView, useEdgeFade } from "../components/TabRow";
 import { ADMIN_SETTINGS_ANCHOR_IDS, ADMIN_WORKERS_ANCHOR_IDS } from "../components/navSections";
 import { DocLink } from "../components/DocLink";
 import { DOC_ADMIN_SETTINGS } from "../lib/doclinks";
@@ -344,68 +344,42 @@ export function AdminSettings() {
     setCurrentId(id);
   }, []);
 
-  // Edge fade (IntersectionObserver rooted at the pill row, no scroll listener): an edge
-  // is faded only while the first/last pill is not fully visible.
-  useEffect(() => {
-    const nav = navRef.current;
-    if (!sectionKey || !nav || typeof IntersectionObserver === "undefined") return;
-    const pills = nav.querySelectorAll<HTMLElement>("a");
-    const first = pills[0];
-    const last = pills[pills.length - 1];
-    const io = new IntersectionObserver(
-      (entries) => {
-        for (const e of entries) {
-          const attr = e.target === first ? "data-fade-start" : "data-fade-end";
-          if (e.intersectionRatio < 0.99) nav.setAttribute(attr, "");
-          else nav.removeAttribute(attr);
-        }
-      },
-      { root: nav, threshold: 0.99 },
-    );
-    if (first) io.observe(first);
-    if (last && last !== first) io.observe(last);
-    return () => {
-      io.disconnect();
-      nav.removeAttribute("data-fade-start");
-      nav.removeAttribute("data-fade-end");
-    };
-  }, [sectionKey]);
+  useEdgeFade(navRef, sectionKey);
 
-  // Current-section highlight, IntersectionObserver only. The reading line sits at the
-  // pinned block's bottom edge; the section across it is current, and in a gap the
-  // previous one stays. Near the page end (zero-height sentinel visible) a line can no
-  // longer reach the last cards, so the clicked pill (else the last) is current.
+  // Current-section highlight. Observers only TRIGGER evaluation (no scroll listener); each
+  // evaluation reads fresh rects. The reading line sits LANDING below the pinned block's
+  // bottom edge: the root scroll-padding gap (12) + the cards' scroll-mt-6 (24) + 4px slack,
+  // so a pill jump, a deep link or the command menu puts the target at or above the line.
+  // Current = the last pill section, in document order, whose top is at or above the line
+  // (the first at the page top). A pill-less card spanning the line leaves the preceding pill
+  // lit. Near the page end the line can no longer reach the last cards: the clicked pill
+  // stays current while its section is still below the line, else the last pill.
   useEffect(() => {
     const nav = navRef.current;
     const block = nav?.closest<HTMLElement>("[data-pinned-block-root]");
     if (!sectionKey || !nav || !block || typeof IntersectionObserver === "undefined") return;
+    const LANDING = 12 + 24 + 4;
     const ids = sectionKey.split(",");
     const els = ids
       .map((id) => document.getElementById(id))
       .filter((el): el is HTMLElement => el !== null);
-    const lineY = () => (parseFloat(getComputedStyle(block).top) || 0) + block.offsetHeight;
-    let atEnd = false;
+    const lineY = () => block.getBoundingClientRect().bottom + LANDING;
     const evaluate = () => {
-      const pending = pendingRef.current;
+      if (els.length === 0) return;
+      const line = lineY();
+      const end = endRef.current;
+      const atEnd = window.scrollY > 0 && !!end && end.getBoundingClientRect().top <= window.innerHeight;
       if (atEnd) {
-        choose(pending ?? ids[ids.length - 1]);
+        const pending = pendingRef.current;
+        const target = pending ? document.getElementById(pending) : null;
+        if (pending && target && target.getBoundingClientRect().top >= line - 4) choose(pending);
+        else choose(els[els.length - 1].id);
         return;
       }
-      const y = lineY();
-      const hit = els.find((el) => {
-        const r = el.getBoundingClientRect();
-        return r.top <= y && r.bottom > y;
-      });
-      if (!hit) return;
-      if (pending && hit.id !== pending) {
-        // A pill jump leaves the previous section under the line while the clicked card
-        // sits just below it; that is the jump landing, not the user moving on.
-        const target = document.getElementById(pending);
-        const top = target ? target.getBoundingClientRect().top : Infinity;
-        if (top >= y - 4 && top <= y + 80) return;
-        pendingRef.current = null;
-      }
-      choose(hit.id);
+      pendingRef.current = null;
+      let cur = els[0];
+      for (const el of els) if (el.getBoundingClientRect().top <= line) cur = el;
+      choose(cur.id);
     };
 
     let lineIO: IntersectionObserver | null = null;
@@ -418,13 +392,7 @@ export function AdminSettings() {
     };
     build();
 
-    const endIO = new IntersectionObserver(
-      (entries) => {
-        atEnd = entries[entries.length - 1].isIntersecting;
-        evaluate();
-      },
-      { root: document },
-    );
+    const endIO = new IntersectionObserver(evaluate, { root: document });
     if (endRef.current) endIO.observe(endRef.current);
 
     const ro = typeof ResizeObserver !== "undefined" ? new ResizeObserver(build) : null;
@@ -443,7 +411,8 @@ export function AdminSettings() {
   useEffect(() => {
     const nav = navRef.current;
     if (!nav || !current) return;
-    keepInRowView(nav, nav.querySelector<HTMLElement>(`a[href="#${current}"]`));
+    // Inset 24: clear of the row's 24px edge fade.
+    keepInRowView(nav, nav.querySelector<HTMLElement>(`a[href="#${current}"]`), 24);
   }, [current]);
 
   return (

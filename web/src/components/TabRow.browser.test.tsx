@@ -482,6 +482,64 @@ describe("focus and anchors clear the pinned block (#4419)", () => {
   }
 });
 
+describe("keyboard focus inside a pinned block does not scroll the window (#4419)", () => {
+  for (const width of [1440, 400]) {
+    it(`shift-tab through the block's controls and tab back out at ${width}px leaves scrollY put`, async () => {
+      await page.viewport(width, 700);
+      render(
+        <MemoryRouter initialEntries={["/settings"]}>
+          <AppShell>
+            <Routes>
+              <Route
+                path="/settings/*"
+                element={
+                  <SettingsShell description="Buttons">
+                    <div>
+                      <div style={{ height: 1200 }} />
+                      {range(40).map((i) => (
+                        <button key={i} type="button" data-n={i} style={{ display: "block", height: 100 }}>
+                          Control {i}
+                        </button>
+                      ))}
+                    </div>
+                  </SettingsShell>
+                }
+              />
+            </Routes>
+          </AppShell>
+        </MemoryRouter>,
+      );
+      await screen.findByRole("button", { name: "Control 1" });
+      const block = blockEl();
+      // Park the first control right under the stuck block, so Shift+Tab goes straight into it.
+      const below = document.querySelector<HTMLElement>('[data-n="1"]')!;
+      const stuckBottom = expectedTop(width) + block.offsetHeight;
+      await scrollDeep(docTop(below) - stuckBottom);
+      await waitFor(() => expect(block.dataset.stuck).toBe("true"));
+      expect(below.getBoundingClientRect().top).toBeGreaterThanOrEqual(stuckBottom - 0.5);
+      below.focus({ preventScroll: true });
+      const y = window.scrollY;
+      const controls = block.querySelectorAll("a, button, [tabindex]").length;
+      expect(controls, "the block has several controls").toBeGreaterThanOrEqual(3);
+      let inside = 0;
+      for (let i = 0; i < 4; i++) {
+        await userEvent.keyboard("{Shift>}{Tab}{/Shift}");
+        await nextFrame();
+        if (block.contains(document.activeElement)) {
+          inside++;
+          expect(window.scrollY, `scrollY after shift-tab ${i + 1}`).toBe(y);
+        }
+      }
+      expect(inside, "focus entered the block").toBeGreaterThanOrEqual(3);
+      for (let i = 0; i < 4 && block.contains(document.activeElement); i++) {
+        await userEvent.keyboard("{Tab}");
+        await nextFrame();
+        if (block.contains(document.activeElement)) expect(window.scrollY, "scrollY after tab").toBe(y);
+      }
+    });
+  }
+});
+
 describe("pinned tablists keep their keyboard contract (#4419)", () => {
   for (const [name, idx, tabs] of [
     ["Schedules", 3, [/^Schedules/, /^Job catalog/]],

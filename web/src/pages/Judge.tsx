@@ -111,6 +111,7 @@ export function Judge() {
   const isAdmin = !!user?.is_admin;
   // lg and up: the chip row pins with the bucket tabs (one LabelFilter instance, never two).
   const wide = useMinWidth(1024);
+  const tabsRef = useRef<HTMLDivElement>(null);
   const [scopePref, setScopePref] = useState<JudgeScope>(() => (isAdmin ? judgeScopePref.get() : "mine"));
   // A ?run= anchor is a notification deep-link into the CALLER'S OWN run, so it FORCES `mine`
   // for that view (the switch is hidden) regardless of the stored pref. A non-admin is always
@@ -704,7 +705,7 @@ export function Judge() {
               onClear={clearCategories}
             />
           )}
-          <TabRow variant="wrap" role="tablist" aria-label="Backlog bucket">
+          <TabRow ref={tabsRef} variant="wrap" role="tablist" aria-label="Backlog bucket">
             {JUDGE_BUCKETS.map((b) => {
               const active = b === bucket;
               return (
@@ -725,12 +726,23 @@ export function Judge() {
               visible (and clearable) inside the pinned block. */}
           {!wide && categories.length > 0 && (
             <div data-judge-filter-marker="" className="flex items-center gap-2 py-1.5 text-sm text-muted">
-              <span className="min-w-0 truncate">
+              <span
+                className="min-w-0 truncate"
+                title={`Filtered: ${categories.map((c) => recommendationLabel(c)).join(", ")}`}
+              >
                 Filtered: {categories.map((c) => recommendationLabel(c)).join(", ")}
               </span>
               <button
                 type="button"
-                onClick={clearCategories}
+                aria-label="Clear label filter"
+                onClick={() => {
+                  clearCategories();
+                  // The marker unmounts with the filter: hand focus to the active bucket tab
+                  // (without scrolling the window) so it is not dropped to <body>.
+                  tabsRef.current
+                    ?.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]')
+                    ?.focus({ preventScroll: true });
+                }}
                 className="ml-auto inline-flex min-h-[24px] shrink-0 items-center gap-1 rounded-md px-2 py-1 text-xs font-medium text-muted transition-colors hover:bg-raised hover:text-fg"
               >
                 <XIcon /> Clear

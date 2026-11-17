@@ -878,10 +878,12 @@ describe("Judge — the ?category= recommendation-label filter (PRD #235 M2)", (
     expect(marker.textContent).toContain("Filtered: Install a worker tool, Improve uzi");
     expect(marker.closest("[role=tablist]")).toBeNull();
 
-    fireEvent.click(within(marker).getByRole("button", { name: "Clear" }));
+    fireEvent.click(within(marker).getByRole("button", { name: "Clear label filter" }));
 
     await waitFor(() => expect(mockApi.getJudgeBacklog).toHaveBeenLastCalledWith("todo", undefined, []));
     expect(container.querySelector("[data-judge-filter-marker]")).toBeNull();
+    // The marker's Clear unmounted: focus moved to the active bucket tab, not <body>.
+    expect(document.activeElement).toBe(container.querySelector('[role="tab"][aria-selected="true"]'));
     expect(chip("Improve uzi").getAttribute("aria-pressed")).toBe("false");
   });
 

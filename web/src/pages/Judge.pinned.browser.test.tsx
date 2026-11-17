@@ -10,6 +10,7 @@ import { api, type JudgeBacklog, type JudgeRecommendationGroup } from "../lib/ap
 import { useAuth } from "../auth/AuthContext";
 import { setupAppShellMocks } from "../test-appshell-mocks";
 import { aUser, authValue } from "./overviewFixtures";
+import { JUDGE_CATEGORIES } from "../lib/judge";
 
 // #4419: on Judge, the label chips pin with the bucket tabs from lg up; below lg they scroll
 // away and a one-line "Filtered:" marker in the pinned block keeps the filter visible.
@@ -102,6 +103,7 @@ const blockEl = () => document.querySelector<HTMLElement>("[data-pinned-block-ro
 const barEl = () => document.querySelector<HTMLElement>("div.frame.sticky")!;
 const chipGroup = () => screen.getByRole("group", { name: "Filter by recommendation label" });
 const chipEl = () => screen.getByRole("button", { name: /^Improve uzi,/ });
+const scroller = () => chipGroup().querySelector<HTMLElement>("[data-fade-row]")!;
 const markerEl = () => document.querySelector<HTMLElement>("[data-judge-filter-marker]");
 
 async function scrollDeep(y = 1500) {
@@ -121,10 +123,49 @@ describe("Judge chips and tabs pin (#4419)", () => {
     expect(block.contains(chipGroup())).toBe(true);
     expect(block.contains(screen.getByRole("tablist", { name: "Backlog bucket" }))).toBe(true);
     expect(markerEl(), "no marker at lg").toBeNull();
-    const row = chipGroup();
+    const row = scroller();
     expect(row.scrollHeight).toBe(row.clientHeight);
+    const chips = Array.from(row.querySelectorAll("button"));
+    expect(chips.length).toBeGreaterThan(1);
+    // scrollHeight === clientHeight also holds for a wrapped, clipped row: assert one line.
+    expect(new Set(chips.map((c) => Math.round(c.getBoundingClientRect().top))).size, "chips share one top").toBe(1);
     expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(1440);
   });
+
+  for (const width of [1440, 1024]) {
+    it(`at ${width}px a far-right filter keeps its chip and Clear visible, and the fade follows overflow`, async () => {
+      const last = JUDGE_CATEGORIES[JUDGE_CATEGORIES.length - 1];
+      await mount(width, `/judge?category=${last}`);
+      await scrollDeep();
+      const row = scroller();
+      expect(row.scrollWidth, "the chip row overflows its scroller").toBeGreaterThan(row.clientWidth);
+      const pressed = screen.getByRole("button", { pressed: true });
+      const clear = within(chipGroup()).getByRole("button", { name: /Clear/ });
+      // Settle the keep-in-view scroll and the edge observers.
+      await waitFor(() => {
+        const r = row.getBoundingClientRect();
+        const p = pressed.getBoundingClientRect();
+        expect(p.left, "pressed chip inside the row").toBeGreaterThanOrEqual(r.left);
+        expect(p.right, "pressed chip inside the row").toBeLessThanOrEqual(r.right + 0.5);
+      });
+      const vw = document.documentElement.clientWidth;
+      for (const el of [pressed, clear]) {
+        const r = el.getBoundingClientRect();
+        expect(r.left).toBeGreaterThanOrEqual(0);
+        expect(r.right).toBeLessThanOrEqual(vw);
+      }
+      expect(clear.getBoundingClientRect().left, "Clear sits outside the scroller").toBeGreaterThanOrEqual(row.getBoundingClientRect().right - 0.5);
+      await waitFor(() => {
+        expect(row.hasAttribute("data-fade-start")).toBe(true);
+        expect(row.hasAttribute("data-fade-end")).toBe(false);
+      });
+      row.scrollLeft = 0;
+      await waitFor(() => {
+        expect(row.hasAttribute("data-fade-start")).toBe(false);
+        expect(row.hasAttribute("data-fade-end")).toBe(true);
+      });
+    });
+  }
 
   it("at 400px the chips scroll away; an active filter shows a Filtered marker in the pinned block, and Clear clears it", async () => {
     await mount(400, "/judge?category=improve_uzi");
@@ -145,8 +186,10 @@ describe("Judge chips and tabs pin (#4419)", () => {
     expect(mr.height).toBeLessThan(48);
     expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(400);
 
-    within(marker).getByRole("button", { name: "Clear" }).click();
+    expect(marker.querySelector("span.truncate")!.getAttribute("title")).toBe("Filtered: Improve uzi");
+    within(marker).getByRole("button", { name: "Clear label filter" }).click();
     await waitFor(() => expect(markerEl()).toBeNull());
+    expect(document.activeElement).toBe(screen.getByRole("tab", { selected: true }));
     expect(chipEl().getAttribute("aria-pressed")).toBe("false");
   });
 
