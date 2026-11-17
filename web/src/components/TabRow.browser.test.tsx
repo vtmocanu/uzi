@@ -388,18 +388,20 @@ describe("stuck detection and the app-bar offset (#4419)", () => {
       await page.viewport(400, 700);
       const user = vi.mocked(useAuth)();
       vi.mocked(useAuth).mockReturnValue({ ...user, user: null });
-      const tree = (
+      // A fresh element per render: the useAuth mock change does not notify React, and an
+      // identical root element lets React bail out of the rerender.
+      const tree = () => (
         <MemoryRouter initialEntries={["/settings"]}>
           <AppShell>
             <Routes>{scenarios[0].routes}</Routes>
           </AppShell>
         </MemoryRouter>
       );
-      const view = render(tree);
+      const view = render(tree());
       await scenarios[0].ready();
       expect(document.querySelector("div.frame.sticky")).toBeNull();
       vi.mocked(useAuth).mockReturnValue(user);
-      view.rerender(tree);
+      view.rerender(tree());
       await waitFor(() => expect(barEl()).toBeTruthy());
       const bar = barEl();
       expect(bar.getBoundingClientRect().height).toBeGreaterThan(60);
