@@ -171,7 +171,7 @@ all of these hold:
    '<url>'` with nothing after it, or an empty (or empty `remote:`) line.
 
 Any other line keeps today's classification, so another `remote rejected`
-reason, a `[rejected]` line and every `remote:` diagnostic (a stated reason,
+reason (other than `missing necessary objects`, added by #4438), a `[rejected]` line and every `remote:` diagnostic (a stated reason,
 marked or not: `GHnnn`, `remote: error:`, GitHub's backticked workflow-scope
 refusal, or free text such as a repository-policy notice) stay permanent.
 This is narrower than enumerating refusal markers: a reason the classifier has
@@ -179,8 +179,8 @@ never seen cannot turn a deterministic refusal transient.
 
 `/remote rejected/i` **stays** in `PERMANENT_PATTERNS`; the exception is a
 narrow, format-based pre-check, with no forge identity in the classifier.
-Everything else is unchanged and permanent: any other reason (including
-`failed to update ref` and `failed to lock`), authentication failures,
+Everything else is unchanged and permanent: any other reason (other than
+`missing necessary objects`, #4438; including `failed to update ref` and `failed to lock`), authentication failures,
 protected-branch and pre-receive-hook refusals, workflow scope, `GH013`, and
 non-fast-forward or `[rejected]`.
 
@@ -244,7 +244,9 @@ framing-only rule (every line a whole git framing line) is unchanged, and
 **Why retrying is safe.** Each attempt pushes the same candidate, non-forced,
 and the publication proofs rerun on every attempt. Stock Git's receive path
 refuses the affected ref when its connectivity check fails, so a failed
-attempt changes nothing on origin. Local shallow or missing-object failures
+attempt changes nothing on origin there; GitHub's receive implementation is
+not stock Git, so the safety rests on the non-forced push and the per-attempt
+proofs, not on that behaviour. Local shallow or missing-object failures
 are detected by the per-attempt preflight (`scratchPublicationPreflight` in
 `agent/src/git.ts`, which raises `ScratchPublicationError` kinds
 `shallow_history` and `missing_objects`) and refuse permanently; the
@@ -255,16 +257,18 @@ permanent.
 
 **Lookalikes stay permanent.** `(missing necessary objects) x`,
 `(missing necessary object)`, `(missing necessary objects: ...)`,
-`(n/a (unpacker error))`, `(bad pack)`, `(shallow update not allowed)`, mixed
-reasons, either reason accompanied by a `remote:` diagnostic, and
+`(n/a (unpacker error))`, `(bad pack)`, `(shallow update not allowed)`, a
+retryable reason beside any other reason on another ref (two retryable
+reasons on different refs are transient; finalize pushes one ref), either reason accompanied by a `remote:` diagnostic, and
 `[rejected]` or non-fast-forward lines.
 
 **Accepted risk.** A deterministic server-side fault that prints only this
 line exhausts its retries and is labelled `publication_forge_unreachable`
 ("unreachable"); an enrolled run re-parks until the hold threshold. This
-mirrors the #3929 accepted risk (related: #3585). Once exhausted publication
-failures are counted (#1324), such a fault could put the worker on cooldown
-for the whole origin. Retry backoff does not bound overall recovery time;
+mirrors the #3929 accepted risk (related: #3585). Today only clone/fetch
+retry groups update the worker-origin cooldown; if exhausted publication
+failures are ever counted toward it (see #1324), such a fault could put the
+worker on cooldown for the whole origin. Retry backoff does not bound overall recovery time;
 parking and its duration policy are unchanged.
 
 **Scope.** Worker-only, as for #3929: older workers keep the old behaviour,
