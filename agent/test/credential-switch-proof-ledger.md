@@ -415,7 +415,7 @@ control is still absent, not that the functional criterion was deferred.
 | Proven A root/tool reap before B material, login and model work; fresh CODEX_HOME | R5 credits unproven registered root pre-apply only; tool-only, other modes/phases and HOME clauses unvalidated |
 | Whole operation-scope/refresh/identity/capability/summary replacement and retired-A rejection | A2 credits one reader; A3 retained-A/Sub→Sub B-scope namespace isolation; R7 B dispatcher publication readiness; R8 retired API-key A reconcile release-request fence during B login; remaining mixed clauses unvalidated |
 | Exact saved-ID resume; confirmed-refusal-only fresh fallback and lineage; preservation re-hold | R6 credits uncertain-error classification only; confirmed-refusal/preserve companions positive, independent preservation and other clauses unvalidated |
-| Policy episode rejection at request and under apply lock | D74/D75 credit isolated owner pending-fresh and unresolved-outcome cases; paused hold, apply-time changes and other policy clauses unvalidated |
+| Policy episode rejection at request and under apply lock | D74–D77 credit the two isolated owner cases and the same two conditions introduced after READY before apply; paused holds, concurrent interleavings and other policy clauses unvalidated |
 | Refresh lease/intent exclusion, account lock ordering and boundary reconciliation before revoke | Unvalidated |
 | Post-switch release epoch and secret-hash authorization | B5/B6 preservation sensitivity controls below, through real worker apply and release routes; final reauthorization timing unvalidated |
 | Transactional frozen binding rewrite, capability revoke/remint and post-commit material response | Unvalidated; B5/B6 do not establish transaction atomicity or mint/revoke implementation |
@@ -1616,3 +1616,80 @@ HEAD; immutable source review 949ec8ebc..e37fb6ca5 found no findings.
 This credits only the two named owner policy cases. Apply-time policy races,
 paused holds, other policy tuples, full suites, security gates and broader
 m3/m4 requirements remain separate and incomplete.
+
+
+### D76/D77 — policy introduced after READY, before worker apply
+
+Candidate 183c2755d7d2ec79a0f91f0067a81f44ae90e2f3. Two independent class (d)
+guard controls on the new Codex-specific apply seam. The predicate body existed
+before; this is not class (a) restoration or wholesale class (b) credit for a
+reused helper. Baseline evidence commands:
+
+```sh
+git show a233883de3c36bae2e940f999cd9d582889dad00:agent/src/runner.ts
+git show a233883de3c36bae2e940f999cd9d582889dad00:api/internal/workersvc/credential_switch_apply.go
+```
+
+At baseline runner.ts:25735–25738 the Codex capture branch retains source,
+logs "Codex credential switch refused; source and session retained", and returns
+"retained_stop". The owner validator also rejects Codex (exact quote/command
+in D74/D75). Baseline apply's fresh step :327 calls chooseApplySecret and :337
+calls LockAnthropicSecretForApply. This is absence evidence for the scoped
+Codex resolver/target seam now dispatched at credential_switch_apply.go:342;
+it is NOT evidence that an arbitrary baseline raw worker apply explicitly
+rejected the harness. The pending Codex target tuple is new in migration 466.
+
+The real worker route calls ApplyCredentialSwitch, enters a READ COMMITTED
+transaction, locks worker then owned run, and dispatches applyCodexSwitchLocked.
+That function calls validateCodexSwitchLocked at :31, whose policy call at
+credential_switch_codex.go:136 precedes target/baseline resolution and all
+binding/capability/journal writes. It delegates through :404 to policy_hold.go:
+189–195. Source census covered this apply path, its transaction helpers and
+writer SQL/triggers: ApplyRunCodexBinding (queries/codex_binding.sql:337,
+generated constant :107) has no duplicate fresh/outcome policy predicate.
+The owner caller at run_credential.go:632 and stopped-settlement SQL do not
+execute here. This trace does not prove lock-order concurrency independently.
+
+TestWorkerCodexApplyPolicyAfterPreflightRouteLiveDB gets actual READY at epoch
+41, retains pending X targeting B, then installs an isolated complete policy
+tuple. The fresh case has fresh=true/resolved timestamp; the outcome case has
+fresh=false/unresolved outcome. Both are running/unheld and assert current
+worker, generation, nonce, A/hash/41, baseline and pending target identity.
+Setup seeds pending X through the store; it does not exercise a new owner POST.
+
+Actual worker apply must return HTTP 200, outcome not_applied, reason
+policy_refusal, and exactly those two wire keys. All six snapshot sections
+must remain identical, including pending X, timestamps, health, capability,
+journals, messages, inputs and custody. Resolution is direct fixture SQL: only
+fresh=false/resolved timestamp change, retaining the preserving tuple. The
+same X then applies B at epoch 42, ordinal 1, with a rotated hash and matching
+journal/worker/generation identity. These preservation and positive companion
+assertions are not separate sensitivity or transaction-atomicity proofs.
+
+D76 removes only the pending-fresh disjunct at policy_hold.go:190; D77
+independently folds only the unresolved-outcome disjunct at :191 to false.
+Each keeps the hold condition, opposite arm, target and authority fences,
+SQL and all other effects intact. Each compiling mutant fails at test :100:
+policy-fenced apply outcome="applied", want not_applied. This decision assertion
+precedes wire-size and snapshot checks, so neither extra auth fields nor a
+helper-only failure supplies the red.
+
+Receipt .uzi/scratch/apply-policy-results.json, script apply-policy-controls.py
+and independent apply-policy-lead-audit.json record exact source/mutant/log
+hashes, raw actions, timings, environment and cleanup. One serial invocation
+uses GOFLAGS=-p=1 GOMAXPROCS=4 and, from api, go test -buildvcs=false -race
+-count=1 -json -timeout=4m ./internal/handler -run <selection>. Primary checks
+select the whole exact test; each mutant selects its named leaf. Logs under
+.uzi/scratch/ (gate-log. prefix): HMqCw7 before exit 0; L840PQ D76 exit 1;
+jaLtWN D77 exit 1; ePZY7K after exit 0. Both greens pass both leaves without
+skips. No SQL, setup, timeout, build failure or race report receives red credit.
+The lead reconstructed both mutant hashes and verified raw log hashes/actions,
+source hashes and unchanged prior receipts. Cheap pre-commit checks: gofmt and
+git diff --check HEAD. Source review 20870a4f7..183c2755d found no findings.
+Owned fixture cleanup TrYIGl exits 0; each export is removed and primary
+fingerprints match. No installs or base builds occurred.
+
+Credit covers only these two sequential post-preflight conditions on the API-key
+fixture. It does not establish an owner-to-worker end-to-end race, arbitrary
+policy tuples, paused hold admission, atomic rollback, or other m3/m4 clauses.
+Full suites and m4 security gates remain unperformed here.

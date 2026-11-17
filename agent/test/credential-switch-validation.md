@@ -852,3 +852,27 @@ cleanup exits 0, primary fingerprints and prior receipts unchanged.
 Source review found no findings. Snapshot preservation is positive evidence;
 apply-time policy, paused hold admission, security and other m3/m4 checks are
 not discharged by these two controls.
+
+
+## Apply policy after successful preflight
+
+D76/D77 at 183c2755d7d2ec79a0f91f0067a81f44ae90e2f3 independently neutralize
+pending-fresh and unresolved-outcome on the new Codex apply seam. Policy is
+installed after actual READY while X remains pending. Each mutant reaches
+actual worker apply and fails at test :100 on applied instead of not_applied;
+HTTP 200 is intentional. The unchanged refusal contains only outcome/reason
+and leaves all six snapshots equal. After fixture resolution, the same X
+successfully binds B at epoch 42 and journals ordinal 1.
+
+Baseline evidence combines the explicit Runner/owner Codex refusals with the
+old apply's Anthropic chooser/lock at :327/:337. No explicit raw worker harness
+rejection is claimed. This is class (d) new-seam guard evidence, not restoration
+of a historical allowed Codex apply.
+
+Scratch apply-policy-results.json and apply-policy-lead-audit.json record exact
+diffs, reconstructed hashes, raw actions and cleanup. Logs HMqCw7/L840PQ/jaLtWN/
+ePZY7K (gate-log. prefix) exit 0/1/1/0; both greens pass both leaves without
+skips. Runs are serial, handler-only, -race -count=1 -json -timeout=4m, p=1/GMP4.
+Exports removed; owned fixture cleanup exits 0; primary and prior receipts
+unchanged. Source review found no findings. No owner-to-worker concurrency,
+atomicity, full-suite, security or broader m3/m4 completion claim is made.
