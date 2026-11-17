@@ -107,6 +107,7 @@ type Store interface {
 	// fleet.hibernation (issue #4207): idle workers the automatic pass could not hibernate, and
 	// workers whose only runs are parked; each row carries the exact window total.
 	ListAutoHibernationBlockers(context.Context, store.ListAutoHibernationBlockersParams) ([]store.ListAutoHibernationBlockersRow, error)
+	ListAutoHibernationBlockersSurplusMode(context.Context, store.ListAutoHibernationBlockersSurplusModeParams) ([]store.ListAutoHibernationBlockersSurplusModeRow, error)
 }
 
 // Settings is the slice of the settings cache healthsvc reads: the run-health kill switch

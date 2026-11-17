@@ -545,7 +545,7 @@ func TestHibernationSurplusOwnerLockConcurrencyLiveDB(t *testing.T) {
 	run := func(s *Service, id uuid.UUID, now time.Time) chan outcome {
 		ch := make(chan outcome, 1)
 		go func() {
-			res, err := s.poolAttempt(p.env.ctx, poolWork{id: id, owner: p.user, anchor: now.Add(-6 * time.Hour), pooled: true}, params(now))
+			res, err := s.poolAttempt(p.env.ctx, poolWork{id: id, owner: p.user, anchor: now.Add(-6 * time.Hour), pooled: true, surplus: true}, params(now))
 			ch <- outcome{res, err}
 		}()
 		return ch

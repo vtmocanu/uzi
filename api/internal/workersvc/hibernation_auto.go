@@ -65,8 +65,7 @@ func refineIntakeFenced(w store.Worker) string {
 	switch {
 	case w.ManualCordonedAt.Valid:
 		return BlockedManualCordon
-	case w.MaintenanceFenced, w.MaintenancePhase == "requested", w.MaintenancePhase == "ready",
-		w.MaintenancePhase == "stopping", w.MaintenancePhase == "recycling":
+	case underMaintenance(w.MaintenanceFenced, w.MaintenancePhase):
 		return BlockedMaintenance
 	case w.DrainingSince.Valid && w.DrainingReason.Valid && w.DrainingReason.String == "image_roll":
 		return BlockedRoll
@@ -96,7 +95,8 @@ func autoHibernationReason(idleAfter time.Duration) string {
 // HibernationAutoPass is the sweeper pass that hibernates idle workers. It does nothing unless
 // both worker_hibernation_enabled and worker_hibernation_auto are on, and runs at most once per
 // HibernationAutoPassEvery. Each worker is its own transaction; one failure never blocks its
-// siblings and the errors are joined. The result counts workers admitted.
+// siblings and the errors are joined. The result counts workers admitted (with surplus mode on,
+// state changes: admissions and warm wakes).
 func (s *Service) HibernationAutoPass(ctx context.Context) (int64, error) {
 	if s.txBeginner == nil || s.hibernationAuto == nil {
 		return 0, nil

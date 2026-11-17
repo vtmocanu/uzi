@@ -171,31 +171,30 @@ func TestPickKeeperOrdering(t *testing.T) {
 	a.Anchor = pgconv.Time(poolNow.Add(-5 * time.Hour))
 	b.Anchor = pgconv.Time(poolNow.Add(-3 * time.Hour)) // most recent surplus anchor
 	c.Anchor = pgconv.Time(poolNow.Add(-4 * time.Hour))
-	got, ok := pickKeeper([]poolRow{a, b, c}, uuid.Nil, poolNow, poolStale)
+	got, ok := pickKeeper([]poolRow{a, b, c}, poolNow, poolStale)
 	if !ok || got != b.ID {
 		t.Fatalf("keeper = %v %t, want the most recently used %v", got, ok, b.ID)
 	}
-	// The candidate is never the keeper.
-	if got, _ := pickKeeper([]poolRow{a, b, c}, b.ID, poolNow, poolStale); got != c.ID {
-		t.Fatalf("keeper excluding b = %v, want %v", got, c.ID)
+	if got, _ := pickKeeper([]poolRow{a, c}, poolNow, poolStale); got != c.ID {
+		t.Fatalf("keeper without b = %v, want %v", got, c.ID)
 	}
 	// Equal anchors: oldest created_at, then lowest id.
 	a.Anchor, b.Anchor = c.Anchor, c.Anchor
 	a.CreatedAt = pgconv.Time(poolNow.Add(-300 * time.Hour))
-	if got, _ := pickKeeper([]poolRow{c, b, a}, uuid.Nil, poolNow, poolStale); got != a.ID {
+	if got, _ := pickKeeper([]poolRow{c, b, a}, poolNow, poolStale); got != a.ID {
 		t.Fatalf("keeper on anchor tie = %v, want the oldest %v", got, a.ID)
 	}
 	a.CreatedAt = c.CreatedAt
-	if got, _ := pickKeeper([]poolRow{c, b, a}, uuid.Nil, poolNow, poolStale); got != a.ID {
+	if got, _ := pickKeeper([]poolRow{c, b, a}, poolNow, poolStale); got != a.ID {
 		t.Fatalf("keeper on full tie = %v, want the lowest id %v", got, a.ID)
 	}
 	// A not-ready member is skipped even with the best anchor.
 	b.Anchor = pgconv.Time(poolNow.Add(-time.Hour))
 	b.Status = "offline"
-	if got, _ := pickKeeper([]poolRow{a, b}, uuid.Nil, poolNow, poolStale); got != a.ID {
+	if got, _ := pickKeeper([]poolRow{a, b}, poolNow, poolStale); got != a.ID {
 		t.Fatalf("keeper = %v, want the ready one %v", got, a.ID)
 	}
-	if _, ok := pickKeeper([]poolRow{b}, uuid.Nil, poolNow, poolStale); ok {
+	if _, ok := pickKeeper([]poolRow{b}, poolNow, poolStale); ok {
 		t.Fatal("no ready member must give no keeper")
 	}
 }

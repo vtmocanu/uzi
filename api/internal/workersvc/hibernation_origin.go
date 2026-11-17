@@ -54,31 +54,40 @@ func joinWakeOrigin(cur, req string) string {
 	return cur
 }
 
-// carryManualGrace raises last_manual_wake_settled_at to last_wake_settled_at when the current
-// op's settle counts as manual-grade, so a later op's origin never reclassifies an earlier
-// settlement (D15). It must run before any write that replaces the op's markers or sets the wake
-// origin to warm or system.
-//
-// The settle is manual-grade unless the markers are valid and the wake origin is warm or system.
-// A valid op with an admit origin and no wake origin has not woken: last_wake_settled_at was
-// already classified when it was admitted, so it carries nothing (reading it by the legacy rule
-// would reclassify an earlier warm or system settle as manual-grade).
+// settleCountsAsManual reports whether w's last_wake_settled_at counts as a manual-grade settle
+// (D15, D18): unless the markers are valid and the wake origin is warm or system. A valid op with
+// an admit origin and no wake origin has not woken: last_wake_settled_at was already classified
+// when it was admitted, so it counts for nothing (reading it by the legacy rule would reclassify
+// an earlier warm or system settle as manual-grade). The SQL conservative wake term of the long
+// queries (queries/hibernation_pool.sql) is this same predicate.
+func settleCountsAsManual(w *store.Worker) bool {
+	if !originMarkersValid(w) {
+		return true
+	}
+	switch w.HibernationWakeOrigin.String {
+	case WakeOriginWarm, WakeOriginSystem:
+		return false
+	}
+	return w.HibernationWakeOrigin.Valid || !w.HibernationAdmitOrigin.Valid
+}
+
+// conservativeWakeTerm is the wake term of the long anchor: GREATEST(last_manual_wake_settled_at,
+// last_wake_settled_at when that settle counts as manual-grade). Only a positively known warm or
+// system wake is excluded; a legacy or unmarked settle counts in full.
+func conservativeWakeTerm(w *store.Worker) pgtype.Timestamptz {
+	term := w.LastManualWakeSettledAt
+	if w.LastWakeSettledAt.Valid && settleCountsAsManual(w) &&
+		(!term.Valid || term.Time.Before(w.LastWakeSettledAt.Time)) {
+		term = w.LastWakeSettledAt
+	}
+	return term
+}
+
+// carryManualGrace raises last_manual_wake_settled_at to the conservative wake term, so a later
+// op's origin never reclassifies an earlier settlement (D15). It must run before any write that
+// replaces the op's markers or sets the wake origin to warm or system.
 func carryManualGrace(w *store.Worker) {
-	if !w.LastWakeSettledAt.Valid {
-		return
-	}
-	if originMarkersValid(w) {
-		switch w.HibernationWakeOrigin.String {
-		case WakeOriginWarm, WakeOriginSystem:
-			return
-		}
-		if !w.HibernationWakeOrigin.Valid && w.HibernationAdmitOrigin.Valid {
-			return
-		}
-	}
-	if !w.LastManualWakeSettledAt.Valid || w.LastManualWakeSettledAt.Time.Before(w.LastWakeSettledAt.Time) {
-		w.LastManualWakeSettledAt = w.LastWakeSettledAt
-	}
+	w.LastManualWakeSettledAt = conservativeWakeTerm(w)
 }
 
 // stampAdmitOrigin binds a fresh admission op to its admit origin; the wake origin starts unset.

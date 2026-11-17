@@ -36,8 +36,9 @@ func TestAutoAdmitReadsIdlenessOnce(t *testing.T) {
 // the pure decision reads exactly those two row fields. The admission itself still goes through
 // hibernateRefusal, which counts the candidate's non-terminal runs again under its row lock as the
 // same refusal gate every hibernation uses; that count is a recheck, not a decision input. The
-// long-rule fallback goes through autoAdmit, which reads idleness once
-// (TestAutoAdmitReadsIdlenessOnce).
+// pooled long rule reads idleness once through admitPooledLong
+// (TestPooledLongAdmissionReadsIdlenessOnce) and an unpooled candidate goes through autoAdmit,
+// which reads idleness once (TestAutoAdmitReadsIdlenessOnce).
 func TestSurplusDecisionReadsIdlenessOnce(t *testing.T) {
 	body := funcBody(t, "hibernation_pool.go", "func (s *Service) poolAttempt(")
 	if n := strings.Count(body, ".GetOwnerHibernationPoolInput("); n != 1 {
@@ -52,6 +53,37 @@ func TestSurplusDecisionReadsIdlenessOnce(t *testing.T) {
 	for _, want := range []string{"c.Nonterminal", "c.Anchor"} {
 		if !strings.Contains(decide, want) {
 			t.Fatalf("decideSurplus must decide on %s from the pool input row", want)
+		}
+	}
+}
+
+// TestPooledLongAdmissionReadsIdlenessOnce pins the surplus-mode half of the single-snapshot
+// contract for the long rule (issue #4395): a pooled worker's long recheck takes its non-terminal
+// count, pooledness, long anchor and owner-active flag from ONE GetWorkerLongIdleness row, and
+// decides on exactly those; it never mixes in GetWorkerIdleness (today's per-worker anchor) or a
+// separate count. The warm decision likewise reads the owner's pool exactly once.
+func TestPooledLongAdmissionReadsIdlenessOnce(t *testing.T) {
+	body := funcBody(t, "hibernation_pool.go", "func (s *Service) admitPooledLong(")
+	if n := strings.Count(body, ".GetWorkerLongIdleness("); n != 1 {
+		t.Fatalf("admitPooledLong must call GetWorkerLongIdleness exactly once, found %d", n)
+	}
+	for _, banned := range []string{".GetWorkerIdleness(", ".CountWorkerNonTerminalRuns(", ".ListWorkerNonTerminalRuns("} {
+		if strings.Contains(body, banned) {
+			t.Fatalf("admitPooledLong must not read idleness through a separate query (%s)", banned)
+		}
+	}
+	for _, want := range []string{"idle.Pooled", "idle.Nonterminal", "idle.OwnerActiveNow", "idle.Anchor"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("admitPooledLong must decide on %s from the single GetWorkerLongIdleness row", want)
+		}
+	}
+	warm := funcBody(t, "hibernation_warm.go", "func (s *Service) warmAttempt(")
+	if n := strings.Count(warm, ".GetOwnerHibernationPoolInput("); n != 1 {
+		t.Fatalf("warmAttempt must read the owner pool exactly once, found %d", n)
+	}
+	for _, banned := range []string{".GetWorkerIdleness(", ".GetWorkerLongIdleness(", ".InsertHibernationWake(", ".WakeWorker(", ".HibernateWorker(", ".DemandWake("} {
+		if strings.Contains(warm, banned) {
+			t.Fatalf("warmAttempt must not call %s", banned)
 		}
 	}
 }

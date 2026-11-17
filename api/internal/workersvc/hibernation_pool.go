@@ -29,9 +29,9 @@ import (
 // runs each decision in hibernationOwnerTx: the owner advisory lock first, then the candidate
 // row lock, then ONE fresh read of the owner's pool, the decision, and the write.
 //
-// M2 extension points (not implemented here): the decision's action set (decisionNone,
-// decisionAutoSurplus) gains auto_long and a warm wake; poolWork.long is where the owner-clock
-// long rule replaces today's per-worker long rule for pooled workers.
+// M2 (same issue) adds the owner-clock long rule for pooled workers (GetWorkerLongIdleness under
+// the owner lock, admit origin auto_long) and the warm wake (decideWarm, in hibernation_warm.go):
+// both run in the same owner-locked transaction shape and share the surplus pass's budget.
 
 const (
 	// HibernationPoolCandidateRows bounds the candidate lists of a surplus pass (fleet size).
@@ -45,6 +45,7 @@ const (
 const (
 	decisionNone        = "none"
 	decisionAutoSurplus = "auto_surplus"
+	decisionWarmWake    = "warm_wake"
 )
 
 // Reasons a decision is none, for logs and tests.
@@ -161,11 +162,11 @@ func anchorOf(r poolRow) time.Time {
 }
 
 // pickKeeper chooses the keeper among the ready idle members of rows: the most recent surplus
-// anchor first, then the oldest created_at, then the lowest id. exclude is never the keeper.
-func pickKeeper(rows []poolRow, exclude uuid.UUID, now time.Time, stale time.Duration) (uuid.UUID, bool) {
+// anchor first, then the oldest created_at, then the lowest id.
+func pickKeeper(rows []poolRow, now time.Time, stale time.Duration) (uuid.UUID, bool) {
 	var ready []poolRow
 	for _, r := range rows {
-		if r.ID != exclude && memberReady(r, now, stale) {
+		if memberReady(r, now, stale) {
 			ready = append(ready, r)
 		}
 	}
@@ -188,6 +189,7 @@ func pickKeeper(rows []poolRow, exclude uuid.UUID, now time.Time, stale time.Dur
 type poolDecision struct {
 	Action string
 	Keeper uuid.UUID // the member that stays awake (auto_surplus only)
+	Target uuid.UUID // the sleeper to wake (warm_wake only)
 	Why    string    // why the action is none
 }
 
@@ -220,7 +222,7 @@ func decideSurplus(rows []poolRow, candidate uuid.UUID, now time.Time, stale tim
 	}
 	// Rank every ready idle member, the candidate included: the candidate is never the keeper,
 	// so when it ranks first no other member is the deterministic keeper and nothing is decided.
-	keeper, ok := pickKeeper(members, uuid.Nil, now, stale)
+	keeper, ok := pickKeeper(members, now, stale)
 	if !ok || keeper == candidate {
 		return poolDecision{Action: decisionNone, Why: noneNoKeeper}
 	}
@@ -241,8 +243,10 @@ func surplusHibernationReason(threshold time.Duration) string {
 type poolWork struct {
 	id, owner uuid.UUID
 	anchor    time.Time
-	pooled    bool // listed by ListHibernationPoolCandidates
-	long      bool // idle past the long threshold: today's per-worker long rule applies
+	pooled    bool // pooled by the SQL form of poolKey (or listed as a surplus candidate)
+	surplus   bool // listed by ListHibernationPoolCandidates: idle past the surplus threshold
+	long      bool // long-idle: by the long anchor when pooled, by today's anchor when not
+	warm      bool // a sleeper that may be warm woken (ListHibernationWarmTargets)
 }
 
 // surplusPassParams are the instants and thresholds one surplus pass uses.
@@ -253,11 +257,12 @@ type surplusPassParams struct {
 }
 
 // hibernationSurplusPass is HibernationAutoPass while surplus mode is on. Candidates are the
-// pool candidates (surplus rule, and today's long rule for pooled workers in M1) plus the
-// long-rule candidates that are in no pool. They are grouped by owner; owners are served
-// oldest-pending-first; each owner gets at most one state change per pass and the whole pass at
-// most HibernationAutoAdmissionsPerPass, shared by every kind of admission. A refused or
-// skipped candidate is not a state change, so the owner's next candidate is tried.
+// surplus candidates, the long-rule candidates (pooled workers judged by the owner-clock long
+// anchor, unpooled ones by today's per-worker anchor) and the warm-wake targets (one sleeper per
+// pool). They are grouped by owner; owners are served oldest-pending-first; each owner gets at
+// most one state change per pass (an admission or a warm wake) and the whole pass at most
+// HibernationAutoAdmissionsPerPass, shared by every kind of change. A refused or skipped candidate
+// is not a state change, so the owner's next candidate is tried. The result counts state changes.
 func (s *Service) hibernationSurplusPass(ctx context.Context, p surplusPassParams) (int64, error) {
 	work, err := s.listSurplusWork(ctx, p)
 	if err != nil {
@@ -266,7 +271,7 @@ func (s *Service) hibernationSurplusPass(ctx context.Context, p surplusPassParam
 	if s.autoPassAfterList != nil {
 		s.autoPassAfterList()
 	}
-	var admitted int64
+	var changes int64
 	var errs []error
 	budget := HibernationAutoAdmissionsPerPass
 owners:
@@ -289,48 +294,71 @@ owners:
 				break owners
 			}
 			if res.admitted {
-				admitted++
+				changes++
 				budget--
-				slog.Info("worker hibernation: automatic admission", "worker_id", w.id,
-					"owner_id", w.owner, "idle_since", w.anchor, "pooled", w.pooled, "surplus", res.surplus)
+				slog.Info("worker hibernation: automatic change", "worker_id", w.id, "owner_id", w.owner,
+					"idle_since", w.anchor, "pooled", w.pooled, "surplus", res.surplus, "warm_wake", res.warm)
 				continue owners // one state change per owner per pass
 			}
 		}
 	}
 	if len(errs) > 0 {
 		slog.Warn("worker hibernation auto pass", "errors", len(errs), "first", errs[0])
-		return admitted, errors.Join(errs...)
+		return changes, errors.Join(errs...)
 	}
-	return admitted, nil
+	return changes, nil
 }
 
-// groupByOwner groups work by owner, each group oldest anchor first (then id), and orders the
-// groups by their oldest anchor (then owner id), so the owner waiting longest is served first.
+// groupByOwner groups work by owner and orders each group warm wakes first (restoring the reserve
+// outranks saving a pod), then oldest anchor first, then id; the groups are ordered by their
+// oldest anchor (then owner id), so the owner waiting longest is served first.
 func groupByOwner(work []poolWork) [][]poolWork {
 	byOwner := map[uuid.UUID][]poolWork{}
 	for _, w := range work {
 		byOwner[w.owner] = append(byOwner[w.owner], w)
 	}
-	groups := make([][]poolWork, 0, len(byOwner))
-	for _, g := range byOwner {
+	type group struct {
+		work   []poolWork
+		oldest time.Time
+		owner  uuid.UUID
+	}
+	groups := make([]group, 0, len(byOwner))
+	for owner, g := range byOwner {
 		slices.SortFunc(g, func(a, b poolWork) int {
+			if a.warm != b.warm {
+				if a.warm {
+					return -1
+				}
+				return 1
+			}
 			if c := a.anchor.Compare(b.anchor); c != 0 {
 				return c
 			}
 			return cmp.Compare(a.id.String(), b.id.String())
 		})
-		groups = append(groups, g)
+		oldest := g[0].anchor
+		for _, w := range g {
+			if w.anchor.Before(oldest) {
+				oldest = w.anchor
+			}
+		}
+		groups = append(groups, group{work: g, oldest: oldest, owner: owner})
 	}
 	sort.Slice(groups, func(i, j int) bool {
-		if c := groups[i][0].anchor.Compare(groups[j][0].anchor); c != 0 {
+		if c := groups[i].oldest.Compare(groups[j].oldest); c != 0 {
 			return c < 0
 		}
-		return groups[i][0].owner.String() < groups[j][0].owner.String()
+		return groups[i].owner.String() < groups[j].owner.String()
 	})
-	return groups
+	out := make([][]poolWork, len(groups))
+	for i, g := range groups {
+		out[i] = g.work
+	}
+	return out
 }
 
-// listSurplusWork reads both candidate lists in one transaction and merges them.
+// listSurplusWork reads the three candidate lists in one transaction and merges them. The long
+// list carries the owner, so no separate owner lookup is needed.
 func (s *Service) listSurplusWork(ctx context.Context, p surplusPassParams) ([]poolWork, error) {
 	tx, err := s.beginReadCommitted(ctx)
 	if err != nil {
@@ -338,67 +366,74 @@ func (s *Service) listSurplusWork(ctx context.Context, p surplusPassParams) ([]p
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	q := store.New(tx)
-	pooled, err := q.ListHibernationPoolCandidates(ctx, store.ListHibernationPoolCandidatesParams{
+	surplus, err := q.ListHibernationPoolCandidates(ctx, store.ListHibernationPoolCandidatesParams{
 		SurplusCutoff: pgconv.Time(p.surplusCutoff), RecentCutoff: pgconv.Time(p.recentCutoff),
 		MaxRows: HibernationPoolCandidateRows,
 	})
 	if err != nil {
 		return nil, err
 	}
-	long, err := q.ListAutoHibernationCandidates(ctx, store.ListAutoHibernationCandidatesParams{
+	long, err := q.ListAutoHibernationCandidatesSurplusMode(ctx, store.ListAutoHibernationCandidatesSurplusModeParams{
 		Cutoff: pgconv.Time(p.longCutoff), RecentCutoff: pgconv.Time(p.recentCutoff), MaxRows: HibernationPoolCandidateRows,
 	})
 	if err != nil {
 		return nil, err
 	}
-	byID := make(map[uuid.UUID]*poolWork, len(pooled)+len(long))
+	warm, err := q.ListHibernationWarmTargets(ctx, store.ListHibernationWarmTargetsParams{
+		OwnerActiveCutoff: pgconv.Time(p.longCutoff), MaxRows: HibernationPoolCandidateRows,
+	})
+	if err != nil {
+		return nil, err
+	}
+	byID := make(map[uuid.UUID]*poolWork, len(surplus)+len(long))
 	var out []*poolWork
-	for _, c := range pooled {
-		w := &poolWork{id: c.ID, owner: c.UserID, anchor: c.Anchor.Time, pooled: true,
-			long: !c.Anchor.Time.After(p.longCutoff)}
+	for _, c := range long {
+		w := &poolWork{id: c.ID, owner: c.UserID, anchor: c.Anchor.Time, pooled: c.Pooled, long: true}
 		byID[c.ID] = w
 		out = append(out, w)
 	}
-	var unknownOwner []uuid.UUID
-	for _, c := range long {
-		if _, ok := byID[c.ID]; ok {
+	for _, c := range surplus {
+		if w, ok := byID[c.ID]; ok {
+			// Also long-listed. When the exact SQL pooledness says it is unpooled it can never be
+			// surplus; otherwise it is both, judged by the older of its two anchors.
+			if w.pooled {
+				w.surplus = true
+				if c.Anchor.Time.Before(w.anchor) {
+					w.anchor = c.Anchor.Time
+				}
+			}
 			continue
 		}
-		w := &poolWork{id: c.ID, anchor: c.Anchor.Time, long: true}
+		w := &poolWork{id: c.ID, owner: c.UserID, anchor: c.Anchor.Time, pooled: true, surplus: true}
 		byID[c.ID] = w
 		out = append(out, w)
-		unknownOwner = append(unknownOwner, c.ID)
 	}
-	if len(unknownOwner) > 0 {
-		owners, err := q.ListWorkerOwners(ctx, unknownOwner)
-		if err != nil {
-			return nil, err
-		}
-		for _, o := range owners {
-			byID[o.ID].owner = o.UserID
-		}
+	for _, c := range warm {
+		out = append(out, &poolWork{id: c.ID, owner: c.UserID, anchor: c.Anchor.Time, pooled: true, warm: true})
 	}
-	res := make([]poolWork, 0, len(out))
-	for _, w := range out {
-		if w.owner != uuid.Nil { // a long candidate deleted since the list has no owner row
-			res = append(res, *w)
-		}
+	res := make([]poolWork, len(out))
+	for i, w := range out {
+		res[i] = *w
 	}
 	return res, nil
 }
 
 // workResult is what one candidate attempt did.
 type workResult struct {
-	admitted bool
+	admitted bool // a state change was written: an admission or a warm wake
 	surplus  bool // the admission was a surplus admission
+	warm     bool // the change was a warm wake
 	stop     bool // the pass should stop: a setting was switched off
 	busy     bool // the owner lock (or the candidate row lock) timed out
 }
 
-// surplusWork runs one candidate: a pooled one under the owner lock, an unpooled long-rule
-// candidate exactly as today's pass does.
+// surplusWork runs one candidate: a warm-wake target and a pooled candidate under the owner lock,
+// an unpooled long-rule candidate exactly as today's pass does.
 func (s *Service) surplusWork(ctx context.Context, w poolWork, p surplusPassParams) (workResult, error) {
-	if !w.pooled {
+	switch {
+	case w.warm:
+		return s.warmAttempt(ctx, w, p)
+	case !w.pooled:
 		var res workResult
 		err := s.hibernationTx(ctx, w.id, func(q *store.Queries, row store.Worker) error {
 			var e error
@@ -410,8 +445,10 @@ func (s *Service) surplusWork(ctx context.Context, w poolWork, p surplusPassPara
 	return s.poolAttempt(ctx, w, p)
 }
 
-// poolAttempt is one pooled candidate's decision: owner lock, candidate row lock, one fresh pool
-// read, the decision, and the write, in one transaction (hibernationOwnerTx).
+// poolAttempt is one pooled candidate's decision: owner lock, candidate row lock, then either the
+// long rule (one GetWorkerLongIdleness read) or one fresh pool read and the surplus decision, and
+// the write, in one transaction (hibernationOwnerTx). A pooled worker that is long-idle is
+// admitted as auto_long even if it is also surplus: it needs no keeper.
 func (s *Service) poolAttempt(ctx context.Context, w poolWork, p surplusPassParams) (workResult, error) {
 	var res workResult
 	err := s.hibernationOwnerTx(ctx, w.owner, w.id, func(q *store.Queries, row store.Worker) error {
@@ -422,9 +459,19 @@ func (s *Service) poolAttempt(ctx context.Context, w poolWork, p surplusPassPara
 			row.HibernationBlockedAt.Valid && row.HibernationBlockedAt.Time.After(p.recentCutoff) {
 			return nil
 		}
+		if w.long {
+			judged, admitted, stop, err := s.admitPooledLong(ctx, q, row, p)
+			if err != nil || judged {
+				res.admitted, res.stop = admitted, stop
+				return err
+			}
+		}
+		if !w.surplus {
+			return nil
+		}
 		// A separate statement after both locks: its own READ COMMITTED snapshot sees every
 		// commit the previous owner-lock holder made.
-		rows, err := q.GetOwnerHibernationPoolInput(ctx, w.owner)
+		rows, err := q.GetOwnerHibernationPoolInput(ctx, store.GetOwnerHibernationPoolInputParams{Owner: w.owner})
 		if err != nil {
 			return err
 		}
@@ -432,26 +479,34 @@ func (s *Service) poolAttempt(ctx context.Context, w poolWork, p surplusPassPara
 		if s.poolPassAfterDecide != nil {
 			s.poolPassAfterDecide()
 		}
-		switch dec.Action {
-		case decisionAutoSurplus:
-			res.surplus = true
-			res.admitted, res.stop, err = s.admitAutomatic(ctx, q, row, p.now, surplusHibernationReason(p.threshold), true)
-			return err
-		default:
-			// M2: the owner-clock long rule (auto_long) and the warm wake decide here. In M1 a
-			// pooled worker keeps today's per-worker long rule, under the owner lock so it
-			// serializes with surplus decisions on the same owner.
-			if !w.long {
-				return nil
-			}
-			res.admitted, res.stop, err = s.autoAdmit(ctx, q, row, p.now, p.longCutoff, p.recentCutoff, p.idleAfter)
-			return err
+		if dec.Action != decisionAutoSurplus {
+			return nil
 		}
+		res.surplus = true
+		res.admitted, res.stop, err = s.admitAutomatic(ctx, q, row, p.now, surplusHibernationReason(p.threshold), true)
+		return err
 	})
 	if errors.Is(err, errHibernationOwnerBusy) {
 		return workResult{busy: true}, nil
 	}
 	return res, err
+}
+
+// admitPooledLong is the long rule for a pooled worker on its locked row, in surplus mode: one
+// GetWorkerLongIdleness read (the long anchor, see the query), then the shared admission with
+// admit origin auto_long. judged is false when the recheck finds the worker not long-idle (a run
+// or activity landed since the list) or no longer pooled (the unpooled list picks it up next pass),
+// so the caller may still try the surplus rule.
+func (s *Service) admitPooledLong(ctx context.Context, q *store.Queries, row store.Worker, p surplusPassParams) (judged, admitted, stop bool, err error) {
+	idle, err := q.GetWorkerLongIdleness(ctx, row.ID)
+	if err != nil {
+		return false, false, false, err
+	}
+	if !idle.Pooled || idle.Nonterminal > 0 || idle.OwnerActiveNow || !idle.Anchor.Valid || idle.Anchor.Time.After(p.longCutoff) {
+		return false, false, false, nil
+	}
+	admitted, stop, err = s.admitAutomatic(ctx, q, row, p.now, autoHibernationReason(p.idleAfter), false)
+	return true, admitted, stop, err
 }
 
 // hibernationOwnerTx runs fn in one READ COMMITTED transaction under the owner's hibernation

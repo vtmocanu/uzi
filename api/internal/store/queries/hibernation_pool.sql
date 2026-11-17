@@ -36,21 +36,36 @@ WHERE w.kind = 'hosted' AND NOT w.ephemeral AND w.hibernation_state = 'none'
 ORDER BY a.anchor ASC, w.id ASC
 LIMIT @max_rows::int;
 
--- name: ListWorkerOwners :many
--- The owner of each listed worker, so the pass can group the long-rule candidates (which
--- ListAutoHibernationCandidates returns without an owner) by owner. A hint read without locks.
-SELECT id, user_id FROM workers WHERE id = ANY(@ids::uuid[]);
-
 -- name: GetOwnerHibernationPoolInput :many
 -- The whole pool decision input of one owner in ONE statement (one snapshot): every persistent
 -- hosted worker of @owner with the pool key fields, the effective capabilities (the shared
 -- fn_effective_worker_caps fold, as the claim gate computes it), the state, intake, readiness
 -- and cleanup columns, the non-terminal run count, the surplus anchor (the GetWorkerIdleness
--- expression), and whether a queued run holds a pending demand wake on the worker. It MUST be a
+-- expression), whether a queued run holds a pending demand wake on the worker, the VALID origin
+-- markers of the current op (admit_origin / wake_origin are '' unless hibernation_origin_op_id
+-- equals hibernation_op_id, so a legacy or foreign-op marker reads as unknown), the owner
+-- activity anchor and whether the owner is active now (see ListAutoHibernationCandidatesSurplusMode
+-- for the anchor), and the two shared gates the database can establish: the instance intake pause
+-- (fn_instance_intake_paused) and the owner's custody admission limit
+-- (fn_custody_admission_count at or over @custody_hold_limit, the claim path's own predicate; a
+-- non-positive limit disables it, so a caller that could not read the limit passes 0). It MUST be a
 -- separate statement executed AFTER the owner lock and the candidate row lock, never folded into
 -- the lock statement or taken from a list query: under READ COMMITTED a statement that waited on
 -- a lock still reads its own fresh snapshot, so the decision sees every commit the previous
--- lock holder made.
+-- lock holder made. The owner anchor is computed once, in the oa CTE, with literal status lists
+-- so runs_user_created_idx, runs_user_terminal_end_idx and runs_user_nonterminal_idx serve it.
+WITH oa AS (
+    SELECT GREATEST(
+               (SELECT max(r.created_at) FROM runs r WHERE r.user_id = @owner::uuid),
+               (SELECT max(COALESCE(r.finished_at, r.status_since)) FROM runs r
+                 WHERE r.user_id = @owner::uuid AND r.status IN ('completed', 'failed', 'cancelled'))
+           )::timestamptz AS anchor,
+           EXISTS (SELECT 1 FROM runs r
+                    WHERE r.user_id = @owner::uuid AND r.status NOT IN ('completed', 'failed', 'cancelled')) AS active_now,
+           (SELECT fn_instance_intake_paused())::boolean AS intake_paused,
+           (@custody_hold_limit::int > 0
+            AND fn_custody_admission_count(@owner::uuid, @heartbeat_cutoff::timestamptz) >= @custody_hold_limit::int)::boolean AS custody_limit_reached
+)
 SELECT
     w.id, w.user_id, w.kind, w.ephemeral, w.status, w.last_heartbeat_at, w.created_at,
     w.hibernation_state, w.wake_error,
@@ -71,7 +86,329 @@ SELECT
         SELECT 1 FROM hibernation_wakes hw
         JOIN runs r ON r.id = hw.run_id
         WHERE hw.worker_id = w.id AND r.status = 'queued'
-    )::boolean AS pending_wake_demand
+    )::boolean AS pending_wake_demand,
+    (CASE WHEN w.hibernation_origin_op_id = w.hibernation_op_id
+          THEN COALESCE(w.hibernation_admit_origin, '') ELSE '' END)::text AS admit_origin,
+    (CASE WHEN w.hibernation_origin_op_id = w.hibernation_op_id
+          THEN COALESCE(w.hibernation_wake_origin, '') ELSE '' END)::text AS wake_origin,
+    oa.anchor AS owner_anchor,
+    oa.active_now::boolean AS owner_active_now,
+    oa.intake_paused, oa.custody_limit_reached
 FROM workers w
+CROSS JOIN oa
 WHERE w.user_id = @owner::uuid AND w.kind = 'hosted' AND NOT w.ephemeral
 ORDER BY w.id ASC;
+
+
+-- Surplus-mode long clock (issue #4395 M2). While worker_hibernation_surplus is on, the long rule
+-- (idle_after) judges a POOLED worker by the long anchor and an unpooled one exactly as today:
+--
+--   long anchor = GREATEST(owner activity anchor, worker.created_at, conservative wake term)
+--   owner activity anchor = GREATEST(max(runs.created_at) of the owner,
+--                                    max(COALESCE(finished_at, status_since)) over the owner's
+--                                    terminal runs), by runs.user_id only, any run kind
+--   owner active now = the owner has any non-terminal run
+--   conservative wake term = GREATEST(last_manual_wake_settled_at, CASE WHEN the op's markers are
+--       valid (hibernation_origin_op_id = hibernation_op_id) AND (wake origin warm or system, OR
+--       no wake origin yet on an admitted op) THEN NULL ELSE last_wake_settled_at END); this is
+--       the predicate workersvc.carryManualGrace applies in Go (D15, D18)
+--
+-- A pooled worker is never long-idle while its owner is active now. "Pooled" is the SQL form of
+-- workersvc.poolKey: persistent hosted, registered (template, size and docker fact known) and at
+-- least one OTHER worker of the same owner with an equal key (template, size, isolated lane,
+-- docker, the sorted deduplicated effective capability set, the sorted deduplicated protocol
+-- capability set, max_concurrent_runs and max_cross_check_slots, NULL equal only to NULL); the pw
+-- CTE below is that key. The status lists are literals on purpose so runs_user_created_idx,
+-- runs_user_terminal_end_idx and runs_user_nonterminal_idx serve the owner arms (a parameterised
+-- list silently loses the partial indexes). The owner anchor is computed once per owner.
+
+-- name: ListAutoHibernationCandidatesSurplusMode :many
+-- The surplus-mode sibling of ListAutoHibernationCandidates: the same listing, the same recent
+-- controller-refusal skip and the same ordering, but a pooled worker is a candidate only when it
+-- is long-idle by the long anchor and its owner is not active now, and an unpooled worker keeps
+-- today's per-worker anchor (the GetWorkerIdleness expression). pooled tells the pass which rule
+-- applies. A hint read without locks: the pass re-checks on the locked row (GetWorkerLongIdleness
+-- for pooled workers, GetWorkerIdleness for unpooled ones).
+WITH pw AS MATERIALIZED (
+    SELECT o.id, o.user_id, o.template_declared AS t, o.hosted_size AS sz, o.isolated_lane AS lane,
+           o.docker_enabled AS dk,
+           ARRAY(SELECT DISTINCT c FROM unnest(fn_effective_worker_caps(o.capabilities, COALESCE(o.docker_enabled, false))::text[]) AS c ORDER BY c) AS caps,
+           ARRAY(SELECT DISTINCT c FROM unnest(COALESCE(o.protocol_capabilities, '{}'::text[])) AS c ORDER BY c) AS proto,
+           o.max_concurrent_runs AS runs_max, o.max_cross_check_slots AS cross_max
+    FROM workers o
+    WHERE o.kind = 'hosted' AND NOT o.ephemeral
+      AND o.template_declared IS NOT NULL AND o.hosted_size IS NOT NULL AND o.docker_enabled IS NOT NULL
+),
+cand AS (
+    SELECT w.id, w.user_id, w.created_at, w.last_wake_settled_at, w.hibernation_blocked_at,
+           GREATEST(w.last_manual_wake_settled_at,
+                   CASE WHEN w.hibernation_origin_op_id = w.hibernation_op_id
+                             AND (w.hibernation_wake_origin IN ('warm', 'system')
+                                  OR (w.hibernation_wake_origin IS NULL AND w.hibernation_admit_origin IS NOT NULL))
+                        THEN NULL ELSE w.last_wake_settled_at END) AS wake_term,
+           EXISTS (
+        SELECT 1 FROM pw p JOIN pw o ON o.user_id = p.user_id AND o.id <> p.id AND o.t = p.t AND o.sz = p.sz
+          AND o.lane IS NOT DISTINCT FROM p.lane AND o.dk = p.dk AND o.caps = p.caps AND o.proto = p.proto
+          AND o.runs_max IS NOT DISTINCT FROM p.runs_max AND o.cross_max IS NOT DISTINCT FROM p.cross_max
+        WHERE p.id = w.id) AS pooled
+    FROM workers w
+    WHERE w.kind = 'hosted' AND NOT w.ephemeral AND w.hibernation_state = 'none'
+      AND NOT EXISTS (
+          SELECT 1 FROM runs r
+          WHERE r.worker_id = w.id AND r.status NOT IN ('completed', 'failed', 'cancelled'))
+      AND NOT COALESCE(w.hibernation_blocked_reason = 'controller_refused'
+                       AND w.hibernation_blocked_at > @recent_cutoff::timestamptz, false)
+), oa AS (
+    SELECT u.user_id, x.anchor, x.active_now
+    FROM (SELECT DISTINCT c.user_id FROM cand c WHERE c.pooled) u
+    CROSS JOIN LATERAL (
+        SELECT GREATEST(
+               (SELECT max(r.created_at) FROM runs r WHERE r.user_id = u.user_id),
+               (SELECT max(COALESCE(r.finished_at, r.status_since)) FROM runs r
+                 WHERE r.user_id = u.user_id AND r.status IN ('completed', 'failed', 'cancelled'))
+           ) AS anchor,
+           EXISTS (SELECT 1 FROM runs r
+                    WHERE r.user_id = u.user_id AND r.status NOT IN ('completed', 'failed', 'cancelled')) AS active_now
+    ) x
+), judged AS (
+    SELECT c.id, c.user_id, c.pooled, c.hibernation_blocked_at,
+           CASE WHEN c.pooled THEN GREATEST(oa.anchor, c.created_at, c.wake_term)
+                ELSE (SELECT GREATEST(
+                   (SELECT max(COALESCE(r.finished_at, r.status_since)) FROM runs r
+                     WHERE r.worker_id = w.id AND r.status IN ('completed', 'failed', 'cancelled')),
+                   w.last_wake_settled_at,
+                   w.created_at) FROM workers w WHERE w.id = c.id) END AS anchor,
+           COALESCE(c.pooled AND oa.active_now, false) AS active_now
+    FROM cand c
+    LEFT JOIN oa ON oa.user_id = c.user_id
+)
+SELECT j.id, j.user_id, j.anchor::timestamptz AS anchor, j.pooled::boolean AS pooled
+FROM judged j
+WHERE NOT j.active_now AND j.anchor <= @cutoff::timestamptz
+ORDER BY COALESCE(j.hibernation_blocked_at > @recent_cutoff::timestamptz, false) ASC,
+         CASE WHEN COALESCE(j.hibernation_blocked_at > @recent_cutoff::timestamptz, false)
+              THEN j.hibernation_blocked_at END ASC NULLS LAST,
+         j.anchor ASC, j.id ASC
+LIMIT @max_rows::int;
+
+-- name: GetWorkerLongIdleness :one
+-- The locked recheck of a pooled worker's long admission, in ONE statement (one snapshot, like
+-- GetWorkerIdleness): the worker's non-terminal run count, whether it is still pooled, the anchor
+-- the long rule judges it by (the long anchor when pooled, today's per-worker anchor otherwise) and
+-- whether its owner is active now (false for an unpooled worker). The pass admits only when it is
+-- pooled, nonterminal is 0, the owner is not active now and anchor is at or before the long cutoff.
+WITH pw AS MATERIALIZED (
+    SELECT o.id, o.user_id, o.template_declared AS t, o.hosted_size AS sz, o.isolated_lane AS lane,
+           o.docker_enabled AS dk,
+           ARRAY(SELECT DISTINCT c FROM unnest(fn_effective_worker_caps(o.capabilities, COALESCE(o.docker_enabled, false))::text[]) AS c ORDER BY c) AS caps,
+           ARRAY(SELECT DISTINCT c FROM unnest(COALESCE(o.protocol_capabilities, '{}'::text[])) AS c ORDER BY c) AS proto,
+           o.max_concurrent_runs AS runs_max, o.max_cross_check_slots AS cross_max
+    FROM workers o
+    WHERE o.kind = 'hosted' AND NOT o.ephemeral
+      AND o.user_id = (SELECT x.user_id FROM workers x WHERE x.id = @worker_id)
+      AND o.template_declared IS NOT NULL AND o.hosted_size IS NOT NULL AND o.docker_enabled IS NOT NULL
+)
+SELECT
+    (SELECT count(*) FROM runs r
+      WHERE r.worker_id = w.id AND r.status NOT IN ('completed', 'failed', 'cancelled'))::bigint AS nonterminal,
+    pl.pooled::boolean AS pooled,
+    (CASE WHEN pl.pooled THEN GREATEST(oa.anchor, w.created_at, GREATEST(w.last_manual_wake_settled_at,
+                   CASE WHEN w.hibernation_origin_op_id = w.hibernation_op_id
+                             AND (w.hibernation_wake_origin IN ('warm', 'system')
+                                  OR (w.hibernation_wake_origin IS NULL AND w.hibernation_admit_origin IS NOT NULL))
+                        THEN NULL ELSE w.last_wake_settled_at END))
+          ELSE GREATEST(
+                   (SELECT max(COALESCE(r.finished_at, r.status_since)) FROM runs r
+                     WHERE r.worker_id = w.id AND r.status IN ('completed', 'failed', 'cancelled')),
+                   w.last_wake_settled_at,
+                   w.created_at) END)::timestamptz AS anchor,
+    COALESCE(pl.pooled AND oa.active_now, false)::boolean AS owner_active_now
+FROM workers w
+CROSS JOIN LATERAL (
+    SELECT EXISTS (
+        SELECT 1 FROM pw p JOIN pw o ON o.user_id = p.user_id AND o.id <> p.id AND o.t = p.t AND o.sz = p.sz
+          AND o.lane IS NOT DISTINCT FROM p.lane AND o.dk = p.dk AND o.caps = p.caps AND o.proto = p.proto
+          AND o.runs_max IS NOT DISTINCT FROM p.runs_max AND o.cross_max IS NOT DISTINCT FROM p.cross_max
+        WHERE p.id = w.id) AS pooled
+) pl
+LEFT JOIN LATERAL (
+    SELECT GREATEST(
+               (SELECT max(r.created_at) FROM runs r WHERE r.user_id = w.user_id),
+               (SELECT max(COALESCE(r.finished_at, r.status_since)) FROM runs r
+                 WHERE r.user_id = w.user_id AND r.status IN ('completed', 'failed', 'cancelled'))
+           ) AS anchor,
+           EXISTS (SELECT 1 FROM runs r
+                    WHERE r.user_id = w.user_id AND r.status NOT IN ('completed', 'failed', 'cancelled')) AS active_now
+    WHERE pl.pooled
+) oa ON true
+WHERE w.id = @worker_id;
+
+-- name: ListHibernationWarmTargets :many
+-- Warm-wake opportunities (a hint read without locks; the pass decides under the owner lock from
+-- GetOwnerHibernationPoolInput): for every pool, the best sleeper that is eligible to be warm
+-- woken "as if awake": a persistent hosted pooled worker (another equal-key member exists) that is
+-- preparing or hibernated, whose current op was admitted by the automatic pass (valid origin
+-- marker, admit origin auto_long or auto_surplus), not manually cordoned, not under maintenance and
+-- without a wake_error, and whose owner is active now or has an owner activity anchor after
+-- @owner_active_cutoff (now - idle_after). Best = preparing first, then hibernated; then the most
+-- recent surplus anchor, then the oldest created_at, then the lowest id. At most one row per pool;
+-- oldest anchor first for fairness, then id; bounded by @max_rows.
+WITH pw AS MATERIALIZED (
+    SELECT o.id, o.user_id, o.template_declared AS t, o.hosted_size AS sz, o.isolated_lane AS lane,
+           o.docker_enabled AS dk,
+           ARRAY(SELECT DISTINCT c FROM unnest(fn_effective_worker_caps(o.capabilities, COALESCE(o.docker_enabled, false))::text[]) AS c ORDER BY c) AS caps,
+           ARRAY(SELECT DISTINCT c FROM unnest(COALESCE(o.protocol_capabilities, '{}'::text[])) AS c ORDER BY c) AS proto,
+           o.max_concurrent_runs AS runs_max, o.max_cross_check_slots AS cross_max
+    FROM workers o
+    WHERE o.kind = 'hosted' AND NOT o.ephemeral
+      AND o.template_declared IS NOT NULL AND o.hosted_size IS NOT NULL AND o.docker_enabled IS NOT NULL
+),
+sl AS (
+    SELECT w.id, w.user_id, w.hibernation_state, w.created_at,
+           p.t, p.sz, p.lane, p.dk, p.caps, p.proto, p.runs_max, p.cross_max,
+           GREATEST(
+                   (SELECT max(COALESCE(r.finished_at, r.status_since)) FROM runs r
+                     WHERE r.worker_id = w.id AND r.status IN ('completed', 'failed', 'cancelled')),
+                   w.last_wake_settled_at,
+                   w.created_at) AS anchor
+    FROM workers w
+    JOIN pw p ON p.id = w.id
+    WHERE w.hibernation_state IN ('preparing', 'hibernated')
+      AND w.hibernation_origin_op_id = w.hibernation_op_id
+      AND w.hibernation_admit_origin IN ('auto_long', 'auto_surplus')
+      AND w.manual_cordoned_at IS NULL AND NOT w.maintenance_fenced
+      AND w.maintenance_phase NOT IN ('requested', 'ready', 'stopping', 'recycling')
+      AND w.wake_error IS NULL
+      AND EXISTS (SELECT 1 FROM pw o WHERE o.user_id = p.user_id AND o.id <> p.id AND o.t = p.t AND o.sz = p.sz
+          AND o.lane IS NOT DISTINCT FROM p.lane AND o.dk = p.dk AND o.caps = p.caps AND o.proto = p.proto
+          AND o.runs_max IS NOT DISTINCT FROM p.runs_max AND o.cross_max IS NOT DISTINCT FROM p.cross_max)
+), oa AS (
+    SELECT u.user_id, x.anchor, x.active_now
+    FROM (SELECT DISTINCT s.user_id FROM sl s) u
+    CROSS JOIN LATERAL (
+        SELECT GREATEST(
+               (SELECT max(r.created_at) FROM runs r WHERE r.user_id = u.user_id),
+               (SELECT max(COALESCE(r.finished_at, r.status_since)) FROM runs r
+                 WHERE r.user_id = u.user_id AND r.status IN ('completed', 'failed', 'cancelled'))
+           ) AS anchor,
+           EXISTS (SELECT 1 FROM runs r
+                    WHERE r.user_id = u.user_id AND r.status NOT IN ('completed', 'failed', 'cancelled')) AS active_now
+    ) x
+), best AS (
+    SELECT DISTINCT ON (s.user_id, s.t, s.sz, s.lane, s.dk, s.caps, s.proto, s.runs_max, s.cross_max)
+           s.id, s.user_id, s.anchor
+    FROM sl s
+    ORDER BY s.user_id, s.t, s.sz, s.lane, s.dk, s.caps, s.proto, s.runs_max, s.cross_max,
+             CASE s.hibernation_state WHEN 'preparing' THEN 0 ELSE 1 END ASC,
+             s.anchor DESC, s.created_at ASC, s.id ASC
+)
+SELECT b.id, b.user_id, b.anchor::timestamptz AS anchor
+FROM best b
+JOIN oa ON oa.user_id = b.user_id
+WHERE oa.active_now OR oa.anchor > @owner_active_cutoff::timestamptz
+ORDER BY b.anchor ASC, b.id ASC
+LIMIT @max_rows::int;
+
+-- name: ListAutoHibernationBlockersSurplusMode :many
+-- The surplus-mode sibling of ListAutoHibernationBlockers for fleet.hibernation: the same columns,
+-- the same two disjoint kinds, the same one-snapshot total and oldest_since over the whole window
+-- and the same row limit, but the idle kind judges a POOLED worker by the long anchor (and never
+-- while its owner is active now), so an old unused pooled worker of an owner that is active
+-- elsewhere is not listed, and an unpooled worker by today's anchor. A pooled worker is therefore
+-- listed only when it is long-idle and a block was recorded at or after that anchor; a block
+-- recorded by a surplus refusal on a worker that is not long-idle is not listed, so a surplus
+-- refusal alone never raises the check. The parked kind covers unpooled workers only: a non-terminal
+-- run on a pooled worker keeps its owner active now, which is exactly the rule that keeps a pooled
+-- worker from being long-idle. controller_reason is the controller's refusal code (the worker's
+-- hibernation_reason when the controller refused) for an idle row, '' for a parked one.
+WITH pw AS MATERIALIZED (
+    SELECT o.id, o.user_id, o.template_declared AS t, o.hosted_size AS sz, o.isolated_lane AS lane,
+           o.docker_enabled AS dk,
+           ARRAY(SELECT DISTINCT c FROM unnest(fn_effective_worker_caps(o.capabilities, COALESCE(o.docker_enabled, false))::text[]) AS c ORDER BY c) AS caps,
+           ARRAY(SELECT DISTINCT c FROM unnest(COALESCE(o.protocol_capabilities, '{}'::text[])) AS c ORDER BY c) AS proto,
+           o.max_concurrent_runs AS runs_max, o.max_cross_check_slots AS cross_max
+    FROM workers o
+    WHERE o.kind = 'hosted' AND NOT o.ephemeral
+      AND o.template_declared IS NOT NULL AND o.hosted_size IS NOT NULL AND o.docker_enabled IS NOT NULL
+),
+base AS (
+    SELECT w.id, w.user_id, w.name, w.created_at, w.last_wake_settled_at,
+           w.hibernation_blocked_reason, w.hibernation_blocked_at, w.hibernation_blocked_since,
+           w.hibernation_reason,
+           GREATEST(w.last_manual_wake_settled_at,
+                   CASE WHEN w.hibernation_origin_op_id = w.hibernation_op_id
+                             AND (w.hibernation_wake_origin IN ('warm', 'system')
+                                  OR (w.hibernation_wake_origin IS NULL AND w.hibernation_admit_origin IS NOT NULL))
+                        THEN NULL ELSE w.last_wake_settled_at END) AS wake_term,
+           EXISTS (
+        SELECT 1 FROM pw p JOIN pw o ON o.user_id = p.user_id AND o.id <> p.id AND o.t = p.t AND o.sz = p.sz
+          AND o.lane IS NOT DISTINCT FROM p.lane AND o.dk = p.dk AND o.caps = p.caps AND o.proto = p.proto
+          AND o.runs_max IS NOT DISTINCT FROM p.runs_max AND o.cross_max IS NOT DISTINCT FROM p.cross_max
+        WHERE p.id = w.id) AS pooled
+    FROM workers w
+    WHERE w.kind = 'hosted' AND NOT w.ephemeral AND w.hibernation_state = 'none'
+), oa AS (
+    SELECT u.user_id, x.anchor, x.active_now
+    FROM (SELECT DISTINCT b.user_id FROM base b WHERE b.pooled AND b.hibernation_blocked_reason IS NOT NULL) u
+    CROSS JOIN LATERAL (
+        SELECT GREATEST(
+               (SELECT max(r.created_at) FROM runs r WHERE r.user_id = u.user_id),
+               (SELECT max(COALESCE(r.finished_at, r.status_since)) FROM runs r
+                 WHERE r.user_id = u.user_id AND r.status IN ('completed', 'failed', 'cancelled'))
+           ) AS anchor,
+           EXISTS (SELECT 1 FROM runs r
+                    WHERE r.user_id = u.user_id AND r.status NOT IN ('completed', 'failed', 'cancelled')) AS active_now
+    ) x
+), idle AS (
+    SELECT b.id, b.name, a.anchor::timestamptz AS anchor,
+           b.hibernation_blocked_reason::text AS reason,
+           COALESCE(b.hibernation_reason, '')::text AS controller_reason,
+           GREATEST(b.hibernation_blocked_since, a.anchor)::timestamptz AS since
+    FROM base b
+    LEFT JOIN oa ON oa.user_id = b.user_id AND b.pooled
+    CROSS JOIN LATERAL (
+        SELECT CASE WHEN b.pooled THEN GREATEST(oa.anchor, b.created_at, b.wake_term)
+                    ELSE (SELECT GREATEST(
+                   (SELECT max(COALESCE(r.finished_at, r.status_since)) FROM runs r
+                     WHERE r.worker_id = w.id AND r.status IN ('completed', 'failed', 'cancelled')),
+                   w.last_wake_settled_at,
+                   w.created_at) FROM workers w WHERE w.id = b.id) END AS anchor
+    ) a
+    WHERE b.hibernation_blocked_reason IS NOT NULL
+      AND NOT COALESCE(b.pooled AND oa.active_now, false)
+      AND NOT EXISTS (
+          SELECT 1 FROM runs r
+          WHERE r.worker_id = b.id AND r.status NOT IN ('completed', 'failed', 'cancelled'))
+      AND a.anchor <= @cutoff::timestamptz
+      AND b.hibernation_blocked_at >= a.anchor
+), parked AS (
+    SELECT b.id, b.name, p.run_id, p.status::text AS status, p.status_since::timestamptz AS since
+    FROM base b
+    CROSS JOIN LATERAL (
+        SELECT r.id AS run_id, r.status, r.status_since
+        FROM runs r
+        WHERE r.worker_id = b.id AND r.status NOT IN ('completed', 'failed', 'cancelled')
+        ORDER BY r.status_since ASC, r.id ASC
+        LIMIT 1
+    ) p
+    WHERE NOT b.pooled
+      AND NOT EXISTS (
+          SELECT 1 FROM runs r
+          WHERE r.worker_id = b.id AND r.status NOT IN ('completed', 'failed', 'cancelled')
+            AND r.status NOT IN ('recovery_wait', 'paused', 'limit_wait'))
+      AND p.status_since <= @cutoff::timestamptz
+), blockers AS (
+    SELECT 'idle'::text AS kind, 0 AS kind_order, i.id, i.name, i.anchor AS sort_at, i.anchor,
+           i.reason, i.controller_reason, i.since, NULL::uuid AS run_id, NULL::text AS status
+    FROM idle i
+    UNION ALL
+    SELECT 'parked'::text, 1, k.id, k.name, k.since, NULL::timestamptz,
+           ''::text, ''::text, k.since, k.run_id, k.status
+    FROM parked k
+)
+SELECT b.kind, b.id, b.name, b.anchor, b.reason, b.controller_reason, b.since, b.run_id, b.status,
+       (count(*) OVER ())::bigint AS total,
+       (min(b.since) OVER ())::timestamptz AS oldest_since
+FROM blockers b
+ORDER BY b.kind_order ASC, b.sort_at ASC, b.id ASC
+LIMIT @max_rows::int;
