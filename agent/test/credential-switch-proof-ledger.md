@@ -1,7 +1,9 @@
 # Live Codex switching: per-seam proof ledger
 
 Base: a233883de3c36bae2e940f999cd9d582889dad00.
-Latest stopped-authority control candidate: 2de82eafb2ace6b0a03c10de8f7a582b7b1d97bd.
+Latest runtime fixture candidate: 47b0d8e374555c504be67ded2f4960f4a6c2e6d5.
+Stopped-policy control candidate: 1cbcb917f156bfb8eb862f743acb1dde87a91a29.
+Earlier stopped-authority control candidate: 2de82eafb2ace6b0a03c10de8f7a582b7b1d97bd.
 Earlier stopped-guard controls: 76cc31aee1b0dafd644e9fa3fb7593442dc7ed6b.
 Earlier Runner controls below used 6a7e7ae11b43c8fbf658d8b2fdcc557441c699c8
 and the replacement-first adoption assertion as specified per control.
@@ -44,7 +46,7 @@ these controls.
 
 ## Executed controls
 
-All six new controls below ran the real Runner case in
+The six earlier A/B controls below ran the real Runner case in
 agent/test/codex-executor.test.ts:
 
 ```sh
@@ -408,10 +410,10 @@ control is still absent, not that the functional criterion was deferred.
 | A reconciliation before strict persistence | C2 in earlier record |
 | Explicit owner Codex request, target ownership/kind and live-status admission | Unvalidated |
 | Same successful flight/generation/worktree with no new attempt, custody or release/reclaim | Positive assertions present; independent preservation/control accounting unvalidated |
-| Strict usable persistence, clear confirmation and continuation on A before teardown | Unvalidated |
-| Proven A root/tool reap before B material, login and model work; fresh CODEX_HOME | Unvalidated |
+| Strict usable persistence, clear confirmation and continuation on A before teardown | R1–R4 below credit three failed-save/inspection variants and empty applied-ACK only; other clauses unvalidated |
+| Proven A root/tool reap before B material, login and model work; fresh CODEX_HOME | R5 credits unproven registered root pre-apply only; tool-only, other modes/phases and HOME clauses unvalidated |
 | Whole operation-scope/refresh/identity/capability/summary replacement and retired-A rejection | A2 credits one reader only; remaining mixed clauses unvalidated |
-| Exact saved-ID resume; confirmed-refusal-only fresh fallback and lineage; preservation re-hold | Unvalidated |
+| Exact saved-ID resume; confirmed-refusal-only fresh fallback and lineage; preservation re-hold | R6 credits uncertain-error classification only; confirmed-refusal/preserve companions positive, independent preservation and other clauses unvalidated |
 | Policy episode rejection at request and under apply lock | Unvalidated |
 | Refresh lease/intent exclusion, account lock ordering and boundary reconciliation before revoke | Unvalidated |
 | Transactional frozen binding rewrite, capability revoke/remint and post-commit material response | Unvalidated |
@@ -427,7 +429,7 @@ control is still absent, not that the functional criterion was deferred.
 | Stopped frozen secret and capability hash presence | D25–D56: running/paused missing_frozen_secret and missing_capability_hash; binding identity/ownership unvalidated |
 | Stopped switch-request/generation, ordinary hold, pause-request/mode, stop-kind/reason and reserve-hold markers | D25–D56: individual running/paused marker cases; policy and other competing controls unvalidated |
 | Stopped refusal of claimed status | D25–D56: running/paused status_claimed; other statuses unvalidated |
-| Stopped ownership, lane and policy fences | Unvalidated; redundant-fence controls remain required |
+| Stopped ownership, lane and policy fences | D57–D60 below credit running/paused pending-fresh and unresolved-outcome only; ownership, lane and other policy clauses unvalidated |
 | Stopped replay after withdrawn X/Y; resume/reclaim and incarnation changes | Unvalidated; the fixture's single HTTP withdrawal does not discharge X/Y |
 | Stopped preservation of binding, journals, session, gates, questions and custody without input consumption/time banking | Unvalidated |
 | Stopped known extra typed member and register_nonce case alias | D25–D56: four running/paused wire cases only |
@@ -521,7 +523,7 @@ it must not be treated as proof of the duplicated policy fences.
 An independent architect source investigation at 5212bffae found no
 reachable single-copy policy/lane control under methods (a)–(d). The lead
 spot-checked the predicates and lock ordering. This is static feasibility
-evidence only: no duplicate-guard mutant has been executed or credited.
+evidence only; the subsequent four executed policy controls are recorded below.
 Whole-operation historical refusal does not isolate these negative fences,
 and the duplicated checks are not an ordering relocation.
 
@@ -540,7 +542,160 @@ requires independent enforcement. Do not infer independent sufficiency from
 a redundant-fence control. A single-copy mutant staying green is expected
 redundancy, not proof of a defect.
 
-No new redundant-fence control has executed. The source investigation and
-anchors above are starting points, not a completed copy census or executed
-proof. The affected controls remain required and unvalidated; no functional
-criterion is waived or deferred. m3 and m4 remain **INCOMPLETE**.
+The four policy controls below now supply bounded redundant-fence evidence.
+Lane and other redundant fences remain unvalidated. No functional criterion
+is waived or deferred. m3 and m4 remain **INCOMPLETE**.
+
+
+### D57–D60 — stopped policy redundant-fence guard controls, class (d)
+
+Receipt: `.uzi/scratch/stopped-policy-results.json`, candidate
+1cbcb917f156bfb8eb862f743acb1dde87a91a29. Each negative used its own
+serial export, removed immediately. Each compiled, exited 1 at
+`refusal mismatch: status=200 applied=true`, and passed its
+`fresh_and_replay` companion. Unchanged before `.uzi/scratch/gate-log.6IMNKT`
+and after `.uzi/scratch/gate-log.pEa5Kp` exited 0, four selected policy
+leaves passed without skips. The receipt contains the exact three-file
+diffs and line anchors per case. These are **redundant-fence guard controls**,
+not baseline restorations or independent per-copy sufficiency proofs.
+
+| Control/case | Semantic fence | Individual red log |
+| --- | --- | --- |
+| D57 `running/policy_pending_fresh` | Pending fresh | `.uzi/scratch/gate-log.idNWSq` |
+| D58 `running/unresolved_policy_outcome` | Unresolved outcome | `.uzi/scratch/gate-log.8WNFnH` |
+| D59 `paused/policy_pending_fresh` | Pending fresh | `.uzi/scratch/gate-log.LYdXmH` |
+| D60 `paused/unresolved_policy_outcome` | Unresolved outcome | `.uzi/scratch/gate-log.yInYkj` |
+
+Copy census: two runtime copies, Go helper and executing SQL.
+api/internal/workersvc/policy_hold.go:190 removes ` || r.PolicyPendingFresh`
+for pending fresh; :190–191 removes the unresolved outcome term (and joining
+`||`) for unresolved outcome. Executing generated
+api/internal/store/codex_switch_stopped.sql.go:29/30 removes respectively
+`AND NOT r.policy_pending_fresh` or
+`AND (r.policy_outcome_id IS NULL OR r.policy_resolved_at IS NOT NULL)`.
+The declarative pair in queries/codex_switch_stopped.sql:19/20 changes
+mechanically with generated SQL; these are not three independent fences.
+The per-case exact diffs leave the other policy term, hold, lane, authority,
+input, status and budget fences intact.
+
+Search scope: WorkerRunState → SetStateReportWithReconciliation →
+setStateWithTx (service.go:4675–4676 early STOP dispatch, before the generic
+policy guard) → stopCodexSwitch → UnresolvedPolicyEpisode and
+SetCodexSwitchStopped. beginClaimMutation takes worker then owned-run
+`FOR UPDATE` locks in READ COMMITTED (milestone_reconciliation.go:295–305);
+the same transaction holds the row through Go and SQL, owned reread and
+commit (codex_switch_stopped.go:32–53). The reviewed shape constraints in
+migrations 00397, 00419 and 00420 permit isolated tested policy tuples;
+they supply no independent sufficiency credit. This direct route/service/query
+census does not exhaustively trace triggers or broadcast consumers.
+These controls prove STOP settlement refusal only. Explicit owner request
+and apply-under-lock policy rejection remain **unvalidated**.
+
+### R1–R6 — individual real Runner safety guard controls, class (d)
+
+Canonical merged receipt: `.uzi/scratch/qualified-runtime-controls.json`.
+The lead checked candidate source hashes against `git show`, exact old/new
+mutation hashes, typecheck exit 0, intended ERR_ASSERTION frames/red and
+before/after greens, and verified the primary unchanged. This documentation
+edit reads those receipts; it does not rerun gates. Exact source/old/new and
+log paths are in that receipt and the raw manifests below.
+
+Baseline a233 runner.ts:25735–25738 (quoted in A1) refused the whole Codex
+operation; there was no historical allowed-operation guard seam here.
+These are **guard controls**, not baseline restorations. Each individual
+control used one export at a time, removed immediately, with provisioned
+agent dependencies linked, no installs or base builds. Each mutant passed
+`npm run typecheck` (exit 0), then the Node CLI with
+`--test-timeout=120000` and the TAP-selected names in the receipt. Each
+selected negative exited 1 with the intended assertion; unchanged before
+and after exited 0. Log names below are relative to `.uzi/scratch/`.
+
+| Control / specific selected case | Witness in codex-executor.test.ts | Candidate | Typecheck / red / before / after logs |
+| --- | --- | --- | --- |
+| R1 `persist-clear-confirmed` | :33922 failedClearRequests empty vs one required clear | 47b0d8e37 | gate-log.5kbOjb / gate-log.PGp5F7 / gate-log.axLCDF / gate-log.Fm09HO |
+| R2 `inspect-missing-clear-confirmed` | :33922 same clear assertion, separate control/export | 47b0d8e37 | gate-log.7wioNQ / gate-log.FybLZz / gate-log.axLCDF / gate-log.Fm09HO |
+| R3 `inspect-unknown-clear-confirmed` | :33922 same clear assertion, separate control/export | 47b0d8e37 | gate-log.teHcg0 / gate-log.i5eqF7 / gate-log.axLCDF / gate-log.Fm09HO |
+| R4 `persist-clear-empty-reply` | :33934 continued_A vs undefined | 1cbcb917f | gate-log.mjzHkm / gate-log.X6HcoB / gate-log.dRY1bQ / gate-log.8Z2C5h |
+| R5 API-key A → subscription B, registered A root reap unproven | :34099 applies 1 vs 0 | 2a8fc55d2 | gate-log.6FfDlX / gate-log.s3yzFp / gate-log.7YV83H / gate-log.uPNNmH |
+| R6 uncertain B resume failure without fresh fallback | :34724 forbidden thread/start count 1 vs 0 | 47b0d8e37 | gate-log.T54qde / gate-log.GSXHpM / gate-log.WiQMUx / gate-log.8RW7CW |
+
+R1–R3 each remove only runner.ts's failed-save block
+`if (saved.kind !== "usable" || !saved.sessionId) { ... }`, retaining the
+save ternary. Raw receipt: runtime-safety-results-persist-per-case.json.
+R4 removes only `if (ack.applied !== true) return false;`, adds `void ack`,
+and keeps reconcile/owned/nonce/pending checks; raw attempt2 receipt.
+R5 removes only the `if (!reaped)` held block and adds `void reaped`;
+raw attempt3 receipt. It credits root reap pre-apply, not tool-only reaping.
+R6 changes codex/codex-executor.ts's `error instanceof CodexResumeError`
+to `Boolean(error) || !error`; raw attempt5 receipt. Confirmed-refusal and
+wire preserve-only companions passed, supplying no independent preserve-guard
+credit. Coverage is limited to the named modes/phases, not all consumers.
+
+Reviewed committed source-fixture repairs: 2a8fc55d2 adds observation of
+bad-apply race settlement; 85bc adds observation of bad fresh fallback;
+47b0d8e37 skips the success-only prepared latch for resumeVariant failure
+fixtures because a proper uncertain error throws. The old mutant was stuck
+on that fixture latch. At the same content as 47, lint
+`.uzi/scratch/gate-log.14E9jE`, typecheck `.uzi/scratch/gate-log.7H3tkW`,
+and eight selected cases `.uzi/scratch/gate-log.X4rnyH` passed, as reported
+by the lead. These are focused fixture gates, not full-suite evidence.
+
+Excluded: stripped Git ENV harness ownership failure before tests; ACK
+unused-variable mutant (typecheck gate-log.6qc_xh88); old root
+gate-log.uIV7Ng timeout; resume attempt3/4 timeouts; and the first mixed
+three-persist-case run, superseded by separate R1–R3 controls. The mixed run
+was assertion-red but is not credited as the individual controls; compilation
+failures and timeouts are not assertion-red proofs. Raw failed-attempt manifests are retained. No overall failed
+attempt script is credited as PASS; credit is individual with before/after green.
+
+## PENDING method clarification — preservation effects
+
+Architect source analysis distinguishes a closed RUN six-column write
+projection from preservation of other tables (no journal/input/custody writes).
+Widening the RUN allowlist could plausibly be a class (d) control analogous
+to B3, but has not executed. The direct stopped SQL writes only RUN status,
+status_since, updated_at, health, health_reason and health_since; after the
+query the service performs owned reread, commit and broadcast. There is no
+existing journal/input/custody write guard to remove at that seam. Adding a
+DELETE/UPDATE introduces a new forbidden effect rather than neutralizing an
+existing guard. Baseline refusal is not preservation proof; ordinary pause
+consumes controls at a different seam and does not establish class (b).
+
+A subsequent read-only DBA census at 47b0d8e37 traced valid four-field
+reports through the common wrapper, effective Goose Up triggers through
+466, and configured PublishState consumers. It found no effective writer to
+run_credential_epochs, run_credential_switch_epochs, run_user_inputs or
+recovery_custody_holds on this accepted STOP path. The wrapper's registration,
+checkpoint and source-publication payloads are absent; completion replay
+requires the completed state (reconciliation.go:148 and the publication
+helpers). Handler acknowledgement construction adds no state mutation.
+
+The closest custody writer is the completion-publication stamp (319 Up),
+but it requires completed status and a non-NULL final head; the 320 Up run
+guard clears that head on paused. A separate 318 publication-identity guard
+also applies. Removing only a pause/status exclusion therefore does not
+make this preservation assertion red. These completion-evidence predicates
+are not established copies of one pause-exclusion fence. The baseline already
+contained the 319/320 guards; they do not supply a class (b) substitute for
+the new operation's absence of writes.
+
+This is not a claim that STOP has no indirect effects. The traced trigger
+closure can write forge_origin_cooldowns, cross_checks and other runs fields
+(432 and 392 Up). The configured MultiBroadcaster (server/main.go:707)
+combines hub.PublishState with Slack notification; Slack may update
+slack_run_messages, including presentation anchors. Those are distinct from
+canonical gate state in runs.gate_* and run_gate_presentations. Question
+identity is runs.open_question_id; question content is run_messages with
+kind=question. No separate questions table is invented. Complete trigger,
+accounting and presentation behavior remains a worker validation obligation;
+this source census is not new red/green evidence or a database-effects waiver.
+
+Pending proposal, **not approved**: one compiling mutant per named
+preservation seam introduces exactly one narrow forbidden effect through the
+real route/store or Runner, leaving other fences/effects intact; the relevant
+preservation assertion must turn red and the candidate stay green. This is
+not guard removal authorized by the current methods. Formal owner method
+clarification is required for that proposal; no functional waiver is sought.
+The conclusion is bounded to the traced accepted route, trigger closure and
+configured consumers, not every code path or deployed schema. Preservation
+rows stay unvalidated and m3/m4 remain **INCOMPLETE**.

@@ -4,7 +4,9 @@ This is a partial evidence ledger for issue #4202, recorded on 2026-11-17.
 It does not declare m3 or m4 complete. Earlier scratch logs were absent after
 recovery; historical commit messages are not treated as passing checks.
 
-Latest stopped-authority control candidate: 2de82eafb2ace6b0a03c10de8f7a582b7b1d97bd.
+Latest runtime fixture candidate: 47b0d8e374555c504be67ded2f4960f4a6c2e6d5.
+Stopped-policy candidate: 1cbcb917f156bfb8eb862f743acb1dde87a91a29.
+Earlier stopped-authority control candidate: 2de82eafb2ace6b0a03c10de8f7a582b7b1d97bd.
 Earlier stopped-guard controls: 76cc31aee1b0dafd644e9fa3fb7593442dc7ed6b.
 Earlier Runner ordering candidate: 73e662c846ac9df92356dd61831967167c44d8ae.
 The primary worktree remained unchanged during those ordering controls. Both mutants
@@ -399,9 +401,105 @@ unchanged green. Unresolved copy coverage remains unvalidated; more than
 one semantic fence per mutant remains invalid. Per-copy sufficiency controls
 are optional unless the frozen criterion requires independent enforcement;
 no independent sufficiency is claimed. Single-copy green is expected
-redundancy, not proof of a defect. No new redundant-fence control has
-executed. Controls remain required; no functional criterion is waived or
+redundancy, not proof of a defect. Four policy redundant-fence controls have subsequently executed as recorded
+below; other controls remain required; no functional criterion is waived or
 deferred, and m3/m4 remain **INCOMPLETE**.
+
+## Stopped policy and individual Runner evidence through 47b0d8e37
+
+The lead completed execution on a clean primary at
+47b0d8e374555c504be67ded2f4960f4a6c2e6d5. This update records supplied
+receipts, not a new execution or an exact-head full-suite claim.
+
+`.uzi/scratch/stopped-policy-results.json` records four individual class (d)
+**redundant-fence guard controls** at 1cbcb917f: running and paused, each
+with policy_pending_fresh and unresolved_policy_outcome. Each compiled,
+exited 1 at `refusal mismatch: status=200 applied=true`, and passed its
+fresh_and_replay companion. Before `.uzi/scratch/gate-log.6IMNKT` and after
+`.uzi/scratch/gate-log.pEa5Kp` exited 0, four policy leaves passed, no skips.
+The [per-case ledger](credential-switch-proof-ledger.md#d57d60--stopped-policy-redundant-fence-guard-controls-class-d)
+records each red log, exact three-file diff mapping and copy census. Two
+runtime copies are the Go helper and executing generated SQL; source query
+and generated counterpart are a mechanical pair, not three independent
+fences. WorkerRunState → SetStateReportWithReconciliation → setStateWithTx
+reaches STOP early dispatch before the generic policy guard. Worker/run
+locks remain held in the same transaction through helper and SQL. The
+search includes migrations 00397/00419/00420 shape constraints and the
+direct route/service/query path, not exhaustive triggers/broadcast consumers.
+Other fences remain intact in the exact diffs. No per-copy independent
+sufficiency is claimed. These controls credit STOP settlement only;
+owner request/apply policy rejection remains unvalidated.
+
+`.uzi/scratch/qualified-runtime-controls.json` canonically merges six
+individual real Runner controls: three separate persist/inspection variants
+at 47b0d8e37 (runtime-safety-results-persist-per-case.json), applied-ACK at
+1cbcb917f (attempt2), root reap pre-apply at 2a8fc55d2 (attempt3), and resume
+classification at 47b0d8e37 (attempt5). The lead checked candidate/source and
+old/new mutation hashes, typecheck exit 0, intended ERR_ASSERTION frames,
+before/after greens and primary unchanged. The
+[per-control table](credential-switch-proof-ledger.md#r1r6--individual-real-runner-safety-guard-controls-class-d)
+records specific case, assertion, candidate and exact typecheck/red/green
+paths. Each mutant compiled and failed its intended assertion with exit 1;
+unchanged before/after passed. These are class (d) guard controls against
+new seams; a233 runner.ts:25735–25738 refused the whole operation, not a
+historically allowed operation restored by these mutations.
+
+Persist controls cut only the failed-save block, retaining the save ternary;
+each observes failedClearRequests empty instead of one (:33922). ACK cuts
+the applied=true check with void ack while retaining reconcile/owned/nonce/
+pending fences; continued_A appears instead of undefined (:33934). Root
+reap cuts only the !reaped held block with void reaped; applies becomes 1
+instead of 0 (:34099). Resume changes instanceof CodexResumeError to
+Boolean(error) || !error; uncertain failure sends a forbidden fresh-thread request
+(1 vs 0, :34724). Confirmed-refusal and preserve companions pass; they give
+no independent preservation-guard credit. Named mode/phase coverage does
+not establish tool-only reap or all consumers.
+
+Reviewed committed fixture repairs: 2a8 observes bad-apply race settlement;
+85bc observes bad fresh fallback; 47 skips the success-only prepared latch
+for resumeVariant failure fixtures, since proper uncertain errors throw.
+Lint `.uzi/scratch/gate-log.14E9jE`, typecheck
+`.uzi/scratch/gate-log.7H3tkW` and eight selected cases
+`.uzi/scratch/gate-log.X4rnyH` passed at the same content as 47. All mutants
+used serial exports removed immediately, linked provisioned dependencies,
+Node --test-timeout=120000 and TAP-selected names; no install or base build.
+
+Excluded experiments remain excluded: stripped Git ENV ownership failure
+before tests, ACK unused-variable typecheck failure (6qc_xh88), root
+uIV7Ng timeout, resume attempt3/4 timeouts, and the mixed persist run
+superseded by separate controls. Raw failed-attempt manifests remain retained;
+no overall failed script receives PASS credit.
+
+### PENDING preservation-method clarification
+
+The [bounded source analysis and proposal](credential-switch-proof-ledger.md#pending-method-clarification--preservation-effects)
+remain an unapproved method proposal after the bounded writer/trigger census below. A closed RUN
+six-column projection might support class (d) allowlist widening like B3;
+none has executed. At the direct-query seam, preservation of other tables has no existing write guard to
+remove: direct STOP SQL writes RUN only and the service then rereads,
+commits and broadcasts. Introducing journal/input/custody DELETE/UPDATE is
+a new forbidden effect, not guard neutralization. Baseline refusal and
+ordinary pause do not prove this preservation seam. The proposal is one
+compiling mutant per named preservation seam introducing one narrow
+forbidden effect through real route/store or Runner, other effects/fences
+intact, preservation assertion red and candidate green. It is **not
+approved**, supplies no functional waiver and leaves preservation rows
+unvalidated. A subsequent source-only DBA census traced the valid four-field
+route, effective Up migration triggers through 466 and configured broadcast
+consumers. It found no effective writer to the four named target tables on
+that accepted STOP path. The nearby completion-custody stamp is also fenced
+by final-head normalization and independent publication identity; removing a
+pause/status exclusion alone cannot supply a preservation red. The baseline
+already has these guards.
+
+The census does not say STOP has no other effects: trigger closure can write
+cooldown reservations, cross-checks and other run fields, and Slack consumers
+can change presentation anchors. Canonical gates are runs.gate_* plus
+run_gate_presentations; question identity is runs.open_question_id and content
+is kind=question run_messages. The ledger records this scope and its limits.
+Accounting, trigger and presentation coverage remains a worker obligation,
+not a deferred criterion. Formal owner method clarification is required for
+the proposed new forbidden-effect control, not a functional waiver.
 
 ## Outstanding evidence
 
@@ -414,10 +512,11 @@ The owner subsequently supplied class (d) for new guards without an a233
 seam: one compiling guard-removal control per negative case, through the real
 switch path or real API route and store transaction. This resolves the prior
 method question only. The 24 earlier stopped controls and 32 authority/wire controls above have
-executed and credit only their specific seams. The ledger splits credited
+executed and credit only their specific seams. Four later policy controls and
+six individual Runner controls add only the bounded credits above. The ledger splits credited
 nonce, claim generation/release, binding presence, markers, claimed status
 and narrow wire cases from remaining ownership/incarnation, other statuses,
-lane/policy, worker-latched bounds, withdrawn X/Y, broader preservation,
+lane/other policy, worker-latched bounds, withdrawn X/Y, broader preservation,
 op_id, bounds and minimal-acknowledgement obligations.
 m3 and m4 are **INCOMPLETE**; no functional criterion is accepted, waived or
 deferred.
