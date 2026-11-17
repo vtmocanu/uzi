@@ -14,15 +14,15 @@ ALTER TABLE users ADD CONSTRAINT users_claude_provider_fkey
 -- +goose Down
 SET LOCAL lock_timeout = '5s';
 -- Refuse rather than silently clear a user's provider source (the 00198 convention): dropping the
--- column would turn every selected source into a vendor fallback, which D12 forbids.
+-- column would turn every selected source into a vendor fallback, which D12 forbids. The table is
+-- locked BEFORE the guard so a source selected concurrently cannot land between the check and the
+-- column drop (SHARE ROW EXCLUSIVE blocks writers).
+LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE;
 -- +goose StatementBegin
 DO $$
-DECLARE
-    n bigint;
 BEGIN
-    SELECT count(*) INTO n FROM users WHERE claude_provider_id IS NOT NULL;
-    IF n > 0 THEN
-        RAISE EXCEPTION 'refusing to roll back 00469: % user(s) still have a Claude provider source selected; clear it explicitly before downgrading', n;
+    IF EXISTS (SELECT 1 FROM users WHERE claude_provider_id IS NOT NULL) THEN
+        RAISE EXCEPTION 'refusing to roll back 00469: user(s) still have a Claude provider source selected; clear it explicitly before downgrading';
     END IF;
 END
 $$;

@@ -5,10 +5,113 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
+
+// TestModelProviderDownGuardsLockBeforeTheCheck: each count-then-ALTER Down locks the table it
+// guards, with a bounded lock wait, BEFORE the guard reads it. Without the lock a writer committing
+// between the guard and the ALTER is silently destroyed (the 00198 refusal is only as good as the
+// snapshot it reads). Text order, because the interleaving needs a live database (see
+// TestModelProviderDownLockSerializesWithAWriterLiveDB).
+func TestModelProviderDownGuardsLockBeforeTheCheck(t *testing.T) {
+	for file, table := range map[string]string{
+		"00466_model_providers.sql":              "model_providers",
+		"00467_user_secrets_provider_key.sql":    "user_secrets",
+		"00469_users_claude_provider_source.sql": "users",
+		"00471_runs_model_provider_binding.sql":  "runs",
+	} {
+		b, err := os.ReadFile(filepath.Join("migrations", file)) //nolint:gosec // G304: a fixed name inside this package's migrations dir.
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, down, ok := strings.Cut(string(b), "-- +goose Down")
+		if !ok {
+			t.Fatalf("%s has no Down block", file)
+		}
+		timeout := strings.Index(down, "SET LOCAL lock_timeout = '5s';")
+		lock := strings.Index(down, "LOCK TABLE "+table+" IN SHARE ROW EXCLUSIVE MODE;")
+		guard := strings.Index(down, "IF EXISTS (SELECT 1 FROM "+table)
+		if timeout < 0 || lock < 0 || guard < 0 || timeout >= lock || lock >= guard {
+			t.Errorf("%s Down: lock_timeout@%d, LOCK TABLE %s@%d, IF EXISTS guard@%d; want all present in that order", file, timeout, table, lock, guard)
+		}
+		if strings.Contains(down, "count(*)") {
+			t.Errorf("%s Down still counts rows instead of IF EXISTS", file)
+		}
+	}
+}
+
+// TestModelProviderDownLockSerializesWithAWriterLiveDB: the 00471 Down started while another session
+// holds an uncommitted bound-run insert waits for it (the table lock), then sees the committed row
+// and refuses. Without the lock the guard reads its snapshot, passes, and the column drop destroys
+// the binding the writer just committed.
+func TestModelProviderDownLockSerializesWithAWriterLiveDB(t *testing.T) {
+	ctx, dsn := standIsolatedDB(t, "model_provider_down_lock_")
+	if err := store.Migrate(ctx, dsn); err != nil {
+		t.Fatal(err)
+	}
+	pool, err := store.OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	user, provider, conn, repo, worker := uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	mustExec(ctx, t, pool, "INSERT INTO users(id,email,password_hash) VALUES($1,$2,'x')", user, user.String()+"@example.com")
+	mustExec(ctx, t, pool, "INSERT INTO model_providers(id,owner_user_id,name,engine,current_revision) VALUES($1,$2,'p','claude',1)", provider, user)
+	mustExec(ctx, t, pool, `INSERT INTO forge_connections(id,user_id,forge_type,base_url,bot_username,bot_forge_user_id,token_ciphertext)
+ VALUES($1,$2,'github','https://example.com','bot',1,'x')`, conn, user)
+	mustExec(ctx, t, pool, `INSERT INTO repos(id,connection_id,forge_project_id,path_with_namespace,web_url,default_branch)
+ VALUES($1,$2,1,'example/down','https://example.com/down','main')`, repo, conn)
+	mustExec(ctx, t, pool, "INSERT INTO workers(id,user_id,name,token_hash,status) VALUES($1,$2,$3,$4,'online')", worker, user, worker.String(), worker[:])
+
+	b, err := os.ReadFile(filepath.Join("migrations", "00471_runs_model_provider_binding.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, down, _ := strings.Cut(string(b), "-- +goose Down")
+
+	writer, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = writer.Rollback(ctx) }()
+	if _, err := writer.Exec(ctx, `INSERT INTO runs(id,user_id,repo_id,worker_id,kind,issue_iid,issue_title,issue_description,status,claim_generation,
+ model_provider_id,model_provider_revision,model_provider_key_mode,model_provider_key_secret_id,model_provider_key_rev)
+ VALUES($1,$2,$3,$4,'issue',1,'t','d','queued',0,$5,1,'user_key',$6,0)`, uuid.New(), user, repo, worker, provider, uuid.New()); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			done <- err
+			return
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		_, err = tx.Exec(ctx, down)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("the Down finished (%v) while a bound-run insert was uncommitted; it must wait for the table lock", err)
+	case <-time.After(500 * time.Millisecond):
+	}
+	if err := writer.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "refusing to roll back 00471") {
+			t.Fatalf("Down after the writer committed: %v, want the refusal", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the Down never finished after the writer committed")
+	}
+}
 
 // TestModelProviderDownGuardsLiveDB: rolling back 00469 refuses while any user has a Claude provider
 // source selected, and rolling back 00471 refuses while any run is bound to a provider (the 00198 /

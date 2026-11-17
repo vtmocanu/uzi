@@ -179,6 +179,7 @@ SELECT r.provider_id, r.revision, r.protocol, r.base_url, r.auth_style, r.model_
 FROM model_provider_revisions r
 JOIN model_providers p ON p.id = r.provider_id
 WHERE r.provider_id = $1 AND r.revision = $2 AND p.owner_user_id = $3
+FOR KEY SHARE OF r
 `
 
 type GetModelProviderRevisionForOwnerParams struct {
@@ -197,7 +198,9 @@ type GetModelProviderRevisionForOwnerRow struct {
 }
 
 // A frozen revision of an owner's provider (inherited creation re-checks the URL against the
-// allowlist). Owner-scoped.
+// allowlist). Owner-scoped. FOR KEY SHARE OF r pins the revision row for the successor's
+// transaction, so the revision-prune delete (which takes the row's key lock) cannot remove a
+// revision between this re-check and the successor's insert.
 func (q *Queries) GetModelProviderRevisionForOwner(ctx context.Context, arg GetModelProviderRevisionForOwnerParams) (GetModelProviderRevisionForOwnerRow, error) {
 	row := q.db.QueryRow(ctx, getModelProviderRevisionForOwner, arg.ProviderID, arg.Revision, arg.OwnerUserID)
 	var i GetModelProviderRevisionForOwnerRow

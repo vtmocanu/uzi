@@ -85,12 +85,12 @@ var (
 
 // refuseOverrideForProviderOwner refuses a vendor credential override when the owner selected a
 // Claude provider source (usable or not): the create is a provider run or refuses outright, never
-// a vendor run carrying an override. q is asserted for the source read; a surface without it (a unit
-// fake) has no provider source to protect.
+// a vendor run carrying an override. q is asserted for the source read; a surface that cannot read
+// the source fails closed (an error, never nil), so an override never rides an unchecked owner.
 func refuseOverrideForProviderOwner(ctx context.Context, q any, userID uuid.UUID) error {
 	r, ok := q.(providerSourceReader)
 	if !ok {
-		return nil
+		return errors.New("credential override: the query surface cannot read the provider source")
 	}
 	row, err := r.GetUserClaudeProviderSource(ctx, userID)
 	if err != nil {

@@ -25,15 +25,15 @@ CREATE UNIQUE INDEX user_secrets_one_provider_key
 
 -- +goose Down
 SET LOCAL lock_timeout = '5s';
--- Refuse rather than silently destroy sealed credential material (the 00198 convention).
+-- Refuse rather than silently destroy sealed credential material (the 00198 convention). The table
+-- is locked BEFORE the guard so a key inserted concurrently cannot slip in between the check and the
+-- column drop (SHARE ROW EXCLUSIVE blocks writers).
+LOCK TABLE user_secrets IN SHARE ROW EXCLUSIVE MODE;
 -- +goose StatementBegin
 DO $$
-DECLARE
-    n bigint;
 BEGIN
-    SELECT count(*) INTO n FROM user_secrets WHERE kind = 'anthropic_compatible_key';
-    IF n > 0 THEN
-        RAISE EXCEPTION 'refusing to roll back 00467: % provider key row(s) (anthropic_compatible_key) still exist; delete them explicitly before downgrading', n;
+    IF EXISTS (SELECT 1 FROM user_secrets WHERE kind = 'anthropic_compatible_key') THEN
+        RAISE EXCEPTION 'refusing to roll back 00467: provider key row(s) (anthropic_compatible_key) still exist; delete them explicitly before downgrading';
     END IF;
 END
 $$;

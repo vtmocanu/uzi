@@ -307,7 +307,9 @@ type EffectiveCredentialSource =
 type EffectiveRefusal =
   | "no_credential_for_harness" | "no_usable_credential" | "credential_disabled" | "credential_not_found"
   | "credential_override_harness_unsupported" | "credential_override_invalid"
-  | "model_incompatible_with_harness" | "provider_source_unusable";
+  | "model_incompatible_with_harness" | "provider_source_unusable"
+  | "provider_lane_unsupported" | "provider_model_unmapped" | "provider_binding_stale"
+  | "provider_destination_not_allowed" | "credential_override_provider_source";
 type EffectiveRefusalDetail = "credential_disabled" | "codex_pool_unavailable";
 type EffectiveModelSetting = "worker_model" | "judge_model" | "summary_model" | "task_review_model" | "cross_check_plan" | "cross_check_code";
 type EffectiveEffortSetting = "worker_effort" | "task_review_effort" | "cross_check_plan" | "cross_check_code";
@@ -433,7 +435,10 @@ export interface StartPreview {
 
 /** PRD #3254 M3: the schedule preview's refusals, the start-preview set plus the save-step
  *  (invalid_model, credential_override_lane_not_switchable) and fire-step (codex_override_conflict,
- *  codex_pool_unavailable) ones, mirroring handler/effective_settings_schedule.go and the
+ *  codex_pool_unavailable) ones; the PRD #4320 provider refusals (provider_source_unusable,
+ *  provider_lane_unsupported, provider_model_unmapped, provider_binding_stale,
+ *  provider_destination_not_allowed, credential_override_provider_source) are in EffectiveRefusal
+ *  and so in this union too. It mirrors handler/effective_settings_schedule.go and the
  *  scheduler's skip reasons it maps. */
 type ScheduleRefusal =
   | EffectiveRefusal | "invalid_model" | "credential_override_lane_not_switchable"

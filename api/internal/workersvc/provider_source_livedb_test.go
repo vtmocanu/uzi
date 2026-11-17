@@ -911,6 +911,58 @@ func TestProviderModelMapRefusesUnmappedModelsLiveDB(t *testing.T) {
 	}
 }
 
+// TestProviderModelCheckMirrorsClaimTimeLeadLiveDB: the creation check maps the lead the claim would
+// run, not the raw stored values. A Codex role token in the Claude lane and an incompatible frozen
+// model are dropped at the claim (the CLI default, the sonnet alias, runs), so they must not refuse
+// creation; the prediction names the same lead; a template the run excludes is not checked.
+func TestProviderModelCheckMirrorsClaimTimeLeadLiveDB(t *testing.T) {
+	fx := newProvFix(t)
+	fx.addProvider(pvDefaultMap, true)
+
+	// A Codex role token in the Claude lane: dropped at the claim, so creation succeeds and the
+	// prediction (which runs the same resolver) ships no lane model either.
+	fx.lane("default_claude_model", "gpt-6-sol")
+	if pred := fx.predictLead(HarnessClaude, false); pred.ClaimModel != nil {
+		t.Fatalf("prediction ships lead %q, want none (the Codex token is dropped at the claim)", *pred.ClaimModel)
+	}
+	if _, _, err := fx.svc.createRunAtomic(fx.env.ctx, fx.userID, nil, fx.insertAt(nil), harnessCreationOrigin{}); err != nil {
+		t.Fatalf("a Codex role token in the Claude lane refused creation: %v", err)
+	}
+
+	// An incompatible frozen model (a schedule pin the Claude harness cannot run) is dropped too.
+	pin := "gpt-6-sol"
+	if _, _, err := fx.svc.createRunAtomic(fx.env.ctx, fx.userID, nil, fx.insertAt(&pin), harnessCreationOrigin{}); err != nil {
+		t.Fatalf("an incompatible frozen model refused creation: %v", err)
+	}
+	// ... while a compatible frozen model that the map lacks still refuses.
+	unmapped := "claude-opus-4-1"
+	if _, _, err := fx.svc.createRunAtomic(fx.env.ctx, fx.userID, nil, fx.insertAt(&unmapped), harnessCreationOrigin{}); !errors.Is(err, ErrProviderModelUnmapped) {
+		t.Fatalf("an unmapped compatible frozen model: err = %v, want provider_model_unmapped", err)
+	}
+
+	// A template whose model is unmapped refuses, unless the run excludes it.
+	fx.lane("default_claude_model", "")
+	fx.template("reviewer-x", "fable", "")
+	if _, err := fx.create(nil, nil); !errors.Is(err, ErrProviderModelUnmapped) {
+		t.Fatalf("an unmapped template: err = %v, want provider_model_unmapped", err)
+	}
+	fx.iid++
+	iid := fx.iid
+	excluding := func(q *store.Queries, r resolvedHarness) (store.Run, error) {
+		b := bindingOf(r)
+		return q.CreateRun(fx.env.ctx, store.CreateRunParams{
+			UserID: fx.userID, RepoID: fx.repoID, IssueIid: pgtype.Int8{Int64: iid, Valid: true},
+			IssueTitle: "provider", IssueDescription: "d", PlanSource: planSourceAgent, TriggerSource: "manual",
+			Harness: string(r.Harness), AgentExclusions: []byte(`["reviewer-x"]`),
+			ModelProviderID: b.ProviderID, ModelProviderRevision: b.Revision, ModelProviderKeyMode: b.KeyMode,
+			ModelProviderKeySecretID: b.KeySecret, ModelProviderKeyRev: b.KeyRev,
+		})
+	}
+	if _, _, err := fx.svc.createRunAtomic(fx.env.ctx, fx.userID, nil, excluding, harnessCreationOrigin{}); err != nil {
+		t.Fatalf("an excluded unmapped template refused creation: %v", err)
+	}
+}
+
 // TestProviderModelCheckAppliesToSuccessorsAndChatLiveDB: the frozen map decides at a successor's
 // and a chat's creation too.
 func TestProviderModelCheckAppliesToSuccessorsAndChatLiveDB(t *testing.T) {
@@ -975,6 +1027,27 @@ func TestProviderOwnerGetsNoJudgeLiveDB(t *testing.T) {
 	judge.maybeEnqueueJudge(fx.env.ctx, mustRun(t, fx.env, vendor.ID))
 	if _, _, ok := judgeForTarget(t, fx.env, vendor.ID); !ok {
 		t.Fatal("control: with no provider source the vendor run is judged as before")
+	}
+}
+
+// TestProviderOwnerJudgeSkipIsVisibleLiveDB (PRD #1429 D4: a derived run that is not created needs a
+// visible reason): the automatic judge refused for a provider-sourced owner records the
+// provider_lane_unsupported skip, for a usable and an unusable source, and for an owner with no
+// Anthropic token at all (which must not read as a missing vendor credential).
+func TestProviderOwnerJudgeSkipIsVisibleLiveDB(t *testing.T) {
+	fx := newProvFix(t)
+	fx.addProvider(pvDefaultMap, true) // a provider-only owner: no Anthropic token
+	judge := judgeEnqueueSvc(fx.env, fx.userID)
+	judge.p.ProviderAllowedBaseURLs = fx.svc.p.ProviderAllowedBaseURLs
+
+	for i, retire := range []bool{false, true} {
+		if retire {
+			fx.env.exec(`UPDATE model_providers SET retired_at = now() WHERE id = $1`, fx.provider)
+		}
+		target := seedJudgeTarget(t, fx.env, fx.userID, fx.repoID, "claude", int64(9701+i))
+		judge.maybeEnqueueJudge(fx.env.ctx, target)
+		noJudgeAnywhere(t, fx.env, target.ID, "provider-sourced owner")
+		wantSkip(t, fx.env, target.ID, "claude", JudgeSkipProviderLaneUnsupported)
 	}
 }
 

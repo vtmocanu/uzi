@@ -287,10 +287,15 @@ func skipReasonForErr(err error) (SkipReason, bool) {
 // until the owner enables the credential or changes the pin. process() also runs the same check
 // before firing (RunCreator.ScheduleCredentialDisabled), so a held row spends no forge call per
 // tick. A recurring row keeps the benign skip and advances.
+//
+// provider_source_unusable (PRD #4320) is the same class: the owner's Claude provider source is
+// retired, off the allowlist or has a missing or disabled key, which only the owner can fix, so a
+// one-time row is held rather than consumed. That reason is not covered by the pre-fire check, so
+// the hold happens after the fire attempt (a forge read per tick until the owner repairs it).
 func holdsOnceCredentialDisabled(sched store.RunSchedule, err error) bool {
 	if sched.Timing != "once" {
 		return false
 	}
 	reason, ok := skipReasonForErr(err)
-	return ok && (reason == SkipCredentialDisabled || reason == SkipCodexPoolUnavailable)
+	return ok && (reason == SkipCredentialDisabled || reason == SkipCodexPoolUnavailable || reason == SkipProviderSourceUnusable)
 }

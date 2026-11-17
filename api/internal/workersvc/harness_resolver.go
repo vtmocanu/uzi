@@ -733,7 +733,7 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 				return store.Run{}, resolvedHarness{}, err
 			}
 		}
-		res, err := s.resolveRunHarnessMode(ctx, userID, explicit, rq, inherit != nil)
+		res, err := s.resolveRunHarnessMode(ctx, userID, explicit, rq, inherit != nil || origin.RefuseProviderOwner)
 		if err != nil {
 			return store.Run{}, resolvedHarness{}, err
 		}
@@ -795,7 +795,11 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 	}
 	// A successor of a vendor run resolves vendor credentials as today, WITHOUT the owner's
 	// provider source (vendorOnly): the source run's lineage, not the owner's setting, decides.
-	vendorOnly := inherit != nil
+	// A refused lane (judge, job, cross-check) does the same: the guard above already found no source,
+	// and a lane insert stamps no binding, so a second source read here could only see a source
+	// selected in between and then fail the binding assertion as an internal mismatch. The lane
+	// instead orders just before that selection (the source read above holds no secret lock).
+	vendorOnly := inherit != nil || origin.RefuseProviderOwner
 	resolve := func() (resolvedHarness, error) {
 		return s.resolveRunHarnessMode(ctx, userID, explicit, qtx, vendorOnly)
 	}

@@ -167,11 +167,14 @@ WHERE id = $1 AND user_id = $2;
 
 -- name: GetModelProviderRevisionForOwner :one
 -- A frozen revision of an owner's provider (inherited creation re-checks the URL against the
--- allowlist). Owner-scoped.
+-- allowlist). Owner-scoped. FOR KEY SHARE OF r pins the revision row for the successor's
+-- transaction, so the revision-prune delete (which takes the row's key lock) cannot remove a
+-- revision between this re-check and the successor's insert.
 SELECT r.provider_id, r.revision, r.protocol, r.base_url, r.auth_style, r.model_map
 FROM model_provider_revisions r
 JOIN model_providers p ON p.id = r.provider_id
-WHERE r.provider_id = $1 AND r.revision = $2 AND p.owner_user_id = $3;
+WHERE r.provider_id = $1 AND r.revision = $2 AND p.owner_user_id = $3
+FOR KEY SHARE OF r;
 
 -- name: SetUserClaudeProviderSource :one
 -- Sets or clears (NULL) the owner's Claude provider source. The CASE/narg shape of

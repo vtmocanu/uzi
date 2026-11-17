@@ -30,15 +30,16 @@ ALTER TABLE runs ADD CONSTRAINT runs_model_provider_exclusive_check
 -- +goose Down
 SET LOCAL lock_timeout = '5s';
 -- Refuse rather than silently drop a bound run's frozen provider binding (the 00198 convention):
--- the run would read back as a vendor run.
+-- the run would read back as a vendor run. The table is locked BEFORE the guard so a binding
+-- created concurrently cannot land between the check and the column drop (SHARE ROW EXCLUSIVE blocks
+-- writers). The guard seq-scans runs: 00473's Down has already dropped idx_runs_model_provider by the
+-- time this runs (Downs run in reverse), so no index serves the check; a one-off downgrade can pay it.
+LOCK TABLE runs IN SHARE ROW EXCLUSIVE MODE;
 -- +goose StatementBegin
 DO $$
-DECLARE
-    n bigint;
 BEGIN
-    SELECT count(*) INTO n FROM runs WHERE model_provider_id IS NOT NULL;
-    IF n > 0 THEN
-        RAISE EXCEPTION 'refusing to roll back 00471: % run(s) are still bound to a model provider; delete them explicitly before downgrading', n;
+    IF EXISTS (SELECT 1 FROM runs WHERE model_provider_id IS NOT NULL) THEN
+        RAISE EXCEPTION 'refusing to roll back 00471: run(s) are still bound to a model provider; delete them explicitly before downgrading';
     END IF;
 END
 $$;

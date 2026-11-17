@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/leadcfg"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/providers"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
@@ -368,26 +369,32 @@ func modelMapped(m providers.ModelMap, model string) bool {
 
 // checkProviderModels refuses (provider_model_unmapped) a creation whose lead model, or any enabled
 // agent template's own model, would not resolve through the bound map. The lead model is the one
-// claim assembly resolves for a Claude run: the run's frozen model (run override or schedule pin)
-// else the owner's Claude lane default, else the CLI default (the sonnet alias). Templates with no
-// model inherit the lead's. Models that only exist at spawn (summary, classifier, advice, later
-// agent selection) are checked at their spawn (PRD module 7; worker-side, not here).
+// claim assembly resolves for a Claude run, through the same resolveLeadSettings the claim calls: a
+// compatible frozen model (run override or schedule pin) wins, else the owner's Claude lane default
+// (a Codex role token there, or an incompatible frozen model, is dropped exactly as at the claim),
+// else the CLI default (the sonnet alias). Templates with no model inherit the lead's, and a template
+// the run's agent exclusions drop is not checked. Repo-sourced agents are only known after the
+// worker detects the repo roster, and models that only exist at spawn (summary, classifier, advice,
+// later agent selection) are checked at their spawn (PRD module 7; worker-side, not here).
 func (s *Service) checkProviderModels(ctx context.Context, q *store.Queries, run store.Run, src providerSource) error {
-	lead := ""
-	leadFrom := "run"
-	if run.Model.Valid && strings.TrimSpace(run.Model.String) != "" {
-		lead = run.Model.String
-	} else {
-		lanes, err := q.GetUserHarnessModelDefaults(ctx, run.UserID)
-		if err != nil {
-			return fmt.Errorf("provider model check: user defaults: %w", err)
-		}
-		if lanes.DefaultClaudeModel.Valid {
-			lead = lanes.DefaultClaudeModel.String
-		}
-		leadFrom = "user default"
+	lanes, err := q.GetUserHarnessModelDefaults(ctx, run.UserID)
+	if err != nil {
+		return fmt.Errorf("provider model check: user defaults: %w", err)
 	}
-	if !modelMapped(src.ModelMap, lead) {
+	settings := resolveLeadSettings(LeadSettingsInput{
+		Harness:        HarnessClaude,
+		RunModel:       run.Model,
+		RunModelSource: run.ModelSource,
+		LaneModel:      lanes.DefaultClaudeModel,
+	})
+	lead, leadFrom := settings.Model.String, "user default"
+	switch settings.ModelSource {
+	case leadcfg.ModelSourceRunOverride, leadcfg.ModelSourceSchedulePin:
+		leadFrom = "run"
+	}
+	// An unhonorable run override is refused where the model is validated at create (and parks the
+	// claim otherwise); it has no resolved lead to map.
+	if settings.Unhonorable == nil && !modelMapped(src.ModelMap, lead) {
 		name := strings.TrimSpace(lead)
 		if name == "" {
 			name = providerDefaultModelAlias
@@ -402,8 +409,14 @@ func (s *Service) checkProviderModels(ctx context.Context, q *store.Queries, run
 	if err != nil {
 		return fmt.Errorf("provider model check: templates: %w", err)
 	}
+	excluded := map[string]bool{}
+	if names, derr := DecodeExclusions(run.AgentExclusions); derr == nil {
+		for _, n := range names {
+			excluded[n] = true
+		}
+	}
 	for _, t := range tmpls {
-		if !t.Model.Valid || strings.TrimSpace(t.Model.String) == "" {
+		if !t.Model.Valid || strings.TrimSpace(t.Model.String) == "" || excluded[t.Name] {
 			continue
 		}
 		if !modelMapped(src.ModelMap, t.Model.String) {

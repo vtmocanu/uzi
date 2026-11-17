@@ -56,6 +56,9 @@ const (
 	refusalOverrideInvalid        = "credential_override_invalid"
 	refusalModelIncompatible      = "model_incompatible_with_harness"
 	refusalProviderSourceUnusable = "provider_source_unusable"
+	// refusalOverrideProviderSource is a credential override refused because the owner's Claude
+	// source is a model provider (PRD #4320 D8).
+	refusalOverrideProviderSource = "credential_override_provider_source"
 	detailCredentialDisabled      = "credential_disabled" //nolint:gosec // G101: refusal-reason token, not a secret
 )
 
@@ -97,6 +100,9 @@ func startRefusal(err error) (refusal, bool) {
 		return refusal{Token: refusalCredentialDisabled}, true
 	case errors.Is(err, workersvc.ErrCredentialOverrideSecretNotFound):
 		return refusal{Token: refusalCredentialNotFound}, true
+	case errors.Is(err, workersvc.ErrCredentialOverrideProviderSource):
+		// Checked before the Codex arm below, which this sentinel wraps.
+		return refusal{Token: refusalOverrideProviderSource}, true
 	case errors.Is(err, workersvc.ErrCredentialOverrideHarnessUnsupported):
 		return refusal{Token: refusalOverrideUnsupported}, true
 	case errors.Is(err, workersvc.ErrCredentialOverridePinnedNeedsSecret),

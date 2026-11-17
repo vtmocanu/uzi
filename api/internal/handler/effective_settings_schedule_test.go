@@ -107,6 +107,13 @@ func TestScheduleFireRefusalMapsThroughSkipReasons(t *testing.T) {
 		{workersvc.ErrCredentialOverrideHarnessUnsupported, "codex_override_conflict"},
 		{fmt.Errorf("wrapped: %w", workersvc.ErrCodexPoolUnavailable), "codex_pool_unavailable"},
 		{workersvc.ErrNoCredentialForHarness, "no_credential_for_harness"},
+		// PRD #4320 M4: each provider refusal is its own token, never a failure (a 500 preview).
+		{&workersvc.ProviderSourceUnusableError{Reason: workersvc.SourceUnusableRetired}, "provider_source_unusable"},
+		{fmt.Errorf("wrapped: %w", workersvc.ErrProviderLaneUnsupported), "provider_lane_unsupported"},
+		{workersvc.ErrProviderModelUnmapped, "provider_model_unmapped"},
+		{workersvc.ErrProviderBindingStale, "provider_binding_stale"},
+		{workersvc.ErrProviderDestinationNotAllowed, "provider_destination_not_allowed"},
+		{workersvc.ErrCredentialOverrideProviderSource, "credential_override_provider_source"},
 	} {
 		got, ok := scheduleFireRefusal(tc.err)
 		if !ok || got.Token != tc.want || got.Detail != "" {
@@ -132,6 +139,8 @@ func TestScheduleSaveRefusalMapsTheValidatorSentinels(t *testing.T) {
 		{workersvc.ErrCredentialOverridePinnedNeedsSecret, "credential_override_invalid"},
 		{workersvc.ErrCredentialOverrideInvalidMode, "credential_override_invalid"},
 		{workersvc.ErrCredentialDisabled, "credential_disabled"},
+		// The provider sentinel wraps the Codex one and must not take its token.
+		{workersvc.ErrCredentialOverrideProviderSource, "credential_override_provider_source"},
 	} {
 		if got, ok := scheduleSaveRefusal(tc.err); !ok || got.Token != tc.want {
 			t.Errorf("scheduleSaveRefusal(%v) = %+v, %v; want %q", tc.err, got, ok, tc.want)

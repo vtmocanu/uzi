@@ -44,14 +44,14 @@ CREATE TABLE model_provider_probe_results (
 -- +goose Down
 SET LOCAL lock_timeout = '5s';
 -- Refuse rather than silently destroy providers, revisions and their keys (the 00198 convention).
+-- The table is locked BEFORE the guard so a concurrent insert cannot land between the check and
+-- the DROP (SHARE ROW EXCLUSIVE blocks writers, and a second Down).
+LOCK TABLE model_providers IN SHARE ROW EXCLUSIVE MODE;
 -- +goose StatementBegin
 DO $$
-DECLARE
-    n bigint;
 BEGIN
-    SELECT count(*) INTO n FROM model_providers;
-    IF n > 0 THEN
-        RAISE EXCEPTION 'refusing to roll back 00466: % model provider row(s) still exist; delete them explicitly before downgrading', n;
+    IF EXISTS (SELECT 1 FROM model_providers) THEN
+        RAISE EXCEPTION 'refusing to roll back 00466: model provider row(s) still exist; delete them explicitly before downgrading';
     END IF;
 END
 $$;

@@ -277,9 +277,21 @@ func TestScheduleGetCIEpisodeStates(t *testing.T) {
 	}
 }
 
+// TestSkipReasonLabelsCoverEverySkipReason pins that EVERY server-side skip reason
+// (schedsvc.AllSkipReasons) renders a human label rather than falling back to the raw wire
+// string, so a new reason added without a CLI label fails.
+func TestSkipReasonLabelsCoverEverySkipReason(t *testing.T) {
+	for _, r := range schedsvc.AllSkipReasons {
+		s := string(r)
+		if got := skipReasonLabel(s); got == "" || got == s {
+			t.Errorf("skip reason %q has no CLI label (renders %q)", s, got)
+		}
+	}
+}
+
 // TestSkipReasonLabelsCoverEveryCIReason pins that every server-side ci_* skip reason
-// (schedsvc.AllSkipReasons) plus no_default_branch renders a human label rather than
-// falling back to the raw wire string, so a new reason added without a CLI label fails.
+// (schedsvc.AllSkipReasons) plus no_default_branch renders a human label, and that the
+// ci_* set did not shrink below the PRD #2865 eleven.
 func TestSkipReasonLabelsCoverEveryCIReason(t *testing.T) {
 	n := 0
 	for _, r := range schedsvc.AllSkipReasons {

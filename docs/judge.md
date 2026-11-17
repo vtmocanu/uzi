@@ -407,7 +407,9 @@ active — populated alongside a non-null `review` in that re-judge case.
 A third sibling, `skip`, is `{"harness": "claude"|"codex", "reason": …, "at": …}`
 or `null`. It is non-null only when the run has no review and no pending judge,
 so it never appears next to either of them; `reason` is one of
-`no_usable_credential`, `credential_disabled` or `codex_pool_unavailable`. Without
+`no_usable_credential`, `credential_disabled`, `codex_pool_unavailable` or
+`provider_lane_unsupported` (your Claude source is a model provider, which the
+judge does not support yet). Without
 `--json`, a skipped run prints a line such as `run <id>: Judge skipped
 2026-11-12: Codex had no usable credential.` in place of "not judged".
 
