@@ -18,6 +18,12 @@ import { Alert, Button, Card, Field, SectionTitle, Select, Toggle } from "./ui";
 import { DEFAULT_WORKER_TEMPLATE, WORKER_TEMPLATES } from "../lib/workerTemplates";
 import { DEFAULT_WORKER_SIZE, WORKER_SIZES, sizeOptionLabel } from "../lib/workerSizes";
 
+// The size the form starts at: the admin's default when it names a known preset, else the
+// built-in default. An older API omits the field; a newer one may ship a name this build lacks.
+function effectiveDefaultSize(configured: string | undefined): string {
+  return (WORKER_SIZES as readonly string[]).includes(configured ?? "") ? (configured as string) : DEFAULT_WORKER_SIZE;
+}
+
 export function HostedWorkers({
   hostedCount,
   onProvisioned,
@@ -51,6 +57,9 @@ export function HostedWorkers({
   const [config, setConfig] = useState<HostedConfig | null>(null);
   const [template, setTemplate] = useState<string>(DEFAULT_WORKER_TEMPLATE);
   const [size, setSize] = useState<string>(DEFAULT_WORKER_SIZE);
+  // The admin's default size (HostedConfig.default_size) is applied when the config
+  // arrives. The form renders nothing until then, so the user cannot have picked a size yet.
+  const defaultSize = effectiveDefaultSize(config?.default_size);
   // Opt into a Docker-in-Docker sidecar (PRD #83 M3). Off by default: the
   // plain worker is the common case, docker is the extra one you ask for.
   const [docker, setDocker] = useState(false);
@@ -89,7 +98,10 @@ export function HostedWorkers({
     api
       .hostedConfig()
       .then((cfg) => {
-        if (live) setConfig(cfg);
+        if (live) {
+          setConfig(cfg);
+          setSize(effectiveDefaultSize(cfg.default_size));
+        }
         // manual = enabled AND self-service quota left; anything else is { manual: false }.
         reportAvailability(!!cfg.enabled && cfg.quota > 0);
       })
@@ -112,7 +124,7 @@ export function HostedWorkers({
       // never in that path (Decision 3). Success is: the row shows up in the list.
       const { worker } = await api.provisionHostedWorker(template, size, docker);
       setTemplate(DEFAULT_WORKER_TEMPLATE);
-      setSize(DEFAULT_WORKER_SIZE);
+      setSize(defaultSize);
       setDocker(false);
       // The page announces it, naming the worker the SERVER created (it derives a name
       // from template + size when the form sends none, and naming the row is how the
@@ -260,7 +272,7 @@ export function HostedWorkers({
             It shows up under <strong>Your workers</strong> and you delete it there.{" "}
             <em>Docker-capable</em> gives it a Docker daemon for container builds and tests,
             at extra CPU and storage. A Docker-capable worker can pick up repo runs only when an
-            admin has added the repo to the Docker worker repo allowlist under Admin → Instance.
+            admin has added the repo to the Docker worker repo allowlist under Admin → Workers.
             Runs on other repos need another eligible worker.
           </p>
         </>

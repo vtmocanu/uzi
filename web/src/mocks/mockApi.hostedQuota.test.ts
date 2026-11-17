@@ -51,3 +51,45 @@ describe("mock hosted worker quota", () => {
     expect((await next.getSettings()).settings).toMatchObject({ hosted_worker_quota: "2", uzi_label: "uzi" });
   });
 });
+
+describe("mock worker size, cap and lease settings (PRD #4212)", () => {
+  it("seeds the defaults with source default, then saves, reports db and resets", async () => {
+    const api = await reload();
+    const first = await api.getSettings();
+    expect(first.settings).toMatchObject({ ephemeral_max_per_user: "2", ephemeral_default_size: "m", hosted_default_size: "l", ephemeral_lease: "2h" });
+    expect(first.sources.hosted_default_size).toBe("default");
+    const saved = await api.updateSettings({ hosted_default_size: "s", ephemeral_lease: "30m" });
+    expect(saved.settings).toMatchObject({ hosted_default_size: "s", ephemeral_lease: "30m" });
+    expect(saved.sources.hosted_default_size).toBe("db");
+    expect(await api.hostedConfig()).toMatchObject({ default_size: "s" });
+    const reset = await api.updateSettings({ hosted_default_size: "" });
+    expect(reset.settings.hosted_default_size).toBe("l");
+    expect(reset.sources.hosted_default_size).toBe("default");
+    expect(await api.hostedConfig()).toMatchObject({ default_size: "l" });
+  });
+
+  it.each([
+    ["ephemeral_max_per_user", "5", "2"],
+    ["ephemeral_default_size", "s", "m"],
+    ["hosted_default_size", "s", "l"],
+    ["ephemeral_lease", "30m", "2h"],
+  ])("a whitespace-only %s resets it to the default like the server", async (key, saved, def) => {
+    const api = await reload();
+    await api.updateSettings({ [key]: saved });
+    const reset = await api.updateSettings({ [key]: "   " });
+    expect((reset.settings as unknown as Record<string, string>)[key]).toBe(def);
+    expect(reset.sources[key]).toBe("default");
+  });
+
+  it.each([
+    ["ephemeral_max_per_user", "21"],
+    ["ephemeral_max_per_user", "abc"],
+    ["ephemeral_default_size", "xl"],
+    ["hosted_default_size", "M"],
+    ["ephemeral_lease", "3h"],
+    ["ephemeral_lease", "abc"],
+  ])("refuses %s=%j", async (key, value) => {
+    const api = await reload();
+    await expect(api.updateSettings({ [key]: value })).rejects.toMatchObject({ status: 400 });
+  });
+});

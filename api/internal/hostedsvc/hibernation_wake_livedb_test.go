@@ -2,6 +2,7 @@ package hostedsvc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"sync/atomic"
@@ -19,12 +20,25 @@ import (
 // PRD #4205 M5: the demand-wake pass and its suppression of ephemeral provisioning, over a real
 // database. Skipped without UZI_TEST_DATABASE_URL; run via ./e2e/run-store-it.sh.
 
-type wakeSettings struct{ ephemeralOn bool }
+// wakeSettings is the settings view of a wake test; lease is settable per test through wakeEnv.settings.
+type wakeSettings struct {
+	ephemeralOn bool
+	lease       time.Duration
+	leaseErr    error // when set, the lease read fails (a settings read error)
+}
 
-func (s wakeSettings) EphemeralWorkersEnabled(context.Context) (bool, error) {
+func (s *wakeSettings) EphemeralWorkersEnabled(context.Context) (bool, error) {
 	return s.ephemeralOn, nil
 }
-func (wakeSettings) DockerRepoAllowlist(context.Context) ([]uuid.UUID, error) {
+
+// The cap, size and lease the provisioner and the waker read per pass (PRD #4212); they replaced the
+// EphemeralConfig MaxPerUser and DefaultSize fields and the zero Lease these tests ran with.
+func (*wakeSettings) EphemeralMaxPerUser(context.Context) (int, error)     { return 5, nil }
+func (*wakeSettings) EphemeralDefaultSize(context.Context) (string, error) { return "m", nil }
+func (s *wakeSettings) EphemeralLease(context.Context) (time.Duration, error) {
+	return s.lease, s.leaseErr
+}
+func (*wakeSettings) DockerRepoAllowlist(context.Context) ([]uuid.UUID, error) {
 	return []uuid.UUID{}, nil
 }
 
@@ -33,15 +47,16 @@ type hibSettingsOff struct{}
 func (hibSettingsOff) WorkerHibernationEnabled(context.Context) (bool, error) { return false, nil }
 
 type wakeEnv struct {
-	t     *testing.T
-	ctx   context.Context
-	pool  *pgxpool.Pool
-	q     *store.Queries
-	svc   *workersvc.Service
-	waker *HibernationWaker
-	prov  *EphemeralProvisioner
-	user  uuid.UUID
-	repo  uuid.UUID
+	t        *testing.T
+	ctx      context.Context
+	pool     *pgxpool.Pool
+	q        *store.Queries
+	svc      *workersvc.Service
+	waker    *HibernationWaker
+	settings *wakeSettings
+	prov     *EphemeralProvisioner
+	user     uuid.UUID
+	repo     uuid.UUID
 }
 
 var wakeIID atomic.Int64
@@ -76,22 +91,21 @@ func newWakeEnv(t *testing.T, ephemeralOn bool) *wakeEnv {
 	e.exec(`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
 	        VALUES ($1, $2, 1, $3, $4, 'main', true)`, e.repo, conn, "g/"+e.repo.String(), "https://forge.e2e/g/"+e.repo.String())
 
+	e.settings = &wakeSettings{ephemeralOn: ephemeralOn}
 	e.svc = workersvc.New(q, box, workersvc.Params{WorkerHeartbeatStale: 45 * time.Second})
 	e.svc.SetTxBeginner(pool)
 	// Both settings are OFF in every test: the wake pass must not depend on either (D7).
 	e.svc.SetHibernationSettings(hibSettingsOff{})
-	e.waker = NewHibernationWaker(q, e.svc, wakeSettings{ephemeralOn: ephemeralOn}, HibernationWakerConfig{
+	e.waker = NewHibernationWaker(q, e.svc, e.settings, HibernationWakerConfig{
 		WorkerAffinityGrace:   2 * time.Minute,
 		WorkerAffinityCeiling: 2 * time.Hour,
 		WorkerHeartbeatStale:  45 * time.Second,
 		BackgroundGrace:       15 * time.Minute,
 	})
-	e.prov = NewEphemeralProvisioner(pool, q, box, wakeSettings{ephemeralOn: ephemeralOn}, EphemeralConfig{
+	e.prov = NewEphemeralProvisioner(pool, q, box, e.settings, EphemeralConfig{
 		WorkerAffinityGrace:   2 * time.Minute,
 		WorkerAffinityCeiling: 2 * time.Hour,
 		BackgroundGrace:       15 * time.Minute,
-		MaxPerUser:            5,
-		DefaultSize:           "m",
 		ProvisionDeadline:     10 * time.Minute,
 	})
 	return e
@@ -470,7 +484,7 @@ func (e *wakeEnv) leasedEphemeral(run uuid.UUID) uuid.UUID {
 func TestHibernationWakePassHonoursTheConfiguredLeaseLiveDB(t *testing.T) {
 	t.Run("a leased ephemeral worker that can take the run through its lease: no sleeper is woken", func(t *testing.T) {
 		e := newWakeEnv(t, false)
-		e.waker.cfg.Lease = time.Hour
+		e.settings.lease = time.Hour
 		sleeper := e.sleeper(nil, nil, time.Hour)
 		run := e.queuedRun()
 		e.leasedEphemeral(run)
@@ -494,4 +508,86 @@ func TestHibernationWakePassHonoursTheConfiguredLeaseLiveDB(t *testing.T) {
 			t.Fatalf("sleeper state = %s, want waking", e.state(sleeper))
 		}
 	})
+}
+
+// wakeRowsFor counts the wake rows recorded for one run.
+func (e *wakeEnv) wakeRowsFor(run uuid.UUID) int {
+	return e.count(`SELECT count(*) FROM hibernation_wakes WHERE run_id = $1`, run)
+}
+
+// leasedEphemeralAged is leasedEphemeral with the lease started `age` ago.
+func (e *wakeEnv) leasedEphemeralAged(run uuid.UUID, age time.Duration) uuid.UUID {
+	e.t.Helper()
+	w := e.leasedEphemeral(run)
+	e.exec(`UPDATE workers SET lease_since = now() - $2::interval WHERE id = $1`, w, fmt.Sprintf("%d seconds", int(age.Seconds())))
+	return w
+}
+
+// PRD #4212: WakePass reads the ephemeral lease on every pass. One waker, one settings object, the
+// lease edited between passes; the waker is never rebuilt.
+func TestHibernationWakePassFollowsLeaseChangeLiveDB(t *testing.T) {
+	e := newWakeEnv(t, false)
+
+	// Run 1: an online ephemeral worker 30 minutes into its lease can take it through the lease
+	// while the lease is longer than that.
+	sleeper1 := e.sleeper(nil, nil, time.Hour)
+	run1 := e.queuedRun()
+	e.leasedEphemeralAged(run1, 30*time.Minute)
+
+	e.settings.lease = 2 * time.Hour
+	if got := e.wake(); got != 0 {
+		t.Fatalf("lease 2h: woke %d, want 0 (the leased worker covers run 1)", got)
+	}
+	if e.state(sleeper1) != "hibernated" || e.wakeRowsFor(run1) != 0 {
+		t.Fatalf("lease 2h: sleeper1=%s wake rows for run 1=%d, want hibernated and none", e.state(sleeper1), e.wakeRowsFor(run1))
+	}
+
+	// Shortened to 10 minutes: the 30-minute-old lease no longer covers run 1, so it is demand.
+	e.settings.lease = 10 * time.Minute
+	if got := e.wake(); got != 1 {
+		t.Fatalf("lease 10m: woke %d, want 1 (the lease expired for run 1)", got)
+	}
+	if e.state(sleeper1) != "waking" || e.wakeRowsFor(run1) != 1 {
+		t.Fatalf("lease 10m: sleeper1=%s wake rows for run 1=%d, want waking and one", e.state(sleeper1), e.wakeRowsFor(run1))
+	}
+
+	// Run 2: covered again once the lease is lengthened, and uncovered when the lease is switched off.
+	sleeper2 := e.sleeper(nil, nil, time.Hour)
+	run2 := e.queuedRun()
+	e.leasedEphemeralAged(run2, 30*time.Minute)
+	e.settings.lease = 2 * time.Hour
+	e.wake()
+	if e.wakeRowsFor(run2) != 0 {
+		t.Fatalf("lease 2h again: run 2 has %d wake rows, want 0", e.wakeRowsFor(run2))
+	}
+	e.settings.lease = 0
+	e.wake()
+	if e.wakeRowsFor(run2) != 1 {
+		t.Fatalf("lease 0: run 2 has %d wake rows, want 1 (a disabled lease covers nothing)", e.wakeRowsFor(run2))
+	}
+	if e.state(sleeper2) != "waking" && e.state(sleeper1) != "waking" {
+		t.Fatal("lease 0: no sleeper is waking for run 2")
+	}
+}
+
+// A failed lease read wakes nothing: the pass returns the error and records no wake, rather than
+// waking on a guessed lease; the same demand wakes once the read works.
+func TestHibernationWakePassLeaseReadErrorWakesNothingLiveDB(t *testing.T) {
+	e := newWakeEnv(t, false)
+	sleeper := e.sleeper(nil, nil, time.Hour)
+	run := e.queuedRun()
+
+	e.settings.leaseErr = errors.New("settings read failed")
+	got, err := e.waker.WakePass(e.ctx)
+	if err == nil {
+		t.Fatal("WakePass = nil error, want the lease read error")
+	}
+	if got != 0 || e.state(sleeper) != "hibernated" || e.wakeRowsFor(run) != 0 {
+		t.Fatalf("after a lease read error: woke=%d sleeper=%s wake rows=%d, want 0, hibernated, 0", got, e.state(sleeper), e.wakeRowsFor(run))
+	}
+
+	e.settings.leaseErr = nil
+	if got := e.wake(); got != 1 || e.state(sleeper) != "waking" || e.wakeRowsFor(run) != 1 {
+		t.Fatalf("control after recovery: woke=%d sleeper=%s wake rows=%d, want 1, waking, 1", got, e.state(sleeper), e.wakeRowsFor(run))
+	}
 }

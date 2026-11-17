@@ -4,7 +4,7 @@
 // (gated by AdminRoute + the admin-only API). Validation mirrors the server
 // (Decision 8) for immediate feedback, but the server stays the source of truth.
 
-import { useLocation } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import {
   api,
@@ -29,7 +29,7 @@ import {
   Skeleton,
 } from "../components/ui";
 import { AdminShell } from "../components/AdminShell";
-import { ADMIN_SETTINGS_ANCHOR_IDS } from "../components/navSections";
+import { ADMIN_SETTINGS_ANCHOR_IDS, ADMIN_WORKERS_ANCHOR_IDS } from "../components/navSections";
 import { DocLink } from "../components/DocLink";
 import { DOC_ADMIN_SETTINGS } from "../lib/doclinks";
 import {
@@ -40,18 +40,12 @@ import {
   DEFAULT_DARK_THEME,
 } from "../lib/theme";
 import { JudgeSettingsCard } from "./adminSettings/JudgeSettingsCard";
-import { CustodyHoldLimitCard } from "./adminSettings/CustodyHoldLimitCard";
-import { HostedWorkerQuotaCard } from "./adminSettings/HostedWorkerQuotaCard";
-import { EphemeralWorkersCard } from "./adminSettings/EphemeralWorkersCard";
-import { WorkerHibernationCard } from "./adminSettings/WorkerHibernationCard";
 import { UpdatesSettingsCard } from "./adminSettings/UpdatesSettingsCard";
 import { MaintenanceCard } from "./adminSettings/MaintenanceCard";
 import { SummarySettingsCard } from "./adminSettings/SummarySettingsCard";
 import { AgentSourceSettingsCard } from "./adminSettings/AgentSourceSettingsCard";
 import { HealthSettingsCard } from "./adminSettings/HealthSettingsCard";
-import { DockerAllowlistCard } from "./adminSettings/DockerAllowlistCard";
 import { TrustedReviewBotsCard } from "./adminSettings/TrustedReviewBotsCard";
-import { CapabilitySchedulingCard } from "./adminSettings/CapabilitySchedulingCard";
 import { CompletionInterlockCard } from "./adminSettings/CompletionInterlockCard";
 import { GithubProjectSyncCard } from "./adminSettings/GithubProjectSyncCard";
 import { FetchCapsCard } from "./adminSettings/FetchCapsCard";
@@ -121,6 +115,7 @@ function resolveDarkDisplay(s: AppSettings): string {
 export function AdminSettings() {
   const { refresh } = useAuth();
   const { hash, key } = useLocation();
+  const navigate = useNavigate();
   const [saved, setSaved] = useState<AppSettings | null>(null);
   // Per-key secret-configured flags and sources (PRD #25), consumed by the Slack
   // card for its "configured ✓" and env-greying behavior.
@@ -211,6 +206,13 @@ export function AdminSettings() {
     [applyResponse],
     { fallback: "Failed to load settings" },
   );
+
+  // The worker-fleet cards moved to Admin → Workers: old bookmarks and links to
+  // /admin/settings#<moved id> are forwarded, on mount and on later hash changes.
+  useEffect(() => {
+    const id = hash.slice(1);
+    if (ADMIN_WORKERS_ANCHOR_IDS.has(id)) navigate(`/admin/workers#${id}`, { replace: true });
+  }, [hash, navigate]);
 
   // Keyed on "loaded", not the `saved` object: every card save replaces `saved`, and a
   // save must not yank the page back to the URL's anchor.
@@ -318,12 +320,7 @@ export function AdminSettings() {
       ? [
           { id: "slack", label: "Slack" },
           { id: "run-health", label: "Run health" },
-          { id: "docker-allowlist", label: "Docker workers" },
           { id: "review-bots", label: "Review bots" },
-          { id: "hosted-worker-quota", label: "Hosted worker quota" },
-          { id: "ephemeral-workers", label: "Ephemeral workers" },
-          { id: "worker-hibernation", label: "Worker hibernation" },
-          { id: "capability-scheduling", label: "Capability scheduling" },
           { id: "completion-interlock", label: "Completion check" },
           { id: "fetch-caps", label: "Research fetch caps" },
         ]
@@ -600,44 +597,8 @@ export function AdminSettings() {
       )}
 
       {!loading && saved && (
-        <section id="docker-allowlist" className="scroll-mt-6">
-          <DockerAllowlistCard settings={saved} sources={sources} onSaved={applyResponse} />
-        </section>
-      )}
-
-      {!loading && saved && (
         <section id="review-bots" className="scroll-mt-6">
           <TrustedReviewBotsCard settings={saved} sources={sources} onSaved={applyResponse} />
-        </section>
-      )}
-
-      {!loading && saved && (
-        <section id="hosted-worker-quota" className="scroll-mt-6">
-          <HostedWorkerQuotaCard settings={saved} onSaved={applyResponse} />
-        </section>
-      )}
-
-      {!loading && saved && (
-        <section id="custody-hold-limit" className="scroll-mt-6">
-          <CustodyHoldLimitCard settings={saved} onSaved={applyResponse} />
-        </section>
-      )}
-
-      {!loading && saved && (
-        <section id="ephemeral-workers" className="scroll-mt-6">
-          <EphemeralWorkersCard settings={saved} onSaved={applyResponse} />
-        </section>
-      )}
-
-      {!loading && saved && (
-        <section id="worker-hibernation" className="scroll-mt-6">
-          <WorkerHibernationCard settings={saved} onSaved={applyResponse} />
-        </section>
-      )}
-
-      {!loading && saved && (
-        <section id="capability-scheduling" className="scroll-mt-6">
-          <CapabilitySchedulingCard settings={saved} sources={sources} onSaved={applyResponse} />
         </section>
       )}
 

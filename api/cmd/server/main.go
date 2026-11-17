@@ -282,18 +282,23 @@ func run() error {
 	// Wire the secret cipher + ENV-source overlay (PRD #25): the Slack tokens and
 	// public base URL an operator set via environment win over their DB rows, and
 	// the box seals/opens the secret keys. Only keys actually set appear in the
-	// overlay, so an unconfigured Slack instance stays a strict no-op.
-	slackEnv := map[string]string{}
+	// overlay, so an unconfigured Slack instance stays a strict no-op. The three
+	// ephemeral worker knobs (PRD #4212) join it only when their raw env var is set,
+	// carrying the canonical value config.Load produced (ephemeralSettingsEnv).
+	settingsEnv := map[string]string{}
 	if cfg.SlackBotToken != "" {
-		slackEnv[settings.KeySlackBotToken] = cfg.SlackBotToken
+		settingsEnv[settings.KeySlackBotToken] = cfg.SlackBotToken
 	}
 	if cfg.SlackAppToken != "" {
-		slackEnv[settings.KeySlackAppToken] = cfg.SlackAppToken
+		settingsEnv[settings.KeySlackAppToken] = cfg.SlackAppToken
 	}
 	if cfg.PublicBaseURL != "" {
-		slackEnv[settings.KeyPublicBaseURL] = cfg.PublicBaseURL
+		settingsEnv[settings.KeyPublicBaseURL] = cfg.PublicBaseURL
 	}
-	settingsCache.ConfigureSecrets(box, slackEnv)
+	for k, v := range ephemeralSettingsEnv(os.LookupEnv, &cfg) {
+		settingsEnv[k] = v
+	}
+	settingsCache.ConfigureSecrets(box, settingsEnv)
 
 	// Shared bot-token Slack surface (PRD #25 M3): the run notifier, the account
 	// linker, and the /me/slack test-DM endpoint all post through it. It reads the
@@ -606,8 +611,8 @@ func run() error {
 	wsvc.SetHibernationAutoSettings(settingsCache)
 	// Issue #1965: a profile-bound run on a deployment without the lane says so instead of waiting.
 	wsvc.SetIsolatedLaneEnabled(cfg.IsolatedLaneEnabled())
-	// PRD #2006: lease entry on a worker-reported terminal and lease-arm claims (0 disables).
-	wsvc.SetEphemeralLease(cfg.EphemeralLease)
+	// PRD #2006 / #4212: the lease (lease entry on a worker-reported terminal, lease-arm claims; 0
+	// disables) is read per decision from the settings cache set just above, never snapshotted.
 
 	// Completion-interlock rollout switch (PRD #1226 M1, D1): createRun reads it from the
 	// same settings cache to decide whether to stamp completion_contract_version=1 on a new
@@ -805,14 +810,11 @@ func run() error {
 		// Issue #1965: lane workers are provisioned only where the chart enabled the lane.
 		IsolatedLaneEnabled: cfg.IsolatedLaneEnabled(),
 		DockerEnabled:       cfg.WorkerDockerEnabled,
-		MaxPerUser:          cfg.EphemeralMaxPerUser,
-		DefaultSize:         cfg.EphemeralDefaultSize,
 		ProvisionDeadline:   cfg.EphemeralProvisionDeadline,
 		SaturationDelay:     cfg.EphemeralSaturationDelay,
 		BackgroundGrace:     cfg.WorkerBackgroundGrace,
-		// PRD #2006: a finished ephemeral worker's lease (0 disables). The reaper spares a
-		// live lease and provisioning evicts the oldest releasable one at the cap.
-		Lease: cfg.EphemeralLease,
+		// PRD #4212: the per-user cap, default size and lease are admin settings the provisioner
+		// reads per pass from settingsCache (env overlay included), not config here.
 	})
 
 	// PRD #4205 M5: the demand-wake pass. Shares the claim knobs ClaimRun uses so its demand query
@@ -823,7 +825,6 @@ func run() error {
 		WorkerAffinityCeiling:   cfg.WorkerAffinityCeiling,
 		WorkerHeartbeatStale:    cfg.WorkerHeartbeatStale,
 		BackgroundGrace:         cfg.WorkerBackgroundGrace,
-		Lease:                   cfg.EphemeralLease,
 	})
 
 	sweep := sweeper.New(wsvc, cfg.SweepInterval,

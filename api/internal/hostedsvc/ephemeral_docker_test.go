@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -46,6 +47,21 @@ type dockerSettingsProbe struct {
 	enabled bool
 	err     error
 	reads   int
+	// maxPerUser, size and lease are what the PRD #4212 settings accessors answer; the zero values
+	// match what the former EphemeralConfig zero values gave these tests.
+	maxPerUser int
+	size       string
+	lease      time.Duration
+}
+
+func (s *dockerSettingsProbe) EphemeralMaxPerUser(context.Context) (int, error) {
+	return s.maxPerUser, nil
+}
+func (s *dockerSettingsProbe) EphemeralDefaultSize(context.Context) (string, error) {
+	return s.size, nil
+}
+func (s *dockerSettingsProbe) EphemeralLease(context.Context) (time.Duration, error) {
+	return s.lease, nil
 }
 
 func (s *dockerSettingsProbe) EphemeralWorkersEnabled(context.Context) (bool, error) {

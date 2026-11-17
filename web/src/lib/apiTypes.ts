@@ -1436,6 +1436,14 @@ export interface AppSettings {
   worker_hibernation_idle_after?: string;
   // Per-user persistent hosted-worker quota: integer 0..20, default 2. Zero disables provisioning.
   hosted_worker_quota: string;
+  // Ephemeral worker admin settings (PRD #4212). Optional for older responses.
+  // ephemeral_max_per_user: integer 0..20, default "2"; ephemeral_default_size and
+  // hosted_default_size: a worker size name (s, m, l, l-highmem), defaults "m" and "l";
+  // ephemeral_lease: Go duration 0..2h, default "2h".
+  ephemeral_max_per_user?: string;
+  ephemeral_default_size?: string;
+  hosted_default_size?: string;
+  ephemeral_lease?: string;
   // Per-owner custody admission limit: whole number 1..1000, default "8". Lowering it blocks future claims only.
   custody_hold_limit: string;
   // Upstream release-check toggles (PRD #836). Both the text "true"/"false" (default
@@ -3208,6 +3216,9 @@ export interface HostedConfig {
   // Whether the instance admin gate permits ephemeral auto-provisioning (PRD #649),
   // independent of `quota`, which governs manual self-service.
   ephemeral_enabled: boolean;
+  // Admin-chosen size the provision form preselects (PRD #4212). Optional: an older API
+  // omits it, and an unknown name is ignored by the form.
+  default_size?: string;
 }
 
 export type RunStatus =

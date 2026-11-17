@@ -1903,6 +1903,9 @@ type CapabilityScheduleReader interface {
 // satisfies it. Optional (nil-safe): a nil reader reports the generic lane wait.
 type EphemeralSettingsReader interface {
 	EphemeralWorkersEnabled(ctx context.Context) (bool, error)
+	// EphemeralLease is the current ephemeral worker lease (PRD #2006, #4212); zero disables it.
+	// Read per decision through Service.currentEphemeralLease, never cached.
+	EphemeralLease(ctx context.Context) (time.Duration, error)
 }
 
 // CompletionInterlockReader is the narrow settings view createRun reads for the
@@ -2035,10 +2038,6 @@ type Service struct {
 	// lane (issue #1965); set via SetIsolatedLaneEnabled. Stored negated so a Service that never
 	// calls the setter (tests, other wiring) keeps the pre-#1965 queued reasons.
 	isolatedLaneDisabled bool
-	// ephemeralLease is the bounded interval a finished ephemeral worker keeps its row for a
-	// same-owner, same-repository, same-branch follow-up (PRD #2006). Zero (the default) turns the
-	// feature off: every path below is exactly the pre-lease one. Set via SetEphemeralLease.
-	ephemeralLease time.Duration
 	// leaseAtOverride pins Claim's @lease_at admission instant. TEST-ONLY: unexported, zero in
 	// production (Valid false), so Claim always reads LeaseClockNow. See claimLeaseAt.
 	leaseAtOverride pgtype.Timestamptz
@@ -2343,15 +2342,24 @@ func (s *Service) SetEphemeralSettings(r EphemeralSettingsReader) { s.ephemeralS
 // (issue #1965), so a queued profile-bound run reports reasonIsolatedLaneNotEnabled when it did not.
 func (s *Service) SetIsolatedLaneEnabled(on bool) { s.isolatedLaneDisabled = !on }
 
-// SetEphemeralLease wires the ephemeral worker lease interval (PRD #2006). Call once at startup,
-// before serving. Zero (the default) disables the lease: no terminal report enters one and no claim
-// rebinds through one, so every path is exactly the pre-lease one. A negative value is treated as
-// zero.
-func (s *Service) SetEphemeralLease(d time.Duration) {
+// currentEphemeralLease is the ephemeral worker lease in force right now (PRD #2006, #4212): the
+// ephemeral_lease admin setting read through the EphemeralSettingsReader, never a boot snapshot.
+// Zero disables the lease: no terminal report enters one and no claim rebinds through one, so every
+// path is exactly the pre-lease one. A nil reader (tests, other wiring) is zero, and a negative
+// value is treated as zero. A read error is returned with a zero duration; each caller decides
+// whether to fail or to proceed leaseless.
+func (s *Service) currentEphemeralLease(ctx context.Context) (time.Duration, error) {
+	if s.ephemeralSettings == nil {
+		return 0, nil
+	}
+	d, err := s.ephemeralSettings.EphemeralLease(ctx)
+	if err != nil {
+		return 0, err
+	}
 	if d < 0 {
 		d = 0
 	}
-	s.ephemeralLease = d
+	return d, nil
 }
 
 // SetCompletionInterlockSettings wires the completion-interlock rollout-switch reader
@@ -3611,6 +3619,20 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 			s.memAuthority.evictIfSet(wkr.ID)
 		}
 	}
+	// PRD #4212: the ephemeral lease is the live admin setting, read ONCE per claim and threaded
+	// through params.EphemeralLease to every consumer (the spread-peer mirror below and claimRunInTx's
+	// lease arm), so one claim never sees two values. An ephemeral claimant that cannot read it fails
+	// the claim (it retries; guessing could bind its run through a lease the admin since turned off,
+	// or refuse a legitimate rebind). A persistent claimant only needs it for the spread-peer mirror,
+	// where proceeding leaseless is the safe, pre-lease behaviour.
+	claimLease, lerr := s.currentEphemeralLease(ctx)
+	if lerr != nil {
+		if wkr.Ephemeral {
+			return nil, fmt.Errorf("workersvc: read ephemeral lease for claim: %w", lerr)
+		}
+		slog.Warn("workersvc: read ephemeral lease for claim; proceeding without a lease", "worker_id", wkr.ID, "error", lerr)
+		claimLease = 0
+	}
 	params := store.ClaimRunParams{
 		MemoryAuthorityLost:      memLost,
 		Lane:                     lane,
@@ -3643,7 +3665,7 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 		// PRD #2006: the configured lease for EVERY claimant, read by ClaimRun's spread-peer mirror so a
 		// leased ephemeral peer is a deferral target. A claimant's own lease identity (LeaseSince,
 		// LeaseRepoID, LeaseBranch, LeaseAt) stays confined to claimRunInTx. Lease 0 yields a NULL interval.
-		EphemeralLease:        LeaseInterval(s.ephemeralLease),
+		EphemeralLease:        LeaseInterval(claimLease),
 		BackgroundGraceCutoff: pgconv.Time(claimNow.Add(-s.p.WorkerBackgroundGrace)),
 		HeartbeatCutoff:       pgconv.Time(claimNow.Add(-s.p.WorkerHeartbeatStale)),
 		// PRD #1030 M2: a draining claimant is scoped to its own promoted run (see the
@@ -4963,6 +4985,21 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 	if reconciliationOut != nil && (owned.PlanCrossCheckRequired || owned.PlanCrossCheckGated) && (req.State == "running" || req.State == "awaiting_approval") && req.ClaimGeneration == nil && !legacyGatedReport {
 		return owned, false, ErrClaimGenerationRequired
 	}
+	// PRD #4212: the ephemeral lease is the live admin setting. It is read ONCE per report, here,
+	// before any transaction opens and before any state changes, and only when a lease decision can
+	// exist: an ephemeral worker's terminal report (the lease fence, the interlocked-completion
+	// lease tx and the teardown below all key on it). A routine running/awaiting report never calls
+	// the reader. A failed read refuses the report before it changes anything: the worker retries,
+	// instead of this report entering or skipping a lease on a guess.
+	var lease time.Duration
+	leaseRead := false
+	if wkr.Ephemeral && terminalStatuses[req.State] {
+		l, lerr := s.currentEphemeralLease(ctx)
+		if lerr != nil {
+			return owned, false, fmt.Errorf("workersvc: read ephemeral lease for terminal report: %w", lerr)
+		}
+		lease, leaseRead = l, true
+	}
 	q := Store(s.q)
 	var fenceTx pgx.Tx
 	defer func() {
@@ -4998,7 +5035,7 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		qtx := store.New(tx)
 		// Completed publication and ephemeral leasing serialize on the worker before the run.
 		// Keep leasing conditional on an ephemeral terminal report with the lease enabled.
-		leaseFence = req.ClaimGeneration != nil && s.ephemeralLease > 0 && wkr.Ephemeral && (req.State == "completed" || req.State == "failed")
+		leaseFence = req.ClaimGeneration != nil && lease > 0 && wkr.Ephemeral && (req.State == "completed" || req.State == "failed")
 		// A publication-enrolled run's authority writes (owner, generation, claim) need the
 		// worker locked before the run row; the enrollment is read before the run lock.
 		pubEnrolled, perr := publicationEnrolled(ctx, qtx, runID)
@@ -5686,7 +5723,7 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		// byte-for-byte.
 		if owned.CompletionContractVersion.Valid {
 			var idempotent bool
-			rows, idempotent, leaseOut, err = s.completeRunWithPermitLease(ctx, wkr, owned, req, completedParams)
+			rows, idempotent, leaseOut, err = s.completeRunWithPermitLease(ctx, wkr, owned, req, completedParams, lease)
 			// PRD #1247 M5 (D3): the interlocked completion runs its OWN permit transaction, so
 			// it cannot nest under an outer FOR UPDATE fence (self-deadlock) — it is
 			// generation-fenced INSIDE that lock instead and returns ErrStaleClaim when a
@@ -6114,7 +6151,23 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		// committed transition; guarded on wkr.Ephemeral and busy-checked in-query so a
 		// normal run's completion is a no-op. Best-effort — never fails the report.
 		// PRD #2006: skipped when the terminal transaction entered the worker's lease.
-		s.maybeTeardownEphemeral(ctx, wkr, run, leaseOut.leased)
+		//
+		// PRD #4212: the lease is the one read above. A non-terminal report can still re-read a run a
+		// concurrent report just made terminal (the settle-scope comment above); then no lease was read
+		// and this is the one lazy read. A failed lazy read skips the delete (the reaper is the backstop)
+		// rather than delete against a guessed lease.
+		if wkr.Ephemeral && terminalStatuses[run.Status] && !leaseOut.leased {
+			if !leaseRead {
+				l, lerr := s.currentEphemeralLease(ctx)
+				if lerr != nil {
+					slog.Warn("ephemeral teardown on run completion: read ephemeral lease; leaving the worker to the reaper", "run", run.ID, "worker", wkr.ID, "error", lerr)
+				} else {
+					s.maybeTeardownEphemeral(ctx, wkr, run, leaseOut.leased, l)
+				}
+			} else {
+				s.maybeTeardownEphemeral(ctx, wkr, run, leaseOut.leased, lease)
+			}
+		}
 		// PRD #1030 M4 / PRD #1810 M1: on a COMMITTED terminal transition (completed, or a
 		// failed→cancelled/stopped/plan-reject/agent-failure route through the switch
 		// above), settle the run's checkpoint ref. While any custody hold of the run is open
@@ -6146,11 +6199,11 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 // PRD #2006: leased reports that the terminal transaction entered the worker's lease, so the worker
 // stays for a follow-up and no delete is issued. Otherwise the delete carries the real lease so its
 // own live-lease skip applies.
-func (s *Service) maybeTeardownEphemeral(ctx context.Context, wkr store.Worker, run store.Run, leased bool) {
+func (s *Service) maybeTeardownEphemeral(ctx context.Context, wkr store.Worker, run store.Run, leased bool, lease time.Duration) {
 	if !wkr.Ephemeral || !terminalStatuses[run.Status] || leased {
 		return
 	}
-	if _, err := s.q.DeleteEphemeralWorkerForRun(ctx, store.DeleteEphemeralWorkerForRunParams{RunID: run.ID, EphemeralLease: LeaseInterval(s.ephemeralLease)}); err != nil {
+	if _, err := s.q.DeleteEphemeralWorkerForRun(ctx, store.DeleteEphemeralWorkerForRunParams{RunID: run.ID, EphemeralLease: LeaseInterval(lease)}); err != nil {
 		slog.Warn("ephemeral teardown on run completion", "run", run.ID, "worker", wkr.ID, "error", err)
 	}
 }

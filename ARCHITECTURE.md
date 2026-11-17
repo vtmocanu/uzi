@@ -2643,8 +2643,11 @@ mounts none of the join token or `/nix`, and from #3153 it mounts only the
 at `/data/runner`), never the whole volume. That is a mount-view property; it
 does not bound rootful dind device reach.
 
-New persistent workers preselect the large preset; new ephemeral workers default
-to medium via `workers.ephemeralDefaultSize`. The decision, partial supersession,
+New persistent workers preselect the admin `hosted_default_size` (shipped default
+large; the provision API still requires an explicit size); new ephemeral workers
+default to the admin `ephemeral_default_size` (shipped default medium), which a
+chart `workers.ephemeralDefaultSize` or `UZI_EPHEMERAL_DEFAULT_SIZE` value pins and
+locks. The decision, partial supersession,
 capacity cost, and preservation of existing stored sizes are recorded in
 [ADR-2240](adr/2240-hosted-worker-default-size.md).
 
