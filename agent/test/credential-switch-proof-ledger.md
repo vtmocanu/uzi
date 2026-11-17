@@ -409,7 +409,7 @@ control is still absent, not that the functional criterion was deferred.
 | Stale captured summary revision remains refused | B4 |
 | Now raw drain before executor suspension | C1 in earlier record |
 | A reconciliation before strict persistence | C2 in earlier record |
-| Explicit owner Codex request, target ownership/kind and live-status admission | A4 credits request availability in four live statuses; U1 credits negative admission (queued, paused, limit_wait, recovery_wait, claimed), target kind/usability, foreign target, foreign run, CLI and web kind scoping; policy is the separate row below |
+| Explicit owner Codex request, target ownership/kind and live-status admission | A4 credits request availability in four live statuses; U1 credits queued/paused/limit_wait/recovery_wait/claimed refusals, target usability and disabled target, the combined kind fence, a foreign API-key target, a foreign run and client-side CLI/web kind scoping. pool_wait, terminal statuses, pinned-without-secret, lane, no-live-worker, unsupported-worker and foreign-subscription refusals remain unvalidated; policy is the separate row below |
 | Same successful flight/generation/worktree with no new attempt, custody or release/reclaim | Positive assertions present; independent preservation/control accounting unvalidated |
 | Strict usable persistence, clear confirmation and continuation on A before teardown | R1–R4 below credit three failed-save/inspection variants and empty applied-ACK only; other clauses unvalidated |
 | Proven A root/tool reap before B material, login and model work; fresh CODEX_HOME | R5 credits unproven registered root pre-apply only; tool-only, other modes/phases and HOME clauses unvalidated |
@@ -1787,8 +1787,9 @@ Baseline (exact a233 commands):
 `git show a233883de3c36bae2e940f999cd9d582889dad00:api/internal/workersvc/run_credential.go`
 reads the run owner-scoped at :166 and calls validateCredentialOverride at :188;
 `git show a233883de3c36bae2e940f999cd9d582889dad00:api/internal/workersvc/credential_override.go`
-:204 `if harness == harnessCodex {` refuses every Codex request (422) before any
-status, target-ownership or target-kind check. The CLI at a233
+:204 `if harness == harnessCodex {` refuses every Codex request before any status,
+target-ownership or target-kind check (422; the lane switch at :198 returns 409
+first for chat, judge, self_improve and job runs). The CLI at a233
 (`api/cmd/uzi/run_limits.go`:405) resolved labels only as `kindAnthropicToken`;
 the web `RunCredentialOverride.tsx`:157 returned null for `run.harness === "codex"`
 and `CodexCredentialSwitch.tsx` did not exist. So every fence below except the
@@ -1812,28 +1813,54 @@ against throwaway postgres `cdr-4202-pg`. Logs: `.uzi/scratch/ctl-logs/<name>.mu
 | u1-anthropic | redundant-fence | the same condition's `err != nil` and `codexSwitchTargetUsable` terms both neutralized (the only two copies of "target is a usable Codex credential" on this path, run_credential.go:649) | anthropic_target_running: 200, want 409 (test :134) |
 | u1-foreignsecret | redundant-fence | owner predicate `user_id = $2` → `$2::uuid IS NOT NULL` in the three target reads on this path: `LockSecretEnablementForShareNowait` (credential_disabled.sql.go), `GetUserSecretMetaByID` (user_secrets.sql.go), `LockCodexAliasForShareNowait` (codex_binding.sql.go) | other_users_secret_running: 200, want 404 (test :178) |
 | u1-foreignrun | (b) preservation sensitivity | `s.q.GetRunByIDForUser(…{ID: runID, UserID: userID})` → `s.q.GetRunByID(ctx, runID)` in SetRunCredential | other_users_token_running: 200, want 404 (test :189) |
-| u1-cli-kind | (d) guard | run_limits.go Codex `eligible` also admits `kindAnthropicToken` | TestRunSetTokenHarnessKindsAndAmbiguity/codex-ignores-anthropic and codex-rejects-anthropic (test :51, :54) |
-| u1-web-kind | (d) guard | CodexCredentialSwitch.tsx `choices` filter also admits `anthropic_token` | "excludes Anthropic credentials…": option "Account B — unavailable" not found |
+| u1-disabled | (d) guard | target condition `disabled` term → `(false && disabled)` | disabled_target_running: 200, want 409 (test :176) |
+| u1-cli-kind | client-side (d) guard | run_limits.go Codex `eligible` also admits `kindAnthropicToken` | TestRunSetTokenHarnessKindsAndAmbiguity/codex-ignores-anthropic and codex-rejects-anthropic (test :51, :54) |
+| u1-web-kind | client-side (d) guard | CodexCredentialSwitch.tsx `choices` filter also admits `anthropic_token` | "excludes Anthropic credentials…": option "Account B — unavailable" not found |
+
+u1-cli-kind runs the real `uzi run set-token` command against the CLI's fake
+API client, and u1-web-kind renders the real component in jsdom. Neither passes
+through the API route or store; they are client-side controls for CLI and web
+kind scoping only. The server-side kind fence is u1-anthropic. u1-disabled ran
+on candidate 4bd0c1da9 with the test file that added `disabled_target_running`
+(sha256 7bdf26f4…, committed after this entry).
 
 Every mutant exited 1 at the named assertion, not in setup or compilation.
+Each mutant stops at the status assertion, so no control proves the
+sensitivity of the no-write snapshot comparison, which also excludes
+user_secrets, codex_credential_state, provider accounts and workers.
+An undisclosed earlier run, u1-status (`.uzi/scratch/ctl-logs/u1-status.*`),
+neutralized both `applyLiveStatus` copies (:597 and :626) and was still
+refused with 409, because `StampHeldCodexCredentialSwitch` also admits only the
+four live statuses. "No switch is written for a non-live run" therefore has at
+least three copies and no redundant-fence control; only the 422 guard is
+controlled (u1-status1).
 Redundant-fence notes: u1-anthropic's `err != nil` term also covers NOWAIT
 lock contention, so that control proves sensitivity to the combined target
 fence, not each copy independently; the subscription-only account lock is not
-on these api-key/anthropic paths. Without u1-status1, `!applyLiveStatus(run.Status)`
-inside the claim mutation (:626) still refuses, as 409; the test pins the 422.
+on these api-key/anthropic paths, so u1-foreignsecret covers a foreign API-key
+target only; a foreign linked subscription target also reaches the owner-scoped
+`LockCodexAccountForUpdateNowait` / `GetCodexProviderAccountByID`, which no
+control neutralizes.
 
 Unchanged-candidate greens (primary clone, same tree): handler test 13/13
 subtests PASS, `ok` EXIT=0 (`.uzi/scratch/ctl-logs/u1-green-handler.log`);
 `go test -race -count=1 ./cmd/uzi -run '^TestRunSetToken'` EXIT=0;
 `npx vitest run src/components/CodexCredentialSwitch.test.tsx` 39 passed EXIT=0.
 
-Credit: the owner-request admission row (statuses queued, paused, limit_wait,
-recovery_wait, claimed; target kind/usability; foreign target; foreign run; CLI
-and web kind scoping). pool_wait is covered only by the existing non-DB
-`TestSetRunCredentialCodexOwnerRequestRefusals` and is not separately credited.
+Credit: statuses queued, paused, limit_wait, recovery_wait and claimed (the 422
+and 409 guards); target usability and disabled target; the combined Codex-kind
+fence; foreign API-key target; foreign run; client-side CLI and web kind
+scoping. Not credited: pool_wait (non-DB test only), terminal statuses,
+pinned-without-secret, the lane check, no live worker, unsupported worker, a
+foreign subscription target and the stamp SQL's own status filter.
 
 U1 follow-up: `task lint:api` flagged gosec G101 on the test constant name
 `msgSecretGone`; it was renamed `msgTargetGone` (no other change). The
 unchanged-candidate green was re-run on the renamed file: 13/13 subtests PASS,
 EXIT=0 (`.uzi/scratch/ctl-logs/u1-green-handler2.log`); `task lint:api` 0 issues.
 The mutant runs used the pre-rename file; the rename touches no assertion.
+
+U1 review fixes: test comments for the anthropic and foreign-secret subtests
+now say "redundant fence (combined)"; `disabled_target_running` was added.
+Green on the final file: 14/14 subtests PASS, EXIT=0
+(`.uzi/scratch/ctl-logs/u1-green-handler3.log`).

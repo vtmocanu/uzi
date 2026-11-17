@@ -126,9 +126,10 @@ func TestWorkerCodexOwnerRequestAdmissionRefusalsLiveDB(t *testing.T) {
 		refuse(t, e, "claimed", e.user, target, http.StatusConflict, msgAssembling)
 	})
 
-	// Guard isolated: the alias lookup. e.secret is an anthropic_token with no
-	// codex_credential_state row, so LockCodexAliasForShareNowait fails, which
-	// maps to ErrCredentialSwitchRaced (409).
+	// Redundant fence (combined): e.secret is an anthropic_token with no
+	// codex_credential_state row, so LockCodexAliasForShareNowait fails, and
+	// codexSwitchTargetUsable would refuse the anthropic kind as well; either
+	// alone maps to ErrCredentialSwitchRaced (409).
 	t.Run("anthropic_target_running", func(t *testing.T) {
 		e, _ := setup(t, "running")
 		refuse(t, e, "running", e.user, e.secret, http.StatusConflict, msgRaced)
@@ -166,9 +167,19 @@ func TestWorkerCodexOwnerRequestAdmissionRefusalsLiveDB(t *testing.T) {
 		})
 	}
 
-	// Guard isolated: LockSecretEnablementForShareNowait / GetUserSecretMetaByID
-	// are owner-scoped, so another user's otherwise usable Codex secret is
-	// ErrCredentialOverrideSecretNotFound (404).
+	// Guard isolated: the request-side disabled term. Target B stays a usable,
+	// owned static API key; only its user_secrets.disabled_at is set, so only
+	// `disabled` in the target condition refuses it (ErrCredentialSwitchRaced).
+	t.Run("disabled_target_running", func(t *testing.T) {
+		e, target := setup(t, "running")
+		stoppedRouteExec(t, e, `UPDATE user_secrets SET disabled_at=now() WHERE id=$1`, target)
+		refuse(t, e, "running", e.user, target, http.StatusConflict, msgRaced)
+	})
+
+	// Redundant fence (combined): LockSecretEnablementForShareNowait,
+	// GetUserSecretMetaByID and LockCodexAliasForShareNowait are each
+	// owner-scoped, so another user's otherwise usable API-key secret is
+	// ErrCredentialOverrideSecretNotFound (404) unless all three are removed.
 	t.Run("other_users_secret_running", func(t *testing.T) {
 		e, _ := setup(t, "running")
 		other := uuid.New()
