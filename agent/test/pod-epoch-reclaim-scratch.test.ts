@@ -1713,17 +1713,36 @@ test("#4420 a run leaf that changed between the census and its re-census is kept
   });
 });
 
-test("#4420 a status change before the read is honoured: the first read of a leaf decides, and a later leaf sees the new state", async () => {
-  await withWorld([leafOf(RUN_A), leafOf(RUN_B)], async w => {
-    w.census = fakeCensus(() => [dirEntry(leafOf(RUN_A), 1), dirEntry(leafOf(RUN_B), 2)]);
+test("#4420 one run's status flipping from terminal to paused after the census is honoured: the per-leaf read sees paused and the leaf is kept run_active", async () => {
+  await withWorld([leafOf(RUN_A), "plain"], async w => {
+    let status = "completed";
+    const inner = fakeCensus(() => [dirEntry(leafOf(RUN_A), 1), dirEntry("plain", 2)]);
+    let flipped = false;
+    // The census of the run leaf is the last step before its server read; flip the status once the census has run.
+    w.census = async (r, e, leaf, t) => {
+      const out = await inner(r, e, leaf, t);
+      if (leaf === leafOf(RUN_A) && !flipped) { flipped = true; status = "paused"; }
+      return out;
+    };
     w.discard = async () => removed();
-    let reads = 0;
-    const seen = countingServer(w, () => (++reads === 1 ? "running" : "completed"));
+    const seen = countingServer(w, () => status);
     const result = await run(w);
-    assert.equal(seen.ownership.length, 2);
-    assert.equal(result.scratch.kept.run_active, 1, "the leaf read while the run was non-terminal is kept");
-    assert.equal(result.scratch.kept.run_local_unknown, 1, "the other is only unproven locally here (no classifier), never deleted on the server's word alone");
-    assert.deepEqual(w.calls.discards, []);
+    assert.equal(flipped, true);
+    assert.equal(result.scratch.kept.run_active, 1, "paused at the read: kept, not deleted");
+    assert.deepEqual(seen.ownership, [RUN_A]);
+    assert.deepEqual(w.calls.discards, ["plain"]);
+    await untouched(w, [leafOf(RUN_A), "plain"]);
+  });
+});
+
+test("#4420 documented window: a status read as terminal at the per-leaf read is read exactly once and not re-read before launch", async () => {
+  await withWorld([leafOf(RUN_A)], async w => {
+    // Terminal is absorbing (api run-status UPDATEs never leave completed/failed/cancelled, audited in m2), so one
+    // terminal read cannot later become non-terminal and a second read before launch would add nothing.
+    const seen = endedRunWorld(w);
+    const result = await run(w);
+    assert.deepEqual(seen.ownership, [RUN_A], "exactly one ownership read for the leaf");
+    assert.equal(result.scratch.deleted, 1);
   });
 });
 
@@ -1741,7 +1760,7 @@ function endedRunWorld(w: World) {
   return seen;
 }
 
-test("#4420 an ended run leaf is deleted, but a leaf that becomes held open after the run-leaf reads is kept by the existing check", async () => {
+test("#4420 an ended run leaf is deleted, but a leaf that becomes held open after the run-leaf reads, or whose idle proof fails, is kept by the existing checks", async () => {
   await withWorld([leafOf(RUN_A)], async w => {
     const seen = endedRunWorld(w);
     const result = await run(w);
@@ -1786,7 +1805,7 @@ test("#4420 a run leaf over the per-leaf census cap is incomplete and never reac
   });
 });
 
-test("#4420 a symlink, mounted, foreign-owned or held-open run leaf is kept by the existing rules before any server read", async () => {
+test("#4420 a non-directory (symlink-shaped census entry), mounted, foreign-owned or held-open run leaf is kept by the existing rules before any server read", async () => {
   const link = leafOf(RUN_A), mounted = leafOf(RUN_B), foreign = leafOf(RUN_C), held = leafOf(RUN_D), foreignFs = leafOf(RUN_E);
   await withWorld([link, mounted, foreign, held, foreignFs, "plain"], async w => {
     w.mounts = () => ({ mountedLeaves: new Set([mounted]) });

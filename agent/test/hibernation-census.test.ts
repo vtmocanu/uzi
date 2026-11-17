@@ -345,6 +345,20 @@ it("runner scratch: a run-<uuid> leaf is protected run_scratch and never counted
   assert.equal(agg?.detail, "leaves_1", "only the non-run leaf is counted disposable");
 });
 
+it("runner scratch: near-miss run names (not a lowercase uuid) are ordinary leaves, counted and not protected run_scratch", async () => {
+  const scratchRoot = path.join(dataDir, "runner/.tmp/uzi-runner");
+  const nearMisses = ["run-NOTAUUID", "run-0B1F3C2E-4D5A-4E6F-8A7B-9C0D1E2F3A4B"];
+  for (const n of nearMisses) put(`runner/.tmp/uzi-runner/${n}/f`);
+  const result = await run({ scratchRoot, git: fakeGit({ collectEpochScratchProtectedPaths: async () => ({ state: "read", paths: [] }) }) });
+  for (const n of nearMisses) {
+    assert.notEqual(byPath(result, `runner/.tmp/uzi-runner/${n}`)?.detail, "run_scratch", n);
+    assert.equal(byPath(result, `runner/.tmp/uzi-runner/${n}`)?.classification, undefined, `${n} stays folded into the aggregate`);
+  }
+  const agg = byPath(result, "runner/.tmp/uzi-runner");
+  assert.equal(agg?.classification, "disposable");
+  assert.equal(agg?.detail, "leaves_2");
+});
+
 it("the worker's own TMPDIR is in the fingerprint; empty is disposable", async () => {
   dir("runner/.tmp/uzi-worker");
   const tmp = path.join(dataDir, "runner/.tmp/uzi-worker");

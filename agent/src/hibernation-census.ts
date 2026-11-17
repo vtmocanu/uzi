@@ -865,8 +865,9 @@ async function classifyScratch(deps: HibernationCensusDeps, dataDir: string, tre
   let disposable = 0;
   for (const leaf of leaves) {
     const name = lastSegment(leaf.rel);
-    // A run's TMPDIR leaf can only be judged against the server's run retention, which a hibernation census does not
-    // read, so it is never disposable here.
+    // A run's TMPDIR leaf is judged by the scratch phase's run-leaf retention judgement (server lifecycle, holds and the
+    // local run-retention classifier). This census does not apply that judgement, so it cannot tell an ended run's leaf
+    // from a retained one and reports every run leaf as protected rather than disposable.
     if (RUN_SCRATCH_LEAF_RE.test(name)) { entry(leaf.rel, "protected", "run_scratch"); continue; }
     if (admitted.has(name)) { disposable++; continue; }
     // Re-derive the single kept reason with the same classifier on this leaf alone.
