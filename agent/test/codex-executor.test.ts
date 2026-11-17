@@ -32446,7 +32446,7 @@ describe("M2 actualRunner credential replacement", () => {
   for (const [oldClaim, target] of [[SUBSCRIPTION, API_KEY], [API_KEY, SUBSCRIPTION],
     [SUBSCRIPTION, { ...SUBSCRIPTION, generation: 20, chatgpt_account_id: "M2-B-account" }]] as const) {
     for (const phase of ["factory", "already-running-body"] as const) {
-      for (const publication of ["resume-cleanup-cancel", "resume-cleanup-shutdown", "resume-cleanup-followup", "resume-policy-ack-lost", "resume-policy-ack-pending", "resume-preserve-pending", "resume-preserve-nonce", "resume-preserve-sequence-refused", "resume-refuse-preserve", "resume-refuse-fresh", "resume-uncertain", "baseline", "clean-apply-uncertain", "clean-successor-epoch-advance", "clean-pending-disappears", "clean-stopped-lost-reply", "clean-stopped-unconfirmed", "clean-stopped-unsupported", "clean-stopped-withdrawn", "clean-stopped-already-paused", "root-reap-unproven", "preflight-target-mismatch", "preflight-foreign-op", "preflight-busy-ready", "preflight-transport-ready", "persist-clear-confirmed", "persist-clear-owner-lost", "persist-clear-nonce-changed", "persist-clear-rejected", "persist-clear-lost-reply", "persist-clear-empty-reply", "persist-clear-pending", "inspect-missing-clear-confirmed", "inspect-unknown-clear-confirmed", "gated", "before-scope-clear", "after-scope-clear", "before-scope-install", "after-scope-install", "before-executor-publication", "before-Now-publication", "after-Now-publication", "before-B-preparation", "Now-finish-false", "publish-failure", "now-publish-failure", "login-failure", "subscription-refresh", "api-key-refresh", "subscription-refresh-prepare-failure", "subscription-refresh-cancel", "crash-after-a-teardown-recovery", "crash-apply-reply-lost-recovery", "crash-apply-ack-recovery", "crash-login-recovery"] as const) {
+      for (const publication of ["resume-cleanup-cancel", "resume-cleanup-shutdown", "resume-cleanup-followup", "resume-policy-ack-lost", "resume-policy-ack-pending", "resume-preserve-pending", "resume-preserve-nonce", "resume-preserve-sequence-refused", "resume-refuse-preserve", "resume-refuse-fresh", "resume-uncertain", "baseline", "clean-apply-uncertain", "clean-successor-epoch-advance", "clean-pending-disappears", "clean-stopped-lost-reply", "clean-stopped-unconfirmed", "clean-stopped-unsupported", "clean-stopped-withdrawn", "clean-stopped-already-paused", "root-reap-unproven", "preflight-target-mismatch", "preflight-foreign-op", "preflight-busy-ready", "preflight-transport-ready", "persist-clear-confirmed", "persist-clear-owner-lost", "persist-clear-nonce-changed", "persist-clear-rejected", "persist-clear-lost-reply", "persist-clear-empty-reply", "persist-clear-pending", "persist-clear-op-changed-before", "persist-clear-target-changed-before", "persist-clear-owner-lost-before", "inspect-missing-clear-confirmed", "inspect-unknown-clear-confirmed", "gated", "before-scope-clear", "after-scope-clear", "before-scope-install", "after-scope-install", "before-executor-publication", "before-Now-publication", "after-Now-publication", "before-B-preparation", "Now-finish-false", "publish-failure", "now-publish-failure", "login-failure", "subscription-refresh", "api-key-refresh", "subscription-refresh-prepare-failure", "subscription-refresh-cancel", "crash-after-a-teardown-recovery", "crash-apply-reply-lost-recovery", "crash-apply-ack-recovery", "crash-login-recovery"] as const) {
         if (publication !== "baseline" && (phase !== "factory" || (oldClaim !== API_KEY && target !== API_KEY))) continue;
         if (publication === "subscription-refresh" && target.auth_mode !== "subscription") continue;
         if (publication === "api-key-refresh" && target.auth_mode !== "api_key") continue;
@@ -32483,7 +32483,13 @@ describe("M2 actualRunner credential replacement", () => {
         const clearNonceChanged = publication === "persist-clear-nonce-changed";
         const clearAuthorityLost = clearOwnerLost || clearNonceChanged;
         const confirmedClear = publication === "persist-clear-confirmed" || inspectFailure;
-        const persistFailure = publication === "persist-clear-confirmed" || clearAuthorityLost ||
+        // Pre-clear refusals: the first reconcile inside confirmClear (after the persist failure) is the only
+        // observation that differs, so exactly one pre-clear guard refuses and no clear is ever sent.
+        const clearOpChangedBefore = publication === "persist-clear-op-changed-before";
+        const clearTargetChangedBefore = publication === "persist-clear-target-changed-before";
+        const clearOwnerLostBefore = publication === "persist-clear-owner-lost-before";
+        const clearRefusedBefore = clearOpChangedBefore || clearTargetChangedBefore || clearOwnerLostBefore;
+        const persistFailure = publication === "persist-clear-confirmed" || clearAuthorityLost || clearRefusedBefore ||
           publication === "persist-clear-rejected" || publication === "persist-clear-lost-reply" ||
           publication === "persist-clear-empty-reply" || publication === "persist-clear-pending" || inspectFailure;
         if (persistFailure && (oldClaim !== API_KEY || target !== SUBSCRIPTION || phase !== "factory")) continue;
@@ -32799,7 +32805,7 @@ describe("M2 actualRunner credential replacement", () => {
             return { ...cleanOwnership };
           }
           const ownership: Awaited<ReturnType<typeof client.getRunOwnership>> = { status: holdReason ? "paused" : "running", claim_generation: predecessorFenced ? 8 : 7,
-            claim_released: clearOwnerLost && clearAcknowledged, hold_reason: holdReason };
+            claim_released: (clearOwnerLost && clearAcknowledged) || (clearOwnerLostBefore && persistFailures > 0), hold_reason: holdReason };
           if (clearAcknowledged) postAckOwnership.push({ claim_generation: ownership.claim_generation ?? 0, claim_released: ownership.claim_released === true });
           return ownership;
         };
@@ -32819,7 +32825,9 @@ describe("M2 actualRunner credential replacement", () => {
         }
         client.getInputs = async (...args) => ({ ...(preserveCleanupFollowup
           ? await originalGetInputs(...args) : { inputs: [] }), nowSummary: true, ...((cancelled || (baselineProofFinished && api.messages(claim.run_id).some(m => m.kind === "progress_note" && m.credential_epoch_ordinal === 1 && String(m.payload.text).startsWith("Inspecting B")))) ? { terminalCancelled: { run_id: claim.run_id, generation: 7 } } : {}),
-          ...(pending ? { credentialSwitch: { generation: 7, op_id: pendingOp, target_secret_id: "M2-target" } } : {}) });
+          ...(pending ? { credentialSwitch: { generation: 7,
+            op_id: clearOpChangedBefore && persistFailures > 0 ? "M2-changed-op" : pendingOp,
+            target_secret_id: clearTargetChangedBefore && persistFailures > 0 ? "M2-changed-target" : "M2-target" } } : {}) });
         client.preflightCodexCredentialSwitch = async (runId, req) => {
           preflights++; events.push("preflight");
           preflightRequests.push({ runId, claimGeneration: req.claimGeneration, registerNonce: req.registerNonce,
@@ -33964,7 +33972,8 @@ describe("M2 actualRunner credential replacement", () => {
             assert.equal(persistFailures, inspectFailure ? 0 : 1, "real lease reaches the session-store copy");
             assert.equal(persistedCopies, inspectFailure ? 1 : 0, "inspection refusal follows a successful real copy");
             assert.equal(unavailableInspections, inspectFailure ? 1 : 0, "inspection injection runs only inside real persistRollout");
-            assert.deepEqual(failedClearRequests, [{ runId: claim.run_id, generation: 7, opId: "M2-op", reason: "rollout_persist_failed" }]);
+            assert.deepEqual(failedClearRequests, clearRefusedBefore ? []
+              : [{ runId: claim.run_id, generation: 7, opId: "M2-op", reason: "rollout_persist_failed" }]);
             assert.equal(preflights, 0, "unproven rollout never reaches preflight");
             assert.equal(teardownAttempts, 0, "switch lease never tears down A");
             assert.equal(applies, 0);
@@ -33998,7 +34007,7 @@ describe("M2 actualRunner credential replacement", () => {
               }
               assert.equal(reopenAttempts, 0);
               assert.equal(a.transport.turnStartCount, 1, "clear without continuing authority cannot admit another A turn");
-              assert.equal(pending, publication === "persist-clear-rejected" || publication === "persist-clear-pending");
+              assert.equal(pending, publication === "persist-clear-rejected" || publication === "persist-clear-pending" || clearRefusedBefore);
             }
             assert.equal(await fs.readFile(path.join(worktree, "M2-retained.txt"), "utf8"), "A work");
             cancelled = true;

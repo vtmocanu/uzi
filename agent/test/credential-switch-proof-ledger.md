@@ -411,7 +411,7 @@ control is still absent, not that the functional criterion was deferred.
 | A reconciliation before strict persistence | C2 in earlier record |
 | Explicit owner Codex request, target ownership/kind and live-status admission | A4 credits request availability in four live statuses; U1 credits queued/paused/limit_wait/recovery_wait/claimed refusals, target usability and disabled target, the combined kind fence, a foreign API-key target, a foreign run and client-side CLI/web kind scoping. pool_wait, terminal statuses, pinned-without-secret, lane, no-live-worker, unsupported-worker and foreign-subscription refusals remain unvalidated; policy is the separate row below |
 | Same successful flight/generation/worktree with no new attempt, custody or release/reclaim | U2 effect-injection sensitivity controls (owner-extended decision 10, U2 only): claimRun, attempt directory, custody release, queued transition, worktree reassignment, through the real Runner success test; other effects and the fresh_B return not separately controlled |
-| Strict usable persistence, clear confirmation and continuation on A before teardown | R1–R4 below credit three failed-save/inspection variants and empty applied-ACK only; other clauses unvalidated |
+| Strict usable persistence, clear confirmation and continuation on A before teardown | R1–R4 credit three failed-save/inspection variants and empty applied-ACK; U3 credits the exact op, target, ownership before/after, combined nonce fence and no-remaining-pending guards; lost-reply clear and reopen-path guards not separately controlled |
 | Proven A root/tool reap before B material, login and model work; fresh CODEX_HOME | R5 credits unproven registered root pre-apply only; tool-only, other modes/phases and HOME clauses unvalidated |
 | Whole operation-scope/refresh/identity/capability/summary replacement and retired-A rejection | A2 credits one reader; A3 retained-A/Sub→Sub B-scope namespace isolation; R7 B dispatcher publication readiness; R8 retired API-key A reconcile release-request fence during B login; remaining mixed clauses unvalidated |
 | Exact saved-ID resume; confirmed-refusal-only fresh fallback and lineage; preservation re-hold | R6 credits uncertain-error classification only; confirmed-refusal/preserve companions positive, independent preservation and other clauses unvalidated |
@@ -1925,7 +1925,7 @@ allocationCalls assertion, no injection run), and the `fresh_B` return (same
 statement sequence; the controls ran through the resumed path). The claim
 generation assertions (:35222–35223) were not shown sensitive. A plan-revision
 `awaiting_approval` restore reachable through `restartAndResume` →
-`epochSourceAdmission` → `PlanRevisionRetry.beforeTurn` (only with an active
+`epochSourceAdmission` → `PlanRevisionRecovery.beforeTurn` (plan-revision-retry.ts) (only with an active
 silent revision) is not covered by u2-transition.
 
 Evidence-log note (2026-11-17): a validator's cleanup deleted ten earlier
@@ -1933,3 +1933,75 @@ Evidence-log note (2026-11-17): a validator's cleanup deleted ten earlier
 `check:sqlc-drift`, the seven-test LiveDB re-verification at 79f74862d and the
 `task check:api` EXIT=0 at e2e84464c. Those results are reported from the
 transcript only; the candidate-level checks are re-run before m3 completion.
+
+U2 checkpoint record: the coverage question again carried a hand-typed SHA
+that is not a commit (`e7263f3fc3b6…`). The owner confirmed the correct full
+SHA from the `git rev-parse HEAD` output: the published checkpoint ref equals
+e7263f3fc46ff8e1d9fc23248afb1ef05484214d. Coverage questions now contain only
+the pasted `git rev-parse HEAD` output and the unit name.
+
+Seam check after the default-branch merge: `git diff f1467ba56 HEAD` over the
+prior controls' production seam files changes `policy_hold.go` only in
+`ReportPolicyHold`'s ephemeral teardown (:311 onward; the credited D74/D76
+anchors are at :189–195), `service.go` only in ephemeral-lease reads (claim,
+terminal report, teardown), `codex-executor.ts` only the progress-observer
+argument, and `runner.ts` only a comment. No prior mutation anchor is inside
+a changed hunk, so prior controls were not re-run; the affected packages'
+positive tests are re-run in the m3 candidate-level checks.
+
+### U3 — continuing on A after a failed save needs the exact operation and proven ownership (2026-11-17)
+
+Baseline: `git show a233883de3c36bae2e940f999cd9d582889dad00:agent/src/runner.ts`
+:25735–25738 refused every Codex switch (A1), so a233 had no failed-clear or
+continue-on-A seam. These are **guard controls** (class (d)), plus one
+redundant-fence guard control.
+
+Production guard (agent/src/runner.ts `confirmClear`, :17364–17375): before
+the clear, `!before.owned`, `before.pending?.opId !== operation.opId`,
+`before.pending.targetSecretId !== operation.targetSecretId`; after an applied
+clear, `after.owned && after.registerNonce === nonce && !after.pending`. A false
+result makes the persist-failure path (:17411) fall through to `retain()`
+(`CredentialSwitchRetainedStop`) instead of `reopen` on A. R4 already credits
+`ack.applied !== true`.
+
+New test variants (same commit), in `describe("M2 actualRunner credential
+replacement")`: `persist-clear-op-changed-before`,
+`persist-clear-target-changed-before`, `persist-clear-owner-lost-before`. The
+changed op, target or ownership is observed only after the real persist
+injection (`persistFailures > 0`), i.e. on confirmClear's own reconcile; each
+asserts `failedClearRequests` is `[]`, no `continued_A`, no reopen, one A turn,
+no teardown, apply or B request, and the unconfirmed-clear report assertions.
+
+Command (from `agent` in the one-at-a-time export; candidate
+e7263f3fc46ff8e1d9fc23248afb1ef05484214d plus this commit's test file, sha256
+1fde6293e298…): `npm run typecheck && node --import tsx --test
+--test-timeout=120000 --test-name-pattern='Codex real rollout persist failure
+before teardown \(<variant>\)$' test/codex-executor.test.ts`.
+
+| Control | Kind | Mutation (only change in runner.ts) | Selected case | Red at |
+|---|---|---|---|---|
+| u3-owner-before | guard | `!before.owned` → `(false && !before.owned)` | persist-clear-owner-lost-before | :33975 failedClearRequests gains the clear request |
+| u3-op-before | guard | `before.pending?.opId !== operation.opId` → `!before.pending` | persist-clear-op-changed-before | :33975 same |
+| u3-target-before | guard | target term → `(false && before.pending?.targetSecretId !== …)` | persist-clear-target-changed-before | :33975 same |
+| u3-owner-after | guard | `after.owned &&` → `(true \|\| after.owned) &&` | persist-clear-owner-lost | :33993 switchResult `continued_A` |
+| u3-pending-after | guard | `&& !after.pending` → `&& (true \|\| !after.pending)` | persist-clear-pending | :33993 `continued_A` |
+| u3-nonce-redundant | redundant-fence guard | nonce term in the confirmClear return and the nonce term in `guard()` (:17311), the two copies on this path | persist-clear-nonce-changed | :33993 `continued_A` |
+
+u3-op-before keeps the pending-presence check so the target line still
+type-narrows. A first u3-target-before attempt failed typecheck (TS18048;
+`u3-target-before.compilefail.log`) and receives no credit. u3-nonce-after
+(only the confirmClear nonce term) stayed green: `guard()`'s nonce check then
+throws `StaleClaimError` on reopen, so that single removal is expected
+redundancy; credit comes only from u3-nonce-redundant. Every credited mutant
+passed typecheck and exited 1 at the named assertion.
+
+Unchanged candidate (primary clone, same test file): the six selected cases
+pass, 6/6, EXIT=0 (`.uzi/scratch/ctl-logs/u3-green.log`); all ten
+persist-clear cases passed in the coder's run; `npm run lint` in agent: 0
+warnings, 0 errors.
+
+Credit: continuing on A after a failed save requires the exact pending
+operation and target, ownership before and after the clear, the same
+registration nonce (combined fence) and no remaining pending operation, plus
+R1–R4. Not credited here: lost-reply clear (existing variant, no control) and
+the reopen path's own guards.
