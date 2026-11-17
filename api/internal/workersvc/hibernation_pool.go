@@ -304,6 +304,19 @@ type surplusPassParams struct {
 	surplusCutoff, longCutoff, recentCutoff time.Time
 }
 
+// at re-anchors the pass parameters at a decision instant. Each locked attempt calls it with a
+// fresh clock read after its locks are granted: the pass instant predates candidate listing and
+// every earlier owner's lock wait (each bounded by the lock timeout, the pass as a whole is not),
+// so judging heartbeats, held receipts, owner activity and cutoffs by it could treat an expired
+// observation as fresh. The listing stays a hint.
+func (p surplusPassParams) at(now time.Time) surplusPassParams {
+	p.now = now
+	p.surplusCutoff = now.Add(-p.threshold)
+	p.longCutoff = now.Add(-p.idleAfter)
+	p.recentCutoff = now.Add(-HibernationAutoRefusalCooldown)
+	return p
+}
+
 // hibernationSurplusPass is HibernationAutoPass while surplus mode is on. Candidates are the
 // surplus candidates, the long-rule candidates (pooled workers judged by the owner-clock long
 // anchor, unpooled ones by today's per-worker anchor) and the warm-wake targets (one sleeper per
@@ -516,6 +529,7 @@ func (s *Service) surplusWork(ctx context.Context, w poolWork, p surplusPassPara
 	case !w.pooled:
 		var res workResult
 		err := s.hibernationTx(ctx, w.id, func(q *store.Queries, row store.Worker) error {
+			p := p.at(s.now()) // decision time: after the row lock (surplusPassParams.at)
 			// The list saw this worker unpooled. If it became pooled since (an equal-key sibling
 			// registered, or keys changed), the per-worker clock no longer applies and no owner
 			// lock is held here: change nothing and spend no budget. The next pass lists it as
@@ -542,6 +556,7 @@ func (s *Service) surplusWork(ctx context.Context, w poolWork, p surplusPassPara
 func (s *Service) poolAttempt(ctx context.Context, w poolWork, p surplusPassParams) (workResult, error) {
 	var res workResult
 	err := s.hibernationOwnerTx(ctx, w.owner, w.id, func(q *store.Queries, row store.Worker) error {
+		p := p.at(s.now()) // decision time: after both locks (surplusPassParams.at)
 		if row.UserID != w.owner || row.Kind != "hosted" || row.Ephemeral || row.HibernationState != "none" {
 			return nil
 		}

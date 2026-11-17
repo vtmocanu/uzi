@@ -634,6 +634,27 @@ func TestHibernationSurplusRecheckLiveDB(t *testing.T) {
 	p.wantStates(map[uuid.UUID]string{cand: "preparing", keeper: "none"})
 }
 
+// The decision is judged at a clock read after the locks, not at the pass instant: a keeper whose
+// heartbeat goes stale while the attempt waits on the owner lock cannot justify a surplus admission.
+func TestHibernationSurplusDecisionTimeAfterLockLiveDB(t *testing.T) {
+	p := newPoolFx(t)
+	cand, keeper := p.member(6*time.Hour), p.member(5*time.Hour)
+	var once sync.Once
+	p.svc.poolPassBeforeOwnerLock = func(int32) {
+		// Stands in for a long owner-lock wait: the keeper's heartbeat, fresh at listing, expires.
+		once.Do(func() { p.advance(p.svc.p.WorkerHeartbeatStale + time.Second) })
+	}
+	if n := p.pass(cand, keeper); n != 0 {
+		t.Fatalf("pass whose keeper went stale during the lock wait = %d, want 0", n)
+	}
+	p.wantStates(map[uuid.UUID]string{cand: "none", keeper: "none"})
+	p.svc.poolPassBeforeOwnerLock = nil
+	if n := p.pass(cand, keeper); n != 1 {
+		t.Fatalf("control pass = %d, want 1", n)
+	}
+	p.wantStates(map[uuid.UUID]string{cand: "preparing", keeper: "none"})
+}
+
 // ambiguousCommitHook fails the after-commit hook for every seeded worker: the commit really
 // landed, the caller saw an error (a lost commit reply). It counts its invocations.
 func ambiguousCommitHook(seeded []uuid.UUID, calls *atomic.Int64) func(uuid.UUID) error {

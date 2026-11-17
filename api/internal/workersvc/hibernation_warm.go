@@ -197,6 +197,7 @@ func (s *Service) warmReserveOn(ctx context.Context) (bool, error) {
 func (s *Service) warmAttempt(ctx context.Context, w poolWork, p surplusPassParams) (workResult, error) {
 	var res workResult
 	err := s.hibernationOwnerTx(ctx, w.owner, w.id, func(q *store.Queries, row store.Worker) error {
+		p := p.at(s.now()) // decision time: after both locks (surplusPassParams.at)
 		if row.UserID != w.owner || row.Kind != "hosted" || row.Ephemeral {
 			return nil
 		}
