@@ -233,6 +233,9 @@ export function AdminSettings() {
     // Most cards render only after a successful load (`saved`), so a FAILED load leaves
     // the page at the top for every anchor, agent-source and maintenance included.
     if (loaded && ADMIN_SETTINGS_ANCHOR_IDS.has(hash.slice(1))) {
+      // Near the page end the scroll cannot bring the target to the line: remember it so
+      // evaluate() lights its own pill.
+      pendingRef.current = hash.slice(1);
       document.getElementById(hash.slice(1))?.scrollIntoView?.({ block: "start" });
     }
   }, [loaded, hash, key]);
@@ -363,7 +366,14 @@ export function AdminSettings() {
     const els = ids
       .map((id) => document.getElementById(id))
       .filter((el): el is HTMLElement => el !== null);
+    // Stuck geometry: the block's sticky top + height, independent of whether it is stuck
+    // right now, so the observer band matches where evaluate() reads once scrolled.
+    const stuckLineY = () => parseFloat(getComputedStyle(block).top) + block.offsetHeight + LANDING;
+    // Live position, used by evaluate() against fresh rects.
     const lineY = () => block.getBoundingClientRect().bottom + LANDING;
+    const observed = [...new Set([...ADMIN_SETTINGS_ANCHOR_IDS, ...ids])]
+      .map((id) => document.getElementById(id))
+      .filter((el): el is HTMLElement => el !== null);
     const evaluate = () => {
       if (els.length === 0) return;
       const line = lineY();
@@ -372,7 +382,7 @@ export function AdminSettings() {
       if (atEnd) {
         const pending = pendingRef.current;
         const target = pending ? document.getElementById(pending) : null;
-        if (pending && target && target.getBoundingClientRect().top >= line - 4) choose(pending);
+        if (pending && target && target.getBoundingClientRect().top >= line - 6) choose(pending);
         else choose(els[els.length - 1].id);
         return;
       }
@@ -385,12 +395,17 @@ export function AdminSettings() {
     let lineIO: IntersectionObserver | null = null;
     const build = () => {
       lineIO?.disconnect();
-      const y = Math.round(lineY());
+      const y = Math.round(stuckLineY());
       const below = Math.max(0, window.innerHeight - y - 1);
       lineIO = new IntersectionObserver(evaluate, { root: document, rootMargin: `-${y}px 0px -${below}px 0px` });
-      for (const el of els) lineIO.observe(el);
+      for (const el of observed) lineIO.observe(el);
     };
     build();
+
+    // The block's stuck flip moves its live bottom (and so evaluate()'s line) without any
+    // observed card crossing the band: re-evaluate once when it changes.
+    const mo = new MutationObserver(evaluate);
+    mo.observe(block, { attributes: true, attributeFilter: ["data-stuck"] });
 
     const endIO = new IntersectionObserver(evaluate, { root: document });
     if (endRef.current) endIO.observe(endRef.current);
@@ -401,6 +416,7 @@ export function AdminSettings() {
     window.addEventListener("uzi:app-bar-h", build);
     return () => {
       lineIO?.disconnect();
+      mo.disconnect();
       endIO.disconnect();
       ro?.disconnect();
       window.removeEventListener("resize", build);

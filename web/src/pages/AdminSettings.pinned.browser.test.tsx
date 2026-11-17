@@ -163,8 +163,13 @@ async function expectInRowView(pill: HTMLElement) {
   await vi.waitFor(() => {
     const row = navEl().getBoundingClientRect();
     const r = pill.getBoundingClientRect();
-    expect(r.left, "pill left inside row").toBeGreaterThanOrEqual(row.left - 1);
-    expect(r.right, "pill right inside row").toBeLessThanOrEqual(row.right + 1);
+    const nav = navEl();
+    const fade = nav.hasAttribute("data-fade-row") ? 24 : 0;
+    // The 24px inset holds unless the row is clamped at that end (nothing more to scroll).
+    const atStart = nav.scrollLeft <= 1;
+    const atEnd = nav.scrollLeft >= nav.scrollWidth - nav.clientWidth - 1;
+    expect(r.left, "pill left inside row").toBeGreaterThanOrEqual(row.left + (atStart ? 0 : fade) - 1);
+    expect(r.right, "pill right inside row").toBeLessThanOrEqual(row.right - (atEnd ? 0 : fade) + 1);
   });
 }
 
@@ -281,6 +286,27 @@ for (const width of [1440, 400]) {
     });
   });
 }
+
+describe("Admin -> Instance wheel-style scrolling from the top (#4419)", () => {
+  it("1440x700: the lit pill follows the reading line in 20px steps, across several sections", async () => {
+    await mount(1440, 700);
+    expect(window.scrollY).toBe(0);
+    // The observer band is built while the block is still unstuck; it must match the stuck geometry.
+    const limit = Math.min(4000, document.documentElement.scrollHeight - 2 * window.innerHeight);
+    const seen: string[] = [];
+    for (let y = 20; y <= limit; y += 20) {
+      window.scrollTo(0, y);
+      await expect.poll(() => Math.abs(window.scrollY - y)).toBeLessThanOrEqual(1);
+      // A few frames for the observers' async callbacks, then the highlight must already be right
+      // (a stale observer band would leave it lagging until some unrelated callback).
+      for (let i = 0; i < 3; i++) await nextFrame();
+      expect(currentPills().map(idOf), `at scrollY ${y}`).toEqual([sectionAtLine().id]);
+      const id = currentPills().map(idOf)[0];
+      if (seen[seen.length - 1] !== id) seen.push(id);
+    }
+    expect(seen.length, `sections lit in order: ${seen.join(",")}`).toBeGreaterThanOrEqual(3);
+  }, 90_000);
+});
 
 describe("Admin -> Instance pill edge fade (#4419)", () => {
   const fade = () => {

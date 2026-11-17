@@ -167,6 +167,24 @@ describe("Judge chips and tabs pin (#4419)", () => {
     });
   }
 
+  it("at 1024px toggling a far chip keeps that chip in the row, not the first pressed one", async () => {
+    await mount(1024, `/judge?category=${JUDGE_CATEGORIES[0]}`);
+    await scrollDeep();
+    const row = scroller();
+    expect(row.scrollWidth).toBeGreaterThan(row.clientWidth);
+    row.scrollLeft = row.scrollWidth;
+    await nextFrame();
+    const chips = Array.from(row.querySelectorAll<HTMLElement>("button"));
+    const lastChip = chips[chips.length - 1];
+    lastChip.click();
+    await waitFor(() => expect(lastChip.getAttribute("aria-pressed")).toBe("true"));
+    for (let i = 0; i < 5; i++) await nextFrame();
+    const r = row.getBoundingClientRect();
+    const c = lastChip.getBoundingClientRect();
+    expect(c.left, "toggled chip inside the row").toBeGreaterThanOrEqual(r.left);
+    expect(c.right, "toggled chip inside the row").toBeLessThanOrEqual(r.right + 0.5);
+  });
+
   it("at 400px the chips scroll away; an active filter shows a Filtered marker in the pinned block, and Clear clears it", async () => {
     await mount(400, "/judge?category=improve_uzi");
     const block = blockEl();

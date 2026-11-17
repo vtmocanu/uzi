@@ -40,11 +40,20 @@ export function LabelFilter({
   const scrollerRef = useRef<HTMLDivElement>(null);
   useEdgeFade(scrollerRef, layout);
   const selectedKey = selected.join(",");
+  // The chip the user just toggled (click or keyboard activation). A toggle keeps THAT chip
+  // in view; only mount or a layout change falls back to the first pressed chip.
+  const toggledRef = useRef<HTMLElement | null>(null);
   useEffect(() => {
     const scroller = scrollerRef.current;
     if (!scroller) return;
+    const toggled = toggledRef.current;
+    toggledRef.current = null;
+    const target =
+      toggled && scroller.contains(toggled)
+        ? toggled
+        : scroller.querySelector<HTMLElement>('[aria-pressed="true"]');
     // Inset 24: clear of the row's 24px edge fade.
-    keepInRowView(scroller, scroller.querySelector<HTMLElement>('[aria-pressed="true"]'), 24);
+    keepInRowView(scroller, target, 24);
   }, [selectedKey, layout]);
   // One inline chip row (PRD #1183 M2): no surrounding box, no eyebrow, no caption line — the
   // "counts are groups, deduped by target" explanation moves onto the row's title attribute so
@@ -64,7 +73,10 @@ export function LabelFilter({
             type="button"
             aria-pressed={on}
             aria-label={`${label}, ${count} ${count === 1 ? "group" : "groups"}`}
-            onClick={() => onToggle(cat)}
+            onClick={(e) => {
+              toggledRef.current = e.currentTarget;
+              onToggle(cat);
+            }}
             className={cx(
               "inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-sm font-medium transition-colors",
               layout === "row" && "shrink-0 focus-visible:ring-inset focus-visible:ring-offset-0",
@@ -103,7 +115,12 @@ export function LabelFilter({
           invisible + non-focusable until something is selected. */}
       <button
         type="button"
-        onClick={onClear}
+        onClick={() => {
+          onClear();
+          // Clear turns invisible and non-focusable once the filter empties: hand focus to
+          // the first chip rather than dropping it to the body.
+          scrollerRef.current?.querySelector<HTMLElement>("button")?.focus({ preventScroll: true });
+        }}
         aria-hidden={active.size === 0}
         tabIndex={active.size === 0 ? -1 : 0}
         className={`${layout === "row" ? "shrink-0" : "ml-auto"} inline-flex min-h-[24px] items-center gap-1 rounded-md px-2 py-1 text-xs font-medium text-muted transition-colors hover:bg-raised hover:text-fg${
