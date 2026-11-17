@@ -429,7 +429,7 @@ control is still absent, not that the functional criterion was deferred.
 | Stopped frozen secret and capability hash presence | D25–D56: running/paused missing_frozen_secret and missing_capability_hash; binding identity/ownership unvalidated |
 | Stopped switch-request/generation, ordinary hold, pause-request/mode, stop-kind/reason and reserve-hold markers | D25–D56: individual running/paused marker cases; policy and other competing controls unvalidated |
 | Stopped refusal of claimed status | D25–D56: running/paused status_claimed; other statuses unvalidated |
-| Stopped ownership, lane and policy fences | D57–D60 credit pending-fresh/unresolved-outcome; D61 paused policy-hold; D62/D63 stable user-owner mismatch running/paused. Lane controls, concurrent owner changes and other policy clauses unvalidated |
+| Stopped ownership, lane and policy fences | D57–D60 credit pending-fresh/unresolved-outcome; D61 paused policy-hold; D62/D63 stable user-owner mismatch running/paused. D64–D73 credit the five enumerated STOP lane exclusions running/paused; concurrent owner changes and other policy clauses unvalidated |
 | Stopped replay after withdrawn X/Y; resume/reclaim and incarnation changes | Unvalidated; the fixture's single HTTP withdrawal does not discharge X/Y |
 | Stopped preservation of binding, journals, session, gates, questions and custody without input consumption/time banking | E1 base-journal deletion, E2 applied-input deletion, E3 custody timestamp corruption only; other effects, actual custody release, replay sensitivity and broader clauses unvalidated |
 | Stopped known extra typed member and register_nonce case alias | D25–D56: four running/paused wire cases only |
@@ -936,3 +936,73 @@ by D62/D63. The lane fixtures now have positive refusal evidence, but their own
 mutation controls remain **unvalidated**. No per-copy independent sufficiency,
 concurrent owner-change freshness, all ownership surfaces, remaining preservation
 or runtime/transaction clauses, or m4 security is claimed. m3/m4 remain incomplete.
+
+
+### D64–D73 — five stopped lane exclusions, class (d)
+
+Candidate 341c861df72618b359b81e1afc81a91300439cc2. Receipts:
+.uzi/scratch/stopped-lane-results-a.json (chat/judge/job) and
+.uzi/scratch/stopped-lane-results-b.json (cross_check/reviewtarget).
+These are **redundant-fence guard controls** on the real authenticated stopped
+route, not historical restorations or per-copy independent sufficiency proofs.
+The shared exact a233 stopped-operation refusal/absence evidence above applies.
+
+Each selected kind control removes only that kind from
+credential_switch_codex.go:338's case list and the source stopped query :16 /
+generated query :26 NOT IN list. Review-target controls remove only the helper's
+ReviewTargetRunID.Valid block (:334–336) and source :15 / generated :25
+review_target_run_id IS NULL conjunct. Source and generated SQL are counterparts
+of one query, not two executing guards. Thus each semantic exclusion has two
+executing copies: the Go helper and generated query. Each status/negative gets
+its own serial candidate export, removed before the next export.
+
+The bounded census follows RequireWorker → WorkerRunState → reconciliation
+wrapper with four-field stopped payload → service.go:4675–4676 early STOP →
+beginClaimMutation worker/run FOR UPDATE locks → codexSwitchLaneEligible and
+policy helper → generated stopped query → worker-owned reread → commit.
+The post-read cross_check generation-zero and isolated-lane backstops remain
+intact; these fixtures use positive generations and compatible unbound workers.
+Other kind/review exclusions, status, worker/user ownership, claim, nonce,
+epoch, binding, policy, input and budget predicates are unchanged in each diff.
+The controls do not certify trigger or concurrency behavior beyond this path.
+
+| Control | Negative | Individual assertion-red log |
+| --- | --- | --- |
+| D64 | running/chat | gate-log.OgS8lD |
+| D65 | paused/chat | gate-log.pWdgjR |
+| D66 | running/judge | gate-log.gvaA6U |
+| D67 | paused/judge | gate-log.I9odkU |
+| D68 | running/job | gate-log.wXKqPC |
+| D69 | paused/job | gate-log.3PZO67 |
+| D70 | running/cross_check | gate-log.NAKUNI |
+| D71 | paused/cross_check | gate-log.EF2wRb |
+| D72 | running/reviewtarget | gate-log.u5TJNl |
+| D73 | paused/reviewtarget | gate-log.sGK7x4 |
+
+All logs are under .uzi/scratch/. Every selected leaf compiles and exits 1 at
+lane fixture :79, `refusal mismatch: status=200 applied=true`; no skips,
+SQLSTATE, build failure or timeout supplies the red. With GOFLAGS=-p=1 and
+GOMAXPROCS=4, each command from the export's api directory is:
+
+```sh
+go test -buildvcs=false -race -count=1 -json -timeout=5m ./internal/handler -run '^TestWorkerCodexStoppedLaneRouteLiveDB$/^STATE$/^KIND$'
+```
+
+Unchanged green is reused from the previous actual before/after handler runs
+at 05169b18b: gate-log.sL2joH and gate-log.zRS6LN, exit 0, all ten lane leaves
+passing without skips. The only revision delta to 341c861df is the two ledger
+docs. Both harnesses verify 5,946 API/fixture/Go/build inputs are byte-identical
+at old candidate, current candidate and primary, and verify the raw green logs,
+Go runtime, serial flags and PostgreSQL fixture recipe before reuse. They do
+not rerun the unchanged gate just to report it again. The lead independently
+checked the current input hashes, raw log hashes/leaf failures, and reconstructed
+every exact three-file mutant to verify its recorded post-mutation hash.
+
+Timing is recorded per case in the receipts (7.648–419.871s, including compile
+and cache costs), not a CI before/after comparison or critical-path measurement.
+Both exact owned database fixtures were removed with cleanup exit 0; exports
+removed, primary unchanged, prior evidence preserved. No installs, base builds,
+concurrent builds or broad security/full-suite result. Credit is only the five
+enumerated stopped exclusions in running/paused states. Owner-request, preflight,
+apply, other statuses and remaining runtime/transaction/security clauses are not
+discharged by this shared helper's STOP controls. m3/m4 remain **INCOMPLETE**.

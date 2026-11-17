@@ -624,3 +624,28 @@ no findings. No production guard changed. Lane refusal assertions are positive
 evidence only until their own sensitivity controls execute. Remaining m3
 requirements and m4 checks remain required and incomplete; no new full-suite,
 security, CI-performance or broad ownership proof is claimed.
+
+
+## Stopped lane exclusion controls
+
+D64–D73 add ten individual class (d) redundant-fence guard controls at
+341c861df: running/paused for chat, judge, job, cross_check and review-target.
+Each neutralizes only one semantic exclusion in the Go helper and executing
+SQL, preserving every other fence. Exact three-file diffs, source/mutant hashes,
+commands, timings and raw logs are in stopped-lane-results-a.json and
+stopped-lane-results-b.json under .uzi/scratch/.
+
+All ten selected real-route leaves compile and exit 1 at the intended
+`refusal mismatch: status=200 applied=true` assertion, with no skipped target,
+SQLSTATE, build failure or timeout. Green is reused from the actual exit-0
+before/after logs sL2joH and zRS6LN at 05169b18b. Both harnesses verified the
+5,946 API/fixture/Go/build input hashes and docs-only delta before reuse; the
+lead independently checked current hashes, raw log hashes/outcomes, and exact
+mutant reconstruction. No unchanged gate was rerun solely for reporting.
+
+Each negative had its own serial removed export. Both recreated exact fixtures
+were removed with cleanup exit 0; primary unchanged and prior evidence preserved.
+The bounded worker/run-locked path and two executing copies are enumerated in
+the ledger. Credit is STOP-only, not independent per-copy sufficiency or owner
+request/preflight/apply/concurrency coverage. Remaining m3 and m4 obligations
+stay required and incomplete; full suites/security and CI timing are not claimed.
