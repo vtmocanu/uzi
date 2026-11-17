@@ -38,6 +38,11 @@ func setupStoppedGuardsRoute(t *testing.T) (*applyRouteEnv, stoppedRouteWire) {
 
 func setupStoppedGuardsRouteWithSeed(t *testing.T, seedPending bool) (*applyRouteEnv, stoppedRouteWire) {
 	t.Helper()
+	return setupCodexSwitchAccountRoute(t, seedPending, false)
+}
+
+func setupCodexSwitchAccountRoute(t *testing.T, seedPending, subscriptionA bool) (*applyRouteEnv, stoppedRouteWire) {
+	t.Helper()
 	e := setupApplyRouteLiveDB(t)
 	ctx := context.Background()
 	q, svc := e.handler.q, e.handler.wsvc
@@ -76,8 +81,16 @@ func setupStoppedGuardsRouteWithSeed(t *testing.T, seedPending bool) (*applyRout
 		return id
 	}
 	oldLabel := "stopped-old-" + uuid.NewString()
-	old, target := seed(oldLabel), seed("stopped-target-"+uuid.NewString())
-	if err := svc.FreezeCodexBinding(ctx, e.user, e.run, old, "api_key"); err != nil {
+	var old uuid.UUID
+	mode := "api_key"
+	if subscriptionA {
+		old, oldLabel = seedCodexSwitchSubscriptionA(t, e)
+		mode = "subscription"
+	} else {
+		old = seed(oldLabel)
+	}
+	target := seed("stopped-target-" + uuid.NewString())
+	if err := svc.FreezeCodexBinding(ctx, e.user, e.run, old, mode); err != nil {
 		t.Fatal(err)
 	}
 	hash := sha256.Sum256([]byte("synthetic stopped capability"))
