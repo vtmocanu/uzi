@@ -598,3 +598,29 @@ Fixture review found no findings. No installs, base build or skipped target case
 CI timing impact remains unmeasured; full suites and m4 security are not credited.
 Only paused policy-hold refusal is newly credited; other policy, lane, ownership,
 preservation and runtime/transaction obligations remain required. m3/m4 incomplete.
+
+
+## Stopped owner controls and repaired lane fixtures
+
+D62/D63 record running and paused user-owner mismatch controls at
+05169b18baf7af89550ea226543a1177abbf1f30. The real authenticated fixture changes
+only the worker's stored owner, preserving worker identity, token, claim and run
+binding; matched cohorts perform identical bookkeeping preparation. The mutant
+neutralizes only the two user-owner comparisons in the stopped query, with source
+and generated counterparts changed mechanically. It preserves worker-ID and all
+other fences, with no per-copy sufficiency or concurrent-owner-change claim.
+
+Receipt .uzi/scratch/stopped-owner-results-05169.json records before exit 0
+(sL2joH), running and paused intended assertion-red exits 1 (0YkQk7, WLnI46),
+and after exit 0 (zRS6LN). Log names use .uzi/scratch/gate-log. prefix. Each matched
+positive passes on the mutant; both complete unchanged runs pass ten lane and
+four owner leaves without skips. The lead inspected hashes, exact diffs and
+individual log events. Cleanup exit 0, export removed, primary unchanged.
+
+The earlier lane seed failure (42P08, CSHyW5 at 7a1054dec) is retained, not
+credited as a mutant kill. The narrow UUID-cast repair passes focused check
+674SKu and subsequent fourteen-leaf runs. Source fixture and repair reviews found
+no findings. No production guard changed. Lane refusal assertions are positive
+evidence only until their own sensitivity controls execute. Remaining m3
+requirements and m4 checks remain required and incomplete; no new full-suite,
+security, CI-performance or broad ownership proof is claimed.

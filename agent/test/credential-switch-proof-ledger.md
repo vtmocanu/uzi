@@ -861,3 +861,78 @@ Security-gate credit is not supplied by this control or by the tester's template
 slot labels; m4 security remains required worker work. This proves the paused
 policy-hold fence only, not running-policy-hold, owner-request/apply policy,
 lane/ownership or remaining preservation clauses. m3/m4 remain **INCOMPLETE**.
+
+
+### D62–D63 — stopped user-owner redundant-fence guard controls, class (d)
+
+Candidate 05169b18baf7af89550ea226543a1177abbf1f30; receipt
+.uzi/scratch/stopped-owner-results-05169.json. Shared exact a233 STOP
+refusal/absence evidence above applies. These are **redundant-fence guard
+controls**, not historical restoration or per-copy sufficiency evidence.
+
+The source query :9–10 implements one semantic owner fence twice:
+`w.user_id = r.user_id` in the join and `r.user_id = sqlc.arg(user_id)::uuid`
+in eligibility. Generated codex_switch_stopped.sql.go:19–20 executes both;
+the source is the declarative counterpart, not two additional executing copies.
+Each mutant removes the join's owner comparison and neutralizes only the second
+comparison as `$3::uuid IS NOT NULL` (matching sqlc.arg form in source). This
+retains argument plumbing and all worker-ID, generation, nonce, epoch, binding,
+status, lane, policy, input and budget checks. Exact two-file diffs and hashes
+are in the receipt. Running and paused cases used separate serial exports.
+
+Fixture owner_routes_livedb_test.go verifies the exact worker and run rows before
+and after preparation. It keeps token, worker ID, nonce, claim and frozen run
+binding unchanged, but assigns the worker to a different existing user. Matched
+controls perform identical forge-origin/cooldown bookkeeping removal, retaining
+the original owner. This avoids changing runs.user_id, which would break its
+Codex-secret composite FK. Both cohorts assert NULL worker Anthropic binding,
+then prove only workers.user_id changed and all run snapshots stayed unchanged.
+This is disposable test preparation, not an application-supported ownership
+transfer or a claim about concurrent authentication/ownership changes.
+
+Path census: actual RequireWorker token lookup reads the current worker owner;
+WorkerRunState → reconciliation wrapper (no optional payloads) → service early
+STOP return → beginClaimMutation (READ COMMITTED, worker then owned-run FOR
+UPDATE locks) → stopped lane/policy checks → SetCodexSwitchStopped → worker-ID
+reread → commit. The lock query and post-read authorize worker identity, not
+user identity. ownedRunOrRefusal service.go:6874–6896 adds cross-check-generation
+and isolated-lane checks, neither a user-owner copy. No Go user-owner comparison
+was found on this exercised four-field path. The query's two owner predicates
+therefore execute under the same locks; the census is bounded to this route.
+
+| Control | Negative case | Individual red log |
+| --- | --- | --- |
+| D62 | running/mismatched_owner | gate-log.0YkQk7 |
+| D63 | paused/mismatched_owner | gate-log.WLnI46 |
+
+Each negative exits 1 at owner fixture :100,
+`refusal mismatch: status=200 applied=true`; its matched_positive companion
+passes. No skips, SQLSTATE, timeout or build error supplies the red. Primary
+before gate-log.sL2joH and after gate-log.zRS6LN exit 0, all ten lane and four
+owner leaves passing. With GOFLAGS=-p=1 and GOMAXPROCS=4, from api:
+
+```sh
+go test -buildvcs=false -race -count=1 -json -timeout=5m ./internal/handler -run '^TestWorkerCodexStopped(Lane|Owner)RouteLiveDB$'
+```
+
+Each control selects the Owner test and one state's negative plus matched leaf.
+All logs are under .uzi/scratch/. The lead checked original source hashes,
+exact diffs, individual JSON leaf outcomes and assertion text. Exact owned
+fixture cleanup exits 0, export removed, primary clean and hashes unchanged.
+No installs, base builds or concurrent Go builds. Source unit and UUID repair
+were independently reviewed without findings.
+
+The initial candidate 7a1054dec failed six lane seed statements with SQLSTATE
+42P08; no mutants were run on that failed baseline. Its log gate-log.CSHyW5,
+receipt stopped-owner-results.json and trace remain preserved. Commit 05169b18b
+consistently casts the shared target ID parameter to UUID, then text only for
+branch construction. Focused judge/reviewtarget gate-log.674SKu exits 0 before
+the complete fourteen-leaf run. This is fixture repair, not a product-guard
+relaxation. Recorded wall times include compilation/cache; CI critical-path
+impact remains unmeasured.
+
+Only stable authenticated worker/run user-owner mismatch refusal is credited
+by D62/D63. The lane fixtures now have positive refusal evidence, but their own
+mutation controls remain **unvalidated**. No per-copy independent sufficiency,
+concurrent owner-change freshness, all ownership surfaces, remaining preservation
+or runtime/transaction clauses, or m4 security is claimed. m3/m4 remain incomplete.
