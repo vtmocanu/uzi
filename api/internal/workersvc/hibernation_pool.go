@@ -264,8 +264,10 @@ type surplusPassParams struct {
 // HibernationAutoAdmissionsPerPass, shared by every kind of change. A refused or skipped candidate
 // is not a state change, so the owner's next candidate is tried. The result counts state changes.
 //
-// Uncertain outcomes: any non-nil Commit error, and any error returned from the attempt body (a
-// 55P03 raised inside the body included), may have landed server-side, so the attempt is
+// Uncertain outcomes (PRD D21): a non-nil Commit error is genuinely ambiguous, since a commit can
+// succeed on the server and still return an error. An error returned from the attempt body (a
+// 55P03 raised inside the body included) never commits, because the transaction is rolled back,
+// but it is treated as uncertain too, conservatively, by the owner's decision. Both surface as
 // *hibernationCommitUncertainError. Such an attempt consumes one unit of the budget, is recorded
 // in the joined error, is not counted as a change, and ends that owner for the pass. Errors from
 // steps before the body (begin, SET LOCAL, the owner advisory lock, GetWorkerForUpdate) keep
@@ -561,9 +563,10 @@ func (s *Service) admitPooledLong(ctx context.Context, q *store.Queries, row sto
 
 // hibernationOwnerTx runs fn in one READ COMMITTED transaction under the owner's hibernation
 // lock. The order is fixed (lock-order invariant of the PRD): lock_timeout, the owner advisory
-// lock as the FIRST locking statement, then the candidate row lock. A lock that is not granted
-// within the lock timeout (SQLSTATE 55P03) rolls the transaction back and returns
-// errHibernationOwnerBusy. It never calls WakeWorker or HibernateWorker (each opens its own
+// lock as the FIRST locking statement, then the candidate row lock. If the owner lock or the
+// candidate row lock is not granted within the lock timeout (SQLSTATE 55P03), it rolls the
+// transaction back and returns errHibernationOwnerBusy. Any error from fn (a 55P03 inside fn
+// included) and any Commit error is returned as *hibernationCommitUncertainError instead. It never calls WakeWorker or HibernateWorker (each opens its own
 // transaction and would wait on the candidate lock held here) and inserts no event row.
 func (s *Service) hibernationOwnerTx(ctx context.Context, owner, candidate uuid.UUID, fn func(q *store.Queries, w store.Worker) error) error {
 	if s.txBeginner == nil {
