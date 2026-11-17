@@ -13,7 +13,7 @@ import (
 )
 
 // Issue #4395 M2: the owner activity anchor is served by the three per-user indexes on runs
-// (00468 runs_user_created_idx, 00469 runs_user_terminal_end_idx, 00470 runs_user_nonterminal_idx).
+// (00469 runs_user_created_idx, 00470 runs_user_terminal_end_idx, 00471 runs_user_nonterminal_idx).
 // The PRD statement is EXPLAINed verbatim, and so is the generated query that embeds the same
 // arms (GetOwnerHibernationPoolInput), so a rewritten arm that loses its index is caught in both.
 //

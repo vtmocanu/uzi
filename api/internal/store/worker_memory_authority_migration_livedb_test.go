@@ -8,7 +8,7 @@ import (
 	"github.com/google/uuid"
 )
 
-// Issue #4395: 00465_worker_memory_authority_lost_at.sql adds workers.memory_authority_lost_at
+// Issue #4395: 00466_worker_memory_authority_lost_at.sql adds workers.memory_authority_lost_at
 // (NULL for every existing row) and its Down drops it. Uses a separate database: never rolls
 // back the shared store-IT database.
 func TestWorkerMemoryAuthorityMigrationLiveDB(t *testing.T) {

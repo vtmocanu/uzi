@@ -8,7 +8,7 @@ import (
 	"github.com/google/uuid"
 )
 
-// Issue #4395: the op-bound origin markers (00466 adds the columns and NOT VALID CHECKs, 00467
+// Issue #4395: the op-bound origin markers (00467 adds the columns and NOT VALID CHECKs, 00468
 // validates them). Uses a separate database: never rolls back the shared store-IT database.
 func TestWorkerHibernationOriginMigrationLiveDB(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
@@ -52,7 +52,7 @@ func TestWorkerHibernationOriginMigrationLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	if columns() != 4 {
-		t.Fatalf("columns after 00466 = %d, want 4", columns())
+		t.Fatalf("columns after 00467 = %d, want 4", columns())
 	}
 	for _, c := range constraints {
 		if validated(c) {
@@ -70,7 +70,7 @@ func TestWorkerHibernationOriginMigrationLiveDB(t *testing.T) {
 	}
 	for _, c := range constraints {
 		if !validated(c) {
-			t.Fatalf("%s not validated after 00467", c)
+			t.Fatalf("%s not validated after 00468", c)
 		}
 	}
 
