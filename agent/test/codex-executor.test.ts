@@ -1,3 +1,4 @@
+import { acquireCodexOperationScope, codexOperationAuthorityIdentity } from "../src/codex-operation-scope.js";
 import { terminalSealMaterial } from "../src/codex/executor-lifetime.js";
 import { ownedSummaryFactories, summaryCallDeadlines, summaryOwnership } from "../src/codex/summary-ownership.js";
 import { provisionNative } from "./codex-provision-fixture.js";
@@ -32470,6 +32471,8 @@ describe("M2 actualRunner credential replacement", () => {
         const positiveBChild = publication === "gated" && oldClaim === API_KEY && target === SUBSCRIPTION && phase === "factory";
         const probeEpochConsumers = publication === "baseline" && oldClaim === API_KEY && phase === "factory";
         const probeBInitialCredential = publication === "baseline" && phase === "factory";
+        const probeScopeIdentity = publication === "baseline" && phase === "factory" &&
+          oldClaim.auth_mode === "subscription" && target.auth_mode === "subscription";
         const aRefreshSubscription = "generation" in oldClaim ? oldClaim : undefined;
         const probeARefreshDrain = publication === "baseline" && phase === "factory" && oldClaim.auth_mode === "subscription";
         const queuedRefreshStop = publication === "subscription-refresh-prepare-failure" || publication === "subscription-refresh-cancel";
@@ -32591,11 +32594,19 @@ describe("M2 actualRunner credential replacement", () => {
         const teardownResults: boolean[] = [];
         const failedRootReaps: Awaited<ReturnType<ReturnType<typeof trackedRoot>["root"]["reap"]>>[] = [];
         const dispositions: { status: string; failure_reason?: string }[] = [];
+        const scopeIdentityUncertain = installerBarrier();
         const unexpectedPreservePause = installerBarrier();
         const report = client.reportState.bind(client);
         client.reportState = async (id, body, ...args) => {
           reports.push(body.status);
           dispositions.push({ status: body.status, failure_reason: body.failure_reason });
+          if (probeScopeIdentity && body.status === "credential_switch_uncertain") {
+            scopeIdentityUncertain.resolve();
+            // ACK only the failure path so the driver can diagnose a scope collision and join cleanup.
+            cleanOwnership.status = "paused";
+            api.setOwnershipStatus(id, "paused", 7);
+            return { applied: true, credentialSwitchUncertain: true };
+          }
           if (preserveNegative && body.status === "credential_switch_uncertain") {
             assert.ok(!preserveNonce, "registration fence cannot report through the old owner");
             assert.equal(body.op_id, "M2-op");
@@ -33698,7 +33709,7 @@ describe("M2 actualRunner credential replacement", () => {
           worktreePath?: string;
           attemptId?: string;
           runnerClone?: { path: string; attemptId?: string };
-          operationScope?: object;
+          operationScope?: ReturnType<typeof acquireCodexOperationScope>;
           parked: boolean;
           keepGuardedInventoryOpen: boolean;
           preserveRecoveryClone: boolean;
@@ -33807,6 +33818,9 @@ describe("M2 actualRunner credential replacement", () => {
             retryScheduled.resolve();
             return handle;
           }) : undefined;
+        let retainedAScope: ReturnType<typeof acquireCodexOperationScope> | undefined;
+        let bLookupScope: ReturnType<typeof acquireCodexOperationScope> | undefined;
+        let actualAController: ReturnType<typeof acquireCodexOperationScope>["controller"] | undefined;
         const running = runner.execute(claim);
         const joinExecution = async () => {
           const settled = await Promise.allSettled([running, ...triggers]);
@@ -33816,6 +33830,13 @@ describe("M2 actualRunner credential replacement", () => {
         };
         try {
           await withTimeout(aEntered.promise, 5000, "M2 A turn");
+          if (probeScopeIdentity) {
+            assert.ok(actualFlight?.operationScope, "actual Runner publishes A subscription scope");
+            actualAController = actualFlight.operationScope.controller;
+            retainedAScope = acquireCodexOperationScope(client, claim.run_id, claim.claim_generation!,
+              undefined, undefined, undefined, undefined, codexOperationAuthorityIdentity(oldClaim.capability));
+            assert.equal(retainedAScope.controller, actualAController, "nonowning A reference retains the actual Runner entry");
+          }
           if (publication === "gated" || injectedStage) {
             assert.ok(actualFlight, "capture the real run/generation/executor flight");
             scopeDescriptor = Object.getOwnPropertyDescriptor(actualFlight, "operationScope");
@@ -35127,6 +35148,24 @@ describe("M2 actualRunner credential replacement", () => {
               return;
             }
           }
+          if (probeScopeIdentity) {
+            const wake = await withTimeout(Promise.race([
+              switchSettled.promise.then(() => "settled" as const),
+              scopeIdentityUncertain.promise.then(() => "uncertain" as const),
+            ]), 5000, "credential scope identity switch disposition");
+            assert.ok(!dispositions.some(body => body.status === "credential_switch_uncertain"),
+              "retaining A scope must not force an uncertain credential switch hold");
+            assert.equal(wake, "settled");
+            assert.equal(switchError, undefined);
+            assert.equal(switchResult, "resumed_B");
+            assert.ok(actualFlight?.operationScope, "actual Runner publishes B subscription scope");
+            assert.notEqual(actualFlight.operationScope.controller, actualAController,
+              "B uses a distinct controller while the nonowning A reference is retained");
+            bLookupScope = acquireCodexOperationScope(client, claim.run_id, claim.claim_generation!,
+              undefined, undefined, undefined, undefined, codexOperationAuthorityIdentity(next.capability));
+            assert.equal(bLookupScope.controller, actualFlight.operationScope.controller,
+              "replacement authority lookup finds the actual Runner B controller");
+          }
           if (probeBInitialCredential) {
             await withTimeout(bInitialCredentialObserved.promise, 5000, "B initial credential request observed");
             assert.deepEqual(bInitialCredentialRequest, { capability: true, mode: true, account: true, floor: true,
@@ -35281,38 +35320,43 @@ describe("M2 actualRunner credential replacement", () => {
           assert.equal(b.transport.threadStartCount, positiveBChild || resumeRefusal ? 1 : 0);
           assert.equal(await fs.readFile(path.join(worktree, "M2-retained.txt"), "utf8"), "A work");
         } finally {
-          scopeProbesArmed = false;
-          aRefreshRelease.resolve(); aRefreshContinue.resolve();
-          releaseRetry?.();
-          retryTimer?.mock.restore();
-          cancelled = true; pending = false; nowContinue.resolve(); summaryDisposeContinue.resolve(); cleanupContinue.resolve();
-          bCleanupContinue.resolve();
-          for (const barrier of publicationBarriers) barrier.proceed.resolve();
-          a.transport.push(turnCompleted("interrupted", savedId, "M2-A-turn"));
-          b.transport.push(turnCompleted("interrupted", bThreadId, bTurns > 1 ? "M2-B-idle" : "M2-B-turn"));
           try {
-            await joinExecution();
-          } finally {
-            await aSuspendOwned?.catch(() => {});
-            try { await joinNowConsumerProbes(); }
-            finally {
-              scopeProbesArmed = false;
-              try {
-                if (scopeIntercepted && actualFlight) {
-                  // Preserve Runner's latest backing value, including terminal cleanup.
-                  Object.defineProperty(actualFlight, "operationScope", scopeDescriptor
-                    ? { ...scopeDescriptor, value: scopeBacking }
-                    : { configurable: true, enumerable: true, writable: true, value: scopeBacking });
-                }
-              } finally { flightProbe.mock.restore(); }
-              preparationProbe.mock.restore();
-              epochProbe.mock.restore();
-              startTurnProbe.mock.restore();
-              brokerProbe.mock.restore();
-              nowProbe.mock.restore();
-              client.registrationNonce = originalRegistrationNonce;
-              await fs.rm(dir, { recursive: true, force: true });
+            scopeProbesArmed = false;
+            aRefreshRelease.resolve(); aRefreshContinue.resolve();
+            releaseRetry?.();
+            retryTimer?.mock.restore();
+            cancelled = true; pending = false; nowContinue.resolve(); summaryDisposeContinue.resolve(); cleanupContinue.resolve();
+            bCleanupContinue.resolve();
+            for (const barrier of publicationBarriers) barrier.proceed.resolve();
+            a.transport.push(turnCompleted("interrupted", savedId, "M2-A-turn"));
+            b.transport.push(turnCompleted("interrupted", bThreadId, bTurns > 1 ? "M2-B-idle" : "M2-B-turn"));
+            try {
+              await joinExecution();
+            } finally {
+              await aSuspendOwned?.catch(() => {});
+              try { await joinNowConsumerProbes(); }
+              finally {
+                scopeProbesArmed = false;
+                try {
+                  if (scopeIntercepted && actualFlight) {
+                    // Preserve Runner's latest backing value, including terminal cleanup.
+                    Object.defineProperty(actualFlight, "operationScope", scopeDescriptor
+                      ? { ...scopeDescriptor, value: scopeBacking }
+                      : { configurable: true, enumerable: true, writable: true, value: scopeBacking });
+                  }
+                } finally { flightProbe.mock.restore(); }
+                preparationProbe.mock.restore();
+                epochProbe.mock.restore();
+                startTurnProbe.mock.restore();
+                brokerProbe.mock.restore();
+                nowProbe.mock.restore();
+                client.registrationNonce = originalRegistrationNonce;
+                await fs.rm(dir, { recursive: true, force: true });
+              }
             }
+          } finally {
+            try { bLookupScope?.close(); }
+            finally { retainedAScope?.close(); }
           }
         }
       });
