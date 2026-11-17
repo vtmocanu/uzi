@@ -876,3 +876,24 @@ skips. Runs are serial, handler-only, -race -count=1 -json -timeout=4m, p=1/GMP4
 Exports removed; owned fixture cleanup exits 0; primary and prior receipts
 unchanged. Source review found no findings. No owner-to-worker concurrency,
 atomicity, full-suite, security or broader m3/m4 completion claim is made.
+
+
+## Subscription A coordination and intent controls
+
+D78/D79 at 09342accbe0cecb5860812a76f1329ff2aeec7e0 independently exercise
+real worker apply after READY with subscription A and static API-key B.
+A selective coordination control admits only the valid in_progress tuple in
+addition to the original idle tuple, retaining intent/reauth/recovery checks.
+The separate intent control changes only unresolved==0. Each reaches the
+actual outcome assertion at :164 (applied instead of not_applied). Before/after
+pass both new leaves and the original API-key helper journal companion.
+
+Scratch apply-refresh-results.json and apply-refresh-lead-audit.json record
+diffs, independently reconstructed mutant hashes, verified raw log actions and
+cleanup. Logs jc9KJV/MtvoZU/S7TURV/z4Dm1C (gate-log. prefix) exit 0/1/1/0,
+without skips or credited setup/build/SQL failures. Runs are serial handler-only,
+-race -count=1 -json -timeout=4m, p=1/GMP4. Exports removed, owned fixture cleanup
+exit 0, primary/prior receipts unchanged. Source and concrete-SQL reviews found
+no findings. Synthetic states isolate the fences; this is not provider refresh
+admission, worker reconciliation ordering, multi-account locking, atomicity,
+full-suite, security or m3/m4 completion evidence.

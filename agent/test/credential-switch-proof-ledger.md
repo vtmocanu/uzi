@@ -416,7 +416,7 @@ control is still absent, not that the functional criterion was deferred.
 | Whole operation-scope/refresh/identity/capability/summary replacement and retired-A rejection | A2 credits one reader; A3 retained-A/Sub→Sub B-scope namespace isolation; R7 B dispatcher publication readiness; R8 retired API-key A reconcile release-request fence during B login; remaining mixed clauses unvalidated |
 | Exact saved-ID resume; confirmed-refusal-only fresh fallback and lineage; preservation re-hold | R6 credits uncertain-error classification only; confirmed-refusal/preserve companions positive, independent preservation and other clauses unvalidated |
 | Policy episode rejection at request and under apply lock | D74–D77 credit the two isolated owner cases and the same two conditions introduced after READY before apply; paused holds, concurrent interleavings and other policy clauses unvalidated |
-| Refresh lease/intent exclusion, account lock ordering and boundary reconciliation before revoke | Unvalidated |
+| Refresh lease/intent exclusion, account lock ordering and boundary reconciliation before revoke | D78/D79 credit isolated A coordination-lease and rotating-intent server checks; actual refresh admission, multi-account lock ordering and worker reconciliation ordering remain unvalidated |
 | Post-switch release epoch and secret-hash authorization | B5/B6 preservation sensitivity controls below, through real worker apply and release routes; final reauthorization timing unvalidated |
 | Transactional frozen binding rewrite, capability revoke/remint and post-commit material response | Unvalidated; B5/B6 do not establish transaction atomicity or mint/revoke implementation |
 | Ordinal-zero baseline, successor journal ordinal/capability relation and usage attribution | Positive assertions present; qualifying controls unvalidated |
@@ -1693,3 +1693,84 @@ Credit covers only these two sequential post-preflight conditions on the API-key
 fixture. It does not establish an owner-to-worker end-to-end race, arbitrary
 policy tuples, paused hold admission, atomic rollback, or other m3/m4 clauses.
 Full suites and m4 security gates remain unperformed here.
+
+
+### D78/D79 — subscription A coordination and unresolved-intent checks
+
+Candidate 09342accbe0cecb5860812a76f1329ff2aeec7e0. These are separate class (d)
+guard controls on the new Codex apply seam. Shared baseline absence evidence
+in D76/D77 applies to each: exact git-show of a233 runner.ts:25735–25738
+explicitly refuses live Codex switching, and credential_switch_apply.go:327/:337
+uses the Anthropic chooser/lock. There was no corresponding allowed scoped
+Codex apply to restore; no explicit raw-worker harness rejection is claimed.
+
+TestWorkerCodexApplyRefreshFencesRouteLiveDB links subscription A before its
+first binding freeze, with vault wiring, actual account identity/revisions,
+ordinal-zero baseline and epoch 41. B remains a static API key. Existing
+helper callers delegate with subscriptionA=false and retain their original
+API-key setup. Real READY, registration nonce and pending X precede injection.
+
+The coordination case commits A in_progress with an operation UUID and future
+lease deadline, with zero rotating intents. The intent case leaves A idle,
+operation/deadline NULL, and inserts one rotating intent for A's actual account
+generation and owner. Both assert frozen A identity, current claim, matched X/B,
+clear reauth/recovery, and the intended isolated state before HTTP apply.
+These are valid synthetic states, not a claim that current worker admission
+creates a lease without an intent. No provider I/O or real refresh admission
+is exercised here.
+
+The actual worker route runs apply validation under worker/run locks. It locks
+aliases before accounts, takes account FOR UPDATE NOWAIT, reads A and locks
+rotating intents with FOR SHARE NOWAIT (codex_binding.sql:1117, :1123). The intent
+query uses LIMIT 1: its result length is an existence indicator, not a census
+of all active intents. The decisive call at credential_switch_codex.go:277
+uses codexSwitchAccountIdle at :349–353. Source census covered this validator,
+account/intent reads, and apply writer; ApplyRunCodexBinding does not duplicate
+these coordination/intent predicates. Lock-contention fences remain intact;
+no conflicting transaction is held across apply.
+
+D78 selectively relaxes only the three-field coordination-idle group:
+
+```text
+(idle && !operationValid && !deadlineValid)
+  OR (in_progress && operationValid && deadlineValid)
+```
+
+The original idle branch remains, and committed/quarantined/malformed tuples
+remain rejected. The unchanged unresolved==0, !reauthRequired and empty
+RecoverySealed checks still follow the group. This neutralizes the coordination
+fence for the valid coordinating tuple rather than replacing the whole helper
+or globally discarding its three checks. D79 independently changes only
+unresolved==0 to true in the original helper, retaining the original coordination,
+reauth and recovery conditions. No combined coordination/intent mutant counts.
+
+Unchanged apply must return HTTP 200, not_applied/credential_busy, exactly two
+wire keys, and eight identical snapshot sections: the original six plus the
+complete A account and all A intents ordered by operation ID. Clearing only
+the injected blocker through fixture SQL then permits the same X to bind B at
+42, ordinal 1, with current claim authority and a rotated hash. These are
+positive preservation/availability assertions, not independent effect-sensitivity
+or atomicity proofs. Each compiling mutant fails first at test :164 on actual
+worker apply outcome="applied", want not_applied, before wire-size or snapshot
+assertions. No setup, SQL, build, timeout or race error supplies red credit.
+
+Receipts and lead audit: .uzi/scratch/apply-refresh-results.json and
+apply-refresh-lead-audit.json; script apply-refresh-controls.py. One serial
+invocation uses GOFLAGS=-p=1 GOMAXPROCS=4 and, from api, go test -buildvcs=false
+-race -count=1 -json -timeout=4m ./internal/handler -run <selection>. Before/after
+select both the new test and TestWorkerCodexStoppedSwitchJournalRouteLiveDB;
+each mutant selects only its named new leaf. Logs under .uzi/scratch/ with
+gate-log. prefix: jc9KJV before exit 0, MtvoZU D78 exit 1, S7TURV D79 exit 1,
+z4Dm1C after exit 0. Both greens pass both new leaves and the existing helper
+companion without skips. The lead verified raw log hashes/actions, reconstructed
+both exact mutant hashes and checked current source/prior-receipt hashes.
+Owned fixture cleanup bsCL69 exits 0; each export is removed; primary
+fingerprints and prior receipts are unchanged. Cheap checks: gofmt and
+git diff --check HEAD. Source review and concrete-SQL DBA review of
+418094f63..09342accb found no findings.
+
+API apply itself does not invoke refresh reconciliation. The actual worker has
+a separate captured reconcileA boundary before teardown; neither it nor live
+admitted-refresh timing is proved here. Multi-account lock ordering, recovery
+states, other tuples, full suites, m4 security and the remaining m3/m4 clauses
+remain separate and incomplete.
