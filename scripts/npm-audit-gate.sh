@@ -58,7 +58,7 @@
 # and "at zero" means high-and-above at zero. When this gate was written two MODERATE
 # advisories survived every option on `web` (`react-router` / `react-router-dom`,
 # GHSA-wrjc-x8rr-h8h6 and GHSA-337j-9hxr-rhxg, patched only at 7.18.0 while 6.x was
-# installed); the React Router 7 major has since cleared them (7.18.2 installed, npm
+# installed); the React Router 7 major has since cleared them (7.18.2 installed;
 # the router-specific advisories are cleared). The threshold stays `high`;
 # ADR-4435 adds only maintainer-approved, expiring, dev-only exceptions.
 #

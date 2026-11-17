@@ -1,6 +1,7 @@
 # ADR-4435: Bounded exceptions for development-only npm advisories
 
-**Status:** Proposed, requires explicit maintainer approval before merge.
+**Status:** Accepted.
+**Maintainer approval:** 2026-11-17, the mechanism plus the web and agent picomatch rows, recheck 2026-12-01. New rows or extensions require fresh approval.
 **Date:** 2026-11-17
 **Issue:** [#4435](https://github.com/vtmocanu/uzi/issues/4435)
 **Amends:** [PRD #103](../prds/done/103-dev-loop-quality-gates.md), ruling 1.
@@ -25,7 +26,7 @@ The maintainer may approve a temporary row in scripts/npm-audit-exceptions.tsv.
 The row binds the component, GHSA, package, exact advisory range, maximum accepted
 severity, inclusive UTC recheck date and tracking issue. Dates more than 30 days
 ahead are invalid. The file and production clock have no environment or argument
-override. The initial proposed rows cover only picomatch in web and agent, at
+override. The initial rows cover only picomatch in web and agent, at
 high severity, through 2026-12-01, tracked by #4435.
 
 A pass requires every gated root to match a row. Both root and affected-record
