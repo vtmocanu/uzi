@@ -47,8 +47,8 @@ sweep detects the block, without waiting for **Stuck queued after**
 limit, and so on) still hides it, and setting `health_queued_seconds` to `0`
 still turns it off with every other queued flag. The wording depends on
 whether the run's owner is an admin, because only an admin can change the
-allowlist (**Admin → Instance → Docker worker repo allowlist**, at
-`/admin/settings`). An admin viewing someone else's run sees the owner's
+allowlist (**Admin → Workers → Docker worker repo allowlist**, at
+`/admin/workers`). An admin viewing someone else's run sees the owner's
 variant.
 
 - Owner is an admin: _"this repo isn't on the Docker worker repo allowlist, so

@@ -260,7 +260,7 @@ export function HostedWorkers({
             It shows up under <strong>Your workers</strong> and you delete it there.{" "}
             <em>Docker-capable</em> gives it a Docker daemon for container builds and tests,
             at extra CPU and storage. A Docker-capable worker can pick up repo runs only when an
-            admin has added the repo to the Docker worker repo allowlist under Admin → Instance.
+            admin has added the repo to the Docker worker repo allowlist under Admin → Workers.
             Runs on other repos need another eligible worker.
           </p>
         </>

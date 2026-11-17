@@ -305,7 +305,7 @@ single setting bounds self-service provisioning:
 |---|---|---|
 | `hosted_worker_quota` | 2 | Maximum persistent hosted workers each user may provision, from 0 to 20. Every size counts as one. Zero disables self-service provisioning without changing existing workers. Ephemeral workers have a separate cap. |
 
-Edit it in the **Hosted worker quota** card on **Admin → Instance**. The value
+Edit it in the **Hosted worker quota** card on **Admin → Workers**. The value
 must be an integer from `0` to `20`; it saves independently of the other cards.
 
 Every size counts the same 1 against this quota; see
@@ -349,7 +349,7 @@ unit together:
 |---|---|---|
 | `custody_hold_limit` | 8 | The per-owner admission limit, a whole number from 1 to 1000. There is no zero or "unlimited" value. One deployment-wide value, applied separately to every owner. |
 
-Edit it in the **Custody hold limit** card on **Admin → Instance settings**. The
+Edit it in the **Custody hold limit** card on **Admin → Workers**. The
 settings API and the form refuse `0`, negatives, non-integers, signs such as `+12`
 and anything above 1000.
 

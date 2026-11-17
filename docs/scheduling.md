@@ -1566,7 +1566,7 @@ provisions when every capable worker stays busy (the saturation trigger),
 after the saturation debounce.
 
 **Turning it on** takes two switches, both off by default: an admin enables
-the feature instance-wide from **Admin → Instance**, then you opt in from
+the feature instance-wide from **Admin → Workers**, then you opt in from
 your own **Workers page** (Settings → Workers), in the hosted-worker
 section — that per-user toggle only appears there once the admin switch is
 on. A per-user cap also bounds how many throwaway workers you can have

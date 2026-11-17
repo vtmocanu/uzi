@@ -1542,7 +1542,7 @@ uzi run recovery [--json]
   custody. `blocked_runs` excludes continuations eligible for the exemption, and also counts queued runs
   stopped by the hard per-run bound (their own open holds at the limit), even when the owner is below it. If the
   server cannot read a valid `custody_hold_limit`, the listing returns an error instead of
-  guessing a limit; an admin saves a valid value in Admin → Instance settings. For each
+  guessing a limit; an admin saves a valid value in Admin → Workers. For each
   `source_only` hold it reports retained source and archive availability independently.
   An available archive can be exported but may omit latest worker-local work; a latest
   preparing/uploading capture is reported as progress, without promising download or

@@ -22,7 +22,7 @@ available if your admin has turned hosting on for this instance.
    whose admin has turned the docker tier on), then **Provision**.
 
    A Docker-capable worker claims repo-bearing runs only for repos on the Docker worker repo allowlist,
-   which only an admin edits at **Admin → Instance → Docker worker repo allowlist**. A run on any other
+   which only an admin edits at **Admin → Workers → Docker worker repo allowlist**. A run on any other
    repo stays queued unless another eligible (for example non-Docker) worker can claim it; repo-less
    judge runs are not affected. See [Run health](./run-health.md#what-the-flags-mean).
 
