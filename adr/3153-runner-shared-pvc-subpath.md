@@ -397,7 +397,7 @@ new parent (`retireRunnerClone` takes the class from its caller in
 |---|---|---|---|
 | `owner_terminal` | yes | yes | The run's own terminal disposition, which today's code already carries out in-process. |
 | `verified_successor` | yes | yes | A server-acknowledged covering FINAL, which today's code already carries out in-process. |
-| `owner_terminal_covered` | yes | never | `preserveRecoveryClone` was lifted by the stopped-source covered verdict, whose proof (`worktreeCleanHardened`) can still miss ignored paths and runner-unreadable directories that Git silently omits (#4141 fixed only the stderr case; #4137 stays open). On a split pod its binding stays `intent` with the parent on disk and reads `bound_intent` (it never settles). |
+| `owner_terminal_covered` | yes | never | `preserveRecoveryClone` was lifted by the stopped-source covered verdict, or the retiring flight was parked (limit, pause or recovery park: a parked run is not terminal, so its scratch must not become reclaimable). The covered verdict's proof (`worktreeCleanHardened`) can still miss ignored paths and runner-unreadable directories that Git silently omits (#4141 fixed only the stderr case; #4137 stays open). On a split pod its binding stays `intent` with the parent on disk and reads `bound_intent` (it never settles). |
 | `completion` | yes | never | Completion keeps the outer bare lock and raw-removes in-process; its binding writes `removing` before that removal and never settles. The binding is unset after a successful in-process removal; a failed or partial removal leaves `removing`, which reads `interrupted_removal`. |
 | `other` (foreign-orphan) | yes | never | No owner-terminal or acknowledged-FINAL authority backs it. On a split pod its binding stays `intent` with the parent on disk and reads `bound_intent` (it never settles). In production a foreign-orphan retire carries no `attemptId`, so it is in practice unbound (today's behaviour). |
 | attempt-less retire | no | never | The owner's cross-check against the attempt-ledger entry (attemptId, runId, clonePath) cannot be satisfied without an attemptId; the parent stays unbound and kept. |
@@ -442,8 +442,8 @@ crashed attempt and adds the epoch exclusion.
   **any** bound non-completion parent in-process (`if (bound && split)` in
   `retireRunnerCloneImpl`); it leaves the parent on disk. `owner_terminal` and
   `verified_successor` settle (when every proof holds) and a verified epoch
-  reclaims them. `owner_terminal_covered` and `other` (foreign-orphan, discard
-  false) stay at `intent` with the parent kept permanently (`bound_intent`); no
+  reclaims them. `owner_terminal_covered` (covered-lift or parked-flight retire) and `other`
+  (foreign-orphan, discard false) stay at `intent` with the parent kept permanently (`bound_intent`); no
   path reclaims them. Only completion keeps its in-process removal (`removing`
   written first, unset after success). **Accepted residual:** this is a behaviour
   change for those two classes on a split pod. Previously the worker's in-process
@@ -633,9 +633,10 @@ An architect, auditor and reviewer examined two judgments and found no stop.
 - **Partial removal** carries no durability claim, and the parent and its
   remaining bytes stay.
 - **FINAL capture proofs run as the runner uid**; see Judgment B.
-- **More retention on split pods (accepted).** Bound `owner_terminal_covered` and
+- **More retention on split pods (accepted).** Bound `owner_terminal_covered` (covered-lift and parked-flight retires) and
   `other` parents are no longer attempted in-process and no epoch path reclaims
-  them; they stay at `intent` (`bound_intent`) until an operator acts. More
+  them; they stay at `intent` (`bound_intent`) with no supported remedy in this
+  release. More
   retention, never less. Foreign-orphan retires carry no `attemptId` in
   production, so they are in practice unbound (today's behaviour).
 - Legacy parents, attempt-less retires, the `owner_terminal_covered` class and
