@@ -1085,6 +1085,10 @@ workers:
     # (kept only; no reclaim). false renders worker UZI_RETIRE_SCRATCH_OUTCOMES=0 after
     # controller reconciliation; takes effect at the next worker startup.
     retireScratchOutcomes: true
+    # Default-on verified-epoch reclaim of bound `.retire-*` parents; binding writes continue
+    # either way. false renders worker UZI_RETIRE_SCRATCH_RECLAIM=0 after controller
+    # reconciliation; takes effect at the next worker startup.
+    retireScratchReclaim: true
     deletionCanaryWorkerId: ""
   docker:
     podEpochReclaim:

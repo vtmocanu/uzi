@@ -449,8 +449,11 @@ type RenderConfig struct {
 	// worker pod. Negative on purpose: the zero value keeps the default (records on)
 	// and leaves existing templates byte-identical.
 	RetireScratchOutcomesDisabled bool
-	RollConcurrency               int
-	RollTargetVersion             string
+	// RetireScratchReclaimDisabled renders UZI_RETIRE_SCRATCH_RECLAIM=0 into every
+	// worker pod. Negative for the same reason as RetireScratchOutcomesDisabled.
+	RetireScratchReclaimDisabled bool
+	RollConcurrency              int
+	RollTargetVersion            string
 	// Namespace is the dedicated worker namespace: it contains nothing but hosted
 	// workers, which is what bounds a compromised controller.
 	Namespace string
@@ -1151,6 +1154,9 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 	}
 	if cfg.RetireScratchOutcomesDisabled {
 		env = append(env, corev1.EnvVar{Name: "UZI_RETIRE_SCRATCH_OUTCOMES", Value: "0"})
+	}
+	if cfg.RetireScratchReclaimDisabled {
+		env = append(env, corev1.EnvVar{Name: "UZI_RETIRE_SCRATCH_RECLAIM", Value: "0"})
 	}
 	if cfg.GoBuildParallelism > 0 {
 		env = append(env, corev1.EnvVar{Name: "WORKER_GO_BUILD_PARALLELISM", Value: strconv.Itoa(cfg.GoBuildParallelism)})

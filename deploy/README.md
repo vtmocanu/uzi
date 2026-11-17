@@ -1155,6 +1155,13 @@ See [startup disable and observation](../docs/run-recovery.md#runner-tmpdir-scra
 for safe replacement, evidence and startup-only limits; hosted observation and
 the keep-default decision remain pending on #4043.
 
+Chart `workers.epochReclaim.retireScratchReclaim` (#4263) is a strict boolean,
+default `true`; a non-boolean fails rendering. `false` makes the controller render
+worker `UZI_RETIRE_SCRATCH_RECLAIM=0` on every worker, which disables the
+verified-epoch reclaim of bound `.retire-*` parents; binding writes continue. Default
+renders are unchanged; `--reuse-values` from an older release fails the boolean
+guard as above.
+
 | Declaration | Audited stack |
 |---|---|
 | `containerd-runc` | containerd **2.3.4**, runc **1.5.1**, kubelet **1.37.1** |

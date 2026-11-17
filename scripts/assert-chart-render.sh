@@ -1123,6 +1123,36 @@ for retire_bad in 0 1 null '{a,b}'; do
   fi
   grep -F 'workers.epochReclaim.retireScratchOutcomes must be a boolean' "$WORK/retire-invalid.log" >/dev/null
 done
+# Retirement-scratch reclaim are a real boolean; explicit false must survive rendering.
+for reclaim_state in default true false; do
+  if [ "$reclaim_state" = default ]; then
+    helm template uzi "$STRIPPED" --set workers.enabled=true --set api.tls.enabled=true > "$WORK/retire-reclaim.yaml"
+    reclaim_expected=true
+  else
+    helm template uzi "$STRIPPED" --set workers.enabled=true --set api.tls.enabled=true \
+      --set "workers.epochReclaim.retireScratchReclaim=$reclaim_state" > "$WORK/retire-reclaim.yaml"
+    reclaim_expected=$reclaim_state
+  fi
+  awk -v expected="\"$reclaim_expected\"" '
+    /- name: UZI_WORKER_RETIRE_SCRATCH_RECLAIM/ { pending=1; count++; next }
+    pending && /^[[:space:]]*value:/ { if ($2 != expected) bad=1; pending=0 }
+    END { if (bad || count != 1 || pending) exit 1 }
+  ' "$WORK/retire-reclaim.yaml"
+done
+for reclaim_bad in false true "" 0 null; do
+  if helm template uzi "$STRIPPED" --set-string "workers.epochReclaim.retireScratchReclaim=$reclaim_bad" > "$WORK/retire-reclaim-invalid.log" 2>&1; then
+    echo "FAIL: string retire scratch reclaim accepted: $reclaim_bad" >&2
+    exit 1
+  fi
+  grep -F 'workers.epochReclaim.retireScratchReclaim must be a boolean' "$WORK/retire-reclaim-invalid.log" >/dev/null
+done
+for reclaim_bad in 0 1 null '{a,b}'; do
+  if helm template uzi "$STRIPPED" --set "workers.epochReclaim.retireScratchReclaim=$reclaim_bad" > "$WORK/retire-reclaim-invalid.log" 2>&1; then
+    echo "FAIL: nonboolean retire scratch reclaim accepted: $reclaim_bad" >&2
+    exit 1
+  fi
+  grep -F 'workers.epochReclaim.retireScratchReclaim must be a boolean' "$WORK/retire-reclaim-invalid.log" >/dev/null
+done
 # DinD builder-cache prune leg (issue #4291) is a real boolean; explicit false must
 # survive Helm rendering, and the controller Deployment carries it exactly once.
 for builder_state in default true false; do
