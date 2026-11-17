@@ -11,9 +11,14 @@ const root = () => ({ source: 1247710, name: 'picomatch', severity: 'high', rang
 const audit = () => ({ auditReportVersion: 2, vulnerabilities: { picomatch: {
   name: 'picomatch', severity: 'high', via: [root()], nodes: ['node_modules/picomatch'],
 } } });
-const lock = () => ({ lockfileVersion: 3, packages: { 'node_modules/picomatch': { version: '4.0.7', dev: true } } });
+const manifest = () => ({ devDependencies: { knip: '6.42.1' } });
+const lock = () => ({ lockfileVersion: 3, packages: {
+  '': { devDependencies: { knip: '6.42.1' } },
+  'node_modules/picomatch': { version: '4.0.7', dev: true },
+} });
 function run(change = () => {}, options = {}) {
-  const input = { rows: rows(), component: 'web', level: 'high', today, auditJson: audit(), lockJson: lock(), ...options };
+  const input = { rows: rows(), component: 'web', level: 'high', today,
+    auditJson: audit(), lockJson: lock(), manifestJson: manifest(), ...options };
   change(input);
   return evaluate(input);
 }
@@ -21,8 +26,9 @@ test('real web and agent reports pass, including the rooted Vitest cycle', () =>
   for (const component of ['web', 'agent']) {
     const auditJson = JSON.parse(readFileSync(new URL('./fixtures/npm-audit/' + component + '.json', import.meta.url)));
     const lockJson = JSON.parse(readFileSync(new URL('./fixtures/npm-audit/' + component + '-lock.json', import.meta.url)));
+    const manifestJson = JSON.parse(readFileSync(new URL('./fixtures/npm-audit/' + component + '-package.json', import.meta.url)));
     const result = evaluate({ rows: rows().map(row => ({ ...row, component })), component,
-      level: 'high', today, auditJson, lockJson });
+      level: 'high', today, auditJson, lockJson, manifestJson });
     assert.equal(result.code, 0);
     assert.match(result.messages[0], /EXCEPTED/);
   }
@@ -134,4 +140,39 @@ test('reported aliases must agree with package identity in the lockfile', () => 
     auditJson.vulnerabilities.picomatch.nodes = ['node_modules/other'];
     lockJson.packages['node_modules/other'] = { dev: true, name: 'other' };
   }).code, 2);
+});
+test('manifest reclassification and a missing lock root cannot borrow stale dev flags', () => {
+  assert.throws(() => run(({ manifestJson }) => {
+    manifestJson.dependencies = { knip: manifestJson.devDependencies.knip };
+    delete manifestJson.devDependencies;
+  }), /manifest and lockfile disagree; regenerate the lockfile/);
+  assert.throws(() => run(({ lockJson }) => {
+    delete lockJson.packages[''];
+  }), /manifest and lockfile disagree; regenerate the lockfile/);
+});
+test('all four root dependency maps require identical keys and string specs', () => {
+  for (const field of ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies']) {
+    for (const change of ['added', 'spec', 'shape']) {
+      assert.throws(() => run(({ manifestJson, lockJson }) => {
+        manifestJson[field] = { example: '1.0.0' };
+        lockJson.packages[''][field] = { example: '1.0.0' };
+        if (change === 'added') manifestJson[field].extra = '2.0.0';
+        else if (change === 'spec') manifestJson[field].example = '^1.0.0';
+        else manifestJson[field] = [];
+      }), /manifest and lockfile disagree; regenerate the lockfile/);
+    }
+  }
+});
+test('absent dependency maps equal empty maps and property order is irrelevant', () => {
+  assert.equal(run(({ manifestJson, lockJson }) => {
+    manifestJson.dependencies = { first: '1', second: '2' };
+    lockJson.packages[''].dependencies = { second: '2', first: '1' };
+    lockJson.packages[''].peerDependencies = {};
+  }).code, 0);
+});
+test('components without rows do not acquire a manifest-root consistency requirement', () => {
+  assert.equal(run(({ auditJson, lockJson }) => {
+    auditJson.vulnerabilities = {};
+    delete lockJson.packages[''];
+  }, { rows: [], manifestJson: undefined }).code, 0);
 });
