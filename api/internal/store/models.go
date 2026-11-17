@@ -2096,6 +2096,7 @@ type Worker struct {
 	HibernationAdmitOrigin     pgtype.Text        `json:"hibernation_admit_origin"`
 	HibernationWakeOrigin      pgtype.Text        `json:"hibernation_wake_origin"`
 	LastManualWakeSettledAt    pgtype.Timestamptz `json:"last_manual_wake_settled_at"`
+	MemoryAuthorityHeldAt      pgtype.Timestamptz `json:"memory_authority_held_at"`
 }
 
 type WorkerActiveRun struct {

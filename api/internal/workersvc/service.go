@@ -2826,7 +2826,7 @@ func (s *Service) RegisterWithCrossCheckSlots(ctx context.Context, wkr store.Wor
 	}
 	snapshotApplied := false
 	if snapshotValid {
-		snapshotApplied, err = s.applyWorkerActiveSnapshot(ctx, qtx, store.Worker(row), snapshot, snapshotModeRegister, entries, locks, pending)
+		snapshotApplied, err = s.applyWorkerActiveSnapshot(ctx, qtx, store.Worker(row), snapshot, snapshotModeRegister, entries, locks, pending, pgtype.Timestamptz{})
 		if err != nil {
 			return store.Worker{}, "", err
 		}
@@ -3104,7 +3104,7 @@ func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *Worker
 		if err != nil {
 			return store.Worker{}, err
 		}
-		applied, err = s.applyWorkerActiveSnapshot(ctx, qtx, updated, snapshot, snapshotModeHeartbeat, entries, locks, pending)
+		applied, err = s.applyWorkerActiveSnapshot(ctx, qtx, updated, snapshot, snapshotModeHeartbeat, entries, locks, pending, pgtype.Timestamptz{})
 		if err != nil {
 			return store.Worker{}, err
 		}
@@ -3791,7 +3791,8 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 	// register nonce the snapshot was just validated against. It precedes the overflow refusal
 	// and the claim, so an idle or refused poll still persists it, and it only touches the
 	// worker row this transaction already holds.
-	if err := s.persistMemoryAuthority(ctx, qtx, locked, snapshot, lane, report); err != nil {
+	heldAt, err := s.persistMemoryAuthority(ctx, qtx, locked, snapshot, lane, report)
+	if err != nil {
 		return nil, err
 	}
 	pending := s.validatePendingAll(locked, snapshot)
@@ -3800,7 +3801,7 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 	if err != nil {
 		return nil, err
 	}
-	applied, err := s.applyWorkerActiveSnapshot(ctx, qtx, locked, snapshot, snapshotModeClaim, entries, locks, pending)
+	applied, err := s.applyWorkerActiveSnapshot(ctx, qtx, locked, snapshot, snapshotModeClaim, entries, locks, pending, heldAt)
 	if err != nil {
 		return nil, err
 	}

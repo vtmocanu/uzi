@@ -87,8 +87,20 @@ func (p *poolFx) owner() uuid.UUID {
 	return user
 }
 
-// beat refreshes the heartbeat of every awake worker of every owner this fixture seeded.
+// beat refreshes the heartbeat of every awake worker of every owner this fixture seeded. A worker
+// that already holds a memory-authority receipt (memory_authority_held_at) has it refreshed too,
+// standing in for the held claims a live agent keeps sending; beatOnly leaves the receipt alone.
 func (p *poolFx) beat(ids ...uuid.UUID) {
+	p.t.Helper()
+	for _, id := range ids {
+		p.env.exec(`UPDATE workers SET last_heartbeat_at = $2,
+		            memory_authority_held_at = CASE WHEN memory_authority_held_at IS NOT NULL THEN $2::timestamptz END
+		            WHERE id = $1`, id, p.clock)
+	}
+}
+
+// beatOnly refreshes heartbeats and nothing else.
+func (p *poolFx) beatOnly(ids ...uuid.UUID) {
 	p.t.Helper()
 	for _, id := range ids {
 		p.env.exec(`UPDATE workers SET last_heartbeat_at = $2 WHERE id = $1`, id, p.clock)
@@ -268,6 +280,8 @@ func TestHibernationSurplusMemoryAuthorityUnknownLiveDB(t *testing.T) {
 			cand, keeper := p.member(6*time.Hour), p.member(5*time.Hour)
 			if tc.capable {
 				p.env.exec(`UPDATE workers SET protocol_capabilities = $1 WHERE id = ANY($2)`, caps, []uuid.UUID{cand, keeper})
+				// The keeper's memory authority is known: a fresh held receipt (beat keeps it fresh).
+				p.env.exec(`UPDATE workers SET memory_authority_held_at = $2 WHERE id = $1`, keeper, p.clock)
 			}
 			p.pass(cand, keeper)
 			p.wantStates(map[uuid.UUID]string{cand: tc.want, keeper: "none"})

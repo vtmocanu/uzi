@@ -71,7 +71,7 @@ SELECT
     fn_effective_worker_caps(w.capabilities, COALESCE(w.docker_enabled, false))::text[] AS effective_caps,
     w.protocol_capabilities, w.max_concurrent_runs, w.max_cross_check_slots,
     w.manual_cordoned_at, w.draining_since, w.maintenance_fenced, w.maintenance_phase,
-    w.pending_overflow_until, w.cleanup_phase, w.memory_authority_lost_at,
+    w.pending_overflow_until, w.cleanup_phase, w.memory_authority_lost_at, w.memory_authority_held_at,
     (SELECT count(*) FROM runs r
       WHERE r.worker_id = w.id AND r.status NOT IN ('completed', 'failed', 'cancelled'))::bigint AS nonterminal,
     GREATEST(

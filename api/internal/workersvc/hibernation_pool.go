@@ -119,7 +119,33 @@ func poolKey(r poolRow) (key string, ok bool) {
 // Custody does not make a member not ready, and the shared gates (a locked vault, the custody
 // hold limit, the instance intake pause) are deliberately absent: they affect every member
 // alike and are not keeper inputs (PRD D17).
+//
+// A worker with both memory capabilities is ready only when its memory authority is known: no
+// persisted loss (memory_authority_lost_at), and a held receipt (memory_authority_held_at) set
+// and fresh, newer than stale (the heartbeat-staleness window). A missing or expired receipt
+// means the authority is unknown and the member is not ready (PRD D16); a snapshot-less claim
+// never refreshes it. A worker without both capabilities is judged by the other gates alone.
 func memberReady(r poolRow, now time.Time, stale time.Duration) bool {
+	return memberReadyExceptMemory(r, now, stale) && !memoryAuthorityLostOrUnknown(r, now, stale)
+}
+
+// memoryAuthorityUnknown reports whether a memory-capable member has no persisted loss but no
+// fresh held receipt either.
+func memoryAuthorityUnknown(r poolRow, now time.Time, stale time.Duration) bool {
+	if !memoryAuthorityCapable(r.ProtocolCapabilities) || r.MemoryAuthorityLostAt.Valid {
+		return false
+	}
+	return !r.MemoryAuthorityHeldAt.Valid || now.Sub(r.MemoryAuthorityHeldAt.Time) >= stale
+}
+
+// memoryAuthorityLostOrUnknown is the memory gate of memberReady: a persisted loss always
+// excludes (whatever the capabilities), an unknown authority excludes a capable member.
+func memoryAuthorityLostOrUnknown(r poolRow, now time.Time, stale time.Duration) bool {
+	return r.MemoryAuthorityLostAt.Valid || memoryAuthorityUnknown(r, now, stale)
+}
+
+// memberReadyExceptMemory is memberReady without the memory-authority gate.
+func memberReadyExceptMemory(r poolRow, now time.Time, stale time.Duration) bool {
 	if r.Ephemeral || r.Kind != "hosted" || r.Status != "online" || r.HibernationState != "none" {
 		return false
 	}
@@ -144,7 +170,7 @@ func memberReady(r poolRow, now time.Time, stale time.Duration) bool {
 	if r.CleanupPhase != CleanupPhaseNone && r.CleanupPhase != CleanupPhaseSettled {
 		return false
 	}
-	return !r.MemoryAuthorityLostAt.Valid
+	return true
 }
 
 // memoryAuthorityCapable reports whether a worker's protocol capabilities make the claim gate
@@ -224,9 +250,31 @@ func decideSurplus(rows []poolRow, candidate uuid.UUID, now time.Time, stale tim
 	// so when it ranks first no other member is the deterministic keeper and nothing is decided.
 	keeper, ok := pickKeeper(members, now, stale)
 	if !ok || keeper == candidate {
-		return poolDecision{Action: decisionNone, Why: noneNoKeeper}
+		return poolDecision{Action: decisionNone, Why: noKeeperReason(members, candidate, now, stale)}
 	}
 	return poolDecision{Action: decisionAutoSurplus, Keeper: keeper}
+}
+
+// noKeeperReason names why no sibling of candidate is a keeper: noneMemoryAuthUnsure when no
+// sibling is ready and at least one is excluded only because its memory authority is unknown,
+// else noneNoKeeper.
+func noKeeperReason(members []poolRow, candidate uuid.UUID, now time.Time, stale time.Duration) string {
+	unknown := false
+	for _, r := range members {
+		if r.ID == candidate {
+			continue
+		}
+		if memberReady(r, now, stale) {
+			return noneNoKeeper
+		}
+		if memberReadyExceptMemory(r, now, stale) && memoryAuthorityUnknown(r, now, stale) {
+			unknown = true
+		}
+	}
+	if unknown {
+		return noneMemoryAuthUnsure
+	}
+	return noneNoKeeper
 }
 
 // surplusThreshold is the surplus idle threshold the pass uses: min(surplus, idle_after).

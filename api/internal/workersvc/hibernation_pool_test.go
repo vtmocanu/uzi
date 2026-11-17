@@ -282,6 +282,8 @@ func TestDecideSurplusMemoryAuthorityUnknown(t *testing.T) {
 	keeper.Anchor = pgconv.Time(poolNow.Add(-3 * time.Hour)) // ranks first, so the candidate is not the keeper
 	caps := []string{capability.WorkerMemoryPressureV1, capability.WorkerMemoryAuthorityClaimV1}
 	cand.ProtocolCapabilities, keeper.ProtocolCapabilities = caps, caps
+	cand.MemoryAuthorityHeldAt = pgconv.Time(poolNow.Add(-5 * time.Second))
+	keeper.MemoryAuthorityHeldAt = pgconv.Time(poolNow.Add(-5 * time.Second))
 	if d := decideSurplus([]poolRow{cand, keeper}, cand.ID, poolNow, poolStale, cutoff, false); d.Action != decisionNone || d.Why != noneMemoryAuthUnsure {
 		t.Fatalf("memory-capable pool with authority unpersisted: %+v", d)
 	}
@@ -294,11 +296,94 @@ func TestDecideSurplusMemoryAuthorityUnknown(t *testing.T) {
 	if d := decideSurplus([]poolRow{cand, keeper}, cand.ID, poolNow, poolStale, cutoff, false); d.Action != decisionAutoSurplus {
 		t.Fatalf("pressure-only pool with authority unpersisted: %+v", d)
 	}
-	// Neither member is marked not-ready: the memory-capable keeper is still ready, so the
-	// policy cannot cascade warm wakes from this mode.
+	// A memory-capable keeper with a fresh held receipt is ready, so the kill-switch mode does not
+	// by itself cascade warm wakes.
 	cand.ProtocolCapabilities, keeper.ProtocolCapabilities = caps, caps
 	if !memberReady(keeper, poolNow, poolStale) {
-		t.Fatal("authority-unknown members must not be marked not ready")
+		t.Fatal("a memory-capable member with a fresh held receipt must be ready")
+	}
+}
+
+// TestMemberReadyMemoryAuthority pins the readiness rule for a worker with both memory
+// capabilities (issue #4395, PRD D16): ready only with no persisted loss and a held receipt set
+// and strictly newer than the staleness window; a worker without both capabilities is unaffected.
+func TestMemberReadyMemoryAuthority(t *testing.T) {
+	caps := []string{capability.WorkerMemoryPressureV1, capability.WorkerMemoryAuthorityClaimV1}
+	half := []string{capability.WorkerMemoryPressureV1}
+	at := func(ago time.Duration) pgtype.Timestamptz { return pgconv.Time(poolNow.Add(-ago)) }
+	for _, tc := range []struct {
+		name string
+		caps []string
+		held pgtype.Timestamptz
+		lost pgtype.Timestamptz
+		want bool
+	}{
+		{"capable, held fresh", caps, at(5 * time.Second), pgtype.Timestamptz{}, true},
+		{"capable, held just inside the window", caps, at(poolStale - time.Second), pgtype.Timestamptz{}, true},
+		{"capable, held missing", caps, pgtype.Timestamptz{}, pgtype.Timestamptz{}, false},
+		{"capable, held at the window edge", caps, at(poolStale), pgtype.Timestamptz{}, false},
+		{"capable, held expired", caps, at(time.Hour), pgtype.Timestamptz{}, false},
+		{"capable, lost", caps, pgtype.Timestamptz{}, at(time.Hour), false},
+		{"capable, lost with a fresh held", caps, at(time.Second), at(time.Hour), false},
+		{"pressure only, held missing", half, pgtype.Timestamptz{}, pgtype.Timestamptz{}, true},
+		{"no protocol caps, held missing", nil, pgtype.Timestamptz{}, pgtype.Timestamptz{}, true},
+		{"not capable, lost", half, pgtype.Timestamptz{}, at(time.Hour), false},
+	} {
+		r := readyRow(1)
+		r.ProtocolCapabilities, r.MemoryAuthorityHeldAt, r.MemoryAuthorityLostAt = tc.caps, tc.held, tc.lost
+		if got := memberReady(r, poolNow, poolStale); got != tc.want {
+			t.Errorf("%s: memberReady = %t, want %t", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestDecideSurplusMemoryAuthorityUnknownKeeper: a sibling excluded only because its memory
+// authority is unknown yields the memory_authority_unknown reason, not no_keeper; a lost sibling,
+// a sibling not ready for another reason, or a ready sibling does not.
+func TestDecideSurplusMemoryAuthorityUnknownKeeper(t *testing.T) {
+	caps := []string{capability.WorkerMemoryPressureV1, capability.WorkerMemoryAuthorityClaimV1}
+	cutoff := poolNow.Add(-2 * time.Hour)
+	mk := func(mut func(*poolRow)) poolDecision {
+		cand, sib := readyRow(1), readyRow(2)
+		cand.Anchor = pgconv.Time(poolNow.Add(-5 * time.Hour))
+		cand.ProtocolCapabilities, sib.ProtocolCapabilities = caps, caps
+		cand.MemoryAuthorityHeldAt = pgconv.Time(poolNow.Add(-time.Second))
+		mut(&sib)
+		return decideSurplus([]poolRow{cand, sib}, cand.ID, poolNow, poolStale, cutoff, true)
+	}
+	for _, tc := range []struct {
+		name string
+		mut  func(*poolRow)
+		want string
+	}{
+		{"no receipt", func(r *poolRow) {}, noneMemoryAuthUnsure},
+		{"expired receipt", func(r *poolRow) { r.MemoryAuthorityHeldAt = pgconv.Time(poolNow.Add(-time.Hour)) }, noneMemoryAuthUnsure},
+		{"lost", func(r *poolRow) { r.MemoryAuthorityLostAt = pgconv.Time(poolNow.Add(-time.Hour)) }, noneNoKeeper},
+		{"unknown and cordoned", func(r *poolRow) { r.ManualCordonedAt = pgconv.Time(poolNow) }, noneNoKeeper},
+		{"not capable", func(r *poolRow) { r.ProtocolCapabilities = caps[:1] }, noneNoKeeper},
+	} {
+		d := mk(tc.mut)
+		if tc.name == "not capable" {
+			// The pool key includes the capabilities, so the sibling is no longer pooled with the
+			// candidate and no keeper exists for the plain reason.
+			if d.Action != decisionNone {
+				t.Errorf("%s: %+v", tc.name, d)
+			}
+			continue
+		}
+		if d.Action != decisionNone || d.Why != tc.want {
+			t.Errorf("%s: %+v, want none/%s", tc.name, d, tc.want)
+		}
+	}
+	// A ready sibling that outranks the candidate is the keeper; unknown siblings do not matter.
+	cand, ready, unknown := readyRow(1), readyRow(2), readyRow(3)
+	for _, r := range []*poolRow{&cand, &ready, &unknown} {
+		r.ProtocolCapabilities = caps
+	}
+	cand.Anchor = pgconv.Time(poolNow.Add(-5 * time.Hour))
+	ready.MemoryAuthorityHeldAt = pgconv.Time(poolNow.Add(-time.Second))
+	if d := decideSurplus([]poolRow{cand, ready, unknown}, cand.ID, poolNow, poolStale, cutoff, true); d.Action != decisionAutoSurplus || d.Keeper != ready.ID {
+		t.Fatalf("ready sibling beside an unknown one: %+v", d)
 	}
 }
 
