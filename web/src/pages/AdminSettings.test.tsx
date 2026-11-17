@@ -2,7 +2,7 @@
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { useState } from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { Link, MemoryRouter, Route, Routes } from "react-router-dom";
+import { Link, MemoryRouter, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import { AdminSettings } from "./AdminSettings";
 import { AdminHealth } from "./AdminHealth";
 import { healthySilentDoc } from "../mocks/data/health";
@@ -907,48 +907,6 @@ describe("AdminSettings — Codex judge model (PRD #3245)", () => {
   });
 });
 
-describe("AdminSettings — ephemeral workers (PRD #649 M1)", () => {
-  it("loads the current ephemeral-workers kill-switch value", async () => {
-    mockApi.getSettings.mockResolvedValue(response({ ephemeral_workers_enabled: "true" }));
-    renderPage();
-    const toggle = (await screen.findByLabelText(
-      /Auto-provision workers on demand for this instance/i,
-    )) as HTMLInputElement;
-    expect(toggle.checked).toBe(true);
-  });
-
-  it("reflects the seeded off value and stays disabled until toggled", async () => {
-    renderPage();
-    const toggle = (await screen.findByLabelText(
-      /Auto-provision workers on demand for this instance/i,
-    )) as HTMLInputElement;
-    expect(toggle.checked).toBe(false);
-    const btn = screen.getByRole("button", {
-      name: /save ephemeral workers settings/i,
-    }) as HTMLButtonElement;
-    expect(btn.disabled).toBe(true);
-  });
-
-  it("saves the flipped kill-switch as a string bool", async () => {
-    mockApi.updateSettings.mockResolvedValue(response({ ephemeral_workers_enabled: "true" }));
-    renderPage();
-    await screen.findByLabelText(/Auto-provision workers on demand for this instance/i);
-    fireEvent.click(screen.getByLabelText(/Auto-provision workers on demand for this instance/i));
-
-    const btn = screen.getByRole("button", {
-      name: /save ephemeral workers settings/i,
-    }) as HTMLButtonElement;
-    expect(btn.disabled).toBe(false);
-    fireEvent.click(btn);
-
-    await waitFor(() =>
-      expect(mockApi.updateSettings).toHaveBeenCalledWith(
-        expect.objectContaining({ ephemeral_workers_enabled: "true" }),
-      ),
-    );
-  });
-});
-
 describe("AdminSettings — run summaries (PRD #362)", () => {
   it("loads the current summary model", async () => {
     mockApi.getSettings.mockResolvedValue(response({ summary_model: "sonnet" }, {}, { summary_model: "db" }));
@@ -1005,124 +963,6 @@ describe("AdminSettings — run summaries (PRD #362)", () => {
   });
 });
 
-
-describe("AdminSettings — docker repo allowlist (PRD #89 M-allow)", () => {
-  // The global stored set must survive edits, including deleted/unresolved IDs.
-  const twoRepos = () =>
-    mockApi.adminListDockerAllowlistRepos.mockResolvedValue({
-      repos: [
-        { id: "repo-uzi", path_with_namespace: "vtmocanu/uzi", enabled: true, owner_email: "admin@example.com", connection_id: "conn-1", forge_type: "gitlab", base_url: "https://gitlab.example.com" },
-        { id: "repo-two", path_with_namespace: "vtmocanu/two", enabled: true, owner_email: "dana@example.com", connection_id: "conn-2", forge_type: "github", base_url: "https://github.com" },
-      ] as unknown as import("../lib/api").AdminDockerAllowlistRepo[],
-    });
-  const saveBtn = () =>
-    screen.getByRole("button", { name: /save repo allowlist/i }) as HTMLButtonElement;
-
-  it("keeps Save disabled until the selection changes (dirty-check)", async () => {
-    mockApi.getSettings.mockResolvedValue(response({ docker_repo_allowlist: "repo-uzi" }));
-    twoRepos();
-    renderPage();
-
-    // Selection equals the stored value → nothing to save.
-    await screen.findByLabelText(/vtmocanu\/two/);
-    expect(saveBtn().disabled).toBe(true);
-
-    fireEvent.click(screen.getByLabelText(/vtmocanu\/two/));
-    expect(saveBtn().disabled).toBe(false);
-  });
-
-  it("saves the ticked repos as comma-separated ids and PRESERVES ids that are unresolved or deleted", async () => {
-    // repo-other no longer resolves to an existing repository.
-    mockApi.getSettings.mockResolvedValue(response({ docker_repo_allowlist: "repo-uzi,repo-other" }));
-    twoRepos();
-    mockApi.updateSettings.mockResolvedValue(
-      response({ docker_repo_allowlist: "repo-other,repo-two,repo-uzi" }),
-    );
-    renderPage();
-
-    // The deleted id is surfaced as preserved, not dropped.
-    expect(await screen.findByText(/unresolved\/deleted repositories \(preserved\)/i)).toBeTruthy();
-
-    // Tick another owner’s repo and save. The deleted repo ID rides through untouched.
-    fireEvent.click(await screen.findByLabelText(/vtmocanu\/two/));
-    fireEvent.click(saveBtn());
-
-    await waitFor(() => {
-      expect(mockApi.updateSettings).toHaveBeenCalledWith({
-        docker_repo_allowlist: "repo-other,repo-two,repo-uzi",
-      });
-    });
-  });
-
-  it("removing the only visible repo writes an empty (fail-closed) allowlist", async () => {
-    mockApi.getSettings.mockResolvedValue(response({ docker_repo_allowlist: "repo-uzi" }));
-    mockApi.adminListDockerAllowlistRepos.mockResolvedValue({
-      repos: [{ id: "repo-uzi", path_with_namespace: "vtmocanu/uzi", enabled: true, owner_email: "admin@example.com", connection_id: "conn-1", forge_type: "gitlab", base_url: "https://gitlab.example.com" }] as unknown as import("../lib/api").AdminDockerAllowlistRepo[],
-    });
-    mockApi.updateSettings.mockResolvedValue(response({ docker_repo_allowlist: "" }));
-    renderPage();
-
-    // The stored repo is ticked; untick it and save → empty string (fail-closed).
-    const box = (await screen.findByLabelText(/vtmocanu\/uzi/)) as HTMLInputElement;
-    expect(box.checked).toBe(true);
-    fireEvent.click(box);
-    fireEvent.click(saveBtn());
-
-    await waitFor(() => {
-      expect(mockApi.updateSettings).toHaveBeenCalledWith({ docker_repo_allowlist: "" });
-    });
-  });
-
-  it("does not show the unresolved indicator when the repos list fails to load", async () => {
-    mockApi.getSettings.mockResolvedValue(response({ docker_repo_allowlist: "repo-uzi,repo-other" }));
-    mockApi.adminListDockerAllowlistRepos.mockRejectedValue(new Error("network"));
-    renderPage();
-
-    // No unresolved count is meaningful until the admin list has loaded.
-    expect(await screen.findByText(/could not load repositories/i)).toBeTruthy();
-    expect(screen.queryByText(/unresolved\/deleted repositories/i)).toBeNull();
-  });
-});
-
-describe("AdminSettings — capability-aware scheduling kill-switch (PRD #84 M2)", () => {
-  const toggle = () =>
-    screen.getByLabelText(/enable capability-aware scheduling/i) as HTMLInputElement;
-  const saveBtn = () =>
-    screen.getByRole("button", { name: /save capability scheduling/i }) as HTMLButtonElement;
-
-  it("renders the toggle checked (default ON) with Save disabled until changed", async () => {
-    renderPage();
-    await screen.findByText("Capability-aware scheduling");
-    expect(toggle().checked).toBe(true);
-    expect(saveBtn().disabled).toBe(true);
-
-    fireEvent.click(toggle());
-    expect(saveBtn().disabled).toBe(false);
-  });
-
-  it("saves the flag OFF through the settings PATCH", async () => {
-    mockApi.updateSettings.mockResolvedValue(response({ capability_aware_scheduling: "false" }));
-    renderPage();
-    await screen.findByText("Capability-aware scheduling");
-
-    fireEvent.click(toggle());
-    fireEvent.click(saveBtn());
-
-    await waitFor(() =>
-      expect(mockApi.updateSettings).toHaveBeenCalledWith({ capability_aware_scheduling: "false" }),
-    );
-  });
-
-  it("disables the toggle when the setting is fixed by the environment", async () => {
-    mockApi.getSettings.mockResolvedValue(
-      response({ capability_aware_scheduling: "true" }, {}, { capability_aware_scheduling: "env" }),
-    );
-    renderPage();
-    await screen.findByText("Capability-aware scheduling");
-    expect(toggle().disabled).toBe(true);
-    expect(saveBtn().disabled).toBe(true);
-  });
-});
 
 describe("AdminSettings — completion check kill-switch (issue #1626)", () => {
   const toggle = () => screen.getByLabelText(/enable the completion check/i) as HTMLInputElement;
@@ -1838,17 +1678,6 @@ describe("DockerAllowlistCard — instance identities", () => {
   });
 });
 
-describe("AdminSettings hosted worker quota (#2960)", () => {
-  it("renders the current quota control and section link", async () => {
-    mockApi.getSettings.mockResolvedValue({ ...response(), settings: { ...settings(), hosted_worker_quota: "3" } });
-    renderPage();
-    const quota = await screen.findByRole("spinbutton", { name: "Hosted workers per user" });
-    expect((quota as HTMLInputElement).value).toBe("3");
-    expect(screen.getByRole("button", { name: "Save hosted worker quota" })).toHaveProperty("disabled", true);
-    expect(screen.getByRole("link", { name: "Hosted worker quota" }).getAttribute("href")).toBe("#hosted-worker-quota");
-  });
-});
-
 
 describe("vault policy", () => {
   it("shows the policy, count and threat model even without migration", async () => {
@@ -1921,5 +1750,85 @@ describe("browser grant lifetime", () => {
     expect(await screen.findByText("lifetime failed")).toBeTruthy();
     fireEvent.change(input, { target: { value: "7" } });
     expect((screen.getByRole("button", { name: "Save browser grant lifetime" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+});
+
+describe("AdminSettings forwards moved worker anchors to Admin → Workers", () => {
+  function Where() {
+    const { pathname, hash } = useLocation();
+    return <output data-testid="where">{pathname + hash}</output>;
+  }
+  function renderRoutes(initial: string | string[], initialIndex?: number) {
+    return render(
+      <MemoryRouter initialEntries={Array.isArray(initial) ? initial : [initial]} initialIndex={initialIndex}>
+        <Link to="/admin/settings#hosted-worker-quota">Quota link</Link>
+        <Link to="/admin/settings#review-bots">Bots link</Link>
+        <Where />
+        <Routes>
+          <Route path="/admin/settings" element={<AdminSettings />} />
+          <Route path="/admin/workers" element={<div>workers page</div>} />
+        </Routes>
+      </MemoryRouter>,
+    );
+  }
+
+  it.each([
+    "docker-allowlist",
+    "hosted-worker-quota",
+    "custody-hold-limit",
+    "ephemeral-workers",
+    "worker-hibernation",
+    "capability-scheduling",
+  ])("redirects /admin/settings#%s on mount", async (id) => {
+    renderRoutes(`/admin/settings#${id}`);
+    await screen.findByText("workers page");
+    expect(screen.getByTestId("where").textContent).toBe(`/admin/workers#${id}`);
+  });
+
+  it("replaces the history entry, so Back skips the redirecting URL", async () => {
+    function Back() {
+      const navigate = useNavigate();
+      return <button onClick={() => navigate(-1)}>Back</button>;
+    }
+    render(
+      <MemoryRouter initialEntries={["/somewhere", "/admin/settings#ephemeral-workers"]} initialIndex={1}>
+        <Back />
+        <Where />
+        <Routes>
+          <Route path="/somewhere" element={<div>somewhere page</div>} />
+          <Route path="/admin/settings" element={<AdminSettings />} />
+          <Route path="/admin/workers" element={<div>workers page</div>} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    await screen.findByText("workers page");
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    await screen.findByText("somewhere page");
+    expect(screen.getByTestId("where").textContent).toBe("/somewhere");
+  });
+
+  it("redirects when the hash changes after mount, and leaves Instance anchors alone", async () => {
+    renderRoutes("/admin/settings");
+    await screen.findByLabelText("uzi label");
+    fireEvent.click(screen.getByRole("link", { name: "Bots link" }));
+    await waitFor(() => expect(screen.getByTestId("where").textContent).toBe("/admin/settings#review-bots"));
+    expect(screen.queryByText("workers page")).toBeNull();
+    fireEvent.click(screen.getByRole("link", { name: "Quota link" }));
+    await screen.findByText("workers page");
+    expect(screen.getByTestId("where").textContent).toBe("/admin/workers#hosted-worker-quota");
+  });
+
+  it("no longer renders the moved cards or lists them in its section index", async () => {
+    renderPage();
+    const nav = await screen.findByRole("navigation", { name: "Sections on this page" });
+    for (const id of ["docker-allowlist", "hosted-worker-quota", "ephemeral-workers", "worker-hibernation", "capability-scheduling"]) {
+      expect(nav.querySelector(`a[href="#${id}"]`), id).toBeNull();
+    }
+    await screen.findByLabelText("uzi label");
+    await waitFor(() => expect(document.getElementById("review-bots")).not.toBeNull());
+    for (const id of ["docker-allowlist", "hosted-worker-quota", "custody-hold-limit", "ephemeral-workers", "worker-hibernation", "capability-scheduling"]) {
+      expect(document.getElementById(id), id).toBeNull();
+    }
+    expect(nav.querySelector('a[href="#review-bots"]')).not.toBeNull();
   });
 });

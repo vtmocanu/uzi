@@ -6,5 +6,6 @@
   "columns": null,
   "cards": null,
   "bot_forge_user_id": 0,
-  "pipeline": null
+  "pipeline": null,
+  "initial_import": null
 }

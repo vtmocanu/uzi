@@ -2178,6 +2178,31 @@ describe("SdkExecutor immediate progress push + transition frames (PRD #1064 M1)
     ]);
   });
 
+  it("(c3) resumed execution: a completion the server already holds is not re-announced; a server reset re-allows it", async () => {
+    // The loop-scope latestProgress starts undefined on every execution (a resume or re-claim),
+    // so the only record of an earlier execution's completions is the server's served completedIds.
+    const runWith = async (served: string[]) => {
+      const { queryFn } = fakeTurns([
+        [submitPlanWithMilestones(), resultSuccess()], // plan
+        [reportProgress(["m1", "m2"], []), signalDone(), resultSuccess()], // re-reports cumulative completed
+      ]);
+      const probe = makeCtx({
+        reportProgress: async () => {},
+        reportIteration: async () => ({ completedIds: served }),
+      });
+      await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+      return transitionFrames(probe.emits);
+    };
+    assert.deepStrictEqual(await runWith(["m1"]), [
+      `milestone m2 reported complete — Decouple both detectors`,
+    ]);
+    // ClearRunMilestonesCompleted (cross-worker reseed) serves an empty list: both re-announce.
+    assert.deepStrictEqual(await runWith([]), [
+      `milestone m1 reported complete — Thread the toggle`,
+      `milestone m2 reported complete — Decouple both detectors`,
+    ]);
+  });
+
   it("(c2) resumed run: a milestone absent from the loop-scope frozen list falls back to the claim's frozen list, then degrades to a titleless frame", async () => {
     // frozenMilestones (loop-scope) stays undefined here because the plan turn declares no
     // milestones; the claim's frozen list (ctx.frozenMilestones) supplies m1's title, and m3

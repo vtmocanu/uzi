@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"time"
 
 	"github.com/google/uuid"
@@ -46,10 +47,61 @@ func durationToInterval(d time.Duration) pgtype.Interval {
 }
 
 // EphemeralSettings is the narrow settings dependency of the provisioner: the
-// instance-wide kill-switch and Docker repository scope. *settings.Cache satisfies it.
+// instance-wide kill-switch, Docker repository scope, and the per-user cap, default
+// size and lease (PRD #4212, read per pass). *settings.Cache satisfies it.
 type EphemeralSettings interface {
 	EphemeralWorkersEnabled(ctx context.Context) (bool, error)
 	DockerRepoAllowlist(ctx context.Context) ([]uuid.UUID, error)
+	// EphemeralMaxPerUser is the per-user concurrent-ephemeral cap; 0 provisions nothing.
+	EphemeralMaxPerUser(ctx context.Context) (int, error)
+	// EphemeralDefaultSize is the workersize preset every ephemeral worker is provisioned at.
+	EphemeralDefaultSize(ctx context.Context) (string, error)
+	// EphemeralLease is how long an ephemeral worker that finished a run stays alive for a
+	// same-repo/branch follow-up (PRD #2006); zero disables the lease. It is passed to the reaper
+	// and the trigger queries so a live lease is not reaped or counted as a slot, and provisionOne
+	// evicts the oldest releasable leased worker when the owner is exactly at the cap (never when
+	// over it).
+	EphemeralLease(ctx context.Context) (time.Duration, error)
+}
+
+// ephemeralKnobs is the per-pass snapshot of the admin-tunable ephemeral settings. It is read once
+// at the top of ProvisionPass and threaded through every query and provisionOne call of that pass,
+// so one pass never mixes two values of a setting that an admin changes mid-pass.
+type ephemeralKnobs struct {
+	maxPerUser  int32
+	defaultSize string
+	lease       time.Duration
+}
+
+// readKnobs reads the three tunable settings. Any error returns it with the zero snapshot: the
+// caller skips the whole pass rather than provision against a default it did not read.
+func (p *EphemeralProvisioner) readKnobs(ctx context.Context) (ephemeralKnobs, error) {
+	maxPerUser, err := p.settings.EphemeralMaxPerUser(ctx)
+	if err != nil {
+		return ephemeralKnobs{}, fmt.Errorf("read ephemeral max per user: %w", err)
+	}
+	size, err := p.settings.EphemeralDefaultSize(ctx)
+	if err != nil {
+		return ephemeralKnobs{}, fmt.Errorf("read ephemeral default size: %w", err)
+	}
+	lease, err := p.settings.EphemeralLease(ctx)
+	if err != nil {
+		return ephemeralKnobs{}, fmt.Errorf("read ephemeral lease: %w", err)
+	}
+	return ephemeralKnobs{maxPerUser: clampMaxPerUser(maxPerUser), defaultSize: size, lease: lease}, nil
+}
+
+// clampMaxPerUser narrows the cap to the int32 the trigger queries take. The settings
+// accessor honours any non-negative env value, so a value past math.MaxInt32 must saturate
+// rather than wrap negative, which would make every owner read as over the cap.
+func clampMaxPerUser(n int) int32 {
+	if n < 0 {
+		return 0
+	}
+	if n > math.MaxInt32 {
+		return math.MaxInt32
+	}
+	return int32(n)
 }
 
 // EphemeralConfig carries the tuning knobs the provisioner needs (PRD #529 M2), lifted
@@ -83,11 +135,8 @@ type EphemeralConfig struct {
 	// threshold (an owner without one is never held).
 	UsagePollInterval      time.Duration
 	CodexUsagePollInterval time.Duration
-	// MaxPerUser is the per-user concurrent-ephemeral cap (UZI_EPHEMERAL_MAX_PER_USER).
-	MaxPerUser int
-	// DefaultSize is the workersize preset every ephemeral worker is provisioned at
-	// (UZI_EPHEMERAL_DEFAULT_SIZE); validated at config load.
-	DefaultSize string
+	// The per-user cap, default size and lease are admin settings read per pass through
+	// EphemeralSettings (PRD #4212), not fields here.
 	// ProvisionDeadline (UZI_EPHEMERAL_PROVISION_DEADLINE, default 10m) bounds how long a
 	// freshly provisioned ephemeral worker may make no progress before ReapPass GCs it. The
 	// SAME deadline drives BOTH orphan shapes the reaper times out — (b) never booted
@@ -113,12 +162,6 @@ type EphemeralConfig struct {
 	// a burst worker only once queued longer than this — roughly worker cold-start — so a
 	// freeing slot claims it first and a transient claim-cycle queue does not churn pods.
 	SaturationDelay time.Duration
-	// Lease (UZI_EPHEMERAL_LEASE, PRD #2006) is how long an ephemeral worker that finished a
-	// run stays alive for a same-repo/branch follow-up. Zero disables the lease. It is passed
-	// to the reaper and the trigger queries so a live lease is not reaped or counted as a
-	// slot, and provisionOne evicts the oldest releasable leased worker when the owner is
-	// exactly at MaxPerUser (never when over it).
-	Lease time.Duration
 }
 
 // EphemeralProvisioner is the background pass that auto-provisions run-bound ephemeral
@@ -141,7 +184,8 @@ type EphemeralProvisioner struct {
 // NewEphemeralProvisioner wires the provisioner. pool is needed for Begin + the
 // advisory lock; q is the store used both for the trigger query and, via WithTx, inside
 // each provision transaction; box seals the join token; settings supplies the instance
-// kill-switch; cfg carries the cap and default size.
+// kill-switch and the cap, default size and lease (read each pass); cfg carries the
+// remaining boot-time tuning.
 func NewEphemeralProvisioner(pool *pgxpool.Pool, q *store.Queries, box *secretbox.Box, s EphemeralSettings, cfg EphemeralConfig) *EphemeralProvisioner {
 	return &EphemeralProvisioner{pool: pool, q: q, box: box, settings: s, cfg: cfg, now: time.Now}
 }
@@ -176,6 +220,15 @@ func (p *EphemeralProvisioner) ProvisionPass(ctx context.Context) (int64, error)
 		allowlist = []uuid.UUID{}
 	}
 
+	// The tunable settings, read once for the whole pass. A failed read skips the pass (logged
+	// once, returned like the kill-switch read): provisioning against a cap, size or lease this
+	// pass could not read would either over-provision or evict leased workers on a guess.
+	knobs, err := p.readKnobs(ctx)
+	if err != nil {
+		slog.Error("ephemeral provisioner: read ephemeral settings; skipping the pass", "error", err)
+		return 0, fmt.Errorf("hostedsvc: %w", err)
+	}
+
 	// @max_per_user is the cross-user FAIRNESS filter (see the query comment): it excludes
 	// runs whose owner is already at/over the per-user ephemeral cap so one at-cap user with
 	// a large backlog cannot monopolize every batch. It is an unlocked snapshot, so it is
@@ -202,8 +255,8 @@ func (p *EphemeralProvisioner) ProvisionPass(ctx context.Context) (int64, error)
 		StaleRequeueCutoff:       staleRequeueCutoff,
 		AffinityCutoff:           claimAffinityCutoff,
 		MaxRows:                  ephemeralProvisionBatch,
-		MaxPerUser:               int32(p.cfg.MaxPerUser), //nolint:gosec // small configured cap, never near int32 range
-		EphemeralLease:           workersvc.LeaseInterval(p.cfg.Lease),
+		MaxPerUser:               knobs.maxPerUser,
+		EphemeralLease:           workersvc.LeaseInterval(knobs.lease),
 		// PRD #2006: the lease arm mirrors ClaimRun's custom-Codex-model gate.
 		CodexCuratedModels:  workersvc.CodexCuratedModels(),
 		WorkerDockerEnabled: p.cfg.DockerEnabled,
@@ -220,8 +273,8 @@ func (p *EphemeralProvisioner) ProvisionPass(ctx context.Context) (int64, error)
 		AffinityCutoff:           claimAffinityCutoff,
 		SaturationDelay:          durationToInterval(p.cfg.SaturationDelay),
 		MaxRows:                  ephemeralProvisionBatch,
-		MaxPerUser:               int32(p.cfg.MaxPerUser), //nolint:gosec // small configured cap, never near int32 range
-		EphemeralLease:           workersvc.LeaseInterval(p.cfg.Lease),
+		MaxPerUser:               knobs.maxPerUser,
+		EphemeralLease:           workersvc.LeaseInterval(knobs.lease),
 		// PRD #2006: the lease arm mirrors ClaimRun's custom-Codex-model gate.
 		CodexCuratedModels:  workersvc.CodexCuratedModels(),
 		WorkerDockerEnabled: p.cfg.DockerEnabled,
@@ -240,7 +293,7 @@ func (p *EphemeralProvisioner) ProvisionPass(ctx context.Context) (int64, error)
 		laneRuns, err = p.q.ListIsolatedQueuedRunsForEphemeral(ctx, store.ListIsolatedQueuedRunsForEphemeralParams{
 			BackgroundGraceCutoff: backgroundGraceCutoff,
 			MaxRows:               ephemeralProvisionBatch,
-			MaxPerUser:            int32(p.cfg.MaxPerUser), //nolint:gosec // small configured cap, never near int32 range
+			MaxPerUser:            knobs.maxPerUser,
 		})
 		if err != nil {
 			return 0, fmt.Errorf("hostedsvc: list isolated-lane queued runs: %w", err)
@@ -305,7 +358,7 @@ func (p *EphemeralProvisioner) ProvisionPass(ctx context.Context) (int64, error)
 		if !isolated && EphemeralDockerPreferenceApplies(c.dockerPreference, p.cfg.DockerEnabled, c.repoID, pgtype.Text{String: c.kind, Valid: true}, pgtype.UUID{}, allowlist) {
 			docker = true
 		}
-		ok, perr := p.provisionOne(ctx, c.userID, c.id, template, docker, isolated)
+		ok, perr := p.provisionOne(ctx, c.userID, c.id, template, docker, isolated, knobs)
 		if perr != nil {
 			slog.Error("ephemeral provisioner: provision failed; continuing with the rest of the pass",
 				"run_id", c.id, "trigger", c.trigger, "error", perr)
@@ -343,8 +396,16 @@ func EphemeralDockerPreferenceApplies(preference, tier bool, repo pgtype.UUID, k
 // ephemeral lease is live is spared (store.ReapEphemeralWorkers: lock, then delete re-checking
 // the same predicate).
 func (p *EphemeralProvisioner) ReapPass(ctx context.Context) (int64, error) {
+	// The lease is the live setting. A failed read fails closed: reaping against a guessed lease
+	// could delete a worker whose lease is still live, so nothing is reaped this pass (the next
+	// tick retries) and the error is returned.
+	lease, err := p.settings.EphemeralLease(ctx)
+	if err != nil {
+		slog.Error("ephemeral reaper: read ephemeral lease; reaping nothing this pass", "error", err)
+		return 0, fmt.Errorf("hostedsvc: read ephemeral lease: %w", err)
+	}
 	cutoff := p.now().Add(-p.cfg.ProvisionDeadline)
-	return store.ReapEphemeralWorkers(ctx, p.pool, pgconv.Time(cutoff), workersvc.LeaseInterval(p.cfg.Lease))
+	return store.ReapEphemeralWorkers(ctx, p.pool, pgconv.Time(cutoff), workersvc.LeaseInterval(lease))
 }
 
 // provisionOne runs the provision transaction for a single run, mirroring
@@ -358,7 +419,7 @@ func (p *EphemeralProvisioner) ReapPass(ctx context.Context) (int64, error) {
 //
 // isolated marks a lane worker (PRD #1906 M5): the caller passes true only for the isolated-lane
 // trigger, whose run is profile-bound, and never together with docker.
-func (p *EphemeralProvisioner) provisionOne(ctx context.Context, userID, runID uuid.UUID, template string, docker, isolated bool) (bool, error) {
+func (p *EphemeralProvisioner) provisionOne(ctx context.Context, userID, runID uuid.UUID, template string, docker, isolated bool, knobs ephemeralKnobs) (bool, error) {
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
 		return false, err
@@ -380,7 +441,7 @@ func (p *EphemeralProvisioner) provisionOne(ctx context.Context, userID, runID u
 	// get an ephemeral worker. This is the one boundary all three triggers (capability gap,
 	// saturation, isolated lane) share. Plain snapshot read; a failure fails closed (the next
 	// pass retries), and a suppressed run is skipped, not counted.
-	suppressed, err := p.wakeSuppressesProvision(ctx, qtx, runID)
+	suppressed, err := p.wakeSuppressesProvision(ctx, qtx, runID, knobs.lease)
 	if err != nil {
 		return false, err
 	}
@@ -425,7 +486,7 @@ func (p *EphemeralProvisioner) provisionOne(ctx context.Context, userID, runID u
 	if err != nil {
 		return false, err
 	}
-	if n >= int64(p.cfg.MaxPerUser) {
+	if n >= int64(knobs.maxPerUser) {
 		// At or over the concurrent-ephemeral cap. With the lease on, a leased-idle worker (PRD
 		// #2006) holds a slot only as a courtesy to a follow-up run, so an owner EXACTLY at the cap
 		// gets the oldest releasable one evicted in THIS tx to make room: after the eviction the
@@ -435,7 +496,7 @@ func (p *EphemeralProvisioner) provisionOne(ctx context.Context, userID, runID u
 		// no lease. Otherwise (nothing releasable, lease off) refuse before minting anything, so
 		// there is no token to seal and nothing to roll back but the lock. Not an error: the cap
 		// working as intended.
-		if p.cfg.Lease <= 0 || n > int64(p.cfg.MaxPerUser) || !p.evictOldestLeased(ctx, qtx, userID) {
+		if knobs.lease <= 0 || n > int64(knobs.maxPerUser) || !p.evictOldestLeased(ctx, qtx, userID) {
 			return false, nil
 		}
 	}
@@ -466,7 +527,7 @@ func (p *EphemeralProvisioner) provisionOne(ctx context.Context, userID, runID u
 		Name:             ephemeralWorkerName(runID),
 		TokenHash:        hash,
 		TemplateDeclared: pgtype.Text{String: template, Valid: true},
-		HostedSize:       pgtype.Text{String: p.cfg.DefaultSize, Valid: true},
+		HostedSize:       pgtype.Text{String: knobs.defaultSize, Valid: true},
 		// Explicit true/false (Valid always), never NULL: on a hosted row a false is a
 		// real "no sidecar", matching CreateHostedWorker.
 		DockerEnabled:     pgtype.Bool{Bool: docker, Valid: true},

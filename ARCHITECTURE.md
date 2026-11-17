@@ -2,6 +2,9 @@
 
 uzi's current MVP is a docker-compose stack of three always-on services (`web`, `api`, `db`) plus one opt-in, profile-gated service (`agent`, a per-user worker — PRD #4), with three trust boundaries: the inbound edge at nginx, the API's outbound calls to the forge (GitLab, Forgejo or GitHub), and the API's connection to each user's worker. This document describes that shape; see [docs/auth-design.md](docs/auth-design.md) for the auth surface, and [docs/proc-hardening.md](docs/proc-hardening.md) for the worker/agent process-isolation detail the Secrets and Guardrails sections below summarize.
 
+The full-tree npm audit and its narrowly bounded, maintainer-approved temporary
+exceptions are recorded in [ADR-4435](adr/4435-npm-audit-exceptions.md).
+
 ## Services
 
 ```
@@ -136,6 +139,8 @@ Migration `00002_forge.sql` adds four tables, all scoped down to `forge_connecti
 `api/internal/forgesvc.Service` is shared by the HTTP handlers and the background poller: it builds a `Forge` driver from a stored (encrypted) connection, runs the PRD-link check, and implements `IncrementalSync`/`FullSync` against an `IssueStore` interface (narrowed for unit testing against a fake store and a mocked `Forge`, without a live database).
 
 `api/internal/poller.Engine` (`main.go`) is started as a single background goroutine alongside the HTTP server. Each tick, for every enabled repo, it either runs an incremental pull — two fetches, the `uzi`-labelled set (`state=all`, PRD #764 M5 keys this on the configured `uzi_label` rather than the old `PRD` label) plus PRD #102 M6's additive open, no-label set, each bounded by its own high-water mark in `forgesvc.Marks{PRD, Open}` (the struct field is still named `PRD` in code; never the client clock; the max `updated_at` that fetch itself returned) — or, every `FORGE_RECONCILE_EVERY`-th tick (and always on a repo's first poll after being enabled), a full reconcile: fetch both complete sets with no lower bound, upsert everything, and evict cache rows absent from their union. Eviction is the only way to observe de-labeling, closing-with-label-removed, or deletion, which an `updated_after`-filtered query structurally cannot report. Per-repo state (`marks forgesvc.Marks`, poll count) lives only in the `Engine`'s in-memory map — a disabled repo simply drops out and a re-enabled one starts over with a fresh full reconcile.
+
+Enabling a repo no longer runs its first import in the request (issue #4399). `SetRepoEnabled` records a `waiting` import on the repo row (`repos.initial_import_*`, migration `00465`) and calls `Engine.RequestImport` (`uzi server setup` records the same `waiting` import but cannot wake the poller, so its import starts on the next tick), which coalesces per repo and wakes the poller; the wake pass runs only those repos' first full reconcile inside the same `Run` goroutine as the ticks, so the poller never syncs a repo concurrently with itself. The poller claims the import `running` and settles it `succeeded` (also for zero issues) or `failed` with a coarse error class, and a failed import is retried on the next tick; after an api restart any `waiting`, `running` or `failed` import is picked up on the first tick. Claim and finish are guarded by an `initial_import_generation` bumped by each enable that owes an import (re-enabling an already-enabled repo whose import succeeded changes nothing), so a completion from an older enable never overwrites a newer one. The board response carries this as `initial_import` (null for repos enabled before the change and not re-enabled since), which the web board renders as a banner. The board's Refresh and first-open seeding still import inside their own request.
 
 Writes are forge-first: a board move (`POST /api/repos/:id/issues/:iid/move`) calls `UpdateIssueLabels` before touching the cache, and only updates the cache on success — a failed forge write leaves the card where it was (snap-back), never an optimistically-moved card the forge disagrees with.
 
@@ -2641,8 +2646,11 @@ mounts none of the join token or `/nix`, and from #3153 it mounts only the
 at `/data/runner`), never the whole volume. That is a mount-view property; it
 does not bound rootful dind device reach.
 
-New persistent workers preselect the large preset; new ephemeral workers default
-to medium via `workers.ephemeralDefaultSize`. The decision, partial supersession,
+New persistent workers preselect the admin `hosted_default_size` (shipped default
+large; the provision API still requires an explicit size); new ephemeral workers
+default to the admin `ephemeral_default_size` (shipped default medium), which a
+chart `workers.ephemeralDefaultSize` or `UZI_EPHEMERAL_DEFAULT_SIZE` value pins and
+locks. The decision, partial supersession,
 capacity cost, and preservation of existing stored sizes are recorded in
 [ADR-2240](adr/2240-hosted-worker-default-size.md).
 

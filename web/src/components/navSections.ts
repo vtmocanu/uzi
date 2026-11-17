@@ -40,6 +40,7 @@ const ADMIN_TABS: SectionDef[] = [
   { label: "Tool allowlist", to: "/admin/tool-allowlist", keywords: ["tools", "allow", "permissions"] },
   { label: "Blocked repos", to: "/admin/blocked-repos", keywords: ["block", "deny", "repositories"] },
   { label: "Settings", to: "/admin/settings", keywords: ["instance", "configuration", "config"] },
+  { label: "Workers", to: "/admin/workers", keywords: ["fleet", "hosted", "docker", "ephemeral", "hibernation", "capability", "scheduling"] },
   { label: "Branding", to: "/admin/branding", keywords: ["logo", "company", "brand"] },
   { label: "Site lists", to: "/admin/egress-profiles", keywords: ["egress", "profiles", "domains", "network"] },
   { label: "Products", to: "/admin/products", keywords: ["external", "jobs"] },
@@ -59,21 +60,31 @@ const ADMIN_SETTINGS_ANCHORS: { id: string; label: string; keywords: string[] }[
   { id: "updates", label: "Updates", keywords: ["release", "version", "upgrade", "banner"] },
   { id: "slack", label: "Slack", keywords: ["notifications", "chat", "bot"] },
   { id: "run-health", label: "Run health", keywords: ["stall", "nudge", "timeout", "health"] },
-  { id: "docker-allowlist", label: "Docker workers", keywords: ["docker", "allowlist", "repos"] },
   { id: "review-bots", label: "Review bots", keywords: ["trusted", "coderabbit", "greptile", "rework"] },
-  { id: "hosted-worker-quota", label: "Hosted worker quota", keywords: ["workers", "quota", "limit"] },
-  { id: "custody-hold-limit", label: "Custody hold limit", keywords: ["custody", "recovery", "hold"] },
-  { id: "ephemeral-workers", label: "Ephemeral workers", keywords: ["workers", "run-bound", "autoscale"] },
-  { id: "worker-hibernation", label: "Worker hibernation", keywords: ["idle", "sleep", "workers"] },
-  { id: "capability-scheduling", label: "Capability scheduling", keywords: ["capabilities", "scheduler", "workers"] },
   { id: "completion-interlock", label: "Completion check", keywords: ["completion", "interlock", "milestones"] },
   { id: "github-project-sync", label: "GitHub Projects sync", keywords: ["github", "projects", "board"] },
   { id: "fetch-caps", label: "Research fetch caps", keywords: ["fetch", "download", "bytes", "limits"] },
 ];
 
+// The worker-fleet cards, on Admin → Workers (they used to live on Instance, so the
+// keywords keep the old and new vocabulary findable). In page order.
+const ADMIN_WORKERS_ANCHORS: { id: string; label: string; keywords: string[] }[] = [
+  { id: "docker-allowlist", label: "Docker workers", keywords: ["docker", "allowlist", "repos"] },
+  { id: "hosted-worker-quota", label: "Hosted worker quota", keywords: ["workers", "quota", "limit", "default size", "size"] },
+  { id: "custody-hold-limit", label: "Custody hold limit", keywords: ["custody", "recovery", "hold"] },
+  { id: "ephemeral-workers", label: "Ephemeral workers", keywords: ["workers", "run-bound", "autoscale", "cap", "per-user", "lease", "ephemeral size", "default size"] },
+  { id: "worker-hibernation", label: "Worker hibernation", keywords: ["idle", "sleep", "workers"] },
+  { id: "capability-scheduling", label: "Capability scheduling", keywords: ["capabilities", "scheduler", "workers"] },
+];
+
 // The anchors AdminSettings may scroll to once its cards have rendered.
 export const ADMIN_SETTINGS_ANCHOR_IDS: ReadonlySet<string> = new Set(
   ADMIN_SETTINGS_ANCHORS.map((a) => a.id),
+);
+
+// The anchors AdminWorkers may scroll to; AdminSettings also forwards these ids to it.
+export const ADMIN_WORKERS_ANCHOR_IDS: ReadonlySet<string> = new Set(
+  ADMIN_WORKERS_ANCHORS.map((a) => a.id),
 );
 
 const ALL_SECTION_ITEMS: SectionItem[] = [
@@ -94,6 +105,13 @@ const ALL_SECTION_ITEMS: SectionItem[] = [
     key: `admin-settings:${a.id}`,
     label: `Admin${SEP}Settings${SEP}${a.label}`,
     to: `/admin/settings#${a.id}`,
+    keywords: a.keywords,
+    adminOnly: true,
+  })),
+  ...ADMIN_WORKERS_ANCHORS.map((a) => ({
+    key: `admin-workers:${a.id}`,
+    label: `Admin${SEP}Workers${SEP}${a.label}`,
+    to: `/admin/workers#${a.id}`,
     keywords: a.keywords,
     adminOnly: true,
   })),

@@ -64,8 +64,13 @@ const opacityChain = (el: Element): number => {
   return o;
 };
 
+// The app renders every page inside AppShell's <main> gutter (px-4 sm:px-6), and the
+// settings shell's pinned tab row bleeds into that gutter (PinnedBlock, #4419).
+const renderInGutter = () =>
+  render(<MemoryRouter><div className="px-4 sm:px-6"><RunDefaults /></div></MemoryRouter>);
+
 it("lays the judge card out in one column at 400px with Codex chosen and the Claude side dimmed", async () => {
-  render(<MemoryRouter><RunDefaults /></MemoryRouter>);
+  renderInGutter();
   const runsOn = (await screen.findByLabelText("Judge runs on")) as HTMLSelectElement;
   await screen.findByLabelText("Token the judge spends");
 
@@ -115,7 +120,7 @@ it("keeps keyboard focus on the select through a save, so a second ArrowDown sti
   mockApi.putMySettings.mockImplementationOnce((patch: UserSettingsPatch) => new Promise((resolve) => {
     release = () => resolve({ settings: settings(patch.judge_runs_on ?? null) });
   }));
-  render(<MemoryRouter><RunDefaults /></MemoryRouter>);
+  renderInGutter();
   const runsOn = (await screen.findByLabelText("Judge runs on")) as HTMLSelectElement;
   await screen.findByLabelText("Token the judge spends");
   runsOn.focus();

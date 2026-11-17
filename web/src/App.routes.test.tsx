@@ -174,6 +174,20 @@ describe("mock-mode route smoke", () => {
   });
 });
 
+describe("Admin → Workers route", () => {
+  it("is a registered admin route that renders the worker cards in mock mode", async () => {
+    const route = APP_ROUTES.find((r) => r.path === "/admin/workers");
+    expect(route?.guard).toBe("admin");
+    await mockApi.login("vlad@uzi.local", "x");
+    const { holder, container, unmount } = await mountRoute("/admin/workers");
+    expectRenderedCleanly("admin /admin/workers", holder, container);
+    expect(await screen.findByRole("link", { name: "Hosted worker quota" })).toBeTruthy();
+    expect(document.getElementById("capability-scheduling")).not.toBeNull();
+    unmount();
+    cleanup();
+  }, 30000);
+});
+
 function RouteLocation() {
   const { pathname, search, hash } = useLocation();
   return <output data-testid="route-location">{pathname + search + hash}</output>;

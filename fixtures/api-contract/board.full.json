@@ -80,5 +80,10 @@
     "web_url": "x",
     "pipeline_id": 1,
     "synced_at": "2020-01-02T03:04:05Z"
+  },
+  "initial_import": {
+    "state": "x",
+    "updated_at": "2020-01-02T03:04:05Z",
+    "error_class": "x"
   }
 }

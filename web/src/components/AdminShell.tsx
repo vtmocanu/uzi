@@ -1,5 +1,5 @@
 // AdminShell: one header + tab bar shared by the admin surfaces (Users, Rate limits,
-// Tool allowlist, Blocked repos, Instance, Branding, Site lists, Products, Health). The same
+// Tool allowlist, Blocked repos, Instance, Workers, Branding, Site lists, Products, Health). The same
 // treatment SettingsShell gives the user-scoped settings: the pages used to be separate
 // top-level sidebar entries wired together only by proximity, which crowded the
 // sidebar for admins and hid that they are one area — this instance's controls.
@@ -12,6 +12,7 @@ import { CountPill, cx, PageHeader } from "./ui";
 import { healthPipLabel } from "../lib/healthView";
 import { useHealthStatus } from "../lib/useAdminHealth";
 import { SeverityShape } from "./healthSeverity";
+import { keepInRowView, PinnedBlock, TabRow, tabClass } from "./TabRow";
 
 // Health is last (PRD #1484 D1); its entry points are the sidebar pip
 // (M5) and the Overview card (M5), not tab position. `pip: true` marks the aggregate
@@ -22,6 +23,7 @@ export const TABS = [
   { to: "/admin/tool-allowlist", label: "Tool allowlist" },
   { to: "/admin/blocked-repos", label: "Blocked repos" },
   { to: "/admin/settings", label: "Instance" },
+  { to: "/admin/workers", label: "Workers" },
   { to: "/admin/branding", label: "Branding" },
   // Optional external-products/jobs controls follow instance configuration. Site lists
   // come first: jobs use them, and products can only allow lists that already exist.
@@ -30,7 +32,16 @@ export const TABS = [
   { to: "/admin/health", label: "Health", pip: true },
 ];
 
-export function AdminShell({ description, children }: { description: ReactNode; children: ReactNode }) {
+export function AdminShell({
+  description,
+  pinned,
+  children,
+}: {
+  description: ReactNode;
+  /** Extra rows pinned with the tabs, under them (e.g. a page's section pills). */
+  pinned?: ReactNode;
+  children: ReactNode;
+}) {
   // The tab pip must show on EVERY admin tab, not only while viewing Health. Both this pip
   // and the page read the ONE shared HealthStatusProvider mounted in AppShell (PRD #1484 M5),
   // so there is a single poll app-wide and the isAdmin gate lives in the provider alone.
@@ -55,10 +66,9 @@ export function AdminShell({ description, children }: { description: ReactNode; 
   const stripRef = useRef<HTMLDivElement>(null);
   const { pathname } = useLocation();
   useEffect(() => {
-    const active = stripRef.current?.querySelector('[aria-current="page"]');
-    if (active && typeof (active as HTMLElement).scrollIntoView === "function") {
-      (active as HTMLElement).scrollIntoView({ block: "nearest", inline: "nearest" });
-    }
+    // keepInRowView adjusts only the row's scrollLeft: scrollIntoView would also move the
+    // window under the pinned block's scroll-padding on every pip re-render (#4419).
+    keepInRowView(stripRef.current, stripRef.current?.querySelector<HTMLElement>('[aria-current="page"]'));
   }, [pathname, attention, pipDanger, sourcePip, sourceSeverity]);
 
   return (
@@ -72,19 +82,13 @@ export function AdminShell({ description, children }: { description: ReactNode; 
       <PageHeader title="Admin" description="Configuration and controls for this uzi instance." />
       {/* Same overflow contract as SettingsShell (issue #204): the tab row scrolls
           within its own container so the page body never scrolls horizontally. */}
-      <div ref={stripRef} className="flex gap-1 overflow-x-auto border-b border-edge">
+      <PinnedBlock>
+      <TabRow ref={stripRef}>
         {TABS.map((t) => (
           <NavLink
             key={t.to}
             to={t.to}
-            className={({ isActive }) =>
-              cx(
-                "-mb-px flex shrink-0 items-center gap-1.5 whitespace-nowrap border-b-2 px-3 py-2 text-sm font-medium transition-colors",
-                isActive
-                  ? "border-brand text-fg"
-                  : "border-transparent text-muted hover:border-edge-strong hover:text-fg",
-              )
-            }
+            className={({ isActive }) => cx(tabClass(isActive), "flex items-center gap-1.5")}
           >
             {t.label}
             {t.to === "/admin/settings" && sourcePip && (
@@ -103,7 +107,9 @@ export function AdminShell({ description, children }: { description: ReactNode; 
             )}
           </NavLink>
         ))}
-      </div>
+      </TabRow>
+      {pinned}
+      </PinnedBlock>
       {description && <p className="text-sm text-muted">{description}</p>}
       {children}
     </div>

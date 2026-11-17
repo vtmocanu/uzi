@@ -1,0 +1,29 @@
+{
+  "lockfileVersion": 3,
+  "packages": {
+    "node_modules/fdir": {
+      "name": null,
+      "version": "6.5.0",
+      "dev": true,
+      "resolved": "https://registry.npmjs.org/fdir/-/fdir-6.5.0.tgz"
+    },
+    "node_modules/knip": {
+      "name": null,
+      "version": "6.42.1",
+      "dev": true,
+      "resolved": "https://registry.npmjs.org/knip/-/knip-6.42.1.tgz"
+    },
+    "node_modules/picomatch": {
+      "name": null,
+      "version": "4.0.7",
+      "dev": true,
+      "resolved": "https://registry.npmjs.org/picomatch/-/picomatch-4.0.7.tgz"
+    },
+    "node_modules/tinyglobby": {
+      "name": null,
+      "version": "0.2.17",
+      "dev": true,
+      "resolved": "https://registry.npmjs.org/tinyglobby/-/tinyglobby-0.2.17.tgz"
+    }
+  }
+}

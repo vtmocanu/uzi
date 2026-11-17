@@ -47,8 +47,8 @@ sweep detects the block, without waiting for **Stuck queued after**
 limit, and so on) still hides it, and setting `health_queued_seconds` to `0`
 still turns it off with every other queued flag. The wording depends on
 whether the run's owner is an admin, because only an admin can change the
-allowlist (**Admin → Instance → Docker worker repo allowlist**, at
-`/admin/settings`). An admin viewing someone else's run sees the owner's
+allowlist (**Admin → Workers → Docker worker repo allowlist**, at
+`/admin/workers`). An admin viewing someone else's run sees the owner's
 variant.
 
 - Owner is an admin: _"this repo isn't on the Docker worker repo allowlist, so
@@ -57,6 +57,9 @@ variant.
 - Owner is not an admin: _"this repo isn't on the Docker worker repo
   allowlist, so your Docker workers can't run it; ask an admin to add it under
   Admin → Instance → Docker worker repo allowlist"_
+
+These reason texts still name Admin → Instance, where the allowlist used to
+live; the control is now on Admin → Workers.
 
 The fix is to add the repo to the allowlist, not to start another worker. The
 owner's Slack nudge for this flag arrives sooner too, still subject to the

@@ -924,8 +924,8 @@ type RunDTO struct {
 	// or about to fill; timed retries become owner holds with NULL retry at the cap, see DiskParkCount);
 	// "provider_outage" is active: a typed provider-transient retry park (PRD #1733).
 	// "anthropic_spend_limit" (issue #3767) is an owner-held hold: the Anthropic API refused for a
-	// spend limit. It never retries on a timer; raise the limit and Resume, switch token with
-	// set-token, or Cancel.
+	// spend limit or (issue #4426) an exhausted prepaid credit balance. It never retries on a timer;
+	// raise the limit (or top up credit) and Resume, switch token with set-token, or Cancel.
 	// "worker_requeue_exhausted" and "worker_memory_pressure" require owner action.
 	// "retained_recovery_exhausted" can be timed or owner-held; see RecoveryRetryNotBefore.
 	// "retained_recovery_adoption_failed" is an integrity hold: retained adoption or a
@@ -1874,8 +1874,8 @@ type RunSummaryItemDTO struct {
 	// or about to fill; timed retries become owner holds with NULL retry at the cap, see DiskParkCount);
 	// "provider_outage" is active: a typed provider-transient retry park (PRD #1733).
 	// "anthropic_spend_limit" (issue #3767) is an owner-held hold: the Anthropic API refused for a
-	// spend limit. It never retries on a timer; raise the limit and Resume, switch token with
-	// set-token, or Cancel.
+	// spend limit or (issue #4426) an exhausted prepaid credit balance. It never retries on a timer;
+	// raise the limit (or top up credit) and Resume, switch token with set-token, or Cancel.
 	// "worker_requeue_exhausted" and "worker_memory_pressure" require owner action.
 	// "retained_recovery_exhausted" can be timed or owner-held; see RecoveryRetryNotBefore.
 	// "retained_recovery_adoption_failed" is an integrity hold: retained adoption or a

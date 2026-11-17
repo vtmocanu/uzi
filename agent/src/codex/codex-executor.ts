@@ -4680,7 +4680,7 @@ export class CodexExecutor implements Executor {
         for (let round = 0; ; round++) {
           // Issue #1674 (PRD #1064 parity): each report_progress observation pushes at once and emits
           // its started / reported-complete frames exactly once, diffed from the last known progress.
-          const onProgress = makeProgressObserver(this.ownedProgressContext(ctx), latestProgress, milestones);
+          const onProgress = makeProgressObserver(this.ownedProgressContext(ctx), latestProgress, milestones, lastServedScope?.completedIds);
           // Issue #1764: an in-turn owner park reports the server's cumulative count when it served one.
           const turnAt = { completedCount: served?.completedCount ?? latestProgress?.completed?.length ?? 0, total: milestones?.length };
           const implTurn = await this.driveTurnWithWallPark(ctx, epoch.harness, epoch.registry, reducer, "implement", nextPrompt, epoch.resumeSessionId, idleMs, wall, epoch.buildPhaseBroker, shared.selection.current, shared.repoInstructions, turnAt, shared.scrubProjected, beforeReapingSink, pauseNow, recreateEpochAfterReap, completion, onProgress, round === 0 ? firstEventHandler : undefined, undefined,

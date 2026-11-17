@@ -80,8 +80,9 @@ type Report struct {
 	Discovery *Step      `json:"discovery,omitempty"`
 	Repos     []RepoStep `json:"repos,omitempty"`
 	Worker    *Step      `json:"worker,omitempty"`
-	// IssueSync is "pending" once a repo is enabled: setup cannot reach the
-	// API's in-process sync, so the poller imports issues on its next pass.
+	// IssueSync is "pending" once a repo is enabled: enabling records a waiting
+	// first import that the API's poller runs on its next pass (setup cannot reach
+	// the API's in-process sync).
 	IssueSync string `json:"issue_sync,omitempty"`
 }
 

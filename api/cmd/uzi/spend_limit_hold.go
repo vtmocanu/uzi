@@ -6,7 +6,8 @@ import (
 )
 
 // anthropicSpendLimitCause is the recovery_wait cause the api sets when a Claude run on an
-// Anthropic API key hit its organization or workspace spend limit. The hold is owner-held:
+// Anthropic API key hit its organization or workspace spend limit, or (issue #4426) ran out of
+// prepaid credit. The hold is owner-held:
 // recovery_retry_not_before is NULL and nothing resumes it automatically.
 const anthropicSpendLimitCause = "anthropic_spend_limit"
 

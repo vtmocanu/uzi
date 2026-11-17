@@ -45,9 +45,11 @@ import {
   ListSkeleton,
   PageHeader,
 } from "../components/ui";
+import { PinnedBlock, TabRow, tabClass } from "../components/TabRow";
 import { ScaleIcon, XIcon } from "../components/icons";
 import type { Toast } from "./judge/shared";
 import { LabelFilter } from "./judge/LabelFilter";
+import { useMinWidth } from "../lib/useMinWidth";
 import { MultiSelectBar } from "./judge/MultiSelectBar";
 import { GroupRow } from "./judge/GroupRow";
 import { SelectAllCheckbox } from "../components/triage/SelectAllCheckbox";
@@ -107,6 +109,9 @@ export function Judge() {
   // Admin "All users" scope (PRD #1184 M4). A non-admin NEVER sees the switch and NEVER reads
   // the pref — so the pref is only consulted when isAdmin, and scopePref stays "mine" otherwise.
   const isAdmin = !!user?.is_admin;
+  // lg and up: the chip row pins with the bucket tabs (one LabelFilter instance, never two).
+  const wide = useMinWidth(1024);
+  const tabsRef = useRef<HTMLDivElement>(null);
   const [scopePref, setScopePref] = useState<JudgeScope>(() => (isAdmin ? judgeScopePref.get() : "mine"));
   // A ?run= anchor is a notification deep-link into the CALLER'S OWN run, so it FORCES `mine`
   // for that view (the switch is hidden) regardless of the stored pref. A non-admin is always
@@ -567,6 +572,7 @@ export function Judge() {
   // A category-filtered view that comes back empty is NOT inbox-zero — the todo backlog may
   // be full of other labels — so a filter narrows out of the zero-state into the "no groups
   // match these labels" empty state below.
+  const pinFilter = wide && !!triage;
   const showZeroState =
     scope === "mine" &&
     bucket === "todo" &&
@@ -677,38 +683,73 @@ export function Judge() {
           on screen: the on-screen groups are capped-before-grouping and bucket-filtered, so
           tallying them stays the anti-pattern the codebase forbids — a chip can honestly read 6
           while a truncated list shows 4 cards. */}
-      <LabelFilter
-        selected={categories}
-        counts={categoryCounts}
-        onToggle={toggleCategory}
-        onClear={clearCategories}
-      />
+      {!pinFilter && (
+        <LabelFilter
+          selected={categories}
+          counts={categoryCounts}
+          onToggle={toggleCategory}
+          onClear={clearCategories}
+        />
+      )}
 
       {/* Bucket tabs — counts straight from the canonical triage aggregate, never tallied
           off the (possibly filtered/truncated) groups on screen. */}
       {triage && (
-        <div role="tablist" aria-label="Backlog bucket" className="flex flex-wrap gap-1 border-b border-edge">
-          {JUDGE_BUCKETS.map((b) => {
-            const active = b === bucket;
-            return (
-              <button
-                key={b}
-                role="tab"
-                aria-selected={active}
-                onClick={() => setBucket(b)}
-                className={cx(
-                  "-mb-px border-b-2 px-3 py-2 text-sm font-medium transition-colors",
-                  active
-                    ? "border-brand text-fg"
-                    : "border-transparent text-faint hover:border-edge-strong hover:text-muted",
-                )}
+        <PinnedBlock>
+          {pinFilter && (
+            <LabelFilter
+              layout="row"
+              selected={categories}
+              counts={categoryCounts}
+              onToggle={toggleCategory}
+              onClear={clearCategories}
+            />
+          )}
+          <TabRow ref={tabsRef} variant="wrap" role="tablist" aria-label="Backlog bucket">
+            {JUDGE_BUCKETS.map((b) => {
+              const active = b === bucket;
+              return (
+                <button
+                  key={b}
+                  role="tab"
+                  aria-selected={active}
+                  onClick={() => setBucket(b)}
+                  className={tabClass(active, "faint")}
+                >
+                  {bucketTabLabel(b)}
+                  <span className="ml-1.5 tabular-nums text-faint">{bucketTabCount(triage, b)}</span>
+                </button>
+              );
+            })}
+          </TabRow>
+          {/* Below lg the chips scroll away, so a one-line marker keeps the active filter
+              visible (and clearable) inside the pinned block. */}
+          {!wide && categories.length > 0 && (
+            <div data-judge-filter-marker="" className="flex items-center gap-2 py-1.5 text-sm text-muted">
+              <span
+                className="min-w-0 truncate"
+                title={`Filtered: ${categories.map((c) => recommendationLabel(c)).join(", ")}`}
               >
-                {bucketTabLabel(b)}
-                <span className="ml-1.5 tabular-nums text-faint">{bucketTabCount(triage, b)}</span>
+                Filtered: {categories.map((c) => recommendationLabel(c)).join(", ")}
+              </span>
+              <button
+                type="button"
+                aria-label="Clear label filter"
+                onClick={() => {
+                  clearCategories();
+                  // The marker unmounts with the filter: hand focus to the active bucket tab
+                  // (without scrolling the window) so it is not dropped to <body>.
+                  tabsRef.current
+                    ?.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]')
+                    ?.focus({ preventScroll: true });
+                }}
+                className="ml-auto inline-flex min-h-[24px] shrink-0 items-center gap-1 rounded-md px-2 py-1 text-xs font-medium text-muted transition-colors hover:bg-raised hover:text-fg"
+              >
+                <XIcon /> Clear
               </button>
-            );
-          })}
-        </div>
+            </div>
+          )}
+        </PinnedBlock>
       )}
 
       {backlog?.truncated && (

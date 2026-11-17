@@ -1419,3 +1419,39 @@ func TestLoadPrerequisiteClosureForges(t *testing.T) {
 		}
 	}
 }
+
+// settings cannot import config, so its EphemeralLeaseMax is a copy of
+// MaxEphemeralLease; this pins the two together (PRD #4212).
+func TestEphemeralLeaseMaxMatchesSettings(t *testing.T) {
+	if settings.EphemeralLeaseMax != MaxEphemeralLease {
+		t.Fatalf("settings.EphemeralLeaseMax = %s, config.MaxEphemeralLease = %s; they must match",
+			settings.EphemeralLeaseMax, MaxEphemeralLease)
+	}
+}
+
+// TestLoadEphemeralMaxPerUser pins the lenient UZI_EPHEMERAL_MAX_PER_USER parse the
+// env overlay of PRD #4212 relies on: malformed and zero fall back to 2, values above
+// the admin bound of 20 are honoured.
+func TestLoadEphemeralMaxPerUser(t *testing.T) {
+	for _, tc := range []struct {
+		name, value string
+		want        int
+	}{
+		{"malformed", "abc", 2},
+		{"zero", "0", 2},
+		{"in range", "7", 7},
+		{"above the admin bound", "25", 25},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			autoselectEnv(t)
+			t.Setenv("UZI_EPHEMERAL_MAX_PER_USER", tc.value)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load(): %v", err)
+			}
+			if cfg.EphemeralMaxPerUser != tc.want {
+				t.Fatalf("EphemeralMaxPerUser = %d, want %d", cfg.EphemeralMaxPerUser, tc.want)
+			}
+		})
+	}
+}

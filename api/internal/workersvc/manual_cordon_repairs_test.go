@@ -125,7 +125,7 @@ func TestManualCordonHealthEntryAssignedFenceLiveDB(t *testing.T) {
 func TestManualCordonHealthLeaseAvailabilityLiveDB(t *testing.T) {
 	e := setupInterlockLiveDB(t)
 	svc := e.permitService(t)
-	svc.ephemeralLease = 2 * time.Hour
+	svc.SetEphemeralSettings(fakeEphemeralSettings{lease: 2 * time.Hour})
 	run := e.seedQueuedRun(t, nil, nil)
 	bound := e.seedQueuedRun(t, nil, nil)
 	worker := e.seedHeartbeatWorker(t, nil)

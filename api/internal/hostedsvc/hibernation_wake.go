@@ -26,6 +26,10 @@ type WakeService interface {
 // ClaimRun's fn_worker_can_claim applies. *settings.Cache satisfies it.
 type WakeSettings interface {
 	DockerRepoAllowlist(ctx context.Context) ([]uuid.UUID, error)
+	// EphemeralLease is the current ephemeral lease (the ephemeral_lease admin setting, env
+	// overlay included): a run an online leased ephemeral worker can take through its lease is not
+	// demand. Zero disables it. Read once per pass, never snapshotted at boot.
+	EphemeralLease(ctx context.Context) (time.Duration, error)
 }
 
 // HibernationWakerConfig carries the claim-side knobs the demand query mirrors. They must equal
@@ -41,9 +45,6 @@ type HibernationWakerConfig struct {
 	WorkerHeartbeatStale time.Duration
 	// BackgroundGrace mirrors the ordering input of the ephemeral trigger.
 	BackgroundGrace time.Duration
-	// Lease is the configured ephemeral lease (EphemeralConfig.Lease, UZI_EPHEMERAL_LEASE): a run an
-	// online leased ephemeral worker can take through its lease is not demand. Zero disables it.
-	Lease time.Duration
 }
 
 // HibernationWaker is the demand-wake sweeper pass (PRD #4205 M5). It runs before ephemeral
@@ -87,6 +88,14 @@ func (w *HibernationWaker) WakePass(ctx context.Context) (int64, error) {
 	if allowlist == nil {
 		allowlist = []uuid.UUID{}
 	}
+	// The lease is the live setting, read once per pass before the demand query. A failed read
+	// wakes nothing (the next pass retries): guessing a lease could wake a sleeper for a run an
+	// online leased ephemeral worker would take, or leave a run stranded.
+	lease, lerr := w.settings.EphemeralLease(ctx)
+	if lerr != nil {
+		errs = append(errs, fmt.Errorf("hostedsvc: read ephemeral lease: %w", lerr))
+		return 0, errors.Join(errs...)
+	}
 	evaluatedAt := w.now()
 	demand, err := w.q.ListHibernationWakeDemand(ctx, store.ListHibernationWakeDemandParams{
 		CrossCheckEvaluatedAt:    pgconv.Time(evaluatedAt),
@@ -96,7 +105,7 @@ func (w *HibernationWaker) WakePass(ctx context.Context) (int64, error) {
 		DockerRepoAllowlist:      allowlist,
 		HeartbeatCutoff:          pgconv.Time(evaluatedAt.Add(-w.cfg.WorkerHeartbeatStale)),
 		StaleRequeueCutoff:       workersvc.StaleRequeueCutoff(evaluatedAt, w.cfg.WorkerStaleRequeueGrace),
-		EphemeralLease:           workersvc.LeaseInterval(w.cfg.Lease),
+		EphemeralLease:           workersvc.LeaseInterval(lease),
 		BackgroundGraceCutoff:    pgconv.Time(evaluatedAt.Add(-w.cfg.BackgroundGrace)),
 		MaxRows:                  ephemeralProvisionBatch,
 	})
@@ -126,7 +135,7 @@ func (w *HibernationWaker) WakePass(ctx context.Context) (int64, error) {
 // wakeSuppressesProvision reports whether run runID's recorded demand wake still covers it, so
 // ephemeral provisioning should skip it (PRD #4205 D9). It reads through qtx, inside
 // provisionOne's advisory-locked transaction.
-func (p *EphemeralProvisioner) wakeSuppressesProvision(ctx context.Context, qtx *store.Queries, runID uuid.UUID) (bool, error) {
+func (p *EphemeralProvisioner) wakeSuppressesProvision(ctx context.Context, qtx *store.Queries, runID uuid.UUID, lease time.Duration) (bool, error) {
 	evaluatedAt := p.now()
 	return qtx.HibernationWakeSuppresses(ctx, store.HibernationWakeSuppressesParams{
 		CrossCheckEvaluatedAt:    pgtype.Timestamptz{Time: evaluatedAt, Valid: true},
@@ -135,7 +144,7 @@ func (p *EphemeralProvisioner) wakeSuppressesProvision(ctx context.Context, qtx 
 		RunID:                    runID,
 		// The lease cannot change the result: the waking worker is always persistent, and the lease only
 		// admits ephemeral workers. Passed for consistency with the demand query.
-		EphemeralLease: workersvc.LeaseInterval(p.cfg.Lease),
+		EphemeralLease: workersvc.LeaseInterval(lease),
 		WakeTimeout:    durationToInterval(workersvc.WorkerWakeTimeout),
 	})
 }

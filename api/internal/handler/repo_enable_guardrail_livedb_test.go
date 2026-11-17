@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -20,6 +21,7 @@ import (
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/privcheck"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // The live-DB half of PRD #66 M4 (D1 layer 1): the repo-enable gate. SetRepoEnabled
@@ -67,6 +69,9 @@ type fakeGuardForge struct {
 	// labelsRefused makes every label call answer 403, the forge refusing the
 	// board column labels.
 	labelsRefused bool
+	// issuesHook, when set, serves GET .../issues instead of the default single
+	// issue; it reports whether it handled the request.
+	issuesHook func(w http.ResponseWriter, r *http.Request) bool
 }
 
 func newFakeGuardForge(t *testing.T) *fakeGuardForge {
@@ -76,6 +81,7 @@ func newFakeGuardForge(t *testing.T) *fakeGuardForge {
 		path := r.URL.Path
 		fg.mu.Lock()
 		labelsRefused := fg.labelsRefused
+		issuesHook := fg.issuesHook
 		fg.mu.Unlock()
 		switch {
 		case labelsRefused && strings.HasSuffix(path, "/labels"):
@@ -91,6 +97,8 @@ func newFakeGuardForge(t *testing.T) *fakeGuardForge {
 			// create calls (answered by the catch-all below) succeed.
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte("[]"))
+			return
+		case strings.HasSuffix(path, "/issues") && r.Method == http.MethodGet && issuesHook != nil && issuesHook(w, r):
 			return
 		case strings.HasSuffix(path, "/issues") && r.Method == http.MethodGet:
 			// One open uzi issue, so an import after the enable has a card to
@@ -192,7 +200,8 @@ func newEnableGuardFixture(ctx context.Context, t *testing.T) enableGuardFixture
 		connID: uuid.New(),
 		forge:  fg,
 	}
-	f.h = &Handler{pool: pool, q: q, box: box, cfg: config.Config{}, svc: svc, pcheck: pcheck}
+	f.h = &Handler{pool: pool, q: q, box: box, cfg: config.Config{}, svc: svc, pcheck: pcheck,
+		wsvc: workersvc.New(q, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})}
 
 	sealed, err := box.Seal([]byte("glpat-dummy-token"))
 	if err != nil {
@@ -223,8 +232,15 @@ func (f enableGuardFixture) seedRepo(ctx context.Context, t *testing.T, projectI
 
 func (f enableGuardFixture) setEnabled(t *testing.T, repoID uuid.UUID, enabled bool) *httptest.ResponseRecorder {
 	t.Helper()
+	return f.setEnabledCtx(context.Background(), t, repoID, enabled)
+}
+
+// setEnabledCtx is setEnabled with the request's context supplied by the caller (a
+// deadline, a cancel), the way a gateway timeout or a client disconnect reaches it.
+func (f enableGuardFixture) setEnabledCtx(ctx context.Context, t *testing.T, repoID uuid.UUID, enabled bool) *httptest.ResponseRecorder {
+	t.Helper()
 	body, _ := json.Marshal(map[string]bool{"enabled": enabled})
-	r := httptest.NewRequest(http.MethodPut, "/repos/x/enabled", bytes.NewReader(body))
+	r := httptest.NewRequestWithContext(ctx, http.MethodPut, "/repos/x/enabled", bytes.NewReader(body))
 	rctx := chi.NewRouteContext()
 	rctx.URLParams.Add("id", repoID.String())
 	r = r.WithContext(context.WithValue(mw.ContextWithUser(r.Context(), f.owner), chi.RouteCtxKey, rctx))
@@ -307,25 +323,33 @@ func TestSetRepoEnableGuardAllowsCleanLiveDB(t *testing.T) {
 	}
 }
 
-// Enabling a repo creates its columns, so the first board open no longer runs
-// the seed that imported issues. The enable itself imports them, best effort,
-// so a newly enabled repo shows its cards without waiting for the poller
-// (PR #3956 review, item 6).
+// Enabling a repo creates its columns, so the first board open no longer runs the
+// seed that imported issues. The enable records a waiting first import and returns;
+// the poller runs it (issue #4399), so the request never imports issues itself.
 func TestSetRepoEnableImportsIssuesLiveDB(t *testing.T) {
 	ctx := context.Background()
 	f := newEnableGuardFixture(ctx, t)
 	repoID := f.seedRepo(ctx, t, 108, false, protClean)
+	engine := f.newPoller(100 * time.Millisecond)
 
 	w := f.setEnabled(t, repoID, true)
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (body %s)", w.Code, w.Body.String())
 	}
-	var n int
-	if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM issues WHERE repo_id = $1`, repoID).Scan(&n); err != nil {
-		t.Fatalf("count issues: %v", err)
+	// Nothing imported on the request: the import is recorded and waiting.
+	if row := f.importRow(ctx, t, repoID); row.state != "waiting" || row.gen != 1 {
+		t.Errorf("import row after the enable = %+v, want waiting at generation 1", row)
 	}
-	if n == 0 {
-		t.Errorf("no issues cached after the enable; the first board open would show an empty board")
+	if got := f.cachedIIDs(ctx, t, repoID); len(got) != 0 {
+		t.Errorf("issues cached on the enable request = %v, want none (the poller imports)", got)
+	}
+
+	// With the poller running (the requester was wired before the enable), the
+	// issues land and the import settles.
+	f.runPoller(t, engine)
+	f.waitImport(ctx, t, repoID, "succeeded")
+	if got := f.cachedIIDs(ctx, t, repoID); fmt.Sprint(got) != "[5]" {
+		t.Errorf("cached issues after the poller import = %v, want [5]", got)
 	}
 }
 

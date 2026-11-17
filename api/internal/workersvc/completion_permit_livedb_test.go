@@ -345,7 +345,7 @@ func TestCompletionRevisionBumpUnderLockStaysNonTerminalLiveDB(t *testing.T) {
 
 	rows, idempotent, _, err := svc.completeRunWithPermitLease(e.ctx, wkr, owned,
 		StateRequest{Head: strPtr(head)},
-		store.SetRunCompletedParams{ID: runID, WorkerID: owned.WorkerID})
+		store.SetRunCompletedParams{ID: runID, WorkerID: owned.WorkerID}, 0)
 	if err != nil {
 		t.Fatalf("completeRunWithPermitLease: %v", err)
 	}

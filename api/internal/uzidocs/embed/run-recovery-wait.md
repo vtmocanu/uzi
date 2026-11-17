@@ -1283,8 +1283,14 @@ A Claude run on an Anthropic API key can reach the **spend limit** its
 Anthropic organization or workspace sets. uzi does not fail that run. It parks
 it in `recovery_wait` with cause `anthropic_spend_limit`, keeps the worker's
 work and custody, and waits for you. This is not the usage window behind
-[`limit_wait`](run-limit-wait.md), and credit depletion (an exhausted prepaid
-or promotional balance) is **not** covered by this hold.
+[`limit_wait`](run-limit-wait.md).
+
+The same hold also covers an **exhausted prepaid credit balance** on the API
+key (issue #4426). The run feed's hold line then names the provider sentence
+`Credit balance is too low` in parentheses. The remedy is to top up the
+organization's credit, then Resume, or to Switch token. The hold's badge and
+guidance still say "spend limit"; read "raise the limit" as "add credit" for
+this case.
 
 ### What you'll see
 
@@ -1320,11 +1326,14 @@ it. Nothing switches credentials for you. The only exits are yours:
 
   Resume uses this run's current credential selection. If it still selects the capped token, raise the limit first. To choose another token now, use Switch token or `uzi run set-token`.
 
-  That last sentence applies only to the kinds that accept a credential
-  switch: not `chat`, `judge`, `self_improve` or `job` runs. In auto mode,
-  Resume re-ranks the pool and may pick the capped token again, or another
-  pooled token; excluding the capped token is follow-up
+  The "To choose another token now" sentence applies only to the kinds that
+  accept a credential switch: not `chat`, `judge`, `self_improve` or `job`
+  runs. In auto mode, Resume re-ranks the pool and may pick the capped token
+  again, or another pooled token; excluding the capped token is follow-up
   [#4163](https://github.com/vtmocanu/uzi/issues/4163).
+
+  For an exhausted credit balance, on every run kind, "raise the limit" means
+  top up the organization's prepaid credit before Resume.
 - **Switch token** (web **Switch token** / **Run with another token**, or
   `uzi token list` then `uzi run set-token <id> <label>`) points the run at a
   different token.
@@ -1332,17 +1341,21 @@ it. Nothing switches credentials for you. The only exits are yours:
 
 ### What triggers it
 
-A narrow, documented text match. Anthropic exposes no structured signal for a
-spend limit (checked against Claude Agent SDK 0.3.316), so uzi matches the
-provider text of the lead's terminal result. The hold applies only when that
+A narrow, documented text match. The lead's terminal result frame carries no
+structured signal for a spend limit (checked against Claude Agent SDK 0.3.316)
+or for credit depletion (checked against 0.3.319), so uzi matches the provider
+text of that result. The hold applies only when that
 result is a failure with terminal reason `api_error` and HTTP status 400, and
 the provider message, after removing one leading `API Error: 400 ` or
 `API Error: ` wrapper, **starts with** one of:
 
 - `You have reached your specified API usage limits.` (organization limit)
 - `You have reached your specified workspace API usage limits.` (workspace limit)
+- `Credit balance is too low` (exhausted prepaid credit balance)
 
-See Anthropic's [errors page](https://platform.claude.com/docs/en/api/errors).
+See Anthropic's [errors page](https://platform.claude.com/docs/en/api/errors)
+for the two spend-limit sentences. The credit sentence is the Claude CLI's own
+text for Anthropic's credit-balance error, which it reports without a wrapper.
 The sentence anywhere other than the start, any other 400, a 429 or 402, other
 terminal reasons, successful turns and subagent errors keep their existing
 handling. A spend-limit terminal wins over earlier rate-limit evidence in the

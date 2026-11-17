@@ -42,6 +42,7 @@ apipost() {
     *) fail "unexpected POST $1" ;;
   esac
 }
+wait_initial_import() { printf 'import %s\n' "$1" >> "$S/calls"; }
 create_run() { printf 'run /api/repos/%s\n' "$1" >> "$S/calls"; echo 00000000-0000-0000-0000-000000000099; }
 wait_outbox_feature() { :; }
 wait_custody_headroom() { :; }
@@ -85,6 +86,9 @@ restore_fixture_repo_states
 [ "${#RESTORE_FIXTURE_REPOS[@]}" = 0 ] || fail 'confirmed restoration must release fixture bookkeeping'
 jq -e 'all(.repos[]; .enabled==false)' "$S/projects" >/dev/null
 [ "$REPO_ID" = base-repo ] || fail 'base repo was overwritten'
+# The enable returns before the first issue import (#4399): every fixture must wait for it, since the
+# phase creates an issue next and an in-flight import would evict it.
+for i in 0 1 2 3; do grep -qxF "import fixture-$i" "$S/calls" || fail "fixture-$i was not waited on for its first import"; done
 echo 'PASS: four distinct fixture selections restore disabled state without modifying REPO_ID'
 
 reset

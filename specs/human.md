@@ -69,6 +69,7 @@ Tracked as GitLab issue vtmocanu/uzi#2; PRD at `prds/done/2-forge-integration-ka
 - Board/agents work only issues carrying the `PRD` label, sanity-checked to contain a link to the PRD file. [superseded — see Feature #22: run-eligibility is now the single `uzi` label and the PRD link is optional (PRD #764) (AI-synced 2026-08-29)]
 - GitLab `GetMergeRequest` and `GetMergeRequestSummary` bound the response body before decoding: 32 MiB for a 200, 201, 202 or 204 and 4 KiB for any other status, counted as transfer-decoded wire bytes (compressed responses are refused). An oversized response is refused with a fixed error and is unverified evidence, never a partial or merged answer (#3038, #3226). (AI-synced 2026-10-21)
 - Base-URL allowlist entries (forge, agent source, product skills, issue tracker) must be a bare `https://host[:port]`; an entry with userinfo, a path, a query or a fragment refuses boot instead of being reduced to its host, and the Helm chart fails the render for the forge and issue-tracker values. (AI-synced 2026-11-12, #4194)
+- Enabling a repo returns once the enable is committed; the first issue import runs on the poller and the board reports its status (waiting, importing, or failed and retrying on the next poll). (AI-synced 2026-11-16, #4399)
 
 ## Feature #3 — Agent templates & per-user Anthropic token
 
@@ -317,6 +318,18 @@ Tracked as GitLab issue vtmocanu/uzi#23; PRD at `prds/done/23-web-ux-live-dashbo
   - Hiding empty columns is the DEFAULT for a board the user has not configured; an explicit "show empty" choice still wins. [AI-synced 2026-09-08 (#1208)]
 - Web-only; no API/schema/agent changes.
 - "Board columns should auto refresh" — already satisfied by existing polling; no change shipped.
+- Tab rows share one component and never show a vertical scrollbar. (AI-synced 2026-11-17, #4419)
+  - The active underline sits on the row's line.
+  - Rows that scroll sideways keep doing so; the page body never scrolls horizontally (#204).
+- Tab rows pin while the window scrolls on Settings, Admin, Runs, Schedules, Workers, Judge and Findings: at the top on lg+, directly under the mobile app bar below lg. The app bar's measured height is the one offset, which the Board toolbar also uses.
+  - The pinned block uses the page background and shows a bottom edge only while stuck, with no layout jump.
+  - Focus, Tab and anchor jumps never land under it.
+  - Keyboard focus inside it never scrolls the page.
+- Admin → Instance pins its section pills with the tabs as one block.
+  - The pills are one sideways-scrolling row with a fade on the overflowing edge.
+  - The pill for the section being read is highlighted with `aria-current="true"` and kept in view, tracked by IntersectionObserver with no scroll listener.
+- Judge pins its category chips with the bucket tabs on lg+, as one sideways-scrolling row with Clear outside the scrolling part, so an active filter is always clearable.
+  - Below lg the chips stay in the page flow, and the pinned block carries a one-line "Filtered: <labels>" marker with its own clear while a filter is active.
 
 ## Feature — Runs page IA (live console + past-runs archive)
 
@@ -619,8 +632,9 @@ Tracked as GitLab issue vtmocanu/uzi#58 (closed); PRD at `prds/done/58-hosted-k8
   - `l` RAM raised again to request **14Gi** / limit **20Gi** (#2127): a persistent `l` worker running two concurrent runs was OOMKilled twice at 12Gi while both runs were in whole-program Go analyzer gates; owner-selected sizing, not a measured capacity guarantee; reduced node placement capacity accepted. `m` likewise raised to request **8Gi** / limit **12Gi** (a single run's `deadcode` hit 7.3-7.5 GiB at the old 8Gi limit and was OOMKilled twice). [user, #2127] (AI-synced 2026-10-07)
   - Hosted worker pods now carry a default `priorityClassName` (a modest cluster-scoped PriorityClass, value 1000, `globalDefault: false`), so under node memory pressure other lower-priority pods are evicted before ours. `preemptionPolicy: PreemptLowerPriority` (owner's choice): a worker that cannot be scheduled for lack of room also preempts lower-priority pods to get placed. Operators can set `Never` to drop that scheduling-time preemption. [user, #1341]
 - Persistent hosted `l` workers request 50Gi of data on both worker tiers; `m` remains 25Gi and run-bound data uses an independent 40Gi default across both worker tiers and the isolated lane. Default PVC ceilings and storage quotas admit the full configured fleet. Existing data PVCs retain their capacity and may be expanded by an operator without recreation when storage supports it. [user, #2013] (AI-synced 2026-10-14) Superseded in part: the controller now converges existing data (and DinD) claims upward to the render size where the claim's StorageClass allows expansion, never shrinking or recreating them; operators may still expand manually. [user 2026-11-04, #3890] (AI-synced 2026-11-04, #3890)
-- New ephemeral hosted workers default to `m`, configurable through chart `workers.ephemeralDefaultSize` (`s`, `m`, `l`, `l-highmem`, invalid values refuse rendering); non-chart API defaults and invalid-value fallback use `m`. The persistent picker stays at `l`; existing workers keep their stored sizes. `m` matches the pre-#2127 `l`: 1/4 CPU, 8Gi/12Gi memory, 25Gi persistent data. Ephemeral data now defaults to 40Gi (#2013); existing persistent `m` PVCs retain capacity until operator expansion or reprovisioning. [user, #2412, #2013] (AI-synced 2026-10-14) (AI-synced 2026-10-24, #3383 `l-highmem`) Superseded in part: the controller now converges existing data claims upward where the claim's StorageClass allows expansion. (AI-synced 2026-11-04, #3890)
+- New ephemeral hosted workers default to `m`, configurable through chart `workers.ephemeralDefaultSize` (`s`, `m`, `l`, `l-highmem`, invalid values refuse rendering); non-chart API defaults and invalid-value fallback use `m`. The persistent picker stays at `l`; existing workers keep their stored sizes. `m` matches the pre-#2127 `l`: 1/4 CPU, 8Gi/12Gi memory, 25Gi persistent data. Ephemeral data now defaults to 40Gi (#2013); existing persistent `m` PVCs retain capacity until operator expansion or reprovisioning. [user, #2412, #2013] (AI-synced 2026-10-14) (AI-synced 2026-10-24, #3383 `l-highmem`) Superseded in part: the controller now converges existing data claims upward where the claim's StorageClass allows expansion. (AI-synced 2026-11-04, #3890) Superseded in part [user, #4212]: ephemeral default size, per-user cap and lease are admin settings on Admin → Workers (`ephemeral_default_size`, `ephemeral_max_per_user`, `ephemeral_lease`); a non-empty env or chart value wins and locks the field, and the chart values are now unset by default. The persistent picker preselects the admin `hosted_default_size` (shipped default `l`). (AI-synced 2026-11-17, #4212)
   - `l-highmem` (#3383) is 1/4 CPU, 24Gi/32Gi memory, 50Gi data, with LimitRange memory max 32Gi on all worker tiers and quotas unchanged. (AI-synced 2026-10-24)
+- **Admin → Workers** (`/admin/workers`) holds the instance worker capacity controls: hosted worker quota and default size, ephemeral workers switch, cap, default size and lease, custody hold limit, worker hibernation, Docker worker repo allowlist and capability-aware scheduling. Changes apply without an api restart; lowering the ephemeral cap evicts no worker. [user, #4212] (AI-synced 2026-11-17, #4212)
 - Three sizes stay, and the picker displays what each size buys. [user 2026-07-17]
   - #3383 adds a fourth curated preset, `l-highmem`; sizes stay a fixed curated list (no arbitrary resource overrides). [user, #3383] (AI-synced 2026-10-24)
 - Deleting a hosted worker requires a confirmation (it destroys the worker's volumes); deleting an external worker stays one click. [user 2026-07-16]
@@ -1612,7 +1626,11 @@ Tracked as GitHub issue vtmocanu/uzi#1809; PRD at `prds/1809-worker-disk-safety.
 
 ## Issue #3767 — Anthropic API spend-limit owner hold
 
-- An Anthropic API spend limit (organization or workspace) holds the run in `recovery_wait` (`anthropic_spend_limit`) for the owner, with no automatic retry or credential switch; it is detected by a narrow anchored text match because Anthropic exposes no structured signal, Resume re-uses the run's own credential selection, and credit depletion is out of scope. See [run-recovery-wait](../docs/run-recovery-wait.md#anthropic-api-spend-limit). (AI-synced 2026-11-11)
+- An Anthropic API spend limit (organization or workspace) holds the run in `recovery_wait` (`anthropic_spend_limit`) for the owner, with no automatic retry or credential switch; it is detected by a narrow anchored text match because Anthropic exposes no structured signal, Resume re-uses the run's own credential selection, and credit depletion was out of scope here (superseded by #4426 below). See [run-recovery-wait](../docs/run-recovery-wait.md#anthropic-api-spend-limit). (AI-synced 2026-11-11; amended 2026-11-17)
+
+## Issue #4426 — Anthropic API credit depletion takes the spend-limit hold
+
+- An Anthropic API key whose prepaid credit balance ran out holds the run exactly like a spend limit: `recovery_wait` with cause `anthropic_spend_limit`, owner-held, no timer, Resume, Switch token or Cancel. It is matched by the same anchored classifier on the Claude CLI's `Credit balance is too low` sentence (SDK 0.3.319), with no new recovery cause, migration or protocol feature; an api or worker that cannot park still fails with the unchanged `provider error: 400 …` message. Credential pool selection on Resume stays out of scope. (AI-synced 2026-11-17)
 
 ## Bug #1864 — Codex delegation still open when the lead's turn ends
 
