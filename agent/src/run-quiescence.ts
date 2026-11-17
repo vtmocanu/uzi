@@ -807,7 +807,8 @@ export function maintenanceBootstrapRoots(): readonly MaintenanceBootstrapRoot[]
  * then (when Docker is wired) the read-only running-container probe, both inside ONE accounting
  * scope. One pass inside uncharged discovery (C2 pre-check), three inside the charged slot.
  * Without a recorded bootstrap set it refuses. */
-export function terminalMaintenanceProof(scans: 1 | 3, dockerHost: string | undefined): Promise<boolean> {
+export function terminalMaintenanceProof(scans: 1 | 3, dockerHost: string | undefined,
+  bound?: { signal: AbortSignal; deadline: number }): Promise<boolean> {
   const bootstrap = maintenanceBootstrapRoots();
   if (bootstrap === undefined) return Promise.resolve(false);
   const req: ScanRequest = {
@@ -815,8 +816,21 @@ export function terminalMaintenanceProof(scans: 1 | 3, dockerHost: string | unde
     liveRoots: [], workerNonce: "", exclusiveIdle: true, exclusiveIdleScans: scans,
     exclusiveIdleRoots: [], exclusiveIdleBootstrap: [...bootstrap],
   };
-  const proof = async () => (await reapRunProcesses(req, { viaHelper: false })).state === "quiescent" &&
-    (dockerHost === undefined || await dockerRunningContainers(dockerHost, MaintenanceResources.signalIfActive()) === "none");
+  // A caller outside a maintenance scope (the startup retire phase) passes its own bound: the process scan reads through the
+  // capped, signal- and deadline-aware table and is admitted only before `deadline` (`deadlineAt`, which also caps the
+  // inter-scan sleep), and the Docker probe is cancelled by the same signal with no more time than is left.
+  // `reportDeadline` is not used: it would switch the scan to the report-observation loop, which is not this proof.
+  const reap = (): Promise<ProcessQuiescence> => reapRunProcesses(req, bound === undefined ? { viaHelper: false } : {
+    viaHelper: false, deadlineAt: bound.deadline, table: procfsTableAt(PROC_ROOT, { signal: bound.signal, deadline: bound.deadline }),
+  });
+  const docker = async (): Promise<boolean> => {
+    if (dockerHost === undefined) return true;
+    const resource = MaintenanceResources.signalIfActive();
+    if (bound === undefined) return await dockerRunningContainers(dockerHost, resource) === "none";
+    const signal = AbortSignal.any(resource ? [bound.signal, resource] : [bound.signal]);
+    return await dockerRunningContainers(dockerHost, signal, Math.min(5_000, bound.deadline - Date.now())) === "none";
+  };
+  const proof = async () => (await reap()).state === "quiescent" && await docker();
   return scans === 1 ? MaintenanceResources.runDiscovery(proof) : proof();
 }
 
@@ -1550,9 +1564,10 @@ export async function reapProcesses(req: ScanRequest, deps: ReapDeps = {}): Prom
       if (last.kill.length > 0) return { state: "unverified", processes: [], killed, detail: "exclusive idle scan proposed a signal" };
       // A transient worker helper may clear within the fixed count; nothing is ever signalled.
       if ((last.survivors.length === 0 && last.unverified.length === 0) || ++scans >= exclusiveScans ||
-          (reportBudget ? Date.now() >= reportBudget.deadline : remaining ? remaining() <= 0 : false)) break;
+          (reportBudget ? Date.now() >= reportBudget.deadline : remaining ? remaining() <= 0 : false) ||
+          (gateDeadline !== undefined && now() >= gateDeadline)) break;
       if (ambient) await ambient.raceIO(() => sleep(Math.min(EXCLUSIVE_IDLE_INTERVAL_MS, remaining!())));
-      else await sleep(EXCLUSIVE_IDLE_INTERVAL_MS);
+      else await sleep(gateDeadline === undefined ? EXCLUSIVE_IDLE_INTERVAL_MS : Math.max(0, Math.min(EXCLUSIVE_IDLE_INTERVAL_MS, gateDeadline - now())));
       continue;
     }
     // The worker may have recorded a peer root since the last scan began. A refreshed list
@@ -2265,18 +2280,22 @@ function dockerRequest(
   signal?.throwIfAborted();
   if (MaintenanceResources.active()) return maintenanceDockerRequest(ep, method, urlPath, timeoutMs, maxBodyBytes, signal);
   return new Promise((resolve, reject) => {
-    let settled = false;
+    // The promise settles only after the request's `close` (and the response's, once one arrived) on every path, so a caller
+    // that reports the step finished never leaves a closing socket behind. The first outcome recorded wins.
     let res: http.IncomingMessage | undefined;
-    const finish = (err: Error | undefined, value?: { status: number; body: string }): void => {
-      if (settled) return;
+    let outcome: { err: Error } | { value: { status: number; body: string } } | undefined;
+    let requestClosed = false, responseClosed = false, settled = false;
+    const finish = (): void => {
+      if (settled || !outcome || !requestClosed || (res && !responseClosed)) return;
       settled = true;
       clearTimeout(absolute);
       signal?.removeEventListener("abort", cancel);
-      if (err) reject(err);
-      else resolve(value!);
+      if ("err" in outcome) reject(outcome.err);
+      else resolve(outcome.value);
     };
+    const record = (next: NonNullable<typeof outcome>): void => { outcome ??= next; };
     const abort = (err: Error): void => {
-      finish(err);
+      record({ err });
       res?.destroy();
       req.destroy();
     };
@@ -2284,8 +2303,9 @@ function dockerRequest(
       res = r;
       const chunks: Buffer[] = [];
       let bytes = 0;
+      r.on("close", () => { responseClosed = true; if (!outcome) record({ err: new Error(`docker ${method} ${urlPath} response closed early`) }); finish(); });
       r.on("data", (c: Buffer) => {
-        if (settled) return;
+        if (outcome) return;
         bytes += c.length;
         if (bytes > maxBodyBytes) {
           abort(new Error(`docker ${method} response body exceeded ${maxBodyBytes} bytes`));
@@ -2293,9 +2313,9 @@ function dockerRequest(
         }
         chunks.push(c);
       });
-      r.on("end", () => finish(undefined, { status: r.statusCode ?? 0, body: Buffer.concat(chunks).toString("utf8") }));
-      r.on("error", (err) => finish(err));
-      r.on("aborted", () => finish(new Error(`docker ${method} ${urlPath} response aborted`)));
+      r.on("end", () => { record({ value: { status: r.statusCode ?? 0, body: Buffer.concat(chunks).toString("utf8") } }); finish(); });
+      r.on("error", (err) => { record({ err }); finish(); });
+      r.on("aborted", () => { record({ err: new Error(`docker ${method} ${urlPath} response aborted`) }); finish(); });
     });
     const cancel = () => abort(new Error("maintenance docker cancelled"));
     const absolute = setTimeout(
@@ -2303,8 +2323,9 @@ function dockerRequest(
       Math.max(0, timeoutMs),
     );
     absolute.unref();
+    req.on("close", () => { requestClosed = true; if (!outcome) record({ err: new Error(`docker ${method} ${urlPath} closed without a response`) }); finish(); });
     req.on("timeout", () => abort(new Error(`docker ${method} ${urlPath} timed out`)));
-    req.on("error", (err) => finish(err));
+    req.on("error", (err) => { record({ err }); finish(); });
     signal?.addEventListener("abort", cancel, { once: true });
     if (signal?.aborted) cancel();
     else req.end();
@@ -2313,11 +2334,12 @@ function dockerRequest(
 
 /** Read-only running-container probe for the exclusive-idle proof: one GET of the
  * running list (never all=1, never a removal). Only an exact 200 empty array is "none". */
-export async function dockerRunningContainers(dockerHost: string, signal?: AbortSignal): Promise<"none" | "running" | "unknown"> {
+export async function dockerRunningContainers(dockerHost: string, signal?: AbortSignal, timeoutMs = 5_000): Promise<"none" | "running" | "unknown"> {
   const ep = parseDockerHost(dockerHost);
-  if (!ep) return "unknown";
+  // No time left means no request: an unproven probe is "unknown", never "none".
+  if (!ep || !(timeoutMs > 0)) return "unknown";
   try {
-    const list = await dockerRequest(ep, "GET", "/containers/json", 5_000, 1024 * 1024, signal);
+    const list = await dockerRequest(ep, "GET", "/containers/json", timeoutMs, 1024 * 1024, signal);
     if (list.status !== 200) return "unknown";
     const parsed: unknown = JSON.parse(list.body);
     if (!Array.isArray(parsed)) return "unknown";

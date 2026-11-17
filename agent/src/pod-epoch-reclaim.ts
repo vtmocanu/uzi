@@ -585,8 +585,12 @@ export interface PodEpochRetireDeps {
   authority: Pick<AuthorityRuntime, "withTransaction" | "active" | "peekSlot" | "heldByOtherSink">;
   /** Bound to RunRunner.withSourceReservation; resolves undefined when the reservation is refused. */
   reserve<T>(runId: string, action: (eligible: () => boolean) => Promise<T>): Promise<T | undefined>;
-  /** Worker-wide exclusive-idle proof (bound to terminalMaintenanceProof). */
-  quiesce: () => Promise<boolean>;
+  /**
+   * Worker-wide exclusive-idle proof (bound to terminalMaintenanceProof). The phase passes the step's bound: `signal` fires and
+   * `deadline` (Date.now() ms) falls `RETIRE_SETTLE_RESERVE_MS` before the phase window ends, and the proof must be joined
+   * (nothing left pending) by then. A proof that was cut off answers false.
+   */
+  quiesce: (bound?: RetireStepBound) => Promise<boolean>;
   /** Absolute `<dataDir>/runner`: the root the retire scratch parents live under. */
   runnerRoot: string;
   /** The `UZI_RETIRE_SCRATCH_RECLAIM` switch parsed by main.ts. It permits the phase and proves nothing. */
@@ -595,6 +599,9 @@ export interface PodEpochRetireDeps {
   retireTestGate?: symbol;
   seams?: PodEpochRetireTestSeams;
 }
+
+/** The cancellation and Date.now() deadline of one pre-effect step of the retire phase. */
+export interface RetireStepBound { signal: AbortSignal; deadline: number }
 
 interface RetireVerdict {
   state: "not_run" | "refused" | "ran" | "stopped";
@@ -627,6 +634,8 @@ const emptyRetire = (): RetireVerdict => ({
 const RETIRE_PHASE_MIN_MS = 30_000;
 const RETIRE_PHASE_MAX_MS = 120_000;
 const RETIRE_CANDIDATE_MIN_MS = 20_000;
+/** Every pre-effect step ends this long before the phase window does, so its cancellation is joined inside the window. */
+const RETIRE_SETTLE_RESERVE_MS = 5_000;
 const RETIRE_HELPER_MAX_MS = 300_000;
 const RETIRE_MAX_CANDIDATES = 64;
 const RETIRE_LIST_CAP = 4096;
@@ -652,7 +661,8 @@ interface RetireContext {
   parents: RetireScratchParentOutcome[];
   openScope(): PodEpochReclaimScope;
   assertSettled(): void;
-  readAuthority(runId: string): Promise<{ lifecycle: RetainedLifecycleSnapshot; holds: RetainedHoldsSnapshot } | undefined>;
+  /** With `deadline` (Date.now() ms) both reads are cancelled there and joined; no request starts once it has passed. */
+  readAuthority(runId: string, deadline?: number): Promise<{ lifecycle: RetainedLifecycleSnapshot; holds: RetainedHoldsSnapshot } | undefined>;
   /** True once the pass is fatal or aborted. */
   interrupted(): boolean;
   /** True once the pass was invalidated (a daemon veto or an entry change). */
@@ -794,10 +804,22 @@ async function retireBody(ctx: RetireContext, pin: ScratchRootPin, root: string,
   if (bound === undefined) return refuse("bind_unknown");
   if ("refused" in bound) return refuse(bound.refused);
 
-  try { if (!(await ctx.owned(() => deps.quiesce(), ctx.hardPass))) return refuse("not_idle"); }
+  // Pre-effect steps run inside the phase window less the settlement reserve: a step that cannot start there is deferred
+  // untouched, and one that ends at its deadline was cancelled and joined by then. The reason a cut-off step reports is the
+  // budget, never a verdict about the daemon or the run.
+  const stepBound = (): RetireStepBound | undefined => {
+    if (phaseEnd - ctx.now() < RETIRE_SETTLE_RESERVE_MS + 1000) return undefined;
+    const deadline = phaseDeadline() - RETIRE_SETTLE_RESERVE_MS;
+    return { signal: AbortSignal.any([controller.signal, AbortSignal.timeout(Math.max(1, deadline - Date.now()))]), deadline };
+  };
+  const cutOff = (bound: RetireStepBound): boolean =>
+    (bound.signal.aborted && !controller.signal.aborted) || Date.now() >= bound.deadline || phaseEnd - ctx.now() <= RETIRE_SETTLE_RESERVE_MS;
+  const first = stepBound();
+  if (first === undefined) return refuse("budget_deferred");
+  try { if (!(await ctx.owned(() => deps.quiesce(first), ctx.hardPass))) return refuse(cutOff(first) ? "budget_deferred" : "not_idle"); }
   catch (error) {
     if (error instanceof PodEpochSettlementError || ctx.interrupted()) throw error;
-    return refuse("not_idle");
+    return refuse(cutOff(first) ? "budget_deferred" : "not_idle");
   }
 
   // ---- the candidate read: every bare under its own lock in one all-or-nothing pass, then the pass-wide paths ----
@@ -905,8 +927,10 @@ async function retireBody(ctx: RetireContext, pin: ScratchRootPin, root: string,
     try {
       step = await ctx.owned(() => deps.authority.withTransaction(tx => deps.reserve(runId, async (eligible): Promise<RetireStep> => {
         if (!eligible() || controller.signal.aborted || !ctx.eligibleNow()) return { kind: "keep", reason: "epoch_not_eligible" };
-        const authority = await ctx.readAuthority(runId);
-        if (!authority) return { kind: "keep", reason: "custody" };
+        const readBound = stepBound();
+        if (readBound === undefined) return { kind: "keep", reason: "budget_deferred", halt: "budget_deferred" };
+        const authority = await ctx.readAuthority(runId, readBound.deadline);
+        if (!authority) return cutOff(readBound) ? { kind: "keep", reason: "budget_deferred", halt: "budget_deferred" } : { kind: "keep", reason: "custody" };
         ctx.check(); ctx.entry();
         const live = (): void => {
           if (!eligible() || deps.authority.active() !== tx) throw new Error("reservation or transaction lost");
@@ -956,9 +980,11 @@ async function retireBody(ctx: RetireContext, pin: ScratchRootPin, root: string,
             ctx.veto();
             throw error instanceof PodEpochDaemonError ? error : new PodEpochDaemonError("daemon_changed");
           }
+          const idleBound = stepBound();
+          if (idleBound === undefined) return { kind: "keep", reason: "budget_deferred", halt: "budget_deferred" };
           let idle = false;
-          try { idle = await deps.quiesce(); } catch { idle = false; }
-          if (!idle) return { kind: "keep", reason: "epoch_not_eligible", halt: "not_idle" };
+          try { idle = await deps.quiesce(idleBound); } catch { idle = false; }
+          if (!idle) return cutOff(idleBound) ? { kind: "keep", reason: "budget_deferred", halt: "budget_deferred" } : { kind: "keep", reason: "epoch_not_eligible", halt: "not_idle" };
           const holding = scan([name]);
           if ("refused" in holding) return { kind: "keep", reason: "held", halt: holding.refused };
           if (holding.held.has(name)) return { kind: "keep", reason: "held" };
@@ -1377,13 +1403,18 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
     const shadowEligible = result.verdict === "eligible" && result.authority.result === "attested";
     // Fresh lifecycle then holds; undefined keeps the source. Never throws: a failed, aborted or non-definitive read is a
     // keep (bounded by the pass signal and deadline).
-    const readAuthority = async (runId: string) => {
+    // With a `deadline` (Date.now() ms; the retire phase's step bound) both reads are cancelled there, never started after it,
+    // and joined by runOwned before this returns.
+    const readAuthority = async (runId: string, deadline?: number) => {
       try {
+        if (deadline !== undefined && Date.now() >= deadline) return undefined;
+        const signal = deadline === undefined ? controller.signal
+          : AbortSignal.any([controller.signal, AbortSignal.timeout(Math.max(1, deadline - Date.now()))]);
         const row = await MaintenanceBudget.runOwned(controller.signal, () => options.client.getRunOwnership(runId, {
-          signal: controller.signal, deadline: hardPass - 5000 }));
+          signal, deadline: deadline ?? hardPass - 5000 }));
         if (!row || !(row.status === "completed" || row.status === "failed" || row.status === "cancelled")) return undefined;
         const response = await MaintenanceBudget.runOwned(controller.signal,
-          () => options.client.listRecoveryHolds(runId, controller.signal));
+          () => options.client.listRecoveryHolds(runId, signal));
         if (!deletionZeroHolds(response, runId)) return undefined;
         return { lifecycle: { state: "terminal", status: row.status } as RetainedLifecycleSnapshot,
           holds: { state: "read", holds: [] } as RetainedHoldsSnapshot };

@@ -8,6 +8,9 @@ import { PassThrough } from "node:stream";
 import { execFileSync, spawn, type ChildProcess, type StdioOptions } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
+import http from "node:http";
+import net from "node:net";
+import os from "node:os";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { readFile } from "node:fs/promises";
@@ -20,6 +23,8 @@ import {
 } from "../src/git.js";
 import { protectedLeaves } from "../src/pod-epoch-scratch.js";
 import { buildPodEpochRetireDeps } from "../src/main.js";
+import { WorkerClient } from "../src/client.js";
+import { dockerRunningContainers } from "../src/run-quiescence.js";
 import { formatAttemptId } from "../src/attempt-path.js";
 import { latchResidueQuarantine, resetResidueQuarantineForTests } from "../src/residue-quarantine.js";
 import { runnerCommand } from "../src/runner-uid.js";
@@ -80,7 +85,7 @@ class World {
   statfs: () => "ok" | "fs_unsupported" = () => "ok";
   binds: () => ReturnType<NonNullable<PodEpochDaemonGuard["bindSources"]>> = () => ({ state: "read", sources: [] });
   scan: (names: readonly string[]) => { held: Set<string> } | { refused: "not_idle" | "self_descriptor_unreadable" } = () => ({ held: new Set() });
-  quiesce: () => Promise<boolean> = async () => true;
+  quiesce: (bound?: { signal: AbortSignal; deadline: number }) => Promise<boolean> = async () => true;
   discoverComplete = true;
   activation: boolean | undefined = true;
   gate = true;
@@ -144,7 +149,7 @@ class World {
     const retire: NonNullable<Options["retire"]> = {
         git: this.splitGit(),
         runnerRoot: this.runnerRoot,
-        quiesce: () => this.quiesce(),
+        quiesce: bound => this.quiesce(bound),
         authority: {
           withTransaction: async <T,>(fn: (t: object) => Promise<T>): Promise<T> => {
             tx = {};
@@ -1420,5 +1425,183 @@ describe("restart after an interrupted retire, then the verified epoch phase", P
     const result = await w.run();
     assert.equal(result.retire_scratch.examined, 0);
     assert.equal(w.spawns.length, 0);
+  });
+});
+
+// Owner review item 2: the 120 s phase bound also holds for the initial and per-candidate quiescence proofs and the authority
+// read. Each step gets a deadline 5 s before the window ends and a signal that fires there; the step is JOINED (never raced),
+// and one that cannot finish inside the window leaves its candidate `budget_deferred` before any effect. The fake clock only
+// moves the window (ctx.now()); the deadlines are on the Date.now() domain, so the tests leave 6.5 s of window (1.5 s of real time).
+describe("the pre-effect steps are bounded by the phase window less the settlement reserve", PROC, () => {
+  const RESERVE = 5_000, LEFT = 6_500, STEP = { timeout: 30_000 };
+  type Bound = { signal: AbortSignal; deadline: number };
+  const probe = { gaveUp: false, inflight: 0 };
+  beforeEach(() => { probe.gaveUp = false; probe.inflight = 0; });
+
+  /** Rejects when the signal fires; gives up on its own after 8 s so a missing bound fails the test instead of hanging it. */
+  const hang = (signal: AbortSignal | undefined): Promise<never> => new Promise((_resolve, reject) => {
+    probe.inflight++;
+    const timer = setTimeout(() => { probe.gaveUp = true; probe.inflight--; reject(new Error("never cancelled")); }, 8_000);
+    const stop = (): void => { clearTimeout(timer); probe.inflight--; reject(signal?.reason ?? new Error("aborted")); };
+    if (signal?.aborted) stop(); else signal?.addEventListener("abort", stop, { once: true });
+  });
+  /** Leaves LEFT ms of the 120 s window; returns the real time of that moment. */
+  const spend = (): number => { w.clock += 120_000 - LEFT; return Date.now(); };
+  function settledClean(): void {
+    assert.equal(probe.gaveUp, false, "the step was never cancelled");
+    assert.equal(probe.inflight, 0, "no pending work");
+    assert.equal(w.pending, 0);
+    assert.equal(w.stopped, false);
+    assert.equal(w.handovers, 1);
+  }
+  function withinWindow(bound: Bound | undefined, calledAt: number, t0: number): void {
+    assert.ok(bound, "the step received a bound");
+    assert.ok(bound.deadline > calledAt, "the bound is in the future when the step starts");
+    assert.ok(bound.deadline - calledAt <= LEFT - RESERVE, `forwarded deadline ${bound.deadline - calledAt} ms ahead`);
+    const elapsed = Date.now() - t0;
+    assert.ok(elapsed <= LEFT, `phase elapsed ${elapsed}`);
+    assert.ok(elapsed < LEFT - RESERVE + 1_500, `the step settled ${elapsed} ms in, outside the reserve`);
+  }
+
+  it("a delayed initial quiescence proof is cancelled at the step deadline and the whole phase is deferred", STEP, async () => {
+    const s = w.seed();
+    let t0 = 0, calledAt = 0, seen: Bound | undefined;
+    w.fence = () => { t0 = spend(); return FUTURE_FENCE(); };
+    w.quiesce = async bound => {
+      seen = bound; calledAt = Date.now();
+      try { await hang(bound?.signal); } catch { return false; }
+      return true;
+    };
+    const result = await w.run();
+    withinWindow(seen, calledAt, t0);
+    assert.equal(result.retire_scratch.state, "refused");
+    assert.equal(result.retire_scratch.reason, "budget_deferred");
+    assert.deepEqual(w.reserveCalls, []);
+    assert.equal(w.spawns.length, 0);
+    untouched(s);
+    settledClean();
+  });
+
+  it("a proof that cannot start inside the window less the reserve is never started", STEP, async () => {
+    const s = w.seed();
+    let calls = 0;
+    w.fence = () => { w.clock += 120_000 - (RESERVE + 500); return FUTURE_FENCE(); };
+    w.quiesce = async () => { calls++; return true; };
+    const result = await w.run();
+    assert.equal(calls, 0);
+    assert.equal(result.retire_scratch.state, "refused");
+    assert.equal(result.retire_scratch.reason, "budget_deferred");
+    assert.deepEqual(w.reserveCalls, []);
+    untouched(s);
+    settledClean();
+  });
+
+  it("a delayed authority read is cancelled at the step deadline and the parent is deferred before any effect", STEP, async () => {
+    const s = w.seed();
+    let t0 = 0, calledAt = 0, seen: Bound | undefined;
+    w.beforeB = () => { t0 = spend(); };
+    (w.options.client as { getRunOwnership: unknown }).getRunOwnership = async (_id: string, o: Bound) => {
+      seen = o; calledAt = Date.now();
+      await hang(o.signal);
+    };
+    const result = await w.run();
+    withinWindow(seen, calledAt, t0);
+    assert.equal(result.retire_scratch.deferred, 1);
+    assert.equal(result.retire_scratch.kept, 0);
+    assert.deepEqual(result.retire_scratch.kept_by_reason, {});
+    assert.equal(result.retire_scratch.state, "stopped");
+    assert.equal(result.retire_scratch.reason, "budget_deferred");
+    assert.equal(kept(result, s.name)?.reason, "budget_deferred");
+    assert.equal(w.spawns.length, 0);
+    assert.equal(w.phaseOf(s.uuid), "settled");
+    untouched(s);
+    settledClean();
+  });
+
+  it("a delayed per-candidate quiescence proof is cancelled at the step deadline: deferred, no removing write, no helper", STEP, async () => {
+    const s = w.seed();
+    let t0 = 0, calledAt = 0, seen: Bound | undefined, calls = 0;
+    w.beforeB = () => { t0 = spend(); };
+    w.quiesce = async bound => {
+      if (++calls === 1) return true;
+      seen = bound; calledAt = Date.now();
+      try { await hang(bound?.signal); } catch { return false; }
+      return true;
+    };
+    const result = await w.run();
+    assert.equal(calls, 2);
+    withinWindow(seen, calledAt, t0);
+    assert.equal(result.retire_scratch.deferred, 1);
+    assert.equal(result.retire_scratch.kept, 0);
+    assert.deepEqual(result.retire_scratch.kept_by_reason, {});
+    assert.equal(result.retire_scratch.state, "stopped");
+    assert.equal(result.retire_scratch.reason, "budget_deferred", "a cancelled proof is a deferral, not not_idle");
+    assert.equal(kept(result, s.name)?.reason, "budget_deferred");
+    assert.equal(w.spawns.length, 0);
+    assert.equal(w.phaseOf(s.uuid), "settled", "removing is only written in beforeEffect");
+    untouched(s);
+    settledClean();
+  });
+
+  it("a real daemon socket that never answers, aborted at the step deadline, settles inside the reserve with the socket closed", STEP, async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "retire-docker-"));
+    const sock = path.join(dir, "d.sock");
+    let accepted = 0, closed = 0;
+    const sockets = new Set<net.Socket>();
+    const server = net.createServer(c => { accepted++; sockets.add(c); c.resume(); c.on("error", () => undefined); c.on("close", () => { closed++; }); });
+    await new Promise<void>(resolve => server.listen(sock, resolve));
+    try {
+      const window = 1_500;
+      const signal = AbortSignal.any([new AbortController().signal, AbortSignal.timeout(window)]);
+      const started = Date.now();
+      assert.equal(await dockerRunningContainers(`unix://${sock}`, signal, window), "unknown");
+      const elapsed = Date.now() - started;
+      assert.ok(elapsed < window + 250, `settled ${elapsed} ms against a ${window} ms step deadline`);
+      for (let i = 0; i < 50 && closed < 1; i++) await new Promise(r => setTimeout(r, 10));
+      assert.equal(accepted, 1);
+      assert.equal(closed, 1, "the socket was closed, not abandoned");
+      // Nothing left to spend: no request at all.
+      const idleStart = Date.now();
+      assert.equal(await dockerRunningContainers(`unix://${sock}`, new AbortController().signal, 0), "unknown");
+      assert.ok(Date.now() - idleStart < 500, "answered without waiting on the daemon");
+      await new Promise(r => setTimeout(r, 50));
+      assert.equal(accepted, 1, "a step with no time left sends no request");
+    } finally {
+      for (const c of sockets) c.destroy();
+      await new Promise<void>(resolve => server.close(() => resolve()));
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("a real API whose body stalls after the headers, cancelled at the step deadline, defers the parent inside the reserve", STEP, async () => {
+    const s = w.seed();
+    let accepted = 0, closed = 0;
+    const server = http.createServer((_req, res) => {
+      res.writeHead(200, { "content-type": "application/json", "content-length": "1000" });
+      res.write("{\"status\":\"compl");
+    });
+    server.on("connection", c => { accepted++; c.on("error", () => undefined); c.on("close", () => { closed++; }); });
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const client = new WorkerClient(`http://127.0.0.1:${(server.address() as { port: number }).port}`, "token", "0.1.0-test", nullLogger());
+      w.options.client = { listRecoveryHolds: client.listRecoveryHolds.bind(client), getRunOwnership: client.getRunOwnership.bind(client) } as never;
+      let t0 = 0;
+      w.beforeB = () => { t0 = spend(); };
+      const result = await w.run();
+      const elapsed = Date.now() - t0;
+      assert.ok(elapsed < LEFT - RESERVE + 1_500, `the read settled ${elapsed} ms in, outside the reserve`);
+      assert.equal(result.retire_scratch.deferred, 1);
+      assert.equal(result.retire_scratch.kept, 0);
+      assert.equal(kept(result, s.name)?.reason, "budget_deferred");
+      assert.equal(w.spawns.length, 0);
+      untouched(s);
+      for (let i = 0; i < 50 && closed < accepted; i++) await new Promise(r => setTimeout(r, 10));
+      assert.ok(accepted >= 1);
+      assert.equal(closed, accepted, "every connection was closed after the cancel");
+      settledClean();
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
   });
 });

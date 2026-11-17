@@ -163,7 +163,7 @@ export function buildPodEpochRetireDeps(parts: {
     activation: parts.activation === true,
     authority: parts.authority,
     reserve: (runId, action) => parts.runner.withSourceReservation(runId, action),
-    quiesce: () => terminalMaintenanceProof(3, parts.dockerHost),
+    quiesce: bound => terminalMaintenanceProof(3, parts.dockerHost, bound),
     git: parts.git,
     runnerRoot: path.join(parts.dataDir, "runner"),
   };
