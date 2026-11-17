@@ -378,7 +378,11 @@ record: neither the journal nor the ledger gained a field.
   `malformed_binding` and keeps the parent.
 - **Cap.** At most 64 binding keys per bare, counting every entry under the
   prefix whether valid or not. At the cap a new retire writes no binding: its
-  parent is unbound and kept, exactly today's behaviour, and the retire logs it.
+  parent is unbound and gets today's in-process removal attempt on both
+  postures. On a uid-split pod that worker removal usually fails on runner-owned
+  content and leaves the parent (and possibly partial residue) behind unbound, as
+  before this change. The retire logs `retire scratch binding cap reached` and
+  reports it `unbound`.
   A read that finds more than 64 is `unknown`, never a truncated list, and keeps
   everything. The cap also bounds the added records against the epoch metadata
   caps and the ACK reader's 1024-entry config cap.

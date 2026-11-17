@@ -703,7 +703,11 @@ durable binding in the bare config, `uzi-retire-scratch.<uuid>.binding`: the
 class, attempt id, run id, branch, clone path, inodes and a phase (`intent`,
 `settled`, `removing`). It is a separate record in the same config store, not a
 field of the recovery journal or the attempt ledger. At most 64 are kept per
-bare; past that a new parent is simply unbound and kept. Only two classes can
+bare; past that no binding is written and the parent gets today's in-process
+removal attempt on both postures. On a uid-split pod that worker removal usually
+fails on runner-owned content and leaves the parent (and possibly partial
+residue) behind unbound, as before this change; the retire logs `retire scratch
+binding cap reached` and reports it `unbound`. Only two classes can
 settle, and only on a uid-split pod: `owner_terminal` and `verified_successor`.
 Completion, covered-lift terminal (`owner_terminal_covered`), foreign-orphan
 (`other`) and attempt-less retires never become eligible. On a uid-split pod
