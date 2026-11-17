@@ -40,10 +40,11 @@ func TestWorkerCodexSwitchPreflightRouteLiveDB(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if tc.stoppedSupport {
-				// This fixture remains a Claude run: passing the stopped-support
-				// admission gate must still leave the Codex authority fence intact.
+				// Satisfy negotiation and registration so this Claude run is
+				// refused by the harness predicate, not another worker fence.
 				if _, err := e.pool.Exec(context.Background(), `UPDATE workers SET protocol_capabilities =
-array_append(protocol_capabilities, $2) WHERE id = $1`, e.worker, capability.CodexSwitchStoppedV1); err != nil {
+protocol_capabilities || $2::text[], credential_switch_apply_nonce = snapshot_register_nonce
+WHERE id = $1`, e.worker, []string{capability.CodexSwitchStoppedV1, capability.CodexCredentialSwitchV1}); err != nil {
 					t.Fatal(err)
 				}
 			}
