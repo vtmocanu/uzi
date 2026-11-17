@@ -310,7 +310,11 @@ workers are in no pool, so the rule never touches them.
 **Ready.** A worker counts as ready when it is online with a fresh heartbeat, awake,
 accepting new work (not cordoned, draining or in maintenance), has no assigned run, has
 no pending-outcome overflow, its cache cleanup has settled, and its memory authority is
-not lost. A worker that reported losing memory authority is not counted as ready.
+not lost. A worker that reported losing memory authority is not counted as ready. A
+worker advertising memory authority reporting (`worker_memory_pressure_v1` and
+`worker_memory_authority_claim_v1`) is counted as ready only after a recent `held`
+report from its current registration, within the worker heartbeat-staleness window.
+Until then, or after a loss, its memory authority is unknown and it is not counted.
 
 **Which worker stays.** The kept worker is the most recently used ready one in the
 pool. A locked owner vault, the owner's custody-hold limit and an instance intake
