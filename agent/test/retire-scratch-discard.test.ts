@@ -11,6 +11,7 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import type { PodEpochReclaimScope } from "../templates/pod-epoch-init.cjs";
 import { GitCache, type JoinedEpochChild, type RetireScratchDiscardInput } from "../src/git.js";
 import { PINNED_SUBTREE_SCRIPT, restoreTreeWritability } from "../src/rmtree.js";
@@ -131,6 +132,27 @@ describe("PINNED_SUBTREE_SCRIPT empty-fd mode", { skip: !fs.existsSync("/proc/se
     assert.ok(fs.readdirSync(flood).length > 0);
   });
 
+  it("exit precedence: an identity change outranks an other-device skip (3 over 9)", async () => {
+    const dir = await mktmp();
+    const home = path.join(dir, "home");
+    fs.mkdirSync(path.join(home, "a"), { recursive: true });
+    fs.writeFileSync(path.join(home, "a", "f"), "");
+    fs.mkdirSync(path.join(home, "other"));
+    const sync = path.join(dir, "sync");
+    fs.writeFileSync(`${sync}.otherdev`, "other");
+    // pause after `a` was emptied and before its rmdir, then swap the name for a different empty directory
+    const running = runHelper(emptyFdArgs(devIno(home), { sync, phase: "emptied" }), pin(home));
+    for (let i = 0; i < 500 && !exists(`${sync}.emptied`); i++) await sleep(20);
+    assert.ok(exists(`${sync}.emptied`), "the helper reached the emptied pause");
+    fs.renameSync(path.join(home, "a"), path.join(dir, "moved"));
+    fs.mkdirSync(path.join(home, "a"));
+    fs.writeFileSync(`${sync}.go`, "");
+    const run = await running;
+    assert.equal(run.code, 3);
+    assert.equal(run.stdout, "");
+    assert.ok(exists(path.join(home, "other")) && exists(path.join(home, "a")));
+  });
+
   it("the time budget exits 8", async () => {
     const flood = await mktmp();
     for (let i = 0; i < 4000; i++) fs.writeFileSync(path.join(flood, `f${i}`), "");
@@ -150,6 +172,13 @@ describe("PINNED_SUBTREE_SCRIPT empty-fd mode", { skip: !fs.existsSync("/proc/se
     assert.equal(run.stdout, "");
     assert.equal(fs.statSync(locked).mode & 0o7777, 0o500);
     assert.ok(exists(path.join(locked, "inside.txt")));
+  });
+
+  it("mutation pin: the only chmod in the helper script is the non-strict one, guarded by !strict on its own or the previous line", () => {
+    const lines = PINNED_SUBTREE_SCRIPT.split("\n").filter(line => !line.trim().startsWith("//"));
+    const sites = lines.flatMap((line, i) => (/chmod|chown/i.test(line) ? [i] : []));
+    assert.equal(sites.length, 1, "exactly one chmod/chown site in the whole script, strict walk included");
+    for (const i of sites) assert.ok(lines[i]!.includes("!strict") || lines[i - 1]?.includes("!strict"), `unguarded: ${lines[i]}`);
   });
 
   it("every malformed empty-fd shape exits 6 and touches nothing", async () => {
@@ -317,9 +346,12 @@ function realScope() {
   return { scope, pending: () => pending, stopped: () => stopped, exId: devIno(exFile) };
 }
 
-type FakeOutcome = "real" | "receipt-only" | "hang";
-/** Replaces the spawn: strips the setpriv wrapper and runs the helper as this uid, or fakes a result. */
-function installSpawn(git: GitCache, outcome: FakeOutcome, calls: Array<{ command: string; args: string[]; stdio: unknown }>) {
+/** `{ exit }` is a helper that exits with that status and no receipt. */
+type FakeOutcome = "real" | "receipt-only" | "hang" | { exit: number };
+/** Replaces the spawn: strips the setpriv wrapper and runs the helper as this uid, or fakes a result.
+ *  `onChild` runs just before a faked child reports its exit. */
+function installSpawn(git: GitCache, outcome: FakeOutcome, calls: Array<{ command: string; args: string[]; stdio: unknown }>,
+  onChild?: () => void) {
   const internal = git as unknown as Internal;
   const wrapLen = runnerCommand(process.execPath, [], true).args.length;
   internal.epochNativeTestDependencies = {
@@ -332,8 +364,15 @@ function installSpawn(git: GitCache, outcome: FakeOutcome, calls: Array<{ comman
       if (outcome === "receipt-only") {
         const expect = args[wrapLen + 7];
         setImmediate(() => {
+          onChild?.();
           child.stdout.end(`UZI-SCRATCH-EMPTIED ${expect}\n`); child.stderr.end("secret-looking stderr text");
           child.emit("exit", 0, null); child.emit("close", 0, null);
+        });
+      } else if (typeof outcome === "object") {
+        setImmediate(() => {
+          onChild?.();
+          child.stdout.end(""); child.stderr.end("");
+          child.emit("exit", outcome.exit, null); child.emit("close", outcome.exit, null);
         });
       }
       return child as unknown as ChildProcess;
@@ -344,7 +383,12 @@ function installSpawn(git: GitCache, outcome: FakeOutcome, calls: Array<{ comman
   };
 }
 
-async function retireFixture(o: { outcome?: FakeOutcome; populate?: (clone: string) => void } = {}) {
+/** The `mnt_id:` line of /proc/self/fdinfo/<fd>. */
+function mntIdOfFd(fd: number): string {
+  return /^mnt_id:\s+(\d+)$/m.exec(fs.readFileSync(`/proc/self/fdinfo/${fd}`, "utf8"))![1]!;
+}
+
+async function retireFixture(o: { outcome?: FakeOutcome; populate?: (clone: string) => void; onChild?: () => void } = {}) {
   process.env.UZI_UID_SPLIT = "1";
   const root = await mktmp();
   const parent = path.join(root, PARENT);
@@ -354,13 +398,15 @@ async function retireFixture(o: { outcome?: FakeOutcome; populate?: (clone: stri
   fs.writeFileSync(path.join(clone, "top.txt"), "t");
   o.populate?.(clone);
   fs.chmodSync(parent, 0o700);
+  fs.chmodSync(root, 0o1700);
   const rootPin = pin(root);
   const f = realScope();
   const git = newGit();
   const calls: Array<{ command: string; args: string[]; stdio: unknown }> = [];
-  installSpawn(git, o.outcome ?? "real", calls);
+  installSpawn(git, o.outcome ?? "real", calls, o.onChild);
   const input: RetireScratchDiscardInput = {
-    scope: f.scope, root, rootPin, rootDev: String(fs.lstatSync(root, { bigint: true }).dev), parentName: PARENT,
+    scope: f.scope, root, rootPin, rootDev: String(fs.lstatSync(root, { bigint: true }).dev), rootMntId: mntIdOfFd(rootPin),
+    parentName: PARENT,
     parentIno: String(fs.lstatSync(parent, { bigint: true }).ino), cloneIno: String(fs.lstatSync(clone, { bigint: true }).ino),
     deadline: Date.now() + 120_000, maxEntries: 2_000_000, maxDepth: 256, signal: new AbortController().signal,
     live: () => undefined, beforeEffect: async () => undefined,
@@ -391,8 +437,16 @@ describe("GitCache.discardRetireScratchParent", { skip: !fs.existsSync("/proc/se
       ["wrong parent inode", "identity_changed", t => ({ parentIno: String(BigInt(t.input.parentIno) + 1n) })],
       ["wrong root dev", "identity_changed", t => ({ rootDev: String(BigInt(t.input.rootDev) + 1n) })],
       ["wrong clone inode", "clone_identity_changed", t => ({ cloneIno: String(BigInt(t.input.cloneIno) + 1n) })],
+      // wrong_owner needs a parent owned by another uid: only a root test run can chown, so this case is skipped
+      // otherwise and the cross-uid proof belongs to the M6 real-lane (uid split) case.
+      ["parent owned by another uid", "wrong_owner", t => { fs.chownSync(t.parent, 12345, 12345); }],
       ["parent mode 0750", "wrong_mode", t => { fs.chmodSync(t.parent, 0o750); }],
       ["parent mode 0700 plus sticky", "wrong_mode", t => { fs.chmodSync(t.parent, 0o1700); }],
+      ["root without the sticky bit", "root_posture", t => { fs.chmodSync(t.root, 0o700); }],
+      ["parent mount id differs from the caller's", "mount_changed", t => ({ rootMntId: String(BigInt(t.input.rootMntId) + 1n) })],
+      ["mount id not decimal", "invalid_input", () => ({ rootMntId: "x" })],
+      // A throw in any preflight step (here: the root pin is no longer an open descriptor) is tagged, never untagged.
+      ["root pin not an open descriptor", "preflight_failed", () => ({ rootPin: 9999 })],
       ["extra entry beside clone", "unexpected_entries", t => { fs.writeFileSync(path.join(t.parent, "other"), ""); }],
       ["clone missing", "unexpected_entries", t => { fs.renameSync(t.clone, path.join(t.root, "moved")); }],
       ["clone replaced by a symlink", "not_directory", t => {
@@ -414,6 +468,7 @@ describe("GitCache.discardRetireScratchParent", { skip: !fs.existsSync("/proc/se
     ];
     for (const [label, reason, mutate] of cases) {
       if (label.startsWith("parent mode") && asRoot) continue;
+      if (label.startsWith("parent owned") && !asRoot) continue;
       const t = await retireFixture();
       const patch = mutate(t) ?? {};
       const before = fs.readdirSync(t.root).sort();
@@ -479,6 +534,67 @@ describe("GitCache.discardRetireScratchParent", { skip: !fs.existsSync("/proc/se
     if (result.kind === "residue") assert.equal(result.reason, "clone_identity_changed");
     assert.ok(exists(path.join(t.root, "moved", "top.txt")));
     assert.ok(exists(t.parent));
+  });
+
+  /** Runs `body` with fsp.rmdir wrapped; `hook(path, real)` decides what happens around each call. */
+  async function withRmdir(hook: (p: string, real: () => Promise<void>) => Promise<void>, body: () => Promise<void>) {
+    const realRmdir = fsp.rmdir;
+    fsp.rmdir = ((p: fs.PathLike) => hook(String(p), () => realRmdir(p))) as typeof fsp.rmdir;
+    try { await body(); } finally { fsp.rmdir = realRmdir; }
+  }
+
+  it("a parent renamed away and replaced by an empty directory just before the parent rmdir is residue, never removed", async () => {
+    const t = await retireFixture();
+    const moved = path.join(t.root, "moved");
+    let result: Awaited<ReturnType<GitCache["discardRetireScratchParent"]>> | undefined;
+    await withRmdir(async (p, real) => {
+      if (p.endsWith(`/${PARENT}`)) { fs.renameSync(t.parent, moved); fs.mkdirSync(t.parent); }
+      await real();
+    }, async () => { result = await t.git.discardRetireScratchParent(t.input); });
+    assert.equal(result?.kind, "residue");
+    if (result?.kind === "residue") assert.equal(result.reason, "parent_unverified");
+    assert.ok(fs.statSync(moved).isDirectory(), "the bound parent survives under its new name");
+    assert.equal(t.f.pending(), 0);
+    assert.doesNotThrow(() => t.git.assertNoUnsettledDeletes());
+  });
+
+  it("a parent swapped after the clone rmdir is caught by the parent re-verify: the planted directory is not removed", async () => {
+    const t = await retireFixture();
+    const moved = path.join(t.root, "moved");
+    let result: Awaited<ReturnType<GitCache["discardRetireScratchParent"]>> | undefined;
+    await withRmdir(async (p, real) => {
+      await real();
+      if (p.endsWith("/clone")) { fs.renameSync(t.parent, moved); fs.mkdirSync(t.parent); }
+    }, async () => { result = await t.git.discardRetireScratchParent(t.input); });
+    assert.equal(result?.kind, "residue");
+    if (result?.kind === "residue") assert.equal(result.reason, "parent_identity_changed");
+    assert.ok(exists(t.parent), "the planted directory was never rmdir'ed");
+    assert.ok(exists(moved));
+  });
+
+  it("a scope stopped while the child ran is unresolved: it throws, keeps the ticket and the unsettled entry", async () => {
+    let fx: Awaited<ReturnType<typeof retireFixture>> | undefined;
+    const t = fx = await retireFixture({ outcome: "receipt-only", onChild: () => fx!.f.scope.stop() });
+    await assert.rejects(t.git.discardRetireScratchParent(t.input),
+      (e: Error & { epochScratchUnresolved?: boolean }) => e.epochScratchUnresolved === true);
+    assert.equal(t.f.stopped(), true);
+    assert.equal(t.f.pending(), 1);
+    assert.equal(t.internal.unsettledDeletes.size, 1);
+    assert.throws(() => t.git.assertNoUnsettledDeletes(), /unsettled runner delete/);
+    assert.ok(exists(path.join(t.clone, "top.txt")));
+  });
+
+  it("each helper exit status maps to its residue reason and keeps the tree", async () => {
+    const cases: Array<[number, string]> = [[3, "helper_identity"], [4, "helper_remaining"], [7, "helper_unopenable"],
+      [8, "helper_budget"], [9, "helper_other_fs"], [1, "helper_failed"]];
+    for (const [exit, reason] of cases) {
+      const t = await retireFixture({ outcome: { exit } });
+      const result = await t.git.discardRetireScratchParent(t.input);
+      assert.deepEqual(result, { kind: "residue", reason, exit, stderrBytes: 0 }, `exit ${exit}`);
+      assert.ok(exists(path.join(t.clone, "top.txt")), `exit ${exit}`);
+      assert.equal(t.f.pending(), 0, `exit ${exit}`);
+      assert.doesNotThrow(() => t.git.assertNoUnsettledDeletes(), `exit ${exit}`);
+    }
   });
 
   it("an unjoined child stops the scope, leaves the unsettled entry and throws epochScratchUnresolved", async () => {

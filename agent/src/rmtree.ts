@@ -437,8 +437,9 @@ function drain(dirFd, limit, spend, skip, each, onFirst) {
  * before it is `rmdir`ed through its parent.
  *
  * Issue #4263 `empty-fd` mode: `node -e <script> fd:3 - <max> <budgetMs> empty-fd <dev:ino> "" pinned - 1
- * <maxDepth>`, selected ONLY by the exact home token `fd:3` together with strict `oneFs` `1`, `<rel>` `-` and
- * `<rootExpect>` `-` (anything else exits 6; every other grammar above is unchanged). The caller passes an
+ * <maxDepth>`, selected by the mode `empty-fd`, which REQUIRES the exact home token `fd:3` together with strict
+ * `oneFs` `1`, `<rel>` `-` and `<rootExpect>` `-` (anything else exits 6; every other grammar above is unchanged).
+ * Exit 7: fd 3 cannot be fstat'd or reopened (this uid cannot open it). The caller passes an
  * `O_PATH|O_NOFOLLOW|O_DIRECTORY` pin of the directory as child fd 3. The script fstats fd 3 (exit 3 unless it is a
  * directory with `<dev>:<ino>` equal to `<expect>`), reopens the fd-3 magic link `O_RDONLY|O_DIRECTORY` (no
  * `O_NOFOLLOW`: it is the magic link), and empties it with the SAME strict walk as `remove` (one st_dev, re-pin and

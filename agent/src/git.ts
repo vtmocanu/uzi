@@ -3543,6 +3543,8 @@ export interface RetireScratchDiscardInput {
   rootPin: number;
   /** Decimal `st_dev` of the runner root. */
   rootDev: string;
+  /** Decimal `mnt_id` of the runner root's mount; the parent and clone pins must report the same `mnt_id:` in fdinfo. */
+  rootMntId: string;
   /** `.retire-<uuid>`: must match the retire binding key grammar. */
   parentName: string;
   /** Decimal inodes bound for the parent and its `clone`. */
@@ -3563,7 +3565,15 @@ export type RetireScratchDiscardResult =
   | { kind: "removed" }
   /** Nothing was touched. */
   | { kind: "refused"; reason: string }
-  /** The tree (or part of it) is kept; the binding must stay. `stderrBytes` is a bounded length, never content. */
+  /**
+   * The tree (or part of it) is kept; the binding must stay. `stderrBytes` is a bounded length, never content.
+   * Residue after the clone `rmdir` (`rmdir_parent_failed`, `parent_unverified`, `parent_still_linked`, `fsync_failed`)
+   * is permanent: the clone is already gone, so the interrupted-removal rule keeps the binding and never retries it.
+   * The parent is removed by name, so a rename-and-replace of that name between the final identity check and the
+   * `rmdir` can remove only an EMPTY directory planted there (`rmdir` never removes content); it is then reported as
+   * `parent_unverified`, never `removed`, because the pinned parent still has links. The root is a sticky, worker-owned
+   * directory (checked as `root_posture`), so no other uid can perform that swap.
+   */
   | { kind: "residue"; reason: string; exit: number | null; stderrBytes?: number };
 
 /** Issue #4043: one admitted scratch leaf to delete (see {@link GitCache.discardEpochScratchLeaf}). */
@@ -4791,10 +4801,13 @@ export class GitCache {
    * Issue #4263: empty and remove one bound `<runnerRoot>/.retire-<uuid>/clone` (worker-owned 0700 parent, runner-owned
    * clone) with no chmod, no chown, no privilege increase and no raw fallback. The caller (the verified pod-epoch
    * phase) owns every authority check; this method owns the identity and launch guarantees. Preflight (nothing is
-   * touched, `refused`): the parent pins through `rootPin` to a worker-owned 0700 directory with the bound inode on
-   * the root's device holding exactly `clone`, and `clone` pins to the bound inode and device. Then the strict
+   * touched, `refused`; any unexpected throw is `preflight_failed`): the root is a worker-owned sticky directory, the
+   * parent pins through `rootPin` to a worker-owned 0700 directory with the bound inode on the root's device holding
+   * exactly `clone`, `clone` pins to the bound inode and device, and both pins report `rootMntId` (else
+   * `mount_changed`). Then the strict
    * `empty-fd` helper runs as the runner with the clone pin as child fd 3 (the EX lock is fd 4). The helper's receipt
-   * is never taken as emptiness: the worker's own `rmdir` of `clone` and then of the parent is. Any helper
+   * is never taken as emptiness: the worker's own `rmdir` of `clone` and then of the parent (whose pin must then report
+   * `st_nlink` 0) is. Any helper
    * non-receipt, rmdir failure, identity change or fsync failure is `residue` (the tree is kept). A child that cannot
    * be proven joined stops the scope, leaves the unsettled entry and throws `epochScratchUnresolved`.
    * Helper stderr is never read into a message; only its bounded byte length is reported.
@@ -4808,7 +4821,7 @@ export class GitCache {
         .some(name => typeof scope[name as keyof PodEpochReclaimScope] !== "function") ||
         !Number.isInteger(input.rootPin) || input.rootPin < 3 || typeof input.root !== "string" || !path.isAbsolute(input.root) ||
         !parentMatch || !RETIRE_UUID_RE.test(parentMatch[1]!) ||
-        !dec.test(String(input.rootDev)) || !dec.test(String(input.parentIno)) || !dec.test(String(input.cloneIno)) ||
+        typeof input.rootMntId !== "string" || !dec.test(input.rootMntId) || !dec.test(String(input.rootDev)) || !dec.test(String(input.parentIno)) || !dec.test(String(input.cloneIno)) ||
         typeof input.live !== "function" || typeof input.beforeEffect !== "function" || !(input.signal instanceof AbortSignal) ||
         !Number.isFinite(input.deadline) || !Number.isInteger(input.maxEntries) || input.maxEntries < 1 ||
         input.maxEntries > SCRATCH_DELETE_LIMITS.maxEntries || !Number.isInteger(input.maxDepth) || input.maxDepth < 1 ||
@@ -4838,23 +4851,39 @@ export class GitCache {
         if (scope.stopped()) return refused("scope_stopped");
         input.live();
       } catch { return refused("not_live"); }
+      const self = BigInt(process.getuid?.() ?? -1);
+      // The root must be worker-owned and sticky: only then can no other uid rename or unlink the parent's name.
+      try {
+        const rst = await fs.stat(`${procFd}${input.rootPin}`, { bigint: true });
+        if (!rst.isDirectory() || rst.uid !== self || (rst.mode & 0o1000n) === 0n) return refused("root_posture");
+      } catch { return refused("preflight_failed"); }
       try { parentPin = await fs.open(`${procFd}${input.rootPin}/${parentName}`, RETIRE_PIN_FLAGS); }
       catch (e) { return refused(isNoEnt(e) ? "parent_missing" : "not_directory"); }
-      const pst = await parentPin.stat({ bigint: true });
-      if (!pst.isDirectory()) return refused("not_directory");
-      if (pst.uid !== BigInt(process.getuid?.() ?? -1)) return refused("wrong_owner");
-      if ((pst.mode & 0o7777n) !== 0o700n) return refused("wrong_mode");
-      if (pst.ino !== parentIno || pst.dev !== rootDev) return refused("identity_changed");
-      const names: string[] = [];
-      const dir = await fs.opendir(`${procFd}${parentPin.fd}`);
-      try { for (let e = await dir.read(); e !== null && names.length < 2; e = await dir.read()) names.push(e.name); }
-      finally { await dir.close(); }
-      if (names.length !== 1 || names[0] !== "clone") return refused("unexpected_entries");
-      try { clonePin = await fs.open(`${procFd}${parentPin.fd}/clone`, RETIRE_PIN_FLAGS); }
-      catch (e) { return refused(isNoEnt(e) ? "clone_missing" : "not_directory"); }
-      const cst = await clonePin.stat({ bigint: true });
-      if (!cst.isDirectory()) return refused("not_directory");
-      if (cst.ino !== cloneIno || cst.dev !== rootDev) return refused("clone_identity_changed");
+      try {
+        const pst = await parentPin.stat({ bigint: true });
+        if (!pst.isDirectory()) return refused("not_directory");
+        if (pst.uid !== self) return refused("wrong_owner");
+        if ((pst.mode & 0o7777n) !== 0o700n) return refused("wrong_mode");
+        if (pst.ino !== parentIno || pst.dev !== rootDev) return refused("identity_changed");
+        const names: string[] = [];
+        const dir = await fs.opendir(`${procFd}${parentPin.fd}`);
+        try { for (let e = await dir.read(); e !== null && names.length < 2; e = await dir.read()) names.push(e.name); }
+        finally { await dir.close(); }
+        if (names.length !== 1 || names[0] !== "clone") return refused("unexpected_entries");
+        try { clonePin = await fs.open(`${procFd}${parentPin.fd}/clone`, RETIRE_PIN_FLAGS); }
+        catch (e) { return refused(isNoEnt(e) ? "clone_missing" : "not_directory"); }
+        const cst = await clonePin.stat({ bigint: true });
+        if (!cst.isDirectory()) return refused("not_directory");
+        if (cst.ino !== cloneIno || cst.dev !== rootDev) return refused("clone_identity_changed");
+        // Both pins must sit on the caller's mount: an unreadable fdinfo counts as a mismatch.
+        const mntId = async (fd: number): Promise<string | undefined> => {
+          try {
+            const ids = (await fs.readFile(`/proc/self/fdinfo/${fd}`, "utf8")).split("\n").filter(line => line.startsWith("mnt_id:"));
+            return ids.length === 1 ? /^mnt_id:[ \t]+(\d+)$/.exec(ids[0]!)?.[1] : undefined;
+          } catch { return undefined; }
+        };
+        if (await mntId(parentPin.fd) !== input.rootMntId || await mntId(clonePin.fd) !== input.rootMntId) return refused("mount_changed");
+      } catch { return refused("preflight_failed"); }
 
       // ---- launch admission ----
       const joinAllowance = 2 * (this.epochNativeTestDependencies?.joinMs ?? EPOCH_NATIVE_JOIN_MS);
@@ -4863,7 +4892,7 @@ export class GitCache {
         childDeadline - Date.now() - SCRATCH_DELETE_LIMITS.killSlackMs));
       if (budgetMs < EPOCH_SCRATCH_MIN_DELETE_BUDGET_MS) return refused("budget_exhausted");
       const env = { PATH: "/usr/bin:/bin" };
-      const expect = `${cst.dev}:${cst.ino}`;
+      const expect = `${rootDev}:${cloneIno}`;
       const wrapped = runnerCommand(process.execPath, ["-e", PINNED_SUBTREE_SCRIPT, "fd:3", "-", String(input.maxEntries),
         String(budgetMs), "empty-fd", expect, "", "pinned", "-", "1", String(input.maxDepth)]);
       try { this.validateEpochRetireEmptyLaunch(wrapped.command, wrapped.args, env, "/", "command"); }
@@ -4915,6 +4944,10 @@ export class GitCache {
         const pst2 = await parentPin.stat({ bigint: true });
         if (pst2.ino !== parentIno || !(await same(parentViaRoot, parentIno))) return residue("parent_identity_changed");
         try { await fs.rmdir(parentViaRoot); } catch { return residue("rmdir_parent_failed"); }
+        // The rmdir above is by name: only the pinned parent reporting no links proves it was the bound directory.
+        let unlinked = false;
+        try { unlinked = (await parentPin.stat({ bigint: true })).nlink === 0n; } catch { return residue("parent_unverified"); }
+        if (!unlinked) return residue("parent_unverified");
         try { await fs.lstat(parentViaRoot); return residue("parent_still_linked"); }
         catch (e) { if (!isNoEnt(e)) return residue("parent_unverified"); }
         try { await syncDirectory(input.root); } catch { return residue("fsync_failed"); }
