@@ -32,7 +32,7 @@ All **deployment** configuration is via environment variables, set in `.env` (co
 | `API_TLS_KEY` | unset (no TLS listener) | Path to the matching PEM private key. Setting exactly one of the pair refuses to boot: a cert without a key cannot serve TLS, and treating that as "TLS off" would silently hand you a plaintext hop you believed was encrypted. |
 | `API_TLS_ADDR` | `:8443` | Address of the TLS listener. Ignored unless the cert/key pair is set. Must differ from `API_ADDR`. |
 
-Invalid values for `AUTH_TOKEN_TTL`, `RATE_LIMIT_MAX`, `RATE_LIMIT_WINDOW`, `V1_RATE_LIMIT_MAX`, `V1_RATE_LIMIT_WINDOW`, `OAUTH_RATE_LIMIT_MAX`, `OAUTH_RATE_LIMIT_WINDOW`, `DB_MAX_CONNS` or an unparseable `TRUSTED_PROXIES` entry fall back to their defaults rather than failing boot (the last two are logged as warnings; `DB_MAX_CONNS` falls back to the `DATABASE_URL` `pool_max_conns`, then `20`); only a bad `JWT_SECRET`, a bad `UZI_SECRET_KEY`, a missing `DATABASE_URL`, or a broken `API_TLS_CERT`/`API_TLS_KEY` pair refuses to start.
+Invalid values for `AUTH_TOKEN_TTL`, `RATE_LIMIT_MAX`, `RATE_LIMIT_WINDOW`, `V1_RATE_LIMIT_MAX`, `V1_RATE_LIMIT_WINDOW`, `OAUTH_RATE_LIMIT_MAX`, `OAUTH_RATE_LIMIT_WINDOW`, `DB_MAX_CONNS` or an unparseable `TRUSTED_PROXIES` entry fall back to their defaults rather than failing boot (the last two are logged as warnings; `DB_MAX_CONNS` falls back to the `DATABASE_URL` `pool_max_conns`, then `20`); only a bad `JWT_SECRET`, a bad `UZI_SECRET_KEY`, a missing `DATABASE_URL`, an invalid `pool_max_conns` inside `DATABASE_URL`, or a broken `API_TLS_CERT`/`API_TLS_KEY` pair refuses to start.
 
 ### The optional TLS listener
 
