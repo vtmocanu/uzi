@@ -26,7 +26,7 @@ func TestWorkerCodexOwnerRequestAdmissionRefusalsLiveDB(t *testing.T) {
 		msgIneligible  = "codex credentials can be switched only on an active, worker-held run"
 		msgAssembling  = "the claim is being assembled; retry in a moment"
 		msgRaced       = "the run changed state while switching its token; retry"
-		msgSecretGone  = "credential override token not found"
+		msgTargetGone  = "credential override token not found"
 		msgRunNotFound = "run not found"
 	)
 
@@ -175,7 +175,7 @@ func TestWorkerCodexOwnerRequestAdmissionRefusalsLiveDB(t *testing.T) {
 		stoppedRouteExec(t, e, `INSERT INTO users (id, email, password_hash, vault_mode) VALUES ($1, $2, 'x', 'unprotected')`,
 			other, fmt.Sprintf("admission-other-%s@e2e", other))
 		foreign := insertAlias(t, e, other, "openai_api_key", "static")
-		refuse(t, e, "running", e.user, foreign, http.StatusNotFound, msgSecretGone)
+		refuse(t, e, "running", e.user, foreign, http.StatusNotFound, msgTargetGone)
 	})
 
 	// Guard isolated: the owner-scoped run read in SetRunCredential

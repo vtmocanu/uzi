@@ -1831,3 +1831,9 @@ Credit: the owner-request admission row (statuses queued, paused, limit_wait,
 recovery_wait, claimed; target kind/usability; foreign target; foreign run; CLI
 and web kind scoping). pool_wait is covered only by the existing non-DB
 `TestSetRunCredentialCodexOwnerRequestRefusals` and is not separately credited.
+
+U1 follow-up: `task lint:api` flagged gosec G101 on the test constant name
+`msgSecretGone`; it was renamed `msgTargetGone` (no other change). The
+unchanged-candidate green was re-run on the renamed file: 13/13 subtests PASS,
+EXIT=0 (`.uzi/scratch/ctl-logs/u1-green-handler2.log`); `task lint:api` 0 issues.
+The mutant runs used the pre-rename file; the rename touches no assertion.
