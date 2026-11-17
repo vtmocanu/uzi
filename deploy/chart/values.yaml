@@ -111,8 +111,9 @@ issueTracker:
 # off. It never feeds the worker egress lists: a worker's network access to the gateway is
 # yours to open, and the api itself must reach the gateway (the Test button dials from the
 # api, directly, ignoring HTTPS_PROXY/HTTP_PROXY, and admits private gateway addresses).
-# The compose-only loopback dev flag (UZI_PROVIDER_ALLOW_LOOPBACK) has no chart value on
-# purpose: in a cluster it would let the probe reach the api's own local ports. Set this
+# The compose-only loopback dev flag (UZI_PROVIDER_ALLOW_LOOPBACK) has no chart value, and
+# setting it in api.config fails the render: in a cluster it would let the probe reach the
+# api's own local ports. Set this
 # per-cluster instead of api.config.UZI_PROVIDER_ALLOWED_BASE_URLS (setting BOTH fails the
 # render, see api-configmap.yaml). A gateway behind a private CA also needs
 # workers.extraCA, which the provider Test probe trusts too (see there).

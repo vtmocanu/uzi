@@ -106,6 +106,15 @@ elif ! grep -q -F "providers.allowedBaseURLs OR api.config.UZI_PROVIDER_ALLOWED_
   echo "FAIL (both): refused, but not with the providers message:" >&2; cat "$WORK/err" >&2; fail=1
 fi
 
+# Loopback is compose-only: setting it in api.config refuses the render, whatever the value.
+for v in true false ""; do
+  if render --set-string "api.config.UZI_PROVIDER_ALLOW_LOOPBACK=$v"; then
+    echo "FAIL (loopback=$v): rendered" >&2; fail=1
+  elif ! grep -q -F "UZI_PROVIDER_ALLOW_LOOPBACK is a compose-only" "$WORK/err"; then
+    echo "FAIL (loopback=$v): refused, but not with the loopback message:" >&2; cat "$WORK/err" >&2; fail=1
+  fi
+done
+
 # workers.extraCA (inline pem) reaches the api pod: read-only mount, env, roll checksum, ConfigMap.
 render --set api.tls.enabled=true --set-string "workers.extraCA.pem=$PEM" \
   || { echo "BROKEN (extraCA pem): render failed" >&2; cat "$WORK/err" >&2; exit 2; }
@@ -116,6 +125,12 @@ has extraCA-pem "- name: provider-extra-ca"
 has extraCA-pem "mountPath: /etc/uzi/provider-extra-ca"
 has extraCA-pem "checksum/provider-extra-ca:"
 has extraCA-pem "name: uzi-worker-extra-ca"
+# The ConfigMap DOCUMENT itself renders with the controller off (workers.enabled is false here):
+# the api Deployment also references "name: uzi-worker-extra-ca", so match the document's source
+# header and its ca.crt key, not the bare name.
+has extraCA-pem "# Source: uzi/templates/worker-extra-ca-configmap.yaml"
+awk '/^# Source: uzi\/templates\/worker-extra-ca-configmap.yaml/{f=1;next} /^# Source:/{f=0} f&&/^kind: ConfigMap/{k=1} f&&/^  ca.crt:/{c=1} END{exit (k&&c)?0:1}' "$WORK/out" \
+  || { echo "FAIL (extraCA pem): the worker-extra-ca ConfigMap document did not render with workers off" >&2; fail=1; }
 # The mount is read-only: the api container's provider-extra-ca volumeMount carries readOnly.
 awk '/- name: provider-extra-ca/{f=1;next} f&&/readOnly: true/{ok=1} f&&/^[[:space:]]*- name:/{f=0} END{exit ok?0:1}' "$WORK/out" \
   || { echo "FAIL (extraCA pem): the provider-extra-ca mount is not readOnly" >&2; fail=1; }

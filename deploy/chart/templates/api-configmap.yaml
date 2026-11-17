@@ -82,6 +82,14 @@ data:
     that combination is a hard render failure, like FORGE_ALLOWED_BASE_URLS.
   */ -}}
   {{- $providerURLs := fromJsonArray (include "uzi.providerAllowedBaseURLs" .) }}
+  {{- /*
+    UZI_PROVIDER_ALLOW_LOOPBACK is a compose development flag. In a cluster it would let the
+    provider Test probe reach the api's own local ports, so any presence in api.config fails
+    the render, whatever the value.
+  */ -}}
+  {{- if hasKey .Values.api.config "UZI_PROVIDER_ALLOW_LOOPBACK" }}
+  {{- fail "UZI_PROVIDER_ALLOW_LOOPBACK is a compose-only development flag and cannot be set in api.config: in a cluster it would let the provider Test probe reach the api's own local ports." }}
+  {{- end }}
   {{- if $providerURLs }}
   {{- if hasKey .Values.api.config "UZI_PROVIDER_ALLOWED_BASE_URLS" }}
   {{- fail "Set the provider allowlist in EITHER providers.allowedBaseURLs OR api.config.UZI_PROVIDER_ALLOWED_BASE_URLS, not both: both set would emit a duplicate UZI_PROVIDER_ALLOWED_BASE_URLS ConfigMap key. Prefer providers.allowedBaseURLs." }}

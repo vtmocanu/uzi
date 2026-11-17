@@ -167,6 +167,11 @@ func TestProbeClassification(t *testing.T) {
 		t.Fatalf("fixture is %d bytes, over the cap", len(atLimit))
 	}
 
+	// Valid Messages JSON followed by whitespace past the cap: still valid JSON, so only the size
+	// check can reject it.
+	padded := okMessage + strings.Repeat(" ", MaxProbeResponseBytes)
+	toolPadded := toolMessage + strings.Repeat(" ", MaxProbeResponseBytes)
+
 	cases := []struct {
 		name       string
 		auth, tool reply
@@ -181,14 +186,20 @@ func TestProbeClassification(t *testing.T) {
 		{"tool not supported: text only", reply{status: 200, body: okMessage}, reply{status: 200, body: okMessage}, 0, AuthOK, ToolNotSupported, 1},
 		{"tool not supported: other tool name", reply{status: 200, body: okMessage},
 			reply{status: 200, body: strings.Replace(toolMessage, "uzi_probe", "other", 1)}, 0, AuthOK, ToolNotSupported, 1},
-		{"tool not supported: input not an object", reply{status: 200, body: okMessage},
-			reply{status: 200, body: strings.Replace(toolMessage, `{"ok":true}`, `"x"`, 1)}, 0, AuthOK, ToolNotSupported, 1},
+		{"tool inconclusive: input not an object", reply{status: 200, body: okMessage},
+			reply{status: 200, body: strings.Replace(toolMessage, `{"ok":true}`, `"x"`, 1)}, 0, AuthOK, ToolInconclusive, 1},
+		{"tool inconclusive: content is not an array of objects", reply{status: 200, body: okMessage},
+			reply{status: 200, body: strings.Replace(toolMessage, `[{"type":"tool_use","id":"t1","name":"uzi_probe","input":{"ok":true}}]`, `[1]`, 1)}, 0, AuthOK, ToolInconclusive, 1},
+		{"tool inconclusive: block type is not a string", reply{status: 200, body: okMessage},
+			reply{status: 200, body: strings.Replace(toolMessage, `"type":"tool_use"`, `"type":7`, 1)}, 0, AuthOK, ToolInconclusive, 1},
+		{"tool not supported: empty content", reply{status: 200, body: okMessage}, reply{status: 200, body: nullStop}, 0, AuthOK, ToolNotSupported, 1},
 		{"tool step html", reply{status: 200, body: okMessage}, reply{status: 200, ctype: "text/html", body: htmlBody}, 0, AuthOK, ToolInconclusive, 1},
 		{"tool step malformed json", reply{status: 200, body: okMessage}, reply{status: 200, body: truncatedBody}, 0, AuthOK, ToolInconclusive, 1},
 		{"tool step unrelated json", reply{status: 200, body: okMessage}, reply{status: 200, body: unrelatedJSON}, 0, AuthOK, ToolInconclusive, 1},
 		{"tool step 500", reply{status: 200, body: okMessage}, reply{status: 500, body: "boom"}, 0, AuthOK, ToolInconclusive, 1},
 		{"tool step 401", reply{status: 200, body: okMessage}, reply{status: 401, body: "no"}, 0, AuthOK, ToolInconclusive, 1},
 		{"tool step oversized", reply{status: 200, body: okMessage}, reply{status: 200, body: big}, 0, AuthOK, ToolInconclusive, 1},
+		{"tool step oversized but valid json", reply{status: 200, body: okMessage}, reply{status: 200, body: toolPadded}, 0, AuthOK, ToolInconclusive, 1},
 		{"tool step timeout", reply{status: 200, body: okMessage}, reply{hang: true}, 150 * time.Millisecond, AuthOK, ToolInconclusive, 1},
 		{"401 rejected", reply{status: 401, body: "unauthorized"}, reply{status: 200, body: toolMessage}, 0, AuthRejected, ToolNotRun, 0},
 		{"403 rejected", reply{status: 403, body: "forbidden"}, reply{status: 200, body: toolMessage}, 0, AuthRejected, ToolNotRun, 0},
@@ -201,6 +212,7 @@ func TestProbeClassification(t *testing.T) {
 		{"200 without stop_reason", reply{status: 200, body: noStopReason}, reply{status: 200, body: toolMessage}, 0, AuthInconclusive, ToolNotRun, 0},
 		{"200 role user", reply{status: 200, body: userRole}, reply{status: 200, body: toolMessage}, 0, AuthInconclusive, ToolNotRun, 0},
 		{"200 content not a list", reply{status: 200, body: contentNotList}, reply{status: 200, body: toolMessage}, 0, AuthInconclusive, ToolNotRun, 0},
+		{"200 oversized but valid json", reply{status: 200, body: padded}, reply{status: 200, body: toolMessage}, 0, AuthInconclusive, ToolNotRun, 0},
 		{"200 oversized", reply{status: 200, body: big}, reply{status: 200, body: toolMessage}, 0, AuthInconclusive, ToolNotRun, 0},
 		{"404", reply{status: 404, body: "nope"}, reply{status: 200, body: toolMessage}, 0, AuthInconclusive, ToolNotRun, 0},
 		{"429", reply{status: 429, body: "slow"}, reply{status: 200, body: toolMessage}, 0, AuthInconclusive, ToolNotRun, 0},
@@ -250,6 +262,49 @@ func TestProbeClassification(t *testing.T) {
 			t.Errorf("gateway saw %d requests, want 1", n)
 		}
 	})
+	for _, style := range []string{AuthBearer, AuthXAPIKey} {
+		// The redirect points at another path on the SAME host the dialer is pinned to, so the pin
+		// does not stop it: only the client's refusal to follow does.
+		const other = "/other-tenant/v1/messages"
+		t.Run("same-host redirect on the auth step, "+style, func(t *testing.T) {
+			gw := newGateway(t, reply{status: 307, location: other}, reply{status: 200, body: toolMessage})
+			p, _ := testProber(t, gw, false, "10.0.0.5")
+			tg := target()
+			tg.AuthStyle = style
+			res, err := p.Probe(context.Background(), tg)
+			if err != nil || res.Auth != AuthInconclusive || res.Tool != ToolNotRun {
+				t.Fatalf("result = %+v, %v", res, err)
+			}
+			reqs := gw.requests()
+			if len(reqs) != 1 {
+				t.Fatalf("gateway saw %d requests, want 1", len(reqs))
+			}
+			for _, r := range reqs {
+				if r.path == other {
+					t.Errorf("the redirect was followed to %s", other)
+				}
+			}
+		})
+		t.Run("same-host redirect on the tool step, "+style, func(t *testing.T) {
+			gw := newGateway(t, reply{status: 200, body: okMessage}, reply{status: 307, location: other})
+			p, _ := testProber(t, gw, false, "10.0.0.5")
+			tg := target()
+			tg.AuthStyle = style
+			res, err := p.Probe(context.Background(), tg)
+			if err != nil || res.Auth != AuthOK || res.Tool != ToolInconclusive {
+				t.Fatalf("result = %+v, %v", res, err)
+			}
+			reqs := gw.requests()
+			if len(reqs) != 2 {
+				t.Fatalf("gateway saw %d requests, want 2", len(reqs))
+			}
+			for _, r := range reqs {
+				if r.path == other {
+					t.Errorf("the redirect was followed to %s", other)
+				}
+			}
+		})
+	}
 	t.Run("redirect on the tool step", func(t *testing.T) {
 		var hits atomic.Int32
 		gw := newGateway(t, reply{status: 200, body: okMessage}, reply{status: 307, location: redirectTarget(&hits)})
@@ -479,7 +534,7 @@ func TestProbeAddressPolicy(t *testing.T) {
 			t.Error("dialed")
 		}
 	})
-	t.Run("the resolver is not consulted again after the check", func(t *testing.T) {
+	t.Run("each connection re-resolves and is checked on its own", func(t *testing.T) {
 		gw := newGateway(t, reply{status: 200, body: okMessage}, reply{status: 200, body: toolMessage})
 		p, rec := testProber(t, gw, false)
 		var calls atomic.Int32

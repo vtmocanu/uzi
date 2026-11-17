@@ -185,11 +185,7 @@ func (p *Prober) Probe(ctx context.Context, t ProbeTarget) (ProbeResult, error) 
 	if !ok || status < 200 || status > 299 || !isMessage(body) {
 		return res, nil
 	}
-	if hasProbeToolUse(body) {
-		res.Tool = ToolPassed
-	} else {
-		res.Tool = ToolNotSupported
-	}
+	res.Tool = toolVerdict(body)
 	return res, nil
 }
 
@@ -291,26 +287,48 @@ func isMessage(body []byte) bool {
 	return ok
 }
 
-// hasProbeToolUse reports a tool_use content block naming the probe tool with an object input.
-func hasProbeToolUse(body []byte) bool {
+// toolVerdict classifies the forced-tool reply's content blocks: ToolPassed for a tool_use block
+// naming the probe tool with an object input; ToolNotSupported for a well-formed content array
+// with no such block; ToolInconclusive when the content is malformed (not an array of objects, or
+// a block whose fields have the wrong type) or the matching tool_use has a non-object input.
+func toolVerdict(body []byte) string {
 	m, ok := messageEnvelope(body)
 	if !ok {
-		return false
+		return ToolInconclusive
 	}
-	var blocks []struct {
-		Type  string          `json:"type"`
-		Name  string          `json:"name"`
-		Input json.RawMessage `json:"input"`
+	var raws []json.RawMessage
+	if json.Unmarshal(m["content"], &raws) != nil {
+		return ToolInconclusive
 	}
-	if json.Unmarshal(m["content"], &blocks) != nil {
-		return false
-	}
-	for _, b := range blocks {
-		if in := bytes.TrimSpace(b.Input); b.Type == "tool_use" && b.Name == probeToolName && len(in) > 0 && in[0] == '{' {
-			return true
+	passed, badInput := false, false
+	for _, raw := range raws {
+		if r := bytes.TrimSpace(raw); len(r) == 0 || r[0] != '{' {
+			return ToolInconclusive
+		}
+		var b struct {
+			Type  string          `json:"type"`
+			Name  string          `json:"name"`
+			Input json.RawMessage `json:"input"`
+		}
+		if json.Unmarshal(raw, &b) != nil {
+			return ToolInconclusive
+		}
+		if b.Type != "tool_use" || b.Name != probeToolName {
+			continue
+		}
+		if in := bytes.TrimSpace(b.Input); len(in) > 0 && in[0] == '{' {
+			passed = true
+		} else {
+			badInput = true
 		}
 	}
-	return false
+	switch {
+	case badInput:
+		return ToolInconclusive
+	case passed:
+		return ToolPassed
+	}
+	return ToolNotSupported
 }
 
 // transport returns a one-use transport for host. Its DialContext ignores the address the
