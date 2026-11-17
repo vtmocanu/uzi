@@ -410,7 +410,7 @@ control is still absent, not that the functional criterion was deferred.
 | Now raw drain before executor suspension | C1 in earlier record |
 | A reconciliation before strict persistence | C2 in earlier record |
 | Explicit owner Codex request, target ownership/kind and live-status admission | A4 credits request availability in four live statuses; U1 credits queued/paused/limit_wait/recovery_wait/claimed refusals, target usability and disabled target, the combined kind fence, a foreign API-key target, a foreign run and client-side CLI/web kind scoping. pool_wait, terminal statuses, pinned-without-secret, lane, no-live-worker, unsupported-worker and foreign-subscription refusals remain unvalidated; policy is the separate row below |
-| Same successful flight/generation/worktree with no new attempt, custody or release/reclaim | Positive assertions present; independent preservation/control accounting unvalidated |
+| Same successful flight/generation/worktree with no new attempt, custody or release/reclaim | U2 effect-injection sensitivity controls (owner-extended decision 10, U2 only): claimRun, attempt directory, custody release, queued transition, worktree reassignment, through the real Runner success test; other effects and the fresh_B return not separately controlled |
 | Strict usable persistence, clear confirmation and continuation on A before teardown | R1–R4 below credit three failed-save/inspection variants and empty applied-ACK only; other clauses unvalidated |
 | Proven A root/tool reap before B material, login and model work; fresh CODEX_HOME | R5 credits unproven registered root pre-apply only; tool-only, other modes/phases and HOME clauses unvalidated |
 | Whole operation-scope/refresh/identity/capability/summary replacement and retired-A rejection | A2 credits one reader; A3 retained-A/Sub→Sub B-scope namespace isolation; R7 B dispatcher publication readiness; R8 retired API-key A reconcile release-request fence during B login; remaining mixed clauses unvalidated |
@@ -1822,7 +1822,7 @@ API client, and u1-web-kind renders the real component in jsdom. Neither passes
 through the API route or store; they are client-side controls for CLI and web
 kind scoping only. The server-side kind fence is u1-anthropic. u1-disabled ran
 on candidate 4bd0c1da9 with the test file that added `disabled_target_running`
-(sha256 7bdf26f4…, committed after this entry).
+(sha256 7bdf26f4…, committed with this entry).
 
 Every mutant exited 1 at the named assertion, not in setup or compilation.
 Each mutant stops at the status assertion, so no control proves the
@@ -1864,3 +1864,56 @@ U1 review fixes: test comments for the anthropic and foreign-secret subtests
 now say "redundant fence (combined)"; `disabled_target_running` was added.
 Green on the final file: 14/14 subtests PASS, EXIT=0
 (`.uzi/scratch/ctl-logs/u1-green-handler3.log`).
+
+U1 checkpoint record: the coverage question for this unit carried a malformed,
+hand-typed SHA (`e8b4ab6fc1d4d8e0e8b4ab6fc0000000`). The owner confirmed the
+correct full SHA instead: the published checkpoint ref equals
+e8b4ab6fc54fb79d63eb4435966cdc27fb9507ae. Later coverage questions paste the
+SHA from `git rev-parse HEAD`. The foreign-secret subtest comment now states
+the 404/409 split (comment only; no assertion changed).
+
+### U2 — in-place success keeps flight, generation, attempt and custody (2026-11-17)
+
+Owner decision (2026-11-17, U2 only): decision 10's effect-injection
+sensitivity control is extended to the in-place success path of
+`attemptCodexCredentialSwitch`; it is not applied by analogy to any other unit.
+
+Baseline: `git show a233883de3c36bae2e940f999cd9d582889dad00:agent/src/runner.ts`
+:25735–25738 refused every Codex switch with `retained_stop` (see A1), so there
+was no historical in-place success path. On the candidate the success path
+(agent/src/runner.ts `attemptCodexCredentialSwitch`, :17290 onward, returning
+`return fresh ? "fresh_B" : "resumed_B";` at :17720) mutates only the existing
+flight's authority, secrets and operation scope; it calls no claim, custody,
+clone-seed or release code, so each property below holds by absence of a call.
+
+Injection point (traced): every control inserts exactly one statement between
+`replacementAdmissionOpen = true;` and that return, i.e. after B `finishB`,
+Now `finishB`, sequence-hold release and switch settlement, on the real success
+path reached by both tests. Each mutant changes nothing else (diffs:
+`.uzi/scratch/ctl-logs/u2-*.mutant.diff`) and passed `npm run typecheck` in the
+export before the tests ran.
+
+Command (from `agent` in the one-at-a-time export, removed after each run):
+`npm run typecheck && node --import tsx --test --test-timeout=120000 --test-name-pattern='(M2 actualRunner api_key to subscription factory account resumes saved thread$)|(Codex real Runner switches A to B to C without a new claim or attempt)' test/codex-executor.test.ts`.
+Candidate e8b4ab6fc54fb79d63eb4435966cdc27fb9507ae. An earlier attempt of all
+five failed in setup (export lacked `.uzi/scratch` for the test's mkdtemp;
+`u2-*.setupfail.log`) and receives no credit; the driver now creates it.
+
+| Control (effect-injection sensitivity) | Seam | Injected effect (only change) | Baseline test red at | A→B→C test |
+|---|---|---|---|---|
+| u2-claim | no new claim generation | `await this.client.claimRun().catch(() => null);` | :35233 allocationCalls `claimRun: 1` vs 0 | red: "no extra claim, clone, custody or settlement in the window" |
+| u2-attemptdir | no new attempt directory | `await fs.mkdir(join(pathDirname(flight.worktreePath!), "injected-attempt"));` | :35231 "no new attempt directory…" (`'injected-attempt'` added) | red (diagnostic wrapper) |
+| u2-custody | no custody release | `await this.client.releaseRecoveryCustody(claim.run_id, generation).catch(() => undefined);` | :35233 `releaseRecoveryCustody: 1` vs 0 | red: same window assertion |
+| u2-transition | no release/reclaim transition | `await this.client.reportState(claim.run_id, { status: "queued" } as never).catch(() => undefined);` | :35236 "no release/reclaim/hold transition…" | red: "no release/reclaim/hold state transition" |
+| u2-worktree | same flight and worktree | ``flight.worktreePath = `${flight.worktreePath}-injected`;`` | :35224 worktreePath strict equality | green: this test checks clone path, not flight.worktreePath |
+
+Every mutant exited 1. Unchanged candidate: both tests pass, 2/2, EXIT=0
+(`.uzi/scratch/ctl-logs/u2-green.log`; baseline test 3.3 s, A→B→C 1.5 s).
+
+Credit: each row proves that the named positive assertion detects that one
+injected effect at that seam on the real success path; it does not prove the
+absence of other effects. Not separately controlled: a new flight object
+(only a worktree reassignment was injected), `reserveRecoveryCapture`,
+`settleRecoveryHold(Live)` and clone seeding (counted by the same
+allocationCalls assertion, no injection run), and the `fresh_B` return (same
+statement sequence; the controls ran through the resumed path).

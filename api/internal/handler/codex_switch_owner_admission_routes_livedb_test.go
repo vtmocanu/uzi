@@ -178,8 +178,9 @@ func TestWorkerCodexOwnerRequestAdmissionRefusalsLiveDB(t *testing.T) {
 
 	// Redundant fence (combined): LockSecretEnablementForShareNowait,
 	// GetUserSecretMetaByID and LockCodexAliasForShareNowait are each
-	// owner-scoped, so another user's otherwise usable API-key secret is
-	// ErrCredentialOverrideSecretNotFound (404) unless all three are removed.
+	// owner-scoped, so another user's otherwise usable API-key secret is refused
+	// unless all three are removed (404 from the first two reads, 409 from the
+	// alias lock alone).
 	t.Run("other_users_secret_running", func(t *testing.T) {
 		e, _ := setup(t, "running")
 		other := uuid.New()
