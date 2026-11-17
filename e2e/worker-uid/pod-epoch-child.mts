@@ -243,6 +243,12 @@ async function retireEval(req: { cache: string; bare: string; uuid: string; runn
 // retireRunnerClone down its EXDEV scratch branch. Only the cross-device rename into the holding root is simulated
 // (a test-only fs.promises.rename wrapper). Reports what the production code left behind, as the worker uid.
 async function retireProduction(req: { dataDir: string }) {
+  // The failing step rides in the error so CI names it, not only the innermost message.
+  let step = "setup";
+  try { return await retireProductionSteps(req, name => { step = name; }); }
+  catch (error) { throw new Error(`retire-production failed at ${step}: ${String(error)}`, { cause: error }); }
+}
+async function retireProductionSteps(req: { dataDir: string }, at: (step: string) => void) {
   process.env.UZI_UID_SPLIT = "1";
   // The worker posture main.ts pairs with the uid split (agent/src/main.ts: `if (uidSplitActive()) process.umask(0o002)`):
   // worker-made runner-clone parents stay group-runner-writable, so the runner-uid clone can create its work tree there.
@@ -263,11 +269,15 @@ async function retireProduction(req: { dataDir: string }) {
   const attemptId = formatAttemptId(new Date("2026-11-05T10:10:10Z"), 1, "0123456789abcdef");
   const runId = "run-retire-production";
   const git: any = new GitCache(req.dataDir, logger);
+  at("ensureClone");
   const bare = await git.ensureClone(origin);
   const branch = "agent/issue-4263";
+  at("createOrAttachRunnerClone");
   const clone = await git.createOrAttachRunnerClone(bare, 4263, { beforeFree: async () => {}, isLive: () => false }, runId, false, undefined,
     { attemptId, isLive: () => false, beforeSeed: async () => {} });
+  at("markRecoveryCapture");
   await git.markRecoveryCapture(bare, clone.path, branch, runId, attemptId);
+  at("retireRunnerClone");
   const runnerRoot = path.join(req.dataDir, "runner");
   const holdingRoot = path.join(req.dataDir, "runner-quarantine");
   const rename = fs.promises.rename;
@@ -278,6 +288,7 @@ async function retireProduction(req: { dataDir: string }) {
   try {
     await git.retireRunnerClone(bare, clone.path, branch, runId, { discard: true, attemptId, dispositionClass: "owner_terminal" });
   } finally { (fs.promises as { rename: typeof fs.promises.rename }).rename = rename; }
+  at("readback");
   const parents = fs.readdirSync(runnerRoot).filter(n => n.startsWith(".retire-"));
   if (parents.length !== 1) throw new Error("expected exactly one retire scratch parent, saw " + JSON.stringify(parents));
   const parentPath = path.join(runnerRoot, parents[0]!);
@@ -295,9 +306,18 @@ for await (const line of createInterface({ input: process.stdin })) {
     let result: unknown;
     switch (request.op) {
       case "seed": result = await runtime.seed(request.uid); break;
-      case "acquire":
-        ownership = await runtime.acquire({ firstMode: request.mode, signal: AbortSignal.timeout(5000) });
+      case "acquire": {
+        // Production posture (agent/src/main.ts: `const controller = new AbortController()`, passed to
+        // `epochRuntime.acquire`): the ownership retains this signal and re-checks it on every reclaim
+        // assertion, so it must live as long as the process. A timer-backed signal expired 5 s after the
+        // acquire and failed a later reclaim with TimeoutError. Only the pending acquire stays bounded.
+        const lifetime = new AbortController();
+        const bound = setTimeout(() =>
+          lifetime.abort(new DOMException("epoch acquire exceeded 5000 ms", "TimeoutError")), 5000);
+        try { ownership = await runtime.acquire({ firstMode: request.mode, signal: lifetime.signal }); }
+        finally { clearTimeout(bound); }
         result = ownership.mode; break;
+      }
       case "consume": result = await ownership.consume(request.uid); break;
       case "matches": result = ownership.matchesEntry(request.current, request.previous); break;
       case "shared": await ownership.reacquireShared(); result = ownership.mode; break;
@@ -377,7 +397,7 @@ for await (const line of createInterface({ input: process.stdin })) {
       case "retire":
         if (request.detached) {
           // The worker is killed while the helper runs, so the reply cannot wait for the discard.
-          void retireOp(request).catch(error => { process.stderr.write("detached retire: " + String(error) + "\n"); });
+          void retireOp(request).catch(error => { process.stderr.write("detached retire: " + String(error) + "\n" + String((error as Error)?.stack ?? "") + "\n"); });
           result = "launched";
         } else result = await retireOp(request);
         break;
@@ -388,6 +408,7 @@ for await (const line of createInterface({ input: process.stdin })) {
     }
     console.log(JSON.stringify({ result }));
   } catch (error) {
-    console.log(JSON.stringify({ error: String(error) }));
+    // `error` stays String(error) (a test regex-matches it); `op` and `stack` name the failing request and frame.
+    console.log(JSON.stringify({ error: String(error), op: request.op, stack: String((error as Error)?.stack ?? "") }));
   }
 }

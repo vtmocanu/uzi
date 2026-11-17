@@ -108,7 +108,9 @@ class Owned {
   }
   async ask(request: object, ms?: number): Promise<any> {
     const response = await this.raw(request, ms);
-    assert.equal(response.error, undefined, response.error);
+    // The child names the failing op and frame; its stderr carries anything the code under test logged.
+    assert.equal(response.error, undefined,
+      `${response.error}\nop: ${response.op}\nstack: ${response.stack}\nchild stderr: ${this.stderr}`);
     return response.result;
   }
   killed = false;
