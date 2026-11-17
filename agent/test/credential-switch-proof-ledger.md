@@ -429,9 +429,9 @@ control is still absent, not that the functional criterion was deferred.
 | Stopped frozen secret and capability hash presence | D25–D56: running/paused missing_frozen_secret and missing_capability_hash; binding identity/ownership unvalidated |
 | Stopped switch-request/generation, ordinary hold, pause-request/mode, stop-kind/reason and reserve-hold markers | D25–D56: individual running/paused marker cases; policy and other competing controls unvalidated |
 | Stopped refusal of claimed status | D25–D56: running/paused status_claimed; other statuses unvalidated |
-| Stopped ownership, lane and policy fences | D57–D60 below credit running/paused pending-fresh and unresolved-outcome only; ownership, lane and other policy clauses unvalidated |
+| Stopped ownership, lane and policy fences | D57–D60 credit pending-fresh/unresolved-outcome; D61 paused policy-hold; D62/D63 stable user-owner mismatch running/paused. Lane controls, concurrent owner changes and other policy clauses unvalidated |
 | Stopped replay after withdrawn X/Y; resume/reclaim and incarnation changes | Unvalidated; the fixture's single HTTP withdrawal does not discharge X/Y |
-| Stopped preservation of binding, journals, session, gates, questions and custody without input consumption/time banking | Unvalidated |
+| Stopped preservation of binding, journals, session, gates, questions and custody without input consumption/time banking | E1 base-journal deletion, E2 applied-input deletion, E3 custody timestamp corruption only; other effects, actual custody release, replay sensitivity and broader clauses unvalidated |
 | Stopped known extra typed member and register_nonce case alias | D25–D56: four running/paused wire cases only |
 | Bounded strict stopped request, other forbidden combinations, op_id and minimal acknowledgement | Unvalidated |
 | Tokens absent from all inputs/acknowledgements/messages/logs | Targeted positive assertions present; qualifying controls and m4 security gates remain required |
@@ -880,13 +880,13 @@ retains argument plumbing and all worker-ID, generation, nonce, epoch, binding,
 status, lane, policy, input and budget checks. Exact two-file diffs and hashes
 are in the receipt. Running and paused cases used separate serial exports.
 
-Fixture owner_routes_livedb_test.go verifies the exact worker and run rows before
+Fixture codex_switch_stopped_owner_routes_livedb_test.go verifies the exact worker and run rows before
 and after preparation. It keeps token, worker ID, nonce, claim and frozen run
 binding unchanged, but assigns the worker to a different existing user. Matched
 controls perform identical forge-origin/cooldown bookkeeping removal, retaining
 the original owner. This avoids changing runs.user_id, which would break its
 Codex-secret composite FK. Both cohorts assert NULL worker Anthropic binding,
-then prove only workers.user_id changed and all run snapshots stayed unchanged.
+then prove no worker field other than user_id changed and all run snapshots stayed unchanged.
 This is disposable test preparation, not an application-supported ownership
 transfer or a claim about concurrent authentication/ownership changes.
 

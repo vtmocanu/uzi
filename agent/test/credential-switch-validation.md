@@ -516,7 +516,7 @@ method question only. The 24 earlier stopped controls and 32 authority/wire cont
 executed and credit only their specific seams. Four later policy controls and
 six individual Runner controls add only the bounded credits above. The ledger splits credited
 nonce, claim generation/release, binding presence, markers, claimed status
-and narrow wire cases from remaining ownership/incarnation, other statuses,
+and narrow wire cases from remaining ownership concurrency/incarnation, other statuses,
 lane/other policy, worker-latched bounds, withdrawn X/Y, broader preservation,
 op_id, bounds and minimal-acknowledgement obligations.
 m3 and m4 are **INCOMPLETE**; no functional criterion is accepted, waived or
