@@ -745,10 +745,10 @@ removes `clone` and the parent with its own `rmdir`, which is the proof that
 nothing was left. `removing` is written durably before the first deletion effect, and a removal
 that leaves anything behind leaves the binding there; **a `removing` binding is never retried or reclaimed** (it reads
 `interrupted_removal`, and `removing_bindings` in the total counts them). Every binding, `intent` and `removing` included, counts toward the 64-per-bare cap.
-On a uid-split pod a retained `intent` or `removing` binding whose parent is still on
-disk is released only when a successful verified-epoch reclaim or a completion removal
-unsets it. (A single-uid pod's in-process removal unsets the binding after a confirmed
-removal, and a retire that moved nothing drops its `intent` binding.) A metadata-only
+A `settled` binding is released by a successful verified-epoch reclaim, and a
+completion or single-uid in-process removal unsets its own binding after a confirmed
+removal; a retire that moved nothing drops its `intent` binding. On a uid-split pod an
+`intent` or `removing` binding left with its parent on disk is never released. A metadata-only
 recovery step clears a binding only when its `.retire-*` parent is already gone (and
 only in its narrow cases); it is not a remedy for a retained parent, which is on disk. Past the cap the fallback is the
 unbound in-process removal attempt described above. Permanently retained `intent` or

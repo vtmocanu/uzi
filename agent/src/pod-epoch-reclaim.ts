@@ -634,7 +634,7 @@ const emptyRetire = (): RetireVerdict => ({
 const RETIRE_PHASE_MIN_MS = 30_000;
 const RETIRE_PHASE_MAX_MS = 120_000;
 const RETIRE_CANDIDATE_MIN_MS = 20_000;
-/** Every pre-effect step ends this long before the phase window does, so its cancellation is joined inside the window. */
+/** The idle proofs and the run-status/holds read end this long before the phase window does, so their cancellation is joined inside the window. */
 const RETIRE_SETTLE_RESERVE_MS = 5_000;
 const RETIRE_HELPER_MAX_MS = 300_000;
 const RETIRE_MAX_CANDIDATES = 64;
@@ -804,7 +804,7 @@ async function retireBody(ctx: RetireContext, pin: ScratchRootPin, root: string,
   if (bound === undefined) return refuse("bind_unknown");
   if ("refused" in bound) return refuse(bound.refused);
 
-  // The idle proofs and the run-status/holds read run inside the phase window less the settlement reserve: a step that cannot start there is deferred
+  // The idle proofs and the run-status/holds read run inside the phase window less the settlement reserve: a step that cannot start there is not run
   // untouched, and one that ends at its deadline was cancelled and joined by then. The reason a cut-off step reports is the
   // budget, never a verdict about the daemon or the run.
   const stepBound = (): RetireStepBound | undefined => {
