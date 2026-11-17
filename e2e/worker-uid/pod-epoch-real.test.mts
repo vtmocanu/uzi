@@ -611,3 +611,102 @@ test("pod epoch real split: the worker pins the runner scratch root, the runner-
     assert.equal(fs.existsSync("/data/runner/.tmp/uzi-worker"), true, "the protected container name is untouched");
   } finally { fs.rmSync(leafDir, { recursive: true, force: true }); }
 });
+
+// Issue #4420 m4: the run-owned TMPDIR leaf on the real image. The worker (uid 10001, production ambient caps)
+// calls prepareRunTmpdir twice (the split helper runs as the runner uid through runnerCommand), stats the leaf,
+// lists it through the runner-uid census and removes it with the same strict delete as the test above. This
+// drives creation, census and strict delete directly; it does not drive runPodEpochShadow admission.
+const RUN_LEAF_PROGRAM = `
+const [scratchUrl, rmUrl, uidUrl, tmpUrl, runId, stage] = process.argv.slice(1);
+const fs = await import("node:fs");
+const cp = await import("node:child_process");
+const scratch = await import(scratchUrl), rm = await import(rmUrl), ids = await import(uidUrl), rt = await import(tmpUrl);
+const out = { uid: process.getuid() };
+const layout = scratch.scratchLayout(process.env);
+out.layout = layout.mode;
+const leaf = "run-" + runId;
+if (stage === "prepare") {
+  out.prepared = await rt.prepareRunTmpdir(runId);
+  console.log(JSON.stringify(out)); process.exit(0);
+}
+const pin = scratch.pinScratchRoot(layout);
+if ("refused" in pin) { out.refused = pin.refused; console.log(JSON.stringify(out)); process.exit(0); }
+const raw = await rm.censusScratchRoot(layout.root, pin.devIno, undefined, 60000);
+const parsed = scratch.parseScratchCensus(raw, pin.devIno);
+const entry = "refused" in parsed ? undefined : parsed.entries.find(e => e.name === leaf);
+out.entry = entry ? { name: entry.name, type: entry.type, uid: entry.uid, foreign: entry.foreignUid, incomplete: entry.incomplete } : null;
+if (entry) {
+  const lim = rm.SCRATCH_DELETE_LIMITS;
+  const w = ids.runnerCommand(process.execPath, ["-e", rm.PINNED_SUBTREE_SCRIPT, layout.root, leaf, String(lim.maxEntries),
+    String(lim.budgetMs), "remove", entry.devIno, "", "pinned", pin.devIno, "1", String(lim.maxDepth)]);
+  const r = cp.spawnSync(w.command, w.args, { env: { PATH: "/usr/bin:/bin" }, cwd: "/", encoding: "utf8", timeout: 60000 });
+  out.delete = { status: r.status, stdout: r.stdout, expect: entry.devIno };
+}
+console.log(JSON.stringify(out));
+`;
+
+type RunLeafCase = { name: string; split: boolean; root: string; rootMode: number; ownerUid: number; tmpdir: string };
+const RUN_LEAF_CASES: Record<"split" | "single0755" | "single3775", RunLeafCase> = {
+  split: { name: "split", split: true, root: "/data/runner/.tmp/uzi-runner", rootMode: 0o700, ownerUid: 10002, tmpdir: "/data/runner/.tmp/uzi-worker" },
+  single0755: { name: "single 0755", split: false, root: "/data/runner/.tmp", rootMode: 0o755, ownerUid: 10001, tmpdir: "/data/runner/.tmp" },
+  single3775: { name: "single 03775", split: false, root: "/data/runner/.tmp", rootMode: 0o3775, ownerUid: 10001, tmpdir: "/data/runner/.tmp" },
+};
+
+async function runLeafProof(c: RunLeafCase) {
+    assert.equal(process.platform, "linux", "image proof requires Linux; never skip");
+    assert.equal(process.getuid!(), 0, "image proof requires the shared root window");
+    const runId = randomUUID(), name = `run-${runId}`;
+    for (const [dir, mode] of [["/data/runner", 0o3775], ["/data/runner/.tmp", c.split ? 0o755 : c.rootMode],
+      ["/data/runner/.tmp/uzi-worker", 0o700], ["/data/runner/.tmp/uzi-runner", 0o700]] as const) {
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      // Reclaim before chmod: this image intentionally has no FOWNER.
+      fs.chownSync(dir, 0, 0); fs.chmodSync(dir, mode);
+      const runner = dir === "/data/runner/.tmp/uzi-runner";
+      fs.chownSync(dir, runner ? 10002 : 10001, runner ? 10002 : 10001);
+    }
+    const leafDir = path.join(c.root, name);
+    fs.rmSync(leafDir, { recursive: true, force: true });
+    try {
+      const url = (relative: string) => new URL(relative, import.meta.url).href;
+      const env: Record<string, string> = { PATH: "/usr/local/bin:/usr/bin:/bin", TSX_DISABLE_CACHE: "1", TMPDIR: c.tmpdir };
+      if (c.split) { env.UZI_UID_SPLIT = "1"; env.UZI_RUNNER_TMPDIR = c.root; }
+      const asWorker = (stage: string) => {
+        const worker = spawnSync("/bin/setpriv", ["--reuid", "worker", "--regid", "worker", "--init-groups",
+          "--bounding-set", "-all,+setuid,+setgid", "--inh-caps", "-all,+setuid,+setgid", "--ambient-caps", "-all,+setuid,+setgid", "--",
+          process.execPath, "--import", loader, "--input-type=module", "-e", RUN_LEAF_PROGRAM,
+          url("../../agent/src/pod-epoch-scratch.ts"), url("../../agent/src/rmtree.ts"), url("../../agent/src/runner-uid.ts"),
+          url("../../agent/src/run-tmpdir.ts"), runId, stage], { env, encoding: "utf8", timeout: 80000 });
+        assert.equal(worker.status, 0, worker.stderr);
+        const out = JSON.parse(worker.stdout.trim().split("\n").at(-1)!);
+        assert.equal(out.uid, 10001, "the pass runs as the worker");
+        assert.equal(out.layout, c.split ? "split" : "single");
+        return out;
+      };
+      // The root-window test process (root with DAC_OVERRIDE) reads the leaf the worker cannot stat in a 0700 runner root.
+      const first = asWorker("prepare");
+      assert.deepEqual(first.prepared, { dir: leafDir }, JSON.stringify(first.prepared));
+      const st = fs.lstatSync(leafDir);
+      assert.equal(st.isDirectory(), true);
+      assert.equal(st.uid, c.ownerUid, "the leaf is owned by the layout owner");
+      assert.equal(st.mode & 0o7777, 0o700, "the mode is exactly 0700 (setgid cleared)");
+      const second = asWorker("prepare");
+      assert.deepEqual(second.prepared, { dir: leafDir }, "a second call reuses the leaf");
+      assert.equal(fs.lstatSync(leafDir).ino, st.ino, "the second call adopts the same directory");
+      const out = asWorker("census-delete");
+      assert.equal(out.refused, undefined, out.refused);
+      assert.deepEqual(out.entry, { name, type: "dir", uid: c.ownerUid, foreign: false, incomplete: false }, "the census lists the run leaf");
+      assert.equal(out.delete.status, 0, JSON.stringify(out.delete));
+      assert.equal(out.delete.stdout, `UZI-SCRATCH-REMOVED ${out.delete.expect}\n`);
+      assert.equal(fs.existsSync(leafDir), false, "the strict delete removed the run leaf");
+    } finally { fs.rmSync(leafDir, { recursive: true, force: true }); }
+}
+
+test("pod epoch real split: the run TMPDIR leaf is runner-owned 0700, reused, listed by the census and strictly deleted", { timeout: 90000 }, async () => {
+  await runLeafProof(RUN_LEAF_CASES.split);
+});
+test("pod epoch real single 0755 root: the run TMPDIR leaf is worker-owned 0700, reused, listed by the census and strictly deleted", { timeout: 90000 }, async () => {
+  await runLeafProof(RUN_LEAF_CASES.single0755);
+});
+test("pod epoch real single 03775 root: the run TMPDIR leaf is worker-owned 0700 with setgid cleared, reused, listed by the census and strictly deleted", { timeout: 90000 }, async () => {
+  await runLeafProof(RUN_LEAF_CASES.single3775);
+});

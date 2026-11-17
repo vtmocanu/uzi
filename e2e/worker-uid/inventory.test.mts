@@ -402,6 +402,9 @@ const epochTitles = [
   "pod epoch private API CA survives both real UID launch chains without relaxing preload refusal",
   "pod epoch restores observable persistent worker and runner scratch in both UID modes and refuses invalid saved paths",
   "pod epoch real split: the worker pins the runner scratch root, the runner-uid census reads it and the strict delete removes a leaf",
+  "pod epoch real split: the run TMPDIR leaf is runner-owned 0700, reused, listed by the census and strictly deleted",
+  "pod epoch real single 0755 root: the run TMPDIR leaf is worker-owned 0700, reused, listed by the census and strictly deleted",
+  "pod epoch real single 03775 root: the run TMPDIR leaf is worker-owned 0700 with setgid cleared, reused, listed by the census and strictly deleted",
 ];
 test("pod epoch inventory independently requires every literal image proof and keeps other lanes unchanged", () => {
   const scratch = mkdtempSync(path.join(repo, ".uzi/scratch/epoch-inventory."));
