@@ -1142,6 +1142,48 @@ export interface ToolAllowlistEntry {
   updated_at: string;
 }
 
+// Per-repo run environment variables (PRD #4416 M1). A secret's value is never
+// returned: `value` is null for it. A plain value is null only while the vault is
+// locked (`value_withheld`).
+export type RunEnvState = "enabled" | "disabled" | "pending_deletion";
+
+export interface RunEnvVar {
+  name: string;
+  secret: boolean;
+  description: string;
+  value: string | null;
+  value_withheld: boolean;
+  state: RunEnvState;
+  rev: number;
+  disabled_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface RunEnvCounts {
+  total: number;
+  disabled: number;
+  pending_deletion: number;
+  limit: number;
+}
+
+export interface RunEnvList {
+  variables: RunEnvVar[];
+  counts: RunEnvCounts;
+  vault_locked: boolean;
+}
+
+/** Write body: every field optional; an omitted value keeps the stored one. */
+export interface RunEnvWriteInput {
+  value?: string;
+  secret?: boolean;
+  description?: string;
+}
+
+export interface RunEnvDeleteResult {
+  state: "deleted" | "pending_deletion";
+}
+
 export interface ToolAllowlistWriteInput {
   name?: string; // create only; ignored on update
   pinned_version?: string;

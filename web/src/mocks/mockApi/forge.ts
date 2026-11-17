@@ -8,6 +8,10 @@ import type {
   PrivilegeReport,
   ProjectSyncOwnerKind,
   ProjectSyncStatus,
+  RunEnvDeleteResult,
+  RunEnvList,
+  RunEnvVar,
+  RunEnvWriteInput,
   ToolAllowlistEntry,
   ToolAllowlistWriteInput,
 } from "../../lib/api";
@@ -124,6 +128,44 @@ const repoToolProfiles = new Map<string, string[]>(
   Object.entries(mockRepoToolProfiles).map(([k, v]) => [k, [...v]]),
 );
 let toolEntryCounter = 0;
+
+// Per-repo run environment variables (PRD #4416 M1). Rows carry no value; plain
+// values live beside them, as the real store keeps them sealed.
+const ENV_LIMIT = 50;
+const envStore = new Map<string, RunEnvVar[]>();
+const envValues = new Map<string, string>();
+
+function requireRepo(repoId: string) {
+  if (!repos.some((r) => r.id === repoId)) throw new ApiError(404, "repo not found");
+}
+function envRuleError(field: string, rule: string) {
+  return new ApiError(422, `${field}: ${rule}`, { error: `${field}: ${rule}`, field, rule });
+}
+function envView(repoId: string, v: RunEnvVar): RunEnvVar {
+  return { ...v, value: v.secret ? null : (envValues.get(`${repoId}/${v.name}`) ?? ""), value_withheld: false };
+}
+function envListFor(repoId: string): RunEnvList {
+  const rows = envStore.get(repoId) ?? [];
+  return {
+    variables: rows.map((v) => envView(repoId, v)),
+    counts: { total: rows.length, disabled: rows.filter((v) => v.state === "disabled").length, pending_deletion: 0, limit: ENV_LIMIT },
+    vault_locked: false,
+  };
+}
+function syncEnvCount(repoId: string) {
+  const n = (envStore.get(repoId) ?? []).length;
+  repos = repos.map((r) => (r.id === repoId ? { ...r, env_var_count: n } : r));
+}
+async function setEnvDisabled(repoId: string, name: string, disabled: boolean) {
+  requireRepo(repoId);
+  const rows = envStore.get(repoId) ?? [];
+  const cur = rows.find((v) => v.name === name);
+  if (!cur) throw new ApiError(404, "variable not found");
+  const now = new Date().toISOString();
+  const next: RunEnvVar = { ...cur, state: disabled ? "disabled" : "enabled", disabled_at: disabled ? now : null, updated_at: now };
+  envStore.set(repoId, rows.map((v) => (v.name === name ? next : v)));
+  return delay({ variable: envView(repoId, next) });
+}
 
 // issue #1432: the pending member override-request queue, mutated by the member
 // requestGuardrailOverride and the admin approve/reject below, and surfaced by
@@ -554,6 +596,57 @@ export const forgeApi = {
     const cleaned = [...new Set(packages)].sort();
     repoToolProfiles.set(repoId, cleaned);
     return delay({ packages: cleaned });
+  },
+  // Per-repo run environment variables (PRD #4416 M1). Same contract as the real API
+  // (a secret's value is never returned; 422 names the field and rule; 409 at the
+  // limit) except that a delete always drops the row: the mock has no run receipts,
+  // so the 202 pending-deletion path never occurs.
+  listRepoEnv: async (repoId: string): Promise<RunEnvList> => {
+    requireRepo(repoId);
+    return delay(envListFor(repoId));
+  },
+  putRepoEnv: async (repoId: string, name: string, input: RunEnvWriteInput) => {
+    requireRepo(repoId);
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+      throw envRuleError("name", "must start with a letter or underscore and use only letters, digits and underscores");
+    }
+    const rows = envStore.get(repoId) ?? [];
+    const cur = rows.find((v) => v.name === name);
+    const secret = input.secret ?? cur?.secret ?? true;
+    const now = new Date().toISOString();
+    const needsValue = !cur || input.value !== undefined || (cur.secret && !secret);
+    if (needsValue && input.value === undefined) {
+      throw envRuleError("value", cur ? "changing a secret to a plain value needs a new value in the same save" : "a value is required to create a variable");
+    }
+    if (input.value !== undefined && secret && input.value.length < 8) {
+      throw envRuleError("value", "a secret must be at least 8 characters");
+    }
+    if (!cur && rows.length >= ENV_LIMIT) {
+      throw new ApiError(409, "this repo is at its variable limit", { error: "this repo is at its variable limit", code: "env_limit_reached" });
+    }
+    const next: RunEnvVar = cur
+      ? { ...cur, secret, description: input.description ?? cur.description, updated_at: now }
+      : { name, secret, description: input.description ?? "", value: null, value_withheld: false, state: "enabled", rev: 1, disabled_at: null, created_at: now, updated_at: now };
+    if (input.value !== undefined) {
+      envValues.set(`${repoId}/${name}`, input.value);
+      next.rev = cur ? cur.rev + 1 : 1;
+    } else if (cur && secret !== cur.secret) {
+      next.rev = cur.rev + 1;
+    }
+    envStore.set(repoId, cur ? rows.map((v) => (v.name === name ? next : v)) : [...rows, next].sort((a, b) => a.name.localeCompare(b.name)));
+    syncEnvCount(repoId);
+    return delay({ variable: envView(repoId, next) });
+  },
+  disableRepoEnv: async (repoId: string, name: string) => setEnvDisabled(repoId, name, true),
+  enableRepoEnv: async (repoId: string, name: string) => setEnvDisabled(repoId, name, false),
+  deleteRepoEnv: async (repoId: string, name: string): Promise<RunEnvDeleteResult> => {
+    requireRepo(repoId);
+    const rows = envStore.get(repoId) ?? [];
+    if (!rows.some((v) => v.name === name)) throw new ApiError(404, "variable not found");
+    envStore.set(repoId, rows.filter((v) => v.name !== name));
+    envValues.delete(`${repoId}/${name}`);
+    syncEnvCount(repoId);
+    return delay({ state: "deleted" as const });
   },
   // Issue #4334: the admin repo-activity read, DERIVED from the shared repos state and the
   // mock runs like the real endpoint: every enabled repo plus every disabled repo with a

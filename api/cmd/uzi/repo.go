@@ -8,6 +8,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
@@ -85,8 +86,64 @@ func newRepoCmd(env Env, gf *globalFlags) *cobra.Command {
 	}
 	remove.Flags().BoolP("force", "f", false, "skip the confirmation prompt")
 
-	cmd.AddCommand(list, remove)
+	cmd.AddCommand(list, remove, newRepoEnvCmd(env, gf))
 	return cmd
+}
+
+// newRepoEnvCmd — `uzi repo env`. Read-only by design (PRD #4416): variables are
+// written in the web UI, where a secret's value is typed once and never shown again.
+func newRepoEnvCmd(env Env, gf *globalFlags) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "env",
+		Short: "Inspect a repository's run variables",
+	}
+	list := &cobra.Command{
+		Use:   "list <repo>",
+		Short: "List a repository's run variables (secret values are never shown)",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := env.client(gf)
+			if err != nil {
+				return err
+			}
+			out, err := c.ListRepoEnv(cmd.Context(), args[0])
+			if err != nil {
+				return err
+			}
+			p := env.printer(gf)
+			if p.Format == uzicli.FormatJSON {
+				return p.JSON(out)
+			}
+			rows := make([][]string, 0, len(out.Variables))
+			for _, v := range out.Variables {
+				kind := "plain"
+				if v.Secret {
+					kind = "secret"
+				}
+				rows = append(rows, []string{
+					sanitizeTTY(v.Name), kind, sanitizeTTY(v.State), runEnvValueCell(v),
+					sanitizeTTY(v.Description), v.UpdatedAt.UTC().Format("2006-01-02 15:04:05Z"),
+				})
+			}
+			return p.Table([]string{"NAME", "KIND", "STATE", "VALUE", "DESCRIPTION", "UPDATED"}, rows)
+		},
+	}
+	cmd.AddCommand(list)
+	return cmd
+}
+
+// runEnvValueCell is the VALUE column: a secret never shows a value, a plain value
+// the server withheld (vault locked) says so, otherwise the user-authored value,
+// terminal-sanitized.
+func runEnvValueCell(v apitypes.RunEnvVarDTO) string {
+	switch {
+	case v.Secret:
+		return "(secret)"
+	case v.ValueWithheld || v.Value == nil:
+		return "(vault locked)"
+	default:
+		return sanitizeTTY(*v.Value)
+	}
 }
 
 // confirmRemoveRepo prompts on stderr and reads a single line from stdin, returning

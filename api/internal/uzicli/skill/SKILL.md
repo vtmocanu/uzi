@@ -1894,6 +1894,11 @@ into `file`/`dismiss`/`resolve`. `undo` keys on the `disposition_id` field (read
   repo's board and run history, so it prompts `[y/N]` unless you pass
   `--force`/`-f`. A repo the bot can still see reappears (disabled) on the next
   projects refresh; to keep it out, remove the bot's forge access first.
+  `uzi repo env list <repo>` — the repo's run variables (PRD #4416), **read-only**:
+  NAME, KIND (`secret`|`plain`), STATE, VALUE, DESCRIPTION, UPDATED; `--json` dumps the
+  full list with counts and `vault_locked`. A secret's value is never shown
+  (`(secret)`), and a plain value reads `(vault locked)` while the owner's vault is
+  locked. Variables are written in the web UI only; the CLI has no write verb.
 - `uzi admin users|runs|workers|health|usage|rate-limits|cli-tokens|guardrail-impact` and
   `uzi admin agent-source get|status` —
   **read-only** factory-wide views. These require an admin-scoped (`uza_`) token; a
