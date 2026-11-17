@@ -409,7 +409,7 @@ control is still absent, not that the functional criterion was deferred.
 | Stale captured summary revision remains refused | B4 |
 | Now raw drain before executor suspension | C1 in earlier record |
 | A reconciliation before strict persistence | C2 in earlier record |
-| Explicit owner Codex request, target ownership/kind and live-status admission | Unvalidated |
+| Explicit owner Codex request, target ownership/kind and live-status admission | A4 credits request availability in four live statuses only; negative admission, target ownership/kind and policy controls remain unvalidated |
 | Same successful flight/generation/worktree with no new attempt, custody or release/reclaim | Positive assertions present; independent preservation/control accounting unvalidated |
 | Strict usable persistence, clear confirmation and continuation on A before teardown | R1–R4 below credit three failed-save/inspection variants and empty applied-ACK only; other clauses unvalidated |
 | Proven A root/tool reap before B material, login and model work; fresh CODEX_HOME | R5 credits unproven registered root pre-apply only; tool-only, other modes/phases and HOME clauses unvalidated |
@@ -1484,3 +1484,61 @@ establish the second authorization pass's timing, concurrent revoke safety,
 apply atomicity, random mint quality, other credential operations or real
 provider behavior. The broader transaction/rebinding clauses and m3/m4 remain
 incomplete; full suites and m4 security gates are not credited here.
+
+
+### A4 — authenticated live owner-request availability
+
+Candidate 21012454b1f03cf20782864392962d7f185316d3. Class (a): restore the
+exact historical refusal path by removing only SetRunCredential's three-line
+Codex dispatch at run_credential.go:186–188. The unchanged validator then
+rejects Codex. Exact baseline commands:
+
+```sh
+git show a233883de3c36bae2e940f999cd9d582889dad00:api/internal/workersvc/run_credential.go
+git show a233883de3c36bae2e940f999cd9d582889dad00:api/internal/workersvc/credential_override.go
+```
+
+Baseline run_credential.go:185–190 calls validateCredentialOverride before
+status dispatch; credential_override.go:202–205 contains the harnessCodex
+branch returning ErrCredentialOverrideHarnessUnsupported. That validator
+branch is still present; the control changes no validator or refusal mapping.
+
+TestWorkerCodexOwnerLiveRequestRouteLiveDB exercises running,
+awaiting_approval, awaiting_input and awaiting_followup independently through
+real CLI Bearer authentication and the owner credential route. It first
+withdraws seeded X through the actual worker route, then requests B and checks
+a fresh operation, generation and target snapshot. Complete run comparisons
+permit only the ten pending-switch fields enumerated in the test; both journals,
+messages, inputs and custody snapshots stay identical. These are positive
+preservation assertions, not separate sensitivity credit for every field.
+
+The original d4b3bb2c0 control failed in setup: setupStoppedGuardsRoute called
+SetRunCredential before the HTTP request. Its logs uDDCr1/7lWFqQ/aUWks2 and
+owner-request-results.json remain recorded, but that setup-red receives no
+class (a) credit. Review identified this mandatory defect. Fix 21012454b adds
+an independent pending seed using the two real store queries in a transaction,
+with actual B material revision and normal operation-ID trigger; existing
+helper callers retain the original service path. Preflight, withdrawal and
+the owner request remain actual routes. Scoped fix review found no new findings.
+
+Corrected receipt: .uzi/scratch/owner-request-fixed-results.json; orchestration:
+owner-request-fixed-control.py in the same scratch directory. Each command is
+serial from api: GOFLAGS=-p=1 GOMAXPROCS=4 go test -buildvcs=false -race
+-count=1 -json -timeout=4m ./internal/handler -run <pattern>. Before/after select
+both exact TestWorkerCodexOwnerLiveRequestRouteLiveDB and
+TestWorkerCodexStoppedSwitchJournalRouteLiveDB; mutant selects only the owner
+test. Logs under .uzi/scratch/: gate-log.qKnKYY before exit 0;
+gate-log.EsWdnN mutant exit 1; gate-log.29NkvH after exit 0. Both greens execute
+all four owner leaves plus the original-helper journal companion without skips.
+Every mutant leaf fails at owner test :77 with HTTP 422 rather than 200, not
+setup, compilation or SQL failure. The lead parsed the raw actions and four
+assertion frames, recomputed log hashes and reconstructed the exact one-block
+mutant hash from candidate source. Cheap pre-commit checks: gofmt and git diff
+--check HEAD. The single export was removed before final green; owned PostgreSQL
+cleanup exited 0, primary fingerprints are unchanged and the invalid prior
+receipt is retained unchanged. No installs or base builds occurred.
+
+Credit is only authenticated request availability in these four live states.
+Negative statuses, wrong owners/targets, policy fences, transaction safety and
+other m3 requirements remain unvalidated unless separately credited above.
+No full suite or m4 security gate is claimed; m3/m4 are incomplete.

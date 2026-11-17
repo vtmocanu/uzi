@@ -812,3 +812,22 @@ All owned fixture cleanup exits are 0; exports are absent and the full tracked
 fingerprint is unchanged. Source review a15d986e0..ce54d754a found no findings.
 No pre-apply A-release positive, concurrent reauthorization proof, full suite
 or security gate is claimed. Other m3/m4 requirements remain incomplete.
+
+
+## Authenticated owner-request historical control
+
+A4 at 21012454b1f03cf20782864392962d7f185316d3 restores a233's Codex
+refusal by removing only the new service dispatch branch. Independent fixture
+seeding prevents that mutation from failing before the real authenticated owner
+route. All four live statuses are assertion-red at HTTP 422 versus 200; unchanged
+before/after pass those four cases and the original-helper journal companion.
+
+Corrected scratch receipt owner-request-fixed-results.json records exact diff,
+hashes, commands and cleanup. Logs qKnKYY/EsWdnN/29NkvH exit 0/1/0 with no skips.
+Runs use one handler package, -race -count=1 -json -timeout=4m, p=1 and GMP4.
+The earlier 7lWFqQ setup-red is explicitly invalid, retained without credit.
+Review found the setup defect; scoped repair review found no new findings.
+Lead spot-checks verified actual HTTP assertion frames and reconstructed the
+mutant hash. Export removed, owned fixture cleanup exit 0, primary unchanged.
+Only request availability is credited; preservation checks are positive evidence.
+Negative admission/ownership/policy controls and broader m3/m4 remain pending.
