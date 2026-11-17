@@ -411,9 +411,37 @@ describe("setgid runner root", () => {
     await c.retireRunnerClone(s.bare, s.clonePath, s.branch, s.owner, { discard: true, attemptId: ATTEMPT, dispositionClass: "owner_terminal" });
     const [parent] = parents();
     assert.ok(parent, "the retire kept a bound scratch parent");
-    // This is exactly the mode discardRetireScratchParent's preflight compares against (wrong_mode otherwise);
-    // driving that discard needs a pod-epoch scope and is covered by the real-image lane.
     assert.equal(fs.statSync(path.join(runnerRoot(), parent)).mode & 0o7777, 0o700);
+    // The discard preflight accepts the production-made parent: every posture/identity check (wrong_mode included) passes
+    // and the call stops only at the effect gate, which refuses here so nothing is launched or deleted.
+    const parentPath = path.join(runnerRoot(), parent);
+    const rootFd = fs.openSync(runnerRoot(), fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
+    const prevSplit = process.env.UZI_UID_SPLIT;
+    process.env.UZI_UID_SPLIT = "1";
+    try {
+      const mntId = /^mnt_id:\s+(\d+)$/m.exec(fs.readFileSync(`/proc/self/fdinfo/${rootFd}`, "utf8"))![1]!;
+      let stopped = false;
+      const scope = {
+        assertExclusive() { if (stopped) throw new Error("stopped"); },
+        beginMutation() { return { settle() {} }; },
+        inheritStdio(stdio: unknown[] = ["pipe", "pipe", "pipe"]) { return stdio; },
+        stop() { stopped = true; }, stopped() { return stopped; },
+      };
+      let gateReached = false;
+      const result = await c.discardRetireScratchParent({
+        scope: scope as never, root: runnerRoot(), rootPin: rootFd, rootDev: String(fs.statSync(runnerRoot(), { bigint: true }).dev),
+        rootMntId: mntId, parentName: parent, parentIno: String(fs.statSync(parentPath, { bigint: true }).ino),
+        cloneIno: String(fs.statSync(path.join(parentPath, "clone"), { bigint: true }).ino), live: () => {},
+        beforeEffect: async () => { gateReached = true; throw new Error("test: stop before any effect"); },
+        signal: new AbortController().signal, deadline: Date.now() + 600_000, maxEntries: 1000, maxDepth: 64,
+      });
+      assert.deepEqual(result, { kind: "refused", reason: "not_live" }, "preflight passed (never wrong_mode); stopped at the effect gate");
+      assert.equal(gateReached, true, "the effect gate was reached");
+      assert.equal(fs.existsSync(path.join(parentPath, "clone")), true, "nothing was deleted");
+    } finally {
+      if (prevSplit === undefined) delete process.env.UZI_UID_SPLIT; else process.env.UZI_UID_SPLIT = prevSplit;
+      fs.closeSync(rootFd);
+    }
   });
 });
 
