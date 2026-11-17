@@ -435,6 +435,13 @@ func (l *Loop) report(ctx context.Context, observed []ObservedWorker, desired []
 	}); ok {
 		outcomes = source.PacingOutcomes()
 	}
+	// Display-only roll marker evidence (issue #4385); attached only to rows emitted below.
+	var markers map[string]*protocol.RollMarker
+	if source, ok := l.materializer.(interface {
+		RollMarkerReports() map[string]*protocol.RollMarker
+	}); ok {
+		markers = source.RollMarkerReports()
+	}
 	workers := make([]protocol.WorkerStatus, 0, len(observed))
 	reported := make(map[string]bool, len(observed))
 	// A worker that is preparing to hibernate or is hibernated has no pod on purpose;
@@ -457,6 +464,7 @@ func (l *Loop) report(ctx context.Context, observed []ObservedWorker, desired []
 		reported[o.ID] = true
 		workers = append(workers, protocol.WorkerStatus{
 			Pacing:            outcomes[o.ID],
+			RollMarker:        markers[o.ID],
 			ID:                o.ID,
 			Phase:             o.Roll.Phase,
 			PhaseSince:        timePtr(o.Roll.PhaseSince),
@@ -481,7 +489,7 @@ func (l *Loop) report(ctx context.Context, observed []ObservedWorker, desired []
 		}
 		reported[w.ID] = true
 		workers = append(workers, protocol.WorkerStatus{
-			ID: w.ID, Phase: protocol.PhaseRolling, TargetImage: pacing.TargetImage, Pacing: pacing,
+			ID: w.ID, Phase: protocol.PhaseRolling, TargetImage: pacing.TargetImage, Pacing: pacing, RollMarker: markers[w.ID],
 		})
 	}
 	report := protocol.StatusReport{

@@ -1774,8 +1774,12 @@ effect on the next request. Each newly authorized cross-user read writes one aud
   api.adminRunDebug.enabled) and an admin_ro (uza_) token` on stderr, at most once per command.
   `uzi run recovery <run-id>` prints it only when you hold nothing on the run and one of its per-run
   reads (the run's holds or its capture metadata) returns 404, the answer a refused foreign read
-  gets; its other per-run read failures (401, 403, server errors) stay silent and leave the normal
-  empty result with exit 0, and a cancelled or timed-out read fails the command. The CLI cannot tell
+  gets. Other per-run read failures (401, 403, server errors) stay silent with exit 0. A failed
+  scoped-holds read can still show captures from a successful archives read that the server marked
+  as an admin debug read; the result is empty only when neither read supplies admissible data.
+  A cancelled or expired command context fails the command. A read that hits the 30-second HTTP
+  client timeout while the context is still active follows the other per-run failures: it stays
+  silent with exit 0. The CLI cannot tell
   a refusal from a missing run or an expired token, so the hint is advisory. It never changes the
   exit code: commands that fail on the error still fail with it. When one of your own holds lists
   the run, `run recovery <run-id>` prints no hint (a hold can outlive its run), and with `--json` a
@@ -3098,6 +3102,24 @@ cordon keeps its ` · cordoned (manual)` marker after the state.
 `wake_requested_at` and `wake_error`, and `hibernation_cleanup` (`{state, outcome, reason}`, the
 [cache cleanup](hosted-workers.md#cache-cleanup-before-sleep) before sleep). `uzi tui` shows the state too. There is no
 write verb: hibernating and waking are web-only admin actions.
+
+`--json` also carries the automatic pass's last recorded blocker as
+`hibernation_blocked_reason`, `hibernation_blocked_since` and `hibernation_blocked_at`
+(each null when unset; the same scoping as `hibernation_reason`), and, for a hosted worker,
+the display-only `roll_marker`. After the table, `uzi worker list`, `uzi worker get` and
+`uzi admin workers` print, when set:
+
+```text
+Hibernation blocker (last recorded) worker <id>: <label> (since <RFC3339>, last observed <RFC3339>)
+Roll marker worker <id>: <state> · canary · completed · target <v> · group <g> · reservation · blocked: <text> · observed <RFC3339>
+```
+
+The blocker line is the last recorded blocker, not the current state: it is not cleared
+when the worker returns to work. In the roll marker line only the state is always shown;
+`canary`, `completed`, `target`, `group`, `reservation`, `blocked` and `observed` appear
+only when set. See
+[Diagnosing a blocked hibernation or a stuck roll](hosted-workers.md#diagnosing-a-blocked-hibernation-or-a-stuck-roll)
+for the fields and the `unknown`, `unavailable` and `absent` states.
 
 `uzi run get` gains four rows, each emitted only when the server has
 something to say:

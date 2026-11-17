@@ -25,7 +25,8 @@ INSERT INTO worker_upgrade_reports (
     worker_id, phase, phase_since, target_image, pod_phase,
     blocking_container, blocking_reason, restart_count, last_exit_code, blocking_kind,
     controller_reported_at, observed_at, upgrading_since,
-    poll_interval_seconds, worker_image_tag, pacing, pacing_observed_at
+    poll_interval_seconds, worker_image_tag, pacing, pacing_observed_at,
+    roll_marker, roll_marker_observed_at
 )
 SELECT
     w.id, @phase, sqlc.narg('phase_since'), sqlc.narg('target_image'), sqlc.narg('pod_phase'),
@@ -73,12 +74,17 @@ SELECT
     sqlc.narg('poll_interval_seconds'), sqlc.narg('worker_image_tag'),
     CASE WHEN @update_pacing::boolean THEN sqlc.narg('pacing')::jsonb ELSE NULL END,
     CASE WHEN @update_pacing::boolean AND sqlc.narg('pacing')::jsonb IS NOT NULL
+         THEN @observed_at::timestamptz ELSE NULL END,
+    CASE WHEN @update_roll_marker::boolean THEN sqlc.narg('roll_marker')::jsonb ELSE NULL END,
+    CASE WHEN @update_roll_marker::boolean AND sqlc.narg('roll_marker')::jsonb IS NOT NULL
          THEN @observed_at::timestamptz ELSE NULL END
 FROM workers w
 WHERE w.id = @worker_id AND w.kind = 'hosted'
 ON CONFLICT (worker_id) DO UPDATE SET
     pacing = CASE WHEN @update_pacing::boolean THEN EXCLUDED.pacing ELSE worker_upgrade_reports.pacing END,
     pacing_observed_at = CASE WHEN @update_pacing::boolean THEN EXCLUDED.pacing_observed_at ELSE worker_upgrade_reports.pacing_observed_at END,
+    roll_marker = CASE WHEN @update_roll_marker::boolean THEN EXCLUDED.roll_marker ELSE worker_upgrade_reports.roll_marker END,
+    roll_marker_observed_at = CASE WHEN @update_roll_marker::boolean THEN EXCLUDED.roll_marker_observed_at ELSE worker_upgrade_reports.roll_marker_observed_at END,
     phase                  = EXCLUDED.phase,
     phase_since            = EXCLUDED.phase_since,
     target_image           = EXCLUDED.target_image,

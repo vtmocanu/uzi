@@ -53,6 +53,7 @@ const listAutoHibernationBlockers = `-- name: ListAutoHibernationBlockers :many
 WITH idle AS (
     SELECT w.id, w.name, a.anchor::timestamptz AS anchor,
            w.hibernation_blocked_reason::text AS reason,
+           COALESCE(w.hibernation_reason, '')::text AS controller_reason,
            GREATEST(w.hibernation_blocked_since, a.anchor)::timestamptz AS since
     FROM workers w
     CROSS JOIN LATERAL (
@@ -88,14 +89,14 @@ WITH idle AS (
       AND p.status_since <= $2::timestamptz
 ), blockers AS (
     SELECT 'idle'::text AS kind, 0 AS kind_order, i.id, i.name, i.anchor AS sort_at, i.anchor,
-           i.reason, i.since, NULL::uuid AS run_id, NULL::text AS status
+           i.reason, i.controller_reason, i.since, NULL::uuid AS run_id, NULL::text AS status
     FROM idle i
     UNION ALL
     SELECT 'parked'::text, 1, k.id, k.name, k.since, NULL::timestamptz,
-           ''::text, k.since, k.run_id, k.status
+           ''::text, ''::text, k.since, k.run_id, k.status
     FROM parked k
 )
-SELECT b.kind, b.id, b.name, b.anchor, b.reason, b.since, b.run_id, b.status,
+SELECT b.kind, b.id, b.name, b.anchor, b.reason, b.controller_reason, b.since, b.run_id, b.status,
        (count(*) OVER ())::bigint AS total,
        (min(b.since) OVER ())::timestamptz AS oldest_since
 FROM blockers b
@@ -109,16 +110,17 @@ type ListAutoHibernationBlockersParams struct {
 }
 
 type ListAutoHibernationBlockersRow struct {
-	Kind        string             `json:"kind"`
-	ID          uuid.UUID          `json:"id"`
-	Name        string             `json:"name"`
-	Anchor      pgtype.Timestamptz `json:"anchor"`
-	Reason      string             `json:"reason"`
-	Since       pgtype.Timestamptz `json:"since"`
-	RunID       pgtype.UUID        `json:"run_id"`
-	Status      pgtype.Text        `json:"status"`
-	Total       int64              `json:"total"`
-	OldestSince pgtype.Timestamptz `json:"oldest_since"`
+	Kind             string             `json:"kind"`
+	ID               uuid.UUID          `json:"id"`
+	Name             string             `json:"name"`
+	Anchor           pgtype.Timestamptz `json:"anchor"`
+	Reason           string             `json:"reason"`
+	ControllerReason string             `json:"controller_reason"`
+	Since            pgtype.Timestamptz `json:"since"`
+	RunID            pgtype.UUID        `json:"run_id"`
+	Status           pgtype.Text        `json:"status"`
+	Total            int64              `json:"total"`
+	OldestSince      pgtype.Timestamptz `json:"oldest_since"`
 }
 
 // fleet.hibernation (admin health): idle persistent hosted workers the automatic pass cannot
@@ -134,7 +136,9 @@ type ListAutoHibernationBlockersRow struct {
 // reason can predate the current idle episode), for parked the oldest parked run's
 // status_since. total is the exact number of matching workers and oldest_since the true oldest
 // since, both across the whole window, not the LIMIT rows. Order: idle first (anchor, id), then
-// parked (status_since, id). @cutoff comes from Go (the injectable clock).
+// parked (status_since, id). controller_reason is the controller's refusal code (the worker's
+// hibernation_reason, set when the controller refused) for an idle row, ” for a parked one.
+// @cutoff comes from Go (the injectable clock).
 func (q *Queries) ListAutoHibernationBlockers(ctx context.Context, arg ListAutoHibernationBlockersParams) ([]ListAutoHibernationBlockersRow, error) {
 	rows, err := q.db.Query(ctx, listAutoHibernationBlockers, arg.MaxRows, arg.Cutoff)
 	if err != nil {
@@ -150,6 +154,7 @@ func (q *Queries) ListAutoHibernationBlockers(ctx context.Context, arg ListAutoH
 			&i.Name,
 			&i.Anchor,
 			&i.Reason,
+			&i.ControllerReason,
 			&i.Since,
 			&i.RunID,
 			&i.Status,

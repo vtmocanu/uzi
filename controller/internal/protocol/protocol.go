@@ -301,7 +301,10 @@ const (
 // exactly what the golden's settled worker exists to catch.
 type WorkerStatus struct {
 	Pacing *Pacing `json:"pacing,omitempty"`
-	ID     string  `json:"id"`
+	// RollMarker is display-only evidence of the retained image-roll reservation
+	// (issue #4385). It never feeds roll or hibernation decisions.
+	RollMarker *RollMarker `json:"roll_marker,omitempty"`
+	ID         string      `json:"id"`
 	// Phase is the closed enum rolling|stuck|settled. The api validates rather than
 	// sanitizes it, and DROPS an entry carrying anything else rather than rejecting
 	// the whole report — one garbage row must not blind the fleet.
@@ -320,6 +323,31 @@ type WorkerStatus struct {
 	BlockingKind      *string `json:"blocking_kind,omitempty"`
 	RestartCount      int32   `json:"restart_count"`
 	LastExitCode      *int32  `json:"last_exit_code"`
+}
+
+// RollMarker states.
+const (
+	RollMarkerPresent     = "present"
+	RollMarkerUnreadable  = "unreadable"
+	RollMarkerAbsent      = "absent"
+	RollMarkerUnavailable = "unavailable"
+)
+
+// RollMarker is a display-only summary of the controller's retained
+// uzi.dev/image-roll evidence (issue #4385). It never carries the raw annotation,
+// nonce, hash, image or owner id.
+type RollMarker struct {
+	State         string `json:"state"`
+	Canary        bool   `json:"canary,omitempty"`
+	Completed     bool   `json:"completed,omitempty"`
+	TargetVersion string `json:"target_version,omitempty"`
+	// CoverageGroup is 16 lowercase hex characters of sha256(coverage key).
+	CoverageGroup string `json:"coverage_group,omitempty"`
+	Reservation   bool   `json:"reservation"`
+	// Blocked is the roll entry's blocker as of the end of roll planning, so it
+	// includes blockers assigned after the snapshot. A pass-2 failure recorded only on
+	// the pacing outcome appears in the next tick's report.
+	Blocked *string `json:"blocked,omitempty"`
 }
 
 // DindMaintenance binds controller transitions to one operation and incarnation.

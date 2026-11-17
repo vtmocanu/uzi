@@ -5431,7 +5431,10 @@ func TestDeleteWorkerNotFoundWhenNoRowDeleted(t *testing.T) {
 }
 
 // PRD #4206: a delete that matched no row because the worker's hibernation cache prune is
-// unsettled is a 409-class error, not a not-found; a settled or absent attempt stays not-found.
+// unsettled is a 409-class error, not a not-found. #4389: a PRESENT worker whose attempt is not
+// unsettled is retried once; when both attempts match no row (this static fake) the result is
+// the retryable ErrWorkerDeleteRaced, never a not-found. An absent worker stays not-found
+// (TestDeleteWorkerNotFoundWhenNoRowDeleted).
 func TestDeleteWorkerRefusedWhileCleanupUnsettled(t *testing.T) {
 	for _, tc := range []struct {
 		phase string
@@ -5440,8 +5443,8 @@ func TestDeleteWorkerRefusedWhileCleanupUnsettled(t *testing.T) {
 		{CleanupPhaseRequested, ErrWorkerHibernationCleanupUnsettled},
 		{CleanupPhaseStarted, ErrWorkerHibernationCleanupUnsettled},
 		{CleanupPhaseUnknown, ErrWorkerHibernationCleanupUnsettled},
-		{CleanupPhaseSettled, ErrWorkerNotFound},
-		{CleanupPhaseNone, ErrWorkerNotFound},
+		{CleanupPhaseSettled, ErrWorkerDeleteRaced},
+		{CleanupPhaseNone, ErrWorkerDeleteRaced},
 	} {
 		fs := &fakeStore{deleteWorkerRows: 0, deleteWorkerRow: &store.Worker{CleanupPhase: tc.phase}}
 		err := New(fs, newBox(t), testParams()).DeleteWorker(context.Background(), uuid.New(), uuid.New())

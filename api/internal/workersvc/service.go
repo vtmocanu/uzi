@@ -7829,21 +7829,64 @@ func (s *Service) WorkerProjectionForOwner(ctx context.Context, userID, workerID
 // could still need it. (The M1 live_worker_id ON DELETE RESTRICT FK is the fail-closed
 // backstop; this guard turns it into a clean, enumerated 409 instead of a raw
 // constraint 500.)
+//
+// #4389: a hibernation cache prune attempt can settle between a DELETE that matched no row and
+// the re-read. A present worker whose attempt is no longer unsettled is therefore retried once
+// through the WHOLE guarded delete (active runs, custody, then the DELETE), so a run or hold
+// that appeared meanwhile is refused exactly as on a first attempt. If the retry also matches
+// no row, the second re-read decides with no further retry: absent → ErrWorkerNotFound, a new
+// unsettled attempt → *WorkerHibernationCleanupUnsettledError, still present and settled (both
+// attempts lost a cleanup start/settle race) → ErrWorkerDeleteRaced (a retryable 409). A
+// lookup error other than not-found is returned unchanged.
 func (s *Service) DeleteWorker(ctx context.Context, userID, workerID uuid.UUID) error {
+	for attempt := 1; ; attempt++ {
+		n, err := s.deleteWorkerGuarded(ctx, userID, workerID)
+		if err != nil {
+			return err
+		}
+		if n > 0 {
+			break
+		}
+		cur, gerr := s.q.GetWorkerByIDForUser(ctx, store.GetWorkerByIDForUserParams{ID: workerID, UserID: userID})
+		if errors.Is(gerr, pgx.ErrNoRows) {
+			return ErrWorkerNotFound
+		}
+		if gerr != nil {
+			return gerr
+		}
+		if cleanupUnsettled(cur.CleanupPhase) {
+			return &WorkerHibernationCleanupUnsettledError{Phase: cur.CleanupPhase}
+		}
+		if attempt >= 2 {
+			return ErrWorkerDeleteRaced
+		}
+	}
+	// The worker is gone; drop its last-known outbox depth (PRD #1391 M5) so a
+	// removed worker's stale depth does not linger on the fleet view. In-memory and
+	// best-effort — the TTL prune is the backstop for any path that skips this.
+	s.outbox.evict(workerID)
+	s.quarantine.evictIfSet(workerID)
+	s.memAuthority.evictIfSet(workerID)
+	return nil
+}
+
+// deleteWorkerGuarded is one guarded delete attempt for DeleteWorker: the active-runs and
+// custody refusals, then the owner-scoped DELETE. It returns the deleted row count.
+func (s *Service) deleteWorkerGuarded(ctx context.Context, userID, workerID uuid.UUID) (int64, error) {
 	active, err := s.q.CountWorkerNonTerminalRuns(ctx, store.CountWorkerNonTerminalRunsParams{
 		WorkerID: pgconv.UUID(workerID), UserID: userID,
 	})
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if active > 0 {
 		rows, err := s.q.ListWorkerNonTerminalRuns(ctx, store.ListWorkerNonTerminalRunsParams{
 			WorkerID: pgconv.UUID(workerID), UserID: userID,
 		})
 		if err != nil {
-			return err
+			return 0, err
 		}
-		return &WorkerHasActiveRunsError{Runs: rows, Total: active}
+		return 0, &WorkerHasActiveRunsError{Runs: rows, Total: active}
 	}
 	// OWNER-SCOPED (userID): the count filters on user_id so a FOREIGN owner's held worker
 	// returns 0 here and falls through to the owner-scoped DeleteWorkerForUser → 404, instead
@@ -7854,7 +7897,7 @@ func (s *Service) DeleteWorker(ctx context.Context, userID, workerID uuid.UUID) 
 		UserID:   userID,
 	})
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if holds > 0 {
 		// #3921: name the blocking holds (same predicate as the count, capped). A listing
@@ -7864,30 +7907,13 @@ func (s *Service) DeleteWorker(ctx context.Context, userID, workerID uuid.UUID) 
 			UserID:   userID,
 		})
 		if err != nil {
-			return err
+			return 0, err
 		}
-		return &WorkerHasCustodyError{Holds: holds, List: list}
+		return 0, &WorkerHasCustodyError{Holds: holds, List: list}
 	}
 	// PRD #4206: an unsettled hibernation cache prune keeps its claim fence until settled, and the
 	// delete query repeats the predicate so a concurrent attempt cannot slip past this read.
-	n, err := s.q.DeleteWorkerForUser(ctx, store.DeleteWorkerForUserParams{ID: workerID, UserID: userID})
-	if err != nil {
-		return err
-	}
-	if n == 0 {
-		cur, gerr := s.q.GetWorkerByIDForUser(ctx, store.GetWorkerByIDForUserParams{ID: workerID, UserID: userID})
-		if gerr == nil && cleanupUnsettled(cur.CleanupPhase) {
-			return &WorkerHibernationCleanupUnsettledError{Phase: cur.CleanupPhase}
-		}
-		return ErrWorkerNotFound
-	}
-	// The worker is gone; drop its last-known outbox depth (PRD #1391 M5) so a
-	// removed worker's stale depth does not linger on the fleet view. In-memory and
-	// best-effort — the TTL prune is the backstop for any path that skips this.
-	s.outbox.evict(workerID)
-	s.quarantine.evictIfSet(workerID)
-	s.memAuthority.evictIfSet(workerID)
-	return nil
+	return s.q.DeleteWorkerForUser(ctx, store.DeleteWorkerForUserParams{ID: workerID, UserID: userID})
 }
 
 // CreateRun queues a manually-started run from a board card. The issue must be a

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Bound foreground capture and verify resource ownership before removal."""
+import errno
 import json
 import os
 from pathlib import Path
@@ -26,6 +27,25 @@ def signal_group(proc, sig):
         os.killpg(proc.pid, sig)
     except ProcessLookupError:
         pass
+    except PermissionError as denied:
+        if sys.platform != "darwin" or denied.errno != errno.EPERM:
+            raise
+        # Darwin can return EPERM after a successful KILL while the orphaned
+        # group is disappearing. Only a subsequent ESRCH proves it is gone.
+        # A present group or an unprivileged probe must retain the error.
+        deadline = time.monotonic() + 0.1
+        while True:
+            try:
+                os.killpg(proc.pid, 0)
+            except ProcessLookupError:
+                return
+            except PermissionError as probe:
+                if probe.errno != errno.EPERM:
+                    raise denied
+                # Still unproven; retain the original error unless ESRCH follows.
+            if time.monotonic() >= deadline:
+                raise denied
+            time.sleep(0.005)
 
 
 def capture(command, output, seconds, limit=REPORT_BYTES):

@@ -559,6 +559,30 @@ export const mockAdminWorkers: AdminWorker[] = [
     disk_pressure_volumes: [],
     cleanup_pending: false,
   },
+  {
+    // Issue #4385: the controller refused automatic hibernation for a roll reservation, and
+    // reports a present, completed canary roll marker for the worker.
+    ...hostedPersistentBase(),
+    id: "w-hib-blocked",
+    name: "base.m-71ab",
+    hibernation_reason: "roll_reservation",
+    hibernation_blocked_reason: "controller_refused",
+    hibernation_blocked_since: minsAgo(42),
+    hibernation_blocked_at: minsAgo(2),
+    roll_marker: {
+      state: "present",
+      canary: true,
+      completed: true,
+      target_version: "0.9.0",
+      coverage_group: "base",
+      reservation: false,
+      blocked: null,
+      observed_at: minsAgo(2),
+    },
+    owner_email: "mira@uzi.local",
+    disk_pressure_volumes: [],
+    cleanup_pending: false,
+  },
 ];
 
 function hostedPersistentBase(): Worker {

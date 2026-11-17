@@ -57,7 +57,7 @@ function controller(registry = new HibernationWriterRegistry(), overrides: Parti
       hasFeature: () => true, currentRegisterNonce: () => "n",
       postHibernationInventory: async () => {}, postHibernationExclusionFinal: async () => {},
     },
-    ownership: undefined, laneSupported: true, podUid: () => undefined, isIdle: () => true,
+    ownership: undefined, laneSupported: true, dockerStorage: true, podUid: () => undefined, isIdle: () => true,
     proof: async () => true,
     census: async () => ({ complete: false, entries: [], fingerprint: "", digest: "", docker: null, uncovered: [] }),
     recomputeFingerprint: async () => ({ digest: "", fingerprint: "" }),
@@ -99,7 +99,7 @@ describe("hibernation wiring", () => {
     assert.equal(without.registrations[0]?.[4]?.includes("hibernation_inventory_v1"), false);
   });
 
-  it("builds the controller only on the DinD lane with a supported epoch ownership", () => {
+  it("the lane supports exclusion only on the DinD lane with a supported epoch ownership", () => {
     const dind = { dockerWiring: { dockerHost: "tcp://dind:2375" } };
     assert.equal(hibernationParticipates(dind, "shared"), true);
     assert.equal(hibernationParticipates(dind, "exclusive"), true);

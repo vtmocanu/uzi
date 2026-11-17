@@ -422,6 +422,7 @@ export class DindPruneController {
   private async cacheLoop(signal: AbortSignal): Promise<void> {
     while (!signal.aborted) {
       try {
+        // Writer exclusion for local in-flight steps only, not inventory coverage (see hibernation-inventory.ts, #4369).
         await asWriter("dind_prune", () => this.tick(signal));
       } catch (err) {
         this.log.warn("dind-prune: evaluation failed", { error: errMessage(err) });

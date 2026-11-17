@@ -1,8 +1,10 @@
 """Docker-free integration tests for run.sh using the real JUnit checker."""
+import errno
 import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -183,6 +185,60 @@ class ToolImageTest(unittest.TestCase):
         self.assertGreaterEqual(bounded.CLEANUP_BASE_SECONDS + bounded.VOLUME_RM_SECONDS, 29 + 120)
 
 
+class SignalGroupTest(unittest.TestCase):
+    def test_macos_permission_error_tolerated_only_after_group_disappears(self):
+        proc = mock.Mock(pid=12345)
+        denied = PermissionError(errno.EPERM, "group has just exited")
+        with mock.patch.object(bounded.sys, "platform", "darwin"), \
+             mock.patch.object(bounded.os, "killpg", side_effect=[denied, None, ProcessLookupError()]) as killpg, \
+             mock.patch.object(bounded.time, "sleep"):
+            bounded.signal_group(proc, signal.SIGKILL)
+        self.assertEqual(killpg.call_args_list, [mock.call(12345, signal.SIGKILL), mock.call(12345, 0), mock.call(12345, 0)])
+
+    def test_macos_live_group_permission_error_is_not_hidden(self):
+        denied = PermissionError(errno.EPERM, "live group")
+        with mock.patch.object(bounded.sys, "platform", "darwin"), \
+             mock.patch.object(bounded.os, "killpg", side_effect=[denied, None]), \
+             mock.patch.object(bounded.time, "monotonic", side_effect=[0, 1]):
+            with self.assertRaises(PermissionError) as caught:
+                bounded.signal_group(mock.Mock(pid=12345), signal.SIGKILL)
+        self.assertIs(caught.exception, denied)
+
+    def test_macos_unverifiable_group_permission_error_is_not_hidden(self):
+        denied = PermissionError(errno.EPERM, "cannot signal")
+        with mock.patch.object(bounded.sys, "platform", "darwin"), \
+             mock.patch.object(bounded.os, "killpg", side_effect=[denied, PermissionError(errno.EPERM, "cannot probe")]), \
+             mock.patch.object(bounded.time, "monotonic", side_effect=[0, 1]):
+            with self.assertRaises(PermissionError) as caught:
+                bounded.signal_group(mock.Mock(pid=12345), signal.SIGKILL)
+        self.assertIs(caught.exception, denied)
+
+    def test_macos_transient_unverifiable_group_requires_absence(self):
+        with mock.patch.object(bounded.sys, "platform", "darwin"), \
+             mock.patch.object(bounded.os, "killpg", side_effect=[PermissionError(errno.EPERM, "kill"), PermissionError(errno.EPERM, "probe"), ProcessLookupError()]) as killpg, \
+             mock.patch.object(bounded.time, "sleep"):
+            bounded.signal_group(mock.Mock(pid=12345), signal.SIGKILL)
+        self.assertEqual(killpg.call_args_list, [mock.call(12345, signal.SIGKILL), mock.call(12345, 0), mock.call(12345, 0)])
+
+    def test_linux_permission_error_is_not_hidden_or_retried(self):
+        denied = PermissionError(errno.EPERM, "cannot signal")
+        with mock.patch.object(bounded.sys, "platform", "linux"), \
+             mock.patch.object(bounded.os, "killpg", side_effect=denied) as killpg:
+            with self.assertRaises(PermissionError) as caught:
+                bounded.signal_group(mock.Mock(pid=12345), signal.SIGKILL)
+        self.assertIs(caught.exception, denied)
+        killpg.assert_called_once_with(12345, signal.SIGKILL)
+
+    def test_macos_other_permission_errors_are_not_hidden_or_retried(self):
+        denied = PermissionError(errno.EACCES, "cannot signal")
+        with mock.patch.object(bounded.sys, "platform", "darwin"), \
+             mock.patch.object(bounded.os, "killpg", side_effect=denied) as killpg:
+            with self.assertRaises(PermissionError) as caught:
+                bounded.signal_group(mock.Mock(pid=12345), signal.SIGKILL)
+        self.assertIs(caught.exception, denied)
+        killpg.assert_called_once_with(12345, signal.SIGKILL)
+
+
 class CaptureTest(unittest.TestCase):
     def test_complete_output_and_inherited_pipe_deadline(self):
         from bounded import capture
@@ -196,8 +252,8 @@ class CaptureTest(unittest.TestCase):
             self.assertEqual(report.read_bytes(), b"x" * 1024)
             # The direct producer exits, but its child holds stdout and ignores TERM.
             # Completion must use the deadline rather than wait indefinitely for EOF.
-            child = ("import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-                     "print('ready', flush=True); time.sleep(60)")
+            child = ("import os,signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                     "print('ready', os.getpid(), flush=True); time.sleep(60)")
             parent = ("import subprocess,sys; "
                       f"subprocess.Popen([sys.executable, '-c', {child!r}])")
             start = time.monotonic()
@@ -205,6 +261,19 @@ class CaptureTest(unittest.TestCase):
             self.assertEqual(rc, 124)
             self.assertLess(time.monotonic() - start, 8)
             self.assertIn(b"ready", report.read_bytes())
+            child_pid = int(report.read_bytes().split()[1])
+            gone = False
+            until = time.monotonic() + 0.5
+            while time.monotonic() < until:
+                try:
+                    os.kill(child_pid, 0)
+                except ProcessLookupError:
+                    gone = True
+                    break
+                time.sleep(0.005)
+            if not gone:
+                os.kill(child_pid, signal.SIGKILL)  # Clean up this test's own child on failure.
+            self.assertTrue(gone, "deadline must stop the inherited-pipe child, not only its producer")
 
 
 class RunnerTest(unittest.TestCase):

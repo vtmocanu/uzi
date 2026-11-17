@@ -31,18 +31,31 @@ type WorkerDTO struct {
 	// HibernationReason is the admin's sanitized reason; HibernatedAt is when the pod was
 	// confirmed absent; WakeRequestedAt is when a wake began; WakeError is the bounded
 	// reason a wake past worker_wake_timeout has not completed. All null when not set.
-	HibernationReason *string    `json:"hibernation_reason"`
-	HibernatedAt      *time.Time `json:"hibernated_at"`
-	WakeRequestedAt   *time.Time `json:"wake_requested_at"`
-	WakeError         *string    `json:"wake_error"`
+	HibernationReason *string `json:"hibernation_reason"`
+	// HibernationBlockedReason is the automatic pass's blocker: the closed code that keeps an
+	// idle worker from hibernating (workersvc Blocked* values, an unknown code possible from a
+	// newer api), sanitized and bounded. HibernationBlockedSince is when that reason began (it
+	// restarts only when the reason changes); HibernationBlockedAt is the latest sighting, shown
+	// as "last observed". All null when no blocker is recorded.
+	HibernationBlockedReason *string    `json:"hibernation_blocked_reason"`
+	HibernationBlockedSince  *time.Time `json:"hibernation_blocked_since"`
+	HibernationBlockedAt     *time.Time `json:"hibernation_blocked_at"`
+	HibernatedAt             *time.Time `json:"hibernated_at"`
+	WakeRequestedAt          *time.Time `json:"wake_requested_at"`
+	WakeError                *string    `json:"wake_error"`
 	// HibernationCleanup (PRD #4206) is the Docker cache cleanup attempt that ran, or is
 	// running, at hibernation. The key is always present; null when no attempt was made and
 	// no outcome is recorded.
 	HibernationCleanup *HibernationCleanupDTO `json:"hibernation_cleanup"`
 	RollPacing         json.RawMessage        `json:"roll_pacing,omitempty"`
-	ID                 string                 `json:"id"`
-	Name               string                 `json:"name"`
-	Status             string                 `json:"status"`
+	// RollMarker (issue #4385) is the controller's display-only summary of the retained
+	// image-roll marker for a hosted worker. Absent for external workers and on responses not
+	// built from the roll-joined projection (register/heartbeat); for a hosted worker with no
+	// report row, or a stored marker that is stale, future-dated or invalid, state is "unknown".
+	RollMarker *RollMarkerDTO `json:"roll_marker,omitempty"`
+	ID         string         `json:"id"`
+	Name       string         `json:"name"`
+	Status     string         `json:"status"`
 	// Kind is "external" (a worker its owner runs by hand) or "hosted" (one the
 	// controller runs in the cluster, PRD #58). HostedSize is the preset name (s/m/l/l-highmem),
 	// null for an external worker. Together they are what lets the UI mark hosted
@@ -351,4 +364,19 @@ type WorkerReportedRunDTO struct {
 	ClaimGeneration      int64      `json:"claim_generation"`
 	TerminalPending      bool       `json:"terminal_pending"`
 	TerminalPendingSince *time.Time `json:"terminal_pending_since"`
+}
+
+// RollMarkerDTO is the display-only roll-marker summary. State is one of present,
+// unreadable, absent, unavailable or unknown. Canary, Completed, TargetVersion and
+// CoverageGroup are non-nil only for present; Reservation and Blocked only when fresh.
+// ObservedAt is the api receipt time of the last stored marker, kept even when stale.
+type RollMarkerDTO struct {
+	State         string     `json:"state"`
+	Canary        *bool      `json:"canary"`
+	Completed     *bool      `json:"completed"`
+	TargetVersion *string    `json:"target_version"`
+	CoverageGroup *string    `json:"coverage_group"`
+	Reservation   *bool      `json:"reservation"`
+	Blocked       *string    `json:"blocked"`
+	ObservedAt    *time.Time `json:"observed_at"`
 }

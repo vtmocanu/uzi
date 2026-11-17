@@ -151,11 +151,14 @@ Read-only reviewer, tester and DBA inspected the supplied-base range
 9d62bc7925371e10d6e2833b43d469367842f8d7..2f1808dbadc98a3d7980c5d75af6fc08333d7de7.
 The tester's two assertion findings are addressed by the changes above.
 The DBA's migration blocker is addressed at the schema level, but broader
-compatibility remains unresolved: the branch also removes the default branch's
-roll-marker API/controller reporting path and its tests. Other deleted
-default-branch tests include hibernation roll history, usage-poller refresh
-and Board sticky-header coverage. These removals are not justified by the
-Codex-switch feature and require explicit reconciliation before completion.
+compatibility required further reconciliation: that reviewed revision had not
+integrated the supplied default at all. Merge 5b16bb133 had integrated older
+default 912661599 instead, leaving 20 later default commits absent. The
+apparent removals included roll-marker reporting, hibernation roll history,
+usage-poller refresh and Board coverage. A subsequent merge of supplied
+9d62bc7925371e10d6e2833b43d469367842f8d7 restores these changes rather than
+reimplementing or omitting them. Integration checks after that merge remain
+separate from the pre-merge results recorded above.
 
 Non-blocking notes from those reviews remain recorded for disposition:
 the reviewer identified coordinator orchestration called only from tests,

@@ -139,8 +139,8 @@ type DesiredWorker struct {
 	// recovery is a rotation. Both are the controller's cue to reconcile the worker
 	// WITHOUT touching its Secret, never to invent or clear one.
 	JoinToken *string `json:"join_token"`
-	// Hibernation is set only while the worker is preparing, hibernated or waking
-	// (PRD #4205); omitted for an awake worker.
+	// Hibernation is set only while the worker is preparing, hibernated, waking or
+	// cleaning (PRD #4205, #4206); omitted for an awake worker.
 	Hibernation *Hibernation `json:"hibernation,omitempty"`
 }
 
@@ -292,8 +292,10 @@ type StatusReport struct {
 // and "never terminated" are different facts.
 type WorkerStatus struct {
 	// Raw JSON keeps an optional, unrecognized cause from failing fleet decoding.
-	BlockingKind      json.RawMessage `json:"blocking_kind,omitempty"`
-	Pacing            *Pacing         `json:"pacing,omitempty"`
+	BlockingKind json.RawMessage `json:"blocking_kind,omitempty"`
+	Pacing       *Pacing         `json:"pacing,omitempty"`
+	// RollMarker stays raw so a mistyped display-only marker cannot fail the entry's decode.
+	RollMarker        json.RawMessage `json:"roll_marker,omitempty"`
 	ID                string          `json:"id"`
 	Phase             string          `json:"phase"`
 	PhaseSince        *time.Time      `json:"phase_since"`

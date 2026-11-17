@@ -190,7 +190,8 @@ type Handler struct {
 	hsvc *hostedsvc.Service
 	// usagePoker pokes the rate-limit poller when a user saves/replaces their
 	// Anthropic token (PRD #53 D3b), so their meters appear within seconds instead
-	// of up to a full poll interval. Wired via SetUsagePoker; nil-safe (the poller
+	// of up to a full poll interval; a vault-ready transition pokes every enabled
+	// token of the user (#4406). Wired via SetUsagePoker; nil-safe (the poller
 	// disabled, or a test handler) — the token still lands, just polled on the next
 	// tick.
 	usagePoker UsagePoker
@@ -387,9 +388,11 @@ func (h *Handler) clock() time.Time {
 // UsagePoker is the slice of the rate-limit poller the token-save handler needs
 // (PRD #53 D3b): request an out-of-band poll for one user's default token, or for
 // one named token (PokeSecret, the re-enable path of PRD #1732 M3a, whose token is
-// usually not the default). *usagepoller.Engine satisfies it.
+// usually not the default), or for every enabled token of the user (PokeUserAll, the
+// vault-ready path, #4406). *usagepoller.Engine satisfies it.
 type UsagePoker interface {
 	Poke(userID uuid.UUID)
+	PokeUserAll(userID uuid.UUID)
 	PokeSecret(userID, secretID uuid.UUID)
 }
 

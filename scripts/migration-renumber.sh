@@ -304,7 +304,10 @@ awk -F"$TAB" '{ print $4 }'                "$WORKDIR/plan" > "$WORKDIR/newpaths"
 # rename, leaving a staged half-run). Its report is printed after the rename. Git's
 # numstat classifies binaries (`-<TAB>-`), which are skipped with a notice; text is
 # scanned under LC_ALL=C so a non-UTF-8 byte cannot abort a UTF-8-locale awk. Token-exact
-# 5-digit scan in awk (this host's ugrep mishandles negated bracket classes in -E mode,
+# 5-digit scan in awk, plus unpadded integer candidates in changed Go test files.
+# Even an exact MigrateTo argument can refer to main's colliding migration rather
+# than the branch's renamed migration, so those candidates need manual review.
+# (This host's ugrep mishandles negated bracket classes in -E mode,
 # so awk digit-run scanning is used).
 # core.quotePath=false hands non-ASCII paths through verbatim; a path git must STILL quote
 # (tab, newline, backslash, double quote) cannot be read back safely here, so it is
@@ -331,13 +334,15 @@ while IFS="$TAB" read -r kind f; do
 "
     continue
   fi
-  hits="$(LC_ALL=C awk -F"$TAB" 'NR==FNR { m[$1]=$2; next }
+  hits="$(LC_ALL=C awk -F"$TAB" 'NR==FNR { m[$1]=$2; numeric[$1+0]=$2+0; next }
     {
       rest=$0
       while (match(rest, /[0-9]+/)) {
         tok=substr(rest, RSTART, RLENGTH)
         if (length(tok)==5 && (tok in m))
           print FILENAME ":" FNR "\t" tok " -> " m[tok] "\t" $0
+        else if (FILENAME ~ /_test[.]go$/ && ((tok+0) in numeric))
+          print FILENAME ":" FNR "\t" tok " -> " numeric[tok+0] "\t" $0
         rest=substr(rest, RSTART+RLENGTH)
       }
     }' "$WORKDIR/map" "$f")" ||

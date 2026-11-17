@@ -109,9 +109,13 @@ type Materializer struct {
 	// resolves their state. This process-local record is not a write fence.
 	migrationPending map[string]rollCoverage
 	pacing           map[string]*protocol.Pacing
-	client           kubernetes.Interface
-	cfg              RenderConfig
-	resolver         preset.Resolver
+	// rollMarkers is the display-only per-worker roll evidence (issue #4385), replaced
+	// with pacing on every synchronous reconcile and read under the same single-goroutine
+	// reconcile/report discipline as pacing (no mutex).
+	rollMarkers map[string]*protocol.RollMarker
+	client      kubernetes.Interface
+	cfg         RenderConfig
+	resolver    preset.Resolver
 	// cordoner is the api cordon-write channel (PRD #422 M4). Nil disables cordoning;
 	// see Cordoner. Injected the same way as resolver, so tests can drive it.
 	cordoner Cordoner

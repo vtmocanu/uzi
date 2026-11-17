@@ -61,7 +61,7 @@ func TestListAutoHibernationBlockersExactTotalLiveDB(t *testing.T) {
 
 	// A: idle since creation (60d), reason first seen 50d ago.
 	a := newWorker(nameA, 60*24*time.Hour)
-	raExec(ctx, t, pool, `UPDATE workers SET hibernation_blocked_reason='manual_cordon', hibernation_blocked_at=$2, hibernation_blocked_since=$3 WHERE id=$1`, a, now, now.Add(-50*24*time.Hour))
+	raExec(ctx, t, pool, `UPDATE workers SET hibernation_blocked_reason='controller_refused', hibernation_reason='roll_reservation', hibernation_blocked_at=$2, hibernation_blocked_since=$3 WHERE id=$1`, a, now, now.Add(-50*24*time.Hour))
 	// B: a run finished 20d ago (the anchor); reason first seen 40d ago, before the anchor.
 	b := newWorker(nameB, 60*24*time.Hour)
 	fin := now.Add(-20 * 24 * time.Hour)
@@ -109,8 +109,15 @@ func TestListAutoHibernationBlockersExactTotalLiveDB(t *testing.T) {
 	if lastIdle > firstParked {
 		t.Fatalf("an idle row follows a parked row (idle ends at %d, parked starts at %d)", lastIdle, firstParked)
 	}
-	if r, ok := got[nameA]; !ok || r.Kind != "idle" || r.Reason != "manual_cordon" || !r.Since.Time.Equal(now.Add(-50*24*time.Hour)) {
+	if r, ok := got[nameA]; !ok || r.Kind != "idle" || r.Reason != "controller_refused" || r.ControllerReason != "roll_reservation" || !r.Since.Time.Equal(now.Add(-50*24*time.Hour)) {
 		t.Fatalf("A = %+v (listed %v)", r, ok)
+	}
+	// controller_reason is the empty string, never NULL, when hibernation_reason is unset or the row is parked.
+	if r := got[nameB]; r.ControllerReason != "" {
+		t.Fatalf("B controller_reason = %q, want empty", r.ControllerReason)
+	}
+	if r := got[nameC]; r.ControllerReason != "" {
+		t.Fatalf("C controller_reason = %q, want empty", r.ControllerReason)
 	}
 	// B's reason predates its anchor: since is the anchor (GREATEST), not the stale first sighting.
 	if r, ok := got[nameB]; !ok || r.Kind != "idle" || !r.Since.Time.Equal(fin) || !r.Anchor.Time.Equal(fin) {

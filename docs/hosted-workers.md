@@ -159,9 +159,27 @@ Hibernate is refused, with a reason, when the worker:
   run is never stranded);
 - or the controller has not advertised hibernation support recently.
 
-The controller can still refuse after the request is accepted (a roll marker or
-reservation, a disk-pressure recycle, DinD maintenance, a busy worker, or a layout
-migration). If nothing was scaled down, a refusal returns the worker to normal.
+The controller can still refuse after the request is accepted (an open, unreadable
+or retained-claim roll reservation (`roll_reservation`), a finished roll while
+another worker in the namespace that is not positively attributed to a different
+owner carries, or cannot be shown not to carry, roll metadata
+(`roll_cohort_cleanup_pending`; a desired worker the controller cannot render
+counts, and one whose placement fails counts in every namespace), a
+disk-pressure recycle, DinD maintenance, a busy
+worker, or a layout migration). Completed roll history from a finished roll is
+retired before sleep, so it does not block hibernation by itself; with
+`roll_cohort_cleanup_pending` the roll history is left in place and the hibernation
+can be retried later (the automatic pass retries after its cooldown, or an admin
+retries). Known limit: peer evidence is not filtered by coverage pool, so when one
+owner has two or more coverage pools (different capability sets) in a namespace,
+each finished roll leaves every pool's canary with a completed marker, and those
+canaries keep refusing each other with `roll_cohort_cleanup_pending` until the owner's
+next image roll in that namespace retires it; retries alone do not clear it.
+Likewise, a non-ephemeral desired worker that cannot be rendered keeps refusing
+every finished-roll canary in its namespace (in every namespace when its placement
+fails) until it renders again or is removed (fix its template, size, or the Docker
+or isolated namespace configuration). If
+nothing was scaled down, a refusal returns the worker to normal.
 Preparation that does not finish within 10 minutes is withdrawn into a wake.
 
 A wake completes only when the new pod registers (or the original pod is still
@@ -253,6 +271,60 @@ threshold before it is considered again.
 **Record.** Automatic hibernations write no hibernation audit event. The worker's
 hibernation reason reads "automatic: no run activity for ..." (for example
 "automatic: no run activity for 14d").
+
+#### Diagnosing a blocked hibernation or a stuck roll
+
+The worker JSON carries the pass's last recorded blocker and, for a hosted
+worker, the controller's retained image-roll marker. Both are evidence for an
+admin to read; neither changes behavior, and the controller stays the authority
+for refusing hibernation and for rolls.
+
+```sh
+uzi admin workers --json
+```
+
+Per worker, `uzi admin workers --json` (and `uzi worker list --json` / `uzi worker get --json`
+for the owner's own workers) carries:
+
+- `hibernation_blocked_reason`: the workersvc code of the last recorded blocker of the
+  automatic pass (for example `controller_refused`), or null. For
+  `controller_refused`, `hibernation_reason` holds the controller's refusal code.
+- `hibernation_blocked_since`: when this reason started holding. It restarts only when the
+  reason changes.
+- `hibernation_blocked_at`: when the pass last observed it.
+
+These are the **last recorded** blocker, not the current state: they are not cleared when
+the worker returns to work, so read them with the worker's status and
+`hibernation_state`.
+
+- `roll_marker` (hosted workers only; display-only): `state`, `canary`, `completed`,
+  `target_version`, `coverage_group` (an opaque 16-hex id that tells coverage groups apart
+  and never carries the raw annotation or nonce), `reservation` (whether the controller sees
+  a roll reservation, the fact that makes it refuse hibernation with `roll_reservation`),
+  `blocked` (the controller's roll blocker) and `observed_at` (when the api received the
+  report). `canary`, `completed`, `target_version` and `coverage_group` are set only when
+  `state` is `present`; `reservation` and `blocked` only when the report is fresh.
+
+`roll_marker.state` tells apart what the controller could and could not see:
+
+| State | Meaning |
+|---|---|
+| `present` | a roll marker exists and was decoded |
+| `unreadable` | a roll annotation exists but could not be decoded |
+| `absent` | positively no marker |
+| `unavailable` | the controller's cluster snapshot failed or was incomplete, so it cannot say whether a marker exists |
+| `unknown` | no fresh report: an older controller, evidence older than the 60 second receipt TTL, an invalid value, or a worker not reported while preparing, hibernated or cleaning |
+
+Read `absent` as a fact and `unavailable` and `unknown` as missing evidence: neither
+shows that no roll is held. `roll_pacing` is unchanged; completed history now shows
+through `roll_marker`.
+
+`uzi worker list`, `uzi worker get` and `uzi admin workers` print the same facts after
+the table as `Hibernation blocker (last recorded)` and `Roll marker` lines, see
+[CLI](./cli.md#hibernated-workers). The web **Admin → Health** Fleet card shows a
+"Hibernation blocker (last recorded)" line and a "Roll marker:" line per worker. The
+`fleet.hibernation` evidence names the same refusal; see
+[Admin health](./admin-health.md).
 
 ### Cache cleanup before sleep
 
@@ -366,6 +438,11 @@ first step, a **dry run**: **no volume is deleted**, and no setting turns deleti
   Docker prune configuration. Its client can close before the daemon has finished
   pruning, so local child settlement cannot prove writer exclusion. Pressure
   cleanup continues with its existing behavior; the volumes remain protected.
+- **Idle cache prune.** Every Docker worker's inventory also reports the uncovered
+  writer `dind_prune` (the idle cache prune) and is incomplete, whether or not the
+  prune is enabled. A Docker worker whose daemon socket never came up, or whose
+  pod-epoch lock mode is unsupported, answers `unsupported` naming it. The prune
+  client can close before the daemon finishes, so retirement stays blocked.
 - **Conditional only.** A worker that nothing blocks is reported as "would retire
   only after M2 verifies": the volumes' actual PV reclaim policy, and that no
   other pod mounted them between the controller's observations (only sampled in

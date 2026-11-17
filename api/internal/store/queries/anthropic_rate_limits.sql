@@ -32,6 +32,20 @@ JOIN users u ON s.user_id = u.id
 WHERE s.kind = 'anthropic_token' AND s.disabled_at IS NULL
 ORDER BY s.user_id, s.id;
 
+-- name: ListAnthropicTokensToPollForUser :many
+-- Owner-scoped sibling of ListAnthropicTokensToPoll for the vault-ready poke
+-- (#4406): every ENABLED anthropic_token of one user, same projection as the
+-- factory-wide listing so the poke opens exactly the rows it listed and captures the
+-- same enablement_rev fence and success generation. A disabled token is not listed
+-- (PRD #1732 D1).
+SELECT s.id, s.user_id, s.ciphertext, s.sealed_with, u.notify_early_limit_reset,
+       s.enablement_rev, s.anthropic_success_generation, u.vault_epoch
+FROM user_secrets s
+JOIN users u ON s.user_id = u.id
+WHERE s.kind = 'anthropic_token' AND s.disabled_at IS NULL
+  AND s.user_id = @user_id
+ORDER BY s.user_id, s.id;
+
 -- name: GetAnthropicTokenToPoll :one
 -- The single-token sibling of ListAnthropicTokensToPoll for the out-of-band poke
 -- (PRD #1732 M3a): the named token when @secret_id is set, else the owner's

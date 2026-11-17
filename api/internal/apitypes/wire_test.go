@@ -966,7 +966,7 @@ var workerDTOKeys = []string{
 	// PRD #4205: worker hibernation lifecycle. hibernation_state is always present;
 	// the reason, hibernated_at, wake_requested_at and wake_error are null outside the
 	// state that sets them. Display-only for the workers UI.
-	"hibernation_state", "hibernation_reason", "hibernated_at", "wake_requested_at", "wake_error", "hibernation_cleanup",
+	"hibernation_state", "hibernation_reason", "hibernation_blocked_reason", "hibernation_blocked_since", "hibernation_blocked_at", "hibernated_at", "wake_requested_at", "wake_error", "hibernation_cleanup",
 }
 
 func TestWorkerDTOTags(t *testing.T) {

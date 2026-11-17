@@ -228,7 +228,9 @@ func (h *Handler) vaultReady(ctx context.Context, userID uuid.UUID) {
 	}
 	h.requestCredentialPromotion(userID)
 	if h.usagePoker != nil {
-		h.usagePoker.Poke(userID)
+		// Every enabled token, not only the default (#4406): unlock makes all the
+		// user's dek-sealed tokens openable again.
+		h.usagePoker.PokeUserAll(userID)
 	}
 	if h.codexUsagePoker != nil {
 		h.codexUsagePoker.Poke(userID)

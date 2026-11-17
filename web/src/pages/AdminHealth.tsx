@@ -580,6 +580,75 @@ function FleetCard() {
   );
 }
 
+// Closed label maps for the controller-reported hibernation evidence (issue #4385). The keys
+// mirror workersvc's hibernation_blocked_reason codes and the controller's refusal codes; the
+// wording mirrors healthsvc's hibernationBlockedLabel and controllerRefusalLabel. An unknown
+// code (a newer api) renders through stripUnsafeChars.
+const HIBERNATION_BLOCKED_LABELS: Record<string, string> = {
+  custody_hold: "recovery custody hold",
+  manual_cordon: "manual cordon",
+  maintenance: "maintenance",
+  roll: "image roll",
+  draining: "draining",
+  pending_wake_demand: "a queued run is waking it",
+  controller_not_advertising: "controller not advertising hibernation",
+  no_pod_identity: "no pod identity",
+  controller_refused: "controller refused",
+  intake_fenced: "intake fenced",
+};
+
+const CONTROLLER_REFUSAL_LABELS: Record<string, string> = {
+  roll_reservation: "roll reservation",
+  roll_blocked: "roll blocked",
+  disk_pressure: "disk pressure",
+  dind_maintenance: "DinD maintenance",
+  busy: "busy",
+  layout_migration_held: "layout migration held",
+  roll_evidence_unavailable: "roll evidence unavailable",
+  roll_cohort_cleanup_pending: "roll cohort cleanup pending",
+};
+
+const ROLL_MARKER_STATE_TEXT: Record<string, string> = {
+  present: "present",
+  unreadable: "unreadable",
+  absent: "none",
+  unavailable: "snapshot unavailable",
+  unknown: "unknown",
+};
+
+function closedLabel(map: Record<string, string>, code: string): string {
+  return Object.prototype.hasOwnProperty.call(map, code) ? map[code] : stripUnsafeChars(code);
+}
+
+// The last recorded blocker; the columns are not cleared when the worker returns to work, so
+// the line says "last recorded" and never reads as current.
+function hibernationBlockerText(w: AdminWorker): string {
+  const code = w.hibernation_blocked_reason;
+  if (!code || !code.trim()) return "";
+  let label = closedLabel(HIBERNATION_BLOCKED_LABELS, code);
+  const refusal = stripUnsafeChars(w.hibernation_reason ?? "").trim();
+  if (code === "controller_refused" && refusal) label += ` (${closedLabel(CONTROLLER_REFUSAL_LABELS, refusal)})`;
+  let text = `Hibernation blocker (last recorded): ${label}`;
+  if (w.hibernation_blocked_since) text += ` for ${formatAgo(w.hibernation_blocked_since).replace(/ ago$/, "")}`;
+  if (w.hibernation_blocked_at) text += `, last observed ${formatAgo(w.hibernation_blocked_at)}`;
+  return text;
+}
+
+// Display-only controller evidence for a hosted worker; every controller value is stripped.
+function rollMarkerText(w: AdminWorker): string {
+  const m = w.roll_marker;
+  if (w.kind !== "hosted" || !m) return "";
+  let text = `Roll marker: ${closedLabel(ROLL_MARKER_STATE_TEXT, m.state)}`;
+  if (m.canary) text += " · canary";
+  if (m.completed) text += " · completed";
+  if (m.target_version) text += ` · target ${stripUnsafeChars(m.target_version)}`;
+  if (m.coverage_group) text += ` · group ${stripUnsafeChars(m.coverage_group)}`;
+  if (m.reservation) text += " · reservation";
+  if (m.blocked && m.blocked.trim()) text += ` · blocked: ${stripUnsafeChars(m.blocked)}`;
+  if (m.observed_at) text += `, last observed ${formatAgo(m.observed_at)}`;
+  return text;
+}
+
 function FleetRow({ worker: w, demo, onChanged }: { worker: AdminWorker; demo: boolean; onChanged: () => void }) {
   // The worker name and the upgrade detail are server-sanitized at write time. Strip them
   // again on the way to a `title=` attribute: an attribute is a sink a rendered-text sweep
@@ -588,6 +657,8 @@ function FleetRow({ worker: w, demo, onChanged }: { worker: AdminWorker; demo: b
   const upgrade = upgradePresentation(w.upgrade_status);
   const wakeError = isHibernating(w) ? stripUnsafeChars(w.wake_error ?? "").trim() : "";
   const cleanup = hibernationCleanupText(w);
+  const blocker = hibernationBlockerText(w);
+  const rollMarker = rollMarkerText(w);
 
   return (
     <tr>
@@ -611,6 +682,8 @@ function FleetRow({ worker: w, demo, onChanged }: { worker: AdminWorker; demo: b
             {cleanup}
           </p>
         )}
+        {blocker && <p className="mt-1 max-w-xs whitespace-normal text-xs text-muted">{blocker}</p>}
+        {rollMarker && <p className="mt-1 max-w-xs whitespace-normal text-xs text-muted">{rollMarker}</p>}
         <WorkerHibernationControls worker={w} onChanged={onChanged} />
       </td>
       <td className="px-4 py-3">

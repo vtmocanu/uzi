@@ -3,6 +3,8 @@ package kube
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -60,12 +62,27 @@ type rollEntry struct {
 	claim              *corev1.PersistentVolumeClaim
 	rawReservation     bool
 	migrationHeldDrift bool
+	// snapshotIncomplete is set when the roll snapshot could not read this worker's
+	// deployment/pod/claim evidence; display-only (RollMarkerReports), never read by planning.
+	snapshotIncomplete bool
+	// markerReport is the snapshot-time display summary, captured before planning
+	// rewrites e.marker in memory. Display-only.
+	markerReport *protocol.RollMarker
 	// hibernation marks a worker whose desired hibernation state is set (PRD #4205).
 	// It stays in rollTick.entries so its snapshot evidence (marker, reservation,
 	// blocked) is readable through rollFrom, but it takes no part in pool grouping,
 	// admission, canary, slots or coverage: a parked worker is neither a roll
 	// participant nor a coverage provider.
 	hibernation bool
+	// historyDependents marks a hibernation candidate whose completed-canary marker
+	// could not be retired because an in-scope peer still carries roll evidence.
+	historyDependents bool
+	// historyAnchor marks such a candidate (or one whose retirement is unconfirmed) as
+	// a read-only completed-canary closure for its own coverage pool.
+	historyAnchor bool
+	// historyRetireUnknown marks a candidate whose marker retirement write is unconfirmed;
+	// reconcileHibernation writes nothing for it this tick.
+	historyRetireUnknown bool
 }
 type rollTick struct {
 	entries   map[string]*rollEntry
@@ -74,8 +91,11 @@ type rollTick struct {
 	uncertain map[string]bool
 	// layoutUncertain names, per coverage key, the held worker whose own reservation
 	// could not be shown withdrawn (see holdForLayoutMigration).
-	layoutUncertain   map[string]string
-	errors            []error
+	layoutUncertain map[string]string
+	errors          []error
+	// unplanned lists the non-ephemeral desired workers planRoll could not render
+	// (placement or template/size resolution failed). They never reach the roll snapshot.
+	unplanned         []unplannedWorker
 	unavailable       map[string]bool
 	migrationFences   map[string]bool
 	migrationMultiple bool
@@ -87,7 +107,72 @@ type rollTick struct {
 	// hibernation volume inventory (classReclaimPolicy).
 	reclaimPolicies map[string]string
 }
+
+// unplannedWorker is a desired worker outside the roll snapshot. nsKnown is false when
+// its placement failed, so the namespace it keeps its objects in is unknown.
+type unplannedWorker struct {
+	id      string
+	ns      string
+	nsKnown bool
+}
 type rollTickKey struct{}
+
+// RollMarkerReports returns a copy of the per-worker display-only roll marker
+// summaries from the last reconcile (issue #4385). It is replaced on every
+// synchronous reconcile and never used to admit or hibernate. Unlike PacingOutcomes it
+// includes completed markers.
+func (m *Materializer) RollMarkerReports() map[string]*protocol.RollMarker {
+	out := make(map[string]*protocol.RollMarker, len(m.rollMarkers))
+	for id, r := range m.rollMarkers {
+		c := *r
+		if r.Blocked != nil {
+			b := *r.Blocked
+			c.Blocked = &b
+		}
+		out[id] = &c
+	}
+	return out
+}
+
+// captureRollMarkerReport summarises the retained cluster evidence as the snapshot
+// read it, before any planning mutation rewrites e.marker.
+func captureRollMarkerReport(e *rollEntry) *protocol.RollMarker {
+	r := &protocol.RollMarker{
+		State:       protocol.RollMarkerAbsent,
+		Reservation: e.marker != nil || e.rawReservation || hasOpenReservation(e),
+	}
+	switch {
+	case e.snapshotIncomplete:
+		r.State = protocol.RollMarkerUnavailable
+	case e.marker != nil:
+		sum := sha256.Sum256([]byte(coverageKey(e.marker.Coverage)))
+		r.State = protocol.RollMarkerPresent
+		r.Canary = e.marker.Canary
+		r.Completed = e.marker.Completed
+		r.TargetVersion = boundedText(e.marker.TargetVersion, 128)
+		r.CoverageGroup = hex.EncodeToString(sum[:])[:16]
+	case e.rawReservation || (e.dep != nil && e.dep.Annotations[annotationRoll] != "") || (e.claim != nil && e.claim.Annotations[annotationRoll] != ""):
+		r.State = protocol.RollMarkerUnreadable
+	}
+	return r
+}
+
+// boundedText replaces control bytes and truncates to n bytes on a rune boundary.
+func boundedText(s string, n int) string {
+	s = strings.Map(func(r rune) rune {
+		if r < 32 || r == 127 {
+			return ' '
+		}
+		return r
+	}, s)
+	if len(s) > n {
+		s = s[:n]
+		for !utf8.ValidString(s) {
+			s = s[:len(s)-1]
+		}
+	}
+	return s
+}
 
 // PacingOutcomes is replaced on every synchronous reconcile, never used to admit.
 func (m *Materializer) PacingOutcomes() map[string]*protocol.Pacing {
@@ -115,10 +200,12 @@ func (m *Materializer) planRoll(ctx context.Context, desired []protocol.DesiredW
 		}
 		ns, err := m.cfg.Placement(w)
 		if err != nil {
+			t.unplanned = append(t.unplanned, unplannedWorker{id: w.ID})
 			continue
 		}
 		spec, err := m.resolver.Resolve(w.Template, w.Size)
 		if err != nil {
+			t.unplanned = append(t.unplanned, unplannedWorker{id: w.ID, ns: ns, nsKnown: true})
 			continue
 		}
 		target := RenderDeployment(m.cfg, w, spec)
@@ -138,8 +225,14 @@ func (m *Materializer) planRoll(ctx context.Context, desired []protocol.DesiredW
 		if err := m.rollSnapshot(ctx, ns, entries); err != nil {
 			for _, e := range entries {
 				e.blocked = "incomplete deployment/pod/ancestry snapshot"
+				e.snapshotIncomplete = true
 			}
 		}
+	}
+	// Capture the retained evidence before prepareMigrationDrains or any planning
+	// mutation rewrites e.marker (display-only; hibernation entries included).
+	for _, e := range t.entries {
+		e.markerReport = captureRollMarkerReport(e)
 	}
 	// Account for drained held workers using the newer pod snapshot before any
 	// ordinary admission can count them as serving coverage.
@@ -152,6 +245,7 @@ func (m *Materializer) planRoll(ctx context.Context, desired []protocol.DesiredW
 				e.dep.Spec.Template.Annotations[AnnotationGeneration] != e.target.Spec.Template.Annotations[AnnotationGeneration]
 		}
 	}
+	m.retireHibernationHistory(ctx, t)
 	for _, e := range t.entries {
 		if e.hibernation || e.blocked != "" || e.marker == nil || !e.marker.Completed || e.dep == nil {
 			continue
@@ -181,8 +275,13 @@ func (m *Materializer) planRoll(ctx context.Context, desired []protocol.DesiredW
 		}
 	}
 	pools := map[string][]*rollEntry{}
+	anchors := map[string][]*rollEntry{}
 	for _, e := range t.entries {
 		if e.hibernation {
+			if e.historyAnchor && e.marker != nil {
+				key := coverageKey(e.marker.Coverage)
+				anchors[key] = append(anchors[key], e)
+			}
 			continue
 		}
 		m.releasePressureHold(ctx, t, e)
@@ -266,7 +365,7 @@ func (m *Materializer) planRoll(ctx context.Context, desired []protocol.DesiredW
 	}
 	sort.Strings(keys)
 	for _, key := range keys {
-		m.planPool(ctx, t, pools[key])
+		m.planPool(ctx, t, append(append([]*rollEntry{}, pools[key]...), anchors[key]...))
 	}
 	order := append([]protocol.DesiredWorker{}, desired...)
 	sort.SliceStable(order, func(i, j int) bool {
@@ -299,6 +398,15 @@ func (m *Materializer) planRoll(ctx context.Context, desired []protocol.DesiredW
 	}
 	m.selectMigrationDrains(ctx, t, desired, observed, pools)
 	m.pacing = t.outcomes
+	markers := make(map[string]*protocol.RollMarker, len(t.entries))
+	for id, e := range t.entries {
+		if e.markerReport == nil {
+			continue
+		}
+		e.markerReport.Blocked = pacingText(e.blocked)
+		markers[id] = e.markerReport
+	}
+	m.rollMarkers = markers
 	return t, order
 }
 
@@ -388,7 +496,7 @@ func pacingText(s string) *string {
 }
 func (m *Materializer) planPool(ctx context.Context, t *rollTick, pool []*rollEntry) {
 	for _, e := range pool {
-		if e.blocked == "" && m.incarnationComplete(t, e) {
+		if !e.hibernation && e.blocked == "" && m.incarnationComplete(t, e) {
 			m.releaseRollHold(ctx, t, e)
 		}
 	}
@@ -406,6 +514,9 @@ func (m *Materializer) planPool(ctx context.Context, t *rollTick, pool []*rollEn
 			continue
 		}
 		for _, peer := range pool {
+			if peer.hibernation {
+				continue // a read-only anchor: no cleanup, outcome or admission
+			}
 			// Current-incarnation proof retires completed pacing metadata only;
 			// this does not release source custody or mutate protected storage.
 			if peer.blocked == "" && peer.marker != nil && !peer.marker.Canary && m.incarnationComplete(t, peer) {
@@ -1479,6 +1590,7 @@ func (m *Materializer) rollSnapshot(ctx context.Context, ns string, entries []*r
 			}
 		} else if e.o.HasDeployment {
 			e.blocked = "deployment missing from snapshot"
+			e.snapshotIncomplete = true
 		}
 		if e.dep != nil && e.marker != nil && e.dep.Spec.Replicas != nil && *e.dep.Spec.Replicas == 0 {
 			e.recovery = true

@@ -2222,5 +2222,7 @@ type WorkerUpgradeReport struct {
 	Pacing               []byte             `json:"pacing"`
 	PacingObservedAt     pgtype.Timestamptz `json:"pacing_observed_at"`
 	// Display-only roll blocking classification; does not control scheduling.
-	BlockingKind pgtype.Text `json:"blocking_kind"`
+	BlockingKind         pgtype.Text        `json:"blocking_kind"`
+	RollMarker           []byte             `json:"roll_marker"`
+	RollMarkerObservedAt pgtype.Timestamptz `json:"roll_marker_observed_at"`
 }

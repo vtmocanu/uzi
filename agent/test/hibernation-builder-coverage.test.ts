@@ -22,7 +22,7 @@ async function inventory(gate: DindPruneGate): Promise<InventoryRequest> {
   let mode: "shared" | "exclusive" = "shared";
   let posted: HibernationInventoryBody | undefined;
   const controller = new HibernationInventoryController({
-    registry: hibernationWriters, gate, laneSupported: true,
+    registry: hibernationWriters, gate, laneSupported: true, dockerStorage: true,
     client: {
       hasFeature: () => true,
       currentRegisterNonce: () => member.register_nonce,
@@ -65,7 +65,9 @@ it("a configured builder leg keeps inventory incomplete across unknown and local
   assert.equal(createDindBuilderPrune({ ...config, dindBuilderPruneEnabled: false }, deps), undefined);
   assert.equal(createDindBuilderPrune({ ...config, dockerWiring: {} }, deps), undefined);
   assert.deepEqual(hibernationWriters.uncovered(), []);
-  assert.equal((await inventory(gate)).complete, true);
+  const before = await inventory(gate);
+  assert.equal(before.complete, false, "Docker-scoped inventory is incomplete even before the builder leg exists: dind_prune");
+  assert.deepEqual(before.exclusion.uncovered, ["dind_prune"]);
 
   let now = 1_700_000_000_000;
   let closeChild!: () => void;
@@ -84,11 +86,11 @@ it("a configured builder leg keeps inventory incomplete across unknown and local
   assert.equal(outcome, "unknown");
   const unknown = await inventory(gate);
   assert.equal(unknown.complete, false, "an unclosed builder child cannot yield complete inventory");
-  assert.deepEqual(unknown.exclusion.uncovered, ["dind_builder"]);
+  assert.deepEqual(unknown.exclusion.uncovered, ["dind_builder", "dind_prune"]);
 
   closeChild();
   await closeObserved;
   const closed = await inventory(gate);
   assert.equal(closed.complete, false, "local close is not proof of daemon-side settlement");
-  assert.deepEqual(closed.exclusion.uncovered, ["dind_builder"]);
+  assert.deepEqual(closed.exclusion.uncovered, ["dind_builder", "dind_prune"]);
 });
