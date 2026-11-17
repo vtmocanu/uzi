@@ -19,9 +19,10 @@ const (
 	MaxRetiredValueBytes = 2097152
 )
 
-// userinfoURL matches scheme://[user[:pass]]@ at the start of a value: an
-// authority section (up to the first path, query or fragment delimiter) holding '@'.
-var userinfoURL = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9+.\-]*://[^/?#\s]*@`)
+// userinfoURL matches scheme://user[:pass]@ anywhere in a value, on any line: a URL
+// whose authority section (up to the first path, query or fragment delimiter) holds a
+// non-empty userinfo. The scheme may be a chain (jdbc:postgresql://).
+var userinfoURL = regexp.MustCompile(`[A-Za-z][A-Za-z0-9+.\-:]*://[^/?#\s@]+@`)
 
 // JSLength counts s the way a JavaScript string length does: UTF-16 code units.
 func JSLength(s string) int {
@@ -54,7 +55,7 @@ func ValidateValue(secret bool, value string) error {
 		}
 		return nil
 	}
-	if userinfoURL.MatchString(strings.TrimSpace(value)) {
+	if userinfoURL.MatchString(value) {
 		return &RuleError{Field: "value", Rule: "a plain value must not be a URL carrying a user or password (scheme://user:password@host); store it as a secret"}
 	}
 	return nil

@@ -197,7 +197,7 @@ func TestRunEnvVarQueriesLiveDB(t *testing.T) {
 	if err != nil || len(counts) != 1 || counts[0].RepoID != s.repo || counts[0].VarCount != 2 {
 		t.Fatalf("repo counts = %+v, %v; want 2 live (enabled+disabled) on one repo, user scope and pending excluded", counts, err)
 	}
-	if n, err := q.CountRunEnvVarsForRepo(ctx, repo); err != nil || n != 2 {
+	if n, err := q.CountRunEnvVarsForRepo(ctx, CountRunEnvVarsForRepoParams{UserID: user, RepoID: repo}); err != nil || n != 2 {
 		t.Fatalf("repo count = %d, %v", n, err)
 	}
 
@@ -270,7 +270,7 @@ func TestRunEnvVarQueriesLiveDB(t *testing.T) {
 	if n, err := q.DeleteAllRunEnvVarsForOwner(ctx, user); err != nil || n != 6 {
 		t.Fatalf("DeleteAllRunEnvVarsForOwner = %d, %v; want 6", n, err)
 	}
-	if n, err := q.CountRunEnvVarsForRepo(ctx, pgtype.UUID{Bytes: fs.repo, Valid: true}); err != nil || n != 1 {
+	if n, err := q.CountRunEnvVarsForRepo(ctx, CountRunEnvVarsForRepoParams{UserID: foreign, RepoID: pgtype.UUID{Bytes: fs.repo, Valid: true}}); err != nil || n != 1 {
 		t.Fatalf("a foreign owner's row after the delete = %d, %v", n, err)
 	}
 }

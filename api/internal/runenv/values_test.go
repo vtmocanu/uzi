@@ -35,6 +35,11 @@ func TestValidateValue(t *testing.T) {
 		{"userinfo user only as plain", false, "https://token@example.test/", "carrying a user or password"},
 		{"userinfo with leading space as plain", false, "  https://u:p@example.test", "carrying a user or password"},
 		{"unparsable userinfo as plain", false, "https://u:%zz@example.test", "carrying a user or password"},
+		{"jdbc scheme chain with userinfo", false, "jdbc:postgresql://u:p@db.example/app", "carrying a user or password"},
+		{"quoted url with userinfo", false, "\"https://u:p@h.example\"", "carrying a user or password"},
+		{"url after a comma with userinfo", false, "primary,https://u:p@h.example", "carrying a user or password"},
+		{"url on a later line with userinfo", false, "x\nhttps://u:p@h.example", "carrying a user or password"},
+		{"at sign after the host path accepted", false, "https://h.example/path?x=a@b", ""},
 		{"userinfo url as secret accepted", true, "postgres://app:pw@db.example.test/app", ""},
 	}
 	for _, tc := range tests {

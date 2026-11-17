@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
@@ -667,7 +668,7 @@ func TestRunEnvCiphertextSwapDoesNotOpenLiveDB(t *testing.T) {
 func TestRunEnvVaultLifecycleLiveDB(t *testing.T) {
 	h, router, pool := cliVaultLiveDB(t)
 	vaultFixturePolicy(t, pool, "optional")
-	owner := cliSeedUser(t, pool, false) // unprotected: master_aad-sealed
+	owner := cliSeedUser(t, pool, false)          // unprotected: master_aad-sealed
 	const password = "a-vault-lifecycle-password" //nolint:gosec // G101: test-only vault password.
 	setVaultFixturePassword(t, pool, owner, password)
 	repo := cliSeedOwnedRepo(t, pool, owner)
@@ -760,4 +761,170 @@ func TestRunEnvVaultLifecycleLiveDB(t *testing.T) {
 	if got := len(load()); got != 0 {
 		t.Fatalf("%d env rows survived an account reset", got)
 	}
+}
+
+func envConflictCode(rec *httptest.ResponseRecorder) string {
+	var e struct{ Code string }
+	_ = json.Unmarshal(rec.Body.Bytes(), &e)
+	return e.Code
+}
+
+// A name freed by a pending deletion can be re-created as a new variable, but the
+// pending row still counts toward the per-scope count and value-byte limits.
+func TestRunEnvRecreateAgainstPendingDeletionLimitsLiveDB(t *testing.T) {
+	secretBody := func(n int) string { return jsonBody(map[string]any{"value": secretFixture(n)}) }
+
+	t.Run("count", func(t *testing.T) {
+		f := newEnvFixture(t)
+		f.withReceipts()
+		for i := range runenv.MaxVarsPerScope {
+			f.put(fmt.Sprintf("S_%02d", i), secretBody(i), http.StatusCreated)
+		}
+		f.must(f.do(http.MethodDelete, "/S_49", ""), http.StatusAccepted) // 49 live + 1 pending
+		if f.rowCount("pending_delete_at IS NOT NULL") != 1 {
+			t.Fatal("no pending-deletion row")
+		}
+		rec := f.do(http.MethodPut, "/S_49", secretBody(49))
+		f.must(rec, http.StatusConflict)
+		if envConflictCode(rec) != "env_limit_reached" {
+			t.Fatalf("re-create at the limit: %s", rec.Body.String())
+		}
+		// One live variable fewer (it has no receipt, so it is dropped at once): 48 live + 1
+		// pending fit, and the name comes back as a new variable.
+		f.h.runEnvHasReceipt = func(context.Context, uuid.UUID, int32) (bool, error) { return false, nil }
+		f.must(f.do(http.MethodDelete, "/S_00", ""), http.StatusOK)
+		f.put("S_49", secretBody(49), http.StatusCreated)
+		if f.rowCount("name='S_49' AND pending_delete_at IS NOT NULL") != 1 || f.rowCount("name='S_49' AND pending_delete_at IS NULL") != 1 {
+			t.Fatal("expected one pending and one live S_49")
+		}
+	})
+
+	t.Run("bytes", func(t *testing.T) {
+		f := newEnvFixture(t)
+		f.withReceipts()
+		for i := range 3 {
+			f.put(fmt.Sprintf("BIG_%d", i), jsonBody(map[string]any{"value": strings.Repeat("a", 65536)}), http.StatusCreated)
+		}
+		f.put("BIG_3", jsonBody(map[string]any{"value": strings.Repeat("a", 65536-8)}), http.StatusCreated) // 262136 bytes
+		f.must(f.do(http.MethodDelete, "/BIG_3", ""), http.StatusAccepted)                                  // the pending row keeps them
+		rec := f.do(http.MethodPut, "/BIG_3", jsonBody(map[string]any{"value": strings.Repeat("b", 9)}))
+		f.must(rec, http.StatusConflict) // 262136 + 9 > 262144
+		if envConflictCode(rec) != "env_limit_reached" {
+			t.Fatalf("re-create over the byte limit: %s", rec.Body.String())
+		}
+		f.put("BIG_3", jsonBody(map[string]any{"value": strings.Repeat("b", 8)}), http.StatusCreated) // exactly 262144
+	})
+}
+
+// A description-only save that commits between the planning read and the write
+// transaction does not bump rev; the value save that follows keeps its description.
+func TestRunEnvValueSaveKeepsConcurrentDescriptionLiveDB(t *testing.T) {
+	f := newEnvFixture(t)
+	f.put("API_BASE", jsonBody(map[string]any{"value": "first-value", "secret": false, "description": "old"}), http.StatusCreated)
+	f.h.secretBeginTx = func(ctx context.Context) (pgx.Tx, error) {
+		f.h.secretBeginTx = nil // the nested save below takes the ordinary transaction
+		f.put("API_BASE", jsonBody(map[string]any{"description": "new"}), http.StatusOK)
+		return f.h.pool.BeginTx(ctx, pgx.TxOptions{})
+	}
+	got := f.put("API_BASE", jsonBody(map[string]any{"value": "second-value"}), http.StatusOK)
+	if got.Rev != 2 || got.Description != "new" {
+		t.Fatalf("new version lost the concurrent description: rev=%d description=%q", got.Rev, got.Description)
+	}
+	if v := f.find(f.list(), "API_BASE"); v == nil || v.Description != "new" || v.Value == nil || *v.Value != "second-value" {
+		t.Fatalf("list: %+v", v)
+	}
+}
+
+// A repo deleted between the ownership check and the write transaction answers 404
+// on every writer (create, rotate, disable), never a 500 or a hang.
+func TestRunEnvWriteAgainstDeletedRepoIs404LiveDB(t *testing.T) {
+	deleteRepoInHook := func(f *envFixture) {
+		f.h.secretBeginTx = func(ctx context.Context) (pgx.Tx, error) {
+			f.h.secretBeginTx = nil
+			cliMustExec(t, f.pool, `DELETE FROM repos WHERE id=$1`, f.repo)
+			return f.h.pool.BeginTx(ctx, pgx.TxOptions{})
+		}
+	}
+	t.Run("create", func(t *testing.T) {
+		f := newEnvFixture(t)
+		deleteRepoInHook(f)
+		f.must(f.do(http.MethodPut, "/NEW_ONE", jsonBody(map[string]any{"value": secretFixture(1)})), http.StatusNotFound)
+	})
+	t.Run("rotate", func(t *testing.T) {
+		f := newEnvFixture(t)
+		f.put("OLD_ONE", jsonBody(map[string]any{"value": secretFixture(1)}), http.StatusCreated)
+		deleteRepoInHook(f)
+		f.must(f.do(http.MethodPut, "/OLD_ONE", jsonBody(map[string]any{"value": secretFixture(2)})), http.StatusNotFound)
+	})
+	t.Run("disable", func(t *testing.T) {
+		f := newEnvFixture(t)
+		f.put("OLD_ONE", jsonBody(map[string]any{"value": secretFixture(1)}), http.StatusCreated)
+		deleteRepoInHook(f)
+		f.must(f.do(http.MethodPost, "/OLD_ONE/disable", ""), http.StatusNotFound)
+	})
+}
+
+// Deleting a repo removes its variables (every version) through the handler.
+func TestRunEnvRepoDeleteRemovesVariablesLiveDB(t *testing.T) {
+	f := newEnvFixture(t)
+	f.withReceipts()
+	f.put("KEEP_ME", jsonBody(map[string]any{"value": secretFixture(1)}), http.StatusCreated)
+	f.put("KEEP_ME", jsonBody(map[string]any{"value": secretFixture(2)}), http.StatusOK) // retires v1
+	f.put("PLAIN_ONE", jsonBody(map[string]any{"value": "x", "secret": false}), http.StatusCreated)
+	if f.rowCount("true") != 3 {
+		t.Fatalf("rows = %d, want 3", f.rowCount("true"))
+	}
+	cliMustExec(t, f.pool, `UPDATE repos SET enabled=false WHERE id=$1`, f.repo)
+	rec := cookieReq(t, f.router, http.MethodDelete, "/api/repos/"+f.repo.String(), f.jwt, "")
+	f.must(rec, http.StatusNoContent)
+	var n int
+	if err := f.pool.QueryRow(context.Background(), `SELECT count(*) FROM run_env_vars WHERE repo_id=$1`, f.repo).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("env rows after repo delete = %d, %v", n, err)
+	}
+}
+
+// The table refuses the nil-AAD legacy marker, so no env row can be opened without
+// the name/repo binding.
+func TestRunEnvTableRefusesMasterSealedLiveDB(t *testing.T) {
+	f := newEnvFixture(t)
+	f.put("A_PLAIN", jsonBody(map[string]any{"value": "plain-value", "secret": false}), http.StatusCreated)
+	if _, err := f.pool.Exec(context.Background(), `UPDATE run_env_vars SET sealed_with='master' WHERE repo_id=$1`, f.repo); err == nil {
+		t.Fatal("sealed_with='master' was accepted on a run_env_vars row")
+	}
+}
+
+// Rotating a value without a receipt replaces its ciphertext in place; a larger value
+// that would push the owner's vault material past the conversion budget is refused.
+func TestRunEnvRotationVaultMaterialHeadroomLiveDB(t *testing.T) {
+	const maxMaterialBytes = 64 * 1024 * 1024 // vault.maxMaterialBytes
+	const rowBytes = 1024 * 1024
+	f := newEnvFixture(t)
+	f.put("ROTATE_ME", jsonBody(map[string]any{"value": secretFixture(1)}), http.StatusCreated)
+	other := envSecondRepo(t, f.pool, f.repo)
+	t.Cleanup(func() { _, _ = f.pool.Exec(context.Background(), `DELETE FROM run_env_vars WHERE repo_id=$1`, other) })
+
+	totals, err := store.New(f.pool).GetVaultMaterialTotals(context.Background(), f.owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const slack = 30000
+	last := maxMaterialBytes - slack - totals.CiphertextBytes - 63*rowBytes
+	fill := func(name string, count, size int64) {
+		t.Helper()
+		cliMustExec(t, f.pool, `INSERT INTO run_env_vars (var_id, user_id, repo_id, name, secret, ciphertext, sealed_with, value_bytes, rev)
+			SELECT gen_random_uuid(), $1, $2, $3 || i, false, decode(repeat('00', $5::int), 'hex'), 'master_aad', 1, 1
+			FROM generate_series(1, $4::int) AS i`, f.owner, other, name, count, size)
+	}
+	fill("FILL_A_", 63, rowBytes)
+	fill("FILL_B_", 1, last)
+
+	rec := f.do(http.MethodPut, "/ROTATE_ME", jsonBody(map[string]any{"value": strings.Repeat("r", 50000)}))
+	f.must(rec, http.StatusConflict)
+	if envConflictCode(rec) != "env_history_full" {
+		t.Fatalf("rotation past the vault material budget: %s", rec.Body.String())
+	}
+	if v := f.find(f.list(), "ROTATE_ME"); v == nil || v.Rev != 1 {
+		t.Fatalf("a refused rotation moved the variable: %+v", v)
+	}
+	f.put("ROTATE_ME", jsonBody(map[string]any{"value": strings.Repeat("r", 10000)}), http.StatusOK) // growth inside the slack
 }

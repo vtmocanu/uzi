@@ -8,7 +8,8 @@ SET LOCAL lock_timeout = '5s';
 -- disabled row (disabled_at) is still live. repo_id NULL is the user-level scope.
 --
 -- Every value, plain or secret, is sealed through the vault seam (sealed_with is the
--- same discriminator user_secrets carries), bound by an AAD that names the scope, repo,
+-- same discriminator user_secrets carries, minus the nil-AAD legacy 'master': a new table
+-- has no legacy rows, and a nil-AAD seal would not bind the value to its name), bound by an AAD that names the scope, repo,
 -- secret flag and variable name (internal/runenv AADKind). value_bytes is the plaintext
 -- length, kept so the per-scope and retired-history byte limits need no decryption.
 CREATE TABLE run_env_vars (
@@ -20,7 +21,7 @@ CREATE TABLE run_env_vars (
     secret            boolean NOT NULL,
     description       text NOT NULL DEFAULT '' CHECK (octet_length(description) <= 1024),
     ciphertext        bytea NOT NULL,
-    sealed_with       text NOT NULL CHECK (sealed_with IN ('master', 'master_aad', 'dek')),
+    sealed_with       text NOT NULL CHECK (sealed_with IN ('master_aad', 'dek')),
     value_bytes       integer NOT NULL CHECK (value_bytes BETWEEN 0 AND 65536),
     rev               integer NOT NULL CHECK (rev >= 1),
     retired_at        timestamptz,

@@ -866,6 +866,8 @@ export interface Repo {
   /** Separate checker consent; absent on older APIs means off. */
   cross_check_repo_instructions_enabled?: boolean;
   code_cross_check_guidance?: string | null;
+  /** Live environment variables (enabled and disabled; not those pending deletion). */
+  env_var_count: number;
   id: string;
   connection_id: string;
   forge_project_id: number;

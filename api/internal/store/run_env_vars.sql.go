@@ -14,12 +14,17 @@ import (
 
 const countRunEnvVarsForRepo = `-- name: CountRunEnvVarsForRepo :one
 SELECT count(*)::bigint AS var_count FROM run_env_vars
-WHERE repo_id = $1 AND retired_at IS NULL AND pending_delete_at IS NULL
+WHERE user_id = $1 AND repo_id = $2 AND retired_at IS NULL AND pending_delete_at IS NULL
 `
 
+type CountRunEnvVarsForRepoParams struct {
+	UserID uuid.UUID   `json:"user_id"`
+	RepoID pgtype.UUID `json:"repo_id"`
+}
+
 // Live variables of one repo, for the repo DTO of the single-repo responses.
-func (q *Queries) CountRunEnvVarsForRepo(ctx context.Context, repoID pgtype.UUID) (int64, error) {
-	row := q.db.QueryRow(ctx, countRunEnvVarsForRepo, repoID)
+func (q *Queries) CountRunEnvVarsForRepo(ctx context.Context, arg CountRunEnvVarsForRepoParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countRunEnvVarsForRepo, arg.UserID, arg.RepoID)
 	var var_count int64
 	err := row.Scan(&var_count)
 	return var_count, err
@@ -42,13 +47,30 @@ func (q *Queries) DeleteRunEnvVarVersion(ctx context.Context, arg DeleteRunEnvVa
 	return result.RowsAffected(), nil
 }
 
+const deleteRunEnvVarsForRepo = `-- name: DeleteRunEnvVarsForRepo :execrows
+DELETE FROM run_env_vars WHERE user_id = $1 AND repo_id = $2
+`
+
+type DeleteRunEnvVarsForRepoParams struct {
+	UserID uuid.UUID   `json:"user_id"`
+	RepoID pgtype.UUID `json:"repo_id"`
+}
+
+// Every version row of a repo scope, for the repo delete handler.
+func (q *Queries) DeleteRunEnvVarsForRepo(ctx context.Context, arg DeleteRunEnvVarsForRepoParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteRunEnvVarsForRepo, arg.UserID, arg.RepoID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const getLiveRunEnvVarByName = `-- name: GetLiveRunEnvVarByName :one
 SELECT id, var_id, user_id, repo_id, name, secret, description, ciphertext, sealed_with, value_bytes,
        rev, retired_at, disabled_at, pending_delete_at, created_at, updated_at
 FROM run_env_vars
 WHERE user_id = $1 AND repo_id = $2 AND name = $3
   AND retired_at IS NULL AND pending_delete_at IS NULL
-FOR UPDATE
 `
 
 type GetLiveRunEnvVarByNameParams struct {
@@ -57,9 +79,50 @@ type GetLiveRunEnvVarByNameParams struct {
 	Name   string      `json:"name"`
 }
 
-// The live row of a repo-scope name, locked for the write that follows.
+// The live row of a repo-scope name. A plain read: the handler's planning read runs
+// outside any transaction.
 func (q *Queries) GetLiveRunEnvVarByName(ctx context.Context, arg GetLiveRunEnvVarByNameParams) (RunEnvVar, error) {
 	row := q.db.QueryRow(ctx, getLiveRunEnvVarByName, arg.UserID, arg.RepoID, arg.Name)
+	var i RunEnvVar
+	err := row.Scan(
+		&i.ID,
+		&i.VarID,
+		&i.UserID,
+		&i.RepoID,
+		&i.Name,
+		&i.Secret,
+		&i.Description,
+		&i.Ciphertext,
+		&i.SealedWith,
+		&i.ValueBytes,
+		&i.Rev,
+		&i.RetiredAt,
+		&i.DisabledAt,
+		&i.PendingDeleteAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const getLiveRunEnvVarByNameForUpdate = `-- name: GetLiveRunEnvVarByNameForUpdate :one
+SELECT id, var_id, user_id, repo_id, name, secret, description, ciphertext, sealed_with, value_bytes,
+       rev, retired_at, disabled_at, pending_delete_at, created_at, updated_at
+FROM run_env_vars
+WHERE user_id = $1 AND repo_id = $2 AND name = $3
+  AND retired_at IS NULL AND pending_delete_at IS NULL
+FOR UPDATE
+`
+
+type GetLiveRunEnvVarByNameForUpdateParams struct {
+	UserID uuid.UUID   `json:"user_id"`
+	RepoID pgtype.UUID `json:"repo_id"`
+	Name   string      `json:"name"`
+}
+
+// The same row, locked for the write that follows inside the secret-mutation transaction.
+func (q *Queries) GetLiveRunEnvVarByNameForUpdate(ctx context.Context, arg GetLiveRunEnvVarByNameForUpdateParams) (RunEnvVar, error) {
+	row := q.db.QueryRow(ctx, getLiveRunEnvVarByNameForUpdate, arg.UserID, arg.RepoID, arg.Name)
 	var i RunEnvVar
 	err := row.Scan(
 		&i.ID,
@@ -311,6 +374,20 @@ func (q *Queries) ListRunEnvVarsForRepo(ctx context.Context, arg ListRunEnvVarsF
 		return nil, err
 	}
 	return items, nil
+}
+
+const lockRepoKeyShare = `-- name: LockRepoKeyShare :one
+SELECT 1::int AS present FROM repos WHERE id = $1 FOR KEY SHARE
+`
+
+// Pins the repo row for the rest of the transaction, so a concurrent repo delete cannot
+// cascade into the env rows this write is about to touch (and cannot deadlock with it).
+// No row: the repo is gone.
+func (q *Queries) LockRepoKeyShare(ctx context.Context, repoID uuid.UUID) (int32, error) {
+	row := q.db.QueryRow(ctx, lockRepoKeyShare, repoID)
+	var present int32
+	err := row.Scan(&present)
+	return present, err
 }
 
 const markRunEnvVarPendingDeletion = `-- name: MarkRunEnvVarPendingDeletion :execrows

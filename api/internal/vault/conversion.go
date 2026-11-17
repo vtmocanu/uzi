@@ -230,6 +230,9 @@ func (v *Vault) convertMaterial(ctx context.Context, q Store, userID uuid.UUID, 
 			if err := progress.add(1, size); err != nil {
 				return err
 			}
+			if row.SealedWith == store.SealedWithMaster {
+				return ErrInvalidState // env rows are never sealed without AAD (table CHECK)
+			}
 			if !lazy || row.SealedWith != store.SealedWithDEK {
 				scope, repoID := runenv.ScopeUser, (*uuid.UUID)(nil)
 				if row.RepoID.Valid {

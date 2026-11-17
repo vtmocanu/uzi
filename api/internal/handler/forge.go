@@ -857,7 +857,7 @@ func (h *Handler) SetRepoEnabled(w http.ResponseWriter, r *http.Request) {
 	}
 
 	dto := repoToDTO(repo)
-	dto.EnvVarCount = h.envVarCountForRepo(r.Context(), repo.ID)
+	dto.EnvVarCount = h.envVarCountForRepo(r.Context(), user.ID, repo.ID)
 	httpx.JSON(w, http.StatusOK, map[string]any{"repo": dto})
 }
 
@@ -976,7 +976,20 @@ func (h *Handler) DeleteRepo(w http.ResponseWriter, r *http.Request) {
 	// The :execrows return may be 0 if a concurrent enable slipped in between the
 	// fetch above and this delete — that is the D6 `enabled = false` guard working, so
 	// treat 0 rows as an already-gone no-op and still return 204, never 500.
-	if _, err := h.q.DeleteRepoForUser(r.Context(), store.DeleteRepoForUserParams{ID: id, UserID: user.ID}); err != nil {
+	// The repo's run environment variables go first, in the same transaction and under the
+	// owner's secret-mutation lock and users-row fence, so a save or a vault conversion
+	// (both take that lock) never meets the cascade half way; a refused repo delete rolls
+	// the variables back with it.
+	if err := h.withSecretLock(r.Context(), user.ID, nil, func(q *store.Queries) error {
+		if _, err := q.LockUserVaultState(r.Context(), user.ID); err != nil {
+			return err
+		}
+		if _, err := q.DeleteRunEnvVarsForRepo(r.Context(), store.DeleteRunEnvVarsForRepoParams{UserID: user.ID, RepoID: pgtype.UUID{Bytes: id, Valid: true}}); err != nil {
+			return err
+		}
+		_, err := q.DeleteRepoForUser(r.Context(), store.DeleteRepoForUserParams{ID: id, UserID: user.ID})
+		return err
+	}); err != nil {
 		// A sweep recorded a salvage row between the salvage count above and this delete:
 		// the RESTRICT FK refused the cascade. Same 409 as the guard, never a 500.
 		if isSalvageRestrict(err) {
@@ -1516,7 +1529,7 @@ func (h *Handler) PatchRepo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	repoDTO := repoToDTO(repo)
-	repoDTO.EnvVarCount = h.envVarCountForRepo(r.Context(), repo.ID)
+	repoDTO.EnvVarCount = h.envVarCountForRepo(r.Context(), user.ID, repo.ID)
 	response := map[string]any{"repo": repoDTO}
 	var overlap []string
 	for _, cap := range repo.RequiredCapabilities {

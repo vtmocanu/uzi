@@ -12,13 +12,32 @@ WHERE user_id = @user_id AND repo_id = @repo_id AND retired_at IS NULL
 ORDER BY name, (pending_delete_at IS NOT NULL), rev DESC;
 
 -- name: GetLiveRunEnvVarByName :one
--- The live row of a repo-scope name, locked for the write that follows.
+-- The live row of a repo-scope name. A plain read: the handler's planning read runs
+-- outside any transaction.
+SELECT id, var_id, user_id, repo_id, name, secret, description, ciphertext, sealed_with, value_bytes,
+       rev, retired_at, disabled_at, pending_delete_at, created_at, updated_at
+FROM run_env_vars
+WHERE user_id = @user_id AND repo_id = @repo_id AND name = @name
+  AND retired_at IS NULL AND pending_delete_at IS NULL;
+
+-- name: GetLiveRunEnvVarByNameForUpdate :one
+-- The same row, locked for the write that follows inside the secret-mutation transaction.
 SELECT id, var_id, user_id, repo_id, name, secret, description, ciphertext, sealed_with, value_bytes,
        rev, retired_at, disabled_at, pending_delete_at, created_at, updated_at
 FROM run_env_vars
 WHERE user_id = @user_id AND repo_id = @repo_id AND name = @name
   AND retired_at IS NULL AND pending_delete_at IS NULL
 FOR UPDATE;
+
+-- name: LockRepoKeyShare :one
+-- Pins the repo row for the rest of the transaction, so a concurrent repo delete cannot
+-- cascade into the env rows this write is about to touch (and cannot deadlock with it).
+-- No row: the repo is gone.
+SELECT 1::int AS present FROM repos WHERE id = @repo_id FOR KEY SHARE;
+
+-- name: DeleteRunEnvVarsForRepo :execrows
+-- Every version row of a repo scope, for the repo delete handler.
+DELETE FROM run_env_vars WHERE user_id = @user_id AND repo_id = @repo_id;
 
 -- name: GetRunEnvScopeUsage :one
 -- What a repo scope holds against the per-scope limits: live rows and rows pending
@@ -85,4 +104,4 @@ GROUP BY repo_id;
 -- name: CountRunEnvVarsForRepo :one
 -- Live variables of one repo, for the repo DTO of the single-repo responses.
 SELECT count(*)::bigint AS var_count FROM run_env_vars
-WHERE repo_id = @repo_id AND retired_at IS NULL AND pending_delete_at IS NULL;
+WHERE user_id = @user_id AND repo_id = @repo_id AND retired_at IS NULL AND pending_delete_at IS NULL;

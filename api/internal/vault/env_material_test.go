@@ -137,6 +137,23 @@ func TestEnvMaterialCountsTowardConversionLimit(t *testing.T) {
 	}
 }
 
+// An env row marked sealed_with=master (nil AAD) never exists (the table CHECK); a
+// conversion that meets one refuses instead of opening it without its binding.
+func TestEnvMaterialConversionRefusesMasterMarkedRow(t *testing.T) {
+	v, _, st := newTestVaultWithStore(t)
+	uid := uuid.New()
+	st.states[uid] = store.LockVaultAuthStateRow{VaultMode: store.VaultModeUnprotected, VaultEpoch: 2}
+	repo := pgtype.UUID{Bytes: uuid.New(), Valid: true}
+	st.envs = append(st.envs, &fakeEnv{id: uuid.New(), userID: uid, repoID: repo, name: "LEGACY", ciphertext: []byte{1}, sealedWith: store.SealedWithMaster})
+	err := v.Enable(context.Background(), uid, "current-login-password")
+	if !errors.Is(err, ErrInvalidState) {
+		t.Fatalf("Enable with a master-marked env row = %v; want ErrInvalidState", err)
+	}
+	if got := st.state(uid); got.VaultMode != store.VaultModeUnprotected || got.VaultEpoch != 2 {
+		t.Fatalf("a refused conversion changed state: %+v", got)
+	}
+}
+
 func TestCheckMaterialHeadroomBoundary(t *testing.T) {
 	at := store.GetVaultMaterialTotalsRow{MaterialRows: maxMaterialRows - 1, CiphertextBytes: maxMaterialBytes - 100}
 	if err := CheckMaterialHeadroom(at, 1, 100); err != nil {

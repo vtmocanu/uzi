@@ -40,6 +40,28 @@ const (
 // locked re-read inside the transaction.
 var errRunEnvChanged = errors.New("run env: the variable changed concurrently")
 
+// errRunEnvRepoGone: the repo was deleted between the ownership check and the write.
+var errRunEnvRepoGone = errors.New("run env: repo not found")
+
+// lockRunEnvRepo pins the repo row (FOR KEY SHARE) right after the users-row fence and
+// before any run_env_vars statement, so a concurrent repo delete (whose cascade takes the
+// env rows) cannot interleave with this write. The lock order of every env writer is:
+// secret-mutation advisory lock, users row, repos row, env rows.
+func lockRunEnvRepo(ctx context.Context, q *store.Queries, repoID uuid.UUID) error {
+	if _, err := q.LockRepoKeyShare(ctx, repoID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return errRunEnvRepoGone
+		}
+		return err
+	}
+	return nil
+}
+
+// runEnvMasterSealed: an env row sealed under the nil-AAD legacy marker. The table never
+// admits one (its CHECK), so seeing one means the row was tampered with; it is refused
+// rather than opened without its name/repo binding.
+func runEnvMasterSealed(sealedWith string) bool { return sealedWith == store.SealedWithMaster }
+
 // runEnvConflictError is a 409 raised inside a write transaction.
 type runEnvConflictError struct{ code, message string }
 
@@ -102,6 +124,8 @@ func (h *Handler) writeRunEnvTxError(w http.ResponseWriter, err error, op string
 	case h.writeVaultLocked(w, err):
 	case errors.As(err, &conflict):
 		writeRunEnvConflict(w, conflict.code, conflict.message)
+	case errors.Is(err, errRunEnvRepoGone), errors.As(err, &pgErr) && pgErr.Code == "23503":
+		httpx.Error(w, http.StatusNotFound, "repo not found")
 	case errors.Is(err, errRunEnvChanged), errors.As(err, &pgErr) && pgErr.Code == "23505":
 		writeRunEnvConflict(w, runEnvCodeChanged, "the variable changed while you were saving; reload and try again")
 	default:
@@ -141,6 +165,11 @@ func (h *Handler) runEnvDTO(userID, repoID uuid.UUID, row runEnvRow) (dto apityp
 		return dto, false
 	}
 	if h.vault == nil {
+		dto.ValueWithheld = true
+		return dto, false
+	}
+	if runEnvMasterSealed(row.SealedWith) {
+		slog.Error("run env value sealed without AAD", "name", row.Name)
 		dto.ValueWithheld = true
 		return dto, false
 	}
@@ -287,6 +316,11 @@ func (h *Handler) PutRepoEnvVar(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 			return
 		}
+		if runEnvMasterSealed(cur.SealedWith) {
+			slog.Error("run env value sealed without AAD", "name", name)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
 		old, openErr := h.vault.Open(userID, runenv.AADKind(runenv.ScopeRepo, &repoID, cur.Secret, name), cur.SealedWith, cur.Ciphertext)
 		if openErr != nil {
 			if h.writeVaultLocked(w, openErr) {
@@ -319,7 +353,10 @@ func (h *Handler) PutRepoEnvVar(w http.ResponseWriter, r *http.Request) {
 
 	var saved runEnvRow
 	err = h.withSecretLock(ctx, userID, &material, func(q *store.Queries) error {
-		live, getErr := q.GetLiveRunEnvVarByName(ctx, store.GetLiveRunEnvVarByNameParams{UserID: userID, RepoID: repo, Name: name})
+		if err := lockRunEnvRepo(ctx, q, repoID); err != nil {
+			return err
+		}
+		live, getErr := q.GetLiveRunEnvVarByNameForUpdate(ctx, store.GetLiveRunEnvVarByNameForUpdateParams{UserID: userID, RepoID: repo, Name: name})
 		switch {
 		case exists && getErr != nil, exists && (live.ID != cur.ID || live.Rev != cur.Rev):
 			if getErr != nil && !errors.Is(getErr, pgx.ErrNoRows) {
@@ -340,6 +377,13 @@ func (h *Handler) PutRepoEnvVar(w http.ResponseWriter, r *http.Request) {
 			return err
 		}
 		newBytes := int64(len(value))
+		// A description-only save does not bump rev, so one committed between the planning
+		// read and this transaction passes the id/rev check: an omitted description keeps
+		// the locked row's, not the planning read's.
+		description := description
+		if exists && req.Description == nil {
+			description = live.Description
+		}
 		params := store.InsertRunEnvVarParams{
 			UserID: userID, RepoID: repo, Name: name, Secret: secret, Description: description,
 			Ciphertext: material.Ciphertext, SealedWith: material.SealedWith, ValueBytes: int32(newBytes), //nolint:gosec // G115: bounded to 65536 by ValidateValue.
@@ -384,11 +428,17 @@ func (h *Handler) PutRepoEnvVar(w http.ResponseWriter, r *http.Request) {
 					}
 					return err
 				}
-			} else if n, err := q.DeleteRunEnvVarVersion(ctx, store.DeleteRunEnvVarVersionParams{ID: live.ID, UserID: userID}); err != nil || n != 1 {
-				if err == nil {
-					err = errRunEnvChanged
+			} else {
+				// The old ciphertext is replaced, so only growth counts against the vault totals.
+				if err := vault.CheckMaterialHeadroom(totals, 0, int64(len(material.Ciphertext))-int64(len(live.Ciphertext))); err != nil {
+					return &runEnvConflictError{runEnvCodeHistoryFull, err.Error()}
 				}
-				return err
+				if n, err := q.DeleteRunEnvVarVersion(ctx, store.DeleteRunEnvVarVersionParams{ID: live.ID, UserID: userID}); err != nil || n != 1 {
+					if err == nil {
+						err = errRunEnvChanged
+					}
+					return err
+				}
 			}
 			params.VarID, params.Rev, params.DisabledAt = live.VarID, live.Rev+1, live.DisabledAt
 		}
@@ -446,7 +496,10 @@ func (h *Handler) mutateLiveRunEnv(ctx context.Context, userID, repoID uuid.UUID
 		if _, err := q.LockUserVaultState(ctx, userID); err != nil {
 			return err
 		}
-		live, err := q.GetLiveRunEnvVarByName(ctx, store.GetLiveRunEnvVarByNameParams{UserID: userID, RepoID: repoPG(repoID), Name: name})
+		if err := lockRunEnvRepo(ctx, q, repoID); err != nil {
+			return err
+		}
+		live, err := q.GetLiveRunEnvVarByNameForUpdate(ctx, store.GetLiveRunEnvVarByNameForUpdateParams{UserID: userID, RepoID: repoPG(repoID), Name: name})
 		if err != nil {
 			return err
 		}
@@ -573,8 +626,8 @@ func (h *Handler) envVarCountsForUser(ctx context.Context, userID uuid.UUID, log
 }
 
 // envVarCountForRepo is the single-repo form for responses that carry one RepoDTO.
-func (h *Handler) envVarCountForRepo(ctx context.Context, repoID uuid.UUID) int {
-	n, err := h.q.CountRunEnvVarsForRepo(ctx, repoPG(repoID))
+func (h *Handler) envVarCountForRepo(ctx context.Context, userID, repoID uuid.UUID) int {
+	n, err := h.q.CountRunEnvVarsForRepo(ctx, store.CountRunEnvVarsForRepoParams{UserID: userID, RepoID: repoPG(repoID)})
 	if err != nil {
 		slog.Warn("repo response: env var count", "error", err)
 		return 0
