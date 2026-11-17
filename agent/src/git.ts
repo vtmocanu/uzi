@@ -525,21 +525,23 @@ export function classifyGitStderr(error: unknown): "transient" | "permanent" {
   return stderr ? classifyGitStderrText(stderr) : "permanent";
 }
 
-const BARE_REMOTE_REJECTED_FAILED = /^\s*!\s+\[remote rejected\]\s+\S+\s+->\s+\S+\s+\(failed\)\s*$/;
+const BARE_REMOTE_REJECTED_RETRYABLE = /^\s*!\s+\[remote rejected\]\s+\S+\s+->\s+\S+\s+\((?:failed|missing necessary objects)\)\s*$/;
 const PUSH_FRAMING_LINES: RegExp[] = [
   /^To \S+\s*$/,
-  BARE_REMOTE_REJECTED_FAILED,
+  BARE_REMOTE_REJECTED_RETRYABLE,
   /^error: failed to push some refs to '[^']*'\s*$/,
   /^remote:\s*$/,
   /^\s*$/,
 ];
 
 /**
- * Classify push stderr text (#3929, ADR-0284 amendment). GitHub was observed refusing a push with a
+ * Classify push stderr text (#3929, #4438, ADR-0284 amendment). GitHub was observed refusing a push with a
  * bare ` ! [remote rejected] <sha> -> <branch> (failed)` and no stated reason (cause undocumented and
- * unproven); the permanent `remote rejected` pattern would fail that fast. By decision, that shape is
- * transient only when at least one bare `(failed)` status line is present and every line is a whole git
- * framing line (`To <url>`, the bare status line, `error: failed to push some refs`, empty `remote:`).
+ * unproven), and later with `(missing necessary objects)` (#4438, cause also unproven); the permanent
+ * `remote rejected` pattern would fail those fast. By decision, retrying them is a policy exception: the
+ * shape is transient only when at least one bare `(failed)` or `(missing necessary objects)` status line
+ * is present and every line is a whole git framing line (`To <url>`, the bare status line,
+ * `error: failed to push some refs`, empty `remote:`).
  * Any other line, a `remote:` diagnostic included, may state a reason and keeps today's classification.
  * Framing lines carry the branch and URL, so they are matched whole (`agent/issue-404` must not decide);
  * nothing inside any other line is masked.
@@ -548,7 +550,8 @@ export function classifyGitStderrText(stderr: string): "transient" | "permanent"
   if (!stderr.trim()) return "permanent";
   const lines = stderr.split(/\r?\n|\r/);
   // Every other line, any other `remote rejected` reason or a `[rejected]` line included, is not framing.
-  if (lines.some((l) => BARE_REMOTE_REJECTED_FAILED.test(l)) && lines.every((l) => PUSH_FRAMING_LINES.some((re) => re.test(l)))) {
+  // Both retryable reasons (`failed`, `missing necessary objects`) are a policy exception (#3929, #4438).
+  if (lines.some((l) => BARE_REMOTE_REJECTED_RETRYABLE.test(l)) && lines.every((l) => PUSH_FRAMING_LINES.some((re) => re.test(l)))) {
     return "transient";
   }
   return classifyForgeError(new Error(stderr));
