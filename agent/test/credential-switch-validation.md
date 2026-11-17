@@ -693,3 +693,22 @@ removed; primary unchanged. Source feasibility was independently traced before
 execution. E4 proves first-STOP detection of this custody disposition only.
 Replay, other dispositions and other m3/m4 obligations remain required and
 unvalidated; no full-suite, CI-performance or security result is claimed.
+
+
+## First-STOP paused-time write control
+
+E5 records a single accounting-field effect at d5834ca78: adding one to
+budget_paused_seconds in the existing stopped UPDATE, with source and generated
+SQL changed mechanically. No guard, fixture or other effect changes. The real
+open_custody route/store run acknowledges settlement, then its full RUN-row
+preservation assertion fails at :101, `first stop changed unrelated run fields`.
+
+Receipt .uzi/scratch/stopped-timebank-effect-results.json records compiling
+mutant exit 1 in gate-log.tRi9CC, with no skipped target, SQLSTATE, build failure
+or timeout. Prior E4 greens eOP2LA and bkwEJh are reused: exact selected leaf,
+command, raw log hashes, API tree and docs-only revision delta were verified.
+No new E5 positive runs are claimed. The lead independently checked exact
+mutation reconstruction, raw outcomes/hashes, tree equality and cleanup exit 0.
+Export removed, primary unchanged. Only direct first-STOP paused-time credit
+sensitivity is proved; replay/other accounting triggers and remaining m3/m4
+criteria are still required and incomplete. No full-suite or security credit.

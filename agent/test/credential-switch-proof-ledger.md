@@ -431,7 +431,7 @@ control is still absent, not that the functional criterion was deferred.
 | Stopped refusal of claimed status | D25–D56: running/paused status_claimed; other statuses unvalidated |
 | Stopped ownership, lane and policy fences | D57–D60 credit pending-fresh/unresolved-outcome; D61 paused policy-hold; D62/D63 stable user-owner mismatch running/paused. D64–D73 credit the five enumerated STOP lane exclusions running/paused; concurrent owner changes and other policy clauses unvalidated |
 | Stopped replay after withdrawn X/Y; resume/reclaim and incarnation changes | Unvalidated; the fixture's single HTTP withdrawal does not discharge X/Y |
-| Stopped preservation of binding, journals, session, gates, questions and custody without input consumption/time banking | E1 base-journal deletion, E2 applied-input deletion, E3 custody timestamp corruption, E4 owner-discard/live-reference loss only; other dispositions/effects, replay sensitivity and broader clauses unvalidated |
+| Stopped preservation of binding, journals, session, gates, questions and custody without input consumption/time banking | E1 base-journal deletion, E2 applied-input deletion, E3 custody timestamp corruption, E4 owner-discard/live-reference loss, E5 direct paused-time credit only; other dispositions/effects, replay sensitivity and broader clauses unvalidated |
 | Stopped known extra typed member and register_nonce case alias | D25–D56: four running/paused wire cases only |
 | Bounded strict stopped request, other forbidden combinations, op_id and minimal acknowledgement | Unvalidated |
 | Tokens absent from all inputs/acknowledgements/messages/logs | Targeted positive assertions present; qualifying controls and m4 security gates remain required |
@@ -1124,3 +1124,50 @@ replay equality remains observed but has no separate replay-effect control.
 Only detection of this open-hold owner-discard effect is credited; other custody
 release/discard paths, replay, other preservation and remaining m3/m4 criteria
 remain required and unvalidated.
+
+
+### E5 — first-STOP paused-time credit effect-injection sensitivity control
+
+Candidate d5834ca78dd84c3b06676ad5cf33d9120299dba9. Receipt:
+.uzi/scratch/stopped-timebank-effect-results.json. Named seam: first accepted
+stopped settlement preserves budget_paused_seconds instead of banking pause
+time. This is an **effect-injection sensitivity control** on a preserved field
+whose write is absent from the stopped SET projection, not guard removal.
+
+The sole added effect is `budget_paused_seconds = r.budget_paused_seconds + 1`
+in the existing changed UPDATE, source SQL :37 and generated counterpart :47.
+Both represent the same executing query. There are no fixture, guard, CTE, other
+assignment or response changes. The receipt's exact two-file diff and hashes
+show the original six status/health assignments remain intact.
+
+The existing real-route open_custody case calls the unchanged full RUN-row
+preservation oracle, which permits only those six status/health fields to change.
+The added budget write occurs in the first eligible transition under worker/run
+locks, before commit and the post-response snapshot. After HTTP 200/applied
+acknowledgement and health checks, it fails at preservation test :101 with
+`first stop changed unrelated run fields`. The lead reconstructed both mutant
+hashes and checked the raw selected leaf failure. Thus the accounting write,
+not a fixture or SQL failure, causes the red on this actual route/transaction.
+
+With GOFLAGS=-p=1 and GOMAXPROCS=4, from exported api:
+
+```sh
+go test -buildvcs=false -race -count=1 -json -timeout=4m ./internal/handler -run '^TestWorkerCodexStoppedPreservationRouteLiveDB$/^open_custody$'
+```
+
+Mutant gate-log.tRi9CC exits 1 (173.694s), selected leaf fails without skips,
+SQLSTATE, build failure or timeout. Logs are under .uzi/scratch/. Unchanged
+green is reused from the prior E4 validator's actual gate-log.eOP2LA and
+gate-log.bkwEJh exit-0 runs of the exact same selected leaf and command. The
+only revision delta from 7e82c7be1 is the two ledger docs; API trees match,
+other build inputs are unchanged, and the receipt verifies raw log hashes,
+commands, actions and runtime/serial flags. The lead independently checked
+raw outcomes/hashes and matching API tree objects. These are reused earlier
+E4 greens, not newly executed before/after E5 gates.
+
+One export removed, exact recreated owned fixture cleanup exits 0, primary
+HEAD/status/diff and hashes preserved, prior evidence retained. No installs,
+base builds, concurrent builds, full-suite or security result. Credit is only
+sensitivity to this direct first-STOP paused-time write. Replay, other accounting
+triggers, concurrency and remaining preservation clauses are not discharged.
+The broader m3/m4 completion contract remains required and incomplete.
