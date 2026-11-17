@@ -316,7 +316,8 @@ Check these traps before every approve:
   human-reviewed plan gates only; unattended (autopilot/sweep) plans get no such review.
 - **An impossible universal proof rule.** Classify each behavioural seam before approving
   baseline-restoring mutations: changed behaviour needs a base-restoring mutant; preserved
-  behaviour needs baseline-role evidence plus a guard-removal sensitivity control through the
+  behaviour needs baseline-role evidence plus a sensitivity control (guard removal; a behavioural
+  mutation of the seam only when it has no guard) through the
   candidate's real path; novel ordering where the base refused the operation needs
   baseline-refusal evidence plus a call-relocation ordering control through that path. Split
   mixed requirements. Helper-only reds do not discharge integration requirements; no executable
