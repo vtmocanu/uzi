@@ -167,6 +167,55 @@ that interrupted post-refresh cleanup may leave switching busy until another
 refresh recovers the committed account. No production failure was executed
 for these notes, and no new cleanup subsystem is introduced by this repair.
 
+## Supplied-default merge integration
+
+The original recovery incorrectly assumed the supplied default was already
+integrated. An independent history check established that merge 5b16bb133
+used older default 912661599, not the requested 9d62bc792. The lead corrected
+that assumption and performed a real merge, without rewriting any history:
+
+```sh
+git merge --no-commit 9d62bc7925371e10d6e2833b43d469367842f8d7
+```
+
+Committed merge: c17f8bd294fd2759132d4c9745ce7a636f760dd4.
+Its second parent is the supplied default; ancestry was explicitly verified.
+The merge was conflict-free. This restored the 20 absent default commits,
+including roll-marker reporting and the corresponding tests. Comparing the
+migration directory with the supplied default now shows only the two Codex
+additions at 465 and 466.
+
+Observed checks on the merged code, with the worktree frozen and clean:
+
+- The focused workersvc command recorded above, with a newly created
+  PostgreSQL 17 fixture: exit 0; 50 top-level tests, no skips; package
+  execution 73.238 seconds.
+- `UZI_DEADCODE_AGENT_REQUIRED=1 task check:agent`: exit 0.
+- The six real Runner cases selected by
+  `M2 actualRunner .*account resumes saved thread`: exit 0, 6 passed,
+  no failures or skips; execution 24074.676 ms.
+- `task fmt-check:api fmt-check:controller check:migration-numbering check:migration-additive`:
+  exit 0, before the merge commit with the same code present.
+- `git diff --check HEAD`: exit 0.
+
+Read-only merge review by reviewer, tester and DBA at c17f8bd29 found no new
+blocking issue in their inspected overlaps. DBA confirmed restored marker
+SQL/generated argument and scan order, retained Codex fields and unchanged
+migrations. The independent auditor's focused cumulative boundary review
+reported no demonstrated Medium-or-higher issue. Scanner claims made outside
+that auditor's assigned scope are NOT credited: m4's lead-owned security
+checks remain required.
+
+Review limitations and optional notes remain explicit. At 3317c14e3, DBA
+and tester noted that the isolated migration test checks column continuity,
+not populated-row preservation, types/defaults/constraints or production lock
+duration; the raw logs do not independently embed every environment/source
+fingerprint. These limits do not turn unperformed checks into passing checks.
+The reviewer at c17f8bd29 repeated the missing before/after CI critical-path
+measurement note, including inherited real delays in worker-memory tests.
+The coordinator duplication and interrupted-refresh cleanup notes recorded
+above remain non-blocking review notes, with no new subsystem added.
+
 ## Outstanding evidence
 
 This ledger is deliberately limited to checks re-observed after recovery.
