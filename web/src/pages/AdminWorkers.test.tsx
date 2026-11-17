@@ -226,7 +226,7 @@ describe("AdminWorkers recreated cases", () => {
     expect(lease.value).toBe("30m");
     expect(lease.disabled).toBe(true);
     expect((screen.getByLabelText("Default size for new workers") as HTMLSelectElement).value).toBe("s");
-    expect(screen.getByRole("button", { name: "Reset Default size for new workers to default" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Reset to default: Default size for new workers" })).toBeTruthy();
   });
 
   it("keeps the docker allowlist Save disabled until the selection changes (dirty-check)", async () => {

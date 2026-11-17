@@ -70,6 +70,9 @@ export function SettingControl({
     try {
       const resp = await api.updateSettings({ [settingKey]: next });
       onSaved(resp);
+      // A reset whose saved value already equalled the default leaves `value` unchanged, so
+      // the effect above would not drop a dirty draft; resync it from the response here.
+      setDraft(resp.settings[settingKey as keyof typeof resp.settings] ?? value);
       setNotice(done);
     } catch (err) {
       setError(errorMessage(err, `Failed to save ${label.toLowerCase()}`));
@@ -84,7 +87,7 @@ export function SettingControl({
     void put(draft.trim(), `${label} saved.`);
   };
 
-  const describedBy = [helper ? `${id}-help` : "", `${id}-source`, invalid ? `${id}-error` : ""].filter(Boolean).join(" ");
+  const describedBy = [helper ? `${id}-help` : "", `${id}-source`, isEnv ? `${id}-env` : "", invalid ? `${id}-error` : ""].filter(Boolean).join(" ");
   const common = {
     id,
     value: draft,
@@ -134,7 +137,7 @@ export function SettingControl({
         {defaultValue !== undefined && defaultValue !== "" ? ` · built-in default ${defaultValue}` : ""}
       </p>
       {isEnv && (
-        <p className="text-xs text-muted">This setting is fixed by an environment variable and cannot be changed here.</p>
+        <p id={`${id}-env`} className="text-xs text-muted">This setting is fixed by an environment variable and cannot be changed here.</p>
       )}
       {invalid && (
         <p id={`${id}-error`} className="text-xs text-danger">
@@ -152,7 +155,7 @@ export function SettingControl({
             <Button
               type="button"
               variant="secondary"
-              aria-label={`Reset ${label} to default`}
+              aria-label={`Reset to default: ${label}`}
               disabled={busy}
               onClick={() => void put("", `${label} reset to default.`)}
             >

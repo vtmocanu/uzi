@@ -36,7 +36,7 @@ describe("EphemeralWorkersCard tuning controls", () => {
   it("shows each effective value with its source label", () => {
     renderCard({ ephemeral_max_per_user: "db", ephemeral_default_size: "env" });
     expect((screen.getByLabelText("Per-user cap") as HTMLInputElement).value).toBe("2");
-    expect((screen.getByLabelText("Default size") as HTMLSelectElement).value).toBe("m");
+    expect((screen.getByLabelText("Ephemeral default size") as HTMLSelectElement).value).toBe("m");
     expect((screen.getByLabelText("Idle lease") as HTMLInputElement).value).toBe("2h");
     expect(screen.getByText("Saved")).toBeTruthy();
     expect(screen.getByText("Set by environment")).toBeTruthy();
@@ -56,8 +56,8 @@ describe("EphemeralWorkersCard tuning controls", () => {
   it("saves the default size and the cap by their own keys", async () => {
     mockApi.updateSettings.mockResolvedValue(response({}));
     renderCard();
-    fireEvent.change(screen.getByLabelText("Default size"), { target: { value: "l-highmem" } });
-    fireEvent.click(screen.getByRole("button", { name: "Save Default size" }));
+    fireEvent.change(screen.getByLabelText("Ephemeral default size"), { target: { value: "l-highmem" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save Ephemeral default size" }));
     await waitFor(() => expect(mockApi.updateSettings).toHaveBeenCalledWith({ ephemeral_default_size: "l-highmem" }));
     fireEvent.change(screen.getByLabelText("Per-user cap"), { target: { value: "5" } });
     fireEvent.click(screen.getByRole("button", { name: "Save Per-user cap" }));
@@ -75,7 +75,7 @@ describe("EphemeralWorkersCard tuning controls", () => {
   it("resets a saved key by PUTting an empty string", async () => {
     mockApi.updateSettings.mockResolvedValue(response({}));
     renderCard({ ephemeral_lease: "db" });
-    fireEvent.click(screen.getByRole("button", { name: "Reset Idle lease to default" }));
+    fireEvent.click(screen.getByRole("button", { name: "Reset to default: Idle lease" }));
     await waitFor(() => expect(mockApi.updateSettings).toHaveBeenCalledWith({ ephemeral_lease: "" }));
   });
 
@@ -88,7 +88,7 @@ describe("EphemeralWorkersCard tuning controls", () => {
     renderCard({ ephemeral_lease: "env" });
     expect((screen.getByLabelText("Idle lease") as HTMLInputElement).disabled).toBe(true);
     expect(screen.queryByRole("button", { name: "Save Idle lease" })).toBeNull();
-    expect(screen.queryByRole("button", { name: "Reset Idle lease to default" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Reset to default: Idle lease" })).toBeNull();
   });
 
   it("shows the server's message inline when the PUT fails", async () => {

@@ -153,8 +153,9 @@ const (
 	// KeyEphemeralDefaultSize (PRD #4212) is the workersize preset every ephemeral worker is
 	// provisioned at. Overlaid by UZI_EPHEMERAL_DEFAULT_SIZE.
 	KeyEphemeralDefaultSize = "ephemeral_default_size"
-	// KeyHostedDefaultSize (PRD #4212) is the workersize preset a persistent hosted worker
-	// is provisioned at when the request names none. Runtime-tunable; no env var.
+	// KeyHostedDefaultSize (PRD #4212) is the workersize preset the persistent provision
+	// form preselects (served via HostedConfig.default_size); the provision API still
+	// requires an explicit size (ADR-2240). Runtime-tunable; no env var.
 	KeyHostedDefaultSize = "hosted_default_size"
 	// KeyEphemeralLease (PRD #4212) is how long an idle ephemeral worker lingers after its
 	// run completes: a Go duration in [0, EphemeralLeaseMax], 0 meaning no lease. Overlaid by

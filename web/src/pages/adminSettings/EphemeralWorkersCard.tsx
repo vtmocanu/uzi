@@ -98,7 +98,7 @@ export function EphemeralWorkersCard({
       />
       <SettingControl
         settingKey="ephemeral_default_size"
-        label="Default size"
+        label="Ephemeral default size"
         kind="size"
         helper="Size every auto-provisioned ephemeral worker starts at."
         value={settings.ephemeral_default_size ?? ""}

@@ -48,8 +48,8 @@ func (c *Cache) EphemeralDefaultSize(ctx context.Context) (string, error) {
 	return c.sizeSetting(ctx, KeyEphemeralDefaultSize)
 }
 
-// HostedDefaultSize returns the workersize preset a persistent hosted worker is
-// provisioned at when the request names none. A stored value that is not a known
+// HostedDefaultSize returns the workersize preset the persistent provision form
+// preselects (the provision API still requires an explicit size). A stored value that is not a known
 // preset falls back to the default. Errors only when the cache has no valid snapshot
 // and the refresh fails.
 func (c *Cache) HostedDefaultSize(ctx context.Context) (string, error) {

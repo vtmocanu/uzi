@@ -110,7 +110,7 @@ describe("HostedWorkerQuotaCard default size", () => {
   it("resets with an empty string", async () => {
     mockApi.updateSettings.mockResolvedValue(sizeResponse("l"));
     render(<HostedWorkerQuotaCard settings={withSize} sources={{ hosted_default_size: "db" }} onSaved={() => {}} />);
-    fireEvent.click(screen.getByRole("button", { name: "Reset Default size for new workers to default" }));
+    fireEvent.click(screen.getByRole("button", { name: "Reset to default: Default size for new workers" }));
     await waitFor(() => expect(mockApi.updateSettings).toHaveBeenCalledWith({ hosted_default_size: "" }));
   });
 
