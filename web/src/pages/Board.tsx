@@ -1174,10 +1174,10 @@ export function Board() {
           the mobile shell's own sticky top bar (z-20). bg-ink is the page-background
           token (tailwind.config.js: `ink: token("bg")`) — an OPAQUE backing so cards
           scroll cleanly under it (plain `bg-bg` is not a real class and renders
-          transparent). On mobile the shell's own bar is a 49px-tall sticky top-0 z-20
-          strip, so offset below it; on lg the shell bar is hidden and we pin at 0.
-          Verified in a browser pass. */}
-      <div ref={toolbarRef} className="sticky top-[49px] z-10 bg-ink lg:top-0">
+          transparent). On mobile the shell's own bar is a sticky top-0 z-20 strip whose
+          measured height AppShell writes to --app-bar-h (index.css), so offset below it;
+          on lg the shell bar is hidden and we pin at 0. Verified in a browser pass. */}
+      <div ref={toolbarRef} className="sticky top-[var(--app-bar-h)] z-10 bg-ink lg:top-0">
       <PageHeader
         backTo="/repos"
         backLabel="Repos"

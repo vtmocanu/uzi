@@ -1053,6 +1053,28 @@ export function AppShell({ children }: { children: ReactNode }) {
   // hook order stays stable; the listener is active only while signed in.
   const [menuOpen, setMenuOpen] = useState(false);
   const openNavRef = useRef<HTMLButtonElement>(null);
+  // The mobile bar's measured height feeds --app-bar-h (index.css), which every sticky
+  // offset below the bar reads (Board toolbar, PinnedBlock). Hidden at lg+ (height 0),
+  // the last measured value is kept.
+  // State, not a ref object: AppShell renders <PublicShell> while signed out, so the bar
+  // mounts later (after sign-in) and the effect must re-run when it appears.
+  const [appBar, setAppBar] = useState<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const bar = appBar;
+    if (!bar || typeof ResizeObserver === "undefined") return;
+    const write = () => {
+      const h = bar.getBoundingClientRect().height;
+      if (h > 0) {
+        document.documentElement.style.setProperty("--app-bar-h", `${h}px`);
+        // PinnedBlock's stuck observer reads its sticky `top` once; tell it the offset moved.
+        window.dispatchEvent(new CustomEvent("uzi:app-bar-h"));
+      }
+    };
+    write();
+    const ro = new ResizeObserver(write);
+    ro.observe(bar);
+    return () => ro.disconnect();
+  }, [appBar]);
   // Opening from the mobile drawer: the drawer unmounts in the same commit the menu
   // mounts, so a drawer link holding focus would vanish and Modal would record <body> as
   // the opener. Move focus to the always-present "Open navigation" button first, so Escape
@@ -1329,7 +1351,7 @@ export function AppShell({ children }: { children: ReactNode }) {
       {/* Mobile top bar + sheet */}
       {/* `frame` (PRD #1167 M4): the mobile top bar is separate from SidebarContent, so
           it carries its own frame marker to go ember-dark under Hall. Inert elsewhere. */}
-      <div className="frame sticky top-0 z-20 flex items-center gap-3 border-b border-edge bg-surface px-4 py-3 lg:hidden">
+      <div ref={setAppBar} className="frame sticky top-0 z-20 flex items-center gap-3 border-b border-edge bg-surface px-4 py-3 lg:hidden">
         <button
           ref={openNavRef}
           onClick={() => setMobileOpen(true)}
