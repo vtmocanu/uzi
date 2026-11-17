@@ -1723,7 +1723,7 @@ The actual worker route runs apply validation under worker/run locks. It locks
 aliases before accounts, takes account FOR UPDATE NOWAIT, reads A and locks
 rotating intents with FOR SHARE NOWAIT (codex_binding.sql:1117, :1123). The intent
 query uses LIMIT 1: its result length is an existence indicator, not a census
-of all active intents. The decisive call at credential_switch_codex.go:277
+of all active intents. The decisive call at credential_switch_codex.go:276
 uses codexSwitchAccountIdle at :349–353. Source census covered this validator,
 account/intent reads, and apply writer; ApplyRunCodexBinding does not duplicate
 these coordination/intent predicates. Lock-contention fences remain intact;
