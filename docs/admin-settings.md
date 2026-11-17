@@ -303,16 +303,76 @@ single setting bounds self-service provisioning:
 
 | Setting | Default | Controls |
 |---|---|---|
-| `hosted_worker_quota` | 2 | Maximum persistent hosted workers each user may provision, from 0 to 20. Every size counts as one. Zero disables self-service provisioning without changing existing workers. Ephemeral workers have a separate cap. |
+| `hosted_worker_quota` | 2 | Maximum persistent hosted workers each user may provision, from 0 to 20. Every size counts as one. Zero disables self-service provisioning without changing existing workers. Ephemeral workers have a [separate cap](#ephemeral-workers). |
+| `hosted_default_size` | `l` | Size the persistent provision form preselects: `s`, `m`, `l` or `l-highmem`. Only the preselection changes: the provision API still requires an explicit size, and existing workers keep theirs. |
 
-Edit it in the **Hosted worker quota** card on **Admin → Workers**. The value
-must be an integer from `0` to `20`; it saves independently of the other cards.
+Edit them in the **Hosted worker quota** card on **Admin → Workers**. The quota
+must be an integer from `0` to `20`; each setting saves independently of the other cards.
+Saving an empty value resets a setting to its default.
 
 Every size counts the same 1 against this quota; see
 [Hosted workers](./hosted-workers.md#type-and-size). This setting exists (and
 is editable) on every instance, including compose ones — it's simply inert
 there, since hosting itself is off unless an admin turns it on for the
 deployment (see [Configuration](./configuration.md#hosted-k8s-workers-prd-58)).
+
+## Ephemeral workers
+
+The **Ephemeral workers** card on **Admin → Workers** holds the instance switch
+(`ephemeral_workers_enabled`) and three settings that tune
+[ephemeral hosted workers](./hosted-workers.md#ephemeral-worker-lease). All of them need
+[hosted workers](./hosted-workers.md) turned on for the deployment.
+
+| Setting | Default | Controls | Env that overrides it |
+|---|---|---|---|
+| `ephemeral_max_per_user` | 2 | Maximum concurrent ephemeral workers each user may hold, from 0 to 20. `0` stops ephemeral provisioning for everyone. | `UZI_EPHEMERAL_MAX_PER_USER` |
+| `ephemeral_default_size` | `m` | Size every new ephemeral worker is provisioned at: `s`, `m`, `l` or `l-highmem`. | `UZI_EPHEMERAL_DEFAULT_SIZE` (chart `workers.ephemeralDefaultSize`) |
+| `ephemeral_lease` | `2h` | How long an idle ephemeral worker stays available to its owner's next run on the same repository and branch after a run completes. A Go duration from `0s` to `2h`; `0` means no lease. | `UZI_EPHEMERAL_LEASE` (chart `workers.ephemeralLease`) |
+
+A write that is out of range (a negative or non-integer cap, an unknown size, a lease
+above `2h` or not a duration) is refused with a field error and the stored value is
+unchanged. Saving an empty or whitespace-only value resets the setting to its default;
+surrounding whitespace is trimmed otherwise.
+
+**Environment wins.** When the environment variable in the last column is set to a
+non-empty value, it takes precedence over the saved value: the field shows
+**Set by environment** and is disabled, and `PUT /api/admin/settings` for that key is
+refused with `409`. The environment value is interpreted as it always was, so an install
+that already sets one behaves the same after upgrading:
+
+- The cap is read leniently: a malformed value or `0` becomes `2`, and a value above
+  `20` is honoured. So `UZI_EPHEMERAL_MAX_PER_USER=0` still means `2` and locks the field.
+  To stop ephemeral provisioning, unset the variable and save `0` here, or turn the
+  ephemeral workers switch off.
+- An unknown size falls back to `m`.
+- The lease is read strictly, any duration from `0` to `2h`; anything else refuses to
+  boot the api.
+
+Unset the variable (on the chart, leave `workers.ephemeralLease` and
+`workers.ephemeralDefaultSize` unset) to edit the field again.
+
+**Changes take effect without a restart.** The provisioner, reaper and hibernation
+wake pass read the cap, size and lease on every pass; run claims, the lease started when a
+run completes, worker health and the worker list's lease expiry read the current lease.
+Other api replicas see a change within the settings cache TTL.
+
+- **Lease expiry is lease start plus the current lease.** Shortening the lease releases
+  leased idle workers whose new expiry has already passed on the next reaper pass;
+  lengthening it extends the existing leases; `0` releases every leased idle worker on the
+  next pass, except ones under a custody hold.
+- **Lowering the cap evicts nothing.** An owner above the new cap keeps the workers they
+  have, and gets no new ephemeral worker until theirs are released.
+- **Existing workers keep their size.** The default size applies to workers provisioned
+  after the change.
+
+**Upgrade note.** The chart's `workers.ephemeralLease` and `workers.ephemeralDefaultSize`
+now default to unset and render their environment variable only when set (an explicit
+`0` lease still renders). An install that sets either value keeps it, and sees that field
+locked until the value is unset; an install that never set them gets editable fields with
+the same defaults (`2h` and `m`), so behaviour on upgrade is unchanged. Setting
+`UZI_EPHEMERAL_LEASE` in `api.config` or `api.secretEnv` now fails the chart render: set it
+through `workers.ephemeralLease` instead, so there is one source. The `UZI_EPHEMERAL_DEFAULT_SIZE`
+guard is unchanged.
 
 ## Worker hibernation
 
