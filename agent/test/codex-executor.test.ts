@@ -32556,6 +32556,7 @@ describe("M2 actualRunner credential replacement", () => {
         };
         const switchSettled = installerBarrier(), continuedATurn = installerBarrier();
         const forbiddenUnprovenApply = installerBarrier();
+        const forbiddenUncertainFresh = installerBarrier();
         let switchResult: Awaited<ReturnType<NonNullable<RunContext["attemptCodexCredentialSwitch"]>>> | undefined;
         let switchError: unknown;
         let failingPersist = false, persistFailures = 0, teardownAttempts = 0;
@@ -33003,6 +33004,7 @@ describe("M2 actualRunner credential replacement", () => {
             return aResponder(c);
           },
           c => {
+            if (resumeUncertain && c.method === "thread/start") forbiddenUncertainFresh.resolve();
             if (positiveBChild && c.method === "thread/start") return { thread: { id: "M3-B-child" } };
             if (positiveBChild && c.method === "turn/start" && rec(c.params).threadId === "M3-B-child") {
               assert.equal(bFinished, true, "actual child turn follows finishB");
@@ -34716,6 +34718,10 @@ describe("M2 actualRunner credential replacement", () => {
               return;
             }
             if (publication !== "gated" && publication !== "subscription-refresh" && !resumeRefusal && !preflightRetry) {
+              if (resumeUncertain) {
+                await withTimeout(Promise.race([running, forbiddenUncertainFresh.promise]), 5000, "uncertain resume retains execution or attempts forbidden fresh");
+                assert.equal(b.transport.threadStartCount, 0, "unclassified resume failure cannot send thread/start");
+              }
               await withTimeout(running, 5000, "failed publication retained stop");
               await joinNowConsumerProbes();
               assert.equal(reopenAttempts, 0);
