@@ -399,6 +399,40 @@ body {
   }
 }
 
+/* Pinned tab rows (#4419). --app-bar-h is the mobile top bar's height: this is the
+   pre-measure default (today's real height); AppShell's ResizeObserver overwrites it on
+   <html> with the measured border-box height. Every sticky offset reads it. */
+:root {
+  --app-bar-h: 53px;
+}
+
+/* While a PinnedBlock is mounted it writes --pinned-h and data-pinned-block on <html>.
+   Root scroll-padding-top keeps fragment jumps, scrollIntoView and focus-driven scrolls
+   from landing under the pinned block (and, below lg, the mobile bar). */
+html[data-pinned-block] {
+  scroll-padding-top: calc(var(--pinned-h, 0px) + 12px);
+}
+@media (max-width: 1023.98px) {
+  html[data-pinned-block] {
+    scroll-padding-top: calc(var(--app-bar-h) + var(--pinned-h, 0px) + 12px);
+  }
+}
+
+/* Edge fade for a sideways-scrolling pill row: [data-fade-start] / [data-fade-end] are set
+   by an IntersectionObserver only on an edge that has more content beyond it. */
+[data-fade-row][data-fade-start] {
+  -webkit-mask-image: linear-gradient(to right, transparent, #000 24px);
+  mask-image: linear-gradient(to right, transparent, #000 24px);
+}
+[data-fade-row][data-fade-end] {
+  -webkit-mask-image: linear-gradient(to left, transparent, #000 24px);
+  mask-image: linear-gradient(to left, transparent, #000 24px);
+}
+[data-fade-row][data-fade-start][data-fade-end] {
+  -webkit-mask-image: linear-gradient(to right, transparent, #000 24px, #000 calc(100% - 24px), transparent);
+  mask-image: linear-gradient(to right, transparent, #000 24px, #000 calc(100% - 24px), transparent);
+}
+
 /* Preflight compatibility (Tailwind v4): v4's reset follows the browser and sets
    `cursor: default` on buttons, where v3's reset set `cursor: pointer`. Restore
    the pointer on enabled buttons and role=button elements so every clickable in

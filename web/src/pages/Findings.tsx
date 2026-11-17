@@ -43,7 +43,8 @@ import { formatAgo } from "../lib/rateLimits";
 import { stripUnsafeChars } from "../lib/safeText";
 import { useDemoMode } from "../lib/demoMode";
 import { maskRepoPath } from "../lib/demoMask";
-import { Alert, Button, cx, EmptyState, ListSkeleton, PageHeader } from "../components/ui";
+import { Alert, Button, EmptyState, ListSkeleton, PageHeader } from "../components/ui";
+import { PinnedBlock, TabRow, tabClass } from "../components/TabRow";
 import { BugIcon, ChevronDownIcon, ChevronRightIcon, XIcon } from "../components/icons";
 import { TriageSummary } from "./RunView";
 import { useSetFindingsOpen } from "../components/FindingsOpenContext";
@@ -743,28 +744,25 @@ export function Findings() {
           the only affordance that calls setBucket, so a failed stats fetch must not strand the user in
           the current bucket. Only the per-bucket count is canonical-stats-only and is simply absent
           when the stats fetch failed. */}
-      <div role="tablist" aria-label="Findings bucket" className="flex flex-wrap gap-1 border-b border-edge">
-        {FINDING_BUCKETS.map((b) => {
-          const active = b === bucket;
-          return (
-            <button
-              key={b}
-              role="tab"
-              aria-selected={active}
-              onClick={() => setBucket(b)}
-              className={cx(
-                "-mb-px border-b-2 px-3 py-2 text-sm font-medium transition-colors",
-                active
-                  ? "border-brand text-fg"
-                  : "border-transparent text-faint hover:border-edge-strong hover:text-muted",
-              )}
-            >
-              {TAB_LABEL[b]}
-              {stats && <span className="ml-1.5 tabular-nums text-faint">{tabCount(stats, b)}</span>}
-            </button>
-          );
-        })}
-      </div>
+      <PinnedBlock>
+        <TabRow variant="wrap" role="tablist" aria-label="Findings bucket">
+          {FINDING_BUCKETS.map((b) => {
+            const active = b === bucket;
+            return (
+              <button
+                key={b}
+                role="tab"
+                aria-selected={active}
+                onClick={() => setBucket(b)}
+                className={tabClass(active, "faint")}
+              >
+                {TAB_LABEL[b]}
+                {stats && <span className="ml-1.5 tabular-nums text-faint">{tabCount(stats, b)}</span>}
+              </button>
+            );
+          })}
+        </TabRow>
+      </PinnedBlock>
 
       {/* Rendered outside the list block below: every load() flips `loading` and unmounts that block,
           which would discard the user's draft edits mid-review. */}

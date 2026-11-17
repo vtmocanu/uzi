@@ -64,8 +64,13 @@ describe("AdminShell agent source pip", () => {
 
   it("scrolls when dedicated severity or presence changes with aggregate attention unchanged", async () => {
     vi.useFakeTimers();
+    // The keep-in-view effect (keepInRowView) writes the ROW's scrollLeft, never the
+    // window's. jsdom has no layout, so place the active tab beyond the row's right edge.
+    const rect = (left: number, right: number) => ({ left, right, top: 0, bottom: 0, width: right - left, height: 0, x: left, y: 0, toJSON() {} }) as DOMRect;
+    vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (this: Element) {
+      return this.getAttribute("aria-current") === "page" ? rect(500, 600) : rect(0, 100);
+    });
     const scroll = vi.fn();
-    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", { value: scroll, configurable: true });
     const warn = sourceDoc("warn");
     const unknown = sourceDoc("unknown");
     const absent = sourceDoc(null);
@@ -75,6 +80,11 @@ describe("AdminShell agent source pip", () => {
     render(<MemoryRouter initialEntries={["/admin/settings"]}><AdminShell description={null}>body</AdminShell></MemoryRouter>);
     await act(async () => { await Promise.resolve(); });
     expect(screen.getByRole("img", { name: "Agent source update available" })).toBeTruthy();
+    Object.defineProperty(screen.getByRole("link", { name: /Instance/ }).parentElement!, "scrollLeft", {
+      configurable: true,
+      get: () => 0,
+      set: scroll,
+    });
     scroll.mockClear();
     await act(async () => { await vi.advanceTimersByTimeAsync(10000); });
     expect(screen.getByRole("img", { name: "Agent source update status unavailable" })).toBeTruthy();

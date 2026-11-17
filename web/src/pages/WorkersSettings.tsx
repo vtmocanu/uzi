@@ -9,6 +9,7 @@ import { Link, useLocation, useSearchParams } from "react-router-dom";
 import { api, type BindMode, type Worker } from "../lib/api";
 import { ApiError, errorMessage } from "../lib/apiError";
 import { Alert, Badge, Button, Card, EmptyState, Field, Input, PageHeader, SectionTitle, Select, Skeleton, cx } from "../components/ui";
+import { PinnedBlock, TabRow, tabClass } from "../components/TabRow";
 import { FleetUpgradePanel, WorkerUpgradeBadge, WorkerUpgradeDetail } from "../components/WorkerUpgradeBadge";
 import { useAppVersion } from "../components/AppShell";
 import { PlusIcon, ServerIcon } from "../components/icons";
@@ -130,10 +131,6 @@ type Tab = "workers" | "add";
 const TAB_ORDER: Tab[] = ["workers", "add"];
 const tabId = (t: Tab) => `workers-tab-${t}`;
 const panelId = (t: Tab) => `workers-panel-${t}`;
-const TAB_BASE =
-  "-mb-px shrink-0 whitespace-nowrap border-b-2 px-3 py-2 text-sm font-medium transition-colors";
-const TAB_ACTIVE = "border-brand text-fg";
-const TAB_INACTIVE = "border-transparent text-muted hover:border-edge-strong hover:text-fg";
 
 // A hosted worker that counts toward the manual hosted quota. Mirrors the server's
 // CountHostedWorkersForUser (`kind = 'hosted' AND NOT ephemeral`): ephemeral workers,
@@ -685,7 +682,8 @@ export function WorkersSettings() {
           with two role=tab buttons carrying ids, aria-selected, aria-controls, a roving
           tabIndex and the arrow/Home/End handler. Both tabs are always rendered (a
           one-tab tablist is an a11y smell). `Your workers · N` carries the live count. */}
-      <div className="flex gap-1 overflow-x-auto border-b border-edge" role="tablist" aria-label="Workers">
+      <PinnedBlock>
+      <TabRow role="tablist" aria-label="Workers">
         <button
           type="button"
           role="tab"
@@ -698,7 +696,7 @@ export function WorkersSettings() {
           }}
           onKeyDown={onTabKeyDown}
           onClick={() => selectTab("workers")}
-          className={cx(TAB_BASE, tab === "workers" ? TAB_ACTIVE : TAB_INACTIVE)}
+          className={tabClass(tab === "workers")}
         >
           Your workers{workers.length > 0 ? ` · ${workers.length}` : ""}
         </button>
@@ -714,11 +712,12 @@ export function WorkersSettings() {
           }}
           onKeyDown={onTabKeyDown}
           onClick={() => selectTab("add")}
-          className={cx(TAB_BASE, tab === "add" ? TAB_ACTIVE : TAB_INACTIVE)}
+          className={tabClass(tab === "add")}
         >
           Add a worker
         </button>
-      </div>
+      </TabRow>
+      </PinnedBlock>
 
       {tab === null ? (
         /* Before the first load resolves: no tab is selected and neither panel is shown,

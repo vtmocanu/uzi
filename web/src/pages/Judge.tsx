@@ -45,6 +45,7 @@ import {
   ListSkeleton,
   PageHeader,
 } from "../components/ui";
+import { PinnedBlock, TabRow, tabClass } from "../components/TabRow";
 import { ScaleIcon, XIcon } from "../components/icons";
 import type { Toast } from "./judge/shared";
 import { LabelFilter } from "./judge/LabelFilter";
@@ -687,28 +688,25 @@ export function Judge() {
       {/* Bucket tabs — counts straight from the canonical triage aggregate, never tallied
           off the (possibly filtered/truncated) groups on screen. */}
       {triage && (
-        <div role="tablist" aria-label="Backlog bucket" className="flex flex-wrap gap-1 border-b border-edge">
-          {JUDGE_BUCKETS.map((b) => {
-            const active = b === bucket;
-            return (
-              <button
-                key={b}
-                role="tab"
-                aria-selected={active}
-                onClick={() => setBucket(b)}
-                className={cx(
-                  "-mb-px border-b-2 px-3 py-2 text-sm font-medium transition-colors",
-                  active
-                    ? "border-brand text-fg"
-                    : "border-transparent text-faint hover:border-edge-strong hover:text-muted",
-                )}
-              >
-                {bucketTabLabel(b)}
-                <span className="ml-1.5 tabular-nums text-faint">{bucketTabCount(triage, b)}</span>
-              </button>
-            );
-          })}
-        </div>
+        <PinnedBlock>
+          <TabRow variant="wrap" role="tablist" aria-label="Backlog bucket">
+            {JUDGE_BUCKETS.map((b) => {
+              const active = b === bucket;
+              return (
+                <button
+                  key={b}
+                  role="tab"
+                  aria-selected={active}
+                  onClick={() => setBucket(b)}
+                  className={tabClass(active, "faint")}
+                >
+                  {bucketTabLabel(b)}
+                  <span className="ml-1.5 tabular-nums text-faint">{bucketTabCount(triage, b)}</span>
+                </button>
+              );
+            })}
+          </TabRow>
+        </PinnedBlock>
       )}
 
       {backlog?.truncated && (
