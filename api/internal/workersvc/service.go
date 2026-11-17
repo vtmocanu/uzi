@@ -2034,6 +2034,24 @@ type Service struct {
 	autoPassMu        sync.Mutex
 	lastAutoPass      time.Time
 	autoPassAfterList func()
+	// ownerLockTimeout overrides HibernationOwnerLockTimeout, the lock_timeout of one surplus
+	// decision's owner and candidate locks (issue #4395). TEST-ONLY: zero in production.
+	ownerLockTimeout time.Duration
+	// poolPassBeforeOwnerLock runs inside a surplus decision's transaction right before the owner
+	// advisory lock is requested, with the transaction's backend pid. TEST-ONLY: nil in production
+	// (the pid is then not even queried).
+	poolPassBeforeOwnerLock func(backendPID int32)
+	// poolPassAfterDecide runs after a surplus decision was made and before it is written, with
+	// the owner lock and the candidate row lock held. TEST-ONLY: nil in production.
+	poolPassAfterDecide func()
+	// hibernationAfterCommit runs after a hibernation transaction committed, with the worker id
+	// (the candidate for hibernationOwnerTx); a non-nil result is returned as an uncertain commit.
+	// TEST-ONLY: nil in production.
+	hibernationAfterCommit func(workerID uuid.UUID) error
+	// memoryAuthorityUnpersisted is true when the api runs with the active-snapshot kill switch,
+	// so workers.memory_authority_lost_at is never written and memory authority is unknown to the
+	// pool policy; set via SetActiveSnapshotDisabled.
+	memoryAuthorityUnpersisted bool
 	// isolatedLaneDisabled is true when the deployment did not enable the isolated research
 	// lane (issue #1965); set via SetIsolatedLaneEnabled. Stored negated so a Service that never
 	// calls the setter (tests, other wiring) keeps the pre-#1965 queued reasons.
@@ -2185,6 +2203,10 @@ type Service struct {
 	// transaction BEGINs and before it locks the worker row, so a test can pause a registration whose
 	// now() is already fixed while a credential-switch hold is stamped behind it.
 	registerAfterBegin func()
+	// registerAfterRegisterWorker is a test seam (nil in production): Register calls it inside its
+	// transaction right after RegisterWorker's UPDATE and before anything commits, so a test can
+	// read the worker row from another connection while the registration is uncommitted.
+	registerAfterRegisterWorker func()
 	// ciRepairAfterInsert is a test seam (nil in production): CreateCIRepairRun calls it inside
 	// the create transaction after the run INSERT and before the episode write, so a test can
 	// inject a failure and prove the run and the episode roll back together.
@@ -2759,6 +2781,9 @@ func (s *Service) RegisterWithCrossCheckSlots(ctx context.Context, wkr store.Wor
 	if err != nil {
 		return store.Worker{}, "", err
 	}
+	if s.registerAfterRegisterWorker != nil {
+		s.registerAfterRegisterWorker()
+	}
 	if row.CredentialSwitchApplyNonce, err = s.stampApplyNonce(ctx, qtx, wkr.ID, protocolCaps, nonce); err != nil {
 		return store.Worker{}, "", err
 	}
@@ -2801,7 +2826,7 @@ func (s *Service) RegisterWithCrossCheckSlots(ctx context.Context, wkr store.Wor
 	}
 	snapshotApplied := false
 	if snapshotValid {
-		snapshotApplied, err = s.applyWorkerActiveSnapshot(ctx, qtx, store.Worker(row), snapshot, snapshotModeRegister, entries, locks, pending)
+		snapshotApplied, err = s.applyWorkerActiveSnapshot(ctx, qtx, store.Worker(row), snapshot, snapshotModeRegister, entries, locks, pending, pgtype.Timestamptz{})
 		if err != nil {
 			return store.Worker{}, "", err
 		}
@@ -3079,7 +3104,7 @@ func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *Worker
 		if err != nil {
 			return store.Worker{}, err
 		}
-		applied, err = s.applyWorkerActiveSnapshot(ctx, qtx, updated, snapshot, snapshotModeHeartbeat, entries, locks, pending)
+		applied, err = s.applyWorkerActiveSnapshot(ctx, qtx, updated, snapshot, snapshotModeHeartbeat, entries, locks, pending, pgtype.Timestamptz{})
 		if err != nil {
 			return store.Worker{}, err
 		}
@@ -3762,13 +3787,21 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 	if !valid {
 		return nil, ErrActiveSnapshotInvalid
 	}
+	// Issue #4395: persist the memory-authority report on the locked worker row, fenced by the
+	// register nonce the snapshot was just validated against. It precedes the overflow refusal
+	// and the claim, so an idle or refused poll still persists it, and it only touches the
+	// worker row this transaction already holds.
+	heldAt, err := s.persistMemoryAuthority(ctx, qtx, locked, snapshot, lane, report)
+	if err != nil {
+		return nil, err
+	}
 	pending := s.validatePendingAll(locked, snapshot)
 	pending.scoped = &scopedPendingClaim{}
 	locks, err := captureWorkerRecoveryLocks(ctx, qtx, locked.ID, entries, pending.ids)
 	if err != nil {
 		return nil, err
 	}
-	applied, err := s.applyWorkerActiveSnapshot(ctx, qtx, locked, snapshot, snapshotModeClaim, entries, locks, pending)
+	applied, err := s.applyWorkerActiveSnapshot(ctx, qtx, locked, snapshot, snapshotModeClaim, entries, locks, pending, heldAt)
 	if err != nil {
 		return nil, err
 	}

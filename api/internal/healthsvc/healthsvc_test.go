@@ -80,6 +80,8 @@ type fakeStore struct {
 	hibRows                []store.ListAutoHibernationBlockersRow
 	hibErr                 error
 	hibParams              []store.ListAutoHibernationBlockersParams
+	hibSurplusRows         []store.ListAutoHibernationBlockersSurplusModeRow
+	hibSurplusParams       []store.ListAutoHibernationBlockersSurplusModeParams
 }
 
 func (f *fakeStore) RecoveryStorageHealth(ctx context.Context, p store.RecoveryStorageHealthParams) ([]store.RecoveryStorageHealthRow, error) {
@@ -168,6 +170,11 @@ func (f *fakeStore) ListAutoHibernationBlockers(_ context.Context, p store.ListA
 	return f.hibRows, f.hibErr
 }
 
+func (f *fakeStore) ListAutoHibernationBlockersSurplusMode(_ context.Context, p store.ListAutoHibernationBlockersSurplusModeParams) ([]store.ListAutoHibernationBlockersSurplusModeRow, error) {
+	f.hibSurplusParams = append(f.hibSurplusParams, p)
+	return f.hibSurplusRows, f.hibErr
+}
+
 type fakeSettings struct {
 	sourceEnabled  bool
 	sourceURL      string
@@ -186,6 +193,7 @@ type fakeSettings struct {
 	custodyErr   error
 	// hibernation (issue #4207) backs WorkerHibernationEnabled/Auto/IdleAfter.
 	hibEnabled, hibAuto bool
+	hibSurplus          bool
 	hibIdleAfter        time.Duration
 	hibErr              error
 }
@@ -198,6 +206,13 @@ func (f *fakeSettings) WorkerHibernationAuto(context.Context) (bool, error) {
 }
 func (f *fakeSettings) WorkerHibernationIdleAfter(context.Context) (time.Duration, error) {
 	return f.hibIdleAfter, f.hibErr
+}
+
+func (f *fakeSettings) WorkerHibernationSurplus(context.Context) (bool, error) {
+	return f.hibSurplus, nil
+}
+func (f *fakeSettings) WorkerHibernationSurplusIdleAfter(context.Context) (time.Duration, error) {
+	return 2 * time.Hour, nil
 }
 
 func (f *fakeSettings) HealthEnabled(context.Context) (bool, error) {
