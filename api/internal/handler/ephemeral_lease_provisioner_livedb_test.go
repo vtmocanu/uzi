@@ -1,6 +1,8 @@
 package handler
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -537,5 +539,266 @@ func TestEphemeralLeaseEvictionVsClaimLiveDB(t *testing.T) {
 	}
 	if !fx.workerExists(w.id) {
 		t.Fatal("a later provision pass evicted the busy worker")
+	}
+}
+
+// ---------------------------------------------------------------------------------------------
+// PRD #4212: the cap, the default size and the lease are read from the CURRENT admin setting on
+// every pass, never from a boot snapshot. Every test below builds ONE provisioner on ONE real
+// settings.Cache, then changes the stored setting between passes (a store row edit plus the
+// Invalidate an admin write performs) and never rebuilds the provisioner.
+// ---------------------------------------------------------------------------------------------
+
+// liveEphemeralSettings is a REAL settings.Cache over a mutable store, shaped like the production
+// wiring. The three per-pass accessors can be made to fail one by one (failMax, failSize,
+// failLease) while the kill-switch and the Docker allowlist keep answering, so a failed read of
+// exactly one tunable setting is observable on its own.
+type liveEphemeralSettings struct {
+	*settings.Cache
+	st                           *settingsStore
+	failMax, failSize, failLease bool
+}
+
+var errSettingsRead = errors.New("settings read failed")
+
+func newLiveEphemeralSettings(maxPerUser int, lease time.Duration) *liveEphemeralSettings {
+	st := &settingsStore{rows: append([]store.AppSetting{
+		{Key: settings.KeyEphemeralWorkersEnabled, Value: "true"},
+	}, ephemeralSettingRows(maxPerUser, lease)...)}
+	return &liveEphemeralSettings{Cache: settings.New(st, time.Hour), st: st}
+}
+
+// set stores value under key (replacing a row), as an admin write does, and drops the cache.
+func (l *liveEphemeralSettings) set(key, value string) {
+	rows := make([]store.AppSetting, 0, len(l.st.rows)+1)
+	for _, r := range l.st.rows {
+		if r.Key != key {
+			rows = append(rows, r)
+		}
+	}
+	l.st.rows = append(rows, store.AppSetting{Key: key, Value: value})
+	l.Cache.Invalidate()
+}
+
+// unset deletes the row, the reset to the compiled-in default.
+func (l *liveEphemeralSettings) unset(key string) {
+	rows := make([]store.AppSetting, 0, len(l.st.rows))
+	for _, r := range l.st.rows {
+		if r.Key != key {
+			rows = append(rows, r)
+		}
+	}
+	l.st.rows = rows
+	l.Cache.Invalidate()
+}
+
+func (l *liveEphemeralSettings) EphemeralMaxPerUser(ctx context.Context) (int, error) {
+	if l.failMax {
+		return 2, errSettingsRead // the compiled-in default alongside the error, as the real cache answers a cold failed read
+	}
+	return l.Cache.EphemeralMaxPerUser(ctx)
+}
+
+func (l *liveEphemeralSettings) EphemeralDefaultSize(ctx context.Context) (string, error) {
+	if l.failSize {
+		return "m", errSettingsRead
+	}
+	return l.Cache.EphemeralDefaultSize(ctx)
+}
+
+func (l *liveEphemeralSettings) EphemeralLease(ctx context.Context) (time.Duration, error) {
+	if l.failLease {
+		return 2 * time.Hour, errSettingsRead
+	}
+	return l.Cache.EphemeralLease(ctx)
+}
+
+func (fx *ephemeralFixture) provisionerOn(sc *liveEphemeralSettings) *hostedsvc.EphemeralProvisioner {
+	return hostedsvc.NewEphemeralProvisioner(fx.pool, fx.q, fx.box, sc, hostedsvc.EphemeralConfig{
+		BackgroundGrace: 5 * time.Minute, ProvisionDeadline: 10 * time.Minute,
+	})
+}
+
+// boundRuns is the set of queued runs the fixture user has an ephemeral worker for.
+func (fx *ephemeralFixture) boundRuns() map[uuid.UUID]bool {
+	fx.t.Helper()
+	out := map[uuid.UUID]bool{}
+	for _, r := range fx.ephemeralRows() {
+		out[r.runID] = true
+	}
+	return out
+}
+
+// TestEphemeralProvisionFollowsCapChangeLiveDB: the per-user cap an admin changes between passes
+// governs the next pass of the SAME provisioner, and a reset to the default (row deleted, or
+// stored "") returns it to the default of 2.
+func TestEphemeralProvisionFollowsCapChangeLiveDB(t *testing.T) {
+	for _, reset := range []string{"row deleted", "empty value"} {
+		t.Run(reset, func(t *testing.T) {
+			fx := newEphemeralFixture(t, true)
+			fx.onlineWorker("base-only", false)
+			sc := newLiveEphemeralSettings(2, 0)
+			prov := fx.provisionerOn(sc)
+			r1, r2, r3 := fx.queuedRun([]string{"docker"}), fx.queuedRun([]string{"docker"}), fx.queuedRun([]string{"docker"})
+
+			if _, err := prov.ProvisionPass(fx.ctx); err != nil {
+				t.Fatalf("ProvisionPass at cap 2: %v", err)
+			}
+			if n := len(fx.ephemeralRows()); n != 2 {
+				t.Fatalf("ephemeral workers at cap 2 = %d, want 2", n)
+			}
+
+			sc.set(settings.KeyEphemeralMaxPerUser, "3")
+			if _, err := prov.ProvisionPass(fx.ctx); err != nil {
+				t.Fatalf("ProvisionPass at cap 3: %v", err)
+			}
+			got := fx.boundRuns()
+			if len(got) != 3 || !got[r1] || !got[r2] || !got[r3] {
+				t.Fatalf("after the cap was raised to 3, workers are bound to %v, want one each for %s %s %s", got, r1, r2, r3)
+			}
+
+			// Back to the default: drop the three workers (their runs stay queued), queue a fourth
+			// run, and a pass must stop at the default cap 2, not the previous 3.
+			if _, err := fx.pool.Exec(fx.ctx, `DELETE FROM workers WHERE user_id = $1 AND ephemeral`, fx.userID); err != nil {
+				t.Fatalf("drop ephemeral workers: %v", err)
+			}
+			fx.queuedRun([]string{"docker"})
+			if reset == "row deleted" {
+				sc.unset(settings.KeyEphemeralMaxPerUser)
+			} else {
+				sc.set(settings.KeyEphemeralMaxPerUser, "")
+			}
+			if _, err := prov.ProvisionPass(fx.ctx); err != nil {
+				t.Fatalf("ProvisionPass after reset: %v", err)
+			}
+			if n := len(fx.ephemeralRows()); n != 2 {
+				t.Fatalf("ephemeral workers after the cap was reset to the default = %d, want 2", n)
+			}
+		})
+	}
+}
+
+// TestEphemeralProvisionFollowsDefaultSizeChangeLiveDB: a worker takes the ephemeral_default_size
+// in force when it is provisioned; changing it between passes of one provisioner changes only the
+// workers provisioned afterwards.
+func TestEphemeralProvisionFollowsDefaultSizeChangeLiveDB(t *testing.T) {
+	fx := newEphemeralFixture(t, true)
+	fx.onlineWorker("base-only", false)
+	sc := newLiveEphemeralSettings(5, 0)
+	prov := fx.provisionerOn(sc)
+
+	sc.set(settings.KeyEphemeralDefaultSize, "s")
+	first := fx.queuedRun([]string{"docker"})
+	if _, err := prov.ProvisionPass(fx.ctx); err != nil {
+		t.Fatalf("first ProvisionPass: %v", err)
+	}
+	sc.set(settings.KeyEphemeralDefaultSize, "l")
+	second := fx.queuedRun([]string{"docker"})
+	if _, err := prov.ProvisionPass(fx.ctx); err != nil {
+		t.Fatalf("second ProvisionPass: %v", err)
+	}
+	size := map[uuid.UUID]string{}
+	for _, r := range fx.ephemeralRows() {
+		size[r.runID] = r.size
+	}
+	if len(size) != 2 || size[first] != "s" || size[second] != "l" {
+		t.Fatalf("hosted_size by run = %v, want %s: s, %s: l", size, first, second)
+	}
+}
+
+// TestEphemeralPassesFailClosedOnSettingsReadErrorLiveDB: when a tunable setting cannot be read,
+// ProvisionPass provisions nothing and ReapPass reaps nothing, instead of acting on a default.
+func TestEphemeralPassesFailClosedOnSettingsReadErrorLiveDB(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		fail func(*liveEphemeralSettings, bool)
+	}{
+		{"cap", func(l *liveEphemeralSettings, v bool) { l.failMax = v }},
+		{"default size", func(l *liveEphemeralSettings, v bool) { l.failSize = v }},
+		{"lease", func(l *liveEphemeralSettings, v bool) { l.failLease = v }},
+	} {
+		t.Run("provision: "+tc.name, func(t *testing.T) {
+			fx := newEphemeralFixture(t, true)
+			fx.onlineWorker("base-only", false)
+			sc := newLiveEphemeralSettings(2, 0)
+			prov := fx.provisionerOn(sc)
+			run := fx.queuedRun([]string{"docker"})
+
+			tc.fail(sc, true)
+			if _, err := prov.ProvisionPass(fx.ctx); err == nil {
+				t.Fatal("ProvisionPass = nil error, want the settings read error")
+			}
+			if n := len(fx.ephemeralRows()); n != 0 {
+				t.Fatalf("ephemeral workers after a failed settings read = %d, want 0", n)
+			}
+
+			tc.fail(sc, false) // the same run is provisioned once the read works: it was only the read
+			if _, err := prov.ProvisionPass(fx.ctx); err != nil {
+				t.Fatalf("ProvisionPass after recovery: %v", err)
+			}
+			if rows := fx.ephemeralRows(); len(rows) != 1 || rows[0].runID != run {
+				t.Fatalf("after recovery ephemeral rows = %+v, want one bound to %s", rows, run)
+			}
+		})
+	}
+
+	t.Run("reap: lease", func(t *testing.T) {
+		fx := newEphemeralFixture(t, true)
+		sc := newLiveEphemeralSettings(2, 30*time.Minute)
+		prov := fx.provisionerOn(sc)
+		expired := fx.leasedWorker(3 * time.Hour) // reapable under the 30m lease and under the 2h default a guess would use
+
+		sc.failLease = true
+		if _, err := prov.ReapPass(fx.ctx); err == nil {
+			t.Fatal("ReapPass = nil error, want the settings read error")
+		}
+		if !fx.workerExists(expired.id) {
+			t.Fatal("ReapPass reaped a worker although the lease could not be read")
+		}
+
+		sc.failLease = false
+		if _, err := prov.ReapPass(fx.ctx); err != nil {
+			t.Fatalf("ReapPass after recovery: %v", err)
+		}
+		if fx.workerExists(expired.id) {
+			t.Fatal("control: the expired lease was not reaped once the lease could be read")
+		}
+	})
+}
+
+// TestEphemeralReapFollowsLeaseChangeLiveDB: the reaper reads the lease on every pass. Two leased
+// idle workers (30m and 5m into their lease) are judged by the lease in force at each pass of one
+// provisioner: 2h spares both, 10m reaps only the 30m one, 0 reaps the 5m one.
+func TestEphemeralReapFollowsLeaseChangeLiveDB(t *testing.T) {
+	fx := newEphemeralFixture(t, true)
+	sc := newLiveEphemeralSettings(2, 2*time.Hour)
+	prov := fx.provisionerOn(sc)
+	old := fx.leasedWorker(30 * time.Minute)
+	young := fx.leasedWorker(5 * time.Minute)
+	reap := func() {
+		t.Helper()
+		if _, err := prov.ReapPass(fx.ctx); err != nil {
+			t.Fatalf("ReapPass: %v", err)
+		}
+	}
+
+	reap()
+	if !fx.workerExists(old.id) || !fx.workerExists(young.id) {
+		t.Fatalf("lease 2h: old exists=%v young exists=%v, want both spared", fx.workerExists(old.id), fx.workerExists(young.id))
+	}
+
+	sc.set(settings.KeyEphemeralLease, "10m")
+	reap()
+	if fx.workerExists(old.id) {
+		t.Fatal("lease 10m: the worker 30m into its lease was not reaped")
+	}
+	if !fx.workerExists(young.id) {
+		t.Fatal("lease 10m: the worker 5m into its lease was reaped")
+	}
+
+	sc.set(settings.KeyEphemeralLease, "0s")
+	reap()
+	if fx.workerExists(young.id) {
+		t.Fatal("lease 0: the finished ephemeral worker was not reaped")
 	}
 }
