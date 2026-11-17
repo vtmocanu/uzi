@@ -859,10 +859,37 @@ describe("Judge — the ?category= recommendation-label filter (PRD #235 M2)", (
     renderJudge(["/judge?category=improve_uzi"]);
     await waitFor(() => expect(mockApi.getJudgeBacklog).toHaveBeenCalledWith("todo", undefined, ["improve_uzi"]));
 
-    fireEvent.click(screen.getByRole("button", { name: /Clear/ }));
+    // Scoped to the chip group: the pinned-tabs marker has its own Clear.
+    const group = screen.getByRole("group", { name: "Filter by recommendation label" });
+    fireEvent.click(within(group).getByRole("button", { name: /Clear/ }));
 
     await waitFor(() => expect(mockApi.getJudgeBacklog).toHaveBeenLastCalledWith("todo", undefined, []));
     expect(chip("Improve uzi").getAttribute("aria-pressed")).toBe("false");
+  });
+
+  // Below lg (jsdom has no matchMedia, so always) the chips scroll away; a one-line marker in
+  // the pinned block names the active filter and clears it.
+  it("shows a Filtered marker naming the labels, and its Clear removes the filter", async () => {
+    mockApi.getJudgeBacklog.mockResolvedValue(backlog());
+    const { container } = renderJudge(["/judge?category=install_worker_tool,improve_uzi"]);
+    await waitFor(() => expect(screen.getByText("shellcheck")).toBeTruthy());
+
+    const marker = container.querySelector<HTMLElement>("[data-judge-filter-marker]")!;
+    expect(marker.textContent).toContain("Filtered: Install a worker tool, Improve uzi");
+    expect(marker.closest("[role=tablist]")).toBeNull();
+
+    fireEvent.click(within(marker).getByRole("button", { name: "Clear" }));
+
+    await waitFor(() => expect(mockApi.getJudgeBacklog).toHaveBeenLastCalledWith("todo", undefined, []));
+    expect(container.querySelector("[data-judge-filter-marker]")).toBeNull();
+    expect(chip("Improve uzi").getAttribute("aria-pressed")).toBe("false");
+  });
+
+  it("shows no marker when no label is selected", async () => {
+    mockApi.getJudgeBacklog.mockResolvedValue(backlog());
+    const { container } = renderJudge();
+    await waitFor(() => expect(screen.getByText("shellcheck")).toBeTruthy());
+    expect(container.querySelector("[data-judge-filter-marker]")).toBeNull();
   });
 });
 

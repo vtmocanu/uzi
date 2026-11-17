@@ -25,11 +25,14 @@ export function LabelFilter({
   counts,
   onToggle,
   onClear,
+  layout = "wrap",
 }: {
   selected: RecommendationCategory[];
   counts: Record<string, number>;
   onToggle: (cat: RecommendationCategory) => void;
   onClear: () => void;
+  /** `wrap` (default) wraps chips onto more lines; `row` keeps one non-wrapping, sideways-scrolling line (the pinned lg layout). */
+  layout?: "wrap" | "row";
 }) {
   const active = new Set(selected);
   // One inline chip row (PRD #1183 M2): no surrounding box, no eyebrow, no caption line — the
@@ -42,7 +45,11 @@ export function LabelFilter({
       role="group"
       aria-label="Filter by recommendation label"
       title="counts are groups, deduped by target"
-      className="flex flex-wrap items-center gap-2"
+      className={
+        layout === "row"
+          ? "flex flex-nowrap items-center gap-2 overflow-x-auto overflow-y-hidden py-1.5"
+          : "flex flex-wrap items-center gap-2"
+      }
     >
       {JUDGE_CATEGORIES.map((cat) => {
         const on = active.has(cat);
@@ -58,6 +65,7 @@ export function LabelFilter({
             onClick={() => onToggle(cat)}
             className={cx(
               "inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-sm font-medium transition-colors",
+              layout === "row" && "shrink-0",
               on
                 ? "border-brand/60 bg-brand/[0.13] text-brand"
                 : "border-edge bg-raised text-muted hover:border-edge-strong hover:text-fg",
@@ -92,7 +100,7 @@ export function LabelFilter({
         onClick={onClear}
         aria-hidden={active.size === 0}
         tabIndex={active.size === 0 ? -1 : 0}
-        className={`ml-auto inline-flex min-h-[24px] items-center gap-1 rounded-md px-2 py-1 text-xs font-medium text-muted transition-colors hover:bg-raised hover:text-fg${
+        className={`ml-auto${layout === "row" ? " shrink-0" : ""} inline-flex min-h-[24px] items-center gap-1 rounded-md px-2 py-1 text-xs font-medium text-muted transition-colors hover:bg-raised hover:text-fg${
           active.size === 0 ? " invisible pointer-events-none" : ""
         }`}
       >
