@@ -244,6 +244,9 @@ async function retireEval(req: { cache: string; bare: string; uuid: string; runn
 // (a test-only fs.promises.rename wrapper). Reports what the production code left behind, as the worker uid.
 async function retireProduction(req: { dataDir: string }) {
   process.env.UZI_UID_SPLIT = "1";
+  // The worker posture main.ts pairs with the uid split (agent/src/main.ts: `if (uidSplitActive()) process.umask(0o002)`):
+  // worker-made runner-clone parents stay group-runner-writable, so the runner-uid clone can create its work tree there.
+  process.umask(0o002);
   const { GitCache } = await import("../../agent/src/git.js");
   const { formatAttemptId } = await import("../../agent/src/attempt-path.js");
   const logger: any = { debug() {}, info() {}, warn() {}, error() {}, addSecret() {}, removeSecret() {},
