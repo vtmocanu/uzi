@@ -802,3 +802,72 @@ func TestEphemeralReapFollowsLeaseChangeLiveDB(t *testing.T) {
 		t.Fatal("lease 0: the finished ephemeral worker was not reaped")
 	}
 }
+
+// TestEphemeralReapFollowsLeaseExtensionLiveDB: the reaper's lease is the setting in force at each
+// pass of ONE provisioner, in the extending direction too. At 10m a worker 30m into its lease is
+// reaped (the old duration is exercised); after the admin extends the lease to 2h a second worker,
+// also 30m into its lease, is spared by the next pass. Control: shortening back to 10m reaps it.
+func TestEphemeralReapFollowsLeaseExtensionLiveDB(t *testing.T) {
+	fx := newEphemeralFixture(t, true)
+	sc := newLiveEphemeralSettings(2, 10*time.Minute)
+	prov := fx.provisionerOn(sc)
+	reap := func() {
+		t.Helper()
+		if _, err := prov.ReapPass(fx.ctx); err != nil {
+			t.Fatalf("ReapPass: %v", err)
+		}
+	}
+
+	first := fx.leasedWorker(30 * time.Minute)
+	reap()
+	if fx.workerExists(first.id) {
+		t.Fatal("lease 10m: the first worker 30m into its lease was not reaped")
+	}
+
+	sc.set(settings.KeyEphemeralLease, "2h")
+	second := fx.leasedWorker(30 * time.Minute)
+	reap()
+	if !fx.workerExists(second.id) {
+		t.Fatal("lease extended to 2h: the second worker 30m into its lease was reaped by the next pass (stale 10m lease)")
+	}
+
+	sc.set(settings.KeyEphemeralLease, "10m")
+	reap()
+	if fx.workerExists(second.id) {
+		t.Fatal("control, lease back to 10m: the second worker 30m into its lease was not reaped")
+	}
+}
+
+// TestEphemeralProvisionFollowsLeaseChangeLiveDB: the lease gates quota eviction in provisionOne,
+// read per pass. The owner is at the cap (1) with one leased-idle worker 30m into a lease and a
+// queued run on another issue no lease can serve. With the lease 0 the pass provisions nothing and
+// evicts nothing; after the admin sets 2h the NEXT pass of the same provisioner evicts the leased
+// worker and provisions one bound to the queued run.
+func TestEphemeralProvisionFollowsLeaseChangeLiveDB(t *testing.T) {
+	fx := newEphemeralFixture(t, true)
+	sc := newLiveEphemeralSettings(1, 0)
+	prov := fx.provisionerOn(sc)
+	leased := fx.leasedWorker(30 * time.Minute)
+	run := fx.queuedRun([]string{"docker"})
+
+	if _, err := prov.ProvisionPass(fx.ctx); err != nil {
+		t.Fatalf("ProvisionPass at lease 0: %v", err)
+	}
+	if !fx.workerExists(leased.id) {
+		t.Fatal("lease 0: the leased worker was evicted")
+	}
+	if got := fx.boundRuns(); got[run] || len(got) != 1 {
+		t.Fatalf("lease 0: ephemeral workers bound to %v, want only the existing lease (none for %s)", got, run)
+	}
+
+	sc.set(settings.KeyEphemeralLease, "2h")
+	if _, err := prov.ProvisionPass(fx.ctx); err != nil {
+		t.Fatalf("ProvisionPass at lease 2h: %v", err)
+	}
+	if fx.workerExists(leased.id) {
+		t.Fatal("lease 2h: the leased worker was not evicted by the next pass (stale lease 0)")
+	}
+	if got := fx.boundRuns(); len(got) != 1 || !got[run] {
+		t.Fatalf("lease 2h: ephemeral workers bound to %v, want exactly one for %s", got, run)
+	}
+}

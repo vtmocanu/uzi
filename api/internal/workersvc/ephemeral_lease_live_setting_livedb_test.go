@@ -6,6 +6,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // PRD #4212 m3: the ephemeral lease is the CURRENT admin setting, read through
@@ -331,5 +333,67 @@ func TestStatusReportLeaseReadsLiveDB(t *testing.T) {
 				t.Fatalf("run after retry = %q, want completed", got)
 			}
 		})
+	}
+}
+
+// TestHealthEligibilityFollowsShortenedPositiveLeaseLiveDB: a positive-to-positive change on one
+// Service. A leased peer 30m into its lease is counted claimable at 2h and not at 10m, in either
+// order of change, so a 2h boot value is not remembered.
+func TestHealthEligibilityFollowsShortenedPositiveLeaseLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	svc := e.permitService(t)
+	m := &mutableLeaseSettings{lease: 2 * time.Hour}
+	svc.SetEphemeralSettings(m)
+	run := e.seedQueuedRun(t, nil, nil)
+	bound := e.seedQueuedRun(t, nil, nil)
+	worker := e.seedHeartbeatWorker(t, nil)
+	e.exec(t, "UPDATE runs SET worker_id=$2,branch=NULL WHERE id=$1", run, worker)
+	e.exec(t, `UPDATE workers SET ephemeral=true,ephemeral_run_id=$2,
+        lease_since=now() - interval '30 minutes',lease_repo_id=(SELECT repo_id FROM runs WHERE id=$3),
+        lease_branch=(SELECT 'agent/issue-' || issue_iid::text FROM runs WHERE id=$3) WHERE id=$1`, worker, bound, run)
+
+	for i, step := range []struct {
+		lease time.Duration
+		want  int64
+	}{{2 * time.Hour, 1}, {10 * time.Minute, 0}, {2 * time.Hour, 1}, {10 * time.Minute, 0}} {
+		m.set(step.lease, nil)
+		c, err := svc.workerEligibilityForHealth(e.ctx, time.Now(), run, true)
+		if err != nil {
+			t.Fatalf("step %d workerEligibilityForHealth: %v", i, err)
+		}
+		if c.Claimable != step.want {
+			t.Fatalf("step %d lease %v (30m into the lease): claimable = %d, want %d", i, step.lease, c.Claimable, step.want)
+		}
+	}
+}
+
+// TestClaimSpreadPeerFollowsShortenedLeaseLiveDB: the spread-peer mirror of the claim's lease read.
+// A busy persistent claimant defers a fresh queued run to an idle leased ephemeral peer 30m into its
+// lease while the setting is 2h; once the SAME Service sees 10m the peer's lease is expired, it is
+// no deferral target, and the claimant claims the run.
+func TestClaimSpreadPeerFollowsShortenedLeaseLiveDB(t *testing.T) {
+	e := newLeaseEnv(t)
+	svc, m := e.liveLeaseService(2 * time.Hour)
+	peer, _, iid := e.seedLeasedWorker(t)
+	e.exec(`UPDATE workers SET max_concurrent_runs = 2, lease_since = now() - interval '30 minutes' WHERE id = $1`, peer)
+
+	claimant := uuid.New()
+	e.exec(`INSERT INTO workers (id, user_id, name, token_hash, status, last_heartbeat_at, max_concurrent_runs, snapshot_register_nonce)
+	        VALUES ($1, $2, 'persistent', $3, 'online', now(), 2, 'nonce-A')`, claimant, e.userID, claimant[:])
+	e.exec(`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, status, worker_id, claim_generation)
+	        VALUES ($1, $2, $3, 'issue', $4, 't', 'd', 'running', $5, 1)`, uuid.New(), e.userID, e.repoID, nextLeaseIID(), claimant)
+	follow := e.seedFollowUp(t, iid, agentIssueBranch(iid))
+
+	if r := awaitClaim(t, e.claimNoSnapshotAsync(svc, claimant)); r.err != nil || r.payload != nil {
+		t.Fatalf("lease 2h: claim = (%+v, %v), want idle (deferred to the live-leased peer)", r.payload, r.err)
+	}
+	if s := e.runStatusOf(t, follow); s != "queued" {
+		t.Fatalf("lease 2h: follow-up = %q, want still queued", s)
+	}
+
+	m.set(10*time.Minute, nil)
+	r := awaitClaim(t, e.claimNoSnapshotAsync(svc, claimant))
+	if r.err != nil || r.payload == nil || r.payload.RunID != follow.String() {
+		t.Fatalf("lease shortened to 10m: claim = (%+v, %v), want the follow-up %s", r.payload, r.err, follow)
 	}
 }
