@@ -751,7 +751,7 @@ test("pod epoch real retire scratch: the production retire writer keeps the scra
   }
 });
 
-test("pod epoch real retire scratch: directories the runner cannot list or modify survive byte-identical as residue with no chmod",{ timeout: 150000 }, async () => {
+test("pod epoch real retire scratch: directories the runner cannot list or modify survive byte-identical as residue with no chmod", { timeout: 150000 }, async () => {
   const f = fixture(); let t: RetireTree | undefined;
   let primary: unknown;
   try {
