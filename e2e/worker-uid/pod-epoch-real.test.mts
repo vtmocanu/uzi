@@ -89,8 +89,8 @@ class Owned {
     });
     this.lines = createInterface({ input: this.child.stdout })[Symbol.asyncIterator]();
   }
-  async read() {
-    const line = await deadline(this.lines.next(), "owned child response: " + this.stderr);
+  async read(ms = 8000) {
+    const line = await deadline(this.lines.next(), "owned child response: " + this.stderr, ms);
     assert.equal(line.done, false, "owned child exited: " + this.stderr);
     return JSON.parse(line.value!);
   }
@@ -102,12 +102,12 @@ class Owned {
     assert.equal(hello.classificationOnly, "ext4");
     assert.notEqual(hello.actualFilesystem, 0xef53, "image lane is actual tmpfs, not ext4 proof");
   }
-  async raw(request: object) {
+  async raw(request: object, ms?: number) {
     this.child.stdin.write(JSON.stringify(request) + "\n");
-    return this.read();
+    return this.read(ms);
   }
-  async ask(request: object): Promise<any> {
-    const response = await this.raw(request);
+  async ask(request: object, ms?: number): Promise<any> {
+    const response = await this.raw(request, ms);
     assert.equal(response.error, undefined, response.error);
     return response.result;
   }
@@ -610,4 +610,228 @@ test("pod epoch real split: the worker pins the runner scratch root, the runner-
     assert.equal(fs.existsSync(leafDir), false);
     assert.equal(fs.existsSync("/data/runner/.tmp/uzi-worker"), true, "the protected container name is untouched");
   } finally { fs.rmSync(leafDir, { recursive: true, force: true }); }
+});
+
+// ---- Issue #4263: GitCache.discardRetireScratchParent under the real uid split ---------------------------------
+// The tree is `<runner root>/.retire-<uuid>/clone`: a worker-owned sticky root, a worker-owned 0700 parent and a
+// runner-owned clone. The worker child (uid 10001, the production ambient SETUID/SETGID) runs the production method
+// with a real reclaim scope, so the strict `empty-fd` helper really runs as the runner uid (setpriv) with the clone
+// pin as fd 3 and the epoch EX lock as fd 4. Only the spawn seam is wrapped (see retireOp in pod-epoch-child.mts):
+// a worker-uid shell waits for a release file and execs the unchanged production argv, which lets a test race the
+// tree after the pins and before the removal, or kill the worker while the helper is pending.
+const WORKER_ID = 10001, RUNNER_ID = 10002, CMD_ID = 10003;
+const RETIRE_PARENT = ".retire-0b9f4a52-3c1d-4e8a-9b7e-1f2a3b4c5d6e";
+
+interface RetireTree { base: string; root: string; parent: string; clone: string; outside: string; elsewhere: string }
+
+function own(p: string, uid: number, gid: number, mode?: number) {
+  // Root holds CHOWN but not FOWNER: chmod first, while root still owns the entry.
+  if (mode !== undefined) fs.chmodSync(p, mode);
+  fs.lchownSync(p, uid, gid);
+}
+function put(p: string, content: string, uid: number, gid: number, mode: number) {
+  fs.writeFileSync(p, content); own(p, uid, gid, mode);
+}
+function retireTree(populate: (t: RetireTree) => void,
+  o: { rootOwner?: [number, number]; rootMode?: number; parentOwner?: [number, number]; parentMode?: number } = {}): RetireTree {
+  assert.equal(process.platform, "linux", "image proof requires Linux; never skip");
+  assert.equal(process.getuid!(), 0, "image proof requires the shared root window");
+  const base = fs.mkdtempSync("/data/retire-proof-");
+  fs.chmodSync(base, 0o755);
+  const t: RetireTree = { base, root: path.join(base, "root"), parent: "", clone: "", outside: path.join(base, "outside"),
+    elsewhere: path.join(base, "elsewhere") };
+  t.parent = path.join(t.root, RETIRE_PARENT); t.clone = path.join(t.parent, "clone");
+  for (const dir of [t.root, t.parent, t.clone, t.outside, t.elsewhere]) fs.mkdirSync(dir, { recursive: true });
+  put(path.join(t.outside, "keep.txt"), "outside-survives", RUNNER_ID, RUNNER_ID, 0o644);
+  own(t.outside, RUNNER_ID, RUNNER_ID, 0o755); own(t.elsewhere, RUNNER_ID, RUNNER_ID, 0o755);
+  own(t.clone, RUNNER_ID, RUNNER_ID, 0o755);
+  populate(t);
+  const [pu, pg] = o.parentOwner ?? [WORKER_ID, WORKER_ID];
+  own(t.parent, pu, pg, o.parentMode ?? 0o700);
+  const [ru, rg] = o.rootOwner ?? [WORKER_ID, RUNNER_ID];
+  own(t.root, ru, rg, o.rootMode ?? 0o1775);
+  return t;
+}
+function dropTree(t: RetireTree) {
+  spawnSync("/bin/chown", ["-R", "-h", "0:0", t.base]);
+  fs.rmSync(t.base, { recursive: true, force: true });
+}
+/** Mode, owner and content (or link target) of everything under `p`, as root; the comparison key of a byte-identical tree. */
+function digest(p: string, rel = "."): string[] {
+  const st = fs.lstatSync(p);
+  const meta = `${rel}|${st.isDirectory() ? "d" : st.isSymbolicLink() ? "l" : "f"}|${(st.mode & 0o7777).toString(8)}|${st.uid}:${st.gid}`;
+  if (st.isSymbolicLink()) return [`${meta}|${fs.readlinkSync(p)}`];
+  if (!st.isDirectory()) return [`${meta}|${fs.readFileSync(p, "utf8")}`];
+  return [meta, ...fs.readdirSync(p).sort().flatMap(name => digest(path.join(p, name), `${rel}/${name}`))];
+}
+/** Closes the fixture without letting a join failure hide the assertion that failed the test body. */
+async function closeAfter(f: Fixture, primary: unknown, cleanup: () => void) {
+  try { await f.close(); }
+  catch (error) { if (primary === undefined) throw error; }
+  finally { cleanup(); }
+}
+let retireSeq = 0;
+function retireReq(f: Fixture, t: RetireTree, extra: object = {}) {
+  const n = ++retireSeq;
+  return { op: "retire", root: t.root, parentName: RETIRE_PARENT, cache: path.join(f.root, "cache"), race: "none",
+    outside: t.outside, elsewhere: t.elsewhere,
+    gate: { started: path.join(f.root, `gate-${n}-started`), release: path.join(f.root, `gate-${n}-release`) }, ...extra };
+}
+async function retireOwner(f: Fixture) {
+  await f.runtime.seed(S);
+  const owner = await f.child(true);
+  assert.equal(await owner.ask({ op: "acquire", mode: "exclusive" }), "exclusive");
+  return owner;
+}
+const POPULATED = (t: RetireTree) => {
+  const { clone, outside } = t;
+  fs.mkdirSync(path.join(clone, "nested", "deeper"), { recursive: true });
+  fs.mkdirSync(path.join(clone, "shared"));
+  put(path.join(clone, "top.txt"), "t", RUNNER_ID, RUNNER_ID, 0o644);
+  put(path.join(clone, "nested", "deeper", "payload"), "p".repeat(4096), RUNNER_ID, RUNNER_ID, 0o644);
+  // A runner-cmd-owned, group-runner-writable file inside a runner-owned directory: the runner owns the directory, so it can unlink it.
+  put(path.join(clone, "shared", "cmd.txt"), "from runner-cmd", CMD_ID, RUNNER_ID, 0o660);
+  fs.symlinkSync(outside, path.join(clone, "nested", "outward")); fs.lchownSync(path.join(clone, "nested", "outward"), RUNNER_ID, RUNNER_ID);
+  for (const dir of ["nested", "nested/deeper", "shared"]) own(path.join(clone, dir), RUNNER_ID, RUNNER_ID, dir === "shared" ? 0o775 : 0o755);
+};
+
+test("pod epoch real retire scratch: the runner-uid empty-fd helper reclaims a populated clone, the worker removes clone and parent and an outward symlink target survives", { timeout: 150000 }, async () => {
+  const f = fixture(); const t = retireTree(POPULATED);
+  let primary: unknown;
+  try {
+    const owner = await retireOwner(f);
+    const out = await owner.ask(retireReq(f, t), 90000);
+    assert.deepEqual(out.result, { kind: "removed" }, JSON.stringify(out));
+    assert.equal(out.spawns, 1, "exactly one runner pass");
+    assert.equal(out.pending, 0); assert.equal(out.stopped, false); assert.deepEqual(out.unsettled, []);
+    assert.equal(fs.existsSync(t.parent), false, "parent and clone are gone");
+    assert.deepEqual(fs.readdirSync(t.root), [], "nothing else was created or left under the root");
+    assert.equal(fs.readFileSync(path.join(t.outside, "keep.txt"), "utf8"), "outside-survives", "the symlink target outside the clone survived");
+    assert.equal(flock(f.root, "-x"), 200, "the owner still holds EX after the discard");
+  } catch (e) { primary = e; throw e; } finally { await closeAfter(f, primary, () => dropTree(t)); }
+});
+
+test("pod epoch real retire scratch: unreadable runner-cmd directories survive byte-identical as residue with no chmod", { timeout: 150000 }, async () => {
+  const f = fixture();
+  let primary: unknown;
+  const t = retireTree(tree => {
+    const tracked = path.join(tree.clone, "tracked");
+    fs.mkdirSync(path.join(tracked, "hidden", "sub"), { recursive: true });
+    fs.mkdirSync(path.join(tracked, "drop"));
+    put(path.join(tracked, "plain.txt"), "removable", RUNNER_ID, RUNNER_ID, 0o644);
+    put(path.join(tracked, "hidden", "data.txt"), "runner-cmd-secret", CMD_ID, CMD_ID, 0o600);
+    put(path.join(tracked, "hidden", "sub", "x"), "x", CMD_ID, CMD_ID, 0o600);
+    put(path.join(tracked, "drop", "y.txt"), "dropped", CMD_ID, CMD_ID, 0o600);
+    own(path.join(tracked, "hidden", "sub"), CMD_ID, CMD_ID, 0o700);
+    own(path.join(tracked, "hidden"), CMD_ID, CMD_ID, 0o700);
+    own(path.join(tracked, "drop"), CMD_ID, CMD_ID, 0o730);
+    own(tracked, RUNNER_ID, RUNNER_ID, 0o755);
+  });
+  try {
+    const hidden = path.join(t.clone, "tracked", "hidden"), drop = path.join(t.clone, "tracked", "drop");
+    const before = { hidden: digest(hidden), drop: digest(drop) };
+    assert.ok(before.hidden.length >= 4 && before.drop.length === 2, "fixture holds content");
+    const owner = await retireOwner(f);
+    const out = await owner.ask(retireReq(f, t), 90000);
+    assert.equal(out.result.kind, "residue", JSON.stringify(out));
+    assert.equal(out.result.reason, "helper_remaining");
+    assert.equal(out.result.exit, 4);
+    assert.equal(out.pending, 0, "the ticket is settled"); assert.deepEqual(out.unsettled, []);
+    assert.deepEqual(digest(hidden), before.hidden, "the 0700 runner-cmd directory is byte-identical, modes and owners unchanged");
+    assert.deepEqual(digest(drop), before.drop, "the 0730 runner-cmd directory is byte-identical, modes and owners unchanged");
+    assert.equal(fs.existsSync(path.join(t.clone, "tracked", "plain.txt")), false, "what the runner could remove was removed");
+    assert.equal(fs.existsSync(t.parent), true, "the parent is kept");
+    assert.equal(fs.statSync(t.clone).isDirectory(), true, "the clone is kept");
+  } catch (e) { primary = e; throw e; } finally { await closeAfter(f, primary, () => dropTree(t)); }
+});
+
+test("pod epoch real retire scratch: a swapped clone or descendant never deletes outside the pinned tree and a swapped clone is never removed", { timeout: 240000 }, async () => {
+  const f = fixture();
+  let primary: unknown;
+  const trees: RetireTree[] = [];
+  const mk = (populate = POPULATED) => { const t = retireTree(populate); trees.push(t); return t; };
+  try {
+    const owner = await retireOwner(f);
+    const survivors = (t: RetireTree) => assert.equal(fs.readFileSync(path.join(t.outside, "keep.txt"), "utf8"), "outside-survives");
+    for (const [race, plant] of [["clone-symlink-before", "symlink"], ["clone-dir-before", "dir"], ["clone-dir-after", "dir"]] as const) {
+      const t = mk();
+      const out = await owner.ask(retireReq(f, t, { race }), 90000);
+      assert.equal(out.result.kind, "residue", race + " " + JSON.stringify(out));
+      assert.equal(out.result.reason, "clone_identity_changed", race);
+      assert.equal(out.pending, 0, race); assert.deepEqual(out.unsettled, [], race);
+      assert.equal(fs.existsSync(t.parent), true, race + ": the parent is kept");
+      assert.equal(fs.lstatSync(t.clone).isSymbolicLink(), plant === "symlink", race + ": the planted entry is untouched");
+      assert.equal(fs.existsSync(path.join(t.parent, "moved")), true, race + ": the bound clone survives under its new name");
+      survivors(t);
+      assert.deepEqual(fs.readdirSync(t.outside).sort(), ["keep.txt"], race + ": nothing was written outside");
+    }
+    // A descendant swapped for a symlink to an outside directory, with the real subtree moved out: the helper unlinks the
+    // symlink and never follows it. The clone is then genuinely empty, so removal is correct; the proof is that nothing outside went.
+    const t = mk();
+    const out = await owner.ask(retireReq(f, t, { race: "descendant" }), 90000);
+    assert.deepEqual(out.result, { kind: "removed" }, JSON.stringify(out));
+    survivors(t);
+    assert.deepEqual(fs.readdirSync(t.outside).sort(), ["keep.txt"], "the symlink target was not emptied");
+    assert.equal(fs.readFileSync(path.join(t.elsewhere, "moved-out", "deeper", "payload"), "utf8"), "p".repeat(4096), "the moved-out subtree is untouched");
+  } catch (e) { primary = e; throw e; } finally { await closeAfter(f, primary, () => { for (const t of trees) dropTree(t); }); }
+});
+
+test("pod epoch real retire scratch: the helper child sees only the clone pin at fd 3 and the EX lock at fd 4 and cannot reopen the worker-private parent", { timeout: 150000 }, async () => {
+  const f = fixture(); const t = retireTree(POPULATED);
+  let primary: unknown;
+  try {
+    const owner = await retireOwner(f);
+    const out = await owner.ask({ ...retireReq(f, t), gate: undefined, probe: true, lockFile: path.join(f.root, ".uzi-epoch.lock") }, 90000);
+    assert.equal(out.exit, 0, JSON.stringify(out));
+    assert.equal(out.probe.uid, RUNNER_ID, "the helper runs as the runner uid");
+    assert.deepEqual(out.probe.fds, { 3: { id: out.cloneId, dir: true }, 4: { id: out.lockId, dir: false } });
+    assert.deepEqual(out.probe.extra, [], "no descriptor beyond stdio, the clone pin and the lock");
+    assert.deepEqual(out.probe.reopen, { parentDotDot: "EACCES", listDotDot: "EACCES", siblingViaDotDot: "EACCES", statViaDotDot: "EACCES" },
+      "the runner cannot open or traverse the worker-private parent through the pinned clone");
+    assert.equal(fs.existsSync(path.join(t.clone, "top.txt")), true, "the probe changes nothing");
+  } catch (e) { primary = e; throw e; } finally { await closeAfter(f, primary, () => dropTree(t)); }
+});
+
+test("pod epoch real retire scratch: a worker killed while the helper runs leaves the helper holding EX until it exits", { timeout: 150000 }, async () => {
+  const f = fixture(); const t = retireTree(POPULATED);
+  let primary: unknown;
+  try {
+    const owner = await retireOwner(f);
+    const req = retireReq(f, t);
+    assert.equal(await owner.ask({ ...req, gate: { ...req.gate, hold: true }, detached: true }, 90000), "launched");
+    await until("the helper child is pending with its descriptors", () => fs.existsSync(req.gate.started), 60000);
+    assert.equal(flock(f.root, "-x"), 200, "EX is held while the worker lives");
+    await owner.killSelf();
+    assert.equal(flock(f.root, "-x"), 200, "the SIGKILLed worker cannot release EX while its helper child lives");
+    assert.equal(flock(f.root, "-s"), 200, "SH stays excluded too");
+    assert.equal(fs.existsSync(path.join(t.clone, "top.txt")), true, "nothing was removed before the helper ran");
+    fs.writeFileSync(req.gate.release, "");
+    await until("the helper exit releases the lock", () => flock(f.root, "-x") === 0, 60000);
+    assert.deepEqual(fs.readdirSync(t.clone), [], "the orphaned helper only emptied the pinned clone");
+    assert.equal(fs.existsSync(t.parent), true, "the dead worker removed nothing else");
+    assert.equal(fs.readFileSync(path.join(t.outside, "keep.txt"), "utf8"), "outside-survives");
+  } catch (e) { primary = e; throw e; } finally { await closeAfter(f, primary, () => dropTree(t)); }
+});
+
+test("pod epoch real retire scratch: another uid owning the root or the parent is refused with nothing launched", { timeout: 150000 }, async () => {
+  const f = fixture();
+  let primary: unknown;
+  const trees: RetireTree[] = [];
+  try {
+    const owner = await retireOwner(f);
+    const cases: Array<[string, string, Parameters<typeof retireTree>[1]]> = [
+      ["root owned by another uid", "root_posture", { rootOwner: [RUNNER_ID, RUNNER_ID] }],
+      ["root without the sticky bit", "root_posture", { rootMode: 0o775 }],
+      ["parent owned by another uid but openable by the worker", "wrong_owner", { parentOwner: [RUNNER_ID, WORKER_ID], parentMode: 0o770 }],
+    ];
+    for (const [label, reason, options] of cases) {
+      const t = retireTree(POPULATED, options); trees.push(t);
+      const before = digest(t.base);
+      const out = await owner.ask(retireReq(f, t), 90000);
+      assert.deepEqual(out.result, { kind: "refused", reason }, label + " " + JSON.stringify(out));
+      assert.equal(out.spawns, 0, label + ": nothing launched");
+      assert.equal(out.pending, 0, label); assert.deepEqual(out.unsettled, [], label);
+      assert.deepEqual(digest(t.base), before, label + ": nothing touched");
+    }
+  } catch (e) { primary = e; throw e; } finally { await closeAfter(f, primary, () => { for (const t of trees) dropTree(t); }); }
 });

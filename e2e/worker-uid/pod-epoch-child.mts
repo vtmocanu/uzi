@@ -6,7 +6,7 @@ import path from "node:path";
 import { createRequire } from "node:module";
 import { execFileSync, spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
-import { setprivArgsForUid, RUNNER_UID } from "../../agent/src/runner-uid.js";
+import { setprivArgsForUid, runnerCommand, RUNNER_UID } from "../../agent/src/runner-uid.js";
 import { restoreEpochRuntimeTmpdir } from "../../agent/src/pod-epoch-lock.js";
 
 const require = createRequire(import.meta.url);
@@ -46,6 +46,122 @@ function firstLine(child: ChildProcess): Promise<any> {
       resolve(JSON.parse(buffer.slice(0, end)));
     });
   });
+}
+// ---- Issue #4263: GitCache.discardRetireScratchParent under the real worker uid ----------------------------------
+// Everything here is real except the spawn seam, which only wraps the production argv in a worker-uid shell that
+// waits on a release file and then execs it unchanged (so the descriptors, the setpriv runner pass and the helper
+// script are the production ones) and which lets the test race the tree at the exact point between pin and removal.
+const O_PATH_DIR = 0o10000000 | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW;
+const GATE = ': > "$UZI_GATE_STARTED"; while [ ! -e "$UZI_GATE_RELEASE" ]; do sleep 0.1; done; exec "$@"';
+// Runs as the runner uid; fd 3 is the clone pin and fd 4 the epoch EX lock (inherited through setpriv).
+const FD_PROBE = [
+  'const fs=require("node:fs");const out={uid:process.getuid(),gid:process.getgid(),fds:{}};',
+  'for (const fd of [3,4]) { const s=fs.fstatSync(fd,{bigint:true}); out.fds[fd]={ id:s.dev+":"+s.ino, dir:s.isDirectory() }; }',
+  'out.extra=[];for (const name of fs.readdirSync("/proc/self/fd")) { if (Number(name)<5) continue;',
+  ' let t="";try{t=fs.readlinkSync("/proc/self/fd/"+name);}catch{continue;}',
+  ' if (t.startsWith("/") && !t.startsWith("/dev/") && !t.startsWith("/proc/")) out.extra.push(t); }',
+  'const code=(f)=>{try{f();return "opened";}catch(e){return e.code;}};',
+  'out.reopen={',
+  ' parentDotDot:code(()=>fs.closeSync(fs.openSync("/proc/self/fd/3/..",fs.constants.O_RDONLY|fs.constants.O_DIRECTORY))),',
+  ' listDotDot:code(()=>fs.readdirSync("/proc/self/fd/3/..")),',
+  ' siblingViaDotDot:code(()=>fs.closeSync(fs.openSync("/proc/self/fd/3/../clone",fs.constants.O_RDONLY|fs.constants.O_DIRECTORY))),',
+  ' statViaDotDot:code(()=>fs.lstatSync("/proc/self/fd/3/../clone")) };',
+  'process.stdout.write(JSON.stringify(out));',
+].join("\n");
+async function retireOp(req: { root: string; parentName: string; cache: string; race: string; outside: string; elsewhere: string;
+  gate?: { started: string; release: string; hold?: boolean }; probe?: boolean; lockFile?: string }) {
+  process.env.UZI_UID_SPLIT = "1";
+  const { GitCache } = await import("../../agent/src/git.js");
+  const { processGroupAlive } = await import("../../agent/src/tick-spawner.js");
+  const rr = await import("../../agent/src/runner-uid.js");
+  const logger: any = { debug() {}, info() {}, warn() {}, error() {}, addSecret() {}, removeSecret() {},
+    redactDiagnostic: (text: string) => text, child() { return logger; } };
+  const git: any = new GitCache(req.cache, logger);
+  const parent = path.join(req.root, req.parentName), clone = path.join(parent, "clone");
+  const rootPin = fs.openSync(req.root, O_PATH_DIR);
+  const mntId = (fd: number) => /^mnt_id:\s+(\d+)$/m.exec(fs.readFileSync(`/proc/self/fdinfo/${fd}`, "utf8"))![1]!;
+  const ids = (p: string) => { try { return fs.lstatSync(p, { bigint: true }); } catch { return undefined; } };
+  let spawns = 0;
+  git.epochNativeTestDependencies = {
+    spawn: (command: string, args: string[], options: any) => {
+      spawns++;
+      if (!req.gate) return spawn(command, args, options);
+      return spawn("/bin/sh", ["-c", GATE, "sh", command, ...args],
+        { ...options, env: { ...options.env, UZI_GATE_STARTED: req.gate.started, UZI_GATE_RELEASE: req.gate.release } });
+    },
+    alive: (pid: number, identity: any) => processGroupAlive(pid, identity, true),
+    kill: (pid: number) => { rr.killRunnerGroupOnly(pid, true); },
+    joinMs: 2000,
+  };
+  const scope = ownership.beginReclaim();
+  let discarded = false;
+  const waitFor = async (file: string) => {
+    // Stops as soon as the discard returned (a refusal never spawns), so no timer outlives the op.
+    for (let i = 0; i < 1200 && !discarded && !fs.existsSync(file); i++) await new Promise(resolve => setTimeout(resolve, 50));
+    if (!fs.existsSync(file)) throw new Error("gate never started");
+  };
+  // The runner cannot walk the worker-private parent by name, so it reaches the clone through an inherited descriptor.
+  const runnerSh = (script: string, ...args: string[]) => {
+    const pinned = fs.openSync(clone, O_PATH_DIR);
+    try {
+      const w = runnerCommand("/bin/sh", ["-c", script, "sh", ...args]);
+      const r = spawnSync(w.command, w.args, { env: { PATH: "/usr/bin:/bin" }, encoding: "utf8", timeout: 10000,
+        stdio: ["ignore", "pipe", "pipe", pinned] });
+      if (r.status !== 0) throw new Error("runner racer failed: " + r.stderr);
+    } finally { fs.closeSync(pinned); }
+  };
+  const swapClone = (plant: "symlink" | "dir") => {
+    fs.renameSync(clone, path.join(parent, "moved"));
+    if (plant === "symlink") fs.symlinkSync(req.outside, clone); else fs.mkdirSync(clone);
+  };
+  const race = () => {
+    if (req.race === "clone-symlink-before") swapClone("symlink");
+    else if (req.race === "clone-dir-before") swapClone("dir");
+    else if (req.race === "descendant") {
+      // The runner moves one subtree out of the clone and plants a symlink to an outside directory in its place.
+      runnerSh('mv /proc/self/fd/3/nested "$1/moved-out" && ln -s "$2" /proc/self/fd/3/nested', req.elsewhere, req.outside);
+    }
+  };
+  const rootStat = fs.lstatSync(req.root, { bigint: true });
+  const st = (p: string) => ids(p);
+  const input = {
+    scope, root: req.root, rootPin, rootDev: String(rootStat.dev), rootMntId: mntId(rootPin), parentName: req.parentName,
+    parentIno: String(st(parent)?.ino ?? 1n), cloneIno: String(st(clone)?.ino ?? 1n),
+    deadline: Date.now() + 120_000, maxEntries: 2_000_000, maxDepth: 256, signal: new AbortController().signal,
+    live: (() => {
+      let calls = 0;
+      return () => { if (++calls === 3 && req.race === "clone-dir-after") swapClone("dir"); };
+    })(),
+    beforeEffect: async () => undefined,
+  };
+  try {
+    if (req.probe) {
+      const lockStat = fs.statSync(req.lockFile!, { bigint: true });
+      const clonePin = fs.openSync(clone, O_PATH_DIR);
+      try {
+        const w = runnerCommand(process.execPath, ["-e", FD_PROBE]);
+        const joined = await git.spawnJoinedEpochChild(scope, w.command, w.args, {
+          env: { PATH: "/usr/bin:/bin" }, cwd: "/", identity: "command", signals: [], deadline: Date.now() + 30_000,
+          timeout: 5000, extraFd: clonePin,
+        });
+        if (!joined.spawned) throw new Error("probe not spawned");
+        joined.ticket.settle();
+        return { probe: JSON.parse(joined.stdout), exit: joined.code, stderr: joined.stderr,
+          cloneId: `${st(clone)!.dev}:${st(clone)!.ino}`, lockId: `${lockStat.dev}:${lockStat.ino}` };
+      } finally { fs.closeSync(clonePin); }
+    }
+    if (req.gate) {
+      void waitFor(req.gate.started).then(() => {
+        race();
+        if (!req.gate!.hold) fs.writeFileSync(req.gate!.release, "");
+      }).catch(() => { fs.writeFileSync(req.gate!.release, ""); });
+    }
+    let result;
+    try { result = await git.discardRetireScratchParent(input); } finally { discarded = true; }
+    return { result, spawns, pending: scope.pendingMutations, stopped: scope.stopped(), unsettled: [...git.unsettledDeletes.keys()] };
+  } finally {
+    try { if (!scope.stopped() && scope.pendingMutations === 0) scope.finish(); } catch { /* reported by the next op */ }
+  }
 }
 console.log(JSON.stringify({ ready: true, pid: process.pid, uid: process.getuid!(),
   actualFilesystem: Number(fs.statfsSync(root).type), classificationOnly: "ext4" }));
@@ -134,6 +250,13 @@ for await (const line of createInterface({ input: process.stdin })) {
           saved: process.env.UZI_EPOCH_RUNTIME_TMPDIR ?? null, runner: JSON.parse(child.stdout) };
         break;
       }
+      case "retire":
+        if (request.detached) {
+          // The worker is killed while the helper runs, so the reply cannot wait for the discard.
+          void retireOp(request).catch(error => { process.stderr.write("detached retire: " + String(error) + "\n"); });
+          result = "launched";
+        } else result = await retireOp(request);
+        break;
       default: throw new Error("unknown request");
     }
     console.log(JSON.stringify({ result }));
