@@ -6,7 +6,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
-  GitCache, RETIRE_BINDING_MAX_PER_BARE, evaluateRetireBinding, parseRetireBinding, parseRetireBindingKey, retireBindingKey, retireBindingValue,
+  GitCache, RETIRE_BINDING_MAX_PER_BARE, evaluateRetireBinding, parseAttemptLedgerEntry, parseRetireBinding, parseRetireBindingKey, retireBindingKey, retireBindingValue,
   type RetireBinding,
 } from "../src/git.js";
 import { syncDirectory } from "../src/authority-lock.js";
@@ -276,6 +276,21 @@ describe("compactAttemptLedger keeps taint a reclaim evaluation relies on (#4263
     await compact();
     assert.ok(ledgerValues().includes(reordered));
     assert.deepEqual(await evaluate(), { kind: "keep", reason: "ledger_mismatch" });
+  });
+
+  it("keeps the relative order of a tainted value and the compacted entries, so the last state per attempt is unchanged", async () => {
+    const other = "20261117T000000Z-g1-0123456789abcdef";
+    const otherLive = JSON.stringify({ attemptId: other, runId: "run-other", clonePath: bare, state: "live" }); // a present path: never dropped
+    const reordered = JSON.stringify({ runId: "run-4263", attemptId: ATTEMPT, clonePath: clonePath(), state: "live" });
+    addLedger(canonicalRetired());
+    addLedger(otherLive);
+    addLedger(reordered);
+    bindSettled();
+    const lastState = (): string | undefined => ledgerValues().map(v => parseAttemptLedgerEntry(v)).filter(e => e?.attemptId === ATTEMPT).at(-1)?.state;
+    assert.equal(lastState(), "live");
+    await compact();
+    assert.deepEqual(ledgerValues(), [canonicalRetired(), otherLive, reordered], "byte-identical and in input order");
+    assert.equal(lastState(), "live", "a reader taking the last value per attempt still sees live, never the earlier retired");
   });
 
   it("with an undecodable binding set, preserves a non-canonical value byte-for-byte", async () => {

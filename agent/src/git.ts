@@ -18064,8 +18064,9 @@ export class GitCache {
    *     keeps every entry.
    * A TAINTED value (issue #4263) is neither dropped nor compacted: a non-canonical value (unparseable, or not byte-identical
    * to its canonical re-serialization) that names an attempt id a decoded binding references, or ANY non-canonical value while
-   * the bindings are undecodable or unreadable. It is preserved verbatim, in its original relative order, placed before the
-   * compacted entries, and takes no part in last-value-per-attemptId selection. This keeps the taint
+   * the bindings are undecodable or unreadable. It is preserved verbatim AT ITS ORIGINAL POSITION
+   * (each compacted entry stays at the position of its attempt's last value, so the relative order of everything kept is
+   * the input order and no reader's last-value-per-attemptId answer changes), and takes no part in last-value selection. This keeps the taint
    * the reclaim evaluation's ledger read relies on (a non-canonical value naming the attempt blocks an earlier `retired`).
    * Nothing is rewritten when nothing would change.
    *
@@ -18099,20 +18100,24 @@ export class GitCache {
         if (e !== undefined && v === attemptLedgerValue(e)) return false;
         return bindingsUndecodable || boundAttemptIds.some(id => v.includes(id) || retireParsedNamesAttempt(v, id));
       };
-      const taintedValues: string[] = [];
-      const last = new Map<string, AttemptLedgerEntry>();
+      // One ordered pass: a tainted value stays at its own position; the last (untainted, parseable) value per attemptId stays
+      // at ITS position, re-serialized; everything else is dropped. With no taint this is the previous last-write order.
+      const slots: Array<{ tainted: string } | { entry: AttemptLedgerEntry }> = [];
+      const lastIndex = new Map<string, number>();
       for (const v of raw) {
-        if (tainted(v)) { taintedValues.push(v); continue; }
+        if (tainted(v)) { slots.push({ tainted: v }); continue; }
         const e = parseAttemptLedgerEntry(v);
         if (!e) continue;
-        last.delete(e.attemptId);
-        last.set(e.attemptId, e);
+        lastIndex.set(e.attemptId, slots.length);
+        slots.push({ entry: e });
       }
       const journaled = [...(await this.journaledClonePaths(barePath))];
       const namedByJournal = (p: string): boolean => journaled.some((j) => isWithinPath(j, p) || isWithinPath(p, j));
-      // Tainted values first, byte-for-byte in their original relative order, then the compacted entries in last-write order.
-      const kept: string[] = [...taintedValues];
-      for (const e of last.values()) {
+      const kept: string[] = [];
+      for (const [i, slot] of slots.entries()) {
+        if ("tainted" in slot) { kept.push(slot.tainted); continue; }
+        const e = slot.entry;
+        if (lastIndex.get(e.attemptId) !== i) continue;
         const gone = path.isAbsolute(e.clonePath) && !(await this.pathPresent(e.clonePath));
         const droppable = gone && !namedByJournal(e.clonePath) && !namedByBinding(e) && !(await this.hasPhysicalTerminalProtection(e.runId)) &&
           (e.state !== "reclaimed" || !(await this.custodyHeld(e.runId)));
