@@ -63,8 +63,11 @@ const REPO: Repo = {
 // Assembled at runtime so no credential-shaped literal sits in source.
 const SECRET_VALUE = ["s3cr", "et-val", "ue-1234"].join("");
 
+let varIdSeq = 0;
+
 function envVar(over: Partial<RunEnvVar> & Pick<RunEnvVar, "name">): RunEnvVar {
   return {
+    var_id: `00000000-0000-4000-8000-${String(++varIdSeq).padStart(12, "0")}`,
     secret: false,
     description: "",
     value: "https://sandbox.example.com",
@@ -228,6 +231,26 @@ describe("Repos environment variables panel", () => {
     fireEvent.change(within(panel).getByLabelText("Value"), { target: { value: SECRET_VALUE } });
     fireEvent.click(within(panel).getByRole("button", { name: "Save variable" }));
     expect(await within(panel).findByText(/Your vault is locked/)).toBeTruthy();
+  });
+
+  it("renders two pending-deletion rows of the same name and rev without a duplicate-key warning", async () => {
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      mockApi.listRepoEnv.mockResolvedValue(
+        list([
+          API_KEY,
+          envVar({ name: "OLD_KEY", var_id: "11111111-1111-4111-8111-111111111111", secret: true, value: null, state: "pending_deletion", rev: 1 }),
+          envVar({ name: "OLD_KEY", var_id: "22222222-2222-4222-8222-222222222222", secret: true, value: null, state: "pending_deletion", rev: 1 }),
+        ]),
+      );
+      const panel = await openPanel();
+      expect(within(panel).getAllByText("OLD_KEY").length).toBe(2);
+      expect(within(panel).getAllByText("Pending deletion").length).toBe(2);
+      const dupKey = errSpy.mock.calls.filter((c) => String(c[0]).includes("same key"));
+      expect(dupKey).toEqual([]);
+    } finally {
+      errSpy.mockRestore();
+    }
   });
 
   it("lists names with plain values withheld while the vault is locked", async () => {

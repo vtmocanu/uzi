@@ -1148,6 +1148,7 @@ export interface ToolAllowlistEntry {
 export type RunEnvState = "enabled" | "disabled" | "pending_deletion";
 
 export interface RunEnvVar {
+  var_id: string;
   name: string;
   secret: boolean;
   description: string;

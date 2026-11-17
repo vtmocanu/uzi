@@ -626,7 +626,7 @@ export const forgeApi = {
     }
     const next: RunEnvVar = cur
       ? { ...cur, secret, description: input.description ?? cur.description, updated_at: now }
-      : { name, secret, description: input.description ?? "", value: null, value_withheld: false, state: "enabled", rev: 1, disabled_at: null, created_at: now, updated_at: now };
+      : { var_id: crypto.randomUUID(), name, secret, description: input.description ?? "", value: null, value_withheld: false, state: "enabled", rev: 1, disabled_at: null, created_at: now, updated_at: now };
     if (input.value !== undefined) {
       envValues.set(`${repoId}/${name}`, input.value);
       next.rev = cur ? cur.rev + 1 : 1;

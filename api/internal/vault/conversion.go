@@ -260,7 +260,8 @@ func (v *Vault) convertMaterial(ctx context.Context, q Store, userID uuid.UUID, 
 		}
 	}
 	if progress.rows != totals.MaterialRows || progress.bytes != totals.CiphertextBytes {
-		// A repo delete cascades its env rows without the secret-mutation lock, so an env
+		// A repo or forge-connection delete cascades its env rows without the secret-mutation
+		// lock (and the fresh read relies on READ COMMITTED, postgres.go), so an env
 		// row not yet locked can vanish after the first measurement. Every row is locked
 		// now, so one fresh read is the settled total: accept it only on an exact match.
 		fresh, err := q.GetVaultMaterialTotals(ctx, userID)

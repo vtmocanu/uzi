@@ -8,7 +8,6 @@ audience: user
 
 > **Temporary note (milestone 1).** Variables are stored and managed, but
 > **not yet injected into runs**. Saving one has no effect on any run today.
-> Remove this note when injection ships.
 
 Give a repo's runs named settings and credentials, such as a database URL or a
 package index token. Each variable belongs to one repo and is either **secret**
