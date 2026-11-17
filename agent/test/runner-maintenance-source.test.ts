@@ -21,7 +21,7 @@ installHarness();
 // An observation names one fresh source; it never proves source-family completeness.
 type TailView = { executionTails: ReadonlyMap<string, Promise<unknown>> };
 
-for (const mode of ["normal", "latched-pause", "failed-stop", "late-shutdown", "late-fence", "failed-reap", "failed-cache", "failed-skills", "failed-retire", "failed-retired-append", "failed-holding-dispose", "failed-scratch-dispose", "failed-owed", "retention-failure", "canonical", "adopted-source"] as const) {
+for (const mode of ["normal", "latched-pause", "failed-stop", "late-shutdown", "late-fence", "failed-reap", "failed-cache", "failed-skills", "failed-retire", "failed-retired-append", "failed-holding-dispose", "failed-scratch-dispose", "intent-write-failed", "intent-sync-failed", "failed-owed", "retention-failure", "canonical", "adopted-source"] as const) {
   it(`#3031 owner pause ${mode}: exact fresh source is observed only after cleanup`, { skip: ["normal", "latched-pause", "retention-failure"].includes(mode) ? LINUX_ONLY : false }, async (t) => {
     const claim = gitlabClaim(3033, { claim_generation: 1 });
     const started = deferred(), finish = deferred(), cleaning = deferred(), finishCleanup = deferred();
@@ -92,6 +92,27 @@ for (const mode of ["normal", "latched-pause", "failed-stop", "late-shutdown", "
           return rm(...args);
         });
       }
+    }
+    if (mode === "intent-write-failed" || mode === "intent-sync-failed") {
+      // issue #4263: the owner terminal retire cannot write its scratch binding on the EXDEV branch. It must fail closed
+      // before the move, exactly as a retirement failure does today: the caller's documented outcome, no run-status change.
+      t.mock.method(runLogger, "warn", (message: string) => { warnings.push(message); });
+      const holdingRoot = path.join(fx.dataDir, "runner-quarantine");
+      const rename = fs.rename.bind(fs);
+      t.mock.method(fs, "rename", async (...args: Parameters<typeof rename>) => {
+        if (String(args[1]).startsWith(holdingRoot + path.sep))
+          throw Object.assign(new Error("cross-device holding move"), { code: "EXDEV" });
+        return rename(...args);
+      });
+      const seam = git as unknown as { retireBindingStepSeam?: (step: string) => void };
+      const previous = seam.retireBindingStepSeam;
+      seam.retireBindingStepSeam = step => {
+        if (step === (mode === "intent-write-failed" ? "intent-write" : "intent-sync")) {
+          internalFaults++;
+          throw new Error("injected intent failure");
+        }
+      };
+      t.after(() => { seam.retireBindingStepSeam = previous; });
     }
     const ackStarted = deferred(), releaseAck = deferred();
     if (mode === "late-fence") {
@@ -192,6 +213,14 @@ for (const mode of ["normal", "latched-pause", "failed-stop", "late-shutdown", "
           assert.equal((await fs.readdir(path.join(fx.dataDir, "runner"))).filter(name => name.startsWith(".retire-")).length, 1);
         }
         assert.ok(!warnings.includes("runner clone cleanup failed"), "helper still resolves after its internal failure");
+      }
+      if (mode === "intent-write-failed" || mode === "intent-sync-failed") {
+        assert.equal(internalFaults, 1, "the retire reached the injected binding failure once");
+        assert.ok(warnings.includes("runner clone cleanup failed"), "owner terminal: warn runner clone cleanup failed");
+        const clonePath = (expected as { genesis: { clonePath: string } }).genesis.clonePath;
+        assert.equal(await fs.readFile(path.join(clonePath, "pause-work.txt"), "utf8"), "fresh work\n", "the clone stays at its canonical path");
+        assert.deepEqual((await fs.readdir(path.join(fx.dataDir, "runner"))).filter(name => name.startsWith(".retire-")), [],
+          "no scratch parent remains");
       }
       assert.equal(tails.has(claim.run_id), false, "no completed registry");
     } finally {

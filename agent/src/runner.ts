@@ -2830,6 +2830,9 @@ interface RunFlight {
   sourceOriginalInputs?: Readonly<{ barePath: string; branch: string; key: string;
     kind: RunKind; defaultBranch: string; cloneUrl: string; repoId: string }>;
   sourceJoinFailed?: boolean;
+  /** issue #4263: retainStoppedSource lifted this flight's preserveRecoveryClone on a `covered` verdict, so the owner
+   *  terminal retire that follows is classed `owner_terminal_covered` (a retirement scratch binding that never settles). */
+  coveredLiftRetire?: boolean;
   /** issue #3239: an unvetted marker may remain in history. Captures never reset this refusal;
    * only a complete-history absence proof permits publication of an exact candidate. */
   wipMarkerUnsafe?: boolean;
@@ -5471,7 +5474,7 @@ export class RunRunner {
       if (after.process?.state !== "quiescent") return retain("not_quiescent");
       if (!open()) return retain("vetoed");
       await this.git.retireRunnerClone(ctx.barePath, source.clonePath, ctx.branch, ctx.runId, {
-        discard: true, attemptId: source.attemptId, completionSource: { expectedHead: source.expectedHead, canDelete: open,
+        discard: true, attemptId: source.attemptId, dispositionClass: "completion", completionSource: { expectedHead: source.expectedHead, canDelete: open,
           ...(durable ? { expectedFence: durable.expectedFence, beforeDestroy: durable.enter } : {}) },
         ...(classification.kind === "knownCodex" ? { processProof: open } : {}),
       });
@@ -7743,6 +7746,7 @@ export class RunRunner {
               flight.branch!,
               runId,
               { discard: true, attemptId: flight.runnerClone?.attemptId,
+                dispositionClass: flight.coveredLiftRetire === true ? "owner_terminal_covered" : "owner_terminal",
                 ...(terminalCodex ? { processProof: cloneReleaseProof } : {}),
                 onRetirementUnproven: () => { flight.sourceJoinFailed = true; } },
             ));
@@ -7780,7 +7784,7 @@ export class RunRunner {
             const q = await this.quiesceRun(flight, flight.executor, { mode: "own", site: "terminal_retire" });
             if (!q.blocked && await acknowledged() && !this.cancellationExpired(flight)) {
               await this.runCancellationMaintenance(flight, () => this.git.retireRunnerClone(flight.barePath!, flight.worktreePath!, flight.branch!, runId, {
-                discard: true, attemptId: flight.attemptId,
+                discard: true, attemptId: flight.attemptId, dispositionClass: "verified_successor",
                 ...(terminalCodex ? { processProof: successorProcessProof } : {}),
                 verifiedSuccessor: { key: this.cloneCoordinates(claim).key, generation: flight.claimGeneration,
                   expected: flight.completedRetainedSuccessor!, acknowledged },
@@ -14648,7 +14652,7 @@ export class RunRunner {
         await this.git.releaseAttemptInPlace(barePath, journaledPath, branch, ownerRunId, "reclaimed");
         disposition = "retained-in-place";
       } else {
-        disposition = await this.git.retireRunnerClone(barePath, journaledPath, branch, ownerRunId, { discard: false, orphanDiagnostics: diagnostics });
+        disposition = await this.git.retireRunnerClone(barePath, journaledPath, branch, ownerRunId, { discard: false, orphanDiagnostics: diagnostics, dispositionClass: "other" });
       }
     } catch (error) {
       return refuseAfterReread(error instanceof AttemptReleaseError ? (error.stage === "ledger" ? "attempt_ledger" : "attempt_journal") : "retirement",
@@ -28040,6 +28044,7 @@ export class RunRunner {
               if (terminalRequest && flight.terminalReleaseOwner) flight.terminalReleaseOwner.provisional(false);
               else flight.preserveRecoveryClone = false;
               flight.stoppedSourceKept = false;
+              flight.coveredLiftRetire = true;
               log.info("stopped source: clean and already held by the worker bare (tracking tip, owed pin or default branch); teardown proceeds", { clone: clonePath, reason });
               return "covered";
             }
