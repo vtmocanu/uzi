@@ -61,6 +61,10 @@ type cardDTO struct {
 	ForgeType  string  `json:"forge_type"`
 	Author     *string `json:"author"`
 	HasPRDLink bool    `json:"has_prd_link"`
+	// IssueKey is the issue tracker key ("ABC-12") of a card cached by the linked
+	// sync (issues.issue_key, PRD #4173 D10). Empty, and so absent from the payload,
+	// for every forge-backed card, which keeps unlinked payloads byte-identical.
+	IssueKey string `json:"issue_key,omitempty"`
 	// Column is the resolved column label; "" means the implicit Open column.
 	// Ignored when Closed is true.
 	Column string `json:"column"`
@@ -343,6 +347,11 @@ func (h *Handler) GetBoard(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// PRD 4173 D13: a never-enabled repo is neither seeded nor synced; the board opens
+	// only after the first enable.
+	if refuseNeverEnabled(w, repo.AwaitingFirstEnable) {
+		return
+	}
 
 	count, err := h.q.CountBoardColumns(r.Context(), repo.ID)
 	if err != nil {
@@ -386,16 +395,19 @@ func (h *Handler) ensureHumanReviewColumn(w http.ResponseWriter, r *http.Request
 		return true // already present — idempotent, no forge or DB work
 	}
 
-	tr, err := h.issueTrackerForRepo(r.Context(), repo.ID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
+	tr, err := h.issueTrackerForRepo(r.Context(), repo.UserID, repo.ID, repo.IssueTrackerConnectionID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
 		slog.Error("build forge for connection", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return false
 	}
-	// Color matches DefaultColumns' Human Review entry.
-	if err := tr.EnsureLabels(r.Context(), repo.ForgeProjectID, []forge.Label{{Name: board.ColumnHumanReview, Color: "#6e49cb"}}); err != nil {
-		slog.Warn("ensure Human Review label on the forge", "repo", repo.PathWithNamespace, "error", err)
-		return true // non-fatal: render with existing columns, retry next load
+	// Color matches DefaultColumns' Human Review entry. A linked issue tracker gets no
+	// label write (PRD #4173 M4); the column row is still added below.
+	if !repo.IssueTrackerConnectionID.Valid {
+		if err := tr.EnsureLabels(r.Context(), repo.ForgeProjectID, []forge.Label{{Name: board.ColumnHumanReview, Color: "#6e49cb"}}); err != nil {
+			slog.Warn("ensure Human Review label on the forge", "repo", repo.PathWithNamespace, "error", err)
+			return true // non-fatal: render with existing columns, retry next load
+		}
 	}
 	// Bump the columns Human Review displaces up one so the new column lands right
 	// after In Progress with a distinct position — the same RELATIVE placement fresh
@@ -453,13 +465,22 @@ func humanReviewPlacement(cols []store.BoardColumn) (pos int, needed bool) {
 // writing an error) only when the label-seeding step fails; an import failure
 // is logged but non-fatal (the board still renders and Refresh retries).
 func (h *Handler) seedBoard(w http.ResponseWriter, r *http.Request, repo store.GetRepoForUserRow) bool {
-	tr, err := h.issueTrackerForRepo(r.Context(), repo.ID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
+	tr, err := h.issueTrackerForRepo(r.Context(), repo.UserID, repo.ID, repo.IssueTrackerConnectionID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
 		slog.Error("build forge for connection", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return false
 	}
-	if err := forgesvc.EnsureBoardColumns(r.Context(), h.q, tr, repo.ID, repo.ForgeProjectID); err != nil {
+	linked := repo.IssueTrackerConnectionID.Valid
+	var boardErr error
+	if linked {
+		// No labels are created on a linked issue tracker (writes arrive in M5): the
+		// column rows are seeded from the store alone.
+		boardErr = forgesvc.EnsureBoardColumnRows(r.Context(), h.q, repo.ID)
+	} else {
+		boardErr = forgesvc.EnsureBoardColumns(r.Context(), h.q, tr, repo.ID, repo.ForgeProjectID)
+	}
+	if err := boardErr; err != nil {
 		var seedErr *forgesvc.LabelSeedError
 		if errors.As(err, &seedErr) {
 			httpx.Error(w, http.StatusBadGateway, "could not seed board labels on the forge: "+seedErr.Error())
@@ -469,7 +490,7 @@ func (h *Handler) seedBoard(w http.ResponseWriter, r *http.Request, repo store.G
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return false
 	}
-	if _, err := h.svc.FullSync(r.Context(), repo.ID, repo.ForgeProjectID, tr); err != nil {
+	if _, err := h.svc.SyncIssues(r.Context(), repo.UserID, repo.ID, repo.ForgeProjectID, tr); err != nil {
 		// Non-fatal: the board renders empty and the poller/Refresh will fill it.
 		slog.Warn("initial board import failed", "repo", repo.PathWithNamespace, "error", err)
 	}
@@ -702,6 +723,7 @@ func assembleCards(issues []store.Issue, runRows []store.ListLatestRunsForRepoRo
 			WebURL:      is.WebUrl,
 			ForgeType:   forgeType,
 			HasPRDLink:  is.HasPrdLink,
+			IssueKey:    is.IssueKey.String,
 			Column:      col,
 			Closed:      closed,
 			Conflict:    conflict,
@@ -733,6 +755,10 @@ type configureColumnsRequest struct {
 func (h *Handler) ConfigureColumns(w http.ResponseWriter, r *http.Request) {
 	repo, ok := h.repoForRequest(w, r)
 	if !ok {
+		return
+	}
+	// PRD 4173 D13: no label seeding on a never-enabled repo.
+	if refuseNeverEnabled(w, repo.AwaitingFirstEnable) {
 		return
 	}
 	var req configureColumnsRequest
@@ -772,7 +798,7 @@ func (h *Handler) ConfigureColumns(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tr, err := h.issueTrackerForRepo(r.Context(), repo.ID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
+	tr, err := h.issueTrackerForRepo(r.Context(), repo.UserID, repo.ID, repo.IssueTrackerConnectionID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
 		slog.Error("build forge for connection", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -784,6 +810,9 @@ func (h *Handler) ConfigureColumns(w http.ResponseWriter, r *http.Request) {
 			labels[i] = forge.Label{Name: n, Color: defaultColumnColor}
 		}
 		if err := tr.EnsureLabels(r.Context(), repo.ForgeProjectID, labels); err != nil {
+			if writeIssueWriteNotOffered(w, err) {
+				return
+			}
 			httpx.Error(w, http.StatusBadGateway, "could not ensure column labels on the forge: "+err.Error())
 			return
 		}
@@ -1027,7 +1056,7 @@ func (h *Handler) MoveIssue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tr, err := h.issueTrackerForRepo(r.Context(), repo.ID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
+	tr, err := h.issueTrackerForRepo(r.Context(), repo.UserID, repo.ID, repo.IssueTrackerConnectionID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
 		slog.Error("build forge for connection", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -1052,6 +1081,9 @@ func (h *Handler) MoveIssue(w http.ResponseWriter, r *http.Request) {
 		updated, err = h.svc.AutoMove(r.Context(), tr, repo.ForgeProjectID, issue, cols, target)
 	}
 	if err != nil {
+		if writeIssueWriteNotOffered(w, err) {
+			return
+		}
 		httpx.Error(w, http.StatusBadGateway, "could not update the issue on the forge: "+err.Error())
 		return
 	}
@@ -1167,7 +1199,7 @@ func (h *Handler) PromoteIssue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tr, err := h.issueTrackerForRepo(r.Context(), repo.ID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
+	tr, err := h.issueTrackerForRepo(r.Context(), repo.UserID, repo.ID, repo.IssueTrackerConnectionID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
 		slog.Error("build forge for connection", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -1179,6 +1211,9 @@ func (h *Handler) PromoteIssue(w http.ResponseWriter, r *http.Request) {
 	// with no forge call, so a double click costs nothing.
 	updated, err := h.svc.SetIssueLabel(r.Context(), tr, repo.ForgeProjectID, issue, label, forgesvc.PromoteLabelColor, true)
 	if err != nil {
+		if writeIssueWriteNotOffered(w, err) {
+			return
+		}
 		httpx.Error(w, http.StatusBadGateway, "could not update the issue label on the forge: "+err.Error())
 		return
 	}
@@ -1226,6 +1261,7 @@ func issueToCard(is store.Issue, position map[string]int, forgeType string) card
 		WebURL:      is.WebUrl,
 		ForgeType:   forgeType,
 		HasPRDLink:  is.HasPrdLink,
+		IssueKey:    is.IssueKey.String,
 		Column:      col,
 		Closed:      closed,
 		Conflict:    conflict,
@@ -1252,13 +1288,16 @@ func (h *Handler) SyncRepo(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	tr, err := h.issueTrackerForRepo(r.Context(), repo.ID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
+	if refuseNeverEnabled(w, repo.AwaitingFirstEnable) {
+		return
+	}
+	tr, err := h.issueTrackerForRepo(r.Context(), repo.UserID, repo.ID, repo.IssueTrackerConnectionID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
 		slog.Error("build forge for connection", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	if _, err := h.svc.FullSync(r.Context(), repo.ID, repo.ForgeProjectID, tr); err != nil {
+	if _, err := h.svc.SyncIssues(r.Context(), repo.UserID, repo.ID, repo.ForgeProjectID, tr); err != nil {
 		httpx.Error(w, http.StatusBadGateway, "sync failed: "+err.Error())
 		return
 	}

@@ -156,10 +156,15 @@ func (s *Service) CreateManualMRReworkRun(ctx context.Context, userID, repoID uu
 func (s *Service) createMRReworkRun(ctx context.Context, userID, repoID uuid.UUID, ref string, mrIID int64, sourceRunID uuid.UUID, title, description string, snapshot *ReviewCommentsSnapshot, triggerSource string, manual, advance *ReviewPlan, recheck *reworkRecheck) (store.Run, error) {
 	// Repo-ownership / existence check, mirroring createCIFixRun so an unknown repo is
 	// a clean ErrRepoNotFound rather than an FK error at INSERT.
-	if _, err := s.q.GetRepoForUser(ctx, store.GetRepoForUserParams{ID: repoID, UserID: userID}); err != nil {
+	row, err := s.q.GetRepoForUser(ctx, store.GetRepoForUserParams{ID: repoID, UserID: userID})
+	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return store.Run{}, ErrRepoNotFound
 		}
+		return store.Run{}, err
+	}
+	// PRD 4173 D13: no run of any kind on a never-enabled repo; refused before any forge call.
+	if err := store.RefuseNeverEnabled(row.AwaitingFirstEnable); err != nil {
 		return store.Run{}, err
 	}
 

@@ -91,6 +91,10 @@ func (h *Handler) FileFinding(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
+	// PRD 4173 D13: before the claim and the forge write.
+	if refuseNeverEnabled(w, repo.AwaitingFirstEnable) {
+		return
+	}
 
 	// (3) Resolve the filed title/description (D4). The default is the deterministic template
 	// over the STORED row (agent text never rides in raw — RenderFinding routes each field
@@ -149,7 +153,7 @@ func (h *Handler) FileFinding(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tr, err := h.issueTrackerForRepo(ctx, repo.ID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
+	tr, err := h.issueTrackerForRepo(ctx, repo.UserID, repo.ID, repo.IssueTrackerConnectionID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
 		h.revertFindingClaim(ctx, finding)
 		slog.Error("file finding: build forge for connection", "error", err)
@@ -162,6 +166,9 @@ func (h *Handler) FileFinding(w http.ResponseWriter, r *http.Request) {
 	// claim and is a 502 (an upstream forge problem), not a duplicate issue.
 	if err := tr.EnsureLabels(ctx, repo.ForgeProjectID, requiredLabels); err != nil {
 		h.revertFindingClaim(ctx, finding)
+		if writeIssueWriteNotOffered(w, err) {
+			return
+		}
 		httpx.Error(w, http.StatusBadGateway, "could not ensure the finding label on the forge: "+err.Error())
 		return
 	}
@@ -171,6 +178,9 @@ func (h *Handler) FileFinding(w http.ResponseWriter, r *http.Request) {
 		// The forge rejected the write: the claim reverts, nothing is persisted, the finding
 		// stays open and re-fileable. err is already PAT-redacted by the driver.
 		h.revertFindingClaim(ctx, finding)
+		if writeIssueWriteNotOffered(w, err) {
+			return
+		}
 		httpx.Error(w, http.StatusBadGateway, "could not create the issue on the forge: "+err.Error())
 		return
 	}

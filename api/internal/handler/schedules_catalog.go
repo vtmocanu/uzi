@@ -72,6 +72,10 @@ func (h *Handler) EnableCatalogSchedule(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
+	// PRD 4173 D13: no schedule on a never-enabled repo.
+	if refuseNeverEnabled(w, repo.AwaitingFirstEnable) {
+		return
+	}
 	user, _ := mw.UserFromContext(r.Context())
 	slug := chi.URLParam(r, "slug")
 	job, ok := schedtmpl.BySlug(slug)
@@ -160,6 +164,9 @@ func (h *Handler) EnableCatalogSchedule(w http.ResponseWriter, r *http.Request) 
 				return
 			}
 			httpx.JSON(w, http.StatusOK, h.scheduleDTOWithLabel(r.Context(), existing, repo.PathWithNamespace))
+			return
+		}
+		if writeIfNeverEnabled(w, err) {
 			return
 		}
 		slog.Error("enable default schedule", "slug", slug, "error", err)

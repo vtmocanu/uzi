@@ -85,6 +85,20 @@ func (e *Scheduler) fireSelfImprove(ctx context.Context, sched store.RunSchedule
 		}
 		return FireOutcome{}, err // transient DB error: retry next tick
 	}
+	// PRD 4173 D13: a never-enabled repo is skipped (transient to advance: logged, retried
+	// next tick, never parked) before any forge call or tracking-issue write.
+	if err := store.RefuseNeverEnabled(repo.AwaitingFirstEnable); err != nil {
+		return FireOutcome{}, err
+	}
+
+	// PRD #4173 M4: self-improve files a tracking issue on the repo's issue tracker, and a
+	// linked repo has none to write to until M5 (the write guard would refuse it anyway).
+	// Skipped as a benign, logged no-op before any forge call; never falls back to the forge.
+	if repo.IssueTrackerConnectionID.Valid {
+		e.logger.Info("scheduler: self_improve skipped, issue creation is not offered on a repo linked to an issue tracker",
+			"schedule", sched.ID.String(), "repo", repo.ID.String())
+		return FireOutcome{Matched: 1, Skips: []Skip{{Reason: SkipConfigNotSupported}}}, nil
+	}
 
 	// 2. Active-run pre-check, per repo. On a DB error retry next tick (transient). If a run
 	// is already active for this repo, benign skip — no notification (mirrors firePrompt's

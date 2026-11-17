@@ -141,7 +141,7 @@ function buildPrompt(claim: ClaimResponse, grant: IsolatedFetchClaim): string {
   const hosts = grant.hosts.length ? grant.hosts.map((h) => `- ${h}`).join("\n") : "- (none)";
   return [
     "Research task: ",
-    buildIssueContext(claim.issue_title ?? "", claim.issue_description ?? "", claim.issue_iid),
+    buildIssueContext(claim.issue_title ?? "", claim.issue_description ?? "", claim.issue_iid, claim.issue_key),
     "",
     `Allowed site list "${grant.profile}" (the fetcher enforces it; other hosts are refused):`,
     hosts,

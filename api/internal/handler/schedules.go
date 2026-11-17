@@ -54,6 +54,10 @@ func (h *Handler) CreateSchedule(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// PRD 4173 D13: no schedule on a never-enabled repo.
+	if refuseNeverEnabled(w, repo.AwaitingFirstEnable) {
+		return
+	}
 	user, _ := mw.UserFromContext(r.Context())
 
 	var req apitypes.ScheduleRequest
@@ -135,6 +139,9 @@ func (h *Handler) CreateSchedule(w http.ResponseWriter, r *http.Request) {
 		CredentialOverrideSecretID: credCols.secretID,
 	})
 	if err != nil {
+		if writeIfNeverEnabled(w, err) {
+			return
+		}
 		slog.Error("create run schedule", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
@@ -249,8 +256,13 @@ func (h *Handler) PatchSchedule(w http.ResponseWriter, r *http.Request) {
 		if repoint {
 			// Ownership mirror (create parity, PRD #344 D3): 404 on a foreign/absent repo.
 			// No enabled/guardrail/blocked gate is added here — those run at fire time.
-			if _, rerr := qw.GetRepoForUser(r.Context(), store.GetRepoForUserParams{ID: repoID, UserID: user.ID}); rerr != nil {
+			target, rerr := qw.GetRepoForUser(r.Context(), store.GetRepoForUserParams{ID: repoID, UserID: user.ID})
+			if rerr != nil {
 				httpx.Error(w, http.StatusNotFound, "repo not found")
+				return
+			}
+			// PRD 4173 D13: a schedule may not be repointed at a never-enabled repo.
+			if refuseNeverEnabled(w, target.AwaitingFirstEnable) {
 				return
 			}
 			// A schedule with CI-watch episode history keeps it only against the repo whose
@@ -349,6 +361,9 @@ func (h *Handler) PatchSchedule(w http.ResponseWriter, r *http.Request) {
 				// hits the partial unique index (PRD #636 Decision 10). Mirror AddScheduleRepo's
 				// 23505→409 mapping rather than surface it as a generic 500.
 				httpx.Error(w, http.StatusConflict, "another repo in this schedule's group already uses that repo")
+				return
+			}
+			if writeIfNeverEnabled(w, err) {
 				return
 			}
 			slog.Error("update run schedule", "error", err)
@@ -468,6 +483,8 @@ func (h *Handler) RunScheduleNow(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case errors.Is(err, workersvc.ErrRepoNotFound):
 			httpx.Error(w, http.StatusNotFound, "the schedule's repo is disconnected or no longer owned by you")
+		case errors.Is(store.MapNeverEnabled(err), store.ErrRepoNeverEnabled):
+			writeNeverEnabled(w)
 		case errors.Is(err, schedsvc.ErrBadConfig):
 			httpx.Error(w, http.StatusBadRequest, "the schedule's configuration is invalid")
 		default:

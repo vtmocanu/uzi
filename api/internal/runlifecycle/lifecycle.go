@@ -33,6 +33,8 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/board"
 	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/forgesvc"
+	"github.com/vtmocanu/uzi/api/internal/issuesource"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -96,6 +98,11 @@ type Lifecycle struct {
 	// Projects v2 Status (PRD #364 M5). Optional; nil skips the projection.
 	projector Projector
 
+	// issueSources resolves the issue side of a repo linked to an external issue
+	// tracker (PRD #4173 DL-5); SetIssueSources. Nil ⇒ a linked repo fails closed
+	// (issuesource.ErrNotWired) and an unlinked one keeps using the mover's forge.
+	issueSources issuesource.Sources
+
 	// frontendOrigin is the user-facing origin (config.FrontendOrigin) the
 	// terminal-comment hook builds run links from. Empty omits the link.
 	frontendOrigin string
@@ -138,6 +145,9 @@ func New(q Store, mover Mover, frontendOrigin string) *Lifecycle {
 // then performs no Status projection.
 func (l *Lifecycle) SetProjector(p Projector) { l.projector = p }
 
+// SetIssueSources wires the resolver of a linked repo's issue side (PRD #4173 DL-5).
+func (l *Lifecycle) SetIssueSources(is issuesource.Sources) { l.issueSources = is }
+
 // SetBeat wires the admin-health loop-beat callback (PRD #1484 M2). Call once at startup,
 // before RunReconciler. A nil beat (the default) disables it, so tests that never wire one
 // behave exactly as before. The callback fires once per reconcile tick.
@@ -151,6 +161,8 @@ func (l *Lifecycle) Interval() time.Duration { return l.interval }
 // by the notifier (GetRunMoveContext) and the reconciler (re-read per run).
 type moveContext struct {
 	repoID          uuid.UUID
+	userID          uuid.UUID
+	linked          bool // the repo's issue_tracker_connection_id is set (PRD #4173)
 	issueIID        int64
 	forgeProjectID  int64
 	forgeType       string
@@ -309,6 +321,8 @@ func contextFromRow(mc store.GetRunMoveContextRow) moveContext {
 		// GetRunMoveContext INNER-JOINs repos, so a row is returned only for a run
 		// with a non-NULL repo_id (a chat run yields ErrNoRows and never reaches here).
 		repoID:          uuid.UUID(mc.RepoID.Bytes),
+		userID:          mc.UserID,
+		linked:          mc.IssueTrackerConnectionID.Valid,
 		issueIID:        mc.IssueIid.Int64, // valid: notifyOnce and reconcileOne skip card-less runs (NULL issue_iid)
 		forgeProjectID:  mc.ForgeProjectID,
 		forgeType:       mc.ForgeType,
@@ -339,6 +353,12 @@ func (l *Lifecycle) apply(ctx context.Context, runID uuid.UUID, mc moveContext, 
 	if err != nil {
 		if !errors.Is(err, pgx.ErrNoRows) {
 			slog.Warn("run lifecycle: load issue for move", "run", runID, "error", err)
+		} else if mc.linked {
+			// PRD #4173 D10: a linked issue that moved to another project is evicted from
+			// the cache; it will never be found again, so the move is a permanent skip.
+			slog.Info("run lifecycle: linked issue is no longer cached (moved or removed), skipping move", "run", runID, "issue", mc.issueIID)
+			l.clearPending(ctx, runID)
+			return
 		}
 		// No cached card to move (evicted/de-labeled forge-side): leave the marker;
 		// the reconcile loop gives up after the window.
@@ -390,7 +410,23 @@ func (l *Lifecycle) apply(ctx context.Context, runID uuid.UUID, mc moveContext, 
 		slog.Warn("run lifecycle: build forge client for move", "run", runID, "error", err)
 		return
 	}
-	if _, err := l.mover.AutoMove(ctx, f, mc.forgeProjectID, issue, cols, dec.target); err != nil {
+	tr, err := issuesource.For(ctx, l.issueSources, mc.linked, mc.userID, mc.repoID, f)
+	if err != nil {
+		// A linked repo with no resolver, or one that cannot be built: never the forge.
+		// Left for the reconcile loop like any other outage.
+		slog.Warn("run lifecycle: resolve issue tracker for move", "run", runID, "error", err)
+		return
+	}
+	if _, err := l.mover.AutoMove(ctx, tr, mc.forgeProjectID, issue, cols, dec.target); err != nil {
+		if forgesvc.IssueWriteSkippable(err) {
+			// PRD #4173 D10: the write is not offered on a linked repo, or the linked issue
+			// is gone from its binding. Retrying cannot help, so clear the marker (permanent
+			// skip, logged once) instead of retrying to the give-up window. The run's
+			// code-host side is unaffected.
+			slog.Info("run lifecycle: issue move skipped on linked repo", "run", runID, "target", dec.target, "reason", err)
+			l.clearPending(ctx, runID)
+			return
+		}
 		// Forge error: the transition already succeeded; leave the marker so the
 		// reconcile loop retries once the forge is reachable again.
 		slog.Warn("run lifecycle: forge move failed, will retry", "run", runID, "target", dec.target, "error", err)
@@ -482,11 +518,21 @@ func (l *Lifecycle) maybeTerminalComment(ctx context.Context, runID uuid.UUID, s
 		slog.Warn("run lifecycle: build forge for terminal comment", "run", runID, "error", err)
 		return
 	}
-	// Only the issue side of the driver is used here.
-	var tracker forge.IssueTracker = f
+	// Only the issue side of the driver is used here. PRD #4173: a linked repo's
+	// comment goes through the resolver, whose write guard refuses it (writes arrive
+	// in M5); like any terminal-comment failure it is logged and the lifecycle continues.
+	tracker, err := issuesource.For(ctx, l.issueSources, mc.IssueTrackerConnectionID.Valid, mc.UserID, uuid.UUID(mc.RepoID.Bytes), f)
+	if err != nil {
+		slog.Warn("run lifecycle: resolve issue tracker for terminal comment", "run", runID, "error", err)
+		return
+	}
 	body := l.terminalCommentBody(status, runID, mc)
 	if _, err := tracker.CreateIssueNote(ctx, mc.ForgeProjectID, mc.IssueIid.Int64, body); err != nil {
 		// Already PAT-redacted by the driver. Recorded but lost (never retried).
+		if forgesvc.IssueWriteSkippable(err) {
+			slog.Info("run lifecycle: autopilot terminal comment skipped on linked repo", "run", runID, "reason", err)
+			return
+		}
 		slog.Warn("run lifecycle: post autopilot terminal comment", "run", runID, "error", err)
 	}
 }

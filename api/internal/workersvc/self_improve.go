@@ -46,6 +46,11 @@ func (s *Service) CreateSelfImproveRun(ctx context.Context, userID, repoID uuid.
 		}
 		return store.Run{}, err
 	}
+	// PRD 4173 D13: self-improve stores a tracking issue number, so a never-enabled repo
+	// is refused before the guard below can reach the forge.
+	if err := store.RefuseNeverEnabled(row.AwaitingFirstEnable); err != nil {
+		return store.Run{}, err
+	}
 	// #66 D1 layer 2: the shared service-layer guardrail. The self-improve engine tick
 	// has no user in the loop, so a refusal here just skips the cycle (logged upstream),
 	// which is the desired outcome — never a run against an unguarded default branch.

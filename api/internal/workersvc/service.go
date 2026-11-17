@@ -40,6 +40,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/config"
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/issueinput"
+	"github.com/vtmocanu/uzi/api/internal/issuesource"
 	"github.com/vtmocanu/uzi/api/internal/jointoken"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/planpolicy"
@@ -94,7 +95,11 @@ var (
 	// ErrRunWallExpired refuses an ordinary pause or guarded question at the run deadline.
 	ErrRunWallExpired = errors.New("run wall deadline expired")
 	ErrRepoNotFound   = errors.New("repo not found")
-	ErrIssueNotFound  = errors.New("issue not found")
+	// ErrRepoNeverEnabled refuses a run, issue filing or sync on a repo that has never been
+	// enabled (PRD 4173 D13). It is store.ErrRepoNeverEnabled, so the store guard's UZ413
+	// (store.MapNeverEnabled) and the service gates answer with one error.
+	ErrRepoNeverEnabled = store.ErrRepoNeverEnabled
+	ErrIssueNotFound    = errors.New("issue not found")
 	// ErrNotPRDIssue rejects a run on an issue that does not carry the configured
 	// run-eligibility label (PRD #764 M1: the uzi_label) → 422. This is now the SINGLE
 	// eligibility gate — an issue without the uzi_label is not uzi's to run, PRD link
@@ -2170,6 +2175,10 @@ type Service struct {
 	// composite ops return ErrForgesUnavailable rather than panic (the pre-#191
 	// deployments and every test that never wires it are unaffected).
 	forges ForgeBuilder
+	// issueSources resolves the issue side of a repo linked to an external issue
+	// tracker (PRD #4173 DL-5); set via SetIssueSources. Nil ⇒ a linked repo fails
+	// closed (issuesource.ErrNotWired) and an unlinked repo keeps using forges.
+	issueSources issuesource.Sources
 	// guard is the #66 default-branch guardrail (D1 layer 2), a narrow RepoGuard
 	// interface *privcheck.Service satisfies; set via SetRepoGuard. Nil ⇒ the
 	// service-layer gate is skipped (guardDefaultBranch is a no-op) and layer 3 (the
@@ -2282,6 +2291,10 @@ func (s *Service) SetSettings(sr SettingsReader) { s.settings = sr }
 // startup, before serving; pass the same *forgesvc.Service the handlers hold. A nil
 // builder leaves the composite ops returning ErrForgesUnavailable.
 func (s *Service) SetForges(fb ForgeBuilder) { s.forges = fb }
+
+// SetIssueSources wires the resolver of a linked repo's issue side (PRD #4173 DL-5).
+// Call once at startup with the same *forgesvc.Service SetForges gets.
+func (s *Service) SetIssueSources(is issuesource.Sources) { s.issueSources = is }
 
 // SetRepoGuard wires the #66 default-branch guardrail (D1 layer 2). Late-injected
 // in main.go because the privcheck.Service is built after this Service. A nil guard
@@ -7036,9 +7049,16 @@ type ForgeConn struct {
 	// unmarshal it into a ReviewCommentsSnapshot and reject any reply/resolve id not
 	// present in it (the Decision-11 server-side scope check).
 	ReviewComments []byte
-	IssueIID       *int64
-	SavedTitle     string
-	SavedBody      string
+	// RepoID, UserID and IssueTrackerConnectionID bind the run's issue side (PRD
+	// #4173 DL-5): the issue routes resolve a linked repo's issue tracker by repo row
+	// and owner, never by the forge project id. IssueTrackerConnectionID.Valid is the
+	// repo's link.
+	RepoID                   uuid.UUID
+	UserID                   uuid.UUID
+	IssueTrackerConnectionID pgtype.UUID
+	IssueIID                 *int64
+	SavedTitle               string
+	SavedBody                string
 	// SavedBodyValid is true when the run captured a raw body (issue_saved_body not NULL); SavedBody
 	// otherwise falls back to the run's issue description.
 	SavedBodyValid bool
@@ -7094,14 +7114,17 @@ func (s *Service) ForgeConnForRun(ctx context.Context, wkr store.Worker, runID u
 		mrIID = &v
 	}
 	return ForgeConn{
-		ForgeType:       row.ForgeType,
-		BaseUrl:         row.BaseUrl,
-		TokenCiphertext: row.TokenCiphertext,
-		ForgeProjectID:  row.ForgeProjectID,
-		BotForgeUserID:  row.BotForgeUserID,
-		MRIID:           mrIID,
-		ReviewComments:  run.ReviewComments,
-		IssueIID:        issueIID, SavedTitle: run.IssueTitle, SavedBody: body, SavedBodyValid: run.IssueSavedBody.Valid, RawDigest: digest, InputReason: run.IssueInputReason.String,
+		ForgeType:                row.ForgeType,
+		BaseUrl:                  row.BaseUrl,
+		TokenCiphertext:          row.TokenCiphertext,
+		ForgeProjectID:           row.ForgeProjectID,
+		BotForgeUserID:           row.BotForgeUserID,
+		RepoID:                   row.RepoID,
+		UserID:                   row.UserID,
+		IssueTrackerConnectionID: row.IssueTrackerConnectionID,
+		MRIID:                    mrIID,
+		ReviewComments:           run.ReviewComments,
+		IssueIID:                 issueIID, SavedTitle: run.IssueTitle, SavedBody: body, SavedBodyValid: run.IssueSavedBody.Valid, RawDigest: digest, InputReason: run.IssueInputReason.String,
 	}, nil
 }
 
@@ -8134,6 +8157,11 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		}
 		return store.Run{}, err
 	}
+	// PRD 4173 D13: a never-enabled repo starts no run, whoever asks (manual, schedule,
+	// autopilot, composite). Before guardDefaultBranch, which may call the forge.
+	if err := store.RefuseNeverEnabled(row.AwaitingFirstEnable); err != nil {
+		return store.Run{}, err
+	}
 	// #66 D1 layer 2: the service-layer guardrail, shared across the PAT-bearing
 	// inserts (issue lane, CI-fix, self-improve, scheduled prompt). Reached by the UI
 	// AND autopilot, so gating here (not the handler) is what covers the unattended path.
@@ -8160,7 +8188,23 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 	// server applies cannot disagree. Promote writes the label forge-first AND updates
 	// this cache row in the same request, so the promote-then-run sequence is not racing
 	// the poller.
-	if !isEligibleIssue(issue.Labels, []string{s.uziLabel(ctx)}) &&
+	//
+	// On a repo linked to an issue tracker (PRD #4173 D14) the eligibility label is the
+	// link's stored eligibility tag name, not the configured uzi label, and bot
+	// assignment never counts (the issue tracker reports no assignees). The cache can
+	// hold an issue that was untagged since the last full sync, so the fresh read at
+	// capture below must carry the tag as well.
+	linkedEligibility := ""
+	if row.IssueTrackerConnectionID.Valid {
+		// Trimmed like schedsvc's eligibilityLabel: a blank stored name is no name.
+		if strings.TrimSpace(row.EligibilityTagName.String) == "" {
+			return store.Run{}, ErrNotPRDIssue
+		}
+		linkedEligibility = row.EligibilityTagName.String
+		if !isEligibleIssue(issue.Labels, []string{linkedEligibility}) {
+			return store.Run{}, ErrNotPRDIssue
+		}
+	} else if !isEligibleIssue(issue.Labels, []string{s.uziLabel(ctx)}) &&
 		!isAssignedToBot(issue.AssigneeIds, row.BotForgeUserID) {
 		return store.Run{}, ErrNotPRDIssue
 	}
@@ -8239,12 +8283,31 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		if ferr != nil {
 			return store.Run{}, ErrForgeBuild
 		}
-		capture, err = issueinput.Fetch(ctx, f, f, row.ForgeProjectID, issueIID, row.BotForgeUserID)
+		// PRD #4173 DL-5: a linked repo's issue is read through the resolver, never the
+		// forge. The code-host half of the fetch stays on the forge, but author eligibility
+		// does only for an unlinked repo: a linked repo's authors are decided by D11 mapping
+		// on the issue side (issueinput.WithIssueSide, applied by Fetch from tr).
+		tr, terr := issuesource.For(ctx, s.issueSources, row.IssueTrackerConnectionID.Valid, userID, repoID, f)
+		if terr != nil {
+			return store.Run{}, fmt.Errorf("%w: %v", ErrForgeBuild, terr)
+		}
+		capture, err = issueinput.Fetch(ctx, f, tr, row.ForgeProjectID, issueIID, row.BotForgeUserID)
 		if err != nil {
 			if forge.IsIssueResponseTooLarge(err) {
 				return store.Run{}, fmt.Errorf("%w: %w", ErrDescriptionTooLarge, err)
 			}
 			return store.Run{}, ErrForgeIssueRead
+		}
+	}
+	if linkedEligibility != "" {
+		// The cached labels may be stale, so a linked run needs the fresh read; with no
+		// capture (no forge builder wired) there is nothing to check it against and the
+		// run is refused rather than started on the cache alone.
+		if capture == nil {
+			return store.Run{}, ErrForgeBuild
+		}
+		if !slices.Contains(capture.Issue.Labels, linkedEligibility) {
+			return store.Run{}, ErrNotPRDIssue
 		}
 	}
 	savedBody, rawDigest, inputReason := pgtype.Text{}, pgtype.Text{}, pgtype.Text{}
@@ -8263,7 +8326,11 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		if err != nil {
 			return store.Run{}, err
 		}
-		if requested, _ := ctx.Value(scheduleApprovalKey{}).(bool); requested && autoApprove {
+		// PRD #4173 D11: a schedule fire asks for the check; a linked repo always gets it, so
+		// the label poller's CreateAutopilotRun (no schedule marker) cannot auto-approve an
+		// unmapped issue tracker author either.
+		requested, _ := ctx.Value(scheduleApprovalKey{}).(bool)
+		if linked := row.IssueTrackerConnectionID.Valid; (requested || linked) && autoApprove {
 			blockedReasons = capture.Reasons()
 			if len(blockedReasons) != 0 {
 				autoApprove = false

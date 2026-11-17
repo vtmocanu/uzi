@@ -65,8 +65,13 @@ func (h *Handler) CloneSchedule(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// Ownership mirror (create parity): 404 on a foreign/absent target repo.
-		if _, gerr := h.q.GetRepoForUser(r.Context(), store.GetRepoForUserParams{ID: rid, UserID: user.ID}); gerr != nil {
+		target, gerr := h.q.GetRepoForUser(r.Context(), store.GetRepoForUserParams{ID: rid, UserID: user.ID})
+		if gerr != nil {
 			httpx.Error(w, http.StatusNotFound, "repo not found")
+			return
+		}
+		// PRD 4173 D13: no schedule on a never-enabled repo.
+		if refuseNeverEnabled(w, target.AwaitingFirstEnable) {
 			return
 		}
 		targetRepo = rid
@@ -164,6 +169,9 @@ func (h *Handler) CloneSchedule(w http.ResponseWriter, r *http.Request) {
 		CredentialOverrideSecretID: cur.CredentialOverrideSecretID,
 	})
 	if err != nil {
+		if writeIfNeverEnabled(w, err) {
+			return
+		}
 		slog.Error("clone run schedule", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
@@ -223,8 +231,13 @@ func (h *Handler) AddScheduleRepo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Ownership mirror (clone parity): 404 on a foreign/absent target repo.
-	if _, gerr := h.q.GetRepoForUser(ctx, store.GetRepoForUserParams{ID: targetRepo, UserID: user.ID}); gerr != nil {
+	target, gerr := h.q.GetRepoForUser(ctx, store.GetRepoForUserParams{ID: targetRepo, UserID: user.ID})
+	if gerr != nil {
 		httpx.Error(w, http.StatusNotFound, "repo not found")
+		return
+	}
+	// PRD 4173 D13: no schedule on a never-enabled repo.
+	if refuseNeverEnabled(w, target.AwaitingFirstEnable) {
 		return
 	}
 
@@ -306,6 +319,9 @@ func (h *Handler) AddScheduleRepo(w http.ResponseWriter, r *http.Request) {
 			// row created (the tx rolls back the coalesce too, which is a harmless no-op when
 			// the source already had the group id).
 			httpx.Error(w, http.StatusConflict, "this schedule already has a sibling on that repo")
+			return
+		}
+		if writeIfNeverEnabled(w, err) {
 			return
 		}
 		slog.Error("add schedule repo: create sibling", "error", err)

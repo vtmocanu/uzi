@@ -61,6 +61,9 @@ const (
 var (
 	// ErrProjectSyncDisabled is the instance kill-switch being off (settings default).
 	ErrProjectSyncDisabled = errors.New("github project sync is disabled instance-wide")
+	// ErrProjectSyncLinkedRepo is an adopt, provision or resync on a repo linked to an
+	// external issue tracker (PRD #4173 M4): a project's items are forge issue numbers.
+	ErrProjectSyncLinkedRepo = errors.New("github project sync is not available on a repo linked to an issue tracker")
 	// ErrProjectSyncNotGitHub is an adopt against a non-GitHub repo.
 	ErrProjectSyncNotGitHub = errors.New("project sync is only supported on github repos")
 	// ErrProjectSyncUnsupported is a forge whose driver does not implement
@@ -245,8 +248,10 @@ func (s *ProjectSyncService) projectSyncResolve(ctx context.Context, repoID uuid
 	return repo, syncer, f, nil
 }
 
-// projectSyncPreamble runs the preconditions the write paths (Adopt, Provision,
-// SetVisibility, ShareWithUser, Unshare) and the RepoOwnerType read share: everything
+// projectSyncPreamble runs the preconditions the share and visibility paths
+// (SetVisibility, ShareWithUser, Unshare) and the RepoOwnerType read share (the paths
+// that project issue numbers, Adopt, Provision, Resync and AutoCreateColumns, use
+// projectSyncSeedPreamble instead): everything
 // projectSyncResolve checks, plus the live scope preflight (ensureProjectScope, which
 // adds MissingScope to the sentinel set). The check order is exactly what the admin
 // handler maps to a 4xx — keeping the entry points DRY without changing any observable
@@ -255,6 +260,28 @@ func (s *ProjectSyncService) projectSyncPreamble(ctx context.Context, repoID uui
 	repo, syncer, f, err := s.projectSyncResolve(ctx, repoID)
 	if err != nil {
 		return store.GetRepoByIDRow{}, nil, err
+	}
+	if err := ensureProjectScope(ctx, f); err != nil {
+		return store.GetRepoByIDRow{}, nil, err
+	}
+	return repo, syncer, nil
+}
+
+// projectSyncSeedPreamble is projectSyncPreamble for the paths that project cached
+// issue numbers onto a board (Adopt, Provision, Resync, AutoCreateColumns): it refuses
+// a never-enabled repo (PRD 4173 D13) after the pure resolve and BEFORE the live scope
+// preflight or any other forge call. The share and visibility paths keep
+// projectSyncPreamble; they store no issue number.
+func (s *ProjectSyncService) projectSyncSeedPreamble(ctx context.Context, repoID uuid.UUID) (store.GetRepoByIDRow, forge.ProjectBoardSyncer, error) {
+	repo, syncer, f, err := s.projectSyncResolve(ctx, repoID)
+	if err != nil {
+		return store.GetRepoByIDRow{}, nil, err
+	}
+	if err := store.RefuseNeverEnabled(repo.AwaitingFirstEnable); err != nil {
+		return store.GetRepoByIDRow{}, nil, err
+	}
+	if repo.IssueTrackerConnectionID.Valid {
+		return store.GetRepoByIDRow{}, nil, ErrProjectSyncLinkedRepo
 	}
 	if err := ensureProjectScope(ctx, f); err != nil {
 		return store.GetRepoByIDRow{}, nil, err

@@ -27,7 +27,7 @@ func (h *Handler) CheckRepoLabels(w http.ResponseWriter, r *http.Request) {
 		httpx.RespondDecodeError(w, err, "invalid request body")
 		return
 	}
-	tr, err := h.issueTrackerForRepo(r.Context(), repo.ID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
+	tr, err := h.issueTrackerForRepo(r.Context(), repo.UserID, repo.ID, repo.IssueTrackerConnectionID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
 		slog.Error("check repo labels: build forge for connection", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -58,7 +58,7 @@ func (h *Handler) EnsureRepoLabels(w http.ResponseWriter, r *http.Request) {
 		httpx.RespondDecodeError(w, err, "invalid request body")
 		return
 	}
-	tr, err := h.issueTrackerForRepo(r.Context(), repo.ID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
+	tr, err := h.issueTrackerForRepo(r.Context(), repo.UserID, repo.ID, repo.IssueTrackerConnectionID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
 		slog.Error("ensure repo labels: build forge for connection", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -67,6 +67,9 @@ func (h *Handler) EnsureRepoLabels(w http.ResponseWriter, r *http.Request) {
 	ensured, err := ensureRepoLabels(r.Context(), tr, repo.ForgeProjectID, req.Labels)
 	if err != nil {
 		// err is already PAT-redacted by the driver; an upstream forge write failure is a 502.
+		if writeIssueWriteNotOffered(w, err) {
+			return
+		}
 		httpx.Error(w, http.StatusBadGateway, "could not ensure the labels on the forge: "+err.Error())
 		return
 	}

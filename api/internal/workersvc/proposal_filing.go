@@ -145,9 +145,23 @@ func (s *Service) maybeFileProposal(ctx context.Context, run store.Run, proposal
 		slog.Warn("file proposal: load repo", "run_id", run.ID, "error", err)
 		return
 	}
+	// PRD 4173 D13: nothing is filed on a never-enabled repo; skipped before the audit
+	// row and the forge write.
+	if err := store.RefuseNeverEnabled(repo.AwaitingFirstEnable); err != nil {
+		slog.Warn("file proposal: skipped", "run_id", run.ID, "error", err)
+		return
+	}
 	f, err := s.forges.ForgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
 		slog.Warn("file proposal: build forge", "run_id", run.ID, "error", err)
+		return
+	}
+	// PRD #4173 M4: filing a proposal creates an issue, which a linked repo does not
+	// offer until M5, so it is skipped before the audit row (no pending row is left
+	// behind) and never falls back to the forge, whose project number means nothing there.
+	if repo.IssueTrackerConnectionID.Valid {
+		slog.Warn("file proposal: skipped, issue creation is not offered on a repo linked to an issue tracker",
+			"run_id", run.ID, "repo_id", repo.ID)
 		return
 	}
 

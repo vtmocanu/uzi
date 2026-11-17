@@ -1307,6 +1307,10 @@ WITH checker_template_pins AS MATERIALIZED (
       -- fn_worker_can_claim, required_capabilities and @capability_aware). A GUARDED run
       -- (ci_config_guard) is claimable only by a worker reporting 'ci_config_guard_v1'.
       AND (NOT r.ci_config_guard OR 'ci_config_guard_v1' = ANY($28::text[]))
+      -- PRD #4173: a run on a LINKED repo (repos.issue_tracker_connection_id) is claimable only by a
+      -- worker reporting 'issue_key_v1' (it renders the run's references by issue_key and never
+      -- writes Closes #<iid>). Standalone, outside fn_worker_can_claim and @capability_aware.
+      AND ('issue_key_v1' = ANY($28::text[]) OR NOT EXISTS (SELECT 1 FROM repos lr WHERE lr.id = r.repo_id AND lr.issue_tracker_connection_id IS NOT NULL))
       AND ((NOT r.repo_agent_source_required AND r.repo_agent_source_commit IS NULL) OR 'repo_agent_source_v1' = ANY($28::text[]))
       AND (r.agent_source_requested IS NULL OR 'agent_source_request_v1' = ANY($28::text[]))
       AND (NOT (r.policy_preserve_required OR r.policy_pending_fresh OR (r.policy_outcome_id IS NOT NULL AND r.policy_resolved_at IS NULL) OR r.policy_required_head IS NOT NULL) OR 'provider_policy_hold_v1' = ANY($28::text[]))
@@ -1589,6 +1593,10 @@ WITH checker_template_pins AS MATERIALIZED (
                 -- fn_worker_can_claim, required_capabilities and @capability_aware). A GUARDED run
                 -- (ci_config_guard) is claimable only by a worker reporting 'ci_config_guard_v1'.
                 AND (NOT r.ci_config_guard OR 'ci_config_guard_v1' = ANY(p.protocol_capabilities))
+                -- PRD #4173: a run on a LINKED repo (repos.issue_tracker_connection_id) is claimable only by a
+                -- worker reporting 'issue_key_v1' (it renders the run's references by issue_key and never
+                -- writes Closes #<iid>). Standalone, outside fn_worker_can_claim and @capability_aware.
+                AND ('issue_key_v1' = ANY(p.protocol_capabilities) OR NOT EXISTS (SELECT 1 FROM repos lr WHERE lr.id = r.repo_id AND lr.issue_tracker_connection_id IS NOT NULL))
                 AND ((NOT r.repo_agent_source_required AND r.repo_agent_source_commit IS NULL) OR 'repo_agent_source_v1' = ANY(p.protocol_capabilities))
                 AND (r.agent_source_requested IS NULL OR 'agent_source_request_v1' = ANY(p.protocol_capabilities))
       AND (NOT (r.policy_preserve_required OR r.policy_pending_fresh OR (r.policy_outcome_id IS NOT NULL AND r.policy_resolved_at IS NULL) OR r.policy_required_head IS NOT NULL) OR 'provider_policy_hold_v1' = ANY(p.protocol_capabilities))
@@ -2940,6 +2948,10 @@ WHERE run.id = $1
   -- fn_worker_can_claim, required_capabilities and @capability_aware). A GUARDED run
   -- (ci_config_guard) is claimable only by a worker reporting 'ci_config_guard_v1'.
   AND (NOT run.ci_config_guard OR 'ci_config_guard_v1' = ANY(w.protocol_capabilities))
+  -- PRD #4173: a run on a LINKED repo (repos.issue_tracker_connection_id) is claimable only by a
+  -- worker reporting 'issue_key_v1' (it renders the run's references by issue_key and never
+  -- writes Closes #<iid>). Standalone, outside fn_worker_can_claim and @capability_aware.
+  AND ('issue_key_v1' = ANY(w.protocol_capabilities) OR NOT EXISTS (SELECT 1 FROM repos lr WHERE lr.id = run.repo_id AND lr.issue_tracker_connection_id IS NOT NULL))
   AND ((NOT run.repo_agent_source_required AND run.repo_agent_source_commit IS NULL) OR 'repo_agent_source_v1' = ANY(w.protocol_capabilities))
   AND (run.agent_source_requested IS NULL OR 'agent_source_request_v1' = ANY(w.protocol_capabilities))
       AND (NOT (run.policy_preserve_required OR run.policy_pending_fresh OR (run.policy_outcome_id IS NOT NULL AND run.policy_resolved_at IS NULL) OR run.policy_required_head IS NOT NULL) OR 'provider_policy_hold_v1' = ANY(w.protocol_capabilities))
@@ -7722,6 +7734,9 @@ SELECT r.checkpoint_tip,
        -- the shared evaluator downgrades the waivable "bot is too strong" findings —
        -- never protection_unreadable, which still refuses even an overridden repo.
        rp.guardrail_override_reason,
+       -- PRD #4173 D11 wiring: the repo's issue tracker project short name, NULL for an
+       -- unlinked repo. A linked run's claim derives issue_key from it and the run's iid.
+       rp.issue_tracker_project_short,
        c.forge_type,
        c.base_url,
        c.bot_username,
@@ -7772,6 +7787,7 @@ type GetRunClaimContextRow struct {
 	RepoDevboxOptIn            bool        `json:"repo_devbox_opt_in"`
 	FoldImproveUziBacklog      bool        `json:"fold_improve_uzi_backlog"`
 	GuardrailOverrideReason    pgtype.Text `json:"guardrail_override_reason"`
+	IssueTrackerProjectShort   pgtype.Text `json:"issue_tracker_project_short"`
 	ForgeType                  string      `json:"forge_type"`
 	BaseUrl                    string      `json:"base_url"`
 	BotUsername                string      `json:"bot_username"`
@@ -7826,6 +7842,7 @@ func (q *Queries) GetRunClaimContext(ctx context.Context, runID uuid.UUID) (GetR
 		&i.RepoDevboxOptIn,
 		&i.FoldImproveUziBacklog,
 		&i.GuardrailOverrideReason,
+		&i.IssueTrackerProjectShort,
 		&i.ForgeType,
 		&i.BaseUrl,
 		&i.BotUsername,
@@ -7945,8 +7962,9 @@ func (q *Queries) GetRunForWorkerUser(ctx context.Context, arg GetRunForWorkerUs
 }
 
 const getRunForgeConnForWorker = `-- name: GetRunForgeConnForWorker :one
-SELECT rp.forge_project_id,
-       c.forge_type, c.base_url, c.token_ciphertext, c.bot_forge_user_id
+SELECT rp.id AS repo_id, rp.forge_project_id,
+       rp.issue_tracker_connection_id,
+       c.user_id, c.forge_type, c.base_url, c.token_ciphertext, c.bot_forge_user_id
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 JOIN forge_connections c ON c.id = rp.connection_id AND c.user_id = r.user_id -- #1688: owner-scoped token
@@ -7959,11 +7977,14 @@ type GetRunForgeConnForWorkerParams struct {
 }
 
 type GetRunForgeConnForWorkerRow struct {
-	ForgeProjectID  int64  `json:"forge_project_id"`
-	ForgeType       string `json:"forge_type"`
-	BaseUrl         string `json:"base_url"`
-	TokenCiphertext []byte `json:"token_ciphertext"`
-	BotForgeUserID  int64  `json:"bot_forge_user_id"`
+	RepoID                   uuid.UUID   `json:"repo_id"`
+	ForgeProjectID           int64       `json:"forge_project_id"`
+	IssueTrackerConnectionID pgtype.UUID `json:"issue_tracker_connection_id"`
+	UserID                   uuid.UUID   `json:"user_id"`
+	ForgeType                string      `json:"forge_type"`
+	BaseUrl                  string      `json:"base_url"`
+	TokenCiphertext          []byte      `json:"token_ciphertext"`
+	BotForgeUserID           int64       `json:"bot_forge_user_id"`
 }
 
 // The forge connection facts a WORKER-authenticated run needs to build a driver and
@@ -7974,11 +7995,16 @@ type GetRunForgeConnForWorkerRow struct {
 // not currently hold return no row, so a cross-tenant read is a 404, not a leak. A
 // repo-less run has no repos row and returns no row too; the service checks repo_id
 // off the owned run FIRST so it can tell that apart and answer 409.
+// PRD #4173 M4 adds repo_id, the connection owner's user_id and the repo's issue
+// tracker link, so the worker proxy can resolve the issue source per repo and owner.
 func (q *Queries) GetRunForgeConnForWorker(ctx context.Context, arg GetRunForgeConnForWorkerParams) (GetRunForgeConnForWorkerRow, error) {
 	row := q.db.QueryRow(ctx, getRunForgeConnForWorker, arg.RunID, arg.WorkerID)
 	var i GetRunForgeConnForWorkerRow
 	err := row.Scan(
+		&i.RepoID,
 		&i.ForgeProjectID,
+		&i.IssueTrackerConnectionID,
+		&i.UserID,
 		&i.ForgeType,
 		&i.BaseUrl,
 		&i.TokenCiphertext,
@@ -8021,7 +8047,9 @@ const getRunMoveContext = `-- name: GetRunMoveContext :one
 SELECT r.status, r.issue_iid, r.repo_id, r.origin_column, r.board_column, r.move_pending_since,
        r.auto_approve, r.mr_iid,
        rp.forge_project_id, rp.web_url AS repo_web_url,
-       c.forge_type, c.base_url, c.token_ciphertext
+       rp.issue_tracker_connection_id, rp.awaiting_first_enable,
+       c.forge_type, c.base_url, c.token_ciphertext,
+       r.user_id
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 JOIN forge_connections c ON c.id = rp.connection_id AND c.user_id = r.user_id -- #1688: owner-scoped token
@@ -8029,19 +8057,22 @@ WHERE r.id = $1
 `
 
 type GetRunMoveContextRow struct {
-	Status           string             `json:"status"`
-	IssueIid         pgtype.Int8        `json:"issue_iid"`
-	RepoID           pgtype.UUID        `json:"repo_id"`
-	OriginColumn     pgtype.Text        `json:"origin_column"`
-	BoardColumn      pgtype.Text        `json:"board_column"`
-	MovePendingSince pgtype.Timestamptz `json:"move_pending_since"`
-	AutoApprove      bool               `json:"auto_approve"`
-	MrIid            pgtype.Int8        `json:"mr_iid"`
-	ForgeProjectID   int64              `json:"forge_project_id"`
-	RepoWebUrl       string             `json:"repo_web_url"`
-	ForgeType        string             `json:"forge_type"`
-	BaseUrl          string             `json:"base_url"`
-	TokenCiphertext  []byte             `json:"token_ciphertext"`
+	Status                   string             `json:"status"`
+	IssueIid                 pgtype.Int8        `json:"issue_iid"`
+	RepoID                   pgtype.UUID        `json:"repo_id"`
+	OriginColumn             pgtype.Text        `json:"origin_column"`
+	BoardColumn              pgtype.Text        `json:"board_column"`
+	MovePendingSince         pgtype.Timestamptz `json:"move_pending_since"`
+	AutoApprove              bool               `json:"auto_approve"`
+	MrIid                    pgtype.Int8        `json:"mr_iid"`
+	ForgeProjectID           int64              `json:"forge_project_id"`
+	RepoWebUrl               string             `json:"repo_web_url"`
+	IssueTrackerConnectionID pgtype.UUID        `json:"issue_tracker_connection_id"`
+	AwaitingFirstEnable      bool               `json:"awaiting_first_enable"`
+	ForgeType                string             `json:"forge_type"`
+	BaseUrl                  string             `json:"base_url"`
+	TokenCiphertext          []byte             `json:"token_ciphertext"`
+	UserID                   uuid.UUID          `json:"user_id"`
 }
 
 // Column automation (PRD #12 M1) ------------------------------------------
@@ -8071,9 +8102,12 @@ func (q *Queries) GetRunMoveContext(ctx context.Context, runID uuid.UUID) (GetRu
 		&i.MrIid,
 		&i.ForgeProjectID,
 		&i.RepoWebUrl,
+		&i.IssueTrackerConnectionID,
+		&i.AwaitingFirstEnable,
 		&i.ForgeType,
 		&i.BaseUrl,
 		&i.TokenCiphertext,
+		&i.UserID,
 	)
 	return i, err
 }
@@ -11357,6 +11391,37 @@ func (q *Queries) InvalidatePriorCompletionPermits(ctx context.Context, arg Inva
 	return result.RowsAffected(), nil
 }
 
+const issueKeyWorkerMissingForRepo = `-- name: IssueKeyWorkerMissingForRepo :one
+SELECT COALESCE((EXISTS (
+  SELECT 1 FROM repos lr
+  WHERE lr.id = $1 AND lr.issue_tracker_connection_id IS NOT NULL
+) AND NOT EXISTS (
+  SELECT 1 FROM workers w
+  WHERE w.user_id = $2
+    AND w.status = 'online'
+    AND fn_worker_accepts_new_intake(w)
+    AND NOT w.ephemeral
+    AND NOT w.isolated_lane
+    AND 'issue_key_v1' = ANY(w.protocol_capabilities)
+)), false)::boolean AS missing
+`
+
+type IssueKeyWorkerMissingForRepoParams struct {
+	RepoID uuid.UUID `json:"repo_id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+// PRD #4173: true when the repo is LINKED to an external issue tracker and none of the user's
+// ONLINE, intake-accepting, non-ephemeral, non-lane workers self-reports 'issue_key_v1'. It
+// drives the queued-reason resolver's issue_key rung: ClaimRun's standalone issue_key clause can
+// never be satisfied for such a repo. Mirrors CountOnlineWorkersSatisfyingCIConfigGuard's filters.
+func (q *Queries) IssueKeyWorkerMissingForRepo(ctx context.Context, arg IssueKeyWorkerMissingForRepoParams) (bool, error) {
+	row := q.db.QueryRow(ctx, issueKeyWorkerMissingForRepo, arg.RepoID, arg.UserID)
+	var missing bool
+	err := row.Scan(&missing)
+	return missing, err
+}
+
 const iterationParkHasPendingControl = `-- name: IterationParkHasPendingControl :one
 SELECT EXISTS (SELECT 1 FROM run_user_inputs WHERE run_id = $1
     AND kind IN ('stop', 'cancel') AND applied_at IS NULL
@@ -11924,6 +11989,8 @@ SELECT id, runs.user_id, status, auto_approve,
        harness, codex_material_revision, codex_secret_id, worker_id, claim_generation, released_worker_id,
        egress_profile_id, job_protocol, ci_config_guard, repo_agent_source_commit, repo_agent_source_required, agent_source_requested,
        EXISTS (SELECT 1 FROM job_files af WHERE af.run_id = runs.id AND af.direction = 'input' AND af.state = 'attached')::boolean AS ci_artifacts_attached,
+       -- PRD #4173: true when the run's repo is linked to an external issue tracker; gates the queued-reason issue_key rung so an unlinked run makes no extra query.
+       EXISTS (SELECT 1 FROM repos lr WHERE lr.id = runs.repo_id AND lr.issue_tracker_connection_id IS NOT NULL)::boolean AS repo_linked,
        COALESCE(runs.status = 'queued' AND runs.kind <> 'cross_check'
                 AND runs.worker_id IS NOT NULL
                 AND runs.stale_requeue_generation = runs.claim_generation
@@ -12056,6 +12123,7 @@ type ListActiveRunsForHealthRow struct {
 	RepoAgentSourceRequired   bool               `json:"repo_agent_source_required"`
 	AgentSourceRequested      pgtype.Text        `json:"agent_source_requested"`
 	CiArtifactsAttached       bool               `json:"ci_artifacts_attached"`
+	RepoLinked                bool               `json:"repo_linked"`
 	StaleRequeuePinnable      bool               `json:"stale_requeue_pinnable"`
 	OwnerHoldPinnable         bool               `json:"owner_hold_pinnable"`
 	StaleRequeueWorkerName    string             `json:"stale_requeue_worker_name"`
@@ -12189,6 +12257,7 @@ func (q *Queries) ListActiveRunsForHealth(ctx context.Context, codexCuratedModel
 			&i.RepoAgentSourceRequired,
 			&i.AgentSourceRequested,
 			&i.CiArtifactsAttached,
+			&i.RepoLinked,
 			&i.StaleRequeuePinnable,
 			&i.OwnerHoldPinnable,
 			&i.StaleRequeueWorkerName,
@@ -15145,6 +15214,10 @@ WHERE r.status = 'queued'
         -- fn_worker_can_claim, required_capabilities and @capability_aware). A GUARDED run
         -- (ci_config_guard) is claimable only by a worker reporting 'ci_config_guard_v1'.
         AND (NOT r.ci_config_guard OR 'ci_config_guard_v1' = ANY(w.protocol_capabilities))
+        -- PRD #4173: a run on a LINKED repo (repos.issue_tracker_connection_id) is claimable only by a
+        -- worker reporting 'issue_key_v1' (it renders the run's references by issue_key and never
+        -- writes Closes #<iid>). Standalone, outside fn_worker_can_claim and @capability_aware.
+        AND ('issue_key_v1' = ANY(w.protocol_capabilities) OR NOT EXISTS (SELECT 1 FROM repos lr WHERE lr.id = r.repo_id AND lr.issue_tracker_connection_id IS NOT NULL))
         AND ((NOT r.repo_agent_source_required AND r.repo_agent_source_commit IS NULL) OR 'repo_agent_source_v1' = ANY(w.protocol_capabilities))
         AND (r.agent_source_requested IS NULL OR 'agent_source_request_v1' = ANY(w.protocol_capabilities))
       AND (NOT (r.policy_preserve_required OR r.policy_pending_fresh OR (r.policy_outcome_id IS NOT NULL AND r.policy_resolved_at IS NULL) OR r.policy_required_head IS NOT NULL) OR 'provider_policy_hold_v1' = ANY(w.protocol_capabilities))
@@ -15233,6 +15306,10 @@ WHERE r.status = 'queued'
         -- fn_worker_can_claim, required_capabilities and @capability_aware). A GUARDED run
         -- (ci_config_guard) is claimable only by a worker reporting 'ci_config_guard_v1'.
         AND (NOT r.ci_config_guard OR 'ci_config_guard_v1' = ANY(w.protocol_capabilities))
+        -- PRD #4173: a run on a LINKED repo (repos.issue_tracker_connection_id) is claimable only by a
+        -- worker reporting 'issue_key_v1' (it renders the run's references by issue_key and never
+        -- writes Closes #<iid>). Standalone, outside fn_worker_can_claim and @capability_aware.
+        AND ('issue_key_v1' = ANY(w.protocol_capabilities) OR NOT EXISTS (SELECT 1 FROM repos lr WHERE lr.id = r.repo_id AND lr.issue_tracker_connection_id IS NOT NULL))
         AND ((NOT r.repo_agent_source_required AND r.repo_agent_source_commit IS NULL) OR 'repo_agent_source_v1' = ANY(w.protocol_capabilities))
         AND (r.agent_source_requested IS NULL OR 'agent_source_request_v1' = ANY(w.protocol_capabilities))
       AND (NOT (r.policy_preserve_required OR r.policy_pending_fresh OR (r.policy_outcome_id IS NOT NULL AND r.policy_resolved_at IS NULL) OR r.policy_required_head IS NOT NULL) OR 'provider_policy_hold_v1' = ANY(w.protocol_capabilities))
@@ -15524,7 +15601,9 @@ WHERE r.status = 'queued'
   -- the CODE exclusion above keeps known CODE children on their own worker.
   -- PRD #2865: a GUARDED run (ci_config_guard) is demand too: with no worker reporting
   -- ci_config_guard_v1 online, only a freshly provisioned worker can claim it.
-  AND (r.checkpoint_coordinates IS NOT NULL OR cardinality(r.required_capabilities) > 0 OR r.plan_cross_check_required OR r.kind = 'cross_check' OR r.ci_config_guard OR r.repo_agent_source_required OR fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, $3::boolean, r.repo_id, r.kind, r.egress_profile_id, $4::uuid[]))
+  -- PRD #4173: a run on a LINKED repo is demand too: with no worker reporting issue_key_v1 online,
+  -- only a freshly provisioned worker can claim it.
+  AND (r.checkpoint_coordinates IS NOT NULL OR cardinality(r.required_capabilities) > 0 OR r.plan_cross_check_required OR r.kind = 'cross_check' OR r.ci_config_guard OR r.repo_agent_source_required OR EXISTS (SELECT 1 FROM repos lr WHERE lr.id = r.repo_id AND lr.issue_tracker_connection_id IS NOT NULL) OR fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, $3::boolean, r.repo_id, r.kind, r.egress_profile_id, $4::uuid[]))
 
   -- PRD #4205 M5: the per-worker placement block (capabilities, protocol, lane, lease and
   -- cross-check predicates) lives in fn_placement_admitting_workers so the hibernation wake-demand

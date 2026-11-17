@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/issuesource"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -81,6 +82,10 @@ func (s *Service) CreateTaskRun(ctx context.Context, userID, repoID uuid.UUID, i
 		}
 		return store.Run{}, err
 	}
+	// PRD 4173 D13: no run of any kind on a never-enabled repo; refused before any forge call.
+	if err := store.RefuseNeverEnabled(row.AwaitingFirstEnable); err != nil {
+		return store.Run{}, err
+	}
 
 	// Linked handoffs validate directly against the owner's forge project. They do not
 	// depend on cached board membership, labels, issue state, or a PRD link.
@@ -96,7 +101,10 @@ func (s *Service) CreateTaskRun(ctx context.Context, userID, repoID uuid.UUID, i
 		if err != nil {
 			return store.Run{}, ErrForgeBuild
 		}
-		var tr forge.IssueTracker = f
+		tr, err := issuesource.For(ctx, s.issueSources, row.IssueTrackerConnectionID.Valid, userID, repoID, f)
+		if err != nil {
+			return store.Run{}, ErrForgeBuild
+		}
 		fetchCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 		issue, err := forge.GetIssueBounded(fetchCtx, tr, row.ForgeProjectID, *continuedIssueIID)
 		cancel()

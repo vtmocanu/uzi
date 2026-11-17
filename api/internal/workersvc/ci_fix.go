@@ -183,6 +183,10 @@ func (s *Service) createCIFixRun(ctx context.Context, userID, repoID uuid.UUID, 
 		}
 		return store.Run{}, err
 	}
+	// PRD 4173 D13: no run of any kind on a never-enabled repo; refused before any forge call.
+	if err := store.RefuseNeverEnabled(row.AwaitingFirstEnable); err != nil {
+		return store.Run{}, err
+	}
 	// #66 D1 layer 2: the shared service-layer guardrail. Covers both the manual
 	// Fix-CI button and the automatic ci-autofix poller (createCIFixRun is shared).
 	if err := s.guardDefaultBranch(ctx, row); err != nil {

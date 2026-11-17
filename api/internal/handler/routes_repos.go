@@ -102,6 +102,11 @@ func (h *Handler) mountRepoRoutes(r chi.Router, forgeLimiter, boardOrderLimiter 
 			r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/override-request", h.RequestGuardrailOverride)
 			// Repo-skills opt-in toggle (PRD #16): repo owner or admin.
 			r.Patch("/{id}", h.PatchRepo)
+			// Link a never-enabled repo to an issue tracker project (PRD #4173 M4): web-only
+			// like the repo enable it must precede. It reads the issue tracker (token, project
+			// and tag lists), so it carries the per-user forge budget; owner-scoped in the
+			// service (404 for a foreign repo or connection). No unlink or relink route exists.
+			r.With(forgeLimiter.PerUserMiddleware).Put("/{id}/issue-tracker-link", h.LinkRepoToIssueTracker)
 			// GitHub Projects v2 sync, owner-or-admin (issue #534, PRD #364 follow-up):
 			// relocated out of /admin (D4). Owner path is guarded by a GetRepoForUser
 			// preflight inside each handler; admin skips it. Instance flag still gates.

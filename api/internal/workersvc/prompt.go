@@ -81,6 +81,10 @@ func (s *Service) createPromptRunShared(ctx context.Context, in promptRunInput, 
 		}
 		return store.Run{}, err
 	}
+	// PRD 4173 D13: no run of any kind on a never-enabled repo; refused before any forge call.
+	if err := store.RefuseNeverEnabled(row.AwaitingFirstEnable); err != nil {
+		return store.Run{}, err
+	}
 	if err := s.guardDefaultBranch(ctx, row); err != nil {
 		return store.Run{}, err
 	}

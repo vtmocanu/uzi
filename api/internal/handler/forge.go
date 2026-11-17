@@ -1523,9 +1523,15 @@ func (h *Handler) PatchRepo(w http.ResponseWriter, r *http.Request) {
 }
 
 // provisioner builds the shared provisioning service over the handler's
-// collaborators. It is cheap, so it is built per call.
+// collaborators. It is cheap, so it is built per call. The enable runs in a
+// transaction over h.pool (PRD #4173 D13); a handler without a pool leaves
+// transactions off.
 func (h *Handler) provisioner() *provisionsvc.Service {
-	return provisionsvc.New(h.q, h.svc, h.pcheck, h.cfg.ForgeBaseURLAllowed)
+	svc := provisionsvc.New(h.q, h.svc, h.pcheck, h.cfg.ForgeBaseURLAllowed)
+	if h.pool != nil {
+		svc.UseTransactions(h.pool, func(tx pgx.Tx) provisionsvc.Store { return h.q.WithTx(tx) })
+	}
+	return svc
 }
 
 // writeProvisionError maps a provisionsvc error to the status and body the
@@ -1544,6 +1550,8 @@ func writeProvisionError(w http.ResponseWriter, err error) {
 		httpx.Error(w, http.StatusNotFound, pe.Message)
 	case provisionsvc.KindBadGateway:
 		httpx.Error(w, http.StatusBadGateway, pe.Message)
+	case provisionsvc.KindConflict:
+		httpx.Error(w, http.StatusConflict, pe.Message)
 	default:
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 	}

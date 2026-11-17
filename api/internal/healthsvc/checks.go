@@ -58,6 +58,7 @@ var checkMeta = map[string]struct {
 	"db.size":                      {"instance", groupControl, "Database size", "admin-health"},
 	"loops":                        {"instance", groupControl, "Background loops", ""},
 	"forge.sync":                   {"owner", groupIntegrations, "Forge issue sync", ""},
+	"issue_tracker.sync":           {"owner", groupIntegrations, "Issue tracker sync", ""},
 	"forge.ciwatch":                {"owner", groupIntegrations, "CI watch capacity", ""},
 	"slack.socket":                 {"owner", groupIntegrations, "Slack socket", ""},
 	"schedules.paused":             {"owner", groupHousekeeping, "Paused schedules", ""},

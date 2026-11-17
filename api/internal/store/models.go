@@ -592,6 +592,7 @@ type Issue struct {
 	SyncedAt       pgtype.Timestamptz `json:"synced_at"`
 	BoardPosition  pgtype.Int8        `json:"board_position"`
 	AssigneeIds    []byte             `json:"assignee_ids"`
+	IssueKey       pgtype.Text        `json:"issue_key"`
 }
 
 type IssueProposal struct {
@@ -1075,6 +1076,22 @@ type Repo struct {
 	InitialImportGeneration           int64              `json:"initial_import_generation"`
 	InitialImportErrorClass           pgtype.Text        `json:"initial_import_error_class"`
 	InitialImportUpdatedAt            pgtype.Timestamptz `json:"initial_import_updated_at"`
+	AwaitingFirstEnable               bool               `json:"awaiting_first_enable"`
+	IssueTrackerConnectionID          pgtype.UUID        `json:"issue_tracker_connection_id"`
+	IssueTrackerProjectID             pgtype.Text        `json:"issue_tracker_project_id"`
+	IssueTrackerProjectShort          pgtype.Text        `json:"issue_tracker_project_short"`
+	EligibilityTagID                  pgtype.Text        `json:"eligibility_tag_id"`
+	EligibilityTagName                pgtype.Text        `json:"eligibility_tag_name"`
+	IssueTrackerLinkedAt              pgtype.Timestamptz `json:"issue_tracker_linked_at"`
+}
+
+type RepoRemovalMarker struct {
+	UserID         uuid.UUID          `json:"user_id"`
+	ForgeType      string             `json:"forge_type"`
+	BaseUrl        string             `json:"base_url"`
+	ForgeProjectID int64              `json:"forge_project_id"`
+	WasLinked      bool               `json:"was_linked"`
+	RemovedAt      pgtype.Timestamptz `json:"removed_at"`
 }
 
 type RepoToolProfile struct {

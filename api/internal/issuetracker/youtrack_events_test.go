@@ -73,3 +73,32 @@ func TestNestedTagsCountTowardTheItemCeiling(t *testing.T) {
 		t.Fatal("nested tags did not count toward the item ceiling")
 	}
 }
+
+// A tag named by any user can carry control or invisible characters, braces or an
+// excessive length; the issue read and the label events drop it instead of passing it on.
+func TestUnsafeTagNamesAreDroppedFromReads(t *testing.T) {
+	y, srv := newFakeDriver(t)
+	good := srv.SeedOwnTag("good")
+	bad := []string{
+		srv.SeedOwnTag("ctl\x1b[31m"),
+		srv.SeedOwnTag("zero\u200bwidth"),
+		srv.SeedOwnTag("brace{d}"),
+		srv.SeedOwnTag(strings.Repeat("x", maxLabelNameLen+1)),
+	}
+	n := srv.SeedIssue("t", "", append([]string{good}, bad...)...)
+	srv.SeedTagActivity(n, "alice", append([]string{good}, bad...), bad)
+	iss, err := y.GetIssue(context.Background(), testProjectID, n)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(iss.Labels) != 1 || iss.Labels[0] != "good" {
+		t.Fatalf("labels = %q, want only good", iss.Labels)
+	}
+	evs, err := y.ListIssueLabelEvents(context.Background(), testProjectID, n)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(evs) != 1 || evs[0].LabelName != "good" || evs[0].ID != 1 {
+		t.Fatalf("events = %+v, want one add of good with ID 1", evs)
+	}
+}

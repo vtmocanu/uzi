@@ -12,6 +12,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/issueinput"
+	"github.com/vtmocanu/uzi/api/internal/issuesource"
 	"github.com/vtmocanu/uzi/api/internal/privcheck"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -133,6 +134,12 @@ func (s *Service) ConfirmProposalForUser(ctx context.Context, userID, runID, pro
 		}
 		return CreatedIssue{}, err
 	}
+	// PRD 4173 D13: no issue is created on a never-enabled repo. The claim reverts so the
+	// proposal stays pending; nothing has touched the forge.
+	if err := store.RefuseNeverEnabled(repo.AwaitingFirstEnable); err != nil {
+		s.revertProposal(ctx, propID)
+		return CreatedIssue{}, err
+	}
 
 	f, err := s.forges.ForgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
@@ -147,12 +154,19 @@ func (s *Service) ConfirmProposalForUser(ctx context.Context, userID, runID, pro
 		}
 	}
 
-	var tr forge.IssueTracker = f
+	// PRD #4173 DL-5: a linked repo's resolver wraps the write guard, which refuses
+	// CreateIssue before any request (writes arrive in M5). The claim reverts below, so
+	// the proposal stays pending and nothing was created.
+	tr, err := issuesource.For(ctx, s.issueSources, repo.IssueTrackerConnectionID.Valid, userID, repo.ID, f)
+	if err != nil {
+		s.revertProposal(ctx, propID)
+		return CreatedIssue{}, fmt.Errorf("%w: %v", ErrForgeBuild, err)
+	}
 	created, err := tr.CreateIssue(ctx, repo.ForgeProjectID, claim.Title, claim.Description, labels)
 	if err != nil {
 		s.revertProposal(ctx, propID)
 		// err is already PAT-redacted by the driver.
-		return CreatedIssue{}, fmt.Errorf("%w: %v", ErrForgeIssueWrite, err)
+		return CreatedIssue{}, fmt.Errorf("%w: %w", ErrForgeIssueWrite, err)
 	}
 
 	// Settle confirming -> confirmed with the created iid. This row is ours (we hold
@@ -207,11 +221,19 @@ func (s *Service) StartRunForUser(ctx context.Context, userID, repoID uuid.UUID,
 		}
 		return store.Run{}, err
 	}
+	// PRD 4173 D13: refused before the forge read below; CreateRun repeats the gate.
+	if err := store.RefuseNeverEnabled(repo.AwaitingFirstEnable); err != nil {
+		return store.Run{}, err
+	}
 	f, err := s.forges.ForgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
 		return store.Run{}, fmt.Errorf("%w: %v", ErrForgeBuild, err)
 	}
-	capture, err := issueinput.FetchWithTimeout(ctx, f, f, repo.ForgeProjectID, issueIID, repo.BotForgeUserID, issueinput.InteractiveAssessmentTimeout)
+	tr, err := issuesource.For(ctx, s.issueSources, repo.IssueTrackerConnectionID.Valid, userID, repo.ID, f)
+	if err != nil {
+		return store.Run{}, fmt.Errorf("%w: %v", ErrForgeBuild, err)
+	}
+	capture, err := issueinput.FetchWithTimeout(ctx, f, tr, repo.ForgeProjectID, issueIID, repo.BotForgeUserID, issueinput.InteractiveAssessmentTimeout)
 	if err != nil {
 		if forge.IsIssueResponseTooLarge(err) {
 			return store.Run{}, fmt.Errorf("%w: %w", ErrDescriptionTooLarge, err)

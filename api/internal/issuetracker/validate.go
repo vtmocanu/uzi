@@ -32,13 +32,29 @@ func InvisibleRune(c rune) bool {
 	return unicode.IsControl(c) || unicode.Is(unicode.Cf, c) || c == '\u2028' || c == '\u2029'
 }
 
-// ValidProjectID reports whether id is a well-formed project entity id such as
-// "0-1".
-func ValidProjectID(id string) bool { return entityIDRE.MatchString(id) }
+// maxEntityIDLen is the longest project or eligibility tag id the store holds:
+// the issue_tracker_project_id and eligibility_tag_id columns carry a
+// char_length CHECK of 1 to 128 (migration 00466_issue_tracker_repo_link.sql).
+// entityIDRE has no cap because it also matches listings and user and group
+// ids, so the bound applies only where an id is about to be stored.
+const maxEntityIDLen = 128
 
-// ValidTagRef requires a well-formed tag id and a name a label may carry.
+// ValidProjectID reports whether id is a well-formed project entity id such as
+// "0-1", short enough for the store's column.
+func ValidProjectID(id string) bool {
+	return len(id) <= maxEntityIDLen && entityIDRE.MatchString(id)
+}
+
+// ValidTagID reports whether id is a well-formed tag entity id short enough
+// for the store's column.
+func ValidTagID(id string) bool {
+	return len(id) <= maxEntityIDLen && entityIDRE.MatchString(id)
+}
+
+// ValidTagRef requires a well-formed tag id, short enough for the store's
+// column, and a name a label may carry.
 func ValidTagRef(ref TagRef) error {
-	if !entityIDRE.MatchString(ref.ID) {
+	if !ValidTagID(ref.ID) {
 		return errors.New("issuetracker: invalid eligibility tag id")
 	}
 	if labelNameProblem(ref.Name) {

@@ -6,11 +6,13 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/vtmocanu/uzi/api/internal/config"
 	"github.com/vtmocanu/uzi/api/internal/forgesvc"
 	"github.com/vtmocanu/uzi/api/internal/privcheck"
+	"github.com/vtmocanu/uzi/api/internal/provisionsvc"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -47,6 +49,8 @@ func openProd(ctx context.Context, cfg config.SetupConfig) (*Backend, func(), er
 		Guard:       privcheck.NewService(q, svc),
 		CheckSchema: func(ctx context.Context) error { return CheckSchemaAtHead(ctx, pool) },
 		Workers:     NewPoolWorkers(pool, box),
+		Begin:       pool,
+		Bind:        func(tx pgx.Tx) provisionsvc.Store { return q.WithTx(tx) },
 	}, pool.Close, nil
 }
 

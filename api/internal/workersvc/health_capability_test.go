@@ -554,3 +554,50 @@ func TestHealthQueuedUnguardedRunNeverCIConfigGuardReason(t *testing.T) {
 		t.Fatalf("issued %d guard lookups for an unguarded run", len(fs.ciGuardCalls))
 	}
 }
+
+// -------------------------------------------------------------------------
+// PRD #4173: the issue_key rung. A queued run on a LINKED repo whose owner has no online worker
+// reporting issue_key_v1 surfaces reasonNoIssueKeyCapableWorker; an unlinked run never asks.
+
+func issueKeySvc(linked, missing bool) (*healthFakeStore, *Service, store.ListActiveRunsForHealthRow) {
+	r := queuedRunPastThreshold()
+	r.RepoID = pgtype.UUID{Bytes: uuid.New(), Valid: true}
+	r.RepoLinked = linked
+	fs := &healthFakeStore{
+		active:          []store.ListActiveRunsForHealthRow{r},
+		issueKeyMissing: missing,
+		onlineWorkers:   1,
+		freeSlotWorkers: 1,
+	}
+	return fs, healthSvc(fs, defaultHealthSettings()), r
+}
+
+func TestHealthQueuedLinkedRepoNoIssueKeyWorkerFlagsReason(t *testing.T) {
+	fs, svc, r := issueKeySvc(true, true)
+	svc.detectRunHealth(context.Background(), t0)
+	if w := lastWrite(t, fs, r.ID); w.HealthReason.String != reasonNoIssueKeyCapableWorker {
+		t.Fatalf("reason = %q, want %q", w.HealthReason.String, reasonNoIssueKeyCapableWorker)
+	}
+	if len(fs.issueKeyCalls) != 1 || fs.issueKeyCalls[0].UserID != r.UserID || fs.issueKeyCalls[0].RepoID != uuid.UUID(r.RepoID.Bytes) {
+		t.Fatalf("issue_key lookups = %v, want exactly one for the run's repo and owner", fs.issueKeyCalls)
+	}
+}
+
+func TestHealthQueuedLinkedRepoWithIssueKeyWorkerFallsThrough(t *testing.T) {
+	fs, svc, r := issueKeySvc(true, false)
+	svc.detectRunHealth(context.Background(), t0)
+	if w := lastWrite(t, fs, r.ID); w.HealthReason.String != reasonWaitingWorker {
+		t.Fatalf("reason = %q, want the generic %q", w.HealthReason.String, reasonWaitingWorker)
+	}
+}
+
+func TestHealthQueuedUnlinkedRepoNeverAsksIssueKeyWorker(t *testing.T) {
+	fs, svc, r := issueKeySvc(false, true)
+	svc.detectRunHealth(context.Background(), t0)
+	if w := lastWrite(t, fs, r.ID); w.HealthReason.String == reasonNoIssueKeyCapableWorker {
+		t.Fatal("emitted the issue_key reason for an unlinked run")
+	}
+	if len(fs.issueKeyCalls) != 0 {
+		t.Fatalf("issued %d issue_key lookups for an unlinked run", len(fs.issueKeyCalls))
+	}
+}

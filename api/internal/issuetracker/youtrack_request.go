@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -99,6 +100,9 @@ func (y *youTrack) do(ctx context.Context, c ytCall, out any) (status, n int, er
 		}
 	}
 	if decodeErr != nil {
+		if errors.Is(decodeErr, errItemCeiling) {
+			return status, len(body), y.red.sentinel(errItemCeiling, status, fmt.Sprintf("%s %s: decode response", c.method, path))
+		}
 		return status, len(body), y.red.errorStatus(fmt.Errorf("youtrack: %s %s: decode response: %w", c.method, path, decodeErr), status)
 	}
 	return status, len(body), nil
@@ -164,7 +168,7 @@ func ytPages[T any](ctx context.Context, y *youTrack, path []string, query url.V
 			}
 		}
 		if seen > maxItems {
-			fetchErr = y.red.error(errItemCeiling)
+			fetchErr = y.red.sentinel(errItemCeiling, 0, "")
 			return nil, 0, fetchErr
 		}
 		if visit(items) {
@@ -175,6 +179,10 @@ func ytPages[T any](ctx context.Context, y *youTrack, path []string, query url.V
 	})
 	if fetchErr != nil {
 		return fetchErr
+	}
+	// A ceiling stays identifiable with errors.Is; anything else is scrubbed.
+	if isPackageSentinel(err) {
+		return y.red.sentinel(err, 0, "")
 	}
 	return y.red.error(err)
 }

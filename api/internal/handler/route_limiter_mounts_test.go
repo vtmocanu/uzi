@@ -329,6 +329,7 @@ var wantRouteMounts = []routeMount{
 	{"DELETE", "/api/admin/products/{id}/egress-profiles/{name}", noLimiter},
 	{"DELETE", "/api/agent-templates/{id}", noLimiter},
 	{"DELETE", "/api/forge/connections/{id}", noLimiter},
+	{"DELETE", "/api/issue-trackers/connections/{id}", noLimiter},
 	{"DELETE", "/api/me/cli-tokens/{id}", noLimiter},
 	// PRD #1907 M5: revoke one of the caller's own product tokens, a cookie-only,
 	// owner-scoped DB write → noLimiter, like the CLI-token revoke above.
@@ -457,6 +458,11 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/forge/config", noLimiter},
 	{"GET", "/api/forge/connections/", noLimiter},
 	{"GET", "/api/forge/connections/{id}/projects", limForge},
+	// PRD #4173 M4: the issue tracker connection list reads only the store; projects and tags
+	// call the issue tracker, so they ride the per-user forge budget.
+	{"GET", "/api/issue-trackers/connections/", noLimiter},
+	{"GET", "/api/issue-trackers/connections/{id}/projects", limForge},
+	{"GET", "/api/issue-trackers/connections/{id}/tags", limForge},
 	{"GET", "/api/health", noLimiter},
 	{"GET", "/api/me/cli-tokens/", noLimiter},
 	// PRD #1907 M5: the caller's own product-token list and the mint picker, cookie-only
@@ -761,6 +767,7 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/forge/connections/", noLimiter},
 	{"POST", "/api/forge/connections/{id}/privilege-check", limForge},
 	{"POST", "/api/forge/connections/{id}/verify", limForge},
+	{"POST", "/api/issue-trackers/connections/", limForge},
 	{"POST", "/api/me/cli-tokens/", noLimiter},
 	{"POST", "/api/me/cli-tokens/revoke-all", noLimiter},
 	// PRD #3254: start-preview is a read that takes a token choice in a body; it writes nothing.
@@ -1098,6 +1105,8 @@ var wantRouteMounts = []routeMount{
 	{"PUT", "/api/repos/{id}/board/prefs", noLimiter},
 	// PRD #557 board-access visibility write: same owner-or-admin group → noLimiter.
 	{"PUT", "/api/repos/{id}/github-project-sync/visibility", noLimiter},
+	// PRD #4173 M4: the repo link reads the issue tracker (token, projects, tags).
+	{"PUT", "/api/repos/{id}/issue-tracker-link", limForge},
 	{"PUT", "/api/repos/{id}/tool-profile", noLimiter},
 	// PRD #35 Decision 7, the per-run toggle. noLimiter for the same reason as
 	// /me/wait-on-limit: one owner-scoped boolean UPDATE, no spend, no forge write,

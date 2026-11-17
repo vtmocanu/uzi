@@ -755,10 +755,15 @@ func (s *Service) CreateProposal(ctx context.Context, wkr store.Worker, runID, r
 	}
 	// The target issue repo must belong to the same user (never trust a worker-
 	// supplied repo_id blindly).
-	if _, err := s.q.GetRepoForUser(ctx, store.GetRepoForUserParams{ID: repoID, UserID: wkr.UserID}); err != nil {
+	prow, err := s.q.GetRepoForUser(ctx, store.GetRepoForUserParams{ID: repoID, UserID: wkr.UserID})
+	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return store.IssueProposal{}, ErrRepoNotFound
 		}
+		return store.IssueProposal{}, err
+	}
+	// PRD 4173 D13: a proposal for a never-enabled repo could never be confirmed.
+	if err := store.RefuseNeverEnabled(prow.AwaitingFirstEnable); err != nil {
 		return store.IssueProposal{}, err
 	}
 	count, err := s.q.CountPendingProposalsForRun(ctx, runID)

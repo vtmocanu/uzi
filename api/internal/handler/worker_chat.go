@@ -332,6 +332,8 @@ func (h *Handler) WorkerCreateProposal(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusConflict, "the chat has ended; cannot add a proposal")
 		case errors.Is(err, workersvc.ErrRepoNotFound):
 			httpx.Error(w, http.StatusNotFound, "repo not found for this worker's user")
+		case errors.Is(err, workersvc.ErrRepoNeverEnabled):
+			writeNeverEnabled(w)
 		case errors.Is(err, workersvc.ErrProposalCapReached):
 			httpx.Error(w, http.StatusConflict, "too many pending proposals for this chat; resolve some first")
 		default:

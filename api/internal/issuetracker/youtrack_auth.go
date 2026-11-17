@@ -47,3 +47,26 @@ func (y *youTrack) fetchAccount(ctx context.Context) (Account, error) {
 	}
 	return Account(u), nil
 }
+
+// MapsAuthor reports whether an issue tracker driver can say that an author
+// login is the connection's own account, which is how D11 of the external issue
+// trackers PRD decides that an issue or comment counts as uzi's. The consumer
+// declares the interface it needs (issueinput.AuthorMapper, which this package
+// does not import); this assertion only guards the method.
+var _ interface {
+	MapsAuthor(ctx context.Context, author string) (bool, error)
+} = (*youTrack)(nil)
+
+// MapsAuthor reports whether author, compared exactly, is the login of the
+// account the token belongs to; an empty author never maps. A failed account
+// lookup is an error and is not kept (see connAccount).
+func (y *youTrack) MapsAuthor(ctx context.Context, author string) (bool, error) {
+	if author == "" {
+		return false, nil
+	}
+	a, err := y.connAccount(ctx)
+	if err != nil {
+		return false, err
+	}
+	return a.Login != "" && a.Login == author, nil
+}

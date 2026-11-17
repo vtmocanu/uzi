@@ -123,6 +123,10 @@ func (h *Handler) FileIssue(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
+	// PRD 4173 D13: before the claim and the forge write.
+	if refuseNeverEnabled(w, repo.AwaitingFirstEnable) {
+		return
+	}
 
 	// Labels are assembled server-side (Decision 3/6): the single uzi run-eligibility
 	// label (PRD #764), NEVER autopilot and NEVER from the request body — the API
@@ -149,7 +153,7 @@ func (h *Handler) FileIssue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tr, err := h.issueTrackerForRepo(ctx, repo.ID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
+	tr, err := h.issueTrackerForRepo(ctx, repo.UserID, repo.ID, repo.IssueTrackerConnectionID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
 		h.revertFiledClaim(ctx, claimID)
 		slog.Error("file issue: build forge for connection", "error", err)
@@ -161,6 +165,9 @@ func (h *Handler) FileIssue(w http.ResponseWriter, r *http.Request) {
 		// Forge rejected the write (mock state E): the claim reverts, nothing is
 		// persisted, the draft stays open. err is already PAT-redacted by the driver.
 		h.revertFiledClaim(ctx, claimID)
+		if writeIssueWriteNotOffered(w, err) {
+			return
+		}
 		httpx.Error(w, http.StatusBadGateway, "could not create the issue on the forge: "+err.Error())
 		return
 	}
@@ -251,6 +258,7 @@ func (h *Handler) settleFiledIssue(ctx context.Context, claimID uuid.UUID, categ
 		Author:         pgconv.TextOrNull(created.Author),
 		HasPrdLink:     forgesvc.HasPRDLink(description),
 		ForgeUpdatedAt: pgtype.Timestamptz{Time: updated, Valid: true},
+		IssueKey:       pgtype.Text{}, // only the linked sync writes issue_key (D10)
 	}); err != nil {
 		slog.Warn("file issue: cache issue", "error", err)
 		return warnUnlinked

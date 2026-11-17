@@ -24,6 +24,9 @@ func (r *runner) outcome(err error) (status, msg string, findings []string) {
 		return StatusRefused, r.clean(pe.Message), cleanAll(r, pe.Violations)
 	case provisionsvc.KindGuardBlocked:
 		return StatusRefused, r.clean(pe.Message), cleanAll(r, blockMessages(pe.Guard))
+	case provisionsvc.KindConflict:
+		// The repo's history forbids the change: a refusal, like a guard block, not a failure.
+		return StatusRefused, r.clean(pe.Message), nil
 	default:
 		return StatusFailed, r.clean(pe.Message), nil
 	}

@@ -12,9 +12,9 @@
 #     quota that lets four workers through here.
 #
 # Spins up a THROWAWAY Postgres, points UZI_TEST_DATABASE_URL at it, applies the
-# real goose migrations, seeds fixtures, and runs every *LiveDB test in the eight
+# real goose migrations, seeds fixtures, and runs every *LiveDB test in the nine
 # packages that carry one (store, handler, forgesvc, schedsvc, workersvc, recovery, poller,
-# hostedsvc -- the ALL_PKGS list below). ci.yml splits that list across two jobs with UZI_STORE_IT_GROUP:
+# hostedsvc, issuetrackersvc -- the ALL_PKGS list below). ci.yml splits that list across two jobs with UZI_STORE_IT_GROUP:
 # `task test:livedb-workersvc` and `task test:codex-refresh-lostreply-e2e` (group rest);
 # `test-api-store-it` requires both.
 # Isolated: unique container + published loopback port, torn down on exit; never
@@ -62,6 +62,7 @@ ALL_PKGS=(
   ./internal/recovery/...
   ./internal/poller/...
   ./internal/hostedsvc/...
+  ./internal/issuetrackersvc/...
 )
 if [ -z "${UZI_STORE_IT_GROUP+set}" ]; then
   PKGS=("${ALL_PKGS[@]}")

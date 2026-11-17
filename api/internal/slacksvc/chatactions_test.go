@@ -262,6 +262,20 @@ func TestChatActionCreateForgeFailureOffersRetry(t *testing.T) {
 	}
 }
 
+// A linked repo's refused filing is not retryable: the ephemeral must not say "press Create again".
+func TestChatActionCreateLinkedRepoIsNotRetryable(t *testing.T) {
+	runID, propID := uuid.New(), uuid.New()
+	sub := &fakeChatActionSubmitter{confirmErr: ErrChatProposalLinkedRepo}
+	fp := &fakePoster{}
+	c := NewChatActions(&fakeChatActionStore{user: store.User{ID: uuid.New()}}, sub, fp, fixedBase, nil)
+
+	c.HandleBlockAction(context.Background(), chatActionPress(ActionChatProposalCreate, runID, propID))
+
+	if len(fp.ephemerals) != 1 || !strings.Contains(fp.ephemerals[0].text, "linked to an issue tracker") || strings.Contains(strings.ToLower(fp.ephemerals[0].text), "again") || !strings.Contains(strings.ToLower(fp.ephemerals[0].text), "pending") {
+		t.Fatalf("want a non-retryable linked-repo ephemeral, got %+v", fp.ephemerals)
+	}
+}
+
 // Dismiss drops the proposal (never touches the forge) and edits the card.
 func TestChatActionDismiss(t *testing.T) {
 	runID, propID := uuid.New(), uuid.New()

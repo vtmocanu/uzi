@@ -183,6 +183,8 @@ func TestListedCommentsAndEventsCarryTheirTimestamps(t *testing.T) {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/comments"):
 			writeRaw(w, `[{"id":"4-1","text":"hi","created":1500,"author":{"id":"1-1","login":"alice"}}]`)
+		case strings.HasSuffix(r.URL.Path, "/activities") && r.URL.Query().Get("categories") == "CommentTextCategory":
+			writeRaw(w, `[]`)
 		case strings.HasSuffix(r.URL.Path, "/activities"):
 			writeRaw(w, `[{"id":"3-1","timestamp":2500,"author":{"id":"1-1","login":"bob"},"added":[`+rawOwnTag("5-1", "a")+`]}]`)
 		default:

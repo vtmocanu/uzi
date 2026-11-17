@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/forgesvc"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	"github.com/vtmocanu/uzi/api/internal/issuedraft"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
@@ -184,7 +185,16 @@ func (h *Handler) FileFindingGroup(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	tr, err := h.issueTrackerForRepo(ctx, repo.ID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
+	// PRD 4173 D13: the group is already claimed, so release it before refusing; nothing
+	// has touched the forge.
+	if store.RefuseNeverEnabled(repo.AwaitingFirstEnable) != nil {
+		if !releaseFindingGroupOrReport(w, op.ID, dispositionIDs, release) {
+			return
+		}
+		writeNeverEnabled(w)
+		return
+	}
+	tr, err := h.issueTrackerForRepo(ctx, repo.UserID, repo.ID, repo.IssueTrackerConnectionID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
 		if !releaseFindingGroupOrReport(w, op.ID, dispositionIDs, release) {
 			return
@@ -208,6 +218,9 @@ func (h *Handler) FileFindingGroup(w http.ResponseWriter, r *http.Request) {
 		if !releaseFindingGroupOrReport(w, op.ID, dispositionIDs, release) {
 			return
 		}
+		if writeIssueWriteNotOffered(w, err) {
+			return
+		}
 		httpx.Error(w, http.StatusBadGateway, "could not ensure the finding label on the forge: "+err.Error())
 		return
 	}
@@ -226,9 +239,14 @@ func (h *Handler) FileFindingGroup(w http.ResponseWriter, r *http.Request) {
 	}
 	created, err := tr.CreateIssue(callCtx, repo.ForgeProjectID, title, description, filedLabels)
 	if err != nil {
-		if forge.IsCreateIssueDefinitiveRejection(err) {
+		// The write guard refuses before any request, so nothing was created: release the
+		// group like a definitive rejection instead of marking it uncertain.
+		if errors.Is(err, forgesvc.ErrIssueWriteNotOffered) || forge.IsCreateIssueDefinitiveRejection(err) {
 			if !h.releaseDefinitiveFindingGroup(user.ID, op.ID) {
 				writeStoppedFindingGroup(w, op.ID, dispositionIDs, "in_flight")
+				return
+			}
+			if writeIssueWriteNotOffered(w, err) {
 				return
 			}
 			httpx.Error(w, http.StatusBadGateway, "could not create the issue on the forge: "+err.Error())

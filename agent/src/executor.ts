@@ -253,6 +253,8 @@ export interface RunContext {
   kind?: RunKind;
   /** The worked issue for an issue run; null for a ci_fix run (no issue). */
   issueIid: number | null;
+  /** PRD 4173: the linked issue's key (ClaimResponse.issue_key); absent on an unlinked run. */
+  issueKey?: string;
   issueTitle: string;
   issueDescription: string;
   /** PRD #381: the bounded, bot/system-filtered snapshot of the issue's human

@@ -235,6 +235,10 @@ func (h *Handler) AdminFileJudgeIssue(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
+	// PRD 4173 D13: before the claim and the forge write.
+	if refuseNeverEnabled(w, repo.AwaitingFirstEnable) {
+		return
+	}
 
 	// Labels are assembled server-side (Decision 3/6): the single uzi run-eligibility label
 	// (PRD #764), never from the request body.
@@ -259,7 +263,7 @@ func (h *Handler) AdminFileJudgeIssue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tr, err := h.issueTrackerForRepo(ctx, repo.ID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
+	tr, err := h.issueTrackerForRepo(ctx, repo.UserID, repo.ID, repo.IssueTrackerConnectionID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
 		h.revertFiledClaim(ctx, claimID)
 		slog.Error("admin file issue: build forge for connection", "error", err)
@@ -271,6 +275,9 @@ func (h *Handler) AdminFileJudgeIssue(w http.ResponseWriter, r *http.Request) {
 		// Forge rejected the write: the claim reverts, nothing persists, the coordinate is
 		// fileable again. err is already PAT-redacted by the driver.
 		h.revertFiledClaim(ctx, claimID)
+		if writeIssueWriteNotOffered(w, err) {
+			return
+		}
 		httpx.Error(w, http.StatusBadGateway, "could not create the issue on the forge: "+err.Error())
 		return
 	}

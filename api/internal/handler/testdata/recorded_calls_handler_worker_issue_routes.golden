@@ -1,0 +1,11 @@
+# WorkerForgeGetIssue own issue
+GetIssue(4242, 7)
+ListIssueComments(4242, 7)
+# WorkerForgeGetIssue other issue
+GetIssue(4242, 8)
+RepositoryAuthorEligibility(4242, 2)
+ListIssueComments(4242, 8)
+# WorkerForgeListIssues
+ListIssues(4242, {Labels:["uzi" "PRD"] UpdatedAfter:2026-03-04T05:06:07Z State:"opened" Limit:51})
+# WorkerForgeListIssueLabelEvents
+ListIssueLabelEvents(4242, 8)
