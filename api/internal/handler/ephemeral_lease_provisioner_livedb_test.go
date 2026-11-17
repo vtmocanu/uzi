@@ -577,7 +577,7 @@ func (l *liveEphemeralSettings) set(key, value string) {
 		}
 	}
 	l.st.rows = append(rows, store.AppSetting{Key: key, Value: value})
-	l.Cache.Invalidate()
+	l.Invalidate()
 }
 
 // unset deletes the row, the reset to the compiled-in default.
@@ -589,7 +589,7 @@ func (l *liveEphemeralSettings) unset(key string) {
 		}
 	}
 	l.st.rows = rows
-	l.Cache.Invalidate()
+	l.Invalidate()
 }
 
 func (l *liveEphemeralSettings) EphemeralMaxPerUser(ctx context.Context) (int, error) {

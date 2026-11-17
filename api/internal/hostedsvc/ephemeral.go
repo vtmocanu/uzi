@@ -46,7 +46,8 @@ func durationToInterval(d time.Duration) pgtype.Interval {
 }
 
 // EphemeralSettings is the narrow settings dependency of the provisioner: the
-// instance-wide kill-switch and Docker repository scope. *settings.Cache satisfies it.
+// instance-wide kill-switch, Docker repository scope, and the per-user cap, default
+// size and lease (PRD #4212, read per pass). *settings.Cache satisfies it.
 type EphemeralSettings interface {
 	EphemeralWorkersEnabled(ctx context.Context) (bool, error)
 	DockerRepoAllowlist(ctx context.Context) ([]uuid.UUID, error)
@@ -169,7 +170,8 @@ type EphemeralProvisioner struct {
 // NewEphemeralProvisioner wires the provisioner. pool is needed for Begin + the
 // advisory lock; q is the store used both for the trigger query and, via WithTx, inside
 // each provision transaction; box seals the join token; settings supplies the instance
-// kill-switch; cfg carries the cap and default size.
+// kill-switch and the cap, default size and lease (read each pass); cfg carries the
+// remaining boot-time tuning.
 func NewEphemeralProvisioner(pool *pgxpool.Pool, q *store.Queries, box *secretbox.Box, s EphemeralSettings, cfg EphemeralConfig) *EphemeralProvisioner {
 	return &EphemeralProvisioner{pool: pool, q: q, box: box, settings: s, cfg: cfg, now: time.Now}
 }
