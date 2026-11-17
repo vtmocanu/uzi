@@ -753,3 +753,64 @@ E1 proves this assertion detects this journal deletion at this first-settlement
 seam only. It does not discharge switch-journal, input, custody, accounting,
 canonical gate, question or replay-effect preservation. Those clauses and all
 other unvalidated rows remain required; m3 and m4 remain **INCOMPLETE**.
+
+
+### E2–E3 — populated input and custody timestamp effect controls
+
+Candidate: 8ed61e8a2f088f16cb5f00509b8fd7a840c4a076. New fixture
+codex_switch_stopped_preservation_routes_livedb_test.go:12–104 supplies separate
+applied_input and open_custody cases. Each verifies owner/current claim fields
+and the exact seeded row in a nonempty snapshot before first STOP and replay.
+The applied pause has applied_at and receipt fields populated, so it is not an
+unapplied competing input. The open inventory-guarded custody row keeps its
+worker/run pointers and NULL release/publication evidence. The unchanged real
+route passes both first settlement and replay without relaxing any guard.
+
+These are **effect-injection sensitivity controls** under the preservation
+method amendment. Each export adds one CTE after changed in the source SQL
+and executing generated counterpart (same query, one effect). All predicates,
+six RUN assignments, fixtures and response expressions remain unchanged:
+
+| Control | Named seam / only injected effect | Intended assertion / red log |
+| --- | --- | --- |
+| E2 | Applied-input preservation at first accepted STOP; DELETE run_user_inputs for changed run IDs, kind=pause, applied_at non-NULL | :61 `snapshot changed in inputs`; gate-log.p1Rpfr |
+| E3 | Custody released_at preservation at first accepted STOP; UPDATE open, unreleased holds for changed run IDs to released_at=2000-01-01 UTC | :101 `snapshot changed in custody`; gate-log.u8Buka |
+
+E3 changes only the timestamp. It does not perform a custody lifecycle release:
+state, live pointers and release evidence remain unchanged. It supplies no
+claim that an actual custody-release mutant has been demonstrated.
+
+Reachability: the authenticated state route dispatches to stopCodexSwitch;
+worker then run locks cover the eligible first transition and changed CTE.
+Each added data-modifying CTE selects that changed run ID within the same SQL
+statement and transaction, before commit and the post-response snapshot.
+The E3 timestamp-only update does not trigger the inventory guard's lifecycle
+branch (effective 00409 Up checks state/live pointers/final disposition).
+These controls inject no effect on paused replay; positive replay equality
+is observed but has no separate replay-effect sensitivity credit.
+
+Receipt .uzi/scratch/stopped-populated-effect-results.json contains exact
+source/generated diffs and hashes, commands, durations, leaf actions, and cleanup.
+Before gate-log.jSzDhs and after gate-log.m4RCxZ exit 0 with both leaves passing,
+no skips. E2 and E3 each exit 1 at the named assertion, with no SQLSTATE, build
+failure or timeout. Separate compilation checks exit 0 (gate-log.390s7u and
+ gate-log.7vFT78); the actual negatives also compile with race detection.
+All logs are under .uzi/scratch/. From api with GOFLAGS=-p=1, GOMAXPROCS=4:
+
+```sh
+go test -buildvcs=false -race -count=1 -json ./internal/handler -run '^TestWorkerCodexStoppedPreservationRouteLiveDB$'
+```
+
+Individual mutants use the same command with the corresponding exact subtest
+suffix. The lead inspected the script, diffs, original source hashes, and recorded
+leaf pass/fail events and assertion text. The tester's handoff had no returned
+outer-command result; the subsequently inspected receipt and logs record completed
+individual subprocess exits, final unchanged passes, and fixture cleanup exit 0.
+No overall harness-exit claim is made. Primary status/diff remained clean, export
+removed, and exact owned fixture removed. One export at a time, no installs or base
+builds. The source fixture range was independently reviewed without findings.
+
+Credit is limited to detecting these particular effects at these first-settlement
+seams. It is not proof of every input mutation, actual custody release, switch
+journal preservation, replay effects, accounting, gates or questions. Remaining
+worker obligations stay unvalidated; m3 and m4 remain **INCOMPLETE**.

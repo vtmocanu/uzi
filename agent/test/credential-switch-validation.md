@@ -552,3 +552,30 @@ removed, primary unchanged. No new full-suite or security-gate claim is made.
 Credit is only detection of this particular first-settlement journal deletion.
 Other preservation seams, replay effects, transactional/runtime clauses and m4
 remain required and unvalidated as listed. m3/m4 remain **INCOMPLETE**.
+
+
+## Populated input and custody timestamp controls
+
+Candidate 8ed61e8a2 adds separate historical applied-input and open custody
+fixtures, verified nonempty and bound to the current owner/claim before first
+settlement and replay through the authenticated route. Independent fixture
+review found no findings. E2/E3 in the proof ledger record the exact credit:
+one applied-input deletion and one custody released_at timestamp corruption,
+respectively. The latter is not an actual custody lifecycle release.
+
+The lead inspected .uzi/scratch/stopped-populated-effect-results.json, exact
+mutant diffs/hashes, script and individual log events after the tester handoff
+lacked a returned outer-command result. Recorded subprocess results are before
+exit 0 (gate-log.jSzDhs), assertion-red input exit 1 (gate-log.p1Rpfr),
+assertion-red custody timestamp exit 1 (gate-log.u8Buka), after exit 0
+(gate-log.m4RCxZ). Both unchanged leaves passed without skips; each mutant
+compiled and failed at its specific snapshot assertion, not infrastructure.
+The receipt records final cleanup exit 0, unchanged primary and removed export.
+No overall harness exit status or full-suite/security result is claimed.
+
+All guards and other effects remained intact; controls used separate serial
+exports of the exact candidate, no installs or base builds. They demonstrate
+sensitivity only to the named effects during first settlement. Positive replay
+checks do not independently validate replay-effect sensitivity. Actual custody
+release, other preservation and transactional/runtime criteria, and m4 remain
+required. m3/m4 remain **INCOMPLETE**.
