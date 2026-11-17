@@ -2805,8 +2805,8 @@ are recorded in [ADR-3153](../adr/3153-runner-shared-pvc-subpath.md).
 
 #### Per-run TMPDIR leaves (#4420)
 
-A Claude run flight in the main run lane (issue, task, CI-fix, self-improve and
-MR-rework runs) launches with its own `TMPDIR`, `<scratch root>/run-<runId>`
+A Claude run flight in the main run lane (issue, task, prompt, CI-fix, self-improve
+and MR-rework runs) launches with its own `TMPDIR`, `<scratch root>/run-<runId>`
 (`agent/src/run-tmpdir.ts`), under the split root `/data/runner/.tmp/uzi-runner` or the
 single-UID root `/data/runner/.tmp`. The leaf is created by a runner-uid helper in split
 mode and by the worker in single-UID mode. The leaf

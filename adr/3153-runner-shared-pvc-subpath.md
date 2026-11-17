@@ -348,7 +348,7 @@ open on #4143 pending a durable parent-binding design.
 
 ## Amendment (2026-11-17, #4420)
 
-Claude run flights in the main run lane (issue, task, CI-fix, self-improve and MR-rework runs) now launch with a run-owned `TMPDIR` leaf `run-<runId>` under
+Claude run flights in the main run lane (issue, task, prompt, CI-fix, self-improve and MR-rework runs) now launch with a run-owned `TMPDIR` leaf `run-<runId>` under
 the scratch root, and the scratch phase may reclaim such a leaf. The authority, exclusion
 and settlement protections of the 2026-11-10 amendment are unchanged. A `run-<uuid>` leaf
 is additionally kept unless the server lifecycle is terminal, the run has zero open
