@@ -804,7 +804,7 @@ async function retireBody(ctx: RetireContext, pin: ScratchRootPin, root: string,
   if (bound === undefined) return refuse("bind_unknown");
   if ("refused" in bound) return refuse(bound.refused);
 
-  // Pre-effect steps run inside the phase window less the settlement reserve: a step that cannot start there is deferred
+  // The idle proofs and the run-status/holds read run inside the phase window less the settlement reserve: a step that cannot start there is deferred
   // untouched, and one that ends at its deadline was cancelled and joined by then. The reason a cut-off step reports is the
   // budget, never a verdict about the daemon or the run.
   const stepBound = (): RetireStepBound | undefined => {

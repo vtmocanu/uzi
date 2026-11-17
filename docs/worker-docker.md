@@ -709,7 +709,7 @@ fails on runner-owned content and leaves the parent (and possibly partial
 residue) behind unbound, as before this change; the retire logs `retire scratch
 binding cap reached` and reports it `unbound`. Only two classes can
 settle, and only on a uid-split pod: `owner_terminal` and `verified_successor`.
-Completion, covered-lift or parked-flight terminal (`owner_terminal_covered`; a
+Completion, covered-lift or parked-flight retires (`owner_terminal_covered`; a
 parked run is not terminal, so its scratch must not become reclaimable), foreign-orphan
 (`other`) and attempt-less retires never become eligible. On a uid-split pod
 every bound non-completion parent is deferred, with no in-process removal:
@@ -732,22 +732,25 @@ the pod-entry fence, no mount or bind at or under it, an idle worker and no
 process holding it. The phase is bounded: 30 s of headroom to start, a 120 s cap,
 20 s minimum per candidate, at most 64 candidates and 2,000,000 helper entries.
 The helper gets at most min(300 s, phase window - 5 s), so at most about 115 s
-with the 120 s cap. Each pre-effect step (the worker-idle proofs and the run-status
-and holds read) is cancelled 5 s before the phase window ends, keeping a 5 s reserve
-for joined teardown; a step that cannot start (under 6 s of window left) or is cut off
-keeps its candidate as `budget_deferred` before any deletion effect. A deferral never
-changes the pass verdict.
+with the 120 s cap. The worker-idle proofs and the run-status and holds read are each
+cancelled 5 s before the phase window ends, keeping a 5 s reserve for joined teardown.
+If the first idle proof cannot start (under 6 s of window left) or is cut off, the whole
+phase is refused as `budget_deferred`; a per-candidate step that cannot start or is cut
+off defers that candidate (and the rest) as `budget_deferred` before any deletion effect.
+A deferral never changes the pass verdict.
 
 Removal runs the strict pinned helper (`empty-fd`) as the runner uid only: no
 chmod, no chown, no privilege increase and no raw fallback. The worker then
 removes `clone` and the parent with its own `rmdir`, which is the proof that
 nothing was left. `removing` is written durably before the first deletion effect, and a removal
 that leaves anything behind leaves the binding there; **a `removing` binding is never retried or reclaimed** (it reads
-`interrupted_removal`, and `removing_bindings` in the total counts them). `intent` and `removing` bindings count toward the 64-per-bare cap and nothing releases
-them: a binding is released only when a successful verified-epoch reclaim unsets it
-or a completion removal unsets it. A metadata-only recovery step clears a binding only
-when its `.retire-*` parent is already gone (and only in its narrow cases); it is not a
-remedy for a retained parent, which is on disk. Past the cap the fallback is the
+`interrupted_removal`, and `removing_bindings` in the total counts them). Every binding, `intent` and `removing` included, counts toward the 64-per-bare cap.
+On a uid-split pod a retained `intent` or `removing` binding whose parent is still on
+disk is released only when a successful verified-epoch reclaim or a completion removal
+unsets it. (A single-uid pod's in-process removal unsets the binding after a confirmed
+removal, and a retire that moved nothing drops its `intent` binding.) A metadata-only
+recovery step clears a binding only when its `.retire-*` parent is already gone (and
+only in its narrow cases); it is not a remedy for a retained parent, which is on disk. Past the cap the fallback is the
 unbound in-process removal attempt described above. Permanently retained `intent` or
 `removing` bindings have no supported remedy in this release: no manual deletion,
 binding reset or cleanup route exists or is supported.
