@@ -761,3 +761,24 @@ unchanged and provisioned dependencies reused without installs or base builds.
 Only namespace availability/isolation in this retained-reference scenario is
 newly credited. Unsafe B auth, other scope-mode transitions, retired refresh,
 whole authority and remaining m3/m4 criteria are not claimed as complete.
+
+
+## Retired A credential-reconciliation request guard
+
+R8 records a new-guard sensitivity control at 795583992 through the actual Runner
+API-key A → subscription B path. Neutralizing only assertCurrent's retirement
+check lets the retained A reconcile closure make one credential-release request
+using A's capability during B login. The driver fails at :35187, with releaseCalls
+1 instead of 0 and result ready instead of retired; other guards remain intact.
+
+The fixture flag releasedA records request capability equality, not response
+token contents. This evidence therefore proves a retired-A request, not returned
+A-token identity, real-server disclosure, unsafe B auth or subscription refresh.
+
+Receipt runtime-retired-credential-results.json and lead audit under .uzi/scratch
+record precise hashes/diff/counter semantics. Logs there: u1y7vJ mutant typecheck
+exit 0, wYdX9k intended assertion-red exit 1. Prior qLXsz4/BrDwU1 target greens
+are reused after raw pass/hash, agent-input and docs-only-delta checks; no new
+primary green runs are claimed. Export removed and primary unchanged. All other
+mixed authority and backend/refresh requirements, full suites and m4 security
+remain required and incomplete.

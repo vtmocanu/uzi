@@ -413,7 +413,7 @@ control is still absent, not that the functional criterion was deferred.
 | Same successful flight/generation/worktree with no new attempt, custody or release/reclaim | Positive assertions present; independent preservation/control accounting unvalidated |
 | Strict usable persistence, clear confirmation and continuation on A before teardown | R1–R4 below credit three failed-save/inspection variants and empty applied-ACK only; other clauses unvalidated |
 | Proven A root/tool reap before B material, login and model work; fresh CODEX_HOME | R5 credits unproven registered root pre-apply only; tool-only, other modes/phases and HOME clauses unvalidated |
-| Whole operation-scope/refresh/identity/capability/summary replacement and retired-A rejection | A2 credits one reader; A3 retained-A/Sub→Sub B-scope namespace isolation; R7 B dispatcher publication readiness only; remaining mixed clauses unvalidated |
+| Whole operation-scope/refresh/identity/capability/summary replacement and retired-A rejection | A2 credits one reader; A3 retained-A/Sub→Sub B-scope namespace isolation; R7 B dispatcher publication readiness; R8 retired API-key A reconcile release-request fence during B login; remaining mixed clauses unvalidated |
 | Exact saved-ID resume; confirmed-refusal-only fresh fallback and lineage; preservation re-hold | R6 credits uncertain-error classification only; confirmed-refusal/preserve companions positive, independent preservation and other clauses unvalidated |
 | Policy episode rejection at request and under apply lock | Unvalidated |
 | Refresh lease/intent exclusion, account lock ordering and boundary reconciliation before revoke | Unvalidated |
@@ -1322,3 +1322,62 @@ legacy restoration demonstrates the namespace-separation dependency. It does
 not prove unsafe old-controller use, every auth-mode scope transition, retired-A
 refresh, all capability consumers, summary authority, whole-handoff correctness
 or m3/m4 completion. Remaining mixed clauses stay required and unvalidated.
+
+
+### R8 — retired A credential-reconciliation request guard, class (d)
+
+Candidate 79558399250c5c8b1000b5bde705381016c862ef. Receipt:
+.uzi/scratch/runtime-retired-credential-results.json; source/counter audit:
+.uzi/scratch/runtime-retired-credential-lead-audit.json. This is one **guard
+control** through the actual Runner API-key A → subscription B factory path.
+Shared exact a233 Codex-operation refusal at runner.ts:25735–25738 applies;
+the new per-epoch retired authority guard has no historical allowed-switch seam.
+
+Only createCodexEpochAuthority's assertCurrent guard is neutralized, replacing
+`if (retired) throw new TrustedExecutionRefusal("codex credential authority retired")`
+with `void retired` (codex-executor.ts:2090–2092). isCurrent, retire, all other
+ownership/capture/phase/lifetime checks and callback creation remain unchanged.
+The lead reconstructed the exact one-block mutant hash and verified the raw
+assertion, source frame and request-counter values.
+
+The existing actual Runner case retains production A's shared reconcile closure
+and invokes it during B's account/login/start with a fresh, noncancelled signal.
+Without the guard it reaches the fake credential-release client once using A's
+capability and returns reconcile outcome ready. The driver, outside callbacks
+that production may catch, fails at :35187 with ERR_ASSERTION:
+
+```text
+expected: { result: 'retired', releaseCalls: 0, releasedA: false }
+actual:   { result: 'ready',   releaseCalls: 1, releasedA: true }
+```
+
+This is counter-sensitive, not merely a changed refusal label. Important fixture
+semantics: retainedBoundaryReleasedA is set at test :33163 when an active retained
+boundary sends req.capability equal to oldClaim.capability. It does not compare
+the response token's identity. Credit is a prohibited A-capability release
+request; no real-server token disclosure, returned-A-token identity, B use of A
+material or unsafe B authentication is inferred from that flag. Server capability
+revocation is a distinct obligation and this fake-backed guard test does not
+establish or bypass the real API's checks.
+
+Selected leaf: `M2 actualRunner api_key to subscription factory account resumes saved thread`.
+The Node command uses --import tsx, --test, --test-reporter=tap,
+--test-timeout=120000, the escaped exact-name suffix pattern and
+`test/codex-executor.test.ts`. Mutant npm run typecheck gate-log.u1y7vJ exits 0;
+mutant gate-log.wYdX9k exits 1 at the intended driver assertion. No timeout,
+cancellation, uncaught owner-close or compilation error supplies the red.
+
+Unchanged target green is reused from the prior scope validator's actual
+seven-pass gate-log.qLXsz4 and gate-log.BrDwU1 runs. The revision delta is only
+the two ledger docs, 1,824 agent inputs are verified identical, and raw target
+passes/log hashes and runtime settings are checked. The lead independently
+parsed the exact target green/red TAP lines and actual row diagnostics and
+verified the docs-only delta. There is no claim of newly run primary positives
+for R8. All logs are under .uzi/scratch/.
+
+One removed export, unchanged primary fingerprint/status and reused provisioned
+dependencies; no installs, base/concurrent builds or full-suite/security claim.
+This credits the new retirement guard's prevention of that retained-A credential
+release request during B login. API-key A has no subscription refresh bridge:
+subscription-refresh ownership, other retired consumers, later phases, backend
+revocation and the whole-authority/m3/m4 contract remain separate and incomplete.
