@@ -864,7 +864,7 @@ func TestRunEnvWriteAgainstDeletedRepoIs404LiveDB(t *testing.T) {
 	})
 }
 
-// Deleting a repo removes its variables (every version) through the handler.
+// Deleting a (disabled) repo removes its variables, every version, by FK cascade.
 func TestRunEnvRepoDeleteRemovesVariablesLiveDB(t *testing.T) {
 	f := newEnvFixture(t)
 	f.withReceipts()

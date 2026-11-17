@@ -47,24 +47,6 @@ func (q *Queries) DeleteRunEnvVarVersion(ctx context.Context, arg DeleteRunEnvVa
 	return result.RowsAffected(), nil
 }
 
-const deleteRunEnvVarsForRepo = `-- name: DeleteRunEnvVarsForRepo :execrows
-DELETE FROM run_env_vars WHERE user_id = $1 AND repo_id = $2
-`
-
-type DeleteRunEnvVarsForRepoParams struct {
-	UserID uuid.UUID   `json:"user_id"`
-	RepoID pgtype.UUID `json:"repo_id"`
-}
-
-// Every version row of a repo scope, for the repo delete handler.
-func (q *Queries) DeleteRunEnvVarsForRepo(ctx context.Context, arg DeleteRunEnvVarsForRepoParams) (int64, error) {
-	result, err := q.db.Exec(ctx, deleteRunEnvVarsForRepo, arg.UserID, arg.RepoID)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
-}
-
 const getLiveRunEnvVarByName = `-- name: GetLiveRunEnvVarByName :one
 SELECT id, var_id, user_id, repo_id, name, secret, description, ciphertext, sealed_with, value_bytes,
        rev, retired_at, disabled_at, pending_delete_at, created_at, updated_at

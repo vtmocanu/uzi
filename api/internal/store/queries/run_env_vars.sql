@@ -35,10 +35,6 @@ FOR UPDATE;
 -- No row: the repo is gone.
 SELECT 1::int AS present FROM repos WHERE id = @repo_id FOR KEY SHARE;
 
--- name: DeleteRunEnvVarsForRepo :execrows
--- Every version row of a repo scope, for the repo delete handler.
-DELETE FROM run_env_vars WHERE user_id = @user_id AND repo_id = @repo_id;
-
 -- name: GetRunEnvScopeUsage :one
 -- What a repo scope holds against the per-scope limits: live rows and rows pending
 -- deletion count together toward both limits.
