@@ -1874,17 +1874,21 @@ the 404/409 split (comment only; no assertion changed).
 
 ### U2 — in-place success keeps flight, generation, attempt and custody (2026-11-17)
 
-Owner decision (2026-11-17, U2 only): decision 10's effect-injection
-sensitivity control is extended to the in-place success path of
+Owner decision (2026-11-17, U2 only): the effect-injection sensitivity
+control of owner Decision 10 (issue #4202 continuation packet; first applied
+as E1 above) is extended to the in-place success path of
 `attemptCodexCredentialSwitch`; it is not applied by analogy to any other unit.
 
 Baseline: `git show a233883de3c36bae2e940f999cd9d582889dad00:agent/src/runner.ts`
 :25735–25738 refused every Codex switch with `retained_stop` (see A1), so there
 was no historical in-place success path. On the candidate the success path
 (agent/src/runner.ts `attemptCodexCredentialSwitch`, :17290 onward, returning
-`return fresh ? "fresh_B" : "resumed_B";` at :17720) mutates only the existing
-flight's authority, secrets and operation scope; it calls no claim, custody,
-clone-seed or release code, so each property below holds by absence of a call.
+`return fresh ? "fresh_B" : "resumed_B";` at :17720) mutates no claim, custody,
+attempt or clone state and makes no claim, custody, clone-seed or
+claim-release call, so each property below holds by absence of a call. (It
+does mutate local state: authority, secrets, operation scope, root dispatch and
+emitter, the sequence hold, steering controllers and a new provider-epoch
+CODEX_HOME.)
 
 Injection point (traced): every control inserts exactly one statement between
 `replacementAdmissionOpen = true;` and that return, i.e. after B `finishB`,
@@ -1901,14 +1905,16 @@ five failed in setup (export lacked `.uzi/scratch` for the test's mkdtemp;
 
 | Control (effect-injection sensitivity) | Seam | Injected effect (only change) | Baseline test red at | A→B→C test |
 |---|---|---|---|---|
-| u2-claim | no new claim generation | `await this.client.claimRun().catch(() => null);` | :35233 allocationCalls `claimRun: 1` vs 0 | red: "no extra claim, clone, custody or settlement in the window" |
-| u2-attemptdir | no new attempt directory | `await fs.mkdir(join(pathDirname(flight.worktreePath!), "injected-attempt"));` | :35231 "no new attempt directory…" (`'injected-attempt'` added) | red (diagnostic wrapper) |
+| u2-claim | no claimRun call during the switch | `await this.client.claimRun().catch(() => null);` | :35233 allocationCalls `claimRun: 1` vs 0 | red: "no extra claim, clone, custody or settlement in the window" |
+| u2-attemptdir | no new attempt directory | `await fs.mkdir(join(pathDirname(flight.worktreePath!), "injected-attempt"));` | :35231 "no new attempt directory…" (`'injected-attempt'` added) | red, but not at :36375: the injected mkdir throws EEXIST on the second (B→C) switch, which holds `initialization_failed`, so the test times out at :36346; no A→B→C credit |
 | u2-custody | no custody release | `await this.client.releaseRecoveryCustody(claim.run_id, generation).catch(() => undefined);` | :35233 `releaseRecoveryCustody: 1` vs 0 | red: same window assertion |
-| u2-transition | no release/reclaim transition | `await this.client.reportState(claim.run_id, { status: "queued" } as never).catch(() => undefined);` | :35236 "no release/reclaim/hold transition…" | red: "no release/reclaim/hold state transition" |
+| u2-transition | no release/reclaim transition | `await this.client.reportState(claim.run_id, { status: "queued" } as never).catch(() => undefined);` | :35235 "no release/reclaim/hold transition…" | red: "no release/reclaim/hold state transition" |
 | u2-worktree | same flight and worktree | ``flight.worktreePath = `${flight.worktreePath}-injected`;`` | :35224 worktreePath strict equality | green: this test checks clone path, not flight.worktreePath |
 
-Every mutant exited 1. Unchanged candidate: both tests pass, 2/2, EXIT=0
-(`.uzi/scratch/ctl-logs/u2-green.log`; baseline test 3.3 s, A→B→C 1.5 s).
+Every mutant exited 1. Unchanged candidate, primary clone: both tests pass,
+2/2, EXIT=0 (`.uzi/scratch/ctl-logs/u2-green.log`, baseline test 3.3 s, A→B→C
+1.5 s; re-run with recorded HEAD in `u2-green2.log`). In the A→B→C test only
+u2-claim, u2-custody and u2-transition are red at its own assertions.
 
 Credit: each row proves that the named positive assertion detects that one
 injected effect at that seam on the real success path; it does not prove the
@@ -1916,4 +1922,14 @@ absence of other effects. Not separately controlled: a new flight object
 (only a worktree reassignment was injected), `reserveRecoveryCapture`,
 `settleRecoveryHold(Live)` and clone seeding (counted by the same
 allocationCalls assertion, no injection run), and the `fresh_B` return (same
-statement sequence; the controls ran through the resumed path).
+statement sequence; the controls ran through the resumed path). The claim
+generation assertions (:35222–35223) were not shown sensitive. A plan-revision
+`awaiting_approval` restore reachable through `restartAndResume` →
+`epochSourceAdmission` → `PlanRevisionRetry.beforeTurn` (only with an active
+silent revision) is not covered by u2-transition.
+
+Evidence-log note (2026-11-17): a validator's cleanup deleted ten earlier
+`.uzi/scratch/gate-log.*` files from this run, including the merge-unit
+`check:sqlc-drift`, the seven-test LiveDB re-verification at 79f74862d and the
+`task check:api` EXIT=0 at e2e84464c. Those results are reported from the
+transcript only; the candidate-level checks are re-run before m3 completion.
