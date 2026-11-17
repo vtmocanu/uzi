@@ -505,7 +505,7 @@ func (s *Service) CreateJobRun(ctx context.Context, p CreateJobParams) (JobView,
 		}
 		originCreatedAt, err = qq.CreateJobOrigin(ctx, origin)
 		return run, err
-	})
+	}, harnessCreationOrigin{RefuseProviderOwner: true}) // PRD #4320: jobs refuse a provider-sourced owner (PRD #4322 enables them)
 	if err != nil {
 		return JobView{}, err
 	}

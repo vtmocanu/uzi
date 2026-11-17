@@ -102,6 +102,12 @@ func (h *Handler) mountMeRoutes(r chi.Router, authLimiter *mw.Limiter) {
 			r.Get("/{id}", h.GetMyProvider)
 			r.Patch("/{id}", h.PatchMyProvider)
 			r.Post("/{id}/retire", h.RetireMyProvider)
+			// The Claude provider source (PRD #4320 M4): selecting or clearing which provider the
+			// caller's Claude runs use. RequireUser (a CLI `uzi provider use` can drive it, plan
+			// decision P1): it reveals no key and cannot move a destination, and a select is
+			// refused unless the provider is the caller's, usable and allowlisted. A static path,
+			// matched ahead of /{id}.
+			r.Put("/claude-source", h.SetMyClaudeProviderSource)
 			// The Test probe sends the stored key to the stored (allowlisted) destination and
 			// returns only two outcome words, so a Bearer caller can run it but cannot read the
 			// key or move the destination. Rate-limited by its own in-memory admission limiter.

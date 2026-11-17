@@ -21,10 +21,11 @@
 -- M5B create seam (workersvc.createRunAtomic), not the SQL literal 'claude'. CI-fix uses
 -- ordinary implicit D11 (no target-run relationship, D4); M2 wires the real resolved value.
 -- Every current caller passes string(HarnessClaude) as a mechanical stopgap.
+-- model_provider_* (PRD #4320 M4), class FRESH-RESOLVE: the five binding columns are the owner's Claude provider source frozen by workersvc.createRunAtomic (NULL = vendor run). An unstamped param is NULL = a vendor run, so createRunAtomic asserts the inserted row against its resolution. CI-fix has no source run (implicit D11), so it resolves the owner's source like a new run.
 INSERT INTO runs (
     user_id, repo_id, kind, issue_title, issue_description,
     pipeline_id, pipeline_ref, failure_snapshot, ci_config_paths, wait_on_limit, auto_approve, required_capabilities, hinted_capabilities, ignored_inferred_capabilities, trigger_source, harness, plan_cross_check_required, plan_cross_check_gated
-, code_cross_check_required, ci_config_guard, repo_agent_source_required, ci_fix_mr_iid) VALUES (
+, code_cross_check_required, ci_config_guard, repo_agent_source_required, ci_fix_mr_iid, model_provider_id, model_provider_revision, model_provider_key_mode, model_provider_key_secret_id, model_provider_key_rev) VALUES (
     -- repo_id is nullable since PRD #39 (chat runs have none); the ::uuid cast keeps
     -- this ci_fix param a non-null uuid.UUID (a ci_fix run always has a repo).
     @user_id, @repo_id::uuid, 'ci_fix', @issue_title, @issue_description,
@@ -63,7 +64,7 @@ INSERT INTO runs (
     ), true,
     -- Issue #4079: the single open PR this fix is bound to, resolved at create by
     -- workersvc.resolveCIFixBinding. NULL = unbound (no open PR on the branch).
-    sqlc.narg(ci_fix_mr_iid))
+    sqlc.narg(ci_fix_mr_iid), sqlc.narg('model_provider_id')::uuid, sqlc.narg('model_provider_revision')::int, sqlc.narg('model_provider_key_mode')::text, sqlc.narg('model_provider_key_secret_id')::uuid, sqlc.narg('model_provider_key_rev')::bigint)
 RETURNING *;
 
 -- name: ListCIFixBindingCandidates :many

@@ -22,8 +22,9 @@ WITH seed AS (
 -- harness (PRD #1332 M5A / D2): SQL literal 'claude', not a param. A chat run never folds
 -- run_usage (the fold skips kind='chat'), but every production INSERT INTO runs writes the
 -- harness explicitly anyway, so the DEFAULT can never mask an omitted origin.
-INSERT INTO runs (id, user_id, kind, issue_title, issue_description, title, trigger_source, harness)
-VALUES (@run_id, @user_id, 'chat', @issue_title, @issue_description, @title, 'chat', 'claude')
+-- model_provider_* (PRD #4320 M4), class FRESH-RESOLVE: the owner's Claude source frozen by the chat create transaction (workersvc.CreateChatRun).
+INSERT INTO runs (id, user_id, kind, issue_title, issue_description, title, trigger_source, harness, model_provider_id, model_provider_revision, model_provider_key_mode, model_provider_key_secret_id, model_provider_key_rev)
+VALUES (@run_id, @user_id, 'chat', @issue_title, @issue_description, @title, 'chat', 'claude', sqlc.narg('model_provider_id')::uuid, sqlc.narg('model_provider_revision')::int, sqlc.narg('model_provider_key_mode')::text, sqlc.narg('model_provider_key_secret_id')::uuid, sqlc.narg('model_provider_key_rev')::bigint)
 RETURNING *;
 
 -- name: CreateChatContinueRun :one
@@ -36,8 +37,9 @@ RETURNING *;
 WITH affinity AS MATERIALIZED (
  SELECT * FROM workers WHERE workers.id = sqlc.narg('worker_id')::uuid FOR UPDATE
 )
-INSERT INTO runs (user_id, kind, issue_title, issue_description, title, resume_of_run_id, worker_id, trigger_source, harness)
-VALUES (@user_id, 'chat', @issue_title, '', @title, @resume_of_run_id, (SELECT affinity.id FROM affinity WHERE fn_worker_accepts_new_intake(affinity)), 'resume', 'claude')
+-- model_provider_* (PRD #4320 M4), class INHERITED: copied verbatim from the ended chat run (workersvc.ContinueChat), never the owner's current source.
+INSERT INTO runs (user_id, kind, issue_title, issue_description, title, resume_of_run_id, worker_id, trigger_source, harness, model_provider_id, model_provider_revision, model_provider_key_mode, model_provider_key_secret_id, model_provider_key_rev)
+VALUES (@user_id, 'chat', @issue_title, '', @title, @resume_of_run_id, (SELECT affinity.id FROM affinity WHERE fn_worker_accepts_new_intake(affinity)), 'resume', 'claude', sqlc.narg('model_provider_id')::uuid, sqlc.narg('model_provider_revision')::int, sqlc.narg('model_provider_key_mode')::text, sqlc.narg('model_provider_key_secret_id')::uuid, sqlc.narg('model_provider_key_rev')::bigint)
 RETURNING *;
 
 -- name: ListChatRunsForUser :many

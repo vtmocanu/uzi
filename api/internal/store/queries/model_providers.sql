@@ -142,3 +142,43 @@ FOR UPDATE;
 -- name: DeleteProviderKeySecret :execrows
 DELETE FROM user_secrets
 WHERE user_id = $1 AND provider_id = $2 AND kind = 'anthropic_compatible_key';
+
+-- name: GetUserClaudeProviderSource :one
+-- The owner's Claude provider source with everything run creation needs to judge it usable in ONE
+-- read (PRD #4320 M4): the setting, the provider, its CURRENT revision and the provider's key row.
+-- Every join is owner-scoped, so a stored foreign id can never resolve. A NULL setting returns a
+-- row whose provider columns are all NULL (no rows only for an unknown user). Plain read: the freeze
+-- takes LockSecretMutationShared and then LockModelProviderForShare around its own re-read.
+SELECT u.claude_provider_id AS provider_id,
+       p.engine, p.current_revision, p.retired_at,
+       r.base_url, r.auth_style, r.model_map,
+       k.id AS key_secret_id, k.kind AS key_kind, k.provider_id AS key_provider_id,
+       k.disabled_at AS key_disabled_at, k.enablement_rev AS key_enablement_rev
+FROM users u
+LEFT JOIN model_providers p ON p.id = u.claude_provider_id AND p.owner_user_id = u.id
+LEFT JOIN model_provider_revisions r ON r.provider_id = p.id AND r.revision = p.current_revision
+LEFT JOIN user_secrets k ON k.user_id = u.id AND k.provider_id = p.id AND k.kind = 'anthropic_compatible_key'
+WHERE u.id = $1;
+
+-- name: GetProviderBindingKeyByID :one
+-- A bound run's frozen key, re-read at inherited creation: the secret row by id, owner-scoped.
+SELECT id, kind, provider_id, disabled_at, enablement_rev FROM user_secrets
+WHERE id = $1 AND user_id = $2;
+
+-- name: GetModelProviderRevisionForOwner :one
+-- A frozen revision of an owner's provider (inherited creation re-checks the URL against the
+-- allowlist). Owner-scoped.
+SELECT r.provider_id, r.revision, r.protocol, r.base_url, r.auth_style, r.model_map
+FROM model_provider_revisions r
+JOIN model_providers p ON p.id = r.provider_id
+WHERE r.provider_id = $1 AND r.revision = $2 AND p.owner_user_id = $3;
+
+-- name: SetUserClaudeProviderSource :one
+-- Sets or clears (NULL) the owner's Claude provider source. The CASE/narg shape of
+-- SetUserHarnessModels, not COALESCE: a NULL provider_id CLEARS the setting. The composite foreign
+-- key (users_claude_provider_fkey) rejects a provider owned by another user. Usability is checked by
+-- the caller, which holds the owner's secret-mutation lock.
+UPDATE users
+SET claude_provider_id = CASE WHEN @set_source::bool THEN sqlc.narg('provider_id')::uuid ELSE claude_provider_id END
+WHERE id = @id
+RETURNING claude_provider_id;

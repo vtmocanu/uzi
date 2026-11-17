@@ -767,7 +767,7 @@ func (q *Queries) GetUserSchedulePause(ctx context.Context, id uuid.UUID) (GetUs
 }
 
 const getUserSettings = `-- name: GetUserSettings :one
-SELECT default_model, default_effort, judge_model, codex_judge_model, summary_model, codex_summary_model, theme, sidebar_token_ids, mr_rework_enabled, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, now_summary_enabled, weekly_reserve_pct, weekly_reserve_pause_running, judge_runs_on FROM users WHERE id = $1
+SELECT default_model, default_effort, judge_model, codex_judge_model, summary_model, codex_summary_model, theme, sidebar_token_ids, mr_rework_enabled, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, now_summary_enabled, weekly_reserve_pct, weekly_reserve_pause_running, judge_runs_on, claude_provider_id FROM users WHERE id = $1
 `
 
 type GetUserSettingsRow struct {
@@ -793,6 +793,7 @@ type GetUserSettingsRow struct {
 	WeeklyReservePct          pgtype.Int2 `json:"weekly_reserve_pct"`
 	WeeklyReservePauseRunning bool        `json:"weekly_reserve_pause_running"`
 	JudgeRunsOn               pgtype.Text `json:"judge_runs_on"`
+	ClaudeProviderID          pgtype.UUID `json:"claude_provider_id"`
 }
 
 // The current user's own (non-secret) settings surface: default worker model
@@ -818,6 +819,8 @@ type GetUserSettingsRow struct {
 // usage reserve, NULL threshold = off.
 // judge_runs_on (PRD #3257) rides it too; NULL means the judge runs on the harness of the run it
 // reviews, the settings surface exposes it as nullable claude|codex.
+// claude_provider_id (PRD #4320 M4) rides it too, read-only on the settings surface: the owner's
+// Claude model-provider source (NULL = the vendor ladder); written only by PUT /me/providers/claude-source.
 func (q *Queries) GetUserSettings(ctx context.Context, id uuid.UUID) (GetUserSettingsRow, error) {
 	row := q.db.QueryRow(ctx, getUserSettings, id)
 	var i GetUserSettingsRow
@@ -844,6 +847,7 @@ func (q *Queries) GetUserSettings(ctx context.Context, id uuid.UUID) (GetUserSet
 		&i.WeeklyReservePct,
 		&i.WeeklyReservePauseRunning,
 		&i.JudgeRunsOn,
+		&i.ClaudeProviderID,
 	)
 	return i, err
 }

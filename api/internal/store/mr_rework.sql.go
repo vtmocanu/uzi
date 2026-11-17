@@ -62,7 +62,7 @@ const createAutoMRReworkRun = `-- name: CreateAutoMRReworkRun :one
 INSERT INTO runs (
     user_id, repo_id, kind, issue_title, issue_description,
     pipeline_ref, mr_iid, target_run_id, review_comments, auto_approve, wait_on_limit, required_capabilities, hinted_capabilities, ignored_inferred_capabilities, trigger_source, harness, plan_cross_check_required
-, code_cross_check_required, ci_config_guard, ci_config_paths, repo_agent_source_required)
+, code_cross_check_required, ci_config_guard, ci_config_paths, repo_agent_source_required, model_provider_id, model_provider_revision, model_provider_key_mode, model_provider_key_secret_id, model_provider_key_rev)
 SELECT
     $1, $2::uuid, 'mr_rework', $3, $4,
     $5, $6, $7, $8::jsonb, true, $9,
@@ -78,7 +78,7 @@ SELECT
     (SELECT array_agg(DISTINCT x.p ORDER BY x.p) FROM (
         SELECT unnest(g.ci_config_paths) AS p FROM runs g WHERE g.repo_id = $2::uuid AND g.ci_config_guard
           AND (g.id = $7 OR g.branch = $5 OR 'uzi/prompt-' || g.id::text = $5)
-    ) x), true
+    ) x), true, $12::uuid, $13::int, $14::text, $15::uuid, $16::bigint
 WHERE NOT EXISTS (
     SELECT 1 FROM runs
     WHERE repo_id = $2::uuid
@@ -90,17 +90,22 @@ RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, statu
 `
 
 type CreateAutoMRReworkRunParams struct {
-	UserID           uuid.UUID   `json:"user_id"`
-	RepoID           uuid.UUID   `json:"repo_id"`
-	IssueTitle       string      `json:"issue_title"`
-	IssueDescription string      `json:"issue_description"`
-	PipelineRef      pgtype.Text `json:"pipeline_ref"`
-	MrIid            pgtype.Int8 `json:"mr_iid"`
-	TargetRunID      pgtype.UUID `json:"target_run_id"`
-	ReviewComments   []byte      `json:"review_comments"`
-	WaitOnLimit      bool        `json:"wait_on_limit"`
-	TriggerSource    string      `json:"trigger_source"`
-	Harness          string      `json:"harness"`
+	UserID                   uuid.UUID   `json:"user_id"`
+	RepoID                   uuid.UUID   `json:"repo_id"`
+	IssueTitle               string      `json:"issue_title"`
+	IssueDescription         string      `json:"issue_description"`
+	PipelineRef              pgtype.Text `json:"pipeline_ref"`
+	MrIid                    pgtype.Int8 `json:"mr_iid"`
+	TargetRunID              pgtype.UUID `json:"target_run_id"`
+	ReviewComments           []byte      `json:"review_comments"`
+	WaitOnLimit              bool        `json:"wait_on_limit"`
+	TriggerSource            string      `json:"trigger_source"`
+	Harness                  string      `json:"harness"`
+	ModelProviderID          pgtype.UUID `json:"model_provider_id"`
+	ModelProviderRevision    pgtype.Int4 `json:"model_provider_revision"`
+	ModelProviderKeyMode     pgtype.Text `json:"model_provider_key_mode"`
+	ModelProviderKeySecretID pgtype.UUID `json:"model_provider_key_secret_id"`
+	ModelProviderKeyRev      pgtype.Int8 `json:"model_provider_key_rev"`
 }
 
 // Queue an mr_rework run (PRD #700 M3, sibling of CreateCIFixRun). The NAME is
@@ -142,6 +147,7 @@ type CreateAutoMRReworkRunParams struct {
 // derived mr_rework inherits its source run's harness as an explicit selection (D4); M2 wires
 // that real value — the caller passes the D11-resolved, source-run-inherited harness, not a
 // stopgap. Keep in sync with CreateManualMRReworkRunAndAdvance's body below.
+// model_provider_* (PRD #4320 M4), class INHERITED: the five binding columns are copied verbatim from the source run's row by the caller (never the owner's current source); createRunAtomic re-validates the copied binding and asserts the inserted row carries it.
 func (q *Queries) CreateAutoMRReworkRun(ctx context.Context, arg CreateAutoMRReworkRunParams) (Run, error) {
 	row := q.db.QueryRow(ctx, createAutoMRReworkRun,
 		arg.UserID,
@@ -155,6 +161,11 @@ func (q *Queries) CreateAutoMRReworkRun(ctx context.Context, arg CreateAutoMRRew
 		arg.WaitOnLimit,
 		arg.TriggerSource,
 		arg.Harness,
+		arg.ModelProviderID,
+		arg.ModelProviderRevision,
+		arg.ModelProviderKeyMode,
+		arg.ModelProviderKeySecretID,
+		arg.ModelProviderKeyRev,
 	)
 	var i Run
 	err := row.Scan(
@@ -423,9 +434,9 @@ func (q *Queries) CreateAutoMRReworkRun(ctx context.Context, arg CreateAutoMRRew
 const createManualMRReworkRunAndAdvance = `-- name: CreateManualMRReworkRunAndAdvance :one
 WITH led AS (
     INSERT INTO mr_rework_ledger (repo_id, ref, high_water, comment_marks, pending_unknown_keys)
-    SELECT $2::uuid, $5, $11,
-           mr_rework_merge_marks('{}'::jsonb, $12::jsonb),
-           mr_rework_merge_pending_keys('{}'::text[], $13::text[], $14::text[], $15::text[], $16::text[], '{}'::jsonb)
+    SELECT $2::uuid, $5, $16,
+           mr_rework_merge_marks('{}'::jsonb, $17::jsonb),
+           mr_rework_merge_pending_keys('{}'::text[], $18::text[], $19::text[], $20::text[], $21::text[], '{}'::jsonb)
     WHERE NOT EXISTS (
         SELECT 1 FROM runs
         WHERE repo_id = $2::uuid
@@ -441,13 +452,13 @@ WITH led AS (
                              ELSE mr_rework_merge_marks(mr_rework_ledger.comment_marks, EXCLUDED.comment_marks) END,
         pending_unknown_keys = CASE WHEN mr_rework_ledger.comment_marks IS NULL
                                     THEN mr_rework_ledger.pending_unknown_keys
-                                    ELSE mr_rework_merge_pending_keys(mr_rework_ledger.pending_unknown_keys, $13::text[], $14::text[], $15::text[], $16::text[], mr_rework_ledger.comment_marks) END,
+                                    ELSE mr_rework_merge_pending_keys(mr_rework_ledger.pending_unknown_keys, $18::text[], $19::text[], $20::text[], $21::text[], mr_rework_ledger.comment_marks) END,
         updated_at    = now()
 )
 INSERT INTO runs (
     user_id, repo_id, kind, issue_title, issue_description,
     pipeline_ref, mr_iid, target_run_id, review_comments, auto_approve, wait_on_limit, required_capabilities, hinted_capabilities, ignored_inferred_capabilities, trigger_source, harness, plan_cross_check_required
-, code_cross_check_required, ci_config_guard, ci_config_paths, repo_agent_source_required)
+, code_cross_check_required, ci_config_guard, ci_config_paths, repo_agent_source_required, model_provider_id, model_provider_revision, model_provider_key_mode, model_provider_key_secret_id, model_provider_key_rev)
 SELECT
     $1, $2::uuid, 'mr_rework', $3, $4,
     $5, $6, $7, $8::jsonb, true, $9,
@@ -465,7 +476,7 @@ SELECT
     (SELECT array_agg(DISTINCT x.p ORDER BY x.p) FROM (
         SELECT unnest(g.ci_config_paths) AS p FROM runs g WHERE g.repo_id = $2::uuid AND g.ci_config_guard
           AND (g.id = $7 OR g.branch = $5 OR 'uzi/prompt-' || g.id::text = $5)
-    ) x), true
+    ) x), true, $11::uuid, $12::int, $13::text, $14::uuid, $15::bigint
 WHERE NOT EXISTS (
     SELECT 1 FROM runs
     WHERE repo_id = $2::uuid
@@ -477,22 +488,27 @@ RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, statu
 `
 
 type CreateManualMRReworkRunAndAdvanceParams struct {
-	UserID              uuid.UUID   `json:"user_id"`
-	RepoID              uuid.UUID   `json:"repo_id"`
-	IssueTitle          string      `json:"issue_title"`
-	IssueDescription    string      `json:"issue_description"`
-	PipelineRef         pgtype.Text `json:"pipeline_ref"`
-	MrIid               pgtype.Int8 `json:"mr_iid"`
-	TargetRunID         pgtype.UUID `json:"target_run_id"`
-	ReviewComments      []byte      `json:"review_comments"`
-	WaitOnLimit         bool        `json:"wait_on_limit"`
-	Harness             string      `json:"harness"`
-	HighWater           int64       `json:"high_water"`
-	Marks               []byte      `json:"marks"`
-	PendingAdd          []string    `json:"pending_add"`
-	PendingRemove       []string    `json:"pending_remove"`
-	PendingSuperseded   []string    `json:"pending_superseded"`
-	PendingSupersededBy []string    `json:"pending_superseded_by"`
+	UserID                   uuid.UUID   `json:"user_id"`
+	RepoID                   uuid.UUID   `json:"repo_id"`
+	IssueTitle               string      `json:"issue_title"`
+	IssueDescription         string      `json:"issue_description"`
+	PipelineRef              pgtype.Text `json:"pipeline_ref"`
+	MrIid                    pgtype.Int8 `json:"mr_iid"`
+	TargetRunID              pgtype.UUID `json:"target_run_id"`
+	ReviewComments           []byte      `json:"review_comments"`
+	WaitOnLimit              bool        `json:"wait_on_limit"`
+	Harness                  string      `json:"harness"`
+	ModelProviderID          pgtype.UUID `json:"model_provider_id"`
+	ModelProviderRevision    pgtype.Int4 `json:"model_provider_revision"`
+	ModelProviderKeyMode     pgtype.Text `json:"model_provider_key_mode"`
+	ModelProviderKeySecretID pgtype.UUID `json:"model_provider_key_secret_id"`
+	ModelProviderKeyRev      pgtype.Int8 `json:"model_provider_key_rev"`
+	HighWater                int64       `json:"high_water"`
+	Marks                    []byte      `json:"marks"`
+	PendingAdd               []string    `json:"pending_add"`
+	PendingRemove            []string    `json:"pending_remove"`
+	PendingSuperseded        []string    `json:"pending_superseded"`
+	PendingSupersededBy      []string    `json:"pending_superseded_by"`
 }
 
 // ATOMIC on-demand (manual) mr_rework create + ledger advance (PRD #1202, review-finding
@@ -513,6 +529,7 @@ type CreateManualMRReworkRunAndAdvanceParams struct {
 // same-MR/active-branch 23505 -> whole statement aborts, ledger rolled back
 // (ErrActiveMRReworkExists/ErrBranchInUse); success -> run + ledger commit together. `ref` on
 // the ledger is the pipeline_ref (the branch), exactly as the two-step path passed it.
+// model_provider_* (PRD #4320 M4), class INHERITED: the five binding columns are copied verbatim from the source run's row by the caller (never the owner's current source); createRunAtomic re-validates the copied binding and asserts the inserted row carries it.
 func (q *Queries) CreateManualMRReworkRunAndAdvance(ctx context.Context, arg CreateManualMRReworkRunAndAdvanceParams) (Run, error) {
 	row := q.db.QueryRow(ctx, createManualMRReworkRunAndAdvance,
 		arg.UserID,
@@ -525,6 +542,11 @@ func (q *Queries) CreateManualMRReworkRunAndAdvance(ctx context.Context, arg Cre
 		arg.ReviewComments,
 		arg.WaitOnLimit,
 		arg.Harness,
+		arg.ModelProviderID,
+		arg.ModelProviderRevision,
+		arg.ModelProviderKeyMode,
+		arg.ModelProviderKeySecretID,
+		arg.ModelProviderKeyRev,
 		arg.HighWater,
 		arg.Marks,
 		arg.PendingAdd,

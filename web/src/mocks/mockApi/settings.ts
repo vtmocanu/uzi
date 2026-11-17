@@ -116,6 +116,8 @@ const SEED_USER_SETTINGS: UserSettings = {
   default_harness: null,
   // PRD #3257: per-user "Judge runs on"; null = same as the run being reviewed.
   judge_runs_on: null,
+  // PRD #4320: provider the Claude lane runs on; null = vendor Claude ladder.
+  claude_provider_id: null,
   harness_overflow_enabled: false,
   // Issue #3719: how a new Codex run chooses its login. Seeded "auto" so the demo shows the
   // pool at work (a pooled login sits in mocks/data/secrets.ts); the server's own default is

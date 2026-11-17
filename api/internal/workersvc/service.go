@@ -1512,6 +1512,12 @@ type Store interface {
 
 // Params are the runtime knobs the service needs, mirrored from config.
 type Params struct {
+	// ProviderAllowedBaseURLs and ProviderAllowLoopback (PRD #4320) mirror config's operator
+	// allowlist of model-provider base URLs. The api is the destination authority: run creation
+	// re-checks a provider source (and an inherited binding) against them. Empty = feature off,
+	// so every set source is unusable (base_url_not_allowed).
+	ProviderAllowedBaseURLs []string
+	ProviderAllowLoopback   bool
 	// CustodyHoldLimit supplies the per-owner custody admission limit (the custody_hold_limit
 	// admin setting; see CustodyHoldLimitReader). Nil means no usable value: claims refuse
 	// and the health pill reports the setting unreadable, never a fallback number.
@@ -8616,9 +8622,16 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 			// PRD #1429 M2 (D1): the AUDITOR INVARIANT — runs.harness is stamped from the D11 result
 			// createRunAtomic resolved and froze inside THIS transaction, never a hardcoded literal, so
 			// the frozen row's harness equals the harness the freeze decision used.
-			Harness:                string(resolved.Harness),
-			CapturedPlanCrossCheck: capturedCreationFlag(resolved.CreationPolicy, true),
-			CapturedCodeCrossCheck: capturedCreationFlag(resolved.CreationPolicy, false),
+			Harness: string(resolved.Harness),
+			// PRD #4320 M4: the five provider binding columns (all NULL for a vendor run). Unstamped
+			// would be a silent vendor run; createRunAtomic asserts the inserted row against the resolution.
+			ModelProviderID:          bindingOf(resolved).ProviderID,
+			ModelProviderRevision:    bindingOf(resolved).Revision,
+			ModelProviderKeyMode:     bindingOf(resolved).KeyMode,
+			ModelProviderKeySecretID: bindingOf(resolved).KeySecret,
+			ModelProviderKeyRev:      bindingOf(resolved).KeyRev,
+			CapturedPlanCrossCheck:   capturedCreationFlag(resolved.CreationPolicy, true),
+			CapturedCodeCrossCheck:   capturedCreationFlag(resolved.CreationPolicy, false),
 			// PRD #1247 / #1429 M2: the per-run credential override columns, from the effective override
 			// resolved above (rawOverride validated against resolved.Harness, or a schedule's stored
 			// credOverride written as-is). nil ⇒ NULL/NULL ⇒ inherit the worker binding.

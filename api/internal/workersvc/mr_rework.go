@@ -200,6 +200,9 @@ func (s *Service) createMRReworkRun(ctx context.Context, userID, repoID uuid.UUI
 	}
 	sourceHarness := Harness(sourceRun.Harness)
 
+	// PRD #4320: the rework is a successor of its source run, so it copies the source run's provider
+	// binding (or, for a vendor source, resolves vendor credentials without the owner's provider
+	// source), never the owner's current source.
 	run, err := s.createRunResolved(ctx, userID, &sourceHarness, func(q Store, resolved resolvedHarness) (store.Run, error) {
 		// Issue #1626: serialize against an issue-run create on the same agent branch. The
 		// run-branch lock is the closure's first statement (same (repo, ref) key the issue run
@@ -258,6 +261,13 @@ func (s *Service) createMRReworkRun(ctx context.Context, userID, repoID uuid.UUI
 				TriggerSource:    triggerSource,
 				// PRD #1429 M2 (D4): the inherited source-run harness, frozen in-tx.
 				Harness: string(resolved.Harness),
+				// PRD #4320 M4: the five provider binding columns (all NULL for a vendor run). Unstamped
+				// would be a silent vendor run; createRunAtomic asserts the inserted row against the resolution.
+				ModelProviderID:          bindingOf(resolved).ProviderID,
+				ModelProviderRevision:    bindingOf(resolved).Revision,
+				ModelProviderKeyMode:     bindingOf(resolved).KeyMode,
+				ModelProviderKeySecretID: bindingOf(resolved).KeySecret,
+				ModelProviderKeyRev:      bindingOf(resolved).KeyRev,
 			})
 			if err != nil || advance == nil {
 				return run, err
@@ -303,8 +313,15 @@ func (s *Service) createMRReworkRun(ctx context.Context, userID, repoID uuid.UUI
 			PendingSupersededBy: encodeKeys(manual.PendingSupersededBy),
 			// PRD #1429 M2 (D4): the inherited source-run harness, frozen in-tx.
 			Harness: string(resolved.Harness),
+			// PRD #4320 M4: the five provider binding columns (all NULL for a vendor run). Unstamped
+			// would be a silent vendor run; createRunAtomic asserts the inserted row against the resolution.
+			ModelProviderID:          bindingOf(resolved).ProviderID,
+			ModelProviderRevision:    bindingOf(resolved).Revision,
+			ModelProviderKeyMode:     bindingOf(resolved).KeyMode,
+			ModelProviderKeySecretID: bindingOf(resolved).KeySecret,
+			ModelProviderKeyRev:      bindingOf(resolved).KeyRev,
 		})
-	})
+	}, harnessCreationOrigin{InheritFrom: &sourceRun})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			// WHERE NOT EXISTS matched an active cross-kind ci_fix sibling on this pipeline_ref:

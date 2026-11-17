@@ -229,6 +229,10 @@ func (s *Service) SubmitPlanCrossCheck(ctx context.Context, worker store.Worker,
 			validateCrossCheckContext(locked.IssueTitle, locked.IssueDescription) != nil {
 			return store.Run{}, ErrCrossCheckRefused
 		}
+		if providerBoundRun(locked) {
+			// A provider-bound lead has no checker lane yet (PRD #4320, PRD #4322).
+			return store.Run{}, ErrProviderLaneUnsupported
+		}
 		candidate.RequiredCapabilities = applyInferredCapabilityPolicy(locked, candidate.RequiredCapabilities)
 		rebound, reboundDigest, e := bindSemanticCheckerCandidate(ctx, txq, leadID, candidate)
 		if e != nil || !bytes.Equal(reboundDigest, digest) {
@@ -287,11 +291,14 @@ func (s *Service) SubmitPlanCrossCheck(ctx context.Context, worker store.Worker,
 			return store.Run{}, fmt.Errorf("freeze owner steering: %w", e)
 		}
 		return child, nil
-	})
+	}, harnessCreationOrigin{RefuseProviderOwner: true}) // PRD #4320: cross-check refuses a provider-sourced owner (PRD #4322)
 	if errors.Is(err, errRetry) {
 		return existing, nil
 	}
-	if errors.Is(err, ErrNoCredentialForHarness) || errors.Is(err, ErrHarnessCredentialDisabled) {
+	if errors.Is(err, ErrNoCredentialForHarness) || errors.Is(err, ErrHarnessCredentialDisabled) ||
+		errors.Is(err, ErrProviderLaneUnsupported) || errors.Is(err, ErrProviderSourceUnusable) {
+		// A provider-sourced owner has no checker lane (PRD #4320): the same non-pass a missing
+		// checker credential gives, so the plan fails closed to the human gate, never auto-approves.
 		return store.CrossCheck{}, ErrCrossCheckUnavailable
 	}
 	if err != nil {

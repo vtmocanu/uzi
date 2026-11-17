@@ -55,6 +55,7 @@ const (
 	refusalOverrideUnsupported    = "credential_override_harness_unsupported"
 	refusalOverrideInvalid        = "credential_override_invalid"
 	refusalModelIncompatible      = "model_incompatible_with_harness"
+	refusalProviderSourceUnusable = "provider_source_unusable"
 	detailCredentialDisabled      = "credential_disabled" //nolint:gosec // G101: refusal-reason token, not a secret
 )
 
@@ -82,6 +83,8 @@ func (r refusal) ptrs() (token, detail *string) {
 // which the caller treats as a failure.
 func startRefusal(err error) (refusal, bool) {
 	switch {
+	case errors.Is(err, workersvc.ErrProviderSourceUnusable):
+		return refusal{Token: refusalProviderSourceUnusable}, true
 	case errors.Is(err, workersvc.ErrHarnessCredentialDisabled):
 		return refusal{refusalNoCredentialForHarness, detailCredentialDisabled}, true
 	case errors.Is(err, workersvc.ErrCodexPoolUnavailable):

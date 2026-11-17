@@ -314,7 +314,7 @@ func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 			s.judgeAfterInsertHook(ctx)
 		}
 		return judge, err
-	})
+	}, harnessCreationOrigin{RefuseProviderOwner: true}) // PRD #4320: judge refuses a provider-sourced owner (PRD #4322 enables it)
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
@@ -322,6 +322,11 @@ func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 		}
 		if errors.Is(err, errJudgeCreateIsolation) {
 			slog.Warn("judge enqueue: judge creation is not READ COMMITTED, no judge created and no skip recorded", "run", run.ID)
+			return
+		}
+		if errors.Is(err, ErrProviderLaneUnsupported) || errors.Is(err, ErrProviderSourceUnusable) {
+			// PRD #4320: a provider-sourced owner has no judge until PRD #4322; not a failure.
+			slog.Info("judge enqueue: owner's Claude source is a model provider, no judge created", "run", run.ID, "error", err)
 			return
 		}
 		if reason, ok := judgeSkipReasonFor(err); ok {

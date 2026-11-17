@@ -174,6 +174,76 @@ func (q *Queries) GetModelProviderRevision(ctx context.Context, arg GetModelProv
 	return i, err
 }
 
+const getModelProviderRevisionForOwner = `-- name: GetModelProviderRevisionForOwner :one
+SELECT r.provider_id, r.revision, r.protocol, r.base_url, r.auth_style, r.model_map
+FROM model_provider_revisions r
+JOIN model_providers p ON p.id = r.provider_id
+WHERE r.provider_id = $1 AND r.revision = $2 AND p.owner_user_id = $3
+`
+
+type GetModelProviderRevisionForOwnerParams struct {
+	ProviderID  uuid.UUID `json:"provider_id"`
+	Revision    int32     `json:"revision"`
+	OwnerUserID uuid.UUID `json:"owner_user_id"`
+}
+
+type GetModelProviderRevisionForOwnerRow struct {
+	ProviderID uuid.UUID `json:"provider_id"`
+	Revision   int32     `json:"revision"`
+	Protocol   string    `json:"protocol"`
+	BaseUrl    string    `json:"base_url"`
+	AuthStyle  string    `json:"auth_style"`
+	ModelMap   []byte    `json:"model_map"`
+}
+
+// A frozen revision of an owner's provider (inherited creation re-checks the URL against the
+// allowlist). Owner-scoped.
+func (q *Queries) GetModelProviderRevisionForOwner(ctx context.Context, arg GetModelProviderRevisionForOwnerParams) (GetModelProviderRevisionForOwnerRow, error) {
+	row := q.db.QueryRow(ctx, getModelProviderRevisionForOwner, arg.ProviderID, arg.Revision, arg.OwnerUserID)
+	var i GetModelProviderRevisionForOwnerRow
+	err := row.Scan(
+		&i.ProviderID,
+		&i.Revision,
+		&i.Protocol,
+		&i.BaseUrl,
+		&i.AuthStyle,
+		&i.ModelMap,
+	)
+	return i, err
+}
+
+const getProviderBindingKeyByID = `-- name: GetProviderBindingKeyByID :one
+SELECT id, kind, provider_id, disabled_at, enablement_rev FROM user_secrets
+WHERE id = $1 AND user_id = $2
+`
+
+type GetProviderBindingKeyByIDParams struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+type GetProviderBindingKeyByIDRow struct {
+	ID            uuid.UUID          `json:"id"`
+	Kind          string             `json:"kind"`
+	ProviderID    pgtype.UUID        `json:"provider_id"`
+	DisabledAt    pgtype.Timestamptz `json:"disabled_at"`
+	EnablementRev int64              `json:"enablement_rev"`
+}
+
+// A bound run's frozen key, re-read at inherited creation: the secret row by id, owner-scoped.
+func (q *Queries) GetProviderBindingKeyByID(ctx context.Context, arg GetProviderBindingKeyByIDParams) (GetProviderBindingKeyByIDRow, error) {
+	row := q.db.QueryRow(ctx, getProviderBindingKeyByID, arg.ID, arg.UserID)
+	var i GetProviderBindingKeyByIDRow
+	err := row.Scan(
+		&i.ID,
+		&i.Kind,
+		&i.ProviderID,
+		&i.DisabledAt,
+		&i.EnablementRev,
+	)
+	return i, err
+}
+
 const getProviderKeyForUpdate = `-- name: GetProviderKeyForUpdate :one
 SELECT id, disabled_at, enablement_rev FROM user_secrets
 WHERE user_id = $1 AND provider_id = $2 AND kind = 'anthropic_compatible_key'
@@ -196,6 +266,59 @@ func (q *Queries) GetProviderKeyForUpdate(ctx context.Context, arg GetProviderKe
 	row := q.db.QueryRow(ctx, getProviderKeyForUpdate, arg.UserID, arg.ProviderID)
 	var i GetProviderKeyForUpdateRow
 	err := row.Scan(&i.ID, &i.DisabledAt, &i.EnablementRev)
+	return i, err
+}
+
+const getUserClaudeProviderSource = `-- name: GetUserClaudeProviderSource :one
+SELECT u.claude_provider_id AS provider_id,
+       p.engine, p.current_revision, p.retired_at,
+       r.base_url, r.auth_style, r.model_map,
+       k.id AS key_secret_id, k.kind AS key_kind, k.provider_id AS key_provider_id,
+       k.disabled_at AS key_disabled_at, k.enablement_rev AS key_enablement_rev
+FROM users u
+LEFT JOIN model_providers p ON p.id = u.claude_provider_id AND p.owner_user_id = u.id
+LEFT JOIN model_provider_revisions r ON r.provider_id = p.id AND r.revision = p.current_revision
+LEFT JOIN user_secrets k ON k.user_id = u.id AND k.provider_id = p.id AND k.kind = 'anthropic_compatible_key'
+WHERE u.id = $1
+`
+
+type GetUserClaudeProviderSourceRow struct {
+	ProviderID       pgtype.UUID        `json:"provider_id"`
+	Engine           pgtype.Text        `json:"engine"`
+	CurrentRevision  pgtype.Int4        `json:"current_revision"`
+	RetiredAt        pgtype.Timestamptz `json:"retired_at"`
+	BaseUrl          pgtype.Text        `json:"base_url"`
+	AuthStyle        pgtype.Text        `json:"auth_style"`
+	ModelMap         []byte             `json:"model_map"`
+	KeySecretID      pgtype.UUID        `json:"key_secret_id"`
+	KeyKind          pgtype.Text        `json:"key_kind"`
+	KeyProviderID    pgtype.UUID        `json:"key_provider_id"`
+	KeyDisabledAt    pgtype.Timestamptz `json:"key_disabled_at"`
+	KeyEnablementRev pgtype.Int8        `json:"key_enablement_rev"`
+}
+
+// The owner's Claude provider source with everything run creation needs to judge it usable in ONE
+// read (PRD #4320 M4): the setting, the provider, its CURRENT revision and the provider's key row.
+// Every join is owner-scoped, so a stored foreign id can never resolve. A NULL setting returns a
+// row whose provider columns are all NULL (no rows only for an unknown user). Plain read: the freeze
+// takes LockSecretMutationShared and then LockModelProviderForShare around its own re-read.
+func (q *Queries) GetUserClaudeProviderSource(ctx context.Context, id uuid.UUID) (GetUserClaudeProviderSourceRow, error) {
+	row := q.db.QueryRow(ctx, getUserClaudeProviderSource, id)
+	var i GetUserClaudeProviderSourceRow
+	err := row.Scan(
+		&i.ProviderID,
+		&i.Engine,
+		&i.CurrentRevision,
+		&i.RetiredAt,
+		&i.BaseUrl,
+		&i.AuthStyle,
+		&i.ModelMap,
+		&i.KeySecretID,
+		&i.KeyKind,
+		&i.KeyProviderID,
+		&i.KeyDisabledAt,
+		&i.KeyEnablementRev,
+	)
 	return i, err
 }
 
@@ -486,6 +609,30 @@ func (q *Queries) RetireModelProvider(ctx context.Context, arg RetireModelProvid
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const setUserClaudeProviderSource = `-- name: SetUserClaudeProviderSource :one
+UPDATE users
+SET claude_provider_id = CASE WHEN $1::bool THEN $2::uuid ELSE claude_provider_id END
+WHERE id = $3
+RETURNING claude_provider_id
+`
+
+type SetUserClaudeProviderSourceParams struct {
+	SetSource  bool        `json:"set_source"`
+	ProviderID pgtype.UUID `json:"provider_id"`
+	ID         uuid.UUID   `json:"id"`
+}
+
+// Sets or clears (NULL) the owner's Claude provider source. The CASE/narg shape of
+// SetUserHarnessModels, not COALESCE: a NULL provider_id CLEARS the setting. The composite foreign
+// key (users_claude_provider_fkey) rejects a provider owned by another user. Usability is checked by
+// the caller, which holds the owner's secret-mutation lock.
+func (q *Queries) SetUserClaudeProviderSource(ctx context.Context, arg SetUserClaudeProviderSourceParams) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, setUserClaudeProviderSource, arg.SetSource, arg.ProviderID, arg.ID)
+	var claude_provider_id pgtype.UUID
+	err := row.Scan(&claude_provider_id)
+	return claude_provider_id, err
 }
 
 const upsertModelProviderProbeResult = `-- name: UpsertModelProviderProbeResult :execrows

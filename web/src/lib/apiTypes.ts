@@ -307,7 +307,7 @@ type EffectiveCredentialSource =
 type EffectiveRefusal =
   | "no_credential_for_harness" | "no_usable_credential" | "credential_disabled" | "credential_not_found"
   | "credential_override_harness_unsupported" | "credential_override_invalid"
-  | "model_incompatible_with_harness";
+  | "model_incompatible_with_harness" | "provider_source_unusable";
 type EffectiveRefusalDetail = "credential_disabled" | "codex_pool_unavailable";
 type EffectiveModelSetting = "worker_model" | "judge_model" | "summary_model" | "task_review_model" | "cross_check_plan" | "cross_check_code";
 type EffectiveEffortSetting = "worker_effort" | "task_review_effort" | "cross_check_plan" | "cross_check_code";
@@ -590,6 +590,10 @@ export interface UserSettings {
   /** Per-user "Judge runs on" (PRD #3257); null = same as the run being reviewed. One of
    *  claude|codex when set. Always present on the wire, like default_harness. */
   judge_runs_on: Harness | null;
+  /** Provider the Claude lane runs on (PRD #4320); null = the vendor Claude ladder. Always on the
+   *  wire; typed optional so pre-feature fixtures stay valid until the UI milestone. Read-only
+   *  on the settings PUT: it is set by PUT /api/me/providers/claude-source. */
+  claude_provider_id?: string | null;
 }
 
 // UserSettingsPatch is the PATCH-like body of PUT /me/settings: a field present
@@ -2589,6 +2593,12 @@ export type ScheduleSkipReason =
   | "no_usable_credential"
   | "credential_disabled"
   | "codex_pool_unavailable"
+  | "provider_source_unusable"
+  | "provider_lane_unsupported"
+  | "provider_model_unmapped"
+  | "provider_binding_stale"
+  | "provider_destination_not_allowed"
+  | "credential_override_provider_source"
   | "ci_green"
   | "ci_already_handled"
   | "ci_halted_no_progress"

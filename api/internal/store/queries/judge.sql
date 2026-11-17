@@ -17,8 +17,9 @@
 -- create seam (workersvc.createRunAtomic), not the SQL literal 'claude'. The caller passes the
 -- judge's resolved harness (#3257): the owner's explicit "Judge runs on" choice when set,
 -- otherwise the target run's harness as an explicit selection (PRD #1429 D4).
-INSERT INTO runs (user_id, kind, target_run_id, issue_title, issue_description, status, trigger_source, harness)
-VALUES (@user_id, 'judge', @target_run_id, @issue_title, @issue_description, 'queued', @trigger_source, @harness)
+-- model_provider_key_mode (PRD #4320 M4), class REFUSED-LANE: written as an explicit NULL because this lane does not support provider-sourced runs yet (PRD #4322); workersvc refuses provider_lane_unsupported BEFORE this INSERT for a provider-sourced owner.
+INSERT INTO runs (user_id, kind, target_run_id, issue_title, issue_description, status, trigger_source, harness, model_provider_key_mode)
+VALUES (@user_id, 'judge', @target_run_id, @issue_title, @issue_description, 'queued', @trigger_source, @harness, NULL::text)
 RETURNING *;
 
 -- name: LastJudgeEnqueuedAt :one

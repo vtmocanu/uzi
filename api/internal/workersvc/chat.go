@@ -499,17 +499,69 @@ func (s *Service) CreateChatRun(ctx context.Context, userID uuid.UUID, message s
 		return store.Run{}, err
 	}
 	title := deriveChatTitle(message)
-	run, err := s.q.CreateChatRun(ctx, store.CreateChatRunParams{
+	params := store.CreateChatRunParams{
 		RunID:            uuid.New(),
 		UserID:           userID,
 		IssueTitle:       title,
 		IssueDescription: message,
 		Title:            pgconv.TextOrNull(title),
-	})
+	}
+	// PRD #4320: a chat is Claude-only, so the owner's Claude source decides. NULL is today's
+	// non-transactional insert with no binding (byte-identical); a set source (usable or not)
+	// needs the freeze transaction, and an unusable one is a typed refusal, never a vendor chat.
+	if r, ok := s.q.(providerSourceReader); ok {
+		src, err := s.claudeProviderSource(ctx, r, userID)
+		if err != nil {
+			return store.Run{}, err
+		}
+		if src.Set() {
+			run, err := s.createChatRunBound(ctx, params)
+			if err != nil {
+				return store.Run{}, err
+			}
+			logRunCreated(run)
+			return run, nil
+		}
+	}
+	run, err := s.q.CreateChatRun(ctx, params)
 	if err != nil {
 		return store.Run{}, err
 	}
 	logRunCreated(run)
+	return run, nil
+}
+
+// createChatRunBound creates a provider-sourced chat in one transaction: the freeze locks and
+// re-validation, the insert carrying the five binding columns, the binding assertion and the
+// model-map check (the chat lead model: the owner's Claude lane default, else the sonnet alias).
+func (s *Service) createChatRunBound(ctx context.Context, params store.CreateChatRunParams) (store.Run, error) {
+	if s.txBeginner == nil {
+		return store.Run{}, errProviderCreateRequiresTx
+	}
+	tx, err := s.txBeginner.Begin(ctx)
+	if err != nil {
+		return store.Run{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	qtx := store.New(tx)
+	frozen, err := s.freezeProviderSource(ctx, tx, qtx, params.UserID)
+	if err != nil {
+		return store.Run{}, err
+	}
+	res := resolvedHarness{Harness: HarnessClaude, ClaudeSourceSet: true, ProviderSource: &frozen}
+	b := bindingOf(res)
+	params.ModelProviderID, params.ModelProviderRevision, params.ModelProviderKeyMode = b.ProviderID, b.Revision, b.KeyMode
+	params.ModelProviderKeySecretID, params.ModelProviderKeyRev = b.KeySecret, b.KeyRev
+	run, err := qtx.CreateChatRun(ctx, params)
+	if err != nil {
+		return store.Run{}, err
+	}
+	if err := s.verifyRunBinding(ctx, qtx, run, res); err != nil {
+		return store.Run{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return store.Run{}, err
+	}
 	return run, nil
 }
 
@@ -626,17 +678,65 @@ func (s *Service) ContinueChat(ctx context.Context, userID, runID uuid.UUID) (st
 	if !title.Valid {
 		title = pgconv.TextOrNull(src.IssueTitle)
 	}
-	run, err := s.q.CreateChatContinueRun(ctx, store.CreateChatContinueRunParams{
+	params := store.CreateChatContinueRunParams{
 		UserID:        userID,
 		IssueTitle:    src.IssueTitle,
 		Title:         title,
 		ResumeOfRunID: pgconv.UUID(src.ID),
 		WorkerID:      src.WorkerID, // affinity to the worker whose disk holds the session (may be NULL)
-	})
+	}
+	if providerBoundRun(src) {
+		// PRD #4320 inheritance: the continuation uses the ended chat's frozen binding (re-validated
+		// first), never the owner's current source.
+		run, err := s.continueChatBound(ctx, src, params)
+		if err != nil {
+			return store.Run{}, err
+		}
+		logRunCreated(run)
+		return run, nil
+	}
+	run, err := s.q.CreateChatContinueRun(ctx, params)
 	if err != nil {
 		return store.Run{}, err
 	}
 	logRunCreated(run)
+	return run, nil
+}
+
+// continueChatBound inserts the continuation of a provider-bound chat in one transaction, with the
+// source run's binding copied verbatim after re-validation (provider_binding_stale,
+// provider_destination_not_allowed).
+func (s *Service) continueChatBound(ctx context.Context, src store.Run, params store.CreateChatContinueRunParams) (store.Run, error) {
+	if s.txBeginner == nil {
+		return store.Run{}, errProviderCreateRequiresTx
+	}
+	tx, err := s.txBeginner.Begin(ctx)
+	if err != nil {
+		return store.Run{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	qtx := store.New(tx)
+	bound, err := s.inheritProviderBinding(ctx, tx, qtx, src)
+	if err != nil {
+		return store.Run{}, err
+	}
+	res := resolvedHarness{Harness: HarnessClaude, ClaudeSourceSet: true, ProviderSource: &bound}
+	b := bindingOf(res)
+	if b != bindingOfRun(src) {
+		return store.Run{}, errProviderBindingMismatch
+	}
+	params.ModelProviderID, params.ModelProviderRevision, params.ModelProviderKeyMode = b.ProviderID, b.Revision, b.KeyMode
+	params.ModelProviderKeySecretID, params.ModelProviderKeyRev = b.KeySecret, b.KeyRev
+	run, err := qtx.CreateChatContinueRun(ctx, params)
+	if err != nil {
+		return store.Run{}, err
+	}
+	if err := s.verifyRunBinding(ctx, qtx, run, res); err != nil {
+		return store.Run{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return store.Run{}, err
+	}
 	return run, nil
 }
 

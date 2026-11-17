@@ -13,5 +13,19 @@ ALTER TABLE users ADD CONSTRAINT users_claude_provider_fkey
 
 -- +goose Down
 SET LOCAL lock_timeout = '5s';
+-- Refuse rather than silently clear a user's provider source (the 00198 convention): dropping the
+-- column would turn every selected source into a vendor fallback, which D12 forbids.
+-- +goose StatementBegin
+DO $$
+DECLARE
+    n bigint;
+BEGIN
+    SELECT count(*) INTO n FROM users WHERE claude_provider_id IS NOT NULL;
+    IF n > 0 THEN
+        RAISE EXCEPTION 'refusing to roll back 00469: % user(s) still have a Claude provider source selected; clear it explicitly before downgrading', n;
+    END IF;
+END
+$$;
+-- +goose StatementEnd
 ALTER TABLE users DROP CONSTRAINT users_claude_provider_fkey;
 ALTER TABLE users DROP COLUMN claude_provider_id;

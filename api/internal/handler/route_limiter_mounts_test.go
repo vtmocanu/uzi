@@ -314,6 +314,7 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/admin/users/{id}/reset-link", noLimiter},
 	{"POST", "/api/admin/egress-profiles", noLimiter},
 	{"PUT", "/api/admin/egress-profiles/{name}", noLimiter},
+	{"PUT", "/api/me/providers/claude-source", noLimiter},
 	{"PUT", "/api/me/providers/{id}/key", noLimiter},
 	{"DELETE", "/api/admin/egress-profiles/{name}", noLimiter},
 	// PRD #685 M1: admin clear of a branding logo — cookie-only admin DB delete, no

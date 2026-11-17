@@ -285,6 +285,9 @@ func (h *Handler) writeCredentialOverrideError(w http.ResponseWriter, err error)
 		httpx.Error(w, http.StatusNotFound, "credential override token not found")
 	case errors.Is(err, workersvc.ErrCredentialOverrideLaneNotSwitchable):
 		httpx.Error(w, http.StatusConflict, "this run's lane does not support a credential override")
+	case errors.Is(err, workersvc.ErrCredentialOverrideProviderSource):
+		// PRD #4320 D8: checked before the codex wording below, which it wraps.
+		httpx.Error(w, http.StatusUnprocessableEntity, "a credential override is not supported while your Claude source is a model provider")
 	case errors.Is(err, workersvc.ErrCredentialOverrideHarnessUnsupported):
 		httpx.Error(w, http.StatusUnprocessableEntity, "a credential override is not supported on the codex harness")
 	case errors.Is(err, workersvc.ErrCredentialOverridePinnedNeedsSecret):
@@ -393,6 +396,9 @@ func (h *Handler) writeStartRunError(w http.ResponseWriter, r *http.Request, err
 			"violations": ge.Findings,
 		})
 		return
+	}
+	if writeProviderCreateRefusal(w, err) {
+		return // PRD #4320: provider_source_unusable, provider_model_unmapped, provider_lane_unsupported, ...
 	}
 	switch {
 	case errors.Is(err, workersvc.ErrContinuedIssueNotFound):

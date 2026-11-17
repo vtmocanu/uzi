@@ -29,6 +29,20 @@ ALTER TABLE runs ADD CONSTRAINT runs_model_provider_exclusive_check
 
 -- +goose Down
 SET LOCAL lock_timeout = '5s';
+-- Refuse rather than silently drop a bound run's frozen provider binding (the 00198 convention):
+-- the run would read back as a vendor run.
+-- +goose StatementBegin
+DO $$
+DECLARE
+    n bigint;
+BEGIN
+    SELECT count(*) INTO n FROM runs WHERE model_provider_id IS NOT NULL;
+    IF n > 0 THEN
+        RAISE EXCEPTION 'refusing to roll back 00471: % run(s) are still bound to a model provider; delete them explicitly before downgrading', n;
+    END IF;
+END
+$$;
+-- +goose StatementEnd
 ALTER TABLE runs
     DROP CONSTRAINT runs_model_provider_exclusive_check,
     DROP CONSTRAINT runs_model_provider_binding_check,

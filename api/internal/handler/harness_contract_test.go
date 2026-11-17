@@ -51,6 +51,11 @@ func (d overrideContractDB) QueryRow(_ context.Context, sql string, _ ...any) pg
 		// ResolveCredentialOverride, which only distinguishes found vs pgx.ErrNoRows).
 		return fakeScanRow{func(...any) error { return nil }}
 	}
+	if strings.Contains(sql, "name: GetUserClaudeProviderSource") {
+		// PRD #4320: the owner has no Claude provider source (every column NULL), so the validator
+		// keeps its vendor behaviour. Scan leaves the zero value, which is that NULL row.
+		return fakeScanRow{func(...any) error { return nil }}
+	}
 	d.t.Errorf("unexpected query reached: %s", sql)
 	return fakeScanRow{func(...any) error { return pgx.ErrNoRows }}
 }

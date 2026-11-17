@@ -615,7 +615,15 @@ func credentialRequirementMet(ctx context.Context, q *store.Queries, run store.L
 // causes a terminal failure.
 func (s *Service) credentialsResetRequirementMet(ctx context.Context, q *store.Queries, run store.LockCredentialDisabledRunForPromotionRow) (bool, error) {
 	harness := Harness(run.Harness)
-	_, err := s.resolveRunHarnessQ(ctx, run.UserID, &harness, q)
+	// PRD #4320: a provider-bound run does not depend on a vendor credential, and a held run's
+	// requirement is its own lineage's, never the owner's CURRENT provider source: a bound run is
+	// released (its claim re-validates the frozen binding), a vendor run is resolved vendor-only.
+	if bound, berr := q.GetRunByID(ctx, run.ID); berr != nil {
+		return false, fmt.Errorf("credentials_reset requirement: read run: %w", berr)
+	} else if providerBoundRun(bound) {
+		return true, nil
+	}
+	_, err := s.resolveRunHarnessMode(ctx, run.UserID, &harness, q, true)
 	switch {
 	case err == nil:
 		return true, nil

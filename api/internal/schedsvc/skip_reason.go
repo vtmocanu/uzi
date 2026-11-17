@@ -118,6 +118,23 @@ const (
 	// (holdsOnceCredentialDisabled) until the owner fixes the pool.
 	SkipCodexPoolUnavailable SkipReason = "codex_pool_unavailable"
 
+	// PRD #4320 M4: the owner's Claude source is a model provider and the fire was refused at the
+	// run-creation seam. Each reason is the workersvc sentinel's literal token. All are benign and
+	// advancing (the fire starts no run and never falls back to a vendor credential or the other
+	// engine); a recurring row re-fires next cadence once the owner repairs the provider.
+	// provider_source_unusable ← ErrProviderSourceUnusable (retired, URL off the allowlist, key
+	// missing or disabled); provider_lane_unsupported ← ErrProviderLaneUnsupported (judge, job,
+	// cross-check or isolated run); provider_model_unmapped ← ErrProviderModelUnmapped;
+	// provider_binding_stale / provider_destination_not_allowed ← the inherited-binding re-check;
+	// credential_override_provider_source ← ErrCredentialOverrideProviderSource (a stored
+	// credential override cannot ride a provider-sourced owner).
+	SkipProviderSourceUnusable           SkipReason = "provider_source_unusable"
+	SkipProviderLaneUnsupported          SkipReason = "provider_lane_unsupported"
+	SkipProviderModelUnmapped            SkipReason = "provider_model_unmapped"
+	SkipProviderBindingStale             SkipReason = "provider_binding_stale"
+	SkipProviderDestinationNotAllowed    SkipReason = "provider_destination_not_allowed"
+	SkipCredentialOverrideProviderSource SkipReason = "credential_override_provider_source" //nolint:gosec // G101: a skip-reason VOCABULARY value, not a credential.
+
 	// The ci_watch fire path (PRD #2865). Each is benign: the schedule advances and the
 	// next cadence tries again. ci_green: every watched workflow's newest completed
 	// execution succeeded. ci_already_handled: this execution was already handled, and a
@@ -166,6 +183,12 @@ var AllSkipReasons = []SkipReason{
 	SkipNoUsableCredential,
 	SkipCredentialDisabled,
 	SkipCodexPoolUnavailable,
+	SkipProviderSourceUnusable,
+	SkipProviderLaneUnsupported,
+	SkipProviderModelUnmapped,
+	SkipProviderBindingStale,
+	SkipProviderDestinationNotAllowed,
+	SkipCredentialOverrideProviderSource,
 	SkipCIGreen,
 	SkipCIAlreadyHandled,
 	SkipCIHaltedNoProgress,
@@ -209,6 +232,20 @@ func skipReasonForErr(err error) (SkipReason, bool) {
 		return SkipDescriptionTooLarge, true
 	case errors.Is(err, workersvc.ErrOpenMRExists):
 		return SkipOpenMRExists, true
+	case errors.Is(err, workersvc.ErrCredentialOverrideProviderSource):
+		// PRD #4320 D8. Checked BEFORE the harness-unsupported arm below, which this sentinel
+		// wraps: otherwise it would be mislabelled as a Codex override conflict.
+		return SkipCredentialOverrideProviderSource, true
+	case errors.Is(err, workersvc.ErrProviderSourceUnusable):
+		return SkipProviderSourceUnusable, true
+	case errors.Is(err, workersvc.ErrProviderLaneUnsupported):
+		return SkipProviderLaneUnsupported, true
+	case errors.Is(err, workersvc.ErrProviderModelUnmapped):
+		return SkipProviderModelUnmapped, true
+	case errors.Is(err, workersvc.ErrProviderBindingStale):
+		return SkipProviderBindingStale, true
+	case errors.Is(err, workersvc.ErrProviderDestinationNotAllowed):
+		return SkipProviderDestinationNotAllowed, true
 	case errors.Is(err, workersvc.ErrCredentialOverrideHarnessUnsupported):
 		// PRD #1429 M2 (D5): a stored Anthropic override that reached the create seam on a run
 		// resolving to Codex. The scheduler's fire-time gate normally catches this first, but the
