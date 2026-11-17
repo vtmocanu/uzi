@@ -843,6 +843,25 @@ describe("protection arriving in another store between the nomination and the lo
       untouched(s);
     } finally { second.cleanup(); }
   });
+
+  // The custody stores (not the bares' config) are read only by the locked examine, so a record there naming only the
+  // binding's clone path (never the parent) is invisible to the nomination and to the re-read of the bares inside S.
+  const storeRecord = (name: string, body: unknown): void => {
+    const dir = path.join(w.fx.dataDir, "recovery");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, name), JSON.stringify(body));
+  };
+
+  it("a recovery-store record arriving after the nomination that names only the clone path keeps the parent", async () => {
+    const s = w.seed();
+    w.beforeB = () => { storeRecord("late.json", { runId: "x", clonePath: s.clonePath }); };
+    const result = await w.run();
+    assert.equal(kept(result, s.name)?.reason, "protected_by_retained_source");
+    assert.equal(w.spawns.length, 0);
+    assert.equal(w.phaseOf(s.uuid), "settled");
+    untouched(s);
+  });
+
 });
 
 describe("budget inside the locked section", PROC, () => {
