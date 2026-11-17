@@ -241,7 +241,7 @@ binding. The amendment of 2026-11-06 above is unaffected.
   or other-filesystem leaves; leaves a Docker bind source or a protected recovery record
   references; leaves a visible process holds open or uses as its cwd; `uzi-quiesce-*` helper leaves; and
   any leaf whose newest subtree ctime is at or after the pod-entry fence (record ctime minus 2 s);
-  and any leaf whose census was incomplete (a cap, the deadline or an unreadable entry). At most 512 leaves are admitted per pass, in name order.
+  and any leaf whose census was incomplete (a cap, the deadline or an unreadable entry). At most 512 leaves are admitted per pass: non-run leaves first in name order, then `run-<uuid>` leaves (see the 2026-11-17 amendment below).
 - **Deletion.** Top-level leaves are censused read-only as the runner uid, then deleted one at a
   time. Before each delete the mounts, daemon inventory, leaf census, idle proof and process
   holders are re-read; a changed leaf is kept and a failed re-read stops the phase or ends the
@@ -345,3 +345,36 @@ retired ledger, emptiness, age or the parent name grant nothing. The legacy
 stderr-proof repair (#4141, landed via #4152) does not certify remnants created
 by older code retroactively, and #4137 is a distinct residual. Reclaim remains
 open on #4143 pending a durable parent-binding design.
+
+## Amendment (2026-11-17, #4420)
+
+Claude issue-run flights now launch with a run-owned `TMPDIR` leaf `run-<runId>` under
+the scratch root, and the scratch phase may reclaim such a leaf. The authority, exclusion
+and settlement protections of the 2026-11-10 amendment are unchanged. A `run-<uuid>` leaf
+is additionally kept unless the server lifecycle is terminal, the run has zero open
+holds and every local retention source has ended (`classifyEpochScratchRunRetention` in
+`agent/src/git.ts`, `agent/src/pod-epoch-run-retention.ts`, outbox check in
+`agent/src/pod-epoch-reclaim.ts`). Non-run leaves take the 512 admission slots first.
+
+Owner decisions:
+
+1. **`uzi-trackowner.<branch>.owner` is not leaf retention.** It is seed provenance for
+   `refs/uzi-runner/<branch>`: written by `promoteTrackingUnderLock` and the attempt
+   repair (both call `runnerTrackingOwnerKey` in `agent/src/git.ts`), read by
+   `readTrackingOwner` through `checkedTrackingOwner`, and preserved by
+   `cleanupRecoveryGeneration`. It neither keeps nor releases a TMPDIR leaf;
+   `scanRunBareConfig` ignores the `uzi-trackowner.` family on purpose.
+2. **Authority slot.** A slot in state `ineligible` or `retired` with pending, retiring
+   and publication all null counts as ended only together with the verified missing
+   footprint, read through a read-only accessor over `peekAuthoritySlot`
+   (`judgeAuthoritySlot`). Any other state, any non-null field or an unreadable slot keeps.
+
+Consequence: the hibernation census reports `run-<uuid>` leaves as protected
+(`run_scratch`), so the hibernation retirement dry-run evaluator
+(`api/internal/workersvc/hibernation_retirement.go`, `entryBlocker`) records a
+`protected_source` blocker for such a worker until its next pod start reclaims the leaves.
+
+Deferred, not shipped: deletion at run end (no fence against sibling runner-uid writers
+or Docker-created mounts after the listing, the #4043 deferral), startup throughput,
+run-procs and cache-cap attribution of the leaf; retained-discovery overflow keeps all
+run leaves for that pass; runs reassigned to another worker are kept on the old worker.
