@@ -5,7 +5,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, ApiError, isVaultLocked, type RunEnvList, type RunEnvVar, type RunEnvWriteInput } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
-import { Alert, Badge, Button, Input, Toggle } from "./ui";
+import { Alert, Badge, Button, Input, Textarea, Toggle } from "./ui";
 
 const VAULT_LOCKED = "Your vault is locked — unlock it with the banner above, then save again.";
 
@@ -308,11 +308,17 @@ export function RepoEnvPanel({
               <label htmlFor="env-value" className="text-xs text-muted">
                 Value
               </label>
-              <Input
+              {/* A textarea keeps line breaks exactly (PEM keys, JSON credentials); a secret is
+                  concealed by CSS masking, since a password input would strip them. */}
+              <Textarea
                 id="env-value"
-                type={draft.secret ? "password" : "text"}
+                rows={3}
+                wrap="off"
                 value={draft.value}
-                autoComplete="new-password"
+                className={draft.secret ? "font-mono [-webkit-text-security:disc]" : "font-mono"}
+                autoComplete="off"
+                autoCorrect="off"
+                autoCapitalize="off"
                 spellCheck={false}
                 placeholder={draft.editing?.secret ? "Leave empty to keep the stored value" : undefined}
                 onChange={(e) => setDraft({ ...draft, value: e.target.value })}

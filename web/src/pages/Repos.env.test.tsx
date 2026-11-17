@@ -168,6 +168,40 @@ describe("Repos environment variables panel", () => {
     expect((document.body.innerHTML.match(new RegExp(SECRET_VALUE, "g")) ?? []).length).toBe(0);
   });
 
+  const PEM = ["-----BEGIN KEY-----", "  MIIBVgIBADAN", "", "\tindented-tab", "-----END KEY-----", ""].join("\n");
+  it.each([
+    ["single-line secret", "one-line-value", true],
+    ["multiline secret", PEM, true],
+    ["single-line plain", "one-line-value", false],
+    ["multiline plain", PEM, false],
+  ])("submits a %s byte-exact", async (_label, text, secret) => {
+    mockApi.putRepoEnv.mockResolvedValue({ variable: envVar({ name: "MULTI", secret, value: null }) });
+    const panel = await openPanel();
+    fireEvent.click(within(panel).getByRole("button", { name: "Add variable" }));
+    if (!secret) fireEvent.click(within(panel).getByRole("switch", { name: "Secret" }));
+    fireEvent.change(within(panel).getByLabelText("Name"), { target: { value: "MULTI" } });
+    fireEvent.change(within(panel).getByLabelText("Value"), { target: { value: text } });
+    fireEvent.click(within(panel).getByRole("button", { name: "Save variable" }));
+    await waitFor(() => expect(mockApi.putRepoEnv).toHaveBeenCalled());
+    const sent = mockApi.putRepoEnv.mock.calls[0][2];
+    expect(sent.value).toBe(text);
+    expect(sent.secret).toBe(secret);
+  });
+
+  it("conceals a secret value field and leaves a plain one readable", async () => {
+    const panel = await openPanel();
+    fireEvent.click(within(panel).getByRole("button", { name: "Add variable" }));
+    const value = within(panel).getByLabelText("Value") as HTMLTextAreaElement;
+    expect(value.tagName).toBe("TEXTAREA");
+    expect(value.className).toContain("[-webkit-text-security:disc]");
+    expect(value.getAttribute("autocomplete")).toBe("off");
+    expect(value.getAttribute("spellcheck")).toBe("false");
+    fireEvent.click(within(panel).getByRole("switch", { name: "Secret" }));
+    const plain = within(panel).getByLabelText("Value") as HTMLTextAreaElement;
+    expect(plain.tagName).toBe("TEXTAREA");
+    expect(plain.className).not.toContain("text-security");
+  });
+
   it("editing a secret without a value sends only the description and never prefills the value", async () => {
     mockApi.putRepoEnv.mockResolvedValue({ variable: API_KEY });
     const panel = await openPanel();

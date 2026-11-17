@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -109,6 +110,40 @@ func (f *envFixture) rowCount(where string, args ...any) int {
 	return n
 }
 
+// rowSnapshot reads every stored column a refused write could alter, for the named
+// variables of the fixture repo, rendered as one comparable string per name.
+func (f *envFixture) rowSnapshot(names ...string) map[string]string {
+	f.t.Helper()
+	out := map[string]string{}
+	for _, n := range names {
+		var (
+			id, varID  uuid.UUID
+			ct         []byte
+			desc       string
+			disabledAt *time.Time
+			rev        int
+		)
+		err := f.pool.QueryRow(context.Background(),
+			`SELECT id, var_id, ciphertext, description, disabled_at, rev FROM run_env_vars WHERE repo_id=$1 AND name=$2 AND retired_at IS NULL`,
+			f.repo, n).Scan(&id, &varID, &ct, &desc, &disabledAt, &rev)
+		if err != nil {
+			f.t.Fatalf("snapshot %s: %v", n, err)
+		}
+		out[n] = fmt.Sprintf("id=%s var_id=%s ct=%x desc=%q disabled_at=%v rev=%d", id, varID, ct, desc, disabledAt, rev)
+	}
+	return out
+}
+
+func (f *envFixture) requireSnapshot(before map[string]string, after string) {
+	f.t.Helper()
+	now := f.rowSnapshot("PAYMENTS_SANDBOX_KEY", "PAYMENTS_SANDBOX_URL")
+	for n, b := range before {
+		if now[n] != b {
+			f.t.Fatalf("%s changed by %s:\n before %s\n after  %s", n, after, b, now[n])
+		}
+	}
+}
+
 // envSecondRepo adds another repo on the same forge connection as repo (a user has one
 // connection per forge and base URL) and returns its id.
 func envSecondRepo(t *testing.T, pool *pgxpool.Pool, repo uuid.UUID) uuid.UUID {
@@ -152,6 +187,8 @@ func TestRunEnvAuthDifferentialLiveDB(t *testing.T) {
 		t.Fatal("the Bearer list carried a secret value")
 	}
 
+	before := f.rowSnapshot("PAYMENTS_SANDBOX_KEY", "PAYMENTS_SANDBOX_URL")
+
 	// Every write is cookie-only: a Bearer token is refused before the handler runs and
 	// nothing changes.
 	for _, c := range []struct{ method, suffix, body string }{
@@ -169,6 +206,7 @@ func TestRunEnvAuthDifferentialLiveDB(t *testing.T) {
 	if got := f.rowCount("true"); got != 2 {
 		t.Fatalf("rows after refused writes = %d, want 2", got)
 	}
+	f.requireSnapshot(before, "the refused Bearer writes")
 
 	// No credential at all, and a cookie without the CSRF header.
 	f.must(bearerReq(f.router, http.MethodGet, f.path(""), ""), http.StatusUnauthorized)
@@ -196,6 +234,7 @@ func TestRunEnvAuthDifferentialLiveDB(t *testing.T) {
 	if got := f.rowCount("name='PAYMENTS_SANDBOX_KEY' AND disabled_at IS NULL AND pending_delete_at IS NULL"); got != 1 || f.rowCount("true") != 2 {
 		t.Fatalf("a CSRF-less write changed the variable: live rows %d, total %d", got, f.rowCount("true"))
 	}
+	f.requireSnapshot(before, "the CSRF-less writes")
 
 	// Owner only: another user's token sees a 404, not the list.
 	f.must(bearerReq(f.router, http.MethodGet, f.path(""), otherToken), http.StatusNotFound)
@@ -205,6 +244,7 @@ func TestRunEnvAuthDifferentialLiveDB(t *testing.T) {
 	if got := f.rowCount("true"); got != 2 {
 		t.Fatalf("rows after foreign writes = %d, want 2", got)
 	}
+	f.requireSnapshot(before, "the foreign-user writes")
 }
 
 func TestRunEnvLifecycleLiveDB(t *testing.T) {
@@ -715,11 +755,12 @@ func TestRunEnvVaultLifecycleLiveDB(t *testing.T) {
 		repo   *uuid.UUID
 		name   string
 		secret bool
+		rev    int
 		ct     []byte
 		marker string
 	}
 	load := func() []rowInfo {
-		rows, err := pool.Query(context.Background(), `SELECT id, repo_id, name, secret, ciphertext, sealed_with FROM run_env_vars WHERE user_id=$1 ORDER BY id`, owner)
+		rows, err := pool.Query(context.Background(), `SELECT id, repo_id, name, secret, rev, ciphertext, sealed_with FROM run_env_vars WHERE user_id=$1 ORDER BY id`, owner)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -727,12 +768,22 @@ func TestRunEnvVaultLifecycleLiveDB(t *testing.T) {
 		var out []rowInfo
 		for rows.Next() {
 			var r rowInfo
-			if err := rows.Scan(&r.id, &r.repo, &r.name, &r.secret, &r.ct, &r.marker); err != nil {
+			if err := rows.Scan(&r.id, &r.repo, &r.name, &r.secret, &r.rev, &r.ct, &r.marker); err != nil {
 				t.Fatal(err)
 			}
 			out = append(out, r)
 		}
 		return out
+	}
+	// Plaintext originally written, keyed by "name#rev": the retired LIVE_SECRET rev 1
+	// and its current rev 2, the other secrets at rev 1, and the plain value.
+	wantPlain := map[string]string{
+		"LIVE_SECRET#1":       secretFixture(1),
+		"LIVE_SECRET#2":       secretFixture(2),
+		"LIVE_PLAIN#1":        "https://sandbox.example.test",
+		"DISABLED_SECRET#1":   secretFixture(3),
+		"PENDING_SECRET#1":    secretFixture(4),
+		"USER_SCOPE_SECRET#1": secretFixture(5),
 	}
 	opensAll := func(want string) {
 		t.Helper()
@@ -740,6 +791,7 @@ func TestRunEnvVaultLifecycleLiveDB(t *testing.T) {
 		if len(rows) != 6 {
 			t.Fatalf("rows = %d, want 6 (live, retired, disabled, pending, plain, user scope)", len(rows))
 		}
+		seen := map[string]bool{}
 		for _, r := range rows {
 			if r.marker != want {
 				t.Fatalf("%s sealed_with = %s, want %s", r.name, r.marker, want)
@@ -748,9 +800,22 @@ func TestRunEnvVaultLifecycleLiveDB(t *testing.T) {
 			if r.repo != nil {
 				scope = runenv.ScopeRepo
 			}
-			if _, err := h.vault.Open(owner, runenv.AADKind(scope, r.repo, r.secret, r.name), r.marker, r.ct); err != nil {
+			pt, err := h.vault.Open(owner, runenv.AADKind(scope, r.repo, r.secret, r.name), r.marker, r.ct)
+			if err != nil {
 				t.Fatalf("%s does not open: %v", r.name, err)
 			}
+			key := fmt.Sprintf("%s#%d", r.name, r.rev)
+			exp, ok := wantPlain[key]
+			if !ok {
+				t.Fatalf("unexpected row %s", key)
+			}
+			if string(pt) != exp {
+				t.Fatalf("%s plaintext = %q, want %q", key, pt, exp)
+			}
+			seen[key] = true
+		}
+		if len(seen) != len(wantPlain) {
+			t.Fatalf("rows seen %v, want all of %d expected name#rev keys", seen, len(wantPlain))
 		}
 	}
 	opensAll(store.SealedWithMasterAAD)
