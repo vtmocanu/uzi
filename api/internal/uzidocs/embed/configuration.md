@@ -231,6 +231,26 @@ one operator-only piece is the SSRF allowlist for the clone target, a
 |---|---|---|
 | `AGENT_SOURCE_ALLOWED_BASE_URLS` | *(empty)* | Comma-separated SSRF allowlist for the agent-source clone URL; every entry must be a bare `https://host[:port]` (optional trailing `/`); an entry with userinfo, a path, a query or a fragment fails boot (previously reduced silently to the host). Unlike `FORGE_ALLOWED_BASE_URLS`, an **empty** list is not a boot error — the feature is off by default, so an unconfigured instance still boots — but it does mean nothing is allowed until you set at least one entry here, no matter what an admin saves in the URL field. |
 
+## Custom model providers (PRD #4320)
+
+A user can define their own Anthropic-compatible endpoint (a gateway, proxy or cloud-hosted
+Messages API) as a **provider** under their account. The operator decides which destinations are
+possible with an allowlist that is **separate** from every other allowlist on this page:
+
+| Var | Default | Notes |
+|---|---|---|
+| `UZI_PROVIDER_ALLOWED_BASE_URLS` | *(empty)* | Comma-separated list of exact provider base URLs, **path included** (for example `https://gw.example.com/anthropic`). A provider's base URL must equal one entry after normalization; there is no host, prefix or path-segment matching, so one tenant's path on a shared gateway cannot be repointed to another's. Entries are normalized (lowercase scheme and host, default port elided, one trailing `/` removed). An entry with a query, fragment, userinfo, a `.` or `..` path segment, any `%` encoding (`%2e`, `%2f`, ...), `;`, `\`, non-ASCII characters or more than 2048 bytes fails boot, naming the variable and the entry's position. **Empty or unset turns the feature off:** no provider can be created and the API reports `enabled: false`. |
+| `UZI_PROVIDER_ALLOW_LOOPBACK` | `false` | Dev flag. Only when `true` may the list hold a loopback host (`localhost`, `127.0.0.0/8`, `::1`) and plain `http` for it, so a local fake gateway works under compose. Never set it in production: the probe would be able to reach the api's own local ports. |
+
+The api is the destination authority: it checks the list when a provider is saved or its endpoint
+edited, and a saved URL is stored as the matching list entry. Removing an entry stops later saves
+and later run claims for providers that used it. Helm: set the variables through `api.config`.
+
+Network reach is a separate control. `workers.fqdnEgress.allowFQDNs` is **namespace-wide** (see
+ADR-0285): once an operator admits a gateway host there, every restricted-tier run in the worker
+namespace can reach it. It is network reach, not per-run authorization; the allowlist above is
+what decides which gateway a user's provider may name.
+
 ## CI status integration (PRD #6)
 
 uzi caches the latest pipeline per **watched ref** (a repo's default branch, plus the branches of that repo's recent agent runs) on the same poll tick as the issue sync — no second loop or interval — and renders it as a status badge on the repos list, the board header, and each card. A failed pipeline offers a **Fix CI** button that queues a plan-gated `ci_fix` agent run; when that run's fix branch pipeline concludes, the sync stamps the run `verified` or `fix_failed` ("uzi verifies its work"). See [ARCHITECTURE.md](../ARCHITECTURE.md) for the full pipeline-sync + verification design.

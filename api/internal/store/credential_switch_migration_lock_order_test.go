@@ -18,7 +18,9 @@ import (
 // with a foreign key, or a DROP TABLE of one, locks the parent too). Matched by content, not by
 // number, so the landing renumber does not move it.
 func TestCredentialSwitchMigrationsLockOneBusyTableEach(t *testing.T) {
-	markers := []string{"credential_epoch_ordinal", "credential_switch_apply_nonce", "run_credential_switch_epochs"}
+	markers := []string{"credential_epoch_ordinal", "credential_switch_apply_nonce", "run_credential_switch_epochs",
+		// PRD #4320: the model provider migrations (user_secrets, users, runs columns) follow the same one-busy-table rule.
+		"model_provider"}
 	busy := map[string]bool{"runs": true, "user_secrets": true, "run_messages": true, "run_usage": true, "workers": true}
 	alter := regexp.MustCompile(`(?i)\bALTER TABLE\s+(?:IF EXISTS\s+)?([a-z_]+)`)
 	refs := regexp.MustCompile(`(?i)\bREFERENCES\s+([a-z_]+)`)

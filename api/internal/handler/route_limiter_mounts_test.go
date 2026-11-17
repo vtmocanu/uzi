@@ -313,6 +313,7 @@ var wantRouteMounts = []routeMount{
 	// PRD #3989: admin-issued reset link, a cookie-only admin DB write with no per-user limiter.
 	{"POST", "/api/admin/users/{id}/reset-link", noLimiter},
 	{"POST", "/api/admin/egress-profiles", noLimiter},
+	{"PUT", "/api/me/providers/{id}/key", noLimiter},
 	{"PUT", "/api/admin/egress-profiles/{name}", noLimiter},
 	{"DELETE", "/api/admin/egress-profiles/{name}", noLimiter},
 	// PRD #685 M1: admin clear of a branding logo — cookie-only admin DB delete, no
@@ -336,6 +337,8 @@ var wantRouteMounts = []routeMount{
 	{"DELETE", "/api/me/cli-tokens/{id}", noLimiter},
 	// PRD #1907 M5: revoke one of the caller's own product tokens, a cookie-only,
 	// owner-scoped DB write → noLimiter, like the CLI-token revoke above.
+	{"DELETE", "/api/me/providers/{id}", noLimiter},
+	{"DELETE", "/api/me/providers/{id}/key", noLimiter},
 	{"DELETE", "/api/me/product-tokens/{id}", noLimiter},
 	{"DELETE", "/api/me/memory/{id}", noLimiter},
 	{"DELETE", "/api/me/secrets/anthropic_token", noLimiter},
@@ -471,6 +474,8 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/me/cli-tokens/", noLimiter},
 	// PRD #1907 M5: the caller's own product-token list and the mint picker, cookie-only
 	// metadata reads with no forge call → noLimiter, like the CLI-token list above.
+	{"GET", "/api/me/providers/", noLimiter},
+	{"GET", "/api/me/providers/{id}", noLimiter},
 	{"GET", "/api/me/product-tokens/", noLimiter},
 	// PRD #1910 M3: the caller's live OAuth connections, a cookie-only plain read like the product-token list.
 	{"GET", "/api/me/oauth-connections/", noLimiter},
@@ -627,6 +632,9 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/workers/", noLimiter},
 	{"GET", "/api/workers/hosted/config", noLimiter},
 	{"GET", "/api/ws", noLimiter},
+	{"PATCH", "/api/me/providers/{id}/key/enabled", noLimiter},
+	{"PATCH", "/api/me/providers/{id}/endpoint", noLimiter},
+	{"PATCH", "/api/me/providers/{id}", noLimiter},
 	{"PATCH", "/api/admin/users/{id}", noLimiter},
 	// PRD #1907 M4: admin edit of a product's description / enabled flag — cookie-only
 	// admin DB write → noLimiter.
@@ -781,6 +789,8 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/me/effective-settings/schedule-preview", noLimiter},
 	// PRD #1907 M5: the product-token MINT rides the credential-surface limiter per user
 	// (a (pattern, user) bucket), on top of the handler's per-product cap (D15).
+	{"POST", "/api/me/providers/", noLimiter},
+	{"POST", "/api/me/providers/{id}/retire", noLimiter},
 	{"POST", "/api/me/product-tokens/", limAuth},
 	{"POST", "/api/me/secrets/anthropic_token", noLimiter},
 	// PRD #1147 M1 codex credential creates: owner-scoped DB write, no forge call, no

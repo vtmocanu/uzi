@@ -28,6 +28,11 @@ const KindOpenAIAPIKey = "openai_api_key" //nolint:gosec // G101: a user_secrets
 // per-alias link status in codex_credential_state.
 const KindCodexAuth = "codex_auth"
 
+// KindAnthropicCompatibleKey is user_secrets.kind for a model provider's gateway key (migration
+// 00467, PRD #4320): bound to one provider through user_secrets.provider_id, never a default,
+// never in the auto-select pool.
+const KindAnthropicCompatibleKey = "anthropic_compatible_key"
+
 // LabelDefaultSecret is the label 00077 backfills onto every pre-existing
 // user_secrets row, and the one the kind-path compatibility routes and the seed
 // create a user's first secret under (PRD #104 D2/D14). It is a conventional name,

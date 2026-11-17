@@ -87,6 +87,32 @@ func (h *Handler) mountMeRoutes(r chi.Router, authLimiter *mw.Limiter) {
 		})
 	})
 
+	// Model providers (PRD #4320 M1): user-defined Anthropic-compatible endpoints. Reads, create,
+	// the name/model-map edit and retire are RequireUser (a CLI `uzi provider` command can drive
+	// them): none reveals or replaces a credential, and the destination they can set is bound to
+	// the operator allowlist. Everything that handles the key or moves the destination (key
+	// set/rotate/delete/enable, the endpoint edit, delete) stays cookie-only, DELIBERATELY, for the
+	// same reason /me/secrets writes are: a stolen uzc_ must not replace a key or repoint the
+	// destination the key is sent to.
+	r.Route("/me/providers", func(r chi.Router) {
+		r.Group(func(r chi.Router) {
+			r.Use(h.requireUser())
+			r.Get("/", h.ListMyProviders)
+			r.Post("/", h.CreateMyProvider)
+			r.Get("/{id}", h.GetMyProvider)
+			r.Patch("/{id}", h.PatchMyProvider)
+			r.Post("/{id}/retire", h.RetireMyProvider)
+		})
+		r.Group(func(r chi.Router) {
+			r.Use(h.requireAuth())
+			r.Put("/{id}/key", h.PutMyProviderKey)
+			r.Delete("/{id}/key", h.DeleteMyProviderKey)
+			r.Patch("/{id}/key/enabled", h.PatchMyProviderKeyEnabled)
+			r.Patch("/{id}/endpoint", h.PatchMyProviderEndpoint)
+			r.Delete("/{id}", h.DeleteMyProvider)
+		})
+	})
+
 	// CLI token management (PRD #64): the credential the `uzi` CLI presents as a
 	// Bearer token. Cookie-only, DELIBERATELY (Decision 16) — never RequireUser:
 	// a Bearer-reachable CRUD would let a stolen uzc_ mint replacements (revocation
