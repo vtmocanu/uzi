@@ -229,6 +229,109 @@ func TestMemoryAuthorityStaleRegistrationReportsChangeNothingLiveDB(t *testing.T
 	})
 }
 
+// The bodyless (snapshotless) claim path enforces a lost report, so it persists it too, but it can
+// only set: a held bodyless report cannot be fenced and writes nothing. The next snapshot-carrying
+// held claim clears it.
+func TestMemoryAuthorityBodylessClaimSetsButNeverClearsLiveDB(t *testing.T) {
+	m := newMemAuthFix(t)
+	bodyless := func(report string) *ClaimPayload {
+		t.Helper()
+		row, err := m.f.env.q.GetWorkerByID(m.f.env.ctx, m.w.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p, err := m.f.svc.ClaimReported(m.f.env.ctx, row, nil, MemoryAuthorityReport{Value: &report})
+		if err != nil {
+			t.Fatalf("bodyless claim(%s): %v", report, err)
+		}
+		return p
+	}
+	if p := bodyless("lost"); p != nil {
+		t.Fatalf("bodyless lost claim returned %s, want idle", p.RunID)
+	}
+	first, ok := m.lostAt(t)
+	if !ok {
+		t.Fatal("a bodyless lost report did not set memory_authority_lost_at")
+	}
+	before := m.writeCount(t)
+	bodyless("lost")
+	if again, _ := m.lostAt(t); !again.Equal(first) || m.writeCount(t) != before {
+		t.Fatal("a repeated bodyless lost report rewrote the column")
+	}
+	bodyless("held")
+	if _, ok := m.lostAt(t); !ok {
+		t.Fatal("a bodyless held report cleared the column; it cannot be fenced and must write nothing")
+	}
+	m.claim(t, "held")
+	if _, ok := m.lostAt(t); ok {
+		t.Fatal("a snapshot-carrying held claim did not clear the column")
+	}
+}
+
+// A reader on another connection during Register sees the old registration with its lost mark, or
+// the new registration with the column cleared, never a mixed pair.
+func TestMemoryAuthorityRegisterIsAtomicToReadersLiveDB(t *testing.T) {
+	m := newMemAuthFix(t)
+	m.claim(t, "lost")
+	if _, ok := m.lostAt(t); !ok {
+		t.Fatal("setup: lost not persisted")
+	}
+	oldNonce := m.nonce
+
+	read := func() (string, bool) {
+		t.Helper()
+		var nonce *string
+		var lost *time.Time
+		if err := m.f.env.pool.QueryRow(m.f.env.ctx,
+			`SELECT snapshot_register_nonce, memory_authority_lost_at FROM workers WHERE id=$1`, m.w.ID).Scan(&nonce, &lost); err != nil {
+			t.Fatal(err)
+		}
+		if nonce == nil {
+			return "", lost != nil
+		}
+		return *nonce, lost != nil
+	}
+
+	held, release := make(chan struct{}), make(chan struct{})
+	m.f.svc.registerAfterRegisterWorker = func() {
+		close(held)
+		select {
+		case <-release:
+		case <-time.After(10 * time.Second):
+			t.Error("register hook never released")
+		}
+	}
+	t.Cleanup(func() { m.f.svc.registerAfterRegisterWorker = nil })
+
+	done := make(chan error, 1)
+	var newNonce string
+	go func() {
+		_, n, err := m.f.svc.Register(m.f.env.ctx, store.Worker{ID: m.w.ID, UserID: m.f.userID}, "v1", "base", nil, nil, capableCaps(), nil)
+		newNonce = n
+		done <- err
+	}()
+	select {
+	case <-held:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Register never reached the hook")
+	}
+	if nonce, lost := read(); nonce != oldNonce || !lost {
+		t.Errorf("reader during uncommitted Register saw nonce=%q lost=%t, want the old pair (%q, true)", nonce, lost, oldNonce)
+	}
+	close(release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Register: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Register never finished")
+	}
+	if nonce, lost := read(); nonce != newNonce || nonce == oldNonce || lost {
+		t.Fatalf("reader after Register saw nonce=%q lost=%t, want the new registration (%q) with the column NULL", nonce, lost, newNonce)
+	}
+}
+
 // A worker that is not capable and sends no report is neither lost nor held: no write.
 func TestMemoryAuthorityAbsentReportWithoutCapabilitiesWritesNothingLiveDB(t *testing.T) {
 	f := newIsoFix(t)

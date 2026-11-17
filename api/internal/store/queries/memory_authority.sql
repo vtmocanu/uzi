@@ -15,6 +15,14 @@ UPDATE workers
    AND snapshot_register_nonce = @register_nonce
    AND memory_authority_lost_at IS NULL;
 
+-- name: MarkWorkerMemoryAuthorityLostUnfenced :execrows
+-- The bodyless (snapshotless) claim path: no registration identity to fence on, so this can only
+-- SET (fail closed), never clear. The row is already locked by the claim transaction.
+UPDATE workers
+   SET memory_authority_lost_at = @lost_at
+ WHERE id = @id
+   AND memory_authority_lost_at IS NULL;
+
 -- name: ClearWorkerMemoryAuthorityLost :execrows
 UPDATE workers
    SET memory_authority_lost_at = NULL

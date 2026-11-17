@@ -305,6 +305,28 @@ func TestHibernationSurplusLongRuleStillAppliesLiveDB(t *testing.T) {
 	}
 }
 
+// A candidate the list saw unpooled (alone in its pool) that became pooled before its attempt (an
+// equal-key sibling registered) is not admitted on the per-worker clock without the owner lock: the
+// attempt changes nothing and the next pass decides it as a pooled worker.
+func TestHibernationSurplusStaleUnpooledCandidateSkippedLiveDB(t *testing.T) {
+	p := newPoolFx(t)
+	cand := p.member(400 * 24 * time.Hour)
+	sibling := uuid.Nil
+	p.svc.autoPassAfterList = func() { sibling = p.member(time.Hour) }
+	if n := p.pass(cand); n != 0 {
+		t.Fatalf("pass with the candidate pooled after the list = %d, want 0", n)
+	}
+	if sibling == uuid.Nil {
+		t.Fatal("the after-list hook never ran")
+	}
+	p.wantStates(map[uuid.UUID]string{cand: "none"})
+	p.svc.autoPassAfterList = nil
+	if n := p.pass(cand, sibling); n != 1 {
+		t.Fatalf("control pass (listed as pooled) = %d, want 1", n)
+	}
+	p.wantStates(map[uuid.UUID]string{cand: "preparing"})
+}
+
 // Refusals are recorded as today, do not use the owner's one change, and the owner's next
 // candidate is tried.
 func TestHibernationSurplusRefusalRecordedLiveDB(t *testing.T) {

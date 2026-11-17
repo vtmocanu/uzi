@@ -19,15 +19,32 @@ import (
 //
 // It persists on snapshot-carrying run and ordinary-lane claims, whether or not a run is claimed:
 // the caller invokes it before the claim, so empty and overflow-refused polls persist too. It does
-// not persist on claims with no active snapshot (for example UZI_ACTIVE_SNAPSHOT_DISABLED, a
-// missing register nonce or a malformed body), nor when the owner's vault gate returns idle before
-// the transaction starts. Ephemeral claims (ephemeral_lease.go) are out of scope: ephemeral
-// workers are never in a pool.
+// not clear on claims with no active snapshot (for example UZI_ACTIVE_SNAPSHOT_DISABLED, a
+// missing register nonce or a malformed body), nor persist when the owner's vault gate returns idle before
+// the transaction starts. A bodyless claim persists a lost report only (see below); ephemeral
+// workers are never in a pool, so this matters for them only as the same code path.
 //
 // The registration fence is the snapshot's register nonce, repeated in the UPDATE's WHERE. A
-// claim without a snapshot carries no registration identity, so it persists nothing.
+// bodyless claim (snapshot nil, claimRunLeasedNoSnapshot) carries no registration identity, so it
+// cannot be fenced: a lost report there only SETS the column (MarkWorkerMemoryAuthorityLostUnfenced),
+// a held report writes nothing. A delayed bodyless lost report from an old registration can
+// therefore only fail closed (the worker counts as not ready until the next fenced held claim or
+// Register), never clear. The claim enforces the loss either way (claimRunInTxCore), so this keeps
+// the persisted column in step with what was enforced. A snapshot with an empty nonce persists nothing.
 func (s *Service) persistMemoryAuthority(ctx context.Context, qtx *store.Queries, locked store.Worker, snapshot *ActiveSnapshot, lane string, report MemoryAuthorityReport) error {
-	if lane == "cross_check" || snapshot == nil || snapshot.RegisterNonce == "" {
+	if lane == "cross_check" {
+		return nil
+	}
+	if snapshot == nil {
+		if locked.MemoryAuthorityLostAt.Valid || !memoryAuthorityLost(locked.ProtocolCapabilities, report) {
+			return nil
+		}
+		_, err := qtx.MarkWorkerMemoryAuthorityLostUnfenced(ctx, store.MarkWorkerMemoryAuthorityLostUnfencedParams{
+			ID: locked.ID, LostAt: pgconv.Time(s.now()),
+		})
+		return err
+	}
+	if snapshot.RegisterNonce == "" {
 		return nil
 	}
 	switch {

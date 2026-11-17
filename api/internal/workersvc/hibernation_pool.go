@@ -357,6 +357,16 @@ func groupByOwner(work []poolWork) [][]poolWork {
 	return out
 }
 
+// warnIfCandidateListFull logs when a bounded candidate list came back at the bound: candidates
+// beyond it are not seen this pass, so a fleet larger than HibernationPoolCandidateRows must be
+// visible. Once per list per pass (listSurplusWork calls it once per list).
+func warnIfCandidateListFull(list string, n int) {
+	if n >= HibernationPoolCandidateRows {
+		slog.Warn("worker hibernation: candidate list is full, later candidates wait for a following pass",
+			"list", list, "rows", n, "bound", HibernationPoolCandidateRows)
+	}
+}
+
 // listSurplusWork reads the three candidate lists in one transaction and merges them. The long
 // list carries the owner, so no separate owner lookup is needed.
 func (s *Service) listSurplusWork(ctx context.Context, p surplusPassParams) ([]poolWork, error) {
@@ -385,6 +395,9 @@ func (s *Service) listSurplusWork(ctx context.Context, p surplusPassParams) ([]p
 	if err != nil {
 		return nil, err
 	}
+	warnIfCandidateListFull("surplus", len(surplus))
+	warnIfCandidateListFull("long", len(long))
+	warnIfCandidateListFull("warm", len(warm))
 	byID := make(map[uuid.UUID]*poolWork, len(surplus)+len(long))
 	var out []*poolWork
 	for _, c := range long {
@@ -436,7 +449,17 @@ func (s *Service) surplusWork(ctx context.Context, w poolWork, p surplusPassPara
 	case !w.pooled:
 		var res workResult
 		err := s.hibernationTx(ctx, w.id, func(q *store.Queries, row store.Worker) error {
-			var e error
+			// The list saw this worker unpooled. If it became pooled since (an equal-key sibling
+			// registered, or keys changed), the per-worker clock no longer applies and no owner
+			// lock is held here: change nothing and spend no budget. The next pass lists it as
+			// pooled and decides under the owner lock.
+			idle, e := q.GetWorkerLongIdleness(ctx, row.ID)
+			if e != nil {
+				return e
+			}
+			if idle.Pooled {
+				return nil
+			}
 			res.admitted, res.stop, e = s.autoAdmit(ctx, q, row, p.now, p.longCutoff, p.recentCutoff, p.idleAfter)
 			return e
 		})

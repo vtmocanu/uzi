@@ -2200,6 +2200,10 @@ type Service struct {
 	// transaction BEGINs and before it locks the worker row, so a test can pause a registration whose
 	// now() is already fixed while a credential-switch hold is stamped behind it.
 	registerAfterBegin func()
+	// registerAfterRegisterWorker is a test seam (nil in production): Register calls it inside its
+	// transaction right after RegisterWorker's UPDATE and before anything commits, so a test can
+	// read the worker row from another connection while the registration is uncommitted.
+	registerAfterRegisterWorker func()
 	// ciRepairAfterInsert is a test seam (nil in production): CreateCIRepairRun calls it inside
 	// the create transaction after the run INSERT and before the episode write, so a test can
 	// inject a failure and prove the run and the episode roll back together.
@@ -2764,6 +2768,9 @@ func (s *Service) RegisterWithCrossCheckSlots(ctx context.Context, wkr store.Wor
 	row, err := qtx.RegisterWorker(ctx, regParams)
 	if err != nil {
 		return store.Worker{}, "", err
+	}
+	if s.registerAfterRegisterWorker != nil {
+		s.registerAfterRegisterWorker()
 	}
 	if row.CredentialSwitchApplyNonce, err = s.stampApplyNonce(ctx, qtx, wkr.ID, protocolCaps, nonce); err != nil {
 		return store.Worker{}, "", err
