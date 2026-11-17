@@ -759,7 +759,7 @@ is a distinct residual.
 Single-uid disposal is unchanged, but a few things differ there: bindings are
 written, a failed intent write fails the retire closed (the clone stays
 canonical), the 64 cap applies, and a failed in-process `rm` leaves a permanent
-`removing` entry that pins attempt-ledger compaction for that bare.
+`removing` entry that keeps that attempt's ledger entry from compaction.
 
 Switches. Reclaim is on by default. Disable it with the chart value
 `workers.epochReclaim.retireScratchReclaim: false` (controller

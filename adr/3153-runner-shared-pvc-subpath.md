@@ -452,8 +452,8 @@ crashed attempt and adds the epoch exclusion.
   is unset after the runner root is synced. What does change on a single-uid
   pod: bindings are written; a failed intent write fails the retire closed (the
   clone stays canonical); the 64-binding cap applies; and a failed in-process
-  `rm` leaves a permanent `removing` entry that pins attempt-ledger compaction
-  for that bare. **#2349 site 2
+  `rm` leaves a permanent `removing` entry that keeps that attempt's ledger entry
+  from compaction. **#2349 site 2
   (holding/scratch disposal in `retireRunnerClone`) therefore stays open**; see
   ADR-1809.
 
@@ -650,6 +650,7 @@ An architect, auditor and reviewer examined two judgments and found no stop.
   therefore proven only by hermetic tests (`agent/test/retire-binding-writes.test.ts`,
   `agent/test/pod-epoch-retire-scratch.test.ts`). The lane's clone-pin mount-id
   half is not exercised (it needs CAP_SYS_ADMIN).
-- In the implementing run the six lane cases ran in an older local image, not the
-  CI-built one. The CI lane `test-agent-worker-uid` on the exact head is the
+- In the implementing run all seven real-image retire-scratch cases (as of commit
+  85a2de9ff) passed in an older locally available image, not the CI-built lane image,
+  whose build exceeded the lane's 60 s build cap in-run. The CI lane `test-agent-worker-uid` on the exact head is the
   evidence of record.

@@ -852,7 +852,7 @@ park, and [Run recovery](./run-recovery.md) for supported inspect/discard
 procedures; pressure does not authorize deleting protected sources.
 [PRD #3431](../prds/3431-pod-epoch-reclaim.md) M1b attempt deletion is
 implemented behind an off-by-default startup opt-in, so production deletes no
-attempts unless an operator selects one canary worker, and #3329's genuine-idle reclaim roll is deferred. Two default-on exceptions exist: the
+attempts unless an operator selects one canary worker, and #3329's genuine-idle reclaim roll is deferred. Two exceptions are requested by default but still run only on an eligible pass with an attested runtime declaration (the chart's default empty runtime declaration supplies no attestation, so with chart defaults neither deletes anything): the
 runner TMPDIR scratch reclaim (#4043, see
 [startup disable and observation](./run-recovery.md#runner-tmpdir-scratch-reclaim-startup-disable-and-observation))
 and the bound `.retire-*` parent reclaim (#4263, see

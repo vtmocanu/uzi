@@ -745,7 +745,7 @@ test("pod epoch real retire scratch: directories the runner cannot list or modif
     const before = digest(t.clone);
     assert.ok(before.includes("./tracked|d|2775|10002:10002") && before.includes("./tracked/locked|d|500|10002:10002"),
       "the fixture mirrors the production runner:runner 2775 setgid directories and holds the 0500 runner-owned one");
-    const hidden =path.join(t.clone, "tracked", "hidden"), drop = path.join(t.clone, "tracked", "drop");
+    const hidden = path.join(t.clone, "tracked", "hidden"), drop = path.join(t.clone, "tracked", "drop");
     assert.ok(digest(hidden).length >= 4 && digest(drop).length === 2, "fixture holds content");
     const owner = await retireOwner(f);
     const out = await owner.ask(retireReq(f, t), 90000);
@@ -841,7 +841,7 @@ test("pod epoch real retire scratch: the helper child sees only the clone pin at
     assert.deepEqual(out.probe.fds, { 3: { id: out.cloneId, dir: true }, 4: { id: out.lockId, dir: false } });
     assert.deepEqual(out.probe.reopen, { parentDotDot: "EACCES", listDotDot: "EACCES", siblingViaDotDot: "EACCES", statViaDotDot: "EACCES" },
       "the runner cannot open or traverse the worker-private parent through the pinned clone");
-    // The full descriptor table of the same wrapped launch, read by a shell (a Node probe owns runtime descriptors of its
+    // The full descriptor table of an identically wrapped second launch, read by a shell (a Node probe owns runtime descriptors of its
     // own, so only a shell can prove that nothing beyond stdio, the clone pin and the lock was inherited).
     const table = new Map<string, string>();
     for (const line of out.list.trimEnd().split("\n")) { const [fd, ...target] = line.split(" "); table.set(fd!, target.join(" ")); }
