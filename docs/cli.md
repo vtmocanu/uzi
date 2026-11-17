@@ -225,7 +225,7 @@ uzi worker list | rm <id> | set-token <worker-id> <label> | set-token <worker-id
 uzi worker cordon <id> [-m <reason>] [--json]
 uzi worker uncordon <id> [--json]
 uzi repo list | remove <id> [--force]
-uzi repo env list <repo> [--json]
+uzi repo env list <id> [--json]
 uzi project-sync status <repo> | resync <repo>
 uzi pr list [--repo <id>] | checks <iid> [--repo <id>] [--watch]
 uzi ci list [--repo <id>] [--limit <n>] | jobs <run-id> [--repo <id>] | fix <ref> [--repo <id>]

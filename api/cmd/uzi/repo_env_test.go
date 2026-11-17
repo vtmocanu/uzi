@@ -19,7 +19,7 @@ func repoEnvFake() *uzicli.FakeClient {
 			{Name: "API_URL", Description: "base url", Value: &plain, State: "enabled", UpdatedAt: ts},
 			{Name: "TOKEN", Secret: true, State: "disabled", UpdatedAt: ts},
 			{Name: "LOCKED", ValueWithheld: true, State: "enabled", UpdatedAt: ts},
-			{Name: "EVIL", Value: &evil, State: "enabled", UpdatedAt: ts},
+			{Name: "EVIL", Value: &evil, Description: "line1\nFAKE_ROW\tplain", State: "enabled", UpdatedAt: ts},
 		},
 		Counts: apitypes.RunEnvCountsDTO{Total: 4, Limit: 50},
 	}}
@@ -43,6 +43,11 @@ func TestRepoEnvListTable(t *testing.T) {
 	}
 	if strings.Contains(out, "\x1b") {
 		t.Errorf("output carries a raw escape byte: %q", out)
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "FAKE_ROW") {
+			t.Errorf("a newline in a description forged a table row: %q", out)
+		}
 	}
 }
 

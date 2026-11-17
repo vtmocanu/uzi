@@ -36,7 +36,7 @@ export const RUN_ENV_DENIED_PREFIXES: readonly string[] = [
 export const RUN_ENV_DENIED_SUFFIXES: readonly string[] = ["_PROXY"];
 
 /** The shape of a variable name. */
-export const RUN_ENV_NAME_REGEXP = /^[A-Z_][A-Z0-9_]{0,127}$/;
+const RUN_ENV_NAME_REGEXP = /^[A-Z_][A-Z0-9_]{0,127}$/;
 
 /** Returns the rule a name breaks, or null when it is allowed. Same order and
  *  semantics as ValidateName in api/internal/runenv/names.go: shape, then exact

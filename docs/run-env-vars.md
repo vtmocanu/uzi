@@ -15,7 +15,7 @@ package index token. Each variable belongs to one repo and is either **secret**
 or **plain**. Values are sealed through your per-user vault.
 
 Set them under **Repos → Environment variables**. Writes are web-only. The CLI
-can list a repo's variables read-only: `uzi repo env list <repo>`
+can list a repo's variables read-only: `uzi repo env list <id>`
 ([CLI reference](./cli.md)).
 
 ## Secret or plain
@@ -67,7 +67,7 @@ Allowed: `DATABASE_URL`, cloud credentials such as `AWS_ACCESS_KEY_ID`,
 
 ## Edit, disable, delete
 
-1. **Edit** changes the description only.
+1. **Edit** without a new value changes only the description; entering a value replaces it.
 2. **Replace the value** to rotate it. A secret keeps its secret flag unless
    you change it.
 3. **Disable** stops injection without deleting the variable; enable it again

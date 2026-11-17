@@ -1033,7 +1033,7 @@ export function Repos() {
                 <tbody className="divide-y divide-edge">
                   {repos.length === 0 ? (
                     <tr>
-                      <td colSpan={9}className="px-4 py-6 text-center text-faint">
+                      <td colSpan={9} className="px-4 py-6 text-center text-faint">
                         {refreshing ? "Loading…" : "No projects found for this bot."}
                       </td>
                     </tr>

@@ -221,7 +221,7 @@ export function RepoEnvPanel({
               {list.variables.map((v) => {
                 const pending = v.state === "pending_deletion";
                 return (
-                  <tr key={v.name} className="border-t border-edge align-top">
+                  <tr key={`${v.name}:${v.state}:${v.rev}`} className="border-t border-edge align-top">
                     <td className="px-2 py-2 font-mono text-xs">{v.name}</td>
                     <td className="px-2 py-2">{v.secret ? "Secret" : "Plain"}</td>
                     <td className="px-2 py-2 font-mono text-xs">

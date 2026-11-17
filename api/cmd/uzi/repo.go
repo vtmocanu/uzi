@@ -98,7 +98,7 @@ func newRepoEnvCmd(env Env, gf *globalFlags) *cobra.Command {
 		Short: "Inspect a repository's run variables",
 	}
 	list := &cobra.Command{
-		Use:   "list <repo>",
+		Use:   "list <id>",
 		Short: "List a repository's run variables (secret values are never shown)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -121,8 +121,8 @@ func newRepoEnvCmd(env Env, gf *globalFlags) *cobra.Command {
 					kind = "secret"
 				}
 				rows = append(rows, []string{
-					sanitizeTTY(v.Name), kind, sanitizeTTY(v.State), runEnvValueCell(v),
-					sanitizeTTY(v.Description), v.UpdatedAt.UTC().Format("2006-01-02 15:04:05Z"),
+					uzicli.CellText(v.Name), kind, uzicli.CellText(v.State), runEnvValueCell(v),
+					uzicli.CellText(v.Description), v.UpdatedAt.UTC().Format("2006-01-02 15:04:05Z"),
 				})
 			}
 			return p.Table([]string{"NAME", "KIND", "STATE", "VALUE", "DESCRIPTION", "UPDATED"}, rows)
@@ -142,7 +142,7 @@ func runEnvValueCell(v apitypes.RunEnvVarDTO) string {
 	case v.ValueWithheld || v.Value == nil:
 		return "(vault locked)"
 	default:
-		return sanitizeTTY(*v.Value)
+		return uzicli.CellText(*v.Value)
 	}
 }
 
