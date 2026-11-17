@@ -576,6 +576,31 @@ export class RecoveryMaintenance {
       for (const [id, reservation] of running ?? []) if (reservation === live) running!.delete(id);
     }
   }
+
+  /**
+   * Issue #4420: whether any cycle of `run` (case-insensitive) may still do work, judged on the AUTHENTICATED, fully validated
+   * table pair (the same load every transaction uses, without initialising or writing anything). `absent`: neither the
+   * ledger root nor its initialisation stage exists. `ended`: valid table, no cycle of the run, or every one exhausted.
+   * `active`: a cycle of the run that is not exhausted. `unknown`: anything else (unreadable, unauthenticated, invalid,
+   * inconsistent pair, a partial initialisation).
+   */
+  async inspectRun(run: string): Promise<"absent" | "ended" | "active" | "unknown"> {
+    try {
+      const root = await this.root();
+      for (const candidate of [root, root + ".initializing"]) {
+        try { await fs.lstat(candidate); }
+        catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+          return "unknown";
+        }
+        if (candidate !== root) return "unknown";
+        const table = await locked(root, () => this.load(root, false));
+        const id = run.toLowerCase();
+        return table.cycles.some(c => c.identity.run.toLowerCase() === id && !c.exhausted) ? "active" : "ended";
+      }
+      return "absent";
+    } catch { return "unknown"; }
+  }
 }
 function checked(token: MaintenanceSlot): Live {
   const live = tokens.get(token);

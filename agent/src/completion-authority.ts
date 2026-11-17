@@ -669,6 +669,23 @@ export function processWorkerIncarnation(): string { return PROCESS_INCARNATION;
 export async function peekAuthoritySlot(
   options: { dataDir: string; workerToken: string; uid?: number }, sourcePath: string,
 ): Promise<SlotSnapshot | null> {
+  const store = await openPeekStore(options);
+  return store === null ? null : store.peekSlot(sourcePath);
+}
+
+/**
+ * Issue #4420: every slot of the store, read-only (the same enrollment and head checks as {@link peekAuthoritySlot}, no
+ * transaction, no write, no head repair). An unenrolled empty store has none. More than `max` slot files, an unexpected
+ * name, a non-directory slots dir or any unreadable or unauthenticated slot rejects; the caller treats a rejection as unknown.
+ */
+export async function peekAllAuthoritySlots(
+  options: { dataDir: string; workerToken: string; uid?: number }, max: number,
+): Promise<SlotSnapshot[]> {
+  const store = await openPeekStore(options);
+  return store === null ? [] : store.peekAllSlots(max);
+}
+
+async function openPeekStore(options: { dataDir: string; workerToken: string; uid?: number }): Promise<AuthorityStore | null> {
   if (options.workerToken === "") throw new AuthorityRefusal("worker token required to authenticate authority state");
   const dataDir = options.dataDir;
   const uid = options.uid ?? process.getuid?.() ?? -1;
@@ -699,11 +716,10 @@ export async function peekAuthoritySlot(
     throw new AuthorityRefusal("authority store was replaced after this process enrolled it");
   }
   enrolledStorage.set(dataDir, enrollment.storageId);
-  const store = new AuthorityStore(storeBrand, {
+  return new AuthorityStore(storeBrand, {
     key, storageId: enrollment.storageId, ctxDir: authorityDir, dataDir, uid,
     incarnation: PROCESS_INCARNATION, ops: realOps, maxHeadBytes: MAX_SLOT_BYTES,
   });
-  return store.peekSlot(sourcePath);
 }
 
 /** Canonical relative layout identity of a source path plus the final component's identity; refuses anything unsafe. */
@@ -950,6 +966,39 @@ export class AuthorityStore {
         await new Promise((resolve) => setTimeout(resolve, 25));
       }
     }
+  }
+
+  /** Issue #4420: every slot, read-only (see {@link peekAllAuthoritySlots}); each is loaded exactly as {@link peekSlot} loads one. */
+  async peekAllSlots(max: number): Promise<SlotSnapshot[]> {
+    const dir = path.join(this.#init.ctxDir, SLOTS_DIR);
+    let names: string[];
+    try {
+      if (!(await fsp.lstat(dir)).isDirectory()) throw new AuthorityRefusal("authority slots path is not a directory");
+      names = await fsp.readdir(dir);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw error;
+    }
+    if (names.length > max) throw new AuthorityRefusal("authority slot listing exceeds its cap");
+    const out: SlotSnapshot[] = [];
+    for (const name of names) {
+      // An orphaned writeDurable temp file is not a slot record.
+      if (name.startsWith(".") && name.endsWith(".tmp")) continue;
+      const m = /^([0-9a-f]{64})\.json$/.exec(name);
+      if (!m) throw new AuthorityRefusal("unexpected entry in authority slots");
+      for (let attempt = 0; ; attempt++) {
+        try {
+          const slot = await this.#load(dir, m[1]!, true);
+          if (slot === null) throw new AuthorityRefusal("authority slot vanished during listing");
+          out.push(slot);
+          break;
+        } catch (error) {
+          if (!(error instanceof AuthorityRefusal) || error.message !== SLOT_AHEAD_OF_HEAD || attempt >= 3) throw error;
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+      }
+    }
+    return out;
   }
 
   #identityOf(): StoreIdentity {

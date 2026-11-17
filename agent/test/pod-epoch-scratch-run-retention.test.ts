@@ -11,9 +11,10 @@ import path from "node:path";
 import { formatAttemptId } from "../src/attempt-path.js";
 import { GitCache, type EpochScratchRunRetentionOptions } from "../src/git.js";
 import {
-  ENDED, classifyCredentialSwitchText, classifyMaintenanceTable, classifyRunDataDirRecords, judgeAuthoritySlot,
+  ENDED, classifyCredentialSwitchText, classifyRunDataDirRecords, judgeAuthoritySlot,
   judgeRetainedEvidence, normalizeRetention, type RetainedEvidenceShape,
 } from "../src/pod-epoch-run-retention.js";
+import { RecoveryMaintenance } from "../src/recovery-maintenance.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { noProofReseed, nullLogger, testGitCacheOptions } from "./helpers.js";
 
@@ -36,9 +37,14 @@ const ledger = (state: string, runId = RUN, clone = clonePath, id = attempt): st
 function options(over: Partial<EpochScratchRunRetentionOptions> = {}): EpochScratchRunRetentionOptions {
   return {
     lifecycle: { state: "terminal", status: "completed" }, holds: { state: "read", holds: [] },
-    signal: new AbortController().signal, deadline: Date.now() + 60_000, peekSlot: async () => null, ...over,
+    signal: new AbortController().signal, deadline: Date.now() + 60_000, peekSlot: async () => null, peekAllSlots: async () => [],
+    inspectMaintenance: inspectMaintenance(), ...over,
   };
 }
+const TOKEN = "fixture";
+/** The production reader: the authenticated recovery-maintenance validator over the fixture's data dir. */
+const inspectMaintenance = (): ((runId: string) => ReturnType<RecoveryMaintenance["inspectRun"]>) =>
+  runId => new RecoveryMaintenance({ root: path.join(fx.dataDir, "recovery-maintenance"), workerToken: TOKEN }).inspectRun(runId);
 const classify = (over: Partial<EpochScratchRunRetentionOptions> = {}, runId = RUN) => git.classifyEpochScratchRunRetention(runId, options(over));
 const active = (source: string) => ({ state: "active", source });
 const unknown = (source: string) => ({ state: "unknown", source });
@@ -241,6 +247,33 @@ describe("attempt footprint and authority slot (a retired ledger entry is ended 
     assert.deepEqual(await classify({ peekSlot: (async () => { reads++; return null; }) as never }), ENDED);
     assert.equal(reads, 0);
   });
+
+  it("authority inventory: a retained publication slot naming the run keeps it even with NO attempt ledger entry (compacted away)", async () => {
+    const publication = (runId: string) => ({ harness: "codex", sourceCoreDigest: "d".repeat(64), cohort: { runId, generation: 1, captureIds: [] } });
+    assert.deepEqual(await classify({ peekAllSlots: async () => [slot({ state: "sealed", publication: publication(OTHER) })] as never }), ENDED, "another run's slot");
+    assert.deepEqual(await classify({ peekAllSlots: async () => [slot({ state: "sealed", publication: publication(RUN) })] as never }),
+      active("authority_slot"));
+    assert.deepEqual(await classify({ peekAllSlots: async () => [slot({ state: "ineligible", publication: publication(RUN.toUpperCase()) })] as never }),
+      active("authority_slot"), "kept through ineligible, matched case-insensitively");
+  });
+
+  it("authority inventory: an unreadable, over-cap or missing enumeration, or a malformed publication, is unknown", async () => {
+    assert.deepEqual(await classify({ peekAllSlots: async () => { throw new Error("unauthenticated store"); } }), unknown("authority_inventory"));
+    assert.deepEqual(await classify({ peekAllSlots: undefined }), unknown("authority_inventory"));
+    assert.deepEqual(await classify({ peekAllSlots: (async () => [slot({ publication: { cohort: {} } })]) as never }), unknown("authority_inventory"));
+    let cap = 0;
+    await classify({ peekAllSlots: async max => { cap = max; return []; } });
+    assert.ok(cap > 0 && Number.isSafeInteger(cap), "the enumeration is bounded");
+  });
+
+  it("authority inventory: read once per pass through the memo", async () => {
+    let reads = 0;
+    const memo: NonNullable<EpochScratchRunRetentionOptions["memo"]> = {};
+    const peekAllSlots = async () => { reads++; return []; };
+    assert.deepEqual(await classify({ memo, peekAllSlots }), ENDED);
+    assert.deepEqual(await classify({ memo, peekAllSlots }, OTHER), ENDED);
+    assert.equal(reads, 1);
+  });
 });
 
 describe("custody and the retained groups", () => {
@@ -392,7 +425,7 @@ describe("judgeAuthoritySlot and normalizeRetention", () => {
 
 describe("dataDir records", () => {
   const records = (id = RUN, over: { maxDirectoryEntries?: number } = {}) =>
-    classifyRunDataDirRecords(fx.dataDir, id, { interrupt: () => undefined, maxDirectoryEntries: over.maxDirectoryEntries ?? 16384 });
+    classifyRunDataDirRecords(fx.dataDir, id, { interrupt: () => undefined, maxDirectoryEntries: over.maxDirectoryEntries ?? 16384, inspectMaintenance: inspectMaintenance() });
   const mkfile = (parts: string[], text = "{}") => { fs.mkdirSync(dataPath(...parts.slice(0, -1)), { recursive: true }); fs.writeFileSync(dataPath(...parts), text); };
 
   it("a data dir with none of the run's records is ended (every store root absent is observed absent)", async () => {
@@ -484,34 +517,112 @@ describe("dataDir records", () => {
     assert.deepEqual(await records(), unknown("quarantine_archive"));
   });
 
-  it("recovery-maintenance: a cycle of the run that is not exhausted is active; exhausted and other runs' are ended", async () => {
-    const cycle = (run: string, exhausted: boolean) => ({ identity: { run }, exhausted });
-    const write = (cycles: unknown[]) => {
-      mkfile(["recovery-maintenance", "complete.json"], JSON.stringify({ version: 1, cycles }));
-      mkfile(["recovery-maintenance", "initialized.json"], JSON.stringify({ version: 1 }));
-    };
-    write([cycle(OTHER, false), cycle(RUN, true)]);
+  const maintenanceAt = (root: string) => new RecoveryMaintenance({ root, workerToken: TOKEN });
+  /** One real, authenticated cycle of `run` in the ledger at `root`, then finished as `outcome` (complete = exhausted). */
+  const admitCycle = async (root: string, run: string, outcome: "complete" | "transient", seed = "b") => {
+    const ledger = maintenanceAt(root);
+    const admitted = await ledger.admit({
+      identity: { run, generation: 1, hold: "hold", repo: "repo", custodian: "worker", bareBasename: "x.git",
+        origin: "a".repeat(64), originalSource: seed.repeat(64), sourceConfig: "c".repeat(64) },
+      config: RecoveryMaintenance.configuration(), exactCustody: true, terminalNonStopped: true, source: seed.repeat(64),
+    });
+    assert.ok(admitted.ok);
+    assert.ok((await ledger.finish(admitted.value, outcome)).ok);
+  };
+
+  it("recovery-maintenance: through the authenticated validator, a cycle of the run that is not exhausted is active; exhausted and other runs' are ended", async () => {
+    const root = dataPath("recovery-maintenance");
+    await admitCycle(root, OTHER, "transient", "d");
+    await admitCycle(root, RUN, "complete");
     assert.deepEqual(await records(), ENDED);
-    write([cycle(OTHER, false), cycle(RUN.toUpperCase(), false)]);
+    fs.rmSync(root, { recursive: true });
+    await admitCycle(root, OTHER, "transient", "d");
+    await admitCycle(root, RUN.toUpperCase(), "transient");
     assert.deepEqual(await records(), active("recovery_maintenance"));
   });
 
-  it("recovery-maintenance: malformed, half-written and unreadable state is unknown", async () => {
-    mkfile(["recovery-maintenance", "complete.json"], "{nope");
-    mkfile(["recovery-maintenance", "initialized.json"], "{}");
-    assert.deepEqual(await records(), unknown("recovery_maintenance"));
-    mkfile(["recovery-maintenance", "complete.json"], JSON.stringify({ cycles: [{ identity: {}, exhausted: true }] }));
-    assert.deepEqual(await records(), unknown("recovery_maintenance"));
-    mkfile(["recovery-maintenance", "complete.json"], JSON.stringify({ cycles: [] }));
-    fs.rmSync(dataPath("recovery-maintenance", "initialized.json"));
+  it("recovery-maintenance: a pair the validator refuses (unauthenticated, mismatched hash, other ledger's table, incomplete, malformed marker) is unknown", async () => {
+    const root = dataPath("recovery-maintenance");
+    await admitCycle(root, RUN, "complete");
+    assert.deepEqual(await records(), ENDED, "the valid exhausted pair is ended");
+    const marker = fs.readFileSync(path.join(root, "initialized.json"), "utf8");
+    const table = fs.readFileSync(path.join(root, "complete.json"), "utf8");
+    // a flipped hash digit: the envelope MAC no longer matches
+    fs.writeFileSync(path.join(root, "initialized.json"), marker.replace(/("tableHash":")([0-9a-f])/, (_m, k, c) => `${k}${c === "0" ? "1" : "0"}`));
+    assert.deepEqual(await records(), unknown("recovery_maintenance"), "mismatched hash");
+    fs.writeFileSync(path.join(root, "initialized.json"), marker);
+    // another (valid, authenticated) ledger's table next to this ledger's marker
+    fs.mkdirSync(dataPath("foreign"));
+    const foreign = dataPath("foreign", "recovery-maintenance");
+    await admitCycle(foreign, OTHER, "transient", "d");
+    fs.copyFileSync(path.join(foreign, "complete.json"), path.join(root, "complete.json"));
+    assert.deepEqual(await records(), unknown("recovery_maintenance"), "table of another ledger");
+    fs.writeFileSync(path.join(root, "complete.json"), table.slice(0, table.length >> 1));
+    assert.deepEqual(await records(), unknown("recovery_maintenance"), "incomplete table");
+    fs.writeFileSync(path.join(root, "complete.json"), table);
+    fs.writeFileSync(path.join(root, "initialized.json"), "{bad");
+    assert.deepEqual(await records(), unknown("recovery_maintenance"), "malformed marker");
+    fs.writeFileSync(path.join(root, "initialized.json"), marker);
+    assert.deepEqual(await records(), ENDED, "restored");
+    fs.rmSync(path.join(root, "initialized.json"));
     assert.deepEqual(await records(), unknown("recovery_maintenance"), "the pair is written together: one without the other is not 'absent'");
-    mkfile(["recovery-maintenance", "initialized.json"], "{bad");
-    assert.deepEqual(await records(), unknown("recovery_maintenance"));
   });
 
-  it("classifyCredentialSwitchText and classifyMaintenanceTable are pure", () => {
+  it("recovery-maintenance: a legacy unauthenticated shape, a leftover initialisation stage and a missing validator are unknown; absent is ended", async () => {
+    mkfile(["recovery-maintenance", "complete.json"], JSON.stringify({ version: 1, cycles: [{ identity: { run: RUN }, exhausted: true }] }));
+    mkfile(["recovery-maintenance", "initialized.json"], JSON.stringify({ version: 1 }));
+    assert.deepEqual(await records(), unknown("recovery_maintenance"), "valid JSON with the right field names but no authentication");
+    assert.deepEqual(await classifyRunDataDirRecords(fx.dataDir, RUN, { interrupt: () => undefined, maxDirectoryEntries: 16 }), unknown("recovery_maintenance"),
+      "no validator supplied: a present store is kept");
+    fs.rmSync(dataPath("recovery-maintenance"), { recursive: true });
+    fs.mkdirSync(dataPath("recovery-maintenance.initializing"));
+    assert.deepEqual(await records(), unknown("recovery_maintenance"));
+    fs.rmdirSync(dataPath("recovery-maintenance.initializing"));
+    assert.deepEqual(await records(), ENDED);
+  });
+
+  it("every store parent must be a real directory: a dangling symlink or a symlink to an empty directory is unknown, absent is ended", async () => {
+    const stores: Array<[string, string]> = [["agent-home", "run_home"], ["retained-homes", "retained_home"],
+      ["credential-switch-ops", "credential_switch"], ["runner-quarantine", "runner_quarantine"],
+      ["terminal-preservation", "terminal_preservation"], ["recovery-archive", "quarantine_archive"]];
+    for (const [store, source] of stores) {
+      fs.symlinkSync(dataPath("no-such-target"), dataPath(store));
+      assert.deepEqual(await records(), unknown(source), `${store}: dangling symlink`);
+      fs.rmSync(dataPath(store));
+      fs.mkdirSync(dataPath("empty-target"), { recursive: true });
+      fs.symlinkSync(dataPath("empty-target"), dataPath(store));
+      assert.deepEqual(await records(), unknown(source), `${store}: symlink to an empty directory`);
+      fs.rmSync(dataPath(store));
+      assert.deepEqual(await records(), ENDED, `${store}: absent`);
+    }
+  });
+
+  it("the data dir itself must be a real directory", async () => {
+    const real = dataPath("real-data");
+    fs.mkdirSync(real);
+    const link = dataPath("link-data");
+    fs.symlinkSync(real, link);
+    const opts = { interrupt: () => undefined, maxDirectoryEntries: 16 };
+    assert.deepEqual(await classifyRunDataDirRecords(link, RUN, opts), unknown("data_dir"));
+    assert.deepEqual(await classifyRunDataDirRecords(dataPath("missing"), RUN, opts), unknown("data_dir"));
+  });
+
+  it("credential-switch-ops: entries the ledger's own parser refuses are unknown (not an object, bad generation, bad outcome)", async () => {
+    const file = ["credential-switch-ops", `${RUN}.json`];
+    for (const ops of [{ a: { state: "settled", generation: "invalid" } }, { a: "settled" }, { a: null }, { a: { state: "settled", generation: 1.5 } },
+      { a: { state: "settled", generation: 1, outcome: 7 } }, { a: { state: "weird", generation: 1 } }]) {
+      assert.equal(classifyCredentialSwitchText(JSON.stringify({ ops })).state, "unknown", JSON.stringify(ops));
+      mkfile(file, JSON.stringify({ ops }));
+      assert.deepEqual(await records(), unknown("credential_switch"), JSON.stringify(ops));
+      assert.deepEqual(await classify(), unknown("credential_switch"), `through the epoch path: ${JSON.stringify(ops)}`);
+    }
+    mkfile(file, JSON.stringify({ ops: { a: { state: "settled", generation: 1, outcome: "applied" } } }));
+    assert.deepEqual(await records(), ENDED);
+  });
+
+  it("classifyCredentialSwitchText is pure", () => {
     assert.deepEqual(classifyCredentialSwitchText(JSON.stringify({ ops: {} })), ENDED);
-    assert.deepEqual(classifyMaintenanceTable(JSON.stringify({ cycles: [] }), RUN), ENDED);
+    assert.deepEqual(classifyCredentialSwitchText(JSON.stringify({ ops: { a: { state: "ambiguous", generation: 2 } } })), active("credential_switch"));
   });
 
   it("the git classifier reads the same records (integration through the bare scan)", async () => {

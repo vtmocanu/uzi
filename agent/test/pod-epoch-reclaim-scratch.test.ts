@@ -22,6 +22,7 @@ import { nullLogger, noProofReseed, testGitCacheOptions } from "./helpers.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { formatAttemptId } from "../src/attempt-path.js";
 import { Outbox } from "../src/outbox.js";
+import { RecoveryMaintenance } from "../src/recovery-maintenance.js";
 import { WorkerClient } from "../src/client.js";
 import { execFileSync } from "node:child_process";
 import { ENABLE_DELETION_FOR_TEST, ENABLE_SCRATCH_FOR_TEST, perGroupInspect } from "./pod-epoch-reclaim-support.js";
@@ -1259,6 +1260,8 @@ interface RunWorld {
   status: Map<string, string | Error>;
   holds: (runId: string) => Awaited<ReturnType<Options["client"]["listRecoveryHolds"]>>;
   peek: (clonePath: string) => Promise<unknown>;
+  /** What the read-only slot enumeration returns. */
+  slots: unknown[];
   calls: string[];
   classified: string[];
   dataPath: (...parts: string[]) => string;
@@ -1277,7 +1280,7 @@ async function attachRunWorld(w: World): Promise<RunWorld> {
   const rw: RunWorld = {
     fx, git, bare, outboxRoot, outbox, status: new Map(), calls: [], classified: [],
     holds: run_id => ({ run_id, holds: [], run_open_holds: { run_id, count: 0 } }),
-    peek: async () => null,
+    peek: async () => null, slots: [],
     dataPath: (...parts) => join(fx.dataDir, ...parts),
     gitIn: args => execFileSync("git", ["-C", bare, ...args], { env: GIT_ENV, encoding: "utf8" }).trim(),
   };
@@ -1291,7 +1294,11 @@ async function attachRunWorld(w: World): Promise<RunWorld> {
   };
   const scratch = w.options.scratch!;
   scratch.git = { ...scratch.git, classifyEpochScratchRunRetention: (id, o) => { rw.classified.push(id); return git.classifyEpochScratchRunRetention(id, o); } };
-  scratch.authority = { peekSlot: clonePath => rw.peek(clonePath) as never };
+  scratch.authority = {
+    peekSlot: clonePath => rw.peek(clonePath) as never,
+    peekAllSlots: async () => rw.slots as never,
+    inspectMaintenance: runId => new RecoveryMaintenance({ root: join(fx.dataDir, "recovery-maintenance"), workerToken: "fixture" }).inspectRun(runId),
+  };
   scratch.outbox = outbox;
   const prior = w.cleanup;
   w.cleanup = async () => { fx.cleanup(); await prior(); };
@@ -1321,6 +1328,16 @@ test("#4420 reclaimed: a terminal zero-hold run with normal settled metadata (re
     assert.equal(JSON.parse(rw.gitIn(["config", "--get-all", `uzi-attempts.${RUN_BRANCH}.entry`]).split("\n").at(-1)!).state, "retired");
     assert.equal(rw.gitIn(["config", "--local", `uzi-recovery.${RUN_BRANCH}.clone`]), "");
     assert.equal(fs.existsSync(clonePath), false);
+    // The run's outbox is driven through the real Outbox: messages appended, drained (acked), a terminal journaled and
+    // retired, leaving the manifest-only directory a normally finished run leaves behind.
+    await rw.outbox.appendSegment(RUN_A, 1, [{ seq: 1, kind: "text", payload: { text: "hi" } }]);
+    assert.equal(rw.outbox.hasUndrainedMessages(RUN_A), true);
+    assert.deepEqual(await rw.outbox.drainRun(RUN_A, async () => undefined), { retired: true, staleRetired: 0 });
+    assert.deepEqual(await rw.outbox.journalTerminal(RUN_A, 1, "running", 1, { status: "completed" }), { journaled: true, adopted: false });
+    assert.equal(rw.outbox.hasPendingTerminal(RUN_A, 1), true);
+    assert.equal(await rw.outbox.retireTerminal(RUN_A, 1), true);
+    const outboxFiles = fs.readdirSync(join(rw.outboxRoot, RUN_A));
+    assert.deepEqual(outboxFiles, ["manifest.json"], "a manifest-only run directory: no segment, terminal-, publication- or finalize- file");
     assert.equal(await rw.outbox.hasPhysicalTerminalProtection(RUN_A), false);
     const result = await run(w);
     assert.equal(result.scratch.state, "ran");

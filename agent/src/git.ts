@@ -34,7 +34,7 @@ import { unmarkedSpawnEnv, workerSpawnEnv } from "./worker-spawn-mark.js";
 import { PINNED_SUBTREE_SCRIPT, SCRATCH_DELETE_LIMITS, TREE_NAME_RE, censusScratchRoot, rmRunnerTeardownTree } from "./rmtree.js";
 import { absorbBareConfigValue, classifyScratchSettlement, isNeverRemovedScratchName, newPathSink, parseScratchCensus, postCensusOf, readProtectedStores, type ProtectedPathsRead, type Settlement } from "./pod-epoch-scratch.js";
 import {
-  ENDED, activeRetention, classifyRunDataDirRecords, isRunUuid, judgeAuthoritySlot, judgeRetainedEvidence, unknownRetention, type RunRetention,
+  ENDED, activeRetention, classifyRunDataDirRecords, isRunUuid, judgeAuthoritySlot, judgeRetainedEvidence, unknownRetention, type MaintenanceInspection, type RunRetention,
 } from "./pod-epoch-run-retention.js";
 import type { SlotSnapshot } from "./completion-authority.js";
 import { classifyForgeError, withForgeRetry } from "./forge-retry.js";
@@ -2703,7 +2703,11 @@ export interface EpochScratchRunRetentionOptions {
   /** Pass-scoped memo of the worker-wide retained census, so N run leaves cost one census. */
   discovery?: { value?: Promise<EpochRetainedDiscoveryResult> };
   /** Pass-scoped memo of each bare's `config --local --null --list` text (keyed by bare path), so N run leaves read each bare once. */
-  memo?: { bareConfigs?: Map<string, Promise<string>> };
+  memo?: { bareConfigs?: Map<string, Promise<string>>; slots?: Promise<SlotSnapshot[]> };
+  /** Read-only, bounded enumeration of every authority slot (AuthorityRuntime.peekAllSlots); absent makes the run unknown (`authority_inventory`). */
+  peekAllSlots?: (max: number) => Promise<SlotSnapshot[]>;
+  /** The authenticated recovery-maintenance read (RecoveryMaintenance.inspectRun); absent makes a present maintenance store unknown. */
+  inspectMaintenance?: (runId: string) => Promise<MaintenanceInspection>;
 }
 
 /** The server's lifecycle verdict for a run, read by the caller (never by GitCache) before it
@@ -4977,10 +4981,27 @@ export class GitCache {
       const judged = judgeAuthoritySlot(footprint, slot);
       if (judged.state !== "ended") return judged;
     }
+    // A slot whose publication cohort names this run is a live authority record even when no ledger entry of the run
+    // remains to name its clone path (ledger compaction can drop one). Read-only, capped, once per pass; any failure,
+    // an unreadable or unauthenticated slot, a cap or a missing accessor is unknown.
+    if (!opts.peekAllSlots) return unknownRetention("authority_inventory");
+    let slots: SlotSnapshot[];
+    try {
+      const inventory = opts.memo
+        ? (opts.memo.slots ??= this.retainedIO(() => opts.peekAllSlots!(limits.maxDirectoryEntries)))
+        : this.retainedIO(() => opts.peekAllSlots!(limits.maxDirectoryEntries));
+      slots = await inventory;
+    } catch { this.checkRecoveryInterruption(); return unknownRetention("authority_inventory"); }
+    for (const slot of slots) {
+      const cohortRun = slot?.publication?.cohort?.runId;
+      if (slot?.publication != null && typeof cohortRun !== "string") return unknownRetention("authority_inventory");
+      if (typeof cohortRun === "string" && cohortRun.toLowerCase() === id) return activeRetention("authority_slot");
+    }
     // custodyHeld folds an unreadable store into "held" (fail closed), so that case reads as active here.
     if (await this.custodyHeld(runId)) return activeRetention("custody");
     return classifyRunDataDirRecords(path.dirname(this.reposRoot), id, {
       interrupt: () => this.checkRecoveryInterruption(), maxDirectoryEntries: limits.maxDirectoryEntries,
+      ...(opts.inspectMaintenance ? { inspectMaintenance: opts.inspectMaintenance } : {}),
     });
   }
 

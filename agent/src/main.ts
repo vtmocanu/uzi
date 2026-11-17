@@ -24,6 +24,7 @@ import { CodexExecutor, FailClosedExecutor, CODEX_PRODUCTION_PROVIDER, makeProdu
 import { ChatExecutor, type ChatExecutorLike } from "./chat-executor.js";
 import { StubChatExecutor } from "./chat-executor-stub.js";
 import { CredentialSwitchOpLedger } from "./credential-switch-op-ledger.js";
+import { RecoveryMaintenance } from "./recovery-maintenance.js";
 import { RunRunner, type ExecutorFactory, type RunExecution, type RunExecutorAddress, type RunnerOptions } from "./runner.js";
 import { ChatRunner } from "./chat-runner.js";
 import { Outbox, deriveTerminalReserveBytes } from "./outbox.js";
@@ -1286,7 +1287,12 @@ async function mainBody(): Promise<void> {
       deletion: buildPodEpochDeletionDeps({ authority, runner, git, dockerHost: config.dockerWiring.dockerHost, activation: epochReclaimDeletion }),
       scratch: buildPodEpochScratchDeps({
         git, dockerHost: config.dockerWiring.dockerHost, activation: epochScratchDeletion,
-        authority: { peekSlot: clonePath => authority.peekSlot(clonePath) }, outbox,
+        authority: {
+          peekSlot: clonePath => authority.peekSlot(clonePath), peekAllSlots: max => authority.peekAllSlots(max),
+          inspectMaintenance: runId => new RecoveryMaintenance({
+            root: path.join(config.dataDir, "recovery-maintenance"), workerToken: config.workerToken,
+          }).inspectRun(runId),
+        }, outbox,
       }),
     });
     if (result !== undefined) log.info("pod_epoch_reclaim", { ...result });

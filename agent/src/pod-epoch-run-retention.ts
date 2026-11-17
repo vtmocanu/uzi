@@ -10,6 +10,7 @@ import { constants as fsc } from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import type { SlotSnapshot } from "./completion-authority.js";
+import { parseFile as parseCredentialSwitchOps } from "./credential-switch-op-ledger.js";
 import { holdingNamePrefix } from "./restore-journal.js";
 import { parseRunDirName } from "./util.js";
 
@@ -125,64 +126,69 @@ async function readBounded(file: string, max: number, interrupt: () => void): Pr
   finally { await handle.close().catch(() => undefined); }
 }
 
-const CREDENTIAL_STATES = new Set(["sending", "ambiguous", "clean_route_absent", "settled"]);
-
-/** `credential-switch-ops/<runId>.json` (credential-switch-op-ledger.ts): any `sending`/`ambiguous` op may have
- *  committed server-side, so it is active; all `settled`/`clean_route_absent` is ended; anything else is unknown. */
+/** `credential-switch-ops/<runId>.json`, parsed by the ledger's own strict parser (credential-switch-op-ledger.ts): any
+ *  `sending`/`ambiguous` op may have committed server-side, so it is active; all `settled`/`clean_route_absent` is
+ *  ended; a file or entry the ledger itself would refuse is unknown. */
 export function classifyCredentialSwitchText(text: string): RunRetention {
-  let parsed: unknown;
-  try { parsed = JSON.parse(text); } catch { return unknownRetention("credential_switch"); }
-  const ops = (parsed as { ops?: unknown } | null)?.ops;
-  if (typeof ops !== "object" || ops === null || Array.isArray(ops)) return unknownRetention("credential_switch");
+  let entries: ReturnType<typeof parseCredentialSwitchOps>;
+  try { entries = parseCredentialSwitchOps(text); } catch { return unknownRetention("credential_switch"); }
   let result: RunRetention = ENDED;
-  for (const entry of Object.values(ops)) {
-    const state = (entry as { state?: unknown } | null)?.state;
-    if (typeof state !== "string" || !CREDENTIAL_STATES.has(state)) return unknownRetention("credential_switch");
-    if (state === "sending" || state === "ambiguous") result = activeRetention("credential_switch");
+  for (const entry of entries.values()) {
+    if (entry.state === "sending" || entry.state === "ambiguous") result = activeRetention("credential_switch");
   }
   return result;
 }
 
-/** `recovery-maintenance/complete.json`: a cycle of this run that is not `exhausted` may still do work. */
-export function classifyMaintenanceTable(text: string, id: string): RunRetention {
-  let parsed: unknown;
-  try { parsed = JSON.parse(text); } catch { return unknownRetention("recovery_maintenance"); }
-  const cycles = (parsed as { cycles?: unknown } | null)?.cycles;
-  if (!Array.isArray(cycles)) return unknownRetention("recovery_maintenance");
-  let result: RunRetention = ENDED;
-  for (const cycle of cycles) {
-    const c = cycle as { identity?: { run?: unknown }; exhausted?: unknown } | null;
-    const run = c?.identity?.run;
-    if (typeof run !== "string" || typeof c?.exhausted !== "boolean") return unknownRetention("recovery_maintenance");
-    if (run.toLowerCase() === id && c.exhausted !== true) result = activeRetention("recovery_maintenance");
-  }
-  return result;
-}
+/** The result of the authenticated recovery-maintenance read (RecoveryMaintenance.inspectRun). */
+export type MaintenanceInspection = "absent" | "ended" | "active" | "unknown";
 
 const MAX_RECORD_BYTES = 1024 * 1024;
-const MAX_TABLE_BYTES = 16 * 1024 * 1024;
 const MAX_QUARANTINE_ENTRIES = 4096;
 
+type StoreDir = "absent" | "dir" | "unknown";
+
+/** One store directory directly under the data dir: ENOENT is observed-absent, a real directory proceeds, a symlink,
+ *  any other type or any other error is unknown. Checked BEFORE a child is read, because O_NOFOLLOW covers only the
+ *  final path component of a read. */
+async function storeDir(dir: string, interrupt: () => void): Promise<StoreDir> {
+  interrupt();
+  try {
+    const st = await fsp.lstat(dir);
+    return st.isDirectory() && !st.isSymbolicLink() ? "dir" : "unknown";
+  } catch (error) {
+    interrupt();
+    return (error as NodeJS.ErrnoException).code === "ENOENT" ? "absent" : "unknown";
+  }
+}
+
 /**
- * The run's records directly under the worker data dir. lstat-based: ENOENT is observed-absent (ended for that
- * source); any other error, a symlink where a directory belongs, an oversized file or a listing over its cap is
- * unknown. `id` is the lowercase run id.
+ * The run's records directly under the worker data dir. lstat-based: the data dir and each store directory must be a
+ * real directory (ENOENT on a store is observed-absent, ended for that source); any other error, a symlink where a
+ * directory belongs, an oversized file or a listing over its cap is unknown. `id` is the lowercase run id.
+ * `inspectMaintenance` is the authenticated read of recovery-maintenance (RecoveryMaintenance.inspectRun); without it a
+ * present recovery-maintenance store is unknown.
  */
 export async function classifyRunDataDirRecords(
-  dataDir: string, id: string, opts: { interrupt: () => void; maxDirectoryEntries: number },
+  dataDir: string, id: string,
+  opts: { interrupt: () => void; maxDirectoryEntries: number; inspectMaintenance?: (id: string) => Promise<MaintenanceInspection> },
 ): Promise<RunRetention> {
   const { interrupt } = opts;
-  const present = async (relative: string, source: string): Promise<RunRetention | undefined> => {
-    const state = await probe(path.join(dataDir, relative), interrupt);
+  if (await storeDir(dataDir, interrupt) !== "dir") return unknownRetention("data_dir");
+  /** The child of a verified store directory: present is active, an unreadable store or child is unknown. */
+  const present = async (store: string, child: string, source: string): Promise<RunRetention | undefined> => {
+    const parent = await storeDir(path.join(dataDir, store), interrupt);
+    if (parent === "absent") return undefined;
+    if (parent === "unknown") return unknownRetention(source);
+    const state = await probe(path.join(dataDir, store, child), interrupt);
     return state === "present" ? activeRetention(source) : state === "unknown" ? unknownRetention(source) : undefined;
   };
   // 1. The run HOME: `agent-home/<runId>` or an independent restore's `<runId>.g<N>`.
-  const home = await present(path.join("agent-home", id), "run_home");
+  const home = await present("agent-home", id, "run_home");
   if (home) return home;
   const homes = path.join(dataDir, "agent-home");
-  const homesState = await probe(homes, interrupt);
+  const homesState = await storeDir(homes, interrupt);
   if (homesState === "unknown") return unknownRetention("run_home");
-  if (homesState === "present") {
+  if (homesState === "dir") {
     let dir: Awaited<ReturnType<typeof fsp.opendir>>;
     try { dir = await fsp.opendir(homes, { bufferSize: 1 }); } catch { interrupt(); return unknownRetention("run_home"); }
     try {
@@ -197,21 +203,21 @@ export async function classifyRunDataDirRecords(
     } catch { interrupt(); return unknownRetention("run_home"); }
     finally { await dir.close().catch(() => undefined); }
   }
-  const retainedHome = await present(path.join("retained-homes", `${id}.json`), "retained_home");
+  const retainedHome = await present("retained-homes", `${id}.json`, "retained_home");
   if (retainedHome) return retainedHome;
   // 2. The credential-switch write-ahead ledger.
-  const ops = await readBounded(path.join(dataDir, "credential-switch-ops", `${id}.json`), MAX_RECORD_BYTES, interrupt);
-  if (ops === "unknown") return unknownRetention("credential_switch");
-  if (ops !== "absent") { const r = classifyCredentialSwitchText(ops.text); if (r.state !== "ended") return r; }
+  const opsStore = await storeDir(path.join(dataDir, "credential-switch-ops"), interrupt);
+  if (opsStore === "unknown") return unknownRetention("credential_switch");
+  if (opsStore === "dir") {
+    const ops = await readBounded(path.join(dataDir, "credential-switch-ops", `${id}.json`), MAX_RECORD_BYTES, interrupt);
+    if (ops === "unknown") return unknownRetention("credential_switch");
+    if (ops !== "absent") { const r = classifyCredentialSwitchText(ops.text); if (r.state !== "ended") return r; }
+  }
   // 3. A quarantined (holding) runner directory named for the run.
   const quarantine = path.join(dataDir, "runner-quarantine");
-  const quarantineState = await probe(quarantine, interrupt);
+  const quarantineState = await storeDir(quarantine, interrupt);
   if (quarantineState === "unknown") return unknownRetention("runner_quarantine");
-  if (quarantineState === "present") {
-    try {
-      const st = await fsp.lstat(quarantine);
-      if (!st.isDirectory() || st.isSymbolicLink()) return unknownRetention("runner_quarantine");
-    } catch { interrupt(); return unknownRetention("runner_quarantine"); }
+  if (quarantineState === "dir") {
     const prefix = holdingNamePrefix(id).toLowerCase();
     let dir: Awaited<ReturnType<typeof fsp.opendir>>;
     try { dir = await fsp.opendir(quarantine, { bufferSize: 1 }); } catch { interrupt(); return unknownRetention("runner_quarantine"); }
@@ -228,17 +234,19 @@ export async function classifyRunDataDirRecords(
     finally { await dir.close().catch(() => undefined); }
   }
   // 4. Terminal preservation and the quarantine archive (its contract has no ended predicate).
-  const terminal = await present(path.join("terminal-preservation", id), "terminal_preservation");
+  const terminal = await present("terminal-preservation", id, "terminal_preservation");
   if (terminal) return terminal;
-  const archive = await present(path.join("recovery-archive", id), "quarantine_archive");
+  const archive = await present("recovery-archive", id, "quarantine_archive");
   if (archive) return archive;
-  // 5. The recovery-maintenance table: complete.json and initialized.json are written as a pair.
-  const root = path.join(dataDir, "recovery-maintenance");
-  const table = await readBounded(path.join(root, "complete.json"), MAX_TABLE_BYTES, interrupt);
-  const marker = await readBounded(path.join(root, "initialized.json"), MAX_TABLE_BYTES, interrupt);
-  if (table === "unknown" || marker === "unknown") return unknownRetention("recovery_maintenance");
-  if (table === "absent" && marker === "absent") return ENDED;
-  if (table === "absent" || marker === "absent") return unknownRetention("recovery_maintenance");
-  try { JSON.parse(marker.text); } catch { return unknownRetention("recovery_maintenance"); }
-  return classifyMaintenanceTable(table.text, id);
+  // 5. The recovery-maintenance table, read only through its own authenticated validator.
+  const maintenance = path.join(dataDir, "recovery-maintenance");
+  const root = await probe(maintenance, interrupt);
+  const stage = await probe(`${maintenance}.initializing`, interrupt);
+  if (root === "absent" && stage === "absent") return ENDED;
+  if (!opts.inspectMaintenance) return unknownRetention("recovery_maintenance");
+  let inspected: MaintenanceInspection;
+  try { inspected = await opts.inspectMaintenance(id); } catch { interrupt(); return unknownRetention("recovery_maintenance"); }
+  if (inspected === "ended") return ENDED;
+  if (inspected === "active") return activeRetention("recovery_maintenance");
+  return unknownRetention("recovery_maintenance");
 }

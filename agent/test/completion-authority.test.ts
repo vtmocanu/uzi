@@ -11,7 +11,7 @@ import {
 } from "../src/authority-lock.js";
 import {
   type AuthorityFsOps, AuthorityStore, installWorkerLifetime, leaseEpoch, leaseHarness, leaseSlotKey, openAuthorityStore,
-  peekAuthoritySlot, requireWorkerLifetime, SourceUseLease, type SlotSnapshot,
+  peekAllAuthoritySlots, peekAuthoritySlot, requireWorkerLifetime, SourceUseLease, type SlotSnapshot,
 } from "../src/completion-authority.js";
 import { buildClaudeSourceCore, buildCodexSourceCore, type CompletionSourceV2, sourceCoreDigest } from "../src/completion-source.js";
 import { ExecutorLifetime } from "../src/codex/executor-lifetime.js";
@@ -1509,6 +1509,31 @@ test("peekAuthoritySlot reads a slot with no transaction and writes nothing", as
   // Slots without an enrollment are a reset, never an empty store.
   fs.rmSync(enrollmentFile(f));
   await assert.rejects(peek(), /reset|without an enrollment/);
+});
+
+test("peekAllAuthoritySlots lists every slot read-only, bounded, and refuses what it cannot authenticate", async (t) => {
+  const f = await fixture(t);
+  const all = (max = 16): Promise<SlotSnapshot[]> => peekAllAuthoritySlots({ dataDir: f.root, workerToken: f.token }, max);
+  assert.deepEqual(await all(), [], "nothing enrolled: no slots, and no store created");
+  assert.equal(fs.existsSync(enrollmentFile(f)), false);
+  const s = await store(f);
+  assert.deepEqual(await all(), [], "enrolled, never admitted");
+  const a = source(f, "runner/qa"), b = source(f, "runner/qb");
+  await tx(f, (t2) => s.admitSourceUse(t2, a));
+  await tx(f, (t2) => s.admitSourceUse(t2, b));
+  const keys = [await tx(f, (t2) => s.slotKey(t2, a)), await tx(f, (t2) => s.slotKey(t2, b))].sort();
+  const stamp = (): string => fs.readdirSync(slotsDir(f)).sort().map((n) => fs.readFileSync(path.join(slotsDir(f), n), "utf8")).join("|");
+  const before = stamp();
+  const seen = await all();
+  assert.deepEqual(seen.map((x) => x.key).sort(), keys);
+  assert.equal(stamp(), before, "listing writes nothing");
+  await assert.rejects(all(1), /exceeds its cap/);
+  await assert.rejects(peekAllAuthoritySlots({ dataDir: f.root, workerToken: f.token + "x" }, 16), /authenticat/);
+  fs.writeFileSync(path.join(slotsDir(f), "stray.json"), "{}");
+  await assert.rejects(all(), /unexpected entry/);
+  fs.rmSync(path.join(slotsDir(f), "stray.json"));
+  fs.writeFileSync(path.join(slotsDir(f), `.${keys[0]}.json.00000000-0000-4000-8000-000000000000.tmp`), "x");
+  assert.equal((await all()).length, 2, "an orphaned write temp file is not a slot");
 });
 
 test("a fresh epoch over a live publication needs the explicit consuming purpose; nothing else mints one", async (t) => {
