@@ -107,6 +107,7 @@ apiget() {
     /api/auth/me) jq -cn --argjson value "$ORIGINAL" '{user:{autopilot_enabled:$value}}' ;;
     /api/forge/connections) echo '{"connections":[{"id":"connection","human_username":"owner-alice"}]}' ;;
     /api/forge/connections/connection/projects) echo '{"repos":[{"id":"repo2","path_with_namespace":"group/repo2"}]}' ;;
+    /api/repos/repo2/board) echo '{"board":{"initial_import":{"state":"succeeded"}}}' ;;
     /api/me/secrets)
       if [ -f "$STATE/token" ]; then
         echo '{"secrets":[{"id":"11111111-1111-4111-8111-111111111111","kind":"anthropic_token","label":"default","is_default":true},{"id":"22222222-2222-4222-8222-222222222222","kind":"anthropic_token","label":"console-key","is_default":false}]}'
@@ -345,6 +346,45 @@ regate "new claim not yet at the gate"              fail "timeout: run R was nev
 regate "gate row with no claimed_at"                fail "timeout: run R was never re-gated" awaiting_approval:
 regate "terminal failure while waiting"             fail "run R entered 'failed'" awaiting_approval:T0 failed:T1
 regate "cancelled while waiting"                    fail "run R entered 'cancelled'" awaiting_approval:T0 cancelled:
+
+# wait_initial_import (#4399): an API enable returns before the first issue import, and only a
+# `succeeded` board status proves the import's eviction pass is over. The scripted apiget serves
+# one board DTO per poll (sticking on the last); each step is a state name, `null` for a legacy
+# board with no import, or `raw:<json>` for a literal body. The virtual clock makes the 3s
+# timeout allow exactly three polls.
+eval "$(awk '/^wait_initial_import\(\) \{/,/^\}/' "$LIB")"
+cases=$((cases + 1))
+if type wait_initial_import >/dev/null 2>&1; then
+  passed=$((passed + 1)); echo "PASS: wait_initial_import extracted from lib.sh"
+else
+  echo "FAIL: wait_initial_import not defined — extraction failed or the helper was removed"
+fi
+# import_wait NAME WANT(pass|fail) DIAGNOSTIC_PREFIX STEP...
+import_wait() {
+  cases=$((cases + 1))
+  local name="$1" want="$2" diagnostic="$3" got output; shift 3
+  : > "$SEQ_DIR/seq"; echo 1 > "$SEQ_DIR/n"
+  for step in "$@"; do
+    case "$step" in
+      null) echo '{"board":{"initial_import":null}}' >> "$SEQ_DIR/seq" ;;
+      raw:*) echo "${step#raw:}" >> "$SEQ_DIR/seq" ;;
+      *) jq -nc --arg s "$step" '{board: {initial_import: {state: $s}}}' >> "$SEQ_DIR/seq" ;;
+    esac
+  done
+  if output="$(unset SECONDS; SECONDS=0; wait_initial_import REPO 3 2>&1)"; then got=pass; else got=fail; fi
+  if [ "$got" = "$want" ] && [[ "$output" == "$diagnostic"* ]]; then
+    passed=$((passed + 1)); echo "PASS: $name"
+  else
+    echo "FAIL: $name — got $got want $want; output [$output] (want prefix [$diagnostic])"
+  fi
+}
+import_wait "already succeeded"                     pass "" succeeded
+import_wait "waiting then running then succeeded"   pass "" waiting running succeeded
+import_wait "failed is retried, not terminal"       pass "" failed running succeeded
+import_wait "never leaves running"                  fail "timeout: repo REPO first issue import did not succeed within 3s (last state: running)" running
+import_wait "a persistent failure names its state"  fail "timeout: repo REPO first issue import did not succeed within 3s (last state: failed)" failed
+import_wait "legacy board without an import"        fail "timeout: repo REPO first issue import did not succeed within 3s (last state: none)" null
+import_wait "unparseable board is not success"      fail "timeout: repo REPO first issue import did not succeed within 3s (last state: unreadable)" raw:notjson
 
 # settle_runs_terminal: best-effort, so it must return 0 both when a run settles and when it
 # never does, and it must stop polling a run once that run is terminal. The virtual clock

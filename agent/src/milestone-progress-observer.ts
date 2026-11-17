@@ -8,6 +8,13 @@ import type { Milestone, MilestoneProgress } from "./protocol.js";
  *     previous turn's final snapshot) and advanced across the turn's several observations,
  *     so an id newly `in_progress`/`completed` emits its transition frame exactly ONCE and
  *     a repeat emits nothing;
+ *   - `serverCompletedIds`, the server's CURRENT `milestones_completed` from the latest
+ *     reportIteration ACK, unioned into the completed diff base at every observation so a
+ *     resumed execution (whose loop-scope progress starts undefined) does not re-announce a
+ *     milestone a prior execution already reported complete. It tracks the server's list as
+ *     served, so after the cross-worker reseed reset (ClearRunMilestonesCompleted) an empty
+ *     list re-allows those announcements. The ACK carries no in-progress ids, so a resumed
+ *     lead's "started" frames can still repeat (known limit; a restarted milestone is real);
  *   - the frozen milestone titles, taken from the loop-scope frozen list (from approval
  *     or the resumed claim), with `ctx.frozenMilestones` as a fallback when unavailable;
  *     a missing title degrades to a titleless frame, never a skip.
@@ -17,13 +24,14 @@ export function makeProgressObserver(
   ctx: RunContext,
   seed: MilestoneProgress | undefined,
   frozen: Milestone[] | undefined,
+  serverCompletedIds?: readonly string[],
 ): (progress: MilestoneProgress) => void {
   let lastObserved: MilestoneProgress | undefined = seed;
   const titles = new Map<string, string>();
   for (const m of frozen ?? ctx.frozenMilestones ?? []) titles.set(m.id, m.title);
   return (progress: MilestoneProgress): void => {
     const prevInProgress = new Set(lastObserved?.in_progress ?? []);
-    const prevCompleted = new Set(lastObserved?.completed ?? []);
+    const prevCompleted = new Set([...(lastObserved?.completed ?? []), ...(serverCompletedIds ?? [])]);
     // Emit completions before starts: when one observation both finishes a milestone and
     // starts the next, "m1 reported complete" then "m2 started" is the natural reading.
     for (const id of progress.completed) {

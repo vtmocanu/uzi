@@ -1,0 +1,3 @@
+component	ghsa	package	range	max_severity	recheck_by	issue
+web	GHSA-fc5q-39xc-vjpf	picomatch	<=4.0.7	high	2026-12-01	#4435
+agent	GHSA-fc5q-39xc-vjpf	picomatch	<=4.0.7	high	2026-12-01	#4435

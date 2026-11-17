@@ -182,6 +182,31 @@ func (q *Queries) AdminListReposWithPrivilege(ctx context.Context) ([]AdminListR
 	return items, nil
 }
 
+const claimRepoInitialImport = `-- name: ClaimRepoInitialImport :execrows
+UPDATE repos SET
+  initial_import_state = 'running',
+  initial_import_error_class = NULL,
+  initial_import_updated_at = now()
+WHERE repos.id = $1
+  AND repos.initial_import_generation = $2
+  AND repos.initial_import_state IN ('waiting','running','failed')
+`
+
+type ClaimRepoInitialImportParams struct {
+	ID                      uuid.UUID `json:"id"`
+	InitialImportGeneration int64     `json:"initial_import_generation"`
+}
+
+// The poller's claim of the repo's owed first import at the generation it read.
+// Zero rows means the generation moved (disable/enable) or the import is not owed.
+func (q *Queries) ClaimRepoInitialImport(ctx context.Context, arg ClaimRepoInitialImportParams) (int64, error) {
+	result, err := q.db.Exec(ctx, claimRepoInitialImport, arg.ID, arg.InitialImportGeneration)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const clearBoardOrderExcept = `-- name: ClearBoardOrderExcept :exec
 UPDATE issues
 SET board_position = NULL
@@ -222,7 +247,7 @@ SET guardrail_override_reason = NULL,
     guardrail_override_by     = NULL,
     guardrail_override_at     = NULL
 WHERE id = $1
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, initial_import_state, initial_import_generation, initial_import_error_class, initial_import_updated_at
 `
 
 // PRD #66 M8 (D8): revoke the admin per-repo override, re-arming the guardrail
@@ -252,6 +277,10 @@ func (q *Queries) ClearRepoGuardrailOverride(ctx context.Context, id uuid.UUID) 
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.InitialImportState,
+		&i.InitialImportGeneration,
+		&i.InitialImportErrorClass,
+		&i.InitialImportUpdatedAt,
 	)
 	return i, err
 }
@@ -484,6 +513,99 @@ type DeleteRepoForUserParams struct {
 // (runs, cached issues, board columns, ...) via existing FKs.
 func (q *Queries) DeleteRepoForUser(ctx context.Context, arg DeleteRepoForUserParams) (int64, error) {
 	result, err := q.db.Exec(ctx, deleteRepoForUser, arg.ID, arg.UserID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const enableRepoForUser = `-- name: EnableRepoForUser :one
+UPDATE repos SET
+  enabled = true,
+  initial_import_generation = CASE
+    WHEN NOT repos.enabled OR repos.initial_import_state IS DISTINCT FROM 'succeeded'
+    THEN repos.initial_import_generation + 1 ELSE repos.initial_import_generation END,
+  initial_import_state = CASE
+    WHEN NOT repos.enabled OR repos.initial_import_state IS DISTINCT FROM 'succeeded'
+    THEN 'waiting' ELSE repos.initial_import_state END,
+  initial_import_error_class = CASE
+    WHEN NOT repos.enabled OR repos.initial_import_state IS DISTINCT FROM 'succeeded'
+    THEN NULL ELSE repos.initial_import_error_class END,
+  initial_import_updated_at = CASE
+    WHEN NOT repos.enabled OR repos.initial_import_state IS DISTINCT FROM 'succeeded'
+    THEN now() ELSE repos.initial_import_updated_at END
+WHERE repos.id = $1
+  AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $2)
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, initial_import_state, initial_import_generation, initial_import_error_class, initial_import_updated_at
+`
+
+type EnableRepoForUserParams struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+// Owner-scoped enable that also records the first-import intent (issue #4399).
+// A newly enabled repo, or one whose import has not succeeded, gets a new
+// generation in state 'waiting' for the poller to run; re-enabling an already
+// enabled repo whose import succeeded changes nothing. The SET expressions read
+// the OLD row, so `repos.enabled` below is the pre-update value.
+func (q *Queries) EnableRepoForUser(ctx context.Context, arg EnableRepoForUserParams) (Repo, error) {
+	row := q.db.QueryRow(ctx, enableRepoForUser, arg.ID, arg.UserID)
+	var i Repo
+	err := row.Scan(
+		&i.ID,
+		&i.ConnectionID,
+		&i.ForgeProjectID,
+		&i.PathWithNamespace,
+		&i.WebUrl,
+		&i.DefaultBranch,
+		&i.Enabled,
+		&i.RepoSkillsEnabled,
+		&i.RepoDevboxOptIn,
+		&i.RepoClaudemdEnabled,
+		&i.GuardrailOverrideReason,
+		&i.GuardrailOverrideBy,
+		&i.GuardrailOverrideAt,
+		&i.RequiredCapabilities,
+		&i.FoldImproveUziBacklog,
+		&i.CodeCrossCheckGuidance,
+		&i.CrossCheckRepoInstructionsEnabled,
+		&i.IgnoredInferredCapabilities,
+		&i.AgentSourceDefault,
+		&i.InitialImportState,
+		&i.InitialImportGeneration,
+		&i.InitialImportErrorClass,
+		&i.InitialImportUpdatedAt,
+	)
+	return i, err
+}
+
+const finishRepoInitialImport = `-- name: FinishRepoInitialImport :execrows
+UPDATE repos SET
+  initial_import_state = $1::text,
+  initial_import_error_class = $2::text,
+  initial_import_updated_at = now()
+WHERE repos.id = $3
+  AND repos.initial_import_generation = $4
+  AND repos.initial_import_state = 'running'
+`
+
+type FinishRepoInitialImportParams struct {
+	State      string      `json:"state"`
+	ErrorClass pgtype.Text `json:"error_class"`
+	ID         uuid.UUID   `json:"id"`
+	Generation int64       `json:"generation"`
+}
+
+// Settles a claimed import: state 'succeeded' with a NULL class, or 'failed' with
+// a class. Generation- and state-guarded so a stale finisher writes zero rows.
+func (q *Queries) FinishRepoInitialImport(ctx context.Context, arg FinishRepoInitialImportParams) (int64, error) {
+	result, err := q.db.Exec(ctx, finishRepoInitialImport,
+		arg.State,
+		arg.ErrorClass,
+		arg.ID,
+		arg.Generation,
+	)
 	if err != nil {
 		return 0, err
 	}
@@ -775,6 +897,7 @@ const getRepoForUser = `-- name: GetRepoForUser :one
 SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url,
        r.default_branch, r.enabled, r.fold_improve_uzi_backlog,
        r.guardrail_override_reason, r.guardrail_override_by, r.guardrail_override_at,
+       r.initial_import_state, r.initial_import_error_class, r.initial_import_updated_at,
        c.forge_type, c.base_url, c.token_ciphertext, c.user_id, c.bot_forge_user_id
 FROM repos r
 JOIN forge_connections c ON c.id = r.connection_id
@@ -798,6 +921,9 @@ type GetRepoForUserRow struct {
 	GuardrailOverrideReason pgtype.Text        `json:"guardrail_override_reason"`
 	GuardrailOverrideBy     pgtype.UUID        `json:"guardrail_override_by"`
 	GuardrailOverrideAt     pgtype.Timestamptz `json:"guardrail_override_at"`
+	InitialImportState      pgtype.Text        `json:"initial_import_state"`
+	InitialImportErrorClass pgtype.Text        `json:"initial_import_error_class"`
+	InitialImportUpdatedAt  pgtype.Timestamptz `json:"initial_import_updated_at"`
 	ForgeType               string             `json:"forge_type"`
 	BaseUrl                 string             `json:"base_url"`
 	TokenCiphertext         []byte             `json:"token_ciphertext"`
@@ -825,6 +951,9 @@ func (q *Queries) GetRepoForUser(ctx context.Context, arg GetRepoForUserParams) 
 		&i.GuardrailOverrideReason,
 		&i.GuardrailOverrideBy,
 		&i.GuardrailOverrideAt,
+		&i.InitialImportState,
+		&i.InitialImportErrorClass,
+		&i.InitialImportUpdatedAt,
 		&i.ForgeType,
 		&i.BaseUrl,
 		&i.TokenCiphertext,
@@ -1034,7 +1163,7 @@ func (q *Queries) ListEnabledRepoIDs(ctx context.Context) ([]uuid.UUID, error) {
 }
 
 const listEnabledReposByConnection = `-- name: ListEnabledReposByConnection :many
-SELECT id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default FROM repos WHERE connection_id = $1 AND enabled = true
+SELECT id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, initial_import_state, initial_import_generation, initial_import_error_class, initial_import_updated_at FROM repos WHERE connection_id = $1 AND enabled = true
 ORDER BY path_with_namespace ASC
 `
 
@@ -1070,6 +1199,10 @@ func (q *Queries) ListEnabledReposByConnection(ctx context.Context, connectionID
 			&i.CrossCheckRepoInstructionsEnabled,
 			&i.IgnoredInferredCapabilities,
 			&i.AgentSourceDefault,
+			&i.InitialImportState,
+			&i.InitialImportGeneration,
+			&i.InitialImportErrorClass,
+			&i.InitialImportUpdatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -1082,7 +1215,7 @@ func (q *Queries) ListEnabledReposByConnection(ctx context.Context, connectionID
 }
 
 const listEnabledReposForUser = `-- name: ListEnabledReposForUser :many
-SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url, r.default_branch, r.enabled, r.repo_skills_enabled, r.repo_devbox_opt_in, r.repo_claudemd_enabled, r.guardrail_override_reason, r.guardrail_override_by, r.guardrail_override_at, r.required_capabilities, r.fold_improve_uzi_backlog, r.code_cross_check_guidance, r.cross_check_repo_instructions_enabled, r.ignored_inferred_capabilities, r.agent_source_default FROM repos r
+SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url, r.default_branch, r.enabled, r.repo_skills_enabled, r.repo_devbox_opt_in, r.repo_claudemd_enabled, r.guardrail_override_reason, r.guardrail_override_by, r.guardrail_override_at, r.required_capabilities, r.fold_improve_uzi_backlog, r.code_cross_check_guidance, r.cross_check_repo_instructions_enabled, r.ignored_inferred_capabilities, r.agent_source_default, r.initial_import_state, r.initial_import_generation, r.initial_import_error_class, r.initial_import_updated_at FROM repos r
 JOIN forge_connections c ON c.id = r.connection_id
 WHERE c.user_id = $1 AND r.enabled = true
 ORDER BY r.path_with_namespace ASC
@@ -1118,6 +1251,10 @@ func (q *Queries) ListEnabledReposForUser(ctx context.Context, userID uuid.UUID)
 			&i.CrossCheckRepoInstructionsEnabled,
 			&i.IgnoredInferredCapabilities,
 			&i.AgentSourceDefault,
+			&i.InitialImportState,
+			&i.InitialImportGeneration,
+			&i.InitialImportErrorClass,
+			&i.InitialImportUpdatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -1132,6 +1269,7 @@ func (q *Queries) ListEnabledReposForUser(ctx context.Context, userID uuid.UUID)
 const listEnabledReposWithConnections = `-- name: ListEnabledReposWithConnections :many
 SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url,
        r.default_branch, r.enabled,
+       r.initial_import_state, r.initial_import_generation,
        c.forge_type, c.base_url, c.token_ciphertext, c.user_id
 FROM repos r
 JOIN forge_connections c ON c.id = r.connection_id
@@ -1139,17 +1277,19 @@ WHERE r.enabled = true
 `
 
 type ListEnabledReposWithConnectionsRow struct {
-	ID                uuid.UUID   `json:"id"`
-	ConnectionID      uuid.UUID   `json:"connection_id"`
-	ForgeProjectID    int64       `json:"forge_project_id"`
-	PathWithNamespace string      `json:"path_with_namespace"`
-	WebUrl            string      `json:"web_url"`
-	DefaultBranch     pgtype.Text `json:"default_branch"`
-	Enabled           bool        `json:"enabled"`
-	ForgeType         string      `json:"forge_type"`
-	BaseUrl           string      `json:"base_url"`
-	TokenCiphertext   []byte      `json:"token_ciphertext"`
-	UserID            uuid.UUID   `json:"user_id"`
+	ID                      uuid.UUID   `json:"id"`
+	ConnectionID            uuid.UUID   `json:"connection_id"`
+	ForgeProjectID          int64       `json:"forge_project_id"`
+	PathWithNamespace       string      `json:"path_with_namespace"`
+	WebUrl                  string      `json:"web_url"`
+	DefaultBranch           pgtype.Text `json:"default_branch"`
+	Enabled                 bool        `json:"enabled"`
+	InitialImportState      pgtype.Text `json:"initial_import_state"`
+	InitialImportGeneration int64       `json:"initial_import_generation"`
+	ForgeType               string      `json:"forge_type"`
+	BaseUrl                 string      `json:"base_url"`
+	TokenCiphertext         []byte      `json:"token_ciphertext"`
+	UserID                  uuid.UUID   `json:"user_id"`
 }
 
 // Every enabled repo across all users, with its connection, for the sync
@@ -1171,6 +1311,8 @@ func (q *Queries) ListEnabledReposWithConnections(ctx context.Context) ([]ListEn
 			&i.WebUrl,
 			&i.DefaultBranch,
 			&i.Enabled,
+			&i.InitialImportState,
+			&i.InitialImportGeneration,
 			&i.ForgeType,
 			&i.BaseUrl,
 			&i.TokenCiphertext,
@@ -1688,7 +1830,7 @@ func (q *Queries) ListPRDLinkPatchCandidates(ctx context.Context, arg ListPRDLin
 }
 
 const listReposByConnectionForUser = `-- name: ListReposByConnectionForUser :many
-SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url, r.default_branch, r.enabled, r.repo_skills_enabled, r.repo_devbox_opt_in, r.repo_claudemd_enabled, r.guardrail_override_reason, r.guardrail_override_by, r.guardrail_override_at, r.required_capabilities, r.fold_improve_uzi_backlog, r.code_cross_check_guidance, r.cross_check_repo_instructions_enabled, r.ignored_inferred_capabilities, r.agent_source_default FROM repos r
+SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url, r.default_branch, r.enabled, r.repo_skills_enabled, r.repo_devbox_opt_in, r.repo_claudemd_enabled, r.guardrail_override_reason, r.guardrail_override_by, r.guardrail_override_at, r.required_capabilities, r.fold_improve_uzi_backlog, r.code_cross_check_guidance, r.cross_check_repo_instructions_enabled, r.ignored_inferred_capabilities, r.agent_source_default, r.initial_import_state, r.initial_import_generation, r.initial_import_error_class, r.initial_import_updated_at FROM repos r
 JOIN forge_connections c ON c.id = r.connection_id
 WHERE r.connection_id = $1 AND c.user_id = $2
 ORDER BY r.path_with_namespace ASC
@@ -1729,6 +1871,10 @@ func (q *Queries) ListReposByConnectionForUser(ctx context.Context, arg ListRepo
 			&i.CrossCheckRepoInstructionsEnabled,
 			&i.IgnoredInferredCapabilities,
 			&i.AgentSourceDefault,
+			&i.InitialImportState,
+			&i.InitialImportGeneration,
+			&i.InitialImportErrorClass,
+			&i.InitialImportUpdatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -1909,7 +2055,7 @@ const setRepoAgentSourceDefault = `-- name: SetRepoAgentSourceDefault :one
 UPDATE repos SET agent_source_default = $1::text
 WHERE repos.id = $2
   AND $1::text IS DISTINCT FROM 'repo'
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, initial_import_state, initial_import_generation, initial_import_error_class, initial_import_updated_at
 `
 
 type SetRepoAgentSourceDefaultParams struct {
@@ -1940,6 +2086,10 @@ func (q *Queries) SetRepoAgentSourceDefault(ctx context.Context, arg SetRepoAgen
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.InitialImportState,
+		&i.InitialImportGeneration,
+		&i.InitialImportErrorClass,
+		&i.InitialImportUpdatedAt,
 	)
 	return i, err
 }
@@ -1948,7 +2098,7 @@ const setRepoAgentSourceDefaultForUser = `-- name: SetRepoAgentSourceDefaultForU
 UPDATE repos SET agent_source_default = $1::text
 WHERE repos.id = $2
   AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $3)
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, initial_import_state, initial_import_generation, initial_import_error_class, initial_import_updated_at
 `
 
 type SetRepoAgentSourceDefaultForUserParams struct {
@@ -1980,12 +2130,16 @@ func (q *Queries) SetRepoAgentSourceDefaultForUser(ctx context.Context, arg SetR
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.InitialImportState,
+		&i.InitialImportGeneration,
+		&i.InitialImportErrorClass,
+		&i.InitialImportUpdatedAt,
 	)
 	return i, err
 }
 
 const setRepoCapabilityPolicy = `-- name: SetRepoCapabilityPolicy :one
-UPDATE repos SET required_capabilities = $2, ignored_inferred_capabilities = $3 WHERE repos.id = $1 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default
+UPDATE repos SET required_capabilities = $2, ignored_inferred_capabilities = $3 WHERE repos.id = $1 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, initial_import_state, initial_import_generation, initial_import_error_class, initial_import_updated_at
 `
 
 type SetRepoCapabilityPolicyParams struct {
@@ -2017,6 +2171,10 @@ func (q *Queries) SetRepoCapabilityPolicy(ctx context.Context, arg SetRepoCapabi
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.InitialImportState,
+		&i.InitialImportGeneration,
+		&i.InitialImportErrorClass,
+		&i.InitialImportUpdatedAt,
 	)
 	return i, err
 }
@@ -2025,7 +2183,7 @@ const setRepoCapabilityPolicyForUser = `-- name: SetRepoCapabilityPolicyForUser 
 UPDATE repos SET required_capabilities = $2, ignored_inferred_capabilities = $3
 WHERE repos.id = $1
   AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $4)
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, initial_import_state, initial_import_generation, initial_import_error_class, initial_import_updated_at
 `
 
 type SetRepoCapabilityPolicyForUserParams struct {
@@ -2063,6 +2221,10 @@ func (q *Queries) SetRepoCapabilityPolicyForUser(ctx context.Context, arg SetRep
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.InitialImportState,
+		&i.InitialImportGeneration,
+		&i.InitialImportErrorClass,
+		&i.InitialImportUpdatedAt,
 	)
 	return i, err
 }
@@ -2071,7 +2233,7 @@ const setRepoCodeCrossCheckInputs = `-- name: SetRepoCodeCrossCheckInputs :one
 UPDATE repos SET
  code_cross_check_guidance = CASE WHEN $1::boolean THEN $2::text ELSE code_cross_check_guidance END,
  cross_check_repo_instructions_enabled = COALESCE($3::boolean, cross_check_repo_instructions_enabled)
-WHERE id = $4 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default
+WHERE id = $4 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, initial_import_state, initial_import_generation, initial_import_error_class, initial_import_updated_at
 `
 
 type SetRepoCodeCrossCheckInputsParams struct {
@@ -2109,6 +2271,10 @@ func (q *Queries) SetRepoCodeCrossCheckInputs(ctx context.Context, arg SetRepoCo
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.InitialImportState,
+		&i.InitialImportGeneration,
+		&i.InitialImportErrorClass,
+		&i.InitialImportUpdatedAt,
 	)
 	return i, err
 }
@@ -2118,7 +2284,7 @@ UPDATE repos SET
  code_cross_check_guidance = CASE WHEN $1::boolean THEN $2::text ELSE code_cross_check_guidance END,
  cross_check_repo_instructions_enabled = COALESCE($3::boolean, cross_check_repo_instructions_enabled)
 WHERE repos.id = $4 AND repos.connection_id IN (SELECT fc.id FROM forge_connections fc WHERE fc.user_id = $5)
-RETURNING repos.id, repos.connection_id, repos.forge_project_id, repos.path_with_namespace, repos.web_url, repos.default_branch, repos.enabled, repos.repo_skills_enabled, repos.repo_devbox_opt_in, repos.repo_claudemd_enabled, repos.guardrail_override_reason, repos.guardrail_override_by, repos.guardrail_override_at, repos.required_capabilities, repos.fold_improve_uzi_backlog, repos.code_cross_check_guidance, repos.cross_check_repo_instructions_enabled, repos.ignored_inferred_capabilities, repos.agent_source_default
+RETURNING repos.id, repos.connection_id, repos.forge_project_id, repos.path_with_namespace, repos.web_url, repos.default_branch, repos.enabled, repos.repo_skills_enabled, repos.repo_devbox_opt_in, repos.repo_claudemd_enabled, repos.guardrail_override_reason, repos.guardrail_override_by, repos.guardrail_override_at, repos.required_capabilities, repos.fold_improve_uzi_backlog, repos.code_cross_check_guidance, repos.cross_check_repo_instructions_enabled, repos.ignored_inferred_capabilities, repos.agent_source_default, repos.initial_import_state, repos.initial_import_generation, repos.initial_import_error_class, repos.initial_import_updated_at
 `
 
 type SetRepoCodeCrossCheckInputsForUserParams struct {
@@ -2158,12 +2324,16 @@ func (q *Queries) SetRepoCodeCrossCheckInputsForUser(ctx context.Context, arg Se
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.InitialImportState,
+		&i.InitialImportGeneration,
+		&i.InitialImportErrorClass,
+		&i.InitialImportUpdatedAt,
 	)
 	return i, err
 }
 
 const setRepoDevboxOptIn = `-- name: SetRepoDevboxOptIn :one
-UPDATE repos SET repo_devbox_opt_in = $2 WHERE repos.id = $1 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default
+UPDATE repos SET repo_devbox_opt_in = $2 WHERE repos.id = $1 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, initial_import_state, initial_import_generation, initial_import_error_class, initial_import_updated_at
 `
 
 type SetRepoDevboxOptInParams struct {
@@ -2196,6 +2366,10 @@ func (q *Queries) SetRepoDevboxOptIn(ctx context.Context, arg SetRepoDevboxOptIn
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.InitialImportState,
+		&i.InitialImportGeneration,
+		&i.InitialImportErrorClass,
+		&i.InitialImportUpdatedAt,
 	)
 	return i, err
 }
@@ -2204,7 +2378,7 @@ const setRepoDevboxOptInForUser = `-- name: SetRepoDevboxOptInForUser :one
 UPDATE repos SET repo_devbox_opt_in = $2
 WHERE repos.id = $1
   AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $3)
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, initial_import_state, initial_import_generation, initial_import_error_class, initial_import_updated_at
 `
 
 type SetRepoDevboxOptInForUserParams struct {
@@ -2238,6 +2412,10 @@ func (q *Queries) SetRepoDevboxOptInForUser(ctx context.Context, arg SetRepoDevb
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.InitialImportState,
+		&i.InitialImportGeneration,
+		&i.InitialImportErrorClass,
+		&i.InitialImportUpdatedAt,
 	)
 	return i, err
 }
@@ -2246,7 +2424,7 @@ const setRepoEnabledForUser = `-- name: SetRepoEnabledForUser :one
 UPDATE repos SET enabled = $2
 WHERE repos.id = $1
   AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $3)
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, initial_import_state, initial_import_generation, initial_import_error_class, initial_import_updated_at
 `
 
 type SetRepoEnabledForUserParams struct {
@@ -2278,12 +2456,16 @@ func (q *Queries) SetRepoEnabledForUser(ctx context.Context, arg SetRepoEnabledF
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.InitialImportState,
+		&i.InitialImportGeneration,
+		&i.InitialImportErrorClass,
+		&i.InitialImportUpdatedAt,
 	)
 	return i, err
 }
 
 const setRepoFoldImproveUziBacklog = `-- name: SetRepoFoldImproveUziBacklog :one
-UPDATE repos SET fold_improve_uzi_backlog = $2 WHERE repos.id = $1 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default
+UPDATE repos SET fold_improve_uzi_backlog = $2 WHERE repos.id = $1 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, initial_import_state, initial_import_generation, initial_import_error_class, initial_import_updated_at
 `
 
 type SetRepoFoldImproveUziBacklogParams struct {
@@ -2316,6 +2498,10 @@ func (q *Queries) SetRepoFoldImproveUziBacklog(ctx context.Context, arg SetRepoF
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.InitialImportState,
+		&i.InitialImportGeneration,
+		&i.InitialImportErrorClass,
+		&i.InitialImportUpdatedAt,
 	)
 	return i, err
 }
@@ -2324,7 +2510,7 @@ const setRepoFoldImproveUziBacklogForUser = `-- name: SetRepoFoldImproveUziBackl
 UPDATE repos SET fold_improve_uzi_backlog = $2
 WHERE repos.id = $1
   AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $3)
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, initial_import_state, initial_import_generation, initial_import_error_class, initial_import_updated_at
 `
 
 type SetRepoFoldImproveUziBacklogForUserParams struct {
@@ -2359,6 +2545,10 @@ func (q *Queries) SetRepoFoldImproveUziBacklogForUser(ctx context.Context, arg S
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.InitialImportState,
+		&i.InitialImportGeneration,
+		&i.InitialImportErrorClass,
+		&i.InitialImportUpdatedAt,
 	)
 	return i, err
 }
@@ -2369,7 +2559,7 @@ SET guardrail_override_reason = $2,
     guardrail_override_by     = $3,
     guardrail_override_at     = $4
 WHERE id = $1
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, initial_import_state, initial_import_generation, initial_import_error_class, initial_import_updated_at
 `
 
 type SetRepoGuardrailOverrideParams struct {
@@ -2413,12 +2603,16 @@ func (q *Queries) SetRepoGuardrailOverride(ctx context.Context, arg SetRepoGuard
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.InitialImportState,
+		&i.InitialImportGeneration,
+		&i.InitialImportErrorClass,
+		&i.InitialImportUpdatedAt,
 	)
 	return i, err
 }
 
 const setRepoIgnoredInferredCapabilities = `-- name: SetRepoIgnoredInferredCapabilities :one
-UPDATE repos SET ignored_inferred_capabilities = $2 WHERE repos.id = $1 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default
+UPDATE repos SET ignored_inferred_capabilities = $2 WHERE repos.id = $1 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, initial_import_state, initial_import_generation, initial_import_error_class, initial_import_updated_at
 `
 
 type SetRepoIgnoredInferredCapabilitiesParams struct {
@@ -2449,6 +2643,10 @@ func (q *Queries) SetRepoIgnoredInferredCapabilities(ctx context.Context, arg Se
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.InitialImportState,
+		&i.InitialImportGeneration,
+		&i.InitialImportErrorClass,
+		&i.InitialImportUpdatedAt,
 	)
 	return i, err
 }
@@ -2457,7 +2655,7 @@ const setRepoIgnoredInferredCapabilitiesForUser = `-- name: SetRepoIgnoredInferr
 UPDATE repos SET ignored_inferred_capabilities = $2
 WHERE repos.id = $1
   AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $3)
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, initial_import_state, initial_import_generation, initial_import_error_class, initial_import_updated_at
 `
 
 type SetRepoIgnoredInferredCapabilitiesForUserParams struct {
@@ -2489,12 +2687,16 @@ func (q *Queries) SetRepoIgnoredInferredCapabilitiesForUser(ctx context.Context,
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.InitialImportState,
+		&i.InitialImportGeneration,
+		&i.InitialImportErrorClass,
+		&i.InitialImportUpdatedAt,
 	)
 	return i, err
 }
 
 const setRepoRequiredCapabilities = `-- name: SetRepoRequiredCapabilities :one
-UPDATE repos SET required_capabilities = $2 WHERE repos.id = $1 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default
+UPDATE repos SET required_capabilities = $2 WHERE repos.id = $1 RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, initial_import_state, initial_import_generation, initial_import_error_class, initial_import_updated_at
 `
 
 type SetRepoRequiredCapabilitiesParams struct {
@@ -2528,6 +2730,10 @@ func (q *Queries) SetRepoRequiredCapabilities(ctx context.Context, arg SetRepoRe
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.InitialImportState,
+		&i.InitialImportGeneration,
+		&i.InitialImportErrorClass,
+		&i.InitialImportUpdatedAt,
 	)
 	return i, err
 }
@@ -2536,7 +2742,7 @@ const setRepoRequiredCapabilitiesForUser = `-- name: SetRepoRequiredCapabilities
 UPDATE repos SET required_capabilities = $2
 WHERE repos.id = $1
   AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $3)
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, initial_import_state, initial_import_generation, initial_import_error_class, initial_import_updated_at
 `
 
 type SetRepoRequiredCapabilitiesForUserParams struct {
@@ -2572,6 +2778,10 @@ func (q *Queries) SetRepoRequiredCapabilitiesForUser(ctx context.Context, arg Se
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.InitialImportState,
+		&i.InitialImportGeneration,
+		&i.InitialImportErrorClass,
+		&i.InitialImportUpdatedAt,
 	)
 	return i, err
 }
@@ -2581,7 +2791,7 @@ UPDATE repos SET
   repo_skills_enabled   = COALESCE($1, repo_skills_enabled),
   repo_claudemd_enabled = COALESCE($2, repo_claudemd_enabled)
 WHERE repos.id = $3
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, initial_import_state, initial_import_generation, initial_import_error_class, initial_import_updated_at
 `
 
 type SetRepoTrustFlagsParams struct {
@@ -2617,6 +2827,10 @@ func (q *Queries) SetRepoTrustFlags(ctx context.Context, arg SetRepoTrustFlagsPa
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.InitialImportState,
+		&i.InitialImportGeneration,
+		&i.InitialImportErrorClass,
+		&i.InitialImportUpdatedAt,
 	)
 	return i, err
 }
@@ -2627,7 +2841,7 @@ UPDATE repos SET
   repo_claudemd_enabled = COALESCE($2, repo_claudemd_enabled)
 WHERE repos.id = $3
   AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $4)
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, initial_import_state, initial_import_generation, initial_import_error_class, initial_import_updated_at
 `
 
 type SetRepoTrustFlagsForUserParams struct {
@@ -2667,6 +2881,10 @@ func (q *Queries) SetRepoTrustFlagsForUser(ctx context.Context, arg SetRepoTrust
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.InitialImportState,
+		&i.InitialImportGeneration,
+		&i.InitialImportErrorClass,
+		&i.InitialImportUpdatedAt,
 	)
 	return i, err
 }
@@ -3048,7 +3266,7 @@ ON CONFLICT (connection_id, forge_project_id) DO UPDATE
 SET path_with_namespace = EXCLUDED.path_with_namespace,
     web_url             = EXCLUDED.web_url,
     default_branch      = EXCLUDED.default_branch
-RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default
+RETURNING id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled, repo_skills_enabled, repo_devbox_opt_in, repo_claudemd_enabled, guardrail_override_reason, guardrail_override_by, guardrail_override_at, required_capabilities, fold_improve_uzi_backlog, code_cross_check_guidance, cross_check_repo_instructions_enabled, ignored_inferred_capabilities, agent_source_default, initial_import_state, initial_import_generation, initial_import_error_class, initial_import_updated_at
 `
 
 type UpsertRepoParams struct {
@@ -3091,6 +3309,10 @@ func (q *Queries) UpsertRepo(ctx context.Context, arg UpsertRepoParams) (Repo, e
 		&i.CrossCheckRepoInstructionsEnabled,
 		&i.IgnoredInferredCapabilities,
 		&i.AgentSourceDefault,
+		&i.InitialImportState,
+		&i.InitialImportGeneration,
+		&i.InitialImportErrorClass,
+		&i.InitialImportUpdatedAt,
 	)
 	return i, err
 }

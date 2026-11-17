@@ -15123,6 +15123,30 @@ describe("CodexExecutor milestone progress (issue #1674)", () => {
     assert.equal(log[7], "iteration:2");
   });
 
+  it("a resumed execution does not re-announce a completion the server already holds, and a server reset re-allows it", async () => {
+    // The loop-scope progress starts undefined on every execution (a resume or re-claim), so the
+    // only record of an earlier execution's completions is the server's served completedIds.
+    const runWith = async (served: string[]) => {
+      const rig = makeMultiEpochRig([script("th-1", [
+        (th, tn) => [progress(11, { completed: ["m1", "m2"], in_progress: [] }, th, tn), done(12, th, tn)],
+      ])]);
+      const { ctx, emitted } = makeCtx({
+        config: { max_iterations: 2 },
+        frozenMilestones: [{ id: "m1", title: "Alpha" }, { id: "m2", title: "Beta" }],
+        reportProgress: async () => {},
+        reportIteration: async () => ({ completedIds: served }),
+      });
+      await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "resumed completion frames run");
+      return transitions(emitted);
+    };
+    assert.deepEqual(await runWith(["m1"]), ["milestone m2 reported complete — Beta"]);
+    // ClearRunMilestonesCompleted (cross-worker reseed) serves an empty list: both re-announce.
+    assert.deepEqual(await runWith([]), [
+      "milestone m1 reported complete — Alpha",
+      "milestone m2 reported complete — Beta",
+    ]);
+  });
+
   it("swallows a synchronous reportProgress throw", async () => {
     const rig = makeMultiEpochRig([script("th-1", [(th, tn) => [progress(11, { in_progress: ["m1"] }, th, tn), done(12, th, tn)]])]);
     const { ctx, emitted } = makeCtx({

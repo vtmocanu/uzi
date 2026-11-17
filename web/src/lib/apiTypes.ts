@@ -1296,6 +1296,18 @@ export interface Board {
   // Optional: an OLD api replica during a rollout skew may omit it entirely, which the
   // consumer treats as "no bot" (0), the same as unresolved.
   bot_forge_user_id?: number;
+  // The repo's durable first-import status (issue #4399). null for a legacy or disabled
+  // repo. Optional: an OLD api replica during a rollout skew omits it, which the board
+  // treats the same as null (no banner).
+  initial_import?: InitialImport | null;
+}
+
+// InitialImport is a just-enabled repo's first issue import, as the board reports it.
+// error_class is present only when state is "failed".
+export interface InitialImport {
+  state: "waiting" | "running" | "succeeded" | "failed";
+  updated_at: string;
+  error_class?: string;
 }
 
 // BoardPrefs is the current user's per-repo board view preferences (PRD #196 M3),
@@ -1424,6 +1436,14 @@ export interface AppSettings {
   worker_hibernation_idle_after?: string;
   // Per-user persistent hosted-worker quota: integer 0..20, default 2. Zero disables provisioning.
   hosted_worker_quota: string;
+  // Ephemeral worker admin settings (PRD #4212). Optional for older responses.
+  // ephemeral_max_per_user: integer 0..20, default "2"; ephemeral_default_size and
+  // hosted_default_size: a worker size name (s, m, l, l-highmem), defaults "m" and "l";
+  // ephemeral_lease: Go duration 0..2h, default "2h".
+  ephemeral_max_per_user?: string;
+  ephemeral_default_size?: string;
+  hosted_default_size?: string;
+  ephemeral_lease?: string;
   // Per-owner custody admission limit: whole number 1..1000, default "8". Lowering it blocks future claims only.
   custody_hold_limit: string;
   // Upstream release-check toggles (PRD #836). Both the text "true"/"false" (default
@@ -3196,6 +3216,9 @@ export interface HostedConfig {
   // Whether the instance admin gate permits ephemeral auto-provisioning (PRD #649),
   // independent of `quota`, which governs manual self-service.
   ephemeral_enabled: boolean;
+  // Admin-chosen size the provision form preselects (PRD #4212). Optional: an older API
+  // omits it, and an unknown name is ignored by the form.
+  default_size?: string;
 }
 
 export type RunStatus =
@@ -4159,8 +4182,9 @@ export interface Run {
    *  the claim was released, local work and custody are kept, and only the owner can Resume or
    *  Cancel. Owner-held with no automatic retry, and not an integrity refusal.
    *  "anthropic_spend_limit" (issue #3767) means a Claude run's Anthropic API key hit its
-   *  organization or workspace spend limit. Owner-held, recovery_retry_not_before is null and
-   *  nothing resumes it automatically. The owner can Resume (the next claim re-selects the
+   *  organization or workspace spend limit, or (issue #4426) ran out of prepaid credit.
+   *  Owner-held, recovery_retry_not_before is null and nothing resumes it automatically.
+   *  The owner can Resume (the next claim re-selects the
    *  credential through the run's own selection, which may pick the capped token again),
    *  switch token (switchable kinds only) or Cancel. A queued run can keep this value stale
    *  after set-token, so also require status === "recovery_wait".

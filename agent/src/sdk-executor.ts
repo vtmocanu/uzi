@@ -3562,7 +3562,9 @@ export class SdkExecutor implements Executor {
           : undefined;
         // PRD #1064 M1 (Decisions 1/2): a per-turn progress observer. It owns the diff base
         // (seeded from the loop-scope latestProgress, the previous turn's final snapshot, so
-        // a transition already seen does not re-emit) and the frozen titles, emits the
+        // a transition already seen does not re-emit, unioned with the server's served
+        // completed ids so a resumed execution does not re-announce completions) and the
+        // frozen titles, emits the
         // transition frames, and enqueues the immediate push. Built fresh per turn so a
         // milestone reported in_progress then completed WITHIN the turn (two SDK messages)
         // diffs correctly across the turn's several observations.
@@ -3570,6 +3572,7 @@ export class SdkExecutor implements Executor {
           ctx,
           latestProgress,
           frozenMilestones,
+          lastServedScope?.completedIds,
         );
         // issue #1197 (D-RC2b): a resumed implement turn that returns POSITIVELY empty
         // (0 turns, no activity) is retried in-process and, if still empty, escalated to

@@ -325,6 +325,8 @@ pass "binding-phase cleanup: the three claimed binding runs terminated so they c
     || fail "manual intake: repo connection mismatch"
   apiput "/api/repos/$M5_REPO" '{"enabled":true}' | jq -e --arg id "$M5_REPO" \
     '.repo.id == $id and .repo.enabled == true' >/dev/null || fail "manual intake: repo enable failed"
+  # JAR holds the new owner's session here (registration above), which is the board's owner.
+  wait_initial_import "$M5_REPO" || fail "manual intake: first issue import did not finish"
   M5_CREDENTIAL="sk-ant-""e2e-manual-$M5_FIXTURE"
   M5_SECRET="$(printf '{"token":"%s","label":"manual-intake"}' "$M5_CREDENTIAL" \
     | curl -fsS -b "$JAR" -X POST "$BASE/api/me/secrets/anthropic_token" \

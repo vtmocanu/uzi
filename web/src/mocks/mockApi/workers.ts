@@ -12,6 +12,8 @@ import { delay, mockScenario, requireAdmin, requireSession } from "./shared";
 import { secrets } from "./secrets";
 // workers ↔ settings is a third cycle: hibernate reads the instance switch inside its body only.
 import { appSettings } from "./settings";
+import { WORKER_SIZES } from "../../lib/workerSizes";
+import type { HostedConfig } from "../../lib/apiTypes";
 // runs ↔ workers is a second import cycle (runs → secrets → workers); deleteWorker reads
 // runsApi only inside its body, so no module-level initializer crosses the modules.
 import { runsApi } from "./runs";
@@ -359,7 +361,12 @@ export const workersApi = {
   //
   // The second seeded worker is the failed roller, which the demo previously could not
   // show at all — so a browser pass could only ever validate the healthy path.
-  hostedConfig: async () => delay({ enabled: true, quota: 5, ephemeral_enabled: true, docker_enabled: true }),
+  hostedConfig: async (): Promise<HostedConfig> => {
+    // PRD #4212: the form preselects the admin's hosted default size ("l" when unset/unknown).
+    const configured = appSettings.hosted_default_size;
+    const default_size = (WORKER_SIZES as readonly string[]).includes(configured ?? "") ? (configured as string) : "l";
+    return delay({ enabled: true, quota: 5, ephemeral_enabled: true, docker_enabled: true, default_size });
+  },
   provisionHostedWorker: async (template: string, size: string, docker = false, name?: string) => {
     const w = {
       id: `w-hosted-${++workerCounter}`,

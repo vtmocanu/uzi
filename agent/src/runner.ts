@@ -711,7 +711,8 @@ type RecoveryParkCause =
   | { kind: "publication_forge_unreachable"; surface: "git" | "api"; step: "floor_refresh" | "push" | "mr_create" }
   | { kind: "vault_locked" | "refresh_unknown" | "account_unavailable" | "credential_release_unavailable" }
   | { kind: "data_volume_full"; preventive: boolean }
-  /** Issue #3767: the Claude lead hit an Anthropic organization or workspace spend limit. */
+  /** Issue #3767: the Claude lead hit an Anthropic organization or workspace spend limit, or
+   *  (issue #4426) its API key's prepaid credit balance ran out. */
   | { kind: "anthropic_spend_limit"; detail: string };
 
 /* Exact local revocation from assertHeldFreeCapture, distinct from an arbitrary refusal. */

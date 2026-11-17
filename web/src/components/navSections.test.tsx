@@ -4,7 +4,7 @@ import { Navigate } from "react-router-dom";
 import { APP_ROUTES } from "../App";
 import { TABS as SETTINGS_TABS } from "./SettingsShell";
 import { TABS as ADMIN_TABS } from "./AdminShell";
-import { ADMIN_SETTINGS_ANCHOR_IDS, visibleSectionItems } from "./navSections";
+import { ADMIN_SETTINGS_ANCHOR_IDS, ADMIN_WORKERS_ANCHOR_IDS, visibleSectionItems } from "./navSections";
 
 const admin = visibleSectionItems(true);
 const pathOf = (to: string) => to.split("#")[0];
@@ -40,11 +40,10 @@ describe("navSections", () => {
     expect(instance.keywords).toContain("instance");
   });
 
-  it("advertises exactly the 19 unconditional Admin Settings sections", () => {
+  it("advertises exactly the 14 unconditional Admin Settings sections", () => {
     expect([...ADMIN_SETTINGS_ANCHOR_IDS]).toEqual([
       "vault-policy", "forge-labels", "run-judge", "run-summaries", "agent-source", "maintenance",
-      "updates", "slack", "run-health", "docker-allowlist", "review-bots", "hosted-worker-quota",
-      "custody-hold-limit", "ephemeral-workers", "worker-hibernation", "capability-scheduling",
+      "updates", "slack", "run-health", "review-bots",
       "completion-interlock", "github-project-sync", "fetch-caps",
     ]);
     expect(ADMIN_SETTINGS_ANCHOR_IDS.has("vault-migration")).toBe(false);
@@ -53,6 +52,23 @@ describe("navSections", () => {
     expect(anchors.map((i) => i.to.split("#")[1])).toEqual([...ADMIN_SETTINGS_ANCHOR_IDS]);
     for (const a of anchors) expect(a.label.startsWith("Admin › Settings › ")).toBe(true);
     expect(anchors.some((a) => a.label === "Admin › Settings › Agent source")).toBe(true);
+  });
+
+  it("advertises the six worker-fleet sections under Admin › Workers, none under Settings", () => {
+    const ids = [
+      "docker-allowlist", "hosted-worker-quota", "custody-hold-limit",
+      "ephemeral-workers", "worker-hibernation", "capability-scheduling",
+    ];
+    expect([...ADMIN_WORKERS_ANCHOR_IDS]).toEqual(ids);
+    for (const id of ids) expect(ADMIN_SETTINGS_ANCHOR_IDS.has(id), id).toBe(false);
+    const anchors = admin.filter((i) => i.key.startsWith("admin-workers:"));
+    expect(anchors.map((i) => i.to)).toEqual(ids.map((id) => `/admin/workers#${id}`));
+    for (const a of anchors) expect(a.label.startsWith("Admin › Workers › ")).toBe(true);
+    expect(anchors.some((a) => a.label === "Admin › Workers › Ephemeral workers")).toBe(true);
+    const keywords = (id: string) => anchors.find((a) => a.to.endsWith(`#${id}`))!.keywords;
+    expect(keywords("ephemeral-workers")).toEqual(expect.arrayContaining(["cap", "per-user", "lease", "ephemeral size", "default size"]));
+    expect(keywords("hosted-worker-quota")).toEqual(expect.arrayContaining(["default size", "size", "quota"]));
+    expect(admin.some((i) => i.to === "/admin/workers" && i.label === "Admin › Workers")).toBe(true);
   });
 
   it("hides admin entries from non-admins", () => {

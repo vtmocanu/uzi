@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import type { Executor, ExecutorResult, RunContext } from "../src/executor.js";
 import type { RunRunner } from "../src/runner.js";
-import { SpendLimitHoldError } from "../src/limit.js";
+import { classifySpendLimitTerminal, SpendLimitHoldError } from "../src/limit.js";
 import { providerErrorMessage } from "../src/sdk-messages.js";
 import { nullLogger } from "./helpers.js";
 import { api, client, fakeGitlab, gitlabClaim, installHarness, runnerWith, worktreeDirFor } from "./runner-harness.js";
@@ -130,6 +130,52 @@ describe("RunRunner #3767 spend-limit hold", () => {
       assert.equal(failed.length, 1);
       assert.equal(failed[0]!.failure_reason, MESSAGE);
       assert.match(failed[0]!.failure_reason!, /^provider error: 400 You have reached your specified API usage limits\./);
+    });
+  });
+
+  // Issue #4426: the characterized credit-depletion terminal (SDK 0.3.319; see
+  // spend-limit-regression.test.ts) goes through the REAL classifier exactly as
+  // sdk-executor.ts does, so a classifier that rejects it yields the plain failure Error.
+  const CREDIT = "Credit balance is too low";
+  const CREDIT_MESSAGE = "provider error: 400 Credit balance is too low";
+  const credit = (): Error => {
+    const terminal = { isError: true, terminalReason: "api_error", apiErrorStatus: 400, resultText: CREDIT };
+    const message = providerErrorMessage(terminal.apiErrorStatus, terminal.resultText);
+    const held = classifySpendLimitTerminal(terminal);
+    return held ? new SpendLimitHoldError(message, held.detail) : new Error(message);
+  };
+
+  it("credit depletion, advertised + fenced: parks recovery_wait anthropic_spend_limit once, feed carries the sentence (issue #4426)", async () => {
+    await withHome(async (homeRoot) => {
+      client.protocolFeatures = ["claim_generation_fence", FEATURE];
+      const r = rig(credit, homeRoot);
+      const claim = gitlabClaim(4426, { claim_generation: 3 });
+      await r.runner.execute(claim);
+      const sent = parks(claim.run_id);
+      assert.equal(sent.length, 1, `states: ${JSON.stringify(statesOf(claim.run_id).map((s) => [s.status, s.failure_reason]))}`);
+      assert.equal(sent[0]!.recovery_cause, "anthropic_spend_limit");
+      assert.equal(sent[0]!.claim_generation, 3);
+      assert.equal(failures(claim.run_id).length, 0, "the run is parked, not failed");
+      assert.equal(r.turns(), 1, "exactly one executor turn: no retry");
+      assert.equal(r.custody(), 0, "no settlement: custody is kept");
+      const feed = feedTexts(claim.run_id).filter((t) => /spend limit/.test(t));
+      assert.equal(feed.length, 1);
+      assert.ok(feed[0]!.includes(CREDIT), "the detail line carries the provider sentence");
+      assert.ok(feed[0]!.includes(RESUME_SENTENCE));
+    });
+  });
+
+  it("credit depletion, feature absent: fails with the byte-identical provider message and never parks (issue #4426)", async () => {
+    await withHome(async (homeRoot) => {
+      client.protocolFeatures = ["claim_generation_fence"];
+      const claim = gitlabClaim(4427, { claim_generation: 3 });
+      const r = rig(credit, homeRoot);
+      await r.runner.execute(claim);
+      assert.equal(r.turns(), 1);
+      assert.equal(parks(claim.run_id).length, 0);
+      const failed = failures(claim.run_id);
+      assert.equal(failed.length, 1);
+      assert.equal(failed[0]!.failure_reason, CREDIT_MESSAGE);
     });
   });
 

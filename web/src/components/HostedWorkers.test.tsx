@@ -341,6 +341,38 @@ describe("HostedWorkers provisioning", () => {
     await waitFor(() => expect((screen.getByLabelText("Hosted worker size") as HTMLSelectElement).value).toBe("l"));
   });
 
+  it("preselects the admin default size once the config arrives", async () => {
+    mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 2, ephemeral_enabled: false, default_size: "m" });
+    mockApi.provisionHostedWorker.mockResolvedValue({ worker: provisioned });
+    renderCard(0);
+    expect((await screen.findByLabelText("Hosted worker size") as HTMLSelectElement).value).toBe("m");
+    fireEvent.click(await provisionButton());
+    // The request still carries an explicit size.
+    await waitFor(() => expect(mockApi.provisionHostedWorker).toHaveBeenCalledWith("base", "m", false));
+  });
+
+  it("resets to the admin default size after a successful provision", async () => {
+    mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 2, ephemeral_enabled: false, default_size: "m" });
+    mockApi.provisionHostedWorker.mockResolvedValue({ worker: provisioned });
+    renderCard(0);
+    fireEvent.change(await screen.findByLabelText("Hosted worker size"), { target: { value: "s" } });
+    fireEvent.click(await provisionButton());
+    await waitFor(() => expect(mockApi.provisionHostedWorker).toHaveBeenCalledWith("base", "s", false));
+    await waitFor(() => expect((screen.getByLabelText("Hosted worker size") as HTMLSelectElement).value).toBe("m"));
+  });
+
+  it("falls back to l when default_size is missing", async () => {
+    mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 2, ephemeral_enabled: false });
+    renderCard(0);
+    expect((await screen.findByLabelText("Hosted worker size") as HTMLSelectElement).value).toBe("l");
+  });
+
+  it("falls back to l when default_size names an unknown size", async () => {
+    mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 2, ephemeral_enabled: false, default_size: "xl" });
+    renderCard(0);
+    expect((await screen.findByLabelText("Hosted worker size") as HTMLSelectElement).value).toBe("l");
+  });
+
   it("shows the 409 quota refusal verbatim (the server's words, not ours)", async () => {
     mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 2, ephemeral_enabled: false });
     // The client-side gate is a hint, not the rule: a stale count gets here and the
@@ -488,7 +520,7 @@ describe("HostedWorkers ephemeral Docker preference", () => {
     expect(screen.getByText("Persistent worker")).toBeTruthy();
     expect(screen.getByText("Ephemeral workers")).toBeTruthy();
     expect(screen.getByText(/Runs in the cluster/).textContent).toBe(
-      "Runs in the cluster, not on your machine: no join token, no container to start. It shows up under Your workers and you delete it there. Docker-capable gives it a Docker daemon for container builds and tests, at extra CPU and storage. A Docker-capable worker can pick up repo runs only when an admin has added the repo to the Docker worker repo allowlist under Admin → Instance. Runs on other repos need another eligible worker.",
+      "Runs in the cluster, not on your machine: no join token, no container to start. It shows up under Your workers and you delete it there. Docker-capable gives it a Docker daemon for container builds and tests, at extra CPU and storage. A Docker-capable worker can pick up repo runs only when an admin has added the repo to the Docker worker repo allowlist under Admin → Workers. Runs on other repos need another eligible worker.",
     );
     expect(checkbox.parentElement?.parentElement).toBe(autoSwitch().parentElement?.parentElement);
     expect(checkbox.getAttribute("aria-describedby")).toBe(autoSwitch().getAttribute("aria-describedby"));

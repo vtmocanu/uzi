@@ -4,7 +4,7 @@
 // (gated by AdminRoute + the admin-only API). Validation mirrors the server
 // (Decision 8) for immediate feedback, but the server stays the source of truth.
 
-import { useLocation } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import {
   api,
@@ -22,6 +22,7 @@ import {
   type BadgeTone,
   Button,
   Card,
+  cx,
   Field,
   Input,
   SectionTitle,
@@ -29,7 +30,8 @@ import {
   Skeleton,
 } from "../components/ui";
 import { AdminShell } from "../components/AdminShell";
-import { ADMIN_SETTINGS_ANCHOR_IDS } from "../components/navSections";
+import { keepInRowView, useEdgeFade } from "../components/TabRow";
+import { ADMIN_SETTINGS_ANCHOR_IDS, ADMIN_WORKERS_ANCHOR_IDS } from "../components/navSections";
 import { DocLink } from "../components/DocLink";
 import { DOC_ADMIN_SETTINGS } from "../lib/doclinks";
 import {
@@ -40,18 +42,12 @@ import {
   DEFAULT_DARK_THEME,
 } from "../lib/theme";
 import { JudgeSettingsCard } from "./adminSettings/JudgeSettingsCard";
-import { CustodyHoldLimitCard } from "./adminSettings/CustodyHoldLimitCard";
-import { HostedWorkerQuotaCard } from "./adminSettings/HostedWorkerQuotaCard";
-import { EphemeralWorkersCard } from "./adminSettings/EphemeralWorkersCard";
-import { WorkerHibernationCard } from "./adminSettings/WorkerHibernationCard";
 import { UpdatesSettingsCard } from "./adminSettings/UpdatesSettingsCard";
 import { MaintenanceCard } from "./adminSettings/MaintenanceCard";
 import { SummarySettingsCard } from "./adminSettings/SummarySettingsCard";
 import { AgentSourceSettingsCard } from "./adminSettings/AgentSourceSettingsCard";
 import { HealthSettingsCard } from "./adminSettings/HealthSettingsCard";
-import { DockerAllowlistCard } from "./adminSettings/DockerAllowlistCard";
 import { TrustedReviewBotsCard } from "./adminSettings/TrustedReviewBotsCard";
-import { CapabilitySchedulingCard } from "./adminSettings/CapabilitySchedulingCard";
 import { CompletionInterlockCard } from "./adminSettings/CompletionInterlockCard";
 import { GithubProjectSyncCard } from "./adminSettings/GithubProjectSyncCard";
 import { FetchCapsCard } from "./adminSettings/FetchCapsCard";
@@ -121,6 +117,7 @@ function resolveDarkDisplay(s: AppSettings): string {
 export function AdminSettings() {
   const { refresh } = useAuth();
   const { hash, key } = useLocation();
+  const navigate = useNavigate();
   const [saved, setSaved] = useState<AppSettings | null>(null);
   // Per-key secret-configured flags and sources (PRD #25), consumed by the Slack
   // card for its "configured ✓" and env-greying behavior.
@@ -212,6 +209,13 @@ export function AdminSettings() {
     { fallback: "Failed to load settings" },
   );
 
+  // The worker-fleet cards moved to Admin → Workers: old bookmarks and links to
+  // /admin/settings#<moved id> are forwarded, on mount and on later hash changes.
+  useEffect(() => {
+    const id = hash.slice(1);
+    if (ADMIN_WORKERS_ANCHOR_IDS.has(id)) navigate(`/admin/workers#${id}`, { replace: true });
+  }, [hash, navigate]);
+
   // Keyed on "loaded", not the `saved` object: every card save replaces `saved`, and a
   // save must not yank the page back to the URL's anchor.
   const loaded = !loading && saved !== null;
@@ -229,7 +233,13 @@ export function AdminSettings() {
     // Most cards render only after a successful load (`saved`), so a FAILED load leaves
     // the page at the top for every anchor, agent-source and maintenance included.
     if (loaded && ADMIN_SETTINGS_ANCHOR_IDS.has(hash.slice(1))) {
+      // Near the page end the scroll cannot bring the target to the line: remember it so
+      // evaluate() lights its own pill.
+      pendingRef.current = hash.slice(1);
       document.getElementById(hash.slice(1))?.scrollIntoView?.({ block: "start" });
+      // A page already at its end does not move, so no observer fires: evaluate once.
+      const raf = requestAnimationFrame(() => evaluateRef.current?.());
+      return () => cancelAnimationFrame(raf);
     }
   }, [loaded, hash, key]);
 
@@ -318,17 +328,126 @@ export function AdminSettings() {
       ? [
           { id: "slack", label: "Slack" },
           { id: "run-health", label: "Run health" },
-          { id: "docker-allowlist", label: "Docker workers" },
           { id: "review-bots", label: "Review bots" },
-          { id: "hosted-worker-quota", label: "Hosted worker quota" },
-          { id: "ephemeral-workers", label: "Ephemeral workers" },
-          { id: "worker-hibernation", label: "Worker hibernation" },
-          { id: "capability-scheduling", label: "Capability scheduling" },
           { id: "completion-interlock", label: "Completion check" },
           { id: "fetch-caps", label: "Research fetch caps" },
         ]
       : []),
   ];
+
+  const showPills = !loading && sections.length > 1;
+  const sectionKey = showPills ? sections.map((s) => s.id).join(",") : "";
+  const navRef = useRef<HTMLElement>(null);
+  const endRef = useRef<HTMLDivElement>(null);
+  const [currentId, setCurrentId] = useState<string | null>(null);
+  const currentRef = useRef<string | null>(null);
+  const pendingRef = useRef<string | null>(null);
+  const evaluateRef = useRef<(() => void) | null>(null);
+  const current = sectionKey.split(",").includes(currentId ?? "") ? currentId : (sections[0]?.id ?? null);
+
+  const choose = useCallback((id: string) => {
+    if (currentRef.current === id) return;
+    currentRef.current = id;
+    setCurrentId(id);
+  }, []);
+
+  useEdgeFade(navRef, sectionKey);
+
+  // Current-section highlight. Observers only TRIGGER evaluation (no scroll listener); each
+  // evaluation reads fresh rects. The reading line sits LANDING below the pinned block's
+  // bottom edge: the root scroll-padding gap (12) + the cards' scroll-mt-6 (24) + 4px slack,
+  // so a pill jump, a deep link or the command menu puts the target at or above the line.
+  // Current = the last pill section, in document order, whose top is at or above the line
+  // (the first at the page top). A pill-less card spanning the line leaves the preceding pill
+  // lit. Near the page end the line can no longer reach the last cards: the clicked pill
+  // stays current while its section is still below the line, else the last pill.
+  useEffect(() => {
+    const nav = navRef.current;
+    const block = nav?.closest<HTMLElement>("[data-pinned-block-root]");
+    if (!sectionKey || !nav || !block || typeof IntersectionObserver === "undefined") return;
+    const LANDING = 12 + 24 + 4;
+    const ids = sectionKey.split(",");
+    const els = ids
+      .map((id) => document.getElementById(id))
+      .filter((el): el is HTMLElement => el !== null);
+    // Stuck geometry: the block's sticky top + height, independent of whether it is stuck
+    // right now, so the observer band matches where evaluate() reads once scrolled.
+    const stuckLineY = () =>
+      (parseFloat(getComputedStyle(block).top) || 0) + block.getBoundingClientRect().height + LANDING;
+    // Live position, used by evaluate() against fresh rects.
+    const lineY = () => block.getBoundingClientRect().bottom + LANDING;
+    const observed = [...new Set([...ADMIN_SETTINGS_ANCHOR_IDS, ...ids])]
+      .map((id) => document.getElementById(id))
+      .filter((el): el is HTMLElement => el !== null);
+    const evaluate = () => {
+      if (els.length === 0) return;
+      const line = lineY();
+      const end = endRef.current;
+      const atEnd = window.scrollY > 0 && !!end && end.getBoundingClientRect().top <= window.innerHeight;
+      if (atEnd) {
+        const pending = pendingRef.current;
+        const target = pending ? document.getElementById(pending) : null;
+        if (pending && target && target.getBoundingClientRect().top >= line - 6) {
+          // Only pill ids may be chosen: a pill-less card maps to the nearest pill section
+          // before it in document order (the last pill when none precedes it).
+          let pill = els[els.length - 1];
+          let before: HTMLElement | null = null;
+          for (const el of els) {
+            if (el === target || el.compareDocumentPosition(target) & Node.DOCUMENT_POSITION_FOLLOWING) before = el;
+          }
+          if (before) pill = before;
+          choose(pill.id);
+        } else choose(els[els.length - 1].id);
+        return;
+      }
+      pendingRef.current = null;
+      let cur = els[0];
+      for (const el of els) if (el.getBoundingClientRect().top <= line) cur = el;
+      choose(cur.id);
+    };
+
+    let lineIO: IntersectionObserver | null = null;
+    const build = () => {
+      lineIO?.disconnect();
+      // Whole-pixel 1px band: an unrounded edge let a card top land on a sub-pixel edge and
+      // miss its crossing (the 20px-step browser test pins this).
+      const y = Math.round(stuckLineY());
+      const below = Math.max(0, window.innerHeight - y - 1);
+      lineIO = new IntersectionObserver(evaluate, { root: document, rootMargin: `-${y}px 0px -${below}px 0px` });
+      for (const el of observed) lineIO.observe(el);
+    };
+    build();
+    evaluateRef.current = evaluate;
+
+    // The block's stuck flip moves its live bottom (and so evaluate()'s line) without any
+    // observed card crossing the band: re-evaluate once when it changes.
+    const mo = new MutationObserver(evaluate);
+    mo.observe(block, { attributes: true, attributeFilter: ["data-stuck"] });
+
+    const endIO = new IntersectionObserver(evaluate, { root: document });
+    if (endRef.current) endIO.observe(endRef.current);
+
+    const ro = typeof ResizeObserver !== "undefined" ? new ResizeObserver(build) : null;
+    ro?.observe(block);
+    window.addEventListener("resize", build);
+    window.addEventListener("uzi:app-bar-h", build);
+    return () => {
+      evaluateRef.current = null;
+      lineIO?.disconnect();
+      mo.disconnect();
+      endIO.disconnect();
+      ro?.disconnect();
+      window.removeEventListener("resize", build);
+      window.removeEventListener("uzi:app-bar-h", build);
+    };
+  }, [sectionKey, choose]);
+
+  useEffect(() => {
+    const nav = navRef.current;
+    if (!nav || !current) return;
+    // Inset 24: clear of the row's 24px edge fade.
+    keepInRowView(nav, nav.querySelector<HTMLElement>(`a[href="#${current}"]`), 24);
+  }, [current]);
 
   return (
     <AdminShell
@@ -338,23 +457,41 @@ export function AdminSettings() {
           <DocLink slug={DOC_ADMIN_SETTINGS}>admin settings</DocLink> guide.
         </>
       }
-    >
-      {/* The section index: this tab is eight cards deep, and without an index the
+      pinned={
+        /* The section index: this tab is eight cards deep, and without an index the
           only way to learn what it holds is to scroll all of it. Quiet pill links,
-          not a second tab row — tabs switch content, these just scroll it. */}
-      {!loading && sections.length > 1 && (
-        <nav aria-label="Sections on this page" className="flex flex-wrap gap-1.5">
-          {sections.map((s) => (
-            <a
-              key={s.id}
-              href={`#${s.id}`}
-              className="rounded-full border border-edge px-2.5 py-1 text-xs font-medium text-muted transition-colors hover:border-edge-strong hover:text-fg"
-            >
-              {s.label}
-            </a>
-          ))}
-        </nav>
-      )}
+          not a second tab row — tabs switch content, these just scroll it. One
+          non-wrapping row, pinned under the tabs, so it never grows the block. */
+        showPills ? (
+          <nav
+            ref={navRef}
+            aria-label="Sections on this page"
+            data-fade-row=""
+            className="flex flex-nowrap gap-1.5 overflow-x-auto overflow-y-hidden px-1 py-2"
+          >
+            {sections.map((s) => (
+              <a
+                key={s.id}
+                href={`#${s.id}`}
+                aria-current={s.id === current ? "true" : undefined}
+                onClick={() => {
+                  pendingRef.current = s.id;
+                  choose(s.id);
+                }}
+                className={cx(
+                  "shrink-0 whitespace-nowrap rounded-full border px-2.5 py-1 text-xs font-medium transition-colors focus-visible:ring-inset focus-visible:ring-offset-0",
+                  s.id === current
+                    ? "border-brand text-fg"
+                    : "border-edge text-muted hover:border-edge-strong hover:text-fg",
+                )}
+              >
+                {s.label}
+              </a>
+            ))}
+          </nav>
+        ) : undefined
+      }
+    >
 
       {(error || loadError) && <Alert message={error || loadError} />}
       {notice && <Alert tone="success" message={notice} />}
@@ -600,44 +737,8 @@ export function AdminSettings() {
       )}
 
       {!loading && saved && (
-        <section id="docker-allowlist" className="scroll-mt-6">
-          <DockerAllowlistCard settings={saved} sources={sources} onSaved={applyResponse} />
-        </section>
-      )}
-
-      {!loading && saved && (
         <section id="review-bots" className="scroll-mt-6">
           <TrustedReviewBotsCard settings={saved} sources={sources} onSaved={applyResponse} />
-        </section>
-      )}
-
-      {!loading && saved && (
-        <section id="hosted-worker-quota" className="scroll-mt-6">
-          <HostedWorkerQuotaCard settings={saved} onSaved={applyResponse} />
-        </section>
-      )}
-
-      {!loading && saved && (
-        <section id="custody-hold-limit" className="scroll-mt-6">
-          <CustodyHoldLimitCard settings={saved} onSaved={applyResponse} />
-        </section>
-      )}
-
-      {!loading && saved && (
-        <section id="ephemeral-workers" className="scroll-mt-6">
-          <EphemeralWorkersCard settings={saved} onSaved={applyResponse} />
-        </section>
-      )}
-
-      {!loading && saved && (
-        <section id="worker-hibernation" className="scroll-mt-6">
-          <WorkerHibernationCard settings={saved} onSaved={applyResponse} />
-        </section>
-      )}
-
-      {!loading && saved && (
-        <section id="capability-scheduling" className="scroll-mt-6">
-          <CapabilitySchedulingCard settings={saved} sources={sources} onSaved={applyResponse} />
         </section>
       )}
 
@@ -658,6 +759,9 @@ export function AdminSettings() {
           <FetchCapsCard settings={saved} onSaved={applyResponse} />
         </section>
       )}
+
+      {/* End sentinel for the section highlight: zero height, observed while the page end is in view. */}
+      <div ref={endRef} aria-hidden="true" className="h-0" />
     </AdminShell>
   );
 }

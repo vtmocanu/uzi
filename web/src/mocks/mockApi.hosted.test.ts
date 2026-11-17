@@ -27,7 +27,7 @@ describe("mockApi hosted workers (PRD #58 M5)", () => {
     // so the mock is the only place M5 can be seen at all.
     const api = await fresh();
     await api.login("vlad@uzi.local", "x");
-    expect(await api.hostedConfig()).toEqual({ enabled: true, quota: 5, ephemeral_enabled: true, docker_enabled: true });
+    expect(await api.hostedConfig()).toEqual({ enabled: true, quota: 5, ephemeral_enabled: true, docker_enabled: true, default_size: "l" });
   });
 
   it("puts the at-quota journey three clicks away: four seeded hosted workers of five", async () => {
