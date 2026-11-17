@@ -146,6 +146,20 @@ const (
 	// where 0 disables self-service entirely (the API then 403s a provision).
 	// Runtime-tunable from the Admin Settings page; no env var.
 	KeyHostedWorkerQuota = "hosted_worker_quota"
+	// KeyEphemeralMaxPerUser (PRD #4212) is the per-user cap on CONCURRENT ephemeral hosted
+	// workers, separate from KeyHostedWorkerQuota. A base-10 integer in [0, maxHostedWorkerQuota],
+	// where 0 stops ephemeral provisioning for everyone. Overlaid by UZI_EPHEMERAL_MAX_PER_USER.
+	KeyEphemeralMaxPerUser = "ephemeral_max_per_user"
+	// KeyEphemeralDefaultSize (PRD #4212) is the workersize preset every ephemeral worker is
+	// provisioned at. Overlaid by UZI_EPHEMERAL_DEFAULT_SIZE.
+	KeyEphemeralDefaultSize = "ephemeral_default_size"
+	// KeyHostedDefaultSize (PRD #4212) is the workersize preset a persistent hosted worker
+	// is provisioned at when the request names none. Runtime-tunable; no env var.
+	KeyHostedDefaultSize = "hosted_default_size"
+	// KeyEphemeralLease (PRD #4212) is how long an idle ephemeral worker lingers after its
+	// run completes: a Go duration in [0, EphemeralLeaseMax], 0 meaning no lease. Overlaid by
+	// UZI_EPHEMERAL_LEASE.
+	KeyEphemeralLease = "ephemeral_lease"
 	// KeyJobMaxActivePerUser (PRD #1908) caps how many NON-TERMINAL job runs one user may have
 	// at once; a create past it is refused (429 over_cap). An integer in [1, maxJobMaxActivePerUser],
 	// validated by validateJobMaxActivePerUser. Runtime-tunable from the Admin Settings API; no env var.
@@ -417,6 +431,12 @@ const (
 	// which is why a permissive-ish default is safe here and the flag, not this
 	// number, is the real "is this feature on" switch.
 	DefaultHostedWorkerQuota = "2"
+	// PRD #4212: the ephemeral/hosted worker knobs default to what the env-only config
+	// shipped before they became settings, so an upgrade changes no behaviour.
+	DefaultEphemeralMaxPerUser  = "2"
+	DefaultEphemeralDefaultSize = "m"
+	DefaultHostedDefaultSize    = "l"
+	DefaultEphemeralLease       = "2h"
 	// PRD #1908: ten concurrent non-terminal job runs per user by default.
 	DefaultJobMaxActivePerUser = "10"
 	// #3150: the per-owner custody admission limit, formerly a compile-time constant in
@@ -574,6 +594,11 @@ var Defaults = map[string]string{
 	// an inert knob is cheaper than a settings surface that changes shape with the
 	// deployment.
 	KeyHostedWorkerQuota: DefaultHostedWorkerQuota,
+	// PRD #4212 ephemeral/hosted worker knobs. Same no-seeded-row pattern as the quota.
+	KeyEphemeralMaxPerUser:  DefaultEphemeralMaxPerUser,
+	KeyEphemeralDefaultSize: DefaultEphemeralDefaultSize,
+	KeyHostedDefaultSize:    DefaultHostedDefaultSize,
+	KeyEphemeralLease:       DefaultEphemeralLease,
 	// PRD #1908 per-user active job cap. Same no-seeded-row pattern as the quota above.
 	KeyJobMaxActivePerUser: DefaultJobMaxActivePerUser,
 	// #3150 per-owner custody admission limit. Same no-seeded-row pattern: unset reads as 8.

@@ -53,8 +53,10 @@ type Cache struct {
 	box *secretbox.Box
 	// env is the ENV-source overlay (PRD #25): key→plaintext value for the keys an
 	// operator set via environment (SLACK_BOT_TOKEN, SLACK_APP_TOKEN,
-	// UZI_PUBLIC_BASE_URL). ENV wins over the DB per key. Only keys actually set in
-	// the environment appear here.
+	// UZI_PUBLIC_BASE_URL) plus, since PRD #4212, the ephemeral worker knobs
+	// (UZI_EPHEMERAL_MAX_PER_USER, UZI_EPHEMERAL_DEFAULT_SIZE, UZI_EPHEMERAL_LEASE),
+	// each in its canonical form. ENV wins over the DB per key. Only keys actually set
+	// in the environment appear here.
 	env map[string]string
 
 	mu      sync.RWMutex
@@ -532,6 +534,12 @@ func Validate(key, value string) error {
 		return validateJudgeDailyBudget(value)
 	case KeyHostedWorkerQuota:
 		return validateHostedWorkerQuota(value)
+	case KeyEphemeralMaxPerUser:
+		return validateEphemeralMaxPerUser(value)
+	case KeyEphemeralDefaultSize, KeyHostedDefaultSize:
+		return validateWorkerSize(value)
+	case KeyEphemeralLease:
+		return validateEphemeralLease(value)
 	case KeyJobMaxActivePerUser:
 		return validateJobMaxActivePerUser(value)
 	case KeyCustodyHoldLimit:

@@ -282,18 +282,23 @@ func run() error {
 	// Wire the secret cipher + ENV-source overlay (PRD #25): the Slack tokens and
 	// public base URL an operator set via environment win over their DB rows, and
 	// the box seals/opens the secret keys. Only keys actually set appear in the
-	// overlay, so an unconfigured Slack instance stays a strict no-op.
-	slackEnv := map[string]string{}
+	// overlay, so an unconfigured Slack instance stays a strict no-op. The three
+	// ephemeral worker knobs (PRD #4212) join it only when their raw env var is set,
+	// carrying the canonical value config.Load produced (ephemeralSettingsEnv).
+	settingsEnv := map[string]string{}
 	if cfg.SlackBotToken != "" {
-		slackEnv[settings.KeySlackBotToken] = cfg.SlackBotToken
+		settingsEnv[settings.KeySlackBotToken] = cfg.SlackBotToken
 	}
 	if cfg.SlackAppToken != "" {
-		slackEnv[settings.KeySlackAppToken] = cfg.SlackAppToken
+		settingsEnv[settings.KeySlackAppToken] = cfg.SlackAppToken
 	}
 	if cfg.PublicBaseURL != "" {
-		slackEnv[settings.KeyPublicBaseURL] = cfg.PublicBaseURL
+		settingsEnv[settings.KeyPublicBaseURL] = cfg.PublicBaseURL
 	}
-	settingsCache.ConfigureSecrets(box, slackEnv)
+	for k, v := range ephemeralSettingsEnv(os.LookupEnv, &cfg) {
+		settingsEnv[k] = v
+	}
+	settingsCache.ConfigureSecrets(box, settingsEnv)
 
 	// Shared bot-token Slack surface (PRD #25 M3): the run notifier, the account
 	// linker, and the /me/slack test-DM endpoint all post through it. It reads the
