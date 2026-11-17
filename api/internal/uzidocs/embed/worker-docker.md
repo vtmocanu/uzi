@@ -761,7 +761,9 @@ written, a failed intent write fails the retire closed (the clone stays
 canonical), the 64 cap applies, and a failed in-process `rm` leaves a permanent
 `removing` entry that keeps that attempt's ledger entry from compaction.
 
-Switches. Reclaim is on by default. Disable it with the chart value
+Switches. Reclaim is requested by default, but it runs only on an eligible pass
+with an attested runtime declaration, so with the chart's default empty
+`runtime` no bound parent is reclaimed. Disable it with the chart value
 `workers.epochReclaim.retireScratchReclaim: false` (controller
 `UZI_WORKER_RETIRE_SCRATCH_RECLAIM`, worker `UZI_RETIRE_SCRATCH_RECLAIM=0`; see
 [configuration](./configuration.md)): the pass then reads and removes no binding,
