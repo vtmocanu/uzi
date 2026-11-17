@@ -223,6 +223,48 @@ it("M3 private legacy positive: known Claude source retains legacy cleanup", { s
   assert.equal((retire.mock.calls[0]!.arguments[4] as { dispositionClass?: string }).dispositionClass, "completion");
 });
 
+// issue #4263 M2: the completion caller of retireRunnerClone, through the real runner boundary. A failed scratch-binding
+// write or sync on the EXDEV branch must fail closed before the move: the boundary logs and retains the source.
+for (const fault of ["intent-write", "intent-sync"] as const) {
+  it(`M4 completion boundary: a failed ${fault} retains the source, with the clone, journal and ledger unchanged`, { skip: process.platform !== "linux" }, async t => {
+    const f = await setup(false);
+    assert.ok(await f.p.recovery.pin({ runId: f.claim.run_id, generation: 29, kind: "issue",
+      branch: f.source.context.branch, sourceSha: f.source.expectedHead, inventoryGuarded: true }));
+    await f.p.bindCompletionSource(f.flight);
+    const source = (await f.p.recovery.inspect(f.claim.run_id))[0]?.completionSource;
+    assert.ok(source);
+    const bare = f.source.context.barePath, branch = f.source.context.branch;
+    const cfg = (...args: string[]): string => {
+      try { return execFileSync("git", ["-C", bare, "config", "--local", ...args], { encoding: "utf8", stdio: "pipe" }); } catch { return ""; }
+    };
+    const before = { journal: cfg("--get-all", `uzi-recovery.${branch}.clone`), ledger: cfg("--get-all", `uzi-attempts.${branch}.entry`) };
+    assert.notEqual(before.journal, "");
+    const holding = path.join(fx.dataDir, "runner-quarantine");
+    const rename = fsp.rename.bind(fsp);
+    t.mock.method(fsp, "rename", async (...args: Parameters<typeof fsp.rename>) => {
+      if (String(args[1]).startsWith(holding + path.sep)) throw Object.assign(new Error("cross-device holding move"), { code: "EXDEV" });
+      return rename(...args);
+    });
+    const seam = git as unknown as { retireBindingStepSeam?: (step: string) => void };
+    const previous = seam.retireBindingStepSeam;
+    seam.retireBindingStepSeam = step => { if (step === fault) throw new Error(`injected ${fault}`); };
+    t.after(() => { seam.retireBindingStepSeam = previous; });
+    const warns: Array<{ message: string; fields?: Record<string, unknown> }> = [];
+    const log = (f.p as unknown as { log: { warn(message: string, fields?: Record<string, unknown>): void } }).log;
+    t.mock.method(log, "warn", (message: string, fields?: Record<string, unknown>) => { warns.push({ message, ...(fields ? { fields } : {}) }); });
+    let actions = 0;
+    assert.equal(await f.p.withCompletionSourceBoundary(source, async () => { actions++; }), "retained");
+    assert.equal(actions, 0, "the caller's action never ran");
+    const retained = warns.filter(w => w.message === "recovery: completion source retained");
+    assert.equal(retained.length, 1, "the documented warn");
+    assert.match(String(retained[0]!.fields?.error), new RegExp(`injected ${fault}`));
+    assert.equal(await git.worktreeHead(f.source.clonePath), f.source.expectedHead, "the clone is canonical and intact");
+    assert.equal(cfg("--get-all", `uzi-recovery.${branch}.clone`), before.journal, "journal unchanged");
+    assert.equal(cfg("--get-all", `uzi-attempts.${branch}.entry`), before.ledger, "ledger unchanged");
+    assert.deepEqual(fs.readdirSync(path.join(fx.dataDir, "runner")).filter(n => n.startsWith(".retire-")), [], "no scratch parent");
+  });
+}
+
 // Lifecycle controls: the authenticated coordinator and runner callback are real;
 // the physical Git cleanup is stubbed, so these cases do not attest process proof.
 for (const outcome of ["success", "partial-retry", "pending-bind", "concurrent-binds", "late-bind",

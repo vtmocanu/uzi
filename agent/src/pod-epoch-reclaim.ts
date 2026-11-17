@@ -14,7 +14,7 @@ import { isRunOwnershipLost } from "./client.js";
 import { parsePodEpochEvidence, assertPodEpochEvidenceBinding } from "./pod-epoch-evidence.js";
 import { openPodEpochDaemonBarrier, PodEpochDaemonError, type PodEpochDaemonGuard } from "./pod-epoch-daemon.js";
 import type { EpochScratchDiscardInput, GitCache, RetainedDiscardResult, RetainedHoldsSnapshot, RetainedLifecycleSnapshot, RetainedSourceSelector, RetainedWorkCounters } from "./git.js";
-import { evaluateRetireBinding, newRetainedWorkCounters, type RetireScratchParentOutcome, type RetireScratchPassReport } from "./git.js";
+import { evaluateRetireBinding, newRetainedWorkCounters, storesNameRetireParent, type RetireScratchParentOutcome, type RetireScratchPassReport } from "./git.js";
 import type { RecoveryHoldsResponse, RunOwnershipResponse } from "./protocol.js";
 import { SCRATCH_DELETE_LIMITS, censusScratchRoot } from "./rmtree.js";
 import { uidSplitActive } from "./runner-uid.js";
@@ -657,6 +657,8 @@ interface RetireContext {
   interrupted(): boolean;
   /** True once the pass was invalidated (a daemon veto or an entry change). */
   invalidated(): boolean;
+  /** True while the pass's current verdict is still `eligible` with attested authority. */
+  eligibleNow(): boolean;
   failFatal(): never;
   veto(): void;
 }
@@ -769,6 +771,10 @@ async function retireBody(ctx: RetireContext, pin: ScratchRootPin, root: string,
   const stopPhase = (reason: string): void => { if (out.state !== "stopped") { out.state = "stopped"; out.reason = reason; } };
   const fence = (seams.readFence ?? ((uid: string) => readPodEntryFence(uid, seams.io, seams.podEntryFile)))(ctx.podUid);
   if ("refused" in fence) return refuse(fence.refused);
+  // Pre-effect reads and the bare lock wait are bounded by the phase window as well as the pass (same Date.now clock as deadlineAt).
+  // Settlement after an effect starts keeps the pass rules: a helper or removal in flight is never cut by this.
+  // The bare-lock operation also carries the helper and the unset, which the helper budget ends 5 s before the window: `settleMs` keeps that reserve.
+  const phaseDeadline = (settleMs = 0): number => Math.min(ctx.deadlineAt(), Date.now() + Math.max(0, phaseEnd - ctx.now()) + settleMs);
   const mounts = (): "ok" | "mount_unknown" | "mount_unexpected" => (seams.readMounts ?? (() => readRunnerMounts(pin, root, io)))();
   const early = mounts();
   if (early !== "ok") return refuse(early);
@@ -796,15 +802,15 @@ async function retireBody(ctx: RetireContext, pin: ScratchRootPin, root: string,
 
   // ---- the candidate read: every bare under its own lock in one all-or-nothing pass, then the pass-wide paths ----
   let evidence: Awaited<ReturnType<PodEpochRetireDeps["git"]["readRetireScratchEvidence"]>>;
-  try { evidence = await ctx.owned(() => deps.git.readRetireScratchEvidence({ signal: controller.signal, deadline: ctx.deadlineAt() }), ctx.hardPass); }
+  try { evidence = await ctx.owned(() => deps.git.readRetireScratchEvidence({ signal: controller.signal, deadline: phaseDeadline() }), ctx.hardPass); }
   catch (error) {
     if (error instanceof PodEpochSettlementError || ctx.interrupted()) throw error;
-    return refuse("evidence_unknown");
+    return refuse(phaseEnd <= ctx.now() ? "budget_deferred" : "evidence_unknown");
   }
-  if (evidence.state !== "read") return refuse("evidence_unknown");
+  if (evidence.state !== "read") return refuse(phaseEnd <= ctx.now() ? "budget_deferred" : "evidence_unknown");
   const readProtected = async (): Promise<string[] | undefined> => {
     try {
-      const stored = await ctx.owned(() => deps.git.collectEpochScratchProtectedPaths({ signal: controller.signal, deadline: ctx.deadlineAt() }), ctx.hardPass);
+      const stored = await ctx.owned(() => deps.git.collectEpochScratchProtectedPaths({ signal: controller.signal, deadline: phaseDeadline(), excludeDisposition: true }), ctx.hardPass);
       return stored.state === "read" ? stored.paths : undefined;
     } catch (error) {
       if (error instanceof PodEpochSettlementError || ctx.interrupted()) throw error;
@@ -812,7 +818,7 @@ async function retireBody(ctx: RetireContext, pin: ScratchRootPin, root: string,
     }
   };
   const storedPaths = await readProtected();
-  if (storedPaths === undefined) return refuse("protected_unknown");
+  if (storedPaths === undefined) return refuse(phaseEnd <= ctx.now() ? "budget_deferred" : "protected_unknown");
 
   // ---- the parents: the listed `.retire-*` names plus every bound uuid (a gone parent is a recovery candidate) ----
   const listed = new Set<string>();
@@ -869,6 +875,7 @@ async function retireBody(ctx: RetireContext, pin: ScratchRootPin, root: string,
   for (const [index, name] of work.entries()) {
     // Soft stop: no new parent once the pass was aborted, a helper ran out of budget, or the phase window is too short.
     if (halted === undefined && controller.signal.aborted) halted = "pass_aborted";
+    if (halted === undefined && !ctx.eligibleNow()) halted = "epoch_not_eligible";
     if (halted === undefined && (phaseEnd - ctx.now() < RETIRE_CANDIDATE_MIN_MS || entriesLeft < 1)) halted = "budget_deferred";
     if (halted !== undefined) {
       defer(work.slice(index), halted === "budget_deferred" ? "budget_deferred" : "epoch_not_eligible");
@@ -897,7 +904,7 @@ async function retireBody(ctx: RetireContext, pin: ScratchRootPin, root: string,
     let step: RetireStep | undefined;
     try {
       step = await ctx.owned(() => deps.authority.withTransaction(tx => deps.reserve(runId, async (eligible): Promise<RetireStep> => {
-        if (!eligible() || controller.signal.aborted) return { kind: "keep", reason: "epoch_not_eligible" };
+        if (!eligible() || controller.signal.aborted || !ctx.eligibleNow()) return { kind: "keep", reason: "epoch_not_eligible" };
         const authority = await ctx.readAuthority(runId);
         if (!authority) return { kind: "keep", reason: "custody" };
         ctx.check(); ctx.entry();
@@ -908,8 +915,12 @@ async function retireBody(ctx: RetireContext, pin: ScratchRootPin, root: string,
         // Other bares may have gained a record since the nomination read: read the pass-wide paths again inside S.
         // Writers on other bares take their own bare's lock, never this one, so this re-read in S sees exactly what a read inside B would.
         const again = await readProtected();
-        if (again === undefined || protectedLeaves(again, root, [name]).has(name)) return { kind: "keep", reason: "protected_by_retained_source" };
-        const lockOpts = { signal: controller.signal, deadline: ctx.deadlineAt() };
+        // A record in ANOTHER bare naming the binding's original clone path keeps it too (alias-aware, like the parent check).
+        if (again === undefined && phaseEnd <= ctx.now()) return { kind: "keep", reason: "budget_deferred" };
+        // (Present parents only: a gone parent's case 2 recovery requires the journal in the owning bare to name the clone path.)
+        if (again === undefined || protectedLeaves(again, root, [name]).has(name) ||
+            (present === "present" && storesNameRetireParent(again, root, uuid, entry!.parsed!.clonePath))) return { kind: "keep", reason: "protected_by_retained_source" };
+        const lockOpts = { signal: controller.signal, deadline: phaseDeadline(5000) };
         return deps.git.withRetireScratchBare(barePath, lockOpts, async (locked): Promise<RetireStep> => {
           // ---- recovery route: the parent is gone, so only metadata can be wrong ----
           if (present === "gone") {
@@ -1572,6 +1583,8 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
               if (shared && (shared.stopped() || shared.pendingMutations > 0)) { fatal = true; throw new PodEpochSettlementError(); }
             },
             interrupted: () => fatal || controller.signal.aborted, invalidated: () => invalid,
+            // The CURRENT verdict, not the shadow snapshot: an M1b downgrade to partial closes the gate for every parent.
+            eligibleNow: () => result.verdict === "eligible" && result.authority.result === "attested",
             failFatal: () => { fatal = true; throw new PodEpochSettlementError(); },
             veto: () => { invalidate("daemon_veto"); stop("daemon_veto"); },
           });

@@ -1,4 +1,5 @@
 import { it } from "node:test";
+import { execFileSync } from "node:child_process";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -27,6 +28,7 @@ for (const mode of ["normal", "latched-pause", "failed-stop", "late-shutdown", "
     const started = deferred(), finish = deferred(), cleaning = deferred(), finishCleanup = deferred();
     let expected: unknown;
     let parked = false;
+    let branchSeen = "";
     const seed = git.runnerCloneForBranch.bind(git);
     t.mock.method(git, "runnerCloneForBranch", async (...args: Parameters<typeof seed>) => {
       const attempt = args[7];
@@ -148,6 +150,7 @@ for (const mode of ["normal", "latched-pause", "failed-stop", "late-shutdown", "
       executor: {
         run: async ctx => {
           await fs.writeFile(path.join(ctx.worktreePath, "pause-work.txt"), "fresh work\n");
+          branchSeen = ctx.branch;
           if (mode === "failed-cache") {
             const target = path.join(homeDir, claim.run_id);
             await fs.mkdir(path.join(target, "kept"), { recursive: true });
@@ -185,6 +188,11 @@ for (const mode of ["normal", "latched-pause", "failed-stop", "late-shutdown", "
         docker: { state: "not_wired", removed: [], detail: "" },
       }),
     });
+    // Keep a handle on the real flight, so the caller's documented flag can be asserted directly.
+    let flightSeen: { sourceJoinFailed?: boolean } | undefined;
+    const priv = runner as unknown as { buildFlight(...args: unknown[]): { sourceJoinFailed?: boolean } };
+    const buildFlight = priv.buildFlight.bind(runner);
+    t.mock.method(priv, "buildFlight", (...args: unknown[]) => { flightSeen = buildFlight(...args); return flightSeen; });
     const executing = runner.execute(claim);
     try {
       await Promise.race([started.promise, executing.then(() => { throw new Error("executor never started"); })]);
@@ -226,6 +234,22 @@ for (const mode of ["normal", "latched-pause", "failed-stop", "late-shutdown", "
         assert.equal(await fs.readFile(path.join(clonePath, "pause-work.txt"), "utf8"), "fresh work\n", "the clone stays at its canonical path");
         assert.deepEqual((await fs.readdir(path.join(fx.dataDir, "runner"))).filter(name => name.startsWith(".retire-")), [],
           "no scratch parent remains");
+        // The caller's documented outcome is unchanged: the failed retire sets sourceJoinFailed (no completed-source
+        // observation is retained), the terminal status is the baseline owner park (never failed or cancelled), and the
+        // journal and ledger are exactly what the pre-retire state left: still journaled, no retired entry, no cleared journal.
+        assert.equal(flightSeen?.sourceJoinFailed, true, "the failed retire sets the flight's sourceJoinFailed");
+        assert.equal(await tail, undefined, "sourceJoinFailed: the source cleanup did not complete, so nothing is observed");
+        const statuses = api.states.map(s => s.body.status);
+        assert.ok(statuses.includes("paused"), "terminal status is the baseline owner park");
+        assert.ok(!statuses.some(st => st === "failed" || st === "completed"), `no other terminal status: ${statuses.join(",")}`);
+        const bare = git.barePathFor(fx.originPath);
+        const cfg = (...args: string[]): string[] => {
+          try { return execFileSync("git", ["-C", bare, "config", "--local", ...args], { encoding: "utf8" }).split("\n").filter(Boolean); } catch { return []; }
+        };
+        const entries = cfg("--get-all", `uzi-attempts.${branchSeen}.entry`).map(raw => JSON.parse(raw) as { clonePath: string; state: string });
+        assert.ok(entries.length > 0 && entries.every(e => e.state !== "retired"), "the ledger carries no retired entry");
+        assert.ok(cfg("--get", `uzi-recovery.${branchSeen}.clone`).join("").includes(clonePath), "the journal still names the clone");
+        if (mode === "intent-write-failed") assert.deepEqual(cfg("--get-regexp", "^uzi-retire-scratch\\."), [], "no binding was written");
       }
       assert.equal(tails.has(claim.run_id), false, "no completed registry");
     } finally {

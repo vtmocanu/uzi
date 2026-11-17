@@ -2670,12 +2670,18 @@ function retireCanonicalRetired(b: RetireBinding): string {
   return attemptLedgerValue({ attemptId: b.attemptId, runId: b.runId, clonePath: b.clonePath, state: "retired" });
 }
 
-/** The last canonical ledger value for the binding's attempt across the bare's branches, or undefined. */
-function retireLedgerLast(evidence: RetireScratchBareEvidence, attemptId: string): { branch: string; raw: string; entry: AttemptLedgerEntry } | undefined {
+/**
+ * The last canonical ledger value for the binding's attempt across the bare's branches, undefined when none, or "tainted"
+ * when any NON-canonical value (reordered, padded, extra field, unparseable) still names the attempt id: such a value could
+ * be a later state this reader cannot interpret, so no earlier canonical `retired` stays authoritative over it.
+ */
+function retireLedgerLast(evidence: RetireScratchBareEvidence, attemptId: string): { branch: string; raw: string; entry: AttemptLedgerEntry } | undefined | "tainted" {
   let last: { branch: string; raw: string; entry: AttemptLedgerEntry } | undefined;
   for (const { branch, raw } of evidence.ledger) {
     const entry = parseAttemptLedgerEntry(raw);
-    if (entry && raw === attemptLedgerValue(entry) && entry.attemptId === attemptId) last = { branch, raw, entry };
+    if (entry && raw === attemptLedgerValue(entry)) {
+      if (entry.attemptId === attemptId) last = { branch, raw, entry };
+    } else if (raw.includes(attemptId)) return "tainted";
   }
   return last;
 }
@@ -2723,6 +2729,7 @@ export function evaluateRetireBinding(input: {
   if (b.phase === "removing") return keep("interrupted_removal");
   if (!RETIRE_RECLAIM_CLASSES.has(b.class)) return keep("class_ineligible");
   const last = retireLedgerLast(evidence, b.attemptId);
+  if (last === "tainted") return keep("ledger_mismatch");
   if (!last) return keep("ledger_missing");
   if (last.branch !== b.branch || last.raw !== retireCanonicalRetired(b)) return keep("ledger_mismatch");
   const parentName = `.retire-${uuid}`;
@@ -2743,7 +2750,7 @@ export function evaluateRetireRecovery(input: {
   const b = own.length === 1 && own[0]!.raw === input.expectRaw ? own[0]!.parsed : undefined;
   if (!b) return "unresolved";
   const last = retireLedgerLast(evidence, b.attemptId);
-  if (!last || last.branch !== b.branch || last.entry.runId !== b.runId || last.entry.clonePath !== b.clonePath) return "unresolved";
+  if (!last || last === "tainted" || last.branch !== b.branch || last.entry.runId !== b.runId || last.entry.clonePath !== b.clonePath) return "unresolved";
   const journal = retireJournalOf(evidence, b.branch);
   if (journal === "unparseable" || evidence.restoreBranches.includes(b.branch)) return "unresolved";
   const named = pathNamed(evidence.protectedPaths, b.clonePath);
@@ -5377,7 +5384,7 @@ export class GitCache {
    * already uses, under the same bare lock, bounds and recovery operation), then the four recovery
    * stores through a bounded fd-relative walk. Anything unreadable, malformed, truncated or over a cap
    * is `unknown`/`malformed` with a fixed reason token and no paths: the caller then refuses scratch. */
-  async collectEpochScratchProtectedPaths(opts: { signal: AbortSignal; deadline: number }): Promise<ProtectedPathsRead> {
+  async collectEpochScratchProtectedPaths(opts: { signal: AbortSignal; deadline: number; excludeDisposition?: boolean }): Promise<ProtectedPathsRead> {
     const sink = newPathSink();
     const limits = this.epochLimits();
     const outcome = async (): Promise<ProtectedPathsRead> => {
@@ -5392,6 +5399,9 @@ export class GitCache {
             const nl = item.indexOf("\n");
             const key = nl < 0 ? item : item.slice(0, nl);
             if (!key.startsWith("uzi-")) continue;
+            // `excludeDisposition`: the retire-scratch binding and the attempt ledger are the reclaim's own disposition
+            // records (they name the very clone path under test), not retained sources; every other record still counts.
+            if (opts.excludeDisposition && (key.startsWith(RETIRE_BINDING_PREFIX) || /^uzi-attempts\..+\.entry$/.test(key))) continue;
             // A valueless record is not a cleared value: other protection readers treat it as
             // undecodable. Refuse every valueless uzi-* key rather than silently omitting one.
             if (nl < 0) return { state: "unknown", reason: "bare_value_unparseable" };
