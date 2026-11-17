@@ -1137,7 +1137,7 @@ must be a boolean. This grants no attestation; undeclared/unattested keeps scrat
 Older controllers or absent env leave scratch off; older workers ignore the env,
 so rendered `1` is not proof. The worker image must include #4171 (`7cd46526`).
 
-`.retire-*` retirement scratch records (#4143): each worker startup
+`.retire-*` retirement scratch outcome records (#4143) are observation only: each worker startup
 logs bounded per-parent outcome rows (parents only) and one total line (whenever
 records are on and the runner root is a directory that was listed, even with
 zero parents; none when the root is missing, a symlink, not a directory or

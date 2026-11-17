@@ -393,10 +393,14 @@ new parent (`retireRunnerClone` takes the class from its caller in
 |---|---|---|---|
 | `owner_terminal` | yes | yes | The run's own terminal disposition, which today's code already carries out in-process. |
 | `verified_successor` | yes | yes | A server-acknowledged covering FINAL, which today's code already carries out in-process. |
-| `owner_terminal_covered` | yes | never | `preserveRecoveryClone` was lifted by the stopped-source covered verdict, whose proof (`worktreeCleanHardened`) can still miss ignored paths and runner-unreadable directories that Git silently omits (#4141 fixed only the stderr case; #4137 stays open). Reads `class_ineligible`. |
-| `completion` | yes | never | Completion keeps the outer bare lock and raw-removes in-process; its binding writes `removing` before that removal and never settles. Reads `class_ineligible`. |
-| `other` (foreign-orphan) | yes | never | No owner-terminal or acknowledged-FINAL authority backs it. Reads `class_ineligible`. |
+| `owner_terminal_covered` | yes | never | `preserveRecoveryClone` was lifted by the stopped-source covered verdict, whose proof (`worktreeCleanHardened`) can still miss ignored paths and runner-unreadable directories that Git silently omits (#4141 fixed only the stderr case; #4137 stays open). On a split pod its binding stays `intent` with the parent on disk and reads `bound_intent` (it never settles). |
+| `completion` | yes | never | Completion keeps the outer bare lock and raw-removes in-process; its binding writes `removing` before that removal and never settles. The binding is unset after a successful in-process removal; a failed or partial removal leaves `removing`, which reads `interrupted_removal`. |
+| `other` (foreign-orphan) | yes | never | No owner-terminal or acknowledged-FINAL authority backs it. On a split pod its binding stays `intent` with the parent on disk and reads `bound_intent` (it never settles). In production a foreign-orphan retire carries no `attemptId`, so it is in practice unbound (today's behaviour). |
 | attempt-less retire | no | never | The owner's cross-check against the attempt-ledger entry (attemptId, runId, clonePath) cannot be satisfied without an attemptId; the parent stays unbound and kept. |
+
+`class_ineligible` is reachable only for a `settled` value of an ineligible class,
+which no writer produces; it is a defensive reading, not an outcome seen in
+practice.
 
 On a uid-split pod a bound `owner_terminal` or `verified_successor` retire
 settles only when every proof holds: the rename was verified (inode on the
@@ -430,12 +434,26 @@ crashed attempt and adds the epoch exclusion.
 - **Interrupted removal is kept permanently** (owner decision). A binding at
   `removing` is never retried, resumed or retired automatically; it reads
   `interrupted_removal`.
-- **Split pod versus single uid.** On a split pod the worker no longer removes a
-  bound `owner_terminal` or `verified_successor` parent in-process; it leaves the
-  parent for the verified epoch. On a single-uid pod nothing changes: the walker
-  and the writer share the uid, so the binding goes straight to `removing` and the
-  existing in-process `rm` runs, then the binding is unset after the runner root
-  is synced. Unbound parents keep today's path-based removal. **#2349 site 2
+- **Split pod versus single uid.** On a split pod the worker no longer removes
+  **any** bound non-completion parent in-process (`if (bound && split)` in
+  `retireRunnerCloneImpl`); it leaves the parent on disk. `owner_terminal` and
+  `verified_successor` settle (when every proof holds) and a verified epoch
+  reclaims them. `owner_terminal_covered` and `other` (foreign-orphan, discard
+  false) stay at `intent` with the parent kept permanently (`bound_intent`); no
+  path reclaims them. Only completion keeps its in-process removal (`removing`
+  written first, unset after success). **Accepted residual:** this is a behaviour
+  change for those two classes on a split pod. Previously the worker's in-process
+  `rm` attempted them (and usually failed on runner-owned content); now it never
+  tries, so retention only grows, never shrinks. Foreign-orphan retires carry no
+  `attemptId` in production, so they are in practice unbound and unchanged.
+  Unbound parents keep today's path-based removal. Single-uid **disposal** is
+  unchanged: the walker and the writer share the uid, so the binding goes
+  straight to `removing` and the existing in-process `rm` runs, then the binding
+  is unset after the runner root is synced. What does change on a single-uid
+  pod: bindings are written; a failed intent write fails the retire closed (the
+  clone stays canonical); the 64-binding cap applies; and a failed in-process
+  `rm` leaves a permanent `removing` entry that pins attempt-ledger compaction
+  for that bare. **#2349 site 2
   (holding/scratch disposal in `retireRunnerClone`) therefore stays open**; see
   ADR-1809.
 
@@ -463,7 +481,8 @@ verdict or reason and reports only a `retire_scratch` block and
   with under 20 s left; at most 64 candidates and 2,000,000 helper entries per
   pass. A deferral (`budget_deferred`, `epoch_not_eligible`) never changes the
   verdict, is counted separately from `kept` and leaves the binding untouched.
-  The helper gets what the phase window holds, never more than 300 s.
+  The helper gets at most min(300 s, phase window − 5 s); with the 120 s phase cap
+  that is at most about 115 s.
 - **Per-candidate exclusion.** Each candidate is re-proven under the existing
   A, S, B order: the authority transaction (A), the run's source reservation (S),
   and the parent bare's lock (B). Inside B the binding, ledger, journal, restore
@@ -555,7 +574,7 @@ parent is unbound and kept.
 
 | Writer | Participation |
 |---|---|
-| EXDEV retire in `retireRunnerClone` (owner terminal, verified successor, completion, foreign-orphan) | Writes `intent`, then `settled` (two eligible classes, split pod only) or `removing`; unsets after a confirmed removal. |
+| EXDEV retire in `retireRunnerClone` (owner terminal, verified successor, completion, foreign-orphan) | Writes `intent`, then `settled` (two eligible classes, split pod only) or `removing` (completion, and every bound class on a single-uid pod); unsets after a confirmed removal. On a split pod `owner_terminal_covered` and `other` stay at `intent` (`bound_intent`) with the parent kept; no in-process removal. |
 | Completion disposal | Writes `removing` before its raw `rm`; never settles; unsets only after a successful full disposal. |
 | Single-uid in-process removal | Writes `removing` before the `rm`; unsets after the runner root is synced; failure keeps `removing`. |
 | Verified-epoch phase | Writes `removing` (once, under B) and unsets; also unsets in the recovery route. |
@@ -587,7 +606,7 @@ An architect, auditor and reviewer examined two judgments and found no stop.
   each of A, S and B; residual fixtures with runner-cmd content inside tracked
   directories; helper stderr never logged; empty-fd refused when the split is
   inactive; the receipt is never emptiness proof; deferral applies only to
-  bound non-completion discard parents. Rejected alternative: opening the parent
+  bound non-completion parents. Rejected alternative: opening the parent
   group write and search for a strict `remove`, which would let the agent uid
   plant entries in a worker-private parent.
 
@@ -610,6 +629,11 @@ An architect, auditor and reviewer examined two judgments and found no stop.
 - **Partial removal** carries no durability claim, and the parent and its
   remaining bytes stay.
 - **FINAL capture proofs run as the runner uid**; see Judgment B.
+- **More retention on split pods (accepted).** Bound `owner_terminal_covered` and
+  `other` parents are no longer attempted in-process and no epoch path reclaims
+  them; they stay at `intent` (`bound_intent`) until an operator acts. More
+  retention, never less. Foreign-orphan retires carry no `attemptId` in
+  production, so they are in practice unbound (today's behaviour).
 - Legacy parents, attempt-less retires, the `owner_terminal_covered` class and
   resume of an interrupted removal are out of scope.
 
@@ -621,3 +645,11 @@ An architect, auditor and reviewer examined two judgments and found no stop.
   parent-death cases that need a root-owned runner root or a real second uid) come
   from exact-head CI `test-agent-worker-uid` unless reported otherwise; this
   amendment does not claim them.
+- The real worker-UID lane cases call `discardRetireScratchParent` directly, with
+  no binding. Binding `removing` retention and the two never-settling classes are
+  therefore proven only by hermetic tests (`agent/test/retire-binding-writes.test.ts`,
+  `agent/test/pod-epoch-retire-scratch.test.ts`). The lane's clone-pin mount-id
+  half is not exercised (it needs CAP_SYS_ADMIN).
+- In the implementing run the six lane cases ran in an older local image, not the
+  CI-built one. The CI lane `test-agent-worker-uid` on the exact head is the
+  evidence of record.

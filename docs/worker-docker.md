@@ -705,8 +705,16 @@ class, attempt id, run id, branch, clone path, inodes and a phase (`intent`,
 field of the recovery journal or the attempt ledger. At most 64 are kept per
 bare; past that a new parent is simply unbound and kept. Only two classes can
 settle, and only on a uid-split pod: `owner_terminal` and `verified_successor`.
-Completion, covered-lift terminal, foreign-orphan and attempt-less retires never
-become eligible. See [ADR-3153](../adr/3153-runner-shared-pvc-subpath.md) for the
+Completion, covered-lift terminal (`owner_terminal_covered`), foreign-orphan
+(`other`) and attempt-less retires never become eligible. On a uid-split pod
+every bound non-completion parent is deferred, with no in-process removal:
+covered-lift and foreign-orphan bindings stay at `intent` with the parent kept
+permanently (`bound_intent`) and no path reclaims them. This is a behaviour
+change: previously the worker's in-process `rm` attempted them (and usually
+failed on runner-owned content), so retention only grows, never shrinks.
+Foreign-orphan retires carry no attempt id in production, so they are in
+practice unbound. Completion keeps its in-process removal: `removing` is written
+first and the binding is unset after success. See [ADR-3153](../adr/3153-runner-shared-pvc-subpath.md) for the
 full table and reasons.
 
 **Verified-epoch reclaim.** On a uid-split Docker worker the verified pod-epoch
@@ -717,14 +725,15 @@ source, restore, custody, quarantine or stopped marker naming it (alias-aware fo
 a worker-owned 0700 parent holding only `clone` with the bound inodes, older than
 the pod-entry fence, no mount or bind at or under it, an idle worker and no
 process holding it. The phase is bounded: 30 s of headroom to start, a 120 s cap,
-20 s minimum per candidate, at most 64 candidates and 2,000,000 helper entries. A
-deferral never changes the pass verdict.
+20 s minimum per candidate, at most 64 candidates and 2,000,000 helper entries.
+The helper gets at most min(300 s, phase window - 5 s), so at most about 115 s
+with the 120 s cap. A deferral never changes the pass verdict.
 
 Removal runs the strict pinned helper (`empty-fd`) as the runner uid only: no
 chmod, no chown, no privilege increase and no raw fallback. The worker then
 removes `clone` and the parent with its own `rmdir`, which is the proof that
-nothing was left. A removal that leaves anything behind marks the binding
-`removing`; **a `removing` binding is never retried or reclaimed** (it reads
+nothing was left. `removing` is written durably before the first deletion effect, and a removal
+that leaves anything behind leaves the binding there; **a `removing` binding is never retried or reclaimed** (it reads
 `interrupted_removal`, and `removing_bindings` in the total counts them). A
 binding whose parent is already gone is cleared by a metadata-only recovery
 step.
@@ -740,11 +749,17 @@ Kept reasons for bound parents include `bound_intent`, `interrupted_removal`,
 `evidence_unknown`, and keeps every parent.
 
 Still kept: legacy parents created before bindings, attempt-less retires,
-anything unbound, every non-eligible class, any parent on a single-uid worker
-(whose in-process removal is unchanged), a parent in `intent` or `removing`, and
+anything unbound, every non-eligible class (never reclaimed by the epoch), any
+parent on a single-uid worker (never reclaimed by the epoch; single-uid workers
+still remove them in-process), a parent in `intent` or `removing`, and
 a parent that any check refuses. The legacy stderr-proof repair (#4141, landed
 via #4152) does not certify remnants created by older code retroactively; #4137
 is a distinct residual.
+
+Single-uid disposal is unchanged, but a few things differ there: bindings are
+written, a failed intent write fails the retire closed (the clone stays
+canonical), the 64 cap applies, and a failed in-process `rm` leaves a permanent
+`removing` entry that pins attempt-ledger compaction for that bare.
 
 Switches. Reclaim is on by default. Disable it with the chart value
 `workers.epochReclaim.retireScratchReclaim: false` (controller
