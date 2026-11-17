@@ -10,8 +10,12 @@ import { attemptClonePath, formatAttemptId } from "../src/attempt-path.js";
 import { nullLogger } from "./helpers.js";
 
 // issue #4263 M1 frozen old-reader proof. This file writes RAW config keys only (no codec import) and calls only APIs that
-// exist before the binding feature, so it can be run unchanged against a base export: every existing reader must return
-// the same answer for a bare config with `uzi-retire-scratch.<uuid>.binding` keys as for the same config without them.
+// exist before the binding feature, so it can be run unchanged against a base export. What it pins for a bare config with
+// `uzi-retire-scratch.<uuid>.binding` keys:
+//  - the attribution readers ignore the `uzi-retire-scratch.` prefix entirely;
+//  - `collectEpochScratchProtectedPaths` absorbs absolute paths found in the JSON value into its protected set, and returns
+//    `unknown` on a valueless `uzi-*` key (both fail closed);
+//  - binding entries count toward existing readers' config-entry caps like any other entry (the ACK reader's cap is 1024).
 
 const ENV = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" };
 const BRANCH = "agent/issue-4263";
@@ -32,7 +36,6 @@ let clonePath: string;
 const gitIn = (args: string[]): string => execFileSync("git", ["-C", bare, ...args], { encoding: "utf8", env: ENV }).trim();
 const setKey = (key: string, value: string, add = false): void => { gitIn(["config", "--local", ...(add ? ["--add"] : []), key, value]); };
 const budget = () => ({ signal: new AbortController().signal, deadline: Date.now() + 60_000 });
-const window = () => ({ signal: new AbortController().signal, deadline: Date.now() + 60_000 });
 
 beforeEach(() => {
   root = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-old-readers-"));
@@ -90,7 +93,7 @@ describe("existing readers ignore uzi-retire-scratch binding keys", () => {
     assert.deepEqual(d, c);
   });
 
-  it("the acknowledged-report reader is unchanged, and its 1024-entry cap counts entries, not binding keys", async () => {
+  it("the acknowledged-report reader is unchanged, and binding keys count like any other entry toward its 1024 cap", async () => {
     const read = () => cache.withReportProofBudget(budget(), () =>
       cache.withBareLock(bare, () => cache.readAcknowledgedReportSourcesUnderLock(bare, RUN)));
     // The snapshot embeds the config bytes and file identity, which legitimately differ; the sources must not.
@@ -112,7 +115,7 @@ describe("existing readers ignore uzi-retire-scratch binding keys", () => {
   });
 
   it("the epoch scratch protected-path read stays readable and adds only the binding's own clone path", async () => {
-    const collect = () => cache.collectEpochScratchProtectedPaths(window());
+    const collect = () => cache.collectEpochScratchProtectedPaths(budget());
     const [a, b] = await beforeAfter(collect);
     assert.equal(a.state, "read");
     assert.equal(b.state, "read");
@@ -126,6 +129,10 @@ describe("existing readers ignore uzi-retire-scratch binding keys", () => {
     assert.deepEqual(await cache.readBareAttributionConfig(bare), before);
     const gathered = await cache.withBareLock(bare, () =>
       (cache as unknown as { gatherRetainedUnderLock(b: string): Promise<{ records: unknown[] }> }).gatherRetainedUnderLock(bare));
-    assert.ok(gathered.records.length >= 0);
+    // Only non-throwing is asserted for the gather: the malformed and valueless keys must not break it.
+    assert.ok(Array.isArray(gathered.records));
+    // The epoch scratch reader is the one old reader that does look at `uzi-*` keys: a valueless one fails closed.
+    const collected = await cache.collectEpochScratchProtectedPaths(budget());
+    assert.equal(collected.state, "unknown");
   });
 });

@@ -2521,9 +2521,13 @@ function attemptLedgerValue(entry: AttemptLedgerEntry): string {
 // config key `uzi-retire-scratch.<uuid>.binding`, so a later verified pass can reclaim it. The value
 // is canonical JSON (field order below, no whitespace, no device number); a reader accepts ONLY a value
 // that re-serializes to itself. The key prefix is not an attribution prefix and not a protected-record
-// family: older readers ignore it (see test/retire-binding-old-readers.test.ts).
+// family. Existing readers: the attribution readers ignore the prefix; `collectEpochScratchProtectedPaths` absorbs absolute
+// paths from the JSON value into its protected set and returns `unknown` on a valueless `uzi-*` key (both fail closed);
+// binding entries count toward existing readers' config-entry caps (the ACK reader's is 1024). See
+// test/retire-binding-old-readers.test.ts.
 
-/** Most binding keys one bare may carry; a bare over the cap reads as `unknown`, never as a truncated list. */
+/** Most binding keys one bare may carry, counting every entry under the `uzi-retire-scratch.` prefix (valid or not);
+ *  a bare over the cap reads as `unknown`, never as a truncated list. */
 export const RETIRE_BINDING_MAX_PER_BARE = 64;
 
 const RETIRE_BINDING_PREFIX = "uzi-retire-scratch.";
@@ -2566,6 +2570,21 @@ export function retireBindingValue(b: RetireBinding): string {
   });
 }
 
+/** At most 4096 chars, no C0/DEL control characters and no bidi controls. */
+function retireTextOk(s: string): boolean {
+  if (s.length > 4096) return false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c <= 0x1f || c === 0x7f || (c >= 0x202a && c <= 0x202e) || (c >= 0x2066 && c <= 0x2069)) return false;
+  }
+  return true;
+}
+
+/** A non-zero inode that fits an unsigned 64-bit integer. */
+function retireInodeOk(s: string): boolean {
+  return RETIRE_INODE_RE.test(s) && BigInt(s) !== 0n && BigInt(s) <= 18446744073709551615n;
+}
+
 /** Strict decode of one binding: the key uuid must be valid and the raw text must be exactly the canonical serialization. */
 export function parseRetireBinding(keyUuid: string, raw: string): { ok: true; binding: RetireBinding } | { ok: false } {
   const bad = { ok: false } as const;
@@ -2581,8 +2600,9 @@ export function parseRetireBinding(keyUuid: string, raw: string): { ok: true; bi
     branch === undefined || clonePath === undefined || parentIno === undefined || cloneIno === undefined || pod === undefined) return bad;
   if (!(RETIRE_CLASSES as readonly string[]).includes(cls) || !(RETIRE_PHASES as readonly string[]).includes(phase)) return bad;
   if (!ATTEMPT_ID_RE.test(attemptId) || !RETIRE_RUN_ID_RE.test(runId) || branch === "") return bad;
+  if (!retireTextOk(branch) || branch.startsWith("-") || !retireTextOk(clonePath)) return bad;
   if (!path.isAbsolute(clonePath) || path.resolve(clonePath) !== clonePath) return bad;
-  if (!RETIRE_INODE_RE.test(parentIno) || !RETIRE_INODE_RE.test(cloneIno) || !RETIRE_POD_RE.test(pod)) return bad;
+  if (!retireInodeOk(parentIno) || !retireInodeOk(cloneIno) || !RETIRE_POD_RE.test(pod)) return bad;
   const binding: RetireBinding = {
     v: 1, class: cls as RetireBinding["class"], attemptId, runId, branch, clonePath,
     phase: phase as RetireBinding["phase"], parentIno, cloneIno, pod,
@@ -2590,8 +2610,9 @@ export function parseRetireBinding(keyUuid: string, raw: string): { ok: true; bi
   return retireBindingValue(binding) === raw ? { ok: true, binding } : bad;
 }
 
-/** One binding key of a bare: `parsed` is undefined for a malformed, valueless or duplicated key. */
-export interface RetireBindingRead { uuid: string; raw: string; parsed?: RetireBinding }
+/** One `uzi-retire-scratch.*` entry of a bare: `key` is the full config key, `uuid` is set only when the key is a well-formed
+ *  binding key, and `parsed` is undefined for a malformed, valueless or duplicated entry. */
+export interface RetireBindingRead { key: string; uuid?: string; raw: string; parsed?: RetireBinding }
 export type RetireBindingsRead = { state: "read"; bindings: RetireBindingRead[] } | { state: "unknown" };
 
 // ─── issue #1786 — retained stopped sources ────────────────────────────────────────────────
@@ -16724,9 +16745,10 @@ export class GitCache {
     for (const r of rows) seen.set(r.key, (seen.get(r.key) ?? 0) + 1);
     const bindings = rows.map((r): RetireBindingRead => {
       const uuid = parseRetireBindingKey(r.key);
-      if (uuid === undefined || seen.get(r.key) !== 1) return { uuid: uuid ?? r.key, raw: r.raw };
+      const base = uuid === undefined ? { key: r.key, raw: r.raw } : { key: r.key, uuid, raw: r.raw };
+      if (uuid === undefined || seen.get(r.key) !== 1) return base;
       const decoded = parseRetireBinding(uuid, r.raw);
-      return decoded.ok ? { uuid, raw: r.raw, parsed: decoded.binding } : { uuid, raw: r.raw };
+      return decoded.ok ? { ...base, parsed: decoded.binding } : base;
     });
     return { state: "read", bindings };
   }
@@ -17430,9 +17452,11 @@ export class GitCache {
       const snapshot = await this.configEntries(barePath);
       if (this.restoreValueIn(snapshot, branch) !== undefined) return;
       // issue #4263: a retirement binding names (attemptId, runId, clonePath) of a scratch parent still owed reclaim; its
-      // ledger entry is kept whatever its state. An unreadable binding set (over the cap) keeps every entry (no drop).
+      // ledger entry is kept whatever its state. An unreadable binding set (over the cap) or any undecodable entry (a
+      // duplicated key, a non-canonical or future-version value) keeps every entry (no drop), like `unknown`.
       const bindingRead = await this.readRetireBindingsUnderLock(barePath, snapshot);
-      const namedByBinding = (e: AttemptLedgerEntry): boolean => bindingRead.state === "unknown" || bindingRead.bindings.some(b =>
+      const bindingsUndecodable = bindingRead.state === "unknown" || bindingRead.bindings.some(b => b.parsed === undefined);
+      const namedByBinding = (e: AttemptLedgerEntry): boolean => bindingsUndecodable || bindingRead.state === "read" && bindingRead.bindings.some(b =>
         b.parsed !== undefined && b.parsed.attemptId === e.attemptId && b.parsed.runId === e.runId && b.parsed.clonePath === e.clonePath);
       const raw = (await this.readAllAttemptLedgerRaw(barePath)).filter(([b]) => b === branch).map(([, v]) => v);
       const last = new Map<string, AttemptLedgerEntry>();

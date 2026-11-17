@@ -26,7 +26,7 @@ const UUID = "1a1a1a1a-1111-4111-8b1b-1c1c1c1c1c1c";
 
 const binding = (over: Partial<RetireBinding> = {}): RetireBinding => ({
   v: 1, class: "completion", attemptId: ATTEMPT, runId: "run-4263", branch: BRANCH,
-  clonePath: "/data/runner/slug/issue-4263.attempt-x", phase: "intent", parentIno: "131072", cloneIno: "0", pod: "worker-0", ...over,
+  clonePath: "/data/runner/slug/issue-4263.attempt-x", phase: "intent", parentIno: "131072", cloneIno: "131073", pod: "worker-0", ...over,
 });
 const asObject = (over: Record<string, unknown>): string => JSON.stringify({ ...JSON.parse(retireBindingValue(binding())), ...over });
 
@@ -42,6 +42,8 @@ describe("retire binding codec", () => {
       for (const phase of ["intent", "settled", "removing"] as const)
         assert.equal(parseRetireBinding(UUID, retireBindingValue(binding({ class: cls, phase }))).ok, true);
     assert.equal(parseRetireBinding(UUID, retireBindingValue(binding({ pod: "" }))).ok, true, "an empty pod is allowed");
+    assert.equal(parseRetireBinding(UUID, retireBindingValue(binding({ parentIno: "18446744073709551615" }))).ok, true, "2^64-1 is allowed");
+    assert.equal(parseRetireBinding(UUID, retireBindingValue(binding({ branch: "b".repeat(4096) }))).ok, true, "4096 chars is allowed");
   });
 
   it("derives and parses the key", () => {
@@ -78,6 +80,19 @@ describe("retire binding codec", () => {
     ["numeric inode", asObject({ cloneIno: 5 })],
     ["negative inode", asObject({ cloneIno: "-1" })],
     ["oversized inode", asObject({ parentIno: "1".repeat(21) })],
+    ["inode above 2^64-1", asObject({ parentIno: "18446744073709551616" })],
+    ["zero parent inode", asObject({ parentIno: "0" })],
+    ["zero clone inode", asObject({ cloneIno: "0" })],
+    ["branch over 4096 chars", asObject({ branch: "b".repeat(4097) })],
+    ["branch starting with a dash", asObject({ branch: "-x" })],
+    ["branch with a newline", asObject({ branch: "agent/a\nb" })],
+    ["branch with a NUL", asObject({ branch: "agent/a\u0000b" })],
+    ["branch with DEL", asObject({ branch: "agent/a\u007Fb" })],
+    ["branch with a bidi override", asObject({ branch: "agent/a‮b" })],
+    ["branch with a bidi isolate", asObject({ branch: "agent/a⁦b" })],
+    ["clonePath over 4096 chars", asObject({ clonePath: `/${"c".repeat(4096)}` })],
+    ["clonePath with a tab", asObject({ clonePath: "/data/runner/a\tb" })],
+    ["clonePath with a bidi control", asObject({ clonePath: "/data/runner/a‪b" })],
     ["pod with a space", asObject({ pod: "a b" })],
     ["pod too long", asObject({ pod: "p".repeat(161) })],
     ["uppercase key uuid", good, UUID.toUpperCase()],
@@ -115,6 +130,7 @@ describe("bounded binding reader", () => {
     if (read.state !== "read") return;
     const byUuid = new Map(read.bindings.map(b => [b.uuid, b]));
     assert.deepEqual(byUuid.get(UUID)?.parsed, binding());
+    assert.equal(byUuid.get(UUID)?.key, retireBindingKey(UUID));
     assert.equal(byUuid.get(other)?.parsed, undefined);
     assert.equal(byUuid.get(other)?.raw, "not json");
   });
@@ -131,7 +147,13 @@ describe("bounded binding reader", () => {
   it("returns a valueless binding key as a malformed entry instead of throwing", async () => {
     fs.appendFileSync(path.join(bare, "config"), `[uzi-retire-scratch "${UUID}"]\n\tbinding\n`);
     const read = await cache.readRetireBindings(bare);
-    assert.deepEqual(read, { state: "read", bindings: [{ uuid: UUID, raw: "" }] });
+    assert.deepEqual(read, { state: "read", bindings: [{ key: retireBindingKey(UUID), uuid: UUID, raw: "" }] });
+  });
+
+  it("carries the full key and no uuid for a key that is not a well-formed binding key", async () => {
+    gitIn(["config", "--local", "uzi-retire-scratch.junk.binding", "x"]);
+    const read = await cache.readRetireBindings(bare);
+    assert.deepEqual(read, { state: "read", bindings: [{ key: "uzi-retire-scratch.junk.binding", raw: "x" }] });
   });
 
   it("treats a duplicated key as malformed for every copy", async () => {
@@ -178,11 +200,27 @@ describe("compactAttemptLedger keeps an attempt a binding names", () => {
     assert.deepEqual(ledgerValues(), []);
   });
 
-  it("a malformed binding names nothing", async () => {
+  it("keeps every entry when any binding is malformed (it may name the entry)", async () => {
     addRetired();
     setBinding(UUID, "{");
+    const before = ledgerValues();
     await compact();
-    assert.deepEqual(ledgerValues(), []);
+    assert.deepEqual(ledgerValues(), before);
+    assert.equal(before.length, 1);
+  });
+
+  it("keeps the entry when the binding key is duplicated", async () => {
+    const clonePath = addRetired();
+    for (let i = 0; i < 2; i++) gitIn(["config", "--local", "--add", retireBindingKey(UUID), retireBindingValue(binding({ clonePath }))]);
+    await compact();
+    assert.equal(ledgerValues().length, 1);
+  });
+
+  it("keeps the entry when the binding value is a future version", async () => {
+    const clonePath = addRetired();
+    setBinding(UUID, asObject({ v: 2, clonePath }));
+    await compact();
+    assert.equal(ledgerValues().length, 1);
   });
 
   it("drops nothing when the binding read is unknown", async () => {
