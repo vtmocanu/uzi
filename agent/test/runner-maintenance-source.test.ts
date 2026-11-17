@@ -48,6 +48,8 @@ for (const mode of ["normal", "latched-pause", "failed-stop", "late-shutdown", "
     }
     if (mode === "failed-owed") t.mock.method(git, "retainCurrentOwedCandidate", async () => ({ kind: "not_updated" as const, reason: "preservation_failed" as const }));
     if (mode === "failed-retire") t.mock.method(git, "retireRunnerClone", async () => { throw new Error("retire failed"); });
+    // issue #4263: the owner terminal retire of a plain flight is classed owner_terminal (passthrough spy).
+    const retireSpy = mode === "normal" ? t.mock.method(git, "retireRunnerClone") : undefined;
     let internalFaults = 0;
     const warnings: string[] = [];
     const runLogger = nullLogger();
@@ -201,6 +203,9 @@ for (const mode of ["normal", "latched-pause", "failed-stop", "late-shutdown", "
         assert.ok(expected, "real attempt onSeeded ran");
         assert.deepEqual(await tail, { ...expected as object, terminal: "normal_park" });
       } else assert.equal(await tail, undefined);
+      if (retireSpy) {
+        assert.deepEqual(retireSpy.mock.calls.map(c => (c.arguments[4] as { dispositionClass?: string }).dispositionClass), ["owner_terminal"]);
+      }
       if (mode === "failed-retired-append" || mode === "failed-holding-dispose" || mode === "failed-scratch-dispose") {
         assert.equal(internalFaults, 1, "actual retirement reached the injected internal failure once");
         if (mode === "failed-retired-append") {

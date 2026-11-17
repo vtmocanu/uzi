@@ -1068,7 +1068,8 @@ export interface GitCacheOptions {
    *  Production never passes it, so the real provisioner runs and fails closed off Linux. */
   scratchProvisioner?: (clonePath: string) => Promise<void>;
   /** issue #1783 M2 — test-only seam for the runner-uid deletions (operator discard's, and M3's
-   *  canonical-path free). `split` overrides {@link uidSplitActive} for these deletions alone; `run`
+   *  canonical-path free). `split` overrides {@link uidSplitActive} for these deletions alone, and also selects the
+   *  retire-binding settle-vs-remove posture of retireRunnerClone (issue #4263); `run`
    *  executes the ALREADY runner-wrapped delete argv in place of the real spawn. Production never
    *  passes it. The rest drive the REAL spawn/timeout/close-wait path of runRunnerUidDelete
    *  (and so must not be combined with `run`): `spawn` stands in for the detached spawn of the
@@ -1094,6 +1095,11 @@ export interface GitCacheOptions {
     rename?: (from: string, to: string) => Promise<void>;
     residueUuid?: () => string;
   };
+  /** issue #4263 — test-only step hook of the retirement-scratch binding lifecycle in retireRunnerClone. It is awaited at
+   *  each named step ({@link RetireBindingStep}); an error it throws takes that step's own failure path (a failure before
+   *  the clone is moved fails the retire closed, a failure in a metadata step after it leaves the binding where it was),
+   *  and a throw from a step with no failure path simulates a crash at that point. Production never passes it. */
+  retireBindingStep?: (step: RetireBindingStep) => void | Promise<void>;
   /** issue #3239 — test-only seams inside {@link GitCache.commitWipMarker}, in firing order:
    *  `afterOmissionCheck` after the omission scan and before staging (to race a file past the
    *  cap); `afterCommit` right after the commit call returns and BEFORE the backstop reads the
@@ -1101,11 +1107,6 @@ export interface GitCacheOptions {
    *  after the marker was read and before the backstop's identity checks; `beforeRollbackWrite`
    *  after the final identity recheck and before the compare-and-swap write. Production never
    *  passes it. */
-  /** issue #4263 — test-only step hook of the retirement-scratch binding lifecycle in retireRunnerClone. It is awaited at
-   *  each named step ({@link RetireBindingStep}); an error it throws takes that step's own failure path (a failure before
-   *  the clone is moved fails the retire closed, a failure in a metadata step after it leaves the binding where it was),
-   *  and a throw from a step with no failure path simulates a crash at that point. Production never passes it. */
-  retireBindingStep?: (step: RetireBindingStep) => void | Promise<void>;
   wipCapture?: {
     afterOmissionCheck?: (clonePath: string) => Promise<void>;
     afterCommit?: (clonePath: string) => Promise<void>;
@@ -2556,7 +2557,8 @@ export type RetireBindingStep =
   | "journal-cleared" | "ledger-appended" | "config-sync"
   | "settle-write" | "settle-sync" | "settled"
   | "removing-write" | "removing-sync" | "removing-written"
-  | "removed" | "root-synced-after-rm" | "unset" | "unset-sync" | "unset-done";
+  | "removed" | "root-synced-after-rm" | "unset" | "unset-sync" | "unset-done"
+  | "unmoved-unset" | "unmoved-unset-sync" | "unmoved-unset-done";
 
 export interface RetireBinding {
   v: 1;
@@ -2643,6 +2645,8 @@ interface RetireBound {
   /** The raw config value last written (and synced) for this binding; an unset must still find exactly this. */
   raw: string;
   pin: FileHandle | undefined;
+  /** The device of the clone as pinned when the retire began; the moved clone must still sit on it. */
+  cloneDev: bigint;
   /** The clone was verified at `<parent>/clone` (inode and device) and the directories holding it were synced. */
   moveVerified: boolean;
   /** The journal clear and the `retired` ledger append were synced after the move. */
@@ -19366,10 +19370,15 @@ export class GitCache {
     let dispatched: Promise<void> | undefined;
     // issue #4263: the retirement scratch binding of this call (EXDEV branch only), shared with the completion disposal below.
     const rb: { bound?: RetireBound } = {};
+    // The identity of the clone directory, pinned (O_PATH|O_NOFOLLOW|O_DIRECTORY) at the start of retire() under the bare
+    // lock, right after the journal pair is validated. Every later binding check (bind time, the move) is against this pin,
+    // never against a late lstat. A substitution of clonePath before retire() starts is runner-controlled content in the
+    // runner-writable repo dir and is a recorded residual: it gains no privilege and the deletion scope equals today's.
+    const early: { pin?: FileHandle; id?: { dev: bigint; ino: bigint } } = {};
     const bindParent = async (scratchParent: string): Promise<void> => {
       if (opts.attemptId === undefined || opts.dispositionClass === undefined) return;
       rb.bound = await this.prepareRetireBinding(barePath, branch, clonePath, ownerRunId, opts.attemptId,
-        opts.dispositionClass, scratchParent);
+        opts.dispositionClass, scratchParent, early.id);
     };
     const split = this.retentionDeleteSeam?.split ?? uidSplitActive();
     const retire = async (): Promise<{ holding?: string; scratch?: string; renamed: boolean; disposition: RunnerCloneRetireResult }> => {
@@ -19392,6 +19401,13 @@ export class GitCache {
       stage = "journal_validation";
       if (pending?.runId !== ownerRunId || pending.clonePath !== clonePath) {
         throw new CapturePathMismatchError(pending?.clonePath ?? "", clonePath, branch, ownerRunId);
+      }
+      if (opts.attemptId !== undefined && opts.dispositionClass !== undefined) {
+        try {
+          early.pin = await fs.open(clonePath, RETIRE_PIN_FLAGS);
+          const st = await early.pin.stat({ bigint: true });
+          if (st.isDirectory()) early.id = { dev: st.dev, ino: st.ino };
+        } catch { /* no pin: the parent stays unbound and the retire proceeds as before bindings existed */ }
       }
       // issue #3404 M2: only a certified completion retirement (checked against its expectedFence below)
       // may clear a fenced journal; any other retirement (orphan reclaim included) refuses before effects.
@@ -19566,6 +19582,12 @@ export class GitCache {
               const scratchParent = await this.createRetireScratchParent();
               if (opts.completionSource && !opts.completionSource.canDelete()) throw new Error("completion cleanup exclusion changed");
               await bindParent(scratchParent);
+              if (opts.completionSource && !opts.completionSource.canDelete()) {
+                // Nothing moved: drop the intent just written and the empty parent, as an intent-write failure does.
+                if (rb.bound) { await this.dropUnmovedRetireBinding(barePath, rb.bound); rb.bound = undefined; }
+                await this.removeBestEffort(scratchParent, "retire-binding-parent", "emptyDir");
+                throw new Error("completion cleanup exclusion changed");
+              }
               renamed = await this.renameIntoScratchUnlessLatched(clonePath, scratchParent, undefined,
                 anchored ? () => checkSuccessor(anchored!) : undefined, checkProcessProof);
               scratch = scratchParent;
@@ -19759,18 +19781,42 @@ export class GitCache {
               // issue #4263: the bound parent is left for a verified epoch to reclaim. Settle first, but only when every
               // proof holds; otherwise the binding stays `intent`.
               beforeDestroy();
-              const settles = (opts.dispositionClass === "verified_successor" || opts.dispositionClass === "owner_terminal") &&
-                bound.moveVerified && bound.durable && retiredAppendOk &&
-                (await this.readRecoveryCapture(barePath, branch))?.clonePath !== clonePath &&
-                residueQuarantine() === undefined && !processRevokedHere &&
-                (() => { try { return opts.processProof === undefined || opts.processProof() === true; } catch { return false; } })();
+              const settles = await (async (): Promise<boolean> => {
+                if (!(opts.dispositionClass === "verified_successor" || opts.dispositionClass === "owner_terminal") ||
+                    !bound.moveVerified || !bound.durable || !retiredAppendOk) return false;
+                try {
+                  if ((await this.readRecoveryCapture(barePath, branch))?.clonePath === clonePath) return false;
+                } catch (err) {
+                  this.log.warn("retire scratch binding stays intent: the recovery journal could not be read", {
+                    clone: clonePath, error: gitErrorMessage(err),
+                  });
+                  return false;
+                }
+                // Terminal protection is re-read last (fail-closed to true on a callback error).
+                if (await this.hasPhysicalTerminalProtection(ownerRunId)) return false;
+                if (residueQuarantine() !== undefined || processRevokedHere) return false;
+                if (opts.processProof !== undefined) {
+                  let valid = false;
+                  try { valid = opts.processProof() === true; } catch { valid = false; }
+                  if (!valid) { processRevokedHere = true; return false; }
+                }
+                return true;
+              })();
               if (settles) {
                 try {
-                  await this.advanceRetireBindingUnderLock(barePath, bound, "settled");
+                  // The guard re-reads terminal protection after the settle-write step and right before the value is written.
+                  await this.advanceRetireBindingUnderLock(barePath, bound, "settled", async () => {
+                    if (await this.hasPhysicalTerminalProtection(ownerRunId)) throw new Error("terminal protection arrived before the settle write");
+                  });
                 } catch (err) {
-                  this.log.warn("retire scratch binding stays intent: settling failed", { clone: clonePath, error: gitErrorMessage(err) });
+                  this.log.warn("retire scratch binding settle did not complete", {
+                    clone: clonePath, error: gitErrorMessage(err),
+                    binding_phase: await this.currentRetireBindingPhase(barePath, bound.uuid),
+                  });
                 }
               }
+              // The deferred parent is left for the epoch exactly as a failed in-process scratch removal leaves it today.
+              unproven();
               this.log.info("retire scratch parent deferred to verified epoch", { path: scratch });
             } else {
               let removingWritten = bound === undefined;
@@ -19782,8 +19828,9 @@ export class GitCache {
                   removingWritten = true;
                 } catch (err) {
                   unproven();
-                  this.log.warn("retire scratch parent kept: its removing binding could not be written", {
+                  this.log.warn("retire scratch parent kept: its removing binding was not confirmed durable", {
                     path: scratch, error: gitErrorMessage(err),
+                    binding_phase: await this.currentRetireBindingPhase(barePath, bound.uuid),
                   });
                 }
               }
@@ -19907,6 +19954,8 @@ export class GitCache {
         emitOrphanDiagnostic(opts.orphanDiagnostics, clonePath, "orphan_retirement_failed", stage, "canonical_retirement_failure", error, undefined, subreason);
       }
       throw error;
+    } finally {
+      await early.pin?.close().catch(() => undefined);
     }
     if (!opts.completionSource) {
       if (dispatched) await dispatched;
@@ -20350,12 +20399,14 @@ export class GitCache {
   /**
    * issue #4263: write one binding value under the caller's bare lock, then make it durable (fsync the config file and
    * the bare directory) and require it to read back byte-identical. Returns the raw value written. `steps` names the
-   * {@link GitCacheOptions.retireBindingStep} points before the write and before the sync.
+   * {@link GitCacheOptions.retireBindingStep} points before the write and before the sync. `guard` runs after the write
+   * step and immediately before `git config`; a throw from it means nothing was written.
    */
   private async writeRetireBindingUnderLock(barePath: string, uuid: string, binding: RetireBinding,
-    steps?: { write: RetireBindingStep; sync: RetireBindingStep }): Promise<string> {
+    steps?: { write: RetireBindingStep; sync: RetireBindingStep }, guard?: () => Promise<void>): Promise<string> {
     const key = retireBindingKey(uuid), raw = retireBindingValue(binding);
     if (steps) await this.retireStep(steps.write);
+    if (guard) await guard();
     await this.runGit(barePath, ["config", "--local", key, raw]);
     if (steps) await this.retireStep(steps.sync);
     await this.syncConfigAndVerify(barePath, async () => {
@@ -20369,17 +20420,29 @@ export class GitCache {
    * issue #4263: remove one binding under the caller's bare lock, only if its current value is exactly `expectRaw`, then
    * make the removal durable and require the key to be gone.
    */
-  private async unsetRetireBindingUnderLock(barePath: string, uuid: string, expectRaw: string): Promise<void> {
+  private async unsetRetireBindingUnderLock(barePath: string, uuid: string, expectRaw: string,
+    steps: { unset: RetireBindingStep; sync: RetireBindingStep; done: RetireBindingStep } =
+      { unset: "unset", sync: "unset-sync", done: "unset-done" }): Promise<void> {
     const key = retireBindingKey(uuid);
     const current = await this.retireBindingRaws(barePath, key);
     if (current.length !== 1 || current[0] !== expectRaw) throw new Error("retire binding changed");
-    await this.retireStep("unset");
+    await this.retireStep(steps.unset);
     await this.runGit(barePath, ["config", "--local", "--unset", key]);
-    await this.retireStep("unset-sync");
+    await this.retireStep(steps.sync);
     await this.syncConfigAndVerify(barePath, async () => {
       if ((await this.retireBindingRaws(barePath, key)).length !== 0) throw new Error("retire binding unset read-back differs");
     });
-    await this.retireStep("unset-done");
+    await this.retireStep(steps.done);
+  }
+
+  /** The phase the bare's binding for `uuid` reads as right now, for logs: its decoded phase, "absent", or "uncertain". */
+  private async currentRetireBindingPhase(barePath: string, uuid: string): Promise<string> {
+    try {
+      const raws = await this.retireBindingRaws(barePath, retireBindingKey(uuid));
+      if (raws.length === 0) return "absent";
+      const parsed = raws.length === 1 ? parseRetireBinding(uuid, raws[0]!) : undefined;
+      return parsed?.ok ? parsed.binding.phase : "uncertain";
+    } catch { return "uncertain"; }
   }
 
   /**
@@ -20392,8 +20455,14 @@ export class GitCache {
    * later step fails stays `intent`, which is harmless metadata (the clone is canonical and the parent is gone).
    */
   private async prepareRetireBinding(barePath: string, branch: string, clonePath: string, ownerRunId: string,
-    attemptId: string, cls: RetireDispositionClass, scratchParent: string): Promise<RetireBound | undefined> {
+    attemptId: string, cls: RetireDispositionClass, scratchParent: string,
+    cloneId: { dev: bigint; ino: bigint } | undefined): Promise<RetireBound | undefined> {
     const uuid = path.basename(scratchParent).slice(".retire-".length);
+    if (cloneId === undefined) {
+      this.log.warn("retire scratch binding needs the clone identity pinned at the start of the retire; the parent stays unbound",
+        { bare: barePath, run_id: ownerRunId });
+      return undefined;
+    }
     const draft: RetireBinding = { v: 1, class: cls, attemptId, runId: ownerRunId, branch, clonePath, phase: "intent",
       parentIno: "1", cloneIno: "1", pod: "" };
     if (!parseRetireBinding(uuid, retireBindingValue(draft)).ok) {
@@ -20410,7 +20479,9 @@ export class GitCache {
       await syncDirectory(this.runnerRoot);
       await this.retireStep("root-synced");
       const cloneStat = await fs.lstat(clonePath, { bigint: true });
-      if (!cloneStat.isDirectory()) throw new Error("retire source is not a directory");
+      // The path must still be the directory pinned when the retire began; a substitution since then is not bound.
+      if (!cloneStat.isDirectory() || cloneStat.dev !== cloneId.dev || cloneStat.ino !== cloneId.ino)
+        throw new Error("retire source is not the directory pinned at the start of the retire");
       let count: number | undefined;
       try {
         const read = await this.readRetireBindingsUnderLock(barePath);
@@ -20422,11 +20493,11 @@ export class GitCache {
         await pin.close();
         return undefined;
       }
-      const binding: RetireBinding = { ...draft, parentIno: parentStat.ino.toString(), cloneIno: cloneStat.ino.toString() };
+      const binding: RetireBinding = { ...draft, parentIno: parentStat.ino.toString(), cloneIno: cloneId.ino.toString() };
       if (!parseRetireBinding(uuid, retireBindingValue(binding)).ok) throw new Error("retire binding inode not representable");
       const raw = await this.writeRetireBindingUnderLock(barePath, uuid, binding, { write: "intent-write", sync: "intent-sync" });
       await this.retireStep("intent-written");
-      return { uuid, parent: scratchParent, binding, raw, pin, moveVerified: false, durable: false };
+      return { uuid, parent: scratchParent, binding, raw, pin, cloneDev: cloneId.dev, moveVerified: false, durable: false };
     } catch (err) {
       await pin?.close().catch(() => undefined);
       await this.removeBestEffort(scratchParent, "retire-binding-parent", "emptyDir");
@@ -20456,7 +20527,7 @@ export class GitCache {
       const parentStat = await pin.stat({ bigint: true });
       const atPath = await fs.lstat(bound.parent, { bigint: true });
       if (!childStat.isDirectory() || childStat.ino.toString() !== bound.binding.cloneIno ||
-          childStat.dev !== parentStat.dev || parentStat.ino.toString() !== bound.binding.parentIno ||
+          childStat.dev !== parentStat.dev || childStat.dev !== bound.cloneDev || parentStat.ino.toString() !== bound.binding.parentIno ||
           atPath.ino !== parentStat.ino || atPath.dev !== parentStat.dev) throw new Error("retire scratch move not verified");
       await this.retireStep("rename-dir-sync");
       await syncDirectory(path.dirname(bound.binding.clonePath));
@@ -20475,17 +20546,20 @@ export class GitCache {
   /** The clone was already free, so nothing moved into the parent: best-effort drop of the intent just written. */
   private async dropUnmovedRetireBinding(barePath: string, bound: RetireBound): Promise<void> {
     await this.closeRetirePin(bound);
-    try { await this.unsetRetireBindingUnderLock(barePath, bound.uuid, bound.raw); }
-    catch (err) {
+    try {
+      await this.unsetRetireBindingUnderLock(barePath, bound.uuid, bound.raw,
+        { unset: "unmoved-unset", sync: "unmoved-unset-sync", done: "unmoved-unset-done" });
+    } catch (err) {
       this.log.warn("retire scratch binding for an unmoved clone could not be removed", { bare: barePath, error: gitErrorMessage(err) });
     }
   }
 
   /** Write the next phase of a bound scratch parent (`settled` or `removing`) and remember the value. */
-  private async advanceRetireBindingUnderLock(barePath: string, bound: RetireBound, phase: "settled" | "removing"): Promise<void> {
+  private async advanceRetireBindingUnderLock(barePath: string, bound: RetireBound, phase: "settled" | "removing",
+    guard?: () => Promise<void>): Promise<void> {
     const next: RetireBinding = { ...bound.binding, phase };
     bound.raw = await this.writeRetireBindingUnderLock(barePath, bound.uuid, next,
-      phase === "settled" ? { write: "settle-write", sync: "settle-sync" } : { write: "removing-write", sync: "removing-sync" });
+      phase === "settled" ? { write: "settle-write", sync: "settle-sync" } : { write: "removing-write", sync: "removing-sync" }, guard);
     bound.binding = next;
     await this.retireStep(phase === "settled" ? "settled" : "removing-written");
   }

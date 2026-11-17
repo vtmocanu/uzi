@@ -27,11 +27,11 @@ let fx: Fixture;
 const runnerRoot = (): string => path.join(fx.dataDir, "runner");
 const holdingRoot = (): string => path.join(fx.dataDir, "runner-quarantine");
 
-interface Logs { warn: string[]; info: string[] }
+interface Logs { warn: string[]; info: string[]; warnFields?: Array<{ event: string; fields: Record<string, unknown> }> }
 function mk(opts: { step?: (s: RetireBindingStep) => void | Promise<void>; split?: boolean; logs?: Logs } = {}): GitCache {
   const logger: Logger = {
     ...nullLogger(),
-    warn: (event: string) => { opts.logs?.warn.push(event); },
+    warn: (event: string, fields?: Record<string, unknown>) => { opts.logs?.warn.push(event); opts.logs?.warnFields?.push({ event, fields: fields ?? {} }); },
     info: (event: string) => { opts.logs?.info.push(event); },
     child: () => logger,
   };
@@ -392,5 +392,167 @@ describe("cap and absent inputs", () => {
     await c.retireRunnerClone(s.bare, s.clonePath, s.branch, s.owner, { discard: true, attemptId: ATTEMPT, dispositionClass: "owner_terminal" });
     assert.deepEqual(bindings(s.bare), []);
     assert.deepEqual(parents(), []);
+  });
+});
+
+describe("audit rework", () => {
+  const retire = (c: GitCache, s: Seed, extra: Record<string, unknown> = {}) =>
+    c.retireRunnerClone(s.bare, s.clonePath, s.branch, s.owner, { discard: true, attemptId: ATTEMPT, dispositionClass: "owner_terminal", ...extra });
+
+  it("terminal protection arriving at the settle-write step leaves intent", async (t) => {
+    exdev(t);
+    let flipped = false;
+    const c = mk({ split: true, step: step => { if (step === "settle-write") flipped = true; } });
+    const s = await seed(c, 4280);
+    const real = c.hasPhysicalTerminalProtection.bind(c);
+    t.mock.method(c, "hasPhysicalTerminalProtection", async (id: string) => (flipped ? true : real(id)));
+    await retire(c, s);
+    assert.equal(flipped, true, "the settle write was reached");
+    assert.equal(phase(s.bare), "intent");
+    assert.equal(parents().length, 1);
+  });
+
+  it("a decoy swapped into clonePath at the bind step is never bound or settled", async (t) => {
+    exdev(t);
+    let s!: Seed;
+    const c = mk({ split: true, step: step => {
+      if (step !== "root-synced") return;
+      fs.renameSync(s.clonePath, `${s.clonePath}.aside`);
+      fs.mkdirSync(s.clonePath);
+    } });
+    s = await seed(c, 4281);
+    await assert.rejects(retire(c, s), /pinned at the start of the retire/);
+    assert.deepEqual(bindings(s.bare), []);
+    assert.deepEqual(parents(), []);
+    assert.equal(fs.existsSync(path.join(`${s.clonePath}.aside`, "owner.txt")), true);
+  });
+
+  it("a decoy swapped into the moved clone leaves the binding at intent", async (t) => {
+    exdev(t);
+    let s!: Seed;
+    const c = mk({ split: true, step: step => {
+      if (step !== "renamed") return;
+      const [parent] = parents();
+      fs.renameSync(path.join(runnerRoot(), parent!, "clone"), path.join(runnerRoot(), "aside-clone"));
+      fs.mkdirSync(path.join(runnerRoot(), parent!, "clone"));
+    } });
+    s = await seed(c, 4282);
+    await retire(c, s);
+    assert.equal(phase(s.bare), "intent");
+    assert.equal(parents().length, 1);
+  });
+
+  for (const mode of ["returns false", "throws"] as const) {
+    it(`a process proof that ${mode} at the settle predicate never settles`, async (t) => {
+      exdev(t);
+      let calls = 0;
+      const counting = mk({ split: true });
+      const first = await seed(counting, 4283);
+      await retire(counting, first, { processProof: () => { calls++; return true; } });
+      assert.equal(phase(first.bare), "settled");
+      const total = calls;
+      assert.ok(total > 1);
+      fx.cleanup();
+      fx = makeFixture();
+      let n = 0;
+      const c = mk({ split: true });
+      const s = await seed(c, 4284);
+      await retire(c, s, { processProof: () => {
+        if (++n < total) return true;
+        if (mode === "throws") throw new Error("proof callback failed");
+        return false;
+      } });
+      assert.equal(n, total, "the denial came from the settle predicate, the last proof read");
+      assert.equal(phase(s.bare), "intent");
+      assert.equal(parents().length, 1);
+    });
+  }
+
+  it("a recovery journal read error at the settle predicate means no settle and no throw", async (t) => {
+    exdev(t);
+    let afterSync = false;
+    const logs: Logs = { warn: [], info: [], warnFields: [] };
+    const c = mk({ split: true, logs, step: step => { if (step === "config-sync") afterSync = true; } });
+    const s = await seed(c, 4285);
+    const priv = c as unknown as { readRecoveryCapture(...a: unknown[]): Promise<unknown> };
+    const real = priv.readRecoveryCapture.bind(c);
+    t.mock.method(priv, "readRecoveryCapture", async (...a: unknown[]) => {
+      if (afterSync) throw new Error("journal read failed");
+      return real(...a);
+    });
+    await retire(c, s);
+    assert.ok(logs.warn.includes("retire scratch binding stays intent: the recovery journal could not be read"));
+    assert.equal(phase(s.bare), "intent");
+  });
+
+  it("a settle sync failure after git config wrote the value logs the actual phase", async (t) => {
+    exdev(t);
+    const logs: Logs = { warn: [], info: [], warnFields: [] };
+    const c = mk({ split: true, logs, step: step => { if (step === "settle-sync") throw new Error("injected settle-sync"); } });
+    const s = await seed(c, 4286);
+    await retire(c, s);
+    const entry = logs.warnFields!.find(w => w.event === "retire scratch binding settle did not complete");
+    assert.ok(entry, "the settle failure is logged");
+    assert.equal(entry.fields.binding_phase, "settled");
+    assert.equal(phase(s.bare), "settled");
+    assert.ok(!logs.warn.some(w => w.includes("stays intent: settling failed")));
+  });
+
+  it("a removing sync failure after git config wrote the value logs the actual phase", async (t) => {
+    exdev(t);
+    const logs: Logs = { warn: [], info: [], warnFields: [] };
+    const c = mk({ split: false, logs, step: step => { if (step === "removing-sync") throw new Error("injected removing-sync"); } });
+    const s = await seed(c, 4287);
+    await retire(c, s);
+    const entry = logs.warnFields!.find(w => w.event === "retire scratch parent kept: its removing binding was not confirmed durable");
+    assert.ok(entry);
+    assert.equal(entry.fields.binding_phase, "removing");
+    assert.equal(phase(s.bare), "removing");
+  });
+
+  it("completion exclusion lost after the bind drops the intent and the parent; nothing moved", async (t) => {
+    exdev(t);
+    let open = true;
+    const seen: RetireBindingStep[] = [];
+    const c = mk({ step: step => { seen.push(step); if (step === "intent-written") open = false; } });
+    const s = await seed(c, 4288);
+    const head = await c.worktreeHead(s.clonePath);
+    assert.ok(head);
+    const journalBefore = journal(s.bare, s.branch);
+    await assert.rejects(retire(c, s, { dispositionClass: "completion", completionSource: { expectedHead: head, canDelete: () => open } }),
+      /completion cleanup exclusion changed/);
+    assert.deepEqual(bindings(s.bare), []);
+    assert.deepEqual(parents(), []);
+    assert.equal(fs.existsSync(path.join(s.clonePath, "owner.txt")), true);
+    assert.equal(journal(s.bare, s.branch), journalBefore);
+    assert.deepEqual(seen.filter(n => n.startsWith("unmoved-")), ["unmoved-unset", "unmoved-unset-sync", "unmoved-unset-done"]);
+    assert.equal(seen.includes("unset"), false, "the unmoved drop has its own step names");
+  });
+
+  it("a split deferral reports the retirement unproven; a single-uid disposal does not", async (t) => {
+    exdev(t);
+    let unproven = 0;
+    const c = mk({ split: true });
+    const s = await seed(c, 4289);
+    await retire(c, s, { onRetirementUnproven: () => { unproven++; } });
+    assert.equal(phase(s.bare), "settled");
+    assert.equal(unproven, 1);
+    let single = 0;
+    const c2 = mk({ split: false });
+    const s2 = await seed(c2, 4290);
+    await retire(c2, s2, { onRetirementUnproven: () => { single++; } });
+    assert.equal(single, 0);
+  });
+
+  it("a failed retired ledger append on a split leaves the binding at intent", async (t) => {
+    exdev(t);
+    const c = mk({ split: true });
+    const s = await seed(c, 4291);
+    const priv = c as unknown as { appendAttemptLedger(...a: unknown[]): Promise<void> };
+    t.mock.method(priv, "appendAttemptLedger", async () => { throw new Error("injected append failure"); });
+    await retire(c, s);
+    assert.equal(hasRetiredEntry(s.bare, s.branch), false);
+    assert.equal(phase(s.bare), "intent");
+    assert.equal(parents().length, 1);
   });
 });

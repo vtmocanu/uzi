@@ -205,8 +205,9 @@ for (const origin of ["Codex", "Claude"] as const) {
   });
 }
 
-it("M3 private legacy positive: known Claude source retains legacy cleanup", { skip: process.platform !== "linux" }, async () => {
+it("M3 private legacy positive: known Claude source retains legacy cleanup", { skip: process.platform !== "linux" }, async t => {
   const f = await setup(false);
+  const retire = t.mock.method(git, "retireRunnerClone");
   assert.ok(await f.p.recovery.pin({ runId: f.claim.run_id, generation: 29, kind: "issue",
     branch: f.source.context.branch, sourceSha: f.source.expectedHead, inventoryGuarded: true }));
   await f.p.bindCompletionSource(f.flight);
@@ -217,6 +218,9 @@ it("M3 private legacy positive: known Claude source retains legacy cleanup", { s
     assert.equal(open(), true); actions++;
   }), "passed");
   assert.equal(actions, 1);
+  // issue #4263: the completion boundary retires with the completion disposition class.
+  assert.equal(retire.mock.callCount(), 1);
+  assert.equal((retire.mock.calls[0]!.arguments[4] as { dispositionClass?: string }).dispositionClass, "completion");
 });
 
 // Lifecycle controls: the authenticated coordinator and runner callback are real;
