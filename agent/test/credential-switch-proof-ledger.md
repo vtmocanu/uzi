@@ -1,7 +1,8 @@
 # Live Codex switching: per-seam proof ledger
 
 Base: a233883de3c36bae2e940f999cd9d582889dad00.
-Latest runtime fixture candidate: 47b0d8e374555c504be67ded2f4960f4a6c2e6d5.
+Latest runtime fixture candidate: e7ee697e9b63abdfd754760926b4b7fca7990175.
+Earlier R1–R6 fixture candidate: 47b0d8e374555c504be67ded2f4960f4a6c2e6d5.
 Stopped-policy control candidate: 1cbcb917f156bfb8eb862f743acb1dde87a91a29.
 Earlier stopped-authority control candidate: 2de82eafb2ace6b0a03c10de8f7a582b7b1d97bd.
 Earlier stopped-guard controls: 76cc31aee1b0dafd644e9fa3fb7593442dc7ed6b.
@@ -412,7 +413,7 @@ control is still absent, not that the functional criterion was deferred.
 | Same successful flight/generation/worktree with no new attempt, custody or release/reclaim | Positive assertions present; independent preservation/control accounting unvalidated |
 | Strict usable persistence, clear confirmation and continuation on A before teardown | R1–R4 below credit three failed-save/inspection variants and empty applied-ACK only; other clauses unvalidated |
 | Proven A root/tool reap before B material, login and model work; fresh CODEX_HOME | R5 credits unproven registered root pre-apply only; tool-only, other modes/phases and HOME clauses unvalidated |
-| Whole operation-scope/refresh/identity/capability/summary replacement and retired-A rejection | A2 credits one reader; R7 B dispatcher publication readiness only; remaining mixed clauses unvalidated |
+| Whole operation-scope/refresh/identity/capability/summary replacement and retired-A rejection | A2 credits one reader; A3 retained-A/Sub→Sub B-scope namespace isolation; R7 B dispatcher publication readiness only; remaining mixed clauses unvalidated |
 | Exact saved-ID resume; confirmed-refusal-only fresh fallback and lineage; preservation re-hold | R6 credits uncertain-error classification only; confirmed-refusal/preserve companions positive, independent preservation and other clauses unvalidated |
 | Policy episode rejection at request and under apply lock | Unvalidated |
 | Refresh lease/intent exclusion, account lock ordering and boundary reconciliation before revoke | Unvalidated |
@@ -1239,3 +1240,85 @@ this does not discharge withdrawn-X/withdrawn-Y delayed-report semantics.
 Owner-request API behavior, Runtime teardown, B model work, journal-generation
 relation controls and replay-effect sensitivity remain separate obligations.
 All remaining m3/m4 criteria stay required and incomplete.
+
+
+### A3 — capability-partitioned scope namespace, exact baseline restoration
+
+Candidate e7ee697e9b63abdfd754760926b4b7fca7990175. Receipt:
+.uzi/scratch/runtime-scope-key-results.json; lead reconstruction/log audit:
+.uzi/scratch/runtime-scope-key-lead-audit.json. This is class **(a)** evidence
+for the changed operation-scope namespace behavior through the actual Runner,
+not a helper-only test or a publication-write/guard-removal control.
+
+Exact baseline evidence:
+
+```sh
+git show a233883de3c36bae2e940f999cd9d582889dad00:agent/src/codex-operation-scope.ts
+```
+
+Baseline lines 39–41 accept client/run/generation and policy arguments without
+an authority identity. Line 44 derives the namespace as:
+
+```ts
+const key = JSON.stringify([runId, generation]);
+```
+
+Candidate helper :51 instead uses `[runId, generation, authorityIdentity]`;
+Runner's B construction passes codexOperationAuthorityIdentity of B's capability.
+The unique mutant restores the exact old two-element key. `void authorityIdentity`
+keeps the retained current signature compiling without changing key behavior.
+All ownership guards, refcounts, retirement logic and callers stay intact.
+The lead reconstructed both source and mutant hashes and checked baseline :44.
+
+The strengthened existing leaf is:
+
+```text
+M2 actualRunner subscription to subscription factory account resumes saved thread
+```
+
+After real A enters, it acquires a nonowning reference with the actual client,
+run ID, **claim generation** and A capability identity, asserting that it shares
+actual A's controller. It never owns, binds or prepares that reference. Retaining
+it keeps A's map entry present after Runner closes the owning A scope, whose
+ownerClosed signal remains aborted. Candidate B then owns a different controller;
+a lookup by B capability identity must find actual B's controller. Both added
+references close unconditionally even if the existing execution join fails.
+
+The old key aliases B with retained closed A. B's own() fails before the B flight
+setter; this is not a demonstration of unsafe B authentication. The fixture's
+existing uncertain-report diagnostic and switch-settled observation wake the
+driver before B readiness waits. The mutant therefore fails a direct Runner
+outcome assertion, not a missing-publication timeout or swallowed callback error:
+:35156, `retaining A scope must not force an uncertain credential switch hold`.
+The primary requires resumed_B, no switch error and the actual controller checks.
+A failure-only fixture ACK lets this wrong held outcome join cleanup; it does
+not change primary success behavior or any production handler.
+
+Actual commands use Node `--import tsx --test --test-reporter=tap
+--test-timeout=120000`, escaped exact-name suffix selectors and
+`test/codex-executor.test.ts`. Before gate-log.qLXsz4 exits 0 with seven selected
+leaves passing; exported `npm run typecheck` gate-log.6HeSzU exits 0; mutant
+gate-log.HysbSl exits 1 at ERR_ASSERTION and the driver frame; after
+gate-log.BrDwU1 exits 0 with the same seven leaves passing. The integration set
+also covers R7 readiness, R5 unproven root, R6 uncertain resume, both factory
+API-key/subscription directions and the already-running Sub→Sub baseline.
+Selected leaves are not SKIP; unrelated Node skips carry no credit. No timeout,
+cancellation, uncaught owner-close error or compiler failure supplies the red.
+All logs are under .uzi/scratch/.
+
+Lead-executed primary lint gate-log.C9cRyH and typecheck gate-log.55Xb9J each exit
+0 before commit. Those logs lack embedded revision headers; the lead audit ties
+them to the observed edit/check/commit sequence and independently reconstructs
+the exact three boolean-assertion edits from 1f1a83bf4 to candidate e7ee697e9.
+Controller identity comparisons are complete but report bounded boolean failures.
+Source review found no findings. Measured command times are in the receipt, not
+a CI critical-path comparison; no new sleep or broader timing claim is made.
+
+One removed export, provisioned dependencies reused, primary fingerprint/status
+unchanged; no installs, base or concurrent builds. Credit is namespace
+availability/isolation for the retained-A, subscription→subscription factory
+handoff. The real B lookup is a positive desired-input witness, while the exact
+legacy restoration demonstrates the namespace-separation dependency. It does
+not prove unsafe old-controller use, every auth-mode scope transition, retired-A
+refresh, all capability consumers, summary authority, whole-handoff correctness
+or m3/m4 completion. Remaining mixed clauses stay required and unvalidated.

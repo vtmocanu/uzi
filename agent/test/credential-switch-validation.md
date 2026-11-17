@@ -4,7 +4,8 @@ This is a partial evidence ledger for issue #4202, recorded on 2026-11-17.
 It does not declare m3 or m4 complete. Earlier scratch logs were absent after
 recovery; historical commit messages are not treated as passing checks.
 
-Latest runtime fixture candidate: 47b0d8e374555c504be67ded2f4960f4a6c2e6d5.
+Latest runtime fixture candidate: e7ee697e9b63abdfd754760926b4b7fca7990175.
+Earlier R1–R6 fixture candidate: 47b0d8e374555c504be67ded2f4960f4a6c2e6d5.
 Stopped-policy candidate: 1cbcb917f156bfb8eb862f743acb1dde87a91a29.
 Earlier stopped-authority control candidate: 2de82eafb2ace6b0a03c10de8f7a582b7b1d97bd.
 Earlier stopped-guard controls: 76cc31aee1b0dafd644e9fa3fb7593442dc7ed6b.
@@ -734,3 +735,29 @@ rerunning tests. Source fixture review found no findings, cleanup exit 0,
 export removed and primary unchanged. First-STOP journal deletion only is newly
 credited; replay mutation sensitivity and remaining transaction/runtime/security
 criteria remain required. m3/m4 incomplete.
+
+
+## Actual Runner capability-partitioned scope namespace
+
+A3 records class (a) at e7ee697e9: exact a233 scope-key restoration from
+three elements back to `JSON.stringify([runId, generation])` (baseline helper
+:44). No guard or refcount changes. The strengthened real Runner Sub→Sub factory
+case keeps a legitimate nonowning reference to actual A, requires resumed_B and
+actual B's separate controller, and checks that a B-identity lookup finds B.
+The legacy key collides with closed A and produces an explicit uncertain-hold
+driver assertion before waiting for B, not a timeout or helper-only red.
+
+Receipt .uzi/scratch/runtime-scope-key-results.json and lead audit record exact
+baseline quote, mutation hashes/diff, selectors and raw outcomes. Logs use the
+.uzi/scratch/gate-log. prefix: qLXsz4 seven-leaf before exit 0; 6HeSzU mutant
+typecheck exit 0; HysbSl intended driver assertion exit 1; BrDwU1 seven-leaf after
+exit 0. Selected leaves execute. Primary lint C9cRyH and typecheck 55Xb9J exit 0;
+their source link comes from the observed parent execution and reconstructed
+edit/commit sequence, not an embedded log revision header. No gate was rerun
+solely to supply metadata. Source review found no findings.
+
+Added references close even if cleanup joins reject. Export removed, primary
+unchanged and provisioned dependencies reused without installs or base builds.
+Only namespace availability/isolation in this retained-reference scenario is
+newly credited. Unsafe B auth, other scope-mode transitions, retired refresh,
+whole authority and remaining m3/m4 criteria are not claimed as complete.
