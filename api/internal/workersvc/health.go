@@ -312,8 +312,8 @@ const (
 	// Distinct from reasonAllWorkersBusy: allowlisting, not a free slot, unblocks it. The
 	// variant is chosen by the run OWNER's is_admin (repoNotDockerAllowedReason), so an admin
 	// viewing someone else's run sees the owner's variant, not their own.
-	reasonRepoNotDockerAllowedAdmin  = "this repo isn't on the Docker worker repo allowlist, so your Docker workers can't run it; add it under Admin → Instance → Docker worker repo allowlist"
-	reasonRepoNotDockerAllowedMember = "this repo isn't on the Docker worker repo allowlist, so your Docker workers can't run it; ask an admin to add it under Admin → Instance → Docker worker repo allowlist"
+	reasonRepoNotDockerAllowedAdmin  = "this repo isn't on the Docker worker repo allowlist, so your Docker workers can't run it; add it under Admin → Workers → Docker worker repo allowlist"
+	reasonRepoNotDockerAllowedMember = "this repo isn't on the Docker worker repo allowlist, so your Docker workers can't run it; ask an admin to add it under Admin → Workers → Docker worker repo allowlist"
 	// reasonCustodyLimit (PRD #1296 M4, D4) is emitted for a queued run whose OWNER is at
 	// the custody-hold admission limit — they hold >= the custody_hold_limit setting's
 	// admission-counted open holds (ADR-2445), so ClaimRun's owner-scoped custody-admission clause matches no row and
@@ -331,7 +331,13 @@ const (
 	// (claimLane fails closed on an unreadable limit), so no custody-gated run is admitted and
 	// the honest cause is the instance-wide setting, not the owner's holds or the fleet. Same
 	// healthWaitingWorker enum; no nudge (see detectRunHealth).
-	reasonCustodyLimitUnavailable = "new runs are paused: the custody hold limit setting could not be read; an admin should check Admin → Instance settings"
+	reasonCustodyLimitUnavailable = "new runs are paused: the custody hold limit setting could not be read; an admin should check Admin → Workers settings"
+	// reasonCustodyLimitUnavailableLegacy is a compatibility READER only, never emitted: the
+	// pre-#4423 wording of reasonCustodyLimitUnavailable, from before the custody hold limit
+	// moved to Admin → Workers (#4212). A run row persisted by an older server keeps this text
+	// until the next health tick rewrites it, and QueuedReasonPrecedesCodexAdmission must give
+	// it the same precedence as the current text. Stored values are not rewritten.
+	reasonCustodyLimitUnavailableLegacy = "new runs are paused: the custody hold limit setting could not be read; an admin should check Admin → Instance settings"
 	// reasonCodexAccountUnavailable (PRD #1590 M2, D2) is emitted for a queued Codex subscription
 	// run that ClaimRun's account gate excludes: its linked account is quarantined, or a re-login
 	// on its alias is in flight or has just linked the same identity with newer material. No
@@ -1337,7 +1343,7 @@ type healthEligibilityResult struct {
 func QueuedReasonPrecedesCodexAdmission(reason string) bool {
 	switch reason {
 	case reasonHandoffSetup, reasonVaultLocked, reasonCustodyLimit, apitypes.ReasonCustodyRunHoldBound,
-		reasonCustodyLimitUnavailable, reasonCodexAccountUnavailable:
+		reasonCustodyLimitUnavailable, reasonCustodyLimitUnavailableLegacy, reasonCodexAccountUnavailable:
 		return true
 	default:
 		return false
