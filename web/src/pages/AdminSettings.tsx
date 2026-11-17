@@ -22,6 +22,7 @@ import {
   type BadgeTone,
   Button,
   Card,
+  cx,
   Field,
   Input,
   SectionTitle,
@@ -29,6 +30,7 @@ import {
   Skeleton,
 } from "../components/ui";
 import { AdminShell } from "../components/AdminShell";
+import { keepInRowView } from "../components/TabRow";
 import { ADMIN_SETTINGS_ANCHOR_IDS, ADMIN_WORKERS_ANCHOR_IDS } from "../components/navSections";
 import { DocLink } from "../components/DocLink";
 import { DOC_ADMIN_SETTINGS } from "../lib/doclinks";
@@ -327,6 +329,123 @@ export function AdminSettings() {
       : []),
   ];
 
+  const showPills = !loading && sections.length > 1;
+  const sectionKey = showPills ? sections.map((s) => s.id).join(",") : "";
+  const navRef = useRef<HTMLElement>(null);
+  const endRef = useRef<HTMLDivElement>(null);
+  const [currentId, setCurrentId] = useState<string | null>(null);
+  const currentRef = useRef<string | null>(null);
+  const pendingRef = useRef<string | null>(null);
+  const current = sectionKey.split(",").includes(currentId ?? "") ? currentId : (sections[0]?.id ?? null);
+
+  const choose = useCallback((id: string) => {
+    if (currentRef.current === id) return;
+    currentRef.current = id;
+    setCurrentId(id);
+  }, []);
+
+  // Edge fade (IntersectionObserver rooted at the pill row, no scroll listener): an edge
+  // is faded only while the first/last pill is not fully visible.
+  useEffect(() => {
+    const nav = navRef.current;
+    if (!sectionKey || !nav || typeof IntersectionObserver === "undefined") return;
+    const pills = nav.querySelectorAll<HTMLElement>("a");
+    const first = pills[0];
+    const last = pills[pills.length - 1];
+    const io = new IntersectionObserver(
+      (entries) => {
+        for (const e of entries) {
+          const attr = e.target === first ? "data-fade-start" : "data-fade-end";
+          if (e.intersectionRatio < 0.99) nav.setAttribute(attr, "");
+          else nav.removeAttribute(attr);
+        }
+      },
+      { root: nav, threshold: 0.99 },
+    );
+    if (first) io.observe(first);
+    if (last && last !== first) io.observe(last);
+    return () => {
+      io.disconnect();
+      nav.removeAttribute("data-fade-start");
+      nav.removeAttribute("data-fade-end");
+    };
+  }, [sectionKey]);
+
+  // Current-section highlight, IntersectionObserver only. The reading line sits at the
+  // pinned block's bottom edge; the section across it is current, and in a gap the
+  // previous one stays. Near the page end (zero-height sentinel visible) a line can no
+  // longer reach the last cards, so the clicked pill (else the last) is current.
+  useEffect(() => {
+    const nav = navRef.current;
+    const block = nav?.closest<HTMLElement>("[data-pinned-block-root]");
+    if (!sectionKey || !nav || !block || typeof IntersectionObserver === "undefined") return;
+    const ids = sectionKey.split(",");
+    const els = ids
+      .map((id) => document.getElementById(id))
+      .filter((el): el is HTMLElement => el !== null);
+    const lineY = () => (parseFloat(getComputedStyle(block).top) || 0) + block.offsetHeight;
+    let atEnd = false;
+    const evaluate = () => {
+      const pending = pendingRef.current;
+      if (atEnd) {
+        choose(pending ?? ids[ids.length - 1]);
+        return;
+      }
+      const y = lineY();
+      const hit = els.find((el) => {
+        const r = el.getBoundingClientRect();
+        return r.top <= y && r.bottom > y;
+      });
+      if (!hit) return;
+      if (pending && hit.id !== pending) {
+        // A pill jump leaves the previous section under the line while the clicked card
+        // sits just below it; that is the jump landing, not the user moving on.
+        const target = document.getElementById(pending);
+        const top = target ? target.getBoundingClientRect().top : Infinity;
+        if (top >= y - 4 && top <= y + 80) return;
+        pendingRef.current = null;
+      }
+      choose(hit.id);
+    };
+
+    let lineIO: IntersectionObserver | null = null;
+    const build = () => {
+      lineIO?.disconnect();
+      const y = Math.round(lineY());
+      const below = Math.max(0, window.innerHeight - y - 1);
+      lineIO = new IntersectionObserver(evaluate, { root: document, rootMargin: `-${y}px 0px -${below}px 0px` });
+      for (const el of els) lineIO.observe(el);
+    };
+    build();
+
+    const endIO = new IntersectionObserver(
+      (entries) => {
+        atEnd = entries[entries.length - 1].isIntersecting;
+        evaluate();
+      },
+      { root: document },
+    );
+    if (endRef.current) endIO.observe(endRef.current);
+
+    const ro = typeof ResizeObserver !== "undefined" ? new ResizeObserver(build) : null;
+    ro?.observe(block);
+    window.addEventListener("resize", build);
+    window.addEventListener("uzi:app-bar-h", build);
+    return () => {
+      lineIO?.disconnect();
+      endIO.disconnect();
+      ro?.disconnect();
+      window.removeEventListener("resize", build);
+      window.removeEventListener("uzi:app-bar-h", build);
+    };
+  }, [sectionKey, choose]);
+
+  useEffect(() => {
+    const nav = navRef.current;
+    if (!nav || !current) return;
+    keepInRowView(nav, nav.querySelector<HTMLElement>(`a[href="#${current}"]`));
+  }, [current]);
+
   return (
     <AdminShell
       description={
@@ -335,23 +454,41 @@ export function AdminSettings() {
           <DocLink slug={DOC_ADMIN_SETTINGS}>admin settings</DocLink> guide.
         </>
       }
-    >
-      {/* The section index: this tab is eight cards deep, and without an index the
+      pinned={
+        /* The section index: this tab is eight cards deep, and without an index the
           only way to learn what it holds is to scroll all of it. Quiet pill links,
-          not a second tab row — tabs switch content, these just scroll it. */}
-      {!loading && sections.length > 1 && (
-        <nav aria-label="Sections on this page" className="flex flex-wrap gap-1.5">
-          {sections.map((s) => (
-            <a
-              key={s.id}
-              href={`#${s.id}`}
-              className="rounded-full border border-edge px-2.5 py-1 text-xs font-medium text-muted transition-colors hover:border-edge-strong hover:text-fg"
-            >
-              {s.label}
-            </a>
-          ))}
-        </nav>
-      )}
+          not a second tab row — tabs switch content, these just scroll it. One
+          non-wrapping row, pinned under the tabs, so it never grows the block. */
+        showPills ? (
+          <nav
+            ref={navRef}
+            aria-label="Sections on this page"
+            data-fade-row=""
+            className="flex flex-nowrap gap-1.5 overflow-x-auto overflow-y-hidden px-1 py-2"
+          >
+            {sections.map((s) => (
+              <a
+                key={s.id}
+                href={`#${s.id}`}
+                aria-current={s.id === current ? "true" : undefined}
+                onClick={() => {
+                  pendingRef.current = s.id;
+                  choose(s.id);
+                }}
+                className={cx(
+                  "shrink-0 whitespace-nowrap rounded-full border px-2.5 py-1 text-xs font-medium transition-colors focus-visible:ring-inset focus-visible:ring-offset-0",
+                  s.id === current
+                    ? "border-brand text-fg"
+                    : "border-edge text-muted hover:border-edge-strong hover:text-fg",
+                )}
+              >
+                {s.label}
+              </a>
+            ))}
+          </nav>
+        ) : undefined
+      }
+    >
 
       {(error || loadError) && <Alert message={error || loadError} />}
       {notice && <Alert tone="success" message={notice} />}
@@ -619,6 +756,9 @@ export function AdminSettings() {
           <FetchCapsCard settings={saved} onSaved={applyResponse} />
         </section>
       )}
+
+      {/* End sentinel for the section highlight: zero height, observed while the page end is in view. */}
+      <div ref={endRef} aria-hidden="true" className="h-0" />
     </AdminShell>
   );
 }
