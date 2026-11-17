@@ -649,3 +649,25 @@ The bounded worker/run-locked path and two executing copies are enumerated in
 the ledger. Credit is STOP-only, not independent per-copy sufficiency or owner
 request/preflight/apply/concurrency coverage. Remaining m3 and m4 obligations
 stay required and incomplete; full suites/security and CI timing are not claimed.
+
+
+## B publication-readiness admission control
+
+R7 records one real Runner class (d) guard control at 0028b6249. The mutant
+neutralizes only !replacementAdmissionOpen in the newly installed B root
+preparation callback and retains the separate bundle-retirement fence.
+The actual before-publication probe fails at its expected-rejection assertion;
+this is early root preparation admission, not a claim that model work ran.
+
+Receipt .uzi/scratch/runtime-publication-results.json and lead audit
+runtime-publication-lead-audit.json record source/mutant hashes, precise diff,
+TAP-selected leaf, commands and cleanup. Logs under .uzi/scratch: nbWG0z before
+exit 0, B5egXj mutant typecheck exit 0, bPtPQR intended assertion-red exit 1,
+9F5E18 after exit 0. The selected leaf executes; unrelated Node skips carry no
+credit. The lead inspected exact TAP outcomes/frame and reconstructed the mutant.
+
+The raw receipt's prose misnames 47b0d8e as a refusing baseline. The lead audit
+corrects that citation to exact a233 runner.ts:25735–25738; raw run results remain
+preserved. No baseline build or installation. Export removed, primary unchanged.
+R7 does not prove capability-derived scope identity, retired-A refresh, whole
+handoff or security/full suites. Other m3/m4 obligations remain required.

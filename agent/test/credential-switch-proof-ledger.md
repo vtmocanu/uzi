@@ -412,7 +412,7 @@ control is still absent, not that the functional criterion was deferred.
 | Same successful flight/generation/worktree with no new attempt, custody or release/reclaim | Positive assertions present; independent preservation/control accounting unvalidated |
 | Strict usable persistence, clear confirmation and continuation on A before teardown | R1–R4 below credit three failed-save/inspection variants and empty applied-ACK only; other clauses unvalidated |
 | Proven A root/tool reap before B material, login and model work; fresh CODEX_HOME | R5 credits unproven registered root pre-apply only; tool-only, other modes/phases and HOME clauses unvalidated |
-| Whole operation-scope/refresh/identity/capability/summary replacement and retired-A rejection | A2 credits one reader only; remaining mixed clauses unvalidated |
+| Whole operation-scope/refresh/identity/capability/summary replacement and retired-A rejection | A2 credits one reader; R7 B dispatcher publication readiness only; remaining mixed clauses unvalidated |
 | Exact saved-ID resume; confirmed-refusal-only fresh fallback and lineage; preservation re-hold | R6 credits uncertain-error classification only; confirmed-refusal/preserve companions positive, independent preservation and other clauses unvalidated |
 | Policy episode rejection at request and under apply lock | Unvalidated |
 | Refresh lease/intent exclusion, account lock ordering and boundary reconciliation before revoke | Unvalidated |
@@ -1006,3 +1006,55 @@ concurrent builds or broad security/full-suite result. Credit is only the five
 enumerated stopped exclusions in running/paused states. Owner-request, preflight,
 apply, other statuses and remaining runtime/transaction/security clauses are not
 discharged by this shared helper's STOP controls. m3/m4 remain **INCOMPLETE**.
+
+
+### R7 — B dispatcher publication-readiness guard, class (d)
+
+Candidate 0028b62492b0bc29be64360ec865f314c6661f1e. Receipt:
+.uzi/scratch/runtime-publication-results.json; independent lead source/log audit:
+.uzi/scratch/runtime-publication-lead-audit.json. This is a **guard control**
+through the real Runner switch, not helper-only or whole-handoff evidence.
+
+The unique runner.ts:17677 callback normally rejects when
+`!replacementAdmissionOpen || flight.codexAuthority !== bundle`.
+The mutant neutralizes only the publication-readiness term, retains the
+bundle-retirement comparison and callback, and adds `void replacementAdmissionOpen`
+solely to preserve compilation after removing its effective read. Scope creation,
+controller ownership, capability-derived identity and binding remain unchanged.
+The receipt carries exact old/new snippets, diff and source/mutant hashes.
+
+Selected actual Runner leaf:
+
+```text
+Codex api_key to subscription publication gates Now, retired A and B preparation children; finished B root dispatch admits work; finished B preparation broker dispatches an actual child
+```
+
+Its before-publish barrier obtains the newly installed B dispatcher, verifies it
+is not retained A's dispatcher, and invokes ordinary root preparation with the
+live lifecycle signal. The mutant fails at :34258 with ERR_ASSERTION,
+`Missing expected rejection: new context dispatcher must refuse ordinary root admission before finishB`.
+This witnesses early root preparation admission, not proof that model work ran.
+
+From agent, the Node command uses `--import tsx --test --test-reporter=tap
+--test-timeout=120000`, an escaped exact-name suffix pattern, and
+`test/codex-executor.test.ts`. Before gate-log.nbWG0z exits 0; mutant
+`npm run typecheck` gate-log.B5egXj exits 0; selected mutant gate-log.bPtPQR
+exits 1 at the intended assertion; after gate-log.9F5E18 exits 0. Each selected
+leaf actually executes, not SKIP; unselected Node test skips are normal. Logs
+are under .uzi/scratch/. The lead parsed the exact TAP leaf/frame and verified
+both source hash and reconstruction of the precise mutant hash.
+
+Baseline evidence is `git show a233883de3c36bae2e940f999cd9d582889dad00:agent/src/runner.ts`,
+lines 25735–25738: Codex capture retains source and returns retained_stop (quoted
+in A1). There is no allowed switch publication guard at that seam. The raw receipt
+incorrectly calls 47b0d8e the refusing baseline in one prose annotation; it is not
+used as baseline evidence. That candidate already contains live switching. The
+lead audit preserves the raw receipt hash and records the exact a233 source
+citation and correction without rewriting the run results.
+
+One removed scratch export, primary fingerprint/status unchanged, provisioned
+agent dependencies reused; no installs, base builds or concurrent Go build.
+This proves only the new B dispatcher's pre-finish publication-readiness fence.
+Capability-derived operation-scope identity, retained-A refresh, other authority
+consumers and the remaining mixed clauses are **unvalidated**. No full-suite or
+security result is supplied. m3/m4 remain incomplete.
