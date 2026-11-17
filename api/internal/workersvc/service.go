@@ -7790,6 +7790,11 @@ func (s *Service) SetWorkerAnthropicToken(ctx context.Context, userID, workerID 
 				}
 				return err
 			}
+			// PRD #4320 D2: only an Anthropic token is bindable here; a provider key (or any other
+			// kind) answers like a foreign id, so it can never be pinned and later opened as one.
+			if row.Kind != store.KindAnthropicToken {
+				return ErrSecretNotOwned
+			}
 			// PRD #1732 D5: a new binding onto a disabled credential is refused, not stored.
 			// Read under the secret mutation lock, so a concurrent disable is serialized.
 			if row.Disabled {
@@ -7857,6 +7862,11 @@ func (s *Service) SetUserJudgeBinding(ctx context.Context, userID uuid.UUID, mod
 					return ErrSecretNotOwned
 				}
 				return err
+			}
+			// PRD #4320 D2: only an Anthropic token is bindable here; a provider key (or any other
+			// kind) answers like a foreign id, so it can never be pinned and later opened as one.
+			if row.Kind != store.KindAnthropicToken {
+				return ErrSecretNotOwned
 			}
 			// PRD #1732 D5: a new binding onto a disabled credential is refused, not stored.
 			// Read under the secret mutation lock, so a concurrent disable is serialized.

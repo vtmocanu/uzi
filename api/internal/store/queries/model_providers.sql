@@ -38,10 +38,13 @@ FROM model_provider_revisions
 WHERE provider_id = $1 AND revision = $2;
 
 -- name: BumpModelProviderRevision :one
--- The FIRST statement of an edit transaction: advancing current_revision takes the provider row's
--- exclusive lock, so it waits for any run-create that holds LockModelProviderForShare and blocks
--- the next run-create until the edit commits. The caller then inserts the revision this returns.
--- Owner-scoped; a retired provider is not edited (0 rows).
+-- Advancing current_revision takes the provider row's exclusive lock (RenameModelProvider takes it
+-- too, so in an edit the provider row is row-locked by one of them before the revision insert), so
+-- it waits for any run-create that holds LockModelProviderForShare and blocks the next run-create
+-- until the edit commits. Edits run under the per-user secret-mutation lock; a run-create must take
+-- LockSecretMutationShared before FOR SHARE on the provider row, or the two lock orders cycle. The
+-- caller then inserts the revision this returns. Owner-scoped; a retired provider is not edited
+-- (0 rows).
 UPDATE model_providers
 SET current_revision = current_revision + 1
 WHERE id = $1 AND owner_user_id = $2 AND retired_at IS NULL

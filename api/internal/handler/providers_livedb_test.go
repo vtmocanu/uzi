@@ -498,3 +498,56 @@ func TestProviderKeyIsInvisibleToGenericSecretRoutesLiveDB(t *testing.T) {
 		t.Errorf("POST /me/secrets/anthropic_compatible_key = %d, want a refusal", rec.Code)
 	}
 }
+
+// An operator who removes an allowlist entry stops later saves of providers that still carry it:
+// the base URL a revision edit or a key save carries is re-checked, not only a newly requested one.
+func TestProviderSavesRecheckAllowlistLiveDB(t *testing.T) {
+	const otherURL = "https://gw2.example.com/anthropic"
+	f := newProviderFixture(t, testGatewayURL, otherURL)
+	p := f.create(t, validCreateBody)
+	id := "/api/me/providers/" + p.ID
+	f.h.cfg.ProviderAllowedBaseURLs = []string{otherURL}
+
+	check := func(name string, rec *httptest.ResponseRecorder) {
+		t.Helper()
+		if rec.Code != http.StatusBadRequest || providerReason(t, rec) != "provider_base_url_not_allowed" {
+			t.Errorf("%s = %d %s, want 400 provider_base_url_not_allowed", name, rec.Code, rec.Body.String())
+		}
+	}
+	check("PATCH model_map", bearerReqBody(f.router, http.MethodPatch, id, f.uzc, `{"model_map":{"haiku":{"model":"h2"}}}`))
+	check("PATCH endpoint auth_style only", cookieReq(t, f.router, http.MethodPatch, id+"/endpoint", f.jwt, `{"auth_style":"x_api_key"}`))
+	check("PUT key", cookieReq(t, f.router, http.MethodPut, id+"/key", f.jwt, `{"key":"`+testProviderKey+`"}`))
+
+	var revs, keys int
+	_ = f.pool.QueryRow(context.Background(), `SELECT (SELECT count(*) FROM model_provider_revisions WHERE provider_id = $1), (SELECT count(*) FROM user_secrets WHERE provider_id = $1)`, p.ID).Scan(&revs, &keys)
+	if revs != 1 || keys != 0 {
+		t.Errorf("refused saves wrote revisions=%d keys=%d, want 1 and 0", revs, keys)
+	}
+	// A rename changes no destination and stays allowed; moving to an allowed URL is the remedy.
+	if rec := bearerReqBody(f.router, http.MethodPatch, id, f.uzc, `{"name":"renamed"}`); rec.Code != http.StatusOK {
+		t.Errorf("rename = %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := cookieReq(t, f.router, http.MethodPatch, id+"/endpoint", f.jwt, `{"base_url":"`+otherURL+`"}`); rec.Code != http.StatusOK {
+		t.Fatalf("move to allowed URL = %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := cookieReq(t, f.router, http.MethodPut, id+"/key", f.jwt, `{"key":"`+testProviderKey+`"}`); rec.Code != http.StatusOK {
+		t.Errorf("PUT key after move = %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestProviderNameUniqueCaseInsensitiveLiveDB(t *testing.T) {
+	f := newProviderFixture(t, testGatewayURL)
+	f.create(t, strings.Replace(validCreateBody, "corp-gw", "Corp", 1))
+	rec := bearerReqBody(f.router, http.MethodPost, "/api/me/providers", f.uzc, strings.Replace(validCreateBody, "corp-gw", "corp", 1))
+	if rec.Code != http.StatusConflict || providerReason(t, rec) != "provider_name_taken" {
+		t.Errorf("create corp after Corp = %d %s, want 409 provider_name_taken", rec.Code, rec.Body.String())
+	}
+	// Another owner may reuse the name, and a rename onto a taken name collides too.
+	o := f.other(t)
+	o.create(t, strings.Replace(validCreateBody, "corp-gw", "corp", 1))
+	second := f.create(t, strings.Replace(validCreateBody, "corp-gw", "second", 1))
+	rec = bearerReqBody(f.router, http.MethodPatch, "/api/me/providers/"+second.ID, f.uzc, `{"name":"CORP"}`)
+	if rec.Code != http.StatusConflict || providerReason(t, rec) != "provider_name_taken" {
+		t.Errorf("rename to CORP = %d %s, want 409 provider_name_taken", rec.Code, rec.Body.String())
+	}
+}

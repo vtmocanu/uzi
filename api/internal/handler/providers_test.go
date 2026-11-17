@@ -88,7 +88,8 @@ func TestWriteProviderErrorMapping(t *testing.T) {
 		{errProviderRetired, 409, "provider_retired"},
 		{errProviderCap, 409, "provider_limit_reached"},
 		{errProviderNoKey, 404, ""},
-		{&pgconn.PgError{Code: "23505", ConstraintName: "model_providers_owner_name_key"}, 409, "provider_name_taken"},
+		{&pgconn.PgError{Code: "23505", ConstraintName: "model_providers_owner_name_lower_key"}, 409, "provider_name_taken"},
+		{errProviderBaseURLGone, 400, "provider_base_url_not_allowed"},
 	}
 	for _, c := range cases {
 		rec := httptest.NewRecorder()
@@ -100,7 +101,8 @@ func TestWriteProviderErrorMapping(t *testing.T) {
 	if writeProviderError(rec, errors.New("boom")) || rec.Body.Len() != 0 {
 		t.Error("an unknown error must be left to the caller")
 	}
-	if !isPGForeignKeyViolation(&pgconn.PgError{Code: "23503"}) || isPGForeignKeyViolation(errors.New("x")) {
+	fk := &pgconn.PgError{Code: "23503", ConstraintName: "users_claude_provider_fkey"}
+	if !isPGForeignKeyViolation(fk, "users_claude_provider_fkey") || isPGForeignKeyViolation(fk, "other_fkey") || isPGForeignKeyViolation(errors.New("x"), "users_claude_provider_fkey") {
 		t.Error("isPGForeignKeyViolation misclassifies")
 	}
 }

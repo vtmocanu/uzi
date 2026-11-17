@@ -9,12 +9,13 @@ SET LOCAL lock_timeout = '5s';
 -- false: 00389's user_secrets_auto_eligible_kind_check already excludes this kind.
 ALTER TABLE user_secrets DROP CONSTRAINT user_secrets_kind_check;
 ALTER TABLE user_secrets ADD CONSTRAINT user_secrets_kind_check
-    CHECK (kind IN ('anthropic_token', 'openai_api_key', 'codex_auth', 'anthropic_compatible_key'));
+    CHECK (kind IN ('anthropic_token', 'openai_api_key', 'codex_auth', 'anthropic_compatible_key')) NOT VALID;
 
 ALTER TABLE user_secrets ADD COLUMN provider_id uuid;
 ALTER TABLE user_secrets ADD CONSTRAINT user_secrets_provider_fkey
-    FOREIGN KEY (user_id, provider_id) REFERENCES model_providers (owner_user_id, id) ON DELETE CASCADE;
--- A provider key carries a provider and nothing else does. NOT VALID here, validated in 00468.
+    FOREIGN KEY (user_id, provider_id) REFERENCES model_providers (owner_user_id, id) ON DELETE CASCADE NOT VALID;
+-- A provider key carries a provider and nothing else does. The kind check, this fkey and the CHECK
+-- are NOT VALID here (no full scan under the lock), validated in 00468.
 ALTER TABLE user_secrets ADD CONSTRAINT user_secrets_provider_key_check
     CHECK ((kind = 'anthropic_compatible_key') = (provider_id IS NOT NULL)) NOT VALID;
 -- One key per (user, provider).

@@ -4,7 +4,7 @@ SET LOCAL lock_timeout = '5s';
 -- PRD #4320 M1: the per-run model provider binding columns, frozen at run creation by a later
 -- milestone. Deliberately NO foreign keys: a revoked provider or key must not null or block a
 -- bound run's row, and a FK would also lock the busy parent tables. This file touches runs only.
--- The CHECKs are NOT VALID here and validated in 00471.
+-- The CHECKs are NOT VALID here and validated in 00472.
 ALTER TABLE runs
     ADD COLUMN model_provider_id uuid,
     ADD COLUMN model_provider_revision integer,

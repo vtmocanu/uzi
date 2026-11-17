@@ -17,15 +17,28 @@ import (
 // MaxBaseURLBytes bounds a base URL, whether it is an allowlist entry or a user candidate.
 const MaxBaseURLBytes = 2048
 
-// IsLoopbackHost reports whether host is a loopback name or IP (localhost, 127.0.0.0/8, ::1).
+// IsLoopbackHost reports whether host is a loopback name or IP: localhost, any *.localhost name
+// (one trailing dot ignored), 127.0.0.0/8, ::1 and the IPv4-mapped form of a loopback address.
 func IsLoopbackHost(host string) bool {
-	if strings.EqualFold(host, "localhost") {
+	host = strings.TrimSuffix(strings.ToLower(host), ".")
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
 		return true
 	}
 	if ip := net.ParseIP(host); ip != nil {
 		return ip.IsLoopback()
 	}
 	return false
+}
+
+// isNumericShorthandHost reports a non-IP host whose last label starts with a digit (127.1,
+// 2130706433, 0x7f.1, 127.000.000.001). Resolvers and URL parsers read these as IPv4 addresses
+// while net.ParseIP does not, so they are refused rather than classified.
+func isNumericShorthandHost(host string) bool {
+	if strings.Contains(host, ":") || net.ParseIP(host) != nil {
+		return false
+	}
+	last := host[strings.LastIndex(host, ".")+1:]
+	return last != "" && last[0] >= '0' && last[0] <= '9'
 }
 
 // NormalizeBaseURL validates raw as a provider base URL and returns its canonical form:
@@ -38,7 +51,8 @@ func IsLoopbackHost(host string) bool {
 // segment, a missing host and an invalid port. The scheme must be https; http is accepted only
 // for a loopback host and only when allowLoopback is set (the dev flag), and a loopback host of
 // either scheme is refused without it, so the api cannot be pointed at its own local ports in
-// production. The error text names the rule and never echoes the input.
+// production. A trailing-dot host, a numeric shorthand host (127.1, 2130706433) and an unspecified
+// or link-local IP literal (0.0.0.0, ::, 169.254/16, fe80::/10) are refused whatever the flag. The error text names the rule and never echoes the input.
 func NormalizeBaseURL(raw string, allowLoopback bool) (string, error) {
 	if raw == "" {
 		return "", errors.New("base URL must not be empty")
@@ -79,6 +93,15 @@ func NormalizeBaseURL(raw string, allowLoopback bool) (string, error) {
 	host := strings.ToLower(u.Hostname())
 	if host == "" {
 		return "", errors.New("base URL must have a host")
+	}
+	if strings.HasSuffix(host, ".") {
+		return "", errors.New("base URL host must not end with a dot")
+	}
+	if isNumericShorthandHost(host) {
+		return "", errors.New("base URL host must be a name or a canonical IP address")
+	}
+	if ip := net.ParseIP(host); ip != nil && (ip.IsUnspecified() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()) {
+		return "", errors.New("unspecified and link-local addresses are never accepted")
 	}
 	loopback := IsLoopbackHost(host)
 	switch {

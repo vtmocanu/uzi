@@ -8,7 +8,8 @@ SET LOCAL lock_timeout = '5s';
 -- a source is never silently nulled (contrast 00078/00079).
 ALTER TABLE users ADD COLUMN claude_provider_id uuid;
 ALTER TABLE users ADD CONSTRAINT users_claude_provider_fkey
-    FOREIGN KEY (id, claude_provider_id) REFERENCES model_providers (owner_user_id, id) ON DELETE RESTRICT;
+    FOREIGN KEY (id, claude_provider_id) REFERENCES model_providers (owner_user_id, id) ON DELETE RESTRICT NOT VALID;
+-- Validated in 00470.
 
 -- +goose Down
 SET LOCAL lock_timeout = '5s';

@@ -402,8 +402,12 @@ func TestModelProviderNameUniquePerOwnerLiveDB(t *testing.T) {
 	newProvider(ctx, t, q, a, "same")
 	newProvider(ctx, t, q, b, "same") // another owner may reuse the name
 	_, err := q.InsertModelProvider(ctx, store.InsertModelProviderParams{OwnerUserID: a, Name: "same", Engine: "claude"})
-	if code, c := pgCodeC(err); code != "23505" || c != "model_providers_owner_name_key" {
+	if code, c := pgCodeC(err); code != "23505" || c != "model_providers_owner_name_lower_key" {
 		t.Fatalf("duplicate name = %v (%s %s)", err, code, c)
+	}
+	_, err = q.InsertModelProvider(ctx, store.InsertModelProviderParams{OwnerUserID: a, Name: "SAME", Engine: "claude"})
+	if code, c := pgCodeC(err); code != "23505" || c != "model_providers_owner_name_lower_key" {
+		t.Fatalf("case-variant name = %v (%s %s)", err, code, c)
 	}
 	_, err = q.InsertModelProvider(ctx, store.InsertModelProviderParams{OwnerUserID: a, Name: "other", Engine: "codex"})
 	if code, _ := pgCodeC(err); code != "23514" {

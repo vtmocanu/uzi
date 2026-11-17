@@ -243,8 +243,9 @@ possible with an allowlist that is **separate** from every other allowlist on th
 | `UZI_PROVIDER_ALLOW_LOOPBACK` | `false` | Dev flag. Only when `true` may the list hold a loopback host (`localhost`, `127.0.0.0/8`, `::1`) and plain `http` for it, so a local fake gateway works under compose. Never set it in production: the probe would be able to reach the api's own local ports. |
 
 The api is the destination authority: it checks the list when a provider is saved or its endpoint
-edited, and a saved URL is stored as the matching list entry. Removing an entry stops later saves
-and later run claims for providers that used it. Helm: set the variables through `api.config`.
+edited, and a saved URL is stored as the matching list entry. Removing an entry stops later saves and
+tests of providers that used it (every save re-checks the URL it carries, a key save included) and,
+once providers can run, their run claims. Helm: set the variables through `api.config`.
 
 Network reach is a separate control. `workers.fqdnEgress.allowFQDNs` is **namespace-wide** (see
 ADR-0285): once an operator admits a gateway host there, every restricted-tier run in the worker

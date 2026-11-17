@@ -44,6 +44,9 @@ var (
 	errProviderRetired  = errors.New("provider is retired")
 	errProviderCap      = errors.New("provider limit reached")
 	errProviderNoKey    = errors.New("provider has no key")
+
+	// errProviderBaseURLGone: the base_url a save would carry is no longer on the operator allowlist.
+	errProviderBaseURLGone = errors.New("provider base URL is no longer allowed")
 )
 
 // providerBodyRefusal names a request field a route refuses with a specific message rather than
@@ -173,9 +176,9 @@ func isPGUnique(err error, constraint string) bool {
 	return errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == constraint
 }
 
-func isPGForeignKeyViolation(err error) bool {
+func isPGForeignKeyViolation(err error, constraint string) bool {
 	var pgErr *pgconn.PgError
-	return errors.As(err, &pgErr) && pgErr.Code == "23503"
+	return errors.As(err, &pgErr) && pgErr.Code == "23503" && pgErr.ConstraintName == constraint
 }
 
 // writeProviderError maps the sentinel errors of a provider transaction to responses. It reports
@@ -190,7 +193,9 @@ func writeProviderError(w http.ResponseWriter, err error) bool {
 		httpx.ErrorReason(w, http.StatusConflict, "provider limit reached (20 per user, retired providers included)", reasonProviderLimit)
 	case errors.Is(err, errProviderNoKey):
 		httpx.Error(w, http.StatusNotFound, "the provider has no key")
-	case isPGUnique(err, "model_providers_owner_name_key"):
+	case errors.Is(err, errProviderBaseURLGone):
+		writeBaseURLRefusal(w)
+	case isPGUnique(err, "model_providers_owner_name_lower_key"):
 		httpx.ErrorReason(w, http.StatusConflict, "a provider with that name already exists", reasonProviderNameTaken)
 	default:
 		return false
@@ -358,9 +363,13 @@ type revisionEdit struct {
 }
 
 // editProvider applies an optional rename and an optional revision edit in one transaction and
-// answers with the updated provider. The edit's first statement advances current_revision (the
-// provider row lock that the run-create freeze lock waits on); the new immutable revision is then
-// inserted, and unreferenced old revisions are pruned in a separate statement after the commit.
+// answers with the updated provider. A revision edit is refused (400 provider_base_url_not_allowed)
+// unless the base URL the new revision carries, the requested one or the previous revision's, is
+// still on the operator allowlist. The provider row is row-locked (by the rename or by the bump)
+// before the new immutable revision is inserted; the whole edit runs under the per-user
+// secret-mutation lock, and a run-create must take LockSecretMutationShared before it takes
+// LockModelProviderForShare on the provider row, or the two lock orders would cycle. Unreferenced
+// old revisions are pruned in a separate statement after the commit.
 func (h *Handler) editProvider(w http.ResponseWriter, r *http.Request, userID, id uuid.UUID, rename *string, edit *revisionEdit) {
 	var row store.GetModelProviderForOwnerRow
 	err := h.withSecretLock(r.Context(), userID, nil, func(q *store.Queries) error {
@@ -373,6 +382,11 @@ func (h *Handler) editProvider(w http.ResponseWriter, r *http.Request, userID, i
 		}
 		if cur.RetiredAt.Valid {
 			return errProviderRetired
+		}
+		if edit != nil && edit.baseURL == nil {
+			if _, ok := h.cfg.ProviderBaseURLAllowed(cur.BaseUrl); !ok {
+				return errProviderBaseURLGone
+			}
 		}
 		if rename != nil {
 			if _, err := q.RenameModelProvider(r.Context(), store.RenameModelProviderParams{ID: id, OwnerUserID: userID, Name: *rename}); err != nil {
@@ -571,7 +585,7 @@ func (h *Handler) DeleteMyProvider(w http.ResponseWriter, r *http.Request) {
 		return nil
 	})
 	if err != nil {
-		if isPGForeignKeyViolation(err) {
+		if isPGForeignKeyViolation(err, "users_claude_provider_fkey") {
 			httpx.ErrorReason(w, http.StatusConflict,
 				"the provider is selected as a source; choose another source before deleting it", reasonProviderInUseAsSource)
 			return
@@ -618,11 +632,15 @@ func (h *Handler) PutMyProviderKey(w http.ResponseWriter, r *http.Request) {
 	}
 	var row store.GetModelProviderForOwnerRow
 	err = h.withSecretLock(r.Context(), user.ID, &material, func(q *store.Queries) error {
-		if _, err := q.GetModelProviderForOwner(r.Context(), store.GetModelProviderForOwnerParams{ID: id, OwnerUserID: user.ID}); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				return errProviderNotFound
-			}
+		prov, err := q.GetModelProviderForOwner(r.Context(), store.GetModelProviderForOwnerParams{ID: id, OwnerUserID: user.ID})
+		if errors.Is(err, pgx.ErrNoRows) {
+			return errProviderNotFound
+		}
+		if err != nil {
 			return err
+		}
+		if _, ok := h.cfg.ProviderBaseURLAllowed(prov.BaseUrl); !ok {
+			return errProviderBaseURLGone
 		}
 		cur, err := q.GetProviderKeyForUpdate(r.Context(), store.GetProviderKeyForUpdateParams{UserID: user.ID, ProviderID: pgtype.UUID{Bytes: id, Valid: true}})
 		switch {

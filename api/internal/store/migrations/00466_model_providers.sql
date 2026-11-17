@@ -14,9 +14,10 @@ CREATE TABLE model_providers (
     current_revision integer     NOT NULL,
     retired_at       timestamptz,
     created_at       timestamptz NOT NULL DEFAULT now(),
-    CONSTRAINT model_providers_owner_name_key UNIQUE (owner_user_id, name),
     CONSTRAINT model_providers_owner_id_key UNIQUE (owner_user_id, id)
 );
+-- Names are unique per owner case-insensitively ("Corp" and "corp" collide).
+CREATE UNIQUE INDEX model_providers_owner_name_lower_key ON model_providers (owner_user_id, lower(name));
 
 CREATE TABLE model_provider_revisions (
     provider_id uuid        NOT NULL REFERENCES model_providers(id) ON DELETE CASCADE,
@@ -42,6 +43,19 @@ CREATE TABLE model_provider_probe_results (
 
 -- +goose Down
 SET LOCAL lock_timeout = '5s';
+-- Refuse rather than silently destroy providers, revisions and their keys (the 00198 convention).
+-- +goose StatementBegin
+DO $$
+DECLARE
+    n bigint;
+BEGIN
+    SELECT count(*) INTO n FROM model_providers;
+    IF n > 0 THEN
+        RAISE EXCEPTION 'refusing to roll back 00466: % model provider row(s) still exist; delete them explicitly before downgrading', n;
+    END IF;
+END
+$$;
+-- +goose StatementEnd
 DROP TABLE model_provider_probe_results;
 DROP TABLE model_provider_revisions;
 DROP TABLE model_providers;
