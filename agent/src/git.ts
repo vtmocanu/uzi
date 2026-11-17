@@ -33,6 +33,10 @@ import { RUNNER_UID, WORKER_UID, killRunnerGroupOnly, killRunnerGroup, runnerCom
 import { unmarkedSpawnEnv, workerSpawnEnv } from "./worker-spawn-mark.js";
 import { PINNED_SUBTREE_SCRIPT, SCRATCH_DELETE_LIMITS, TREE_NAME_RE, censusScratchRoot, rmRunnerTeardownTree } from "./rmtree.js";
 import { absorbBareConfigValue, classifyScratchSettlement, isNeverRemovedScratchName, newPathSink, parseScratchCensus, postCensusOf, readProtectedStores, type ProtectedPathsRead, type Settlement } from "./pod-epoch-scratch.js";
+import {
+  ENDED, activeRetention, classifyRunDataDirRecords, isRunUuid, judgeAuthoritySlot, judgeRetainedEvidence, unknownRetention, type RunRetention,
+} from "./pod-epoch-run-retention.js";
+import type { SlotSnapshot } from "./completion-authority.js";
 import { classifyForgeError, withForgeRetry } from "./forge-retry.js";
 import { RunDiskLocks } from "./run-disk-locks.js";
 import {
@@ -2686,6 +2690,20 @@ export interface RetainedSourceEvidence {
   epochJournalExtraFields?: true;
 }
 
+/** Issue #4420 m2: {@link GitCache.classifyEpochScratchRunRetention}'s options. */
+export interface EpochScratchRunRetentionOptions {
+  /** The server verdicts the caller read for this run; the retained-group inspection evaluates against them. */
+  lifecycle: RetainedLifecycleSnapshot;
+  holds: RetainedHoldsSnapshot;
+  signal: AbortSignal;
+  /** Absolute wall-clock deadline. */
+  deadline: number;
+  /** Read-only authority slot accessor (AuthorityRuntime.peekSlot); absent makes a retired entry unknown. */
+  peekSlot?: (clonePath: string) => Promise<SlotSnapshot | null>;
+  /** Pass-scoped memo of the worker-wide retained census, so N run leaves cost one census. */
+  discovery?: { value?: Promise<EpochRetainedDiscoveryResult> };
+}
+
 /** The server's lifecycle verdict for a run, read by the caller (never by GitCache) before it
  *  inspects or discards. `terminal` is positive evidence; every other state keeps a marker-less
  *  canonical source. */
@@ -4880,6 +4898,166 @@ export class GitCache {
     } catch {
       return { state: "unknown", reason: opts.signal.aborted ? "protected_aborted" : Date.now() >= opts.deadline ? "protected_deadline" : "bare_unreadable" };
     }
+  }
+
+  /**
+   * Issue #4420 m2: whether every LOCAL record of `runId` has positively ended, so the run's TMPDIR leaf
+   * (`run-<runId>` under the runner scratch root) may be reclaimed. Read-only, under the same scope as
+   * {@link collectEpochScratchProtectedPaths} (epoch limits plus a recovery operation); it creates and mutates no
+   * authority record, git config, ref or store, and never throws. `ended` only when EVERY source was observed
+   * and ended: ENOENT on a store root, run directory or the bare repos root is observed-absent (ended for that source);
+   * any other error, cap, symlink or special file, or malformed value is `unknown`; a live record is `active`.
+   * Sources: (1) per bare, the attempt ledger (state AND footprint AND authority slot), the recovery and restore
+   * journals, stopped/retained/recovery-owner records and the run's refs; (2) custody (recovery and settlement
+   * records plus terminal protection); (3) the run's dataDir records (pod-epoch-run-retention.ts); (4) the retained
+   * groups, judged by {@link judgeRetainedEvidence}. The outbox is NOT read here (see runScratchPhase). Source tokens
+   * are a fixed vocabulary.
+   */
+  async classifyEpochScratchRunRetention(runId: string, opts: EpochScratchRunRetentionOptions): Promise<RunRetention> {
+    try {
+      const id = runId.toLowerCase();
+      if (!isRunUuid(id)) return unknownRetention("run_id");
+      const limits = this.epochLimits();
+      const local = await this.epochRetained.run(limits, () => this.withRecoveryOperation(opts.signal, opts.deadline,
+        () => this.classifyRunLocalRecords(runId, id, opts, limits)));
+      if (local.state !== "ended") return local;
+      return await this.classifyRunRetainedGroups(id, opts);
+    } catch {
+      return unknownRetention(opts.signal.aborted ? "aborted" : "classifier");
+    }
+  }
+
+  private async classifyRunLocalRecords(runId: string, id: string, opts: EpochScratchRunRetentionOptions,
+      limits: Required<EpochRetainedLimits>): Promise<RunRetention> {
+    const ledger: AttemptLedgerEntry[] = [];
+    let configBytes = 0;
+    for (const bare of await this.retainedBares(undefined, { strict: true })) {
+      this.checkRecoveryInterruption();
+      const found = await this.withLock(bare, async (): Promise<RunRetention | { ledger: AttemptLedgerEntry[] }> => {
+        await this.assertRecoveryBare(bare);
+        const config = await this.runGit(bare, ["config", "--local", "--null", "--list"]);
+        if ((configBytes += config.length) > limits.maxMetadataBytes) return unknownRetention("bare_config");
+        const scanned = this.scanRunBareConfig(config, id);
+        if ("state" in scanned) return scanned;
+        // The run's pins and anchors. One bounded listing (`--count=1`: any match is enough); a read failure is
+        // unknown through the caller's catch. Refs are keyed by the run id (a UUID survives the sanitising of
+        // the archive ref's id); refs/uzi-cross-check/<runId> is a single ref.
+        const refs = await this.runGit(bare, ["for-each-ref", "--count=1", "--format=%(refname)",
+          `refs/uzi-owed/${id}/`, `refs/uzi-recovery-episode/${id}/`, `refs/uzi-recovery-pin/${id}/`,
+          `refs/uzi-coverage/${id}/`, `refs/uzi-settle/${id}/`, `refs/uzi-archive/${id}/`, `refs/uzi-cross-check/${id}`]);
+        if (refs.trim() !== "") return activeRetention("run_refs");
+        return scanned;
+      }, opts.signal);
+      if ("state" in found) return found;
+      ledger.push(...found.ledger);
+    }
+    for (const entry of ledger) {
+      if (entry.state !== "retired") return activeRetention(`ledger_${entry.state}`);
+    }
+    for (const entry of ledger) {
+      // The footprint first: an authority slot never stands in for it.
+      const footprint = await this.epochFootprintState(entry.clonePath);
+      if (footprint === "present") return activeRetention("attempt_footprint");
+      if (footprint === "unknown") return unknownRetention("attempt_footprint");
+      if (!opts.peekSlot) return unknownRetention("authority_slot");
+      let slot: SlotSnapshot | null;
+      try { slot = await this.retainedIO(() => opts.peekSlot!(entry.clonePath)); }
+      catch { this.checkRecoveryInterruption(); return unknownRetention("authority_slot"); }
+      const judged = judgeAuthoritySlot(slot);
+      if (judged.state !== "ended") return judged;
+    }
+    // custodyHeld folds an unreadable store into "held" (fail closed), so that case reads as active here.
+    if (await this.custodyHeld(runId)) return activeRetention("custody");
+    return classifyRunDataDirRecords(path.dirname(this.reposRoot), id, {
+      interrupt: () => this.checkRecoveryInterruption(), maxDirectoryEntries: limits.maxDirectoryEntries,
+    });
+  }
+
+  /**
+   * One bare's config, for one run. Pure. The attempt ledger yields the run's entries (last value per attemptId
+   * wins); every other family yields a keep or is ignored. Matching is case-insensitive on the run id.
+   * `uzi-trackowner.<branch>.owner` is DELIBERATELY IGNORED (owner decision, issue #4420): it is seed provenance for
+   * refs/uzi-runner/<branch> (written by promoteTrackingUnderLock and the attempt repair, read by readTrackingOwner,
+   * preserved by cleanupRecoveryGeneration), not retention of a TMPDIR leaf, so its presence neither keeps nor
+   * releases. Any other `uzi-*` key is ignored unless it names the run.
+   */
+  private scanRunBareConfig(config: string, id: string): RunRetention | { ledger: AttemptLedgerEntry[] } {
+    const protectedFamily = /^uzi-(?:recovery|retained|attempts|stopped|recoveryowner|restore)\./;
+    const ledger = new Map<string, AttemptLedgerEntry>();
+    const journals = new Map<string, string>();
+    for (const item of config.split("\0")) {
+      const nl = item.indexOf("\n");
+      const key = nl < 0 ? item : item.slice(0, nl);
+      if (!key.startsWith("uzi-") || key.startsWith("uzi-trackowner.")) continue;
+      // A valueless record is not a cleared value: it cannot be interpreted, so it is unknown, never skipped.
+      if (nl < 0) { if (protectedFamily.test(key)) return unknownRetention("bare_config"); continue; }
+      const value = item.slice(nl + 1);
+      const lowKey = key.toLowerCase();
+      let m = /^uzi-attempts\.(.+)\.entry$/.exec(key);
+      if (m) {
+        const entry = parseAttemptLedgerEntry(value);
+        if (!entry) return unknownRetention("attempt_ledger");
+        ledger.set(entry.attemptId, entry);
+        continue;
+      }
+      m = /^uzi-recovery\.(.+)\.clone$/.exec(key);
+      if (m) { journals.set(m[1]!, value); continue; }
+      if (restoreKeyBranch(key) !== undefined) {
+        if (value === "") continue;
+        try {
+          const parsed = parseRestoreValue(value);
+          const named = parsed.kind === "entry" ? parsed.remainder.runId : parsed.successor.runId;
+          if (typeof named !== "string" || named.toLowerCase() === id || value.toLowerCase().includes(id)) return activeRetention("restore_journal");
+        } catch { return unknownRetention("restore_journal"); }
+        continue;
+      }
+      const family = /^uzi-(stopped|retained|recoveryowner)\.([^.]+)\./.exec(lowKey);
+      if (family) {
+        if (family[2] === id) {
+          if (value === "") continue;
+          return activeRetention(family[1] === "stopped" ? "stopped_marker" : family[1] === "retained" ? "retained_descriptor" : "recovery_owner");
+        }
+        if (value !== "" && !value.startsWith("/")) { try { JSON.parse(value); } catch { return unknownRetention("bare_config"); } }
+        continue;
+      }
+      if (protectedFamily.test(key)) { if (value !== "" && value.toLowerCase().includes(id)) return activeRetention("bare_config"); continue; }
+      if (lowKey.includes(id) || value.toLowerCase().includes(id)) return activeRetention("bare_config");
+    }
+    for (const raw of journals.values()) {
+      if (raw === "") continue;
+      try { parseRecoveryJournal(raw); } catch { return unknownRetention("recovery_journal"); }
+      if (raw.toLowerCase().includes(id)) return activeRetention("recovery_journal");
+    }
+    return { ledger: [...ledger.values()].filter(entry => entry.runId.toLowerCase() === id) };
+  }
+
+  /** The run's retained groups from the worker-wide census, inspected against the caller's server verdicts. */
+  private async classifyRunRetainedGroups(id: string, opts: EpochScratchRunRetentionOptions): Promise<RunRetention> {
+    const discover = () => this.discoverEpochRetainedSources({ signal: opts.signal, deadline: opts.deadline, maxPhysicalPaths: 200 });
+    const census = await (opts.discovery ? (opts.discovery.value ??= discover()) : discover());
+    // An incomplete or overflowing inventory may have omitted this run's groups: unknown.
+    if (!census.inventoryComplete || census.unreadable > 0 || census.overflow > 0) return unknownRetention("retained_inventory");
+    const byBare = new Map<string, typeof census.groups>();
+    for (const group of census.groups) {
+      if (group.selector.runId.toLowerCase() !== id) continue;
+      byBare.set(group.barePath, [...(byBare.get(group.barePath) ?? []), group]);
+    }
+    for (const [barePath, groups] of byBare) {
+      const inspected = await this.inspectEpochRetainedGroups({
+        barePath, maxDescriptors: 200, isLivePath: () => false, signal: opts.signal, deadline: opts.deadline,
+        budgetMs: Math.max(1, opts.deadline - Date.now()),
+        requests: groups.map(group => ({ selector: group.selector, holds: opts.holds, lifecycle: opts.lifecycle, maxPhysicalPaths: group.paths.length })),
+      });
+      if (!Array.isArray(inspected) || inspected.length !== groups.length) return unknownRetention("retained_inventory");
+      for (const result of inspected) {
+        if (result.partial || result.unreadable > 0) return unknownRetention("retained_inventory");
+        for (const source of result.sources) {
+          const judged = judgeRetainedEvidence(source);
+          if (judged.state !== "ended") return judged;
+        }
+      }
+    }
+    return ENDED;
   }
 
   /** Local recovery clocks, including queued locks and actual child settlement. */
@@ -14734,18 +14912,28 @@ export class GitCache {
   /** At most the path depth plus two leaves, charged to the epoch read budget; no retry.
    * Missing ancestors and symlinks cannot prove an absent footprint. */
   private async epochMissingFootprint(rec: GatheredRecord): Promise<boolean> {
-    const clone = rec.parts[0]!.clonePath;
+    return (await this.epochFootprintState(rec.parts[0]!.clonePath)) === "missing";
+  }
+
+  /** The same walk as {@link epochMissingFootprint} with its three outcomes kept apart (also read by
+   *  {@link classifyEpochScratchRunRetention}): `missing` only when every ancestor is a real directory and both the
+   *  clone and its `.uzi-skills-` sibling are positively absent; `present` when either exists as a real directory;
+   *  `unknown` for a missing ancestor, a symlink, a non-directory or an unreadable path. */
+  private async epochFootprintState(clone: string): Promise<"missing" | "present" | "unknown"> {
     const parent = path.dirname(clone);
     const root = path.parse(parent).root;
     let current = root;
     for (const component of parent.slice(root.length).split(path.sep).filter(Boolean)) {
       current = path.join(current, component);
-      if ((await this.clonePresence(current)).presence !== "present") return false;
+      if ((await this.clonePresence(current)).presence !== "present") return "unknown";
     }
+    let state: "missing" | "present" | "unknown" = "missing";
     for (const target of [clone, path.join(parent, `.uzi-skills-${path.basename(clone)}`)]) {
-      if ((await this.clonePresence(target)).presence !== "missing") return false;
+      const presence = (await this.clonePresence(target)).presence;
+      if (presence === "present") return "present";
+      if (presence === "unsafe") state = "unknown";
     }
-    return true;
+    return state;
   }
 
   /** Narrow metadata-only retry evidence, from the complete ordered raw snapshot under B.

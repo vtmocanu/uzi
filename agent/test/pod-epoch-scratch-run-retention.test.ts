@@ -1,0 +1,497 @@
+// Issue #4420 m2: the read-only run-retention classifier behind the scratch phase's `run-<uuid>` leaves. Every
+// source has an active case, an ended case, an observed-absent case and an unreadable case; absence and
+// unreadable are distinct (absent releases that source, unreadable keeps). Bare-config sources run against a real
+// bare repository (GitCache.classifyEpochScratchRunRetention); the pure judgements and dataDir records are driven
+// directly.
+import assert from "node:assert/strict";
+import { afterEach, beforeEach, describe, it } from "node:test";
+import { execFileSync } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
+import { formatAttemptId } from "../src/attempt-path.js";
+import { GitCache, type EpochScratchRunRetentionOptions } from "../src/git.js";
+import {
+  ENDED, classifyCredentialSwitchText, classifyMaintenanceTable, classifyRunDataDirRecords, judgeAuthoritySlot,
+  judgeRetainedEvidence, normalizeRetention, type RetainedEvidenceShape,
+} from "../src/pod-epoch-run-retention.js";
+import { makeFixture, type Fixture } from "./fixture-repo.js";
+import { noProofReseed, nullLogger, testGitCacheOptions } from "./helpers.js";
+
+const RUN = "11111111-2222-4333-8444-555555555555";
+const OTHER = "99999999-8888-4777-8666-555555555555";
+const BRANCH = "agent/issue-4420";
+const ENV = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null", GIT_TERMINAL_PROMPT: "0" };
+
+let fx: Fixture;
+let git: GitCache;
+let bare: string;
+let attempt: string;
+let clonePath: string;
+
+const gitIn = (args: string[]): string => execFileSync("git", ["-C", bare, ...args], { env: ENV, encoding: "utf8" }).trim();
+const cfg = (key: string, value: string): void => { gitIn(["config", "--local", "--add", key, value]); };
+const dataPath = (...parts: string[]): string => path.join(fx.dataDir, ...parts);
+const ledger = (state: string, runId = RUN, clone = clonePath, id = attempt): string => JSON.stringify({ attemptId: id, runId, clonePath: clone, state });
+
+function options(over: Partial<EpochScratchRunRetentionOptions> = {}): EpochScratchRunRetentionOptions {
+  return {
+    lifecycle: { state: "terminal", status: "completed" }, holds: { state: "read", holds: [] },
+    signal: new AbortController().signal, deadline: Date.now() + 60_000, peekSlot: async () => null, ...over,
+  };
+}
+const classify = (over: Partial<EpochScratchRunRetentionOptions> = {}, runId = RUN) => git.classifyEpochScratchRunRetention(runId, options(over));
+const active = (source: string) => ({ state: "active", source });
+const unknown = (source: string) => ({ state: "unknown", source });
+
+beforeEach(async () => {
+  fx = makeFixture();
+  git = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
+  bare = await git.ensureClone(fx.originPath);
+  fs.chmodSync(path.dirname(bare), 0o700);
+  fs.chmodSync(bare, 0o700);
+  attempt = formatAttemptId(new Date("2026-01-01T00:00:00Z"), 1, "0000000000000001");
+  clonePath = dataPath("runner", "slug", `issue-4420.attempt-${attempt}`);
+  fs.mkdirSync(path.dirname(clonePath), { recursive: true });
+});
+afterEach(() => fx?.cleanup());
+
+describe("baseline and the bare-config sources", () => {
+  it("a bare with no record of the run is ended, and the trackowner stamp neither keeps nor releases", async () => {
+    assert.deepEqual(await classify(), ENDED);
+    cfg(`uzi-trackowner.${BRANCH}.owner`, JSON.stringify({ runId: RUN, anything: true }));
+    cfg(`uzi-trackowner.${BRANCH}.receiptversion`, "1");
+    assert.deepEqual(await classify(), ENDED, "stamp present alone releases nothing and keeps nothing");
+    cfg(`uzi-stopped.${RUN}.entry`, "{}");
+    assert.deepEqual(await classify(), active("stopped_marker"), "with another active source the stamp does not release it");
+  });
+
+  it("a run id that is not a uuid, and a repos root that cannot be enumerated, are unknown", async () => {
+    assert.deepEqual(await git.classifyEpochScratchRunRetention("not-a-uuid", options()), unknown("run_id"));
+    fs.writeFileSync(path.join(fx.dataDir, "repos", "stray.git"), "file, not a bare directory");
+    assert.deepEqual(await classify(), unknown("classifier"), "a non-directory .git candidate refuses the whole scan");
+  });
+
+  it("an absent repos root is observed absent (ended)", async () => {
+    fs.rmSync(path.dirname(bare), { recursive: true, force: true });
+    assert.deepEqual(await classify(), ENDED);
+  });
+
+  for (const [state, source] of [["live", "ledger_live"], ["abandoned", "ledger_abandoned"], ["reclaimed", "ledger_reclaimed"]] as const) {
+    it(`a ${state} ledger entry of the run is active (${source}); another run's is ignored`, async () => {
+      cfg(`uzi-attempts.${BRANCH}.entry`, ledger(state, OTHER));
+      assert.deepEqual(await classify(), ENDED);
+      cfg(`uzi-attempts.${BRANCH}.entry`, ledger(state));
+      assert.deepEqual(await classify(), active(source));
+    });
+  }
+
+  it("the last ledger value per attempt wins: live then retired with a missing footprint is ended", async () => {
+    cfg(`uzi-attempts.${BRANCH}.entry`, ledger("live"));
+    cfg(`uzi-attempts.${BRANCH}.entry`, ledger("retired"));
+    assert.deepEqual(await classify(), ENDED);
+    cfg(`uzi-attempts.${BRANCH}.entry`, ledger("live"));
+    assert.deepEqual(await classify(), active("ledger_live"));
+  });
+
+  it("a malformed ledger value, or a valueless protected-family key, is unknown, never skipped", async () => {
+    cfg(`uzi-attempts.${BRANCH}.entry`, "{not json");
+    assert.deepEqual(await classify(), unknown("attempt_ledger"));
+    gitIn(["config", "--local", "--unset-all", `uzi-attempts.${BRANCH}.entry`]);
+    assert.deepEqual(await classify(), ENDED);
+    fs.appendFileSync(path.join(bare, "config"), `[uzi-stopped "x"]\n\tentry\n`);
+    assert.deepEqual(await classify(), unknown("bare_config"));
+  });
+
+  it("the recovery journal: cleared is ended, this run's is active, another run's valid one is ended, an unparseable one is unknown", async () => {
+    const key = `uzi-recovery.${BRANCH}.clone`;
+    cfg(key, "");
+    assert.deepEqual(await classify(), ENDED);
+    cfg(key, JSON.stringify({ runId: RUN, clonePath }));
+    assert.deepEqual(await classify(), active("recovery_journal"));
+    cfg(key, "");
+    assert.deepEqual(await classify(), ENDED, "the last value wins: a cleared journal releases");
+    cfg(key, JSON.stringify({ runId: OTHER, clonePath }));
+    assert.deepEqual(await classify(), ENDED);
+    cfg(key, "{broken");
+    assert.deepEqual(await classify(), unknown("recovery_journal"));
+  });
+
+  for (const [family, suffix, source] of [["stopped", "entry", "stopped_marker"], ["retained", "journal", "retained_descriptor"],
+    ["recoveryowner", "record", "recovery_owner"]] as const) {
+    it(`uzi-${family}.<run>.${suffix}: this run is active, a cleared value and another run's valid value are ended, another run's garbage is unknown`, async () => {
+      // The worker-wide census is stubbed clean: these fixtures are not full retained-source records, so the real
+      // census would (correctly) call a foreign malformed record an incomplete inventory.
+      git.discoverEpochRetainedSources = async () => ({ groups: [], inventoryComplete: true, physicalPaths: 0, overflow: 0, overflowExact: true, unreadable: 0 });
+      cfg(`uzi-${family}.${OTHER}.${suffix}`, "{}");
+      assert.deepEqual(await classify(), ENDED);
+      cfg(`uzi-${family}.${RUN}.${suffix}`, "");
+      assert.deepEqual(await classify(), ENDED, "a cleared value is nothing");
+      cfg(`uzi-${family}.${RUN}.${suffix}`, "{}");
+      assert.deepEqual(await classify(), active(source));
+      gitIn(["config", "--local", "--unset-all", `uzi-${family}.${RUN}.${suffix}`]);
+      cfg(`uzi-${family}.${OTHER}.${suffix}`, "garbage");
+      assert.deepEqual(await classify(), unknown("bare_config"));
+    });
+  }
+
+  it("a restore journal naming the run (as its successor) is active; an unparseable one is unknown; a cleared one is ended", async () => {
+    const key = `uzi-restore.${BRANCH}.journal`;
+    cfg(key, "");
+    assert.deepEqual(await classify(), ENDED);
+    const predecessor = formatAttemptId(new Date("2026-01-01T00:00:00Z"), 1, "0000000000000002");
+    const successorAttempt = formatAttemptId(new Date("2026-01-02T00:00:00Z"), 2, "0000000000000003");
+    const basis = { version: 1, predecessor: { clonePath: dataPath("runner", "slug", `issue-4420.attempt-${predecessor}`), attemptId: predecessor, generation: 1,
+      root: { dev: "1", ino: "2" } }, journalDigest: "a".repeat(64), boundary: { predecessor: "b".repeat(64), successor: "c".repeat(64) },
+      slotOwner: { worker: "w", epoch: "e" }, pin: { captureId: "cap", generation: 1, sourceSha: "d".repeat(40), finalization: false },
+      restoreTip: "e".repeat(40) };
+    cfg(key, JSON.stringify({ restore: basis, restoreStage: "retired",
+      successor: { runId: RUN, attemptId: successorAttempt, clonePath: dataPath("runner", "slug", `issue-4420.attempt-${successorAttempt}`) } }));
+    assert.deepEqual(await classify(), active("restore_journal"));
+    gitIn(["config", "--local", "--unset-all", key]);
+    cfg(key, "{nope");
+    assert.deepEqual(await classify(), unknown("restore_journal"));
+  });
+
+  it("the run's refs: each family is active, another run's refs are ignored, a failed read is unknown", async t => {
+    const sha = gitIn(["rev-parse", "--verify", "refs/remotes/origin/main"]);
+    for (const ref of [`refs/uzi-owed/${OTHER}/${sha}`, `refs/uzi-cross-check/${OTHER}`]) gitIn(["update-ref", ref, sha]);
+    assert.deepEqual(await classify(), ENDED);
+    for (const ref of [`refs/uzi-owed/${RUN}/${sha}`, `refs/uzi-recovery-episode/${RUN}/${sha}`, `refs/uzi-recovery-pin/${RUN}/1`,
+      `refs/uzi-coverage/${RUN}/1/${"f".repeat(8)}`, `refs/uzi-settle/${RUN}/hold/source`, `refs/uzi-archive/${RUN}/g1`, `refs/uzi-cross-check/${RUN}`]) {
+      gitIn(["update-ref", ref, sha]);
+      assert.deepEqual(await classify(), active("run_refs"), ref.split("/").slice(0, 2).join("/"));
+      gitIn(["update-ref", "-d", ref]);
+      assert.deepEqual(await classify(), ENDED, `${ref.split("/")[1]} deleted`);
+    }
+    const original = (git as unknown as { runGit: (cwd: string, args: string[]) => Promise<string> }).runGit.bind(git);
+    t.mock.method(git as unknown as { runGit: typeof original }, "runGit", async (cwd: string, args: string[]) => {
+      if (args[0] === "for-each-ref") throw new Error("injected read failure");
+      return original(cwd, args);
+    });
+    assert.deepEqual(await classify(), unknown("classifier"));
+  });
+
+  it("another uzi-* key is ignored unless it names the run", async () => {
+    cfg("uzi-future.thing.value", "x");
+    assert.deepEqual(await classify(), ENDED);
+    cfg("uzi-future.thing.other", `names ${RUN} somewhere`);
+    assert.deepEqual(await classify(), active("bare_config"));
+  });
+});
+
+describe("attempt footprint and authority slot (a retired ledger entry is ended only with a verified missing footprint)", () => {
+  const retire = () => cfg(`uzi-attempts.${BRANCH}.entry`, ledger("retired"));
+  const slot = (over: Record<string, unknown> = {}) => ({ state: "ineligible", pending: null, retiring: null, publication: null, ...over });
+
+  it("retired with the clone directory present is active; with the skills sibling present is active", async () => {
+    retire();
+    fs.mkdirSync(clonePath);
+    assert.deepEqual(await classify(), active("attempt_footprint"));
+    fs.rmdirSync(clonePath);
+    assert.deepEqual(await classify(), ENDED);
+    fs.mkdirSync(path.join(path.dirname(clonePath), `.uzi-skills-${path.basename(clonePath)}`));
+    assert.deepEqual(await classify(), active("attempt_footprint"));
+  });
+
+  it("a symlink, a non-directory or a missing ancestor cannot prove the footprint absent (unknown, not ended)", async () => {
+    retire();
+    fs.symlinkSync("/nonexistent-target", clonePath);
+    assert.deepEqual(await classify(), unknown("attempt_footprint"));
+    fs.unlinkSync(clonePath);
+    fs.writeFileSync(clonePath, "x");
+    assert.deepEqual(await classify(), unknown("attempt_footprint"));
+    fs.unlinkSync(clonePath);
+    fs.rmdirSync(path.dirname(clonePath));
+    assert.deepEqual(await classify(), unknown("attempt_footprint"), "a missing ancestor is not an observed-absent footprint");
+  });
+
+  it("authority: an absent slot, an ineligible slot with every field null and a retired tombstone are ended", async () => {
+    retire();
+    for (const read of [async () => null, async () => slot(), async () => slot({ state: "retired" })]) {
+      assert.deepEqual(await classify({ peekSlot: read as never }), ENDED);
+    }
+  });
+
+  it("authority: each of pending, retiring and publication alone keeps; any live state keeps", async () => {
+    retire();
+    for (const over of [{ pending: {} }, { retiring: {} }, { publication: {} }, { state: "active" }, { state: "retiring" }, { state: "sealed" }]) {
+      assert.deepEqual(await classify({ peekSlot: (async () => slot(over)) as never }), active("authority_slot"), JSON.stringify(Object.keys(over)));
+    }
+  });
+
+  it("authority: a malformed slot and a read error keep as unknown; a missing accessor keeps", async () => {
+    retire();
+    assert.deepEqual(await classify({ peekSlot: (async () => slot({ pending: undefined })) as never }), unknown("authority_slot"));
+    assert.deepEqual(await classify({ peekSlot: (async () => ({ state: 7 })) as never }), unknown("authority_slot"));
+    assert.deepEqual(await classify({ peekSlot: async () => { throw new Error("unauthenticated store"); } }), unknown("authority_slot"));
+    assert.deepEqual(await classify({ peekSlot: undefined }), unknown("authority_slot"));
+  });
+
+  it("authority: an ineligible slot never stands in for a present footprint (and is not even read)", async () => {
+    retire();
+    fs.mkdirSync(clonePath);
+    let reads = 0;
+    const peekSlot = (async () => { reads++; return slot(); }) as never;
+    assert.deepEqual(await classify({ peekSlot }), active("attempt_footprint"));
+    assert.equal(reads, 0);
+  });
+
+  it("a run with no ledger entry reads no authority slot", async () => {
+    let reads = 0;
+    assert.deepEqual(await classify({ peekSlot: (async () => { reads++; return null; }) as never }), ENDED);
+    assert.equal(reads, 0);
+  });
+});
+
+describe("custody and the retained groups", () => {
+  it("recovery and settlement records of the run are active; an empty directory and another run's are ended", async () => {
+    fs.mkdirSync(dataPath("recovery", RUN), { recursive: true });
+    assert.deepEqual(await classify(), ENDED, "an empty run directory holds nothing");
+    fs.mkdirSync(dataPath("recovery", OTHER));
+    fs.writeFileSync(dataPath("recovery", OTHER, "a.json"), "{}");
+    assert.deepEqual(await classify(), ENDED);
+    fs.writeFileSync(dataPath("recovery", RUN, "a.json"), "{}");
+    assert.deepEqual(await classify(), active("custody"));
+    fs.rmSync(dataPath("recovery", RUN), { recursive: true });
+    fs.mkdirSync(dataPath("recovery-settlement", RUN), { recursive: true });
+    fs.writeFileSync(dataPath("recovery-settlement", RUN, "a.json"), "{}");
+    assert.deepEqual(await classify(), active("custody"));
+  });
+
+  it("an unreadable custody store is held (fail closed, folded into active), not ended", async () => {
+    fs.writeFileSync(dataPath("recovery"), "a file where the store directory belongs");
+    assert.deepEqual(await classify(), active("custody"));
+  });
+
+  it("terminal protection reported by the configured callback is custody; a throwing callback is custody", async () => {
+    for (const protection of [async () => true, async () => { throw new Error("unreadable outbox"); }]) {
+      const guarded = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({ terminalRecordProtection: protection }));
+      assert.deepEqual(await guarded.classifyEpochScratchRunRetention(RUN, options()), active("custody"));
+    }
+    const clear = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({ terminalRecordProtection: async () => false }));
+    assert.deepEqual(await clear.classifyEpochScratchRunRetention(RUN, options()), ENDED);
+  });
+
+  it("the memoised census is shared across calls: a second run leaf does not rescan", async () => {
+    const discovery: NonNullable<EpochScratchRunRetentionOptions["discovery"]> = {};
+    let scans = 0;
+    const original = git.discoverEpochRetainedSources.bind(git);
+    git.discoverEpochRetainedSources = async o => { scans++; return original(o); };
+    assert.deepEqual(await classify({ discovery }), ENDED);
+    assert.deepEqual(await classify({ discovery }, OTHER), ENDED);
+    assert.equal(scans, 1);
+  });
+
+  it("an inventory that is incomplete or overflowing may hide the run's groups: unknown", async () => {
+    for (const census of [{ inventoryComplete: false, unreadable: 0, overflow: 0 }, { inventoryComplete: true, unreadable: 1, overflow: 0 },
+      { inventoryComplete: true, unreadable: 0, overflow: 2 }]) {
+      git.discoverEpochRetainedSources = async () => ({ groups: [], physicalPaths: 0, overflowExact: true, ...census });
+      assert.deepEqual(await classify(), unknown("retained_inventory"));
+    }
+  });
+
+  it("an inspection that is partial or returns the wrong number of results is unknown", async () => {
+    const group = { barePath: bare, selector: { runId: RUN, generation: 1 as const, attempt: attempt }, paths: [clonePath] };
+    git.discoverEpochRetainedSources = async () => ({ groups: [group], inventoryComplete: true, physicalPaths: 1, overflow: 0, overflowExact: true, unreadable: 0 });
+    git.inspectEpochRetainedGroups = async () => [];
+    assert.deepEqual(await classify(), unknown("retained_inventory"));
+    git.inspectEpochRetainedGroups = async () => [{ sources: [], partial: true, unreadable: 0, sampledAt: "" }];
+    assert.deepEqual(await classify(), unknown("retained_inventory"));
+    git.inspectEpochRetainedGroups = async () => [{ sources: [], partial: false, unreadable: 1, sampledAt: "" }];
+    assert.deepEqual(await classify(), unknown("retained_inventory"));
+    git.inspectEpochRetainedGroups = async () => [{ sources: [], partial: false, unreadable: 0, sampledAt: "" }];
+    assert.deepEqual(await classify(), ENDED, "a complete inspection with no source of the run has nothing left to keep");
+  });
+});
+
+describe("judgeRetainedEvidence: no disposition alone yields ended", () => {
+  const settled = (over: Partial<RetainedEvidenceShape> = {}): RetainedEvidenceShape => ({
+    kind: "attempt", ledgerState: "retired", presence: "missing", sources: [{ presence: "missing", live: false }],
+    epochSettlement: { basis: "strict_plain", disposition: { kind: "local_discard" } }, ...over });
+
+  it("only the verified settled shape is ended", () => {
+    assert.deepEqual(judgeRetainedEvidence(settled()), ENDED);
+  });
+  it("a bare local_discard disposition, on any other shape, is active", () => {
+    const local = { disposition: { kind: "local_discard" } };
+    assert.deepEqual(judgeRetainedEvidence(settled({ epochSettlement: undefined, ...local })), active("retained_source"));
+    assert.deepEqual(judgeRetainedEvidence(settled({ presence: "present", sources: [{ presence: "present", live: false }] })), active("attempt_footprint"));
+    assert.deepEqual(judgeRetainedEvidence(settled({ sources: [{ presence: "missing", live: false }, { presence: "present", live: false }] })), active("attempt_footprint"));
+    assert.deepEqual(judgeRetainedEvidence(settled({ sources: [{ presence: "missing", live: true }] })), active("attempt_footprint"));
+    assert.deepEqual(judgeRetainedEvidence(settled({ sources: [] })), active("attempt_footprint"));
+    assert.deepEqual(judgeRetainedEvidence(settled({ kind: "canonical" })), active("retained_source"));
+    assert.deepEqual(judgeRetainedEvidence(settled({ epochSettlement: { basis: "other", disposition: { kind: "local_discard" } } })), active("retained_source"));
+  });
+  it("protected, owner-hold, local-record and refused dispositions each name their keep", () => {
+    assert.deepEqual(judgeRetainedEvidence(settled({ epochSettlement: undefined, disposition: { kind: "local_protected_discard" } })), active("protected_source"));
+    assert.deepEqual(judgeRetainedEvidence(settled({ kind: "protected" })), active("protected_source"));
+    assert.deepEqual(judgeRetainedEvidence(settled({ epochSettlement: undefined, disposition: { kind: "owner_hold_discard" } })), active("owner_hold"));
+    assert.deepEqual(judgeRetainedEvidence(settled({ epochSettlement: undefined, disposition: { kind: "resolve_local_record" } })), active("local_record"));
+    assert.deepEqual(judgeRetainedEvidence(settled({ epochSettlement: undefined, disposition: { kind: "refused" } })), active("retained_refused"));
+  });
+  it("a non-retired ledger state keeps under its own name even when the strict basis says local_discard", () => {
+    for (const state of ["live", "abandoned", "reclaimed"]) {
+      assert.deepEqual(judgeRetainedEvidence(settled({ ledgerState: state })), active(`ledger_${state}`));
+    }
+  });
+});
+
+describe("judgeAuthoritySlot and normalizeRetention", () => {
+  it("an absent slot is ended; a malformed one is unknown", () => {
+    assert.deepEqual(judgeAuthoritySlot(null), ENDED);
+    assert.deepEqual(judgeAuthoritySlot("slot" as never), unknown("authority_slot"));
+    assert.deepEqual(judgeAuthoritySlot({ state: "ineligible", pending: null, retiring: null } as never), unknown("authority_slot"));
+  });
+  it("a classifier result that is not a fixed-token verdict never reads as ended", () => {
+    assert.deepEqual(normalizeRetention(undefined), unknown("classifier"));
+    assert.deepEqual(normalizeRetention({ state: "done" }), unknown("classifier"));
+    assert.deepEqual(normalizeRetention({ state: "active", source: "/data/runner/run-x" }), active("unspecified"));
+    assert.deepEqual(normalizeRetention({ state: "unknown" }), unknown("unspecified"));
+    assert.deepEqual(normalizeRetention({ state: "ended" }), ENDED);
+  });
+});
+
+describe("dataDir records", () => {
+  const records = (id = RUN, over: { maxDirectoryEntries?: number } = {}) =>
+    classifyRunDataDirRecords(fx.dataDir, id, { interrupt: () => undefined, maxDirectoryEntries: over.maxDirectoryEntries ?? 16384 });
+  const mkfile = (parts: string[], text = "{}") => { fs.mkdirSync(dataPath(...parts.slice(0, -1)), { recursive: true }); fs.writeFileSync(dataPath(...parts), text); };
+
+  it("a data dir with none of the run's records is ended (every store root absent is observed absent)", async () => {
+    assert.deepEqual(await records(), ENDED);
+  });
+
+  it("agent-home: the run's directory and its restore generations are active, another run's is ended", async () => {
+    fs.mkdirSync(dataPath("agent-home", OTHER), { recursive: true });
+    fs.mkdirSync(dataPath("agent-home", `${OTHER}.g2`));
+    assert.deepEqual(await records(), ENDED);
+    fs.mkdirSync(dataPath("agent-home", `${RUN}.g3`));
+    assert.deepEqual(await records(), active("run_home"));
+    fs.rmdirSync(dataPath("agent-home", `${RUN}.g3`));
+    fs.mkdirSync(dataPath("agent-home", RUN));
+    assert.deepEqual(await records(), active("run_home"));
+  });
+
+  it("agent-home: an unreadable listing and a listing over the cap are unknown", async () => {
+    fs.writeFileSync(dataPath("agent-home"), "a file");
+    assert.deepEqual(await records(), unknown("run_home"));
+    fs.rmSync(dataPath("agent-home"));
+    fs.mkdirSync(dataPath("agent-home", "a"), { recursive: true });
+    fs.mkdirSync(dataPath("agent-home", "b"));
+    assert.deepEqual(await records(RUN, { maxDirectoryEntries: 1 }), unknown("run_home"));
+  });
+
+  it("retained-homes marker: present is active, an unreadable store is unknown", async () => {
+    mkfile(["retained-homes", `${RUN}.json`]);
+    assert.deepEqual(await records(), active("retained_home"));
+    fs.rmSync(dataPath("retained-homes"), { recursive: true });
+    fs.writeFileSync(dataPath("retained-homes"), "a file where the store belongs");
+    assert.deepEqual(await records(), unknown("retained_home"));
+  });
+
+  it("credential-switch-ops: sending and ambiguous are active; settled and clean_route_absent are ended; absent is ended", async () => {
+    const file = ["credential-switch-ops", `${RUN}.json`];
+    assert.deepEqual(await records(), ENDED);
+    for (const [states, expected] of [[["settled", "clean_route_absent"], ENDED], [["settled", "sending"], active("credential_switch")],
+      [["ambiguous"], active("credential_switch")]] as const) {
+      mkfile(file, JSON.stringify({ ops: Object.fromEntries(states.map((state, i) => [`op${i}`, { generation: 1, state }])) }));
+      assert.deepEqual(await records(), expected, states.join("+"));
+    }
+  });
+
+  it("credential-switch-ops: malformed, oversized, symlinked and unreadable files are unknown", async () => {
+    const file = ["credential-switch-ops", `${RUN}.json`];
+    for (const text of ["{nope", JSON.stringify({ ops: [] }), JSON.stringify({ ops: { a: { generation: 1, state: "weird" } } }), JSON.stringify({ nothing: 1 })]) {
+      mkfile(file, text);
+      assert.deepEqual(await records(), unknown("credential_switch"), text.slice(0, 20));
+    }
+    mkfile(file, "x".repeat(1024 * 1024 + 1));
+    assert.deepEqual(await records(), unknown("credential_switch"));
+    fs.rmSync(dataPath(...file));
+    fs.symlinkSync(dataPath("elsewhere.json"), dataPath(...file));
+    assert.deepEqual(await records(), unknown("credential_switch"));
+    fs.rmSync(dataPath(...file));
+    fs.mkdirSync(dataPath(...file));
+    assert.deepEqual(await records(), unknown("credential_switch"));
+  });
+
+  it("runner-quarantine: an entry with the run's holding prefix is active; other entries are ended; bad roots and over-cap listings are unknown", async () => {
+    fs.mkdirSync(dataPath("runner-quarantine", `${OTHER}-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee`), { recursive: true });
+    assert.deepEqual(await records(), ENDED);
+    fs.mkdirSync(dataPath("runner-quarantine", `${RUN}-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee`));
+    assert.deepEqual(await records(), active("runner_quarantine"));
+    fs.rmSync(dataPath("runner-quarantine"), { recursive: true });
+    fs.writeFileSync(dataPath("runner-quarantine"), "a file");
+    assert.deepEqual(await records(), unknown("runner_quarantine"));
+    fs.rmSync(dataPath("runner-quarantine"));
+    fs.symlinkSync(dataPath("agent-home"), dataPath("runner-quarantine"));
+    assert.deepEqual(await records(), unknown("runner_quarantine"));
+    fs.rmSync(dataPath("runner-quarantine"));
+    fs.mkdirSync(dataPath("runner-quarantine"));
+    for (let i = 0; i < 4097; i++) fs.writeFileSync(dataPath("runner-quarantine", `entry-${i}`), "");
+    assert.deepEqual(await records(), unknown("runner_quarantine"));
+  });
+
+  it("terminal-preservation and recovery-archive: the run's entry is active; an unreadable parent is unknown", async () => {
+    fs.mkdirSync(dataPath("terminal-preservation", OTHER), { recursive: true });
+    fs.mkdirSync(dataPath("recovery-archive", OTHER), { recursive: true });
+    assert.deepEqual(await records(), ENDED);
+    fs.mkdirSync(dataPath("terminal-preservation", RUN));
+    assert.deepEqual(await records(), active("terminal_preservation"));
+    fs.rmdirSync(dataPath("terminal-preservation", RUN));
+    fs.mkdirSync(dataPath("recovery-archive", RUN));
+    assert.deepEqual(await records(), active("quarantine_archive"), "its contract has no ended predicate: presence alone keeps");
+    fs.rmSync(dataPath("recovery-archive"), { recursive: true });
+    fs.writeFileSync(dataPath("recovery-archive"), "a file");
+    assert.deepEqual(await records(), unknown("quarantine_archive"));
+  });
+
+  it("recovery-maintenance: a cycle of the run that is not exhausted is active; exhausted and other runs' are ended", async () => {
+    const cycle = (run: string, exhausted: boolean) => ({ identity: { run }, exhausted });
+    const write = (cycles: unknown[]) => {
+      mkfile(["recovery-maintenance", "complete.json"], JSON.stringify({ version: 1, cycles }));
+      mkfile(["recovery-maintenance", "initialized.json"], JSON.stringify({ version: 1 }));
+    };
+    write([cycle(OTHER, false), cycle(RUN, true)]);
+    assert.deepEqual(await records(), ENDED);
+    write([cycle(OTHER, false), cycle(RUN.toUpperCase(), false)]);
+    assert.deepEqual(await records(), active("recovery_maintenance"));
+  });
+
+  it("recovery-maintenance: malformed, half-written and unreadable state is unknown", async () => {
+    mkfile(["recovery-maintenance", "complete.json"], "{nope");
+    mkfile(["recovery-maintenance", "initialized.json"], "{}");
+    assert.deepEqual(await records(), unknown("recovery_maintenance"));
+    mkfile(["recovery-maintenance", "complete.json"], JSON.stringify({ cycles: [{ identity: {}, exhausted: true }] }));
+    assert.deepEqual(await records(), unknown("recovery_maintenance"));
+    mkfile(["recovery-maintenance", "complete.json"], JSON.stringify({ cycles: [] }));
+    fs.rmSync(dataPath("recovery-maintenance", "initialized.json"));
+    assert.deepEqual(await records(), unknown("recovery_maintenance"), "the pair is written together: one without the other is not 'absent'");
+    mkfile(["recovery-maintenance", "initialized.json"], "{bad");
+    assert.deepEqual(await records(), unknown("recovery_maintenance"));
+  });
+
+  it("classifyCredentialSwitchText and classifyMaintenanceTable are pure", () => {
+    assert.deepEqual(classifyCredentialSwitchText(JSON.stringify({ ops: {} })), ENDED);
+    assert.deepEqual(classifyMaintenanceTable(JSON.stringify({ cycles: [] }), RUN), ENDED);
+  });
+
+  it("the git classifier reads the same records (integration through the bare scan)", async () => {
+    fs.mkdirSync(dataPath("agent-home", RUN), { recursive: true });
+    assert.deepEqual(await classify(), active("run_home"));
+  });
+});
+
+describe("a real retired attempt (driven through the production retire code)", () => {
+  it("is ended once retired with a missing footprint, and active again if the footprint reappears", async () => {
+    const real = formatAttemptId(new Date("2026-02-01T00:00:00Z"), 1, "0000000000000009");
+    const clone = await git.runnerCloneForBranch(bare, BRANCH, "issue-4420", noProofReseed, RUN, false, undefined,
+      { attemptId: real, isLive: () => false, beforeSeed: async () => {} });
+    await git.markRecoveryCapture(bare, clone.path, BRANCH, RUN, real);
+    assert.deepEqual(await classify(), active("recovery_journal"), "a journaled attempt is custody before its ledger is even read");
+    await git.retireRunnerClone(bare, clone.path, BRANCH, RUN, { discard: true, attemptId: real });
+    assert.equal(gitIn(["config", "--local", `uzi-recovery.${BRANCH}.clone`]), "");
+    assert.deepEqual(await classify(), ENDED);
+    fs.mkdirSync(clone.path);
+    assert.deepEqual(await classify(), active("attempt_footprint"));
+  });
+});

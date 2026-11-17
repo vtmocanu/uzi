@@ -143,8 +143,15 @@ export function buildPodEpochScratchDeps(parts: {
   git: PodEpochScratchDeps["git"];
   dockerHost: string | undefined;
   activation?: boolean;
+  /** Issue #4420: the read-only authority slot accessor and the (already initialised) outbox, for `run-<uuid>` leaves. */
+  authority?: PodEpochScratchDeps["authority"];
+  outbox?: PodEpochScratchDeps["outbox"];
 }): PodEpochScratchDeps {
-  return { activation: parts.activation === true, git: parts.git, quiesce: () => terminalMaintenanceProof(3, parts.dockerHost) };
+  return {
+    activation: parts.activation === true, git: parts.git, quiesce: () => terminalMaintenanceProof(3, parts.dockerHost),
+    ...(parts.authority ? { authority: parts.authority } : {}),
+    ...(parts.outbox ? { outbox: parts.outbox } : {}),
+  };
 }
 
 /** Only the stub lane may accelerate retry spacing. No predicates or pass cap change. */
@@ -1277,7 +1284,10 @@ async function mainBody(): Promise<void> {
       bootstrap: epochBootstrap, ownership: epochOwnership, consumption: epochConsumption,
       dockerHost: config.dockerWiring.dockerHost, git, client, signal: controller.signal, log,
       deletion: buildPodEpochDeletionDeps({ authority, runner, git, dockerHost: config.dockerWiring.dockerHost, activation: epochReclaimDeletion }),
-      scratch: buildPodEpochScratchDeps({ git, dockerHost: config.dockerWiring.dockerHost, activation: epochScratchDeletion }),
+      scratch: buildPodEpochScratchDeps({
+        git, dockerHost: config.dockerWiring.dockerHost, activation: epochScratchDeletion,
+        authority: { peekSlot: clonePath => authority.peekSlot(clonePath) }, outbox,
+      }),
     });
     if (result !== undefined) log.info("pod_epoch_reclaim", { ...result });
   }

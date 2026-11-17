@@ -13,12 +13,17 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { runPodEpochShadow, PodEpochSettlementError } from "../src/pod-epoch-reclaim.js";
 import { PodEpochDaemonError, type PodEpochDaemonGuard } from "../src/pod-epoch-daemon.js";
-import { GitCache, type EpochScratchDiscardInput, type RetainedSourceEvidence } from "../src/git.js";
+import { GitCache, type EpochScratchDiscardInput, type RetainedSourceEvidence, type RetainedInspectResult } from "../src/git.js";
 import { censusScratchRoot } from "../src/rmtree.js";
 import { scanScratchProcesses, type Settlement } from "../src/pod-epoch-scratch.js";
 import { WORKER_UID } from "../src/runner-uid.js";
 import { buildPodEpochScratchDeps } from "../src/main.js";
-import { nullLogger } from "./helpers.js";
+import { nullLogger, noProofReseed, testGitCacheOptions } from "./helpers.js";
+import { makeFixture, type Fixture } from "./fixture-repo.js";
+import { formatAttemptId } from "../src/attempt-path.js";
+import { Outbox } from "../src/outbox.js";
+import { WorkerClient } from "../src/client.js";
+import { execFileSync } from "node:child_process";
 import { ENABLE_DELETION_FOR_TEST, ENABLE_SCRATCH_FOR_TEST, perGroupInspect } from "./pod-epoch-reclaim-support.js";
 import type { PodEpochOwnership } from "../src/pod-epoch-lock.js";
 
@@ -283,7 +288,8 @@ test("baseline: only admitted leaves are removed; protected, bound, held, helper
     assert.equal(s.state, "ran"); assert.equal(s.reason, "complete"); assert.equal(s.layout, "split");
     assert.equal(s.examined, 8);
     assert.deepEqual(s.kept, { protected_name: 1, not_directory: 1, name_refused: 0, active_helper: 1, foreign_owner: 0, mount: 0,
-      incomplete: 0, current_pod: 0, protected_record: 1, bind_referenced: 1, held_open: 1, cap: 0, changed: 0 });
+      incomplete: 0, current_pod: 0, protected_record: 1, bind_referenced: 1, held_open: 1, cap: 0, changed: 0,
+      run_active: 0, run_retained: 0, run_unknown: 0, run_unreadable: 0, run_local_active: 0, run_local_unknown: 0 });
     assert.equal(s.eligible, 2); assert.equal(s.deleted, 2); assert.equal(s.residue, 0); assert.equal(s.helper_failed, 0);
     assert.ok(s.eligible_allocated_bytes_estimate > 0);
     assert.equal(s.deleted_allocated_bytes_estimate, s.eligible_allocated_bytes_estimate);
@@ -329,7 +335,8 @@ test("kept with a fixed reason: an open descriptor, a mount, an active quiesce h
       dirEntry("fresh", 4, { ctime: future }), dirEntry("old", 5)]);
     const result = await run(w);
     assert.deepEqual(result.scratch.kept, { protected_name: 0, not_directory: 0, name_refused: 0, active_helper: 1, foreign_owner: 0,
-      mount: 1, incomplete: 0, current_pod: 1, protected_record: 0, bind_referenced: 0, held_open: 1, cap: 0, changed: 0 });
+      mount: 1, incomplete: 0, current_pod: 1, protected_record: 0, bind_referenced: 0, held_open: 1, cap: 0, changed: 0,
+      run_active: 0, run_retained: 0, run_unknown: 0, run_unreadable: 0, run_local_active: 0, run_local_unknown: 0 });
     assert.deepEqual(w.calls.discards, ["old"]);
   });
 });
@@ -349,7 +356,8 @@ test("single-UID layout: one pass over a mixed root deletes only the safe orphan
     assert.equal(s.state, "ran"); assert.equal(s.layout, "single");
     assert.equal(s.examined, 6); assert.equal(s.eligible, 1); assert.equal(s.deleted, 1); assert.equal(s.residue, 0);
     assert.deepEqual(s.kept, { protected_name: 2, not_directory: 0, name_refused: 0, active_helper: 1, foreign_owner: 0, mount: 0,
-      incomplete: 0, current_pod: 1, protected_record: 0, bind_referenced: 1, held_open: 0, cap: 0, changed: 0 });
+      incomplete: 0, current_pod: 1, protected_record: 0, bind_referenced: 1, held_open: 0, cap: 0, changed: 0,
+      run_active: 0, run_retained: 0, run_unknown: 0, run_unreadable: 0, run_local_active: 0, run_local_unknown: 0 });
     assert.deepEqual(w.calls.discards, ["orphan"]);
     await untouched(w, ["cur", "dind", "uzi-quiesce-1", "uzi-runner", "uzi-worker"]);
   });
@@ -1230,4 +1238,302 @@ test("#4143: a partial or deferred pass never touches a .retire-<uuid> parent", 
       await untouched(w, ["ok-1", RETIRE_PARENT]);
     });
   }
+});
+
+// ---- Issue #4420 m2: per-run `run-<uuid>` TMPDIR leaves --------------------------------------------------------
+// The leaf is deleted only when the server says the run is terminal with zero holds AND every local source of the run
+// has positively ended. These cases drive the whole pass: the scratch phase is the real one, the leaf census and the
+// delete are the real ones, the run's local state lives in a real GitCache over a real bare repository, and the
+// server is a stub. Where a case needs a retained-group shape that the earlier sources would otherwise pre-empt, the
+// group inspection (and only that) is stubbed; each such case says so.
+
+const RUN_A = "0a0a0a0a-1111-4222-8333-444444444444";
+const RUN_B = "0b0b0b0b-1111-4222-8333-444444444444";
+const RUN_BRANCH = "agent/issue-4420";
+const GIT_ENV = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null", GIT_TERMINAL_PROMPT: "0" };
+const leafOf = (id: string) => `run-${id}`;
+const FD_ONLY = { skip: HAS_PROC_FD ? false : "no fd directory under the process pseudo-filesystem on this host: the pinned walk refuses here by design" };
+
+interface RunWorld {
+  fx: Fixture; git: GitCache; bare: string; outboxRoot: string; outbox: Outbox;
+  status: Map<string, string | Error>;
+  holds: (runId: string) => Awaited<ReturnType<Options["client"]["listRecoveryHolds"]>>;
+  peek: (clonePath: string) => Promise<unknown>;
+  calls: string[];
+  classified: string[];
+  dataPath: (...parts: string[]) => string;
+  gitIn: (args: string[]) => string;
+}
+
+/** Wires a real GitCache (and a real, initialised Outbox) into the world's scratch deps and server stub. */
+async function attachRunWorld(w: World): Promise<RunWorld> {
+  const fx = makeFixture();
+  const git = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
+  const bare = await git.ensureClone(fx.originPath);
+  fs.chmodSync(join(bare, ".."), 0o700); fs.chmodSync(bare, 0o700);
+  const outboxRoot = join(fx.dataDir, "outbox");
+  const outbox = new Outbox({ root: outboxRoot, log: nullLogger(), runMaxBytes: 1e6, maxBytes: 4e6, retentionMs: 86_400_000 });
+  await outbox.init();
+  const rw: RunWorld = {
+    fx, git, bare, outboxRoot, outbox, status: new Map(), calls: [], classified: [],
+    holds: run_id => ({ run_id, holds: [], run_open_holds: { run_id, count: 0 } }),
+    peek: async () => null,
+    dataPath: (...parts) => join(fx.dataDir, ...parts),
+    gitIn: args => execFileSync("git", ["-C", bare, ...args], { env: GIT_ENV, encoding: "utf8" }).trim(),
+  };
+  w.options.client = {
+    getRunOwnership: async runId => {
+      rw.calls.push("ownership"); const s = rw.status.get(runId) ?? "completed";
+      if (s instanceof Error) throw s;
+      return { status: s };
+    },
+    listRecoveryHolds: async runId => { rw.calls.push("holds"); return rw.holds(runId); },
+  };
+  const scratch = w.options.scratch!;
+  scratch.git = { ...scratch.git, classifyEpochScratchRunRetention: (id, o) => { rw.classified.push(id); return git.classifyEpochScratchRunRetention(id, o); } };
+  scratch.authority = { peekSlot: clonePath => rw.peek(clonePath) as never };
+  scratch.outbox = outbox;
+  const prior = w.cleanup;
+  w.cleanup = async () => { fx.cleanup(); await prior(); };
+  return rw;
+}
+
+async function withRunWorld(leaves: string[], body: (w: World, rw: RunWorld) => Promise<void>): Promise<void> {
+  await withWorld(leaves, async w => { await body(w, await attachRunWorld(w)); });
+}
+
+/** The real production path to a settled retired attempt: seed a clone, journal it, retire it with discard. */
+async function seedRetiredAttempt(rw: RunWorld, runId: string, retire = true): Promise<string> {
+  const attempt = formatAttemptId(new Date("2026-02-01T00:00:00Z"), 1, "000000000000000a");
+  const clone = await rw.git.runnerCloneForBranch(rw.bare, RUN_BRANCH, "issue-4420", noProofReseed, runId, false, undefined,
+    { attemptId: attempt, isLive: () => false, beforeSeed: async () => {} });
+  await rw.git.markRecoveryCapture(rw.bare, clone.path, RUN_BRANCH, runId, attempt);
+  if (retire) await rw.git.retireRunnerClone(rw.bare, clone.path, RUN_BRANCH, runId, { discard: true, attemptId: attempt });
+  return clone.path;
+}
+
+const keptRun = (r: Awaited<ReturnType<typeof run>>) => Object.fromEntries(Object.entries(r.scratch.kept).filter(([k, v]) => k.startsWith("run_") && v > 0));
+
+test("#4420 reclaimed: a terminal zero-hold run with normal settled metadata (retired ledger, missing footprint, cleared journal, idle outbox) has its leaf deleted; a plain leaf follows today's rules", FD_ONLY, async () => {
+  await withRunWorld([leafOf(RUN_A), "plain"], async (w, rw) => {
+    const clonePath = await seedRetiredAttempt(rw, RUN_A);
+    // The facts this fixture rests on, read back from the state the production retire left behind.
+    assert.equal(JSON.parse(rw.gitIn(["config", "--get-all", `uzi-attempts.${RUN_BRANCH}.entry`]).split("\n").at(-1)!).state, "retired");
+    assert.equal(rw.gitIn(["config", "--local", `uzi-recovery.${RUN_BRANCH}.clone`]), "");
+    assert.equal(fs.existsSync(clonePath), false);
+    assert.equal(await rw.outbox.hasPhysicalTerminalProtection(RUN_A), false);
+    const result = await run(w);
+    assert.equal(result.scratch.state, "ran");
+    assert.deepEqual(keptRun(result), {});
+    assert.deepEqual(result.scratch.run_local_sources, {});
+    assert.deepEqual([...w.calls.discards].sort(), [leafOf(RUN_A), "plain"].sort());
+    assert.equal(result.scratch.deleted, 2);
+    await untouched(w, []);
+    assert.deepEqual(rw.calls, ["ownership", "holds"], "one lifecycle read then one holds read, for the run leaf only");
+    assert.deepEqual(rw.classified, [RUN_A]);
+  });
+});
+
+test("#4420 kept run_local_active: the run's recovery record, a journal naming the clone, a live ledger, outbox protection and an in-flight credential switch", FD_ONLY, async () => {
+  const cases: Array<[string, string, (rw: RunWorld) => Promise<void>]> = [
+    ["custody", "recovery/<runId> record", async rw => {
+      fs.mkdirSync(rw.dataPath("recovery", RUN_A), { recursive: true }); fs.writeFileSync(rw.dataPath("recovery", RUN_A, "r.json"), "{}");
+    }],
+    ["recovery_journal", "a journal still naming the clone (named_by_journal)", async rw => { await seedRetiredAttempt(rw, RUN_A, false); }],
+    ["ledger_live", "a live ledger entry", async rw => {
+      const attempt = formatAttemptId(new Date("2026-02-02T00:00:00Z"), 1, "000000000000000b");
+      rw.gitIn(["config", "--local", "--add", `uzi-attempts.${RUN_BRANCH}.entry`,
+        JSON.stringify({ attemptId: attempt, runId: RUN_A, clonePath: rw.dataPath("runner", "slug", `issue-4420.attempt-${attempt}`), state: "live" })]);
+    }],
+    ["outbox", "a terminal journal file in the run's outbox directory", async rw => {
+      fs.mkdirSync(join(rw.outboxRoot, RUN_A), { recursive: true, mode: 0o700 }); fs.writeFileSync(join(rw.outboxRoot, RUN_A, "terminal-1.json"), "{}");
+    }],
+    ["outbox", "a publication record in the run's outbox directory", async rw => {
+      fs.mkdirSync(join(rw.outboxRoot, RUN_A), { recursive: true, mode: 0o700 }); fs.writeFileSync(join(rw.outboxRoot, RUN_A, "publication-1.json"), "{}");
+    }],
+    ["credential_switch", "a credential-switch op still `sending`", async rw => {
+      fs.mkdirSync(rw.dataPath("credential-switch-ops"), { recursive: true });
+      fs.writeFileSync(rw.dataPath("credential-switch-ops", `${RUN_A}.json`), JSON.stringify({ ops: { op: { generation: 1, state: "sending" } } }));
+    }],
+  ];
+  for (const [source, label, arrange] of cases) {
+    await withRunWorld([leafOf(RUN_A)], async (w, rw) => {
+      await arrange(rw);
+      const result = await run(w);
+      assert.deepEqual(keptRun(result), { run_local_active: 1 }, label);
+      assert.deepEqual(result.scratch.run_local_sources, { [source]: 1 }, label);
+      assert.deepEqual(w.calls.discards, [], label);
+      await untouched(w, [leafOf(RUN_A)]);
+    });
+  }
+});
+
+test("#4420 kept via the retained-group evidence (group inspection stubbed, everything else real): owner hold, local record, protected source, ordinary local_discard with a present footprint, refused", FD_ONLY, async () => {
+  const evidence = (over: Partial<RetainedSourceEvidence>): RetainedSourceEvidence => ({
+    barePath: "", runId: RUN_A, branch: RUN_BRANCH, key: "issue-4420", kind: "attempt", generation: 1, attempt: "a", ledgerState: "retired",
+    journalState: "none", markerState: "none", presence: "missing", descriptor: "d", allocatedBytes: 0, bytesState: "measured",
+    sources: [{ clonePath: "/x", attempt: "a", generation: 1, presence: "missing", ledgerState: "retired", live: false, allocatedBytes: 0 }],
+    consumers: [], localRecords: [], holds: { state: "read", ids: [] }, disposition: undefined, ...over });
+  const present = (ledgerState: "retired" | "reclaimed") =>
+    [{ clonePath: "/x", attempt: "a", generation: 1, presence: "present" as const, ledgerState, live: false, allocatedBytes: 1 }];
+  const cases: Array<[string, RetainedSourceEvidence]> = [
+    ["owner_hold", evidence({ disposition: { kind: "owner_hold_discard", holdIds: ["h"] } })],
+    ["local_record", evidence({ disposition: { kind: "resolve_local_record", records: [] } })],
+    ["protected_source", evidence({ kind: "protected", disposition: { kind: "local_protected_discard" }, presence: "present", sources: present("retired") })],
+    ["attempt_footprint", evidence({ presence: "present", disposition: { kind: "local_discard" }, sources: present("retired") })],
+    ["retained_refused", evidence({ disposition: { kind: "refused", consumers: ["named_by_journal:active"] } })],
+  ];
+  for (const [source, ev] of cases) {
+    await withRunWorld([leafOf(RUN_A), "plain"], async (w, rw) => {
+      const group = { barePath: rw.bare, selector: { runId: RUN_A, generation: 1 as const, attempt: "a" }, paths: ["/x"] };
+      rw.git.discoverEpochRetainedSources = async () => ({ groups: [group], inventoryComplete: true, physicalPaths: 1, overflow: 0, overflowExact: true, unreadable: 0 });
+      rw.git.inspectEpochRetainedGroups = async () => [{ sources: [ev], partial: false, unreadable: 0, sampledAt: "" } satisfies RetainedInspectResult];
+      const result = await run(w);
+      assert.deepEqual(keptRun(result), { run_local_active: 1 }, source);
+      assert.deepEqual(result.scratch.run_local_sources, { [source]: 1 }, source);
+      assert.deepEqual(w.calls.discards, ["plain"], source);
+      await untouched(w, [leafOf(RUN_A)]);
+    });
+  }
+});
+
+test("#4420 a local retained source whose recorded path is outside TMPDIR still keeps the leaf", FD_ONLY, async () => {
+  await withRunWorld([leafOf(RUN_A)], async (w, rw) => {
+    // The footprint lives under the data dir's runner tree, nowhere near the scratch root; retention is by run, not path.
+    const clonePath = await seedRetiredAttempt(rw, RUN_A);
+    fs.mkdirSync(clonePath);
+    assert.ok(!clonePath.startsWith(w.root));
+    const result = await run(w);
+    assert.deepEqual(keptRun(result), { run_local_active: 1 });
+    assert.deepEqual(result.scratch.run_local_sources, { attempt_footprint: 1 });
+    await untouched(w, [leafOf(RUN_A)]);
+  });
+});
+
+test("#4420 an unreadable local store is run_local_unknown for run leaves while a plain leaf in the same pass is deleted as before", FD_ONLY, async () => {
+  await withRunWorld([leafOf(RUN_A), leafOf(RUN_B), "plain"], async (w, rw) => {
+    fs.writeFileSync(rw.dataPath("repos", "stray.git"), "a file where a bare repository belongs");
+    const result = await run(w);
+    assert.deepEqual(keptRun(result), { run_local_unknown: 2 });
+    assert.deepEqual(result.scratch.run_local_sources, { classifier: 2 });
+    assert.deepEqual(w.calls.discards, ["plain"]);
+    assert.equal(result.scratch.deleted, 1);
+    await untouched(w, [leafOf(RUN_A), leafOf(RUN_B)]);
+  });
+});
+
+test("#4420 an outbox that is missing, disabled or throwing keeps the leaf as run_local_unknown(outbox); an outbox with a record of the run keeps it active", FD_ONLY, async () => {
+  const stub = (over: Record<string, unknown>) => ({
+    isDisabled: () => false, unusableRootReason: () => undefined, hasPhysicalTerminalProtection: async () => false,
+    listPendingFinalizes: () => [], listPublicationRecords: () => [], depthFor: () => undefined, uncleanRuns: () => [], ...over }) as never;
+  const unknownCases: Array<[string, unknown]> = [
+    ["no outbox dependency", undefined],
+    ["disabled", stub({ isDisabled: () => true })],
+    ["unusable root", stub({ unusableRootReason: () => "symlink" })],
+    ["a listing that throws", stub({ listPendingFinalizes: () => { throw new Error("boom"); } })],
+  ];
+  for (const [label, outbox] of unknownCases) {
+    await withRunWorld([leafOf(RUN_A)], async (w, _rw) => {
+      if (outbox === undefined) delete w.options.scratch!.outbox; else w.options.scratch!.outbox = outbox as never;
+      const result = await run(w);
+      assert.deepEqual(keptRun(result), { run_local_unknown: 1 }, label);
+      assert.deepEqual(result.scratch.run_local_sources, { outbox: 1 }, label);
+      await untouched(w, [leafOf(RUN_A)]);
+    });
+  }
+  const depth = (pendingMessages: number, pendingTerminal: number) =>
+    (id: string) => id === RUN_A ? { runId: id, pendingMessages, pendingTerminal, staleRetired: 0, since: 0 } : undefined;
+  const activeCases: Array<[string, unknown]> = [
+    ["a pending finalize (case-insensitive)", stub({ listPendingFinalizes: () => [{ run_id: RUN_A.toUpperCase(), claim_generation: 1 }] })],
+    ["a publication record", stub({ listPublicationRecords: () => [{ run_id: RUN_A, claim_generation: 1 }] })],
+    ["pending messages", stub({ depthFor: depth(2, 0) })],
+    ["a pending terminal", stub({ depthFor: depth(0, 1) })],
+    ["a spill-unclean flag", stub({ uncleanRuns: () => [RUN_A] })],
+  ];
+  for (const [label, outbox] of activeCases) {
+    await withRunWorld([leafOf(RUN_A)], async (w, _rw) => {
+      w.options.scratch!.outbox = outbox as never;
+      const result = await run(w);
+      assert.deepEqual(keptRun(result), { run_local_active: 1 }, label);
+      assert.deepEqual(result.scratch.run_local_sources, { outbox: 1 }, label);
+    });
+  }
+  // A tracked run whose manifest holds nothing pending is not a keep.
+  await withRunWorld([leafOf(RUN_A)], async (w, _rw) => {
+    w.options.scratch!.outbox = stub({ depthFor: depth(0, 0) });
+    await run(w);
+    assert.deepEqual(w.calls.discards, [leafOf(RUN_A)]);
+  });
+});
+
+test("#4420 server lifecycle: a non-terminal status keeps run_active without any local read", FD_ONLY, async () => {
+  for (const status of ["running", "paused", "awaiting_input", "queued"]) {
+    await withRunWorld([leafOf(RUN_A), "plain"], async (w, rw) => {
+      rw.status.set(RUN_A, status);
+      const result = await run(w);
+      assert.deepEqual(keptRun(result), { run_active: 1 }, status);
+      assert.deepEqual(rw.calls, ["ownership"], "no holds read for a run that has not ended");
+      assert.deepEqual(rw.classified, []);
+      assert.deepEqual(w.calls.discards, ["plain"]);
+      await untouched(w, [leafOf(RUN_A)]);
+    });
+  }
+});
+
+test("#4420 server lifecycle: an exact ownership 404 is run_unknown; any other failure or malformed answer is run_unreadable", FD_ONLY, async () => {
+  const answers: Array<[string, () => Response, string]> = [
+    ["exact 404", () => new Response(JSON.stringify({ error: "run not found for this worker" }), { status: 404 }), "run_unknown"],
+    ["404 with another body", () => new Response(JSON.stringify({ error: "not found" }), { status: 404 }), "run_unreadable"],
+    ["500", () => new Response("boom", { status: 500 }), "run_unreadable"],
+    ["malformed body", () => new Response(JSON.stringify({ nope: true })), "run_unreadable"],
+  ];
+  for (const [label, answer, reason] of answers) {
+    await withRunWorld([leafOf(RUN_A), "plain"], async (w, rw) => {
+      w.options.client = new WorkerClient("http://example.invalid", "inert", "test", nullLogger(), {
+        fetch: async url => {
+          const p = new URL(String(url)).pathname;
+          if (p.endsWith("/ownership")) return answer();
+          const run_id = p.split("/").at(-2)!;
+          return new Response(JSON.stringify({ run_id, holds: [], run_open_holds: { run_id, count: 0 } }));
+        },
+      });
+      const result = await run(w);
+      assert.deepEqual(keptRun(result), { [reason]: 1 }, label);
+      assert.deepEqual(rw.classified, [], label);
+      assert.deepEqual(w.calls.discards, ["plain"], label);
+      await untouched(w, [leafOf(RUN_A)]);
+    });
+  }
+});
+
+test("#4420 server holds: an open hold, a run-wide open count, a missing run_open_holds and a failed read each keep the leaf", FD_ONLY, async () => {
+  const cases: Array<[string, RunWorld["holds"], string]> = [
+    ["a hold on this worker", run_id => ({ run_id, holds: [{ hold_id: "h", generation: 1 } as never], run_open_holds: { run_id, count: 1 } }), "run_retained"],
+    ["a run-wide open count with no local hold", run_id => ({ run_id, holds: [], run_open_holds: { run_id, count: 2 } }), "run_retained"],
+    ["no run_open_holds (unknown, never zero)", run_id => ({ run_id, holds: [] }), "run_unreadable"],
+    ["run_open_holds for another run", run_id => ({ run_id, holds: [], run_open_holds: { run_id: "other", count: 0 } }), "run_unreadable"],
+    ["a response for another run", () => ({ run_id: "other", holds: [], run_open_holds: { run_id: "other", count: 0 } }), "run_unreadable"],
+    ["a read that throws", () => { throw new Error("holds unreachable"); }, "run_unreadable"],
+  ];
+  for (const [label, holds, reason] of cases) {
+    await withRunWorld([leafOf(RUN_A)], async (w, rw) => {
+      rw.holds = holds;
+      const result = await run(w);
+      assert.deepEqual(keptRun(result), { [reason]: 1 }, label);
+      assert.deepEqual(rw.classified, [], label);
+      assert.deepEqual(w.calls.discards, [], label);
+      await untouched(w, [leafOf(RUN_A)]);
+    });
+  }
+});
+
+test("#4420 an aborted pass is not swallowed as a keep: an abort during the lifecycle read stops the phase", FD_ONLY, async () => {
+  // "zplain" sorts after the run leaf, so the abort lands before any leaf is deleted.
+  await withRunWorld([leafOf(RUN_A), "zplain"], async (w, rw) => {
+    w.options.client.getRunOwnership = async () => { rw.calls.push("ownership"); w.parent.abort(); throw new Error("aborted mid-read"); };
+    const result = (await runPodEpochShadow(w.options))!;
+    assert.equal(result.scratch.state, "stopped");
+    assert.deepEqual(w.calls.discards, []);
+    await untouched(w, [leafOf(RUN_A), "zplain"]);
+  });
 });
