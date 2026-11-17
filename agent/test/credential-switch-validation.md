@@ -912,10 +912,15 @@ full-suite, security or m3/m4 completion evidence.
   `00465_repo_initial_import.sql`. Afterwards `find … -name '.renum*'` was
   empty and `git status --porcelain --ignored` on the migrations directory
   showed only the two renames.
-- Postflight references reviewed by migration identity:
-  `ARCHITECTURE.md:143` names main's `00465` (repo initial import) and stays
-  unchanged; proof-ledger line 1208 names this branch's former `00465`.
+- Postflight references reviewed by migration identity: the ARCHITECTURE.md
+  repo-initial-import paragraph names main's `00465` and stays unchanged; the
+  proof ledger's "00465 Codex snapshot additions" names this branch's former
+  `00465`.
+- Owner decisions 11 and 12 are owner answers given at the #4202 successor
+  plan gate on 2026-11-17 and are recorded in the approved plan.
 - Earlier ledger prose (this file and the proof ledger) that says 464/465/466
-  is evidence recorded at the time: read the Codex snapshot as 466 and the
+  is evidence recorded at the time, including present-tense wording such as
+  "new in migration 466", "fixture database to version 464" and "Up migration
+  triggers through 466": read the Codex snapshot as 466 and the
   pending target as 467 from this point. The migration LiveDB test now
   downgrades to 465 and asserts that main's 464 and 465 columns survive.

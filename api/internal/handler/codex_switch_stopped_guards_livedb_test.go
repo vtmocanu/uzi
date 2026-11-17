@@ -108,7 +108,7 @@ func setupCodexSwitchAccountRoute(t *testing.T, seedPending, subscriptionA bool)
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer tx.Rollback(ctx)
+		defer func() { _ = tx.Rollback(ctx) }()
 		var revision int64
 		if err := tx.QueryRow(ctx, `SELECT material_revision FROM codex_credential_state
  WHERE user_secret_id=$1 AND user_id=$2`, target, e.user).Scan(&revision); err != nil {
