@@ -771,7 +771,7 @@ func (t probeTx) Commit(ctx context.Context) error {
 		`INSERT INTO hib_commit_probe VALUES (1)`,
 		`INSERT INTO hib_commit_probe VALUES (1)`,
 	} {
-		if _, err := t.Tx.Exec(ctx, sql); err != nil {
+		if _, err := t.Exec(ctx, sql); err != nil {
 			return err
 		}
 	}
