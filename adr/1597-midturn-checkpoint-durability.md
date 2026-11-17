@@ -144,7 +144,9 @@ allowance expires (its owned timer fired while the caller's signal did not), the
 classified `timeout` from that state, not from the error's shape.
 
 The replay factory captures the original source, candidate, literal floor and optional
-`defaultBlobSha`, including its absence. These remain immutable for the logical
+`defaultBlobSha`, and the confirmed-tip `confirmedBlobSha` (see
+[the #4439 amendment](#amendment--4439-omit-blobs-reachable-from-the-confirmed-checkpoint-tip)),
+including their absence. These remain immutable for the logical
 publish. It opens a fresh stream without resolving branch tips, rebuilding overlays,
 acquiring credentials or widening ranges. A captured default ref advancing, being
 rewritten or being deleted does not re-resolve the captured object on replay; loss of
@@ -419,6 +421,47 @@ differences still refuse as `ci_config_guard`. No trees outside the original wal
 are newly promised: missing-floor-tree strictness in the existing guard is inherited.
 The existing scan and pack budgets, HTTP protocol, broker fetch depth and inflation
 limits remain unchanged.
+
+### Amendment — #4439: omit blobs reachable from the confirmed checkpoint tip
+
+Long runs that keep rewriting large files re-sent the same blobs in every checkpoint pack
+and could hit `pack_too_large`. The selective producer may now also omit blobs reachable
+from C, the server-confirmed checkpoint ref tip (`flight.lastCheckpointRefTip`; sources are
+the 2xx ACK, the guard restore and the claim seed `checkpoint_tip`). The runner passes it as
+`confirmedBlobTip` to the pack call and requests `captureConfirmedBlob: true` from the
+scan-and-pin. Commits and trees are selected exactly as before, from `candidate ^floor`;
+C confers blob-only omission authority.
+
+Eligibility is decided once per logical publish, on the final overlay or chain candidate,
+and only inside the existing selective gate (a captured server default, not a zero-range
+envelope). C must be defined, differ from the candidate and the floor, resolve as a commit
+and be an ancestor of the candidate (`confirmedBlobFloor` in `checkpointPackCaptured`). Any
+non-abort failure means not eligible, which yields today's bytes; a boundary abort
+propagates. When eligible, the blob walk is
+`candidate ^floor ^C ^default ^default^{tree}`; otherwise it is exactly the #3171 walk
+`candidate ^floor ^default`. `^default^{tree}` is added only with an eligible C, to omit
+default-tip blobs when the default is not an edge parent. Git excludes C's own tree only
+while C is an edge, so the omission is a subset of C's blobs, not exact.
+
+A pinned range carries `confirmedBlobSha` (`CheckpointRange`) only when the checkpoint
+scan-and-pin requests it; a malformed value is refused. Remediation scans, frozen-held and
+terminal ranges never carry it, and `terminal-range.ts` deliberately does not persist it.
+Replay uses the captured eligibility result (or its absence) and re-verifies only that C
+still resolves; otherwise it refuses with `ScratchPublicationError`. There is no
+rebuild-without-C path. A run without server default-name authority (the legacy producer)
+gets no relief.
+
+Broker checks keep the same inputs: the pack and scan budgets, the step-5 commit-only
+`strictDescends`, the `forwardPack` CAS bound to the fetched checkpoint tip, and the CI
+config guard's tree-hash comparison. The secret scan revisions
+(`secretScanCheckpointRange`: `tipSha`, `excludeSha`, `scanFloorShas`) are unchanged;
+omission only removes objects from the pack.
+
+Accepted boundary: origin's receive-pack needs the omitted blobs present. They are
+reachable from C under the checkpoint ref. If that ref is deleted or moved below C and
+origin garbage-collects them, the push is rejected and the existing publish-failure path
+applies. C only advances on an ACK, so this repeats until the ref is restored. There is no
+automatic fallback to a full pack; this is the issue's accepted race.
 
 ### Per-flight sink gate and preemption
 

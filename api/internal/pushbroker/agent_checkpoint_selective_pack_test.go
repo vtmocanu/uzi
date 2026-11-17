@@ -101,6 +101,10 @@ type selectiveSummary struct {
 	Calls                        []string            `json:"calls"`
 	Settled                      bool                `json:"settled"`
 	Artifacts                    []selectiveArtifact `json:"artifacts"`
+	ConfirmedTip                 string              `json:"confirmedTip"`
+	CapturedConfirmed            string              `json:"capturedConfirmed"`
+	ConfirmedHistoryBlobs        []string            `json:"confirmedHistoryBlobs"`
+	ConfirmedClosureBlobs        []string            `json:"confirmedClosureBlobs"`
 }
 
 func selectiveBridgeFixture(t *testing.T, parent context.Context, mode string) (*gitFixture, selectiveSummary) {
@@ -196,7 +200,8 @@ func TestAgentCheckpointSelectivePackBridge(t *testing.T) {
 		"MirrorHeadsOnly", "ConflictingOriginHEAD", "ReplayAdvance", "ReplayRewrite", "ReplayDelete",
 		"FrozenHeld", "ProtectedDifference", "UnprotectedDifference", "ExpiredParent", "CancelledParent",
 		"PreparationAbort", "PreparationDeadline", "CapExpiredParent", "LiveCapFallback",
-		"ReplayDeadline", "ReplayAbort", "ReplayCapExpired", "ReplayCapLive"}
+		"ReplayDeadline", "ReplayAbort", "ReplayCapExpired", "ReplayCapLive",
+		"ConfirmedLargeHistory", "ConfirmedNotAncestor", "ConfirmedReplay"}
 	t.Run("OutputBounds", testCheckpointBridgeOutputBounds)
 	for _, mode := range modes {
 		t.Run(mode, func(t *testing.T) {
@@ -215,7 +220,24 @@ func TestAgentCheckpointSelectivePackBridge(t *testing.T) {
 			if len(s.Artifacts) < 2 {
 				t.Fatal("missing production pack")
 			}
-			legacy, selected := s.Artifacts[0], s.Artifacts[1]
+			byName := func(name string) (selectiveArtifact, bool) {
+				for _, a := range s.Artifacts {
+					if a.Name == name {
+						return a, true
+					}
+				}
+				return selectiveArtifact{}, false
+			}
+			legacy, ok := byName("legacy")
+			if !ok {
+				t.Fatal("missing legacy artifact")
+			}
+			selected, ok := byName("selective")
+			if !ok {
+				selected = s.Artifacts[1] // FrozenHeld names its production artifact "held".
+			}
+			confirmedMode := mode == "ConfirmedLargeHistory" || mode == "ConfirmedReplay"
+			isReplay := strings.HasPrefix(mode, "Replay") || mode == "ConfirmedReplay"
 			if !s.HistoricalBlobAbsentDepthOne {
 				t.Fatal("historical omitted blob must be absent from depth-one bases and present at origin")
 			}
@@ -235,6 +257,19 @@ func TestAgentCheckpointSelectivePackBridge(t *testing.T) {
 			eligible := s.EligibleDefaultBlobs
 			if legacyMode {
 				eligible = nil
+			}
+			if confirmedMode {
+				// Omission is allowed for the default closure and the confirmed tip's closure.
+				eligible = append(append([]string{}, eligible...), s.ConfirmedClosureBlobs...)
+			}
+			if strings.HasPrefix(mode, "Confirmed") && (s.ConfirmedTip == "" || s.CapturedConfirmed != s.ConfirmedTip) {
+				t.Fatalf("captured confirmed=%s want=%s", s.CapturedConfirmed, s.ConfirmedTip)
+			}
+			if mode == "ConfirmedNotAncestor" {
+				noc, ok := byName("selective-noc")
+				if !ok || !equalCheckpointInventory(noc.Inventory, selected.Inventory) {
+					t.Fatal("ineligible confirmed tip changed the selective inventory")
+				}
 			}
 			assertCheckpointInventory(t, legacy.Inventory, selected.Inventory, eligible)
 			selectedSet, legacySet := make(map[string]bool), make(map[string]bool)
@@ -307,6 +342,55 @@ func TestAgentCheckpointSelectivePackBridge(t *testing.T) {
 				}
 				if f.originRef("refs/uzi-checkpoints/"+s.Branch) != "" {
 					t.Fatal("legacy refusal created ref")
+				}
+			}
+			if mode == "ConfirmedLargeHistory" {
+				ref := "refs/uzi-checkpoints/" + s.Branch
+				if got := f.originRef(ref); got != s.ConfirmedTip {
+					t.Fatalf("prior confirmed checkpoint=%s want=%s", got, s.ConfirmedTip)
+				}
+				noc, ok := byName("selective-noc")
+				if !ok {
+					t.Fatal("missing selective-noc artifact")
+				}
+				if len(s.ConfirmedHistoryBlobs) != 6 {
+					t.Fatalf("confirmed history blobs=%d", len(s.ConfirmedHistoryBlobs))
+				}
+				// Without C the refusal exists: both the legacy and today's selection exceed the budget.
+				for _, a := range []selectiveArtifact{legacy, noc} {
+					if a.Reconstructed <= 128<<20 {
+						t.Fatalf("%s did not exceed cumulative budget: %d", a.Name, a.Reconstructed)
+					}
+					if err := publish(a); !errors.Is(err, pushbroker.ErrPackTooLarge) {
+						t.Fatalf("%s Publish=%v; want ErrPackTooLarge", a.Name, err)
+					}
+					if got := f.originRef(ref); got != s.ConfirmedTip {
+						t.Fatalf("%s refusal moved checkpoint ref to %s", a.Name, got)
+					}
+				}
+				// Large C-history blobs are retained without C and omitted with it.
+				for _, oid := range append([]string{s.HistoricalBlob}, s.ConfirmedHistoryBlobs...) {
+					if !has(legacy, oid, "blob") || has(selected, oid, "blob") {
+						t.Fatalf("blob %s must be in legacy and omitted from selective", oid)
+					}
+				}
+				for _, oid := range s.ConfirmedHistoryBlobs {
+					if !has(noc, oid, "blob") {
+						t.Fatalf("selective-noc lacks C-history blob %s", oid)
+					}
+				}
+			}
+			if mode == "ConfirmedReplay" {
+				if len(s.ConfirmedHistoryBlobs) == 0 {
+					t.Fatal("no confirmed history blobs")
+				}
+				for _, oid := range s.ConfirmedHistoryBlobs {
+					if !has(legacy, oid, "blob") || has(selected, oid, "blob") {
+						t.Fatalf("confirmed history blob %s must be omitted from selective", oid)
+					}
+				}
+				if got := f.originRef("refs/uzi-checkpoints/" + s.Branch); got != s.ConfirmedTip {
+					t.Fatalf("prior confirmed checkpoint=%s want=%s", got, s.ConfirmedTip)
 				}
 			}
 			if mode == "LargeRunOnly" {
@@ -396,8 +480,11 @@ func TestAgentCheckpointSelectivePackBridge(t *testing.T) {
 					t.Fatalf("held ref=%s want=%s", got, s.Tip)
 				}
 			}
-			if strings.HasPrefix(mode, "Replay") {
+			if isReplay {
 				wantArtifacts := 3
+				if mode == "ConfirmedReplay" {
+					wantArtifacts = 4 // legacy, selective-noc, selective, replay
+				}
 				if mode == "ReplayDeadline" || mode == "ReplayAbort" || mode == "ReplayCapExpired" {
 					wantArtifacts = 2
 				}
@@ -405,12 +492,12 @@ func TestAgentCheckpointSelectivePackBridge(t *testing.T) {
 					t.Fatalf("replay artifacts=%d want=%d", len(s.Artifacts), wantArtifacts)
 				}
 			}
-			if strings.HasPrefix(mode, "Replay") && len(s.Artifacts) == 3 {
-				assertCheckpointInventory(t, legacy.Inventory, s.Artifacts[2].Inventory, eligible)
-				if !equalCheckpointInventory(selected.Inventory, s.Artifacts[2].Inventory) {
+			if replay, ok := byName("replay"); isReplay && ok {
+				assertCheckpointInventory(t, legacy.Inventory, replay.Inventory, eligible)
+				if !equalCheckpointInventory(selected.Inventory, replay.Inventory) {
 					t.Fatal("replay inventory drift")
 				}
-				if err := publish(s.Artifacts[2]); err != nil {
+				if err := publish(replay); err != nil {
 					t.Fatalf("replay Publish: %v", err)
 				}
 				if f.originRef("refs/uzi-checkpoints/"+s.Branch) != s.Tip {
