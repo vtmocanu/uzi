@@ -294,8 +294,11 @@ api:
     # `ephemeral_workers_enabled` turned on (PUT /settings) AND the per-user
     # opt-in. These env knobs only TUNE an already-enabled feature; leave them
     # unset to use config.go's defaults. Uncomment to override.
+    # The per-user cap is an admin setting (ephemeral_max_per_user, Admin -> Workers);
+    # an env value pins it and locks the admin field.
     # UZI_EPHEMERAL_MAX_PER_USER: "2"          # per-user concurrent-ephemeral cap
-    # Provision size is chart-owned: use workers.ephemeralDefaultSize below.
+    # Provision size and lease are admin settings too; to pin them from the chart use
+    # workers.ephemeralDefaultSize / workers.ephemeralLease below (env locks the field).
     # UZI_EPHEMERAL_PROVISION_DEADLINE: 10m    # GC deadline for never-booted / idle-stolen workers
     # UZI_EPHEMERAL_SATURATION_DELAY: 90s     # debounce before bursting on a saturated (all capable workers full) fleet
     # Job files and product skill sets (PRD #1909). Unset => config.go's defaults
@@ -887,8 +890,8 @@ workers:
   # "WorkerData" for exactly that reason.
   #
   # It REPLACES the size preset's DataSize for a run-bound worker, on both tiers: the
-  # worker's CPU/memory still follow its preset (the api's UZI_EPHEMERAL_DEFAULT_SIZE
-  # unless the run asks for one), but /data does not, because a run-bound worker holds
+  # worker's CPU/memory still follow its preset (the default size, an admin setting or
+  # the api's UZI_EPHEMERAL_DEFAULT_SIZE when pinned, unless the run asks for one), but /data does not, because a run-bound worker holds
   # one clone for one run and its disk need tracks the repository, not the size. So an
   # ephemeral `s` worker gets MORE than its preset's /data (5Gi → 40Gi) and an
   # ephemeral `m` or `l` worker gets 40Gi, replacing its 25Gi or 50Gi preset.
@@ -921,18 +924,26 @@ workers:
   # The lease ends early on a cordon, roll or restart, and the oldest leased worker is
   # evicted if the per-user ephemeral cap is hit. "0" DISABLES it (torn down at the run's
   # end, as before). Maximum 2h: a larger value or a malformed duration refuses to boot
-  # the api. Unset or null renders the 2h default.
+  # the api.
   #
-  # This is a DIRECT env entry on the api Deployment, so it OVERRIDES a UZI_EPHEMERAL_LEASE
-  # set through api.config (envFrom): set it here, not there.
-  ephemeralLease: "2h"
+  # Unset (null) by default: the admin setting Admin -> Workers supplies the default (2h)
+  # and is editable without a restart. Setting it here pins it through the api's
+  # UZI_EPHEMERAL_LEASE env, and the admin field then shows it as set by the environment
+  # (locked). An explicit "0" is rendered (it is not treated as unset). Set it only here:
+  # the same key in api.config or api.secretEnv fails the render.
+  ephemeralLease: ~
   # Issue #2412: a run-bound worker needs one run's memory headroom, not a
   # persistent L worker's two-run budget. M reserves 8Gi instead of 14Gi while
   # both presets request 1 CPU and can burst to 4 CPU. Valid values: s, m, l, l-highmem; invalid values fail
   # chart rendering. Existing workers keep their stored size; persistent workers
-  # still preselect L. Set the size only here: the same key in api.config or
+  # still preselect L.
+  #
+  # Unset (null) by default: the admin setting Admin -> Workers supplies the default (m)
+  # and is editable without a restart. Setting it here pins it through the api's
+  # UZI_EPHEMERAL_DEFAULT_SIZE env, and the admin field then shows it as set by the
+  # environment (locked). Set the size only here: the same key in api.config or
   # api.secretEnv fails the render.
-  ephemeralDefaultSize: m
+  ephemeralDefaultSize: ~
   # Where the hosted worker's join-token Secret (worker_token + ca.crt) mounts (issue
   # #1761). Empty keeps the default /run/secrets, and then nothing about the worker pod
   # changes. OpenShift/OKD MUST set it (the render fails otherwise when

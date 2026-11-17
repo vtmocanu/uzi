@@ -3,11 +3,20 @@
 {{- include "uzi.validateSecretMountPath" . }}
 {{- if .Values.api.enabled }}
 {{- $ephemeralDefaultSize := .Values.workers.ephemeralDefaultSize }}
-{{- if not (has $ephemeralDefaultSize (list "s" "m" "l" "l-highmem")) }}
+{{- $ephemeralSizeSet := not (or (kindIs "invalid" $ephemeralDefaultSize) (eq (toString $ephemeralDefaultSize) "")) }}
+{{- $ephemeralLease := .Values.workers.ephemeralLease }}
+{{- $ephemeralLeaseSet := not (or (kindIs "invalid" $ephemeralLease) (eq (toString $ephemeralLease) "")) }}
+{{- if and $ephemeralSizeSet (not (has $ephemeralDefaultSize (list "s" "m" "l" "l-highmem"))) }}
 {{- fail "workers.ephemeralDefaultSize must be one of s, m, l, l-highmem" }}
 {{- end }}
 {{- if hasKey (.Values.api.secretEnv | default dict) "UZI_EPHEMERAL_DEFAULT_SIZE" }}
 {{- fail "Set UZI_EPHEMERAL_DEFAULT_SIZE through workers.ephemeralDefaultSize, not api.secretEnv" }}
+{{- end }}
+{{- if hasKey (.Values.api.secretEnv | default dict) "UZI_EPHEMERAL_LEASE" }}
+{{- fail "Set UZI_EPHEMERAL_LEASE through workers.ephemeralLease, not api.secretEnv (a duplicate env entry would conflict with the chart value)" }}
+{{- end }}
+{{- if hasKey (.Values.api.config | default dict) "UZI_EPHEMERAL_LEASE" }}
+{{- fail "Set UZI_EPHEMERAL_LEASE through workers.ephemeralLease, not api.config (an env value locks the admin setting; keep one source)" }}
 {{- end }}
 {{- if hasKey (.Values.api.secretEnv | default dict) "UZI_ADMIN_RUN_DEBUG" }}
 {{- fail "Set UZI_ADMIN_RUN_DEBUG through api.adminRunDebug.enabled, not api.secretEnv" }}
@@ -116,17 +125,21 @@ spec:
                   key: {{ $secretKey | quote }}
                   optional: true
             {{- end }}
-            # PRD #2006: how long an ephemeral worker is held idle after its run for a
-            # same-owner/repo/branch follow-up. Direct env, so it wins over api.config
-            # (envFrom). Null or unset renders the 2h default; any other value is quoted
-            # as a string so an explicit 0 (lease disabled) survives and is never read as
-            # unset. The api validates it (max 2h) and refuses to boot on a bad value.
-            {{- $ephemeralLease := .Values.workers.ephemeralLease }}
+            # Issue #4212: both ephemeral knobs are admin settings (Admin > Workers) and are
+            # rendered ONLY when the chart value is set; an env value pins the setting and
+            # locks the admin field. Unset (null or "") renders no entry.
+            {{- if $ephemeralSizeSet }}
             # Issue #2412: chart-owned size; api.config/api.secretEnv duplicates fail above.
             - name: UZI_EPHEMERAL_DEFAULT_SIZE
               value: {{ $ephemeralDefaultSize | quote }}
+            {{- end }}
+            {{- if $ephemeralLeaseSet }}
+            # PRD #2006: idle lease for an ephemeral worker after its run. Set values are
+            # quoted as strings so an explicit 0 (lease disabled) survives and is never read
+            # as unset. The api validates it (max 2h) and refuses to boot on a bad value.
             - name: UZI_EPHEMERAL_LEASE
-              value: {{ if kindIs "invalid" $ephemeralLease }}"2h"{{ else }}{{ toString $ephemeralLease | quote }}{{ end }}
+              value: {{ toString $ephemeralLease | quote }}
+            {{- end }}
             - name: WORKER_DOCKER_ENABLED
               value: {{ ternary "true" "false" (and (not (empty (include "uzi.apiHostingEnabled" .))) .Values.workers.docker.enabled) | quote }}
             {{- if include "uzi.apiHostingEnabled" . }}
