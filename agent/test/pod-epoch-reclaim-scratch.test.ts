@@ -14,9 +14,9 @@ import { fileURLToPath } from "node:url";
 import { runPodEpochShadow, PodEpochSettlementError, RUN_LEAF_READ_MAX_MS } from "../src/pod-epoch-reclaim.js";
 import { PodEpochDaemonError, type PodEpochDaemonGuard } from "../src/pod-epoch-daemon.js";
 import { GitCache, type EpochScratchDiscardInput, type RetainedSourceEvidence, type RetainedInspectResult } from "../src/git.js";
-import { censusScratchRoot } from "../src/rmtree.js";
+import { censusScratchRoot, runAgentHelper, SCRATCH_CENSUS_SCRIPT } from "../src/rmtree.js";
 import { scanScratchProcesses, type Settlement } from "../src/pod-epoch-scratch.js";
-import { WORKER_UID } from "../src/runner-uid.js";
+import { WORKER_UID, runnerCommand } from "../src/runner-uid.js";
 import { buildPodEpochScratchDeps } from "../src/main.js";
 import { nullLogger, noProofReseed, testGitCacheOptions } from "./helpers.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
@@ -1625,5 +1625,180 @@ test("#4420 an abort of the pass during a hung run-leaf read still propagates as
     assert.equal(rw.calls.filter(c => c === "ownership").length, 1, "no further run leaf is read after the abort");
     assert.deepEqual(keptRun(result), {});
     await untouched(w, [leafOf(RUN_A), leafOf(RUN_B)]);
+  });
+});
+
+// ---- Issue #4420 m3: admission, restart and cap coverage for run leaves, driven through the pass ---------------------
+// These cases use the fake-census world (no real git), so each leaf's census facts are explicit. The server stub counts
+// every read so "no server read" is an assertion, not an assumption.
+
+const RUN_C = "0c0c0c0c-1111-4222-8333-444444444444";
+const RUN_D = "0d0d0d0d-1111-4222-8333-444444444444";
+const RUN_E = "0e0e0e0e-1111-4222-8333-444444444444";
+
+function countingServer(w: World, status: (runId: string) => string = () => "completed", holdsOpen = 0) {
+  const seen = { ownership: [] as string[], holds: [] as string[] };
+  w.options.client = {
+    getRunOwnership: async runId => { seen.ownership.push(runId); return { status: status(runId) }; },
+    listRecoveryHolds: async runId => {
+      seen.holds.push(runId);
+      return { run_id: runId, holds: [], run_open_holds: { run_id: runId, count: holdsOpen } };
+    },
+  };
+  return seen;
+}
+
+test("#4420 every non-terminal status, parked ones included, keeps the run leaf run_active with no holds read", async () => {
+  const statuses = ["queued", "claimed", "running", "awaiting_approval", "awaiting_input", "awaiting_followup",
+    "limit_wait", "pool_wait", "paused", "recovery_wait"];
+  for (const status of statuses) {
+    await withWorld([leafOf(RUN_A), "plain"], async w => {
+      w.census = fakeCensus(() => [dirEntry(leafOf(RUN_A), 1), dirEntry("plain", 2)]);
+      w.discard = async () => removed();
+      const seen = countingServer(w, () => status);
+      const result = await run(w);
+      assert.equal(result.scratch.kept.run_active, 1, status);
+      assert.deepEqual(seen.ownership, [RUN_A], status);
+      assert.deepEqual(seen.holds, [], status);
+      assert.deepEqual(w.calls.discards, ["plain"], status);
+      await untouched(w, [leafOf(RUN_A), "plain"]);
+    });
+  }
+});
+
+test("#4420 restart: a previous-pod run leaf (older than the pod-entry fence) of a paused run, or of a terminal run with an open hold, survives", async () => {
+  const cases: Array<[string, string, number, "run_active" | "run_retained"]> = [
+    ["paused", "paused", 0, "run_active"],
+    ["recovery-retained (terminal, one open hold)", "failed", 1, "run_retained"],
+  ];
+  for (const [label, status, open, reason] of cases) {
+    await withWorld([leafOf(RUN_A), "plain"], async w => {
+      // ctime 1 against a fence far in the future: the leaf belongs to a previous pod, so current_pod does not shield it.
+      w.fence = () => ({ t0Ms: 1_000_000 });
+      w.census = fakeCensus(() => [dirEntry(leafOf(RUN_A), 1, { ctime: 1 }), dirEntry("plain", 2, { ctime: 1 })]);
+      w.discard = async () => removed();
+      countingServer(w, () => status, open);
+      const result = await run(w);
+      assert.equal(result.scratch.kept.current_pod, 0, label);
+      assert.equal(result.scratch.kept[reason], 1, label);
+      assert.deepEqual(w.calls.discards, ["plain"], label);
+      await untouched(w, [leafOf(RUN_A), "plain"]);
+    });
+  }
+});
+
+test("#4420 restart (real worker-local state): a previous-pod run leaf of a terminal run with a local recovery record survives", FD_ONLY, async () => {
+  await withRunWorld([leafOf(RUN_A), "plain"], async (w, rw) => {
+    fs.mkdirSync(rw.dataPath("recovery", RUN_A), { recursive: true }); fs.writeFileSync(rw.dataPath("recovery", RUN_A, "r.json"), "{}");
+    const result = await run(w);
+    assert.equal(result.scratch.kept.current_pod, 0);
+    assert.deepEqual(keptRun(result), { run_local_active: 1 });
+    assert.deepEqual(w.calls.discards, ["plain"]);
+    await untouched(w, [leafOf(RUN_A)]);
+  });
+});
+
+test("#4420 a run leaf that changed between the census and its re-census is kept changed without any server read", async () => {
+  await withWorld([leafOf(RUN_A), "plain"], async w => {
+    let bump = false;
+    const inner = fakeCensus(() => [dirEntry(leafOf(RUN_A), 1, bump ? { bytes: 8192 } : {}), dirEntry("plain", 2)]);
+    w.census = async (r, e, leaf, t) => { if (leaf === leafOf(RUN_A)) bump = true; return inner(r, e, leaf, t); };
+    w.discard = async () => removed();
+    const seen = countingServer(w);
+    const result = await run(w);
+    assert.equal(result.scratch.kept.changed, 1);
+    assert.deepEqual(seen, { ownership: [], holds: [] });
+    assert.deepEqual(w.calls.discards, ["plain"]);
+    await untouched(w, [leafOf(RUN_A), "plain"]);
+  });
+});
+
+test("#4420 a status change before the read is honoured: the first read of a leaf decides, and a later leaf sees the new state", async () => {
+  await withWorld([leafOf(RUN_A), leafOf(RUN_B)], async w => {
+    w.census = fakeCensus(() => [dirEntry(leafOf(RUN_A), 1), dirEntry(leafOf(RUN_B), 2)]);
+    w.discard = async () => removed();
+    let reads = 0;
+    const seen = countingServer(w, () => (++reads === 1 ? "running" : "completed"));
+    const result = await run(w);
+    assert.equal(seen.ownership.length, 2);
+    assert.equal(result.scratch.kept.run_active, 1, "the leaf read while the run was non-terminal is kept");
+    assert.equal(result.scratch.kept.run_local_unknown, 1, "the other is only unproven locally here (no classifier), never deleted on the server's word alone");
+    assert.deepEqual(w.calls.discards, []);
+  });
+});
+
+/** A server stub, a classifier and an outbox that all say the run has ended, so only the delete-time checks remain. */
+function endedRunWorld(w: World) {
+  const seen = countingServer(w);
+  w.options.scratch!.git = { ...w.options.scratch!.git, classifyEpochScratchRunRetention: async () => ({ state: "ended" }) } as never;
+  w.options.scratch!.outbox = {
+    isDisabled: () => false, unusableRootReason: () => undefined, hasPhysicalTerminalProtection: async () => false,
+    listPendingFinalizes: () => [], listPendingFinalizeGenerations: () => [], listPublicationRecords: () => [],
+    depthFor: (id: string) => ({ runId: id, pendingMessages: 0, pendingTerminal: 0, staleRetired: 0, since: 0 }), uncleanRuns: () => [],
+  } as never;
+  w.census = fakeCensus(() => [dirEntry(leafOf(RUN_A), 1)]);
+  w.discard = async () => removed();
+  return seen;
+}
+
+test("#4420 an ended run leaf is deleted, but a leaf that becomes held open after the run-leaf reads is kept by the existing check", async () => {
+  await withWorld([leafOf(RUN_A)], async w => {
+    const seen = endedRunWorld(w);
+    const result = await run(w);
+    assert.deepEqual(seen, { ownership: [RUN_A], holds: [RUN_A] });
+    assert.equal(result.scratch.deleted, 1); assert.deepEqual(w.calls.discards, [leafOf(RUN_A)]);
+  });
+  await withWorld([leafOf(RUN_A)], async w => {
+    const seen = endedRunWorld(w);
+    // Scan 1 is the pre-census probe, scan 2 the census-time scan, scan 3 the per-leaf scan after the run-leaf reads.
+    let scans = 0;
+    w.scan = () => ({ held: new Set(++scans >= 3 ? [leafOf(RUN_A)] : []) });
+    const result = await run(w);
+    assert.deepEqual(seen, { ownership: [RUN_A], holds: [RUN_A] });
+    assert.equal(result.scratch.kept.held_open, 1); assert.equal(result.scratch.deleted, 0);
+    assert.deepEqual(w.calls.discards, []);
+    await untouched(w, [leafOf(RUN_A)]);
+  });
+  await withWorld([leafOf(RUN_A)], async w => {
+    endedRunWorld(w);
+    let q = 0;
+    w.quiesce = async () => ++q < 2;
+    const result = await run(w);
+    assert.equal(result.scratch.state, "stopped"); assert.equal(result.scratch.reason, "not_idle");
+    assert.deepEqual(w.calls.discards, []);
+    await untouched(w, [leafOf(RUN_A)]);
+  });
+});
+
+test("#4420 a run leaf over the per-leaf census cap is incomplete and never reaches a server read", FD_ONLY, async () => {
+  await withWorld([leafOf(RUN_A), "plain"], async w => {
+    // makeWorld seeds <leaf>/sub/f.txt (two entries); drop the plain leaf's file so only the run leaf is over a cap of 1.
+    await rm(join(w.root, "plain", "sub", "f.txt"));
+    w.census = (root, expect, leaf, budget) => runAgentHelper(runnerCommand, SCRATCH_CENSUS_SCRIPT,
+      [root, expect, leaf ?? "-", "4096", "1", "2000000", "256", String(Math.max(0, Math.floor(budget) - 2000))], budget);
+    w.discard = async () => removed();
+    const seen = countingServer(w);
+    const result = await run(w);
+    assert.equal(result.scratch.kept.incomplete, 1);
+    assert.deepEqual(seen, { ownership: [], holds: [] });
+    assert.deepEqual(w.calls.discards, ["plain"]);
+    await untouched(w, [leafOf(RUN_A), "plain"]);
+  });
+});
+
+test("#4420 a symlink, mounted, foreign-owned or held-open run leaf is kept by the existing rules before any server read", async () => {
+  const link = leafOf(RUN_A), mounted = leafOf(RUN_B), foreign = leafOf(RUN_C), held = leafOf(RUN_D), foreignFs = leafOf(RUN_E);
+  await withWorld([link, mounted, foreign, held, foreignFs, "plain"], async w => {
+    w.mounts = () => ({ mountedLeaves: new Set([mounted]) });
+    w.scan = () => ({ held: new Set([held]) });
+    w.discard = async () => removed();
+    w.census = fakeCensus(() => [dirEntry(link, 1, { type: "other" }), dirEntry(mounted, 2), dirEntry(foreign, 3, { fuid: true }),
+      dirEntry(held, 4), dirEntry(foreignFs, 5, { fsdiff: true }), dirEntry("plain", 6)]);
+    const seen = countingServer(w);
+    const result = await run(w);
+    const k = result.scratch.kept;
+    assert.equal(k.not_directory, 1); assert.equal(k.mount, 2); assert.equal(k.foreign_owner, 1); assert.equal(k.held_open, 1);
+    assert.deepEqual(seen, { ownership: [], holds: [] }, "none of them is read from the server");
+    assert.deepEqual(w.calls.discards, ["plain"]);
   });
 });
