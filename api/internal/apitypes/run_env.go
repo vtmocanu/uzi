@@ -1,6 +1,10 @@
 package apitypes
 
-import "time"
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
 
 // Run environment variable states (PRD #4416). A live variable is enabled or
 // disabled; a secret some run holds a receipt for is kept as pending deletion.
@@ -14,6 +18,9 @@ const (
 // value appears in no response, ever: Value is null for it. For a plain variable Value
 // is null only while the vault is locked, and ValueWithheld says so.
 type RunEnvVarDTO struct {
+	// VarID identifies the variable across its versions; a name re-created after a
+	// delete gets a new one, so it keys rows that share a name.
+	VarID         uuid.UUID  `json:"var_id"`
 	Name          string     `json:"name"`
 	Secret        bool       `json:"secret"`
 	Description   string     `json:"description"`

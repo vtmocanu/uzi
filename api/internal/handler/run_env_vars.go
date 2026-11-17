@@ -9,11 +9,15 @@ package handler
 // the users-row fence, like every other secret writer (withSecretLock).
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
+	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -35,6 +39,9 @@ const (
 	runEnvCodeHistoryFull  = "env_history_full"
 	runEnvCodeChanged      = "env_changed"
 )
+
+// runEnvMaxBodyBytes caps a PUT body, the same 1 MiB as httpx.DecodeJSONLimited.
+const runEnvMaxBodyBytes = 1 << 20
 
 // errRunEnvChanged: the live row moved between the read that planned the write and the
 // locked re-read inside the transaction.
@@ -66,6 +73,17 @@ func runEnvMasterSealed(sealedWith string) bool { return sealedWith == store.Sea
 type runEnvConflictError struct{ code, message string }
 
 func (e *runEnvConflictError) Error() string { return e.code + ": " + e.message }
+
+// runEnvHeadroomConflict turns a failed vault headroom check into the 409 a run-env save
+// answers with. The vault's own message talks about enabling or disabling the vault, which
+// is not what the caller is doing; any other error is returned unchanged (a 500).
+func runEnvHeadroomConflict(code string, err error) error {
+	var limit *vault.ConversionLimitError
+	if !errors.As(err, &limit) {
+		return err
+	}
+	return &runEnvConflictError{code, fmt.Sprintf("saving this would bring your stored credentials and variables to %d records and %d bytes, over the vault's storage limit; disable or delete a variable, or remove a credential, first", limit.Rows, limit.Bytes)}
+}
 
 // runEnvRow is the shape every run_env_vars read returns, whichever generated query
 // produced it.
@@ -126,7 +144,7 @@ func (h *Handler) writeRunEnvTxError(w http.ResponseWriter, err error, op string
 		writeRunEnvConflict(w, conflict.code, conflict.message)
 	case errors.Is(err, errRunEnvRepoGone), errors.As(err, &pgErr) && pgErr.Code == "23503":
 		httpx.Error(w, http.StatusNotFound, "repo not found")
-	case errors.Is(err, errRunEnvChanged), errors.As(err, &pgErr) && pgErr.Code == "23505":
+	case errors.Is(err, errRunEnvChanged), errors.Is(err, pgx.ErrNoRows), errors.As(err, &pgErr) && pgErr.Code == "23505":
 		writeRunEnvConflict(w, runEnvCodeChanged, "the variable changed while you were saving; reload and try again")
 	default:
 		slog.Error(op, "error", err)
@@ -149,6 +167,7 @@ func runEnvState(r runEnvRow) string {
 // opened) withholds it and reports locked=true only for the locked case.
 func (h *Handler) runEnvDTO(userID, repoID uuid.UUID, row runEnvRow) (dto apitypes.RunEnvVarDTO, locked bool) {
 	dto = apitypes.RunEnvVarDTO{
+		VarID:       row.VarID,
 		Name:        row.Name,
 		Secret:      row.Secret,
 		Description: row.Description,
@@ -213,6 +232,11 @@ func (h *Handler) ListRepoEnvVars(w http.ResponseWriter, r *http.Request) {
 		Variables: make([]apitypes.RunEnvVarDTO, 0, len(rows)),
 		Counts:    apitypes.RunEnvCountsDTO{Limit: runenv.MaxVarsPerScope},
 	}
+	// Secret rows never open here, so a secret-only list cannot tell a locked vault from
+	// an unlocked one by its rows: ask the vault itself (fail-closed on a lookup error).
+	if h.vault != nil {
+		out.VaultLocked = h.vault.RequiresUnlock(r.Context(), userID)
+	}
 	for _, row := range rows {
 		dto, locked := h.runEnvDTO(userID, repoID, row)
 		out.VaultLocked = out.VaultLocked || locked
@@ -258,8 +282,21 @@ func (h *Handler) PutRepoEnvVar(w http.ResponseWriter, r *http.Request) {
 		writeRunEnvRule(w, err)
 		return
 	}
+	// encoding/json replaces invalid UTF-8 with U+FFFD, which would store a different
+	// value than the caller sent, so the raw body is checked before it is decoded.
+	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, runEnvMaxBodyBytes))
+	if err != nil {
+		httpx.RespondDecodeError(w, err, "invalid request body")
+		return
+	}
+	if !utf8.Valid(raw) {
+		httpx.Error(w, http.StatusBadRequest, "the request body is not valid UTF-8")
+		return
+	}
 	var req putRunEnvRequest
-	if err := httpx.DecodeJSONLimited(w, r, &req); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
 		httpx.RespondDecodeError(w, err, "invalid request body")
 		return
 	}
@@ -395,8 +432,8 @@ func (h *Handler) PutRepoEnvVar(w http.ResponseWriter, r *http.Request) {
 			if usage.ValueBytes+newBytes > runenv.MaxScopeValueBytes {
 				return &runEnvConflictError{runEnvCodeLimitReached, fmt.Sprintf("the variables of this repo may hold at most %d bytes of values", runenv.MaxScopeValueBytes)}
 			}
-			if err := vault.CheckMaterialHeadroom(totals, 1, int64(len(material.Ciphertext))); err != nil {
-				return &runEnvConflictError{runEnvCodeLimitReached, err.Error()}
+			if err := vault.CheckMaterialHeadroom(totals, 1, int64(len(material.Ciphertext)), int64(len(material.Ciphertext))); err != nil {
+				return runEnvHeadroomConflict(runEnvCodeLimitReached, err)
 			}
 			params.VarID, params.Rev = uuid.New(), 1
 		} else {
@@ -419,8 +456,8 @@ func (h *Handler) PutRepoEnvVar(w http.ResponseWriter, r *http.Request) {
 				if retired.RetiredCount+1 > runenv.MaxRetiredVersions || retired.ValueBytes+int64(live.ValueBytes) > runenv.MaxRetiredValueBytes {
 					return &runEnvConflictError{runEnvCodeHistoryFull, fmt.Sprintf("this change keeps the previous secret version for runs that still hold it, and the history budget is full (%d of %d versions, %d of %d bytes); disable or delete a variable instead", retired.RetiredCount, runenv.MaxRetiredVersions, retired.ValueBytes, runenv.MaxRetiredValueBytes)}
 				}
-				if err := vault.CheckMaterialHeadroom(totals, 1, int64(len(material.Ciphertext))); err != nil {
-					return &runEnvConflictError{runEnvCodeHistoryFull, err.Error()}
+				if err := vault.CheckMaterialHeadroom(totals, 1, int64(len(material.Ciphertext)), int64(len(material.Ciphertext))); err != nil {
+					return runEnvHeadroomConflict(runEnvCodeHistoryFull, err)
 				}
 				if n, err := q.RetireRunEnvVarVersion(ctx, store.RetireRunEnvVarVersionParams{ID: live.ID, UserID: userID}); err != nil || n != 1 {
 					if err == nil {
@@ -430,8 +467,8 @@ func (h *Handler) PutRepoEnvVar(w http.ResponseWriter, r *http.Request) {
 				}
 			} else {
 				// The old ciphertext is replaced, so only growth counts against the vault totals.
-				if err := vault.CheckMaterialHeadroom(totals, 0, int64(len(material.Ciphertext))-int64(len(live.Ciphertext))); err != nil {
-					return &runEnvConflictError{runEnvCodeHistoryFull, err.Error()}
+				if err := vault.CheckMaterialHeadroom(totals, 0, int64(len(material.Ciphertext))-int64(len(live.Ciphertext)), int64(len(material.Ciphertext))); err != nil {
+					return runEnvHeadroomConflict(runEnvCodeHistoryFull, err)
 				}
 				if n, err := q.DeleteRunEnvVarVersion(ctx, store.DeleteRunEnvVarVersionParams{ID: live.ID, UserID: userID}); err != nil || n != 1 {
 					if err == nil {

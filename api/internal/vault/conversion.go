@@ -45,13 +45,15 @@ func checkMaterialBudget(totals store.GetVaultMaterialTotalsRow) error {
 // bytes to the owner's measured vault material (totals) stays inside the conversion
 // budget, so a writer can refuse a save that would make a later vault enable or
 // disable fail. It returns a *ConversionLimitError on overflow. Run environment
-// variables count live, retired and pending-deletion rows alike (PRD #4416).
-func CheckMaterialHeadroom(totals store.GetVaultMaterialTotalsRow, addRows, addBytes int64) error {
+// variables count live, retired and pending-deletion rows alike (PRD #4416). addBytes is
+// the change in total ciphertext (negative when a row shrinks); rowBytes is the size of
+// the largest row being written, which the per-row batch limit applies to.
+func CheckMaterialHeadroom(totals store.GetVaultMaterialTotalsRow, addRows, addBytes, rowBytes int64) error {
 	next := totals
 	next.MaterialRows += addRows
 	next.CiphertextBytes += addBytes
-	if addBytes > next.MaxRowBytes {
-		next.MaxRowBytes = addBytes
+	if rowBytes > next.MaxRowBytes {
+		next.MaxRowBytes = rowBytes
 	}
 	return checkMaterialBudget(next)
 }
@@ -258,7 +260,16 @@ func (v *Vault) convertMaterial(ctx context.Context, q Store, userID uuid.UUID, 
 		}
 	}
 	if progress.rows != totals.MaterialRows || progress.bytes != totals.CiphertextBytes {
-		return fmt.Errorf("vault: material totals changed: %w", ErrInvalidState)
+		// A repo delete cascades its env rows without the secret-mutation lock, so an env
+		// row not yet locked can vanish after the first measurement. Every row is locked
+		// now, so one fresh read is the settled total: accept it only on an exact match.
+		fresh, err := q.GetVaultMaterialTotals(ctx, userID)
+		if err != nil {
+			return err
+		}
+		if progress.rows != fresh.MaterialRows || progress.bytes != fresh.CiphertextBytes {
+			return fmt.Errorf("vault: material totals changed: %w", ErrInvalidState)
+		}
 	}
 	return nil
 }

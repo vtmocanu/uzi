@@ -156,15 +156,114 @@ func TestEnvMaterialConversionRefusesMasterMarkedRow(t *testing.T) {
 
 func TestCheckMaterialHeadroomBoundary(t *testing.T) {
 	at := store.GetVaultMaterialTotalsRow{MaterialRows: maxMaterialRows - 1, CiphertextBytes: maxMaterialBytes - 100}
-	if err := CheckMaterialHeadroom(at, 1, 100); err != nil {
+	if err := CheckMaterialHeadroom(at, 1, 100, 100); err != nil {
 		t.Fatalf("exactly at the limit must pass: %v", err)
 	}
 	var limit *ConversionLimitError
-	if err := CheckMaterialHeadroom(at, 2, 100); !errors.As(err, &limit) {
+	if err := CheckMaterialHeadroom(at, 2, 100, 100); !errors.As(err, &limit) {
 		t.Fatalf("one row past the limit = %v", err)
 	}
-	if err := CheckMaterialHeadroom(at, 1, 101); !errors.As(err, &limit) {
+	if err := CheckMaterialHeadroom(at, 1, 101, 101); !errors.As(err, &limit) {
 		t.Fatalf("one byte past the limit = %v", err)
+	}
+}
+
+// The per-row batch limit applies to the size of the row written, not to the change in
+// total bytes: a replace that barely grows a row already over the limit is refused, and
+// a shrinking replace of a row inside the limit passes.
+func TestCheckMaterialHeadroomPerRowLimitUsesRowSize(t *testing.T) {
+	totals := store.GetVaultMaterialTotalsRow{MaterialRows: 5, CiphertextBytes: 3 * maxBatchBytes, MaxRowBytes: 10}
+	var limit *ConversionLimitError
+	if err := CheckMaterialHeadroom(totals, 0, 1, maxBatchBytes+1); !errors.As(err, &limit) {
+		t.Fatalf("a row above the batch limit with a +1 byte delta = %v; want a ConversionLimitError", err)
+	}
+	if err := CheckMaterialHeadroom(totals, 0, -50, 1000); err != nil {
+		t.Fatalf("a shrinking replace of an in-limit row = %v; want nil", err)
+	}
+}
+
+// A repo delete cascades its env rows without the secret-mutation lock, so a row counted
+// by the first measurement can be gone before its batch is locked. The conversion must
+// settle on the fresh total instead of failing.
+func TestEnvMaterialConversionToleratesConcurrentEnvDelete(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		run  func(*Vault, context.Context, uuid.UUID) error
+	}{
+		{"enable", func(v *Vault, ctx context.Context, uid uuid.UUID) error {
+			return v.Enable(ctx, uid, "current-login-password")
+		}},
+		{"disable", func(v *Vault, ctx context.Context, uid uuid.UUID) error {
+			return v.Disable(ctx, uid)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v, _, st := newTestVaultWithStore(t)
+			uid := uuid.New()
+			ctx := context.Background()
+			st.states[uid] = store.LockVaultAuthStateRow{VaultMode: store.VaultModeUnprotected, VaultEpoch: 2}
+			rows := seedEnv(t, v, st, uid, fixtureEnvRows())
+			if tc.name == "disable" {
+				if err := v.Enable(ctx, uid, "current-login-password"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			gone := rows[len(rows)-1].id // the delete lands before any env batch is locked
+			hs := &totalsHookStore{fakeVaultStore: st}
+			hs.after = func() {
+				st.mu.Lock()
+				defer st.mu.Unlock()
+				kept := st.envs[:0:0]
+				for _, e := range st.envs {
+					if e.id != gone {
+						kept = append(kept, e)
+					}
+				}
+				st.envs = kept
+			}
+			v.transact = st.transaction(hs)
+			if err := tc.run(v, ctx, uid); err != nil {
+				t.Fatalf("%s with an env row deleted mid-conversion = %v; want success", tc.name, err)
+			}
+			if envRowByID(st, gone) != nil {
+				t.Fatal("the deleted env row came back")
+			}
+			for _, r := range rows[:len(rows)-1] {
+				e := envRowByID(st, r.id)
+				if e == nil {
+					t.Fatalf("%s vanished", r.name)
+				}
+				wantMarker := store.SealedWithDEK
+				if tc.name == "disable" {
+					wantMarker = store.SealedWithMasterAAD
+				}
+				if e.sealedWith != wantMarker {
+					t.Fatalf("%s sealed_with = %s; want %s", r.name, e.sealedWith, wantMarker)
+				}
+			}
+		})
+	}
+}
+
+// A total that still differs from what the conversion visited after the fresh read is
+// not a repo delete: the conversion fails closed.
+func TestEnvMaterialConversionFailsWhenFreshTotalsStillDiffer(t *testing.T) {
+	v, _, st := newTestVaultWithStore(t)
+	uid := uuid.New()
+	st.states[uid] = store.LockVaultAuthStateRow{VaultMode: store.VaultModeUnprotected, VaultEpoch: 2}
+	seedEnv(t, v, st, uid, fixtureEnvRows())
+	hs := &totalsHookStore{fakeVaultStore: st, skewFresh: 1}
+	hs.after = func() {
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		st.envs = st.envs[:len(st.envs)-1] // a delete makes progress != first totals
+	}
+	v.transact = st.transaction(hs)
+	if err := v.Enable(context.Background(), uid, "current-login-password"); !errors.Is(err, ErrInvalidState) {
+		t.Fatalf("Enable with fresh totals above the visited rows = %v; want ErrInvalidState", err)
+	}
+	if got := st.state(uid); got.VaultMode != store.VaultModeUnprotected || got.VaultEpoch != 2 {
+		t.Fatalf("a refused conversion changed state: %+v", got)
 	}
 }
 

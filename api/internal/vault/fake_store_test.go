@@ -138,6 +138,30 @@ func (f *fakeVaultStore) GetVaultMaterialTotals(_ context.Context, id uuid.UUID)
 	return t, nil
 }
 
+// totalsHookStore wraps the fixture so a test can act between the conversion's first
+// measurement of the owner's material and the end of its env batches, which is where a
+// repo delete (cascading env rows without the secret-mutation lock) can land. after is
+// called once, right after the first GetVaultMaterialTotals; skewFresh, when set,
+// is added to the rows of every later measurement.
+type totalsHookStore struct {
+	*fakeVaultStore
+	after     func()
+	skewFresh int64
+	calls     int
+}
+
+func (s *totalsHookStore) GetVaultMaterialTotals(ctx context.Context, id uuid.UUID) (store.GetVaultMaterialTotalsRow, error) {
+	t, err := s.fakeVaultStore.GetVaultMaterialTotals(ctx, id)
+	s.calls++
+	if s.calls == 1 && s.after != nil {
+		s.after()
+	}
+	if s.calls > 1 {
+		t.MaterialRows += s.skewFresh
+	}
+	return t, err
+}
+
 // No account rows are seeded by this crypto fixture.
 func (f *fakeVaultStore) LockVaultAccountMaterialBatch(context.Context, store.LockVaultAccountMaterialBatchParams) ([]store.LockVaultAccountMaterialBatchRow, error) {
 	return nil, nil

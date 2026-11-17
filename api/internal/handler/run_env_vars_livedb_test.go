@@ -172,13 +172,29 @@ func TestRunEnvAuthDifferentialLiveDB(t *testing.T) {
 
 	// No credential at all, and a cookie without the CSRF header.
 	f.must(bearerReq(f.router, http.MethodGet, f.path(""), ""), http.StatusUnauthorized)
-	req := httptest.NewRequest(http.MethodPut, f.path("/NO_CSRF"), strings.NewReader(`{"value":"abcdefgh12345"}`))
-	req.AddCookie(&http.Cookie{Name: auth.AuthCookieName, Value: f.jwt}) //nolint:gosec // G124: test-only client cookie.
-	req.Header.Set("Content-Type", "application/json")
-	noCSRF := httptest.NewRecorder()
-	f.router.ServeHTTP(noCSRF, req)
-	if noCSRF.Code < 400 || f.rowCount("name='NO_CSRF'") != 0 {
-		t.Errorf("cookie PUT without CSRF = %d (rows %d)", noCSRF.Code, f.rowCount("name='NO_CSRF'"))
+	noCSRF := func(method, suffix, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, f.path(suffix), strings.NewReader(body))
+		req.AddCookie(&http.Cookie{Name: auth.AuthCookieName, Value: f.jwt}) //nolint:gosec // G124: test-only client cookie.
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		f.router.ServeHTTP(rec, req)
+		return rec
+	}
+	if rec := noCSRF(http.MethodPut, "/NO_CSRF", `{"value":"abcdefgh12345"}`); rec.Code < 400 || f.rowCount("name='NO_CSRF'") != 0 {
+		t.Errorf("cookie PUT without CSRF = %d (rows %d)", rec.Code, f.rowCount("name='NO_CSRF'"))
+	}
+	// The other cookie writers on an existing variable are refused too, and change nothing.
+	for _, c := range []struct{ method, suffix string }{
+		{http.MethodPost, "/PAYMENTS_SANDBOX_KEY/disable"},
+		{http.MethodPost, "/PAYMENTS_SANDBOX_KEY/enable"},
+		{http.MethodDelete, "/PAYMENTS_SANDBOX_KEY"},
+	} {
+		if rec := noCSRF(c.method, c.suffix, ""); rec.Code < 400 {
+			t.Errorf("cookie %s %s without CSRF = %d, want >= 400", c.method, c.suffix, rec.Code)
+		}
+	}
+	if got := f.rowCount("name='PAYMENTS_SANDBOX_KEY' AND disabled_at IS NULL AND pending_delete_at IS NULL"); got != 1 || f.rowCount("true") != 2 {
+		t.Fatalf("a CSRF-less write changed the variable: live rows %d, total %d", got, f.rowCount("true"))
 	}
 
 	// Owner only: another user's token sees a 404, not the list.
@@ -835,6 +851,63 @@ func TestRunEnvValueSaveKeepsConcurrentDescriptionLiveDB(t *testing.T) {
 	}
 }
 
+// A description-only save whose row is deleted between the planning read and the write
+// transaction is a conflict the caller can retry, not a 500.
+func TestRunEnvDescriptionSaveOfDeletedRowIs409LiveDB(t *testing.T) {
+	f := newEnvFixture(t)
+	f.put("API_BASE", jsonBody(map[string]any{"value": "first-value", "secret": false, "description": "old"}), http.StatusCreated)
+	f.h.secretBeginTx = func(ctx context.Context) (pgx.Tx, error) {
+		f.h.secretBeginTx = nil
+		cliMustExec(t, f.pool, `DELETE FROM run_env_vars WHERE repo_id=$1 AND name='API_BASE'`, f.repo)
+		return f.h.pool.BeginTx(ctx, pgx.TxOptions{})
+	}
+	rec := f.do(http.MethodPut, "/API_BASE", jsonBody(map[string]any{"description": "new"}))
+	f.must(rec, http.StatusConflict)
+	if envConflictCode(rec) != "env_changed" {
+		t.Fatalf("description save of a deleted row: %s", rec.Body.String())
+	}
+}
+
+// A body with raw bytes that are not UTF-8 is refused: encoding/json would otherwise
+// store U+FFFD in place of what the caller sent.
+func TestRunEnvPutRefusesInvalidUTF8LiveDB(t *testing.T) {
+	f := newEnvFixture(t)
+	rec := f.do(http.MethodPut, "/UTF_TEST", "{\"value\":\"abcd\xffefgh12345\",\"secret\":false}")
+	f.must(rec, http.StatusBadRequest)
+	if f.rowCount("name='UTF_TEST'") != 0 {
+		t.Fatal("an invalid-UTF-8 body wrote a row")
+	}
+	// Control: the same body with valid text is accepted.
+	f.put("UTF_TEST", "{\"value\":\"abcdéefgh12345\",\"secret\":false}", http.StatusCreated)
+}
+
+// vault_locked comes from the vault, so a list of secrets only (which never opens a
+// value) still tells a locked protected vault from an unlocked or unprotected one.
+func TestRunEnvListReportsLockedVaultForSecretOnlyLiveDB(t *testing.T) {
+	h, router, pool := cliVaultLiveDB(t)
+	owner := cliVaultUser(t, pool, false)
+	cliVaultSeed(t, h, owner)
+	repo := cliSeedOwnedRepo(t, pool, owner)
+	f := &envFixture{t: t, h: h, router: router, pool: pool, owner: owner, repo: repo, jwt: cliMintJWT(t, pool, owner)}
+	if err := h.vault.Unlock(context.Background(), owner, cliVaultPassword); err != nil {
+		t.Fatal(err)
+	}
+	f.put("ONLY_SECRET", jsonBody(map[string]any{"value": secretFixture(1)}), http.StatusCreated)
+	if f.list().VaultLocked {
+		t.Fatal("an unlocked protected vault reports locked")
+	}
+	h.vault.Lock(owner)
+	if l := f.list(); !l.VaultLocked || len(l.Variables) != 1 || !l.Variables[0].Secret {
+		t.Fatalf("a secret-only list of a locked vault = %+v; want vault_locked", l)
+	}
+
+	u := newEnvFixture(t)
+	u.put("ONLY_SECRET", jsonBody(map[string]any{"value": secretFixture(1)}), http.StatusCreated)
+	if u.list().VaultLocked {
+		t.Fatal("an unprotected vault reports locked")
+	}
+}
+
 // A repo deleted between the ownership check and the write transaction answers 404
 // on every writer (create, rotate, disable), never a 500 or a hang.
 func TestRunEnvWriteAgainstDeletedRepoIs404LiveDB(t *testing.T) {
@@ -922,6 +995,12 @@ func TestRunEnvRotationVaultMaterialHeadroomLiveDB(t *testing.T) {
 	f.must(rec, http.StatusConflict)
 	if envConflictCode(rec) != "env_history_full" {
 		t.Fatalf("rotation past the vault material budget: %s", rec.Body.String())
+	}
+	// The refusal speaks about the variable save, not about enabling or disabling the vault.
+	for _, vaultWording := range []string{"vault conversion", "Your mode and credentials"} {
+		if strings.Contains(rec.Body.String(), vaultWording) {
+			t.Fatalf("the 409 carries the vault-conversion text %q: %s", vaultWording, rec.Body.String())
+		}
 	}
 	if v := f.find(f.list(), "ROTATE_ME"); v == nil || v.Rev != 1 {
 		t.Fatalf("a refused rotation moved the variable: %+v", v)
