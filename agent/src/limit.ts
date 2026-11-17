@@ -291,14 +291,27 @@ export function describeLimit(limit: { resetsAtMs?: number; rateLimitType?: stri
 // is its message text. SDK 0.3.316 re-check: the result frame has no spend discriminator
 // (`TerminalReason` has no spend member; `billing_error` exists only on assistant frames and the
 // observed spend frames carry `error: "unknown"`; `USAGE_LIMIT_ERROR_PREFIXES` does not contain
-// these strings). So this one classifier matches the two documented sentences, exact and
-// case-sensitive, and only on a lead terminal that structurally is a 400 `api_error` result.
+// these strings). So this one classifier matches three sentences, exact and case-sensitive, and
+// only on a lead terminal that structurally is a 400 `api_error` result: the organization spend
+// limit, the workspace spend limit, and (issue #4426) the Claude CLI's credit-depletion sentence.
+// SDK 0.3.319 re-check for credit depletion: the CLI maps Anthropic's 400 credit-balance error to
+// an assistant API-error message whose text is exactly `Credit balance is too low` (assistant
+// `error: "billing_error"`, never retried), and the result frame is structurally the same as a
+// spend-limit frame (`is_error: true`, `terminal_reason: "api_error"`, `api_error_status: 400`).
 // A reworded provider message degrades to today's terminal failure, never to a retry loop.
 
 /** Organization spend limit sentence (issue #3767; https://platform.claude.com/docs/en/api/errors). */
 export const SPEND_LIMIT_ORG_TEXT = "You have reached your specified API usage limits.";
 /** Workspace spend limit sentence (issue #3767; https://platform.claude.com/docs/en/api/errors). */
 export const SPEND_LIMIT_WORKSPACE_TEXT = "You have reached your specified workspace API usage limits.";
+/**
+ * Credit depletion sentence (issue #4426): an Anthropic API key whose prepaid credit balance ran
+ * out. Observed on a hosted worker (0.87.0-rc.15) as `provider error: 400 Credit balance is too low`.
+ * This is the Claude CLI's own replacement text at SDK 0.3.319 (its `billing_error` mapping of the
+ * API's credit-balance 400), not the sentence on Anthropic's errors page, and it arrives bare, with
+ * no `API Error:` wrapper.
+ */
+export const CREDIT_BALANCE_LOW_TEXT = "Credit balance is too low";
 
 /** The lead's terminal frame facts the spend-limit classifier reads. */
 export interface SpendLimitTerminalFacts {
@@ -309,10 +322,12 @@ export interface SpendLimitTerminalFacts {
 }
 
 /**
- * Classify a failed lead terminal as an Anthropic spend-limit hold. Requires the structural
+ * Classify a failed lead terminal as an Anthropic spend-limit hold (an organization or workspace
+ * spend limit, or an exhausted prepaid credit balance). Requires the structural
  * facts (`is_error === true`, `terminal_reason: "api_error"`, HTTP status 400) AND the raw result
  * text, after stripping at most one leading `API Error: 400 ` (else `API Error: `) wrapper,
- * starting with one of the two documented sentences. `detail` is the provider sentence line
+ * starting with one of the three sentences ({@link SPEND_LIMIT_ORG_TEXT},
+ * {@link SPEND_LIMIT_WORKSPACE_TEXT}, {@link CREDIT_BALANCE_LOW_TEXT}). `detail` is the provider sentence line
  * (trimmed, capped at 200 characters) for the owner-facing feed.
  */
 export function classifySpendLimitTerminal(t: SpendLimitTerminalFacts): { detail: string } | undefined {
@@ -324,14 +339,18 @@ export function classifySpendLimitTerminal(t: SpendLimitTerminalFacts): { detail
     : raw.startsWith("API Error: ")
       ? raw.slice("API Error: ".length)
       : raw;
-  if (!text.startsWith(SPEND_LIMIT_ORG_TEXT) && !text.startsWith(SPEND_LIMIT_WORKSPACE_TEXT)) return undefined;
+  if (
+    !text.startsWith(SPEND_LIMIT_ORG_TEXT) &&
+    !text.startsWith(SPEND_LIMIT_WORKSPACE_TEXT) &&
+    !text.startsWith(CREDIT_BALANCE_LOW_TEXT)
+  ) return undefined;
   const firstLine = text.split("\n").map((l) => l.trim()).find((l) => l.length > 0) ?? "";
   return { detail: firstLine.slice(0, 200).trim() };
 }
 
 /**
- * Issue #3767: thrown by the Claude executor for a lead terminal classified by
- * {@link classifySpendLimitTerminal}. `message` is byte-identical to the terminal failure message
+ * Issue #3767 (credit depletion: issue #4426): thrown by the Claude executor for a lead terminal
+ * classified by {@link classifySpendLimitTerminal}. `message` is byte-identical to the terminal failure message
  * a non-parking worker reports (`provider error: 400 ...`), so a worker or api that cannot park
  * this cause fails exactly as before.
  */

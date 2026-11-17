@@ -1,8 +1,13 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
-  classifySpendLimitTerminal, SPEND_LIMIT_ORG_TEXT, SPEND_LIMIT_WORKSPACE_TEXT, SpendLimitHoldError,
+  classifySpendLimitTerminal, CREDIT_BALANCE_LOW_TEXT, SPEND_LIMIT_ORG_TEXT, SPEND_LIMIT_WORKSPACE_TEXT,
+  SpendLimitHoldError,
 } from "../src/limit.js";
+
+// Issue #4426: the Claude CLI's credit-depletion sentence, written literally here so the holding
+// cases below pin the classifier's acceptance, not merely the constant's value.
+const CREDIT = "Credit balance is too low";
 import { decodeResult } from "../src/sdk-messages.js";
 
 // Issue #3767: the single text-matched classification. Structural facts AND an exact sentence.
@@ -10,7 +15,10 @@ const hold = (resultText: string | undefined, over: Record<string, unknown> = {}
   classifySpendLimitTerminal({ isError: true, terminalReason: "api_error", apiErrorStatus: 400, resultText, ...over });
 
 describe("classifySpendLimitTerminal (issue #3767)", () => {
-  for (const sentence of [SPEND_LIMIT_ORG_TEXT, SPEND_LIMIT_WORKSPACE_TEXT]) {
+  it("CREDIT_BALANCE_LOW_TEXT is the CLI's exact sentence (issue #4426)", () => {
+    assert.equal(CREDIT_BALANCE_LOW_TEXT, CREDIT);
+  });
+  for (const sentence of [SPEND_LIMIT_ORG_TEXT, SPEND_LIMIT_WORKSPACE_TEXT, CREDIT_BALANCE_LOW_TEXT]) {
     for (const wrap of ["", "API Error: ", "API Error: 400 "]) {
       it(`holds ${JSON.stringify(wrap + sentence)}`, () => {
         const got = hold(`${wrap}${sentence} You will regain access on 2026-12-01.`);
@@ -33,7 +41,22 @@ describe("classifySpendLimitTerminal (issue #3767)", () => {
     ["isError false", SPEND_LIMIT_ORG_TEXT, { isError: false }],
     ["isError undefined", SPEND_LIMIT_ORG_TEXT, { isError: undefined }],
     ["no text", undefined, {}],
+    // Issue #4426: the credit-depletion sentence takes every gate the spend sentences take.
+    ["credit: a lowercase variant", CREDIT.toLowerCase(), {}],
+    ["credit: the sentence mid-string", `Note: ${CREDIT}`, {}],
+    ["credit: status 429", CREDIT, { apiErrorStatus: 429 }],
+    ["credit: status 402", CREDIT, { apiErrorStatus: 402 }],
+    ["credit: terminal max_turns", CREDIT, { terminalReason: "max_turns" }],
+    ["credit: isError false", CREDIT, { isError: false }],
   ];
+  it("holds the bare credit-depletion line the CLI emits (issue #4426)", () => {
+    assert.deepEqual(hold(CREDIT), { detail: CREDIT });
+  });
+  for (const wrap of ["", "API Error: ", "API Error: 400 "]) {
+    it(`holds the literal credit sentence under ${JSON.stringify(wrap)} (issue #4426)`, () => {
+      assert.deepEqual(hold(`${wrap}${CREDIT}`), { detail: CREDIT });
+    });
+  }
   for (const [name, text, over] of cases) {
     it(`does not hold ${name}`, () => assert.equal(hold(text, over), undefined));
   }
