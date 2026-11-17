@@ -1032,8 +1032,10 @@ export interface CheckpointRange {
   /** Captured server-confirmed checkpoint tip. A BLOB-ONLY omission authority: blobs reachable from
    *  it may be left out of the selective pack, but it is never a commit/tree exclusion, a scan floor
    *  or a pack floor. Used only when it is an ancestor of the packed candidate; part of the
-   *  immutable replay set. The same SHA is already a scan floor through `confirmedTip` (see
-   *  `scanFloorShas`), so every blob it omits is one the scan also floors. terminal-range.ts
+   *  immutable replay set. When it is an ancestor of the raw tip it is also a scan floor through
+   *  `confirmedTip` (see `scanFloorShas`); in the chain/overlay case it is not. Either way,
+   *  omitting blobs cannot publish unscanned content: omission only removes objects from the
+   *  pack and the scan range is unchanged. terminal-range.ts
    *  intentionally does not persist this field: no terminal producer sets it. */
   confirmedBlobSha?: string;
   /** issue #3242: TRANSPORT-only pack exclusions, replacing `^excludeSha` in the pack (never the

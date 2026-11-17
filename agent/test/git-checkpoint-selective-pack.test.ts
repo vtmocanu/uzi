@@ -564,6 +564,34 @@ it("legacy producers ignore the confirmed tip: no captured default, and the zero
   } finally { f.cleanup(); }
 });
 
+it("legacy producers never re-check the confirmed tip on replay: unpinned, pinned and zero-range", async () => {
+  const f = fixture();
+  try {
+    const h = linear(f);
+    const internals = f.cache as unknown as { revParse: (barePath: string, ref: string) => Promise<string | null> };
+    const original = internals.revParse.bind(f.cache);
+    const replayBytes = async (packed: Awaited<ReturnType<typeof packRows>>) => {
+      const first = await packBytes(packed);
+      internals.revParse = async (barePath, ref) => ref === `${h.c}^{commit}` ? null : original(barePath, ref);
+      try {
+        assert.equal(sha256(await packBytes(await packed.replay())), sha256(first));
+      } finally { internals.revParse = original; }
+    };
+    // Unpinned, no captured default.
+    await replayBytes(await packRows(f, { defaultBranch: undefined, confirmedBlobTip: h.c }));
+    // Pinned range with no captured default but a confirmedBlobSha carried on it.
+    const range = await f.cache.resolveCheckpointRange(f.bare, f.branch, {});
+    assert.ok(range);
+    assert.equal(range.defaultBlobSha, undefined);
+    range.confirmedBlobSha = h.c;
+    await replayBytes(await packRows(f, {}, range));
+    // Zero-range transport envelope.
+    f.git(["update-ref", "-d", `refs/remotes/origin/${f.branch}`]);
+    f.git(["update-ref", "refs/remotes/origin/main", h.t]);
+    await replayBytes(await packRows(f, { defaultBranch: "main", confirmedBlobTip: h.c }));
+  } finally { f.cleanup(); }
+});
+
 it("pinned range carries the confirmed tip only when asked, and scan floors are unchanged", async () => {
   const f = fixture();
   try {
