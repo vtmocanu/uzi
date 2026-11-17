@@ -604,9 +604,12 @@ interface RetireVerdict {
   reclaimed: number;
   /** Bindings of already-gone parents cleared by the metadata-only recovery route. */
   recovered: number;
+  /** Examined parents left in place for a per-parent reason; `kept_by_reason` sums to exactly this. Never counts a deferral. */
   kept: number;
-  /** Candidates left untouched because the phase budget ended or the phase stopped starting new ones. */
+  /** Candidates left untouched because the phase budget ended or a whole-phase refusal stopped it from starting new ones. Never in `kept`/`kept_by_reason`. */
   deferred: number;
+  /** Listed `.retire-*` parents no binding names: not examined, not in `kept`. */
+  unbound: number;
   /** Removals that left residue: the binding stays `removing`, permanently. */
   residue: number;
   /** Reclaimed parents whose binding could not be unset afterwards (a later pass recovers them). */
@@ -617,7 +620,7 @@ interface RetireVerdict {
   kept_by_reason: Record<string, number>;
 }
 const emptyRetire = (): RetireVerdict => ({
-  state: "not_run", reason: "not_run", examined: 0, reclaimed: 0, recovered: 0, kept: 0, deferred: 0, residue: 0, unset_failed: 0,
+  state: "not_run", reason: "not_run", examined: 0, reclaimed: 0, recovered: 0, kept: 0, deferred: 0, unbound: 0, residue: 0, unset_failed: 0,
   bytes: 0, bytes_state: "unknown", kept_by_reason: {},
 });
 
@@ -849,7 +852,7 @@ async function retireBody(ctx: RetireContext, pin: ScratchRootPin, root: string,
   if ("refused" in firstScan) return refuse(firstScan.refused);
   out.state = "ran"; out.reason = "complete";
   out.examined = work.length;
-  out.kept_by_reason.unbound = [...listed].filter(n => !owners.has(RETIRE_PARENT_RE.exec(n)![1]!)).length;
+  out.unbound = [...listed].filter(n => !owners.has(RETIRE_PARENT_RE.exec(n)![1]!)).length;
 
   const count = (reason: string, n = 1): void => { out.kept_by_reason[reason] = (out.kept_by_reason[reason] ?? 0) + n; };
   const keep = (name: string, reason: string, exists: boolean): void => {
@@ -857,7 +860,7 @@ async function retireBody(ctx: RetireContext, pin: ScratchRootPin, root: string,
     if (exists) ctx.parents.push({ name, outcome: "kept", reason, bytes: 0, bytesState: "unknown" });
   };
   const defer = (names: readonly string[], reason: string): void => {
-    out.deferred += names.length; count(reason, names.length);
+    out.deferred += names.length;
     for (const n of names) if (parentPresence(io, pin, n) === "present") ctx.parents.push({ name: n, outcome: "kept", reason, bytes: 0, bytesState: "unknown" });
   };
   const t0Ms = fence.t0Ms;
@@ -903,6 +906,7 @@ async function retireBody(ctx: RetireContext, pin: ScratchRootPin, root: string,
           ctx.check();
         };
         // Other bares may have gained a record since the nomination read: read the pass-wide paths again inside S.
+        // Writers on other bares take their own bare's lock, never this one, so this re-read in S sees exactly what a read inside B would.
         const again = await readProtected();
         if (again === undefined || protectedLeaves(again, root, [name]).has(name)) return { kind: "keep", reason: "protected_by_retained_source" };
         const lockOpts = { signal: controller.signal, deadline: ctx.deadlineAt() };
@@ -925,10 +929,14 @@ async function retireBody(ctx: RetireContext, pin: ScratchRootPin, root: string,
           try { st = io.lstatSync(`/proc/self/fd/${pin.fd}/${name}`); } catch { return { kind: "keep", reason: "identity_changed" }; }
           if (st.ctimeMs >= t0Ms) return { kind: "keep", reason: "newer_than_predecessor" };
           // Mounts and binds re-read for THIS parent (d1 narrowing 2): a bind at or below it, or a changed mount, keeps it.
+          // An unreadable or refused bind inventory or mount table is a whole-phase refusal (halt); a bind at or below this parent is its own.
           const nowBinds = classifyBinds();
-          if (nowBinds === undefined || "refused" in nowBinds || nowBinds.referenced.has(name) || mounts() !== "ok")
-            return { kind: "keep", reason: "mount_changed" };
-          if (typeof guard.refreshInventory !== "function") { stopPhase("daemon_changed"); return { kind: "keep", reason: "epoch_not_eligible" }; }
+          if (nowBinds === undefined) return { kind: "keep", reason: "mount_changed", halt: "bind_unknown" };
+          if ("refused" in nowBinds) return { kind: "keep", reason: "mount_changed", halt: nowBinds.refused };
+          const mountB = mounts();
+          if (mountB !== "ok") return { kind: "keep", reason: "mount_changed", halt: mountB };
+          if (nowBinds.referenced.has(name)) return { kind: "keep", reason: "mount_changed" };
+          if (typeof guard.refreshInventory !== "function") return { kind: "keep", reason: "epoch_not_eligible", halt: "daemon_changed" };
           try { await guard.refreshInventory(); }
           catch (error) {
             if (error instanceof PodEpochSettlementError || error instanceof Refusal) throw error;
@@ -939,29 +947,32 @@ async function retireBody(ctx: RetireContext, pin: ScratchRootPin, root: string,
           }
           let idle = false;
           try { idle = await deps.quiesce(); } catch { idle = false; }
-          if (!idle) { stopPhase("not_idle"); return { kind: "keep", reason: "epoch_not_eligible" }; }
+          if (!idle) return { kind: "keep", reason: "epoch_not_eligible", halt: "not_idle" };
           const holding = scan([name]);
-          if ("refused" in holding) { stopPhase(holding.refused); return { kind: "keep", reason: "held" }; }
+          if ("refused" in holding) return { kind: "keep", reason: "held", halt: holding.refused };
           if (holding.held.has(name)) return { kind: "keep", reason: "held" };
           const mntId = seams.rootMntId ? seams.rootMntId() : mntIdOf(pin.fd, io);
           if (mntId === undefined) return { kind: "keep", reason: "mount_changed" };
-          // Budget: the helper gets what the phase window still holds, never more than the helper cap.
+          // Measure first (at most 5 s), then budget: the helper gets what the phase window still holds, never more than the helper cap.
+          const measured = await deps.git.measureRetireScratchParent(name, { signal: controller.signal, deadline: Date.now() + 5000 });
           const helperMs = Math.min(RETIRE_HELPER_MAX_MS, phaseEnd - ctx.now() - 5000);
           if (phaseEnd - ctx.now() < RETIRE_CANDIDATE_MIN_MS || helperMs < 1000) return { kind: "keep", reason: "budget_deferred" };
-          const measured = await deps.git.measureRetireScratchParent(name, { signal: controller.signal, deadline: Date.now() + Math.min(5000, helperMs) });
+          // Entry budget: the helper may never be allowed more than is left. Only a complete measurement says how much this
+          // parent used; an incomplete or unknown one (walk cap or deadline) charges everything left, so no later parent is admitted.
+          const maxEntries = entriesLeft;
+          entriesLeft = measured.bytesState === "measured" ? Math.max(0, entriesLeft - measured.entries - 1) : 0;
           const scope = ctx.openScope();
           if (scope.stopped()) ctx.failFatal();
           let removingRaw = ready.raw;
           inDiscard = true;
           const result = await deps.git.discardRetireScratchParent({
             scope, root, rootPin: pin.fd, rootDev: pin.dev, rootMntId: mntId, parentName: name,
-            parentIno: b.parentIno, cloneIno: b.cloneIno, deadline: Date.now() + helperMs, maxEntries: Math.max(1, entriesLeft),
+            parentIno: b.parentIno, cloneIno: b.cloneIno, deadline: Date.now() + helperMs, maxEntries,
             maxDepth: SCRATCH_DELETE_LIMITS.maxDepth, signal: controller.signal, live,
             // Every identity and posture refusal precedes this callback, so an ordinary mismatch keeps `settled`.
-            beforeEffect: async () => { ctx.check(); ctx.entry(); removingWritten = true; removingRaw = await locked.markRemoving(uuid, ready.raw); },
+            beforeEffect: async () => { ctx.check(); ctx.entry(); removingRaw = await locked.markRemoving(uuid, ready.raw); removingWritten = true; },
           });
           inDiscard = false;
-          entriesLeft = measured.bytesState === "unknown" && measured.entries === 0 ? 0 : Math.max(0, entriesLeft - measured.entries - 1);
           if (result.kind === "refused") {
             return { kind: "keep", reason: removingWritten ? "interrupted_removal" : retireRefusalReason(result.reason),
               ...(result.reason === "root_posture" ? { halt: "root_posture" } : {}) };
@@ -986,7 +997,8 @@ async function retireBody(ctx: RetireContext, pin: ScratchRootPin, root: string,
     switch (step.kind) {
       case "keep":
         if (step.halt) halted = step.halt;
-        keep(name, step.reason, present === "present");
+        if (step.reason === "budget_deferred") defer([name], step.reason);
+        else keep(name, step.reason, present === "present");
         break;
       case "recovered":
         out.recovered++;

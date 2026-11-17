@@ -33,7 +33,7 @@ import { syncDirectory } from "./authority-lock.js";
 import { RUNNER_UID, WORKER_UID, killRunnerGroupOnly, killRunnerGroup, runnerCommand, runnerPath, runnerTmpdir, uidSplitActive } from "./runner-uid.js";
 import { unmarkedSpawnEnv, workerSpawnEnv } from "./worker-spawn-mark.js";
 import { PINNED_SUBTREE_SCRIPT, SCRATCH_DELETE_LIMITS, TREE_NAME_RE, censusScratchRoot, rmRunnerTeardownTree } from "./rmtree.js";
-import { absorbBareConfigValue, classifyScratchSettlement, isNeverRemovedScratchName, newPathSink, parseScratchCensus, postCensusOf, protectedLeaves, readProtectedStores, type ProtectedPathsRead, type Settlement } from "./pod-epoch-scratch.js";
+import { absorbBareConfigValue, canonicalRunnerAlias, classifyScratchSettlement, isNeverRemovedScratchName, newPathSink, parseScratchCensus, postCensusOf, protectedLeaves, readProtectedStores, type ProtectedPathsRead, type Settlement } from "./pod-epoch-scratch.js";
 import { classifyForgeError, withForgeRetry } from "./forge-retry.js";
 import { RunDiskLocks } from "./run-disk-locks.js";
 import {
@@ -2683,7 +2683,13 @@ function retireLedgerLast(evidence: RetireScratchBareEvidence, attemptId: string
 /** Does any recorded path equal, lie under, or contain the parent or the binding's clone path? Alias-aware for the parent. */
 function retireNamed(evidence: RetireScratchBareEvidence, runnerRoot: string, parentName: string, clonePath: string): boolean {
   if (protectedLeaves(evidence.protectedPaths, runnerRoot, [parentName]).has(parentName)) return true;
-  return evidence.protectedPaths.some(p => isWithinPath(p, clonePath) || isWithinPath(clonePath, p));
+  return pathNamed(evidence.protectedPaths, clonePath);
+}
+
+/** Does any recorded path equal, lie under, or contain `target`, treating `/data/runner-shared/...` as `/data/runner/...`? */
+function pathNamed(recorded: readonly string[], target: string): boolean {
+  const t = canonicalRunnerAlias(target);
+  return recorded.some(p => { const r = canonicalRunnerAlias(p); return isWithinPath(r, t) || isWithinPath(t, r); });
 }
 
 function retireJournalOf(evidence: RetireScratchBareEvidence, branch: string): RecoveryJournalEntry | "unparseable" | undefined {
@@ -2735,7 +2741,7 @@ export function evaluateRetireRecovery(input: {
   if (!last || last.branch !== b.branch || last.entry.runId !== b.runId || last.entry.clonePath !== b.clonePath) return "unresolved";
   const journal = retireJournalOf(evidence, b.branch);
   if (journal === "unparseable" || evidence.restoreBranches.includes(b.branch)) return "unresolved";
-  const named = evidence.protectedPaths.some(p => isWithinPath(p, b.clonePath) || isWithinPath(b.clonePath, p));
+  const named = pathNamed(evidence.protectedPaths, b.clonePath);
   if (last.raw === retireCanonicalRetired(b)) {
     return !input.canonical.present && !named && journal?.completionSourceFence === undefined ? "case1" : "unresolved";
   }
@@ -17280,8 +17286,7 @@ export class GitCache {
         const stores = await readProtectedStores(
           [this.recoveryRoot, this.recoveryMaintenanceRoot, this.recoverySettlementRoot, this.recoveryArchiveRoot],
           { interrupt: () => this.checkRecoveryInterruption() });
-        if (stores.state !== "read" || stores.paths.some(p => isWithinPath(p, parent) || isWithinPath(parent, p) ||
-            isWithinPath(p, b.clonePath) || isWithinPath(b.clonePath, p))) return { kind: "keep", reason: "protected_by_retained_source" };
+        if (stores.state !== "read" || pathNamed(stores.paths, parent) || pathNamed(stores.paths, b.clonePath)) return { kind: "keep", reason: "protected_by_retained_source" };
         if (residueQuarantine() !== undefined || await this.custodyHeld(b.runId) || (await this.listLocalRecords(b.runId)).length > 0)
           return { kind: "keep", reason: "custody" };
         if (!await this.missingFootprintOf(b.clonePath)) return { kind: "keep", reason: "canonical_present" };

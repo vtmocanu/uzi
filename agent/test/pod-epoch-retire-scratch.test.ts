@@ -15,9 +15,10 @@ import { fileURLToPath } from "node:url";
 import { runPodEpochShadow, PodEpochSettlementError } from "../src/pod-epoch-reclaim.js";
 import type { PodEpochDaemonGuard } from "../src/pod-epoch-daemon.js";
 import {
-  GitCache, parseRetireBinding, readRetireScratchReclaimActivation, retireBindingKey, retireBindingValue,
-  type RetireBinding, type RetireBindingStep, type RetireDispositionClass, type RetireScratchPassReport,
+  GitCache, evaluateRetireBinding, evaluateRetireRecovery, parseRetireBinding, readRetireScratchReclaimActivation, retireBindingKey, retireBindingValue,
+  type RetireBinding, type RetireBindingStep, type RetireDispositionClass, type RetireScratchBareEvidence, type RetireScratchPassReport,
 } from "../src/git.js";
+import { protectedLeaves } from "../src/pod-epoch-scratch.js";
 import { buildPodEpochRetireDeps } from "../src/main.js";
 import { formatAttemptId } from "../src/attempt-path.js";
 import { latchResidueQuarantine, resetResidueQuarantineForTests } from "../src/residue-quarantine.js";
@@ -68,6 +69,7 @@ class World {
   held = new Set<string>();
   eligible = true;
   txLost = false;
+  txCount = 0;
   beforeB?: () => void | Promise<void>;
   reserveCalls: string[] = [];
   runStatus = "completed";
@@ -146,6 +148,7 @@ class World {
         authority: {
           withTransaction: async <T,>(fn: (t: object) => Promise<T>): Promise<T> => {
             tx = {};
+            this.txCount++;
             const mine = tx;
             try { await this.beforeB?.(); return await fn(mine); } finally { tx = undefined; }
           },
@@ -479,7 +482,9 @@ describe("keep reasons", PROC, () => {
     const parent = path.join(w.runnerRoot, `.retire-${randomUUID()}`);
     fs.mkdirSync(path.join(parent, "clone"), { recursive: true });
     const result = await w.run();
-    assert.equal(result.retire_scratch.kept_by_reason.unbound, 1);
+    assert.equal(result.retire_scratch.unbound, 1);
+    assert.equal(result.retire_scratch.kept, 0);
+    assert.deepEqual(result.retire_scratch.kept_by_reason, {});
     assert.equal(result.retire_scratch.examined, 0);
     assert.ok(exists(parent));
     assert.equal(w.spawns.length, 0);
@@ -661,7 +666,8 @@ describe("budget", PROC, () => {
     const result = await w.run();
     assert.equal(result.retire_scratch.reclaimed, 1);
     assert.equal(result.retire_scratch.deferred, 2);
-    assert.equal(result.retire_scratch.kept_by_reason.budget_deferred, 2);
+    assert.equal(result.retire_scratch.kept, 0, "a deferral is not a keep");
+    assert.deepEqual(result.retire_scratch.kept_by_reason, {});
     assert.equal(result.retire_scratch.state, "stopped");
     assert.equal(result.retire_scratch.reason, "budget_deferred");
     assert.ok(!exists(order[0]!.parent));
@@ -735,6 +741,192 @@ describe("budget", PROC, () => {
     assert.equal(w.handovers, 0, "EX is kept");
     assert.equal(w.phaseOf(s.uuid), "removing");
     assert.ok(w.stopped, "the scope is stopped");
+  });
+});
+
+describe("a whole-phase refusal inside the lock halts the loop", PROC, () => {
+  const pair = (): [Seed, Seed] => {
+    const sorted = [w.seed({ n: 1 }), w.seed({ n: 2 })].sort((x, y) => (x.name < y.name ? -1 : 1));
+    return [sorted[0]!, sorted[1]!];
+  };
+  /** True exactly once, the first time it is asked after the first parent's locked section began. */
+  const armOnce = (): (() => boolean) => {
+    let armed = false, fired = false;
+    w.beforeB = () => { armed = true; };
+    return () => { if (!armed || fired) return false; fired = true; return true; };
+  };
+  const assertHalted = async (reason: string): Promise<void> => {
+    const [first, second] = pair2;
+    const result = await w.run();
+    assert.equal(result.retire_scratch.state, "stopped", JSON.stringify(result.retire_scratch));
+    assert.equal(result.retire_scratch.reason, reason);
+    assert.equal(result.retire_scratch.reclaimed, 0);
+    assert.equal(result.retire_scratch.kept, 1);
+    assert.equal(result.retire_scratch.deferred, 1);
+    assert.equal(w.spawns.length, 0, "no helper ran for any parent");
+    assert.equal(w.pending, 0);
+    untouched(first); untouched(second);
+    assert.equal(result.verdict, "eligible");
+  };
+  let pair2: [Seed, Seed];
+
+  it("a parent-level idle check that fails once stops the phase before the next parent", async () => {
+    pair2 = pair();
+    const fire = armOnce();
+    w.quiesce = async () => !fire();
+    await assertHalted("not_idle");
+  });
+
+  it("a process-scan refusal for one parent stops the phase before the next parent", async () => {
+    pair2 = pair();
+    const fire = armOnce();
+    w.scan = names => (names.length === 1 && fire() ? { refused: "self_descriptor_unreadable" } : { held: new Set() });
+    await assertHalted("self_descriptor_unreadable");
+  });
+
+  it("a daemon guard that cannot refresh its inventory stops the phase before the next parent", async () => {
+    pair2 = pair();
+    const fire = armOnce();
+    const open = w.options.openDaemonGuard!;
+    w.options.openDaemonGuard = async (...a) => {
+      const guard = await open(...a);
+      Object.defineProperty(guard, "refreshInventory", { get: () => (fire() ? undefined : async () => undefined) });
+      return guard;
+    };
+    await assertHalted("daemon_changed");
+  });
+
+  it("a mount table that cannot be re-read for one parent stops the phase before the next parent", async () => {
+    pair2 = pair();
+    const fire = armOnce();
+    w.mounts = () => (fire() ? "mount_unknown" : "ok");
+    await assertHalted("mount_unknown");
+  });
+});
+
+describe("protection arriving in another store between the nomination and the locked section", PROC, () => {
+  it("a record in another bare naming the parent is seen by the re-read inside S and keeps the parent", async () => {
+    const s = w.seed();
+    const second = makeFixture();
+    try {
+      const bare2 = await w.cache.ensureClone(second.originPath);
+      fs.chmodSync(path.dirname(bare2), 0o700);
+      fs.chmodSync(bare2, 0o700);
+      w.beforeB = () => {
+        const first = w.bare;
+        w.bare = bare2;
+        try { w.setConfig("uzi-recovery.agent/late.clone", JSON.stringify({ runId: "x", clonePath: s.parent })); } finally { w.bare = first; }
+      };
+      const result = await w.run();
+      assert.equal(kept(result, s.name)?.reason, "protected_by_retained_source");
+      assert.equal(w.spawns.length, 0);
+      untouched(s);
+    } finally { second.cleanup(); }
+  });
+});
+
+describe("budget inside the locked section", PROC, () => {
+  it("a recovery under an exhausted window is deferred and the binding stays", async () => {
+    const s = w.seed({ withParent: false });
+    w.beforeB = () => { w.clock += 110_000; };
+    const result = await w.run();
+    assert.equal(result.retire_scratch.recovered, 0);
+    assert.equal(result.retire_scratch.deferred, 1);
+    assert.equal(result.retire_scratch.kept, 0);
+    assert.deepEqual(w.bindingRaws(s.uuid), [s.raw]);
+  });
+
+  it("with 6 to 20 s left at the pre-helper check no helper is spawned and the parent is deferred", async () => {
+    const s = w.seed();
+    w.beforeB = () => { w.clock += 105_000; };
+    const result = await w.run();
+    assert.equal(w.spawns.length, 0);
+    assert.equal(result.retire_scratch.deferred, 1);
+    assert.equal(result.retire_scratch.kept, 0);
+    assert.deepEqual(result.retire_scratch.kept_by_reason, {});
+    untouched(s);
+  });
+
+  /** Replaces the measurement and records the entry cap every helper launch was given. */
+  const fakeMeasure = (measure: { bytes: number; bytesState: "measured" | "partial" | "unknown"; entries: number }): number[] => {
+    const git = w.options.retire!.git;
+    const caps: number[] = [];
+    const real = git.discardRetireScratchParent;
+    git.discardRetireScratchParent = input => { caps.push(input.maxEntries); return real(input); };
+    git.measureRetireScratchParent = async () => measure;
+    return caps;
+  };
+
+  it("an incomplete measurement charges the whole entry budget: later parents are deferred, no cap exceeds what was left", async () => {
+    const seeds = [w.seed({ n: 1 }), w.seed({ n: 2 }), w.seed({ n: 3 })].sort((x, y) => (x.name < y.name ? -1 : 1));
+    const caps = fakeMeasure({ bytes: 0, bytesState: "partial", entries: 200_000 });
+    const result = await w.run();
+    assert.deepEqual(caps, [2_000_000]);
+    assert.equal(result.retire_scratch.reclaimed, 1);
+    assert.equal(result.retire_scratch.deferred, 2);
+    assert.equal(result.retire_scratch.kept, 0);
+    assert.equal(result.retire_scratch.state, "stopped");
+    assert.equal(result.retire_scratch.reason, "budget_deferred");
+    for (const s of seeds.slice(1)) { untouched(s); assert.equal(kept(result, s.name)?.reason, "budget_deferred"); }
+  });
+
+  it("a complete measurement charges what the walk saw: the next helper is capped to what remains", async () => {
+    const seeds = [w.seed({ n: 1 }), w.seed({ n: 2 }), w.seed({ n: 3 })].sort((x, y) => (x.name < y.name ? -1 : 1));
+    const caps = fakeMeasure({ bytes: 10, bytesState: "measured", entries: 1_500_000 });
+    const result = await w.run();
+    assert.deepEqual(caps, [2_000_000, 499_999]);
+    assert.equal(result.retire_scratch.reclaimed, 2);
+    assert.equal(result.retire_scratch.deferred, 1);
+    untouched(seeds[2]!);
+  });
+
+  it("a rejection before the removing write is a refusal that keeps settled", async () => {
+    const s = w.seed();
+    w.stepHook = step => { if (step === "removing-write") throw new Error("injected before the write"); };
+    const result = await w.run();
+    assert.equal(w.spawns.length, 0);
+    assert.equal(kept(result, s.name)?.reason, "epoch_not_eligible");
+    assert.equal(w.phaseOf(s.uuid), "settled");
+    untouched(s);
+  });
+});
+
+describe("alias-aware protection at the runner root itself", () => {
+  const root = "/data/runner";
+  const uuid = randomUUID();
+  const name = `.retire-${uuid}`;
+  const attemptId = formatAttemptId(new Date(Date.UTC(2026, 10, 5, 10, 10, 1)), 1, "0123456789abcdef");
+  const clonePath = `${root}/slug/issue-4263.attempt-${attemptId}`;
+  const binding: RetireBinding = { v: 1, class: "owner_terminal", attemptId, runId: "run-1", branch: BRANCH, clonePath,
+    phase: "settled", parentIno: "1", cloneIno: "1", pod: "" };
+  const raw = retireBindingValue(binding);
+  const evidenceWith = (protectedPaths: string[]): RetireScratchBareEvidence => ({
+    barePath: "/bare", bindings: [{ key: retireBindingKey(uuid), uuid, raw, parsed: binding }],
+    ledger: [{ branch: BRANCH, raw: JSON.stringify({ attemptId, runId: "run-1", clonePath, state: "retired" }) }],
+    protectedPaths, restoreBranches: [], recovery: [], stoppedRuns: [],
+  });
+  const shared = "/data/runner-shared";
+
+  it("protectedLeaves sees a record written through the shared alias", () => {
+    assert.deepEqual([...protectedLeaves([`${shared}/${name}/clone`], root, [name])], [name]);
+    assert.deepEqual([...protectedLeaves([`${shared}/.retire-${randomUUID()}/clone`], root, [name])], []);
+  });
+
+  it("a record naming the parent through the alias keeps the binding", () => {
+    assert.deepEqual(evaluateRetireBinding({ evidence: evidenceWith([`${shared}/${name}/clone`]), uuid, runnerRoot: root, expectRaw: raw }),
+      { kind: "keep", reason: "protected_by_retained_source" });
+  });
+
+  it("a record naming the clone path through the alias keeps the binding", () => {
+    assert.deepEqual(evaluateRetireBinding({ evidence: evidenceWith([`${shared}/slug/issue-4263.attempt-${attemptId}/sub`]), uuid, runnerRoot: root, expectRaw: raw }),
+      { kind: "keep", reason: "protected_by_retained_source" });
+    assert.equal(evaluateRetireBinding({ evidence: evidenceWith([`${shared}/other`]), uuid, runnerRoot: root, expectRaw: raw }).kind, "ready");
+  });
+
+  it("recovery case 1 does not unset when the clone path is named through the alias", () => {
+    const canonical = { present: false };
+    assert.equal(evaluateRetireRecovery({ evidence: evidenceWith([]), uuid, runnerRoot: root, expectRaw: raw, canonical }), "case1");
+    assert.equal(evaluateRetireRecovery({ evidence: evidenceWith([`${shared}/slug/issue-4263.attempt-${attemptId}`]), uuid, runnerRoot: root, expectRaw: raw, canonical }), "unresolved");
   });
 });
 
