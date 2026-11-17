@@ -144,7 +144,8 @@ allowance expires (its owned timer fired while the caller's signal did not), the
 classified `timeout` from that state, not from the error's shape.
 
 The replay factory captures the original source, candidate, literal floor and optional
-`defaultBlobSha`, and the confirmed-tip `confirmedBlobSha` (see
+`defaultBlobSha`, and the confirmed-tip eligibility result (the pinned `confirmedBlobSha`
+or unpinned `confirmedBlobTip` when eligible; see
 [the #4439 amendment](#amendment--4439-omit-blobs-reachable-from-the-confirmed-checkpoint-tip)),
 including their absence. These remain immutable for the logical
 publish. It opens a fresh stream without resolving branch tips, rebuilding overlays,

@@ -234,6 +234,9 @@ func TestAgentCheckpointSelectivePackBridge(t *testing.T) {
 			}
 			selected, ok := byName("selective")
 			if !ok {
+				if mode != "FrozenHeld" {
+					t.Fatal("missing selective artifact")
+				}
 				selected = s.Artifacts[1] // FrozenHeld names its production artifact "held".
 			}
 			confirmedMode := mode == "ConfirmedLargeHistory" || mode == "ConfirmedReplay"

@@ -88,7 +88,8 @@ if (confirmedChain) {
     ["public", publicBlobs.at(-1)!]]);
 }
 if (cfg.mode === "ConfirmedNotAncestor") {
-  confirmedTip = commit(tree([["side", blob("side\n")]]), [floor], "C side commit");
+  // Parented on X so a wrongly-eligible ^C would hide X's still-unpublished privateBlob.
+  confirmedTip = commit(tree([["side", blob("side\n")]]), [x], "C side commit");
 }
 const d = confirmedChain ? commit(confirmedMid!, [confirmedTip!, defaultAtCapture], "D merged")
   : commit(exact ? defaultTree : candidateTree, exact || cfg.mode === "NoDefaultMerge" || cfg.mode === "LargeRunOnly"
