@@ -488,6 +488,66 @@ it("confirmed tip equal to the floor is ineligible", async () => {
   } finally { f.cleanup(); }
 });
 
+/** F -> D1(default) -> X -> Mm(merge X,D1) -> C -> T, with the default later advanced to D2 (child of
+ *  D1). T carries D2's blob bd2 by copy without merging D2, so D2 is a commit exclusion only: it is
+ *  not an edge, hence only an explicit `^D2^{tree}` keeps bd2 out of the blob selection. */
+function advancedDefault(f: Fx) {
+  const bx = f.blob("only-in-x"), bc = f.blob("in-c"), bt = f.blob("new-in-t"), bd2 = f.blob("default-later");
+  const mk = (extra: [string, string][]) => f.tree([[QUOTED, f.sharedBlob], ...extra]);
+  const x = f.commit(mk([["x", bx]]), f.defaultSha, "x");
+  const mm = f.git(["commit-tree", mk([["x", bx]]), "-p", x, "-p", f.defaultSha], "merge main\n");
+  const c = f.commit(mk([["x", bx], ["c", bc]]), mm, "c");
+  const d2 = f.commit(mk([["d2", bd2]]), f.defaultSha, "d2");
+  const t = f.commit(mk([["x", bx], ["c", bc], ["t", bt], ["d2", bd2]]), c, "t");
+  f.git(["update-ref", "refs/remotes/origin/開発/custom", d2]);
+  f.git(["update-ref", `refs/uzi-runner/${f.branch}`, t]);
+  return { bx, bc, bt, bd2, x, mm, c, d2, t };
+}
+
+it("confirmed tip keeps default-tree exclusion: a default blob copied into the candidate is omitted", async () => {
+  const f = fixture();
+  try {
+    const h = advancedDefault(f);
+    const noC = await rowsOf(f);
+    const withC = await rowsOf(f, { confirmedBlobTip: h.c });
+    assertBlobOnlyOmission(withC, noC);
+    assert.ok(parsePack(noC).blobs.includes(h.bd2), "baseline ships the copied default blob");
+    assert.deepEqual(parsePack(withC).blobs, [h.bt], "bd2 is excluded through the default tree; C's blobs are omitted");
+  } finally { f.cleanup(); }
+});
+
+it("confirmed tip equal to the floor adds no default-tree exclusion (byte-identical to no C)", async () => {
+  const f = fixture();
+  try {
+    const h = advancedDefault(f);
+    const noC = await rowsOf(f);
+    assert.ok(parsePack(noC).blobs.includes(h.bd2));
+    assert.deepEqual(await rowsOf(f, { confirmedBlobTip: f.floor }), noC);
+  } finally { f.cleanup(); }
+});
+
+it("replay refuses when the captured confirmed tip is no longer resolvable, and spawns no producer", async () => {
+  const f = fixture();
+  const owner = supervised(f);
+  try {
+    const h = advancedDefault(f);
+    const internals = f.cache as unknown as { revParse: (barePath: string, ref: string) => Promise<string | null> };
+    const original = internals.revParse.bind(f.cache);
+    await f.cache.withBoundaryProcessSpawner(owner.spawner, new AbortController().signal, async () => {
+      const packed = await packRows(f, { confirmedBlobTip: h.c });
+      assert.deepEqual(parsePack(await f.inventory(packed)).blobs, [h.bt], "first open used the confirmed tip");
+      const producers = () => owner.calls.filter(call => call.args.includes("pack-objects")).length;
+      assert.equal(producers(), 1);
+      internals.revParse = async (barePath, ref) => ref === `${h.c}^{commit}` ? null : original(barePath, ref);
+      try {
+        await assert.rejects(packed.replay(),
+          (error: unknown) => error instanceof ScratchPublicationError && /confirmed tip is unavailable/.test(error.message));
+      } finally { internals.revParse = original; }
+      assert.equal(producers(), 1, "replay spawned no pack-objects producer");
+    });
+  } finally { f.cleanup(); }
+});
+
 it("legacy producers ignore the confirmed tip: no captured default, and the zero-range envelope", async () => {
   const f = fixture();
   try {

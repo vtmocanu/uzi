@@ -1032,7 +1032,9 @@ export interface CheckpointRange {
   /** Captured server-confirmed checkpoint tip. A BLOB-ONLY omission authority: blobs reachable from
    *  it may be left out of the selective pack, but it is never a commit/tree exclusion, a scan floor
    *  or a pack floor. Used only when it is an ancestor of the packed candidate; part of the
-   *  immutable replay set. */
+   *  immutable replay set. The same SHA is already a scan floor through `confirmedTip` (see
+   *  `scanFloorShas`), so every blob it omits is one the scan also floors. terminal-range.ts
+   *  intentionally does not persist this field: no terminal producer sets it. */
   confirmedBlobSha?: string;
   /** issue #3242: TRANSPORT-only pack exclusions, replacing `^excludeSha` in the pack (never the
    *  scan, never the floor validation). Set only for a zero range (`tipSha === excludeSha`) with no
@@ -17809,7 +17811,9 @@ export class GitCache {
         }
       }
       const candidate = wanted;
-      const blobFloor = await confirmedBlobFloor(confirmedBlobSha, candidate, excludeSha);
+      // C is consulted only when the selective producer will run (same condition as openProducer).
+      const blobFloor = defaultBlobSha && !(candidate === excludeSha && packExcludeShas !== undefined)
+        ? await confirmedBlobFloor(confirmedBlobSha, candidate, excludeSha) : undefined;
       const replay = (currentRegisterOwner: typeof registerOwner) => openProducer(currentRegisterOwner, tipSha, candidate, excludeSha, defaultBlobSha, packExcludeShas, blobFloor);
       return { tipOid: wanted, ...await replay(registerOwner), replay };
     }
@@ -17880,7 +17884,9 @@ export class GitCache {
         kind: "checkpoint_range", step: "checkpoint_floor", ...execDetail(classifyExecFailure(e)),
       });
     }
-    const blobFloor = await confirmedBlobFloor(options.confirmedBlobTip, wanted, floor);
+    // C is consulted only when the selective producer will run (same condition as openProducer).
+    const blobFloor = defaultBlobSha && !(wanted === floor && packExcludes !== undefined)
+      ? await confirmedBlobFloor(options.confirmedBlobTip, wanted, floor) : undefined;
     const replay = (currentRegisterOwner: typeof registerOwner) => openProducer(currentRegisterOwner, realTip, wanted, floor, defaultBlobSha, packExcludes, blobFloor);
     return { tipOid: wanted, ...await replay(registerOwner), replay };
   }
