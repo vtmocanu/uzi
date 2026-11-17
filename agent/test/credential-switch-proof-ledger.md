@@ -417,7 +417,8 @@ control is still absent, not that the functional criterion was deferred.
 | Exact saved-ID resume; confirmed-refusal-only fresh fallback and lineage; preservation re-hold | R6 credits uncertain-error classification only; confirmed-refusal/preserve companions positive, independent preservation and other clauses unvalidated |
 | Policy episode rejection at request and under apply lock | Unvalidated |
 | Refresh lease/intent exclusion, account lock ordering and boundary reconciliation before revoke | Unvalidated |
-| Transactional frozen binding rewrite, capability revoke/remint and post-commit material response | Unvalidated |
+| Post-switch release epoch and secret-hash authorization | B5/B6 preservation sensitivity controls below, through real worker apply and release routes; final reauthorization timing unvalidated |
+| Transactional frozen binding rewrite, capability revoke/remint and post-commit material response | Unvalidated; B5/B6 do not establish transaction atomicity or mint/revoke implementation |
 | Ordinal-zero baseline, successor journal ordinal/capability relation and usage attribution | Positive assertions present; qualifying controls unvalidated |
 | Atomic rollback, lost-reply replay, stale/foreign apply and target fences | Unvalidated |
 | Stopped-support negotiation, immutable expected-epoch latch and unsupported-response obligation | Unvalidated |
@@ -1381,3 +1382,105 @@ This credits the new retirement guard's prevention of that retained-A credential
 release request during B login. API-key A has no subscription refresh bridge:
 subscription-refresh ownership, other retired consumers, later phases, backend
 revocation and the whole-authority/m3/m4 contract remain separate and incomplete.
+
+### B5/B6 — post-switch release epoch and hash preservation
+
+Candidate ce54d754aa0257fa85bc22c2cb639b0cc297457a. These are two separate
+class (b) **preservation sensitivity controls**, not pre-feature baseline
+evidence. Source fixture:
+api/internal/handler/codex_switch_release_fences_routes_livedb_test.go.
+Receipts under .uzi/scratch/: release-fence-results.json,
+release-fence-finish-results.json and release-fence-lead-audit.json.
+
+Exact baseline command:
+
+```sh
+git show a233883de3c36bae2e940f999cd9d582889dad00:api/internal/workersvc/codexauthz.go
+```
+
+At baseline :680–682 the guard is:
+
+```go
+if presentedEpoch != row.CodexClaimEpoch {
+    return store.GetRunCodexAuthContextRow{}, ErrCodexCapabilityEpoch
+}
+```
+
+At :686–688:
+
+```go
+if subtle.ConstantTimeCompare(hashCodexCapability(secret), row.CodexCapHash) != 1 {
+    return store.GetRunCodexAuthContextRow{}, ErrCodexCapabilityMismatch
+}
+```
+
+Their historical role was authorization of an already-bound Codex credential,
+not account switching. Both expressions and refusal bodies are preserved at
+candidate codexauthz.go:693–695 and :699–701. The parser at :290 separates the
+epoch from the bare secret; hashCodexCapability at :274 hashes only the secret,
+so the negative cases isolate the two predicates.
+
+The exercised candidate path is authenticated worker apply X, its real store
+transaction, then POST /api/worker/runs/{id}/codex/release. WorkerCodexRelease
+calls ReleaseCodexCredential, whose authorization passes at codexrefresh.go:1320
+and :1335 both reach codexCredentialPreludeWithQueries and these same guards.
+GetRunCodexAuthContext projects the stored epoch and hash (source query
+codex_binding.sql:131–132; executing generated copy :589–590); it does not
+compare the presented capability. The apply CAS and mint writers are left
+intact. This is a trace of this release path, not a census of every credential
+consumer.
+
+Each subcase creates its own real fixture, applies pending X from A at epoch 41
+to B at epoch 42, checks B's persisted hash and journal binding, and successfully
+releases the exact synthetic B API key with Cache-Control: no-store.
+old_epoch_new_secret sends epoch 41 with B's matching secret; only epoch is bad.
+current_epoch_old_secret sends epoch 42 with A's obsolete secret; only hash is
+bad. Each refusal must be HTTP 403 without an access_token member or A/B
+plaintext, followed by successful B release. Both also reject the wholly old A
+capability. That last request has two stale factors and is not used to isolate
+either guard. The later direct store-backed service call distinguishes the
+sentinels hidden by the HTTP mapping; the mutant fails at the preceding real
+route assertion, before that call.
+
+B5 neutralizes only epoch equality by adding false && to its if condition.
+B6 independently adds false && only to the hash-equality condition. Parsing,
+stored-hash presence, the other equality predicate, ownership, active-claim and
+binding checks remain intact. Each export starts from the exact candidate and
+is removed before another is created. In both compiling mutants, the selected
+route returns 200 instead of 403; the assertion is attributed to test :150
+because checkRefused uses t.Helper (assertion source :125). Neither a build
+failure nor a helper-only failure supplies the red.
+
+All four credited commands run from api with GOFLAGS=-p=1, GOMAXPROCS=4 and
+go test -buildvcs=false -race -count=1 -json -timeout=4m
+./internal/handler -run <selection>. Selections and logs:
+
+| Stage | Selection after TestWorkerCodexSwitchReleaseFencesRouteLiveDB | Log under .uzi/scratch/ | Exit |
+| --- | --- | --- | --- |
+| Unchanged before, both cases | whole exact test | gate-log.x6KOS8 | 0 |
+| B5 epoch neutralization | old_epoch_new_secret only | gate-log.l5v1Np | 1, intended assertion |
+| B6 hash neutralization | current_epoch_old_secret only | gate-log.3vzPPG | 1, intended assertion |
+| Unchanged after, both cases | whole exact test | gate-log.i4oWND | 0 |
+
+Before and after each execute both named subcases without skips. Raw JSON
+actions, terminal exit records, source/test hashes and exact one-condition
+mutant hashes were independently checked. Cheap pre-commit checks were
+file-scoped gofmt and git diff --check HEAD. Immutable source review of
+a15d986e0..ce54d754a found no findings.
+
+The tester corrected an assertion matcher from :125 to the observed t.Helper
+callsite :150 and retained the existing red without rerunning it. Its
+15-minute child timeout later interrupted the final green command before any
+exit was recorded (gate-log.dkyM2l); that attempt receives no credit. The lead
+removed the inherited fixture, created a fresh owned PostgreSQL fixture, and
+completed only that missing final green. The recorded initial green and both
+red controls were retained without repetition. All three owned fixture cleanup
+commands returned 0; exports are absent and the complete tracked-file
+fingerprint matches the initial candidate.
+
+Credit is limited to preservation of epoch and secret-hash authorization on a
+post-apply release. No pre-apply A-release positive was run. The proof does not
+establish the second authorization pass's timing, concurrent revoke safety,
+apply atomicity, random mint quality, other credential operations or real
+provider behavior. The broader transaction/rebinding clauses and m3/m4 remain
+incomplete; full suites and m4 security gates are not credited here.

@@ -782,3 +782,33 @@ are reused after raw pass/hash, agent-input and docs-only-delta checks; no new
 primary green runs are claimed. Export removed and primary unchanged. All other
 mixed authority and backend/refresh requirements, full suites and m4 security
 remain required and incomplete.
+
+## Post-switch release epoch and secret-hash guards
+
+B5/B6 at ce54d754aa0257fa85bc22c2cb639b0cc297457a exercise the real worker
+apply and release routes with the actual store. Separate mixed capabilities
+isolate a stale epoch from an obsolete secret. B release succeeds before and
+after the negative requests, with exact synthetic B token identity and no-store.
+
+Both guards are identical to a233 codexauthz.go:680 and :686; current guards
+are :693 and :699. Each preservation sensitivity control neutralizes only its
+one equality check in an exact candidate export. The real release route then
+returns 200 instead of 403, failing at test :150 before any service-only check.
+Parsing, hash presence and every other fence remain intact. This does not
+establish the final reauthorization's interleaving or apply atomicity.
+
+Raw logs under .uzi/scratch/: x6KOS8 initial both-case green exit 0; l5v1Np epoch
+control exit 1; 3vzPPG hash control exit 1; i4oWND final both-case green exit 0.
+Commands use the single handler package, -race -count=1 -json -timeout=4m,
+GOFLAGS=-p=1 and GOMAXPROCS=4. Both greens execute both cases without skips.
+The tester's final-green command was interrupted by its child timeout with no
+exit record (dkyM2l), so the lead completed that missing check on a fresh fixture.
+Earlier valid results were not rerun. A t.Helper matcher correction reused the
+observed red rather than repeating it.
+
+Receipts release-fence-results.json, release-fence-finish-results.json and the
+lead audit record the hashes, exact diffs, actual test actions and recovery.
+All owned fixture cleanup exits are 0; exports are absent and the full tracked
+fingerprint is unchanged. Source review a15d986e0..ce54d754a found no findings.
+No pre-apply A-release positive, concurrent reauthorization proof, full suite
+or security gate is claimed. Other m3/m4 requirements remain incomplete.
