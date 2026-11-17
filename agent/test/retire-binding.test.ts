@@ -6,7 +6,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
-  GitCache, RETIRE_BINDING_MAX_PER_BARE, parseRetireBinding, parseRetireBindingKey, retireBindingKey, retireBindingValue,
+  GitCache, RETIRE_BINDING_MAX_PER_BARE, evaluateRetireBinding, parseRetireBinding, parseRetireBindingKey, retireBindingKey, retireBindingValue,
   type RetireBinding,
 } from "../src/git.js";
 import { syncDirectory } from "../src/authority-lock.js";
@@ -230,6 +230,62 @@ describe("compactAttemptLedger keeps an attempt a binding names", () => {
     await compact();
     assert.deepEqual(ledgerValues(), before);
     assert.equal(before.length, 1);
+  });
+});
+
+describe("compactAttemptLedger keeps taint a reclaim evaluation relies on (#4263)", () => {
+  const clonePath = (): string => attemptClonePath(cache.runnerClonePath(bare, KEY), ATTEMPT);
+  const canonicalRetired = (): string => JSON.stringify({ attemptId: ATTEMPT, runId: "run-4263", clonePath: clonePath(), state: "retired" });
+  const addLedger = (raw: string): void => { gitIn(["config", "--local", "--add", LEDGER_KEY, raw]); };
+  const bindSettled = (): void => setBinding(UUID, retireBindingValue(binding({ class: "owner_terminal", phase: "settled", clonePath: clonePath() })));
+  const evaluate = async () => {
+    const read = await cache.readRetireBindings(bare);
+    assert.equal(read.state, "read");
+    return evaluateRetireBinding({
+      evidence: { barePath: bare, bindings: read.state === "read" ? read.bindings : [],
+        ledger: ledgerValues().map(raw => ({ branch: BRANCH, raw })), protectedPaths: [], restoreBranches: [], recovery: [], stoppedRuns: [] },
+      uuid: UUID, runnerRoot: path.join(fx.dataDir, "runner"),
+    });
+  };
+
+  it("control: a canonical bound attempt still compacts to its last value and stays reclaimable", async () => {
+    addLedger(JSON.stringify({ attemptId: ATTEMPT, runId: "run-4263", clonePath: clonePath(), state: "live" }));
+    addLedger(canonicalRetired());
+    bindSettled();
+    assert.equal((await evaluate()).kind, "ready");
+    await compact();
+    assert.deepEqual(ledgerValues(), [canonicalRetired()]);
+    assert.equal((await evaluate()).kind, "ready");
+  });
+
+  it("keeps an unknown-state value naming a bound attempt byte-for-byte, so the evaluation stays ledger_mismatch", async () => {
+    addLedger(canonicalRetired());
+    const unknownState = JSON.stringify({ attemptId: ATTEMPT, runId: "run-4263", clonePath: clonePath(), state: "future-state" });
+    addLedger(unknownState);
+    bindSettled();
+    await compact();
+    assert.ok(ledgerValues().includes(unknownState), "the non-canonical value survives compaction verbatim");
+    assert.deepEqual(await evaluate(), { kind: "keep", reason: "ledger_mismatch" });
+  });
+
+  it("keeps a reordered (parseable, non-canonical) value naming a bound attempt verbatim", async () => {
+    addLedger(canonicalRetired());
+    const reordered = JSON.stringify({ runId: "run-4263", attemptId: ATTEMPT, clonePath: clonePath(), state: "live" });
+    addLedger(reordered);
+    bindSettled();
+    await compact();
+    assert.ok(ledgerValues().includes(reordered));
+    assert.deepEqual(await evaluate(), { kind: "keep", reason: "ledger_mismatch" });
+  });
+
+  it("with an undecodable binding set, preserves a non-canonical value byte-for-byte", async () => {
+    setBinding(randomUUID(), "{");
+    const junk = "not json at all";
+    const reordered = JSON.stringify({ runId: "run-4263", attemptId: ATTEMPT, clonePath: clonePath(), state: "live" });
+    addLedger(junk);
+    addLedger(reordered);
+    await compact();
+    assert.deepEqual(ledgerValues(), [junk, reordered]);
   });
 });
 

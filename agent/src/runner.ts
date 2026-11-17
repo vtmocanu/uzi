@@ -2831,7 +2831,8 @@ interface RunFlight {
     kind: RunKind; defaultBranch: string; cloneUrl: string; repoId: string }>;
   sourceJoinFailed?: boolean;
   /** issue #4263: retainStoppedSource lifted this flight's preserveRecoveryClone on a `covered` verdict, so the owner
-   *  terminal retire that follows is classed `owner_terminal_covered` (a retirement scratch binding that never settles). */
+   *  terminal retire that follows is classed `owner_terminal_covered` (a retirement scratch binding that never settles).
+   *  A parked flight (`parked`) that reaches the ordinary terminal retire is classed the same way. */
   coveredLiftRetire?: boolean;
   /** issue #3239: an unvetted marker may remain in history. Captures never reset this refusal;
    * only a complete-history absence proof permits publication of an exact candidate. */
@@ -7746,7 +7747,7 @@ export class RunRunner {
               flight.branch!,
               runId,
               { discard: true, attemptId: flight.runnerClone?.attemptId,
-                dispositionClass: flight.coveredLiftRetire === true ? "owner_terminal_covered" : "owner_terminal",
+                dispositionClass: flight.parked || flight.coveredLiftRetire === true ? "owner_terminal_covered" : "owner_terminal",
                 ...(terminalCodex ? { processProof: cloneReleaseProof } : {}),
                 onRetirementUnproven: () => { flight.sourceJoinFailed = true; } },
             ));

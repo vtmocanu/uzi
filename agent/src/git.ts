@@ -18062,6 +18062,11 @@ export class GitCache {
    *     `recovery-settlement/<runId>`) exists; with both gone it is dropped.
    *   - an entry whose (attemptId, runId, clonePath) a decoded retirement binding names (issue #4263); an unreadable binding set
    *     keeps every entry.
+   * A TAINTED value (issue #4263) is neither dropped nor compacted: a non-canonical value (unparseable, or not byte-identical
+   * to its canonical re-serialization) that names an attempt id a decoded binding references, or ANY non-canonical value while
+   * the bindings are undecodable or unreadable. It is preserved verbatim, in its original relative order, placed before the
+   * compacted entries, and takes no part in last-value-per-attemptId selection. This keeps the taint
+   * the reclaim evaluation's ledger read relies on (a non-canonical value naming the attempt blocks an earlier `retired`).
    * Nothing is rewritten when nothing would change.
    *
    * The rewrite is ATOMIC ({@link rewriteLedgerAtomically}): the full compacted value set lands in
@@ -18084,8 +18089,20 @@ export class GitCache {
       const namedByBinding = (e: AttemptLedgerEntry): boolean => bindingsUndecodable || bindingRead.state === "read" && bindingRead.bindings.some(b =>
         b.parsed !== undefined && b.parsed.attemptId === e.attemptId && b.parsed.runId === e.runId && b.parsed.clonePath === e.clonePath);
       const raw = (await this.readAllAttemptLedgerRaw(barePath)).filter(([b]) => b === branch).map(([, v]) => v);
+      // A NON-canonical value (unparseable, or parseable but not byte-identical to its canonical form) naming a bound attempt is
+      // TAINTED: retireLedgerLast treats it as a possibly-later state it cannot interpret, so compaction must neither drop nor
+      // re-serialize it. With an undecodable binding set every non-canonical value is tainted (the binding may name it).
+      const boundAttemptIds = bindingRead.state === "read"
+        ? bindingRead.bindings.flatMap(b => b.parsed === undefined ? [] : [b.parsed.attemptId]) : [];
+      const tainted = (v: string): boolean => {
+        const e = parseAttemptLedgerEntry(v);
+        if (e !== undefined && v === attemptLedgerValue(e)) return false;
+        return bindingsUndecodable || boundAttemptIds.some(id => v.includes(id) || retireParsedNamesAttempt(v, id));
+      };
+      const taintedValues: string[] = [];
       const last = new Map<string, AttemptLedgerEntry>();
       for (const v of raw) {
+        if (tainted(v)) { taintedValues.push(v); continue; }
         const e = parseAttemptLedgerEntry(v);
         if (!e) continue;
         last.delete(e.attemptId);
@@ -18093,7 +18110,8 @@ export class GitCache {
       }
       const journaled = [...(await this.journaledClonePaths(barePath))];
       const namedByJournal = (p: string): boolean => journaled.some((j) => isWithinPath(j, p) || isWithinPath(p, j));
-      const kept: string[] = [];
+      // Tainted values first, byte-for-byte in their original relative order, then the compacted entries in last-write order.
+      const kept: string[] = [...taintedValues];
       for (const e of last.values()) {
         const gone = path.isAbsolute(e.clonePath) && !(await this.pathPresent(e.clonePath));
         const droppable = gone && !namedByJournal(e.clonePath) && !namedByBinding(e) && !(await this.hasPhysicalTerminalProtection(e.runId)) &&

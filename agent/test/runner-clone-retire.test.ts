@@ -3049,3 +3049,42 @@ it("normal: revocation during the quarantine rollback leaves the restored clone 
   assert.equal(fs.existsSync(movedTo), false);
   assert.deepEqual(readJournal(bare, branch), journal, "journal still names the restored canonical clone");
 });
+
+// issue #4263: a PARKED flight (owner pause park, no preserveRecoveryClone) that reaches the ordinary terminal retire must be
+// classed owner_terminal_covered (a retirement scratch binding that never settles or reclaims), while a plain non-parked
+// terminal flight keeps owner_terminal.
+describe("ordinary terminal retire disposition class by park state (#4263)", () => {
+  const LINUX_ONLY = process.platform !== "linux" ? "needs the Linux-only run-quiescence / stopped-source proof" : false;
+  const quiesce = async (): Promise<QuiesceRunOutcome> => ({
+    process: { state: "quiescent", processes: [], killed: [], detail: "" },
+    docker: { state: "not_wired", removed: [], detail: "" },
+  });
+
+  for (const parked of [true, false]) {
+    it(`${parked ? "a pause-parked" : "a non-parked failed"} flight retires as ${parked ? "owner_terminal_covered" : "owner_terminal"}`, { skip: LINUX_ONLY }, async t => {
+      const iid = parked ? 4263 : 4264;
+      const claim = gitlabClaim(iid, { claim_generation: 1 });
+      const retireSpy = t.mock.method(git, "retireRunnerClone");
+      t.mock.method(client, "publishCheckpoint", async (...args: Parameters<typeof client.publishCheckpoint>) => {
+        for await (const chunk of args[2]) void chunk;
+        return { ok: true, body: { published: true, ref: "refs/uzi-checkpoints/fixture" } };
+      });
+      const runner = runnerWith(() => ({
+        homeDir: path.join(homeDir, claim.run_id),
+        executor: {
+          run: async ctx => {
+            fs.writeFileSync(path.join(ctx.worktreePath, "work.txt"), "fresh work\n");
+            if (!parked) throw new Error("terminal executor failure");
+            const pausedAt = { completedCount: 0 };
+            assert.equal(await ctx.parkForPause?.(pausedAt), true, "owner pause park accepted");
+            return { branch: ctx.branch, pausedAt };
+          },
+        },
+      }), fakeGitlab().gitlab, undefined, nullLogger(), { quiesceRun: quiesce });
+      await runner.execute(claim);
+      if (parked) assert.equal(api.states.some(s => s.body.status === "paused"), true, "the run parked");
+      assert.deepEqual(retireSpy.mock.calls.map(c => (c.arguments[4] as { dispositionClass?: string }).dispositionClass),
+        [parked ? "owner_terminal_covered" : "owner_terminal"]);
+    });
+  }
+});
