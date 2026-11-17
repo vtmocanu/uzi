@@ -671,8 +671,12 @@ func TestHibernationSurplusAmbiguousCommitOwnerStopsLiveDB(t *testing.T) {
 	}
 	changed := 0
 	for _, id := range []uuid.UUID{cand1, cand2} {
-		if p.state(id) != "none" {
+		switch st := p.state(id); st {
+		case "none":
+		case "preparing":
 			changed++
+		default:
+			t.Fatalf("candidate %s state = %q, want none or preparing", id, st)
 		}
 	}
 	if changed != 1 {
@@ -705,9 +709,20 @@ func TestHibernationSurplusAmbiguousCommitBudgetLiveDB(t *testing.T) {
 		t.Fatalf("%d commits in one pass, want at most %d", got, HibernationAutoAdmissionsPerPass)
 	}
 	changed := 0
-	for _, id := range all {
-		if p.state(id) != "none" {
+	for i, id := range all {
+		st := p.state(id)
+		if i%2 == 1 { // each owner's keeper (5h) never changes
+			if st != "none" {
+				t.Fatalf("keeper %s state = %q, want none", id, st)
+			}
+			continue
+		}
+		switch st {
+		case "none":
+		case "preparing":
 			changed++
+		default:
+			t.Fatalf("candidate %s state = %q, want none or preparing", id, st)
 		}
 	}
 	if changed > HibernationAutoAdmissionsPerPass {
