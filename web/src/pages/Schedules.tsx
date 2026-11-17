@@ -48,7 +48,7 @@ import {
   PageHeader,
   cx,
 } from "../components/ui";
-import { PinnedBlock, TabRow, tabClass } from "../components/TabRow";
+import { keepInRowView, PinnedBlock, TabRow, tabClass } from "../components/TabRow";
 import { ChevronRightIcon, ClockIcon, PlusIcon } from "../components/icons";
 
 type Tab = "schedules" | "catalog";
@@ -175,6 +175,12 @@ export function Schedules() {
   // Refs to the tab buttons so the arrow-key handler can move focus with selection
   // (APG tabs, automatic activation): Left/Right wrap, Home/End jump to the ends.
   const tabRefs = useRef<Partial<Record<Tab, HTMLButtonElement | null>>>({});
+  // preventScroll also skips the overflowing row's sideways scroll, so reveal the tab ourselves.
+  const focusTab = (target: Tab) => {
+    const el = tabRefs.current[target];
+    el?.focus({ preventScroll: true });
+    keepInRowView(el?.closest<HTMLElement>('[role="tablist"]'), el);
+  };
   const onTabKeyDown = (e: React.KeyboardEvent) => {
     const idx = TAB_ORDER.indexOf(tab);
     let next = idx;
@@ -186,7 +192,7 @@ export function Schedules() {
     e.preventDefault();
     const target = TAB_ORDER[next];
     setTab(target);
-    tabRefs.current[target]?.focus({ preventScroll: true });
+    focusTab(target);
   };
 
   // schedules/catalog/repos are seeded here as fetcher side effects because all three
@@ -384,7 +390,7 @@ export function Schedules() {
       await api.deleteSchedule(s.id);
       await reload();
       if (fromList && neighbour) setPendingReveal({ id: neighbour.id, focus: true, afterSeq: 0 });
-      else if (fromList) tabRefs.current.schedules?.focus({ preventScroll: true });
+      else if (fromList) focusTab("schedules");
     } catch (err) {
       setError(errorMessage(err, "Could not remove the schedule"));
     } finally {
@@ -420,7 +426,7 @@ export function Schedules() {
   const showJobInSchedules = (slug: string) => {
     setTab("schedules");
     applyFilter({ ...NO_FILTER, jobSlug: slug });
-    tabRefs.current.schedules?.focus({ preventScroll: true });
+    focusTab("schedules");
   };
 
   // Closing the edit modal: a clone's modal hands focus to the cloned row (D12).
@@ -649,8 +655,8 @@ export function Schedules() {
       // the request is dropped instead of lingering to steal focus later.
       if (!row && schedules && loadedSeq >= pendingReveal.afterSeq) {
         setPendingReveal(null);
-        if (pendingReveal.focus && pendingReveal.fallbackFocus !== false) tabRefs.current.schedules?.focus({ preventScroll: true });
-      }
+        if (pendingReveal.focus && pendingReveal.fallbackFocus !== false) focusTab("schedules");
+}
       return;
     }
     el.scrollIntoView?.({ block: "nearest" });

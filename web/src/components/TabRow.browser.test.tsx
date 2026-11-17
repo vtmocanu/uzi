@@ -569,6 +569,41 @@ describe("pinned tablists keep their keyboard contract (#4419)", () => {
     });
   }
 
+  for (const [name, idx, tabs, width, mustOverflow] of [
+    ["Schedules", 3, [/^Schedules/, /^Job catalog/], 240, true],
+    ["Workers", 4, [/^Your workers/, /^Add a worker/], 240, true],
+  ] as const) {
+    it(`${name} at ${width}px: arrow, End and Home keep the focused tab inside the overflowing row`, async () => {
+      document.documentElement.style.overflowAnchor = "none";
+      await mount(scenarios[idx], width, 700, <div style={{ height: 6000 }} />);
+      await scrollDeep();
+      const tab = (re: RegExp) => screen.getByRole("tab", { name: re });
+      const row = tab(tabs[0]).closest<HTMLElement>('[role="tablist"]')!;
+      const overflows = row.scrollWidth > row.clientWidth;
+      if (mustOverflow) expect(overflows, "the row overflows").toBe(true);
+      tab(tabs[0]).focus({ preventScroll: true });
+      const y = window.scrollY;
+      const expectVisible = (label: string) => {
+        expect(window.scrollY, `${label} leaves the window put`).toBe(y);
+        if (!overflows) return;
+        const r = row.getBoundingClientRect();
+        const t = document.activeElement!.getBoundingClientRect();
+        expect(t.left, `${label}: tab left edge`).toBeGreaterThanOrEqual(r.left - 0.5);
+        expect(t.right, `${label}: tab right edge`).toBeLessThanOrEqual(r.right + 0.5);
+      };
+      await userEvent.keyboard("{ArrowRight}");
+      await waitFor(() => expect(tab(tabs[1]).getAttribute("aria-selected")).toBe("true"));
+      expect(document.activeElement).toBe(tab(tabs[1]));
+      expectVisible("ArrowRight");
+      await userEvent.keyboard("{Home}");
+      await waitFor(() => expect(tab(tabs[0]).getAttribute("aria-selected")).toBe("true"));
+      expectVisible("Home");
+      await userEvent.keyboard("{End}");
+      await waitFor(() => expect(tab(tabs[1]).getAttribute("aria-selected")).toBe("true"));
+      expectVisible("End");
+    });
+  }
+
   for (const width of [1440, 400]) {
     it(`Schedules at ${width}px: Pause all, from deep in the page, shows the picker with focus in it`, async () => {
       await mount(scenarios[3], width);

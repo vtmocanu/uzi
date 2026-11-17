@@ -9,7 +9,7 @@ import { Link, useLocation, useSearchParams } from "react-router-dom";
 import { api, type BindMode, type Worker } from "../lib/api";
 import { ApiError, errorMessage } from "../lib/apiError";
 import { Alert, Badge, Button, Card, EmptyState, Field, Input, PageHeader, SectionTitle, Select, Skeleton, cx } from "../components/ui";
-import { PinnedBlock, TabRow, tabClass } from "../components/TabRow";
+import { keepInRowView, PinnedBlock, TabRow, tabClass } from "../components/TabRow";
 import { FleetUpgradePanel, WorkerUpgradeBadge, WorkerUpgradeDetail } from "../components/WorkerUpgradeBadge";
 import { useAppVersion } from "../components/AppShell";
 import { PlusIcon, ServerIcon } from "../components/icons";
@@ -356,7 +356,10 @@ export function WorkersSettings() {
     e.preventDefault();
     const target = TAB_ORDER[next];
     selectTab(target);
-    tabRefs.current[target]?.focus({ preventScroll: true });
+    const el = tabRefs.current[target];
+    el?.focus({ preventScroll: true });
+    // preventScroll also skips the row's sideways scroll, so reveal the tab ourselves.
+    keepInRowView(el?.closest<HTMLElement>('[role="tablist"]'), el);
   };
 
   // rebind points one worker at a named token, or clears the binding when the
