@@ -171,18 +171,20 @@ all of these hold:
    '<url>'` with nothing after it, or an empty (or empty `remote:`) line.
 
 Any other line keeps today's classification, so another `remote rejected`
-reason (other than `missing necessary objects`, added by #4438), a `[rejected]` line and every `remote:` diagnostic (a stated reason,
-marked or not: `GHnnn`, `remote: error:`, GitHub's backticked workflow-scope
-refusal, or free text such as a repository-policy notice) stay permanent.
-This is narrower than enumerating refusal markers: a reason the classifier has
-never seen cannot turn a deterministic refusal transient.
+reason (other than `missing necessary objects`, added by #4438), a
+`[rejected]` line and every `remote:` diagnostic (a stated reason, marked or
+not: `GHnnn`, `remote: error:`, GitHub's backticked workflow-scope refusal, or
+free text such as a repository-policy notice) stay permanent. This is narrower
+than enumerating refusal markers: a reason the classifier has never seen
+cannot turn a deterministic refusal transient.
 
 `/remote rejected/i` **stays** in `PERMANENT_PATTERNS`; the exception is a
 narrow, format-based pre-check, with no forge identity in the classifier.
 Everything else is unchanged and permanent: any other reason (other than
-`missing necessary objects`, #4438; including `failed to update ref` and `failed to lock`), authentication failures,
-protected-branch and pre-receive-hook refusals, workflow scope, `GH013`, and
-non-fast-forward or `[rejected]`.
+`missing necessary objects`, #4438; including `failed to update ref` and
+`failed to lock`), authentication failures, protected-branch and
+pre-receive-hook refusals, workflow scope, `GH013`, and non-fast-forward or
+`[rejected]`.
 
 **Effect.** At the finalize branch push (`pushToOrigin`: the plain arm and the
 `base_align` overlay, merge and rebase arms), the same non-forced push of the
@@ -255,21 +257,21 @@ whether the local candidate is complete, and this amendment does not rely on
 it. Any additional local or remote diagnostic line keeps the error
 permanent.
 
-**Lookalikes stay permanent.** `(missing necessary objects) x`,
-`(missing necessary object)`, `(missing necessary objects: ...)`,
-`(n/a (unpacker error))`, `(bad pack)`, `(shallow update not allowed)`, a
-retryable reason beside any other reason on another ref (two retryable
-reasons on different refs are transient; finalize pushes one ref), either reason accompanied by a `remote:` diagnostic, and
-`[rejected]` or non-fast-forward lines.
+**Lookalikes stay permanent.** `(missing necessary objects) x`, `(missing
+necessary object)`, `(missing necessary objects: ...)`, `(n/a (unpacker
+error))`, `(bad pack)`, `(shallow update not allowed)`, a retryable reason
+beside any other reason on another ref (two retryable reasons on different
+refs are transient; finalize pushes one ref), either reason accompanied by a
+`remote:` diagnostic, and `[rejected]` or non-fast-forward lines.
 
 **Accepted risk.** A deterministic server-side fault that prints only this
 line exhausts its retries and is labelled `publication_forge_unreachable`
 ("unreachable"); an enrolled run re-parks until the hold threshold. This
-mirrors the #3929 accepted risk (related: #3585). Today only clone/fetch
-retry groups update the worker-origin cooldown; if exhausted publication
-failures are ever counted toward it (see #1324), such a fault could put the
-worker on cooldown for the whole origin. Retry backoff does not bound overall recovery time;
-parking and its duration policy are unchanged.
+mirrors the #3929 accepted risk (related: #3585). An exhausted publication
+park also records the failure on the worker-origin cooldown (#1324 D9), so
+such a fault can put the worker on cooldown for the whole origin and push the
+run's retry time to that cooldown's deadline. Retry backoff does not bound
+overall recovery time; parking and its duration policy are unchanged.
 
 **Scope.** Worker-only, as for #3929: older workers keep the old behaviour,
 and there is no API or schema change.
