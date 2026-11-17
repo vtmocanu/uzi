@@ -141,6 +141,10 @@ type dbStat struct {
 	schemaHead    int64
 	schemaAtHead  bool
 	schemaErr     error
+	// Cumulative pgxpool counters since pool creation; the db check works on their deltas.
+	emptyAcquireCount    int64
+	emptyAcquireWait     time.Duration
+	canceledAcquireCount int64
 }
 
 // Config carries the injected collaborators. Every field is a seam a unit test overrides.
@@ -238,6 +242,15 @@ type Service struct {
 	dbSizeInitialized bool
 	dbSizeResult      apitypes.HealthCheckDTO
 	dbSizeRefreshedAt time.Time
+
+	// poolWaitMu guards the db pool-wait window state (see poolWaitVerdict).
+	poolWaitMu          sync.Mutex
+	poolWaitInitialized bool
+	poolWaitBaselineAt  time.Time
+	poolWaitBaseCount   int64
+	poolWaitBaseWait    time.Duration
+	poolWaitBaseCancels int64
+	poolWaitCached      poolWait
 }
 
 // New builds a Service from cfg. The db probe defaults to the live-pool probe; a nil pool
