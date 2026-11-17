@@ -16,6 +16,16 @@ func WithQueryTracer(t pgx.QueryTracer) PoolOption {
 	return func(cfg *pgxpool.Config) { cfg.ConnConfig.Tracer = t }
 }
 
+// WithMaxConns sets the pool's maximum connection count to n. A non-positive n leaves the
+// parsed value (the DSN's pool_max_conns, else pgx's max(4, NumCPU) default) unchanged.
+func WithMaxConns(n int32) PoolOption {
+	return func(cfg *pgxpool.Config) {
+		if n > 0 {
+			cfg.MaxConns = n
+		}
+	}
+}
+
 // OpenPool creates a pgx connection pool and verifies connectivity.
 func OpenPool(ctx context.Context, dsn string, opts ...PoolOption) (*pgxpool.Pool, error) {
 	cfg, err := pgxpool.ParseConfig(dsn)
