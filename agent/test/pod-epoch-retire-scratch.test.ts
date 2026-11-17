@@ -1203,6 +1203,9 @@ describe("a non-canonical ledger value naming the attempt outranks an earlier ca
     ["reordered keys", s => JSON.stringify({ runId: s.runId, attemptId: s.attemptId, clonePath: s.clonePath, state: "live" })],
     ["whitespace", s => JSON.stringify({ attemptId: s.attemptId, runId: s.runId, clonePath: s.clonePath, state: "live" }, null, 1)],
     ["an unknown field", s => JSON.stringify({ attemptId: s.attemptId, runId: s.runId, clonePath: s.clonePath, state: "live", extra: 1 })],
+    // The attempt id (and the clone path embedding it) spelled with JSON unicode escapes: it parses to the same id but
+    // never appears literally in the raw value.
+    ["JSON-escaped attemptId and clonePath", s => JSON.stringify({ attemptId: s.attemptId, runId: s.runId, clonePath: s.clonePath, state: "live" }).split(s.attemptId).join(s.attemptId.replace(/T/g, "\\u0054"))],
   ];
   for (const [label, value] of variants) {
     it(`a later live entry with ${label} keeps the settled parent`, async () => {

@@ -76,9 +76,10 @@ const FD_PROBE = [
 const RACER = [
   'const fs=require("node:fs");const outside=process.argv[1];const end=Date.now()+8000;let swaps=0;const R="/proc/self/fd/3/";',
   'const names=[];for(let i=0;i<4;i++)names.push("r"+i);',
-  'let seenNonEmpty=false;',
+  'let seenNonEmpty=false;let ready=false;',
   'while(Date.now()<end){',
   ' let left;try{left=fs.readdirSync(R);}catch{break;}',
+  ' if(!ready){ready=true;fs.writeSync(1,"READY\\n");}',
   ' if(left.length>0)seenNonEmpty=true; else if(seenNonEmpty)break;',
   ' for(const n of names){try{fs.renameSync(R+n,R+n+".aside");fs.symlinkSync(outside,R+n);swaps++;',
   '   fs.unlinkSync(R+n);fs.renameSync(R+n+".aside",R+n);}catch{}}',
@@ -141,11 +142,12 @@ async function retireOp(req: { root: string; parentName: string; cache: string; 
     fs.renameSync(clone, path.join(parent, "moved"));
     if (plant === "symlink") fs.symlinkSync(req.outside, clone); else fs.mkdirSync(clone);
   };
-  const race = () => {
+  const race = async () => {
     if (req.race === "clone-symlink-before") swapClone("symlink");
     else if (req.race === "clone-dir-before") swapClone("dir");
     else if (req.race === "concurrent") {
-      // Started asynchronously; the gate is released at once, so the racer and the helper run at the same time.
+      // Started asynchronously; the caller releases the gate only after the racer's READY line (its first successful
+      // readdir of the clone), so the helper cannot win the start race and leave the racer nothing to swap.
       const pinned = fs.openSync(clone, O_PATH_DIR);
       const w = runnerCommand(process.execPath, ["-e", RACER, req.outside]);
       const child = spawn(w.command, w.args, { env: { PATH: "/usr/bin:/bin" }, stdio: ["ignore", "pipe", "pipe", pinned] });
@@ -153,9 +155,12 @@ async function retireOp(req: { root: string; parentName: string; cache: string; 
       let out = "";
       child.stdout!.on("data", chunk => { out += chunk; });
       racer = new Promise(resolve => child.once("close", status => {
-        let swaps = -1; try { swaps = JSON.parse(out).swaps; } catch { /* reported as -1 */ }
+        let swaps = -1; try { swaps = JSON.parse(out.replace(/^READY\n/, "")).swaps; } catch { /* reported as -1 */ }
         resolve({ swaps, status });
       }));
+      // Bounded (15 s): a racer that never reports ready fails the case rather than hanging or silently racing nothing.
+      for (let i = 0; i < 300 && !out.startsWith("READY\n"); i++) await new Promise(resolve => setTimeout(resolve, 50));
+      if (!out.startsWith("READY\n")) throw new Error("runner racer never reported ready");
     } else if (req.race === "descendant") {
       // The runner moves one subtree out of the clone and plants a symlink to an outside directory in its place.
       runnerSh('mv /proc/self/fd/3/nested "$1/moved-out" && ln -s "$2" /proc/self/fd/3/nested', req.elsewhere, req.outside);
@@ -197,8 +202,8 @@ async function retireOp(req: { root: string; parentName: string; cache: string; 
       } finally { fs.closeSync(clonePin); }
     }
     if (req.gate) {
-      void waitFor(req.gate.started).then(() => {
-        race();
+      void waitFor(req.gate.started).then(async () => {
+        await race();
         if (!req.gate!.hold) fs.writeFileSync(req.gate!.release, "");
       }).catch(() => { fs.writeFileSync(req.gate!.release, ""); });
     }

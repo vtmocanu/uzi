@@ -2681,9 +2681,18 @@ function retireLedgerLast(evidence: RetireScratchBareEvidence, attemptId: string
     const entry = parseAttemptLedgerEntry(raw);
     if (entry && raw === attemptLedgerValue(entry)) {
       if (entry.attemptId === attemptId) last = { branch, raw, entry };
-    } else if (raw.includes(attemptId)) return "tainted";
+    } else if (raw.includes(attemptId) || retireParsedNamesAttempt(raw, attemptId)) return "tainted";
   }
   return last;
+}
+
+/** Does a non-canonical value parse (JSON escapes decoded, so the id need not appear literally) to an object naming the attempt? */
+function retireParsedNamesAttempt(raw: string, attemptId: string): boolean {
+  if (parseAttemptLedgerEntry(raw)?.attemptId === attemptId) return true;
+  try {
+    const v: unknown = JSON.parse(raw);
+    return typeof v === "object" && v !== null && (v as { attemptId?: unknown }).attemptId === attemptId;
+  } catch { return false; }
 }
 
 /** Does any recorded path equal, lie under, or contain the parent or the binding's clone path? Alias-aware for the parent. */
