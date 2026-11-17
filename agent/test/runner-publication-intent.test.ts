@@ -450,37 +450,44 @@ it("a non-enrolled run keeps the existing typed failure for the same outage", as
   assert.match(String(failed(claim.run_id)[0]?.failure_reason), /publication_forge_unreachable: push/);
 });
 
-// #3929: GitHub's bare ` ! [remote rejected] <sha> -> <branch> (failed)` is classified transient (cause unproven).
-const BARE_FAILED_STDERR =
-  "To https://github.com/org/repo.git\n ! [remote rejected] 0123456789abcdef0123456789abcdef01234567 -> agent/issue-5113 (failed)\n" +
+// #3929, #4438: GitHub's bare ` ! [remote rejected] <sha> -> <branch> (failed)` and its `(missing necessary objects)`
+// sibling are classified transient (cause unproven). Distinct iids per reason.
+const RETRYABLE_REASONS = ["failed", "missing necessary objects"] as const;
+const bareRejectedStderr = (iid: number, reason: string) =>
+  `To https://github.com/org/repo.git\n ! [remote rejected] 0123456789abcdef0123456789abcdef01234567 -> agent/issue-${iid} (${reason})\n` +
   "error: failed to push some refs to 'https://github.com/org/repo.git'\n";
 
-it("a sustained bare remote-rejected (failed) push on an enrolled run parks on the git surface", async () => {
-  client.protocolFeatures = FEATURES;
-  const outbox = await mkOutbox();
-  ackIntents([]);
-  let pushes = 0;
-  failGit("push", BARE_FAILED_STDERR, () => { pushes++; });
-  const claim = claimFor(5113);
-  const r = build(new StubExecutor(nullLogger()), { gitlab: fakeGitlab().gitlab }, outbox);
-  await r.execute(claim);
-  assert.equal(pushes, ATTEMPTS);
-  const park = parks(claim.run_id);
-  assert.equal(park.length, 1);
-  assert.deepEqual([park[0]!.recovery_phase, park[0]!.publication_surface, park[0]!.publication_step], ["publication", "git", "push"]);
-  assert.equal(failed(claim.run_id).length, 0);
-});
+RETRYABLE_REASONS.forEach((reason, idx) => {
+  const enrolledIid = 5113 + idx * 100;
+  const plainIid = 5114 + idx * 100;
 
-it("a sustained bare remote-rejected (failed) push on a non-enrolled run fails typed publication_forge_unreachable: push", async () => {
-  client.protocolFeatures = ["recovery_park_cause"];
-  let pushes = 0;
-  failGit("push", BARE_FAILED_STDERR, () => { pushes++; });
-  const claim = claimFor(5114);
-  const r = build(new StubExecutor(nullLogger()), { gitlab: fakeGitlab().gitlab }, await mkOutbox());
-  await r.execute(claim);
-  assert.equal(pushes, ATTEMPTS);
-  assert.equal(parks(claim.run_id).length, 0);
-  assert.match(String(failed(claim.run_id)[0]?.failure_reason), /publication_forge_unreachable: push/);
+  it(`a sustained bare remote-rejected (${reason}) push on an enrolled run parks on the git surface`, async () => {
+    client.protocolFeatures = FEATURES;
+    const outbox = await mkOutbox();
+    ackIntents([]);
+    let pushes = 0;
+    failGit("push", bareRejectedStderr(enrolledIid, reason), () => { pushes++; });
+    const claim = claimFor(enrolledIid);
+    const r = build(new StubExecutor(nullLogger()), { gitlab: fakeGitlab().gitlab }, outbox);
+    await r.execute(claim);
+    assert.equal(pushes, ATTEMPTS);
+    const park = parks(claim.run_id);
+    assert.equal(park.length, 1);
+    assert.deepEqual([park[0]!.recovery_phase, park[0]!.publication_surface, park[0]!.publication_step], ["publication", "git", "push"]);
+    assert.equal(failed(claim.run_id).length, 0);
+  });
+
+  it(`a sustained bare remote-rejected (${reason}) push on a non-enrolled run fails typed publication_forge_unreachable: push`, async () => {
+    client.protocolFeatures = ["recovery_park_cause"];
+    let pushes = 0;
+    failGit("push", bareRejectedStderr(plainIid, reason), () => { pushes++; });
+    const claim = claimFor(plainIid);
+    const r = build(new StubExecutor(nullLogger()), { gitlab: fakeGitlab().gitlab }, await mkOutbox());
+    await r.execute(claim);
+    assert.equal(pushes, ATTEMPTS);
+    assert.equal(parks(claim.run_id).length, 0);
+    assert.match(String(failed(claim.run_id)[0]?.failure_reason), /publication_forge_unreachable: push/);
+  });
 });
 
 it("a lost park ACK is reconciled through the ownership probe: parked once, record kept, no failure", async () => {
