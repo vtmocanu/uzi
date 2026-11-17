@@ -1,8 +1,10 @@
 # Live Codex switching: per-seam proof ledger
 
 Base: a233883de3c36bae2e940f999cd9d582889dad00.
-Candidate code: 6a7e7ae11b43c8fbf658d8b2fdcc557441c699c8, with the
-test-only replacement-first adoption assertion in this commit.
+Latest stopped-guard source/test revision: 76cc31aee1b0dafd644e9fa3fb7593442dc7ed6b.
+Earlier Runner controls below used 6a7e7ae11b43c8fbf658d8b2fdcc557441c699c8
+and the replacement-first adoption assertion as specified per control.
+Results belong to their recorded revisions; this is not an exact-head full-suite claim.
 The earlier [validation record](credential-switch-validation.md) retains
 positive execution, review and migration evidence. Passing positive tests
 alone does not satisfy the proof-method requirement below.
@@ -191,6 +193,89 @@ C1 is executor suspension moved ahead of Now drain; C2 is A reconciliation
 moved after persistence. Both failed the six real Runner cases; unchanged candidate passed.
 These proofs remain credited for those exact orderings only.
 
+### D1–D24 — stopped route guard controls, class (d)
+
+The lead completed `.uzi/scratch/stopped-guard-controls.py`, exit 0, at
+76cc31aee1b0dafd644e9fa3fb7593442dc7ed6b. The manifest
+`.uzi/scratch/stopped-guard-results.json` records exact changes and logs.
+These are **guard controls**, not pre-feature baseline evidence. All 24 use
+the exact shared refusal/absence evidence in the baseline section below.
+
+The fixture in api/internal/handler/codex_switch_stopped_guards_livedb_test.go
+uses authenticated WorkerRoutes, negotiates a real registration nonce, seeds
+a Codex binding and journal, and stamps the switch through the owner service.
+Real HTTP preflight latches epoch 41; HTTP withdrawal clears the pending
+switch; `/state` reaches the service with the pool as transaction beginner.
+`epoch_applied_successor` instead applies through HTTP, commits epoch 42,
+and reports the retained 41. Snapshot comparisons cover the full run,
+base/switch journals, messages, inputs and custody rows. First settlement
+permits its specified status/timestamps and health reset; replay compares
+without those exclusions. The fixture seeds stalled health and checks its
+reset, and checks the committed minimal acknowledgement. These test repairs
+were reviewed clean at the recorded revision.
+
+Each distinct negative used its own disposable candidate export and log;
+exports ran serially and were removed immediately. Source query
+api/internal/store/queries/codex_switch_stopped.sql and generated counterpart
+api/internal/store/codex_switch_stopped.sql.go changed together, removing or
+neutralizing one behavioral guard. No base builds or installations were used.
+The wave recreated its owned PostgreSQL 17 fixture and removed it by exact
+name with `docker rm -fv` after completion.
+
+From each export's api directory:
+
+```sh
+GOFLAGS=-p=1 GOMAXPROCS=4 go test -buildvcs=false -race -count=1 -json -timeout=5m \
+  ./internal/handler -run '^TestWorkerCodexStoppedGuardsRouteLiveDB$/<selected>'
+```
+
+For 23 mutants, `<selected>` includes both the negative case and
+`fresh_and_replay`; the latter passed as an independent SQL-prepare control.
+Only `replay_update` omits it because that mutation deliberately breaks the
+same replay invariant. Each negative compiled and exited 1 at its intended
+assertion, with no SQL-prepare/build failure credited. Unchanged before
+`.uzi/scratch/gate-log.oduxq5` and after `.uzi/scratch/gate-log.COd4tJ`
+each exited 0 with 25 subcases passed and no skips.
+
+In the table, E neutralizes numeric epoch equality; P removes just the named
+input kind from the pending-input anti-join; B replaces positive remaining
+budget with a non-NULL check; C replaces the original paused clock with the
+current clock; W removes `e.status <> 'paused'` from the update guard.
+E/P/B produced `refusal mismatch: status=200 applied=true` (22 cases).
+C produced `stop acceptance mismatch: status=409 applied=false`;
+W produced `snapshot changed in run`.
+
+| Case | Guard | Individual log |
+| --- | --- | --- |
+| `epoch_running_stale` | E: epoch equality | `.uzi/scratch/gate-log.ogXTFm` |
+| `epoch_running_mismatched` | E: epoch equality | `.uzi/scratch/gate-log.c50m7z` |
+| `pending_running_pause` | P: pause | `.uzi/scratch/gate-log.bWq6SF` |
+| `pending_running_pause_cancel` | P: pause_cancel | `.uzi/scratch/gate-log.UWNi71` |
+| `pending_running_cancel` | P: cancel | `.uzi/scratch/gate-log.KZmCnX` |
+| `pending_running_stop` | P: stop | `.uzi/scratch/gate-log.nSMZWr` |
+| `pending_running_scope` | P: scope | `.uzi/scratch/gate-log.hXkvEu` |
+| `pending_running_revise_plan` | P: revise_plan | `.uzi/scratch/gate-log.CCYkJW` |
+| `pending_running_reject_plan` | P: reject_plan | `.uzi/scratch/gate-log.R4pGvP` |
+| `pending_running_resume` | P: resume | `.uzi/scratch/gate-log.zBOSyJ` |
+| `epoch_paused_stale` | E: epoch equality | `.uzi/scratch/gate-log.mkAz6B` |
+| `epoch_paused_mismatched` | E: epoch equality | `.uzi/scratch/gate-log.zKToni` |
+| `pending_paused_pause` | P: pause | `.uzi/scratch/gate-log.EvnbDg` |
+| `pending_paused_pause_cancel` | P: pause_cancel | `.uzi/scratch/gate-log.GlTnMJ` |
+| `pending_paused_cancel` | P: cancel | `.uzi/scratch/gate-log.VQGklP` |
+| `pending_paused_stop` | P: stop | `.uzi/scratch/gate-log.JCkZpL` |
+| `pending_paused_scope` | P: scope | `.uzi/scratch/gate-log.AEcM5d` |
+| `pending_paused_revise_plan` | P: revise_plan | `.uzi/scratch/gate-log.teLSlJ` |
+| `pending_paused_reject_plan` | P: reject_plan | `.uzi/scratch/gate-log.w6NTYZ` |
+| `pending_paused_resume` | P: resume | `.uzi/scratch/gate-log.cie8tb` |
+| `epoch_applied_successor` | E: epoch equality | `.uzi/scratch/gate-log.kEvre2` |
+| `paused_expired_budget` | B: remaining budget | `.uzi/scratch/gate-log.7ub1jo` |
+| `paused_replay_original_clock` | C: original pause clock | `.uzi/scratch/gate-log.qzCiDa` |
+| `paused_replay_no_write` | W: replay no-write | `.uzi/scratch/gate-log.wpJOcF` |
+
+This credits five epoch cases, sixteen pending-kind/state cases and three
+budget/clock/write cases. It does not credit the other stopped guards or
+broader preservation and strict-wire clauses below.
+
 ## Clause accounting
 
 The rows below split mixed requirements. Positive coverage is recorded in
@@ -218,13 +303,38 @@ control is still absent, not that the functional criterion was deferred.
 | Ordinal-zero baseline, successor journal ordinal/capability relation and usage attribution | Positive assertions present; qualifying controls unvalidated |
 | Atomic rollback, lost-reply replay, stale/foreign apply and target fences | Unvalidated |
 | Stopped-support negotiation, immutable expected-epoch latch and unsupported-response obligation | Unvalidated |
-| Stopped numeric epoch, registration/claim ownership, pending-control exclusion, wall/policy/reserve fences | Unvalidated |
-| Stopped replay after withdrawn X/Y; refusal after epoch/claim/incarnation changes; original pause clock | Unvalidated |
+| Stopped numeric epoch equality: stale/mismatched running and paused, applied successor | D controls: five individually executed cases above |
+| Stopped pending-input exclusion for eight named kinds in running and paused states | D controls: sixteen individually executed cases above; other control flags/cutoffs unvalidated |
+| Paused replay rejects expired wall budget | D: paused_expired_budget; other wall-budget branches unvalidated |
+| Paused replay uses original pause clock and performs no run update | D: paused_replay_original_clock and paused_replay_no_write |
+| Stopped registration/claim ownership and incarnation fences | Unvalidated |
+| Stopped policy/reserve and other competing-control fences | Unvalidated |
+| Stopped replay after withdrawn X/Y; resume/reclaim and incarnation changes | Unvalidated; the fixture's single HTTP withdrawal does not discharge X/Y |
 | Stopped preservation of binding, journals, session, gates, questions and custody without input consumption/time banking | Unvalidated |
 | Bounded strict stopped request, forbidden op_id/combinations and minimal acknowledgement | Unvalidated |
 | Tokens absent from all inputs/acknowledgements/messages/logs | Targeted positive assertions present; qualifying controls and m4 security gates remain required |
 
 ## Baseline absence and the class (d) method boundary
+
+At exact base a233883de3c36bae2e940f999cd9d582889dad00,
+api/internal/workersvc/service.go:5901–5902 refuses unsupported states:
+
+```go
+default:
+    return store.Run{}, false, ErrInvalidState
+```
+
+api/internal/handler/worker_protocol.go:1605–1606 maps ErrInvalidState to
+HTTP 400 with the exact refusal:
+
+```text
+state must be one of running, awaiting_approval, awaiting_input, awaiting_followup, limit_wait, recovery_wait, paused, pause_failed, credential_switch, credential_switch_failed, credential_switch_held, credential_switch_hold_settled, credential_switch_uncertain, clarification_settled, completed, failed
+```
+
+This list excludes `codex_switch_stopped`. Read-only `git show` confirms
+api/internal/store/queries/codex_switch_stopped.sql is absent at that exact
+base (path-not-in-revision error), and there is no corresponding stopped
+numeric `expected_epoch` request shape. No base was built.
 
 At a233, ordinary `SetRunPaused` (queries/runtime.sql:4426–4446) required
 `status = 'running'`, `pause_requested_at IS NOT NULL` and a pause mode
@@ -243,10 +353,10 @@ The stopped numeric epoch equality, pending-input anti-join and paused-replay
 eligibility/accounting are new non-ordering predicates. Whole-operation
 refusal cannot discriminate those negative fences; their guards are not
 historically identical, and they are not call-order requirements. The subsequent owner class (d) extension resolves this method boundary.
-These clauses remain required and unvalidated until their individual real-path
-guard controls have executed; no functional criterion is accepted, waived
-or deferred.
+The 24 individual real-route guard controls above now discharge the precise
+credited seams, not this entire predicate. Other clauses remain required and
+unvalidated; no functional criterion is accepted, waived or deferred.
 
-Other unvalidated rows also remain worker obligations. m3 is incomplete.
-m4, exact-head CI obligations and two-real-account owner acceptance retain
+Other unvalidated rows also remain worker obligations. m3 and m4 are **INCOMPLETE**.
+Exact-head CI obligations and two-real-account owner acceptance retain
 their existing classifications.

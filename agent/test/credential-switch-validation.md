@@ -4,8 +4,9 @@ This is a partial evidence ledger for issue #4202, recorded on 2026-11-17.
 It does not declare m3 or m4 complete. Earlier scratch logs were absent after
 recovery; historical commit messages are not treated as passing checks.
 
-Candidate tested: 73e662c846ac9df92356dd61831967167c44d8ae.
-The primary worktree remained unchanged during the controls below. Both mutants
+Latest stopped-guard source/test revision: 76cc31aee1b0dafd644e9fa3fb7593442dc7ed6b.
+Earlier Runner ordering candidate: 73e662c846ac9df92356dd61831967167c44d8ae.
+The primary worktree remained unchanged during those ordering controls. Both mutants
 were applied only to disposable exports of this exact candidate, with provisioned
 agent dependencies linked into each export. No dependencies were installed.
 Each export was removed after its command exited.
@@ -92,8 +93,8 @@ deadcode and TypeScript checks.
 ## Transactional recovery and compatibility repair
 
 On 2026-11-17, the lead recreated a unique throwaway PostgreSQL 17 container
-using the already available image, with no persistent volumes and a loopback
-port. The container was removed by exact name after the command exited.
+using the already available image, with no named/shared volumes and a loopback
+port. This does not establish removal of Docker's anonymous data volume. The container was removed by exact name after the command exited.
 With its database URL in UZI_TEST_DATABASE_URL, the lead ran from api:
 
 ```sh
@@ -290,6 +291,49 @@ and api/internal/handler respectively. Other agent files are under agent/test.
 | Request 1 MiB, acknowledgement 16 KiB, no op_id | handler codex_switch_stopped_decode_test.go: `TestWorkerStateStoppedStrictBody`, `TestStoppedSettlementAck`; codex_switch_stopped_route_test.go: `TestWorkerRunStateCodexSwitchStoppedRoute`; client-credential-switch-apply.test.ts wire cases. |
 | Targeted token absence | client-credential-switch-apply.test.ts: `Codex switch wire contract` and token/body error assertions; workersvc credential_switch_codex_apply_livedb_test.go: `TestCodexTransactionalApplyBundleLiveDB` journal/run/feed assertions; handler codex_switch_preflight_routes_livedb_test.go response assertions. These do not establish m4 security gates. |
 
+## Stopped guard route evidence at 76cc31a
+
+The lead's `.uzi/scratch/stopped-guard-controls.py` completed with exit 0 at
+76cc31aee1b0dafd644e9fa3fb7593442dc7ed6b. Its manifest
+`.uzi/scratch/stopped-guard-results.json` records 24 compiling class (d)
+**guard controls**, each with an individual log and exact one-guard change
+in both SQL source and generated counterpart. These are not pre-feature
+baseline evidence. The [per-case proof ledger](credential-switch-proof-ledger.md)
+records five epoch, sixteen pending-kind/state and three budget/clock/write
+cases and their failure witnesses.
+
+The actual authenticated WorkerRoutes fixture negotiates registration,
+seeds the Codex binding/journal, stamps an owner switch, latches epoch 41 via
+HTTP preflight, withdraws via HTTP and reports `/state` through the pool-backed
+transaction. The applied-successor case commits epoch 42 through HTTP apply
+before reporting retained 41. Snapshots compare full run/base/switch/messages/
+inputs/custody; fresh settlement allows the specified status/timestamp/health
+changes, while replay allows no changes. The stalled-health reset and
+committed minimal-acknowledgement test repairs were reviewed clean at 76cc31a.
+These observations do not establish broader preservation or strict-wire proof.
+
+Each mutant ran serially in its own candidate export, removed immediately,
+with no base builds or installations. The owned PostgreSQL 17 container was
+recreated for the wave and removed by exact name using `docker rm -fv`.
+Commands used `GOFLAGS=-p=1 GOMAXPROCS=4` and
+`go test -buildvcs=false -race -count=1 -json -timeout=5m ./internal/handler`
+with the named route/subcase selector. For 23 mutants the selector also ran
+`fresh_and_replay`, which passed as an independent SQL-prepare control;
+only replay_update omitted it because it breaks that replay invariant.
+All 24 intended negatives compiled and exited 1: 22 inappropriate acceptances
+(`refusal mismatch: status=200 applied=true`), original-clock refusal
+(`stop acceptance mismatch: status=409 applied=false`) and replay write
+(`snapshot changed in run`). Before `.uzi/scratch/gate-log.oduxq5` and after
+`.uzi/scratch/gate-log.COd4tJ` each exited 0: 25 subcases passed, no skips.
+
+The primary focused route matrix (new 25 plus existing apply/preflight)
+passed in `.uzi/scratch/gate-log.f9IftP`, package 20.676 seconds, EXIT=0.
+Narrow fresh/replay after the test repairs passed in
+`.uzi/scratch/gate-log.B5w1oi`, EXIT=0. These are focused results, not a full
+suite or broad no-tokens proof. This documentation update inspected the
+script, manifest, fixture and SQL, spot-checked logs and counted unchanged
+passes; it did not rerun the commands.
+
 ## Outstanding evidence
 
 Transactional and LiveDB evidence has been re-observed, including the 50-test
@@ -300,9 +344,11 @@ six additional executed controls and retains the two earlier ordering controls.
 The owner subsequently supplied class (d) for new guards without an a233
 seam: one compiling guard-removal control per negative case, through the real
 switch path or real API route and store transaction. This resolves the prior
-method question only. The remaining mandatory clauses are still required and
-unvalidated until those controls execute; no functional criterion is accepted,
-waived or deferred.
+method question only. The 24 stopped controls above have now executed and credit only their
+specific seams. Registration/claim/incarnation, policy/reserve/other controls,
+withdrawn X/Y, broader preservation and strict-wire clauses remain unvalidated.
+m3 and m4 are **INCOMPLETE**; no functional criterion is accepted, waived or
+deferred.
 
 `task test:codex-m4` and lead-owned m4 security, contracts, sqlc regeneration
 and integration checks remain pending. Full suites remain pending exact-head
