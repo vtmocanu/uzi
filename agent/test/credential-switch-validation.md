@@ -671,3 +671,25 @@ corrects that citation to exact a233 runner.ts:25735–25738; raw run results re
 preserved. No baseline build or installation. Export removed, primary unchanged.
 R7 does not prove capability-derived scope identity, retired-A refresh, whole
 handoff or security/full suites. Other m3/m4 obligations remain required.
+
+
+## Open custody owner-discard effect control
+
+E4 adds one real stopped-route/store sensitivity control at 7e82c7be1, stronger
+than the earlier timestamp-only E3 but still narrow. A single added CTE changes
+the open hold to owner-discarded and clears both live references, using the four
+coherent canonical disposition fields. Every guard, RUN assignment and other
+effect stays intact; no test fixture changes. This is not completed-publication
+release or exercise of owner API authorization.
+
+Receipt .uzi/scratch/stopped-custody-disposition-results.json records before
+exit 0 (eOP2LA), compiling mutant exit 1 at preservation test :101,
+`snapshot changed in custody` (KpbaC1), and after exit 0 (bkwEJh). Logs use the
+.uzi/scratch/gate-log. prefix. Named leaves execute, with no skipped target or
+SQL/build/timeout error supplying the red. Lead source/mutant hash reconstruction
+and raw outcome checks confirm the result; the stale pending marker does not
+override recorded terminal results and cleanup exit 0. Exact fixture and export
+removed; primary unchanged. Source feasibility was independently traced before
+execution. E4 proves first-STOP detection of this custody disposition only.
+Replay, other dispositions and other m3/m4 obligations remain required and
+unvalidated; no full-suite, CI-performance or security result is claimed.

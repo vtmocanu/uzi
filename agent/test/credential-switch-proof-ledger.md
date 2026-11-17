@@ -431,7 +431,7 @@ control is still absent, not that the functional criterion was deferred.
 | Stopped refusal of claimed status | D25–D56: running/paused status_claimed; other statuses unvalidated |
 | Stopped ownership, lane and policy fences | D57–D60 credit pending-fresh/unresolved-outcome; D61 paused policy-hold; D62/D63 stable user-owner mismatch running/paused. D64–D73 credit the five enumerated STOP lane exclusions running/paused; concurrent owner changes and other policy clauses unvalidated |
 | Stopped replay after withdrawn X/Y; resume/reclaim and incarnation changes | Unvalidated; the fixture's single HTTP withdrawal does not discharge X/Y |
-| Stopped preservation of binding, journals, session, gates, questions and custody without input consumption/time banking | E1 base-journal deletion, E2 applied-input deletion, E3 custody timestamp corruption only; other effects, actual custody release, replay sensitivity and broader clauses unvalidated |
+| Stopped preservation of binding, journals, session, gates, questions and custody without input consumption/time banking | E1 base-journal deletion, E2 applied-input deletion, E3 custody timestamp corruption, E4 owner-discard/live-reference loss only; other dispositions/effects, replay sensitivity and broader clauses unvalidated |
 | Stopped known extra typed member and register_nonce case alias | D25–D56: four running/paused wire cases only |
 | Bounded strict stopped request, other forbidden combinations, op_id and minimal acknowledgement | Unvalidated |
 | Tokens absent from all inputs/acknowledgements/messages/logs | Targeted positive assertions present; qualifying controls and m4 security gates remain required |
@@ -1058,3 +1058,69 @@ This proves only the new B dispatcher's pre-finish publication-readiness fence.
 Capability-derived operation-scope identity, retained-A refresh, other authority
 consumers and the remaining mixed clauses are **unvalidated**. No full-suite or
 security result is supplied. m3/m4 remain incomplete.
+
+
+### E4 — open custody owner-discard effect-injection sensitivity control
+
+Candidate 7e82c7be1b8d6be08d2f41229ebbca7bcba8c631. Receipt:
+.uzi/scratch/stopped-custody-disposition-results.json. This is one
+**effect-injection sensitivity control**, distinct from E3's timestamp-only
+corruption. The named seam is preservation of the open custody hold and its
+live worker/run references during first accepted STOP.
+
+The source query :40 and generated counterpart :50 add the same single CTE
+after changed, with all existing eligibility predicates, six RUN assignments
+and response expressions intact:
+
+```sql
+), discarded_custody AS (
+    UPDATE recovery_custody_holds
+    SET state='discarded', release_evidence='owner_discard', live_worker_id=NULL, live_run_id=NULL
+    WHERE run_id IN (SELECT id FROM changed) AND state='open'
+    RETURNING id
+```
+
+These four assignments form one coherent custody disposition effect, not four
+independent seams. They match the disposition fields in DiscardCustodyHoldForOwner
+(queries/recovery.sql:774–792), omitting its updated_at assignment. The mutant
+is intentionally forbidden on STOP; it does not exercise the owner API's intent
+or authorization checks and does not claim identical owner-query scoping.
+Immutable provenance, release timestamps, FINAL/publication fields and all other
+effects remain unchanged by the injected SET list. This is owner discard and
+loss of live references, not completed-publication release.
+
+Source-only DBA feasibility review traced the effective 00409 owner-discard
+branch, 00318 completion guard, 00386 merged-predecessor guard, 00393 evidence
+and closure checks, publication/ancestry ties and nullable live FKs. No guard is
+removed or disabled. The subsequent compiling real-route run reaches the custody
+comparison, rather than failing SQL preparation or silently retaining the row.
+
+The unchanged open_custody fixture verifies its inventory-guarded open row,
+current owner/generation/live pointers and NULL FINAL evidence before STOP. The
+real authenticated state route locks worker/run, executes changed then the
+custody effect within the same statement/transaction, commits, and reads the
+unfiltered whole-row custody snapshot. At :101 the mutant fails with
+`snapshot changed in custody`. Existing first-STOP RUN checks have already
+passed; no unrelated RUN-field change supplies this failure.
+
+With GOFLAGS=-p=1, GOMAXPROCS=4, from api:
+
+```sh
+go test -buildvcs=false -race -count=1 -json -timeout=4m ./internal/handler -run '^TestWorkerCodexStoppedPreservationRouteLiveDB$/^open_custody$'
+```
+
+Before gate-log.eOP2LA exits 0 (219.445s); mutant gate-log.KpbaC1 exits 1
+(216.761s); after gate-log.bkwEJh exits 0 (9.997s). All logs are under
+.uzi/scratch/. The selected leaf runs without skips; no SQLSTATE/build error or
+timeout supplies the red. The lead reconstructed both precise file mutations
+and verified their hashes, actual log leaf outcomes and assertion. The receipt's
+old pending-stage marker is not a verdict; terminal result entries, raw exits
+and cleanup prove completion. Its exact owned fixture cleanup exits 0, export
+removed immediately, primary status/diff and hashes unchanged. No installation,
+base build, concurrent build, full-suite or security-gate claim.
+
+The CTE is gated by changed, so it exercises first settlement only. Positive
+replay equality remains observed but has no separate replay-effect control.
+Only detection of this open-hold owner-discard effect is credited; other custody
+release/discard paths, replay, other preservation and remaining m3/m4 criteria
+remain required and unvalidated.
