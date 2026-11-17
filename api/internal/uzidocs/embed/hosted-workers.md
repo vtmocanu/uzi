@@ -332,7 +332,9 @@ memory-capable pools are not surplus-hibernated.
 worker advertising `hibernation_cache_prune_v1` whose cleanup completes re-wakes with a
 pruned build cache.
 
-**Owner-wide long clock.** While `worker_hibernation_surplus` is on, the long idle clock
+##### Owner-wide long clock
+
+While `worker_hibernation_surplus` is on, the long idle clock
 of a pooled worker runs from the latest of the owner's run activity, the worker's
 creation, and its last completed manual or demand wake. Owner run activity is any run of
 the owner, including runs on no worker; a run that is not terminal keeps the owner
@@ -340,7 +342,9 @@ active, so none of its pooled workers is long-idle. Warm and system wakes do not
 this clock. The surplus clock above still restarts on every completed wake. An unpooled
 worker keeps the per-worker clock described under Idle.
 
-**Warm reserve replenishment.** When no ready idle worker is awake in a pool, the api
+##### Warm reserve replenishment
+
+When no ready idle worker is awake in a pool, the api
 wakes one automatically hibernated member so the owner's next run finds a warm worker.
 All of these must hold:
 
