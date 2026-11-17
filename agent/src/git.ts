@@ -5044,8 +5044,9 @@ export class GitCache {
         if (!cst.isDirectory()) return refused("not_directory");
         if (cst.ino !== cloneIno || cst.dev !== rootDev) return refused("clone_identity_changed");
         // Both pins must sit on the caller's mount: an unreadable fdinfo counts as a mismatch. A clone on a different
-        // mount_id than the root (a same-device bind mount) is exercised only by the root/real worker-UID lane (M6): an
-        // unprivileged test cannot create one.
+        // mount_id than the root (a same-device bind mount) is not pinned by any test: creating one needs a bind mount
+        // (CAP_SYS_ADMIN), which neither the unit tests nor the real worker-UID lane have. That half is backed by the
+        // phase-level mount/bind classifier.
         const mntId = async (fd: number): Promise<string | undefined> => {
           try {
             const ids = (await fs.readFile(`/proc/self/fdinfo/${fd}`, "utf8")).split("\n").filter(line => line.startsWith("mnt_id:"));

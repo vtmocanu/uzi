@@ -52,14 +52,14 @@ function firstLine(child: ChildProcess): Promise<any> {
 // waits on a release file and then execs it unchanged (so the descriptors, the setpriv runner pass and the helper
 // script are the production ones) and which lets the test race the tree at the exact point between pin and removal.
 const O_PATH_DIR = 0o10000000 | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW;
-const GATE = ': > "$UZI_GATE_STARTED"; while [ ! -e "$UZI_GATE_RELEASE" ]; do sleep 0.1; done; exec "$@"';
+// The wait is bounded (1200 x 0.1 s) so a failed assertion can never leave an orphan spinning with the EX descriptor, and
+// the gate variables are removed so the helper starts with exactly the audited environment.
+const GATE = ': > "$UZI_GATE_STARTED"; n=0; while [ ! -e "$UZI_GATE_RELEASE" ]; do n=$((n+1)); [ "$n" -le 1200 ] || exit 97; sleep 0.1; done; ' +
+  'unset UZI_GATE_STARTED UZI_GATE_RELEASE n; exec "$@"';
 // Runs as the runner uid; fd 3 is the clone pin and fd 4 the epoch EX lock (inherited through setpriv).
 const FD_PROBE = [
   'const fs=require("node:fs");const out={uid:process.getuid(),gid:process.getgid(),fds:{}};',
   'for (const fd of [3,4]) { const s=fs.fstatSync(fd,{bigint:true}); out.fds[fd]={ id:s.dev+":"+s.ino, dir:s.isDirectory() }; }',
-  'out.extra=[];for (const name of fs.readdirSync("/proc/self/fd")) { if (Number(name)<5) continue;',
-  ' let t="";try{t=fs.readlinkSync("/proc/self/fd/"+name);}catch{continue;}',
-  ' if (t.startsWith("/") && !t.startsWith("/dev/") && !t.startsWith("/proc/")) out.extra.push(t); }',
   'const code=(f)=>{try{f();return "opened";}catch(e){return e.code;}};',
   'out.reopen={',
   ' parentDotDot:code(()=>fs.closeSync(fs.openSync("/proc/self/fd/3/..",fs.constants.O_RDONLY|fs.constants.O_DIRECTORY))),',
@@ -68,6 +68,9 @@ const FD_PROBE = [
   ' statViaDotDot:code(()=>fs.lstatSync("/proc/self/fd/3/../clone")) };',
   'process.stdout.write(JSON.stringify(out));',
 ].join("\n");
+// A shell lists its own whole descriptor table (a Node process holds runtime descriptors of its own). The glob's directory
+// descriptor is closed before the test, so a surviving entry is a real one; readlink is the only process spawned.
+const FD_LIST = 'for p in /proc/$$/fd/*; do [ -L "$p" ] || continue; printf "%s " "${p##*/}"; readlink "$p"; done';
 async function retireOp(req: { root: string; parentName: string; cache: string; race: string; outside: string; elsewhere: string;
   gate?: { started: string; release: string; hold?: boolean }; probe?: boolean; lockFile?: string }) {
   process.env.UZI_UID_SPLIT = "1";
@@ -85,13 +88,20 @@ async function retireOp(req: { root: string; parentName: string; cache: string; 
   git.epochNativeTestDependencies = {
     spawn: (command: string, args: string[], options: any) => {
       spawns++;
-      if (!req.gate) return spawn(command, args, options);
-      return spawn("/bin/sh", ["-c", GATE, "sh", command, ...args],
-        { ...options, env: { ...options.env, UZI_GATE_STARTED: req.gate.started, UZI_GATE_RELEASE: req.gate.release } });
+      const child = req.gate
+        ? spawn("/bin/sh", ["-c", GATE, "sh", command, ...args],
+          { ...options, env: { ...options.env, UZI_GATE_STARTED: req.gate.started, UZI_GATE_RELEASE: req.gate.release } })
+        : spawn(command, args, options);
+      // Registered before the production listeners, so the swap lands after the helper exited and before the worker's removal.
+      if (req.race === "clone-dir-after") child.once("exit", () => swapClone("dir"));
+      return child;
     },
     alive: (pid: number, identity: any) => processGroupAlive(pid, identity, true),
-    kill: (pid: number) => { rr.killRunnerGroupOnly(pid, true); },
-    joinMs: 2000,
+    // Production kill semantics for identity "command": a signal not confirmed while the group lives is an error.
+    kill: (pid: number, identity: any) => {
+      if (!rr.killRunnerGroupOnly(pid, true) && processGroupAlive(pid, identity, true)) throw new Error("epoch group signal unconfirmed");
+    },
+    // joinMs is deliberately omitted: GitCache falls back to its production EPOCH_NATIVE_JOIN_MS (not exported).
   };
   const scope = ownership.beginReclaim();
   let discarded = false;
@@ -128,10 +138,7 @@ async function retireOp(req: { root: string; parentName: string; cache: string; 
     scope, root: req.root, rootPin, rootDev: String(rootStat.dev), rootMntId: mntId(rootPin), parentName: req.parentName,
     parentIno: String(st(parent)?.ino ?? 1n), cloneIno: String(st(clone)?.ino ?? 1n),
     deadline: Date.now() + 120_000, maxEntries: 2_000_000, maxDepth: 256, signal: new AbortController().signal,
-    live: (() => {
-      let calls = 0;
-      return () => { if (++calls === 3 && req.race === "clone-dir-after") swapClone("dir"); };
-    })(),
+    live: () => undefined,
     beforeEffect: async () => undefined,
   };
   try {
@@ -139,14 +146,18 @@ async function retireOp(req: { root: string; parentName: string; cache: string; 
       const lockStat = fs.statSync(req.lockFile!, { bigint: true });
       const clonePin = fs.openSync(clone, O_PATH_DIR);
       try {
-        const w = runnerCommand(process.execPath, ["-e", FD_PROBE]);
-        const joined = await git.spawnJoinedEpochChild(scope, w.command, w.args, {
-          env: { PATH: "/usr/bin:/bin" }, cwd: "/", identity: "command", signals: [], deadline: Date.now() + 30_000,
-          timeout: 5000, extraFd: clonePin,
-        });
-        if (!joined.spawned) throw new Error("probe not spawned");
-        joined.ticket.settle();
-        return { probe: JSON.parse(joined.stdout), exit: joined.code, stderr: joined.stderr,
+        const launch = async (w: { command: string; args: string[] }) => {
+          const joined = await git.spawnJoinedEpochChild(scope, w.command, w.args, {
+            env: { PATH: "/usr/bin:/bin" }, cwd: "/", identity: "command", signals: [], deadline: Date.now() + 30_000,
+            timeout: 5000, extraFd: clonePin,
+          });
+          if (!joined.spawned) throw new Error("probe not spawned");
+          joined.ticket.settle();
+          return joined;
+        };
+        const joined = await launch(runnerCommand(process.execPath, ["-e", FD_PROBE]));
+        const listed = await launch(runnerCommand("/bin/sh", ["-c", FD_LIST]));
+        return { probe: JSON.parse(joined.stdout), exit: joined.code || listed.code, stderr: joined.stderr + listed.stderr, list: listed.stdout,
           cloneId: `${st(clone)!.dev}:${st(clone)!.ino}`, lockId: `${lockStat.dev}:${lockStat.ino}` };
       } finally { fs.closeSync(clonePin); }
     }

@@ -625,8 +625,9 @@ const RETIRE_PARENT = ".retire-0b9f4a52-3c1d-4e8a-9b7e-1f2a3b4c5d6e";
 interface RetireTree { base: string; root: string; parent: string; clone: string; outside: string; elsewhere: string }
 
 function own(p: string, uid: number, gid: number, mode?: number) {
-  // Root holds CHOWN but not FOWNER: chmod first, while root still owns the entry.
-  if (mode !== undefined) fs.chmodSync(p, mode);
+  // Root holds CHOWN but not FOWNER or FSETID: chmod while root owns the entry, and with its own group so a setgid bit
+  // (a directory made under a setgid parent inherits that parent's group) is kept rather than stripped.
+  if (mode !== undefined) { fs.lchownSync(p, 0, 0); fs.chmodSync(p, mode); }
   fs.lchownSync(p, uid, gid);
 }
 function put(p: string, content: string, uid: number, gid: number, mode: number) {
@@ -637,20 +638,23 @@ function retireTree(populate: (t: RetireTree) => void,
   assert.equal(process.platform, "linux", "image proof requires Linux; never skip");
   assert.equal(process.getuid!(), 0, "image proof requires the shared root window");
   const base = fs.mkdtempSync("/data/retire-proof-");
-  fs.chmodSync(base, 0o755);
   const t: RetireTree = { base, root: path.join(base, "root"), parent: "", clone: "", outside: path.join(base, "outside"),
     elsewhere: path.join(base, "elsewhere") };
   t.parent = path.join(t.root, RETIRE_PARENT); t.clone = path.join(t.parent, "clone");
-  for (const dir of [t.root, t.parent, t.clone, t.outside, t.elsewhere]) fs.mkdirSync(dir, { recursive: true });
-  put(path.join(t.outside, "keep.txt"), "outside-survives", RUNNER_ID, RUNNER_ID, 0o644);
-  own(t.outside, RUNNER_ID, RUNNER_ID, 0o755); own(t.elsewhere, RUNNER_ID, RUNNER_ID, 0o755);
-  own(t.clone, RUNNER_ID, RUNNER_ID, 0o755);
-  populate(t);
-  const [pu, pg] = o.parentOwner ?? [WORKER_ID, WORKER_ID];
-  own(t.parent, pu, pg, o.parentMode ?? 0o700);
-  const [ru, rg] = o.rootOwner ?? [WORKER_ID, RUNNER_ID];
-  own(t.root, ru, rg, o.rootMode ?? 0o1775);
-  return t;
+  try {
+    fs.chmodSync(base, 0o755);
+    for (const dir of [t.root, t.parent, t.clone, t.outside, t.elsewhere]) fs.mkdirSync(dir, { recursive: true });
+    put(path.join(t.outside, "keep.txt"), "outside-survives", RUNNER_ID, RUNNER_ID, 0o644);
+    own(t.outside, RUNNER_ID, RUNNER_ID, 0o755); own(t.elsewhere, RUNNER_ID, RUNNER_ID, 0o755);
+    // Production clone posture: runner:runner 2775 (setgid), like every directory the runner creates inside it.
+    own(t.clone, RUNNER_ID, RUNNER_ID, 0o2775);
+    populate(t);
+    const [pu, pg] = o.parentOwner ?? [WORKER_ID, WORKER_ID];
+    own(t.parent, pu, pg, o.parentMode ?? 0o700);
+    const [ru, rg] = o.rootOwner ?? [WORKER_ID, RUNNER_ID];
+    own(t.root, ru, rg, o.rootMode ?? 0o1775);
+    return t;
+  } catch (error) { dropTree(t); throw error; }
 }
 function dropTree(t: RetireTree) {
   spawnSync("/bin/chown", ["-R", "-h", "0:0", t.base]);
@@ -691,14 +695,20 @@ const POPULATED = (t: RetireTree) => {
   put(path.join(clone, "nested", "deeper", "payload"), "p".repeat(4096), RUNNER_ID, RUNNER_ID, 0o644);
   // A runner-cmd-owned, group-runner-writable file inside a runner-owned directory: the runner owns the directory, so it can unlink it.
   put(path.join(clone, "shared", "cmd.txt"), "from runner-cmd", CMD_ID, RUNNER_ID, 0o660);
+  // Judgment A: a runner-cmd-owned directory whose group is runner and group-writable. The runner can write and search it
+  // through the group, so it unlinks the runner-cmd file inside and then removes the directory from its runner-owned parent.
+  fs.mkdirSync(path.join(clone, "cmd-group"));
+  put(path.join(clone, "cmd-group", "owned.txt"), "from runner-cmd", CMD_ID, CMD_ID, 0o640);
+  own(path.join(clone, "cmd-group"), CMD_ID, RUNNER_ID, 0o2775);
   fs.symlinkSync(outside, path.join(clone, "nested", "outward")); fs.lchownSync(path.join(clone, "nested", "outward"), RUNNER_ID, RUNNER_ID);
-  for (const dir of ["nested", "nested/deeper", "shared"]) own(path.join(clone, dir), RUNNER_ID, RUNNER_ID, dir === "shared" ? 0o775 : 0o755);
+  for (const dir of ["nested", "nested/deeper", "shared"]) own(path.join(clone, dir), RUNNER_ID, RUNNER_ID, 0o2775);
 };
 
 test("pod epoch real retire scratch: the runner-uid empty-fd helper reclaims a populated clone, the worker removes clone and parent and an outward symlink target survives", { timeout: 150000 }, async () => {
-  const f = fixture(); const t = retireTree(POPULATED);
+  const f = fixture(); let t: RetireTree | undefined;
   let primary: unknown;
   try {
+    t = retireTree(POPULATED);
     const owner = await retireOwner(f);
     const out = await owner.ask(retireReq(f, t), 90000);
     assert.deepEqual(out.result, { kind: "removed" }, JSON.stringify(out));
@@ -708,44 +718,83 @@ test("pod epoch real retire scratch: the runner-uid empty-fd helper reclaims a p
     assert.deepEqual(fs.readdirSync(t.root), [], "nothing else was created or left under the root");
     assert.equal(fs.readFileSync(path.join(t.outside, "keep.txt"), "utf8"), "outside-survives", "the symlink target outside the clone survived");
     assert.equal(flock(f.root, "-x"), 200, "the owner still holds EX after the discard");
-  } catch (e) { primary = e; throw e; } finally { await closeAfter(f, primary, () => dropTree(t)); }
+  } catch (e) { primary = e; throw e; } finally { await closeAfter(f, primary, () => t && dropTree(t)); }
 });
 
-test("pod epoch real retire scratch: unreadable runner-cmd directories survive byte-identical as residue with no chmod", { timeout: 150000 }, async () => {
-  const f = fixture();
+test("pod epoch real retire scratch: directories the runner cannot list or modify survive byte-identical as residue with no chmod", { timeout: 150000 }, async () => {
+  const f = fixture(); let t: RetireTree | undefined;
   let primary: unknown;
-  const t = retireTree(tree => {
-    const tracked = path.join(tree.clone, "tracked");
-    fs.mkdirSync(path.join(tracked, "hidden", "sub"), { recursive: true });
-    fs.mkdirSync(path.join(tracked, "drop"));
-    put(path.join(tracked, "plain.txt"), "removable", RUNNER_ID, RUNNER_ID, 0o644);
-    put(path.join(tracked, "hidden", "data.txt"), "runner-cmd-secret", CMD_ID, CMD_ID, 0o600);
-    put(path.join(tracked, "hidden", "sub", "x"), "x", CMD_ID, CMD_ID, 0o600);
-    put(path.join(tracked, "drop", "y.txt"), "dropped", CMD_ID, CMD_ID, 0o600);
-    own(path.join(tracked, "hidden", "sub"), CMD_ID, CMD_ID, 0o700);
-    own(path.join(tracked, "hidden"), CMD_ID, CMD_ID, 0o700);
-    own(path.join(tracked, "drop"), CMD_ID, CMD_ID, 0o730);
-    own(tracked, RUNNER_ID, RUNNER_ID, 0o755);
-  });
   try {
-    const hidden = path.join(t.clone, "tracked", "hidden"), drop = path.join(t.clone, "tracked", "drop");
-    const before = { hidden: digest(hidden), drop: digest(drop) };
-    assert.ok(before.hidden.length >= 4 && before.drop.length === 2, "fixture holds content");
+    t = retireTree(tree => {
+      const tracked = path.join(tree.clone, "tracked");
+      fs.mkdirSync(path.join(tracked, "hidden", "sub"), { recursive: true });
+      fs.mkdirSync(path.join(tracked, "drop")); fs.mkdirSync(path.join(tracked, "locked"));
+      put(path.join(tracked, "plain.txt"), "removable", RUNNER_ID, RUNNER_ID, 0o644);
+      put(path.join(tracked, "hidden", "data.txt"), "runner-cmd-secret", CMD_ID, CMD_ID, 0o600);
+      put(path.join(tracked, "hidden", "sub", "x"), "x", CMD_ID, CMD_ID, 0o600);
+      put(path.join(tracked, "drop", "y.txt"), "dropped", CMD_ID, CMD_ID, 0o600);
+      // A runner-OWNED directory without write permission: a chmod walk (the non-strict mode) would add it and empty it.
+      put(path.join(tracked, "locked", "kept.txt"), "runner-owned-in-0500", RUNNER_ID, RUNNER_ID, 0o644);
+      own(path.join(tracked, "hidden", "sub"), CMD_ID, CMD_ID, 0o700);
+      own(path.join(tracked, "hidden"), CMD_ID, CMD_ID, 0o700);
+      // Group runner may write and search but not list: the runner cannot enumerate the entry it would have to unlink.
+      own(path.join(tracked, "drop"), CMD_ID, RUNNER_ID, 0o730);
+      own(path.join(tracked, "locked"), RUNNER_ID, RUNNER_ID, 0o500);
+      own(tracked, RUNNER_ID, RUNNER_ID, 0o2775);
+    });
+    const before = digest(t.clone);
+    assert.ok(before.includes("./tracked|d|2775|10002:10002") && before.includes("./tracked/locked|d|500|10002:10002"),
+      "the fixture mirrors the production runner:runner 2775 setgid directories and holds the 0500 runner-owned one");
+    const hidden =path.join(t.clone, "tracked", "hidden"), drop = path.join(t.clone, "tracked", "drop");
+    assert.ok(digest(hidden).length >= 4 && digest(drop).length === 2, "fixture holds content");
     const owner = await retireOwner(f);
     const out = await owner.ask(retireReq(f, t), 90000);
     assert.equal(out.result.kind, "residue", JSON.stringify(out));
     assert.equal(out.result.reason, "helper_remaining");
     assert.equal(out.result.exit, 4);
+    assert.equal(out.spawns, 1, "exactly one runner pass");
     assert.equal(out.pending, 0, "the ticket is settled"); assert.deepEqual(out.unsettled, []);
-    assert.deepEqual(digest(hidden), before.hidden, "the 0700 runner-cmd directory is byte-identical, modes and owners unchanged");
-    assert.deepEqual(digest(drop), before.drop, "the 0730 runner-cmd directory is byte-identical, modes and owners unchanged");
+    // The whole clone (modes including directories, owners, content) differs only by the file the runner could remove.
+    assert.deepEqual(digest(t.clone), before.filter(line => !line.startsWith("./tracked/plain.txt|")),
+      "only the runner-removable file went; every other mode, owner and byte (0700, 0730, 0500) is unchanged");
     assert.equal(fs.existsSync(path.join(t.clone, "tracked", "plain.txt")), false, "what the runner could remove was removed");
+    assert.equal(fs.readFileSync(path.join(drop, "y.txt"), "utf8"), "dropped", "the unlistable 0730 directory kept its content");
     assert.equal(fs.existsSync(t.parent), true, "the parent is kept");
     assert.equal(fs.statSync(t.clone).isDirectory(), true, "the clone is kept");
-  } catch (e) { primary = e; throw e; } finally { await closeAfter(f, primary, () => dropTree(t)); }
+  } catch (e) { primary = e; throw e; } finally { await closeAfter(f, primary, () => t && dropTree(t)); }
 });
 
-test("pod epoch real retire scratch: a swapped clone or descendant never deletes outside the pinned tree and a swapped clone is never removed", { timeout: 240000 }, async () => {
+test("pod epoch real retire scratch: a runner-cmd directory the runner can list but not unlink from survives byte-identical as residue", { timeout: 150000 }, async () => {
+  const f = fixture(); let t: RetireTree | undefined;
+  let primary: unknown;
+  try {
+    t = retireTree(tree => {
+      const tracked = path.join(tree.clone, "tracked");
+      fs.mkdirSync(path.join(tracked, "readonly"), { recursive: true });
+      put(path.join(tracked, "readonly", "cmd.txt"), "runner-cmd-content", CMD_ID, CMD_ID, 0o644);
+      // Owner and group runner-cmd, 0755: the runner has only other r-x, so it lists the file and cannot unlink it.
+      own(path.join(tracked, "readonly"), CMD_ID, CMD_ID, 0o755);
+      own(tracked, RUNNER_ID, RUNNER_ID, 0o2775);
+    });
+    const before = digest(t.clone);
+    assert.ok(before.some(line => line.startsWith("./tracked/readonly/cmd.txt|")), "fixture holds the file");
+    const owner = await retireOwner(f);
+    const out = await owner.ask(retireReq(f, t), 90000);
+    assert.equal(out.result.kind, "residue", JSON.stringify(out));
+    assert.equal(out.result.reason, "helper_remaining");
+    assert.equal(out.result.exit, 4);
+    assert.equal(out.spawns, 1, "exactly one runner pass");
+    assert.equal(out.pending, 0, "the ticket is settled"); assert.deepEqual(out.unsettled, []);
+    assert.deepEqual(digest(t.clone), before, "the whole clone is byte-identical: nothing was chmodded, re-owned or removed");
+    assert.equal(fs.readFileSync(path.join(t.clone, "tracked", "readonly", "cmd.txt"), "utf8"), "runner-cmd-content");
+    assert.equal(fs.existsSync(t.parent), true, "the parent is kept");
+  } catch (e) { primary = e; throw e; } finally { await closeAfter(f, primary, () => t && dropTree(t)); }
+});
+
+// The swaps below are staged by the spawn seam AFTER the pins and BEFORE the helper runs (the two "before" clone swaps and
+// the descendant swap) or when the helper process exits and before the worker's removal (the "after" clone swap). None is
+// a mid-walk race against the helper's own traversal: that TOCTOU is covered by the hermetic `rechecked` seam tests.
+test("pod epoch real retire scratch: a clone swapped around the helper run is never followed or removed and a descendant swapped before the helper is unlinked, never followed", { timeout: 240000 }, async () => {
   const f = fixture();
   let primary: unknown;
   const trees: RetireTree[] = [];
@@ -758,6 +807,7 @@ test("pod epoch real retire scratch: a swapped clone or descendant never deletes
       const out = await owner.ask(retireReq(f, t, { race }), 90000);
       assert.equal(out.result.kind, "residue", race + " " + JSON.stringify(out));
       assert.equal(out.result.reason, "clone_identity_changed", race);
+      assert.equal(out.spawns, 1, race + ": exactly one runner pass");
       assert.equal(out.pending, 0, race); assert.deepEqual(out.unsettled, [], race);
       assert.equal(fs.existsSync(t.parent), true, race + ": the parent is kept");
       assert.equal(fs.lstatSync(t.clone).isSymbolicLink(), plant === "symlink", race + ": the planted entry is untouched");
@@ -770,6 +820,9 @@ test("pod epoch real retire scratch: a swapped clone or descendant never deletes
     const t = mk();
     const out = await owner.ask(retireReq(f, t, { race: "descendant" }), 90000);
     assert.deepEqual(out.result, { kind: "removed" }, JSON.stringify(out));
+    assert.equal(out.spawns, 1, "exactly one runner pass");
+    assert.equal(out.pending, 0); assert.deepEqual(out.unsettled, []);
+    assert.equal(fs.existsSync(t.parent), false, "parent and clone are gone");
     survivors(t);
     assert.deepEqual(fs.readdirSync(t.outside).sort(), ["keep.txt"], "the symlink target was not emptied");
     assert.equal(fs.readFileSync(path.join(t.elsewhere, "moved-out", "deeper", "payload"), "utf8"), "p".repeat(4096), "the moved-out subtree is untouched");
@@ -777,27 +830,38 @@ test("pod epoch real retire scratch: a swapped clone or descendant never deletes
 });
 
 test("pod epoch real retire scratch: the helper child sees only the clone pin at fd 3 and the EX lock at fd 4 and cannot reopen the worker-private parent", { timeout: 150000 }, async () => {
-  const f = fixture(); const t = retireTree(POPULATED);
+  const f = fixture(); let t: RetireTree | undefined;
   let primary: unknown;
   try {
+    t = retireTree(POPULATED);
     const owner = await retireOwner(f);
     const out = await owner.ask({ ...retireReq(f, t), gate: undefined, probe: true, lockFile: path.join(f.root, ".uzi-epoch.lock") }, 90000);
     assert.equal(out.exit, 0, JSON.stringify(out));
     assert.equal(out.probe.uid, RUNNER_ID, "the helper runs as the runner uid");
     assert.deepEqual(out.probe.fds, { 3: { id: out.cloneId, dir: true }, 4: { id: out.lockId, dir: false } });
-    assert.deepEqual(out.probe.extra, [], "no descriptor beyond stdio, the clone pin and the lock");
     assert.deepEqual(out.probe.reopen, { parentDotDot: "EACCES", listDotDot: "EACCES", siblingViaDotDot: "EACCES", statViaDotDot: "EACCES" },
       "the runner cannot open or traverse the worker-private parent through the pinned clone");
+    // The full descriptor table of the same wrapped launch, read by a shell (a Node probe owns runtime descriptors of its
+    // own, so only a shell can prove that nothing beyond stdio, the clone pin and the lock was inherited).
+    const table = new Map<string, string>();
+    for (const line of out.list.trimEnd().split("\n")) { const [fd, ...target] = line.split(" "); table.set(fd!, target.join(" ")); }
+    assert.deepEqual([...table.keys()].sort(), ["0", "1", "2", "3", "4"], "no descriptor at all at 5 or above, of any type: " + out.list);
+    for (const fd of ["0", "1", "2"]) assert.match(table.get(fd)!, /^(socket|pipe):\[\d+\]$/, "fd " + fd + " is the spawn stdio pipe");
+    assert.equal(table.get("3"), t.clone, "fd 3 is the clone pin");
+    assert.equal(table.get("4"), path.join(f.root, ".uzi-epoch.lock"), "fd 4 is the epoch lock");
     assert.equal(fs.existsSync(path.join(t.clone, "top.txt")), true, "the probe changes nothing");
-  } catch (e) { primary = e; throw e; } finally { await closeAfter(f, primary, () => dropTree(t)); }
+  } catch (e) { primary = e; throw e; } finally { await closeAfter(f, primary, () => t && dropTree(t)); }
 });
 
 test("pod epoch real retire scratch: a worker killed while the helper runs leaves the helper holding EX until it exits", { timeout: 150000 }, async () => {
-  const f = fixture(); const t = retireTree(POPULATED);
+  const f = fixture(); let t: RetireTree | undefined;
   let primary: unknown;
+  let releaseFile: string | undefined;
   try {
+    t = retireTree(POPULATED);
     const owner = await retireOwner(f);
     const req = retireReq(f, t);
+    releaseFile = req.gate.release;
     assert.equal(await owner.ask({ ...req, gate: { ...req.gate, hold: true }, detached: true }, 90000), "launched");
     await until("the helper child is pending with its descriptors", () => fs.existsSync(req.gate.started), 60000);
     assert.equal(flock(f.root, "-x"), 200, "EX is held while the worker lives");
@@ -810,7 +874,11 @@ test("pod epoch real retire scratch: a worker killed while the helper runs leave
     assert.deepEqual(fs.readdirSync(t.clone), [], "the orphaned helper only emptied the pinned clone");
     assert.equal(fs.existsSync(t.parent), true, "the dead worker removed nothing else");
     assert.equal(fs.readFileSync(path.join(t.outside, "keep.txt"), "utf8"), "outside-survives");
-  } catch (e) { primary = e; throw e; } finally { await closeAfter(f, primary, () => dropTree(t)); }
+  } catch (e) { primary = e; throw e; } finally {
+    // Never leave a gated helper holding EX for a failed assertion; the gate shell also gives up on its own.
+    if (releaseFile) { try { fs.writeFileSync(releaseFile, ""); } catch { /* the fixture root may be gone */ } }
+    await closeAfter(f, primary, () => t && dropTree(t));
+  }
 });
 
 test("pod epoch real retire scratch: another uid owning the root or the parent is refused with nothing launched", { timeout: 150000 }, async () => {
