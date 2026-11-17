@@ -90,6 +90,15 @@ function buildModelMap(rows: ModelRows): { map: ProviderModelMap } | { error: st
   return { map: out as ProviderModelMap };
 }
 
+function sameModelMap(a: ProviderModelMap, b: ProviderModelMap): boolean {
+  return ROLES.every(({ role }) => {
+    const x = a[role];
+    const y = b[role];
+    if (!x || !y) return !x && !y;
+    return x.model === y.model && (x.context_window ?? null) === (y.context_window ?? null);
+  });
+}
+
 function validName(name: string): string | null {
   const n = name.trim();
   if (n.length < 1 || n.length > 64) return "Name must be 1-64 characters.";
@@ -100,7 +109,7 @@ const REASON_MESSAGES: Record<string, string> = {
   provider_base_url_not_allowed: "That base URL is not on the operator's allowlist. Pick one from the list.",
   provider_in_use_as_source:
     "This provider is still in use as a model source. Switch what uses it to another source, then delete it.",
-  provider_limit_reached: "You have reached the maximum number of providers. Delete or retire one first.",
+  provider_limit_reached: "You have reached the maximum number of providers. Delete one first.",
   provider_retired: "This provider is retired and can no longer be changed.",
   provider_name_taken: "You already have a provider with that name.",
   provider_probe_rate_limited: "Tests are rate limited. Wait a moment, then test again.",
@@ -264,6 +273,7 @@ function ProviderRow({
   const [key, setKey] = useState("");
   const [formError, setFormError] = useState("");
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [confirmKeyDelete, setConfirmKeyDelete] = useState(false);
   const [testing, setTesting] = useState(false);
 
   const open = (next: Panel) => {
@@ -287,7 +297,17 @@ function ProviderRow({
     const err = nameErr ?? ("error" in built ? built.error : null);
     if (err) return setFormError(err);
     setFormError("");
-    if (await run(() => api.patchProvider(p.id, { name: name.trim(), model_map: (built as { map: ProviderModelMap }).map }), "Provider updated.", "Failed to update the provider")) {
+    // Send only what changed: a model_map always bumps a revision server-side (wiping the stored
+    // Test result and re-checking the allowlist), so a pure rename must not carry one.
+    const nextMap = (built as { map: ProviderModelMap }).map;
+    const body: { name?: string; model_map?: ProviderModelMap } = {};
+    if (name.trim() !== p.name) body.name = name.trim();
+    if (!sameModelMap(nextMap, p.model_map)) body.model_map = nextMap;
+    if (Object.keys(body).length === 0) {
+      setPanel(null);
+      return;
+    }
+    if (await run(() => api.patchProvider(p.id, body), "Provider updated.", "Failed to update the provider")) {
       setPanel(null);
     }
   };
@@ -303,11 +323,11 @@ function ProviderRow({
 
   const saveKey = async (e: FormEvent) => {
     e.preventDefault();
-    if (!KEY_RE.test(key)) {
+    const value = key.trim();
+    if (!KEY_RE.test(value)) {
       return setFormError("Key must be 16-4096 printable ASCII characters with no spaces.");
     }
     setFormError("");
-    const value = key;
     setKey("");
     if (await run(() => api.putProviderKey(p.id, value), "Key saved. It will not be shown again.", "Failed to save the key")) {
       setPanel(null);
@@ -405,7 +425,7 @@ function ProviderRow({
                   size="sm"
                   variant="danger"
                   disabled={rowBusy}
-                  onClick={() => void run(() => api.deleteProviderKey(p.id), "Key deleted.", "Failed to delete the key")}
+                  onClick={() => setConfirmKeyDelete(true)}
                 >
                   Delete key
                 </Button>
@@ -450,6 +470,28 @@ function ProviderRow({
               Confirm delete
             </Button>
             <Button size="sm" variant="secondary" onClick={() => setConfirmDelete(false)}>
+              Cancel
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {confirmKeyDelete && (
+        <div role="group" aria-label={`Confirm deleting the key of ${sanitizeLabel(p.name)}`} className="space-y-2 rounded-lg border border-danger/40 bg-danger/10 p-3 text-sm">
+          <p>Delete the key of “{sanitizeLabel(p.name)}”? You will need to paste it again to use this provider.</p>
+          <div className="flex gap-2">
+            <Button
+              size="sm"
+              variant="dangerSolid"
+              disabled={rowBusy}
+              onClick={async () => {
+                await run(() => api.deleteProviderKey(p.id), "Key deleted.", "Failed to delete the key");
+                setConfirmKeyDelete(false);
+              }}
+            >
+              Confirm delete key
+            </Button>
+            <Button size="sm" variant="secondary" onClick={() => setConfirmKeyDelete(false)}>
               Cancel
             </Button>
           </div>

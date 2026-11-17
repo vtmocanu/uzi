@@ -178,7 +178,7 @@ describe("Providers — create", () => {
   });
 
   it("submits the allowlisted URL, auth style and model map", async () => {
-    mockApi.createProvider.mockResolvedValue(provider());
+    mockApi.createProvider.mockResolvedValue({ provider: provider() });
     await renderCard(list({ providers: [] }));
     fireEvent.change(within(form()).getByLabelText("Provider name"), { target: { value: "gw" } });
     fireEvent.change(within(form()).getByLabelText("Base URL"), { target: { value: URL_B } });
@@ -199,7 +199,7 @@ describe("Providers — create", () => {
 
 describe("Providers — key", () => {
   it("sends the key, then clears the field and never echoes it", async () => {
-    mockApi.putProviderKey.mockResolvedValue(provider());
+    mockApi.putProviderKey.mockResolvedValue({ provider: provider() });
     const secret = "k".repeat(24);
     const { container } = await renderCard();
     const row = await screen.findByTestId("provider-p1");
@@ -222,6 +222,119 @@ describe("Providers — key", () => {
     fireEvent.click(within(row).getByRole("button", { name: "Save key" }));
     expect(await within(row).findByText(/16-4096 printable ASCII/)).toBeTruthy();
     expect(mockApi.putProviderKey).not.toHaveBeenCalled();
+  });
+});
+
+describe("Providers — key trimming and actions", () => {
+  it("trims the pasted key before validating and sending", async () => {
+    mockApi.putProviderKey.mockResolvedValue({ provider: provider() });
+    const secret = "k".repeat(20);
+    await renderCard();
+    const row = await screen.findByTestId("provider-p1");
+    fireEvent.click(within(row).getByRole("button", { name: "Rotate key" }));
+    fireEvent.change(within(row).getByLabelText("Provider key"), { target: { value: `  ${secret}\n` } });
+    fireEvent.click(within(row).getByRole("button", { name: "Save key" }));
+    await waitFor(() => expect(mockApi.putProviderKey).toHaveBeenCalledWith("p1", secret));
+  });
+
+  it("disables and enables the key", async () => {
+    mockApi.setProviderKeyEnabled.mockResolvedValue({ provider: provider() });
+    await renderCard();
+    const row = await screen.findByTestId("provider-p1");
+    fireEvent.click(within(row).getByRole("button", { name: "Disable key" }));
+    await waitFor(() => expect(mockApi.setProviderKeyEnabled).toHaveBeenCalledWith("p1", false));
+  });
+
+  it("enables a disabled key", async () => {
+    mockApi.setProviderKeyEnabled.mockResolvedValue({ provider: provider() });
+    await renderCard(list({ providers: [provider({ key_enabled: false })] }));
+    const row = await screen.findByTestId("provider-p1");
+    fireEvent.click(within(row).getByRole("button", { name: "Enable key" }));
+    await waitFor(() => expect(mockApi.setProviderKeyEnabled).toHaveBeenCalledWith("p1", true));
+  });
+
+  it("asks before deleting the key, and Cancel deletes nothing", async () => {
+    mockApi.deleteProviderKey.mockResolvedValue(null);
+    await renderCard();
+    const row = await screen.findByTestId("provider-p1");
+    fireEvent.click(within(row).getByRole("button", { name: "Delete key" }));
+    expect(mockApi.deleteProviderKey).not.toHaveBeenCalled();
+    fireEvent.click(within(row).getByRole("button", { name: "Cancel" }));
+    expect(mockApi.deleteProviderKey).not.toHaveBeenCalled();
+    fireEvent.click(within(row).getByRole("button", { name: "Delete key" }));
+    fireEvent.click(within(row).getByRole("button", { name: "Confirm delete key" }));
+    await waitFor(() => expect(mockApi.deleteProviderKey).toHaveBeenCalledWith("p1"));
+  });
+
+  it("retires a provider", async () => {
+    mockApi.retireProvider.mockResolvedValue({ provider: provider({ retired: true }) });
+    await renderCard();
+    const row = await screen.findByTestId("provider-p1");
+    fireEvent.click(within(row).getByRole("button", { name: "Retire" }));
+    await waitFor(() => expect(mockApi.retireProvider).toHaveBeenCalledWith("p1"));
+  });
+
+  it("tells the user to delete (not retire) at the provider limit", async () => {
+    mockApi.createProvider.mockRejectedValue(apiError(409, "provider_limit_reached"));
+    await renderCard(list({ providers: [] }));
+    const f = screen.getByRole("form", { name: "Add a provider" });
+    fireEvent.change(within(f).getByLabelText("Provider name"), { target: { value: "gw" } });
+    fireEvent.change(within(f).getByLabelText("Base URL"), { target: { value: URL_A } });
+    fireEvent.change(within(f).getByLabelText("Haiku model (required)"), { target: { value: "gw-small" } });
+    fireEvent.click(within(f).getByRole("button", { name: "Add provider" }));
+    expect((await screen.findByRole("alert")).textContent).toMatch(/Delete one first\./);
+  });
+});
+
+describe("Providers — edit", () => {
+  const openEdit = async () => {
+    const row = await screen.findByTestId("provider-p1");
+    fireEvent.click(within(row).getByRole("button", { name: "Edit name and models" }));
+    return row;
+  };
+
+  it("a rename sends only the name", async () => {
+    mockApi.patchProvider.mockResolvedValue({ provider: provider() });
+    await renderCard();
+    const row = await openEdit();
+    fireEvent.change(within(row).getByLabelText("Provider name"), { target: { value: "  renamed " } });
+    fireEvent.click(within(row).getByRole("button", { name: "Save changes" }));
+    await waitFor(() => expect(mockApi.patchProvider).toHaveBeenCalledTimes(1));
+    expect(mockApi.patchProvider.mock.calls[0]).toEqual(["p1", { name: "renamed" }]);
+  });
+
+  it("a model change sends only the model map", async () => {
+    mockApi.patchProvider.mockResolvedValue({ provider: provider() });
+    await renderCard();
+    const row = await openEdit();
+    fireEvent.change(within(row).getByLabelText("Haiku context window"), { target: { value: "65536" } });
+    fireEvent.click(within(row).getByRole("button", { name: "Save changes" }));
+    await waitFor(() => expect(mockApi.patchProvider).toHaveBeenCalledTimes(1));
+    expect(mockApi.patchProvider.mock.calls[0]).toEqual([
+      "p1",
+      { model_map: { haiku: { model: "gw-small", context_window: 65536 }, sonnet: { model: "gw-large" } } },
+    ]);
+  });
+
+  it("makes no request when nothing changed", async () => {
+    await renderCard();
+    const row = await openEdit();
+    fireEvent.click(within(row).getByRole("button", { name: "Save changes" }));
+    await waitFor(() => expect(within(row).queryByRole("button", { name: "Save changes" })).toBeNull());
+    expect(mockApi.patchProvider).not.toHaveBeenCalled();
+  });
+
+  it("endpoint edit sends the chosen URL and auth style", async () => {
+    mockApi.patchProviderEndpoint.mockResolvedValue({ provider: provider() });
+    await renderCard();
+    const row = await screen.findByTestId("provider-p1");
+    fireEvent.click(within(row).getByRole("button", { name: "Edit endpoint" }));
+    fireEvent.change(within(row).getByLabelText("Base URL"), { target: { value: URL_B } });
+    fireEvent.change(within(row).getByLabelText("Auth style"), { target: { value: "x_api_key" } });
+    fireEvent.click(within(row).getByRole("button", { name: "Save endpoint" }));
+    await waitFor(() =>
+      expect(mockApi.patchProviderEndpoint).toHaveBeenCalledWith("p1", { base_url: URL_B, auth_style: "x_api_key" }),
+    );
   });
 });
 

@@ -8,7 +8,7 @@ audience: user
 
 A **model provider** is a named, Anthropic-compatible gateway (a company LLM proxy, for
 example) that you register with its own API key and a map from Claude's model names to the
-gateway's models. Settings has a **Providers** section for them, and `uzi provider` covers
+gateway's models. Settings has a **Custom providers** card for them, and `uzi provider` covers
 the same ground from a terminal.
 
 Selecting a provider as your Claude source arrives in a later release step. Until then you can
@@ -26,7 +26,7 @@ instead of a table.
 
 ## Create a provider
 
-In Settings, open **Providers** and add one, or from the CLI:
+In Settings, open **Custom providers** and add one, or from the CLI:
 
 ```sh
 uzi provider create --name corp-gw \
@@ -64,8 +64,8 @@ and reports them as two separate lines:
 
 - **auth**: `ok`, `rejected` or `inconclusive`. Does the key authenticate and does the endpoint
   speak the Messages protocol?
-- **tools**: `passed`, `not supported`, `inconclusive` or `not run`. Does the gateway return a
-  tool call when asked for one? It is `not run` when auth did not succeed.
+- **tools**: `passed`, `not_supported`, `inconclusive` or `not_run` (Settings words them as plain sentences). Does the gateway return a
+  tool call when asked for one? It is `not_run` when auth did not succeed.
 
 `inconclusive` means the gateway could not be judged (a network error, a timeout, a redirect or
 an unexpected reply), which is not a failure of the key. **Neither result certifies full
@@ -76,8 +76,8 @@ The probe is dialed from the api directly, not from a worker, and it ignores pro
 environment variables. It admits private gateway addresses (RFC 1918, carrier-grade NAT,
 IPv6 unique-local) and refuses link-local (including cloud metadata), unspecified, multicast
 and broadcast addresses. Loopback is refused unless the operator turned on the development
-flag. Limits: one test at a time per user, and 30 per hour per user; the count resets when the
-api restarts. Past a limit the request fails with the reason `provider_probe_rate_limited`.
+flag. Limits: one test at a time per user, 30 per hour per user, and at most 4 tests running at once across the whole instance; the counts reset when the
+api restarts. Past any of these limits the request fails with the reason `provider_probe_rate_limited`.
 
 ## Retire or delete
 

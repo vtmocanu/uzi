@@ -358,3 +358,24 @@ func TestProviderUnsafeNameNeverReachesTerminalRaw(t *testing.T) {
 	_, errOut, _ = runCLI(t, fakeEnv(fc), "provider", "retire", hostileANSI)
 	check("not found", errOut)
 }
+
+func TestParseModelFlagsContextWindowSuffix(t *testing.T) {
+	mm, err := parseModelFlags([]string{"haiku=corp:model", "sonnet=bedrock-v1:0", "opus=big:200000"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mm.Haiku.Model != "corp:model" || mm.Haiku.ContextWindow != nil {
+		t.Fatalf("haiku = %+v", mm.Haiku)
+	}
+	if mm.Sonnet.Model != "bedrock-v1:0" || mm.Sonnet.ContextWindow != nil {
+		t.Fatalf("sonnet = %+v", mm.Sonnet)
+	}
+	if mm.Opus.Model != "big" || mm.Opus.ContextWindow == nil || *mm.Opus.ContextWindow != 200000 {
+		t.Fatalf("opus = %+v", mm.Opus)
+	}
+	_, err = parseModelFlags([]string{"haiku=corp:99999999999999999999999"})
+	var ee *uzicli.ExitError
+	if !errors.As(err, &ee) || ee.Code != uzicli.ExitUsage {
+		t.Fatalf("overflowing window: err = %v", err)
+	}
+}

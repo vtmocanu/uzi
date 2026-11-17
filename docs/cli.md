@@ -2941,7 +2941,7 @@ Web-only, deliberately: the **API key** (add, replace, remove, enable), a **base
 style change**, and **deleting** a provider. There is no key verb or flag, so a stolen CLI token
 cannot mint or redirect a credential. `create` ends by pointing you at Settings for the key.
 A server without `UZI_PROVIDER_ALLOWED_BASE_URLS` has the feature off: `list` says so
-(`--json` gives `enabled: false`) and the other verbs exit 5. A refusal prints the server's
+(`--json` gives `enabled: false`); `create` is refused with `provider_base_url_not_allowed` (exit 2), and `edit`, `test` and `retire` exit 5. A refusal prints the server's
 `reason` (for example `provider_base_url_not_allowed`) after the message. Selecting a provider
 as your Claude source arrives in a later release step, so there is no `use` verb yet.
 

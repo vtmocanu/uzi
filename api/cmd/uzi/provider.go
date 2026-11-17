@@ -138,7 +138,7 @@ func newProviderCmd(env Env, gf *globalFlags) *cobra.Command {
 	create.Flags().StringVar(&cName, "name", "", "provider name (unique among your providers, case-insensitively)")
 	create.Flags().StringVar(&cBaseURL, "base-url", "", "gateway base URL, exactly as your operator allowed it")
 	create.Flags().StringVar(&cAuthStyle, "auth-style", "bearer", "how the key is sent: bearer or x_api_key")
-	create.Flags().StringArrayVar(&cModels, "model", nil, "alias=model[:context_window], repeatable; haiku is required")
+	create.Flags().StringArrayVar(&cModels, "model", nil, "alias=model[:context_window], repeatable; haiku is required (digits after the last colon are the window; a name ending in :0 or containing other colons stays whole)")
 
 	var eName, eBaseURL, eAuthStyle string
 	var eModels []string
@@ -195,7 +195,7 @@ func newProviderCmd(env Env, gf *globalFlags) *cobra.Command {
 		},
 	}
 	edit.Flags().StringVar(&eName, "name", "", "new provider name")
-	edit.Flags().StringArrayVar(&eModels, "model", nil, "alias=model[:context_window], repeatable; replaces the whole model map")
+	edit.Flags().StringArrayVar(&eModels, "model", nil, "alias=model[:context_window], repeatable; replaces the whole model map (digits after the last colon are the window)")
 	// Offered only to explain: a destination change is a web-only action.
 	edit.Flags().StringVar(&eBaseURL, "base-url", "", "web-only: change the base URL in Settings")
 	edit.Flags().StringVar(&eAuthStyle, "auth-style", "", "web-only: change the auth style in Settings")
@@ -338,8 +338,14 @@ func parseModelFlags(vals []string) (apitypes.ModelMapDTO, error) {
 		entry := apitypes.ModelEntryDTO{Model: rest}
 		if i := strings.LastIndex(rest, ":"); i > 0 && i < len(rest)-1 {
 			// A zero suffix is never a window: it is the tail of an id such as "...-v1:0".
-			if n, err := strconv.Atoi(rest[i+1:]); err == nil && isAllDigits(rest[i+1:]) && n > 0 {
-				entry = apitypes.ModelEntryDTO{Model: rest[:i], ContextWindow: &n}
+			if suffix := rest[i+1:]; isAllDigits(suffix) {
+				n, err := strconv.Atoi(suffix)
+				if err != nil {
+					return mm, uzicli.Exitf(uzicli.ExitUsage, "invalid --model %q; the context window after the last colon is too large", cellText(v))
+				}
+				if n > 0 {
+					entry = apitypes.ModelEntryDTO{Model: rest[:i], ContextWindow: &n}
+				}
 			}
 		}
 		if seen[alias] {

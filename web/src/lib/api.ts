@@ -711,21 +711,21 @@ const realApi = {
   // is write-only (PUT /key) and never comes back in any response.
   listProviders: () => request<ProvidersList>("GET", "/me/providers"),
   createProvider: (input: CreateProviderInput) =>
-    request<ProviderDTO>("POST", "/me/providers", {
+    request<{ provider: ProviderDTO }>("POST", "/me/providers", {
       ...input,
       engine: "claude",
       protocol: "anthropic_messages",
     }),
   patchProvider: (id: string, body: { name?: string; model_map?: ProviderModelMap }) =>
-    request<ProviderDTO>("PATCH", `/me/providers/${id}`, body),
+    request<{ provider: ProviderDTO }>("PATCH", `/me/providers/${id}`, body),
   patchProviderEndpoint: (id: string, body: { base_url?: string; auth_style?: ProviderAuthStyle }) =>
-    request<ProviderDTO>("PATCH", `/me/providers/${id}/endpoint`, body),
+    request<{ provider: ProviderDTO }>("PATCH", `/me/providers/${id}/endpoint`, body),
   putProviderKey: (id: string, key: string) =>
-    request<ProviderDTO>("PUT", `/me/providers/${id}/key`, { key }),
-  deleteProviderKey: (id: string) => request<ProviderDTO>("DELETE", `/me/providers/${id}/key`),
+    request<{ provider: ProviderDTO }>("PUT", `/me/providers/${id}/key`, { key }),
+  deleteProviderKey: (id: string) => request<null>("DELETE", `/me/providers/${id}/key`),
   setProviderKeyEnabled: (id: string, enabled: boolean) =>
-    request<ProviderDTO>("PATCH", `/me/providers/${id}/key/enabled`, { enabled }),
-  retireProvider: (id: string) => request<ProviderDTO>("POST", `/me/providers/${id}/retire`),
+    request<{ provider: ProviderDTO }>("PATCH", `/me/providers/${id}/key/enabled`, { enabled }),
+  retireProvider: (id: string) => request<{ provider: ProviderDTO }>("POST", `/me/providers/${id}/retire`),
   deleteProvider: (id: string) => request<null>("DELETE", `/me/providers/${id}`),
   testProvider: (id: string) =>
     request<{ probe: ProviderProbe }>("POST", `/me/providers/${id}/test`),

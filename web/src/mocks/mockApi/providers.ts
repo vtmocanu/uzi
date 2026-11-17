@@ -28,8 +28,22 @@ function live(id: string): ProviderDTO {
 
 function checkUrl(url: string): void {
   if (!mockProviderAllowedBaseUrls.includes(url)) {
-    fail(422, "provider_base_url_not_allowed", "base URL is not in the operator allowlist");
+    fail(400, "provider_base_url_not_allowed", "base URL is not in the operator allowlist");
   }
+}
+
+function noKey(): never {
+  throw new ApiError(404, "the provider has no key", { error: "the provider has no key" });
+}
+
+function nameTaken(name: string, exceptId?: string): boolean {
+  const n = name.trim().toLowerCase();
+  return providers.some((p) => p.id !== exceptId && p.name.toLowerCase() === n);
+}
+
+// bump mirrors a new revision: the stored Test result belongs to the old one.
+function bump(id: string, patch: Partial<ProviderDTO>): ProviderDTO {
+  return update(id, { ...patch, current_revision: find(id).current_revision + 1, probe: null });
 }
 
 function update(id: string, patch: Partial<ProviderDTO>): ProviderDTO {
@@ -55,7 +69,7 @@ export const providersApi = {
   }) => {
     requireSession();
     checkUrl(input.base_url);
-    if (providers.some((p) => p.name === input.name)) {
+    if (nameTaken(input.name)) {
       fail(409, "provider_name_taken", "a provider with that name already exists");
     }
     const created: ProviderDTO = {
@@ -73,12 +87,17 @@ export const providersApi = {
       probe: null,
     };
     providers = [...providers, created];
-    return delay({ ...created });
+    return delay({ provider: { ...created } });
   },
   patchProvider: async (id: string, body: { name?: string; model_map?: ProviderDTO["model_map"] }) => {
     requireSession();
     live(id);
-    return delay(update(id, body));
+    if (body.name !== undefined && nameTaken(body.name, id)) {
+      fail(409, "provider_name_taken", "a provider with that name already exists");
+    }
+    const { model_map, ...rename } = body;
+    if (rename.name !== undefined) update(id, { name: rename.name.trim() });
+    return delay({ provider: model_map ? bump(id, { model_map }) : find(id) });
   },
   patchProviderEndpoint: async (
     id: string,
@@ -87,27 +106,27 @@ export const providersApi = {
     requireSession();
     live(id);
     if (body.base_url !== undefined) checkUrl(body.base_url);
-    return delay(update(id, body));
+    return delay({ provider: bump(id, body) });
   },
   putProviderKey: async (id: string, _key: string) => {
     requireSession();
-    live(id);
-    return delay(update(id, { has_key: true, key_enabled: true, probe: null }));
+    find(id);
+    return delay({ provider: update(id, { has_key: true, key_enabled: true }) });
   },
   deleteProviderKey: async (id: string) => {
     requireSession();
-    live(id);
-    return delay(update(id, { has_key: false, key_enabled: false }));
+    if (!find(id).has_key) noKey();
+    update(id, { has_key: false, key_enabled: false });
+    return delay(null);
   },
   setProviderKeyEnabled: async (id: string, enabled: boolean) => {
     requireSession();
-    const p = live(id);
-    if (!p.has_key) fail(409, "provider_no_key", "provider has no key");
-    return delay(update(id, { key_enabled: enabled }));
+    if (!find(id).has_key) noKey();
+    return delay({ provider: update(id, { key_enabled: enabled }) });
   },
   retireProvider: async (id: string) => {
     requireSession();
-    return delay(update(id, { retired: true, key_enabled: false }));
+    return delay({ provider: update(id, { retired: true }) });
   },
   deleteProvider: async (id: string) => {
     requireSession();
@@ -118,7 +137,7 @@ export const providersApi = {
   testProvider: async (id: string) => {
     requireSession();
     const p = live(id);
-    if (!p.has_key || !p.key_enabled) fail(409, "provider_no_key", "provider has no enabled key");
+    if (!p.has_key || !p.key_enabled) noKey();
     const probe: ProviderProbe = {
       auth_result: "ok",
       tool_result: "passed",
