@@ -1296,6 +1296,18 @@ export interface Board {
   // Optional: an OLD api replica during a rollout skew may omit it entirely, which the
   // consumer treats as "no bot" (0), the same as unresolved.
   bot_forge_user_id?: number;
+  // The repo's durable first-import status (issue #4399). null for a legacy or disabled
+  // repo. Optional: an OLD api replica during a rollout skew omits it, which the board
+  // treats the same as null (no banner).
+  initial_import?: InitialImport | null;
+}
+
+// InitialImport is a just-enabled repo's first issue import, as the board reports it.
+// error_class is present only when state is "failed".
+export interface InitialImport {
+  state: "waiting" | "running" | "succeeded" | "failed";
+  updated_at: string;
+  error_class?: string;
 }
 
 // BoardPrefs is the current user's per-repo board view preferences (PRD #196 M3),

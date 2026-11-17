@@ -84,6 +84,24 @@ func (f *fakeStore) ListAnthropicTokensToPoll(context.Context) ([]store.ListAnth
 	}
 	return out, nil
 }
+
+// ListAnthropicTokensToPollForUser mirrors the owner-scoped query: one user's enabled
+// tokens, with the same notify/revision/generation projection as the factory listing.
+func (f *fakeStore) ListAnthropicTokensToPollForUser(_ context.Context, userID uuid.UUID) ([]store.ListAnthropicTokensToPollForUserRow, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := []store.ListAnthropicTokensToPollForUserRow{}
+	for _, r := range f.rows {
+		if r.UserID != userID || f.disabled[r.ID] {
+			continue
+		}
+		r.NotifyEarlyLimitReset = f.notify[r.UserID]
+		r.EnablementRev = f.rev[r.ID]
+		r.AnthropicSuccessGeneration = f.generation[r.ID]
+		out = append(out, store.ListAnthropicTokensToPollForUserRow(r))
+	}
+	return out, nil
+}
 func (f *fakeStore) GetAnthropicTokenToPoll(_ context.Context, arg store.GetAnthropicTokenToPollParams) (store.GetAnthropicTokenToPollRow, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -494,6 +512,19 @@ func (m *multiTokenStore) ListAnthropicTokensToPoll(context.Context) ([]store.Li
 	for i, r := range m.rows {
 		r.NotifyEarlyLimitReset = m.notify[r.UserID]
 		out[i] = r
+	}
+	return out, nil
+}
+func (m *multiTokenStore) ListAnthropicTokensToPollForUser(_ context.Context, userID uuid.UUID) ([]store.ListAnthropicTokensToPollForUserRow, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := []store.ListAnthropicTokensToPollForUserRow{}
+	for _, r := range m.rows {
+		if r.UserID != userID {
+			continue
+		}
+		r.NotifyEarlyLimitReset = m.notify[r.UserID]
+		out = append(out, store.ListAnthropicTokensToPollForUserRow(r))
 	}
 	return out, nil
 }

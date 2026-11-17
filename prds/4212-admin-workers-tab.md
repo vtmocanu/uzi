@@ -9,8 +9,8 @@
 
 An admin tuning hosted worker capacity has to look in two places, and for some knobs cannot use the UI at all:
 
-- Worker settings are scattered across the long **Admin → Instance** page (`web/src/pages/AdminSettings.tsx`), between judge, Slack, SSO and forge-label cards: the hosted worker quota, the ephemeral workers switch, the custody hold limit, the Docker worker repo allowlist and capability-aware scheduling.
-- The ephemeral worker per-user cap, default size and idle lease are environment-only (`UZI_EPHEMERAL_MAX_PER_USER`, `UZI_EPHEMERAL_DEFAULT_SIZE`, `UZI_EPHEMERAL_LEASE`, read once in `api/internal/config/config.go` `Load`). On k8s the chart always renders the last two (`deploy/chart/templates/api-deployment.yaml:117-120`, defaults in `deploy/chart/values.yaml` `workers.ephemeralLease` / `workers.ephemeralDefaultSize`). Changing one needs a Helm or compose edit and an api restart.
+- Worker settings are scattered across the long **Admin → Instance** page (`web/src/pages/AdminSettings.tsx`), between judge, Slack, SSO and forge-label cards: the hosted worker quota, the ephemeral workers switch, the custody hold limit, worker hibernation, the Docker worker repo allowlist and capability-aware scheduling.
+- The ephemeral worker per-user cap, default size and idle lease are environment-only (`UZI_EPHEMERAL_MAX_PER_USER`, `UZI_EPHEMERAL_DEFAULT_SIZE`, `UZI_EPHEMERAL_LEASE`, read once in `api/internal/config/config.go` `Load`). On k8s the chart always renders the last two (`deploy/chart/templates/api-deployment.yaml:~124-129`, defaults in `deploy/chart/values.yaml` `workers.ephemeralLease` / `workers.ephemeralDefaultSize`). Changing one needs a Helm or compose edit and an api restart.
 
 ## Outcome
 
@@ -18,7 +18,7 @@ A new admin-only page, **Admin → Workers** (`/admin/workers`; always named "Ad
 
 Acceptance examples:
 
-1. An admin opens Admin → Workers and sees the hosted worker quota, ephemeral workers switch, ephemeral per-user cap, ephemeral default size, ephemeral lease, custody hold limit, Docker worker repo allowlist and capability-aware scheduling. None of them appears on Admin → Instance any more, nor in its on-page table of contents.
+1. An admin opens Admin → Workers and sees the hosted worker quota, ephemeral workers switch, ephemeral per-user cap, ephemeral default size, ephemeral lease, custody hold limit, worker hibernation, Docker worker repo allowlist and capability-aware scheduling. None of them appears on Admin → Instance any more, nor in its on-page table of contents; the command menu finds each under Admin › Workers.
 2. On a Helm install with `workers.ephemeralLease`, `workers.ephemeralDefaultSize` and `UZI_EPHEMERAL_MAX_PER_USER` all unset, an admin sets the ephemeral per-user cap to 3 and saves. A user already at 2 ephemeral workers gets a third provisioned on the next provisioner pass, without an api restart. "Reset to default" returns it to 2.
 3. With `UZI_EPHEMERAL_LEASE=30m` set in the api environment (or `workers.ephemeralLease: 30m` in the chart), the lease field shows `30m`, labelled as set by the environment and disabled; a PUT to that key is refused with the same error the other env-sourced keys return.
 4. An admin sets the default size for new workers to `m`. A user opening the provision form sees `m` preselected; workers that already exist keep their size.
@@ -55,7 +55,7 @@ Four new non-secret keys, each in `Defaults` and an explicit `Validate` case; th
 
 ### Chart and compose (`deploy/chart`, `docker-compose.yml`)
 
-- `workers.ephemeralLease` and `workers.ephemeralDefaultSize` default to null in `values.yaml`, and `api-deployment.yaml` renders each env entry **only when its value is set** (an explicit `0` lease still renders, as today). Keep the `api.config`/`api.secretEnv` duplicate-key fail guards (`api-deployment.yaml:9-13`). Update `scripts/assert-ephemeral-lease-render.sh` for the unset case.
+- `workers.ephemeralLease` and `workers.ephemeralDefaultSize` default to null in `values.yaml`, and `api-deployment.yaml` renders each env entry **only when its value is set** (an explicit `0` lease still renders, as today). Keep the `api.config`/`api.secretEnv` duplicate-key fail guards (`api-deployment.yaml:~9-16`). The size-membership guard at the top of that template (`api-deployment.yaml:~5-7`, `fail` unless the value is one of the shipped sizes) runs today on every render, so with a null default it would fail every install: make it check only a set value. Update `scripts/assert-ephemeral-lease-render.sh` for the unset case.
 - `docker-compose.yml` already passes `UZI_EPHEMERAL_LEASE: ${..:-}` (empty when unset), which the overlay's non-empty check ignores; keep that, and confirm the other two are not set to non-empty defaults there.
 - Upgrade note (docs + changelog): an install that sets either chart value keeps its value and sees the field env-locked until the operator unsets it; an install that never set them gets editable fields with the same defaults (`2h`, `m`), so effective behaviour is unchanged on upgrade.
 
@@ -73,14 +73,17 @@ Four new non-secret keys, each in `Defaults` and an explicit `Validate` case; th
 All readers of the three values route through the settings accessors, so they never disagree:
 
 - Provisioner (`api/internal/hostedsvc/ephemeral.go`): add `EphemeralMaxPerUser`, `EphemeralDefaultSize`, `EphemeralLease` to the `EphemeralSettings` interface (`ephemeral.go:50-53`, which already serves `EphemeralWorkersEnabled` and `DockerRepoAllowlist` per pass) and remove the matching fields from `EphemeralConfig` (update its test construction sites, e.g. `api/internal/handler/*ephemeral*_livedb_test.go`). Read once at the start of each pass and use that snapshot for the three trigger queries (`ephemeral.go:205,223,243`), the cap check under the per-user advisory lock (`ephemeral.go:414`), and the reaper (`:347`). A read error skips the whole pass, logged once (fail closed: nothing provisioned, nothing reaped on a blip).
-- Lease entry at completion and ClaimRun's lease arm: `workersvc.Service.ephemeralLease` (`service.go:~2006`, set by `wsvc.SetEphemeralLease` in `main.go:~605`; read in `completion_permit.go:~924`, `ephemeral_lease.go:~195`) reads the accessor per decision instead of a boot-time field.
-- `handler/workers.go:~264` (`ephemeral_lease_expires_at`) reads the accessor.
+- Lease entry at completion and ClaimRun's lease arm: `workersvc.Service.ephemeralLease` (`service.go:~2038`, set by `wsvc.SetEphemeralLease` in `main.go:~610`; read in `completion_permit.go:~924`, `ephemeral_lease.go:~195`) reads the accessor per decision instead of a boot-time field.
+- `handler/workers.go:~326` (`overlayEphemeralLease`, `ephemeral_lease_expires_at`) reads the accessor.
+- Hibernation demand waker (`api/internal/hostedsvc/hibernation_wake.go`, added by #4205-#4207 after this PRD was drafted): `HibernationWakerConfig.Lease` is a boot-time snapshot (`main.go:~823`; the provisioner's `EphemeralConfig.Lease` at `main.go:~812`), passed to `ListHibernationWakeDemand` (`hibernation_wake.go:~99`) and read by `wakeSuppressesProvision` (`:~138`). Demand-wake eligibility and provisioning suppression use the same current effective lease as claims, health and the provisioner; remove the waker's boot-time lease snapshot. Test changing the lease without reconstructing the waker or provisioner, including `0` and an existing leased ephemeral worker.
+- Admin health (`api/internal/workersvc/health.go:~67`, `LeaseInterval(s.ephemeralLease)`) reads the same accessor.
 - **One lease policy: the current effective duration, everywhere.** Lease expiry is always computed as lease start + the current effective `ephemeral_lease`, consistently in the expiry display, ClaimRun/rebind, completion lease entry, Admin health and the reaper. Shortening releases leased-idle workers whose new expiry has passed on the next reaper pass; lengthening extends existing leases; `0` releases every leased-idle worker on the next pass (never strands one); `0` → >0 applies to completions after the change. A settings read error makes the reaper skip the pass (no release on a blip). Existing transaction and custody fences around lease release are unchanged. Each case is tested.
 
 ### Admin → Workers page (`web`)
 
 - New route `/admin/workers` (`web/src/App.tsx`, guard `admin`) and an "Admin → Workers" entry in `AdminShell` nav (`web/src/components/AdminShell.tsx`), after `Instance`.
-- Moves, unchanged in behaviour, from `AdminSettings.tsx`: `HostedWorkerQuotaCard`, `EphemeralWorkersCard`, `CustodyHoldLimitCard`, `DockerAllowlistCard`, `CapabilitySchedulingCard`, keeping each card's `id` (`hosted-worker-quota`, `ephemeral-workers`, `custody-hold-limit`, `docker-allowlist`, `capability-scheduling`). Remove them from Instance's on-page table of contents (`AdminSettings.tsx:~307-311`; its test `AdminSettings.test.tsx:~1846`) and give the new page its own.
+- Moves, unchanged in behaviour, from `AdminSettings.tsx`: `HostedWorkerQuotaCard`, `EphemeralWorkersCard`, `CustodyHoldLimitCard`, `WorkerHibernationCard` (added by #4363 after this PRD was drafted), `DockerAllowlistCard`, `CapabilitySchedulingCard`, keeping each section's `id` (`hosted-worker-quota`, `ephemeral-workers`, `custody-hold-limit`, `worker-hibernation`, `docker-allowlist`, `capability-scheduling`). The card components stay in `web/src/pages/adminSettings/`; only their `<section>` mounts move. Remove them from Instance's on-page table of contents and its test (find the current lines; they drifted) and give the new page its own.
+- **Command menu** (`web/src/components/navSections.ts`, #4375): add the Admin → Workers tab to the admin tab list (its test pins that list to `AdminShell`'s tabs, and every path must be a real non-redirect route in `APP_ROUTES`), and point the six moved sections' entries at `/admin/workers#<id>` instead of the Instance page. Split `ADMIN_SETTINGS_ANCHORS` (and `ADMIN_SETTINGS_ANCHOR_IDS`, which `AdminSettings` scrolls to) so each page scrolls only to its own anchors. Update `navSections.test.tsx`.
 - Adds controls for the four new keys (the three ephemeral ones grouped with `EphemeralWorkersCard`, `hosted_default_size` with `HostedWorkerQuotaCard`), showing effective value, source and reset-to-default, following the existing `sources`/`defaults` card props.
 - Reset sends the existing admin settings PUT with an empty value for the key (the repo's reset convention, verify against `AdminSettings.tsx` cards); the response reports source `default` (or `env` when the env overlay holds the key, in which case the control is disabled and reset is not offered).
 - Saves go through the existing admin settings PUT; no new endpoint.
@@ -88,7 +91,7 @@ All readers of the three values route through the settings accessors, so they ne
 
 ### Docs
 
-- `docs/admin-settings.md`: keep the existing section anchors (`#hosted-worker-quota`, `#custody-hold-limit`, …) so inbound links from `docs/configuration.md:~56`, `docs/hosted-workers.md:~99`, `docs/cli.md:~1471`, `docs/run-recovery.md:~1150` keep resolving; change the "Edit it on Admin → Instance" wording to Admin → Workers.
+- `docs/admin-settings.md`: keep the existing section anchors (`#hosted-worker-quota`, `#custody-hold-limit`, the worker hibernation section, …) so inbound links from `docs/configuration.md:~56`, `docs/hosted-workers.md:~99`, `docs/cli.md:~1471`, `docs/run-recovery.md:~1150` keep resolving; change the "Edit it on Admin → Instance" wording to Admin → Workers.
 - Location wording in: `docs/admin-settings.md`, `docs/hosted-workers.md` (~25, ~99), `docs/capability-scheduling.md` (~182), `docs/cli.md` (~1502), `docs/configuration.md` (env table: the three keys become admin settings with env precedence; env interpretation unchanged). Sweep with `git grep -n -F 'Admin → Instance' -- docs web/src api/cmd/uzi` and read each hit; only those about a moved card change. `task docs:sync`, `task check-docs:web`.
 
 ## Testing decisions
@@ -97,7 +100,8 @@ All readers of the three values route through the settings accessors, so they ne
 - Config: existing `config.Load` behaviour for the three env values is pinned unchanged (malformed cap → 2, `0` cap → 2, cap 25 honoured, unknown size → `m`, lease bounds).
 - Overlay: a key appears in the overlay only when the raw env is non-empty, holding the canonical `cfg` value (main.go wiring test or a small extracted helper).
 - Lifecycle: the lease-policy cases above and the cap change run as LiveDB tests through `./e2e/run-store-it.sh` (live-DB rules in `.claude/rules/go.md`).
-- E2E contract sweep (CLAUDE.md "A product contract change updates the E2E harness"): `git grep -F` the changed literals and settings keys across `e2e/phases/`, `e2e/lib.sh`, `e2e/lib.test.sh`, `e2e/forge-fake/`; run `task test:e2e-lib` and `task test:forge-fake` if anything there changes; name unrun phases in the PR.
+- E2E contract sweep (CLAUDE.md "A product contract change updates the E2E harness"): `git grep -F` the changed literals and settings keys across `e2e/phases/`, `e2e/lib.sh`, `e2e/lib.test.sh`, `e2e/forge-fake/`; run `task test:e2e-lib` and `task test:forge-fake` even when the sweep finds nothing (this PRD changes runtime policy and a response field); name unrun phases in the PR.
+- In-run validation boundary: `task check:api`, affected Go packages with `go test -race -count=1` plus the required LiveDB coverage, `task check:web`, touched Vitest files, the chart assertion scripts, `task docs:sync` + `task check-docs:web`, `task check:changelog-entry`. Full gates stay exact-head PR CI obligations (Landing obligations).
 - Provisioner: a changed cap takes effect on the next pass without rebuilding the provisioner; a settings read error provisions and reaps nothing; lease 0 releases leased-idle workers on the next reaper pass. Follow the existing ephemeral provisioner/reaper tests.
 - workersvc: lease entry at completion follows a changed setting.
 - Chart: `scripts/assert-ephemeral-lease-render.sh` covers unset (no env entry), `0`, and a duration; same for default size.
@@ -108,7 +112,7 @@ All readers of the three values route through the settings accessors, so they ne
 
 ### M1: Admin → Workers holds the existing worker cards
 Blocked by: none.
-- Route, nav entry, the five moved cards, both TOCs, client-side hash redirect, web tests, docs location wording (list above; `task docs:sync`).
+- Route, nav entry, the six moved cards, both TOCs, command-menu entries, client-side hash redirect, web tests, docs location wording (list above; `task docs:sync`).
 - Acceptance: example 1 minus the four new controls; every listed doc site names Admin → Workers; old anchors land on the moved card.
 
 ### M2: Ephemeral cap, default sizes and lease are admin settings
@@ -135,3 +139,4 @@ Blocked by: M1.
 - **Completion interlock stays on Instance**: a run-protocol rollout, not a capacity control.
 - **No CLI change**: there is no CLI admin-settings read/write path for instance settings today; adding one is out of scope.
 - **Cap bound 0..20**: mirrors `maxHostedWorkerQuota`; the namespace ResourceQuota remains the real backstop.
+- **Refresh 2026-11-17 (AI-synced)**: worker hibernation (#4363) added `WorkerHibernationCard` on Instance, so it moves too: it is a worker capacity control. The command menu (#4375) now indexes admin sections in `navSections.ts`, so moved entries must point at the new page. The chart's size guard runs on every render, so a null default needs it relaxed. #4395 (in flight) also changes `WorkerHibernationCard.tsx`, `docs/admin-settings.md`, `workersvc/service.go`, `ephemeral_lease.go`, the settings package and server wiring, all seams this PRD touches. Coordinate those overlapping seams and re-read whichever implementation lands first; preserve #4395's registration fencing and transaction ordering while replacing boot-time lease readers. The demand waker (#4205-#4207) holds its own boot-time lease snapshot, so it joins the lease consumers. Rejected: leaving hibernation on Instance (splits worker controls again).

@@ -453,6 +453,8 @@ enable_restore_fixture_repo() {
   # Record ownership before the enable RPC: an unknown response must still be restored on exit.
   RESTORE_FIXTURE_REPOS+=("$id")
   apiput "/api/repos/$id" '{"enabled":true}' | jq -e '.repo.enabled==true' >/dev/null || return 1
+  # The enable returns before the first import; the callers create an issue next, which an in-flight import would evict.
+  wait_initial_import "$id" || return 1
   # shellcheck disable=SC2034  # result consumed by the phase caller after this function returns
   RESTORE_FIXTURE_REPO_ID="$id"
   pass "independent restore fixture: group/$name (repo $id), isolated bare"
@@ -1729,6 +1731,24 @@ wait_status() {
     sleep 0.3
   done
   fail "timeout: run $run never reached '$want' (last: ${s:-none})"
+}
+
+# wait_initial_import REPO_ID [TIMEOUT_S] — wait for the repo's first issue import to finish. Enabling a repo
+# through the API returns once the enable commits; the poller then runs the first FullSync (board
+# initial_import: waiting -> running -> succeeded). A full sync evicts issues absent from its forge listing,
+# so an issue created through the API while it is still in flight can be deleted again. A `failed` import is
+# retried by the poller, so it is not terminal here: keep polling and name the last state on timeout. Needs
+# the session (JAR) of the repo's owner. Returns 1 with a message on stderr on timeout; callers `|| fail`.
+wait_initial_import() {
+  local id="$1" timeout="${2:-60}" s=none
+  local start=$SECONDS deadline=$((SECONDS + timeout))
+  while [ $SECONDS -lt $deadline ]; do
+    s="$(apiget "/api/repos/$id/board" | jq -r '.board.initial_import.state // "none"' 2>/dev/null)" || s=unreadable
+    if [ "$s" = succeeded ]; then record_margin "repo $id initial import succeeded" "$((SECONDS - start))" "$timeout"; return 0; fi
+    sleep 1
+  done
+  echo "timeout: repo $id first issue import did not succeed within ${timeout}s (last state: $s)" >&2
+  return 1
 }
 
 # run_claimed_at RUN — the run's claimed_at (empty while unclaimed). Capture it BEFORE a

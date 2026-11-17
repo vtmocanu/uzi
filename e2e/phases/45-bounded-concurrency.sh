@@ -76,6 +76,7 @@ else
     || fail "forge-fake did not advertise group/repo2 (is FORGE_FAKE_PROJECT2 set in the overlay?)"
   apiput "/api/repos/$REPO2_ID" '{"enabled":true}' | jq -e '.repo.enabled == true' >/dev/null \
     || fail "could not enable group/repo2"
+  wait_initial_import "$REPO2_ID" || fail "group/repo2 first issue import did not finish"
   pass "second repo group/repo2 enabled (id $REPO2_ID)"
 
   # Recreate the one worker at cap 2. UZI_WORKER_TOKEN reaches this (post-#966) subshell

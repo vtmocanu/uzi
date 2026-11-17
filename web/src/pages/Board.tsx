@@ -105,6 +105,21 @@ function columnLabel(card: CardData): string {
   return card.column;
 }
 
+// importBannerCopy is the banner text for a repo's first-import state (issue #4399);
+// undefined (no banner) for succeeded, null or an old api that omits the field.
+function importBannerCopy(state: string | undefined): string | undefined {
+  switch (state) {
+    case "waiting":
+      return "Waiting to import issues";
+    case "running":
+      return "Importing issues…";
+    case "failed":
+      return "Issue import failed; retrying on the next poll";
+    default:
+      return undefined;
+  }
+}
+
 export function Board() {
   const { id: repoId = "" } = useParams();
   const navigate = useNavigate();
@@ -1095,6 +1110,8 @@ export function Board() {
     [cardsByColumn, applyDrop, pushToast],
   );
 
+  const importBannerText = importBannerCopy(board?.initial_import?.state);
+
   const toolbarRef = useRef<HTMLDivElement>(null);
   const [toolbarH, setToolbarH] = useState(0);
   useLayoutEffect(() => {
@@ -1328,6 +1345,24 @@ export function Board() {
       </div>
 
       {error && <Alert message={error} />}
+
+      {/* Issue #4399: first-import status, driven only by the server's initial_import
+          state (never the card count), so cached cards keep rendering beneath it. Mounted
+          only while there is something to say, like the run banner below; the 10s board
+          poll swaps it out when the state moves on. */}
+      {importBannerText && (
+        <div
+          role="status"
+          aria-live="polite"
+          className={`rounded-lg border px-4 py-2.5 text-sm ${
+            board?.initial_import?.state === "failed"
+              ? "border-danger/40 bg-danger/10 text-danger"
+              : "border-warn/40 bg-warn/10 text-warn"
+          }`}
+        >
+          {importBannerText}
+        </div>
+      )}
 
       {(awaitingRuns.length > 0 ||
         questionRuns.length > 0 ||

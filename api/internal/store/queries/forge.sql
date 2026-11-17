@@ -139,6 +139,7 @@ ORDER BY r.path_with_namespace ASC;
 SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url,
        r.default_branch, r.enabled, r.fold_improve_uzi_backlog,
        r.guardrail_override_reason, r.guardrail_override_by, r.guardrail_override_at,
+       r.initial_import_state, r.initial_import_error_class, r.initial_import_updated_at,
        c.forge_type, c.base_url, c.token_ciphertext, c.user_id, c.bot_forge_user_id
 FROM repos r
 JOIN forge_connections c ON c.id = r.connection_id
@@ -238,6 +239,52 @@ UPDATE repos SET enabled = $2
 WHERE repos.id = $1
   AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $3)
 RETURNING *;
+
+-- name: EnableRepoForUser :one
+-- Owner-scoped enable that also records the first-import intent (issue #4399).
+-- A newly enabled repo, or one whose import has not succeeded, gets a new
+-- generation in state 'waiting' for the poller to run; re-enabling an already
+-- enabled repo whose import succeeded changes nothing. The SET expressions read
+-- the OLD row, so `repos.enabled` below is the pre-update value.
+UPDATE repos SET
+  enabled = true,
+  initial_import_generation = CASE
+    WHEN NOT repos.enabled OR repos.initial_import_state IS DISTINCT FROM 'succeeded'
+    THEN repos.initial_import_generation + 1 ELSE repos.initial_import_generation END,
+  initial_import_state = CASE
+    WHEN NOT repos.enabled OR repos.initial_import_state IS DISTINCT FROM 'succeeded'
+    THEN 'waiting' ELSE repos.initial_import_state END,
+  initial_import_error_class = CASE
+    WHEN NOT repos.enabled OR repos.initial_import_state IS DISTINCT FROM 'succeeded'
+    THEN NULL ELSE repos.initial_import_error_class END,
+  initial_import_updated_at = CASE
+    WHEN NOT repos.enabled OR repos.initial_import_state IS DISTINCT FROM 'succeeded'
+    THEN now() ELSE repos.initial_import_updated_at END
+WHERE repos.id = $1
+  AND repos.connection_id IN (SELECT forge_connections.id FROM forge_connections WHERE forge_connections.user_id = $2)
+RETURNING *;
+
+-- name: ClaimRepoInitialImport :execrows
+-- The poller's claim of the repo's owed first import at the generation it read.
+-- Zero rows means the generation moved (disable/enable) or the import is not owed.
+UPDATE repos SET
+  initial_import_state = 'running',
+  initial_import_error_class = NULL,
+  initial_import_updated_at = now()
+WHERE repos.id = $1
+  AND repos.initial_import_generation = $2
+  AND repos.initial_import_state IN ('waiting','running','failed');
+
+-- name: FinishRepoInitialImport :execrows
+-- Settles a claimed import: state 'succeeded' with a NULL class, or 'failed' with
+-- a class. Generation- and state-guarded so a stale finisher writes zero rows.
+UPDATE repos SET
+  initial_import_state = sqlc.arg('state')::text,
+  initial_import_error_class = sqlc.narg('error_class')::text,
+  initial_import_updated_at = now()
+WHERE repos.id = sqlc.arg('id')
+  AND repos.initial_import_generation = sqlc.arg('generation')
+  AND repos.initial_import_state = 'running';
 
 -- name: DeleteRepoForUser :execrows
 -- Owner-scoped hard delete of a single repo (PRD #357). The `AND enabled = false`
@@ -401,6 +448,7 @@ RETURNING *;
 -- engine's poller set.
 SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_url,
        r.default_branch, r.enabled,
+       r.initial_import_state, r.initial_import_generation,
        c.forge_type, c.base_url, c.token_ciphertext, c.user_id
 FROM repos r
 JOIN forge_connections c ON c.id = r.connection_id

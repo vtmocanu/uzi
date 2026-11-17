@@ -569,6 +569,52 @@ func TestAutoRetriesOnceOntoAnotherPooledTokenWhenThePickWillNotOpen(t *testing.
 	}
 }
 
+// TestAutoRetryFloorSkipsKnownExhaustedToken (#4405): the open_failed floor runs
+// autoselect.Floor over FRESH, measured tokens too, so the exhaustion demotion reaches
+// it. After the pick will not open, the remaining pool holds a token whose five-hour
+// window is at 100% with its reset 30 minutes out (the soonest reset, so tieLess alone
+// would choose it) and a token with headroom. The retry must spend the one with
+// headroom.
+//
+// MUTATION THIS CATCHES: Floor ordering by tieLess alone → the exhausted token is
+// re-floored onto and recorded.
+func TestAutoRetryFloorSkipsKnownExhaustedToken(t *testing.T) {
+	f := newAutoFixture(t)
+	box := f.svc.box
+	sealedSpent, _ := box.Seal([]byte("anthropic-SPENT-autosel-abcdef1234"))
+	spentID := uuid.New()
+	f.fs.byIDSecrets[spentID] = store.GetUserSecretCiphertextByIDRow{
+		UserID: f.owner, Kind: store.KindAnthropicToken, Ciphertext: sealedSpent, SealedWith: store.SealedWithMaster,
+	}
+	f.fs.byIDLabels[spentID] = "spent-key"
+	f.fs.byIDSecrets[f.emptyID] = store.GetUserSecretCiphertextByIDRow{
+		UserID: f.owner, Kind: store.KindAnthropicToken,
+		Ciphertext: []byte("not-sealed-by-this-box"), SealedWith: store.SealedWithMaster,
+	}
+	spent := candRow(spentID, "spent-key", true, 0, time.Minute, 0)
+	spent.FiveHourResetsAt = pgtype.Timestamptz{Time: autoNow.Add(30 * time.Minute), Valid: true}
+	f.fs.autoCandidates = []store.ListAutoSelectCandidatesRow{
+		candRow(f.emptyID, "spare-key", true, 90, time.Minute, 0), // the pick; will not open
+		spent,
+		candRow(f.fullID, "console-key", true, 20, time.Minute, 0), // reset +20h, later than spent's
+	}
+
+	if payload := f.claim(t); payload == nil {
+		t.Fatal("the claim went idle; console-key was openable")
+	}
+	if f.fs.claimFailed != nil {
+		t.Fatalf("the run was failed terminally (%v)", f.fs.claimFailed)
+	}
+	rec := onlyRecord(t, f.fs)
+	if got := uuid.UUID(rec.AnthropicSecretID.Bytes); got != f.fullID {
+		t.Fatalf("recorded %v, want console-key %v — spent-key's last reading is a five-hour window "+
+			"at 100%% whose reset is still ahead (spent-key = %v)", got, f.fullID, spentID)
+	}
+	if rec.AnthropicSelectReason.String != string(autoselect.ReasonOpenFailed) {
+		t.Fatalf("reason = %q, want %q", rec.AnthropicSelectReason.String, autoselect.ReasonOpenFailed)
+	}
+}
+
 // TestAutoRetryIsOnceOnly: when the floor-retry target ALSO fails to open, the claim
 // fails terminally rather than looping. The bound is structural — autoFloorRetry
 // records reason=open_failed, which fails autoLaneRetryable, so the second open

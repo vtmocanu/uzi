@@ -189,6 +189,61 @@ func (q *Queries) ListAnthropicTokensToPoll(ctx context.Context) ([]ListAnthropi
 	return items, nil
 }
 
+const listAnthropicTokensToPollForUser = `-- name: ListAnthropicTokensToPollForUser :many
+SELECT s.id, s.user_id, s.ciphertext, s.sealed_with, u.notify_early_limit_reset,
+       s.enablement_rev, s.anthropic_success_generation, u.vault_epoch
+FROM user_secrets s
+JOIN users u ON s.user_id = u.id
+WHERE s.kind = 'anthropic_token' AND s.disabled_at IS NULL
+  AND s.user_id = $1
+ORDER BY s.user_id, s.id
+`
+
+type ListAnthropicTokensToPollForUserRow struct {
+	ID                         uuid.UUID `json:"id"`
+	UserID                     uuid.UUID `json:"user_id"`
+	Ciphertext                 []byte    `json:"ciphertext"`
+	SealedWith                 string    `json:"sealed_with"`
+	NotifyEarlyLimitReset      bool      `json:"notify_early_limit_reset"`
+	EnablementRev              int64     `json:"enablement_rev"`
+	AnthropicSuccessGeneration int64     `json:"anthropic_success_generation"`
+	VaultEpoch                 int64     `json:"vault_epoch"`
+}
+
+// Owner-scoped sibling of ListAnthropicTokensToPoll for the vault-ready poke
+// (#4406): every ENABLED anthropic_token of one user, same projection as the
+// factory-wide listing so the poke opens exactly the rows it listed and captures the
+// same enablement_rev fence and success generation. A disabled token is not listed
+// (PRD #1732 D1).
+func (q *Queries) ListAnthropicTokensToPollForUser(ctx context.Context, userID uuid.UUID) ([]ListAnthropicTokensToPollForUserRow, error) {
+	rows, err := q.db.Query(ctx, listAnthropicTokensToPollForUser, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListAnthropicTokensToPollForUserRow{}
+	for rows.Next() {
+		var i ListAnthropicTokensToPollForUserRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.UserID,
+			&i.Ciphertext,
+			&i.SealedWith,
+			&i.NotifyEarlyLimitReset,
+			&i.EnablementRev,
+			&i.AnthropicSuccessGeneration,
+			&i.VaultEpoch,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listAutoSelectCandidates = `-- name: ListAutoSelectCandidates :many
 SELECT s.id                     AS user_secret_id,
        s.label                  AS label,

@@ -194,7 +194,9 @@ message) and answer with `uzi run answer`. A completion-interlock question is di
 plain answer cannot exempt a frozen milestone. Record the decision with `uzi run decide RUN`
 (`--continue`, `--partial <kept ids> --reason '...'` or `--accept <ids> --reason '...'`), on the
 live question or on a run already parked in the completion hold. Then re-arm the poller with
-the answered question's seq as its 6th arg (`min-question-seq`, script header). **Never answer with "keep waiting"**
+the answered question's seq as its 6th arg (`min-question-seq`, script header). Decide within
+the question's live window: when it expires the run parks `paused` with hold `completion_blocked`.
+`uzi run decide --continue` re-queues that held run; generic `uzi run resume` refuses the hold. **Never answer with "keep waiting"**
 (e.g. for a dependency PR to merge): an answer resumes the run, and a run with nothing to do spends
 its iteration budget on no-op turns (#2657). At iteration exhaustion, eligible runs with
 negotiated `iteration_park_version: 1` and authoritative persisted `completion_attempts = 0`
@@ -312,6 +314,21 @@ Check these traps before every approve:
   the plan must say how the gate is attempted and which lane covers it if it fails.
   Otherwise `revise`. A missing `/proc` alone does not make a gate blocked. This covers
   human-reviewed plan gates only; unattended (autopilot/sweep) plans get no such review.
+- **An impossible universal proof rule.** Classify each behavioural seam before approving
+  baseline-restoring mutations: changed behaviour needs a base-restoring mutant; preserved
+  behaviour needs baseline-role evidence plus a sensitivity control (guard removal; a behavioural
+  mutation of the seam only when it has no guard) through the
+  candidate's real path; novel ordering where the base refused the operation needs
+  baseline-refusal evidence plus a call-relocation ordering control through that path. Split
+  mixed requirements. Helper-only reds do not discharge integration requirements; no executable
+  proof means unvalidated.
+- **A step requiring unavailable network git.** Run agents cannot fetch. Verify the run's local
+  `origin/main` and ancestry before approving offline migration renumbering
+  (`MIGRATION_RENUMBER_NO_FETCH=1`); never bypass the guard or describe that ref as current
+  without evidence. Authorize necessary in-run renumbering before LiveDB proofs, updating
+  references by migration identity. Leave fresh-main integration to the lander when unavailable
+  in-run. The lander reviews the integration/renumber delta, revalidates affected proofs and
+  requires exact-head CI.
 
 Each is a `revise` (or, for a genuine plan/PRD conflict, a question to the user), not a
 reject — the rest of a good plan stays.
