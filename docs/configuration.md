@@ -252,7 +252,8 @@ so does every Test, right before it connects) and, once providers can run, their
 URLs, rendered into `UZI_PROVIDER_ALLOWED_BASE_URLS`; setting the variable in `api.config` as well
 fails the render). The chart checks every entry's shape (https only; no userinfo, query, fragment,
 `%`, `;`, `\`, dot or empty path segments, comma or whitespace) and the api re-validates at boot.
-`UZI_PROVIDER_ALLOW_LOOPBACK` is a compose development flag and has no chart value. For a gateway
+`UZI_PROVIDER_ALLOW_LOOPBACK` is a compose development flag and has no chart value; setting it in
+`api.config` fails the render. For a gateway
 behind a private CA, set `workers.extraCA` (it needs `api.tls.enabled`): the chart mounts the same
 bundle read-only into the api pod, sets `UZI_PROVIDER_EXTRA_CA_FILE` to it and rolls the pod when the
 inline `pem` changes (an in-place edit of an existing ConfigMap needs an api restart). Without it, a

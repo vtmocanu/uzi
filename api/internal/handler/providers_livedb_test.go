@@ -106,6 +106,9 @@ func TestProviderCreateAndListLiveDB(t *testing.T) {
 	if strings.Contains(rec.Body.String(), "ciphertext") || strings.Contains(rec.Body.String(), testProviderKey) {
 		t.Errorf("list leaks key material: %s", rec.Body.String())
 	}
+	if len(list.AllowedBaseURLs) != 1 || list.AllowedBaseURLs[0] != testGatewayURL {
+		t.Errorf("allowed_base_urls = %v, want the operator entry %q", list.AllowedBaseURLs, testGatewayURL)
+	}
 	rec = bearerReqBody(f.router, http.MethodGet, "/api/me/providers/"+p.ID, f.uzc, "")
 	if rec.Code != http.StatusOK {
 		t.Errorf("get = %d", rec.Code)
@@ -170,6 +173,9 @@ func TestProviderFeatureOffLiveDB(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), `"providers":[]`) {
 		t.Errorf("providers must serialize as an empty array: %s", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"allowed_base_urls":[]`) {
+		t.Errorf("allowed_base_urls must serialize as an empty array: %s", rec.Body.String())
 	}
 }
 

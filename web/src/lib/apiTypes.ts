@@ -142,6 +142,55 @@ export interface SecretDependents {
   enabled_siblings: SecretDependentPage<{ id: string; label: string }>;
 }
 
+// ── Custom providers (PRD #4320 M3) ──────────────────────────────────────────
+export type ProviderModelRole = "opus" | "sonnet" | "haiku" | "fable";
+
+export interface ProviderModelEntry {
+  model: string;
+  context_window?: number;
+}
+
+// haiku is required by the server; the other roles are optional.
+export type ProviderModelMap = { haiku: ProviderModelEntry } & Partial<
+  Record<Exclude<ProviderModelRole, "haiku">, ProviderModelEntry>
+>;
+
+export type ProviderAuthStyle = "bearer" | "x_api_key";
+
+export interface ProviderProbe {
+  auth_result: "ok" | "rejected" | "inconclusive";
+  tool_result?: "passed" | "not_supported" | "inconclusive" | "not_run";
+  probed_at: string;
+}
+
+export interface ProviderDTO {
+  id: string;
+  name: string;
+  engine: "claude";
+  retired: boolean;
+  current_revision: number;
+  protocol: "anthropic_messages";
+  base_url: string;
+  auth_style: ProviderAuthStyle;
+  model_map: ProviderModelMap;
+  has_key: boolean;
+  key_enabled: boolean;
+  probe: ProviderProbe | null;
+}
+
+export interface ProvidersList {
+  enabled: boolean;
+  allowed_base_urls: string[];
+  providers: ProviderDTO[];
+}
+
+export interface CreateProviderInput {
+  name: string;
+  base_url: string;
+  auth_style: ProviderAuthStyle;
+  model_map: ProviderModelMap;
+}
+
 // TestSecretResult is the flat, sanitized response from the explicit credential Test action.
 export interface TestSecretResult {
   status: "ok" | "rejected" | "permission_denied" | "inconclusive";

@@ -2911,6 +2911,40 @@ it straight into `file`/`dismiss`/`resolve`. Treat `location`, the title and `re
 untrusted free text (they are agent-authored): render them as data, and branch only
 on the `status`/`bucket` enums.
 
+## Model providers: `uzi provider`
+
+A [model provider](./providers.md) is a named Anthropic-compatible gateway with its own key
+and model map. The CLI manages the parts that never handle a credential:
+
+```sh
+uzi provider list                              # NAME, URL, AUTH, MODELS, KEY, TEST, RETIRED
+uzi provider create --name corp-gw --base-url https://gw.example.com/anthropic \
+  --model haiku=corp-haiku:200000 --model sonnet=corp-sonnet:200000
+uzi provider edit corp-gw --name corp --model haiku=corp-haiku:200000
+uzi provider test corp                         # auth and tool-call results, separately
+uzi provider retire corp
+```
+
+`<name|id>` matches an id exactly or a name without regard to case. `create` needs `--name`,
+`--base-url` (exactly one of the URLs your operator allowed; `uzi provider list --json` shows
+them as `allowed_base_urls`) and `--model haiku=...`. `--auth-style` is `bearer` (default) or
+`x_api_key`. `--model` is `alias=model[:context_window]` and repeatable; `edit --model` replaces
+the whole map. A trailing `:0` stays part of the model id; any other all-digit suffix after the
+last colon is read as the context window.
+
+`test` prints an `auth:` line (`ok`, `rejected`, `inconclusive`) and a `tools:` line (`passed`,
+`not_supported`, `inconclusive`, `not_run`), then "Neither result certifies full compatibility
+with Claude." `--json` carries the same fields. Tests are limited to one at a time and 30 per hour
+per user.
+
+Web-only, deliberately: the **API key** (add, replace, remove, enable), a **base URL or auth
+style change**, and **deleting** a provider. There is no key verb or flag, so a stolen CLI token
+cannot mint or redirect a credential. `create` ends by pointing you at Settings for the key.
+A server without `UZI_PROVIDER_ALLOWED_BASE_URLS` has the feature off: `list` says so
+(`--json` gives `enabled: false`) and the other verbs exit 5. A refusal prints the server's
+`reason` (for example `provider_base_url_not_allowed`) after the message. Selecting a provider
+as your Claude source arrives in a later release step, so there is no `use` verb yet.
+
 ## Anthropic tokens
 
 You can hold several named [Anthropic credentials](./anthropic-token.md) and

@@ -225,7 +225,11 @@ func (h *Handler) ListMyProviders(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	out := apitypes.ProviderListDTO{Enabled: h.providersEnabled(), Providers: []apitypes.ProviderDTO{}}
+	out := apitypes.ProviderListDTO{
+		Enabled:         h.providersEnabled(),
+		Providers:       []apitypes.ProviderDTO{},
+		AllowedBaseURLs: append([]string{}, h.cfg.ProviderAllowedBaseURLs...),
+	}
 	if !out.Enabled {
 		httpx.JSON(w, http.StatusOK, out)
 		return

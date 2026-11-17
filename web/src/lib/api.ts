@@ -170,6 +170,12 @@ import type {
   Worker,
   CodexAccountMode,
   HibernationResult,
+  CreateProviderInput,
+  ProviderAuthStyle,
+  ProviderDTO,
+  ProviderModelMap,
+  ProvidersList,
+  ProviderProbe,
 } from "./apiTypes";
 export type * from "./apiTypes";
 export { DEFAULT_AUTOPILOT_LABEL, RATE_LIMIT_SOURCES } from "./apiTypes";
@@ -701,6 +707,28 @@ const realApi = {
     return request<{ user: User }>("PUT", "/me/judge", body);
   },
   listSecrets: () => request<{ secrets: SecretMeta[] }>("GET", "/me/secrets"),
+  // Custom providers (PRD #4320 M3). Cookie session like the secrets routes; the key
+  // is write-only (PUT /key) and never comes back in any response.
+  listProviders: () => request<ProvidersList>("GET", "/me/providers"),
+  createProvider: (input: CreateProviderInput) =>
+    request<ProviderDTO>("POST", "/me/providers", {
+      ...input,
+      engine: "claude",
+      protocol: "anthropic_messages",
+    }),
+  patchProvider: (id: string, body: { name?: string; model_map?: ProviderModelMap }) =>
+    request<ProviderDTO>("PATCH", `/me/providers/${id}`, body),
+  patchProviderEndpoint: (id: string, body: { base_url?: string; auth_style?: ProviderAuthStyle }) =>
+    request<ProviderDTO>("PATCH", `/me/providers/${id}/endpoint`, body),
+  putProviderKey: (id: string, key: string) =>
+    request<ProviderDTO>("PUT", `/me/providers/${id}/key`, { key }),
+  deleteProviderKey: (id: string) => request<ProviderDTO>("DELETE", `/me/providers/${id}/key`),
+  setProviderKeyEnabled: (id: string, enabled: boolean) =>
+    request<ProviderDTO>("PATCH", `/me/providers/${id}/key/enabled`, { enabled }),
+  retireProvider: (id: string) => request<ProviderDTO>("POST", `/me/providers/${id}/retire`),
+  deleteProvider: (id: string) => request<null>("DELETE", `/me/providers/${id}`),
+  testProvider: (id: string) =>
+    request<{ probe: ProviderProbe }>("POST", `/me/providers/${id}/test`),
   testSecret: (kind: "anthropic_token" | "codex_auth" | "openai_api_key", id: string) =>
     request<TestSecretResult>("POST", `/me/secrets/${kind}/${id}/test`),
   // PRD #104 M2 token CRUD. create/rename/set-default/rotate/delete are all

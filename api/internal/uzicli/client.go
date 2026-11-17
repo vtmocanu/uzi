@@ -104,6 +104,13 @@ type Client interface {
 	// entry's value appears nowhere — there is no reveal endpoint.
 	ListSecrets(ctx context.Context) ([]apitypes.SecretDTO, error)
 	TestSecret(ctx context.Context, kind, id string) (apitypes.SecretTestResult, error)
+	// Model providers (PRD #4320): /api/me/providers, RequireUser. The key and endpoint routes
+	// are cookie-only and deliberately absent here.
+	ListProviders(ctx context.Context) (apitypes.ProviderListDTO, error)
+	CreateProvider(ctx context.Context, req apitypes.ProviderCreateRequest) (apitypes.ProviderDTO, error)
+	EditProvider(ctx context.Context, id string, req apitypes.ProviderPatchRequest) (apitypes.ProviderDTO, error)
+	RetireProvider(ctx context.Context, id string) (apitypes.ProviderDTO, error)
+	TestProvider(ctx context.Context, id string) (*apitypes.ProviderProbeDTO, error)
 	// SetTokenAutoEligible opts one of the caller's Anthropic tokens into or out of
 	// the auto-selection pool (PRD #111 M2, D2): PATCH
 	// /api/me/secrets/anthropic_token/{id}/auto-eligible {auto_eligible}.

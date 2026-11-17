@@ -391,6 +391,18 @@ type FakeClient struct {
 	LastReservePct   *int
 	LastReservePause bool
 
+	// Model providers (PRD #4320): ProviderList drives ListProviders; ProviderResult and
+	// ProviderProbe are the canned replies of the writes and the test; the Last* fields record
+	// what the command sent.
+	ProviderList        apitypes.ProviderListDTO
+	ProviderResult      apitypes.ProviderDTO
+	ProviderProbe       *apitypes.ProviderProbeDTO
+	LastProviderCreate  *apitypes.ProviderCreateRequest
+	LastProviderPatch   *apitypes.ProviderPatchRequest
+	LastProviderID      string
+	ProviderRetireCalls int
+	ProviderTestCalls   int
+
 	// Secrets drives ListSecrets (PRD #104 M2).
 	Secrets                  []apitypes.SecretDTO
 	SecretTestResult         apitypes.SecretTestResult

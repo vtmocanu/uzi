@@ -1,0 +1,53 @@
+package uzicli
+
+import (
+	"context"
+
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
+)
+
+// fake_providers.go holds the FakeClient model-provider methods (PRD #4320). Providers drives
+// the list; the write methods record what they were asked for and answer the canned
+// ProviderResult / ProviderProbe, or Err.
+
+func (f *FakeClient) ListProviders(context.Context) (apitypes.ProviderListDTO, error) {
+	if f.Err != nil {
+		return apitypes.ProviderListDTO{}, f.Err
+	}
+	return f.ProviderList, nil
+}
+
+func (f *FakeClient) CreateProvider(_ context.Context, req apitypes.ProviderCreateRequest) (apitypes.ProviderDTO, error) {
+	f.LastProviderCreate = &req
+	if f.Err != nil {
+		return apitypes.ProviderDTO{}, f.Err
+	}
+	return f.ProviderResult, nil
+}
+
+func (f *FakeClient) EditProvider(_ context.Context, id string, req apitypes.ProviderPatchRequest) (apitypes.ProviderDTO, error) {
+	f.LastProviderID = id
+	f.LastProviderPatch = &req
+	if f.Err != nil {
+		return apitypes.ProviderDTO{}, f.Err
+	}
+	return f.ProviderResult, nil
+}
+
+func (f *FakeClient) RetireProvider(_ context.Context, id string) (apitypes.ProviderDTO, error) {
+	f.LastProviderID = id
+	f.ProviderRetireCalls++
+	if f.Err != nil {
+		return apitypes.ProviderDTO{}, f.Err
+	}
+	return f.ProviderResult, nil
+}
+
+func (f *FakeClient) TestProvider(_ context.Context, id string) (*apitypes.ProviderProbeDTO, error) {
+	f.LastProviderID = id
+	f.ProviderTestCalls++
+	if f.Err != nil {
+		return nil, f.Err
+	}
+	return f.ProviderProbe, nil
+}

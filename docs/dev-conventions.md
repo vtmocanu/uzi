@@ -654,6 +654,9 @@ scenarios are mutually exclusive by construction. Known values:
   otherwise collapse after approval. Now fixtures illustrate intended work
   from titles and role labels. Prompt tests check instructions and fences;
   live model wording remains a maintainer spot-check.
+- `providers` — `/settings?mock=providers` turns the model-providers feature on with one
+  seeded provider (PRD #4320), so the Settings Providers section shows its list, the allowed
+  URLs and the Test result lines. Without it the demo shows the feature off.
 - `oidc`, `oidc-degraded`, `sso-only` — the PRD #45 OIDC UX, otherwise
   unreachable in the demo (OIDC off, password on, by default).
 - `truncated-backlog` — `/judge?mock=truncated-backlog` puts the
