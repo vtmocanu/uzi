@@ -360,3 +360,57 @@ unvalidated; no functional criterion is accepted, waived or deferred.
 Other unvalidated rows also remain worker obligations. m3 and m4 are **INCOMPLETE**.
 Exact-head CI obligations and two-real-account owner acceptance retain
 their existing classifications.
+
+## Duplicated enforcement method boundary
+
+At source revision dda69dd2d82a11bf123066771decd3b6c5cec53f,
+api/internal/workersvc/codex_switch_stopped.go:32–40 locks the claim and
+then rejects in Go before issuing the stopped SQL:
+
+```go
+locked, run, tx, err := s.beginClaimMutation(ctx, w, id, req.ClaimGeneration)
+// error handling and deferred rollback
+if !codexSwitchLaneEligible(run) || UnresolvedPolicyEpisode(run) {
+    return run, false, nil
+}
+```
+
+The worker lock precedes the owned run lock in
+api/internal/workersvc/milestone_reconciliation.go:295–305; the transaction
+is retained through the stopped query. The owned read in
+queries/runtime.sql:12843 ends in `FOR UPDATE OF runs`. A concurrent writer
+of that run cannot commit a changed policy or lane between the Go read and
+the SQL predicate. No race-based separation is established.
+
+The smallest duplicated case is pending fresh policy.
+api/internal/workersvc/policy_hold.go:189–192 rejects
+`r.PolicyPendingFresh`; queries/codex_switch_stopped.sql:19 also requires
+`NOT r.policy_pending_fresh`. Removing only the Go term leaves SQL refusal;
+removing only the SQL term leaves Go refusal. Unresolved-outcome enforcement
+is similarly duplicated: Go checks
+`r.PolicyOutcomeID.Valid && !r.PolicyResolvedAt.Valid`, while SQL:20 requires
+`r.policy_outcome_id IS NULL OR r.policy_resolved_at IS NOT NULL`.
+
+Lane exclusions are also duplicated. The Go helper in
+api/internal/workersvc/credential_switch_codex.go:333–342 rejects a review
+target and chat/judge/job/cross_check; SQL:15–16 repeats those exclusions.
+The SQL general-hold check is broader than the Go policy-hold check, so an
+ordinary non-policy hold remains an independently discriminating candidate;
+it must not be treated as proof of the duplicated policy fences.
+
+An independent architect source investigation at 5212bffae found no
+reachable single-copy policy/lane control under methods (a)–(d). The lead
+spot-checked the predicates and lock ordering. This is static feasibility
+evidence only: no duplicate-guard mutant has been executed or credited.
+Whole-operation historical refusal does not isolate these negative fences,
+and the duplicated checks are not an ordering relocation.
+
+Class (d) does not expressly define whether a guard is an enforcing
+occurrence or a semantic fence with multiple copies. Its exact-one-guard
+and no-combined-removal requirements cannot silently authorize deleting
+both copies. Owner method clarification is required before counting a
+control that neutralizes all and only the enumerated copies of one semantic
+fence. Each negative case would still need its own compiling, real-path
+red/green control with every other fence intact. This is a proposed method
+clarification, not accepted evidence or a functional waiver. The affected
+clauses remain required and unvalidated; m3/m4 remain incomplete.

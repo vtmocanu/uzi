@@ -334,6 +334,33 @@ suite or broad no-tokens proof. This documentation update inspected the
 script, manifest, fixture and SQL, spot-checked logs and counted unchanged
 passes; it did not rerun the commands.
 
+## Additional authority-route cases at dda69dd2d
+
+The test-only commit dda69dd2d82a11bf123066771decd3b6c5cec53f adds
+api/internal/handler/codex_switch_stopped_authority_routes_livedb_test.go.
+The exact committed file content passed the focused handler race run in
+`.uzi/scratch/gate-log.5F4QD4`, EXIT=0, package 23.616 seconds: 28
+running/paused authority-marker cases and four wire-shape cases, no skips.
+The command selected only TestWorkerCodexStoppedAuthorityRouteLiveDB and
+TestWorkerCodexStoppedWireAuthorityRouteLiveDB with GOFLAGS=-p=1 and
+GOMAXPROCS=4 through the recreated throwaway handler database harness.
+Generation/release cases explicitly require an audit-free fixture so the
+outer reconciliation check does not mask the SQL guard. The wire cases
+exercise a known extra typed field and a case alias for register_nonce.
+
+Independent reviewer inspection at dda69dd2d found no blocking code defect.
+Its one non-blocking note was unmeasured before/after CI job and critical-path
+timing; the focused package duration above is not that measurement. No base
+build or CI timing comparison was performed. The prepared
+`.uzi/scratch/stopped-authority-controls.py` has **not** executed. These 32
+positive cases do not yet carry qualifying mutation evidence and do not
+change the unvalidated clause accounting.
+
+The duplicated-policy/lane proof-method boundary is recorded in the
+[proof ledger](credential-switch-proof-ledger.md#duplicated-enforcement-method-boundary).
+This is a pending method clarification, not an accepted proof or functional
+waiver. The production guards are unchanged.
+
 ## Outstanding evidence
 
 Transactional and LiveDB evidence has been re-observed, including the 50-test
