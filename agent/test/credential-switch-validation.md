@@ -712,3 +712,25 @@ mutation reconstruction, raw outcomes/hashes, tree equality and cleanup exit 0.
 Export removed, primary unchanged. Only direct first-STOP paused-time credit
 sensitivity is proved; replay/other accounting triggers and remaining m3/m4
 criteria are still required and incomplete. No full-suite or security credit.
+
+
+## Populated applied-switch journal control
+
+E6 records candidate 7ff6c1644 with a real applied-X audit row, not a synthetic
+or empty journal. A second Y operation preflights at epoch 42 and withdraws
+without changing capability authority or recording withdrawn history. The test
+requires exactly the actual X row and preserves it across first STOP and replay.
+It does not relatch a failed report or claim withdrawn-X/Y coverage.
+
+One added DELETE CTE in source/generated stopped SQL removes that journal row
+only for changed run IDs. No fences, other effects or fixture code are changed.
+Receipt .uzi/scratch/stopped-switch-journal-results.json records actual before
+exit 0 (OkTFgQ), compiling assertion-red exit 1 at fixture :142,
+`snapshot changed in switch` (8M32R4), and after exit 0 (JhaNNp). Logs use the
+.uzi/scratch/gate-log. prefix. No skipped test, SQL/build error or timeout counts
+as red. Lead reconstruction and raw-log checks verify the exact mutations and
+results; a whitespace-only audit reconstruction error was corrected without
+rerunning tests. Source fixture review found no findings, cleanup exit 0,
+export removed and primary unchanged. First-STOP journal deletion only is newly
+credited; replay mutation sensitivity and remaining transaction/runtime/security
+criteria remain required. m3/m4 incomplete.

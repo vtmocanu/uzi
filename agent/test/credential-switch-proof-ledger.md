@@ -431,7 +431,7 @@ control is still absent, not that the functional criterion was deferred.
 | Stopped refusal of claimed status | D25–D56: running/paused status_claimed; other statuses unvalidated |
 | Stopped ownership, lane and policy fences | D57–D60 credit pending-fresh/unresolved-outcome; D61 paused policy-hold; D62/D63 stable user-owner mismatch running/paused. D64–D73 credit the five enumerated STOP lane exclusions running/paused; concurrent owner changes and other policy clauses unvalidated |
 | Stopped replay after withdrawn X/Y; resume/reclaim and incarnation changes | Unvalidated; the fixture's single HTTP withdrawal does not discharge X/Y |
-| Stopped preservation of binding, journals, session, gates, questions and custody without input consumption/time banking | E1 base-journal deletion, E2 applied-input deletion, E3 custody timestamp corruption, E4 owner-discard/live-reference loss, E5 direct paused-time credit only; other dispositions/effects, replay sensitivity and broader clauses unvalidated |
+| Stopped preservation of binding, journals, session, gates, questions and custody without input consumption/time banking | E1 base-journal deletion, E2 applied-input deletion, E3 custody timestamp corruption, E4 owner-discard/live-reference loss, E5 direct paused-time credit, E6 applied-switch journal deletion only; other dispositions/effects, replay sensitivity and broader clauses unvalidated |
 | Stopped known extra typed member and register_nonce case alias | D25–D56: four running/paused wire cases only |
 | Bounded strict stopped request, other forbidden combinations, op_id and minimal acknowledgement | Unvalidated |
 | Tokens absent from all inputs/acknowledgements/messages/logs | Targeted positive assertions present; qualifying controls and m4 security gates remain required |
@@ -1171,3 +1171,71 @@ base builds, concurrent builds, full-suite or security result. Credit is only
 sensitivity to this direct first-STOP paused-time write. Replay, other accounting
 triggers, concurrency and remaining preservation clauses are not discharged.
 The broader m3/m4 completion contract remains required and incomplete.
+
+
+### E6 — populated applied-switch journal deletion sensitivity control
+
+Candidate 7ff6c1644f50dccc78825e0207f79d22e5808ca1. Receipt:
+.uzi/scratch/stopped-switch-journal-results.json. This is one
+**effect-injection sensitivity control** for preservation of applied switch
+history on first accepted STOP, distinct from E1's ordinal-zero base journal.
+
+The new TestWorkerCodexStoppedSwitchJournalRouteLiveDB applies X through the
+real worker apply route at epoch 42, verifies its actual ordinal-1 row and frozen
+B snapshot, and then prepares Y targeting the original credential. Y's actual
+preflight response supplies epoch 42, claim generation and registration nonce
+for the new stopped report. After Y withdrawal, the capability is unchanged,
+there is no Y audit row, and the snapshot must contain exactly the unchanged X
+row. This is fresh authority negotiated for a new operation, not relatching an
+epoch after a rejected report. No fake journal INSERT supplies the fixture.
+The pre-existing applied-successor case still rejects stale epoch 41.
+
+One CTE is added after changed, identically to source SQL :40 and generated
+constant :50, before the unchanged accepted-result SELECT:
+
+```sql
+), erased_switch_epochs AS (
+ DELETE FROM run_credential_switch_epochs
+ WHERE run_id IN (SELECT id FROM changed)
+ RETURNING run_id
+```
+
+It is one journal DELETE effect; all eligibility fences, six RUN assignments,
+responses and fixtures remain unchanged. It deletes the populated X row for
+this fixture's changed run. Source-only DBA review traced 00446 table keys and
+constraints, 00447 outgoing secret FK and 00465 Codex snapshot additions. The
+bounded migration census found no switch-table DELETE guard, user trigger,
+incoming FK, rule or RLS policy, and no RUN trigger referencing the switch table.
+Deleting the child does not delete its run/secret parents or fire RUN triggers.
+Actual execution then establishes the effect reaches the preservation assertion,
+not merely that the SQL text appears valid.
+
+The authenticated state route holds worker/run locks; changed identifies the
+first transition, the DELETE executes in the same transaction before commit,
+and the unfiltered whole-row switch snapshot is read after acknowledgement.
+The mutant reaches new fixture :142, `snapshot changed in switch`, after its
+HTTP 200/applied checks. Thus neither an empty set nor a preparation failure
+supplies the red. The unchanged test also completes paused replay positively.
+
+From api, with GOFLAGS=-p=1 and GOMAXPROCS=4:
+
+```sh
+go test -buildvcs=false -race -count=1 -json -timeout=4m ./internal/handler -run '^TestWorkerCodexStoppedSwitchJournalRouteLiveDB$'
+```
+
+Before gate-log.OkTFgQ exits 0 (130.205s), mutant gate-log.8M32R4 exits 1
+(183.084s), after gate-log.JhaNNp exits 0 (9.382s). Logs are under
+.uzi/scratch/. No skips, SQLSTATE, build failure or timeout supplies the red.
+The lead verified raw test outcomes and reconstructed both exact mutant hashes;
+its first reconstruction used different whitespace, was corrected to the saved
+diff, and did not rerun any gate. Terminal entries and raw exits establish the
+completed results despite the receipt's retained pending-stage marker.
+
+Fixture source review found no findings. Export removed, exact owned fixture
+cleanup exits 0, primary HEAD/status/diff and hashes unchanged. No installs,
+base builds, concurrent builds or full-suite/security result. Credit is only
+first-STOP applied-X journal deletion sensitivity. X was applied, not withdrawn:
+this does not discharge withdrawn-X/withdrawn-Y delayed-report semantics.
+Owner-request API behavior, Runtime teardown, B model work, journal-generation
+relation controls and replay-effect sensitivity remain separate obligations.
+All remaining m3/m4 criteria stay required and incomplete.
