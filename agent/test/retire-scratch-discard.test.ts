@@ -330,7 +330,10 @@ describe("validateEpochRetireEmptyLaunch", () => {
 /** A scope whose EX lock is a real descriptor, so the child fd table can be inspected. */
 function realScope() {
   let pending = 0, stopped = false;
-  const exFile = path.join(os.tmpdir(), `uzi-retire-ex-${process.pid}-${Math.random().toString(36).slice(2)}`);
+  // The EX file lives in this file's own temp root, removed by afterEach (never loose in TMPDIR).
+  const exRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-retire-discard-"));
+  tmpDirs.push(exRoot);
+  const exFile = path.join(exRoot, "ex");
   fs.writeFileSync(exFile, "");
   const exFd = fs.openSync(exFile, fs.constants.O_RDONLY);
   openFds.push(exFd);
