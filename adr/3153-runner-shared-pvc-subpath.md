@@ -348,7 +348,7 @@ open on #4143 pending a durable parent-binding design.
 
 ## Amendment (2026-11-17, #4420)
 
-Claude issue-run flights now launch with a run-owned `TMPDIR` leaf `run-<runId>` under
+Claude run flights in the main run lane (issue, task, CI-fix, self-improve and MR-rework runs) now launch with a run-owned `TMPDIR` leaf `run-<runId>` under
 the scratch root, and the scratch phase may reclaim such a leaf. The authority, exclusion
 and settlement protections of the 2026-11-10 amendment are unchanged. A `run-<uuid>` leaf
 is additionally kept unless the server lifecycle is terminal, the run has zero open
@@ -372,7 +372,8 @@ Owner decisions:
 Consequence: the hibernation census reports `run-<uuid>` leaves as protected
 (`run_scratch`), so the hibernation retirement dry-run evaluator
 (`api/internal/workersvc/hibernation_retirement.go`, `entryBlocker`) records a
-`protected_source` blocker for such a worker until its next pod start reclaims the leaves.
+`protected_source` blocker for such a worker until a later pod start's scratch phase reclaims them, if it does
+(the scratch phase must run, deletion be requested, the epoch be eligible and attested, and the run have ended).
 
 Deferred, not shipped: deletion at run end (no fence against sibling runner-uid writers
 or Docker-created mounts after the listing, the #4043 deferral), startup throughput,

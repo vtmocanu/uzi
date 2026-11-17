@@ -2805,14 +2805,16 @@ are recorded in [ADR-3153](../adr/3153-runner-shared-pvc-subpath.md).
 
 #### Per-run TMPDIR leaves (#4420)
 
-A Claude issue-run flight launches with its own `TMPDIR`, `<scratch root>/run-<runId>`
-(`agent/src/run-tmpdir.ts`), under the split root `/data/runner/.tmp/uzi-runner`
-(created by a runner-uid helper) or the single-UID root `/data/runner/.tmp`. The leaf
+A Claude run flight in the main run lane (issue, task, CI-fix, self-improve and
+MR-rework runs) launches with its own `TMPDIR`, `<scratch root>/run-<runId>`
+(`agent/src/run-tmpdir.ts`), under the split root `/data/runner/.tmp/uzi-runner` or the
+single-UID root `/data/runner/.tmp`. The leaf is created by a runner-uid helper in split
+mode and by the worker in single-UID mode. The leaf
 is mode exactly `0700`; an existing leaf is reused only when it is exactly `0700` and
 has the right owner. Any failure falls back to the shared `TMPDIR` and logs a warning
 with a fixed reason token. The Claude SDK env, the pre-plan JS dependency install,
 self-improve checks and devbox provisioning use it; Codex, chat, job, isolated,
-advice and cross-check lanes are unchanged.
+advice, judge, review and cross-check lanes are unchanged.
 
 The startup scratch phase above stays the only deleter. Non-run leaves take the 512
 admission slots first and are processed first, in name order, so run leaves cannot
@@ -2839,7 +2841,7 @@ New `scratch.kept` reasons for run leaves:
 |---|---|
 | `run_active` | the run is not terminal on the server |
 | `run_retained` | the run still has open recovery holds |
-| `run_unknown` | the server does not know the run (ownership 404, for example a run reassigned to another worker) |
+| `run_unknown` | the server reports the run as not this worker's (ownership 404), e.g. a run reassigned to another worker |
 | `run_unreadable` | a server read failed, timed out or was malformed |
 | `run_local_active` | a local retention source is still active |
 | `run_local_unknown` | a local retention source could not be read or classified |
@@ -2851,7 +2853,9 @@ Known consequences and not shipped:
 
 - The hibernation census reports `run-<uuid>` leaves as protected (`run_scratch`),
   so the hibernation retirement dry-run records a `protected_source` blocker for such
-  a worker until its next pod start reclaims the leaves.
+  a worker until a later pod start's scratch phase reclaims them, if it does (reclaim
+  needs the scratch phase to run, deletion requested, an eligible and attested epoch,
+  and an ended run).
 - Deletion at run end is deferred: after the listing there is no fence against
   sibling runner-uid writers or Docker-created mounts (the #4043 deferral).
 - Startup throughput, run-procs and cache-cap attribution of the leaf are deferred.
