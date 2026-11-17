@@ -395,6 +395,28 @@ describe("cap and absent inputs", () => {
   });
 });
 
+describe("setgid runner root", () => {
+  it("the retire scratch parent is 0700 even when the runner root is setgid (production 3775)", async (t) => {
+    exdev(t);
+    const c = mk({ split: true });
+    const s = await seed(c, 4292);
+    // Precondition: a host that cannot set g+s must fail loudly, not give a vacuous green.
+    fs.chmodSync(runnerRoot(), 0o3775);
+    assert.equal(fs.statSync(runnerRoot()).mode & 0o2000, 0o2000, "runner root carries S_ISGID");
+    const probe = path.join(runnerRoot(), ".probe-setgid");
+    fs.mkdirSync(probe, 0o700);
+    try {
+      assert.equal(fs.statSync(probe).mode & 0o7777, 0o2700, "a plain mkdir under the root inherits S_ISGID");
+    } finally { fs.rmdirSync(probe); }
+    await c.retireRunnerClone(s.bare, s.clonePath, s.branch, s.owner, { discard: true, attemptId: ATTEMPT, dispositionClass: "owner_terminal" });
+    const [parent] = parents();
+    assert.ok(parent, "the retire kept a bound scratch parent");
+    // This is exactly the mode discardRetireScratchParent's preflight compares against (wrong_mode otherwise);
+    // driving that discard needs a pod-epoch scope and is covered by the real-image lane.
+    assert.equal(fs.statSync(path.join(runnerRoot(), parent)).mode & 0o7777, 0o700);
+  });
+});
+
 describe("audit rework", () => {
   const retire = (c: GitCache, s: Seed, extra: Record<string, unknown> = {}) =>
     c.retireRunnerClone(s.bare, s.clonePath, s.branch, s.owner, { discard: true, attemptId: ATTEMPT, dispositionClass: "owner_terminal", ...extra });

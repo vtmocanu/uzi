@@ -21238,12 +21238,28 @@ export class GitCache {
    *  daemon file-hold where a recursive rm races). The mkdir is NON-recursive, so it throws
    *  EEXIST if a runner pre-planted the path — fail closed, rather than using a recursive
    *  0700 mkdir under the runner-writable tree as an ownership assertion; the lstat then
-   *  rejects a symlink or other type surprise. Returns the created scratch parent path. */
+   *  rejects a symlink or other type surprise. Returns the created scratch parent path.
+   *
+   *  The production runner root is setgid (mode 3775), so Linux gives the new directory S_ISGID and
+   *  the mkdir mode 0700 comes out as 02700. The pod-epoch discard refuses any parent whose mode is
+   *  not exactly 0700, so the parent is pinned and fchmod'ed to 0700 here (the owner may clear
+   *  S_ISGID without CAP_FSETID; access never widens), then re-read and required to be exactly 0700. */
   private async createRetireScratchParent(): Promise<string> {
     const scratchParent = path.join(this.runnerRoot, `.retire-${randomUUID()}`);
     await fs.mkdir(scratchParent, { mode: 0o700 }); // non-recursive ⇒ throws on EEXIST — fail closed
     const st = await fs.lstat(scratchParent);
     if (!st.isDirectory()) throw new Error("retire scratch parent is not a directory");
+    // Plain read-only directory open (not O_PATH): fchmod needs a real descriptor.
+    const handle = await fs.open(scratchParent, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
+    try {
+      const pinned = await handle.stat();
+      if (!pinned.isDirectory() || pinned.uid !== process.getuid?.()) throw new Error("retire scratch parent is not a directory owned by this uid");
+      await handle.chmod(0o700);
+      const after = await handle.stat();
+      if ((after.mode & 0o7777) !== 0o700) throw new Error("retire scratch parent mode is not 0700");
+    } finally {
+      await handle.close();
+    }
     return scratchParent;
   }
 

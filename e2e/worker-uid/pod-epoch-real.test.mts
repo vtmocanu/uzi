@@ -721,7 +721,37 @@ test("pod epoch real retire scratch: the runner-uid empty-fd helper reclaims a p
   } catch (e) { primary = e; throw e; } finally { await closeAfter(f, primary, () => t && dropTree(t)); }
 });
 
-test("pod epoch real retire scratch: directories the runner cannot list or modify survive byte-identical as residue with no chmod", { timeout: 150000 }, async () => {
+test("pod epoch real retire scratch: the production retire writer keeps the scratch parent 0700 under the setgid 3775 runner root and the discard removes it", { timeout: 200000 }, async () => {
+  const f = fixture(); let base: string | undefined;
+  let primary: unknown;
+  try {
+    // The entrypoint posture for the runner root (agent/templates/entrypoint.sh): worker:runner, sticky and setgid.
+    base = fs.mkdtempSync("/data/retire-prod-");
+    fs.chmodSync(base, 0o755); fs.chownSync(base, WORKER_ID, WORKER_ID);
+    const runnerRoot = path.join(base, "runner");
+    fs.mkdirSync(runnerRoot);
+    own(runnerRoot, WORKER_ID, RUNNER_ID, 0o3775);
+    assert.equal(fs.statSync(runnerRoot).mode & 0o7777, 0o3775, "the runner root carries sticky and setgid");
+    const owner = await retireOwner(f);
+    const made = await owner.ask({ op: "retire-production", dataDir: base }, 120000);
+    assert.equal(made.runnerRoot, runnerRoot);
+    assert.equal(made.canonicalGone, true, "the clone moved into the scratch parent");
+    assert.equal(made.cloneExists, true);
+    assert.match(made.bindings, /uzi-retire-scratch\./, "the parent is durably bound");
+    assert.equal(made.parentUid, WORKER_ID);
+    assert.equal(made.parentMode.toString(8), "700", "a setgid root must not leave 02700 on the scratch parent");
+    for (const dir of ["outside", "elsewhere"]) fs.mkdirSync(path.join(base, dir));
+    const t: RetireTree = { base, root: runnerRoot, parent: path.join(runnerRoot, made.parentName), clone: path.join(runnerRoot, made.parentName, "clone"),
+      outside: path.join(base, "outside"), elsewhere: path.join(base, "elsewhere") };
+    const out = await owner.ask({ ...retireReq(f, t), parentName: made.parentName }, 90000);
+    assert.deepEqual(out.result, { kind: "removed" }, JSON.stringify(out));
+    assert.equal(fs.existsSync(t.parent), false, "parent and clone are gone");
+  } catch (e) { primary = e; throw e; } finally {
+    await closeAfter(f, primary, () => base && dropTree({ base } as RetireTree));
+  }
+});
+
+test("pod epoch real retire scratch: directories the runner cannot list or modify survive byte-identical as residue with no chmod",{ timeout: 150000 }, async () => {
   const f = fixture(); let t: RetireTree | undefined;
   let primary: unknown;
   try {

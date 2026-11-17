@@ -403,6 +403,7 @@ const epochTitles = [
   "pod epoch restores observable persistent worker and runner scratch in both UID modes and refuses invalid saved paths",
   "pod epoch real split: the worker pins the runner scratch root, the runner-uid census reads it and the strict delete removes a leaf",
   "pod epoch real retire scratch: the runner-uid empty-fd helper reclaims a populated clone, the worker removes clone and parent and an outward symlink target survives",
+  "pod epoch real retire scratch: the production retire writer keeps the scratch parent 0700 under the setgid 3775 runner root and the discard removes it",
   "pod epoch real retire scratch: directories the runner cannot list or modify survive byte-identical as residue with no chmod",
   "pod epoch real retire scratch: a runner-cmd directory the runner can list but not unlink from survives byte-identical as residue",
   "pod epoch real retire scratch: a clone swapped around the helper run is never followed or removed and a descendant swapped before the helper is unlinked, never followed",

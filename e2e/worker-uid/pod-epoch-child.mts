@@ -238,6 +238,52 @@ async function retireEval(req: { cache: string; bare: string; uuid: string; runn
   const exam = evaluateRetireBinding({ evidence, uuid: req.uuid, runnerRoot: req.runnerRoot });
   return { read, exam };
 }
+// The production retire writer in the real image: a GitCache over a data dir whose runner root is worker:runner 3775
+// (the entrypoint posture, so the new scratch parent inherits setgid) seeds a runner clone from a local origin and runs
+// retireRunnerClone down its EXDEV scratch branch. Only the cross-device rename into the holding root is simulated
+// (a test-only fs.promises.rename wrapper). Reports what the production code left behind, as the worker uid.
+async function retireProduction(req: { dataDir: string }) {
+  process.env.UZI_UID_SPLIT = "1";
+  const { GitCache } = await import("../../agent/src/git.js");
+  const { formatAttemptId } = await import("../../agent/src/attempt-path.js");
+  const logger: any = { debug() {}, info() {}, warn() {}, error() {}, addSecret() {}, removeSecret() {},
+    redactDiagnostic: (text: string) => text, child() { return logger; } };
+  const env = { PATH: "/usr/bin:/bin", HOME: os.tmpdir(), GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null", GIT_TERMINAL_PROMPT: "0" };
+  const plain = (cwd: string, ...args: string[]) => execFileSync("git",
+    ["-C", cwd, "-c", "user.email=fixture@example.com", "-c", "user.name=fixture", "-c", "commit.gpgsign=false", ...args], { encoding: "utf8", env });
+  const origin = path.join(req.dataDir, "origin");
+  fs.mkdirSync(origin);
+  execFileSync("git", ["init", "-q", "-b", "main", origin], { env });
+  fs.writeFileSync(path.join(origin, "README.md"), "one\n");
+  plain(origin, "add", "README.md");
+  plain(origin, "commit", "-q", "-m", "commit 1");
+  const attemptId = formatAttemptId(new Date("2026-11-05T10:10:10Z"), 1, "0123456789abcdef");
+  const runId = "run-retire-production";
+  const git: any = new GitCache(req.dataDir, logger);
+  const bare = await git.ensureClone(origin);
+  const branch = "agent/issue-4263";
+  const clone = await git.createOrAttachRunnerClone(bare, 4263, { beforeFree: async () => {}, isLive: () => false }, runId, false, undefined,
+    { attemptId, isLive: () => false, beforeSeed: async () => {} });
+  await git.markRecoveryCapture(bare, clone.path, branch, runId, attemptId);
+  const runnerRoot = path.join(req.dataDir, "runner");
+  const holdingRoot = path.join(req.dataDir, "runner-quarantine");
+  const rename = fs.promises.rename;
+  (fs.promises as { rename: typeof fs.promises.rename }).rename = (async (from: fs.PathLike, to: fs.PathLike) => {
+    if (String(to).startsWith(holdingRoot)) throw Object.assign(new Error("cross device"), { code: "EXDEV" });
+    return rename(from, to);
+  }) as typeof fs.promises.rename;
+  try {
+    await git.retireRunnerClone(bare, clone.path, branch, runId, { discard: true, attemptId, dispositionClass: "owner_terminal" });
+  } finally { (fs.promises as { rename: typeof fs.promises.rename }).rename = rename; }
+  const parents = fs.readdirSync(runnerRoot).filter(n => n.startsWith(".retire-"));
+  if (parents.length !== 1) throw new Error("expected exactly one retire scratch parent, saw " + JSON.stringify(parents));
+  const parentPath = path.join(runnerRoot, parents[0]!);
+  const pst = fs.lstatSync(parentPath);
+  const bindings = execFileSync("git", ["-C", bare, "config", "--local", "--get-regexp", "^uzi-retire-scratch\\."], { encoding: "utf8", env }).trim();
+  return { runnerRoot, parentName: parents[0]!, parentMode: pst.mode & 0o7777, parentUid: pst.uid,
+    rootMode: fs.lstatSync(runnerRoot).mode & 0o7777, cloneExists: fs.existsSync(path.join(parentPath, "clone")),
+    canonicalGone: !fs.existsSync(clone.path), bindings };
+}
 console.log(JSON.stringify({ ready: true, pid: process.pid, uid: process.getuid!(),
   actualFilesystem: Number(fs.statfsSync(root).type), classificationOnly: "ext4" }));
 for await (const line of createInterface({ input: process.stdin })) {
@@ -334,6 +380,7 @@ for await (const line of createInterface({ input: process.stdin })) {
         break;
       case "retire-bind": result = await retireBind(request); break;
       case "retire-eval": result = await retireEval(request); break;
+      case "retire-production": result = await retireProduction(request); break;
       default: throw new Error("unknown request");
     }
     console.log(JSON.stringify({ result }));
