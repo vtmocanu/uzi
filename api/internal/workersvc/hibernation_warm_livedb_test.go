@@ -1032,3 +1032,148 @@ func TestWarmWakeNeedsSurplusModeLiveDB(t *testing.T) {
 	p.pass(keeper)
 	p.wantWarm(sleeper)
 }
+
+// Issue #4442: a draining (non-maintenance) sleeper stays a warm-wake target. A replacement pod's
+// Register clears the drain (clear-on-roll, PRD #422) so the worker becomes a ready keeper; an
+// original pod retained settles without a Register, so the drain and the not-ready state stay.
+
+// drain marks id draining outside maintenance, as an image roll does.
+func (p *poolFx) drain(id uuid.UUID) {
+	p.t.Helper()
+	p.env.exec(`UPDATE workers SET draining_since = $2, draining_reason = 'image_roll' WHERE id = $1`, id, p.clock.Add(-time.Minute))
+}
+
+// registerPod registers id from pod through the real Register path with the seeded slot count
+// (so the pool key keeps max_concurrent_runs) and the given protocol capabilities; it returns
+// the new registration nonce.
+func (p *poolFx) registerPod(id, pod uuid.UUID, protocolCaps []string) string {
+	p.t.Helper()
+	slots := 2
+	_, nonce, err := p.svc.RegisterWithCrossCheckSlots(p.env.ctx, p.row(id), "v1", "", &slots, nil, nil, protocolCaps, nil, pod)
+	if err != nil {
+		p.t.Fatalf("register: %v", err)
+	}
+	return nonce
+}
+
+// readyReplacement sends the controller's ready report for a fresh pod of the waking id: ready
+// alone never settles a replacement pod.
+func (p *poolFx) readyReplacement(id uuid.UUID) uuid.UUID {
+	p.t.Helper()
+	next := uuid.New()
+	p.env.exec(`UPDATE workers SET registered_pod_uid = $2 WHERE id = $1`, id, next)
+	p.mustApply(id, TransitionReady, next)
+	p.want(id, "waking")
+	return next
+}
+
+// keeperOf is the deterministic keeper of the owner's pool input, if any.
+func (p *poolFx) keeperOf() (uuid.UUID, bool) {
+	p.t.Helper()
+	rows, err := p.env.q.GetOwnerHibernationPoolInput(p.env.ctx, p.user)
+	if err != nil {
+		p.t.Fatal(err)
+	}
+	return pickKeeper(rows, p.clock, p.svc.p.WorkerHeartbeatStale)
+}
+
+func TestWarmWakeDrainingSleeperLiveDB(t *testing.T) {
+	// warmDraining warm wakes a draining, automatically admitted sleeper beside a busy keeper.
+	warmDraining := func(p *poolFx, keeper, sleeper uuid.UUID, hibernated bool) {
+		p.t.Helper()
+		p.sleeper(sleeper, AdmitOriginAutoSurplus, hibernated)
+		p.drain(sleeper)
+		p.busy(keeper, time.Hour)
+		if n := p.pass(keeper); n != 1 {
+			p.t.Fatalf("pass = %d, want 1", n)
+		}
+		p.wantWarm(sleeper)
+		if !p.row(sleeper).DrainingSince.Valid {
+			p.t.Fatal("the warm wake itself must not clear the drain")
+		}
+	}
+
+	t.Run("eligibility: a draining hibernated sleeper is the warm-wake target", func(t *testing.T) {
+		p := newPoolFx(t)
+		keeper, sleeper := p.member(5*time.Hour), p.member(6*time.Hour)
+		warmDraining(p, keeper, sleeper, true)
+	})
+
+	t.Run("replacement pod: ready plus Register settles and clears the drain", func(t *testing.T) {
+		p := newPoolFx(t)
+		keeper, sleeper := p.member(5*time.Hour), p.member(6*time.Hour)
+		warmDraining(p, keeper, sleeper, true)
+		pod := p.readyReplacement(sleeper)
+		p.registerPod(sleeper, pod, nil)
+		p.want(sleeper, "none")
+		row := p.row(sleeper)
+		if row.DrainingSince.Valid {
+			t.Fatal("Register's clear-on-roll must clear a non-maintenance drain")
+		}
+		if !row.WakeRegisterOpID.Valid {
+			t.Fatal("the replacement settle must record the Register")
+		}
+		p.beatOnly(sleeper) // Register stamped the database now(); pass moved the fixture clock ahead
+		if !p.ready(sleeper) {
+			t.Fatal("the woken worker must be a ready keeper")
+		}
+		if k, ok := p.keeperOf(); !ok || k != sleeper {
+			t.Fatalf("keeper = %v, %v; want the woken worker", k, ok)
+		}
+	})
+
+	t.Run("replacement pod, memory-capable: ready only after a fresh fenced held report", func(t *testing.T) {
+		p := newPoolFx(t)
+		keeper, sleeper := p.member(5*time.Hour), p.member(6*time.Hour)
+		p.makeCapable(keeper)
+		m := p.makeCapable(sleeper)
+		if a, b := keyOf(t, p.poolRowOf(sleeper)), keyOf(t, p.poolRowOf(keeper)); a != b {
+			t.Fatalf("setup: sleeper and keeper are in different pools: %s vs %s", a, b)
+		}
+		warmDraining(p, keeper, sleeper, true)
+		pod := p.readyReplacement(sleeper)
+		m.nonce, m.epoch = p.registerPod(sleeper, pod, capableCaps()), 0
+		p.want(sleeper, "none")
+		if p.row(sleeper).DrainingSince.Valid {
+			t.Fatal("Register's clear-on-roll must clear a non-maintenance drain")
+		}
+		p.beatOnly(sleeper)
+		if _, ok := p.heldAt(sleeper); ok {
+			t.Fatal("Register must leave no held receipt")
+		}
+		if p.ready(sleeper) {
+			t.Fatal("a memory-capable worker without a fresh held report must not be ready")
+		}
+		m.claim("held")
+		if _, ok := p.heldAt(sleeper); !ok {
+			t.Fatal("a held report on the new registration must stamp the receipt")
+		}
+		p.beat(sleeper) // refreshes the heartbeat and the existing receipt to the fixture clock
+		if !p.ready(sleeper) {
+			t.Fatal("after a fresh fenced held report the woken worker must be a ready keeper")
+		}
+		if k, ok := p.keeperOf(); !ok || k != sleeper {
+			t.Fatalf("keeper = %v, %v; want the woken worker", k, ok)
+		}
+	})
+
+	t.Run("original pod retained: settles without Register and keeps the drain", func(t *testing.T) {
+		p := newPoolFx(t)
+		keeper, sleeper := p.member(5*time.Hour), p.member(6*time.Hour)
+		warmDraining(p, keeper, sleeper, false) // preparing: withdrawn, never scaled down
+		row := p.settleSamePod(sleeper)
+		if row.WakeRegisterOpID.Valid {
+			t.Fatal("the same-pod settle must not need a Register")
+		}
+		if !row.DrainingSince.Valid {
+			t.Fatal("without a Register the drain must stay")
+		}
+		p.beatOnly(sleeper)
+		if p.ready(sleeper) {
+			t.Fatal("a draining worker must not be a ready keeper")
+		}
+		if k, ok := p.keeperOf(); ok {
+			t.Fatalf("keeper = %v; want none", k)
+		}
+	})
+}
