@@ -297,9 +297,12 @@ c17 result above. The behavior map and later focused results do not establish
 m3 or m4 completion. The full (a)/(b)/(c) method has now been restored in the
 [per-seam proof ledger](credential-switch-proof-ledger.md). That ledger records
 six additional executed controls and retains the two earlier ordering controls.
-Several mandatory clauses, including new non-ordering stopped-settlement
-fences, remain required and unvalidated. A proof-method decision is pending;
-no functional criterion is accepted, waived or deferred.
+The owner subsequently supplied class (d) for new guards without an a233
+seam: one compiling guard-removal control per negative case, through the real
+switch path or real API route and store transaction. This resolves the prior
+method question only. The remaining mandatory clauses are still required and
+unvalidated until those controls execute; no functional criterion is accepted,
+waived or deferred.
 
 `task test:codex-m4` and lead-owned m4 security, contracts, sqlc regeneration
 and integration checks remain pending. Full suites remain pending exact-head

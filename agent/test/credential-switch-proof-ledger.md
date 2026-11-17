@@ -24,6 +24,13 @@ criterion is accepted, waived or deferred.
   historical refusal; relocate/reorder the particular call in a compiling
   candidate export, red through the real switch path and green unchanged.
   Label this an **ordering control**, not pre-feature baseline evidence.
+- **(d)** New guard without a corresponding a233 seam: record exact baseline
+  refusal/absence, then remove or neutralize exactly that guard in a compiling
+  candidate export. The focused regression must be red through the real
+  Runner/switch path, or the real API route and store transaction for server
+  fences, with unchanged-candidate green. Label it a **guard control**, not
+  pre-feature baseline evidence. Each negative case needs its own control;
+  removing several guards together does not discharge them individually.
 
 Mixed clauses are split. An old helper does not establish historical
 provenance for new callers, ordering or authority fences. Each required
@@ -217,7 +224,7 @@ control is still absent, not that the functional criterion was deferred.
 | Bounded strict stopped request, forbidden op_id/combinations and minimal acknowledgement | Unvalidated |
 | Tokens absent from all inputs/acknowledgements/messages/logs | Targeted positive assertions present; qualifying controls and m4 security gates remain required |
 
-## Unresolved method boundary
+## Baseline absence and the class (d) method boundary
 
 At a233, ordinary `SetRunPaused` (queries/runtime.sql:4426–4446) required
 `status = 'running'`, `pause_requested_at IS NOT NULL` and a pause mode
@@ -235,10 +242,10 @@ the old prelude introduces a different credential requirement.
 The stopped numeric epoch equality, pending-input anti-join and paused-replay
 eligibility/accounting are new non-ordering predicates. Whole-operation
 refusal cannot discriminate those negative fences; their guards are not
-historically identical, and they are not call-order requirements. No qualifying
-(a), (b) or (c) control has been established for them. They remain required
-and unvalidated. A proof-method decision is needed before claiming these
-clauses complete; no functional waiver is proposed.
+historically identical, and they are not call-order requirements. The subsequent owner class (d) extension resolves this method boundary.
+These clauses remain required and unvalidated until their individual real-path
+guard controls have executed; no functional criterion is accepted, waived
+or deferred.
 
 Other unvalidated rows also remain worker obligations. m3 is incomplete.
 m4, exact-head CI obligations and two-real-account owner acceptance retain

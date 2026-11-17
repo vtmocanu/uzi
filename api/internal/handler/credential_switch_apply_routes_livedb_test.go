@@ -28,16 +28,17 @@ import (
 const applyRouteNonce = "nonce-route"
 
 type applyRouteEnv struct {
-	pool   *pgxpool.Pool
-	router http.Handler
-	user   uuid.UUID
-	worker uuid.UUID
-	tokens map[uuid.UUID]string
-	run    uuid.UUID
-	op     uuid.UUID
-	secret uuid.UUID
-	plain  string
-	gen    int64
+	handler *Handler
+	pool    *pgxpool.Pool
+	router  http.Handler
+	user    uuid.UUID
+	worker  uuid.UUID
+	tokens  map[uuid.UUID]string
+	run     uuid.UUID
+	op      uuid.UUID
+	secret  uuid.UUID
+	plain   string
+	gen     int64
 }
 
 func setupApplyRouteLiveDB(t *testing.T) *applyRouteEnv {
@@ -59,8 +60,8 @@ func setupApplyRouteLiveDB(t *testing.T) *applyRouteEnv {
 	box := newHandlerTestBox(t)
 	svc := workersvc.New(q, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})
 	svc.SetTxBeginner(pool)
-	h := &Handler{q: q, wsvc: svc}
-	e := &applyRouteEnv{pool: pool, router: h.WorkerRoutes(mw.NewLimiter(1000, time.Minute, nil)), tokens: map[uuid.UUID]string{}, gen: 3}
+	h := &Handler{q: q, wsvc: svc, box: box}
+	e := &applyRouteEnv{handler: h, pool: pool, router: h.WorkerRoutes(mw.NewLimiter(1000, time.Minute, nil)), tokens: map[uuid.UUID]string{}, gen: 3}
 	exec := func(sql string, args ...any) {
 		t.Helper()
 		if _, err := pool.Exec(ctx, sql, args...); err != nil {
