@@ -897,3 +897,25 @@ exit 0, primary/prior receipts unchanged. Source and concrete-SQL reviews found
 no findings. Synthetic states isolate the fences; this is not provider refresh
 admission, worker reconciliation ordering, multi-account locking, atomicity,
 full-suite, security or m3/m4 completion evidence.
+
+## Default-branch merge and migration renumber (2026-11-17)
+
+- Merge: `git merge 210a2232d122ea8a8b1b68d1d573e634b51d0147` landed as
+  9b005c4c0 with no conflicts. `task check:sqlc-drift` on it: EXIT=0
+  ("api/internal/store matches `sqlc generate` output").
+- Owner decision 12 (narrow exception): the renumber helper's adjacent
+  `.renum.*` / `.renumber-tmp-*` transient paths are permitted for this one
+  step. Command, with the ancestry and clean-tree guards intact:
+  `TMPDIR=$PWD/.uzi/scratch/tmp-renum MIGRATION_RENUMBER_NO_FETCH=1 task migration:renumber`
+  (EXIT=0). It renamed `00465_codex_credential_epoch_snapshot.sql` to
+  `00466_…` and `00466_codex_pending_switch.sql` to `00467_…`, above main's
+  `00465_repo_initial_import.sql`. Afterwards `find … -name '.renum*'` was
+  empty and `git status --porcelain --ignored` on the migrations directory
+  showed only the two renames.
+- Postflight references reviewed by migration identity:
+  `ARCHITECTURE.md:143` names main's `00465` (repo initial import) and stays
+  unchanged; proof-ledger line 1208 names this branch's former `00465`.
+- Earlier ledger prose (this file and the proof ledger) that says 464/465/466
+  is evidence recorded at the time: read the Codex snapshot as 466 and the
+  pending target as 467 from this point. The migration LiveDB test now
+  downgrades to 465 and asserts that main's 464 and 465 columns survive.

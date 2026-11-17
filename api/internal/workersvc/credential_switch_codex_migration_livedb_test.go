@@ -6,9 +6,10 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// The supplied default branch already shipped 464. Only this fixture-owned
-// database is downgraded; 464 must retain the worker-roll columns while the
-// Codex additions are installed strictly afterward.
+// The default branch already shipped 464 (worker roll marker) and 465 (repo
+// initial import). Only this fixture-owned database is downgraded; 465 must
+// retain both while the Codex additions (466, 467) are installed strictly
+// afterward.
 func TestCodexSwitchMigrationUpgradeLiveDB(t *testing.T) {
 	env := isolatedCoordinateDatabase(t)
 	dsn := env.pool.Config().ConnString()
@@ -24,20 +25,23 @@ WHERE table_schema = 'public' AND table_name = $1 AND column_name = ANY($2::text
 		}
 	}
 	marker := []string{"roll_marker", "roll_marker_observed_at"}
+	importCols := []string{"initial_import_state", "initial_import_generation", "initial_import_error_class", "initial_import_updated_at"}
 	epoch := []string{"codex_auth_mode", "codex_material_revision", "codex_account_key", "codex_account_id", "codex_claim_epoch"}
 	pending := []string{"codex_switch_target_secret_id", "codex_switch_target_generation", "codex_switch_target_op_id", "codex_switch_target_auth_mode", "codex_switch_target_material_revision", "codex_switch_target_account_key", "codex_switch_target_account_revision"}
 	assertHead := func() {
 		t.Helper()
 		columns("worker_upgrade_reports", marker, len(marker))
+		columns("repos", importCols, len(importCols))
 		columns("run_credential_epochs", epoch, len(epoch))
 		columns("run_credential_switch_epochs", epoch, len(epoch))
 		columns("runs", pending, len(pending))
 	}
 	assertHead() // Fresh installation.
-	if err := store.MigrateDownTo(env.ctx, dsn, 464); err != nil {
+	if err := store.MigrateDownTo(env.ctx, dsn, 465); err != nil {
 		t.Fatal(err)
 	}
 	columns("worker_upgrade_reports", marker, len(marker))
+	columns("repos", importCols, len(importCols))
 	columns("run_credential_epochs", epoch, 0)
 	columns("run_credential_switch_epochs", epoch, 0)
 	columns("runs", pending, 0)
