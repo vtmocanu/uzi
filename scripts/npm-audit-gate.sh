@@ -59,13 +59,14 @@
 # advisories survived every option on `web` (`react-router` / `react-router-dom`,
 # GHSA-wrjc-x8rr-h8h6 and GHSA-337j-9hxr-rhxg, patched only at 7.18.0 while 6.x was
 # installed); the React Router 7 major has since cleared them (7.18.2 installed, npm
-# audit reports 0 vulnerabilities). The threshold stays `high` per the ruling.
+# the router-specific advisories are cleared). The threshold stays `high`;
+# ADR-4435 adds only maintainer-approved, expiring, dev-only exceptions.
 #
 # NOT DELEGATED TO A `package.json` SCRIPT THE WAY EVERY OTHER npm TARGET IS, AND
 # THAT IS DELIBERATE: it IS delegated, but through this file rather than around it.
 # `package.json`'s `audit` script carries the flags (so the Taskfile header's rule
-# holds and a rewrite cannot drop them silently), and this script exists solely for
-# the exit-code mapping, which a package.json script cannot express. A committed
+# holds and a rewrite cannot drop them silently). This script owns exit-code
+# classification and the bounded exception policy of ADR-4435. A committed
 # script also gets linted by `lint:shell`, where an inline `cmds:` string gets
 # nothing.
 set -eu
@@ -83,6 +84,15 @@ if [ ! -f "$PKG_DIR/package.json" ]; then
   echo "npm-audit-gate: no package.json in: $PKG_DIR" >&2
   exit 2
 fi
+
+SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
+policy_rc=0
+node "$SCRIPT_DIR/npm-audit-exceptions.mjs" has-rows "$PKG_DIR" || policy_rc=$?
+case "$policy_rc" in
+  0) exceptions_present=1 ;;
+  3) exceptions_present=0 ;;
+  *) echo "npm-audit-gate: invalid exception policy (instrument exit 2)." >&2; exit 2 ;;
+esac
 
 # 🔴 BOTH ASSERTIONS BELOW READ `scripts.audit` BY PARSING, NOT THE FILE BY GREP.
 # They were file-wide `grep -q -F` over package.json, which is a different claim
@@ -163,6 +173,11 @@ case "$AUDIT_SCRIPT" in
 esac
 
 # No `-t` on mktemp: it is not portable, and only CI could show it (f0e3c438).
+if [ "$exceptions_present" -eq 1 ] && [ "$AUDIT_SCRIPT" != "npm audit --audit-level=$LEVEL --include=dev" ]; then
+  echo "npm-audit-gate: exception rows require the exact npm audit command (instrument exit 2)." >&2
+  exit 2
+fi
+
 TMP="$(mktemp -d)"
 # shellcheck disable=SC2064  # expand TMP now: the trap must survive its unset.
 trap "rm -rf '$TMP'" EXIT INT TERM
@@ -179,6 +194,36 @@ registry_unreachable() {  # $1 = output file; rc 0 iff it looks like a registry 
   grep -q -F -e 'audit endpoint returned an error' \
              -e 'ENOTFOUND' -e 'ECONNREFUSED' -e 'ETIMEDOUT' -e 'ERR_SOCKET_TIMEOUT' \
              "$1"
+}
+
+# The later JSON snapshot is authoritative for exceptions, including on clean text
+# verdicts. Its stderr is kept out of the JSON parser, but both streams inform retries.
+evaluate_exceptions() {
+  json_attempt=1
+  json_backoff="$initial_backoff"
+  while : ; do
+    json_rc=0
+    (cd "$PKG_DIR" && npm audit --json --include=dev) >"$TMP/audit.json" 2>"$TMP/audit.err" || json_rc=$?
+    cat "$TMP/audit.json" "$TMP/audit.err" >"$TMP/json-output" || return 2
+    if ! registry_unreachable "$TMP/json-output" || [ "$json_attempt" -ge "$attempts" ]; then
+      break
+    fi
+    echo "npm-audit-gate: $PKG_DIR JSON registry query unavailable; retrying." >&2
+    sleep "$json_backoff" || true
+    json_attempt=$((json_attempt + 1))
+    json_backoff=$((json_backoff * 2)); [ "$json_backoff" -le 60 ] || json_backoff=60
+  done
+  if registry_unreachable "$TMP/json-output"; then
+    echo "npm-audit-gate: JSON registry query unavailable (instrument exit 2)." >&2
+    return 2
+  fi
+  case "$json_rc" in
+    0|1) ;;
+    *) echo "npm-audit-gate: JSON audit exited $json_rc (instrument exit 2)." >&2; return 2 ;;
+  esac
+  evaluation_rc=0
+  node "$SCRIPT_DIR/npm-audit-exceptions.mjs" evaluate "$PKG_DIR" "$LEVEL" "$TMP/audit.json" || evaluation_rc=$?
+  return "$evaluation_rc"
 }
 
 # 🔴 RC FIRST, AND INTO A FILE. Redirect and read `$?` on the very next line -- do
@@ -217,6 +262,7 @@ backoff="${UZI_NPM_AUDIT_BACKOFF_SECONDS:-2}"
 # `|| default` keeps these set -eu safe.
 case "$attempts" in ''|*[!0-9]*) attempts=3 ;; *) [ "$attempts" -ge 1 ] && [ "$attempts" -le 10 ] || attempts=3 ;; esac
 case "$backoff"  in ''|*[!0-9]*) backoff=2  ;; *) [ "$backoff" -le 60 ] || backoff=2 ;; esac
+initial_backoff="$backoff"
 attempt=1
 rc=0
 while : ; do
@@ -287,6 +333,11 @@ if [ "$rc" -eq 0 ]; then
     echo "  that swallows npm's exit code with \`|| something\`." >&2
     exit 2
   fi
+  if [ "$exceptions_present" -eq 1 ]; then
+    exception_rc=0
+    evaluate_exceptions || exception_rc=$?
+    exit "$exception_rc"
+  fi
   echo "npm-audit-gate: $PKG_DIR clean at --audit-level=$LEVEL"
   exit 0
 fi
@@ -312,6 +363,16 @@ if ! grep -q -F 'npm audit report' "$TMP/out"; then
   echo "  INSTRUMENT FAILURE, NOT FINDINGS. The output above is the whole of what" >&2
   echo "  npm produced; nothing in it is a verdict about this tree." >&2
   exit 2
+fi
+
+if [ "$exceptions_present" -eq 1 ]; then
+  if [ "$rc" -ne 1 ]; then
+    echo "npm-audit-gate: unexpected audit exit $rc (instrument exit 2)." >&2
+    exit 2
+  fi
+  exception_rc=0
+  evaluate_exceptions || exception_rc=$?
+  exit "$exception_rc"
 fi
 
 echo "npm-audit-gate: $PKG_DIR has advisories at or above '$LEVEL' (gate exit 1)." >&2
