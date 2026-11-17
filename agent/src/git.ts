@@ -3534,6 +3534,38 @@ export type JoinedEpochChild =
       stdout: string; stderr: string; stdoutBytes?: Buffer; stderrBytes?: Buffer; failure: unknown }
   | { joined: true; spawned: false; provenance?: "not-spawned"; ticket: { settle(): void }; failure: unknown };
 
+/** Issue #4263: one bound retire-scratch parent to empty and remove (see {@link GitCache.discardRetireScratchParent}). */
+export interface RetireScratchDiscardInput {
+  scope: PodEpochReclaimScope;
+  /** Absolute path of the runner root; only used to fsync it and to key the unsettled entry. */
+  root: string;
+  /** An open `O_PATH` descriptor of the runner root (>= 3), pinned by the caller. */
+  rootPin: number;
+  /** Decimal `st_dev` of the runner root. */
+  rootDev: string;
+  /** `.retire-<uuid>`: must match the retire binding key grammar. */
+  parentName: string;
+  /** Decimal inodes bound for the parent and its `clone`. */
+  parentIno: string;
+  cloneIno: string;
+  /** Absolute wall-clock deadline in milliseconds. */
+  deadline: number;
+  maxEntries: number;
+  maxDepth: number;
+  signal: AbortSignal;
+  /** Synchronous liveness check; throws to deny. Called before, and again after, the helper. */
+  live: () => void;
+  /** The caller's final pre-effect observation; rejects to deny. */
+  beforeEffect: () => Promise<void>;
+}
+
+export type RetireScratchDiscardResult =
+  | { kind: "removed" }
+  /** Nothing was touched. */
+  | { kind: "refused"; reason: string }
+  /** The tree (or part of it) is kept; the binding must stay. `stderrBytes` is a bounded length, never content. */
+  | { kind: "residue"; reason: string; exit: number | null; stderrBytes?: number };
+
 /** Issue #4043: one admitted scratch leaf to delete (see {@link GitCache.discardEpochScratchLeaf}). */
 export interface EpochScratchDiscardInput {
   scope: PodEpochReclaimScope;
@@ -4391,14 +4423,16 @@ export class GitCache {
     scope: PodEpochReclaimScope, command: string, args: string[],
     options: { env: NodeJS.ProcessEnv; timeout?: number; maxBuffer?: number; cwd?: string; input?: string | Buffer;
       bytes?: true; encoding?: "latin1"; identity: BoundaryProcessRequest["identity"];
-      signals: readonly AbortSignal[]; deadline: number },
+      signals: readonly AbortSignal[]; deadline: number;
+      /** One extra descriptor handed to the child as fd 3; the scope's EX lock is then fd 4. */
+      extraFd?: number },
   ): Promise<JoinedEpochChild> {
     const identity = options.identity;
     const ticket = scope.beginMutation();
     const deps = this.epochNativeTestDependencies;
     let child: ChildProcess;
     try {
-      const stdio = scope.inheritStdio(["pipe", "pipe", "pipe"]);
+      const stdio = scope.inheritStdio(options.extraFd === undefined ? ["pipe", "pipe", "pipe"] : ["pipe", "pipe", "pipe", options.extraFd]);
       child = (deps?.spawn ?? spawn)(command, args, {
         env: options.env, cwd: options.cwd, detached: true, stdio,
       });
@@ -4725,6 +4759,172 @@ export class GitCache {
     else this.unsettledDeletes.delete(key);
     joined.ticket.settle();
     return settlement;
+  }
+
+  /**
+   * Issue #4263: the fixed argv the retire-scratch `empty-fd` helper may launch. Exactly ONE wrapper is
+   * accepted, `runnerCommand` (the uid split must be active: single-uid it would run as the worker, so this
+   * refuses), never `commandRootCommand`, a worker wrapper, a retry identity or a chmod step. The argv is
+   * `[...wrap, "-e", PINNED_SUBTREE_SCRIPT, "fd:3", "-", <max>, <budget>, "empty-fd", <dev:ino>, "", "pinned", "-",
+   * "1", <depth>]` with env `{ PATH }`, cwd `/` and identity `command`.
+   */
+  private validateEpochRetireEmptyLaunch(command: string, args: readonly string[], env: NodeJS.ProcessEnv,
+    cwd: string | undefined, identity: BoundaryProcessRequest["identity"]): void {
+    const refuse = (): never => { throw new Error("epoch retire empty launch unaudited"); };
+    if (!uidSplitActive()) return refuse();
+    const wrap = runnerCommand(process.execPath, []);
+    if (command !== wrap.command || identity !== "command" || cwd !== "/") return refuse();
+    const keys = Object.keys(env);
+    if (keys.length !== 1 || keys[0] !== "PATH" || env.PATH !== "/usr/bin:/bin") return refuse();
+    if (args.length !== wrap.args.length + 13 || !wrap.args.every((arg, i) => args[i] === arg)) return refuse();
+    const [dash, script, home, rel, max, budget, mode, expect, sync, phase, rootExpect, oneFs, depth] = args.slice(wrap.args.length);
+    const lim = SCRATCH_DELETE_LIMITS;
+    const canon = (s: string | undefined, lo: number, hi: number): boolean =>
+      s !== undefined && /^[1-9][0-9]{0,9}$/.test(s) && Number(s) >= lo && Number(s) <= hi;
+    if (dash !== "-e" || script !== PINNED_SUBTREE_SCRIPT || home !== "fd:3" || rel !== "-" ||
+        !canon(max, 1, lim.maxEntries) || !canon(budget, EPOCH_SCRATCH_MIN_DELETE_BUDGET_MS, lim.budgetMs) ||
+        mode !== "empty-fd" || !/^[0-9]+:[0-9]+$/.test(expect!) || sync !== "" || phase !== "pinned" ||
+        rootExpect !== "-" || oneFs !== "1" || !canon(depth, 1, lim.maxDepth)) return refuse();
+  }
+
+  /**
+   * Issue #4263: empty and remove one bound `<runnerRoot>/.retire-<uuid>/clone` (worker-owned 0700 parent, runner-owned
+   * clone) with no chmod, no chown, no privilege increase and no raw fallback. The caller (the verified pod-epoch
+   * phase) owns every authority check; this method owns the identity and launch guarantees. Preflight (nothing is
+   * touched, `refused`): the parent pins through `rootPin` to a worker-owned 0700 directory with the bound inode on
+   * the root's device holding exactly `clone`, and `clone` pins to the bound inode and device. Then the strict
+   * `empty-fd` helper runs as the runner with the clone pin as child fd 3 (the EX lock is fd 4). The helper's receipt
+   * is never taken as emptiness: the worker's own `rmdir` of `clone` and then of the parent is. Any helper
+   * non-receipt, rmdir failure, identity change or fsync failure is `residue` (the tree is kept). A child that cannot
+   * be proven joined stops the scope, leaves the unsettled entry and throws `epochScratchUnresolved`.
+   * Helper stderr is never read into a message; only its bounded byte length is reported.
+   */
+  async discardRetireScratchParent(input: RetireScratchDiscardInput): Promise<RetireScratchDiscardResult> {
+    const refused = (reason: string): RetireScratchDiscardResult => ({ kind: "refused", reason });
+    const scope = input?.scope;
+    const dec = /^[1-9][0-9]{0,19}$/;
+    const parentMatch = typeof input?.parentName === "string" ? /^\.retire-([0-9a-f-]{36})$/.exec(input.parentName) : null;
+    if (!scope || ["assertExclusive", "beginMutation", "inheritStdio", "stop", "stopped"]
+        .some(name => typeof scope[name as keyof PodEpochReclaimScope] !== "function") ||
+        !Number.isInteger(input.rootPin) || input.rootPin < 3 || typeof input.root !== "string" || !path.isAbsolute(input.root) ||
+        !parentMatch || !RETIRE_UUID_RE.test(parentMatch[1]!) ||
+        !dec.test(String(input.rootDev)) || !dec.test(String(input.parentIno)) || !dec.test(String(input.cloneIno)) ||
+        typeof input.live !== "function" || typeof input.beforeEffect !== "function" || !(input.signal instanceof AbortSignal) ||
+        !Number.isFinite(input.deadline) || !Number.isInteger(input.maxEntries) || input.maxEntries < 1 ||
+        input.maxEntries > SCRATCH_DELETE_LIMITS.maxEntries || !Number.isInteger(input.maxDepth) || input.maxDepth < 1 ||
+        input.maxDepth > SCRATCH_DELETE_LIMITS.maxDepth) return refused("invalid_input");
+    if (!uidSplitActive()) return refused("split_inactive");
+    const procFd = "/proc/self/fd/";
+    const parentName = input.parentName;
+    const rootDev = BigInt(input.rootDev), parentIno = BigInt(input.parentIno), cloneIno = BigInt(input.cloneIno);
+    const parentPath = path.resolve(input.root, parentName);
+    const isNoEnt = (e: unknown) => (e as NodeJS.ErrnoException)?.code === "ENOENT";
+    let parentPin: FileHandle | undefined, clonePin: FileHandle | undefined;
+    let key: string | undefined;
+    let joined: JoinedEpochChild | undefined;
+    const release = () => {
+      if (key === undefined) return;
+      const pending = (this.unsettledDeletes.get(key) ?? 1) - 1;
+      if (pending > 0) this.unsettledDeletes.set(key, pending);
+      else this.unsettledDeletes.delete(key);
+      key = undefined;
+    };
+    try {
+      // ---- preflight: nothing below may have an effect ----
+      try {
+        input.signal.throwIfAborted();
+        if (Date.now() >= input.deadline) return refused("deadline");
+        scope.assertExclusive();
+        if (scope.stopped()) return refused("scope_stopped");
+        input.live();
+      } catch { return refused("not_live"); }
+      try { parentPin = await fs.open(`${procFd}${input.rootPin}/${parentName}`, RETIRE_PIN_FLAGS); }
+      catch (e) { return refused(isNoEnt(e) ? "parent_missing" : "not_directory"); }
+      const pst = await parentPin.stat({ bigint: true });
+      if (!pst.isDirectory()) return refused("not_directory");
+      if (pst.uid !== BigInt(process.getuid?.() ?? -1)) return refused("wrong_owner");
+      if ((pst.mode & 0o7777n) !== 0o700n) return refused("wrong_mode");
+      if (pst.ino !== parentIno || pst.dev !== rootDev) return refused("identity_changed");
+      const names: string[] = [];
+      const dir = await fs.opendir(`${procFd}${parentPin.fd}`);
+      try { for (let e = await dir.read(); e !== null && names.length < 2; e = await dir.read()) names.push(e.name); }
+      finally { await dir.close(); }
+      if (names.length !== 1 || names[0] !== "clone") return refused("unexpected_entries");
+      try { clonePin = await fs.open(`${procFd}${parentPin.fd}/clone`, RETIRE_PIN_FLAGS); }
+      catch (e) { return refused(isNoEnt(e) ? "clone_missing" : "not_directory"); }
+      const cst = await clonePin.stat({ bigint: true });
+      if (!cst.isDirectory()) return refused("not_directory");
+      if (cst.ino !== cloneIno || cst.dev !== rootDev) return refused("clone_identity_changed");
+
+      // ---- launch admission ----
+      const joinAllowance = 2 * (this.epochNativeTestDependencies?.joinMs ?? EPOCH_NATIVE_JOIN_MS);
+      const childDeadline = input.deadline - joinAllowance;
+      const budgetMs = Math.floor(Math.min(SCRATCH_DELETE_LIMITS.budgetMs,
+        childDeadline - Date.now() - SCRATCH_DELETE_LIMITS.killSlackMs));
+      if (budgetMs < EPOCH_SCRATCH_MIN_DELETE_BUDGET_MS) return refused("budget_exhausted");
+      const env = { PATH: "/usr/bin:/bin" };
+      const expect = `${cst.dev}:${cst.ino}`;
+      const wrapped = runnerCommand(process.execPath, ["-e", PINNED_SUBTREE_SCRIPT, "fd:3", "-", String(input.maxEntries),
+        String(budgetMs), "empty-fd", expect, "", "pinned", "-", "1", String(input.maxDepth)]);
+      try { this.validateEpochRetireEmptyLaunch(wrapped.command, wrapped.args, env, "/", "command"); }
+      catch { return refused("launch_unaudited"); }
+      try { await input.beforeEffect(); input.live(); input.signal.throwIfAborted(); scope.assertExclusive(); }
+      catch { return refused("not_live"); }
+      if (scope.stopped()) return refused("scope_stopped");
+
+      // ---- the single runner pass ----
+      key = parentPath;
+      this.unsettledDeletes.set(key, (this.unsettledDeletes.get(key) ?? 0) + 1);
+      const unresolved = (cause?: unknown): never => {
+        scope.stop();
+        throw Object.assign(new Error("epoch retire scratch discard unresolved"),
+          { epochScratchUnresolved: true, ...(cause === undefined ? {} : { cause }) });
+      };
+      try {
+        joined = await this.spawnJoinedEpochChild(scope, wrapped.command, wrapped.args, {
+          env, cwd: "/", timeout: budgetMs + SCRATCH_DELETE_LIMITS.killSlackMs, identity: "command",
+          signals: [input.signal], deadline: childDeadline, extraFd: clonePin.fd,
+        });
+      } catch (error) { return unresolved(error); }
+      if (scope.stopped()) return unresolved();
+      const settle = () => { release(); joined!.ticket.settle(); };
+      if (!joined.spawned) {
+        settle();
+        return { kind: "residue", reason: "not_spawned", exit: null };
+      }
+      const exit = joined.code;
+      const stderrBytes = Math.min(Buffer.byteLength(joined.stderr), 65_536);
+      const receipt = !joined.failure && joined.signal === null && exit === 0 && joined.stdout === `UZI-SCRATCH-EMPTIED ${expect}\n`;
+      const residue = (reason: string): RetireScratchDiscardResult => { settle(); return { kind: "residue", reason, exit, stderrBytes }; };
+      if (!receipt) {
+        const byExit: Record<number, string> = { 3: "helper_identity", 4: "helper_remaining", 7: "helper_unopenable", 8: "helper_budget", 9: "helper_other_fs" };
+        return residue(joined.failure ? "helper_interrupted" : joined.signal !== null ? "helper_signal" : byExit[exit ?? -1] ?? "helper_failed");
+      }
+      try { input.live(); } catch { return residue("not_live"); }
+
+      // ---- the worker's own removal: the receipt is not emptiness proof, a successful rmdir is ----
+      const same = async (p: string, ino: bigint): Promise<boolean> => {
+        try { const st = await fs.lstat(p, { bigint: true }); return st.isDirectory() && st.ino === ino && st.dev === rootDev; }
+        catch { return false; }
+      };
+      const clonePath = `${procFd}${parentPin.fd}/clone`;
+      const parentViaRoot = `${procFd}${input.rootPin}/${parentName}`;
+      try {
+        if ((await clonePin.stat({ bigint: true })).ino !== cloneIno || !(await same(clonePath, cloneIno))) return residue("clone_identity_changed");
+        try { await fs.rmdir(clonePath); } catch { return residue("rmdir_clone_failed"); }
+        const pst2 = await parentPin.stat({ bigint: true });
+        if (pst2.ino !== parentIno || !(await same(parentViaRoot, parentIno))) return residue("parent_identity_changed");
+        try { await fs.rmdir(parentViaRoot); } catch { return residue("rmdir_parent_failed"); }
+        try { await fs.lstat(parentViaRoot); return residue("parent_still_linked"); }
+        catch (e) { if (!isNoEnt(e)) return residue("parent_unverified"); }
+        try { await syncDirectory(input.root); } catch { return residue("fsync_failed"); }
+      } catch { return residue("removal_error"); }
+      settle();
+      return { kind: "removed" };
+    } finally {
+      await clonePin?.close().catch(() => undefined);
+      await parentPin?.close().catch(() => undefined);
+    }
   }
 
   /**

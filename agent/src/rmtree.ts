@@ -436,6 +436,17 @@ function drain(dirFd, limit, spend, skip, each, onFirst) {
  * any child in it is pinned; phase `emptied` pauses after a child directory was emptied and
  * before it is `rmdir`ed through its parent.
  *
+ * Issue #4263 `empty-fd` mode: `node -e <script> fd:3 - <max> <budgetMs> empty-fd <dev:ino> "" pinned - 1
+ * <maxDepth>`, selected ONLY by the exact home token `fd:3` together with strict `oneFs` `1`, `<rel>` `-` and
+ * `<rootExpect>` `-` (anything else exits 6; every other grammar above is unchanged). The caller passes an
+ * `O_PATH|O_NOFOLLOW|O_DIRECTORY` pin of the directory as child fd 3. The script fstats fd 3 (exit 3 unless it is a
+ * directory with `<dev>:<ino>` equal to `<expect>`), reopens the fd-3 magic link `O_RDONLY|O_DIRECTORY` (no
+ * `O_NOFOLLOW`: it is the magic link), and empties it with the SAME strict walk as `remove` (one st_dev, re-pin and
+ * compare before each descendant `rmdir`, symlinks unlinked never followed, entry/depth/time caps, never a chmod),
+ * but never removes the directory itself. It prints `UZI-SCRATCH-EMPTIED <dev>:<ino>` and exits 0 only if the
+ * still-open fd 3 then lists no entry; otherwise exit 3 > 9 > 8 > 4 as in strict mode. The receipt is not proof of
+ * emptiness for the caller, whose own `rmdir` of the directory is.
+ *
  * Issue #4043 STRICT scratch mode: three trailing arguments after `<sync> <phase>` (`<sync>` may be
  * the empty string, which turns the seams off): `<rootExpect> <oneFs> <maxDepth>`. Absent (every
  * caller above), the script behaves exactly as described so far. `<rootExpect>` (`<dev>:<ino>`, or
@@ -465,12 +476,15 @@ const [home, rel, maxArg, budgetArg, mode = "remove", expect = "-", sync, phase 
   rootExpect = "", oneFs = "", maxDepthArg = ""] = process.argv.slice(1);
 const maxEntries = Number(maxArg);
 const budgetMs = Number(budgetArg);
-if (!home || !home.startsWith("/") || !rel || !(maxEntries >= 0) || !(budgetMs >= 0)) process.exit(6);
-if (mode !== "remove" && mode !== "empty") process.exit(6);
+const fdMode = mode === "empty-fd";
+if (!home || !(fdMode ? home === "fd:3" : home.startsWith("/")) || !rel || !(maxEntries >= 0) || !(budgetMs >= 0)) process.exit(6);
+if (mode !== "remove" && mode !== "empty" && !fdMode) process.exit(6);
 if (oneFs !== "" && oneFs !== "1") process.exit(6);
 const strict = oneFs === "1";
 const maxDepth = strict ? Number(maxDepthArg) : Infinity;
-if (strict && (mode !== "remove" || rel.includes("/") || rel === "." || rel === ".." || !/^\\d+:\\d+$/.test(expect) || !/^\\d+:\\d+$/.test(rootExpect) ||
+if (strict && !fdMode && (mode !== "remove" || rel.includes("/") || rel === "." || rel === ".." || !/^\\d+:\\d+$/.test(expect) || !/^\\d+:\\d+$/.test(rootExpect) ||
+    !(Number.isInteger(maxDepth) && maxDepth >= 0))) process.exit(6);
+if (fdMode && (!strict || rel !== "-" || rootExpect !== "-" || !/^\\d+:\\d+$/.test(expect) ||
     !(Number.isInteger(maxDepth) && maxDepth >= 0))) process.exit(6);
 let rootDev;
 let changed = false;
@@ -498,10 +512,20 @@ function otherDev(name) {
   try { return fs.readFileSync(sync + ".otherdev", "utf8") === name; } catch { return false; }
 }
 const verdict = (e) => (e.code === "ENOENT" ? 2 : e.code === "ELOOP" || e.code === "ENOTDIR" ? 3 : 7);
-const parts = rel.split("/");
+const parts = fdMode ? [] : rel.split("/");
 let parentFd;
 let leafPin;
-try {
+if (fdMode) {
+  // The caller's O_PATH pin of the directory is inherited as fd 3. Identity first, nothing touched on a mismatch.
+  try {
+    const st = fs.fstatSync(3, { bigint: true });
+    if (!st.isDirectory() || st.dev + ":" + st.ino !== expect) process.exit(3);
+    rootDev = st.dev;
+  } catch (e) {
+    process.exit(7);
+  }
+  leafPin = 3;
+} else try {
   leafPin = fs.openSync(home, PIN);
   if (rootExpect !== "" && rootExpect !== "-") {
     const rootSt = fs.fstatSync(leafPin, { bigint: true });
@@ -516,7 +540,7 @@ try {
 } catch (e) {
   process.exit(verdict(e));
 }
-if (expect !== "-") {
+if (expect !== "-" && !fdMode) {
   const st = fs.fstatSync(leafPin, { bigint: true });
   if (st.dev + ":" + st.ino !== expect) process.exit(3);
 }
@@ -603,6 +627,21 @@ function emptyDir(dirFd, isLeaf, depth) {
   }, isLeaf ? () => pause("listed") : undefined);
 }
 emptyDir(leafFd, true, 0);
+if (fdMode) {
+  // Empty the inherited directory, never remove it. Receipt only if the still-open fd 3 lists nothing.
+  fs.closeSync(leafFd);
+  if (changed) process.exit(3);
+  if (devSkipped) process.exit(9);
+  if (exhausted || depthHit) process.exit(8);
+  let left = 1;
+  try {
+    const st = fs.fstatSync(3, { bigint: true });
+    if (st.dev + ":" + st.ino === expect) left = readSome(3, 1, new Set(), () => true).length;
+  } catch {}
+  if (left !== 0) process.exit(4);
+  fs.writeSync(1, "UZI-SCRATCH-EMPTIED " + expect + "\\n");
+  process.exit(0);
+}
 if (mode === "empty") {
   let left;
   try { left = readSome(leafFd, 1, new Set(), () => true).length; } catch { left = 1; }
