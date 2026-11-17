@@ -4183,7 +4183,8 @@ export interface Run {
    *  Cancel. Owner-held with no automatic retry, and not an integrity refusal.
    *  "anthropic_spend_limit" (issue #3767) means a Claude run's Anthropic API key hit its
    *  organization or workspace spend limit, or (issue #4426) ran out of prepaid credit.
-   *  Owner-held, recovery_retry_not_before is null and nothing resumes it automatically. The owner can Resume (the next claim re-selects the
+   *  Owner-held, recovery_retry_not_before is null and nothing resumes it automatically.
+   *  The owner can Resume (the next claim re-selects the
    *  credential through the run's own selection, which may pick the capped token again),
    *  switch token (switchable kinds only) or Cancel. A queued run can keep this value stale
    *  after set-token, so also require status === "recovery_wait".

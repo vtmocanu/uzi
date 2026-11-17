@@ -1614,7 +1614,7 @@ Tracked as GitHub issue vtmocanu/uzi#1809; PRD at `prds/1809-worker-disk-safety.
 
 ## Issue #3767 — Anthropic API spend-limit owner hold
 
-- An Anthropic API spend limit (organization or workspace) holds the run in `recovery_wait` (`anthropic_spend_limit`) for the owner, with no automatic retry or credential switch; it is detected by a narrow anchored text match because Anthropic exposes no structured signal, Resume re-uses the run's own credential selection, and credit depletion was out of scope here (superseded by #4426 below). See [run-recovery-wait](../docs/run-recovery-wait.md#anthropic-api-spend-limit). (AI-synced 2026-11-11)
+- An Anthropic API spend limit (organization or workspace) holds the run in `recovery_wait` (`anthropic_spend_limit`) for the owner, with no automatic retry or credential switch; it is detected by a narrow anchored text match because Anthropic exposes no structured signal, Resume re-uses the run's own credential selection, and credit depletion was out of scope here (superseded by #4426 below). See [run-recovery-wait](../docs/run-recovery-wait.md#anthropic-api-spend-limit). (AI-synced 2026-11-11; amended 2026-11-17)
 
 ## Issue #4426 — Anthropic API credit depletion takes the spend-limit hold
 
