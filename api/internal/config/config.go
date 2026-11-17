@@ -18,6 +18,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
+
 	"github.com/vtmocanu/uzi/api/internal/auth"
 	"github.com/vtmocanu/uzi/api/internal/autoselect"
 	"github.com/vtmocanu/uzi/api/internal/forge"
@@ -25,6 +27,35 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/workersize"
 )
+
+// defaultDBMaxConns is the pgx pool size when neither DB_MAX_CONNS nor the DATABASE_URL
+// pool_max_conns parameter sets one. A fixed constant, never derived from runtime.NumCPU.
+const defaultDBMaxConns int32 = 20
+
+// resolveDBMaxConns picks the pool size from raw (the DB_MAX_CONNS value) then the dsn's
+// pool_max_conns parameter, then defaultDBMaxConns, and reports which one won ("env", "dsn",
+// "default"). An invalid raw value is warned about and skipped. A dsn pool_max_conns that is
+// present but not a positive int32 returns (0, "dsn"): no override, so store.OpenPool's own
+// parse fails boot as before. A dsn pgconn cannot parse is never logged (it holds credentials)
+// and falls through to the default.
+func resolveDBMaxConns(raw, dsn string) (int32, string) {
+	raw = strings.TrimSpace(raw)
+	if raw != "" {
+		if v, err := strconv.ParseInt(raw, 10, 32); err == nil && v > 0 {
+			return int32(v), "env"
+		}
+		slog.Warn("DB_MAX_CONNS is not a positive 32-bit integer; ignoring it", "value", raw)
+	}
+	if pc, err := pgconn.ParseConfig(dsn); err == nil {
+		if p, ok := pc.RuntimeParams["pool_max_conns"]; ok {
+			if v, perr := strconv.ParseInt(p, 10, 32); perr == nil && v > 0 {
+				return int32(v), "dsn"
+			}
+			return 0, "dsn"
+		}
+	}
+	return defaultDBMaxConns, "default"
+}
 
 // Config holds all runtime settings derived from the environment.
 type Config struct {
@@ -52,6 +83,12 @@ type Config struct {
 	TLSKeyFile  string
 	// DatabaseURL is the pgx connection string.
 	DatabaseURL string
+	// DBMaxConns is the resolved pgx pool size: DB_MAX_CONNS first, then the DATABASE_URL
+	// pool_max_conns parameter, then defaultDBMaxConns. 0 means "do not override" (the DSN
+	// carried an invalid pool_max_conns, which store.OpenPool rejects at boot).
+	DBMaxConns int32
+	// DBMaxConnsSource says where DBMaxConns came from: "env", "dsn" or "default".
+	DBMaxConnsSource string
 	// JWTSecret is the validated HS256 signing key.
 	JWTSecret []byte
 	// AuthTokenTTL is the session lifetime and cookie MaxAge.
@@ -952,6 +989,7 @@ func Load() (Config, error) {
 	if strings.TrimSpace(cfg.DatabaseURL) == "" {
 		return Config{}, fmt.Errorf("%s is required", dbSource)
 	}
+	cfg.DBMaxConns, cfg.DBMaxConnsSource = resolveDBMaxConns(os.Getenv("DB_MAX_CONNS"), cfg.DatabaseURL)
 
 	jwtRaw, jwtSource, err := resolveSecret("JWT_SECRET")
 	if err != nil {

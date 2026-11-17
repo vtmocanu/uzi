@@ -210,11 +210,14 @@ func run() error {
 	// diskFull records SQLSTATE 53100 write failures seen on the api pool; the admin
 	// health db check reads it.
 	diskFull := dbdiskfull.New(time.Now)
-	pool, err := store.OpenPool(ctx, cfg.DatabaseURL, store.WithQueryTracer(&dbdiskfull.Tracer{Signal: diskFull}))
+	pool, err := store.OpenPool(ctx, cfg.DatabaseURL,
+		store.WithQueryTracer(&dbdiskfull.Tracer{Signal: diskFull}),
+		store.WithMaxConns(cfg.DBMaxConns))
 	if err != nil {
 		return err
 	}
 	defer pool.Close()
+	slog.Info("db pool sized", "max_conns", pool.Config().MaxConns, "source", cfg.DBMaxConnsSource)
 
 	q := store.New(pool)
 
@@ -412,8 +415,9 @@ func run() error {
 	// transfer routes reach through wsvc.JobFiles(), and the job_files_sweep pass below. The
 	// request deadline is the recovery archive's: both are one bounded upload transaction.
 	// The upload write slots are clamped to half the actual pool (ClampWriteSlots): each streaming
-	// upload holds a pooled connection, and store.OpenPool sets no pool_max_conns, so the pgx
-	// default (max(4, NumCPU)) can equal the fixed slot count.
+	// upload holds a pooled connection. The pool size is explicit (DB_MAX_CONNS, then the
+	// DATABASE_URL pool_max_conns, then the default 20), so the clamp now guards a small
+	// operator-chosen size.
 	jobFiles := workersvc.NewJobFiles(pool, box, workersvc.ClampWriteSlots(pool.Config().MaxConns, workersvc.JobFileLimits{
 		InputFileMaxBytes:      cfg.JobInputFileMaxBytes,
 		InputsMaxFiles:         cfg.JobInputsMaxFiles,
