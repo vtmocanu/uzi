@@ -738,6 +738,9 @@ func run() error {
 	// cancel an in-flight sync call — decouples the tick DEADLINE from the poll cadence
 	// (issue #139).
 	engine.SetForgeTimeout(cfg.ForgeHTTPTimeout)
+	// Durable first-import status (issue #4399): the poller claims and settles the
+	// import a repo enable records, so the enable request never imports itself.
+	engine.SetImportStateStore(q)
 	// Autopilot (PRD #19 M4): the poller's post-sync detector turns an autopilot-label
 	// application on a PRD issue into an auto_approve run for the mapped consenting
 	// user (or one explanatory issue comment). Wired post-construction like the other
@@ -1500,6 +1503,7 @@ func run() error {
 	// changes (PRD #19 M2). Wired post-construction: the poller is built above but
 	// the signal target is the handler.
 	h.SetReconciler(engine)
+	h.SetInitialImportRequester(engine.RequestImport)
 	// The admin agent-source endpoints (PRD #602 M4) drive the SAME reconciler the
 	// interval loop uses: "Sync now" calls Reconcile, approve-and-apply calls Apply.
 	h.SetAgentSourceReconciler(agentSourceRec)

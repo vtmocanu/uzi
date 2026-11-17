@@ -52,6 +52,8 @@ const boardFixtures: Record<string, Board> = {
     path_with_namespace: "vtmocanu/uzi",
     forge_type: "gitlab",
     web_url: "https://gitlab.example.com/myorg/uzi",
+    // The demo repos are long-enabled (a legacy import state), so no first-import banner.
+    initial_import: null,
     columns: [
       { label_name: "Ready", position: 0 },
       { label_name: "In progress", position: 1 },
@@ -551,6 +553,7 @@ const boardFixtures: Record<string, Board> = {
     path_with_namespace: "vtmocanu/atlas-api",
     forge_type: "gitlab",
     web_url: "https://gitlab.example.com/myorg/atlas-api",
+    initial_import: null,
     columns: [
       { label_name: "Ready", position: 0 },
       { label_name: "Doing", position: 1 },

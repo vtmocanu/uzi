@@ -602,6 +602,67 @@ describe("Board — the Backlog rename is display-only (PRD #102 Decision 14a)",
     expect(within(container).queryByText("Open")).toBeNull();
   });
 
+  describe("first-import banner (issue #4399)", () => {
+    const WAITING = /Waiting to import issues/;
+    const RUNNING = /Importing issues/;
+    const FAILED = /Issue import failed; retrying on the next poll/;
+    const imp = (state: "waiting" | "running" | "succeeded" | "failed") => ({
+      state,
+      updated_at: "2026-01-01T00:00:00Z",
+      ...(state === "failed" ? { error_class: "timeout" } : {}),
+    });
+    const bannerTexts = () => screen.queryAllByRole("status").map((el) => el.textContent ?? "");
+    // Every role=status node except the always-mounted sr-only announcement region. With
+    // this fixture (no runs awaiting action) any remaining node is an import banner, so
+    // "no banner" is pinned regardless of its copy.
+    const visibleStatuses = () =>
+      screen.queryAllByRole("status").filter((el) => !el.classList.contains("sr-only"));
+    const hasBanner =(re: RegExp) => bannerTexts().some((t) => re.test(t));
+
+    it.each([
+      ["waiting", WAITING],
+      ["running", RUNNING],
+      ["failed", FAILED],
+    ] as const)("shows the %s banner and keeps cached cards visible", async (state, re) => {
+      mockApi.getBoard.mockResolvedValue({ board: aBoard({ initial_import: imp(state) }) });
+      renderBoard();
+      await screen.findByText("Backlog");
+      expect(hasBanner(re)).toBe(true);
+      // The seeded card still renders under the banner.
+      expect(screen.getByText("Add a metrics dashboard")).toBeTruthy();
+    });
+
+    it.each([
+      ["succeeded", { initial_import: imp("succeeded") }],
+      ["null", { initial_import: null }],
+      ["absent", {}],
+    ] as const)("shows no banner for %s", async (_name, over) => {
+      mockApi.getBoard.mockResolvedValue({ board: aBoard(over) });
+      renderBoard();
+      await screen.findByText("Backlog");
+      expect(visibleStatuses()).toHaveLength(0);
+    });
+
+    it("shows no banner for an empty succeeded import", async () => {
+      mockApi.getBoard.mockResolvedValue({
+        board: aBoard({ cards: [], initial_import: imp("succeeded") }),
+      });
+      renderBoard();
+      await screen.findByText("Backlog");
+      expect(visibleStatuses()).toHaveLength(0);
+    });
+
+    it("drops the banner when a poll reports the import succeeded", async () => {
+      mockApi.getBoard.mockResolvedValueOnce({ board: aBoard({ initial_import: imp("running") }) });
+      renderBoard();
+      await screen.findByText("Backlog");
+      expect(hasBanner(RUNNING)).toBe(true);
+      mockApi.getBoard.mockResolvedValue({ board: aBoard({ initial_import: imp("succeeded") }) });
+      fireEvent(document, new Event("visibilitychange"));
+      await waitFor(() => expect(hasBanner(RUNNING)).toBe(false));
+    });
+  });
+
   it('still sends the wire string "open" when a card is dropped on Backlog', async () => {
     renderBoard();
     await screen.findByText("Backlog");
