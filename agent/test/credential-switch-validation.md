@@ -472,7 +472,7 @@ no overall failed script receives PASS credit.
 
 ### Preservation-method clarification history
 
-The [bounded source analysis and proposal](credential-switch-proof-ledger.md#pending-method-clarification--preservation-effects)
+The [bounded source analysis and proposal](credential-switch-proof-ledger.md#preservation-effects--source-census-and-subsequent-method-amendment)
 were an unapproved method proposal at 4db59ee48 after the bounded writer/trigger census below. A closed RUN
 six-column projection might support class (d) allowlist widening like B3;
 none has executed. At the direct-query seam, preservation of other tables has no existing write guard to
