@@ -157,7 +157,7 @@ if helm template uzi "$CHART" --set api.secretEnv.UZI_EPHEMERAL_DEFAULT_SIZE=ano
 fi
 grep -qF 'Set UZI_EPHEMERAL_DEFAULT_SIZE through workers.ephemeralDefaultSize, not api.secretEnv' "$WORK/duplicate.err" || exit 2
 if helm template uzi "$CHART" --set api.config.UZI_EPHEMERAL_DEFAULT_SIZE=l > "$WORK/config.yaml" 2> "$WORK/config.err"; then
-  echo "FAIL: api.config set the chart-owned ephemeral size (it would be silently overridden)" >&2
+  echo "FAIL: api.config set the chart-owned ephemeral size (the chart value is the one source for it)" >&2
   exit 1
 fi
 grep -qF 'Set UZI_EPHEMERAL_DEFAULT_SIZE through workers.ephemeralDefaultSize, not api.config' "$WORK/config.err" || exit 2

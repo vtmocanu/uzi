@@ -205,3 +205,41 @@ describe("AdminWorkers", () => {
     expect((screen.getByLabelText(/enable capability-aware scheduling/i) as HTMLInputElement).disabled).toBe(true);
   });
 });
+
+describe("AdminWorkers recreated cases", () => {
+  it("loads the current ephemeral-workers kill-switch value (true)", async () => {
+    mockApi.getSettings.mockResolvedValue(response({ ephemeral_workers_enabled: "true" }));
+    renderPage();
+    const toggle = (await screen.findByLabelText(/Auto-provision workers on demand for this instance/i)) as HTMLInputElement;
+    expect(toggle.checked).toBe(true);
+  });
+
+  it("keeps the docker allowlist Save disabled until the selection changes (dirty-check)", async () => {
+    mockApi.getSettings.mockResolvedValue(response({ docker_repo_allowlist: "repo-uzi" }));
+    renderPage();
+    const saveBtn = () => screen.getByRole("button", { name: /save repo allowlist/i }) as HTMLButtonElement;
+    await screen.findByLabelText(/vtmocanu\/two/);
+    expect(saveBtn().disabled).toBe(true);
+    fireEvent.click(screen.getByLabelText(/vtmocanu\/two/));
+    expect(saveBtn().disabled).toBe(false);
+  });
+
+  it("does not show the unresolved indicator when the repos list fails to load", async () => {
+    mockApi.getSettings.mockResolvedValue(response({ docker_repo_allowlist: "repo-uzi,repo-other" }));
+    mockApi.adminListDockerAllowlistRepos.mockRejectedValue(new Error("network"));
+    renderPage();
+    expect(await screen.findByText(/could not load repositories/i)).toBeTruthy();
+    expect(screen.queryByText(/unresolved\/deleted repositories/i)).toBeNull();
+  });
+
+  it("renders the capability toggle checked (default ON) with Save disabled until changed", async () => {
+    renderPage();
+    await screen.findByText("Capability-aware scheduling");
+    const toggle = screen.getByLabelText(/enable capability-aware scheduling/i) as HTMLInputElement;
+    const saveBtn = screen.getByRole("button", { name: /save capability scheduling/i }) as HTMLButtonElement;
+    expect(toggle.checked).toBe(true);
+    expect(saveBtn.disabled).toBe(true);
+    fireEvent.click(toggle);
+    expect(saveBtn.disabled).toBe(false);
+  });
+});

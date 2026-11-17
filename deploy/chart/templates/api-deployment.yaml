@@ -13,7 +13,7 @@
 {{- fail "Set UZI_EPHEMERAL_DEFAULT_SIZE through workers.ephemeralDefaultSize, not api.secretEnv" }}
 {{- end }}
 {{- if hasKey (.Values.api.secretEnv | default dict) "UZI_EPHEMERAL_LEASE" }}
-{{- fail "Set UZI_EPHEMERAL_LEASE through workers.ephemeralLease, not api.secretEnv (a duplicate env entry would conflict with the chart value)" }}
+{{- fail "Set UZI_EPHEMERAL_LEASE through workers.ephemeralLease, not api.secretEnv (one source: an env value locks the admin ephemeral_lease setting)" }}
 {{- end }}
 {{- if hasKey (.Values.api.config | default dict) "UZI_EPHEMERAL_LEASE" }}
 {{- fail "Set UZI_EPHEMERAL_LEASE through workers.ephemeralLease, not api.config (an env value locks the admin setting; keep one source)" }}
@@ -22,7 +22,7 @@
 {{- fail "Set UZI_ADMIN_RUN_DEBUG through api.adminRunDebug.enabled, not api.secretEnv" }}
 {{- end }}
 {{- if hasKey (.Values.api.config | default dict) "UZI_EPHEMERAL_DEFAULT_SIZE" }}
-{{- fail "Set UZI_EPHEMERAL_DEFAULT_SIZE through workers.ephemeralDefaultSize, not api.config (the chart value now overrides it)" }}
+{{- fail "Set UZI_EPHEMERAL_DEFAULT_SIZE through workers.ephemeralDefaultSize, not api.config (one source: an env value locks the admin ephemeral_default_size setting)" }}
 {{- end }}
 apiVersion: apps/v1
 kind: Deployment

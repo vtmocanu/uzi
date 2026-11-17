@@ -8,7 +8,7 @@ import { useLocation } from "react-router-dom";
 import { useCallback, useEffect, useState } from "react";
 import { api, type AppSettings, type SettingSource, type SettingsResponse } from "../lib/api";
 import { useAsyncData } from "../lib/useAsyncData";
-import { Alert } from "../components/ui";
+import { Alert, Skeleton } from "../components/ui";
 import { AdminShell } from "../components/AdminShell";
 import { ADMIN_WORKERS_ANCHOR_IDS } from "../components/navSections";
 import { DocLink } from "../components/DocLink";
@@ -91,6 +91,13 @@ export function AdminWorkers() {
       )}
 
       {loadError && <Alert message={loadError} />}
+
+      {loading && (
+        <div className="space-y-4">
+          <Skeleton className="h-16 w-full" />
+          <Skeleton className="h-16 w-full" />
+        </div>
+      )}
 
       {loaded && saved && (
         <>

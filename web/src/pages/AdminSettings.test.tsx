@@ -2,7 +2,7 @@
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { useState } from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { Link, MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
+import { Link, MemoryRouter, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import { AdminSettings } from "./AdminSettings";
 import { AdminHealth } from "./AdminHealth";
 import { healthySilentDoc } from "../mocks/data/health";
@@ -1758,9 +1758,9 @@ describe("AdminSettings forwards moved worker anchors to Admin → Workers", () 
     const { pathname, hash } = useLocation();
     return <output data-testid="where">{pathname + hash}</output>;
   }
-  function renderRoutes(initial: string) {
+  function renderRoutes(initial: string | string[], initialIndex?: number) {
     return render(
-      <MemoryRouter initialEntries={[initial]}>
+      <MemoryRouter initialEntries={Array.isArray(initial) ? initial : [initial]} initialIndex={initialIndex}>
         <Link to="/admin/settings#hosted-worker-quota">Quota link</Link>
         <Link to="/admin/settings#review-bots">Bots link</Link>
         <Where />
@@ -1783,6 +1783,28 @@ describe("AdminSettings forwards moved worker anchors to Admin → Workers", () 
     renderRoutes(`/admin/settings#${id}`);
     await screen.findByText("workers page");
     expect(screen.getByTestId("where").textContent).toBe(`/admin/workers#${id}`);
+  });
+
+  it("replaces the history entry, so Back skips the redirecting URL", async () => {
+    function Back() {
+      const navigate = useNavigate();
+      return <button onClick={() => navigate(-1)}>Back</button>;
+    }
+    render(
+      <MemoryRouter initialEntries={["/somewhere", "/admin/settings#ephemeral-workers"]} initialIndex={1}>
+        <Back />
+        <Where />
+        <Routes>
+          <Route path="/somewhere" element={<div>somewhere page</div>} />
+          <Route path="/admin/settings" element={<AdminSettings />} />
+          <Route path="/admin/workers" element={<div>workers page</div>} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    await screen.findByText("workers page");
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    await screen.findByText("somewhere page");
+    expect(screen.getByTestId("where").textContent).toBe("/somewhere");
   });
 
   it("redirects when the hash changes after mount, and leaves Instance anchors alone", async () => {

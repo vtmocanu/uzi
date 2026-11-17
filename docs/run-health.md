@@ -58,6 +58,9 @@ variant.
   allowlist, so your Docker workers can't run it; ask an admin to add it under
   Admin → Instance → Docker worker repo allowlist"_
 
+These reason texts still name Admin → Instance, where the allowlist used to
+live; the control is now on Admin → Workers.
+
 The fix is to add the repo to the allowlist, not to start another worker. The
 owner's Slack nudge for this flag arrives sooner too, still subject to the
 [Slack nudge cooldown](./admin-settings.md).

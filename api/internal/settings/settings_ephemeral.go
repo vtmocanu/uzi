@@ -7,8 +7,10 @@ package settings
 // cache holds no valid snapshot and the refresh fails (the same cold-cache blip
 // HostedWorkerQuota documents); the returned value is then the compiled-in default.
 // A key set through the ENV overlay never errors, because get answers it without
-// touching the store. A stored value that is junk or out of range is not an error:
-// it falls back to the default, since Validate cannot reach a hand-edited row.
+// touching the store. A stored value outside what an accessor accepts (each
+// accessor documents its own fallback rule) is not an error: it falls back to the
+// default, since Validate cannot reach a hand-edited row. The cap accessor accepts
+// any non-negative integer, because an env value above the admin bound is honoured.
 
 import (
 	"context"

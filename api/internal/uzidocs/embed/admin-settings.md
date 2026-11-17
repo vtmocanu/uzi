@@ -322,7 +322,7 @@ deployment (see [Configuration](./configuration.md#hosted-k8s-workers-prd-58)).
 | `worker_hibernation_auto` | `false` | Whether the api [hibernates idle workers automatically](./hosted-workers.md#automatic-hibernation). Effective only while `worker_hibernation_enabled` is on. Enable it only once the [PRD #4206](../prds/4206-worker-hibernation-cache-cleanup.md) cache cleanup is deployed, including the worker support it needs: a worker image that advertises the `hibernation_cache_prune_v1` capability (see [Cache cleanup before sleep](./hosted-workers.md#cache-cleanup-before-sleep)). |
 | `worker_hibernation_idle_after` | `336h` | How long a worker must show no run activity before automatic hibernation considers it. A Go duration from `1h` to `2160h`. |
 
-Edit them in the **Worker hibernation** card on **Admin → Settings**. Hibernate and
+Edit them in the **Worker hibernation** card on **Admin → Workers**. Hibernate and
 Wake are per-worker buttons in **Admin → Health**. Roll back migrations before an
 older api if you downgrade; see
 [Downgrading](./hosted-workers.md#downgrading).
@@ -380,7 +380,8 @@ and anything above 1000.
   - new run-lane claims are refused (the dedicated cross-check lane is unaffected,
     but legacy checker children claimed through the ordinary run lane wait that cycle);
   - queued runs show "new runs are paused: the custody hold limit setting could not
-    be read; an admin should check Admin → Instance settings";
+    be read; an admin should check Admin → Instance settings" (the reason text predates
+    the move: the limit is now on Admin → Workers);
   - the held-work listing (`GET /api/recovery/holds`, `uzi run recovery`) returns a
     generic error;
   - the `custody.holds` health check reports `unknown` and names `custody_hold_limit`.
