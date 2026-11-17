@@ -32555,6 +32555,7 @@ describe("M2 actualRunner credential replacement", () => {
           context.emit({ kind: "tool_use", agent: "lead", payload: { id, name: "Bash", input: { command: "true", description: `Inspect ${id}` } } });
         };
         const switchSettled = installerBarrier(), continuedATurn = installerBarrier();
+        const forbiddenUnprovenApply = installerBarrier();
         let switchResult: Awaited<ReturnType<NonNullable<RunContext["attemptCodexCredentialSwitch"]>>> | undefined;
         let switchError: unknown;
         let failingPersist = false, persistFailures = 0, teardownAttempts = 0;
@@ -32824,6 +32825,7 @@ describe("M2 actualRunner credential replacement", () => {
           }
           applyRequests.push({ claimGeneration: req.claimGeneration, opId: req.opId });
           applies++;
+          if (rootReapUnproven) forbiddenUnprovenApply.resolve();
           if (publication === "baseline") events.push("apply");
           if (successorEpochAdvance) {
             if (applies > 1) forbiddenSuccessorApply.resolve();
@@ -34093,7 +34095,8 @@ describe("M2 actualRunner credential replacement", () => {
               registerNonce: "M2-original-nonce", opId: "M2-op" }]);
             assert.equal(holdReason, null);
             cleanupContinue.resolve();
-            await withTimeout(switchSettled.promise, 5000, "unproven real lease switch stops");
+            await withTimeout(Promise.race([switchSettled.promise, forbiddenUnprovenApply.promise]), 5000, "unproven real lease switch stops");
+            assert.equal(applies, 0, "unproven A reap cannot apply a switch");
             await withTimeout(running, 5000, "unproven real lease hold joins and settles");
             assert.deepEqual(teardownResults, [false], "actual lease reports failure outside its callback");
             assert.ok(failedRootReaps.length > 0);
