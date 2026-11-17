@@ -160,11 +160,11 @@ func (s *fakeStore) GetRepoForUser(_ context.Context, a store.GetRepoForUserPara
 	}
 	return store.GetRepoForUserRow{ID: r.ID, ForgeProjectID: r.ForgeProjectID, PathWithNamespace: r.PathWithNamespace, ForgeType: "github", BaseUrl: testBase}, nil
 }
-func (s *fakeStore) SetRepoEnabledForUser(_ context.Context, a store.SetRepoEnabledForUserParams) (store.Repo, error) {
+func (s *fakeStore) EnableRepoForUser(_ context.Context, a store.EnableRepoForUserParams) (store.Repo, error) {
 	s.writes++
 	s.flips[a.ID]++
 	r := s.repos[a.ID]
-	r.Enabled = a.Enabled
+	r.Enabled = true
 	return *r, nil
 }
 func (s *fakeStore) DeletePendingGuardrailOverrideRequestsForRepo(context.Context, uuid.UUID) error {

@@ -192,7 +192,9 @@ func (s *Service) claimRunInTxCore(ctx context.Context, tx pgx.Tx, qtx *store.Qu
 	params.IsEphemeral = reread.Ephemeral
 	params.EphemeralRunID = reread.EphemeralRunID
 	params.IsDockerWorker = reread.DockerEnabled.Valid && reread.DockerEnabled.Bool
-	leased := s.ephemeralLease > 0 && reread.Ephemeral && reread.LeaseSince.Valid &&
+	// params.EphemeralLease is the one lease read Claim made for this claim (Valid only when the
+	// lease is on), so this decision and the ClaimRun lease arm below never see two values.
+	leased := params.EphemeralLease.Valid && reread.Ephemeral && reread.LeaseSince.Valid &&
 		reread.LeaseRepoID.Valid && reread.LeaseBranch.Valid
 	if !leased {
 		run, err := s.claimCheckpointRun(ctx, tx, params)
@@ -204,7 +206,6 @@ func (s *Service) claimRunInTxCore(ctx context.Context, tx pgx.Tx, qtx *store.Qu
 		}
 		return run, true, nil
 	}
-	params.EphemeralLease = LeaseInterval(s.ephemeralLease)
 	params.LeaseSince = reread.LeaseSince
 	params.LeaseRepoID = reread.LeaseRepoID
 	params.LeaseBranch = reread.LeaseBranch

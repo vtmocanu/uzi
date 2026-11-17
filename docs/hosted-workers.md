@@ -22,7 +22,7 @@ available if your admin has turned hosting on for this instance.
    whose admin has turned the docker tier on), then **Provision**.
 
    A Docker-capable worker claims repo-bearing runs only for repos on the Docker worker repo allowlist,
-   which only an admin edits at **Admin → Instance → Docker worker repo allowlist**. A run on any other
+   which only an admin edits at **Admin → Workers → Docker worker repo allowlist**. A run on any other
    repo stays queued unless another eligible (for example non-Docker) worker can claim it; repo-less
    judge runs are not affected. See [Run health](./run-health.md#what-the-flags-mean).
 
@@ -57,7 +57,8 @@ worker runs at. Its CPU and memory still follow its size.
 
 New ephemeral hosted workers default to **M** (1 CPU / 8Gi memory
 requested, 4 CPU / 12Gi memory limits), saving 6Gi of memory reservation per
-worker compared with **L**. New persistent workers still preselect **L**
+worker compared with **L**. New persistent workers preselect **L** by default (an admin can change the preselected
+size with `hosted_default_size`; see [Admin settings](./admin-settings.md#hosted-worker-quota))
 (1 CPU / 14Gi requested, 4 CPU / 20Gi limits) for more memory headroom.
 **L-HIGHMEM** (1 CPU / 24Gi memory requested, 4 CPU / 32Gi limits) is for
 memory-heavy builds and test suites that outgrow **L**. It is a capacity choice,
@@ -76,11 +77,13 @@ support or the controller's read-only StorageClass access, the volume keeps its 
 operators can [expand it in place](https://github.com/vtmocanu/uzi/blob/main/deploy/README.md#expanding-existing-worker-data-volumes).
 Existing workers keep their stored size and are not switched to another size; existing **M** workers receive the
 1-CPU request and 4-CPU limit when the controller next rolls their pod spec.
-Operators set `workers.ephemeralDefaultSize` in the chart (`s`, `m`, `l`, or `l-highmem`);
-invalid values fail rendering, and so does setting
-`UZI_EPHEMERAL_DEFAULT_SIZE` in `api.config` or `api.secretEnv` (move it to
-`workers.ephemeralDefaultSize`). Non-chart deployments can set
-`UZI_EPHEMERAL_DEFAULT_SIZE`, which defaults and falls back to `m`.
+The ephemeral default size is an [admin setting](./admin-settings.md#ephemeral-workers)
+(**Admin → Workers**, default `m`), changeable without a restart. An operator can pin it
+instead with `workers.ephemeralDefaultSize` in the chart (`s`, `m`, `l`, or `l-highmem`;
+unset by default, invalid values fail rendering), which locks the admin field; setting
+`UZI_EPHEMERAL_DEFAULT_SIZE` in `api.config` or `api.secretEnv` also fails rendering
+(move it to `workers.ephemeralDefaultSize`). Non-chart deployments can set
+`UZI_EPHEMERAL_DEFAULT_SIZE`, which falls back to `m` when invalid.
 Users can choose another size when provisioning a persistent worker.
 
 **Every size costs you the same, 1 of your quota below**; there's
@@ -755,11 +758,16 @@ and download everything again.
   the same branch (a `ci_fix` run's branch is the ref of the failure it fixes). Other kinds (chat, task, job, prompt, judge and self-improve runs), a
   run without a repository, a run on an egress profile, and a worker on the
   isolated research lane never reuse a lease.
-- **How long.** 2 hours by default, which is also the maximum: the operator sets
-  `UZI_EPHEMERAL_LEASE` (chart `workers.ephemeralLease`) to anything up to
-  `2h`. `0` turns the lease off, so an ephemeral worker is removed when its run
-  finishes, as before. A value above 2h or a malformed one refuses to boot the
-  api.
+- **How long.** 2 hours by default, which is also the maximum: an admin sets the
+  `ephemeral_lease` [setting](./admin-settings.md#ephemeral-workers) on **Admin → Workers** to
+  anything up to `2h`, with no restart. `0` turns the lease off, so an ephemeral
+  worker is removed when its run finishes, as before. Expiry is always the lease
+  start plus the current lease, so shortening it releases leased idle workers whose
+  new expiry has passed on the next reaper pass, and `0` releases every leased idle
+  worker (not ones under a custody hold). An operator can pin it with
+  `UZI_EPHEMERAL_LEASE` (chart `workers.ephemeralLease`, unset by default), which
+  locks the admin field; a pinned value above 2h or a malformed one refuses to boot
+  the api.
 - **At the cap.** A leased worker still counts toward your per-user ephemeral
   cap. If a new run needs a slot and you are exactly at the cap, the oldest
   releasable leased worker (one that is not busy and holds no custody hold) is

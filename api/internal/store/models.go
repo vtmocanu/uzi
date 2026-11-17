@@ -1071,6 +1071,10 @@ type Repo struct {
 	CrossCheckRepoInstructionsEnabled bool               `json:"cross_check_repo_instructions_enabled"`
 	IgnoredInferredCapabilities       []string           `json:"ignored_inferred_capabilities"`
 	AgentSourceDefault                pgtype.Text        `json:"agent_source_default"`
+	InitialImportState                pgtype.Text        `json:"initial_import_state"`
+	InitialImportGeneration           int64              `json:"initial_import_generation"`
+	InitialImportErrorClass           pgtype.Text        `json:"initial_import_error_class"`
+	InitialImportUpdatedAt            pgtype.Timestamptz `json:"initial_import_updated_at"`
 }
 
 type RepoToolProfile struct {

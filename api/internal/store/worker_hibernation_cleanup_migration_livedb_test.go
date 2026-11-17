@@ -1,10 +1,14 @@
 package store_test
 
 import (
+	"errors"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -25,32 +29,66 @@ func TestWorkerHibernationCleanupMigrationLiveDB(t *testing.T) {
 		t.Fatalf("defaults wrong: %d", n)
 	}
 	// The validate migration validated every staged constraint.
-	if n := scalarInt(ctx, t, pool, `SELECT count(*) FROM pg_constraint WHERE conrelid='workers'::regclass AND conname LIKE 'workers_%cleanup%' AND NOT convalidated`); n != 0 {
+	if n := scalarInt(ctx, t, pool, `SELECT count(*) FROM pg_constraint WHERE conrelid='workers'::regclass AND contype='c' AND conname LIKE 'workers_%cleanup%' AND NOT convalidated`); n != 0 {
 		t.Fatalf("%d cleanup constraints left NOT VALID", n)
 	}
-	if n := scalarInt(ctx, t, pool, `SELECT count(*) FROM pg_constraint WHERE conrelid='workers'::regclass AND conname LIKE 'workers_%cleanup%'`); n != 10 {
-		t.Fatalf("%d cleanup constraints, want 10", n)
+	// The exact staged set, by name: a rename or a swap that keeps the count still fails.
+	rows, err := pool.Query(ctx, `SELECT conname FROM pg_constraint WHERE conrelid='workers'::regclass AND contype='c' AND conname LIKE 'workers_%cleanup%' ORDER BY conname`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		names = append(names, n)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	wantNames := []string{
+		"workers_cleanup_coherent",
+		"workers_cleanup_fence_none",
+		"workers_cleanup_fence_unsettled",
+		"workers_cleanup_phase_check",
+		"workers_cleanup_reconcile_seq_check",
+		"workers_cleanup_settled_coherent",
+		"workers_cleanup_started_coherent",
+		"workers_cleanup_unknown_coherent",
+		"workers_hibernation_cleanup_check",
+		"workers_hibernation_cleanup_reason_bounds",
+	}
+	if !reflect.DeepEqual(names, wantNames) {
+		t.Fatalf("cleanup constraints = %v, want %v", names, wantNames)
 	}
 
 	// An unsettled attempt: coherent columns under a preparing worker.
 	mustExec(ctx, t, pool, `UPDATE workers SET hibernation_state='preparing', hibernation_op_id=gen_random_uuid(), hibernation_requested_at=now(),
 		cleanup_phase='requested', cleanup_op_id=gen_random_uuid(), cleanup_register_nonce='n', cleanup_requested_at=now() WHERE id=$1`, worker)
 
-	// The fences reject what an image that does not know the attempt would write.
-	for name, sql := range map[string]string{
-		"restore none":     `UPDATE workers SET hibernation_state='none' WHERE id=$1`,
-		"scaling down":     `UPDATE workers SET hibernation_scaling_down_at=now() WHERE id=$1`,
-		"hibernated":       `UPDATE workers SET hibernation_state='hibernated', hibernated_at=now() WHERE id=$1`,
-		"started no pod":   `UPDATE workers SET cleanup_phase='started', cleanup_started_at=now() WHERE id=$1`,
-		"settled no value": `UPDATE workers SET cleanup_phase='settled', cleanup_settled_at=now() WHERE id=$1`,
+	// The fences reject what an image that does not know the attempt would write, each by
+	// the constraint that owns that rule.
+	for name, c := range map[string]struct{ sql, constraint string }{
+		// Also violates workers_cleanup_fence_unsettled; PostgreSQL tests CHECKs in name order,
+		// so fence_none is the one reported.
+		"restore none":     {`UPDATE workers SET hibernation_state='none' WHERE id=$1`, "workers_cleanup_fence_none"},
+		"scaling down":     {`UPDATE workers SET hibernation_scaling_down_at=now() WHERE id=$1`, "workers_cleanup_fence_unsettled"},
+		"hibernated":       {`UPDATE workers SET hibernation_state='hibernated', hibernated_at=now() WHERE id=$1`, "workers_cleanup_fence_unsettled"},
+		"started no pod":   {`UPDATE workers SET cleanup_phase='started', cleanup_started_at=now() WHERE id=$1`, "workers_cleanup_started_coherent"},
+		"settled no value": {`UPDATE workers SET cleanup_phase='settled', cleanup_settled_at=now() WHERE id=$1`, "workers_cleanup_settled_coherent"},
 	} {
-		if _, err := pool.Exec(ctx, sql, worker); err == nil || !strings.Contains(err.Error(), "violates check constraint") {
-			t.Fatalf("%s: %v, want a check violation", name, err)
+		_, err := pool.Exec(ctx, c.sql, worker)
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "23514" || pgErr.ConstraintName != c.constraint {
+			t.Fatalf("%s: %v, want a check violation of %s", name, err, c.constraint)
 		}
 	}
 
 	// Down refuses while the attempt is unsettled, and changes nothing.
-	err := store.MigrateDownTo(ctx, dsn, belowV)
+	err = store.MigrateDownTo(ctx, dsn, belowV)
 	if err == nil || !strings.Contains(err.Error(), "rollback refused") {
 		t.Fatalf("Down with an unsettled attempt: %v", err)
 	}

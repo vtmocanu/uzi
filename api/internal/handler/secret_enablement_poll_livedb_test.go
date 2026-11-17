@@ -19,6 +19,20 @@ type recordingUsagePoker struct {
 	mu      sync.Mutex
 	users   []uuid.UUID
 	secrets [][2]uuid.UUID
+	all     []uuid.UUID
+}
+
+func (p *recordingUsagePoker) PokeUserAll(userID uuid.UUID) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.all = append(p.all, userID)
+}
+
+// snapshotAll returns the PokeUserAll (vault-ready, #4406) owners recorded so far.
+func (p *recordingUsagePoker) snapshotAll() []uuid.UUID {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]uuid.UUID(nil), p.all...)
 }
 
 func (p *recordingUsagePoker) Poke(userID uuid.UUID) {

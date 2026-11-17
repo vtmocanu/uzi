@@ -860,12 +860,13 @@ func unionMilestoneIDs(existing, declared []byte) []byte {
 //
 // A nil txBeginner is fail-closed (error): an interlocked run never completes non-atomically.
 //
+// leaseDur is the current ephemeral lease the caller read once for this report (zero: lease off).
 // lease is the PRD #2006 lease outcome: on an ephemeral worker with the lease on, the permit
 // transaction locks the worker row BEFORE the run row and, after the terminal write, releases the
 // completed run's custody hold and enters the worker's lease before it commits, so the completion,
 // the release and the lease become visible together. The outcome is zero on every other path (lease off, a non-ephemeral worker, a
 // non-applied completion), where SetState's post-commit steps run exactly as before.
-func (s *Service) completeRunWithPermitLease(ctx context.Context, wkr store.Worker, owned store.Run, req StateRequest, completedParams store.SetRunCompletedParams) (rows int64, idempotent bool, lease terminalLeaseOutcome, err error) {
+func (s *Service) completeRunWithPermitLease(ctx context.Context, wkr store.Worker, owned store.Run, req StateRequest, completedParams store.SetRunCompletedParams, leaseDur time.Duration) (rows int64, idempotent bool, lease terminalLeaseOutcome, err error) {
 	if s.txBeginner == nil {
 		return 0, false, lease, fmt.Errorf("completion transaction unavailable: no tx beginner wired for run %s", owned.ID)
 	}
@@ -921,7 +922,8 @@ func (s *Service) completeRunWithPermitLease(ctx context.Context, wkr store.Work
 
 	// Completed publication and ephemeral leasing serialize on the worker before the run.
 	// A persistent worker or nil-generation report never enters a lease.
-	leaseTx := s.ephemeralLease > 0 && wkr.Ephemeral && req.ClaimGeneration != nil
+	// leaseDur is the one lease read setStateWithTx made for this report (PRD #4212).
+	leaseTx := leaseDur > 0 && wkr.Ephemeral && req.ClaimGeneration != nil
 	if leaseTx || completedPublicationCapable(wkr, req) || req.SourcePublication != nil {
 		if _, werr := qtx.GetWorkerForUpdate(ctx, wkr.ID); werr != nil {
 			if errors.Is(werr, pgx.ErrNoRows) {

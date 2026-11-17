@@ -59,7 +59,7 @@ func seedSerializedPublication(t *testing.T, e interlockLiveDB, permit bool) ser
 	e.exec(t, `INSERT INTO recovery_custody_holds(id,user_id,repo_id,run_id,generation,state,original_worker_id,original_worker_identity,live_worker_id,live_run_id,inventory_guarded)
  VALUES($1,$2,$3,$4,1,'open',$5,'ident',$5,$4,true)`, hold, e.userID, e.repoID, run, wid)
 	svc := e.permitService(t)
-	svc.SetEphemeralLease(0)
+	svc.SetEphemeralSettings(fakeEphemeralSettings{lease: 0})
 	w := store.Worker{ID: wid, UserID: e.userID, ProtocolCapabilities: caps}
 	req := StateRequest{State: "completed", ClaimGeneration: &gen, CompletionFinalHead: &head, Branch: &branch, MrIID: &mr}
 	if permit {

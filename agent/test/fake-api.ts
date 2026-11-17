@@ -344,6 +344,10 @@ export class FakeApi {
   /** Focused receipt fixture: hold a message response until its request is aborted. */
   holdMessagesUntilAbort?: (runId: string, body: Record<string, unknown>) => boolean;
   abortedHeldMessages = 0;
+  /** Focused latency fixture: wall-clock delay (ms) applied by the HTTP route before a messages batch is recorded.
+   *  It is HTTP-only: acceptMessages never traverses it. */
+  delayMessagesMs?: (runId: string, body: Record<string, unknown>) => number;
+  delayedMessages = 0;
   readonly usageRequests: Record<string, unknown>[] = [];
   checkedTransport = false;
   private readonly checkedFencedRuns = new Set<string>();
@@ -1842,6 +1846,11 @@ export class FakeApi {
           this.abortedHeldMessages++;
           return;
         }
+        const delayMs = this.delayMessagesMs?.(runId, json) ?? 0;
+        if (delayMs > 0) {
+          this.delayedMessages++;
+          await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+        }
         return this.handleMessages(res, runId, json);
       }
       if (req.method === "POST" && kind === "state")
@@ -2177,14 +2186,33 @@ export class FakeApi {
     return send(res, 404, { error: "not found", path: p });
   }
 
+  /**
+   * In-process acceptance of a messages batch: the same recording (failure injection, seq dedupe,
+   * generation bookkeeping) the HTTP route applies, without a loopback request. A rejected batch throws,
+   * as a non-2xx response would. The caller supplies the real messages; nothing is manufactured here.
+   */
+  acceptMessages(runId: string, body: { messages: OutgoingMessage[]; claim_generation?: number }): number {
+    const result = this.recordMessages(runId, body as unknown as Record<string, unknown>);
+    if (result.status !== 200) throw new Error(`fake api rejected messages: HTTP ${result.status}`);
+    return (result.body as { accepted: number }).accepted;
+  }
+
   private handleMessages(
     res: http.ServerResponse,
     runId: string,
     json: Record<string, unknown>,
   ): void {
+    const result = this.recordMessages(runId, json);
+    send(res, result.status, result.body);
+  }
+
+  private recordMessages(
+    runId: string,
+    json: Record<string, unknown>,
+  ): { status: number; body: unknown } {
     if (this.msgFailRemaining > 0) {
       this.msgFailRemaining--;
-      return send(res, this.msgFailStatus, { error: "injected failure" });
+      return { status: this.msgFailStatus, body: { error: "injected failure" } };
     }
     const incoming = (json.messages ?? []) as OutgoingMessage[];
     // PRD #1247 M5b: record the wrapper as it arrived, so a test can assert claim_generation was
@@ -2212,7 +2240,7 @@ export class FakeApi {
     }
     this.messagesByRun.set(runId, list);
     this.seenSeqByRun.set(runId, seen);
-    send(res, 200, { accepted: incoming.length });
+    return { status: 200, body: { accepted: incoming.length } };
   }
 
   /** Classify on a copy: source-fenced reports must pass their checks before allocation,

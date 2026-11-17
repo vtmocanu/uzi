@@ -272,6 +272,9 @@ api:
   # database.mode external set it HERE as a QUOTED string
   # ("107374182400"; an unquoted number renders as 1.073741824e+11, which the api rejects);
   # under simple/cnpg the chart renders it from the database storage size and setting it here too fails the render (duplicate key).
+  # DB_MAX_CONNS (optional, QUOTED string, e.g. "20"): api DB pool size per replica. Budget
+  # replicas x value against Postgres max_connections. Unset means the DATABASE_URL
+  # pool_max_conns, else 20.
   config:
     API_ADDR: ":8080"
     # Optional startup forge seed type: gitlab (default), forgejo, or github.
@@ -294,8 +297,11 @@ api:
     # `ephemeral_workers_enabled` turned on (PUT /settings) AND the per-user
     # opt-in. These env knobs only TUNE an already-enabled feature; leave them
     # unset to use config.go's defaults. Uncomment to override.
+    # The per-user cap is an admin setting (ephemeral_max_per_user, Admin -> Workers);
+    # an env value pins it and locks the admin field.
     # UZI_EPHEMERAL_MAX_PER_USER: "2"          # per-user concurrent-ephemeral cap
-    # Provision size is chart-owned: use workers.ephemeralDefaultSize below.
+    # Provision size and lease are admin settings too; to pin them from the chart use
+    # workers.ephemeralDefaultSize / workers.ephemeralLease below (env locks the field).
     # UZI_EPHEMERAL_PROVISION_DEADLINE: 10m    # GC deadline for never-booted / idle-stolen workers
     # UZI_EPHEMERAL_SATURATION_DELAY: 90s     # debounce before bursting on a saturated (all capable workers full) fleet
     # Job files and product skill sets (PRD #1909). Unset => config.go's defaults
@@ -721,7 +727,7 @@ workers:
     # so the fleet rolls as its workers finish their runs. It must be concrete: the
     # controller-deployment template wraps it in `required`, so a blank tag fails the
     # render loudly rather than shipping an empty image reference.
-    tag: "0.87.0-rc.13"
+    tag: "0.87.0-rc.15"
   # The Harbor pull secret IN THE WORKER NAMESPACE. It cannot be the release
   # namespace's copy: a ServiceAccount's imagePullSecrets can only name a Secret in
   # its OWN namespace. Empty = no pull secret (the KinD smoke, where the agent image
@@ -887,8 +893,8 @@ workers:
   # "WorkerData" for exactly that reason.
   #
   # It REPLACES the size preset's DataSize for a run-bound worker, on both tiers: the
-  # worker's CPU/memory still follow its preset (the api's UZI_EPHEMERAL_DEFAULT_SIZE
-  # unless the run asks for one), but /data does not, because a run-bound worker holds
+  # worker's CPU/memory still follow its preset (the default size, an admin setting or
+  # the api's UZI_EPHEMERAL_DEFAULT_SIZE when pinned, unless the run asks for one), but /data does not, because a run-bound worker holds
   # one clone for one run and its disk need tracks the repository, not the size. So an
   # ephemeral `s` worker gets MORE than its preset's /data (5Gi → 40Gi) and an
   # ephemeral `m` or `l` worker gets 40Gi, replacing its 25Gi or 50Gi preset.
@@ -921,18 +927,26 @@ workers:
   # The lease ends early on a cordon, roll or restart, and the oldest leased worker is
   # evicted if the per-user ephemeral cap is hit. "0" DISABLES it (torn down at the run's
   # end, as before). Maximum 2h: a larger value or a malformed duration refuses to boot
-  # the api. Unset or null renders the 2h default.
+  # the api.
   #
-  # This is a DIRECT env entry on the api Deployment, so it OVERRIDES a UZI_EPHEMERAL_LEASE
-  # set through api.config (envFrom): set it here, not there.
-  ephemeralLease: "2h"
+  # Unset (null) by default: the admin setting Admin -> Workers supplies the default (2h)
+  # and is editable without a restart. Setting it here pins it through the api's
+  # UZI_EPHEMERAL_LEASE env, and the admin field then shows it as set by the environment
+  # (locked). An explicit "0" is rendered (it is not treated as unset). Set it only here:
+  # the same key in api.config or api.secretEnv fails the render.
+  ephemeralLease: ~
   # Issue #2412: a run-bound worker needs one run's memory headroom, not a
   # persistent L worker's two-run budget. M reserves 8Gi instead of 14Gi while
   # both presets request 1 CPU and can burst to 4 CPU. Valid values: s, m, l, l-highmem; invalid values fail
   # chart rendering. Existing workers keep their stored size; persistent workers
-  # still preselect L. Set the size only here: the same key in api.config or
+  # still preselect L.
+  #
+  # Unset (null) by default: the admin setting Admin -> Workers supplies the default (m)
+  # and is editable without a restart. Setting it here pins it through the api's
+  # UZI_EPHEMERAL_DEFAULT_SIZE env, and the admin field then shows it as set by the
+  # environment (locked). Set the size only here: the same key in api.config or
   # api.secretEnv fails the render.
-  ephemeralDefaultSize: m
+  ephemeralDefaultSize: ~
   # Where the hosted worker's join-token Secret (worker_token + ca.crt) mounts (issue
   # #1761). Empty keeps the default /run/secrets, and then nothing about the worker pod
   # changes. OpenShift/OKD MUST set it (the render fails otherwise when
@@ -1732,6 +1746,41 @@ web:
     # e.g. [{name: shared, namespace: gateway-system}] (Gateway API parentRefs, verbatim)
     parentRefs: []
     annotations: {}
+    # Gateway API HTTPRouteTimeouts for POST /api/v1/files (input-file upload): {request,
+    # backendRequest}, each a Gateway API Duration ("300s", "5m", "1h30m"; quote it). Empty
+    # (the default) renders today's route unchanged and leaves the timeout to the Gateway
+    # implementation, which for Envoy-based gateways is commonly 15s. Set, it renders a
+    # dedicated `Exact /api/v1/files` rule carrying exactly the keys given. HTTPRoute timeouts
+    # are a Gateway API Extended feature: set this only on a gateway that supports them.
+    # Recommended: {request: "300s", backendRequest: "300s"}, sized for a 25 MiB upload on a
+    # slow link. Web nginx buffers the whole request body before the api sees any of it, so
+    # what 300s bounds depends on when the gateway starts its request timer, which Gateway
+    # API leaves to the implementation:
+    # - timer from request start: 300s caps the whole transaction, client upload included.
+    #   A 25 MiB upload at the api's assumed 100 KiB/s floor takes 256s, leaving ~44s for
+    #   forwarding and api processing; a client slower than ~85 KiB/s on average is cut off.
+    # - timer after the body is received: the client upload is not counted against
+    #   `request`, and 300s covers the api's own budget for the buffered body: its upload
+    #   deadline is the larger of the request deadline (UZI_RECOVERY_REQUEST_DEADLINE, 120s)
+    #   and the declared size at 100 KiB/s (256s at 25 MiB), plus a 15s response grace, 271s.
+    #   On a gateway that streams the request body upstream, upload time can still count
+    #   against `backendRequest` even when `request` starts after the body is received.
+    # So 300s is not a portable cap on total upload duration. Raising the per-file cap
+    # (UZI_JOB_INPUT_FILE_MAX_BYTES) needs a larger value.
+    # This value must cover web nginx's /api/v1/files budgets, as web.ingress.annotations do
+    # for Ingress; size it as a TOTAL budget, not by copying nginx's numbers, because nginx's
+    # client_body/proxy_send/proxy_read timeouts (120s/150s/150s) bound inactivity between
+    # operations, not total duration. Set backendRequest too: omitted, the implementation
+    # applies its own backend timeout, which may be shorter. The render fails on a value that
+    # is not a map (false, [], "", 0), an unknown key, a malformed duration, or backendRequest longer than request (compared as parsed
+    # durations, so 300s == 5m; request "0s" disables that timeout and allows any
+    # backendRequest). /api/ws stays on the general rule below, untouched by this value.
+    timeouts: {}
+    # The same HTTPRouteTimeouts shape and validation for the general `PathPrefix /` rule
+    # (SPA, every other /api/ route, and the /api/ws WebSocket). Empty by default; set it only
+    # to override the gateway's default for all of that traffic, and check how your
+    # implementation applies a request timeout to WebSocket upgrades first.
+    rootTimeouts: {}
 
 # --- Runtime secrets via Infisical (opt-in; used only when secrets.mode: infisical) ---
 # When selected, the chart renders InfisicalSecret CRs (from infisicalList) so a cluster

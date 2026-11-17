@@ -223,7 +223,9 @@ too — see [Paused on a usage limit](run-limit-wait.md).
 not even your default, if you kept it out. If it can pick, it does. If it
 can't pick but the pool has a non-rejected value with no usable reading,
 it spends the **best non-rejected pooled token anyway**, stale reading and all,
-rather than reach outside the pool. A rejected value is excluded even at this
+rather than reach outside the pool. At that last resort it passes over a token
+whose last reading showed a usage window at 100% with its reset still ahead,
+unless every pooled token looks like that. A rejected value is excluded even at this
 last-resort floor. If the pool is empty or every pooled value is rejected,
 the run **holds**, waiting for a spendable pooled token (or for you to resume
 it yourself).

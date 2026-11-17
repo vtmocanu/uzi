@@ -600,7 +600,7 @@ func TestDB(t *testing.T) {
 		{"danger on schema mismatch", &dbStat{schemaApplied: 190, schemaHead: 192, schemaAtHead: false}, false, sevDanger, "differs from the embedded head"},
 		{"danger on schema read error", &dbStat{schemaErr: errors.New("no goose"), schemaAtHead: false}, false, sevDanger, "Could not read the applied migration"},
 		{"warn on slow ping", &dbStat{pingDur: 400 * time.Millisecond, schemaAtHead: true}, false, sevWarn, "ping is slow"},
-		{"warn on saturated pool", &dbStat{acquiredConns: 18, maxConns: 20, schemaAtHead: true}, false, sevWarn, "near capacity"},
+		{"ok with 7 of 8 in use and no waits", &dbStat{pingDur: time.Millisecond, acquiredConns: 7, maxConns: 8, schemaAtHead: true}, false, sevOK, "schema at head"},
 		{"ok when healthy", &dbStat{pingDur: 5 * time.Millisecond, acquiredConns: 1, maxConns: 20, schemaAtHead: true}, false, sevOK, "schema at head"},
 	}
 	for _, tc := range tests {

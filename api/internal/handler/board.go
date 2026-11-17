@@ -294,6 +294,36 @@ type boardDTO struct {
 	// Pipeline is the repo's default-branch CI status (PRD #6, the board header
 	// badge), null when there is no cached default-branch pipeline.
 	Pipeline *apitypes.PipelineDTO `json:"pipeline"`
+	// InitialImport is the repo's durable first-import status (issue #4399), read from
+	// the repo row and never inferred from the card count: an empty board is ambiguous
+	// between "importing", "failed" and "the repo has no issues". Null for a legacy
+	// repo (no recorded import) and for a repo that is not enabled.
+	InitialImport *initialImportDTO `json:"initial_import"`
+}
+
+// initialImportDTO is one repo's first-import status: state is
+// waiting|running|succeeded|failed; error_class (timeout|auth|server_error|
+// rate_limited|other) is present only when state is failed.
+type initialImportDTO struct {
+	State      string    `json:"state"`
+	UpdatedAt  time.Time `json:"updated_at"`
+	ErrorClass string    `json:"error_class,omitempty"`
+}
+
+// initialImportForBoard maps the repo row to the board's import status, nil for a
+// legacy (NULL state) or disabled repo.
+func initialImportForBoard(repo store.GetRepoForUserRow) *initialImportDTO {
+	if !repo.Enabled || !repo.InitialImportState.Valid {
+		return nil
+	}
+	dto := &initialImportDTO{State: repo.InitialImportState.String}
+	if repo.InitialImportUpdatedAt.Valid {
+		dto.UpdatedAt = repo.InitialImportUpdatedAt.Time
+	}
+	if repo.InitialImportErrorClass.Valid {
+		dto.ErrorClass = repo.InitialImportErrorClass.String
+	}
+	return dto
 }
 
 // ── Board ───────────────────────────────────────────────────────────────────
@@ -508,6 +538,7 @@ func (h *Handler) buildBoard(w http.ResponseWriter, r *http.Request, repo store.
 		Cards:          cards,
 		Pipeline:       repoPipeline,
 		BotForgeUserID: repo.BotForgeUserID,
+		InitialImport:  initialImportForBoard(repo),
 	}, true
 }
 

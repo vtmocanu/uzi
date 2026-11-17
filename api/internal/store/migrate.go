@@ -15,7 +15,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	_ "github.com/jackc/pgx/v5/stdlib" // registers the "pgx" database/sql driver
+	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/pressly/goose/v3"
 )
 
@@ -400,6 +400,31 @@ func MigrateDownTo(ctx context.Context, dsn string, version int64) error {
 		return fmt.Errorf("run migrations down to %d: %w", version, err)
 	}
 	return nil
+}
+
+// migrateConnConfig parses dsn for the migration connection through pgxpool.ParseConfig, the
+// parser OpenPool uses: it validates the pgxpool-only settings (pool_max_conns etc.) and strips
+// them, so they are never sent to Postgres as runtime parameters, which the server rejects.
+func migrateConnConfig(dsn string) (*pgx.ConnConfig, error) {
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, err
+	}
+	return cfg.ConnConfig, nil
+}
+
+// RegisterMigrationDSN turns an operator connection string (DATABASE_URL) into one Migrate
+// can use: it parses dsn with migrateConnConfig (rejecting an invalid pool setting, stripping
+// the valid ones) and registers the result with the pgx database/sql driver. Migrate's own
+// sql.Open would otherwise keep pool_max_conns and friends as runtime parameters, which
+// Postgres rejects. The returned name is valid until release is called.
+func RegisterMigrationDSN(dsn string) (name string, release func(), err error) {
+	cc, err := migrateConnConfig(dsn)
+	if err != nil {
+		return "", nil, fmt.Errorf("parse database url: %w", err)
+	}
+	name = stdlib.RegisterConnConfig(cc)
+	return name, func() { stdlib.UnregisterConnConfig(name) }, nil
 }
 
 // openForMigrate opens the sql.DB at dsn, waits for it to become reachable, and

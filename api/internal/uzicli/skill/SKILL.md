@@ -65,7 +65,7 @@ version-matched, no server needed — see *Onboarding & concepts* below.
 `uzi worker list --json` and read each worker's `status`, `docker`, `active_runs`,
 `max_concurrent_runs` (a missing or null field is unknown, never "no"). If every online worker has
 `docker: true`, a repo-bearing run on a repo outside the Docker worker repo allowlist cannot be
-claimed: point to **Admin → Instance → Docker worker repo allowlist** (an admin edits it there;
+claimed: point to **Admin → Workers → Docker worker repo allowlist** (an admin edits it there;
 anyone else asks an admin). Then `uzi docs show run-health`.
 
 **On-screen labels**: name a web UI location only by the labels in `uzi docs`, never by a

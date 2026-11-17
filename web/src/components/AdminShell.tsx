@@ -1,5 +1,5 @@
 // AdminShell: one header + tab bar shared by the admin surfaces (Users, Rate limits,
-// Tool allowlist, Blocked repos, Instance, Branding, Site lists, Products, Health). The same
+// Tool allowlist, Blocked repos, Instance, Workers, Branding, Site lists, Products, Health). The same
 // treatment SettingsShell gives the user-scoped settings: the pages used to be separate
 // top-level sidebar entries wired together only by proximity, which crowded the
 // sidebar for admins and hid that they are one area — this instance's controls.
@@ -22,6 +22,7 @@ export const TABS = [
   { to: "/admin/tool-allowlist", label: "Tool allowlist" },
   { to: "/admin/blocked-repos", label: "Blocked repos" },
   { to: "/admin/settings", label: "Instance" },
+  { to: "/admin/workers", label: "Workers" },
   { to: "/admin/branding", label: "Branding" },
   // Optional external-products/jobs controls follow instance configuration. Site lists
   // come first: jobs use them, and products can only allow lists that already exist.

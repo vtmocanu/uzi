@@ -323,11 +323,27 @@ func ephemeralLeaseExpiry(leaseSince, drainingSince pgtype.Timestamptz, lease ti
 	return &exp
 }
 
+// currentEphemeralLease is the ephemeral_lease admin setting in force now (PRD #4212), never a
+// boot snapshot. A request handler reads it once (a list handler once per request, not per row)
+// and passes it to overlayEphemeralLease. It is display-only, so a nil settings cache or a failed
+// read is logged and answers zero: no expiry is shown rather than the request failing.
+func (h *Handler) currentEphemeralLease(ctx context.Context) time.Duration {
+	if h.settings == nil {
+		return 0
+	}
+	lease, err := h.settings.EphemeralLease(ctx)
+	if err != nil {
+		slog.Error("read ephemeral lease for worker response; showing no lease expiry", "error", err)
+		return 0
+	}
+	return lease
+}
+
 // overlayEphemeralLease sets the DTO's ephemeral_lease_expires_at from the worker's lease
-// columns and the configured lease. A post-step rather than a builder parameter because
-// the lease duration lives on the handler config, not on the row.
-func (h *Handler) overlayEphemeralLease(dto *apitypes.WorkerDTO, leaseSince, drainingSince pgtype.Timestamptz) {
-	dto.EphemeralLeaseExpiresAt = ephemeralLeaseExpiry(leaseSince, drainingSince, h.cfg.EphemeralLease, h.clock())
+// columns and the lease the caller read (currentEphemeralLease). A post-step rather than a
+// builder parameter because the lease duration lives in settings, not on the row.
+func (h *Handler) overlayEphemeralLease(dto *apitypes.WorkerDTO, leaseSince, drainingSince pgtype.Timestamptz, lease time.Duration) {
+	dto.EphemeralLeaseExpiresAt = ephemeralLeaseExpiry(leaseSince, drainingSince, lease, h.clock())
 }
 
 // rollSignalFromRow lifts the LEFT-JOINed roll-health columns into the classifier's
@@ -758,7 +774,7 @@ func (h *Handler) workerDTOWithOverlays(ctx context.Context, row store.ListWorke
 	if count, ok := h.custodyDecisionsByWorker(ctx, ids)[row.ID]; ok {
 		dto.CustodyDecisionsNeeded = &count
 	}
-	h.overlayEphemeralLease(&dto, row.LeaseSince, row.DrainingSince)
+	h.overlayEphemeralLease(&dto, row.LeaseSince, row.DrainingSince, h.currentEphemeralLease(ctx))
 	h.overlayWorkerReports(&dto, row.ID)
 	h.overlayReportedRuns(&dto, h.reportedRunsByWorker(ctx, ids), row.ID)
 	overlayRunDisk(&dto, h.runDiskByWorker(ctx, ids), row.ID)
@@ -794,6 +810,7 @@ func (h *Handler) ListWorkers(w http.ResponseWriter, r *http.Request) {
 	reported := h.reportedRunsByWorker(r.Context(), ids)
 	cooldowns := h.workerForgeOriginCooldowns(r.Context(), ids)
 	runDisk := h.runDiskByWorker(r.Context(), ids)
+	lease := h.currentEphemeralLease(r.Context())
 	for _, row := range rows {
 		dto := workerDTOFromRow(row, h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt)
 		dto.ForgeOriginCooldowns = cooldowns[row.ID]
@@ -801,7 +818,7 @@ func (h *Handler) ListWorkers(w http.ResponseWriter, r *http.Request) {
 		if count, ok := decisions[row.ID]; ok {
 			dto.CustodyDecisionsNeeded = &count
 		}
-		h.overlayEphemeralLease(&dto, row.LeaseSince, row.DrainingSince)
+		h.overlayEphemeralLease(&dto, row.LeaseSince, row.DrainingSince, lease)
 		h.overlayWorkerReports(&dto, row.ID)
 		h.overlayReportedRuns(&dto, reported, row.ID)
 		overlayRunDisk(&dto, runDisk, row.ID)
@@ -834,13 +851,14 @@ func (h *Handler) AdminListWorkers(w http.ResponseWriter, r *http.Request) {
 	decisions := h.custodyDecisionsByWorker(r.Context(), ids)
 	reported := h.reportedRunsByWorker(r.Context(), ids)
 	runDisk := h.runDiskByWorker(r.Context(), ids)
+	lease := h.currentEphemeralLease(r.Context())
 	for _, row := range rows {
 		dto := adminWorkerDTOFromRow(row, h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt, h.cfg.WorkerHeartbeatStale)
 		appendUpgradeBlockers(&dto.WorkerDTO, blockers, row.Worker.ID)
 		if count, ok := decisions[row.Worker.ID]; ok {
 			dto.CustodyDecisionsNeeded = &count
 		}
-		h.overlayEphemeralLease(&dto.WorkerDTO, row.Worker.LeaseSince, row.Worker.DrainingSince)
+		h.overlayEphemeralLease(&dto.WorkerDTO, row.Worker.LeaseSince, row.Worker.DrainingSince, lease)
 		h.overlayWorkerReports(&dto.WorkerDTO, row.Worker.ID)
 		h.overlayReportedRuns(&dto.WorkerDTO, reported, row.Worker.ID)
 		overlayRunDisk(&dto.WorkerDTO, runDisk, row.Worker.ID)
@@ -926,6 +944,10 @@ func (h *Handler) DeleteWorker(w http.ResponseWriter, r *http.Request) {
 			// PRD #4206: the hibernation cache prune keeps the worker's claim fence until its
 			// settlement is confirmed; deleting the row would drop that fence.
 			httpx.Error(w, http.StatusConflict, "this worker is still reclaiming its Docker cache for hibernation; wait for the cleanup to settle before removing it")
+		case errors.Is(err, workersvc.ErrWorkerDeleteRaced):
+			// #4389: both guarded attempts lost a cache prune start/settle race while the worker
+			// stayed present and settled; nothing was deleted and a retry can succeed.
+			httpx.Error(w, http.StatusConflict, "this worker's hibernation cache cleanup changed state while it was being removed; retry the delete")
 		case errors.As(err, &custody):
 			// PRD #1296 M4 (D3): a worker still holding an OPEN custody hold is refused
 			// with a DISTINCT 409 from the active-runs case above — deleting it cascades
@@ -1109,7 +1131,7 @@ func (h *Handler) PatchWorker(w http.ResponseWriter, r *http.Request) {
 	// register/heartbeat/list surfaces: this worker may be active with a live backlog,
 	// and without the overlay its outbox_* fields would read null on this response.
 	dto := workerDTOFromWorker(wkr, 0, false, token.label, h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt)
-	h.overlayEphemeralLease(&dto, wkr.LeaseSince, wkr.DrainingSince)
+	h.overlayEphemeralLease(&dto, wkr.LeaseSince, wkr.DrainingSince, h.currentEphemeralLease(r.Context()))
 	h.overlayWorkerReports(&dto, wkr.ID)
 	// Reuse the batched query with a one-element id set (PRD #1390 M2c): this worker may hold a
 	// live snapshot, so without the overlay its reported_runs would read [] on this response.

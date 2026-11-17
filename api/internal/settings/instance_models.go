@@ -22,10 +22,14 @@ var instanceModelKeys = map[string]struct{}{
 
 // NormalizeForStorage returns the value to validate and store for key: the
 // instance model keys are trimmed so a whitespace-only submission stores
-// exactly "" (which reads back as the default). Every other key is returned
-// verbatim.
+// exactly "" (which reads back as the default). The ephemeral/hosted worker keys
+// (PRD #4212) are trimmed the same way. Every other key is returned verbatim.
 func NormalizeForStorage(key, value string) string {
 	if _, ok := instanceModelKeys[key]; ok {
+		return strings.TrimSpace(value)
+	}
+	switch key {
+	case KeyEphemeralMaxPerUser, KeyEphemeralDefaultSize, KeyHostedDefaultSize, KeyEphemeralLease:
 		return strings.TrimSpace(value)
 	}
 	return value

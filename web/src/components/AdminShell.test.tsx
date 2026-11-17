@@ -86,6 +86,15 @@ describe("AdminShell agent source pip", () => {
   });
 });
 
+describe("AdminShell tabs", () => {
+  it("lists Workers right after Instance", async () => {
+    await renderShell(healthySilentDoc());
+    const labels = screen.getAllByRole("link").map((l) => l.textContent);
+    expect(labels.indexOf("Workers")).toBe(labels.indexOf("Instance") + 1);
+    expect(screen.getByRole("link", { name: "Workers" }).getAttribute("href")).toBe("/admin/workers");
+  });
+});
+
 describe("AdminShell health tab pip", () => {
   it("names danger and warning separately on an incident, with the attention total visible", async () => {
     await renderShell(incidentDoc()); // 3 danger + 1 warn

@@ -1111,9 +1111,10 @@ func (s *Service) checkQueueUndispatched(ctx context.Context, now time.Time) api
 // control group
 // -------------------------------------------------------------------------
 
-// checkDB warns on a slow ping or a saturated pool and is danger on a failed ping or a
-// migration-version mismatch. It reads the injected probe (the live pool in production, a
-// fake in unit tests). A nil probe (no pool wired) is `unknown`.
+// checkDB warns on a slow ping or on requests that waited for a pooled connection (windowed
+// empty-acquire wait time, see poolWaitVerdict; occupancy alone never warns) and is danger on
+// a failed ping or a migration-version mismatch. It reads the injected probe (the live pool
+// in production, a fake in unit tests). A nil probe (no pool wired) is `unknown`.
 func (s *Service) checkDB(ctx context.Context, now time.Time) apitypes.HealthCheckDTO {
 	c := s.base("db")
 	// Evaluated before the nil-probe return so a recorded 53100 is never hidden behind
@@ -1132,6 +1133,7 @@ func (s *Service) checkDB(ctx context.Context, now time.Time) apitypes.HealthChe
 		return c
 	}
 	st := s.probeDB(ctx)
+	pw := s.poolWaitVerdict(now, st)
 	switch {
 	case st.pingErr != nil:
 		c.Severity = sevDanger
@@ -1153,25 +1155,82 @@ func (s *Service) checkDB(ctx context.Context, now time.Time) apitypes.HealthChe
 		c.Action = strPtr("Run the pending migrations, or roll back to the release whose embedded head matches.")
 		return c
 	}
-	poolRatio := 0.0
-	if st.maxConns > 0 {
-		poolRatio = float64(st.acquiredConns) / float64(st.maxConns)
-	}
 	if st.pingDur > dbPingWarn {
 		c.Severity = sevWarn
 		c.Summary = fmt.Sprintf("Database ping is slow (%dms).", st.pingDur.Milliseconds())
 		c.Action = strPtr("The database is slow to respond; check its load and the network path.")
 		return c
 	}
-	if poolRatio >= dbPoolWarnRatio {
+	c.Evidence = []apitypes.HealthEvidenceDTO{{Label: "In use", Value: fmt.Sprintf("%d of %d", st.acquiredConns, st.maxConns)}}
+	if pw.hasWindow {
+		c.Evidence = append(c.Evidence,
+			apitypes.HealthEvidenceDTO{Label: "Waits", Value: fmt.Sprintf("%d", pw.waits)},
+			apitypes.HealthEvidenceDTO{Label: "Wait time", Value: fmt.Sprintf("%dms", pw.waitTime.Milliseconds())},
+			apitypes.HealthEvidenceDTO{Label: "Cancelled acquires", Value: fmt.Sprintf("%d", pw.cancels)},
+			apitypes.HealthEvidenceDTO{Label: "Interval", Value: fmt.Sprintf("%ds", int64(pw.elapsed.Seconds()))},
+		)
+	} else {
+		c.Evidence = append(c.Evidence, apitypes.HealthEvidenceDTO{Label: "Wait window", Value: "collecting (first window not complete)"})
+	}
+	if pw.warn {
 		c.Severity = sevWarn
-		c.Summary = fmt.Sprintf("Connection pool is near capacity (%d of %d in use).", st.acquiredConns, st.maxConns)
-		c.Action = strPtr("Connection demand is high; consider raising the pool size or reducing load.")
+		c.Summary = fmt.Sprintf("Requests waited for a database connection (%d waits, %dms total over the last %ds).",
+			pw.waits, pw.waitTime.Milliseconds(), int64(pw.elapsed.Seconds()))
+		c.Action = strPtr("Requests queued for a pooled database connection (waits include opening new connections). Raise DB_MAX_CONNS, budgeting replicas × DB_MAX_CONNS against Postgres max_connections, or reduce load.")
 		return c
 	}
 	c.Severity = sevOK
 	c.Summary = fmt.Sprintf("Database reachable (%dms); schema at head.", st.pingDur.Milliseconds())
 	return c
+}
+
+// poolWait is the db check's connection-acquire wait verdict for one completed window.
+type poolWait struct {
+	hasWindow bool
+	waits     int64
+	cancels   int64
+	waitTime  time.Duration
+	elapsed   time.Duration
+	warn      bool
+}
+
+// poolWaitVerdict turns the pool's cumulative empty-acquire counters into a windowed
+// verdict. The first call records a baseline and reports no window. Calls inside
+// dbPoolWaitWindow of the baseline return the cached verdict without consuming any delta.
+// Once the window has elapsed it computes the deltas against the baseline over the actual
+// elapsed interval, caches the verdict and resets the baseline. It is lazy (no timer) and
+// uses the caller's now. Cancelled acquires are reported but never warn on their own.
+func (s *Service) poolWaitVerdict(now time.Time, st dbStat) poolWait {
+	s.poolWaitMu.Lock()
+	defer s.poolWaitMu.Unlock()
+	reset := func() {
+		s.poolWaitBaselineAt = now
+		s.poolWaitBaseCount = st.emptyAcquireCount
+		s.poolWaitBaseWait = st.emptyAcquireWait
+		s.poolWaitBaseCancels = st.canceledAcquireCount
+	}
+	if !s.poolWaitInitialized {
+		s.poolWaitInitialized = true
+		reset()
+		s.poolWaitCached = poolWait{}
+		return s.poolWaitCached
+	}
+	elapsed := now.Sub(s.poolWaitBaselineAt)
+	if elapsed < dbPoolWaitWindow {
+		return s.poolWaitCached
+	}
+	pw := poolWait{
+		hasWindow: true,
+		waits:     max(st.emptyAcquireCount-s.poolWaitBaseCount, 0),
+		cancels:   max(st.canceledAcquireCount-s.poolWaitBaseCancels, 0),
+		waitTime:  max(st.emptyAcquireWait-s.poolWaitBaseWait, 0),
+		elapsed:   elapsed,
+	}
+	wd := int64(pw.waitTime)
+	pw.warn = wd > math.MaxInt64/dbPoolWaitRatio || wd*dbPoolWaitRatio >= int64(elapsed)
+	s.poolWaitCached = pw
+	reset()
+	return pw
 }
 
 // livePoolProbe is the production db probe: a real ping (timed with wall-clock time, not
@@ -1184,6 +1243,11 @@ func (s *Service) livePoolProbe(ctx context.Context) dbStat {
 	stat := s.cfg.Pool.Stat()
 	st.acquiredConns = stat.AcquiredConns()
 	st.maxConns = stat.MaxConns()
+	// The counters are cumulative, so this probe's own acquires (the ping above, the schema
+	// read below) count in a window like any other request.
+	st.emptyAcquireCount = stat.EmptyAcquireCount()
+	st.emptyAcquireWait = stat.EmptyAcquireWaitTime()
+	st.canceledAcquireCount = stat.CanceledAcquireCount()
 	st.schemaApplied, st.schemaHead, st.schemaAtHead, st.schemaErr = store.SchemaVersionStatus(ctx, s.cfg.Pool)
 	return st
 }
