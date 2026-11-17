@@ -27,7 +27,7 @@ Acceptance examples:
 2. A new run on that repo runs the integration tests. The test code reads both variables from the environment and calls the sandbox, with no step by the agent. This holds on the Claude harness and on the Codex harness, in every command of the run, whichever agent issues it.
 3. The lead's prompt lists each variable's name and description, and the value of each plain variable, so the agent knows what is set and does not guess. Secret values never appear in a prompt.
 4. Any tool that takes its settings from the environment works unchanged. A package manager installs from a private index with a token variable. A build tool resolves private dependencies from `ARTIFACT_REPO_URL`, `ARTIFACT_REPO_USER` and `ARTIFACT_REPO_PASSWORD`. A database migration runs against `DATABASE_URL`.
-5. A tool that logs in once and keeps the result on disk is driven by the agent or a repo script. For a container registry: `echo "$REGISTRY_PASSWORD" | docker login "$REGISTRY_HOST" -u "$REGISTRY_USER" --password-stdin` runs once, and later commands in the same run, including an image build with a private base image and a test suite that starts containers through a library reading the Docker client configuration, pull private images without logging in again. This holds on both harnesses. A run resumed on a worker that no longer has the login is told to log in again.
+5. A tool that logs in once and keeps the result on disk is driven by the agent or a repo script. For a container registry: `echo "$REGISTRY_PASSWORD" | docker login "$REGISTRY_HOST" -u "$REGISTRY_USER" --password-stdin` runs once, and later commands in the same run, including an image build with a private base image and a test suite that starts containers through a library reading the Docker client configuration, pull private images without logging in again. This holds on Claude from M2 and on Codex from M3; before M3 a Codex run logs in and pulls in one command. A run resumed on a worker that no longer has the login is told to log in again.
 6. A command prints a secret's value. The run message, the worker log and any memory, review reply or finding the agent writes show the redaction marker instead. A plain value such as a hostname is not redacted, so output stays readable.
 7. The agent writes a secret's value into a tracked file. The next checkpoint or the final push is held by the existing secret-remediation hold, the hold names the variable, and nothing containing the value reaches the forge. A plain value that already appears in tracked files (a hostname in a build file) holds nothing.
 8. A user tries to save `ANTHROPIC_BASE_URL`, `NODE_OPTIONS`, `GITHUB_TOKEN` or `PATH`. The save is refused with a field error naming the rule.
@@ -64,25 +64,28 @@ What stays:
 - No reveal endpoint for secrets, no admin read path to another user's values.
 - Worker-set environment keys always win. A user variable can never replace or remove one.
 - A locked vault delays work and never fails it.
-- Guardrails are unchanged. `env`, `printenv` and `/proc` reads stay denied; this feature does not rely on them as a boundary.
+- Guardrails are unchanged. Bare environment enumeration, non-allowlisted environment reads and `/proc` reads stay denied; the existing diagnostic reads (`printenv PATH` and the rest of `adr/0319-env-read-diagnostic-allowlist.md`) remain allowed. This feature does not rely on any of them as a boundary.
 
 Residuals, accepted and to be recorded in the ADR:
 
 - The agent can read secret values and docker-tier egress is open (`adr/0285-worker-egress-tier-trust-model.md`). Users should store read-only, narrowly scoped credentials.
 - Concurrent runs on one worker share a runner uid and one DinD daemon (`adr/0091-runner-cross-run-persistence-residual.md`, `docs/proc-hardening.md`). A run on one repo can reach another repo's variables and pulled images. A worker serves one user, so nothing crosses users. The Anthropic token has the same exposure today.
-- Redaction is exact-match with an 8-character floor (`agent/src/redact.ts`) and does not survive arbitrary encodings. It is a net, not a boundary.
-- Login state a tool writes to disk holds the credential for as long as the directory lives. On Claude that is the run home, until the run ends. On Codex the command home is recreated per command, so only the run's Docker configuration directory keeps such state, including while the run is parked.
+- Redaction is exact-match with an 8-character floor (`agent/src/redact.ts`). It covers the forms listed under Worker and no other encoding. It is a net, not a boundary.
+- Values reach the model provider: the agent reads them and tool results carry them. Native Claude and Codex transcripts persisted on the worker hold them unredacted, as they hold anything else the agent reads.
+- Login state a tool writes to disk holds the credential for as long as the directory lives. On Claude that is the run home, until the run ends. On Codex the command home is recreated per command, so before M3 a login and the command that uses it must run in one command (`docker login … && docker pull …`); from M3 the run's Docker configuration directory keeps the login, including while the run is parked. Either directory is removed when the run ends. While it exists, a concurrent run on the same worker can read it, per the shared-uid residual above.
 - Values passed to an image build as build arguments stay in that image's history in the shared DinD daemon. That is how such builds behave everywhere; the user doc says so.
 
 ## Modules and seams
 
 ### Store and vault (`api`)
 
-- New table `run_env_vars` (additive goose migration): `id`, `user_id` (`ON DELETE CASCADE`), `repo_id` (nullable, `ON DELETE CASCADE`), `name`, `secret` (bool), `description`, `ciphertext`, `sealed_with`, `master_aad`, `rev`, `created_at`, `updated_at`. A row with a repo belongs to that repo; a row without one is the user-level scope that M4 uses. M1 to M3 write and read repo rows only. Two partial unique indexes: `(user_id, repo_id, name)` where `repo_id` is set, and `(user_id, name)` where it is not.
+- New table `run_env_vars` (additive goose migration): `id`, `user_id` (`ON DELETE CASCADE`), `repo_id` (nullable, `ON DELETE CASCADE`), `name`, `secret` (bool), `description`, `ciphertext`, `sealed_with`, `master_aad`, `rev`, `retired_at` (nullable), `created_at`, `updated_at`. A row with a repo belongs to that repo; a row without one is the user-level scope that M4 uses. M1 to M3 write and read repo rows only. Two partial unique indexes over live rows (`retired_at` unset): `(user_id, repo_id, name)` where `repo_id` is set, and `(user_id, name)` where it is not.
+- Retired rows. Replacing a secret's value or deleting a secret does not drop the old ciphertext while a run that received it is not terminal. The old row is marked retired, stays sealed, is never injected or shown, and is delivered to those runs for redaction and scanning only (see Claim). The sweeper deletes a retired row once no non-terminal run recorded its rev. Plain values are never retired; replacing or deleting one drops it.
 - Every value, plain or secret, is sealed through the existing vault seam, so there is one storage path. The `secret` flag decides what may be read back, redacted and scanned. The AAD binds a domain tag, the user id, a scope tag (repo or user) with the repo id when there is one, the secret flag and the length-prefixed name. A ciphertext cannot be moved between names, repos or scopes, and a secret cannot be relabelled plain without its value being supplied again.
 - Edits: a save without a value changes only the description. A save with a value replaces it and bumps `rev`. Secret to plain requires a value in the same save. Plain to secret reseals the stored value and needs an unlocked vault. There is no rename; delete and create.
 - The table joins every explicit vault enumeration, or its rows become undecryptable: the material totals, the lock and reseal batches used when the vault is enabled or disabled (`api/internal/store/queries/vault_material.sql`, `api/internal/vault/lifecycle.go`), the budgets of `adr/3507-optional-credential-vault.md`, and the account-reset delete (`api/internal/store/queries/account_reset_links.sql`). Writes take the same users-row fence as other secret writes.
-- Limits: name `^[A-Z_][A-Z0-9_]{0,127}$`; value at most 64 KiB; a secret at least 8 characters; a plain value must not be a URL with userinfo; at most 50 variables and 256 KiB per scope.
+- Value rules: valid UTF-8 without NUL (a process environment cannot carry it); at most 65536 bytes; a plain value may be empty and must not be a URL with userinfo; a secret is at least 8 characters as `MIN_SECRET_LEN` in `agent/src/redact.ts` counts them, so every secret can be masked and scanned. Plain values are never masked or scanned, whatever their length.
+- Limits: name `^[A-Z_][A-Z0-9_]{0,127}$`; at most 50 live variables and 262144 value bytes per scope. Every boundary is tested at the limit and one past it.
 
 ### Name rules (shared fixture)
 
@@ -99,10 +102,11 @@ Residuals, accepted and to be recorded in the ADR:
 
 ### Claim (`api/internal/workersvc`)
 
-- `ClaimSecrets` gains `run_env` (`omitempty`): a list of name, value and the secret flag. It is filled in `assembleClaim` by its own query, for run-lane claims only, in the transaction that finishes the claim, so the set a worker receives is the set recorded. The set is a claim-time snapshot: a change made while a run is claimed reaches it at its next claim.
-- The run records injected names and revs (no values, no hashes).
-- An open failure caused by a locked vault maps to the existing requeue path, never to a failed run.
-- New worker protocol capability `run_env_v1`. `ClaimRun` requires it when the run's repo has variables, using the existing `EXISTS` gate pattern in `api/internal/store/queries/runtime.sql`. The same condition is mirrored in fleet-aware placement and in run health, so an unplaceable run says why.
+- Run kinds. `run_env` is delivered to the lead kinds of `fixtures/run-kinds/registry.json` that execute repo code: `issue`, `prompt`, `self_improve`, `ci_fix`, `mr_rework` and `task`. `chat`, `judge`, `job` and `cross_check` never receive it, and the claim gate does not apply to them.
+- `ClaimSecrets` gains `run_env` (`omitempty`): for each live variable, name, value, the secret flag, rev and description. A second list, `run_env_redact`, carries the retired secret values this run recorded, for redaction and scanning only; the worker never sets them in an environment or a prompt.
+- Snapshot. `assembleClaim` reads the set and its `(name, rev)` list. `finishRunClaimTx` (`api/internal/workersvc/claim_recovery.go`) then takes the owner's users-row fence that variable writes take, re-reads the `(name, rev)` list and checks `run_env_v1` against it. If the list changed, or the set is non-empty and the worker lacks the capability, the claim settles through the existing transient path (like `errCustomModelCapabilityMissing`): the run returns to queued and is retried, and nothing is delivered. Otherwise the same transaction records the delivered names and revs on the run (no values, no hashes). A change committed after that transaction reaches the run at its next claim.
+- An open failure caused by a locked vault maps to the existing requeue path, never to a failed run. A recorded retired rev that cannot be opened, or is missing, is not delivered silently: the claim parks the run with a visible reason, and the run neither resumes nor publishes until the owner acts.
+- New worker protocol capability `run_env_v1`. `ClaimRun` requires it when the run is of a receiving kind and its repo has live variables or the run recorded retired revs, using the existing `EXISTS` gate pattern in `api/internal/store/queries/runtime.sql`. The same condition is mirrored in fleet-aware placement and in run health, so an unplaceable run says why.
 - The claim response sets `Cache-Control: no-store`.
 
 ### Worker (`agent`)
@@ -114,9 +118,13 @@ Residuals, accepted and to be recorded in the ADR:
   - Codex: the command home is recreated for every command (`commandEffectSpec` in `agent/src/codex/codex-executor.ts`), and the run's shared cache is optional and rotated, so neither can hold it. The command sandbox gets a dedicated per-run grant for this directory, independent of the cache, and `DOCKER_CONFIG` is set per command in `commandEffectSpec`. It applies with and without the uid split.
   - Lifecycle follows the run home: kept while the run is parked, removed when the run ends. The name `.docker` keeps `config.json` inside the existing credential denylist for terminal snapshots (`agent/src/git.ts`).
   - M3 starts by proving on Codex, on a uid-split worker, that a login in one command is visible to an image pull and an image build in the next. If the sandbox cannot be granted the directory, M3 stops and the PRD is revised; M2 does not depend on it.
-- Redaction. One helper registers, with every redactor the run owns (the run-message set and logger set in `agent/src/runner.ts`, the Codex stream scrub), each secret value, its base64 form, and the base64 form of `<other value>:<secret>` for every other variable of the repo, plain or secret, whose value is at most 128 characters. That is the HTTP Basic form, which is what an `Authorization` header, a package-manager configuration and a registry login carry. Tool inputs that leave the worker without passing those sets today are redacted too: saved memories, review-thread replies, findings and CI evidence notes. Plain values alone are never registered.
-- On a re-claim after a secret is replaced, the previous value stays registered for redaction for the life of the run's working directory.
-- Exact-value scan: before a checkpoint publish, a salvage-ref publish and the final push, the outgoing range is searched for the same forms the redactor registers. A hit uses the existing secret-remediation hold and names the variable, so a user who chose a common word as a secret sees why. gitleaks stays as it is; it cannot know these values.
+- Registered forms. One helper derives, for each secret in `run_env` and `run_env_redact`: the value; its JSON-escaped form when that differs (`agent/src/log.ts` scrubs after `JSON.stringify`, so a value holding a quote, backslash or newline is otherwise missed); and the three base64 alignments of the value, each trimmed to the characters that do not depend on neighbouring bytes, so the secret is caught inside any base64 stream, including the `user:password` entry a registry login stores and an HTTP Basic header. Plain values are never registered. The run's secret set in `agent/src/runner.ts` is built from every claim, so a worker restart rebuilds it from the next claim with nothing persisted.
+- Outbound sinks. Every path that carries repo or agent text off the worker either passes the run's redactor, or the exact-value scan, or both:
+  - Redacted: run messages, the worker log, the Codex stream, saved memories, review-thread replies, findings, CI evidence notes, PR/MR title and body including the description fallback fields (`agent/src/pr-description-publisher.ts`), issues the agent files, questions and answers, persisted plan and cross-check inputs, and judge-visible output.
+  - Scanned, and held on a hit: checkpoint publish, salvage-ref publish, final push, recovery-capture archives uploaded to the API.
+  - Redacted and scanned: `preserved_patch`, which is scrubbed with the run's registered secrets (now including these) before its gitleaks scan, then exact-value scanned.
+  - Allowed exposure, not protected: the model provider and the worker's local filesystem, listed under residuals.
+- Exact-value scan. Before each scanned publish, every commit in the outgoing range is searched for the registered forms, not only the final tree, and the verdict is bound to the exact commit or archive digest that is then published. A hit uses the existing secret-remediation hold and names the variable, so a user who chose a common word as a secret sees why. The scan fails closed: on timeout, an unresolved range, truncated input or a scanner error the publish is withheld, unlike the gitleaks path in `agent/src/secret-scan-guard.ts`, which fails open to forge push protection that cannot know these values. gitleaks stays as it is.
 - Prompt. The environment-facts block of `agent/src/prompt.ts` (Claude and Codex call sites) and the append every subagent gets list names, descriptions and plain values, fenced and sanitised like other user-supplied text, and state that the listed variables are already set in the command environment. From M3, a resumed run is also told that a registry login may not have survived and to log in again if a pull is refused.
 - A test pins that no outbox, recovery journal or hibernation record serialises `run_env`.
 
@@ -132,25 +140,28 @@ Residuals, accepted and to be recorded in the ADR:
 - Store: both partial unique indexes, limits, the edit rules, cascade on repo and user delete.
 - Vault: enable, disable and account reset with variables present; every row opens afterwards or is gone. A ciphertext swapped between two names, two repos, or a secret and a plain row, fails to open.
 - Name rules: the shared fixture drives table tests on both sides; a name allowed by one side and denied by the other fails the build.
-- Claim: gate on and off, an old worker never claims a gated run, locked vault requeues, names and revs recorded, a mid-run change reaching only the next claim, `no-store` header present.
-- Worker: precedence (a user `PATH` smuggled past the api is dropped); redaction of a secret, of its base64 form and of a written registry login entry through each sink listed above, and no redaction of a plain value; redaction of a replaced secret's previous value after a re-claim; exact-value scan holding a checkpoint, a salvage publish and a final push for a secret, and holding nothing for a plain value present in the tree.
+- Value rules: NUL refused, empty plain value accepted, a 7-character secret refused and an 8-character one accepted, size and count limits at the boundary and one past it.
+- Claim: gate on and off per run kind, an old worker never claims a gated run, locked vault requeues, names and revs recorded, `no-store` header present. Races through the claim hooks: a repo's first variable added between admission and finish for a worker without the capability returns the run to queued with nothing delivered; a rotation and a delete between assembly and finish do the same; a change after finish reaches only the next claim.
+- Retired values: rotate a secret during a run, then claim again on another worker; the old value arrives in `run_env_redact` and not in the environment; the retired row is swept once the run is terminal; a retired row that cannot be opened parks the run.
+- Worker: precedence (a user `PATH` smuggled past the api is dropped). Redaction through each redacted sink of a secret, its JSON-escaped form, each base64 alignment and a written registry login entry; no redaction of a plain value. Restart, then rotate or delete, then resume, then an attempted publish of a commit holding the old value: held. Exact-value scan holding a hit in a middle commit of the range, in a recovery archive and in `preserved_patch`; withholding on timeout, an unresolved range, truncated input and a scanner error; refusing a publish whose candidate differs from the scanned one; holding nothing for a plain value present in the tree.
 - E2E for M2, compose, both harnesses, dummy values: a run's test command reads a plain URL variable and a secret, calls a local HTTP stub that requires the secret, and passes; the secret printed by a command is redacted in the run messages.
 - E2E for M3, compose, both harnesses, with a local registry stub that requires authentication: a run logs in with a secret, and later commands pull an image and build one from a private base image through the Docker client configuration.
+- The two E2E scenarios run at landing, not in a run (see Landing obligations).
 - Fixtures that look like credentials are assembled at runtime and `task scan:secrets` runs in every milestone gate.
 
 ## Milestones
 
 ### M1: Variables can be stored and managed
 
-Migration, vault integration (seal, enumerations, reset), secret flag, edit rules, name rules fixture, API, web panel and repo-row count, CLI list, user doc. Nothing is injected yet and the panel says so. Gate: `task gate:api`, `task gate:web`, `task scan:secrets`.
+Migration, vault integration (seal, enumerations, reset), secret flag, edit rules, name rules fixture, API, web panel and repo-row count, CLI list, user doc. Nothing is injected yet and the panel says so. Gate: `task check:api` plus `-race` tests on the touched packages and the vault and store LiveDB tests; `task check:web` plus the touched Vitest files; `task scan:secrets`.
 
 ### M2: Runs receive the variables
 
-The claim field and capability gate with its placement and health mirrors, worker merge on both harnesses, redaction helper and tool-input redaction, exact-value scan on the three publish paths, prompt blocks for the lead and subagents, injected names on the run page, the ADR, E2E. After this, everything that reads the environment works: test code, package managers, build tools, cloud CLIs. Gate: `task gate:api`, `task gate:agent`, `task gate:web`, `task scan:secrets`, compose E2E, and a hosted k8s run of the E2E scenario.
+The claim fields, snapshot check and capability gate with its placement and health mirrors, retired rows and their sweep, worker merge on both harnesses, registered forms and redaction of every listed sink, the fail-closed exact-value scan on every scanned publish, prompt blocks for the lead and subagents, injected names on the run page, the ADR. After this, everything that reads the environment works: test code, package managers, build tools, cloud CLIs. Gate: `task check:api` plus `-race` tests on the touched packages and the claim LiveDB tests; `UZI_DEADCODE_AGENT_REQUIRED=1 task check:agent` plus the touched agent tests and `task test:codex-m4`; `task check:web` plus the touched Vitest files; the focused regression tests above; `task scan:secrets`.
 
 ### M3: Container registry logins last for the run
 
-The Codex login-persistence proof first; it gates the rest. Then the run's Docker configuration directory on both harnesses, the resume hint, the registry example in the user doc, E2E. Gate: `task gate:agent`, `task scan:secrets`, compose E2E, and a hosted k8s run of the E2E scenario.
+The Codex login-persistence proof first; it gates the rest. Then the run's Docker configuration directory on both harnesses, the resume hint, the registry example in the user doc. Gate: `UZI_DEADCODE_AGENT_REQUIRED=1 task check:agent` plus the touched agent tests and `task test:codex-m4`; `task scan:secrets`.
 
 ### M4: Variables for all of a user's repos
 
@@ -162,6 +173,12 @@ A user-level set applied to every repo the user owns, with a repo variable of th
 - Migration numbers are assigned at merge time.
 - A changelog fragment per PR.
 - The ADR for the amended invariants and accepted residuals lands with M2.
+- Full agent suite: exact-head PR CI.
+- The compose E2E scenarios for M2 and M3 pass on the landing head, on both harnesses.
+
+## Owner acceptance
+
+Outside the milestones, not a worker obligation; this delivery is `non_closing` until it is done. On the hosted deployment, a run on a repo with a plain URL variable and a secret passes a test that needs both, and after M3 a run logs in to a private registry in one command and pulls and builds from it in later commands, on both harnesses. Filed as a linked `acceptance` issue at landing.
 
 ## Decision Log
 
@@ -178,4 +195,8 @@ A user-level set applied to every repo the user owns, with a repo variable of th
 - **Web-only writes.** Keeps the existing cookie-only rule for secret writes.
 - **Lowest-precedence merge plus a denylist.** The existing provisioning fold is a three-key allowlist and cannot carry user names; precedence protects every worker-set key structurally, the denylist covers names the worker never sets.
 - **Hard claim gate.** A soft gate would let an old worker run the job without the variables and fail in a confusing way.
+- **Snapshot checked at finish, not assembled at finish.** Assembly stays outside the claim transaction as it is today; the finish transaction re-reads the `(name, rev)` list under the owner fence and requeues on a mismatch. Retrying a rare race is cheaper than moving vault opens into the claim transaction.
+- **Retired secrets kept server-side while a run needs them.** The worker persists nothing about `run_env`, so a restarted or different worker can protect an old value only if the claim carries it. Keeping the old ciphertext until the run is terminal does that with one column; refusing to resume is the fallback when it cannot be opened.
+- **Exact-value scan fails closed.** gitleaks can fail open because forge push protection backs it; nothing outside the worker knows these values, so an untrustworthy scan withholds.
+- **Base64 alignments instead of fixed pairs.** Three trimmed alignments catch a secret inside any base64 stream, including a `user:password` entry, without knowing which other value it is paired with.
 - **Cross-repo exposure on a shared worker accepted.** Same exposure as the Anthropic token today; recorded as a residual rather than requiring uid-split or ephemeral workers.
