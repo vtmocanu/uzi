@@ -2515,6 +2515,85 @@ function attemptLedgerValue(entry: AttemptLedgerEntry): string {
   });
 }
 
+// ─── issue #4263 — retirement-scratch bindings ─────────────────────────────────────────────
+//
+// Each `<runnerRoot>/.retire-<uuid>/` retirement scratch parent is bound durably in the bare
+// config key `uzi-retire-scratch.<uuid>.binding`, so a later verified pass can reclaim it. The value
+// is canonical JSON (field order below, no whitespace, no device number); a reader accepts ONLY a value
+// that re-serializes to itself. The key prefix is not an attribution prefix and not a protected-record
+// family: older readers ignore it (see test/retire-binding-old-readers.test.ts).
+
+/** Most binding keys one bare may carry; a bare over the cap reads as `unknown`, never as a truncated list. */
+export const RETIRE_BINDING_MAX_PER_BARE = 64;
+
+const RETIRE_BINDING_PREFIX = "uzi-retire-scratch.";
+const RETIRE_BINDING_KEY_RE = /^uzi-retire-scratch\.([0-9a-f-]{36})\.binding$/;
+const RETIRE_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const RETIRE_RUN_ID_RE = /^[A-Za-z0-9_-]{1,160}$/;
+const RETIRE_POD_RE = /^[A-Za-z0-9_-]{0,160}$/;
+const RETIRE_INODE_RE = /^(0|[1-9][0-9]{0,19})$/;
+const RETIRE_CLASSES = ["completion", "verified_successor", "owner_terminal", "owner_terminal_covered", "other"] as const;
+const RETIRE_PHASES = ["intent", "settled", "removing"] as const;
+
+export interface RetireBinding {
+  v: 1;
+  class: (typeof RETIRE_CLASSES)[number];
+  attemptId: string;
+  runId: string;
+  branch: string;
+  clonePath: string;
+  phase: (typeof RETIRE_PHASES)[number];
+  parentIno: string;
+  cloneIno: string;
+  pod: string;
+}
+
+export function retireBindingKey(uuid: string): string {
+  return `${RETIRE_BINDING_PREFIX}${uuid}.binding`;
+}
+
+/** The uuid a well-formed binding key names, else undefined. */
+export function parseRetireBindingKey(key: string): string | undefined {
+  const m = RETIRE_BINDING_KEY_RE.exec(key);
+  return m && RETIRE_UUID_RE.test(m[1]!) ? m[1] : undefined;
+}
+
+/** One binding value in the documented field order. */
+export function retireBindingValue(b: RetireBinding): string {
+  return JSON.stringify({
+    v: b.v, class: b.class, attemptId: b.attemptId, runId: b.runId, branch: b.branch,
+    clonePath: b.clonePath, phase: b.phase, parentIno: b.parentIno, cloneIno: b.cloneIno, pod: b.pod,
+  });
+}
+
+/** Strict decode of one binding: the key uuid must be valid and the raw text must be exactly the canonical serialization. */
+export function parseRetireBinding(keyUuid: string, raw: string): { ok: true; binding: RetireBinding } | { ok: false } {
+  const bad = { ok: false } as const;
+  if (!RETIRE_UUID_RE.test(keyUuid) || raw === "") return bad;
+  let parsed: unknown;
+  try { parsed = JSON.parse(raw); } catch { return bad; }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return bad;
+  const o = parsed as Record<string, unknown>;
+  const str = (k: string): string | undefined => typeof o[k] === "string" ? o[k] as string : undefined;
+  const cls = str("class"), phase = str("phase"), attemptId = str("attemptId"), runId = str("runId"), branch = str("branch");
+  const clonePath = str("clonePath"), parentIno = str("parentIno"), cloneIno = str("cloneIno"), pod = str("pod");
+  if (o.v !== 1 || cls === undefined || phase === undefined || attemptId === undefined || runId === undefined ||
+    branch === undefined || clonePath === undefined || parentIno === undefined || cloneIno === undefined || pod === undefined) return bad;
+  if (!(RETIRE_CLASSES as readonly string[]).includes(cls) || !(RETIRE_PHASES as readonly string[]).includes(phase)) return bad;
+  if (!ATTEMPT_ID_RE.test(attemptId) || !RETIRE_RUN_ID_RE.test(runId) || branch === "") return bad;
+  if (!path.isAbsolute(clonePath) || path.resolve(clonePath) !== clonePath) return bad;
+  if (!RETIRE_INODE_RE.test(parentIno) || !RETIRE_INODE_RE.test(cloneIno) || !RETIRE_POD_RE.test(pod)) return bad;
+  const binding: RetireBinding = {
+    v: 1, class: cls as RetireBinding["class"], attemptId, runId, branch, clonePath,
+    phase: phase as RetireBinding["phase"], parentIno, cloneIno, pod,
+  };
+  return retireBindingValue(binding) === raw ? { ok: true, binding } : bad;
+}
+
+/** One binding key of a bare: `parsed` is undefined for a malformed, valueless or duplicated key. */
+export interface RetireBindingRead { uuid: string; raw: string; parsed?: RetireBinding }
+export type RetireBindingsRead = { state: "read"; bindings: RetireBindingRead[] } | { state: "unknown" };
+
 // ─── issue #1786 — retained stopped sources ────────────────────────────────────────────────
 //
 // A stopped generation's clone is kept, not discarded, until an operator
@@ -16628,6 +16707,35 @@ export class GitCache {
     return (await this.runGit(barePath, ["config", "--local", "--no-includes", "--null", "--list"])).split("\0");
   }
 
+  /**
+   * issue #4263: every `uzi-retire-scratch.*` key of the bare, decoded strictly, under the caller's bare lock (it takes
+   * none). Bounded: more than {@link RETIRE_BINDING_MAX_PER_BARE} such keys is `unknown`. A valueless, undecodable or
+   * duplicated key is returned as an entry with no `parsed`, never thrown. A git failure propagates to the caller.
+   */
+  private async readRetireBindingsUnderLock(barePath: string, snapshot?: readonly string[]): Promise<RetireBindingsRead> {
+    const items = (snapshot ?? await this.configEntries(barePath)).filter(item => item.startsWith(RETIRE_BINDING_PREFIX));
+    if (items.length > RETIRE_BINDING_MAX_PER_BARE) return { state: "unknown" };
+    const rows = items.map(item => {
+      const nl = item.indexOf("\n");
+      const key = nl < 0 ? item : item.slice(0, nl);
+      return { key, raw: nl < 0 ? "" : item.slice(nl + 1) };
+    });
+    const seen = new Map<string, number>();
+    for (const r of rows) seen.set(r.key, (seen.get(r.key) ?? 0) + 1);
+    const bindings = rows.map((r): RetireBindingRead => {
+      const uuid = parseRetireBindingKey(r.key);
+      if (uuid === undefined || seen.get(r.key) !== 1) return { uuid: uuid ?? r.key, raw: r.raw };
+      const decoded = parseRetireBinding(uuid, r.raw);
+      return decoded.ok ? { uuid, raw: r.raw, parsed: decoded.binding } : { uuid, raw: r.raw };
+    });
+    return { state: "read", bindings };
+  }
+
+  /** {@link readRetireBindingsUnderLock} under the bare lock. */
+  readRetireBindings(barePath: string): Promise<RetireBindingsRead> {
+    return this.withLock(barePath, () => this.readRetireBindingsUnderLock(barePath));
+  }
+
   /** {@link resolveBranchJournalUnderLock} under the bare lock, for callers that do not already hold it. */
   resolveBranchJournal(barePath: string, branch: string): Promise<BranchJournal> {
     return this.withLock(barePath, () => this.resolveBranchJournalUnderLock(barePath, branch));
@@ -17300,11 +17408,13 @@ export class GitCache {
    * gone (lstat ENOENT), whatever its state: a gone path has nothing left for any reader to
    * find. (Before issue #3153 `<runnerRoot>` was an emptyDir that vanished with the pod; it now
    * persists on the data volume, so an entry whose path is gone was removed by something else, and
-   * there is still nothing at that path for a reader to find. A surviving clone is NOT compacted.) Two exceptions are always kept:
+   * there is still nothing at that path for a reader to find. A surviving clone is NOT compacted.) Three exceptions are always kept:
    *   - an entry any branch's recovery journal still names (the journal is what (d′) and a capture
    *     resolve through the ledger);
    *   - a gone `reclaimed` entry while its run's journal or custody record (`recovery/<runId>`,
    *     `recovery-settlement/<runId>`) exists; with both gone it is dropped.
+   *   - an entry whose (attemptId, runId, clonePath) a decoded retirement binding names (issue #4263); an unreadable binding set
+   *     keeps every entry.
    * Nothing is rewritten when nothing would change.
    *
    * The rewrite is ATOMIC ({@link rewriteLedgerAtomically}): the full compacted value set lands in
@@ -17317,7 +17427,13 @@ export class GitCache {
     try {
       const key = attemptLedgerKey(branch);
       // issue #3644: compaction lstats every ledger path, a restored predecessor's included; it waits while THIS branch has a restore entry.
-      if (this.restoreValueIn(await this.configEntries(barePath), branch) !== undefined) return;
+      const snapshot = await this.configEntries(barePath);
+      if (this.restoreValueIn(snapshot, branch) !== undefined) return;
+      // issue #4263: a retirement binding names (attemptId, runId, clonePath) of a scratch parent still owed reclaim; its
+      // ledger entry is kept whatever its state. An unreadable binding set (over the cap) keeps every entry (no drop).
+      const bindingRead = await this.readRetireBindingsUnderLock(barePath, snapshot);
+      const namedByBinding = (e: AttemptLedgerEntry): boolean => bindingRead.state === "unknown" || bindingRead.bindings.some(b =>
+        b.parsed !== undefined && b.parsed.attemptId === e.attemptId && b.parsed.runId === e.runId && b.parsed.clonePath === e.clonePath);
       const raw = (await this.readAllAttemptLedgerRaw(barePath)).filter(([b]) => b === branch).map(([, v]) => v);
       const last = new Map<string, AttemptLedgerEntry>();
       for (const v of raw) {
@@ -17331,7 +17447,7 @@ export class GitCache {
       const kept: string[] = [];
       for (const e of last.values()) {
         const gone = path.isAbsolute(e.clonePath) && !(await this.pathPresent(e.clonePath));
-        const droppable = gone && !namedByJournal(e.clonePath) && !(await this.hasPhysicalTerminalProtection(e.runId)) &&
+        const droppable = gone && !namedByJournal(e.clonePath) && !namedByBinding(e) && !(await this.hasPhysicalTerminalProtection(e.runId)) &&
           (e.state !== "reclaimed" || !(await this.custodyHeld(e.runId)));
         if (!droppable) kept.push(attemptLedgerValue(e));
       }
