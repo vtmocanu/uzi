@@ -1,9 +1,14 @@
 package handler
 
 import (
+	"context"
+	"encoding/json"
 	"net/http"
 	"strings"
 	"testing"
+
+	"github.com/vtmocanu/uzi/api/internal/capability"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 func TestWorkerCodexSwitchPreflightRouteLiveDB(t *testing.T) {
@@ -24,14 +29,36 @@ func TestWorkerCodexSwitchPreflightRouteLiveDB(t *testing.T) {
 		}
 	}
 	body := strings.TrimSuffix(e.applyBody(e.op), "}") + ",\"target_secret_id\":\"" + e.secret.String() + "\"}"
-	rec := e.do(e.worker, "POST", path, body)
-	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "\"outcome\":\"fenced\"") {
-		t.Fatalf("unnegotiated preflight status=%d body=%s", rec.Code, rec.Body)
-	}
-	if strings.Contains(rec.Body.String(), e.plain) || strings.Contains(rec.Body.String(), "ciphertext") {
-		t.Fatal("preflight disclosed material")
-	}
-	if rec.Header().Get("Cache-Control") != "no-store" {
-		t.Fatal("preflight result is cacheable")
+	for _, tc := range []struct {
+		name           string
+		stoppedSupport bool
+		outcome        string
+		reason         string
+	}{
+		{"missing_stopped_support", false, "not_applied", "worker_upgrade_required"},
+		{"stopped_support_wrong_harness", true, "fenced", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.stoppedSupport {
+				// This fixture remains a Claude run: passing the stopped-support
+				// admission gate must still leave the Codex authority fence intact.
+				if _, err := e.pool.Exec(context.Background(), `UPDATE workers SET protocol_capabilities =
+array_append(protocol_capabilities, $2) WHERE id = $1`, e.worker, capability.CodexSwitchStoppedV1); err != nil {
+					t.Fatal(err)
+				}
+			}
+			rec := e.do(e.worker, "POST", path, body)
+			var got workersvc.CodexSwitchPreflightResult
+			if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &got) != nil ||
+				got.Outcome != tc.outcome || got.Reason != tc.reason {
+				t.Fatalf("unnegotiated preflight status=%d body=%s", rec.Code, rec.Body)
+			}
+			if strings.Contains(rec.Body.String(), e.plain) || strings.Contains(rec.Body.String(), "ciphertext") {
+				t.Fatal("preflight disclosed material")
+			}
+			if rec.Header().Get("Cache-Control") != "no-store" {
+				t.Fatal("preflight result is cacheable")
+			}
+		})
 	}
 }
