@@ -4,11 +4,11 @@ import {
   classifySpendLimitTerminal, CREDIT_BALANCE_LOW_TEXT, SPEND_LIMIT_ORG_TEXT, SPEND_LIMIT_WORKSPACE_TEXT,
   SpendLimitHoldError,
 } from "../src/limit.js";
+import { decodeResult } from "../src/sdk-messages.js";
 
 // Issue #4426: the Claude CLI's credit-depletion sentence, written literally here so the holding
 // cases below pin the classifier's acceptance, not merely the constant's value.
 const CREDIT = "Credit balance is too low";
-import { decodeResult } from "../src/sdk-messages.js";
 
 // Issue #3767: the single text-matched classification. Structural facts AND an exact sentence.
 const hold = (resultText: string | undefined, over: Record<string, unknown> = {}) =>

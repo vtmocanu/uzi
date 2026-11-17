@@ -1614,7 +1614,11 @@ Tracked as GitHub issue vtmocanu/uzi#1809; PRD at `prds/1809-worker-disk-safety.
 
 ## Issue #3767 — Anthropic API spend-limit owner hold
 
-- An Anthropic API spend limit (organization or workspace) holds the run in `recovery_wait` (`anthropic_spend_limit`) for the owner, with no automatic retry or credential switch; it is detected by a narrow anchored text match because Anthropic exposes no structured signal, Resume re-uses the run's own credential selection, and credit depletion is out of scope. See [run-recovery-wait](../docs/run-recovery-wait.md#anthropic-api-spend-limit). (AI-synced 2026-11-11)
+- An Anthropic API spend limit (organization or workspace) holds the run in `recovery_wait` (`anthropic_spend_limit`) for the owner, with no automatic retry or credential switch; it is detected by a narrow anchored text match because Anthropic exposes no structured signal, Resume re-uses the run's own credential selection, and credit depletion was out of scope here (superseded by #4426 below). See [run-recovery-wait](../docs/run-recovery-wait.md#anthropic-api-spend-limit). (AI-synced 2026-11-11)
+
+## Issue #4426 — Anthropic API credit depletion takes the spend-limit hold
+
+- An Anthropic API key whose prepaid credit balance ran out holds the run exactly like a spend limit: `recovery_wait` with cause `anthropic_spend_limit`, owner-held, no timer, Resume, Switch token or Cancel. It is matched by the same anchored classifier on the Claude CLI's `Credit balance is too low` sentence (SDK 0.3.319), with no new recovery cause, migration or protocol feature; an api or worker that cannot park still fails with the unchanged `provider error: 400 …` message. Credential pool selection on Resume stays out of scope. (AI-synced 2026-11-17)
 
 ## Bug #1864 — Codex delegation still open when the lead's turn ends
 
