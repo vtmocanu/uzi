@@ -135,6 +135,9 @@ WHERE c.user_id = $1 AND r.enabled = true
 ORDER BY r.path_with_namespace ASC;
 
 -- name: GetRepoForUser :one
+-- issue_source_locked (PRD #4173 D13): the project was linked to an issue tracker before it was
+-- removed and this row is not linked. Every refusal of an operation that reads, imports or
+-- writes issues or starts a run reads it with awaiting_first_enable (store.RefuseNeverEnabled).
 -- One repo plus the connection fields needed to build a forge client, scoped to
 -- the owning user. guardrail_override_reason feeds the #66 gates (M4 enable, M5
 -- create): a non-NULL reason means the admin per-repo override is active, so the
@@ -146,6 +149,10 @@ SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_u
        r.initial_import_state, r.initial_import_error_class, r.initial_import_updated_at,
        r.issue_tracker_connection_id, r.issue_tracker_project_id, r.issue_tracker_project_short,
        r.eligibility_tag_id, r.eligibility_tag_name, r.issue_tracker_linked_at, r.awaiting_first_enable,
+       (r.issue_tracker_connection_id IS NULL AND EXISTS (
+           SELECT 1 FROM repo_removal_markers m
+           WHERE m.user_id = c.user_id AND m.forge_type = c.forge_type AND m.base_url = c.base_url
+             AND m.forge_project_id = r.forge_project_id AND m.was_linked))::boolean AS issue_source_locked,
        c.forge_type, c.base_url, c.token_ciphertext, c.user_id, c.bot_forge_user_id
 FROM repos r
 JOIN forge_connections c ON c.id = r.connection_id
@@ -168,6 +175,10 @@ SELECT r.id, r.connection_id, r.forge_project_id, r.path_with_namespace, r.web_u
        r.default_branch, r.enabled,
        r.issue_tracker_connection_id, r.issue_tracker_project_id, r.issue_tracker_project_short,
        r.eligibility_tag_id, r.eligibility_tag_name, r.issue_tracker_linked_at, r.awaiting_first_enable,
+       (r.issue_tracker_connection_id IS NULL AND EXISTS (
+           SELECT 1 FROM repo_removal_markers m
+           WHERE m.user_id = c.user_id AND m.forge_type = c.forge_type AND m.base_url = c.base_url
+             AND m.forge_project_id = r.forge_project_id AND m.was_linked))::boolean AS issue_source_locked,
        c.forge_type, c.base_url, c.token_ciphertext, c.user_id
 FROM repos r
 JOIN forge_connections c ON c.id = r.connection_id

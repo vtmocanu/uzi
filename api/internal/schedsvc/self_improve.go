@@ -87,7 +87,7 @@ func (e *Scheduler) fireSelfImprove(ctx context.Context, sched store.RunSchedule
 	}
 	// PRD 4173 D13: a never-enabled repo is skipped (transient to advance: logged, retried
 	// next tick, never parked) before any forge call or tracking-issue write.
-	if err := store.RefuseNeverEnabled(repo.AwaitingFirstEnable); err != nil {
+	if err := store.RefuseNeverEnabled(repo.AwaitingFirstEnable, repo.IssueSourceLocked); err != nil {
 		return FireOutcome{}, err
 	}
 

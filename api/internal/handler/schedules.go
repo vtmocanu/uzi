@@ -55,7 +55,7 @@ func (h *Handler) CreateSchedule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// PRD 4173 D13: no schedule on a never-enabled repo.
-	if refuseNeverEnabled(w, repo.AwaitingFirstEnable) {
+	if refuseNeverEnabled(w, repo.AwaitingFirstEnable, repo.IssueSourceLocked) {
 		return
 	}
 	user, _ := mw.UserFromContext(r.Context())
@@ -262,7 +262,7 @@ func (h *Handler) PatchSchedule(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			// PRD 4173 D13: a schedule may not be repointed at a never-enabled repo.
-			if refuseNeverEnabled(w, target.AwaitingFirstEnable) {
+			if refuseNeverEnabled(w, target.AwaitingFirstEnable, target.IssueSourceLocked) {
 				return
 			}
 			// A schedule with CI-watch episode history keeps it only against the repo whose
@@ -484,7 +484,7 @@ func (h *Handler) RunScheduleNow(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, workersvc.ErrRepoNotFound):
 			httpx.Error(w, http.StatusNotFound, "the schedule's repo is disconnected or no longer owned by you")
 		case errors.Is(store.MapNeverEnabled(err), store.ErrRepoNeverEnabled):
-			writeNeverEnabled(w)
+			writeNeverEnabled(w, err)
 		case errors.Is(err, schedsvc.ErrBadConfig):
 			httpx.Error(w, http.StatusBadRequest, "the schedule's configuration is invalid")
 		default:

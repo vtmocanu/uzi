@@ -763,7 +763,7 @@ func (s *Service) CreateProposal(ctx context.Context, wkr store.Worker, runID, r
 		return store.IssueProposal{}, err
 	}
 	// PRD 4173 D13: a proposal for a never-enabled repo could never be confirmed.
-	if err := store.RefuseNeverEnabled(prow.AwaitingFirstEnable); err != nil {
+	if err := store.RefuseNeverEnabled(prow.AwaitingFirstEnable, prow.IssueSourceLocked); err != nil {
 		return store.IssueProposal{}, err
 	}
 	count, err := s.q.CountPendingProposalsForRun(ctx, runID)

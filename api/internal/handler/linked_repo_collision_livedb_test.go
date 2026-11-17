@@ -35,6 +35,10 @@ func (*collisionForge) ListIssues(context.Context, int64, forge.ListIssuesOption
 	return nil, nil
 }
 func (*collisionForge) ListLabels(context.Context, int64) ([]forge.Label, error) { return nil, nil }
+
+// EnsureLabels succeeds so a board open on a plain forge repo (the positive control of
+// TestRemovedUnlinkedRepoIsUsableAfterRelistLiveDB) is not a 502 from BaseFake.
+func (*collisionForge) EnsureLabels(context.Context, int64, []forge.Label) error { return nil }
 func (*collisionForge) GetMergeRequest(_ context.Context, _, iid int64) (forge.MergeRequest, error) {
 	return forge.MergeRequest{IID: iid, State: forge.MRStateOpened}, nil
 }

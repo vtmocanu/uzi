@@ -33,7 +33,7 @@ func (h *Handler) CreateCIFixRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// PRD 4173 D13: no run on a never-enabled repo, refused before any pipeline read.
-	if refuseNeverEnabled(w, repo.AwaitingFirstEnable) {
+	if refuseNeverEnabled(w, repo.AwaitingFirstEnable, repo.IssueSourceLocked) {
 		return
 	}
 	user, _ := mw.UserFromContext(r.Context())
@@ -127,7 +127,7 @@ func (h *Handler) CreateCIFixRun(w http.ResponseWriter, r *http.Request) {
 			// construction errors are logged in workersvc and never reach this body.
 			httpx.Error(w, http.StatusBadGateway, err.Error())
 		case errors.Is(err, workersvc.ErrRepoNeverEnabled):
-			writeNeverEnabled(w)
+			writeNeverEnabled(w, err)
 		case errors.Is(err, workersvc.ErrRepoNotFound):
 			httpx.Error(w, http.StatusNotFound, "repo not found")
 		case errors.Is(err, workersvc.ErrActiveFixExists):

@@ -53,6 +53,11 @@ func (h *Handler) EnsureRepoLabels(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// PRD 4173 D13: refused for a repo that was never enabled or whose issue source is locked
+	// after a removal, before any forge call.
+	if refuseNeverEnabled(w, repo.AwaitingFirstEnable, repo.IssueSourceLocked) {
+		return
+	}
 	var req apitypes.LabelEnsureRequest
 	if err := httpx.DecodeJSONLimited(w, r, &req); err != nil {
 		httpx.RespondDecodeError(w, err, "invalid request body")

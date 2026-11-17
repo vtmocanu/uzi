@@ -8159,7 +8159,7 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 	}
 	// PRD 4173 D13: a never-enabled repo starts no run, whoever asks (manual, schedule,
 	// autopilot, composite). Before guardDefaultBranch, which may call the forge.
-	if err := store.RefuseNeverEnabled(row.AwaitingFirstEnable); err != nil {
+	if err := store.RefuseNeverEnabled(row.AwaitingFirstEnable, row.IssueSourceLocked); err != nil {
 		return store.Run{}, err
 	}
 	// #66 D1 layer 2: the service-layer guardrail, shared across the PAT-bearing

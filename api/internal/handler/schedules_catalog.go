@@ -73,7 +73,7 @@ func (h *Handler) EnableCatalogSchedule(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	// PRD 4173 D13: no schedule on a never-enabled repo.
-	if refuseNeverEnabled(w, repo.AwaitingFirstEnable) {
+	if refuseNeverEnabled(w, repo.AwaitingFirstEnable, repo.IssueSourceLocked) {
 		return
 	}
 	user, _ := mw.UserFromContext(r.Context())

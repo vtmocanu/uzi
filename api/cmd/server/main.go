@@ -2110,6 +2110,10 @@ func startRunCardMessage(err error) string {
 	switch {
 	case errors.Is(err, workersvc.ErrRepoNotFound):
 		return "That repo isn't yours, or it no longer exists."
+	case errors.Is(err, store.ErrRepoSourceLocked):
+		// Checked first: ErrRepoSourceLocked matches ErrRepoNeverEnabled under errors.Is, but
+		// enabling the repo is refused, so the never-enabled advice would be wrong.
+		return "That repo's issues were on an issue tracker link that was removed, so it can't be used in uzi."
 	case errors.Is(err, workersvc.ErrRepoNeverEnabled):
 		return "That repo has never been enabled; enable it in uzi first."
 	case errors.Is(err, workersvc.ErrIssueNotFound):

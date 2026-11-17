@@ -9,21 +9,28 @@ import (
 )
 
 // writeNeverEnabled answers the typed refusal for an operation on a repo that has
-// never been enabled (PRD 4173 D13): 409 with a message that says what to do. The
-// body is the fixed sentinel text, never a database error.
-func writeNeverEnabled(w http.ResponseWriter) {
+// never been enabled, or whose issue source is locked after a removal (PRD 4173 D13):
+// 409 with a message that says what to do. The body is a fixed sentinel text, never a
+// database error; err only selects which of the two.
+func writeNeverEnabled(w http.ResponseWriter, err error) {
+	if errors.Is(err, store.ErrRepoSourceLocked) {
+		httpx.Error(w, http.StatusConflict, store.ErrRepoSourceLocked.Error())
+		return
+	}
 	httpx.Error(w, http.StatusConflict, store.ErrRepoNeverEnabled.Error())
 }
 
 // refuseNeverEnabled writes the 409 and returns true when the repo row's
-// AwaitingFirstEnable marker is set. Handlers call it right after loading the repo
+// AwaitingFirstEnable marker is set or its IssueSourceLocked column says the project was
+// linked to an issue tracker before it was removed. Handlers call it right after loading the repo
 // row, before any forge or issue tracker call, so the database guard never strands
 // an issue the forge already created.
-func refuseNeverEnabled(w http.ResponseWriter, awaitingFirstEnable bool) bool {
-	if store.RefuseNeverEnabled(awaitingFirstEnable) == nil {
+func refuseNeverEnabled(w http.ResponseWriter, awaitingFirstEnable, issueSourceLocked bool) bool {
+	err := store.RefuseNeverEnabled(awaitingFirstEnable, issueSourceLocked)
+	if err == nil {
 		return false
 	}
-	writeNeverEnabled(w)
+	writeNeverEnabled(w, err)
 	return true
 }
 
@@ -34,6 +41,6 @@ func writeIfNeverEnabled(w http.ResponseWriter, err error) bool {
 	if !errors.Is(store.MapNeverEnabled(err), store.ErrRepoNeverEnabled) {
 		return false
 	}
-	writeNeverEnabled(w)
+	writeNeverEnabled(w, err)
 	return true
 }

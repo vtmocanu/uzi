@@ -71,7 +71,7 @@ func (h *Handler) CloneSchedule(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// PRD 4173 D13: no schedule on a never-enabled repo.
-		if refuseNeverEnabled(w, target.AwaitingFirstEnable) {
+		if refuseNeverEnabled(w, target.AwaitingFirstEnable, target.IssueSourceLocked) {
 			return
 		}
 		targetRepo = rid
@@ -237,7 +237,7 @@ func (h *Handler) AddScheduleRepo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// PRD 4173 D13: no schedule on a never-enabled repo.
-	if refuseNeverEnabled(w, target.AwaitingFirstEnable) {
+	if refuseNeverEnabled(w, target.AwaitingFirstEnable, target.IssueSourceLocked) {
 		return
 	}
 

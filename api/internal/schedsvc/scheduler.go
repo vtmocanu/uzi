@@ -941,7 +941,7 @@ func (e *Scheduler) firePrompt(ctx context.Context, sched store.RunSchedule) (Fi
 	// active-run lookup and any forge read; transient to advance, like resolveRepoForge.
 	// A repo read that fails is left to the create seam below, which reports it.
 	if repo, rerr := e.store.GetRepoForUser(ctx, store.GetRepoForUserParams{ID: sched.RepoID, UserID: sched.UserID}); rerr == nil {
-		if err := store.RefuseNeverEnabled(repo.AwaitingFirstEnable); err != nil {
+		if err := store.RefuseNeverEnabled(repo.AwaitingFirstEnable, repo.IssueSourceLocked); err != nil {
 			return FireOutcome{}, err
 		}
 	}
@@ -1199,8 +1199,10 @@ func (e *Scheduler) resolveRepoForge(ctx context.Context, sched store.RunSchedul
 	// for every fire that resolves its forge through this function. firePrompt checks the
 	// marker itself (it may need no forge at all). The error is transient to advance
 	// (logged, retried next tick, never parked), so the schedule fires once the repo is
-	// enabled.
-	if err := store.RefuseNeverEnabled(repo.AwaitingFirstEnable); err != nil {
+	// enabled. A source-locked repo (store.ErrRepoSourceLocked) is never enabled, but no
+	// schedule can reach it: run_schedules.repo_id cascades on repo delete, so a removal
+	// deletes the repo's schedules, and schedule creation is gated by the same refusal.
+	if err := store.RefuseNeverEnabled(repo.AwaitingFirstEnable, repo.IssueSourceLocked); err != nil {
 		return store.GetRepoForUserRow{}, nil, err
 	}
 	f, err := e.forge.ForgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)

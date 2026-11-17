@@ -348,7 +348,7 @@ func (h *Handler) ConfirmProposal(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, workersvc.ErrProposalRepoGone):
 			httpx.Error(w, http.StatusNotFound, "the proposal's target repo is no longer available")
 		case errors.Is(err, workersvc.ErrRepoNeverEnabled):
-			writeNeverEnabled(w)
+			writeNeverEnabled(w, err)
 		case errors.Is(err, issuesource.ErrIssueWriteNotOffered):
 			writeIssueWriteNotOffered(w, err)
 		case errors.Is(err, workersvc.ErrForgeIssueWrite):

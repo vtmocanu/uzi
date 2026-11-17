@@ -409,7 +409,7 @@ func (h *Handler) writeStartRunError(w http.ResponseWriter, r *http.Request, err
 		httpx.Error(w, http.StatusNotFound, "repo not found")
 	case errors.Is(store.MapNeverEnabled(err), store.ErrRepoNeverEnabled):
 		// PRD 4173 D13: the service gate, or the database guard's UZ413.
-		writeNeverEnabled(w)
+		writeNeverEnabled(w, err)
 	case errors.Is(err, workersvc.ErrIssueNotFound):
 		httpx.Error(w, http.StatusNotFound, "issue not found on this repo's board")
 	case errors.Is(err, workersvc.ErrDescriptionTooLarge):

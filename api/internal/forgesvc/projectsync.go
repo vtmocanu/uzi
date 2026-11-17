@@ -277,7 +277,7 @@ func (s *ProjectSyncService) projectSyncSeedPreamble(ctx context.Context, repoID
 	if err != nil {
 		return store.GetRepoByIDRow{}, nil, err
 	}
-	if err := store.RefuseNeverEnabled(repo.AwaitingFirstEnable); err != nil {
+	if err := store.RefuseNeverEnabled(repo.AwaitingFirstEnable, repo.IssueSourceLocked); err != nil {
 		return store.GetRepoByIDRow{}, nil, err
 	}
 	if repo.IssueTrackerConnectionID.Valid {

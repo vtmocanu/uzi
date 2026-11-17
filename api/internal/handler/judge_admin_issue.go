@@ -236,7 +236,7 @@ func (h *Handler) AdminFileJudgeIssue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// PRD 4173 D13: before the claim and the forge write.
-	if refuseNeverEnabled(w, repo.AwaitingFirstEnable) {
+	if refuseNeverEnabled(w, repo.AwaitingFirstEnable, repo.IssueSourceLocked) {
 		return
 	}
 

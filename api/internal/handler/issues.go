@@ -39,7 +39,7 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 	}
 	// PRD 4173 D13: refused before the forge write, so nothing is created that the
 	// issue-number guard would then strand.
-	if refuseNeverEnabled(w, repo.AwaitingFirstEnable) {
+	if refuseNeverEnabled(w, repo.AwaitingFirstEnable, repo.IssueSourceLocked) {
 		return
 	}
 	var req createIssueRequest
@@ -209,6 +209,11 @@ func buildIssueDetail(issue forge.Issue, position map[string]int, forgeType stri
 func (h *Handler) GetIssueDetail(w http.ResponseWriter, r *http.Request) {
 	repo, ok := h.repoForRequest(w, r)
 	if !ok {
+		return
+	}
+	// PRD 4173 D13: a re-listed project whose issue source was an issue tracker reads no forge
+	// issue by number (the forge's numbers are not the ones its history used).
+	if refuseNeverEnabled(w, repo.AwaitingFirstEnable, repo.IssueSourceLocked) {
 		return
 	}
 	iid, err := parseInt64(chi.URLParam(r, "iid"))

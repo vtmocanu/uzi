@@ -147,7 +147,7 @@ func (s *Service) maybeFileProposal(ctx context.Context, run store.Run, proposal
 	}
 	// PRD 4173 D13: nothing is filed on a never-enabled repo; skipped before the audit
 	// row and the forge write.
-	if err := store.RefuseNeverEnabled(repo.AwaitingFirstEnable); err != nil {
+	if err := store.RefuseNeverEnabled(repo.AwaitingFirstEnable, repo.IssueSourceLocked); err != nil {
 		slog.Warn("file proposal: skipped", "run_id", run.ID, "error", err)
 		return
 	}

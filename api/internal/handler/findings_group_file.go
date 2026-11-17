@@ -187,11 +187,11 @@ func (h *Handler) FileFindingGroup(w http.ResponseWriter, r *http.Request) {
 	}
 	// PRD 4173 D13: the group is already claimed, so release it before refusing; nothing
 	// has touched the forge.
-	if store.RefuseNeverEnabled(repo.AwaitingFirstEnable) != nil {
+	if refusal := store.RefuseNeverEnabled(repo.AwaitingFirstEnable, repo.IssueSourceLocked); refusal != nil {
 		if !releaseFindingGroupOrReport(w, op.ID, dispositionIDs, release) {
 			return
 		}
-		writeNeverEnabled(w)
+		writeNeverEnabled(w, refusal)
 		return
 	}
 	tr, err := h.issueTrackerForRepo(ctx, repo.UserID, repo.ID, repo.IssueTrackerConnectionID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
