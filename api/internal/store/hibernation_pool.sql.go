@@ -21,9 +21,7 @@ WITH oa AS (
            )::timestamptz AS anchor,
            EXISTS (SELECT 1 FROM runs r
                     WHERE r.user_id = $1::uuid AND r.status NOT IN ('completed', 'failed', 'cancelled')) AS active_now,
-           (SELECT fn_instance_intake_paused())::boolean AS intake_paused,
-           ($2::int > 0
-            AND fn_custody_admission_count($1::uuid, $3::timestamptz) >= $2::int)::boolean AS custody_limit_reached
+           (SELECT fn_instance_intake_paused())::boolean AS intake_paused
 )
 SELECT
     w.id, w.user_id, w.kind, w.ephemeral, w.status, w.last_heartbeat_at, w.created_at,
@@ -52,18 +50,12 @@ SELECT
           THEN COALESCE(w.hibernation_wake_origin, '') ELSE '' END)::text AS wake_origin,
     oa.anchor AS owner_anchor,
     oa.active_now::boolean AS owner_active_now,
-    oa.intake_paused, oa.custody_limit_reached
+    oa.intake_paused
 FROM workers w
 CROSS JOIN oa
 WHERE w.user_id = $1::uuid AND w.kind = 'hosted' AND NOT w.ephemeral
 ORDER BY w.id ASC
 `
-
-type GetOwnerHibernationPoolInputParams struct {
-	Owner            uuid.UUID          `json:"owner"`
-	CustodyHoldLimit int32              `json:"custody_hold_limit"`
-	HeartbeatCutoff  pgtype.Timestamptz `json:"heartbeat_cutoff"`
-}
 
 type GetOwnerHibernationPoolInputRow struct {
 	ID                    uuid.UUID          `json:"id"`
@@ -98,7 +90,6 @@ type GetOwnerHibernationPoolInputRow struct {
 	OwnerAnchor           pgtype.Timestamptz `json:"owner_anchor"`
 	OwnerActiveNow        bool               `json:"owner_active_now"`
 	IntakePaused          bool               `json:"intake_paused"`
-	CustodyLimitReached   bool               `json:"custody_limit_reached"`
 }
 
 // The whole pool decision input of one owner in ONE statement (one snapshot): every persistent
@@ -109,17 +100,17 @@ type GetOwnerHibernationPoolInputRow struct {
 // markers of the current op (admit_origin / wake_origin are ” unless hibernation_origin_op_id
 // equals hibernation_op_id, so a legacy or foreign-op marker reads as unknown), the owner
 // activity anchor and whether the owner is active now (see ListAutoHibernationCandidatesSurplusMode
-// for the anchor), and the two shared gates the database can establish: the instance intake pause
-// (fn_instance_intake_paused) and the owner's custody admission limit
-// (fn_custody_admission_count at or over @custody_hold_limit, the claim path's own predicate; a
-// non-positive limit disables it, so a caller that could not read the limit passes 0). It MUST be a
+// for the anchor), and the one shared gate the database can establish: the instance intake pause
+// (fn_instance_intake_paused). The owner's custody admission limit is deliberately NOT read: the
+// claim path exempts cross_check runs and continuation-exempt requeues and chat claims carry no
+// custody predicate, so a warm worker is still useful at the limit. It MUST be a
 // separate statement executed AFTER the owner lock and the candidate row lock, never folded into
 // the lock statement or taken from a list query: under READ COMMITTED a statement that waited on
 // a lock still reads its own fresh snapshot, so the decision sees every commit the previous
 // lock holder made. The owner anchor is computed once, in the oa CTE, with literal status lists
 // so runs_user_created_idx, runs_user_terminal_end_idx and runs_user_nonterminal_idx serve it.
-func (q *Queries) GetOwnerHibernationPoolInput(ctx context.Context, arg GetOwnerHibernationPoolInputParams) ([]GetOwnerHibernationPoolInputRow, error) {
-	rows, err := q.db.Query(ctx, getOwnerHibernationPoolInput, arg.Owner, arg.CustodyHoldLimit, arg.HeartbeatCutoff)
+func (q *Queries) GetOwnerHibernationPoolInput(ctx context.Context, owner uuid.UUID) ([]GetOwnerHibernationPoolInputRow, error) {
+	rows, err := q.db.Query(ctx, getOwnerHibernationPoolInput, owner)
 	if err != nil {
 		return nil, err
 	}
@@ -160,7 +151,6 @@ func (q *Queries) GetOwnerHibernationPoolInput(ctx context.Context, arg GetOwner
 			&i.OwnerAnchor,
 			&i.OwnerActiveNow,
 			&i.IntakePaused,
-			&i.CustodyLimitReached,
 		); err != nil {
 			return nil, err
 		}
@@ -315,8 +305,7 @@ base AS (
         ORDER BY r.status_since ASC, r.id ASC
         LIMIT 1
     ) p
-    WHERE NOT b.pooled
-      AND NOT EXISTS (
+    WHERE NOT EXISTS (
           SELECT 1 FROM runs r
           WHERE r.worker_id = b.id AND r.status NOT IN ('completed', 'failed', 'cancelled')
             AND r.status NOT IN ('recovery_wait', 'paused', 'limit_wait'))
@@ -364,9 +353,10 @@ type ListAutoHibernationBlockersSurplusModeRow struct {
 // elsewhere is not listed, and an unpooled worker by today's anchor. A pooled worker is therefore
 // listed only when it is long-idle and a block was recorded at or after that anchor; a block
 // recorded by a surplus refusal on a worker that is not long-idle is not listed, so a surplus
-// refusal alone never raises the check. The parked kind covers unpooled workers only: a non-terminal
-// run on a pooled worker keeps its owner active now, which is exactly the rule that keeps a pooled
-// worker from being long-idle. controller_reason is the controller's refusal code (the worker's
+// refusal alone never raises the check. The parked kind covers pooled and unpooled workers alike,
+// exactly as ListAutoHibernationBlockers does: a worker whose only non-terminal runs have been
+// parked (paused, limit_wait, recovery_wait) past the threshold is reported as "assigned run
+// parked" whether or not it is pooled. controller_reason is the controller's refusal code (the worker's
 // hibernation_reason when the controller refused) for an idle row, ” for a parked one.
 func (q *Queries) ListAutoHibernationBlockersSurplusMode(ctx context.Context, arg ListAutoHibernationBlockersSurplusModeParams) ([]ListAutoHibernationBlockersSurplusModeRow, error) {
 	rows, err := q.db.Query(ctx, listAutoHibernationBlockersSurplusMode, arg.MaxRows, arg.Cutoff)

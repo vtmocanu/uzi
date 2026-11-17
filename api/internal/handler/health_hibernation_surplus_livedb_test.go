@@ -26,8 +26,8 @@ import (
 //     roll_cohort_cleanup_pending);
 //   - an old unused pooled worker of an owner that is active elsewhere is NOT listed, and neither is
 //     one whose only recorded block is a surplus refusal (a real pass recorded it);
-//   - an unpooled worker is still judged by today's per-worker anchor, and its parked run still
-//     raises the check;
+//   - an unpooled worker is still judged by today's per-worker anchor, and a parked run raises the
+//     check for pooled and unpooled workers alike;
 //   - the same blocked pooled worker IS listed with the surplus setting off (today's query), which
 //     is the difference the owner clock makes.
 //
@@ -171,7 +171,7 @@ func TestAdminHealthHibernationSurplusModeLiveDB(t *testing.T) {
 	surplusRefused := newWorker(active, surplusRefusedName, true, 6*time.Hour)
 	keeper := newWorker(active, tag("k"), true, time.Hour)
 	// A pooled worker whose only parked run is 30 days old: the owner is active now (non-terminal
-	// run), so the pooled worker is not long-idle and the parked kind covers unpooled workers only.
+	// run), so the pooled worker is not long-idle, but the parked kind covers pooled workers too.
 	pooledParkedName := tag("p")
 	pooledParked := newWorker(active, pooledParkedName, true, 60*24*time.Hour)
 	run(active, "chat", "paused", pooledParked, 30*24*time.Hour, 30*24*time.Hour, false)
@@ -215,10 +215,15 @@ func TestAdminHealthHibernationSurplusModeLiveDB(t *testing.T) {
 	if v, ok := listed(ev, refusedName); !ok || v != fmt.Sprintf("worker %s idle 60d, hibernation blocked: controller refused (roll cohort cleanup pending)", refusedName) {
 		t.Fatalf("controller-refused pooled worker = %q (listed %v), all: %+v", v, ok, ev)
 	}
-	for _, name := range []string{activeOldName, surplusRefusedName, pooledParkedName} {
+	for _, name := range []string{activeOldName, surplusRefusedName} {
 		if v, ok := listed(ev, name); ok {
 			t.Fatalf("%s must not warn in surplus mode (owner active elsewhere / surplus refusal only): %q", name, v)
 		}
+	}
+	// Parity with the setting off: a pooled worker whose only runs are parked past the threshold is
+	// reported as "assigned run parked", exactly as ListAutoHibernationBlockers reports it.
+	if v, ok := listed(ev, pooledParkedName); !ok || !strings.Contains(v, "blocked: assigned run parked") {
+		t.Fatalf("pooled worker with a parked run = %q (listed %v), all: %+v", v, ok, ev)
 	}
 	if v, ok := listed(ev, unpooledName); !ok || v != fmt.Sprintf("worker %s idle 60d, hibernation blocked: manual cordon", unpooledName) {
 		t.Fatalf("unpooled worker = %q (listed %v), all: %+v", v, ok, ev)

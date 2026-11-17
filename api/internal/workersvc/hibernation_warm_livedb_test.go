@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -295,19 +296,11 @@ func TestWarmWakeSharedGatesLiveDB(t *testing.T) {
 			_, _ = p.env.pool.Exec(context.Background(), `UPDATE instance_intake_pause SET active = false, since = NULL, reason = NULL WHERE id`)
 		})
 	}
-	custody := func(t *testing.T, p *poolFx, on bool) {
-		t.Helper()
-		p.svc.p.CustodyHoldLimit = &fakeCustodyLimit{n: 1}
-		if on {
-			p.seedOpenCustodyHold(p.member(time.Minute)) // holds one admission unit on a young third worker
-		}
-	}
 	for _, gate := range []struct {
 		name string
 		set  func(t *testing.T, p *poolFx)
 	}{
 		{"paused instance intake", pause},
-		{"owner at the custody admission limit", func(t *testing.T, p *poolFx) { custody(t, p, true) }},
 	} {
 		t.Run(gate.name+": busy keeper and a sleeper get no warm wake", func(t *testing.T) {
 			p := newPoolFx(t)
@@ -330,17 +323,19 @@ func TestWarmWakeSharedGatesLiveDB(t *testing.T) {
 	}
 	t.Run("control: the same pool without a gate is warm woken", func(t *testing.T) {
 		p := newPoolFx(t)
-		p.svc.p.CustodyHoldLimit = &fakeCustodyLimit{n: 1}
 		keeper, sleeper := p.member(5*time.Hour), p.member(6*time.Hour)
 		p.sleeper(sleeper, AdmitOriginAutoSurplus, true)
 		p.busy(keeper, time.Hour)
 		p.pass(keeper)
 		p.wantWarm(sleeper)
 	})
-	t.Run("an unreadable custody limit establishes no gate", func(t *testing.T) {
+	t.Run("the owner at the custody admission limit is still warm woken", func(t *testing.T) {
+		// Cross-check and continuation-exempt claims and chat claims ignore the limit, so a warm
+		// worker stays useful: the custody limit is not a warm-wake gate.
 		p := newPoolFx(t)
-		p.svc.p.CustodyHoldLimit = &fakeCustodyLimit{err: fmt.Errorf("unavailable")}
+		p.svc.p.CustodyHoldLimit = &fakeCustodyLimit{n: 1}
 		keeper, sleeper := p.member(5*time.Hour), p.member(6*time.Hour)
+		p.seedOpenCustodyHold(keeper) // one admission unit: the owner is at the limit of 1
 		p.sleeper(sleeper, AdmitOriginAutoSurplus, true)
 		p.busy(keeper, time.Hour)
 		p.pass(keeper)
@@ -724,6 +719,51 @@ func TestSettingOffAfterWarmWakeKeepsWorkerAwakeLiveDB(t *testing.T) {
 	}
 }
 
+// flipSurplus reports surplus mode on for its first read (the pass's list read) and off for every
+// later one, as an admin turning the setting off between the list and the locked decision.
+type flipSurplus struct {
+	*poolSettings
+	reads atomic.Int32
+}
+
+func (f *flipSurplus) WorkerHibernationSurplus(ctx context.Context) (bool, error) {
+	if f.reads.Add(1) == 1 {
+		return f.poolSettings.WorkerHibernationSurplus(ctx)
+	}
+	return false, nil
+}
+
+// Example 5, the race form: surplus mode is switched off after the pass listed a pooled worker as
+// long-idle by the owner clock but before the locked decision. The worker's last settle is a known
+// warm one (excluded from the owner clock) and recent, so today's per-worker anchor keeps it awake:
+// it must not be admitted on the owner clock. The control keeps the setting on and does admit.
+func TestSettingOffBetweenListAndDecideKeepsPooledWorkerAwakeLiveDB(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		flip bool
+		want string
+	}{
+		{"control: setting stays on", false, "preparing"},
+		{"setting switched off before the locked decision", true, "none"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			p := newPoolFx(t)
+			target, sibling := p.member(warmLongIdle), p.member(warmLongIdle)
+			p.hibernate(sibling) // pooled but sleeping, manually admitted: no keeper, no warm target
+			p.env.exec(`UPDATE workers SET hibernation_op_id = $3, hibernation_origin_op_id = $3,
+			   hibernation_wake_origin = 'warm', last_wake_settled_at = $2 WHERE id = $1`,
+				target, p.clock.Add(-time.Hour), uuid.New())
+			if c.flip {
+				p.svc.SetHibernationAutoSettings(&flipSurplus{poolSettings: p.ps})
+			}
+			p.pass(target)
+			if got := p.state(target); got != c.want {
+				t.Fatalf("state = %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
 // The carry-forward regression: a recent legacy wake, older but still-active owner history, an
 // automatic surplus sleep, then warm wakes from keeper unavailability with no new activity. The
 // original grace survives op replacement and settlement; repeated warm wakes never extend it.
@@ -886,7 +926,7 @@ func TestPooledSQLMatchesGoPoolKeyLiveDB(t *testing.T) {
 	ids["ephemeral"] = eph
 
 	goPooled := map[uuid.UUID]bool{}
-	rows, err := p.env.q.GetOwnerHibernationPoolInput(p.env.ctx, store.GetOwnerHibernationPoolInputParams{Owner: p.user})
+	rows, err := p.env.q.GetOwnerHibernationPoolInput(p.env.ctx, p.user)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -471,7 +471,7 @@ func (s *Service) poolAttempt(ctx context.Context, w poolWork, p surplusPassPara
 		}
 		// A separate statement after both locks: its own READ COMMITTED snapshot sees every
 		// commit the previous owner-lock holder made.
-		rows, err := q.GetOwnerHibernationPoolInput(ctx, store.GetOwnerHibernationPoolInputParams{Owner: w.owner})
+		rows, err := q.GetOwnerHibernationPoolInput(ctx, w.owner)
 		if err != nil {
 			return err
 		}
@@ -504,6 +504,16 @@ func (s *Service) admitPooledLong(ctx context.Context, q *store.Queries, row sto
 	}
 	if !idle.Pooled || idle.Nonterminal > 0 || idle.OwnerActiveNow || !idle.Anchor.Valid || idle.Anchor.Time.After(p.longCutoff) {
 		return false, false, false, nil
+	}
+	// The owner-wide long clock only applies while surplus mode is on. If it was switched off since
+	// the list, stop the pass without admitting: today's per-worker anchor would keep a just
+	// warm-woken worker awake (PRD Example 5). admitAutomatic re-reads the enabled and auto switches.
+	on, err := s.hibernationAuto.WorkerHibernationSurplus(ctx)
+	if err != nil {
+		return false, false, false, err
+	}
+	if !on {
+		return true, false, true, nil
 	}
 	admitted, stop, err = s.admitAutomatic(ctx, q, row, p.now, autoHibernationReason(p.idleAfter), false)
 	return true, admitted, stop, err

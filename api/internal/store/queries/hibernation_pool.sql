@@ -45,10 +45,10 @@ LIMIT @max_rows::int;
 -- markers of the current op (admit_origin / wake_origin are '' unless hibernation_origin_op_id
 -- equals hibernation_op_id, so a legacy or foreign-op marker reads as unknown), the owner
 -- activity anchor and whether the owner is active now (see ListAutoHibernationCandidatesSurplusMode
--- for the anchor), and the two shared gates the database can establish: the instance intake pause
--- (fn_instance_intake_paused) and the owner's custody admission limit
--- (fn_custody_admission_count at or over @custody_hold_limit, the claim path's own predicate; a
--- non-positive limit disables it, so a caller that could not read the limit passes 0). It MUST be a
+-- for the anchor), and the one shared gate the database can establish: the instance intake pause
+-- (fn_instance_intake_paused). The owner's custody admission limit is deliberately NOT read: the
+-- claim path exempts cross_check runs and continuation-exempt requeues and chat claims carry no
+-- custody predicate, so a warm worker is still useful at the limit. It MUST be a
 -- separate statement executed AFTER the owner lock and the candidate row lock, never folded into
 -- the lock statement or taken from a list query: under READ COMMITTED a statement that waited on
 -- a lock still reads its own fresh snapshot, so the decision sees every commit the previous
@@ -62,9 +62,7 @@ WITH oa AS (
            )::timestamptz AS anchor,
            EXISTS (SELECT 1 FROM runs r
                     WHERE r.user_id = @owner::uuid AND r.status NOT IN ('completed', 'failed', 'cancelled')) AS active_now,
-           (SELECT fn_instance_intake_paused())::boolean AS intake_paused,
-           (@custody_hold_limit::int > 0
-            AND fn_custody_admission_count(@owner::uuid, @heartbeat_cutoff::timestamptz) >= @custody_hold_limit::int)::boolean AS custody_limit_reached
+           (SELECT fn_instance_intake_paused())::boolean AS intake_paused
 )
 SELECT
     w.id, w.user_id, w.kind, w.ephemeral, w.status, w.last_heartbeat_at, w.created_at,
@@ -93,7 +91,7 @@ SELECT
           THEN COALESCE(w.hibernation_wake_origin, '') ELSE '' END)::text AS wake_origin,
     oa.anchor AS owner_anchor,
     oa.active_now::boolean AS owner_active_now,
-    oa.intake_paused, oa.custody_limit_reached
+    oa.intake_paused
 FROM workers w
 CROSS JOIN oa
 WHERE w.user_id = @owner::uuid AND w.kind = 'hosted' AND NOT w.ephemeral
@@ -317,9 +315,10 @@ LIMIT @max_rows::int;
 -- elsewhere is not listed, and an unpooled worker by today's anchor. A pooled worker is therefore
 -- listed only when it is long-idle and a block was recorded at or after that anchor; a block
 -- recorded by a surplus refusal on a worker that is not long-idle is not listed, so a surplus
--- refusal alone never raises the check. The parked kind covers unpooled workers only: a non-terminal
--- run on a pooled worker keeps its owner active now, which is exactly the rule that keeps a pooled
--- worker from being long-idle. controller_reason is the controller's refusal code (the worker's
+-- refusal alone never raises the check. The parked kind covers pooled and unpooled workers alike,
+-- exactly as ListAutoHibernationBlockers does: a worker whose only non-terminal runs have been
+-- parked (paused, limit_wait, recovery_wait) past the threshold is reported as "assigned run
+-- parked" whether or not it is pooled. controller_reason is the controller's refusal code (the worker's
 -- hibernation_reason when the controller refused) for an idle row, '' for a parked one.
 WITH pw AS MATERIALIZED (
     SELECT o.id, o.user_id, o.template_declared AS t, o.hosted_size AS sz, o.isolated_lane AS lane,
@@ -391,8 +390,7 @@ base AS (
         ORDER BY r.status_since ASC, r.id ASC
         LIMIT 1
     ) p
-    WHERE NOT b.pooled
-      AND NOT EXISTS (
+    WHERE NOT EXISTS (
           SELECT 1 FROM runs r
           WHERE r.worker_id = b.id AND r.status NOT IN ('completed', 'failed', 'cancelled')
             AND r.status NOT IN ('recovery_wait', 'paused', 'limit_wait'))

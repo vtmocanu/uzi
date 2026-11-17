@@ -9,7 +9,6 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -108,8 +107,7 @@ func ownerActiveWithin(r poolRow, now time.Time, window time.Duration) bool {
 // All of these must hold: the pool (equal key, at least two members) has no awake ready idle
 // member, no waking member without wake_error (a healthy waking member counts toward the reserve)
 // and no member with a pending demand wake; the owner is active within idleAfter (or active now);
-// no shared gate the database can establish makes a wake useless (paused instance intake, the
-// owner at the custody admission limit); and target is the best eligible sleeper of the pool.
+// no shared gate the database can establish makes a wake useless (paused instance intake); and target is the best eligible sleeper of the pool.
 // memoryAuthorityPersisted is false while the api does not persist memory authority: a pool of
 // memory-capable members then has unknown readiness and gets no decision, as in decideSurplus.
 func decideWarm(rows []poolRow, target uuid.UUID, now time.Time, stale, idleAfter time.Duration, memoryAuthorityPersisted bool) poolDecision {
@@ -151,13 +149,15 @@ func decideWarm(rows []poolRow, target uuid.UUID, now time.Time, stale, idleAfte
 	if !ownerActiveWithin(c, now, idleAfter) {
 		return poolDecision{Action: decisionNone, Why: noneOwnerInactive}
 	}
-	// Shared gates established from persisted state: the instance intake pause and the owner's
-	// custody admission limit. A locked owner vault is deliberately NOT a gate here: the database
-	// holds only the vault mode (protected or not), while whether the DEK is cached is the
-	// in-memory vault.Vault cache of one api process (RequiresUnlock), so another replica serving a
-	// worker's claim may disagree with the sweeper's replica. A locked vault therefore only costs
-	// the existing demand-wake behaviour (a useless warm wake), never a wrong suppression.
-	if c.IntakePaused || c.CustodyLimitReached {
+	// The one shared gate established from persisted state: the instance intake pause. A locked
+	// owner vault is deliberately NOT a gate here: the database holds only the vault mode
+	// (protected or not), while whether the DEK is cached is the in-memory vault.Vault cache of one
+	// api process (RequiresUnlock), so another replica serving a worker's claim may disagree with
+	// the sweeper's replica. A locked vault therefore only costs the existing demand-wake behaviour
+	// (a useless warm wake), never a wrong suppression. The owner at the custody admission limit is
+	// likewise NOT a gate: ClaimRun exempts cross_check runs and continuation-exempt requeues, and
+	// ClaimChatRun has no custody predicate, so a warm worker is still useful at the limit.
+	if c.IntakePaused {
 		return poolDecision{Action: decisionNone, Why: noneSharedGate}
 	}
 	best, ok := pickWakeTarget(members)
@@ -189,30 +189,15 @@ func (s *Service) warmReserveOn(ctx context.Context) (bool, error) {
 	return true, nil
 }
 
-// ownerCustodyLimit reads the custody admission limit for the shared-gate check. An unreadable
-// limit is 0, which the query treats as "no custody gate established": it never suppresses a warm
-// wake, so the worst case is the existing demand-wake behaviour.
-func (s *Service) ownerCustodyLimit(ctx context.Context) int32 {
-	n, err := s.custodyLimit(ctx)
-	if err != nil || n < 0 {
-		return 0
-	}
-	return n
-}
-
 // warmAttempt is one warm-wake target's decision in the lock order of the PRD: the owner lock,
 // then the target's row lock, then ONE fresh read of the owner's pool, the decision, the write.
 func (s *Service) warmAttempt(ctx context.Context, w poolWork, p surplusPassParams) (workResult, error) {
 	var res workResult
-	limit := s.ownerCustodyLimit(ctx)
 	err := s.hibernationOwnerTx(ctx, w.owner, w.id, func(q *store.Queries, row store.Worker) error {
 		if row.UserID != w.owner || row.Kind != "hosted" || row.Ephemeral {
 			return nil
 		}
-		rows, err := q.GetOwnerHibernationPoolInput(ctx, store.GetOwnerHibernationPoolInputParams{
-			Owner: w.owner, CustodyHoldLimit: limit,
-			HeartbeatCutoff: pgconv.Time(p.now.Add(-s.p.WorkerHeartbeatStale)),
-		})
+		rows, err := q.GetOwnerHibernationPoolInput(ctx, w.owner)
 		if err != nil {
 			return err
 		}

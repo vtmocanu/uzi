@@ -119,7 +119,7 @@ func TestOwnerActivityAnchorUsesPerUserIndexesLiveDB(t *testing.T) {
 	}
 	check("owner anchor statement", explain(ownerAnchorStatement, user))
 	at := pgtype.Timestamptz{Time: time.Now(), Valid: true}
-	check("GetOwnerHibernationPoolInput", explain(getOwnerHibernationPoolInput, user, int32(8), at))
+	check("GetOwnerHibernationPoolInput", explain(getOwnerHibernationPoolInput, user))
 	// The surplus-mode long queries compute the same owner arms once per owner.
 	check("ListAutoHibernationCandidatesSurplusMode", explain(listAutoHibernationCandidatesSurplusMode, at, at, int32(512)))
 	check("ListAutoHibernationBlockersSurplusMode", explain(listAutoHibernationBlockersSurplusMode, int32(50), at))

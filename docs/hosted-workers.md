@@ -341,8 +341,10 @@ All of these must hold:
   has not failed, and no member with a demand wake pending.
 - The owner was active within the idle threshold (`worker_hibernation_idle_after`) or is
   active now.
-- No shared gate is established: instance intake is not paused and the owner is not at
-  the custody-hold limit. A locked owner vault does not suppress the wake.
+- Instance intake is not paused. Only the instance intake pause suppresses a warm wake: a
+  locked owner vault and the owner being at the custody-hold limit do not, because a
+  warm worker is still useful there (cross-check and continuation claims and chat claims
+  are exempt from the limit).
 
 The wake takes a member the automatic pass hibernated (a manual hibernation is never
 warm-woken); a member that is still preparing is withdrawn first, then hibernated

@@ -155,11 +155,6 @@ func TestDecideWarm(t *testing.T) {
 			s.IntakePaused = true
 			return []poolRow{busyRow(1), s}, s.ID
 		}, noneSharedGate},
-		{"owner at the custody admission limit", func() ([]poolRow, uuid.UUID) {
-			s := sleeperRow(2, "hibernated")
-			s.CustodyLimitReached = true
-			return []poolRow{busyRow(1), s}, s.ID
-		}, noneSharedGate},
 		{"manually hibernated member", func() ([]poolRow, uuid.UUID) {
 			s := sleeperRow(2, "hibernated")
 			s.AdmitOrigin = AdmitOriginManual
