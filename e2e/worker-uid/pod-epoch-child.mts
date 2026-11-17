@@ -70,9 +70,25 @@ const FD_PROBE = [
 ].join("\n");
 // A shell lists its own whole descriptor table (a Node process holds runtime descriptors of its own). The glob's directory
 // descriptor is closed before the test, so a surviving entry is a real one; readlink is the only process spawned.
+// A runner-uid racer: against the clone pin at fd 3 it repeatedly moves a top-level directory aside, plants a symlink to an
+// outside directory under its name, then undoes it, until the clone is empty or its own bounded clock ends. Errors are
+// expected (the helper is deleting the same entries) and ignored; it only counts the swaps that did land.
+const RACER = [
+  'const fs=require("node:fs");const outside=process.argv[1];const end=Date.now()+8000;let swaps=0;const R="/proc/self/fd/3/";',
+  'const names=[];for(let i=0;i<4;i++)names.push("r"+i);',
+  'let seenNonEmpty=false;',
+  'while(Date.now()<end){',
+  ' let left;try{left=fs.readdirSync(R);}catch{break;}',
+  ' if(left.length>0)seenNonEmpty=true; else if(seenNonEmpty)break;',
+  ' for(const n of names){try{fs.renameSync(R+n,R+n+".aside");fs.symlinkSync(outside,R+n);swaps++;',
+  '   fs.unlinkSync(R+n);fs.renameSync(R+n+".aside",R+n);}catch{}}',
+  '}',
+  'process.stdout.write(JSON.stringify({swaps}));',
+].join("\n");
 const FD_LIST = 'for p in /proc/$$/fd/*; do [ -L "$p" ] || continue; printf "%s " "${p##*/}"; readlink "$p"; done';
 async function retireOp(req: { root: string; parentName: string; cache: string; race: string; outside: string; elsewhere: string;
-  gate?: { started: string; release: string; hold?: boolean }; probe?: boolean; lockFile?: string }) {
+  gate?: { started: string; release: string; hold?: boolean }; probe?: boolean; lockFile?: string;
+  mark?: { bare: string; uuid: string; settledRaw: string } }) {
   process.env.UZI_UID_SPLIT = "1";
   const { GitCache } = await import("../../agent/src/git.js");
   const { processGroupAlive } = await import("../../agent/src/tick-spawner.js");
@@ -85,6 +101,7 @@ async function retireOp(req: { root: string; parentName: string; cache: string; 
   const mntId = (fd: number) => /^mnt_id:\s+(\d+)$/m.exec(fs.readFileSync(`/proc/self/fdinfo/${fd}`, "utf8"))![1]!;
   const ids = (p: string) => { try { return fs.lstatSync(p, { bigint: true }); } catch { return undefined; } };
   let spawns = 0;
+  let racer: Promise<{ swaps: number; status: number | null }> | undefined;
   git.epochNativeTestDependencies = {
     spawn: (command: string, args: string[], options: any) => {
       spawns++;
@@ -127,7 +144,19 @@ async function retireOp(req: { root: string; parentName: string; cache: string; 
   const race = () => {
     if (req.race === "clone-symlink-before") swapClone("symlink");
     else if (req.race === "clone-dir-before") swapClone("dir");
-    else if (req.race === "descendant") {
+    else if (req.race === "concurrent") {
+      // Started asynchronously; the gate is released at once, so the racer and the helper run at the same time.
+      const pinned = fs.openSync(clone, O_PATH_DIR);
+      const w = runnerCommand(process.execPath, ["-e", RACER, req.outside]);
+      const child = spawn(w.command, w.args, { env: { PATH: "/usr/bin:/bin" }, stdio: ["ignore", "pipe", "pipe", pinned] });
+      fs.closeSync(pinned);
+      let out = "";
+      child.stdout!.on("data", chunk => { out += chunk; });
+      racer = new Promise(resolve => child.once("close", status => {
+        let swaps = -1; try { swaps = JSON.parse(out).swaps; } catch { /* reported as -1 */ }
+        resolve({ swaps, status });
+      }));
+    } else if (req.race === "descendant") {
       // The runner moves one subtree out of the clone and plants a symlink to an outside directory in its place.
       runnerSh('mv /proc/self/fd/3/nested "$1/moved-out" && ln -s "$2" /proc/self/fd/3/nested', req.elsewhere, req.outside);
     }
@@ -139,7 +168,13 @@ async function retireOp(req: { root: string; parentName: string; cache: string; 
     parentIno: String(st(parent)?.ino ?? 1n), cloneIno: String(st(clone)?.ino ?? 1n),
     deadline: Date.now() + 120_000, maxEntries: 2_000_000, maxDepth: 256, signal: new AbortController().signal,
     live: () => undefined,
-    beforeEffect: async () => undefined,
+    // With a bound bare, the real `removing` transition (config write plus the production syncs) runs before the helper spawns.
+    beforeEffect: async () => {
+      if (!req.mark) return;
+      const { bare, uuid, settledRaw } = req.mark;
+      await git.withRetireScratchBare(bare, { signal: new AbortController().signal, deadline: Date.now() + 60_000 },
+        (locked: any) => locked.markRemoving(uuid, settledRaw));
+    },
   };
   try {
     if (req.probe) {
@@ -169,10 +204,34 @@ async function retireOp(req: { root: string; parentName: string; cache: string; 
     }
     let result;
     try { result = await git.discardRetireScratchParent(input); } finally { discarded = true; }
-    return { result, spawns, pending: scope.pendingMutations, stopped: scope.stopped(), unsettled: [...git.unsettledDeletes.keys()] };
+    const raced = racer === undefined ? undefined : await Promise.race([racer,
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("racer did not finish")), 30_000).unref())]);
+    return { raced, result, spawns, pending: scope.pendingMutations, stopped: scope.stopped(), unsettled: [...git.unsettledDeletes.keys()] };
   } finally {
     try { if (!scope.stopped() && scope.pendingMutations === 0) scope.finish(); } catch { /* reported by the next op */ }
   }
+}
+// Creates a bare repository as this (worker) uid and writes one canonical settled binding for the parent with git config.
+async function retireBind(req: { cache: string; bare: string; uuid: string; binding: object }) {
+  const { retireBindingKey, retireBindingValue } = await import("../../agent/src/git.js");
+  fs.mkdirSync(req.cache, { recursive: true });
+  const git = (...args: string[]) => execFileSync("git", args, { encoding: "utf8", env: { PATH: "/usr/bin:/bin", HOME: os.tmpdir() } });
+  git("init", "--bare", "--quiet", req.bare);
+  const value = retireBindingValue(req.binding as any);
+  git("-C", req.bare, "config", "--local", retireBindingKey(req.uuid), value);
+  return value;
+}
+// The successor's view: a fresh GitCache reads the bare back and evaluates the binding with the exported pure decision.
+async function retireEval(req: { cache: string; bare: string; uuid: string; runnerRoot: string }) {
+  const { GitCache, evaluateRetireBinding } = await import("../../agent/src/git.js");
+  const logger: any = { debug() {}, info() {}, warn() {}, error() {}, addSecret() {}, removeSecret() {},
+    redactDiagnostic: (text: string) => text, child() { return logger; } };
+  const git: any = new GitCache(req.cache, logger);
+  const read = await git.readRetireBindings(req.bare);
+  const evidence = await git.withRetireScratchBare(req.bare, { signal: new AbortController().signal, deadline: Date.now() + 60_000 },
+    (locked: any) => locked.evidence());
+  const exam = evaluateRetireBinding({ evidence, uuid: req.uuid, runnerRoot: req.runnerRoot });
+  return { read, exam };
 }
 console.log(JSON.stringify({ ready: true, pid: process.pid, uid: process.getuid!(),
   actualFilesystem: Number(fs.statfsSync(root).type), classificationOnly: "ext4" }));
@@ -268,6 +327,8 @@ for await (const line of createInterface({ input: process.stdin })) {
           result = "launched";
         } else result = await retireOp(request);
         break;
+      case "retire-bind": result = await retireBind(request); break;
+      case "retire-eval": result = await retireEval(request); break;
       default: throw new Error("unknown request");
     }
     console.log(JSON.stringify({ result }));

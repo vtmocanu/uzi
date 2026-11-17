@@ -24,7 +24,8 @@ const epochLeaves = [
   'pod epoch real retire scratch: a runner-cmd directory the runner can list but not unlink from survives byte-identical as residue',
   'pod epoch real retire scratch: a clone swapped around the helper run is never followed or removed and a descendant swapped before the helper is unlinked, never followed',
   'pod epoch real retire scratch: the helper child sees only the clone pin at fd 3 and the EX lock at fd 4 and cannot reopen the worker-private parent',
-  'pod epoch real retire scratch: a worker killed while the helper runs leaves the helper holding EX until it exits',
+  'pod epoch real retire scratch: a worker killed mid-helper leaves the binding at removing, so a successor keeps the parent and removes nothing',
+  'pod epoch real retire scratch: a runner-uid racer swapping directories for outward symlinks while the helper walks a large tree never causes a deletion outside the clone',
   'pod epoch real retire scratch: another uid owning the root or the parent is refused with nothing launched',
 ];
 // Issue #3907: the one lane whose container leaves /nix unmasked (a labelled named volume), so the

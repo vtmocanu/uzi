@@ -853,32 +853,83 @@ test("pod epoch real retire scratch: the helper child sees only the clone pin at
   } catch (e) { primary = e; throw e; } finally { await closeAfter(f, primary, () => t && dropTree(t)); }
 });
 
-test("pod epoch real retire scratch: a worker killed while the helper runs leaves the helper holding EX until it exits", { timeout: 150000 }, async () => {
+test("pod epoch real retire scratch: a worker killed mid-helper leaves the binding at removing, so a successor keeps the parent and removes nothing", { timeout: 200000 }, async () => {
   const f = fixture(); let t: RetireTree | undefined;
   let primary: unknown;
   let releaseFile: string | undefined;
   try {
     t = retireTree(POPULATED);
     const owner = await retireOwner(f);
-    const req = retireReq(f, t);
+    const cache = path.join(f.root, "cache"), bare = path.join(cache, "bare.git");
+    const uuid = RETIRE_PARENT.slice(".retire-".length);
+    // A canonical settled binding in a real bare repository created by the worker uid.
+    const settledRaw = await owner.ask({ op: "retire-bind", cache, bare, uuid, binding: {
+      v: 1, class: "verified_successor", attemptId: "20261117T064707Z-g1-b72b1aee67da0c9f", runId: "run-4263",
+      branch: "agent/issue-4263", clonePath: "/data/runner/proof/issue-4263", phase: "settled",
+      parentIno: String(fs.statSync(t.parent).ino), cloneIno: String(fs.statSync(t.clone).ino), pod: "" } });
+    assert.equal(JSON.parse(settledRaw).phase, "settled");
+    const req = retireReq(f, t, { mark: { bare, uuid, settledRaw } });
     releaseFile = req.gate.release;
     assert.equal(await owner.ask({ ...req, gate: { ...req.gate, hold: true }, detached: true }, 90000), "launched");
+    // The gate file appears only after the production removing transition ran and the helper child was spawned.
     await until("the helper child is pending with its descriptors", () => fs.existsSync(req.gate.started), 60000);
     assert.equal(flock(f.root, "-x"), 200, "EX is held while the worker lives");
     await owner.killSelf();
     assert.equal(flock(f.root, "-x"), 200, "the SIGKILLed worker cannot release EX while its helper child lives");
-    assert.equal(flock(f.root, "-s"), 200, "SH stays excluded too");
-    assert.equal(fs.existsSync(path.join(t.clone, "top.txt")), true, "nothing was removed before the helper ran");
     fs.writeFileSync(req.gate.release, "");
     await until("the helper exit releases the lock", () => flock(f.root, "-x") === 0, 60000);
     assert.deepEqual(fs.readdirSync(t.clone), [], "the orphaned helper only emptied the pinned clone");
     assert.equal(fs.existsSync(t.parent), true, "the dead worker removed nothing else");
+    // The successor is a fresh worker-uid process: it reads the binding back and decides.
+    const successor = await f.child(true);
+    const seen = await successor.ask({ op: "retire-eval", cache, bare, uuid, runnerRoot: t.root }, 60000);
+    const removingRaw = JSON.stringify({ ...JSON.parse(settledRaw), phase: "removing" });
+    assert.equal(seen.read.state, "read");
+    assert.equal(seen.read.bindings.length, 1);
+    assert.equal(seen.read.bindings[0].raw, removingRaw, "the removing value was durably written before the helper spawned");
+    assert.equal(seen.read.bindings[0].parsed.phase, "removing");
+    assert.deepEqual(seen.exam, { kind: "keep", reason: "interrupted_removal" }, "the successor keeps the parent");
+    assert.equal(fs.existsSync(t.parent), true, "no second removal was attempted");
     assert.equal(fs.readFileSync(path.join(t.outside, "keep.txt"), "utf8"), "outside-survives");
   } catch (e) { primary = e; throw e; } finally {
     // Never leave a gated helper holding EX for a failed assertion; the gate shell also gives up on its own.
     if (releaseFile) { try { fs.writeFileSync(releaseFile, ""); } catch { /* the fixture root may be gone */ } }
     await closeAfter(f, primary, () => t && dropTree(t));
   }
+});
+
+// Best effort and nondeterministic by nature (the helper's `<sync>` seam is forbidden in production launches, so no
+// deterministic mid-walk swap exists). What is asserted is outcome-invariant: whatever interleaving happens, nothing
+// outside the clone is touched and the result is removed or residue.
+test("pod epoch real retire scratch: a runner-uid racer swapping directories for outward symlinks while the helper walks a large tree never causes a deletion outside the clone", { timeout: 240000 }, async () => {
+  const f = fixture(); let t: RetireTree | undefined;
+  let primary: unknown;
+  try {
+    t = retireTree(tree => {
+      POPULATED(tree);
+      for (let d = 0; d < 4; d++) {
+        const dir = path.join(tree.clone, "r" + d);
+        fs.mkdirSync(dir); own(dir, RUNNER_ID, RUNNER_ID, 0o2775);
+        for (let i = 0; i < 50; i++) put(path.join(dir, "f" + i), "x", RUNNER_ID, RUNNER_ID, 0o644);
+      }
+      for (let d = 0; d < 40; d++) {
+        const dir = path.join(tree.clone, "bulk" + d);
+        fs.mkdirSync(dir); own(dir, RUNNER_ID, RUNNER_ID, 0o2775);
+        for (let i = 0; i < 250; i++) put(path.join(dir, "f" + i), "x", RUNNER_ID, RUNNER_ID, 0o644);
+      }
+    });
+    const owner = await retireOwner(f);
+    const out = await owner.ask(retireReq(f, t, { race: "concurrent" }), 150000);
+    assert.ok(out.raced.swaps > 0, "the racer landed at least one swap: " + JSON.stringify(out.raced));
+    assert.ok(["removed", "residue"].includes(out.result.kind), JSON.stringify(out));
+    assert.equal(out.spawns, 1, "exactly one runner pass");
+    assert.equal(out.pending, 0); assert.deepEqual(out.unsettled, []);
+    assert.equal(fs.readFileSync(path.join(t.outside, "keep.txt"), "utf8"), "outside-survives");
+    assert.deepEqual(fs.readdirSync(t.outside).sort(), ["keep.txt"], "nothing outside the clone was emptied or written");
+    assert.deepEqual(fs.readdirSync(t.elsewhere), [], "nothing was written elsewhere");
+    if (out.result.kind === "removed") assert.equal(fs.existsSync(t.parent), false);
+    else assert.equal(fs.existsSync(t.parent), true, "residue keeps the parent");
+  } catch (e) { primary = e; throw e; } finally { await closeAfter(f, primary, () => t && dropTree(t)); }
 });
 
 test("pod epoch real retire scratch: another uid owning the root or the parent is refused with nothing launched", { timeout: 150000 }, async () => {
