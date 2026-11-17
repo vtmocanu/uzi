@@ -3567,8 +3567,9 @@ export type RetireScratchDiscardResult =
   | { kind: "refused"; reason: string }
   /**
    * The tree (or part of it) is kept; the binding must stay. `stderrBytes` is a bounded length, never content.
-   * Residue after the clone `rmdir` (`rmdir_parent_failed`, `parent_unverified`, `parent_still_linked`, `fsync_failed`)
-   * is permanent: the clone is already gone, so the interrupted-removal rule keeps the binding and never retries it.
+   * Residue after the clone `rmdir` (for example `rmdir_parent_failed`, `parent_unverified`, `parent_still_linked`,
+   * `parent_identity_changed`, `removal_error`, `fsync_failed`; not exhaustive) is permanent: the clone is already gone,
+   * so the M4 caller keeps the binding at `removing` permanently (owner decision) and never retries it.
    * The parent is removed by name, so a rename-and-replace of that name between the final identity check and the
    * `rmdir` can remove only an EMPTY directory planted there (`rmdir` never removes content); it is then reported as
    * `parent_unverified`, never `removed`, because the pinned parent still has links. The root is a sticky, worker-owned
@@ -4853,6 +4854,8 @@ export class GitCache {
       } catch { return refused("not_live"); }
       const self = BigInt(process.getuid?.() ?? -1);
       // The root must be worker-owned and sticky: only then can no other uid rename or unlink the parent's name.
+      // The `rst.uid !== self` half of this check is exercised only by the root/real worker-UID lane (M6): an
+      // unprivileged test cannot create a root owned by another uid.
       try {
         const rst = await fs.stat(`${procFd}${input.rootPin}`, { bigint: true });
         if (!rst.isDirectory() || rst.uid !== self || (rst.mode & 0o1000n) === 0n) return refused("root_posture");
@@ -4875,7 +4878,9 @@ export class GitCache {
         const cst = await clonePin.stat({ bigint: true });
         if (!cst.isDirectory()) return refused("not_directory");
         if (cst.ino !== cloneIno || cst.dev !== rootDev) return refused("clone_identity_changed");
-        // Both pins must sit on the caller's mount: an unreadable fdinfo counts as a mismatch.
+        // Both pins must sit on the caller's mount: an unreadable fdinfo counts as a mismatch. A clone on a different
+        // mount_id than the root (a same-device bind mount) is exercised only by the root/real worker-UID lane (M6): an
+        // unprivileged test cannot create one.
         const mntId = async (fd: number): Promise<string | undefined> => {
           try {
             const ids = (await fs.readFile(`/proc/self/fdinfo/${fd}`, "utf8")).split("\n").filter(line => line.startsWith("mnt_id:"));

@@ -482,6 +482,37 @@ describe("GitCache.discardRetireScratchParent", { skip: !fs.existsSync("/proc/se
     assert.equal(fs.readFileSync(path.join(outside, "keep"), "utf8"), "k");
   });
 
+  it("an unexpected throw inside the parent/clone pin preflight is preflight_failed with the tree intact", async () => {
+    const t = await retireFixture();
+    const before = fs.readdirSync(t.parent).sort();
+    const real = fsp.opendir;
+    // The directory listing of the pinned parent fails (as an I/O error would); nothing else is touched.
+    fsp.opendir = (async () => { throw Object.assign(new Error("injected"), { code: "EIO" }); }) as unknown as typeof fsp.opendir;
+    let result;
+    try { result = await t.git.discardRetireScratchParent(t.input); } finally { fsp.opendir = real; }
+    assert.deepEqual(result, { kind: "refused", reason: "preflight_failed" });
+    assert.equal(t.calls.length, 0);
+    assert.equal(t.f.pending(), 0);
+    assert.deepEqual(fs.readdirSync(t.parent).sort(), before);
+    assert.ok(exists(path.join(t.clone, "top.txt")));
+    assert.equal(t.internal.unsettledDeletes.size, 0);
+  });
+
+  it("an unreadable /proc/self/fdinfo is mount_changed (fail closed), never accepted", async () => {
+    const t = await retireFixture();
+    const real = fsp.readFile;
+    fsp.readFile = (async (...args: Parameters<typeof fsp.readFile>) => {
+      if (typeof args[0] === "string" && args[0].startsWith("/proc/self/fdinfo/")) throw Object.assign(new Error("injected"), { code: "EACCES" });
+      return real(...args);
+    }) as unknown as typeof fsp.readFile;
+    let result;
+    try { result = await t.git.discardRetireScratchParent(t.input); } finally { fsp.readFile = real; }
+    assert.deepEqual(result, { kind: "refused", reason: "mount_changed" });
+    assert.equal(t.calls.length, 0);
+    assert.ok(exists(path.join(t.clone, "top.txt")));
+    assert.equal(t.internal.unsettledDeletes.size, 0);
+  });
+
   it("refuses with nothing touched when the uid split is inactive", async () => {
     const t = await retireFixture();
     delete process.env.UZI_UID_SPLIT;
