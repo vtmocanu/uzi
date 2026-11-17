@@ -106,6 +106,8 @@ export interface SdkEnv {
  *                   Set as GOTMPDIR AFTER the toolEnv fold and the Go concurrency env, so
  *                   a provisioned GOTMPDIR cannot override it. Undefined ⇒ no key from
  *                   this parameter (a provisioned GOTMPDIR behaves as before).
+ * @param runTmpdir  issue #4420: the run-owned scratch leaf (`RunContext.runTmpdir`). When set it
+ *                   is the TMPDIR instead of the shared runner TMPDIR; undefined ⇒ unchanged.
  */
 export function buildSdkEnv(
   oauthToken: string,
@@ -114,6 +116,7 @@ export function buildSdkEnv(
   dockerHost?: string,
   attempt?: SdkAttemptEnv,
   goWorkDir?: string,
+  runTmpdir?: string,
 ): SdkEnv {
   const env: SdkEnv = {
     CLAUDE_CODE_OAUTH_TOKEN: oauthToken,
@@ -148,7 +151,7 @@ export function buildSdkEnv(
     AGENT_BROWSER_ARGS: "--no-sandbox,--disable-dev-shm-usage",
   };
   // 5-bis: the agent's scratch on the runner's private 0700 TMPDIR under the split.
-  const tmp = runnerTmpdir();
+  const tmp = runTmpdir ?? runnerTmpdir();
   if (tmp) env.TMPDIR = tmp;
   if (process.env.UZI_SQLC_DIR) env.UZI_SQLC_DIR = process.env.UZI_SQLC_DIR;
   // Fold in the provisioned tool env. Only allowlisted keys reach here; PATH (if
@@ -224,6 +227,7 @@ export function buildCheckEnv(
   homeDir: string,
   toolEnv?: Record<string, string>,
   goWorkDir?: string,
+  runTmpdir?: string,
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
     // The RUNNER PATH (PRD #51 M4): the provisioned toolchain PATH when present, else
@@ -237,7 +241,7 @@ export function buildCheckEnv(
     GIT_TERMINAL_PROMPT: "0",
   };
   // 5-bis: check scratch on the runner's private 0700 TMPDIR under the split.
-  const tmp = runnerTmpdir(source);
+  const tmp = runTmpdir ?? runnerTmpdir(source);
   if (tmp) env.TMPDIR = tmp;
   if (source.UZI_SQLC_DIR) env.UZI_SQLC_DIR = source.UZI_SQLC_DIR;
   // TLS trust + locale so nix-provided toolchains and `npm ci` over HTTPS work. Prefer

@@ -278,3 +278,23 @@ describe("Go concurrency defaults (issue #3382)", () => {
     assert.deepEqual({ ...withDir, GOTMPDIR: undefined }, { ...without, GOTMPDIR: undefined });
   });
 });
+
+describe("run-owned TMPDIR (issue #4420)", () => {
+  const leaf = "/data/runner/.tmp/run-123e4567-e89b-42d3-a456-426614174000";
+
+  it("buildSdkEnv uses the run leaf over the runner TMPDIR, and is unchanged without one", () => {
+    process.env.UZI_RUNNER_TMPDIR = "/data/runner/.tmp/uzi-runner";
+    try {
+      assert.strictEqual(buildSdkEnv(FAKE_OAUTH, HOME_DIR, {}, undefined, undefined, undefined, leaf).TMPDIR, leaf);
+      assert.strictEqual(buildSdkEnv(FAKE_OAUTH, HOME_DIR).TMPDIR, "/data/runner/.tmp/uzi-runner");
+    } finally {
+      delete process.env.UZI_RUNNER_TMPDIR;
+    }
+  });
+
+  it("buildCheckEnv uses the run leaf over the source TMPDIR, and is unchanged without one", () => {
+    const source = { PATH: "/usr/bin", TMPDIR: "/shared/tmp" };
+    assert.strictEqual(buildCheckEnv(source, HOME_DIR, undefined, undefined, leaf).TMPDIR, leaf);
+    assert.strictEqual(buildCheckEnv(source, HOME_DIR).TMPDIR, "/shared/tmp");
+  });
+});

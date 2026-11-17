@@ -2087,6 +2087,56 @@ export async function censusScratchRoot(
 }
 
 /**
+ * Issue #4420: create-or-adopt one run-owned scratch leaf directly under the scratch root, as
+ * `node -e <script> <root> <rootExpect> <leaf> <ownerUid>`. It re-pins `<root>` from `/` component by
+ * component ({@link PINNED_PRELUDE}; a missing component exits 2, a symlink or non-directory 3, anything
+ * else 7) and exits 3 unless the root's dev:ino equals `<rootExpect>`. `<leaf>` must match the run leaf
+ * grammar (`run-<lowercase uuid>`, exit 6 otherwise). It then `mkdir`s `<leaf>` (mode 0700) relative to
+ * the pinned root descriptor (EEXIST: an existing leaf; other errors exit 8), opens it `O_NOFOLLOW |
+ * O_DIRECTORY` through the same descriptor (exit 9), and requires a directory owned by `<ownerUid>`
+ * (exit 10). A leaf this call created is `fchmod`ed to 0700 on that descriptor; an existing leaf is
+ * never chmodded. The final mode must be exactly 0700 (exit 11). The only stdout is the receipt
+ * `UZI-RUN-TMP created|reused <dev>:<ino>` plus a newline. No chown, no removal, no recursion.
+ */
+export const RUN_TMPDIR_SCRIPT = `${PINNED_PRELUDE}
+const [rootArg, expect, leaf, uidArg] = process.argv.slice(1);
+const owner = Number(uidArg);
+if (!rootArg || !rootArg.startsWith("/") || !expect || !/^run-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(leaf || "") ||
+    !Number.isSafeInteger(owner) || owner < 0) process.exit(6);
+const parts = rootArg.split("/").slice(1);
+if (parts.length === 0 || parts.some((x) => x === "" || x === "." || x === "..")) process.exit(6);
+let rootFd;
+try {
+  rootFd = fs.openSync("/", PIN);
+  for (const part of parts) { const next = fs.openSync(at(rootFd, part), PIN); fs.closeSync(rootFd); rootFd = next; }
+} catch (e) {
+  process.exit(e.code === "ENOENT" ? 2 : e.code === "ELOOP" || e.code === "ENOTDIR" ? 3 : 7);
+}
+const rst = fs.fstatSync(rootFd, { bigint: true });
+if (rst.dev + ":" + rst.ino !== expect) process.exit(3);
+const leafPath = at(rootFd, leaf);
+let fresh = false;
+try { fs.mkdirSync(leafPath, 0o700); fresh = true; } catch (e) { if (e.code !== "EEXIST") process.exit(8); }
+let fd;
+try { fd = fs.openSync(leafPath, C.O_RDONLY | C.O_DIRECTORY | C.O_NOFOLLOW); } catch { process.exit(9); }
+let st = fs.fstatSync(fd, { bigint: true });
+if (!st.isDirectory() || Number(st.uid) !== owner) process.exit(10);
+if (fresh) { fs.fchmodSync(fd, 0o700); st = fs.fstatSync(fd, { bigint: true }); }
+if ((Number(st.mode) & 0o7777) !== 0o700) process.exit(11);
+process.stdout.write("UZI-RUN-TMP " + (fresh ? "created" : "reused") + " " + st.dev + ":" + st.ino + "\\n");
+`;
+
+/** Issue #4420: run {@link RUN_TMPDIR_SCRIPT} as the runner uid (the only uid that can traverse a 0700
+ * split root), joined on timeout and killed through the matching group killer under the uid split.
+ * `wrap` is a test seam; production passes none. */
+export async function runTmpdirHelper(
+  root: string, rootExpect: string, leaf: string, ownerUid: number, timeoutMs: number, wrap: CommandWrapper = runnerCommand,
+): Promise<{ code: number; stdout: string }> {
+  return runAgentHelper(wrap, RUN_TMPDIR_SCRIPT, [root, rootExpect, leaf, String(ownerUid)],
+    timeoutMs, "", { joinOnTimeout: true, killAsHelperUid: helperUidKillerFor(wrap) });
+}
+
+/**
  * The helper's `H` summary: exactly one `H\t<json object>` line, and it is the LAST line. Anything
  * else (none, two, one followed by more output, JSON that is not an object) is undefined: the pass
  * is then a failed pass, never a throw that drops what the caller already accounted for.

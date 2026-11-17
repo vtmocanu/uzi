@@ -203,6 +203,7 @@ import {
   type TerminalOutboxDeps,
 } from "./terminal-resolve.js";
 import { rmTeardownTree, type TeardownTestDeps } from "./rmtree.js";
+import { prepareRunTmpdir } from "./run-tmpdir.js";
 import { prepareManagedGoWork, removeGoWorkLeaves, type GoWorkFsOps } from "./go-work.js";
 import { uidSplitActive } from "./runner-uid.js";
 import { dropRunCaches } from "./run-caches.js";
@@ -2893,6 +2894,9 @@ interface RunFlight {
   /** Issue #3870: this claim's managed Go work leaf (`<runHome>/.uzi-go-work/g<gen>`), set in
    *  phasePreflightHandoff for a Claude flight only; undefined when none was prepared. */
   managedGoWorkDir?: string;
+  /** Issue #4420: this flight's run-owned scratch leaf (`<scratch root>/run-<runId>`), set beside
+   *  managedGoWorkDir for a Claude flight only; undefined when none was prepared. */
+  runTmpdir?: string;
   readonly runScopedSecrets: string[];
   readonly runLog: Logger;
   /** Issue #4201: the ONE flight-scoped secret set every redaction sink reads at use time (the batcher's
@@ -11615,6 +11619,7 @@ export class RunRunner {
         runHome ?? os.tmpdir(),
         result.toolEnv,
         runHome ? flight.managedGoWorkDir : undefined,
+        flight.runTmpdir,
       );
       // Issue #1830: the governor's in-place drop keeps `.npm/_cacache` while this install runs.
       flight.jsDepsInstalling = true;
@@ -16927,9 +16932,23 @@ export class RunRunner {
         if ("dir" in prepared) flight.managedGoWorkDir = prepared.dir;
       }
     }
+    // Issue #4420: the run-owned TMPDIR leaf. Same Claude-only gate as above; any failure launches with
+    // today's shared TMPDIR and logs a fixed reason token only.
+    if (!flight.executor.safety && flight.executor.sandboxesCommands !== true && !claim.secrets.codex &&
+      flight.runHome && process.platform === "linux") {
+      const prepared = await prepareRunTmpdir(runId);
+      if ("dir" in prepared) flight.runTmpdir = prepared.dir;
+      else {
+        runLog.warn("run TMPDIR unavailable; launching with the shared TMPDIR", {
+          reason: prepared.reason,
+          generation: Number.isFinite(flight.claimGeneration) ? flight.claimGeneration : null,
+        });
+      }
+    }
     const ctx: RunContext = {
       semanticPlanning,
       managedGoWorkDir: flight.managedGoWorkDir,
+      runTmpdir: flight.runTmpdir,
       ...(claim.kind === "prompt" && claim.config?.ci_config_guard === true && claim.ci_repair != null ? {
         prepareCIEvidence: async () => {
           if (!flight.runHome) throw new Error("CI evidence requires a prepared run home");
