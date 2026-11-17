@@ -102,6 +102,11 @@ func (f *fakeVaultStore) HasMasterVaultMaterial(_ context.Context, id uuid.UUID)
 			return true, nil
 		}
 	}
+	for _, e := range f.envs {
+		if e.userID == id && (e.sealedWith == store.SealedWithMaster || e.sealedWith == store.SealedWithMasterAAD) {
+			return true, nil
+		}
+	}
 	return false, nil
 }
 func (f *fakeVaultStore) GetVaultMaterialTotals(_ context.Context, id uuid.UUID) (store.GetVaultMaterialTotalsRow, error) {
@@ -113,6 +118,17 @@ func (f *fakeVaultStore) GetVaultMaterialTotals(_ context.Context, id uuid.UUID)
 			continue
 		}
 		n := int64(len(s.ciphertext))
+		t.MaterialRows++
+		t.CiphertextBytes += n
+		if n > t.MaxRowBytes {
+			t.MaxRowBytes = n
+		}
+	}
+	for _, e := range f.envs {
+		if e.userID != id {
+			continue
+		}
+		n := int64(len(e.ciphertext))
 		t.MaterialRows++
 		t.CiphertextBytes += n
 		if n > t.MaxRowBytes {
@@ -161,6 +177,56 @@ func (f *fakeVaultStore) ResealVaultSecretMaterial(_ context.Context, arg store.
 		}
 	}
 	return 0, nil
+}
+func (f *fakeVaultStore) LockVaultEnvMaterialBatch(_ context.Context, arg store.LockVaultEnvMaterialBatchParams) ([]store.LockVaultEnvMaterialBatchRow, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var matching []*fakeEnv
+	for _, e := range f.envs {
+		if e.userID == arg.UserID && (!arg.AfterID.Valid || bytes.Compare(e.id[:], arg.AfterID.Bytes[:]) > 0) {
+			matching = append(matching, e)
+		}
+	}
+	sort.Slice(matching, func(i, j int) bool { return bytes.Compare(matching[i].id[:], matching[j].id[:]) < 0 })
+	var out []store.LockVaultEnvMaterialBatchRow
+	var size int64
+	for _, e := range matching {
+		size += int64(len(e.ciphertext))
+		if int64(len(out)) == maxBatchRows || size > maxBatchBytes {
+			break
+		}
+		out = append(out, store.LockVaultEnvMaterialBatchRow{ID: e.id, RepoID: e.repoID, Name: e.name, Secret: e.secret,
+			Ciphertext: append([]byte(nil), e.ciphertext...), SealedWith: e.sealedWith})
+	}
+	return out, nil
+}
+func (f *fakeVaultStore) ResealVaultEnvMaterial(_ context.Context, arg store.ResealVaultEnvMaterialParams) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, e := range f.envs {
+		if e.id == arg.ID && e.userID == arg.UserID {
+			e.ciphertext = append([]byte(nil), arg.Ciphertext...)
+			e.sealedWith = arg.SealedWith
+			return 1, nil
+		}
+	}
+	return 0, nil
+}
+func (f *fakeVaultStore) DeleteAllRunEnvVarsForOwner(_ context.Context, id uuid.UUID) (int64, error) {
+	f.record("DeleteAllRunEnvVarsForOwner")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var kept []*fakeEnv
+	var n int64
+	for _, e := range f.envs {
+		if e.userID == id {
+			n++
+			continue
+		}
+		kept = append(kept, e)
+	}
+	f.envs = kept
+	return n, nil
 }
 func (f *fakeVaultStore) ClaimVaultLockNotice(_ context.Context, id uuid.UUID) (uuid.UUID, error) {
 	return id, nil

@@ -7,6 +7,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/runenv"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -40,6 +41,21 @@ func checkMaterialBudget(totals store.GetVaultMaterialTotalsRow) error {
 	return nil
 }
 
+// CheckMaterialHeadroom reports whether adding addRows rows and addBytes ciphertext
+// bytes to the owner's measured vault material (totals) stays inside the conversion
+// budget, so a writer can refuse a save that would make a later vault enable or
+// disable fail. It returns a *ConversionLimitError on overflow. Run environment
+// variables count live, retired and pending-deletion rows alike (PRD #4416).
+func CheckMaterialHeadroom(totals store.GetVaultMaterialTotalsRow, addRows, addBytes int64) error {
+	next := totals
+	next.MaterialRows += addRows
+	next.CiphertextBytes += addBytes
+	if addBytes > next.MaxRowBytes {
+		next.MaxRowBytes = addBytes
+	}
+	return checkMaterialBudget(next)
+}
+
 type conversionProgress struct {
 	rows, bytes int64
 	totals      store.GetVaultMaterialTotalsRow
@@ -62,7 +78,7 @@ func (p *conversionProgress) add(rows, size int64) error {
 
 // convertMaterial is called only with lifecycle/advisory/users/wrapper exclusion.
 // Accounts precede secret rows; all material is read locked and in ascending ID
-// order. Each returned collection is capped by SQL at 64 slots and 1 MiB.
+// order; run environment variables follow the secret rows. Each returned collection is capped by SQL at 64 slots and 1 MiB.
 func (v *Vault) convertMaterial(ctx context.Context, q Store, userID uuid.UUID, source store.GetUserVaultStateRow, targetMode string, targetEpoch int64, private *secretbox.Box, lazy bool) error {
 	totals, err := q.GetVaultMaterialTotals(ctx, userID)
 	if err != nil {
@@ -178,6 +194,54 @@ func (v *Vault) convertMaterial(ctx context.Context, q Store, userID uuid.UUID, 
 					return err
 				}
 				n, err := q.ResealVaultSecretMaterial(ctx, store.ResealVaultSecretMaterialParams{
+					ID: row.ID, UserID: userID, Ciphertext: ciphertext, SealedWith: marker,
+				})
+				if err != nil {
+					return err
+				}
+				if n != 1 {
+					return ErrInvalidState
+				}
+			}
+			cursor = pgtype.UUID{Bytes: row.ID, Valid: true}
+		}
+	}
+	// Run environment variables (PRD #4416): every version row, whatever its state.
+	// The sealing context is rebuilt from the row's own columns.
+	cursor = pgtype.UUID{}
+	for {
+		rows, err := q.LockVaultEnvMaterialBatch(ctx, store.LockVaultEnvMaterialBatchParams{UserID: userID, AfterID: cursor})
+		if err != nil {
+			return err
+		}
+		if len(rows) == 0 {
+			break
+		}
+		if int64(len(rows)) > maxBatchRows {
+			return ErrInvalidState
+		}
+		var batchBytes int64
+		for _, row := range rows {
+			size := int64(len(row.Ciphertext))
+			batchBytes += size
+			if batchBytes > maxBatchBytes {
+				return ErrInvalidState
+			}
+			if err := progress.add(1, size); err != nil {
+				return err
+			}
+			if !lazy || row.SealedWith != store.SealedWithDEK {
+				scope, repoID := runenv.ScopeUser, (*uuid.UUID)(nil)
+				if row.RepoID.Valid {
+					id := uuid.UUID(row.RepoID.Bytes)
+					scope, repoID = runenv.ScopeRepo, &id
+				}
+				kind := runenv.AADKind(scope, repoID, row.Secret, row.Name)
+				ciphertext, marker, err := v.convertCipher(userID, kind, row.Ciphertext, row.SealedWith, source, sourceBox, targetMode, targetEpoch, private, lazy)
+				if err != nil {
+					return err
+				}
+				n, err := q.ResealVaultEnvMaterial(ctx, store.ResealVaultEnvMaterialParams{
 					ID: row.ID, UserID: userID, Ciphertext: ciphertext, SealedWith: marker,
 				})
 				if err != nil {

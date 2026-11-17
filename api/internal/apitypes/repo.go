@@ -81,6 +81,10 @@ type RepoDTO struct {
 	// by repoToDTO/PatchRepo. Derived purely from the github_project_links row's
 	// last_error/last_synced_at — a pure store read, no forge call.
 	GithubProjectSync *RepoProjectSyncHealth `json:"github_project_sync,omitempty"`
+	// EnvVarCount is how many environment variables the repo has (PRD #4416): enabled
+	// and disabled, not those pending deletion. Set by the list handlers and the
+	// single-repo responses; never by repoToDTO.
+	EnvVarCount int `json:"env_var_count"`
 }
 
 // RepoProjectSyncHealth is the health readout the sync badge reads (PRD #576 M2). It
