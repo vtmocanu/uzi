@@ -234,6 +234,15 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **A hosted worker that was the canary of a finished image roll can be hibernated again (Refs #4384) ([#4393](https://github.com/vtmocanu/uzi/pull/4393)).**
   The controller retires the worker's completed roll history before sleep when no other worker in the namespace that is not positively attributed to a different owner carries roll metadata; otherwise it refuses with `roll_cohort_cleanup_pending` and can be retried.
 
+- **The chart rejects a non-map `web.httpRoute.timeouts` or `rootTimeouts` ([#4404](https://github.com/vtmocanu/uzi/pull/4404), [#4410](https://github.com/vtmocanu/uzi/pull/4410)).**
+  A falsy value such as `false`, `[]`, `""` or `0` now fails the render with its value path instead of silently rendering no timeouts; `{}` stays the off default.
+
+- **Auto credential selection prefers a pooled token over one whose last reading was exhausted ([#4405](https://github.com/vtmocanu/uzi/pull/4405), [#4407](https://github.com/vtmocanu/uzi/pull/4407)).**
+  When no pooled token has a fresh reading, the last-resort pick passes over a token whose last reading showed a usage window at 100% with its reset still ahead, unless every pooled token looks like that; the same order applies when a pick fails to open.
+
+- **Removing a worker no longer answers 404 when its hibernation cache cleanup settles mid-delete ([#4389](https://github.com/vtmocanu/uzi/pull/4389), [#4398](https://github.com/vtmocanu/uzi/pull/4398)).**
+  The delete retries once through the same guards; an absent worker is still not found, and a present worker that loses both attempts to a cleanup race gets a retryable 409.
+
 ### Added
 
 - **A preview of the new Overview at /overview/next, decisions first ([#3878](https://github.com/vtmocanu/uzi/pull/3878), [#3952](https://github.com/vtmocanu/uzi/pull/3952)).**
@@ -376,6 +385,9 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 - **Admins can see why an idle hosted worker is not hibernating and what the controller holds for a roll ([#4385](https://github.com/vtmocanu/uzi/pull/4385), [#4394](https://github.com/vtmocanu/uzi/pull/4394)).**
   `fleet.hibernation` names the controller's refusal, worker JSON carries `hibernation_blocked_reason`, `hibernation_blocked_since` and `hibernation_blocked_at` (the last recorded blocker, not cleared when the worker returns to work) and a display-only `roll_marker` for hosted workers, and the CLI and admin health card print them; the controller stays the authority.
+
+- **The chart's Gateway API HTTPRoute can give input-file uploads a longer gateway timeout ([#4401](https://github.com/vtmocanu/uzi/pull/4401), [#4403](https://github.com/vtmocanu/uzi/pull/4403)).**
+  Set `web.httpRoute.timeouts` (recommended `request` and `backendRequest` of 300s) on a gateway that supports HTTPRoute timeouts to add an `/api/v1/files` rule carrying them; empty, the route renders as before.
 
 ### Changed
 
