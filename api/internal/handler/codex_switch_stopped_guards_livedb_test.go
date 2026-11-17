@@ -101,6 +101,7 @@ func setupStoppedGuardsRoute(t *testing.T) (*applyRouteEnv, stoppedRouteWire) {
 		ready.ExpectedEpoch != 41 || ready.ClaimGeneration != e.gen || ready.RegisterNonce != nonce {
 		t.Fatalf("preflight must be ready with captured authority (status=%d)", rec.Code)
 	}
+	stoppedRouteExec(t, e, `UPDATE runs SET health='stalled',health_reason='fixture',health_since=now() WHERE id=$1`, e.run)
 	return e, stoppedRouteWire{"codex_switch_stopped", ready.ClaimGeneration, ready.RegisterNonce, ready.ExpectedEpoch}
 }
 
@@ -154,6 +155,9 @@ func assertStoppedSnapshot(t *testing.T, before, after map[string]json.RawMessag
 		if string(a["status"]) != `"paused"` || string(a["hold_reason"]) != "null" {
 			t.Fatal("stop did not store paused with NULL hold")
 		}
+		if string(a["health"]) != `"ok"` || string(a["health_reason"]) != "null" || string(a["health_since"]) != "null" {
+			t.Fatal("stop did not reset unhealthy state")
+		}
 		for _, key := range []string{"status", "status_since", "updated_at", "health", "health_reason", "health_since"} {
 			delete(b, key)
 			delete(a, key)
@@ -180,8 +184,9 @@ func reportStoppedRoute(t *testing.T, e *applyRouteEnv, w stoppedRouteWire, acce
 	}
 	rec := e.do(e.worker, http.MethodPost, "/api/worker/runs/"+e.run.String()+"/state", string(body))
 	var response struct {
-		Applied     bool   `json:"applied"`
-		Disposition string `json:"disposition"`
+		Applied     bool                       `json:"applied"`
+		Disposition string                     `json:"disposition"`
+		Run         map[string]json.RawMessage `json:"run"`
 	}
 	if err = json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
 		t.Fatalf("state status=%d invalid JSON", rec.Code)
@@ -189,6 +194,15 @@ func reportStoppedRoute(t *testing.T, e *applyRouteEnv, w stoppedRouteWire, acce
 	if accept {
 		if rec.Code != http.StatusOK || !response.Applied || response.Disposition != "codex_switch_stopped" {
 			t.Fatalf("stop acceptance mismatch: status=%d applied=%t", rec.Code, response.Applied)
+		}
+		var envelope map[string]json.RawMessage
+		if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil || len(envelope) != 3 || rec.Body.Len() > 16*1024 {
+			t.Fatal("stopped acknowledgement is not a bounded minimal envelope")
+		}
+		if len(response.Run) != 4 || string(response.Run["id"]) != fmt.Sprintf("%q", e.run.String()) ||
+			string(response.Run["status"]) != `"paused"` ||
+			string(response.Run["claim_generation"]) != fmt.Sprint(w.ClaimGeneration) || string(response.Run["hold_reason"]) != "null" {
+			t.Fatal("stopped acknowledgement does not identify the committed paused run")
 		}
 	} else if rec.Code != http.StatusConflict || response.Applied {
 		t.Fatalf("refusal mismatch: status=%d applied=%t", rec.Code, response.Applied)
