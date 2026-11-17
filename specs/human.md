@@ -318,6 +318,18 @@ Tracked as GitLab issue vtmocanu/uzi#23; PRD at `prds/done/23-web-ux-live-dashbo
   - Hiding empty columns is the DEFAULT for a board the user has not configured; an explicit "show empty" choice still wins. [AI-synced 2026-09-08 (#1208)]
 - Web-only; no API/schema/agent changes.
 - "Board columns should auto refresh" — already satisfied by existing polling; no change shipped.
+- Tab rows share one component and never show a vertical scrollbar.
+  - The active underline sits on the row's line.
+  - Rows that scroll sideways keep doing so; the page body never scrolls horizontally (#204).
+- Tab rows pin while the window scrolls on Settings, Admin, Runs, Schedules, Workers, Judge and Findings: at the top on lg+, directly under the mobile app bar below lg. The app bar's measured height is the one offset, which the Board toolbar also uses.
+  - The pinned block uses the page background and shows a bottom edge only while stuck, with no layout jump.
+  - Focus, Tab and anchor jumps never land under it.
+  - Keyboard focus inside it never scrolls the page.
+- Admin → Instance pins its section pills with the tabs as one block.
+  - The pills are one sideways-scrolling row with a fade on the overflowing edge.
+  - The pill for the section being read is highlighted with `aria-current="true"` and kept in view, tracked by IntersectionObserver with no scroll listener.
+- Judge pins its category chips with the bucket tabs on lg+, as one sideways-scrolling row with Clear always visible.
+  - Below lg the chips stay in the page flow, and the pinned block carries a one-line "Filtered: <labels>" marker with its own clear while a filter is active. (AI-synced 2026-11-17, #4419)
 
 ## Feature — Runs page IA (live console + past-runs archive)
 
