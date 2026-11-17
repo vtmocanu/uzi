@@ -589,6 +589,14 @@ it("legacy producers never re-check the confirmed tip on replay: unpinned, pinne
     f.git(["update-ref", "-d", `refs/remotes/origin/${f.branch}`]);
     f.git(["update-ref", "refs/remotes/origin/main", h.t]);
     await replayBytes(await packRows(f, { defaultBranch: "main", confirmedBlobTip: h.c }));
+    // Pinned zero-range envelope: default, confirmed tip and transport excludes all captured.
+    const zeroRange = await f.cache.resolveCheckpointRange(f.bare, f.branch,
+      { defaultBranch: "main", confirmedTip: h.c, captureConfirmedBlob: true });
+    assert.ok(zeroRange);
+    assert.equal(zeroRange.tipSha, zeroRange.excludeSha);
+    assert.ok(zeroRange.packExcludeShas !== undefined && zeroRange.defaultBlobSha !== undefined);
+    assert.equal(zeroRange.confirmedBlobSha, h.c);
+    await replayBytes(await packRows(f, {}, zeroRange));
   } finally { f.cleanup(); }
 });
 
