@@ -649,9 +649,10 @@ func (s *Service) hibernationOwnerTx(ctx context.Context, owner, candidate uuid.
 }
 
 // hibernationCommitUncertainError wraps an error from the attempt body or from Commit of a
-// hibernation transaction: the outcome of the write is unknown (a commit can succeed on the server
-// and still return an error), so the caller must not treat it as "nothing changed". It never
-// matches errHibernationOwnerBusy.
+// hibernation transaction. A Commit error is genuinely ambiguous (a commit can succeed on the
+// server and still return an error); a body error never commits (the transaction is rolled back)
+// but is classified uncertain too, conservatively, by the owner's decision (PRD D21). Either way
+// the surplus pass must not treat it as "nothing changed". It never matches errHibernationOwnerBusy.
 type hibernationCommitUncertainError struct{ err error }
 
 func (e *hibernationCommitUncertainError) Error() string {

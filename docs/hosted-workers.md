@@ -314,7 +314,7 @@ not lost. A worker that reported losing memory authority is not counted as ready
 worker advertising memory authority reporting (`worker_memory_pressure_v1` and
 `worker_memory_authority_claim_v1`) is counted as ready only after a recent `held`
 report from its current registration, within the worker heartbeat-staleness window.
-Until then, or after a loss, its memory authority is unknown and it is not counted.
+Until then its memory authority is unknown; after a loss it is lost. Neither is counted.
 
 **Which worker stays.** The kept worker is the most recently used ready one in the
 pool. A locked owner vault, the owner's custody-hold limit and an instance intake
