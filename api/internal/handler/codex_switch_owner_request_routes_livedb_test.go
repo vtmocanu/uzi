@@ -18,7 +18,7 @@ import (
 func TestWorkerCodexOwnerLiveRequestRouteLiveDB(t *testing.T) {
 	for _, status := range []string{"running", "awaiting_approval", "awaiting_input", "awaiting_followup"} {
 		t.Run(status, func(t *testing.T) {
-			e, w := setupStoppedGuardsRoute(t)
+			e, w := setupStoppedGuardsRouteWithSeed(t, true)
 			ctx := context.Background()
 			// Read A and B from the Codex binding and pending target. e.secret
 			// is the fixture's ordinary Anthropic override, not target B.

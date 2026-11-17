@@ -33,6 +33,11 @@ func stoppedRouteExec(t *testing.T, e *applyRouteEnv, sql string, args ...any) {
 
 func setupStoppedGuardsRoute(t *testing.T) (*applyRouteEnv, stoppedRouteWire) {
 	t.Helper()
+	return setupStoppedGuardsRouteWithSeed(t, false)
+}
+
+func setupStoppedGuardsRouteWithSeed(t *testing.T, seedPending bool) (*applyRouteEnv, stoppedRouteWire) {
+	t.Helper()
 	e := setupApplyRouteLiveDB(t)
 	ctx := context.Background()
 	q, svc := e.handler.q, e.handler.wsvc
@@ -83,7 +88,38 @@ func setupStoppedGuardsRoute(t *testing.T) (*applyRouteEnv, stoppedRouteWire) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.SetRunCredential(ctx, e.user, e.run, workersvc.BindModePinned, &target); err != nil {
+	if seedPending {
+		// Seed X independently of the owner request route under test. These
+		// queries preserve the pending-only writes and operation-ID trigger.
+		tx, err := e.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback(ctx)
+		var revision int64
+		if err := tx.QueryRow(ctx, `SELECT material_revision FROM codex_credential_state
+ WHERE user_secret_id=$1 AND user_id=$2`, target, e.user).Scan(&revision); err != nil {
+			t.Fatal(err)
+		}
+		fixtureQ := q.WithTx(tx)
+		generation := pgtype.Int8{Int64: e.gen, Valid: true}
+		n, err := fixtureQ.StampHeldCodexCredentialSwitch(ctx, store.StampHeldCodexCredentialSwitchParams{
+			ID: e.run, UserID: e.user, WorkerID: pgtype.UUID{Bytes: e.worker, Valid: true}, Generation: generation,
+		})
+		if err != nil || n != 1 {
+			t.Fatalf("seed pending switch stamp: rows=%d err=%v", n, err)
+		}
+		n, err = fixtureQ.SetPendingCodexSwitchTarget(ctx, store.SetPendingCodexSwitchTargetParams{
+			ID: e.run, UserID: e.user, SecretID: pgtype.UUID{Bytes: target, Valid: true}, Generation: generation,
+			AuthMode: "api_key", MaterialRevision: revision,
+		})
+		if err != nil || n != 1 {
+			t.Fatalf("seed pending switch target: rows=%d err=%v", n, err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+	} else if _, err := svc.SetRunCredential(ctx, e.user, e.run, workersvc.BindModePinned, &target); err != nil {
 		t.Fatal(err)
 	}
 	if err := e.pool.QueryRow(ctx, `SELECT credential_switch_op_id FROM runs WHERE id=$1`, e.run).Scan(&e.op); err != nil {
