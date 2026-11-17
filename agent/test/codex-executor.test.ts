@@ -33835,7 +33835,7 @@ describe("M2 actualRunner credential replacement", () => {
             actualAController = actualFlight.operationScope.controller;
             retainedAScope = acquireCodexOperationScope(client, claim.run_id, claim.claim_generation!,
               undefined, undefined, undefined, undefined, codexOperationAuthorityIdentity(oldClaim.capability));
-            assert.equal(retainedAScope.controller, actualAController, "nonowning A reference retains the actual Runner entry");
+            assert.ok(retainedAScope.controller === actualAController, "nonowning A reference retains the actual Runner entry");
           }
           if (publication === "gated" || injectedStage) {
             assert.ok(actualFlight, "capture the real run/generation/executor flight");
@@ -35159,11 +35159,11 @@ describe("M2 actualRunner credential replacement", () => {
             assert.equal(switchError, undefined);
             assert.equal(switchResult, "resumed_B");
             assert.ok(actualFlight?.operationScope, "actual Runner publishes B subscription scope");
-            assert.notEqual(actualFlight.operationScope.controller, actualAController,
+            assert.ok(actualFlight.operationScope.controller !== actualAController,
               "B uses a distinct controller while the nonowning A reference is retained");
             bLookupScope = acquireCodexOperationScope(client, claim.run_id, claim.claim_generation!,
               undefined, undefined, undefined, undefined, codexOperationAuthorityIdentity(next.capability));
-            assert.equal(bLookupScope.controller, actualFlight.operationScope.controller,
+            assert.ok(bLookupScope.controller === actualFlight.operationScope.controller,
               "replacement authority lookup finds the actual Runner B controller");
           }
           if (probeBInitialCredential) {
