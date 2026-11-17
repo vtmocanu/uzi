@@ -186,7 +186,7 @@ export function Schedules() {
     e.preventDefault();
     const target = TAB_ORDER[next];
     setTab(target);
-    tabRefs.current[target]?.focus();
+    tabRefs.current[target]?.focus({ preventScroll: true });
   };
 
   // schedules/catalog/repos are seeded here as fetcher side effects because all three
@@ -384,7 +384,7 @@ export function Schedules() {
       await api.deleteSchedule(s.id);
       await reload();
       if (fromList && neighbour) setPendingReveal({ id: neighbour.id, focus: true, afterSeq: 0 });
-      else if (fromList) tabRefs.current.schedules?.focus();
+      else if (fromList) tabRefs.current.schedules?.focus({ preventScroll: true });
     } catch (err) {
       setError(errorMessage(err, "Could not remove the schedule"));
     } finally {
@@ -420,7 +420,7 @@ export function Schedules() {
   const showJobInSchedules = (slug: string) => {
     setTab("schedules");
     applyFilter({ ...NO_FILTER, jobSlug: slug });
-    tabRefs.current.schedules?.focus();
+    tabRefs.current.schedules?.focus({ preventScroll: true });
   };
 
   // Closing the edit modal: a clone's modal hands focus to the cloned row (D12).
@@ -649,7 +649,7 @@ export function Schedules() {
       // the request is dropped instead of lingering to steal focus later.
       if (!row && schedules && loadedSeq >= pendingReveal.afterSeq) {
         setPendingReveal(null);
-        if (pendingReveal.focus && pendingReveal.fallbackFocus !== false) tabRefs.current.schedules?.focus();
+        if (pendingReveal.focus && pendingReveal.fallbackFocus !== false) tabRefs.current.schedules?.focus({ preventScroll: true });
       }
       return;
     }
@@ -732,7 +732,7 @@ export function Schedules() {
 
       {/* Two tabs (D1): the operational list, then the catalog of shipped jobs. */}
       <PinnedBlock>
-      <TabRow className="items-center" role="tablist" aria-label="Schedules">
+      <TabRow className="items-stretch" role="tablist" aria-label="Schedules">
         <button
           type="button"
           role="tab"

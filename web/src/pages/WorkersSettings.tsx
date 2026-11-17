@@ -356,7 +356,7 @@ export function WorkersSettings() {
     e.preventDefault();
     const target = TAB_ORDER[next];
     selectTab(target);
-    tabRefs.current[target]?.focus();
+    tabRefs.current[target]?.focus({ preventScroll: true });
   };
 
   // rebind points one worker at a named token, or clears the binding when the

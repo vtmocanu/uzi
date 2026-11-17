@@ -166,6 +166,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  document.documentElement.style.removeProperty("overflow-anchor");
   window.scrollTo(0, 0);
   localStorage.clear();
   vi.clearAllMocks();
@@ -248,12 +249,13 @@ const scenarios: Scenario[] = [
 
 const nextFrame = () => new Promise((r) => requestAnimationFrame(() => r(null)));
 
-async function mount(s: Scenario, width: number, height = 700) {
+async function mount(s: Scenario, width: number, height = 700, after?: ReactNode) {
   await page.viewport(width, height);
   render(
     <MemoryRouter initialEntries={[s.path]}>
       <AppShell>
         <Routes>{s.routes}</Routes>
+        {after}
       </AppShell>
     </MemoryRouter>,
   );
@@ -284,10 +286,16 @@ describe("tab rows do not grow a vertical scrollbar (#4419)", () => {
       it(`${s.name} at ${width}px: the row fits its box and the active tab sits on the line`, async () => {
         await mount(s, width);
         const row = rowOf(blockEl());
+        // Make the row's one non-tab control (Schedules' Pause all) taller than the tabs, as it
+        // is at some font sizes; the tabs must stretch to the row so the underline stays on the line.
+        const extra = screen.queryByRole("button", { name: /^Pause all/ });
+        if (extra) extra.style.minHeight = "48px";
+        await nextFrame();
         expect(row.scrollHeight, "scrollHeight").toBe(row.clientHeight);
         const active = row.querySelector<HTMLElement>('[aria-current="page"], [aria-selected="true"]')!;
         expect(active, "active tab").toBeTruthy();
-        expect(active.getBoundingClientRect().bottom).toBeCloseTo(row.getBoundingClientRect().bottom, 1);
+        // Exact: a taller control in the row (Schedules' Pause all) must not lift the underline.
+        expect(Math.abs(active.getBoundingClientRect().bottom - row.getBoundingClientRect().bottom)).toBeLessThanOrEqual(0.01);
       });
     }
   }
@@ -328,6 +336,85 @@ describe("page tab rows pin below the app bar (#4419)", () => {
       }
     });
   }
+});
+
+describe("stuck detection and the app-bar offset (#4419)", () => {
+  it("an instant jump from a partly visible block still reads as stuck (1440x420)", async () => {
+    await page.viewport(1440, 420);
+    render(
+      <MemoryRouter initialEntries={["/settings"]}>
+        <AppShell>
+          <Routes>
+            <Route
+              path="/settings/*"
+              element={
+                <>
+                  <div data-spacer="" />
+                  <SettingsShell description="Tall child">
+                    <Tall />
+                  </SettingsShell>
+                </>
+              }
+            />
+          </Routes>
+        </AppShell>
+      </MemoryRouter>,
+    );
+    await screen.findByRole("link", { name: "Appearance" });
+    const block = blockEl();
+    const spacer = document.querySelector<HTMLElement>("[data-spacer]")!;
+    // Straddle the viewport bottom: the block's top edge 20px above it.
+    spacer.style.height = "0px";
+    spacer.style.height = `${Math.max(0, 420 - 20 - block.getBoundingClientRect().top)}px`;
+    await nextFrame();
+    await nextFrame();
+    const top = block.getBoundingClientRect().top;
+    expect(top).toBeLessThan(420);
+    expect(top + block.getBoundingClientRect().height).toBeGreaterThan(420);
+    expect(block.dataset.stuck).toBe("false");
+    window.scrollTo({ top: 2000, behavior: "instant" });
+    await waitFor(() => expect(block.dataset.stuck).toBe("true"));
+    window.scrollTo({ top: 0, behavior: "instant" });
+    await waitFor(() => expect(block.dataset.stuck).toBe("false"));
+  });
+
+  it("follows the bar's real height when the bar mounts after sign-in (400px)", async () => {
+    // The shell renders the public layout while signed out, so the bar (and its observer)
+    // appear only after the auth value flips. Make the bar taller than the 53px default.
+    const style = document.createElement("style");
+    style.textContent = "div.frame.sticky { padding-top: 30px !important; }";
+    document.head.appendChild(style);
+    try {
+      await page.viewport(400, 700);
+      const user = vi.mocked(useAuth)();
+      vi.mocked(useAuth).mockReturnValue({ ...user, user: null });
+      const tree = (
+        <MemoryRouter initialEntries={["/settings"]}>
+          <AppShell>
+            <Routes>{scenarios[0].routes}</Routes>
+          </AppShell>
+        </MemoryRouter>
+      );
+      const view = render(tree);
+      await scenarios[0].ready();
+      expect(document.querySelector("div.frame.sticky")).toBeNull();
+      vi.mocked(useAuth).mockReturnValue(user);
+      view.rerender(tree);
+      await waitFor(() => expect(barEl()).toBeTruthy());
+      const bar = barEl();
+      expect(bar.getBoundingClientRect().height).toBeGreaterThan(60);
+      await waitFor(() =>
+        expect(document.documentElement.style.getPropertyValue("--app-bar-h")).toBe(`${bar.getBoundingClientRect().height}px`),
+      );
+      const block = blockEl();
+      await scrollDeep();
+      await waitFor(() => expect(block.dataset.stuck).toBe("true"));
+      expect(Math.abs(block.getBoundingClientRect().top - bar.getBoundingClientRect().bottom)).toBeLessThanOrEqual(0.5);
+    } finally {
+      style.remove();
+      document.documentElement.style.removeProperty("--app-bar-h");
+    }
+  });
 });
 
 describe("Board toolbar offset follows the app bar (#4419)", () => {
@@ -401,16 +488,26 @@ describe("pinned tablists keep their keyboard contract (#4419)", () => {
     ["Workers", 4, [/^Your workers/, /^Add a worker/]],
   ] as const) {
     it(`${name}: arrows, Home and End move the selection while pinned`, async () => {
-      await mount(scenarios[idx], 1440);
+      // Filler after the page keeps the document tall on every tab, so a scrollY change can
+      // only come from focus moving the window, not from a shorter panel clamping it.
+      // Chromium's scroll anchoring would also shift scrollY when a taller panel mounts above
+      // the filler, so switch it off for this test.
+      document.documentElement.style.overflowAnchor = "none";
+      await mount(scenarios[idx], 1440, 700, <div style={{ height: 6000 }} />);
       await scrollDeep();
       const tab = (re: RegExp) => screen.getByRole("tab", { name: re });
       tab(tabs[0]).focus({ preventScroll: true });
+      const y = window.scrollY;
       await userEvent.keyboard("{ArrowRight}");
       await waitFor(() => expect(tab(tabs[1]).getAttribute("aria-selected")).toBe("true"));
+      expect(document.activeElement).toBe(tab(tabs[1]));
+      expect(window.scrollY, "ArrowRight leaves the window put").toBe(y);
       await userEvent.keyboard("{Home}");
       await waitFor(() => expect(tab(tabs[0]).getAttribute("aria-selected")).toBe("true"));
+      expect(window.scrollY, "Home leaves the window put").toBe(y);
       await userEvent.keyboard("{End}");
       await waitFor(() => expect(tab(tabs[1]).getAttribute("aria-selected")).toBe("true"));
+      expect(window.scrollY, "End leaves the window put").toBe(y);
     });
   }
 

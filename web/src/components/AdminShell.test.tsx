@@ -16,15 +16,12 @@ vi.mock("../lib/api", async (importOriginal) => {
   return { ...actual, api: { getAdminHealth: vi.fn() } };
 });
 const mockApi = vi.mocked(api);
-const originalScrollIntoView = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "scrollIntoView");
 
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
   vi.useRealTimers();
   vi.restoreAllMocks();
-  if (originalScrollIntoView) Object.defineProperty(HTMLElement.prototype, "scrollIntoView", originalScrollIntoView);
-  else Reflect.deleteProperty(HTMLElement.prototype, "scrollIntoView");
 });
 
 async function renderShell(doc: HealthDoc) {

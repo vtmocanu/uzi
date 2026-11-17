@@ -70,28 +70,39 @@ let pinnedOwner: symbol | null = null;
 
 export function PinnedBlock({ className, children }: { className?: string; children: ReactNode }) {
   const ref = useRef<HTMLDivElement>(null);
+  const sentinelRef = useRef<HTMLDivElement>(null);
 
+  // Stuck detection observes a zero-size sentinel at the block's natural (static) top, not the
+  // block: a threshold on the block's own ratio misses an instant jump from a partially
+  // visible state. The sentinel leaves the root margin (shrunk by the sticky `top`) when the
+  // block's natural position scrolls above the pin line.
   useEffect(() => {
     const el = ref.current;
-    if (!el || typeof IntersectionObserver === "undefined" || !window.matchMedia) return;
+    const sentinel = sentinelRef.current;
+    if (!el || !sentinel || typeof IntersectionObserver === "undefined" || !window.matchMedia) return;
     const wide = window.matchMedia("(min-width: 1024px)");
     let io: IntersectionObserver | null = null;
     const build = () => {
       io?.disconnect();
       const top = parseFloat(getComputedStyle(el).top) || 0;
       io = new IntersectionObserver(
-        ([entry]) => {
-          const stuck = entry.intersectionRatio < 1 && entry.boundingClientRect.top <= top + 1;
+        (entries) => {
+          // Records queue in time order when the callback is delayed; the newest one is current.
+          const entry = entries[entries.length - 1];
+          const stuck = !entry.isIntersecting && entry.boundingClientRect.top < top;
           el.dataset.stuck = stuck ? "true" : "false";
         },
-        { root: null, threshold: [1], rootMargin: `-${top + 1}px 0px 0px 0px` },
+        { root: document, rootMargin: `-${top}px 0px 0px 0px` },
       );
-      io.observe(el);
+      io.observe(sentinel);
     };
     build();
     wide.addEventListener("change", build);
+    // AppShell fires this after it rewrites --app-bar-h (the sticky top just changed).
+    window.addEventListener("uzi:app-bar-h", build);
     return () => {
       wide.removeEventListener("change", build);
+      window.removeEventListener("uzi:app-bar-h", build);
       io?.disconnect();
     };
   }, []);
@@ -103,6 +114,8 @@ export function PinnedBlock({ className, children }: { className?: string; child
     const owner = Symbol("pinned-block");
     pinnedOwner = owner;
     const write = () => {
+      // Only the owner (the latest mounted block) writes; a stale block's resize is ignored.
+      if (pinnedOwner !== owner) return;
       root.style.setProperty("--pinned-h", `${el.getBoundingClientRect().height}px`);
       root.setAttribute("data-pinned-block", "");
     };
@@ -120,17 +133,20 @@ export function PinnedBlock({ className, children }: { className?: string; child
   }, []);
 
   return (
-    <div
-      ref={ref}
-      data-pinned-block-root=""
-      data-stuck="false"
-      className={cx(
-        "sticky top-[var(--app-bar-h)] z-[15] -mx-4 bg-ink px-4 sm:-mx-6 sm:px-6 lg:top-0",
-        "data-[stuck=true]:shadow-[0_1px_0_rgb(var(--edge))]",
-        className,
-      )}
-    >
-      {children}
-    </div>
+    <>
+      <div ref={sentinelRef} aria-hidden="true" className="pointer-events-none absolute h-0 w-0" />
+      <div
+        ref={ref}
+        data-pinned-block-root=""
+        data-stuck="false"
+        className={cx(
+          "sticky top-[var(--app-bar-h)] z-[15] -mx-4 bg-ink px-4 sm:-mx-6 sm:px-6 lg:top-0",
+          "data-[stuck=true]:shadow-[0_1px_0_rgb(var(--edge))]",
+          className,
+        )}
+      >
+        {children}
+      </div>
+    </>
   );
 }
