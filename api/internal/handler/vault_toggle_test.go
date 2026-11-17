@@ -83,10 +83,11 @@ func TestVaultTogglePasswordLifecycle(t *testing.T) {
 		t.Fatalf("disabled status=%+v epoch=%d pokes=%d", status, m.states[id].VaultEpoch, poker.count(id))
 	}
 	users, secrets := anthropicPoker.snapshot()
-	if len(users) != 3 || len(secrets) != 0 {
-		t.Fatalf("Anthropic usage pokes=%d secret pokes=%d want=3/0", len(users), len(secrets))
+	all := anthropicPoker.snapshotAll()
+	if len(all) != 3 || len(users) != 0 || len(secrets) != 0 {
+		t.Fatalf("Anthropic usage PokeUserAll=%d Poke=%d PokeSecret=%d want=3/0/0", len(all), len(users), len(secrets))
 	}
-	for _, owner := range users {
+	for _, owner := range all {
 		if owner != id {
 			t.Fatal("Anthropic usage wake targeted a different owner")
 		}
