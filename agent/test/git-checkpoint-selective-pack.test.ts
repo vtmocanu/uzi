@@ -355,6 +355,9 @@ const packBytes = async (s: PackedStream) => {
   assert.equal(await s.exited, 0);
   return Buffer.concat(chunks);
 };
+/** sha256 of the captured pack bytes: an ineligible C must change nothing, not merely the inventory. */
+const bytesHashOf = async (f: Fx, options: Record<string, unknown> = {}, range?: Parameters<GitCache["checkpointPack"]>[3]) =>
+  sha256(await packBytes(await packRows(f, options, range)));
 const rowsOfBytes = (f: Fx, bytes: Buffer, name: string) => {
   const file = path.join(f.root, name);
   fs.writeFileSync(file, bytes);
@@ -474,6 +477,8 @@ for (const control of ["equals candidate", "not an ancestor", "unresolvable", "m
       const confirmed = { "equals candidate": h.t, "not an ancestor": side,
         unresolvable: "e".repeat(40), malformed: "not-a-sha" }[control];
       const noC = await rowsOf(f);
+      assert.ok(parsePack(noC).blobs.includes(h.bx), "baseline carries X's unpublished blob");
+      assert.equal(await bytesHashOf(f, { confirmedBlobTip: confirmed }), await bytesHashOf(f));
       assert.deepEqual(await rowsOf(f, { confirmedBlobTip: confirmed }), noC);
     } finally { f.cleanup(); }
   });
@@ -483,8 +488,51 @@ it("confirmed tip equal to the floor is ineligible", async () => {
   const f = fixture();
   try {
     linear(f);
-    const noC = await rowsOf(f);
-    assert.deepEqual(await rowsOf(f, { confirmedBlobTip: f.floor }), noC);
+    assert.equal(await bytesHashOf(f, { confirmedBlobTip: f.floor }), await bytesHashOf(f));
+  } finally { f.cleanup(); }
+});
+
+it("overlay wrapper: eligibility is judged on the wrapper, and C below it omits blobs only", async () => {
+  const f = fixture();
+  try {
+    const wf = (blob: string) => f.git(["mktree"], `100644 blob ${blob}\tci.yml\n`);
+    const dotGithub = (blob: string) => f.git(["mktree"], `040000 tree ${wf(blob)}\tworkflows\n`);
+    const mk = (extra: [string, string][], wfBlob: string) => f.git(["mktree"],
+      [`100644 blob ${f.sharedBlob}\t${JSON.stringify(QUOTED)}\n`,
+        ...extra.map(([n, o]) => `100644 blob ${o}\t${JSON.stringify(n)}\n`),
+        `040000 tree ${dotGithub(wfBlob)}\t.github\n`].join(""));
+    const wf1 = f.blob("name: ci\n# v1\n"), wf2 = f.blob("name: ci\n# v2\n");
+    const bx = f.blob("only-in-x"), bc = f.blob("in-c"), bt = f.blob("new-in-t");
+    const d2 = f.commit(mk([], wf1), f.defaultSha, "d2");
+    f.git(["update-ref", "refs/remotes/origin/開発/custom", d2]);
+    // The default branch is ahead on .github/workflows: the branch is behind and an overlay is built.
+    const dm = f.commit(mk([], wf2), d2, "main advances its workflow");
+    const origin = path.join(f.root, "origin.git");
+    execFileSync("git", ["init", "--bare", origin], { stdio: "pipe" });
+    f.git(["remote", "add", "origin", origin]);
+    f.git(["push", "origin", `${dm}:refs/heads/main`]);
+    f.git(["update-ref", "refs/remotes/origin/main", dm]);
+    const x = f.commit(mk([["x", bx]], wf1), d2, "x");
+    const c = f.commit(mk([["x", bx], ["c", bc]], wf1), x, "c");
+    const t = f.commit(mk([["x", bx], ["c", bc], ["t", bt]], wf1), c, "t");
+    f.git(["update-ref", `refs/uzi-runner/${f.branch}`, t]);
+    const overlayPack = async (options: Record<string, unknown>) => {
+      const packed = await f.cache.checkpointPack(f.bare, f.branch, { defaultBranch: "main" }, undefined,
+        undefined, undefined, undefined, undefined, { defaultBranch: "開発/custom", ...options });
+      assert.ok(packed);
+      assert.notEqual(packed.tipOid, t, "the overlay wrapper is the candidate, not the raw tip");
+      assert.ok(f.git(["log", "-1", "--format=%s", packed.tipOid]).startsWith(OVERLAY_COMMIT_PREFIX));
+      assert.equal(isAncestor(f, c, packed.tipOid), true, "C is an ancestor of the wrapper");
+      return f.inventory(packed);
+    };
+    const noC = await overlayPack({});
+    const withC = await overlayPack({ confirmedBlobTip: c });
+    assertBlobOnlyOmission(withC, noC);
+    assert.ok(parsePack(noC).blobs.includes(bx) && parsePack(noC).blobs.includes(bc), "baseline carries C-reachable blobs");
+    const after = parsePack(withC).blobs;
+    assert.equal(after.includes(bc), false, "a C-reachable blob is omitted");
+    assert.equal(after.includes(bx), false);
+    assert.ok(after.includes(bt) && after.includes(wf2), "the wrapper's own workflow blob and T's new blob still ship");
   } finally { f.cleanup(); }
 });
 
@@ -522,7 +570,7 @@ it("confirmed tip equal to the floor adds no default-tree exclusion (byte-identi
     const h = advancedDefault(f);
     const noC = await rowsOf(f);
     assert.ok(parsePack(noC).blobs.includes(h.bd2));
-    assert.deepEqual(await rowsOf(f, { confirmedBlobTip: f.floor }), noC);
+    assert.equal(await bytesHashOf(f, { confirmedBlobTip: f.floor }), await bytesHashOf(f));
   } finally { f.cleanup(); }
 });
 
@@ -553,14 +601,16 @@ it("legacy producers ignore the confirmed tip: no captured default, and the zero
   try {
     const h = linear(f);
     const noDefault = await rowsOf(f, { defaultBranch: undefined });
-    assert.deepEqual(await rowsOf(f, { defaultBranch: undefined, confirmedBlobTip: h.c }), noDefault);
+    assert.equal(await bytesHashOf(f, { defaultBranch: undefined, confirmedBlobTip: h.c }),
+      await bytesHashOf(f, { defaultBranch: undefined }));
     assert.ok(parsePack(noDefault).blobs.includes(f.sharedBlob), "legacy producer keeps the shared blob");
 
     f.git(["update-ref", "-d", `refs/remotes/origin/${f.branch}`]);
     f.git(["update-ref", "refs/remotes/origin/main", h.t]);
     const zero = await rowsOf(f, { defaultBranch: "main" });
     assert.ok(zero.includes(`${h.t} commit`));
-    assert.deepEqual(await rowsOf(f, { defaultBranch: "main", confirmedBlobTip: h.c }), zero);
+    assert.equal(await bytesHashOf(f, { defaultBranch: "main", confirmedBlobTip: h.c }),
+      await bytesHashOf(f, { defaultBranch: "main" }));
   } finally { f.cleanup(); }
 });
 
