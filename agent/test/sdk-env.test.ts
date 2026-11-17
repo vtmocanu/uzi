@@ -283,12 +283,13 @@ describe("run-owned TMPDIR (issue #4420)", () => {
   const leaf = "/data/runner/.tmp/run-123e4567-e89b-42d3-a456-426614174000";
 
   it("buildSdkEnv uses the run leaf over the runner TMPDIR, and is unchanged without one", () => {
+    const prior = process.env.UZI_RUNNER_TMPDIR;
     process.env.UZI_RUNNER_TMPDIR = "/data/runner/.tmp/uzi-runner";
     try {
       assert.strictEqual(buildSdkEnv(FAKE_OAUTH, HOME_DIR, {}, undefined, undefined, undefined, leaf).TMPDIR, leaf);
       assert.strictEqual(buildSdkEnv(FAKE_OAUTH, HOME_DIR).TMPDIR, "/data/runner/.tmp/uzi-runner");
     } finally {
-      delete process.env.UZI_RUNNER_TMPDIR;
+      if (prior === undefined) delete process.env.UZI_RUNNER_TMPDIR; else process.env.UZI_RUNNER_TMPDIR = prior;
     }
   });
 

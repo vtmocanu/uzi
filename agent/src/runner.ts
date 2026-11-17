@@ -3447,6 +3447,8 @@ export interface RunnerOptions {
   teardownTestDeps?: TeardownTestDeps;
   /** Test-only: inject a syscall failure into the managed Go work dir creation (issue #3870). */
   goWorkTestDeps?: { fsOps?: GoWorkFsOps };
+  /** Test-only: replace the run TMPDIR leaf preparation (issue #4420); production never sets it. */
+  runTmpdirTestDeps?: { prepare?: (runId: string) => ReturnType<typeof prepareRunTmpdir> };
   queueTerminalRejectionReconciliation?: (runId: string, generation: number) => void;
   /** How often the steering channel polls /inputs (default 3s). */
   pollMs?: number;
@@ -3737,6 +3739,7 @@ export class RunRunner {
   /** Issue #1831: test-only teardown seams; production always uses pinned removal. */
   private readonly teardownTestDeps: TeardownTestDeps | undefined;
   private readonly goWorkTestDeps: { fsOps?: GoWorkFsOps } | undefined;
+  private readonly runTmpdirTestDeps: { prepare?: (runId: string) => ReturnType<typeof prepareRunTmpdir> } | undefined;
   /** issue #1597 M2: test-only seams (undefined in production). */
   private readonly checkpointTestHooks: CheckpointTestHooks | undefined;
   private readonly planCrossCheckTiming: PlanCrossCheckTiming | undefined;
@@ -4043,6 +4046,7 @@ export class RunRunner {
     this.semanticCoverageTestTransport = opts.semanticCoverageTestTransport;
     this.teardownTestDeps = opts.teardownTestDeps;
     this.goWorkTestDeps = opts.goWorkTestDeps;
+    this.runTmpdirTestDeps = opts.runTmpdirTestDeps;
     this.shutdownPublishTimeoutMs = opts.shutdownPublishTimeoutMs ?? 15_000;
     this.recoveryRetryMs = Math.max(1, Math.min(opts.recoveryRetryMs ?? 1_000, 30_000));
     const holdBudget = opts.completionHoldReconcileTimeoutMs === undefined
@@ -16936,7 +16940,7 @@ export class RunRunner {
     // today's shared TMPDIR and logs a fixed reason token only.
     if (!flight.executor.safety && flight.executor.sandboxesCommands !== true && !claim.secrets.codex &&
       flight.runHome && process.platform === "linux") {
-      const prepared = await prepareRunTmpdir(runId);
+      const prepared = await (this.runTmpdirTestDeps?.prepare ?? prepareRunTmpdir)(runId);
       if ("dir" in prepared) flight.runTmpdir = prepared.dir;
       else {
         runLog.warn("run TMPDIR unavailable; launching with the shared TMPDIR", {

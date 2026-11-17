@@ -357,6 +357,13 @@ describe("issue #3870: managed Go work dir reaches the lead CLI env", () => {
     }
   });
 
+  it("issue #4420: sets TMPDIR from ctx.runTmpdir and keeps it through guardedCommandEnv", async () => {
+    const leaf = "/data/runner/.tmp/run-123e4567-e89b-42d3-a456-426614174000";
+    const options = await launchEnv({ runTmpdir: leaf });
+    assert.equal(options.env?.TMPDIR, leaf);
+    assert.equal(guardedCommandEnv(options.env!).TMPDIR, leaf);
+  });
+
   it("launches without GOTMPDIR when the ctx carries no managed dir", async () => {
     const options = await launchEnv({});
     assert.equal(Object.hasOwn(options.env ?? {}, "GOTMPDIR"), false);
@@ -5038,6 +5045,23 @@ describe("SdkExecutor JS dependency provisioning (PRD #121 M2)", () => {
     assert.equal(seen.length, 2);
     assert.strictEqual(seen[0]!.GOTMPDIR, goWork);
     assert.strictEqual(seen[1]!.GOTMPDIR, undefined);
+  });
+
+  it("issue #4420: the install env TMPDIR is ctx.runTmpdir when set", async () => {
+    const leaf = "/data/runner/.tmp/run-123e4567-e89b-42d3-a456-426614174000";
+    const seen: Array<NodeJS.ProcessEnv> = [];
+    const { queryFn } = fakeTurns([
+      [submitPlan("# plan"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const installDeps: SdkExecutorOptions["installDeps"] = async (_root, env) => {
+      seen.push(env);
+      return { results: [], truncated: false };
+    };
+    const probe = makeCtx({ runTmpdir: leaf });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn, installDeps }).run(probe.ctx);
+    assert.equal(seen.length, 1);
+    assert.strictEqual(seen[0]!.TMPDIR, leaf);
   });
 
   it("says so plainly when the repo has no JS dependencies to install", async () => {

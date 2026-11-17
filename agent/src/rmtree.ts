@@ -2100,8 +2100,8 @@ export async function censusScratchRoot(
  */
 export const RUN_TMPDIR_SCRIPT = `${PINNED_PRELUDE}
 const [rootArg, expect, leaf, uidArg] = process.argv.slice(1);
-const owner = Number(uidArg);
-if (!rootArg || !rootArg.startsWith("/") || !expect || !/^run-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(leaf || "") ||
+const owner = /^\\d{1,15}$/.test(uidArg || "") ? Number(uidArg) : -1;
+if (!rootArg ||!rootArg.startsWith("/") || !expect || !/^run-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(leaf || "") ||
     !Number.isSafeInteger(owner) || owner < 0) process.exit(6);
 const parts = rootArg.split("/").slice(1);
 if (parts.length === 0 || parts.some((x) => x === "" || x === "." || x === "..")) process.exit(6);

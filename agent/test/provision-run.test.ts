@@ -94,7 +94,7 @@ describe("provisionRunTools run-owned TMPDIR (issue #4420)", () => {
     assert.deepStrictEqual(inputs.map((i) => i.runTmpdir), [leaf, leaf]);
   });
 
-  it("never sets runTmpdir for a context without one (Codex and fallback lanes)", async () => {
+  it("never sets runTmpdir for a context without one", async () => {
     const h = makeCtx({ tool_packages: ["kubectl@1.31"], repo_devbox_opt_in: false });
     const { fn, inputs } = capture();
     await provisionRunTools(h.ctx, makeDeps(fn));
