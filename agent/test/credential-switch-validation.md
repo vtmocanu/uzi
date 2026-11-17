@@ -216,13 +216,93 @@ measurement note, including inherited real delays in worker-memory tests.
 The coordinator duplication and interrupted-refresh cleanup notes recorded
 above remain non-blocking review notes, with no new subsystem added.
 
+## Later focused evidence and handler repair
+
+The following results were supplied by the lead, not rerun for this ledger edit.
+At 71ae949a9, 15 changed agent test files ran serially from agent with
+`node --import tsx --test --test-concurrency=1 --test-timeout=120000`
+(command timeout 900 seconds). The files were client-credential-switch-apply,
+codex-advice-harness, codex-appserver-auth, codex-harness, codex-operation-scope,
+codex-switch-coordinator, codex-switch-preflight, cross-check-runner, judge-runner,
+now-summary, review-runner, runner-now-summary, runner-policy-hold, steering
+and worker (each under agent/test with suffix .test.ts).
+Log `.uzi/scratch/gate-log.qtJGzE`: 1765 passed, 0 failed, 0 skipped,
+217287.644572 ms.
+
+On the same 71ae949a9 candidate, focused codex-executor.test.ts selections
+covered the nine describe blocks named in the behavior map below:
+`.uzi/scratch/gate-log.XRdztp`, 144 passed, 0 failed, 0 skipped,
+201804.648334 ms. These two runs are focused selections, not the full agent
+suite. Runtime source remained unchanged through ed3455fbacdc164f7b9c0ba93abcdd88ddcf82a8;
+the intervening changes were handler route tests. The recovered 50-test
+workersvc result remains evidence at c17f8bd29 on unchanged code, not a new
+latest-head run.
+
+The initial focused handler run at 71ae949a9 with fresh PostgreSQL 17 failed
+(`.uzi/scratch/gate-log.FlfQ8l`), then reproduced narrowly
+(`.uzi/scratch/gate-log.5aou7y`): the original test expected fenced, but the
+mandatory stopped-support admission guard returned
+`not_applied/worker_upgrade_required`. The supplied-base 9d62bc792 export
+with the original test failed earlier with 404 because the route was absent.
+That comparison is inconclusive for the same failure; it does not establish
+an unrelated failure.
+
+Test-only repair b09e expected the exact upgrade outcome, then fenced Claude
+with stopped support. Review found that the second case was masked by missing
+Codex capability/apply registration. Minimal repair ed3455 supplies both Codex
+protocols and a matching nonce while preserving Claude. Reviewer and tester
+closed that masking finding on ed3455 with no new findings.
+
+The candidate harness-fence sensitivity control
+(`.uzi/scratch/gate-log.GRcJ2H`) used a disposable b09e export plus the intended
+fixed test, identified by a SHA256 fingerprint. It compiled and removed only
+`r.Harness == harnessCodex`; the actual real-route named test failed with
+`not_applied/target_mismatch`, exit 1. The primary guard was untouched.
+Candidate positives before/after (`.uzi/scratch/gate-log.RvT5LM` and
+`.uzi/scratch/gate-log.goIKWF`) exited 0. This is a candidate guard sensitivity
+control, not a class (c) ordering control or historical a233 baseline; it
+supplies no missing proof-class inference.
+
+Repaired lead-owned focused handler validation with fresh PostgreSQL 17
+(`.uzi/scratch/gate-log.4MYoL9`) exited 0, metadata ed3455, with no skips.
+The full capability package race run, count 1
+(`.uzi/scratch/gate-log.Sqjnvy`), exited 0 at b09e on unchanged capability
+source. Each Go command ran one package serially with
+`GOFLAGS=-p=1 GOMAXPROCS=4`. Format validation
+(`.uzi/scratch/gate-log.eA3Ddm`) exited 0.
+
+## Behavior coverage map
+
+These are concrete coverage starting points, not a claim that the frozen
+assertion inventory is exhausted. E means agent/test/codex-executor.test.ts;
+workersvc and handler filenames below are relative to api/internal/workersvc
+and api/internal/handler respectively. Other agent files are under agent/test.
+
+| Behavior | Named coverage starting points |
+| --- | --- |
+| Same flight/worktree, no new attempt, custody and B resume | E: `M2 actualRunner credential replacement`, `Codex repeated actualRunner switching`. |
+| A persistence/reaping, fresh HOME and sessions-only transfer | E: `CodexExecutor: strict saved rollout seam`, `CodexExecutor: strict rollout real session store`, `CodexExecutor: strict rollout currency`, `CodexExecutor: suspended A boundary`, `CodexExecutor: replacement B boundary`. |
+| Scope, refresh, identity, capability and summary | E: `CodexExecutor credential switch continuation`, `M2 external Now owned composition`, actualRunner replacement; codex-operation-scope.test.ts, now-summary.test.ts and runner-now-summary.test.ts. |
+| Policy race and refresh serialization | workersvc credential_switch_codex_policy_livedb_test.go: `TestCodexPolicyEpisodeBetweenPreflightAndApplyLiveDB`; credential_switch_codex_apply_refresh_livedb_test.go: `TestCodexRefreshAdmittedBeforeApplyLiveDB`; credential_switch_codex_apply_races_livedb_test.go: `TestCodexApplyAccountLockOrderLiveDB`, `TestCodexApplyWinsLateRefreshAdmissionLiveDB`. |
+| Ordinal-zero exact A, successor B and snapshots | workersvc credential_switch_codex_spend_livedb_test.go: `TestCodexSwitchSpendJoinsAuthorityEpochLiveDB`; credential_switch_codex_apply_livedb_test.go: `TestCodexTransactionalApplyBundleLiveDB`. |
+| Lost reply, rollback, stale or foreign authority | workersvc credential_switch_codex_apply_lostreply_livedb_test.go: `TestCodexApplyCommittedLostReplyLiveDB`; credential_switch_codex_apply_rollback_livedb_test.go: `TestCodexApplyWriteRollbackLiveDB`; credential_switch_codex_livedb_test.go: `TestCodexSwitchPreflightLiveDB`; credential_switch_codex_policy_livedb_test.go: `TestOwnerCodexForeignRunOrCredentialRefusedLiveDB`. |
+| Stopped full predicate, withdrawn X/Y, epoch/nonce, competing controls and replay | workersvc codex_switch_stopped_test.go: `TestCodexSwitchStoppedAuthorityBounds`; codex_switch_stopped_livedb_test.go: `TestCodexSwitchStoppedWithdrawnXYLiveDB`, `TestCodexSwitchStoppedEpochAdvanceAppliedSuccessorLiveDB`, `TestCodexSwitchStoppedCompetingControlsDelayedReportLiveDB`, `TestCodexSwitchStoppedResumeReclaimReregistrationLiveDB`, `TestCodexSwitchStoppedPreservationReplayLostReplyLiveDB`; E suspended/replacement boundaries and client-credential-switch-apply.test.ts. |
+| Request 1 MiB, acknowledgement 16 KiB, no op_id | handler codex_switch_stopped_decode_test.go: `TestWorkerStateStoppedStrictBody`, `TestStoppedSettlementAck`; codex_switch_stopped_route_test.go: `TestWorkerRunStateCodexSwitchStoppedRoute`; client-credential-switch-apply.test.ts wire cases. |
+| Targeted token absence | client-credential-switch-apply.test.ts: `Codex switch wire contract` and token/body error assertions; workersvc credential_switch_codex_apply_livedb_test.go: `TestCodexTransactionalApplyBundleLiveDB` journal/run/feed assertions; handler codex_switch_preflight_routes_livedb_test.go response assertions. These do not establish m4 security gates. |
+
 ## Outstanding evidence
 
-This ledger is deliberately limited to checks re-observed after recovery.
-It does not replace the frozen requirement-to-verification map, transactional
-and LiveDB evidence, the rest of the required regression controls, independent
-committed-range review, `task test:codex-m4`, or m4 security and contract gates.
-Those items remain to be reconciled or executed; no scope is waived here.
-Full suites remain pending exact-head PR CI under the approved boundary.
+Transactional and LiveDB evidence has been re-observed, including the 50-test
+c17 result above. The behavior map and later focused results do not establish
+m3 or m4 completion. The preserved owner amendment defines class (c) and
+references earlier classes (a)/(b), whose exact definitions have not been
+recovered. Those definitions are needed to classify the remaining regression
+evidence against the frozen m3 requirements. The behavior map does not
+establish that every required control has run; no acceptance waiver is proposed.
+
+`task test:codex-m4` and lead-owned m4 security, contracts, sqlc regeneration
+and integration checks remain pending. Full suites remain pending exact-head
+PR CI under the approved boundary (full agent suite: exact-head PR CI).
 Live cross-account thread resume with two real accounts remains owner acceptance,
-unverified and non-closing.
+unverified and non-closing. Existing optional review notes above remain optional;
+this record creates no new acceptance gates.
