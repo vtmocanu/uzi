@@ -15,7 +15,7 @@ import { fileURLToPath } from "node:url";
 import { runPodEpochShadow, PodEpochSettlementError } from "../src/pod-epoch-reclaim.js";
 import type { PodEpochDaemonGuard } from "../src/pod-epoch-daemon.js";
 import {
-  GitCache, evaluateRetireBinding, evaluateRetireRecovery, parseRetireBinding, readRetireScratchReclaimActivation, retireBindingKey, retireBindingValue,
+  GitCache, evaluateRetireBinding, evaluateRetireRecovery, parseRetireBinding, readRetireScratchReclaimActivation, retireBindingKey, retireBindingValue, storesNameRetireParent,
   type RetireBinding, type RetireBindingStep, type RetireDispositionClass, type RetireScratchBareEvidence, type RetireScratchPassReport,
 } from "../src/git.js";
 import { protectedLeaves } from "../src/pod-epoch-scratch.js";
@@ -802,6 +802,26 @@ describe("a whole-phase refusal inside the lock halts the loop", PROC, () => {
     w.mounts = () => (fire() ? "mount_unknown" : "ok");
     await assertHalted("mount_unknown");
   });
+
+  it("an unreadable root mount id for one parent stops the phase with mount_unknown", async () => {
+    pair2 = pair();
+    (w.options.retire!.seams as { rootMntId?: () => string | undefined }).rootMntId = () => undefined;
+    await assertHalted("mount_unknown");
+  });
+
+  it("a bind inventory that cannot be read inside the lock stops the phase before the next parent", async () => {
+    pair2 = pair();
+    const fire = armOnce();
+    w.binds = () => (fire() ? { state: "unknown" } : { state: "read", sources: [] });
+    await assertHalted("bind_unknown");
+  });
+
+  it("a bind inventory refused inside the lock stops the phase before the next parent", async () => {
+    pair2 = pair();
+    const fire = armOnce();
+    w.binds = () => (fire() ? { state: "read", sources: [path.dirname(w.runnerRoot)] } : { state: "read", sources: [] });
+    await assertHalted("bind_ancestor");
+  });
 });
 
 describe("protection arriving in another store between the nomination and the locked section", PROC, () => {
@@ -874,11 +894,23 @@ describe("budget inside the locked section", PROC, () => {
     const seeds = [w.seed({ n: 1 }), w.seed({ n: 2 }), w.seed({ n: 3 })].sort((x, y) => (x.name < y.name ? -1 : 1));
     const caps = fakeMeasure({ bytes: 10, bytesState: "measured", entries: 1_500_000 });
     const result = await w.run();
-    assert.deepEqual(caps, [2_000_000, 499_999]);
+    assert.deepEqual(caps, [1_500_001, 499_999]);
+    assert.equal(caps.reduce((a, b) => a + b, 0) <= 2_000_000, true);
     assert.equal(result.retire_scratch.reclaimed, 2);
     assert.equal(result.retire_scratch.deferred, 1);
     untouched(seeds[2]!);
   });
+
+  it("the measurement runs before the budget check: a measure that uses the window defers the parent without a helper", async () => {
+    const s = w.seed();
+    w.options.retire!.git.measureRetireScratchParent = async () => { w.clock += 105_000; return { bytes: 1, bytesState: "measured", entries: 3 }; };
+    const result = await w.run();
+    assert.equal(w.spawns.length, 0);
+    assert.equal(result.retire_scratch.deferred, 1);
+    assert.equal(result.retire_scratch.kept, 0);
+    untouched(s);
+  });
+
 
   it("a rejection before the removing write is a refusal that keeps settled", async () => {
     const s = w.seed();
@@ -921,6 +953,25 @@ describe("alias-aware protection at the runner root itself", () => {
     assert.deepEqual(evaluateRetireBinding({ evidence: evidenceWith([`${shared}/slug/issue-4263.attempt-${attemptId}/sub`]), uuid, runnerRoot: root, expectRaw: raw }),
       { kind: "keep", reason: "protected_by_retained_source" });
     assert.equal(evaluateRetireBinding({ evidence: evidenceWith([`${shared}/other`]), uuid, runnerRoot: root, expectRaw: raw }).kind, "ready");
+  });
+
+  // Non-canonical spellings of the alias must not slip past the alias mapping.
+  const spellings = [`/data//runner-shared`, `/data/./runner-shared`, `/data/x/../runner-shared`, `//data/runner-shared`];
+  for (const base of spellings) {
+    it(`a clone path recorded as ${base}/... is protected and unresolved for recovery`, () => {
+      const recorded = [`${base}/slug/issue-4263.attempt-${attemptId}/sub`];
+      assert.deepEqual(evaluateRetireBinding({ evidence: evidenceWith(recorded), uuid, runnerRoot: root, expectRaw: raw }),
+        { kind: "keep", reason: "protected_by_retained_source" });
+      assert.equal(evaluateRetireRecovery({ evidence: evidenceWith(recorded), uuid, runnerRoot: root, expectRaw: raw, canonical: { present: false } }), "unresolved");
+    });
+  }
+
+  it("the locked stores check is alias-aware for the parent and the clone path", () => {
+    assert.equal(storesNameRetireParent([`${shared}/${name}/clone`], root, uuid, clonePath), true);
+    assert.equal(storesNameRetireParent([`${shared}/slug/issue-4263.attempt-${attemptId}`], root, uuid, clonePath), true);
+    assert.equal(storesNameRetireParent([`${shared}/other`], root, uuid, clonePath), false);
+    // The compared path may itself be spelled through the alias while the record is canonical.
+    assert.equal(storesNameRetireParent([`${root}/slug/issue-4263.attempt-${attemptId}`], root, uuid, `${shared}/slug/issue-4263.attempt-${attemptId}`), true);
   });
 
   it("recovery case 1 does not unset when the clone path is named through the alias", () => {

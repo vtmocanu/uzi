@@ -952,14 +952,16 @@ async function retireBody(ctx: RetireContext, pin: ScratchRootPin, root: string,
           if ("refused" in holding) return { kind: "keep", reason: "held", halt: holding.refused };
           if (holding.held.has(name)) return { kind: "keep", reason: "held" };
           const mntId = seams.rootMntId ? seams.rootMntId() : mntIdOf(pin.fd, io);
-          if (mntId === undefined) return { kind: "keep", reason: "mount_changed" };
-          // Measure first (at most 5 s), then budget: the helper gets what the phase window still holds, never more than the helper cap.
-          const measured = await deps.git.measureRetireScratchParent(name, { signal: controller.signal, deadline: Date.now() + 5000 });
+          if (mntId === undefined) return { kind: "keep", reason: "mount_changed", halt: "mount_unknown" };
+          // Measure first (at most 5 s, never past the phase window), then budget: the helper gets what the phase window still holds, never more than the helper cap.
+          const measured = await deps.git.measureRetireScratchParent(name, { signal: controller.signal, deadline: Date.now() + Math.max(0, Math.min(5000, phaseEnd - ctx.now())) });
           const helperMs = Math.min(RETIRE_HELPER_MAX_MS, phaseEnd - ctx.now() - 5000);
           if (phaseEnd - ctx.now() < RETIRE_CANDIDATE_MIN_MS || helperMs < 1000) return { kind: "keep", reason: "budget_deferred" };
           // Entry budget: the helper may never be allowed more than is left. Only a complete measurement says how much this
           // parent used; an incomplete or unknown one (walk cap or deadline) charges everything left, so no later parent is admitted.
-          const maxEntries = entriesLeft;
+          // A complete measurement caps the helper at what it saw plus one, so the caps of all helpers sum to at most the budget
+          // and growth since the measurement fails closed as helper_budget residue.
+          const maxEntries = measured.bytesState === "measured" ? Math.min(entriesLeft, measured.entries + 1) : entriesLeft;
           entriesLeft = measured.bytesState === "measured" ? Math.max(0, entriesLeft - measured.entries - 1) : 0;
           const scope = ctx.openScope();
           if (scope.stopped()) ctx.failFatal();

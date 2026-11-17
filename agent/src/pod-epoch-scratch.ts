@@ -283,8 +283,9 @@ function rootsWithAlias(root: string): string[] {
 
 /** The `/data/runner` spelling of a path that may be written through the `/data/runner-shared` alias; anything else unchanged. */
 export function canonicalRunnerAlias(p: string): string {
-  if (p === "/data/runner-shared") return "/data/runner";
-  return p.startsWith(SHARED_PREFIX) ? RUNNER_PREFIX + p.slice(SHARED_PREFIX.length) : p;
+  const n = path.posix.resolve(p);
+  if (n === "/data/runner-shared") return "/data/runner";
+  return n.startsWith(SHARED_PREFIX) ? RUNNER_PREFIX + n.slice(SHARED_PREFIX.length) : n;
 }
 
 function allWorkerIds(status: string, label: "Uid" | "Gid"): boolean {

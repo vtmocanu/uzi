@@ -2686,6 +2686,11 @@ function retireNamed(evidence: RetireScratchBareEvidence, runnerRoot: string, pa
   return pathNamed(evidence.protectedPaths, clonePath);
 }
 
+/** Does a recorded store path name the retire parent (`<runnerRoot>/.retire-<uuid>`) or the binding's clone path, alias-aware? */
+export function storesNameRetireParent(recorded: readonly string[], runnerRoot: string, uuid: string, clonePath: string): boolean {
+  return pathNamed(recorded, path.join(runnerRoot, `.retire-${uuid}`)) || pathNamed(recorded, clonePath);
+}
+
 /** Does any recorded path equal, lie under, or contain `target`, treating `/data/runner-shared/...` as `/data/runner/...`? */
 function pathNamed(recorded: readonly string[], target: string): boolean {
   const t = canonicalRunnerAlias(target);
@@ -17282,11 +17287,11 @@ export class GitCache {
         const evidence = await locked.evidence();
         const pure = evaluateRetireBinding({ evidence, uuid, runnerRoot, expectRaw, ...(acrossBares === undefined ? {} : { acrossBares }) });
         if (pure.kind !== "ready") return pure;
-        const b = pure.binding, parent = path.join(runnerRoot, `.retire-${uuid}`);
+        const b = pure.binding;
         const stores = await readProtectedStores(
           [this.recoveryRoot, this.recoveryMaintenanceRoot, this.recoverySettlementRoot, this.recoveryArchiveRoot],
           { interrupt: () => this.checkRecoveryInterruption() });
-        if (stores.state !== "read" || pathNamed(stores.paths, parent) || pathNamed(stores.paths, b.clonePath)) return { kind: "keep", reason: "protected_by_retained_source" };
+        if (stores.state !== "read" || storesNameRetireParent(stores.paths, runnerRoot, uuid, b.clonePath)) return { kind: "keep", reason: "protected_by_retained_source" };
         if (residueQuarantine() !== undefined || await this.custodyHeld(b.runId) || (await this.listLocalRecords(b.runId)).length > 0)
           return { kind: "keep", reason: "custody" };
         if (!await this.missingFootprintOf(b.clonePath)) return { kind: "keep", reason: "canonical_present" };
