@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/capability"
@@ -290,19 +291,32 @@ func TestProviderClaimRefusedWhenURLRemovedThenPromotedLiveDB(t *testing.T) {
 	}
 }
 
-// TestProviderDestinationHoldNeedsAnIntactBindingLiveDB: re-allowlisting the URL does not re-queue a
-// destination hold whose binding changed meanwhile.
-func TestProviderDestinationHoldNeedsAnIntactBindingLiveDB(t *testing.T) {
+// TestProviderDestinationHoldGoesStaleWhileParkedLiveDB: a destination hold whose binding breaks while
+// the run is parked is rewritten by the promoter to the final provider_binding_stale (its "resumes
+// automatically" copy is false then), and re-allowlisting the URL never re-queues it. A still-intact
+// hold keeps its reason while the URL stays de-listed.
+func TestProviderDestinationHoldGoesStaleWhileParkedLiveDB(t *testing.T) {
 	pf := newPCFix(t)
 	runID := pf.run(t)
 	pf.allow(pcOtherURL)
 	if p, err := pf.svc.Claim(pf.env.ctx, pf.worker(t), nil); err != nil || p != nil {
 		t.Fatalf("Claim = (%v, %v)", p != nil, err)
 	}
+	pf.svc.RequestCredentialDisabledPromotion(pf.userID)
+	pf.wantParked(t, runID, "provider_destination_not_allowed") // intact binding, URL still de-listed
+	before := mustRun(t, pf.env, runID)
 	pf.rotate()
+	pf.svc.RequestCredentialDisabledPromotion(pf.userID)
+	after := pf.wantParked(t, runID, "provider_binding_stale")
+	if after.StatusSince != before.StatusSince || !after.ClaimReleasedAt.Valid {
+		t.Fatalf("the rewrite must keep the pause anchor and released claim: since %v -> %v, released=%v", before.StatusSince, after.StatusSince, after.ClaimReleasedAt)
+	}
 	pf.allow(pvBase)
 	pf.svc.RequestCredentialDisabledPromotion(pf.userID)
-	pf.wantParked(t, runID, "provider_destination_not_allowed")
+	if _, err := pf.svc.Sweep(pf.env.ctx); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	pf.wantParked(t, runID, "provider_binding_stale")
 }
 
 // TestProviderClaimRevokedBindingParksStaleLiveDB: key disable, rotation (enablement_rev bump), key
@@ -389,20 +403,129 @@ func TestProviderChatDestinationRefusedThenPromotedLiveDB(t *testing.T) {
 
 // TestProviderClaimRotationBetweenAssemblyAndFinishLiveDB: a rotation that commits after assembly
 // opened the key is seen by the finisher's locked re-check: nothing is delivered (no re-keyed
-// payload reaches the frozen destination) and the run parks stale. Issue run and chat.
+// payload reaches the frozen destination) and the run parks stale. Each lane gets its own fixture and
+// only that lane's after-assembly hook rotates, so the issue claim cannot pre-refuse the chat at
+// assembly and the CHAT finisher's re-check is what parks it.
 func TestProviderClaimRotationBetweenAssemblyAndFinishLiveDB(t *testing.T) {
+	t.Run("issue run", func(t *testing.T) {
+		pf := newPCFix(t)
+		runID := pf.run(t)
+		pf.svc.claimHooks = &claimTestHooks{
+			afterAssembly: func(context.Context, store.Run, *ClaimPayload, error) { pf.rotate() },
+		}
+		if p, err := pf.svc.Claim(pf.env.ctx, pf.worker(t), nil); err != nil || p != nil {
+			t.Fatalf("Claim = (%v, %v), want nothing delivered", p != nil, err)
+		}
+		pf.wantParked(t, runID, "provider_binding_stale")
+	})
+	t.Run("chat", func(t *testing.T) {
+		pf := newPCFix(t)
+		chatID := pf.chat(t)
+		pf.svc.claimHooks = &claimTestHooks{
+			afterChatAssembly: func(context.Context, store.Run) { pf.rotate() },
+		}
+		if c, err := pf.svc.ClaimChat(pf.env.ctx, pf.worker(t)); err != nil || c != nil {
+			t.Fatalf("ClaimChat = (%v, %v), want nothing delivered", c != nil, err)
+		}
+		pf.wantParked(t, chatID, "provider_binding_stale")
+	})
+}
+
+// TestProviderClaimHeldRevisionRowRetriesNowaitLiveDB: the finisher's revision read is NOWAIT. A
+// provider delete cascades the revision rows before the key row, while the finisher holds the key row
+// FOR SHARE: a BLOCKING revision lock there is a lock cycle (40P01, which the finishers do not
+// retry). With NOWAIT a revision row held by another session is 55P03, the bounded whole-transaction
+// retry the finishers already have, never 40P01 and never a wait. The run is not mutated by the
+// refused finish, and once the holder lets go the same claim delivers. Issue run and chat.
+func TestProviderClaimHeldRevisionRowRetriesNowaitLiveDB(t *testing.T) {
+	defer func(d time.Duration) { finishRunClaimRetryDelay = d }(finishRunClaimRetryDelay)
+	finishRunClaimRetryDelay = time.Millisecond
+	for _, lane := range []string{"issue run", "chat"} {
+		t.Run(lane, func(t *testing.T) {
+			pf := newPCFix(t)
+			var id uuid.UUID
+			if lane == "chat" {
+				id = pf.chat(t)
+			} else {
+				id = pf.run(t)
+			}
+			holder, err := pf.env.pool.Begin(pf.env.ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = holder.Rollback(pf.env.ctx) }()
+			hold := func() {
+				// What a provider delete's cascade holds on the revision row mid-statement.
+				if _, err := holder.Exec(pf.env.ctx, `SELECT 1 FROM model_provider_revisions WHERE provider_id = $1 AND revision = 1 FOR UPDATE`, pf.provider); err != nil {
+					t.Errorf("hold revision row: %v", err)
+				}
+			}
+			pf.svc.claimHooks = &claimTestHooks{
+				afterAssembly:     func(context.Context, store.Run, *ClaimPayload, error) { hold() },
+				afterChatAssembly: func(context.Context, store.Run) { hold() },
+			}
+			type result struct {
+				delivered bool
+				err       error
+			}
+			claim := func() result {
+				done := make(chan result, 1)
+				go func() {
+					if lane == "chat" {
+						c, err := pf.svc.ClaimChat(pf.env.ctx, pf.worker(t))
+						done <- result{c != nil, err}
+						return
+					}
+					p, err := pf.svc.Claim(pf.env.ctx, pf.worker(t), nil)
+					done <- result{p != nil, err}
+				}()
+				select {
+				case r := <-done:
+					return r
+				case <-time.After(20 * time.Second):
+					_ = holder.Rollback(pf.env.ctx) // free the goroutine before failing
+					t.Fatalf("claim finishing blocked on the held revision row (a blocking revision lock)")
+					return result{}
+				}
+			}
+			r := claim()
+			var pgErr *pgconn.PgError
+			if errors.As(r.err, &pgErr) && pgErr.Code == "40P01" {
+				t.Fatalf("finisher hit a deadlock (40P01) on the revision row: %v", r.err)
+			}
+			if r.delivered || !isLockNotAvailable(r.err) {
+				t.Fatalf("claim = (delivered=%v, %v), want (nothing, 55P03)", r.delivered, r.err)
+			}
+			if got := mustRun(t, pf.env, id); got.Status != "claimed" || got.HoldReason.Valid {
+				t.Fatalf("a refused finish mutated the run: %s %v", got.Status, got.HoldReason)
+			}
+			// The holder lets go; the sweeper would requeue the held claim, and the next claim delivers.
+			if err := holder.Rollback(pf.env.ctx); err != nil {
+				t.Fatal(err)
+			}
+			pf.svc.claimHooks = nil
+			pf.env.exec(`UPDATE runs SET status = 'queued', claim_released_at = NULL WHERE id = $1`, id)
+			if r := claim(); r.err != nil || !r.delivered {
+				t.Fatalf("claim after release = (delivered=%v, %v), want delivered", r.delivered, r.err)
+			}
+		})
+	}
+}
+
+// TestProviderBindingStaleBeatsDestinationLiveDB: precedence. A binding that is BOTH broken and
+// de-listed is provider_binding_stale (final for the run), never the destination hold the promoter
+// would re-queue once the URL is allowed again. Issue run and chat.
+func TestProviderBindingStaleBeatsDestinationLiveDB(t *testing.T) {
 	pf := newPCFix(t)
 	runID, chatID := pf.run(t), pf.chat(t)
-	pf.svc.claimHooks = &claimTestHooks{
-		afterAssembly:     func(context.Context, store.Run, *ClaimPayload, error) { pf.rotate() },
-		afterChatAssembly: func(context.Context, store.Run) { pf.rotate() },
-	}
+	pf.rotate()
+	pf.allow(pcOtherURL)
 	if p, err := pf.svc.Claim(pf.env.ctx, pf.worker(t), nil); err != nil || p != nil {
-		t.Fatalf("Claim = (%v, %v), want nothing delivered", p != nil, err)
+		t.Fatalf("Claim = (%v, %v), want idle", p != nil, err)
 	}
 	pf.wantParked(t, runID, "provider_binding_stale")
 	if c, err := pf.svc.ClaimChat(pf.env.ctx, pf.worker(t)); err != nil || c != nil {
-		t.Fatalf("ClaimChat = (%v, %v), want nothing delivered", c != nil, err)
+		t.Fatalf("ClaimChat = (%v, %v), want idle", c != nil, err)
 	}
 	pf.wantParked(t, chatID, "provider_binding_stale")
 }

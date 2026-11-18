@@ -117,7 +117,7 @@ type providerClaimReader interface {
 // row FOR SHARE NOWAIT plus the revision read. A transaction-bound *store.Queries satisfies it.
 type providerBindingLocker interface {
 	LockProviderBindingKeyForShareNowait(ctx context.Context, arg store.LockProviderBindingKeyForShareNowaitParams) (store.LockProviderBindingKeyForShareNowaitRow, error)
-	GetModelProviderRevisionForOwner(ctx context.Context, arg store.GetModelProviderRevisionForOwnerParams) (store.GetModelProviderRevisionForOwnerRow, error)
+	LockProviderBindingRevisionForKeyShareNowait(ctx context.Context, arg store.LockProviderBindingRevisionForKeyShareNowaitParams) (store.LockProviderBindingRevisionForKeyShareNowaitRow, error)
 }
 
 // providerKeyFacts are the key-row fields the binding check reads.
@@ -163,8 +163,11 @@ func (s *Service) providerBindingRefusal(run store.Run, rev *store.GetModelProvi
 // run lock already held: it takes the frozen key row FOR SHARE NOWAIT (a concurrent rotation,
 // disable or delete either committed first and is seen here, or waits until this claim decision
 // commits; a held row is 55P03, which rolls the transaction back for the bounded retry instead of
-// blocking under the run lock), then reads the frozen revision, and returns the refusal reason or ""
-// when intact. A missing key row or revision is stale. A not-provider-bound run returns "".
+// blocking under the run lock), then reads the frozen revision FOR KEY SHARE NOWAIT too (a blocking
+// revision lock would form a lock cycle with DeleteModelProvider, which cascades the revisions before
+// the key row: 40P01, which the finishers do not retry; NOWAIT makes it 55P03, which they do), and
+// returns the refusal reason or "" when intact. A missing key row or revision is stale. A
+// not-provider-bound run returns "".
 func (s *Service) lockedProviderRefusal(ctx context.Context, q any, locked store.Run) (string, error) {
 	if !providerBoundRun(locked) {
 		return "", nil
@@ -184,7 +187,7 @@ func (s *Service) lockedProviderRefusal(ctx context.Context, q any, locked store
 	if err != nil {
 		return "", err
 	}
-	rev, err := pl.GetModelProviderRevisionForOwner(ctx, store.GetModelProviderRevisionForOwnerParams{
+	rev, err := pl.LockProviderBindingRevisionForKeyShareNowait(ctx, store.LockProviderBindingRevisionForKeyShareNowaitParams{
 		ProviderID: uuid.UUID(locked.ModelProviderID.Bytes), Revision: locked.ModelProviderRevision.Int32, OwnerUserID: locked.UserID,
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -194,7 +197,8 @@ func (s *Service) lockedProviderRefusal(ctx context.Context, q any, locked store
 		return "", err
 	}
 	facts := providerKeyFacts{Kind: k.Kind, ProviderID: k.ProviderID, Disabled: k.DisabledAt.Valid, EnablementRev: k.EnablementRev}
-	return s.providerBindingRefusal(locked, &rev, &facts), nil
+	revRow := store.GetModelProviderRevisionForOwnerRow(rev)
+	return s.providerBindingRefusal(locked, &revRow, &facts), nil
 }
 
 // assembleProviderBinding builds the `provider` object of a provider-bound run's claim from the
@@ -269,36 +273,51 @@ func (s *Service) assembleProviderBinding(ctx context.Context, run store.Run) (*
 	}, nil
 }
 
-// providerRequirementMet is the promoter's requirement for a run held on
-// provider_destination_not_allowed: the run is provider-bound and its binding is otherwise intact
-// (frozen revision and key as at creation, key enabled) and its frozen URL is allowlisted again.
-// Run under the owner's secret mutation lock (so a rotation or disable serializes against this
-// decision) with plain reads; the claim re-checks under locks anyway. A retired provider does not
-// block (retiring keeps bound runs). Any other hold reason never reaches here.
-func (s *Service) providerRequirementMet(ctx context.Context, q *store.Queries, run store.Run) (bool, error) {
+// promotionRunBinding is the run-shaped view of the frozen provider binding the promoter's locked
+// read (LockCredentialDisabledRunForPromotion) carries, so the provider arms need no second read of
+// the run row. Only the binding columns (plus identity) are set.
+func promotionRunBinding(r store.LockCredentialDisabledRunForPromotionRow) store.Run {
+	return store.Run{
+		ID: r.ID, UserID: r.UserID,
+		ModelProviderID: r.ModelProviderID, ModelProviderRevision: r.ModelProviderRevision,
+		ModelProviderKeyMode: r.ModelProviderKeyMode, ModelProviderKeySecretID: r.ModelProviderKeySecretID,
+		ModelProviderKeyRev: r.ModelProviderKeyRev,
+	}
+}
+
+// providerHoldRefusal is the promoter's decision for a run held on provider_destination_not_allowed:
+// "" when the run's own frozen binding is intact and its frozen URL is allowlisted again (re-queue),
+// holdProviderDestinationNotAllowed while the URL is still off the list (stay held), and
+// holdProviderBindingStale when the binding broke while parked (frozen key or revision changed: the
+// caller rewrites the hold, whose "resumes automatically" copy is false then). Run under the owner's
+// secret mutation lock (so a rotation or disable serializes against this decision) with plain reads;
+// the claim re-checks under locks anyway. A retired provider does not block (retiring keeps bound
+// runs). Any other hold reason never reaches here.
+func (s *Service) providerHoldRefusal(ctx context.Context, q *store.Queries, run store.Run) (string, error) {
 	if !providerBoundRun(run) {
-		return false, nil
+		return holdProviderDestinationNotAllowed, nil
 	}
 	keyID, ok := frozenProviderKeyID(run)
 	if !ok {
-		return false, nil
+		return holdProviderBindingStale, nil
 	}
+	var revp *store.GetModelProviderRevisionForOwnerRow
 	rev, err := q.GetModelProviderRevisionForOwner(ctx, store.GetModelProviderRevisionForOwnerParams{
 		ProviderID: uuid.UUID(run.ModelProviderID.Bytes), Revision: run.ModelProviderRevision.Int32, OwnerUserID: run.UserID,
 	})
-	if errors.Is(err, pgx.ErrNoRows) {
-		return false, nil
+	switch {
+	case err == nil:
+		revp = &rev
+	case !errors.Is(err, pgx.ErrNoRows):
+		return "", fmt.Errorf("provider requirement: read revision: %w", err)
 	}
-	if err != nil {
-		return false, fmt.Errorf("provider requirement: read revision: %w", err)
-	}
+	var keyp *providerKeyFacts
 	key, err := q.GetProviderBindingKeyByID(ctx, store.GetProviderBindingKeyByIDParams{ID: keyID, UserID: run.UserID})
-	if errors.Is(err, pgx.ErrNoRows) {
-		return false, nil
+	switch {
+	case err == nil:
+		keyp = &providerKeyFacts{Kind: key.Kind, ProviderID: key.ProviderID, Disabled: key.DisabledAt.Valid, EnablementRev: key.EnablementRev}
+	case !errors.Is(err, pgx.ErrNoRows):
+		return "", fmt.Errorf("provider requirement: read key: %w", err)
 	}
-	if err != nil {
-		return false, fmt.Errorf("provider requirement: read key: %w", err)
-	}
-	facts := providerKeyFacts{Kind: key.Kind, ProviderID: key.ProviderID, Disabled: key.DisabledAt.Valid, EnablementRev: key.EnablementRev}
-	return s.providerBindingRefusal(run, &rev, &facts) == "", nil
+	return s.providerBindingRefusal(run, revp, keyp), nil
 }

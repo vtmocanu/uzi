@@ -160,6 +160,10 @@ func (q *Queries) ListCredentialDisabledUsers(ctx context.Context, arg ListCrede
 const lockCredentialDisabledRunForPromotion = `-- name: LockCredentialDisabledRunForPromotion :one
 SELECT id, user_id, kind, harness, status, hold_reason, pause_requested_at, pause_mode,
        credential_override_mode, credential_override_secret_id, codex_secret_id, worker_id, checkpoint_coordinates,
+       -- PRD #4320 module 5: the frozen provider binding rides the locked read, so the promoter's
+       -- provider arms decide on the run row it already locked instead of a second GetRunByID.
+       model_provider_id, model_provider_revision, model_provider_key_mode, model_provider_key_secret_id, model_provider_key_rev,
+       claim_generation,
        (runs.pause_requested_at IS NULL
         AND (runs.kind IN ('chat', 'judge') OR runs.interactive OR runs.started_at IS NULL OR
              (COALESCE(runs.budget_wall_seconds, $1::int)
@@ -191,6 +195,12 @@ type LockCredentialDisabledRunForPromotionRow struct {
 	CodexSecretID              pgtype.UUID        `json:"codex_secret_id"`
 	WorkerID                   pgtype.UUID        `json:"worker_id"`
 	CheckpointCoordinates      []byte             `json:"checkpoint_coordinates"`
+	ModelProviderID            pgtype.UUID        `json:"model_provider_id"`
+	ModelProviderRevision      pgtype.Int4        `json:"model_provider_revision"`
+	ModelProviderKeyMode       pgtype.Text        `json:"model_provider_key_mode"`
+	ModelProviderKeySecretID   pgtype.UUID        `json:"model_provider_key_secret_id"`
+	ModelProviderKeyRev        pgtype.Int8        `json:"model_provider_key_rev"`
+	ClaimGeneration            int64              `json:"claim_generation"`
 	CanQueue                   bool               `json:"can_queue"`
 }
 
@@ -213,6 +223,12 @@ func (q *Queries) LockCredentialDisabledRunForPromotion(ctx context.Context, arg
 		&i.CodexSecretID,
 		&i.WorkerID,
 		&i.CheckpointCoordinates,
+		&i.ModelProviderID,
+		&i.ModelProviderRevision,
+		&i.ModelProviderKeyMode,
+		&i.ModelProviderKeySecretID,
+		&i.ModelProviderKeyRev,
+		&i.ClaimGeneration,
 		&i.CanQueue,
 	)
 	return i, err
@@ -822,6 +838,36 @@ type RecordScheduleHeldFireParams struct {
 // concurrent edit, disable or fire is never overwritten with a stale hold.
 func (q *Queries) RecordScheduleHeldFire(ctx context.Context, arg RecordScheduleHeldFireParams) (int64, error) {
 	result, err := q.db.Exec(ctx, recordScheduleHeldFire, arg.LastFire, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const rewriteProviderDestinationHoldStale = `-- name: RewriteProviderDestinationHoldStale :execrows
+UPDATE runs SET
+    hold_reason = 'provider_binding_stale',
+    updated_at = now()
+WHERE id = $1 AND user_id = $2
+  AND status = 'paused' AND hold_reason = 'provider_destination_not_allowed'
+  AND claim_generation = $3
+  AND model_provider_id IS NOT NULL
+`
+
+type RewriteProviderDestinationHoldStaleParams struct {
+	ID              uuid.UUID `json:"id"`
+	UserID          uuid.UUID `json:"user_id"`
+	ClaimGeneration int64     `json:"claim_generation"`
+}
+
+// PRD #4320 module 5: the promoter's rewrite of a provider_destination_not_allowed hold whose binding
+// went stale while the run was parked (frozen key disabled, rotated, deleted, or the revision gone).
+// The hold's copy ("resumes automatically when the URL is allowed") is false then, and only
+// provider_binding_stale (a new run picks up the current key) is true. Guarded like the park writers:
+// the exact status and hold, the claim generation the promoter read under the run lock, and a
+// provider-bound run; status_since is untouched (it is the paused-time accounting anchor).
+func (q *Queries) RewriteProviderDestinationHoldStale(ctx context.Context, arg RewriteProviderDestinationHoldStaleParams) (int64, error) {
+	result, err := q.db.Exec(ctx, rewriteProviderDestinationHoldStale, arg.ID, arg.UserID, arg.ClaimGeneration)
 	if err != nil {
 		return 0, err
 	}

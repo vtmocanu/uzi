@@ -147,7 +147,7 @@
     "non_completion": true,
     "owner_resumable": false,
     "tone": "warning",
-    "web_label": "provider key changed: start a new run",
+    "web_label": "provider binding changed: start a new run",
     "cli_notice": "held, its provider or key changed after the run was created, so it cannot continue; start a new run, which uses the current key, and cancel this one: uzi run cancel run-1",
     "announces_entry": true,
     "completion_panel_early_return": false,

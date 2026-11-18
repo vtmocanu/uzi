@@ -63,7 +63,22 @@ func TestVendorIssueClaimGoldenLiveDB(t *testing.T) {
 	if payload.Secrets.Provider != nil || payload.Secrets.AnthropicOAuthToken == "" {
 		t.Fatalf("a vendor claim must carry its token and no provider: %+v", payload.Secrets)
 	}
-	got := normalizeClaimGolden(t, payload)
+	// Agents and skills depend on which shared templates and skills other tests in the same database
+	// seeded (store.ReconcileBuiltinTemplates), and a shared skill allocation cannot be switched off
+	// per user, so they are not pinnable. Assert their SHAPE (present arrays, never null) on the real
+	// payload, then compare the golden with them normalized to empty arrays.
+	full, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{`"agents":[`, `"skills":[`, `"skills_dropped":[`} {
+		if !strings.Contains(string(full), key) {
+			t.Fatalf("vendor claim wire lacks %s (null or missing): %s", key, full)
+		}
+	}
+	norm := *payload
+	norm.Agents, norm.Skills, norm.SkillsDropped = []ClaimAgent{}, []ClaimSkill{}, []ClaimSkillDrop{}
+	got := normalizeClaimGolden(t, &norm)
 	if strings.Contains(string(got), `"provider"`) {
 		t.Fatalf("a vendor claim carries a provider key:\n%s", got)
 	}

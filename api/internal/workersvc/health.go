@@ -1662,15 +1662,11 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 	// priority-class re-label. r.ModelProviderKeyMode is the claim clause's own discriminator, so the
 	// pill and the claim can never disagree. Read errors fall through.
 	if r.ModelProviderKeyMode.Valid {
-		if q, ok := s.q.(interface {
-			CountOnlineWorkersSatisfyingClaudeProvider(context.Context, uuid.UUID) (int64, error)
-		}); ok {
-			c, cerr := q.CountOnlineWorkersSatisfyingClaudeProvider(ctx, r.UserID)
-			if cerr != nil {
-				slog.Error("health: count online workers satisfying claude provider", "run_id", r.ID, "error", cerr)
-			} else if c == 0 {
-				return reasonNoProviderCapableWorker
-			}
+		c, cerr := s.q.CountOnlineWorkersSatisfyingClaudeProvider(ctx, r.UserID)
+		if cerr != nil {
+			slog.Error("health: count online workers satisfying claude provider", "run_id", r.ID, "error", cerr)
+		} else if c == 0 {
+			return reasonNoProviderCapableWorker
 		}
 	}
 	// PRD #1551 M4 (D6): a CUSTOM-Codex-root run whose owner has NO online worker advertising BOTH

@@ -176,6 +176,20 @@ SELECT id, kind, provider_id, disabled_at, enablement_rev FROM user_secrets
 WHERE id = $1 AND user_id = $2
 FOR SHARE NOWAIT;
 
+-- name: LockProviderBindingRevisionForKeyShareNowait :one
+-- The claim finisher's revision read (PRD #4320 module 5, D9): the same SELECT as
+-- GetModelProviderRevisionForOwner but FOR KEY SHARE OF r NOWAIT. The finisher already holds the run
+-- row and the key row FOR SHARE; DeleteModelProvider cascades the revision rows BEFORE the key row,
+-- so a BLOCKING revision lock here against a provider delete mid-cascade is a lock cycle (40P01,
+-- which the finishers do not retry). NOWAIT turns that contention into 55P03, which finishRunClaim /
+-- finishChatClaim already retry as a bounded whole-transaction retry. A missing row is
+-- pgx.ErrNoRows (stale).
+SELECT r.provider_id, r.revision, r.protocol, r.base_url, r.auth_style, r.model_map
+FROM model_provider_revisions r
+JOIN model_providers p ON p.id = r.provider_id
+WHERE r.provider_id = $1 AND r.revision = $2 AND p.owner_user_id = $3
+FOR KEY SHARE OF r NOWAIT;
+
 -- name: GetModelProviderRevisionForOwner :one
 -- A frozen revision of an owner's provider (inherited creation re-checks the URL against the
 -- allowlist). Owner-scoped. FOR KEY SHARE OF r only protects the prune-FIRST ordering (a prune that

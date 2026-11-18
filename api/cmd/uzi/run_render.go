@@ -669,7 +669,7 @@ func holdReasonLabel(reason string) string {
 	case holdProviderDestinationNotAllowed:
 		return "provider URL not allowed"
 	case holdProviderBindingStale:
-		return "provider key changed"
+		return "provider binding changed"
 	default:
 		return cellText(reason)
 	}
@@ -718,6 +718,16 @@ func isCredentialDisabledHold(r apitypes.RunDTO) bool {
 // and deleted every model credential (PRD #3989: status paused, hold_reason credentials_reset).
 func isCredentialsResetHold(r apitypes.RunDTO) bool {
 	return r.Status == statusPaused && strOr(r.HoldReason, "") == holdCredentialsReset
+}
+
+// isProviderDestinationHold and isProviderBindingStaleHold report the two parks of a provider-bound run
+// whose next claim was refused (PRD #4320 module 5). Neither is owner-resumable (Resume is refused, 409).
+func isProviderDestinationHold(r apitypes.RunDTO) bool {
+	return r.Status == statusPaused && strOr(r.HoldReason, "") == holdProviderDestinationNotAllowed
+}
+
+func isProviderBindingStaleHold(r apitypes.RunDTO) bool {
+	return r.Status == statusPaused && strOr(r.HoldReason, "") == holdProviderBindingStale
 }
 
 // credentialsResetAction is the owner's next step for a credentials_reset hold (PRD #3989). The

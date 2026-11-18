@@ -364,6 +364,10 @@ LIMIT @page_size::int;
 -- name: LockCredentialDisabledRunForPromotion :one
 SELECT id, user_id, kind, harness, status, hold_reason, pause_requested_at, pause_mode,
        credential_override_mode, credential_override_secret_id, codex_secret_id, worker_id, checkpoint_coordinates,
+       -- PRD #4320 module 5: the frozen provider binding rides the locked read, so the promoter's
+       -- provider arms decide on the run row it already locked instead of a second GetRunByID.
+       model_provider_id, model_provider_revision, model_provider_key_mode, model_provider_key_secret_id, model_provider_key_rev,
+       claim_generation,
        (runs.pause_requested_at IS NULL
         AND (runs.kind IN ('chat', 'judge') OR runs.interactive OR runs.started_at IS NULL OR
              (COALESCE(runs.budget_wall_seconds, @global_timeout_seconds::int)
@@ -373,6 +377,21 @@ SELECT id, user_id, kind, harness, status, hold_reason, pause_requested_at, paus
 FROM runs
 WHERE id = @id AND user_id = @user_id
 FOR UPDATE;
+
+-- PRD #4320 module 5: the promoter's rewrite of a provider_destination_not_allowed hold whose binding
+-- went stale while the run was parked (frozen key disabled, rotated, deleted, or the revision gone).
+-- The hold's copy ("resumes automatically when the URL is allowed") is false then, and only
+-- provider_binding_stale (a new run picks up the current key) is true. Guarded like the park writers:
+-- the exact status and hold, the claim generation the promoter read under the run lock, and a
+-- provider-bound run; status_since is untouched (it is the paused-time accounting anchor).
+-- name: RewriteProviderDestinationHoldStale :execrows
+UPDATE runs SET
+    hold_reason = 'provider_binding_stale',
+    updated_at = now()
+WHERE id = @id AND user_id = @user_id
+  AND status = 'paused' AND hold_reason = 'provider_destination_not_allowed'
+  AND claim_generation = @claim_generation
+  AND model_provider_id IS NOT NULL;
 
 -- The set-token verb's run lock (PRD #1733). SetRunCredential reads a run unlocked, validates the
 -- override, then takes the owner's secret mutation lock; this re-reads the run FOR UPDATE under

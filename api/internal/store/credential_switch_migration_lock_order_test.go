@@ -26,15 +26,23 @@ func TestCredentialSwitchMigrationsLockOneBusyTableEach(t *testing.T) {
 	busy := map[string]bool{"runs": true, "user_secrets": true, "run_messages": true, "run_usage": true, "workers": true}
 	alter := regexp.MustCompile(`(?i)\bALTER TABLE\s+(?:IF EXISTS\s+)?([a-z_]+)`)
 	refs := regexp.MustCompile(`(?i)\bREFERENCES\s+([a-z_]+)`)
-	// An explicit LOCK TABLE takes the same table lock as an ALTER, so a migration that locks a busy
-	// table this way counts toward the one-busy-table rule too.
-	lockTable := regexp.MustCompile(`(?i)\bLOCK TABLE\s+(?:ONLY\s+)?([a-z_]+)`)
+	// An explicit LOCK takes the same table lock as an ALTER, so a migration that locks a busy table
+	// this way counts toward the one-busy-table rule too. The TABLE keyword is optional (`LOCK runs`),
+	// the target may be schema-qualified (`public.runs`) and one statement may lock a comma list
+	// (`LOCK TABLE a, b`); busyIn splits the list and strips the schema prefix.
+	lockTable := regexp.MustCompile(`(?i)\bLOCK\s+(?:TABLE\s+)?(?:ONLY\s+)?([a-z_.]+(?:\s*,\s*[a-z_.]+)*)`)
 	dropTable := regexp.MustCompile(`(?i)\bDROP TABLE\b`)
 	comment := regexp.MustCompile(`--[^\n]*`)
 	busyIn := func(section string, re *regexp.Regexp, into map[string]bool) {
 		for _, m := range re.FindAllStringSubmatch(section, -1) {
-			if name := strings.ToLower(m[1]); busy[name] {
-				into[name] = true
+			for _, target := range strings.Split(m[1], ",") {
+				name := strings.ToLower(strings.TrimSpace(target))
+				if i := strings.LastIndex(name, "."); i >= 0 {
+					name = name[i+1:]
+				}
+				if busy[name] {
+					into[name] = true
+				}
 			}
 		}
 	}

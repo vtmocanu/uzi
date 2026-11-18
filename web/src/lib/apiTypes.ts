@@ -1322,7 +1322,7 @@ export interface LatestRun {
   // 'credential_disabled' so the card reads "waiting: credential disabled", not "paused",
   // 'credentials_reset' (PRD #3989) likewise reads "waiting: credentials were reset", and
   // 'provider_destination_not_allowed' / 'provider_binding_stale' (PRD #4320) read "provider URL not allowed: waiting" /
-  // "provider key changed: start a new run", and
+  // "provider binding changed: start a new run", and
   // the issue #3181 token-switch holds ('credential_switch_settling' / 'credential_switch_unsettled')
   // so they read "settling: token switch" / "held: token switch".
   // 'base_attestation_missing' (issue #3194) reads "base unverified: owner hold" likewise.

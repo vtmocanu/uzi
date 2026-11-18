@@ -259,11 +259,30 @@ func (s *Service) promoteCredentialDisabledRun(ctx context.Context, userID, runI
 		// frozen binding (never the owner's Anthropic default or current provider source): re-queue only
 		// when its URL is allowlisted again AND the binding is otherwise intact. provider_binding_stale
 		// is not in this hold set at all: it has no promoter.
-		bound, berr := q.GetRunByID(ctx, run.ID)
-		if berr != nil {
-			return "", fmt.Errorf("provider destination requirement: read run: %w", berr)
+		var reason string
+		reason, err = s.providerHoldRefusal(ctx, q, promotionRunBinding(run))
+		if err != nil {
+			return "", err
 		}
-		met, err = s.providerRequirementMet(ctx, q, bound)
+		if reason == holdProviderBindingStale {
+			// The binding broke while parked: the destination hold's copy ("resumes automatically") is
+			// false now, so the hold becomes the final provider_binding_stale, in this same transaction
+			// under the run lock (never a promotion).
+			n, werr := q.RewriteProviderDestinationHoldStale(ctx, store.RewriteProviderDestinationHoldStaleParams{
+				ID: run.ID, UserID: run.UserID, ClaimGeneration: run.ClaimGeneration,
+			})
+			if werr != nil {
+				return "", fmt.Errorf("rewrite provider hold stale: %w", werr)
+			}
+			if n != 1 {
+				return "", nil
+			}
+			if err := tx.Commit(ctx); err != nil {
+				return "", err
+			}
+			return "paused", nil
+		}
+		met = reason == ""
 	case holdCredentialsReset:
 		met, err = s.credentialsResetRequirementMet(ctx, q, run)
 	default:
@@ -552,10 +571,8 @@ func credentialRequirementMet(ctx context.Context, q *store.Queries, run store.L
 	// PRD #4320 module 5: a provider-bound run has no Anthropic credential requirement: its claim never
 	// reads the owner's default, worker or judge binding, so none of them can ever satisfy (or be
 	// promoted on) its hold. It is never promoted through this credential ladder; the one provider hold
-	// with a promoter (provider_destination_not_allowed) is decided by providerRequirementMet.
-	if bound, err := q.GetRunByID(ctx, run.ID); err != nil {
-		return false, fmt.Errorf("credential requirement: read run: %w", err)
-	} else if providerBoundRun(bound) {
+	// with a promoter (provider_destination_not_allowed) is decided by providerHoldRefusal.
+	if providerBoundRun(promotionRunBinding(run)) {
 		return false, nil
 	}
 	if run.Harness == harnessCodex {
@@ -639,9 +656,7 @@ func (s *Service) credentialsResetRequirementMet(ctx context.Context, q *store.Q
 	// PRD #4320: a provider-bound run does not depend on a vendor credential, and a held run's
 	// requirement is its own lineage's, never the owner's CURRENT provider source: a bound run is
 	// released (its claim re-validates the frozen binding), a vendor run is resolved vendor-only.
-	if bound, berr := q.GetRunByID(ctx, run.ID); berr != nil {
-		return false, fmt.Errorf("credentials_reset requirement: read run: %w", berr)
-	} else if providerBoundRun(bound) {
+	if providerBoundRun(promotionRunBinding(run)) {
 		return true, nil
 	}
 	_, err := s.resolveRunHarnessMode(ctx, run.UserID, &harness, q, true)
