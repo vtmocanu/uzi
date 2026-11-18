@@ -418,7 +418,7 @@ control is still absent, not that the functional criterion was deferred.
 | Policy episode rejection at request and under apply lock | D74–D77 owner request and post-READY apply; U7 episode starting before preflight (both arms); hold arm unreachable in live statuses by `runs_policy_hold_shape`, paused hold refused by status (u1-status1); concurrent lock-order contention not controlled |
 | Refresh lease/intent exclusion, account lock ordering and boundary reconciliation before revoke | D78/D79 credit isolated A coordination-lease and rotating-intent server checks; U8 credits alias and enablement (old/target) lock presence and NOWAIT keyword, the account lock and its NOWAIT against a reverse-order writer, the busy mapping, intent count/lock (A's account) and real admitted-refresh lease/intent redundant fences, and the executor A reconcile inside reconcileA before teardown (c); per-account lock isolation, the target account's intent check, the refresh admission's binding recheck in isolation and global lock sorting not controlled |
 | Post-switch release epoch and secret-hash authorization | B5/B6 preservation sensitivity controls below, through real worker apply and release routes; U9 credits the final reauthorization's presence (b) and placement after the material read (c) against a switch apply committed between the two authorizations (subscription A release path, service level); the API-key A path and the vault-locked branch after a switch not controlled |
-| Transactional frozen binding rewrite, capability revoke/remint and post-commit material response | U10 credits the zero-row fences (binding, stamp, message, last_seq), the commit-error check, material returned only after commit (c) and the persisted new hash, with the existing error-injection rollback test; A's refusal after remint by B5/B6; the empty-material check and journal-insert errors not separately controlled |
+| Transactional frozen binding rewrite, capability revoke/remint and post-commit material response | U10 credits the zero-row fences (binding, mint redundant ×3, journal, stamp, message, last_seq), the commit-error check, material returned only after commit (c) and the persisted new hash, with the existing error-injection rollback test; A's refusal after remint by B5/B6; per-statement server-error returns (argued equivalent), the empty-AccessToken check and the caller's deferred rollback not separately controlled |
 | Ordinal-zero baseline, successor journal ordinal/capability relation and usage attribution | Positive assertions present; qualifying controls unvalidated |
 | Atomic rollback, lost-reply replay, stale/foreign apply and target fences | Unvalidated |
 | Stopped-support negotiation, immutable expected-epoch latch and unsupported-response obligation | Unvalidated |
@@ -2498,7 +2498,7 @@ Baseline: `git show a233883de3c36bae2e940f999cd9d582889dad00:api/internal/worker
 fails: the file does not exist at a233, and a233 refused every live Codex switch
 (runner.ts :25735–25738; credential_override.go :204, see D74). Every fence in
 `applyCodexSwitchLocked` (api/internal/workersvc/credential_switch_codex_apply.go
-:29–138) is new, so these are class (c)/(d) controls.
+:29–125) is new, so these are class (c)/(d) controls.
 
 Mechanism (candidate): after `validateCodexSwitchLocked` returns ready, one
 transaction under the caller's worker/run locks writes `ApplyRunCodexBinding`
@@ -2518,14 +2518,19 @@ Tests:
   ordinal 2 / epoch 43) and `TestCodexApplyWriteRollbackLiveDB`
   (credential_switch_codex_apply_rollback_livedb_test.go :12; RAISE triggers at
   binding, mint, journal, stamp, message, last_seq and a deferred commit-time
-  constraint; :46 no auth on failure, snapshot unchanged).
-- New (d43fd2ca6): `TestCodexApplyZeroRowWriteRollbackLiveDB`
+  constraint; :46 no auth on failure, :48–49 snapshot unchanged).
+- New (d43fd2ca6; mint and journal leaves added in ca154ebae review rework;
+  line numbers at ca154ebae): `TestCodexApplyZeroRowWriteRollbackLiveDB`
   (credential_switch_codex_apply_zero_row_livedb_test.go), leaves binding,
-  stamp, message, last_seq: a per-run BEFORE trigger `RETURN NULL`s the one
-  intended statement so it affects zero rows without an error. Apply must return
-  an error and no material (:39), `ErrStaleClaim` (:45–46) or, for message,
-  "codex switch message sequence occupied" (:42–43), and leave the snapshot
-  unchanged (:49). The three `ErrStaleClaim` leaves rely on each trigger
+  mint, journal, stamp, message, last_seq: a per-run BEFORE trigger
+  `RETURN NULL`s the one intended statement so it affects zero rows without a
+  server error. Apply must return an error and no material (:47),
+  "codex switch message sequence occupied" for message (:51–52),
+  `pgx.ErrNoRows` for mint and journal (:55–56; the two RETURNING writes
+  surface the skip client-side, which does not abort the Postgres transaction),
+  `ErrStaleClaim` otherwise (:59–60), and leave the snapshot unchanged (:64).
+  The d43fd2ca6 control rows below cite that commit's lines (:39 = today's
+  :47). The three `ErrStaleClaim` leaves rely on each trigger
   condition matching only its statement (checked against the SQL: the binding
   writer leaves the stamp, last_seq and epoch columns alone).
 
@@ -2542,27 +2547,38 @@ Command (export of d43fd2ca6, throwaway postgres `cdr-4202-u10pg`): from api,
 | u10-lastseq-n | (d) guard | last_seq `n != 1` → `false && …` (:113) | zero-row last_seq | u10-lastseq-n | :39 "last_seq: …" |
 | u10-commit-check | (d) guard | `tx.Commit` error check → `false && err != nil` (:116) | rollback commit | u10-commit-check | rollback test :46 "write failure returned auth … outcome=applied" |
 | u10-return-before-commit | (c) ordering | the applied result with B's material is returned before `tx.Commit` (:116); the commit becomes unreachable | bundle (both auth modes); rollback commit | u10-return-before-commit (bundle), u10-return-before-commit-rollback (commit leaf) | bundle :79 "old capability still authorized" (both leaves: the returned material belongs to a switch the caller's rollback undid); rollback :46 "write failure returned auth" |
-| u10-mint-hash | (d) guard | the mint writes the run's old hash instead of the freshly minted one (`Hash: func() []byte { _ = hash; return run.CodexCapHash }()`, :58) | bundle | u10-mint-hash | bundle :83 "replacement capability cannot authorize credential release codex capability does not match", both leaves |
+| u10-mint-hash | (d) behavioural write mutation (not a guard removal) | the mint writes the run's old hash instead of the freshly minted one (`Hash: func() []byte { _ = hash; return run.CodexCapHash }()`, :58) | bundle | u10-mint-hash | bundle :83 "replacement capability cannot authorize credential release codex capability does not match", both leaves |
+| u10-journal-err | (d) guard, ca154ebae | journal insert `err != nil` → `false && err != nil` (:80) | zero-row journal | u10-journal-err | zero-row test :47 "journal: zero-row write returned auth … outcome=applied ordinal=0" |
+| u10-mint-redundant | redundant-fence guard (decision 9), ca154ebae | mint zero-row has three copies: the mint `err != nil` (:60), the `capabilityEpoch <= 0` check (:65) and the journal insert's `r.codex_claim_epoch = @capability_epoch` predicate (runtime.sql :2466) surfacing at :80. (i) :60 alone; (ii) :65 alone; (iii) :60+:65; (iv) :60+:65+:80 | zero-row mint | u10-mint-err-only, u10-mint-epochcheck-only, u10-mint-both, u10-mint-triple | (i) still refused, red only at the error-identity assertion :56 ("incomplete Codex switch material, want pgx.ErrNoRows": :65 refused); (ii) EXIT=0; (iii) EXIT=0 (the journal predicate refused epoch 0 with ErrNoRows at :80); (iv) :47 "mint: zero-row write returned auth … outcome=applied" |
 
 Not credited: the first u10-mint-hash form (`Hash: run.CodexCapHash`) failed
 to compile (`declared and not used: hash`,
 `u10-mint-hash.compilefail.log`); the first u10-return-before-commit selection
 named the rollback commit leaf in a top-level alternation that `-run` does not
 match, so only the bundle half ran there (the commit leaf was re-run as
-u10-return-before-commit-rollback). The `capabilityEpoch <= 0` / empty
-material check before journalling (:65–67) and the journal insert's own errors
-are not controlled. Revocation of A's capability is the epoch bump plus the new
+u10-return-before-commit-rollback). The empty-AccessToken half of the :65
+check is not controlled (validate refuses empty material first). The
+per-statement `err != nil` returns for server-raised errors (:50, :60, :72, :80,
+:84, :101, :110) and the JSON errors (:68, :94) have no individual control:
+`TestCodexApplyWriteRollbackLiveDB` exercises the RAISE paths, and a
+server-raised error aborts the transaction so the next statement or the commit
+also fails (argued from Postgres semantics, not tested per guard); :60 and :80
+are controlled for their zero-row ErrNoRows case above. No control removes the
+caller's deferred rollback (credential_switch_apply.go :295); the snapshot
+assertions (zero-row :64, rollback :48–49) are positive assertions on it. Revocation of A's capability is the epoch bump plus the new
 hash; the epoch and hash guards that refuse A are credited by B5/B6, and
 u10-mint-hash credits that the new hash is what is persisted.
 
-Unchanged candidate d43fd2ca6: the bundle, target-moved-after-preflight,
-write-rollback and zero-row tests pass, EXIT=0
-(`.uzi/scratch/ctl-logs/u10-green.log`); `task lint:api` 0 issues
-(`u10-lint-api.log`).
+Unchanged candidate ca154ebae: the bundle, target-moved-after-preflight,
+write-rollback and zero-row (six leaves) tests pass, EXIT=0
+(`.uzi/scratch/ctl-logs/u10r-green.log`); `task lint:api` 0 issues
+(`u10r-lint-api.log`). (d43fd2ca6's u10-green.log / u10-lint-api.log are the
+first-round records.)
 
 Credit: the binding rewrite, capability remint, journal, stamp clear and
-message commit together or not at all, including when a write affects zero rows
-without an error; B's material is returned only after a successful commit (a
+message commit together or not at all, including when any of the six writes
+affects zero rows without a server error (for the mint, any one of three
+copies suffices); B's material is returned only after a successful commit (a
 commit failure or a return placed before the commit is detected); the persisted
 capability hash is the newly minted one. Not credited: storage or power-loss
 durability (process-loss model only), concurrent readers' isolation beyond
