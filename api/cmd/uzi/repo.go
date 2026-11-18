@@ -126,7 +126,7 @@ func newRepoEnvCmd(env Env, gf *globalFlags) *cobra.Command {
 				})
 			}
 			if out.VaultLocked {
-				_, _ = fmt.Fprintln(env.Stderr, "Your vault is locked: plain values are withheld until you unlock it (uzi vault unlock).")
+				_, _ = fmt.Fprintln(env.Stderr, vaultLockedNote(gf))
 			}
 			return p.Table([]string{"NAME", "KIND", "STATE", "VALUE", "DESCRIPTION", "UPDATED"}, rows)
 		},
@@ -135,9 +135,41 @@ func newRepoEnvCmd(env Env, gf *globalFlags) *cobra.Command {
 	return cmd
 }
 
+// vaultLockedNote is the stderr hint printed when the list reports vault_locked (the
+// vault is locked or its state could not be checked). The suggested unlock command
+// carries the caller's --context/--url so it targets the same server.
+func vaultLockedNote(gf *globalFlags) string {
+	cmd := "uzi vault unlock"
+	if gf.context != "" {
+		cmd += " --context " + shellQuote(gf.context)
+	}
+	if gf.url != "" {
+		cmd += " --url " + shellQuote(gf.url)
+	}
+	return uzicli.CellText("Your vault is locked or its state could not be checked: plain values are withheld. If it is locked, run " + cmd + ".")
+}
+
+// shellQuote wraps s in POSIX single quotes (each embedded single quote becomes
+// close-quote, backslash-quote, reopen-quote) unless it is
+// non-empty and made only of characters that are safe unquoted.
+func shellQuote(s string) string {
+	safe := s != ""
+	for _, r := range s {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("._:/@=+-", r)) {
+			safe = false
+			break
+		}
+	}
+	if safe {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
 // runEnvValueCell is the VALUE column: a secret never shows a value, a plain value
 // the server withheld says so without guessing why (the vault may be locked, absent,
-// or unable to open the value; the list's vault_locked tells which), otherwise the
+// or unable to open the value; the list's vault_locked is only a fail-closed hint,
+// true when the vault is locked or its state could not be checked), otherwise the
 // user-authored value, terminal-sanitized.
 func runEnvValueCell(v apitypes.RunEnvVarDTO) string {
 	switch {

@@ -18,7 +18,8 @@ const (
 // value appears in no response, ever: Value is null for it. For a plain variable the
 // value is withheld (Value null, ValueWithheld true) when the vault is locked, no vault
 // is configured, or the value cannot be opened. On the list, RunEnvListDTO.VaultLocked
-// says whether the vault is locked; a write response carries no such indicator.
+// is true when the vault is locked or its state could not be checked; a write
+// response carries no such indicator.
 type RunEnvVarDTO struct {
 	// VarID identifies the variable across its versions; a name re-created after a
 	// delete gets a new one, so it keys rows that share a name.
@@ -47,9 +48,11 @@ type RunEnvCountsDTO struct {
 
 // RunEnvListDTO is the body of GET /api/repos/{id}/env.
 type RunEnvListDTO struct {
-	Variables   []RunEnvVarDTO  `json:"variables"`
-	Counts      RunEnvCountsDTO `json:"counts"`
-	VaultLocked bool            `json:"vault_locked"`
+	Variables []RunEnvVarDTO  `json:"variables"`
+	Counts    RunEnvCountsDTO `json:"counts"`
+	// VaultLocked is true when the vault is locked OR its state could not be checked
+	// (fail-closed: plain values are withheld either way).
+	VaultLocked bool `json:"vault_locked"`
 }
 
 // RunEnvWriteDTO is the body of a PUT that created or changed one variable.

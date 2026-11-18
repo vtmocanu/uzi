@@ -86,7 +86,32 @@ func TestRepoEnvListVaultLockedNote(t *testing.T) {
 	if _, errOut, _ := runCLI(t, fakeEnv(repoEnvFake()), "repo", "env", "list", "r1"); strings.Contains(errOut, note) {
 		t.Errorf("unlocked list printed the note: %q", errOut)
 	}
-	if _, errOut, _ := runCLI(t, fakeEnv(locked), "repo", "env", "list", "r1", "--json"); strings.Contains(errOut, note) {
-		t.Errorf("--json printed the note: %q", errOut)
+	jout, jerr, jcode := runCLI(t, fakeEnv(locked), "repo", "env", "list", "r1", "--json")
+	if jcode != uzicli.ExitOK {
+		t.Fatalf("--json exit = %d, want 0", jcode)
+	}
+	if strings.Contains(jerr, note) {
+		t.Errorf("--json printed the note: %q", jerr)
+	}
+	var got apitypes.RunEnvListDTO
+	if err := json.Unmarshal([]byte(jout), &got); err != nil {
+		t.Fatalf("--json stdout is not the list DTO: %v\n%s", err, jout)
+	}
+	if !got.VaultLocked {
+		t.Errorf("--json vault_locked = false, want true: %s", jout)
+	}
+}
+
+func TestRepoEnvListVaultLockedNoteCarriesFlags(t *testing.T) {
+	locked := repoEnvFake()
+	locked.RepoEnvResult.VaultLocked = true
+	_, errOut, code := runCLI(t, fakeEnv(locked), "repo", "env", "list", "r1",
+		"--context", "my ctx", "--url", "https://uzi.example.com")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, stderr=%q", code, errOut)
+	}
+	const want = "uzi vault unlock --context 'my ctx' --url https://uzi.example.com"
+	if !strings.Contains(errOut, want) {
+		t.Errorf("note missing %q: %q", want, errOut)
 	}
 }

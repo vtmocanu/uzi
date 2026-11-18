@@ -69,8 +69,9 @@ Allowed: `DATABASE_URL`, cloud credentials such as `AWS_ACCESS_KEY_ID`,
 The value field is a single line by default; a secret is masked by a password
 field. Turn on **Multiline** for values with line breaks, such as PEM keys or
 JSON. Pasting a value that contains line breaks into the single-line field
-switches to Multiline automatically and keeps the line breaks. Line endings are
-stored as LF. A multiline secret is masked with CSS, which is not portable
+switches to Multiline automatically and keeps the line breaks. A paste with only
+a single trailing line break, such as a token copied from a terminal, is trimmed
+and stays single-line. The form saves line endings as LF. A multiline secret is masked with CSS, which is not portable
 across browsers.
 
 ## Worked examples
@@ -82,7 +83,7 @@ are only stored. All hosts are placeholders.
 
 | Name | Kind | Value | Why |
 |---|---|---|---|
-| `EXAMPLE_API_URL` | plain | `https://api.example.com` | Not sensitive; the agent needs to see it. |
+| `EXAMPLE_API_URL` | plain | `https://api.example.com` | Not sensitive; plain values are readable in the UI and CLI. |
 | `EXAMPLE_API_KEY` | secret | the key | A credential; never shown again and redacted from output. |
 
 ### A private Maven repository
@@ -102,6 +103,18 @@ A build can reference them, for example a `settings.xml` server entry:
   <password>${env.MAVEN_REPO_PASSWORD}</password>
 </server>
 ```
+
+and a matching repository declaration, for example in a `pom.xml` or a
+`settings.xml` profile:
+
+```xml
+<repository>
+  <id>example</id>
+  <url>${env.MAVEN_REPO_URL}</url>
+</repository>
+```
+
+The repository `id` must match the server `id`, or Maven sends no credentials.
 
 ### A container registry
 

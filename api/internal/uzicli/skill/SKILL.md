@@ -1899,8 +1899,9 @@ into `file`/`dismiss`/`resolve`. `undo` keys on the `disposition_id` field (read
   full list with counts and `vault_locked`. A secret's value is never shown
   (`(secret)`), and a plain value the server withheld reads `(withheld)` (vault
   locked, no vault configured, or the value cannot be opened). When the list reports
-  `vault_locked`, the table path also prints a note to stderr telling you to run
-  `uzi vault unlock`; `--json` is unchanged. Variables are written in the web UI only; the CLI has no write verb.
+  `vault_locked` (the vault is locked or its state could not be checked), the table
+  path prints a note to stderr suggesting `uzi vault unlock`, carrying the same
+  `--context`/`--url` flags; `--json` prints no note. Variables are written in the web UI only; the CLI has no write verb.
 - `uzi admin users|runs|workers|health|usage|rate-limits|cli-tokens|guardrail-impact` and
   `uzi admin agent-source get|status` —
   **read-only** factory-wide views. These require an admin-scoped (`uza_`) token; a
