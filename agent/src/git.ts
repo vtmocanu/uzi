@@ -2581,7 +2581,6 @@ export type RetireBindingStep =
   | "intent-write" | "intent-sync" | "intent-written"
   | "renamed" | "rename-dir-sync" | "move-verified"
   | "journal-cleared" | "ledger-appended" | "config-sync"
-  | "settle-write" | "settle-sync" | "settled"
   | "removing-write" | "removing-sync" | "removing-written"
   | "removed" | "root-synced-after-rm" | "unset" | "unset-sync" | "unset-done"
   | "unmoved-unset" | "unmoved-unset-sync" | "unmoved-unset-done"
@@ -2668,7 +2667,7 @@ export type RetireBindingsRead = { state: "read"; bindings: RetireBindingRead[] 
 /** Why a bound retire-scratch parent is kept; fixed tokens only. */
 export type RetireKeepReason =
   | "conflict" | "malformed_binding" | "bound_intent" | "interrupted_removal" | "class_ineligible"
-  | "ledger_missing" | "ledger_mismatch" | "protected_by_retained_source" | "custody" | "canonical_present";
+  | "ledger_missing" | "ledger_mismatch" | "protected_by_retained_source" | "custody" | "canonical_present" | "settled_kept";
 
 /** One bare's raw metadata as the retire-scratch reclaim reads it under that bare's lock. */
 export interface RetireScratchBareEvidence {
@@ -2812,6 +2811,8 @@ export function evaluateRetireBinding(input: {
   if (!b) return keep("malformed_binding");
   if (b.phase === "intent") return keep("bound_intent");
   if (b.phase === "removing") return keep("interrupted_removal");
+  // C-prime (#4263 [7]): no writer produces `settled`; a pre-existing one is kept, never reclaimed.
+  if (b.phase === "settled") return keep("settled_kept");
   if (!RETIRE_RECLAIM_CLASSES.has(b.class)) return keep("class_ineligible");
   if (retireOtherBindingConflicts(evidence, entry.key, b)) return keep("conflict");
   if (input.otherBares && retireCrossBareConflict(input.otherBares, b.attemptId)) return keep("conflict");
@@ -2878,7 +2879,7 @@ interface RetireBound {
   cloneDev: bigint;
   /** The clone was verified at `<parent>/clone` (inode and device) and the directories holding it were synced. */
   moveVerified: boolean;
-  /** The journal clear and the `retired` ledger append were synced after the move. */
+  /** The journal clear and the `retired` ledger append were synced after the move (recorded for the step order; no settle decision reads it). */
   durable: boolean;
 }
 
@@ -20420,7 +20421,7 @@ export class GitCache {
       const journalBeforeMove = opts.completionSource ? undefined : await this.readRecoveryCaptureWithRaw(barePath, branch);
       const ledgerBeforeMove = (opts.completionSource ? [] : await this.readAllAttemptLedgerRaw(barePath))
         .filter(([b]) => b === branch).map(([, raw]) => raw);
-      let cleared = false, appended = false, retiredAppendOk = false;
+      let cleared = false, appended = false;
       let movedTo: string | undefined;
       const retiredValue = opts.attemptId === undefined ? undefined : attemptLedgerValue({
         attemptId: opts.attemptId, runId: ownerRunId, clonePath, state: "retired",
@@ -20596,7 +20597,7 @@ export class GitCache {
           checkProcessProof();
           appended = true;
           await this.appendAttemptLedger(barePath, branch, { attemptId: opts.attemptId, runId: ownerRunId, clonePath, state: "retired" }).then(
-            () => { retiredAppendOk = true; },
+            undefined,
             (err: unknown) => {
               unproven();
               this.log.warn("retireRunnerClone: could not record the attempt as retired; the gone path is compacted later", {
@@ -20609,7 +20610,7 @@ export class GitCache {
           if (rb.bound) await this.retireStep("ledger-appended");
         }
         if (rb.bound && !opts.completionSource) {
-          // Make the journal clear and the retired append durable before the binding may settle.
+          // Make the journal clear and the retired append durable before any later removing transition.
           try {
             await this.retireStep("config-sync");
             await this.syncConfigAndVerify(barePath, async () => {});
@@ -20648,49 +20649,11 @@ export class GitCache {
             };
             const bound = rb.bound;
             if (bound && split) {
-              // issue #4263: the bound parent is left for a verified epoch to reclaim. Settle first, but only when every
-              // proof holds; otherwise the binding stays `intent`.
+              // issue #4263 [7] (C-prime): a bound split parent is never settled. A process-proof revocation arriving during a
+              // settle write could leave `settled`, which authorizes deletion by the pod epoch, so on a uid-split pod the
+              // binding stays `intent` and the epoch keeps it.
               beforeDestroy();
-              const settles = await (async (): Promise<boolean> => {
-                if (!(opts.dispositionClass === "verified_successor" || opts.dispositionClass === "owner_terminal") ||
-                    !bound.moveVerified || !bound.durable || !retiredAppendOk) return false;
-                try {
-                  if ((await this.readRecoveryCapture(barePath, branch))?.clonePath === clonePath) return false;
-                } catch (err) {
-                  this.log.warn("retire scratch binding stays intent: the recovery journal could not be read", {
-                    clone: clonePath, error: gitErrorMessage(err),
-                  });
-                  return false;
-                }
-                // Terminal protection is re-read last (fail-closed to true on a callback error).
-                if (await this.hasPhysicalTerminalProtection(ownerRunId)) return false;
-                if (residueQuarantine() !== undefined || processRevokedHere) return false;
-                if (opts.processProof !== undefined) {
-                  let valid = false;
-                  try { valid = opts.processProof() === true; } catch { valid = false; }
-                  if (!valid) { processRevokedHere = true; return false; }
-                }
-                return true;
-              })();
-              if (settles) {
-                try {
-                  // The guard re-reads terminal protection after the settle-write step and right before the value is written,
-                  // then re-reads process proof and the residue quarantine. Narrowed guarantee: a revocation or quarantine
-                  // visible at the guard's final check never writes settled. A revocation arriving after that check (while
-                  // the git config write runs or during sync) is NOT covered here.
-                  await this.advanceRetireBindingUnderLock(barePath, bound, "settled", async () => {
-                    if (await this.hasPhysicalTerminalProtection(ownerRunId)) throw new Error("terminal protection arrived before the settle write");
-                    checkProcessProof();
-                    if (residueQuarantine() !== undefined) throw new Error("residue quarantine latched before the settle write");
-                  });
-                } catch (err) {
-                  this.log.warn("retire scratch binding settle did not complete", {
-                    clone: clonePath, error: gitErrorMessage(err),
-                    binding_phase: await this.currentRetireBindingPhase(barePath, bound.uuid),
-                  });
-                }
-              }
-              // The deferred parent is left for the epoch exactly as a failed in-process scratch removal leaves it today.
+              // The deferred parent is left in place exactly as a failed in-process scratch removal leaves it today.
               unproven();
               this.log.info("retire scratch parent deferred to verified epoch", { path: scratch });
             } else {
@@ -20960,7 +20923,7 @@ export class GitCache {
    *  warning is followed by OBSERVATION records only: at most RETIRE_SCRATCH_REPORTED_PATHS
    *  `runner retire scratch outcome` rows (`kept`, or since issue #4263 `reclaimed` from the pass's own report
    *  `opts.reclaim.report`; a kept bound parent carries a binding-aware reason: `bound_intent`, `interrupted_removal`,
-   *  `malformed_binding`, `disabled`, `epoch_not_eligible`, `budget_deferred` or the pass's own, while an unbound one keeps
+   *  `malformed_binding`, `settled_kept` or the pass's own, while an unbound one keeps
    *  `protected_by_retained_source` / `no_disposition_evidence`) and exactly one
    *  `runner retire scratch total` per startup whenever outcomes are on and the runner root was
    *  listed (it exists and is a real directory), including with zero parents. A missing,
@@ -21238,10 +21201,7 @@ export class GitCache {
       if (binding === "intent") return { retained_source, binding, reason: "bound_intent" };
       if (binding === "removing") return { retained_source, binding, reason: "interrupted_removal" };
       if (binding === "malformed") return { retained_source, binding, reason: "malformed_binding" };
-      if (binding === "settled") {
-        const reason = opts.reclaim?.enabled === false ? "disabled" : report?.reason === "budget_deferred" ? "budget_deferred" : "epoch_not_eligible";
-        return { retained_source, binding, reason };
-      }
+      if (binding === "settled") return { retained_source, binding, reason: "settled_kept" };
       return { retained_source, binding, reason: legacy };
     };
     // Parents the pass reclaimed are gone from the listing, so their rows come from its report.
@@ -21474,14 +21434,14 @@ export class GitCache {
     }
   }
 
-  /** Write the next phase of a bound scratch parent (`settled` or `removing`) and remember the value. */
-  private async advanceRetireBindingUnderLock(barePath: string, bound: RetireBound, phase: "settled" | "removing",
+  /** Write the `removing` phase of a bound scratch parent and remember the value. No writer produces `settled` (C-prime). */
+  private async advanceRetireBindingUnderLock(barePath: string, bound: RetireBound, phase: "removing",
     guard?: () => Promise<void>): Promise<void> {
     const next: RetireBinding = { ...bound.binding, phase };
     bound.raw = await this.writeRetireBindingUnderLock(barePath, bound.uuid, next,
-      phase === "settled" ? { write: "settle-write", sync: "settle-sync" } : { write: "removing-write", sync: "removing-sync" }, guard);
+      { write: "removing-write", sync: "removing-sync" }, guard);
     bound.binding = next;
-    await this.retireStep(phase === "settled" ? "settled" : "removing-written");
+    await this.retireStep("removing-written");
   }
 
   /** issue #4263: require the removed scratch parent to read ENOENT, then sync the runner root so the removal is durable. */

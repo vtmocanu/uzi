@@ -303,7 +303,7 @@ describe("verified successor retirement", () => {
     });
   }
 
-  it("verified successor on a simulated split settles its binding and leaves the parent for a verified epoch", async (t) => {
+  it("verified successor on a simulated split leaves its binding at intent and the parent in place", async (t) => {
     const s = await seedCompleted();
     bindingSeams(t, { split: true });
     await retireClassed(s);
@@ -311,9 +311,24 @@ describe("verified successor retirement", () => {
     assert.equal(rows.length, 1);
     const raw = rows[0]!.slice(rows[0]!.indexOf(" ") + 1);
     const parsed = JSON.parse(raw) as { class: string; phase: string; attemptId: string };
-    assert.deepEqual([parsed.class, parsed.phase, parsed.attemptId], ["verified_successor", "settled", s.opts.attemptId]);
+    assert.deepEqual([parsed.class, parsed.phase, parsed.attemptId], ["verified_successor", "intent", s.opts.attemptId]);
     assert.equal(fs.readdirSync(runnerRoot()).filter(n => n.startsWith(".retire-")).length, 1, "the parent is not disposed in process");
     assert.equal(s.ledger().at(-1)!.state, "retired");
+  });
+
+  // C-prime (#4263 [7]): the verified successor's split retire never writes `settled`.
+  it("C-prime: a split verified_successor retire with a valid proof never reaches a settle step and stays intent", async (t) => {
+    const s = await seedCompleted();
+    const seen: string[] = [];
+    bindingSeams(t, { split: true, step: step => { seen.push(String(step)); } });
+    await retireClassed(s);
+    assert.ok(seen.includes("config-sync"), "the retire ran to its last binding step");
+    assert.deepEqual(seen.filter(n => n.startsWith("settle")), [], "no step whose name starts with settle");
+    const rows = retireBindings(s.bare);
+    assert.equal(rows.length, 1);
+    const parsed = JSON.parse(rows[0]!.slice(rows[0]!.indexOf(" ") + 1)) as { phase: string };
+    assert.equal(parsed.phase, "intent");
+    assert.equal(fs.readdirSync(runnerRoot()).filter(n => n.startsWith(".retire-")).length, 1, "the parent is present");
   });
 
   for (const drift of ["journal", "ledger", "identity"] as const) {

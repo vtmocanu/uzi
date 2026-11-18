@@ -86,7 +86,7 @@ beforeEach(() => { fx = makeFixture(); });
 afterEach(() => { resetResidueQuarantineForTests(); fx.cleanup(); });
 
 describe("happy paths", () => {
-  it("owner_terminal on a simulated split settles the binding, keeps the parent and runs no rm", async (t) => {
+  it("owner_terminal on a simulated split leaves the binding at intent, keeps the parent and runs no rm", async (t) => {
     exdev(t);
     const rm = fsp.rm.bind(fsp);
     const removed: string[] = [];
@@ -107,7 +107,7 @@ describe("happy paths", () => {
     assert.deepEqual(lost, []);
     const [b] = bindings(s.bare);
     assert.equal(bindings(s.bare).length, 1);
-    assert.equal(b!.binding!.phase, "settled");
+    assert.equal(b!.binding!.phase, "intent");
     assert.equal(b!.binding!.class, "owner_terminal");
     assert.equal(b!.binding!.attemptId, ATTEMPT);
     assert.equal(b!.binding!.runId, s.owner);
@@ -124,9 +124,23 @@ describe("happy paths", () => {
     assert.ok(logs.info.includes("retire scratch parent deferred to verified epoch"));
     const phaseAt = (step: RetireBindingStep): string | undefined => seen.find(([name]) => name === step)?.[1];
     for (const step of ["parent-created", "parent-pinned", "root-synced", "cap-checked", "intent-write"] as const) assert.equal(phaseAt(step), "absent", step);
-    for (const step of ["intent-written", "renamed", "move-verified", "journal-cleared", "ledger-appended", "config-sync", "settle-write"] as const)
+    for (const step of ["intent-written", "renamed", "move-verified", "journal-cleared", "ledger-appended", "config-sync"] as const)
       assert.equal(phaseAt(step), "intent", step);
-    assert.equal(phaseAt("settled"), "settled");
+    assert.deepEqual(seen.map(([name]) => String(name)).filter(n => n.startsWith("settle")), [], "no settle step is ever reached");
+  });
+
+  // C-prime (#4263 [7]): a uid-split retire never writes `settled`. The verified_successor twin is in runner-clone-retire.test.ts.
+  it("C-prime: a split owner_terminal retire with a valid proof never reaches a settle step and stays intent", async (t) => {
+    exdev(t);
+    const seen: string[] = [];
+    const c = mk({ split: true, step: step => { seen.push(String(step)); } });
+    const s = await seed(c, 4903);
+    await c.retireRunnerClone(s.bare, s.clonePath, s.branch, s.owner,
+      { discard: true, attemptId: ATTEMPT, dispositionClass: "owner_terminal", processProof: () => true });
+    assert.deepEqual(seen.filter(n => n.startsWith("settle")), [], "no step whose name starts with settle");
+    assert.equal(phase(s.bare), "intent");
+    assert.equal(parents().length, 1, "the parent is present");
+    assert.equal(fs.existsSync(s.clonePath), false);
   });
 
   it("owner_terminal on a single uid writes removing before the rm, then unsets and removes the parent", async (t) => {
@@ -144,7 +158,7 @@ describe("happy paths", () => {
     assert.deepEqual(at("removing-written").slice(1), ["removing", true], "removing is durable while the parent still exists");
     assert.deepEqual(at("removed").slice(1), ["removing", false]);
     assert.equal(at("unset")[1], "removing");
-    assert.equal(seen.some(([name]) => name === "settle-write"), false, "a single-uid retire never settles");
+    assert.equal(seen.some(([name]) => String(name) === "settle-write"), false, "a single-uid retire never settles");
   });
 
   for (const [cls, discard] of [["owner_terminal_covered", true], ["other", false]] as const) {
@@ -181,7 +195,7 @@ describe("happy paths", () => {
       { discard: true, attemptId: ATTEMPT, dispositionClass: "completion", completionSource: { expectedHead: head, canDelete: () => true } });
     assert.deepEqual(bindings(s.bare), []);
     assert.deepEqual(parents(), []);
-    assert.equal(seen.some(([name]) => name === "settle-write"), false, "completion never settles");
+    assert.equal(seen.some(([name]) => String(name) === "settle-write"), false, "completion never settles");
     assert.equal(seen.find(([name]) => name === "removing-written")![1], "removing");
     assert.equal(seen.find(([name]) => name === "unset")![1], "removing");
     assert.equal(hasRetiredEntry(s.bare, s.branch), true);
@@ -251,9 +265,8 @@ describe("crash and failure injection recovery table", () => {
       rows.push({ step, split, rejects: true, bind: ["intent"], where: "scratch" });
   }
   // Soft metadata steps after the move: the retire still completes and the binding is left where it was.
-  for (const step of ["rename-dir-sync", "config-sync", "settle-write"] as const) rows.push({ step, split: true, rejects: false, bind: ["intent"], where: "scratch" });
-  rows.push({ step: "settle-sync", split: true, rejects: false, bind: ["settled", "intent"], where: "scratch" });
-  rows.push({ step: "settled", split: true, rejects: false, bind: ["settled"], where: "scratch" });
+  // C-prime: the split retire has no settle step, so config-sync is its last binding step and the binding stays intent.
+  for (const step of ["rename-dir-sync", "config-sync"] as const) rows.push({ step, split: true, rejects: false, bind: ["intent"], where: "scratch" });
   for (const step of ["rename-dir-sync", "config-sync"] as const) rows.push({ step, split: false, rejects: false, bind: ["absent"], where: "gone" });
   rows.push({ step: "removing-write", split: false, rejects: false, bind: ["intent"], where: "scratch" });
   for (const step of ["removing-sync", "removing-written"] as const) rows.push({ step, split: false, rejects: false, bind: ["removing"], where: "scratch" });
@@ -287,7 +300,7 @@ describe("crash and failure injection recovery table", () => {
   }
 });
 
-describe("arrivals between intent and settle", () => {
+describe("arrivals after the move on a split", () => {
   it("terminal protection arriving after the move leaves intent and the parent", async (t) => {
     exdev(t);
     const c = mk({ split: true });
@@ -449,15 +462,17 @@ describe("audit rework", () => {
   const retire = (c: GitCache, s: Seed, extra: Record<string, unknown> = {}) =>
     c.retireRunnerClone(s.bare, s.clonePath, s.branch, s.owner, { discard: true, attemptId: ATTEMPT, dispositionClass: "owner_terminal", ...extra });
 
-  it("terminal protection arriving at the settle-write step leaves intent", async (t) => {
+  it("terminal protection arriving at the former settle point (after config-sync) leaves intent and no settle step", async (t) => {
     exdev(t);
     let flipped = false;
-    const c = mk({ split: true, step: step => { if (step === "settle-write") flipped = true; } });
+    const seen: string[] = [];
+    const c = mk({ split: true, step: step => { seen.push(String(step)); if (step === "config-sync") flipped = true; } });
     const s = await seed(c, 4280);
     const real = c.hasPhysicalTerminalProtection.bind(c);
     t.mock.method(c, "hasPhysicalTerminalProtection", async (id: string) => (flipped ? true : real(id)));
     await retire(c, s);
-    assert.equal(flipped, true, "the settle write was reached");
+    assert.equal(flipped, true, "the config-sync step was reached");
+    assert.deepEqual(seen.filter(n => n.startsWith("settle")), []);
     assert.equal(phase(s.bare), "intent");
     assert.equal(parents().length, 1);
   });
@@ -492,102 +507,44 @@ describe("audit rework", () => {
     assert.equal(parents().length, 1);
   });
 
-  // The settle predicate reads the proof second to last; the settle-write guard reads it last (the final read of the call).
-  for (const site of ["predicate", "guard"] as const) {
-    for (const mode of ["returns false", "throws"] as const) {
-      it(`a process proof that ${mode} at the settle ${site} never settles`, async (t) => {
+  // C-prime (#4263 [7]): the former settle point is the end of the split retire. A proof revocation or quarantine latch
+  // injected there, or at the step before it, leaves the binding at intent and no settle step is ever observed.
+  for (const at of ["ledger-appended", "config-sync"] as const) {
+    for (const arrival of ["process proof revoked", "residue quarantine latched"] as const) {
+      it(`${arrival} at ${at} leaves intent, never settled, and reaches no settle step`, async (t) => {
         exdev(t);
-        let calls = 0;
-        const counting = mk({ split: true });
-        const first = await seed(counting, 4283);
-        await retire(counting, first, { processProof: () => { calls++; return true; } });
-        assert.equal(phase(first.bare), "settled");
-        const total = calls;
-        assert.ok(total > 2);
-        const denyAt = site === "guard" ? total : total - 1;
-        fx.cleanup();
-        fx = makeFixture();
-        let n = 0;
-        // Anchor each denial to an observable step: the guard runs after settle-write, the predicate before it.
-        let nAtSettleWrite: number | undefined;
-        const c = mk({ split: true, step: step => { if (step === "settle-write") nAtSettleWrite = n; } });
-        const s = await seed(c, 4284);
-        await retire(c, s, { processProof: () => {
-          if (++n < denyAt) return true;
-          if (mode === "throws") throw new Error("proof callback failed");
-          return false;
+        let revoked = false;
+        const seen: string[] = [];
+        let s!: Seed;
+        const c = mk({ split: true, step: step => {
+          seen.push(String(step));
+          if (step !== at) return;
+          if (arrival === "process proof revoked") revoked = true;
+          else latchResidueQuarantine({ cause: "arrival", site: "test", runId: s.owner }, nullLogger());
         } });
-        assert.equal(n, denyAt, `the denial came from the settle ${site}, read ${denyAt} of ${total}`);
-        if (site === "guard") assert.equal(nAtSettleWrite, denyAt - 1, "the denying read is the first one after the settle-write step");
-        else assert.equal(nAtSettleWrite, undefined, "a predicate denial never reaches the settle write");
+        s = await seed(c, at === "config-sync" ? 4900 : 4901);
+        await retire(c, s, { processProof: () => !revoked }).catch(() => undefined);
+        assert.ok(seen.includes(at), `${at} was reached`);
+        assert.deepEqual(seen.filter(n => n.startsWith("settle")), []);
+        assert.notEqual(phase(s.bare), "settled", "the parent stays ineligible for epoch deletion");
         assert.equal(phase(s.bare), "intent");
-        assert.equal(parents().length, 1);
+        // A revoked proof rolls the clone back to its canonical path (the binding is left for the epoch's gone-parent
+        // recovery); a quarantine latch keeps the clone in its parent. Either way the clone is never lost.
+        if (arrival === "process proof revoked") assert.equal(fs.existsSync(path.join(s.clonePath, "owner.txt")), true);
+        else assert.equal(parents().length, 1);
       });
     }
   }
 
-  it("review probe: revoked process proof at settle-write must not leave a settled binding", async (t) => {
+  it("control: a valid process proof through config-sync still ends at intent with the parent kept", async (t) => {
     exdev(t);
-    let revoked = false;
-    const c = mk({ split: true, step: step => { if (step === "settle-write") revoked = true; } });
-    const s = await seed(c, 4900);
-    await c.retireRunnerClone(s.bare, s.clonePath, s.branch, s.owner, { discard: true, attemptId: ATTEMPT, dispositionClass: "owner_terminal", processProof: () => !revoked });
-    assert.equal(revoked, true);
-    assert.notEqual(phase(s.bare), "settled", "revocation must keep the parent ineligible for epoch deletion");
-    assert.equal(parents().length, 1);
-  });
-
-  it("control: a process proof that stays valid through settle-write reaches settled", async (t) => {
-    exdev(t);
-    let reached = false;
-    const c = mk({ split: true, step: step => { if (step === "settle-write") reached = true; } });
-    const s = await seed(c, 4901);
-    await c.retireRunnerClone(s.bare, s.clonePath, s.branch, s.owner, { discard: true, attemptId: ATTEMPT, dispositionClass: "owner_terminal", processProof: () => true });
-    assert.equal(reached, true);
-    assert.equal(phase(s.bare), "settled");
-    assert.equal(parents().length, 1);
-  });
-
-  it("a residue quarantine latched at settle-write never leaves a settled binding", async (t) => {
-    exdev(t);
-    let s!: Seed;
-    const c = mk({ split: true, step: step => {
-      if (step === "settle-write") latchResidueQuarantine({ cause: "arrival", site: "test", runId: s.owner }, nullLogger());
-    } });
-    s = await seed(c, 4902);
-    await c.retireRunnerClone(s.bare, s.clonePath, s.branch, s.owner, { discard: true, attemptId: ATTEMPT, dispositionClass: "owner_terminal" });
-    assert.notEqual(phase(s.bare), "settled");
-    assert.equal(parents().length, 1);
-  });
-
-  it("a recovery journal read error at the settle predicate means no settle and no throw", async (t) => {
-    exdev(t);
-    let afterSync = false;
-    const logs: Logs = { warn: [], info: [], warnFields: [] };
-    const c = mk({ split: true, logs, step: step => { if (step === "config-sync") afterSync = true; } });
-    const s = await seed(c, 4285);
-    const priv = c as unknown as { readRecoveryCapture(...a: unknown[]): Promise<unknown> };
-    const real = priv.readRecoveryCapture.bind(c);
-    t.mock.method(priv, "readRecoveryCapture", async (...a: unknown[]) => {
-      if (afterSync) throw new Error("journal read failed");
-      return real(...a);
-    });
-    await retire(c, s);
-    assert.ok(logs.warn.includes("retire scratch binding stays intent: the recovery journal could not be read"));
+    const seen: string[] = [];
+    const c = mk({ split: true, step: step => { seen.push(String(step)); } });
+    const s = await seed(c, 4902);
+    await retire(c, s, { processProof: () => true });
+    assert.ok(seen.includes("config-sync"));
     assert.equal(phase(s.bare), "intent");
-  });
-
-  it("a settle sync failure after git config wrote the value logs the actual phase", async (t) => {
-    exdev(t);
-    const logs: Logs = { warn: [], info: [], warnFields: [] };
-    const c = mk({ split: true, logs, step: step => { if (step === "settle-sync") throw new Error("injected settle-sync"); } });
-    const s = await seed(c, 4286);
-    await retire(c, s);
-    const entry = logs.warnFields!.find(w => w.event === "retire scratch binding settle did not complete");
-    assert.ok(entry, "the settle failure is logged");
-    assert.equal(entry.fields.binding_phase, "settled");
-    assert.equal(phase(s.bare), "settled");
-    assert.ok(!logs.warn.some(w => w.includes("stays intent: settling failed")));
+    assert.equal(parents().length, 1);
   });
 
   it("a removing sync failure after git config wrote the value logs the actual phase", async (t) => {
@@ -627,7 +584,7 @@ describe("audit rework", () => {
     const c = mk({ split: true });
     const s = await seed(c, 4289);
     await retire(c, s, { onRetirementUnproven: () => { unproven++; } });
-    assert.equal(phase(s.bare), "settled");
+    assert.equal(phase(s.bare), "intent");
     assert.equal(unproven, 1);
     let single = 0;
     const c2 = mk({ split: false });

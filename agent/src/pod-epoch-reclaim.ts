@@ -553,9 +553,9 @@ async function scratchBody(ctx: ScratchContext, layout: ScratchLayout, pin: Scra
 
 // ─── issue #4263 M4: the retire-scratch phase ────────────────────────────────────────────────────
 //
-// The verified pass's last phase: it reclaims the bound `<runnerRoot>/.retire-<uuid>` scratch parents whose retirement a
-// previous pod settled (class verified_successor or owner_terminal) and clears the binding of a parent that is already
-// gone. The binding is never activation authority: the gate is the shadow verdict, attested evidence and switch the other
+// The verified pass's last phase: it clears the binding of a bound `<runnerRoot>/.retire-<uuid>` scratch parent that is
+// already gone. C-prime (#4263 [7]): no retire writes `settled`, and a bound parent whose binding reads `settled` is kept
+// with `settled_kept`, so the epoch never deletes a split-pod parent. The binding is never activation authority: the gate is the shadow verdict, attested evidence and switch the other
 // phases use, and every parent is re-proven under A -> S -> B before anything is touched.
 
 const TEST_RETIRE_GATE = Symbol.for("uzi.test.pod-epoch-reclaim.retire-gate");
@@ -1023,7 +1023,7 @@ async function retireBody(ctx: RetireContext, pin: ScratchRootPin, root: string,
             scope, root, rootPin: pin.fd, rootDev: pin.dev, rootMntId: mntId, parentName: name,
             parentIno: b.parentIno, cloneIno: b.cloneIno, deadline: Date.now() + helperMs, maxEntries,
             maxDepth: SCRATCH_DELETE_LIMITS.maxDepth, signal: controller.signal, live,
-            // Every identity and posture refusal precedes this callback, so an ordinary mismatch keeps `settled`.
+            // Every identity and posture refusal precedes this callback, so an ordinary mismatch keeps the binding as examined.
             beforeEffect: async () => { ctx.check(); ctx.entry(); removingRaw = await locked.markRemoving(uuid, ready.raw); removingWritten = true; },
           });
           inDiscard = false;

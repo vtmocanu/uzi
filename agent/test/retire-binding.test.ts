@@ -250,24 +250,24 @@ describe("compactAttemptLedger keeps taint a reclaim evaluation relies on (#4263
     });
   };
 
-  it("control: a canonical bound attempt still compacts to its last value and stays reclaimable", async () => {
+  it("control: a canonical bound attempt still compacts to its last value and still compacts only to its last value (C-prime: a settled binding is kept, never reclaimable)", async () => {
     addLedger(JSON.stringify({ attemptId: ATTEMPT, runId: "run-4263", clonePath: clonePath(), state: "live" }));
     addLedger(canonicalRetired());
     bindSettled();
-    assert.equal((await evaluate()).kind, "ready");
+    assert.deepEqual(await evaluate(), { kind: "keep", reason: "settled_kept" });
     await compact();
     assert.deepEqual(ledgerValues(), [canonicalRetired()]);
-    assert.equal((await evaluate()).kind, "ready");
+    assert.deepEqual(await evaluate(), { kind: "keep", reason: "settled_kept" });
   });
 
-  it("keeps an unknown-state value naming a bound attempt byte-for-byte, so the evaluation stays ledger_mismatch", async () => {
+  it("keeps an unknown-state value naming a bound attempt byte-for-byte, and a settled binding is kept (settled_kept)", async () => {
     addLedger(canonicalRetired());
     const unknownState = JSON.stringify({ attemptId: ATTEMPT, runId: "run-4263", clonePath: clonePath(), state: "future-state" });
     addLedger(unknownState);
     bindSettled();
     await compact();
     assert.ok(ledgerValues().includes(unknownState), "the non-canonical value survives compaction verbatim");
-    assert.deepEqual(await evaluate(), { kind: "keep", reason: "ledger_mismatch" });
+    assert.deepEqual(await evaluate(), { kind: "keep", reason: "settled_kept" });
   });
 
   it("keeps a reordered (parseable, non-canonical) value naming a bound attempt verbatim", async () => {
@@ -277,7 +277,7 @@ describe("compactAttemptLedger keeps taint a reclaim evaluation relies on (#4263
     bindSettled();
     await compact();
     assert.ok(ledgerValues().includes(reordered));
-    assert.deepEqual(await evaluate(), { kind: "keep", reason: "ledger_mismatch" });
+    assert.deepEqual(await evaluate(), { kind: "keep", reason: "settled_kept" });
   });
 
   it("keeps the relative order of a tainted value and the compacted entries, so the last state per attempt is unchanged", async () => {
@@ -335,25 +335,34 @@ describe("conflicting canonical history for one attempt id (#4263)", () => {
   const control: L = [{ branch: BRANCH, raw: ent("live") }, { branch: BRANCH, raw: retired }];
 
   for (const [name, ledger] of conflicts) {
-    it(`pure: an earlier canonical value with ${name} is ledger_mismatch and unresolved`, () => {
-      assert.deepEqual(exam(ledger), { kind: "keep", reason: "ledger_mismatch" });
+    it(`pure: an earlier canonical value with ${name} is kept (settled_kept) and its recovery is unresolved`, () => {
+      assert.deepEqual(exam(ledger), { kind: "keep", reason: "settled_kept" });
       assert.equal(recover(ledger), "unresolved");
     });
   }
 
-  it("pure control: same-identity live then retired is ready and case1", () => {
-    assert.equal(exam(control).kind, "ready");
+  it("pure control: same-identity live then retired is kept (settled_kept) and case1", () => {
+    assert.deepEqual(exam(control), { kind: "keep", reason: "settled_kept" });
     assert.equal(recover(control), "case1");
   });
 
-  it("pure: a second binding naming the attempt with another identity is a conflict and unresolved", () => {
+  it("C-prime: an otherwise-eligible settled binding (canonical ledger, no protection) is kept as settled_kept, never ready", () => {
+    for (const cls of ["owner_terminal", "verified_successor"] as const) {
+      const b: RetireBinding = { ...settled, class: cls };
+      const evidence = evidenceOf(control, [{ key: retireBindingKey(UUID), uuid: UUID, raw: retireBindingValue(b), parsed: b }]);
+      assert.deepEqual(evaluateRetireBinding({ evidence, uuid: UUID, runnerRoot: RUNNER_ROOT, expectRaw: retireBindingValue(b) }),
+        { kind: "keep", reason: "settled_kept" }, cls);
+    }
+  });
+
+  it("pure: a second binding naming the attempt with another identity is kept (settled_kept) and its recovery unresolved", () => {
     const other: RetireBinding = { ...settled, runId: "run-other" };
     const otherUuid = "2b2b2b2b-2222-4222-8b2b-2c2c2c2c2c2c";
     const bindings = [
       { key: retireBindingKey(UUID), uuid: UUID, raw: retireBindingValue(settled), parsed: settled as RetireBinding | undefined },
       { key: retireBindingKey(otherUuid), uuid: otherUuid, raw: retireBindingValue(other), parsed: other as RetireBinding | undefined },
     ];
-    assert.deepEqual(evaluateRetireBinding({ evidence: evidenceOf(control, bindings), uuid: UUID, runnerRoot: RUNNER_ROOT }), { kind: "keep", reason: "conflict" });
+    assert.deepEqual(evaluateRetireBinding({ evidence: evidenceOf(control, bindings), uuid: UUID, runnerRoot: RUNNER_ROOT }), { kind: "keep", reason: "settled_kept" });
     assert.equal(evaluateRetireRecovery({
       evidence: evidenceOf(control, bindings), uuid: UUID, runnerRoot: RUNNER_ROOT, expectRaw: retireBindingValue(settled), canonical: { present: false },
     }), "unresolved");
@@ -399,7 +408,7 @@ describe("conflicting canonical history for one attempt id (#4263)", () => {
       await compactBranch(BRANCH);
       assert.deepEqual(ledgerValues(), input);
       const { ledger, bindings } = await realEvidence();
-      assert.deepEqual(await evalReal(ledger, bindings), { exam: { kind: "keep", reason: "ledger_mismatch" }, recovery: "unresolved" });
+      assert.deepEqual(await evalReal(ledger, bindings), { exam: { kind: "keep", reason: "settled_kept" }, recovery: "unresolved" });
     });
   }
 
@@ -414,7 +423,7 @@ describe("conflicting canonical history for one attempt id (#4263)", () => {
       assert.deepEqual(valuesOf(OTHER_KEY), [live]);
       assert.deepEqual(valuesOf(LEDGER_KEY), [ret]);
       const { ledger, bindings } = await realEvidence();
-      assert.deepEqual(await evalReal(ledger, bindings), { exam: { kind: "keep", reason: "ledger_mismatch" }, recovery: "unresolved" });
+      assert.deepEqual(await evalReal(ledger, bindings), { exam: { kind: "keep", reason: "settled_kept" }, recovery: "unresolved" });
     });
   }
 
@@ -430,7 +439,7 @@ describe("conflicting canonical history for one attempt id (#4263)", () => {
       assert.deepEqual(valuesOf(LEDGER_KEY), [ret]);
       bindSettled();
       const { ledger, bindings } = await realEvidence();
-      assert.deepEqual(await evalReal(ledger, bindings), { exam: { kind: "keep", reason: "ledger_mismatch" }, recovery: "unresolved" });
+      assert.deepEqual(await evalReal(ledger, bindings), { exam: { kind: "keep", reason: "settled_kept" }, recovery: "unresolved" });
     });
   }
 
@@ -441,7 +450,7 @@ describe("conflicting canonical history for one attempt id (#4263)", () => {
     assert.deepEqual(ledgerValues(), input);
     bindSettled();
     const { ledger, bindings } = await realEvidence();
-    assert.deepEqual(await evalReal(ledger, bindings), { exam: { kind: "keep", reason: "ledger_mismatch" }, recovery: "unresolved" });
+    assert.deepEqual(await evalReal(ledger, bindings), { exam: { kind: "keep", reason: "settled_kept" }, recovery: "unresolved" });
   });
 
   it("compaction keeps a gone entry whose run id differs from a decoded binding's", async () => {

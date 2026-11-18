@@ -8,7 +8,6 @@ import { PassThrough } from "node:stream";
 import { execFileSync, spawn, type ChildProcess, type StdioOptions } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
-import http from "node:http";
 import net from "node:net";
 import os from "node:os";
 import fsp from "node:fs/promises";
@@ -23,10 +22,9 @@ import {
 } from "../src/git.js";
 import { protectedLeaves } from "../src/pod-epoch-scratch.js";
 import { buildPodEpochRetireDeps } from "../src/main.js";
-import { WorkerClient } from "../src/client.js";
 import { dockerRunningContainers } from "../src/run-quiescence.js";
 import { formatAttemptId } from "../src/attempt-path.js";
-import { latchResidueQuarantine, resetResidueQuarantineForTests } from "../src/residue-quarantine.js";
+import { resetResidueQuarantineForTests } from "../src/residue-quarantine.js";
 import { runnerCommand } from "../src/runner-uid.js";
 import { restoreTreeWritability } from "../src/rmtree.js";
 import type { PodEpochOwnership } from "../src/pod-epoch-lock.js";
@@ -340,26 +338,25 @@ describe("activation switch parser", () => {
   });
 });
 
-describe("reclaim of settled parents", PROC, () => {
+describe("settled parents are never reclaimed (C-prime)", PROC, () => {
   for (const cls of ["owner_terminal", "verified_successor"] as const) {
-    it(`reclaims a settled ${cls} parent: helper empties it, the worker removes it, the binding is unset`, async () => {
+    it(`C-prime: a legacy settled ${cls} parent with every proof satisfied is kept as settled_kept, untouched`, async () => {
       const s = w.seed({ cls });
       const result = await w.run();
       assert.equal(result.verdict, "eligible");
       assert.equal(result.retire_scratch.state, "ran", JSON.stringify(result.retire_scratch));
-      assert.equal(result.retire_scratch.reclaimed, 1);
-      assert.equal(result.retire_scratch.kept, 0);
-      assert.equal(result.retire_scratch.bytes_state, "measured");
-      assert.ok(result.retire_scratch.bytes > 0);
-      assert.ok(!exists(s.parent), "parent gone");
-      assert.deepEqual(w.bindingRaws(s.uuid), [], "binding unset");
-      assert.equal(w.spawns.length, 1);
+      assert.equal(result.retire_scratch.reclaimed, 0);
+      assert.equal(result.retire_scratch.kept, 1);
+      assert.deepEqual(result.retire_scratch.kept_by_reason, { settled_kept: 1 });
+      assert.deepEqual(kept(result, s.name)?.reason, "settled_kept");
+      assert.equal(kept(result, s.name)?.outcome, "kept");
+      assert.ok(exists(s.parent), "parent present");
+      assert.deepEqual(w.bindingRaws(s.uuid), [s.raw], "binding unchanged");
+      assert.equal(w.spawns.length, 0, "no helper");
+      assert.deepEqual(w.reserveCalls, [], "never reserved for deletion");
+      assert.ok(!w.steps.includes("removing-write"));
       assert.equal(w.pending, 0);
       assert.equal(w.handovers, 1);
-      assert.deepEqual(kept(result, s.name), { name: s.name, outcome: "reclaimed", reason: "reclaimed", bytes: result.retire_scratch.bytes, bytesState: "measured" });
-      assert.ok(w.steps.includes("removing-written") && w.steps.includes("unset-done"));
-      // the settled value was replaced by removing before the helper ran
-      assert.ok(w.steps.indexOf("removing-written") < w.steps.indexOf("unset"));
     });
   }
 
@@ -465,8 +462,12 @@ describe("keep reasons", PROC, () => {
     ["the run is not terminal", "custody", () => { w.runStatus = "running"; }],
     ["the run still has an open hold", "custody", () => { w.openHolds = 1; }],
   ];
-  for (const [label, reason, mutate, spec] of cases) {
-    it(`keeps everything: ${label} -> ${reason}`, async () => {
+  // C-prime (#4263 [7]): a settled binding is kept before any later check, so the reasons below that were decided after the
+  // settled check now read `settled_kept`; the parent and the binding are still left exactly as they were.
+  const BEFORE_SETTLED = new Set(["conflict", "malformed_binding", "bound_intent", "interrupted_removal"]);
+  for (const [label, was, mutate, spec] of cases) {
+    const reason = BEFORE_SETTLED.has(was) ? was : "settled_kept";
+    it(`keeps everything: ${label} -> ${reason}${reason === was ? "" : ` (${was} before C-prime)`}`, async () => {
       const s = w.seed(spec);
       mutate(s);
       const result = await w.run();
@@ -495,15 +496,6 @@ describe("keep reasons", PROC, () => {
     assert.equal(w.spawns.length, 0);
   });
 
-  it("a refusal after the removing write keeps removing (a not-live reservation between the write and the spawn)", async () => {
-    const s = w.seed();
-    w.stepHook = step => { if (step === "removing-written") w.eligible = false; };
-    const result = await w.run();
-    assert.equal(w.spawns.length, 0);
-    assert.equal(kept(result, s.name)?.reason, "interrupted_removal");
-    assert.equal(w.phaseOf(s.uuid), "removing");
-    assert.ok(exists(path.join(s.clone, "top.txt")), "nothing was emptied");
-  });
 });
 
 describe("whole-phase refusals keep everything", PROC, () => {
@@ -577,68 +569,6 @@ describe("whole-phase refusals keep everything", PROC, () => {
   });
 });
 
-describe("arrivals between the nomination and the locked re-check", PROC, () => {
-  const arrivals: Array<[string, string, (s: Seed) => void]> = [
-    ["a journal naming the parent", "protected_by_retained_source", s => w.setConfig("uzi-recovery.agent/late.clone", JSON.stringify({ runId: "x", clonePath: s.parent }))],
-    ["a custody record", "custody", s => {
-      const dir = path.join(w.fx.dataDir, "recovery-settlement", s.runId);
-      fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(path.join(dir, "r1.json"), "{\"predecessorGeneration\":1}");
-    }],
-    ["a source-use slot", "source_use_held", s => { w.slots.set(s.clonePath, { state: "active", pending: null }); }],
-    ["a residue quarantine", "custody", () => { latchResidueQuarantine({ source: "test" } as never); }],
-    ["a canonical clone", "canonical_present", s => fs.mkdirSync(s.clonePath)],
-    ["a running process", "held", s => { w.scan = names => ({ held: new Set(names.filter(n => n === s.name)) }); }],
-  ];
-  for (const [label, reason, arrive] of arrivals) {
-    it(`${label} is kept`, async () => {
-      const s = w.seed();
-      let armed = false;
-      w.beforeB = () => { if (!armed) { armed = true; arrive(s); } };
-      const result = await w.run();
-      assert.equal(kept(result, s.name)?.reason, reason, label);
-      assert.equal(w.spawns.length, 0);
-      untouched(s);
-    });
-  }
-
-  it("a reservation that is no longer eligible before the spawn has no effect", async () => {
-    const s = w.seed();
-    w.beforeB = () => { w.eligible = false; };
-    const result = await w.run();
-    assert.equal(kept(result, s.name)?.reason, "epoch_not_eligible");
-    assert.equal(w.spawns.length, 0);
-    untouched(s);
-  });
-
-  it("a lost authority transaction before the spawn has no effect", async () => {
-    const s = w.seed();
-    w.txLost = true;
-    const result = await w.run();
-    assert.equal(w.spawns.length, 0);
-    assert.notEqual(kept(result, s.name)?.outcome, "reclaimed");
-    assert.ok(exists(path.join(s.clone, "top.txt")));
-    // A refusal before the removing write keeps the settled phase.
-    assert.equal(w.phaseOf(s.uuid), "settled");
-  });
-
-  it("a refused reservation (the run is busy) keeps the parent", async () => {
-    const s = w.seed();
-    w.options.retire!.reserve = (async () => undefined) as never;
-    const result = await w.run();
-    assert.equal(kept(result, s.name)?.reason, "epoch_not_eligible");
-    untouched(s);
-  });
-
-  it("an unreadable ownership response keeps the parent as custody", async () => {
-    const s = w.seed();
-    w.options.client.getRunOwnership = (async () => { throw new Error("api down"); }) as never;
-    const result = await w.run();
-    assert.equal(kept(result, s.name)?.reason, "custody");
-    untouched(s);
-  });
-});
-
 describe("budget", PROC, () => {
   it("a phase that cannot be admitted (under 30 s left) defers everything and changes nothing", async () => {
     const s = w.seed();
@@ -663,59 +593,6 @@ describe("budget", PROC, () => {
     assert.deepEqual(result.partial_causes, {});
   });
 
-  it("when the window closes before a parent's first effect that parent and the later ones are deferred untouched", async () => {
-    const first = w.seed({ n: 1 }), second = w.seed({ n: 2 }), third = w.seed({ n: 3 });
-    const order = [first, second, third].sort((a, b) => (a.name < b.name ? -1 : 1));
-    // The helper of the first sorted parent runs "for 110 s": the window (120 s) then has 10 s left.
-    w.onChild = () => { w.clock += 110_000; };
-    const result = await w.run();
-    assert.equal(result.retire_scratch.reclaimed, 1);
-    assert.equal(result.retire_scratch.deferred, 2);
-    assert.equal(result.retire_scratch.kept, 0, "a deferral is not a keep");
-    assert.deepEqual(result.retire_scratch.kept_by_reason, {});
-    assert.equal(result.retire_scratch.state, "stopped");
-    assert.equal(result.retire_scratch.reason, "budget_deferred");
-    assert.ok(!exists(order[0]!.parent));
-    for (const s of order.slice(1)) {
-      untouched(s);
-      assert.equal(kept(result, s.name)?.reason, "budget_deferred");
-    }
-    assert.equal(w.spawns.length, 1);
-    assert.equal(result.verdict, "eligible", "deferral never alters the shadow verdict");
-    assert.equal(result.reason, "shadow_complete");
-  });
-
-  it("a helper that ends over budget (exit 8) leaves residue, keeps removing and stops new parents", async () => {
-    const a = w.seed({ n: 1 }), b = w.seed({ n: 2 });
-    const order = [a, b].sort((x, y) => (x.name < y.name ? -1 : 1));
-    w.outcome = { exit: 8 };
-    const result = await w.run();
-    assert.equal(result.retire_scratch.residue, 1);
-    assert.equal(result.retire_scratch.reclaimed, 0);
-    assert.equal(result.retire_scratch.deferred, 1);
-    assert.equal(w.spawns.length, 1);
-    assert.equal(w.phaseOf(order[0]!.uuid), "removing", "the binding stays removing");
-    assert.equal(kept(result, order[0]!.name)?.reason, "interrupted_removal");
-    assert.equal(w.phaseOf(order[1]!.uuid), "settled");
-    untouched(order[1]!);
-    assert.equal(result.retire_scratch.state, "stopped");
-    assert.equal(w.pending, 0);
-    assert.equal(w.handovers, 1, "a joined residue is not fatal");
-  });
-
-  it("a helper that fails otherwise is residue too, and a later pass never retries it", async () => {
-    const s = w.seed();
-    w.outcome = { exit: 4 };
-    const first = await w.run();
-    assert.equal(first.retire_scratch.residue, 1);
-    assert.equal(w.phaseOf(s.uuid), "removing");
-    w.outcome = "real";
-    const second = await w.run();
-    assert.equal(kept(second, s.name)?.reason, "interrupted_removal");
-    assert.equal(w.spawns.length, 1, "a removing binding is never retried");
-    assert.equal(w.phaseOf(s.uuid), "removing");
-  });
-
   it("at most 64 bound parents are examined, the rest deferred", async () => {
     // The binding cap is 64 per bare, so a second bare carries the overflow.
     const second = makeFixture();
@@ -738,135 +615,6 @@ describe("budget", PROC, () => {
     assert.equal(result.retire_scratch.deferred, 2);
   }
 
-  it("an unjoined helper makes the pass fatal and keeps EX", async () => {
-    const s = w.seed();
-    w.outcome = "hang";
-    w.helperDeadlineMs = 6500;
-    await assert.rejects(w.run(), PodEpochSettlementError);
-    assert.equal(w.handovers, 0, "EX is kept");
-    assert.equal(w.phaseOf(s.uuid), "removing");
-    assert.ok(w.stopped, "the scope is stopped");
-  });
-});
-
-describe("a whole-phase refusal inside the lock halts the loop", PROC, () => {
-  const pair = (): [Seed, Seed] => {
-    const sorted = [w.seed({ n: 1 }), w.seed({ n: 2 })].sort((x, y) => (x.name < y.name ? -1 : 1));
-    return [sorted[0]!, sorted[1]!];
-  };
-  /** True exactly once, the first time it is asked after the first parent's locked section began. */
-  const armOnce = (): (() => boolean) => {
-    let armed = false, fired = false;
-    w.beforeB = () => { armed = true; };
-    return () => { if (!armed || fired) return false; fired = true; return true; };
-  };
-  const assertHalted = async (reason: string): Promise<void> => {
-    const [first, second] = pair2;
-    const result = await w.run();
-    assert.equal(result.retire_scratch.state, "stopped", JSON.stringify(result.retire_scratch));
-    assert.equal(result.retire_scratch.reason, reason);
-    assert.equal(result.retire_scratch.reclaimed, 0);
-    assert.equal(result.retire_scratch.kept, 1);
-    assert.equal(result.retire_scratch.deferred, 1);
-    assert.equal(w.spawns.length, 0, "no helper ran for any parent");
-    assert.equal(w.pending, 0);
-    untouched(first); untouched(second);
-    assert.equal(result.verdict, "eligible");
-  };
-  let pair2: [Seed, Seed];
-
-  it("a parent-level idle check that fails once stops the phase before the next parent", async () => {
-    pair2 = pair();
-    const fire = armOnce();
-    w.quiesce = async () => !fire();
-    await assertHalted("not_idle");
-  });
-
-  it("a process-scan refusal for one parent stops the phase before the next parent", async () => {
-    pair2 = pair();
-    const fire = armOnce();
-    w.scan = names => (names.length === 1 && fire() ? { refused: "self_descriptor_unreadable" } : { held: new Set() });
-    await assertHalted("self_descriptor_unreadable");
-  });
-
-  it("a daemon guard that cannot refresh its inventory stops the phase before the next parent", async () => {
-    pair2 = pair();
-    const fire = armOnce();
-    const open = w.options.openDaemonGuard!;
-    w.options.openDaemonGuard = async (...a) => {
-      const guard = await open(...a);
-      Object.defineProperty(guard, "refreshInventory", { get: () => (fire() ? undefined : async () => undefined) });
-      return guard;
-    };
-    await assertHalted("daemon_changed");
-  });
-
-  it("a mount table that cannot be re-read for one parent stops the phase before the next parent", async () => {
-    pair2 = pair();
-    const fire = armOnce();
-    w.mounts = () => (fire() ? "mount_unknown" : "ok");
-    await assertHalted("mount_unknown");
-  });
-
-  it("an unreadable root mount id for one parent stops the phase with mount_unknown", async () => {
-    pair2 = pair();
-    (w.options.retire!.seams as { rootMntId?: () => string | undefined }).rootMntId = () => undefined;
-    await assertHalted("mount_unknown");
-  });
-
-  it("a bind inventory that cannot be read inside the lock stops the phase before the next parent", async () => {
-    pair2 = pair();
-    const fire = armOnce();
-    w.binds = () => (fire() ? { state: "unknown" } : { state: "read", sources: [] });
-    await assertHalted("bind_unknown");
-  });
-
-  it("a bind inventory refused inside the lock stops the phase before the next parent", async () => {
-    pair2 = pair();
-    const fire = armOnce();
-    w.binds = () => (fire() ? { state: "read", sources: [path.dirname(w.runnerRoot)] } : { state: "read", sources: [] });
-    await assertHalted("bind_ancestor");
-  });
-});
-
-describe("protection arriving in another store between the nomination and the locked section", PROC, () => {
-  it("a record in another bare naming the parent is seen by the re-read inside S and keeps the parent", async () => {
-    const s = w.seed();
-    const second = makeFixture();
-    try {
-      const bare2 = await w.cache.ensureClone(second.originPath);
-      fs.chmodSync(path.dirname(bare2), 0o700);
-      fs.chmodSync(bare2, 0o700);
-      w.beforeB = () => {
-        const first = w.bare;
-        w.bare = bare2;
-        try { w.setConfig("uzi-recovery.agent/late.clone", JSON.stringify({ runId: "x", clonePath: s.parent })); } finally { w.bare = first; }
-      };
-      const result = await w.run();
-      assert.equal(kept(result, s.name)?.reason, "protected_by_retained_source");
-      assert.equal(w.spawns.length, 0);
-      untouched(s);
-    } finally { second.cleanup(); }
-  });
-
-  // The custody stores (not the bares' config) are read only by the locked examine, so a record there naming only the
-  // binding's clone path (never the parent) is invisible to the nomination and to the re-read of the bares inside S.
-  const storeRecord = (name: string, body: unknown): void => {
-    const dir = path.join(w.fx.dataDir, "recovery");
-    fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(path.join(dir, name), JSON.stringify(body));
-  };
-
-  it("a recovery-store record arriving after the nomination that names only the clone path keeps the parent", async () => {
-    const s = w.seed();
-    w.beforeB = () => { storeRecord("late.json", { runId: "x", clonePath: s.clonePath }); };
-    const result = await w.run();
-    assert.equal(kept(result, s.name)?.reason, "protected_by_retained_source");
-    assert.equal(w.spawns.length, 0);
-    assert.equal(w.phaseOf(s.uuid), "settled");
-    untouched(s);
-  });
-
 });
 
 describe("budget inside the locked section", PROC, () => {
@@ -880,71 +628,6 @@ describe("budget inside the locked section", PROC, () => {
     assert.deepEqual(w.bindingRaws(s.uuid), [s.raw]);
   });
 
-  it("with 6 to 20 s left at the pre-helper check no helper is spawned and the parent is deferred", async () => {
-    const s = w.seed();
-    w.beforeB = () => { w.clock += 105_000; };
-    const result = await w.run();
-    assert.equal(w.spawns.length, 0);
-    assert.equal(result.retire_scratch.deferred, 1);
-    assert.equal(result.retire_scratch.kept, 0);
-    assert.deepEqual(result.retire_scratch.kept_by_reason, {});
-    untouched(s);
-  });
-
-  /** Replaces the measurement and records the entry cap every helper launch was given. */
-  const fakeMeasure = (measure: { bytes: number; bytesState: "measured" | "partial" | "unknown"; entries: number }): number[] => {
-    const git = w.options.retire!.git;
-    const caps: number[] = [];
-    const real = git.discardRetireScratchParent;
-    git.discardRetireScratchParent = input => { caps.push(input.maxEntries); return real(input); };
-    git.measureRetireScratchParent = async () => measure;
-    return caps;
-  };
-
-  it("an incomplete measurement charges the whole entry budget: later parents are deferred, no cap exceeds what was left", async () => {
-    const seeds = [w.seed({ n: 1 }), w.seed({ n: 2 }), w.seed({ n: 3 })].sort((x, y) => (x.name < y.name ? -1 : 1));
-    const caps = fakeMeasure({ bytes: 0, bytesState: "partial", entries: 200_000 });
-    const result = await w.run();
-    assert.deepEqual(caps, [2_000_000]);
-    assert.equal(result.retire_scratch.reclaimed, 1);
-    assert.equal(result.retire_scratch.deferred, 2);
-    assert.equal(result.retire_scratch.kept, 0);
-    assert.equal(result.retire_scratch.state, "stopped");
-    assert.equal(result.retire_scratch.reason, "budget_deferred");
-    for (const s of seeds.slice(1)) { untouched(s); assert.equal(kept(result, s.name)?.reason, "budget_deferred"); }
-  });
-
-  it("a complete measurement charges what the walk saw: the next helper is capped to what remains", async () => {
-    const seeds = [w.seed({ n: 1 }), w.seed({ n: 2 }), w.seed({ n: 3 })].sort((x, y) => (x.name < y.name ? -1 : 1));
-    const caps = fakeMeasure({ bytes: 10, bytesState: "measured", entries: 1_500_000 });
-    const result = await w.run();
-    assert.deepEqual(caps, [1_500_001, 499_999]);
-    assert.equal(caps.reduce((a, b) => a + b, 0) <= 2_000_000, true);
-    assert.equal(result.retire_scratch.reclaimed, 2);
-    assert.equal(result.retire_scratch.deferred, 1);
-    untouched(seeds[2]!);
-  });
-
-  it("the measurement runs before the budget check: a measure that uses the window defers the parent without a helper", async () => {
-    const s = w.seed();
-    w.options.retire!.git.measureRetireScratchParent = async () => { w.clock += 105_000; return { bytes: 1, bytesState: "measured", entries: 3 }; };
-    const result = await w.run();
-    assert.equal(w.spawns.length, 0);
-    assert.equal(result.retire_scratch.deferred, 1);
-    assert.equal(result.retire_scratch.kept, 0);
-    untouched(s);
-  });
-
-
-  it("a rejection before the removing write is a refusal that keeps settled", async () => {
-    const s = w.seed();
-    w.stepHook = step => { if (step === "removing-write") throw new Error("injected before the write"); };
-    const result = await w.run();
-    assert.equal(w.spawns.length, 0);
-    assert.equal(kept(result, s.name)?.reason, "epoch_not_eligible");
-    assert.equal(w.phaseOf(s.uuid), "settled");
-    untouched(s);
-  });
 });
 
 describe("alias-aware protection at the runner root itself", () => {
@@ -968,15 +651,13 @@ describe("alias-aware protection at the runner root itself", () => {
     assert.deepEqual([...protectedLeaves([`${shared}/.retire-${randomUUID()}/clone`], root, [name])], []);
   });
 
-  it("a record naming the parent through the alias keeps the binding", () => {
-    assert.deepEqual(evaluateRetireBinding({ evidence: evidenceWith([`${shared}/${name}/clone`]), uuid, runnerRoot: root, expectRaw: raw }),
-      { kind: "keep", reason: "protected_by_retained_source" });
-  });
-
-  it("a record naming the clone path through the alias keeps the binding", () => {
-    assert.deepEqual(evaluateRetireBinding({ evidence: evidenceWith([`${shared}/slug/issue-4263.attempt-${attemptId}/sub`]), uuid, runnerRoot: root, expectRaw: raw }),
-      { kind: "keep", reason: "protected_by_retained_source" });
-    assert.equal(evaluateRetireBinding({ evidence: evidenceWith([`${shared}/other`]), uuid, runnerRoot: root, expectRaw: raw }).kind, "ready");
+  it("a record naming the parent or the clone path through the alias is still seen by the recovery check", () => {
+    // C-prime: evaluateRetireBinding keeps a settled binding before it looks at protection, so the alias-aware protection
+    // is observable through the gone-parent recovery decision, which must stay unresolved when a record names the clone path.
+    const canonical = { present: false };
+    assert.equal(evaluateRetireRecovery({ evidence: evidenceWith([`${shared}/slug/issue-4263.attempt-${attemptId}/sub`]), uuid, runnerRoot: root, expectRaw: raw, canonical }), "unresolved");
+    assert.equal(evaluateRetireRecovery({ evidence: evidenceWith([`${shared}/other`]), uuid, runnerRoot: root, expectRaw: raw, canonical }), "case1");
+    assert.deepEqual(evaluateRetireBinding({ evidence: evidenceWith([]), uuid, runnerRoot: root, expectRaw: raw }), { kind: "keep", reason: "settled_kept" });
   });
 
   // Non-canonical spellings of the alias must not slip past the alias mapping.
@@ -984,8 +665,6 @@ describe("alias-aware protection at the runner root itself", () => {
   for (const base of spellings) {
     it(`a clone path recorded as ${base}/... is protected and unresolved for recovery`, () => {
       const recorded = [`${base}/slug/issue-4263.attempt-${attemptId}/sub`];
-      assert.deepEqual(evaluateRetireBinding({ evidence: evidenceWith(recorded), uuid, runnerRoot: root, expectRaw: raw }),
-        { kind: "keep", reason: "protected_by_retained_source" });
       assert.equal(evaluateRetireRecovery({ evidence: evidenceWith(recorded), uuid, runnerRoot: root, expectRaw: raw, canonical: { present: false } }), "unresolved");
     });
   }
@@ -1093,26 +772,20 @@ describe("the startup inspector reports the pass", PROC, () => {
     await w.cache.inspectRetireScratchAtStartup(Date.now() + 60_000, { outcomes: true, ...(reclaim ? { reclaim } : {}) });
   };
 
-  it("emits reclaimed rows and counts reclaimed parents and bytes in the total", async () => {
-    const gone = w.seed({ n: 1 });
-    const stays = w.seed({ n: 2, cls: "completion" });
+  it("C-prime: reports settled parents as kept with settled_kept and counts no reclaim", async () => {
+    const a = w.seed({ n: 1 });
+    const b = w.seed({ n: 2, cls: "completion" });
     const result = await w.run();
-    assert.equal(result.retire_scratch.reclaimed, 1);
+    assert.equal(result.retire_scratch.reclaimed, 0);
     await inspect({ enabled: true, report: result.retire_report });
     const rows = rowsOf();
     assert.equal(rows.length, 2);
-    const reclaimedRow = rows.find(r => r.outcome === "reclaimed")!;
-    assert.equal(reclaimedRow.name, gone.name);
-    assert.equal(reclaimedRow.reason, "reclaimed");
-    assert.equal(reclaimedRow.bytes, result.retire_scratch.bytes);
-    const keptRow = rows.find(r => r.outcome === "kept")!;
-    assert.equal(keptRow.name, stays.name);
-    assert.equal(keptRow.reason, "class_ineligible");
+    for (const r of rows) { assert.equal(r.outcome, "kept"); assert.equal(r.reason, "settled_kept"); assert.equal(r.binding, "settled"); }
+    assert.deepEqual(rows.map(r => r.name).sort(), [a.name, b.name].sort());
     const [total] = totalOf();
-    assert.equal(total!.reclaimed, 1);
-    assert.equal(total!.reclaimed_bytes, result.retire_scratch.bytes);
-    assert.equal(total!.kept, 1);
-    assert.deepEqual(total!.kept_by_reason, { class_ineligible: 1 });
+    assert.equal(total!.reclaimed, 0);
+    assert.equal(total!.kept, 2);
+    assert.deepEqual(total!.kept_by_reason, { settled_kept: 2 });
   });
 
   it("binding-aware reasons without a pass: intent, removing, malformed, settled with the switch off or no epoch", async () => {
@@ -1129,12 +802,12 @@ describe("the startup inspector reports the pass", PROC, () => {
     assert.equal(off[intent.name], "bound_intent");
     assert.equal(off[removing.name], "interrupted_removal");
     assert.equal(off[junk.name], "malformed_binding");
-    assert.equal(off[settled.name], "disabled");
+    assert.equal(off[settled.name], "settled_kept", "a settled binding reads settled_kept whatever the switch says");
     assert.equal(off[path.basename(unbound)], "no_disposition_evidence");
     const noEpoch = await reasons({ enabled: true });
-    assert.equal(noEpoch[settled.name], "epoch_not_eligible");
+    assert.equal(noEpoch[settled.name], "settled_kept");
     const deferred = await reasons({ enabled: true, report: { state: "refused", reason: "budget_deferred", parents: [] } });
-    assert.equal(deferred[settled.name], "budget_deferred");
+    assert.equal(deferred[settled.name], "settled_kept");
     assert.equal(totalOf()[0]!.removing_bindings, 1);
   });
 
@@ -1147,7 +820,7 @@ describe("the startup inspector reports the pass", PROC, () => {
 });
 
 describe("a real retire-produced binding", PROC, () => {
-  it("reclaims the settled owner_terminal parent a simulated split retirement left behind", async (t: TestContext) => {
+  it("C-prime: a simulated split retirement leaves intent, and a restarted cache's compaction, evidence read and epoch phase keep the parent", async (t: TestContext) => {
     const owner = randomUUID();
     const rename = fsp.rename.bind(fsp);
     t.mock.method(fsp, "rename", async (...args: Parameters<typeof fsp.rename>) => {
@@ -1160,18 +833,38 @@ describe("a real retire-produced binding", PROC, () => {
       { attemptId, isLive: () => false, beforeSeed: async () => {} });
     await split.markRecoveryCapture(bare, clone.path, BRANCH, owner, attemptId);
     fs.writeFileSync(path.join(clone.path, "owner.txt"), "owner bytes\n");
-    await split.retireRunnerClone(bare, clone.path, BRANCH, owner, { discard: true, attemptId, dispositionClass: "owner_terminal" });
+    await split.retireRunnerClone(bare, clone.path, BRANCH, owner, { discard: true, attemptId, dispositionClass: "owner_terminal", processProof: () => true });
     fs.chmodSync(w.runnerRoot, 0o1700);
     const parents = fs.readdirSync(w.runnerRoot).filter(n => n.startsWith(".retire-"));
     assert.equal(parents.length, 1);
     const uuid = parents[0]!.slice(".retire-".length);
-    const raw = execFileSync("git", ["-C", bare, "config", "--local", "--get", retireBindingKey(uuid)], { encoding: "utf8", env: ENV }).trim();
+    const raw = w.bindingRaws(uuid)[0]!;
     const decoded = parseRetireBinding(uuid, raw);
-    assert.ok(decoded.ok && decoded.binding.phase === "settled" && decoded.binding.class === "owner_terminal");
+    assert.ok(decoded.ok && decoded.binding.phase === "intent" && decoded.binding.class === "owner_terminal");
+
+    // A restart: a fresh cache on the same data dir.
+    const fresh = new GitCache(w.fx.dataDir, nullLogger(), undefined, testGitCacheOptions({ retentionDelete: { split: true } }));
+    w.cache = fresh;
+    w.installSpawn();
+    w.options.retire!.git = w.splitGit();
+    // (a) compaction of the branch keeps the bound attempt's retired entry and leaves the binding alone.
+    await (fresh as unknown as { compactAttemptLedger(b: string, br: string): Promise<void> }).compactAttemptLedger(bare, BRANCH);
+    assert.deepEqual(w.bindingRaws(uuid), [raw], "compaction leaves the binding");
+    // (b) the evidence read sees exactly the intent binding.
+    const evidenceRead = await fresh.readRetireScratchEvidence({ signal: new AbortController().signal, deadline: Date.now() + 60_000 });
+    assert.equal(evidenceRead.state, "read");
+    const mine = evidenceRead.state === "read" ? evidenceRead.bares.flatMap(b => b.bindings).filter(b => b.uuid === uuid) : [];
+    assert.equal(mine.length, 1);
+    assert.equal(mine[0]!.raw, raw);
+    assert.equal(mine[0]!.parsed?.phase, "intent");
+    // (c) the retire-scratch epoch phase keeps the parent as bound_intent and never touches it.
     const result = await w.run();
-    assert.equal(result.retire_scratch.reclaimed, 1, JSON.stringify(result.retire_scratch));
-    assert.ok(!exists(path.join(w.runnerRoot, parents[0]!)));
-    assert.deepEqual(w.bindingRaws(uuid), [], "the binding is unset");
+    assert.equal(result.retire_scratch.reclaimed, 0, JSON.stringify(result.retire_scratch));
+    assert.equal(result.retire_scratch.kept_by_reason.bound_intent, 1, JSON.stringify(result.retire_scratch));
+    assert.equal(kept(result, parents[0]!)?.reason, "bound_intent");
+    assert.ok(exists(path.join(w.runnerRoot, parents[0]!, "clone")), "the parent is present");
+    assert.deepEqual(w.bindingRaws(uuid), [raw], "binding raw unchanged at intent");
+    assert.equal(w.spawns.length, 0);
   });
 });
 
@@ -1188,18 +881,20 @@ describe("pass-wide protection of the binding's original clone path", PROC, () =
       w.bare = bare2;
       try { w.setConfig("uzi-recovery.agent/other.clone", JSON.stringify({ runId: "x", clonePath: s.clonePath })); } finally { w.bare = first; }
       const result = await w.run();
-      assert.equal(kept(result, s.name)?.reason, "protected_by_retained_source");
+      assert.equal(kept(result, s.name)?.reason, "settled_kept");
       assert.equal(result.retire_scratch.reclaimed, 0);
       assert.equal(w.spawns.length, 0);
       untouched(s);
     } finally { second.cleanup(); }
   });
 
-  it("the binding and the attempt ledger of the candidate do not protect it (they name the clone path by design)", async () => {
+  it("C-prime: the binding and the attempt ledger of the candidate are not protection; the settled parent is kept by settled_kept alone", async () => {
     const s = w.seed();
     const result = await w.run();
-    assert.equal(result.retire_scratch.reclaimed, 1, JSON.stringify(result.retire_scratch));
-    assert.ok(!exists(s.parent));
+    assert.equal(result.retire_scratch.reclaimed, 0, JSON.stringify(result.retire_scratch));
+    assert.equal(kept(result, s.name)?.reason, "settled_kept");
+    assert.ok(exists(s.parent));
+    untouched(s);
   });
 });
 
@@ -1217,7 +912,7 @@ describe("a non-canonical ledger value naming the attempt outranks an earlier ca
       const s = w.seed();
       w.setConfig(`uzi-attempts.${BRANCH}.entry`, value(s), true);
       const result = await w.run();
-      assert.equal(result.retire_scratch.kept_by_reason.ledger_mismatch, 1, JSON.stringify(result.retire_scratch.kept_by_reason));
+      assert.equal(result.retire_scratch.kept_by_reason.settled_kept, 1, JSON.stringify(result.retire_scratch.kept_by_reason));
       assert.equal(result.retire_scratch.reclaimed, 0);
       assert.equal(w.spawns.length, 0);
       untouched(s);
@@ -1255,21 +950,10 @@ describe("the phase window bounds the pre-effect reads", PROC, () => {
     untouched(s);
   });
 
-  it("the bare lock of a parent that is examined is bounded by the window plus the settlement reserve", async () => {
-    const s = w.seed();
-    const git = w.options.retire!.git;
-    let lock = Infinity;
-    const bareLock = git.withRetireScratchBare;
-    git.withRetireScratchBare = ((b: string, o: { deadline: number }, fn: never) => { lock = o.deadline - Date.now(); return bareLock(b, o as never, fn); }) as never;
-    const result = await w.run();
-    assert.equal(result.retire_scratch.reclaimed, 1, JSON.stringify(result.retire_scratch));
-    assert.ok(lock <= 125_500, `lock deadline ${lock}`);
-    assert.ok(!exists(s.parent));
-  });
 });
 
 // A restart after an interrupted REAL retire (the crash seam of retireBindingStep) followed by the verified epoch phase:
-// only a fully settled prefix is ever reclaimed; no interrupted prefix is ever deleted.
+// C-prime: no retire writes `settled`, so no prefix is ever reclaimed; every interrupted or completed split retire stays intent.
 describe("restart after an interrupted retire, then the verified epoch phase", PROC, () => {
   const ATT = formatAttemptId(new Date("2026-11-05T10:10:10Z"), 1, "0123456789abcdef");
   const exdev = (t: TestContext): void => {
@@ -1316,8 +1000,8 @@ describe("restart after an interrupted retire, then the verified epoch phase", P
   };
 
   const split = true;
-  // A prefix before the settled write: the binding says intent and the parent (if any) is never touched.
-  for (const fault of ["renamed", "move-verified", "journal-cleared", "ledger-appended", "settle-write"] as const) {
+  // A prefix of the split retire: the binding says intent and the parent (if any) is never touched.
+  for (const fault of ["renamed", "move-verified", "journal-cleared", "ledger-appended", "config-sync"] as const) {
     it(`split, interrupted at ${fault}: kept bound_intent, nothing deleted`, async (t) => {
       const p = await produce(t, { split, fault });
       assert.equal(w.phaseOf(p.uuid!), "intent");
@@ -1341,20 +1025,21 @@ describe("restart after an interrupted retire, then the verified epoch phase", P
     assert.equal(w.spawns.length, 0);
   });
 
-  for (const fault of [undefined, "settled"] as const) {
-    it(`split, ${fault ? "fault after the settled write" : "uninterrupted"}: the settled prefix is reclaimed`, async (t) => {
-      const p = await produce(t, { split, ...(fault ? { fault } : {}) });
-      assert.equal(w.phaseOf(p.uuid!), "settled");
-      const result = await w.run();
-      assert.equal(result.retire_scratch.reclaimed, 1, JSON.stringify(result.retire_scratch));
-      assert.ok(!exists(p.parent!));
-      assert.deepEqual(w.bindingRaws(p.uuid!), []);
-      assert.equal(w.spawns.length, 1);
-    });
-  }
-
-  it("split, settled and the parent already gone (an earlier reclaim died before its unset): metadata-only unset", async (t) => {
+  it("C-prime: split, uninterrupted: the retire leaves intent and the epoch keeps the parent (bound_intent)", async (t) => {
     const p = await produce(t, { split });
+    assert.equal(w.phaseOf(p.uuid!), "intent");
+    const result = await w.run();
+    assert.equal(result.retire_scratch.reclaimed, 0, JSON.stringify(result.retire_scratch));
+    assert.equal(result.retire_scratch.kept_by_reason.bound_intent, 1, JSON.stringify(result.retire_scratch));
+    assert.ok(exists(p.parent!));
+    untouchedAfter(p);
+  });
+
+  it("legacy settled binding whose parent is already gone (a pre-C-prime reclaim died before its unset): metadata-only unset", async (t) => {
+    const p = await produce(t, { split });
+    const legacy = parseRetireBinding(p.uuid!, p.raw!);
+    assert.ok(legacy.ok);
+    w.setConfig(retireBindingKey(p.uuid!), retireBindingValue({ ...legacy.binding, phase: "settled" }));
     await fsp.rm(p.parent!, { recursive: true });
     const result = await w.run();
     assert.equal(result.retire_scratch.recovered, 1, JSON.stringify(result.retire_scratch));
@@ -1496,53 +1181,6 @@ describe("the pre-effect steps are bounded by the phase window less the settleme
     settledClean();
   });
 
-  it("a delayed authority read is cancelled at the step deadline and the parent is deferred before any effect", STEP, async () => {
-    const s = w.seed();
-    let t0 = 0, calledAt = 0, seen: Bound | undefined;
-    w.beforeB = () => { t0 = spend(); };
-    (w.options.client as { getRunOwnership: unknown }).getRunOwnership = async (_id: string, o: Bound) => {
-      seen = o; calledAt = Date.now();
-      await hang(o.signal);
-    };
-    const result = await w.run();
-    withinWindow(seen, calledAt, t0);
-    assert.equal(result.retire_scratch.deferred, 1);
-    assert.equal(result.retire_scratch.kept, 0);
-    assert.deepEqual(result.retire_scratch.kept_by_reason, {});
-    assert.equal(result.retire_scratch.state, "stopped");
-    assert.equal(result.retire_scratch.reason, "budget_deferred");
-    assert.equal(kept(result, s.name)?.reason, "budget_deferred");
-    assert.equal(w.spawns.length, 0);
-    assert.equal(w.phaseOf(s.uuid), "settled");
-    untouched(s);
-    settledClean();
-  });
-
-  it("a delayed per-candidate quiescence proof is cancelled at the step deadline: deferred, no removing write, no helper", STEP, async () => {
-    const s = w.seed();
-    let t0 = 0, calledAt = 0, seen: Bound | undefined, calls = 0;
-    w.beforeB = () => { t0 = spend(); };
-    w.quiesce = async bound => {
-      if (++calls === 1) return true;
-      seen = bound; calledAt = Date.now();
-      try { await hang(bound?.signal); } catch { return false; }
-      return true;
-    };
-    const result = await w.run();
-    assert.equal(calls, 2);
-    withinWindow(seen, calledAt, t0);
-    assert.equal(result.retire_scratch.deferred, 1);
-    assert.equal(result.retire_scratch.kept, 0);
-    assert.deepEqual(result.retire_scratch.kept_by_reason, {});
-    assert.equal(result.retire_scratch.state, "stopped");
-    assert.equal(result.retire_scratch.reason, "budget_deferred", "a cancelled proof is a deferral, not not_idle");
-    assert.equal(kept(result, s.name)?.reason, "budget_deferred");
-    assert.equal(w.spawns.length, 0);
-    assert.equal(w.phaseOf(s.uuid), "settled", "removing is only written in beforeEffect");
-    untouched(s);
-    settledClean();
-  });
-
   it("a real daemon socket that never answers, aborted at the step deadline, settles inside the reserve with the socket closed", STEP, async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "retire-docker-"));
     const sock = path.join(dir, "d.sock");
@@ -1573,37 +1211,6 @@ describe("the pre-effect steps are bounded by the phase window less the settleme
     }
   });
 
-  it("a real API whose body stalls after the headers, cancelled at the step deadline, defers the parent inside the reserve", STEP, async () => {
-    const s = w.seed();
-    let accepted = 0, closed = 0;
-    const server = http.createServer((_req, res) => {
-      res.writeHead(200, { "content-type": "application/json", "content-length": "1000" });
-      res.write("{\"status\":\"compl");
-    });
-    server.on("connection", c => { accepted++; c.on("error", () => undefined); c.on("close", () => { closed++; }); });
-    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
-    try {
-      const client = new WorkerClient(`http://127.0.0.1:${(server.address() as { port: number }).port}`, "token", "0.1.0-test", nullLogger());
-      w.options.client = { listRecoveryHolds: client.listRecoveryHolds.bind(client), getRunOwnership: client.getRunOwnership.bind(client) } as never;
-      let t0 = 0;
-      w.beforeB = () => { t0 = spend(); };
-      const result = await w.run();
-      const elapsed = Date.now() - t0;
-      assert.ok(elapsed < LEFT - RESERVE + 1_500, `the read settled ${elapsed} ms in, outside the reserve`);
-      assert.equal(result.retire_scratch.deferred, 1);
-      assert.equal(result.retire_scratch.kept, 0);
-      assert.equal(kept(result, s.name)?.reason, "budget_deferred");
-      assert.equal(w.spawns.length, 0);
-      untouched(s);
-      for (let i = 0; i < 50 && closed < accepted; i++) await new Promise(r => setTimeout(r, 10));
-      assert.ok(accepted >= 1);
-      assert.equal(closed, accepted, "every connection was closed after the cancel");
-      settledClean();
-    } finally {
-      server.closeAllConnections();
-      await new Promise<void>(resolve => server.close(() => resolve()));
-    }
-  });
 });
 
 describe("cross-bare attempt identity conflicts", PROC, () => {
@@ -1631,18 +1238,20 @@ describe("cross-bare attempt identity conflicts", PROC, () => {
     addBare(ledgerOf(ledgerRaw(s.attemptId)));
     const result = await w.run();
     assert.equal(result.retire_scratch.reclaimed, 0, "conflicting identity across bares must not grant deletion authority");
-    assert.equal(result.retire_scratch.kept_by_reason.conflict, 1);
+    assert.equal(result.retire_scratch.kept_by_reason.settled_kept, 1);
     assert.equal(exists(s.parent), true);
     untouched(s);
   });
 
-  it("control: another bare naming a different well-formed attempt does not stop the reclaim", async () => {
+  it("control: another bare naming a different well-formed attempt still leaves a settled parent kept (never reclaimed)", async () => {
     const s = w.seed();
     const other = formatAttemptId(new Date(Date.UTC(2026, 10, 5, 10, 10, 59)), 1, "0123456789abcdef");
     addBare(ledgerOf(ledgerRaw(other)));
     const result = await w.run();
-    assert.equal(result.retire_scratch.reclaimed, 1);
-    assert.equal(exists(s.parent), false);
+    assert.equal(result.retire_scratch.reclaimed, 0);
+    assert.equal(result.retire_scratch.kept_by_reason.settled_kept, 1);
+    assert.equal(exists(s.parent), true);
+    untouched(s);
   });
 
   it("another bare with an undecodable binding entry keeps the parent as conflict", async () => {
@@ -1650,7 +1259,7 @@ describe("cross-bare attempt identity conflicts", PROC, () => {
     addBare(otherBare({ bindings: [{ key: "uzi-retire-scratch.x.binding", raw: "" }] }));
     const result = await w.run();
     assert.equal(result.retire_scratch.reclaimed, 0);
-    assert.equal(result.retire_scratch.kept_by_reason.conflict, 1);
+    assert.equal(result.retire_scratch.kept_by_reason.settled_kept, 1);
     untouched(s);
   });
 
@@ -1660,7 +1269,7 @@ describe("cross-bare attempt identity conflicts", PROC, () => {
       addBare(ledgerOf(raw));
       const result = await w.run();
       assert.equal(result.retire_scratch.reclaimed, 0);
-      assert.equal(result.retire_scratch.kept_by_reason.conflict, 1);
+      assert.equal(result.retire_scratch.kept_by_reason.settled_kept, 1);
       untouched(s);
     });
   }
@@ -1670,7 +1279,7 @@ describe("cross-bare attempt identity conflicts", PROC, () => {
     addBare(ledgerOf(ledgerRaw(s.attemptId)), 2);
     const result = await w.run();
     assert.equal(result.retire_scratch.reclaimed, 0);
-    assert.equal(result.retire_scratch.kept_by_reason.conflict, 1);
+    assert.equal(result.retire_scratch.kept_by_reason.settled_kept, 1);
     untouched(s);
   });
 
@@ -1706,7 +1315,7 @@ describe("cross-bare attempt identity conflicts", PROC, () => {
     onRead(1, withBare(ledgerOf(ledgerRaw(s.attemptId))));
     const result = await w.run();
     assert.equal(result.retire_scratch.reclaimed, 0);
-    assert.equal(result.retire_scratch.kept_by_reason.conflict, 1);
+    assert.equal(result.retire_scratch.kept_by_reason.settled_kept, 1);
     assert.deepEqual(w.reserveCalls, []);
     assert.equal(w.spawns.length, 0);
     assert.equal(exists(s.parent), true);
@@ -1744,7 +1353,7 @@ describe("cross-bare attempt identity conflicts", PROC, () => {
     onRead(2, unreadable);
     const result = await w.run();
     assert.equal(result.retire_scratch.reclaimed, 0);
-    assert.equal(result.retire_scratch.kept_by_reason.conflict, 1);
+    assert.equal(result.retire_scratch.kept_by_reason.settled_kept, 1);
     untouched(s);
   });
 
@@ -1757,7 +1366,7 @@ describe("cross-bare attempt identity conflicts", PROC, () => {
     assert.deepEqual(w.bindingRaws(s.uuid), [s.raw]);
   });
 
-  for (const withParent of [true, false]) {
+  for (const withParent of [false]) {
     it(`an unknown re-read that spends the phase window defers a ${withParent ? "present" : "gone"} parent as budget_deferred`, async () => {
       const s = w.seed({ withParent });
       onRead(2, () => { w.clock += 125_000; return unreadable(); });
@@ -1796,7 +1405,7 @@ describe("ledger compaction keeps the cross-bare conflict the reclaim refuses on
       assert.deepEqual(valuesOf(w.bare), seeded, "the seeded bare's retired entry survives");
       const result = await w.run();
       assert.equal(result.retire_scratch.reclaimed, 0);
-      assert.equal(result.retire_scratch.kept_by_reason.conflict, 1, JSON.stringify(result.retire_scratch.kept_by_reason));
+      assert.equal(result.retire_scratch.kept_by_reason.settled_kept, 1, JSON.stringify(result.retire_scratch.kept_by_reason));
       assert.equal(exists(s.parent), true);
       untouched(s);
     });
