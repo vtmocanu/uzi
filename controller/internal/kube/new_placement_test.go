@@ -523,6 +523,54 @@ func TestNewPlacementAC9RestartWhileManuallyCordoned(t *testing.T) {
 	}
 }
 
+// A migrated worker still needs the ordinary roll coverage. A manually cordoned
+// sole provider cannot supply it; uncordoning that provider lets restoration proceed
+// while the migrated worker's own manual cordon remains set.
+func TestNewPlacementAC9RestoreWaitsForUsableCoverage(t *testing.T) {
+	cfg := placementConfig()
+	target := evidence(desired("w1"), m5Now)
+	manualWorker(&target)
+	peer := evidence(desired("w2"), m5Now)
+	manualWorker(&peer)
+	zero := int32(0)
+	dep := liveDeployment(t, cfg, target, false)
+	dep.Spec.Replicas, dep.UID = &zero, "dep-w1"
+	objs := []runtime.Object{dep, liveDeployment(t, cfg, peer, false)}
+	objs = append(objs, livePVCs(t, cfg, peer, false)...)
+	m, client := npMatFor(t, cfg, &fakeCordoner{}, DrainPolicy{Deadline: time.Hour}, objs...)
+	currentProof(t, client, &peer, m5Now)
+	for i := 0; i < 4; i++ {
+		if err := npTick(t, m, target, peer); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if d := npDep(t, client, cfg.Namespace, target.ID); d.Spec.Replicas == nil || *d.Spec.Replicas != 0 {
+		t.Fatal("restored replicas without usable peer coverage")
+	}
+	pacing := m.PacingOutcomes()[target.ID]
+	if pacing == nil || pacing.BlockingReason == nil || !strings.Contains(*pacing.BlockingReason, "manual_cordon") {
+		t.Fatalf("missing manual-cordon coverage explanation: %+v", pacing)
+	}
+	peer.ManualCordonedAt, peer.EffectiveCordoned = nil, nil
+	for i := 0; i < 8; i++ {
+		if err := npTick(t, m, target, peer); err != nil {
+			t.Fatal(err)
+		}
+		if d := npDep(t, client, cfg.Namespace, target.ID); d.Spec.Replicas != nil && *d.Spec.Replicas == 1 {
+			if got := podPlacement(d); got != "new" {
+				t.Fatalf("restored placement=%s, want new", got)
+			}
+			for _, name := range []string{dataPVCName(target.ID), nixPVCName(target.ID)} {
+				if !isStamped(npPVC(t, client, cfg.Namespace, name)) {
+					t.Fatalf("restored claim %s is unstamped", name)
+				}
+			}
+			return
+		}
+	}
+	t.Fatalf("provider release did not unblock restoration: %+v", m.PacingOutcomes()[target.ID])
+}
+
 // The per-tick decision stored on the Reconcile context is authoritative: consumers handed
 // an observation that implies the opposite decision (a mid-tick re-observation) must
 // follow the map, for both the render and the stamp on a created claim.
