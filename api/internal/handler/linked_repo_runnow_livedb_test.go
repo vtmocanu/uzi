@@ -10,6 +10,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
+	"github.com/vtmocanu/uzi/api/internal/issuetracker/youtracktest"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 )
 
@@ -26,15 +27,17 @@ func TestLinkedRepoRunNowResolvesTheIssueTrackerLiveDB(t *testing.T) {
 	ctx := context.Background()
 	mustExecT(ctx, t, f.pool,
 		`INSERT INTO run_schedules (id, user_id, repo_id, target, labels, timing, cron_expr, timezone, next_fire_at, auto_approve, status, enabled, max_issues)
-		 VALUES ($1, $2, $3, 'sweep', '["uzi"]'::jsonb, 'recurring', '0 3 * * *', 'UTC', now() + interval '1 day', false, 'active', true, 1)`,
-		sweep, f.user.ID, f.repo)
+		 VALUES ($1, $2, $3, 'sweep', jsonb_build_array($4::text), 'recurring', '0 3 * * *', 'UTC', now() + interval '1 day', false, 'active', true, 1)`,
+		sweep, f.user.ID, f.repo, youtracktest.EligibilityTagName)
 	mustExecT(ctx, t, f.pool,
 		`INSERT INTO run_schedules (id, user_id, repo_id, target, issue_iid, timing, cron_expr, timezone, next_fire_at, auto_approve, status, enabled)
 		 VALUES ($1, $2, $3, 'issue', $4, 'recurring', '0 3 * * *', 'UTC', now() + interval '1 day', false, 'active', true)`,
 		issue, f.user.ID, f.repo, f.issueN)
 
-	// The sweep reads its candidates from the cached cards' labels; make the seeded card one.
-	mustExecT(ctx, t, f.pool, `UPDATE issues SET labels = '["uzi"]' WHERE repo_id = $1`, f.repo)
+	// The sweep reads its candidates from the cached cards' labels, and a linked repo's
+	// eligibility is its stored issue-tracker tag, not the forge label: give the selector and
+	// the seeded card that tag, so the sweep matches it and reaches the issue tracker.
+	mustExecT(ctx, t, f.pool, `UPDATE issues SET labels = jsonb_build_array($2::text) WHERE repo_id = $1`, f.repo, youtracktest.EligibilityTagName)
 
 	for name, id := range map[string]uuid.UUID{"sweep": sweep, "issue": issue} {
 		t.Run(name, func(t *testing.T) {
