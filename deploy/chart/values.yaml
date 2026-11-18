@@ -780,9 +780,10 @@ workers:
   tolerations: []
   # An opt-in second placement for moving workers to a new node pool (for example a
   # dedicated, tainted pool in another storage zone). Off by default: empty renders
-  # no env and nothing changes. When set, the controller stamps each worker volume it
-  # creates with `uzi.dev/placement: new`, and ONLY a worker whose volumes were all
-  # created while this was set uses it; every other worker keeps the global
+  # no env and nothing changes. When set, the controller stamps a worker volume it
+  # creates with `uzi.dev/placement: new` unless that worker still has an unstamped
+  # volume (a legacy worker's missing volume is recreated unstamped), and ONLY a worker
+  # whose volumes are all stamped uses it; every other worker keeps the global
   # nodeSelector/tolerations above. Setting it rolls no worker.
   #
   # Both fields REPLACE (never merge with) the global ones for such a worker: keep

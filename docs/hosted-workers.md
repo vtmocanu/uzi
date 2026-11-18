@@ -600,9 +600,11 @@ recreating each worker's volumes where the new placement applies.
 
 How the stamp works:
 
-- While `workers.newPlacement` is set, the controller stamps each worker volume it
-  creates with the annotation `uzi.dev/placement: new`. It never adds, removes or
-  rewrites the stamp on an existing volume, and it deletes nothing.
+- While `workers.newPlacement` is set, the controller stamps a worker volume it
+  creates with the annotation `uzi.dev/placement: new`, unless that worker still has
+  an unstamped volume (then the new volume is created unstamped, per the rules below).
+  It never adds, removes or rewrites the stamp on an existing volume, and it deletes
+  nothing.
 - Per worker on each reconcile pass: if any of its volumes is Terminating, it creates
   none; if none exist, it creates all of them stamped; if all existing ones are stamped,
   it creates the missing ones stamped; if any existing one is unstamped, it creates the
