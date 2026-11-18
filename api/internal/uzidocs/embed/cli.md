@@ -1896,6 +1896,16 @@ origins it also refuses a set `remote.origin.receivepack`, which changes the
 remote command the host check evaluates. `--repo` never bypasses this check; it
 only picks among repos that already match.
 
+The check covers creating a handoff only:
+
+- **Pulling the result:** `git fetch origin` (the command above and the CLI's
+  hint) reads origin's *fetch* URL. If that differs from the push destination,
+  fetch from the push URL instead:
+  `git fetch "$(git remote get-url --push origin)" uzi/task/<run-id>:uzi/task/<run-id>`.
+- **`uzi handoff rm`:** it deletes the branch with `git push origin --delete`,
+  which runs no check and goes to every push destination. Confirm
+  `git remote get-url --push --all origin` before removing.
+
 - **https / http origin:** the host must equal the host of the forge's web URL.
 - **SSH origin (scp-like `git@host:owner/repo` or `ssh://`):** the host your SSH
   config resolves to must be the forge's web host (or `ssh.github.com` for a
