@@ -154,6 +154,24 @@ func setupCodexSwitchAccountRoute(t *testing.T, seedPending, subscriptionA bool)
 	return e, stoppedRouteWire{"codex_switch_stopped", ready.ClaimGeneration, ready.RegisterNonce, ready.ExpectedEpoch}
 }
 
+// insertStoppedCutoff inserts one pending input of the given kind and a
+// reconciliation whose stop_cutoff covers it.
+func insertStoppedCutoff(t *testing.T, e *applyRouteEnv, kind string) {
+	t.Helper()
+	ctx := context.Background()
+	var applied, pending int64
+	if err := e.pool.QueryRow(ctx, "INSERT INTO run_user_inputs(run_id,kind,body,applied_at) VALUES($1,'follow_up','x',now()) RETURNING id", e.run).Scan(&applied); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.pool.QueryRow(ctx, "INSERT INTO run_user_inputs(run_id,kind,body) VALUES($1,$2,'x') RETURNING id", e.run, kind).Scan(&pending); err != nil {
+		t.Fatal(err)
+	}
+	stoppedRouteExec(t, e, `INSERT INTO run_milestone_reconciliations(id,run_id,owner_id,gate_revision,presentation_id,gate_digest,
+ reset_state_digest,worker_id,claim_generation,reason,consent,before_state,after_state,applied_input_id,stop_cutoff)
+ VALUES($1,$2,$3,1,$4,'\x00','d',$5,$6,'fixture','{}','{}','{}',$7,$8)`,
+		uuid.New(), e.run, e.user, uuid.New(), e.worker, e.gen, applied, pending)
+}
+
 func withdrawStoppedRoute(t *testing.T, e *applyRouteEnv, w stoppedRouteWire) {
 	t.Helper()
 	rec := e.do(e.worker, http.MethodPost, "/api/worker/runs/"+e.run.String()+"/state",
@@ -307,6 +325,62 @@ func TestWorkerCodexStoppedGuardsRouteLiveDB(t *testing.T) {
 		}
 		reportStoppedRoute(t, e, w, false, false)
 	})
+	// The pending-input anti-join and the wall-budget predicate, on a RUNNING run.
+	// The test service has a zero RunTimeout, so a NULL budget_wall_seconds
+	// coalesces to a zero-second base.
+	const hourAgo = "started_at=now()-interval '1 hour'"
+	inputCases := []struct {
+		name   string
+		setup  func(t *testing.T, e *applyRouteEnv)
+		accept bool
+	}{
+		{"input_applied_pause", func(t *testing.T, e *applyRouteEnv) {
+			stoppedRouteExec(t, e, "INSERT INTO run_user_inputs(run_id,kind,body,applied_at) VALUES($1,'pause','x',now())", e.run)
+		}, true},
+		{"input_superseded_pause", func(t *testing.T, e *applyRouteEnv) {
+			stoppedRouteExec(t, e, "INSERT INTO run_user_inputs(run_id,kind,body,disposition) VALUES($1,'pause','x','superseded')", e.run)
+		}, true},
+		{"input_stop_under_cutoff", func(t *testing.T, e *applyRouteEnv) {
+			insertStoppedCutoff(t, e, "stop")
+		}, true},
+		{"input_pause_under_cutoff", func(t *testing.T, e *applyRouteEnv) {
+			insertStoppedCutoff(t, e, "pause")
+		}, false},
+		{"budget_running_expired", func(t *testing.T, e *applyRouteEnv) {
+			stoppedRouteExec(t, e, `UPDATE runs SET `+hourAgo+`,budget_wall_seconds=60,budget_paused_seconds=0,budget_extension_seconds=0,budget_finalize_seconds=0 WHERE id=$1`, e.run)
+		}, false},
+		{"budget_interactive_exempt", func(t *testing.T, e *applyRouteEnv) {
+			stoppedRouteExec(t, e, `UPDATE runs SET `+hourAgo+`,budget_wall_seconds=60,budget_paused_seconds=0,budget_extension_seconds=0,budget_finalize_seconds=0,interactive=true WHERE id=$1`, e.run)
+		}, true},
+		{"budget_unstarted_exempt", func(t *testing.T, e *applyRouteEnv) {
+			stoppedRouteExec(t, e, `UPDATE runs SET started_at=NULL,budget_wall_seconds=60 WHERE id=$1`, e.run)
+		}, true},
+		{"budget_extension_keeps_positive", func(t *testing.T, e *applyRouteEnv) {
+			stoppedRouteExec(t, e, `UPDATE runs SET `+hourAgo+`,budget_wall_seconds=60,budget_paused_seconds=0,budget_extension_seconds=7200,budget_finalize_seconds=0 WHERE id=$1`, e.run)
+		}, true},
+		{"budget_finalize_keeps_positive", func(t *testing.T, e *applyRouteEnv) {
+			stoppedRouteExec(t, e, `UPDATE runs SET `+hourAgo+`,budget_wall_seconds=60,budget_paused_seconds=0,budget_extension_seconds=0,budget_finalize_seconds=7200 WHERE id=$1`, e.run)
+		}, true},
+		{"budget_paused_seconds_keeps_positive", func(t *testing.T, e *applyRouteEnv) {
+			stoppedRouteExec(t, e, `UPDATE runs SET `+hourAgo+`,budget_wall_seconds=600,budget_paused_seconds=3580,budget_extension_seconds=0,budget_finalize_seconds=0 WHERE id=$1`, e.run)
+		}, true},
+		// NULL wall falls back to the service default, which is zero here: refused.
+		{"budget_default_timeout", func(t *testing.T, e *applyRouteEnv) {
+			stoppedRouteExec(t, e, `UPDATE runs SET `+hourAgo+`,budget_wall_seconds=NULL,budget_paused_seconds=0,budget_extension_seconds=0,budget_finalize_seconds=0 WHERE id=$1`, e.run)
+		}, false},
+		// Same NULL wall, but the extension alone makes the remainder positive.
+		{"budget_default_timeout_with_extension", func(t *testing.T, e *applyRouteEnv) {
+			stoppedRouteExec(t, e, `UPDATE runs SET `+hourAgo+`,budget_wall_seconds=NULL,budget_paused_seconds=0,budget_extension_seconds=7200,budget_finalize_seconds=0 WHERE id=$1`, e.run)
+		}, true},
+	}
+	for _, c := range inputCases {
+		t.Run(c.name, func(t *testing.T) {
+			e, w := setupStoppedGuardsRoute(t)
+			withdrawStoppedRoute(t, e, w)
+			c.setup(t, e)
+			reportStoppedRoute(t, e, w, c.accept, c.accept)
+		})
+	}
 	for _, scenario := range []string{"expired_budget", "replay_original_clock", "replay_no_write"} {
 		t.Run("paused_"+scenario, func(t *testing.T) {
 			e, w := setupStoppedGuardsRoute(t)
