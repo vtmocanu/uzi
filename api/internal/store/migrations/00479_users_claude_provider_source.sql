@@ -9,7 +9,7 @@ SET LOCAL lock_timeout = '5s';
 ALTER TABLE users ADD COLUMN claude_provider_id uuid;
 ALTER TABLE users ADD CONSTRAINT users_claude_provider_fkey
     FOREIGN KEY (id, claude_provider_id) REFERENCES model_providers (owner_user_id, id) ON DELETE RESTRICT NOT VALID;
--- Validated in 00478.
+-- Validated in 00480.
 
 -- +goose Down
 SET LOCAL lock_timeout = '5s';
@@ -22,7 +22,7 @@ LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE;
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM users WHERE claude_provider_id IS NOT NULL) THEN
-        RAISE EXCEPTION 'refusing to roll back 00477: user(s) still have a Claude provider source selected; clear it explicitly before downgrading';
+        RAISE EXCEPTION 'refusing to roll back 00479: user(s) still have a Claude provider source selected; clear it explicitly before downgrading';
     END IF;
 END
 $$;

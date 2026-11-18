@@ -5,7 +5,7 @@ SET LOCAL lock_timeout = '5s';
 -- judge of a run is not created for an owner whose Claude source is a model provider, and that skip is
 -- recorded as 'provider_lane_unsupported'. This widens the judge_skips.reason CHECK of 00430 by one
 -- value. Existing rows satisfy the wider form; the new constraint is NOT VALID here (no full scan under
--- the lock) and validated in 00483. judge_skips is a small table written only by the judge enqueue path.
+-- the lock) and validated in 00485. judge_skips is a small table written only by the judge enqueue path.
 ALTER TABLE judge_skips DROP CONSTRAINT judge_skips_reason_check;
 ALTER TABLE judge_skips ADD CONSTRAINT judge_skips_reason_check
     CHECK (reason IN ('no_usable_credential', 'credential_disabled', 'codex_pool_unavailable', 'provider_lane_unsupported')) NOT VALID;

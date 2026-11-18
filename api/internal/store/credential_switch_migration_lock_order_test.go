@@ -21,7 +21,7 @@ func TestCredentialSwitchMigrationsLockOneBusyTableEach(t *testing.T) {
 	markers := []string{"credential_epoch_ordinal", "credential_switch_apply_nonce", "run_credential_switch_epochs",
 		// PRD #4320: the model provider migrations (user_secrets, users, runs columns) follow the same one-busy-table rule.
 		"model_provider",
-		// 00476 and 00478 validate the provider foreign keys and carry no "model_provider" literal.
+		// 00478 and 00480 validate the provider foreign keys and carry no "model_provider" literal.
 		"provider_fkey", "provider_key_check"}
 	busy := map[string]bool{"runs": true, "user_secrets": true, "run_messages": true, "run_usage": true, "workers": true}
 	alter := regexp.MustCompile(`(?i)\bALTER TABLE\s+(?:IF EXISTS\s+)?([a-z_]+)`)

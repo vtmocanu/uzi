@@ -27,7 +27,7 @@ import (
 // other. Measured in both directions.
 func TestRateLimitTypeVocabularyMatchesCheck(t *testing.T) {
 	// The newest migration that (re)defines the CHECK, found by content so a later widening
-	// (00486 added provider_gateway_limit) is the one compared, not 00091's original.
+	// (00488 added provider_gateway_limit) is the one compared, not 00091's original.
 	files, err := filepath.Glob("../store/migrations/*.sql")
 	if err != nil {
 		t.Fatal(err)

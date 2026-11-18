@@ -19,11 +19,11 @@ import (
 func TestModelProviderDownGuardsLockBeforeTheCheck(t *testing.T) {
 	// mode is the table lock each Down takes: the runs Downs take ACCESS EXCLUSIVE up front (no lock upgrade).
 	for file, spec := range map[string]struct{ table, mode string }{
-		"00474_model_providers.sql":                  {"model_providers", "SHARE ROW EXCLUSIVE"},
-		"00475_user_secrets_provider_key.sql":        {"user_secrets", "SHARE ROW EXCLUSIVE"},
-		"00477_users_claude_provider_source.sql":     {"users", "SHARE ROW EXCLUSIVE"},
-		"00479_runs_model_provider_binding.sql":      {"runs", "ACCESS EXCLUSIVE"},
-		"00486_runs_provider_gateway_limit_type.sql": {"runs", "ACCESS EXCLUSIVE"},
+		"00476_model_providers.sql":                  {"model_providers", "SHARE ROW EXCLUSIVE"},
+		"00477_user_secrets_provider_key.sql":        {"user_secrets", "SHARE ROW EXCLUSIVE"},
+		"00479_users_claude_provider_source.sql":     {"users", "SHARE ROW EXCLUSIVE"},
+		"00481_runs_model_provider_binding.sql":      {"runs", "ACCESS EXCLUSIVE"},
+		"00488_runs_provider_gateway_limit_type.sql": {"runs", "ACCESS EXCLUSIVE"},
 	} {
 		table := spec.table
 		b, err := os.ReadFile(filepath.Join("migrations", file)) //nolint:gosec // G304: a fixed name inside this package's migrations dir.
@@ -46,7 +46,7 @@ func TestModelProviderDownGuardsLockBeforeTheCheck(t *testing.T) {
 	}
 }
 
-// TestModelProviderDownLockSerializesWithAWriterLiveDB: the 00479 Down started while another session
+// TestModelProviderDownLockSerializesWithAWriterLiveDB: the 00481 Down started while another session
 // holds an uncommitted bound-run insert waits for it (the table lock), then sees the committed row
 // and refuses. Without the lock the guard reads its snapshot, passes, and the column drop destroys
 // the binding the writer just committed.
@@ -70,7 +70,7 @@ func TestModelProviderDownLockSerializesWithAWriterLiveDB(t *testing.T) {
  VALUES($1,$2,1,'example/down','https://example.com/down','main')`, repo, conn)
 	mustExec(ctx, t, pool, "INSERT INTO workers(id,user_id,name,token_hash,status) VALUES($1,$2,$3,$4,'online')", worker, user, worker.String(), worker[:])
 
-	b, err := os.ReadFile(filepath.Join("migrations", "00479_runs_model_provider_binding.sql"))
+	b, err := os.ReadFile(filepath.Join("migrations", "00481_runs_model_provider_binding.sql"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +108,7 @@ func TestModelProviderDownLockSerializesWithAWriterLiveDB(t *testing.T) {
 	}
 	select {
 	case err := <-done:
-		if err == nil || !strings.Contains(err.Error(), "refusing to roll back 00479") {
+		if err == nil || !strings.Contains(err.Error(), "refusing to roll back 00481") {
 			t.Fatalf("Down after the writer committed: %v, want the refusal", err)
 		}
 	case <-time.After(10 * time.Second):
@@ -116,9 +116,9 @@ func TestModelProviderDownLockSerializesWithAWriterLiveDB(t *testing.T) {
 	}
 }
 
-// TestModelProviderDownGuardsLiveDB: rolling back 00477 refuses while any user has a Claude provider
-// source selected, and rolling back 00479 refuses while any run is bound to a provider (the 00198 /
-// 00474 convention: refuse rather than silently turn a bound run or a selected source into a vendor
+// TestModelProviderDownGuardsLiveDB: rolling back 00479 refuses while any user has a Claude provider
+// source selected, and rolling back 00481 refuses while any run is bound to a provider (the 00198 /
+// 00476 convention: refuse rather than silently turn a bound run or a selected source into a vendor
 // fallback). Once the rows are gone the Down runs. Skipped unless UZI_TEST_DATABASE_URL points at a
 // throwaway Postgres.
 func TestModelProviderDownGuardsLiveDB(t *testing.T) {
@@ -163,22 +163,22 @@ func TestModelProviderDownGuardsLiveDB(t *testing.T) {
 		return err
 	}
 
-	// 00477: a selected source blocks the Down.
+	// 00479: a selected source blocks the Down.
 	mustExec(ctx, t, pool, "UPDATE users SET claude_provider_id = $2 WHERE id = $1", user, provider)
-	if err := run00("00477_users_claude_provider_source.sql"); err == nil || !strings.Contains(err.Error(), "refusing to roll back 00477") {
-		t.Fatalf("00477 Down with a selected source: %v, want a refusal", err)
+	if err := run00("00479_users_claude_provider_source.sql"); err == nil || !strings.Contains(err.Error(), "refusing to roll back 00479") {
+		t.Fatalf("00479 Down with a selected source: %v, want a refusal", err)
 	}
 	mustExec(ctx, t, pool, "UPDATE users SET claude_provider_id = NULL WHERE id = $1", user)
-	if err := run00("00477_users_claude_provider_source.sql"); err != nil {
-		t.Fatalf("00477 Down with no selected source: %v", err)
+	if err := run00("00479_users_claude_provider_source.sql"); err != nil {
+		t.Fatalf("00479 Down with no selected source: %v", err)
 	}
 
-	// 00486: a run still waiting (limit_wait) on a provider gateway limit blocks the Down (it would otherwise
+	// 00488: a run still waiting (limit_wait) on a provider gateway limit blocks the Down (it would otherwise
 	// be coerced to 'unknown' and stranded as an owner-wait the sweeper and Resume can no longer match).
 	mustExec(ctx, t, pool, `INSERT INTO runs(id,user_id,repo_id,worker_id,kind,issue_iid,issue_title,issue_description,status,claim_generation,rate_limit_type)
  VALUES($1,$2,$3,$4,'issue',2,'t','d','limit_wait',0,'provider_gateway_limit')`, run, user, repo, worker)
-	if err := run00("00486_runs_provider_gateway_limit_type.sql"); err == nil || !strings.Contains(err.Error(), "refusing to roll back 00486") {
-		t.Fatalf("00486 Down with a limit_wait provider_gateway_limit run: %v, want a refusal", err)
+	if err := run00("00488_runs_provider_gateway_limit_type.sql"); err == nil || !strings.Contains(err.Error(), "refusing to roll back 00488") {
+		t.Fatalf("00488 Down with a limit_wait provider_gateway_limit run: %v, want a refusal", err)
 	}
 	// Once the run is terminal the type is only history: it does not block, and it is mapped to unknown.
 	mustExec(ctx, t, pool, "UPDATE runs SET status = 'cancelled' WHERE id = $1", run)
@@ -186,9 +186,9 @@ func TestModelProviderDownGuardsLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tx.Exec(ctx, down("00486_runs_provider_gateway_limit_type.sql")); err != nil {
+	if _, err := tx.Exec(ctx, down("00488_runs_provider_gateway_limit_type.sql")); err != nil {
 		_ = tx.Rollback(ctx)
-		t.Fatalf("00486 Down with a terminal provider_gateway_limit run: %v, want it to pass", err)
+		t.Fatalf("00488 Down with a terminal provider_gateway_limit run: %v, want it to pass", err)
 	}
 	var mapped string
 	if err := tx.QueryRow(ctx, "SELECT rate_limit_type FROM runs WHERE id = $1", run).Scan(&mapped); err != nil {
@@ -197,19 +197,19 @@ func TestModelProviderDownGuardsLiveDB(t *testing.T) {
 	}
 	_ = tx.Rollback(ctx)
 	if mapped != "unknown" {
-		t.Fatalf("00486 Down mapped a terminal provider_gateway_limit run to %q, want unknown", mapped)
+		t.Fatalf("00488 Down mapped a terminal provider_gateway_limit run to %q, want unknown", mapped)
 	}
 	mustExec(ctx, t, pool, "DELETE FROM runs WHERE id = $1", run)
 
-	// 00479: a bound run blocks the Down.
+	// 00481: a bound run blocks the Down.
 	mustExec(ctx, t, pool, `INSERT INTO runs(id,user_id,repo_id,worker_id,kind,issue_iid,issue_title,issue_description,status,claim_generation,
  model_provider_id,model_provider_revision,model_provider_key_mode,model_provider_key_secret_id,model_provider_key_rev)
  VALUES($1,$2,$3,$4,'issue',1,'t','d','queued',0,$5,1,'user_key',$6,0)`, run, user, repo, worker, provider, uuid.New())
-	if err := run00("00479_runs_model_provider_binding.sql"); err == nil || !strings.Contains(err.Error(), "refusing to roll back 00479") {
-		t.Fatalf("00479 Down with a bound run: %v, want a refusal", err)
+	if err := run00("00481_runs_model_provider_binding.sql"); err == nil || !strings.Contains(err.Error(), "refusing to roll back 00481") {
+		t.Fatalf("00481 Down with a bound run: %v, want a refusal", err)
 	}
 	mustExec(ctx, t, pool, "DELETE FROM runs WHERE id = $1", run)
-	if err := run00("00479_runs_model_provider_binding.sql"); err != nil {
-		t.Fatalf("00479 Down with no bound run: %v", err)
+	if err := run00("00481_runs_model_provider_binding.sql"); err != nil {
+		t.Fatalf("00481 Down with no bound run: %v", err)
 	}
 }

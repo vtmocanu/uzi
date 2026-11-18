@@ -67,7 +67,7 @@ const RateLimitTypeUnknown = "unknown"
 const RateLimitTypeProviderGatewayLimit = "provider_gateway_limit"
 
 // rateLimitTypes is the closed set the newest runs_rate_limit_type_check migration
-// enforces (00091, widened by 00486): the six members of SDKRateLimitInfo.rateLimitType
+// enforces (00091, widened by 00488): the six members of SDKRateLimitInfo.rateLimitType
 // at the pinned @anthropic-ai/claude-agent-sdk (sdk.d.ts), plus RateLimitTypeUnknown and
 // RateLimitTypeProviderGatewayLimit.
 //
@@ -83,7 +83,7 @@ var rateLimitTypes = []string{
 	"seven_day_overage_included",
 	"overage",
 	RateLimitTypeUnknown,
-	// PRD #4320 M6: the provider-bound gateway-limit park (migration 00486). The worker
+	// PRD #4320 M6: the provider-bound gateway-limit park (migration 00488). The worker
 	// reports it when a provider run hits a persistent gateway 429/529.
 	RateLimitTypeProviderGatewayLimit,
 }
