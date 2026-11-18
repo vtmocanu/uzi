@@ -24,6 +24,7 @@ import { CodexExecutor, FailClosedExecutor, CODEX_PRODUCTION_PROVIDER, makeProdu
 import { ChatExecutor, type ChatExecutorLike } from "./chat-executor.js";
 import { StubChatExecutor } from "./chat-executor-stub.js";
 import { CredentialSwitchOpLedger } from "./credential-switch-op-ledger.js";
+import { RecoveryMaintenance } from "./recovery-maintenance.js";
 import { RunRunner, type ExecutorFactory, type RunExecution, type RunExecutorAddress, type RunnerOptions } from "./runner.js";
 import { ChatRunner } from "./chat-runner.js";
 import { Outbox, deriveTerminalReserveBytes } from "./outbox.js";
@@ -143,8 +144,15 @@ export function buildPodEpochScratchDeps(parts: {
   git: PodEpochScratchDeps["git"];
   dockerHost: string | undefined;
   activation?: boolean;
+  /** Issue #4420: the read-only authority slot accessor and the (already initialised) outbox, for `run-<uuid>` leaves. */
+  authority?: PodEpochScratchDeps["authority"];
+  outbox?: PodEpochScratchDeps["outbox"];
 }): PodEpochScratchDeps {
-  return { activation: parts.activation === true, git: parts.git, quiesce: () => terminalMaintenanceProof(3, parts.dockerHost) };
+  return {
+    activation: parts.activation === true, git: parts.git, quiesce: () => terminalMaintenanceProof(3, parts.dockerHost),
+    ...(parts.authority ? { authority: parts.authority } : {}),
+    ...(parts.outbox ? { outbox: parts.outbox } : {}),
+  };
 }
 
 /**
@@ -1292,7 +1300,15 @@ async function mainBody(): Promise<void> {
       bootstrap: epochBootstrap, ownership: epochOwnership, consumption: epochConsumption,
       dockerHost: config.dockerWiring.dockerHost, git, client, signal: controller.signal, log,
       deletion: buildPodEpochDeletionDeps({ authority, runner, git, dockerHost: config.dockerWiring.dockerHost, activation: epochReclaimDeletion }),
-      scratch: buildPodEpochScratchDeps({ git, dockerHost: config.dockerWiring.dockerHost, activation: epochScratchDeletion }),
+      scratch: buildPodEpochScratchDeps({
+        git, dockerHost: config.dockerWiring.dockerHost, activation: epochScratchDeletion,
+        authority: {
+          peekSlot: (clonePath, bound) => authority.peekSlot(clonePath, bound), peekAllSlots: (max, bound) => authority.peekAllSlots(max, bound),
+          inspectMaintenance: (runId, bound) => new RecoveryMaintenance({
+            root: path.join(config.dataDir, "recovery-maintenance"), workerToken: config.workerToken,
+          }).inspectRun(runId, bound),
+        }, outbox,
+      }),
       retire: buildPodEpochRetireDeps({ authority, runner, git, dockerHost: config.dockerWiring.dockerHost, dataDir: config.dataDir, activation: retireScratchReclaim }),
     });
     if (result !== undefined) {

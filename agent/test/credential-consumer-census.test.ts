@@ -47,7 +47,7 @@ const EXACT_SITES: Record<string, Site[]> = {
     { label: "drive rebind", line: "drive.state.rebindDrive = (token) => { drive.oauthToken = token; };", count: 1 },
     { label: "phaseSetup reads the (rebound) context at drive start", line: "const oauthToken = ctx.oauthToken?.trim();", count: 1 },
     { label: "phaseSetup reads the (rebound) context at drive start", line: "if (!oauthToken) {", count: 1 },
-    { label: "phaseSetup reads the (rebound) context at drive start", line: "const env = buildSdkEnv(oauthToken, this.homeDir, toolEnv, this.dockerHost, ctx.runAttempt, ctx.managedGoWorkDir);", count: 1 },
+    { label: "phaseSetup reads the (rebound) context at drive start", line: "const env = buildSdkEnv(oauthToken, this.homeDir, toolEnv, this.dockerHost, ctx.runAttempt, ctx.managedGoWorkDir, ctx.runTmpdir);", count: 1 },
     { label: "drive carrier fields", line: "oauthToken,", count: 2 },
     { label: "drive carrier fields", line: "!!oauthToken &&", count: 1 },
     { label: "intent summary: credentialFor snapshot", line: "const cred = this.credentialFor(ctx, oauthToken);", count: 1 },

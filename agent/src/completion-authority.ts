@@ -305,8 +305,28 @@ function unseal<T extends object>(key: Buffer, kind: string, source: string, nor
 
 // ---- file IO (async only) -------------------------------------------------------------
 
-export async function readRegular(file: string, uid: number, limit: number): Promise<string | null> {
+/**
+ * Issue #4420: the interruption bound of a read-only inventory pass. Checked BETWEEN fs operations: an operation already
+ * started is always awaited to completion (and every handle closed) before the refusal propagates, so nothing is abandoned.
+ */
+export type AuthorityReadBound = { signal: AbortSignal; deadline: number };
+
+function interrupt(bound: AuthorityReadBound | undefined): void {
+  if (bound !== undefined && (bound.signal.aborted || Date.now() >= bound.deadline)) {
+    throw new AuthorityRefusal("authority read interrupted");
+  }
+}
+
+/** Check the bound, then start `op`. Without a bound this is exactly `op()`. */
+function step<T>(bound: AuthorityReadBound | undefined, op: () => Promise<T>): Promise<T> {
+  if (bound === undefined) return op();
+  interrupt(bound);
+  return op();
+}
+
+export async function readRegular(file: string, uid: number, limit: number, bound?: AuthorityReadBound): Promise<string | null> {
   let handle: fsp.FileHandle;
+  interrupt(bound);
   try { handle = await fsp.open(file, fsc.O_RDONLY | fsc.O_NOFOLLOW | fsc.O_NONBLOCK); }
   catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
@@ -314,7 +334,7 @@ export async function readRegular(file: string, uid: number, limit: number): Pro
     throw new AuthorityRefusal(`unreadable authority file: ${code ?? "error"}`);
   }
   try {
-    const stat = await handle.stat({ bigint: true });
+    const stat = await step(bound, () => handle.stat({ bigint: true }));
     if (!stat.isFile() || stat.uid !== BigInt(uid) || (stat.mode & 0o7777n) !== 0o600n || stat.nlink !== 1n) {
       throw new AuthorityRefusal("unsafe authority file metadata");
     }
@@ -322,11 +342,11 @@ export async function readRegular(file: string, uid: number, limit: number): Pro
     const bytes = Buffer.alloc(Number(stat.size));
     let length = 0;
     while (length < bytes.length) {
-      const { bytesRead } = await handle.read(bytes, length, bytes.length - length, length);
+      const { bytesRead } = await step(bound, () => handle.read(bytes, length, bytes.length - length, length));
       if (bytesRead === 0) break;
       length += bytesRead;
     }
-    const after = await handle.stat({ bigint: true });
+    const after = await step(bound, () => handle.stat({ bigint: true }));
     if (length !== bytes.length || after.size !== stat.size) throw new AuthorityRefusal("authority file changed while read");
     const decoded = bytes.toString("utf8");
     if (!Buffer.from(decoded, "utf8").equals(bytes)) throw new AuthorityRefusal("non-UTF-8 authority file");
@@ -341,9 +361,10 @@ export async function readRegular(file: string, uid: number, limit: number): Pro
  * the directory this handle was opened on. Memory only: st_dev/st_ino are never persisted.
  */
 async function withDirGuard<T>(
-  dir: string, uid: number, fn: (handle: fsp.FileHandle, check: () => Promise<void>) => Promise<T>,
+  dir: string, uid: number, fn: (handle: fsp.FileHandle, check: () => Promise<void>) => Promise<T>, bound?: AuthorityReadBound,
 ): Promise<T> {
   let handle: fsp.FileHandle;
+  interrupt(bound);
   try { handle = await fsp.open(dir, fsc.O_RDONLY | fsc.O_DIRECTORY | fsc.O_NOFOLLOW); }
   catch (error) {
     // A missing directory, a symlink (ELOOP) and a non-directory (ENOTDIR) are all refusals, not raw errors.
@@ -356,12 +377,13 @@ async function withDirGuard<T>(
     throw new AuthorityRefusal(`authority directory unavailable: ${code ?? "error"}`);
   }
   try {
-    const held = await handle.stat({ bigint: true });
+    const held = await step(bound, () => handle.stat({ bigint: true }));
     if (!held.isDirectory() || held.uid !== BigInt(uid) || !isPrivateDirMode(held.mode)) {
       throw new AuthorityRefusal("unsafe authority directory");
     }
     const check = async (): Promise<void> => {
       let named;
+      interrupt(bound);
       try { named = await fsp.lstat(dir, { bigint: true }); }
       catch { throw new AuthorityRefusal("authority directory identity changed"); }
       if (!named.isDirectory() || named.dev !== held.dev || named.ino !== held.ino) {
@@ -416,12 +438,12 @@ function sealHead(init: StoreIdentity, shard: string, heads: ReadonlyMap<string,
  * The authenticated head shard. Every shard exists from store creation on, so a missing one
  * refuses: reading it as empty would let a deleted shard roll back every key in it.
  */
-async function readHead(init: StoreIdentity, shard: string): Promise<Map<string, number>> {
+async function readHead(init: StoreIdentity, shard: string, bound?: AuthorityReadBound): Promise<Map<string, number>> {
   const source = await withDirGuard(path.join(init.dir, HEADS_DIR), init.uid, async (_handle, check) => {
-    const read = await readRegular(path.join(init.dir, HEADS_DIR, `${shard}.json`), init.uid, init.maxHeadBytes);
+    const read = await readRegular(path.join(init.dir, HEADS_DIR, `${shard}.json`), init.uid, init.maxHeadBytes, bound);
     await check();
     return read;
-  }).catch((error: unknown) => {
+  }, bound).catch((error: unknown) => {
     if (error instanceof AuthorityRefusal && error.message === "authority directory missing") throw new AuthorityRefusal("authority head missing");
     throw error;
   });
@@ -515,12 +537,12 @@ async function createHeads(ops: AuthorityFsOps, init: StoreIdentity): Promise<vo
 }
 
 /** An existing heads/ must be a private directory holding every shard; none may be missing. */
-async function requireCompleteHeads(init: { dir: string; uid: number }): Promise<void> {
+async function requireCompleteHeads(init: { dir: string; uid: number }, bound?: AuthorityReadBound): Promise<void> {
   const names = await withDirGuard(path.join(init.dir, HEADS_DIR), init.uid, async (_handle, check) => {
-    const listed = await fsp.readdir(path.join(init.dir, HEADS_DIR));
+    const listed = await step(bound, () => fsp.readdir(path.join(init.dir, HEADS_DIR)));
     await check();
     return new Set(listed);
-  });
+  }, bound);
   if (SHARD_NAMES.some((shard) => !names.has(`${shard}.json`))) throw new AuthorityRefusal("authority head missing");
 }
 
@@ -667,22 +689,47 @@ export function processWorkerIncarnation(): string { return PROCESS_INCARNATION;
  * rejects them). The storage-type probe is skipped: W acquisition already required a supported filesystem.
  */
 export async function peekAuthoritySlot(
-  options: { dataDir: string; workerToken: string; uid?: number }, sourcePath: string,
+  options: { dataDir: string; workerToken: string; uid?: number }, sourcePath: string, bound?: AuthorityReadBound,
 ): Promise<SlotSnapshot | null> {
+  const store = await openPeekStore(options, bound);
+  const slot = store === null ? null : await store.peekSlot(sourcePath, bound);
+  interrupt(bound);
+  return slot;
+}
+
+/**
+ * Issue #4420: every slot of the store, read-only (the same enrollment and head checks as {@link peekAuthoritySlot}, no
+ * transaction, no write, no head repair). An unenrolled empty store has none. The directory listing is checked against the
+ * authenticated heads: a slot a head records whose file (or whole slots directory) is gone rejects. More than `max` slots
+ * (listed or head-recorded), an unexpected name, a non-directory slots dir or any unreadable or unauthenticated slot rejects;
+ * the caller treats a rejection as unknown.
+ */
+export async function peekAllAuthoritySlots(
+  options: { dataDir: string; workerToken: string; uid?: number }, max: number, bound?: AuthorityReadBound,
+): Promise<SlotSnapshot[]> {
+  const store = await openPeekStore(options, bound);
+  const slots = store === null ? [] : await store.peekAllSlots(max, bound);
+  interrupt(bound);
+  return slots;
+}
+
+async function openPeekStore(
+  options: { dataDir: string; workerToken: string; uid?: number }, bound?: AuthorityReadBound,
+): Promise<AuthorityStore | null> {
   if (options.workerToken === "") throw new AuthorityRefusal("worker token required to authenticate authority state");
   const dataDir = options.dataDir;
   const uid = options.uid ?? process.getuid?.() ?? -1;
   const key = deriveAuthorityKey(options.workerToken);
-  if (path.resolve(dataDir) !== dataDir || await fsp.realpath(dataDir) !== dataDir) {
+  if (path.resolve(dataDir) !== dataDir || await step(bound, () => fsp.realpath(dataDir)) !== dataDir) {
     throw new AuthorityRefusal("authority data root is not the canonical spelling");
   }
   const authorityDir = path.join(dataDir, AUTHORITY_DIR_NAME);
-  const existing = await readRegular(path.join(authorityDir, ENROLLMENT_FILE), uid, MAX_ENROLLMENT_BYTES);
+  const existing = await readRegular(path.join(authorityDir, ENROLLMENT_FILE), uid, MAX_ENROLLMENT_BYTES, bound);
   const latched = enrolledStorage.get(dataDir);
   if (existing === null) {
     if (latched !== undefined) throw new AuthorityRefusal("authority store was reset after this process enrolled it");
     for (const name of [SLOTS_DIR, HEADS_DIR]) {
-      try { await fsp.lstat(path.join(authorityDir, name)); }
+      try { await step(bound, () => fsp.lstat(path.join(authorityDir, name))); }
       catch (error) {
         if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
         throw error;
@@ -694,20 +741,21 @@ export async function peekAuthoritySlot(
   const enrollment = unseal(key, "enrollment", existing, normalizeEnrollment);
   if (enrollment.layout !== AUTHORITY_LAYOUT) throw new AuthorityRefusal("unsupported authority layout");
   if (enrollment.dataDir !== dataDir) throw new AuthorityRefusal("authority enrolled under a different data root spelling");
-  await requireCompleteHeads({ dir: authorityDir, uid });
+  await requireCompleteHeads({ dir: authorityDir, uid }, bound);
   if (latched !== undefined && latched !== enrollment.storageId) {
     throw new AuthorityRefusal("authority store was replaced after this process enrolled it");
   }
   enrolledStorage.set(dataDir, enrollment.storageId);
-  const store = new AuthorityStore(storeBrand, {
+  return new AuthorityStore(storeBrand, {
     key, storageId: enrollment.storageId, ctxDir: authorityDir, dataDir, uid,
     incarnation: PROCESS_INCARNATION, ops: realOps, maxHeadBytes: MAX_SLOT_BYTES,
   });
-  return store.peekSlot(sourcePath);
 }
 
 /** Canonical relative layout identity of a source path plus the final component's identity; refuses anything unsafe. */
-async function relativeWithRoot(root: string, sourcePath: string): Promise<{ rel: string; root: { dev: string; ino: string } | undefined }> {
+async function relativeWithRoot(
+  root: string, sourcePath: string, bound?: AuthorityReadBound,
+): Promise<{ rel: string; root: { dev: string; ino: string } | undefined }> {
   if (typeof sourcePath !== "string" || sourcePath.includes("\0") || !path.isAbsolute(sourcePath) ||
       path.resolve(sourcePath) !== sourcePath) {
     throw new AuthorityRefusal("source path must be a normalized absolute path");
@@ -723,6 +771,7 @@ async function relativeWithRoot(root: string, sourcePath: string): Promise<{ rel
   for (const [index, part] of parts.entries()) {
     current = path.join(current, part);
     let stat;
+    interrupt(bound);
     try { stat = await fsp.lstat(current, { bigint: true }); }
     catch (error) {
       // Only the final component may be absent: nothing below a missing ancestor is checkable.
@@ -909,8 +958,8 @@ export class AuthorityStore {
   }
 
   /** Canonical relative layout identity of a source path; refuses anything unsafe. */
-  async #relative(sourcePath: string): Promise<string> {
-    return (await relativeWithRoot(this.#init.dataDir, sourcePath)).rel;
+  async #relative(sourcePath: string, bound?: AuthorityReadBound): Promise<string> {
+    return (await relativeWithRoot(this.#init.dataDir, sourcePath, bound)).rel;
   }
 
   /**
@@ -927,8 +976,8 @@ export class AuthorityStore {
     return this.#slotKeyOf(sourcePath);
   }
 
-  async #slotKeyOf(sourcePath: string): Promise<string> {
-    const rel = await this.#relative(sourcePath);
+  async #slotKeyOf(sourcePath: string, bound?: AuthorityReadBound): Promise<string> {
+    const rel = await this.#relative(sourcePath, bound);
     return createHmac("sha256", this.#init.key).update(`slot\0${this.#init.storageId}\0${rel}`).digest("hex");
   }
 
@@ -940,16 +989,70 @@ export class AuthorityStore {
    * refused, after a short bounded re-read in case a writer in this process is between the two renames), and
    * never moves the in-process high-water mark. Not for any decision that must be atomic with a write.
    */
-  async peekSlot(sourcePath: string): Promise<SlotSnapshot | null> {
-    const key = await this.#slotKeyOf(sourcePath);
+  async peekSlot(sourcePath: string, bound?: AuthorityReadBound): Promise<SlotSnapshot | null> {
+    const key = await this.#slotKeyOf(sourcePath, bound);
     const dir = path.join(this.#init.ctxDir, SLOTS_DIR);
     for (let attempt = 0; ; attempt++) {
-      try { return await this.#load(dir, key, true); }
-      catch (error) {
+      try {
+        const slot = await this.#load(dir, key, true, bound);
+        interrupt(bound);
+        return slot;
+      } catch (error) {
         if (!(error instanceof AuthorityRefusal) || error.message !== SLOT_AHEAD_OF_HEAD || attempt >= 3) throw error;
-        await new Promise((resolve) => setTimeout(resolve, 25));
+        await step(bound, () => new Promise<void>((resolve) => setTimeout(resolve, 25)));
       }
     }
+  }
+
+  /**
+   * Issue #4420: every slot, read-only (see {@link peekAllAuthoritySlots}); each is loaded exactly as {@link peekSlot} loads one.
+   * The directory listing is checked against the authenticated heads: every key a head records (seq > 0) is loaded too, so a
+   * deleted slot file or a deleted slots directory refuses ("authority slot missing") instead of listing as absent.
+   */
+  async peekAllSlots(max: number, bound?: AuthorityReadBound): Promise<SlotSnapshot[]> {
+    const dir = path.join(this.#init.ctxDir, SLOTS_DIR);
+    const keys = new Set<string>();
+    for (const shard of SHARD_NAMES) {
+      for (const [key, seq] of await readHead(this.#identityOf(), shard, bound)) {
+        if (seq > 0) keys.add(key);
+      }
+      if (keys.size > max) throw new AuthorityRefusal("authority slot listing exceeds its cap");
+    }
+    let names: string[] = [];
+    try {
+      if (!(await step(bound, () => fsp.lstat(dir))).isDirectory()) throw new AuthorityRefusal("authority slots path is not a directory");
+      names = await step(bound, () => fsp.readdir(dir));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    if (names.length > max) throw new AuthorityRefusal("authority slot listing exceeds its cap");
+    for (const name of names) {
+      // An orphaned writeDurable temp file is not a slot record.
+      if (name.startsWith(".") && name.endsWith(".tmp")) continue;
+      const m = /^([0-9a-f]{64})\.json$/.exec(name);
+      if (!m) throw new AuthorityRefusal("unexpected entry in authority slots");
+      keys.add(m[1]!);
+    }
+    if (keys.size > max) throw new AuthorityRefusal("authority slot listing exceeds its cap");
+    const out: SlotSnapshot[] = [];
+    for (const key of keys) {
+      for (let attempt = 0; ; attempt++) {
+        try {
+          const slot = await this.#load(dir, key, true, bound);
+          // Listed or head-recorded, a key that now reads as absent is an unresolved read inconsistency: refuse. Defensive:
+          // a head-recorded key already refuses inside #load ("authority slot missing"), so this branch is reached only by a
+          // listed, head-less file removed between the listing and its read, which no test injects.
+          if (slot === null) throw new AuthorityRefusal("authority slot vanished during listing");
+          out.push(slot);
+          break;
+        } catch (error) {
+          if (!(error instanceof AuthorityRefusal) || error.message !== SLOT_AHEAD_OF_HEAD || attempt >= 3) throw error;
+          await step(bound, () => new Promise<void>((resolve) => setTimeout(resolve, 25)));
+        }
+      }
+    }
+    interrupt(bound);
+    return out;
   }
 
   #identityOf(): StoreIdentity {
@@ -959,9 +1062,9 @@ export class AuthorityStore {
     };
   }
 
-  async #load(dir: string, key: string, readOnly = false): Promise<SlotSnapshot | null> {
-    const head = await readHead(this.#identityOf(), shardOf(key));
-    const source = await readRegular(path.join(dir, `${key}.json`), this.#init.uid, MAX_SLOT_BYTES);
+  async #load(dir: string, key: string, readOnly = false, bound?: AuthorityReadBound): Promise<SlotSnapshot | null> {
+    const head = await readHead(this.#identityOf(), shardOf(key), bound);
+    const source = await readRegular(path.join(dir, `${key}.json`), this.#init.uid, MAX_SLOT_BYTES, bound);
     const headSeq = head.get(key) ?? 0;
     const floor = Math.max(headSeq, this.#highWater.get(key) ?? 0);
     if (source === null) {

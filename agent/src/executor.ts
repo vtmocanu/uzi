@@ -218,6 +218,11 @@ export interface RunContext {
    *  pre-plan JS-deps install, and is inherited by Bash, subagents and the guarded command lane.
    *  Absent when the runner could not prepare one (launch proceeds without GOTMPDIR). */
   managedGoWorkDir?: string;
+  /** Issue #4420, Claude run flight only (the runner sets it; Codex never does): the run-owned
+   *  scratch leaf `<scratch root>/run-<runId>`. It becomes TMPDIR for the lead CLI, the provisioning
+   *  subprocess and the pre-plan JS-deps install, and is inherited by Bash and subagents. Absent when
+   *  the runner could not prepare one (launch proceeds with the shared runner TMPDIR). */
+  runTmpdir?: string;
   /** PRD #3244: the claim's single lead-config reporter, constructed by the runner only. Executors
    *  call `enterPhase` before a lead turn; absent for stub/test executors and non-lead lanes. */
   leadConfig?: import("./lead-config-report.js").LeadConfigReporter;

@@ -241,7 +241,7 @@ binding. The amendment of 2026-11-06 above is unaffected.
   or other-filesystem leaves; leaves a Docker bind source or a protected recovery record
   references; leaves a visible process holds open or uses as its cwd; `uzi-quiesce-*` helper leaves; and
   any leaf whose newest subtree ctime is at or after the pod-entry fence (record ctime minus 2 s);
-  and any leaf whose census was incomplete (a cap, the deadline or an unreadable entry). At most 512 leaves are admitted per pass, in name order.
+  and any leaf whose census was incomplete (a cap, the deadline or an unreadable entry). At most 512 leaves are admitted per pass: non-run leaves first in name order, then `run-<uuid>` leaves (see the 2026-11-17 amendment below).
 - **Deletion.** Top-level leaves are censused read-only as the runner uid, then deleted one at a
   time. Before each delete the mounts, daemon inventory, leaf census, idle proof and process
   holders are re-read; a changed leaf is kept and a failed re-read stops the phase or ends the
@@ -345,7 +345,46 @@ retired ledger, emptiness, age or the parent name grant nothing. The legacy
 stderr-proof repair (#4141, landed via #4152) does not certify remnants created
 by older code retroactively, and #4137 is a distinct residual. Reclaim remains
 open on #4143 pending a durable parent-binding design (superseded in part by the
-2026-11-17 amendment below).
+2026-11-17 #4263 amendment below).
+
+## Amendment (2026-11-17, #4420)
+
+Claude run flights in the main run lane (issue, task, prompt, CI-fix, self-improve and MR-rework runs) now launch with a run-owned `TMPDIR` leaf `run-<runId>` under
+the scratch root, and the scratch phase may reclaim such a leaf. The authority, exclusion
+and settlement protections of the 2026-11-10 amendment are unchanged. A `run-<uuid>` leaf
+is additionally kept unless the server lifecycle is terminal, the run has zero open
+holds and every local retention source has ended (`classifyEpochScratchRunRetention` in
+`agent/src/git.ts`, `agent/src/pod-epoch-run-retention.ts`, outbox check in
+`agent/src/pod-epoch-reclaim.ts`). Non-run leaves take the 512 admission slots first.
+
+Owner decisions:
+
+1. **`uzi-trackowner.<branch>.owner` is not leaf retention.** It is seed provenance for
+   `refs/uzi-runner/<branch>`: written by `promoteTrackingUnderLock` and the attempt
+   repair (both call `runnerTrackingOwnerKey` in `agent/src/git.ts`), read by
+   `readTrackingOwner` through `checkedTrackingOwner`, and preserved by
+   `cleanupRecoveryGeneration`. It neither keeps nor releases a TMPDIR leaf;
+   `scanRunBareConfig` ignores the `uzi-trackowner.` family on purpose.
+2. **Authority slot.** A slot in state `ineligible` or `retired` with pending, retiring
+   and publication all null counts as ended only together with the verified missing
+   footprint, read through a read-only accessor over `peekAuthoritySlot`
+   (`judgeAuthoritySlot`). Any other state, any non-null field or an unreadable slot keeps.
+
+Consequence: the hibernation census reports `run-<uuid>` leaves as protected
+(`run_scratch`), so the hibernation retirement dry-run evaluator
+(`api/internal/workersvc/hibernation_retirement.go`, `entryBlocker`) records a
+`protected_source` blocker for such a worker until a later pod start's scratch phase reclaims them, if it does
+(the scratch phase must run, deletion be requested, the epoch be eligible and attested, and the run have ended).
+A #4263 retire-scratch binding names its run, so `scanRunBareConfig` keeps that run's
+leaf (`bare_config`) while the binding exists; on a uid-split pod a non-completion binding
+stays `intent` under C-prime, so such a leaf is kept with it (fail closed; an exemption
+backed by settled-binding evidence is open on #4453). See the bare-config readers table in
+the #4263 amendment below.
+
+Deferred, not shipped: deletion at run end (no fence against sibling runner-uid writers
+or Docker-created mounts after the listing, the #4043 deferral), startup throughput,
+run-procs and cache-cap attribution of the leaf; retained-discovery overflow keeps all
+run leaves for that pass; runs reassigned to another worker are kept on the old worker.
 
 ## Amendment 2026-11-17 — issue #4263: durable `.retire-*` parent bindings and verified-epoch reclaim
 
@@ -677,6 +716,7 @@ cross-check and every in-pass check. Reader-by-reader decisions (abbreviated;
 | ACK reader and runGit config accounting | Entries count toward their caps (1024 entries); the 64-per-bare cap bounds the addition. |
 | Startup inspector | Changed: reads bindings and reports binding-aware reasons. |
 | Attempt-ledger compaction | Changed: an attempt named by a binding keeps its `retired` entry; an unreadable or undecodable binding set keeps every entry; an attempt whose ledger values, on any branch, or a binding name more than one run, clone path or branch keeps every value verbatim, never dropped or collapsed (issue #4263); its binding is kept as `ledger_mismatch`, or `conflict` when a second binding names it. Such a conflict no longer heals by compaction, so readers that already refuse it (terminal attribution `duplicate_attempt`, the recovery source ledger check) keep refusing; normal flows never write a second identity for an attempt id. Cross-bare: compaction reads every other bare's config once, without that bare's lock, and preserves verbatim any attempt id another bare names (a decoded binding or an identified ledger value); while any other bare holds a decoded binding, own values that cannot be attributed to an attempt are kept too. Guarantee: every cross-bare conflict observed in that snapshot is preserved; a mention written after the read is outside it, so if another bare's first binding is written after the scan read none, an own unattributable value may be dropped; by the legitimate-writer argument that value is not about that binding's attempt, so only an earlier reclaim follows (legitimate writers only write fresh-minted ids, `mintAttemptId`: timestamp, claim generation, 64 random bits, or same-bare ids into their own bare under its lock). The scan is bounded (1024 bares, 16 MiB, 131072 records, a 5 s budget checked between reads); on any failure compaction is skipped, the ledger is unchanged and it warns `attempt ledger compaction skipped: foreign retire evidence unavailable` with a fixed reason (`bare_cap`, `bytes_cap`, `records_cap`, `deadline`, `unreadable`, `binding_unknown`, `binding_undecodable`, `ledger_unidentified`). A kept unattributable value is self-sustaining (the refused reclaim leaves its binding, and other bares' compaction skips on it); remediation is an operator-only, unsupported step done with the worker stopped, since compaction computes what to keep from an earlier read and its rewrite could reinstate a value an operator removed after that read. One unreadable or unidentifiable foreign bare disables compaction worker-wide. |
+| Run-leaf retention classifier (`scanRunBareConfig`, issue #4420) | No change to the keep rule. The prefix is not one of its families, so the catch-all keeps the named run's `run-<uuid>` TMPDIR leaf (`bare_config`) while the binding exists: under C-prime a split-pod non-completion binding stays `intent`, so that leaf stays too, and a gone-parent binding cleared by this pass still keeps the leaf for this pass (the scratch phase runs first). Fail closed; pinned in `agent/test/pod-epoch-scratch-run-retention.test.ts`. |
 | Hibernation census (filesystem walk of the runner root) | No change. A bound parent reports `unknown`, which blocks volume retirement conservatively (a residual below). |
 | `backup-runs.sh` config reads | No change. They match exact keys; a retired, discarded clone is not backup material. |
 
@@ -735,6 +775,13 @@ An architect, auditor and reviewer examined two judgments and found no stop.
 
 ### Residuals
 
+- **Retire-phase budget after the run-leaf scratch phase (issue #4420).** The retire
+  phase has no reserved share of the pass: it refuses with `budget_deferred` when less
+  than `RETIRE_PHASE_MIN_MS` (30 s) of the pass budget remains after its 5 s
+  reserve. The #4420 scratch phase spends up to two
+  30 s server reads plus the local classifier per run leaf, so a worker with many run
+  leaves can starve the attempt and retire phases. Everything not reached is kept; no
+  deadline or budget was changed when the two features were merged.
 - **Historical-pod writer.** A worker image without this change writes no
   binding; its parents stay unbound and kept.
 - **Clone substitution before `retire()` starts.** The clone directory is pinned

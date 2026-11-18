@@ -72,6 +72,37 @@ function makeDeps(provision: ProvisionRunDeps["provision"]): ProvisionRunDeps {
   return { provisionRoot, homeDir, log: nullLogger(), provision };
 }
 
+describe("provisionRunTools run-owned TMPDIR (issue #4420)", () => {
+  const leaf = "/scratch/run-123e4567-e89b-42d3-a456-426614174000";
+  const capture = () => {
+    const inputs: ProvisionInput[] = [];
+    const fn = (async (input: ProvisionInput): Promise<ProvisionResult> => {
+      inputs.push(input);
+      if (input.packages.includes("ruby@3.3")) throw new Error("devbox install failed resolving ruby@3.3");
+      return { toolEnv: {} };
+    }) as unknown as ProvisionRunDeps["provision"];
+    return { fn, inputs };
+  };
+
+  it("passes ctx.runTmpdir on the merged call and on the tier-1 retry", async () => {
+    await writeDevbox(["ruby@3.3"]);
+    const h = makeCtx({ tool_packages: ["kubectl@1.31"], repo_devbox_opt_in: true });
+    h.ctx.runTmpdir = leaf;
+    const { fn, inputs } = capture();
+    await provisionRunTools(h.ctx, makeDeps(fn));
+    assert.strictEqual(inputs.length, 2);
+    assert.deepStrictEqual(inputs.map((i) => i.runTmpdir), [leaf, leaf]);
+  });
+
+  it("never sets runTmpdir for a context without one", async () => {
+    const h = makeCtx({ tool_packages: ["kubectl@1.31"], repo_devbox_opt_in: false });
+    const { fn, inputs } = capture();
+    await provisionRunTools(h.ctx, makeDeps(fn));
+    assert.strictEqual(inputs.length, 1);
+    assert.ok(!("runTmpdir" in inputs[0]!));
+  });
+});
+
 describe("provisionRunTools tier-2 best-effort fallback (PRD #278 M2)", () => {
   it("(a) UZI CASE: opt-in, empty tier-1, repo extra; provision always throws → degrades to empty env", async () => {
     await writeDevbox(["ruby@3.3"]);

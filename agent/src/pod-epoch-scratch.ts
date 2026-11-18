@@ -17,6 +17,8 @@ const ACTIVE_HELPER_PREFIX = "uzi-quiesce-";
  * helper leaf. The census classifier and the delete launch validator both use this one rule. */
 export const isNeverRemovedScratchName = (name: string): boolean =>
   PROTECTED_NAMES.has(name) || name.startsWith(ACTIVE_HELPER_PREFIX);
+/** Issue #4420: the run-owned scratch leaf name, `run-<lowercase uuid>`, directly under the scratch root. */
+export const RUN_SCRATCH_LEAF_RE = /^run-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const POD_ENTRY = "/data/.uzi-pod-entry";
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 /** `O_PATH` (Linux; absent from `fs.constants`), the same idiom as rmtree's PINNED_PRELUDE. */
@@ -639,11 +641,20 @@ export function classifyScratchCensus(input: {
     if (input.heldLeaves.has(e.name)) return "held_open";
     return undefined;
   };
-  // Name order makes the 512 cut deterministic.
-  for (const e of [...input.census.entries].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))) {
+  // Name order makes the 512 cut deterministic. Issue #4420: kept `run-<uuid>` leaves sort before `tmp.` ones and
+  // can be permanent, so non-run leaves are offered the slots first and run leaves take what remains. `admitted` is
+  // returned in that admission order (non-run leaves in name order, then run leaves in name order) so the delete loop
+  // processes the cheap non-run leaves before any run leaf, whose keep check costs server reads.
+  const byName = [...input.census.entries].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  const eligible: CensusEntry[] = [];
+  for (const e of byName) {
     const reason = reasonOf(e);
     if (reason) kept[reason]++;
-    else if (admitted.length >= MAX_ADMITTED_LEAVES) kept.cap++;
+    else eligible.push(e);
+  }
+  const ordered = [...eligible.filter(e => !RUN_SCRATCH_LEAF_RE.test(e.name)), ...eligible.filter(e => RUN_SCRATCH_LEAF_RE.test(e.name))];
+  for (const e of ordered) {
+    if (admitted.length >= MAX_ADMITTED_LEAVES) kept.cap++;
     else admitted.push({ name: e.name, devIno: e.devIno, bytes: e.bytes, sharedBytes: e.sharedBytes, maxCtimeMs: e.maxCtimeMs });
   }
   return { examined: input.census.entries.length, admitted, kept,

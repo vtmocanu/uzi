@@ -70,8 +70,8 @@ function contract(text: string): void {
   // The scratch dependencies are passed after the runtime TMPDIR was restored (restore < shadow above) and
   // carry no scratch gate sentinel or test seam.
   assert.match(main.slice(shadow, admission),
-    /scratch: buildPodEpochScratchDeps\(\{ git, dockerHost: config.dockerWiring.dockerHost, activation: epochScratchDeletion \}\)/,
-    "the pass receives the production scratch dependencies");
+    /scratch: buildPodEpochScratchDeps\(\{\s*git, dockerHost: config.dockerWiring.dockerHost, activation: epochScratchDeletion,\s*authority: \{\s*peekSlot: \(clonePath, bound\) => authority\.peekSlot\(clonePath, bound\), peekAllSlots: \(max, bound\) => authority\.peekAllSlots\(max, bound\),\s*inspectMaintenance: \(runId, bound\) => new RecoveryMaintenance\(\{\s*root: path\.join\(config\.dataDir, "recovery-maintenance"\), workerToken: config\.workerToken,\s*\}\)\.inspectRun\(runId, bound\),\s*\}, outbox,\s*\}\)/,
+    "the pass receives the production scratch dependencies, including the read-only authority slot accessors, the authenticated maintenance reader and the outbox");
   assert.ok(!main.includes("scratchTestGate") && !main.includes("seams"), "main never passes the scratch test gate or seams");
   const cancellation = at("if (controller.signal.aborted) {");
   assert.ok(shadow < cancellation, "cancellation checked after shadow");
@@ -199,6 +199,9 @@ const admissionBody = section("const verdict = startupReapVerdict(", "await work
 
 function admissionPorts(shadow: (options: Record<string, unknown>) => Promise<unknown>) {
   const events: string[] = [];
+  const peeked: string[] = [];
+  const maintenanceBuilt: unknown[] = [];
+  const maintenanceBounds: unknown[] = [];
   const inspections: Array<Record<string, unknown>> = [];
   const controller = new AbortController();
   const ports = {
@@ -206,9 +209,15 @@ function admissionPorts(shadow: (options: Record<string, unknown>) => Promise<un
     shutdownSignal: undefined,
     finishShutdown: async () => { events.push("shutdown"); return { result: "drained", exitCode: 0 }; },
     epochBootstrap: {}, epochOwnership: {}, epochConsumption: {},
-    config: { dockerWiring: { dockerHost: "unix:///docker.sock" }, dataDir: "/data" },
+    config: { dockerWiring: { dockerHost: "unix:///docker.sock" }, dataDir: "/data", workerToken: "tok" },
     git: { inspectRetireScratchAtStartup: async (_start: number, opts: Record<string, unknown>) => { events.push("inspect"); inspections.push(opts); } },
-    client: {}, authority: {}, runner: {}, epochReclaimDeletion: false, epochScratchDeletion: true,
+    client: {},
+    path: { join: (...parts: string[]) => parts.join("/") },
+    RecoveryMaintenance: class { constructor(readonly options: unknown) { maintenanceBuilt.push(options); } async inspectRun(id: string, bound?: unknown) { peeked.push(`maintenance:${id}`); maintenanceBounds.push(bound); return "absent"; } },
+    authority: {
+      peekSlot: async (clonePath: string) => { peeked.push(clonePath); return null; },
+      peekAllSlots: async (max: number) => { peeked.push(`all:${max}`); return []; },
+    }, outbox: {}, runner: {}, epochReclaimDeletion: false, epochScratchDeletion: true,
     retireScratchOutcomes: true, retireScratchReclaim: true, errMessage: (err: Error) => err.message,
     buildPodEpochRetireDeps: (parts: Record<string, unknown>) => ({ built: parts }),
     buildPodEpochDeletionDeps: (parts: Record<string, unknown>) => ({ built: parts }),
@@ -217,7 +226,7 @@ function admissionPorts(shadow: (options: Record<string, unknown>) => Promise<un
     log: { info: (message: string, fields: unknown) => { events.push(message); assert.ok(fields); }, warn: () => assert.fail("no warning expected") },
     worker: { run: async (signal: AbortSignal) => { assert.equal(signal, controller.signal); events.push("run"); } },
   };
-  return { ports, events, inspections, controller, run: () => executeBoundary('let lifecyclePhase;\n' + admissionBody, ports) };
+  return { ports, events, peeked, maintenanceBuilt, maintenanceBounds, inspections, controller, run: () => executeBoundary('let lifecyclePhase;\n' + admissionBody, ports) };
 }
 
 test("main waits for shadow handover, forwards its ports and logs a defined verdict before admission", async () => {
@@ -238,9 +247,25 @@ test("main waits for shadow handover, forwards its ports and logs a defined verd
     assert.equal(built.dockerHost, "unix:///docker.sock");
     assert.equal(built.activation, fixture.ports.epochReclaimDeletion);
     const scratch = (options.scratch as { built: Record<string, unknown> }).built;
-    assert.deepEqual(Object.keys(scratch).sort(), ["activation", "dockerHost", "git"]);
+    assert.deepEqual(Object.keys(scratch).sort(), ["activation", "authority", "dockerHost", "git", "outbox"]);
     assert.equal(scratch.activation, fixture.ports.epochScratchDeletion);
     assert.equal(scratch.git, fixture.ports.git);
+    assert.equal(scratch.outbox, fixture.ports.outbox);
+    const peek = (scratch.authority as { peekSlot: (clonePath: string) => Promise<unknown> }).peekSlot;
+    assert.equal(typeof peek, "function");
+    assert.notEqual(scratch.authority, fixture.ports.authority, "only the read-only accessor is handed over, not the authority");
+    assert.deepEqual(Object.keys(scratch.authority as object).sort(), ["inspectMaintenance", "peekAllSlots", "peekSlot"]);
+    const accessors = scratch.authority as { peekAllSlots: (max: number) => Promise<unknown>; inspectMaintenance: (id: string, bound?: { signal: AbortSignal; deadline: number }) => Promise<unknown> };
+    void peek("/clone/x");
+    void accessors.peekAllSlots(7);
+    const bound = { signal: new AbortController().signal, deadline: 1_234_567 };
+    void accessors.inspectMaintenance("run-1", bound);
+    assert.deepEqual(fixture.peeked, ["/clone/x", "all:7", "maintenance:run-1"], "the accessors delegate to the authority and the maintenance ledger");
+    assert.equal(fixture.maintenanceBounds.length, 1);
+    assert.equal((fixture.maintenanceBounds[0] as typeof bound).signal, bound.signal, "the bound's signal reaches inspectRun by identity");
+    assert.equal((fixture.maintenanceBounds[0] as typeof bound).deadline, 1_234_567, "the bound's deadline reaches inspectRun");
+    assert.deepEqual(fixture.maintenanceBuilt, [{ root: "/data/recovery-maintenance", workerToken: "tok" }],
+      "the maintenance reader is authenticated with the worker token over the data dir's ledger");
     assert.equal(scratch.dockerHost, "unix:///docker.sock");
     const retire = (options.retire as { built: Record<string, unknown> }).built;
     assert.deepEqual(Object.keys(retire).sort(), ["activation", "authority", "dataDir", "dockerHost", "git", "runner"]);
@@ -350,6 +375,12 @@ test("the scratch dependencies main builds carry activation, git and a deny-only
   const git = {};
   const deps = buildPodEpochScratchDeps({ git: git as never, dockerHost: undefined });
   assert.deepEqual(Object.keys(deps).sort(), ["activation", "git", "quiesce"]);
+  const authority = { peekSlot: async () => null };
+  const outbox = {};
+  const full = buildPodEpochScratchDeps({ git: git as never, dockerHost: undefined, authority, outbox: outbox as never });
+  assert.deepEqual(Object.keys(full).sort(), ["activation", "authority", "git", "outbox", "quiesce"]);
+  assert.equal(full.authority, authority);
+  assert.equal(full.outbox, outbox);
   assert.equal(deps.activation, false);
   assert.equal(buildPodEpochScratchDeps({ git: git as never, dockerHost: undefined, activation: true }).activation, true);
   assert.equal(deps.git, git);

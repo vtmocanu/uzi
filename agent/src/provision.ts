@@ -71,6 +71,9 @@ export interface ProvisionInput {
   /** HOME for the install subprocess (nix single-user profile + devbox state);
    *  a dir on the persistent data volume so the nix store warm-starts. */
   homeDir: string;
+  /** Issue #4420: the run-owned scratch leaf to use as the subprocess TMPDIR instead of the shared
+   *  runner TMPDIR. Claude lane only (`RunContext.runTmpdir`); absent ⇒ unchanged. */
+  runTmpdir?: string;
 }
 
 /** Result of running a provisioning command. */
@@ -95,6 +98,7 @@ export interface SupervisedProvisionRequest {
 const supervisedProvisions = new WeakMap<SupervisedProvisionRequest, {
   readonly cwd: string;
   readonly homeDir: string;
+  readonly runTmpdir: string | undefined;
   readonly source: Readonly<NodeJS.ProcessEnv>;
   readonly env: Readonly<NodeJS.ProcessEnv>;
   readonly args: readonly string[];
@@ -107,12 +111,12 @@ export function prepareSupervisedProvision(
   command: string,
   args: readonly string[],
   opts: { cwd: string; env: NodeJS.ProcessEnv },
-  input: Pick<ProvisionInput, "runDir" | "homeDir">,
+  input: Pick<ProvisionInput, "runDir" | "homeDir" | "runTmpdir">,
   source: NodeJS.ProcessEnv,
   signal: AbortSignal,
   beforeSpawn: () => void,
 ): SupervisedProvisionRequest {
-  const capturedSource = Object.freeze(buildProvisionEnv(source, input.homeDir));
+  const capturedSource = Object.freeze(buildProvisionEnv(source, input.homeDir, input.runTmpdir));
   const env = capturedSource;
   const keys = Object.keys(opts.env);
   if (command !== "devbox" ||
@@ -133,7 +137,7 @@ export function prepareSupervisedProvision(
     env, timeoutMs: 10 * 60_000, signal,
   }) as SupervisedProvisionRequest;
   supervisedProvisions.set(request, {
-    cwd: input.runDir, homeDir: input.homeDir, source: capturedSource,
+    cwd: input.runDir, homeDir: input.homeDir, runTmpdir: input.runTmpdir, source: capturedSource,
     env, args: capturedArgs, signal, beforeSpawn,
   });
   assertSupervisedProvisionRequest(request);
@@ -153,7 +157,7 @@ export function assertSupervisedProvisionRequest(request: SupervisedProvisionReq
       request.args[1] === "shellenv" && request.args[2] === "--no-refresh-alias")) {
     throw new Error("provision request has no canonical preparation provenance");
   }
-  const canonicalEnv = buildProvisionEnv(binding.source, binding.homeDir);
+  const canonicalEnv = buildProvisionEnv(binding.source, binding.homeDir, binding.runTmpdir);
   if (!path.isAbsolute(request.cwd) || path.resolve(request.cwd) !== request.cwd ||
     request.cwd.includes("\0") || !path.isAbsolute(binding.homeDir) ||
     path.resolve(binding.homeDir) !== binding.homeDir ||
@@ -220,7 +224,7 @@ const defaultRun = async (
  * are absent by construction; the PAT + Anthropic token are never in process.env
  * to begin with. Only what nix/devbox demonstrably needs is added.
  */
-export function buildProvisionEnv(source: NodeJS.ProcessEnv, homeDir: string): NodeJS.ProcessEnv {
+export function buildProvisionEnv(source: NodeJS.ProcessEnv, homeDir: string, runTmpdir?: string): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
     // So `devbox`, `nix`, and `sh` resolve. The RUNNER PATH (PRD #51 M4): the
     // /nix-bearing image PATH under the split (provisioning runs as `runner`), NOT the
@@ -233,7 +237,7 @@ export function buildProvisionEnv(source: NodeJS.ProcessEnv, homeDir: string): N
     HOME: homeDir,
   };
   // 5-bis: nix/devbox scratch on the runner's private 0700 TMPDIR under the split.
-  const tmp = runnerTmpdir(source);
+  const tmp = runTmpdir ?? runnerTmpdir(source);
   if (tmp) env.TMPDIR = tmp;
   // Pass through TLS trust only if the base image set it (needed to fetch from
   // substituters over HTTPS). Never invent it; never carry anything else.
@@ -350,7 +354,7 @@ export async function provisionTools(input: ProvisionInput, deps: ProvisionDeps)
   const manifest = JSON.stringify({ packages }, null, 2) + "\n";
   await fs.writeFile(path.join(input.runDir, "devbox.json"), manifest, "utf8");
 
-  const env = buildProvisionEnv(source, input.homeDir);
+  const env = buildProvisionEnv(source, input.homeDir, input.runTmpdir);
 
   try {
     await withRetry(() => run("devbox", ["install"], { cwd: input.runDir, env }), {

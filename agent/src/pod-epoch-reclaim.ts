@@ -13,13 +13,16 @@ import type { AuthorityRuntime } from "./authority-runtime.js";
 import { isRunOwnershipLost } from "./client.js";
 import { parsePodEpochEvidence, assertPodEpochEvidenceBinding } from "./pod-epoch-evidence.js";
 import { openPodEpochDaemonBarrier, PodEpochDaemonError, type PodEpochDaemonGuard } from "./pod-epoch-daemon.js";
-import type { EpochScratchDiscardInput, GitCache, RetainedDiscardResult, RetainedHoldsSnapshot, RetainedLifecycleSnapshot, RetainedSourceSelector, RetainedWorkCounters } from "./git.js";
+import type { EpochRetainedDiscoveryResult, EpochScratchDiscardInput, GitCache, RetainedDiscardResult, RetainedHoldsSnapshot, RetainedLifecycleSnapshot, RetainedSourceSelector, RetainedWorkCounters } from "./git.js";
 import { evaluateRetireBinding, newRetainedWorkCounters, retireCrossBareConflict, storesNameRetireParent, type RetireScratchParentOutcome, type RetireScratchPassReport } from "./git.js";
+import type { Outbox } from "./outbox.js";
+import type { AuthorityReadBound, SlotSnapshot } from "./completion-authority.js";
+import { ENDED, RUN_KEPT_REASONS, activeRetention, normalizeRetention, unknownRetention, type MaintenanceInspection, type RunRetention } from "./pod-epoch-run-retention.js";
 import type { RecoveryHoldsResponse, RunOwnershipResponse } from "./protocol.js";
 import { SCRATCH_DELETE_LIMITS, censusScratchRoot } from "./rmtree.js";
 import { uidSplitActive } from "./runner-uid.js";
 import {
-  KEPT_REASONS, censusEntryUnchanged, classifyBindSources, classifyScratchCensus, parseScratchCensus, pinScratchRoot,
+  KEPT_REASONS, RUN_SCRATCH_LEAF_RE, censusEntryUnchanged, classifyBindSources, classifyScratchCensus, parseScratchCensus, pinScratchRoot,
   protectedLeaves, readPodEntryFence, readScratchMounts, repinScratchRoot, scanScratchProcesses, scratchFilesystemOf,
   scratchLayout, type ScratchIo, type ScratchLayout, type ScratchRootPin, type Settlement,
 } from "./pod-epoch-scratch.js";
@@ -100,7 +103,20 @@ export interface PodEpochScratchTestSeams {
 }
 /** What the scratch phase needs; absent means no scratch work whatever the gate says. */
 export interface PodEpochScratchDeps {
-  git: Pick<GitCache, "collectEpochScratchProtectedPaths" | "discardEpochScratchLeaf" | "assertNoUnsettledDeletes">;
+  git: Pick<GitCache, "collectEpochScratchProtectedPaths" | "discardEpochScratchLeaf" | "assertNoUnsettledDeletes"> &
+    /** Issue #4420: the local-retention classifier of a `run-<uuid>` leaf. Absent keeps every such leaf (`classifier`). */
+    Partial<Pick<GitCache, "classifyEpochScratchRunRetention">>;
+  /** Issue #4420: the read-only authority slot accessor (AuthorityRuntime.peekSlot). Absent keeps a retired attempt (`authority_slot`). */
+  authority?: {
+    peekSlot(clonePath: string, bound?: AuthorityReadBound): Promise<SlotSnapshot | null>;
+    /** Read-only, bounded enumeration of every slot (AuthorityRuntime.peekAllSlots). Absent keeps every run (`authority_inventory`). */
+    peekAllSlots?(max: number, bound?: AuthorityReadBound): Promise<SlotSnapshot[]>;
+    /** The authenticated recovery-maintenance read (RecoveryMaintenance.inspectRun). Absent keeps a run while that store exists. */
+    inspectMaintenance?(runId: string, bound?: AuthorityReadBound): Promise<MaintenanceInspection>;
+  };
+  /** Issue #4420: the worker's outbox (initialised before this pass). Absent or unusable keeps every `run-<uuid>` leaf (`outbox`). */
+  outbox?: Pick<Outbox, "isDisabled" | "unusableRootReason" | "hasPhysicalTerminalProtection" | "listPendingFinalizeGenerations" |
+    "listPublicationRecords" | "depthFor" | "uncleanRuns" | "hasLoadRejectedRecords" | "runsWithPending">;
   /** Worker-wide exclusive-idle proof (bound to terminalMaintenanceProof). */
   quiesce: () => Promise<boolean>;
   /** Startup opt-in parsed by main.ts; permits phase entry, supplies no evidence. */
@@ -236,13 +252,17 @@ interface ScratchVerdict {
   /** The idle proof failed after the last delete joined (everything deleted was already settled); the phase then
    *  reports `stopped`/`not_idle` with the settled counts kept. */
   not_idle_after: boolean;
+  /** Issue #4420: which local source kept a `run-<uuid>` leaf (`run_local_active` or `run_local_unknown`), by fixed
+   *  token; never a path or run id. Like `kept.mount`/`changed`/`held_open` this counts admitted leaves, so it
+   *  overlaps `eligible`. */
+  run_local_sources: Record<string, number>;
 }
 const emptyScratch = (): ScratchVerdict => ({
   state: "not_run", reason: "not_run", layout: null, examined: 0,
-  kept: Object.fromEntries([...KEPT_REASONS, "changed"].map(reason => [reason, 0])), eligible: 0,
+  kept: Object.fromEntries([...KEPT_REASONS, "changed", ...RUN_KEPT_REASONS].map(reason => [reason, 0])), eligible: 0,
   eligible_allocated_bytes_estimate: 0, shared_bytes: 0, deleted: 0, deleted_allocated_bytes_estimate: 0, residue: 0,
   helper_failed: 0, estimate_partial: false, statfs_free_delta_unattributed: null, reclaim_bytes_state: "unknown",
-  list_overflow: false, not_idle_after: false,
+  list_overflow: false, not_idle_after: false, run_local_sources: {},
 });
 /** Fatal startup refusal. The caller must exit without admitting a worker or releasing EX. */
 export class PodEpochSettlementError extends Error {
@@ -319,6 +339,12 @@ const safe = (value: string) => value.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 
 interface ScratchContext {
   deps: PodEpochScratchDeps;
   seams: PodEpochScratchTestSeams;
+  /** The server reads of a `run-<uuid>` leaf's run (lifecycle and holds). */
+  client: Options["client"];
+  /** The pass-scoped retained census memo shared by every run leaf's classification. */
+  runDiscovery: { value?: Promise<EpochRetainedDiscoveryResult> };
+  /** The pass-scoped memo of each bare's config listing, shared by every run leaf's classification. */
+  runMemo: { bareConfigs?: Map<string, Promise<string>>; slots?: Promise<SlotSnapshot[]> };
   podUid: string;
   guard: PodEpochDaemonGuard;
   controller: AbortController;
@@ -326,6 +352,8 @@ interface ScratchContext {
   check(): void;
   entry(): void;
   now(): number;
+  /** The pass's injectable timer; returns its cancel. */
+  schedule(fn: () => void, ms: number): () => void;
   hardPass: number;
   deadlineAt(): number;
   out: ScratchVerdict;
@@ -371,6 +399,110 @@ async function runScratchPhase(ctx: ScratchContext): Promise<void> {
     if (out.state === "ran" || out.state === "not_run") stopPhase(error instanceof Refusal || error instanceof PodEpochDaemonError ? error.reason : "interrupted");
     throw error;
   } finally { pin.close(); }
+}
+
+/** The outbox half of a run's local retention (issue #4420 C3). Read-only; a missing, disabled or unusable store, or
+ *  any read failure, is unknown, never ended. Run ids match case-insensitively where the outbox keeps case aliases. */
+async function outboxRetention(outbox: PodEpochScratchDeps["outbox"], runId: string): Promise<RunRetention> {
+  if (!outbox) return unknownRetention("outbox");
+  try {
+    if (outbox.isDisabled() || outbox.unusableRootReason() !== undefined) return unknownRetention("outbox");
+    // A record init rejected is still on disk and unaccounted for in memory: unknown, never ended.
+    if (outbox.hasLoadRejectedRecords(runId)) return unknownRetention("outbox");
+    const id = runId.toLowerCase();
+    if (await outbox.hasPhysicalTerminalProtection(runId)) return activeRetention("outbox");
+    // The complete listing (every generation, terminal-holding runs included), not the register's capped view
+    // (listPendingFinalizes truncates at its entry cap and would omit a record past it).
+    if (outbox.listPendingFinalizeGenerations(true).some(p => p.run_id.toLowerCase() === id)) return activeRetention("outbox");
+    if (outbox.listPublicationRecords().some(p => p.run_id.toLowerCase() === id)) return activeRetention("outbox");
+    for (const key of new Set([runId, id])) {
+      const depth = outbox.depthFor(key);
+      // staleRetired counts records the drainer already retired and blockedReason only labels a blocked terminal,
+      // which pendingTerminal already counts; neither is a pending record, so neither is consulted.
+      if (depth && (depth.pendingMessages > 0 || depth.pendingTerminal > 0)) return activeRetention("outbox");
+    }
+    // depthFor is an exact-key lookup and leaf names are lowercase, so undrained messages kept under a case alias of the
+    // run id are found through the complete list of runs with pending messages, matched case-insensitively.
+    if (outbox.runsWithPending().some(r => r.toLowerCase() === id)) return activeRetention("outbox");
+    if (outbox.uncleanRuns().some(r => r.toLowerCase() === id)) return activeRetention("outbox");
+    return ENDED;
+  } catch { return unknownRetention("outbox"); }
+}
+
+/** Upper bound on one run-leaf server read (matches the client's HTTP timeout scale). Exported for the tests. */
+export const RUN_LEAF_READ_MAX_MS = 30_000;
+
+/**
+ * One run-leaf server read under its own deadline: `min(hardPass - 5000, now + RUN_LEAF_READ_MAX_MS)`. The read gets a
+ * signal that follows the pass's abort and also fires at that deadline, so a hung read fails only this leaf (the caller
+ * keeps it as unreadable) while an aborted pass still propagates as interrupted.
+ */
+async function boundedRunLeafRead<T>(ctx: ScratchContext, read: (signal: AbortSignal, deadline: number) => Promise<T>): Promise<T> {
+  const deadline = Math.min(ctx.hardPass - 5000, ctx.now() + RUN_LEAF_READ_MAX_MS);
+  const local = new AbortController();
+  const follow = () => local.abort(ctx.controller.signal.reason);
+  ctx.controller.signal.addEventListener("abort", follow, { once: true });
+  if (ctx.controller.signal.aborted) follow();
+  const cancel = ctx.schedule(() => local.abort(new Error("run_leaf_read_timeout")), Math.max(0, deadline - ctx.now()));
+  try { return await MaintenanceBudget.runOwned(local.signal, () => read(local.signal, deadline)); }
+  finally { cancel(); ctx.controller.signal.removeEventListener("abort", follow); }
+}
+
+/**
+ * Issue #4420: why a `run-<uuid>` leaf must be kept, or undefined when its run has ended everywhere. Server first
+ * (lifecycle terminal, then zero holds by the deletion-side rule), then local retention (GitCache) and the outbox.
+ * Every read is bounded by the pass and joined; a failure keeps the leaf. A pass-fatal or aborted pass still
+ * propagates as it does for the other scratch reads. Counts the local source in `out.run_local_sources`.
+ */
+async function runLeafKeep(ctx: ScratchContext, name: string): Promise<(typeof RUN_KEPT_REASONS)[number] | undefined> {
+  const { deps, controller, out, client } = ctx;
+  const runId = name.slice("run-".length);
+  const rethrow = (error: unknown): void => { if (error instanceof PodEpochSettlementError || ctx.interrupted()) throw error; };
+  let row: RunOwnershipResponse | undefined;
+  try {
+    row = await ctx.owned(() => boundedRunLeafRead(ctx,
+      (signal, deadline) => client.getRunOwnership(runId, { signal, deadline })), ctx.hardPass);
+  } catch (error) {
+    rethrow(error);
+    // Only the exact ownership 404 is "unknown to the server"; every other failure is unreadable.
+    return isRunOwnershipLost(error, runId) ? "run_unknown" : "run_unreadable";
+  }
+  if (!row || typeof row.status !== "string") return "run_unreadable";
+  // No disposition alone means ended: only a terminal status does.
+  if (row.status !== "completed" && row.status !== "failed" && row.status !== "cancelled") return "run_active";
+  const lifecycle: RetainedLifecycleSnapshot = { state: "terminal", status: row.status };
+  let response: RecoveryHoldsResponse | undefined;
+  try {
+    response = await ctx.owned(() => boundedRunLeafRead(ctx,
+      signal => client.listRecoveryHolds(runId, signal)), ctx.hardPass);
+  } catch (error) { rethrow(error); return "run_unreadable"; }
+  const snapshot = holdsSnapshot(response!, runId);
+  const open = response?.run_open_holds;
+  if (snapshot.state === "read" && (snapshot.holds.length > 0 ||
+      (!!open && typeof open === "object" && open.run_id === runId && Number.isSafeInteger(open.count) && open.count > 0))) return "run_retained";
+  if (!deletionZeroHolds(response!, runId)) return "run_unreadable";
+  const holds: RetainedHoldsSnapshot = { state: "read", holds: [] };
+  let local: RunRetention;
+  const classify = deps.git.classifyEpochScratchRunRetention;
+  if (typeof classify !== "function") local = unknownRetention("classifier");
+  else {
+    try {
+      const peek = deps.authority;
+      local = normalizeRetention(await ctx.owned(() => classify.call(deps.git, runId, {
+        lifecycle, holds, signal: controller.signal, deadline: ctx.deadlineAt(), discovery: ctx.runDiscovery, memo: ctx.runMemo,
+        ...(peek ? { peekSlot: (clonePath: string, bound?: AuthorityReadBound) => peek.peekSlot(clonePath, bound) } : {}),
+        ...(peek?.peekAllSlots ? { peekAllSlots: (max: number, bound?: AuthorityReadBound) => peek.peekAllSlots!(max, bound) } : {}),
+        ...(peek?.inspectMaintenance ? { inspectMaintenance: (id: string, bound?: AuthorityReadBound) => peek.inspectMaintenance!(id, bound) } : {}),
+      }), ctx.hardPass));
+    } catch (error) { rethrow(error); local = unknownRetention("classifier"); }
+  }
+  if (local.state === "ended") {
+    try { local = normalizeRetention(await ctx.owned(() => outboxRetention(deps.outbox, runId), ctx.hardPass)); }
+    catch (error) { rethrow(error); local = unknownRetention("outbox"); }
+  }
+  if (local.state === "ended") return undefined;
+  out.run_local_sources[local.source] = (out.run_local_sources[local.source] ?? 0) + 1;
+  return local.state === "active" ? "run_local_active" : "run_local_unknown";
 }
 
 async function scratchBody(ctx: ScratchContext, layout: ScratchLayout, pin: ScratchRootPin,
@@ -488,6 +620,12 @@ async function scratchBody(ctx: ScratchContext, layout: ScratchLayout, pin: Scra
     if ("refused" in again) { stopPhase(again.refused); break; }
     if (!censusEntryUnchanged(leaf, again.entries.find(e => e.name === leaf.name), again.rootUid)) {
       out.kept.changed = (out.kept.changed ?? 0) + 1; continue;
+    }
+    // Issue #4420: a per-run TMPDIR leaf also needs its run ended on the server and on this worker. Only reads, so
+    // every error is a keep; an `ended` verdict falls through to the idle proof and the delete below unchanged.
+    if (RUN_SCRATCH_LEAF_RE.test(leaf.name)) {
+      const keep = await runLeafKeep(ctx, leaf.name);
+      if (keep !== undefined) { out.kept[keep] = (out.kept[keep] ?? 0) + 1; continue; }
     }
     if (!(await idle())) { stopPhase("not_idle"); break; }
     const holding = scan([leaf.name]);
@@ -1472,7 +1610,8 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
       const scratchStart = now();
       await runScratchPhase({
         deps: scratchDeps, seams: scratchDeps.scratchTestGate === TEST_SCRATCH_GATE ? scratchDeps.seams ?? {} : {},
-        podUid: boot.podUid, guard: guard!, controller, owned, check, entry, now, hardPass, deadlineAt, out: result.scratch,
+        client: options.client, runDiscovery: {}, runMemo: {},
+        podUid: boot.podUid, guard: guard!, controller, owned, check, entry, now, schedule, hardPass, deadlineAt, out: result.scratch,
         openScope,
         interrupted: () => fatal || controller.signal.aborted,
         failFatal: () => { fatal = true; throw new PodEpochSettlementError(); },

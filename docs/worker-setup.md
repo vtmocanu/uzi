@@ -353,7 +353,10 @@ object then reports `state` and `reason` (fixed tokens), `layout`, the counts
 `examined`, `kept` by reason, `eligible` (admitted at census time; a leaf
 demoted before its delete is also counted under `kept`), `deleted`, `residue`
 and `helper_failed`, and the flags `estimate_partial`, `list_overflow` and
-`not_idle_after`. The byte figures `eligible_allocated_bytes_estimate`,
+`not_idle_after`. Per-run `run-<uuid>` leaves (#4420) add the kept reasons `run_active`,
+`run_retained`, `run_unknown`, `run_unreadable`, `run_local_active` and `run_local_unknown`,
+and `run_local_sources` (counts by fixed source token); see
+[per-run TMPDIR leaves](run-recovery.md#per-run-tmpdir-leaves-4420). The byte figures `eligible_allocated_bytes_estimate`,
 `deleted_allocated_bytes_estimate` and `shared_bytes` (hard-linked files) come
 from allocated blocks, and `statfs_free_delta_unattributed` is the change in
 available bytes across the delete loop from all writers, so none of them proves
