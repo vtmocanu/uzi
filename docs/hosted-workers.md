@@ -251,6 +251,9 @@ finished on it for `worker_hibernation_idle_after` (default `336h`, between `1h`
 its last completed wake, and its creation. Logins and heartbeats do not count. A
 user's last or only worker is included, and there is no per-user opt-out.
 
+With [surplus mode](#surplus-warm-reserve) on, a pooled worker's long clock is owner-wide
+instead: see [Owner-wide long clock](#owner-wide-long-clock).
+
 **The pass.** The sweeper runs the pass at most once per minute and hibernates at
 most 10 workers per pass, oldest idle first. Each worker goes through the same
 admission checks as a manual hibernation (see the refusal list above) and the same
@@ -266,14 +269,102 @@ starve clean ones. When the controller refuses before scaling down, the worker i
 not tried again for at least 1 hour. Admin health's `fleet.hibernation` check names
 idle workers that are blocked this way and runs that have been parked past the
 threshold; see [Admin health](./admin-health.md).
+With surplus mode on, the check judges a pooled worker by the
+[owner-wide long clock](#owner-wide-long-clock): it lists the worker only when it is
+long-idle and a block was recorded at or after that anchor, so a refusal recorded by the
+surplus rule alone does not raise it.
 
 **Waking.** Every completed wake restarts the idle clock: a manual wake, a demand
 wake, turning the setting off, or a withdrawn hibernation. A woken worker gets a full
 threshold before it is considered again.
 
+With surplus mode on, the long clock of a pooled worker is the exception: only completed
+manual and demand wakes extend it, and warm and system wakes do not (see
+[Owner-wide long clock](#owner-wide-long-clock)). The surplus clock still restarts on every
+completed wake.
+
 **Record.** Automatic hibernations write no hibernation audit event. The worker's
 hibernation reason reads "automatic: no run activity for ..." (for example
-"automatic: no run activity for 14d").
+"automatic: no run activity for 14d"); a surplus admission (below) reads
+"automatic: surplus in pool, idle ..." (for example "automatic: surplus in pool, idle 2h").
+
+#### Surplus warm reserve
+
+With `worker_hibernation_surplus` on (default off; effective only while
+`worker_hibernation_enabled` and `worker_hibernation_auto` are both on), the pass
+also hibernates surplus workers sooner than the long idle rule. Among an owner's
+interchangeable workers, one idle, ready worker stays awake and the pool's other
+idle workers are hibernated once they have shown no run activity for the surplus
+threshold, `worker_hibernation_surplus_idle_after` (default `2h`, between `15m` and
+`336h`). The pass uses the shorter of that and `worker_hibernation_idle_after`; the
+settings card shows a hint when the surplus threshold is longer. See
+[Admin settings](./admin-settings.md#worker-hibernation). The long
+`worker_hibernation_idle_after` rule still applies, within the same per-pass budget
+and one-change-per-owner limit.
+
+**Equivalence pool.** Workers are interchangeable when they share the same owner,
+template, size, isolated lane, Docker setting, effective capabilities, protocol
+capabilities, max concurrent runs and cross-check slots. Ephemeral and unregistered
+workers are in no pool, so the rule never touches them.
+
+**Ready.** A worker counts as ready when it is online with a fresh heartbeat, awake,
+accepting new work (not cordoned, draining or in maintenance), has no assigned run, has
+no pending-outcome overflow, its cache cleanup has settled, and its memory authority is
+not lost. A worker that reported losing memory authority is not counted as ready. A
+worker advertising memory authority reporting (`worker_memory_pressure_v1` and
+`worker_memory_authority_claim_v1`) is counted as ready only after a recent `held`
+report from its current registration, within the worker heartbeat-staleness window.
+Until then its memory authority is unknown; after a loss it is lost. Neither is counted.
+
+**Which worker stays.** The kept worker is the most recently used ready one in the
+pool. A locked owner vault, the owner's custody-hold limit and an instance intake
+pause do not affect which worker is kept.
+
+**Limits.** The pass makes at most 10 state changes, and at most one per owner per pass,
+oldest first. A worker the usual admission checks refuse records its blocker as it does
+today (see the refusal list above and
+[Diagnosing a blocked hibernation](#diagnosing-a-blocked-hibernation-or-a-stuck-roll)).
+If the api runs with `UZI_ACTIVE_SNAPSHOT_DISABLED`, memory authority is unknown, so
+memory-capable pools are not surplus-hibernated.
+
+**Docker workers.** A surplus sleep goes through the same
+[cache cleanup before sleep](#cache-cleanup-before-sleep) as any hibernation, so a
+worker advertising `hibernation_cache_prune_v1` whose cleanup completes re-wakes with a
+pruned build cache.
+
+##### Owner-wide long clock
+
+While `worker_hibernation_surplus` is on, the long idle clock
+of a pooled worker runs from the latest of the owner's run activity, the worker's
+creation, and its last completed manual or demand wake. Owner run activity is any run of
+the owner, including runs on no worker; a run that is not terminal keeps the owner
+active, so none of its pooled workers is long-idle. Warm and system wakes do not extend
+this clock. The surplus clock above still restarts on every completed wake. An unpooled
+worker keeps the per-worker clock described under Idle.
+
+##### Warm reserve replenishment
+
+When no ready idle worker is awake in a pool, the api
+wakes one automatically hibernated member so the owner's next run finds a warm worker.
+All of these must hold:
+
+- The pool (at least two members) has no ready idle worker, no waking worker whose wake
+  has not failed, and no member with a demand wake pending.
+- The owner was active within the idle threshold (`worker_hibernation_idle_after`) or is
+  active now.
+- Instance intake is not paused. Only the instance intake pause suppresses a warm wake: a
+  locked owner vault and the owner being at the custody-hold limit do not, because a
+  warm worker is still useful there (cross-check and continuation claims and chat claims
+  are exempt from the limit).
+
+The wake takes a member the automatic pass hibernated (a manual hibernation is never
+warm-woken); a member that is still preparing is withdrawn first, then hibernated
+members, most recently used first. A member with a wake error, a manual cordon or
+maintenance in effect is never chosen. The worker's reason reads "automatic: warm
+reserve". It counts against the same 10 per pass and one per owner budget as a
+hibernation, and it writes no hibernation audit event. When memory authority is not
+persisted (`UZI_ACTIVE_SNAPSHOT_DISABLED`), memory-capable pools get no warm wake, as for
+the surplus sleep.
 
 #### Diagnosing a blocked hibernation or a stuck roll
 

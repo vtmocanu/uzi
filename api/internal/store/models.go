@@ -2091,6 +2091,12 @@ type Worker struct {
 	HibernationBlockedReason   pgtype.Text        `json:"hibernation_blocked_reason"`
 	HibernationBlockedAt       pgtype.Timestamptz `json:"hibernation_blocked_at"`
 	HibernationBlockedSince    pgtype.Timestamptz `json:"hibernation_blocked_since"`
+	MemoryAuthorityLostAt      pgtype.Timestamptz `json:"memory_authority_lost_at"`
+	HibernationOriginOpID      pgtype.UUID        `json:"hibernation_origin_op_id"`
+	HibernationAdmitOrigin     pgtype.Text        `json:"hibernation_admit_origin"`
+	HibernationWakeOrigin      pgtype.Text        `json:"hibernation_wake_origin"`
+	LastManualWakeSettledAt    pgtype.Timestamptz `json:"last_manual_wake_settled_at"`
+	MemoryAuthorityHeldAt      pgtype.Timestamptz `json:"memory_authority_held_at"`
 }
 
 type WorkerActiveRun struct {

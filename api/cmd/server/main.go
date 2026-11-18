@@ -619,6 +619,9 @@ func run() error {
 	// Automatic idle-worker hibernation (issue #4207): the pass reads worker_hibernation_auto and
 	// worker_hibernation_idle_after on top of the kill-switch above.
 	wsvc.SetHibernationAutoSettings(settingsCache)
+	// Issue #4395: with the active-snapshot kill switch on, memory-authority loss is never
+	// persisted, so the surplus pool policy treats memory authority as unknown.
+	wsvc.SetActiveSnapshotDisabled(cfg.ActiveSnapshotDisabled)
 	// Issue #1965: a profile-bound run on a deployment without the lane says so instead of waiting.
 	wsvc.SetIsolatedLaneEnabled(cfg.IsolatedLaneEnabled())
 	// PRD #2006 / #4212: the lease (lease entry on a worker-reported terminal, lease-arm claims; 0
