@@ -21,7 +21,8 @@ func repoEnvFake() *uzicli.FakeClient {
 			{Name: "LOCKED", ValueWithheld: true, State: "enabled", UpdatedAt: ts},
 			{Name: "EVIL", Value: &evil, Description: "line1\nFAKE_ROW\tplain", State: "enabled", UpdatedAt: ts},
 		},
-		Counts: apitypes.RunEnvCountsDTO{Total: 4, Limit: 50},
+		VaultLocked: true,
+		Counts:      apitypes.RunEnvCountsDTO{Total: 4, Limit: 50},
 	}}
 }
 
@@ -48,6 +49,23 @@ func TestRepoEnvListTable(t *testing.T) {
 		if strings.HasPrefix(strings.TrimSpace(line), "FAKE_ROW") {
 			t.Errorf("a newline in a description forged a table row: %q", out)
 		}
+	}
+}
+
+// A plain value the server withheld while the vault is NOT locked (no vault configured,
+// or the value cannot be opened) must not claim the vault is locked.
+func TestRepoEnvListWithheldButUnlocked(t *testing.T) {
+	ts := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
+	fc := &uzicli.FakeClient{RepoEnvResult: apitypes.RunEnvListDTO{
+		Variables: []apitypes.RunEnvVarDTO{{Name: "UNOPENABLE", ValueWithheld: true, State: "enabled", UpdatedAt: ts}},
+		Counts:    apitypes.RunEnvCountsDTO{Total: 1, Limit: 50},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "repo", "env", "list", "r1")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(out, "(withheld)") || strings.Contains(out, "(vault locked)") {
+		t.Errorf("want (withheld) and no (vault locked):\n%s", out)
 	}
 }
 

@@ -260,6 +260,10 @@ func (v *Vault) convertMaterial(ctx context.Context, q Store, userID uuid.UUID, 
 		}
 	}
 	if progress.rows != totals.MaterialRows || progress.bytes != totals.CiphertextBytes {
+		// progress counts the pre-reseal ciphertext sizes, while the fresh recount below
+		// reads the stored (resealed) rows, so this comparison relies on resealing
+		// preserving ciphertext length. An envelope change that alters length must
+		// update this check.
 		// A repo or forge-connection delete cascades its env rows without the secret-mutation
 		// lock (and the fresh read relies on READ COMMITTED, postgres.go), so an env
 		// row not yet locked can vanish after the first measurement. Every row is locked

@@ -121,7 +121,7 @@ func newRepoEnvCmd(env Env, gf *globalFlags) *cobra.Command {
 					kind = "secret"
 				}
 				rows = append(rows, []string{
-					uzicli.CellText(v.Name), kind, uzicli.CellText(v.State), runEnvValueCell(v),
+					uzicli.CellText(v.Name), kind, uzicli.CellText(v.State), runEnvValueCell(v, out.VaultLocked),
 					uzicli.CellText(v.Description), v.UpdatedAt.UTC().Format("2006-01-02 15:04:05Z"),
 				})
 			}
@@ -133,14 +133,17 @@ func newRepoEnvCmd(env Env, gf *globalFlags) *cobra.Command {
 }
 
 // runEnvValueCell is the VALUE column: a secret never shows a value, a plain value
-// the server withheld (vault locked) says so, otherwise the user-authored value,
-// terminal-sanitized.
-func runEnvValueCell(v apitypes.RunEnvVarDTO) string {
+// the server withheld reads "(vault locked)" when the list reports the vault locked
+// and "(withheld)" otherwise (no vault configured, or the value cannot be opened),
+// else the user-authored value, terminal-sanitized.
+func runEnvValueCell(v apitypes.RunEnvVarDTO, vaultLocked bool) string {
 	switch {
 	case v.Secret:
 		return "(secret)"
-	case v.ValueWithheld || v.Value == nil:
+	case (v.ValueWithheld || v.Value == nil) && vaultLocked:
 		return "(vault locked)"
+	case v.ValueWithheld || v.Value == nil:
+		return "(withheld)"
 	default:
 		return uzicli.CellText(*v.Value)
 	}

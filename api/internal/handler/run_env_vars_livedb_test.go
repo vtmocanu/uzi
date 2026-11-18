@@ -121,15 +121,19 @@ func (f *envFixture) rowSnapshot(names ...string) map[string]string {
 			ct         []byte
 			desc       string
 			disabledAt *time.Time
+			pendingAt  *time.Time
+			updatedAt  time.Time
+			sealedWith string
+			secret     bool
 			rev        int
 		)
 		err := f.pool.QueryRow(context.Background(),
-			`SELECT id, var_id, ciphertext, description, disabled_at, rev FROM run_env_vars WHERE repo_id=$1 AND name=$2 AND retired_at IS NULL`,
-			f.repo, n).Scan(&id, &varID, &ct, &desc, &disabledAt, &rev)
+			`SELECT id, var_id, ciphertext, description, disabled_at, rev, secret, sealed_with, pending_delete_at, updated_at FROM run_env_vars WHERE repo_id=$1 AND name=$2 AND retired_at IS NULL`,
+			f.repo, n).Scan(&id, &varID, &ct, &desc, &disabledAt, &rev, &secret, &sealedWith, &pendingAt, &updatedAt)
 		if err != nil {
 			f.t.Fatalf("snapshot %s: %v", n, err)
 		}
-		out[n] = fmt.Sprintf("id=%s var_id=%s ct=%x desc=%q disabled_at=%v rev=%d", id, varID, ct, desc, disabledAt, rev)
+		out[n] = fmt.Sprintf("id=%s var_id=%s ct=%x desc=%q disabled_at=%v rev=%d secret=%v sealed_with=%s pending_delete_at=%v updated_at=%v", id, varID, ct, desc, disabledAt, rev, secret, sealedWith, pendingAt, updatedAt)
 	}
 	return out
 }
@@ -971,6 +975,47 @@ func TestRunEnvListReportsLockedVaultForSecretOnlyLiveDB(t *testing.T) {
 	if u.list().VaultLocked {
 		t.Fatal("an unprotected vault reports locked")
 	}
+}
+
+// A plain value sealed while unprotected (sealed_with master_aad) must not be returned
+// once the owner turns protection on and the vault is locked: vault.Open alone does not
+// check the lock for such a row, so the list and every write response withhold it.
+func TestRunEnvStalePlainValueWithheldWhenProtectedAndLockedLiveDB(t *testing.T) {
+	f := newEnvFixture(t)
+	f.put("PLAIN_URL", jsonBody(map[string]any{"value": "https://example.test/x", "secret": false}), http.StatusCreated)
+	var sealedWith string
+	if err := f.pool.QueryRow(context.Background(),
+		`SELECT sealed_with FROM run_env_vars WHERE repo_id=$1 AND name='PLAIN_URL' AND retired_at IS NULL`, f.repo).Scan(&sealedWith); err != nil {
+		t.Fatal(err)
+	}
+	if sealedWith != "master_aad" {
+		t.Fatalf("sealed_with = %q; want master_aad", sealedWith)
+	}
+	if _, err := f.pool.Exec(context.Background(), `UPDATE users SET vault_mode='protected' WHERE id=$1`, f.owner); err != nil {
+		t.Fatal(err)
+	}
+	withheld := func(what string, v *apitypes.RunEnvVarDTO) {
+		t.Helper()
+		if v == nil || v.Value != nil || !v.ValueWithheld {
+			t.Fatalf("%s = %+v; want value withheld", what, v)
+		}
+	}
+	l := f.list()
+	if !l.VaultLocked {
+		t.Fatal("list of a protected, locked vault must report vault_locked")
+	}
+	withheld("list", f.find(l, "PLAIN_URL"))
+
+	rec := f.do(http.MethodPost, "/PLAIN_URL/disable", "")
+	f.must(rec, http.StatusOK)
+	var w apitypes.RunEnvWriteDTO
+	if err := json.Unmarshal(rec.Body.Bytes(), &w); err != nil {
+		t.Fatal(err)
+	}
+	withheld("disable response", &w.Variable)
+
+	desc := f.put("PLAIN_URL", jsonBody(map[string]any{"description": "new note"}), http.StatusOK)
+	withheld("description-only PUT response", &desc)
 }
 
 // A repo deleted between the ownership check and the write transaction answers 404

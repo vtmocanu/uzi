@@ -31,7 +31,7 @@ func TestRunEnvDTORefusesMasterMarkedRow(t *testing.T) {
 	})}
 	row := runEnvRow{Name: "PLAIN_ONE", Ciphertext: sealed, SealedWith: store.SealedWithMaster,
 		CreatedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true}, UpdatedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true}}
-	dto, locked := h.runEnvDTO(uuid.New(), uuid.New(), row)
+	dto, locked := h.runEnvDTO(uuid.New(), uuid.New(), row, false)
 	if dto.Value != nil || !dto.ValueWithheld || locked {
 		t.Fatalf("master-marked row: %+v locked=%v", dto, locked)
 	}
