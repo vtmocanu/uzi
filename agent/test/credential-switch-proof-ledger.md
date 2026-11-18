@@ -436,7 +436,7 @@ control is still absent, not that the functional criterion was deferred.
 | Stopped preservation of binding, journals, session, gates, questions and custody without input consumption/time banking | E1 base-journal deletion, E2 applied-input deletion, E3 custody timestamp corruption, E4 owner-discard/live-reference loss, E5 direct paused-time credit, E6 applied-switch journal deletion; U17 effect-injection for session id, gate presentation id and row, question id and message on the first stop, and a run-row write (`updated_at`) and presentation deletion on replay; other gate columns and other replay tables compared but not individually injected; Slack, `cross_checks` and other trigger-closure tables outside the snapshot |
 | Stopped known extra typed member and register_nonce case alias | D25–D56: four running/paused wire cases only |
 | Bounded strict stopped request, other forbidden combinations, op_id and minimal acknowledgement | U18 credits the 1 MiB inclusive bound and the single-value rule (one copy each), op_id and unknown-field refusal (two copies each), expected_epoch on a running report (two copies), and the acknowledgement's four-key run object and 16 KiB bound under a 64 KiB plan; other statuses and the envelope key count not controlled; null/missing fields and case aliases beyond D25–D56 not controlled |
-| Tokens absent from all inputs/acknowledgements/messages/logs | Targeted positive assertions present; qualifying controls and m4 security gates remain required |
+| Tokens absent from all inputs/acknowledgements/messages/logs | U19 credits B material's registration with the log and run-message redactors after a real Runner switch ((d), each separately) and the stopped acknowledgement and log (effect-injection); the remaining surfaces are guardless by construction and go to the owner batch; m4 security gates remain required |
 
 ## Baseline absence and the class (d) method boundary
 
@@ -3450,3 +3450,76 @@ decoder unit test covers them without a control); the second strict decode's
 own bound and trailing checks (not independent fences); `expected_epoch`
 case variants (EqualFold) on other statuses; the 16 KiB acknowledgement
 bound under other large fields.
+
+### U19 — token absence: B material redaction and stopped-route surfaces (2026-11-18)
+
+Candidate 8a3df9d63612fcec13207d254e3f352429b9b8b3:
+- agent/test/codex-executor.test.ts, the six "M2 actualRunner … account
+  resumes saved thread" baseline leaves (subscription → API key, API key →
+  subscription, subscription → subscription on another account; factory and
+  already-running-body), now assert after the real Runner switch that B's
+  access token and capability are registered with the log redactor (a
+  recording `addSecret` on the Runner's logger) and with the flight's
+  run-message redactor (`flight.secrets` holds them and `flight.redactText`
+  scrubs them);
+- api/internal/handler/codex_switch_stopped_token_livedb_test.go
+  (`TestWorkerCodexStoppedTokenAbsenceRouteLiveDB`) opens the run's bound
+  fixture secret with the handler's box, captures slog, and requires that the
+  first stop and its replay through the authenticated `/state` route leave the
+  secret out of both acknowledgements, every run message, every user input
+  body and the server log.
+
+a233 reference: a233883de3c36bae2e940f999cd9d582889dad00 has no Codex switch
+(`git show a233883de3c36bae2e940f999cd9d582889dad00:agent/src/runner.ts`
+has no `bundle.binding.accessToken, bundle.binding.capability` loop) and no
+stopped settlement, so the redaction-registration controls are class (d)
+and the stopped-route controls are effect-injection (decision 10): the
+stopped route reads no material, so there is no redaction guard to remove.
+
+Seams. The registration guard is runner.ts:17657–17659
+(`for (const token of [bundle.binding.accessToken, bundle.binding.capability]) {
+flight.secrets.add(token); this.log.addSecret(token); flight.runScopedSecrets.push(token); }`),
+run after the committed apply and before B is published. The stopped route's
+token-bearing sinks are its acknowledgement (worker_protocol.go:1786,
+`stoppedSettlementAck`) and the server log.
+
+Commands: agent controls by `.uzi/scratch/u8tools/actl.sh` (export,
+`npm run typecheck`, then
+`node --import tsx --test --test-timeout=120000 --test-name-pattern='M2 actualRunner .* account resumes saved thread' test/codex-executor.test.ts`);
+handler controls by `.uzi/scratch/u8tools/ctl.sh` (throwaway postgres
+`cdr-4202-u19pg`, `-run '^TestWorkerCodexStoppedTokenAbsenceRouteLiveDB$'`).
+Diffs and logs `.uzi/scratch/ctl-logs/u19-*.{diff,log}`; each mutant log ends
+`SHA=8a3df9d63… EXIT=1`.
+
+| Control | Class | Mutation | Red |
+| --- | --- | --- | --- |
+| u19-agent-log-redactor | (d) | drop `this.log.addSecret(token);` from the loop | all six leaves, codex-executor.test.ts:35293 "Codex switch registers B material with the log redactor" |
+| u19-agent-message-redactor | (d) | drop `flight.secrets.add(token);` from the loop | all six leaves, :35294 "Codex switch redacts B material from run messages" |
+| u19-ack-leak | effect-injection | the stopped branch opens the bound secret (`GetUserSecretCiphertextByID`, `h.box.Open`) and adds it to the acknowledgement | codex_switch_stopped_token_livedb_test.go:38 "first stop acknowledgement carries the bound secret" |
+| u19-log-leak | effect-injection | the stopped branch opens the bound secret and logs it with `slog.Info` | :51 "stopped settlement logged the bound secret" |
+
+Unchanged candidate 8a3df9d63: the six agent leaves pass (`ℹ pass 6`,
+`u19-green-a.log`), the stopped token test passes (`u19-green-h.log`), both
+`SHA=8a3df9d63… EXIT=0`; `task lint:api` 0 issues (`u19-lint-api.log`);
+`npm run lint` in agent 0 warnings and 0 errors (`u19-lint-agent.log`).
+Runtime: the agent assertions add no wait to existing leaves (the six take
+about 12 s together, as before, unmeasured as a delta); the new handler test
+is about 1 s in-package after migration (LiveDB, skipped without
+`UZI_TEST_DATABASE_URL`). Hosted effect unmeasured.
+
+Credit: after a real Runner Codex switch, B's access token and capability are
+registered with both the log redactor and the run-message redactor (each
+registration controlled separately); the stopped settlement keeps the bound
+secret out of its acknowledgement and the server log (effect-injection), and
+the test also asserts run messages and inputs stay free of it.
+
+Not credited (no qualifying class; for the owner batch): every other surface
+keeps the token out by construction, with no redaction or omission guard to
+remove — the server apply/preflight responses' non-token fields, the Codex
+switch feed message and journals (`TestCodexTransactionalApplyBundleLiveDB`
+asserts them), server logs on the apply path, the worker client's fixed
+detail strings (`client-credential-switch-apply.test.ts` asserts them), the
+owner set-token input (it carries a secret id, never material), and message
+and input injection on the stopped route (asserted, not injected). The
+redactors' own matching (`SecretSet`, the log scrubber) is outside this
+seam. m4 `scan:secrets` and `sast:semgrep` remain required.
