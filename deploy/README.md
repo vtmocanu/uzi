@@ -1142,7 +1142,7 @@ logs bounded per-parent outcome rows (parents only) and one total line (whenever
 records are on and the runner root is a directory that was listed, even with
 zero parents; none when the root is missing, a symlink, not a directory or
 unlistable, which logs `runner retire scratch inspection failed`; `runner retire
-scratch outcomes failed` replaces it if the outcome step itself throws). The records delete nothing themselves; the separate reclaim switch below decides whether bound parents are removed. Chart `workers.epochReclaim.retireScratchOutcomes` is a strict
+scratch outcomes failed` replaces it if the outcome step itself throws). The records delete nothing themselves; the separate switch below gates the retire-scratch epoch phase, which deletes no bound parent on a uid-split pod. Chart `workers.epochReclaim.retireScratchOutcomes` is a strict
 boolean, default `true`; a non-boolean fails rendering. `false` makes the
 controller render worker `UZI_RETIRE_SCRATCH_OUTCOMES=0` on every worker (Docker
 or not); default renders are unchanged, so upgrading does not roll workers,
@@ -1156,12 +1156,13 @@ for safe replacement, evidence and startup-only limits; hosted observation and
 the keep-default decision remain pending on #4043.
 
 Chart `workers.epochReclaim.retireScratchReclaim` (#4263) is a strict boolean,
-default `true`; a non-boolean fails rendering. It gates the verified-epoch reclaim
-of **bound** `.retire-*` parents (uid-split Docker workers only; see
+default `true`; a non-boolean fails rendering. It gates the verified-epoch retire-scratch
+phase for **bound** `.retire-*` parents (uid-split Docker workers only; that phase never
+deletes a bound parent, because a split retire never writes `settled`; see
 [Disk-full residual](../docs/worker-docker.md#disk-full-residual-on-the-data-volume)
 and [ADR-3153](../adr/3153-runner-shared-pvc-subpath.md)). `false` makes the
 controller render worker `UZI_RETIRE_SCRATCH_RECLAIM=0` on every worker; the pass
-then reads and removes no binding, while binding writes continue. Default renders
+then reads no binding and unsets none, while binding writes continue. Default renders
 are unchanged, so upgrading does not roll workers; disabling rolls the worker
 template and takes effect at the next worker startup, so the new default is live
 only on workers that start on an image with the feature. A rendered `0` is a no-op
