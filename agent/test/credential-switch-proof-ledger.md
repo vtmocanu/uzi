@@ -3367,14 +3367,14 @@ therefore new on this route (class (d), not (b)). Unknown-field refusal did
 exist at a233 (`DecodeJSON` runs `DisallowUnknownFields`, a233 respond.go:112);
 its u18-unknown control is class (d) because the stopped status itself is
 absent at a233 (see "Baseline absence and the class (d) method boundary").
-The httpx mutants edit the shared helper, which `DecodeJSONStrict` and 38
-other call sites in 24 handler files also use; on this route their effect is
+The httpx mutants edit the shared helper, which `DecodeJSONStrict` and 37
+other non-test call sites in 24 handler files also use; on this route their effect is
 confined to the decodes in `decodeWorkerState`.
 
 Copy census (the route: `WorkerRunState` worker_protocol.go:1541 →
 `decodeWorkerState` → `SetStateReportWithReconciliation` → `setStateWithTx`
 → `stopCodexSwitch`; the route is mounted through `mountWorkerRoutes` on both
-the main router (handler.go:1181) and `WorkerRoutes` (:1210–1230; Recoverer
+the main router (handler.go:1181) and `WorkerRoutes` (:1210–1222; Recoverer
 and RequestID), and `mountWorkerRoutes` itself applies RequireWorker and the
 lane guard (:1238 onwards); none adds a body bound or strictness layer):
 - 1 MiB body bound: the first `DecodeJSONStrictBounded(r, &raw, 1<<20)`
@@ -3418,7 +3418,7 @@ Unchanged candidate 3b78045f6: the new route test and the existing
 `TestWorkerRunStateCodexSwitchStoppedRoute` pass (17 PASS lines, no FAIL or
 SKIP), `SHA=3b78045f6… EXIT=0` (`u18-green.log`); `task lint:api` 0 issues
 (`u18-lint-api.log`). Runtime: 4.31 s for the new test in that run (a LiveDB test,
-skipped when `UZI_TEST_DATABASE_URL` is unset) (same
+skipped when `UZI_TEST_DATABASE_URL` is unset; same
 worker, warm cache, migrated schema, one serial run; `u18-first.log` has no
 SHA line and includes migration). Hosted effect unmeasured.
 
@@ -3427,7 +3427,8 @@ one JSON value (one copy), refuses `op_id` and unknown fields (two copies
 each), and `expected_epoch` is refused on a `running` report (two copies);
 the acceptance answers with the stopped acknowledgement (u18-minimal-ack shows
 only that the stopped builder supplies `applied`; the mutant sets
-`disposition` itself, so no control covers it), whose run
+`disposition` itself, so no U18 route mutant covers it; the builder unit
+test `TestStoppedSettlementAck` asserts it and the three-key envelope), whose run
 object has exactly four keys (u18-ack-extra-key) and which stays under 16 KiB
 with a 64 KiB plan where the full DTO would not (u18-ack-full-run). The
 three-key envelope count itself is not reached by any mutant.
