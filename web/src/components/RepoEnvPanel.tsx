@@ -24,6 +24,14 @@ const EMPTY_DRAFT: Draft = { editing: null, name: "", value: "", secret: true, d
 
 const hasLineBreak = (s: string) => /[\r\n]/.test(s);
 
+// The "keep the stored value" hint holds only while an existing secret stays secret.
+// Switching a secret to plain always sends the field's value, so an empty field
+// replaces the secret with an empty plain value.
+function valuePlaceholder(draft: Draft): string | undefined {
+  if (!draft.editing?.secret) return undefined;
+  return draft.secret ? "Leave empty to keep the stored value" : "Enter the new plain value; an empty field saves an empty value";
+}
+
 interface FieldProblem {
   field: string;
   rule: string;
@@ -361,7 +369,7 @@ export function RepoEnvPanel({
                   autoCorrect="off"
                   autoCapitalize="off"
                   spellCheck={false}
-                  placeholder={draft.editing?.secret ? "Leave empty to keep the stored value" : undefined}
+                  placeholder={valuePlaceholder(draft)}
                   onChange={(e) => setDraft({ ...draft, value: e.target.value })}
                 />
               ) : (
@@ -374,7 +382,7 @@ export function RepoEnvPanel({
                   autoCorrect="off"
                   autoCapitalize="off"
                   spellCheck={false}
-                  placeholder={draft.editing?.secret ? "Leave empty to keep the stored value" : undefined}
+                  placeholder={valuePlaceholder(draft)}
                   onChange={(e) => setDraft({ ...draft, value: e.target.value })}
                   onPaste={onSingleLinePaste}
                 />

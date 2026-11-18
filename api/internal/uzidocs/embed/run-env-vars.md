@@ -124,6 +124,8 @@ command that uses the registry.
 ## Edit, disable, delete
 
 1. **Edit** without a new value changes only the description; entering a value replaces it.
+   Switching a secret to plain is the exception: it replaces the secret with
+   whatever the field holds, even an empty value.
 2. **Replace the value** to rotate it. A secret keeps its secret flag unless
    you change it.
 3. **Disable** stops injection without deleting the variable; enable it again

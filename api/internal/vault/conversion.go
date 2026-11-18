@@ -227,8 +227,9 @@ func (v *Vault) convertMaterial(ctx context.Context, q Store, userID uuid.UUID, 
 	cursor = pgtype.UUID{}
 	for {
 		// Candidates are listed unlocked, then locked by id. Rows can vanish in between,
-		// so the scan ends only on an empty candidate list and the cursor follows the
-		// last candidate, never the last locked row.
+		// so the scan ends only on an empty candidate list. The cursor follows the last
+		// candidate, so a listed id is never listed again (defensive: a vanished id
+		// would also drop out of the next listing on its own).
 		candidates, err := q.ListVaultEnvMaterialCandidates(ctx, store.ListVaultEnvMaterialCandidatesParams{UserID: userID, AfterID: cursor})
 		if err != nil {
 			return err

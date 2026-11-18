@@ -290,7 +290,13 @@ describe("Repos environment variables panel", () => {
     mockApi.putRepoEnv.mockResolvedValue({ variable: envVar({ name: "API_KEY" }) });
     const panel = await openPanel();
     fireEvent.click(within(panel).getByRole("button", { name: "Edit API_KEY" }));
+    const value = within(panel).getByLabelText("Value") as HTMLInputElement;
+    expect(value.placeholder).toBe("Leave empty to keep the stored value");
     fireEvent.click(within(panel).getByRole("switch", { name: "Secret" }));
+    // The keep-the-stored-value hint would be false now: an empty field is saved as empty.
+    const plainValue = within(panel).getByLabelText("Value") as HTMLInputElement;
+    expect(plainValue.placeholder).not.toMatch(/keep the stored value/i);
+    expect(plainValue.placeholder).toMatch(/empty field saves an empty value/);
     fireEvent.click(within(panel).getByRole("button", { name: "Save variable" }));
     await waitFor(() =>
       expect(mockApi.putRepoEnv).toHaveBeenCalledWith("repo-uzi", "API_KEY", { description: "Sandbox key", secret: false, value: "" }),
