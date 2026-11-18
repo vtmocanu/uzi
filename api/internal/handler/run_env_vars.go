@@ -214,6 +214,16 @@ func (h *Handler) runEnvDTO(userID, repoID uuid.UUID, row runEnvRow, vaultLocked
 	return dto, false
 }
 
+// runEnvWriteDTO builds a write response's view of the saved row. It asks the vault for
+// its lock state after the write committed, so an enable+lock that lands between the
+// commit and this response still withholds the plain value (the row may carry master_aad
+// material the master key opens).
+func (h *Handler) runEnvWriteDTO(ctx context.Context, userID, repoID uuid.UUID, row runEnvRow) apitypes.RunEnvVarDTO {
+	vaultLocked := h.vault != nil && h.vault.RequiresUnlock(ctx, userID)
+	dto, _ := h.runEnvDTO(userID, repoID, row, vaultLocked)
+	return dto
+}
+
 func wipeBytes(b []byte) {
 	for i := range b {
 		b[i] = 0
@@ -498,7 +508,7 @@ func (h *Handler) PutRepoEnvVar(w http.ResponseWriter, r *http.Request) {
 		h.writeRunEnvTxError(w, err, "write run env var")
 		return
 	}
-	dto, _ := h.runEnvDTO(userID, repoID, saved, false)
+	dto := h.runEnvWriteDTO(r.Context(), userID, repoID, saved)
 	status := http.StatusOK
 	if !exists {
 		status = http.StatusCreated
@@ -526,7 +536,7 @@ func (h *Handler) putRunEnvDescription(ctx context.Context, w http.ResponseWrite
 			return
 		}
 	}
-	dto, _ := h.runEnvDTO(userID, repoID, row, false)
+	dto := h.runEnvWriteDTO(ctx, userID, repoID, row)
 	w.Header().Set("Cache-Control", "no-store")
 	httpx.JSON(w, http.StatusOK, apitypes.RunEnvWriteDTO{Variable: dto})
 }
@@ -582,7 +592,7 @@ func (h *Handler) setRepoEnvVarDisabled(w http.ResponseWriter, r *http.Request, 
 		h.writeRunEnvTxError(w, err, "disable run env var")
 		return
 	}
-	dto, _ := h.runEnvDTO(userID, repoID, row, false)
+	dto := h.runEnvWriteDTO(r.Context(), userID, repoID, row)
 	w.Header().Set("Cache-Control", "no-store")
 	httpx.JSON(w, http.StatusOK, apitypes.RunEnvWriteDTO{Variable: dto})
 }

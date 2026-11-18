@@ -69,3 +69,32 @@ func TestRunEnvDTOWithholdsWhenVaultLocked(t *testing.T) {
 		t.Fatalf("locked vault: %+v locked=%v", dto, locked)
 	}
 }
+
+// A write response asks the vault for its lock state after the write committed: a vault
+// that reports locked (here its state lookup fails, which fails closed) withholds a
+// master_aad plain value the master key would otherwise open.
+func TestRunEnvWriteDTOWithholdsWhenVaultLocked(t *testing.T) {
+	box, err := secretbox.New([]byte("0123456789abcdef0123456789abcdef"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &Handler{vault: vault.New(box, nil, func(context.Context, func(context.Context, vault.Store) error) error {
+		return errors.New("state lookup unavailable")
+	})}
+	userID, repoID := uuid.New(), uuid.New()
+	kind := runenv.AADKind(runenv.ScopeRepo, &repoID, false, "PLAIN_ONE")
+	aad := append(append(append([]byte{}, userID[:]...), 0), kind...)
+	sealed, err := box.SealWithAAD([]byte("stale-plain"), aad)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row := runEnvRow{Name: "PLAIN_ONE", Ciphertext: sealed, SealedWith: store.SealedWithMasterAAD,
+		CreatedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true}, UpdatedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true}}
+	if dto, _ := h.runEnvDTO(userID, repoID, row, false); dto.Value == nil {
+		t.Fatalf("control: the row must open when not reported locked: %+v", dto)
+	}
+	dto := h.runEnvWriteDTO(context.Background(), userID, repoID, row)
+	if dto.Value != nil || !dto.ValueWithheld {
+		t.Fatalf("write response under a locked vault: %+v", dto)
+	}
+}
