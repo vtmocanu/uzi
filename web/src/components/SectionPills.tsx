@@ -4,7 +4,8 @@
 // Shared by Admin → Instance and Admin → Workers (#4454).
 //
 // The page owns `endRef` (its zero-height end sentinel after the last card), `pendingRef`
-// (set to the target id before a deep-link scrollIntoView) and `evaluateRef` (called in a
+// (the requested section: the page's deep-link effect sets it before its scrollIntoView,
+// and a pill click sets it here) and `evaluateRef` (the page calls it in a
 // requestAnimationFrame after that scroll). `anchorIds` is the page's observed id set.
 // All four must keep a stable identity (a module-level Set and useRef objects): they are
 // observer-effect dependencies, and a fresh value per render would rebuild the observers.

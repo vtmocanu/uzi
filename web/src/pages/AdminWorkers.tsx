@@ -5,11 +5,12 @@
 // are redirected here by AdminSettings. Admin-only (AdminRoute + the admin-only API).
 
 import { useLocation } from "react-router-dom";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api, type AppSettings, type SettingSource, type SettingsResponse } from "../lib/api";
 import { useAsyncData } from "../lib/useAsyncData";
 import { Alert, Skeleton } from "../components/ui";
 import { AdminShell } from "../components/AdminShell";
+import { SectionPills } from "../components/SectionPills";
 import { ADMIN_WORKERS_ANCHOR_IDS } from "../components/navSections";
 import { DocLink } from "../components/DocLink";
 import { DOC_ADMIN_SETTINGS } from "../lib/doclinks";
@@ -46,6 +47,11 @@ export function AdminWorkers() {
   // yank the page back to the URL's anchor.
   const loaded = !loading && saved !== null;
   const failed = !loading && saved === null;
+  // Page-owned refs SectionPills reads: the end sentinel, the deep-link target pending its
+  // highlight, and the current-section evaluator the deep-link effect re-runs after scrolling.
+  const endRef = useRef<HTMLDivElement>(null);
+  const pendingRef = useRef<string | null>(null);
+  const evaluateRef = useRef<(() => void) | null>(null);
   useEffect(() => {
     // SPA navigation keeps the previous page's scroll position, so a failed load that
     // arrived via an advertised anchor resets to the top itself.
@@ -54,7 +60,13 @@ export function AdminWorkers() {
   useEffect(() => {
     // Every card renders only after a successful load, so deep links scroll once it settles.
     if (loaded && ADMIN_WORKERS_ANCHOR_IDS.has(hash.slice(1))) {
+      // Near the page end the scroll cannot bring the target to the line: remember it so
+      // evaluate() lights its own pill.
+      pendingRef.current = hash.slice(1);
       document.getElementById(hash.slice(1))?.scrollIntoView?.({ block: "start" });
+      // A page already at its end does not move, so no observer fires: evaluate once.
+      const raf = requestAnimationFrame(() => evaluateRef.current?.());
+      return () => cancelAnimationFrame(raf);
     }
   }, [loaded, hash, key]);
 
@@ -77,20 +89,20 @@ export function AdminWorkers() {
           <DocLink slug={DOC_ADMIN_SETTINGS}>admin settings</DocLink> guide.
         </>
       }
+      pinned={
+        /* The section index, pinned under the tabs as one non-wrapping row, as on
+          Admin → Instance. Shown only after a successful load. */
+        sections.length > 1 ? (
+          <SectionPills
+            sections={sections}
+            anchorIds={ADMIN_WORKERS_ANCHOR_IDS}
+            endRef={endRef}
+            pendingRef={pendingRef}
+            evaluateRef={evaluateRef}
+          />
+        ) : undefined
+      }
     >
-      {sections.length > 1 && (
-        <nav aria-label="Sections on this page" className="flex flex-wrap gap-1.5">
-          {sections.map((s) => (
-            <a
-              key={s.id}
-              href={`#${s.id}`}
-              className="rounded-full border border-edge px-2.5 py-1 text-xs font-medium text-muted transition-colors hover:border-edge-strong hover:text-fg"
-            >
-              {s.label}
-            </a>
-          ))}
-        </nav>
-      )}
 
       {loadError && <Alert message={loadError} />}
 
@@ -123,6 +135,9 @@ export function AdminWorkers() {
           </section>
         </>
       )}
+
+      {/* End sentinel for the section highlight: zero height, observed while the page end is in view. */}
+      <div ref={endRef} aria-hidden="true" className="h-0" />
     </AdminShell>
   );
 }
