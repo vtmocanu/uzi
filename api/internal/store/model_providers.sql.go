@@ -93,7 +93,7 @@ func (q *Queries) DeleteProviderKeySecret(ctx context.Context, arg DeleteProvide
 const getModelProviderForOwner = `-- name: GetModelProviderForOwner :one
 SELECT p.id, p.name, p.engine, p.current_revision, p.retired_at, p.created_at,
        r.protocol, r.base_url, r.auth_style, r.model_map,
-       k.id AS key_secret_id, k.disabled_at AS key_disabled_at,
+       k.id AS key_secret_id, k.disabled_at AS key_disabled_at, k.enablement_rev AS key_enablement_rev,
        pr.auth_result AS probe_auth_result, pr.tool_result AS probe_tool_result, pr.probed_at AS probed_at
 FROM model_providers p
 JOIN model_provider_revisions r ON r.provider_id = p.id AND r.revision = p.current_revision
@@ -108,21 +108,22 @@ type GetModelProviderForOwnerParams struct {
 }
 
 type GetModelProviderForOwnerRow struct {
-	ID              uuid.UUID          `json:"id"`
-	Name            string             `json:"name"`
-	Engine          string             `json:"engine"`
-	CurrentRevision int32              `json:"current_revision"`
-	RetiredAt       pgtype.Timestamptz `json:"retired_at"`
-	CreatedAt       pgtype.Timestamptz `json:"created_at"`
-	Protocol        string             `json:"protocol"`
-	BaseUrl         string             `json:"base_url"`
-	AuthStyle       string             `json:"auth_style"`
-	ModelMap        []byte             `json:"model_map"`
-	KeySecretID     pgtype.UUID        `json:"key_secret_id"`
-	KeyDisabledAt   pgtype.Timestamptz `json:"key_disabled_at"`
-	ProbeAuthResult pgtype.Text        `json:"probe_auth_result"`
-	ProbeToolResult pgtype.Text        `json:"probe_tool_result"`
-	ProbedAt        pgtype.Timestamptz `json:"probed_at"`
+	ID               uuid.UUID          `json:"id"`
+	Name             string             `json:"name"`
+	Engine           string             `json:"engine"`
+	CurrentRevision  int32              `json:"current_revision"`
+	RetiredAt        pgtype.Timestamptz `json:"retired_at"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+	Protocol         string             `json:"protocol"`
+	BaseUrl          string             `json:"base_url"`
+	AuthStyle        string             `json:"auth_style"`
+	ModelMap         []byte             `json:"model_map"`
+	KeySecretID      pgtype.UUID        `json:"key_secret_id"`
+	KeyDisabledAt    pgtype.Timestamptz `json:"key_disabled_at"`
+	KeyEnablementRev pgtype.Int8        `json:"key_enablement_rev"`
+	ProbeAuthResult  pgtype.Text        `json:"probe_auth_result"`
+	ProbeToolResult  pgtype.Text        `json:"probe_tool_result"`
+	ProbedAt         pgtype.Timestamptz `json:"probed_at"`
 }
 
 func (q *Queries) GetModelProviderForOwner(ctx context.Context, arg GetModelProviderForOwnerParams) (GetModelProviderForOwnerRow, error) {
@@ -141,6 +142,7 @@ func (q *Queries) GetModelProviderForOwner(ctx context.Context, arg GetModelProv
 		&i.ModelMap,
 		&i.KeySecretID,
 		&i.KeyDisabledAt,
+		&i.KeyEnablementRev,
 		&i.ProbeAuthResult,
 		&i.ProbeToolResult,
 		&i.ProbedAt,
@@ -438,7 +440,7 @@ func (q *Queries) InsertProviderKeySecret(ctx context.Context, arg InsertProvide
 const listModelProvidersForOwner = `-- name: ListModelProvidersForOwner :many
 SELECT p.id, p.name, p.engine, p.current_revision, p.retired_at, p.created_at,
        r.protocol, r.base_url, r.auth_style, r.model_map,
-       k.id AS key_secret_id, k.disabled_at AS key_disabled_at,
+       k.id AS key_secret_id, k.disabled_at AS key_disabled_at, k.enablement_rev AS key_enablement_rev,
        pr.auth_result AS probe_auth_result, pr.tool_result AS probe_tool_result, pr.probed_at AS probed_at
 FROM model_providers p
 JOIN model_provider_revisions r ON r.provider_id = p.id AND r.revision = p.current_revision
@@ -449,21 +451,22 @@ ORDER BY lower(p.name), p.id
 `
 
 type ListModelProvidersForOwnerRow struct {
-	ID              uuid.UUID          `json:"id"`
-	Name            string             `json:"name"`
-	Engine          string             `json:"engine"`
-	CurrentRevision int32              `json:"current_revision"`
-	RetiredAt       pgtype.Timestamptz `json:"retired_at"`
-	CreatedAt       pgtype.Timestamptz `json:"created_at"`
-	Protocol        string             `json:"protocol"`
-	BaseUrl         string             `json:"base_url"`
-	AuthStyle       string             `json:"auth_style"`
-	ModelMap        []byte             `json:"model_map"`
-	KeySecretID     pgtype.UUID        `json:"key_secret_id"`
-	KeyDisabledAt   pgtype.Timestamptz `json:"key_disabled_at"`
-	ProbeAuthResult pgtype.Text        `json:"probe_auth_result"`
-	ProbeToolResult pgtype.Text        `json:"probe_tool_result"`
-	ProbedAt        pgtype.Timestamptz `json:"probed_at"`
+	ID               uuid.UUID          `json:"id"`
+	Name             string             `json:"name"`
+	Engine           string             `json:"engine"`
+	CurrentRevision  int32              `json:"current_revision"`
+	RetiredAt        pgtype.Timestamptz `json:"retired_at"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+	Protocol         string             `json:"protocol"`
+	BaseUrl          string             `json:"base_url"`
+	AuthStyle        string             `json:"auth_style"`
+	ModelMap         []byte             `json:"model_map"`
+	KeySecretID      pgtype.UUID        `json:"key_secret_id"`
+	KeyDisabledAt    pgtype.Timestamptz `json:"key_disabled_at"`
+	KeyEnablementRev pgtype.Int8        `json:"key_enablement_rev"`
+	ProbeAuthResult  pgtype.Text        `json:"probe_auth_result"`
+	ProbeToolResult  pgtype.Text        `json:"probe_tool_result"`
+	ProbedAt         pgtype.Timestamptz `json:"probed_at"`
 }
 
 func (q *Queries) ListModelProvidersForOwner(ctx context.Context, ownerUserID uuid.UUID) ([]ListModelProvidersForOwnerRow, error) {
@@ -488,6 +491,7 @@ func (q *Queries) ListModelProvidersForOwner(ctx context.Context, ownerUserID uu
 			&i.ModelMap,
 			&i.KeySecretID,
 			&i.KeyDisabledAt,
+			&i.KeyEnablementRev,
 			&i.ProbeAuthResult,
 			&i.ProbeToolResult,
 			&i.ProbedAt,

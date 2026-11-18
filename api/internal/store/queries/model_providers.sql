@@ -89,7 +89,7 @@ DELETE FROM model_providers WHERE id = $1 AND owner_user_id = $2;
 -- name: ListModelProvidersForOwner :many
 SELECT p.id, p.name, p.engine, p.current_revision, p.retired_at, p.created_at,
        r.protocol, r.base_url, r.auth_style, r.model_map,
-       k.id AS key_secret_id, k.disabled_at AS key_disabled_at,
+       k.id AS key_secret_id, k.disabled_at AS key_disabled_at, k.enablement_rev AS key_enablement_rev,
        pr.auth_result AS probe_auth_result, pr.tool_result AS probe_tool_result, pr.probed_at AS probed_at
 FROM model_providers p
 JOIN model_provider_revisions r ON r.provider_id = p.id AND r.revision = p.current_revision
@@ -101,7 +101,7 @@ ORDER BY lower(p.name), p.id;
 -- name: GetModelProviderForOwner :one
 SELECT p.id, p.name, p.engine, p.current_revision, p.retired_at, p.created_at,
        r.protocol, r.base_url, r.auth_style, r.model_map,
-       k.id AS key_secret_id, k.disabled_at AS key_disabled_at,
+       k.id AS key_secret_id, k.disabled_at AS key_disabled_at, k.enablement_rev AS key_enablement_rev,
        pr.auth_result AS probe_auth_result, pr.tool_result AS probe_tool_result, pr.probed_at AS probed_at
 FROM model_providers p
 JOIN model_provider_revisions r ON r.provider_id = p.id AND r.revision = p.current_revision

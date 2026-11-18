@@ -10,8 +10,11 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/providers"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // Router-level coverage for POST /api/me/providers/{id}/test (PRD #4320 section 8), against a
@@ -75,6 +78,73 @@ func probeFixture(t *testing.T) (providerFixture, *fakeProviderGateway, string) 
 	f.h.cfg.ProviderAllowLoopback = true
 	body := strings.Replace(validCreateBody, testGatewayURL, base, 1)
 	return f, gw, body
+}
+
+// Interleave a committed edit/rotation after the probe's endpoint snapshot but
+// before its ciphertext read. The production handler has no test-only hook.
+type providerProbeOpenInterleave struct {
+	store.DBTX
+	once   sync.Once
+	before func()
+}
+
+func (db *providerProbeOpenInterleave) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	if strings.Contains(sql, "-- name: GetUserSecretCiphertextByID ") {
+		db.once.Do(db.before)
+	}
+	return db.DBTX.QueryRow(ctx, sql, args...)
+}
+
+func TestProviderProbeRefusesChangedSnapshotBeforeSendingLiveDB(t *testing.T) {
+	for _, change := range []string{"endpoint and key", "key only", "endpoint only", "disable key"} {
+		t.Run(change, func(t *testing.T) {
+			f, original, createBody := probeFixture(t)
+			replacement := newFakeProviderGateway(t)
+			base := replacement.srv.URL + "/anthropic"
+			f.h.cfg.ProviderAllowedBaseURLs = append(f.h.cfg.ProviderAllowedBaseURLs, base)
+			p := f.create(t, createBody)
+			path := "/api/me/providers/" + p.ID
+			putKey := func(key string) {
+				t.Helper()
+				rec := cookieReq(t, f.router, http.MethodPut, path+"/key", f.jwt, `{"key":"`+key+`"}`)
+				if rec.Code != http.StatusOK {
+					t.Fatalf("rotate key = %d %s", rec.Code, rec.Body.String())
+				}
+			}
+			putKey(testProviderKey)
+			interleaved := false
+			hook := &providerProbeOpenInterleave{DBTX: f.pool, before: func() {
+				interleaved = true
+				if change == "endpoint and key" || change == "endpoint only" {
+					rec := cookieReq(t, f.router, http.MethodPatch, path+"/endpoint", f.jwt,
+						`{"base_url":"`+base+`","auth_style":"bearer"}`)
+					if rec.Code != http.StatusOK {
+						t.Fatalf("edit endpoint = %d %s", rec.Code, rec.Body.String())
+					}
+				}
+				if change == "endpoint and key" || change == "key only" {
+					putKey("replacement-gateway-key-0002")
+				}
+				if change == "disable key" {
+					rec := cookieReq(t, f.router, http.MethodPatch, path+"/key/enabled", f.jwt, `{"enabled":false}`)
+					if rec.Code != http.StatusOK {
+						t.Fatalf("disable key = %d %s", rec.Code, rec.Body.String())
+					}
+				}
+			}}
+			f.h.q = store.New(hook)
+			rec := bearerReqBody(f.router, http.MethodPost, path+"/test", f.uzc, "")
+			if !interleaved {
+				t.Fatal("the probe never reached the key-open interleaving")
+			}
+			if rec.Code != http.StatusConflict {
+				t.Errorf("probe = %d %s, want 409", rec.Code, rec.Body.String())
+			}
+			if n := len(original.seenAuth()) + len(replacement.seenAuth()); n != 0 {
+				t.Errorf("gateway received %d request(s) after the snapshot changed; want none", n)
+			}
+		})
+	}
 }
 
 func TestProviderTestProbeLiveDB(t *testing.T) {

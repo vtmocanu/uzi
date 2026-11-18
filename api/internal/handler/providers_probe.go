@@ -129,6 +129,22 @@ func (h *Handler) TestMyProvider(w http.ResponseWriter, r *http.Request) {
 			key[i] = 0
 		}
 	}()
+	// The ID alone does not bind the opened material: rotation keeps the secret
+	// ID and bumps enablement_rev without changing the provider revision. Re-read
+	// both revisions in one snapshot after opening and before any network request,
+	// so a new destination's key can never be sent to the old destination. Edits
+	// after this check can only leave us sending the old key to its old endpoint.
+	current, err := h.q.GetModelProviderForOwner(r.Context(), store.GetModelProviderForOwnerParams{ID: id, OwnerUserID: user.ID})
+	if errors.Is(err, pgx.ErrNoRows) || err == nil && (current.CurrentRevision != row.CurrentRevision ||
+		current.KeySecretID != row.KeySecretID || !row.KeyEnablementRev.Valid ||
+		current.KeyEnablementRev != row.KeyEnablementRev || current.KeyDisabledAt.Valid || current.RetiredAt.Valid) {
+		httpx.Error(w, http.StatusConflict, "the provider was edited or removed while it was being tested; test it again")
+		return
+	}
+	if err != nil {
+		internalProviderError(w, "recheck provider key for test", err)
+		return
+	}
 
 	// The listener's 15 s WriteTimeout would cut a probe (two steps of up to 20 s) short.
 	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(2*providers.DefaultProbeStepTimeout + providerProbeResponseGrace))
