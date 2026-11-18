@@ -654,7 +654,7 @@ Procedure:
       terminated. Under GitOps, pause self-heal for it first, or the sync restores it.
    3. Scale the worker's Deployment (`uzi-hw-<id>`, where `<id>` is the worker id) to 0
       and confirm no worker pod exists.
-   4. Before deleting anything, confirm the restore in step 5 can be admitted: the
+   4. Before deleting anything, confirm the restore in step 2.6 can be admitted: the
       paced roll's prerequisites hold for this worker (usable, uncordoned coverage from
       another worker of the same owner and lane where pacing requires it, capability
       coverage where required, a known image and version, and no blocking canary in
