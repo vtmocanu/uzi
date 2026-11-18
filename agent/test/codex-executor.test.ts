@@ -34402,7 +34402,12 @@ describe("M2 actualRunner credential replacement", () => {
                   assert.equal(credentialRefreshes, refreshes);
                 }
                 assert.throws(() => owners[0]!.guard(), /authority|aborted|admission|closed/i);
+                // Codex switch publication keeps Now refresh and child dispatch gated: with the
+                // minimum Now interval elapsed, this trigger reaches Now's scheduler, which must
+                // still construct nothing before finishB (its zero-delay timer runs before the join).
+                clockOffset += 300001;
                 await triggerNow(`held-${barrier.stage}`);
+                await new Promise<void>(resolve => setTimeout(resolve, 0));
                 assert.ok(retainedRootDispatch);
                 await assert.rejects(retainedRootDispatch.prepare(), "retired A root dispatch is refused");
                 assert.ok(retainedBroker);
