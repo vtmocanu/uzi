@@ -631,7 +631,13 @@ a new checkpoint or an available recovery archive.
 An **online** worker is heartbeating to uzi; it may still be unable to reach
 the forge directly. An applied exhausted clone/fetch retry group updates a
 cooldown for that authenticated owner, worker and canonical actual Git
-origin. Repositories sharing that origin share the cooldown on that worker;
+origin. A publication park after an exhausted transient failure (see
+[Forge unreachable while publishing](#forge-unreachable-while-publishing))
+updates it too: the stamped Git origin for a push or base refresh, the
+API origin for merge request creation. Its retry time is then the later of the
+capped backoff and that origin's cooldown. A worker-reported publication
+hold updates no cooldown, since the forge did not fail.
+Repositories sharing that origin share the cooldown on that worker;
 another worker or origin has its own admission decision.
 
 Before the cooldown is due, that worker cannot claim the affected origin.

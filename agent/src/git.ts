@@ -753,6 +753,11 @@ interface CheckpointPackOptions {
   /** issue #2753: false on non-GitHub forges: the chain skips GATE 3 and takes realTip's own tree
    *  instead of swapping in P's `.github/workflows` subtree. Absent/true: today's GitHub behaviour. */
   chainWorkflowSwap?: boolean;
+  /** The server-confirmed checkpoint ref tip, as the unpinned path's source of the BLOB-ONLY
+   *  confirmed omission (see {@link CheckpointRange.confirmedBlobSha}). Separate from
+   *  `markerTrustedTip`, which is the park-marker trust contract. Ignored when a pinned range is
+   *  supplied: then only `pinned.confirmedBlobSha` counts. */
+  confirmedBlobTip?: string;
 }
 
 /** Copy only the identity fields before any await, including waiting for B. */
@@ -1028,6 +1033,16 @@ export interface CheckpointRange {
   scanFloorShas?: string[];
   /** Captured server-named origin tracking commit; only its reachable blobs may be omitted. */
   defaultBlobSha?: string;
+  /** Captured server-confirmed checkpoint tip. A BLOB-ONLY omission authority: blobs reachable from
+   *  it may be left out of the selective pack, but it is never a commit/tree exclusion, a scan floor
+   *  or a pack floor. Used only when it is an ancestor of the packed candidate; part of the
+   *  immutable replay set. When it is an ancestor of the raw tip it is also a scan floor through
+   *  `confirmedTip` (see `scanFloorShas`); otherwise (e.g. a chain/overlay candidate that descends
+   *  from it while the raw tip does not) it is not. Either way,
+   *  omitting blobs cannot publish unscanned content: omission only removes objects from the
+   *  pack and the scan range is unchanged. terminal-range.ts
+   *  intentionally does not persist this field: no terminal producer sets it. */
+  confirmedBlobSha?: string;
   /** issue #3242: TRANSPORT-only pack exclusions, replacing `^excludeSha` in the pack (never the
    *  scan, never the floor validation). Set only for a zero range (`tipSha === excludeSha`) with no
    *  origin branch: the pack would otherwise be empty, and the broker cannot prove it will fetch the
@@ -18407,7 +18422,8 @@ export class GitCache {
    * STREAMS, never buffers: a pack can exceed the 64 MiB `maxBuffer` cap runGit uses, so
    * this spawns `git pack-objects` and hands back its stdout as a Readable. It uses a
    * bounded explicit object list when a server-named default tracking commit was captured:
-   * every legacy commit and tree remains, and only default-reachable blobs are omitted.
+   * every legacy commit and tree remains, and only blobs reachable from the default or an
+   * eligible confirmed checkpoint tip (#4439) are omitted.
    * Without that captured authority (or on preparation cap exhaustion), the legacy revision
    * input is used. Both producers are non-thin. The stdout is returned
    * for the client to upload directly. Credential-free: this is a LOCAL read of the
@@ -18533,7 +18549,7 @@ export class GitCache {
     replay: (registerOwner: Parameters<GitCache["checkpointPackCaptured"]>[0]) => Promise<{ pack: Readable; exited: Promise<number>; cancel: () => void; settled: () => Promise<void> }>;
   } | null> {
     // Replay closes over literal OIDs and the original guard; it never rebuilds an overlay.
-    const openProducer = async (registerOwner: Parameters<GitCache["checkpointPackCaptured"]>[0], source: string, candidate: string, floor: string, defaultBlobSha?: string, packExcludes?: readonly string[]) => {
+    const openProducer = async (registerOwner: Parameters<GitCache["checkpointPackCaptured"]>[0], source: string, candidate: string, floor: string, defaultBlobSha?: string, packExcludes?: readonly string[], blobFloor?: string) => {
       this.checkCheckpointCooperation();
       onStep?.("scratch_preflight");
       await this.scratchPublicationPreflight(barePath, branch, source);
@@ -18542,6 +18558,10 @@ export class GitCache {
       if (defaultBlobSha && (!SHA40_RE.test(defaultBlobSha) ||
           await this.revParse(barePath, `${defaultBlobSha}^{commit}`) !== defaultBlobSha)) {
         throw new ScratchPublicationError("captured checkpoint default is unavailable");
+      }
+      if (blobFloor && (!SHA40_RE.test(blobFloor) ||
+          await this.revParse(barePath, `${blobFloor}^{commit}`) !== blobFloor)) {
+        throw new ScratchPublicationError("captured checkpoint confirmed tip is unavailable");
       }
       const excludes = Object.freeze([...(candidate === floor && packExcludes !== undefined ? packExcludes : [floor])]);
       const context = (restrictionFacts?: CheckpointPublicationContext["restrictionFacts"]): CheckpointPublicationContext => Object.freeze({
@@ -18552,7 +18572,7 @@ export class GitCache {
       if (!options.restrictionIdentity) await beforePack?.(candidate, context());
       this.checkCheckpointCooperation();
       const selected = defaultBlobSha && !(candidate === floor && packExcludes !== undefined)
-        ? await this.prepareCheckpointObjects(barePath, candidate, floor, defaultBlobSha) : undefined;
+        ? await this.prepareCheckpointObjects(barePath, candidate, floor, defaultBlobSha, blobFloor) : undefined;
       this.checkCheckpointCooperation();
       onStep?.("checkpoint_pack");
       // Preserve #3242's zero-range transport envelope. It is deliberately packed by
@@ -18581,12 +18601,29 @@ export class GitCache {
       // Release B after starting the producer, before handing out its stream.
       return options.restrictionIdentity ? this.withLock(barePath, start) : start();
     };
+    // Decided once per logical publish on the final candidate; replay reuses the literal result.
+    // Any non-abort failure means "not eligible", which is today's exact behaviour.
+    const confirmedBlobFloor = async (confirmed: string | undefined, candidate: string, floor: string): Promise<string | undefined> => {
+      this.checkCheckpointCooperation();
+      if (!confirmed || confirmed === candidate || confirmed === floor || !SHA40_RE.test(confirmed)) return undefined;
+      try {
+        if (await this.revParse(barePath, `${confirmed}^{commit}`) !== confirmed) return undefined;
+        if (!(await this.isAncestorRef(barePath, confirmed, candidate))) return undefined;
+      } catch (e) {
+        const abort = this.boundaryAbortError(e);
+        if (abort) throw abort;
+        return undefined;
+      }
+      this.checkCheckpointCooperation();
+      return confirmed;
+    };
     // A pinned range uses literal commit OIDs for the pack floor and candidate.
     // If an overlay is requested, its wrapper becomes the wanted OID while the
     // excluded floor remains pinned.
     if (pinned) {
-      const { tipSha, excludeSha, defaultBlobSha, packExcludeShas } = pinned;
+      const { tipSha, excludeSha, defaultBlobSha, packExcludeShas, confirmedBlobSha } = pinned;
       if (!SHA40_RE.test(tipSha) || !SHA40_RE.test(excludeSha) ||
+          (confirmedBlobSha !== undefined && !SHA40_RE.test(confirmedBlobSha)) ||
           (packExcludeShas !== undefined && (tipSha !== excludeSha || !packExcludeShas.every((x) => SHA40_RE.test(x)))) ||
           (sourceSha !== undefined && sourceSha !== tipSha)) {
         throw new ScratchPublicationError("pinned checkpoint range must be two 40-hex commit SHAs", undefined, {
@@ -18611,7 +18648,10 @@ export class GitCache {
         }
       }
       const candidate = wanted;
-      const replay = (currentRegisterOwner: typeof registerOwner) => openProducer(currentRegisterOwner, tipSha, candidate, excludeSha, defaultBlobSha, packExcludeShas);
+      // C is consulted only when the selective producer will run (same condition as openProducer).
+      const blobFloor = defaultBlobSha && !(candidate === excludeSha && packExcludeShas !== undefined)
+        ? await confirmedBlobFloor(confirmedBlobSha, candidate, excludeSha) : undefined;
+      const replay = (currentRegisterOwner: typeof registerOwner) => openProducer(currentRegisterOwner, tipSha, candidate, excludeSha, defaultBlobSha, packExcludeShas, blobFloor);
       return { tipOid: wanted, ...await replay(registerOwner), replay };
     }
     const defaultBlobSha = await this.captureCheckpointDefault(barePath, options.defaultBranch);
@@ -18681,7 +18721,10 @@ export class GitCache {
         kind: "checkpoint_range", step: "checkpoint_floor", ...execDetail(classifyExecFailure(e)),
       });
     }
-    const replay = (currentRegisterOwner: typeof registerOwner) => openProducer(currentRegisterOwner, realTip, wanted, floor, defaultBlobSha, packExcludes);
+    // C is consulted only when the selective producer will run (same condition as openProducer).
+    const blobFloor = defaultBlobSha && !(wanted === floor && packExcludes !== undefined)
+      ? await confirmedBlobFloor(options.confirmedBlobTip, wanted, floor) : undefined;
+    const replay = (currentRegisterOwner: typeof registerOwner) => openProducer(currentRegisterOwner, realTip, wanted, floor, defaultBlobSha, packExcludes, blobFloor);
     return { tipOid: wanted, ...await replay(registerOwner), replay };
   }
 
@@ -18711,7 +18754,7 @@ export class GitCache {
   /** Four sequential owned children; only the classifier has concurrent bounded input/output.
    * One failed child stops the pass. All cancellation and exit promises settle before fallback.
    * Rows retain Git's path spelling; classification never requests object contents. */
-  private async prepareCheckpointObjects(barePath: string, candidate: string, floor: string, defaultSha: string): Promise<Buffer | undefined> {
+  private async prepareCheckpointObjects(barePath: string, candidate: string, floor: string, defaultSha: string, blobFloor?: string): Promise<Buffer | undefined> {
     const limits = this.checkpointPackBounds;
     const maxRecords = Math.max(0, Math.min(65536, limits.records ?? 65536));
     const maxBytes = Math.max(0, Math.min(16 * 1024 * 1024, limits.bytes ?? 16 * 1024 * 1024));
@@ -18820,7 +18863,11 @@ export class GitCache {
         };
         await child(["rev-list", candidate, `^${floor}`], retain("commit"));
         await child(["rev-list", "--objects", candidate, `^${floor}`], retain("all"));
-        await child(["rev-list", "--objects", candidate, `^${floor}`, `^${defaultSha}`], retain("blob"));
+        // blobFloor (the confirmed checkpoint tip) only trims blobs: commits and trees are retained
+        // from the first two children. Unset: exactly the legacy arguments.
+        await child(["rev-list", "--objects", candidate, `^${floor}`,
+          ...(blobFloor ? [`^${blobFloor}`] : []), `^${defaultSha}`,
+          ...(blobFloor ? [`^${defaultSha}^{tree}`] : [])], retain("blob"));
         const iterator = rows.entries();
         const selected: Buffer[] = [];
         await child(["cat-file", "--batch-check=%(objectname) %(objecttype)"], line => {
@@ -18901,7 +18948,9 @@ export class GitCache {
   async resolveCheckpointRange(
     barePath: string,
     branch: string,
-    opts: { confirmedTip?: string; extraFloors?: string[]; tipSha?: string; defaultBranch?: string } = {},
+    opts: { confirmedTip?: string; extraFloors?: string[]; tipSha?: string; defaultBranch?: string;
+      /** Also capture `confirmedTip` as {@link CheckpointRange.confirmedBlobSha} (blob-only omission). */
+      captureConfirmedBlob?: true } = {},
   ): Promise<CheckpointRange | null> {
     try {
       // Issue #2545: a held publication names its tip explicitly (the frozen record's aggregate
@@ -18952,8 +19001,18 @@ export class GitCache {
       const defaultBlobSha = await this.captureCheckpointDefault(barePath, opts.defaultBranch);
       this.checkCheckpointCooperation();
       const packExcludeShas = await this.zeroRangePackExcludes(barePath, branch, tipSha, excludeSha);
+      // No ancestry check against the raw tip: a chain/overlay candidate may descend from the
+      // confirmed tip while the raw tip does not. Eligibility is judged on the final candidate.
+      let confirmedBlobSha: string | undefined;
+      if (opts.captureConfirmedBlob === true && confirmed && SHA40_RE.test(confirmed) &&
+          confirmed !== excludeSha &&
+          (await this.revParse(barePath, `${confirmed}^{commit}`)) === confirmed) {
+        confirmedBlobSha = confirmed;
+      }
+      this.checkCheckpointCooperation();
       return { tipSha, excludeSha, scanFloorShas,
         ...(defaultBlobSha === undefined ? {} : { defaultBlobSha }),
+        ...(confirmedBlobSha === undefined ? {} : { confirmedBlobSha }),
         ...(packExcludeShas === undefined ? {} : { packExcludeShas }) };
     } catch (err) {
       this.checkCheckpointCooperation();
