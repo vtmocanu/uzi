@@ -2000,7 +2000,7 @@ redundancy; credit comes only from u3-nonce-redundant. Every credited mutant
 passed typecheck and exited 1 at the named assertion.
 
 Unchanged candidate (primary clone, same test file): the six selected cases
-pass, 6/6, EXIT=0 (`.uzi/scratch/ctl-logs/u3-green.log`); all ten
+pass, 6/6, EXIT=0 (`.uzi/scratch/ctl-logs/u3-green.log`);
 `npm run lint` in agent: 0 warnings, 0 errors. (The other four persist-clear
 cases passed in the coder's unlogged run; no credit rests on that.)
 
@@ -2037,12 +2037,15 @@ sets `reaped` only when the registry is not left in `unverifiedEpochRegistries`
 and `restartAndResume` (:4148) also refuse without `reaped`.
 
 New test variant (this commit): `tool-reap-unproven` — "Codex real Runner holds
-API-key A to subscription B when an A tool root reap is unproven". A's real
-file-operation command root (`uzi-codex-fileop` under the command sandbox,
-registered kind `command`, launched via `launchRegisteredEffectRoot`) returns an
-unclean dispose, so its registered reap fails
-("command supervisor root disposal not clean") while A's provider reap stays
-clean. It shares root-reap-unproven's hold assertions (applies 0, teardown
+API-key A to subscription B when an A tool root reap is unproven". The rig's
+injected effect root for A's file-operation command (a PassThrough-based fake
+from `makeMultiEpochRig`; no fileop binary or sandbox runs) is launched and
+registered as kind `command` through the real executor path
+(`launchRegisteredEffectRoot`, `registeredRoot`). Its dispose reports unclean,
+so the real registry reap of that root fails while A's provider root is reaped
+through the same registry. The test does not assert the root's identity, the
+registry error text, or the provider reap's own result (it checks that
+`A-reaped` was logged). It shares root-reap-unproven's hold assertions (applies 0, teardown
 results `[false]`, no B auth, hold reports, event order). Both variants now also
 assert `providerAdmissions.length === 1` (no B provider launch).
 
@@ -2054,16 +2057,27 @@ abc0af4aba05…): `npm run typecheck && node --import tsx --test
 | Control | Kind | Mutation | Case(s) | Red at |
 |---|---|---|---|---|
 | u4-exec-reap | (d) guard | `reaped = true \|\| (…unverifiedEpochRegistries…)` (:4125) | root- and tool-reap-unproven | :34170 "unproven A reap cannot apply a switch" (1 vs 0), both |
-| u4-after-reap | redundant-fence guard | `!reaped` neutralized in the runner hold (:17525), `publishB` (:4131) and replacement preparation (:4148), the three copies of "no apply or B start before a proven reap" | root-reap-unproven | :34170 applies 1 vs 0 |
+| u4-after-reap | redundant-fence guard | `!reaped` neutralized in the runner hold (:17525, fences apply and B), `publishB` (:4131) and replacement preparation (:4148) (these two fence B start only, after apply) | root-reap-unproven | :34170 applies 1 vs 0; only the runner copy's effect is observed, the same red as R5 |
+| u4-epoch-index | (d) guard | the switch's new `++epochIndex` at :4157 → `epochIndex` | baseline API-key→subscription | :35271 "B provider uses a distinct owned HOME root" |
 | u4-fresh-home | (b) preservation sensitivity | `-epoch-${epochIndex}` suffix removed from the owned data root (:5693) | baseline API-key→subscription | :35271 "B provider uses a distinct owned HOME root" |
+
+Copy-census scope: every `reaped`/reap-proof read in agent/src between the
+switch teardown and apply or B start (runner.ts attemptCodexCredentialSwitch,
+codex-executor.ts suspendEpoch closures, now-summary.ts). The checks in
+codex-switch-coordinator.ts (:103, :173) are off the path: `coordinateCodexSwitch`
+has no caller in agent/src.
 
 Every mutant passed typecheck and exited 1 at the named assertion. Unchanged
 candidate, primary clone, same test file: all three cases pass, 3/3, EXIT=0
 (`.uzi/scratch/ctl-logs/u4-green.log`); agent `npm run lint` 0/0.
+u4-epoch-index ran on candidate f9cc45f9d708 with the comment-corrected test
+file (sha256 80be3475…), committed with this note; green re-run on that file:
+3/3, EXIT=0 (`u4-green2.log`).
 
 Credit: A's tool (command) root reap failure and root reap failure each block
 apply and B through the executor's reap proof; the combined "no B before
-proven reap" fence; a distinct per-epoch B HOME on the switch path. Not
+proven reap" fence; a distinct per-epoch B HOME on the switch path (the old naming helper as (b),
+the switch's new epoch increment as (d)). Not
 credited: in-flight tool callbacks or pending launches at teardown
 (registry quiesce checks, no switch-time test); the new `providerAdmissions`
 assertion (every mutant fails earlier at applies); the production launcher's

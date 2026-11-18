@@ -33131,7 +33131,7 @@ describe("M2 actualRunner credential replacement", () => {
             root.dispose = async (...disposeArgs) => {
               if (epoch === 0) { cleanupStarts++; events.push("A-cleanup-start"); cleanupEntered.resolve(); await cleanupContinue.promise; }
               if (toolReapUnproven && epoch === 0) {
-                // The real supervisor's disposal is not proven clean; registeredRoot turns this into a failed reap.
+                // The rig's injected command-kind effect root reports an unclean disposal; the real executor's registeredRoot turns this into a failed reap.
                 const result = { ...(await dispose(...disposeArgs)), clean: false as const, reason: "M2 tool reap unproven" };
                 failedToolDisposals.push({ identity: (args[0] as CodexEffectLaunchSpec).identity });
                 events.push("A-reap-failed");
