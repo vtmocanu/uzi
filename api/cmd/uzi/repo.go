@@ -146,7 +146,10 @@ func vaultLockedNote(gf *globalFlags) string {
 	if gf.url != "" {
 		cmd += " --url " + shellQuote(gf.url)
 	}
-	return uzicli.CellText("Your vault is locked or its state could not be checked: plain values are withheld. If it is locked, run " + cmd + ".")
+	// The command sits alone on its own line with no trailing punctuation, so a copied
+	// final argument (a --url or a quoted --context) stays exactly what was passed.
+	return uzicli.CellText("Your vault is locked or its state could not be checked: plain values are withheld. If it is locked, run:") +
+		"\n  " + uzicli.CellText(cmd)
 }
 
 // shellQuote wraps s in POSIX single quotes (each embedded single quote becomes

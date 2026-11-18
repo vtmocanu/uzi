@@ -104,17 +104,35 @@ A build can reference them, for example a `settings.xml` server entry:
 </server>
 ```
 
-and a matching repository declaration, for example in a `pom.xml` or a
-`settings.xml` profile:
+and a matching repository declaration. Declare it in a `settings.xml` profile
+that is listed under `<activeProfiles>`:
 
 ```xml
-<repository>
-  <id>example</id>
-  <url>${env.MAVEN_REPO_URL}</url>
-</repository>
+<profiles>
+  <profile>
+    <id>example</id>
+    <repositories>
+      <repository>
+        <id>example</id>
+        <url>${env.MAVEN_REPO_URL}</url>
+      </repository>
+    </repositories>
+  </profile>
+</profiles>
+<activeProfiles>
+  <activeProfile>example</activeProfile>
+</activeProfiles>
 ```
 
 The repository `id` must match the server `id`, or Maven sends no credentials.
+
+Maven 3.10.0 and later, and Maven 4, bind a server's credentials to the hosts
+of the same-id repositories declared in `settings.xml`, so a same-id repository
+at another host gets none. A repository declared only in a `pom.xml` is not
+known in advance: Maven still sends it the credentials, with a warning, unless
+`maven.repository.credentialScope=strict` is set. Maven 3.9.x and earlier match
+credentials by `id` alone, so a same-id repository in any dependency or parent
+POM receives them; use 3.10.0 or later.
 
 ### A container registry
 

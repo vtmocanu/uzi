@@ -73,7 +73,7 @@ func TestRepoEnvListRequiresRepo(t *testing.T) {
 }
 
 func TestRepoEnvListVaultLockedNote(t *testing.T) {
-	const note = "Your vault is locked or its state could not be checked: plain values are withheld. If it is locked, run uzi vault unlock"
+	const note = "Your vault is locked or its state could not be checked: plain values are withheld. If it is locked, run:"
 	locked := repoEnvFake()
 	locked.RepoEnvResult.VaultLocked = true
 	out, errOut, code := runCLI(t, fakeEnv(locked), "repo", "env", "list", "r1")
@@ -111,8 +111,16 @@ func TestRepoEnvListVaultLockedNoteCarriesFlags(t *testing.T) {
 		t.Fatalf("exit = %d, stderr=%q", code, errOut)
 	}
 	const want = "uzi vault unlock --context 'my ctx' --url https://uzi.example.com"
-	if !strings.Contains(errOut, want) {
-		t.Errorf("note missing %q: %q", want, errOut)
+	// The command must be a whole line of its own: no sentence punctuation may follow it,
+	// or a copied --url gains a trailing dot.
+	found := false
+	for _, line := range strings.Split(errOut, "\n") {
+		if line == "  "+want {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("note has no line exactly %q: %q", "  "+want, errOut)
 	}
 }
 

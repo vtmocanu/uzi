@@ -263,12 +263,20 @@ describe("Repos environment variables panel", () => {
   });
 
   it("pasting a value with line breaks into the single-line field switches to multiline with LF", async () => {
+    mockApi.putRepoEnv.mockResolvedValue({ variable: envVar({ name: "MIXED", secret: true, value: null }) });
     const panel = await openPanel();
     fireEvent.click(within(panel).getByRole("button", { name: "Add variable" }));
-    fireEvent.paste(within(panel).getByLabelText("Value"), { clipboardData: { getData: () => "a\r\nb\rc" } });
+    fireEvent.change(within(panel).getByLabelText("Name"), { target: { value: "MIXED" } });
+    const mixedEndings = "a\r\nb\rc";
+    fireEvent.paste(within(panel).getByLabelText("Value"), { clipboardData: { getData: () => mixedEndings } });
     const value = within(panel).getByLabelText("Value") as HTMLTextAreaElement;
     expect(value.tagName).toBe("TEXTAREA");
+    // What the editor displays (the textarea getter normalizes endings on its own)...
     expect(value.value).toBe("a\nb\nc");
+    // ...and what Save sends from the draft, which only the paste handler normalizes.
+    fireEvent.click(within(panel).getByRole("button", { name: "Save variable" }));
+    await waitFor(() => expect(mockApi.putRepoEnv).toHaveBeenCalled());
+    expect(mockApi.putRepoEnv.mock.calls[0][2].value).toBe("a\nb\nc");
   });
 
   it.each([

@@ -260,8 +260,13 @@ func TestRunEnvVarQueriesLiveDB(t *testing.T) {
 			t.Fatalf("partial lock row %d is not cands[%d] (ascending order)", i, 3+i)
 		}
 	}
-	vaultMaterialWantLocked(t, pool, "SELECT id FROM run_env_vars WHERE id=$1 FOR UPDATE NOWAIT", cands[3])
-	vaultMaterialWantUnlocked(t, pool, "SELECT id FROM run_env_vars WHERE id=$1 FOR UPDATE NOWAIT", cands[0])
+	// Probe every id while partTx is open: the requested ones locked, every omitted one free.
+	for _, id := range cands[3:] {
+		vaultMaterialWantLocked(t, pool, "SELECT id FROM run_env_vars WHERE id=$1 FOR UPDATE NOWAIT", id)
+	}
+	for _, id := range cands[:3] {
+		vaultMaterialWantUnlocked(t, pool, "SELECT id FROM run_env_vars WHERE id=$1 FOR UPDATE NOWAIT", id)
+	}
 	if err := partTx.Rollback(ctx); err != nil {
 		t.Fatal(err)
 	}
