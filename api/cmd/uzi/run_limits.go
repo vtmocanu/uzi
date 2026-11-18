@@ -309,7 +309,7 @@ func newRunSetTokenCmd(env Env, gf *globalFlags) *cobra.Command {
 			"tokens, --auto, --default or --inherit. Codex accepts only an explicit Codex subscription " +
 			"(codex_auth) or OpenAI API key (openai_api_key) label; no auto/default/inherit. " +
 			"Exactly one label or mode is required. Ambiguous eligible labels are refused; rename " +
-			"them with `uzi token` before retrying.\n\n" +
+			"them in the web UI before retrying.\n\n" +
 			"For Claude, QUEUED switches apply at next claim and eligible PARKED switches requeue. " +
 			"Live Codex switches request a safe-boundary resume attempt in the same claim and " +
 			"worktree, without promising provider resume. A request leaves the committed binding " +
@@ -434,7 +434,7 @@ func setTokenOverride(cmd *cobra.Command, args []string, c uzicli.Client) (uzicl
 	}
 	if matches > 1 {
 		return uzicli.SetRunCredentialOverride{}, uzicli.Exitf(uzicli.ExitUsage,
-			"ambiguous %s label %q; rename credentials with `uzi token`", noun, sanitizeTTY(label))
+			"ambiguous %s label %q; rename credentials in the web UI", noun, sanitizeTTY(label))
 	}
 	if matches == 0 {
 		if otherKind != "" {
