@@ -1022,3 +1022,133 @@ the ledger's Clause-accounting table, could not reach a human. The lead's
 stated assumption is to record them all as unvalidated and uncredited, run
 m3.2 and m4, and request the owner's formal partial decision at completion.
 m3 stays open until that decision.
+
+## Final inventory (m4, 2026-11-18)
+
+An index over evidence already recorded in
+[the proof ledger](credential-switch-proof-ledger.md) (its "Clause accounting"
+table and the U1-U21 sections) and in the sections above. It grants no new
+credit. "Partly credited" means only the controls named in the ledger row;
+every "not controlled" residue in that row stays unvalidated. Symbols were
+checked with grep at this tree; line numbers drift, so only the symbol and file
+are given. A cell reading "not found in ledger" means no ledger test or control
+names that surface.
+
+### 1. Authority inventory
+
+| Authority | Surface and route | Auth or fence that admits it | Code symbol (file) | Ledger tests and controls |
+| --- | --- | --- | --- | --- |
+| Owner request | `POST /api/runs/{id}/credential` | Owner-scoped run read, live status, target ownership, kind and enablement; U1 authenticates through CLI Bearer | `Handler.SetRunCredential` (api/internal/handler/run_credential.go); `Service.SetRunCredential`, `requestCodexCredentialSwitch` (api/internal/workersvc/run_credential.go) | A4 `TestWorkerCodexOwnerLiveRequestRouteLiveDB`; U1 `TestWorkerCodexOwnerRequestAdmissionRefusalsLiveDB`: u1-claimed, u1-status1, u1-usable, u1-anthropic, u1-foreignsecret, u1-foreignrun, u1-disabled; U7 and D74/D75 policy; U13 owner negotiation: u13-own-negotiated, u13-own-stopped, u13-own-heartbeat. Cookie-session path distinct from CLI Bearer: not found in ledger |
+| CLI | `uzi run set-token` to the same route | Client-side kind scoping, then the owner request fences above | `newRunSetTokenCmd` (api/cmd/uzi/run_limits.go) | U1 `TestRunSetTokenHarnessKindsAndAmbiguity`: u1-cli-kind (client side only) |
+| Web picker | `RunCredentialOverride` renders `CodexCredentialSwitch` for Codex runs | Client-side kind filter, then the owner request fences | `RunCredentialOverride` (web/src/components/RunCredentialOverride.tsx), `CodexCredentialSwitch` (web/src/components/CodexCredentialSwitch.tsx) | U1 `CodexCredentialSwitch.test.tsx`: u1-web-kind (client side only) |
+| Worker preflight | `POST /api/worker/runs/{id}/credential-switch/codex/preflight` | Worker Bearer join token, claim generation, register nonce, released flag, live status, negotiated switch and stopped support | `Handler.WorkerCodexSwitchPreflight` (api/internal/handler/worker_protocol.go); `validateCodexSwitchLocked`, `codexSwitchFence`, `codexSwitchNegotiated` (api/internal/workersvc/credential_switch_codex.go) | `TestCodexSwitchPreflightLiveDB`, `TestWorkerCodexSwitchPreflightRouteLiveDB`: u12-fence-nonce, u12-fence-gen, u12-fence-released, u12-fence-status, u12-op-mismatch, u12-target-mismatch, u13-neg-cap, u13-neg-reg, u13-preflight-stopped, u11-baseline-missing, u11-baseline-match, u7-preflight-fresh, u7-preflight-outcome; U8 lock controls (u8-alias-share, u8-alias-nowait, u8-enable-share, u8-enable-nowait, u8-account-call, u8-account-nowait, u8-busy-map, u8-intent-redundant) |
+| Worker apply | `POST /api/worker/runs/{id}/credential-switch/apply` | Same fence plus op id, target revision and the owning-worker query | `Handler.WorkerCredentialSwitchApply` (worker_protocol.go); `applyCodexSwitchLocked` (api/internal/workersvc/credential_switch_codex_apply.go) | `TestCodexTransactionalApplyBundleLiveDB`, `TestCodexApplyWriteRollbackLiveDB`, `TestCodexApplyZeroRowWriteRollbackLiveDB`, `TestCodexApplyForeignWorkerFencedLiveDB`, `TestCodexReplayCommittedOpUnderNewGenerationFencedLiveDB`, `TestCodexApplyCommittedLostReplyLiveDB`: u10-binding-n, u10-stamp-n, u10-message-ins, u10-lastseq-n, u10-commit-check, u10-return-before-commit, u10-mint-hash, u10-journal-err, u10-mint-redundant, u12-replay-codex, u12-replay-nomaterial, u12-foreign-owner, u12-replay-gen, u12-target-moved-rev, u12-target-moved-acct, u11-ordinal-genscope, u11-ordinal-n1, u11-ordinal-skip, u11-epoch-indep, u11-attrib-clamp |
+| Per-claim Codex capability | Minted on apply and on each fresh claim; A's revoked on apply | Run-scoped capability plus owning worker | `mintCodexCapability`, `codexClaimSecrets` (api/internal/workersvc/codexauthz.go) | Mint on apply: u10-mint-hash, u10-mint-redundant; A3 scope namespace; R8 retired A reconcile guard; B5/B6 (`TestWorkerCodexSwitchReleaseFencesRouteLiveDB`). Mint on a fresh claim, including cross-worker: not found in ledger; see crash point 5 and section 4 |
+| Refresh bridge and release | `POST /api/worker/runs/{id}/codex/refresh` and `/codex/release` | Capability, owning worker, authority epoch and secret hash | `CoordinatedCodexRefresh`, `ReleaseCodexCredential` (api/internal/workersvc/codexrefresh.go); `refreshCodex`, `releaseCodex` (agent/src/client.ts); `createCodexEpochAuthority` and the refresh wrapper (agent/src/codex/codex-executor.ts) | U5: u5-bridge-pre, u5-identity; U9 `TestCodexReleaseRecheckRefusesAfterSwitchApplyLiveDB`: u9-recheck, u9-recheck-relocate; B5/B6; U21: u21r-exec-release-before-proof, u21r-exec-refresh-before-proof. `createRunLaneInstallerReconcile` (agent/src/codex/codex-executor.ts, the installer-before-credential reconcile): not found in ledger |
+| Now and summary | Frames to `NowSummaryController`; executor summary factory | Switch gate and executor authority guard | `NowSummaryController`, `switchGate` (agent/src/now-summary.ts); summary `assertAuthority` (codex-executor.ts) | U5: u5-summary-redundant (executor summary guard only). U20: Now `switchGate`, plan and intent summaries, and B refresh suspension are not credited (diagnostic rows u20-now-gate, u20-exec-summary-switch, u20-exec-summary-both, u20-summary-all, u20-now-gate-lifecycle, u20-now-switch-gates; u20r-b-refresh is a timeout red) |
+| Stopped settlement | `POST /api/worker/runs/{id}/state` with `codex_switch_stopped`; `credential_switch_failed` is a separate state on the same route | Worker Bearer, claim generation, expected epoch, register nonce, owning worker, marker and status fences | `Handler.WorkerRunState` (worker_protocol.go); `setStateWithTx` (api/internal/workersvc/service.go); `stoppedSettlementAck` (worker_protocol.go) | D1-D73 stopped guards; U13: u13-w-latch-frozen, u13-w-latch-successor, u13-w-withdrawal; U14 u14-*, u14r-*; U15 u15-*; U16 u16-*, u16r-*; U17 u17-*; U18 u18-*; U19 u19-ack-leak, u19-log-leak. `credential_switch_failed` as a stopped-route authority: only the op-less withdrawal note in U16, no control |
+| Recovery | Runner recovery of a retained same-worker claim | Predecessor proof (`predecessor_capture`) and `quiescence_failed` gate | `recoverRetainedClaimBody` (agent/src/runner.ts) | U21: u21r-exec-release-before-proof, u21r-exec-refresh-before-proof, u21-release-before-proof (Runner-client counter only), u21-gate (rerun u21f-gate), u21r-blocker; U6 crash controls. Cross-worker claim: unvalidated, see section 4 |
+| Redactor | Log and run-message redaction of B material and the apply result | Registration of delivered tokens | `flight.secrets.add` and `this.log.addSecret` in the switch loop, canaries (agent/src/runner.ts); `CredentialSwitchApplyResult.LogValue` (api/internal/workersvc/credential_switch_apply.go) | U19: u19-agent-log-redactor, u19-agent-message-redactor, u19r-log-value (`TestWorkerCodexApplyLogRedactionRouteLiveDB`), u19-ack-leak, u19-log-leak, u19r-ack-leak, u19r-log-leak (`TestWorkerCodexStoppedTokenAbsenceRouteLiveDB`). The executor's second log registration and the remaining surfaces: not controlled, owner batch |
+
+### 2. Requirement to test to control map
+
+Status is the ledger's Clause-accounting wording, not a new assessment. No
+requirement below is fully credited: each carries the residual the ledger names.
+
+| # | Requirement | Tests | Controls (class) | Status | Residual named in the ledger |
+| --- | --- | --- | --- | --- | --- |
+| U1 | Owner request admission | `TestWorkerCodexOwnerRequestAdmissionRefusalsLiveDB`, `TestRunSetTokenHarnessKindsAndAmbiguity`, `CodexCredentialSwitch.test.tsx`; A4 | u1-claimed, u1-status1, u1-usable, u1-disabled (d); u1-anthropic, u1-foreignsecret (redundant-fence); u1-foreignrun (b); u1-cli-kind, u1-web-kind (client-side d) | partly credited | pool_wait, terminal statuses, pinned-without-secret, lane, no-live-worker, unsupported-worker and foreign-subscription refusals unvalidated; no control proves the no-write snapshot comparison; stamp SQL's own status filter |
+| U2 | Same flight, generation, worktree | `M2 actualRunner api_key to subscription factory account resumes saved thread`, `Codex real Runner switches A to B to C without a new claim or attempt` | u2-claim, u2-custody, u2-transition, u2-worktree (effect-injection); u2-attemptdir red on baseline test only | partly credited | u2-attemptdir has no A to B to C credit; new flight object, `reserveRecoveryCapture`, `settleRecoveryHold(Live)`, clone seeding and the `fresh_B` return not separately controlled; claim generation assertions not shown sensitive |
+| U3 | Strict persistence variants | `Codex real rollout persist failure before teardown (<variant>)`; R1-R4 | u3-owner-before, u3-op-before, u3-target-before, u3-owner-after, u3-pending-after (d); u3-nonce-redundant (redundant-fence) | partly credited | pending-absent-before, hold/status/generation legs of `owned`, lost-reply clear and reopen's other guards not controlled |
+| U4 | A reap before B, fresh CODEX_HOME | `tool-reap-unproven`, `root-reap-unproven`, baseline api_key to subscription; R5 | u4-exec-reap, u4-epoch-index (d); u4-after-reap (redundant-fence); u4-fresh-home (b) | partly credited | in-flight tool callbacks and pending launches at teardown, launcher must-not-exist check, "created after reap" beyond the combined fence |
+| U5 | Authority retirement of A | codex-executor.ts probes P1-P4 (four cases) | u5-bridge-pre (d); u5-summary-redundant (redundant-fence); u5-identity (b) | partly credited | A-account rejection under subscription to subscription, bridge post-call copy, `assertRefreshAdmission`, Now stale-result drops not controlled |
+| U6 | Exact saved-ID resume, lineage notice | real Runner resume and crash cases in codex-executor.test.ts | u6-resume-id (d data-flow); u6-lineage-notice, u6-crash-missing-id (d); u6-preserve-3copy (redundant-fence); u6-crash-preserve-saved (b); u6-preserve-redundant, u6-crash-preserve-attempt (cause attribution only) | partly credited | confirmed-refusal classification (timeout reds, uncredited), the `sessionId !== saved` check, `session_missing` on the switch path, three of four crash publications not mutated |
+| U7 | Policy at request and apply | `TestWorkerCodexPolicyEpisodeBeforePreflightRouteLiveDB`; D74-D77 | u7-preflight-fresh, u7-preflight-outcome (d) | partly credited | hold arm unreachable in live statuses (`runs_policy_hold_shape`); paused hold refused by status (u1-status1); concurrent lock-order contention not controlled |
+| U8 | Pre-revoke reconciliation, lease and intent, lock order | `TestCodexApplyAliasRowContentionLiveDB`, `TestCodexApplyReverseOrderReloginWriterLiveDB`, `TestCodexApplyRotatingIntentRowLockLiveDB`, `TestCodexRefreshAdmittedBeforeApplyLiveDB`; D78/D79 | u8-alias-share, u8-alias-nowait, u8-enable-share, u8-enable-nowait, u8-account-call, u8-account-nowait, u8-busy-map (d); u8-intent-redundant, u8-admitted-refresh-redundant (redundant-fence); u8-reconcile-after-teardown (c) | partly credited | per-account lock isolation, target account's intent check, refresh admission's binding recheck in isolation, global lock sorting |
+| U9 | Final reauthorization timing | `TestCodexReleaseRecheckRefusesAfterSwitchApplyLiveDB`; B5/B6 | u9-recheck (b); u9-recheck-relocate (c) | partly credited | API-key A path and the vault-locked branch after a switch |
+| U10 | Transactional binding rewrite, material after commit | `TestCodexTransactionalApplyBundleLiveDB`, `TestCodexApplyWriteRollbackLiveDB`, `TestCodexApplyZeroRowWriteRollbackLiveDB` | u10-binding-n, u10-stamp-n, u10-message-ins, u10-lastseq-n, u10-commit-check, u10-journal-err (d); u10-mint-hash (d behavioural); u10-mint-redundant (redundant-fence); u10-return-before-commit (c) | partly credited | per-statement server-error returns (argued equivalent), empty-AccessToken check, the caller's deferred rollback |
+| U11 | Ordinal and epoch attribution | `TestCodexSwitchPreflightLiveDB`, `TestCodexTransactionalApplyBundleLiveDB`, `TestCodexSwitchSpendJoinsAuthorityEpochLiveDB`, `TestCodexSwitchOrdinalRestartsPerGenerationLiveDB` | u11-baseline-missing, u11-baseline-match, u11-ordinal-genscope (d); u11-ordinal-n1, u11-ordinal-skip, u11-epoch-indep (d behavioural); u11-attrib-clamp (b) | partly credited | per-field baseline comparisons, epoch<=0 refusal, uncommitted-ordinal and generation-scope clamp branches on the Codex path, cross-generation spend joins |
+| U12 | Rollback, lost-reply replay, stale or foreign apply | `TestCodexApplyCommittedLostReplyLiveDB`, `TestCodexApplyForeignWorkerFencedLiveDB`, `TestCodexReplayCommittedOpUnderNewGenerationFencedLiveDB`, `TestCodexSwitchPreflightLiveDB`; rollback by U10 | u12-replay-codex, u12-fence-nonce, u12-fence-gen, u12-fence-released, u12-fence-status, u12-op-mismatch, u12-target-mismatch, u12-target-moved-rev, u12-target-moved-acct (d); u12-replay-nomaterial (redundant-fence); u12-foreign-owner, u12-replay-gen (b) | partly credited | preflight's own non-owner refusal, validator replay copy, Step 1 worker check, apply Step 0 copies, other fence conjuncts, stamp checks, target sub-checks, old-alias refusals |
+| U13 | Stopped-support negotiation | `TestOwnerCodexSwitchUnsupportedWorkerLiveDB`, `TestWorkerCodexSwitchPreflightRouteLiveDB`, codex-switch-preflight.test.ts, client tests, executor latch cases | u13-own-negotiated, u13-own-stopped, u13-own-heartbeat, u13-neg-cap, u13-neg-reg, u13-preflight-stopped, u13-w-unknown-reason, u13-w-admit-cap, u13-w-admit-feature, u13-w-latch-frozen, u13-w-latch-successor (d); u13-w-withdrawal (d behavioural) | partly credited | the runner's own admission check, fence/Step 0 negotiation copies, null-heartbeat and registration sub-conjuncts, in-place conjunct, identical-tuple replay, first-READY latch, unchanged-stamp assertions, worker-side `worker_upgrade_required` reason |
+| U14 | Stopped pending input and wall budget | `TestWorkerCodexStoppedGuardsRouteLiveDB` | u14-applied, u14-superseded, u14-cutoff, u14-cutoff-kind, u14-interactive, u14r-unstarted-isolated, u14r-cutoff-boundary, u14r-cutoff-equal, u14r-coalesce (d); u14-running-clock, u14-extension, u14-finalize, u14-paused-secs, u14-default-timeout (d behavioural) | partly credited | paused-run carve-out variants, cancel/reject_plan under the cutoff, cutoff run correlation, chat/judge exemption (unreachable), `RunTimeout` value, future-`started_at` clamp, production default |
+| U15 | Stopped bounds, ownership, statuses | `TestWorkerCodexStoppedAuthorityBoundsRouteLiveDB`, `TestWorkerCodexStoppedOwnershipRouteLiveDB`, `TestCodexSwitchStoppedAuthorityBounds` | u15-gen-edge, u15-epoch-edge, u15-nonce-length, u15-nonce-edge, u15-nonce-nul, u15-status (d); u15-gen-lower, u15-gen-upper, u15-epoch-lower, u15-epoch-upper, u15-nonce-empty, u15-recon-generation, u15-recon-released, u15-foreign-worker (redundant-fence); u15-binding-fk (b); u15-utf8 (unit, supporting only, uncredited) | partly credited | NULL snapshot nonce, reconciled `*g <= 0` copy, binding identity beyond ownership (no predicate clause; owner batch) |
+| U16 | Stopped markers, competing controls, withdrawn X/Y | `TestWorkerCodexStoppedWithdrawnXYRouteLiveDB`, `TestCodexSwitchStoppedLateControlLockOrderLiveDB`, `TestCodexSwitchStoppedRunningPolicyHoldLiveDB`, `TestCodexSwitchStoppedResumeReclaimReregistrationLiveDB` | u16-y-markers, u16-resume, u16-locks, u16r-run-locks, u16r-locks, u16-policy-hold (redundant-fence); u16-reclaim, u16-registration (d); u16-stale-withdraw, u16-worker-lock, u16r-worker-lock (b) | partly credited | op-less v1 withdrawals unfenced by op; xy_settles positive only; paused-origin replay under concurrency, owner writers that take no worker or run row lock |
+| U17 | Stopped preservation | `TestWorkerCodexStoppedStatePreservationRouteLiveDB`; E1-E6 | u17-session, u17-gate-run, u17-question-id, u17-gate-presentation, u17-question-message, u17-replay-run, u17-replay-presentation (effect-injection) | partly credited | other gate columns and other replay tables compared but not individually injected; Slack, `cross_checks` and other trigger-closure tables outside the snapshot |
+| U18 | Bounded strict stopped request | `TestWorkerCodexStoppedRequestShapeRouteLiveDB`, `TestWorkerStateStoppedStrictBody`, `TestStoppedSettlementAck`, `TestWorkerRunStateCodexSwitchStoppedRoute` | u18-body-bound, u18-body-edge, u18-trailing, u18-minimal-ack, u18-ack-full-run, u18-ack-extra-key (d); u18-op-id, u18-unknown, u18-epoch-other (redundant-fence) | partly credited | other statuses and the envelope key count; null/missing fields and case aliases beyond D25-D56 |
+| U19 | Token absence | `TestWorkerCodexStoppedTokenAbsenceRouteLiveDB`, `TestWorkerCodexApplyLogRedactionRouteLiveDB`, executor leaves in codex-executor.test.ts | u19-agent-log-redactor, u19-agent-message-redactor, u19r-log-value (d); u19-ack-leak, u19-log-leak, u19r-ack-leak, u19r-log-leak (effect-injection) | partly credited | executor's second log registration; remaining surfaces are guardless by construction and go to the owner batch; m4 security gates remain required |
+| U20 | Publication ordering and admission | the two "publication gates Now, retired A and B preparation children" leaves, eleven "partial B publication never reopens A" leaves, "startup refresh stays deferred until B finish", six baseline leaves; R7 | u20f-exec-admission (d); R7 (d) | partly credited | Now advice and `switchGate` (masked by an undetermined layer, no leaf on the preserve-only resume-refusal path), plan and intent summaries (untested), B refresh suspension (u20r-b-refresh, timeout red) not credited; wait-time effect unmeasured |
+| U21 | Decision 11 non-use before the predecessor proof | the 32 "Codex switch crash" leaves (four crash points, eight recovery modes) | u21r-exec-release-before-proof, u21r-exec-refresh-before-proof (c, b); u21-release-before-proof (c, Runner-client counter only); u21-gate, u21r-blocker (d, b) | partly credited | API-key A to subscription B, same-worker retained recovery only; "discarded" not shown (non-use only); subscription A and API-key B, the `kind` half of the gate, the re-hold variant and cross-worker recovery not controlled |
+
+Crash points (U21 leaves, with the controls named in the ledger):
+
+| Crash point | Tests | Controls | Status | Residual |
+| --- | --- | --- | --- | --- |
+| 1. After A teardown, before apply | "Codex switch crash after A teardown before apply recovers committed A without switching" | u21r-exec-release-before-proof, u21r-exec-refresh-before-proof, u21-gate, u21r-blocker | partly credited (API-key A to subscription B, same-worker only) | as U21; delivered material here is API-key A |
+| 2. API commit, reply lost | "Codex switch crash after apply commit loses auth response and recovers committed B"; `TestCodexApplyCommittedLostReplyLiveDB` (U12) | same four U21 controls; u12-replay-codex, u12-replay-nomaterial | partly credited | as U21 and U12 |
+| 3. After apply acknowledgment, before B login | "Codex switch crash after apply acknowledgement before B login recovers committed B" | same four U21 controls | partly credited | as U21; U6 crash controls ran through the crash-during-login publication only |
+| 4. During B login | "Codex switch crash during B login retains committed B"; U6 crash cases | same four U21 controls; u6-crash-missing-id, u6-crash-preserve-saved (u6-crash-preserve-attempt cause only) | partly credited | as U21 and U6 |
+| 5. Predecessor host unreachable | none | none | **unvalidated and uncredited** (owner decision 2026-11-18, environmental limitation) | The code does not enforce predecessor quiescence on cross-worker reclaim; recorded in "Decision 11 recovery controls and crash point 5". Pending owner decision |
+
+### 3. PRD #1147 constraints
+
+Line numbers checked against `prds/done/1147-codex-credentials-foundation.md`
+(Approved policies, lines 15-19); all match. The "Plan's proof units" column is
+the plan's own; the last column is the ledger evidence.
+
+| PRD #1147 constraint (line) | Status | Plan's proof units | Ledger evidence |
+| --- | --- | --- | --- |
+| Freeze credential/auth mode at creation (:15) | Amended narrowly: only the owner-authorized fenced apply may change it (ADR-4201/1590 amendment, `adr/4201-in-place-credential-switch.md`, `adr/1590-codex-binding-same-identity-readmission.md`) | U1, U12, U13; m4 docs | U1 u1-*; U12 u12-fence-*, u12-op-mismatch, u12-target-mismatch; U13 u13-own-*, u13-neg-*; this section is the m4 docs index |
+| "Never silently switch a subscription run to a paid key" (:15) | Retained; change only on explicit owner choice | U1, U2, U12 | U1 u1-foreignrun, u1-usable, u1-anthropic; U2 u2-claim, u2-custody, u2-transition, u2-worktree; U12 u12-foreign-owner. A control for the subscription-to-paid-key direction specifically: not found in ledger |
+| A replaced saved row must not silently move a bound run (:15) | Retained; revision and identity checked under lock (credential_switch_codex.go, the old-alias account key and revision check) | U12 | U12 u12-target-moved-rev, u12-target-moved-acct. Old-alias refusals: listed as not controlled in the U12 row |
+| Verified provider identity (:16) | Retained | U12, U5 | U5 u5-identity (b; shows B's account is carried, not that A's is rejected); U12 u12-target-moved-acct. A-account rejection under subscription to subscription: not controlled |
+| Concurrent runs on one subscription; no seat lock (:17) | Unaffected | reviewer check | not found in ledger (reviewer check, not evidenced here) |
+| Persist refreshed login before pause or park; reconcile lost acknowledgments (:18) | Retained | U8 | U8 u8-reconcile-after-teardown (c); C2 reconciliation before strict persistence; U8 residues listed in section 2 |
+| Capability and owning worker; target derived from binding (:19) | Retained; worker apply carries no secret id | U12, U10, U5 | U12 u12-foreign-owner, u12-fence-*; U10 u10-mint-hash, u10-mint-redundant; U5 u5-bridge-pre. "Apply carries no secret id" as a request-shape assertion: not found in ledger as a control |
+
+### 4. Decisions 11 and 12
+
+| Decision | What was decided | Evidence | What remains open |
+| --- | --- | --- | --- |
+| 11 | The runtime stays fail-closed: B is never used while predecessor quiescence is unproven; the run holds instead. Crash point 5 is a recorded scope decision, unvalidated and uncredited. No option-B protocol work | "Decision 11 recovery controls and crash point 5 (2026-11-18)" above; ledger U21 and Clause-accounting rows for decision 11 and crash point 5 | Open on the cross-worker path: the code does not enforce it there (a new worker has no retained journal, so the `predecessor_capture` and `quiescence_failed` gate does not run and the run proceeds with B). On the same-worker path the held outcome is a terminal `failed` report with clone and custody kept, not an owner pause. Formal owner decision pending |
+| 12 | Narrow exception: the renumber helper's adjacent `.renum.*` and `.renumber-tmp-*` transient paths are permitted for one step, with the ancestry and clean-tree guards intact | "Default-branch merge and migration renumber (2026-11-17)" above: command and EXIT=0, `find ... -name '.renum*'` empty afterwards, `git status --porcelain --ignored` on the migrations directory showing only the two renames, 00465 to 00466 and 00466 to 00467 | Nothing open for this step. The record's verification is the post-run check; no later renumber is covered by the exception |
+
+### 5. Pending, not claimed
+
+- Landing obligations (exact-head PR CI, not run here): the full agent unit
+  suite; the run-store-it LiveDB sweep; `test:api`, `test:web` and
+  `test:web-browser`. `api/internal/capability` is not run with `-race` in the
+  m3.2 checks and is covered only by `test:api` in that CI.
+- Owner acceptance: live cross-account `thread/resume`, not verified.
+- Owner partial decision on every unvalidated residue: the "not controlled"
+  residues in the ledger's Clause-accounting table, the clauses that fit no
+  proof class, crash point 5 and the cross-worker path of decision 11. m3
+  stays open until that decision.
+- Optional deferred doc notes from the last review round (not applied here):
+  - the affinity pin can also be released by a forge-origin cooldown
+    (`fn_forge_origin_owner_pins`), and the case 5 texts do not list it;
+  - the user doc omits "in maintenance";
+  - the subscription sign-out advice does not say an already-issued access
+    token may stay valid until expiry;
+  - the ADR's appositive reads as a list.
+
+## m4 repo checks (2026-11-18)
+
+The lead ran each check serially at 59416337d (a docs-only parent of the
+final docs commits). Logs are `.uzi/scratch/ctl-logs/m4-*.log`, each ending
+`SHA=59416337d… EXIT=0`:
+
+- `task check:changelog-entry`: OK.
+- `task check:token-literals`: OK, canary detected.
+- `task check:migration-numbering`: OK, canary detected.
+- `task check:migration-additive`: OK, canary detected.
+- `task scan:secrets`: OK, canary detected.
+- `task sast:semgrep`: 0 results, 0 errors.
+
+On every docs commit, `task docs:sync` then `task check-docs:web` ran with
+EXIT=0, and the `api/internal/uzidocs` test passed.
+
+E2E sweep: none of the 49 string literals this branch removed from api and
+agent production code appears under `e2e/`. The branch changes nothing under
+forge, e2e, scripts, workflows, shell or YAML, so `test:e2e-lib`,
+`test:forge-fake`, `lint:shell`, `lint:yaml` and `check:guidance-size` are not
+affected and were not run.
