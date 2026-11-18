@@ -954,19 +954,16 @@ run is a terminal `failed` report with clone and custody kept, not an owner
 pause. **The code does not enforce that requirement on the cross-worker path.**
 A stale worker's run is requeued (`RequeueRunsOfStaleWorkers`); `ClaimRun`'s
 affinity pin lets another of the user's workers claim it once the owner is
-heartbeat-stale past the grace period, after the affinity ceiling (default 2h),
+heartbeat-stale, not draining or in maintenance, and past the stale-requeue grace, after the affinity ceiling (default 2h),
 or when the worker row is deleted; `codexClaimSecrets` then mints a fresh
 capability and delivers the run's current binding (B after an applied switch).
 The new worker has no retained journal, so `if (retainedJournal)` in
 `agent/src/runner.ts` is false, `recoverRetainedClaim` is skipped, the
 `predecessor_capture` / `quiescence_failed` gate never runs, and the run
-proceeds with B. B can therefore be used while an unreachable predecessor may
-still hold provider credential A. Without a switch the same path delivers A to
-the new worker; the claim path has no switch-specific logic (read from the
-code, not executed). U21 evidences the gate only for same-worker retained
+proceeds with B. B can therefore be used while an unreachable predecessor may still hold provider credential A, and B too if the switch applied on that host (the apply response delivers B's material: a static API key, or a subscription access token until it expires). Without a switch the same path delivers A to
+the new worker; the Codex claim path (`codexClaimSecrets`) and `ClaimRun`'s affinity pin have no switch-specific logic (read from the code, not executed). U21 evidences the gate only for same-worker retained
 recovery. The cross-worker path is unvalidated and uncredited, and the gap goes
-to the owner as a formal decision; fail-closing it would need new
-claim-affinity design, which the approved plan does not include. Continuation is
+to the owner as a formal decision; fail-closing it (for example refusing or holding a cross-worker Codex claim while the predecessor is unproven) is an option for the owner, its size not assessed, and outside the approved plan. Continuation is
 never credited because the host is gone. This covers crash point 5 only.
 
 ## m3.2 candidate-level checks (2026-11-18)

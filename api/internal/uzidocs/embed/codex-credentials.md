@@ -338,15 +338,12 @@ provider credential that predecessor already holds. This case is an
 owner-recorded limitation, unvalidated and uncredited. The owner's stated
 requirement is that the new credential is never used while the predecessor is
 unproven, but **uzi does not enforce that across workers.** If the lost host's
-run is claimed by another of your workers (once the old worker is stale past the
-grace period, past the affinity ceiling, or deleted), that worker has no local
+run is claimed by another of your workers (once the old worker is stale and not draining past the grace period, past the affinity ceiling, or deleted), that worker has no local
 retained journal, so the quiescence proof does not run, and the run continues
 with its current credential: the new one after a switch, or the old one if you
-never switched. The unreachable host may still hold the old credential.
+never switched. The unreachable host may still hold the old credential, and the new one too if the switch had already applied there.
 
-If a worker host is lost, revoke or rotate the old credential at the provider
-(OpenAI). Removing it in uzi, or switching away from it, does not stop a copy
-an unreachable host already holds.
+If a worker host is lost, revoke or rotate every credential delivered to that host at the provider (OpenAI): the old one, and the new one if the switch had already applied there. For an API key, rotate the key; for a ChatGPT subscription login, sign out of or revoke its sessions. Removing a credential in uzi, or switching away from it, does not stop a copy an unreachable host already holds.
 
 This is not a universal crash-resume or storage-durability guarantee.
 Cross-account provider acceptance is **unproven**: evidence uses fakes, and

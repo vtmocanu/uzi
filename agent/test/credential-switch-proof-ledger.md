@@ -3793,7 +3793,7 @@ quiescence is unproven, with the run held for the owner instead. **The code
 does not enforce that requirement on this path.** Traced at HEAD:
 1. `RequeueRunsOfStaleWorkers` (runtime.sql) requeues a stale worker's run.
 2. `ClaimRun`'s affinity pin (runtime.sql) lets another of the user's workers
-   claim it once the owner is heartbeat-stale past the grace period, after the
+   claim it once the owner is heartbeat-stale, not draining or in maintenance, and past the stale-requeue grace, after the
    affinity ceiling (default 2h), or when the worker row is deleted.
 3. `codexClaimSecrets` (workersvc/codexauthz.go) mints a fresh capability and
    delivers the run's current binding, which after an applied switch is B.
@@ -3802,13 +3802,9 @@ does not enforce that requirement on this path.** Traced at HEAD:
    `predecessor_capture` / `quiescence_failed` gate never runs, and the run
    proceeds with B.
 
-So B can be used while an unreachable predecessor may still hold provider
-credential A. Without a switch the same path delivers A to the new worker. The
-claim path contains no switch-specific logic, so this is not introduced by the
-switch (read from the code, not executed). U21 (above) evidences the gate only
+So B can be used while an unreachable predecessor may still hold provider credential A, and B too if the switch applied on that host (the apply response delivers B's material: a static API key, or a subscription access token until it expires). Without a switch the same path delivers A to the new worker. The Codex claim path (`codexClaimSecrets`) and `ClaimRun`'s affinity pin contain no switch-specific logic, so this is not introduced by the switch (read from the code, not executed). U21 (above) evidences the gate only
 for same-worker retained recovery; the cross-worker path is unvalidated and
-uncredited. This gap goes to the owner as a formal decision; fail-closing it
-would need new claim-affinity design, which the approved plan does not include.
+uncredited. This gap goes to the owner as a formal decision; fail-closing it (for example refusing or holding a cross-worker Codex claim while the predecessor is unproven) is an option for the owner, its size not assessed, and outside the approved plan.
 On the same-worker path the held outcome is a terminal `failed` report with
 clone and custody kept, not an owner pause. Continuation is never credited
 because the host is gone.

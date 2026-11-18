@@ -87,17 +87,15 @@ instead (on the same-worker path that means terminal `failed`,
 `worker_residue_blocked`, with clone and custody kept; not an owner pause).
 **The code does not enforce that requirement across workers.** A stale worker's
 run is requeued (`RequeueRunsOfStaleWorkers`); `ClaimRun`'s affinity pin lets
-another of the user's workers claim it once the owner is heartbeat-stale past
-the grace period, after the affinity ceiling (default 2h), or when the worker
+another of the user's workers claim it once the owner is heartbeat-stale, not draining or in maintenance, and past the stale-requeue grace, after the affinity ceiling (default 2h), or when the worker
 row is deleted; `codexClaimSecrets` mints a fresh capability and delivers the
 run's current binding (B after an applied switch). The new worker has no local
 retained journal, so the `predecessor_capture` / `quiescence_failed` gate never
 runs and the run proceeds with B, possibly while an unreachable predecessor
-still holds provider credential A. Without a switch the same path delivers A
-(the claim path has no switch-specific logic; read from the code, not executed).
+still holds provider credential A, and B too if the switch applied on that host (the apply response delivers B's material: a static API key, or a subscription access token until it expires). Without a switch the same path delivers A
+(the Codex claim path, `codexClaimSecrets`, and `ClaimRun`'s affinity pin have no switch-specific logic; read from the code, not executed).
 The gap is unvalidated and uncredited and goes to the owner as a formal
-decision; fail-closing it needs new claim-affinity design, outside the approved
-plan. Continuation is never justified by "the host is gone". No new
+decision; fail-closing it (for example refusing or holding a cross-worker Codex claim while the predecessor is unproven) is an option for the owner, its size not assessed, and outside the approved plan. Continuation is never justified by "the host is gone". No new
 credential-delivery protocol was started.
 
 Residuals recorded as unvalidated and uncredited, never as proven, including:
