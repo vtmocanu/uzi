@@ -1549,7 +1549,14 @@ test("peekAllAuthoritySlots refuses a head-recorded slot whose file or whole slo
     assert.equal((await all()).length, 1, mode);
     if (mode === "file") fs.rmSync(path.join(slotsDir(f), `${key}.json`));
     else fs.rmSync(slotsDir(f), { recursive: true, force: true });
+    const headsDir = path.join(authorityDir(f), "heads");
+    const heads = (): string => fs.readdirSync(headsDir).sort().map((n) => fs.readFileSync(path.join(headsDir, n), "utf8")).join("|");
+    const before = heads();
     await assert.rejects(all(), /authority slot missing/, mode);
+    // The refusal repairs nothing: no slots directory or slot file is recreated and no head changes.
+    assert.equal(heads(), before, mode);
+    if (mode === "file") assert.deepEqual(fs.readdirSync(slotsDir(f)), [], mode);
+    else assert.equal(fs.existsSync(slotsDir(f)), false, mode);
   }
 });
 

@@ -984,7 +984,6 @@ export class AuthorityStore {
       }
       if (keys.size > max) throw new AuthorityRefusal("authority slot listing exceeds its cap");
     }
-    const listed = new Set<string>();
     let names: string[] = [];
     try {
       if (!(await fsp.lstat(dir)).isDirectory()) throw new AuthorityRefusal("authority slots path is not a directory");
@@ -998,7 +997,6 @@ export class AuthorityStore {
       if (name.startsWith(".") && name.endsWith(".tmp")) continue;
       const m = /^([0-9a-f]{64})\.json$/.exec(name);
       if (!m) throw new AuthorityRefusal("unexpected entry in authority slots");
-      listed.add(m[1]!);
       keys.add(m[1]!);
     }
     if (keys.size > max) throw new AuthorityRefusal("authority slot listing exceeds its cap");
@@ -1007,10 +1005,8 @@ export class AuthorityStore {
       for (let attempt = 0; ; attempt++) {
         try {
           const slot = await this.#load(dir, key, true);
-          if (slot === null) {
-            if (listed.has(key)) throw new AuthorityRefusal("authority slot vanished during listing");
-            break;
-          }
+          // Listed or head-recorded, a key that now reads as absent is an unresolved read inconsistency: refuse.
+          if (slot === null) throw new AuthorityRefusal("authority slot vanished during listing");
           out.push(slot);
           break;
         } catch (error) {
