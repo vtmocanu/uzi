@@ -2922,7 +2922,8 @@ whose assertions are "stop acceptance mismatch" (:263) and "refusal mismatch"
 unstarted arm).
 
 Command (export of f7a795fb1 for u14-* rows, 1b3afe49e for u14r-* rows except
-u14r-cutoff-equal at 039947e1d, a ledger-only child; throwaway postgres `cdr-4202-u14pg`): from api,
+u14r-cutoff-equal at 039947e1d, a ledger-only child, which ran the whole
+test under `-run '^TestWorkerCodexStoppedGuardsRouteLiveDB$'` (one leaf red, 38 pass); throwaway postgres `cdr-4202-u14pg`): from api,
 `GOFLAGS='-p=1 -buildvcs=false' GOMAXPROCS=4 go test -race -count=1 -timeout=6m
 ./internal/handler -run '^TestWorkerCodexStoppedGuardsRouteLiveDB$/^<leaf>$' -v`;
 logs `.uzi/scratch/ctl-logs/<log name>.{diff,log}`.
