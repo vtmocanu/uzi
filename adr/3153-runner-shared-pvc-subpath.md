@@ -375,6 +375,11 @@ Consequence: the hibernation census reports `run-<uuid>` leaves as protected
 (`api/internal/workersvc/hibernation_retirement.go`, `entryBlocker`) records a
 `protected_source` blocker for such a worker until a later pod start's scratch phase reclaims them, if it does
 (the scratch phase must run, deletion be requested, the epoch be eligible and attested, and the run have ended).
+A #4263 retire-scratch binding names its run, so `scanRunBareConfig` keeps that run's
+leaf (`bare_config`) while the binding exists; on a uid-split pod a non-completion binding
+stays `intent` under C-prime, so such a leaf is kept with it (fail closed; an exemption
+backed by settled-binding evidence is open on #4453). See the bare-config readers table in
+the #4263 amendment below.
 
 Deferred, not shipped: deletion at run end (no fence against sibling runner-uid writers
 or Docker-created mounts after the listing, the #4043 deferral), startup throughput,
@@ -711,6 +716,7 @@ cross-check and every in-pass check. Reader-by-reader decisions (abbreviated;
 | ACK reader and runGit config accounting | Entries count toward their caps (1024 entries); the 64-per-bare cap bounds the addition. |
 | Startup inspector | Changed: reads bindings and reports binding-aware reasons. |
 | Attempt-ledger compaction | Changed: an attempt named by a binding keeps its `retired` entry; an unreadable or undecodable binding set keeps every entry; an attempt whose ledger values, on any branch, or a binding name more than one run, clone path or branch keeps every value verbatim, never dropped or collapsed (issue #4263); its binding is kept as `ledger_mismatch`, or `conflict` when a second binding names it. Such a conflict no longer heals by compaction, so readers that already refuse it (terminal attribution `duplicate_attempt`, the recovery source ledger check) keep refusing; normal flows never write a second identity for an attempt id. Cross-bare: compaction reads every other bare's config once, without that bare's lock, and preserves verbatim any attempt id another bare names (a decoded binding or an identified ledger value); while any other bare holds a decoded binding, own values that cannot be attributed to an attempt are kept too. Guarantee: every cross-bare conflict observed in that snapshot is preserved; a mention written after the read is outside it, so if another bare's first binding is written after the scan read none, an own unattributable value may be dropped; by the legitimate-writer argument that value is not about that binding's attempt, so only an earlier reclaim follows (legitimate writers only write fresh-minted ids, `mintAttemptId`: timestamp, claim generation, 64 random bits, or same-bare ids into their own bare under its lock). The scan is bounded (1024 bares, 16 MiB, 131072 records, a 5 s budget checked between reads); on any failure compaction is skipped, the ledger is unchanged and it warns `attempt ledger compaction skipped: foreign retire evidence unavailable` with a fixed reason (`bare_cap`, `bytes_cap`, `records_cap`, `deadline`, `unreadable`, `binding_unknown`, `binding_undecodable`, `ledger_unidentified`). A kept unattributable value is self-sustaining (the refused reclaim leaves its binding, and other bares' compaction skips on it); remediation is an operator-only, unsupported step done with the worker stopped, since compaction computes what to keep from an earlier read and its rewrite could reinstate a value an operator removed after that read. One unreadable or unidentifiable foreign bare disables compaction worker-wide. |
+| Run-leaf retention classifier (`scanRunBareConfig`, issue #4420) | No change to the keep rule. The prefix is not one of its families, so the catch-all keeps the named run's `run-<uuid>` TMPDIR leaf (`bare_config`) while the binding exists: under C-prime a split-pod non-completion binding stays `intent`, so that leaf stays too, and a gone-parent binding cleared by this pass still keeps the leaf for this pass (the scratch phase runs first). Fail closed; pinned in `agent/test/pod-epoch-scratch-run-retention.test.ts`. |
 | Hibernation census (filesystem walk of the runner root) | No change. A bound parent reports `unknown`, which blocks volume retirement conservatively (a residual below). |
 | `backup-runs.sh` config reads | No change. They match exact keys; a retired, discarded clone is not backup material. |
 
@@ -769,6 +775,12 @@ An architect, auditor and reviewer examined two judgments and found no stop.
 
 ### Residuals
 
+- **Retire-phase budget after the run-leaf scratch phase (issue #4420).** The retire
+  phase has no reserved share of the pass: it refuses with `budget_deferred` when less
+  than `RETIRE_PHASE_MIN_MS` (30 s) remains. The #4420 scratch phase spends up to two
+  30 s server reads plus the local classifier per run leaf, so a worker with many run
+  leaves can starve the attempt and retire phases. Everything not reached is kept; no
+  deadline or budget was changed when the two features were merged.
 - **Historical-pod writer.** A worker image without this change writes no
   binding; its parents stay unbound and kept.
 - **Clone substitution before `retire()` starts.** The clone directory is pinned

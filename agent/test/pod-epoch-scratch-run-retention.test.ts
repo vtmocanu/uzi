@@ -10,7 +10,7 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { formatAttemptId } from "../src/attempt-path.js";
-import { GitCache, type EpochScratchRunRetentionOptions } from "../src/git.js";
+import { GitCache, retireBindingKey, retireBindingValue, type EpochScratchRunRetentionOptions } from "../src/git.js";
 import {
   ENDED, classifyCredentialSwitchText, classifyRunDataDirRecords, judgeAuthoritySlot,
   judgeRetainedEvidence, judgeRunRefListing, normalizeRetention, type RetainedEvidenceShape,
@@ -70,6 +70,23 @@ describe("baseline and the bare-config sources", () => {
     assert.deepEqual(await classify(), ENDED, "stamp present alone releases nothing and keeps nothing");
     cfg(`uzi-stopped.${RUN}.entry`, "{}");
     assert.deepEqual(await classify(), active("stopped_marker"), "with another active source the stamp does not release it");
+  });
+
+  it("a #4263 retire-scratch binding naming the run keeps its leaf (bare_config); another run's binding does not", async () => {
+    // Cross-feature pin (#4420 x #4263): the binding key is no attribution prefix, so its value, which always carries
+    // runId, reaches the catch-all and is retention. Under C-prime a split-pod non-completion binding stays `intent`,
+    // so the leaf is kept for as long as the binding exists (fail closed; exemption is follow-up #4453).
+    const binding = (runId: string, uuid: string) => {
+      cfg(retireBindingKey(uuid), retireBindingValue({
+        v: 1, class: "owner_terminal", attemptId: attempt, runId, branch: BRANCH, clonePath,
+        phase: "intent", parentIno: "11", cloneIno: "12", pod: "pod-a",
+      }));
+    };
+    binding(OTHER, "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee");
+    assert.deepEqual(await classify(), ENDED, "another run's binding neither keeps nor releases this leaf");
+    binding(RUN, "aaaaaaaa-bbbb-4ccc-8ddd-ffffffffffff");
+    assert.deepEqual(await classify(), active("bare_config"), "the run's own intent binding keeps its leaf");
+    assert.deepEqual(await classify({}, OTHER), active("bare_config"), "and OTHER's binding keeps OTHER's leaf");
   });
 
   it("a run id that is not a uuid, and a repos root that cannot be enumerated, are unknown", async () => {

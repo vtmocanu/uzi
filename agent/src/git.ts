@@ -2554,7 +2554,9 @@ function attemptLedgerValue(entry: AttemptLedgerEntry): string {
 // writes `settled`; the verified pass deletes no bound parent and only clears the binding of a gone one). The value
 // is canonical JSON (field order below, no whitespace, no device number); a reader accepts ONLY a value
 // that re-serializes to itself. The key prefix is not an attribution prefix and not a protected-record
-// family. Existing readers: the attribution readers ignore the prefix; `collectEpochScratchProtectedPaths` absorbs absolute
+// family. Existing readers: the attribution readers ignore the prefix, except the #4420 run-leaf classifier
+// (`scanRunBareConfig`), whose catch-all keeps a run's TMPDIR leaf while any binding value names the run (fail
+// closed; a split-pod non-completion binding stays `intent`, so that leaf is kept with it); `collectEpochScratchProtectedPaths` absorbs absolute
 // paths from the JSON value into its protected set and returns `unknown` on a valueless `uzi-*` key (both fail closed);
 // binding entries count toward existing readers' config-entry caps (the ACK reader's is 1024). See
 // test/retire-binding-old-readers.test.ts.
@@ -5791,7 +5793,8 @@ export class GitCache {
    * `uzi-trackowner.<branch>.owner` is DELIBERATELY IGNORED (owner decision, issue #4420): it is seed provenance for
    * refs/uzi-runner/<branch> (written by promoteTrackingUnderLock and the attempt repair, read by readTrackingOwner,
    * preserved by cleanupRecoveryGeneration), not retention of a TMPDIR leaf, so its presence neither keeps nor
-   * releases. Any other `uzi-*` key is ignored unless it names the run.
+   * releases. Any other `uzi-*` key is ignored unless it names the run; a #4263 `uzi-retire-scratch.<uuid>.binding`
+   * value always carries its runId, so it keeps that run's leaf for as long as the binding exists.
    */
   private scanRunBareConfig(config: string, id: string): RunRetention | { ledger: Array<AttemptLedgerEntry & { branch: string }> } {
     const protectedFamily = /^uzi-(?:recovery|retained|attempts|stopped|recoveryowner|restore)\./;
@@ -15748,7 +15751,8 @@ export class GitCache {
   }
 
   /** The footprint rule of {@link epochMissingFootprint} for one clone path (read by the retire-scratch phase): the
-   *  `missing` outcome of {@link epochFootprintState}. */
+   *  `missing` outcome of {@link epochFootprintState}. An unsafe clone path still reads the `.uzi-skills-` sibling
+   *  (within the same depth-plus-two-leaves bound); the answer is `false` either way. */
   private async missingFootprintOf(clone: string): Promise<boolean> {
     return (await this.epochFootprintState(clone)) === "missing";
   }
