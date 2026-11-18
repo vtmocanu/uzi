@@ -220,12 +220,14 @@ func (e Env) getenv(k string) string {
 	return e.Getenv(k)
 }
 
-// lookupEnv is the nil-safe accessor for Env.LookupEnv: a nil seam reads as unset.
-func (e Env) lookupEnv(k string) (string, bool) {
+// envSet is the nil-safe presence check over Env.LookupEnv: a nil seam reads as unset.
+// It reports set even for an empty value.
+func (e Env) envSet(k string) bool {
 	if e.LookupEnv == nil {
-		return "", false
+		return false
 	}
-	return e.LookupEnv(k)
+	_, ok := e.LookupEnv(k)
+	return ok
 }
 
 // sshConfig is the nil-safe accessor for Env.SSHConfig: a nil seam is an error.

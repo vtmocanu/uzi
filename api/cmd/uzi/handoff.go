@@ -531,13 +531,13 @@ func (o *originHost) compute(ctx context.Context, env Env) (string, error) {
 	}
 	// (a) transport overrides change where ssh actually connects, in ways ssh -G cannot see.
 	for _, k := range []string{"GIT_SSH", "GIT_SSH_COMMAND"} {
-		if _, ok := env.lookupEnv(k); ok {
+		if env.envSet(k) {
 			return refuse("%s is set, which overrides the ssh transport, so the real host cannot be verified", k)
 		}
 	}
 	// GIT_CONFIG redirects `git config` (only) to one file, so the core.sshCommand lookup
 	// below would not see the scopes git push reads.
-	if _, ok := env.lookupEnv("GIT_CONFIG"); ok {
+	if env.envSet("GIT_CONFIG") {
 		return refuse("GIT_CONFIG is set, which hides the git configuration push uses, so core.sshCommand cannot be checked")
 	}
 	out, gerr := env.Git(".", "config", "--get", "core.sshCommand")
