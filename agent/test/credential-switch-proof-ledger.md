@@ -426,7 +426,7 @@ control is still absent, not that the functional criterion was deferred.
 | Stopped pending-input exclusion for eight named kinds in running and paused states | D controls: sixteen individually executed cases above; U14 credits the applied and superseded carve-outs, the stop-cutoff exemption, its kind restriction and its id boundary (running run; stop only); paused-run carve-out variants, cancel/reject_plan under the cutoff and the cutoff's run correlation not controlled |
 | Paused replay rejects expired wall budget | D: paused_expired_budget; U14 credits the running-clock arm, interactive and unstarted exemptions, extension, finalize and paused seconds, and the NULL-wall coalesce; chat/judge exemption unreachable; the RunTimeout value, the future-started_at clamp and the production default not controlled |
 | Paused replay uses original pause clock and performs no run update | D: paused_replay_original_clock and paused_replay_no_write |
-| Stopped registration nonce equality | D25–D56: running/paused registration_nonce_mismatch; U15 credits the worker-latched generation, epoch and nonce bounds (lower, upper, inclusive edges; nonce empty/length/NUL at the route, UTF-8 at the service entry) (worker identity is credited in the claim-generation row); a NULL snapshot nonce not controlled; resume/reclaim/re-registration are the withdrawn X/Y row |
+| Stopped registration nonce equality | D25–D56: running/paused registration_nonce_mismatch; U15 credits the worker-latched generation, epoch and nonce bounds (lower, upper, inclusive edges; nonce empty/length/NUL at the route; UTF-8 supporting only, uncredited); worker ownership is credited in the claim-generation row; a NULL snapshot nonce not controlled; resume/reclaim/re-registration are the withdrawn X/Y row |
 | Stopped claim generation and unreleased claim | D25–D56: running/paused generation/release without reconciliation; U15 credits the reconciliation path's generation and release refusals (two copies each, Go copy (b)) and worker ownership; the reconciled `*g <= 0` copy not controlled |
 | Stopped frozen secret and capability hash presence | D25–D56: running/paused missing_frozen_secret and missing_capability_hash; U15 credits binding ownership as the composite FK (b); binding identity beyond ownership has no predicate clause and stays unvalidated (owner batch) |
 | Stopped switch-request/generation, ordinary hold, pause-request/mode, stop-kind/reason and reserve-hold markers | D25–D56: individual running/paused marker cases; policy and other competing controls unvalidated |
@@ -2974,7 +2974,7 @@ reconciliation writer normally marks superseded (milestone_reconciliation.go
 `interactive` is set on an issue run; the predicate keys on none of these, so
 the controls stand, but the states are synthetic.
 
-### U15 — stopped bounds, ownership, reconciliation path, statuses and binding ownership (class (d), redundant-fence, (b))
+### U15 — stopped bounds, ownership, reconciliation path, statuses and binding ownership (class (d), redundant-fence, (b); one service-entry unit control, supporting only)
 
 Candidate b52b38e6d9e573dda9663b12b32b9d06e709c948 adds
 api/internal/handler/codex_switch_stopped_authority_bounds_livedb_test.go
@@ -3033,8 +3033,8 @@ GOFLAGS='-p=1 -buildvcs=false' GOMAXPROCS=4 go test -race -count=1 -timeout=6m \
 ```
 
 (`./internal/workersvc -run '^TestCodexSwitchStoppedAuthorityBounds$'` for
-u15-utf8). Mutants and logs: `.uzi/scratch/ctl-logs/u15-*.{diff,log}`; each log
-ends `SHA=b52b38e6d… EXIT=1`. Bounds leaves report at
+u15-utf8). Mutants and logs: `.uzi/scratch/ctl-logs/u15-*.{diff,log}`; each mutant
+log ends `SHA=b52b38e6d… EXIT=1` (u15r-binding-fk at f355da022). Bounds leaves report at
 codex_switch_stopped_authority_bounds_livedb_test.go:67 ("bounds mismatch");
 the ownership leaves at :82, :89 and :110 are `reportStoppedRoute` call sites
 ("refusal mismatch"), :101 is "foreign worker refusal mismatch", :131 is the
@@ -3073,13 +3073,16 @@ u15-first.log (no SHA line) includes one-time schema migration. Hosted effect
 on test-livedb-workersvc and test-api-store-it is unmeasured.
 
 Credit: the worker-latched bounds (generation and epoch lower, upper and the
-inclusive 2^53−1 edge; nonce non-empty, ≤128 bytes inclusive, no NUL, valid
-UTF-8 at the service entry); generation and release refusal on the
+inclusive 2^53−1 edge; nonce non-empty, ≤128 bytes inclusive, no NUL); generation and release refusal on the
 reconciliation path; worker identity (a same-user foreign worker with its own
 current nonce); refusal of the seven statuses outside the live set and
 `claimed` (D); binding ownership as the composite foreign key, identical at
 a233 (the predicate checks presence only, so a foreign binding is refused by
 being unrepresentable).
+
+Supporting only, outside the approved classes: UTF-8 validity (u15-utf8,
+red at the service entry; the route cannot deliver invalid UTF-8, so the guard
+has no route-reachable negative case and it is not credited).
 
 Not credited: the redundant copies individually (no single-copy mutant was
 run; each copy's removal alone is expected to be masked); the NUL guard's
