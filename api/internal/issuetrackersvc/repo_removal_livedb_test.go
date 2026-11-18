@@ -1,6 +1,6 @@
 package issuetrackersvc
 
-// Live-DB tests of the removal markers (PRD #4173 D13, migration 00467): a repo that was ever
+// Live-DB tests of the removal markers (PRD #4173 D13, migration 00475): a repo that was ever
 // enabled stays unlinkable after it is removed and listed again, and a repo that was linked
 // before its removal can never be enabled as a forge-issue repo again. They need
 // UZI_TEST_DATABASE_URL like the rest of link_livedb_test.go.

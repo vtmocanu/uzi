@@ -34,7 +34,7 @@ func InvisibleRune(c rune) bool {
 
 // maxEntityIDLen is the longest project or eligibility tag id the store holds:
 // the issue_tracker_project_id and eligibility_tag_id columns carry a
-// char_length CHECK of 1 to 128 (migration 00466_issue_tracker_repo_link.sql).
+// char_length CHECK of 1 to 128 (migration 00474_issue_tracker_repo_link.sql).
 // entityIDRE has no cap because it also matches listings and user and group
 // ids, so the bound applies only where an id is about to be stored.
 const maxEntityIDLen = 128

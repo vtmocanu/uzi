@@ -109,9 +109,9 @@ WHERE id = $1;
 -- Upserted whenever the membership list is fetched. Never touches `enabled`, so
 -- a re-listing does not un-enable a repo the user already turned on. The insert
 -- branch marks a newly discovered repo awaiting_first_enable (PRD #4173 D13), but the
--- repos trigger from 00467 clears it again when a removal marker says the project was
+-- repos trigger from 00475 clears it again when a removal marker says the project was
 -- enabled before it was removed; the conflict branch never touches it, and the repos
--- trigger from 00466 clears it on first enable.
+-- trigger from 00474 clears it on first enable.
 INSERT INTO repos (connection_id, forge_project_id, path_with_namespace, web_url, default_branch, awaiting_first_enable)
 VALUES ($1, $2, $3, $4, $5, true)
 ON CONFLICT (connection_id, forge_project_id) DO UPDATE

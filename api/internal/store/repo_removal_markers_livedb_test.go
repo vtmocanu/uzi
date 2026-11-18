@@ -10,7 +10,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// Migration 00467 (PRD #4173 D13) against a real Postgres: a delete still reports its row,
+// Migration 00475 (PRD #4173 D13) against a real Postgres: a delete still reports its row,
 // a second removal keeps a linked flag, and Down removes the table and its triggers so a
 // delete and an enable behave as before. Skipped without UZI_TEST_DATABASE_URL.
 func TestRepoRemovalMarkersMigrationLiveDB(t *testing.T) {
@@ -56,7 +56,7 @@ func TestRepoRemovalMarkersMigrationLiveDB(t *testing.T) {
 	}
 
 	// Down: the table and triggers are gone, and the enable that was refused goes through.
-	if err := store.MigrateDownTo(ctx, dsn, 466); err != nil {
+	if err := store.MigrateDownTo(ctx, dsn, 474); err != nil {
 		t.Fatalf("down: %v", err)
 	}
 	if got := count(`SELECT count(*) FROM pg_tables WHERE tablename='repo_removal_markers'`); got != 0 {

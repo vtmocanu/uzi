@@ -13,7 +13,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// Bounds the repos_issue_tracker_link_shape CHECK (migration 00466) enforces.
+// Bounds the repos_issue_tracker_link_shape CHECK (migration 00474) enforces.
 const (
 	maxProjectShortLen = 44
 	maxTagNameLen      = 256

@@ -9,7 +9,7 @@ import (
 )
 
 // Postgres SQLSTATEs the service maps. UZ413 is the issue-number guard's own
-// code (migration 00466).
+// code (migration 00474).
 const (
 	sqlStateForeignKeyViolation = "23503"
 	sqlStateIssueNumberGuard    = "UZ413"

@@ -117,7 +117,7 @@ type LockRepoForEnableForUserRow struct {
 // rows that reference the repo by foreign key (board columns, cards).
 // source_locked: the project was linked before it was removed and this row is not linked, so
 // its issue source cannot change and the enable is refused before any board or label work
-// (the repos trigger from 00467 refuses it too, later and less cheaply).
+// (the repos trigger from 00475 refuses it too, later and less cheaply).
 func (q *Queries) LockRepoForEnableForUser(ctx context.Context, arg LockRepoForEnableForUserParams) (LockRepoForEnableForUserRow, error) {
 	row := q.db.QueryRow(ctx, lockRepoForEnableForUser, arg.ID, arg.UserID)
 	var i LockRepoForEnableForUserRow
@@ -169,7 +169,7 @@ SELECT (
 `
 
 // True when any table that stores an issue number for the repo has such a row. The
-// guard triggers (migration 00466) make this false for an awaiting repo; the link
+// guard triggers (migration 00474) make this false for an awaiting repo; the link
 // checks it anyway as defence in depth. Keep in step with the trigger list there.
 func (q *Queries) RepoStoresIssueNumber(ctx context.Context, repoID uuid.UUID) (bool, error) {
 	row := q.db.QueryRow(ctx, repoStoresIssueNumber, repoID)

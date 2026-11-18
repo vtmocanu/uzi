@@ -99,7 +99,7 @@ CREATE TRIGGER repos_removal_marker_connection_record
 -- board_columns and cards take on the repo row does not conflict. Under READ COMMITTED
 -- the lookup after it takes a fresh snapshot that sees the marker the removal committed.
 -- Without the wait the lookup could run before the removal committed and miss its marker.
--- Triggers of one event fire in name order, so repos_awaiting_first_enable_guard (00466) runs
+-- Triggers of one event fire in name order, so repos_awaiting_first_enable_guard (00474) runs
 -- first and this one second; the guard only clears the marker column or refuses setting it
 -- back, and clearing it here is always allowed, so the order does not matter.
 -- +goose StatementBegin
@@ -125,7 +125,7 @@ CREATE TRIGGER repos_removal_marker_relist
 -- A project that was linked before its removal may not be enabled unlinked: its issues were
 -- numbered by an issue tracker, and the forge's numbers would collide with the agent branches
 -- and merge requests they named. Reads only OLD, NEW and the marker, never
--- awaiting_first_enable, which the 00466 guard rewrites. SQLSTATE UZ414 is this refusal's own
+-- awaiting_first_enable, which the 00474 guard rewrites. SQLSTATE UZ414 is this refusal's own
 -- code (class UZ is not a PostgreSQL class); the provisioning service maps it.
 -- +goose StatementBegin
 CREATE FUNCTION repos_removal_marker_enable_guard() RETURNS trigger AS $$

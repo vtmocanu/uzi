@@ -14,7 +14,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// issue_tracker_repo_link_livedb_test.go proves migration 00466 (PRD #4173 M4) against a
+// issue_tracker_repo_link_livedb_test.go proves migration 00474 (PRD #4173 M4) against a
 // real Postgres on an isolated database: the never-enabled marker and its trigger, the
 // issue-number guard on every table that stores an issue number, the issue_key and link
 // CHECKs, the connection FK, and the link queries. Skipped without UZI_TEST_DATABASE_URL.
@@ -55,7 +55,7 @@ func itlAwaiting(t *testing.T, pool *pgxpool.Pool, repo uuid.UUID) bool {
 }
 
 // itlFixture is a user with a forge connection, an issue tracker connection, a legacy repo
-// (inserted before 00466) and the ids a test needs.
+// (inserted before 00474) and the ids a test needs.
 type itlFixture struct {
 	user, forgeConn, itc, legacy uuid.UUID
 }
@@ -63,8 +63,8 @@ type itlFixture struct {
 func itlMigrateWithLegacyRepo(t *testing.T) (context.Context, string, *pgxpool.Pool, itlFixture) {
 	t.Helper()
 	ctx, dsn := standIsolatedDB(t, "issue_tracker_link_")
-	if err := store.MigrateTo(ctx, dsn, 465); err != nil {
-		t.Fatalf("migrate to 465: %v", err)
+	if err := store.MigrateTo(ctx, dsn, 473); err != nil {
+		t.Fatalf("migrate to 473: %v", err)
 	}
 	pool, err := store.OpenPool(ctx, dsn)
 	if err != nil {
@@ -419,10 +419,10 @@ func TestIssueTrackerRepoLinkMigrationLiveDB(t *testing.T) {
 	})
 }
 
-// TestIssueTrackerRepoLinkDownUpLiveDB runs 00466's Down and Up again.
+// TestIssueTrackerRepoLinkDownUpLiveDB runs 00474's Down and Up again.
 func TestIssueTrackerRepoLinkDownUpLiveDB(t *testing.T) {
 	ctx, dsn, pool, f := itlMigrateWithLegacyRepo(t)
-	if err := store.MigrateDownTo(ctx, dsn, 465); err != nil {
+	if err := store.MigrateDownTo(ctx, dsn, 473); err != nil {
 		t.Fatalf("down: %v", err)
 	}
 	var n int

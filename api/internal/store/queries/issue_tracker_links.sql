@@ -36,7 +36,7 @@ FOR UPDATE OF r;
 -- rows that reference the repo by foreign key (board columns, cards).
 -- source_locked: the project was linked before it was removed and this row is not linked, so
 -- its issue source cannot change and the enable is refused before any board or label work
--- (the repos trigger from 00467 refuses it too, later and less cheaply).
+-- (the repos trigger from 00475 refuses it too, later and less cheaply).
 SELECT r.awaiting_first_enable, r.issue_tracker_connection_id,
        (r.issue_tracker_connection_id IS NULL AND EXISTS (
            SELECT 1 FROM repo_removal_markers m
@@ -49,7 +49,7 @@ FOR NO KEY UPDATE OF r;
 
 -- name: RepoStoresIssueNumber :one
 -- True when any table that stores an issue number for the repo has such a row. The
--- guard triggers (migration 00466) make this false for an awaiting repo; the link
+-- guard triggers (migration 00474) make this false for an awaiting repo; the link
 -- checks it anyway as defence in depth. Keep in step with the trigger list there.
 SELECT (
     EXISTS (SELECT 1 FROM issues WHERE issues.repo_id = $1 AND issues.forge_issue_iid IS NOT NULL)
