@@ -367,4 +367,10 @@ func TestNewSSHConfigCmd(t *testing.T) {
 	if cmd.Stdin != nil || cmd.Stderr != nil {
 		t.Errorf("stdin and stderr must stay unconnected")
 	}
+	// The 5 s bound depends on the ctx killing the ssh child: only exec.CommandContext
+	// installs a Cancel hook (exec.Command leaves it nil), so a regression to
+	// exec.Command — dropping the timeout — fails here.
+	if cmd.Cancel == nil {
+		t.Errorf("Cancel = nil: the command is not bound to its context (exec.CommandContext required)")
+	}
 }
