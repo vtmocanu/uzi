@@ -3360,20 +3360,23 @@ no `expected_epoch requires codex_switch_stopped` refusal, so the decoder,
 service and acknowledgement controls are class (d). The shared strict decoder
 `httpx.DecodeJSONStrictBounded` is byte-identical at a233 (respond.go :133,
 :137, :142), but a233's `WorkerRunState` decoded with `httpx.DecodeJSON`
-(a233 worker_protocol.go around :1482), which truncates at 1 MiB and has no
+(a233 worker_protocol.go:1482), which truncates at 1 MiB and has no
 trailing-value check; the route adopted the strict decoder only with the
-stopped settlement (abb3c7835). Its bound, single-value and unknown-field
-refusals are therefore new on this route, and their controls are class (d),
-not (b). The httpx mutants edit the shared helper, which `DecodeJSONStrict`
-and about 25 other call sites also use; on this route their effect is
+stopped settlement (abb3c7835). The bound and single-value refusals are
+therefore new on this route (class (d), not (b)). Unknown-field refusal did
+exist at a233 (`DecodeJSON` runs `DisallowUnknownFields`, a233 respond.go:112);
+its u18-unknown control is class (d) because the stopped status itself is
+absent at a233 (see "Baseline absence and the class (d) method boundary").
+The httpx mutants edit the shared helper, which `DecodeJSONStrict` and 38
+other call sites in 24 handler files also use; on this route their effect is
 confined to the decodes in `decodeWorkerState`.
 
 Copy census (the route: `WorkerRunState` worker_protocol.go:1541 →
 `decodeWorkerState` → `SetStateReportWithReconciliation` → `setStateWithTx`
 → `stopCodexSwitch`; the route is mounted through `mountWorkerRoutes` on both
-the main router (handler.go:1181) and `WorkerRoutes` (:1210–1230), whose
-middleware (RequireWorker, the lane guard, Recoverer, RequestID) adds no
-body bound or strictness layer):
+the main router (handler.go:1181) and `WorkerRoutes` (:1210–1230; Recoverer
+and RequestID), and `mountWorkerRoutes` itself applies RequireWorker and the
+lane guard (:1238 onwards); none adds a body bound or strictness layer):
 - 1 MiB body bound: the first `DecodeJSONStrictBounded(r, &raw, 1<<20)`
   (worker_state_decode.go:19). The second decode (:49) re-reads the captured
   value; it is a backup bound only for oversize bytes inside the value
@@ -3414,7 +3417,8 @@ Unchanged candidate 3b78045f6: the new route test and the existing
 `TestWorkerStateStoppedStrictBody`, `TestStoppedSettlementAck` and
 `TestWorkerRunStateCodexSwitchStoppedRoute` pass (17 PASS lines, no FAIL or
 SKIP), `SHA=3b78045f6… EXIT=0` (`u18-green.log`); `task lint:api` 0 issues
-(`u18-lint-api.log`). Runtime: (a LiveDB test, skipped when `UZI_TEST_DATABASE_URL` is unset) 4.31 s for the new test in that run (same
+(`u18-lint-api.log`). Runtime: 4.31 s for the new test in that run (a LiveDB test,
+skipped when `UZI_TEST_DATABASE_URL` is unset) (same
 worker, warm cache, migrated schema, one serial run; `u18-first.log` has no
 SHA line and includes migration). Hosted effect unmeasured.
 
@@ -3422,15 +3426,21 @@ Credit: the stopped request is bounded at 1 MiB inclusive (one copy), must be
 one JSON value (one copy), refuses `op_id` and unknown fields (two copies
 each), and `expected_epoch` is refused on a `running` report (two copies);
 the acceptance answers with the stopped acknowledgement (u18-minimal-ack shows
-only that the stopped builder supplies `applied`/`disposition`), whose run
+only that the stopped builder supplies `applied`; the mutant sets
+`disposition` itself, so no control covers it), whose run
 object has exactly four keys (u18-ack-extra-key) and which stays under 16 KiB
 with a 64 KiB plan where the full DTO would not (u18-ack-full-run). The
 three-key envelope count itself is not reached by any mutant.
 
 Not credited: the redundant copies individually; `expected_epoch` on
 statuses other than `running` (the decoder loop is generic, but statuses that
-leave `SetStateReportWithReconciliation` early through the replay paths, or
-after `recordRegistrationEvidence` writes, rely on the decoder copy alone);
+leave `SetStateReportWithReconciliation` early through the replay paths,
+reconciliation.go:171/:177, rely on the decoder copy alone); no-write for a
+`running` report that carries both `registration_evidence` and
+`expected_epoch` (`validateRegistrationEvidence` admits evidence only on
+running reports, and `recordRegistrationEvidence`, reconciliation.go:184,
+writes before the service copy at service.go:4700, so only the decoder copy
+keeps that shape write-free; the leaf sends no evidence);
 the exact limit within `[1<<20, 1<<20 + len(valid))` (a limit raised by fewer
 bytes than the JSON length stays green); the overlap with the decoder unit
 test's own at-bound case; `op_id: null`, missing or
