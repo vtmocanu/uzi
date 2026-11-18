@@ -742,10 +742,9 @@ func TestNewPlacementAC8SizeChangeKeepsNewPlacement(t *testing.T) {
 	}
 }
 
-// The Terminating gate reads each claim with its own Has* flag. On the fenced DinD
-// maintenance path the flags are refreshed but the claim pointers are stale: a claim that
-// the refresh no longer sees must not hold back the create of its replacement.
-func TestNewPlacementTerminatingGateIgnoresStaleClaimPointer(t *testing.T) {
+// A maintenance refresh can remove a claim counted by the frozen placement decision.
+// Defer until a fresh tick rather than creating its replacement under that old decision.
+func TestNewPlacementTerminatingGateDefersStaleClaimPointer(t *testing.T) {
 	cfg := placementConfig()
 	cfg.DockerNamespace = "uzi-workers-docker"
 	cfg.DinDImage = "docker:28-dind-rootless@sha256:deadbeef"
@@ -760,16 +759,85 @@ func TestNewPlacementTerminatingGateIgnoresStaleClaimPointer(t *testing.T) {
 		DinDClaim: claim(dindDataPVCName("w1"), true), // stale: gone in the refreshed flags
 	}
 	deferred, err := m.ensurePVCs(context.Background(), w, obs, cfg.DockerNamespace, testSpec(t, w.Template, w.Size))
-	if err != nil || deferred {
+	if err != nil || !deferred {
 		t.Fatalf("ensurePVCs = %v, %v", deferred, err)
 	}
-	created := createdPVCs(client)
-	p := created[dindDataPVCName("w1")]
-	if len(created) != 1 || p == nil {
-		t.Fatalf("created = %v, want only the dind claim", created)
+	if got := writes(client); len(got) != 0 {
+		t.Fatalf("stale counted claim must defer all writes, got %v", got)
 	}
-	if !isStamped(p) {
-		t.Error("dind claim created unstamped")
+}
+
+// The initial observation counts an unstamped, Terminating DinD claim, so placement
+// is frozen as legacy. If the claim disappears before maintenance's fresh list, no
+// replacement may be minted using that stale decision. The following tick observes
+// only the stamped durable siblings and recreates DinD with the new placement.
+func TestNewPlacementDinDMaintenanceDefersDisappearedCountedClaim(t *testing.T) {
+	cfg := placementConfig()
+	cfg.DockerNamespace = "uzi-workers-docker"
+	cfg.DinDImage = "docker:28-dind-rootless@sha256:deadbeef"
+	w := desiredDocker("w1")
+	w.DindMaintenance = &protocol.DindMaintenance{
+		ID: "op", Phase: "recycling", Fenced: true,
+		DeploymentUID: "old-deployment", PVCUID: "old-dind",
+	}
+	claims := livePVCs(t, cfg, w, true)
+	for _, obj := range claims {
+		p := obj.(*corev1.PersistentVolumeClaim)
+		if p.Name == dindDataPVCName(w.ID) {
+			delete(p.Annotations, AnnotationPlacement)
+			p.UID = "old-dind"
+			now := metav1.NewTime(m5Now)
+			p.DeletionTimestamp = &now
+		}
+	}
+	m, client := npMat(t, cfg, claims...)
+	m.cordoner = &maintenanceFake{op: w.DindMaintenance}
+	ctx := context.Background()
+	observed, err := m.Observe(ctx)
+	if err != nil || len(observed) != 1 {
+		t.Fatalf("initial Observe: %v, %v", observed, err)
+	}
+	obs := observed[0]
+	if !obs.HasDinDDataPVC || obs.DinDClaim == nil || !obs.DinDClaim.Terminating || obs.DinDClaim.PlacementNew {
+		t.Fatalf("initial DinD observation does not describe the unstamped deleting claim: %+v", obs.DinDClaim)
+	}
+	decisions := m.placementDecisions([]protocol.DesiredWorker{w}, map[string]reconcile.ObservedWorker{w.ID: obs})
+	if decisions[w.ID] {
+		t.Fatal("mixed initial claims must freeze legacy placement")
+	}
+	tickCtx := context.WithValue(ctx, placementTickKey{}, decisions)
+	// Finalization completes after Observe, before reconcileDinD re-lists claims.
+	if err := client.CoreV1().PersistentVolumeClaims(cfg.DockerNamespace).Delete(ctx, dindDataPVCName(w.ID), metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	client.ClearActions()
+	handled, err := m.reconcileDinD(tickCtx, w, obs, cfg.DockerNamespace, testSpec(t, w.Template, w.Size))
+	if err != nil || !handled {
+		t.Fatalf("maintenance handled=%v, err=%v", handled, err)
+	}
+	if got := writes(client); len(got) != 0 {
+		t.Fatalf("disappeared counted claim must defer the worker, wrote %v", got)
+	}
+	observed, err = m.Observe(ctx)
+	if err != nil || len(observed) != 1 {
+		t.Fatalf("next Observe: %v, %v", observed, err)
+	}
+	obs = observed[0]
+	decisions = m.placementDecisions([]protocol.DesiredWorker{w}, map[string]reconcile.ObservedWorker{w.ID: obs})
+	if !decisions[w.ID] {
+		t.Fatal("fresh observation of stamped durable siblings must select new placement")
+	}
+	tickCtx = context.WithValue(ctx, placementTickKey{}, decisions)
+	client.ClearActions()
+	handled, err = m.reconcileDinD(tickCtx, w, obs, cfg.DockerNamespace, testSpec(t, w.Template, w.Size))
+	if err != nil || !handled {
+		t.Fatalf("next maintenance handled=%v, err=%v", handled, err)
+	}
+	if !isStamped(npPVC(t, client, cfg.DockerNamespace, dindDataPVCName(w.ID))) {
+		t.Fatal("fresh DinD claim was recreated unstamped")
+	}
+	if got := podPlacement(npDep(t, client, cfg.DockerNamespace, w.ID)); got != "new" {
+		t.Fatalf("replacement Deployment placement=%s, want new", got)
 	}
 }
 

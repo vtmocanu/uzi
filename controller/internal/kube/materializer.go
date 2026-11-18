@@ -954,8 +954,9 @@ func (m *Materializer) recycleWorkerVolumes(ctx context.Context, w protocol.Desi
 // stamped). A Terminating claim holds back every create: during a staggered deletion the
 // decision counts the Terminating claim, so a create made now could be UNSTAMPED, and
 // that unstamped replacement would pin the worker to the legacy placement for good.
-// Each claim is read only together with its own Has* flag: on the fenced DinD maintenance
-// path the flags are refreshed while the claim pointers are the earlier observation's.
+// On the fenced DinD maintenance path the flags are refreshed while the claim pointers
+// belong to the earlier observation that decided placement. A counted claim disappearing
+// defers the worker until the next tick can decide placement from the current claim set.
 func (m *Materializer) ensurePVCs(ctx context.Context, w protocol.DesiredWorker, obs reconcile.ObservedWorker, ns string, spec preset.Spec) (deferred bool, err error) {
 	placementSet := m.cfg.NewPlacementSet()
 	stamp := false
@@ -968,6 +969,9 @@ func (m *Materializer) ensurePVCs(ctx context.Context, w protocol.DesiredWorker,
 			{obs.HasNixPVC, obs.NixClaim},
 			{obs.HasDinDDataPVC, obs.DinDClaim},
 		} {
+			if !c.has && c.claim != nil {
+				return true, nil
+			}
 			if c.has && c.claim != nil && c.claim.Terminating {
 				return false, nil
 			}
