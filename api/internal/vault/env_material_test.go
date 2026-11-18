@@ -295,8 +295,10 @@ func TestEnvMaterialConversionSurvivesWholePageVanishing(t *testing.T) {
 	rows := seedEnv(t, v, st, uid, fixture)
 
 	vanished := map[uuid.UUID]bool{}
+	var lastVanished uuid.UUID
 	hs := &candidateHookStore{fakeVaultStore: st}
 	hs.after = func(page []uuid.UUID) { // the cascade lands after the first page was listed
+		lastVanished = page[len(page)-1]
 		st.mu.Lock()
 		defer st.mu.Unlock()
 		for _, id := range page {
@@ -316,6 +318,14 @@ func TestEnvMaterialConversionSurvivesWholePageVanishing(t *testing.T) {
 	}
 	if len(vanished) != int(maxBatchRows) {
 		t.Fatalf("hook removed %d rows; want one full page of %d", len(vanished), maxBatchRows)
+	}
+	// The listing right after the vanished page must resume from that page's last listed
+	// id; nothing was locked for the page, so a cursor that followed locked rows would not.
+	if len(hs.afterIDs) < 2 {
+		t.Fatalf("listing calls = %d; want at least 2", len(hs.afterIDs))
+	}
+	if got := hs.afterIDs[1]; !got.Valid || got.Bytes != lastVanished {
+		t.Fatalf("second listing AfterID = %+v; want the vanished page's last id %s", got, lastVanished)
 	}
 	resealed := 0
 	for _, r := range rows {

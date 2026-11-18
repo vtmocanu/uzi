@@ -183,6 +183,7 @@ func TestVaultEnvFenceBlocksRepoAndConnectionDeleteLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer func() { _ = txB.Rollback(ctx) }()
 	if _, err := txB.Exec(ctx, `SET LOCAL lock_timeout='300ms'`); err != nil {
 		t.Fatal(err)
 	}
@@ -196,6 +197,7 @@ func TestVaultEnvFenceBlocksRepoAndConnectionDeleteLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer func() { _ = txC.Rollback(ctx) }()
 	if _, err := txC.Exec(ctx, `SET LOCAL lock_timeout='300ms'`); err != nil {
 		t.Fatal(err)
 	}

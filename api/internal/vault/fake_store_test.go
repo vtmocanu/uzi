@@ -7,6 +7,7 @@ import (
 	"sort"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -266,9 +267,12 @@ type candidateHookStore struct {
 	*fakeVaultStore
 	after func(candidates []uuid.UUID)
 	fired bool
+	// afterIDs records the AfterID cursor of every listing call, in call order.
+	afterIDs []pgtype.UUID
 }
 
 func (s *candidateHookStore) ListVaultEnvMaterialCandidates(ctx context.Context, arg store.ListVaultEnvMaterialCandidatesParams) ([]uuid.UUID, error) {
+	s.afterIDs = append(s.afterIDs, arg.AfterID)
 	ids, err := s.fakeVaultStore.ListVaultEnvMaterialCandidates(ctx, arg)
 	if err == nil && len(ids) > 0 && !s.fired && s.after != nil {
 		s.fired = true

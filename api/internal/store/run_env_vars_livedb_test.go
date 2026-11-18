@@ -244,6 +244,28 @@ func TestRunEnvVarQueriesLiveDB(t *testing.T) {
 	if foreignCands, err := tq.ListVaultEnvMaterialCandidates(ctx, ListVaultEnvMaterialCandidatesParams{UserID: foreign}); err != nil || len(foreignCands) != 1 {
 		t.Fatalf("foreign candidates = %d, %v; want only the foreign owner's row", len(foreignCands), err)
 	}
+	// A partial id list locks only those rows: run it first, in its own transaction, before
+	// any full batch has locked everything.
+	partTx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = partTx.Rollback(ctx) }()
+	part, err := q.WithTx(partTx).LockVaultEnvMaterialBatch(ctx, LockVaultEnvMaterialBatchParams{UserID: user, Ids: cands[3:]})
+	if err != nil || len(part) != 3 {
+		t.Fatalf("partial lock = %d rows, %v; want the 3 listed rows", len(part), err)
+	}
+	for i := range part {
+		if part[i].ID != cands[3+i] {
+			t.Fatalf("partial lock row %d is not cands[%d] (ascending order)", i, 3+i)
+		}
+	}
+	vaultMaterialWantLocked(t, pool, "SELECT id FROM run_env_vars WHERE id=$1 FOR UPDATE NOWAIT", cands[3])
+	vaultMaterialWantUnlocked(t, pool, "SELECT id FROM run_env_vars WHERE id=$1 FOR UPDATE NOWAIT", cands[0])
+	if err := partTx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+
 	// The lock batch is owner scoped by id: foreign ids lock nothing, vanished ids are absent.
 	if got, err := tq.LockVaultEnvMaterialBatch(ctx, LockVaultEnvMaterialBatchParams{UserID: foreign, Ids: cands}); err != nil || len(got) != 0 {
 		t.Fatalf("lock under a foreign owner = %d rows, %v; want none", len(got), err)
@@ -258,10 +280,6 @@ func TestRunEnvVarQueriesLiveDB(t *testing.T) {
 		}
 	}
 	vaultMaterialWantLocked(t, pool, "SELECT id FROM run_env_vars WHERE id=$1 FOR UPDATE NOWAIT", batch[0].ID)
-	// A partial id list locks only those rows.
-	if part, err := tq.LockVaultEnvMaterialBatch(ctx, LockVaultEnvMaterialBatchParams{UserID: user, Ids: cands[3:]}); err != nil || len(part) != 3 || part[0].ID != cands[3] {
-		t.Fatalf("partial lock = %d rows, %v", len(part), err)
-	}
 	// The connection and repo fence queries return the owner's env-bearing parents only.
 	if conns, err := tq.LockVaultEnvConnectionsKeyShare(ctx, user); err != nil || len(conns) != 1 || conns[0] != s.conn {
 		t.Fatalf("connection fence = %v, %v; want the owner's one env-bearing connection", conns, err)

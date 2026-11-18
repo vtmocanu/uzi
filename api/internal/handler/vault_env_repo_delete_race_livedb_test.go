@@ -117,6 +117,32 @@ func TestVaultEnableSurvivesRepoDeleteOfWholeEnvPageLiveDB(t *testing.T) {
 	if gone != 0 || resealed != keptRows || other != 0 {
 		t.Fatalf("after enable: deleted-repo rows=%d, kept rows resealed=%d, kept rows left unsealed=%d; want 0, %d, 0", gone, resealed, other, keptRows)
 	}
+	// The surviving rows must open under the DEK with their own name/repo binding.
+	keptRowsSet, err := pool.Query(ctx, `SELECT name, ciphertext, sealed_with FROM run_env_vars WHERE user_id=$1 AND repo_id=$2`, owner, kept)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer keptRowsSet.Close()
+	opened := 0
+	for keptRowsSet.Next() {
+		var name, sealedWith string
+		var ciphertext []byte
+		if err := keptRowsSet.Scan(&name, &ciphertext, &sealedWith); err != nil {
+			t.Fatal(err)
+		}
+		plain, err := h.vault.Open(owner, runenv.AADKind(runenv.ScopeRepo, &kept, true, name), sealedWith, ciphertext)
+		if err != nil || string(plain) != "dummy-"+name {
+			t.Fatalf("kept row %s opened to %q, %v; want %q", name, plain, err, "dummy-"+name)
+		}
+		opened++
+	}
+	if err := keptRowsSet.Err(); err != nil {
+		t.Fatal(err)
+	}
+	keptRowsSet.Close()
+	if opened != keptRows {
+		t.Fatalf("opened %d kept rows; want %d", opened, keptRows)
+	}
 	var mode string
 	if err := pool.QueryRow(ctx, `SELECT vault_mode FROM users WHERE id=$1`, owner).Scan(&mode); err != nil || mode != store.VaultModeProtected {
 		t.Fatalf("vault mode = %q, %v; want protected", mode, err)
