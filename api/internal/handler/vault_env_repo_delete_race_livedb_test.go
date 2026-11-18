@@ -14,9 +14,11 @@ import (
 )
 
 // A repo delete cascades its env rows without the secret-mutation lock. A real vault
-// enable that meets the delete mid-flight must still reseal every surviving env row:
-// the first 64-row page is entirely the deleted repo's rows, so the conversion's first
-// page locks nothing once the delete commits, and the later rows must not be skipped.
+// enable that meets the delete mid-flight must still reseal every surviving env row.
+// With the lock-order fence the conversion blocks at the repo KEY SHARE
+// (LockVaultEnvReposKeyShare) until the delete commits, so the doomed rows are never
+// candidates and the surviving rows are all resealed. The unit test in internal/vault
+// covers the cursor path for a candidate page that vanishes between listing and locking.
 func TestVaultEnableSurvivesRepoDeleteOfWholeEnvPageLiveDB(t *testing.T) {
 	ctx := context.Background()
 	h, _, pool := cliVaultLiveDB(t)
@@ -68,12 +70,17 @@ func TestVaultEnableSurvivesRepoDeleteOfWholeEnvPageLiveDB(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- h.vault.Enable(convCtx, owner, password) }()
 
-	// Wait until the conversion is blocked on a row lock held by B.
+	// Wait until the conversion is blocked at the repo KEY SHARE fence (the
+	// LockVaultEnvReposKeyShare statement) on B's uncommitted delete. A wait of any other
+	// statement (for example the env row lock, which is where an unfenced conversion would
+	// block) does not satisfy this, so dropping the fence fails the test here.
 	deadline := time.Now().Add(20 * time.Second)
 	for {
 		var waiting int
 		if err := pool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity
- WHERE datname=current_database() AND pid<>pg_backend_pid() AND wait_event_type='Lock'`).Scan(&waiting); err != nil {
+ WHERE datname=current_database() AND pid<>pg_backend_pid() AND wait_event_type='Lock'
+   AND wait_event IN ('transactionid','tuple')
+   AND query LIKE '%FROM repos r%' AND query LIKE '%FOR KEY SHARE OF r%'`).Scan(&waiting); err != nil {
 			t.Fatal(err)
 		}
 		if waiting > 0 {

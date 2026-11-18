@@ -120,6 +120,40 @@ func TestEnvMaterialEnableDisableRoundTrip(t *testing.T) {
 	}
 }
 
+// The lock-order fence must come first in convertMaterial: the connection fence, then the
+// repo fence, both before the first measurement of the owner's material and before any
+// material row lock (the real ordering is exercised against PostgreSQL in the store and
+// handler LiveDB suites; this pins that convertMaterial asks for it).
+func TestConvertMaterialTakesEnvFenceBeforeMeasuringOrLocking(t *testing.T) {
+	v, _, st := newTestVaultWithStore(t)
+	uid := uuid.New()
+	st.states[uid] = store.LockVaultAuthStateRow{VaultMode: store.VaultModeUnprotected, VaultEpoch: 2}
+	seedEnv(t, v, st, uid, fixtureEnvRows())
+	st.resetCalls()
+	if err := v.Enable(context.Background(), uid, "current-login-password"); err != nil {
+		t.Fatal(err)
+	}
+	calls := st.callLog()
+	first := func(names ...string) int {
+		for i, c := range calls {
+			for _, n := range names {
+				if c == n {
+					return i
+				}
+			}
+		}
+		t.Fatalf("none of %v was called: %v", names, calls)
+		return -1
+	}
+	conns := first("LockVaultEnvConnectionsKeyShare")
+	repos := first("LockVaultEnvReposKeyShare")
+	totals := first("GetVaultMaterialTotals")
+	batch := first("LockVaultAccountMaterialBatch", "LockVaultSecretMaterialBatch", "LockVaultEnvMaterialBatch")
+	if !(conns < repos && repos < totals && totals < batch) {
+		t.Fatalf("want connections < repos < totals < first material batch lock, got %d, %d, %d, %d in %v", conns, repos, totals, batch, calls)
+	}
+}
+
 func TestEnvMaterialCountsTowardConversionLimit(t *testing.T) {
 	v, _, st := newTestVaultWithStore(t)
 	uid := uuid.New()

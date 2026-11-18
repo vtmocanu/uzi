@@ -17,8 +17,8 @@ const (
 // RunEnvVarDTO is one variable of a repo as the browser and the CLI see it. A secret's
 // value appears in no response, ever: Value is null for it. For a plain variable the
 // value is withheld (Value null, ValueWithheld true) when the vault is locked, no vault
-// is configured, or the value cannot be opened; the list-level VaultLocked says which
-// of these is the locked case.
+// is configured, or the value cannot be opened. On the list, RunEnvListDTO.VaultLocked
+// says whether the vault is locked; a write response carries no such indicator.
 type RunEnvVarDTO struct {
 	// VarID identifies the variable across its versions; a name re-created after a
 	// delete gets a new one, so it keys rows that share a name.

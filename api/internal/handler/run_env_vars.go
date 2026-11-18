@@ -54,8 +54,8 @@ var errRunEnvRepoGone = errors.New("run env: repo not found")
 // before any run_env_vars statement, so a concurrent repo delete (whose cascade takes the
 // env rows) cannot interleave with this write. The lock order of every env writer is:
 // secret-mutation advisory lock, users row, repos row, env rows. The vault conversion
-// (convertMaterial) follows the same order, extended: advisory, users, ..., connections,
-// repos, env rows.
+// (convertMaterial) takes: advisory lock, users row (vault state), connections, repos,
+// accounts, secrets, env rows.
 func lockRunEnvRepo(ctx context.Context, q *store.Queries, repoID uuid.UUID) error {
 	if _, err := q.LockRepoKeyShare(ctx, repoID); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

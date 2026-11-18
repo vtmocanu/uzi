@@ -110,6 +110,7 @@ func (f *fakeVaultStore) HasMasterVaultMaterial(_ context.Context, id uuid.UUID)
 	return false, nil
 }
 func (f *fakeVaultStore) GetVaultMaterialTotals(_ context.Context, id uuid.UUID) (store.GetVaultMaterialTotalsRow, error) {
+	f.record("GetVaultMaterialTotals")
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var t store.GetVaultMaterialTotalsRow
@@ -164,12 +165,14 @@ func (s *totalsHookStore) GetVaultMaterialTotals(ctx context.Context, id uuid.UU
 
 // No account rows are seeded by this crypto fixture.
 func (f *fakeVaultStore) LockVaultAccountMaterialBatch(context.Context, store.LockVaultAccountMaterialBatchParams) ([]store.LockVaultAccountMaterialBatchRow, error) {
+	f.record("LockVaultAccountMaterialBatch")
 	return nil, nil
 }
 func (f *fakeVaultStore) ResealVaultAccountMaterial(context.Context, store.ResealVaultAccountMaterialParams) (int64, error) {
 	return 0, errors.New("fake: account reseal unsupported")
 }
 func (f *fakeVaultStore) LockVaultSecretMaterialBatch(_ context.Context, arg store.LockVaultSecretMaterialBatchParams) ([]store.LockVaultSecretMaterialBatchRow, error) {
+	f.record("LockVaultSecretMaterialBatch")
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var matching []*fakeSecret
@@ -203,9 +206,11 @@ func (f *fakeVaultStore) ResealVaultSecretMaterial(_ context.Context, arg store.
 	return 0, nil
 }
 func (f *fakeVaultStore) LockVaultEnvConnectionsKeyShare(context.Context, uuid.UUID) ([]uuid.UUID, error) {
+	f.record("LockVaultEnvConnectionsKeyShare")
 	return nil, nil
 }
 func (f *fakeVaultStore) LockVaultEnvReposKeyShare(context.Context, uuid.UUID) ([]uuid.UUID, error) {
+	f.record("LockVaultEnvReposKeyShare")
 	return nil, nil
 }
 func (f *fakeVaultStore) ListVaultEnvMaterialCandidates(_ context.Context, arg store.ListVaultEnvMaterialCandidatesParams) ([]uuid.UUID, error) {
@@ -230,6 +235,7 @@ func (f *fakeVaultStore) ListVaultEnvMaterialCandidates(_ context.Context, arg s
 	return out, nil
 }
 func (f *fakeVaultStore) LockVaultEnvMaterialBatch(_ context.Context, arg store.LockVaultEnvMaterialBatchParams) ([]store.LockVaultEnvMaterialBatchRow, error) {
+	f.record("LockVaultEnvMaterialBatch")
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var matching []*fakeEnv

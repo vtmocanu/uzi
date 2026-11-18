@@ -794,7 +794,7 @@ const getCodeCrossCheckRepoInputsForUpdate = `-- name: GetCodeCrossCheckRepoInpu
 SELECT repo.code_cross_check_guidance, repo.cross_check_repo_instructions_enabled
 FROM repos repo JOIN forge_connections c ON c.id = repo.connection_id
 WHERE repo.id = $1 AND c.user_id = $2
-FOR UPDATE OF repo
+FOR NO KEY UPDATE OF repo
 `
 
 type GetCodeCrossCheckRepoInputsForUpdateParams struct {
@@ -808,6 +808,12 @@ type GetCodeCrossCheckRepoInputsForUpdateRow struct {
 }
 
 // Called only after locking and validating the current owned lead generation.
+// FOR NO KEY UPDATE, not FOR UPDATE: it still conflicts with every UPDATE of repos, FOR SHARE
+// and DELETE, which is all freezing the repo inputs needs, but it does not conflict with
+// KEY SHARE. That compatibility is deliberate: the vault conversion holds the users row FOR
+// UPDATE and then takes KEY SHARE on the owner's env-bearing repos (LockVaultEnvReposKeyShare,
+// convertMaterial in internal/vault/conversion.go), while the child-run insert that follows
+// this read needs KEY SHARE on the users row. FOR UPDATE here would close that cycle (40P01).
 func (q *Queries) GetCodeCrossCheckRepoInputsForUpdate(ctx context.Context, arg GetCodeCrossCheckRepoInputsForUpdateParams) (GetCodeCrossCheckRepoInputsForUpdateRow, error) {
 	row := q.db.QueryRow(ctx, getCodeCrossCheckRepoInputsForUpdate, arg.RepoID, arg.UserID)
 	var i GetCodeCrossCheckRepoInputsForUpdateRow

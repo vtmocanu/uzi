@@ -284,14 +284,17 @@ func (v *Vault) convertMaterial(ctx context.Context, q Store, userID uuid.UUID, 
 		}
 		cursor = pgtype.UUID{Bytes: lastCandidate, Valid: true}
 	}
-	// The recount compares the pre-reseal sizes accumulated in progress with the
-	// post-reseal sizes GetVaultMaterialTotals measures, so it relies on resealing
-	// preserving ciphertext length (master_aad and dek sealing share the same overhead).
+	// progress counts the pre-reseal sizes of the rows this pass locked and compares them
+	// with totals, which was measured before any row was resealed. Only the fresh
+	// fallback below reads post-reseal sizes. Both comparisons, and the totals model as a
+	// whole, rely on resealing preserving ciphertext length (every mode is AES-GCM:
+	// nonce plus a constant tag).
 	if progress.rows != totals.MaterialRows || progress.bytes != totals.CiphertextBytes {
-		// A repo or forge-connection delete cascades its env rows without the secret-mutation
-		// lock (and the fresh read relies on READ COMMITTED, postgres.go), so an env
-		// row not yet locked can vanish after the first measurement. Every row is locked
-		// now, so one fresh read is the settled total: accept it only on an exact match.
+		// The fence above is taken before the first measurement, so no env row can vanish
+		// to a repo or forge-connection delete (which cascades env rows without the
+		// secret-mutation lock) during this conversion. This branch stays defensive: one
+		// fresh read (READ COMMITTED, postgres.go) is the settled total, accepted only on
+		// an exact match.
 		fresh, err := q.GetVaultMaterialTotals(ctx, userID)
 		if err != nil {
 			return err
