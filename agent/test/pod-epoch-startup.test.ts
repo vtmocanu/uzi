@@ -66,7 +66,7 @@ function contract(text: string): void {
   // The scratch dependencies are passed after the runtime TMPDIR was restored (restore < shadow above) and
   // carry no scratch gate sentinel or test seam.
   assert.match(main.slice(shadow, admission),
-    /scratch: buildPodEpochScratchDeps\(\{\s*git, dockerHost: config.dockerWiring.dockerHost, activation: epochScratchDeletion,\s*authority: \{\s*peekSlot: \(clonePath, bound\) => authority\.peekSlot\(clonePath, bound\), peekAllSlots: \(max, bound\) => authority\.peekAllSlots\(max, bound\),\s*inspectMaintenance: runId => new RecoveryMaintenance\(\{\s*root: path\.join\(config\.dataDir, "recovery-maintenance"\), workerToken: config\.workerToken,\s*\}\)\.inspectRun\(runId\),\s*\}, outbox,\s*\}\)/,
+    /scratch: buildPodEpochScratchDeps\(\{\s*git, dockerHost: config.dockerWiring.dockerHost, activation: epochScratchDeletion,\s*authority: \{\s*peekSlot: \(clonePath, bound\) => authority\.peekSlot\(clonePath, bound\), peekAllSlots: \(max, bound\) => authority\.peekAllSlots\(max, bound\),\s*inspectMaintenance: \(runId, bound\) => new RecoveryMaintenance\(\{\s*root: path\.join\(config\.dataDir, "recovery-maintenance"\), workerToken: config\.workerToken,\s*\}\)\.inspectRun\(runId, bound\),\s*\}, outbox,\s*\}\)/,
     "the pass receives the production scratch dependencies, including the read-only authority slot accessors, the authenticated maintenance reader and the outbox");
   assert.ok(!main.includes("scratchTestGate") && !main.includes("seams"), "main never passes the scratch test gate or seams");
   const cancellation = at("if (controller.signal.aborted) {");
@@ -194,6 +194,7 @@ function admissionPorts(shadow: (options: Record<string, unknown>) => Promise<un
   const events: string[] = [];
   const peeked: string[] = [];
   const maintenanceBuilt: unknown[] = [];
+  const maintenanceBounds: unknown[] = [];
   const controller = new AbortController();
   const ports = {
     controller, reap: undefined, startupReapVerdict: () => "run",
@@ -202,7 +203,7 @@ function admissionPorts(shadow: (options: Record<string, unknown>) => Promise<un
     epochBootstrap: {}, epochOwnership: {}, epochConsumption: {},
     config: { dockerWiring: { dockerHost: "unix:///docker.sock" }, dataDir: "/data", workerToken: "tok" }, git: {}, client: {},
     path: { join: (...parts: string[]) => parts.join("/") },
-    RecoveryMaintenance: class { constructor(readonly options: unknown) { maintenanceBuilt.push(options); } async inspectRun(id: string) { peeked.push(`maintenance:${id}`); return "absent"; } },
+    RecoveryMaintenance: class { constructor(readonly options: unknown) { maintenanceBuilt.push(options); } async inspectRun(id: string, bound?: unknown) { peeked.push(`maintenance:${id}`); maintenanceBounds.push(bound); return "absent"; } },
     authority: {
       peekSlot: async (clonePath: string) => { peeked.push(clonePath); return null; },
       peekAllSlots: async (max: number) => { peeked.push(`all:${max}`); return []; },
@@ -213,7 +214,7 @@ function admissionPorts(shadow: (options: Record<string, unknown>) => Promise<un
     log: { info: (message: string, fields: unknown) => { events.push(message); assert.ok(fields); } },
     worker: { run: async (signal: AbortSignal) => { assert.equal(signal, controller.signal); events.push("run"); } },
   };
-  return { ports, events, peeked, maintenanceBuilt, controller, run: () => executeBoundary('let lifecyclePhase;\n' + admissionBody, ports) };
+  return { ports, events, peeked, maintenanceBuilt, maintenanceBounds, controller, run: () => executeBoundary('let lifecyclePhase;\n' + admissionBody, ports) };
 }
 
 test("main waits for shadow handover, forwards its ports and logs a defined verdict before admission", async () => {
@@ -242,11 +243,15 @@ test("main waits for shadow handover, forwards its ports and logs a defined verd
     assert.equal(typeof peek, "function");
     assert.notEqual(scratch.authority, fixture.ports.authority, "only the read-only accessor is handed over, not the authority");
     assert.deepEqual(Object.keys(scratch.authority as object).sort(), ["inspectMaintenance", "peekAllSlots", "peekSlot"]);
-    const accessors = scratch.authority as { peekAllSlots: (max: number) => Promise<unknown>; inspectMaintenance: (id: string) => Promise<unknown> };
+    const accessors = scratch.authority as { peekAllSlots: (max: number) => Promise<unknown>; inspectMaintenance: (id: string, bound?: { signal: AbortSignal; deadline: number }) => Promise<unknown> };
     void peek("/clone/x");
     void accessors.peekAllSlots(7);
-    void accessors.inspectMaintenance("run-1");
+    const bound = { signal: new AbortController().signal, deadline: 1_234_567 };
+    void accessors.inspectMaintenance("run-1", bound);
     assert.deepEqual(fixture.peeked, ["/clone/x", "all:7", "maintenance:run-1"], "the accessors delegate to the authority and the maintenance ledger");
+    assert.equal(fixture.maintenanceBounds.length, 1);
+    assert.equal((fixture.maintenanceBounds[0] as typeof bound).signal, bound.signal, "the bound's signal reaches inspectRun by identity");
+    assert.equal((fixture.maintenanceBounds[0] as typeof bound).deadline, 1_234_567, "the bound's deadline reaches inspectRun");
     assert.deepEqual(fixture.maintenanceBuilt, [{ root: "/data/recovery-maintenance", workerToken: "tok" }],
       "the maintenance reader is authenticated with the worker token over the data dir's ledger");
     assert.equal(scratch.dockerHost, "unix:///docker.sock");

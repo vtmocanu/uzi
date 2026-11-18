@@ -1302,7 +1302,7 @@ async function attachRunWorld(w: World): Promise<RunWorld> {
   scratch.authority = {
     peekSlot: clonePath => rw.peek(clonePath) as never,
     peekAllSlots: async () => rw.slots as never,
-    inspectMaintenance: runId => new RecoveryMaintenance({ root: join(fx.dataDir, "recovery-maintenance"), workerToken: "fixture" }).inspectRun(runId),
+    inspectMaintenance: (runId, bound) => new RecoveryMaintenance({ root: join(fx.dataDir, "recovery-maintenance"), workerToken: "fixture" }).inspectRun(runId, bound),
   };
   scratch.outbox = outbox;
   const prior = w.cleanup;
@@ -1825,6 +1825,90 @@ for (const mode of ["abort", "deadline"] as const) {
     });
   }
 }
+
+/** A real, authenticated recovery-maintenance table holding one finished cycle of ANOTHER run, so RUN_A has no cycle (ended). */
+async function seedMaintenanceTable(rw: RunWorld): Promise<string> {
+  const root = join(fs.realpathSync(rw.fx.dataDir), "recovery-maintenance");
+  const ledger = new RecoveryMaintenance({ root, workerToken: "fixture" });
+  const admitted = await ledger.admit({
+    identity: { run: RUN_B, generation: 1, hold: "hold", repo: "repo", custodian: "worker", bareBasename: "x.git",
+      origin: "a".repeat(64), originalSource: "b".repeat(64), sourceConfig: "c".repeat(64) },
+    config: RecoveryMaintenance.configuration(), exactCustody: true, terminalNonStopped: true, source: "b".repeat(64),
+  });
+  assert.ok(admitted.ok);
+  assert.ok((await ledger.finish(admitted.value, "transient")).ok);
+  return root;
+}
+
+/**
+ * The real recovery-maintenance read of a run leaf through the real runPodEpochShadow: the first read of complete.json is
+ * held while the pass is interrupted. The read must finish and close its handle, initialized.json must never be opened, and
+ * the pass must wait for the held read and then resolve (deadline) or stop (abort) without discarding the leaf.
+ */
+async function interruptMaintenanceThroughEpoch(mode: "abort" | "deadline") {
+  await withRunWorld([leafOf(RUN_A)], async (w, rw) => {
+    await seedRetiredAttempt(rw, RUN_A);
+    const root = await seedMaintenanceTable(rw);
+    let clock = 0, jumpedAt = 0;
+    if (mode === "deadline") {
+      w.options.now = () => clock;
+      const ownership = w.options.client.getRunOwnership;
+      w.options.client.getRunOwnership = async (...args) => {
+        clock = 600_000 - 5000 - EPOCH_DEADLINE_LEFT_MS; jumpedAt = Date.now();
+        return ownership(...args);
+      };
+    }
+    const ins = instrumentFs({ op: "read", path: join(root, "complete.json"), nth: 1 });
+    try {
+      await ins.install();
+      const pass = runPodEpochShadow(w.options);
+      let settled = false;
+      pass.then(() => { settled = true; }, () => { settled = true; });
+      try {
+        let reachTimer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          await Promise.race([ins.reached, new Promise<void>((_, reject) => {
+            reachTimer = setTimeout(() => reject(new Error("the held maintenance read was never reached")), 10_000);
+          })]);
+        } finally { clearTimeout(reachTimer); }
+        if (mode === "abort") w.parent.abort();
+        else while (Date.now() - jumpedAt < EPOCH_DEADLINE_LEFT_MS + 400) await new Promise(resolve => setTimeout(resolve, 50));
+        for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve));
+        assert.equal(settled, false, "epoch handover waits: the pass does not resolve while the started read is in flight");
+      } finally { ins.release(); }
+      const result = (await pass)!;
+      const mine = ins.log.filter(r => r.path.startsWith(root));
+      assert.equal(mine.some(r => r.op === "open" && r.path === join(root, "initialized.json")), false, "initialized.json is never opened");
+      assert.equal(mine.filter(r => r.op === "close").length, mine.filter(r => r.op === "open").length, "every opened maintenance handle was closed");
+      if (mode === "deadline") {
+        assert.deepEqual(keptRun(result), { run_local_unknown: 1 });
+        assert.deepEqual(result.scratch.run_local_sources, { classifier: 1 });
+      } else {
+        assert.equal(result.scratch.state, "stopped");
+        assert.deepEqual(keptRun(result), {});
+      }
+      assert.deepEqual(w.calls.discards, []);
+      assert.equal(result.scratch.deleted, 0);
+      await untouched(w, [leafOf(RUN_A)]);
+    } finally { ins.restore(); }
+  });
+}
+
+for (const mode of ["abort", "deadline"] as const) {
+  test(`#4420 through the epoch: ${mode} while the real recovery-maintenance complete.json read is held keeps the leaf, never opens initialized.json, and the pass waits then resolves`, FD_ONLY, async () => {
+    await interruptMaintenanceThroughEpoch(mode);
+  });
+}
+
+test("#4420 control: a run with a real present maintenance table holding no cycle of it is ended and its leaf is reclaimed", FD_ONLY, async () => {
+  await withRunWorld([leafOf(RUN_A)], async (w, rw) => {
+    await seedRetiredAttempt(rw, RUN_A);
+    await seedMaintenanceTable(rw);
+    const result = await run(w);
+    assert.deepEqual(keptRun(result), {});
+    assert.deepEqual(w.calls.discards, [leafOf(RUN_A)]);
+  });
+});
 
 test("#4420 kept run_local_active: the run's recovery record, a journal naming the clone, a live ledger, outbox protection and an in-flight credential switch", FD_ONLY, async () => {
   const cases: Array<[string, string, (rw: RunWorld) => Promise<void>]> = [

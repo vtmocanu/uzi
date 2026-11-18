@@ -2725,7 +2725,7 @@ export interface EpochScratchRunRetentionOptions {
   /** Read-only, bounded enumeration of every authority slot (AuthorityRuntime.peekAllSlots); absent makes the run unknown (`authority_inventory`). */
   peekAllSlots?: (max: number, bound?: AuthorityReadBound) => Promise<SlotSnapshot[]>;
   /** The authenticated recovery-maintenance read (RecoveryMaintenance.inspectRun); absent makes a present maintenance store unknown. */
-  inspectMaintenance?: (runId: string) => Promise<MaintenanceInspection>;
+  inspectMaintenance?: (runId: string, bound?: AuthorityReadBound) => Promise<MaintenanceInspection>;
 }
 
 /** The server's lifecycle verdict for a run, read by the caller (never by GitCache) before it
@@ -5151,7 +5151,8 @@ export class GitCache {
     if (await this.custodyHeld(runId)) return activeRetention("custody");
     return classifyRunDataDirRecords(path.dirname(this.reposRoot), id, {
       interrupt: () => this.checkRecoveryInterruption(), maxDirectoryEntries: limits.maxDirectoryEntries,
-      ...(opts.inspectMaintenance ? { inspectMaintenance: opts.inspectMaintenance } : {}),
+      // The classifier's own interruption bound travels with every maintenance read.
+      ...(opts.inspectMaintenance ? { inspectMaintenance: (id: string) => opts.inspectMaintenance!(id, { signal: opts.signal, deadline: opts.deadline }) } : {}),
     });
   }
 

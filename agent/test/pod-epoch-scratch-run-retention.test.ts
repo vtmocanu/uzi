@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
+import fsp from "node:fs/promises";
 import path from "node:path";
 import { formatAttemptId } from "../src/attempt-path.js";
 import { GitCache, type EpochScratchRunRetentionOptions } from "../src/git.js";
@@ -43,8 +44,8 @@ function options(over: Partial<EpochScratchRunRetentionOptions> = {}): EpochScra
 }
 const TOKEN = "fixture";
 /** The production reader: the authenticated recovery-maintenance validator over the fixture's data dir. */
-const inspectMaintenance = (): ((runId: string) => ReturnType<RecoveryMaintenance["inspectRun"]>) =>
-  runId => new RecoveryMaintenance({ root: path.join(fx.dataDir, "recovery-maintenance"), workerToken: TOKEN }).inspectRun(runId);
+const inspectMaintenance = (): ((runId: string, bound?: { signal: AbortSignal; deadline: number }) => ReturnType<RecoveryMaintenance["inspectRun"]>) =>
+  (runId, bound) => new RecoveryMaintenance({ root: path.join(fx.dataDir, "recovery-maintenance"), workerToken: TOKEN }).inspectRun(runId, bound);
 const classify = (over: Partial<EpochScratchRunRetentionOptions> = {}, runId = RUN) => git.classifyEpochScratchRunRetention(runId, options(over));
 const active = (source: string) => ({ state: "active", source });
 const unknown = (source: string) => ({ state: "unknown", source });
@@ -760,6 +761,57 @@ describe("dataDir records", () => {
     assert.deepEqual(await records(), ENDED, "restored");
     fs.rmSync(path.join(root, "initialized.json"));
     assert.deepEqual(await records(), unknown("recovery_maintenance"), "the pair is written together: one without the other is not 'absent'");
+  });
+
+  it("recovery-maintenance: the classifier's own signal and deadline are the bound handed to the maintenance reader", async () => {
+    fs.mkdirSync(dataPath("recovery-maintenance"));
+    const controller = new AbortController(), deadline = Date.now() + 123_456;
+    const bounds: unknown[] = [];
+    const result = await classify({ signal: controller.signal, deadline, inspectMaintenance: async (_id: string, bound?: unknown) => { bounds.push(bound); return "active" as const; } });
+    assert.deepEqual(result, active("recovery_maintenance"));
+    assert.equal(bounds.length, 1);
+    assert.ok(bounds[0], "a bound is handed over");
+    const bound = bounds[0] as { signal: AbortSignal; deadline: number };
+    assert.equal(bound.signal, controller.signal);
+    assert.equal(bound.deadline, deadline);
+  });
+
+  it("recovery-maintenance: a real ended table is ended; a deadline passing while the complete.json read is held stops before initialized.json and is unknown (classifier)", async t => {
+    const root = dataPath("recovery-maintenance");
+    await admitCycle(root, RUN, "complete");
+    assert.deepEqual(await classify(), ENDED, "control: no interruption");
+    let clock = Date.now();
+    t.mock.method(Date, "now", () => clock);
+    const opened: string[] = [], closed: string[] = [];
+    let release!: () => void, entered!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const reached = new Promise<void>(resolve => { entered = resolve; });
+    const realOpen = fsp.open.bind(fsp);
+    t.mock.method(fsp, "open", async (...args: Parameters<typeof fsp.open>) => {
+      const handle = await realOpen(...args);
+      const name = path.basename(String(args[0]));
+      if (name !== "complete.json" && name !== "initialized.json") return handle;
+      opened.push(name);
+      const read = handle.read.bind(handle), close = handle.close.bind(handle);
+      (handle as { read: unknown }).read = async (...rest: unknown[]) => {
+        if (name === "complete.json" && !closed.length) { entered(); await gate; }
+        return (read as (...a: unknown[]) => Promise<unknown>)(...rest);
+      };
+      (handle as { close: unknown }).close = async () => { closed.push(name); return close(); };
+      return handle;
+    });
+    const deadline = clock + 60_000;
+    let settled = false;
+    const pass = classify({ deadline }).finally(() => { settled = true; });
+    try {
+      await reached;
+      clock = deadline + 1;
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(settled, false, "the held read is awaited, never abandoned");
+    } finally { release(); }
+    assert.deepEqual(await pass, unknown("classifier"));
+    assert.deepEqual(opened, ["complete.json"], "initialized.json is never opened once the deadline passed");
+    assert.deepEqual(closed, ["complete.json"]);
   });
 
   it("recovery-maintenance: a legacy unauthenticated shape, a leftover initialisation stage and a missing validator are unknown; absent is ended", async () => {

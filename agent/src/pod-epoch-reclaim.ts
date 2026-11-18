@@ -110,7 +110,7 @@ export interface PodEpochScratchDeps {
     /** Read-only, bounded enumeration of every slot (AuthorityRuntime.peekAllSlots). Absent keeps every run (`authority_inventory`). */
     peekAllSlots?(max: number, bound?: AuthorityReadBound): Promise<SlotSnapshot[]>;
     /** The authenticated recovery-maintenance read (RecoveryMaintenance.inspectRun). Absent keeps a run while that store exists. */
-    inspectMaintenance?(runId: string): Promise<MaintenanceInspection>;
+    inspectMaintenance?(runId: string, bound?: AuthorityReadBound): Promise<MaintenanceInspection>;
   };
   /** Issue #4420: the worker's outbox (initialised before this pass). Absent or unusable keeps every `run-<uuid>` leaf (`outbox`). */
   outbox?: Pick<Outbox, "isDisabled" | "unusableRootReason" | "hasPhysicalTerminalProtection" | "listPendingFinalizeGenerations" |
@@ -480,7 +480,7 @@ async function runLeafKeep(ctx: ScratchContext, name: string): Promise<(typeof R
         lifecycle, holds, signal: controller.signal, deadline: ctx.deadlineAt(), discovery: ctx.runDiscovery, memo: ctx.runMemo,
         ...(peek ? { peekSlot: (clonePath: string, bound?: AuthorityReadBound) => peek.peekSlot(clonePath, bound) } : {}),
         ...(peek?.peekAllSlots ? { peekAllSlots: (max: number, bound?: AuthorityReadBound) => peek.peekAllSlots!(max, bound) } : {}),
-        ...(peek?.inspectMaintenance ? { inspectMaintenance: (id: string) => peek.inspectMaintenance!(id) } : {}),
+        ...(peek?.inspectMaintenance ? { inspectMaintenance: (id: string, bound?: AuthorityReadBound) => peek.inspectMaintenance!(id, bound) } : {}),
       }), ctx.hardPass));
     } catch (error) { rethrow(error); local = unknownRetention("classifier"); }
   }

@@ -1289,9 +1289,9 @@ async function mainBody(): Promise<void> {
         git, dockerHost: config.dockerWiring.dockerHost, activation: epochScratchDeletion,
         authority: {
           peekSlot: (clonePath, bound) => authority.peekSlot(clonePath, bound), peekAllSlots: (max, bound) => authority.peekAllSlots(max, bound),
-          inspectMaintenance: runId => new RecoveryMaintenance({
+          inspectMaintenance: (runId, bound) => new RecoveryMaintenance({
             root: path.join(config.dataDir, "recovery-maintenance"), workerToken: config.workerToken,
-          }).inspectRun(runId),
+          }).inspectRun(runId, bound),
         }, outbox,
       }),
     });
