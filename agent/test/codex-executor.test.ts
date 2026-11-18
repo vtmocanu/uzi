@@ -33248,6 +33248,7 @@ describe("M2 actualRunner credential replacement", () => {
         let aRefreshesAfterFinish = 0;
         let retiredATransportCounts: { before: number[]; after: number[] } | undefined;
         let bRefreshExpectedAtFinish: typeof bRefreshExpected | undefined;
+        let bRefreshAnsweredBeforeFinish: boolean | undefined;
         let retiredAAfterFinish: unknown;
         const bRefreshExpected: (Parameters<WorkerClient["refreshCodex"]>[2] | undefined)[] = [];
         const refreshDelivered = installerBarrier(), refreshResponded = installerBarrier();
@@ -33467,8 +33468,9 @@ describe("M2 actualRunner credential replacement", () => {
               if (publication === "subscription-refresh") {
                 await withTimeout(refreshDelivered.promise, 5000, "B startup refresh delivered to auth owner");
                 assert.equal(refreshDeliveries, 1);
-                assert.equal(b.transport.responses.some(response => response.requestId === 91), false,
-                  "startup refresh remains deferred through full B preparation");
+                // Recorded here and asserted in the final block: a throw inside this
+                // production-called hook would only retain the switch.
+                bRefreshAnsweredBeforeFinish = b.transport.responses.some(response => response.requestId === 91);
               }
               await lease.finishB(...args);
               bFinished = true;
@@ -34403,8 +34405,9 @@ describe("M2 actualRunner credential replacement", () => {
                 }
                 assert.throws(() => owners[0]!.guard(), /authority|aborted|admission|closed/i);
                 // Codex switch publication keeps Now refresh and child dispatch gated: with the
-                // minimum Now interval elapsed, this trigger reaches Now's scheduler, which must
-                // still construct nothing before finishB (its zero-delay timer runs before the join).
+                // minimum Now interval elapsed, this trigger reaches Now's gate (the frame goes to
+                // observeFrame directly); a gate opened early would arm a zero-delay timer that
+                // runs before the join below. On the candidate the gate stays closed.
                 clockOffset += 300001;
                 await triggerNow(`held-${barrier.stage}`);
                 await new Promise<void>(resolve => setTimeout(resolve, 0));
@@ -35359,6 +35362,7 @@ describe("M2 actualRunner credential replacement", () => {
             assert.deepEqual(retiredATransportCounts.after, retiredATransportCounts.before, "retired A refresh sends nothing on A or B transport");
           }
           if (publication === "subscription-refresh") {
+            assert.equal(bRefreshAnsweredBeforeFinish, false, "startup refresh remains deferred through full B preparation");
             assert.ok(next.auth_mode === "subscription");
             assert.deepEqual(bRefreshExpectedAtFinish, [{ authMode: "subscription", chatgptAccountId: next.chatgpt_account_id }],
               "B refresh expectation names B's account");
