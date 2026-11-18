@@ -18,10 +18,8 @@ ALTER TABLE user_secrets ADD CONSTRAINT user_secrets_provider_fkey
 -- are NOT VALID here (no full scan under the lock), validated in 00478.
 ALTER TABLE user_secrets ADD CONSTRAINT user_secrets_provider_key_check
     CHECK ((kind = 'anthropic_compatible_key') = (provider_id IS NOT NULL)) NOT VALID;
--- One key per (user, provider).
-CREATE UNIQUE INDEX user_secrets_one_provider_key
-    ON user_secrets (user_id, provider_id)
-    WHERE provider_id IS NOT NULL;
+-- One key per (user, provider) is enforced by the concurrent index migration.
+-- Keep its table scan out of this transaction's ACCESS EXCLUSIVE table lock.
 
 -- +goose Down
 SET LOCAL lock_timeout = '5s';
@@ -38,7 +36,6 @@ BEGIN
 END
 $$;
 -- +goose StatementEnd
-DROP INDEX user_secrets_one_provider_key;
 ALTER TABLE user_secrets DROP CONSTRAINT user_secrets_provider_key_check;
 ALTER TABLE user_secrets DROP CONSTRAINT user_secrets_provider_fkey;
 ALTER TABLE user_secrets DROP COLUMN provider_id;
