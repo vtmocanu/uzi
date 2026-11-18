@@ -20,6 +20,7 @@ type handoffRecorder struct {
 	gitCalls [][]string
 	gitOut   map[string]string
 	gitErr   map[string]error
+	sshCfg   *sshConfigRecorder
 }
 
 func (r *handoffRecorder) git(_ string, args ...string) (string, error) {
@@ -61,12 +62,44 @@ func handoffEnv(fc *uzicli.FakeClient, rec *handoffRecorder) (Env, *handoffClien
 		rec.gitOut["remote get-url origin"] = "https://github.com/acme/widgets.git"
 	}
 	if len(fc.Repos) == 0 {
-		fc.Repos = []apitypes.RepoDTO{{ID: "p1", PathWithNamespace: "acme/widgets"}}
+		fc.Repos = []apitypes.RepoDTO{{ID: "p1", PathWithNamespace: "acme/widgets", WebURL: "https://github.com/acme/widgets"}}
 	}
+	// An ssh origin makes handoff ask `git config --get core.sshCommand` (unset: exit 1)
+	// and `ssh -G`; default both to "nothing overridden, resolves to github.com".
+	if rec.gitErr == nil {
+		rec.gitErr = map[string]error{}
+	}
+	if _, ok := rec.gitErr["config --get core.sshCommand"]; !ok {
+		rec.gitErr["config --get core.sshCommand"] = exitCodeErr{1}
+	}
+	rec.sshCfg = &sshConfigRecorder{out: "hostname github.com\n"}
 	hc := &handoffClient{FakeClient: fc, rec: rec}
 	env := fakeEnv(hc)
 	env.Git = rec.git
+	env.SSHConfig = rec.sshCfg.run
 	return env, hc
+}
+
+// exitCodeErr is a git failure carrying an exit status, like *exec.ExitError.
+type exitCodeErr struct{ code int }
+
+func (e exitCodeErr) Error() string { return "exit status " + string(rune('0'+e.code)) }
+func (e exitCodeErr) ExitCode() int { return e.code }
+
+// sshConfigRecorder is a fake Env.SSHConfig recording argv and call count.
+type sshConfigRecorder struct {
+	calls [][]string
+	out   string
+	err   error
+	fn    func(ctx context.Context, args []string) (string, error)
+}
+
+func (s *sshConfigRecorder) run(ctx context.Context, args ...string) (string, error) {
+	s.calls = append(s.calls, append([]string(nil), args...))
+	if s.fn != nil {
+		return s.fn(ctx, args)
+	}
+	return s.out, s.err
 }
 
 // taskRun builds a created/dispatched task-run DTO with a server-named branch.
@@ -307,14 +340,14 @@ func TestHandoffRepoAutoDetect(t *testing.T) {
 		{
 			name:       "https",
 			origin:     "https://github.com/acme/widgets.git",
-			repos:      []apitypes.RepoDTO{{ID: "p9", PathWithNamespace: "acme/widgets"}},
+			repos:      []apitypes.RepoDTO{{ID: "p9", PathWithNamespace: "acme/widgets", WebURL: "https://github.com/acme/widgets"}},
 			wantRepoID: "p9",
 			wantCode:   uzicli.ExitOK,
 		},
 		{
 			name:       "ssh scp form",
 			origin:     "git@github.com:acme/widgets.git",
-			repos:      []apitypes.RepoDTO{{ID: "p9", PathWithNamespace: "acme/widgets"}},
+			repos:      []apitypes.RepoDTO{{ID: "p9", PathWithNamespace: "acme/widgets", WebURL: "https://github.com/acme/widgets"}},
 			wantRepoID: "p9",
 			wantCode:   uzicli.ExitOK,
 		},
@@ -328,8 +361,8 @@ func TestHandoffRepoAutoDetect(t *testing.T) {
 			name:   "ambiguous",
 			origin: "https://github.com/acme/widgets.git",
 			repos: []apitypes.RepoDTO{
-				{ID: "p9", PathWithNamespace: "acme/widgets"},
-				{ID: "p10", PathWithNamespace: "acme/widgets"},
+				{ID: "p9", PathWithNamespace: "acme/widgets", WebURL: "https://github.com/acme/widgets"},
+				{ID: "p10", PathWithNamespace: "acme/widgets", WebURL: "https://github.com/acme/widgets"},
 			},
 			wantCode: uzicli.ExitUsage,
 		},
@@ -358,7 +391,7 @@ func TestHandoffRepoAutoDetect(t *testing.T) {
 // issue #403 F2: --repo whose repo path MATCHES origin proceeds and resolves to that id.
 func TestHandoffRepoFlagMatchesOrigin(t *testing.T) {
 	fc := &uzicli.FakeClient{
-		Repos:          []apitypes.RepoDTO{{ID: "p1", PathWithNamespace: "acme/widgets"}},
+		Repos:          []apitypes.RepoDTO{{ID: "p1", PathWithNamespace: "acme/widgets", WebURL: "https://github.com/acme/widgets"}},
 		CreatedTaskRun: taskRun("rf", "uzi/task/rf"),
 		DispatchedRun:  taskRun("rf", "uzi/task/rf"),
 	}
@@ -411,7 +444,7 @@ func TestHandoffRepoFlagMismatchOrigin(t *testing.T) {
 // and nothing is created or pushed.
 func TestHandoffRepoFlagUnknown(t *testing.T) {
 	fc := &uzicli.FakeClient{
-		Repos:          []apitypes.RepoDTO{{ID: "p1", PathWithNamespace: "acme/widgets"}},
+		Repos:          []apitypes.RepoDTO{{ID: "p1", PathWithNamespace: "acme/widgets", WebURL: "https://github.com/acme/widgets"}},
 		CreatedTaskRun: taskRun("rf", "uzi/task/rf"),
 		DispatchedRun:  taskRun("rf", "uzi/task/rf"),
 	}
@@ -437,8 +470,8 @@ func TestHandoffRepoFlagUnknown(t *testing.T) {
 func TestHandoffRepoFlagDisambiguates(t *testing.T) {
 	fc := &uzicli.FakeClient{
 		Repos: []apitypes.RepoDTO{
-			{ID: "p1", PathWithNamespace: "acme/widgets"},
-			{ID: "p2", PathWithNamespace: "acme/widgets"},
+			{ID: "p1", PathWithNamespace: "acme/widgets", WebURL: "https://github.com/acme/widgets"},
+			{ID: "p2", PathWithNamespace: "acme/widgets", WebURL: "https://github.com/acme/widgets"},
 		},
 		CreatedTaskRun: taskRun("rf", "uzi/task/rf"),
 		DispatchedRun:  taskRun("rf", "uzi/task/rf"),
