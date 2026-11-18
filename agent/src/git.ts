@@ -20657,9 +20657,14 @@ export class GitCache {
               })();
               if (settles) {
                 try {
-                  // The guard re-reads terminal protection after the settle-write step and right before the value is written.
+                  // The guard re-reads terminal protection after the settle-write step and right before the value is written,
+                  // then re-reads process proof and the residue quarantine. Narrowed guarantee: a revocation or quarantine
+                  // visible at the guard's final check never writes settled. A revocation arriving after that check (while
+                  // the git config write runs or during sync) is NOT covered here.
                   await this.advanceRetireBindingUnderLock(barePath, bound, "settled", async () => {
                     if (await this.hasPhysicalTerminalProtection(ownerRunId)) throw new Error("terminal protection arrived before the settle write");
+                    checkProcessProof();
+                    if (residueQuarantine() !== undefined) throw new Error("residue quarantine latched before the settle write");
                   });
                 } catch (err) {
                   this.log.warn("retire scratch binding settle did not complete", {

@@ -492,31 +492,69 @@ describe("audit rework", () => {
     assert.equal(parents().length, 1);
   });
 
-  for (const mode of ["returns false", "throws"] as const) {
-    it(`a process proof that ${mode} at the settle predicate never settles`, async (t) => {
-      exdev(t);
-      let calls = 0;
-      const counting = mk({ split: true });
-      const first = await seed(counting, 4283);
-      await retire(counting, first, { processProof: () => { calls++; return true; } });
-      assert.equal(phase(first.bare), "settled");
-      const total = calls;
-      assert.ok(total > 1);
-      fx.cleanup();
-      fx = makeFixture();
-      let n = 0;
-      const c = mk({ split: true });
-      const s = await seed(c, 4284);
-      await retire(c, s, { processProof: () => {
-        if (++n < total) return true;
-        if (mode === "throws") throw new Error("proof callback failed");
-        return false;
-      } });
-      assert.equal(n, total, "the denial came from the settle predicate, the last proof read");
-      assert.equal(phase(s.bare), "intent");
-      assert.equal(parents().length, 1);
-    });
+  // The settle predicate reads the proof second to last; the settle-write guard reads it last (the final read of the call).
+  for (const site of ["predicate", "guard"] as const) {
+    for (const mode of ["returns false", "throws"] as const) {
+      it(`a process proof that ${mode} at the settle ${site} never settles`, async (t) => {
+        exdev(t);
+        let calls = 0;
+        const counting = mk({ split: true });
+        const first = await seed(counting, 4283);
+        await retire(counting, first, { processProof: () => { calls++; return true; } });
+        assert.equal(phase(first.bare), "settled");
+        const total = calls;
+        assert.ok(total > 2);
+        const denyAt = site === "guard" ? total : total - 1;
+        fx.cleanup();
+        fx = makeFixture();
+        let n = 0;
+        const c = mk({ split: true });
+        const s = await seed(c, 4284);
+        await retire(c, s, { processProof: () => {
+          if (++n < denyAt) return true;
+          if (mode === "throws") throw new Error("proof callback failed");
+          return false;
+        } });
+        assert.equal(n, denyAt, `the denial came from the settle ${site}, read ${denyAt} of ${total}`);
+        assert.equal(phase(s.bare), "intent");
+        assert.equal(parents().length, 1);
+      });
+    }
   }
+
+  it("review probe: revoked process proof at settle-write must not leave a settled binding", async (t) => {
+    exdev(t);
+    let revoked = false;
+    const c = mk({ split: true, step: step => { if (step === "settle-write") revoked = true; } });
+    const s = await seed(c, 4900);
+    await c.retireRunnerClone(s.bare, s.clonePath, s.branch, s.owner, { discard: true, attemptId: ATTEMPT, dispositionClass: "owner_terminal", processProof: () => !revoked });
+    assert.equal(revoked, true);
+    assert.notEqual(phase(s.bare), "settled", "revocation must keep the parent ineligible for epoch deletion");
+    assert.equal(parents().length, 1);
+  });
+
+  it("control: a process proof that stays valid through settle-write reaches settled", async (t) => {
+    exdev(t);
+    let reached = false;
+    const c = mk({ split: true, step: step => { if (step === "settle-write") reached = true; } });
+    const s = await seed(c, 4901);
+    await c.retireRunnerClone(s.bare, s.clonePath, s.branch, s.owner, { discard: true, attemptId: ATTEMPT, dispositionClass: "owner_terminal", processProof: () => true });
+    assert.equal(reached, true);
+    assert.equal(phase(s.bare), "settled");
+    assert.equal(parents().length, 1);
+  });
+
+  it("a residue quarantine latched at settle-write never leaves a settled binding", async (t) => {
+    exdev(t);
+    let s!: Seed;
+    const c = mk({ split: true, step: step => {
+      if (step === "settle-write") latchResidueQuarantine({ cause: "arrival", site: "test", runId: s.owner }, nullLogger());
+    } });
+    s = await seed(c, 4902);
+    await c.retireRunnerClone(s.bare, s.clonePath, s.branch, s.owner, { discard: true, attemptId: ATTEMPT, dispositionClass: "owner_terminal" });
+    assert.notEqual(phase(s.bare), "settled");
+    assert.equal(parents().length, 1);
+  });
 
   it("a recovery journal read error at the settle predicate means no settle and no throw", async (t) => {
     exdev(t);
