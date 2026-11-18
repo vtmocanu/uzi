@@ -26,6 +26,9 @@ func TestCredentialSwitchMigrationsLockOneBusyTableEach(t *testing.T) {
 	busy := map[string]bool{"runs": true, "user_secrets": true, "run_messages": true, "run_usage": true, "workers": true}
 	alter := regexp.MustCompile(`(?i)\bALTER TABLE\s+(?:IF EXISTS\s+)?([a-z_]+)`)
 	refs := regexp.MustCompile(`(?i)\bREFERENCES\s+([a-z_]+)`)
+	// An explicit LOCK TABLE takes the same table lock as an ALTER, so a migration that locks a busy
+	// table this way counts toward the one-busy-table rule too.
+	lockTable := regexp.MustCompile(`(?i)\bLOCK TABLE\s+(?:ONLY\s+)?([a-z_]+)`)
 	dropTable := regexp.MustCompile(`(?i)\bDROP TABLE\b`)
 	comment := regexp.MustCompile(`--[^\n]*`)
 	busyIn := func(section string, re *regexp.Regexp, into map[string]bool) {
@@ -64,8 +67,10 @@ func TestCredentialSwitchMigrationsLockOneBusyTableEach(t *testing.T) {
 		upLocks, downLocks := map[string]bool{}, map[string]bool{}
 		busyIn(up, alter, upLocks)
 		busyIn(up, refs, upLocks)
+		busyIn(up, lockTable, upLocks)
 		busyIn(down, alter, downLocks)
 		busyIn(down, refs, downLocks)
+		busyIn(down, lockTable, downLocks)
 		if dropTable.MatchString(down) {
 			// Dropping the table the Up created locks every parent its foreign keys reference.
 			busyIn(up, refs, downLocks)

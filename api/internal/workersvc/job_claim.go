@@ -70,6 +70,11 @@ func jobCredentialErr(err error) error {
 // The wire keeps the (empty) repo and forge_pat keys because a job rides the ordinary
 // ClaimPayload; the no-PAT guarantee is that assembly never decrypts one.
 func (s *Service) assembleJobClaim(ctx context.Context, wkr store.Worker, run store.Run) (*ClaimPayload, error) {
+	// PRD #4320 module 5: the job lane has no provider support until PRD #4322. A provider-bound row
+	// (creation cannot produce one; defence in depth) fails closed before any credential is opened.
+	if providerBoundRun(run) {
+		return nil, errProviderLaneClaimRefused
+	}
 	if run.Harness == harnessCodex {
 		// Jobs are created with an explicit Claude pin; a Codex job is a data error and must
 		// fail closed rather than run without a credential.
@@ -197,6 +202,10 @@ func (s *Service) assembleJobClaim(ctx context.Context, wkr store.Worker, run st
 	if policyErr != nil {
 		return nil, policyErr
 	}
+	secrets := ClaimSecrets{AnthropicOAuthToken: string(cred.Token)}
+	if err := assertClaimSecretsExclusive(secrets); err != nil {
+		return nil, fmt.Errorf("%w: %w", errCredentialUnavailable, err)
+	}
 	return &ClaimPayload{
 		MemoryEpisode:              run.MemoryEpisode,
 		MemoryInterventionCount:    run.MemoryInterventionCount,
@@ -214,7 +223,7 @@ func (s *Service) assembleJobClaim(ctx context.Context, wkr store.Worker, run st
 		LastSeq:                    run.LastSeq,
 		IterationCount:             run.IterationCount,
 		RequeueCount:               run.RequeueCount,
-		Secrets:                    ClaimSecrets{AnthropicOAuthToken: string(cred.Token)},
+		Secrets:                    secrets,
 		Agents:                     []ClaimAgent{},
 		Skills:                     skills,
 		SkillsDropped:              skillDrops,

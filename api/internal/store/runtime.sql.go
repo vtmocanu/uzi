@@ -1336,6 +1336,11 @@ WITH checker_template_pins AS MATERIALIZED (
       AND (r.completion_contract_version IS NULL
            OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
            OR 'codex_completion_interlock_v1' = ANY($28::text[]))
+      -- PRD #4320 module 5: the NON-BYPASSABLE provider claim clause (standalone, outside fn_worker_can_claim,
+      -- required_capabilities and @capability_aware). A provider-bound run (model_provider_key_mode set)
+      -- is claimable only by a worker reporting 'claude_provider_v1': an older worker would ignore the
+      -- unknown claim key and start the run with no model credential. Same @worker_protocol_caps.
+      AND (r.model_provider_key_mode IS NULL OR 'claude_provider_v1' = ANY($28::text[]))
       AND (NOT (r.plan_cross_check_required OR (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan')))
            OR 'cross_check_v1' = ANY($28::text[]))
       AND (NOT (r.kind = 'cross_check' AND r.harness = 'claude' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
@@ -1612,6 +1617,9 @@ WITH checker_template_pins AS MATERIALIZED (
                 AND (r.completion_contract_version IS NULL
                      OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                      OR 'codex_completion_interlock_v1' = ANY(p.protocol_capabilities))
+                -- PRD #4320 module 5: MIRROR the provider claim clause for the peer, or fleet-spread could DEFER a
+                -- provider-bound run to a peer that lacks 'claude_provider_v1' and could never claim it.
+                AND (r.model_provider_key_mode IS NULL OR 'claude_provider_v1' = ANY(p.protocol_capabilities))
       AND (NOT (r.plan_cross_check_required OR (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan')))
            OR 'cross_check_v1' = ANY(p.protocol_capabilities))
       AND (NOT (r.kind = 'cross_check' AND r.harness = 'claude' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
@@ -2967,6 +2975,8 @@ WHERE run.id = $1
   AND (run.completion_contract_version IS NULL
        OR NOT (run.harness = 'codex' OR run.codex_material_revision IS NOT NULL OR run.codex_secret_id IS NOT NULL)
        OR 'codex_completion_interlock_v1' = ANY(w.protocol_capabilities))
+  -- PRD #4320 module 5: the provider claim clause, mirrored (see ClaimRun).
+  AND (run.model_provider_key_mode IS NULL OR 'claude_provider_v1' = ANY(w.protocol_capabilities))
       AND (NOT (run.plan_cross_check_required OR (run.kind = 'cross_check' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = run.id AND pc.stage = 'plan')))
            OR 'cross_check_v1' = ANY(w.protocol_capabilities))
       AND (NOT (run.kind = 'cross_check' AND run.harness = 'claude' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = run.id AND pc.stage = 'plan'))
@@ -3269,6 +3279,33 @@ type CountOnlineWorkersSatisfyingCapsParams struct {
 // is only ever "who could run THIS if it were free", and a bound worker never could.
 func (q *Queries) CountOnlineWorkersSatisfyingCaps(ctx context.Context, arg CountOnlineWorkersSatisfyingCapsParams) (int64, error) {
 	row := q.db.QueryRow(ctx, countOnlineWorkersSatisfyingCaps, arg.UserID, arg.RequiredCapabilities)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
+const countOnlineWorkersSatisfyingClaudeProvider = `-- name: CountOnlineWorkersSatisfyingClaudeProvider :one
+SELECT count(*) FROM workers w
+WHERE w.user_id = $1
+  AND w.status = 'online'
+  AND fn_worker_accepts_new_intake(w)
+  AND NOT w.ephemeral
+  -- The lane half of ClaimRun's isolated-lane clause: these rungs only run for an UNBOUND run, and a
+  -- lane worker never claims an unbound run, so it is never a satisfier here.
+  AND NOT w.isolated_lane
+  AND 'claude_provider_v1' = ANY(w.protocol_capabilities)
+`
+
+// PRD #4320 module 5: how many of a user's ONLINE, non-draining, non-ephemeral workers self-report the
+// 'claude_provider_v1' PROTOCOL capability. It drives the queued-reason resolver's provider rung
+// (reasonNoProviderCapableWorker): a 0 here for a PROVIDER-BOUND queued run (model_provider_key_mode
+// set) means every online worker predates provider claims, so ClaimRun's NON-BYPASSABLE provider clause
+// ('claude_provider_v1' = ANY(@worker_protocol_caps)) can never be satisfied. Same filters as
+// CountOnlineWorkersSatisfyingCodexHarness, the twin this mirrors; only called for a provider-bound
+// queued run already past its health threshold (or one the early docker-allowlist probe found
+// online-but-ineligible), so it is off the hot path.
+func (q *Queries) CountOnlineWorkersSatisfyingClaudeProvider(ctx context.Context, userID uuid.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, countOnlineWorkersSatisfyingClaudeProvider, userID)
 	var count int64
 	err := row.Scan(&count)
 	return count, err
@@ -12126,6 +12163,7 @@ SELECT id, runs.user_id, status, auto_approve,
        repo_id, kind, dispatched_at, required_capabilities, completion_contract_version,
        harness, codex_material_revision, codex_secret_id, worker_id, claim_generation, released_worker_id,
        egress_profile_id, job_protocol, ci_config_guard, repo_agent_source_commit, repo_agent_source_required, agent_source_requested,
+       model_provider_key_mode,
        EXISTS (SELECT 1 FROM job_files af WHERE af.run_id = runs.id AND af.direction = 'input' AND af.state = 'attached')::boolean AS ci_artifacts_attached,
        -- PRD #4173: true when the run's repo is linked to an external issue tracker; gates the queued-reason issue_key rung so an unlinked run makes no extra query.
        EXISTS (SELECT 1 FROM repos lr WHERE lr.id = runs.repo_id AND lr.issue_tracker_connection_id IS NOT NULL)::boolean AS repo_linked,
@@ -12260,6 +12298,7 @@ type ListActiveRunsForHealthRow struct {
 	RepoAgentSourceCommit     pgtype.Text        `json:"repo_agent_source_commit"`
 	RepoAgentSourceRequired   bool               `json:"repo_agent_source_required"`
 	AgentSourceRequested      pgtype.Text        `json:"agent_source_requested"`
+	ModelProviderKeyMode      pgtype.Text        `json:"model_provider_key_mode"`
 	CiArtifactsAttached       bool               `json:"ci_artifacts_attached"`
 	RepoLinked                bool               `json:"repo_linked"`
 	StaleRequeuePinnable      bool               `json:"stale_requeue_pinnable"`
@@ -12302,6 +12341,9 @@ type ListActiveRunsForHealthRow struct {
 // PRD #1226 M1: completion_contract_version rides this read so the queued arm can surface a
 // completion-capability reason for an INTERLOCKED run (version non-null) that no online worker
 // implements the completion protocol — the non-bypassable claim clause can never be satisfied.
+// PRD #4320 module 5: model_provider_key_mode rides this read so the queued arm can surface a
+// provider-capability reason for a PROVIDER-BOUND run that no online worker advertises
+// 'claude_provider_v1' for: the non-bypassable provider claim clause can never be satisfied.
 // PRD #1332 M5A (D3): harness, codex_material_revision and codex_secret_id ride this read so the
 // queued arm can surface a Codex-capability reason for a CODEX-INDICATING run (any of the three set)
 // that no online worker advertises 'codex_harness_v1' — the non-bypassable Codex claim clause can
@@ -12394,6 +12436,7 @@ func (q *Queries) ListActiveRunsForHealth(ctx context.Context, codexCuratedModel
 			&i.RepoAgentSourceCommit,
 			&i.RepoAgentSourceRequired,
 			&i.AgentSourceRequested,
+			&i.ModelProviderKeyMode,
 			&i.CiArtifactsAttached,
 			&i.RepoLinked,
 			&i.StaleRequeuePinnable,
@@ -15389,6 +15432,8 @@ WHERE r.status = 'queued'
                  AND (r.completion_contract_version IS NULL
                       OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                       OR 'codex_completion_interlock_v1' = ANY(w.protocol_capabilities))
+  -- PRD #4320 module 5: the provider claim clause, mirrored (see ClaimRun).
+  AND (r.model_provider_key_mode IS NULL OR 'claude_provider_v1' = ANY(w.protocol_capabilities))
                  AND (
                      NOT (
                          r.harness = 'codex'
@@ -15481,6 +15526,8 @@ WHERE r.status = 'queued'
                  AND (r.completion_contract_version IS NULL
                       OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                       OR 'codex_completion_interlock_v1' = ANY(w.protocol_capabilities))
+  -- PRD #4320 module 5: the provider claim clause, mirrored (see ClaimRun).
+  AND (r.model_provider_key_mode IS NULL OR 'claude_provider_v1' = ANY(w.protocol_capabilities))
                  AND (
                      NOT (
                          r.harness = 'codex'
@@ -24281,6 +24328,11 @@ WITH candidates AS MATERIALIZED (
   AND runs.hold_reason IS DISTINCT FROM 'credential_disabled'
   -- PRD #3989: a credentials_reset hold is released only by the credential promoter.
   AND runs.hold_reason IS DISTINCT FROM 'credentials_reset'
+  -- PRD #4320 module 5: the provider refusals are released only by the promoter (the destination hold,
+  -- once the URL is allowlisted again and the binding is intact) or never (provider_binding_stale: a new
+  -- run picks up the current key). An owner Resume must not re-queue a run the next claim would refuse.
+  AND runs.hold_reason IS DISTINCT FROM 'provider_destination_not_allowed'
+  AND runs.hold_reason IS DISTINCT FROM 'provider_binding_stale'
   -- #3607 M2a: refuse ONLY an unresolved policy episode (its own owner resume is ResumePolicyHold).
   -- A resolved preserving run still resumes ordinary holds and keeps its constraint: this writer
   -- touches no policy column.
@@ -24383,6 +24435,11 @@ WHERE runs.id = $6 AND runs.user_id = $7
   AND runs.hold_reason IS DISTINCT FROM 'credential_disabled'
   -- PRD #3989: a credentials_reset hold is released only by the credential promoter.
   AND runs.hold_reason IS DISTINCT FROM 'credentials_reset'
+  -- PRD #4320 module 5: the provider refusals are released only by the promoter (the destination hold,
+  -- once the URL is allowlisted again and the binding is intact) or never (provider_binding_stale: a new
+  -- run picks up the current key). An owner Resume must not re-queue a run the next claim would refuse.
+  AND runs.hold_reason IS DISTINCT FROM 'provider_destination_not_allowed'
+  AND runs.hold_reason IS DISTINCT FROM 'provider_binding_stale'
   -- #3607 M2a: refuse ONLY an unresolved policy episode (its own owner resume is ResumePolicyHold).
   -- A resolved preserving run still resumes ordinary holds and keeps its constraint: this writer
   -- touches no policy column.

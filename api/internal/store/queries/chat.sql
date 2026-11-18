@@ -122,8 +122,14 @@ WHERE id = (
       -- Codex-indicating chat run must NEVER be claimed by ANY worker, however capable. Checks
       -- all THREE binding facts (harness='codex' OR codex_material_revision IS NOT NULL OR
       -- codex_secret_id IS NOT NULL) so it stays closed on inconsistent/legacy data, exactly as
-      -- the run lane does. No new bind param, so ClaimChatRunParams is unchanged.
+      -- the run lane does.
       AND NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
+      -- PRD #4320 module 5: the NON-BYPASSABLE provider claim clause, the chat twin of ClaimRun's. A
+      -- provider-bound chat (model_provider_key_mode set) is claimable only by a worker reporting
+      -- 'claude_provider_v1' (@worker_protocol_caps is the claimant's stored workers.protocol_capabilities,
+      -- read under the claimant row lock by claimChatRun): an older worker would ignore the unknown
+      -- `provider` claim key and start the chat with an empty Anthropic token.
+      AND (r.model_provider_key_mode IS NULL OR 'claude_provider_v1' = ANY(@worker_protocol_caps::text[]))
       -- PRD #1906 M5: the chat lane never claims a profile-bound run. The schema already forbids a
       -- profile-bound chat (runs_egress_profile_not_chat, 00270); this is the claim-side backstop,
       -- so dropping that CHECK could never hand one to the chat executor's full tool set.

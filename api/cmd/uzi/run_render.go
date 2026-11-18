@@ -666,6 +666,10 @@ func holdReasonLabel(reason string) string {
 		return "model choice unavailable"
 	case holdWeeklyReserve:
 		return "weekly usage reserve"
+	case holdProviderDestinationNotAllowed:
+		return "provider URL not allowed"
+	case holdProviderBindingStale:
+		return "provider key changed"
 	default:
 		return cellText(reason)
 	}
@@ -790,6 +794,10 @@ func pausedHoldNotice(r apitypes.RunDTO, origin ...string) string {
 		return "held, " + holdReasonLabel(reason) + "; " + runOverrideAction(r)
 	case holdWeeklyReserve:
 		return "held by the weekly usage reserve; " + weeklyReserveAction(r)
+	case holdProviderDestinationNotAllowed:
+		return "held, the provider's URL is not allowed by the operator; the run resumes by itself once it is allowed again, or cancel: uzi run cancel " + id
+	case holdProviderBindingStale:
+		return "held, its provider or key changed after the run was created, so it cannot continue; start a new run, which uses the current key, and cancel this one: uzi run cancel " + id
 	default:
 		return "paused (" + holdReasonLabel(reason) + ")"
 	}

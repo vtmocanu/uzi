@@ -247,14 +247,26 @@ func (s *Service) promoteCredentialDisabledRun(ctx context.Context, userID, runI
 		return "", err
 	}
 	if run.Status != "paused" || !run.HoldReason.Valid ||
-		(run.HoldReason.String != holdCredentialDisabled && run.HoldReason.String != holdCredentialsReset) {
+		(run.HoldReason.String != holdCredentialDisabled && run.HoldReason.String != holdCredentialsReset &&
+			run.HoldReason.String != holdProviderDestinationNotAllowed) {
 		return "", nil // no longer this hold
 	}
 	// (3) + (4) The requirement source and the requirement credential.
 	var met bool
-	if run.HoldReason.String == holdCredentialsReset {
+	switch run.HoldReason.String {
+	case holdProviderDestinationNotAllowed:
+		// PRD #4320 module 5: the one provider refusal with a promoter. The requirement is the run's OWN
+		// frozen binding (never the owner's Anthropic default or current provider source): re-queue only
+		// when its URL is allowlisted again AND the binding is otherwise intact. provider_binding_stale
+		// is not in this hold set at all: it has no promoter.
+		bound, berr := q.GetRunByID(ctx, run.ID)
+		if berr != nil {
+			return "", fmt.Errorf("provider destination requirement: read run: %w", berr)
+		}
+		met, err = s.providerRequirementMet(ctx, q, bound)
+	case holdCredentialsReset:
 		met, err = s.credentialsResetRequirementMet(ctx, q, run)
-	} else {
+	default:
 		heartbeatCutoff := pgconv.Time(s.now().Add(-s.p.WorkerHeartbeatStale))
 		met, err = credentialRequirementMet(ctx, q, run, heartbeatCutoff)
 	}
@@ -537,6 +549,15 @@ func (s *Service) reassignCredentialDisabledRun(ctx context.Context, userID, run
 // resolved (no recorded worker, a deleted credential) is promoted, so the next claim decides
 // with its own checks instead of the run waiting forever on something that no longer exists.
 func credentialRequirementMet(ctx context.Context, q *store.Queries, run store.LockCredentialDisabledRunForPromotionRow, heartbeatCutoff pgtype.Timestamptz) (bool, error) {
+	// PRD #4320 module 5: a provider-bound run has no Anthropic credential requirement: its claim never
+	// reads the owner's default, worker or judge binding, so none of them can ever satisfy (or be
+	// promoted on) its hold. It is never promoted through this credential ladder; the one provider hold
+	// with a promoter (provider_destination_not_allowed) is decided by providerRequirementMet.
+	if bound, err := q.GetRunByID(ctx, run.ID); err != nil {
+		return false, fmt.Errorf("credential requirement: read run: %w", err)
+	} else if providerBoundRun(bound) {
+		return false, nil
+	}
 	if run.Harness == harnessCodex {
 		if !run.CodexSecretID.Valid {
 			return true, nil

@@ -1122,6 +1122,11 @@ func judgeDefaultChoice(c secretChoice) secretChoice {
 // forks BEFORE GetRunClaimContext (a judge run has no repo) — that fork lives in
 // claim_assembly.go's assembleClaim, unchanged.
 func (s *Service) assembleJudgeClaim(ctx context.Context, wkr store.Worker, run store.Run) (*ClaimPayload, error) {
+	// PRD #4320 module 5: the judge lane has no provider support until PRD #4322. A provider-bound
+	// row (creation cannot produce one; defence in depth) is refused before any credential is opened.
+	if providerBoundRun(run) {
+		return nil, errProviderLaneClaimRefused
+	}
 	var anthropic []byte
 	recordedLastSeq := run.LastSeq
 	if run.Harness != harnessCodex {
@@ -1341,6 +1346,9 @@ func (s *Service) assembleJudgeClaim(ctx context.Context, wkr store.Worker, run 
 		payload.Secrets.Codex = codex
 	}
 
+	if err := assertClaimSecretsExclusive(payload.Secrets); err != nil {
+		return nil, fmt.Errorf("%w: %w", errCredentialUnavailable, err)
+	}
 	return payload, nil
 }
 

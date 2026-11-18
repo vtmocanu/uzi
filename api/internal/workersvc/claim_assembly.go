@@ -218,6 +218,14 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	if isolated && (run.Kind == runkind.Judge || run.Harness == harnessCodex) {
 		return nil, errIsolatedClaimRefused
 	}
+	// PRD #4320 module 5: a provider-bound run exists only on the Claude issue/chat lanes (module 4's
+	// creation refusals). Judge, job, cross-check and isolated claims have no provider support until
+	// PRD #4322, so such a row (data that creation cannot produce; defence in depth) is refused
+	// terminally before anything is opened: a provider run never reaches a vendor credential ladder.
+	if providerBoundRun(run) && (run.Kind == runkind.Judge || run.Kind == runkind.Job || run.Kind == runkind.CrossCheck ||
+		isolated || run.Harness != harnessClaude) {
+		return nil, errProviderLaneClaimRefused
+	}
 	// PRD #1906 M5 (Decision 9): the Go backstop of ClaimRun's two-way isolated-lane clause. A
 	// profile-bound run on a worker outside the lane, or an unbound run on a lane worker, means
 	// the SQL gate did not hold: refuse before anything is opened rather than deliver it.
@@ -363,8 +371,20 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	// Its Codex secrets are attached just below, in the harnessCodex block after the payload
 	// literal. A Claude run keeps the exact existing ladder — byte-identical.
 	var anthropic []byte
+	var providerBinding *ClaimProviderBinding
 	recordedLastSeq := run.LastSeq
-	if run.Harness != harnessCodex {
+	if providerBoundRun(run) {
+		// PRD #4320 module 5: a provider-bound run takes this branch BEFORE the vendor ladder. Its
+		// claim carries ONE `provider` binding built from the run's frozen binding and no Anthropic
+		// credential: claimSecretID, openWithAutoRetry, recordRunCredential and SetRunAnthropicSecret
+		// are never called (runs.anthropic_secret_id and anthropic_rejected_at are never written), the
+		// claiming worker's anthropic_bind_mode is ignored, and `anthropic` stays nil.
+		pb, err := s.assembleProviderBinding(ctx, run)
+		if err != nil {
+			return nil, err
+		}
+		providerBinding = pb
+	} else if run.Harness != harnessCodex {
 		// Which credential this claim spends: the claiming worker's binding for ordinary
 		// runs, the owner's judge binding for self_improve, the owner's default when
 		// neither names one (PRD #104 D1). Resolution is per-claim, which is what makes a
@@ -941,6 +961,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			ForgeUsername:       rc.BotUsername,
 			ForgePAT:            string(botPAT),
 			AnthropicOAuthToken: string(anthropic),
+			Provider:            providerBinding,
 		},
 		Agents:        agentsFromTemplates(templates, skills.perTemplate, run.Harness),
 		Skills:        skills.union,
@@ -1129,6 +1150,9 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		return nil, err
 	}
 	payload.PublicationResume = resume
+	if err := assertClaimSecretsExclusive(payload.Secrets); err != nil {
+		return nil, fmt.Errorf("%w: %w", errCredentialUnavailable, err)
+	}
 	return payload, nil
 }
 

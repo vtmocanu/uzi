@@ -23,6 +23,14 @@ import (
 // (PRD #3989 M3). Only the credential promoter releases that hold.
 var credentialsResetResumeRefusal = workersvc.ErrCredentialsResetHeld.Error()
 
+// The 409 bodies of an owner Resume on a provider hold (PRD #4320 module 5). Neither hold is
+// resumable: provider_destination_not_allowed is re-queued by the promoter once the operator allows
+// the provider's URL again, and provider_binding_stale is final for the run.
+const (
+	providerBindingStaleResumeRefusal = "provider_binding_stale: this run's provider key or provider changed after it was created, so it cannot continue; start a new run, which picks up the current key"
+	providerDestinationResumeRefusal  = "provider_destination_not_allowed: this run's provider URL is no longer allowed by the operator; the run resumes automatically once it is allowed again, or cancel it"
+)
+
 // ResumeRunNow resumes an owner-held pool_wait or paused run, or starts a new
 // worker-recovery episode for recovery_wait/worker_requeue_exhausted. The owner-scoped
 // read returns 404 for foreign/absent runs. Each status-scoped write refuses races
@@ -273,6 +281,16 @@ func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 				// credential promoter releases it, once the owner adds a credential.
 				if run.HoldReason.Valid && run.HoldReason.String == "credentials_reset" {
 					httpx.Error(w, http.StatusConflict, credentialsResetResumeRefusal)
+					return
+				}
+				// PRD #4320 module 5 (D9): ResumePausedRun refuses both provider holds. A resume would only
+				// be refused again at the next claim, so name the reason and the way out instead.
+				if run.HoldReason.Valid && run.HoldReason.String == "provider_binding_stale" {
+					httpx.Error(w, http.StatusConflict, providerBindingStaleResumeRefusal)
+					return
+				}
+				if run.HoldReason.Valid && run.HoldReason.String == "provider_destination_not_allowed" {
+					httpx.Error(w, http.StatusConflict, providerDestinationResumeRefusal)
 					return
 				}
 				httpx.Error(w, http.StatusConflict, "run is no longer paused")

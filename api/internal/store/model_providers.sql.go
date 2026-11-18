@@ -198,9 +198,11 @@ type GetModelProviderRevisionForOwnerRow struct {
 }
 
 // A frozen revision of an owner's provider (inherited creation re-checks the URL against the
-// allowlist). Owner-scoped. FOR KEY SHARE OF r pins the revision row for the successor's
-// transaction, so the revision-prune delete (which takes the row's key lock) cannot remove a
-// revision between this re-check and the successor's insert.
+// allowlist). Owner-scoped. FOR KEY SHARE OF r only protects the prune-FIRST ordering (a prune that
+// already took the row's key lock makes this read wait, then find the row gone): it is released with
+// the transaction and does not by itself keep the revision. What keeps PruneModelProviderRevisions off
+// a revision is the source run row's own reference (model_provider_revision), which stays true while
+// run rows are never deleted.
 func (q *Queries) GetModelProviderRevisionForOwner(ctx context.Context, arg GetModelProviderRevisionForOwnerParams) (GetModelProviderRevisionForOwnerRow, error) {
 	row := q.db.QueryRow(ctx, getModelProviderRevisionForOwner, arg.ProviderID, arg.Revision, arg.OwnerUserID)
 	var i GetModelProviderRevisionForOwnerRow
@@ -547,6 +549,44 @@ SELECT pg_advisory_xact_lock(
 func (q *Queries) LockModelProviderOwner(ctx context.Context, ownerUserID uuid.UUID) error {
 	_, err := q.db.Exec(ctx, lockModelProviderOwner, ownerUserID)
 	return err
+}
+
+const lockProviderBindingKeyForShareNowait = `-- name: LockProviderBindingKeyForShareNowait :one
+SELECT id, kind, provider_id, disabled_at, enablement_rev FROM user_secrets
+WHERE id = $1 AND user_id = $2
+FOR SHARE NOWAIT
+`
+
+type LockProviderBindingKeyForShareNowaitParams struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+type LockProviderBindingKeyForShareNowaitRow struct {
+	ID            uuid.UUID          `json:"id"`
+	Kind          string             `json:"kind"`
+	ProviderID    pgtype.UUID        `json:"provider_id"`
+	DisabledAt    pgtype.Timestamptz `json:"disabled_at"`
+	EnablementRev int64              `json:"enablement_rev"`
+}
+
+// The claim finisher's in-transaction re-check of a PROVIDER-BOUND run's frozen key (PRD #4320
+// module 5, D9), taken under the exact-claim run lock. FOR SHARE blocks a concurrent rotation,
+// disable or delete (which lock the row FOR UPDATE under the owner's secret mutation lock) until the
+// claim decision commits; NOWAIT means the finisher never waits on that writer while holding the
+// run row: a held row is 55P03 and finishRunClaim / finishChatClaim retry the whole transaction.
+// Owner-scoped; a missing row is pgx.ErrNoRows (the key was deleted: stale).
+func (q *Queries) LockProviderBindingKeyForShareNowait(ctx context.Context, arg LockProviderBindingKeyForShareNowaitParams) (LockProviderBindingKeyForShareNowaitRow, error) {
+	row := q.db.QueryRow(ctx, lockProviderBindingKeyForShareNowait, arg.ID, arg.UserID)
+	var i LockProviderBindingKeyForShareNowaitRow
+	err := row.Scan(
+		&i.ID,
+		&i.Kind,
+		&i.ProviderID,
+		&i.DisabledAt,
+		&i.EnablementRev,
+	)
+	return i, err
 }
 
 const pruneModelProviderRevisions = `-- name: PruneModelProviderRevisions :execrows

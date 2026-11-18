@@ -1050,6 +1050,10 @@ export class Worker {
           // the human plan gate). Advertised UNCONDITIONALLY: the api sends plan_cross_check_gated
           // only to a worker advertising it, so an older image keeps the ordinary gate.
           "cross_check_gated_v1",
+          // PRD #4320 module 5: this image accepts a provider-bound Claude claim (claim.secrets.provider).
+          // Advertised UNCONDITIONALLY: the api makes it a non-bypassable claim clause of a
+          // provider-bound run only, so every vendor claim is unaffected.
+          "claude_provider_v1",
           // PRD #1230 M4 (dormant): this image runs the semantic plan checker child and
           // publishes maintainer-pending (completion_pending) delivery non-closing. Advertised
           // UNCONDITIONALLY: the api makes each a hard claim clause of its semantic runs only,

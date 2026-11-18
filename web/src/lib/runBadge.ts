@@ -173,6 +173,11 @@ export function isRevisingRun(run: { status: string; is_revising?: boolean }): b
 export const NON_COMPLETION_HOLDS = {
   credential_disabled: { tone: "warning", label: "waiting: credential disabled", ownerResumable: false, attention: false, afterCompletionPhase: true, completionEarlyReturn: false, heldDeny: "always", historyParkLabel: false, ownerActionsLink: false },
   credentials_reset: { tone: "warning", label: "waiting: credentials were reset", ownerResumable: false, attention: false, afterCompletionPhase: true, completionEarlyReturn: false, heldDeny: "always", historyParkLabel: false, ownerActionsLink: false },
+  // PRD #4320 module 5: a provider-bound run whose next claim was refused (D9). Neither is owner-resumable:
+  // the destination hold re-queues by itself once the operator allows the URL again; the stale hold is final
+  // (the provider or its key changed after the run was created), so the owner cancels and starts a new run.
+  provider_destination_not_allowed: { tone: "warning", label: "provider URL not allowed: waiting", ownerResumable: false, attention: false, afterCompletionPhase: true, completionEarlyReturn: false, heldDeny: "always", historyParkLabel: false, ownerActionsLink: false },
+  provider_binding_stale: { tone: "warning", label: "provider key changed: start a new run", ownerResumable: false, attention: false, afterCompletionPhase: true, completionEarlyReturn: false, heldDeny: "always", historyParkLabel: false, ownerActionsLink: false },
   provider_unavailable: { tone: "warning", label: "provider unavailable: owner hold", ownerResumable: true, attention: true, afterCompletionPhase: false, completionEarlyReturn: true, heldDeny: "always", historyParkLabel: false, ownerActionsLink: true },
   codex_policy_hold: { tone: "warning", label: "Codex policy hold", ownerResumable: false, attention: true, afterCompletionPhase: false, completionEarlyReturn: false, heldDeny: "never", historyParkLabel: true, ownerActionsLink: false },
   base_attestation_missing: { tone: "warning", label: "base unverified: owner hold", ownerResumable: false, attention: true, afterCompletionPhase: false, completionEarlyReturn: false, heldDeny: "always", historyParkLabel: false, ownerActionsLink: false },
@@ -932,6 +937,22 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_detai
         tone: "warning",
         pulse: false,
         title: "An admin reset this account and its credentials were deleted. The run resumes by itself once you add a credential in Settings.",
+      };
+    case "provider_destination_not_allowed":
+      return {
+        kind: "badge",
+        label: PARK_LABELS.provider_destination_not_allowed,
+        tone: "warning",
+        pulse: false,
+        title: "The operator no longer allows this run's provider URL. The run resumes by itself once it is allowed again, or Cancel it.",
+      };
+    case "provider_binding_stale":
+      return {
+        kind: "badge",
+        label: PARK_LABELS.provider_binding_stale,
+        tone: "warning",
+        pulse: false,
+        title: "The provider or its key changed after this run was created, so it cannot continue. Cancel it and start a new run, which uses the current key.",
       };
     case "running":
       // The running elapsed moved OUT of the badge to the uniform per-card duration

@@ -128,5 +128,31 @@
     "completion_panel_held_deny": "always",
     "history_park_label": true,
     "owner_actions_link": true
+  },
+  {
+    "reason": "provider_destination_not_allowed",
+    "non_completion": true,
+    "owner_resumable": false,
+    "tone": "warning",
+    "web_label": "provider URL not allowed: waiting",
+    "cli_notice": "held, the provider's URL is not allowed by the operator; the run resumes by itself once it is allowed again, or cancel: uzi run cancel run-1",
+    "announces_entry": true,
+    "completion_panel_early_return": false,
+    "completion_panel_held_deny": "always",
+    "history_park_label": false,
+    "owner_actions_link": false
+  },
+  {
+    "reason": "provider_binding_stale",
+    "non_completion": true,
+    "owner_resumable": false,
+    "tone": "warning",
+    "web_label": "provider key changed: start a new run",
+    "cli_notice": "held, its provider or key changed after the run was created, so it cannot continue; start a new run, which uses the current key, and cancel this one: uzi run cancel run-1",
+    "announces_entry": true,
+    "completion_panel_early_return": false,
+    "completion_panel_held_deny": "always",
+    "history_park_label": false,
+    "owner_actions_link": false
   }
 ]

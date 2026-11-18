@@ -57,15 +57,21 @@ WHERE id = (
       -- Codex-indicating chat run must NEVER be claimed by ANY worker, however capable. Checks
       -- all THREE binding facts (harness='codex' OR codex_material_revision IS NOT NULL OR
       -- codex_secret_id IS NOT NULL) so it stays closed on inconsistent/legacy data, exactly as
-      -- the run lane does. No new bind param, so ClaimChatRunParams is unchanged.
+      -- the run lane does.
       AND NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
+      -- PRD #4320 module 5: the NON-BYPASSABLE provider claim clause, the chat twin of ClaimRun's. A
+      -- provider-bound chat (model_provider_key_mode set) is claimable only by a worker reporting
+      -- 'claude_provider_v1' (@worker_protocol_caps is the claimant's stored workers.protocol_capabilities,
+      -- read under the claimant row lock by claimChatRun): an older worker would ignore the unknown
+      -- ` + "`" + `provider` + "`" + ` claim key and start the chat with an empty Anthropic token.
+      AND (r.model_provider_key_mode IS NULL OR 'claude_provider_v1' = ANY($4::text[]))
       -- PRD #1906 M5: the chat lane never claims a profile-bound run. The schema already forbids a
       -- profile-bound chat (runs_egress_profile_not_chat, 00270); this is the claim-side backstop,
       -- so dropping that CHECK could never hand one to the chat executor's full tool set.
       AND r.egress_profile_id IS NULL
       AND (r.worker_id IS NULL
            OR r.worker_id = $1
-           OR r.updated_at < $4)
+           OR r.updated_at < $5)
     ORDER BY COALESCE(r.worker_id = $1, false) DESC, r.created_at ASC
     FOR UPDATE SKIP LOCKED
     LIMIT 1
@@ -74,10 +80,11 @@ RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, statu
 `
 
 type ClaimChatRunParams struct {
-	WorkerID       pgtype.UUID        `json:"worker_id"`
-	UserID         uuid.UUID          `json:"user_id"`
-	IsEphemeral    bool               `json:"is_ephemeral"`
-	AffinityCutoff pgtype.Timestamptz `json:"affinity_cutoff"`
+	WorkerID           pgtype.UUID        `json:"worker_id"`
+	UserID             uuid.UUID          `json:"user_id"`
+	IsEphemeral        bool               `json:"is_ephemeral"`
+	WorkerProtocolCaps []string           `json:"worker_protocol_caps"`
+	AffinityCutoff     pgtype.Timestamptz `json:"affinity_cutoff"`
 }
 
 // The chat claim lane (Decision 4): atomically claim the oldest claimable queued
@@ -89,6 +96,7 @@ func (q *Queries) ClaimChatRun(ctx context.Context, arg ClaimChatRunParams) (Run
 		arg.WorkerID,
 		arg.UserID,
 		arg.IsEphemeral,
+		arg.WorkerProtocolCaps,
 		arg.AffinityCutoff,
 	)
 	var i Run

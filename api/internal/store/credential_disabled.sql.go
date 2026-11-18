@@ -74,7 +74,7 @@ func (q *Queries) InsertRunOverrideUnavailableMessage(ctx context.Context, arg I
 
 const listCredentialDisabledRuns = `-- name: ListCredentialDisabledRuns :many
 SELECT id, user_id, status_since FROM runs
-WHERE user_id = $1 AND status = 'paused' AND hold_reason IN ('credential_disabled', 'credentials_reset')
+WHERE user_id = $1 AND status = 'paused' AND hold_reason IN ('credential_disabled', 'credentials_reset', 'provider_destination_not_allowed')
   AND ($2::timestamptz IS NULL
        OR (status_since, id) > ($2::timestamptz,
                                 $3::uuid))
@@ -124,7 +124,7 @@ func (q *Queries) ListCredentialDisabledRuns(ctx context.Context, arg ListCreden
 
 const listCredentialDisabledUsers = `-- name: ListCredentialDisabledUsers :many
 SELECT DISTINCT user_id FROM runs
-WHERE status = 'paused' AND hold_reason IN ('credential_disabled', 'credentials_reset')
+WHERE status = 'paused' AND hold_reason IN ('credential_disabled', 'credentials_reset', 'provider_destination_not_allowed')
   AND ($1::uuid IS NULL OR user_id > $1::uuid)
 ORDER BY user_id
 LIMIT $2::int
@@ -396,7 +396,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE runs.id = $2 AND runs.worker_id = $3
-  AND $1::text IN ('credential_disabled', 'credentials_reset')
+  AND $1::text IN ('credential_disabled', 'credentials_reset', 'provider_destination_not_allowed', 'provider_binding_stale')
   AND runs.kind = 'chat'
   AND runs.status = 'claimed'
 `
@@ -448,7 +448,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE runs.id = $3 AND runs.worker_id = $4
-  AND $2::text IN ('credential_disabled', 'credentials_reset')
+  AND $2::text IN ('credential_disabled', 'credentials_reset', 'provider_destination_not_allowed', 'provider_binding_stale')
   AND runs.claim_generation = $1
   AND runs.claim_released_at IS NULL
   AND runs.status = 'claimed'
@@ -462,8 +462,13 @@ type ParkCredentialDisabledRunParams struct {
 }
 
 // PRD #3989 M3: the park writers take the hold reason (credential_disabled, or credentials_reset
-// for a run claimed after its owner's account reset), guarded to those two values. The promoter,
-// list, lock and settle queries below read both reasons; the two reassign queries stay on
+// for a run claimed after its owner's account reset), guarded to those two values.
+// PRD #4320 module 5: the same two park writers also park a PROVIDER-BOUND run whose claim was
+// refused (hold_reason provider_destination_not_allowed or provider_binding_stale). Only the
+// destination hold has a promoter arm (the list, lock and settle queries below read it too);
+// provider_binding_stale is final: the run's frozen key or revision changed, so only a new run
+// helps, and no query below reads it. The promoter, list, lock and settle queries below read
+// both credential reasons plus the destination hold; the two reassign queries stay on
 // credential_disabled (a credentials_reset hold has no credential to re-point).
 //
 // Credential disablement parks an UNDELIVERED claim (status 'claimed', exact worker and
@@ -555,7 +560,7 @@ const promoteCredentialDisabledRun = `-- name: PromoteCredentialDisabledRun :one
 WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
     WHERE runs.id = $1 AND runs.user_id = $2
-  AND runs.status = 'paused' AND runs.hold_reason IN ('credential_disabled', 'credentials_reset')
+  AND runs.status = 'paused' AND runs.hold_reason IN ('credential_disabled', 'credentials_reset', 'provider_destination_not_allowed')
   AND runs.pause_requested_at IS NULL
   AND runs.credential_override_mode IS NOT DISTINCT FROM $3::text
   AND runs.credential_override_secret_id IS NOT DISTINCT FROM $4::uuid
@@ -617,7 +622,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE runs.id = $1 AND runs.user_id = $2
-  AND runs.status = 'paused' AND runs.hold_reason IN ('credential_disabled', 'credentials_reset')
+  AND runs.status = 'paused' AND runs.hold_reason IN ('credential_disabled', 'credentials_reset', 'provider_destination_not_allowed')
   AND runs.pause_requested_at IS NULL
   -- The requirement the promoter evaluated must still be the run's requirement: a
   -- concurrent reassignment or rebind that is not serialized by the caller's locks
@@ -828,7 +833,7 @@ WITH settled_inputs AS (
     UPDATE run_user_inputs u SET consumed_at = COALESCE(u.consumed_at, now()), applied_at = now()
     WHERE u.run_id = $1 AND u.kind = 'pause' AND u.applied_at IS NULL
       AND EXISTS (SELECT 1 FROM runs r WHERE r.id = $1 AND r.user_id = $2
-                  AND r.status = 'paused' AND r.hold_reason IN ('credential_disabled', 'credentials_reset')
+                  AND r.status = 'paused' AND r.hold_reason IN ('credential_disabled', 'credentials_reset', 'provider_destination_not_allowed')
                   AND r.pause_requested_at IS NOT NULL)
 )
 UPDATE runs SET
@@ -841,7 +846,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE runs.id = $1 AND runs.user_id = $2
-  AND runs.status = 'paused' AND runs.hold_reason IN ('credential_disabled', 'credentials_reset')
+  AND runs.status = 'paused' AND runs.hold_reason IN ('credential_disabled', 'credentials_reset', 'provider_destination_not_allowed')
   AND runs.pause_requested_at IS NOT NULL
   AND runs.credential_override_mode IS NOT DISTINCT FROM $3::text
   AND runs.credential_override_secret_id IS NOT DISTINCT FROM $4::uuid
@@ -911,7 +916,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE id = $1 AND user_id = $2
-  AND status = 'paused' AND hold_reason IN ('credential_disabled', 'credentials_reset')
+  AND status = 'paused' AND hold_reason IN ('credential_disabled', 'credentials_reset', 'provider_destination_not_allowed')
   AND pause_requested_at IS NULL
   AND credential_override_mode IS NOT DISTINCT FROM $3::text
   AND credential_override_secret_id IS NOT DISTINCT FROM $4::uuid

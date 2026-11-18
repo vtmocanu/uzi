@@ -469,6 +469,9 @@ type RunDTO struct {
 	// 'iteration_budget_exhausted' for an iteration park (Resume/Cancel; Extend adds time only),
 	// 'credential_disabled' while a credential the run needs is disabled (PRD #1732 D14),
 	// 'credentials_reset' while a run created before an account reset waits for a new credential (PRD #3989),
+	// 'provider_destination_not_allowed' / 'provider_binding_stale' while a provider-bound run's next claim was
+	// refused (PRD #4320: the operator no longer allows its URL, which re-queues by itself once allowed again;
+	// or its provider or key changed after creation, which is final; Resume is refused for both),
 	// 'credential_switch_settling' while the worker is still finishing its own operations on a run whose
 	// token switch could not be proven settled (Resume is refused until it finishes; Cancel works),
 	// 'credential_switch_unsettled' once it finished them, processes not proven stopped (Resume is open) (issue
@@ -1445,6 +1448,9 @@ type RunSummaryItemDTO struct {
 	// 'iteration_budget_exhausted' for an iteration park (Resume/Cancel; Extend adds time only),
 	// 'credential_disabled' while a credential the run needs is disabled (PRD #1732 D14),
 	// 'credentials_reset' while a run created before an account reset waits for a new credential (PRD #3989),
+	// 'provider_destination_not_allowed' / 'provider_binding_stale' while a provider-bound run's next claim was
+	// refused (PRD #4320: the operator no longer allows its URL, which re-queues by itself once allowed again;
+	// or its provider or key changed after creation, which is final; Resume is refused for both),
 	// 'credential_switch_settling' while the worker is still finishing its own operations on a run whose
 	// token switch could not be proven settled (Resume is refused until it finishes; Cancel works),
 	// 'credential_switch_unsettled' once it finished them, processes not proven stopped (Resume is open) (issue

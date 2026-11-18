@@ -107,9 +107,11 @@ func TestRunOverrideNoticeCopy(t *testing.T) {
 
 // The set drives the default `run wait` stop and the TUI owner band and count: membership is pinned.
 func TestHoldSetStopAndBoardMembership(t *testing.T) {
-	wantWait := map[string]bool{holdBaseAttestation: true, holdCredentialSwitchSettling: true, holdCredentialSwitchUnsettled: true, holdRunOverrideUnavailable: true}
+	wantWait := map[string]bool{holdBaseAttestation: true, holdCredentialSwitchSettling: true, holdCredentialSwitchUnsettled: true, holdRunOverrideUnavailable: true,
+		holdProviderBindingStale: true}
 	wantBoard := map[string]bool{holdCredentialDisabled: true, holdCredentialsReset: true, holdProviderUnavailable: true, holdIterationExhausted: true,
-		holdCredentialSwitchSettling: true, holdCredentialSwitchUnsettled: true, holdRunOverrideUnavailable: true}
+		holdCredentialSwitchSettling: true, holdCredentialSwitchUnsettled: true, holdRunOverrideUnavailable: true,
+		holdProviderDestinationNotAllowed: true, holdProviderBindingStale: true}
 	for reason := range nonCompletionHolds {
 		reason := reason
 		r := apitypes.RunDTO{ID: "r1", Status: statusPaused, HoldReason: &reason}

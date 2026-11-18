@@ -165,11 +165,24 @@ WHERE u.id = $1;
 SELECT id, kind, provider_id, disabled_at, enablement_rev FROM user_secrets
 WHERE id = $1 AND user_id = $2;
 
+-- name: LockProviderBindingKeyForShareNowait :one
+-- The claim finisher's in-transaction re-check of a PROVIDER-BOUND run's frozen key (PRD #4320
+-- module 5, D9), taken under the exact-claim run lock. FOR SHARE blocks a concurrent rotation,
+-- disable or delete (which lock the row FOR UPDATE under the owner's secret mutation lock) until the
+-- claim decision commits; NOWAIT means the finisher never waits on that writer while holding the
+-- run row: a held row is 55P03 and finishRunClaim / finishChatClaim retry the whole transaction.
+-- Owner-scoped; a missing row is pgx.ErrNoRows (the key was deleted: stale).
+SELECT id, kind, provider_id, disabled_at, enablement_rev FROM user_secrets
+WHERE id = $1 AND user_id = $2
+FOR SHARE NOWAIT;
+
 -- name: GetModelProviderRevisionForOwner :one
 -- A frozen revision of an owner's provider (inherited creation re-checks the URL against the
--- allowlist). Owner-scoped. FOR KEY SHARE OF r pins the revision row for the successor's
--- transaction, so the revision-prune delete (which takes the row's key lock) cannot remove a
--- revision between this re-check and the successor's insert.
+-- allowlist). Owner-scoped. FOR KEY SHARE OF r only protects the prune-FIRST ordering (a prune that
+-- already took the row's key lock makes this read wait, then find the row gone): it is released with
+-- the transaction and does not by itself keep the revision. What keeps PruneModelProviderRevisions off
+-- a revision is the source run row's own reference (model_provider_revision), which stays true while
+-- run rows are never deleted.
 SELECT r.provider_id, r.revision, r.protocol, r.base_url, r.auth_style, r.model_map
 FROM model_provider_revisions r
 JOIN model_providers p ON p.id = r.provider_id
