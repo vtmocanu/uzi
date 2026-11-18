@@ -4125,7 +4125,7 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   URL from `UZI_PROVIDER_ALLOWED_BASE_URLS`, and the run resumes by itself once it is allowed
   again; `hold_reason: provider_binding_stale` means the provider's key or revision changed
   after the run was created, so it cannot continue. `run get` prints a `HOLD` row reading
-  `provider URL not allowed` or `provider binding changed`; `run get --follow` and `run wait`
+  `provider URL not allowed` or `provider binding changed`; `run logs --follow` and `run wait`
   name the next step (wait, or `uzi run cancel` and start a new run). No worker claims a provider
   run yet (activation is blocked), so these holds cannot occur until it lands. `run resume` is refused with a 409 for both, and neither
   falls back to an Anthropic token. See [Model providers](./providers.md#what-a-run-keeps).
