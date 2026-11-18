@@ -415,7 +415,7 @@ control is still absent, not that the functional criterion was deferred.
 | Proven A root/tool reap before B material, login and model work; fresh CODEX_HOME | R5 (runner hold) and U4: executor reap proof for root and command-root failures, combined no-B-before-reap fence, distinct per-epoch HOME (b); in-flight tool callbacks, launcher must-not-exist and other phases not controlled |
 | Whole operation-scope/refresh/identity/capability/summary replacement and retired-A rejection | A2 one reader; A3 scope namespace; R7 B dispatcher readiness; R8 retired API-key A reconcile fence; U5 retired A refresh bridge pre-call refusal (P3), combined executor summary-guard refusal, B expected identity carried (b); A-account rejection, bridge post-call copy, assertRefreshAdmission and Now stale-result drops not separately controlled |
 | Exact saved-ID resume; confirmed-refusal-only fresh fallback and lineage; preservation re-hold | R6 uncertain-error classification; U6 resume carries the saved id, lineage notice, three-copy preserve re-hold, crash missing-id disclosure (d) and preserve retained refusal with a saved conversation (b); confirmed-refusal classification (timeout), :4148 check and session_missing on the switch path not controlled |
-| Policy episode rejection at request and under apply lock | D74–D77 credit the two isolated owner cases and the same two conditions introduced after READY before apply; paused holds, concurrent interleavings and other policy clauses unvalidated |
+| Policy episode rejection at request and under apply lock | D74–D77 owner request and post-READY apply; U7 episode starting before preflight (both arms); hold arm unreachable in live statuses by `runs_policy_hold_shape`, paused hold refused by status (u1-status1); concurrent lock-order contention not controlled |
 | Refresh lease/intent exclusion, account lock ordering and boundary reconciliation before revoke | D78/D79 credit isolated A coordination-lease and rotating-intent server checks; actual refresh admission, multi-account lock ordering and worker reconciliation ordering remain unvalidated |
 | Post-switch release epoch and secret-hash authorization | B5/B6 preservation sensitivity controls below, through real worker apply and release routes; final reauthorization timing unvalidated |
 | Transactional frozen binding rewrite, capability revoke/remint and post-commit material response | Unvalidated; B5/B6 do not establish transaction atomicity or mint/revoke implementation |
@@ -2185,7 +2185,8 @@ runner (runner.ts :17688–17704) re-holds a preserve-only run with
 `PolicyContinuationRejected("provider_resume_rejected")`.
 
 No test change in this unit; existing real Runner cases. Command (agent,
-one-at-a-time export; commit c5ad0d0cf59ac44ea54338bd74bf4a7eeb03f5c0):
+one-at-a-time export; commit c5ad0d0cf59ac44ea54338bd74bf4a7eeb03f5c0, and for
+u6-preserve-3copy / u6-crash-preserve-saved the ledger-only successor 22200286b):
 `npm run typecheck && node --import tsx --test --test-timeout=120000
 --test-name-pattern='<pattern>' test/codex-executor.test.ts`.
 
@@ -2224,7 +2225,61 @@ agent `npm run lint` 0/0.
 Credit: B's `thread/resume` carries the exact saved thread id (later turns on
 that thread are not pinned in the baseline case, and the returned thread id is
 not checked against the requested one); a fresh lineage emits its notice; a
-preserve-only run re-holds instead of starting a fresh B thread (three-copy
-fence); after worker loss a missing persisted id is disclosed as a lineage
+preserve-only run's re-hold depends on the three-copy fence (the red shows the
+re-hold missing; a fresh B thread start was not observed); after worker loss a missing persisted id is disclosed as a lineage
 break; a preserve-only retained recovery with a saved conversation refuses
 without launching a provider (preserved behaviour).
+
+U6 checkpoint record: the owner confirmed the published checkpoint ref equals
+bb4559fa8a5e8fa71915f69095b882f105ece139 and contains c5ad0d0cf59a….
+
+### U7 — policy episode refusal at owner request, preflight and apply (2026-11-18)
+
+Baseline: a233 refused every Codex owner request at
+`git show a233883de3c36bae2e940f999cd9d582889dad00:api/internal/workersvc/credential_override.go`
+:204 (see D74), so the switch's policy fences are new.
+
+Predicate (api/internal/workersvc/policy_hold.go :189–192): the hold arm
+(`hold_reason = 'codex_policy_hold'`), the pending-fresh arm and the
+unresolved-outcome arm. Call sites: owner request (run_credential.go :632) and
+`validateCodexSwitchLocked` (credential_switch_codex.go :136), shared by worker
+preflight and apply.
+
+Hold arm: unreachable on these live-status paths. The database rejects
+`hold_reason = 'codex_policy_hold'` for running and every awaiting status:
+`runs_policy_hold_shape` (api/internal/store/migrations/00397_compact_policy_hold.sql)
+requires `status IN ('paused','failed','cancelled','completed')` for that hold
+(probe: `new row … violates check constraint "runs_policy_hold_shape"`). A paused
+policy hold is refused by the owner request's status guard, credited by
+u1-status1 (paused); preflight/apply require a live claimed run.
+
+New test (this commit): `TestWorkerCodexPolicyEpisodeBeforePreflightRouteLiveDB`
+(api/internal/handler/codex_switch_apply_policy_routes_livedb_test.go), leaves
+`pending_fresh` and `unresolved_outcome`. After the shared fixture's first
+(rolled-back) READY, it installs the policy tuple, then calls the real worker
+preflight route again and the apply route. Each must return `not_applied` /
+`policy_refusal` (preflight with exactly five fields and no `expected_epoch`),
+with all six snapshot sections unchanged. This is the "episode starts between
+the owner request and preflight" interleaving; D76/D77 cover "after READY,
+before apply"; D74/D75 the owner request.
+
+Command (api, one-at-a-time export; commit
+bb4559fa8a5e8fa71915f69095b882f105ece139 plus this commit's test file, sha256
+2e7cf79f830b…): `GOFLAGS=-p=1 GOMAXPROCS=4 go test -race -count=1
+./internal/handler -run '^TestWorkerCodexPolicyEpisodeBeforePreflightRouteLiveDB$/<leaf>' -v`
+on throwaway postgres `cdr-4202-pg`.
+
+| Control | Kind | Mutation | Leaf | Red at |
+|---|---|---|---|---|
+| u7-preflight-fresh | (d) guard | `r.PolicyPendingFresh` → `(false && r.PolicyPendingFresh)` (policy_hold.go :190) | pending_fresh | test :59 preflight outcome "ready", want not_applied |
+| u7-preflight-outcome | (d) guard | unresolved-outcome arm → `(false && …)` (policy_hold.go :191) | unresolved_outcome | test :59 preflight outcome "ready", want not_applied |
+
+Unchanged candidate: the three policy route tests, six leaves, pass, EXIT=0
+(`.uzi/scratch/ctl-logs/u7-green.log`); `task lint:api` 0 issues.
+
+Credit: an unresolved policy episode (pending fresh or unresolved outcome)
+refuses the switch at the owner request (D74/D75), at preflight when it
+starts after the request (U7) and at apply when it starts after READY
+(D76/D77); the hold arm is unreachable in live statuses by schema, and a paused
+hold is refused by status. Not credited: true concurrent interleaving under
+contention (lock-order) beyond these sequential orderings; that is U8.

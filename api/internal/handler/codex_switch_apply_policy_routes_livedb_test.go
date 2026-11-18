@@ -11,6 +11,98 @@ import (
 	"github.com/google/uuid"
 )
 
+// A policy episode that starts after the owner request is stored but before the
+// worker's (next) preflight must be refused by preflight itself, never READY,
+// and apply, which repeats validation, must refuse too. The shared setup helper
+// obtains one earlier READY (a rolled-back, stateless decision); the episode is
+// installed after it and the real preflight route is called again.
+func TestWorkerCodexPolicyEpisodeBeforePreflightRouteLiveDB(t *testing.T) {
+	for _, fence := range []string{"pending_fresh", "unresolved_outcome"} {
+		t.Run(fence, func(t *testing.T) {
+			e, w := setupStoppedGuardsRouteWithSeed(t, true)
+			ctx := context.Background()
+			var target uuid.UUID
+			if err := e.pool.QueryRow(ctx, `SELECT codex_switch_target_secret_id FROM runs WHERE id=$1`,
+				e.run).Scan(&target); err != nil {
+				t.Fatal(err)
+			}
+			if target == uuid.Nil {
+				t.Fatal("fixture requires a pending target B")
+			}
+			fresh := fence == "pending_fresh"
+			stoppedRouteExec(t, e, `UPDATE runs SET
+ status='running', hold_reason=NULL,
+ policy_outcome_id=$2, policy_preserve_required=true,
+ policy_continuation_mode='same_conversation',
+ policy_applying_worker_id=worker_id,
+ policy_applying_generation=claim_generation,
+ policy_source_generation=claim_generation,
+ policy_pending_fresh=$3,
+ policy_resolved_at=CASE WHEN $3::boolean THEN now() ELSE NULL END
+ WHERE id=$1`, e.run, uuid.New(), fresh)
+
+			before := stoppedRouteSnapshot(t, e)
+			pre := fmt.Sprintf(`{"claim_generation":%d,"register_nonce":%q,"op_id":%q,"target_secret_id":%q}`,
+				w.ClaimGeneration, w.RegisterNonce, e.op, target)
+			rec := e.do(e.worker, http.MethodPost,
+				"/api/worker/runs/"+e.run.String()+"/credential-switch/codex/preflight", pre)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("policy-fenced preflight status=%d, want 200", rec.Code)
+			}
+			var wire map[string]json.RawMessage
+			if json.Unmarshal(rec.Body.Bytes(), &wire) != nil {
+				t.Fatal("preflight response is not a JSON object")
+			}
+			var outcome, reason string
+			// Check the decision first so a bypass fails on READY, not on shape.
+			if json.Unmarshal(wire["outcome"], &outcome) != nil || outcome != "not_applied" {
+				t.Fatalf("policy-fenced preflight outcome=%.64q, want not_applied", outcome)
+			}
+			if json.Unmarshal(wire["reason"], &reason) != nil || reason != "policy_refusal" {
+				t.Fatal("policy-fenced preflight did not return policy_refusal")
+			}
+			if _, ok := wire["expected_epoch"]; ok {
+				t.Fatal("refused preflight must not carry READY authority")
+			}
+			var gen int64
+			var nonce, op string
+			if json.Unmarshal(wire["claim_generation"], &gen) != nil || gen != w.ClaimGeneration ||
+				json.Unmarshal(wire["register_nonce"], &nonce) != nil || nonce != w.RegisterNonce ||
+				json.Unmarshal(wire["op_id"], &op) != nil || op != e.op.String() {
+				t.Fatal("refused preflight must echo the current claim, nonce and operation")
+			}
+			if len(wire) != 5 {
+				t.Fatal("refused preflight must contain exactly outcome, reason, claim_generation, register_nonce and op_id")
+			}
+
+			rec = e.do(e.worker, http.MethodPost, e.applyPath(), fmt.Sprintf(
+				`{"claim_generation":%d,"register_nonce":%q,"op_id":%q}`, w.ClaimGeneration, w.RegisterNonce, e.op))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("apply after refused preflight status=%d, want 200", rec.Code)
+			}
+			var applyWire map[string]json.RawMessage
+			if json.Unmarshal(rec.Body.Bytes(), &applyWire) != nil ||
+				json.Unmarshal(applyWire["outcome"], &outcome) != nil || outcome != "not_applied" ||
+				json.Unmarshal(applyWire["reason"], &reason) != nil || reason != "policy_refusal" {
+				t.Fatal("apply after refused preflight did not return not_applied/policy_refusal")
+			}
+
+			after := stoppedRouteSnapshot(t, e)
+			sections := []string{"run", "base", "switch", "messages", "inputs", "custody"}
+			if len(before) != len(sections) || len(after) != len(sections) {
+				t.Fatal("snapshot must contain all six sections")
+			}
+			for _, section := range sections {
+				b, bok := before[section]
+				a, aok := after[section]
+				if !bok || !aok || !reflect.DeepEqual(b, a) {
+					t.Fatalf("refused preflight or apply changed snapshot section %s", section)
+				}
+			}
+		})
+	}
+}
+
 func TestWorkerCodexApplyPolicyAfterPreflightRouteLiveDB(t *testing.T) {
 	for _, fence := range []string{"pending_fresh", "unresolved_outcome"} {
 		t.Run(fence, func(t *testing.T) {
