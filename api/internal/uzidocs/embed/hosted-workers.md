@@ -590,6 +590,81 @@ attempt, and could scale a worker down in the middle of a prune. CHECK constrain
 on the worker row refuse an old-code write that would reopen claims during an
 unsettled attempt, so such a write fails instead of silently dropping the fence.
 
+## Moving workers to a new node pool
+
+Changing `workers.nodeSelector` or `workers.tolerations` rolls every worker with its
+old volumes. When the new nodes are a dedicated, tainted pool, possibly in a different
+storage topology zone, those volumes may not attach there. The opt-in
+`workers.newPlacement` chart value lets you move workers one at a time instead, by
+recreating each worker's volumes where the new placement applies.
+
+How the stamp works:
+
+- While `workers.newPlacement` is set, the controller stamps each worker volume it
+  creates with the annotation `uzi.dev/placement: new`. It never adds, removes or
+  rewrites the stamp on an existing volume, and it deletes nothing.
+- Per worker on each reconcile pass: if any of its volumes is Terminating, it creates
+  none; if none exist, it creates all of them stamped; if all existing ones are stamped,
+  it creates the missing ones stamped; if any existing one is unstamped, it creates the
+  missing ones unstamped.
+- A worker is stamped when `newPlacement` is set and every one of its volumes is
+  stamped (a worker with no volumes counts as stamped). Stamped workers render
+  `newPlacement`; all others render the global `workers.nodeSelector` and
+  `workers.tolerations`.
+- For a stamped worker both `newPlacement` fields replace the global ones, they do not
+  merge. A tolerations-only `newPlacement` therefore renders no node selector at all:
+  keep `kubernetes.io/arch: amd64` in `newPlacement.nodeSelector` and repeat any global
+  toleration the worker still needs.
+- Setting `newPlacement` rolls nothing: existing workers' pod templates are unchanged.
+  Clearing it sends stamped workers back to the global placement; the stamps are kept,
+  so setting it again resumes.
+- Which volumes are recreated decides which workers move. A recycle for data plus Nix
+  pressure on a plain worker moves it. A Nix-only size recycle stays on the old
+  placement, and so does a Docker pressure recycle, which keeps `/data`. Run-bound
+  (ephemeral) workers get fresh volumes, so they move. Hibernation is unchanged.
+
+Procedure:
+
+1. Set `workers.newPlacement` (`nodeSelector` and `tolerations`) in your values. Nothing
+   rolls.
+2. For each worker that is not hibernated (wake a hibernated worker first, or leave it
+   for later):
+   1. Cordon the worker and wait until it holds no assigned run and no recovery custody
+      hold. Back up anything you need from `/data`.
+   2. Stop the controller: scale its Deployment to 0 and wait until its pods have
+      terminated. Under GitOps, pause self-heal for it first, or the sync restores it.
+   3. Scale the worker's Deployment to 0 and confirm no worker pod exists.
+   4. Delete all of the worker's volumes (`<id>-data`, `<id>-nix`, and `<id>-dind-data`
+      on Docker workers) and confirm they are gone, not Terminating.
+   5. Start the controller again (restore its replicas and self-heal). On the following
+      reconcile passes it creates the volumes stamped, re-renders the worker's
+      Deployment with the new placement, and restores its replicas once the existing
+      placement guards permit; they wait for a fresh observation of the recreated
+      claims. The restore goes through the normal paced roll admission (roll evidence
+      for the worker, a free roll slot in its pool, no other unpromoted canary), so it
+      can wait on that. The volumes bind in the new zone (`WaitForFirstConsumer`).
+   6. Confirm the worker is online on a new node, then uncordon it.
+3. When no unstamped worker remains, copy `newPlacement` into `workers.nodeSelector` and
+   `workers.tolerations` first, then clear `newPlacement`.
+
+Check which workers are stamped. Annotations are not shown by `-L`, so use:
+
+```sh
+kubectl get pvc -n <worker namespace> \
+  -o custom-columns=NAME:.metadata.name,PLACEMENT:.metadata.annotations.uzi\.dev/placement
+```
+
+Caveats:
+
+- Step 2.4 permanently deletes the worker's `/data` (run clones and the recovery store)
+  and any Docker state. The controller does not guard a manual delete, so step 2.1 is the
+  only safety gate.
+- While the controller is stopped, no worker is provisioned, rolled, hibernated or
+  woken. Keep that window to minutes.
+- Clearing `newPlacement` before updating the global placement sends stamped workers back
+  to the old nodes, where their new volumes may not attach. Rolling back to a controller
+  version without this feature has the same effect, because it ignores the stamp.
+
 ## Pod shutdown grace
 
 Worker pods render `terminationGracePeriodSeconds: 40`. On a stop, the worker joins its own already-authorized authority settlements and logs one `worker_shutdown_result` line within 35 s of the first signal; the extra 5 s is margin (the result is described in [Configuration](./configuration.md)). The field is part of the pod spec, so upgrading the controller changes the pod spec hash once and every hosted worker rolls once through the existing paced roll ([ADR-1470](../adr/1470-paced-hosted-worker-rolls.md)). If a worker stops on its own and its shutdown is `incomplete` (exit 1), the container restarts in the live pod, and the roll health view may briefly name that terminated container (exit 1) as the blocking one; a pod being deleted by the roll is normally not shown. An `incomplete` result never certifies anything: any unresolved record keeps its protections (a successor still refuses it), while a write already started may still complete after the diagnostic. Hosted end-to-end acceptance is pending.
