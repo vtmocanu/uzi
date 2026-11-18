@@ -1900,8 +1900,11 @@ The check covers creating a handoff only:
 
 - **Pulling the result:** `git fetch origin` (the command above and the CLI's
   hint) reads origin's *fetch* URL. If that differs from the push destination,
-  fetch from the push URL instead:
-  `git fetch "$(git remote get-url --push origin)" uzi/task/<run-id>:uzi/task/<run-id>`.
+  add a separate remote for the repository handoff pushed to. Confirm
+  `git remote get-url <remote>` names that repository, then run
+  `git fetch <remote> uzi/task/<run-id>`. Don't paste the output of
+  `git remote get-url --push` back into git, because `insteadOf` rules can
+  rewrite it a second time.
 - **`uzi handoff rm`:** it deletes the branch with `git push origin --delete`,
   which runs no check and goes to every push destination. Confirm
   `git remote get-url --push --all origin` before removing.
