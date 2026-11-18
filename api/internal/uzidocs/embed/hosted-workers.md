@@ -639,9 +639,11 @@ Procedure:
       hold. Back up anything you need from `/data`.
    2. Stop the controller: scale its Deployment to 0 and wait until its pods have
       terminated. Under GitOps, pause self-heal for it first, or the sync restores it.
-   3. Scale the worker's Deployment to 0 and confirm no worker pod exists.
-   4. Delete all of the worker's volumes (`<id>-data`, `<id>-nix`, and `<id>-dind-data`
-      on Docker workers) and confirm they are gone, not Terminating.
+   3. Scale the worker's Deployment (`uzi-hw-<id>`, where `<id>` is the worker id) to 0
+      and confirm no worker pod exists.
+   4. Delete all of the worker's volumes (`uzi-hw-<id>-data`, `uzi-hw-<id>-nix`, and
+      `uzi-hw-<id>-dind-data` on Docker workers) and confirm they are gone, not
+      Terminating.
    5. Start the controller again (restore its replicas and self-heal). On the following
       reconcile passes it creates the volumes stamped, re-renders the worker's
       Deployment with the new placement, and restores its replicas once the existing

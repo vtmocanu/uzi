@@ -951,15 +951,24 @@ func (m *Materializer) recycleWorkerVolumes(ctx context.Context, w protocol.Desi
 //
 // With newPlacement set, new claims are stamped uzi.dev/placement=new only when the
 // worker's tick decision says stamped (no claim exists, or every existing one is
-// stamped). A Terminating claim holds back every create: otherwise a staggered deletion
-// could leave a stamped replacement beside a still-unstamped claim, a mixed set that
-// renders the global placement while owning claims created under the new one.
+// stamped). A Terminating claim holds back every create: during a staggered deletion the
+// decision counts the Terminating claim, so a create made now could be UNSTAMPED, and
+// that unstamped replacement would pin the worker to the legacy placement for good.
+// Each claim is read only together with its own Has* flag: on the fenced DinD maintenance
+// path the flags are refreshed while the claim pointers are the earlier observation's.
 func (m *Materializer) ensurePVCs(ctx context.Context, w protocol.DesiredWorker, obs reconcile.ObservedWorker, ns string, spec preset.Spec) (deferred bool, err error) {
 	placementSet := m.cfg.NewPlacementSet()
 	stamp := false
 	if placementSet {
-		for _, c := range []*reconcile.ClaimObservation{obs.DataClaim, obs.NixClaim, obs.DinDClaim} {
-			if c != nil && c.Terminating {
+		for _, c := range []struct {
+			has   bool
+			claim *reconcile.ClaimObservation
+		}{
+			{obs.HasDataPVC, obs.DataClaim},
+			{obs.HasNixPVC, obs.NixClaim},
+			{obs.HasDinDDataPVC, obs.DinDClaim},
+		} {
+			if c.has && c.claim != nil && c.claim.Terminating {
 				return false, nil
 			}
 		}
@@ -995,6 +1004,7 @@ func (m *Materializer) ensurePVCs(ctx context.Context, w protocol.DesiredWorker,
 			// attempted, and this tick's decision was made without it. Do nothing
 			// more for the worker (no further claims, no Deployment render) and let
 			// the next observation decide.
+			m.log.Info("pvc already exists but is not attributed to the worker; deferring", "worker_id", w.ID, "pvc", pvc.Name)
 			return true, nil
 		}
 		if err == nil && pvc.Name == dindDataPVCName(w.ID) {

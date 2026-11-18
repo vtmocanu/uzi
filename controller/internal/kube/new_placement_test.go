@@ -58,12 +58,6 @@ func npTick(t *testing.T, m *Materializer, ws ...protocol.DesiredWorker) error {
 	return m.Reconcile(ctx, ws, o)
 }
 
-func pvcStamped(id, kind string) *corev1.PersistentVolumeClaim {
-	p := pvcFor(id, kind)
-	p.Annotations = map[string]string{AnnotationPlacement: placementNew}
-	return p
-}
-
 // livePVCs renders the worker's claims as they would exist after creation, stamped or
 // not, so size drift and expansion stay out of the way.
 func livePVCs(t *testing.T, cfg RenderConfig, w protocol.DesiredWorker, stamped bool) []runtime.Object {
@@ -617,6 +611,98 @@ func TestNewPlacementAC8ImageChangeKeepsNewPlacement(t *testing.T) {
 	}
 	if !strings.Contains(workerImage(d), "v1.1.0") {
 		t.Errorf("image = %s, want the v1.1.0 target", workerImage(d))
+	}
+}
+
+// AC8: a size change (a different resolved pod template) of a stamped worker keeps the new
+// placement and neither gains nor loses a claim stamp.
+func TestNewPlacementAC8SizeChangeKeepsNewPlacement(t *testing.T) {
+	cfg := placementConfig()
+	w := desired("w1")
+	w.Ephemeral = true
+	w.Size = "l"
+	w = evidence(w, m5Now)
+	old := liveDeployment(t, cfg, w, true)
+	oldMem := old.Spec.Template.Spec.Containers[0].Resources.Limits.Memory().String()
+	resized := w
+	resized.Size = "l-highmem"
+	m, client := npMat(t, cfg, append(livePVCs(t, cfg, w, true), old)...)
+	if err := npTick(t, m, resized); err != nil {
+		t.Fatal(err)
+	}
+	d := npDep(t, client, cfg.Namespace, "w1")
+	if got := d.Spec.Template.Spec.Containers[0].Resources.Limits.Memory().String(); got == oldMem {
+		t.Fatalf("memory limit %s did not change; the size change never reached the Deployment", got)
+	}
+	if got := podPlacement(d); got != "new" {
+		t.Errorf("placement after the size change = %s", got)
+	}
+	if got := d.Spec.Template.Spec.Tolerations; len(got) != 1 || got[0].Value != "new" {
+		t.Errorf("tolerations after the size change = %v", got)
+	}
+	for _, n := range []string{dataPVCName("w1"), nixPVCName("w1")} {
+		if !isStamped(npPVC(t, client, cfg.Namespace, n)) {
+			t.Errorf("claim %s lost its stamp", n)
+		}
+	}
+	if got := len(createdPVCs(client)); got != 0 {
+		t.Errorf("size change created %d claims", got)
+	}
+}
+
+// The Terminating gate reads each claim with its own Has* flag. On the fenced DinD
+// maintenance path the flags are refreshed but the claim pointers are stale: a claim that
+// the refresh no longer sees must not hold back the create of its replacement.
+func TestNewPlacementTerminatingGateIgnoresStaleClaimPointer(t *testing.T) {
+	cfg := placementConfig()
+	cfg.DockerNamespace = "uzi-workers-docker"
+	cfg.DinDImage = "docker:28-dind-rootless@sha256:deadbeef"
+	w := desiredDocker("w1")
+	m, client := npMat(t, cfg)
+	claim := func(name string, terminating bool) *reconcile.ClaimObservation {
+		return &reconcile.ClaimObservation{Name: name, PlacementNew: true, Terminating: terminating}
+	}
+	obs := reconcile.ObservedWorker{
+		ID: "w1", HasDataPVC: true, HasNixPVC: true, HasDinDDataPVC: false,
+		DataClaim: claim(dataPVCName("w1"), false), NixClaim: claim(nixPVCName("w1"), false),
+		DinDClaim: claim(dindDataPVCName("w1"), true), // stale: gone in the refreshed flags
+	}
+	deferred, err := m.ensurePVCs(context.Background(), w, obs, cfg.DockerNamespace, testSpec(t, w.Template, w.Size))
+	if err != nil || deferred {
+		t.Fatalf("ensurePVCs = %v, %v", deferred, err)
+	}
+	created := createdPVCs(client)
+	p := created[dindDataPVCName("w1")]
+	if len(created) != 1 || p == nil {
+		t.Fatalf("created = %v, want only the dind claim", created)
+	}
+	if !isStamped(p) {
+		t.Error("dind claim created unstamped")
+	}
+}
+
+// With newPlacement unset a Terminating claim does not gate creates: the missing sibling is
+// still created, unstamped (today's behaviour).
+func TestNewPlacementUnsetTerminatingClaimDoesNotGate(t *testing.T) {
+	cfg := globalOnly(placementConfig())
+	w := newWorkerFixture(desired("w1"))
+	m, client := npMat(t, cfg, pvcTerminating("w1", "data"))
+	if err := npTick(t, m, w); err != nil {
+		t.Fatal(err)
+	}
+	p := createdPVCs(client)[nixPVCName("w1")]
+	if p == nil {
+		t.Fatalf("sibling nix claim not created; created = %v", createdPVCs(client))
+	}
+	if isStamped(p) {
+		t.Error("sibling created stamped with newPlacement unset")
+	}
+}
+
+// A claim flagged present but with no observation is not proof of a stamp.
+func TestNewPlacementStampedNeedsReadableClaim(t *testing.T) {
+	if newPlacementStamped(placementConfig(), reconcile.ObservedWorker{ID: "w1", HasDataPVC: true}) {
+		t.Error("present claim with nil observation counted as stamped")
 	}
 }
 
