@@ -2837,10 +2837,12 @@ missing footprint, and any other slot keeps. The worker-wide slot inventory is
 checked against the authenticated heads (a head-recorded slot whose file or `slots`
 directory is gone refuses the inventory, which keeps the leaf), and an inventory slot
 with no publication record keeps the leaf as unknown unless the run's own ledger
-entry attributed it and judged it ended. An outbox manifest or finalize record that
-the outbox could not load at startup (unreadable, malformed, unauthenticated,
-cross-run or a non-canonical name) keeps the leaf as unknown for the life of that
-process.
+entry attributed it and judged it ended and the inventory copy is itself still an
+ended tombstone. An outbox manifest or finalize record that the outbox could not
+load at startup (unreadable, malformed, unauthenticated, cross-run or a non-canonical
+name, including a finalize temp file a crash left behind), or a run directory it could
+not list, keeps the leaf as unknown for the life of that process. Undrained outbox
+messages kept under a case alias of the run id keep the leaf.
 
 New `scratch.kept` reasons for run leaves:
 
