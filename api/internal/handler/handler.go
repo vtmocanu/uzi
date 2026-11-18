@@ -67,6 +67,11 @@ type Handler struct {
 	// secretBeginTx supplies a real transaction for secret mutations in tests.
 	// Production uses pool.BeginTx; withSecretLock enforces READ COMMITTED.
 	secretBeginTx func(ctx context.Context) (pgx.Tx, error)
+	// runEnvHasReceipt, when non-nil, replaces store.RunEnvVersionHasReceipt as the answer to
+	// "does any run hold a delivery receipt for this variable version" (PRD #4416), so a
+	// test can reach the retire and pending-deletion paths before M2 adds receipts. nil in
+	// production.
+	runEnvHasReceipt func(ctx context.Context, varID uuid.UUID, rev int32) (bool, error)
 	// tmplWriteStore, when non-nil, replaces h.q for the two builtin-definition/reset
 	// agent-template handlers so their DB touch can be faked in a unit test without a
 	// live database (issue #223). nil in production — New leaves it unset and the

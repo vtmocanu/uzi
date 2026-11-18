@@ -46,5 +46,6 @@
     "healthy": true,
     "last_error": "x",
     "last_synced_at": "2020-01-02T03:04:05Z"
-  }
+  },
+  "env_var_count": 1
 }

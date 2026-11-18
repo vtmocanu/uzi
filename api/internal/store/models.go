@@ -1413,6 +1413,25 @@ type RunDecisionMemo struct {
 	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
 }
 
+type RunEnvVar struct {
+	ID              uuid.UUID          `json:"id"`
+	VarID           uuid.UUID          `json:"var_id"`
+	UserID          uuid.UUID          `json:"user_id"`
+	RepoID          pgtype.UUID        `json:"repo_id"`
+	Name            string             `json:"name"`
+	Secret          bool               `json:"secret"`
+	Description     string             `json:"description"`
+	Ciphertext      []byte             `json:"ciphertext"`
+	SealedWith      string             `json:"sealed_with"`
+	ValueBytes      int32              `json:"value_bytes"`
+	Rev             int32              `json:"rev"`
+	RetiredAt       pgtype.Timestamptz `json:"retired_at"`
+	DisabledAt      pgtype.Timestamptz `json:"disabled_at"`
+	PendingDeleteAt pgtype.Timestamptz `json:"pending_delete_at"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+}
+
 type RunFetch struct {
 	ID            uuid.UUID          `json:"id"`
 	RunID         uuid.UUID          `json:"run_id"`
