@@ -250,7 +250,7 @@ describe("compactAttemptLedger keeps taint a reclaim evaluation relies on (#4263
     });
   };
 
-  it("control: a canonical bound attempt still compacts to its last value and still compacts only to its last value (C-prime: a settled binding is kept, never reclaimable)", async () => {
+  it("control: a canonical bound attempt compacts to its last value, and its settled binding stays kept (settled_kept) before and after", async () => {
     addLedger(JSON.stringify({ attemptId: ATTEMPT, runId: "run-4263", clonePath: clonePath(), state: "live" }));
     addLedger(canonicalRetired());
     bindSettled();

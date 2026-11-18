@@ -630,6 +630,100 @@ describe("budget inside the locked section", PROC, () => {
 
 });
 
+// C-prime keeps every present settled parent at nomination, so the only parents that reach the reservation, the authority read and the
+// locked re-checks are GONE parents (binding present, parent directory absent). Each gate below decides whether the metadata-only
+// recovery (`recoverGone`, which unsets the binding) may run; every test asserts the binding is byte-identical and nothing was recovered.
+describe("gone parents: the gates before recoverGone", PROC, () => {
+  type Result = Awaited<ReturnType<World["run"]>>;
+  const notRecovered = (result: Result, s: Seed, reason: string): void => {
+    assert.equal(result.retire_scratch.recovered, 0, JSON.stringify(result.retire_scratch));
+    assert.equal(result.retire_scratch.reclaimed, 0);
+    assert.equal(result.retire_scratch.kept_by_reason[reason], 1, JSON.stringify(result.retire_scratch.kept_by_reason));
+    assert.deepEqual(w.bindingRaws(s.uuid), [s.raw], "binding raw unchanged");
+    assert.ok(!w.steps.includes("unset"), "no unset");
+    assert.ok(!w.steps.includes("recover-root-sync"), "no recovery sync");
+    assert.equal(w.spawns.length, 0);
+    assert.equal(w.pending, 0);
+  };
+
+  it("control: with every gate satisfied the same gone parent is recovered", async () => {
+    const s = w.seed({ withParent: false });
+    const result = await w.run();
+    assert.equal(result.retire_scratch.recovered, 1);
+    assert.deepEqual(w.bindingRaws(s.uuid), []);
+    assert.deepEqual(w.reserveCalls, [s.runId]);
+  });
+
+  it("the run is not terminal: custody, binding untouched", async () => {
+    const s = w.seed({ withParent: false });
+    w.runStatus = "running";
+    notRecovered(await w.run(), s, "custody");
+    assert.deepEqual(w.reserveCalls, [s.runId], "the reservation was taken and the authority read refused it");
+  });
+
+  it("the run still has an open hold: custody, binding untouched", async () => {
+    const s = w.seed({ withParent: false });
+    w.openHolds = 1;
+    notRecovered(await w.run(), s, "custody");
+  });
+
+  it("an unreadable ownership response: custody, binding untouched", async () => {
+    const s = w.seed({ withParent: false });
+    w.options.client.getRunOwnership = (async () => { throw new Error("api down"); }) as never;
+    notRecovered(await w.run(), s, "custody");
+  });
+
+  it("a reservation that is no longer eligible: epoch_not_eligible before the authority is even read", async () => {
+    const s = w.seed({ withParent: false });
+    let ownershipReads = 0;
+    const read = w.options.client.getRunOwnership;
+    w.options.client.getRunOwnership = ((...a: Parameters<typeof read>) => { ownershipReads++; return read(...a); }) as never;
+    w.beforeB = () => { w.eligible = false; };
+    notRecovered(await w.run(), s, "epoch_not_eligible");
+    assert.equal(ownershipReads, 0, "the eligibility gate precedes the authority read");
+  });
+
+  it("a lost authority transaction: epoch_not_eligible, binding untouched", async () => {
+    const s = w.seed({ withParent: false });
+    w.txLost = true;
+    notRecovered(await w.run(), s, "epoch_not_eligible");
+  });
+
+  it("a refused reservation (the run is busy): epoch_not_eligible, binding untouched", async () => {
+    const s = w.seed({ withParent: false });
+    w.options.retire!.reserve = (async () => undefined) as never;
+    notRecovered(await w.run(), s, "epoch_not_eligible");
+  });
+
+  it("a record in another bare naming the parent is seen by the re-read inside S: kept, binding untouched", async () => {
+    const s = w.seed({ withParent: false });
+    const second = makeFixture();
+    try {
+      const bare2 = await w.cache.ensureClone(second.originPath);
+      fs.chmodSync(path.dirname(bare2), 0o700);
+      fs.chmodSync(bare2, 0o700);
+      w.beforeB = () => {
+        const first = w.bare;
+        w.bare = bare2;
+        try { w.setConfig("uzi-recovery.agent/late.clone", JSON.stringify({ runId: "x", clonePath: s.parent })); } finally { w.bare = first; }
+      };
+      notRecovered(await w.run(), s, "protected_by_retained_source");
+    } finally { second.cleanup(); }
+  });
+
+  it("the bare lock of a gone parent is bounded by the window plus the settlement reserve", async () => {
+    const s = w.seed({ withParent: false });
+    const git = w.options.retire!.git;
+    let lock = Infinity;
+    const bareLock = git.withRetireScratchBare;
+    git.withRetireScratchBare = ((b: string, o: { deadline: number }, fn: never) => { lock = o.deadline - Date.now(); return bareLock(b, o as never, fn); }) as never;
+    const result = await w.run();
+    assert.equal(result.retire_scratch.recovered, 1, JSON.stringify(result.retire_scratch));
+    assert.ok(lock <= 125_500, `lock deadline ${lock}`);
+    assert.deepEqual(w.bindingRaws(s.uuid), []);
+  });
+});
+
 describe("alias-aware protection at the runner root itself", () => {
   const root = "/data/runner";
   const uuid = randomUUID();
@@ -1167,6 +1261,28 @@ describe("the pre-effect steps are bounded by the phase window less the settleme
     settledClean();
   });
 
+  it("a delayed authority read for a gone parent is cancelled at the step deadline: deferred before any recovery, binding untouched", STEP, async () => {
+    const s = w.seed({ withParent: false });
+    let t0 = 0, calledAt = 0, seen: Bound | undefined;
+    w.beforeB = () => { t0 = spend(); };
+    (w.options.client as { getRunOwnership: unknown }).getRunOwnership = async (_id: string, o: Bound) => {
+      seen = o; calledAt = Date.now();
+      await hang(o.signal);
+    };
+    const result = await w.run();
+    withinWindow(seen, calledAt, t0);
+    assert.equal(result.retire_scratch.deferred, 1);
+    assert.equal(result.retire_scratch.kept, 0);
+    assert.equal(result.retire_scratch.recovered, 0);
+    assert.deepEqual(result.retire_scratch.kept_by_reason, {});
+    assert.equal(result.retire_scratch.state, "stopped");
+    assert.equal(result.retire_scratch.reason, "budget_deferred");
+    assert.deepEqual(w.bindingRaws(s.uuid), [s.raw], "binding raw unchanged");
+    assert.ok(!w.steps.includes("unset"));
+    assert.equal(w.spawns.length, 0);
+    settledClean();
+  });
+
   it("a proof that cannot start inside the window less the reserve is never started", STEP, async () => {
     const s = w.seed();
     let calls = 0;
@@ -1254,7 +1370,7 @@ describe("cross-bare attempt identity conflicts", PROC, () => {
     untouched(s);
   });
 
-  it("another bare with an undecodable binding entry keeps the parent as conflict", async () => {
+  it("another bare with an undecodable binding entry: a present settled parent is kept as settled_kept (C-prime)", async () => {
     const s = w.seed();
     addBare(otherBare({ bindings: [{ key: "uzi-retire-scratch.x.binding", raw: "" }] }));
     const result = await w.run();
@@ -1274,7 +1390,7 @@ describe("cross-bare attempt identity conflicts", PROC, () => {
     });
   }
 
-  it("a conflicting bare that appears only at the deletion-time re-read keeps the parent", async () => {
+  it("a conflicting bare that appears only at the second read: a present settled parent is kept as settled_kept (C-prime)", async () => {
     const s = w.seed();
     addBare(ledgerOf(ledgerRaw(s.attemptId)), 2);
     const result = await w.run();
@@ -1310,7 +1426,7 @@ describe("cross-bare attempt identity conflicts", PROC, () => {
   const withBare = (extra: RetireScratchBareEvidence) => (r: ReadResult): ReadResult =>
     r.state === "read" ? { ...r, bares: [...r.bares, extra] } : r;
 
-  it("a conflicting bare seen only at nomination keeps a present parent as conflict before any reservation", async () => {
+  it("a conflicting bare seen only at nomination: a present settled parent is kept as settled_kept, never reserved (C-prime)", async () => {
     const s = w.seed();
     onRead(1, withBare(ledgerOf(ledgerRaw(s.attemptId))));
     const result = await w.run();
@@ -1348,7 +1464,7 @@ describe("cross-bare attempt identity conflicts", PROC, () => {
 
   const unreadable = (): ReadResult => ({ state: "unknown", reason: "unreadable" } as unknown as ReadResult);
 
-  it("an unknown re-read inside the reservation keeps a present parent as conflict", async () => {
+  it("an unknown second read is never reached for a present settled parent: kept as settled_kept (C-prime)", async () => {
     const s = w.seed();
     onRead(2, unreadable);
     const result = await w.run();
@@ -1366,17 +1482,15 @@ describe("cross-bare attempt identity conflicts", PROC, () => {
     assert.deepEqual(w.bindingRaws(s.uuid), [s.raw]);
   });
 
-  for (const withParent of [false]) {
-    it(`an unknown re-read that spends the phase window defers a ${withParent ? "present" : "gone"} parent as budget_deferred`, async () => {
-      const s = w.seed({ withParent });
-      onRead(2, () => { w.clock += 125_000; return unreadable(); });
-      const result = await w.run();
-      assert.equal(result.retire_scratch.deferred, 1);
-      assert.equal(result.retire_scratch.kept, 0);
-      assert.equal(result.retire_scratch.reclaimed + result.retire_scratch.recovered, 0);
-      assert.deepEqual(w.bindingRaws(s.uuid), [s.raw]);
-    });
-  }
+  it("an unknown re-read that spends the phase window defers a gone parent as budget_deferred", async () => {
+    const s = w.seed({ withParent: false });
+    onRead(2, () => { w.clock += 125_000; return unreadable(); });
+    const result = await w.run();
+    assert.equal(result.retire_scratch.deferred, 1);
+    assert.equal(result.retire_scratch.kept, 0);
+    assert.equal(result.retire_scratch.reclaimed + result.retire_scratch.recovered, 0);
+    assert.deepEqual(w.bindingRaws(s.uuid), [s.raw]);
+  });
 });
 
 // Compaction of either bare must not erase the evidence the cross-bare refusal reads (a real second bare, not a faked read).
@@ -1396,7 +1510,7 @@ describe("ledger compaction keeps the cross-bare conflict the reclaim refuses on
   const valuesOf = (bare: string): string[] => execFileSync("git", ["-C", bare, "config", "--local", "--get-all", LEDGER_KEY], { encoding: "utf8", env: ENV }).trim().split("\n");
 
   for (const order of [["seed", "other"], ["other", "seed"]] as const) {
-    it(`a present parent stays kept as conflict after compacting ${order.join(" then ")}`, async () => {
+    it(`a present settled parent is kept as settled_kept after compacting ${order.join(" then ")} (C-prime)`, async () => {
       const s = w.seed();
       const other = otherBareHolding(s.attemptId);
       const seeded = valuesOf(w.bare);
