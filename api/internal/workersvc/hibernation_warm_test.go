@@ -68,6 +68,27 @@ func TestWakeTargetEligibleEachCondition(t *testing.T) {
 	if !wakeTargetEligible(r) {
 		t.Error("a completed maintenance phase must stay eligible")
 	}
+	// Issue #4442: a draining (non-maintenance) sleeper stays a warm-wake target.
+	for _, state := range []string{"hibernated", "preparing"} {
+		r = sleeperRow(1, state)
+		r.DrainingSince = pgconv.Time(poolNow)
+		if !wakeTargetEligible(r) {
+			t.Errorf("a draining %s sleeper must stay eligible", state)
+		}
+	}
+}
+
+// Issue #4442: a draining sleeper beside a busy member is picked as the warm-wake target.
+func TestDecideWarmDrainingSleeper(t *testing.T) {
+	busy, sleeper := busyRow(1), sleeperRow(2, "hibernated")
+	sleeper.DrainingSince = pgconv.Time(poolNow.Add(-time.Hour))
+	rows := []poolRow{busy, sleeper}
+	if id, ok := pickWakeTarget(rows); !ok || id != sleeper.ID {
+		t.Fatalf("pickWakeTarget = %v, %v; want the draining sleeper", id, ok)
+	}
+	if d := decideWarm(rows, sleeper.ID, poolNow, poolStale, warmIdleAfter, true); d.Action != decisionWarmWake || d.Target != sleeper.ID {
+		t.Fatalf("decideWarm = %+v, want a warm wake of the draining sleeper", d)
+	}
 }
 
 func TestPickWakeTargetOrdering(t *testing.T) {

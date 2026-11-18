@@ -50,6 +50,15 @@ func underMaintenance(fenced bool, phase string) bool {
 // marker with admit origin auto_long or auto_surplus; a manual admission, a legacy op and an op
 // minted without markers all read as not eligible), it is not manually cordoned, not under
 // maintenance and has no wake_error.
+//
+// A draining sleeper (draining_since set outside maintenance) deliberately stays eligible (issue
+// #4442). The drain's fate depends on which settle path of trySettle the wake takes:
+//   - replacement pod: the controller's ready report plus a matching Register settle the wake, and
+//     that Register's clear-on-roll (PRD #422) clears a non-maintenance draining_since, so the
+//     worker can become a ready keeper;
+//   - original pod retained: a withdrawn preparation whose scale-down was never recorded settles
+//     on the same pod without a Register, so draining_since stays until the drain's own lifecycle
+//     clears it and the woken worker is not a ready keeper meanwhile.
 func wakeTargetEligible(r poolRow) bool {
 	if r.HibernationState != "preparing" && r.HibernationState != "hibernated" {
 		return false
