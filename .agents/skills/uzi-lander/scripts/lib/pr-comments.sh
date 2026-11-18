@@ -61,8 +61,9 @@ def status_only:
         or ($b | contains("<!-- auto-generated comment: rate limited by coderabbit.ai -->"))
         or ($b | contains("<!-- CodeRabbit review command invocation:"))
         # The answer to the cr-rate-limit.sh quota query, matched as the WHOLE body: any
-        # extra text (a mixed reply with feedback) still needs an ack.
-        or ($b | test("^\\s*<!-- This is an auto-generated reply by CodeRabbit -->\\s*Your \\[plan\\]\\([^)\\s]*\\) includes PR reviews subject to \\[rate limits\\]\\([^)\\s]*\\)\\. (More reviews will be available in [0-9]+ minutes?|Reviews are available now)\\.\\s*$"))))
+        # extra text (a mixed reply with feedback) still needs an ack. CodeRabbit may lead
+        # with a version marker (<!-- coderabbit-ai-generated:v1 -->, PR #4446).
+        or ($b | test("^\\s*(<!-- coderabbit-ai-generated:v[0-9]+ -->\\s*)?<!-- This is an auto-generated reply by CodeRabbit -->\\s*Your \\[plan\\]\\([^)\\s]*\\) includes PR reviews subject to \\[rate limits\\]\\([^)\\s]*\\)\\. (More reviews will be available in [0-9]+ minutes?|Reviews are available now)\\.\\s*$"))))
     or ($u == "greptile-apps[bot]" and (
         ($b | contains("<!-- greptile_comment -->"))
         or ($b | contains("<!-- greptile_outside_diff -->"))));
