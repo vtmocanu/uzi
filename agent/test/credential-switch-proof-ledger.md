@@ -433,7 +433,7 @@ control is still absent, not that the functional criterion was deferred.
 | Stopped refusal of claimed status | D25–D56: running/paused status_claimed; U15 credits refusal of queued, limit_wait, pool_wait, recovery_wait, completed, failed and cancelled (running origin) |
 | Stopped ownership, lane and policy fences | D57–D60 credit pending-fresh/unresolved-outcome; D61 paused policy-hold; D62/D63 stable user-owner mismatch running/paused. D64–D73 credit the five enumerated STOP lane exclusions running/paused; U16 credits concurrent late controls (worker-row by the worker lock, run-row by the run locks alone, (b)) and the running policy hold; paused-origin replay under concurrency and op-less withdrawals not covered; owner writers that take no worker or run row lock not covered |
 | Stopped replay after withdrawn X/Y; resume/reclaim and incarnation changes | U16 credits refusal while Y is pending, the withdraw op fence against a delayed op-carrying X withdrawal ((b); op-less v1 withdrawals are unfenced by op), and refusal after resume (three copies), reclaim and re-registration; settlement after withdrawn X/Y is positive coverage only (no guard to remove) |
-| Stopped preservation of binding, journals, session, gates, questions and custody without input consumption/time banking | E1 base-journal deletion, E2 applied-input deletion, E3 custody timestamp corruption, E4 owner-discard/live-reference loss, E5 direct paused-time credit, E6 applied-switch journal deletion; U17 effect-injection for session id, gate presentation id and row, question id and message on the first stop, and run-row and presentation effects on replay; other gate columns, other replay tables and Slack/trigger-closure tables not individually injected |
+| Stopped preservation of binding, journals, session, gates, questions and custody without input consumption/time banking | E1 base-journal deletion, E2 applied-input deletion, E3 custody timestamp corruption, E4 owner-discard/live-reference loss, E5 direct paused-time credit, E6 applied-switch journal deletion; U17 effect-injection for session id, gate presentation id and row, question id and message on the first stop, and run-row and presentation effects on replay; other gate columns and other replay tables compared but not individually injected; Slack, `cross_checks` and other trigger-closure tables outside the snapshot |
 | Stopped known extra typed member and register_nonce case alias | D25–D56: four running/paused wire cases only |
 | Bounded strict stopped request, other forbidden combinations, op_id and minimal acknowledgement | Unvalidated |
 | Tokens absent from all inputs/acknowledgements/messages/logs | Targeted positive assertions present; qualifying controls and m4 security gates remain required |
@@ -3263,7 +3263,9 @@ forbidden effect per named stopped-route seam. The stopped settlement does not
 exist at a233 (`git show a233883de3c36bae2e940f999cd9d582889dad00:api/internal/store/queries/codex_switch_stopped.sql`
 fails), and the traced route has no write guard to remove (source census
 above). Each mutant edits only the executing generated query
-api/internal/store/codex_switch_stopped.sql.go (`changed` CTE at :45–49);
+api/internal/store/codex_switch_stopped.sql.go: three add one column to the
+`changed` CTE's SET list (:45–49), four add one sibling data-modifying CTE
+after it;
 the declarative queries/codex_switch_stopped.sql is not executed by the test.
 Every eligibility conjunct and the six run assignments stay as they are.
 
@@ -3293,12 +3295,30 @@ snapshot subquery's cost across the other stopped tests was not separately
 measured (no before run of the same selection at the parent); hosted effect
 unmeasured.
 
-Credit: the first stop and its replay are shown sensitive to loss or rewrite
-of the session id, the run's gate presentation id, the gate presentation row,
-the open question id and the question message, and the replay to any run-row
-write and to presentation deletion.
+Credit: the first stop is shown sensitive to loss (NULLing or deletion) of the
+session id, the run's gate presentation id, the gate presentation row, the
+open question id and the question message; the replay to a run-row write
+(shown on `updated_at`) and to gate presentation deletion. The session id was
+already populated by the route fixture (credential_switch_apply_routes_livedb_test.go:90–91)
+and compared by the existing fresh_and_replay leaf; U17 adds the injection
+control, not first coverage.
 
-Not credited: the other gate columns (`gate_revision`, `gate_presented_payload`,
+Review rework 372aa398a: the `presentations` key broke three consumers of the
+shared snapshot that count its sections (codex_switch_apply_policy_routes_livedb_test.go
+:91 and :202, codex_switch_owner_policy_routes_livedb_test.go:92) and
+`codex_switch_apply_refresh_routes_livedb_test.go`:174, none of which the
+`^TestWorkerCodexStopped` green selection ran. Their section lists now include
+it. Every test that calls `stoppedRouteSnapshot` (all `^TestWorkerCodexStopped`
+tests plus the policy-episode, apply-policy, apply-refresh, owner-policy,
+owner-admission and owner-request route tests) passes at 372aa398a: 19 tests,
+164 PASS lines, no FAIL or SKIP, `SHA=372aa398a… EXIT=0`
+(`u17r-green.log`); `task lint:api` 0 issues (`u17r-lint-api.log`).
+
+Not credited: rewriting a value (every mutant NULLs or deletes); a replay
+write that stores an unchanged value; the first stop's own `status_since` and
+`updated_at` values, which the first-stop comparison drops and does not pin;
+replay loss of the session id, question id or question message (no replay
+injection on them); the other gate columns (`gate_revision`, `gate_presented_payload`,
 `gate_payload_digest`) and other session/question carriers are compared by
 the same whole-row snapshot but were not individually injected; replay
 injections cover the run row and presentations only (inputs, journals, custody
@@ -3307,4 +3327,16 @@ Slack presentation anchors (`slack_run_messages`) and other trigger-closure
 tables named in the census are outside the snapshot; this is sensitivity of
 the assertion, not proof that no other effect exists. Fixture-shape note: the
 gate and question state is written directly on a running run, which
-production reaches only through the gate and question writers.
+production reaches only through the gate and question writers; it is not
+internally coherent (revision 2 with no revision-1 row, a one-byte digest,
+an open question outside awaiting_input), which the stop predicate does not
+read; awaiting_approval and awaiting_input origins, whose trigger closure
+differs, are not exercised. The most security-relevant state outside the
+snapshot is `cross_checks`: on running → paused the
+`settle_exited_plan_cross_check` / `settle_exited_code_cross_check`
+triggers (00432) stamp interruption, fail a pending verdict, cancel the
+checker child and bank wait time into the lead's `budget_paused_seconds`;
+this fixture seeds no cross check, so that path is not exercised (the run-row
+banking would be caught by the run compare, the `cross_checks` rewrite would
+not). `u17-first.log` (no SHA line) is the uncommitted first run, not
+evidence.
