@@ -16,9 +16,13 @@ interface Draft {
   value: string;
   secret: boolean;
   description: string;
+  // Multiline swaps the single-line input for a textarea; held only in React state.
+  multiline: boolean;
 }
 
-const EMPTY_DRAFT: Draft = { editing: null, name: "", value: "", secret: true, description: "" };
+const EMPTY_DRAFT: Draft = { editing: null, name: "", value: "", secret: true, description: "", multiline: false };
+
+const hasLineBreak = (s: string) => /[\r\n]/.test(s);
 
 interface FieldProblem {
   field: string;
@@ -92,7 +96,8 @@ export function RepoEnvPanel({
 
   const startEdit = (v: RunEnvVar) => {
     // A secret's value is never prefilled; a plain value is, unless the vault withholds it.
-    setDraft({ editing: v, name: v.name, value: v.secret ? "" : (v.value ?? ""), secret: v.secret, description: v.description });
+    const value = v.secret ? "" : (v.value ?? "");
+    setDraft({ editing: v, name: v.name, value, secret: v.secret, description: v.description, multiline: hasLineBreak(value) });
     setProblem(null);
     setFormError("");
     setNotice("");
@@ -117,10 +122,13 @@ export function RepoEnvPanel({
         input.value = draft.value;
         input.secret = draft.secret;
       } else {
-        if (draft.secret !== orig.secret) input.secret = draft.secret;
-        // Editing a secret without a value changes only the description (and the flag).
-        const changed = draft.secret ? draft.value !== "" : draft.value !== (orig.value ?? "");
-        if (changed) input.value = draft.value;
+        const flagChanged = draft.secret !== orig.secret;
+        if (flagChanged) input.secret = draft.secret;
+        // Changing the flag always sends the value (the server refuses a secret-to-plain change
+        // without one); a secret that stays secret sends one only when re-entered; plain stays
+        // plain only when edited.
+        const sendValue = flagChanged ? true : draft.secret ? draft.value !== "" : draft.value !== (orig.value ?? "");
+        if (sendValue) input.value = draft.value;
       }
       await api.putRepoEnv(repoId, draft.name, input);
       setDraft(null);
@@ -308,22 +316,55 @@ export function RepoEnvPanel({
               <label htmlFor="env-value" className="text-xs text-muted">
                 Value
               </label>
-              {/* A textarea keeps line breaks exactly (PEM keys, JSON credentials); a secret is
-                  concealed by CSS masking, since a password input would strip them. */}
-              <Textarea
-                id="env-value"
-                rows={3}
-                wrap="off"
-                value={draft.value}
-                className={draft.secret ? "font-mono [-webkit-text-security:disc]" : "font-mono"}
-                autoComplete="off"
-                autoCorrect="off"
-                autoCapitalize="off"
-                spellCheck={false}
-                placeholder={draft.editing?.secret ? "Leave empty to keep the stored value" : undefined}
-                onChange={(e) => setDraft({ ...draft, value: e.target.value })}
-              />
+              {/* Single-line (default) uses a native password input for secrets. Multiline uses a
+                  textarea, which keeps line breaks (PEM keys, JSON credentials) but can only be
+                  concealed by CSS masking. Neither opts in to form-state restoration. */}
+              {draft.multiline ? (
+                <Textarea
+                  id="env-value"
+                  rows={3}
+                  wrap="off"
+                  value={draft.value}
+                  className={draft.secret ? "font-mono [-webkit-text-security:disc]" : "font-mono"}
+                  autoComplete="off"
+                  autoCorrect="off"
+                  autoCapitalize="off"
+                  spellCheck={false}
+                  placeholder={draft.editing?.secret ? "Leave empty to keep the stored value" : undefined}
+                  onChange={(e) => setDraft({ ...draft, value: e.target.value })}
+                />
+              ) : (
+                <Input
+                  id="env-value"
+                  type={draft.secret ? "password" : "text"}
+                  value={draft.value}
+                  className="font-mono"
+                  autoComplete="off"
+                  autoCorrect="off"
+                  autoCapitalize="off"
+                  spellCheck={false}
+                  placeholder={draft.editing?.secret ? "Leave empty to keep the stored value" : undefined}
+                  onChange={(e) => setDraft({ ...draft, value: e.target.value })}
+                />
+              )}
               {fieldErr("value")}
+              <div className="flex items-center gap-2 text-xs text-muted">
+                <Toggle
+                  label="Multiline"
+                  checked={draft.multiline}
+                  disabled={draft.multiline && hasLineBreak(draft.value)}
+                  onChange={(next) => setDraft({ ...draft, multiline: next })}
+                />
+                <span>Multiline value</span>
+              </div>
+              {draft.multiline && hasLineBreak(draft.value) && (
+                <p className="text-xs text-muted">Multiline stays on while the value contains a line break.</p>
+              )}
+              {draft.multiline && (
+                <p className="text-xs text-muted">
+                  Masking a multiline secret is not portable across browsers. Line endings are stored as LF.
+                </p>
+              )}
             </div>
           </div>
           <div className="space-y-1">

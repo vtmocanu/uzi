@@ -170,15 +170,19 @@ describe("Repos environment variables panel", () => {
 
   const PEM = ["-----BEGIN KEY-----", "  MIIBVgIBADAN", "", "\tindented-tab", "-----END KEY-----", ""].join("\n");
   it.each([
-    ["single-line secret", "one-line-value", true],
-    ["multiline secret", PEM, true],
-    ["single-line plain", "one-line-value", false],
-    ["multiline plain", PEM, false],
-  ])("submits a %s byte-exact", async (_label, text, secret) => {
+    ["single-line secret", "one-line-value", true, false],
+    ["multiline secret", PEM, true, true],
+    ["single-line plain", "one-line-value", false, false],
+    ["multiline plain", PEM, false, true],
+    ["single-line plain with spaces, unicode and a trailing space", "  grüße 日本語 value ", false, false],
+    ["multiline LF value", "line1\nline2\n", true, true],
+  ])("submits a %s byte-exact", async (_label, text, secret, multiline) => {
     mockApi.putRepoEnv.mockResolvedValue({ variable: envVar({ name: "MULTI", secret, value: null }) });
     const panel = await openPanel();
     fireEvent.click(within(panel).getByRole("button", { name: "Add variable" }));
     if (!secret) fireEvent.click(within(panel).getByRole("switch", { name: "Secret" }));
+    if (multiline) fireEvent.click(within(panel).getByRole("switch", { name: "Multiline" }));
+    expect(within(panel).getByLabelText("Value").tagName).toBe(multiline ? "TEXTAREA" : "INPUT");
     fireEvent.change(within(panel).getByLabelText("Name"), { target: { value: "MULTI" } });
     fireEvent.change(within(panel).getByLabelText("Value"), { target: { value: text } });
     fireEvent.click(within(panel).getByRole("button", { name: "Save variable" }));
@@ -188,18 +192,56 @@ describe("Repos environment variables panel", () => {
     expect(sent.secret).toBe(secret);
   });
 
-  it("conceals a secret value field and leaves a plain one readable", async () => {
+  it("conceals a secret value in a native password input and shows a plain one as text", async () => {
     const panel = await openPanel();
     fireEvent.click(within(panel).getByRole("button", { name: "Add variable" }));
+    const value = within(panel).getByLabelText("Value") as HTMLInputElement;
+    expect(value.tagName).toBe("INPUT");
+    expect(value.type).toBe("password");
+    expect(value.getAttribute("autocomplete")).toBe("off");
+    fireEvent.click(within(panel).getByRole("switch", { name: "Secret" }));
+    const plain = within(panel).getByLabelText("Value") as HTMLInputElement;
+    expect(plain.tagName).toBe("INPUT");
+    expect(plain.type).toBe("text");
+    expect(plain.getAttribute("autocomplete")).toBe("off");
+  });
+
+  it("multiline mode shows the masking and LF help and a textarea with autocomplete off", async () => {
+    const panel = await openPanel();
+    fireEvent.click(within(panel).getByRole("button", { name: "Add variable" }));
+    expect(within(panel).queryByText(/not portable across browsers/)).toBeNull();
+    fireEvent.click(within(panel).getByRole("switch", { name: "Multiline" }));
     const value = within(panel).getByLabelText("Value") as HTMLTextAreaElement;
     expect(value.tagName).toBe("TEXTAREA");
-    expect(value.className).toContain("[-webkit-text-security:disc]");
     expect(value.getAttribute("autocomplete")).toBe("off");
-    expect(value.getAttribute("spellcheck")).toBe("false");
+    expect(within(panel).getByText(/not portable across browsers/).textContent).toContain("Line endings are stored as LF");
+  });
+
+  it("editing a plain value with a newline opens in multiline and cannot leave it", async () => {
+    mockApi.listRepoEnv.mockResolvedValue(list([API_KEY, envVar({ name: "CERT", value: "a\nb" })]));
+    const panel = await openPanel();
+    fireEvent.click(within(panel).getByRole("button", { name: "Edit CERT" }));
+    const value = within(panel).getByLabelText("Value") as HTMLTextAreaElement;
+    expect(value.tagName).toBe("TEXTAREA");
+    expect(value.value).toBe("a\nb");
+    const toggle = within(panel).getByRole("switch", { name: "Multiline" }) as HTMLButtonElement;
+    expect(toggle.disabled).toBe(true);
+    fireEvent.click(toggle);
+    expect(within(panel).getByLabelText("Value").tagName).toBe("TEXTAREA");
+    // Once the line break is gone the toggle is free again.
+    fireEvent.change(value, { target: { value: "ab" } });
+    expect((within(panel).getByRole("switch", { name: "Multiline" }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("switching a secret to plain with an empty value still sends the empty value", async () => {
+    mockApi.putRepoEnv.mockResolvedValue({ variable: envVar({ name: "API_KEY" }) });
+    const panel = await openPanel();
+    fireEvent.click(within(panel).getByRole("button", { name: "Edit API_KEY" }));
     fireEvent.click(within(panel).getByRole("switch", { name: "Secret" }));
-    const plain = within(panel).getByLabelText("Value") as HTMLTextAreaElement;
-    expect(plain.tagName).toBe("TEXTAREA");
-    expect(plain.className).not.toContain("text-security");
+    fireEvent.click(within(panel).getByRole("button", { name: "Save variable" }));
+    await waitFor(() =>
+      expect(mockApi.putRepoEnv).toHaveBeenCalledWith("repo-uzi", "API_KEY", { description: "Sandbox key", secret: false, value: "" }),
+    );
   });
 
   it("editing a secret without a value sends only the description and never prefills the value", async () => {
