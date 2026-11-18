@@ -433,7 +433,7 @@ control is still absent, not that the functional criterion was deferred.
 | Stopped refusal of claimed status | D25–D56: running/paused status_claimed; U15 credits refusal of queued, limit_wait, pool_wait, recovery_wait, completed, failed and cancelled (running origin) |
 | Stopped ownership, lane and policy fences | D57–D60 credit pending-fresh/unresolved-outcome; D61 paused policy-hold; D62/D63 stable user-owner mismatch running/paused. D64–D73 credit the five enumerated STOP lane exclusions running/paused; U16 credits concurrent late controls (worker-row by the worker lock, run-row by the run locks alone, (b)) and the running policy hold; paused-origin replay under concurrency and op-less withdrawals not covered; owner writers that take no worker or run row lock not covered |
 | Stopped replay after withdrawn X/Y; resume/reclaim and incarnation changes | U16 credits refusal while Y is pending, the withdraw op fence against a delayed op-carrying X withdrawal ((b); op-less v1 withdrawals are unfenced by op), and refusal after resume (three copies), reclaim and re-registration; settlement after withdrawn X/Y is positive coverage only (no guard to remove) |
-| Stopped preservation of binding, journals, session, gates, questions and custody without input consumption/time banking | E1 base-journal deletion, E2 applied-input deletion, E3 custody timestamp corruption, E4 owner-discard/live-reference loss, E5 direct paused-time credit, E6 applied-switch journal deletion only; other dispositions/effects, replay sensitivity and broader clauses unvalidated |
+| Stopped preservation of binding, journals, session, gates, questions and custody without input consumption/time banking | E1 base-journal deletion, E2 applied-input deletion, E3 custody timestamp corruption, E4 owner-discard/live-reference loss, E5 direct paused-time credit, E6 applied-switch journal deletion; U17 effect-injection for session id, gate presentation id and row, question id and message on the first stop, and run-row and presentation effects on replay; other gate columns, other replay tables and Slack/trigger-closure tables not individually injected |
 | Stopped known extra typed member and register_nonce case alias | D25–D56: four running/paused wire cases only |
 | Bounded strict stopped request, other forbidden combinations, op_id and minimal acknowledgement | Unvalidated |
 | Tokens absent from all inputs/acknowledgements/messages/logs | Targeted positive assertions present; qualifying controls and m4 security gates remain required |
@@ -3240,3 +3240,71 @@ single-copy census holds for these synthetic states only; the running policy
 hold early return accepts any violation of `runs_policy_hold_shape`, not only
 its hold arm (the u16-policy-hold red shows the other arms hold for this
 fixture).
+
+### U17 — stopped preservation of session, gate, question and replay effects (effect-injection, 2026-11-18)
+
+Candidate 0434cd750e6d167630b5f819c9504986511931e5 adds
+api/internal/handler/codex_switch_stopped_state_preservation_livedb_test.go
+(`TestWorkerCodexStoppedStatePreservationRouteLiveDB`) and extends the shared
+`stoppedRouteSnapshot` (codex_switch_stopped_guards_livedb_test.go) with
+`run_gate_presentations`. After withdrawal the fixture populates the session
+(`runs.session_id`, set by the route fixture), the canonical gate
+(`runs.gate_revision`, `gate_presentation_id`, `gate_presented_payload`,
+`gate_payload_digest` and the matching `run_gate_presentations` row) and the
+open question (`runs.open_question_id` and a `kind='question'` run message,
+per the source census above: no separate questions table), reads it back,
+then sends a first stop and a replay through the authenticated `/state`
+route. `assertStoppedSnapshot` compares the whole run row (except status,
+status_since, updated_at and health on the first stop; everything on the
+replay) and every snapshot table.
+
+Class: effect-injection sensitivity control (decision 10), one narrow
+forbidden effect per named stopped-route seam. The stopped settlement does not
+exist at a233 (`git show a233883de3c36bae2e940f999cd9d582889dad00:api/internal/store/queries/codex_switch_stopped.sql`
+fails), and the traced route has no write guard to remove (source census
+above). Each mutant edits only the executing generated query
+api/internal/store/codex_switch_stopped.sql.go (`changed` CTE at :45–49);
+the declarative queries/codex_switch_stopped.sql is not executed by the test.
+Every eligibility conjunct and the six run assignments stay as they are.
+
+Command: `.uzi/scratch/u8tools/ctl.sh` (export of 0434cd750, throwaway postgres
+`cdr-4202-u17pg`), from the export's api directory,
+`GOFLAGS='-p=1 -buildvcs=false' GOMAXPROCS=4 go test -race -count=1 -timeout=6m ./internal/handler -run '^TestWorkerCodexStoppedStatePreservationRouteLiveDB$' -v`.
+Diffs and logs: `.uzi/scratch/ctl-logs/u17-*.{diff,log}`; each mutant log ends
+`SHA=0434cd750… EXIT=1`. :33 is the first-stop `reportStoppedRoute`, :34 the
+replay.
+
+| Control | Seam | Injected effect | Red |
+| --- | --- | --- | --- |
+| u17-session | first stop, session | `changed` also sets `session_id = NULL` | :33 "first stop changed unrelated run fields" |
+| u17-gate-run | first stop, canonical gate on the run | `changed` also sets `gate_presentation_id = NULL` | :33 (same message) |
+| u17-question-id | first stop, question identity | `changed` also sets `open_question_id = NULL` | :33 (same message) |
+| u17-gate-presentation | first stop, gate presentation row | added CTE deletes `run_gate_presentations` for the changed run | :33 "snapshot changed in presentations" |
+| u17-question-message | first stop, question content | added CTE deletes the run's `kind='question'` messages for the changed run | :33 "snapshot changed in messages" |
+| u17-replay-run | replay, run row | added CTE updates `updated_at` on the eligible already-paused row | :34 "snapshot changed in run" |
+| u17-replay-presentation | replay, gate presentation row | added CTE deletes `run_gate_presentations` for the eligible already-paused row | :34 "snapshot changed in presentations" |
+
+Unchanged candidate 0434cd750: every `^TestWorkerCodexStopped` handler test
+passes with the extended snapshot (132 PASS lines, no FAIL or SKIP,
+`ok … 54.384s`), `SHA=0434cd750… EXIT=0` (`u17-green.log`); `task lint:api`
+0 issues (`u17-lint-api.log`). Runtime: the new test 0.39 s in-package
+(same worker, warm cache, migrated schema, one serial run); the extra
+snapshot subquery's cost across the other stopped tests was not separately
+measured (no before run of the same selection at the parent); hosted effect
+unmeasured.
+
+Credit: the first stop and its replay are shown sensitive to loss or rewrite
+of the session id, the run's gate presentation id, the gate presentation row,
+the open question id and the question message, and the replay to any run-row
+write and to presentation deletion.
+
+Not credited: the other gate columns (`gate_revision`, `gate_presented_payload`,
+`gate_payload_digest`) and other session/question carriers are compared by
+the same whole-row snapshot but were not individually injected; replay
+injections cover the run row and presentations only (inputs, journals, custody
+and messages on replay were not injected, though the snapshot compares them);
+Slack presentation anchors (`slack_run_messages`) and other trigger-closure
+tables named in the census are outside the snapshot; this is sensitivity of
+the assertion, not proof that no other effect exists. Fixture-shape note: the
+gate and question state is written directly on a running run, which
+production reaches only through the gate and question writers.
