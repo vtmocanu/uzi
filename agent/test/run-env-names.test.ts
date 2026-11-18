@@ -112,4 +112,9 @@ describe("worker-protected keys are all denied", () => {
       assert.notEqual(runEnvNameViolation(key), null);
     });
   }
+
+  it("COMMAND_ENV_PROTECTED_KEYS mirrors every PROTECTED_ENV_KEYS member", () => {
+    const missing = [...PROTECTED_ENV_KEYS].filter((k) => !COMMAND_ENV_PROTECTED_KEYS.has(k));
+    assert.deepEqual([], missing);
+  });
 });

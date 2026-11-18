@@ -290,7 +290,8 @@ const COMMAND_ENV_PATH = "/opt/uzi-toolchain/bin:/usr/local/sbin:/usr/local/bin:
  *  identity pins these, and sdk-env.ts's PROTECTED_ENV_KEYS deliberately OMITS
  *  PATH/TMPDIR/LANG, so relying on it alone would leave those open) with a MIRROR (a copy,
  *  not an import) of that exported PROTECTED_ENV_KEYS set (the OAuth credential + the two ANTHROPIC_* keys +
- *  the browser flag and the two browser discovery paths), plus Docker endpoint/configuration keys owned by trusted startup wiring.
+ *  the Node CA key NODE_EXTRA_CA_CERTS + the browser flag and the two browser discovery paths;
+ *  the mirror is pinned by agent/test/run-env-names.test.ts), plus Docker endpoint/configuration keys owned by trusted startup wiring.
  *  So a hostile/malformed `toolEnv` can neither breach the command
  *  boundary NOR reintroduce a credential-adjacent key. PATH is additionally handled
  *  specially in {@link buildCommandEnv} (fixed prefix, provisioned value appended). */
@@ -317,6 +318,9 @@ export const COMMAND_ENV_PROTECTED_KEYS: ReadonlySet<string> = new Set([
   "ANTHROPIC_API_KEY",
   "ANTHROPIC_AUTH_TOKEN",
   "AGENT_BROWSER_ARGS",
+  // Defence in depth: a provisioned toolEnv can never point a command's Node TLS trust at a
+  // file of its choosing. Nothing on the Codex path sets it.
+  "NODE_EXTRA_CA_CERTS",
   // Issue #3907: the browser discovery keys (sdk-env.ts protects them too; set only by
   // buildCommandEnv's browserDiscovery flag, never by a provisioned toolEnv).
   ...Object.keys(BROWSER_DISCOVERY_ENV),
