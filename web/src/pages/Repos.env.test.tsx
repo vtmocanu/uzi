@@ -212,7 +212,7 @@ describe("Repos environment variables panel", () => {
     const value = within(panel).getByLabelText("Value") as HTMLInputElement;
     expect(value.tagName).toBe("INPUT");
     expect(value.type).toBe("password");
-    expect(value.getAttribute("autocomplete")).toBe("off");
+    expect(value.getAttribute("autocomplete")).toBe("new-password");
     fireEvent.click(within(panel).getByRole("switch", { name: "Secret" }));
     const plain = within(panel).getByLabelText("Value") as HTMLInputElement;
     expect(plain.tagName).toBe("INPUT");
@@ -269,6 +269,71 @@ describe("Repos environment variables panel", () => {
     const value = within(panel).getByLabelText("Value") as HTMLTextAreaElement;
     expect(value.tagName).toBe("TEXTAREA");
     expect(value.value).toBe("a\nb\nc");
+  });
+
+  it.each([
+    ["LF", "token\n"],
+    ["CRLF", "token\r\n"],
+  ])("pasting a value with one trailing %s break stays single-line and saves it trimmed", async (_l, pasted) => {
+    mockApi.putRepoEnv.mockResolvedValue({ variable: envVar({ name: "TOK", secret: true, value: null }) });
+    const panel = await openPanel();
+    fireEvent.click(within(panel).getByRole("button", { name: "Add variable" }));
+    fireEvent.change(within(panel).getByLabelText("Name"), { target: { value: "TOK" } });
+    fireEvent.paste(within(panel).getByLabelText("Value"), { clipboardData: { getData: () => pasted } });
+    const value = within(panel).getByLabelText("Value") as HTMLInputElement;
+    expect(value.tagName).toBe("INPUT");
+    expect(value.value).toBe("token");
+    fireEvent.click(within(panel).getByRole("button", { name: "Save variable" }));
+    await waitFor(() => expect(mockApi.putRepoEnv).toHaveBeenCalled());
+    expect(mockApi.putRepoEnv.mock.calls[0][2].value).toBe("token");
+  });
+
+  it("pasting multi-line text with a trailing break switches to multiline and keeps the break", async () => {
+    const panel = await openPanel();
+    fireEvent.click(within(panel).getByRole("button", { name: "Add variable" }));
+    fireEvent.paste(within(panel).getByLabelText("Value"), { clipboardData: { getData: () => "a\nb\n" } });
+    const value = within(panel).getByLabelText("Value") as HTMLTextAreaElement;
+    expect(value.tagName).toBe("TEXTAREA");
+    expect(value.value).toBe("a\nb\n");
+  });
+
+  it("a trimmed paste replaces the selection, stays single-line and puts the caret after it", async () => {
+    const panel = await openPanel();
+    fireEvent.click(within(panel).getByRole("button", { name: "Add variable" }));
+    const before = within(panel).getByLabelText("Value") as HTMLInputElement;
+    fireEvent.change(before, { target: { value: "leftMIDright" } });
+    before.setSelectionRange(4, 7);
+    fireEvent.paste(before, { clipboardData: { getData: () => "X\n" } });
+    const value = within(panel).getByLabelText("Value") as HTMLInputElement;
+    expect(value.tagName).toBe("INPUT");
+    expect(value.value).toBe("leftXright");
+    expect(document.activeElement).toBe(value);
+    expect([value.selectionStart, value.selectionEnd]).toEqual([5, 5]);
+  });
+
+  it.each([
+    ["secret", true, "new-password"],
+    ["plain", false, "off"],
+  ])("a %s draft marks Name and Value as password-manager ignored", async (_l, secret, valueAutoComplete) => {
+    const panel = await openPanel();
+    fireEvent.click(within(panel).getByRole("button", { name: "Add variable" }));
+    if (!secret) fireEvent.click(within(panel).getByRole("switch", { name: "Secret" }));
+    const name = within(panel).getByLabelText("Name");
+    const value = within(panel).getByLabelText("Value");
+    for (const el of [name, value]) {
+      expect(el.hasAttribute("data-1p-ignore")).toBe(true);
+      expect(el.getAttribute("data-lpignore")).toBe("true");
+      expect(el.hasAttribute("data-bwignore")).toBe(true);
+    }
+    expect(name.getAttribute("autocomplete")).toBe("off");
+    expect(value.getAttribute("autocomplete")).toBe(valueAutoComplete);
+    fireEvent.click(within(panel).getByRole("switch", { name: "Multiline" }));
+    const area = within(panel).getByLabelText("Value");
+    expect(area.tagName).toBe("TEXTAREA");
+    expect(area.hasAttribute("data-1p-ignore")).toBe(true);
+    expect(area.getAttribute("data-lpignore")).toBe("true");
+    expect(area.hasAttribute("data-bwignore")).toBe(true);
+    expect(area.getAttribute("autocomplete")).toBe("off");
   });
 
   it.each([

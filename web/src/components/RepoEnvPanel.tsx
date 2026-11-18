@@ -2,7 +2,7 @@
 // and delete. A secret's value is write-only: the API never returns it, the edit form
 // never prefills it, and nothing here renders one back.
 
-import { useCallback, useEffect, useRef, useState, type ClipboardEvent } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ClipboardEvent } from "react";
 import { api, ApiError, isVaultLocked, type RunEnvList, type RunEnvVar, type RunEnvWriteInput } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
 import { Alert, Badge, Button, Input, Textarea, Toggle } from "./ui";
@@ -95,18 +95,20 @@ export function RepoEnvPanel({
     void load();
   }, [load]);
 
-  // After a paste switched the field to the textarea, focus it with the caret after the paste.
-  const caretAfterSwitch = useRef<number | null>(null);
-  const multiline = draft?.multiline;
-  useEffect(() => {
-    if (!multiline || caretAfterSwitch.current === null) return;
-    const el = document.getElementById("env-value") as HTMLTextAreaElement | null;
+  // After an intercepted paste, focus the value field with the caret after the pasted text. The
+  // field may have been swapped for the textarea or may keep its input; the counter is bumped on
+  // every intercepted paste so the effect runs even when the value itself did not change.
+  const caretAfterPaste = useRef<number | null>(null);
+  const [pasteSeq, setPasteSeq] = useState(0);
+  useLayoutEffect(() => {
+    if (caretAfterPaste.current === null) return;
+    const el = document.getElementById("env-value") as HTMLInputElement | HTMLTextAreaElement | null;
     if (el) {
       el.focus();
-      el.setSelectionRange(caretAfterSwitch.current, caretAfterSwitch.current);
+      el.setSelectionRange(caretAfterPaste.current, caretAfterPaste.current);
     }
-    caretAfterSwitch.current = null;
-  }, [multiline]);
+    caretAfterPaste.current = null;
+  }, [pasteSeq]);
 
   const startAdd = () => {
     setDraft({ ...EMPTY_DRAFT });
@@ -198,8 +200,11 @@ export function RepoEnvPanel({
   };
 
   // A single-line input strips line breaks from a pasted value. Catch a paste that carries
-  // one, insert it at the selection (replacing any selected text) as LF, and switch to the
-  // textarea so the value survives; the effect above then restores focus and the caret.
+  // one and insert it at the selection (replacing any selected text). One trailing line break
+  // (a copied line's newline) is ignored when deciding: if no break remains, insert the text
+  // without it and stay single-line. Otherwise insert the whole paste as LF, trailing break
+  // included, and switch to the textarea so the value survives. The layout effect above then
+  // restores focus and the caret.
   const onSingleLinePaste = (e: ClipboardEvent<HTMLInputElement>) => {
     const text = e.clipboardData.getData("text");
     if (!draft || !hasLineBreak(text)) return;
@@ -207,9 +212,16 @@ export function RepoEnvPanel({
     const input = e.currentTarget;
     const start = input.selectionStart ?? draft.value.length;
     const end = input.selectionEnd ?? start;
-    const pasted = text.replace(/\r\n?/g, "\n");
-    caretAfterSwitch.current = start + pasted.length;
-    setDraft({ ...draft, multiline: true, value: draft.value.slice(0, start) + pasted + draft.value.slice(end) });
+    const trimmed = text.replace(/(\r\n|\r|\n)$/, "");
+    const switchToMultiline = hasLineBreak(trimmed);
+    const pasted = switchToMultiline ? text.replace(/\r\n?/g, "\n") : trimmed;
+    caretAfterPaste.current = start + pasted.length;
+    setPasteSeq((n) => n + 1);
+    setDraft({
+      ...draft,
+      multiline: switchToMultiline ? true : draft.multiline,
+      value: draft.value.slice(0, start) + pasted + draft.value.slice(end),
+    });
   };
 
   const lockedOn = !!draft && draft.multiline && hasLineBreak(draft.value);
@@ -346,6 +358,9 @@ export function RepoEnvPanel({
                 value={draft.name}
                 disabled={draft.editing !== null}
                 autoComplete="off"
+                data-1p-ignore
+                data-lpignore="true"
+                data-bwignore
                 spellCheck={false}
                 onChange={(e) => setDraft({ ...draft, name: e.target.value })}
               />
@@ -366,6 +381,9 @@ export function RepoEnvPanel({
                   value={draft.value}
                   className={draft.secret ? "font-mono [-webkit-text-security:disc]" : "font-mono"}
                   autoComplete="off"
+                  data-1p-ignore
+                  data-lpignore="true"
+                  data-bwignore
                   autoCorrect="off"
                   autoCapitalize="off"
                   spellCheck={false}
@@ -378,7 +396,10 @@ export function RepoEnvPanel({
                   type={draft.secret ? "password" : "text"}
                   value={draft.value}
                   className="font-mono"
-                  autoComplete="off"
+                  autoComplete={draft.secret ? "new-password" : "off"}
+                  data-1p-ignore
+                  data-lpignore="true"
+                  data-bwignore
                   autoCorrect="off"
                   autoCapitalize="off"
                   spellCheck={false}
