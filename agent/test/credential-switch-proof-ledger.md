@@ -417,7 +417,7 @@ control is still absent, not that the functional criterion was deferred.
 | Exact saved-ID resume; confirmed-refusal-only fresh fallback and lineage; preservation re-hold | R6 uncertain-error classification; U6 resume carries the saved id, lineage notice, three-copy preserve re-hold, crash missing-id disclosure (d) and preserve retained refusal with a saved conversation (b); confirmed-refusal classification (timeout), :4148 check and session_missing on the switch path not controlled |
 | Policy episode rejection at request and under apply lock | D74–D77 owner request and post-READY apply; U7 episode starting before preflight (both arms); hold arm unreachable in live statuses by `runs_policy_hold_shape`, paused hold refused by status (u1-status1); concurrent lock-order contention not controlled |
 | Refresh lease/intent exclusion, account lock ordering and boundary reconciliation before revoke | D78/D79 credit isolated A coordination-lease and rotating-intent server checks; U8 credits alias and enablement (old/target) lock presence and NOWAIT keyword, the account lock and its NOWAIT against a reverse-order writer, the busy mapping, intent count/lock (A's account) and real admitted-refresh lease/intent redundant fences, and the executor A reconcile inside reconcileA before teardown (c); per-account lock isolation, the target account's intent check, the refresh admission's binding recheck in isolation and global lock sorting not controlled |
-| Post-switch release epoch and secret-hash authorization | B5/B6 preservation sensitivity controls below, through real worker apply and release routes; U9 credits the final reauthorization against a switch apply committed mid-release (subscription A release path); the API-key A path and the vault-locked branch after a switch not controlled |
+| Post-switch release epoch and secret-hash authorization | B5/B6 preservation sensitivity controls below, through real worker apply and release routes; U9 credits the final reauthorization's presence (b) and placement after the material read (c) against a switch apply committed between the two authorizations (subscription A release path, service level); the API-key A path and the vault-locked branch after a switch not controlled |
 | Transactional frozen binding rewrite, capability revoke/remint and post-commit material response | Unvalidated; B5/B6 do not establish transaction atomicity or mint/revoke implementation |
 | Ordinal-zero baseline, successor journal ordinal/capability relation and usage attribution | Positive assertions present; qualifying controls unvalidated |
 | Atomic rollback, lost-reply replay, stale/foreign apply and target fences | Unvalidated |
@@ -2444,19 +2444,24 @@ feature: a live Codex switch apply (a233 refused every live switch, runner.ts
 :25735–25738, see U8) that re-mints the capability and advances the claim
 epoch while a release with A's capability is between its first authorization
 (:1320) and this final reauthorization. Existing tests pin the recheck only for
-non-switch staleness (codexrefresh_livedb_test.go `releaseHookStore`, :141–160).
+non-switch staleness (codexrefresh_livedb_test.go `releaseHookStore`, :141–156),
+all staling authority by direct SQL updates.
 
 New test (628535ef9):
 `TestCodexReleaseRecheckRefusesAfterSwitchApplyLiveDB`
 (api/internal/workersvc/credential_switch_codex_release_recheck_livedb_test.go).
 A run bound to linked subscription A with a pending switch to a static API key
 (`codexApplyFromSubscription`). A release with A's capability first succeeds
-(:20). Then `releaseHookStore.onAccountRead`, which fires during the
-subscription account read inside `releaseCodexCredential`, runs the real
+(:20). Then `releaseHookStore.onAccountRead`, which fires right after the
+subscription account read returns inside `releaseCodexCredential` (before the
+login is opened), runs the real
 `f.apply` once and requires `applied` (:32). The release must return no token
-(:41), an error (:44) that is `ErrCodexCapabilityEpoch` (:47); afterwards A's
+(:41), an error (:44) that is `ErrCodexCapabilityEpoch` (:48–49); afterwards A's
 capability is refused at the first authorization with the same sentinel, and
-the run is bound to the target with the request cleared.
+the run's binding has changed from A with the request cleared. The test
+calls the service (`ReleaseCodexCredential`, `ApplyCredentialSwitch`) with the
+hook store, not the HTTP release route: the mid-call injection needs the store
+seam. (B5/B6 cover the route's epoch and hash guards.)
 
 Command (export of 628535ef9, throwaway postgres `cdr-4202-u9pg`): from api,
 `GOFLAGS='-p=1 -buildvcs=false' GOMAXPROCS=4 go test -race -count=1 -timeout=6m
@@ -2464,15 +2469,21 @@ Command (export of 628535ef9, throwaway postgres `cdr-4202-u9pg`): from api,
 
 | Control | Kind | Mutation | Log, commit | Red at |
 |---|---|---|---|---|
-| u9-recheck | (d) guard on the switch interleaving (preserved a233 guard) | final reauthorization `aerr != nil` → `false && aerr != nil` (codexrefresh.go :1335) | `.uzi/scratch/ctl-logs/u9-recheck.{diff,log}`, 628535ef9 | test :41 "release returned A's token after a switch apply committed before the final reauthorization" |
+| u9-recheck | (b) **preservation sensitivity control** (the guard is the unchanged a233 recheck; the switch interleaving that triggers it is new) | final reauthorization `aerr != nil` → `false && aerr != nil` (codexrefresh.go :1335) | `.uzi/scratch/ctl-logs/u9-recheck.{diff,log}`, 628535ef9 | test :41 "release returned A's token after a switch apply committed before the final reauthorization" |
+| u9-recheck-relocate | (c) ordering | the same reauthorization moved from after the material read (:1335) to just before `releaseCodexCredential` (:1325) | `.uzi/scratch/ctl-logs/u9-recheck-relocate.{diff,log}`, 628535ef9 | test :41, as above |
 
 Unchanged candidate 628535ef9: the test passes, EXIT=0
 (`.uzi/scratch/ctl-logs/u9-green.log`); `task lint:api` 0 issues
 (`u9-lint-api.log`).
 
-Credit: when a switch apply commits after a release's first authorization, the
-final reauthorization is what keeps A's token from being returned; the release
-fails with the stale-epoch authorization error. Not credited: the API-key A
+Credit: when a switch apply commits between a release's first authorization
+(:1320) and its final reauthorization (:1335), that reauthorization — present
+and placed after the material read — is what keeps A's token from being
+returned; the release fails with the stale-epoch authorization error. An apply
+that commits after the final reauthorization passed, before the response is
+written, still returns A's token: that window is inherent (no lock spans the
+response) and the token is one the worker already held under A's epoch. Not credited: the API-key A
 release path (its material read is not hooked here), the vault-locked branch of
-the same recheck after a switch, and releases that complete before the apply
+the same recheck after a switch (pinned without a switch by
+`TestReleaseCodexCredentialVaultLockedAuthorityLostLiveDB`), and releases that complete before the apply
 commits (they legitimately return A's token, under A's still-current epoch).
