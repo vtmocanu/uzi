@@ -61,6 +61,9 @@ type forgeProbeForge struct {
 	forgetest.BaseFake
 	username string
 	userID   int64
+	// scopes is the least-privilege set the requested forge type requires, so a
+	// connection of either type passes the token gate and reaches the store.
+	scopes []string
 }
 
 func (f *forgeProbeForge) VerifyToken(context.Context) (forge.BotIdentity, error) {
@@ -68,15 +71,19 @@ func (f *forgeProbeForge) VerifyToken(context.Context) (forge.BotIdentity, error
 }
 
 func (f *forgeProbeForge) TokenInfo(context.Context) (forge.TokenInfo, error) {
-	return forge.TokenInfo{Scopes: []string{"api"}, Active: true}, nil
+	return forge.TokenInfo{Scopes: f.scopes, Active: true}, nil
 }
 
 // buildForge mirrors *forgesvc.Service's builder seam: the driver gets the token
 // the caller passed, which is what makes a rotation observable.
-func buildForgeProbe(_ forge.Type, _ string, token string, _ time.Duration) (forge.Forge, error) {
+func buildForgeProbe(ft forge.Type, _ string, token string, _ time.Duration) (forge.Forge, error) {
 	suffix := strings.TrimPrefix(token, "tok-")
 	name := "bot-" + suffix
-	return &forgeProbeForge{username: name, userID: int64(len(name))}, nil
+	scopes := []string{"api"}
+	if ft == forge.TypeForgejo {
+		scopes = []string{"read:user", "write:issue", "write:repository"}
+	}
+	return &forgeProbeForge{username: name, userID: int64(len(name)), scopes: scopes}, nil
 }
 
 func newForgeOverwriteFixture(ctx context.Context, t *testing.T) forgeOverwriteFixture {
@@ -245,13 +252,8 @@ func TestCreateConnectionAllowsDifferentTargetLiveDB(t *testing.T) {
 	ctx := context.Background()
 	f := newForgeOverwriteFixture(ctx, t)
 
-	rec := f.call(t, `{"forge_type":"gitlab","base_url":"https://other.example","token":""}`)
-	if rec.Code == http.StatusConflict {
-		t.Fatalf("a different host must not be refused as a duplicate (body %s)", rec.Body.String())
-	}
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400 from validation (body %s)", rec.Code, rec.Body.String())
-	}
+	rec := f.call(t, `{"forge_type":"gitlab","base_url":"https://other.example","token":"tok-other"}`)
+	f.assertSecondConnection(ctx, t, rec, "gitlab", "https://other.example", "bot-other", "tok-other")
 }
 
 // A different forge TYPE on the same host is a different connection: the
@@ -261,12 +263,53 @@ func TestCreateConnectionAllowsDifferentForgeTypeLiveDB(t *testing.T) {
 	ctx := context.Background()
 	f := newForgeOverwriteFixture(ctx, t)
 
-	rec := f.call(t, fmt.Sprintf(`{"forge_type":"forgejo","base_url":%q,"token":""}`, forgeOverwriteBaseURL))
-	if rec.Code == http.StatusConflict {
-		t.Fatalf("a different forge type must not be refused as a duplicate (body %s)", rec.Body.String())
+	rec := f.call(t, fmt.Sprintf(`{"forge_type":"forgejo","base_url":%q,"token":"tok-forgejo"}`, forgeOverwriteBaseURL))
+	f.assertSecondConnection(ctx, t, rec, "forgejo", forgeOverwriteBaseURL, "bot-forgejo", "tok-forgejo")
+}
+
+// assertSecondConnection requires a create for a target distinct from the
+// fixture's to succeed as a NEW row carrying the requested target and
+// credential, with the original connection left exactly as it was. A refusal,
+// a validation error or an in-place rotation all fail it.
+func (f forgeOverwriteFixture) assertSecondConnection(ctx context.Context, t *testing.T, rec *httptest.ResponseRecorder, wantType, wantBaseURL, wantBot, wantToken string) {
+	t.Helper()
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 for a distinct target (body %s)", rec.Code, rec.Body.String())
 	}
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400 from validation (body %s)", rec.Code, rec.Body.String())
+	var body struct {
+		Connection struct {
+			ID string `json:"id"`
+		} `json:"connection"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode body: %v (%s)", err, rec.Body.String())
+	}
+	newID, err := uuid.Parse(body.Connection.ID)
+	if err != nil {
+		t.Fatalf("parse new connection id %q: %v", body.Connection.ID, err)
+	}
+	if newID == f.connID {
+		t.Fatalf("the distinct target rotated the original connection %s instead of creating one", f.connID)
+	}
+	var gotType, gotBaseURL string
+	if err := f.pool.QueryRow(ctx, `SELECT forge_type, base_url FROM forge_connections WHERE id = $1`, newID).Scan(&gotType, &gotBaseURL); err != nil {
+		t.Fatalf("read new row: %v", err)
+	}
+	if gotType != wantType || gotBaseURL != wantBaseURL {
+		t.Fatalf("new row target = (%q, %q), want (%q, %q)", gotType, gotBaseURL, wantType, wantBaseURL)
+	}
+	if bot, token := f.storedRow(ctx, t, newID); bot != wantBot || token != wantToken {
+		t.Fatalf("new row credential = (%q, %q), want (%q, %q)", bot, token, wantBot, wantToken)
+	}
+	if bot, token := f.storedRow(ctx, t, f.connID); bot != "bot-original" || token != "tok-original" {
+		t.Fatalf("original row = (%q, %q), want it untouched (bot-original, tok-original)", bot, token)
+	}
+	var rows int
+	if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM forge_connections WHERE user_id = $1`, f.owner.ID).Scan(&rows); err != nil {
+		t.Fatalf("count rows: %v", err)
+	}
+	if rows != 2 {
+		t.Fatalf("connection rows = %d, want 2 (the original plus the distinct target)", rows)
 	}
 }
 

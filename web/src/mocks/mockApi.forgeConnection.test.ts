@@ -59,8 +59,13 @@ describe("mockApi — forge connection duplicate guard", () => {
 
   it("does not refuse a different forge type on the same host", async () => {
     const api = await reload();
-    // forgejo is a different connection from the gitlab one on that host.
-    const err = await api.createConnection(HOST, "fjp-second", "forgejo").catch((e) => e);
-    expect(err.status).not.toBe(409);
+    const before = await api.listConnections();
+    const gitlab = before.connections.find((c) => c.base_url === HOST)!;
+    // forgejo is a different connection from the gitlab one on that host, so the
+    // create must succeed: any rejection fails the test.
+    const { connection } = await api.createConnection(HOST, "fjp-second", "forgejo");
+    expect(connection.forge_type).toBe("forgejo");
+    expect(connection.base_url).toBe(HOST);
+    expect(connection.id).not.toBe(gitlab.id);
   });
 });
