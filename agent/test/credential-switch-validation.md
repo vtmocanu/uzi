@@ -927,18 +927,26 @@ full-suite, security or m3/m4 completion evidence.
 
 ## Decision 11 recovery controls and crash point 5 (2026-11-18)
 
-Ledger U21: on retained recovery after crash points 1–4, the four crash
-leaves (now 32 with the survivors/unverified modes) show delivered Codex
-material is not released, refreshed, logged in or launched before the
-`predecessor_capture` proof, and never used when that proof reports survivors
-or unverified (`quiescence_failed`, clone and custody kept). Controls: an
-ordering mutant moving a release ahead of the proof (32 of 32 red) and a
-removal of the gate (all 8 forced leaves red), both class (b) preservation.
+Ledger U21: on same-worker retained recovery after crash points 1–4 (API-key A
+to subscription B), the four crash leaves (now 32 with the survivors/unverified
+modes) show delivered Codex material is not released or refreshed through the
+executor's provider client before the `predecessor_capture` proof (insertion
+controls, 32 of 32 red each). When the proof reports survivors or unverified,
+the executor never runs and the run takes the `quiescence_failed` blocker
+(gate and blocker controls, 8 of 8 forced leaves red each), all class (b)
+preservation. On `quiescence_failed` the run is reported `failed`
+(`worker_residue_blocked`) with its clone and custody kept; it is a terminal
+failure, not an owner pause.
 
 Owner decision on crash point 5 (predecessor host unreachable), 2026-11-18:
 recorded scope decision, **unvalidated and uncredited**, an environmental
 limitation. Fencing refuses stale uzi operations, but a different B credential
 and revoking A's uzi capability do not stop a provider credential that an
-unreachable predecessor already holds. No option-B protocol work; the runtime
-stays fail-closed (B is never used while predecessor quiescence is unproven,
-and the run holds for the owner). This covers crash point 5 only.
+unreachable predecessor already holds. No option-B protocol work. The runtime
+stays fail-closed: B is never used while predecessor quiescence is unproven,
+and the run holds for the owner instead. U21 evidences this only for
+same-worker retained recovery; a successor on another worker has no local
+retained journal, so the U21 gate does not run there, and how the api treats
+that claim is not evidenced here. This is not an exception to the quiescence
+guarantee, and continuation is never credited because the host is gone. This
+covers crash point 5 only.

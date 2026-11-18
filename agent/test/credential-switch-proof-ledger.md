@@ -436,7 +436,7 @@ control is still absent, not that the functional criterion was deferred.
 | Stopped preservation of binding, journals, session, gates, questions and custody without input consumption/time banking | E1 base-journal deletion, E2 applied-input deletion, E3 custody timestamp corruption, E4 owner-discard/live-reference loss, E5 direct paused-time credit, E6 applied-switch journal deletion; U17 effect-injection for session id, gate presentation id and row, question id and message on the first stop, and a run-row write (`updated_at`) and presentation deletion on replay; other gate columns and other replay tables compared but not individually injected; Slack, `cross_checks` and other trigger-closure tables outside the snapshot |
 | Stopped known extra typed member and register_nonce case alias | D25–D56: four running/paused wire cases only |
 | Bounded strict stopped request, other forbidden combinations, op_id and minimal acknowledgement | U18 credits the 1 MiB inclusive bound and the single-value rule (one copy each), op_id and unknown-field refusal (two copies each), expected_epoch on a running report (two copies), and the acknowledgement's four-key run object and 16 KiB bound under a 64 KiB plan; other statuses and the envelope key count not controlled; null/missing fields and case aliases beyond D25–D56 not controlled |
-| Decision 11: no worker-side use of delivered Codex material before the predecessor proof (crash points 1–4) | U21 credits non-use before the proof on all four crash points ((c) ordering, (b)), non-use and the `quiescence_failed` stop on survivors/unverified ((d), (b)); discard shown observably; the re-hold variant (runner.ts:30857) not exercised |
+| Decision 11: no worker-side use of delivered Codex material before the predecessor proof (crash points 1–4) | U21 credits, for API-key A → subscription B on same-worker retained recovery, no executor-client release or refresh before the proof ((c) insertion, (b)) and, on survivors/unverified, no executor run and the `quiescence_failed` blocker ((d), (b)); bodies, launches and requests before the proof asserted only; discard shown only as non-use; other auth directions, the `kind` half of the gate, the re-hold variant and cross-worker recovery not controlled |
 | Crash point 5: predecessor host unreachable | Owner decision 2026-11-18: recorded scope decision, unvalidated and uncredited (environmental limitation); runtime fail-closed per decision 11 |
 | Tokens absent from all inputs/acknowledgements/messages/logs | U19 credits B material's registration with the Runner's log and run-message redactors ((d), each separately; the executor's second log registration not controlled), the Codex apply route's log redaction (`LogValue`, (d)) and the stopped acknowledgement and log (effect-injection); the remaining surfaces are guardless by construction and go to the owner batch; m4 security gates remain required |
 
@@ -3655,80 +3655,117 @@ Not credited:
 
 ### U21 — decision 11: no worker-side use of delivered Codex material before the predecessor proof (2026-11-18)
 
-Candidate e3bc3e722d1b22e8f910ac9ba26aaa31eb66eac9 extends the four crash-point
-recovery leaves of "M2 actualRunner credential replacement" in
-agent/test/codex-executor.test.ts: "Codex switch crash after A teardown before
-apply recovers committed A without switching" (crash point 1), "… after apply
-commit loses auth response and recovers committed B" (2), "… after apply
-acknowledgement before B login recovers committed B" (3), and "… during B
-login retains committed B" (4). Each recovers through a distinct real Runner
-(`recoverRetainedClaim` → `recoverRetainedClaimBody`) consuming the recovered
-claim, whose payload delivers the committed A or B material with a reminted
-capability.
+Final candidate feb16cdf2547797b706b5305131fc3ed8114150b (tests from
+e3bc3e722, extended at feb16cdf2) extends the four crash-point recovery leaves
+of "M2 actualRunner credential replacement" in agent/test/codex-executor.test.ts:
+- "Codex switch crash after A teardown before apply recovers committed A
+  without switching" (crash point 1);
+- "… after apply commit loses auth response and recovers committed B" (2);
+- "… after apply acknowledgement before B login recovers committed B" (3);
+- "… during B login retains committed B" (4).
 
-The recovery Runner gets a `quiesceRun` option that records, at the
-`predecessor_capture` site (runner.ts:31041–31046), the state of every
-credential sink (the executor's provider client `releaseCodex`, the recovery
-Runner's own `releaseCodex`/`refreshCodex`, executor bodies, provider
-launches), then delegates to the real `quiesceRunAttempt`. Two new recovery
+The crash leaves exist only for API-key A switching to subscription B
+(factory phase), so the credit below is for that direction: delivered
+API-key A material at crash point 1, delivered subscription B material at
+2–4. Each leaf recovers through a distinct real Runner
+(`recoverRetainedClaim` → `recoverRetainedClaimBody`) that consumes the
+recovered claim, whose payload delivers the committed material with a
+reminted capability.
+
+The recovery Runner gets a `quiesceRun` option. At the `predecessor_capture`
+site (runner.ts:31041–31046) it records the state of every credential sink
+the test can observe, then delegates to the real `quiesceRunAttempt`. The
+recorded state is the executor provider client's `releaseCodex` (`releases`)
+and `refreshCodex` (`refreshCalls`), the recovery Runner's own client, executor
+bodies, provider launches and provider transport requests. Two new recovery
 modes, "quiescence survivors" and "quiescence unverified", return that verdict
-instead, for that site only. Assertions:
+for that site only. Assertions:
 - every one of the 32 leaves (four crash points × eight recovery modes)
-  requires the first predecessor proof to run with `releases=0 runner=0 bodies=0 launches=0`;
-- the forced leaves (8) require zero executor bodies, zero capability
-  releases or refreshes on either client, no provider launch and no provider
-  request at all (no `account/login/start`), the retained journal's
-  `blocker: "quiescence_failed"`, and a `failed` report whose reason starts
-  `worker_residue_blocked` (the run is stopped with its clone and custody kept);
-- the existing normal modes still require the first release and the B login
-  after the proof.
+  requires the first predecessor proof to run with
+  `releases=0 refreshes=0 runner=0 bodies=0 launches=0 requests=0`
+  (codex-executor.test.ts:35217–35218);
+- the forced leaves (8) require:
+  - zero executor bodies;
+  - zero releases and refreshes on the executor client and zero credential
+    operations on the Runner client;
+  - at least one recovery rig, with no provider launch and no provider request
+    on any rig (so no `account/login/start`);
+  - the retained journal's `blocker: "quiescence_failed"`;
+  - a `failed` report whose reason starts `worker_residue_blocked`.
 
 a233 reference: the gate is identical at a233883de3c36bae2e940f999cd9d582889dad00
 (`git show a233883de3c36bae2e940f999cd9d582889dad00:agent/src/runner.ts`
 :29462–29469: the `predecessor_capture` proof and `blocker = "quiescence_failed"; throw finalize;`),
-so both controls are class (b) preservation, here exercised through the switch
-crash points with switch-delivered material.
+so the gate controls are class (b) preservation, exercised here through the
+switch crash points with switch-delivered material.
 
-Trace: before the proof, the recovery path reads the delivered material only
-to register it with the redactors (runner.ts:6223–6226) and to construct (not
-run) the executor and a lazy operation scope (runner.ts:6230, :6284–6296;
-`acquireCodexOperationScope` makes no client call until an operation). The
-first credential operation is the executor's eager release inside
+Trace (code reading). Before the proof the recovery path reads the delivered
+material only to:
+- register it with the redactors (runner.ts:6223–6226);
+- construct, but not run, the executor (runner.ts:6230; the `CodexExecutor`
+  constructor makes no client call);
+- create a lazy operation scope (runner.ts:6284–6296;
+  `acquireCodexOperationScope` makes no client call until an operation).
+
+The other pre-proof steps are credential-free: policy admission
+reconciliation, the memory receipt handoff and repark check, the predecessor
+memory-settlement log, held-source disposal and predecessor source admission.
+The first credential operation is the executor's eager release inside
 `executor.run` (codex/codex-executor.ts:3903), reached at runner.ts:19017
 after recovery returns. No use before the proof was found, so no fix was
 needed.
 
 Command: `.uzi/scratch/u8tools/actl.sh` (export, `npm run typecheck`, then
 `node --import tsx --test --test-timeout=120000 --test-name-pattern='Codex switch crash' test/codex-executor.test.ts`,
-32 leaves). Logs `.uzi/scratch/ctl-logs/u21-*.{diff,log}`; each mutant log
-ends `SHA=e3bc3e722… EXIT=1`. Two earlier ordering and one gate attempt did
-not compile (`u21-*.compilefail*.log`) and earn nothing.
+32 leaves). Logs `.uzi/scratch/ctl-logs/u21*-*.{diff,log}`. Three earlier
+attempts did not compile (`u21-*.compilefail*.log`) and earn nothing.
 
-| Control | Class | Mutation | Red |
+| Control | Class | Mutation (runner.ts) | Red |
 | --- | --- | --- | --- |
-| u21-release-before-proof | (c) ordering, (b) | the first credential use, a `releaseCodex` with the delivered capability on the Runner client, moved ahead of the predecessor proof (runner.ts:31040) | 32 of 32 leaves at codex-executor.test.ts:35217 "no delivered Codex material is used before the first predecessor proof" |
-| u21-gate | (d) removal, (b) | the `quiescence_failed` gate after the proof (runner.ts:31050) → `if ((…) && Number.NaN > 0)` | 8 of 32 (every forced survivors/unverified leaf) at :35219 "unproven predecessor never reaches the executor body"; the 24 quiescent leaves pass |
+| u21r-exec-release-before-proof | (c) insertion of the real first use ahead of the proof, (b) | before the proof (:31038) insert a `releaseCodex` through the executor's own provider client (`flight.executor.opts.client`), the client its eager release uses | at feb16cdf2: 32 of 32 at :35217 "no delivered Codex material is used before the first predecessor proof", actual `releases=1 …` |
+| u21r-exec-refresh-before-proof | (c) insertion, (b) | the same position, a `refreshCodex` through the executor's provider client | at feb16cdf2: 32 of 32 at :35217, actual `refreshes=1 …` |
+| u21-release-before-proof | (c) insertion, sensitivity of the Runner-client counter only | the same position, a `releaseCodex` on the Runner's own client (production never releases through it) | at e3bc3e722: 32 of 32 at :35217, `runner=1` |
+| u21-gate | (d) removal, (b) | the `quiescence_failed` gate (:31050) → `if ((…) && Number.NaN > 0)` | at e3bc3e722: 8 of 32 (every forced leaf) at :35219 "unproven predecessor never reaches the executor body"; the 24 quiescent leaves pass |
+| u21r-blocker | (d), (b) | the gate's `blocker = "quiescence_failed"` → `"preservation_failed"` (:31051) | at feb16cdf2: 8 of 32 (every forced leaf) at :35232 "an unproven predecessor takes the quiescence_failed blocker", the executor still unrun |
 
-Unchanged candidate e3bc3e722: 32 of 32 pass (`u21-green.log`, 99.7 s,
-`SHA=e3bc3e722… EXIT=0`); agent `npm run lint` 0 warnings and 0 errors
-(`u21-lint-agent.log`). Runtime: eight new leaves of about 3 s each (the 32 take
-99.7 s; the previous 24 were not timed separately); they run in the codex
-executor test shard; hosted effect unmeasured.
+Unchanged candidate feb16cdf2: 32 of 32 pass (`u21r-green.log`, 92.2 s,
+`SHA=feb16cdf2… EXIT=0`); agent `npm run lint` 0 warnings and 0 errors
+(`u21r-lint-agent.log`). Runtime: the eight new leaves take about 10.5 s
+together (1.1–2.0 s each, from per-leaf durations in that log); no pre-change
+baseline of the 24 existing leaves was recorded, so the shard delta is
+estimated; hosted effect unmeasured.
 
-Credit: on retained recovery after each of crash points 1–4, delivered A or B
-material is not used (no release, refresh, login, provider start or executor
-body) before the predecessor proof; when the proof reports survivors or
-unverified, the material is never used, the run takes the `quiescence_failed`
-blocker and stops with its clone and custody kept; when the proof is
-quiescent, the first use follows it.
+Credit (API-key A → subscription B crash points 1–4, same-worker retained
+recovery):
+- delivered material is not released or refreshed through the executor's
+  provider client before the predecessor proof (two (c) insertion controls,
+  (b));
+- when the proof reports survivors or unverified, the executor never runs
+  (u21-gate), and the run takes the `quiescence_failed` blocker (u21r-blocker),
+  all (b).
 
-Not credited: "discarded" is shown observably (the recovery flight ends with
-the executor never run and no provider root), not by inspecting the flight's
-memory; the redactor registration of the delivered material is the permitted
-exception; the re-hold variant at runner.ts:30857–30866 is not exercised;
-the run's outcome on `quiescence_failed` is a terminal `failed` report with
-custody kept (existing behaviour), not an owner pause; crash point 5 is the
-owner's recorded limitation below.
+Asserted but not controlled: zero executor bodies, provider launches and
+provider requests before the proof; on the forced leaves, zero releases,
+refreshes, launches and requests and the `worker_residue_blocked` report
+(the gate mutant fails earlier, at the body assertion); in the normal modes,
+the existing assertions that the release and the B login happen at all (they
+are not ordered against the proof except by the first-proof snapshot).
+
+Not credited:
+- "Discarded" is shown only as non-use: no executor body and no provider root.
+  Nothing checks the flight's memory, redactor eviction, scope closure or
+  executor disposal. The redactor registration of the delivered material is
+  the permitted exception.
+- Subscription A and API-key B delivered material.
+- The gate's `kind !== "observed_empty"` half: the forced verdicts arrive as
+  `observed_empty` with `blocked`.
+- The re-hold variant at runner.ts:30857–30866.
+- Recovery on a different worker, which has no local retained journal, so
+  this gate does not run.
+- The outcome on `quiescence_failed`: it is a terminal `failed` report with the
+  clone and custody kept (existing behaviour), not an owner pause.
+
+Crash point 5 is the owner's recorded limitation below.
 
 Crash point 5 (predecessor host unreachable): owner decision (2026-11-18),
 recorded scope decision, **unvalidated and uncredited**, an environmental
