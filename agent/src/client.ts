@@ -14,7 +14,7 @@ import type { PublicationContextRequest, PublicationContextResponse } from "./pr
 import type { PublicationIntentRequest, PublicationIntentResult } from "./publication-intent.js";
 import type { CodexCatalogDefaultBody, LeadConfigReportBody } from "./protocol.js";
 import { decodeCompletionPending, type CompletionPending } from "./completion-pending.js";
-import { decodeProviderBinding } from "./provider-binding.js";
+import { CLAUDE_PROVIDER_CAPABILITY, decodeProviderBinding, ProviderBindingError } from "./provider-binding.js";
 import { SEMANTIC_GATE_ACK_MAX_BYTES, semanticGateAckSchema } from "./semantic-gate-wire.js";
 import { decodeInterruptedCalls, interruptedRegistration, type InterruptedRegistration, type InterruptedCalls } from "./interrupted-calls.js";
 import { Readable } from "node:stream";
@@ -1448,6 +1448,8 @@ export class WorkerClient {
   private hasBindinglessHoldCapability = false;
   /** Issue #3142: this registration advertised worker_memory_authority_claim_v1. */
   private hasMemoryAuthorityClaimCapability = false;
+  /** Whether this registration advertised claude_provider_v1; a provider claim is refused without it. */
+  private hasClaudeProviderCapability = false;
   private memoryAuthorityLostLogged = false;
   // Provenance survives uncertain registration; only a successful changed identity resets it.
   private completionWorkerId: string | undefined;
@@ -2119,6 +2121,7 @@ export class WorkerClient {
     this.hasExactHoldCapability = originalCapabilities?.includes("recovery_held_publication_v2") ?? false;
     this.hasBindinglessHoldCapability = originalCapabilities?.includes("recovery_bindingless_closed_v1") ?? false;
     this.hasMemoryAuthorityClaimCapability = originalCapabilities?.includes("worker_memory_authority_claim_v1") ?? false;
+    this.hasClaudeProviderCapability = originalCapabilities?.includes(CLAUDE_PROVIDER_CAPABILITY) ?? false;
     // PRD #1390 M2a: capture the per-registration nonce the api minted, stamped onto every
     // ActiveSnapshot the worker sends. A string only (defensive); absent on an older api ⇒
     // undefined, in which case no snapshot is sent even if later heartbeat adverts grow the cache.
@@ -2548,7 +2551,10 @@ export class WorkerClient {
       // vendor-contradicting binding, naming the rule and never a value).
       if (isRecord(claim) && isRecord(claim.secrets)) {
         const provider = decodeProviderBinding(claim.secrets);
-        if (provider) claim.secrets.provider = provider;
+        if (provider) {
+          this.requireProviderCapability();
+          claim.secrets.provider = provider;
+        }
       }
       // PRD #1230 M4: a present-but-malformed maintainer-pending projection fails the claim closed.
       if (isRecord(claim) && isRecord(claim.config) && Object.hasOwn(claim.config, "completion_pending")) {
@@ -2663,11 +2669,19 @@ export class WorkerClient {
         (claim.worker_recovery_owner_episode as number) < 0)) delete claim.worker_recovery_owner_episode;
     if (isRecord(claim) && isRecord(claim.secrets)) {
       const provider = decodeProviderBinding(claim.secrets);
-      if (provider) claim.secrets.provider = provider;
+      if (provider) {
+        this.requireProviderCapability();
+        claim.secrets.provider = provider;
+      }
     }
     validateClaimMemory(claim);
     this.dropUnknownDefaultEffort(claim);
     return claim;
+  }
+
+  /** Fail closed (PRD #4320): a provider claim is malformed unless this registration advertised claude_provider_v1. */
+  private requireProviderCapability(): void {
+    if (!this.hasClaudeProviderCapability) throw new ProviderBindingError("capability not advertised");
   }
 
   /** Claim guard (PRD #3247): a `config.default_effort` outside the closed HARNESS_EFFORTS set

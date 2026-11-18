@@ -108,6 +108,9 @@ func blockerAction(r store.ListWorkerUpgradeBlockersRow) string {
 	case "pool_wait":
 		return "a pooled token becomes spendable, or the owner adds or selects a usable token / runs `uzi run resume-now`"
 	case "limit_wait":
+		// A limit_wait with a NULL retry_not_before has no timer: a provider gateway limit_wait from its
+		// fourth park onward (PRD #4320) waits for its owner to resume or cancel, so "unavailable" below
+		// means no automatic promotion at all, not a missing reading.
 		return fmt.Sprintf("retry_not_before %s gates promotion; limit reset %s is informational; owner may inspect or resume; no roll time promised", blockerTime(r.RetryNotBefore), blockerTime(r.LimitResetsAt))
 	case "recovery_wait":
 		cause := blockerFact(r.RecoveryWaitCause)

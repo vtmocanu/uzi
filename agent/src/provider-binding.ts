@@ -4,14 +4,17 @@
 //     (operator allowlist); the worker validates only the binding's SHAPE and its exclusivity with
 //     any vendor credential. A claim that fails it is malformed: the claim loop treats the throw
 //     like every other malformed claim (nothing starts, nothing is spent).
-//   - sdkCredentialFromBinding / sdkCredentialForSecrets: the one place a claim's secrets become
-//     the SdkCredential every spawn site hands to buildSdkEnv.
+//   - sdkCredentialFromBinding: the one place a decoded binding becomes the SdkCredential every
+//     spawn site hands to buildSdkEnv.
 //   - resolveProviderModel: model resolution through the bound map. An unmapped alias or a full
 //     vendor model ID is a typed refusal; nothing is ever rewritten.
 
 import type { EmittedMessage } from "./executor.js";
 import type { ClaimProviderBinding } from "./protocol.js";
 import type { SdkCredential } from "./sdk-env.js";
+
+/** The protocol capability a worker must advertise (at register) to accept a provider-bound claim. */
+export const CLAUDE_PROVIDER_CAPABILITY = "claude_provider_v1";
 
 /** The reason a claim whose lane cannot serve a provider reports (the server refuses these lanes
  *  first; this is the worker's second layer). */
@@ -174,12 +177,12 @@ export class ProviderModelUnmappedError extends Error {
 /**
  * Resolve a requested model through a provider's map. Allowed: a Claude alias the map carries
  * (`opus`, `sonnet`, `haiku`, `fable`) or exactly one of the mapped target model strings. An empty
- * or unset model means the CLI default slot, which is the `sonnet` alias. Anything else throws
+ * or unset model, or the SDK's `inherit`, means the CLI default slot, which is the `sonnet` alias. Anything else throws
  * {@link ProviderModelUnmappedError}. The returned string is what the SDK `model` option receives:
  * the alias or mapped target as given, never a rewrite.
  */
 export function resolveProviderModel(model: string | undefined, modelMap: ClaimProviderBinding["model_map"]): string {
-  const effective = model === undefined || model.trim() === "" ? "sonnet" : model;
+  const effective = model === undefined || model.trim() === "" || model === "inherit" ? "sonnet" : model;
   if ((ALIASES as readonly string[]).includes(effective)) {
     if (modelMap[effective as Alias] !== undefined) return effective;
     throw new ProviderModelUnmappedError(effective);
@@ -190,7 +193,7 @@ export function resolveProviderModel(model: string | undefined, modelMap: ClaimP
 
 /**
  * Resolve every explicit model of a subagent roster through a provider's map (PRD #4320 module 7:
- * templates and repo-sourced agents alike). An agent with no `model` inherits the lead's, which the
+ * templates and repo-sourced agents alike). An agent with no `model`, or `model: inherit`, inherits the lead's, which the
  * caller has already resolved; an unmapped one throws {@link ProviderModelUnmappedError} naming it.
  * Nothing is rewritten.
  */
@@ -199,6 +202,6 @@ export function assertAgentModelsMapped(
   modelMap: ClaimProviderBinding["model_map"],
 ): void {
   for (const def of Object.values(agents)) {
-    if (def.model !== undefined && def.model !== "") resolveProviderModel(def.model, modelMap);
+    if (def.model !== undefined && def.model !== "" && def.model !== "inherit") resolveProviderModel(def.model, modelMap);
   }
 }

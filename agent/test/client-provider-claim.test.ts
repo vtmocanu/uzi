@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { afterEach, beforeEach, describe, it, mock } from "node:test";
 import { WorkerClient } from "../src/client.js";
+import { CLAUDE_PROVIDER_CAPABILITY } from "../src/provider-binding.js";
 import { makeClaim, recordingLogger } from "./helpers.js";
 
 // PRD #4320 module 5: the claim decoder is fail-closed on a provider binding, on the run lane
@@ -42,21 +43,30 @@ function setBody(kind: string, secrets: Record<string, unknown>): void {
 for (const [label, kind, claim] of LANES) {
   describe(label, () => {
     it("decodes a well-formed provider binding with an empty oauth token", async () => {
-      await client.register("provider-worker");
+      await client.register("provider-worker", undefined, undefined, undefined, [CLAUDE_PROVIDER_CAPABILITY]);
       setBody(kind, { forge_pat: "p", anthropic_oauth_token: "", provider: provider() });
       const decoded = await claim();
       assert.equal((decoded!.secrets as Secrets).provider?.credential, KEY);
     });
 
+    it("refuses a provider claim when the worker did not advertise claude_provider_v1", async () => {
+      await client.register("provider-worker", undefined, undefined, undefined, ["cross_check_v1"]);
+      setBody(kind, { forge_pat: "p", anthropic_oauth_token: "", provider: provider() });
+      await assert.rejects(claim(), (e: Error) => /malformed provider binding on claim: capability not advertised/.test(e.message) && !e.message.includes(KEY));
+      // A vendor claim is unaffected by the missing capability.
+      setBody(kind, { forge_pat: "p", anthropic_oauth_token: "vendor-token-do-not-scan" });
+      assert.ok(await claim());
+    });
+
     it("leaves a vendor claim (no provider key) untouched", async () => {
-      await client.register("provider-worker");
+      await client.register("provider-worker", undefined, undefined, undefined, [CLAUDE_PROVIDER_CAPABILITY]);
       setBody(kind, { forge_pat: "p", anthropic_oauth_token: "vendor-token-do-not-scan" });
       const decoded = await claim();
       assert.ok(!("provider" in (decoded!.secrets as object)));
     });
 
     it("refuses BOTH bindings: a provider next to a non-empty OAuth token", async () => {
-      await client.register("provider-worker");
+      await client.register("provider-worker", undefined, undefined, undefined, [CLAUDE_PROVIDER_CAPABILITY]);
       setBody(kind, { forge_pat: "p", anthropic_oauth_token: "vendor-token-do-not-scan", provider: provider() });
       await assert.rejects(claim(), (e: Error) => /malformed provider binding/.test(e.message) && !e.message.includes(KEY));
     });
@@ -70,7 +80,7 @@ for (const [label, kind, claim] of LANES) {
       ["an out-of-range context window", { model_map: { haiku: { model: "h", context_window: 100 } } }],
     ] as const) {
       it(`refuses ${name}`, async () => {
-        await client.register("provider-worker");
+        await client.register("provider-worker", undefined, undefined, undefined, [CLAUDE_PROVIDER_CAPABILITY]);
         setBody(kind, { forge_pat: "p", anthropic_oauth_token: "", provider: provider(over) });
         await assert.rejects(claim(), /malformed provider binding/);
       });
@@ -86,7 +96,7 @@ describe("loopback is accepted only with the worker's own UZI_PROVIDER_ALLOW_LOO
   });
 
   it("refuses http loopback by default and accepts it with the dev flag", async () => {
-    await client.register("provider-worker");
+    await client.register("provider-worker", undefined, undefined, undefined, [CLAUDE_PROVIDER_CAPABILITY]);
     delete process.env.UZI_PROVIDER_ALLOW_LOOPBACK;
     setBody("issue", { forge_pat: "p", anthropic_oauth_token: "", provider: provider({ base_url: "http://127.0.0.1:4010/anthropic" }) });
     await assert.rejects(client.claimRun(), /malformed provider binding/);

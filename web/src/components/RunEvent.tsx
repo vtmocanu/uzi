@@ -1049,7 +1049,7 @@ function LimitRow({
           outcome is true for every emitter; the cause is true for the current one. */}
       {gateway
         ? parked
-          ? "Provider gateway rate limit reached — paused, retrying automatically"
+          ? "Provider gateway rate limit reached — paused, retrying or waiting for you to resume"
           : "Provider gateway rate limit reached — the run failed here"
         : parked
           ? `${usageLimitLabel(harness)} reached — paused until it resets`

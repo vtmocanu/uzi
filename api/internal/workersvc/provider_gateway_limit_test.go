@@ -123,3 +123,17 @@ func TestProviderRunUsageReportsRecordUnreportedThroughTheAppendPath(t *testing.
 		}
 	}
 }
+
+// TestProviderGatewayLimitFailureWording: the failed arm composes provider wording for the provider
+// type (never the vendor "Anthropic usage limit" sentence), identical to the park-decision opt-out text.
+func TestProviderGatewayLimitFailureWording(t *testing.T) {
+	typ := RateLimitTypeProviderGatewayLimit
+	want := decideProviderLimitPark(false, 0, parkNow).Reason
+	if got := limitFailureReason("claude", &typ, nil, ""); got != want {
+		t.Errorf("limitFailureReason = %q, want %q", got, want)
+	}
+	req := StateRequest{RateLimitType: &typ}
+	if got := limitAwareFailureReason("claude", req).String; got != want {
+		t.Errorf("limitAwareFailureReason = %q, want %q", got, want)
+	}
+}

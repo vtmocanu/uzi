@@ -517,6 +517,13 @@ func limitWindowFor(rateLimitType *string) limitWindow {
 // never claims a fact the server does not have: no type means no parenthetical, no
 // reset means no "resets at" clause.
 func limitFailureReason(harness string, rateLimitType *string, resetsAt *time.Time, detail string) string {
+	if rateLimitType != nil && *rateLimitType == RateLimitTypeProviderGatewayLimit {
+		// A provider gateway has no vendor usage window and no reset time: name the gateway, not Anthropic.
+		if detail != "" {
+			return providerGatewayLimitReason + "; " + detail
+		}
+		return providerGatewayLimitReason
+	}
 	s := "Anthropic usage limit"
 	if harness == "codex" {
 		s = "Codex usage limit"
@@ -558,6 +565,11 @@ func providerGatewayRetryNotBefore(streakBefore int32, now time.Time) (time.Time
 	return now.Add(providerGatewayLimitBackoff[streakBefore]), true
 }
 
+// providerGatewayLimitReason is the failure sentence of a provider run that hit a gateway limit
+// without waiting: composed by decideProviderLimitPark and, for a `failed` report carrying the
+// provider_gateway_limit type, by limitFailureReason (the opt-out arrives through either).
+const providerGatewayLimitReason = "Provider gateway rate limit reached; this run is not set to wait on rate limits"
+
 // decideProviderLimitPark is the whole policy for a provider-bound run's limit report. Pure.
 //
 // The reported rate_limit_type and reset are IGNORED, not merely sanitized: a provider run has no
@@ -569,7 +581,7 @@ func decideProviderLimitPark(waitOnLimit bool, streakBefore int32, now time.Time
 	t := RateLimitTypeProviderGatewayLimit
 	d := limitParkDecision{RateLimitType: &t}
 	if !waitOnLimit {
-		d.Reason = "Provider gateway rate limit reached; this run is not set to wait on rate limits"
+		d.Reason = providerGatewayLimitReason
 		return d
 	}
 	d.Park = true

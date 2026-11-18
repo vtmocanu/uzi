@@ -181,6 +181,10 @@ describe("resolveProviderModel (PRD #4320 module 7)", () => {
     assertAgentModelsMapped({ a: {}, b: { model: "haiku" }, c: { model: "corp-opus" } }, map);
     assert.throws(() => assertAgentModelsMapped({ a: {}, b: { model: "claude-sonnet-4-5" } }, map), ProviderModelUnmappedError);
     assert.throws(() => assertAgentModelsMapped({ a: { model: "fable" } }, map), /fable/);
+    // "inherit" is the SDK's parent-model sentinel: the lead is already resolved, so it is never refused.
+    // Checked against a map WITHOUT sonnet, so an "inherit" mistaken for the sonnet default would throw.
+    assertAgentModelsMapped({ a: { model: "inherit" } }, { haiku: { model: "corp-haiku" } });
+    assert.equal(resolveProviderModel("inherit", map), resolveProviderModel(undefined, map));
   });
 });
 

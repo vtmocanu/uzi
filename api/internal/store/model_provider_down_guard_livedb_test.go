@@ -17,12 +17,15 @@ import (
 // snapshot it reads). Text order, because the interleaving needs a live database (see
 // TestModelProviderDownLockSerializesWithAWriterLiveDB).
 func TestModelProviderDownGuardsLockBeforeTheCheck(t *testing.T) {
-	for file, table := range map[string]string{
-		"00466_model_providers.sql":              "model_providers",
-		"00467_user_secrets_provider_key.sql":    "user_secrets",
-		"00469_users_claude_provider_source.sql": "users",
-		"00471_runs_model_provider_binding.sql":  "runs",
+	// mode is the table lock each Down takes: the runs Downs take ACCESS EXCLUSIVE up front (no lock upgrade).
+	for file, spec := range map[string]struct{ table, mode string }{
+		"00466_model_providers.sql":                  {"model_providers", "SHARE ROW EXCLUSIVE"},
+		"00467_user_secrets_provider_key.sql":        {"user_secrets", "SHARE ROW EXCLUSIVE"},
+		"00469_users_claude_provider_source.sql":     {"users", "SHARE ROW EXCLUSIVE"},
+		"00471_runs_model_provider_binding.sql":      {"runs", "ACCESS EXCLUSIVE"},
+		"00478_runs_provider_gateway_limit_type.sql": {"runs", "ACCESS EXCLUSIVE"},
 	} {
+		table := spec.table
 		b, err := os.ReadFile(filepath.Join("migrations", file)) //nolint:gosec // G304: a fixed name inside this package's migrations dir.
 		if err != nil {
 			t.Fatal(err)
@@ -32,7 +35,7 @@ func TestModelProviderDownGuardsLockBeforeTheCheck(t *testing.T) {
 			t.Fatalf("%s has no Down block", file)
 		}
 		timeout := strings.Index(down, "SET LOCAL lock_timeout = '5s';")
-		lock := strings.Index(down, "LOCK TABLE "+table+" IN SHARE ROW EXCLUSIVE MODE;")
+		lock := strings.Index(down, "LOCK TABLE "+table+" IN "+spec.mode+" MODE;")
 		guard := strings.Index(down, "IF EXISTS (SELECT 1 FROM "+table)
 		if timeout < 0 || lock < 0 || guard < 0 || timeout >= lock || lock >= guard {
 			t.Errorf("%s Down: lock_timeout@%d, LOCK TABLE %s@%d, IF EXISTS guard@%d; want all present in that order", file, timeout, table, lock, guard)
@@ -169,6 +172,19 @@ func TestModelProviderDownGuardsLiveDB(t *testing.T) {
 	if err := run00("00469_users_claude_provider_source.sql"); err != nil {
 		t.Fatalf("00469 Down with no selected source: %v", err)
 	}
+
+	// 00478: a run still parked on a provider gateway limit blocks the Down (it would otherwise be coerced
+	// to 'unknown' and stranded as an owner-wait the sweeper and Resume can no longer match).
+	mustExec(ctx, t, pool, `INSERT INTO runs(id,user_id,repo_id,worker_id,kind,issue_iid,issue_title,issue_description,status,claim_generation,rate_limit_type)
+ VALUES($1,$2,$3,$4,'issue',2,'t','d','limit_wait',0,'provider_gateway_limit')`, run, user, repo, worker)
+	if err := run00("00478_runs_provider_gateway_limit_type.sql"); err == nil || !strings.Contains(err.Error(), "refusing to roll back 00478") {
+		t.Fatalf("00478 Down with a provider_gateway_limit run: %v, want a refusal", err)
+	}
+	mustExec(ctx, t, pool, "UPDATE runs SET rate_limit_type = 'unknown' WHERE id = $1", run)
+	if err := run00("00478_runs_provider_gateway_limit_type.sql"); err != nil {
+		t.Fatalf("00478 Down with no provider_gateway_limit run: %v", err)
+	}
+	mustExec(ctx, t, pool, "DELETE FROM runs WHERE id = $1", run)
 
 	// 00471: a bound run blocks the Down.
 	mustExec(ctx, t, pool, `INSERT INTO runs(id,user_id,repo_id,worker_id,kind,issue_iid,issue_title,issue_description,status,claim_generation,

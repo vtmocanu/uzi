@@ -10,6 +10,7 @@ import type { ChatInput, ChatInputSource } from "../src/steering.js";
 import type { WorkerClient } from "../src/client.js";
 import type { ChatClaimResponse, OutgoingMessage, StateRequest } from "../src/protocol.js";
 import { nullLogger } from "./helpers.js";
+import { secretRecordingLogger } from "./runner-harness.js";
 
 // The ChatRunner is exercised with a fake in-memory client (state + message
 // captures), a fake input source (scripted ChatInputs — the ChatSteering channel is
@@ -347,5 +348,36 @@ describe("ChatRunner — resume preflight (issue #105)", () => {
     await runnerWithHome(client, new ChatExecutor(nullLogger(), homeDir, { queryFn }), fakeSource([msg("q"), { kind: "idle" }]))
       .execute(baseClaim({ resume_of_run_id: "prior-run", session_id: SID }));
     assert.strictEqual(options[0]!.resume, SID, "no HOME configured ⇒ the claim's id passes through unchanged");
+  });
+});
+
+describe("ChatRunner — provider gateway key redaction (PRD #4320)", () => {
+  // Assembled at runtime: no provider-token-shaped literal in source.
+  const PROVIDER_KEY = ["gw", "key", "do-not-scan", "5151", "abcdefgh"].join("-");
+  const providerClaim = (): ChatClaimResponse => baseClaim({
+    secrets: {
+      anthropic_oauth_token: "",
+      provider: {
+        provider_id: "p-1", revision: 1, engine: "claude", protocol: "anthropic_messages", base_url: "https://gw.example.test/a",
+        auth_style: "bearer", credential: PROVIDER_KEY, model_map: { sonnet: { model: "corp-sonnet" }, haiku: { model: "corp-haiku" } },
+      },
+    },
+  });
+
+  it("registers the key with the logger, evicts it on terminal, and scrubs it from emitted messages", async () => {
+    const { messages, client } = fakeClient();
+    const queryFn: SdkQueryFn = (params) => (async function* () {
+      for await (const _ of params.prompt) { /* drain */ }
+      yield assistantText(`the gateway echoed ${PROVIDER_KEY}`);
+      yield resultSuccess();
+    })();
+    const { logger, added, removed } = secretRecordingLogger();
+    const executor = new ChatExecutor(nullLogger(), homeDir, { queryFn });
+    await new ChatRunner(client, () => executor, logger, 5, DEFAULTS, JOIN, { makeSource: () => fakeSource([msg("hi"), { kind: "idle" }]) }).execute(providerClaim());
+    assert.ok(added.includes(PROVIDER_KEY), "the provider key was registered with the logger");
+    assert.ok(removed.includes(PROVIDER_KEY), "and evicted when the chat ended");
+    const emitted = JSON.stringify(messages);
+    assert.ok(!emitted.includes(PROVIDER_KEY), "the key never reaches a chat message");
+    assert.ok(emitted.includes("REDACTED"), "it was replaced, not dropped");
   });
 });

@@ -1237,7 +1237,10 @@ describe("RunEventRow — limit_wait / limit_hit (PRD #35)", () => {
       <RunEventRow msg={msg({ seq: 5, kind: "limit_wait", payload: { rate_limit_type: "provider_gateway_limit" } })} live={false} />,
     );
     expect(container.textContent).toContain("Provider gateway rate limit reached");
-    expect(container.textContent).toContain("retrying automatically");
+    // From the fourth park retry_not_before is NULL and the run waits for its owner, so the row never
+    // promises an automatic retry on its own.
+    expect(container.textContent).not.toContain("retrying automatically");
+    expect(container.textContent).toContain("waiting for you to resume");
     expect(container.textContent).not.toContain("Usage limit");
     expect(container.textContent).not.toContain("resets");
     expect(container.querySelector(".text-warn")).not.toBeNull();

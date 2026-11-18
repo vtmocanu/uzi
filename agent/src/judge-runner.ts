@@ -331,6 +331,7 @@ export class JudgeRunner {
         this.log.warn("judge claim carried a provider binding; refusing the lane", { run_id: judgeRunId, reason: PROVIDER_LANE_UNSUPPORTED });
         await safeReportFailed(this.client, this.log, "judge", judgeRunId, PROVIDER_LANE_UNSUPPORTED, undefined,
           claim.claim_generation, this.terminalDeps);
+        this.log.removeSecret(claim.secrets.provider.credential);
         required?.close();
         this.activeRuns?.remove(judgeRunId);
         return;

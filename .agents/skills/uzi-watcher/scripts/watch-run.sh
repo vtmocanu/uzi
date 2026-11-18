@@ -84,6 +84,10 @@
 # is null) also always stops as an owner decision: it never resumes by itself; owner uzi run resume
 # (after raising the limit), uzi run set-token (another credential; switchable kinds only, not chat,
 # judge, self_improve or job), or cancel.
+# A provider gateway limit_wait (PRD #4320: rate_limit_type provider_gateway_limit) whose retry_not_before is
+# explicitly null is an owner wait (the fourth gateway park onward): it never resumes by itself, so it always
+# stops the watch: STOP=limit_wait:provider_gateway_limit, RESULT=stop:limit_wait, exit 0. A stamped park
+# retries itself and keeps polling like any other limit_wait.
 # Other recovery_wait causes keep polling unless the stop set names
 # recovery_wait, except a `data_volume_full` park, which is an attention signal (above).
 # `paused` never resumes on its own either (an owner pause, or hold_reason budget_exhausted /
@@ -217,6 +221,15 @@ while [ "$i" -lt "$MAX" ]; do
       printf 'STOP=recovery_wait:retained_recovery_exhausted\n'
       printf 'NOTE owner decision: automatic retained-recovery retries are capped (no retry stamp); local work and custody are retained; uzi run resume or cancel\n'
       printf 'RESULT=stop:recovery_wait\n'
+      exit 0
+    fi
+  fi
+  if [ "$s" = limit_wait ]; then
+    rj="$(uzi run get "$RID" --json 2>/dev/null)" || rj=""
+    if printf '%s' "$rj" | jq -e '.rate_limit_type == "provider_gateway_limit" and has("retry_not_before") and .retry_not_before == null' >/dev/null 2>&1; then
+      printf 'STOP=limit_wait:provider_gateway_limit\n'
+      printf 'NOTE owner decision: the provider gateway limit has no retry time and never resumes by itself; uzi run resume or cancel\n'
+      printf 'RESULT=stop:limit_wait\n'
       exit 0
     fi
   fi

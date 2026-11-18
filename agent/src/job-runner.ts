@@ -752,7 +752,8 @@ export class JobRunner {
     // The secrets every outgoing string is scrubbed of. A lane job adds its fetch credential the
     // moment the grant validates; one list builds the batcher's redactors AND the text redactor
     // finish() and the failure reports use.
-    let secrets: Array<string | undefined> = [token, claim.secrets?.provider?.credential, this.joinToken];
+    const providerKey = claim.secrets?.provider?.credential;
+    let secrets: Array<string | undefined> = [token, providerKey, this.joinToken];
     let redactText: TextRedactor = makeTextRedactor(secrets);
     let laneCredential: string | undefined;
     try {
@@ -943,6 +944,7 @@ export class JobRunner {
       if (ws) await removeJobWorkspace(ws, runLog);
       this.activeRuns?.remove(runId);
       if (token) this.log.removeSecret(token);
+      if (providerKey) this.log.removeSecret(providerKey);
       if (laneCredential) this.log.removeSecret(laneCredential);
     }
   }

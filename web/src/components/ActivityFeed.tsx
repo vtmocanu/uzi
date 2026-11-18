@@ -378,7 +378,9 @@ function agentOneLiner(latest: RunMessage | undefined, detail?: PlanCrossCheckSu
         ? "Waiting on a provider gateway rate limit"
         : "Paused on a usage limit";
     case "limit_hit":
-      return "Hit a usage limit";
+      return (latest.payload as { rate_limit_type?: unknown } | null)?.rate_limit_type === PROVIDER_GATEWAY_LIMIT
+        ? "Hit a provider gateway rate limit"
+        : "Hit a usage limit";
     // PRD #634: the worker acknowledged an operator scope directive and finalized the
     // committed slice at the ceiling. `text` is worker-authored; it renders here as a
     // plain escaped string child (same as the `status`/`text` cases above), truncated to
@@ -904,7 +906,9 @@ export function ActivityFeed({
                     ? "Run waiting on a provider gateway rate limit"
                     : `Run paused on ${usageLimitPhrase(run.harness)}`
                   : meaningful.kind === "limit_hit"
-                    ? `Run hit ${usageLimitPhrase(run.harness)}`
+                    ? (meaningful.payload as { rate_limit_type?: unknown } | null)?.rate_limit_type === PROVIDER_GATEWAY_LIMIT
+                      ? "Run hit a provider gateway rate limit"
+                      : `Run hit ${usageLimitPhrase(run.harness)}`
                     : // Fixed phrase, matching the limit_* treatment: the steer_ack
                       // payload is worker-authored, and this is read aloud out of
                       // context, so it interpolates nothing from the payload.

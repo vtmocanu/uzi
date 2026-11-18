@@ -1456,6 +1456,10 @@ func TestProviderGatewayParkRendersAsGatewayWaitNotUsageLimit(t *testing.T) {
 	}
 	_, section := blockSummary(blocks)
 	all := section + contextText(blocks) + fallback
+	// The block heading and the notification fallback carry the same verb.
+	if !strings.Contains(fallback, "Waiting · provider gateway rate limit · ") || strings.Contains(fallback, "Paused") {
+		t.Errorf("fallback = %q, want the same Waiting heading as the blocks", fallback)
+	}
 	for _, want := range []string{"Waiting · provider gateway rate limit", "retrying <!date^", "(pause 2)"} {
 		if !strings.Contains(all, want) {
 			t.Errorf("thread = %q, want %q", all, want)

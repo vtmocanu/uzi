@@ -204,6 +204,38 @@ func TestProviderGatewayLimitOptOutFailsLiveDB(t *testing.T) {
 	if err != nil || !applied || r.Status != "failed" || r.FailOrigin.String != "rate_limited" {
 		t.Fatalf("opt-out park: status=%s origin=%v applied=%v err=%v", r.Status, r.FailOrigin, applied, err)
 	}
+	const want = "Provider gateway rate limit reached; this run is not set to wait on rate limits"
+	if got := mustRun(t, pf.env, runID).FailureReason.String; got != want {
+		t.Fatalf("opt-out park failure_reason = %q, want %q", got, want)
+	}
+}
+
+// TestProviderGatewayLimitFailedReportReasonLiveDB: the opt-out worker may also report `failed`
+// directly with the structured limit type (the SetRunFailed arm). The stored reason is the server's
+// provider wording, never the vendor "Anthropic usage limit" sentence, and never the worker's text.
+func TestProviderGatewayLimitFailedReportReasonLiveDB(t *testing.T) {
+	pf := newPCFix(t)
+	runID := pf.run(t)
+	pf.env.exec(`UPDATE runs SET wait_on_limit = false WHERE id = $1`, runID)
+	w := pf.worker(t)
+	payload, err := pf.svc.Claim(pf.env.ctx, w, nil)
+	if err != nil || payload == nil {
+		t.Fatalf("Claim = (%v, %v)", payload != nil, err)
+	}
+	gen := payload.ClaimGeneration
+	if _, applied, err := pf.svc.SetState(pf.env.ctx, w, runID, StateRequest{State: "running", ClaimGeneration: &gen}); err != nil || !applied {
+		t.Fatalf("start: applied=%v err=%v", applied, err)
+	}
+	reason := "worker-composed text that must be replaced"
+	r, applied, err := pf.svc.SetState(pf.env.ctx, w, runID, StateRequest{State: "failed", ClaimGeneration: &gen, FailureReason: &reason,
+		RateLimitType: strPtr(RateLimitTypeProviderGatewayLimit)})
+	if err != nil || !applied || r.Status != "failed" {
+		t.Fatalf("failed report: status=%s applied=%v err=%v", r.Status, applied, err)
+	}
+	const want = "Provider gateway rate limit reached; this run is not set to wait on rate limits"
+	if got := mustRun(t, pf.env, runID).FailureReason.String; got != want {
+		t.Fatalf("failure_reason = %q, want %q", got, want)
+	}
 }
 
 // TestProviderGatewayLimitOwnerWaitCancelsLiveDB: the owner-wait row (streak 4, NULL retry) is not a

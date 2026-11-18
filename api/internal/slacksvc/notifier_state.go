@@ -1017,9 +1017,9 @@ func renderThreadBlocks(rc store.GetSlackRunContextRow, base string) (blocks []s
 		// The ONE non-terminal case, ruled rather than accidental. The reasoning and the
 		// two properties that bound it live on this function's doc comment above, in one
 		// place, so they cannot drift from the contract they amend.
-		head, parkWord := "⏸️ *Paused · usage limit*", "usage limit"
+		head, parkLabel := "⏸️ *Paused · usage limit*", "Paused · usage limit"
 		if providerGatewayPark(rc) {
-			head, parkWord = "⏸️ *Waiting · provider gateway rate limit*", "provider gateway rate limit"
+			head, parkLabel = "⏸️ *Waiting · provider gateway rate limit*", "Waiting · provider gateway rate limit"
 		}
 		blocks = []slack.Block{threadSectionBlock(head)}
 		var ctxElems []slack.MixedElement
@@ -1032,7 +1032,7 @@ func renderThreadBlocks(rc store.GetSlackRunContextRow, base string) (blocks []s
 		if len(ctxElems) > 0 {
 			blocks = append(blocks, slack.NewContextBlock("slack_thread_limit_ctx", ctxElems...))
 		}
-		return blocks, fmt.Sprintf("Paused · %s · %s#%d", parkWord, repo, iid(rc.IssueIid)), true
+		return blocks, fmt.Sprintf("%s · %s#%d", parkLabel, repo, iid(rc.IssueIid)), true
 
 	case "paused":
 		if iterationHold(rc) {

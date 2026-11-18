@@ -13,8 +13,9 @@ import { buildSdkEnv, type SdkCredential } from "../src/sdk-env.js";
 // env uzi builds, send every request (main agent, Task subagent, haiku auxiliary calls) ONLY to the
 // bound base URL, and does it refuse to follow a gateway redirect for either auth style?
 //
-// The SDK `env` REPLACES the child environment (sdk-env.ts), so the CLI sees exactly
-// {...buildSdkEnv(providerCredential, home), HTTPS_PROXY, HTTP_PROXY, NO_PROXY}. The proxy variables are
+// The SDK `env` REPLACES the child environment (sdk-env.ts), so the CLI's environment is built from
+// {...buildSdkEnv(providerCredential, home), HTTPS_PROXY, HTTP_PROXY, NO_PROXY} (the SDK may add its own
+// entrypoint variables on top; the worker's process environment does not leak in). The proxy variables are
 // TEST-ONLY: they point at a loopback recorder that records and refuses every CONNECT and absolute-URI
 // request, so a request the CLI sends anywhere except the (NO_PROXY-exempt) fake gateway is recorded.
 // CALIBRATION comes first: a binding to https://foreign.invalid must be recorded at the recorder,
