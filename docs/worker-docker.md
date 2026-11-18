@@ -773,8 +773,9 @@ of such an attempt as written, so the conflict survives it.
 
 The rule spans bares: any other bare's binding or ledger value naming the
 attempt, or any one that cannot be identified (an undecodable binding, an
-unparseable or attempt-less ledger value), keeps a `settled` parent as `conflict`
-(`intent` and `removing` parents are already kept for their own reasons). The
+unparseable or attempt-less ledger value), keeps the parent: a present parent
+with a `settled` binding is reported as `conflict` (`intent` and `removing` are
+already kept for their own reasons), and a gone parent is checked in every phase. The
 two re-reads inside the per-candidate exclusion are named separately. An unknown
 re-read of the protected paths keeps the parent as
 `protected_by_retained_source` (`budget_deferred` when the phase window is
@@ -782,17 +783,19 @@ over). An unreadable re-read of the other bares' retire evidence keeps it as
 `budget_deferred` when the phase window is over, else `conflict` (or
 `metadata_unresolved` for a gone parent). The cross-bare check reads only bares
 other than the parent's own, so one such binding or value in any other bare
-keeps every settled parent bound in any other bare until it is removed.
+keeps every bound parent of every other bare (settled, or gone in any phase)
+until it is removed.
 Compaction preserves values naming another bare's attempts and, while any other
 bare holds a binding, its own values that cannot be attributed to an attempt. It
 skips, leaving the ledger unchanged, with the warning
 `attempt ledger compaction skipped: foreign retire evidence unavailable` (plus a
 fixed reason) when another bare cannot be read within its bounds, or its content
-is readable but unidentifiable (`binding_undecodable`, `binding_unknown`,
-`ledger_unidentified`). A kept unidentifiable value does not heal itself, and
+is readable but unidentifiable (`binding_undecodable`, `ledger_unidentified`), or
+another bare's binding set is over its cap (`binding_unknown`). A kept unidentifiable value does not heal itself, and
 such a skip can persist worker-wide. Removing the value from that bare's config
 is an operator-only, unsupported step, done with the worker stopped: compaction
-rewrites the config under `config.lock`, so a live edit races it.
+computes what to keep from an earlier read, and its rewrite could reinstate a
+value removed after that read.
 
 Still kept: legacy parents created before bindings, attempt-less retires,
 anything unbound, every non-eligible class (never reclaimed by the epoch), any

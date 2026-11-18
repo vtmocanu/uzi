@@ -530,17 +530,18 @@ verdict or reason and reports only a `retire_scratch` block and
   **Cross-bare attempt identity**
   (`retireCrossBareConflict`): any other bare's binding entry that cannot be
   decoded, any decoded binding naming the attempt, or any ledger value not
-  positively identified as a different attempt keeps a `settled` parent as
-  `conflict` (`intent` and `removing` parents are already kept for their own
-  reasons).
+  positively identified as a different attempt keeps the parent. For a present
+  parent this is reported as `conflict` for a `settled` binding (`intent` and
+  `removing` are already kept for their own reasons); for a gone parent every
+  phase is checked.
   Unidentified values include unparseable text, `{}`, `null`, a non-string or
   malformed `attemptId` and values naming the attempt. This holds at nomination,
   under the lock for deletion and in gone-parent recovery (kept as `conflict` at
   nomination, `metadata_unresolved` under the lock). A gone parent whose uuid is
-  bound in more than one bare is kept as `conflict`. The check reads only bares other than the
-  parent's own, so one undecodable binding or unidentified ledger value in any
-  other bare keeps every settled parent bound in any other bare until it is
-  removed.
+  bound in more than one bare is kept as `conflict`. The check reads only bares
+  other than the parent's own, so one undecodable binding or unidentified ledger
+  value in any bare keeps every bound parent of every other bare (settled, or
+  gone in any phase) until it is removed.
   Under B the source-use check is read-only (a held lease from
   another sink, or an active slot, keeps with `source_use_held`; nothing is
   admitted or taken over); the parent must be a worker-owned 0700 directory with
@@ -614,7 +615,7 @@ cross-check and every in-pass check. Reader-by-reader decisions (abbreviated;
 | Epoch census, maintenance and recovery families, FINAL inventory, terminal attribution, restore census and restore-route | No change. They match exact key families and ignore the prefix; none lists the runner root. |
 | ACK reader and runGit config accounting | Entries count toward their caps (1024 entries); the 64-per-bare cap bounds the addition. |
 | Startup inspector | Changed: reads bindings and reports binding-aware reasons. |
-| Attempt-ledger compaction | Changed: an attempt named by a binding keeps its `retired` entry; an unreadable or undecodable binding set keeps every entry; an attempt whose ledger values, on any branch, or a binding name more than one run, clone path or branch keeps every value verbatim, never dropped or collapsed (issue #4263); its binding is kept as `ledger_mismatch`, or `conflict` when a second binding names it. Such a conflict no longer heals by compaction, so readers that already refuse it (terminal attribution `duplicate_attempt`, the recovery source ledger check) keep refusing; normal flows never write a second identity for an attempt id. Cross-bare: compaction reads every other bare's config once, without that bare's lock, and preserves verbatim any attempt id another bare names (a decoded binding or an identified ledger value); while any other bare holds a decoded binding, own values that cannot be attributed to an attempt are kept too. Guarantee: every cross-bare conflict observed in that snapshot is preserved; a mention written after the read is outside it, so if another bare's first binding is written after the scan read none, an own unattributable value may be dropped; by the legitimate-writer argument that value is not about that binding's attempt, so only an earlier reclaim follows (legitimate writers only write fresh-minted ids, `mintAttemptId`: timestamp, claim generation, 64 random bits, or same-bare ids into their own bare under its lock). The scan is bounded (1024 bares, 16 MiB, 131072 records, a 5 s budget checked between reads); on any failure compaction is skipped, the ledger is unchanged and it warns `attempt ledger compaction skipped: foreign retire evidence unavailable` with a fixed reason (`bare_cap`, `bytes_cap`, `records_cap`, `deadline`, `unreadable`, `binding_unknown`, `binding_undecodable`, `ledger_unidentified`). A kept unattributable value is self-sustaining (the refused reclaim leaves its binding, and other bares' compaction skips on it); remediation is an operator-only, unsupported step done with the worker stopped, since compaction rewrites the config under `config.lock` and a live edit races it. One unreadable or unidentifiable foreign bare disables compaction worker-wide. |
+| Attempt-ledger compaction | Changed: an attempt named by a binding keeps its `retired` entry; an unreadable or undecodable binding set keeps every entry; an attempt whose ledger values, on any branch, or a binding name more than one run, clone path or branch keeps every value verbatim, never dropped or collapsed (issue #4263); its binding is kept as `ledger_mismatch`, or `conflict` when a second binding names it. Such a conflict no longer heals by compaction, so readers that already refuse it (terminal attribution `duplicate_attempt`, the recovery source ledger check) keep refusing; normal flows never write a second identity for an attempt id. Cross-bare: compaction reads every other bare's config once, without that bare's lock, and preserves verbatim any attempt id another bare names (a decoded binding or an identified ledger value); while any other bare holds a decoded binding, own values that cannot be attributed to an attempt are kept too. Guarantee: every cross-bare conflict observed in that snapshot is preserved; a mention written after the read is outside it, so if another bare's first binding is written after the scan read none, an own unattributable value may be dropped; by the legitimate-writer argument that value is not about that binding's attempt, so only an earlier reclaim follows (legitimate writers only write fresh-minted ids, `mintAttemptId`: timestamp, claim generation, 64 random bits, or same-bare ids into their own bare under its lock). The scan is bounded (1024 bares, 16 MiB, 131072 records, a 5 s budget checked between reads); on any failure compaction is skipped, the ledger is unchanged and it warns `attempt ledger compaction skipped: foreign retire evidence unavailable` with a fixed reason (`bare_cap`, `bytes_cap`, `records_cap`, `deadline`, `unreadable`, `binding_unknown`, `binding_undecodable`, `ledger_unidentified`). A kept unattributable value is self-sustaining (the refused reclaim leaves its binding, and other bares' compaction skips on it); remediation is an operator-only, unsupported step done with the worker stopped, since compaction computes what to keep from an earlier read and its rewrite could reinstate a value an operator removed after that read. One unreadable or unidentifiable foreign bare disables compaction worker-wide. |
 | Hibernation census (filesystem walk of the runner root) | No change. A bound parent reports `unknown`, which blocks volume retirement conservatively (a residual below). |
 | `backup-runs.sh` config reads | No change. They match exact keys; a retired, discarded clone is not backup material. |
 
@@ -688,7 +689,8 @@ An architect, auditor and reviewer examined two judgments and found no stop.
   nothing was deleted. An unreadable or undecodable binding set keeps
   every entry of that bare, and since issue #4263 the effect is worker-wide: an
   undecodable binding in one bare makes every other bare's compaction skip
-  (`binding_undecodable`), and any decoded binding anywhere makes the other bares
+  (`binding_undecodable`), as does an unreadable (over-cap) binding set
+  (`binding_unknown`), and any decoded binding anywhere makes the other bares
   keep their unattributable values.
 - **Partial removal** carries no durability claim, and the parent and its
   remaining bytes stay.
