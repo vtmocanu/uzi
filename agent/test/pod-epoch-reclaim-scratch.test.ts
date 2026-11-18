@@ -1354,6 +1354,21 @@ test("#4420 reclaimed: a terminal zero-hold run with normal settled metadata (re
   });
 });
 
+test("#4420 kept: a broken loose recovery pin under the run's refs (one git lists nothing for) keeps the run leaf", FD_ONLY, async () => {
+  await withRunWorld([leafOf(RUN_A)], async (w, rw) => {
+    await seedRetiredAttempt(rw, RUN_A);
+    await settleOutboxRun(rw, RUN_A);
+    const pin = join(rw.bare, "refs", "uzi-recovery-pin", RUN_A, "1");
+    fs.mkdirSync(join(pin, ".."), { recursive: true });
+    fs.writeFileSync(pin, "garbage\n");
+    const result = await run(w);
+    assert.equal(result.scratch.state, "ran");
+    assert.deepEqual([...w.calls.discards], [], "the leaf is not deleted");
+    assert.deepEqual(rw.classified, [RUN_A]);
+    assert.equal(result.scratch.deleted, 0);
+  });
+});
+
 /** Drives the real Outbox to the settled manifest-only run directory a normally finished run leaves behind. */
 async function settleOutboxRun(rw: RunWorld, runId: string): Promise<string> {
   await rw.outbox.appendSegment(runId, 1, [{ seq: 1, kind: "text", payload: { text: "hi" } }]);

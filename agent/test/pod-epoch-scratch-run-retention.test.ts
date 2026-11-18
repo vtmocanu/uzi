@@ -12,7 +12,7 @@ import { formatAttemptId } from "../src/attempt-path.js";
 import { GitCache, type EpochScratchRunRetentionOptions } from "../src/git.js";
 import {
   ENDED, classifyCredentialSwitchText, classifyRunDataDirRecords, judgeAuthoritySlot,
-  judgeRetainedEvidence, normalizeRetention, type RetainedEvidenceShape,
+  judgeRetainedEvidence, judgeRunRefListing, normalizeRetention, type RetainedEvidenceShape,
 } from "../src/pod-epoch-run-retention.js";
 import { RecoveryMaintenance } from "../src/recovery-maintenance.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
@@ -169,12 +169,96 @@ describe("baseline and the bare-config sources", () => {
       gitIn(["update-ref", "-d", ref]);
       assert.deepEqual(await classify(), ENDED, `${ref.split("/")[1]} deleted`);
     }
-    const original = (git as unknown as { runGit: (cwd: string, args: string[]) => Promise<string> }).runGit.bind(git);
-    t.mock.method(git as unknown as { runGit: typeof original }, "runGit", async (cwd: string, args: string[]) => {
-      if (args[0] === "for-each-ref") throw new Error("injected read failure");
-      return original(cwd, args);
+    type Exec = (cmd: string, args: string[], o: unknown) => Promise<{ stdout: string; stderr: string }>;
+    const original = (git as unknown as { execScoped: Exec }).execScoped.bind(git);
+    t.mock.method(git as unknown as { execScoped: Exec }, "execScoped", async (cmd: string, args: string[], o: unknown) => {
+      if (args.includes("for-each-ref")) throw new Error("injected read failure");
+      return original(cmd, args, o);
     });
-    assert.deepEqual(await classify(), unknown("classifier"));
+    assert.deepEqual(await classify(), unknown("run_refs"), "a plain listing failure is unknown, not a classifier fault");
+  });
+
+  it("the ref listing is trusted only with exit 0 and no stderr at all", () => {
+    assert.deepEqual(judgeRunRefListing({ code: 0, stdout: "", stderr: "" }), ENDED);
+    assert.deepEqual(judgeRunRefListing({ code: 0, stdout: "", stderr: "\n" }), unknown("run_refs"));
+    assert.deepEqual(judgeRunRefListing({ code: 0, stdout: "refs/uzi-owed/x\n", stderr: "warning: ignoring broken ref" }), unknown("run_refs"));
+    assert.deepEqual(judgeRunRefListing({ code: 1, stdout: "", stderr: "" }), unknown("run_refs"));
+    assert.deepEqual(judgeRunRefListing({ code: 0, stdout: "refs/uzi-owed/x\n", stderr: "" }), active("run_refs"));
+  });
+
+  describe("refs git cannot list are unknown, not ended", () => {
+    const put = (rel: string, content: string): string => {
+      const file = path.join(bare, rel);
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, content);
+      return file;
+    };
+
+    it("a garbage loose pin, and a dangling symref", async () => {
+      const f = put(`refs/uzi-recovery-pin/${RUN}/1`, "garbage\n");
+      assert.deepEqual(await classify(), unknown("run_refs"));
+      fs.rmSync(f);
+      assert.deepEqual(await classify(), ENDED, "an empty run directory is nothing");
+      put(`refs/uzi-owed/${RUN}/x`, "ref: refs/heads/nope\n");
+      assert.deepEqual(await classify(), unknown("run_refs"));
+    });
+
+    it("a FIFO under the run's directory", async t => {
+      const dir = path.join(bare, "refs", "uzi-settle", RUN);
+      fs.mkdirSync(dir, { recursive: true });
+      try { execFileSync("mkfifo", [path.join(dir, "pipe")]); } catch { t.skip("mkfifo unavailable"); return; }
+      assert.deepEqual(await classify(), unknown("run_refs"));
+    });
+
+    it("a dangling symlink at a family directory, and a symlinked run directory", async () => {
+      const fam = path.join(bare, "refs", "uzi-owed");
+      fs.rmSync(fam, { recursive: true, force: true });
+      fs.symlinkSync("/nonexistent-target", fam);
+      assert.deepEqual(await classify(), unknown("run_refs"));
+      fs.unlinkSync(fam);
+      fs.mkdirSync(fam);
+      fs.symlinkSync("/nonexistent-target", path.join(fam, RUN));
+      assert.deepEqual(await classify(), unknown("run_refs"));
+    });
+
+    it("a cross-check entry of any type under the run's id", async () => {
+      fs.mkdirSync(path.join(bare, "refs", "uzi-cross-check", RUN), { recursive: true });
+      assert.deepEqual(await classify(), unknown("run_refs"));
+    });
+
+    it("a packed-refs line under a run prefix that the listing did not report", async () => {
+      const file = path.join(bare, "packed-refs");
+      const existing = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "# pack-refs with: peeled fully-peeled sorted \n";
+      fs.writeFileSync(file, `${existing}zzzz refs/uzi-owed/${RUN}/bad\n`);
+      assert.deepEqual(await classify(), unknown("run_refs"));
+      fs.writeFileSync(file, `${existing}zzzz refs/uzi-cross-check/${RUN}\n`);
+      assert.deepEqual(await classify(), unknown("run_refs"));
+      fs.writeFileSync(file, `${existing}zzzz refs/uzi-cross-check/${OTHER}\n`);
+      assert.deepEqual(await classify(), ENDED, "another run's line is not this run's");
+    });
+
+    it("reftable storage, by extension or by directory", async () => {
+      fs.mkdirSync(path.join(bare, "reftable"));
+      assert.deepEqual(await classify(), unknown("run_refs"));
+      fs.rmdirSync(path.join(bare, "reftable"));
+      assert.deepEqual(await classify(), ENDED);
+      cfg("extensions.refstorage", "reftable");
+      // git itself may refuse a repository whose declared storage it cannot open; either way it is not ended.
+      assert.equal((await classify()).state, "unknown");
+    });
+  });
+
+  it("positive controls: a readable pin (loose or packed) is active; an empty left-over family directory is ended", async () => {
+    const sha = gitIn(["rev-parse", "--verify", "refs/remotes/origin/main"]);
+    fs.mkdirSync(path.join(bare, "refs", "uzi-archive"), { recursive: true });
+    assert.deepEqual(await classify(), ENDED);
+    const ref = `refs/uzi-recovery-pin/${RUN}/1`;
+    gitIn(["update-ref", ref, sha]);
+    assert.deepEqual(await classify(), active("run_refs"));
+    gitIn(["pack-refs", "--all"]);
+    assert.deepEqual(await classify(), active("run_refs"));
+    gitIn(["update-ref", "-d", ref]);
+    assert.deepEqual(await classify(), ENDED);
   });
 
   it("another uzi-* key is ignored unless it names the run", async () => {

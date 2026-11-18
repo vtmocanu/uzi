@@ -20,6 +20,15 @@ export const ENDED: RunRetention = { state: "ended" };
 export const activeRetention = (source: string): RunRetention => ({ state: "active", source });
 export const unknownRetention = (source: string): RunRetention => ({ state: "unknown", source });
 
+/** The verdict on the run-ref listing (`git for-each-ref --count=1` over the run's seven ref prefixes). Only an exit 0
+ * with NO stderr at all (not even whitespace: a warning means git skipped or complained about something it could not
+ * parse) is a trusted answer: a listed ref is active, and a clean empty listing is `ended` as far as the listing goes
+ * (the caller still checks loose and packed storage git may have declined to list). Anything else is unknown. */
+export function judgeRunRefListing(r: { code: number; stdout: string; stderr: string }): RunRetention {
+  if (r.code !== 0 || r.stderr !== "") return unknownRetention("run_refs");
+  return r.stdout.trim() !== "" ? activeRetention("run_refs") : ENDED;
+}
+
 /** The six kept reasons the run-leaf wiring adds to the scratch verdict. */
 export const RUN_KEPT_REASONS = ["run_active", "run_retained", "run_unknown", "run_unreadable", "run_local_active", "run_local_unknown"] as const;
 

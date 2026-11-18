@@ -34,7 +34,7 @@ import { unmarkedSpawnEnv, workerSpawnEnv } from "./worker-spawn-mark.js";
 import { PINNED_SUBTREE_SCRIPT, SCRATCH_DELETE_LIMITS, TREE_NAME_RE, censusScratchRoot, rmRunnerTeardownTree } from "./rmtree.js";
 import { absorbBareConfigValue, classifyScratchSettlement, isNeverRemovedScratchName, newPathSink, parseScratchCensus, postCensusOf, readProtectedStores, type ProtectedPathsRead, type Settlement } from "./pod-epoch-scratch.js";
 import {
-  ENDED, activeRetention, classifyRunDataDirRecords, isRunUuid, judgeAuthoritySlot, judgeRetainedEvidence, unknownRetention, type MaintenanceInspection, type RunRetention,
+  ENDED, activeRetention, classifyRunDataDirRecords, isRunUuid, judgeAuthoritySlot, judgeRetainedEvidence, judgeRunRefListing, unknownRetention, type MaintenanceInspection, type RunRetention,
 } from "./pod-epoch-run-retention.js";
 import type { SlotSnapshot } from "./completion-authority.js";
 import { classifyForgeError, withForgeRetry } from "./forge-retry.js";
@@ -4951,6 +4951,111 @@ export class GitCache {
     }
   }
 
+  /** The run's ref listing, judged by judgeRunRefListing. Unlike runGit this keeps stderr and the exit code: a plain
+   * failure or any stderr is unknown; residue and boundary aborts rethrow (as strictGitRead does). */
+  private async listRunRefs(bare: string, id: string): Promise<RunRetention> {
+    try {
+      const out = await this.execScoped("git", withDir(bare, ["for-each-ref", "--count=1", "--format=%(refname)",
+        `refs/uzi-owed/${id}/`, `refs/uzi-recovery-episode/${id}/`, `refs/uzi-recovery-pin/${id}/`,
+        `refs/uzi-coverage/${id}/`, `refs/uzi-settle/${id}/`, `refs/uzi-archive/${id}/`, `refs/uzi-cross-check/${id}`]),
+      { env: gitEnv(), timeout: GIT_TIMEOUT_MS });
+      return judgeRunRefListing({ code: 0, stdout: out.stdout, stderr: out.stderr });
+    } catch (err) {
+      if (err instanceof RunResidueBlockedError) throw err;
+      const abort = this.boundaryAbortError(err);
+      if (abort) throw abort;
+      this.checkRecoveryInterruption();
+      return unknownRetention("run_refs");
+    }
+  }
+
+  /** Read-only, bounded look at the bare's loose and packed ref storage for the run's refs. Called only after a clean,
+   * empty listing, so any run-named entry that is not an ordinary readable ref is something git declined to list:
+   * unknown, never ended. */
+  private async judgeRunRefStorage(bare: string, id: string, config: string, limits: Required<EpochRetainedLimits>): Promise<RunRetention> {
+    const refuse = unknownRetention("run_refs");
+    const probe = async (p: string): Promise<Stats | null | "error"> => this.retainedIO(async () => {
+      try { return await fs.lstat(p); }
+      catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT" ? null : "error"; }
+    });
+    // Reftable or any other ref storage extension: the loose/packed layout below does not describe it.
+    for (const item of config.split("\0")) {
+      const nl = item.indexOf("\n");
+      if ((nl < 0 ? item : item.slice(0, nl)).toLowerCase() === "extensions.refstorage") return refuse;
+    }
+    const reftable = await probe(path.join(bare, "reftable"));
+    if (reftable !== null) return refuse;
+    // An absent location passes; a symlink, non-directory or unreadable one at any ancestor is unknown (git reads a
+    // dangling symlink at an ancestor as a missing ref).
+    const dirAt = async (p: string): Promise<"absent" | "dir" | "bad"> => {
+      const st = await probe(p);
+      if (st === null) return "absent";
+      return st !== "error" && st.isDirectory() && !st.isSymbolicLink() ? "dir" : "bad";
+    };
+    let entries = 0;
+    const walk = async (dir: string): Promise<boolean> => {
+      this.checkRecoveryInterruption();
+      const handle = await fs.opendir(dir, { bufferSize: 1 });
+      try {
+        for (;;) {
+          const ent = await this.retainedIO(() => handle.read());
+          if (!ent) return true;
+          if (++entries > limits.maxDirectoryEntries) return false;
+          if (!ent.isDirectory() || ent.isSymbolicLink()) return false;
+          if (!await walk(path.join(dir, ent.name))) return false;
+        }
+      } finally { await handle.close(); }
+    };
+    try {
+      const refsDir = path.join(bare, "refs");
+      const top = await dirAt(refsDir);
+      if (top === "bad") return refuse;
+      if (top === "dir") {
+        for (const family of ["uzi-owed", "uzi-recovery-episode", "uzi-recovery-pin", "uzi-coverage", "uzi-settle", "uzi-archive", "uzi-cross-check"]) {
+          const famDir = path.join(refsDir, family);
+          const fam = await dirAt(famDir);
+          if (fam === "bad") return refuse;
+          if (fam === "absent") continue;
+          const leaf = path.join(famDir, id);
+          if (family === "uzi-cross-check") {
+            if (await probe(leaf) !== null) return refuse;
+            continue;
+          }
+          const run = await dirAt(leaf);
+          if (run === "bad") return refuse;
+          if (run === "dir" && !await walk(leaf)) return refuse;
+        }
+      }
+    } catch (err) {
+      if (err instanceof RunResidueBlockedError || isAbortLike(err) || this.boundaryAbortError(err)) throw err;
+      this.checkRecoveryInterruption();
+      return refuse;
+    }
+    // packed-refs, size-bounded before it is read.
+    const packedPath = path.join(bare, "packed-refs");
+    const packed = await probe(packedPath);
+    if (packed === null) return ENDED;
+    if (packed === "error" || !packed.isFile() || packed.size > limits.maxMetadataBytes) return refuse;
+    let text: string;
+    try { text = await this.retainedIO(() => fs.readFile(packedPath, "utf8")); }
+    catch (err) {
+      if (err instanceof RunResidueBlockedError || isAbortLike(err) || this.boundaryAbortError(err)) throw err;
+      this.checkRecoveryInterruption();
+      return refuse;
+    }
+    const prefixes = [`refs/uzi-owed/${id}/`, `refs/uzi-recovery-episode/${id}/`, `refs/uzi-recovery-pin/${id}/`,
+      `refs/uzi-coverage/${id}/`, `refs/uzi-settle/${id}/`, `refs/uzi-archive/${id}/`];
+    const cross = `refs/uzi-cross-check/${id}`;
+    for (const line of text.split("\n")) {
+      if (prefixes.some(p => line.includes(p))) return refuse;
+      for (let at = line.indexOf(cross); at >= 0; at = line.indexOf(cross, at + 1)) {
+        const next = line[at + cross.length];
+        if (next === undefined || next === "/" || /\s/.test(next)) return refuse;
+      }
+    }
+    return ENDED;
+  }
+
   private async classifyRunLocalRecords(runId: string, id: string, opts: EpochScratchRunRetentionOptions,
       limits: Required<EpochRetainedLimits>): Promise<RunRetention> {
     const ledger: AttemptLedgerEntry[] = [];
@@ -4975,10 +5080,12 @@ export class GitCache {
         // The run's pins and anchors. One bounded listing (`--count=1`: any match is enough); a read failure is
         // unknown through the caller's catch. Refs are keyed by the run id (a UUID survives the sanitising of
         // the archive ref's id); refs/uzi-cross-check/<runId> is a single ref.
-        const refs = await this.runGit(bare, ["for-each-ref", "--count=1", "--format=%(refname)",
-          `refs/uzi-owed/${id}/`, `refs/uzi-recovery-episode/${id}/`, `refs/uzi-recovery-pin/${id}/`,
-          `refs/uzi-coverage/${id}/`, `refs/uzi-settle/${id}/`, `refs/uzi-archive/${id}/`, `refs/uzi-cross-check/${id}`]);
-        if (refs.trim() !== "") return activeRetention("run_refs");
+        const listing = await this.listRunRefs(bare, id);
+        if (listing.state !== "ended") return listing;
+        // for-each-ref skips a ref it cannot read, so a clean empty listing proves little: read the loose and packed
+        // storage directly (read-only, bounded) for anything under the run's prefixes.
+        const storage = await this.judgeRunRefStorage(bare, id, config, limits);
+        if (storage.state !== "ended") return storage;
         return scanned;
       }, opts.signal);
       if ("state" in found) return found;
