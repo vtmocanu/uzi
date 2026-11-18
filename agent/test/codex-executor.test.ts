@@ -35097,8 +35097,9 @@ describe("M2 actualRunner credential replacement", () => {
                   runMaxBytes: 64 * 1024 * 1024, maxBytes: 128 * 1024 * 1024, retentionMs: 86400000 });
                 if (preservingRecovery) await recoveryOutbox.init();
                 const predecessorProofs: string[] = [];
-                // Credential operations the recovery Runner's own client performs (the executor's
-                // provider client is recoveryRig.client, counted in `releases`).
+                // Credential operations on the recovery Runner's own client. The executor's provider
+                // client is recoveryRig.client: its releases are counted in `releases` and its
+                // refreshes in `refreshCalls`.
                 const runnerCredentialOps: string[] = [];
                 client.releaseCodex = async () => { runnerCredentialOps.push("releaseCodex"); return { access_token: committedCodex.access_token } as never; };
                 client.refreshCodex = async () => { runnerCredentialOps.push("refreshCodex"); throw new Error("recovery refresh before proof"); };
@@ -35111,7 +35112,7 @@ describe("M2 actualRunner credential replacement", () => {
                     // Decision 11: the predecessor proof is the gate before any use of delivered material.
                     quiesceRun: async req => {
                       if (req.site === "predecessor_capture") {
-                        predecessorProofs.push(`releases=${releases.length} runner=${runnerCredentialOps.length} bodies=${recoveryBodies} launches=${recoveryRigs.reduce((n, r) => n + r.providerLaunches(), 0)}`);
+                        predecessorProofs.push(`releases=${releases.length} refreshes=${recoveryRigs.reduce((n, r) => n + r.client.refreshCalls.length, 0)} runner=${runnerCredentialOps.length} bodies=${recoveryBodies} launches=${recoveryRigs.reduce((n, r) => n + r.providerLaunches(), 0)} requests=${recoveryRigs.reduce((n, r) => n + r.transport.requests.length, 0)}`);
                         if (forcedQuiescence) return {
                           process: { state: forcedQuiescence, processes: [], killed: [], detail: "fixture predecessor not proven stopped" },
                           docker: { state: "not_wired", removed: [], detail: "not wired" },
@@ -35213,12 +35214,15 @@ describe("M2 actualRunner credential replacement", () => {
                 assert.equal(applyRequests.length, expectedApplies);
                 assert.equal(rig.providerLaunches(), launchedPredecessors.length);
                 assert.ok(predecessorProofs.length > 0, "recovery runs the predecessor proof");
-                assert.equal(predecessorProofs[0], "releases=0 runner=0 bodies=0 launches=0",
+                assert.equal(predecessorProofs[0], "releases=0 refreshes=0 runner=0 bodies=0 launches=0 requests=0",
                   "no delivered Codex material is used before the first predecessor proof");
                 if (forcedQuiescence) {
                   assert.equal(recoveryBodies, 0, "unproven predecessor never reaches the executor body");
                   assert.deepEqual(releases, [], "unproven predecessor consumes no capability (no releaseCodex/refreshCodex)");
                   assert.deepEqual(runnerCredentialOps, [], "the recovery Runner performs no credential operation");
+                  assert.ok(recoveryRigs.length > 0, "the recovery executor (and its provider client) was built");
+                  for (const recoveryRig of recoveryRigs)
+                    assert.deepEqual(recoveryRig.client.refreshCalls, [], "unproven predecessor never refreshes through the executor client");
                   assert.equal(recoveryWorkSent, false);
                   for (const recoveryRig of recoveryRigs) {
                     assert.equal(recoveryRig.providerLaunches(), 0, "unproven predecessor starts no provider");
