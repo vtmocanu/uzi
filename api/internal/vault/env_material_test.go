@@ -149,7 +149,7 @@ func TestConvertMaterialTakesEnvFenceBeforeMeasuringOrLocking(t *testing.T) {
 	repos := first("LockVaultEnvReposKeyShare")
 	totals := first("GetVaultMaterialTotals")
 	batch := first("LockVaultAccountMaterialBatch", "LockVaultSecretMaterialBatch", "LockVaultEnvMaterialBatch")
-	if !(conns < repos && repos < totals && totals < batch) {
+	if conns >= repos || repos >= totals || totals >= batch {
 		t.Fatalf("want connections < repos < totals < first material batch lock, got %d, %d, %d, %d in %v", conns, repos, totals, batch, calls)
 	}
 }
