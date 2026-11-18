@@ -17589,7 +17589,8 @@ export class GitCache {
    * STREAMS, never buffers: a pack can exceed the 64 MiB `maxBuffer` cap runGit uses, so
    * this spawns `git pack-objects` and hands back its stdout as a Readable. It uses a
    * bounded explicit object list when a server-named default tracking commit was captured:
-   * every legacy commit and tree remains, and only default-reachable blobs are omitted.
+   * every legacy commit and tree remains, and only blobs reachable from the default or an
+   * eligible confirmed checkpoint tip (#4439) are omitted.
    * Without that captured authority (or on preparation cap exhaustion), the legacy revision
    * input is used. Both producers are non-thin. The stdout is returned
    * for the client to upload directly. Credential-free: this is a LOCAL read of the
