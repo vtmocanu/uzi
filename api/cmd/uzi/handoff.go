@@ -308,6 +308,7 @@ type remoteInfo struct {
 	hasUser bool
 	hasPort bool
 	path    string // ssh forms: the repo path git sends in its remote command
+	sshHost string // ssh forms: host as spelled in the origin, as git passes it to ssh
 }
 
 // parseRemote classifies an origin URL and extracts its host (and, for ssh, the user and
@@ -345,7 +346,7 @@ func parseRemote(remote string) (remoteInfo, error) {
 			if err != nil || u.Hostname() == "" {
 				return refuse("unparsable URL")
 			}
-			info := remoteInfo{form: formSSHURL, host: strings.ToLower(u.Hostname())}
+			info := remoteInfo{form: formSSHURL, host: strings.ToLower(u.Hostname()), sshHost: u.Hostname()}
 			if u.User != nil {
 				if _, hasPass := u.User.Password(); hasPass {
 					return refuse("password in an ssh:// user")
@@ -395,7 +396,7 @@ func parseRemote(remote string) (remoteInfo, error) {
 	if hostPart == "" {
 		return refuse("empty host")
 	}
-	info.host = strings.ToLower(hostPart)
+	info.host, info.sshHost = strings.ToLower(hostPart), hostPart
 	if hasSpaceOrControl(info.host) || hasSpaceOrControl(info.user) {
 		return refuse("whitespace or control character in ssh host or user")
 	}
@@ -549,10 +550,10 @@ func (o *originHost) compute(ctx context.Context, env Env) (string, error) {
 		return refuse("core.sshCommand is set, which overrides the ssh transport, so the real host cannot be verified")
 	}
 	// (b) input validation: nothing option-shaped or explicitly empty reaches ssh.
-	if info.host == "" || (info.hasUser && info.user == "") || (info.hasPort && info.port == "") {
+	if info.sshHost == "" || (info.hasUser && info.user == "") || (info.hasPort && info.port == "") {
 		return refuse("the ssh host, user or port is empty")
 	}
-	for _, v := range []string{info.host, info.user, info.port} {
+	for _, v := range []string{info.sshHost, info.user, info.port} {
 		if strings.HasPrefix(v, "-") {
 			return refuse("the ssh host, user or port starts with '-'")
 		}
@@ -565,7 +566,8 @@ func (o *originHost) compute(ctx context.Context, env Env) (string, error) {
 	if info.hasPort {
 		args = append(args, "-p", info.port)
 	}
-	args = append(args, "--", info.host, receivePackCommand(info.path))
+	// The origin's own spelling: ssh's %n (and so a Match exec rule) sees what git passes.
+	args = append(args, "--", info.sshHost, receivePackCommand(info.path))
 	cctx, cancel := context.WithTimeout(ctx, sshConfigTimeout)
 	defer cancel()
 	cfg, err := env.sshConfig(cctx, args...)
