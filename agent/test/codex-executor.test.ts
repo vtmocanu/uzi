@@ -27,7 +27,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { CodexSessionStore, DEFAULT_SESSION_STORE_BOUNDS } from "../src/codex/session-state.js";
 import { fakeGitHub, fakeGitlab } from "./runner-harness.js";
 import { realProcfsSkip } from "./real-procfs.js";
-import { newRunAttempt } from "../src/run-quiescence.js";
+import { newRunAttempt, quiesceRunAttempt } from "../src/run-quiescence.js";
 
 const HAS_PROCFS = process.platform === "linux";
 // The real runner path opens the Codex session store and quiescence proofs through /proc/self/fd
@@ -32518,8 +32518,11 @@ describe("M2 actualRunner credential replacement", () => {
         const expectedApplies = publication === "crash-after-a-teardown-recovery" ? 0 : 1;
         if ((queuedRefreshStop || crashRecovery) && (oldClaim !== API_KEY || target !== SUBSCRIPTION || phase !== "factory")) continue;
         for (const recoveryMode of ["normal", "ordinary missing persisted ID", "ordinary missing retained rollout",
-          "preserve saved conversation", "preserve missing persisted ID", "preserve missing retained rollout"] as const) {
+          "preserve saved conversation", "preserve missing persisted ID", "preserve missing retained rollout",
+          "quiescence survivors", "quiescence unverified"] as const) {
           if (!crashRecovery && recoveryMode !== "normal") continue;
+          const forcedQuiescence = recoveryMode === "quiescence survivors" ? "survivors" as const
+            : recoveryMode === "quiescence unverified" ? "unverified" as const : undefined;
           const preservingRecovery = recoveryMode.startsWith("preserve");
           const missingRecoveryId = recoveryMode.endsWith("missing persisted ID");
           const missingRecoveryRollout = recoveryMode.endsWith("missing retained rollout");
@@ -35093,11 +35096,30 @@ describe("M2 actualRunner credential replacement", () => {
                 const recoveryOutbox = new Outbox({ root: path.join(dir, "recovery-outbox"), log: noopLog,
                   runMaxBytes: 64 * 1024 * 1024, maxBytes: 128 * 1024 * 1024, retentionMs: 86400000 });
                 if (preservingRecovery) await recoveryOutbox.init();
+                const predecessorProofs: string[] = [];
+                // Credential operations the recovery Runner's own client performs (the executor's
+                // provider client is recoveryRig.client, counted in `releases`).
+                const runnerCredentialOps: string[] = [];
+                client.releaseCodex = async () => { runnerCredentialOps.push("releaseCodex"); return { access_token: committedCodex.access_token } as never; };
+                client.refreshCodex = async () => { runnerCredentialOps.push("refreshCodex"); throw new Error("recovery refresh before proof"); };
                 const recoveryRunner = m2Runner.runnerWith(buildRecovery,
-                  m2Runner.fakeGitlab().gitlab, undefined, recoveryLog.logger, preservingRecovery ? {
-                    outbox: recoveryOutbox,
-                    activeRuns: new ActiveRunRegistry(() => recoveryOutbox.listPendingTerminals(), () => 10),
-                  } : undefined);
+                  m2Runner.fakeGitlab().gitlab, undefined, recoveryLog.logger, {
+                    ...(preservingRecovery ? {
+                      outbox: recoveryOutbox,
+                      activeRuns: new ActiveRunRegistry(() => recoveryOutbox.listPendingTerminals(), () => 10),
+                    } : {}),
+                    // Decision 11: the predecessor proof is the gate before any use of delivered material.
+                    quiesceRun: async req => {
+                      if (req.site === "predecessor_capture") {
+                        predecessorProofs.push(`releases=${releases.length} runner=${runnerCredentialOps.length} bodies=${recoveryBodies} launches=${recoveryRigs.reduce((n, r) => n + r.providerLaunches(), 0)}`);
+                        if (forcedQuiescence) return {
+                          process: { state: forcedQuiescence, processes: [], killed: [], detail: "fixture predecessor not proven stopped" },
+                          docker: { state: "not_wired", removed: [], detail: "not wired" },
+                        };
+                      }
+                      return quiesceRunAttempt(req);
+                    },
+                  });
                 // Fake UID metadata and supervisor lifecycle only: this is not a real
                 // abrupt crash or kernel confinement/security proof. The supplied helper
                 // runs unchanged against real descriptors, bytes, modes and alternates;
@@ -35190,6 +35212,24 @@ describe("M2 actualRunner credential replacement", () => {
                 assert.equal(applies, expectedApplies, "no recovery mode replays apply");
                 assert.equal(applyRequests.length, expectedApplies);
                 assert.equal(rig.providerLaunches(), launchedPredecessors.length);
+                assert.ok(predecessorProofs.length > 0, "recovery runs the predecessor proof");
+                assert.equal(predecessorProofs[0], "releases=0 runner=0 bodies=0 launches=0",
+                  "no delivered Codex material is used before the first predecessor proof");
+                if (forcedQuiescence) {
+                  assert.equal(recoveryBodies, 0, "unproven predecessor never reaches the executor body");
+                  assert.deepEqual(releases, [], "unproven predecessor consumes no capability (no releaseCodex/refreshCodex)");
+                  assert.deepEqual(runnerCredentialOps, [], "the recovery Runner performs no credential operation");
+                  assert.equal(recoveryWorkSent, false);
+                  for (const recoveryRig of recoveryRigs) {
+                    assert.equal(recoveryRig.providerLaunches(), 0, "unproven predecessor starts no provider");
+                    assert.deepEqual(recoveryRig.transport.requests, [], "no account/login/start or other provider request");
+                  }
+                  assert.equal((JSON.parse(readRecoveryJournal()) as { recovery?: { blocker?: string } }).recovery?.blocker,
+                    "quiescence_failed", "an unproven predecessor takes the quiescence_failed blocker");
+                  assert.ok(dispositions.slice(recoveryReportStart).some(body => body.status === "failed" &&
+                    String(body.failure_reason).startsWith("worker_residue_blocked")), "the run reports the residue block with custody kept");
+                  return;
+                }
                 if (preservingRecovery) {
                   assert.equal(readinessWaits, readinessLaunches, "every launched readiness root was joined on refusal");
                   assert.equal(readinessDisposals, readinessLaunches, "every launched readiness root was disposed on refusal");
