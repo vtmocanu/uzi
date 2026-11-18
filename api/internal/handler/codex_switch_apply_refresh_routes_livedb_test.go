@@ -171,9 +171,9 @@ func TestWorkerCodexApplyRefreshFencesRouteLiveDB(t *testing.T) {
 				t.Fatal("refusal must contain exactly outcome and reason")
 			}
 			after := codexApplyRefreshSnapshot(t, e, account)
-			sections := []string{"run", "base", "switch", "messages", "inputs", "custody", "account", "intents"}
-			if len(before) != 8 || len(after) != 8 {
-				t.Fatal("snapshot must contain eight sections")
+			sections := []string{"run", "base", "switch", "messages", "inputs", "custody", "presentations", "account", "intents"}
+			if len(before) != 9 || len(after) != 9 {
+				t.Fatal("snapshot must contain nine sections")
 			}
 			for _, section := range sections {
 				b, bok := before[section]

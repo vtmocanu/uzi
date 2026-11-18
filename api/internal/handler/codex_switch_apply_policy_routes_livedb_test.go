@@ -88,9 +88,9 @@ func TestWorkerCodexPolicyEpisodeBeforePreflightRouteLiveDB(t *testing.T) {
 			}
 
 			after := stoppedRouteSnapshot(t, e)
-			sections := []string{"run", "base", "switch", "messages", "inputs", "custody"}
+			sections := []string{"run", "base", "switch", "messages", "inputs", "custody", "presentations"}
 			if len(before) != len(sections) || len(after) != len(sections) {
-				t.Fatal("snapshot must contain all six sections")
+				t.Fatal("snapshot must contain all seven sections")
 			}
 			for _, section := range sections {
 				b, bok := before[section]
@@ -199,9 +199,9 @@ func TestWorkerCodexApplyPolicyAfterPreflightRouteLiveDB(t *testing.T) {
 				t.Fatal("refusal must contain exactly outcome and reason")
 			}
 			after := stoppedRouteSnapshot(t, e)
-			sections := []string{"run", "base", "switch", "messages", "inputs", "custody"}
+			sections := []string{"run", "base", "switch", "messages", "inputs", "custody", "presentations"}
 			if len(before) != len(sections) || len(after) != len(sections) {
-				t.Fatal("snapshot must contain all six sections")
+				t.Fatal("snapshot must contain all seven sections")
 			}
 			for _, section := range sections {
 				b, bok := before[section]

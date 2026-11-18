@@ -89,9 +89,9 @@ func TestWorkerCodexOwnerPolicyRouteLiveDB(t *testing.T) {
 				t.Fatal("owner refusal did not identify the policy hold")
 			}
 			after := stoppedRouteSnapshot(t, e)
-			sections := []string{"run", "base", "switch", "messages", "inputs", "custody"}
+			sections := []string{"run", "base", "switch", "messages", "inputs", "custody", "presentations"}
 			if len(before) != len(sections) || len(after) != len(sections) {
-				t.Fatal("snapshot must contain all six sections")
+				t.Fatal("snapshot must contain all seven sections")
 			}
 			for _, section := range sections {
 				if !reflect.DeepEqual(before[section], after[section]) {
