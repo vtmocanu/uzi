@@ -2872,6 +2872,9 @@ func limitWaitLine(r apitypes.RunDTO, now time.Time) string {
 	// PRD #1190 D13: the leading word is "waiting:", NOT "paused:". Once an owner pause
 	// exists, "paused:" on the rate-limit line would read as a user pause; "waiting:" says
 	// plainly that the run is held on a usage limit, not parked by its owner.
+	if strOr(r.RateLimitType, "") == providerGatewayLimitType {
+		return providerGatewayLimitLine(r, now)
+	}
 	line := "waiting: usage limit"
 	switch r.Harness {
 	case "claude":
@@ -2888,6 +2891,30 @@ func limitWaitLine(r apitypes.RunDTO, now time.Time) string {
 	// that ships on its own release cadence. 0 is a run that has not parked, which this
 	// function has already excluded — but the guard stays, because a server that
 	// reports a park without a count should print no number rather than "attempt 0".
+	if r.LimitWaitCount > 0 {
+		line += " · attempt " + itoa(int(r.LimitWaitCount))
+	}
+	return line
+}
+
+// providerGatewayLimitType is the server's rate_limit_type literal for a provider-bound run parked
+// on a persistent gateway 429/529 (PRD #4320 module 5): workersvc.RateLimitTypeProviderGatewayLimit.
+const providerGatewayLimitType = "provider_gateway_limit"
+
+// providerGatewayLimitLine is limitWaitLine's reading of a provider gateway-limit park. It names the
+// gateway, not a subscription window, and never claims a reset time: the run retries on a fixed
+// capped backoff (1, 5, then 15 minutes) and then waits for its owner, which is the NULL
+// RetryNotBefore case. The run DTO does not carry the provider's name yet, so it says "your provider".
+func providerGatewayLimitLine(r apitypes.RunDTO, now time.Time) string {
+	line := "waiting: your provider's gateway rate limit"
+	switch {
+	case r.RetryNotBefore == nil:
+		line += " · waiting for you to resume (uzi run resume " + r.ID + ")"
+	case !r.RetryNotBefore.After(now):
+		line += " · retrying shortly"
+	default:
+		line += " · retrying at " + r.RetryNotBefore.Local().Format("15:04") + " (in " + fmtUntil(r.RetryNotBefore.Sub(now)) + ")"
+	}
 	if r.LimitWaitCount > 0 {
 		line += " · attempt " + itoa(int(r.LimitWaitCount))
 	}

@@ -1232,6 +1232,17 @@ describe("RunEventRow — limit_wait / limit_hit (PRD #35)", () => {
     expect(container.querySelector(".text-danger")).toBeNull();
   });
 
+  it("renders a provider gateway-limit park as a gateway pause, not a usage limit or a reset", () => {
+    const { container } = render(
+      <RunEventRow msg={msg({ seq: 5, kind: "limit_wait", payload: { rate_limit_type: "provider_gateway_limit" } })} live={false} />,
+    );
+    expect(container.textContent).toContain("Provider gateway rate limit reached");
+    expect(container.textContent).toContain("retrying automatically");
+    expect(container.textContent).not.toContain("Usage limit");
+    expect(container.textContent).not.toContain("resets");
+    expect(container.querySelector(".text-warn")).not.toBeNull();
+  });
+
   it("renders a limit_hit row as a DANGER-toned death, with no 'paused' wording", () => {
     const { container } = render(
       <RunEventRow

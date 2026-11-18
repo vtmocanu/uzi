@@ -14,7 +14,7 @@ const common = { cwd: "/checkout", log: nullLogger(), secretPaths: ["/worker-sec
 it("every isolated lane disables the SDK builtin plugin-authoring plugin", () => {
   const options: SdkOptions[] = [
     ...["plan", "code"].map(stage => buildClaudeCrossCheckOptions({ ...common, homeDir: "/home", oauthToken: "fixture-token", brief: stage })),
-    buildIsolatedSdkOptions({ ...common, env: buildSdkEnv("fixture-token", "/home"), fetchServer: {} as never, maxTurns: 1 }),
+    buildIsolatedSdkOptions({ ...common, env: buildSdkEnv({ kind: "oauth", token: "fixture-token" }, "/home"), fetchServer: {} as never, maxTurns: 1 }),
     ...[[], ["product:approved"]].map(names => buildJobSdkOptions({ env: {}, systemPrompt: "job", workDir: "/checkout",
       log: common.log, secretPaths: common.secretPaths, resultServer: {} as never, toolNames: [],
       ...(names.length ? { productSkills: { pluginPath: "/approved-plugin", names } } : {}),

@@ -62,9 +62,14 @@ import (
 // are different facts and a support query must be able to tell them apart.
 const RateLimitTypeUnknown = "unknown"
 
-// rateLimitTypes is the closed set migration 00091's CHECK enforces: the six
-// members of SDKRateLimitInfo.rateLimitType at the pinned
-// @anthropic-ai/claude-agent-sdk (sdk.d.ts), plus RateLimitTypeUnknown.
+// RateLimitTypeProviderGatewayLimit is the park type of a provider-bound run that hit
+// a persistent gateway 429/529 (PRD #4320 M6). It names no subscription window.
+const RateLimitTypeProviderGatewayLimit = "provider_gateway_limit"
+
+// rateLimitTypes is the closed set the newest runs_rate_limit_type_check migration
+// enforces (00091, widened by 00478): the six members of SDKRateLimitInfo.rateLimitType
+// at the pinned @anthropic-ai/claude-agent-sdk (sdk.d.ts), plus RateLimitTypeUnknown and
+// RateLimitTypeProviderGatewayLimit.
 //
 // An SDK pin bump adding a seventh member is the ONE thing that moves this list,
 // and it must move 00091 in the same commit — TestRateLimitTypeVocabularyMatchesCheck
@@ -78,6 +83,9 @@ var rateLimitTypes = []string{
 	"seven_day_overage_included",
 	"overage",
 	RateLimitTypeUnknown,
+	// PRD #4320 M6: the provider-bound gateway-limit park (migration 00478). The worker
+	// reports it when a provider run hits a persistent gateway 429/529.
+	RateLimitTypeProviderGatewayLimit,
 }
 
 // rateLimitTypeSet is the lookup form. Built once; rateLimitTypes stays the
@@ -355,6 +363,13 @@ type limitParkDecision struct {
 // land in the past cannot spin the promotion pass.
 func decideLimitPark(in limitParkInput) limitParkDecision {
 	d := limitParkDecision{RateLimitType: CoerceRateLimitType(in.ReportedType)}
+	// provider_gateway_limit belongs to provider-bound runs only (decideProviderLimitPark). A vendor
+	// run that reports it is reporting something no vendor window means, so it stores as unknown:
+	// otherwise the web would offer the owner a Resume the server refuses for a vendor park.
+	if d.RateLimitType != nil && *d.RateLimitType == RateLimitTypeProviderGatewayLimit {
+		unknown := RateLimitTypeUnknown
+		d.RateLimitType = &unknown
+	}
 	if reset, ok := validReportedReset(in.ReportedResetMs); ok {
 		d.LimitResetsAt = &reset
 	}
@@ -519,6 +534,49 @@ func limitFailureReason(harness string, rateLimitType *string, resetsAt *time.Ti
 	return s
 }
 
+// The provider gateway-limit schedule (PRD #4320 module 5, D11). A provider-bound run that hits a
+// persistent gateway 429/529 has no subscription window and no reset time, so the park does not
+// invent one: it waits a fixed capped backoff keyed on runs.model_provider_limit_streak (the number
+// of gateway parks since the owner last resumed the run), read BEFORE this park's increment:
+//
+//	streak before:  0     1     2     3+
+//	retry in:       1m    5m    15m   never (the owner Resumes or Cancels)
+//
+// There is deliberately NO jitter: the jitter on a vendor park spreads a promoted wave across one
+// user's credential pool, and a provider run has no pool. limit_wait_count still bumps in
+// SetRunLimitWait (history), but RUN_LIMIT_MAX_WAITS and RUN_LIMIT_MAX_PARK do not apply: the fourth
+// park is an indefinite owner wait BY DESIGN, and failing the run at the budget or ceiling would
+// discard the work the owner is being asked to resume.
+var providerGatewayLimitBackoff = [...]time.Duration{1 * time.Minute, 5 * time.Minute, 15 * time.Minute}
+
+// providerGatewayRetryNotBefore returns the park's retry_not_before for a run whose streak is
+// streakBefore, or the zero value and false when the park waits for the owner.
+func providerGatewayRetryNotBefore(streakBefore int32, now time.Time) (time.Time, bool) {
+	if streakBefore < 0 || int(streakBefore) >= len(providerGatewayLimitBackoff) {
+		return time.Time{}, false
+	}
+	return now.Add(providerGatewayLimitBackoff[streakBefore]), true
+}
+
+// decideProviderLimitPark is the whole policy for a provider-bound run's limit report. Pure.
+//
+// The reported rate_limit_type and reset are IGNORED, not merely sanitized: a provider run has no
+// vendor window, so whatever the worker sent (a vendor-style type from a gateway that proxies one, or
+// nothing) is recorded as provider_gateway_limit with no resets_at. Only the run's own opt-out
+// (WaitOnLimit false) fails it, with the same server-composed failure the vendor path uses.
+// RetryNotBefore is the zero value when the park waits for the owner; callers store it as NULL.
+func decideProviderLimitPark(waitOnLimit bool, streakBefore int32, now time.Time) limitParkDecision {
+	t := RateLimitTypeProviderGatewayLimit
+	d := limitParkDecision{RateLimitType: &t}
+	if !waitOnLimit {
+		d.Reason = "Provider gateway rate limit reached; this run is not set to wait on rate limits"
+		return d
+	}
+	d.Park = true
+	d.RetryNotBefore, _ = providerGatewayRetryNotBefore(streakBefore, now)
+	return d
+}
+
 // limitParkJitter rolls one jitter value. The ONLY nondeterminism in the park path,
 // isolated to this call so decideLimitPark stays pure and every case in its test is
 // an exact-value assertion rather than a range check.
@@ -573,54 +631,21 @@ func (s *Service) setLimitWait(ctx context.Context, run store.Run, wkr store.Wor
 }
 
 func (s *Service) setLimitWaitLocked(ctx context.Context, run store.Run, wkr store.Worker, req StateRequest, sessionID pgtype.Text) (int64, error) {
-	// The candidate pool is fetched ONLY when the run names the credential it was
-	// spending. Without that id there is nothing to exclude, and NextAvailable would
-	// have to be trusted not to let the dead credential vote for its own replacement
-	// — a query saved is beside the point; this is the correctness half.
-	var cands []autoselect.Candidate
+	// PRD #4320 module 5: a provider-bound run never reads or writes a vendor pool. It skips the
+	// candidate fetch, the exhausted-window gauge write and the pooled-alternative lowering, and
+	// parks on the fixed gateway schedule instead. A vendor run takes the unchanged path below.
+	providerBound := run.ModelProviderKeyMode.Valid
+	var d limitParkDecision
 	dead := uuid.Nil
-	if run.AnthropicSecretID.Valid {
-		dead = uuid.UUID(run.AnthropicSecretID.Bytes)
-		rows, err := s.q.ListAutoSelectCandidates(ctx, run.UserID)
-		if err != nil {
-			return 0, fmt.Errorf("auto-select candidates: %w", err)
-		}
-		cands = make([]autoselect.Candidate, 0, len(rows))
-		for _, row := range rows {
-			cands = append(cands, autoselectrow.FromCandidateRow(row))
-		}
-	}
-
-	// The effective next-claim mode gates Decision 6e (PRD #1247 gap 3): only an `auto`
-	// resume can spend a pooled alternative, so only it may lower the park to one. The
-	// reporting worker `wkr` IS this run's recorded worker (it holds the running claim),
-	// so it is the right row for effectiveNextClaimMode's worker rung. ownerJudgeMode is
-	// consulted only for a self_improve run (which follows the owner's judge binding);
-	// every other kind passes "" without a read.
-	ownerJudgeMode := ""
-	if run.Kind == runkind.SelfImprove {
-		m, err := s.ownerJudgeBindMode(ctx, run.UserID)
+	if providerBound {
+		d = decideProviderLimitPark(run.WaitOnLimit, run.ModelProviderLimitStreak, s.now())
+	} else {
+		var err error
+		d, dead, err = s.decideVendorLimitPark(ctx, run, wkr, req)
 		if err != nil {
 			return 0, err
 		}
-		ownerJudgeMode = m
 	}
-
-	d := decideLimitPark(limitParkInput{
-		Harness:         run.Harness,
-		WaitOnLimit:     run.WaitOnLimit,
-		LimitWaitCount:  run.LimitWaitCount,
-		DeadSecretID:    dead,
-		ReportedResetMs: req.LimitResetsAt,
-		ReportedType:    req.RateLimitType,
-		Candidates:      cands,
-		NextClaimMode:   effectiveNextClaimMode(run, ownerJudgeMode, wkr),
-		Policy:          s.p.Autoselect,
-		MaxWaits:        s.p.RunLimitMaxWaits,
-		MaxPark:         s.p.RunLimitMaxPark,
-		Jitter:          limitParkJitter(),
-		Now:             s.now(),
-	})
 
 	if !d.Park {
 		rows, err := s.q.SetRunFailed(ctx, store.SetRunFailedParams{
@@ -672,7 +697,7 @@ func (s *Service) setLimitWaitLocked(ctx context.Context, run store.Run, wkr sto
 	// and failing the whole report — which the worker then retries — is consistent with
 	// how this path handles a DB failure. It runs before SetRunLimitWait, whose returned
 	// row count remains this function's return value.
-	if run.AnthropicSecretID.Valid {
+	if !providerBound && run.AnthropicSecretID.Valid {
 		switch limitWindowFor(d.RateLimitType) {
 		case windowFiveHour:
 			if _, err := s.q.MarkFiveHourExhausted(ctx, dead); err != nil {
@@ -685,12 +710,22 @@ func (s *Service) setLimitWaitLocked(ctx context.Context, run store.Run, wkr sto
 		}
 	}
 
+	// A zero RetryNotBefore is the provider owner-wait row (streak 3+): store NULL, which the
+	// sweeper's `retry_not_before <= now` promotion can never match.
+	retryNotBefore := pgconv.Time(d.RetryNotBefore)
+	if d.RetryNotBefore.IsZero() {
+		retryNotBefore = pgtype.Timestamptz{}
+	}
+	limitDeadSecret := run.AnthropicSecretID
+	if providerBound {
+		limitDeadSecret = pgtype.UUID{}
+	}
 	return s.q.SetRunLimitWait(ctx, store.SetRunLimitWaitParams{
 		ID:             run.ID,
 		WorkerID:       pgconv.UUID(wkr.ID),
 		LimitResetsAt:  pgconv.TimePtr(d.LimitResetsAt),
 		RateLimitType:  pgconv.TextPtr(d.RateLimitType),
-		RetryNotBefore: pgconv.Time(d.RetryNotBefore),
+		RetryNotBefore: retryNotBefore,
 		// PRD #1247 M5a-1 rework (reviewer NB1): thread the reported generation to the per-query
 		// fence. A capability worker stamps it; a stale/reclaimed old flight's park matches 0 rows
 		// and cannot clobber the reclaiming run. The outer locked claim guard permits nil
@@ -700,9 +735,63 @@ func (s *Service) setLimitWaitLocked(ctx context.Context, run store.Run, wkr sto
 		// excludes it (runs.limit_dead_secret_id). Passed straight through from the run
 		// row — an invalid/NULL AnthropicSecretID writes NULL, i.e. no exclusion, which
 		// is the honest answer for a run that never recorded a credential.
-		LimitDeadSecretID: run.AnthropicSecretID,
+		LimitDeadSecretID: limitDeadSecret,
 		SessionID:         sessionID,
 	})
+}
+
+// decideVendorLimitPark is the vendor (non-provider) half of setLimitWaitLocked: the pool read and
+// the pure decision. dead is the credential the run was spending, uuid.Nil when none was recorded.
+func (s *Service) decideVendorLimitPark(ctx context.Context, run store.Run, wkr store.Worker, req StateRequest) (limitParkDecision, uuid.UUID, error) {
+	// The candidate pool is fetched ONLY when the run names the credential it was
+	// spending. Without that id there is nothing to exclude, and NextAvailable would
+	// have to be trusted not to let the dead credential vote for its own replacement
+	// — a query saved is beside the point; this is the correctness half.
+	var cands []autoselect.Candidate
+	dead := uuid.Nil
+	if run.AnthropicSecretID.Valid {
+		dead = uuid.UUID(run.AnthropicSecretID.Bytes)
+		rows, err := s.q.ListAutoSelectCandidates(ctx, run.UserID)
+		if err != nil {
+			return limitParkDecision{}, uuid.Nil, fmt.Errorf("auto-select candidates: %w", err)
+		}
+		cands = make([]autoselect.Candidate, 0, len(rows))
+		for _, row := range rows {
+			cands = append(cands, autoselectrow.FromCandidateRow(row))
+		}
+	}
+
+	// The effective next-claim mode gates Decision 6e (PRD #1247 gap 3): only an `auto`
+	// resume can spend a pooled alternative, so only it may lower the park to one. The
+	// reporting worker `wkr` IS this run's recorded worker (it holds the running claim),
+	// so it is the right row for effectiveNextClaimMode's worker rung. ownerJudgeMode is
+	// consulted only for a self_improve run (which follows the owner's judge binding);
+	// every other kind passes "" without a read.
+	ownerJudgeMode := ""
+	if run.Kind == runkind.SelfImprove {
+		m, err := s.ownerJudgeBindMode(ctx, run.UserID)
+		if err != nil {
+			return limitParkDecision{}, uuid.Nil, err
+		}
+		ownerJudgeMode = m
+	}
+
+	d := decideLimitPark(limitParkInput{
+		Harness:         run.Harness,
+		WaitOnLimit:     run.WaitOnLimit,
+		LimitWaitCount:  run.LimitWaitCount,
+		DeadSecretID:    dead,
+		ReportedResetMs: req.LimitResetsAt,
+		ReportedType:    req.RateLimitType,
+		Candidates:      cands,
+		NextClaimMode:   effectiveNextClaimMode(run, ownerJudgeMode, wkr),
+		Policy:          s.p.Autoselect,
+		MaxWaits:        s.p.RunLimitMaxWaits,
+		MaxPark:         s.p.RunLimitMaxPark,
+		Jitter:          limitParkJitter(),
+		Now:             s.now(),
+	})
+	return d, dead, nil
 }
 
 // limitAwareFailureReason is the `failed` arm's half of the same rule (§7.8): a

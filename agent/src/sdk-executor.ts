@@ -44,7 +44,8 @@ import type { Executor, ExecutorResult, InPlaceSwitchSite, RunContext, SecretRem
 import type { Logger } from "./log.js";
 import { resolveLeadRequest, type LeadRequest, type PhaseEntry } from "./lead-config-report.js";
 import { toLeadObservation } from "./runtime-observation.js";
-import { buildSdkEnv } from "./sdk-env.js";
+import { buildSdkEnv, type SdkCredential } from "./sdk-env.js";
+import { assertAgentModelsMapped, isGatewayLimitStatus, PROVIDER_GATEWAY_LIMIT, resolveProviderModel, sdkCredentialFromBinding, stripProviderCost } from "./provider-binding.js";
 import { startDepsInstall, reportDepsInstall, safeDirLabel } from "./js-deps-provision.js";
 import { makeProgressObserver } from "./milestone-progress-observer.js";
 import type { DockerWiring } from "./docker-wiring.js";
@@ -206,6 +207,8 @@ const REASON_CREDENTIAL_SWITCH = "run released for a credential switch";
 // Exported so the runner's failed-report site can map it to a fail_origin
 // (PRD #69 M7a): a missing Anthropic token is a credential_unavailable failure.
 export const REASON_NO_TOKEN = "no Anthropic OAuth token was provided for this run";
+/** PRD #4320 D8: a credential switch on a provider-bound run is refused (the run fails; no OAuth token is injected). */
+const REASON_PROVIDER_SWITCH_REFUSED = "provider_credential_switch_refused: a provider-bound run cannot switch credentials";
 const REASON_NO_PLAN =
   "the agent ended the planning turn without submitting a plan";
 /** PRD #88 M4: the lead kept asking instead of planning. Distinct from
@@ -1458,7 +1461,7 @@ export class SdkExecutor implements Executor {
       // frame carries its ordinal, even when an in-place switch lands while it runs.
       const cred = this.credentialFor(ctx, ctx.oauthToken ?? "");
       const token = cred.token.trim();
-      if (!isRunSummaryKind(ctx.kind) || !token || !this.client || !prdInputP ||
+      if (!isRunSummaryKind(ctx.kind) || (!token && !ctx.provider) || !this.client || !prdInputP ||
           lifecycle.closed || generation !== this.planGeneration) return Promise.resolve();
       // Own the flight before the first await, including a repeated storage callback.
       const owned: IntentFlight & { generation: number; closed: boolean } = { ctrl: new AbortController(),
@@ -1482,7 +1485,7 @@ export class SdkExecutor implements Executor {
           if (!allowed()) return;
           candidate.generated = true;
           const result = await this.summaryRunner.generatePlanSummary({
-            token, model: ctx.summaryModel ?? "", issueTitle: ctx.issueTitle,
+            token, ...(ctx.provider ? { provider: ctx.provider } : {}), model: ctx.summaryModel ?? "", issueTitle: ctx.issueTitle,
             issueBody: ctx.issueDescription, prdText: prd.prdText, planMd,
             signal: AbortSignal.any([owned.ctrl.signal,
               ...(liveSignal ? [liveSignal] : []),
@@ -1633,7 +1636,7 @@ export class SdkExecutor implements Executor {
    */
   private async phaseSetup(ctx: RunContext, observeState: (state: RunDrive) => void): Promise<DriveState> {
     const oauthToken = ctx.oauthToken?.trim();
-    if (!oauthToken) {
+    if (!oauthToken && !ctx.provider) {
       // OAuth is the sole supported credential (no API keys). Detect its
       // absence up front and fail fast rather than spawning a doomed CLI.
       throw new Error(REASON_NO_TOKEN);
@@ -1665,7 +1668,9 @@ export class SdkExecutor implements Executor {
 
     // issue #1783 (R2): the runner's attempt marker rides the CLI env, so every process the
     // agent starts is positively attributable to this attempt by the quiescence reaper.
-    const env = buildSdkEnv(oauthToken, this.homeDir, toolEnv, this.dockerHost, ctx.runAttempt, ctx.managedGoWorkDir, ctx.runTmpdir);
+    // PRD #4320 module 6: a provider run builds its env from the frozen binding and never carries an OAuth token.
+    const credential: SdkCredential = ctx.provider ? sdkCredentialFromBinding(ctx.provider) : { kind: "oauth", token: oauthToken! };
+    const env = buildSdkEnv(credential, this.homeDir, toolEnv, this.dockerHost, ctx.runAttempt, ctx.managedGoWorkDir, ctx.runTmpdir);
     // issue #1866 M2: measure the lead's execution environment once, before the plan turn. The
     // probe runs as the runner uid with this SDK env in its own process group: a baseline for
     // what the lead's commands can do, NOT provably identical to an SDK Bash tool call (the SDK
@@ -1813,6 +1818,10 @@ export class SdkExecutor implements Executor {
       ...(assembled.leadModel !== undefined ? { templateModel: assembled.leadModel } : {}),
     });
     const leadModel = leadRequest.model;
+    // PRD #4320 module 7: a provider run resolves the lead through the bound map BEFORE any content is
+    // sent. An unmapped alias or vendor model ID is a typed refusal (provider_model_unmapped) that
+    // fails the run; an unset model is the sonnet alias. Never rewritten.
+    const spawnModel = ctx.provider ? resolveProviderModel(leadModel, ctx.provider.model_map) : leadModel;
     // PRD #305: apply the run's model to every OWN subagent now, before planTurnSubagents
     // copies them and before the own-source implement path reuses them, so both the plan
     // turn and an own-source implement follow the lead model. The repo roster is built
@@ -1847,6 +1856,9 @@ export class SdkExecutor implements Executor {
     if (planSource === "repo" && ctx.config?.override_subagent_model && leadModel) {
       applySubagentModelOverride(planAgents, leadModel);
     }
+    // PRD #4320 module 7: every subagent the plan turn can run resolves through the bound map (own and
+    // repo-sourced rosters alike); an excluded template is never in this map and is not checked.
+    if (ctx.provider) assertAgentModelsMapped(planAgents, ctx.provider.model_map);
     const planUnavailable: UnavailableRole[] = planShaped ? planShaped.unavailable : [];
     const planSubagentNames = Object.keys(planAgents);
     const subagentCanWrite = subagentWriteCapabilities(planPool);
@@ -2106,7 +2118,7 @@ export class SdkExecutor implements Executor {
       mcpServers,
       preToolUse: preToolUse(planSubagentNames, false, planUnavailable),
       ...(lane ? { guardedCommand: true as const } : {}),
-      ...(leadModel ? { model: leadModel } : {}),
+      ...(spawnModel ? { model: spawnModel } : {}),
       ...(effort ? { effort } : {}),
       ...(ctx.config?.attribution_enabled === false
         ? { attributionSettings: { attribution: { commit: "", pr: "" } } }
@@ -2234,7 +2246,7 @@ export class SdkExecutor implements Executor {
     let resumeId = ctx.sessionId ?? undefined;
 
     return {
-      oauthToken,
+      oauthToken: oauthToken ?? "",
       toolEnv,
       provisionDir,
       depsAbort,
@@ -2455,7 +2467,7 @@ export class SdkExecutor implements Executor {
       // reused by BOTH hooks; it never throws.
       const summariesOn =
         isRunSummaryKind(ctx.kind) &&
-        !!oauthToken &&
+        (!!oauthToken || !!ctx.provider) &&
         !!this.client;
       const prdInputP: Promise<PrdInput> | undefined = summariesOn
         ? resolvePrdInput(ctx.issueDescription, ctx.worktreePath, ctx.issueIid, this.log)
@@ -2485,6 +2497,7 @@ export class SdkExecutor implements Executor {
             if (flight.abandoned || flight.ctrl.signal.aborted || ctx.claimFenced?.() || ctx.cancelRequested?.()) return;
             const summary = await this.summaryRunner.generateIntentSummary({
               token: cred.token,
+              ...(ctx.provider ? { provider: ctx.provider } : {}),
               model: ctx.summaryModel ?? "",
               issueTitle: ctx.issueTitle,
               issueBody: ctx.issueDescription,
@@ -3065,6 +3078,7 @@ export class SdkExecutor implements Executor {
       if (ctx.config?.override_subagent_model && leadModel) {
         applySubagentModelOverride(selectedSubagents, leadModel);
       }
+      if (ctx.provider) assertAgentModelsMapped(selectedSubagents, ctx.provider.model_map);
       // Issue #2471: a guard-bound run shapes the implement roster the same way as the plan roster.
       const selectedShaped = drive.lane ? shapeGuardedGrants(selectedSubagents) : undefined;
       const implementAgents = selectedShaped ? selectedShaped.agents : selectedSubagents;
@@ -4856,6 +4870,9 @@ export class SdkExecutor implements Executor {
   private async attemptCredentialSwitch(
     ctx: RunContext, state: RunDrive, site: InPlaceSwitchSite,
   ): Promise<"released" | "gave_up" | "applied" | undefined> {
+    // PRD #4320 D8: no live credential switching on a provider run. The server refuses the switch at
+    // admission; this is the second layer. Nothing is applied and no OAuth token is ever injected.
+    if (ctx.provider) throw new Error(REASON_PROVIDER_SWITCH_REFUSED);
     if (!ctx.attemptCredentialSwitch) return undefined;
     await this.waitIntentSummary();
     await this.closeAndSettlePlanSummary();
@@ -4900,6 +4917,7 @@ export class SdkExecutor implements Executor {
    * the drive carrier, and the abort listener (the old ctx.signal is spent).
    */
   private rebindCredential(ctx: RunContext, state: RunDrive): void {
+    if (ctx.provider) throw new Error(REASON_PROVIDER_SWITCH_REFUSED);
     const token = (ctx.credential?.().token ?? ctx.oauthToken)?.trim();
     if (!token) return;
     ctx.oauthToken = token;
@@ -5397,7 +5415,11 @@ export class SdkExecutor implements Executor {
             { run_id: ctx.runId, kind: d.frameKind },
           );
         }
-        for (const em of reduction.messages) ctx.emit(epoch > 0 ? { ...em, credentialEpochOrdinal: epoch } : em);
+        for (const raw of reduction.messages) {
+          // PRD #4320 P7: a provider run reports tokens, never the SDK's vendor-priced cost.
+          const em = ctx.provider ? stripProviderCost(raw) : raw;
+          ctx.emit(epoch > 0 ? { ...em, credentialEpochOrdinal: epoch } : em);
+        }
         if (event.kind === "initialized" && event.pluginErrors && event.pluginErrors.length > 0) {
           this.onPluginLoadErrors(ctx, state, event.pluginErrors);
           // A skills run tripped above: stop now rather than let the turn work without them.
@@ -5446,6 +5468,12 @@ export class SdkExecutor implements Executor {
         // FIRST, so neither stale rate-limit evidence (limitFacts) nor the transient branch can
         // shadow it. The runner decides whether the api can take it; otherwise this error's
         // message is today's failure text.
+        // PRD #4320 D11: on a provider run a terminal gateway 429 or 529 (after the CLI's own bounded
+        // retries) parks as a limit with the provider reason and NO reset time: the vendor reset and
+        // pool machinery does not apply to a gateway.
+        if (ctx.provider && isGatewayLimitStatus(terminal.apiErrorStatus)) {
+          throw new LimitReachedError({ rateLimitType: PROVIDER_GATEWAY_LIMIT, detail: "provider gateway limit" });
+        }
         const spend = classifySpendLimitTerminal(terminal);
         if (spend) {
           throw new SpendLimitHoldError(

@@ -21,7 +21,7 @@ import { mergeRequestUrl } from "../lib/forgeUrls";
 import { errorMessage } from "../lib/apiError";
 import { changedMilestones } from "../lib/milestoneReset";
 import { MilestoneResetHistory } from "./runView/MilestoneResetHistory";
-import { canToggleWaitOnLimit, formatCountdown, runWindowLabel, usageLimitPhrase } from "../lib/limitWait";
+import { canToggleWaitOnLimit, formatCountdown, isProviderGatewayLimit, providerGatewayLimitDetail, providerGatewayLimitHeadline, runWindowLabel, usageLimitPhrase } from "../lib/limitWait";
 import {
   budgetRightLabel,
   extendBudgetView,
@@ -693,6 +693,7 @@ export function LimitWaitPanel({
   canSteer = true,
   onToggle,
   onStop,
+  onResume,
 }: {
   run: Run;
   busy: boolean;
@@ -709,6 +710,9 @@ export function LimitWaitPanel({
   // was the faintest text on the page (4.56 contrast) and named a control the user
   // then had to hunt for past the whole activity feed.
   onStop: () => void;
+  // PRD #4320: owner Resume of a provider gateway-limit park (the only limit_wait the server lets
+  // its owner resume). Omitted by the settings-disclosure mount, which never shows a parked run.
+  onResume?: () => void;
 }) {
   const parked = run.status === "limit_wait";
   // Only while parked: off the park there is no clock, and a 1s interval running
@@ -778,6 +782,7 @@ export function LimitWaitPanel({
   // tokens can pay for it". Naming a second credential specifically would be a guess —
   // the DTO carries no field saying which leg of the computation won.
   const resumesEarly = hasReset && Number.isFinite(retryMs) && retryMs < resetsMs;
+  const gateway = isProviderGatewayLimit(run.rate_limit_type);
 
   // Seconds on a multi-hour horizon are noise (web-ux nit): toLocaleString() renders
   // "01:37:11" for an instant that is only known to within a poll interval anyway.
@@ -815,10 +820,15 @@ export function LimitWaitPanel({
               which is the kind that stops the next person from checking.) */}
           <p role="status" className="text-sm font-semibold text-warn">
             <span aria-hidden="true">⏸ </span>
-            {`Paused on ${usageLimitPhrase(run.harness)}`}
+            {gateway ? providerGatewayLimitHeadline() : `Paused on ${usageLimitPhrase(run.harness)}`}
           </p>
           <p className="mt-0.5 text-xs text-muted">
-            {countdown ? (
+            {gateway ? (
+              <>
+                {providerGatewayLimitDetail(run.retry_not_before, now)}
+                {attemptClause && ` ${attemptClause}`}
+              </>
+            ) : countdown ? (
               <>
                 Resumes in <span className="tabular-nums text-fg">{countdown}</span>
                 {resumesEarly && windowClause ? (
@@ -833,7 +843,7 @@ export function LimitWaitPanel({
               // into a negative would read as a fault where there is none.
               <>Resuming shortly.{windowClause && ` ${capitalise(windowClause)}.`}</>
             )}
-            {attemptClause && ` ${attemptClause}`}
+            {!gateway && attemptClause && ` ${attemptClause}`}
           </p>
           {/* Keep the recovery limits legible alongside the Stop control. */}
           <p className="mt-1.5 text-xs text-muted">
@@ -849,6 +859,9 @@ export function LimitWaitPanel({
             side they wrap as one unit and stay legible from 390px up. */}
         <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
           {toggle}
+          {gateway && canSteer && onResume && (
+            <Button size="sm" disabled={busy} onClick={onResume}>Resume</Button>
+          )}
           {/* Non-owner (#183): no live Stop — inert text stating who can, never a greyed
               button that 404s. Mirrors the PlanPanel/QuestionPanel non-owner branches. */}
           {canSteer ? (
@@ -3320,6 +3333,11 @@ export function RunView() {
             busy={busy}
             canSteer={canSteer}
             onStop={() => cancelRun()}
+            onResume={() => act(async (isCurrent) => {
+              const requestRunId = run.id;
+              await api.resumeRun(requestRunId);
+              if (isCurrent()) await refreshRun();
+            })}
             onToggle={(enabled) =>
               act(async () => {
                 await api.setRunWaitOnLimit(run.id, enabled);

@@ -24569,6 +24569,46 @@ func (q *Queries) ResumePausedRun(ctx context.Context, arg ResumePausedRunParams
 	return i, err
 }
 
+const resumeProviderGatewayLimitWait = `-- name: ResumeProviderGatewayLimitWait :execrows
+UPDATE runs SET
+    status     = 'queued',
+    status_since = now(),
+    started_at = NULL,
+    budget_paused_seconds = 0,
+    codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
+    model_provider_limit_streak = 0,
+    retry_not_before = NULL,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE runs.id = $1 AND runs.user_id = $2 AND runs.status = 'limit_wait'
+  AND runs.model_provider_key_mode IS NOT NULL
+  AND runs.rate_limit_type = 'provider_gateway_limit'
+  AND runs.kind NOT IN ('judge', 'job', 'cross_check')
+`
+
+type ResumeProviderGatewayLimitWaitParams struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+// PRD #4320 M6: the OWNER's Resume of a provider gateway-limit park. A provider-bound run parked as
+// limit_wait with rate_limit_type 'provider_gateway_limit' after the third gateway park waits for
+// the owner (retry_not_before NULL), and may be resumed earlier from any of the first three rows.
+// The mutation set is PromoteLimitWaitRunNow's (fresh wall, cleared pause bank, revoked codex cap,
+// reset health) PLUS the two columns that make this an owner reset: model_provider_limit_streak back
+// to 0 and retry_not_before cleared, so the next gateway park starts the schedule over.
+//
+// Vendor limit_wait is NOT resumable here: the predicate requires a provider binding AND the gateway
+// limit type, so a vendor park (which auto-resumes at its window) stays a 409 at the handler.
+// Owner- and status-scoped; 0 rows is a race or an ineligible run, which the handler maps to 409.
+func (q *Queries) ResumeProviderGatewayLimitWait(ctx context.Context, arg ResumeProviderGatewayLimitWaitParams) (int64, error) {
+	result, err := q.db.Exec(ctx, resumeProviderGatewayLimitWait, arg.ID, arg.UserID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const resumeWorkerRecoveryEpisode = `-- name: ResumeWorkerRecoveryEpisode :one
 WITH locked_source_workers AS MATERIALIZED (
     -- Consume this lock before any run/parent lock, including a hold changing after the
@@ -27426,6 +27466,12 @@ UPDATE runs SET
     rate_limit_type      = $2,
     retry_not_before     = $3,
     limit_wait_count     = limit_wait_count + 1,
+    -- PRD #4320 M6: a provider-bound run counts its gateway parks since the owner last resumed it.
+    -- The increment is in this statement so the count and the transition are one write; the caller
+    -- selected retry_not_before from the value BEFORE this increment (workersvc providerLimitSchedule).
+    -- A vendor run (model_provider_key_mode NULL) keeps 0.
+    model_provider_limit_streak = CASE WHEN model_provider_key_mode IS NOT NULL
+        THEN model_provider_limit_streak + 1 ELSE model_provider_limit_streak END,
     -- Boundary reconcile precedes park; revoke this Codex flight atomically.
     codex_cap_hash       = CASE WHEN harness = 'codex' THEN NULL ELSE codex_cap_hash END,
     codex_claim_epoch    = CASE WHEN harness = 'codex' THEN codex_claim_epoch + 1 ELSE codex_claim_epoch END,

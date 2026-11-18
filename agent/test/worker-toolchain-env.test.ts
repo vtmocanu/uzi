@@ -9,7 +9,7 @@ it("the baked sqlc cache crosses scrubbed run environments without a provision o
   try {
     process.env.UZI_SQLC_DIR = cache;
     const hostile = { UZI_SQLC_DIR: "/untrusted/cache" };
-    const sdk = buildSdkEnv("fixture", "/run-home", hostile);
+    const sdk = buildSdkEnv({ kind: "oauth", token: "fixture" }, "/run-home", hostile);
     const command = buildCommandEnv("/scratch", hostile);
     const check = buildCheckEnv({ UZI_SQLC_DIR: cache, UZI_WORKER_TOKEN: "must-not-cross" }, "/run-home", hostile);
     for (const env of [sdk, command, check]) {
@@ -17,7 +17,7 @@ it("the baked sqlc cache crosses scrubbed run environments without a provision o
       assert.equal(env.UZI_WORKER_TOKEN, undefined);
     }
     delete process.env.UZI_SQLC_DIR;
-    assert.equal(buildSdkEnv("fixture", "/run-home", hostile).UZI_SQLC_DIR, undefined);
+    assert.equal(buildSdkEnv({ kind: "oauth", token: "fixture" }, "/run-home", hostile).UZI_SQLC_DIR, undefined);
     assert.equal(buildCommandEnv("/scratch", hostile).UZI_SQLC_DIR, undefined);
     assert.equal(buildCheckEnv({}, "/run-home", hostile).UZI_SQLC_DIR, undefined);
   } finally {

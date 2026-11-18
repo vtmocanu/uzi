@@ -4032,7 +4032,10 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   mode](./handoff.md#interactive-mode);
 - `limit_wait` — parked on a Claude or Codex subscription usage window, promoted
   back to `queued` once past its `retry_not_before` (reset plus jitter, or bounded
-  fallback when no usable reset is known); see [Paused on a usage limit](run-limit-wait.md);
+  fallback when no usable reset is known); see [Paused on a usage limit](run-limit-wait.md).
+  A custom-provider run's gateway rate limit also parks here, retries at 1, 5 and
+  15 minutes and then waits for you; `uzi run resume` resumes it (see
+  [A custom provider's gateway rate limit](run-limit-wait.md#a-custom-providers-gateway-rate-limit));
 - `pool_wait` — an `auto` worker held because its Anthropic token pool is
   genuinely empty, resumed once a token is pooled — see [Letting uzi pick the
   token](anthropic-token.md#letting-uzi-pick-the-token-auto-selection);

@@ -300,8 +300,27 @@ func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 			return
 		}
+	case "limit_wait":
+		// PRD #4320 module 5: ONLY a provider gateway-limit park is owner-resumable. It re-queues the
+		// run, resets its gateway streak and clears retry_not_before, so the next gateway park starts
+		// the 1/5/15 minute schedule over. A vendor limit_wait waits for its usage window and
+		// auto-resumes (the sweeper), so it keeps the refusal below.
+		if !run.ModelProviderKeyMode.Valid || !run.RateLimitType.Valid || run.RateLimitType.String != workersvc.RateLimitTypeProviderGatewayLimit {
+			httpx.Error(w, http.StatusConflict, fmt.Sprintf("run is %s", run.Status))
+			return
+		}
+		rows, err := h.q.ResumeProviderGatewayLimitWait(r.Context(), store.ResumeProviderGatewayLimitWaitParams{ID: runID, UserID: user.ID})
+		if err != nil {
+			slog.Error("resume run now (provider gateway limit_wait)", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		if rows == 0 {
+			httpx.Error(w, http.StatusConflict, "run is no longer waiting on the provider gateway limit")
+			return
+		}
 	default:
-		// Every other status is either terminal or a park with its own resume (a limit_wait
+		// Every other status is either terminal or a park with its own resume (a vendor limit_wait
 		// auto-resumes; the gates resume on their own input), so there is nothing to resume here.
 		httpx.Error(w, http.StatusConflict, fmt.Sprintf("run is %s", run.Status))
 		return

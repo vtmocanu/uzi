@@ -39,6 +39,7 @@ import { LimitReachedError } from "./limit.js";
 import type { Logger } from "./log.js";
 import type { Outbox } from "./outbox.js";
 import type { ClaimResponse, IsolatedFetchClaim, StateRequest } from "./protocol.js";
+import { PROVIDER_LANE_UNSUPPORTED } from "./provider-binding.js";
 import { buildIssueContext } from "./prompt.js";
 import { makeRedactor, makeTextRedactor } from "./redact.js";
 import { uidSplitActive } from "./runner-uid.js";
@@ -123,6 +124,9 @@ export function preflightReason(
 ): string | undefined {
   if (!validGrant(claim.isolated_fetch)) return "profile-bound claim carried a malformed isolated_fetch grant";
   const secrets = claim.secrets as Partial<ClaimResponse["secrets"]> | undefined;
+  // PRD #4320: the isolated lane's network admits one exact model host, so it cannot serve a provider
+  // until PRD #4322 M3. The server refuses it first; this is the worker's second layer.
+  if (secrets?.provider) return PROVIDER_LANE_UNSUPPORTED;
   if (secrets?.codex !== undefined && secrets.codex !== null) {
     return "a profile-bound run cannot run on the Codex harness (its web search is server-side)";
   }
@@ -216,7 +220,7 @@ export class IsolatedRunner {
     const grant = validGrant(claim.isolated_fetch);
     const token = claim.secrets?.anthropic_oauth_token?.trim() ?? "";
     // Registered before anything can log; evicted in the finally.
-    const runSecrets = [token, grant?.credential ?? ""].filter((s) => s.length > 0);
+    const runSecrets = [token, claim.secrets?.provider?.credential ?? "", grant?.credential ?? ""].filter((s) => s.length > 0);
     for (const s of runSecrets) this.log.addSecret(s);
     this.opts.activeRuns?.add(runId, generation);
 

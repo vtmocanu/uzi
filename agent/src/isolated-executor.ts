@@ -472,7 +472,7 @@ export class IsolatedExecutor {
     }, ctx.timeoutMs, { now: this.timeoutNow, unref: true });
 
     const options = buildIsolatedSdkOptions({
-      env: isolateSdkEnv(buildSdkEnv(ctx.oauthToken, ctx.homeDir)),
+      env: isolateSdkEnv(buildSdkEnv({ kind: "oauth", token: ctx.oauthToken }, ctx.homeDir)),
       cwd: ctx.workspace,
       log: this.log,
       secretPaths: this.secretPaths,

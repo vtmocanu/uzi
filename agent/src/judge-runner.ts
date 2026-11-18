@@ -21,6 +21,7 @@ import type { Logger } from "./log.js";
 import { fenceNonce } from "./prompt.js";
 import { defaultQueryFn, mapSdkMessage } from "./sdk-messages.js";
 import { runReadOnlyModelPass, safeReportFailed } from "./model-pass.js";
+import { PROVIDER_LANE_UNSUPPORTED } from "./provider-binding.js";
 import {
   isStaleClaimRefusal,
   makeTerminalOutboxDeps,
@@ -322,6 +323,17 @@ export class JudgeRunner {
         const judged = await this.judgeCodex(claim, trace, selection.binding, signal);
         review = judged.review;
         usageMessage = judged.usageMessage;
+      } else if (claim.secrets?.provider) {
+        // PRD #4320: the judge lane cannot serve a provider until PRD #4322 (the server refuses it first;
+        // this is the worker's second layer). The judge is reported failed with the typed reason and no
+        // model call, no fallback review, is made.
+        this.log.addSecret(claim.secrets.provider.credential);
+        this.log.warn("judge claim carried a provider binding; refusing the lane", { run_id: judgeRunId, reason: PROVIDER_LANE_UNSUPPORTED });
+        await safeReportFailed(this.client, this.log, "judge", judgeRunId, PROVIDER_LANE_UNSUPPORTED, undefined,
+          claim.claim_generation, this.terminalDeps);
+        required?.close();
+        this.activeRuns?.remove(judgeRunId);
+        return;
       } else {
         const token = claim.secrets?.anthropic_oauth_token?.trim();
         if (!token) {

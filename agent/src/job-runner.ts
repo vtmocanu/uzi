@@ -91,6 +91,7 @@ import type {
 } from "./protocol.js";
 import { makeRedactor, makeTextRedactor, type TextRedactor } from "./redact.js";
 import { buildSdkEnv } from "./sdk-env.js";
+import { PROVIDER_LANE_UNSUPPORTED } from "./provider-binding.js";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import type { SdkQueryFn } from "./sdk-executor.js";
@@ -751,10 +752,17 @@ export class JobRunner {
     // The secrets every outgoing string is scrubbed of. A lane job adds its fetch credential the
     // moment the grant validates; one list builds the batcher's redactors AND the text redactor
     // finish() and the failure reports use.
-    let secrets: Array<string | undefined> = [token, this.joinToken];
+    let secrets: Array<string | undefined> = [token, claim.secrets?.provider?.credential, this.joinToken];
     let redactText: TextRedactor = makeTextRedactor(secrets);
     let laneCredential: string | undefined;
     try {
+      // PRD #4320: the job lane cannot serve a provider until PRD #4322; the server refuses it first
+      // (a job fails terminally), this is the worker's second layer.
+      if (claim.secrets?.provider) {
+        this.log.addSecret(claim.secrets.provider.credential);
+        await this.fail(runId, generation, PROVIDER_LANE_UNSUPPORTED);
+        return;
+      }
       const job = claim.job;
       if (!job || !token) {
         await this.fail(runId, generation, !job ? "job claim carried no job block" : "job claim carried no Anthropic credential");
@@ -891,7 +899,7 @@ export class JobRunner {
         : undefined;
       const resultTool = buildJobResultServer(store, { workDir: ws.work, secretPaths: this.secretPaths });
       const options = buildJobSdkOptions({
-        env: (lane ? isolateSdkEnv(buildSdkEnv(token, ws.home)) : buildSdkEnv(token, ws.home)) as unknown as Record<string, string | undefined>,
+        env: (lane ? isolateSdkEnv(buildSdkEnv({ kind: "oauth", token }, ws.home)) : buildSdkEnv({ kind: "oauth", token }, ws.home)) as unknown as Record<string, string | undefined>,
         systemPrompt: (lane ? LANE_JOB_SYSTEM_PROMPT : JOB_SYSTEM_PROMPT) + (productSkills ? JOB_SKILLS_PROMPT_SUFFIX : ""),
         workDir: ws.work,
         log: runLog,

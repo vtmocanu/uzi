@@ -280,9 +280,10 @@ const CrossCheckGatedV1 = "cross_check_gated_v1"
 // protocol capability, never a repo capability, and a NON-BYPASSABLE ClaimRun, ClaimChatRun and
 // placement clause: an older worker would ignore the unknown `provider` key and start the run
 // with an empty Anthropic credential, so a provider-bound run is claimable only by a worker
-// that advertises it. The worker (agent/src/worker.ts) advertises it only once it consumes
-// `secrets.provider` (the claim decoder, env and scrubber registration land in module 6); until
-// then no worker reports it and a provider-bound run stays queued behind the capability reason.
+// that advertises it. The worker (agent/src/worker.ts) advertises it once it consumes
+// `secrets.provider` (the claim decoder, env and scrubber registration land in module 6, with
+// the gateway-limit park); a worker that has not been rolled to that build never reports it, so
+// a provider-bound run stays queued behind the capability reason until one is.
 const ClaudeProviderV1 = "claude_provider_v1"
 
 // CrossCheckSemanticPlanV1 identifies workers whose Claude/Codex checker understands the

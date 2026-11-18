@@ -14,6 +14,7 @@ import type { PublicationContextRequest, PublicationContextResponse } from "./pr
 import type { PublicationIntentRequest, PublicationIntentResult } from "./publication-intent.js";
 import type { CodexCatalogDefaultBody, LeadConfigReportBody } from "./protocol.js";
 import { decodeCompletionPending, type CompletionPending } from "./completion-pending.js";
+import { decodeProviderBinding } from "./provider-binding.js";
 import { SEMANTIC_GATE_ACK_MAX_BYTES, semanticGateAckSchema } from "./semantic-gate-wire.js";
 import { decodeInterruptedCalls, interruptedRegistration, type InterruptedRegistration, type InterruptedCalls } from "./interrupted-calls.js";
 import { Readable } from "node:stream";
@@ -2543,6 +2544,12 @@ export class WorkerClient {
       if (isRecord(claim) && (!Number.isSafeInteger(claim.worker_recovery_owner_episode) ||
           (claim.worker_recovery_owner_episode as number) < 0)) delete claim.worker_recovery_owner_episode;
       if (isRecord(claim) && claim.semantic_planning !== undefined) claim.semantic_planning = parseSemanticEnrollment(claim.semantic_planning);
+      // PRD #4320 module 5: a provider binding is decoded fail-closed (throws on any malformed or
+      // vendor-contradicting binding, naming the rule and never a value).
+      if (isRecord(claim) && isRecord(claim.secrets)) {
+        const provider = decodeProviderBinding(claim.secrets);
+        if (provider) claim.secrets.provider = provider;
+      }
       // PRD #1230 M4: a present-but-malformed maintainer-pending projection fails the claim closed.
       if (isRecord(claim) && isRecord(claim.config) && Object.hasOwn(claim.config, "completion_pending")) {
         const pending = decodeCompletionPending(claim.config.completion_pending);
@@ -2654,6 +2661,10 @@ export class WorkerClient {
         (claim.worker_recovery_episode as number) < 0)) delete claim.worker_recovery_episode;
     if (isRecord(claim) && (!Number.isSafeInteger(claim.worker_recovery_owner_episode) ||
         (claim.worker_recovery_owner_episode as number) < 0)) delete claim.worker_recovery_owner_episode;
+    if (isRecord(claim) && isRecord(claim.secrets)) {
+      const provider = decodeProviderBinding(claim.secrets);
+      if (provider) claim.secrets.provider = provider;
+    }
     validateClaimMemory(claim);
     this.dropUnknownDefaultEffort(claim);
     return claim;

@@ -301,6 +301,9 @@ const maxPlausibleWait = 8 * 24 * time.Hour
 func resumeThreadBlocks(rc store.GetSlackRunContextRow, waited time.Duration, hasWait bool, base, parkKind, switchedTo string) (blocks []slack.Block, fallback string) {
 	repo := ScrubSecrets(EscapeMrkdwn(rc.PathWithNamespace))
 	header := "▶️ *Resumed · usage limit cleared*"
+	if providerGatewayPark(rc) {
+		header = "▶️ *Resumed · provider gateway limit cleared*"
+	}
 	if parkKind == "paused" {
 		header = "▶️ *Resumed*"
 	}
@@ -1014,7 +1017,11 @@ func renderThreadBlocks(rc store.GetSlackRunContextRow, base string) (blocks []s
 		// The ONE non-terminal case, ruled rather than accidental. The reasoning and the
 		// two properties that bound it live on this function's doc comment above, in one
 		// place, so they cannot drift from the contract they amend.
-		blocks = []slack.Block{threadSectionBlock("⏸️ *Paused · usage limit*")}
+		head, parkWord := "⏸️ *Paused · usage limit*", "usage limit"
+		if providerGatewayPark(rc) {
+			head, parkWord = "⏸️ *Waiting · provider gateway rate limit*", "provider gateway rate limit"
+		}
+		blocks = []slack.Block{threadSectionBlock(head)}
 		var ctxElems []slack.MixedElement
 		if detail := limitWaitDetail(rc); detail != "" {
 			ctxElems = append(ctxElems, threadMrkdwnElem(ScrubSecrets(detail)))
@@ -1025,7 +1032,7 @@ func renderThreadBlocks(rc store.GetSlackRunContextRow, base string) (blocks []s
 		if len(ctxElems) > 0 {
 			blocks = append(blocks, slack.NewContextBlock("slack_thread_limit_ctx", ctxElems...))
 		}
-		return blocks, fmt.Sprintf("Paused · usage limit · %s#%d", repo, iid(rc.IssueIid)), true
+		return blocks, fmt.Sprintf("Paused · %s · %s#%d", parkWord, repo, iid(rc.IssueIid)), true
 
 	case "paused":
 		if iterationHold(rc) {
@@ -1101,6 +1108,30 @@ func cancelledThreadBlocks(linkElem func() (slack.MixedElement, bool)) []slack.B
 	return blocks
 }
 
+// providerGatewayPark reports a provider-bound run's gateway-limit park (PRD #4320 module 5). The
+// type is server-allowlisted, so an exact comparison to one fixed literal is the whole check.
+func providerGatewayPark(rc store.GetSlackRunContextRow) bool {
+	return rc.RateLimitType.Valid && rc.RateLimitType.String == workersvc.RateLimitTypeProviderGatewayLimit
+}
+
+// providerGatewayDetail is the context line of a provider gateway-limit park: when uzi retries (the
+// reader-local date token, as the vendor park's), or that it waits for its owner when no retry time
+// is recorded (the fourth gateway park onward). It names no subscription window or reset, and the
+// provider's name is not on the run context row yet, so the line says "your provider".
+func providerGatewayDetail(rc store.GetSlackRunContextRow) string {
+	var b strings.Builder
+	if rc.RetryNotBefore.Valid {
+		fmt.Fprintf(&b, "your provider's gateway is rate limiting; retrying <!date^%d^{time}|%s>",
+			rc.RetryNotBefore.Time.Unix(), rc.RetryNotBefore.Time.UTC().Format("15:04 MST"))
+	} else {
+		b.WriteString("your provider's gateway is rate limiting; waiting for you to resume from the run page or `uzi run resume " + rc.ID.String() + "`")
+	}
+	if rc.LimitWaitCount > 1 {
+		fmt.Fprintf(&b, " (pause %d)", rc.LimitWaitCount)
+	}
+	return b.String()
+}
+
 // limitWaitDetail renders ONLY the park detail suffix — the rate-limit type, the
 // resume `<!date^…>` reader-local-time token, and the pause count — for the park
 // thread event's context block; the head (`⏸️ Paused · usage limit`) is the section
@@ -1111,6 +1142,9 @@ func cancelledThreadBlocks(linkElem func() (slack.MixedElement, bool)) []slack.B
 // have. A park with neither a window nor a stamp yields "", so the context block is
 // just the deep link (or omitted when no base URL resolves).
 func limitWaitDetail(rc store.GetSlackRunContextRow) string {
+	if providerGatewayPark(rc) {
+		return providerGatewayDetail(rc)
+	}
 	var b strings.Builder
 	if rc.RateLimitType.Valid && rc.RateLimitType.String != "" {
 		// EscapeMrkdwn even though workersvc has already allowlisted this to a
@@ -1198,6 +1232,9 @@ func statusGlyph(rc store.GetSlackRunContextRow) (emoji, label string) {
 		// `awaiting_followup` on the root line (Slack has no _→space fallback).
 		return "💬", "Awaiting your follow-up"
 	case "limit_wait":
+		if providerGatewayPark(rc) {
+			return "⏸️", "Waiting · provider gateway rate limit"
+		}
 		return "⏸️", "Paused · usage limit"
 	case "paused":
 		if iterationHold(rc) {

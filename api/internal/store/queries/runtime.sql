@@ -3564,6 +3564,12 @@ UPDATE runs SET
     rate_limit_type      = sqlc.narg('rate_limit_type'),
     retry_not_before     = @retry_not_before,
     limit_wait_count     = limit_wait_count + 1,
+    -- PRD #4320 M6: a provider-bound run counts its gateway parks since the owner last resumed it.
+    -- The increment is in this statement so the count and the transition are one write; the caller
+    -- selected retry_not_before from the value BEFORE this increment (workersvc providerLimitSchedule).
+    -- A vendor run (model_provider_key_mode NULL) keeps 0.
+    model_provider_limit_streak = CASE WHEN model_provider_key_mode IS NOT NULL
+        THEN model_provider_limit_streak + 1 ELSE model_provider_limit_streak END,
     -- Boundary reconcile precedes park; revoke this Codex flight atomically.
     codex_cap_hash       = CASE WHEN harness = 'codex' THEN NULL ELSE codex_cap_hash END,
     codex_claim_epoch    = CASE WHEN harness = 'codex' THEN codex_claim_epoch + 1 ELSE codex_claim_epoch END,
@@ -3783,6 +3789,32 @@ WHERE runs.id = @id AND runs.user_id = @user_id AND runs.status = 'limit_wait'
       WHERE cc.checker_run_id = runs.id AND runs.id = ANY(checks.ids)
         AND cc.lead_run_id = runs.target_run_id AND lead.user_id = runs.user_id
   ));
+
+-- name: ResumeProviderGatewayLimitWait :execrows
+-- PRD #4320 M6: the OWNER's Resume of a provider gateway-limit park. A provider-bound run parked as
+-- limit_wait with rate_limit_type 'provider_gateway_limit' after the third gateway park waits for
+-- the owner (retry_not_before NULL), and may be resumed earlier from any of the first three rows.
+-- The mutation set is PromoteLimitWaitRunNow's (fresh wall, cleared pause bank, revoked codex cap,
+-- reset health) PLUS the two columns that make this an owner reset: model_provider_limit_streak back
+-- to 0 and retry_not_before cleared, so the next gateway park starts the schedule over.
+--
+-- Vendor limit_wait is NOT resumable here: the predicate requires a provider binding AND the gateway
+-- limit type, so a vendor park (which auto-resumes at its window) stays a 409 at the handler.
+-- Owner- and status-scoped; 0 rows is a race or an ineligible run, which the handler maps to 409.
+UPDATE runs SET
+    status     = 'queued',
+    status_since = now(),
+    started_at = NULL,
+    budget_paused_seconds = 0,
+    codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
+    model_provider_limit_streak = 0,
+    retry_not_before = NULL,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE runs.id = @id AND runs.user_id = @user_id AND runs.status = 'limit_wait'
+  AND runs.model_provider_key_mode IS NOT NULL
+  AND runs.rate_limit_type = 'provider_gateway_limit'
+  AND runs.kind NOT IN ('judge', 'job', 'cross_check');
 
 -- name: ListLimitWaitReeval :many
 -- The duration-time auto-failover worklist (PRD #1247 M3, D8): every run STILL parked

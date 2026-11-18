@@ -45,7 +45,7 @@ afterEach(() => {
 
 describe("buildSdkEnv", () => {
   it("contains only the OAuth token, HOME, PATH, AGENT_BROWSER_ARGS, the browser discovery paths, TMPDIR (plus explicitly-unset ANTHROPIC_*)", () => {
-    const env = buildSdkEnv(FAKE_OAUTH, HOME_DIR);
+    const env = buildSdkEnv({ kind: "oauth", token: FAKE_OAUTH }, HOME_DIR);
 
     assert.strictEqual(env.CLAUDE_CODE_OAUTH_TOKEN, FAKE_OAUTH);
     assert.strictEqual(env.HOME, HOME_DIR);
@@ -67,14 +67,14 @@ describe("buildSdkEnv", () => {
   });
 
   it("hands the CLI the extra CA bundle path, which a provisioned tool env cannot redirect", () => {
-    assert.ok(!("NODE_EXTRA_CA_CERTS" in buildSdkEnv(FAKE_OAUTH, HOME_DIR, { NODE_EXTRA_CA_CERTS: "/tmp/attacker.pem" })));
+    assert.ok(!("NODE_EXTRA_CA_CERTS" in buildSdkEnv({ kind: "oauth", token: FAKE_OAUTH }, HOME_DIR, { NODE_EXTRA_CA_CERTS: "/tmp/attacker.pem" })));
     process.env.UZI_CLI_CA_FILE = "/run/secrets/ca.crt";
-    const env = buildSdkEnv(FAKE_OAUTH, HOME_DIR, { NODE_EXTRA_CA_CERTS: "/tmp/attacker.pem" });
+    const env = buildSdkEnv({ kind: "oauth", token: FAKE_OAUTH }, HOME_DIR, { NODE_EXTRA_CA_CERTS: "/tmp/attacker.pem" });
     assert.strictEqual(env.NODE_EXTRA_CA_CERTS, "/run/secrets/ca.crt");
   });
 
   it("issue #3907: browser discovery points at the uzi-chromium wrapper and adds no Puppeteer/CHROME_BIN key", () => {
-    const env = buildSdkEnv(FAKE_OAUTH, HOME_DIR);
+    const env = buildSdkEnv({ kind: "oauth", token: FAKE_OAUTH }, HOME_DIR);
     assert.strictEqual(env.AGENT_BROWSER_EXECUTABLE_PATH, "/usr/local/bin/uzi-chromium");
     assert.strictEqual(env.CHROME_PATH, "/usr/local/bin/uzi-chromium");
     assert.ok(!("PUPPETEER_EXECUTABLE_PATH" in env));
@@ -82,7 +82,7 @@ describe("buildSdkEnv", () => {
   });
 
   it("issue #3907: a hostile toolEnv cannot replace the browser discovery paths", () => {
-    const env = buildSdkEnv(FAKE_OAUTH, HOME_DIR, {
+    const env = buildSdkEnv({ kind: "oauth", token: FAKE_OAUTH }, HOME_DIR, {
       AGENT_BROWSER_EXECUTABLE_PATH: "/evil/chromium",
       CHROME_PATH: "/evil/chrome",
     });
@@ -96,7 +96,7 @@ describe("buildSdkEnv", () => {
     assert.notStrictEqual(process.env.PATH, "/runner/pinned/bin:/usr/bin");
     // runnerPath's documented entrypoint precedence: a nonempty pin wins over PATH.
     assert.strictEqual(runnerPath(), "/runner/pinned/bin:/usr/bin");
-    assert.strictEqual(buildSdkEnv(FAKE_OAUTH, HOME_DIR).PATH, "/runner/pinned/bin:/usr/bin");
+    assert.strictEqual(buildSdkEnv({ kind: "oauth", token: FAKE_OAUTH }, HOME_DIR).PATH, "/runner/pinned/bin:/usr/bin");
   });
 
   it("falls back to the ambient PATH for an explicitly empty runner pin", () => {
@@ -104,7 +104,7 @@ describe("buildSdkEnv", () => {
     process.env.UZI_RUNNER_PATH = "";
     // runnerPath treats an empty pin like an absent pin at non-entrypoint starts.
     assert.strictEqual(runnerPath(), ambientPath);
-    assert.strictEqual(buildSdkEnv(FAKE_OAUTH, HOME_DIR).PATH, ambientPath);
+    assert.strictEqual(buildSdkEnv({ kind: "oauth", token: FAKE_OAUTH }, HOME_DIR).PATH, ambientPath);
   });
 
   it("always sets AGENT_BROWSER_ARGS with --no-sandbox and --disable-dev-shm-usage", () => {
@@ -112,7 +112,7 @@ describe("buildSdkEnv", () => {
     // not a credential) so they survive a shim bypass — the real agent-browser CLI reads
     // AGENT_BROWSER_ARGS from its environment. --no-sandbox is required under the PRD #51
     // hardening (unprivileged uid + cap_drop:ALL make Chromium's setuid sandbox impossible).
-    const env = buildSdkEnv(FAKE_OAUTH, HOME_DIR);
+    const env = buildSdkEnv({ kind: "oauth", token: FAKE_OAUTH }, HOME_DIR);
     assert.ok(env.AGENT_BROWSER_ARGS, "AGENT_BROWSER_ARGS must be present");
     assert.ok(env.AGENT_BROWSER_ARGS?.includes("--no-sandbox"), "must carry --no-sandbox");
     assert.ok(
@@ -124,7 +124,7 @@ describe("buildSdkEnv", () => {
   it("never lets a provisioned AGENT_BROWSER_ARGS drop --no-sandbox", () => {
     // AGENT_BROWSER_ARGS is a PROTECTED key: a provisioned toolEnv value (e.g. from
     // allowlist drift) cannot overwrite the mandatory launch flags.
-    const env = buildSdkEnv(FAKE_OAUTH, HOME_DIR, {
+    const env = buildSdkEnv({ kind: "oauth", token: FAKE_OAUTH }, HOME_DIR, {
       AGENT_BROWSER_ARGS: "--something-else",
     } as Record<string, string>);
     assert.ok(
@@ -139,7 +139,7 @@ describe("buildSdkEnv", () => {
   });
 
   it("never carries the join token or the bot PAT", () => {
-    const env = buildSdkEnv(FAKE_OAUTH, HOME_DIR);
+    const env = buildSdkEnv({ kind: "oauth", token: FAKE_OAUTH }, HOME_DIR);
     const serialized = JSON.stringify(env);
     assert.ok(!serialized.includes(FAKE_JOIN_TOKEN), "join token must not appear in the SDK env");
     assert.ok(!serialized.includes(FAKE_PAT), "bot PAT must not appear in the SDK env");
@@ -148,7 +148,7 @@ describe("buildSdkEnv", () => {
   it("does not let an inherited ANTHROPIC_API_KEY override the OAuth token", () => {
     // ANTHROPIC_API_KEY is set in process.env (above) yet the built env pins it
     // to undefined, so the OAuth token wins the SDK's auth precedence.
-    const env: SdkEnv = buildSdkEnv(FAKE_OAUTH, HOME_DIR);
+    const env: SdkEnv = buildSdkEnv({ kind: "oauth", token: FAKE_OAUTH }, HOME_DIR);
     assert.strictEqual(env.ANTHROPIC_API_KEY, undefined);
     assert.ok(!JSON.stringify(env).includes(FAKE_API_KEY));
   });
@@ -157,7 +157,7 @@ describe("buildSdkEnv", () => {
     process.env.UZI_RUNNER_PATH = "/runner/pinned/bin:/usr/bin";
     // Provisioned PATH replaces even the nonempty entrypoint pin selected by runnerPath.
     assert.strictEqual(runnerPath(), "/runner/pinned/bin:/usr/bin");
-    const env = buildSdkEnv(FAKE_OAUTH, HOME_DIR, {
+    const env = buildSdkEnv({ kind: "oauth", token: FAKE_OAUTH }, HOME_DIR, {
       PATH: "/nix/store/kubectl/bin:/usr/bin",
       NIX_SSL_CERT_FILE: "/etc/ssl/cert.pem",
     });
@@ -169,19 +169,19 @@ describe("buildSdkEnv", () => {
   });
 
   it("omits DOCKER_HOST when no sidecar is wired (PRD #83 Q4)", () => {
-    const env = buildSdkEnv(FAKE_OAUTH, HOME_DIR);
+    const env = buildSdkEnv({ kind: "oauth", token: FAKE_OAUTH }, HOME_DIR);
     assert.ok(!("DOCKER_HOST" in env), "no DOCKER_HOST key when the worker has no daemon wired");
-    const withTools = buildSdkEnv(FAKE_OAUTH, HOME_DIR, { PATH: "/nix/bin" });
+    const withTools = buildSdkEnv({ kind: "oauth", token: FAKE_OAUTH }, HOME_DIR, { PATH: "/nix/bin" });
     assert.ok(!("DOCKER_HOST" in withTools));
   });
 
   it("injects DOCKER_HOST when a sidecar is wired, and a provisioned var cannot clobber it", () => {
     const DIND = "unix:///run/dind/docker.sock";
-    const env = buildSdkEnv(FAKE_OAUTH, HOME_DIR, {}, DIND);
+    const env = buildSdkEnv({ kind: "oauth", token: FAKE_OAUTH }, HOME_DIR, {}, DIND);
     assert.strictEqual(env.DOCKER_HOST, DIND);
     // Set AFTER the tool-env fold: even if a provisioned var carried a DOCKER_HOST (it
     // never does — not on the allowlist), the wired endpoint wins.
-    const folded = buildSdkEnv(FAKE_OAUTH, HOME_DIR, { DOCKER_HOST: "tcp://evil:2375" } as Record<string, string>, DIND);
+    const folded = buildSdkEnv({ kind: "oauth", token: FAKE_OAUTH }, HOME_DIR, { DOCKER_HOST: "tcp://evil:2375" } as Record<string, string>, DIND);
     assert.strictEqual(folded.DOCKER_HOST, DIND);
     // The credential + HOME are untouched by the new param.
     assert.strictEqual(env.CLAUDE_CODE_OAUTH_TOKEN, FAKE_OAUTH);
@@ -191,7 +191,7 @@ describe("buildSdkEnv", () => {
   it("never lets tool env overwrite a protected key (credential, HOME, ANTHROPIC_*)", () => {
     // filterShellenv already drops these, but buildSdkEnv is defensive too — the
     // ANTHROPIC_* keys must stay undefined so nothing outranks the OAuth token.
-    const env = buildSdkEnv(FAKE_OAUTH, HOME_DIR, {
+    const env = buildSdkEnv({ kind: "oauth", token: FAKE_OAUTH }, HOME_DIR, {
       CLAUDE_CODE_OAUTH_TOKEN: "attacker-token",
       HOME: "/tmp/evil",
       ANTHROPIC_API_KEY: "attacker-key",
@@ -212,7 +212,7 @@ describe("Go concurrency defaults (issue #3382)", () => {
   const hostile = { PATH: "/nix/bin", GOFLAGS: "-toolexec=evil", GOMAXPROCS: "99" };
 
   it("adds no GOFLAGS or GOMAXPROCS key when unset, in either builder", () => {
-    for (const env of [buildSdkEnv(FAKE_OAUTH, HOME_DIR), buildCheckEnv({ GOFLAGS: "-x", GOMAXPROCS: "8" }, HOME_DIR)]) {
+    for (const env of [buildSdkEnv({ kind: "oauth", token: FAKE_OAUTH }, HOME_DIR), buildCheckEnv({ GOFLAGS: "-x", GOMAXPROCS: "8" }, HOME_DIR)]) {
       assert.equal(Object.hasOwn(env, "GOFLAGS"), false);
       assert.equal(Object.hasOwn(env, "GOMAXPROCS"), false);
     }
@@ -220,15 +220,15 @@ describe("Go concurrency defaults (issue #3382)", () => {
 
   it("buildSdkEnv carries each setting, overriding a provisioned value, without touching protected keys", () => {
     configureGoConcurrency({ buildParallelism: 2 });
-    let env = buildSdkEnv(FAKE_OAUTH, HOME_DIR);
+    let env = buildSdkEnv({ kind: "oauth", token: FAKE_OAUTH }, HOME_DIR);
     assert.equal(env.GOFLAGS, "-p=2");
     assert.equal(Object.hasOwn(env, "GOMAXPROCS"), false);
     configureGoConcurrency({ maxProcs: 3 });
-    env = buildSdkEnv(FAKE_OAUTH, HOME_DIR);
+    env = buildSdkEnv({ kind: "oauth", token: FAKE_OAUTH }, HOME_DIR);
     assert.equal(env.GOMAXPROCS, "3");
     assert.equal(Object.hasOwn(env, "GOFLAGS"), false);
     configureGoConcurrency({ buildParallelism: 2, maxProcs: 3 });
-    env = buildSdkEnv(FAKE_OAUTH, HOME_DIR, hostile);
+    env = buildSdkEnv({ kind: "oauth", token: FAKE_OAUTH }, HOME_DIR, hostile);
     assert.equal(env.GOFLAGS, "-p=2");
     assert.equal(env.GOMAXPROCS, "3");
     assert.equal(env.PATH, "/nix/bin");
@@ -253,14 +253,14 @@ describe("Go concurrency defaults (issue #3382)", () => {
     configureGoConcurrency({ buildParallelism: 2, maxProcs: 3 });
     try {
       const tool = { PATH: "/nix/bin", GOTMPDIR: "/provisioned/tmp", GOFLAGS: "-x" };
-      const without = buildSdkEnv(FAKE_OAUTH, HOME_DIR, tool, "unix:///run/dind.sock");
+      const without = buildSdkEnv({ kind: "oauth", token: FAKE_OAUTH }, HOME_DIR, tool, "unix:///run/dind.sock");
       assert.equal(without.GOTMPDIR, "/provisioned/tmp", "no managed dir: a provisioned GOTMPDIR passes as before");
-      const withDir = buildSdkEnv(FAKE_OAUTH, HOME_DIR, tool, "unix:///run/dind.sock", undefined, "/home/run/.uzi-go-work/g3");
+      const withDir = buildSdkEnv({ kind: "oauth", token: FAKE_OAUTH }, HOME_DIR, tool, "unix:///run/dind.sock", undefined, "/home/run/.uzi-go-work/g3");
       assert.equal(withDir.GOTMPDIR, "/home/run/.uzi-go-work/g3", "the managed dir overrides a provisioned GOTMPDIR");
       assert.deepEqual({ ...withDir, GOTMPDIR: undefined }, { ...without, GOTMPDIR: undefined });
-      const bare = buildSdkEnv(FAKE_OAUTH, HOME_DIR);
+      const bare = buildSdkEnv({ kind: "oauth", token: FAKE_OAUTH }, HOME_DIR);
       assert.equal(Object.hasOwn(bare, "GOTMPDIR"), false);
-      const bareWith = buildSdkEnv(FAKE_OAUTH, HOME_DIR, {}, undefined, undefined, "/w/g1");
+      const bareWith = buildSdkEnv({ kind: "oauth", token: FAKE_OAUTH }, HOME_DIR, {}, undefined, undefined, "/w/g1");
       assert.equal(bareWith.GOTMPDIR, "/w/g1");
       assert.deepEqual({ ...bareWith, GOTMPDIR: undefined }, { ...bare, GOTMPDIR: undefined });
     } finally {

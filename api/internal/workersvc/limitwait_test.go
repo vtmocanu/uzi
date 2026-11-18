@@ -3,6 +3,7 @@ package workersvc
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -25,7 +26,26 @@ import (
 // MUTATION THIS CATCHES: adding or removing a member on either side without the
 // other. Measured in both directions.
 func TestRateLimitTypeVocabularyMatchesCheck(t *testing.T) {
-	const path = "../store/migrations/00091_run_limit_wait.sql"
+	// The newest migration that (re)defines the CHECK, found by content so a later widening
+	// (00478 added provider_gateway_limit) is the one compared, not 00091's original.
+	files, err := filepath.Glob("../store/migrations/*.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sort.Strings(files)
+	path := ""
+	for _, f := range files {
+		b, err := os.ReadFile(f) //nolint:gosec // G304: f comes from a Glob over the store migrations dir.
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(b), "ADD CONSTRAINT runs_rate_limit_type_check") {
+			path = f
+		}
+	}
+	if path == "" {
+		t.Fatal("no migration defines runs_rate_limit_type_check")
+	}
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read %s: %v", path, err)

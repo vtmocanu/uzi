@@ -36,7 +36,7 @@ import type { CodexBinding } from "./codex/select.js";
 import type { CodexAdviceHarnessFactory } from "./codex/codex-executor.js"; // type-only — the injected seam, never constructed here
 import { CODEX_TASK_REVIEW_MODEL } from "./codex/task-review-model.js"; // PRD #1551 M2: leaf value import (no runtime dep on the heavy codex-executor)
 import { errMessage } from "./util.js";
-import type { ClaimResponse, TaskReviewFinding, TaskReviewRequest } from "./protocol.js";
+import type { ClaimProviderBinding, ClaimResponse, TaskReviewFinding, TaskReviewRequest } from "./protocol.js";
 
 // Wall-clock cap on the single reviewer model turn, mirroring JUDGE_MODEL_TIMEOUT_MS.
 // Without it a review run whose model call hangs or retries indefinitely only ends when
@@ -144,8 +144,14 @@ export class ReviewRunner {
     const scope = claim.secrets.codex?.auth_mode === "subscription"
       ? acquireCodexOperationScope(this.client, claim.run_id, claim.claim_generation ?? 0, {}, undefined, undefined, this.log) : undefined;
     scope?.own();
+    // PRD #4320: a provider-bound review's gateway key is scrubbed from this worker's log for the claim.
+    const providerKey = claim.secrets?.provider?.credential;
+    if (providerKey) this.log.addSecret(providerKey);
     try { await this.executeClaim(claim, signal); }
-    finally { scope?.close(); }
+    finally {
+      scope?.close();
+      if (providerKey) this.log.removeSecret(providerKey);
+    }
   }
 
   private async executeClaim(claim: ClaimResponse, signal?: AbortSignal): Promise<void> {
@@ -248,7 +254,8 @@ export class ReviewRunner {
         const onUsage = (snapshot: AdviceUsageSnapshot): void => {
           // The Claude result fold assumes a provider cost. Token-only interrupted
           // evidence would otherwise fabricate metered zero; keep that gap explicit.
-          if (selection.kind === "claude" && !hasProviderCostForEveryModel(snapshot)) {
+          // PRD #4320 P7: a provider review reports tokens only (no vendor-priced cost exists to require).
+          if (selection.kind === "claude" && !claim.secrets?.provider && !hasProviderCostForEveryModel(snapshot)) {
             this.log.warn("review pass usage unavailable", { run_id: reviewRunId });
             return;
           }
@@ -258,11 +265,11 @@ export class ReviewRunner {
           review = await this.reviewCodex(claim, diff, selection.binding, onUsage, signal);
         } else {
           const token = claim.secrets?.anthropic_oauth_token?.trim();
-          if (!token) {
+          if (!token && !claim.secrets?.provider) {
             this.log.warn("review claim carried no Anthropic token; posting failed review", { run_id: reviewRunId });
             review = { status: "failed", summary: "No Anthropic token available for review.", findings: [] };
           } else {
-            review = await this.review(claim, diff, token, onUsage);
+            review = await this.review(claim, diff, token ?? "", onUsage, claim.secrets?.provider);
           }
         }
       }
@@ -371,10 +378,11 @@ export class ReviewRunner {
   private async review(
     claim: ClaimResponse, diff: string, token: string,
     onUsage: (snapshot: AdviceUsageSnapshot) => void,
+    provider?: ClaimProviderBinding,
   ): Promise<TaskReviewRequest> {
     try {
       const prompt = buildReviewPrompt(diff);
-      const text = await this.runModel(token, prompt, onUsage);
+      const text = await this.runModel(token, prompt, onUsage, provider);
       return parseTaskReview(text);
     } catch (err) {
       this.log.warn("review model call failed; posting failed review", {
@@ -429,9 +437,10 @@ export class ReviewRunner {
     }
   }
 
-  private async runModel(token: string, prompt: string, onUsage: (snapshot: AdviceUsageSnapshot) => void): Promise<string> {
+  private async runModel(token: string, prompt: string, onUsage: (snapshot: AdviceUsageSnapshot) => void, provider?: ClaimProviderBinding): Promise<string> {
     return runReadOnlyModelPass({
       token,
+      ...(provider ? { provider } : {}),
       systemPrompt: REVIEW_SYSTEM_PROMPT,
       prompt,
       homeRoot: this.homeRoot,
