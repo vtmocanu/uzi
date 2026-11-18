@@ -50,9 +50,12 @@ uzi provider create --name corp-gw \
   the small/fast slot, which is `haiku`. Set `context_window` to the gateway model's real
   window. Without it, the Claude CLI assumes a 200k window for model names it does not
   recognize and auto-compacts about 33k tokens below it, which is wrong for a smaller or larger
-  model. A `context_window` is **not enforced for mapped model names the Claude CLI recognises**
-  (names starting with `claude-`): the CLI keeps its own window for those, so the value has no
-  effect there.
+  model. Measured at the pinned CLI, the configured window was enforced for `corp-sonnet` and
+  `corp-claude-x`, and was **not honoured** for `claude-sonnet-4-5`,
+  `us.anthropic.claude-sonnet-4-5` and `claude-corp-custom`. So for model names containing
+  "claude", `context_window` may not take effect; the CLI was observed to ignore it for such
+  names. Not every name containing "claude" was ignored, and the rule behind the difference is
+  not known.
 
 ## The key
 

@@ -118,6 +118,31 @@ func TestProviderCreateSendsMapAndHintsKey(t *testing.T) {
 	}
 }
 
+func TestProviderWarnsContextWindowOnClaudeNames(t *testing.T) {
+	fc := &uzicli.FakeClient{ProviderResult: providerFixture("corp")}
+	_, errOut, code := runCLI(t, fakeEnv(fc), "provider", "create", "--name", "corp",
+		"--base-url", "https://gw.example.com/anthropic",
+		"--model", "haiku=corp-haiku:200000", "--model", "sonnet=us.anthropic.Claude-sonnet-4-5:50000", "--model", "opus=claude-opus")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, stderr %q", code, errOut)
+	}
+	if !strings.Contains(errOut, "warning: --model sonnet: context_window may not take effect for model names containing 'claude'") {
+		t.Errorf("create stderr lacks the sonnet warning: %q", errOut)
+	}
+	if strings.Contains(errOut, "--model haiku") || strings.Contains(errOut, "--model opus") {
+		t.Errorf("warned for a name without a window or without claude: %q", errOut)
+	}
+	fc = &uzicli.FakeClient{ProviderList: enabledList(providerFixture("corp")), ProviderResult: providerFixture("corp")}
+	_, errOut, code = runCLI(t, fakeEnv(fc), "provider", "edit", providerTestID, "--model", "haiku=claude-haiku-4-5:100000")
+	if code != uzicli.ExitOK || !strings.Contains(errOut, "warning: --model haiku: context_window may not take effect") {
+		t.Errorf("edit: code %d stderr %q", code, errOut)
+	}
+	_, errOut, _ = runCLI(t, fakeEnv(fc), "provider", "edit", providerTestID, "--model", "haiku=corp-haiku:100000")
+	if strings.Contains(errOut, "warning") {
+		t.Errorf("warned for a non-claude name: %q", errOut)
+	}
+}
+
 func TestProviderCreateRejectsBadFlags(t *testing.T) {
 	base := []string{"provider", "create", "--name", "corp", "--base-url", "https://gw.example.com/anthropic"}
 	cases := map[string][]string{

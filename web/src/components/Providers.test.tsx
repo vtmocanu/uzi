@@ -170,13 +170,16 @@ describe("Providers — create", () => {
     expect(screen.queryByTestId("ctx-warning-haiku")).toBeNull();
   });
 
-  it("says a context window is not enforced for a claude-* mapped name, only when one is set", async () => {
+  it("warns a context window may not take effect for a name containing claude, only when one is set", async () => {
     await renderCard(list({ providers: [] }));
-    fireEvent.change(within(form()).getByLabelText("Haiku model (required)"), { target: { value: "claude-haiku-4-5" } });
-    expect(screen.getByTestId("ctx-warning-haiku").textContent).toMatch(/not enforced for model names the Claude CLI recognises/);
+    fireEvent.change(within(form()).getByLabelText("Haiku model (required)"), { target: { value: "us.anthropic.Claude-haiku-4-5" } });
+    expect(screen.getByTestId("ctx-warning-haiku").textContent).toMatch(/assumes a 200k-token window/);
+    expect(screen.getByTestId("ctx-warning-haiku").textContent).not.toMatch(/may not take effect/);
     expect(screen.queryByTestId("ctx-unenforced-haiku")).toBeNull();
     fireEvent.change(within(form()).getByLabelText("Haiku context window"), { target: { value: "65536" } });
-    expect(screen.getByTestId("ctx-unenforced-haiku").textContent).toMatch(/not enforced for model names the Claude CLI recognises/);
+    expect(screen.getByTestId("ctx-unenforced-haiku").textContent).toMatch(
+      /context_window may not take effect for model names containing 'claude'; the CLI was observed to ignore it for such names/,
+    );
     fireEvent.change(within(form()).getByLabelText("Haiku model (required)"), { target: { value: "gw-small" } });
     expect(screen.queryByTestId("ctx-unenforced-haiku")).toBeNull();
   });

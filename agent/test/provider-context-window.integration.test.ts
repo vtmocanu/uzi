@@ -283,23 +283,42 @@ describe("context-window env keys vs a model name the CLI does not recognize (PR
     within(firstCompaction(o, "lead", "AUTO_COMPACT_WINDOW=50000"), 50_000, 100_000, "AUTO_COMPACT_WINDOW=50000", o);
   });
 
-  // A catalog-style mapped name (one the CLI knows) with a smaller configured window, the context env
-  // taken from the production buildSdkEnv.
-  it("single model, mapped catalog name claude-sonnet-4-5 with a 50000 window from buildSdkEnv", { timeout: 120_000 }, async () => {
+  // The context env for a mapped sonnet name with a 50000 window, taken from the production buildSdkEnv.
+  const WINDOW = 50_000;
+  const prodWindowEnv = (sonnet: string): Record<string, string> => {
     const prod = buildSdkEnv(
-      { kind: "provider", baseUrl: "http://127.0.0.1:1", authStyle: "bearer", key: "k", modelMap: { sonnet: { model: "claude-sonnet-4-5", context_window: 50_000 }, haiku: { model: SUB_MODEL } } },
+      { kind: "provider", baseUrl: "http://127.0.0.1:1", authStyle: "bearer", key: "k", modelMap: { sonnet: { model: sonnet, context_window: WINDOW }, haiku: { model: SUB_MODEL } } },
       "/unused-home",
     );
-    assert.equal(prod.CLAUDE_CODE_MAX_CONTEXT_TOKENS, "50000");
-    const o = await run({ ANTHROPIC_DEFAULT_SONNET_MODEL: "claude-sonnet-4-5", CLAUDE_CODE_MAX_CONTEXT_TOKENS: prod.CLAUDE_CODE_MAX_CONTEXT_TOKENS! }, false);
-    assert.ok(o.gw.calls.some((c) => c.model === "claude-sonnet-4-5"), `the catalog name reached the gateway\ncalls: ${trace(o)}`);
-    // OBSERVED at the pin (SDK 0.3.319 / CLI 2.1.319, 2026-11-18): the configured window is NOT enforced
-    // for a name the CLI recognises. The CLI keeps its catalog window (larger than the 200k default here:
-    // no compaction through 400k+ reported tokens), so a context_window on a claude-* mapped name is
-    // inert. This pins that behaviour as a KNOWN REQUIREMENT GAP (PRD Decision Log); if a CLI bump
-    // starts enforcing it, this fails and the docs/warning must be revisited.
-    const n = o.gw.tokensAtFirstCompaction("lead");
-    assert.ok(n === undefined || n > DEFAULT_WINDOW, `the catalog window was not retained (first compaction at ${n}, configured 50000)\ncalls: ${trace(o)}`);
+    assert.equal(prod.CLAUDE_CODE_MAX_CONTEXT_TOKENS, String(WINDOW));
+    return { ANTHROPIC_DEFAULT_SONNET_MODEL: sonnet, CLAUDE_CODE_MAX_CONTEXT_TOKENS: prod.CLAUDE_CODE_MAX_CONTEXT_TOKENS! };
+  };
+  const maxLeadTokens = (o: Outcome): number => Math.max(0, ...o.gw.calls.filter((c) => c.agent === "lead" && !c.compaction).map((c) => c.reported));
+
+  // OBSERVED at the pin (SDK 0.3.319 / CLI 2.1.319, 2026-11-18), with a 50000 window: the names below
+  // were NOT compacted at that window. These tests record what was seen, not why; they fail if a CLI
+  // bump starts honouring the window for them, and the docs/CLI help/form warning must be revisited.
+  for (const [name, minReported] of [
+    ["claude-sonnet-4-5", DEFAULT_WINDOW],
+    ["us.anthropic.claude-sonnet-4-5", DEFAULT_WINDOW],
+    // Unrecognized by the CLI (it logs unrecognized_model) yet not honoured: it compacted near the 200k default.
+    ["claude-corp-custom", 100_000],
+  ] as const) {
+    it(`single model, mapped name ${name} with a 50000 window from buildSdkEnv: the window is not honoured`, { timeout: 120_000 }, async () => {
+      const o = await run(prodWindowEnv(name), false);
+      assert.ok(o.gw.calls.some((c) => c.model === name), `the name reached the gateway\ncalls: ${trace(o)}`);
+      const max = maxLeadTokens(o);
+      assert.ok(max > minReported, `the lead only reached ${max} reported tokens, expected above ${minReported} (window 50000)\ncalls: ${trace(o)}`);
+      const n = o.gw.tokensAtFirstCompaction("lead");
+      assert.ok(n === undefined || n > WINDOW, `compaction at or below the configured window (first compaction at ${n})\ncalls: ${trace(o)}`);
+    });
+  }
+
+  // Positive control for the same measurement: a name containing "claude" that WAS enforced.
+  it("single model, mapped name corp-claude-x with a 50000 window from buildSdkEnv: the window is enforced", { timeout: 120_000 }, async () => {
+    const o = await run(prodWindowEnv("corp-claude-x"), false);
+    assert.ok(o.gw.calls.some((c) => c.model === "corp-claude-x"), `the name reached the gateway\ncalls: ${trace(o)}`);
+    within(firstCompaction(o, "lead", "corp-claude-x"), 0, WINDOW, "corp-claude-x", o);
   });
 
   it("lead + subagent on different unrecognized models: no context env, both assume the same 200k default", { timeout: 120_000 }, async () => {

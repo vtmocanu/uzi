@@ -287,10 +287,13 @@ func isMessage(body []byte) bool {
 	return ok
 }
 
-// toolVerdict classifies the forced-tool reply's content blocks: ToolPassed for a tool_use block
-// naming the probe tool with an object input; ToolNotSupported for a well-formed content array
-// with no such block; ToolInconclusive when the content is malformed (not an array of objects, or
-// a block whose fields have the wrong type) or the matching tool_use has a non-object input.
+// toolVerdict classifies the forced-tool reply's content blocks. Each block is an object with a
+// string type; only the fields of the types the probe understands are checked, so an unknown block
+// type with odd fields is tolerated. A "text" block needs a string text; a "tool_use" block needs a
+// string id, a string name and an object input. ToolPassed: a valid tool_use block names the probe
+// tool. ToolNotSupported: every block is well formed and none does. ToolInconclusive: the content
+// is malformed (a non-object block, a missing or non-string type, or a text or tool_use block
+// whose fields are missing, null or of the wrong type).
 func toolVerdict(body []byte) string {
 	m, ok := messageEnvelope(body)
 	if !ok {
@@ -305,26 +308,33 @@ func toolVerdict(body []byte) string {
 		if r := bytes.TrimSpace(raw); len(r) == 0 || r[0] != '{' {
 			return ToolInconclusive
 		}
-		var b struct {
-			Type  string          `json:"type"`
-			Text  *string         `json:"text"`
-			ID    *string         `json:"id"`
-			Name  string          `json:"name"`
-			Input json.RawMessage `json:"input"`
+		var head struct {
+			Type string `json:"type"`
 		}
-		if json.Unmarshal(raw, &b) != nil || b.Type == "" {
+		if json.Unmarshal(raw, &head) != nil || head.Type == "" {
 			return ToolInconclusive
 		}
-		switch b.Type {
+		switch head.Type {
 		case "text":
-			if b.Text == nil {
+			var b struct {
+				Text *string `json:"text"`
+			}
+			if json.Unmarshal(raw, &b) != nil || b.Text == nil {
 				return ToolInconclusive
 			}
 		case "tool_use":
-			if in := bytes.TrimSpace(b.Input); b.ID == nil || len(in) == 0 || in[0] != '{' {
+			var b struct {
+				ID    *string         `json:"id"`
+				Name  *string         `json:"name"`
+				Input json.RawMessage `json:"input"`
+			}
+			if json.Unmarshal(raw, &b) != nil || b.ID == nil || b.Name == nil {
 				return ToolInconclusive
 			}
-			if b.Name == probeToolName {
+			if in := bytes.TrimSpace(b.Input); len(in) == 0 || in[0] != '{' {
+				return ToolInconclusive
+			}
+			if *b.Name == probeToolName {
 				passed = true
 			}
 		}
