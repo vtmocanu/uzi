@@ -2914,7 +2914,9 @@ Known consequences and not shipped:
   leaf (`run_local_active`, `bare_config`) for as long as the binding exists. On a
   uid-split pod a non-completion retire's binding stays `intent` and the epoch never
   clears it, so that run's leaf is kept with it. A completion retire that succeeds unsets
-  its binding in-process (a failed one leaves `removing`, and the leaf is kept with it); a binding of an already-gone parent is cleared by the retire phase, which
+  its binding in-process; a failed one, or one whose unset fails, leaves its binding
+  (`intent` if it failed before disposal began, `removing` after), and the leaf is kept
+  with it; a binding of an already-gone parent is cleared by the retire phase, which
   runs after the scratch phase, so the leaf is reclaimed at the earliest on a later
   start. This fails closed; an exemption backed by settled-binding evidence is open on
   #4453.
