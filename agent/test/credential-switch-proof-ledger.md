@@ -3395,7 +3395,8 @@ Command: `.uzi/scratch/u8tools/ctl.sh` (export of 3b78045f6, throwaway postgres
 `cdr-4202-u18pg`), from the export's api directory,
 `GOFLAGS='-p=1 -buildvcs=false' GOMAXPROCS=4 go test -race -count=1 -timeout=6m ./internal/handler -run '^TestWorkerCodexStoppedRequestShapeRouteLiveDB$/^<leaf>$' -v`.
 Diffs and logs: `.uzi/scratch/ctl-logs/u18-*.{diff,log}`; each mutant log ends
-`SHA=3b78045f6… EXIT=1`.
+`SHA=3b78045f6… EXIT=1`, except u18-ack-extra-key, run at daeb23b8b (a
+ledger-only child of 3b78045f6).
 
 | Control | Class | Mutation | Leaf | Red |
 | --- | --- | --- | --- | --- |
