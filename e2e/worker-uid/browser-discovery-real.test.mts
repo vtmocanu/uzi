@@ -186,7 +186,7 @@ describe("real browser discovery under the worker identities", { skip: INIT_SKIP
     let lane: ClaudeCommandLane | undefined;
     const attempt = newRunAttempt(randomUUID(), 1, dir, () => lane?.recordedRoots() ?? []);
     // The production command env: buildSdkEnv for the CLI, guardedCommandEnv for each command.
-    const cliEnv = buildSdkEnv("browser-proof-fake-token", home, {}, undefined, attempt);
+    const cliEnv = buildSdkEnv({ kind: "oauth", token: "browser-proof-fake-token" }, home, {}, undefined, attempt);
     const commandEnv = guardedCommandEnv(cliEnv);
     assert.equal(commandEnv.CHROME_PATH, WRAPPER);
     assert.equal(commandEnv.AGENT_BROWSER_EXECUTABLE_PATH, WRAPPER);
