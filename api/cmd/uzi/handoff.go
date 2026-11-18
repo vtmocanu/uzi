@@ -558,6 +558,13 @@ func (o *originHost) compute(ctx context.Context, env Env) (string, error) {
 			return refuse("the ssh host, user or port starts with '-'")
 		}
 	}
+	// git strips its repository-local variables (GIT_DIR, ...) before it starts ssh for
+	// the push; the installed git names them, and the probe drops the same set.
+	lev, lerr := env.Git(".", "rev-parse", "--local-env-vars")
+	localEnv := strings.Fields(lev)
+	if lerr != nil || len(localEnv) == 0 {
+		return refuse("could not list git's repository-local environment variables (%v)", lerr)
+	}
 	// (c) ssh -G: evaluates (does not connect) the user's ssh config.
 	args := []string{"-G"}
 	if info.hasUser {
@@ -570,7 +577,7 @@ func (o *originHost) compute(ctx context.Context, env Env) (string, error) {
 	args = append(args, "--", info.sshHost, receivePackCommand(info.path))
 	cctx, cancel := context.WithTimeout(ctx, sshConfigTimeout)
 	defer cancel()
-	cfg, err := env.sshConfig(cctx, args...)
+	cfg, err := env.sshConfig(cctx, localEnv, args...)
 	if err != nil {
 		o.evalFail = err
 		return "", nil

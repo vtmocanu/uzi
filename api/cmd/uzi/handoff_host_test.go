@@ -383,7 +383,7 @@ func TestSSHConfigCapture(t *testing.T) {
 }
 
 func TestNewSSHConfigCmd(t *testing.T) {
-	cmd := newSSHConfigCmd(context.Background(), []string{"-G", "--", "host"})
+	cmd := newSSHConfigCmd(context.Background(), nil, []string{"-G", "--", "host"})
 	if cmd.Dir != "" {
 		t.Errorf("Dir = %q, want unset (inherit the push's cwd)", cmd.Dir)
 	}
@@ -441,5 +441,52 @@ func TestHandoffRefusalRedactsOriginCredentials(t *testing.T) {
 		if !strings.Contains(stderr, "origin") {
 			t.Errorf("refusal lost its reason: %s", stderr)
 		}
+	}
+}
+
+func TestHandoffSSHProbeDropsGitLocalEnv(t *testing.T) {
+	// The probe receives the set the installed git reports...
+	_, rec, _, code := runHostCase(t, hostCase{origin: "git@github.com:acme/widgets.git", wantMatch: true})
+	if code != uzicli.ExitOK || len(rec.sshCfg.unset) != 1 || !reflect.DeepEqual(rec.sshCfg.unset[0], []string{"GIT_DIR", "GIT_WORK_TREE", "GIT_CONFIG"}) {
+		t.Fatalf("exit=%d unset=%v, want git's local env list passed to ssh -G", code, rec.sshCfg.unset)
+	}
+	// ...and the real command cannot observe an inherited GIT_DIR.
+	t.Setenv("GIT_DIR", "/elsewhere/.git")
+	t.Setenv("UZI_PROBE_KEEP", "1")
+	cmd := newSSHConfigCmd(context.Background(), []string{"GIT_DIR"}, []string{"-G", "--", "h"})
+	if cmd.Env == nil {
+		t.Fatal("cmd.Env is nil: ssh would inherit the full environment")
+	}
+	keep := false
+	for _, kv := range cmd.Env {
+		if strings.HasPrefix(kv, "GIT_DIR=") {
+			t.Errorf("ssh -G environment still carries %s", kv)
+		}
+		keep = keep || kv == "UZI_PROBE_KEEP=1"
+	}
+	if !keep {
+		t.Error("unrelated variables must stay in the ssh -G environment")
+	}
+}
+
+func TestHandoffSSHRefusesWithoutGitLocalEnvList(t *testing.T) {
+	for name, mutate := range map[string]func(*handoffRecorder){
+		"rev-parse fails": func(r *handoffRecorder) { r.gitErr[localEnvKey] = errors.New("old git") },
+		"empty list":      func(r *handoffRecorder) { r.gitOut[localEnvKey] = " \n" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			fc := &uzicli.FakeClient{
+				Repos:          []apitypes.RepoDTO{{ID: "p1", PathWithNamespace: "acme/widgets", WebURL: "https://github.com/acme/widgets"}},
+				CreatedTaskRun: taskRun("rh", "uzi/task/rh"),
+				DispatchedRun:  taskRun("rh", "uzi/task/rh"),
+			}
+			rec := &handoffRecorder{gitOut: map[string]string{"remote get-url origin": "git@github.com:acme/widgets.git"}}
+			env, _ := handoffEnv(fc, rec)
+			mutate(rec)
+			_, stderr, code := runCLI(t, env, "handoff", "-m", "x")
+			if code != uzicli.ExitUsage || fc.LastCreateTaskRepoID != "" || len(rec.sshCfg.calls) != 0 {
+				t.Fatalf("exit=%d repo=%q ssh=%d, want refusal before ssh -G:\n%s", code, fc.LastCreateTaskRepoID, len(rec.sshCfg.calls), stderr)
+			}
+		})
 	}
 }
