@@ -171,11 +171,19 @@ describe("baseline and the bare-config sources", () => {
     }
     type Exec = (cmd: string, args: string[], o: unknown) => Promise<{ stdout: string; stderr: string }>;
     const original = (git as unknown as { execScoped: Exec }).execScoped.bind(git);
+    let mode: "throw" | "warn" = "throw";
     t.mock.method(git as unknown as { execScoped: Exec }, "execScoped", async (cmd: string, args: string[], o: unknown) => {
-      if (args.includes("for-each-ref")) throw new Error("injected read failure");
+      if (args.includes("for-each-ref")) {
+        if (mode === "throw") throw new Error("injected read failure");
+        // The real listing (empty: the storage is clean), with a warning on stderr: the wiring of stderr itself.
+        const real = await original(cmd, args, o);
+        return { ...real, stderr: "warning: ignoring broken ref\n" };
+      }
       return original(cmd, args, o);
     });
     assert.deepEqual(await classify(), unknown("run_refs"), "a plain listing failure is unknown, not a classifier fault");
+    mode = "warn";
+    assert.deepEqual(await classify(), unknown("run_refs"), "an empty exit-0 listing with stderr is unknown though the storage is clean");
   });
 
   it("the ref listing is trusted only with exit 0 and no stderr at all", () => {

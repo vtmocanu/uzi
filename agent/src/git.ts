@@ -5077,8 +5077,8 @@ export class GitCache {
         if ((configBytes += config.length) > limits.maxMetadataBytes) return unknownRetention("bare_config");
         const scanned = this.scanRunBareConfig(config, id);
         if ("state" in scanned) return scanned;
-        // The run's pins and anchors. One bounded listing (`--count=1`: any match is enough); a read failure is
-        // unknown through the caller's catch. Refs are keyed by the run id (a UUID survives the sanitising of
+        // The run's pins and anchors. One bounded listing (`--count=1`: any match is enough); a read failure or any
+        // stderr is unknown("run_refs") from listRunRefs. Refs are keyed by the run id (a UUID survives the sanitising of
         // the archive ref's id); refs/uzi-cross-check/<runId> is a single ref.
         const listing = await this.listRunRefs(bare, id);
         if (listing.state !== "ended") return listing;
