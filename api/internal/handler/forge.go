@@ -223,6 +223,13 @@ type createConnectionRequest struct {
 	ForgeType string `json:"forge_type"`
 	BaseURL   string `json:"base_url"`
 	Token     string `json:"token"`
+	// Replace is the explicit opt-in to rotate an EXISTING connection's credential.
+	// Without it, a create that targets a (user, forge_type, base_url) already
+	// connected is refused with 409 rather than silently overwriting the stored
+	// token and bot identity. The Settings form reads as "add a repo", so a user
+	// re-submitting the same host would otherwise destroy the credential they
+	// already had. A plain bool, so absence means "do not replace".
+	Replace bool `json:"replace"`
 }
 
 // CreateConnection connects (or reconnects/rotates) a bot PAT. It validates the
@@ -242,20 +249,62 @@ func (h *Handler) CreateConnection(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	conn, err := h.provisioner().ConnectForge(r.Context(), user.ID, req.ForgeType, req.BaseURL, req.Token)
-	if err != nil {
-		var pe *provisionsvc.Error
-		if errors.As(err, &pe) && pe.Kind == provisionsvc.KindOverPrivileged {
-			httpx.JSON(w, http.StatusUnprocessableEntity, map[string]any{
-				"error":      pe.Message,
-				"violations": pe.Violations,
-			})
+	// A create that targets an already-connected (user, forge_type, base_url) must
+	// not silently rotate that connection's credential. The Settings form reads as
+	// "add a repo", so a user re-submitting the same host would otherwise destroy
+	// the token and bot identity they already had. Refuse with 409 and name the
+	// existing connection, so the caller can either enable a repo on it (the thing
+	// they probably meant) or re-submit with replace=true to rotate it deliberately.
+	//
+	// The refusal is the store's create-only insert, not a read followed by an
+	// upsert. ON CONFLICT DO NOTHING makes it atomic, so two concurrent creates
+	// cannot both pass a lookup and have the second overwrite the first. The cost is
+	// that a duplicate now pays the token verification before the conflict is
+	// detected, where a pre-flight lookup could have refused it for free; the
+	// atomicity is worth more than the saved round trip, and the create-only path
+	// shares validateConnection with the upsert path so the two cannot drift.
+	//
+	// h.q == nil is the validation-only test seam (issue #223): there is no store to
+	// be atomic against, and validation is all those tests reach.
+	prov := h.provisioner()
+	if req.Replace || h.q == nil {
+		conn, err := prov.ConnectForge(r.Context(), user.ID, req.ForgeType, req.BaseURL, req.Token)
+		if err != nil {
+			writeConnectError(w, err)
 			return
 		}
-		writeProvisionError(w, err)
+		httpx.JSON(w, http.StatusCreated, map[string]any{"connection": connToDTO(conn)})
+		return
+	}
+	conn, created, err := prov.ConnectForgeCreateOnly(r.Context(), user.ID, req.ForgeType, req.BaseURL, req.Token)
+	if err != nil {
+		writeConnectError(w, err)
+		return
+	}
+	if !created {
+		httpx.JSON(w, http.StatusConflict, map[string]any{
+			"error":         "a connection to this forge already exists; enable a repository on it, or resend with replace=true to rotate its credential",
+			"code":          "forge_connection_exists",
+			"connection_id": conn.ID.String(),
+		})
 		return
 	}
 	httpx.JSON(w, http.StatusCreated, map[string]any{"connection": connToDTO(conn)})
+}
+
+// writeConnectError maps a connect failure to its wire response: the
+// over-privileged 422 carries the violations the form renders, everything else
+// goes through the shared provisioning mapping.
+func writeConnectError(w http.ResponseWriter, err error) {
+	var pe *provisionsvc.Error
+	if errors.As(err, &pe) && pe.Kind == provisionsvc.KindOverPrivileged {
+		httpx.JSON(w, http.StatusUnprocessableEntity, map[string]any{
+			"error":      pe.Message,
+			"violations": pe.Violations,
+		})
+		return
+	}
+	writeProvisionError(w, err)
 }
 
 // ListConnections returns the current user's forge connections.
