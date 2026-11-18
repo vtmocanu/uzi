@@ -1317,7 +1317,8 @@ test("unknown sources and changed original bindings are refused before any slot 
 });
 
 // Issue #4420: inspectRun honours an optional interruption bound at every fs step and before every definitive answer.
-type InspectHold = "complete.json" | "initialized.json" | "probe";
+// "initialized.close" holds the final file's handle close: every read of both files has fully finished by then.
+type InspectHold = "complete.json" | "initialized.json" | "initialized.close" | "probe";
 async function inspectUnderBound(t: test.TestContext, opts: { seed: "ended" | "active" | "absent"; hold?: InspectHold; expire?: "abort" | "deadline"; bound?: boolean }) {
   const f = await fixture(t);
   if (opts.seed !== "absent") {
@@ -1343,7 +1344,11 @@ async function inspectUnderBound(t: test.TestContext, opts: { seed: "ended" | "a
       if (armed && opts.hold === name) { armed = false; entered.resolve(); await release.promise; }
       return (read as (...a: unknown[]) => Promise<unknown>)(...rest);
     };
-    (handle as { close: unknown }).close = async () => { closed.push(name); return close(); };
+    (handle as { close: unknown }).close = async () => {
+      closed.push(name);
+      if (armed && opts.hold === "initialized.close" && name === "initialized.json") { armed = false; entered.resolve(); await release.promise; }
+      return close();
+    };
     return handle;
   });
   t.mock.method(fs, "lstat", async (...args: Parameters<typeof fs.lstat>) => {
@@ -1385,6 +1390,13 @@ for (const expire of ["abort", "deadline"] as const) {
       const r = await inspectUnderBound(t, { seed, hold: "initialized.json", expire });
       assert.deepEqual(r.closed, ["complete.json", "initialized.json"]);
       assert.equal(r.result, "unknown");
+    }
+  });
+  test(`inspectRun: ${expire} after the final initialized.json read has fully finished (at its handle close) is unknown, never ended or active`, async t => {
+    for (const seed of ["ended", "active"] as const) {
+      const r = await inspectUnderBound(t, { seed, hold: "initialized.close", expire });
+      assert.deepEqual(r.closed, ["complete.json", "initialized.json"], seed);
+      assert.equal(r.result, "unknown", seed);
     }
   });
   test(`inspectRun: ${expire} during the final absent-store probe is unknown, never absent`, async t => {

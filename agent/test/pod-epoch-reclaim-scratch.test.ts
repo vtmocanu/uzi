@@ -1397,12 +1397,19 @@ test("#4420 the pass forwards its signal and a finite deadline to the per-attemp
     await settleOutboxRun(rw, RUN_A);
     const bounds: unknown[] = [];
     w.options.scratch!.authority!.peekSlot = (async (_clonePath: string, bound?: unknown) => { bounds.push(bound); return null; }) as never;
+    // Capture the options the pass actually hands the classifier, to compare the slot read's bound against them.
+    const passOpts: Array<{ signal?: unknown; deadline?: unknown } | undefined> = [];
+    const classifier = w.options.scratch!.git.classifyEpochScratchRunRetention!;
+    w.options.scratch!.git = { ...w.options.scratch!.git, classifyEpochScratchRunRetention: (id: string, o: never) => { passOpts.push(o); return classifier(id, o); } } as never;
     const result = await run(w);
     assert.equal(result.scratch.state, "ran");
     assert.equal(bounds.length, 1, "the retired row's slot is read once");
+    assert.equal(passOpts.length, 1, "the classifier is called once");
     const bound = bounds[0] as { signal?: unknown; deadline?: unknown } | undefined;
     assert.ok(bound?.signal instanceof AbortSignal, "the pass's signal is forwarded");
     assert.ok(typeof bound.deadline === "number" && Number.isFinite(bound.deadline), "a finite deadline is forwarded");
+    assert.equal(bound.signal, passOpts[0]?.signal, "the slot read gets the very signal the pass handed the classifier");
+    assert.equal(bound.deadline, passOpts[0]?.deadline, "the slot read gets the very deadline the pass handed the classifier");
   });
 });
 
@@ -1788,15 +1795,19 @@ async function interruptInventoryThroughEpoch(mode: "abort" | "deadline", scenar
     await seedRetiredAttempt(rw, RUN_A);
     const authority = join(fs.realpathSync(rw.fx.dataDir), ".uzi-authority");
     if (scenario === "readdir") await enrollRealAuthority(w, rw, true); else await enrollAheadAuthority(w, rw);
-    let clock = 0, jumpedAt = 0;
+    let clock = 0;
     if (mode === "deadline") {
       w.options.now = () => clock;
       const ownership = w.options.client.getRunOwnership;
       w.options.client.getRunOwnership = async (...args) => {
-        clock = 600_000 - 5000 - EPOCH_DEADLINE_LEFT_MS; jumpedAt = Date.now();
+        clock = 600_000 - 5000 - EPOCH_DEADLINE_LEFT_MS;
         return ownership(...args);
       };
     }
+    // Release against the deadline the inventory actually received, not the jump time.
+    let receivedDeadline: number | undefined;
+    const enrolledPeekAll = w.options.scratch!.authority!.peekAllSlots!;
+    w.options.scratch!.authority!.peekAllSlots = (max, bound) => { receivedDeadline = bound?.deadline; return enrolledPeekAll(max, bound); };
     const ins = instrumentFs(scenario === "readdir" ? { op: "readdir", path: join(authority, "slots"), nth: 1 } : { op: "sleep", path: "", nth: 1 });
     // restore() is idempotent and safe after a partial install.
     try {
@@ -1805,17 +1816,28 @@ async function interruptInventoryThroughEpoch(mode: "abort" | "deadline", scenar
       let settled = false;
       pass.then(() => { settled = true; }, () => { settled = true; });
       try {
-        let reachTimer: ReturnType<typeof setTimeout> | undefined;
         try {
-          await Promise.race([ins.reached, new Promise<void>((_, reject) => {
-            reachTimer = setTimeout(() => reject(new Error("the held operation was never reached")), 10_000);
-          })]);
-        } finally { clearTimeout(reachTimer); }
-        if (mode === "abort") w.parent.abort();
-        else while (Date.now() - jumpedAt < EPOCH_DEADLINE_LEFT_MS + 400) await new Promise(resolve => setTimeout(resolve, 50));
-        for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve));
-        assert.equal(settled, false, "epoch handover waits: the pass does not resolve while the started operation is in flight");
-      } finally { ins.release(); }
+          let reachTimer: ReturnType<typeof setTimeout> | undefined;
+          try {
+            await Promise.race([ins.reached, new Promise<void>((_, reject) => {
+              reachTimer = setTimeout(() => reject(new Error("the held operation was never reached")), 10_000);
+            })]);
+          } finally { clearTimeout(reachTimer); }
+          if (mode === "abort") w.parent.abort();
+          else {
+            assert.equal(typeof receivedDeadline, "number", "the inventory received a deadline");
+            const until = receivedDeadline! + 400;
+            while (Date.now() < until) await new Promise(resolve => setTimeout(resolve, 50));
+          }
+          for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve));
+          assert.equal(settled, false, "epoch handover waits: the pass does not resolve while the started operation is in flight");
+        } finally { ins.release(); }
+      } catch (error) {
+        // Join the pass before fixture teardown, and surface the ORIGINAL failure, not a settlement error.
+        w.parent.abort();
+        await pass.catch(() => {});
+        throw error;
+      }
       const result = (await pass)!; // a PodEpochSettlementError would reject here and fail the test; it is not caught
       const after = ins.log.slice(ins.state.heldIndex + 1).filter(r => r.op === "sleep" || r.path.startsWith(authority));
       assert.deepEqual(after.filter(r => r.op !== "close"), [], "no inventory operation starts after the held one");
@@ -1882,17 +1904,24 @@ async function interruptMaintenanceThroughEpoch(mode: "abort" | "deadline") {
       let settled = false;
       pass.then(() => { settled = true; }, () => { settled = true; });
       try {
-        let reachTimer: ReturnType<typeof setTimeout> | undefined;
         try {
-          await Promise.race([ins.reached, new Promise<void>((_, reject) => {
-            reachTimer = setTimeout(() => reject(new Error("the held maintenance read was never reached")), 10_000);
-          })]);
-        } finally { clearTimeout(reachTimer); }
-        if (mode === "abort") w.parent.abort();
-        else while (Date.now() - jumpedAt < EPOCH_DEADLINE_LEFT_MS + 400) await new Promise(resolve => setTimeout(resolve, 50));
-        for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve));
-        assert.equal(settled, false, "epoch handover waits: the pass does not resolve while the started read is in flight");
-      } finally { ins.release(); }
+          let reachTimer: ReturnType<typeof setTimeout> | undefined;
+          try {
+            await Promise.race([ins.reached, new Promise<void>((_, reject) => {
+              reachTimer = setTimeout(() => reject(new Error("the held maintenance read was never reached")), 10_000);
+            })]);
+          } finally { clearTimeout(reachTimer); }
+          if (mode === "abort") w.parent.abort();
+          else while (Date.now() - jumpedAt < EPOCH_DEADLINE_LEFT_MS + 400) await new Promise(resolve => setTimeout(resolve, 50));
+          for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve));
+          assert.equal(settled, false, "epoch handover waits: the pass does not resolve while the started read is in flight");
+        } finally { ins.release(); }
+      } catch (error) {
+        // Join the pass before fixture teardown, and surface the ORIGINAL failure, not a settlement error.
+        w.parent.abort();
+        await pass.catch(() => {});
+        throw error;
+      }
       const result = (await pass)!;
       const mine = ins.log.filter(r => r.path.startsWith(root));
       assert.equal(mine.some(r => r.op === "open" && r.path === join(root, "initialized.json")), false, "initialized.json is never opened");

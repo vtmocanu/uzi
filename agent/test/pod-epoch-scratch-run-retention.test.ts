@@ -458,23 +458,30 @@ describe("attempt footprint and authority slot (a retired ledger entry is ended 
     }
   });
 
-  it("authority inventory: the pass's signal and deadline reach the accessor, and an interruption mid-read is unknown", async () => {
+  it("authority inventory: the pass's signal and deadline reach the accessor, and an interruption mid-read is unknown", async t => {
     for (const mode of ["abort", "deadline"] as const) {
-      const controller = new AbortController();
-      const deadline = Date.now() + (mode === "abort" ? 60_000 : 500);
-      let received: { signal: AbortSignal; deadline: number } | undefined;
-      const peekAllSlots = async (_max: number, bound?: { signal: AbortSignal; deadline: number }) => {
-        received = bound;
-        if (mode === "abort") controller.abort();
-        else await new Promise((resolve) => setTimeout(resolve, 650));
-        // The production accessor refuses between its reads once the bound is spent.
-        if (bound && (bound.signal.aborted || Date.now() >= bound.deadline)) throw new Error("authority read interrupted");
-        return [];
-      };
-      const result = await classify({ signal: controller.signal, deadline, peekAllSlots });
-      assert.equal(received?.signal, controller.signal, mode);
-      assert.equal(received?.deadline, deadline, mode);
-      assert.deepEqual(result, unknown(mode === "abort" ? "aborted" : "classifier"), mode);
+      // A controlled clock: the budget cannot expire during setup, and expires exactly when the accessor has the bound.
+      let clock = Date.now();
+      const clockMock = t.mock.method(Date, "now", () => clock);
+      try {
+        const controller = new AbortController();
+        const deadline = clock + 60_000;
+        let received: { signal: AbortSignal; deadline: number } | undefined;
+        const peekAllSlots = async (_max: number, bound?: { signal: AbortSignal; deadline: number }) => {
+          received = bound;
+          if (mode === "abort") controller.abort();
+          else clock = deadline + 1;
+          // The production accessor refuses between its reads once the bound is spent.
+          if (bound && (bound.signal.aborted || Date.now() >= bound.deadline)) throw new Error("authority read interrupted");
+          return [];
+        };
+        const result = await classify({ signal: controller.signal, deadline, peekAllSlots });
+        assert.equal(received?.signal, controller.signal, mode);
+        assert.equal(received?.deadline, deadline, mode);
+        assert.deepEqual(result, unknown(mode === "abort" ? "aborted" : "classifier"), mode);
+      } finally {
+        clockMock.mock.restore();
+      }
     }
   });
 
