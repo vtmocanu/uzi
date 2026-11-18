@@ -71,9 +71,16 @@ func TestVendorIssueClaimGoldenLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, key := range []string{`"agents":[`, `"skills":[`, `"skills_dropped":[`} {
-		if !strings.Contains(string(full), key) {
-			t.Fatalf("vendor claim wire lacks %s (null or missing): %s", key, full)
+	// Check the TOP-LEVEL keys only: each agent carries its own "skills" array, so a substring
+	// search over the whole payload would be satisfied by an agent's field.
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(full, &top); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"agents", "skills", "skills_dropped"} {
+		raw, ok := top[key]
+		if !ok || len(raw) == 0 || raw[0] != '[' {
+			t.Fatalf("vendor claim wire top-level %q is not an array (null or missing): %s", key, raw)
 		}
 	}
 	norm := *payload
