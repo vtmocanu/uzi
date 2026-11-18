@@ -420,7 +420,7 @@ control is still absent, not that the functional criterion was deferred.
 | Post-switch release epoch and secret-hash authorization | B5/B6 preservation sensitivity controls below, through real worker apply and release routes; U9 credits the final reauthorization's presence (b) and placement after the material read (c) against a switch apply committed between the two authorizations (subscription A release path, service level); the API-key A path and the vault-locked branch after a switch not controlled |
 | Transactional frozen binding rewrite, capability revoke/remint and post-commit material response | U10 credits the zero-row fences (binding, mint redundant ×3, journal, stamp, message, last_seq), the commit-error check, material returned only after commit (c) and the persisted new hash, with the existing error-injection rollback test; A's refusal after remint by B5/B6; per-statement server-error returns (argued equivalent), the empty-AccessToken check and the caller's deferred rollback not separately controlled |
 | Ordinal-zero baseline, successor journal ordinal/capability relation and usage attribution | U11 credits typed baseline-missing and baseline-match refusals (preflight), exact ordinal N+1 and its restart per generation, journal epoch independence from the ordinal, and B usage attribution via the preserved clamp (b); per-field baseline comparisons, the epoch<=0 refusal, the uncommitted-ordinal and generation-scope clamp branches on the Codex path, and cross-generation spend joins not controlled |
-| Atomic rollback, lost-reply replay, stale/foreign apply and target fences | Unvalidated |
+| Atomic rollback, lost-reply replay, stale/foreign apply and target fences | U10 rollback; U12 credits the Codex replay answer and its redundant no-material copies, the new-generation replay fence (b), nonce/generation/released/status fence conjuncts, op mismatch, target mismatch and both target-moved checks (preflight/apply); foreign-worker refusal positive only (a233 ownership query), Step 1 worker check, apply Step 0 copies, harness/user conjuncts and old-alias refusals not controlled |
 | Stopped-support negotiation, immutable expected-epoch latch and unsupported-response obligation | Unvalidated |
 | Stopped numeric epoch equality: stale/mismatched running and paused, applied successor | D controls: five individually executed cases above |
 | Stopped pending-input exclusion for eight named kinds in running and paused states | D controls: sixteen individually executed cases above; other control flags/cutoffs unvalidated |
@@ -2674,3 +2674,89 @@ surfaced through the primary key). The generation test's first-generation-row
 and post-mint-epoch assertions are positive only (no control changes them; the
 epoch is read from the same column the insert reads). The (b) clamp control
 rests on a233 code identity; a233 has no Codex path to execute.
+
+### U12 — rollback, lost-reply replay, stale or foreign apply and target fences (2026-11-18)
+
+Baselines. The shared apply path's Step 1 replay check is old:
+`git show a233883de3c36bae2e940f999cd9d582889dad00:api/internal/workersvc/credential_switch_apply.go`
+:302 reads `if prior.ClaimGeneration != gen || !prior.WorkerID.Valid ||
+uuid.UUID(prior.WorkerID.Bytes) != wkr.ID { return fenced, nil }`, identical at
+the candidate (credential_switch_apply.go :322), so its control is a (b)
+preservation sensitivity control on the new Codex replay. The Codex replay
+branch (`if run.Harness == harnessCodex { return … RefusedCommitted, Reason:
+applyReasonCredentialChanged }`, :325–327) and the Codex validator
+(credential_switch_codex.go, absent at a233; a233 refused every live Codex
+switch, runner.ts :25735–25738) are new: class (d).
+
+Mechanism (candidate). `ApplyCredentialSwitch` takes worker then run locks in
+`beginClaimMutation` (credential_switch_apply.go :288; a run the worker does
+not own fails there with `ErrRunNotOwned`), applies the Step 0 fence (:297–316),
+then Step 1 looks up a journal row for the op (:319–331): a row from another
+generation or worker is fenced; a Codex row answers `refused_committed` /
+`credential_changed` without material (:325–327). Otherwise the Codex
+validator `validateCodexSwitchLocked` repeats the fence (`codexSwitchFence`,
+credential_switch_codex.go :322–329), refuses a different pending op
+(:124–129, `superseded` / `no_pending_switch`), a target mismatch (:139–143)
+and a moved target (material revision :200–203; account revision :261–263).
+Rollback of partial writes is U10's (`TestCodexApplyWriteRollbackLiveDB`,
+`TestCodexApplyZeroRowWriteRollbackLiveDB`, both green here).
+
+New tests (2c5e02296; 02f2933a0 review rework):
+api/internal/workersvc/credential_switch_codex_apply_foreign_livedb_test.go.
+`TestCodexApplyForeignWorkerFencedLiveDB`: a second worker of the same user
+applies the pending op: `ErrRunNotOwned`, no material (:27), its preflight is
+fenced (:32), no writes; the owner then applies (:36).
+`TestCodexReplayCommittedOpUnderNewGenerationFencedLiveDB`: after a committed
+switch and a fresh recovery claim (the fixture moves the run to running, as the
+first generation does, so the live-status fence passes), the original op
+replayed with the new generation must be fenced (:93) with no writes (:96).
+The first form left the run `claimed`, so the status fence decided and the
+u12-replay-gen mutant survived (`u12-replay-gen.status-fenced.log`, EXIT=0);
+02f2933a0 fixed the fixture. 02f2933a0 also pins the Codex replay reason in
+`TestCodexApplyCommittedLostReplyLiveDB`
+(credential_switch_codex_apply_lostreply_livedb_test.go :55–56); before that,
+u12-replay-codex survived because the shared Anthropic replay also refused
+(`u12-replay-codex.pre-reason.log`, EXIT=0).
+
+Command (export of 02f2933a0, throwaway postgres `cdr-4202-u12pg`): from api,
+`GOFLAGS='-p=1 -buildvcs=false' GOMAXPROCS=4 go test -race -count=1 -timeout=6m
+./internal/workersvc -run '<selection>' -v`; diffs and logs
+`.uzi/scratch/ctl-logs/<log name>.{diff,log}`. Preflight leaves are
+`TestCodexSwitchPreflightLiveDB` (credential_switch_codex_livedb_test.go,
+assertion :135).
+
+| Control | Kind | Mutation | Selection | Red at |
+|---|---|---|---|---|
+| u12-replay-codex | (d) guard | Codex replay branch `if run.Harness == harnessCodex {` → `if false && …` (credential_switch_apply.go :325) | lost-reply | lostreply :56 "committed Codex replay reason = \"credential_gone\", want \"credential_changed\"" |
+| u12-replay-nomaterial | redundant-fence guard (decision 9) | (i) kind filter `AND kind = 'anthropic_token'` dropped from `LockAnthropicSecretForApply` (generated runtime.sql.go :16533) alone; (ii) with the Codex branch also removed | lost-reply | (i) EXIT=0 (`u12-replay-kind-only`); (ii) lostreply :51 "committed retry returned or reminted authority" (`u12-replay-nomaterial-both`): with neither copy, the shared Anthropic replay hands back the Codex secret |
+| u12-replay-gen | (b) **preservation sensitivity control** | `prior.ClaimGeneration != gen ||` → `false && …` (:322) | new-generation replay | foreign test :93 "committed op replayed under a new generation was not fenced: [outcome=refused_committed …]" |
+| u12-fence-nonce | (d) guard | nonce conjunct of `codexSwitchFence` → `true` (:325) | preflight stale_nonce | :135 "Outcome:ready … want fenced" |
+| u12-fence-gen | (d) guard | generation conjunct → `true` (:327) | preflight stale_generation | :135 "Outcome:not_applied Reason:generation_mismatch … want fenced" (the later stamp-generation check still refused, with the wrong outcome) |
+| u12-fence-released | (d) guard | released conjunct → `true` (:327) | preflight released | :135 "Outcome:ready … want fenced" |
+| u12-fence-status | (d) guard | live-status conjunct → `true` (:328) | preflight claimed | :135 "Outcome:ready … want fenced" |
+| u12-op-mismatch | (d) guard | op inequality → `false && …` (:124) | preflight wrong_operation | :135 "Outcome:ready … want superseded" |
+| u12-target-mismatch | (d) guard | target secret id and validity checks → `false && …` (:139) | preflight foreign_target, wrong_target | :135 "want not_applied/target_mismatch" (foreign: "credential_gone"; wrong: "Outcome:ready") |
+| u12-target-moved-rev | (d) guard | target material-revision check → `false && (…)` (:201) | target-moved API key leaf | apply test :168 "preflight accepted moved target {… ready …}" |
+| u12-target-moved-acct | (d) guard | target account-revision check → `false && (…)` (:262) | target-moved subscription leaf | apply test :168, as above |
+
+Unchanged candidate 02f2933a0: preflight, target-moved, lost-reply, the two
+new tests, write-rollback and zero-row pass, EXIT=0
+(`.uzi/scratch/ctl-logs/u12-green.log`); `task lint:api` 0 issues
+(`u12-lint-api.log`).
+
+Credit: a committed Codex op replayed in its own generation answers
+`refused_committed`/`credential_changed` and never returns material (the Codex
+branch and the Anthropic replay's kind filter are redundant copies of the
+no-material property); replayed under a new generation it is fenced (preserved
+check); a stale nonce, stale generation, released claim or non-live status
+fences the validator; a different pending op is superseded; a foreign or wrong
+target is refused `target_mismatch`; a target whose material or account
+revision moved after preflight is refused `target_moved`; partial writes roll
+back (U10). Not credited: the foreign-worker refusal (decided by the a233
+ownership query in `beginClaimMutation`, not by `codexSwitchFence`'s worker
+conjunct; only positive here), the Step 1 worker check (unreachable in a live
+generation without a reclaim), the apply path's own Step 0 copies for Codex
+(the validator copies are controlled through preflight; Step 0 is shared with
+the Anthropic path), the harness/user/lane conjuncts (lane: D64–D73 for the
+stopped route), old-alias `credential_changed`/`credential_gone` refusals
+(:208–217, :239–244), and apply-route reds for the validator conjuncts.
