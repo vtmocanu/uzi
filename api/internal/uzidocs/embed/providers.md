@@ -146,7 +146,7 @@ It does not park or retry.
 
 ### Usage and cost
 
-A run card names the provider the run used (or "(deleted)" if it was deleted since), shows no
+A run card names the provider the run used (or "(name unavailable)" when the name is not known for that view, for example after the provider was deleted), shows no
 Anthropic token for it, and hides the credential override. Usage and cost show as **unknown** for provider runs: the model names are the gateway's, so the
 vendor price table does not apply. Token counts are still recorded, and run, time and
 concurrency limits still apply.

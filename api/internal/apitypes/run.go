@@ -807,10 +807,12 @@ type RunDTO struct {
 	// ProviderID / ProviderName name the custom model provider the run is bound to (PRD #4320).
 	// ProviderID is the run's bound provider id (a run carries no foreign key to the provider,
 	// so it outlives a deleted provider); null for a run on the vendor's own API. ProviderName is
-	// the provider's CURRENT name, resolved under the run's owner, and is null for a vendor run
-	// and for a run whose provider has since been deleted. The name is USER-AUTHORED text: render
-	// it as plain text (the CLI through cellText/renderer.Plain, the web escaped). Owner-or-admin
-	// scoped like the Anthropic label above; never added to the shared board DTO.
+	// the provider's CURRENT name, resolved under the run's owner. A null ProviderName means a
+	// vendor run (ProviderID also null) OR that the name was not resolved for this response
+	// (provider deleted, lookup failed, or a mutation response that does not resolve names), so
+	// a client must not read null-name-with-id as "deleted". The name is USER-AUTHORED text:
+	// render it as plain text (the CLI through cellText/renderer.Plain, the web escaped).
+	// Owner-or-admin scoped like the Anthropic label above; never added to the shared board DTO.
 	ProviderID   *string `json:"provider_id"`
 	ProviderName *string `json:"provider_name"`
 	// AnthropicSelectReason is the MODE that named that credential, and it is why
@@ -1769,10 +1771,12 @@ type RunSummaryItemDTO struct {
 	// ProviderID / ProviderName name the custom model provider the run is bound to (PRD #4320).
 	// ProviderID is the run's bound provider id (a run carries no foreign key to the provider,
 	// so it outlives a deleted provider); null for a run on the vendor's own API. ProviderName is
-	// the provider's CURRENT name, resolved under the run's owner, and is null for a vendor run
-	// and for a run whose provider has since been deleted. The name is USER-AUTHORED text: render
-	// it as plain text (the CLI through cellText/renderer.Plain, the web escaped). Owner-or-admin
-	// scoped like the Anthropic label above; never added to the shared board DTO.
+	// the provider's CURRENT name, resolved under the run's owner. A null ProviderName means a
+	// vendor run (ProviderID also null) OR that the name was not resolved for this response
+	// (provider deleted, lookup failed, or a mutation response that does not resolve names), so
+	// a client must not read null-name-with-id as "deleted". The name is USER-AUTHORED text:
+	// render it as plain text (the CLI through cellText/renderer.Plain, the web escaped).
+	// Owner-or-admin scoped like the Anthropic label above; never added to the shared board DTO.
 	ProviderID   *string `json:"provider_id"`
 	ProviderName *string `json:"provider_name"`
 	// AnthropicSelectReason is the MODE that named that credential, and it is why

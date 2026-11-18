@@ -376,6 +376,27 @@ describe("Providers — Claude source (PRD #4320 M7)", () => {
     expect(within(row).queryByRole("button", USE)).toBeNull();
   });
 
+  it("shows the PUT response's source even when the settings reload fails", async () => {
+    mockApi.setClaudeProviderSource.mockResolvedValue({ claude_provider_id: "p1" });
+    await renderCard();
+    const row = await screen.findByTestId("provider-p1");
+    mockApi.getMySettings.mockRejectedValue(new Error("boom"));
+    fireEvent.click(within(row).getByRole("button", USE));
+    await waitFor(() => expect(mockApi.getMySettings).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.getByTestId("claude-source").textContent).toMatch(/Current Claude source: team-gateway/));
+    expect(within(row).getByText("Claude source")).toBeTruthy();
+  });
+
+  it("disables Delete on the current Claude source and says why", async () => {
+    mockApi.getMySettings.mockResolvedValue({ settings: { claude_provider_id: "p1" } } as never);
+    await renderCard();
+    const row = await screen.findByTestId("provider-p1");
+    await waitFor(() => expect(screen.getByTestId("delete-blocked-p1").textContent).toMatch(/Stop using it before you delete it/));
+    const del = within(row).getByRole("button", { name: "Delete" }) as HTMLButtonElement;
+    expect(del.disabled).toBe(true);
+    expect(del.title).toMatch(/Stop using it before you delete it/);
+  });
+
   it("Stop using reverts to Anthropic", async () => {
     mockApi.getMySettings.mockResolvedValue({ settings: { claude_provider_id: "p1" } } as never);
     mockApi.setClaudeProviderSource.mockResolvedValue({ claude_provider_id: null });

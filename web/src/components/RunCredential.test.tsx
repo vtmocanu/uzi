@@ -52,9 +52,10 @@ describe("RunCredential provider branch (PRD #4320 M7)", () => {
     expect(screen.queryByText(/deleted/)).toBeNull();
   });
 
-  it.each(["full", "compact"] as const)("%s: a deleted provider (null name) says so", (variant) => {
+  it.each(["full", "compact"] as const)("%s: an unresolved provider name (null name, id set) is not called deleted", (variant) => {
     render(<RunCredential run={provider("prov-1", null)} variant={variant} />);
-    expect(screen.getByText(/\(deleted\)/)).toBeTruthy();
+    expect(screen.getByText(/\(name unavailable\)/)).toBeTruthy();
+    expect(screen.queryByText(/deleted/)).toBeNull();
     expect(screen.queryByText(/console-key/)).toBeNull();
   });
 

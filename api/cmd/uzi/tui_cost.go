@@ -251,10 +251,11 @@ func runCostDetailCell(r apitypes.RunDTO) string {
 }
 
 // providerCell is the PROVIDER row/column text: the provider's current name as plain text (it is
-// user-authored), or "(deleted)" when the provider row is gone and only the run's id remains.
+// user-authored), or "(name unavailable)" when only the run's id is known: a null name does not
+// prove deletion (mutation responses and failed lookups leave it null too).
 func providerCell(r apitypes.RunDTO) string {
 	if r.ProviderName == nil || *r.ProviderName == "" {
-		return "(deleted)"
+		return "(name unavailable)"
 	}
 	return cellText(*r.ProviderName)
 }

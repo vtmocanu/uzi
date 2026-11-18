@@ -38,10 +38,11 @@ func TestRunGetProviderRun(t *testing.T) {
 		t.Errorf("provider name reached the terminal raw:\n%q", out)
 	}
 
-	// The provider was deleted: the id survives, the name is null.
+	// The id survives but the name was not resolved (deleted provider, failed lookup, or a
+	// mutation response): null must never be read as a claim of deletion.
 	out = renderDetail(t, providerRun(nil, unreportedUsage()))
-	if !strings.Contains(out, "PROVIDER") || !strings.Contains(out, "(deleted)") {
-		t.Errorf("deleted provider not shown:\n%s", out)
+	if !strings.Contains(out, "PROVIDER") || !strings.Contains(out, "(name unavailable)") || strings.Contains(out, "(deleted)") {
+		t.Errorf("unresolved provider name not shown as unavailable:\n%s", out)
 	}
 
 	// A vendor run is unchanged: no provider row, the generic unavailable wording.
@@ -80,8 +81,8 @@ func TestTUIProviderRunCost(t *testing.T) {
 		t.Errorf("board cost = %q, want n/a", s)
 	}
 	item.ProviderName = nil
-	if got := board.boardCredLabel(item); got != "(deleted)" {
-		t.Errorf("deleted provider credential column = %q", got)
+	if got := board.boardCredLabel(item); got != "(no name)" {
+		t.Errorf("unresolved provider credential column = %q", got)
 	}
 
 	// A hostile name never reaches the board raw.

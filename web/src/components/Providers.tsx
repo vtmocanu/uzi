@@ -259,6 +259,8 @@ function AuthStyleSelect({
 
 type RunFn = (fn: () => Promise<unknown>, notice: string, fallback: string, refresh?: boolean) => Promise<boolean>;
 
+const DELETE_SOURCE_REASON = "This is your Claude source. Stop using it before you delete it.";
+
 type Panel = "edit" | "endpoint" | "key" | null;
 
 function ProviderRow({
@@ -268,6 +270,7 @@ function ProviderRow({
   run,
   onProbe,
   isSource,
+  onSource,
 }: {
   provider: ProviderDTO;
   allowed: string[];
@@ -275,6 +278,7 @@ function ProviderRow({
   run: RunFn;
   onProbe: (id: string, probe: ProviderProbe) => void;
   isSource: boolean;
+  onSource: (id: string | null) => void;
 }) {
   const p = provider;
   const uid = useId();
@@ -414,7 +418,11 @@ function ProviderRow({
             size="sm"
             disabled={rowBusy}
             onClick={() =>
-              void run(() => api.setClaudeProviderSource(null), "Claude runs use Anthropic again.", "Failed to stop using the provider")
+              void run(
+                async () => onSource((await api.setClaudeProviderSource(null)).claude_provider_id),
+                "Claude runs use Anthropic again.",
+                "Failed to stop using the provider",
+              )
             }
           >
             Stop using
@@ -426,7 +434,7 @@ function ProviderRow({
             title={blocked ?? undefined}
             onClick={() =>
               void run(
-                () => api.setClaudeProviderSource(p.id),
+                async () => onSource((await api.setClaudeProviderSource(p.id)).claude_provider_id),
                 "This provider is now your Claude source.",
                 "Failed to use the provider",
               )
@@ -487,10 +495,19 @@ function ProviderRow({
             Retire
           </Button>
         )}
-        <Button size="sm" variant="danger" disabled={rowBusy} onClick={() => setConfirmDelete(true)}>
+        <Button
+          size="sm"
+          variant="danger"
+          disabled={rowBusy || isSource}
+          title={isSource ? DELETE_SOURCE_REASON : undefined}
+          onClick={() => setConfirmDelete(true)}
+        >
           Delete
         </Button>
       </div>
+      {isSource && (
+        <p className="text-xs text-faint" data-testid={`delete-blocked-${p.id}`}>{DELETE_SOURCE_REASON}</p>
+      )}
       {!isSource && blocked && (
         <p className="text-xs text-faint" data-testid={`source-blocked-${p.id}`}>{blocked}</p>
       )}
@@ -747,6 +764,7 @@ export function Providers() {
                   run={run}
                   onProbe={onProbe}
                   isSource={sourceId === p.id}
+                  onSource={setSourceId}
                 />
               ))}
             </ul>

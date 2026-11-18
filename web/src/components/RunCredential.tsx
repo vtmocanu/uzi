@@ -58,22 +58,24 @@ export function RunCredential({
 }) {
   // PRD #4320: a run bound to a custom model provider names the provider, never an
   // Anthropic token (it spent none). provider_name is user-authored text: sanitized like a
-  // label and rendered as escaped JSX. null name with an id means the provider was deleted.
+  // label and rendered as escaped JSX. A null name with an id only means the name was not
+  // resolved for this response (deleted, failed lookup, or a mutation response), so it is
+  // never presented as a deletion.
   if (run.provider_id) {
     const name = run.provider_name ? sanitizeLabel(run.provider_name) : null;
-    const gone = name === null;
-    const title = gone
-      ? "This run used a custom model provider that has since been deleted."
+    const unresolved = name === null;
+    const title = unresolved
+      ? "This run used a custom model provider; its name is not available here."
       : `This run used the custom model provider “${name}”, not an Anthropic token.`;
     return variant === "compact" ? (
       <Badge tone="info" title={title}>
-        <span className="max-w-[12rem] truncate">{gone ? "provider" : name}</span>
-        {gone && " (deleted)"}
+        <span className="max-w-[12rem] truncate">{unresolved ? "provider" : name}</span>
+        {unresolved && " (name unavailable)"}
       </Badge>
     ) : (
       <Badge tone="info" wrap title={title}>
-        provider {!gone && <>“<span className="font-semibold">{name}</span>”</>}
-        {gone && "(deleted)"}
+        provider {!unresolved && <>“<span className="font-semibold">{name}</span>”</>}
+        {unresolved && "(name unavailable)"}
       </Badge>
     );
   }

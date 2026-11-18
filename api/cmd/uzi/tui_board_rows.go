@@ -406,8 +406,13 @@ func (m tuiModel) boardAccountCols(rows []apitypes.RunListItemDTO) boardAccountC
 func (m tuiModel) boardCredLabel(r apitypes.RunListItemDTO) string {
 	if isProviderRun(r.RunDTO) {
 		// A provider run has no Anthropic token: the column names the provider (plain text, it is
-		// user-authored), or "(deleted)" once the provider row is gone.
-		return clampVisual(m.renderer.Plain(providerCell(r.RunDTO), boardCredWidth), boardCredWidth)
+		// user-authored), or the short "(no name)" when only the id is known: the column is
+		// boardCredWidth wide, which "(name unavailable)" would clamp. Never claims deletion.
+		cell := "(no name)"
+		if r.ProviderName != nil && *r.ProviderName != "" {
+			cell = providerCell(r.RunDTO)
+		}
+		return clampVisual(m.renderer.Plain(cell, boardCredWidth), boardCredWidth)
 	}
 	var label, id *string
 	count := 0
