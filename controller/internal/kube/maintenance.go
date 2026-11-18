@@ -212,9 +212,15 @@ func (m *Materializer) reconcileDinD(ctx context.Context, w protocol.DesiredWork
 			// Permission to reconcile an unchanged worker is not roll admission.
 			// A fresh list may also find a different same-name Deployment: neither
 			// can reuse the earlier decision. Let the next tick plan and reserve it.
-			if e := rollFrom(ctx, w.ID); !m.drain.ForceRoll &&
-				(e == nil || !e.admitted || !e.drift || e.marker == nil || e.dep == nil || string(e.dep.UID) != o.DeploymentUID) {
-				return true, nil
+			if e := rollFrom(ctx, w.ID); !m.drain.ForceRoll {
+				if e == nil || !e.admitted || !e.drift || e.marker == nil || e.dep == nil || string(e.dep.UID) != o.DeploymentUID {
+					return true, nil
+				}
+				// Use the reservation from the same fresh read as the patch RV.
+				// Status updates may advance RV, but cancellation must still fence us.
+				if o.MaintenanceRollAnnotation == "" || o.MaintenanceRollAnnotation != e.dep.Annotations[annotationRoll] {
+					return true, nil
+				}
 			}
 			return true, m.reconcileReplacement(ctx, w, o)
 		}
