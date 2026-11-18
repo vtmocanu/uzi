@@ -74,39 +74,50 @@ func (x codexLockOrderFixture) wantBusy(t *testing.T, ctx context.Context, leaf 
 	})
 }
 
-// codexLockTimeoutBeginner bounds every lock wait in apply's transaction with a
-// test-only lock_timeout, set right after the service's isolation statement.
-// A NOWAIT refusal is unaffected; a guard-removed mutant that would WAIT on a
-// held row instead fails fast with SQLSTATE 55P03 from that later statement,
-// surfacing as an apply error at the busy-decision assertion, not a test deadline.
-type codexLockTimeoutBeginner struct{ TxBeginner }
+// codexStatementTimeoutBeginner bounds every statement in apply's transaction
+// with a test-only statement_timeout, set right after the service's isolation
+// statement. A NOWAIT refusal (SQLSTATE 55P03) returns at once and maps to
+// credential_busy. Any WAIT on a held row — at a preflight lock statement whose
+// NOWAIT was removed, or at a later statement such as a foreign-key check —
+// is cancelled with SQLSTATE 57014, which codexSwitchReadFailure does NOT map
+// to busy, so it surfaces as an apply error at the busy-decision assertion.
+// (lock_timeout would not do: its expiry is also 55P03 and would read as busy.)
+type codexStatementTimeoutBeginner struct {
+	TxBeginner
+	armed *int
+}
 
-type codexLockTimeoutTx struct{ pgx.Tx }
+type codexStatementTimeoutTx struct {
+	pgx.Tx
+	armed *int
+}
 
-func (b codexLockTimeoutBeginner) Begin(ctx context.Context) (pgx.Tx, error) {
+func (b codexStatementTimeoutBeginner) Begin(ctx context.Context) (pgx.Tx, error) {
 	tx, err := b.TxBeginner.Begin(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return codexLockTimeoutTx{tx}, nil
+	return codexStatementTimeoutTx{Tx: tx, armed: b.armed}, nil
 }
 
-func (tx codexLockTimeoutTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+func (tx codexStatementTimeoutTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
 	tag, err := tx.Tx.Exec(ctx, sql, args...)
 	if err == nil && strings.HasPrefix(sql, "SET TRANSACTION ISOLATION LEVEL") {
-		if _, err := tx.Tx.Exec(ctx, "SET LOCAL lock_timeout = '1s'"); err != nil {
+		if _, err := tx.Tx.Exec(ctx, "SET LOCAL statement_timeout = '1s'"); err != nil {
 			return tag, err
 		}
+		*tx.armed++
 	}
 	return tag, err
 }
 
 // A held alias row or enablement row, on either side, must make NOWAIT return
 // the public busy decision with no writes; the same request then applies. A
-// successful blocker Scan is the readiness barrier. Apply's lock waits are
-// bounded by codexLockTimeoutBeginner, so a removed NOWAIT guard fails at an
-// assertion even when apply would otherwise block on a later statement (for
-// example the runs.codex_secret_id foreign-key check on B's user_secrets row).
+// successful blocker Scan is the readiness barrier. Apply's statements are
+// bounded by codexStatementTimeoutBeginner, so apply waiting on the held row
+// anywhere (a blocking lock in place of NOWAIT, or a later statement such as the
+// runs.codex_secret_id foreign-key check on B's user_secrets row) fails at the
+// busy assertion with an error instead of reading as busy or hitting the deadline.
 func TestCodexApplyAliasRowContentionLiveDB(t *testing.T) {
 	const aliasSQL = "SELECT user_secret_id FROM codex_credential_state WHERE user_secret_id=$1 AND user_id=$2 FOR UPDATE"
 	const enablementSQL = "SELECT id FROM user_secrets WHERE id=$1 AND user_id=$2 FOR UPDATE"
@@ -122,7 +133,8 @@ func TestCodexApplyAliasRowContentionLiveDB(t *testing.T) {
 	} {
 		t.Run(leaf.name, func(t *testing.T) {
 			x := newCodexLockOrderFixture(t)
-			x.f.svc.SetTxBeginner(codexLockTimeoutBeginner{x.f.env.pool})
+			armed := 0
+			x.f.svc.SetTxBeginner(codexStatementTimeoutBeginner{TxBeginner: x.f.env.pool, armed: &armed})
 			held := x.aliasA
 			if leaf.target {
 				held = x.aliasB
@@ -140,6 +152,9 @@ func TestCodexApplyAliasRowContentionLiveDB(t *testing.T) {
 				t.Fatalf("%s: blocker not ready", leaf.name)
 			}
 			x.wantBusy(t, ctx, leaf.name)
+			if armed == 0 {
+				t.Fatalf("%s: statement_timeout was never armed in apply's transaction", leaf.name)
+			}
 			if x.snapshot() != before {
 				t.Fatalf("%s: contended apply changed account, intent or alias state", leaf.name)
 			}
