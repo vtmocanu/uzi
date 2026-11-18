@@ -1380,8 +1380,7 @@ async function assertRejectedRecordKeepsLeaf(prepare: (rw: RunWorld, dir: string
     const dir = await settleOutboxRun(rw, RUN_A);
     await prepare(rw, dir);
     const next = await restartOutbox(w, rw);
-    assert.equal(next.hasLoadRejectedRecords(RUN_A), true, label);
-    assert.equal(next.hasLoadRejectedRecords(RUN_A.toUpperCase()), true, `${label} (case-insensitive)`);
+    // The behaviour first (so the unfixed code fails on the deletion, not on the accessor), then the accessor.
     const result = await run(w);
     assert.equal(result.scratch.state, "ran", label);
     assert.deepEqual(keptRun(result), { run_local_unknown: 1 }, label);
@@ -1389,6 +1388,8 @@ async function assertRejectedRecordKeepsLeaf(prepare: (rw: RunWorld, dir: string
     assert.deepEqual(w.calls.discards, [], label);
     assert.equal(result.scratch.deleted, 0, label);
     await untouched(w, [leafOf(RUN_A)]);
+    assert.equal(next.hasLoadRejectedRecords(RUN_A), true, label);
+    assert.equal(next.hasLoadRejectedRecords(RUN_A.toUpperCase()), true, `${label} (case-insensitive)`);
   });
 }
 
@@ -1403,6 +1404,24 @@ test("#4420 restart: a manifest or finalize record that init rejected keeps the 
   }, "manifest with a wrong mac");
   await assertRejectedRecordKeepsLeaf((_rw, dir) => { fs.writeFileSync(join(dir, "finalize-1.json"), JSON.stringify({ version: 1, mac: WRONG_MAC })); }, "finalize with a wrong mac");
   await assertRejectedRecordKeepsLeaf((_rw, dir) => { fs.rmSync(join(dir, "manifest.json")); fs.mkdirSync(join(dir, "manifest.json")); }, "a directory in place of the manifest");
+  // Authentic but cross-run: another run's valid manifest copied into this run's directory.
+  await assertRejectedRecordKeepsLeaf(async (rw, dir) => {
+    const other = await settleOutboxRun(rw, RUN_B);
+    fs.copyFileSync(join(other, "manifest.json"), join(dir, "manifest.json"));
+  }, "cross-run manifest");
+});
+
+test("#4420 restart: undrained messages kept under an upper-case alias of the run id keep the lowercase run leaf active", FD_ONLY, async () => {
+  await withRunWorld([leafOf(RUN_A)], async (w, rw) => {
+    await seedRetiredAttempt(rw, RUN_A);
+    await rw.outbox.appendSegment(RUN_A.toUpperCase(), 1, [{ seq: 1, kind: "text", payload: { text: "pending" } }]);
+    await restartOutbox(w, rw);
+    const result = await run(w);
+    assert.deepEqual(keptRun(result), { run_local_active: 1 });
+    assert.deepEqual(result.scratch.run_local_sources, { outbox: 1 });
+    assert.deepEqual(w.calls.discards, []);
+    await untouched(w, [leafOf(RUN_A)]);
+  });
 });
 
 test("#4420 restart controls: a valid pending record stays active; an absent run directory and a valid settled run reclaim", FD_ONLY, async () => {
@@ -1606,7 +1625,7 @@ test("#4420 an unreadable local store is run_local_unknown for run leaves while 
 
 test("#4420 an outbox that is missing, disabled or throwing keeps the leaf as run_local_unknown(outbox); an outbox with a record of the run keeps it active", FD_ONLY, async () => {
   const stub = (over: Record<string, unknown>) => ({
-    isDisabled: () => false, unusableRootReason: () => undefined, hasPhysicalTerminalProtection: async () => false, hasLoadRejectedRecords: () => false,
+    isDisabled: () => false, unusableRootReason: () => undefined, hasPhysicalTerminalProtection: async () => false, hasLoadRejectedRecords: () => false, runsWithPending: () => [],
     // listPendingFinalizes (the register's view, capped at 256 entries) is deliberately a truncated empty list here.
     listPendingFinalizes: () => [], listPendingFinalizeGenerations: (_includeTerminal?: boolean) => [], listPublicationRecords: () => [], depthFor: () => undefined, uncleanRuns: () => [], ...over }) as never;
   const unknownCases: Array<[string, unknown]> = [
@@ -1933,7 +1952,7 @@ function endedRunWorld(w: World) {
   const seen = countingServer(w);
   w.options.scratch!.git = { ...w.options.scratch!.git, classifyEpochScratchRunRetention: async () => ({ state: "ended" }) } as never;
   w.options.scratch!.outbox = {
-    isDisabled: () => false, unusableRootReason: () => undefined, hasPhysicalTerminalProtection: async () => false, hasLoadRejectedRecords: () => false,
+    isDisabled: () => false, unusableRootReason: () => undefined, hasPhysicalTerminalProtection: async () => false, hasLoadRejectedRecords: () => false, runsWithPending: () => [],
     listPendingFinalizes: () => [], listPendingFinalizeGenerations: () => [], listPublicationRecords: () => [],
     depthFor: (id: string) => ({ runId: id, pendingMessages: 0, pendingTerminal: 0, staleRetired: 0, since: 0 }), uncleanRuns: () => [],
   } as never;

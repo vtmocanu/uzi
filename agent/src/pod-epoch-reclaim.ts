@@ -114,7 +114,7 @@ export interface PodEpochScratchDeps {
   };
   /** Issue #4420: the worker's outbox (initialised before this pass). Absent or unusable keeps every `run-<uuid>` leaf (`outbox`). */
   outbox?: Pick<Outbox, "isDisabled" | "unusableRootReason" | "hasPhysicalTerminalProtection" | "listPendingFinalizeGenerations" |
-    "listPublicationRecords" | "depthFor" | "uncleanRuns" | "hasLoadRejectedRecords">;
+    "listPublicationRecords" | "depthFor" | "uncleanRuns" | "hasLoadRejectedRecords" | "runsWithPending">;
   /** Worker-wide exclusive-idle proof (bound to terminalMaintenanceProof). */
   quiesce: () => Promise<boolean>;
   /** Startup opt-in parsed by main.ts; permits phase entry, supplies no evidence. */
@@ -409,6 +409,9 @@ async function outboxRetention(outbox: PodEpochScratchDeps["outbox"], runId: str
       // which pendingTerminal already counts; neither is a pending record, so neither is consulted.
       if (depth && (depth.pendingMessages > 0 || depth.pendingTerminal > 0)) return activeRetention("outbox");
     }
+    // depthFor is an exact-key lookup and leaf names are lowercase, so undrained messages kept under a case alias of the
+    // run id are found through the complete list of runs with pending messages, matched case-insensitively.
+    if (outbox.runsWithPending().some(r => r.toLowerCase() === id)) return activeRetention("outbox");
     if (outbox.uncleanRuns().some(r => r.toLowerCase() === id)) return activeRetention("outbox");
     return ENDED;
   } catch { return unknownRetention("outbox"); }
