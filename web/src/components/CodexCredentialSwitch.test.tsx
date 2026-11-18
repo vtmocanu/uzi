@@ -64,7 +64,8 @@ describe("Codex credential switch", () => {
     fireEvent.click(confirm());
     await waitFor(() => expect(onSwitched).toHaveBeenCalledWith(returned));
     expect(api.setRunCredential).toHaveBeenCalledExactlyOnceWith("run-1", { mode: "pinned", secret_id: other.id });
-    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Switch credential" }));
+    // onSwitched runs before submit's finally clears busy; focus returns once busy is false.
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "Switch credential" })));
   });
   it("does not auto-select the first available credential or resolve a missing ID by label", () => {
     render(<SwitchTokenAction run={run({ codex_secret_id: "deleted", codex_secret_label: b.label })} canSteer tokens={[b]} />);
