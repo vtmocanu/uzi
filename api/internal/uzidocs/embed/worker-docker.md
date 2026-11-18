@@ -726,9 +726,10 @@ kept as `bound_intent` indefinitely, and reclaim needs operator action or the
 existing discard paths. Each `intent` binding holds one of the 64 per-bare
 slots, so after 64 kept split retires on one bare a further retire writes no
 binding and takes the unbound in-process removal path described above. The epoch
-examines at most 64 candidates per pass, sorted by uuid, so 64 or more
-permanently kept present parents can starve gone-parent recovery of
-later-sorting uuids.
+fills at most 64 work slots per pass, sorted by uuid. Kept present parents are
+reported as kept without taking a slot, so they cannot starve gone-parent
+recovery; 64 or more earlier-sorting gone parents that keep failing a check can
+still defer later ones.
 
 **Verified-epoch phase.** On a uid-split Docker worker the verified pod-epoch
 pass has a last retire-scratch phase. Nothing writes `settled` any more, so the
@@ -744,7 +745,7 @@ source, restore, custody, quarantine or stopped marker naming it (alias-aware fo
 a worker-owned 0700 parent holding only `clone` with the bound inodes, older than
 the pod-entry fence, no mount or bind at or under it, an idle worker and no
 process holding it. The phase is bounded: 30 s of headroom to start, a 120 s cap,
-20 s minimum per candidate, at most 64 candidates and 2,000,000 helper entries.
+20 s minimum per candidate, at most 64 work slots (kept present parents take none) and 2,000,000 helper entries.
 The helper gets at most min(300 s, phase window - 5 s), so at most about 115 s
 with the 120 s cap. The worker-idle proofs and the run-status and holds read are each
 cancelled 5 s before the phase window ends, keeping a 5 s reserve for joined teardown.

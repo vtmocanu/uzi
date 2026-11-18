@@ -479,9 +479,13 @@ discard paths. Two cap consequences follow:
 - Each `intent` binding holds one of the 64 per-bare binding slots (see Cap). After
   64 kept split retires on one bare, a further retire writes no binding and takes
   the pre-binding unbound in-process removal path on the split pod.
-- The epoch examines at most 64 candidates per pass, sorted by uuid. With 64 or more
-  permanently kept present parents, gone-parent recovery for later-sorting uuids can
-  be starved.
+- The epoch fills at most 64 work slots per pass, sorted by uuid. A present parent
+  whose nomination over the evidence already read is a keep (every present binding
+  phase under C-prime) is reported kept without taking a slot, so kept present
+  parents cannot starve gone-parent recovery. Gone parents still take slots: 64 or
+  more earlier-sorting gone parents that keep failing a later check (`conflict`,
+  `malformed_binding`, `metadata_unresolved`, custody) can still defer later ones
+  (accepted residual).
 
 **The disposal route is retained with no producer.** The epoch's removal machinery
 (`markRemoving`, the `empty-fd` helper, `discardRetireScratchParent`, `reclaimed`
@@ -562,9 +566,10 @@ verdict or reason and reports only a `retire_scratch` block and
   re-checked mid-phase halt it with that token.
 - **Budget.** The phase needs 30 s of admission headroom, is capped at 120 s and
   leaves a 10 s margin before the pass settlement reserve. No new candidate starts
-  with under 20 s left; at most 64 candidates and 2,000,000 helper entries per
-  pass, sorted by uuid, so 64 or more permanently kept present parents can starve
-  gone-parent recovery for later-sorting uuids. A deferral (`budget_deferred`,
+  with under 20 s left; at most 64 work slots and 2,000,000 helper entries per
+  pass, sorted by uuid. Present parents kept at nomination are reported without a
+  slot, so only gone (or workable) parents fill the slots; see the residual under
+  Cap consequences. A deferral (`budget_deferred`,
   `epoch_not_eligible`) never changes the
   verdict, is counted separately from `kept` and leaves the binding untouched.
   The helper gets at most min(300 s, phase window − 5 s); with the 120 s phase cap
@@ -753,7 +758,7 @@ An architect, auditor and reviewer examined two judgments and found no stop.
   (`owner_terminal`, `verified_successor`, `owner_terminal_covered`, `other`) is no
   longer attempted in-process and no epoch path reclaims it; it stays at `intent`
   (`bound_intent`) with no supported remedy in this release (operator action or the
-  existing discard paths). The 64-slot and 64-candidate caps above apply. More
+  existing discard paths). The 64-slot binding cap and the 64 work-slot cap above apply (kept present parents take no work slot). More
   retention, never less. Foreign-orphan retires carry no `attemptId` in
   production, so they are in practice unbound (today's behaviour).
 - Legacy parents, attempt-less retires, the `owner_terminal_covered` class and
