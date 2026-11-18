@@ -579,12 +579,54 @@ describe("compactAttemptLedger keeps cross-bare evidence (#4263)", () => {
       await expectSkipped(c, warns, "deadline");
     });
 
-    it("the seam can only lower a limit: a raised bare limit is ignored", async () => {
+    it("the seam can only lower a limit: a raised deadline is ignored, the production budget still expires", async () => {
       addAt(y, yValue());
-      const { c, warns } = cacheWith({ compactForeignScanForTest: { maxBares: 1_000_000, maxRecords: 1_000_000_000 } });
-      await compactOn(c, y);
-      assert.deepEqual(valuesAt(y), [], "a fixture within the production limits compacts normally");
-      assert.deepEqual(skipReasons(warns), []);
+      let t = 0;
+      const { c, warns } = cacheWith({ compactForeignScanForTest: { deadlineMs: 1e9, now: () => (t += 10_000) } });
+      await expectSkipped(c, warns, "deadline");
+    });
+  });
+
+  describe("an own value no attempt can be attributed to (B1)", () => {
+    const yBinding = (): void => { gitAt(y, ["config", "--local", retireBindingKey(UUID), retireBindingValue(binding())]); };
+    const UNATTRIBUTABLE = ["not json", "{}", "", '{"attemptId":42}'];
+
+    for (const raw of UNATTRIBUTABLE) {
+      it(`survives verbatim next to a foreign binding: ${JSON.stringify(raw)}`, async () => {
+        addAt(bare, raw);
+        yBinding();
+        const { c, warns } = cacheWith();
+        await compactOn(c, bare);
+        assert.deepEqual(skipReasons(warns), []);
+        assert.deepEqual(valuesAt(bare), [raw]);
+      });
+
+      it(`is dropped as before when no other bare holds a binding: ${JSON.stringify(raw)}`, async () => {
+        addAt(bare, raw);
+        addAt(y, entryOf(OTHER_ATTEMPT, "run-y", Y_CLONE));
+        const { c, warns } = cacheWith();
+        await compactOn(c, bare);
+        assert.deepEqual(skipReasons(warns), []);
+        assert.deepEqual(valuesAt(bare), []);
+      });
+    }
+
+    it("all of them survive together, in order, while an identified value of a different attempt is dropped", async () => {
+      const other = JSON.stringify({ attemptId: OTHER_ATTEMPT, state: "future" });
+      for (const raw of ["not json", other, "", "{}"]) addAt(bare, raw);
+      yBinding();
+      const { c } = cacheWith();
+      await compactOn(c, bare);
+      assert.deepEqual(valuesAt(bare), ["not json", "", "{}"]);
+    });
+
+    it("a non-canonical value naming the foreign id survives (the foreign-id clause alone)", async () => {
+      const named = JSON.stringify({ attemptId: ATTEMPT, state: "future" });
+      addAt(bare, named);
+      yBinding();
+      const { c } = cacheWith();
+      await compactOn(c, bare);
+      assert.deepEqual(valuesAt(bare), [named]);
     });
   });
 

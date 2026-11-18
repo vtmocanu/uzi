@@ -18174,10 +18174,16 @@ export class GitCache {
    * bare's lock). A mention written into another bare after that read is outside the guarantee; legitimate writers only write
    * fresh-minted ({@link mintAttemptId}: timestamp, claim generation, 64 random bits) or same-bare attempt ids into their own
    * bare under its lock, so a later foreign mention of an id this bare holds is not a legitimate event.
-   * The foreign scan is BOUNDED ({@link COMPACT_FOREIGN_SCAN_LIMITS}: bares, config bytes, records, a wall-clock deadline) and
+   * While ANY other bare holds a decoded binding, a non-canonical value here that retireIdentifiedAttempt cannot attribute to an
+   * attempt (unparseable, `{}`, a non-string `attemptId`, an empty value) is tainted too: retireCrossBareConflict refuses that
+   * bare's reclaim on exactly such a value. With no foreign binding such values are dropped as usual, and a value identified as
+   * a different attempt is exempt there, so it may be dropped.
+   * The foreign scan is BOUNDED ({@link COMPACT_FOREIGN_SCAN_LIMITS}: bares, config bytes, records, and a 5 s budget checked
+   * before each bare and after each read; a single read is bounded by the git command timeout, not by that budget) and
    * strict (an unlistable, symlinked or non-directory `.git` candidate, an unreadable config, an undecodable or unknown binding
    * set, or a ledger value that cannot be attributed to an attempt all fail it). When it fails, compaction is SKIPPED before any
-   * rewrite (the ledger is byte-identical) and a warning with a fixed reason token is logged.
+   * rewrite (the ledger is byte-identical) and a warning with a fixed reason token is logged. One unreadable or unidentifiable
+   * foreign bare therefore skips compaction worker-wide until it is fixed, the same strictness as the epoch evidence reader.
    * Nothing is rewritten when nothing would change.
    *
    * The rewrite is ATOMIC ({@link rewriteLedgerAtomically}): the full compacted value set lands in
@@ -18240,6 +18246,7 @@ export class GitCache {
       const tainted = (v: string): boolean => {
         const e = parseAttemptLedgerEntry(v);
         if (e !== undefined && v === attemptLedgerValue(e)) return false;
+        if (foreign.hasBinding && retireIdentifiedAttempt(v) === undefined) return true;
         return bindingsUndecodable || boundAttemptIds.some(id => v.includes(id) || retireParsedNamesAttempt(v, id)) ||
           [...foreignIds].some(id => v.includes(id) || retireParsedNamesAttempt(v, id));
       };
@@ -18281,11 +18288,14 @@ export class GitCache {
    * ({@link COMPACT_FOREIGN_SCAN_LIMITS}, possibly lowered by the test seam): it returns the fixed reason it could not
    * complete instead of a partial answer. Only a recovery interruption is rethrown.
    */
-  private async scanForeignAttemptIds(barePath: string): Promise<{ ids: Set<string> } | { reason: CompactForeignSkipReason }> {
+  private async scanForeignAttemptIds(barePath: string): Promise<{ ids: Set<string>; hasBinding: boolean } | { reason: CompactForeignSkipReason }> {
     const limits = this.compactForeignLimits;
     const started = this.compactForeignNow();
     const expired = (): boolean => this.compactForeignNow() - started > limits.deadlineMs;
     const ids = new Set<string>();
+    // True when any other bare holds a decoded binding: retireCrossBareConflict then refuses reclaim on such a bare for any
+    // value in THIS bare that retireIdentifiedAttempt cannot attribute, so those values must survive compaction.
+    let hasBinding = false;
     try {
       let names: string[];
       try {
@@ -18323,6 +18333,7 @@ export class GitCache {
         for (const b of bindings.bindings) {
           if (b.parsed === undefined) return { reason: "binding_undecodable" };
           ids.add(b.parsed.attemptId);
+          hasBinding = true;
         }
         for (const [, raw] of ledger) {
           const id = retireIdentifiedAttempt(raw);
@@ -18330,7 +18341,7 @@ export class GitCache {
           ids.add(id);
         }
       }
-      return { ids };
+      return { ids, hasBinding };
     } catch {
       this.checkRecoveryInterruption();
       return { reason: "unreadable" };
