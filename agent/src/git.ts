@@ -1087,7 +1087,7 @@ export interface GitCacheOptions {
   scratchProvisioner?: (clonePath: string) => Promise<void>;
   /** issue #1783 M2 — test-only seam for the runner-uid deletions (operator discard's, and M3's
    *  canonical-path free). `split` overrides {@link uidSplitActive} for these deletions alone, and also selects the
-   *  retire-binding settle-vs-remove posture of retireRunnerClone (issue #4263); `run`
+   *  retire-binding keep-vs-remove posture of retireRunnerClone (issue #4263); `run`
    *  executes the ALREADY runner-wrapped delete argv in place of the real spawn. Production never
    *  passes it. The rest drive the REAL spawn/timeout/close-wait path of runRunnerUidDelete
    *  (and so must not be combined with `run`): `spawn` stands in for the detached spawn of the
@@ -2546,7 +2546,8 @@ function attemptLedgerValue(entry: AttemptLedgerEntry): string {
 // ─── issue #4263 — retirement-scratch bindings ─────────────────────────────────────────────
 //
 // Each `<runnerRoot>/.retire-<uuid>/` retirement scratch parent is bound durably in the bare
-// config key `uzi-retire-scratch.<uuid>.binding`, so a later verified pass can reclaim it. The value
+// config key `uzi-retire-scratch.<uuid>.binding`, so its parent is kept and identifiable (C-prime: no retire
+// writes `settled`; the verified pass deletes no bound parent and only clears the binding of a gone one). The value
 // is canonical JSON (field order below, no whitespace, no device number); a reader accepts ONLY a value
 // that re-serializes to itself. The key prefix is not an attribution prefix and not a protected-record
 // family. Existing readers: the attribution readers ignore the prefix; `collectEpochScratchProtectedPaths` absorbs absolute
@@ -3583,8 +3584,8 @@ export function readRetireScratchOutcomesActivation(env: NodeJS.ProcessEnv): boo
   throw new Error("UZI_RETIRE_SCRATCH_OUTCOMES must be unset, empty, 0 or 1");
 }
 
-/** Reads `UZI_RETIRE_SCRATCH_RECLAIM` (issue #4263): whether the verified pod-epoch pass may reclaim bound
- *  retire-scratch parents. On by default; `0` restores observation only. Anything else refuses startup. The
+/** Reads `UZI_RETIRE_SCRATCH_RECLAIM` (issue #4263): whether the verified pod-epoch pass runs its retire-scratch
+ *  phase (since C-prime it deletes no bound parent; it clears the binding of a gone one). On by default; `0` restores observation only. Anything else refuses startup. The
  *  switch permits the phase and proves nothing: every gate in the pass still applies. */
 export function readRetireScratchReclaimActivation(env: NodeJS.ProcessEnv): boolean {
   const raw = env.UZI_RETIRE_SCRATCH_RECLAIM;
@@ -18204,7 +18205,7 @@ export class GitCache {
       // issue #3644: compaction lstats every ledger path, a restored predecessor's included; it waits while THIS branch has a restore entry.
       const snapshot = await this.configEntries(barePath);
       if (this.restoreValueIn(snapshot, branch) !== undefined) return;
-      // issue #4263: a retirement binding names (attemptId, runId, clonePath) of a scratch parent still owed reclaim; its
+      // issue #4263: a retirement binding names (attemptId, runId, clonePath) of a kept scratch parent; its
       // ledger entry is kept whatever its state. An unreadable binding set (over the cap) or any undecodable entry (a
       // duplicated key, a non-canonical or future-version value) keeps every entry (no drop), like `unknown`.
       const bindingRead = await this.readRetireBindingsUnderLock(barePath, snapshot);
@@ -20655,7 +20656,7 @@ export class GitCache {
               beforeDestroy();
               // The deferred parent is left in place exactly as a failed in-process scratch removal leaves it today.
               unproven();
-              this.log.info("retire scratch parent deferred to verified epoch", { path: scratch });
+              this.log.info("retire scratch parent kept in place (split pod, binding stays intent)", { path: scratch });
             } else {
               let removingWritten = bound === undefined;
               if (bound) {

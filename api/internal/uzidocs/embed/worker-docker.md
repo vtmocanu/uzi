@@ -769,12 +769,13 @@ unbound in-process removal attempt described above. Permanently retained `intent
 binding reset or cleanup route exists or is supported.
 
 Kept reasons for bound parents include `bound_intent`, `interrupted_removal`,
-`malformed_binding`, `conflict`, `class_ineligible`, `ledger_missing`,
+`malformed_binding`, `conflict`, `ledger_missing`,
 `ledger_mismatch`, `protected_by_retained_source`, `custody`,
 `canonical_present`, `source_use_held`, `newer_than_predecessor`,
 `unexpected_entries`, `identity_changed`, `mount_changed`, `held`,
-`settled_kept`, `epoch_not_eligible`, `budget_deferred` and `disabled` (a
-settled binding row reports only `settled_kept`). A whole-phase refusal
+`settled_kept`, `epoch_not_eligible` and `budget_deferred` (a settled binding
+row the pass did not report reads `settled_kept`; `disabled` is a whole-phase
+reason only). A whole-phase refusal
 (`retire_scratch.state: refused`) names one token, for example `split_inactive`,
 `not_idle`, `mount_unexpected`, `fs_unsupported`, `bind_unknown` or
 `evidence_unknown`, and keeps every parent.

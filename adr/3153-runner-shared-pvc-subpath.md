@@ -420,9 +420,10 @@ code already exercises in-process on a single-uid pod:
 | `other` (foreign-orphan) | yes | never | No owner-terminal or acknowledged-FINAL authority backs it. On a split pod its binding stays `intent` with the parent on disk and reads `bound_intent` (it never settles). In production a foreign-orphan retire carries no `attemptId`, so it is in practice unbound (today's behaviour). |
 | attempt-less retire | no | never | The owner's cross-check against the attempt-ledger entry (attemptId, runId, clonePath) cannot be satisfied without an attemptId; the parent stays unbound and kept. |
 
-`class_ineligible` and `settled_kept` are reachable only for a `settled` value,
-which no writer produces (a pre-existing value is read and kept); they are
-defensive readings, not outcomes seen in practice.
+`class_ineligible` is no longer reachable (every parsed phase is kept before the
+class check), and `settled_kept` is reachable only for a `settled` value, which
+no writer produces (a pre-existing value is read and kept); it is a defensive
+reading, not an outcome seen in practice.
 
 ### Split-pod parents are never settled (C-prime, issue #4263 review finding [7])
 
@@ -650,8 +651,8 @@ before the claim loop) and reports what the pass did. Rows carry `reclaimed` as
 an outcome for parents the pass removed and a binding-aware `reason` for kept
 ones: the pass's own token for a parent it examined, otherwise `bound_intent`,
 `interrupted_removal`, `malformed_binding` or `settled_kept` for a bound parent
-(a settled binding row reports `settled_kept`, never `disabled`,
-`epoch_not_eligible` or `budget_deferred`), and the #4143 reasons for an unbound one.
+(a settled binding row the pass did not report reads `settled_kept`, never
+`disabled`, `epoch_not_eligible` or `budget_deferred`), and the #4143 reasons for an unbound one.
 The total line gains `reclaimed`, `reclaimed_bytes`, `kept_by_reason` and
 `removing_bindings`.
 

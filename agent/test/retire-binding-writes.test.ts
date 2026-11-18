@@ -121,7 +121,7 @@ describe("happy paths", () => {
     assert.equal(journal(s.bare, s.branch), "", "journal cleared");
     assert.equal(hasRetiredEntry(s.bare, s.branch), true);
     assert.deepEqual(removed.filter(p => p.includes(".retire-")), [], "no rm of the parent");
-    assert.ok(logs.info.includes("retire scratch parent deferred to verified epoch"));
+    assert.ok(logs.info.includes("retire scratch parent kept in place (split pod, binding stays intent)"));
     const phaseAt = (step: RetireBindingStep): string | undefined => seen.find(([name]) => name === step)?.[1];
     for (const step of ["parent-created", "parent-pinned", "root-synced", "cap-checked", "intent-write"] as const) assert.equal(phaseAt(step), "absent", step);
     for (const step of ["intent-written", "renamed", "move-verified", "journal-cleared", "ledger-appended", "config-sync"] as const)
