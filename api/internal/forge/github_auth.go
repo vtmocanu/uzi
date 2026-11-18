@@ -21,6 +21,9 @@ func (g *github) VerifyToken(ctx context.Context) (BotIdentity, error) {
 	// fall through to TokenInfo's introspection-unsupported WARNING path, which is
 	// the right disposition for GitLab's known-coarse token but wrong for an
 	// un-introspectable one. The message carries no secret.
+	if g.app != nil {
+		return g.verifyApp(ctx)
+	}
 	if strings.HasPrefix(g.token, "github_pat_") {
 		return BotIdentity{}, errors.New("github: fine-grained tokens are not supported yet; use a classic PAT (ghp_…)")
 	}
@@ -35,6 +38,9 @@ func (g *github) VerifyToken(ctx context.Context) (BotIdentity, error) {
 }
 
 func (g *github) TokenInfo(ctx context.Context) (TokenInfo, error) {
+	if g.app != nil {
+		return g.appTokenInfo(ctx)
+	}
 	// HAND-ROLLED FROM RESPONSE HEADERS (D7): GitHub has no token-introspection JSON
 	// endpoint. A classic PAT's granted scopes come back in X-OAuth-Scopes and its
 	// expiry in GitHub-Authentication-Token-Expiration on ANY authenticated request;

@@ -14,6 +14,8 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/forgecred"
 	"github.com/vtmocanu/uzi/api/internal/pushbroker"
 	"github.com/vtmocanu/uzi/api/internal/secretscrub"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -414,11 +416,15 @@ func (s *Service) forgeForRetention(ctx context.Context, runID uuid.UUID) (f ret
 	if err != nil || !s.forgeBaseURLAllowed(cloneHost) {
 		return retentionForge{}, "clone host is not allowlisted", false
 	}
-	botPAT, err := s.box.Open(rc.TokenCiphertext)
+	botPAT, err := forgecred.Open(s.box, rc.TokenCiphertext)
 	if err != nil {
 		return retentionForge{}, "bot PAT could not be decrypted", false
 	}
-	return retentionForge{cloneURL: cloneURL, username: rc.BotUsername, pat: string(botPAT)}, "", false
+	pat, _, err := forge.ResolveGitCredentialWithExpiry(ctx, forge.Type(rc.ForgeType), rc.BaseUrl, string(botPAT), 20*time.Second)
+	if err != nil {
+		return retentionForge{}, "forge credential unavailable", false
+	}
+	return retentionForge{cloneURL: cloneURL, username: gitCredentialUsername(rc.ForgeType, rc.BotUsername, pat), pat: pat}, "", false
 }
 
 // retentionBookkeepingCtx is the context a retention record write runs on when it must land even

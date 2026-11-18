@@ -99,7 +99,11 @@ func (g *github) artifactGET(ctx context.Context, path string) (*http.Response, 
 	if req.URL.Scheme != base.Scheme || req.URL.Host != base.Host || req.URL.User != nil {
 		return nil, errArtifactDestination
 	}
-	req.Header.Set("Authorization", "Bearer "+g.token)
+	token, authErr := g.gitCredential(req.Context())
+	if authErr != nil {
+		return nil, authErr
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Accept-Encoding", "identity")
 	resp, err := g.artifactAPI.Do(req)
 	if err != nil {

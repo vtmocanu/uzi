@@ -16,11 +16,36 @@ repo, uzi reports `main` as protected but shows push/merge rights as
 below. Prefer a ruleset over classic protection so uzi's report is authoritative,
 and either way, require pull-request reviews before merge.
 
-uzi acts on the forge as **your own bot account**, never your personal identity: a
-revocable, individually-scoped identity instead of one shared credential. See
+uzi acts on the forge as a **dedicated identity**, never your personal account: a
+revocable, individually-scoped credential instead of one shared one. On GitHub
+that identity is either a bot account holding a personal access token, or a
+GitHub App installation. See
 [ARCHITECTURE.md](../ARCHITECTURE.md#forge-integration) for why.
 
-## 1. Protect the default branch
+## Two ways to authenticate
+
+uzi accepts two GitHub credential types. Both are verified at connect, and
+re-checked on demand and periodically — see
+[Least privilege](#least-privilege-what-uzi-verifies).
+
+- **[Personal access token](#personal-access-token)** — a second GitHub account
+  for the bot, holding a classic PAT. Works on any plan, and is the only path
+  that supports [GitHub Projects v2 sync](./github-project-sync.md).
+- **[GitHub App](#github-app)** — an App installed on your organization or
+  account. No second human account, per-repository scoping, and one-hour tokens
+  minted automatically. Recommended for org deployments.
+
+| | Bot account + PAT | GitHub App |
+|---|---|---|
+| Second human account | Required | Not required — the App is the identity |
+| Credential | Classic PAT (`ghp_…`), valid until it expires or is revoked | RSA private key; uzi mints one-hour installation tokens from it |
+| Permission scoping | Coarse classic scopes (`repo`, optionally `project`) | Per-permission and per-repository; every token is downscoped to the exact set uzi requests |
+| Repository access | Every repo the bot is a collaborator on | Only the repositories selected at install, narrowed further by the names on the connection |
+| Audit trail | Actions attributed to the bot user account | Actions attributed to `<app-slug>[bot]`; the App appears in the org audit log |
+| Seat cost | Consumes a user seat on paid plans | Does not consume a user seat |
+| Projects v2 sync | Supported with the `project` scope | Not supported — installation tokens carry no `project` scope |
+
+## Protect the default branch
 
 Repository → **Settings → Rules → Rulesets**, add a ruleset targeting your
 repository's default branch (`main` in most repos) that requires a pull
@@ -29,11 +54,22 @@ preferred over the legacy **Settings → Branches** protection rule because uzi 
 read it at write role; classic protection is invisible to the bot beyond a bare
 "protected" flag.
 
-## 2. Create the bot account
+**A GitHub App connection additionally needs the "Restrict updates" rule.** A
+required pull request stops a merge without review, but it does not stop a
+credential from updating the branch ref directly, so uzi's App path treats a
+ruleset without **Restrict updates** as unreadable and refuses the repo. Add that
+rule to the same ruleset. Leave the App out of the ruleset's **bypass list** — an
+App listed there with `always` can push and merge, and uzi reports that as a
+violation. A PAT connection does not need this rule; it is checked by role
+instead.
+
+## Personal access token
+
+### 1. Create the bot account
 
 Register a second GitHub account for the bot yourself (e.g. `uzi-bot-<yourname>`).
 
-## 3. Create a personal access token
+### 2. Create a personal access token
 
 From the bot account's **Settings → Developer settings → Personal access tokens
 → Tokens (classic)**:
@@ -131,17 +167,17 @@ secret-scanned first, which a rewritten branch usually prevents; either way
 your committed work stays on the run's branch and is recoverable with `uzi run
 export`.
 
-## 4. Add the bot to your repo
+### 3. Add the bot to your repo
 
 Repository → **Settings → Collaborators**, add the bot with role **Write** (not
 Read, not Admin). Write is a hard requirement: uzi's project discovery only sees
 repos where the bot has at least Write access, and Admin would hand the bot power
 it doesn't need — including reading the branch protection rule you just set up.
 
-## Project sync: invite the bot onto the Project (GitHub Projects v2 only)
+### Project sync: invite the bot onto the Project (GitHub Projects v2 only)
 
 If you plan to use [GitHub Projects v2 sync](./github-project-sync.md),
-there's a **second, separate invite** beyond step 4 above. A Project has
+there's a **second, separate invite** beyond step 3 above. A Project has
 its own membership, distinct from the repo's collaborator list — adding
 the bot to the repo does not by itself let it read or move the Project's
 Status field. On the Project itself, open its **⋯ menu → Manage access**
@@ -149,18 +185,19 @@ Status field. On the Project itself, open its **⋯ menu → Manage access**
 **Write**. Do this before running Adopt — see [The Adopt flow, step by
 step](./github-project-sync.md#the-adopt-flow-step-by-step).
 
-## 5. Connect the bot in uzi
+### 4. Connect the bot in uzi
 
 1. Log in and open **Settings → Forge**.
 2. Pick a base URL and forge type (only the operator-configured allowlist is
    offered — the SSRF guard; see [ARCHITECTURE.md](../ARCHITECTURE.md#forge-integration)).
-3. Paste the bot's PAT and submit. uzi verifies it immediately, runs the
+3. Leave **GitHub authentication** on **Personal access token**.
+4. Paste the bot's PAT and submit. uzi verifies it immediately, runs the
    least-privilege token check (see below), and shows the bot's username; the
    token itself is never shown again. An **over-privileged** token, or a
    fine-grained token, is rejected here and nothing is stored — mint a clean
    classic `ghp_…` token and retry.
 
-## 6. Enable the repo
+### 5. Enable the repo
 
 Open **Repos**, pick the connection, and enable each repo you added the bot to.
 This makes its board appear in the sidebar and starts syncing its `uzi`-labeled
@@ -170,10 +207,116 @@ If verification fails, check: the token's scope is exactly `repo`, it's a
 classic token (not `github_pat_…`), it hasn't expired, and the bot is at least
 Write on the target repo.
 
+## GitHub App
+
+A GitHub App installation replaces the bot account entirely: the App is the
+identity, and uzi mints short-lived installation tokens from its private key.
+Nothing here needs a second human account.
+
+### 1. Create the App
+
+**Settings → Developer settings → GitHub Apps → New GitHub App** — on the
+organization's settings for an org-owned App, or on your personal account's
+settings for a user-owned one.
+
+- **Name:** anything you like — this doc uses `uzi-forge`. The name becomes the
+  bot identity, `<app-slug>[bot]`.
+- **Homepage URL:** required by GitHub; any URL you control.
+- **Webhook:** uncheck **Active**. uzi does not receive webhooks.
+
+### 2. Set repository permissions
+
+Under **Permissions → Repository permissions**, grant exactly this set and leave
+every other permission at **No access**:
+
+| Permission | Access |
+|---|---|
+| Contents | Read and write |
+| Issues | Read and write |
+| Pull requests | Read and write |
+| Metadata | Read-only |
+| Actions | Read-only |
+| Checks | Read-only |
+| Statuses | Read-only |
+
+`Metadata: Read-only` is mandatory on every GitHub App and is granted
+automatically. uzi requests exactly this set when it mints each installation
+token and refuses a token that carries anything different, so the App must be
+granted at least these; granting more on the App does not widen what uzi's token
+can do, because every token is downscoped to the set above.
+
+### 3. Generate a private key
+
+On the App's settings page, **Private keys → Generate a private key**. GitHub
+downloads a `.pem` file and never shows the key again — keep it. uzi accepts an
+RSA key of at least 2048 bits, in either PKCS#1 (`-----BEGIN RSA PRIVATE KEY-----`)
+or PKCS#8 (`-----BEGIN PRIVATE KEY-----`) PEM form.
+
+### 4. Install the App
+
+On the App's settings page, **Install App**, choose the organization or account,
+and select the repositories uzi should see (**All repositories**, or **Only
+select repositories**).
+
+The **Installation ID** is the number in the installation's settings URL:
+
+```
+https://github.com/organizations/<org>/settings/installations/<installation-id>
+https://github.com/settings/installations/<installation-id>
+```
+
+### 5. Connect the App in uzi
+
+1. Log in and open **Settings → Forge**.
+2. Pick the `https://github.com` base URL and forge type **GitHub**. Only
+   github.com is supported for App credentials — a custom or self-hosted base URL
+   is refused.
+3. Set **GitHub authentication** to **GitHub App**. Four fields appear:
+   - **App ID** — the number shown as **App ID** on the App's settings page.
+   - **Installation ID** — the number from step 4.
+   - **Repository names** — comma-separated repository names within this
+     installation, without the owner (e.g. `my-repo, my-other-repo`). At least
+     one is required, up to 100. Only these repositories are authorized.
+   - **Private key (PEM)** — paste the entire `.pem` file, including its
+     `BEGIN` and `END` lines. Multiline paste is preserved and the key stays
+     masked.
+4. Submit. uzi signs a JWT with the key, exchanges it for an installation token,
+   verifies the token's permissions and repository scope, and shows the bot
+   identity (`<app-slug>[bot]`). The private key is never shown again.
+
+### 6. Enable the repo
+
+Open **Repos**, pick the connection, and enable each repository you named on it.
+Only those repositories are visible to the connection.
+
+If verification fails, check: the App ID and Installation ID are the numbers from
+the App's own settings and installation URL, the installation is not suspended,
+the App is granted at least the permissions in step 2, the installation includes
+every repository you named, and the PEM is the complete file.
+
+### Operational properties
+
+- **Tokens expire hourly and are minted automatically.** uzi exchanges a signed
+  JWT for an installation token valid for one hour, and mints a fresh one when
+  fewer than five minutes remain. Workers receive only the installation token.
+- **The private key never leaves the API server.** It is sealed at rest with a
+  distinct encryption context from a PAT, so an App credential can never be
+  opened as a PAT envelope, or the reverse.
+- **The bot identity is `<app-slug>[bot]`** — for an App named `uzi-forge`,
+  `uzi-forge[bot]`. No second human account exists to manage, and the App does
+  not consume a user seat.
+- **Projects v2 sync is not available on this path.** It needs the PAT's
+  `project` scope, which an installation token does not carry — use the
+  [personal access token](#personal-access-token) path if you need it.
+
 ## Least privilege: what uzi verifies
 
 Same posture as [GitLab bot setup](./gitlab-bot-setup.md#least-privilege-what-uzi-verifies),
-mapped onto GitHub's model:
+mapped onto GitHub's model. The two credential types are checked by different
+code paths: a PAT is checked by its scopes, an App by the permissions on its
+installation token.
+
+**Personal access token:**
 
 - **Token scope is exactly `repo`.** Anything more, including `workflow`, is
   refused at connect.
@@ -182,12 +325,29 @@ mapped onto GitHub's model:
 - **The bot is not a site admin.**
 - **On every enabled repo, the bot's role is exactly Write.** Admin can push
   protected branches and change repo settings; below Write breaks sync.
-- **Push/merge rights on the protected default branch, when uzi can determine
-  them.** If a **ruleset** covering `main` is readable, uzi reports whether the
-  write role can push or merge — authoritative. If `main` is protected only by
-  **classic branch protection**, uzi cannot read who may push or merge at write
-  role (that detail needs admin), so it reports the branch as protected but the
-  push/merge finding as **unverified**, never a false "safe".
+
+**GitHub App:**
+
+- **The installation token's permissions must equal the required minimum
+  exactly** — `contents: write`, `issues: write`, `pull_requests: write`,
+  `metadata: read`, `actions: read`, `checks: read`, `statuses: read`. A token
+  carrying anything more or less is a violation.
+- **The token's repository set must match the names configured on the
+  connection exactly.** A missing or unexpected repository is refused.
+- **The installation must belong to the configured App ID and must not be
+  suspended.**
+- **The bot identity must be a Bot account and not a site admin.**
+- **Only github.com is supported.** A custom or self-hosted base URL is refused.
+
+**Push/merge rights on the protected default branch, when uzi can determine
+them.** If a **ruleset** covering `main` is readable, uzi reports whether the
+credential can push or merge — authoritative. For a PAT that means the write
+role; for an App it means the App itself, read from the ruleset's bypass actors
+(`always` → can push and merge, `pull_request` → can merge, no bypass entry →
+protected and safe). If `main` is protected only by **classic branch
+protection**, uzi cannot read who may push or merge at write role (that detail
+needs admin), so it reports the branch as protected but the push/merge finding
+as **unverified**, never a false "safe".
 
 **Checked at the same three points as GitLab**: at connect (blocking — an
 over-privilege or fine-grained-token violation rejects the save and stores

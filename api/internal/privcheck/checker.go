@@ -215,7 +215,7 @@ func evaluateRepo(rr *RepoReport, repo Repo, role forge.Role, member bool, roleE
 	// protection_unreadable BLOCK code. It does NOT early-return: the Can* fields
 	// are false here so nothing else fires, but the structure is preserved.
 	if bp.ProtectionUnverified {
-		rr.Findings = append(rr.Findings, newFinding(CodeProtectionUnreadable, fmt.Sprintf("could not fully verify push/merge rights on protected %q", repo.DefaultBranch)))
+		rr.Findings = append(rr.Findings, newFinding(CodeProtectionUnreadable, fmt.Sprintf("could not verify push/merge rights on protected %q: add a ruleset covering it with \"Require a pull request before merging\" and \"Restrict updates\", and list this credential in no bypass actor", repo.DefaultBranch)))
 	}
 	// Push/merge findings all BLOCK (D6): a bot that can push or merge into
 	// protected main breaks the primary directive. M1 only surfaces them as coded
@@ -276,7 +276,11 @@ func evaluateToken(forgeType forge.Type, info forge.TokenInfo, isAdmin bool, now
 		return tr
 	}
 
-	if !scopesAcceptable(forgeType, info.Scopes) {
+	if info.GitHubApp {
+		if forgeType != forge.TypeGitHub || !forge.GitHubAppPermissionsValid(info.AppPermissions) {
+			tr.Violations = append(tr.Violations, "GitHub App installation token permissions do not match the required minimum")
+		}
+	} else if !scopesAcceptable(forgeType, info.Scopes) {
 		tr.Violations = append(tr.Violations, fmt.Sprintf("token scopes %v are not acceptable: they must include %v and add nothing beyond the allowed optional scopes %v", info.Scopes, requiredScopesFor(forgeType), allowedOptionalScopesFor(forgeType)))
 	}
 	if !info.Active {
@@ -286,7 +290,7 @@ func evaluateToken(forgeType forge.Type, info forge.TokenInfo, isAdmin bool, now
 		switch {
 		case !info.ExpiresAt.After(now):
 			tr.Violations = append(tr.Violations, "token has expired")
-		case info.ExpiresAt.Before(now.Add(warnWindow)):
+		case !info.GitHubApp && info.ExpiresAt.Before(now.Add(warnWindow)):
 			days := int(warnWindow.Hours() / 24)
 			tr.Warnings = append(tr.Warnings, fmt.Sprintf("token expires within %d days (on %s)", days, info.ExpiresAt.Format("2006-01-02")))
 		}

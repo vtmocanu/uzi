@@ -21,6 +21,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/board"
 	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/forgecred"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -485,7 +486,7 @@ func (s *Service) findingLabel(ctx context.Context) string {
 
 // EncryptToken seals a plaintext PAT for storage.
 func (s *Service) EncryptToken(pat string) ([]byte, error) {
-	return s.box.Seal([]byte(pat))
+	return forgecred.Seal(s.box, pat)
 }
 
 // ForgeForToken builds a driver from a plaintext token (the connect/verify path,
@@ -497,7 +498,7 @@ func (s *Service) ForgeForToken(forgeType forge.Type, baseURL, token string) (fo
 // ForgeForConnection builds a driver from a stored connection by decrypting its
 // token ciphertext.
 func (s *Service) ForgeForConnection(forgeType, baseURL string, tokenCiphertext []byte) (forge.Forge, error) {
-	plain, err := s.box.Open(tokenCiphertext)
+	plain, err := forgecred.Open(s.box, tokenCiphertext)
 	if err != nil {
 		return nil, err
 	}

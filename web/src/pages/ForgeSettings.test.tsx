@@ -464,3 +464,86 @@ describe("ForgeSettings — connect-form token hints follow the forge (M6b, D6b)
     expect(screen.queryByPlaceholderText("glpat-…")).toBeNull();
   });
 });
+
+
+describe("ForgeSettings — GitHub App connection", () => {
+  const pem = ["-----BEGIN PRIVATE KEY-----", "ui-test-fixture", "-----END PRIVATE KEY-----"].join("\n");
+
+  async function appForm() {
+    mockApi.forgeConfig.mockResolvedValue({
+      allowed_base_urls: ["https://gitlab.example.com", "https://github.com"],
+      forge_types: ["gitlab", "github"],
+    });
+    renderPage();
+    const picker = await screen.findByLabelText("Forge type");
+    fireEvent.change(picker, { target: { value: "github" } });
+    expect((screen.getByLabelText("GitHub authentication") as HTMLSelectElement).value).toBe("pat");
+    fireEvent.change(screen.getByLabelText("GitHub authentication"), { target: { value: "app" } });
+    fireEvent.change(screen.getByLabelText("App ID"), { target: { value: "12345" } });
+    fireEvent.change(screen.getByLabelText("Installation ID"), { target: { value: "98765" } });
+    fireEvent.change(screen.getByLabelText("Repository names"), { target: { value: "widgets, other-repo, widgets" } });
+    fireEvent.paste(screen.getByLabelText("Private key (PEM)"), { clipboardData: { getData: () => pem } });
+    return document.querySelector("form") as HTMLFormElement;
+  }
+
+  it("preserves a multiline PEM paste in the App envelope, masks it, and clears it after saving", async () => {
+    const form = await appForm();
+    const key = screen.getByLabelText("Private key (PEM)") as HTMLInputElement;
+    expect(key.type).toBe("password");
+    mockApi.createConnection.mockResolvedValue({ connection: conn({ forge_type: "github", bot_username: "multica[bot]" }) });
+    fireEvent.submit(form);
+    await waitFor(() => expect(mockApi.createConnection).toHaveBeenCalledWith(
+      "https://github.com",
+      JSON.stringify({ auth_type: "github_app", app_id: "12345", installation_id: 98765, private_key: pem, repositories: ["widgets", "other-repo"] }),
+      "github",
+      "github_app",
+    ));
+    expect(await screen.findByText("Connected as multica[bot].")).toBeTruthy();
+    expect(key.value).toBe("");
+    expect(key.type).toBe("password");
+    expect(screen.queryByRole("button", { name: "Show token" })).toBeNull();
+  });
+
+  it("explains an older API's missing App route without retrying the PAT route", async () => {
+    const form = await appForm();
+    mockApi.createConnection.mockRejectedValue(new ApiError(404, "not found"));
+    fireEvent.submit(form);
+    expect(await screen.findByText("This Uzi API does not support GitHub App connections. Update the API, then try again.")).toBeTruthy();
+    expect(mockApi.createConnection).toHaveBeenCalledTimes(1);
+    expect(mockApi.createConnection.mock.calls[0]?.[3]).toBe("github_app");
+  });
+
+  it.each([
+    ["App ID", "not-an-id", "App ID must be a positive decimal number."],
+    ["Installation ID", "9007199254740992", "Installation ID must be a positive integer."],
+    ["Repository names", "acme/widgets", "Enter 1–100 repository names, without an owner or URL."],
+    ["Repository names", Array.from({ length: 101 }, (_, i) => `repo-${i}`).join(","), "Enter 1–100 repository names, without an owner or URL."],
+  ])("rejects invalid %s before sending credentials", async (label, value, message) => {
+    const form = await appForm();
+    fireEvent.change(screen.getByLabelText(label), { target: { value } });
+    fireEvent.submit(form);
+    expect(await screen.findByText(message)).toBeTruthy();
+    expect(mockApi.createConnection).not.toHaveBeenCalled();
+  });
+
+  it("rejects an incomplete PEM and never sends it", async () => {
+    const form = await appForm();
+    fireEvent.paste(screen.getByLabelText("Private key (PEM)"), { clipboardData: { getData: () => "incomplete-key" } });
+    fireEvent.submit(form);
+    expect(await screen.findByText(/Paste the complete PEM private key/)).toBeTruthy();
+    expect(mockApi.createConnection).not.toHaveBeenCalled();
+  });
+
+  it("keeps PAT as the default and clears the PEM when changing authentication mode", async () => {
+    const form = await appForm();
+    fireEvent.change(screen.getByLabelText("GitHub authentication"), { target: { value: "pat" } });
+    const pat = screen.getByLabelText("Bot personal access token (scope: repo)");
+    expect(screen.queryByLabelText("Private key (PEM)")).toBeNull();
+    mockApi.createConnection.mockResolvedValue({ connection: conn({ forge_type: "github" }) });
+    fireEvent.change(pat, { target: { value: "test-classic-pat" } });
+    fireEvent.submit(form);
+    await waitFor(() => expect(mockApi.createConnection).toHaveBeenCalledWith("https://github.com", "test-classic-pat", "github"));
+    fireEvent.change(screen.getByLabelText("GitHub authentication"), { target: { value: "app" } });
+    expect((screen.getByLabelText("Private key (PEM)") as HTMLInputElement).value).toBe("");
+  });
+});

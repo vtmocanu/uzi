@@ -46,7 +46,11 @@ func (g *github) githubGetBounded(ctx context.Context, op, path string, limit in
 	if err != nil {
 		return 0, nil, g.wrapErr(op, err)
 	}
-	req.Header.Set("Authorization", "Bearer "+g.token)
+	token, authErr := g.gitCredential(ctx)
+	if authErr != nil {
+		return 0, nil, authErr
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
 	resp, err := g.ancClient.Do(req)
 	if err != nil {
 		return 0, nil, g.wrapErr(op, err)

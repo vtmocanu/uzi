@@ -2,6 +2,7 @@ package forge
 
 import (
 	"errors"
+	"slices"
 	"strings"
 )
 
@@ -14,7 +15,8 @@ const redactPlaceholder = "[REDACTED]"
 // through redact, so even if the underlying client ever embedded the token in a
 // message, it would not escape the package.
 type redactor struct {
-	secrets []string
+	secrets        []string
+	dynamicSecrets func() []string
 }
 
 // newRedactor builds a redactor for the given secrets. Empty and very short
@@ -32,7 +34,11 @@ func newRedactor(secrets ...string) redactor {
 
 // string returns s with every known secret replaced by the placeholder.
 func (r redactor) string(s string) string {
-	for _, secret := range r.secrets {
+	secrets := r.secrets
+	if r.dynamicSecrets != nil {
+		secrets = append(slices.Clone(secrets), r.dynamicSecrets()...)
+	}
+	for _, secret := range secrets {
 		s = strings.ReplaceAll(s, secret, redactPlaceholder)
 	}
 	return s

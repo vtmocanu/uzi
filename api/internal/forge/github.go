@@ -2,6 +2,8 @@ package forge
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
@@ -40,6 +42,7 @@ const githubDefaultLabelColor = "ededed"
 // driver is rebuilt per ForgeForConnection call, so a rename cannot go stale
 // across operations. This mirrors the Forgejo driver's repoSlugFor exactly.
 type github struct {
+	app    *githubAppAuth
 	token  string
 	client *gh.Client
 	redact redactor
@@ -84,6 +87,23 @@ var (
 // derives the same <host>/api/v3 in agent/src/forge.ts), or the httptest URL a
 // test/fake points us at. CI exercises only the latter.
 func newGitHub(baseURL, token string, timeout time.Duration) (*github, error) {
+	var app *githubAppAuth
+	if IsGitHubAppCredential(token) {
+		if !isDefaultGitHubBase(baseURL) || strings.HasPrefix(baseURL, "http:") {
+			return nil, errors.New("github app: only github.com is supported")
+		}
+		var err error
+		app, err = githubAppProvider(token, timeout)
+		if err != nil {
+			return nil, err
+		}
+		hash := sha256.Sum256([]byte(token))
+		token = "github-app:" + hex.EncodeToString(hash[:])
+	}
+	return newGitHubWithApp(baseURL, token, timeout, app)
+}
+
+func newGitHubWithApp(baseURL, token string, timeout time.Duration, app *githubAppAuth) (*github, error) {
 	// Wrap the HTTP client's transport with the process-wide ETag RoundTripper
 	// (D4) so conditional GETs on the new read paths replay a cached 200 on 304
 	// instead of spending primary rate-limit budget. WithAuthToken then wraps this
@@ -103,7 +123,11 @@ func newGitHub(baseURL, token string, timeout time.Duration) (*github, error) {
 	httpClient.Transport = responseLimitTransport{base: ciRepairTransport{base: pin}}
 	opts := []gh.ClientOptionsFunc{
 		gh.WithHTTPClient(httpClient),
-		gh.WithAuthToken(token),
+	}
+	if app == nil {
+		opts = append(opts, gh.WithAuthToken(token))
+	} else {
+		httpClient.Transport = githubAppTransport{base: httpClient.Transport, auth: app}
 	}
 	if b := strings.TrimRight(strings.TrimSpace(baseURL), "/"); b != "" && !isDefaultGitHubBase(b) {
 		// WithEnterpriseURLs appends /api/v3/ to a non-api. host, so the test harness
@@ -111,6 +135,9 @@ func newGitHub(baseURL, token string, timeout time.Duration) (*github, error) {
 		opts = append(opts, gh.WithEnterpriseURLs(b, b))
 	}
 	redact := newRedactor(token)
+	if app != nil {
+		redact.dynamicSecrets = app.secretValues
+	}
 	c, err := gh.NewClient(opts...)
 	if err != nil {
 		return nil, redact.error(fmt.Errorf("github: new client: %w", err))
@@ -136,6 +163,7 @@ func newGitHub(baseURL, token string, timeout time.Duration) (*github, error) {
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
 	return &github{
+		app:         app,
 		artifactAPI: artifactAPI,
 		token:       token,
 		client:      c,
@@ -235,6 +263,9 @@ func (g *github) repoSlugFor(ctx context.Context, projectID int64) (repoSlug, er
 }
 
 func (g *github) ListProjects(ctx context.Context) ([]Project, error) {
+	if g.app != nil {
+		return g.listAppProjects(ctx)
+	}
 	opt := &gh.RepositoryListByAuthenticatedUserOptions{
 		ListOptions: gh.ListOptions{PerPage: githubPerPage},
 	}
