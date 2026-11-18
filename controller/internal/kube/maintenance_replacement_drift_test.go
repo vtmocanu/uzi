@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"slices"
+	"strconv"
 	"testing"
 	"time"
 
@@ -177,6 +178,112 @@ func TestDinDRecyclingReplacementTemplateDriftHeld(t *testing.T) {
 	}
 }
 
+// addFlappingReadyPod creates a ready replacement pod carrying the Deployment's
+// current template, with a container restarted past the stuck threshold and
+// started startedAgo before the harness clock. Within the flap window the roll
+// health is not settled even though the pod is Ready.
+func (h *driftHarness) addFlappingReadyPod(startedAgo time.Duration) {
+	h.t.Helper()
+	d := h.deployment()
+	started := metav1.NewTime(m5Now.Add(-startedAgo))
+	ready := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "replacement", Namespace: h.cfg.DockerNamespace, UID: "new-pod", Labels: d.Spec.Template.Labels, Annotations: d.Spec.Template.Annotations}, Status: corev1.PodStatus{
+		Phase:             corev1.PodRunning,
+		Conditions:        []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+		ContainerStatuses: []corev1.ContainerStatus{{Name: "worker", RestartCount: stuckRestartThreshold, State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: started}}}},
+	}}
+	stampMaintenancePodOwner(ready, d.Name)
+	if _, err := h.client.AppsV1().ReplicaSets(h.cfg.DockerNamespace).Create(context.Background(), maintenanceReplicaSet(ready, d), metav1.CreateOptions{}); err != nil {
+		h.t.Fatal(err)
+	}
+	if _, err := h.client.CoreV1().Pods(h.cfg.DockerNamespace).Create(context.Background(), ready, metav1.CreateOptions{}); err != nil {
+		h.t.Fatal(err)
+	}
+	version, nonce, uid, at := driftPinVersion, "new-registration", "new-pod", m5Now
+	h.w.RollEvidence.RegisteredVersion, h.w.RollEvidence.RegisterNonce, h.w.RollEvidence.PodUID, h.w.RollEvidence.HeartbeatAt = &version, &nonce, &uid, &at
+}
+
+// settlePod ages the container past the flap window so roll health reads settled.
+func (h *driftHarness) settlePod() {
+	h.t.Helper()
+	p, err := h.client.CoreV1().Pods(h.cfg.DockerNamespace).Get(context.Background(), "replacement", metav1.GetOptions{})
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	p.Status.ContainerStatuses[0].State.Running.StartedAt = metav1.NewTime(m5Now.Add(-2 * flapWindow))
+	if _, err := h.client.CoreV1().Pods(h.cfg.DockerNamespace).Update(context.Background(), p, metav1.UpdateOptions{}); err != nil {
+		h.t.Fatal(err)
+	}
+}
+
+// tickOp ticks with the operation the fake last recorded, as the poller would resend it.
+func (h *driftHarness) tickOp() {
+	h.t.Helper()
+	h.w.DindMaintenance = h.f.op
+	if h.w.DindMaintenance == nil {
+		h.w.DindMaintenance = &protocol.DindMaintenance{Phase: "recycling", Fenced: true, DeploymentUID: driftOldDeployment, PVCUID: driftOldPVC}
+	}
+	h.tick()
+}
+
+// reconcileDinDDirect runs the maintenance state machine on a fresh observation
+// of the harness's current pods, bypassing the roll-admission gate in Reconcile.
+func (h *driftHarness) reconcileDinDDirect() {
+	h.t.Helper()
+	o, err := h.m.Observe(context.Background())
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	spec, err := h.m.resolver.Resolve(h.w.Template, h.w.Size)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	h.w.DindMaintenance = h.f.op
+	if h.w.DindMaintenance == nil {
+		h.w.DindMaintenance = &protocol.DindMaintenance{Phase: "recycling", Fenced: true, DeploymentUID: driftOldDeployment, PVCUID: driftOldPVC}
+	}
+	if _, err := h.m.reconcileDinD(context.Background(), h.w, o[0], h.cfg.DockerNamespace, spec); err != nil {
+		h.t.Fatal(err)
+	}
+}
+
+// convergeThenSettle drives the drifted replacement to want, then proves that a
+// Ready pod at the new template with unsettled roll health does not complete the
+// operation, and that the same pod does once settled.
+func (h *driftHarness) convergeThenSettle(want func() bool) {
+	h.t.Helper()
+	for i := 0; i < 6 && !want(); i++ {
+		h.tick()
+	}
+	if !want() {
+		h.t.Fatal("replacement template did not converge")
+	}
+	if h.completed() {
+		h.t.Fatalf("completed before a ready pod at the new template: %v", h.f.calls)
+	}
+	h.tick()
+	if h.completed() {
+		h.t.Fatalf("completed without a ready pod: %v", h.f.calls)
+	}
+	h.addFlappingReadyPod(time.Minute)
+	h.f.calls = nil
+	for i := 0; i < 4; i++ {
+		h.tickOp()
+	}
+	// Reconcile holds a stuck worker before the maintenance state machine runs, so
+	// the settled-pod completion guard is exercised through reconcileDinD itself.
+	h.reconcileDinDDirect()
+	if len(h.f.calls) != 0 {
+		h.t.Fatalf("reported or completed on a ready but unsettled pod: %v", h.f.calls)
+	}
+	h.settlePod()
+	for i := 0; i < 4 && !h.completed(); i++ {
+		h.tickOp()
+	}
+	if !slices.Equal(h.f.calls, []string{"report", "complete"}) {
+		h.t.Fatalf("calls = %v, want report then complete", h.f.calls)
+	}
+}
+
 func TestDinDRecyclingReplacementTemplateDrift(t *testing.T) {
 	t.Run("image change converges and then completes", func(t *testing.T) {
 		h := newDriftHarness(t, driftNewDeployment, driftNewPVC)
@@ -185,41 +292,21 @@ func TestDinDRecyclingReplacementTemplateDrift(t *testing.T) {
 		if want == h.oldRev {
 			t.Fatal("pin change did not change the desired hash")
 		}
-		for i := 0; i < 6 && h.templateHash() != want; i++ {
-			h.tick()
+		h.convergeThenSettle(func() bool { return h.templateHash() == want })
+	})
+
+	t.Run("generation-only drift converges and then completes", func(t *testing.T) {
+		h := newDriftHarness(t, driftNewDeployment, driftNewPVC)
+		h.w.Generation++
+		wantGen := strconv.FormatInt(h.w.Generation, 10)
+		if h.wantHash() != h.oldRev {
+			t.Fatal("generation bump unexpectedly changed the spec hash")
 		}
-		if got := h.templateHash(); got != want {
-			t.Fatalf("replacement template stuck at %s, want %s", got, want)
+		if h.deployment().Spec.Template.Annotations[AnnotationGeneration] == wantGen {
+			t.Fatal("seed deployment already at the new generation")
 		}
-		if h.completed() {
-			t.Fatalf("completed before a ready pod at the new hash: %v", h.f.calls)
-		}
-		h.tick()
-		if h.completed() {
-			t.Fatalf("completed without a ready pod: %v", h.f.calls)
-		}
-		// A ready replacement pod at the new hash with settled roll evidence.
-		d := h.deployment()
-		ready := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "replacement", Namespace: h.cfg.DockerNamespace, UID: "new-pod", Labels: d.Spec.Template.Labels, Annotations: d.Spec.Template.Annotations}, Status: corev1.PodStatus{Phase: corev1.PodRunning, Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}}}
-		stampMaintenancePodOwner(ready, d.Name)
-		if _, err := h.client.AppsV1().ReplicaSets(h.cfg.DockerNamespace).Create(context.Background(), maintenanceReplicaSet(ready, d), metav1.CreateOptions{}); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := h.client.CoreV1().Pods(h.cfg.DockerNamespace).Create(context.Background(), ready, metav1.CreateOptions{}); err != nil {
-			t.Fatal(err)
-		}
-		version, nonce, uid, at := driftPinVersion, "new-registration", "new-pod", m5Now
-		h.w.RollEvidence.RegisteredVersion, h.w.RollEvidence.RegisterNonce, h.w.RollEvidence.PodUID, h.w.RollEvidence.HeartbeatAt = &version, &nonce, &uid, &at
-		h.f.calls = nil
-		for i := 0; i < 4 && !h.completed(); i++ {
-			h.w.DindMaintenance = h.f.op
-			if h.w.DindMaintenance == nil {
-				h.w.DindMaintenance = &protocol.DindMaintenance{Phase: "recycling", Fenced: true, DeploymentUID: driftOldDeployment, PVCUID: driftOldPVC}
-			}
-			h.tick()
-		}
-		if !slices.Equal(h.f.calls, []string{"report", "complete"}) {
-			t.Fatalf("calls = %v, want report then complete", h.f.calls)
-		}
+		h.convergeThenSettle(func() bool {
+			return h.deployment().Spec.Template.Annotations[AnnotationGeneration] == wantGen
+		})
 	})
 }
