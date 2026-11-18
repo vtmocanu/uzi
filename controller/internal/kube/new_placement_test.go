@@ -463,6 +463,98 @@ func TestNewPlacementAC9RestartAfterProcedure(t *testing.T) {
 	}
 }
 
+// AC9 variant: the operator left w1 manually cordoned (Deployment at zero, claims deleted).
+// Manual cordon is not an automatic drain, so the cordon fields stay untouched and no drain
+// is cleared; the claims return stamped and the Deployment is re-rendered at replicas 1.
+func TestNewPlacementAC9RestartWhileManuallyCordoned(t *testing.T) {
+	cfg := placementConfig()
+	ns := cfg.Namespace
+	w1 := evidence(desired("w1"), m5Now)
+	manualWorker(&w1)
+	zero := int32(0)
+	d1 := liveDeployment(t, cfg, w1, false)
+	d1.Spec.Replicas = &zero
+	d1.UID = "dep-w1"
+	objs := []runtime.Object{d1}
+	workers := []protocol.DesiredWorker{w1}
+	for _, id := range []string{"w2", "w3"} {
+		w := evidence(desired(id), m5Now)
+		workers = append(workers, w)
+		objs = append(objs, liveDeployment(t, cfg, w, false))
+		objs = append(objs, livePVCs(t, cfg, w, false)...)
+	}
+	cord := &fakeCordoner{}
+	m, client := npMatFor(t, cfg, cord, DrainPolicy{Deadline: time.Hour}, objs...)
+	for i := 1; i < len(workers); i++ {
+		currentProof(t, client, &workers[i], m5Now)
+	}
+	var d *appsv1.Deployment
+	for i := 0; i < 8; i++ {
+		if err := npTick(t, m, workers...); err != nil {
+			t.Fatalf("tick %d: %v", i+1, err)
+		}
+		d = npDep(t, client, ns, "w1")
+		if podPlacement(d) == "new" && d.Spec.Replicas != nil && *d.Spec.Replicas == 1 {
+			break
+		}
+	}
+	for _, n := range []string{dataPVCName("w1"), nixPVCName("w1")} {
+		if !isStamped(npPVC(t, client, ns, n)) {
+			t.Errorf("%s not stamped", n)
+		}
+	}
+	if podPlacement(d) != "new" || d.Spec.Replicas == nil || *d.Spec.Replicas != 1 {
+		t.Fatalf("w1 placement=%s replicas=%v; pacing=%+v", podPlacement(d), d.Spec.Replicas, m.PacingOutcomes()["w1"])
+	}
+	if len(cord.clearCalls) != 0 {
+		t.Errorf("manual cordon: ClearDrain called for %v", cord.clearCalls)
+	}
+	if w1.ManualCordonedAt == nil || !w1.ManualCordonedAt.Equal(m5Now) || w1.EffectiveCordoned == nil || !*w1.EffectiveCordoned {
+		t.Errorf("cordon fields changed on the desired worker: %+v %v", w1.ManualCordonedAt, w1.EffectiveCordoned)
+	}
+}
+
+// The per-tick decision stored on the Reconcile context is authoritative: consumers handed
+// an observation that implies the opposite decision (a mid-tick re-observation) must
+// follow the map, for both the render and the stamp on a created claim.
+func TestNewPlacementTickDecisionIsFrozen(t *testing.T) {
+	for _, mapStamped := range []bool{true, false} {
+		name := map[bool]string{true: "map-stamped-obs-legacy", false: "map-legacy-obs-stamped"}[mapStamped]
+		t.Run(name, func(t *testing.T) {
+			cfg := placementConfig()
+			ns := cfg.Namespace
+			w := evidence(desired("w1"), m5Now)
+			spec := testSpec(t, w.Template, w.Size)
+			// The observation reads the opposite of the map; the nix claim is missing.
+			obs := npObserved("w1", !mapStamped, "")
+			obs.HasNixPVC, obs.NixClaim = false, nil
+			if newPlacementStamped(cfg, obs) == mapStamped {
+				t.Fatal("observation does not imply the opposite decision")
+			}
+			m, client := npMat(t, cfg)
+			ctx := context.WithValue(context.Background(), placementTickKey{}, map[string]bool{"w1": mapStamped})
+
+			want := map[bool]string{true: "new", false: "global"}[mapStamped]
+			if got := podPlacement(RenderDeployment(m.renderCfgFor(ctx, w, obs), w, spec)); got != want {
+				t.Errorf("render placement = %s, want %s (the map)", got, want)
+			}
+
+			deferred, err := m.ensurePVCs(ctx, w, obs, ns, spec)
+			if err != nil || deferred {
+				t.Fatalf("ensurePVCs deferred=%v err=%v", deferred, err)
+			}
+			created := createdPVCs(client)
+			p, ok := created[nixPVCName("w1")]
+			if !ok || len(created) != 1 {
+				t.Fatalf("created claims = %v, want only the missing nix claim", created)
+			}
+			if isStamped(p) != mapStamped {
+				t.Errorf("created claim stamped=%v, want %v (the map)", isStamped(p), mapStamped)
+			}
+		})
+	}
+}
+
 // hand-built observation of a converged worker, for the consumers that take one directly.
 func npObserved(id string, stamped bool, hash string) reconcile.ObservedWorker {
 	claim := func(name string) *reconcile.ClaimObservation {
