@@ -794,7 +794,9 @@ workers:
   # volumes: see docs/hosted-workers.md "Moving workers to a new node pool". When no
   # unstamped worker remains, copy newPlacement into workers.nodeSelector and
   # workers.tolerations FIRST, then clear newPlacement; clearing it earlier sends
-  # stamped workers back to the old nodes.
+  # stamped workers back to the old nodes. Helm merges maps, so an empty
+  # `nodeSelector: {}` keeps the amd64 default: use `nodeSelector: null` when the new
+  # placement has none, and render the chart to confirm before clearing newPlacement.
   newPlacement:
     nodeSelector: {}
     tolerations: []

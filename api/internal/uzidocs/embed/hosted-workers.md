@@ -617,9 +617,11 @@ How the stamp works:
   merge. A tolerations-only `newPlacement` therefore renders no node selector at all:
   keep `kubernetes.io/arch: amd64` in `newPlacement.nodeSelector` and repeat any global
   toleration the worker still needs.
-- Setting `newPlacement` rolls nothing: existing workers' pod templates are unchanged.
-  Clearing it sends stamped workers back to the global placement; the stamps are kept,
-  so setting it again resumes.
+- Setting `newPlacement` rolls no worker that is still on the global placement: those
+  workers' pod templates are unchanged. Clearing it sends stamped workers back to the
+  global placement; the stamps are kept, so setting it again resumes. Changing it, or
+  setting it again with values different from before, changes stamped workers' pod
+  templates, and they roll through normal roll admission.
 - Which volumes are recreated decides which workers move. A recycle for data plus Nix
   pressure on a plain worker moves it. A Nix-only size recycle stays on the old
   placement, and so does a Docker pressure recycle, which keeps `/data`. Run-bound
@@ -630,11 +632,20 @@ default when it is empty). It must use `volumeBindingMode: WaitForFirstConsumer`
 otherwise provision in the new pool's zone. With `Immediate` binding a recreated volume
 is provisioned before any pod asks for it and can land in the old zone, after step 2.4
 has already deleted the worker's data; the worker then stays Pending on the new pool.
+Delayed binding alone is not enough: the provisioner must also be able to create
+volumes in the new pool's topology (no `allowedTopologies` or storage policy limited to
+the old zone). Prove it first, for example with a throwaway claim and pod pinned to a new
+node, before deleting any worker's volumes.
 
 Procedure:
 
-1. Set `workers.newPlacement` (`nodeSelector` and `tolerations`) in your values. Nothing
-   rolls.
+1. Set `workers.newPlacement` (`nodeSelector` and `tolerations`) in your values and
+   apply it (`helm upgrade`, or let the GitOps sync finish). Editing the values file alone
+   changes nothing. Confirm the running controller has it before step 2: its Deployment
+   carries `UZI_WORKER_NEW_PLACEMENT_NODE_SELECTOR` and/or
+   `UZI_WORKER_NEW_PLACEMENT_TOLERATIONS` with the expected values, and its pod has
+   restarted onto that spec. A controller still on the old configuration would recreate
+   the deleted volumes unstamped. No worker on the global placement rolls.
 2. For each worker that is not hibernated (wake a hibernated worker first, or leave it
    for later):
    1. Cordon the worker and wait until it holds no assigned run and no recovery custody
@@ -657,7 +668,11 @@ Procedure:
       new zone when the pod is scheduled.
    6. Confirm the worker is online on a new node, then uncordon it.
 3. When no unstamped worker remains, copy `newPlacement` into `workers.nodeSelector` and
-   `workers.tolerations` first, then clear `newPlacement`.
+   `workers.tolerations` first, then clear `newPlacement`. Helm merges maps into the
+   chart default, so an empty `nodeSelector: {}` keeps the default
+   `kubernetes.io/arch: amd64`; when the new placement has no node selector, set
+   `workers.nodeSelector: null`. Render the chart and confirm the global selector and
+   tolerations equal the new placement before clearing it.
 
 Check which workers are stamped. Annotations are not shown by `-L`, so use:
 
