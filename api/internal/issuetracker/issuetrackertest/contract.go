@@ -65,6 +65,9 @@ type SameNameSeams struct {
 	// IssueTracker under test. Nil skips the RenamedEligibilityTagIsStillListed
 	// case.
 	RenameTag func(t *testing.T, tagID, name string)
+	// SeedForeignTag seeds a tag named name that another user owns and that is
+	// visible to the connection's account, and returns its id.
+	SeedForeignTag func(t *testing.T, name string) string
 }
 
 // TagView is one server-side tag, as far as the SameName case judges it.
@@ -107,6 +110,7 @@ func RunContract(t *testing.T, newSubject func(t *testing.T) Subject) {
 		{"ProjectGuard", caseProjectGuard},
 		{"SameNameTagUsesEligibilityTag", caseSameNameTag},
 		{"RenamedEligibilityTagIsStillListed", caseRenamedEligibilityTag},
+		{"ListLabelsOnlyUsableTags", caseListLabelsOnlyUsableTags},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -551,5 +555,41 @@ func caseRenamedEligibilityTag(t *testing.T, c *contract) {
 	}
 	if got := c.get(t, lookalike).Labels; slices.Contains(got, elig) {
 		t.Errorf("an issue with only a same-named tag reports labels %v", got)
+	}
+}
+
+// caseListLabelsOnlyUsableTags shows that ListLabels offers only names a caller
+// can use: the eligibility name and the tags the account owns, not a tag of
+// another user that is merely visible.
+func caseListLabelsOnlyUsableTags(t *testing.T, c *contract) {
+	s := c.SameName
+	if s == nil {
+		t.Skip("labels have no owners on this implementation")
+	}
+	foreign := unique("contract-foreign")
+	s.SeedForeignTag(t, foreign)
+	count := func(name string) int {
+		t.Helper()
+		labels, err := c.IssueTracker.ListLabels(c.ctx, c.ProjectID)
+		if err != nil {
+			t.Fatalf("ListLabels: %v", err)
+		}
+		n := 0
+		for _, l := range labels {
+			if l.Name == name {
+				n++
+			}
+		}
+		return n
+	}
+	if n := count(foreign); n != 0 {
+		t.Errorf("ListLabels lists another user's tag %q %d times, want 0", foreign, n)
+	}
+	if n := count(s.EligibilityName); n != 1 {
+		t.Errorf("ListLabels lists the eligibility name %q %d times, want 1", s.EligibilityName, n)
+	}
+	c.ensure(t, foreign)
+	if n := count(foreign); n != 1 {
+		t.Errorf("after EnsureLabels ListLabels lists %q %d times, want 1", foreign, n)
 	}
 }

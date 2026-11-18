@@ -16,7 +16,7 @@ import { scratchLayout } from "./pod-epoch-scratch.js";
 import { maintenanceBootstrapRoots, readMaintenancePosture, recordMaintenanceBootstrap, snapshotMaintenanceBootstrap, terminalMaintenanceProof } from "./run-quiescence.js";
 import { MaintenanceWriterExclusion } from "./maintenance-exclusion.js";
 import { WorkerClient, RequestError } from "./client.js";
-import { GitCache, readRetireScratchOutcomesActivation, type GitCacheOptions } from "./git.js";
+import { GitCache, readRetireScratchOutcomesActivation, readRetireScratchReclaimActivation, type GitCacheOptions } from "./git.js";
 import { StubExecutor, waitForStubOutboxCut } from "./executor.js";
 import { SdkExecutor } from "./sdk-executor.js";
 import { selectCodexBinding, CodexSelectionError } from "./codex/select.js";
@@ -68,7 +68,7 @@ import type { CommandSandboxMode } from "./config.js";
 import { ensureRunnerTmpdir } from "./runner-tmpdir.js";
 import { createPodEpoch, restoreEpochRuntimeTmpdir } from "./pod-epoch-lock.js";
 import { inspectPodEpochBootstrap } from "./pod-epoch-bootstrap.js";
-import { PodEpochSettlementError, readEpochReclaimDeletionActivation, readEpochScratchDeletionActivation, runPodEpochShadow, type PodEpochDeletionDeps, type PodEpochScratchDeps } from "./pod-epoch-reclaim.js";
+import { PodEpochSettlementError, readEpochReclaimDeletionActivation, readEpochScratchDeletionActivation, runPodEpochShadow, type PodEpochDeletionDeps, type PodEpochRetireDeps, type PodEpochScratchDeps } from "./pod-epoch-reclaim.js";
 import { armShutdownResultDeadline, finishWorkerShutdown, type ShutdownGate, type ShutdownLog } from "./shutdown-barrier.js";
 
 export function buildWorkerGitCache(
@@ -152,6 +152,28 @@ export function buildPodEpochScratchDeps(parts: {
     activation: parts.activation === true, git: parts.git, quiesce: () => terminalMaintenanceProof(3, parts.dockerHost),
     ...(parts.authority ? { authority: parts.authority } : {}),
     ...(parts.outbox ? { outbox: parts.outbox } : {}),
+  };
+}
+
+/**
+ * The production dependencies of the pod-epoch retire-scratch reclaim (issue #4263). The switch permits phase entry only;
+ * these dependencies carry no test sentinel or seam. `runnerRoot` is the same `<dataDir>/runner` the GitCache uses.
+ */
+export function buildPodEpochRetireDeps(parts: {
+  authority: PodEpochRetireDeps["authority"];
+  runner: Pick<RunRunner, "withSourceReservation">;
+  git: PodEpochRetireDeps["git"];
+  dockerHost: string | undefined;
+  dataDir: string;
+  activation?: boolean;
+}): PodEpochRetireDeps {
+  return {
+    activation: parts.activation === true,
+    authority: parts.authority,
+    reserve: (runId, action) => parts.runner.withSourceReservation(runId, action),
+    quiesce: bound => terminalMaintenanceProof(3, parts.dockerHost, bound),
+    git: parts.git,
+    runnerRoot: path.join(parts.dataDir, "runner"),
   };
 }
 
@@ -501,6 +523,8 @@ async function mainBody(): Promise<void> {
   const epochScratchDeletion = readEpochScratchDeletionActivation(process.env);
   // Read here so an invalid value refuses startup, like the activation switches above.
   const retireScratchOutcomes = readRetireScratchOutcomesActivation(process.env);
+  // Issue #4263: on unless `UZI_RETIRE_SCRATCH_RECLAIM=0`; it permits the verified pass's retire-scratch phase and proves nothing.
+  const retireScratchReclaim = readRetireScratchReclaimActivation(process.env);
   const epochEnabled = process.env.UZI_EPOCH_LOCK === "1";
   if (epochEnabled && process.env.UZI_DATA_DIR !== "/data") {
     throw new Error("epoch workers require UZI_DATA_DIR=/data");
@@ -1235,16 +1259,6 @@ async function mainBody(): Promise<void> {
   // and holds a wall-clock deadline: when the api is unreachable nothing can be
   // reclaimed anyway, and a worker restarting while the api is unhealthy is a
   // CORRELATED failure, not an exotic one — they roll together.
-  // Issue #3153: `<dataDir>/runner` persists across pod replacements, so inspect `.retire-*`
-  // scratch parents a previous process left behind. Strictly before worker.run() (the claim loop
-  // and every retire/recovery path). Removes nothing: every parent, empty ones included, is retained
-  // and counted in one warning. Never throws. Parents newer than this process are not counted as retained.
-  // Unless UZI_RETIRE_SCRATCH_OUTCOMES=0 it then adds read-only, bounded observation records (one
-  // absolute 30 s budget, the abort signal of this process); it still removes nothing.
-  await git.inspectRetireScratchAtStartup(Date.now() - process.uptime() * 1000,
-    { outcomes: retireScratchOutcomes, signal: controller.signal })
-    .catch((err) => log.warn("runner retire scratch inspection threw", { error: errMessage(err) }));
-
   if (config.homeReclaimEnabled) {
     await reclaimStrandedRunHomes(
       sdkHomeRoot,
@@ -1280,6 +1294,7 @@ async function mainBody(): Promise<void> {
     return;
   }
 
+  let retireReport;
   if (epochBootstrap && epochOwnership && epochConsumption) {
     const result = await runPodEpochShadow({
       bootstrap: epochBootstrap, ownership: epochOwnership, consumption: epochConsumption,
@@ -1294,8 +1309,14 @@ async function mainBody(): Promise<void> {
           }).inspectRun(runId, bound),
         }, outbox,
       }),
+      retire: buildPodEpochRetireDeps({ authority, runner, git, dockerHost: config.dockerWiring.dockerHost, dataDir: config.dataDir, activation: retireScratchReclaim }),
     });
-    if (result !== undefined) log.info("pod_epoch_reclaim", { ...result });
+    if (result !== undefined) {
+      // The per-parent report is for the retire-scratch inspector below, not for the operator log line.
+      const { retire_report, ...logged } = result;
+      retireReport = retire_report;
+      log.info("pod_epoch_reclaim", { ...logged });
+    }
   }
   if (controller.signal.aborted) {
     const gate = await finishShutdown();
@@ -1305,6 +1326,17 @@ async function mainBody(): Promise<void> {
     });
     return;
   }
+
+  // Issue #3153: `<dataDir>/runner` persists across pod replacements, so inspect the `.retire-*` scratch parents that
+  // remain. Strictly before worker.run() (the claim loop and every retire/recovery path), and since issue #4263 AFTER the
+  // verified pod-epoch pass: the pass is the only thing that removes a bound parent, and this inspection reports what it
+  // reclaimed and why it kept the rest. The inspector itself removes nothing and never throws. Parents newer than this
+  // process are not counted as retained. Unless UZI_RETIRE_SCRATCH_OUTCOMES=0 it adds read-only, bounded observation
+  // records (one absolute 30 s budget, the abort signal of this process).
+  await git.inspectRetireScratchAtStartup(Date.now() - process.uptime() * 1000,
+    { outcomes: retireScratchOutcomes, signal: controller.signal,
+      reclaim: { enabled: retireScratchReclaim, ...(retireReport ? { report: retireReport } : {}) } })
+    .catch((err) => log.warn("runner retire scratch inspection threw", { error: errMessage(err) }));
 
   lifecyclePhase = "worker";
   await worker.run(controller.signal);

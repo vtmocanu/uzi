@@ -225,6 +225,13 @@ func (s *Service) guardedMRMove(ctx context.Context, repoID uuid.UUID, forgeProj
 	}
 
 	if _, err := s.AutoMove(ctx, tr, forgeProjectID, issue, cols, target); err != nil {
+		if IssueWriteSkippable(err) {
+			// A linked repo's card is never moved by uzi (writes arrive in M5) or its
+			// issue is gone: consume the edge so recordMRState still records the MR
+			// state, and never retry forever (PRD #4173 D10).
+			slog.Info("forgesvc: MR-state move skipped for a linked repo", "repo", repoID, "issue", issueIID, "target", target, "reason", err)
+			return moveSkipped
+		}
 		// Forge error: leave mr_state unadvanced so the next tick re-observes this
 		// edge and retries once the forge is reachable again.
 		slog.Warn("forgesvc: MR-state move failed, will retry", "repo", repoID, "issue", issueIID, "target", target, "error", err)
@@ -239,8 +246,9 @@ func (s *Service) guardedMRMove(ctx context.Context, repoID uuid.UUID, forgeProj
 // so no run is ever recorded by both on one tick: ListMRWatchCandidates requires a
 // non-null issue_iid (via its issues JOIN) AND kind NOT IN ('prompt','self_improve'),
 // while ListBoardFreeMRStateWatchCandidates owns exactly the complement
-// (issue_iid IS NULL OR kind IN ('prompt','self_improve')) — a run cannot satisfy both
-// predicates at once. Best-effort: a write failure only means the same edge is
+// (issue_iid IS NULL OR kind IN ('prompt','self_improve'), plus EVERY run of a repo linked
+// to an external issue tracker, which the board lane excludes — PRD #4173 M4) — a run
+// cannot satisfy both predicates at once. Best-effort: a write failure only means the same edge is
 // re-observed next tick, and the guards make the retry a no-op if the card has
 // already moved.
 func (s *Service) recordMRState(ctx context.Context, runID uuid.UUID, state string) {

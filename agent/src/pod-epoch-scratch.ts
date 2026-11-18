@@ -279,7 +279,15 @@ const SHARED_PREFIX = "/data/runner-shared/";
 /** The worker container mounts the whole data PVC at /data and its runner-shared subPath at
  * /data/runner, so the same scratch inodes are also reachable under /data/runner-shared. */
 function rootsWithAlias(root: string): string[] {
+  if (root === "/data/runner") return [root, "/data/runner-shared"];
   return root.startsWith(RUNNER_PREFIX) ? [root, SHARED_PREFIX + root.slice(RUNNER_PREFIX.length)] : [root];
+}
+
+/** The `/data/runner` spelling of a path that may be written through the `/data/runner-shared` alias; anything else unchanged. */
+export function canonicalRunnerAlias(p: string): string {
+  const n = path.posix.resolve(p);
+  if (n === "/data/runner-shared") return "/data/runner";
+  return n.startsWith(SHARED_PREFIX) ? RUNNER_PREFIX + n.slice(SHARED_PREFIX.length) : n;
 }
 
 function allWorkerIds(status: string, label: "Uid" | "Gid"): boolean {

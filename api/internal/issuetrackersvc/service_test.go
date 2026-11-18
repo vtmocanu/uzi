@@ -27,8 +27,11 @@ const testHost = "https://issues.example.com"
 
 // fakeQuerier is an in-memory Querier keyed like the real table.
 type fakeQuerier struct {
-	mu   sync.Mutex
-	rows []store.IssueTrackerConnection
+	mu    sync.Mutex
+	rows  []store.IssueTrackerConnection
+	repos map[uuid.UUID]*fakeRepo // link-side state; see link_fake_test.go
+	// deleteErr, when set, is what DeleteIssueTrackerConnectionForUser answers.
+	deleteErr error
 }
 
 func (f *fakeQuerier) UpsertIssueTrackerConnection(_ context.Context, a store.UpsertIssueTrackerConnectionParams) (store.IssueTrackerConnection, error) {
@@ -77,6 +80,9 @@ func (f *fakeQuerier) GetIssueTrackerConnectionForUser(_ context.Context, a stor
 func (f *fakeQuerier) DeleteIssueTrackerConnectionForUser(_ context.Context, a store.DeleteIssueTrackerConnectionForUserParams) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.deleteErr != nil {
+		return 0, f.deleteErr
+	}
 	for i, r := range f.rows {
 		if r.ID == a.ID && r.UserID == a.UserID {
 			f.rows = append(f.rows[:i], f.rows[i+1:]...)

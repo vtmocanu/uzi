@@ -344,7 +344,8 @@ retired-ledger write, and the ledger names only the canonical clone path; a
 retired ledger, emptiness, age or the parent name grant nothing. The legacy
 stderr-proof repair (#4141, landed via #4152) does not certify remnants created
 by older code retroactively, and #4137 is a distinct residual. Reclaim remains
-open on #4143 pending a durable parent-binding design.
+open on #4143 pending a durable parent-binding design (superseded in part by the
+2026-11-17 #4263 amendment below).
 
 ## Amendment (2026-11-17, #4420)
 
@@ -379,3 +380,440 @@ Deferred, not shipped: deletion at run end (no fence against sibling runner-uid 
 or Docker-created mounts after the listing, the #4043 deferral), startup throughput,
 run-procs and cache-cap attribution of the leaf; retained-discovery overflow keeps all
 run leaves for that pass; runs reassigned to another worker are kept on the old worker.
+
+## Amendment 2026-11-17 — issue #4263: durable `.retire-*` parent bindings and verified-epoch reclaim
+
+This amendment narrows D4 and D5 ("no new cleanup authority") and the 2026-11-13
+statement that reclaim stays open: a gated, default-on exception was designed to
+let a verified pod epoch remove a **bound** `.retire-*` parent. **As shipped
+(C-prime, below), a uid-split pod never settles a parent, so the epoch deletes no
+bound parent in production**; the removal machinery is retained without a
+producer. Unbound (legacy, attempt-less) parents stay kept exactly as before.
+
+**Owner amendment of the requirement.** Issue #4263 asked for the binding
+"inside an existing record (the recovery journal or the attempt ledger)". The
+owner amended that to **"a scoped sibling record (`uzi-retire-scratch.<uuid>.binding`)
+in the existing bare-config store"**. That is the same store, not the same
+record: neither the journal nor the ledger gained a field.
+
+### The binding
+
+- **Key and value.** Key `uzi-retire-scratch.<uuid>.binding` in the retiring
+  attempt's bare config; `<uuid>` is the parent's UUID. Value is canonical JSON
+  in this field order: `v` (always 1), `class`, `attemptId`, `runId`, `branch`,
+  `clonePath`, `phase`, `parentIno`, `cloneIno`, `pod`. Inodes are canonical
+  decimals; no device number is persisted (device equality is checked only
+  in-pass, against the pinned runner root). The value is never empty or valueless.
+- **Phases.** `intent` (written before the clone moves; grants nothing),
+  `settled` (a reserved value: **no code writes it** since the C-prime owner
+  decision below; a pre-existing value still parses and is kept as
+  `settled_kept`) and `removing` (written durably before the first byte of the
+  parent is deleted).
+- **Strict codec.** A reader accepts only a value that re-serializes to itself
+  (known class and phase, valid attempt id and run id, absolute normalized
+  `clonePath`, key uuid valid, canonical inodes, bounded length, no control or
+  bidi characters). Anything else, a duplicated key or a valueless key is
+  `malformed_binding` and keeps the parent.
+- **Cap.** At most 64 binding keys per bare, counting every entry under the
+  prefix whether valid or not. At the cap a new retire writes no binding: its
+  parent is unbound and gets today's in-process removal attempt on both
+  postures. On a uid-split pod that worker removal usually fails on runner-owned
+  content and leaves the parent (and possibly partial residue) behind unbound, as
+  before this change. The retire logs `retire scratch binding cap reached` and
+  reports it `unbound`.
+  A read that finds more than 64 is `unknown`, never a truncated list, and keeps
+  everything. The cap also bounds the added records against the epoch metadata
+  caps and the ACK reader's 1024-entry config cap.
+  - Bindings that are never removed hold slots permanently. On a uid-split pod
+    every bound non-completion retire leaves its `intent` binding with the parent
+    on disk, so each one holds one of the 64 slots indefinitely; so do an
+    interrupted `removing` and any pre-existing `settled` binding kept by a keep
+    reason. The cap fills at 64 such keys in one bare.
+  - After 64 kept split retires on one bare, a further retire writes no binding
+    and takes the pre-binding unbound in-process removal path on the split pod.
+    That attempt can succeed; when it fails (typical on a uid-split pod), the
+    parent and possibly partial residue is retained unbound and never reclaimed by
+    the epoch. Retention can grow with each further retirement in that bare whose
+    removal fails.
+  - This is an accepted residual. No purge route exists.
+
+### Who binds, and why no class settles
+
+Every EXDEV retire that carries an `attemptId` and a disposition class binds its
+new parent (`retireRunnerClone` takes the class from its caller in
+`agent/src/runner.ts`). No class is ever written as `settled` (C-prime, below); the
+"Eligible" column records which classes carry disposition authority that today's
+code already exercises in-process on a single-uid pod:
+
+| Class | Binds | Eligible | Reason |
+|---|---|---|---|
+| `owner_terminal` | yes | yes | The run's own terminal disposition, which today's code already carries out in-process. On a split pod its binding stays `intent` with the parent on disk (`bound_intent`). |
+| `verified_successor` | yes | yes | A server-acknowledged covering FINAL, which today's code already carries out in-process. On a split pod its binding stays `intent` with the parent on disk (`bound_intent`). |
+| `owner_terminal_covered` | yes | never | `preserveRecoveryClone` was lifted by the stopped-source covered verdict, or the retiring flight was parked (limit, pause or recovery park: a parked run is not terminal, so its scratch must not become reclaimable). The covered verdict's proof (`worktreeCleanHardened`) can still miss ignored paths and runner-unreadable directories that Git silently omits (#4141 fixed only the stderr case; #4137 stays open). On a split pod its binding stays `intent` with the parent on disk and reads `bound_intent` (it never settles). |
+| `completion` | yes | never | Completion keeps the outer bare lock and raw-removes in-process; its binding writes `removing` before that removal and never settles. The binding is unset after a successful in-process removal; a failed or partial removal leaves `removing`, which reads `interrupted_removal`. |
+| `other` (foreign-orphan) | yes | never | No owner-terminal or acknowledged-FINAL authority backs it. On a split pod its binding stays `intent` with the parent on disk and reads `bound_intent` (it never settles). In production a foreign-orphan retire carries no `attemptId`, so it is in practice unbound (today's behaviour). |
+| attempt-less retire | no | never | The owner's cross-check against the attempt-ledger entry (attemptId, runId, clonePath) cannot be satisfied without an attemptId; the parent stays unbound and kept. |
+
+`class_ineligible` is no longer reachable (every parsed phase is kept before the
+class check), and `settled_kept` is reachable only for a `settled` value, which
+no writer produces (a pre-existing value is read and kept); it is a defensive
+reading, not an outcome seen in practice.
+
+### Split-pod parents are never settled (C-prime, issue #4263 review finding [7])
+
+On a uid-split pod (`UZI_UID_SPLIT=1`) `retireRunnerClone` never writes
+`settled`. A bound parent of any class, `owner_terminal` and
+`verified_successor` included, stays at its `intent` phase with the parent and
+the moved clone left in place (`unproven`, logged as kept in place). No new phase was
+added. The `settle-write`, `settle-sync` and `settled` retire steps no longer
+exist; `RETIRE_PHASES` still parses `settled` so a pre-existing value is read
+and kept. This adds no disposition authority and removes none that earlier code
+had: the epoch gains nothing from the binding except exclusion.
+
+**Why (owner decision C-prime).** An earlier draft settled a split parent after
+every proof held (rename verified and synced, journal clear and `retired` append
+synced, terminal protection false, no quarantine or process revocation), with a
+guard re-reading terminal protection, process proof and the residue quarantine
+just before the config write. That left residual R: a process-proof revocation
+arriving after the guard's last check, while the config write or its sync ran,
+followed by a crash or power loss, could leave `settled`, which authorized epoch
+deletion although the proof had been revoked. Process proof and the quarantine
+latch are in-memory only, so a crash erases the revocation and the epoch's later
+checks catch it only if its cause is still observable.
+
+**Residual R is CLOSED BY CONSTRUCTION.** There is no writer of `settled`, and the
+epoch keeps any `settled` binding it finds as `settled_kept` (a keep reason, not a
+phase). The retire-scratch epoch phase runs only on split pods, where it never
+deletes any bound parent: `intent` reads `bound_intent`, `removing` reads
+`interrupted_removal`, `settled` reads `settled_kept`.
+
+Narrowed guarantee, stated by kind:
+
+- **(a) No code writes `settled`** and **(c) recovery and compaction never promote
+  a binding** (compaction only keeps entries; the gone-parent recovery only unsets
+  a binding). These are code properties. They hold at every crash point, for a
+  process crash and for storage or power loss alike, because they do not depend on
+  any write surviving.
+- **(b) The epoch decides each pass from whatever binding survives** (absent,
+  `intent`, `settled` or `removing`), and none of those leads to deletion of a
+  parent. An absent binding is an unbound parent, which the epoch never removes.
+- **Not claimed:** that the parent or clone is present after every crash. A
+  failure before the move (an `intent` write or sync failure) removes the empty
+  parent and fails the retire closed, and a process-proof rollback restores the
+  canonical clone and removes the scratch parent. Both are unchanged.
+
+**Gone-parent metadata-only recovery is unchanged.** When the parent is already
+gone, the binding is unset after the custody, authority and eligibility gates
+(see the recovery route below). It deletes no bytes.
+
+**Accepted cost.** Split-pod retire scratch is not reclaimed by the epoch. It is
+kept as `bound_intent` indefinitely; reclaim needs operator action or the existing
+discard paths. Two cap consequences follow:
+
+- Each `intent` binding holds one of the 64 per-bare binding slots (see Cap). After
+  64 kept split retires on one bare, a further retire writes no binding and takes
+  the pre-binding unbound in-process removal path on the split pod.
+- The epoch fills at most 64 work slots per pass, sorted by uuid. A present parent
+  whose nomination over the evidence already read is a keep (every present binding
+  phase under C-prime) is reported kept without taking a slot, so kept present
+  parents cannot starve gone-parent recovery. Gone parents still take slots: 64 or
+  more earlier-sorting gone parents that keep failing a later check (`conflict`,
+  `malformed_binding`, `metadata_unresolved`, custody) can block later ones, and
+  while those failures persist the later parents are never recovered (accepted
+  residual: possibly permanent starvation, the same sorted-prefix limit the pass
+  had before C-prime; no eventual recovery is promised).
+
+**The disposal route is retained with no producer.** The epoch's removal machinery
+(`markRemoving`, the `empty-fd` helper, `discardRetireScratchParent`, `reclaimed`
+rows) has no production producer on a split pod. It is kept because the real-image
+e2e tests drive the helpers directly; removing it is a deferred simplification.
+
+### Write and sync ordering, failure model
+
+- Each write is git's atomic `config.lock` rename, followed by an fsync of the
+  config file and of the bare directory, and a required byte-identical read-back,
+  before the next dependent effect. Bindings are durable across process crash and
+  across storage loss on ext4 and XFS.
+- Order: create and pin the parent, sync the runner root, record the clone inode,
+  write `intent`, rename, verify the moved clone through the parent pin, sync the
+  source directory and the parent, clear the journal and append `retired`, sync. A split pod ends there (it never
+  writes `settled`); a non-split pod continues to `removing`, the in-process
+  removal and the unset. A directory that holds an effect is synced before the binding
+  transition that depends on it; the runner root is synced after the parent is
+  removed and before the binding is unset.
+- Effects that never gate a transition carry no durability claim: the `mkdir`
+  before `intent`, and **partial removal under `removing`**. Losing them only
+  makes an identity check fail, which keeps.
+- Failure before the move (an intent write or sync failure) removes the empty
+  parent and fails the retire closed, leaving the clone and journal untouched.
+  This is a stated behaviour change. A failure in a later metadata step leaves the
+  binding where it was (harmless `intent`).
+- **Interrupted removal is kept permanently** (owner decision). A binding at
+  `removing` is never retried, resumed or retired automatically; it reads
+  `interrupted_removal`.
+- **Split pod versus single uid.** On a split pod the worker no longer removes
+  **any** bound non-completion parent in-process (`if (bound && split)` in
+  `retireRunnerCloneImpl`); it leaves the parent on disk at `intent` and never
+  writes `settled`, whatever the class (`owner_terminal`, `verified_successor`,
+  `owner_terminal_covered`, `other`), and no path reclaims it
+  (`bound_intent`). Only completion keeps its in-process removal (`removing`
+  written first, unset after success). **Accepted residual:** this is a behaviour
+  change for every non-completion class on a split pod. Previously the worker's in-process
+  `rm` attempted them (and usually failed on runner-owned content); now it never
+  tries, so retention only grows, never shrinks. Foreign-orphan retires carry no
+  `attemptId` in production, so they are in practice unbound and unchanged.
+  Unbound parents keep today's path-based removal. Single-uid **disposal** is
+  unchanged: the walker and the writer share the uid, so the binding goes
+  straight to `removing` and the existing in-process `rm` runs, then the binding
+  is unset after the runner root is synced. What does change on a single-uid
+  pod: bindings are written; a failed intent write fails the retire closed (the
+  clone stays canonical); the 64-binding cap applies; and a failed in-process
+  `rm` leaves a permanent `removing` entry that keeps that attempt's ledger entry
+  from compaction. **#2349 site 2
+  (holding/scratch disposal in `retireRunnerClone`) therefore stays open**; see
+  ADR-1809.
+
+### The verified-epoch phase
+
+**Current behaviour (C-prime): this phase never deletes a bound parent.** It runs
+only on split pods, and the only bindings those pods carry are `intent` (kept as
+`bound_intent`), `removing` (`interrupted_removal`) and a pre-existing `settled`
+(`settled_kept`). What follows describes the retained gates and the disposal
+route, which has no production producer; the real-image e2e tests drive its
+helpers directly. The phase's live work is the gone-parent metadata-only recovery
+and the keep verdicts.
+
+The retire-scratch phase runs **last** in the verified pod-epoch pass, after the
+scratch phase and the attempt-deletion phase, under the same shadow gate (an
+`eligible` verdict, `attested` authority and an intact pass) plus its own switch.
+The binding is never activation authority; the phase does not alter the shadow
+verdict or reason and reports only a `retire_scratch` block and
+`retire_scratch_phase_ms` on the `pod_epoch_reclaim` line.
+
+- **Whole-phase refusals** keep every parent and record one fixed token:
+  `split_inactive` (single-uid pods never run it), the pod-entry fence, the
+  runner-root pin or posture (`root_posture`), a mount at or under the runner root
+  (`mount_unexpected`) or an unreadable mount table (`mount_unknown`), a
+  filesystem other than ext4 or XFS (`fs_unsupported`), an unreadable or
+  at-or-above bind inventory (`bind_unknown`), a failed idle proof (`not_idle`),
+  unreadable evidence (`evidence_unknown`, `protected_unknown`), an incomplete
+  root listing over 4096 entries (`list_incomplete`), an unreadable process scan,
+  and a budget too short to start (`budget_deferred`). The same conditions
+  re-checked mid-phase halt it with that token.
+- **Budget.** The phase needs 30 s of admission headroom, is capped at 120 s and
+  leaves a 10 s margin before the pass settlement reserve. No new candidate starts
+  with under 20 s left; at most 64 work slots and 2,000,000 helper entries per
+  pass, sorted by uuid. Present parents kept at nomination are reported without a
+  slot, so only gone (or workable) parents fill the slots; see the residual under
+  Cap consequences. A deferral (`budget_deferred`,
+  `epoch_not_eligible`) never changes the
+  verdict, is counted separately from `kept` and leaves the binding untouched.
+  The helper gets at most min(300 s, phase window − 5 s); with the 120 s phase cap
+  that is at most about 115 s.
+- **Per-candidate exclusion.** Each candidate is re-proven under the existing
+  A, S, B order: the authority transaction (A), the run's source reservation (S),
+  and the parent bare's lock (B). Every other bare's protected paths and
+  retire evidence (bindings and attempt ledgers) are read again inside S, before B;
+  writers on other bares take their own bare's lock, never this one, so that read
+  sees what a read inside B would. Inside B the binding, ledger, journal, restore
+  holder, custody, quarantine and canonical footprint are read again. The S
+  re-reads are separate. If the protected-paths re-read is unknown, the parent is
+  kept as `protected_by_retained_source` (`budget_deferred` when the phase window
+  is over). If the retire-evidence re-read of the other bares is unknown, the
+  parent is kept: `budget_deferred` when the phase window is over, else
+  `conflict` for a present parent or `metadata_unresolved` for a gone one.
+  **Cross-bare attempt identity**
+  (`retireCrossBareConflict`): any other bare's binding entry that cannot be
+  decoded, any decoded binding naming the attempt, or any ledger value not
+  positively identified as a different attempt keeps the parent. For a present
+  parent the binding is already kept for its own reason (`bound_intent`,
+  `interrupted_removal` or `settled_kept`); for a gone parent every phase is checked. Values that keep it
+  include unparseable text, `{}`, `null`, a non-string or malformed `attemptId`
+  and values naming the attempt. This holds at nomination,
+  under the lock for deletion and in gone-parent recovery (kept as `conflict` at
+  nomination, `metadata_unresolved` under the lock). A gone parent whose uuid is
+  bound in more than one bare is kept as `conflict`. The check reads only bares
+  other than the parent's own, so one undecodable binding or ledger value that
+  cannot be attributed to any attempt, in any bare, keeps every bound parent of
+  every other bare (present, or gone in any phase) until it is removed.
+  Under B the source-use check is read-only (a held lease from
+  another sink, or an active slot, keeps with `source_use_held`; nothing is
+  admitted or taken over); the parent must be a worker-owned 0700 directory with
+  the bound inode on the root's device, holding only `clone`, older than the
+  predecessor's pod-entry fence; mounts, binds, the daemon inventory, the idle
+  proof and a fresh process scan are re-read for that parent. The run must be
+  terminal with zero server-side holds.
+- **Alias-aware protection.** Retained-source protection treats
+  `/data/runner-shared/...` as `/data/runner/...` at the runner root, so a
+  journal or retained source written through either spelling protects the parent.
+- **Removal route (retained, no production producer).** The existing strict pinned helper script gains one argument
+  shape, `empty-fd`. The worker pins `<parent>/clone` (`O_PATH`, no symlink
+  follow, directory) and passes it as child fd 3; the pass's exclusive lock is fd
+  4. The helper runs **as the runner uid** through the one `runnerCommand`
+  wrapper, never the command-root wrapper and never a worker, retry or chmod
+  step, and it refuses to launch unless the uid split is active. It re-checks
+  fd 3's identity, empties it under the same strict rules as `remove` (one
+  filesystem, descendant re-pin, symlinks unlinked and never followed, entry,
+  depth and time caps) and never removes the directory itself. **No chmod, no
+  chown, no privilege increase and no raw fallback.** Its receipt is not
+  emptiness proof; the worker's own `rmdir` of `clone`, then of the parent (whose
+  pin must then report zero links), is. Root posture (worker-owned and sticky) and
+  the root's mount id are checked on the parent and clone pins before launch.
+  Helper stderr is never logged; only its bounded length is. Any non-receipt,
+  `rmdir` failure, identity change or sync failure is residue.
+- **`removing` order (retained route, no production producer).** The `removing` phase is written by the last pre-effect
+  callback, after every identity, posture and budget refusal. A refusal before it
+  keeps the earlier binding; a failure after it keeps `removing`. After a verified removal
+  the runner root is synced and the binding is unset (`unset_failed` counts a
+  failed unset; a later pass recovers it).
+- **Recovery route (parent gone).** A binding whose parent is already absent is
+  resolved by metadata only, under the same A, S, B: case 1, the ledger's last
+  canonical value is the matching `retired` entry, the canonical clone is absent
+  with no footprint and nothing names it; case 2, an `intent` binding whose
+  canonical clone is still present at the bound inode and is still named by its
+  journal (the clone never moved). The binding is unset after the relevant
+  directory syncs. Anything else is `metadata_unresolved` and the binding stays.
+
+### Switch
+
+Worker `UZI_RETIRE_SCRATCH_RECLAIM` (unset, empty or `1` on; `0` off; other
+values refuse startup), controller `UZI_WORKER_RETIRE_SCRATCH_RECLAIM` (empty or
+`true` on; `false` off; other values a boot error) and strict-boolean chart
+`workers.epochReclaim.retireScratchReclaim` (default `true`; `false` renders
+worker `UZI_RETIRE_SCRATCH_RECLAIM=0` on every worker). Default renders are
+unchanged. Off means the pass reads no binding, removes nothing and unsets
+nothing (`retire_scratch.reason` is `disabled`); retire-path binding writes
+continue, as metadata only. The switch permits the phase and proves nothing.
+
+### Outcome records
+
+The startup `.retire-*` inspector now runs **after** the verified pass (still
+before the claim loop) and reports what the pass did. Rows carry `reclaimed` as
+an outcome for parents the pass removed and a binding-aware `reason` for kept
+ones: the pass's own token for a parent it examined, otherwise `bound_intent`,
+`interrupted_removal`, `malformed_binding` or `settled_kept` for a bound parent
+(a settled binding row the pass did not report reads `settled_kept`, never
+`disabled`, `epoch_not_eligible` or `budget_deferred`), and the #4143 reasons for an unbound one.
+The total line gains `reclaimed`, `reclaimed_bytes`, `kept_by_reason` and
+`removing_bindings`.
+
+### Readers of the bare config (rollback safety)
+
+Old code has no reader for the key and never deletes `.retire-*`, so it cannot
+create authority; authority needs a binding written by new code, the ledger
+cross-check and every in-pass check. Reader-by-reader decisions (abbreviated;
+`agent/test/retire-binding-old-readers.test.ts` pins the unchanged ones against raw config keys):
+
+| Reader | Decision |
+|---|---|
+| `collectEpochScratchProtectedPaths` | No change. Absolute paths in the JSON value join the protected set (outside the TMPDIR scratch root, harmless); a valueless `uzi-*` key reads `unknown`, so the binding is never valueless. |
+| Epoch census, maintenance and recovery families, FINAL inventory, terminal attribution, restore census and restore-route | No change. They match exact key families and ignore the prefix; none lists the runner root. |
+| ACK reader and runGit config accounting | Entries count toward their caps (1024 entries); the 64-per-bare cap bounds the addition. |
+| Startup inspector | Changed: reads bindings and reports binding-aware reasons. |
+| Attempt-ledger compaction | Changed: an attempt named by a binding keeps its `retired` entry; an unreadable or undecodable binding set keeps every entry; an attempt whose ledger values, on any branch, or a binding name more than one run, clone path or branch keeps every value verbatim, never dropped or collapsed (issue #4263); its binding is kept as `ledger_mismatch`, or `conflict` when a second binding names it. Such a conflict no longer heals by compaction, so readers that already refuse it (terminal attribution `duplicate_attempt`, the recovery source ledger check) keep refusing; normal flows never write a second identity for an attempt id. Cross-bare: compaction reads every other bare's config once, without that bare's lock, and preserves verbatim any attempt id another bare names (a decoded binding or an identified ledger value); while any other bare holds a decoded binding, own values that cannot be attributed to an attempt are kept too. Guarantee: every cross-bare conflict observed in that snapshot is preserved; a mention written after the read is outside it, so if another bare's first binding is written after the scan read none, an own unattributable value may be dropped; by the legitimate-writer argument that value is not about that binding's attempt, so only an earlier reclaim follows (legitimate writers only write fresh-minted ids, `mintAttemptId`: timestamp, claim generation, 64 random bits, or same-bare ids into their own bare under its lock). The scan is bounded (1024 bares, 16 MiB, 131072 records, a 5 s budget checked between reads); on any failure compaction is skipped, the ledger is unchanged and it warns `attempt ledger compaction skipped: foreign retire evidence unavailable` with a fixed reason (`bare_cap`, `bytes_cap`, `records_cap`, `deadline`, `unreadable`, `binding_unknown`, `binding_undecodable`, `ledger_unidentified`). A kept unattributable value is self-sustaining (the refused reclaim leaves its binding, and other bares' compaction skips on it); remediation is an operator-only, unsupported step done with the worker stopped, since compaction computes what to keep from an earlier read and its rewrite could reinstate a value an operator removed after that read. One unreadable or unidentifiable foreign bare disables compaction worker-wide. |
+| Hibernation census (filesystem walk of the runner root) | No change. A bound parent reports `unknown`, which blocks volume retirement conservatively (a residual below). |
+| `backup-runs.sh` config reads | No change. They match exact keys; a retired, discarded clone is not backup material. |
+
+Rollback to an older worker image: old compaction dropping a `retired` entry
+reads `ledger_missing`, a re-seeded attempt id `ledger_mismatch`, a journal or
+retained source naming the parent `protected_by_retained_source`, a moved clone
+or parent `identity_changed`; an old-image retire writes no binding, so its
+parent is unbound and kept.
+
+### Writers that participate
+
+| Writer | Participation |
+|---|---|
+| EXDEV retire in `retireRunnerClone` (owner terminal, verified successor, completion, foreign-orphan) | Writes `intent`, then `removing` (completion, and every bound class on a single-uid pod); unsets after a confirmed removal. Never writes `settled`. On a split pod every bound non-completion class stays at `intent` (`bound_intent`) with the parent kept; no in-process removal. |
+| Completion disposal | Writes `removing` before its raw `rm`; never settles; unsets only after a successful full disposal. |
+| Single-uid in-process removal | Writes `removing` before the `rm`; unsets after the runner root is synced; failure keeps `removing`. |
+| Verified-epoch phase | Unsets in the gone-parent recovery route. Its `removing` write belongs to the retained disposal route, which has no production producer. |
+| Attempt-ledger compaction | Reads bindings to keep named entries, and reads every other bare's config once without that bare's lock. |
+
+### D1 outcome (design review before the removal route)
+
+An architect, auditor and reviewer examined two judgments and found no stop.
+
+- **Judgment A.** The runner unlinking runner-cmd-owned files through
+  group-writable directories is not "runner-cmd disposal" in the sense of #4137 and
+  #4143: the helper runs only as the runner uid and never chmods, and the runner
+  already had that reach (the worker had it before this change, and the canonical
+  clone path is already freed by deleting its content as the runner uid).
+- **Judgment B.** Yes, the two eligible classes' disposition can rest on
+  runner-uid git status and capture proofs (the restore-point transfer, the
+  credential-free clean-head check and the FINAL capture all run as the runner
+  uid), but only under a **visibility invariant**: content that #4137's residual
+  hides lives in directories the runner cannot open; `empty-fd` runs with the same
+  uid and groups as the capture git, so it cannot list or unlink that content
+  either; the worker's step is only `rmdir`, which fails on a non-empty directory
+  and leaves residue (the binding stays `removing`, the bytes survive). The
+  invariant covers runner-unreadable directories only, not gitignored files.
+  Gitignored files are already outside every capture and outside terminal coverage
+  by the existing contract (the accepted residuals in
+  `adr/1786-stopped-source-retention.md`; `docs/run-recovery.md`, "Gitignored files
+  are not covered by any capture" and its "Gitignored files are not covered."
+  bullet), so runner-readable ignored content can be removed under that exclusion.
+  The capture contract is unchanged, and the receipt is still not proof of
+  emptiness. The invariant holds only while there is a single runner pass, no chmod by helper or
+  worker, identity and groups equal to the capture git identity, and no runner-cmd
+  process alive (the process scan refuses non-worker uids). Any second identity or
+  a chmod makes both classes ineligible.
+- **Narrowings adopted.** The launch wrapper list is exactly `runnerCommand`
+  (mutation-pinned); a per-candidate mount, bind and filesystem gate re-read at
+  each of A, S and B; residual fixtures with runner-cmd content inside tracked
+  directories; helper stderr never logged; empty-fd refused when the split is
+  inactive; the receipt is never emptiness proof; deferral applies only to
+  bound non-completion parents. Rejected alternative: opening the parent
+  group write and search for a strict `remove`, which would let the agent uid
+  plant entries in a worker-private parent.
+
+### Residuals
+
+- **Historical-pod writer.** A worker image without this change writes no
+  binding; its parents stay unbound and kept.
+- **Clone substitution before `retire()` starts.** The clone directory is pinned
+  at the start of `retire()`; a substitution of `clonePath` before that point is
+  runner-controlled content in the runner-writable repo directory. It gains no
+  privilege and the deletion scope equals today's.
+- **Hibernation census** reports a bound parent as `unknown`, which blocks volume
+  retirement conservatively.
+- **Availability cost of `removing`.** A `removing` binding is never reclaimed,
+  and the total line counts them (`removing_bindings`). This includes the case
+  where liveness or the reservation is lost right after the `removing` write
+  while the parent is still intact: it stays at `removing` and kept, although
+  nothing was deleted. An unreadable or undecodable binding set keeps
+  every entry of that bare, and since issue #4263 the effect is worker-wide: an
+  undecodable binding in one bare makes every other bare's compaction skip
+  (`binding_undecodable`), as does an unreadable (over-cap) binding set
+  (`binding_unknown`), and any decoded binding anywhere makes the other bares
+  keep their unattributable values.
+- **Partial removal** carries no durability claim, and the parent and its
+  remaining bytes stay.
+- **FINAL capture proofs run as the runner uid**; see Judgment B.
+- **More retention on split pods (accepted).** Every bound non-completion parent
+  (`owner_terminal`, `verified_successor`, `owner_terminal_covered`, `other`) is no
+  longer attempted in-process and no epoch path reclaims it; it stays at `intent`
+  (`bound_intent`) with no supported remedy in this release (operator action or the
+  existing discard paths). The 64-slot binding cap and the 64 work-slot cap above apply (kept present parents take no work slot). More
+  retention, never less. Foreign-orphan retires carry no `attemptId` in
+  production, so they are in practice unbound (today's behaviour).
+- Legacy parents, attempt-less retires, the `owner_terminal_covered` class and
+  resume of an interrupted removal are out of scope.
+
+### Not verified
+
+- Hosted rollout observation of the first default-on epochs and the owner's
+  keep-default decision are not claimed here and stay on #4143.
+- Real worker-UID lane results (ownership, symlink, partial-removal and
+  parent-death cases that need a root-owned runner root or a real second uid) come
+  from exact-head CI `test-agent-worker-uid` unless reported otherwise; this
+  amendment does not claim them.
+- The real worker-UID lane cases call `discardRetireScratchParent` directly, with
+  no binding. Binding `removing` retention and the never-settling split classes are
+  therefore proven only by hermetic tests (`agent/test/retire-binding-writes.test.ts`,
+  `agent/test/pod-epoch-retire-scratch.test.ts`). The lane's clone-pin mount-id
+  half is not exercised (it needs CAP_SYS_ADMIN).
+- In the implementing run all seven real-image retire-scratch cases (as of commit
+  85a2de9ff) passed in an older locally available image, not the CI-built lane image,
+  whose build exceeded the lane's 60 s build cap in-run. The CI lane `test-agent-worker-uid` on the exact head is the
+  evidence of record.

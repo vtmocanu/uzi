@@ -137,7 +137,9 @@ func snapshotEgressProfile(ctx context.Context, q *store.Queries, run store.Run)
 // issue_description, the Anthropic token, config's timeout, model and effort, and
 // isolated_fetch) plus run bookkeeping the runner ignores (kind, status, the plan, session
 // and resume fields, the milestones and flags): none of it is a credential, a forge
-// handle or a tool. A new claim field that is one must be cleared here.
+// handle or a tool. A new claim field that is one must be cleared here. issue_key is left:
+// it names an issue, is no credential or handle, and is derived from a repo link that a
+// profile-bound run (no repo) does not have, so an isolated claim never carries it.
 func stripForIsolation(p *ClaimPayload) {
 	p.Repo = ClaimRepo{}
 	p.IssueComments = nil

@@ -524,6 +524,21 @@ describe("RunRunner #1786 M2 — the recovery handler's exits keep an unpreserve
     assert.deepEqual(stopMarkers(r.claim.run_id), []);
   });
 
+  it("a covered-clone release retires with the owner_terminal_covered class (issue #4263)", { skip: LINUX_CAPTURE }, async (t) => {
+    const r = credRig(17911);
+    const retire = t.mock.method(git, "retireRunnerClone");
+    const report = client.reportState.bind(client);
+    client.reportState = async (runId, body, signal) => (body.status === "recovery_wait"
+      ? ({ applied: true, status: "failed" } as never) : report(runId, body, signal));
+    try {
+      await r.runner.execute(r.claim);
+    } finally {
+      client.reportState = report;
+    }
+    assert.equal(fs.existsSync(r.clone()), false, "terminal coverage still releases the clone");
+    assert.deepEqual(retire.mock.calls.map(c => (c.arguments[4] as { dispositionClass?: string }).dispositionClass), ["owner_terminal_covered"]);
+  });
+
   it("row 9: a StaleClaimError on the park report keeps the source and reports nothing further", async () => {
     const iid = 17908;
     const r = credRig(iid);

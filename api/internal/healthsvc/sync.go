@@ -129,14 +129,58 @@ func (r *SyncRegistry) snapshot(ctx context.Context, list func(context.Context) 
 }
 
 func (s *Service) checkForgeSync(ctx context.Context, now time.Time) apitypes.HealthCheckDTO {
-	c := s.base("forge.sync")
-	entries, err := s.cfg.ForgeSyncRegistry.snapshot(ctx, s.cfg.Store.ListEnabledRepoIDs)
+	return s.checkSync(ctx, now, syncCheckSpec{
+		id:       "forge.sync",
+		registry: s.cfg.ForgeSyncRegistry,
+		list:     s.cfg.Store.ListEnabledRepoIDs,
+		naText:   "No enabled repositories.",
+		actions: syncActions{
+			other:   "read the api logs for `poller:` errors.",
+			timeout: "check outbound reachability from the api pod. If other pods reach the forge and only the api process times out, restarting the api pod is a workaround, not a fix.",
+			auth:    "the connection's token is invalid or lacks scope; re-check the forge connection.",
+			server:  "forge-side; check the forge's status and rate limits, and wait.",
+		},
+	})
+}
+
+// checkIssueTrackerSync is the linked repos' counterpart: the same severity and evidence
+// rules over the linked issue sync results, with issue tracker action texts.
+func (s *Service) checkIssueTrackerSync(ctx context.Context, now time.Time) apitypes.HealthCheckDTO {
+	return s.checkSync(ctx, now, syncCheckSpec{
+		id:       "issue_tracker.sync",
+		registry: s.cfg.IssueTrackerSyncRegistry,
+		list:     s.cfg.Store.ListEnabledLinkedRepoIDs,
+		naText:   "No enabled repositories linked to an issue tracker.",
+		actions: syncActions{
+			other:   "read the api logs for `poller: linked issue sync` and `poller: build linked issue tracker` errors.",
+			timeout: "check reachability of the issue tracker from the api pod.",
+			auth:    "the issue tracker connection's token is invalid or lacks access; re-check the issue tracker connection.",
+			server:  "issue-tracker side; check the issue tracker's status and rate limits, and wait.",
+		},
+	})
+}
+
+// syncCheckSpec parameterises checkSync: which check, which registry and enumeration,
+// and the texts that differ between the forge and issue tracker checks.
+type syncCheckSpec struct {
+	id       string
+	registry *SyncRegistry
+	list     func(context.Context) ([]uuid.UUID, error)
+	naText   string
+	actions  syncActions
+}
+
+type syncActions struct{ other, timeout, auth, server string }
+
+func (s *Service) checkSync(ctx context.Context, now time.Time, spec syncCheckSpec) apitypes.HealthCheckDTO {
+	c := s.base(spec.id)
+	entries, err := spec.registry.snapshot(ctx, spec.list)
 	if err != nil {
-		return degradeUnknown(c, "forge.sync", err)
+		return degradeUnknown(c, spec.id, err)
 	}
 	if len(entries) == 0 {
 		c.Severity = sevNA
-		c.Summary = "No enabled repositories."
+		c.Summary = spec.naText
 		return c
 	}
 	interval := s.cfg.ForgeSyncInterval
@@ -191,14 +235,14 @@ func (s *Service) checkForgeSync(ctx context.Context, now time.Time) apitypes.He
 		c.Severity = sevOK
 	}
 	if c.Severity == sevWarn || c.Severity == sevDanger {
-		action := "read the api logs for `poller:` errors."
+		action := spec.actions.other
 		switch class {
 		case forge.ErrorClassTimeout:
-			action = "check outbound reachability from the api pod. If other pods reach the forge and only the api process times out, restarting the api pod is a workaround, not a fix."
+			action = spec.actions.timeout
 		case forge.ErrorClassAuth:
-			action = "the connection's token is invalid or lacks scope; re-check the forge connection."
+			action = spec.actions.auth
 		case forge.ErrorClassServerError, forge.ErrorClassRateLimited:
-			action = "forge-side; check the forge's status and rate limits, and wait."
+			action = spec.actions.server
 		}
 		c.Action = strPtr(action)
 	}

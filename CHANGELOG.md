@@ -264,6 +264,21 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **Unlocking your vault refreshes every Anthropic token's meter ([#4408](https://github.com/vtmocanu/uzi/pull/4408)).**
   Previously only the default token was re-polled on unlock, so other pooled tokens stayed stale until their next successful scheduled poll.
 
+- **A DinD maintenance replacement now converges to the desired worker template while recycling ([#4455](https://github.com/vtmocanu/uzi/pull/4455), [#4458](https://github.com/vtmocanu/uzi/pull/4458)).**
+  When the replacement Deployment and its bound DinD claim already existed but the image pin or generation changed, the controller stopped patching the template and the operation could not complete.
+
+- **Connecting a forge no longer overwrites an existing connection's credential ([#4296](https://github.com/vtmocanu/uzi/pull/4296)).**
+  A create that targets an already-connected user, forge type and base URL is refused with `409` and `code: forge_connection_exists` instead of silently rotating the stored token and bot identity; the refusal is an atomic create-only insert, so two concurrent creates cannot both pass a check and have the second overwrite the first; resend with `replace: true` to rotate the credential deliberately.
+
+- **A deep link to an Admin → Instance or Admin → Workers section no longer lands the card under the pinned pill row ([#4461](https://github.com/vtmocanu/uzi/pull/4461)).**
+  The scroll now waits until the pinned block has measured its new height.
+
+- **`uzi handoff` resolves an origin remote ending in `.git/` ([#4447](https://github.com/vtmocanu/uzi/pull/4447)).**
+  A trailing slash after `.git` no longer leaves `.git` in the parsed repo path, which had blocked handoff with or without `--repo`.
+
+- **Admin → Workers section pills stay pinned under the tabs ([#4454](https://github.com/vtmocanu/uzi/pull/4454), [#4456](https://github.com/vtmocanu/uzi/pull/4456)).**
+  They now match Admin → Instance: one sideways-scrolling row that no longer scrolls away or wraps, with the pill for the section being read highlighted.
+
 ### Added
 
 - **A preview of the new Overview at /overview/next, decisions first ([#3878](https://github.com/vtmocanu/uzi/pull/3878), [#3952](https://github.com/vtmocanu/uzi/pull/3952)).**
@@ -415,6 +430,12 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 - **Admins can keep one idle worker warm and sleep the rest of an owner's interchangeable workers sooner ([#4395](https://github.com/vtmocanu/uzi/pull/4395), [#4430](https://github.com/vtmocanu/uzi/pull/4430)).**
   The new `worker_hibernation_surplus` setting is off by default and only applies while automatic hibernation is on; surplus workers sleep after `worker_hibernation_surplus_idle_after` (default 2h); a surplus sleep runs the same cache cleanup as any hibernation. When a pool has no warm worker and its owner is active, the api wakes one automatically hibernated member (reason "automatic: warm reserve"), and a pooled worker's long idle clock runs from the owner's latest run activity rather than its own; warm and system wakes do not extend it.
+
+- **Per-repo secrets and variables for runs ([#4416](https://github.com/vtmocanu/uzi/pull/4416), [#4441](https://github.com/vtmocanu/uzi/pull/4441)).**
+  Define named secret or plain variables on a repo in the web UI and list them with `uzi repo env list`.
+
+- **Hosted workers can move to a new node pool one at a time with `workers.newPlacement` ([#4451](https://github.com/vtmocanu/uzi/pull/4451), [#4452](https://github.com/vtmocanu/uzi/pull/4452)).**
+  An opt-in second placement applies only to workers whose volumes all carry the controller's create-time `uzi.dev/placement: new` annotation, and its fields replace the global placement; the move itself is a manual per-worker procedure that deletes the worker's volumes (see Hosted workers).
 
 ### Changed
 

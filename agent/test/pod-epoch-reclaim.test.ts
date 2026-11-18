@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import http from "node:http";
-import { mkdtemp, mkdir, open, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, open, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -11,7 +13,9 @@ import { PodEpochDaemonError } from "../src/pod-epoch-daemon.js";
 import { WorkerClient } from "../src/client.js";
 import { buildPodEpochDeletionDeps } from "../src/main.js";
 import { nullLogger } from "./helpers.js";
-import { daemon, ENABLE_DELETION_FOR_TEST, perGroupInspect, singleInspect } from "./pod-epoch-reclaim-support.js";
+import { daemon, ENABLE_DELETION_FOR_TEST, ENABLE_RETIRE_FOR_TEST, perGroupInspect, singleInspect } from "./pod-epoch-reclaim-support.js";
+import { retireBindingKey, retireBindingValue, parseRetireBinding, type RetireBinding } from "../src/git.js";
+import { formatAttemptId } from "../src/attempt-path.js";
 import type { PodEpochOwnership } from "../src/pod-epoch-lock.js";
 import type { RetainedSourceEvidence } from "../src/git.js";
 import type { RecoveryHoldsResponse } from "../src/protocol.js";
@@ -1464,6 +1468,75 @@ test("a refused reservation or a missing transaction keeps the source and admits
   await withDeletion(1, w => { w.proofThrows = true; }, (w, result) => {
     assert.equal(w.spies.discards.length, 0); assert.equal(result.kept_after_refusal, 1); assert.equal(result.verdict, "partial");
   });
+});
+// #4263 review: a present parent is kept at nomination (no work slot); a gone parent takes a slot, so it drives the loop's own gate.
+for (const present of [true, false]) test(present
+  ? "retire-scratch: an M1b downgrade to partial closes the retire gate; a present parent is kept at nomination (settled_kept) and the phase stops epoch_not_eligible"
+  : "retire-scratch: an M1b downgrade to partial closes the retire gate; a gone parent's work slot is deferred epoch_not_eligible and nothing runs", async () => {
+  const root = await mkdtemp(join(tmpdir(), "retire-gate-"));
+  try {
+    await chmod(root, 0o1700);
+    const uuid = randomUUID();
+    const name = `.retire-${uuid}`;
+    if (present) await mkdir(join(root, name, "clone"), { recursive: true });
+    const attemptId = formatAttemptId(new Date(Date.UTC(2026, 10, 5, 10, 10, 1)), 1, "0123456789abcdef");
+    const clonePath = join(root, "slug", `issue-4263.attempt-${attemptId}`);
+    const binding: RetireBinding = { v: 1, class: "owner_terminal", attemptId, runId: "run-1", branch: "agent/issue-4263", clonePath,
+      phase: "settled", parentIno: "1", cloneIno: "1", pod: "" };
+    const raw = retireBindingValue(binding);
+    const parsed = parseRetireBinding(uuid, raw);
+    assert.ok(parsed.ok);
+    const spies = { reserve: [] as string[], tx: 0, bareLock: 0, discards: 0 };
+    await withDeletion(1, w => {
+      w.reserveRefused = true; // M1b refuses its source: the verdict becomes partial before the retire phase starts
+      const guard = { signal: new AbortController().signal, assertHealthy: () => undefined, close: async () => undefined,
+        bindSources: () => ({ state: "read", sources: [] }), refreshInventory: async () => undefined };
+      w.options.openDaemonGuard = (async () => guard) as never;
+      w.options.retire = {
+        retireTestGate: ENABLE_RETIRE_FOR_TEST,
+        runnerRoot: root,
+        quiesce: async () => true,
+        reserve: (async (runId: string, action: (eligible: () => boolean) => Promise<unknown>) => { spies.reserve.push(runId); return action(() => true); }) as never,
+        authority: {
+          withTransaction: async (fn: (t: unknown) => Promise<unknown>) => { spies.tx++; return fn({}); },
+          active: () => undefined, peekSlot: async () => null, heldByOtherSink: () => false,
+        } as never,
+        git: {
+          assertNoUnsettledDeletes: () => undefined,
+          readRetireScratchEvidence: async () => ({ state: "read", bares: [{ barePath: "/bare",
+            bindings: [{ key: retireBindingKey(uuid), uuid, raw, parsed: parsed.ok ? parsed.binding : undefined }],
+            ledger: [{ branch: "agent/issue-4263", raw: JSON.stringify({ attemptId, runId: "run-1", clonePath, state: "retired" }) }],
+            protectedPaths: [], restoreBranches: [], recovery: [], stoppedRuns: [] }] }),
+          collectEpochScratchProtectedPaths: async () => ({ state: "read", paths: [] }),
+          withRetireScratchBare: async () => { spies.bareLock++; throw new Error("must not lock"); },
+          discardRetireScratchParent: async () => { spies.discards++; throw new Error("must not discard"); },
+          measureRetireScratchParent: async () => ({ bytes: 0, bytesState: "unknown", entries: 0 }),
+        } as never,
+        seams: { split: true, readFence: () => ({ t0Ms: Date.now() + 3_600_000 }), readMounts: () => "ok", statfs: () => "ok",
+          scanProcesses: () => ({ held: new Set() }), bindShared: root, env: {} },
+      };
+    }, (_w, result) => {
+      assert.equal(result.verdict, "partial");
+      assert.equal(result.reason, "reclaim_partial");
+      assert.deepEqual(spies, { reserve: [], tx: 0, bareLock: 0, discards: 0 });
+      assert.equal(result.retire_scratch.state, "stopped", JSON.stringify(result.retire_scratch));
+      assert.equal(result.retire_scratch.reason, "epoch_not_eligible");
+      assert.equal(result.retire_scratch.reclaimed, 0);
+      assert.equal(result.retire_scratch.recovered, 0);
+      if (present) {
+        // The present settled parent is kept at nomination (settled_kept, no work slot), so nothing is deferred.
+        assert.equal(result.retire_scratch.deferred, 0);
+        assert.equal(result.retire_scratch.kept, 1);
+        assert.deepEqual(result.retire_scratch.kept_by_reason, { settled_kept: 1 });
+        assert.deepEqual(result.retire_report.parents.map(p => [p.name, p.outcome, p.reason]), [[name, "kept", "settled_kept"]]);
+      } else {
+        // The gone parent takes a work slot; the loop's eligibility stop defers it before any reservation.
+        assert.equal(result.retire_scratch.deferred, 1);
+        assert.equal(result.retire_scratch.kept, 0);
+        assert.deepEqual(result.retire_report.parents, []);
+      }
+    });
+  } finally { await rm(root, { recursive: true, force: true }); }
 });
 test("a pre-effect refusal keeps its source, calls no end for it, and the pass continues to the next source", async () => {
   await withDeletion(2, w => {

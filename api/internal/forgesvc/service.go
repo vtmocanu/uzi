@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -106,8 +107,14 @@ func HasPRDLink(description string) bool {
 // be unit-tested against a fake store (and a mocked Forge) without a live
 // database. *store.Queries satisfies it.
 type IssueStore interface {
+	// GetRepoIssueSourceForUser is the one owner-scoped row the per-repo resolvers
+	// (IssueTrackerForRepo, CodeHostForRepo) read.
+	GetRepoIssueSourceForUser(ctx context.Context, arg store.GetRepoIssueSourceForUserParams) (store.GetRepoIssueSourceForUserRow, error)
 	RemoveCachedIssueLabel(context.Context, store.RemoveCachedIssueLabelParams) (store.Issue, error)
 	UpsertIssue(ctx context.Context, arg store.UpsertIssueParams) (store.Issue, error)
+	// UpsertIssueIfChanged is the linked issue sync's write: UpsertIssue's columns, but a
+	// row whose cached values are unchanged is not rewritten.
+	UpsertIssueIfChanged(ctx context.Context, arg store.UpsertIssueIfChangedParams) error
 	// UpsertIssueLabels is the label-only cache-write variant used by AutoMove and
 	// SetIssueLabel: it omits assignee_ids so a racing label mutation cannot clobber
 	// the forge-synced assignees with a stale in-memory snapshot (PRD #767).
@@ -187,6 +194,10 @@ type Service struct {
 	groupCursorMu sync.Mutex
 	groupCursors  map[uuid.UUID]store.FindingGroupCursor
 	forgeBuilder  ForgeBuilder
+
+	// itDrivers builds a linked repo's issue tracker driver (SetIssueTrackerDrivers).
+	// nil means a linked repo fails closed.
+	itDrivers IssueTrackerDrivers
 
 	// findingGroupSince is the optional pending-warning age clock; nil uses time.Since.
 	findingGroupSince func(time.Time) time.Duration
@@ -835,13 +846,13 @@ func (s *Service) FullSync(ctx context.Context, repoID uuid.UUID, forgeProjectID
 	}
 	advanceGroups()
 
-	if err := s.upsertIssues(ctx, repoID, issues); err != nil {
+	if err := s.upsertIssues(ctx, repoID, issues, ""); err != nil {
 		return Marks{}, err
 	}
-	if err := s.upsertIssues(ctx, repoID, extra); err != nil {
+	if err := s.upsertIssues(ctx, repoID, extra, ""); err != nil {
 		return Marks{}, err
 	}
-	if err := s.upsertIssues(ctx, repoID, findingExtra); err != nil {
+	if err := s.upsertIssues(ctx, repoID, findingExtra, ""); err != nil {
 		return Marks{}, err
 	}
 	// A clean SET of fetches that legitimately returns zero issues DOES evict
@@ -935,13 +946,13 @@ func (s *Service) IncrementalSync(ctx context.Context, repoID uuid.UUID, forgePr
 	// deliberately ignored), so incremental passes cannot shift which page the
 	// next FullSync examines. Recorded-op settlement on later pages therefore
 	// happens as FullSync rotates to them.
-	if err := s.upsertIssues(ctx, repoID, issues); err != nil {
+	if err := s.upsertIssues(ctx, repoID, issues, ""); err != nil {
 		return m, err
 	}
-	if err := s.upsertIssues(ctx, repoID, withoutLabel(openIssues, uziLabel)); err != nil {
+	if err := s.upsertIssues(ctx, repoID, withoutLabel(openIssues, uziLabel), ""); err != nil {
 		return m, err
 	}
-	if err := s.upsertIssues(ctx, repoID, withoutLabel(findingIssues, uziLabel)); err != nil {
+	if err := s.upsertIssues(ctx, repoID, withoutLabel(findingIssues, uziLabel), ""); err != nil {
 		return m, err
 	}
 	return m.Advance(Marks{PRD: maxUpdatedAt(issues), Open: maxUpdatedAt(openIssues), Finding: maxUpdatedAt(findingIssues)}), nil
@@ -997,10 +1008,12 @@ func maxUpdatedAt(issues []forge.Issue) time.Time {
 }
 
 // upsertIssues writes each forge issue into the cache, computing has_prd_link at
-// write time. It reports only an error: no high-water mark is read off this path,
+// write time. issueKeyShort is the linked repo's issue tracker project short name:
+// non-empty, every row is stored with issue_key = short + "-" + iid (D10); empty (the
+// forge sync), issue_key is written NULL. It reports only an error: no high-water mark is read off this path,
 // deliberately, because the time.Now() substitution below would put one past the
 // instant its fetch observed (see maxUpdatedAt).
-func (s *Service) upsertIssues(ctx context.Context, repoID uuid.UUID, issues []forge.Issue) error {
+func (s *Service) upsertIssues(ctx context.Context, repoID uuid.UUID, issues []forge.Issue, issueKeyShort string) error {
 	for _, is := range issues {
 		labelsJSON, err := json.Marshal(is.Labels)
 		if err != nil {
@@ -1021,7 +1034,11 @@ func (s *Service) upsertIssues(ctx context.Context, repoID uuid.UUID, issues []f
 		if updated.IsZero() {
 			updated = time.Now()
 		}
-		if _, err := s.q.UpsertIssue(ctx, store.UpsertIssueParams{
+		issueKey := pgtype.Text{}
+		if issueKeyShort != "" {
+			issueKey = pgtype.Text{String: issueKeyShort + "-" + strconv.FormatInt(is.IID, 10), Valid: true}
+		}
+		params := store.UpsertIssueParams{
 			RepoID:         repoID,
 			ForgeIssueIid:  is.IID,
 			Title:          is.Title,
@@ -1032,7 +1049,16 @@ func (s *Service) upsertIssues(ctx context.Context, repoID uuid.UUID, issues []f
 			Author:         author,
 			HasPrdLink:     HasPRDLink(is.Description),
 			ForgeUpdatedAt: pgtype.Timestamptz{Time: updated, Valid: true},
-		}); err != nil {
+			IssueKey:       issueKey,
+		}
+		if issueKeyShort != "" {
+			// The linked sync re-reads every tagged issue each tick, so it writes only rows
+			// that changed; the forge sync keeps the unconditional write.
+			err = s.q.UpsertIssueIfChanged(ctx, store.UpsertIssueIfChangedParams(params))
+		} else {
+			_, err = s.q.UpsertIssue(ctx, params)
+		}
+		if err != nil {
 			return err
 		}
 	}

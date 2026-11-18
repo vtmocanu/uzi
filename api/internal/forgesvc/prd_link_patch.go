@@ -158,6 +158,10 @@ func (s *Service) patchOnePRDLink(ctx context.Context, forgeProjectID int64, ch 
 
 	issue, err := tr.GetIssue(ctx, forgeProjectID, c.IssueIid.Int64)
 	if err != nil {
+		if IssueWriteSkippable(err) {
+			s.settlePRDLink(ctx, lg, c.ID, "PRD link patch: the linked issue is gone; nothing to patch")
+			return
+		}
 		// Case 1 again: a failed read is not evidence about the description.
 		lg.Warn("PRD link patch: read issue", "error", err)
 		return
@@ -178,6 +182,10 @@ func (s *Service) patchOnePRDLink(ctx context.Context, forgeProjectID int64, ch 
 	}
 
 	if err := tr.UpdateIssueDescription(ctx, forgeProjectID, c.IssueIid.Int64, desc); err != nil {
+		if IssueWriteSkippable(err) {
+			s.settlePRDLink(ctx, lg, c.ID, "PRD link patch: issue writes are not offered for this repo; nothing to patch")
+			return
+		}
 		// Leave the marker: the write is what we are retrying.
 		lg.Warn("PRD link patch: update issue description", "error", err)
 		return

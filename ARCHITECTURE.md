@@ -3121,9 +3121,15 @@ thresholds and the notice contract.
 
 Issue-sync failure streaks have shipped as `forge.sync`
 ([#2203](https://github.com/vtmocanu/uzi/issues/2203)), separate from deferred
-freshness. The private `api/cmd/server/forge_sync.go` wiring used by startup and
-tests connects `poller.SetSyncAttempt` to an empty process-local
-`healthsvc.SyncRegistry` after seed and before polling, and gives health the
+freshness. A repo linked to an
+issue tracker reports its issue-sync streaks to a second registry that feeds
+`issue_tracker.sync`; for such a repo `forge.sync` measures a cheap code-host
+probe (one project lookup per poll tick) instead, so a revoked forge token and
+an issue tracker outage show on different checks, and the code-host steps run
+whatever the probe returns. The private `api/cmd/server/forge_sync.go` wiring used by startup and
+tests connects `poller.SetSyncAttempt` and `poller.SetIssueTrackerSyncAttempt`
+to two empty process-local `healthsvc.SyncRegistry` values after seed and
+before polling (the handler's repo-sync invalidator resets both), and gives health the
 same engine's effective interval. Each repo attempt binds at `syncRepo`
 start; client-construction failures and returned `FullSync`/`IncrementalSync`
 outcomes feed the registry. Success is reported before sibling sync work,

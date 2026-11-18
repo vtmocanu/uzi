@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/vtmocanu/uzi/api/internal/config"
 	"github.com/vtmocanu/uzi/api/internal/forge"
@@ -24,12 +25,16 @@ type fakeForge struct {
 	projects   []forge.Project
 	projectErr error
 	labelsErr  error
+	labelCalls int
 }
 
 func (f *fakeForge) VerifyToken(context.Context) (forge.BotIdentity, error) {
 	return f.identity, f.verifyErr
 }
-func (f *fakeForge) EnsureLabels(context.Context, int64, []forge.Label) error { return f.labelsErr }
+func (f *fakeForge) EnsureLabels(context.Context, int64, []forge.Label) error {
+	f.labelCalls++
+	return f.labelsErr
+}
 func (f *fakeForge) ListProjects(context.Context) ([]forge.Project, error) {
 	return f.projects, f.projectErr
 }
@@ -69,6 +74,10 @@ type fakeStore struct {
 	// database errors boot must not swallow.
 	countErr  error
 	insertErr error
+
+	// sourceLocked and enableErr script the removal-marker lookup and the enable.
+	sourceLocked bool
+	enableErr    error
 }
 
 func (s *fakeStore) CountBoardColumns(_ context.Context, repoID uuid.UUID) (int64, error) {
@@ -109,7 +118,13 @@ func (s *fakeStore) UpsertRepo(_ context.Context, arg store.UpsertRepoParams) (s
 	s.repoIDByPath[arg.PathWithNamespace] = id
 	return store.Repo{ID: id, ConnectionID: arg.ConnectionID, ForgeProjectID: arg.ForgeProjectID, PathWithNamespace: arg.PathWithNamespace}, nil
 }
+func (s *fakeStore) LockRepoForEnableForUser(context.Context, store.LockRepoForEnableForUserParams) (store.LockRepoForEnableForUserRow, error) {
+	return store.LockRepoForEnableForUserRow{SourceLocked: s.sourceLocked}, nil
+}
 func (s *fakeStore) SetRepoEnabledForUser(_ context.Context, arg store.SetRepoEnabledForUserParams) (store.Repo, error) {
+	if s.enableErr != nil {
+		return store.Repo{}, s.enableErr
+	}
 	s.enabled = append(s.enabled, arg)
 	return store.Repo{ID: arg.ID, Enabled: arg.Enabled}, nil
 }
@@ -377,5 +392,41 @@ func TestForgeConnectionBoardColumnDatabaseErrorIsFatal(t *testing.T) {
 				t.Fatal("a database error creating the board columns must be fatal (returned), got nil")
 			}
 		})
+	}
+}
+
+// A project linked to an issue tracker before it was removed cannot be enabled
+// again (migration 00467). The seed skips it before any forge label write and
+// boot succeeds, instead of failing on every restart.
+func TestForgeConnectionSourceLockedRepoIsSkipped(t *testing.T) {
+	st := &fakeStore{user: store.User{ID: uuid.New(), Email: "admin@uzi.test"}, sourceLocked: true}
+	ff := &fakeForge{
+		identity: forge.BotIdentity{ForgeUserID: 42, Username: "uzi-bot"},
+		projects: []forge.Project{{ForgeProjectID: 1, PathWithNamespace: "vtmocanu/uzi"}},
+	}
+	if err := ForgeConnection(context.Background(), st, &fakeSvc{forge: ff}, baseCfg()); err != nil {
+		t.Fatalf("a source-locked repo must not fail boot: %v", err)
+	}
+	if ff.labelCalls != 0 {
+		t.Fatalf("no forge label write may precede the refused enable, got %d", ff.labelCalls)
+	}
+	if len(st.enabled) != 0 {
+		t.Fatalf("a source-locked repo must stay disabled, got %d enables", len(st.enabled))
+	}
+}
+
+// Backstop: the repos trigger refusing the enable (SQLSTATE UZ414) after the
+// lookup is skipped too, not boot-fatal.
+func TestForgeConnectionTriggerRefusalIsSkipped(t *testing.T) {
+	st := &fakeStore{
+		user:      store.User{ID: uuid.New(), Email: "admin@uzi.test"},
+		enableErr: &pgconn.PgError{Code: "UZ414"},
+	}
+	ff := &fakeForge{
+		identity: forge.BotIdentity{ForgeUserID: 42, Username: "uzi-bot"},
+		projects: []forge.Project{{ForgeProjectID: 1, PathWithNamespace: "vtmocanu/uzi"}},
+	}
+	if err := ForgeConnection(context.Background(), st, &fakeSvc{forge: ff}, baseCfg()); err != nil {
+		t.Fatalf("a UZ414 refusal must not fail boot: %v", err)
 	}
 }

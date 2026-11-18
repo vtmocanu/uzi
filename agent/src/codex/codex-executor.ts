@@ -6770,7 +6770,7 @@ export class CodexExecutor implements Executor {
   /** Issue #1866 M2: `facts` appends the run-start environment facts block (empty ⇒ unchanged). */
   private planPrompt(ctx: RunContext, facts?: EnvFacts): string {
     const head = ctx.issueIid != null
-      ? [buildIssueContext(ctx.issueTitle, ctx.issueDescription, ctx.issueIid), buildIssueCommentsContext(ctx.issueComments)].filter(Boolean).join("\n\n")
+      ? [buildIssueContext(ctx.issueTitle, ctx.issueDescription, ctx.issueIid, ctx.issueKey), buildIssueCommentsContext(ctx.issueComments)].filter(Boolean).join("\n\n")
       : `${ctx.issueTitle}\n\n${ctx.issueDescription}`;
     const review = buildReviewCommentsContext(ctx.reviewComments);
     const withReview = review ? `${head}\n\n${review}` : head;
@@ -6849,7 +6849,7 @@ export class CodexExecutor implements Executor {
           "</approved_plan>",
         ].join("\n")
       : approved ? approved : ctx.issueIid != null
-        ? [buildIssueContext(ctx.issueTitle, ctx.issueDescription, ctx.issueIid), buildIssueCommentsContext(ctx.issueComments)].filter(Boolean).join("\n\n")
+        ? [buildIssueContext(ctx.issueTitle, ctx.issueDescription, ctx.issueIid, ctx.issueKey), buildIssueCommentsContext(ctx.issueComments)].filter(Boolean).join("\n\n")
         : `${ctx.issueTitle}\n\n${ctx.issueDescription}`;
     // PRD #1416 M1: prepend the published-floor paragraph whether or not a plan is approved.
     // Empty ⇒ unchanged (a fresh branch).

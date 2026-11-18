@@ -2593,6 +2593,13 @@ export class WorkerClient {
           claim.pr_description = pr;
         }
       }
+      // PRD 4173: `issue_key` is a string or absent. A present non-string (null, number, object) is
+      // normalised to "" rather than dropped: its presence still marks the run linked and so
+      // non-closing (fail closed), and linkedIssueKey renders "the linked issue" for it.
+      if (isRecord(claim) && claim.issue_key !== undefined && typeof claim.issue_key !== "string") {
+        claim.issue_key = "";
+        this.log.warn("claim issue_key is not a string; treating the run as linked without a key", { run_id: claim.run_id });
+      }
       if (incarnation === this.completionIncarnation && isRecord(claim) && terminalUUID(claim.run_id) && terminalGeneration(claim.claim_generation) && claim.claim_generation > 0) {
         const kind = claim.kind ?? "issue";
         const branch = kind === "issue" && Number.isSafeInteger(claim.issue_iid) && (claim.issue_iid ?? 0) > 0

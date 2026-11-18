@@ -44,7 +44,7 @@ describe("health scenario routing", () => {
   it("appends healthy Codex pricing metadata with empty evidence", async () => {
     vi.mocked(mockScenario).mockReturnValue("health-silent");
     const doc = await healthApi.getAdminHealth();
-    expect(doc.checks).toHaveLength(27);
+    expect(doc.checks).toHaveLength(28);
     expect(doc.checks[doc.checks.length - 1]).toMatchObject({
       id: "pricing.codex", scope: "instance", group: "housekeeping", title: "Codex price coverage",
       doc: "admin-health", severity: "ok", summary: "no recent Codex usage on unpriced models", evidence: [],
@@ -126,6 +126,17 @@ describe("health scenario routing", () => {
     });
   });
 
+  it("emits issue_tracker.sync in the integrations group, ok, right after forge.sync", async () => {
+    vi.mocked(mockScenario).mockReturnValue("health-silent");
+    const doc = await healthApi.getAdminHealth();
+    const ids = doc.checks.map((c) => c.id);
+    expect(ids.indexOf("issue_tracker.sync")).toBe(ids.indexOf("forge.sync") + 1);
+    expect(doc.checks.find((c) => c.id === "issue_tracker.sync")).toMatchObject({
+      scope: "owner", group: "integrations", title: "Issue tracker sync", severity: "ok",
+      summary: "0 of 1 failing; 0 pending.", doc: null,
+    });
+  });
+
   it("serves owner-only danger without an instance episode", async () => {
     vi.mocked(mockScenario).mockReturnValue("health-owner-only");
     const doc = await healthApi.getAdminHealth();
@@ -137,7 +148,7 @@ describe("health scenario routing", () => {
     expect(doc.checks.filter((c) => c.attention_banner === true)).toMatchObject([
       { id: "recovery.storage", scope: "owner", severity: "warn", summary: "2 captures currently marked quota-refused." },
     ]);
-    expect(doc.counts).toEqual({ ok: 22, warn: 2, danger: 2, unknown: 0, na: 1 });
+    expect(doc.counts).toEqual({ ok: 23, warn: 2, danger: 2, unknown: 0, na: 1 });
     for (const id of ["fleet.capacity", "queue.waiting"]) {
       expect(doc.checks.find((c) => c.id === id)?.evidence[0]).toEqual({
         label: "Waiting run",
@@ -161,7 +172,7 @@ describe("health scenario routing", () => {
     expect(doc.blocking).toBe(false);
     expect(doc.episode_id).toBeNull();
     expect(doc.snoozed_until).toBeNull();
-    expect(doc.counts).toEqual({ ok: 26, warn: 0, danger: 0, unknown: 0, na: 1 });
+    expect(doc.counts).toEqual({ ok: 27, warn: 0, danger: 0, unknown: 0, na: 1 });
     expect(doc.checks.find((c) => c.id === "fleet.roll")).toMatchObject({
       scope: "instance", severity: "ok", summary: "All 4 hosted workers are rolling cleanly.",
     });

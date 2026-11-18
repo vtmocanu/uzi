@@ -6,6 +6,7 @@ import { AdminWorkers } from "./AdminWorkers";
 import { healthySilentDoc } from "../mocks/data/health";
 import { api } from "../lib/api";
 import { ADMIN_WORKERS_ANCHOR_IDS, visibleSectionItems } from "../components/navSections";
+import { installAnchorFrames } from "../test/anchorFrames";
 
 vi.mock("../lib/api", async (importActual) => {
   const actual = await importActual<typeof import("../lib/api")>();
@@ -122,6 +123,52 @@ function renderAt(hash: string) {
 }
 
 describe("AdminWorkers anchors", () => {
+  it("keeps a non-final deep-link pill current when an observer evaluates between frames", async () => {
+    const id = "worker-hibernation";
+    const frames = installAnchorFrames(id);
+    scroll.mockImplementation(function(this: HTMLElement) { if (this.id === id) frames.landAtEnd(); });
+    try {
+      renderAt(`#${id}`);
+      await waitFor(() => expect(frames.hasLineObserver()).toBe(true));
+      const nav = screen.getByRole("navigation", { name: "Sections on this page" });
+      const links = within(nav).getAllByRole("link");
+      expect(links[links.length - 1].getAttribute("href")).not.toBe(`#${id}`);
+      await act(async () => { frames.advanceFrame(); });
+      expect(scroll).not.toHaveBeenCalledWith({ block: "start" });
+      await act(async () => { frames.evaluateAtTop(); });
+      await act(async () => { frames.advanceFrame(); });
+      expect(scroll).toHaveBeenCalledExactlyOnceWith({ block: "start" });
+      expect(scroll.mock.contexts[0]).toBe(document.getElementById(id));
+      expect(nav.querySelector('[aria-current="true"]')?.getAttribute("href")).toBe(`#${id}`);
+    } finally {
+      cleanup();
+      frames.restore();
+      scroll.mockReset();
+    }
+  });
+
+  it("cancels the delayed jump when navigation changes after the first frame", async () => {
+    const id = "worker-hibernation";
+    const frames = installAnchorFrames(id);
+    scroll.mockImplementation(function(this: HTMLElement) { if (this.id === id) frames.landAtEnd(); });
+    try {
+      render(<MemoryRouter initialEntries={[`/admin/workers#${id}`]}>
+        <GoTo to="/admin/workers#not-advertised" /><AdminWorkers />
+      </MemoryRouter>);
+      await waitFor(() => expect(frames.hasLineObserver()).toBe(true));
+      const target = document.getElementById(id);
+      await act(async () => { frames.advanceFrame(); });
+      await act(async () => { fireEvent.click(screen.getByRole("button", { name: "go" })); });
+      expect(document.getElementById(id)).toBe(target); // target remains mounted, so a leaked callback would scroll
+      await act(async () => { frames.advanceFrame(); });
+      expect(scroll).not.toHaveBeenCalledWith({ block: "start" });
+    } finally {
+      cleanup();
+      frames.restore();
+      scroll.mockReset();
+    }
+  });
+
   it("renders every advertised anchor, labelled as the menu advertises it", async () => {
     renderAt("");
     const nav = await screen.findByRole("navigation", { name: "Sections on this page" });

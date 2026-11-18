@@ -68,6 +68,12 @@ var (
 	ErrChatProposalGone    = errors.New("slack: proposal not found or not yours")
 	ErrChatProposalHandled = errors.New("slack: proposal already resolved")
 	ErrChatProposalForge   = errors.New("slack: forge rejected the issue")
+	// ErrChatProposalRepoNeverEnabled: the proposal's repo has never been enabled (PRD 4173
+	// D13), so nothing is filed until the user enables it.
+	ErrChatProposalRepoNeverEnabled = errors.New("slack: the proposal's repo has never been enabled")
+	// ErrChatProposalLinkedRepo: the proposal's repo is linked to an issue tracker, where
+	// uzi does not file issues yet (PRD 4173 M4); retrying cannot succeed.
+	ErrChatProposalLinkedRepo = errors.New("slack: issues cannot be filed on a repo linked to an issue tracker")
 	// Lifecycle sentinels (PRD #191 M6).
 	ErrChatGone        = errors.New("slack: chat not found or not yours")
 	ErrChatNotEndedYet = errors.New("slack: chat is still active")
@@ -398,6 +404,10 @@ func (c *ChatActions) createProposal(ctx context.Context, a BlockAction, userID,
 		c.editCard(ctx, a, "This proposal was already handled.", "")
 	case errors.Is(err, ErrChatProposalGone):
 		c.ephemeral(ctx, a, "That proposal isn't yours, or it no longer exists.")
+	case errors.Is(err, ErrChatProposalRepoNeverEnabled):
+		c.ephemeral(ctx, a, "That repo has never been enabled in uzi, so no issue was filed. Enable the repo first, then press Create again.")
+	case errors.Is(err, ErrChatProposalLinkedRepo):
+		c.ephemeral(ctx, a, "Issues can't be filed on a repo linked to an issue tracker yet; the proposal stays pending.")
 	case errors.Is(err, ErrChatProposalForge):
 		c.ephemeral(ctx, a, "Couldn't file the issue on the forge — the proposal is back to pending, so press Create again or open it in uzi.")
 	default:

@@ -297,16 +297,11 @@ func TestEnsureLabelsStopsWhenTheEligibilityTagCannotBeRead(t *testing.T) {
 }
 
 // TestEligibilityNameAloneMakesNoRequest: resolving the eligibility name needs
-// no request. ListIssues by it reads the eligibility tag by id, for its live
-// name, and nothing else about tags or the account.
+// no request. EnsureLabels by it sends nothing; ListIssues by it pages the
+// issues of the eligibility tag by id and reads nothing else about tags or the
+// account.
 func TestEligibilityNameAloneMakesNoRequest(t *testing.T) {
-	y, log := loggedDriver(t, func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, "/api/tags/") {
-			writeRaw(w, `{"id":"`+youtracktest.EligibilityTagID+`","name":"`+youtracktest.EligibilityTagName+`"}`)
-			return
-		}
-		writeRaw(w, "[]")
-	})
+	y, log := loggedDriver(t, func(w http.ResponseWriter, _ *http.Request) { writeRaw(w, "[]") })
 	if err := y.EnsureLabels(context.Background(), testProjectID, labels(youtracktest.EligibilityTagName)); err != nil {
 		t.Fatal(err)
 	}
@@ -316,16 +311,21 @@ func TestEligibilityNameAloneMakesNoRequest(t *testing.T) {
 	if _, err := y.ListIssues(context.Background(), testProjectID, forge.ListIssuesOptions{Labels: []string{youtracktest.EligibilityTagName}}); err != nil {
 		t.Fatal(err)
 	}
-	tagReads := 0
+	// Changed on purpose (PRD #4173 M4, replacing the read of the tag's live name):
+	// a listing with labels pages the issues of the eligibility tag by id, so
+	// exactly that request is allowed. Any tag lookup, tag create or account read
+	// is still forbidden.
+	byID := 0
 	for _, c := range log.all() {
-		switch {
-		case c == "GET /api/tags/"+youtracktest.EligibilityTagID:
-			tagReads++
-		case strings.Contains(c, "/tags") || strings.Contains(c, "users/me"):
+		if strings.Contains(c, "/api/tags/"+youtracktest.EligibilityTagID+"/issues") {
+			byID++
+			continue
+		}
+		if strings.Contains(c, "/tags") || strings.Contains(c, "users/me") {
 			t.Errorf("sent %v for the eligibility name alone", c)
 		}
 	}
-	if tagReads != 1 {
-		t.Errorf("read the eligibility tag by id %d times, want 1", tagReads)
+	if byID < 1 {
+		t.Errorf("ListIssues sent no by-id listing request; sent %v", log.all())
 	}
 }
