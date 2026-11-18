@@ -815,6 +815,12 @@ func TestParseRepoPath(t *testing.T) {
 		"git@github.com:acme/widgets":               "acme/widgets",
 		"ssh://git@github.com:22/acme/widgets.git":  "acme/widgets",
 		"https://gitlab.com/acme/group/widgets.git": "acme/group/widgets",
+		// A trailing slash after .git must not leave .git in the path: it made
+		// resolveHandoffRepo miss the repo with and without --repo.
+		"https://github.com/acme/widgets.git/":      "acme/widgets",
+		"git@github.com:acme/widgets.git/":          "acme/widgets",
+		"ssh://git@github.com:22/acme/widgets.git/": "acme/widgets",
+		"https://github.com/acme/widgets.git.git":   "acme/widgets.git",
 	}
 	for in, want := range cases {
 		if got := parseRepoPath(in); got != want {
