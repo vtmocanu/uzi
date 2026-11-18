@@ -122,7 +122,7 @@ func TestWorkerCodexStoppedOwnershipRouteLiveDB(t *testing.T) {
 			foreignSecret, foreignUser, []byte("x"))
 		_, err := e.pool.Exec(context.Background(), "UPDATE runs SET codex_secret_id=$2 WHERE id=$1", e.run, foreignSecret)
 		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == "23503" {
+		if errors.As(err, &pgErr) && pgErr.Code == "23503" && pgErr.ConstraintName == "runs_codex_secret_fk" {
 			return
 		}
 		if err != nil {
