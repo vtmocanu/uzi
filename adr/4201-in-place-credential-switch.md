@@ -54,6 +54,41 @@ claim.session_id, subject to path, rollout and provider checks; fresh cwd
 requires explicit lineage, and missing IDs produce an explicit retained-
 recovery notice. Preservation refuses fresh cwd or a missing conversation.
 
+Recovery after a crash is two separate guarantees (decision 11). **uzi-operation
+fencing (server):** a fresh claim increments the generation, remints the
+capability and records the baseline, and stale applies and stale capabilities
+are refused (`codexSwitchFence` in `api/internal/workersvc/credential_switch_codex.go`,
+`ErrStaleClaim`). Settlement does not prove the run's processes stopped
+(`settleCredentialSwitchHold`), and fencing refuses stale uzi operations only.
+**Predecessor stop (worker):** `recoverRetainedClaimBody` (`agent/src/runner.ts`)
+runs the `predecessor_capture` quiescence proof before `executor.run`. On
+same-worker retained recovery, delivered Codex material (A or B) is not used for
+login, provider start, refresh, release or any other credential operation
+before that proof passes. If the proof reports survivors or is unverified, the
+material stays unused and the run ends as a terminal `failed` with the
+`quiescence_failed` blocker (`worker_residue_blocked`), clone and custody kept.
+That is not an owner pause. Claim-payload delivery of the material may remain;
+delivery is not evidence of quiescence.
+
+**Crash point 5 (predecessor host unreachable)** is an owner-recorded scope
+decision (2026-11-18): unvalidated and uncredited, an environmental limitation.
+Fencing refuses stale uzi operations, but neither a different B credential nor
+revoking A's uzi capability stops a provider credential an unreachable
+predecessor already holds. A successor on another worker has no local retained
+journal, so the same-worker gate does not run there. The owner's required
+property is that B is never used while predecessor quiescence is unproven, with
+the run held for the owner instead; it is evidenced only for same-worker
+retained recovery (ledger U21), not for the cross-worker case. Continuation is
+never justified by "the host is gone". No new credential-delivery protocol was
+started.
+
+Residuals recorded as unvalidated and uncredited, never as proven: token-absence
+surfaces with no guard to remove (outside the stopped route), stopped-route
+binding identity, positive X/Y withdrawn-switch settlement credit, Now and
+summary gating during B publication (masked), suspension of B's startup refresh
+before finish (its red was a timeout), and crash point 5. The source of truth is
+the "Clause accounting" table in `agent/test/credential-switch-proof-ledger.md`.
+
 Real cross-account provider acceptance remains UNPROVEN; fake-provider
 evidence does not settle it. Owner two-account acceptance is pending and
 non-closing. Neither universal crash-resume nor storage durability is claimed. The Claude legacy release

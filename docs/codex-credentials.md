@@ -317,6 +317,25 @@ lineage break. Missing session IDs now produce an explicit notice on retained
 recovery. Preservation refuses a fresh directory or missing conversation
 instead of silently starting over.
 
+Crash recovery gives two separate guarantees. The server fences stale uzi
+operations: a fresh claim increments the generation, remints the capability and
+records the baseline, and stale applies and capabilities are refused. That does
+not prove the old processes stopped. On the worker, same-worker retained
+recovery runs the predecessor quiescence proof before the run starts. Until it
+passes, the delivered Codex material (old or new) is not used for login,
+provider start, refresh or release. If the proof finds survivors or cannot be
+verified, the run ends `failed` with the `quiescence_failed` blocker
+(`worker_residue_blocked`) and keeps its clone and custody. That is a terminal
+failure, not an owner pause.
+
+If the predecessor's host is unreachable, uzi cannot prove it stopped, and
+neither a different credential nor revoking the old uzi capability stops a
+provider credential that predecessor already holds. This case is an owner-recorded
+limitation, unvalidated: the required property is that the new credential is
+never used while the predecessor is unproven, and it is evidenced only for
+same-worker retained recovery. A successor on another worker has no local
+retained journal, so that gate does not run there.
+
 This is not a universal crash-resume or storage-durability guarantee.
 Cross-account provider acceptance is **unproven**: evidence uses fakes, and
 owner acceptance with two real accounts remains pending and non-closing.

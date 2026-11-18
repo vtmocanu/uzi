@@ -797,7 +797,9 @@ uzi version
 - `uzi run set-token <run-id> <label>|--auto|--default|--inherit` — re-point which
   credential this run spends. For Codex, use an explicit enabled owner-owned
   Codex subscription or OpenAI API-key **label**; `--auto`, `--default` and
-  `--inherit` are refused. It accepts running or worker-held awaiting_approval,
+  `--inherit` are refused. An ambiguous eligible label is refused before any
+  write; rename the credential in the web UI (the CLI cannot rename), then retry.
+  It accepts running or worker-held awaiting_approval,
   awaiting_input and awaiting_followup runs, applying at the next safe boundary.
   Claimed is 409; queued and every park (including worker-held limit_wait and
   recovery_wait) are 422. Unresolved policy episodes refuse request and apply;

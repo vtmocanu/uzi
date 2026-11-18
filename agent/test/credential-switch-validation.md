@@ -934,7 +934,10 @@ executor's provider client before the `predecessor_capture` proof (insertion
 controls, 32 of 32 red each). When the proof reports survivors or unverified,
 the executor never runs and the run takes the `quiescence_failed` blocker
 (gate and blocker controls, 8 of 8 forced leaves red each), all class (b)
-preservation. On `quiescence_failed` the run is reported `failed`
+preservation. The tests observe non-use only; "discarded" is not shown
+observably. The eight forced leaves take about 1.1–1.6 s each (observed
+1.08–1.58 s, about 10.5 s in the u21r green log); shard time before and after
+is unmeasured. On `quiescence_failed` the run is reported `failed`
 (`worker_residue_blocked`) with its clone and custody kept; it is a terminal
 failure, not an owner pause.
 
@@ -943,9 +946,12 @@ recorded scope decision, **unvalidated and uncredited**, an environmental
 limitation. Fencing refuses stale uzi operations, but a different B credential
 and revoking A's uzi capability do not stop a provider credential that an
 unreachable predecessor already holds. No option-B protocol work. The runtime
-stays fail-closed: B is never used while predecessor quiescence is unproven,
-and the run holds for the owner instead. U21 evidences this only for
-same-worker retained recovery; a successor on another worker has no local
+stays fail-closed; the owner's required property is that B is never used while
+predecessor quiescence is unproven,
+and the run is held for the owner instead. "Held for the owner" is the
+owner's wording and is true only in that the clone and custody are kept for the
+owner; on the same-worker path above the run is a terminal `failed` report, not
+an owner pause. U21 evidences this only for same-worker retained recovery; a successor on another worker has no local
 retained journal, so the U21 gate does not run there, and how the api treats
 that claim is not evidenced here. This is not an exception to the quiescence
 guarantee, and continuation is never credited because the host is gone. This
@@ -954,8 +960,11 @@ covers crash point 5 only.
 ## m3.2 candidate-level checks (2026-11-18)
 
 Run serially by the lead, one command at a time, on the same worker with a warm
-cache. Logs are under `.uzi/scratch/ctl-logs/m32-*`, each ending
-`SHA=<tested revision> EXIT=<status>`.
+cache. Logs are under `.uzi/scratch/ctl-logs/m32-*`. All but five end with
+`SHA=<tested revision> EXIT=<status>`; the five without it are
+`m32-lint-web`, `m32-uzi-focused`, `m32-vitest-ccs-focus1`,
+`m32-vitest-ccs-focus2` and `m32-vitest-ccs-2`, whose tested revision is not
+recorded in the log.
 
 - `task test:codex-m4` at 9555784fc: 209 pass, run-completeness OK, EXIT=0
   (121 s).
@@ -965,7 +974,9 @@ cache. Logs are under `.uzi/scratch/ctl-logs/m32-*`, each ending
 - `-race -count=1`, one package at a time, without `UZI_TEST_DATABASE_URL`
   (LiveDB tests compile and skip; their focused runs are recorded per unit on
   `cdr-*`):
-  - workersvc, store and handler: ok at 9555784fc;
+  - workersvc, store and handler: ok at 9555784fc. `api/internal/capability`,
+    which this branch touches (`capability.go` and tests), is not run with `-race` in
+    this run; it is covered by `test:api` in exact-head PR CI;
   - `api/cmd/uzi` failed at 9555784fc in `TestPrintedInstructionsAreRegistered`
     (the set-token help and the ambiguous-label error named "`uzi token`" for
     renaming, which is web-only and has no registry entry). The fix at
@@ -977,9 +988,17 @@ cache. Logs are under `.uzi/scratch/ctl-logs/m32-*`, each ending
   - `RunCredentialOverride.test.tsx`: 21 pass.
   - `CodexCredentialSwitch.test.tsx`: 1 of 39 failed in the full-file run at
     ca76b1a31. The focus check raced `submit`'s `busy` reset; it passed alone
-    twice. The test now waits for focus (e0287607a, test only, component
+    twice (`m32-vitest-ccs-focus1`/`-focus2`, 2 passed and 37 skipped each, no
+    recorded revision: by file time they predate the e0287607a commit only).
+    `m32-vitest-ccs-2` (39 passed) is likewise revision-unrecorded. The test now waits for focus (e0287607a, test only, component
     unchanged), and all 39 pass at e0287607a.
   - `CodexCredentialSwitch.browser.test.tsx` (Chromium): 10 pass at e0287607a.
+  - d8717dd28 applies the same focus `waitFor` to
+    `CodexCredentialSwitch.browser.test.tsx` (the "seeds ... Header" case).
+    Chromium 10 of 10 and jsdom 39 of 39 pass on that tree (logs under
+    `.uzi/scratch/gate-log.*`). Note: the Chromium log's `SHA=` line reads
+    `de0da0237+wt` (the parent plus the then-uncommitted edit), and the jsdom
+    log records no revision.
 - The 16 agent test files this branch touches, each run alone with
   `--test-timeout=120000`, all pass at ca76b1a31, including
   `codex-executor.test.ts` (1966 tests, 863 s) and `worker.test.ts`.

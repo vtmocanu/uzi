@@ -140,7 +140,7 @@ LiveDB suite, and each reddened at least one test
 
 This same-identity readmission is distinct from the owner-authorized live-switch
 exception added on 2026-11-15 in [ADR-4201](4201-in-place-credential-switch.md#codex-live-owner-switch-2026-11-15).
-Outside that fenced switch, identity changes remain terminal. For this readmission, `FreezeRunCodexBinding` and
+The freeze-at-creation rule of PRD #1147 is therefore narrowly amended: only the owner-authorized, fenced apply of that switch may change a Codex run's binding to another identity. Outside it, identity changes remain terminal. For this readmission, `FreezeRunCodexBinding` and
 `SetRunCodexFrozenIdentity` still refuse every change, and the relaxation cannot re-point a
 run to another alias, account, auth mode or credential revision.
 
