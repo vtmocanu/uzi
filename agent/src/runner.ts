@@ -20703,6 +20703,7 @@ export class RunRunner {
       const range = await this.git.resolveCheckpointRange(barePath, branch, {
         defaultBranch: flight.checkpointDefaultBranch,
         confirmedTip: flight.lastCheckpointRefTip,
+        captureConfirmedBlob: true,
         extraFloors: flight.publishedRealTips,
       });
       if (!range) {
@@ -22499,6 +22500,7 @@ export class RunRunner {
         [flight.lastAttemptedCheckpointRefTip, flight.lastCheckpointRefTip],
         { defaultBranch: flight.checkpointDefaultBranch, signal, restrictionIdentity: identity,
           markerTrustedTip: flight.lastCheckpointRefTip,
+          confirmedBlobTip: flight.lastCheckpointRefTip,
           chainWorkflowSwap: flight.checkpointChainForge === true }));
       // tracking tip unresolved (no tracking ref, or it could not be read) — nothing to pack; not a
       // publish failure, stay silent

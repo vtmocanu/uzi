@@ -1479,6 +1479,11 @@ export interface AppSettings {
   // duration (default "336h", valid 1h..2160h). Optional for older responses.
   worker_hibernation_auto?: string;
   worker_hibernation_idle_after?: string;
+  // Warm reserve (PRD #4395): "true"/"false", default "false", effective only while
+  // enabled and auto are both "true". surplus_idle_after is a Go duration (default
+  // "2h", valid 15m..336h); the server uses min(surplus_idle_after, idle_after).
+  worker_hibernation_surplus?: string;
+  worker_hibernation_surplus_idle_after?: string;
   // Per-user persistent hosted-worker quota: integer 0..20, default 2. Zero disables provisioning.
   hosted_worker_quota: string;
   // Ephemeral worker admin settings (PRD #4212). Optional for older responses.

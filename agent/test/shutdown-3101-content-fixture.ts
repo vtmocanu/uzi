@@ -24,10 +24,13 @@ function read(repo: string, ...args: string[]): string {
   return execFileSync("git", ["-C", repo, ...args], { env: GIT_ENV, encoding: "utf8", stdio: "pipe" });
 }
 
-/** Local broker simulation, not real Go handler proof. Only the fixture default seed and
- * emitted packs can supply objects to receiver; receipt assertions run BEFORE each ACK. */
+/** Local broker simulation, not real Go handler proof. Only the fixture origin's branches
+ * (which the real forge holds, so a selective pack may omit blobs they reach, #4439) and
+ * emitted packs can supply objects to receiver; receipt assertions run BEFORE each ACK.
+ * `trackedDefaultBare` names the worker bare whose `refs/remotes/origin/main` prepare moves to
+ * the advanced origin, so the captured default reaches the new workflow blob deterministically. */
 export function shutdownContentProof(fx: Fixture, client: WorkerClient, iid: number, expectedRunId?: string,
-  publication: "overlay" | "park_marker" = "overlay") {
+  publication: "overlay" | "park_marker" = "overlay", options: { trackedDefaultBare?: () => string } = {}) {
   const scratch = path.resolve(import.meta.dirname, "../../.uzi/scratch");
   fs.mkdirSync(scratch, { recursive: true });
   const dir = makeScratchRoot("3101-content-", scratch);
@@ -50,6 +53,9 @@ export function shutdownContentProof(fx: Fixture, client: WorkerClient, iid: num
     try {
       const chunks: Buffer[] = [];
       for await (const chunk of pack) chunks.push(Buffer.from(chunk));
+      // The forge holds its default branch: refresh it before applying the (non-thin) pack.
+      execFileSync("git", ["-C", receiver, "fetch", "--quiet", fx.originPath, "+refs/heads/*:refs/heads/*"],
+        { env: GIT_ENV, stdio: "pipe" });
       execFileSync("git", ["-C", receiver, "index-pack", "--stdin", "--fix-thin"],
         { env: GIT_ENV, input: Buffer.concat(chunks), stdio: "pipe" });
       read(receiver, "update-ref", ref, tip);
@@ -100,6 +106,10 @@ export function shutdownContentProof(fx: Fixture, client: WorkerClient, iid: num
       assert.match(read(ctx.worktreePath, "status", "--porcelain"), /\?\? UNTRACKED-3101.txt/);
       // Advance ONLY the isolated fixture origin after the runner branch has been seeded.
       commitInTree(fx.originPath, WF, NEW_WORKFLOW);
+      if (options.trackedDefaultBare) {
+        execFileSync("git", ["-C", options.trackedDefaultBare(), "fetch", "--quiet", fx.originPath,
+          "+refs/heads/main:refs/remotes/origin/main"], { env: GIT_ENV, stdio: "pipe" });
+      }
     },
     async verify(local: GitCache) {
       // Resolve the independent receiver ref first: an old checkpoint or a missing
