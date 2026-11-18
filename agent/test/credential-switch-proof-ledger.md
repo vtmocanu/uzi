@@ -2596,7 +2596,7 @@ and a233 `api/internal/store/queries/runtime.sql` has no
 Codex journal's ordinal/epoch columns are new: class (d). The attribution clamp
 is old: a233 `api/internal/workersvc/usage_fold.go` :1004–1033
 (`clampCredentialEpochOrdinals`, `if sent <= *ceiling {` at :1027) is identical
-at the candidate (:1004–1035, :1027), so its control is a (b) preservation
+at the candidate (:1004–1037, :1027), so its control is a (b) preservation
 sensitivity control on the new Codex spend path.
 
 Mechanism (candidate):
