@@ -4,6 +4,7 @@ import { errorMessage } from "../../lib/apiError";
 import { Alert, Button, Card, Field, Input, SectionTitle } from "../../components/ui";
 
 const DEFAULT_IDLE_AFTER = "336h";
+const DEFAULT_SURPLUS_IDLE_AFTER = "2h";
 
 // durationHours reads the Go-duration subset the admin is likely to type (h/m/s
 // components, decimals allowed) into hours, or null when it does not parse. It only
@@ -31,9 +32,9 @@ function readout(v: string): string {
 
 // WorkerHibernationCard is the admin surface for worker hibernation: the instance
 // switch (PRD #4205) plus automatic hibernation of idle workers and its idle threshold
-// (PRD #4207). One card, one Save: the three keys go in a single updateSettings call so
+// (PRD #4207) and the warm-reserve surplus switch (PRD #4395). One card, one Save: the five keys go in a single updateSettings call so
 // the automatic policy can never be stored half-edited. All round-trip through
-// /admin/settings.
+// the Admin → Workers page (the settings API is still /admin/settings).
 export function WorkerHibernationCard({
   settings,
   onSaved,
@@ -46,7 +47,14 @@ export function WorkerHibernationCard({
   const currentIdle = settings.worker_hibernation_idle_after ?? DEFAULT_IDLE_AFTER;
   const [enabled, setEnabled] = useState(currentEnabled === "true");
   const [auto, setAuto] = useState(currentAuto === "true");
+  const currentSurplus = settings.worker_hibernation_surplus ?? "false";
+  const currentSurplusIdle = settings.worker_hibernation_surplus_idle_after ?? DEFAULT_SURPLUS_IDLE_AFTER;
   const [idleAfter, setIdleAfter] = useState(currentIdle);
+  const [surplus, setSurplus] = useState(currentSurplus === "true");
+  const [surplusIdleAfter, setSurplusIdleAfter] = useState(currentSurplusIdle);
+  const surplusIdleId = useId();
+  const surplusIdleHintId = useId();
+  const surplusHintId = useId();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -57,7 +65,9 @@ export function WorkerHibernationCard({
   const dirty =
     (enabled ? "true" : "false") !== currentEnabled ||
     (auto ? "true" : "false") !== currentAuto ||
-    idleAfter !== currentIdle;
+    idleAfter !== currentIdle ||
+    (surplus ? "true" : "false") !== currentSurplus ||
+    surplusIdleAfter !== currentSurplusIdle;
 
   const save = async (e: FormEvent) => {
     e.preventDefault();
@@ -69,11 +79,15 @@ export function WorkerHibernationCard({
         worker_hibernation_enabled: String(enabled),
         worker_hibernation_auto: String(auto),
         worker_hibernation_idle_after: idleAfter,
+        worker_hibernation_surplus: String(surplus),
+        worker_hibernation_surplus_idle_after: surplusIdleAfter,
       });
       onSaved(resp);
       setEnabled(resp.settings.worker_hibernation_enabled === "true");
       setAuto(resp.settings.worker_hibernation_auto === "true");
       setIdleAfter(resp.settings.worker_hibernation_idle_after ?? DEFAULT_IDLE_AFTER);
+      setSurplus(resp.settings.worker_hibernation_surplus === "true");
+      setSurplusIdleAfter(resp.settings.worker_hibernation_surplus_idle_after ?? DEFAULT_SURPLUS_IDLE_AFTER);
       setNotice("Worker hibernation settings saved.");
     } catch (err) {
       // The typed values stay in the form so the admin can correct them.
@@ -84,6 +98,11 @@ export function WorkerHibernationCard({
   };
 
   const spelled = readout(idleAfter);
+  const surplusActive = enabled && auto;
+  const surplusH = durationHours(surplusIdleAfter);
+  const idleH = durationHours(idleAfter);
+  // The server uses min(surplus, idle_after) at read time; this is only a hint.
+  const surplusClamped = surplusH !== null && idleH !== null && surplusH > idleH;
 
   return (
     <Card className="space-y-5">
@@ -162,6 +181,61 @@ export function WorkerHibernationCard({
                 <>
                   <br />
                   <span className="text-fg">{spelled}</span>
+                </>
+              )}
+            </p>
+          </Field>
+
+          <div className="space-y-1.5">
+            <label
+              className={`flex select-none items-center gap-2 text-sm ${surplusActive ? "cursor-pointer" : "cursor-not-allowed opacity-60"}`}
+            >
+              <input
+                type="checkbox"
+                checked={surplus}
+                disabled={!surplusActive}
+                onChange={(e) => setSurplus(e.target.checked)}
+                aria-describedby={surplusHintId}
+                className="h-4 w-4 rounded border-edge accent-brand"
+              />
+              Keep one warm worker per pool, hibernate the surplus
+            </label>
+            <div id={surplusHintId} className="space-y-1 pl-6 text-sm text-muted">
+              <p>
+                Hibernates a pool's extra idle workers after the shorter surplus
+                threshold below, keeping one awake so new runs start without a
+                cold start. Off by default.
+              </p>
+              {!surplusActive && (
+                <p className="font-medium">
+                  Needs both "Allow hibernating" and "Automatically hibernate"
+                  switched on.
+                </p>
+              )}
+            </div>
+          </div>
+
+          <Field label="Surplus idle threshold" htmlFor={surplusIdleId}>
+            <Input
+              id={surplusIdleId}
+              value={surplusIdleAfter}
+              onChange={(e) => setSurplusIdleAfter(e.target.value)}
+              disabled={!surplusActive}
+              aria-describedby={surplusIdleHintId}
+              spellCheck={false}
+              autoComplete="off"
+              inputMode="text"
+              className="max-w-40 font-mono"
+            />
+            <p id={surplusIdleHintId} className="text-xs text-muted">
+              Go duration, e.g. 2h; 15m–336h
+              {surplusClamped && (
+                <>
+                  <br />
+                  <span className="text-fg">
+                    Longer than the idle threshold above, so the shorter idle
+                    threshold ({idleAfter}) is used.
+                  </span>
                 </>
               )}
             </p>

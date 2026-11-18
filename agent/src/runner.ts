@@ -711,7 +711,8 @@ type RecoveryParkCause =
   | { kind: "publication_forge_unreachable"; surface: "git" | "api"; step: "floor_refresh" | "push" | "mr_create" }
   | { kind: "vault_locked" | "refresh_unknown" | "account_unavailable" | "credential_release_unavailable" }
   | { kind: "data_volume_full"; preventive: boolean }
-  /** Issue #3767: the Claude lead hit an Anthropic organization or workspace spend limit. */
+  /** Issue #3767: the Claude lead hit an Anthropic organization or workspace spend limit, or
+   *  (issue #4426) its API key's prepaid credit balance ran out. */
   | { kind: "anthropic_spend_limit"; detail: string };
 
 /* Exact local revocation from assertHeldFreeCapture, distinct from an arbitrary refusal. */
@@ -20725,6 +20726,7 @@ export class RunRunner {
       const range = await this.git.resolveCheckpointRange(barePath, branch, {
         defaultBranch: flight.checkpointDefaultBranch,
         confirmedTip: flight.lastCheckpointRefTip,
+        captureConfirmedBlob: true,
         extraFloors: flight.publishedRealTips,
       });
       if (!range) {
@@ -22521,6 +22523,7 @@ export class RunRunner {
         [flight.lastAttemptedCheckpointRefTip, flight.lastCheckpointRefTip],
         { defaultBranch: flight.checkpointDefaultBranch, signal, restrictionIdentity: identity,
           markerTrustedTip: flight.lastCheckpointRefTip,
+          confirmedBlobTip: flight.lastCheckpointRefTip,
           chainWorkflowSwap: flight.checkpointChainForge === true }));
       // tracking tip unresolved (no tracking ref, or it could not be read) — nothing to pack; not a
       // publish failure, stay silent

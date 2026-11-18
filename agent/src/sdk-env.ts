@@ -29,7 +29,7 @@ import { RUN_ATTEMPT_ENV, RUN_CLONE_ENV, RUN_CLONE_KEY_ENV, WORKER_SPAWN_ENV } f
 /** Keys a provisioned tool env may NEVER set (PRD #18 M3): the OAuth credential,
  *  HOME, and the two ANTHROPIC_* keys pinned to undefined so nothing outranks the
  *  OAuth token in the SDK's auth precedence. */
-const PROTECTED_ENV_KEYS: ReadonlySet<string> = new Set([
+export const PROTECTED_ENV_KEYS: ReadonlySet<string> = new Set([
   "CLAUDE_CODE_OAUTH_TOKEN",
   "HOME",
   "ANTHROPIC_API_KEY",

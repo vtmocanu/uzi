@@ -80,6 +80,8 @@ type fakeStore struct {
 	hibRows                []store.ListAutoHibernationBlockersRow
 	hibErr                 error
 	hibParams              []store.ListAutoHibernationBlockersParams
+	hibSurplusRows         []store.ListAutoHibernationBlockersSurplusModeRow
+	hibSurplusParams       []store.ListAutoHibernationBlockersSurplusModeParams
 }
 
 func (f *fakeStore) RecoveryStorageHealth(ctx context.Context, p store.RecoveryStorageHealthParams) ([]store.RecoveryStorageHealthRow, error) {
@@ -168,6 +170,11 @@ func (f *fakeStore) ListAutoHibernationBlockers(_ context.Context, p store.ListA
 	return f.hibRows, f.hibErr
 }
 
+func (f *fakeStore) ListAutoHibernationBlockersSurplusMode(_ context.Context, p store.ListAutoHibernationBlockersSurplusModeParams) ([]store.ListAutoHibernationBlockersSurplusModeRow, error) {
+	f.hibSurplusParams = append(f.hibSurplusParams, p)
+	return f.hibSurplusRows, f.hibErr
+}
+
 type fakeSettings struct {
 	sourceEnabled  bool
 	sourceURL      string
@@ -186,6 +193,7 @@ type fakeSettings struct {
 	custodyErr   error
 	// hibernation (issue #4207) backs WorkerHibernationEnabled/Auto/IdleAfter.
 	hibEnabled, hibAuto bool
+	hibSurplus          bool
 	hibIdleAfter        time.Duration
 	hibErr              error
 }
@@ -198,6 +206,13 @@ func (f *fakeSettings) WorkerHibernationAuto(context.Context) (bool, error) {
 }
 func (f *fakeSettings) WorkerHibernationIdleAfter(context.Context) (time.Duration, error) {
 	return f.hibIdleAfter, f.hibErr
+}
+
+func (f *fakeSettings) WorkerHibernationSurplus(context.Context) (bool, error) {
+	return f.hibSurplus, nil
+}
+func (f *fakeSettings) WorkerHibernationSurplusIdleAfter(context.Context) (time.Duration, error) {
+	return 2 * time.Hour, nil
 }
 
 func (f *fakeSettings) HealthEnabled(context.Context) (bool, error) {
@@ -585,7 +600,7 @@ func TestDB(t *testing.T) {
 		{"danger on schema mismatch", &dbStat{schemaApplied: 190, schemaHead: 192, schemaAtHead: false}, false, sevDanger, "differs from the embedded head"},
 		{"danger on schema read error", &dbStat{schemaErr: errors.New("no goose"), schemaAtHead: false}, false, sevDanger, "Could not read the applied migration"},
 		{"warn on slow ping", &dbStat{pingDur: 400 * time.Millisecond, schemaAtHead: true}, false, sevWarn, "ping is slow"},
-		{"warn on saturated pool", &dbStat{acquiredConns: 18, maxConns: 20, schemaAtHead: true}, false, sevWarn, "near capacity"},
+		{"ok with 7 of 8 in use and no waits", &dbStat{pingDur: time.Millisecond, acquiredConns: 7, maxConns: 8, schemaAtHead: true}, false, sevOK, "schema at head"},
 		{"ok when healthy", &dbStat{pingDur: 5 * time.Millisecond, acquiredConns: 1, maxConns: 20, schemaAtHead: true}, false, sevOK, "schema at head"},
 	}
 	for _, tc := range tests {

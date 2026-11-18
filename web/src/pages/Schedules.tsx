@@ -48,6 +48,7 @@ import {
   PageHeader,
   cx,
 } from "../components/ui";
+import { keepInRowView, PinnedBlock, TabRow, tabClass } from "../components/TabRow";
 import { ChevronRightIcon, ClockIcon, PlusIcon } from "../components/icons";
 
 type Tab = "schedules" | "catalog";
@@ -64,13 +65,6 @@ const TAB_ORDER: Tab[] = ["schedules", "catalog"];
 const tabId = (t: Tab) => `sched-tab-${t}`;
 const panelId = (t: Tab) => `sched-panel-${t}`;
 const isTab = (v: string | null): v is Tab => v === "schedules" || v === "catalog";
-
-// TAB_CLASS mirrors AdminShell's tab strip (issue #204 overflow contract) so the two
-// in-page tabs read identically to the app's other tabbed surfaces.
-const TAB_BASE =
-  "-mb-px shrink-0 whitespace-nowrap border-b-2 px-3 py-2 text-sm font-medium transition-colors";
-const TAB_ACTIVE = "border-brand text-fg";
-const TAB_INACTIVE = "border-transparent text-muted hover:border-edge-strong hover:text-fg";
 
 export function Schedules() {
   // The active tab lives in the URL (?tab=schedules|catalog, D1), so a tab is shareable
@@ -122,6 +116,19 @@ export function Schedules() {
   const [pause, setPause] = useState<SchedulePauseDTO | null>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [pauseBusy, setPauseBusy] = useState(false);
+  // The picker renders inline ABOVE the pinned tab row; opened from a scrolled-deep page
+  // it would be offscreen, so bring it into view (root scroll-padding keeps it below the
+  // app bar and pinned row) and move focus into it.
+  const pausePanelRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!pickerOpen) return;
+    const panel = pausePanelRef.current;
+    if (!panel) return;
+    panel.scrollIntoView?.({ block: "start" });
+    panel
+      .querySelector<HTMLElement>('button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])')
+      ?.focus({ preventScroll: true });
+  }, [pickerOpen]);
   // Failed expiry re-reads in the current streak (drives the 60s retry backoff in the
   // expiry effect below); reset to 0 whenever a new pause state is applied.
   const [pauseRefreshAttempt, setPauseRefreshAttempt] = useState(0);
@@ -168,6 +175,12 @@ export function Schedules() {
   // Refs to the tab buttons so the arrow-key handler can move focus with selection
   // (APG tabs, automatic activation): Left/Right wrap, Home/End jump to the ends.
   const tabRefs = useRef<Partial<Record<Tab, HTMLButtonElement | null>>>({});
+  // preventScroll also skips the overflowing row's sideways scroll, so reveal the tab ourselves.
+  const focusTab = (target: Tab) => {
+    const el = tabRefs.current[target];
+    el?.focus({ preventScroll: true });
+    keepInRowView(el?.closest<HTMLElement>('[role="tablist"]'), el);
+  };
   const onTabKeyDown = (e: React.KeyboardEvent) => {
     const idx = TAB_ORDER.indexOf(tab);
     let next = idx;
@@ -179,7 +192,7 @@ export function Schedules() {
     e.preventDefault();
     const target = TAB_ORDER[next];
     setTab(target);
-    tabRefs.current[target]?.focus();
+    focusTab(target);
   };
 
   // schedules/catalog/repos are seeded here as fetcher side effects because all three
@@ -377,7 +390,7 @@ export function Schedules() {
       await api.deleteSchedule(s.id);
       await reload();
       if (fromList && neighbour) setPendingReveal({ id: neighbour.id, focus: true, afterSeq: 0 });
-      else if (fromList) tabRefs.current.schedules?.focus();
+      else if (fromList) focusTab("schedules");
     } catch (err) {
       setError(errorMessage(err, "Could not remove the schedule"));
     } finally {
@@ -413,7 +426,7 @@ export function Schedules() {
   const showJobInSchedules = (slug: string) => {
     setTab("schedules");
     applyFilter({ ...NO_FILTER, jobSlug: slug });
-    tabRefs.current.schedules?.focus();
+    focusTab("schedules");
   };
 
   // Closing the edit modal: a clone's modal hands focus to the cloned row (D12).
@@ -642,8 +655,8 @@ export function Schedules() {
       // the request is dropped instead of lingering to steal focus later.
       if (!row && schedules && loadedSeq >= pendingReveal.afterSeq) {
         setPendingReveal(null);
-        if (pendingReveal.focus && pendingReveal.fallbackFocus !== false) tabRefs.current.schedules?.focus();
-      }
+        if (pendingReveal.focus && pendingReveal.fallbackFocus !== false) focusTab("schedules");
+}
       return;
     }
     el.scrollIntoView?.({ block: "nearest" });
@@ -711,7 +724,9 @@ export function Schedules() {
           lives here, between the header and the tab row, so it covers nothing on the
           page. One control per state: while paused the tab-row button yields to the banner. */}
       {pickerOpen ? (
-        <PausePanel onSubmit={submitPause} onCancel={() => setPickerOpen(false)} busy={pauseBusy} />
+        <div ref={pausePanelRef}>
+          <PausePanel onSubmit={submitPause} onCancel={() => setPickerOpen(false)} busy={pauseBusy} />
+        </div>
       ) : pauseActive && pause ? (
         <PausedBanner
           pause={pause}
@@ -722,7 +737,8 @@ export function Schedules() {
       ) : null}
 
       {/* Two tabs (D1): the operational list, then the catalog of shipped jobs. */}
-      <div className="flex items-center gap-1 overflow-x-auto border-b border-edge" role="tablist" aria-label="Schedules">
+      <PinnedBlock>
+      <TabRow className="items-stretch" role="tablist" aria-label="Schedules">
         <button
           type="button"
           role="tab"
@@ -735,7 +751,7 @@ export function Schedules() {
           }}
           onKeyDown={onTabKeyDown}
           onClick={() => setTab("schedules")}
-          className={cx(TAB_BASE, tab === "schedules" ? TAB_ACTIVE : TAB_INACTIVE)}
+          className={tabClass(tab === "schedules")}
         >
           Schedules{loaded ? ` · ${total}` : ""}
         </button>
@@ -759,7 +775,7 @@ export function Schedules() {
               ? `Job catalog · ${catalog.entries.length}, ${notEnabled} not enabled`
               : undefined
           }
-          className={cx(TAB_BASE, "inline-flex items-center gap-2", tab === "catalog" ? TAB_ACTIVE : TAB_INACTIVE)}
+          className={cx(tabClass(tab === "catalog"), "inline-flex items-center gap-2")}
         >
           Job catalog{loaded ? ` · ${catalog.entries.length}` : ""}
           {loaded && notEnabled > 0 && <Badge tone="neutral">{notEnabled} not enabled</Badge>}
@@ -773,7 +789,8 @@ export function Schedules() {
         {pause !== null && !pauseActive && !pickerOpen && (
           <PauseAllButton onClick={() => setPickerOpen(true)} disabled={pauseBusy} />
         )}
-      </div>
+      </TabRow>
+      </PinnedBlock>
 
       {/* One tabpanel per tab, each labelled by its tab; the inactive one is unmounted,
           so its id/aria-controls link is live only for the shown panel (APG tabs). */}

@@ -303,16 +303,76 @@ single setting bounds self-service provisioning:
 
 | Setting | Default | Controls |
 |---|---|---|
-| `hosted_worker_quota` | 2 | Maximum persistent hosted workers each user may provision, from 0 to 20. Every size counts as one. Zero disables self-service provisioning without changing existing workers. Ephemeral workers have a separate cap. |
+| `hosted_worker_quota` | 2 | Maximum persistent hosted workers each user may provision, from 0 to 20. Every size counts as one. Zero disables self-service provisioning without changing existing workers. Ephemeral workers have a [separate cap](#ephemeral-workers). |
+| `hosted_default_size` | `l` | Size the persistent provision form preselects: `s`, `m`, `l` or `l-highmem`. Only the preselection changes: the provision API still requires an explicit size, and existing workers keep theirs. |
 
-Edit it in the **Hosted worker quota** card on **Admin → Instance**. The value
-must be an integer from `0` to `20`; it saves independently of the other cards.
+Edit them in the **Hosted worker quota** card on **Admin → Workers**. The quota
+must be an integer from `0` to `20`; each setting saves independently of the other cards.
+Saving an empty default size (**Reset to default**) restores `l`; the quota itself has no reset and needs a number.
 
 Every size counts the same 1 against this quota; see
 [Hosted workers](./hosted-workers.md#type-and-size). This setting exists (and
 is editable) on every instance, including compose ones — it's simply inert
 there, since hosting itself is off unless an admin turns it on for the
 deployment (see [Configuration](./configuration.md#hosted-k8s-workers-prd-58)).
+
+## Ephemeral workers
+
+The **Ephemeral workers** card on **Admin → Workers** holds the instance switch
+(`ephemeral_workers_enabled`) and three settings that tune
+[ephemeral hosted workers](./hosted-workers.md#ephemeral-worker-lease). All of them need
+[hosted workers](./hosted-workers.md) turned on for the deployment.
+
+| Setting | Default | Controls | Env that overrides it |
+|---|---|---|---|
+| `ephemeral_max_per_user` | 2 | Maximum concurrent ephemeral workers each user may hold, from 0 to 20. `0` stops ephemeral provisioning for everyone. | `UZI_EPHEMERAL_MAX_PER_USER` |
+| `ephemeral_default_size` | `m` | Size every new ephemeral worker is provisioned at: `s`, `m`, `l` or `l-highmem`. | `UZI_EPHEMERAL_DEFAULT_SIZE` (chart `workers.ephemeralDefaultSize`) |
+| `ephemeral_lease` | `2h` | How long an idle ephemeral worker stays available to its owner's next run on the same repository and branch after a run completes. A Go duration from `0s` to `2h`; `0` means no lease. | `UZI_EPHEMERAL_LEASE` (chart `workers.ephemeralLease`) |
+
+A write that is out of range (a negative or non-integer cap, an unknown size, a lease
+above `2h` or not a duration) is refused with a field error and the stored value is
+unchanged. Saving an empty or whitespace-only value resets the setting to its default;
+surrounding whitespace is trimmed otherwise.
+
+**Environment wins.** When the environment variable in the last column is set to a
+non-blank value, it takes precedence over the saved value: the field shows
+**Set by environment** and is disabled, and `PUT /api/admin/settings` for that key is
+refused with `409`. The environment value is interpreted as it always was, so an install
+that already sets one behaves the same after upgrading:
+
+- The cap is read leniently: a non-numeric value or `0` becomes `2` (a leading number is kept), and a value above
+  `20` is honoured. So `UZI_EPHEMERAL_MAX_PER_USER=0` still means `2` and locks the field.
+  To stop ephemeral provisioning, unset the variable and save `0` here, or turn the
+  ephemeral workers switch off.
+- An unknown size falls back to `m`.
+- The lease is read strictly, any duration from `0` to `2h`; anything else refuses to
+  boot the api.
+
+Unset the variable (on the chart, leave `workers.ephemeralLease` and
+`workers.ephemeralDefaultSize` unset) to edit the field again.
+
+**Changes take effect without a restart.** The provisioner reads the cap, size and
+lease on every pass, and the reaper and hibernation wake pass read the lease on every pass; run claims, the lease started when a
+run completes, worker health and the worker list's lease expiry read the current lease.
+Other api replicas see a change within the settings cache TTL.
+
+- **Lease expiry is lease start plus the current lease.** Shortening the lease releases
+  leased idle workers whose new expiry has already passed on the next reaper pass;
+  lengthening it extends the existing leases; `0` releases every leased idle worker on the
+  next pass, except ones under a custody hold.
+- **Lowering the cap evicts nothing.** An owner above the new cap keeps the workers they
+  have, and gets no new ephemeral worker until theirs are released.
+- **Existing workers keep their size.** The default size applies to workers provisioned
+  after the change.
+
+**Upgrade note.** The chart's `workers.ephemeralLease` and `workers.ephemeralDefaultSize`
+now default to unset and render their environment variable only when set (an explicit
+`0` lease still renders). An install that sets either value keeps it, and sees that field
+locked until the value is unset; an install that never set them gets editable fields with
+the same defaults (`2h` and `m`), so behaviour on upgrade is unchanged. Setting
+`UZI_EPHEMERAL_LEASE` in `api.config` or `api.secretEnv` now fails the chart render: set it
+through `workers.ephemeralLease` instead, so there is one source. The `UZI_EPHEMERAL_DEFAULT_SIZE`
+guard is unchanged.
 
 ## Worker hibernation
 
@@ -321,8 +381,10 @@ deployment (see [Configuration](./configuration.md#hosted-k8s-workers-prd-58)).
 | `worker_hibernation_enabled` | `false` | Whether admins may [hibernate](./hosted-workers.md#hibernation) idle persistent hosted workers (Deployment scaled to 0, worker row, join-token Secret and volumes kept). Turning it off wakes every hibernated or still-hibernating worker, at most 10 per sweeper pass. Waking is never gated by this setting. |
 | `worker_hibernation_auto` | `false` | Whether the api [hibernates idle workers automatically](./hosted-workers.md#automatic-hibernation). Effective only while `worker_hibernation_enabled` is on. Enable it only once the [PRD #4206](../prds/4206-worker-hibernation-cache-cleanup.md) cache cleanup is deployed, including the worker support it needs: a worker image that advertises the `hibernation_cache_prune_v1` capability (see [Cache cleanup before sleep](./hosted-workers.md#cache-cleanup-before-sleep)). |
 | `worker_hibernation_idle_after` | `336h` | How long a worker must show no run activity before automatic hibernation considers it. A Go duration from `1h` to `2160h`. |
+| `worker_hibernation_surplus` | `false` | Whether the automatic pass also keeps a [warm reserve](./hosted-workers.md#surplus-warm-reserve): among an owner's interchangeable workers, one idle ready worker stays awake and the pool's other idle workers are hibernated after the surplus threshold. With it on, an owner's pooled workers also share an [owner-wide long idle clock](./hosted-workers.md#owner-wide-long-clock), and the api [wakes one hibernated member](./hosted-workers.md#surplus-warm-reserve) when a pool has no warm worker. Effective only while `worker_hibernation_enabled` and `worker_hibernation_auto` are both on. |
+| `worker_hibernation_surplus_idle_after` | `2h` | How long a surplus worker must show no run activity before the surplus rule hibernates it. A Go duration from `15m` to `336h`. The pass uses the shorter of this and `worker_hibernation_idle_after`; the settings card shows a hint when this value is longer. |
 
-Edit them in the **Worker hibernation** card on **Admin → Settings**. Hibernate and
+Edit them in the **Worker hibernation** card on **Admin → Workers**. Hibernate and
 Wake are per-worker buttons in **Admin → Health**. Roll back migrations before an
 older api if you downgrade; see
 [Downgrading](./hosted-workers.md#downgrading).
@@ -349,7 +411,7 @@ unit together:
 |---|---|---|
 | `custody_hold_limit` | 8 | The per-owner admission limit, a whole number from 1 to 1000. There is no zero or "unlimited" value. One deployment-wide value, applied separately to every owner. |
 
-Edit it in the **Custody hold limit** card on **Admin → Instance settings**. The
+Edit it in the **Custody hold limit** card on **Admin → Workers**. The
 settings API and the form refuse `0`, negatives, non-integers, signs such as `+12`
 and anything above 1000.
 
@@ -380,7 +442,8 @@ and anything above 1000.
   - new run-lane claims are refused (the dedicated cross-check lane is unaffected,
     but legacy checker children claimed through the ordinary run lane wait that cycle);
   - queued runs show "new runs are paused: the custody hold limit setting could not
-    be read; an admin should check Admin → Instance settings";
+    be read; an admin should check Admin → Instance settings" (the reason text predates
+    the move: the limit is now on Admin → Workers);
   - the held-work listing (`GET /api/recovery/holds`, `uzi run recovery`) returns a
     generic error;
   - the `custody.holds` health check reports `unknown` and names `custody_hold_limit`.

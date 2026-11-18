@@ -107,6 +107,7 @@ type Store interface {
 	// fleet.hibernation (issue #4207): idle workers the automatic pass could not hibernate, and
 	// workers whose only runs are parked; each row carries the exact window total.
 	ListAutoHibernationBlockers(context.Context, store.ListAutoHibernationBlockersParams) ([]store.ListAutoHibernationBlockersRow, error)
+	ListAutoHibernationBlockersSurplusMode(context.Context, store.ListAutoHibernationBlockersSurplusModeParams) ([]store.ListAutoHibernationBlockersSurplusModeRow, error)
 }
 
 // Settings is the slice of the settings cache healthsvc reads: the run-health kill switch
@@ -128,6 +129,9 @@ type Settings interface {
 	WorkerHibernationEnabled(context.Context) (bool, error)
 	WorkerHibernationAuto(context.Context) (bool, error)
 	WorkerHibernationIdleAfter(context.Context) (time.Duration, error)
+	// Warm-reserve surplus hibernation (issue #4395).
+	WorkerHibernationSurplus(context.Context) (bool, error)
+	WorkerHibernationSurplusIdleAfter(context.Context) (time.Duration, error)
 }
 
 // dbStat is the db check's raw probe result. Separating it from the severity logic is what
@@ -141,6 +145,10 @@ type dbStat struct {
 	schemaHead    int64
 	schemaAtHead  bool
 	schemaErr     error
+	// Cumulative pgxpool counters since pool creation; the db check works on their deltas.
+	emptyAcquireCount    int64
+	emptyAcquireWait     time.Duration
+	canceledAcquireCount int64
 }
 
 // Config carries the injected collaborators. Every field is a seam a unit test overrides.
@@ -238,6 +246,15 @@ type Service struct {
 	dbSizeInitialized bool
 	dbSizeResult      apitypes.HealthCheckDTO
 	dbSizeRefreshedAt time.Time
+
+	// poolWaitMu guards the db pool-wait window state (see poolWaitVerdict).
+	poolWaitMu          sync.Mutex
+	poolWaitInitialized bool
+	poolWaitBaselineAt  time.Time
+	poolWaitBaseCount   int64
+	poolWaitBaseWait    time.Duration
+	poolWaitBaseCancels int64
+	poolWaitCached      poolWait
 }
 
 // New builds a Service from cfg. The db probe defaults to the live-pool probe; a nil pool

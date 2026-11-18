@@ -1,7 +1,9 @@
+import { useEffect, useRef } from "react";
 import { type RecommendationCategory } from "../../lib/api";
 import { JUDGE_CATEGORIES, recommendationLabel } from "../../lib/judge";
 import { cx } from "../../components/ui";
 import { XIcon } from "../../components/icons";
+import { keepInRowView, useEdgeFade } from "../../components/TabRow";
 
 // LabelFilter is the recommendation-label chip row (PRD #235 M2): one toggle chip per
 // JUDGE_CATEGORIES key, multi-select (OR semantics — a group has one category, so AND is
@@ -25,25 +27,41 @@ export function LabelFilter({
   counts,
   onToggle,
   onClear,
+  layout = "wrap",
 }: {
   selected: RecommendationCategory[];
   counts: Record<string, number>;
   onToggle: (cat: RecommendationCategory) => void;
   onClear: () => void;
+  /** `wrap` (default) wraps chips onto more lines; `row` keeps one non-wrapping, sideways-scrolling line (the pinned lg layout). */
+  layout?: "wrap" | "row";
 }) {
   const active = new Set(selected);
+  const scrollerRef = useRef<HTMLDivElement>(null);
+  useEdgeFade(scrollerRef, layout);
+  const selectedKey = selected.join(",");
+  // The chip the user just toggled (click or keyboard activation). A toggle keeps THAT chip
+  // in view; only mount or a layout change falls back to the first pressed chip.
+  const toggledRef = useRef<HTMLElement | null>(null);
+  useEffect(() => {
+    const scroller = scrollerRef.current;
+    if (!scroller) return;
+    const toggled = toggledRef.current;
+    toggledRef.current = null;
+    const target =
+      toggled && scroller.contains(toggled)
+        ? toggled
+        : scroller.querySelector<HTMLElement>('[aria-pressed="true"]');
+    // Inset 24: clear of the row's 24px edge fade.
+    keepInRowView(scroller, target, 24);
+  }, [selectedKey, layout]);
   // One inline chip row (PRD #1183 M2): no surrounding box, no eyebrow, no caption line — the
   // "counts are groups, deduped by target" explanation moves onto the row's title attribute so
   // the count unit is still discoverable without a standing line of chrome. The Clear control
   // stays always-mounted (invisible + non-focusable when nothing is selected) so the row height
   // does not shift.
-  return (
-    <div
-      role="group"
-      aria-label="Filter by recommendation label"
-      title="counts are groups, deduped by target"
-      className="flex flex-wrap items-center gap-2"
-    >
+  const chips = (
+    <>
       {JUDGE_CATEGORIES.map((cat) => {
         const on = active.has(cat);
         const count = counts[cat] ?? 0;
@@ -55,9 +73,13 @@ export function LabelFilter({
             type="button"
             aria-pressed={on}
             aria-label={`${label}, ${count} ${count === 1 ? "group" : "groups"}`}
-            onClick={() => onToggle(cat)}
+            onClick={(e) => {
+              toggledRef.current = e.currentTarget;
+              onToggle(cat);
+            }}
             className={cx(
               "inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-sm font-medium transition-colors",
+              layout === "row" && "shrink-0 focus-visible:ring-inset focus-visible:ring-offset-0",
               on
                 ? "border-brand/60 bg-brand/[0.13] text-brand"
                 : "border-edge bg-raised text-muted hover:border-edge-strong hover:text-fg",
@@ -85,19 +107,64 @@ export function LabelFilter({
           </button>
         );
       })}
+    </>
+  );
+  const clear = (
+    <>
       {/* Clear rides at the end of the same row; always mounted so the row height is stable,
           invisible + non-focusable until something is selected. */}
       <button
         type="button"
-        onClick={onClear}
+        onClick={() => {
+          onClear();
+          // Clear turns invisible and non-focusable once the filter empties: hand focus to
+          // the first chip rather than dropping it to the body.
+          // The first chip may be scrolled out of the row: bring the row back to its start
+          // (the page's scrollY is untouched).
+          const scroller = scrollerRef.current;
+          if (scroller) scroller.scrollLeft = 0;
+          scroller?.querySelector<HTMLElement>("button")?.focus({ preventScroll: true });
+        }}
         aria-hidden={active.size === 0}
         tabIndex={active.size === 0 ? -1 : 0}
-        className={`ml-auto inline-flex min-h-[24px] items-center gap-1 rounded-md px-2 py-1 text-xs font-medium text-muted transition-colors hover:bg-raised hover:text-fg${
+        className={`${layout === "row" ? "shrink-0" : "ml-auto"} inline-flex min-h-[24px] items-center gap-1 rounded-md px-2 py-1 text-xs font-medium text-muted transition-colors hover:bg-raised hover:text-fg${
           active.size === 0 ? " invisible pointer-events-none" : ""
         }`}
       >
         <XIcon /> Clear
       </button>
+    </>
+  );
+  if (layout === "row") {
+    // The chips scroll sideways inside their own scroller; Clear sits OUTSIDE it, at the
+    // row's right end, so an active filter can always be cleared however far the chips scroll.
+    return (
+      <div
+        role="group"
+        aria-label="Filter by recommendation label"
+        title="counts are groups, deduped by target"
+        className="flex items-center gap-2 py-1.5"
+      >
+        <div
+          ref={scrollerRef}
+          data-fade-row=""
+          className="flex min-w-0 flex-1 flex-nowrap items-center gap-2 overflow-x-auto overflow-y-hidden"
+        >
+          {chips}
+        </div>
+        {clear}
+      </div>
+    );
+  }
+  return (
+    <div
+      role="group"
+      aria-label="Filter by recommendation label"
+      title="counts are groups, deduped by target"
+      className="flex flex-wrap items-center gap-2"
+    >
+      {chips}
+      {clear}
     </div>
   );
 }

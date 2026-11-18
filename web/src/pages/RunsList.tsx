@@ -22,6 +22,7 @@ import { useAuth } from "../auth/AuthContext";
 import { api, isTerminalRun, preferForgeUrl, type AdminWorker, type RunSummaryItem, type RunUsage } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
 import { Alert, Badge, Card, EmptyState, Input, ListSkeleton, PageHeader, SectionTitle, StatusPill, cx } from "../components/ui";
+import { PinnedBlock, TabRow, tabClass } from "../components/TabRow";
 import { ActivityIcon } from "../components/icons";
 import { MrChip } from "../components/MrChip";
 import { RunIssueRef } from "../components/RunIssueRef";
@@ -249,25 +250,20 @@ function RunsAccountLayout() {
     <div className="space-y-6">
       <PageHeader title="Runs" description={scope === "cross-checks" ? "Plan and code cross-checks on your runs, with retained rounds grouped together." : "Your agent runs. Open one to watch it live."} actions={controls} />
       {notice}
-      <div className="flex gap-1 overflow-x-auto border-b border-edge">
-        {tabs.map((t) => (
-          <NavLink
-            key={t.to}
-            to={{ pathname: t.to, search: tabParams.toString() }}
-            end={t.end}
-            className={({ isActive }) =>
-              cx(
-                "-mb-px shrink-0 whitespace-nowrap border-b-2 px-3 py-2 text-sm font-medium transition-colors",
-                isActive
-                  ? "border-brand text-fg"
-                  : "border-transparent text-muted hover:border-edge-strong hover:text-fg",
-              )
-            }
-          >
-            {scope === "cross-checks" ? t.end ? "Active" : "Past checks" : t.label}
-          </NavLink>
-        ))}
-      </div>
+      <PinnedBlock>
+        <TabRow>
+          {tabs.map((t) => (
+            <NavLink
+              key={t.to}
+              to={{ pathname: t.to, search: tabParams.toString() }}
+              end={t.end}
+              className={({ isActive }) => tabClass(isActive)}
+            >
+              {scope === "cross-checks" ? t.end ? "Active" : "Past checks" : t.label}
+            </NavLink>
+          ))}
+        </TabRow>
+      </PinnedBlock>
       {scope === "cross-checks" ? <CrossChecks key={user?.id} lifecycle={lifecycle} /> : <Outlet context={{ runs, loading, error, credentialCounts, reload: () => void load() } satisfies RunsData} />}
     </div>
   );

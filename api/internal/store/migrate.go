@@ -15,7 +15,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	_ "github.com/jackc/pgx/v5/stdlib" // registers the "pgx" database/sql driver
+	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/pressly/goose/v3"
 )
 
@@ -134,11 +134,32 @@ const OAuthAuthorizeLockClass int32 = 0x757A6F61 // "uzoa"
 // XACT-scoped.
 const OAuthUserLockClass int32 = 0x757A6F75 // "uzou"
 
+// HibernationOwnerLockClass is the class half of the two-int advisory lock that serializes one
+// owner's automatic hibernation policy decisions (issue #4395, PRD warm reserve): the pass reads
+// an owner's whole pool, decides, and writes one worker, so two passes (two api replicas, or a
+// pass and its retry) deciding on the same owner would each see the other's candidate as a
+// ready keeper and could hibernate both members of a pool. A row lock on the candidate alone
+// cannot prevent that because the two transactions lock different rows.
+//
+// The lock is taken from Go (workersvc.hibernationOwnerTx), as the FIRST locking statement of
+// the transaction, before any worker or run row lock: no path may take it while already holding
+// a worker or run row lock. It is keyed by HibernationOwnerLockObjID(owner). XACT-scoped. The
+// source-enumeration collision test (TestProductTokenMintLockClassMatchesSQL) covers it like
+// every other *LockClass.
+const HibernationOwnerLockClass int32 = 0x757A686F // "uzho"
+
+// HibernationOwnerLockObjID derives the objid half of the per-owner hibernation lock from the
+// owner's uuid, the same derivation as the secret-mutation lock (the class half differs).
+func HibernationOwnerLockObjID(ownerID uuid.UUID) int32 { return userLockObjID(ownerID) }
+
 // SecretMutationLockObjID derives the objid half of the per-user secret mutation lock from
 // a user's uuid, exactly as the hosted-provision lock does: a uuid's leading bytes are
 // random, so two users can collide and serialize for a moment, a contention non-event,
 // never a correctness one.
-func SecretMutationLockObjID(userID uuid.UUID) int32 {
+func SecretMutationLockObjID(userID uuid.UUID) int32 { return userLockObjID(userID) }
+
+// userLockObjID is the shared per-user objid derivation: the first four uuid bytes.
+func userLockObjID(userID uuid.UUID) int32 {
 	return int32(binary.BigEndian.Uint32(userID[:4])) //nolint:gosec // wraparound is fine: a lock key, not a number
 }
 
@@ -379,6 +400,31 @@ func MigrateDownTo(ctx context.Context, dsn string, version int64) error {
 		return fmt.Errorf("run migrations down to %d: %w", version, err)
 	}
 	return nil
+}
+
+// migrateConnConfig parses dsn for the migration connection through pgxpool.ParseConfig, the
+// parser OpenPool uses: it validates the pgxpool-only settings (pool_max_conns etc.) and strips
+// them, so they are never sent to Postgres as runtime parameters, which the server rejects.
+func migrateConnConfig(dsn string) (*pgx.ConnConfig, error) {
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, err
+	}
+	return cfg.ConnConfig, nil
+}
+
+// RegisterMigrationDSN turns an operator connection string (DATABASE_URL) into one Migrate
+// can use: it parses dsn with migrateConnConfig (rejecting an invalid pool setting, stripping
+// the valid ones) and registers the result with the pgx database/sql driver. Migrate's own
+// sql.Open would otherwise keep pool_max_conns and friends as runtime parameters, which
+// Postgres rejects. The returned name is valid until release is called.
+func RegisterMigrationDSN(dsn string) (name string, release func(), err error) {
+	cc, err := migrateConnConfig(dsn)
+	if err != nil {
+		return "", nil, fmt.Errorf("parse database url: %w", err)
+	}
+	name = stdlib.RegisterConnConfig(cc)
+	return name, func() { stdlib.UnregisterConnConfig(name) }, nil
 }
 
 // openForMigrate opens the sql.DB at dsn, waits for it to become reachable, and

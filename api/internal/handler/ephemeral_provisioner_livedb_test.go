@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strconv"
 	"testing"
 	"time"
 
@@ -119,6 +120,24 @@ func (fx *ephemeralFixture) provisionerWithDelay(instanceEnabled bool, maxPerUse
 	return fx.provisionerWithLane(instanceEnabled, true, maxPerUser, saturationDelay)
 }
 
+// ephemeralSettingRows seeds the three admin settings the provisioner, the reaper and the claim
+// path read per decision (PRD #4212): the per-user cap, the default size ("m") and the lease. They
+// replaced the EphemeralConfig MaxPerUser, DefaultSize and Lease fields, so a test that used
+// MaxPerUser:1 seeds 1 here and runs with cap 1.
+func ephemeralSettingRows(maxPerUser int, lease time.Duration) []store.AppSetting {
+	return []store.AppSetting{
+		{Key: settings.KeyEphemeralMaxPerUser, Value: strconv.Itoa(maxPerUser)},
+		{Key: settings.KeyEphemeralDefaultSize, Value: "m"},
+		{Key: settings.KeyEphemeralLease, Value: settings.FormatEphemeralLease(lease)},
+	}
+}
+
+// ephemeralLeaseSettings is the settings cache a workersvc.Service under test reads its ephemeral
+// lease from (Service.SetEphemeralSettings).
+func ephemeralLeaseSettings(lease time.Duration) *settings.Cache {
+	return settings.New(&settingsStore{rows: ephemeralSettingRows(2, lease)}, time.Minute)
+}
+
 // provisionerLaneOff is provisioner on a deployment that did not enable the isolated research
 // lane (issue #1965): the kill-switch follows instanceEnabled but the lane trigger is skipped.
 func (fx *ephemeralFixture) provisionerLaneOff(instanceEnabled bool, maxPerUser int) *hostedsvc.EphemeralProvisioner {
@@ -128,12 +147,10 @@ func (fx *ephemeralFixture) provisionerLaneOff(instanceEnabled bool, maxPerUser 
 // provisionerWithLane is the one construction behind the helpers above. The lane defaults ON in
 // provisioner/provisionerWithDelay so the lane tests keep provisioning.
 func (fx *ephemeralFixture) provisionerWithLane(instanceEnabled, laneEnabled bool, maxPerUser int, saturationDelay time.Duration) *hostedsvc.EphemeralProvisioner {
-	sc := settings.New(&settingsStore{rows: []store.AppSetting{
+	sc := settings.New(&settingsStore{rows: append([]store.AppSetting{
 		{Key: settings.KeyEphemeralWorkersEnabled, Value: fmt.Sprintf("%t", instanceEnabled)},
-	}}, time.Minute)
+	}, ephemeralSettingRows(maxPerUser, 0)...)}, time.Minute)
 	return hostedsvc.NewEphemeralProvisioner(fx.pool, fx.q, fx.box, sc, hostedsvc.EphemeralConfig{
-		MaxPerUser:          maxPerUser,
-		DefaultSize:         "m",
 		SaturationDelay:     saturationDelay,
 		BackgroundGrace:     5 * time.Minute,
 		IsolatedLaneEnabled: laneEnabled,

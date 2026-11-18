@@ -10,6 +10,7 @@ import { OverviewNext } from "./pages/OverviewNext";
 import { AdminUsers } from "./pages/AdminUsers";
 import { AdminRateLimits } from "./pages/AdminRateLimits";
 import { AdminSettings } from "./pages/AdminSettings";
+import { AdminWorkers } from "./pages/AdminWorkers";
 import { AdminBranding } from "./pages/AdminBranding";
 import { AdminHealth } from "./pages/AdminHealth";
 import { AdminProducts } from "./pages/AdminProducts";
@@ -152,6 +153,7 @@ export const APP_ROUTES: AppRoute[] = [
   { path: "/admin/users", element: <AdminUsers />, guard: "admin" },
   { path: "/admin/rate-limits", element: <AdminRateLimits />, guard: "admin" },
   { path: "/admin/settings", element: <AdminSettings />, guard: "admin" },
+  { path: "/admin/workers", element: <AdminWorkers />, guard: "admin" },
   { path: "/admin/branding", element: <AdminBranding />, guard: "admin" },
   { path: "/admin/tool-allowlist", element: <ToolAllowlist />, guard: "admin" },
   { path: "/admin/blocked-repos", element: <AdminBlockedRepos />, guard: "admin" },

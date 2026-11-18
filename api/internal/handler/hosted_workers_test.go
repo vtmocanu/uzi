@@ -289,3 +289,27 @@ func TestHostedConfigDockerTier(t *testing.T) {
 		}
 	}
 }
+
+// PRD #4212: HostedConfig reports the admin-chosen persistent-worker size so the
+// provision form can preselect it.
+func TestHostedConfigReportsDefaultSize(t *testing.T) {
+	for _, tc := range []struct{ name, stored, want string }{
+		{"unset uses compiled-in default", "", "l"},
+		{"stored preset", "m", "m"},
+		{"stored highmem preset", "l-highmem", "l-highmem"},
+		{"unknown stored value falls back", "xl", "l"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHostedHandler(true, "5")
+			if tc.stored != "" {
+				h.settings = settings.New(&settingsStore{rows: []store.AppSetting{
+					{Key: settings.KeyHostedWorkerQuota, Value: "5"},
+					{Key: settings.KeyHostedDefaultSize, Value: tc.stored},
+				}}, time.Minute)
+			}
+			if got := hostedConfig(t, h)["default_size"]; got != tc.want {
+				t.Fatalf("default_size = %v, want %q", got, tc.want)
+			}
+		})
+	}
+}

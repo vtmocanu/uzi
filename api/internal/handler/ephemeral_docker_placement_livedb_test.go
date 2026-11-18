@@ -59,12 +59,9 @@ func (fx *ephemeralFixture) dockerPlacementSnapshot(pref, tier bool, list string
 		value = id.String()
 	}
 	probe.values = ids
-	probe.Cache = settings.New(&settingsStore{rows: []store.AppSetting{
-		{Key: settings.KeyEphemeralWorkersEnabled, Value: "true"},
-		{Key: settings.KeyDockerRepoAllowlist, Value: value},
-	}}, time.Minute)
+	probe.Cache = settings.New(&settingsStore{rows: dockerSettingRows(value, max, 2*time.Hour)}, time.Minute)
 	p := hostedsvc.NewEphemeralProvisioner(fx.pool, fx.q, fx.box, probe, hostedsvc.EphemeralConfig{BackgroundGrace: 5 * time.Minute,
-		DockerEnabled: tier, MaxPerUser: max, DefaultSize: "m", Lease: 2 * time.Hour, SaturationDelay: time.Hour,
+		DockerEnabled: tier, SaturationDelay: time.Hour,
 	})
 	return p, probe, ids
 }
@@ -78,7 +75,7 @@ func (fx *ephemeralFixture) dockerClaimService(probe *dockerAllowlistProbe, tier
 	})
 	svc.SetVault(vault.NewPostgres(fx.box, fx.pool))
 	svc.SetTxBeginner(fx.pool)
-	svc.SetEphemeralLease(2 * time.Hour)
+	svc.SetEphemeralSettings(ephemeralLeaseSettings(2 * time.Hour))
 	svc.SetDockerAllowlist(probe)
 	svc.SetEffectiveDockerTier(tier)
 	svc.SetBackground(func(func()) {})

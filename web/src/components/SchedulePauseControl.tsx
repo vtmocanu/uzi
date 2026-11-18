@@ -31,7 +31,7 @@ const PAUSE_SCOPE_SENTENCE =
 // the tab row, under "New schedule", adding no header height).
 export function PauseAllButton({ onClick, disabled }: { onClick: () => void; disabled?: boolean }) {
   return (
-    <Button variant="secondary" size="sm" className="ml-auto" onClick={onClick} disabled={disabled}>
+    <Button variant="secondary" size="sm" className="ml-auto self-center" onClick={onClick} disabled={disabled}>
       Pause all
       <ChevronDownIcon className="h-3.5 w-3.5" />
     </Button>

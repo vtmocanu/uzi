@@ -80,7 +80,7 @@ const goClient = new WorkerClient(cfg.url, cfg.token, "0.1.0-test", nullLogger()
 });
 const tips: string[] = [];
 const results: unknown[] = [];
-const packRanges = new Map<string, { bare: string; floor: string; defaultSha: string }>();
+const packRanges = new Map<string, { bare: string; floor: string; defaultSha: string; confirmed?: string }>();
 const wireDigests = new Map<string, string>();
 const wireArtifacts: { file: string; legacyFile: string; tip: string; floor: string; defaultSha: string; bytes: number }[] = [];
 let inventoryFailure: string | undefined;
@@ -125,8 +125,19 @@ function assertInventory(expected: string[], actual: string[]): void {
   assert.ok(fs.statSync(legacyFile).size <= 64 * 1024 * 1024);
   const legacy = inventory(range.bare, legacyFile);
   wireArtifacts.push({ file, legacyFile, tip: tipOid, floor: range.floor, defaultSha: range.defaultSha, bytes });
-  // Independent oracle: the full default closure is tiny in this fixture only.
-  const objects = gitIn(range.bare, ["rev-list", "--objects", range.defaultSha]).split("\n")
+  // Independent oracle: the full default closure is tiny in this fixture only. #4439: blobs
+  // reachable from the confirmed checkpoint tip are eligible too, but only when that tip is an
+  // ancestor of the uploaded tip (the producer's eligibility rule).
+  let confirmedEligible = false;
+  if (range.confirmed && range.confirmed !== tipOid) {
+    try {
+      execFileSync("git", ["-C", range.bare, "merge-base", "--is-ancestor", range.confirmed, tipOid],
+        { env: gitEnv, stdio: "pipe", timeout: 20_000 });
+      confirmedEligible = true;
+    } catch (error) { assert.equal((error as { status: number }).status, 1); }
+  }
+  const objects = gitIn(range.bare, ["rev-list", "--objects", range.defaultSha,
+    ...(confirmedEligible ? [range.confirmed!] : [])]).split("\n")
     .map(row => row.split(" ")[0]!);
   const eligible = new Set(execFileSync("git", ["-C", range.bare, "cat-file", "--batch-check=%(objectname) %(objecttype)"], {
     env: gitEnv, input: objects.join("\n") + "\n", encoding: "utf8", timeout: 20_000, maxBuffer: 1024 * 1024,
@@ -190,7 +201,10 @@ gitCache.checkpointPack = async (...args) => {
   if (packed) {
     if (args[3]) assert.equal(args[3].defaultBlobSha, captured, "overlay must retain scanned default authority");
     packDefaults.push(captured);
-    packRanges.set(packed.tipOid, { bare: args[0], floor, defaultSha: captured });
+    // #4439: the confirmed checkpoint tip the producer may use as a blob-only omission authority
+    // (pinned range wins; otherwise the unpinned option).
+    const confirmed = args[3] ? args[3].confirmedBlobSha : args[8]?.confirmedBlobTip;
+    packRanges.set(packed.tipOid, { bare: args[0], floor, defaultSha: captured, confirmed });
   }
   return packed;
 };

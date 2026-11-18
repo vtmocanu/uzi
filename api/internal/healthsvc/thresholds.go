@@ -47,10 +47,14 @@ const (
 	runDiskWarnFraction  = 0.40
 	runDiskInodeFreeWarn = 0.05
 
-	// db check: a ping slower than this warns; the pool warns when acquired connections
-	// reach this fraction of the max.
-	dbPingWarn      = 250 * time.Millisecond
-	dbPoolWarnRatio = 0.80
+	// db check: a ping slower than this warns. The pool warns on connection-acquire waits,
+	// not occupancy: dbPoolWaitBudget is the aggregate wait allowed per dbPoolWaitWindow of
+	// actual elapsed time, and dbPoolWaitRatio is how many budgets fit in one window (a
+	// delta warns when waitDelta * dbPoolWaitRatio >= elapsed).
+	dbPingWarn       = 250 * time.Millisecond
+	dbPoolWaitWindow = 60 * time.Second
+	dbPoolWaitBudget = 250 * time.Millisecond
+	dbPoolWaitRatio  = int64(dbPoolWaitWindow / dbPoolWaitBudget)
 
 	// db.size: percent of DB_STORAGE_CAPACITY_BYTES at or above which the database size
 	// warns or is danger.

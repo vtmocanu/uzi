@@ -164,24 +164,27 @@ the shape as transient by decision, not because its cause is known.
 all of these hold:
 
 1. at least one ref-status line is `! [remote rejected] <src> -> <dst> (failed)`
-   with the reason exactly `failed`;
+   with the reason exactly `failed` (`missing necessary objects` was added as a
+   second reason by the #4438 amendment below);
 2. every line is a whole git framing line in an anchored complete format:
    `To <url>`, such a ref-status line, `error: failed to push some refs to
    '<url>'` with nothing after it, or an empty (or empty `remote:`) line.
 
 Any other line keeps today's classification, so another `remote rejected`
-reason, a `[rejected]` line and every `remote:` diagnostic (a stated reason,
-marked or not: `GHnnn`, `remote: error:`, GitHub's backticked workflow-scope
-refusal, or free text such as a repository-policy notice) stay permanent.
-This is narrower than enumerating refusal markers: a reason the classifier has
-never seen cannot turn a deterministic refusal transient.
+reason (other than `missing necessary objects`, added by #4438), a
+`[rejected]` line and every `remote:` diagnostic (a stated reason, marked or
+not: `GHnnn`, `remote: error:`, GitHub's backticked workflow-scope refusal, or
+free text such as a repository-policy notice) stay permanent. This is narrower
+than enumerating refusal markers: a reason the classifier has never seen
+cannot turn a deterministic refusal transient.
 
 `/remote rejected/i` **stays** in `PERMANENT_PATTERNS`; the exception is a
 narrow, format-based pre-check, with no forge identity in the classifier.
-Everything else is unchanged and permanent: any other reason (including
-`failed to update ref` and `failed to lock`), authentication failures,
-protected-branch and pre-receive-hook refusals, workflow scope, `GH013`, and
-non-fast-forward or `[rejected]`.
+Everything else is unchanged and permanent: any other reason (other than
+`missing necessary objects`, #4438; including `failed to update ref` and
+`failed to lock`), authentication failures, protected-branch and
+pre-receive-hook refusals, workflow scope, `GH013`, and non-fast-forward or
+`[rejected]`.
 
 **Effect.** At the finalize branch push (`pushToOrigin`: the plain arm and the
 `base_align` overlay, merge and rebase arms), the same non-forced push of the
@@ -220,3 +223,55 @@ hard duration bound.
 **Scope.** Worker-only; older workers keep the old behaviour, and there is no
 API or schema change. Out of scope: checkpoint publication through the api push
 broker, merge-request creation, and the CLI `uzi handoff` push.
+
+## Amendment (2026-11-17, #4438): bare `(missing necessary objects)` remote rejection is classified transient
+
+**Observed.** An `mr_rework` run's finalize push, an ordinary non-forced push
+from the canonical bare, was refused by GitHub with only the three framing
+lines and the reason `missing necessary objects`:
+`! [remote rejected] <src> -> <dst> (missing necessary objects)`. A later
+read-only check of the surviving bare found it not shallow, with no
+partial-clone configuration, alternates or replace refs, and an object walk
+from the candidate found nothing missing. That check ran after the run ended,
+so a later fetch could in principle have filled a gap that existed at push
+time. The commit is now on GitHub. The underlying fault is unproven.
+
+**Decision.** An explicit retry-policy exception, not a diagnosis. The #3929
+rule now accepts the reason exactly `failed` or exactly
+`missing necessary objects` on the bare ref-status line (the constant is
+renamed `BARE_REMOTE_REJECTED_RETRYABLE`). Nothing else changes: the
+framing-only rule (every line a whole git framing line) is unchanged, and
+`/remote rejected/i` stays in `PERMANENT_PATTERNS`.
+
+**Why retrying is safe.** Each attempt pushes the same candidate, non-forced,
+and the publication proofs rerun on every attempt. Stock Git's receive path
+refuses the affected ref when its connectivity check fails, so a failed
+attempt changes nothing on origin there; GitHub's receive implementation is
+not stock Git, so the safety rests on the non-forced push and the per-attempt
+proofs, not on that behaviour. Local shallow or missing-object failures
+are detected by the per-attempt preflight (`scratchPublicationPreflight` in
+`agent/src/git.ts`, which raises `ScratchPublicationError` kinds
+`shallow_history` and `missing_objects`) and refuse permanently; the
+classifier does not look for them. A framing-only stderr says nothing about
+whether the local candidate is complete, and this amendment does not rely on
+it. Any additional local or remote diagnostic line keeps the error
+permanent.
+
+**Lookalikes stay permanent.** `(missing necessary objects) x`, `(missing
+necessary object)`, `(missing necessary objects: ...)`, `(n/a (unpacker
+error))`, `(bad pack)`, `(shallow update not allowed)`, a retryable reason
+beside any other reason on another ref (two retryable reasons on different
+refs are transient; finalize pushes one ref), either reason accompanied by a
+`remote:` diagnostic, and `[rejected]` or non-fast-forward lines.
+
+**Accepted risk.** A deterministic server-side fault that prints only this
+line exhausts its retries and is labelled `publication_forge_unreachable`
+("unreachable"); an enrolled run re-parks until the hold threshold. This
+mirrors the #3929 accepted risk (related: #3585). An exhausted publication
+park also records the failure on the worker-origin cooldown (#1324 D9), so
+such a fault can put the worker on cooldown for the whole origin and push the
+run's retry time to that cooldown's deadline. Retry backoff does not bound
+overall recovery time; parking and its duration policy are unchanged.
+
+**Scope.** Worker-only, as for #3929: older workers keep the old behaviour,
+and there is no API or schema change.

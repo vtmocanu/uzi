@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -25,6 +26,17 @@ type fakeSecret struct {
 	sealedWith string
 }
 
+// fakeEnv is one run_env_vars version row of the crypto fixture (PRD #4416).
+type fakeEnv struct {
+	id         uuid.UUID
+	userID     uuid.UUID
+	repoID     pgtype.UUID
+	name       string
+	secret     bool
+	ciphertext []byte
+	sealedWith string
+}
+
 type fakeVaultStore struct {
 	mu      sync.Mutex
 	txMu    sync.Mutex
@@ -32,6 +44,7 @@ type fakeVaultStore struct {
 	policy  string
 	vaults  map[uuid.UUID]store.UserVault
 	secrets []*fakeSecret
+	envs    []*fakeEnv
 
 	// clearNoticeCalls records every ClearVaultLockNotice(userID) the unlock hook
 	// fires (PRD #890 M1), so the unlock-hook test can assert it ran. clearNoticeErr,

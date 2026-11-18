@@ -81,6 +81,11 @@ SELECT credentials_reset_at FROM users WHERE id = @id;
 -- worker and judge bindings and cascade the rate-limit and Codex state rows.
 DELETE FROM user_secrets WHERE user_id = @user_id;
 
+-- name: DeleteAllRunEnvVarsForOwner :execrows
+-- Every run_env_vars row of the owner: live, retired and pending deletion, whatever
+-- the sealing marker (PRD #4416). Their ciphertext is unreadable after a reset.
+DELETE FROM run_env_vars WHERE user_id = @user_id;
+
 -- name: DeleteAllCodexProviderAccountsForOwner :execrows
 -- Whole account rows (live and recovery slots together). Cascades the refresh
 -- intent, rate-limit and admission-throttle rows keyed on the account.

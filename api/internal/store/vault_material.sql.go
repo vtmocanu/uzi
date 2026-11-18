@@ -18,6 +18,12 @@ WITH secrets AS (
            coalesce(sum(octet_length(s.ciphertext)), 0)::bigint AS ciphertext_bytes,
            coalesce(max(octet_length(s.ciphertext)), 0)::bigint AS max_row_bytes
     FROM user_secrets s WHERE s.user_id = $1
+), env AS (
+    -- PRD #4416: run_env_vars rows (live, retired and pending deletion) are vault material.
+    SELECT count(*)::bigint AS material_rows,
+           coalesce(sum(octet_length(e.ciphertext)), 0)::bigint AS ciphertext_bytes,
+           coalesce(max(octet_length(e.ciphertext)), 0)::bigint AS max_row_bytes
+    FROM run_env_vars e WHERE e.user_id = $1
 ), accounts AS (
     SELECT (count(*) + count(a.recovery_sealed))::bigint AS material_rows,
            coalesce(sum(octet_length(a.sealed_login)::bigint
@@ -26,10 +32,10 @@ WITH secrets AS (
                         + coalesce(octet_length(a.recovery_sealed), 0)::bigint), 0)::bigint AS max_row_bytes
     FROM codex_provider_account a WHERE a.user_id = $1
 )
-SELECT (secrets.material_rows + accounts.material_rows)::bigint AS material_rows,
-       (secrets.ciphertext_bytes + accounts.ciphertext_bytes)::bigint AS ciphertext_bytes,
-       greatest(secrets.max_row_bytes, accounts.max_row_bytes)::bigint AS max_row_bytes
-FROM secrets CROSS JOIN accounts
+SELECT (secrets.material_rows + env.material_rows + accounts.material_rows)::bigint AS material_rows,
+       (secrets.ciphertext_bytes + env.ciphertext_bytes + accounts.ciphertext_bytes)::bigint AS ciphertext_bytes,
+       greatest(secrets.max_row_bytes, env.max_row_bytes, accounts.max_row_bytes)::bigint AS max_row_bytes
+FROM secrets CROSS JOIN env CROSS JOIN accounts
 `
 
 type GetVaultMaterialTotalsRow struct {
@@ -50,6 +56,9 @@ const hasMasterVaultMaterial = `-- name: HasMasterVaultMaterial :one
 SELECT EXISTS (
     SELECT 1 FROM user_secrets s
     WHERE s.user_id = $1 AND s.sealed_with IN ('master', 'master_aad')
+    UNION ALL
+    SELECT 1 FROM run_env_vars e
+    WHERE e.user_id = $1 AND e.sealed_with IN ('master', 'master_aad')
     UNION ALL
     SELECT 1 FROM codex_provider_account a
     WHERE a.user_id = $1
@@ -125,6 +134,67 @@ func (q *Queries) LockVaultAccountMaterialBatch(ctx context.Context, arg LockVau
 			&i.SealedWith,
 			&i.RecoverySealed,
 			&i.RecoverySealedWith,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const lockVaultEnvMaterialBatch = `-- name: LockVaultEnvMaterialBatch :many
+WITH candidates AS MATERIALIZED (
+    SELECT e.id, octet_length(e.ciphertext)::bigint AS ciphertext_bytes
+    FROM run_env_vars e
+    WHERE e.user_id = $1
+      AND ($2::uuid IS NULL OR e.id > $2::uuid)
+    ORDER BY e.id LIMIT 64
+), bounded AS (
+    SELECT id, sum(ciphertext_bytes) OVER (ORDER BY id) AS batch_bytes
+    FROM candidates
+)
+SELECT e.id, e.repo_id, e.name, e.secret, e.ciphertext, e.sealed_with
+FROM run_env_vars e JOIN bounded b ON b.id = e.id
+WHERE e.user_id = $1 AND b.batch_bytes <= 1048576
+ORDER BY e.id
+FOR UPDATE OF e
+`
+
+type LockVaultEnvMaterialBatchParams struct {
+	UserID  uuid.UUID   `json:"user_id"`
+	AfterID pgtype.UUID `json:"after_id"`
+}
+
+type LockVaultEnvMaterialBatchRow struct {
+	ID         uuid.UUID   `json:"id"`
+	RepoID     pgtype.UUID `json:"repo_id"`
+	Name       string      `json:"name"`
+	Secret     bool        `json:"secret"`
+	Ciphertext []byte      `json:"ciphertext"`
+	SealedWith string      `json:"sealed_with"`
+}
+
+// Same bounded shape as the secret batch, over run_env_vars (PRD #4416). Every row
+// is returned with the columns the AAD is rebuilt from: scope, repo, secret flag, name.
+func (q *Queries) LockVaultEnvMaterialBatch(ctx context.Context, arg LockVaultEnvMaterialBatchParams) ([]LockVaultEnvMaterialBatchRow, error) {
+	rows, err := q.db.Query(ctx, lockVaultEnvMaterialBatch, arg.UserID, arg.AfterID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []LockVaultEnvMaterialBatchRow{}
+	for rows.Next() {
+		var i LockVaultEnvMaterialBatchRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.RepoID,
+			&i.Name,
+			&i.Secret,
+			&i.Ciphertext,
+			&i.SealedWith,
 		); err != nil {
 			return nil, err
 		}
@@ -218,6 +288,32 @@ func (q *Queries) ResealVaultAccountMaterial(ctx context.Context, arg ResealVaul
 		arg.SealedWith,
 		arg.RecoverySealed,
 		arg.RecoverySealedWith,
+		arg.UserID,
+		arg.ID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const resealVaultEnvMaterial = `-- name: ResealVaultEnvMaterial :execrows
+UPDATE run_env_vars SET ciphertext = $1, sealed_with = $2
+WHERE user_id = $3 AND id = $4
+`
+
+type ResealVaultEnvMaterialParams struct {
+	Ciphertext []byte    `json:"ciphertext"`
+	SealedWith string    `json:"sealed_with"`
+	UserID     uuid.UUID `json:"user_id"`
+	ID         uuid.UUID `json:"id"`
+}
+
+// Crypto only: preserve revision, flags and timestamps.
+func (q *Queries) ResealVaultEnvMaterial(ctx context.Context, arg ResealVaultEnvMaterialParams) (int64, error) {
+	result, err := q.db.Exec(ctx, resealVaultEnvMaterial,
+		arg.Ciphertext,
+		arg.SealedWith,
 		arg.UserID,
 		arg.ID,
 	)

@@ -18,6 +18,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	"github.com/vtmocanu/uzi/api/internal/jointoken"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/termsafe"
 	"github.com/vtmocanu/uzi/api/internal/workersize"
@@ -331,10 +332,19 @@ func (h *Handler) HostedConfig(w http.ResponseWriter, r *http.Request) {
 	// config fetch: the typed getter already returns false on error (fails closed
 	// by construction), so the error is deliberately discarded.
 	ephemeralEnabled, _ := h.settings.EphemeralWorkersEnabled(r.Context())
+	// The admin-chosen size the provision form preselects (PRD #4212). Only a
+	// preselection: a settings blip falls back to the compiled-in "l" rather than
+	// failing the config fetch.
+	defaultSize, err := h.settings.HostedDefaultSize(r.Context())
+	if err != nil {
+		slog.Error("hosted default size setting", "error", err)
+		defaultSize = settings.DefaultHostedDefaultSize
+	}
 	httpx.JSON(w, http.StatusOK, map[string]any{
 		"enabled":           h.cfg.WorkerHostingEnabled,
 		"docker_enabled":    h.cfg.WorkerHostingEnabled && h.cfg.WorkerDockerEnabled,
 		"quota":             quota,
 		"ephemeral_enabled": ephemeralEnabled,
+		"default_size":      defaultSize,
 	})
 }
