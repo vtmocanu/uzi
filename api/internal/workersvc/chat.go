@@ -191,7 +191,7 @@ func (s *Service) ClaimChat(ctx context.Context, wkr store.Worker) (*ChatClaimPa
 		}
 		return nil, err
 	}
-	payload, err := s.assembleChatClaim(ctx, run)
+	payload, err := s.assembleChatClaim(ctx, wkr, run)
 	if errors.Is(err, errCredentialDisabled) {
 		return nil, s.parkChatCredentialDisabled(ctx, wkr, run, holdCredentialDisabled)
 	}
@@ -407,7 +407,7 @@ func (s *Service) parkChatCredentialDisabled(ctx context.Context, wkr store.Work
 // It joins NO repo and NO forge connection (Decision 12): the only context it needs
 // beyond the run row is the resumed-from session for a Continue run, and the only
 // secret it opens is the Anthropic token.
-func (s *Service) assembleChatClaim(ctx context.Context, run store.Run) (*ChatClaimPayload, error) {
+func (s *Service) assembleChatClaim(ctx context.Context, wkr store.Worker, run store.Run) (*ChatClaimPayload, error) {
 	resumeSession, err := s.q.GetChatRunClaimContext(ctx, run.ID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -444,7 +444,7 @@ func (s *Service) assembleChatClaim(ctx context.Context, run store.Run) (*ChatCl
 		// PRD #4320 module 5: a provider-bound chat carries the frozen provider binding and NO vendor
 		// credential: openAnthropic, recordRunCredential and the credential_disabled/reset parks are
 		// never reached (the owner's Anthropic default is irrelevant to it).
-		pb, err := s.assembleProviderBinding(ctx, run)
+		pb, err := s.assembleProviderBinding(ctx, wkr, run)
 		if err != nil {
 			return nil, err
 		}

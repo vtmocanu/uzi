@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/providers"
 	"github.com/vtmocanu/uzi/api/internal/secretopen"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -210,10 +212,19 @@ func (s *Service) lockedProviderRefusal(ctx context.Context, q any, locked store
 // openWithAutoRetry, recordRunCredential or SetRunAnthropicSecret, so runs.anthropic_secret_id and
 // anthropic_rejected_at stay untouched, and the claiming worker's anthropic_bind_mode is ignored.
 //
+// The claiming worker must advertise capability.ClaudeProviderV1 (checked before anything is read).
+//
 // The finisher re-checks the same binding under locks (lockedProviderRefusal) after this open: a
 // rotation between the open and the delivery bumps enablement_rev, so the locked re-check refuses it
 // and the possibly re-keyed payload is never delivered.
-func (s *Service) assembleProviderBinding(ctx context.Context, run store.Run) (*ClaimProviderBinding, error) {
+func (s *Service) assembleProviderBinding(ctx context.Context, wkr store.Worker, run store.Run) (*ClaimProviderBinding, error) {
+	// Go-side backstop to the SQL claim clauses (PRD #4320 Decision Log, "M2 finding: the pinned Claude
+	// CLI follows gateway redirects"): a worker that did not report claude_provider_v1 never receives a
+	// provider key, so nothing below (no read, no vault open) runs for it. Refused terminally, like
+	// every other provider-lane refusal, never delivered.
+	if !slices.Contains(wkr.ProtocolCapabilities, capability.ClaudeProviderV1) {
+		return nil, errProviderLaneClaimRefused
+	}
 	keyID, ok := frozenProviderKeyID(run)
 	if !ok {
 		return nil, staleProviderRefusal("the run's provider binding is incomplete")

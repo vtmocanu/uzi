@@ -109,13 +109,22 @@ type dialRecorder struct {
 	mu    sync.Mutex
 	dials []netip.AddrPort
 	to    string // the real address every recorded dial is connected to
+
+	// When altPort is non-zero, a dial to that port is connected to altTo instead of to: a test's
+	// stand-in for a second origin the gateway could redirect to.
+	altPort uint16
+	altTo   string
 }
 
 func (d *dialRecorder) dial(ctx context.Context, ap netip.AddrPort) (net.Conn, error) {
 	d.mu.Lock()
 	d.dials = append(d.dials, ap)
 	d.mu.Unlock()
-	return (&net.Dialer{}).DialContext(ctx, "tcp", d.to)
+	to := d.to
+	if d.altPort != 0 && ap.Port() == d.altPort {
+		to = d.altTo
+	}
+	return (&net.Dialer{}).DialContext(ctx, "tcp", to)
 }
 
 func (d *dialRecorder) recorded() []netip.AddrPort {
@@ -250,10 +259,13 @@ func TestProbeClassification(t *testing.T) {
 		var hits atomic.Int32
 		loc := redirectTarget(&hits)
 		gw := newGateway(t, reply{status: 302, location: loc}, reply{status: 200, body: toolMessage})
-		p, _ := testProber(t, gw, false, "10.0.0.5")
+		p, rec := testProber(t, gw, false, "10.0.0.5")
 		res, err := p.Probe(context.Background(), target())
 		if err != nil || res.Auth != AuthInconclusive || res.Tool != ToolNotRun {
 			t.Fatalf("result = %+v, %v", res, err)
+		}
+		if n := len(rec.recorded()); n != 1 {
+			t.Errorf("%d dials, want 1 (a followed redirect opens another connection)", n)
 		}
 		if hits.Load() != 0 {
 			t.Errorf("redirect target was contacted %d time(s)", hits.Load())
@@ -308,12 +320,78 @@ func TestProbeClassification(t *testing.T) {
 	t.Run("redirect on the tool step", func(t *testing.T) {
 		var hits atomic.Int32
 		gw := newGateway(t, reply{status: 200, body: okMessage}, reply{status: 307, location: redirectTarget(&hits)})
-		p, _ := testProber(t, gw, false, "10.0.0.5")
+		p, rec := testProber(t, gw, false, "10.0.0.5")
 		res, _ := p.Probe(context.Background(), target())
 		if res.Auth != AuthOK || res.Tool != ToolInconclusive || hits.Load() != 0 {
 			t.Fatalf("result = %+v, redirect hits %d", res, hits.Load())
 		}
+		if n := len(rec.recorded()); n != 2 {
+			t.Errorf("%d dials, want 2 (one per step; a followed redirect adds one)", n)
+		}
 	})
+}
+
+// TestProbeNeverFollowsACrossOriginRedirect proves the probe re-sends neither the key nor the body
+// to the Location of a 3xx. The redirect target is a real second TLS origin the dialer can reach
+// (routed by port), the resolver admits it, and its certificate is trusted, so the only thing that
+// keeps the attacker unreached is the client refusing to follow.
+func TestProbeNeverFollowsACrossOriginRedirect(t *testing.T) {
+	const attackerPort = 8443
+	const location = "https://attacker.example:8443/steal"
+	for _, step := range []string{"auth", "tool"} {
+		for _, style := range []string{AuthBearer, AuthXAPIKey} {
+			for _, status := range []int{302, 307, 308} {
+				t.Run(fmt.Sprintf("%s step, %s, %d", step, style, status), func(t *testing.T) {
+					var mu sync.Mutex
+					var got []captured
+					attacker := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						body := mustRead(r)
+						mu.Lock()
+						got = append(got, captured{path: r.URL.Path, header: r.Header.Clone(), body: body})
+						mu.Unlock()
+						reply{status: 200, body: okMessage}.write(w, r)
+					}))
+					t.Cleanup(attacker.Close)
+
+					redirect := reply{status: status, location: location}
+					auth, tool := redirect, reply{status: 200, body: toolMessage}
+					wantAuth, wantTool, wantDials := AuthInconclusive, ToolNotRun, 1
+					if step == "tool" {
+						auth, tool = reply{status: 200, body: okMessage}, redirect
+						wantAuth, wantTool, wantDials = AuthOK, ToolInconclusive, 2
+					}
+					gw := newGateway(t, auth, tool)
+					p, rec := testProber(t, gw, false, "10.0.0.5")
+					rec.altPort, rec.altTo = attackerPort, attacker.Listener.Addr().String()
+					pool := x509.NewCertPool()
+					pool.AddCert(gw.srv.Certificate())
+					pool.AddCert(attacker.Certificate())
+					p.cfg.RootCAs = pool
+					tg := target()
+					tg.AuthStyle = style
+
+					res, err := p.Probe(context.Background(), tg)
+					if err != nil || res.Auth != wantAuth || res.Tool != wantTool {
+						t.Fatalf("result = %+v, %v; want auth %q tool %q", res, err, wantAuth, wantTool)
+					}
+					mu.Lock()
+					defer mu.Unlock()
+					for _, r := range got {
+						t.Errorf("attacker received %s with Authorization=%q x-api-key=%q body=%d bytes",
+							r.path, r.header.Get("Authorization"), r.header.Get("x-api-key"), len(r.body))
+					}
+					for _, d := range rec.recorded() {
+						if d.Port() == attackerPort {
+							t.Errorf("dialed the redirect target port: %v", d)
+						}
+					}
+					if n := len(rec.recorded()); n != wantDials {
+						t.Errorf("%d dials, want %d", n, wantDials)
+					}
+				})
+			}
+		}
+	}
 }
 
 func TestProbeRequestShape(t *testing.T) {

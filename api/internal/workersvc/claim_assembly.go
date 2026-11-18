@@ -379,7 +379,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		// credential: claimSecretID, openWithAutoRetry, recordRunCredential and SetRunAnthropicSecret
 		// are never called (runs.anthropic_secret_id and anthropic_rejected_at are never written), the
 		// claiming worker's anthropic_bind_mode is ignored, and `anthropic` stays nil.
-		pb, err := s.assembleProviderBinding(ctx, run)
+		pb, err := s.assembleProviderBinding(ctx, wkr, run)
 		if err != nil {
 			return nil, err
 		}

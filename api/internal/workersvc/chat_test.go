@@ -221,7 +221,7 @@ func TestAssembleChatClaimRefusesCodexIndicatingRun(t *testing.T) {
 			fs := &fakeStore{anthropic: sealedTok}
 			svc := New(fs, box, testParams())
 
-			payload, err := svc.assembleChatClaim(context.Background(), c.run)
+			payload, err := svc.assembleChatClaim(context.Background(), store.Worker{}, c.run)
 			if !errors.Is(err, errCredentialUnavailable) {
 				t.Fatalf("err = %v, want errCredentialUnavailable (the Codex refusal)", err)
 			}
@@ -254,7 +254,7 @@ func TestAssembleChatClaimAllowsClaudeRun(t *testing.T) {
 	svc := newOffModeService(fs, box, testParams())
 
 	run := store.Run{ID: uuid.New(), UserID: uuid.New(), Kind: runkind.Chat, Harness: harnessClaude, Status: "claimed", Title: pgtype.Text{String: "hi", Valid: true}}
-	payload, err := svc.assembleChatClaim(context.Background(), run)
+	payload, err := svc.assembleChatClaim(context.Background(), store.Worker{}, run)
 	if err != nil {
 		t.Fatalf("assembleChatClaim(claude): %v", err)
 	}

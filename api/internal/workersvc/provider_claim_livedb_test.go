@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -650,5 +651,59 @@ func TestCredentialPromoterSkipsProviderRowsLiveDB(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		pf.svc.RequestCredentialDisabledPromotion(pf.userID)
 		pf.wantParked(t, stale, "provider_binding_stale")
+	}
+}
+
+// keyOpenSpy counts the store reads that precede a provider key open.
+type keyOpenSpy struct {
+	Store
+	rd                            providerClaimReader
+	bindingReads, ciphertextReads atomic.Int32
+}
+
+func (s *keyOpenSpy) GetModelProviderRevisionForOwner(ctx context.Context, arg store.GetModelProviderRevisionForOwnerParams) (store.GetModelProviderRevisionForOwnerRow, error) {
+	return s.rd.GetModelProviderRevisionForOwner(ctx, arg)
+}
+
+func (s *keyOpenSpy) GetProviderBindingKeyByID(ctx context.Context, arg store.GetProviderBindingKeyByIDParams) (store.GetProviderBindingKeyByIDRow, error) {
+	s.bindingReads.Add(1)
+	return s.rd.GetProviderBindingKeyByID(ctx, arg)
+}
+
+func (s *keyOpenSpy) GetUserSecretCiphertextByID(ctx context.Context, arg store.GetUserSecretCiphertextByIDParams) (store.GetUserSecretCiphertextByIDRow, error) {
+	s.ciphertextReads.Add(1)
+	return s.Store.GetUserSecretCiphertextByID(ctx, arg)
+}
+
+// TestProviderBindingNeverOpensTheKeyForAWorkerWithoutTheCapabilityLiveDB: the Go-side backstop to the
+// SQL claim clauses. A provider-bound run (real frozen binding, real sealed key) assembled for a
+// worker lacking claude_provider_v1 is refused terminally on the run and chat lanes before the key
+// row or its ciphertext is read; the same run assembled for a capable worker does open the key
+// (so the spy is live).
+func TestProviderBindingNeverOpensTheKeyForAWorkerWithoutTheCapabilityLiveDB(t *testing.T) {
+	pf := newPCFix(t)
+	spy := &keyOpenSpy{Store: pf.svc.q, rd: pf.svc.q.(providerClaimReader)}
+	pf.svc.q = spy
+	runRow, chatRow := mustRun(t, pf.env, pf.run(t)), mustRun(t, pf.env, pf.chat(t))
+	capable := pf.worker(t)
+	incapable := capable
+	incapable.ProtocolCapabilities = []string{capability.RecoveryArchiveV1, capability.CredentialSwitchV1}
+
+	if _, err := pf.svc.assembleClaim(pf.env.ctx, incapable, runRow); !errors.Is(err, ErrProviderLaneUnsupported) || !errors.Is(err, errCredentialUnavailable) {
+		t.Fatalf("assembleClaim for an incapable worker: err = %v, want terminal provider_lane_unsupported", err)
+	}
+	if _, err := pf.svc.assembleChatClaim(pf.env.ctx, incapable, chatRow); !errors.Is(err, ErrProviderLaneUnsupported) || !errors.Is(err, errCredentialUnavailable) {
+		t.Fatalf("assembleChatClaim for an incapable worker: err = %v, want terminal provider_lane_unsupported", err)
+	}
+	if b, c := spy.bindingReads.Load(), spy.ciphertextReads.Load(); b != 0 || c != 0 {
+		t.Fatalf("the key was reached for an incapable worker: %d binding read(s), %d ciphertext read(s)", b, c)
+	}
+
+	pb, err := pf.svc.assembleProviderBinding(pf.env.ctx, capable, runRow)
+	if err != nil || pb == nil || pb.Credential != pf.plain {
+		t.Fatalf("assembleProviderBinding for a capable worker = (%+v, %v)", pb, err)
+	}
+	if spy.bindingReads.Load() == 0 || spy.ciphertextReads.Load() == 0 {
+		t.Fatalf("the spy saw no key open for the capable worker: %d / %d", spy.bindingReads.Load(), spy.ciphertextReads.Load())
 	}
 }

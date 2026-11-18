@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -90,8 +91,44 @@ func TestProviderBoundRowsRefuseUnsupportedLanes(t *testing.T) {
 // A store that cannot read provider bindings fails a provider-bound claim closed.
 func TestProviderBoundClaimFailsClosedWithoutBindingReader(t *testing.T) {
 	svc := New(&fakeStore{}, newBox(t), testParams())
-	_, err := svc.assembleProviderBinding(context.Background(), providerBoundRow(runkind.Issue))
+	_, err := svc.assembleProviderBinding(context.Background(), store.Worker{ProtocolCapabilities: []string{capability.ClaudeProviderV1}}, providerBoundRow(runkind.Issue))
 	if !errors.Is(err, errCredentialUnavailable) {
 		t.Fatalf("err = %v, want errCredentialUnavailable", err)
+	}
+}
+
+// bindingReadSpy fails the test on any provider binding read; every other store method is the
+// nil-embedding fake's, which panics, so a vault open would fail loudly too.
+type bindingReadSpy struct {
+	*fakeStore
+	t *testing.T
+}
+
+func (s bindingReadSpy) GetModelProviderRevisionForOwner(context.Context, store.GetModelProviderRevisionForOwnerParams) (store.GetModelProviderRevisionForOwnerRow, error) {
+	s.t.Error("the provider revision was read for a worker without claude_provider_v1")
+	return store.GetModelProviderRevisionForOwnerRow{}, errors.New("unexpected read")
+}
+
+func (s bindingReadSpy) GetProviderBindingKeyByID(context.Context, store.GetProviderBindingKeyByIDParams) (store.GetProviderBindingKeyByIDRow, error) {
+	s.t.Error("the provider key row was read for a worker without claude_provider_v1")
+	return store.GetProviderBindingKeyByIDRow{}, errors.New("unexpected read")
+}
+
+// A provider-bound run assembled for a worker that did not report claude_provider_v1 is refused
+// terminally before the binding is read or the key is opened, on the run lane (issue) and the chat
+// lane: a Go-side backstop to the SQL claim clauses.
+func TestProviderBoundAssemblyRefusesAWorkerWithoutTheCapability(t *testing.T) {
+	svc := New(bindingReadSpy{fakeStore: &fakeStore{}, t: t}, newBox(t), testParams())
+	for _, caps := range [][]string{nil, {}, {capability.CrossCheckGatedV1, capability.RecoveryArchiveV1}} {
+		wkr := store.Worker{ID: uuid.New(), ProtocolCapabilities: caps}
+		run := providerBoundRow(runkind.Issue)
+		wkr.UserID = run.UserID
+		if _, err := svc.assembleProviderBinding(context.Background(), wkr, run); !errors.Is(err, ErrProviderLaneUnsupported) || !errors.Is(err, errCredentialUnavailable) {
+			t.Errorf("caps %v: assembleProviderBinding err = %v, want terminal provider_lane_unsupported", caps, err)
+		}
+		chat := providerBoundRow(runkind.Chat)
+		if _, err := svc.assembleChatClaim(context.Background(), wkr, chat); !errors.Is(err, ErrProviderLaneUnsupported) {
+			t.Errorf("caps %v: assembleChatClaim err = %v", caps, err)
+		}
 	}
 }
