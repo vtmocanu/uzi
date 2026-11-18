@@ -642,6 +642,11 @@ volumes in the new pool's topology (no `allowedTopologies` or storage policy lim
 the old zone). Prove it first, for example with a throwaway claim and pod pinned to a new
 node, before deleting any worker's volumes.
 
+Also test whether an existing worker volume can attach on a new node (for example by
+pinning a throwaway pod that mounts a copy, or a retired worker's volume, to a new node).
+If it cannot, step 3 is safe only after every worker has moved: a worker still on its
+old volumes would stay Pending under the new global placement.
+
 Procedure (it moves unstamped workers that are on the global placement):
 
 Do not manually delete or replace worker claims while the controller is running.
@@ -656,9 +661,20 @@ move it; follow the stop-and-confirm sequence below.
    restarted onto that spec. A controller still on the old configuration would recreate
    the deleted volumes unstamped. No worker on the global placement rolls.
 2. For each worker that is not hibernated (wake a hibernated worker first, or leave it
-   for later):
+   for later), one worker at a time. Never move two workers of the same owner and lane
+   together: each one's restore waits on coverage from the other, so neither comes back.
+   A hibernated worker gives no coverage, so wake an owner's other worker first when it
+   is the only cover.
    1. Cordon the worker and wait until it holds no assigned run and no recovery custody
       hold. Back up anything you need from `/data`.
+      - The CLI cordons only your own workers. Without a cordon, check that the worker is
+        idle (no active run, not busy, no custody hold) before step 2.3, and again after
+        step 2.4 together with no assigned nonterminal run; if either check fails, back
+        out as in step 2.5.
+      - A custody hold on a completed task or prompt run does not release on its own, and
+        only the run's owner can discard it. Verify its work reached the forge first. If
+        you move the worker anyway, step 2.6 deletes the held copy and the hold stays
+        listed until the owner discards it.
    2. Confirm that the restore in step 2.7 can be admitted. The paced roll's
       prerequisites must hold for this worker:
       - usable, uncordoned coverage from another worker of the same owner and lane,
@@ -668,7 +684,8 @@ move it; follow the stop-and-confirm sequence below.
       - no blocking canary in flight.
 
       If they do not hold, stop here and uncordon the worker; nothing has changed yet.
-      Do not weaken pacing to get past it.
+      Do not weaken pacing to get past it. A manual cordon on the covering worker, or on
+      the pool's canary, also holds the restore back.
    3. Stop the controller: scale its Deployment to 0 and wait until its pods have
       terminated. Under GitOps, pause self-heal for it first, or the sync restores it.
    4. Scale the worker's Deployment (`uzi-hw-<id>`, where `<id>` is the worker id) to 0
@@ -693,7 +710,7 @@ move it; follow the stop-and-confirm sequence below.
       can wait on that. With a `WaitForFirstConsumer` StorageClass the volumes bind in the
       new zone when the pod is scheduled.
    8. Confirm the worker is online on a new node, then uncordon it.
-3. When no unstamped worker remains, copy `newPlacement` into `workers.nodeSelector` and
+3. When no unstamped worker remains (hibernated workers included), copy `newPlacement` into `workers.nodeSelector` and
    `workers.tolerations` first, then clear `newPlacement`. Helm merges maps into the
    chart default, so an empty `nodeSelector: {}` keeps the default
    `kubernetes.io/arch: amd64`; when the new placement has no node selector, set
@@ -717,6 +734,13 @@ Caveats:
 - Clearing `newPlacement` before updating the global placement sends stamped workers back
   to the old nodes, where their new volumes may not attach. Rolling back to a controller
   version without this feature has the same effect, because it ignores the stamp.
+- Known issues that can stall a restore in step 2.7:
+  - a roll pool whose participant reservations have lost their canary holds every
+    participant, and the controller does not recover it yet (#4466);
+  - while a restore waits on admission, its `WaitForFirstConsumer` claims stay Pending
+    and can be reported stranded after the bind timeout, though storage is fine (#4468);
+  - the roll status view can drop a worker's health row when its blocker is synthetic
+    (#4467), so read the worker list as well.
 
 ## Pod shutdown grace
 
