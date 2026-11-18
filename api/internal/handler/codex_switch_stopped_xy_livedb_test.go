@@ -46,9 +46,9 @@ func withdrawStoppedOp(e *applyRouteEnv, w stoppedRouteWire, op uuid.UUID) int {
 }
 
 // A stop latched from X's READY settles after X is withdrawn and a later Y is
-// requested and withdrawn: neither withdrawal changes binding, claim,
-// incarnation or epoch. A pending Y refuses it, and a delayed withdrawal of X
-// cannot discharge Y.
+// requested and withdrawn: neither withdrawal changes claim, incarnation or
+// epoch (the latched values the predicate compares). A pending Y refuses it, and
+// a delayed withdrawal naming X cannot discharge Y.
 func TestWorkerCodexStoppedWithdrawnXYRouteLiveDB(t *testing.T) {
 	t.Run("xy_settles", func(t *testing.T) {
 		e, w := setupStoppedGuardsRoute(t)

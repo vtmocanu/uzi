@@ -11,12 +11,13 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// A late control written (uncommitted) under the worker lock before the report
-// starts must fence it. The report is released only once it is blocked behind
-// the control's transaction or has already finished, so the outcome does not
-// depend on goroutine scheduling.
+// A late control written (uncommitted) before the report starts must fence it.
+// pause_run_only writes the run row without the worker lock, as single-statement
+// owner writers do, so only the report's run row locks can fence it. The control
+// commits only once a backend is blocked behind its transaction or the report has
+// already finished, so the outcome does not depend on goroutine scheduling.
 func TestCodexSwitchStoppedLateControlLockOrderLiveDB(t *testing.T) {
-	for _, control := range []string{"policy", "registration", "pause"} {
+	for _, control := range []string{"policy", "registration", "pause", "pause_run_only"} {
 		t.Run(control, func(t *testing.T) {
 			f, id, _, req := stoppedFixture(t)
 			withdrawStoppedSwitch(t, f, id)
@@ -28,15 +29,17 @@ func TestCodexSwitchStoppedLateControlLockOrderLiveDB(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer func() { _ = tx.Rollback(ctx) }()
-			if _, err := store.New(tx).GetWorkerForUpdate(ctx, worker.ID); err != nil {
-				t.Fatal(err)
+			if control != "pause_run_only" {
+				if _, err := store.New(tx).GetWorkerForUpdate(ctx, worker.ID); err != nil {
+					t.Fatal(err)
+				}
 			}
 			switch control {
 			case "policy":
 				_, err = tx.Exec(ctx, "UPDATE runs SET policy_outcome_id=$2, policy_preserve_required=true, policy_continuation_mode='same_conversation', policy_applying_worker_id=worker_id, policy_applying_generation=claim_generation, policy_source_generation=claim_generation WHERE id=$1", id, uuid.New())
 			case "registration":
 				_, err = tx.Exec(ctx, "UPDATE workers SET snapshot_register_nonce='late-registration' WHERE id=$1", worker.ID)
-			case "pause":
+			case "pause", "pause_run_only":
 				_, err = tx.Exec(ctx, "UPDATE runs SET pause_requested_at=now(),pause_mode='wall' WHERE id=$1", id)
 			}
 			if err != nil {
@@ -56,6 +59,7 @@ func TestCodexSwitchStoppedLateControlLockOrderLiveDB(t *testing.T) {
 				done <- report{accepted, err}
 			}()
 			var result *report
+			blocked := false
 			for deadline := time.Now().Add(2 * time.Second); result == nil; {
 				select {
 				case r := <-done:
@@ -63,7 +67,6 @@ func TestCodexSwitchStoppedLateControlLockOrderLiveDB(t *testing.T) {
 					continue
 				default:
 				}
-				var blocked bool
 				if err := f.env.pool.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE $1::int = ANY(pg_blocking_pids(pid)))", txPID).Scan(&blocked); err != nil {
 					t.Fatal(err)
 				}
@@ -84,6 +87,9 @@ func TestCodexSwitchStoppedLateControlLockOrderLiveDB(t *testing.T) {
 			}
 			if result.err != nil || result.accepted {
 				t.Fatalf("late control did not fence the report: accepted=%t err=%v", result.accepted, result.err)
+			}
+			if !blocked {
+				t.Fatal("report was refused without waiting behind the control")
 			}
 		})
 	}
