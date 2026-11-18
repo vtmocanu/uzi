@@ -56,6 +56,8 @@ type ClaimObservation struct {
 	// RollAnnotation is the uzi.dev/image-roll annotation value on the claim.
 	RollAnnotation        string
 	RollAnnotationPresent bool
+	// PlacementNew is true when the claim carries uzi.dev/placement: new.
+	PlacementNew bool
 }
 
 // ObservedWorker is one hosted worker's state as it currently exists in the

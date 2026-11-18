@@ -30,6 +30,9 @@ func (m *Materializer) reconcileDinD(ctx context.Context, w protocol.DesiredWork
 	if !w.Docker || w.Ephemeral || !supported {
 		return active, nil
 	}
+	// The tick's placement was decided from this claim, before the maintenance
+	// relist. A new identity or stamp must wait for a new whole-worker observation.
+	placementClaim := o.DinDClaim
 	transition := func(next protocol.DindMaintenance) {
 		if _, err := c.TransitionDinD(ctx, w.ID, next); err != nil {
 			m.log.Info("DinD maintenance waiting for server preconditions", "worker_id", w.ID, "phase", next.Phase, "error", err)
@@ -49,6 +52,9 @@ func (m *Materializer) reconcileDinD(ctx context.Context, w protocol.DesiredWork
 		o, err = m.maintenanceObservation(ctx, w.ID, ns, o)
 		if err != nil {
 			return true, err
+		}
+		if m.cfg.NewPlacementSet() && placementClaimChanged(placementClaim, o.DinDClaim) {
+			return true, nil
 		}
 		if o.DinDPVCCreatedAt != nil && m.now().Sub(*o.DinDPVCCreatedAt) < m.recycle.Cooldown {
 			m.log.Info(fmt.Sprintf("disk-recycle-skipped-cooldown worker=%s", w.ID))
@@ -88,7 +94,7 @@ func (m *Materializer) reconcileDinD(ctx context.Context, w protocol.DesiredWork
 			}
 		}
 	}
-	wantHash := RenderDeployment(m.cfg, w, spec).Spec.Template.Annotations[AnnotationSpecHash]
+	wantHash := RenderDeployment(m.renderCfgFor(ctx, w, o), w, spec).Spec.Template.Annotations[AnnotationSpecHash]
 	if !m.recycle.Enabled && (op.Phase == "requested" || op.Phase == "ready") {
 		next.Phase = "cancelled"
 		next.Reason = "recycle_disabled"
@@ -100,6 +106,9 @@ func (m *Materializer) reconcileDinD(ctx context.Context, w protocol.DesiredWork
 		o, err = m.maintenanceObservation(ctx, w.ID, ns, o, op)
 		if err != nil {
 			return true, err
+		}
+		if m.cfg.NewPlacementSet() && placementClaimChanged(placementClaim, o.DinDClaim) {
+			return true, nil
 		}
 	}
 	switch op.Phase {

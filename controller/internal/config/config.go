@@ -154,6 +154,16 @@ type Config struct {
 	// (UZI_WORKER_TOLERATIONS, a JSON array of Kubernetes tolerations). Unset, empty,
 	// "null" or "[]" means none, which keeps the pod template hash unchanged.
 	WorkerTolerations []corev1.Toleration
+	// WorkerNewPlacementNodeSelector / WorkerNewPlacementTolerations are an opt-in
+	// second placement (UZI_WORKER_NEW_PLACEMENT_NODE_SELECTOR, a JSON object of label
+	// key -> value; UZI_WORKER_NEW_PLACEMENT_TOLERATIONS, a JSON array of tolerations),
+	// applied only to workers whose PVCs all carry the uzi.dev/placement: new stamp.
+	// "Set" means the selector or the tolerations is non-empty. For a stamped worker
+	// each field REPLACES (never merges with) the matching global field above. Parsed
+	// with the same validation as the global fields; unset, empty or "null" means none,
+	// as does "{}" for the selector and "[]" for the tolerations.
+	WorkerNewPlacementNodeSelector map[string]string
+	WorkerNewPlacementTolerations  []corev1.Toleration
 	// WorkerEphemeralRequest overrides the WORKER container's
 	// requests.ephemeral-storage for a PLAIN worker (issue #224 M-b;
 	// UZI_WORKER_EPHEMERAL_REQUEST). Empty ⇒ the render side's built-in 512Mi.
@@ -553,7 +563,7 @@ func loadWorkerSettings(cfg *Config) error {
 	}
 	cfg.WorkerStorageClass = strings.TrimSpace(os.Getenv("UZI_WORKER_STORAGE_CLASS"))
 	cfg.WorkerPriorityClassName = strings.TrimSpace(os.Getenv("UZI_WORKER_PRIORITY_CLASS_NAME"))
-	sel, err := parseNodeSelector(os.Getenv("UZI_WORKER_NODE_SELECTOR"))
+	sel, err := parseNodeSelector("UZI_WORKER_NODE_SELECTOR", os.Getenv("UZI_WORKER_NODE_SELECTOR"))
 	if err != nil {
 		return err
 	}
@@ -564,11 +574,17 @@ func loadWorkerSettings(cfg *Config) error {
 	if cfg.WorkerDeploymentAnnotations, err = parseDeploymentMetadata("UZI_WORKER_DEPLOYMENT_ANNOTATIONS", false); err != nil {
 		return err
 	}
-	tol, err := parseTolerations(os.Getenv("UZI_WORKER_TOLERATIONS"))
+	tol, err := parseTolerations("UZI_WORKER_TOLERATIONS", os.Getenv("UZI_WORKER_TOLERATIONS"))
 	if err != nil {
 		return err
 	}
 	cfg.WorkerTolerations = tol
+	if cfg.WorkerNewPlacementNodeSelector, err = parseNodeSelector("UZI_WORKER_NEW_PLACEMENT_NODE_SELECTOR", os.Getenv("UZI_WORKER_NEW_PLACEMENT_NODE_SELECTOR")); err != nil {
+		return err
+	}
+	if cfg.WorkerNewPlacementTolerations, err = parseTolerations("UZI_WORKER_NEW_PLACEMENT_TOLERATIONS", os.Getenv("UZI_WORKER_NEW_PLACEMENT_TOLERATIONS")); err != nil {
+		return err
+	}
 
 	// The per-worker slot cap (UZI_WORKER_MAX_CONCURRENT_RUNS). Default 1 (empty/unset),
 	// operator-configurable in [1, workerMaxConcurrentRunsCeiling]. A non-integer or an
@@ -854,31 +870,32 @@ func validateDockerTier(cfg *Config) error {
 	return nil
 }
 
-// parseNodeSelector reads UZI_WORKER_NODE_SELECTOR. Every key must be a valid label
+// parseNodeSelector reads the node selector env var called name
+// (UZI_WORKER_NODE_SELECTOR or UZI_WORKER_NEW_PLACEMENT_NODE_SELECTOR). Every key must be a valid label
 // key and every value a valid label value, checked here at boot: the API server would
 // accept neither on a Deployment, so a bad selector would otherwise surface only as
 // workers that never appear. A top-level null means no selector, but a null MEMBER is
 // refused: decoded into a plain string it would become "", a valid label value, and
 // every worker would then require an empty label and stay Pending.
-func parseNodeSelector(raw string) (map[string]string, error) {
+func parseNodeSelector(name, raw string) (map[string]string, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" || raw == "null" {
 		return nil, nil
 	}
 	var members map[string]*string
 	if err := json.Unmarshal([]byte(raw), &members); err != nil {
-		return nil, fmt.Errorf("UZI_WORKER_NODE_SELECTOR=%q is not a JSON object of label key to string value: %w", raw, err)
+		return nil, fmt.Errorf("%s=%q is not a JSON object of label key to string value: %w", name, raw, err)
 	}
 	sel := make(map[string]string, len(members))
 	for k, v := range members {
 		if v == nil {
-			return nil, fmt.Errorf("UZI_WORKER_NODE_SELECTOR: key %q has a null value; give it a string value or remove the key", k)
+			return nil, fmt.Errorf("%s: key %q has a null value; give it a string value or remove the key", name, k)
 		}
 		if errs := validation.IsQualifiedName(k); len(errs) > 0 {
-			return nil, fmt.Errorf("UZI_WORKER_NODE_SELECTOR: key %q is not a valid label key: %s", k, strings.Join(errs, "; "))
+			return nil, fmt.Errorf("%s: key %q is not a valid label key: %s", name, k, strings.Join(errs, "; "))
 		}
 		if errs := validation.IsValidLabelValue(*v); len(errs) > 0 {
-			return nil, fmt.Errorf("UZI_WORKER_NODE_SELECTOR: value %q for key %q is not a valid label value: %s", *v, k, strings.Join(errs, "; "))
+			return nil, fmt.Errorf("%s: value %q for key %q is not a valid label value: %s", name, *v, k, strings.Join(errs, "; "))
 		}
 		sel[k] = *v
 	}
@@ -936,12 +953,13 @@ func parseDeploymentMetadata(name string, labels bool) (map[string]string, error
 	return out, nil
 }
 
-// parseTolerations reads UZI_WORKER_TOLERATIONS, a JSON array of tolerations, and
+// parseTolerations reads the toleration env var called name (UZI_WORKER_TOLERATIONS or
+// UZI_WORKER_NEW_PLACEMENT_TOLERATIONS), a JSON array of tolerations, and
 // applies the API server's toleration rules (Equal/Exists only) at boot: a Deployment carrying a toleration
 // the API server rejects would otherwise surface only as workers that never appear.
 // Unknown fields are refused so a misspelt key (e.g. "efect") fails loudly instead of
 // widening the toleration to every effect.
-func parseTolerations(raw string) ([]corev1.Toleration, error) {
+func parseTolerations(name, raw string) ([]corev1.Toleration, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" || raw == "null" {
 		return nil, nil
@@ -950,14 +968,14 @@ func parseTolerations(raw string) ([]corev1.Toleration, error) {
 	dec.DisallowUnknownFields()
 	var tols []corev1.Toleration
 	if err := dec.Decode(&tols); err != nil {
-		return nil, fmt.Errorf("UZI_WORKER_TOLERATIONS=%q is not a JSON array of tolerations: %w", raw, err)
+		return nil, fmt.Errorf("%s=%q is not a JSON array of tolerations: %w", name, raw, err)
 	}
 	if dec.More() {
-		return nil, fmt.Errorf("UZI_WORKER_TOLERATIONS=%q has trailing data after the array", raw)
+		return nil, fmt.Errorf("%s=%q has trailing data after the array", name, raw)
 	}
 	for i, t := range tols {
 		if err := validateToleration(t); err != nil {
-			return nil, fmt.Errorf("UZI_WORKER_TOLERATIONS[%d]: %w", i, err)
+			return nil, fmt.Errorf("%s[%d]: %w", name, i, err)
 		}
 	}
 	if len(tols) == 0 {

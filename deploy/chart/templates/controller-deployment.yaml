@@ -193,6 +193,31 @@ spec:
             - name: UZI_WORKER_TOLERATIONS
               value: {{ toJson . | quote }}
             {{- end }}
+            # The opt-in second placement (see values.yaml workers.newPlacement). The parent
+            # must be a map or null (null = off; the field reads below run only for a map);
+            # each field gets the same type guard as its global twin. Empty renders no env.
+            {{- $newPlacement := .Values.workers.newPlacement }}
+            {{- if not (or (kindIs "map" $newPlacement) (kindIs "invalid" $newPlacement)) }}
+            {{- fail (printf "workers.newPlacement must be a map with nodeSelector and tolerations, or null; got %s %v" (kindOf $newPlacement) $newPlacement) }}
+            {{- end }}
+            {{- if kindIs "map" $newPlacement }}
+            {{- $npSelector := $newPlacement.nodeSelector }}
+            {{- if not (or (kindIs "map" $npSelector) (kindIs "invalid" $npSelector)) }}
+            {{- fail (printf "workers.newPlacement.nodeSelector must be a map of label key to value, or null; got %s %v" (kindOf $npSelector) $npSelector) }}
+            {{- end }}
+            {{- with $npSelector }}
+            - name: UZI_WORKER_NEW_PLACEMENT_NODE_SELECTOR
+              value: {{ toJson . | quote }}
+            {{- end }}
+            {{- $npTolerations := $newPlacement.tolerations }}
+            {{- if not (or (kindIs "slice" $npTolerations) (kindIs "invalid" $npTolerations)) }}
+            {{- fail (printf "workers.newPlacement.tolerations must be a list of toleration objects, or null; got %s %v" (kindOf $npTolerations) $npTolerations) }}
+            {{- end }}
+            {{- with $npTolerations }}
+            - name: UZI_WORKER_NEW_PLACEMENT_TOLERATIONS
+              value: {{ toJson . | quote }}
+            {{- end }}
+            {{- end }}
             # The default worker PriorityClass name (issue #1341). Gated on the bool, not
             # `with`: when enabled the class name always has a chart default, and the
             # controller renders priorityClassName onto every worker pod so a busy worker
