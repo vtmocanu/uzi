@@ -114,7 +114,7 @@ export interface PodEpochScratchDeps {
   };
   /** Issue #4420: the worker's outbox (initialised before this pass). Absent or unusable keeps every `run-<uuid>` leaf (`outbox`). */
   outbox?: Pick<Outbox, "isDisabled" | "unusableRootReason" | "hasPhysicalTerminalProtection" | "listPendingFinalizeGenerations" |
-    "listPublicationRecords" | "depthFor" | "uncleanRuns">;
+    "listPublicationRecords" | "depthFor" | "uncleanRuns" | "hasLoadRejectedRecords">;
   /** Worker-wide exclusive-idle proof (bound to terminalMaintenanceProof). */
   quiesce: () => Promise<boolean>;
   /** Startup opt-in parsed by main.ts; permits phase entry, supplies no evidence. */
@@ -395,6 +395,8 @@ async function outboxRetention(outbox: PodEpochScratchDeps["outbox"], runId: str
   if (!outbox) return unknownRetention("outbox");
   try {
     if (outbox.isDisabled() || outbox.unusableRootReason() !== undefined) return unknownRetention("outbox");
+    // A record init rejected is still on disk and unaccounted for in memory: unknown, never ended.
+    if (outbox.hasLoadRejectedRecords(runId)) return unknownRetention("outbox");
     const id = runId.toLowerCase();
     if (await outbox.hasPhysicalTerminalProtection(runId)) return activeRetention("outbox");
     // The complete listing (every generation, terminal-holding runs included), not the register's capped view

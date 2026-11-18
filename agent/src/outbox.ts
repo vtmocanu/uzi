@@ -860,12 +860,37 @@ export class Outbox {
     }
   }
 
+  /** Lowercased physical run directory names whose manifest or finalize record was present on disk
+   *  but rejected (unreadable, malformed, unauthenticated, cross-run or non-canonical) during init.
+   *  Written only by loadRun/loadFinalizes, which run only from init; sticky for the instance's
+   *  lifetime (fail-closed), so a later init-time rejection is never forgotten. Nothing is deleted,
+   *  repaired or adopted on this basis. */
+  private readonly loadRejectedRuns = new Set<string>();
+
+  /** True when init found a record under this run's directory that it rejected and left on disk
+   *  (a manifest that is unreadable, malformed, unauthenticated or cross-run, or a finalize file
+   *  with a non-canonical name, a read failure or an authentication/shape failure). The run's
+   *  outbox state is then unknown, not ended. Case-insensitive on the run id. */
+  hasLoadRejectedRecords(runId: string): boolean {
+    return this.loadRejectedRuns.has(runId.toLowerCase());
+  }
+
   private async loadRun(runId: string): Promise<void> {
     const manifestPath = path.join(this.runDir(runId), MANIFEST_FILE);
     const parsed = await this.readAuthed(manifestPath, MAC_DOMAIN_MANIFEST);
-    if (!parsed) return; // absent (nothing to load) or tampered (readAuthed logged)
+    if (!parsed) {
+      // readAuthed returns null for absence, read errors, bad JSON and MAC mismatch alike; only ENOENT is absence.
+      try {
+        await fs.lstat(manifestPath);
+        this.loadRejectedRuns.add(runId.toLowerCase());
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") this.loadRejectedRuns.add(runId.toLowerCase());
+      }
+      return; // absent (nothing to load) or rejected (readAuthed logged)
+    }
     const manifest = coerceManifest(parsed);
     if (!manifest || manifest.runId !== runId) {
+      this.loadRejectedRuns.add(runId.toLowerCase());
       this.log.warn("outbox: malformed or cross-run manifest; skipping run", { run_id: runId });
       return;
     }
@@ -1504,14 +1529,19 @@ export class Outbox {
     try {
       names = await fs.readdir(dir);
     } catch {
+      this.loadRejectedRuns.add(runId.toLowerCase());
       return;
     }
     for (const name of names) {
       const gen = parseFinalizeFileName(name);
-      if (gen === undefined) continue;
+      if (gen === undefined) {
+        if (name.startsWith(FINALIZE_FILE_PREFIX)) this.loadRejectedRuns.add(runId.toLowerCase());
+        continue;
+      }
       const parsed = await this.readAuthed(path.join(dir, name), MAC_DOMAIN_FINALIZE);
       const meta = parsed ? coerceFinalize(parsed, runId, gen) : null;
       if (!meta) {
+        this.loadRejectedRuns.add(runId.toLowerCase());
         this.log.warn("outbox: unauthenticated or misfiled finalize record ignored (left on disk)", {
           run_id: runId,
           file: name,

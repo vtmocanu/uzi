@@ -1354,6 +1354,91 @@ test("#4420 reclaimed: a terminal zero-hold run with normal settled metadata (re
   });
 });
 
+/** Drives the real Outbox to the settled manifest-only run directory a normally finished run leaves behind. */
+async function settleOutboxRun(rw: RunWorld, runId: string): Promise<string> {
+  await rw.outbox.appendSegment(runId, 1, [{ seq: 1, kind: "text", payload: { text: "hi" } }]);
+  assert.deepEqual(await rw.outbox.drainRun(runId, async () => undefined), { retired: true, staleRetired: 0 });
+  assert.deepEqual(await rw.outbox.journalTerminal(runId, 1, "running", 1, { status: "completed" }), { journaled: true, adopted: false });
+  assert.equal(await rw.outbox.retireTerminal(runId, 1), true);
+  assert.deepEqual(fs.readdirSync(join(rw.outboxRoot, runId)), ["manifest.json"]);
+  return join(rw.outboxRoot, runId);
+}
+
+/** The restart: a NEW Outbox over the same root (no cross-instance lock; the old instance is simply no longer consulted). */
+async function restartOutbox(w: World, rw: RunWorld): Promise<Outbox> {
+  const next = new Outbox({ root: rw.outboxRoot, log: nullLogger(), runMaxBytes: 1e6, maxBytes: 4e6, retentionMs: 86_400_000 });
+  await next.init();
+  w.options.scratch!.outbox = next;
+  return next;
+}
+
+const WRONG_MAC = "0".repeat(64);
+
+async function assertRejectedRecordKeepsLeaf(prepare: (rw: RunWorld, dir: string) => void | Promise<void>, label: string): Promise<void> {
+  await withRunWorld([leafOf(RUN_A)], async (w, rw) => {
+    await seedRetiredAttempt(rw, RUN_A);
+    const dir = await settleOutboxRun(rw, RUN_A);
+    await prepare(rw, dir);
+    const next = await restartOutbox(w, rw);
+    assert.equal(next.hasLoadRejectedRecords(RUN_A), true, label);
+    assert.equal(next.hasLoadRejectedRecords(RUN_A.toUpperCase()), true, `${label} (case-insensitive)`);
+    const result = await run(w);
+    assert.equal(result.scratch.state, "ran", label);
+    assert.deepEqual(keptRun(result), { run_local_unknown: 1 }, label);
+    assert.deepEqual(result.scratch.run_local_sources, { outbox: 1 }, label);
+    assert.deepEqual(w.calls.discards, [], label);
+    assert.equal(result.scratch.deleted, 0, label);
+    await untouched(w, [leafOf(RUN_A)]);
+  });
+}
+
+test("#4420 restart: a manifest or finalize record that init rejected keeps the run leaf as unknown(outbox), untouched", FD_ONLY, async () => {
+  await assertRejectedRecordKeepsLeaf((_rw, dir) => { fs.writeFileSync(join(dir, "manifest.json"), "{not json"); }, "malformed manifest");
+  await assertRejectedRecordKeepsLeaf((_rw, dir) => { fs.writeFileSync(join(dir, "finalize-1.json"), "{not json"); }, "malformed finalize");
+  await assertRejectedRecordKeepsLeaf((_rw, dir) => { fs.writeFileSync(join(dir, "finalize-01.json"), "{}"); }, "non-canonical finalize name");
+  await assertRejectedRecordKeepsLeaf((_rw, dir) => {
+    const body = JSON.parse(fs.readFileSync(join(dir, "manifest.json"), "utf8")) as Record<string, unknown>;
+    assert.ok("mac" in body, "the fixture's manifest carries a mac field");
+    fs.writeFileSync(join(dir, "manifest.json"), JSON.stringify({ ...body, mac: WRONG_MAC }));
+  }, "manifest with a wrong mac");
+  await assertRejectedRecordKeepsLeaf((_rw, dir) => { fs.writeFileSync(join(dir, "finalize-1.json"), JSON.stringify({ version: 1, mac: WRONG_MAC })); }, "finalize with a wrong mac");
+  await assertRejectedRecordKeepsLeaf((_rw, dir) => { fs.rmSync(join(dir, "manifest.json")); fs.mkdirSync(join(dir, "manifest.json")); }, "a directory in place of the manifest");
+});
+
+test("#4420 restart controls: a valid pending record stays active; an absent run directory and a valid settled run reclaim", FD_ONLY, async () => {
+  await withRunWorld([leafOf(RUN_A)], async (w, rw) => {
+    await seedRetiredAttempt(rw, RUN_A);
+    await rw.outbox.appendSegment(RUN_A, 1, [{ seq: 1, kind: "text", payload: { text: "pending" } }]);
+    const next = await restartOutbox(w, rw);
+    assert.equal(next.hasLoadRejectedRecords(RUN_A), false);
+    const result = await run(w);
+    assert.deepEqual(keptRun(result), { run_local_active: 1 });
+    assert.deepEqual(result.scratch.run_local_sources, { outbox: 1 });
+    assert.deepEqual(w.calls.discards, []);
+    await untouched(w, [leafOf(RUN_A)]);
+  });
+  await withRunWorld([leafOf(RUN_A)], async (w, rw) => {
+    await seedRetiredAttempt(rw, RUN_A);
+    assert.equal(fs.existsSync(join(rw.outboxRoot, RUN_A)), false);
+    const next = await restartOutbox(w, rw);
+    assert.equal(next.hasLoadRejectedRecords(RUN_A), false);
+    const result = await run(w);
+    assert.deepEqual(keptRun(result), {});
+    assert.deepEqual(w.calls.discards, [leafOf(RUN_A)]);
+    assert.equal(result.scratch.deleted, 1);
+  });
+  await withRunWorld([leafOf(RUN_A)], async (w, rw) => {
+    await seedRetiredAttempt(rw, RUN_A);
+    await settleOutboxRun(rw, RUN_A);
+    const next = await restartOutbox(w, rw);
+    assert.equal(next.hasLoadRejectedRecords(RUN_A), false);
+    const result = await run(w);
+    assert.deepEqual(keptRun(result), {});
+    assert.deepEqual(w.calls.discards, [leafOf(RUN_A)]);
+    assert.equal(result.scratch.deleted, 1);
+  });
+});
+
 // Issue #4420: the slot inventory is checked against the authenticated heads, driven through the REAL authority store
 // enrolled in the fixture's data dir and the REAL read-only enumeration (only the world's slot stub is replaced).
 async function enrollRealAuthority(w: World, rw: RunWorld, admit: boolean): Promise<string> {
@@ -1521,7 +1606,7 @@ test("#4420 an unreadable local store is run_local_unknown for run leaves while 
 
 test("#4420 an outbox that is missing, disabled or throwing keeps the leaf as run_local_unknown(outbox); an outbox with a record of the run keeps it active", FD_ONLY, async () => {
   const stub = (over: Record<string, unknown>) => ({
-    isDisabled: () => false, unusableRootReason: () => undefined, hasPhysicalTerminalProtection: async () => false,
+    isDisabled: () => false, unusableRootReason: () => undefined, hasPhysicalTerminalProtection: async () => false, hasLoadRejectedRecords: () => false,
     // listPendingFinalizes (the register's view, capped at 256 entries) is deliberately a truncated empty list here.
     listPendingFinalizes: () => [], listPendingFinalizeGenerations: (_includeTerminal?: boolean) => [], listPublicationRecords: () => [], depthFor: () => undefined, uncleanRuns: () => [], ...over }) as never;
   const unknownCases: Array<[string, unknown]> = [
@@ -1848,7 +1933,7 @@ function endedRunWorld(w: World) {
   const seen = countingServer(w);
   w.options.scratch!.git = { ...w.options.scratch!.git, classifyEpochScratchRunRetention: async () => ({ state: "ended" }) } as never;
   w.options.scratch!.outbox = {
-    isDisabled: () => false, unusableRootReason: () => undefined, hasPhysicalTerminalProtection: async () => false,
+    isDisabled: () => false, unusableRootReason: () => undefined, hasPhysicalTerminalProtection: async () => false, hasLoadRejectedRecords: () => false,
     listPendingFinalizes: () => [], listPendingFinalizeGenerations: () => [], listPublicationRecords: () => [],
     depthFor: (id: string) => ({ runId: id, pendingMessages: 0, pendingTerminal: 0, staleRetired: 0, since: 0 }), uncleanRuns: () => [],
   } as never;
