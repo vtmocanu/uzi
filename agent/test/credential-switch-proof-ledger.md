@@ -2806,7 +2806,7 @@ Mechanism (candidate):
 - Epoch latch: the runner freezes `{claimGeneration, registerNonce,
   expectedEpoch}` from the first READY (runner.ts :17430, :17494–17496) and
   reuses that object for each of up to three serial settlement attempts
-  (:17497–17499 onward); a successor READY with a different epoch pauses instead of
+  (loop at :17499); a successor READY with a different epoch pauses instead of
   applying (:17595).
 
 New test (69c028a39): `TestOwnerCodexSwitchUnsupportedWorkerLiveDB`
