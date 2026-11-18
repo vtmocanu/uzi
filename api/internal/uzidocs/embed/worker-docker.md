@@ -728,8 +728,10 @@ slots, so after 64 kept split retires on one bare a further retire writes no
 binding and takes the unbound in-process removal path described above. The epoch
 fills at most 64 work slots per pass, sorted by uuid. Kept present parents are
 reported as kept without taking a slot, so they cannot starve gone-parent
-recovery; 64 or more earlier-sorting gone parents that keep failing a check can
-still defer later ones.
+recovery. Gone parents still take slots, so 64 or more earlier-sorting gone
+parents that keep failing a check can block later ones for as long as those
+failures persist; that starvation can be permanent, and no eventual recovery is
+promised.
 
 **Verified-epoch phase.** On a uid-split Docker worker the verified pod-epoch
 pass has a last retire-scratch phase. Nothing writes `settled` any more, so the

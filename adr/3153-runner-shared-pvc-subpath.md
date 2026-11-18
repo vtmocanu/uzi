@@ -484,8 +484,10 @@ discard paths. Two cap consequences follow:
   phase under C-prime) is reported kept without taking a slot, so kept present
   parents cannot starve gone-parent recovery. Gone parents still take slots: 64 or
   more earlier-sorting gone parents that keep failing a later check (`conflict`,
-  `malformed_binding`, `metadata_unresolved`, custody) can still defer later ones
-  (accepted residual).
+  `malformed_binding`, `metadata_unresolved`, custody) can block later ones, and
+  while those failures persist the later parents are never recovered (accepted
+  residual: possibly permanent starvation, the same sorted-prefix limit the pass
+  had before C-prime; no eventual recovery is promised).
 
 **The disposal route is retained with no producer.** The epoch's removal machinery
 (`markRemoving`, the `empty-fd` helper, `discardRetireScratchParent`, `reclaimed`
