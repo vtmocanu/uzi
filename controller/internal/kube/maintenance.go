@@ -211,6 +211,28 @@ func (m *Materializer) reconcileDinD(ctx context.Context, w protocol.DesiredWork
 			}
 			return true, m.reconcileReplacement(ctx, w, o)
 		}
+		// Replacement template drift (#4455): the replacement Deployment and its bound
+		// DinD claim exist, so converge the template through the admission-gated path.
+		// The identity terms repeat the old-PVC branch and old-daemon guard above as
+		// defence in depth.
+		if o.DinDPVCLive && o.DinDPVCPhase == string(corev1.ClaimBound) && o.DinDPVCUID != "" && o.DinDPVCUID != op.PVCUID &&
+			o.DeploymentUID != "" && o.DeploymentUID != op.DeploymentUID && !o.DeploymentTerminating &&
+			(o.SpecHash != wantHash || o.Generation != w.Generation) {
+			// Permission to reconcile an unchanged worker is not roll admission.
+			// A fresh list may also find a different same-name Deployment: neither
+			// can reuse the earlier decision. Let the next tick plan and reserve it.
+			if e := rollFrom(ctx, w.ID); !m.drain.ForceRoll {
+				if e == nil || !e.admitted || !e.drift || e.marker == nil || e.dep == nil || string(e.dep.UID) != o.DeploymentUID {
+					return true, nil
+				}
+				// Use the reservation from the same fresh read as the patch RV.
+				// Status updates may advance RV, but cancellation must still fence us.
+				if o.MaintenanceRollAnnotation == "" || o.MaintenanceRollAnnotation != e.dep.Annotations[annotationRoll] {
+					return true, nil
+				}
+			}
+			return true, m.reconcileReplacement(ctx, w, o)
+		}
 		if !o.DinDPVCLive || o.DinDPVCPhase != string(corev1.ClaimBound) || o.DinDPVCUID == "" || o.DeploymentUID == "" || o.DeploymentUID == op.DeploymentUID || o.DeploymentTerminating || !o.PodsKnown || o.ReadyPodUID == "" || o.ReadyPodUID == op.DeploymentUID || o.SpecHash != wantHash || o.Generation != w.Generation || o.Roll.Phase != protocol.PhaseSettled {
 			return true, nil
 		}

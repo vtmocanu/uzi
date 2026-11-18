@@ -46,12 +46,14 @@ func (m *Materializer) maintenanceObservation(ctx context.Context, id, ns string
 	o.DeploymentUID = ""
 	o.DeploymentResourceVersion = ""
 	o.DeploymentTerminating = false
+	o.MaintenanceRollAnnotation = ""
 	o.SpecHash, o.Generation = "", 0
 	o.DeploymentNodeSelector = nil
 	if o.HasDeployment {
 		o.DeploymentUID = string(d.UID)
 		o.DeploymentResourceVersion = d.ResourceVersion
 		o.DeploymentTerminating = d.DeletionTimestamp != nil
+		o.MaintenanceRollAnnotation = d.Annotations[annotationRoll]
 		o.SpecHash = d.Spec.Template.Annotations[AnnotationSpecHash]
 		o.DeploymentNodeSelector = d.Spec.Template.Spec.NodeSelector
 		o.Generation, _ = strconv.ParseInt(d.Spec.Template.Annotations[AnnotationGeneration], 10, 64)

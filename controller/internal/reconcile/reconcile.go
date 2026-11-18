@@ -111,6 +111,9 @@ type ObservedWorker struct {
 	DeploymentResourceVersion string
 	DeploymentUID             string
 	DeploymentTerminating     bool
+	// MaintenanceRollAnnotation is the raw reservation from the fresh Deployment
+	// list for fenced maintenance, empty when no reservation was read. Not on the wire.
+	MaintenanceRollAnnotation string
 	DinDPVCUID                string
 	DinDPVCLive               bool
 	DinDPVCPhase              string
