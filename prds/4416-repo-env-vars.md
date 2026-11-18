@@ -223,3 +223,4 @@ Outside the milestones, not a worker obligation; this delivery is `non_closing` 
 - **Exact-value scan fails closed.** gitleaks can fail open because forge push protection backs it; nothing outside the worker knows these values, so an untrustworthy scan withholds.
 - **Base64 alignments instead of fixed pairs.** Three trimmed alignments catch a secret inside any base64 stream, including a `user:password` entry, without knowing which other value it is paired with.
 - **Cross-repo exposure on a shared worker accepted.** Same exposure as the Anthropic token today; recorded as a residual rather than requiring uid-split or ephemeral workers.
+- **M1 schema: no `master_aad` column; sealing is recorded by `sealed_with`, size by `value_bytes` (M1, 2026-11-18).** The `sealed_with` marker (`master_aad` or `dek`) records how a row is sealed, and a `value_bytes` column carries the value size so the count and size budgets need no unseal.

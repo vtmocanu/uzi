@@ -288,9 +288,12 @@ const COMMAND_ENV_PATH = "/opt/uzi-toolchain/bin:/usr/local/sbin:/usr/local/bin:
 /** Keys a provisioned `toolEnv` entry may NEVER set in the credential-free command env.
  *  UNIONS the command boundary literals (PATH/TMPDIR/LANG/HOME — the scrubbed command
  *  identity pins these, and sdk-env.ts's PROTECTED_ENV_KEYS deliberately OMITS
- *  PATH/TMPDIR/LANG, so relying on it alone would leave those open) with a MIRROR of that
- *  module-private PROTECTED_ENV_KEYS set (the OAuth credential + the two ANTHROPIC_* keys +
- *  the browser flag and the two browser discovery paths), plus Docker endpoint/configuration keys owned by trusted startup wiring.
+ *  PATH/TMPDIR/LANG, so relying on it alone would leave those open) with a hand-maintained
+ *  list of credential-adjacent keys that overlaps sdk-env.ts's exported PROTECTED_ENV_KEYS
+ *  but is not generated from it (the OAuth credential + the two ANTHROPIC_* keys + the
+ *  browser flag and the two browser discovery paths; it does not list NODE_EXTRA_CA_CERTS,
+ *  and HOME is covered here as a boundary literal), plus Docker endpoint/configuration keys
+ *  owned by trusted startup wiring.
  *  So a hostile/malformed `toolEnv` can neither breach the command
  *  boundary NOR reintroduce a credential-adjacent key. PATH is additionally handled
  *  specially in {@link buildCommandEnv} (fixed prefix, provisioned value appended). */
@@ -312,7 +315,8 @@ export const COMMAND_ENV_PROTECTED_KEYS: ReadonlySet<string> = new Set([
   "GOCACHE",
   "npm_config_cache",
   "NPM_CONFIG_CACHE",
-  // Mirror of sdk-env.ts PROTECTED_ENV_KEYS (module-private there; cannot be imported).
+  // Overlaps sdk-env.ts's exported PROTECTED_ENV_KEYS but is maintained by hand, not derived
+  // from it: NODE_EXTRA_CA_CERTS is not listed here, and HOME is a boundary literal above.
   "CLAUDE_CODE_OAUTH_TOKEN",
   "ANTHROPIC_API_KEY",
   "ANTHROPIC_AUTH_TOKEN",

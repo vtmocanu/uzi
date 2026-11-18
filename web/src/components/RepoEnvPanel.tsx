@@ -119,8 +119,11 @@ export function RepoEnvPanel({
       } else {
         if (draft.secret !== orig.secret) input.secret = draft.secret;
         // Editing a secret without a value changes only the description (and the flag).
+        // Secret -> plain must carry the new value in the same save (even an empty one);
+        // the server refuses the switch otherwise.
+        const toPlain = orig.secret && !draft.secret;
         const changed = draft.secret ? draft.value !== "" : draft.value !== (orig.value ?? "");
-        if (changed) input.value = draft.value;
+        if (toPlain || changed) input.value = draft.value;
       }
       await api.putRepoEnv(repoId, draft.name, input);
       setDraft(null);
@@ -320,7 +323,7 @@ export function RepoEnvPanel({
                 autoCorrect="off"
                 autoCapitalize="off"
                 spellCheck={false}
-                placeholder={draft.editing?.secret ? "Leave empty to keep the stored value" : undefined}
+                placeholder={draft.secret && draft.editing?.secret ?"Leave empty to keep the stored value" : undefined}
                 onChange={(e) => setDraft({ ...draft, value: e.target.value })}
               />
               {fieldErr("value")}

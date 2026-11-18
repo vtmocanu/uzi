@@ -200,6 +200,32 @@ describe("Repos environment variables panel", () => {
     const plain = within(panel).getByLabelText("Value") as HTMLTextAreaElement;
     expect(plain.tagName).toBe("TEXTAREA");
     expect(plain.className).not.toContain("text-security");
+    expect(plain.getAttribute("autocomplete")).toBe("off");
+
+    // Editing a stored secret: still masked, autocomplete off, never prefilled.
+    fireEvent.click(within(panel).getByRole("button", { name: "Edit API_KEY" }));
+    const editing = within(panel).getByLabelText("Value") as HTMLTextAreaElement;
+    expect(editing.className).toContain("[-webkit-text-security:disc]");
+    expect(editing.getAttribute("autocomplete")).toBe("off");
+    expect(editing.value).toBe("");
+    expect(editing.getAttribute("placeholder")).toBe("Leave empty to keep the stored value");
+  });
+
+  it("switching a secret to plain sends an explicit empty value and drops the keep-stored hint", async () => {
+    mockApi.putRepoEnv.mockResolvedValue({ variable: { ...API_KEY, secret: false } });
+    const panel = await openPanel();
+    fireEvent.click(within(panel).getByRole("button", { name: "Edit API_KEY" }));
+    fireEvent.click(within(panel).getByRole("switch", { name: "Secret" }));
+    const value = within(panel).getByLabelText("Value") as HTMLTextAreaElement;
+    expect(value.getAttribute("placeholder")).toBeNull();
+    fireEvent.click(within(panel).getByRole("button", { name: "Save variable" }));
+    await waitFor(() =>
+      expect(mockApi.putRepoEnv).toHaveBeenCalledWith("repo-uzi", "API_KEY", {
+        description: API_KEY.description,
+        secret: false,
+        value: "",
+      }),
+    );
   });
 
   it("editing a secret without a value sends only the description and never prefills the value", async () => {

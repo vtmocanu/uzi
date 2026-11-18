@@ -41,6 +41,11 @@ or your repo scripts do.
    secret.
 4. A description is at most 1024 bytes.
 
+In the web panel, a secret's value field is masked with a browser text-masking
+style that not every browser applies, so in some browsers the characters can
+show while you type. The panel also stores line breaks as LF: a value pasted
+with CRLF line endings is saved with LF.
+
 A repo holds at most **50 variables and 256 KiB** of values. Disabled variables
 and variables pending deletion count toward both.
 
