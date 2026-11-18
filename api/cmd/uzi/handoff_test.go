@@ -73,6 +73,9 @@ func handoffEnv(fc *uzicli.FakeClient, rec *handoffRecorder) (Env, *handoffClien
 	if _, ok := rec.gitErr["config --get core.sshCommand"]; !ok {
 		rec.gitErr["config --get core.sshCommand"] = exitCodeErr{1}
 	}
+	if _, ok := rec.gitOut[topKey]; !ok {
+		rec.gitOut[topKey] = "/work/widgets\n"
+	}
 	if _, ok := rec.gitOut[localEnvKey]; !ok {
 		rec.gitOut[localEnvKey] = "GIT_DIR\nGIT_WORK_TREE\nGIT_CONFIG\n"
 	}
@@ -84,7 +87,10 @@ func handoffEnv(fc *uzicli.FakeClient, rec *handoffRecorder) (Env, *handoffClien
 	return env, hc
 }
 
-const localEnvKey = "rev-parse --local-env-vars"
+const (
+	localEnvKey = "rev-parse --local-env-vars"
+	topKey      = "rev-parse --show-toplevel"
+)
 
 // exitCodeErr is a git failure carrying an exit status, like *exec.ExitError.
 type exitCodeErr struct{ code int }
@@ -96,14 +102,17 @@ func (e exitCodeErr) ExitCode() int { return e.code }
 type sshConfigRecorder struct {
 	calls [][]string
 	unset [][]string
+	dirs  []string
 	out   string
 	err   error
 	fn    func(ctx context.Context, args []string) (string, error)
 }
 
-func (s *sshConfigRecorder) run(ctx context.Context, unset []string, args ...string) (string, error) {
+func (s *sshConfigRecorder) run(ctx context.Context, p sshProbe) (string, error) {
+	args := p.args
 	s.calls = append(s.calls, append([]string(nil), args...))
-	s.unset = append(s.unset, append([]string(nil), unset...))
+	s.unset = append(s.unset, append([]string(nil), p.unset...))
+	s.dirs = append(s.dirs, p.dir)
 	if s.fn != nil {
 		return s.fn(ctx, args)
 	}

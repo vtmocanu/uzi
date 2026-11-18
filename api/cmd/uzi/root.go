@@ -118,9 +118,9 @@ type Env struct {
 	// `Match exec` blocks that can run local commands. DefaultEnv wires realSSHConfig;
 	// tests inject a fake that records argv, so no test forks ssh. A nil seam reports an
 	// error through the sshConfig accessor, which handoff treats as an unresolved host.
-	// unset names environment variables removed from ssh's environment, as git removes
-	// its repository-local variables before it starts ssh for a push.
-	SSHConfig func(ctx context.Context, unset []string, args ...string) (string, error)
+	// The probe mirrors the ssh git push starts: run from the worktree root, with git's
+	// repository-local variables removed from the environment (sshProbe).
+	SSHConfig func(ctx context.Context, p sshProbe) (string, error)
 
 	// LookupEnv is the presence-aware environment lookup (a variable that is set but
 	// empty is distinguishable from an unset one). `uzi handoff` reads GIT_SSH and
@@ -233,11 +233,11 @@ func (e Env) envSet(k string) bool {
 }
 
 // sshConfig is the nil-safe accessor for Env.SSHConfig: a nil seam is an error.
-func (e Env) sshConfig(ctx context.Context, unset []string, args ...string) (string, error) {
+func (e Env) sshConfig(ctx context.Context, p sshProbe) (string, error) {
 	if e.SSHConfig == nil {
 		return "", errors.New("ssh config lookup is unavailable")
 	}
-	return e.SSHConfig(ctx, unset, args...)
+	return e.SSHConfig(ctx, p)
 }
 
 // sshConfigMaxOutput caps the stdout realSSHConfig will accept from ssh -G.
@@ -270,15 +270,23 @@ func (c *sshCapture) Write(p []byte) (int, error) {
 	return c.buf.Write(p)
 }
 
-// newSSHConfigCmd builds the ssh command: argv only, Dir left unset so it inherits the
-// working directory the push (`env.Git(".", "push", ...)`) later runs in, stdin not
-// connected and stderr discarded (nil), WaitDelay bounding pipe waits after a kill. Its
-// environment is uzi's minus unset (git's repository-local variables), matching the
-// environment git gives ssh for the push.
-func newSSHConfigCmd(ctx context.Context, unset, args []string) *exec.Cmd {
-	cmd := exec.CommandContext(ctx, "ssh", args...) //nolint:gosec // G204: argv-only `ssh -G [-l user] [-p port] -- host`; handoff validates host/user/port against a leading '-' and passes `--` before the host, and runs no shell.
+// sshProbe is one ssh -G invocation shaped like the ssh git push starts: git chdirs to
+// the worktree root and removes its repository-local variables before running ssh, so
+// relative paths and environment tests in a `Match exec` rule see the same values.
+type sshProbe struct {
+	dir   string   // worktree root (git rev-parse --show-toplevel)
+	unset []string // git rev-parse --local-env-vars
+	args  []string // -G [-l user] [-p port] -- host command
+}
+
+// newSSHConfigCmd builds the ssh command: argv only, run in p.dir, stdin not connected
+// and stderr discarded (nil), WaitDelay bounding pipe waits after a kill. Its
+// environment is uzi's minus p.unset, never nil.
+func newSSHConfigCmd(ctx context.Context, p sshProbe) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, "ssh", p.args...) //nolint:gosec // G204: argv-only `ssh -G [-l user] [-p port] -- host`; handoff validates host/user/port against a leading '-' and passes `--` before the host, and runs no shell.
 	cmd.WaitDelay = time.Second
-	cmd.Env = envWithout(os.Environ(), unset)
+	cmd.Dir = p.dir
+	cmd.Env = envWithout(os.Environ(), p.unset)
 	return cmd
 }
 
@@ -304,10 +312,10 @@ func envWithout(environ, unset []string) []string {
 // commands: it is configuration evaluation, not a side-effect-free lookup. The ctx
 // kills the direct ssh child and WaitDelay bounds the pipe waits; neither guarantees
 // that descendants started by a Match exec block terminate.
-func realSSHConfig(ctx context.Context, unset []string, args ...string) (string, error) {
+func realSSHConfig(ctx context.Context, p sshProbe) (string, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	cmd := newSSHConfigCmd(ctx, unset, args)
+	cmd := newSSHConfigCmd(ctx, p)
 	c := &sshCapture{max: sshConfigMaxOutput, cancel: cancel}
 	cmd.Stdout = c
 	err := cmd.Run()

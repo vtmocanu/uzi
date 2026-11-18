@@ -565,6 +565,12 @@ func (o *originHost) compute(ctx context.Context, env Env) (string, error) {
 	if lerr != nil || len(localEnv) == 0 {
 		return refuse("could not list git's repository-local environment variables (%v)", lerr)
 	}
+	// git push runs ssh from the worktree root, whatever directory handoff starts in.
+	top, terr := env.Git(".", "rev-parse", "--show-toplevel")
+	top = strings.TrimSpace(top)
+	if terr != nil || top == "" {
+		return refuse("could not find the worktree root git push runs ssh from (%v)", terr)
+	}
 	// (c) ssh -G: evaluates (does not connect) the user's ssh config.
 	args := []string{"-G"}
 	if info.hasUser {
@@ -577,7 +583,7 @@ func (o *originHost) compute(ctx context.Context, env Env) (string, error) {
 	args = append(args, "--", info.sshHost, receivePackCommand(info.path))
 	cctx, cancel := context.WithTimeout(ctx, sshConfigTimeout)
 	defer cancel()
-	cfg, err := env.sshConfig(cctx, localEnv, args...)
+	cfg, err := env.sshConfig(cctx, sshProbe{dir: top, unset: localEnv, args: args})
 	if err != nil {
 		o.evalFail = err
 		return "", nil

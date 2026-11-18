@@ -383,9 +383,9 @@ func TestSSHConfigCapture(t *testing.T) {
 }
 
 func TestNewSSHConfigCmd(t *testing.T) {
-	cmd := newSSHConfigCmd(context.Background(), nil, []string{"-G", "--", "host"})
-	if cmd.Dir != "" {
-		t.Errorf("Dir = %q, want unset (inherit the push's cwd)", cmd.Dir)
+	cmd := newSSHConfigCmd(context.Background(), sshProbe{dir: "/work/widgets", args: []string{"-G", "--", "host"}})
+	if cmd.Dir != "/work/widgets" {
+		t.Errorf("Dir = %q, want the worktree root git push runs ssh from", cmd.Dir)
 	}
 	if cmd.WaitDelay <= 0 {
 		t.Errorf("WaitDelay = %v, want > 0", cmd.WaitDelay)
@@ -453,7 +453,7 @@ func TestHandoffSSHProbeDropsGitLocalEnv(t *testing.T) {
 	// ...and the real command cannot observe an inherited GIT_DIR.
 	t.Setenv("GIT_DIR", "/elsewhere/.git")
 	t.Setenv("UZI_PROBE_KEEP", "1")
-	cmd := newSSHConfigCmd(context.Background(), []string{"GIT_DIR"}, []string{"-G", "--", "h"})
+	cmd := newSSHConfigCmd(context.Background(), sshProbe{dir: t.TempDir(), unset: []string{"GIT_DIR"}, args: []string{"-G", "--", "h"}})
 	if cmd.Env == nil {
 		t.Fatal("cmd.Env is nil: ssh would inherit the full environment")
 	}
@@ -471,8 +471,10 @@ func TestHandoffSSHProbeDropsGitLocalEnv(t *testing.T) {
 
 func TestHandoffSSHRefusesWithoutGitLocalEnvList(t *testing.T) {
 	for name, mutate := range map[string]func(*handoffRecorder){
-		"rev-parse fails": func(r *handoffRecorder) { r.gitErr[localEnvKey] = errors.New("old git") },
-		"empty list":      func(r *handoffRecorder) { r.gitOut[localEnvKey] = " \n" },
+		"rev-parse fails":  func(r *handoffRecorder) { r.gitErr[localEnvKey] = errors.New("old git") },
+		"empty list":       func(r *handoffRecorder) { r.gitOut[localEnvKey] = " \n" },
+		"no worktree root": func(r *handoffRecorder) { r.gitErr[topKey] = errors.New("bare repository") },
+		"empty root":       func(r *handoffRecorder) { r.gitOut[topKey] = "\n" },
 	} {
 		t.Run(name, func(t *testing.T) {
 			fc := &uzicli.FakeClient{
@@ -488,5 +490,48 @@ func TestHandoffSSHRefusesWithoutGitLocalEnvList(t *testing.T) {
 				t.Fatalf("exit=%d repo=%q ssh=%d, want refusal before ssh -G:\n%s", code, fc.LastCreateTaskRepoID, len(rec.sshCfg.calls), stderr)
 			}
 		})
+	}
+}
+
+func TestHandoffSSHProbeRunsFromWorktreeRoot(t *testing.T) {
+	_, rec, _, code := runHostCase(t, hostCase{origin: "git@github.com:acme/widgets.git", wantMatch: true})
+	if code != uzicli.ExitOK || !reflect.DeepEqual(rec.sshCfg.dirs, []string{"/work/widgets"}) {
+		t.Fatalf("exit=%d dirs=%v, want ssh -G run from the worktree root", code, rec.sshCfg.dirs)
+	}
+}
+
+// TestSSHProbeDirMatchesGitPushRealGit pins the premise against real git: from a nested
+// directory, git push starts ssh in the worktree root, the directory handoff resolves.
+func TestSSHProbeDirMatchesGitPushRealGit(t *testing.T) {
+	for _, k := range []string{"GIT_DIR", "GIT_WORK_TREE", "GIT_CONFIG", "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"} {
+		t.Setenv(k, "")
+		_ = os.Unsetenv(k)
+	}
+	t.Setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	root := t.TempDir()
+	if _, err := realGit(root, "init", "-q"); err != nil {
+		t.Skipf("git unavailable: %v", err)
+	}
+	if _, err := realGit(root, "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "--allow-empty", "-m", "x"); err != nil {
+		t.Fatal(err)
+	}
+	nested := root + "/a/b"
+	if err := os.MkdirAll(nested, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	marker := t.TempDir() + "/pwd"
+	t.Setenv("GIT_SSH_COMMAND", "pwd -P > "+marker+"; false")
+	_, _ = realGit(nested, "push", "git@h.invalid:a/b.git", "HEAD:refs/heads/x")
+	got, err := os.ReadFile(marker) //nolint:gosec // G304: test-owned temp file
+	if err != nil {
+		t.Fatalf("git push did not start ssh: %v", err)
+	}
+	top, err := realGit(nested, "rev-parse", "--show-toplevel")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(got)) != strings.TrimSpace(top) {
+		t.Errorf("git push ran ssh in %q, handoff probes from %q", strings.TrimSpace(string(got)), strings.TrimSpace(top))
 	}
 }
