@@ -1423,6 +1423,23 @@ test("#4420 kept: a retired ledger row naming an unrelated missing path (not the
   });
 });
 
+test("#4420 kept: a later ledger row of another run reusing this run's attempt id keeps the run leaf as unknown from attempt_ledger (ID1)", FD_ONLY, async () => {
+  await withRunWorld([leafOf(RUN_A)], async (w, rw) => {
+    noAuthoritySlots(w);
+    await seedRetiredAttempt(rw, RUN_A);
+    await settleOutboxRun(rw, RUN_A);
+    const row = JSON.parse(rw.gitIn(["config", "--get-all", `uzi-attempts.${RUN_BRANCH}.entry`]).split("\n").at(-1)!);
+    // Same attemptId and path, another run: folding it by attempt id alone would erase RUN_A's row before the run filter.
+    rw.gitIn(["config", "--local", "--add", `uzi-attempts.${RUN_BRANCH}.entry`,
+      JSON.stringify({ ...row, runId: "99999999-8888-4777-8666-555555555555" })]);
+    const result = await run(w);
+    assert.equal(result.scratch.state, "ran");
+    assert.deepEqual(result.scratch.run_local_sources, { attempt_ledger: 1 });
+    assert.deepEqual([...w.calls.discards], [], "the leaf is not deleted");
+    assert.equal(result.scratch.deleted, 0);
+  });
+});
+
 /** Drives the real Outbox to the settled manifest-only run directory a normally finished run leaves behind. */
 async function settleOutboxRun(rw: RunWorld, runId: string): Promise<string> {
   await rw.outbox.appendSegment(runId, 1, [{ seq: 1, kind: "text", payload: { text: "hi" } }]);

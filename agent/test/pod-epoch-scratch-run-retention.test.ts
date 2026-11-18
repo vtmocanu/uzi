@@ -85,7 +85,10 @@ describe("baseline and the bare-config sources", () => {
 
   for (const [state, source] of [["live", "ledger_live"], ["abandoned", "ledger_abandoned"], ["reclaimed", "ledger_reclaimed"]] as const) {
     it(`a ${state} ledger entry of the run is active (${source}); another run's is ignored`, async () => {
-      cfg(`uzi-attempts.${BRANCH}.entry`, ledger(state, OTHER));
+      // Another run's row carries its own attempt identity (a shared attempt id is a conflict: see the ID1 tests).
+      const otherAttempt = formatAttemptId(new Date("2026-01-01T00:00:00Z"), 2, "0000000000000002");
+      const otherClone = `${git.runnerClonePath(bare, "issue-4420")}.attempt-${otherAttempt}`;
+      cfg(`uzi-attempts.${BRANCH}.entry`, ledger(state, OTHER, otherClone, otherAttempt));
       assert.deepEqual(await classify(), ENDED);
       cfg(`uzi-attempts.${BRANCH}.entry`, ledger(state));
       assert.deepEqual(await classify(), active(source));
@@ -325,6 +328,33 @@ describe("attempt footprint and authority slot (a retired ledger entry is ended 
       retire();
       assert.deepEqual(await classify(), ENDED, "positive control: bare A's own canonical path");
     } finally { fx2.cleanup(); }
+  });
+
+  it("ID1: a later row of another run (or branch, or path) reusing an attempt id never erases this run's row: unknown", async () => {
+    const otherBranch = "agent/issue-9999";
+    fs.mkdirSync(clonePath);
+    const cases: Array<[string, string, string]> = [
+      ["another run, same branch", BRANCH, ledger("retired", OTHER)],
+      ["another run, another branch", otherBranch, ledger("retired", OTHER)],
+      ["same run, another branch", otherBranch, ledger("retired")],
+      ["same run, another path", BRANCH, ledger("retired", RUN, `${clonePath}-x`)],
+    ];
+    for (const [label, branch, value] of cases) {
+      cfg(`uzi-attempts.${BRANCH}.entry`, ledger("live"));
+      cfg(`uzi-attempts.${branch}.entry`, value);
+      assert.deepEqual(await classify(), unknown("attempt_ledger"), label);
+      gitIn(["config", "--local", "--unset-all", `uzi-attempts.${BRANCH}.entry`]);
+      if (branch !== BRANCH) gitIn(["config", "--local", "--unset-all", `uzi-attempts.${branch}.entry`]);
+    }
+  });
+
+  it("ID1 control: rows of one identical identity keep last-value-wins (retired, live, retired is ended; live last is active)", async () => {
+    cfg(`uzi-attempts.${BRANCH}.entry`, ledger("retired"));
+    cfg(`uzi-attempts.${BRANCH}.entry`, ledger("live"));
+    cfg(`uzi-attempts.${BRANCH}.entry`, ledger("retired"));
+    assert.deepEqual(await classify(), ENDED);
+    cfg(`uzi-attempts.${BRANCH}.entry`, ledger("live"));
+    assert.deepEqual(await classify(), active("ledger_live"));
   });
 
   it("retired with the clone directory present is active; with the skills sibling present is active", async () => {

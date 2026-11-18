@@ -5180,6 +5180,10 @@ export class GitCache {
       if (m) {
         const entry = parseAttemptLedgerEntry(value);
         if (!entry) return unknownRetention("attempt_ledger");
+        // One attempt id must keep one identity: a later row of another run, branch or path would otherwise fold
+        // over this run's row before the run filter below and release its clone.
+        const prev = ledger.get(entry.attemptId);
+        if (prev && (prev.branch !== m[1] || prev.runId !== entry.runId || prev.clonePath !== entry.clonePath)) return unknownRetention("attempt_ledger");
         ledger.set(entry.attemptId, { ...entry, branch: m[1]! });
         continue;
       }
