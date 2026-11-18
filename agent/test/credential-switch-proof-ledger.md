@@ -416,7 +416,7 @@ control is still absent, not that the functional criterion was deferred.
 | Whole operation-scope/refresh/identity/capability/summary replacement and retired-A rejection | A2 one reader; A3 scope namespace; R7 B dispatcher readiness; R8 retired API-key A reconcile fence; U5 retired A refresh bridge pre-call refusal (P3), combined executor summary-guard refusal, B expected identity carried (b); A-account rejection, bridge post-call copy, assertRefreshAdmission and Now stale-result drops not separately controlled |
 | Exact saved-ID resume; confirmed-refusal-only fresh fallback and lineage; preservation re-hold | R6 uncertain-error classification; U6 resume carries the saved id, lineage notice, three-copy preserve re-hold, crash missing-id disclosure (d) and preserve retained refusal with a saved conversation (b); confirmed-refusal classification (timeout), :4148 check and session_missing on the switch path not controlled |
 | Policy episode rejection at request and under apply lock | D74–D77 owner request and post-READY apply; U7 episode starting before preflight (both arms); hold arm unreachable in live statuses by `runs_policy_hold_shape`, paused hold refused by status (u1-status1); concurrent lock-order contention not controlled |
-| Refresh lease/intent exclusion, account lock ordering and boundary reconciliation before revoke | D78/D79 credit isolated A coordination-lease and rotating-intent server checks; U8 credits alias, old-enablement and account NOWAIT refusals, the busy mapping, the NOWAIT account lock against a reverse-order writer, intent count/lock and real admitted-refresh lease/intent redundant fences, and the executor A reconcile inside reconcileA before teardown (c); target-enablement contention, the refresh admission's binding recheck in isolation and global lock sorting not controlled |
+| Refresh lease/intent exclusion, account lock ordering and boundary reconciliation before revoke | D78/D79 credit isolated A coordination-lease and rotating-intent server checks; U8 credits alias (old/target), enablement (old/target) and account NOWAIT refusals, the busy mapping, the NOWAIT account lock against a reverse-order writer, intent count/lock (A's account) and real admitted-refresh lease/intent redundant fences, and the executor A reconcile inside reconcileA before teardown (c); per-account lock isolation, the target account's intent check, the refresh admission's binding recheck in isolation and global lock sorting not controlled |
 | Post-switch release epoch and secret-hash authorization | B5/B6 preservation sensitivity controls below, through real worker apply and release routes; final reauthorization timing unvalidated |
 | Transactional frozen binding rewrite, capability revoke/remint and post-commit material response | Unvalidated; B5/B6 do not establish transaction atomicity or mint/revoke implementation |
 | Ordinal-zero baseline, successor journal ordinal/capability relation and usage attribution | Positive assertions present; qualifying controls unvalidated |
@@ -2300,87 +2300,117 @@ per alias, old A first, `LockSecretEnablementForShareNowait` (:173) then
 per account (:229–233); then `LockUnresolvedCodexSwitchIntents` (:246,
 `FOR SHARE NOWAIT`, LIMIT 1) and `codexSwitchAccountIdle` (:349–353). Any NOWAIT
 failure maps to not_applied/credential_busy in `codexSwitchReadFailure`
-(:313). Worker: the runner calls `a.reconcileA` (runner.ts :17390) before
-`persistRollout` (:17408) and `teardown` (:17516); the executor's `reconcileA`
-calls `capturedReconcile` = `shared.reconcile` (codex-executor.ts :4088), built
-by `buildRunLaneReconcile` (:1055): subscription A one `refreshCodex`, API-key
-A one fresh `releaseCodex`.
+(:312, the `isLockNotAvailable` test at :313). Worker: the runner calls
+`a.reconcileA` (runner.ts :17390) before `persistRollout` (:17408) and
+`teardown` (:17516); the executor's `reconcileA` calls `capturedReconcile` =
+`shared.reconcile` (codex-executor.ts :4088), built by `buildRunLaneReconcile`
+(:1055): subscription A one `refreshCodex`, API-key A one fresh `releaseCodex`.
+
+Real writers that take an account before its alias (the order the
+reverse-order test emulates): the reconciler's quarantine/reauth restore,
+`RefreshCodexAccountLogin` then `LinkCodexCredentialState` in one
+`installAndLink` transaction (workersvc/codexcred.go), and account deletion
+cascading ON DELETE SET NULL to the alias. `BumpCodexMaterialRevision`
+(handler/secrets.go, after locking the user_secrets row) and the healthy link
+path take the user_secrets or alias row first, the same order as apply; the
+enablement leaves model the former. (The comment at
+store/queries/codex_binding.sql :161–166 attributes the reverse order to
+BumpCodexMaterialRevision / LinkCodexCredentialState; that SQL comment is
+outside this unit and was not changed.)
 
 New tests:
-- 1b0d1a69c / 08d5c0e4b (constant rename only):
-  api/internal/workersvc/credential_switch_codex_apply_lockorder_livedb_test.go.
-  `TestCodexApplyAliasRowContentionLiveDB` (leaves old_alias, target_alias,
-  old_enablement, target_enablement: a blocker tx holds FOR UPDATE on the alias
-  state row or the user_secrets row; apply must be an empty busy decision with
-  no writes and an unchanged account/intent/alias snapshot; the same request then
-  applies). `TestCodexApplyReverseOrderReloginWriterLiveDB`: just before apply's
+- api/internal/workersvc/credential_switch_codex_apply_lockorder_livedb_test.go
+  (1b0d1a69c; 08d5c0e4b constant rename; 6155e078b review rework).
+  `TestCodexApplyAliasRowContentionLiveDB` (:110; leaves old_alias,
+  target_alias, old_enablement, target_enablement): a blocker tx holds FOR
+  UPDATE on the alias state row or the user_secrets row; apply must be an empty
+  busy decision with no writes and an unchanged account/intent/alias snapshot,
+  and the same request then applies. Apply's transaction runs through
+  `codexLockTimeoutBeginner` (:76–100), a test-only `SET LOCAL lock_timeout =
+  '1s'` issued right after the service's isolation statement: NOWAIT refusals
+  are unaffected, and a mutant that would wait on a held row fails at the busy
+  assertion with SQLSTATE 55P03 instead of the test deadline.
+  `TestCodexApplyReverseOrderReloginWriterLiveDB` (:196): just before apply's
   account NOWAIT for A, a writer tx takes A's account FOR UPDATE and starts the
   real `LinkCodexCredentialState` alias write, observed blocked through
-  `pg_blocking_pids` (event-driven, bounded); apply must refuse busy without
-  writes, the writer must finish without 40P01, and after the writer's rollback
-  the same request applies. The account step is an emulated row lock (the real
-  reconciler cannot be paused between its steps); the order is the one
-  codex_binding.sql :161–166 documents for re-login writers.
-  `TestCodexApplyRotatingIntentRowLockLiveDB`: A idle with one committed rotating
-  intent whose row a blocker holds FOR UPDATE: busy (leg intent_row_lock); after
-  release still busy (leg intent_count).
-- 235e433fe: agent/test/codex-executor.test.ts, the six `M2 actualRunner …
-  account resumes saved thread` baseline cases now count A-capability
+  `pg_blocking_pids` (event-driven, bounded by a 20 s context); apply must refuse
+  busy without writes, the writer must finish without 40P01 (:291), and after
+  its rollback the same request applies. The account step is an emulated row
+  lock (the real reconciler cannot be paused between its steps). On a failure
+  path the deferred cleanup cancels and drains the writer goroutine before
+  rolling back its connection and logs the writer's result.
+  `TestCodexApplyRotatingIntentRowLockLiveDB` (:314): A idle with one committed
+  rotating intent on A's account whose row a blocker holds FOR UPDATE: busy
+  (leg intent_row_lock, :335); after release still busy (leg intent_count,
+  :342).
+- agent/test/codex-executor.test.ts (235e433fe): the six `M2 actualRunner …
+  account resumes saved thread` baseline cases count A-capability
   `releaseCodex`/`refreshCodex` calls and assert (:33343–33353) the exact
   delta inside `reconcileA` (subscription A {releases 0, refreshes 1}, API-key A
-  {1, 0}), no A call between reconcile and teardown entry, and none between
-  teardown entry and apply (:33194). Before this, the baseline observed only the
-  runner-level lease call: the (c) mutant below survived it
-  (`.uzi/scratch/ctl-logs/u8-reconcile-after-teardown.survived-pre-assert.log`,
+  {1, 0}), no A call between reconcile and teardown entry (:33352), and none
+  between teardown entry and apply (:33194, called at :35288). Before this, the
+  baseline observed only the runner-level lease call: the (c) mutant below
+  survived the api_key→subscription factory case (one case run,
+  `.uzi/scratch/ctl-logs/u8-reconcile-after-teardown.survived-pre-assert.log`,
   EXIT=0), which is why the assertion was added.
 
-Commands. Go (one-at-a-time export of 1b0d1a69c, throwaway postgres
+Commands. Go (one-at-a-time export of the named commit, throwaway postgres
 `cdr-4202-u8pg`, `UZI_TEST_DATABASE_URL`): from api,
 `GOFLAGS='-p=1 -buildvcs=false' GOMAXPROCS=4 go test -race -count=1 -timeout=6m
 ./internal/workersvc -run '<selection>' -v`. Agent (export of 235e433fe with the
 primary agent/node_modules symlinked): `npm run typecheck && node --import tsx
 --test --test-timeout=120000 --test-name-pattern='M2 actualRunner .* account
 resumes saved thread$' test/codex-executor.test.ts`. Driver scripts
-`.uzi/scratch/u8tools/ctl.sh` / `actl.sh`; diffs and logs
-`.uzi/scratch/ctl-logs/u8-*.{diff,log}`.
+`.uzi/scratch/u8tools/ctl.sh` / `actl.sh`; each arm's diff and log is
+`.uzi/scratch/ctl-logs/<log name>.{diff,log}` as named in the table.
 
-| Control | Kind | Mutation | Selection | Red at |
-|---|---|---|---|---|
-| u8-alias-share | (d) guard | `FOR SHARE NOWAIT` removed from `lockCodexAliasForShareNowait` (store/codex_binding.sql.go :1167) | alias leaves old_alias, target_alias | lockorder test :69 "apply was APPLIED while its blocker row lock was held", both |
-| u8-enable-share | (d) guard | `FOR SHARE NOWAIT` removed from `lockSecretEnablementForShareNowait` (store/credential_disabled.sql.go :295) | old_enablement | :69, as above |
-| u8-account-call | (d) guard | the account-lock loop iterates `accounts[:0]` (credential_switch_codex.go :229) | AccountRowContention old, target; ReverseOrder | races test :82 busy decision missing (both leaves); lockorder :235 "apply was APPLIED while a writer held A's account lock" |
-| u8-account-nowait | (d) guard | `FOR UPDATE NOWAIT` → `FOR UPDATE` in `lockCodexAccountForUpdateNowait` (codex_binding.sql.go :1147) | ReverseOrder | lockorder :235 applied (after ~1.8 s: Postgres aborted one side of the apply/writer cycle and apply then won A's account; the 40P01 on the writer was not observed because :235 fires first) |
-| u8-busy-map | (d) guard | `isLockNotAvailable(err)` → `false && …` (:313) | old_alias; AccountRowContention old | lockorder :72 err "codex credential switch preflight unavailable"; races :82 |
-| u8-intent-redundant | redundant-fence guard (decision 9) | (i) `unresolved == 0` → `true` (:351) alone; (ii) intent `FOR SHARE NOWAIT` removed (codex_binding.sql.go :1273) alone; (iii) both | RotatingIntentRowLock | (i) intent_row_lock leg stays busy (the lock copy refuses), red only at the intent_count leg :69; (ii) EXIT=0, the count copy refuses; (iii) red at the intent_row_lock leg :69 |
-| u8-admitted-refresh-redundant | redundant-fence guard (decision 9) | (i) D78 coordination relaxation alone (:350–351); (ii) `unresolved == 0` → `true` alone; (iii) both | TestCodexRefreshAdmittedBeforeApplyLiveDB, TestCodexInitialSubscriptionRefreshAdmissionLiveDB (real `CoordinatedCodexRefresh` admission, apply during the provider call) | (i), (ii) EXIT=0; (iii) refresh test :41 "admitted refresh did not block switch [outcome=applied …]", both |
-| u8-reconcile-after-teardown | (c) ordering | executor `reconcileA` returns `{ kind: "ready" }` without calling `capturedReconcile` (codex-executor.ts :4088); `teardown` calls `capturedReconcile` right after `await captured.dispose()` (:4119) | six M2 baseline cases | codex-executor.test.ts :33350 "real A credential reconcile (subscription refresh / api_key release) runs inside reconcileA before teardown", 6/6 |
+| Control | Kind | Mutation | Selection | Log name(s), commit | Red at |
+|---|---|---|---|---|---|
+| u8-alias-share | (d) guard | `FOR SHARE NOWAIT` removed from `lockCodexAliasForShareNowait` (store/codex_binding.sql.go :1167) | old_alias, target_alias | u8r-alias-share, 6155e078b | lockorder test :69 "apply was APPLIED; expected credential_busy", both |
+| u8-enable-share | (d) guard | `FOR SHARE NOWAIT` removed from `lockSecretEnablementForShareNowait` (store/credential_disabled.sql.go :295) | old_enablement, target_enablement | u8r-enable-share, 6155e078b | old: :69 applied; target: :72 busy decision missing, `err=… canceling statement due to lock timeout (SQLSTATE 55P03)` (apply waited on B's user_secrets row through the runs.codex_secret_id foreign-key check; the test's 1 s lock_timeout, not its 10 s deadline, ended the wait) |
+| u8-account-call | (d) guard | the account-lock loop iterates `accounts[:0]` (credential_switch_codex.go :229) | AccountRowContention old, target; ReverseOrder | u8r-account-call, 6155e078b | races test :82 busy decision missing (both leaves); lockorder :277 "apply was APPLIED while a writer held A's account lock" |
+| u8-account-nowait | (d) guard | `FOR UPDATE NOWAIT` → `FOR UPDATE` in `lockCodexAccountForUpdateNowait` (codex_binding.sql.go :1147) | ReverseOrder | u8r-account-nowait, 6155e078b | lockorder :277 applied; the cleanup logs the writer's result `ERROR: deadlock detected (SQLSTATE 40P01)` (:265): Postgres aborted the writer and apply then won A's account. No data race in that log |
+| u8-busy-map | (d) guard | `isLockNotAvailable(err)` → `false && …` (:313) | old_alias; AccountRowContention old | u8r-busy-map, 6155e078b | lockorder :72 `err=codex credential switch preflight unavailable`; races :82 |
+| u8-intent-redundant | redundant-fence guard (decision 9) | (i) `unresolved == 0` → `true` (:351) alone; (ii) intent `FOR SHARE NOWAIT` removed (codex_binding.sql.go :1273) alone; (iii) both | RotatingIntentRowLock | u8r-intent-count-only, u8r-intent-lock-only, u8r-intent-both; 6155e078b | (i) the intent_row_lock leg stays busy (the lock copy refuses); red only at the uncontended intent_count leg, :69; (ii) EXIT=0, the count copy refuses; (iii) red at the intent_row_lock leg, :69 |
+| u8-admitted-refresh-redundant | redundant-fence guard (decision 9) | (i) D78 coordination relaxation alone (:350–351); (ii) `unresolved == 0` → `true` alone; (iii) both | TestCodexRefreshAdmittedBeforeApplyLiveDB, TestCodexInitialSubscriptionRefreshAdmissionLiveDB (real `CoordinatedCodexRefresh` admission, apply during the provider call) | u8-adm-coord-only, u8-adm-count-only, u8-adm-both; 1b0d1a69c (files unchanged since) | (i), (ii) EXIT=0; (iii) refresh test :41 "admitted refresh did not block switch [outcome=applied …]", both |
+| u8-reconcile-after-teardown | (c) ordering | executor `reconcileA` returns `{ kind: "ready" }` without calling `capturedReconcile` (codex-executor.ts :4088); `teardown` calls `capturedReconcile` right after `await captured.dispose()` (:4119) | six M2 baseline cases | u8-reconcile-after-teardown, 235e433fe | codex-executor.test.ts :33350 "real A credential reconcile (subscription refresh / api_key release) runs inside reconcileA before teardown", 6/6 |
 
-Not credited: u8-enable-share's target_enablement leaf reddened only by its
-10 s context deadline (apply blocked later on B's user_secrets row), a timeout
-rather than an assertion. u8-late-binding / u8-late-binding-all (the refresh
-admission's locked binding recheck, codexrefresh.go :660–664, partly and wholly
+The first-round logs at 1b0d1a69c (u8-alias-share, u8-enable-share,
+u8-account-call, u8-account-blocking, u8-busy-map, u8-intent-*) are superseded
+by the u8r-* arms above; in that round the target_enablement leaf reddened only
+by its 10 s context deadline (no credit) and the u8-account-blocking failure
+path had a data race in cleanup, both fixed in 6155e078b.
+
+Not credited: u8-late-binding / u8-late-binding-all (the refresh admission's
+locked binding recheck, codexrefresh.go :660–664, partly and wholly
 neutralized) both survive TestCodexApplyWinsLateRefreshAdmissionLiveDB: the
 stale capability is refused first by `authorizeCodexCredentialOpWithQueries`;
-that recheck has no isolating control. The intent_count leg's failure text says
-"while its blocker row lock was held" although that blocker was already
-released; the leaf name identifies it.
+that recheck has no isolating control. The u8-account-call fold removes the
+whole account loop; the old and target account locks are not isolated
+individually. The intent controls use A's (old) account only; the target
+account's intent check is not controlled. The (c) mutant fails first at
+:33350, so the two "no A credential call" assertions (:33352 and :33194) are
+positive assertions without their own control.
 
-Unchanged candidate 235e433fe, primary clone: the three new tests plus
+Unchanged candidate 6155e078b, primary clone: the three new tests plus
 AccountRowContention, AccountLockOrder, BusyOldAccount, WinsLateRefreshAdmission,
 RefreshAdmittedBeforeApply, InitialSubscriptionRefreshAdmission and
-AcceptsIdleSameAuthorityNewGeneration pass, EXIT=0
-(`.uzi/scratch/ctl-logs/u8-green-server.log`); the six M2 baseline cases pass
-6/6 (`.uzi/scratch/u8-coder-agent.log`, uncommitted state identical to
-235e433fe's test file). 08d5c0e4b renames one test constant; `task lint:api`
-0 issues after it; agent `npm run lint` 0/0.
+AcceptsIdleSameAuthorityNewGeneration pass 10/10, EXIT=0
+(`.uzi/scratch/ctl-logs/u8r-green-server.log`); the six M2 baseline cases pass
+6/6 in each of three repeats, EXIT=0
+(`.uzi/scratch/ctl-logs/u8r-green-agent-x3.log`). `task lint:api` 0 issues
+(at 08d5c0e4b); agent `npm run lint` 0/0.
 
-Credit: a held alias, old enablement or account row makes apply refuse busy
-with no writes; the NOWAIT account lock is what prevents a wait cycle with an
-account-then-alias writer; the busy mapping is what makes contention a
-retryable public refusal; a rotating intent is refused by either the count or
-the intent row lock; a real admitted subscription refresh blocks apply by the
-coordination lease or the intent; the executor performs the real A credential
-reconcile (API-key release or subscription refresh) inside `reconcileA`,
-before teardown, and makes no A credential call between teardown and apply.
-Not credited: global lock sorting, target-enablement contention, the refresh
-recheck isolated from the capability fence, other writers.
+Credit: a held alias (old or target), old enablement or target enablement row,
+or a held account row, makes apply refuse busy with no writes and without
+waiting; the NOWAIT account lock is what prevents a wait cycle with an
+account-then-alias writer (a blocking lock produced a real 40P01); the busy
+mapping is what makes contention a retryable public refusal; a rotating intent
+on A's account is refused by either the count or the intent row lock; a real
+admitted subscription refresh blocks apply by the coordination lease or the
+intent; the executor performs the real A credential reconcile (API-key release
+or subscription refresh) inside `reconcileA`, before teardown. Not credited:
+global lock sorting (two opposite-direction switches of one user's accounts
+can both refuse busy; no deadlock), per-account lock isolation, the target
+account's intent check, the refresh recheck isolated from the capability fence,
+the "no A call after reconcile" assertions, other writers.
