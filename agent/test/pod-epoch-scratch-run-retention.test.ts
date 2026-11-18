@@ -281,18 +281,49 @@ describe("attempt footprint and authority slot (a retired ledger entry is ended 
   const retire = () => cfg(`uzi-attempts.${BRANCH}.entry`, ledger("retired"));
   const slot = (over: Record<string, unknown> = {}) => ({ state: "ineligible", pending: null, retiring: null, publication: null, ...over });
 
-  it("a retired row whose path is not this bare's canonical attempt clone, or whose attempt id differs from the path's, is unknown", async () => {
+  it("a retired row whose path is not this bare's canonical attempt clone is unknown (an unrelated missing child is not an observed-absent footprint)", async () => {
     const stray = dataPath("runner", "slug", `issue-4420.attempt-${attempt}`);
     fs.mkdirSync(path.dirname(stray), { recursive: true });
     cfg(`uzi-attempts.${BRANCH}.entry`, ledger("retired", RUN, stray));
-    assert.deepEqual(await classify(), unknown("attempt_ledger"), "an unrelated missing child is not an observed-absent footprint");
-    gitIn(["config", "--local", "--unset-all", `uzi-attempts.${BRANCH}.entry`]);
-    const other = formatAttemptId(new Date("2026-01-02T00:00:00Z"), 1, "0000000000000002");
-    cfg(`uzi-attempts.${BRANCH}.entry`, ledger("retired", RUN, clonePath, other));
-    assert.deepEqual(await classify(), unknown("attempt_ledger"), "an attempt id that differs from the path's");
+    assert.deepEqual(await classify(), unknown("attempt_ledger"));
     gitIn(["config", "--local", "--unset-all", `uzi-attempts.${BRANCH}.entry`]);
     retire();
     assert.deepEqual(await classify(), ENDED, "positive control: the canonical path with a missing footprint is ended");
+  });
+
+  it("a retired row whose attempt id differs from its path's attempt id is unknown", async () => {
+    const other = formatAttemptId(new Date("2026-01-02T00:00:00Z"), 1, "0000000000000002");
+    cfg(`uzi-attempts.${BRANCH}.entry`, ledger("retired", RUN, clonePath, other));
+    assert.deepEqual(await classify(), unknown("attempt_ledger"));
+    gitIn(["config", "--local", "--unset-all", `uzi-attempts.${BRANCH}.entry`]);
+    retire();
+    assert.deepEqual(await classify(), ENDED, "positive control");
+  });
+
+  it("a retired row whose attempt id is well-formed in its path but carries an unreadable (non-safe-integer) generation is unknown", async () => {
+    const huge = formatAttemptId(new Date("2026-01-01T00:00:00Z"), 1, "0000000000000001").replace("-g1-", "-g99999999999999999999-");
+    const hugePath = `${git.runnerClonePath(bare, "issue-4420")}.attempt-${huge}`;
+    cfg(`uzi-attempts.${BRANCH}.entry`, ledger("retired", RUN, hugePath, huge));
+    assert.deepEqual(await classify(), unknown("attempt_ledger"));
+    gitIn(["config", "--local", "--unset-all", `uzi-attempts.${BRANCH}.entry`]);
+    const safe = huge.replace("-g99999999999999999999-", "-g12-");
+    cfg(`uzi-attempts.${BRANCH}.entry`, ledger("retired", RUN, `${git.runnerClonePath(bare, "issue-4420")}.attempt-${safe}`, safe));
+    assert.deepEqual(await classify(), ENDED, "positive control: the same shape with a readable generation");
+  });
+
+  it("a row recorded in bare A whose path is canonical under a second bare B is unknown", async () => {
+    const fx2 = makeFixture();
+    try {
+      const bareB = await git.ensureClone(fx2.originPath);
+      assert.notEqual(bareB, bare);
+      const underB = `${git.runnerClonePath(bareB, "issue-4420")}.attempt-${attempt}`;
+      assert.notEqual(underB, clonePath);
+      cfg(`uzi-attempts.${BRANCH}.entry`, ledger("retired", RUN, underB));
+      assert.deepEqual(await classify(), unknown("attempt_ledger"));
+      gitIn(["config", "--local", "--unset-all", `uzi-attempts.${BRANCH}.entry`]);
+      retire();
+      assert.deepEqual(await classify(), ENDED, "positive control: bare A's own canonical path");
+    } finally { fx2.cleanup(); }
   });
 
   it("retired with the clone directory present is active; with the skills sibling present is active", async () => {

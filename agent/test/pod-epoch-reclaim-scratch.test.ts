@@ -1369,15 +1369,37 @@ test("#4420 kept: a broken loose recovery pin under the run's refs (one git list
   });
 });
 
-test("#4420 kept: a retired ledger row naming an unrelated missing path (not the bare's canonical attempt clone) keeps the run leaf", FD_ONLY, async () => {
+/** No authority slot exists anywhere, so the only thing that can keep the leaf is the ledger row's path/attempt binding. */
+function noAuthoritySlots(w: World): void {
+  w.options.scratch!.authority!.peekSlot = async () => null as never;
+  w.options.scratch!.authority!.peekAllSlots = async () => [] as never;
+}
+
+test("#4420 sensitivity control: with no authority slots, a retired ledger row at the bare's canonical attempt clone (verified missing footprint) IS reclaimed", FD_ONLY, async () => {
   await withRunWorld([leafOf(RUN_A)], async (w, rw) => {
+    noAuthoritySlots(w);
+    await seedRetiredAttempt(rw, RUN_A);
+    await settleOutboxRun(rw, RUN_A);
+    const result = await run(w);
+    assert.equal(result.scratch.state, "ran");
+    assert.deepEqual(result.scratch.run_local_sources, {});
+    assert.deepEqual([...w.calls.discards], [leafOf(RUN_A)]);
+    assert.equal(result.scratch.deleted, 1);
+  });
+});
+
+test("#4420 kept: a retired ledger row naming an unrelated missing path (not the bare's canonical attempt clone) keeps the run leaf as unknown from attempt_ledger", FD_ONLY, async () => {
+  await withRunWorld([leafOf(RUN_A)], async (w, rw) => {
+    noAuthoritySlots(w);
     const clonePath = await seedRetiredAttempt(rw, RUN_A);
     await settleOutboxRun(rw, RUN_A);
     const row = JSON.parse(rw.gitIn(["config", "--get-all", `uzi-attempts.${RUN_BRANCH}.entry`]).split("\n").at(-1)!);
+    // Same attemptId, so this row supersedes the real one: the only difference from the control is the path.
     rw.gitIn(["config", "--local", "--add", `uzi-attempts.${RUN_BRANCH}.entry`,
       JSON.stringify({ ...row, clonePath: join(dirname(dirname(clonePath)), "unrelated", basename(clonePath)) })]);
     const result = await run(w);
     assert.equal(result.scratch.state, "ran");
+    assert.deepEqual(result.scratch.run_local_sources, { attempt_ledger: 1 });
     assert.deepEqual([...w.calls.discards], [], "the leaf is not deleted");
     assert.equal(result.scratch.deleted, 0);
   });
