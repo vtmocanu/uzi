@@ -198,7 +198,8 @@ func stoppedRouteSnapshot(t *testing.T, e *applyRouteEnv) map[string]json.RawMes
  'switch',(SELECT coalesce(jsonb_agg(to_jsonb(s) ORDER BY claim_generation,ordinal),'[]'::jsonb) FROM run_credential_switch_epochs s WHERE run_id=$1),
  'messages',(SELECT coalesce(jsonb_agg(to_jsonb(m) ORDER BY seq),'[]'::jsonb) FROM run_messages m WHERE run_id=$1),
  'inputs',(SELECT coalesce(jsonb_agg(to_jsonb(i) ORDER BY id),'[]'::jsonb) FROM run_user_inputs i WHERE run_id=$1),
- 'custody',(SELECT coalesce(jsonb_agg(to_jsonb(c) ORDER BY id),'[]'::jsonb) FROM recovery_custody_holds c WHERE run_id=$1))`, e.run).Scan(&raw)
+ 'custody',(SELECT coalesce(jsonb_agg(to_jsonb(c) ORDER BY id),'[]'::jsonb) FROM recovery_custody_holds c WHERE run_id=$1),
+ 'presentations',(SELECT coalesce(jsonb_agg(to_jsonb(g) ORDER BY revision),'[]'::jsonb) FROM run_gate_presentations g WHERE run_id=$1))`, e.run).Scan(&raw)
 	if err != nil {
 		t.Fatal(err)
 	}
