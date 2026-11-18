@@ -689,6 +689,10 @@ func (m *Materializer) Reconcile(ctx context.Context, desired []protocol.Desired
 		observedByID[o.ID] = o
 	}
 
+	// Freeze each worker's placement decision from THIS tick's observation, before any
+	// PVC is created or deleted below, so every render in the tick agrees.
+	ctx = context.WithValue(ctx, placementTickKey{}, m.placementDecisions(desired, observedByID))
+
 	var errs []error
 	tick, order := m.planRoll(ctx, desired, observedByID)
 	errs = append(errs, tick.errors...)
@@ -942,8 +946,25 @@ func (m *Materializer) recycleWorkerVolumes(ctx context.Context, w protocol.Desi
 }
 
 // ensurePVCs creates each of the worker's claims the observation says is missing,
-// treating AlreadyExists as success. It never deletes or resizes anything.
-func (m *Materializer) ensurePVCs(ctx context.Context, w protocol.DesiredWorker, obs reconcile.ObservedWorker, ns string, spec preset.Spec) error {
+// treating AlreadyExists as success unless newPlacement is set, where it reports deferred
+// (see below). It never deletes or resizes anything.
+//
+// With newPlacement set, new claims are stamped uzi.dev/placement=new only when the
+// worker's tick decision says stamped (no claim exists, or every existing one is
+// stamped). A Terminating claim holds back every create: otherwise a staggered deletion
+// could leave a stamped replacement beside a still-unstamped claim, a mixed set that
+// renders the global placement while owning claims created under the new one.
+func (m *Materializer) ensurePVCs(ctx context.Context, w protocol.DesiredWorker, obs reconcile.ObservedWorker, ns string, spec preset.Spec) (deferred bool, err error) {
+	placementSet := m.cfg.NewPlacementSet()
+	stamp := false
+	if placementSet {
+		for _, c := range []*reconcile.ClaimObservation{obs.DataClaim, obs.NixClaim, obs.DinDClaim} {
+			if c != nil && c.Terminating {
+				return false, nil
+			}
+		}
+		stamp = m.placementStampedFor(ctx, w, obs)
+	}
 	for _, pvc := range RenderPVCs(m.cfg, w, spec) {
 		switch pvc.Name {
 		case dataPVCName(w.ID):
@@ -959,15 +980,28 @@ func (m *Materializer) ensurePVCs(ctx context.Context, w protocol.DesiredWorker,
 				continue
 			}
 		}
+		if stamp {
+			if pvc.Annotations == nil {
+				pvc.Annotations = map[string]string{}
+			}
+			pvc.Annotations[AnnotationPlacement] = placementNew
+		}
 		created, err := m.client.CoreV1().PersistentVolumeClaims(ns).Create(ctx, pvc, metav1.CreateOptions{})
 		if err != nil && !apierrors.IsAlreadyExists(err) {
-			return fmt.Errorf("create pvc %s: %w", pvc.Name, err)
+			return false, fmt.Errorf("create pvc %s: %w", pvc.Name, err)
+		}
+		if err != nil && placementSet {
+			// AlreadyExists does not prove the existing claim carries the stamp we
+			// attempted, and this tick's decision was made without it. Do nothing
+			// more for the worker (no further claims, no Deployment render) and let
+			// the next observation decide.
+			return true, nil
 		}
 		if err == nil && pvc.Name == dindDataPVCName(w.ID) {
 			m.recordEpochMint(ctx, w.ID, created)
 		}
 	}
-	return nil
+	return false, nil
 }
 
 // withinRecycleCooldown reports whether the worker's disk volumes were minted too
@@ -1054,7 +1088,7 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 	// may scale a parked worker or delete its volumes. The claims are still created if
 	// missing, and the Secret above is never touched.
 	if w.Hibernation != nil {
-		if err := m.ensurePVCs(ctx, w, obs, ns, spec); err != nil {
+		if deferred, err := m.ensurePVCs(ctx, w, obs, ns, spec); deferred || err != nil {
 			return err
 		}
 		// A worker with no Deployment is placed only over claims live at the render
@@ -1133,7 +1167,7 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 	// The dind data root (issue #224 M-a) is a THIRD claim, and only for a docker worker:
 	// RenderPVCs emits it only when w.Docker, so this loop never sees it for a plain one
 	// and its gate cannot mis-fire there.
-	if err := m.ensurePVCs(ctx, w, obs, ns, spec); err != nil {
+	if deferred, err := m.ensurePVCs(ctx, w, obs, ns, spec); deferred || err != nil {
 		return err
 	}
 
@@ -1145,7 +1179,7 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 	}
 
 	// The Deployment.
-	dep := RenderDeployment(m.cfg, w, spec)
+	dep := RenderDeployment(m.renderCfgFor(ctx, w, obs), w, spec)
 	if e := rollFrom(ctx, w.ID); e != nil {
 		dep = e.target.DeepCopy()
 	}

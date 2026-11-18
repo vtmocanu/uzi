@@ -246,7 +246,7 @@ func (m *Materializer) createHibernationDeployment(ctx context.Context, w protoc
 	if deploymentPlacementBlocked(w, obs, spec) {
 		return nil
 	}
-	dep := RenderDeployment(m.cfg, w, spec)
+	dep := RenderDeployment(m.renderCfgFor(ctx, w, obs), w, spec)
 	dep.Spec.Replicas = &replicas
 	if dep.Annotations == nil {
 		dep.Annotations = map[string]string{}
@@ -695,7 +695,7 @@ func (m *Materializer) hibernateWake(ctx context.Context, w protocol.DesiredWork
 	if obs.DeploymentReplicas != nil && *obs.DeploymentReplicas == 0 && m.wakeHeldForPods(w, obs) {
 		return nil
 	}
-	dep := RenderDeployment(m.cfg, w, spec)
+	dep := RenderDeployment(m.renderCfgFor(ctx, w, obs), w, spec)
 	wantHash := dep.Spec.Template.Annotations[AnnotationSpecHash]
 	asleep := obs.DeploymentReplicas == nil || *obs.DeploymentReplicas == 0
 	drifted := obs.SpecHash != wantHash || obs.Generation != w.Generation

@@ -88,7 +88,7 @@ func (m *Materializer) reconcileDinD(ctx context.Context, w protocol.DesiredWork
 			}
 		}
 	}
-	wantHash := RenderDeployment(m.cfg, w, spec).Spec.Template.Annotations[AnnotationSpecHash]
+	wantHash := RenderDeployment(m.renderCfgFor(ctx, w, o), w, spec).Spec.Template.Annotations[AnnotationSpecHash]
 	if !m.recycle.Enabled && (op.Phase == "requested" || op.Phase == "ready") {
 		next.Phase = "cancelled"
 		next.Reason = "recycle_disabled"
