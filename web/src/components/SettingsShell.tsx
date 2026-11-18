@@ -11,7 +11,8 @@
 
 import { NavLink } from "react-router-dom";
 import type { ReactNode } from "react";
-import { cx, PageHeader } from "./ui";
+import { PageHeader } from "./ui";
+import { PinnedBlock, TabRow, tabClass } from "./TabRow";
 
 export const TABS = [
   { to: "/settings", label: "Account & tokens", end: true },
@@ -36,25 +37,15 @@ export function SettingsShell({ description, children }: { description: string; 
           scroll rather than forcing the page body sideways. The tabs are
           `shrink-0`/`whitespace-nowrap` so they overflow-and-scroll rather than compress
           to fit (which would defeat overflow-x). */}
-      <div className="flex gap-1 overflow-x-auto border-b border-edge">
-        {TABS.map((t) => (
-          <NavLink
-            key={t.to}
-            to={t.to}
-            end={t.end}
-            className={({ isActive }) =>
-              cx(
-                "-mb-px shrink-0 whitespace-nowrap border-b-2 px-3 py-2 text-sm font-medium transition-colors",
-                isActive
-                  ? "border-brand text-fg"
-                  : "border-transparent text-muted hover:border-edge-strong hover:text-fg",
-              )
-            }
-          >
-            {t.label}
-          </NavLink>
-        ))}
-      </div>
+      <PinnedBlock>
+        <TabRow>
+          {TABS.map((t) => (
+            <NavLink key={t.to} to={t.to} end={t.end} className={({ isActive }) => tabClass(isActive)}>
+              {t.label}
+            </NavLink>
+          ))}
+        </TabRow>
+      </PinnedBlock>
       {description && <p className="text-sm text-muted">{description}</p>}
       {children}
     </div>

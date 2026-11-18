@@ -255,8 +255,9 @@ func resolveHandoffRepo(env Env, ctx context.Context, c uzicli.Client, repoFlag 
 // groups) and the scp-like SSH form (`git@host:owner/repo(.git)`). The `.git` suffix
 // and any leading/trailing slashes are stripped. Returns "" if it cannot find a path.
 func parseRepoPath(remote string) string {
-	s := strings.TrimSpace(remote)
-	s = strings.TrimSuffix(s, ".git")
+	// Trim trailing slashes BEFORE stripping .git, so `…/repo.git/` loses its .git too.
+	s := strings.TrimRight(strings.TrimSpace(remote), "/")
+	s = strings.TrimRight(strings.TrimSuffix(s, ".git"), "/")
 	if s == "" {
 		return ""
 	}

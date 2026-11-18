@@ -207,18 +207,27 @@ func run() error {
 	defer stop()
 
 	slog.Info("running migrations")
-	if err := store.Migrate(ctx, cfg.DatabaseURL); err != nil {
+	migrationDSN, releaseMigrationDSN, err := store.RegisterMigrationDSN(cfg.DatabaseURL)
+	if err != nil {
+		return err
+	}
+	err = store.Migrate(ctx, migrationDSN)
+	releaseMigrationDSN()
+	if err != nil {
 		return err
 	}
 
 	// diskFull records SQLSTATE 53100 write failures seen on the api pool; the admin
 	// health db check reads it.
 	diskFull := dbdiskfull.New(time.Now)
-	pool, err := store.OpenPool(ctx, cfg.DatabaseURL, store.WithQueryTracer(&dbdiskfull.Tracer{Signal: diskFull}))
+	pool, err := store.OpenPool(ctx, cfg.DatabaseURL,
+		store.WithQueryTracer(&dbdiskfull.Tracer{Signal: diskFull}),
+		store.WithMaxConns(cfg.DBMaxConns))
 	if err != nil {
 		return err
 	}
 	defer pool.Close()
+	slog.Info("db pool sized", "max_conns", pool.Config().MaxConns, "source", cfg.DBMaxConnsSource)
 
 	q := store.New(pool)
 
@@ -286,18 +295,23 @@ func run() error {
 	// Wire the secret cipher + ENV-source overlay (PRD #25): the Slack tokens and
 	// public base URL an operator set via environment win over their DB rows, and
 	// the box seals/opens the secret keys. Only keys actually set appear in the
-	// overlay, so an unconfigured Slack instance stays a strict no-op.
-	slackEnv := map[string]string{}
+	// overlay, so an unconfigured Slack instance stays a strict no-op. The three
+	// ephemeral worker knobs (PRD #4212) join it only when their raw env var is set,
+	// carrying the canonical value config.Load produced (ephemeralSettingsEnv).
+	settingsEnv := map[string]string{}
 	if cfg.SlackBotToken != "" {
-		slackEnv[settings.KeySlackBotToken] = cfg.SlackBotToken
+		settingsEnv[settings.KeySlackBotToken] = cfg.SlackBotToken
 	}
 	if cfg.SlackAppToken != "" {
-		slackEnv[settings.KeySlackAppToken] = cfg.SlackAppToken
+		settingsEnv[settings.KeySlackAppToken] = cfg.SlackAppToken
 	}
 	if cfg.PublicBaseURL != "" {
-		slackEnv[settings.KeyPublicBaseURL] = cfg.PublicBaseURL
+		settingsEnv[settings.KeyPublicBaseURL] = cfg.PublicBaseURL
 	}
-	settingsCache.ConfigureSecrets(box, slackEnv)
+	for k, v := range ephemeralSettingsEnv(os.LookupEnv, &cfg) {
+		settingsEnv[k] = v
+	}
+	settingsCache.ConfigureSecrets(box, settingsEnv)
 
 	// Shared bot-token Slack surface (PRD #25 M3): the run notifier, the account
 	// linker, and the /me/slack test-DM endpoint all post through it. It reads the
@@ -416,8 +430,9 @@ func run() error {
 	// transfer routes reach through wsvc.JobFiles(), and the job_files_sweep pass below. The
 	// request deadline is the recovery archive's: both are one bounded upload transaction.
 	// The upload write slots are clamped to half the actual pool (ClampWriteSlots): each streaming
-	// upload holds a pooled connection, and store.OpenPool sets no pool_max_conns, so the pgx
-	// default (max(4, NumCPU)) can equal the fixed slot count.
+	// upload holds a pooled connection. The pool size is explicit (DB_MAX_CONNS, then the
+	// DATABASE_URL pool_max_conns, then the default 20), so the clamp now guards a small
+	// operator-chosen size.
 	jobFiles := workersvc.NewJobFiles(pool, box, workersvc.ClampWriteSlots(pool.Config().MaxConns, workersvc.JobFileLimits{
 		InputFileMaxBytes:      cfg.JobInputFileMaxBytes,
 		InputsMaxFiles:         cfg.JobInputsMaxFiles,
@@ -608,10 +623,13 @@ func run() error {
 	// Automatic idle-worker hibernation (issue #4207): the pass reads worker_hibernation_auto and
 	// worker_hibernation_idle_after on top of the kill-switch above.
 	wsvc.SetHibernationAutoSettings(settingsCache)
+	// Issue #4395: with the active-snapshot kill switch on, memory-authority loss is never
+	// persisted, so the surplus pool policy treats memory authority as unknown.
+	wsvc.SetActiveSnapshotDisabled(cfg.ActiveSnapshotDisabled)
 	// Issue #1965: a profile-bound run on a deployment without the lane says so instead of waiting.
 	wsvc.SetIsolatedLaneEnabled(cfg.IsolatedLaneEnabled())
-	// PRD #2006: lease entry on a worker-reported terminal and lease-arm claims (0 disables).
-	wsvc.SetEphemeralLease(cfg.EphemeralLease)
+	// PRD #2006 / #4212: the lease (lease entry on a worker-reported terminal, lease-arm claims; 0
+	// disables) is read per decision from the settings cache set just above, never snapshotted.
 
 	// Completion-interlock rollout switch (PRD #1226 M1, D1): createRun reads it from the
 	// same settings cache to decide whether to stamp completion_contract_version=1 on a new
@@ -809,14 +827,11 @@ func run() error {
 		// Issue #1965: lane workers are provisioned only where the chart enabled the lane.
 		IsolatedLaneEnabled: cfg.IsolatedLaneEnabled(),
 		DockerEnabled:       cfg.WorkerDockerEnabled,
-		MaxPerUser:          cfg.EphemeralMaxPerUser,
-		DefaultSize:         cfg.EphemeralDefaultSize,
 		ProvisionDeadline:   cfg.EphemeralProvisionDeadline,
 		SaturationDelay:     cfg.EphemeralSaturationDelay,
 		BackgroundGrace:     cfg.WorkerBackgroundGrace,
-		// PRD #2006: a finished ephemeral worker's lease (0 disables). The reaper spares a
-		// live lease and provisioning evicts the oldest releasable one at the cap.
-		Lease: cfg.EphemeralLease,
+		// PRD #4212: the per-user cap, default size and lease are admin settings the provisioner
+		// reads per pass from settingsCache (env overlay included), not config here.
 	})
 
 	// PRD #4205 M5: the demand-wake pass. Shares the claim knobs ClaimRun uses so its demand query
@@ -827,7 +842,6 @@ func run() error {
 		WorkerAffinityCeiling:   cfg.WorkerAffinityCeiling,
 		WorkerHeartbeatStale:    cfg.WorkerHeartbeatStale,
 		BackgroundGrace:         cfg.WorkerBackgroundGrace,
-		Lease:                   cfg.EphemeralLease,
 	})
 
 	sweep := sweeper.New(wsvc, cfg.SweepInterval,

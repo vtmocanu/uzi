@@ -717,6 +717,11 @@ type Client interface {
 	// recommendation is a 409 (exit 5) — both come straight from statusError.
 	FileReviewIssue(ctx context.Context, runID, recID, repoID, title, description string) (ReviewIssueFileResult, error)
 
+	// ListRepoEnv reads a repo's run variables (PRD #4416): GET /api/repos/{id}/env.
+	// A secret's value is never in the response; a plain value is withheld while the
+	// vault is locked. Read-only: the CLI has no write twin.
+	ListRepoEnv(ctx context.Context, repoID string) (apitypes.RunEnvListDTO, error)
+
 	// GetProjectSyncStatus reads a repo's GitHub Projects v2 sync health (PRD #576
 	// M7): GET /api/repos/{id}/github-project-sync. RequireUser since M7 moved the
 	// route out of the cookie-only group, so a uzc_ Bearer reaches it (issue #428

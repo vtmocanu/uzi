@@ -2,6 +2,9 @@
 
 uzi's current MVP is a docker-compose stack of three always-on services (`web`, `api`, `db`) plus one opt-in, profile-gated service (`agent`, a per-user worker — PRD #4), with three trust boundaries: the inbound edge at nginx, the API's outbound calls to the forge (GitLab, Forgejo or GitHub), and the API's connection to each user's worker. This document describes that shape; see [docs/auth-design.md](docs/auth-design.md) for the auth surface, and [docs/proc-hardening.md](docs/proc-hardening.md) for the worker/agent process-isolation detail the Secrets and Guardrails sections below summarize.
 
+The full-tree npm audit and its narrowly bounded, maintainer-approved temporary
+exceptions are recorded in [ADR-4435](adr/4435-npm-audit-exceptions.md).
+
 ## Services
 
 ```
@@ -2643,8 +2646,11 @@ mounts none of the join token or `/nix`, and from #3153 it mounts only the
 at `/data/runner`), never the whole volume. That is a mount-view property; it
 does not bound rootful dind device reach.
 
-New persistent workers preselect the large preset; new ephemeral workers default
-to medium via `workers.ephemeralDefaultSize`. The decision, partial supersession,
+New persistent workers preselect the admin `hosted_default_size` (shipped default
+large; the provision API still requires an explicit size); new ephemeral workers
+default to the admin `ephemeral_default_size` (shipped default medium), which a
+chart `workers.ephemeralDefaultSize` or `UZI_EPHEMERAL_DEFAULT_SIZE` value pins and
+locks. The decision, partial supersession,
 capacity cost, and preservation of existing stored sizes are recorded in
 [ADR-2240](adr/2240-hosted-worker-default-size.md).
 

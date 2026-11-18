@@ -242,6 +242,14 @@ func (c *HTTPClient) ListRepos(ctx context.Context) ([]apitypes.RepoDTO, error) 
 	return env.Repos, nil
 }
 
+func (c *HTTPClient) ListRepoEnv(ctx context.Context, repoID string) (apitypes.RunEnvListDTO, error) {
+	var out apitypes.RunEnvListDTO
+	if err := c.get(ctx, "/api/repos/"+url.PathEscape(repoID)+"/env", &out); err != nil {
+		return apitypes.RunEnvListDTO{}, err
+	}
+	return out, nil
+}
+
 func (c *HTTPClient) GetProjectSyncStatus(ctx context.Context, repoID string) (ProjectSyncStatus, error) {
 	var out ProjectSyncStatus
 	if err := c.get(ctx, "/api/repos/"+url.PathEscape(repoID)+"/github-project-sync", &out); err != nil {

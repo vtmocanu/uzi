@@ -53,6 +53,11 @@ func (s *Service) workerEligibilityForHealth(ctx context.Context, now time.Time,
 	if allowlist == nil {
 		allowlist = []uuid.UUID{}
 	}
+	// PRD #4212: the live lease, one read per detector call; a failed read fails the call.
+	lease, err := s.currentEphemeralLease(ctx)
+	if err != nil {
+		return store.CountOnlineWorkersClaimableForRunRow{}, err
+	}
 	return s.q.CountOnlineWorkersClaimableForRun(ctx, store.CountOnlineWorkersClaimableForRunParams{
 		RunID:                    runID,
 		HeartbeatCutoff:          pgconv.Time(now.Add(-s.p.WorkerHeartbeatStale)),
@@ -64,7 +69,7 @@ func (s *Service) workerEligibilityForHealth(ctx context.Context, now time.Time,
 		WorkerDockerEnabled:      s.effectiveDockerTier,
 		CapabilityAware:          capAware,
 		CodexCuratedModels:       codexCuratedModelsSlice(),
-		EphemeralLease:           LeaseInterval(s.ephemeralLease),
+		EphemeralLease:           LeaseInterval(lease),
 	})
 }
 
@@ -1849,7 +1854,13 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 				}
 			}
 		}
-		if claimable, cerr := s.q.CountOnlineWorkersClaimableForRun(ctx, store.CountOnlineWorkersClaimableForRunParams{
+		// PRD #4212: the live lease, read once for this count (this block is per run, not a loop). A
+		// failed read skips the count, as a failed count below does: the reason falls through to the
+		// generic ones.
+		lease, lerr := s.currentEphemeralLease(ctx)
+		if lerr != nil {
+			slog.Error("health: ephemeral lease for released-worker reason", "run_id", r.ID, "error", lerr)
+		} else if claimable, cerr := s.q.CountOnlineWorkersClaimableForRun(ctx, store.CountOnlineWorkersClaimableForRunParams{
 			RunID:                    r.ID,
 			CodexCuratedModels:       codexCuratedModelsSlice(),
 			AffinityCutoff:           pgconv.Time(now.Add(-s.p.WorkerAffinityCeiling)),
@@ -1860,7 +1871,7 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 			DockerRepoAllowlist:      allowlist,
 			WorkerDockerEnabled:      s.effectiveDockerTier,
 			CapabilityAware:          capAware,
-			EphemeralLease:           LeaseInterval(s.ephemeralLease),
+			EphemeralLease:           LeaseInterval(lease),
 		}); cerr != nil {
 			slog.Error("health: count workers claimable for run", "run_id", r.ID, "error", cerr)
 		} else if claimable.Claimable == 0 {

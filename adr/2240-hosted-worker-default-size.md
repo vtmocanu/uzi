@@ -65,8 +65,9 @@ Figures below are the sizes at the time of this decision; issue #2127 later rais
 
 ## Partial supersession, 2026-10-07 (#2412)
 
-The persistent provision form retains `l`. New ephemeral workers instead default
-to `m`, configured by chart `workers.ephemeralDefaultSize` (`s`, `m`, or `l`).
+The persistent provision form retains `l` (amended by #4212 below). New ephemeral workers instead default
+to `m`, configured by chart `workers.ephemeralDefaultSize` (`s`, `m`, or `l`;
+now an optional pin, see the #4212 amendment).
 The chart rejects invalid values and renders a direct API environment entry;
 setting the same key in `api.config` or `api.secretEnv` fails the render, so an
 older override cannot be silently ignored.
@@ -152,3 +153,20 @@ memory, sidecars, and slot counts require separate decisions. Higher CPU limits
 reserve no node capacity and guarantee no CPU per slot. Publish raw measurements
 and ranges/medians to #2240; if there is no actionable benefit, the maintainer may
 close it without scaling.
+
+## Amendment, 2026-11-17 (#4212)
+
+Current policy, replacing the hard-coded preselection and the chart-only default
+above (the history stays as written):
+
+- The persistent provision form preselects the admin setting `hosted_default_size`
+  (shipped default `l`), served to the form through the session-authenticated hosted
+  config. The persistent provision API still requires an explicit size; only the
+  preselection changed, and existing workers keep their sizes.
+- The ephemeral default size is the admin setting `ephemeral_default_size` (shipped
+  default `m`), editable on Admin → Workers without a restart. A non-empty
+  `UZI_EPHEMERAL_DEFAULT_SIZE` (chart `workers.ephemeralDefaultSize`, now unset by
+  default and rendered only when set) wins and locks the field. The chart guards
+  against setting the key in `api.config` or `api.secretEnv` are unchanged.
+
+See [PRD #4212](../prds/4212-admin-workers-tab.md).

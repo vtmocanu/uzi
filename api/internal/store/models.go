@@ -1430,6 +1430,25 @@ type RunDecisionMemo struct {
 	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
 }
 
+type RunEnvVar struct {
+	ID              uuid.UUID          `json:"id"`
+	VarID           uuid.UUID          `json:"var_id"`
+	UserID          uuid.UUID          `json:"user_id"`
+	RepoID          pgtype.UUID        `json:"repo_id"`
+	Name            string             `json:"name"`
+	Secret          bool               `json:"secret"`
+	Description     string             `json:"description"`
+	Ciphertext      []byte             `json:"ciphertext"`
+	SealedWith      string             `json:"sealed_with"`
+	ValueBytes      int32              `json:"value_bytes"`
+	Rev             int32              `json:"rev"`
+	RetiredAt       pgtype.Timestamptz `json:"retired_at"`
+	DisabledAt      pgtype.Timestamptz `json:"disabled_at"`
+	PendingDeleteAt pgtype.Timestamptz `json:"pending_delete_at"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+}
+
 type RunFetch struct {
 	ID            uuid.UUID          `json:"id"`
 	RunID         uuid.UUID          `json:"run_id"`
@@ -2108,6 +2127,12 @@ type Worker struct {
 	HibernationBlockedReason   pgtype.Text        `json:"hibernation_blocked_reason"`
 	HibernationBlockedAt       pgtype.Timestamptz `json:"hibernation_blocked_at"`
 	HibernationBlockedSince    pgtype.Timestamptz `json:"hibernation_blocked_since"`
+	MemoryAuthorityLostAt      pgtype.Timestamptz `json:"memory_authority_lost_at"`
+	HibernationOriginOpID      pgtype.UUID        `json:"hibernation_origin_op_id"`
+	HibernationAdmitOrigin     pgtype.Text        `json:"hibernation_admit_origin"`
+	HibernationWakeOrigin      pgtype.Text        `json:"hibernation_wake_origin"`
+	LastManualWakeSettledAt    pgtype.Timestamptz `json:"last_manual_wake_settled_at"`
+	MemoryAuthorityHeldAt      pgtype.Timestamptz `json:"memory_authority_held_at"`
 }
 
 type WorkerActiveRun struct {

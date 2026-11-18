@@ -1,0 +1,120 @@
+{
+  "auditReportVersion": 2,
+  "vulnerabilities": {
+    "fdir": {
+      "name": "fdir",
+      "severity": "high",
+      "isDirect": false,
+      "via": [
+        "picomatch"
+      ],
+      "effects": [
+        "tinyglobby"
+      ],
+      "range": ">=5.2.1",
+      "nodes": [
+        "node_modules/fdir"
+      ],
+      "fixAvailable": {
+        "name": "knip",
+        "version": "3.13.2",
+        "isSemVerMajor": true
+      }
+    },
+    "knip": {
+      "name": "knip",
+      "severity": "high",
+      "isDirect": true,
+      "via": [
+        "picomatch",
+        "tinyglobby"
+      ],
+      "effects": [],
+      "range": ">=4.0.0-canary.0",
+      "nodes": [
+        "node_modules/knip"
+      ],
+      "fixAvailable": {
+        "name": "knip",
+        "version": "3.13.2",
+        "isSemVerMajor": true
+      }
+    },
+    "picomatch": {
+      "name": "picomatch",
+      "severity": "high",
+      "isDirect": false,
+      "via": [
+        {
+          "source": 1247710,
+          "name": "picomatch",
+          "dependency": "picomatch",
+          "title": "picomatch vulnerable to ReDoS through single-branch repeated extglobs",
+          "url": "https://github.com/advisories/GHSA-fc5q-39xc-vjpf",
+          "severity": "high",
+          "cwe": [
+            "CWE-1333"
+          ],
+          "cvss": {
+            "score": 7.5,
+            "vectorString": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H"
+          },
+          "range": "<=4.0.7"
+        }
+      ],
+      "effects": [
+        "fdir",
+        "knip",
+        "tinyglobby"
+      ],
+      "range": "*",
+      "nodes": [
+        "node_modules/picomatch"
+      ],
+      "fixAvailable": {
+        "name": "knip",
+        "version": "3.13.2",
+        "isSemVerMajor": true
+      }
+    },
+    "tinyglobby": {
+      "name": "tinyglobby",
+      "severity": "high",
+      "isDirect": false,
+      "via": [
+        "fdir",
+        "picomatch"
+      ],
+      "effects": [
+        "knip"
+      ],
+      "range": "*",
+      "nodes": [
+        "node_modules/tinyglobby"
+      ],
+      "fixAvailable": {
+        "name": "knip",
+        "version": "3.13.2",
+        "isSemVerMajor": true
+      }
+    }
+  },
+  "metadata": {
+    "vulnerabilities": {
+      "info": 0,
+      "low": 0,
+      "moderate": 0,
+      "high": 4,
+      "critical": 0,
+      "total": 4
+    },
+    "dependencies": {
+      "prod": 8,
+      "dev": 104,
+      "optional": 118,
+      "peer": 100,
+      "peerOptional": 0,
+      "total": 246
+    }
+  }
+}

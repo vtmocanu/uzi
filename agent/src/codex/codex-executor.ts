@@ -294,7 +294,7 @@ const COMMAND_ENV_PATH = "/opt/uzi-toolchain/bin:/usr/local/sbin:/usr/local/bin:
  *  So a hostile/malformed `toolEnv` can neither breach the command
  *  boundary NOR reintroduce a credential-adjacent key. PATH is additionally handled
  *  specially in {@link buildCommandEnv} (fixed prefix, provisioned value appended). */
-const COMMAND_ENV_PROTECTED_KEYS: ReadonlySet<string> = new Set([
+export const COMMAND_ENV_PROTECTED_KEYS: ReadonlySet<string> = new Set([
   // Command boundary literals.
   "PATH",
   "TMPDIR",

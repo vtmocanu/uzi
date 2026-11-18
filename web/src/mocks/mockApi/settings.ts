@@ -11,6 +11,7 @@ import {
   type VaultStatus,
   type VaultDisableResponse,
 } from "../../lib/api";
+import { WORKER_SIZES } from "../../lib/workerSizes";
 import { ApiError } from "../../lib/apiError";
 import { trimAllowlistToken, uuidIdentity } from "../../lib/dockerAllowlist";
 import {
@@ -173,7 +174,15 @@ const SEED_APP_SETTINGS: AppSettings = {
   // PRD #4207: automatic hibernation of idle workers, default OFF, 14-day threshold.
   worker_hibernation_auto: "false",
   worker_hibernation_idle_after: "336h",
+  // PRD #4395: keep one warm worker per pool and hibernate the surplus, default OFF, 2h.
+  worker_hibernation_surplus: "false",
+  worker_hibernation_surplus_idle_after: "2h",
   hosted_worker_quota: "2",
+  // PRD #4212: ephemeral cap/size/lease and the persistent-worker default size.
+  ephemeral_max_per_user: "2",
+  ephemeral_default_size: "m",
+  hosted_default_size: "l",
+  ephemeral_lease: "2h",
   custody_hold_limit: "8",
   // PRD #836: upstream release-check toggles, both default ON (the master air-gap
   // switch and the escalation-banner switch). The Updates card reads the live values
@@ -339,6 +348,10 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
     // Legacy demo settings inherit the quota seed; reject malformed non-string values.
     (a.hosted_worker_quota === undefined || typeof a.hosted_worker_quota === "string") &&
     (a.custody_hold_limit === undefined || typeof a.custody_hold_limit === "string") &&
+    (a.ephemeral_max_per_user === undefined || typeof a.ephemeral_max_per_user === "string") &&
+    (a.ephemeral_default_size === undefined || typeof a.ephemeral_default_size === "string") &&
+    (a.hosted_default_size === undefined || typeof a.hosted_default_size === "string") &&
+    (a.ephemeral_lease === undefined || typeof a.ephemeral_lease === "string") &&
     // PRD #649: accept legacy blobs that predate this field (undefined), but reject a
     // malformed non-string so a bad localStorage blob can't violate the AppSettings contract.
     (a.ephemeral_workers_enabled === undefined || typeof a.ephemeral_workers_enabled === "string") &&
@@ -656,6 +669,11 @@ function slackLinkResponse(): { slack: SlackLink } {
   return { slack: { ...slackLink, state, workspace: "unconfigured" } };
 }
 
+// PRD #4212 worker settings the demo lets an admin reset. A key reads "db" once it holds a
+// non-default value or was saved explicitly, else "default" (the demo has no env overlay).
+const EPHEMERAL_WORKER_KEYS = new Set(["ephemeral_max_per_user", "ephemeral_default_size", "hosted_default_size", "ephemeral_lease"]);
+const explicitWorkerKeys = new Set<string>();
+
 // settingsResponse builds the admin SettingsResponse from the mock's current
 // state: readable non-secret values, per-secret configured flags, and per-key
 // sources (all db/default — the demo has no ENV overlay).
@@ -666,6 +684,10 @@ function settingsResponse(): SettingsResponse {
   // An empty judge_model is the explicit reset (PRD #3245): the response reports the
   // built-in as the effective value with source "default", like the server.
   const effective: AppSettings = { ...appSettings };
+  for (const key of EPHEMERAL_WORKER_KEYS) {
+    const def = SEED_APP_SETTINGS[key as keyof AppSettings];
+    sources[key] = explicitWorkerKeys.has(key) || appSettings[key as keyof AppSettings] !== def ? "db" : "default";
+  }
   if (appSettings.judge_model.trim() === "") {
     effective.judge_model = MOCK_JUDGE_BUILTINS.claude;
     sources.judge_model = "default";
@@ -1039,6 +1061,7 @@ export const settingsApi = {
         key === "ephemeral_workers_enabled" ||
         key === "worker_hibernation_enabled" ||
         key === "worker_hibernation_auto" ||
+        key === "worker_hibernation_surplus" ||
         key === "now_summary_enabled" ||
         key === "release_check_enabled" ||
         key === "release_check_banner_enabled" ||
@@ -1071,6 +1094,23 @@ export const settingsApi = {
         nonSecret.worker_hibernation_idle_after = value;
         continue;
       }
+      if (key === "worker_hibernation_surplus_idle_after") {
+        // PRD #4395: same Go time.ParseDuration subset as idle_after, bounded 15m..336h.
+        const units: Record<string, number> = { h: 3600, m: 60, s: 1, ms: 1e-3, us: 1e-6, "µs": 1e-6, ns: 1e-9 };
+        const comp = "(\\d+(?:\\.\\d*)?|\\.\\d+)(ns|us|µs|ms|h|m|s)";
+        const m0 = new RegExp(`^([-+]?)(0|(?:${comp})+)$`).exec(value.trim());
+        if (!m0) {
+          throw new ApiError(400, 'worker_hibernation_surplus_idle_after: must be a duration like "2h"');
+        }
+        let seconds = 0;
+        for (const m of m0[2].matchAll(new RegExp(comp, "g"))) seconds += Number(m[1]) * units[m[2]];
+        if (m0[1] === "-") seconds = -seconds;
+        if (seconds < 15 * 60 || seconds > 336 * 3600) {
+          throw new ApiError(400, "worker_hibernation_surplus_idle_after: must be between 15m and 336h");
+        }
+        nonSecret.worker_hibernation_surplus_idle_after = value;
+        continue;
+      }
       if (key === "custody_hold_limit") {
         // Mirrors validateCustodyHoldLimit server-side: trim, digits only, 1..1000.
         const t = value.trim();
@@ -1079,6 +1119,34 @@ export const settingsApi = {
           throw new ApiError(400, "custody_hold_limit: must be a whole number between 1 and 1000");
         }
         nonSecret.custody_hold_limit = value;
+        continue;
+      }
+      if (EPHEMERAL_WORKER_KEYS.has(key)) {
+        // PRD #4212: "" (or whitespace, trimmed like the server's NormalizeForStorage) resets
+        // to the default; otherwise mirror the server validators.
+        if (value.trim() === "") {
+          explicitWorkerKeys.delete(key);
+          (nonSecret as Record<string, string>)[key] = SEED_APP_SETTINGS[key as keyof AppSettings] as string;
+          continue;
+        }
+        const t = value.trim();
+        if (key === "ephemeral_max_per_user") {
+          if (!/^[0-9]+$/.test(t) || Number(t) > 20) {
+            throw new ApiError(400, "ephemeral_max_per_user: must be a whole number between 0 and 20");
+          }
+        } else if (key === "ephemeral_lease") {
+          const units: Record<string, number> = { h: 3600, m: 60, s: 1, ms: 1e-3 };
+          const comp = "(\\d+(?:\\.\\d*)?|\\.\\d+)(ms|h|m|s)";
+          const m0 = new RegExp(`^(0|(?:${comp})+)$`).exec(t);
+          let seconds = 0;
+          if (m0) for (const m of m0[1].matchAll(new RegExp(comp, "g"))) seconds += Number(m[1]) * units[m[2]];
+          if (!m0) throw new ApiError(400, 'ephemeral_lease: must be a duration like "30m"');
+          if (seconds > 2 * 3600) throw new ApiError(400, "ephemeral_lease: must be between 0s and 2h");
+        } else if (!(WORKER_SIZES as readonly string[]).includes(t)) {
+          throw new ApiError(400, `${key}: must be one of ${WORKER_SIZES.join(", ")}`);
+        }
+        explicitWorkerKeys.add(key);
+        (nonSecret as Record<string, string>)[key] = t;
         continue;
       }
       if (key === "hosted_worker_quota") {

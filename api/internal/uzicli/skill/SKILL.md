@@ -65,7 +65,7 @@ version-matched, no server needed — see *Onboarding & concepts* below.
 `uzi worker list --json` and read each worker's `status`, `docker`, `active_runs`,
 `max_concurrent_runs` (a missing or null field is unknown, never "no"). If every online worker has
 `docker: true`, a repo-bearing run on a repo outside the Docker worker repo allowlist cannot be
-claimed: point to **Admin → Instance → Docker worker repo allowlist** (an admin edits it there;
+claimed: point to **Admin → Workers → Docker worker repo allowlist** (an admin edits it there;
 anyone else asks an admin). Then `uzi docs show run-health`.
 
 **On-screen labels**: name a web UI location only by the labels in `uzi docs`, never by a
@@ -1894,6 +1894,11 @@ into `file`/`dismiss`/`resolve`. `undo` keys on the `disposition_id` field (read
   repo's board and run history, so it prompts `[y/N]` unless you pass
   `--force`/`-f`. A repo the bot can still see reappears (disabled) on the next
   projects refresh; to keep it out, remove the bot's forge access first.
+  `uzi repo env list <id>` — the repo's run variables (PRD #4416), **read-only**:
+  NAME, KIND (`secret`|`plain`), STATE, VALUE, DESCRIPTION, UPDATED; `--json` dumps the
+  full list with counts and `vault_locked`. A secret's value is never shown
+  (`(secret)`), and a plain value reads `(vault locked)` while the owner's vault is
+  locked. Variables are written in the web UI only; the CLI has no write verb.
 - `uzi admin users|runs|workers|health|usage|rate-limits|cli-tokens|guardrail-impact` and
   `uzi admin agent-source get|status` —
   **read-only** factory-wide views. These require an admin-scoped (`uza_`) token; a

@@ -866,6 +866,8 @@ export interface Repo {
   /** Separate checker consent; absent on older APIs means off. */
   cross_check_repo_instructions_enabled?: boolean;
   code_cross_check_guidance?: string | null;
+  /** Live environment variables (enabled and disabled; not those pending deletion). */
+  env_var_count: number;
   id: string;
   connection_id: string;
   forge_project_id: number;
@@ -1138,6 +1140,49 @@ export interface ToolAllowlistEntry {
   updated_by: string | null;
   created_at: string;
   updated_at: string;
+}
+
+// Per-repo run environment variables (PRD #4416 M1). A secret's value is never
+// returned: `value` is null for it. A plain value is null only while the vault is
+// locked (`value_withheld`).
+export type RunEnvState = "enabled" | "disabled" | "pending_deletion";
+
+export interface RunEnvVar {
+  var_id: string;
+  name: string;
+  secret: boolean;
+  description: string;
+  value: string | null;
+  value_withheld: boolean;
+  state: RunEnvState;
+  rev: number;
+  disabled_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface RunEnvCounts {
+  total: number;
+  disabled: number;
+  pending_deletion: number;
+  limit: number;
+}
+
+export interface RunEnvList {
+  variables: RunEnvVar[];
+  counts: RunEnvCounts;
+  vault_locked: boolean;
+}
+
+/** Write body: every field optional; an omitted value keeps the stored one. */
+export interface RunEnvWriteInput {
+  value?: string;
+  secret?: boolean;
+  description?: string;
+}
+
+export interface RunEnvDeleteResult {
+  state: "deleted" | "pending_deletion";
 }
 
 export interface ToolAllowlistWriteInput {
@@ -1438,8 +1483,21 @@ export interface AppSettings {
   // duration (default "336h", valid 1h..2160h). Optional for older responses.
   worker_hibernation_auto?: string;
   worker_hibernation_idle_after?: string;
+  // Warm reserve (PRD #4395): "true"/"false", default "false", effective only while
+  // enabled and auto are both "true". surplus_idle_after is a Go duration (default
+  // "2h", valid 15m..336h); the server uses min(surplus_idle_after, idle_after).
+  worker_hibernation_surplus?: string;
+  worker_hibernation_surplus_idle_after?: string;
   // Per-user persistent hosted-worker quota: integer 0..20, default 2. Zero disables provisioning.
   hosted_worker_quota: string;
+  // Ephemeral worker admin settings (PRD #4212). Optional for older responses.
+  // ephemeral_max_per_user: integer 0..20, default "2"; ephemeral_default_size and
+  // hosted_default_size: a worker size name (s, m, l, l-highmem), defaults "m" and "l";
+  // ephemeral_lease: Go duration 0..2h, default "2h".
+  ephemeral_max_per_user?: string;
+  ephemeral_default_size?: string;
+  hosted_default_size?: string;
+  ephemeral_lease?: string;
   // Per-owner custody admission limit: whole number 1..1000, default "8". Lowering it blocks future claims only.
   custody_hold_limit: string;
   // Upstream release-check toggles (PRD #836). Both the text "true"/"false" (default
@@ -3212,6 +3270,9 @@ export interface HostedConfig {
   // Whether the instance admin gate permits ephemeral auto-provisioning (PRD #649),
   // independent of `quota`, which governs manual self-service.
   ephemeral_enabled: boolean;
+  // Admin-chosen size the provision form preselects (PRD #4212). Optional: an older API
+  // omits it, and an unknown name is ignored by the form.
+  default_size?: string;
 }
 
 export type RunStatus =
@@ -4175,8 +4236,9 @@ export interface Run {
    *  the claim was released, local work and custody are kept, and only the owner can Resume or
    *  Cancel. Owner-held with no automatic retry, and not an integrity refusal.
    *  "anthropic_spend_limit" (issue #3767) means a Claude run's Anthropic API key hit its
-   *  organization or workspace spend limit. Owner-held, recovery_retry_not_before is null and
-   *  nothing resumes it automatically. The owner can Resume (the next claim re-selects the
+   *  organization or workspace spend limit, or (issue #4426) ran out of prepaid credit.
+   *  Owner-held, recovery_retry_not_before is null and nothing resumes it automatically.
+   *  The owner can Resume (the next claim re-selects the
    *  credential through the run's own selection, which may pick the capped token again),
    *  switch token (switchable kinds only) or Cancel. A queued run can keep this value stale
    *  after set-token, so also require status === "recovery_wait".

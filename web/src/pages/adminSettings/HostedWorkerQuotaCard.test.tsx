@@ -87,3 +87,45 @@ describe("HostedWorkerQuotaCard", () => {
     expect(button().disabled).toBe(false);
   });
 });
+
+describe("HostedWorkerQuotaCard default size", () => {
+  const withSize = { hosted_worker_quota: "2", hosted_default_size: "l" } as AppSettings;
+  const sizeResponse = (size: string): SettingsResponse => ({ settings: { ...withSize, hosted_default_size: size } as AppSettings, secrets: {}, sources: {}, slack_status: "disabled" });
+  const select = () => screen.getByLabelText("Default size for new workers") as HTMLSelectElement;
+
+  it("shows the effective size and its source", () => {
+    render(<HostedWorkerQuotaCard settings={withSize} sources={{ hosted_default_size: "db" }} onSaved={() => {}} />);
+    expect(select().value).toBe("l");
+    expect(screen.getByText("Saved")).toBeTruthy();
+  });
+
+  it("saves only hosted_default_size", async () => {
+    mockApi.updateSettings.mockResolvedValue(sizeResponse("m"));
+    render(<HostedWorkerQuotaCard settings={withSize} sources={{}} onSaved={() => {}} />);
+    fireEvent.change(select(), { target: { value: "m" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save Default size for new workers" }));
+    await waitFor(() => expect(mockApi.updateSettings).toHaveBeenCalledWith({ hosted_default_size: "m" }));
+  });
+
+  it("resets with an empty string", async () => {
+    mockApi.updateSettings.mockResolvedValue(sizeResponse("l"));
+    render(<HostedWorkerQuotaCard settings={withSize} sources={{ hosted_default_size: "db" }} onSaved={() => {}} />);
+    fireEvent.click(screen.getByRole("button", { name: "Reset to default: Default size for new workers" }));
+    await waitFor(() => expect(mockApi.updateSettings).toHaveBeenCalledWith({ hosted_default_size: "" }));
+  });
+
+  it("is locked when set by the environment", () => {
+    render(<HostedWorkerQuotaCard settings={withSize} sources={{ hosted_default_size: "env" }} onSaved={() => {}} />);
+    expect(select().disabled).toBe(true);
+    expect(screen.getByText("Set by environment")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /Default size for new workers/ })).toBeNull();
+  });
+
+  it("shows a failed save inline", async () => {
+    mockApi.updateSettings.mockRejectedValue(new ApiError(409, "hosted_default_size is set by the environment"));
+    render(<HostedWorkerQuotaCard settings={withSize} sources={{}} onSaved={() => {}} />);
+    fireEvent.change(select(), { target: { value: "s" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save Default size for new workers" }));
+    expect((await screen.findByRole("alert")).textContent).toContain("set by the environment");
+  });
+});

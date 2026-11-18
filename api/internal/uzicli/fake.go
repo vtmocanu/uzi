@@ -641,6 +641,11 @@ type FakeClient struct {
 	LastResyncProjectSyncRepoID string
 	ResyncProjectSyncErr        error
 
+	// Repo run variables (PRD #4416): ListRepoEnv returns RepoEnvResult (or Err) and
+	// records the repo id it was asked about.
+	RepoEnvResult         apitypes.RunEnvListDTO
+	LastListRepoEnvRepoID string
+
 	// GetRunHook, when non-nil, drives GetRun instead of the static RunByID map. It
 	// is the sequencing seam `uzi run wait`'s tests need: a poll loop calls GetRun
 	// repeatedly, so a test scripts a per-call STATUS SEQUENCE (and injects a

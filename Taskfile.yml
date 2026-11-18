@@ -321,6 +321,7 @@ tasks:
       - task: test:golangci-wrapper
       # Best-effort deadcode diagnostics and gate verdicts, with fake Go only.
       - task: test:deadcode-gate
+      - task: test:npm-audit-gate
       # Hermetic tests of the oasdiff wrapper's verified-archive cache (PRD #1908 M5): fake
       # curl/uname, a real fixture tarball, no network. Same protection as the line above.
       - task: test:oasdiff-wrapper
@@ -1033,6 +1034,12 @@ tasks:
     desc: hermetic deadcode verdict and optional diagnostic contracts (fake Go)
     cmds:
       - ./scripts/deadcode-gate.test.sh
+
+  test:npm-audit-gate:
+    desc: hermetic npm audit classification and bounded exception policy
+    cmds:
+      - node --test scripts/npm-audit-exceptions.test.mjs
+      - ./scripts/npm-audit-gate.test.sh
 
   test:golangci-wrapper:
     desc: hermetic tests of the verified golangci-lint archive cache and build-Go guard
@@ -2843,9 +2850,10 @@ tasks:
       # WHY `high` AND NOT ZERO: the ruling is high-and-above at zero. When this
       # target was written two moderate react-router advisories survived every
       # option on 6.x; the React Router 7 major has since cleared them (7.18.2
-      # installed, npm audit reports 0 vulnerabilities at this level) and the
+      # installed, the router advisories are cleared). New advisories still gate; the
       # threshold stays `high` per the ruling. scripts/npm-audit-gate.sh's header
       # carries the rest.
+      # ADR-4435 permits only maintainer-approved, expiring dev-only exceptions.
       - ./scripts/npm-audit-gate.sh web high
 
   test:web:
@@ -3028,9 +3036,8 @@ tasks:
     cmds:
       # Same script, same level, same reasons, and the same deliberate absence
       # from `gate:agent` - read vulncheck:web's comment before editing either.
-      # One asymmetry worth knowing: this package's findings are PRODUCTION
-      # dependencies that ship in the worker image, where web's are all dev-tree.
-      # That does not change the recipe; it changes how urgently a red here reads.
+      # Both dependency trees are audited. Production occurrences can never use the
+      # bounded dev-only exceptions documented in ADR-4435.
       - ./scripts/npm-audit-gate.sh agent high
 
   test:agent:

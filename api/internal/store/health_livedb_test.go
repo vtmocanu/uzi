@@ -320,6 +320,16 @@ func TestHealthChecksLiveDB(t *testing.T) {
 	}
 }
 
+// staticLeaseSettings is the workersvc.EphemeralSettingsReader of a test that needs a fixed ephemeral
+// lease (PRD #4212: the lease is a live setting read through this reader, not a Service field).
+type staticLeaseSettings struct{ lease time.Duration }
+
+func (staticLeaseSettings) EphemeralWorkersEnabled(context.Context) (bool, error) { return true, nil }
+
+func (s staticLeaseSettings) EphemeralLease(context.Context) (time.Duration, error) {
+	return s.lease, nil
+}
+
 type rollRepoAllowlist []uuid.UUID
 
 func (r rollRepoAllowlist) DockerRepoAllowlist(context.Context) ([]uuid.UUID, error) {
@@ -339,6 +349,11 @@ func (rollHealthSettings) WorkerHibernationEnabled(context.Context) (bool, error
 func (rollHealthSettings) WorkerHibernationAuto(context.Context) (bool, error)    { return false, nil }
 func (rollHealthSettings) WorkerHibernationIdleAfter(context.Context) (time.Duration, error) {
 	return 0, nil
+}
+
+func (rollHealthSettings) WorkerHibernationSurplus(context.Context) (bool, error) { return false, nil }
+func (rollHealthSettings) WorkerHibernationSurplusIdleAfter(context.Context) (time.Duration, error) {
+	return 2 * time.Hour, nil
 }
 
 func (rollHealthSettings) CustodyHoldLimit(context.Context) (int32, error)   { return 8, nil }
@@ -624,7 +639,7 @@ func TestHealthRollStrictLeaseEligibilityLiveDB(t *testing.T) {
 				target = leased.served
 			}
 			svc := workersvc.New(fx.q, nil, workersvc.Params{WorkerHeartbeatStale: 45 * time.Second, WorkerAffinityCeiling: 2 * time.Hour})
-			svc.SetEphemeralLease(2 * time.Hour)
+			svc.SetEphemeralSettings(staticLeaseSettings{lease: 2 * time.Hour})
 			svc.SetDockerAllowlist(rollRepoAllowlist{fx.repoID})
 			row, err := svc.WorkerEligibilityForHealth(fx.ctx, time.Now(), target)
 			if err != nil {

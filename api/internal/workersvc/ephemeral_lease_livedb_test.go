@@ -54,7 +54,7 @@ func (e leaseEnv) service(lease time.Duration, tx TxBeginner) *Service {
 	svc.SetVault(e.vlt)
 	svc.SetTxBeginner(tx)
 	svc.SetBackground(func(func()) {})
-	svc.SetEphemeralLease(lease)
+	svc.SetEphemeralSettings(fakeEphemeralSettings{lease: lease})
 	return svc
 }
 
@@ -898,7 +898,7 @@ func TestClaimVsDeleteEphemeralWorkerForRunLiveDB(t *testing.T) {
 	follow := e.seedFollowUp(t, iid, agentIssueBranch(iid))
 	del := func() int64 {
 		n, err := e.q.DeleteEphemeralWorkerForRun(e.ctx, store.DeleteEphemeralWorkerForRunParams{
-			RunID: served, EphemeralLease: LeaseInterval(svc.ephemeralLease)})
+			RunID: served, EphemeralLease: LeaseInterval(2 * time.Hour)})
 		if err != nil {
 			t.Fatalf("DeleteEphemeralWorkerForRun: %v", err)
 		}

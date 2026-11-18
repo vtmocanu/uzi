@@ -157,6 +157,37 @@ describe("mockApi — F3 updateSettings accepts the nine missing AppSettings key
     for (const ok of ["1h", "2160h", "60m", "3600s", "3600000ms", "+1h", "1h30m", "1.5h", "720h", " 336h "]) {
       await check("worker_hibernation_idle_after", { worker_hibernation_idle_after: ok }, ok);
     }
+    // PRD #4395: warm-reserve surplus switch and its idle threshold (bounds inclusive).
+    expect((await api.getSettings()).settings).toMatchObject({
+      worker_hibernation_surplus: "false",
+      worker_hibernation_surplus_idle_after: "2h",
+    });
+    await check("worker_hibernation_surplus", { worker_hibernation_surplus: "true" }, "true");
+    await check("worker_hibernation_surplus", { worker_hibernation_surplus: "false" }, "false");
+    for (const ok of ["15m", "336h", "2h", "900s", "1h30m", "+15m", " 2h "]) {
+      await check("worker_hibernation_surplus_idle_after", { worker_hibernation_surplus_idle_after: ok }, ok);
+    }
+  });
+
+  it("refuses invalid warm-reserve values with the server's messages", async () => {
+    const api = await reload();
+    await expect(api.updateSettings({ worker_hibernation_surplus: "yes" })).rejects.toMatchObject({
+      status: 400,
+      message: 'worker_hibernation_surplus: must be "true" or "false"',
+    });
+    for (const bad of ["", "2", "2d", "h", "garbage", "1x"]) {
+      await expect(api.updateSettings({ worker_hibernation_surplus_idle_after: bad })).rejects.toMatchObject({
+        status: 400,
+        message: 'worker_hibernation_surplus_idle_after: must be a duration like "2h"',
+      });
+    }
+    for (const bad of ["0", "14m", "14m59s", "336h1s", "337h", "-1h"]) {
+      await expect(api.updateSettings({ worker_hibernation_surplus_idle_after: bad })).rejects.toMatchObject({
+        status: 400,
+        message: "worker_hibernation_surplus_idle_after: must be between 15m and 336h",
+      });
+    }
+    expect((await api.getSettings()).settings.worker_hibernation_surplus_idle_after).toBe("2h");
   });
 
   it("refuses invalid automatic-hibernation values with the server's messages", async () => {

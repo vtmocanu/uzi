@@ -883,7 +883,9 @@ func TestRepoDTOTags(t *testing.T) {
 		"docker_allowlisted",
 		// PRD #361 M3: the computed, caller-scoped "is a run on this repo actually
 		// blocked by the Docker-allowlist gap right now" bool, from eligibility directly.
-		"docker_blocked")
+		"docker_blocked",
+		// PRD #4416: how many environment variables the repo has (enabled and disabled).
+		"env_var_count")
 }
 
 func TestGuardrailOverrideDTOTags(t *testing.T) {

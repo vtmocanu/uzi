@@ -374,10 +374,17 @@ func TestProfileBoundFailedAssemblySettlesLiveDB(t *testing.T) {
 type fakeEphemeralSettings struct {
 	on  bool
 	err error
+	// lease is what EphemeralLease answers (PRD #4212: the lease is a live setting, not a Service
+	// field). Zero disables the lease. err applies to the kill-switch read only.
+	lease time.Duration
 }
 
 func (f fakeEphemeralSettings) EphemeralWorkersEnabled(context.Context) (bool, error) {
 	return f.on, f.err
+}
+
+func (f fakeEphemeralSettings) EphemeralLease(context.Context) (time.Duration, error) {
+	return f.lease, nil
 }
 
 // TestIsolatedLaneQueuedReasonLiveDB: the queued reason of a profile-bound run is truthful. A
