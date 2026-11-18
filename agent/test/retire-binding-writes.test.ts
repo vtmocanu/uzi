@@ -508,7 +508,9 @@ describe("audit rework", () => {
         fx.cleanup();
         fx = makeFixture();
         let n = 0;
-        const c = mk({ split: true });
+        // Anchor each denial to an observable step: the guard runs after settle-write, the predicate before it.
+        let nAtSettleWrite: number | undefined;
+        const c = mk({ split: true, step: step => { if (step === "settle-write") nAtSettleWrite = n; } });
         const s = await seed(c, 4284);
         await retire(c, s, { processProof: () => {
           if (++n < denyAt) return true;
@@ -516,6 +518,8 @@ describe("audit rework", () => {
           return false;
         } });
         assert.equal(n, denyAt, `the denial came from the settle ${site}, read ${denyAt} of ${total}`);
+        if (site === "guard") assert.equal(nAtSettleWrite, denyAt - 1, "the denying read is the first one after the settle-write step");
+        else assert.equal(nAtSettleWrite, undefined, "a predicate denial never reaches the settle write");
         assert.equal(phase(s.bare), "intent");
         assert.equal(parents().length, 1);
       });
