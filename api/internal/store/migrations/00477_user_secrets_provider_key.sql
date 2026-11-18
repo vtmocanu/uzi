@@ -25,8 +25,9 @@ ALTER TABLE user_secrets ADD CONSTRAINT user_secrets_provider_key_check
 SET LOCAL lock_timeout = '5s';
 -- Refuse rather than silently destroy sealed credential material (the 00198 convention). The table
 -- is locked BEFORE the guard so a key inserted concurrently cannot slip in between the check and the
--- column drop (SHARE ROW EXCLUSIVE blocks writers).
-LOCK TABLE user_secrets IN SHARE ROW EXCLUSIVE MODE;
+-- column drop. Take the final ALTER lock up front so a reader that later writes cannot
+-- deadlock against a lock upgrade after the guard.
+LOCK TABLE user_secrets IN ACCESS EXCLUSIVE MODE;
 -- +goose StatementBegin
 DO $$
 BEGIN

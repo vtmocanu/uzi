@@ -16,8 +16,9 @@ SET LOCAL lock_timeout = '5s';
 -- Refuse rather than silently clear a user's provider source (the 00198 convention): dropping the
 -- column would turn every selected source into a vendor fallback, which D12 forbids. The table is
 -- locked BEFORE the guard so a source selected concurrently cannot land between the check and the
--- column drop (SHARE ROW EXCLUSIVE blocks writers).
-LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE;
+-- column drop. Take the final ALTER lock up front so a reader that later writes cannot
+-- deadlock against a lock upgrade after the guard.
+LOCK TABLE users IN ACCESS EXCLUSIVE MODE;
 -- +goose StatementBegin
 DO $$
 BEGIN

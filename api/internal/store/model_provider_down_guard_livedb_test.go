@@ -17,11 +17,11 @@ import (
 // snapshot it reads). Text order, because the interleaving needs a live database (see
 // TestModelProviderDownLockSerializesWithAWriterLiveDB).
 func TestModelProviderDownGuardsLockBeforeTheCheck(t *testing.T) {
-	// mode is the table lock each Down takes: the runs Downs take ACCESS EXCLUSIVE up front (no lock upgrade).
+	// ALTER Downs take their final ACCESS EXCLUSIVE lock up front (no lock upgrade).
 	for file, spec := range map[string]struct{ table, mode string }{
 		"00476_model_providers.sql":                  {"model_providers", "SHARE ROW EXCLUSIVE"},
-		"00477_user_secrets_provider_key.sql":        {"user_secrets", "SHARE ROW EXCLUSIVE"},
-		"00479_users_claude_provider_source.sql":     {"users", "SHARE ROW EXCLUSIVE"},
+		"00477_user_secrets_provider_key.sql":        {"user_secrets", "ACCESS EXCLUSIVE"},
+		"00479_users_claude_provider_source.sql":     {"users", "ACCESS EXCLUSIVE"},
 		"00481_runs_model_provider_binding.sql":      {"runs", "ACCESS EXCLUSIVE"},
 		"00488_runs_provider_gateway_limit_type.sql": {"runs", "ACCESS EXCLUSIVE"},
 	} {
