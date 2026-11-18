@@ -924,3 +924,21 @@ full-suite, security or m3/m4 completion evidence.
   triggers through 466": read the Codex snapshot as 466 and the
   pending target as 467 from this point. The migration LiveDB test now
   downgrades to 465 and asserts that main's 464 and 465 columns survive.
+
+## Decision 11 recovery controls and crash point 5 (2026-11-18)
+
+Ledger U21: on retained recovery after crash points 1–4, the four crash
+leaves (now 32 with the survivors/unverified modes) show delivered Codex
+material is not released, refreshed, logged in or launched before the
+`predecessor_capture` proof, and never used when that proof reports survivors
+or unverified (`quiescence_failed`, clone and custody kept). Controls: an
+ordering mutant moving a release ahead of the proof (32 of 32 red) and a
+removal of the gate (all 8 forced leaves red), both class (b) preservation.
+
+Owner decision on crash point 5 (predecessor host unreachable), 2026-11-18:
+recorded scope decision, **unvalidated and uncredited**, an environmental
+limitation. Fencing refuses stale uzi operations, but a different B credential
+and revoking A's uzi capability do not stop a provider credential that an
+unreachable predecessor already holds. No option-B protocol work; the runtime
+stays fail-closed (B is never used while predecessor quiescence is unproven,
+and the run holds for the owner). This covers crash point 5 only.
