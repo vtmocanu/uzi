@@ -73,6 +73,16 @@ describe("buildSdkEnv provider mode (PRD #4320)", () => {
     assert.equal(e.CLAUDE_CODE_OAUTH_TOKEN, undefined);
   });
 
+  it("keeps provider routing with run-owned TMPDIR and a provisioned PATH", () => {
+    const leaf = "/data/runner/.tmp/run-provider-test";
+    const e = buildSdkEnv(providerCred(), HOME_DIR, { PATH: "/provisioned/bin" }, undefined, undefined, undefined, leaf);
+    assert.equal(e.TMPDIR, leaf);
+    assert.equal(e.PATH, "/provisioned/bin");
+    assert.equal(e.ANTHROPIC_BASE_URL, GATEWAY_URL);
+    assert.equal(e.ANTHROPIC_AUTH_TOKEN, GATEWAY_KEY);
+    assert.equal(e.CLAUDE_CODE_OAUTH_TOKEN, undefined);
+  });
+
   for (const authStyle of ["bearer", "x_api_key"] as const) {
     it(`${authStyle}: the defined key set is exactly the provider keys plus the base keys, and the key appears once`, () => {
       const e = buildSdkEnv(providerCred({

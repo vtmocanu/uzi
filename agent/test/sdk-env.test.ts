@@ -286,8 +286,8 @@ describe("run-owned TMPDIR (issue #4420)", () => {
     const prior = process.env.UZI_RUNNER_TMPDIR;
     process.env.UZI_RUNNER_TMPDIR = "/data/runner/.tmp/uzi-runner";
     try {
-      assert.strictEqual(buildSdkEnv(FAKE_OAUTH, HOME_DIR, {}, undefined, undefined, undefined, leaf).TMPDIR, leaf);
-      assert.strictEqual(buildSdkEnv(FAKE_OAUTH, HOME_DIR).TMPDIR, "/data/runner/.tmp/uzi-runner");
+      assert.strictEqual(buildSdkEnv({ kind: "oauth", token: FAKE_OAUTH }, HOME_DIR, {}, undefined, undefined, undefined, leaf).TMPDIR, leaf);
+      assert.strictEqual(buildSdkEnv({ kind: "oauth", token: FAKE_OAUTH }, HOME_DIR).TMPDIR, "/data/runner/.tmp/uzi-runner");
     } finally {
       if (prior === undefined) delete process.env.UZI_RUNNER_TMPDIR; else process.env.UZI_RUNNER_TMPDIR = prior;
     }
