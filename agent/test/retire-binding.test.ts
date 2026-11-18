@@ -6,8 +6,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
-  GitCache, RETIRE_BINDING_MAX_PER_BARE, evaluateRetireBinding, parseAttemptLedgerEntry, parseRetireBinding, parseRetireBindingKey, retireBindingKey, retireBindingValue,
-  type RetireBinding,
+  GitCache, RETIRE_BINDING_MAX_PER_BARE, evaluateRetireBinding, evaluateRetireRecovery, parseAttemptLedgerEntry, parseRetireBinding, parseRetireBindingKey, retireBindingKey, retireBindingValue,
+  type RetireBinding, type RetireBindingRead,
 } from "../src/git.js";
 import { syncDirectory } from "../src/authority-lock.js";
 import { attemptClonePath, formatAttemptId } from "../src/attempt-path.js";
@@ -192,12 +192,14 @@ describe("compactAttemptLedger keeps an attempt a binding names", () => {
     }
   });
 
-  it("still drops an entry when the binding names a different run or path", async () => {
+  it("keeps the entry of an attempt whose bindings name a different identity", async () => {
     const clonePath = addRetired();
     setBinding(UUID, retireBindingValue(binding({ clonePath, runId: "run-other" })));
     setBinding(randomUUID(), retireBindingValue(binding({ clonePath: `${clonePath}-x` })));
+    const before = ledgerValues();
     await compact();
-    assert.deepEqual(ledgerValues(), []);
+    assert.equal(before.length, 1);
+    assert.deepEqual(ledgerValues(), before);
   });
 
   it("keeps every entry when any binding is malformed (it may name the entry)", async () => {
@@ -301,6 +303,127 @@ describe("compactAttemptLedger keeps taint a reclaim evaluation relies on (#4263
     addLedger(reordered);
     await compact();
     assert.deepEqual(ledgerValues(), [junk, reordered]);
+  });
+});
+
+describe("conflicting canonical history for one attempt id (#4263)", () => {
+  const RUNNER_ROOT = "/data/runner";
+  const CLONE = "/data/runner/slug/attempt";
+  const OTHER_BRANCH = "agent/other";
+  const OTHER_KEY = `uzi-attempts.${OTHER_BRANCH}.entry`;
+  const settled: RetireBinding = {
+    v: 1, class: "owner_terminal", attemptId: ATTEMPT, runId: "run-current", branch: BRANCH, clonePath: CLONE,
+    phase: "settled", parentIno: "100", cloneIno: "101", pod: "",
+  };
+  const ent = (state: string, over: Record<string, string> = {}): string => {
+    const f = { attemptId: ATTEMPT, runId: "run-current", clonePath: CLONE, ...over };
+    return JSON.stringify({ attemptId: f.attemptId, runId: f.runId, clonePath: f.clonePath, state });
+  };
+  const retired = ent("retired");
+  type L = Array<{ branch: string; raw: string }>;
+  const evidenceOf = (ledger: L, bindings = [{ key: retireBindingKey(UUID), uuid: UUID, raw: retireBindingValue(settled), parsed: settled as RetireBinding | undefined }]) =>
+    ({ barePath: "/data/repos/fixture.git", bindings, ledger, protectedPaths: [], restoreBranches: [], recovery: [], stoppedRuns: [] });
+  const exam = (ledger: L) => evaluateRetireBinding({ evidence: evidenceOf(ledger), uuid: UUID, runnerRoot: RUNNER_ROOT });
+  const recover = (ledger: L) => evaluateRetireRecovery({
+    evidence: evidenceOf(ledger), uuid: UUID, runnerRoot: RUNNER_ROOT, expectRaw: retireBindingValue(settled), canonical: { present: false },
+  });
+  const conflicts: Array<[string, L]> = [
+    ["a different run id", [{ branch: BRANCH, raw: ent("live", { runId: "run-other" }) }, { branch: BRANCH, raw: retired }]],
+    ["a different clone path", [{ branch: BRANCH, raw: ent("live", { clonePath: "/data/runner/slug/other" }) }, { branch: BRANCH, raw: retired }]],
+    ["a different branch", [{ branch: OTHER_BRANCH, raw: ent("live") }, { branch: BRANCH, raw: retired }]],
+  ];
+  const control: L = [{ branch: BRANCH, raw: ent("live") }, { branch: BRANCH, raw: retired }];
+
+  for (const [name, ledger] of conflicts) {
+    it(`pure: an earlier canonical value with ${name} is ledger_mismatch and unresolved`, () => {
+      assert.deepEqual(exam(ledger), { kind: "keep", reason: "ledger_mismatch" });
+      assert.equal(recover(ledger), "unresolved");
+    });
+  }
+
+  it("pure control: same-identity live then retired is ready and case1", () => {
+    assert.equal(exam(control).kind, "ready");
+    assert.equal(recover(control), "case1");
+  });
+
+  it("pure: a second binding naming the attempt with another identity is a conflict and unresolved", () => {
+    const other: RetireBinding = { ...settled, runId: "run-other" };
+    const otherUuid = "2b2b2b2b-2222-4222-8b2b-2c2c2c2c2c2c";
+    const bindings = [
+      { key: retireBindingKey(UUID), uuid: UUID, raw: retireBindingValue(settled), parsed: settled as RetireBinding | undefined },
+      { key: retireBindingKey(otherUuid), uuid: otherUuid, raw: retireBindingValue(other), parsed: other as RetireBinding | undefined },
+    ];
+    assert.deepEqual(evaluateRetireBinding({ evidence: evidenceOf(control, bindings), uuid: UUID, runnerRoot: RUNNER_ROOT }), { kind: "keep", reason: "conflict" });
+    assert.equal(evaluateRetireRecovery({
+      evidence: evidenceOf(control, bindings), uuid: UUID, runnerRoot: RUNNER_ROOT, expectRaw: retireBindingValue(settled), canonical: { present: false },
+    }), "unresolved");
+  });
+
+  // Real git fixture: compaction must not erase the conflicting history.
+  const clonePath = (): string => attemptClonePath(cache.runnerClonePath(bare, KEY), ATTEMPT);
+  const entry = (state: string, over: Record<string, string> = {}): string => {
+    const f = { attemptId: ATTEMPT, runId: "run-4263", clonePath: clonePath(), ...over };
+    return JSON.stringify({ attemptId: f.attemptId, runId: f.runId, clonePath: f.clonePath, state });
+  };
+  const addTo = (key: string, raw: string): void => { gitIn(["config", "--local", "--add", key, raw]); };
+  const valuesOf = (key: string): string[] => { try { return gitIn(["config", "--local", "--get-all", key]).split("\n"); } catch { return []; } };
+  const bindSettled = (): void => setBinding(UUID, retireBindingValue(binding({ class: "owner_terminal", phase: "settled", clonePath: clonePath() })));
+  const compactBranch = (br: string): Promise<void> => (cache as unknown as { compactAttemptLedger(b: string, br: string): Promise<void> }).compactAttemptLedger(bare, br);
+  const realEvidence = async (): Promise<{ ledger: L; bindings: RetireBindingRead[] }> => {
+    const read = await cache.readRetireBindings(bare);
+    assert.equal(read.state, "read");
+    return {
+      bindings: read.state === "read" ? read.bindings : [],
+      // Config order across every branch, as the reclaim's evidence read sees it.
+      ledger: gitIn(["config", "--local", "--null", "--list"]).split("\0").flatMap(item => {
+        const nl = item.indexOf("\n");
+        const m = nl < 0 ? null : /^uzi-attempts\.(.+)\.entry$/.exec(item.slice(0, nl));
+        return m ? [{ branch: m[1]!, raw: item.slice(nl + 1) }] : [];
+      }),
+    };
+  };
+  const evalReal = async (ledger: L, bindings: RetireBindingRead[]) => {
+    const evidence = { barePath: bare, bindings, ledger, protectedPaths: [], restoreBranches: [], recovery: [], stoppedRuns: [] };
+    const runnerRoot = path.join(fx.dataDir, "runner");
+    return {
+      exam: evaluateRetireBinding({ evidence, uuid: UUID, runnerRoot }),
+      recovery: evaluateRetireRecovery({ evidence, uuid: UUID, runnerRoot, expectRaw: bindings.find(b => b.uuid === UUID)!.raw, canonical: { present: false } }),
+    };
+  };
+
+  for (const [name, over] of [["run id", { runId: "run-other" }], ["clone path", { clonePath: "/data/runner/slug/other" }]] as const) {
+    it(`compaction preserves an earlier canonical entry with a different ${name} verbatim`, async () => {
+      const input = [entry("live", over), entry("retired")];
+      for (const v of input) addTo(LEDGER_KEY, v);
+      bindSettled();
+      await compactBranch(BRANCH);
+      assert.deepEqual(ledgerValues(), input);
+      const { ledger, bindings } = await realEvidence();
+      assert.deepEqual(await evalReal(ledger, bindings), { exam: { kind: "keep", reason: "ledger_mismatch" }, recovery: "unresolved" });
+    });
+  }
+
+  for (const order of [[BRANCH, OTHER_BRANCH], [OTHER_BRANCH, BRANCH]]) {
+    it(`compaction keeps a cross-branch conflict, compacting ${order.join(" then ")}`, async () => {
+      const live = entry("live");
+      const ret = entry("retired");
+      addTo(OTHER_KEY, live);
+      addTo(LEDGER_KEY, ret);
+      bindSettled();
+      for (const br of order) await compactBranch(br);
+      assert.deepEqual(valuesOf(OTHER_KEY), [live]);
+      assert.deepEqual(valuesOf(LEDGER_KEY), [ret]);
+      const { ledger, bindings } = await realEvidence();
+      assert.deepEqual(await evalReal(ledger, bindings), { exam: { kind: "keep", reason: "ledger_mismatch" }, recovery: "unresolved" });
+    });
+  }
+
+  it("compaction keeps a gone entry whose run id differs from a decoded binding's", async () => {
+    const only = entry("retired", { runId: "run-other" });
+    addTo(LEDGER_KEY, only);
+    bindSettled();
+    await compactBranch(BRANCH);
+    assert.deepEqual(ledgerValues(), [only]);
   });
 });
 

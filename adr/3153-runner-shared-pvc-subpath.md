@@ -564,7 +564,7 @@ cross-check and every in-pass check. Reader-by-reader decisions (abbreviated;
 | Epoch census, maintenance and recovery families, FINAL inventory, terminal attribution, restore census and restore-route | No change. They match exact key families and ignore the prefix; none lists the runner root. |
 | ACK reader and runGit config accounting | Entries count toward their caps (1024 entries); the 64-per-bare cap bounds the addition. |
 | Startup inspector | Changed: reads bindings and reports binding-aware reasons. |
-| Attempt-ledger compaction | Changed: an attempt named by a binding keeps its `retired` entry; an unreadable or undecodable binding set keeps every entry. |
+| Attempt-ledger compaction | Changed: an attempt named by a binding keeps its `retired` entry; an unreadable or undecodable binding set keeps every entry; an attempt whose ledger values, on any branch, or a binding name more than one run, clone path or branch keeps every value verbatim (issue #4263), and its binding evaluates `ledger_mismatch`. |
 | Hibernation census (filesystem walk of the runner root) | No change. A bound parent reports `unknown`, which blocks volume retirement conservatively (a residual below). |
 | `backup-runs.sh` config reads | No change. They match exact keys; a retired, discarded clone is not backup material. |
 

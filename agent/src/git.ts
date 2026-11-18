@@ -2677,16 +2677,29 @@ function retireCanonicalRetired(b: RetireBinding): string {
  * The last canonical ledger value for the binding's attempt across the bare's branches, undefined when none, or "tainted"
  * when any NON-canonical value (reordered, padded, extra field, unparseable) still names the attempt id: such a value could
  * be a later state this reader cannot interpret, so no earlier canonical `retired` stays authoritative over it.
+ * Also "tainted" (issue #4263) when ANY canonical value for the attempt id, earlier or last, names a (branch, runId, clonePath)
+ * different from the binding's: an attempt id has one identity, so a second one is conflicting history, not a superseded state.
+ * Only same-identity values (live then retired) are accepted.
  */
-function retireLedgerLast(evidence: RetireScratchBareEvidence, attemptId: string): { branch: string; raw: string; entry: AttemptLedgerEntry } | undefined | "tainted" {
+function retireLedgerLast(evidence: RetireScratchBareEvidence, b: RetireBinding): { branch: string; raw: string; entry: AttemptLedgerEntry } | undefined | "tainted" {
+  const attemptId = b.attemptId;
   let last: { branch: string; raw: string; entry: AttemptLedgerEntry } | undefined;
   for (const { branch, raw } of evidence.ledger) {
     const entry = parseAttemptLedgerEntry(raw);
     if (entry && raw === attemptLedgerValue(entry)) {
-      if (entry.attemptId === attemptId) last = { branch, raw, entry };
+      if (entry.attemptId === attemptId) {
+        if (branch !== b.branch || entry.runId !== b.runId || entry.clonePath !== b.clonePath) return "tainted";
+        last = { branch, raw, entry };
+      }
     } else if (raw.includes(attemptId) || retireParsedNamesAttempt(raw, attemptId)) return "tainted";
   }
   return last;
+}
+
+/** Issue #4263: does ANOTHER decoded binding (a different key) name the same attempt id with a different (branch, runId, clonePath)? */
+function retireOtherBindingConflicts(evidence: RetireScratchBareEvidence, key: string, b: RetireBinding): boolean {
+  return evidence.bindings.some(o => o.key !== key && o.parsed !== undefined && o.parsed.attemptId === b.attemptId &&
+    (o.parsed.branch !== b.branch || o.parsed.runId !== b.runId || o.parsed.clonePath !== b.clonePath));
 }
 
 /** Does a non-canonical value parse (JSON escapes decoded, so the id need not appear literally) to an object naming the attempt? */
@@ -2740,7 +2753,8 @@ export function evaluateRetireBinding(input: {
   if (b.phase === "intent") return keep("bound_intent");
   if (b.phase === "removing") return keep("interrupted_removal");
   if (!RETIRE_RECLAIM_CLASSES.has(b.class)) return keep("class_ineligible");
-  const last = retireLedgerLast(evidence, b.attemptId);
+  if (retireOtherBindingConflicts(evidence, entry.key, b)) return keep("conflict");
+  const last = retireLedgerLast(evidence, b);
   if (last === "tainted") return keep("ledger_mismatch");
   if (!last) return keep("ledger_missing");
   if (last.branch !== b.branch || last.raw !== retireCanonicalRetired(b)) return keep("ledger_mismatch");
@@ -2761,7 +2775,8 @@ export function evaluateRetireRecovery(input: {
   const own = evidence.bindings.filter(b => b.key === retireBindingKey(uuid));
   const b = own.length === 1 && own[0]!.raw === input.expectRaw ? own[0]!.parsed : undefined;
   if (!b) return "unresolved";
-  const last = retireLedgerLast(evidence, b.attemptId);
+  if (retireOtherBindingConflicts(evidence, own[0]!.key, b)) return "unresolved";
+  const last = retireLedgerLast(evidence, b);
   if (!last || last === "tainted" || last.branch !== b.branch || last.entry.runId !== b.runId || last.entry.clonePath !== b.clonePath) return "unresolved";
   const journal = retireJournalOf(evidence, b.branch);
   if (journal === "unparseable" || evidence.restoreBranches.includes(b.branch)) return "unresolved";
@@ -18071,6 +18086,10 @@ export class GitCache {
    * (each compacted entry stays at the position of its attempt's last value, so the relative order of everything kept is
    * the input order and no reader's last-value-per-attemptId answer changes), and takes no part in last-value selection. This keeps the taint
    * the reclaim evaluation's ledger read relies on (a non-canonical value naming the attempt blocks an earlier `retired`).
+   * A CONFLICTED attempt id (issue #4263) is likewise preserved verbatim at its position, every canonical value of it, never
+   * collapsed to a last value nor dropped: the ledger of ALL branches is read, and an id is conflicted when its canonical
+   * values carry more than one (branch, runId, clonePath), or a decoded binding names it with an identity that some canonical
+   * value does not share. retireLedgerLast reads exactly this history and answers "tainted" for it.
    * Nothing is rewritten when nothing would change.
    *
    * The rewrite is ATOMIC ({@link rewriteLedgerAtomically}): the full compacted value set lands in
@@ -18092,7 +18111,29 @@ export class GitCache {
       const bindingsUndecodable = bindingRead.state === "unknown" || bindingRead.bindings.some(b => b.parsed === undefined);
       const namedByBinding = (e: AttemptLedgerEntry): boolean => bindingsUndecodable || bindingRead.state === "read" && bindingRead.bindings.some(b =>
         b.parsed !== undefined && b.parsed.attemptId === e.attemptId && b.parsed.runId === e.runId && b.parsed.clonePath === e.clonePath);
-      const raw = (await this.readAllAttemptLedgerRaw(barePath)).filter(([b]) => b === branch).map(([, v]) => v);
+      const allRaw = await this.readAllAttemptLedgerRaw(barePath);
+      const raw = allRaw.filter(([b]) => b === branch).map(([, v]) => v);
+      // A CONFLICTED attempt id (issue #4263): its canonical values, over ALL branches, carry more than one (branch, runId,
+      // clonePath), or a decoded binding names it with an identity some canonical value does not share. Those values are
+      // preserved verbatim (never collapsed to a last value, dropped or re-serialized), since retireLedgerLast reads them.
+      const identities = new Map<string, Set<string>>();
+      for (const [b, v] of allRaw) {
+        const e = parseAttemptLedgerEntry(v);
+        if (!e || v !== attemptLedgerValue(e)) continue;
+        const set = identities.get(e.attemptId) ?? new Set<string>();
+        set.add(JSON.stringify([b, e.runId, e.clonePath]));
+        identities.set(e.attemptId, set);
+      }
+      const conflictedIds = new Set<string>();
+      for (const [id, set] of identities) if (set.size > 1) conflictedIds.add(id);
+      if (bindingRead.state === "read") {
+        for (const bd of bindingRead.bindings) {
+          const p = bd.parsed;
+          if (p === undefined) continue;
+          const set = identities.get(p.attemptId);
+          if (set !== undefined && [...set].some(i => i !== JSON.stringify([p.branch, p.runId, p.clonePath]))) conflictedIds.add(p.attemptId);
+        }
+      }
       // A NON-canonical value (unparseable, or parseable but not byte-identical to its canonical form) naming a bound attempt is
       // TAINTED: retireLedgerLast treats it as a possibly-later state it cannot interpret, so compaction must neither drop nor
       // re-serialize it. With an undecodable binding set every non-canonical value is tainted (the binding may name it).
@@ -18111,6 +18152,7 @@ export class GitCache {
         if (tainted(v)) { slots.push({ tainted: v }); continue; }
         const e = parseAttemptLedgerEntry(v);
         if (!e) continue;
+        if (conflictedIds.has(e.attemptId)) { slots.push({ tainted: v }); continue; }
         lastIndex.set(e.attemptId, slots.length);
         slots.push({ entry: e });
       }
