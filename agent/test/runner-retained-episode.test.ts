@@ -9,6 +9,7 @@ import { RunRunner } from "../src/runner.js";
 import { portableTeardownTestDeps } from "./teardown-fixtures.js";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import fsp from "node:fs/promises";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { randomBytes, createHmac } from "node:crypto";
@@ -87,10 +88,24 @@ async function requireEpisodeEntry(entry: Promise<void>, execution: Promise<unkn
   assert.equal(entered, true, "runner ended before the recovery seam");
 }
 
-for (const authority of ["covering FINAL", "uploaded-without-FINAL", "wrong-generation FINAL", "tampered physical journal", "unreadable physical journal", "incomplete coverage", "absent journal", "legacy journal", "shutdown during FINAL read", "fence during FINAL read"] as const) {
-  it(`successor terminal retirement requires ${authority}`, async () => {
+for (const authority of ["covering FINAL", "uploaded-without-FINAL", "wrong-generation FINAL", "tampered physical journal", "unreadable physical journal", "incomplete coverage", "absent journal", "legacy journal", "shutdown during FINAL read", "fence during FINAL read", "covering FINAL, intent-write fault", "covering FINAL, intent-sync fault"] as const) {
+  it(`successor terminal retirement requires ${authority}`, async (t) => {
     const { claim, bare, clone, key } = await seed();
     claim.inventory_guarded = true;
+    // issue #4263 M2: the verified successor's EXDEV retire cannot write its scratch binding (a fault at the intent step).
+    const fault = authority === "covering FINAL, intent-write fault" ? "intent-write" : authority === "covering FINAL, intent-sync fault" ? "intent-sync" : undefined;
+    if (fault) {
+      const holding = path.join(fx.dataDir, "runner-quarantine");
+      const rename = fsp.rename.bind(fsp);
+      t.mock.method(fsp, "rename", async (...args: Parameters<typeof fsp.rename>) => {
+        if (String(args[1]).startsWith(holding + path.sep)) throw Object.assign(new Error("cross-device holding move"), { code: "EXDEV" });
+        return rename(...args);
+      });
+      const seam = git as unknown as { retireBindingStepSeam?: (step: string) => void };
+      const previous = seam.retireBindingStepSeam;
+      seam.retireBindingStepSeam = step => { if (step === fault) throw new Error(`injected ${fault}`); };
+      t.after(() => { seam.retireBindingStepSeam = previous; });
+    }
     const feature = client.hasFeature.bind(client);
     client.hasFeature = name => name === "recovery_inventory_v1" || name === "claim_generation_fence" || feature(name);
     client.getRunOwnership = async () => ({
@@ -230,13 +245,30 @@ for (const authority of ["covering FINAL", "uploaded-without-FINAL", "wrong-gene
     assert.ok(terminalPreparations >= 1, "completed successor reaches terminal inventory preparation");
     assert.equal(generationSettlements, 1, "completed successor reaches its generation settlement");
     assert.equal(guardedGenerationSettlements, 1, "its exact terminal generation actually settles guarded inventory");
-    assert.equal(retirements, movedSuccessor ? 1 : 0);
+    assert.equal(retirements, movedSuccessor || fault ? 1 : 0);
+    if (fault) {
+      // The retire refused before the move: the documented caller outcome is the warn and retained predecessor custody,
+      // the terminal status is the same single failed generation the other no-retire cases produce, the successor stays
+      // canonical with its ledger `live`, no scratch parent or binding remains.
+      const warned = (retirementLog.lines as Array<{ level: string; msg: string; error?: string }>)
+        .filter(l => l.level === "warn" && l.msg === "verified successor retirement refused; predecessor custody retained");
+      assert.equal(warned.length, 1, "the caller's documented warn");
+      assert.match(warned[0]!.error ?? "", new RegExp(`injected ${fault}`));
+      assert.equal(api.states.filter(s => s.body.status === "failed" && s.body.claim_generation === 2).length, 1, "terminal status is the no-fault baseline");
+      assert.deepEqual(fs.readdirSync(path.join(fx.dataDir, "runner")).filter(n => n.startsWith(".retire-")), [], "no scratch parent");
+      if (fault === "intent-write") {
+        let bindings = "";
+        try { bindings = command(bare, "config", "--local", "--get-regexp", "^uzi-retire-scratch\\."); } catch { /* none */ }
+        assert.equal(bindings, "", "no binding written");
+      }
+    }
     if (authority === "covering FINAL") {
       assert.equal(await (r as any).recovery.inventoryCleanupState(claim.run_id, 2), "acknowledged",
         "terminal retirement retains physical FINAL evidence for this generation");
     }
     const journal = readJournal(bare, clone.branch);
-    assert.equal(journal.clonePath, movedSuccessor ? clone.path : successor);
+    // (a fault after the predecessor anchor leaves the anchored journal, which names the first predecessor)
+    assert.equal(journal.clonePath, movedSuccessor || fault ? clone.path : successor);
     const ledger = command(bare, "config", "--get-all", `uzi-attempts.${clone.branch}.entry`).split("\n").map(raw => JSON.parse(raw));
     assert.equal(ledger.filter(entry => entry.clonePath === successor).at(-1).state, movedSuccessor ? "retired" : "live");
     assert.equal(fs.readFileSync(path.join(clone.path, "retained.txt"), "utf8"), "only local dirty work\n");

@@ -1077,9 +1077,14 @@ or supported manual settled-tree cleanup frees space. See
 bounds, periodic reclaim, admission stop and the bounded `data_volume_full`
 park, and [Run recovery](./run-recovery.md) for supported inspect/discard
 procedures; pressure does not authorize deleting protected sources.
-[PRD #3431](../prds/3431-pod-epoch-reclaim.md) M1b settlement/deletion is
-implemented behind an off-by-default startup opt-in, so production deletes
-nothing unless an operator selects one canary worker, and #3329's genuine-idle reclaim roll is deferred. This policy adds
+[PRD #3431](../prds/3431-pod-epoch-reclaim.md) M1b attempt deletion is
+implemented behind an off-by-default startup opt-in, so production deletes no
+attempts unless an operator selects one canary worker, and #3329's genuine-idle reclaim roll is deferred. One exception is requested by default but still runs only on an eligible pass with an attested runtime declaration (the chart's default empty runtime declaration supplies no attestation, so with chart defaults it deletes nothing): the
+runner TMPDIR scratch reclaim (#4043, see
+[startup disable and observation](./run-recovery.md#runner-tmpdir-scratch-reclaim-startup-disable-and-observation)).
+The bound `.retire-*` parent phase (#4263, see
+[Disk-full residual](./worker-docker.md#disk-full-residual-on-the-data-volume)) deletes no
+bound parent on a uid-split pod: nothing writes `settled`, so every bound parent is kept. This policy adds
 no reclaim authority.
 
 ### Docker workers: run directory on the data volume

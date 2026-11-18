@@ -321,6 +321,9 @@ type Config struct {
 	// WorkerRetireScratchOutcomes controls worker retirement-scratch outcome records
 	// (UZI_RETIRE_SCRATCH_OUTCOMES). Default true; false renders the worker opt-out.
 	WorkerRetireScratchOutcomes bool
+	// WorkerRetireScratchReclaim controls the verified-epoch retire-scratch phase, which
+	// deletes no bound `.retire-*` parent and clears the binding of a gone one (UZI_RETIRE_SCRATCH_RECLAIM). Default true; false renders the worker opt-out.
+	WorkerRetireScratchReclaim bool
 	// WorkerDinDImage is the fully-pinned DinD sidecar image
 	// (docker:<tag>-dind-rootless@sha256:... or, non-rootless, docker:<tag>-dind@...).
 	// It is operator config, not wire data — the api never names an image — and shared
@@ -528,6 +531,13 @@ func loadWorkerSettings(cfg *Config) error {
 	case "false":
 	default:
 		return fmt.Errorf("UZI_WORKER_RETIRE_SCRATCH_OUTCOMES must be empty, true or false")
+	}
+	switch os.Getenv("UZI_WORKER_RETIRE_SCRATCH_RECLAIM") {
+	case "", "true":
+		cfg.WorkerRetireScratchReclaim = true
+	case "false":
+	default:
+		return fmt.Errorf("UZI_WORKER_RETIRE_SCRATCH_RECLAIM must be empty, true or false")
 	}
 	cfg.WorkerEpochReclaimDeletionCanaryID = os.Getenv("UZI_WORKER_EPOCH_RECLAIM_DELETION_CANARY_ID")
 	if id := cfg.WorkerEpochReclaimDeletionCanaryID; id != "" && !canonicalUUIDRE.MatchString(id) {

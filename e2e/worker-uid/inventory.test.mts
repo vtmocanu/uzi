@@ -402,6 +402,15 @@ const epochTitles = [
   "pod epoch private API CA survives both real UID launch chains without relaxing preload refusal",
   "pod epoch restores observable persistent worker and runner scratch in both UID modes and refuses invalid saved paths",
   "pod epoch real split: the worker pins the runner scratch root, the runner-uid census reads it and the strict delete removes a leaf",
+  "pod epoch real retire scratch: the runner-uid empty-fd helper reclaims a populated clone, the worker removes clone and parent and an outward symlink target survives",
+  "pod epoch real retire scratch: the production retire writer keeps the scratch parent 0700 under the setgid 3775 runner root and the discard removes it",
+  "pod epoch real retire scratch: directories the runner cannot list or modify survive byte-identical as residue with no chmod",
+  "pod epoch real retire scratch: a runner-cmd directory the runner can list but not unlink from survives byte-identical as residue",
+  "pod epoch real retire scratch: a clone swapped around the helper run is never followed or removed and a descendant swapped before the helper is unlinked, never followed",
+  "pod epoch real retire scratch: the helper child sees only the clone pin at fd 3 and the EX lock at fd 4 and cannot reopen the worker-private parent",
+  "pod epoch real retire scratch: a worker killed mid-helper leaves the binding at removing, so a successor keeps the parent and removes nothing",
+  "pod epoch real retire scratch: a runner-uid racer swapping directories for outward symlinks while the helper walks a large tree never causes a deletion outside the clone",
+  "pod epoch real retire scratch: another uid owning the root or the parent is refused with nothing launched",
 ];
 test("pod epoch inventory independently requires every literal image proof and keeps other lanes unchanged", () => {
   const scratch = mkdtempSync(path.join(repo, ".uzi/scratch/epoch-inventory."));
