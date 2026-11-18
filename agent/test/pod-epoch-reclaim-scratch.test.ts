@@ -1909,15 +1909,19 @@ async function interruptMaintenanceThroughEpoch(mode: "abort" | "deadline") {
   await withRunWorld([leafOf(RUN_A)], async (w, rw) => {
     await seedRetiredAttempt(rw, RUN_A);
     const root = await seedMaintenanceTable(rw);
-    let clock = 0, jumpedAt = 0;
+    let clock = 0;
     if (mode === "deadline") {
       w.options.now = () => clock;
       const ownership = w.options.client.getRunOwnership;
       w.options.client.getRunOwnership = async (...args) => {
-        clock = 600_000 - 5000 - EPOCH_DEADLINE_LEFT_MS; jumpedAt = Date.now();
+        clock = 600_000 - 5000 - EPOCH_DEADLINE_LEFT_MS;
         return ownership(...args);
       };
     }
+    // Release against the deadline the maintenance read actually received (wall-clock), not the clock-jump time.
+    let receivedDeadline: number | undefined;
+    const realInspect = w.options.scratch!.authority!.inspectMaintenance!;
+    w.options.scratch!.authority!.inspectMaintenance = (id, bound) => { receivedDeadline = bound?.deadline; return realInspect(id, bound); };
     const ins = instrumentFs({ op: "read", path: join(root, "complete.json"), nth: 1 });
     try {
       await ins.install();
@@ -1933,7 +1937,11 @@ async function interruptMaintenanceThroughEpoch(mode: "abort" | "deadline") {
             })]);
           } finally { clearTimeout(reachTimer); }
           if (mode === "abort") w.parent.abort();
-          else while (Date.now() - jumpedAt < EPOCH_DEADLINE_LEFT_MS + 400) await new Promise(resolve => setTimeout(resolve, 50));
+          else {
+            assert.equal(typeof receivedDeadline, "number", "the maintenance read received a deadline");
+            const until = receivedDeadline! + 400;
+            while (Date.now() < until) await new Promise(resolve => setTimeout(resolve, 50));
+          }
           for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve));
           assert.equal(settled, false, "epoch handover waits: the pass does not resolve while the started read is in flight");
         } finally { ins.release(); }
