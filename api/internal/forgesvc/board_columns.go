@@ -29,6 +29,28 @@ type LabelSeedError struct{ Err error }
 func (e *LabelSeedError) Error() string { return e.Err.Error() }
 func (e *LabelSeedError) Unwrap() error { return e.Err }
 
+// EnsureBoardColumnRows is the store-only half of EnsureBoardColumns, for a repo linked
+// to an external issue tracker (PRD #4173 M4): it records the DefaultColumns rows when
+// the repo has none and never calls an issue tracker, because uzi creates no labels or
+// tags there (writes arrive in M5). Same one-statement insert, same idempotence.
+func EnsureBoardColumnRows(ctx context.Context, q BoardColumnStore, repoID uuid.UUID) error {
+	count, err := q.CountBoardColumns(ctx, repoID)
+	if err != nil {
+		return fmt.Errorf("count board columns: %w", err)
+	}
+	if count > 0 {
+		return nil
+	}
+	names := make([]string, len(DefaultColumns))
+	for i, col := range DefaultColumns {
+		names[i] = col.Name
+	}
+	if err := q.InsertDefaultBoardColumns(ctx, store.InsertDefaultBoardColumnsParams{RepoID: repoID, LabelNames: names}); err != nil {
+		return fmt.Errorf("insert default board columns: %w", err)
+	}
+	return nil
+}
+
 // EnsureBoardColumns gives a repo its board columns when it has none: it
 // ensures the DefaultColumns labels exist on the forge, then records them as
 // board_columns rows in DefaultColumns order. A repo that already has any

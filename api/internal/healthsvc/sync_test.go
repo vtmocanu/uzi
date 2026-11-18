@@ -326,3 +326,68 @@ func TestForgeSyncConcurrentOperations(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func issueTrackerSyncCheck(t *testing.T, svc *Service) apitypes.HealthCheckDTO {
+	t.Helper()
+	doc, err := svc.Evaluate(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range doc.Checks {
+		if c.ID == "issue_tracker.sync" {
+			return c
+		}
+	}
+	t.Fatal("missing issue_tracker.sync")
+	return apitypes.HealthCheckDTO{}
+}
+
+func TestIssueTrackerSyncNaWithNoLinkedRepos(t *testing.T) {
+	// Enabled but unlinked repos do not count: the enumeration is the linked set.
+	svc := New(Config{Store: &fakeStore{enabledIDs: []uuid.UUID{uuid.New()}}, Now: func() time.Time { return fixedNow }, IssueTrackerSyncRegistry: NewSyncRegistry(nil)})
+	c := issueTrackerSyncCheck(t, svc)
+	if c.Severity != sevNA || c.Summary != "No enabled repositories linked to an issue tracker." {
+		t.Fatalf("issue_tracker.sync = %+v", c)
+	}
+}
+
+func TestIssueTrackerSyncNilRegistryReadsPending(t *testing.T) {
+	svc := New(Config{Store: &fakeStore{linkedIDs: []uuid.UUID{uuid.New()}}, Now: func() time.Time { return fixedNow }})
+	if c := issueTrackerSyncCheck(t, svc); c.Severity != sevUnknown {
+		t.Fatalf("issue_tracker.sync = %+v, want unknown", c)
+	}
+}
+
+func TestIssueTrackerSyncBandsAndActions(t *testing.T) {
+	for _, tc := range []struct {
+		class forge.ErrorClass
+		want  string
+	}{
+		{forge.ErrorClassAuth, "the issue tracker connection's token is invalid or lacks access; re-check the issue tracker connection."},
+		{forge.ErrorClassTimeout, "check reachability of the issue tracker from the api pod."},
+		{forge.ErrorClassServerError, "issue-tracker side; check the issue tracker's status and rate limits, and wait."},
+		{forge.ErrorClassRateLimited, "issue-tracker side; check the issue tracker's status and rate limits, and wait."},
+		{forge.ErrorClassOther, "read the api logs for `poller: linked issue sync` and `poller: build linked issue tracker` errors."},
+	} {
+		t.Run(string(tc.class), func(t *testing.T) {
+			clock := &syncClock{t: fixedNow}
+			a, b := uuid.New(), uuid.New()
+			reg := NewSyncRegistry(clock.now)
+			svc := New(Config{Store: &fakeStore{linkedIDs: []uuid.UUID{a, b}}, Now: clock.now, IssueTrackerSyncRegistry: reg, ForgeSyncInterval: time.Minute})
+			reg.Begin(a)(true, forge.ErrorClassOther)
+			reg.Begin(b)(false, tc.class)
+			if c := issueTrackerSyncCheck(t, svc); c.Severity != sevOK || c.Action != nil {
+				t.Fatalf("before the band: %+v", c)
+			}
+			clock.set(fixedNow.Add(3 * time.Minute))
+			c := issueTrackerSyncCheck(t, svc)
+			if c.Severity != sevWarn || c.Action == nil || *c.Action != tc.want {
+				t.Fatalf("warn band: %+v, want action %q", c, tc.want)
+			}
+			clock.set(fixedNow.Add(10 * time.Minute))
+			if c := issueTrackerSyncCheck(t, svc); c.Severity != sevDanger || *c.Action != tc.want {
+				t.Fatalf("danger band: %+v", c)
+			}
+		})
+	}
+}

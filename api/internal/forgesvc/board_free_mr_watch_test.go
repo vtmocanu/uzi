@@ -111,6 +111,23 @@ func TestSyncBoardFreeMRStatesDifferential(t *testing.T) {
 			wantCancel: 1,
 		},
 		{
+			// A linked repo's issue-lane run is also watched at stored 'closed' (the reopen
+			// edge): the reopen records 'opened' and cancels nothing.
+			name:       "closed->opened (reopen)",
+			stored:     strptr(forge.MRStateClosed),
+			observed:   forge.MRStateOpened,
+			wantRecord: strptr(forge.MRStateOpened),
+			wantCancel: 0,
+		},
+		{
+			// A still-closed MR polled again must not re-fire the close side effects.
+			name:       "closed->closed (no re-cancel)",
+			stored:     strptr(forge.MRStateClosed),
+			observed:   forge.MRStateClosed,
+			wantRecord: nil,
+			wantCancel: 0,
+		},
+		{
 			name:       "unknown-state",
 			stored:     strptr(forge.MRStateOpened),
 			observed:   "weird",

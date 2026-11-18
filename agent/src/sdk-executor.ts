@@ -2594,6 +2594,7 @@ export class SdkExecutor implements Executor {
         } else {
           planPrompt = buildPlanPrompt({
             issueIid: ctx.issueIid ?? 0,
+            issueKey: ctx.issueKey,
             issueTitle: ctx.issueTitle,
             issueDescription: ctx.issueDescription,
             // PRD #381: the snapshotted issue comments, rendered under a per-prompt

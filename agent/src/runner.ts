@@ -305,6 +305,7 @@ import {
   repoPathFromUrl,
   type ReconcileResult,
 } from "./pr-description-publisher.js";
+import { linkedIssueKey, linkedIssueLabel } from "./linked-issue.js";
 import { closingDirectiveFor, escapeInline, nonClosingTitle, renderCompletionBlock, type KindSection } from "./pr-description.js";
 import type { CompletionQuestionTrigger } from "./completion-attempt.js";
 import type { SummaryRunner } from "./summary-runner.js";
@@ -10236,6 +10237,9 @@ export class RunRunner {
     // and the live claim.config.non_closing decide there.
     if (claim.config?.completion_contract_version == null && resolveRunKind(claim.kind) === "issue" &&
         typeof claim.issue_iid === "number" && claim.config?.non_closing == null &&
+        // PRD 4173: a linked run never closes by design (nonClosingDelivery holds it non-closing),
+        // so its empty recorded closing set is not an "original delivery did not close" signal.
+        !linkedIssueKey(claim).linked &&
         (claim.config?.completion_scope?.deferred?.length ?? 0) === 0 &&
         !record.mr.closing.includes(`#${claim.issue_iid}`)) {
       flight.result.nonClosing = { reason: "The original delivery did not close its issue; the resumed publication keeps it open." };
@@ -11683,7 +11687,10 @@ export class RunRunner {
     const refreshPublication = resolveRunKind(claim.kind) === "mr_rework" ||
       (resolveRunKind(claim.kind) === "ci_fix" && !!claim.pipeline && result.branch === claim.pipeline.ref);
     const publicationContextLatch = new PublicationContextLatch();
-    let closingGateIid = issuePublication && effectiveDeclared ? claim.issue_iid! : undefined;
+    // PRD 4173: a run linked to an external issue tracker never closes `#<iid>` (an unrelated forge issue
+    // there), so its commit messages are gated like a declared non-closing run's.
+    const linkedRun = issuePublication && linkedIssueKey(claim).linked;
+    let closingGateIid = issuePublication && (effectiveDeclared || linkedRun) ? claim.issue_iid! : undefined;
     const refreshPublicationContext = async (head: string | null): Promise<void> => {
       if (!refreshPublication) return;
       try {
@@ -11904,7 +11911,7 @@ export class RunRunner {
           // (phasePublicationOnly) uses this value only to TIGHTEN: when the live rules would close the issue of a
           // non-interlocked run but this set omits it, the resume delivers non-closing. It never adds a closing
           // directive: phasePublish recomputes those from the live claim and the delivery rules.
-          closing: issuePublication && typeof claim.issue_iid === "number" && !effectiveDeclared && !result.scopeCapped &&
+          closing: issuePublication && typeof claim.issue_iid === "number" && !effectiveDeclared && !linkedRun && !result.scopeCapped &&
             (completionScope?.deferred?.length ?? 0) === 0 && !interlocked ? [`#${claim.issue_iid}`] : [],
           contract_revision: claim.config?.completion_contract_version ?? 0,
         },
@@ -12039,7 +12046,7 @@ export class RunRunner {
       }
       publicationPending = publicationAck.completionPending;
       pendingNonClosing = (publicationPending?.criteria.length ?? 0) > 0;
-      if (effectiveDeclared || result.scopeCapped || publicationProjection.deferredIds.length > 0 || pendingNonClosing)
+      if (effectiveDeclared || linkedRun || result.scopeCapped || publicationProjection.deferredIds.length > 0 || pendingNonClosing)
         closingGateIid = claim.issue_iid!;
     }
 
@@ -13255,7 +13262,11 @@ export class RunRunner {
     // blocker arm (a delivery that must not close its issue) needs BOTH: a matching non-closing arm in
     // issueArm (setting this flag alone still renders `Closes #N`, and the publisher's scan skips uzi's
     // own completion block), and this flag set here rather than its own check at one of those sites.
-    const nonClosingDelivery = isOwnerPartial || !!result.scopeCapped || !!effectiveNonClosing || pendingNonClosing;
+    // PRD 4173: a run linked to an external issue tracker (claim.issue_key) is non-closing by the repo link:
+    // `#<iid>` is an unrelated forge issue there, so no body may carry a closing directive for it
+    // and issueArm's linkedIssue arm never writes Closes.
+    const linkedDelivery = runKind === "issue" && linkedIssueKey(claim).linked;
+    const nonClosingDelivery = isOwnerPartial || !!result.scopeCapped || !!effectiveNonClosing || pendingNonClosing || linkedDelivery;
     const createCloses = renderCloses && !nonClosingDelivery;
     // H1: a forge response over its byte cap (ForgeResponseTooLarge) is a deterministic answer, not
     // a blip: classifyForgeError classifies it permanent, so it is never retried. Both the publisher
@@ -13377,9 +13388,10 @@ export class RunRunner {
     // deliveries keep the plain title. Interlocked owner-partial and scope-capped publication also
     // refuses closing commit history using the publication-start projection and exact candidate.
     const nonClosingTitleDelivery = nonClosingDelivery && scanIid !== undefined;
+    const issueTitleLabel = linkedDelivery ? linkedIssueLabel(linkedIssueKey(claim)) : undefined;
     const titleFor = (): string => {
       const title = mrTitle(claim, result.scopeCapped, completionScope);
-      return nonClosingTitleDelivery ? nonClosingTitle(title, scanIid!, repoPath) : title;
+      return nonClosingTitleDelivery ? nonClosingTitle(title, scanIid!, repoPath, issueTitleLabel) : title;
     };
     let mr: Awaited<ReturnType<typeof forge.createMergeRequest>>;
     try {
@@ -13456,14 +13468,14 @@ export class RunRunner {
           const actual = await readTitle();
           if (actual === undefined) return false;
           if (!closingDirectiveFor(actual, scanIid!, repoPath)) return true;
-          let written = nonClosingTitle(actual, scanIid!, repoPath);
+          let written = nonClosingTitle(actual, scanIid!, repoPath, issueTitleLabel);
           try {
             await writeTitle(written);
           } catch (e) {
             // A forge may refuse the broken title (e.g. a length cap after the inserted characters);
             // one retry with the fixed non-closing fallback, anything else fails closed.
             if (!(e instanceof ForgeError && (e.status === 422 || e.status === 400))) throw e;
-            written = `Work on issue #${scanIid}`;
+            written = `Work on issue ${issueTitleLabel ?? `#${scanIid}`}`;
             await writeTitle(written);
           }
           const reread = await readTitle();
@@ -16989,6 +17001,7 @@ export class RunRunner {
       } : {}),
       kind: resolveRunKind(claim.kind),
       issueIid: claim.issue_iid,
+      ...(claim.issue_key !== undefined ? { issueKey: claim.issue_key } : {}),
       issueTitle: claim.issue_title,
       issueDescription: claim.issue_description,
       // PRD #381: carry the snapshotted issue-comment set onto the ctx; the SDK
@@ -32400,7 +32413,9 @@ export function mrTitle(
   if (kindTitle !== undefined) return kindTitle;
   // #1801: NOT `Resolve issue #N` — GitLab's default merge/squash commit messages carry the title,
   // and `Resolve` + ref there closes the issue on the default branch.
-  return `${prefix}Work on issue #${claim.issue_iid}`;
+  const linked = linkedIssueKey(claim);
+  const linkedIssue = resolveRunKind(claim.kind) === "issue" && linked.linked;
+  return `${prefix}Work on issue ${linkedIssue ? linkedIssueLabel(linked) : `#${claim.issue_iid}`}`;
 }
 
 /** PRD #1798: the options mrCompletionBlock takes after its positional parameters. All optional.
@@ -32461,12 +32476,14 @@ export function mrCompletionBlock(
   // RUN_KIND_PROFILES.completionLine. A row's undefined — ci_fix with no pipeline, and the
   // issue/chat/judge kinds that carry none — takes the issue arm (Related / Closes / partial /
   // accepted / gates) inside renderCompletionBlock.
+  const linked = linkedIssueKey(claim);
   const kindLine = RUN_KIND_PROFILES[resolveRunKind(claim.kind)].completionLine?.(claim, {
     branch,
     baseBranch: claim.base_branch?.trim() || undefined,
   });
   return renderCompletionBlock({
     issueIid: claim.issue_iid,
+    ...(resolveRunKind(claim.kind) === "issue" && linked.linked ? { linkedIssue: { label: linked.label } } : {}),
     branch,
     kindLine,
     kindSections: [selfImproveSection, promptGuardSection, codeCrossCheckSummary ? [{ codeCrossCheck: codeCrossCheckSummary }] : undefined],

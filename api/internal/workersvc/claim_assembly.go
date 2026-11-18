@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -567,6 +568,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		v := run.IssueIid.Int64
 		issueIID = &v
 	}
+	issueKey := linkedIssueKey(run, rc.IssueTrackerProjectShort)
 	var pipeline *ClaimPipeline
 	if run.Kind == runkind.CIFix {
 		pipeline = claimPipelineFromSnapshot(run.FailureSnapshot)
@@ -781,6 +783,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		RunID:                 run.ID.String(),
 		Kind:                  run.Kind,
 		IssueIID:              issueIID,
+		IssueKey:              issueKey,
 		IssueTitle:            run.IssueTitle,
 		IssueDescription:      run.IssueDescription,
 		// PRD #381: the structured comments snapshot, decoded above. omitempty keeps a
@@ -1492,4 +1495,14 @@ func (s *Service) recordCodexEpoch(ctx context.Context, run store.Run) {
 	}); err != nil {
 		slog.Warn("workersvc: codex credential epoch not recorded", "run_id", run.ID.String(), "generation", run.ClaimGeneration, "error", err)
 	}
+}
+
+// linkedIssueKey is the issue tracker key (PRD #4173) of an issue run on a linked
+// repo: the repo link's project short name and the run's issue number. It is empty
+// for an unlinked repo (a NULL short) and for every run that is not an issue run.
+func linkedIssueKey(run store.Run, projectShort pgtype.Text) string {
+	if run.Kind != runkind.Issue || !run.IssueIid.Valid || !projectShort.Valid || projectShort.String == "" {
+		return ""
+	}
+	return projectShort.String + "-" + strconv.FormatInt(run.IssueIid.Int64, 10)
 }

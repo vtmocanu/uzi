@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/issuesource"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -101,7 +102,11 @@ func (s *Service) currentSemanticIssue(ctx context.Context, wkr store.Worker, ru
 	if err != nil {
 		return currentIssue{Reason: "unreadable"}, nil
 	}
-	cur := readCurrentSemanticIssue(ctx, f, conn.ForgeProjectID, *conn.IssueIID)
+	tr, err := issuesource.For(ctx, s.issueSources, conn.IssueTrackerConnectionID.Valid, conn.UserID, conn.RepoID, f)
+	if err != nil {
+		return currentIssue{Reason: "unreadable"}, nil
+	}
+	cur := readCurrentSemanticIssue(ctx, tr, conn.ForgeProjectID, *conn.IssueIID)
 	cur.Saved, cur.SavedValid = conn.SavedBody, conn.SavedBodyValid
 	return cur, nil
 }

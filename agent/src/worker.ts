@@ -1065,6 +1065,10 @@ export class Worker {
           "ci_config_guard_v1",
           "repo_agent_source_v1",
           "agent_source_request_v1",
+          // PRD #4173: this image renders a linked run's references by claim.issue_key and never
+          // writes Closes #<iid>. Advertised UNCONDITIONALLY: the api offers a run on a linked
+          // repo only to a worker advertising it.
+          "issue_key_v1",
           // Verified artifact files use Linux descriptor anchoring; other hosts remain logs-only.
           ...(process.platform === "linux" ? ["ci_artifacts_v1"] : []),
         ];

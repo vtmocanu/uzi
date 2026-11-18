@@ -1,6 +1,7 @@
 package youtracktest
 
 import (
+	"cmp"
 	"encoding/json"
 	"net/http"
 	"regexp"
@@ -32,6 +33,7 @@ func (s *Server) routes() *http.ServeMux {
 	route("/api/admin/projects/{pid}/customFields/{cf}/bundle/values", map[string]http.HandlerFunc{http.MethodGet: s.listBundleValues})
 	route("/api/tags", map[string]http.HandlerFunc{http.MethodGet: s.listTags, http.MethodPost: s.createTag})
 	route("/api/tags/{id}", map[string]http.HandlerFunc{http.MethodGet: s.getTag})
+	route("/api/tags/{id}/issues", map[string]http.HandlerFunc{http.MethodGet: s.listTagIssues})
 	route("/api/issues", map[string]http.HandlerFunc{http.MethodGet: s.listIssues, http.MethodPost: s.createIssue})
 	route("/api/issues/{id}", map[string]http.HandlerFunc{http.MethodGet: s.getIssue, http.MethodPost: s.updateIssue})
 	route("/api/issues/{id}/tags", map[string]http.HandlerFunc{http.MethodPost: s.addIssueTag})
@@ -178,7 +180,7 @@ func (s *Server) getTag(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	t := s.m.tagByID(r.PathValue("id"))
-	if t == nil || !t.visibleTo(BotID) {
+	if t == nil || !t.visibleToBot() {
 		notFound(w, r.PathValue("id"))
 		return
 	}
@@ -256,7 +258,6 @@ func (s *Server) createTag(w http.ResponseWriter, r *http.Request) {
 
 var (
 	queryProject    = regexp.MustCompile(`project: \{([^{}]*)\}`)
-	queryTag        = regexp.MustCompile(`tag: \{([^{}]*)\}`)
 	queryUpdated    = regexp.MustCompile(`updated: (\d{4}-\d{2}-\d{2}) \.\. \*`)
 	queryUnresolved = regexp.MustCompile(`#Unresolved`)
 	queryResolved   = regexp.MustCompile(`#Resolved`)
@@ -271,11 +272,6 @@ func (s *Server) listIssues(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q := r.URL.Query().Get("query")
-	var tagNames []string
-	for _, m := range queryTag.FindAllStringSubmatch(q, -1) {
-		tagNames = append(tagNames, m[1])
-	}
-	q = queryTag.ReplaceAllString(q, "")
 	proj := queryProject.FindStringSubmatch(q)
 	q = queryProject.ReplaceAllString(q, "")
 	upd := queryUpdated.FindStringSubmatch(q)
@@ -301,9 +297,6 @@ func (s *Server) listIssues(w http.ResponseWriter, r *http.Request) {
 		if i.project != p || i.updated < floor || (unresolved && i.resolved != nil) || (resolved && i.resolved == nil) {
 			continue
 		}
-		if !s.hasAllTags(i, tagNames) {
-			continue
-		}
 		matched = append(matched, i)
 	}
 	slices.SortStableFunc(matched, func(a, b *issue) int { return int(a.updated - b.updated) })
@@ -314,21 +307,36 @@ func (s *Server) listIssues(w http.ResponseWriter, r *http.Request) {
 	writePage(w, r, spec, items)
 }
 
-// hasAllTags matches tag names case-insensitively, as YouTrack's query does;
-// the driver filters again by resolved tag id.
-func (s *Server) hasAllTags(i *issue, names []string) bool {
-	for _, name := range names {
-		found := false
-		for _, id := range i.tags {
-			if t := s.m.tagByID(id); t != nil && strings.EqualFold(t.name, name) {
-				found = true
-			}
-		}
-		if !found {
-			return false
+// listTagIssues lists every issue carrying the tag, across all projects, newest
+// update first like the real API's default order. The resource takes no query:
+// the driver filters on its side. A tag the bot cannot see is a 404, as in getTag.
+func (s *Server) listTagIssues(w http.ResponseWriter, r *http.Request) {
+	spec, ok := fields(w, r)
+	if !ok {
+		return
+	}
+	if r.URL.Query().Has("query") {
+		writeError(w, http.StatusBadRequest, "Bad Request", "a tag's issue listing takes no query parameter")
+		return
+	}
+	id := r.PathValue("id")
+	t := s.m.tagByID(id)
+	if t == nil || !t.visibleToBot() {
+		notFound(w, id)
+		return
+	}
+	var matched []*issue
+	for _, i := range s.m.issues {
+		if i.hasTag(id) {
+			matched = append(matched, i)
 		}
 	}
-	return true
+	slices.SortStableFunc(matched, func(a, b *issue) int { return cmp.Compare(b.updated, a.updated) })
+	items := make([]map[string]any, 0, len(matched))
+	for _, i := range matched {
+		items = append(items, s.m.issueJSON(i))
+	}
+	writePage(w, r, spec, items)
 }
 
 func (s *Server) createIssue(w http.ResponseWriter, r *http.Request) {
@@ -400,6 +408,7 @@ func (s *Server) updateIssue(w http.ResponseWriter, r *http.Request) {
 	if body.Description != nil {
 		i.description = *body.Description
 		i.updated = s.m.now()
+		i.activities = append(i.activities, &activity{id: s.m.textActivityID(), category: catDescription, timestamp: i.updated, author: BotLogin})
 	}
 	for _, cf := range body.CustomFields {
 		v := s.m.stateByName(cf.Value.Name)
@@ -437,7 +446,7 @@ func (s *Server) addIssueTag(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	t := s.m.tagByID(body.ID)
-	if t == nil || !t.visibleTo(BotID) {
+	if t == nil || !t.visibleToBot() {
 		writeError(w, http.StatusBadRequest, "Bad Request", "unknown tag")
 		return
 	}
@@ -473,9 +482,15 @@ func (s *Server) listActivities(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if r.URL.Query().Get("categories") != "TagsCategory" {
-		writeError(w, http.StatusBadRequest, "Bad Request", "categories must be TagsCategory")
-		return
+	cats := map[string]bool{}
+	for _, c := range strings.Split(r.URL.Query().Get("categories"), ",") {
+		switch c {
+		case catTags, catIssueCreate, catSummary, catDescription, catCommentText:
+			cats[c] = true
+		default:
+			writeError(w, http.StatusBadRequest, "Bad Request", "unsupported activity category")
+			return
+		}
 	}
 	i := s.m.lookup(r.PathValue("id"))
 	if i == nil {
@@ -486,12 +501,37 @@ func (s *Server) listActivities(w http.ResponseWriter, r *http.Request) {
 	var items []map[string]any
 	for k := len(i.activities) - 1; k >= 0; k-- {
 		a := i.activities[k]
-		items = append(items, map[string]any{
-			"$type": "TagsActivityItem", "id": a.id, "timestamp": a.timestamp, "author": userJSON(a.author),
-			"added": s.m.tagsJSON(a.added), "removed": s.m.tagsJSON(a.removed),
-		})
+		if !cats[a.category] {
+			continue
+		}
+		items = append(items, s.m.activityJSON(a))
 	}
 	writePage(w, r, spec, items)
+}
+
+// activityJSON is the full wire object of an activity item. A null author is
+// the JSON null YouTrack sends for an edit it cannot attribute.
+func (m *model) activityJSON(a *activity) map[string]any {
+	var author any
+	if a.author != "" {
+		author = userJSON(a.author)
+	}
+	item := map[string]any{"id": a.id, "timestamp": a.timestamp, "author": author, "category": map[string]any{"id": a.category}}
+	switch a.category {
+	case catTags:
+		item["$type"] = "TagsActivityItem"
+		item["added"], item["removed"] = m.tagsJSON(a.added), m.tagsJSON(a.removed)
+	case catIssueCreate:
+		item["$type"] = "IssueCreatedActivityItem"
+	case catSummary:
+		item["$type"] = "SimpleValueActivityItem"
+	case catDescription:
+		item["$type"] = "TextMarkupActivityItem"
+	case catCommentText:
+		item["$type"] = "CommentActivityItem"
+		item["target"] = map[string]any{"$type": "IssueComment", "id": a.target}
+	}
+	return item
 }
 
 func commentJSON(c *comment) map[string]any {

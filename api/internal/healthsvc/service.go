@@ -74,6 +74,7 @@ const (
 type Store interface {
 	RecoveryStorageHealth(context.Context, store.RecoveryStorageHealthParams) ([]store.RecoveryStorageHealthRow, error)
 	ListEnabledRepoIDs(context.Context) ([]uuid.UUID, error)
+	ListEnabledLinkedRepoIDs(context.Context) ([]uuid.UUID, error)
 	// fleet.roll + fleet.disk read every worker with its roll-health join.
 	ListAllWorkers(ctx context.Context) ([]store.ListAllWorkersRow, error)
 	ListWorkerUpgradeBlockers(context.Context, []uuid.UUID) ([]store.ListWorkerUpgradeBlockersRow, error)
@@ -220,7 +221,9 @@ type Config struct {
 	// (a struct-literal test handler that never wired loops) makes loops degrade to `na`.
 	Registry          *BeatRegistry
 	ForgeSyncRegistry *SyncRegistry
-	ForgeSyncInterval time.Duration
+	// IssueTrackerSyncRegistry feeds issue_tracker.sync (linked repos' issue sync results).
+	IssueTrackerSyncRegistry *SyncRegistry
+	ForgeSyncInterval        time.Duration
 }
 
 // Service holds the injected deps plus the process-memory slack "first-saw-non-connected"
@@ -348,6 +351,7 @@ func (s *Service) Evaluate(ctx context.Context) (Doc, error) {
 		s.checkLoops(now),
 		s.checkForgeCIWatch(ctx, now),
 		s.checkForgeSync(ctx, now),
+		s.checkIssueTrackerSync(ctx, now),
 		s.checkSlackSocket(now),
 		s.checkSchedulesPaused(ctx, now),
 		s.checkMaintenanceActive(ctx),

@@ -211,3 +211,14 @@ describe("IssueCard — Start run and Options (PRD #3250 M2)", () => {
     expect(screen.getByRole("button", { name: "Start run" })).toBeTruthy();
   });
 });
+
+it("shows the issue key instead of #iid when the card carries one", () => {
+  const { container } = renderCard({ issue_key: "ABC-12" });
+  expect(container.textContent).toContain("ABC-12");
+  expect(container.textContent).not.toContain("#7");
+});
+
+it("shows #iid when the card has no issue key", () => {
+  const { container } = renderCard();
+  expect(container.textContent).toContain("#7");
+});

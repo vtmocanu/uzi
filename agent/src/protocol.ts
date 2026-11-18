@@ -1805,6 +1805,12 @@ export interface ClaimResponse extends ClaimMemoryState {
   kind?: RunKind;
   /** The worked issue for an issue run; null for a ci_fix run (no issue). */
   issue_iid: number | null;
+  /** PRD 4173: present only for an issue run on a repo linked to an external issue tracker (the
+   *  issue's key, e.g. "ABC-12"); `issue_iid` is then that issue's number in its project and `#<iid>`
+   *  on the code host is an unrelated forge issue. Its presence (any value) makes the run non-closing
+   *  and names the issue by key (linkedIssueKey in linked-issue.ts); client.ts normalises a present
+   *  non-string to "". Absent for every other run. */
+  issue_key?: string;
   /** Snapshotted at queue time so the run is self-contained (PRD §Schema). For a
    *  ci_fix run these carry a synthesized summary, not a real issue. */
   issue_title: string;

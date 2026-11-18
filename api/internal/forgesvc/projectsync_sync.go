@@ -69,6 +69,10 @@ func (s *ProjectSyncService) ForwardMove(ctx context.Context, repoID uuid.UUID, 
 		s.log.Warn("project sync: forward move load repo", "repo", repoID, "issue", issueIID, "error", err)
 		return nil
 	}
+	if repo.IssueTrackerConnectionID.Valid {
+		s.log.Info("project sync: forward move skipped, repo is linked to an issue tracker", "repo", repoID, "issue", issueIID)
+		return nil
+	}
 	if repo.ForgeType != string(forge.TypeGitHub) {
 		return nil
 	}
@@ -276,6 +280,10 @@ func (s *ProjectSyncService) ReverseSync(ctx context.Context, repoID uuid.UUID) 
 	repo, err := s.store.GetRepoByID(ctx, repoID)
 	if err != nil {
 		s.log.Warn("project sync: reverse load repo", "repo", repoID, "error", err)
+		return nil
+	}
+	if repo.IssueTrackerConnectionID.Valid {
+		s.log.Info("project sync: reverse sync skipped, repo is linked to an issue tracker", "repo", repoID)
 		return nil
 	}
 	if repo.ForgeType != string(forge.TypeGitHub) {
