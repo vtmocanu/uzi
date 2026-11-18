@@ -2,7 +2,7 @@
 // and delete. A secret's value is write-only: the API never returns it, the edit form
 // never prefills it, and nothing here renders one back.
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type ClipboardEvent } from "react";
 import { api, ApiError, isVaultLocked, type RunEnvList, type RunEnvVar, type RunEnvWriteInput } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
 import { Alert, Badge, Button, Input, Textarea, Toggle } from "./ui";
@@ -87,6 +87,19 @@ export function RepoEnvPanel({
     void load();
   }, [load]);
 
+  // After a paste switched the field to the textarea, focus it with the caret after the paste.
+  const caretAfterSwitch = useRef<number | null>(null);
+  const multiline = draft?.multiline;
+  useEffect(() => {
+    if (!multiline || caretAfterSwitch.current === null) return;
+    const el = document.getElementById("env-value") as HTMLTextAreaElement | null;
+    if (el) {
+      el.focus();
+      el.setSelectionRange(caretAfterSwitch.current, caretAfterSwitch.current);
+    }
+    caretAfterSwitch.current = null;
+  }, [multiline]);
+
   const startAdd = () => {
     setDraft({ ...EMPTY_DRAFT });
     setProblem(null);
@@ -124,10 +137,12 @@ export function RepoEnvPanel({
       } else {
         const flagChanged = draft.secret !== orig.secret;
         if (flagChanged) input.secret = draft.secret;
-        // Changing the flag always sends the value (the server refuses a secret-to-plain change
-        // without one); a secret that stays secret sends one only when re-entered; plain stays
-        // plain only when edited.
-        const sendValue = flagChanged ? true : draft.secret ? draft.value !== "" : draft.value !== (orig.value ?? "");
+        // Secret-to-plain always sends the value (the server refuses it without one). Plain-to-secret
+        // and plain-to-plain send it only when edited from the original, so a value the vault
+        // withholds (prefilled "") is resealed by the server instead of overwritten with "". A
+        // secret that stays secret sends one only when re-entered.
+        const sendValue =
+          flagChanged && !draft.secret ? true : draft.secret && orig.secret ? draft.value !== "" : draft.value !== (orig.value ?? "");
         if (sendValue) input.value = draft.value;
       }
       await api.putRepoEnv(repoId, draft.name, input);
@@ -174,6 +189,22 @@ export function RepoEnvPanel({
     }
   };
 
+  // A single-line input strips line breaks from a pasted value. Catch a paste that carries
+  // one, insert it at the selection (replacing any selected text) as LF, and switch to the
+  // textarea so the value survives; the effect above then restores focus and the caret.
+  const onSingleLinePaste = (e: ClipboardEvent<HTMLInputElement>) => {
+    const text = e.clipboardData.getData("text");
+    if (!draft || !hasLineBreak(text)) return;
+    e.preventDefault();
+    const input = e.currentTarget;
+    const start = input.selectionStart ?? draft.value.length;
+    const end = input.selectionEnd ?? start;
+    const pasted = text.replace(/\r\n?/g, "\n");
+    caretAfterSwitch.current = start + pasted.length;
+    setDraft({ ...draft, multiline: true, value: draft.value.slice(0, start) + pasted + draft.value.slice(end) });
+  };
+
+  const lockedOn = !!draft && draft.multiline && hasLineBreak(draft.value);
   const counts = list?.counts;
   const fieldErr = (field: string) =>
     problem && problem.field === field ? (
@@ -345,6 +376,7 @@ export function RepoEnvPanel({
                   spellCheck={false}
                   placeholder={draft.editing?.secret ? "Leave empty to keep the stored value" : undefined}
                   onChange={(e) => setDraft({ ...draft, value: e.target.value })}
+                  onPaste={onSingleLinePaste}
                 />
               )}
               {fieldErr("value")}
@@ -352,17 +384,23 @@ export function RepoEnvPanel({
                 <Toggle
                   label="Multiline"
                   checked={draft.multiline}
-                  disabled={draft.multiline && hasLineBreak(draft.value)}
+                  disabled={lockedOn}
+                  focusableWhenDisabled
+                  aria-describedby={
+                    [lockedOn && "env-multiline-locked", draft.multiline && "env-multiline-help"].filter(Boolean).join(" ") || undefined
+                  }
                   onChange={(next) => setDraft({ ...draft, multiline: next })}
                 />
                 <span>Multiline value</span>
               </div>
-              {draft.multiline && hasLineBreak(draft.value) && (
-                <p className="text-xs text-muted">Multiline stays on while the value contains a line break.</p>
+              {lockedOn && (
+                <p id="env-multiline-locked" className="text-xs text-muted">
+                  Multiline stays on while the value contains a line break.
+                </p>
               )}
               {draft.multiline && (
-                <p className="text-xs text-muted">
-                  Masking a multiline secret is not portable across browsers. Line endings are stored as LF.
+                <p id="env-multiline-help" className="text-xs text-muted">
+                  {draft.secret && "Masking a multiline secret is not portable across browsers. "}Line endings are stored as LF.
                 </p>
               )}
             </div>

@@ -68,8 +68,10 @@ Allowed: `DATABASE_URL`, cloud credentials such as `AWS_ACCESS_KEY_ID`,
 
 The value field is a single line by default; a secret is masked by a password
 field. Turn on **Multiline** for values with line breaks, such as PEM keys or
-JSON. In multiline mode masking is not portable across browsers, and line
-endings are stored as LF.
+JSON. Pasting a value that contains line breaks into the single-line field
+switches to Multiline automatically and keeps the line breaks. Line endings are
+stored as LF. A multiline secret is masked with CSS, which is not portable
+across browsers.
 
 ## Worked examples
 
@@ -112,7 +114,8 @@ A build can reference them, for example a `settings.xml` server entry:
 The agent or your repo scripts log in, for example:
 
 ```sh
-printf '%s' "$REGISTRY_PASSWORD" | docker login "$REGISTRY_HOST" -u "$REGISTRY_USER" --password-stdin
+printf '%s' "$REGISTRY_PASSWORD" | docker login "$REGISTRY_HOST" -u "$REGISTRY_USER" --password-stdin &&
+  docker pull "$REGISTRY_HOST/team/image:tag"
 ```
 
 Login persistence across commands is not yet available, so log in in the same

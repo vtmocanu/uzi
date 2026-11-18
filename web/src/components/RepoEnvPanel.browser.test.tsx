@@ -65,4 +65,28 @@ describe("RepoEnvPanel value field in a real browser", () => {
     expect(sent.value).toBe("line1\nline2\n");
     expect(sent.value).not.toContain("\r");
   });
+
+  it("pasting a multi-line value into the single-line field switches to multiline and saves it byte-exact with LF", async () => {
+    await openAdd();
+    await userEvent.type(screen.getByLabelText("Name"), "KEY_PEM");
+    const input = screen.getByLabelText("Value") as HTMLInputElement;
+    expect(input.tagName).toBe("INPUT");
+    input.focus();
+    const data = new DataTransfer();
+    data.setData("text/plain", "-----BEGIN KEY-----\r\nABCDEFGH\r-----END KEY-----\n");
+    input.dispatchEvent(new ClipboardEvent("paste", { clipboardData: data, bubbles: true, cancelable: true }));
+    await waitFor(() => expect((screen.getByLabelText("Value") as HTMLElement).tagName).toBe("TEXTAREA"));
+    await userEvent.click(screen.getByRole("button", { name: "Save variable" }));
+    await waitFor(() => expect(mockApi.putRepoEnv).toHaveBeenCalled());
+    expect(mockApi.putRepoEnv.mock.calls[0][2].value).toBe("-----BEGIN KEY-----\nABCDEFGH\n-----END KEY-----\n");
+  });
+
+  it("masks a multiline secret with CSS text security and leaves a plain multiline value readable", async () => {
+    await openAdd();
+    await userEvent.click(screen.getByRole("switch", { name: "Multiline" }));
+    const area = screen.getByLabelText("Value") as HTMLTextAreaElement;
+    expect(getComputedStyle(area).getPropertyValue("-webkit-text-security")).toBe("disc");
+    await userEvent.click(screen.getByRole("switch", { name: "Secret" }));
+    expect(getComputedStyle(screen.getByLabelText("Value")).getPropertyValue("-webkit-text-security")).not.toBe("disc");
+  });
 });

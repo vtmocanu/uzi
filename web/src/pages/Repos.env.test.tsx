@@ -124,6 +124,20 @@ async function openPanel(): Promise<HTMLElement> {
   });
 }
 
+// Like openPanel, but waits for the first listed variable instead of API_KEY.
+async function openPanel2(): Promise<HTMLElement> {
+  render(
+    <MemoryRouter>
+      <Repos />
+    </MemoryRouter>,
+  );
+  await screen.findByText("vtmocanu/uzi");
+  fireEvent.click(screen.getByRole("button", { name: "Environment variables for vtmocanu/uzi" }));
+  const g = await screen.findByRole("group", { name: "Environment variables for vtmocanu/uzi" });
+  await within(g).findByText("API_BASE_URL");
+  return g;
+}
+
 describe("Repos environment variables panel", () => {
   it("shows the live count on the repo row", async () => {
     render(
@@ -225,12 +239,51 @@ describe("Repos environment variables panel", () => {
     expect(value.tagName).toBe("TEXTAREA");
     expect(value.value).toBe("a\nb");
     const toggle = within(panel).getByRole("switch", { name: "Multiline" }) as HTMLButtonElement;
-    expect(toggle.disabled).toBe(true);
+    // Locked on but still focusable, and described by the hint and help texts.
+    expect(toggle.disabled).toBe(false);
+    expect(toggle.getAttribute("aria-disabled")).toBe("true");
+    const described = toggle.getAttribute("aria-describedby")!.split(" ").map((id) => document.getElementById(id)?.textContent);
+    expect(described.join(" ")).toContain("Multiline stays on while the value contains a line break.");
+    expect(described.join(" ")).toContain("Line endings are stored as LF.");
     fireEvent.click(toggle);
     expect(within(panel).getByLabelText("Value").tagName).toBe("TEXTAREA");
     // Once the line break is gone the toggle is free again.
     fireEvent.change(value, { target: { value: "ab" } });
-    expect((within(panel).getByRole("switch", { name: "Multiline" }) as HTMLButtonElement).disabled).toBe(false);
+    expect(within(panel).getByRole("switch", { name: "Multiline" }).getAttribute("aria-disabled")).toBeNull();
+  });
+
+  it("shows the browser-portability sentence for a multiline secret only", async () => {
+    const panel = await openPanel();
+    fireEvent.click(within(panel).getByRole("button", { name: "Add variable" }));
+    fireEvent.click(within(panel).getByRole("switch", { name: "Multiline" }));
+    expect(within(panel).getByText(/not portable across browsers/)).toBeTruthy();
+    fireEvent.click(within(panel).getByRole("switch", { name: "Secret" }));
+    expect(within(panel).queryByText(/not portable across browsers/)).toBeNull();
+    expect(within(panel).getByText("Line endings are stored as LF.")).toBeTruthy();
+  });
+
+  it("pasting a value with line breaks into the single-line field switches to multiline with LF", async () => {
+    const panel = await openPanel();
+    fireEvent.click(within(panel).getByRole("button", { name: "Add variable" }));
+    fireEvent.paste(within(panel).getByLabelText("Value"), { clipboardData: { getData: () => "a\r\nb\rc" } });
+    const value = within(panel).getByLabelText("Value") as HTMLTextAreaElement;
+    expect(value.tagName).toBe("TEXTAREA");
+    expect(value.value).toBe("a\nb\nc");
+  });
+
+  it.each([
+    ["a plain variable", BASE_URL],
+    ["a plain variable whose value the vault withholds", { ...BASE_URL, value: null, value_withheld: true }],
+  ])("flipping %s to secret without touching the value sends no value", async (_l, variable) => {
+    mockApi.listRepoEnv.mockResolvedValue(list([variable]));
+    mockApi.putRepoEnv.mockResolvedValue({ variable: { ...variable, secret: true } });
+    const panel = await openPanel2();
+    fireEvent.click(within(panel).getByRole("button", { name: "Edit API_BASE_URL" }));
+    fireEvent.click(within(panel).getByRole("switch", { name: "Secret" }));
+    fireEvent.click(within(panel).getByRole("button", { name: "Save variable" }));
+    await waitFor(() =>
+      expect(mockApi.putRepoEnv).toHaveBeenCalledWith("repo-uzi", "API_BASE_URL", { description: "Sandbox base URL", secret: true }),
+    );
   });
 
   it("switching a secret to plain with an empty value still sends the empty value", async () => {
