@@ -56,7 +56,7 @@ beforeEach(async () => {
   fs.chmodSync(path.dirname(bare), 0o700);
   fs.chmodSync(bare, 0o700);
   attempt = formatAttemptId(new Date("2026-01-01T00:00:00Z"), 1, "0000000000000001");
-  clonePath = dataPath("runner", "slug", `issue-4420.attempt-${attempt}`);
+  clonePath = `${git.runnerClonePath(bare, "issue-4420")}.attempt-${attempt}`;
   fs.mkdirSync(path.dirname(clonePath), { recursive: true });
 });
 afterEach(() => fx?.cleanup());
@@ -272,6 +272,20 @@ describe("baseline and the bare-config sources", () => {
 describe("attempt footprint and authority slot (a retired ledger entry is ended only with a verified missing footprint)", () => {
   const retire = () => cfg(`uzi-attempts.${BRANCH}.entry`, ledger("retired"));
   const slot = (over: Record<string, unknown> = {}) => ({ state: "ineligible", pending: null, retiring: null, publication: null, ...over });
+
+  it("a retired row whose path is not this bare's canonical attempt clone, or whose attempt id differs from the path's, is unknown", async () => {
+    const stray = dataPath("runner", "slug", `issue-4420.attempt-${attempt}`);
+    fs.mkdirSync(path.dirname(stray), { recursive: true });
+    cfg(`uzi-attempts.${BRANCH}.entry`, ledger("retired", RUN, stray));
+    assert.deepEqual(await classify(), unknown("attempt_ledger"), "an unrelated missing child is not an observed-absent footprint");
+    gitIn(["config", "--local", "--unset-all", `uzi-attempts.${BRANCH}.entry`]);
+    const other = formatAttemptId(new Date("2026-01-02T00:00:00Z"), 1, "0000000000000002");
+    cfg(`uzi-attempts.${BRANCH}.entry`, ledger("retired", RUN, clonePath, other));
+    assert.deepEqual(await classify(), unknown("attempt_ledger"), "an attempt id that differs from the path's");
+    gitIn(["config", "--local", "--unset-all", `uzi-attempts.${BRANCH}.entry`]);
+    retire();
+    assert.deepEqual(await classify(), ENDED, "positive control: the canonical path with a missing footprint is ended");
+  });
 
   it("retired with the clone directory present is active; with the skills sibling present is active", async () => {
     retire();

@@ -9,7 +9,7 @@ import { PassThrough } from "node:stream";
 import type { spawn, ChildProcess } from "node:child_process";
 import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { runPodEpochShadow, PodEpochSettlementError, RUN_LEAF_READ_MAX_MS } from "../src/pod-epoch-reclaim.js";
 import { PodEpochDaemonError, type PodEpochDaemonGuard } from "../src/pod-epoch-daemon.js";
@@ -1365,6 +1365,20 @@ test("#4420 kept: a broken loose recovery pin under the run's refs (one git list
     assert.equal(result.scratch.state, "ran");
     assert.deepEqual([...w.calls.discards], [], "the leaf is not deleted");
     assert.deepEqual(rw.classified, [RUN_A]);
+    assert.equal(result.scratch.deleted, 0);
+  });
+});
+
+test("#4420 kept: a retired ledger row naming an unrelated missing path (not the bare's canonical attempt clone) keeps the run leaf", FD_ONLY, async () => {
+  await withRunWorld([leafOf(RUN_A)], async (w, rw) => {
+    const clonePath = await seedRetiredAttempt(rw, RUN_A);
+    await settleOutboxRun(rw, RUN_A);
+    const row = JSON.parse(rw.gitIn(["config", "--get-all", `uzi-attempts.${RUN_BRANCH}.entry`]).split("\n").at(-1)!);
+    rw.gitIn(["config", "--local", "--add", `uzi-attempts.${RUN_BRANCH}.entry`,
+      JSON.stringify({ ...row, clonePath: join(dirname(dirname(clonePath)), "unrelated", basename(clonePath)) })]);
+    const result = await run(w);
+    assert.equal(result.scratch.state, "ran");
+    assert.deepEqual([...w.calls.discards], [], "the leaf is not deleted");
     assert.equal(result.scratch.deleted, 0);
   });
 });

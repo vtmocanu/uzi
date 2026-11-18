@@ -5058,7 +5058,7 @@ export class GitCache {
 
   private async classifyRunLocalRecords(runId: string, id: string, opts: EpochScratchRunRetentionOptions,
       limits: Required<EpochRetainedLimits>): Promise<RunRetention> {
-    const ledger: AttemptLedgerEntry[] = [];
+    const ledger: Array<AttemptLedgerEntry & { bare: string }> = [];
     let configBytes = 0;
     for (const bare of await this.retainedBares(undefined, { strict: true })) {
       this.checkRecoveryInterruption();
@@ -5089,7 +5089,7 @@ export class GitCache {
         return scanned;
       }, opts.signal);
       if ("state" in found) return found;
-      ledger.push(...found.ledger);
+      for (const entry of found.ledger) ledger.push({ ...entry, bare });
     }
     for (const entry of ledger) {
       if (entry.state !== "retired") return activeRetention(`ledger_${entry.state}`);
@@ -5097,6 +5097,16 @@ export class GitCache {
     // Keys of slots the ledger loop attributed to this run and judged ended (a verified missing footprint).
     const attributedEnded = new Set<string>();
     for (const entry of ledger) {
+      // The census's path/attempt identity contract, before any probe: a row naming a path that is not this bare's
+      // canonical attempt clone (or whose attempt id differs from the path's) would probe an unrelated location as
+      // missing, so the run is unknown, never ended.
+      const parsed = parseAttemptPath(entry.clonePath, path.resolve(this.runnerRoot));
+      const key = parsed?.key ?? "";
+      if (!parsed || parsed.attemptId !== entry.attemptId || entry.runId === "" || !/^[A-Za-z0-9_-]+$/.test(key) ||
+          this.clonePathShape(entry.clonePath, this.runnerClonePath(entry.bare, key))?.attemptId !== entry.attemptId ||
+          attemptGenerationEvidence(entry.attemptId).unreadable) {
+        return unknownRetention("attempt_ledger");
+      }
       // The footprint first: an authority slot never stands in for it.
       const footprint = await this.epochFootprintState(entry.clonePath);
       if (footprint === "present") return activeRetention("attempt_footprint");
