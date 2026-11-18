@@ -35286,8 +35286,8 @@ describe("M2 actualRunner credential replacement", () => {
             throw new Error(JSON.stringify({ events, applies, hooks, diagnostics: diagnostics.lines, messages: api.messages(claim.run_id) }), { cause: error });
           });
           if (publication === "baseline") {
-            // B's material reaches both redactors before B work: the run-message redactor
-            // (flight.secrets / redactText) and the log redactor.
+            // After the switch, B's material is registered with the Runner's run-message
+            // redactor (flight.secrets / redactText) and its log redactor.
             const redaction = actualFlight as unknown as { secrets: { values(): readonly string[] }; redactText: (text: string) => string };
             for (const secret of [next.access_token, next.capability]) {
               assert.ok(loggedSecrets.includes(secret), "Codex switch registers B material with the log redactor");
