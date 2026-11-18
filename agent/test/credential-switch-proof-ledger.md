@@ -3511,10 +3511,11 @@ Review rework c24bfa7fa71fccc439735e1cc62218a8a6af6ee8:
 - api/internal/handler/codex_switch_apply_log_livedb_test.go
   (`TestWorkerCodexApplyLogRedactionRouteLiveDB`) performs a real Codex apply
   through the authenticated apply route with slog set to the production JSON
-  handler (cmd/server/main.go:170), requires the response to carry B's access
-  token and capability, and requires the captured "worker credential switch
-  apply" line (worker_protocol.go:1868 logs `"result", res`) to carry
-  neither. The guard is `CredentialSwitchApplyResult.LogValue`
+  handler (cmd/server/main.go:170), requires the applied response to carry an
+  access token and capability (length only; the test does not compare them
+  with the target's plaintext), and requires the whole captured log, including
+  the "worker credential switch apply" line (worker_protocol.go:1864 logs
+  `"result", res`), to carry neither. The guard is `CredentialSwitchApplyResult.LogValue`
   (workersvc/credential_switch_apply.go:136); without it the JSON handler
   marshals the wire shape (:157–170), codex material included. `LogValue`
   exists at a233 (credential_switch_apply.go:134) but the result had no Codex
@@ -3540,19 +3541,22 @@ Runner and the Codex executor share one logger (agent/src/main.ts:763–764,
 :841), and the executor's `publishB` registers B with it again
 (codex/codex-executor.ts:3210–3214, :4139); the test gives the executor a
 no-op logger, so u19-agent-log-redactor isolates the Runner's copy, and the
-executor's copy is not controlled. `flight.runScopedSecrets.push` (terminal
-eviction, runner.ts:7615) is retention hygiene and not controlled. The Codex
+executor's copy is not controlled. `flight.runScopedSecrets.push` (runner.ts:17658;
+the terminal eviction it feeds is at runner.ts:7615) is retention hygiene and
+not controlled. The Codex
 apply route's server log stays free of B material through `LogValue` ((d)).
-The stopped settlement keeps both fixture secrets out of its acknowledgement
-and the server log (effect-injection); the test also asserts run messages and
-inputs stay free of them.
+The stopped settlement keeps the bound secret out of its acknowledgement and
+the server log (effect-injection; both mutants inject only the bound secret);
+the withdrawn target's absence there, and both secrets' absence from run
+messages and inputs, are asserted only. The test's failure messages say
+"bound secret" for either secret.
 
 Not credited (no qualifying class; for the owner batch): every other surface
 keeps the token out by construction, with no redaction or omission guard to
 remove — the server apply/preflight responses' non-token fields, the Codex
 switch feed message and journals (`TestCodexTransactionalApplyBundleLiveDB`
 asserts them), the apply route's error log (its errors wrap no material;
-the comment at worker_protocol.go:1863–1864 is inaccurate for Codex, where
+the comment at worker_protocol.go:1857–1858 is inaccurate for Codex, where
 B is decrypted before later apply errors, but its conclusion holds), the
 stopped route's run row and journals (compared by the U14–U17 snapshot,
 not checked for material), the worker client's fixed
