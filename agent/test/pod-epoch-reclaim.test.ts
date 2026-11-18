@@ -1469,13 +1469,16 @@ test("a refused reservation or a missing transaction keeps the source and admits
     assert.equal(w.spies.discards.length, 0); assert.equal(result.kept_after_refusal, 1); assert.equal(result.verdict, "partial");
   });
 });
-test("retire-scratch: an M1b downgrade to partial closes the retire gate; every bound parent is epoch_not_eligible and nothing runs", async () => {
+// #4263 review: a present parent is kept at nomination (no work slot); a gone parent takes a slot, so it drives the loop's own gate.
+for (const present of [true, false]) test(present
+  ? "retire-scratch: an M1b downgrade to partial closes the retire gate; a present parent is kept at nomination (settled_kept) and the phase stops epoch_not_eligible"
+  : "retire-scratch: an M1b downgrade to partial closes the retire gate; a gone parent's work slot is deferred epoch_not_eligible and nothing runs", async () => {
   const root = await mkdtemp(join(tmpdir(), "retire-gate-"));
   try {
     await chmod(root, 0o1700);
     const uuid = randomUUID();
     const name = `.retire-${uuid}`;
-    await mkdir(join(root, name, "clone"), { recursive: true });
+    if (present) await mkdir(join(root, name, "clone"), { recursive: true });
     const attemptId = formatAttemptId(new Date(Date.UTC(2026, 10, 5, 10, 10, 1)), 1, "0123456789abcdef");
     const clonePath = join(root, "slug", `issue-4263.attempt-${attemptId}`);
     const binding: RetireBinding = { v: 1, class: "owner_terminal", attemptId, runId: "run-1", branch: "agent/issue-4263", clonePath,
@@ -1518,12 +1521,20 @@ test("retire-scratch: an M1b downgrade to partial closes the retire gate; every 
       assert.deepEqual(spies, { reserve: [], tx: 0, bareLock: 0, discards: 0 });
       assert.equal(result.retire_scratch.state, "stopped", JSON.stringify(result.retire_scratch));
       assert.equal(result.retire_scratch.reason, "epoch_not_eligible");
-      // #4263 review: the present settled parent is kept at nomination (settled_kept, no work slot), so nothing is deferred.
-      assert.equal(result.retire_scratch.deferred, 0);
-      assert.equal(result.retire_scratch.kept, 1);
-      assert.deepEqual(result.retire_scratch.kept_by_reason, { settled_kept: 1 });
       assert.equal(result.retire_scratch.reclaimed, 0);
-      assert.deepEqual(result.retire_report.parents.map(p => [p.name, p.outcome, p.reason]), [[name, "kept", "settled_kept"]]);
+      assert.equal(result.retire_scratch.recovered, 0);
+      if (present) {
+        // The present settled parent is kept at nomination (settled_kept, no work slot), so nothing is deferred.
+        assert.equal(result.retire_scratch.deferred, 0);
+        assert.equal(result.retire_scratch.kept, 1);
+        assert.deepEqual(result.retire_scratch.kept_by_reason, { settled_kept: 1 });
+        assert.deepEqual(result.retire_report.parents.map(p => [p.name, p.outcome, p.reason]), [[name, "kept", "settled_kept"]]);
+      } else {
+        // The gone parent takes a work slot; the loop's eligibility stop defers it before any reservation.
+        assert.equal(result.retire_scratch.deferred, 1);
+        assert.equal(result.retire_scratch.kept, 0);
+        assert.deepEqual(result.retire_report.parents, []);
+      }
     });
   } finally { await rm(root, { recursive: true, force: true }); }
 });
