@@ -160,8 +160,8 @@ type Config struct {
 	// applied only to workers whose PVCs all carry the uzi.dev/placement: new stamp.
 	// "Set" means the selector or the tolerations is non-empty. For a stamped worker
 	// each field REPLACES (never merges with) the matching global field above. Parsed
-	// with the same validation as the global fields; unset, empty, "null", "{}" or "[]"
-	// means none.
+	// with the same validation as the global fields; unset, empty or "null" means none,
+	// as does "{}" for the selector and "[]" for the tolerations.
 	WorkerNewPlacementNodeSelector map[string]string
 	WorkerNewPlacementTolerations  []corev1.Toleration
 	// WorkerEphemeralRequest overrides the WORKER container's

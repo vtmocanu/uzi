@@ -194,7 +194,7 @@ spec:
               value: {{ toJson . | quote }}
             {{- end }}
             # The opt-in second placement (see values.yaml workers.newPlacement). The parent
-            # must be a map or null (null = off, and must not nil-pointer the reads below);
+            # must be a map or null (null = off; the field reads below run only for a map);
             # each field gets the same type guard as its global twin. Empty renders no env.
             {{- $newPlacement := .Values.workers.newPlacement }}
             {{- if not (or (kindIs "map" $newPlacement) (kindIs "invalid" $newPlacement)) }}

@@ -623,6 +623,12 @@ How the stamp works:
   placement, and so does a Docker pressure recycle, which keeps `/data`. Run-bound
   (ephemeral) workers get fresh volumes, so they move. Hibernation is unchanged.
 
+Before you start, check the worker StorageClass (`workers.storageClass`, or the cluster
+default when it is empty). It must use `volumeBindingMode: WaitForFirstConsumer`, or
+otherwise provision in the new pool's zone. With `Immediate` binding a recreated volume
+is provisioned before any pod asks for it and can land in the old zone, after step 2.4
+has already deleted the worker's data; the worker then stays Pending on the new pool.
+
 Procedure:
 
 1. Set `workers.newPlacement` (`nodeSelector` and `tolerations`) in your values. Nothing
@@ -639,10 +645,12 @@ Procedure:
    5. Start the controller again (restore its replicas and self-heal). On the following
       reconcile passes it creates the volumes stamped, re-renders the worker's
       Deployment with the new placement, and restores its replicas once the existing
-      placement guards permit; they wait for a fresh observation of the recreated
-      claims. The restore goes through the normal paced roll admission (roll evidence
+      placement guards permit: the controller does not start a worker pod over a
+      missing or Terminating volume, and waits until it has observed the recreated
+      claims live. The restore goes through the normal paced roll admission (roll evidence
       for the worker, a free roll slot in its pool, no other unpromoted canary), so it
-      can wait on that. The volumes bind in the new zone (`WaitForFirstConsumer`).
+      can wait on that. With a `WaitForFirstConsumer` StorageClass the volumes bind in the
+      new zone when the pod is scheduled.
    6. Confirm the worker is online on a new node, then uncordon it.
 3. When no unstamped worker remains, copy `newPlacement` into `workers.nodeSelector` and
    `workers.tolerations` first, then clear `newPlacement`.
@@ -651,7 +659,7 @@ Check which workers are stamped. Annotations are not shown by `-L`, so use:
 
 ```sh
 kubectl get pvc -n <worker namespace> \
-  -o custom-columns=NAME:.metadata.name,PLACEMENT:.metadata.annotations.uzi\.dev/placement
+  -o 'custom-columns=NAME:.metadata.name,PLACEMENT:.metadata.annotations.uzi\.dev/placement'
 ```
 
 Caveats:
