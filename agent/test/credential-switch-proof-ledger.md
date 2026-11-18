@@ -411,8 +411,8 @@ control is still absent, not that the functional criterion was deferred.
 | A reconciliation before strict persistence | C2 in earlier record |
 | Explicit owner Codex request, target ownership/kind and live-status admission | A4 credits request availability in four live statuses; U1 credits queued/paused/limit_wait/recovery_wait/claimed refusals, target usability and disabled target, the combined kind fence, a foreign API-key target, a foreign run and client-side CLI/web kind scoping. pool_wait, terminal statuses, pinned-without-secret, lane, no-live-worker, unsupported-worker and foreign-subscription refusals remain unvalidated; policy is the separate row below |
 | Same successful flight/generation/worktree with no new attempt, custody or release/reclaim | U2 effect-injection sensitivity controls (owner-extended decision 10, U2 only): claimRun, attempt directory, custody release, queued transition, worktree reassignment, through the real Runner success test; other effects and the fresh_B return not separately controlled |
-| Strict usable persistence, clear confirmation and continuation on A before teardown | R1–R4 credit three failed-save/inspection variants and empty applied-ACK; U3 credits the exact op, target, ownership before/after, combined nonce fence and no-remaining-pending guards; lost-reply clear and reopen-path guards not separately controlled |
-| Proven A root/tool reap before B material, login and model work; fresh CODEX_HOME | R5 credits unproven registered root pre-apply only; tool-only, other modes/phases and HOME clauses unvalidated |
+| Strict usable persistence, clear confirmation and continuation on A before teardown | R1–R4 credit three failed-save/inspection variants and empty applied-ACK; U3 credits op mismatch, target, claim_released ownership before/after, combined nonce fence and no-remaining-pending guards; pending-absent-before, other ownership legs, lost-reply clear and reopen's other guards not controlled |
+| Proven A root/tool reap before B material, login and model work; fresh CODEX_HOME | R5 (runner hold) and U4: executor reap proof for root and command-root failures, combined no-B-before-reap fence, distinct per-epoch HOME (b); in-flight tool callbacks, launcher must-not-exist and other phases not controlled |
 | Whole operation-scope/refresh/identity/capability/summary replacement and retired-A rejection | A2 credits one reader; A3 retained-A/Sub→Sub B-scope namespace isolation; R7 B dispatcher publication readiness; R8 retired API-key A reconcile release-request fence during B login; remaining mixed clauses unvalidated |
 | Exact saved-ID resume; confirmed-refusal-only fresh fallback and lineage; preservation re-hold | R6 credits uncertain-error classification only; confirmed-refusal/preserve companions positive, independent preservation and other clauses unvalidated |
 | Policy episode rejection at request and under apply lock | D74–D77 credit the two isolated owner cases and the same two conditions introduced after READY before apply; paused holds, concurrent interleavings and other policy clauses unvalidated |
@@ -1941,11 +1941,15 @@ e7263f3fc46ff8e1d9fc23248afb1ef05484214d. Coverage questions now contain only
 the pasted `git rev-parse HEAD` output and the unit name.
 
 Seam check after the default-branch merge: `git diff f1467ba56 HEAD` over the
-prior controls' production seam files changes `policy_hold.go` only in
+production files the prior controls mutate or trace (derived by listing every
+file path named in this ledger; full paths below) changes `policy_hold.go` only in
 `ReportPolicyHold`'s ephemeral teardown (:311 onward; the credited D74/D76
-anchors are at :189–195), `service.go` only in ephemeral-lease reads (claim,
-terminal report, teardown), `codex-executor.ts` only the progress-observer
-argument, and `runner.ts` only a comment. No prior mutation anchor is inside
+anchors are at :189–195), `api/internal/workersvc/service.go` only in
+ephemeral-lease reads (claim, terminal report, teardown),
+`agent/src/codex/codex-executor.ts` only the progress-observer argument,
+`agent/src/runner.ts` only a comment, `api/internal/handler/worker_protocol.go`
+only WorkerHeartbeat's lease argument (:692, off the traced stopped path) and
+`api/cmd/server/main.go` (cited only as a reference). No prior mutation anchor is inside
 a changed hunk, so prior controls were not re-run; the affected packages'
 positive tests are re-run in the m3 candidate-level checks.
 
@@ -1997,11 +2001,72 @@ passed typecheck and exited 1 at the named assertion.
 
 Unchanged candidate (primary clone, same test file): the six selected cases
 pass, 6/6, EXIT=0 (`.uzi/scratch/ctl-logs/u3-green.log`); all ten
-persist-clear cases passed in the coder's run; `npm run lint` in agent: 0
-warnings, 0 errors.
+`npm run lint` in agent: 0 warnings, 0 errors. (The other four persist-clear
+cases passed in the coder's unlogged run; no credit rests on that.)
 
-Credit: continuing on A after a failed save requires the exact pending
-operation and target, ownership before and after the clear, the same
-registration nonce (combined fence) and no remaining pending operation, plus
-R1–R4. Not credited here: lost-reply clear (existing variant, no control) and
-the reopen path's own guards.
+Credit: continuing on A after a failed save requires a matching pending op id
+and target, ownership (the claim_released leg) before and after the clear, the
+same registration nonce (combined fence, including the shared `guard()` term
+that reopen runs) and no remaining pending operation, plus R1–R4. Not
+credited: a pending operation that disappears before the clear (u3-op-before
+keeps the presence check), the hold/status/generation legs of `owned`, the
+lost-reply clear and reopen's other guards. The new variants do not assert that
+production read the changed value; the mutants show the gate.
+
+U3 checkpoint record: the coverage question carried a non-commit SHA
+(`5cd892025a6b…`, sent before the `git rev-parse HEAD` output returned). The
+owner confirmed the correct SHA: the published checkpoint ref equals
+5cd892025bdf867c7c43a4686381733eefcbdf55 and contains e7263f3fc46f…. The U3
+review notes above were folded into this entry with U4.
+
+### U4 — proven A root and tool reap before apply and B; fresh B home (2026-11-18)
+
+Baseline: a233 `agent/src/runner.ts`:25735–25738 refused every Codex switch
+(A1). The switch's reap gate is new; the provider-epoch HOME naming is not:
+`git show a233883de3c36bae2e940f999cd9d582889dad00:agent/src/codex/codex-executor.ts`
+:5247 already reads
+`const ownedDataRoot = path.join(homeRoot, "codex-data", \`${epochNamespace}-epoch-${epochIndex}\`);`
+(provider-epoch recreation). The candidate's identical line (:5693) is reached
+by the switch through `restartAndResume` → `startProviderEpoch(…, ++epochIndex, …)` (:4157).
+
+Mechanism: the switch's `teardown` closure (codex-executor.ts :4110–4128)
+disposes A's epoch (`tearDownEpoch`: `registry.reapProcesses` over every
+registered root, provider and command/tool alike, then terminal disposal) and
+sets `reaped` only when the registry is not left in `unverifiedEpochRegistries`
+(:4125–4126). The runner holds on `!reaped` (:17525, R5); `publishB` (:4131)
+and `restartAndResume` (:4148) also refuse without `reaped`.
+
+New test variant (this commit): `tool-reap-unproven` — "Codex real Runner holds
+API-key A to subscription B when an A tool root reap is unproven". A's real
+file-operation command root (`uzi-codex-fileop` under the command sandbox,
+registered kind `command`, launched via `launchRegisteredEffectRoot`) returns an
+unclean dispose, so its registered reap fails
+("command supervisor root disposal not clean") while A's provider reap stays
+clean. It shares root-reap-unproven's hold assertions (applies 0, teardown
+results `[false]`, no B auth, hold reports, event order). Both variants now also
+assert `providerAdmissions.length === 1` (no B provider launch).
+
+Command (agent, one-at-a-time export; candidate
+5cd892025bdf867c7c43a4686381733eefcbdf55 plus this commit's test file, sha256
+abc0af4aba05…): `npm run typecheck && node --import tsx --test
+--test-timeout=120000 --test-name-pattern='<pattern>' test/codex-executor.test.ts`.
+
+| Control | Kind | Mutation | Case(s) | Red at |
+|---|---|---|---|---|
+| u4-exec-reap | (d) guard | `reaped = true \|\| (…unverifiedEpochRegistries…)` (:4125) | root- and tool-reap-unproven | :34170 "unproven A reap cannot apply a switch" (1 vs 0), both |
+| u4-after-reap | redundant-fence guard | `!reaped` neutralized in the runner hold (:17525), `publishB` (:4131) and replacement preparation (:4148), the three copies of "no apply or B start before a proven reap" | root-reap-unproven | :34170 applies 1 vs 0 |
+| u4-fresh-home | (b) preservation sensitivity | `-epoch-${epochIndex}` suffix removed from the owned data root (:5693) | baseline API-key→subscription | :35271 "B provider uses a distinct owned HOME root" |
+
+Every mutant passed typecheck and exited 1 at the named assertion. Unchanged
+candidate, primary clone, same test file: all three cases pass, 3/3, EXIT=0
+(`.uzi/scratch/ctl-logs/u4-green.log`); agent `npm run lint` 0/0.
+
+Credit: A's tool (command) root reap failure and root reap failure each block
+apply and B through the executor's reap proof; the combined "no B before
+proven reap" fence; a distinct per-epoch B HOME on the switch path. Not
+credited: in-flight tool callbacks or pending launches at teardown
+(registry quiesce checks, no switch-time test); the new `providerAdmissions`
+assertion (every mutant fails earlier at applies); the production launcher's
+`mkdir -m 700` must-not-exist check (the rig injects the provider launch);
+"created after reap" beyond the combined fence. Sessions-only and `auth.json`
+exclusion remain credited by B1–B3.

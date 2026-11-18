@@ -32446,7 +32446,7 @@ describe("M2 actualRunner credential replacement", () => {
   for (const [oldClaim, target] of [[SUBSCRIPTION, API_KEY], [API_KEY, SUBSCRIPTION],
     [SUBSCRIPTION, { ...SUBSCRIPTION, generation: 20, chatgpt_account_id: "M2-B-account" }]] as const) {
     for (const phase of ["factory", "already-running-body"] as const) {
-      for (const publication of ["resume-cleanup-cancel", "resume-cleanup-shutdown", "resume-cleanup-followup", "resume-policy-ack-lost", "resume-policy-ack-pending", "resume-preserve-pending", "resume-preserve-nonce", "resume-preserve-sequence-refused", "resume-refuse-preserve", "resume-refuse-fresh", "resume-uncertain", "baseline", "clean-apply-uncertain", "clean-successor-epoch-advance", "clean-pending-disappears", "clean-stopped-lost-reply", "clean-stopped-unconfirmed", "clean-stopped-unsupported", "clean-stopped-withdrawn", "clean-stopped-already-paused", "root-reap-unproven", "preflight-target-mismatch", "preflight-foreign-op", "preflight-busy-ready", "preflight-transport-ready", "persist-clear-confirmed", "persist-clear-owner-lost", "persist-clear-nonce-changed", "persist-clear-rejected", "persist-clear-lost-reply", "persist-clear-empty-reply", "persist-clear-pending", "persist-clear-op-changed-before", "persist-clear-target-changed-before", "persist-clear-owner-lost-before", "inspect-missing-clear-confirmed", "inspect-unknown-clear-confirmed", "gated", "before-scope-clear", "after-scope-clear", "before-scope-install", "after-scope-install", "before-executor-publication", "before-Now-publication", "after-Now-publication", "before-B-preparation", "Now-finish-false", "publish-failure", "now-publish-failure", "login-failure", "subscription-refresh", "api-key-refresh", "subscription-refresh-prepare-failure", "subscription-refresh-cancel", "crash-after-a-teardown-recovery", "crash-apply-reply-lost-recovery", "crash-apply-ack-recovery", "crash-login-recovery"] as const) {
+      for (const publication of ["resume-cleanup-cancel", "resume-cleanup-shutdown", "resume-cleanup-followup", "resume-policy-ack-lost", "resume-policy-ack-pending", "resume-preserve-pending", "resume-preserve-nonce", "resume-preserve-sequence-refused", "resume-refuse-preserve", "resume-refuse-fresh", "resume-uncertain", "baseline", "clean-apply-uncertain", "clean-successor-epoch-advance", "clean-pending-disappears", "clean-stopped-lost-reply", "clean-stopped-unconfirmed", "clean-stopped-unsupported", "clean-stopped-withdrawn", "clean-stopped-already-paused", "root-reap-unproven", "tool-reap-unproven", "preflight-target-mismatch", "preflight-foreign-op", "preflight-busy-ready", "preflight-transport-ready", "persist-clear-confirmed", "persist-clear-owner-lost", "persist-clear-nonce-changed", "persist-clear-rejected", "persist-clear-lost-reply", "persist-clear-empty-reply", "persist-clear-pending", "persist-clear-op-changed-before", "persist-clear-target-changed-before", "persist-clear-owner-lost-before", "inspect-missing-clear-confirmed", "inspect-unknown-clear-confirmed", "gated", "before-scope-clear", "after-scope-clear", "before-scope-install", "after-scope-install", "before-executor-publication", "before-Now-publication", "after-Now-publication", "before-B-preparation", "Now-finish-false", "publish-failure", "now-publish-failure", "login-failure", "subscription-refresh", "api-key-refresh", "subscription-refresh-prepare-failure", "subscription-refresh-cancel", "crash-after-a-teardown-recovery", "crash-apply-reply-lost-recovery", "crash-apply-ack-recovery", "crash-login-recovery"] as const) {
         if (publication !== "baseline" && (phase !== "factory" || (oldClaim !== API_KEY && target !== API_KEY))) continue;
         if (publication === "subscription-refresh" && target.auth_mode !== "subscription") continue;
         if (publication === "api-key-refresh" && target.auth_mode !== "api_key") continue;
@@ -32473,7 +32473,10 @@ describe("M2 actualRunner credential replacement", () => {
         const cleanRetainedStop = cleanApplyUncertain || cleanPendingDisappears || successorEpochAdvance;
         if (cleanRetainedStop && (oldClaim !== API_KEY || target !== SUBSCRIPTION || phase !== "factory")) continue;
         const rootReapUnproven = publication === "root-reap-unproven";
-        if (rootReapUnproven && (oldClaim !== API_KEY || target !== SUBSCRIPTION || phase !== "factory")) continue;
+        // A's provider root reaps clean; a registered tool root of A (registry roots are shared) fails instead.
+        const toolReapUnproven = publication === "tool-reap-unproven";
+        const reapUnproven = rootReapUnproven || toolReapUnproven;
+        if (reapUnproven && (oldClaim !== API_KEY || target !== SUBSCRIPTION || phase !== "factory")) continue;
         const preflightRefusal = publication === "preflight-target-mismatch" || publication === "preflight-foreign-op";
         const targetMismatch = publication === "preflight-target-mismatch";
         const preflightRetry = publication === "preflight-busy-ready" || publication === "preflight-transport-ready";
@@ -32534,6 +32537,7 @@ describe("M2 actualRunner credential replacement", () => {
         : cleanApplyUncertain ? "Codex real Runner clean A teardown then uncertain apply parks ownership without custody hold"
         : cleanPendingDisappears ? `Codex real Runner pending op disappears after clean A teardown (${publication})`
         : rootReapUnproven ? "Codex real Runner holds API-key A to subscription B when the registered A root reap is unproven"
+        : toolReapUnproven ? "Codex real Runner holds API-key A to subscription B when an A tool root reap is unproven"
         : publication === "preflight-busy-ready" ? "Codex real Runner retries credential_busy then exact ready for the same operation"
         : publication === "preflight-transport-ready" ? "Codex real Runner retries uncertain transport then exact ready for the same operation"
         : targetMismatch ? "Codex real rollout preflight target_mismatch clears the exact operation and continues A"
@@ -32623,6 +32627,8 @@ describe("M2 actualRunner credential replacement", () => {
         const cleanPausedObservations: typeof cleanOwnership[] = [];
         const teardownResults: boolean[] = [];
         const failedRootReaps: Awaited<ReturnType<ReturnType<typeof trackedRoot>["root"]["reap"]>>[] = [];
+        const failedToolDisposals: { identity: string }[] = [];
+        const reapFailureCount = () => failedRootReaps.length + failedToolDisposals.length;
         const dispositions: { status: string; failure_reason?: string }[] = [];
         const scopeIdentityUncertain = installerBarrier();
         const unexpectedPreservePause = installerBarrier();
@@ -32694,11 +32700,11 @@ describe("M2 actualRunner credential replacement", () => {
             events.push("clean-owner-ACK");
             return { applied: true, credentialSwitchUncertain: true };
           }
-          if (rootReapUnproven && (body.status === "credential_switch_held" || body.status === "credential_switch_hold_settled")) {
+          if (reapUnproven && (body.status === "credential_switch_held" || body.status === "credential_switch_hold_settled")) {
             assert.equal(id, claim.run_id);
             assert.equal(body.claim_generation, 7);
             assert.deepEqual(teardownResults, [false], "hold ACK is independent of the real failed teardown proof");
-            assert.ok(failedRootReaps.length > 0);
+            assert.ok(reapFailureCount() > 0);
             holdReports.push({ runId: id, status: body.status, generation: body.claim_generation, opId: body.op_id });
             events.push(body.status);
             if (body.status === "credential_switch_held") {
@@ -32832,7 +32838,7 @@ describe("M2 actualRunner credential replacement", () => {
           preflights++; events.push("preflight");
           preflightRequests.push({ runId, claimGeneration: req.claimGeneration, registerNonce: req.registerNonce,
             opId: req.opId, targetSecretId: req.targetSecretId });
-          if (preflightRefusal || preflightRetry || rootReapUnproven)
+          if (preflightRefusal || preflightRetry || reapUnproven)
             preflightStorePresence = await CodexSessionStore.inspectSession(store, savedId);
           if (preflightRetry && preflights === 1) {
             const reply = publication === "preflight-busy-ready"
@@ -32856,7 +32862,7 @@ describe("M2 actualRunner credential replacement", () => {
             assert.equal(req.targetSecretId, "M2-target");
             assert.equal(preflights, pendingOp === "M2-op" ? 1 : 2);
           }
-          if (preflightRefusal || preflightRetry || rootReapUnproven || successorEpochAdvance) deliveredPreflightReplies.push(reply);
+          if (preflightRefusal || preflightRetry || reapUnproven || successorEpochAdvance) deliveredPreflightReplies.push(reply);
           return reply;
         };
         const applyRequests: { claimGeneration: number; opId: string }[] = [];
@@ -32869,7 +32875,7 @@ describe("M2 actualRunner credential replacement", () => {
           }
           applyRequests.push({ claimGeneration: req.claimGeneration, opId: req.opId });
           applies++;
-          if (rootReapUnproven) forbiddenUnprovenApply.resolve();
+          if (reapUnproven) forbiddenUnprovenApply.resolve();
           if (publication === "baseline") events.push("apply");
           if (successorEpochAdvance) {
             if (applies > 1) forbiddenSuccessorApply.resolve();
@@ -33124,6 +33130,13 @@ describe("M2 actualRunner credential replacement", () => {
             const dispose = root.dispose.bind(root);
             root.dispose = async (...disposeArgs) => {
               if (epoch === 0) { cleanupStarts++; events.push("A-cleanup-start"); cleanupEntered.resolve(); await cleanupContinue.promise; }
+              if (toolReapUnproven && epoch === 0) {
+                // The real supervisor's disposal is not proven clean; registeredRoot turns this into a failed reap.
+                const result = { ...(await dispose(...disposeArgs)), clean: false as const, reason: "M2 tool reap unproven" };
+                failedToolDisposals.push({ identity: (args[0] as CodexEffectLaunchSpec).identity });
+                events.push("A-reap-failed");
+                return result;
+              }
               const result = await dispose(...disposeArgs);
               if (result.clean) disposedEffects.add(epoch);
               if (epoch === 0) events.push("A-effect-disposed");
@@ -33359,7 +33372,7 @@ describe("M2 actualRunner credential replacement", () => {
               try {
                 const saved = await lease.persistRollout(bounds);
                 if (publication === "persist-clear-confirmed") persistBoundKind = saved.kind;
-                if (preflightRefusal || preflightRetry || rootReapUnproven) usableSaves.push(saved);
+                if (preflightRefusal || preflightRetry || reapUnproven) usableSaves.push(saved);
                 return saved;
               }
               finally {
@@ -33377,7 +33390,7 @@ describe("M2 actualRunner credential replacement", () => {
               teardownAttempts++;
               const result = await lease.teardown(bounds);
               teardownResults.push(result);
-              if (rootReapUnproven || cleanRetainedStop) events.push("lease-teardown-returned");
+              if (reapUnproven || cleanRetainedStop) events.push("lease-teardown-returned");
               // Remove only the pending target after the real lease joins; A remains committed.
               if (cleanPendingDisappears) {
                 pending = false;
@@ -34136,11 +34149,12 @@ describe("M2 actualRunner credential replacement", () => {
             await assert.rejects(retainedRootDispatch.prepare(), "A dispatch stays closed after retry timer clears");
           }
           assert.equal(b.transport.requests.length, 0, "B auth waits for A reap");
-          if (rootReapUnproven) {
+          if (reapUnproven) {
             const releasesBeforeRootFailure = credentialReleases;
             assert.equal(teardownAttempts, 1);
             assert.deepEqual(teardownResults, []);
             assert.deepEqual(failedRootReaps, []);
+            assert.deepEqual(failedToolDisposals, []);
             assert.equal(applies, 0);
             assert.equal(preflightStorePresence, "present");
             assert.equal(usableSaves.length, 1);
@@ -34156,9 +34170,17 @@ describe("M2 actualRunner credential replacement", () => {
             assert.equal(applies, 0, "unproven A reap cannot apply a switch");
             await withTimeout(running, 5000, "unproven real lease hold joins and settles");
             assert.deepEqual(teardownResults, [false], "actual lease reports failure outside its callback");
-            assert.ok(failedRootReaps.length > 0);
-            for (const result of failedRootReaps)
-              assert.deepEqual(result, { ok: false, error: { category: "tool", message: "M2 reap unproven" } });
+            assert.ok(reapFailureCount() > 0);
+            if (rootReapUnproven) {
+              assert.deepEqual(failedToolDisposals, []);
+              for (const result of failedRootReaps)
+                assert.deepEqual(result, { ok: false, error: { category: "tool", message: "M2 reap unproven" } });
+            } else {
+              assert.deepEqual(failedRootReaps, [], "provider root reap stays clean");
+              assert.ok(events.includes("A-reaped"), "A provider root reaped clean");
+              assert.ok(failedToolDisposals.length > 0, "an A tool root disposal failed");
+            }
+            assert.equal(providerAdmissions.length, 1, "no B provider launch while A reap is unproven");
             assert.equal(switchResult, undefined);
             assert.ok(switchError instanceof Error);
             assert.equal(switchError.name, "CredentialSwitchRetainedStop");
