@@ -33249,6 +33249,7 @@ describe("M2 actualRunner credential replacement", () => {
         let retiredATransportCounts: { before: number[]; after: number[] } | undefined;
         let bRefreshExpectedAtFinish: typeof bRefreshExpected | undefined;
         let bRefreshAnsweredBeforeFinish: boolean | undefined;
+        let ordinaryBRefreshesBeforeFinish: number | undefined;
         let retiredAAfterFinish: unknown;
         const bRefreshExpected: (Parameters<WorkerClient["refreshCodex"]>[2] | undefined)[] = [];
         const refreshDelivered = installerBarrier(), refreshResponded = installerBarrier();
@@ -33464,7 +33465,7 @@ describe("M2 actualRunner credential replacement", () => {
               if (resumeRefusal) await publicationBoundary("prepared");
             },
             finishB: async (...args) => {
-              assert.equal(ordinaryBRefreshes, 0, "no ordinary refresh before finishB");
+              ordinaryBRefreshesBeforeFinish = ordinaryBRefreshes;
               if (publication === "subscription-refresh") {
                 await withTimeout(refreshDelivered.promise, 5000, "B startup refresh delivered to auth owner");
                 assert.equal(refreshDeliveries, 1);
@@ -35368,6 +35369,7 @@ describe("M2 actualRunner credential replacement", () => {
               "B refresh expectation names B's account");
           }
           assert.equal(aRefreshesAfterFinish, 0, "no refreshCodex call carries A's capability after finishB");
+          assert.equal(ordinaryBRefreshesBeforeFinish, 0, "no ordinary refresh before finishB");
           assert.ok(retiredADenial);
           assert.equal(retiredADenial.refusal, true, "retired A summary guard refuses with TrustedExecutionRefusal");
           assert.ok(["summary credential authority changed", "codex credential authority retired"].includes(retiredADenial.message),
