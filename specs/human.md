@@ -328,6 +328,7 @@ Tracked as GitLab issue vtmocanu/uzi#23; PRD at `prds/done/23-web-ux-live-dashbo
 - Admin → Instance pins its section pills with the tabs as one block.
   - The pills are one sideways-scrolling row with a fade on the overflowing edge.
   - The pill for the section being read is highlighted with `aria-current="true"` and kept in view, tracked by IntersectionObserver with no scroll listener.
+- Admin → Workers pins the same shared section-pill row (`SectionPills`) with the same behaviour. (AI-synced 2026-11-18)
 - Judge pins its category chips with the bucket tabs on lg+, as one sideways-scrolling row with Clear outside the scrolling part, so an active filter is always clearable.
   - Below lg the chips stay in the page flow, and the pinned block carries a one-line "Filtered: <labels>" marker with its own clear while a filter is active.
 
