@@ -435,7 +435,7 @@ control is still absent, not that the functional criterion was deferred.
 | Stopped replay after withdrawn X/Y; resume/reclaim and incarnation changes | U16 credits refusal while Y is pending, the withdraw op fence against a delayed op-carrying X withdrawal ((b); op-less v1 withdrawals are unfenced by op), and refusal after resume (three copies), reclaim and re-registration; settlement after withdrawn X/Y is positive coverage only (no guard to remove) |
 | Stopped preservation of binding, journals, session, gates, questions and custody without input consumption/time banking | E1 base-journal deletion, E2 applied-input deletion, E3 custody timestamp corruption, E4 owner-discard/live-reference loss, E5 direct paused-time credit, E6 applied-switch journal deletion; U17 effect-injection for session id, gate presentation id and row, question id and message on the first stop, and a run-row write (`updated_at`) and presentation deletion on replay; other gate columns and other replay tables compared but not individually injected; Slack, `cross_checks` and other trigger-closure tables outside the snapshot |
 | Stopped known extra typed member and register_nonce case alias | D25–D56: four running/paused wire cases only |
-| Bounded strict stopped request, other forbidden combinations, op_id and minimal acknowledgement | Unvalidated |
+| Bounded strict stopped request, other forbidden combinations, op_id and minimal acknowledgement | U18 credits the 1 MiB inclusive bound, the single-value rule, op_id and unknown-field refusal (two copies each), expected_epoch on other statuses (two copies) and the minimal acknowledgement under a 64 KiB plan; null/missing fields and case aliases beyond D25–D56 not controlled |
 | Tokens absent from all inputs/acknowledgements/messages/logs | Targeted positive assertions present; qualifying controls and m4 security gates remain required |
 
 ## Baseline absence and the class (d) method boundary
@@ -3340,3 +3340,79 @@ this fixture seeds no cross check, so that path is not exercised (the run-row
 banking would be caught by the run compare, the `cross_checks` rewrite and the checker
 child's cancellation, a different run row, would not). `u17-first.log` (no SHA line) is the uncommitted first run, not
 evidence.
+
+### U18 — bounded strict stopped request, forbidden combinations, op_id and minimal acknowledgement (2026-11-18)
+
+Candidate 3b78045f6dc458906a63fd48e9b5c5e8ca8a901f adds
+api/internal/handler/codex_switch_stopped_request_livedb_test.go
+(`TestWorkerCodexStoppedRequestShapeRouteLiveDB`). Every leaf posts a raw body
+to the authenticated `/state` route of `setupStoppedGuardsRoute` after
+withdrawal. Refused leaves (body_over_bound, trailing_value, op_id_present,
+unknown_field, expected_epoch_on_running) require 400 and an unchanged
+snapshot (:52). body_at_bound (a body of exactly 1 MiB) requires acceptance
+(:67). minimal_ack_large_plan sets a 64 KiB `plan_md` and requires the
+`reportStoppedRoute` acceptance: a three-key envelope of at most 16 KiB whose
+run object has exactly id, status, claim_generation and hold_reason (:74).
+
+a233 reference: `worker_state_decode.go` and the stopped settlement do not
+exist at a233883de3c36bae2e940f999cd9d582889dad00, and a233's service.go has
+no `expected_epoch requires codex_switch_stopped` refusal, so the decoder,
+service and acknowledgement controls are class (d). The shared strict decoder
+`httpx.DecodeJSONStrictBounded` is identical at a233 (respond.go :133 bound
+check, :137 `DisallowUnknownFields`, :142 trailing-value check at both), so
+its copies are (b) preservation.
+
+Copy census (the route: `WorkerRunState` worker_protocol.go:1541 →
+`decodeWorkerState` → `SetStateReportWithReconciliation` → `setStateWithTx`
+→ `stopCodexSwitch`; no body-size middleware is mounted on the worker
+routes, handler.go:1210–1230):
+- 1 MiB body bound: the first `DecodeJSONStrictBounded(r, &raw, 1<<20)`
+  (worker_state_decode.go:19); the second decode re-reads the already bounded
+  value and adds no fence;
+- inclusive edge: respond.go:133 (`len(body) > limit`);
+- one JSON value: respond.go:142 in the first decode;
+- op_id: decoder `len(fields) != 4` (:31) and service `req.OpID != nil`
+  (codex_switch_stopped.go:24), two copies;
+- unknown field: decoder `len(fields) != 4` and `DisallowUnknownFields`
+  (respond.go:137) in the second decode, two copies;
+- expected_epoch on another status: decoder `EqualFold` loop (:41–44) and
+  service.go:4700–4701, two copies;
+- minimal acknowledgement: `stoppedSettlementAck` (worker_protocol.go:1786,
+  :2828) only.
+
+Command: `.uzi/scratch/u8tools/ctl.sh` (export of 3b78045f6, throwaway postgres
+`cdr-4202-u18pg`), from the export's api directory,
+`GOFLAGS='-p=1 -buildvcs=false' GOMAXPROCS=4 go test -race -count=1 -timeout=6m ./internal/handler -run '^TestWorkerCodexStoppedRequestShapeRouteLiveDB$/^<leaf>$' -v`.
+Diffs and logs: `.uzi/scratch/ctl-logs/u18-*.{diff,log}`; each mutant log ends
+`SHA=3b78045f6… EXIT=1`.
+
+| Control | Class | Mutation | Leaf | Red |
+| --- | --- | --- | --- | --- |
+| u18-body-bound | (d) | first decode limit `1<<20` → `1<<21` | body_over_bound | :52 "malformed stopped request status=200; want 400" |
+| u18-body-edge | (b) preservation | respond.go `len(body) > limit` → `>= limit` | body_at_bound | :67 "status=400; want accepted" |
+| u18-trailing | (b) preservation | respond.go trailing check → `false && …` | trailing_value | :52 "status=200; want 400" |
+| u18-op-id | redundant-fence (2 copies) | decoder `len(fields) != 4` → `< 4`; service `\|\| req.OpID != nil` removed | op_id_present | :52 "status=200; want 400" |
+| u18-unknown | redundant-fence (2 copies; httpx copy (b)) | decoder `len(fields) != 4` → `< 4`; `dec.DisallowUnknownFields()` removed from the strict-bounded decoder | unknown_field | :52 "status=200; want 400" |
+| u18-epoch-other | redundant-fence (2 copies) | decoder EqualFold check → `false && …`; service `req.ExpectedEpoch != nil` → `false && …` | expected_epoch_on_running | :52 "status=200; want 400" |
+| u18-minimal-ack | (d) | `ack = stoppedSettlementAck(run)` → the default ack with `disposition` set | minimal_ack_large_plan | :74 "stop acceptance mismatch: status=200 applied=false" |
+| u18-ack-full-run | (d) | the minimal ack kept but its `run` replaced by the full run DTO | minimal_ack_large_plan | :74 "stopped acknowledgement is not a bounded minimal envelope" |
+
+Unchanged candidate 3b78045f6: the new route test and the existing
+`TestWorkerStateStoppedStrictBody`, `TestStoppedSettlementAck` and
+`TestWorkerRunStateCodexSwitchStoppedRoute` pass (17 PASS lines, no FAIL or
+SKIP), `SHA=3b78045f6… EXIT=0` (`u18-green.log`); `task lint:api` 0 issues
+(`u18-lint-api.log`). Runtime: 4.31 s for the new test in that run (same
+worker, warm cache, migrated schema, one serial run; `u18-first.log` has no
+SHA line and includes migration). Hosted effect unmeasured.
+
+Credit: the stopped request is bounded at 1 MiB inclusive, must be one JSON
+value, refuses `op_id` and unknown fields, and `expected_epoch` is refused on
+any other status; the acceptance answers with the minimal acknowledgement,
+which stays under 16 KiB with a 64 KiB plan (the full DTO would not).
+
+Not credited: the redundant copies individually; `op_id: null`, missing or
+null authority fields and case aliases beyond U15/D25–D56 (the existing
+decoder unit test covers them without a control); the second strict decode's
+own bound and trailing checks (not independent fences); `expected_epoch`
+case variants (EqualFold) on other statuses; the 16 KiB acknowledgement
+bound under other large fields.
