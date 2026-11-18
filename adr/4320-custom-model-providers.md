@@ -142,6 +142,8 @@ So a gateway (or anyone who can make it answer with a redirect) could cause the 
 
 **Deferred: a loopback relay.** A relay on the worker would hold the key and refuse redirects, so the CLI would only ever talk to loopback. It is deferred to a separate issue the owner files, with its own design review. The advertisement and the guard test flip together in the change that lands it. Until then, provider runs cannot be used and any statement that they run is wrong.
 
+Ephemeral capability-gap provisioning also excludes provider-bound runs during this dormant phase. An ordinary ephemeral image cannot claim them and an online worker bound to a queued run is not reaped for lacking the provider capability. Activation must remove that temporary query exclusion along with enabling the worker capability.
+
 ## Consequences
 
 - Operators can allowlist gateway URLs and users can define, test, retire and select providers (Settings, `uzi provider use`, API).

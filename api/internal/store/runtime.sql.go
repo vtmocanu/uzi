@@ -15772,6 +15772,10 @@ WHERE r.status = 'queued'
   -- run's one uq_workers_ephemeral_run slot and never claim it, and the lane trigger
   -- (ListIsolatedQueuedRunsForEphemeral) could then never provision the worker that can.
   AND r.egress_profile_id IS NULL
+  -- PRD #4320: provider execution is not activated: ephemeral images do not advertise
+  -- claude_provider_v1. Lift this exclusion when activation lands. Until then a pod
+  -- could never claim this run and would consume its unique slot and the owner's cap.
+  AND r.model_provider_key_mode IS NULL
   -- #3000: draining or maintenance owners hold independently of stale-requeue grace.
   AND NOT COALESCE(
         r.worker_id IS NOT NULL AND r.kind <> 'cross_check'
