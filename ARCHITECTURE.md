@@ -1342,7 +1342,8 @@ chain in the diagram above, with no intervening `running`.
   provider revision is gone) is final for that run, and a manual resume of either is refused
   with 409. Neither falls back to a vendor credential. A gateway 429 or overload parks an
   issue run as `limit_wait` instead (1, 5, 15 minutes, then the owner). See
-  [adr/4320-custom-model-providers.md](adr/4320-custom-model-providers.md).
+  [adr/4320-custom-model-providers.md](adr/4320-custom-model-providers.md). Dormant until
+  activation lands: no worker advertises `claude_provider_v1` yet, so a provider run stays queued.
 
 - **running → recovery_wait → queued** (issue #1197): an SDK turn
   that comes back **positively empty** (zero reported turns, no model activity,

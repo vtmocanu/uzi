@@ -2949,7 +2949,8 @@ runs use your Anthropic token again (see
 [Use a provider as your Claude source](./providers.md#use-a-provider-as-your-claude-source)). It
 applies to runs you start afterwards and Codex runs are unaffected. Exit codes: 2 for usage errors
 (pass a name or id, or `--none`, not both), 4 when the provider is not found, 5 when it is retired,
-has no key or a disabled key, the feature is off, or the server answers `provider_source_unusable`.
+has no key or a disabled key, the feature is off, or the server answers `provider_source_unusable`
+(`use --none` only clears the selection, so it succeeds even with the feature off).
 `--json` prints `{"claude_provider_id", "name"}`. `run get` shows a `PROVIDER` row and cost as
 "unknown (custom provider)". Runs through a provider are currently blocked and stay queued; see [Model providers](./providers.md).
 
@@ -4124,8 +4125,9 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   URL from `UZI_PROVIDER_ALLOWED_BASE_URLS`, and the run resumes by itself once it is allowed
   again; `hold_reason: provider_binding_stale` means the provider's key or revision changed
   after the run was created, so it cannot continue. `run get` prints a `HOLD` row reading
-  `provider URL not allowed` or `provider binding changed`, with the next step (wait, or
-  `uzi run cancel` and start a new run), `run resume` is refused with a 409 for both, and neither
+  `provider URL not allowed` or `provider binding changed`; `run get --follow` and `run wait`
+  name the next step (wait, or `uzi run cancel` and start a new run). No worker claims a provider
+  run yet (activation is blocked), so these holds cannot occur until it lands. `run resume` is refused with a 409 for both, and neither
   falls back to an Anthropic token. See [Model providers](./providers.md#what-a-run-keeps).
   A `paused` run can also be **waiting because your credentials were reset**
   (`hold_reason: credentials_reset`): a Claude or chat run created before an

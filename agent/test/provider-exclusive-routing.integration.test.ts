@@ -338,7 +338,7 @@ describe("exclusive routing of the real CLI in provider mode (PRD #4320 module 7
     for (const target of ["same-origin sibling path", "second loopback server"] as const) {
       it(`${authStyle}: a 307 to a ${target} is not followed with the key`, {
         timeout: 120_000,
-        todo: "the pinned CLI follows a gateway 307 (see the characterization test); plan decision pending, capability not advertised",
+        todo: "the pinned CLI follows a gateway 307 (see the characterization test); owner decision: ship blocked, relay later; capability not advertised",
       }, async () => {
         const r = await redirectRun(authStyle, target);
         assert.ok(r.gatewayLines.some((l) => l.startsWith("POST /gw/anthropic/v1/messages")), "the gateway issued the redirect");

@@ -130,6 +130,10 @@ frozen binding, not whatever your source is later. CI-fix and handoff runs have 
 use your current source. Editing a provider's model map creates a new revision for later runs
 and older ones keep theirs.
 
+The rest of this section and the next two describe how a provider run behaves once workers
+support providers. Until then a provider run waits in the queue (see the note at the top of this
+page), and a revoked binding simply leaves it queued.
+
 Revocation takes effect at the run's **next claim**, not mid-claim, and cancelling is the
 immediate stop. If the operator removes the URL from the allowlist, the run pauses as
 `provider_destination_not_allowed` and resumes by itself once the URL is allowed again. If the
@@ -146,9 +150,11 @@ It does not park or retry.
 
 ### Usage and cost
 
-A run card names the provider the run used (or "(name unavailable)" when the name is not known for that view, for example after the provider was deleted), shows no
-Anthropic token for it, and hides the credential override. Usage and cost show as **unknown** for provider runs: the model names are the gateway's, so the
-vendor price table does not apply. Token counts are still recorded, and run, time and
+A run card names the provider the run used (or "(name unavailable)" when the name is not known
+for that view, for example after the provider was deleted; the TUI board's narrow column shows
+"(no name)"), shows no Anthropic token for it, and hides the credential override. Usage and cost
+show as **unknown** for provider runs: the model names are the gateway's, so the vendor price
+table does not apply. Token counts are still recorded, and run, time and
 concurrency limits still apply.
 
 ## Gateways behind a private CA
@@ -157,7 +163,8 @@ The Test probe trusts the operator's `workers.extraCA` bundle (the chart also mo
 api pod). Under the chart's `workers.uidSplit`, the Claude CLI runs as a different uid that
 cannot read that bundle, so `workers.extraCA` reaches only the worker process there, not the CLI.
 A private-CA gateway can therefore pass **Test** and still fail from a run on a uid-split worker.
-Workers without `uidSplit` and isolated-lane workers are covered. Ask your operator which applies.
+Workers without `uidSplit` are covered. (The isolated research lane refuses provider runs, so it
+never reaches a gateway.) Ask your operator which applies.
 
 ## Retire or delete
 
