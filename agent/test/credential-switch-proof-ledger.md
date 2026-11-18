@@ -419,7 +419,7 @@ control is still absent, not that the functional criterion was deferred.
 | Refresh lease/intent exclusion, account lock ordering and boundary reconciliation before revoke | D78/D79 credit isolated A coordination-lease and rotating-intent server checks; U8 credits alias and enablement (old/target) lock presence and NOWAIT keyword, the account lock and its NOWAIT against a reverse-order writer, the busy mapping, intent count/lock (A's account) and real admitted-refresh lease/intent redundant fences, and the executor A reconcile inside reconcileA before teardown (c); per-account lock isolation, the target account's intent check, the refresh admission's binding recheck in isolation and global lock sorting not controlled |
 | Post-switch release epoch and secret-hash authorization | B5/B6 preservation sensitivity controls below, through real worker apply and release routes; U9 credits the final reauthorization's presence (b) and placement after the material read (c) against a switch apply committed between the two authorizations (subscription A release path, service level); the API-key A path and the vault-locked branch after a switch not controlled |
 | Transactional frozen binding rewrite, capability revoke/remint and post-commit material response | U10 credits the zero-row fences (binding, mint redundant ×3, journal, stamp, message, last_seq), the commit-error check, material returned only after commit (c) and the persisted new hash, with the existing error-injection rollback test; A's refusal after remint by B5/B6; per-statement server-error returns (argued equivalent), the empty-AccessToken check and the caller's deferred rollback not separately controlled |
-| Ordinal-zero baseline, successor journal ordinal/capability relation and usage attribution | Positive assertions present; qualifying controls unvalidated |
+| Ordinal-zero baseline, successor journal ordinal/capability relation and usage attribution | U11 credits baseline-missing and baseline-match refusals, generation-scoped ordinal N+1 (restart per generation; N+1 surfaced via the primary key), journal epoch independence from the ordinal, and B usage attribution via the preserved clamp (b); per-field baseline comparisons and the uncommitted-ordinal clamp branch on the Codex path not controlled |
 | Atomic rollback, lost-reply replay, stale/foreign apply and target fences | Unvalidated |
 | Stopped-support negotiation, immutable expected-epoch latch and unsupported-response obligation | Unvalidated |
 | Stopped numeric epoch equality: stale/mismatched running and paused, applied successor | D controls: five individually executed cases above |
@@ -2585,3 +2585,77 @@ commit failure or a return placed before the commit is detected); the persisted
 capability hash is the newly minted one. Not credited: storage or power-loss
 durability (process-loss model only), concurrent readers' isolation beyond
 Postgres READ COMMITTED atomic commit, and the uncontrolled checks listed above.
+
+### U11 — ordinal-zero baseline, ordinal N+1 per generation, epoch independence, B usage attribution (2026-11-18)
+
+Baselines: `git show a233883de3c36bae2e940f999cd9d582889dad00:api/internal/workersvc/credential_switch_codex.go`
+fails (file absent; a233 refused every live Codex switch, runner.ts :25735–25738),
+and a233 `api/internal/store/queries/runtime.sql` has no
+`InsertCodexRunCredentialSwitchEpoch` (only the Anthropic
+`InsertRunCredentialSwitchEpoch` at :2400). So the Codex baseline check and the
+Codex journal's ordinal/epoch columns are new: class (d). The attribution clamp
+is old: a233 `api/internal/workersvc/usage_fold.go` :1004–1033
+(`clampCredentialEpochOrdinals`, `if sent <= *ceiling {` at :1027) is identical
+at the candidate (:1004–1035, :1027), so its control is a (b) preservation
+sensitivity control on the new Codex spend path.
+
+Mechanism (candidate):
+- Ordinal-zero baseline: preflight and apply read the generation's
+  `run_credential_epochs` row (`GetCodexClaimBaseline`), refuse
+  `baseline_missing` when absent (credential_switch_codex.go :144–147) and
+  `baseline_mismatch` unless `codexSwitchBaselineMatches` (:158; :357–389)
+  finds the ordinal-zero baseline, overlaid with the latest child of the same
+  generation, equal to the run's binding and epoch.
+- Ordinal N+1: the journal insert computes
+  `COALESCE(max(e.ordinal), 0) + 1` over the run's rows of the same claim
+  generation (runtime.sql :2456–2457, generated runtime.sql.go ~:11112); the
+  table's primary key rejects a duplicate ordinal.
+- Epoch independence: the journal records `r.codex_claim_epoch` (the post-mint
+  capability epoch), not the ordinal (runtime.sql :2462).
+- B usage attribution: frames carry the worker's `credential_epoch_ordinal`;
+  the append path keeps it only if that ordinal is already committed for the
+  current generation (usage_fold.go :1027), otherwise stores -1.
+
+Tests: existing `TestCodexSwitchPreflightLiveDB`
+(credential_switch_codex_livedb_test.go :15; leaves missing_baseline,
+binding_mismatch, epoch_mismatch; assertion :135),
+`TestCodexTransactionalApplyBundleLiveDB` (credential_switch_codex_apply_livedb_test.go
+:66; ordinal 1 / epoch 42, journal epoch :117–120, second switch ordinal 2 /
+epoch 43 at :140–143) and `TestCodexSwitchSpendJoinsAuthorityEpochLiveDB`
+(credential_switch_codex_spend_livedb_test.go :8; A spend at ordinal 0 / epoch
+41, B spend at ordinal 1 / epoch 42, `assertJoins` called at :63 and after a
+refold). New (a2bf58dae): `TestCodexSwitchOrdinalRestartsPerGenerationLiveDB`
+(credential_switch_codex_generation_ordinal_livedb_test.go): a first switch
+in generation G at ordinal 1, recovery by a fresh claim into G+1 (the fixture
+sets status running before the second owner request, as the first generation
+does), a second switch in G+1 must be ordinal 1 (:69), its journal row ordinal 1
+with the run's post-mint epoch (:79), and the G row still ordinal 1 (:83).
+
+Command (export of a2bf58dae, throwaway postgres `cdr-4202-u11pg`): from api,
+`GOFLAGS='-p=1 -buildvcs=false' GOMAXPROCS=4 go test -race -count=1 -timeout=6m
+./internal/workersvc -run '<selection>' -v`; diffs and logs
+`.uzi/scratch/ctl-logs/<log name>.{diff,log}`.
+
+| Control | Kind | Mutation | Selection | Red at |
+|---|---|---|---|---|
+| u11-ordinal-genscope | (d) guard | drop `AND e.claim_generation = r.claim_generation` from the ordinal subquery (generated runtime.sql.go) | generation-ordinal test | :69 "second-generation switch ordinal = 2, want 1 (ordinals restart per claim generation)" |
+| u11-ordinal-n1 | (d) behavioural mutation | `COALESCE(max(e.ordinal), 0) + 1` → `COALESCE(min(e.ordinal) * 0, 0) + 1` (always 1) | bundle | :140, the second switch's apply fails with `duplicate key … run_credential_switch_epochs_pkey` (the primary key is the backstop that caught the repeated ordinal), both leaves |
+| u11-epoch-indep | (d) behavioural mutation | the journal's `codex_claim_epoch` column takes the ordinal expression instead of `r.codex_claim_epoch` | bundle; spend | bundle :120 "journal used ordinal as capability epoch" (both leaves); spend :63 "B spend did not join the exact minted B epoch" |
+| u11-baseline-missing | (d) guard | `errors.Is(err, pgx.ErrNoRows)` → `false && …` (:145) | preflight missing_baseline | :135 "… codex credential switch preflight unavailable; want not_applied/baseline_missing" |
+| u11-baseline-match | (d) guard | `!codexSwitchBaselineMatches(…)` → `false && …` (:158) | preflight binding_mismatch, epoch_mismatch | :135 "preflight = {… Outcome:ready …}; want not_applied/baseline_mismatch", both |
+| u11-attrib-clamp | (b) **preservation sensitivity control** | `if sent <= *ceiling {` → `if false && …` (usage_fold.go :1027) | spend | :63 "spend rows did not join both authority snapshots" (B's frame stored unattributed) |
+
+Unchanged candidate a2bf58dae: the four tests pass, EXIT=0
+(`.uzi/scratch/ctl-logs/u11-green.log`); `task lint:api` 0 issues
+(`u11-lint-api.log`).
+
+Credit: a switch is refused without its generation's ordinal-zero baseline or
+when the baseline (with the latest same-generation child) does not match the
+run; ordinals are N+1 within a claim generation and restart in a new one; the
+journal records the minted capability epoch, distinct from the ordinal; B's
+usage joins the B journal row only once that ordinal is committed (preserved
+clamp). Not credited: the clamp's upper bound for an uncommitted ordinal on the
+Codex path (only the committed case is exercised here; the general clamp is
+#4201's), `codexSwitchBaselineMatches`'s individual field comparisons, and
+the u11-ordinal-n1 red as an ordinal assertion (it surfaced through the primary
+key).
