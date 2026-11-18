@@ -18327,13 +18327,14 @@ export class GitCache {
         this.checkRecoveryInterruption();
         for (const entry of snapshot) bytes += Buffer.byteLength(entry) + 1;
         if (bytes > limits.maxConfigBytes) return { reason: "bytes_cap" };
+        // Every config entry counts toward the record cap, as in the epoch metadata accounting, not only uzi records.
+        records += snapshot.length;
+        if (records > limits.maxRecords) return { reason: "records_cap" };
         if (expired()) return { reason: "deadline" };
         const bindings = await this.readRetireBindingsUnderLock(bare, snapshot);
         if (bindings.state !== "read") return { reason: "binding_unknown" };
         const ledger = await this.readAllAttemptLedgerRaw(bare, snapshot);
         this.checkRecoveryInterruption();
-        records += bindings.bindings.length + ledger.length;
-        if (records > limits.maxRecords) return { reason: "records_cap" };
         if (expired()) return { reason: "deadline" };
         for (const b of bindings.bindings) {
           if (b.parsed === undefined) return { reason: "binding_undecodable" };

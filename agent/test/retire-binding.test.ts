@@ -572,6 +572,13 @@ describe("compactAttemptLedger keeps cross-bare evidence (#4263)", () => {
       await expectSkipped(c, warns, "records_cap");
     });
 
+    it("the record limit counts every foreign config entry, not only uzi records", async () => {
+      addAt(y, yValue());
+      // y holds one uzi record but several ordinary entries (core.*) from git init --bare.
+      const { c, warns } = cacheWith({ compactForeignScanForTest: { maxRecords: 2 } });
+      await expectSkipped(c, warns, "records_cap");
+    });
+
     it("an expired deadline", async () => {
       addAt(y, yValue());
       let t = 0;
