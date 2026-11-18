@@ -1005,9 +1005,9 @@ func (m *Materializer) ensurePVCs(ctx context.Context, w protocol.DesiredWorker,
 		}
 		if err != nil && placementSet {
 			// AlreadyExists does not prove the existing claim carries the stamp we
-			// attempted, and this tick's decision was made without it. Do nothing
-			// more for the worker (no further claims, no Deployment render) and let
-			// the next observation decide.
+			// attempted, and this tick's decision was made without it. Defer further
+			// provisioning (no more claims or Deployment render) until the next
+			// observation decides placement.
 			m.log.Info("pvc already exists but is not attributed to the worker; deferring", "worker_id", w.ID, "pvc", pvc.Name)
 			return true, nil
 		}
@@ -1102,8 +1102,17 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 	// may scale a parked worker or delete its volumes. The claims are still created if
 	// missing, and the Secret above is never touched.
 	if w.Hibernation != nil {
-		if deferred, err := m.ensurePVCs(ctx, w, obs, ns, spec); deferred || err != nil {
+		deferred, err := m.ensurePVCs(ctx, w, obs, ns, spec)
+		if err != nil {
 			return err
+		}
+		if deferred {
+			// Claim attribution blocks provisioning and wake, not the guarded stop
+			// of a Deployment we already own. Never create or retarget one here.
+			if obs.HasDeployment && w.Hibernation.State == protocol.HibernationPreparing {
+				return m.reconcileHibernation(ctx, w, obs, ns, spec)
+			}
+			return nil
 		}
 		// A worker with no Deployment is placed only over claims live at the render
 		// size (deploymentPlacementBlocked), so an undersized retained claim must be
