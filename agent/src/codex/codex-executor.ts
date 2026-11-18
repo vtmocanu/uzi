@@ -288,8 +288,8 @@ const COMMAND_ENV_PATH = "/opt/uzi-toolchain/bin:/usr/local/sbin:/usr/local/bin:
 /** Keys a provisioned `toolEnv` entry may NEVER set in the credential-free command env.
  *  UNIONS the command boundary literals (PATH/TMPDIR/LANG/HOME — the scrubbed command
  *  identity pins these, and sdk-env.ts's PROTECTED_ENV_KEYS deliberately OMITS
- *  PATH/TMPDIR/LANG, so relying on it alone would leave those open) with a MIRROR of that
- *  module-private PROTECTED_ENV_KEYS set (the OAuth credential + the two ANTHROPIC_* keys +
+ *  PATH/TMPDIR/LANG, so relying on it alone would leave those open) with a MIRROR (a copy,
+ *  not an import) of that exported PROTECTED_ENV_KEYS set (the OAuth credential + the two ANTHROPIC_* keys +
  *  the browser flag and the two browser discovery paths), plus Docker endpoint/configuration keys owned by trusted startup wiring.
  *  So a hostile/malformed `toolEnv` can neither breach the command
  *  boundary NOR reintroduce a credential-adjacent key. PATH is additionally handled
@@ -312,7 +312,7 @@ export const COMMAND_ENV_PROTECTED_KEYS: ReadonlySet<string> = new Set([
   "GOCACHE",
   "npm_config_cache",
   "NPM_CONFIG_CACHE",
-  // Mirror of sdk-env.ts PROTECTED_ENV_KEYS (module-private there; cannot be imported).
+  // Mirror of sdk-env.ts PROTECTED_ENV_KEYS (exported there; copied here, not imported).
   "CLAUDE_CODE_OAUTH_TOKEN",
   "ANTHROPIC_API_KEY",
   "ANTHROPIC_AUTH_TOKEN",

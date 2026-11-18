@@ -64,6 +64,60 @@ Allowed: `DATABASE_URL`, cloud credentials such as `AWS_ACCESS_KEY_ID`,
 `NPM_TOKEN`, `GRADLE_OPTS`, `DOCKER_AUTH_CONFIG`, `NO_COLOR`. The full list is
 `fixtures/run-env/name-rules.json`.
 
+## Entering a value
+
+The value field is a single line by default; a secret is masked by a password
+field. Turn on **Multiline** for values with line breaks, such as PEM keys or
+JSON. In multiline mode masking is not portable across browsers, and line
+endings are stored as LF.
+
+## Worked examples
+
+These describe how the variables will be used once injection ships. Today they
+are only stored. All hosts are placeholders.
+
+### An API
+
+| Name | Kind | Value | Why |
+|---|---|---|---|
+| `EXAMPLE_API_URL` | plain | `https://api.example.com` | Not sensitive; the agent needs to see it. |
+| `EXAMPLE_API_KEY` | secret | the key | A credential; never shown again and redacted from output. |
+
+### A private Maven repository
+
+| Name | Kind | Value | Why |
+|---|---|---|---|
+| `MAVEN_REPO_URL` | plain | `https://maven.example.com/releases` | Not sensitive. Keep credentials out of it: rule 3 refuses a plain URL with a user or password. |
+| `MAVEN_REPO_USER` | plain | the user name | Usually not sensitive. Make it secret if the name itself is. |
+| `MAVEN_REPO_PASSWORD` | secret | the password | A credential; at least 8 characters. |
+
+A build can reference them, for example a `settings.xml` server entry:
+
+```xml
+<server>
+  <id>example</id>
+  <username>${env.MAVEN_REPO_USER}</username>
+  <password>${env.MAVEN_REPO_PASSWORD}</password>
+</server>
+```
+
+### A container registry
+
+| Name | Kind | Value | Why |
+|---|---|---|---|
+| `REGISTRY_HOST` | plain | `registry.example.com` | Not sensitive; keeping it plain leaves it readable in logs. |
+| `REGISTRY_USER` | plain | the user name | Usually not sensitive. |
+| `REGISTRY_PASSWORD` | secret | the password or token | A credential. |
+
+The agent or your repo scripts log in, for example:
+
+```sh
+printf '%s' "$REGISTRY_PASSWORD" | docker login "$REGISTRY_HOST" -u "$REGISTRY_USER" --password-stdin
+```
+
+Login persistence across commands is not yet available, so log in in the same
+command that uses the registry.
+
 ## Edit, disable, delete
 
 1. **Edit** without a new value changes only the description; entering a value replaces it.
