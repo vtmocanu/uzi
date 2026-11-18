@@ -551,7 +551,7 @@ export class ChatExecutor {
       return finishTurn(this, ctx, turnTimer, onCancel, { sessionId: turnSessionId, outcome: "timeout" });
     }
     if (sawError) {
-      // PRD #4320 D15: a provider chat turn that ends on a gateway 429 or overload names the provider
+      // PRD #4320 Decision Log "Chat gateway limits end the turn without parking": a provider chat turn that ends on a gateway 429 or overload names the provider
       // gateway limit, never a subscription reset. The turn ends the ordinary chat way: no park, no
       // auto-retry, no pool or vendor-meter write.
       const status = (resultFrame as { api_error_status?: unknown } | undefined)?.api_error_status;
