@@ -433,7 +433,7 @@ control is still absent, not that the functional criterion was deferred.
 | Stopped refusal of claimed status | D25–D56: running/paused status_claimed; U15 credits refusal of queued, limit_wait, pool_wait, recovery_wait, completed, failed and cancelled (running origin) |
 | Stopped ownership, lane and policy fences | D57–D60 credit pending-fresh/unresolved-outcome; D61 paused policy-hold; D62/D63 stable user-owner mismatch running/paused. D64–D73 credit the five enumerated STOP lane exclusions running/paused; U16 credits concurrent late controls (worker-row by the worker lock, run-row by the run locks alone, (b)) and the running policy hold; paused-origin replay under concurrency and op-less withdrawals not covered; owner writers that take no worker or run row lock not covered |
 | Stopped replay after withdrawn X/Y; resume/reclaim and incarnation changes | U16 credits refusal while Y is pending, the withdraw op fence against a delayed op-carrying X withdrawal ((b); op-less v1 withdrawals are unfenced by op), and refusal after resume (three copies), reclaim and re-registration; settlement after withdrawn X/Y is positive coverage only (no guard to remove) |
-| Stopped preservation of binding, journals, session, gates, questions and custody without input consumption/time banking | E1 base-journal deletion, E2 applied-input deletion, E3 custody timestamp corruption, E4 owner-discard/live-reference loss, E5 direct paused-time credit, E6 applied-switch journal deletion; U17 effect-injection for session id, gate presentation id and row, question id and message on the first stop, and run-row and presentation effects on replay; other gate columns and other replay tables compared but not individually injected; Slack, `cross_checks` and other trigger-closure tables outside the snapshot |
+| Stopped preservation of binding, journals, session, gates, questions and custody without input consumption/time banking | E1 base-journal deletion, E2 applied-input deletion, E3 custody timestamp corruption, E4 owner-discard/live-reference loss, E5 direct paused-time credit, E6 applied-switch journal deletion; U17 effect-injection for session id, gate presentation id and row, question id and message on the first stop, and a run-row write (`updated_at`) and presentation deletion on replay; other gate columns and other replay tables compared but not individually injected; Slack, `cross_checks` and other trigger-closure tables outside the snapshot |
 | Stopped known extra typed member and register_nonce case alias | D25–D56: four running/paused wire cases only |
 | Bounded strict stopped request, other forbidden combinations, op_id and minimal acknowledgement | Unvalidated |
 | Tokens absent from all inputs/acknowledgements/messages/logs | Targeted positive assertions present; qualifying controls and m4 security gates remain required |
@@ -3330,13 +3330,13 @@ gate and question state is written directly on a running run, which
 production reaches only through the gate and question writers; it is not
 internally coherent (revision 2 with no revision-1 row, a one-byte digest,
 an open question outside awaiting_input), which the stop predicate does not
-read; awaiting_approval and awaiting_input origins, whose trigger closure
-differs, are not exercised. The most security-relevant state outside the
+read; awaiting_approval, awaiting_input and awaiting_followup origins, whose
+trigger closure differs, are not exercised. The most security-relevant state outside the
 snapshot is `cross_checks`: on running → paused the
 `settle_exited_plan_cross_check` / `settle_exited_code_cross_check`
 triggers (00432) stamp interruption, fail a pending verdict, cancel the
 checker child and bank wait time into the lead's `budget_paused_seconds`;
 this fixture seeds no cross check, so that path is not exercised (the run-row
-banking would be caught by the run compare, the `cross_checks` rewrite would
-not). `u17-first.log` (no SHA line) is the uncommitted first run, not
+banking would be caught by the run compare, the `cross_checks` rewrite and the checker
+child's cancellation, a different run row, would not). `u17-first.log` (no SHA line) is the uncommitted first run, not
 evidence.
