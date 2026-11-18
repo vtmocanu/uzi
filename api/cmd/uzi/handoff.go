@@ -215,7 +215,7 @@ func resolveHandoffRepo(env Env, ctx context.Context, c uzicli.Client, repoFlag 
 	path := parseRepoPath(origin)
 	if path == "" {
 		return "", uzicli.Exitf(uzicli.ExitUsage,
-			"could not parse origin %q into an owner/repo path; handoff pushes local HEAD to origin, so it must be a resolvable remote", origin)
+			"could not parse origin %q into an owner/repo path; handoff pushes local HEAD to origin, so it must be a resolvable remote", redactOrigin(origin))
 	}
 	info, err := parseRemote(origin)
 	if err != nil {
@@ -317,7 +317,7 @@ type remoteInfo struct {
 func parseRemote(remote string) (remoteInfo, error) {
 	s := strings.TrimSpace(remote)
 	refuse := func(why string) (remoteInfo, error) {
-		return remoteInfo{}, fmt.Errorf("origin %q is not supported for handoff (%s); handoff pushes local HEAD to origin and must verify its host, so use an https or ssh remote", remote, why)
+		return remoteInfo{}, fmt.Errorf("origin %q is not supported for handoff (%s); handoff pushes local HEAD to origin and must verify its host, so use an https or ssh remote", redactOrigin(remote), why)
 	}
 	if s == "" || strings.HasPrefix(s, "[") {
 		return refuse("unrecognized remote")
@@ -403,6 +403,25 @@ func parseRemote(remote string) (remoteInfo, error) {
 	return info, nil
 }
 
+// redactOrigin drops the userinfo of a URL-form origin, so a password or token
+// embedded in it never reaches an error message. scp-like origins carry no password.
+func redactOrigin(remote string) string {
+	i := strings.Index(remote, "://")
+	if i < 0 {
+		return remote
+	}
+	rest := remote[i+3:]
+	auth := rest
+	if j := strings.IndexAny(rest, "/?#"); j >= 0 {
+		auth = rest[:j]
+	}
+	at := strings.LastIndex(auth, "@")
+	if at < 0 {
+		return remote
+	}
+	return remote[:i+3] + "<redacted>@" + rest[at+1:]
+}
+
 // gitSSHPath applies git's ssh path rule: "/~user/repo" is sent as "~user/repo".
 func gitSSHPath(p string) string {
 	if len(p) > 1 && p[0] == '/' && p[1] == '~' {
@@ -412,10 +431,21 @@ func gitSSHPath(p string) string {
 }
 
 // receivePackCommand is the remote command git push runs over ssh for path: the default
-// receive-pack program with the path single-quoted as git's sq_quote does. ssh -G gets it
+// receive-pack program with the path single-quoted as git's sq_quote does (' and ! leave
+// the quotes as \' and \!). ssh -G gets it
 // so that Match command / sessiontype rules resolve as they will for the push.
 func receivePackCommand(path string) string {
-	return "git-receive-pack '" + strings.ReplaceAll(path, "'", `'\''`) + "'"
+	var b strings.Builder
+	b.WriteString("git-receive-pack '")
+	for _, r := range path {
+		if r == '\'' || r == '!' {
+			b.WriteString(`'\` + string(r) + `'`)
+			continue
+		}
+		b.WriteRune(r)
+	}
+	b.WriteString("'")
+	return b.String()
 }
 
 // hasSpaceOrControl reports whether s holds any whitespace or control rune (newline, tab,
@@ -497,7 +527,7 @@ func (o *originHost) compute(ctx context.Context, env Env) (string, error) {
 		return info.host, nil
 	}
 	refuse := func(format string, a ...any) (string, error) {
-		return "", uzicli.Exitf(uzicli.ExitUsage, "origin %q: "+format+"; use an https remote instead", append([]any{o.origin}, a...)...)
+		return "", uzicli.Exitf(uzicli.ExitUsage, "origin %q: "+format+"; use an https remote instead", append([]any{redactOrigin(o.origin)}, a...)...)
 	}
 	// (a) transport overrides change where ssh actually connects, in ways ssh -G cannot see.
 	for _, k := range []string{"GIT_SSH", "GIT_SSH_COMMAND"} {

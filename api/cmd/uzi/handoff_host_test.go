@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"os"
 	"os/exec"
 	"reflect"
 	"strings"
@@ -55,7 +56,7 @@ func TestParseRemote(t *testing.T) {
 	} {
 		if got, err := parseRemote(in); err == nil {
 			t.Errorf("parseRemote(%q) = %+v, want refusal", in, got)
-		} else if in != "" && !strings.Contains(err.Error(), in) {
+		} else if in != "" && !strings.Contains(err.Error(), redactOrigin(in)) {
 			t.Errorf("refusal for %q should name the origin: %v", in, err)
 		}
 	}
@@ -244,8 +245,17 @@ func TestHandoffOriginHostTimeout(t *testing.T) {
 	tc := hostCase{
 		origin: "git@github.com:acme/widgets.git",
 		stubFn: func(ctx context.Context, _ []string) (string, error) {
-			<-ctx.Done()
-			return "", ctx.Err()
+			if _, ok := ctx.Deadline(); !ok {
+				t.Error("ssh -G ran without a deadline")
+				return "", errors.New("no deadline")
+			}
+			select {
+			case <-ctx.Done():
+				return "", ctx.Err()
+			case <-time.After(5 * time.Second):
+				t.Error("ssh -G deadline did not fire")
+				return "", errors.New("deadline did not fire")
+			}
 		},
 	}
 	fc, rec, stderr, code := runHostCase(t, tc)
@@ -312,6 +322,13 @@ func TestHandoffMixedHostSamePath(t *testing.T) {
 // The classification of `git config --get core.sshCommand` must hold for the real git:
 // unset is exit status 1 (absent); set to the empty string succeeds (present).
 func TestSSHCommandConfiguredRealGit(t *testing.T) {
+	// Inherited location or config-injection variables (a hook, git bisect run) would
+	// point these real git calls at the caller's repository.
+	for _, k := range []string{"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+		"GIT_COMMON_DIR", "GIT_CONFIG", "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"} {
+		t.Setenv(k, "")
+		_ = os.Unsetenv(k)
+	}
 	t.Setenv("GIT_CONFIG_GLOBAL", "/dev/null")
 	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
 	dir := t.TempDir()
@@ -394,6 +411,7 @@ func TestReceivePackCommandMatchesGit(t *testing.T) {
 		{"ssh://git@github.com/~acme/widgets.git", "git-receive-pack '~acme/widgets.git'"},
 		{"git@github.com:/~acme/widgets.git", "git-receive-pack '~acme/widgets.git'"},
 		{"git@github.com:acme/wid'gets.git", `git-receive-pack 'acme/wid'\''gets.git'`},
+		{"git@github.com:acme/w!gets.git", `git-receive-pack 'acme/w'\!'gets.git'`},
 	}
 	for _, tc := range cases {
 		info, err := parseRemote(tc.origin)
@@ -402,6 +420,26 @@ func TestReceivePackCommandMatchesGit(t *testing.T) {
 		}
 		if got := receivePackCommand(info.path); got != tc.want {
 			t.Errorf("%s: command %q, want %q", tc.origin, got, tc.want)
+		}
+	}
+}
+
+func TestHandoffRefusalRedactsOriginCredentials(t *testing.T) {
+	const secret = "s3cr3t-sentinel"
+	for _, origin := range []string{
+		"ssh://git:" + secret + "@github.com/acme/widgets.git",
+		"https://x:" + secret + "@other.example/acme/widgets.git",
+		"git://x:" + secret + "@github.com/acme/widgets.git",
+	} {
+		_, _, stderr, code := runHostCase(t, hostCase{origin: origin})
+		if code != uzicli.ExitUsage {
+			t.Fatalf("%s: exit=%d, want usage refusal", origin, code)
+		}
+		if strings.Contains(stderr, secret) {
+			t.Errorf("refusal leaks the credential: %s", stderr)
+		}
+		if !strings.Contains(stderr, "origin") {
+			t.Errorf("refusal lost its reason: %s", stderr)
 		}
 	}
 }

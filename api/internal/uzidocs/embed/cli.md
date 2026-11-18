@@ -1888,8 +1888,13 @@ watch it with `uzi run get`/`uzi run logs --follow`, or drop into
 ### Origin matching
 
 Because the push goes to `origin`, the connected repo must be the one `origin`
-really points at: its owner/repo path **and** its host must match. `--repo`
-never bypasses this; it only picks among repos that already match.
+fetches from: its owner/repo path **and** its host must match. The check reads
+only the fetch URL (`git remote get-url origin`). It does not check a push URL,
+a `pushInsteadOf` rewrite, extra `remote.origin.url` values or a custom
+`remote.origin.receivepack`, so with any of those the push can go elsewhere.
+Check the push destination with `git remote get-url --push --all origin` before
+you run handoff. `--repo` never bypasses this check; it only picks among repos
+that already match.
 
 - **https / http origin:** the host must equal the host of the forge's web URL.
 - **SSH origin (scp-like `git@host:owner/repo` or `ssh://`):** the host your SSH
