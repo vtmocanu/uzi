@@ -164,12 +164,19 @@ function expectRowPinned() {
   expect(r.bottom, "row bottom inside the block").toBeLessThanOrEqual(b.bottom + 0.5);
   expect(r.top, "row top on screen").toBeGreaterThanOrEqual(0);
   expect(r.bottom, "row bottom on screen").toBeLessThanOrEqual(window.innerHeight);
+  // Under the tabs: the Admin tab row shares the block, on screen, directly above the pills.
+  const tab = block.querySelector<HTMLElement>('a[href="/admin/users"]');
+  expect(tab, "the Admin tabs are in the pinned block").not.toBeNull();
+  const t = tab!.getBoundingClientRect();
+  expect(t.top, "tabs on screen").toBeGreaterThanOrEqual(0);
+  expect(t.bottom, "tabs above the pill row").toBeLessThanOrEqual(r.top + 0.5);
 }
 
 // Near-page-end deep link: a tall viewport so the last cards fit below the reading line and the
 // page cannot scroll a non-final target up to it. Per-width because card heights differ.
-// Measured while choosing: at 1440x1100 the clamped target sat only ~4px below the line
-// (120), and at 400x1400 the page was not yet clamped (the target landed above the line, 173).
+// Measured while choosing: at 1440x1100 the clamped target sat only ~4px below the reading
+// line (120px from the viewport top), and at 400x1400 the page was not yet clamped (the target
+// landed above the reading line, 173px).
 // 1440x1200 and 400x1700 clamp the page with the target below the line. The in-test
 // precondition asserts that, so a card-height change that breaks the setup fails loudly
 // instead of passing vacuously.
@@ -256,6 +263,7 @@ for (const width of [1440, 400]) {
       // Precondition: the page could not bring the target up to the reading line.
       await nextFrame();
       expect(target.getBoundingClientRect().top, "target stays below the reading line").toBeGreaterThan(readingLine());
+      expect(window.scrollY, "the page actually scrolled").toBeGreaterThan(0);
       expect(
         window.scrollY + window.innerHeight,
         "page is scrolled to its end",

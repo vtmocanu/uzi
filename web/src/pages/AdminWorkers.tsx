@@ -47,7 +47,7 @@ export function AdminWorkers() {
   // yank the page back to the URL's anchor.
   const loaded = !loading && saved !== null;
   const failed = !loading && saved === null;
-  // Page-owned refs SectionPills reads: the end sentinel, the deep-link target pending its
+  // Page-owned refs shared with SectionPills: the end sentinel, the deep-link target pending its
   // highlight, and the current-section evaluator the deep-link effect re-runs after scrolling.
   const endRef = useRef<HTMLDivElement>(null);
   const pendingRef = useRef<string | null>(null);
@@ -103,7 +103,6 @@ export function AdminWorkers() {
         ) : undefined
       }
     >
-
       {loadError && <Alert message={loadError} />}
 
       {loading && (
