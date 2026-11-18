@@ -2534,7 +2534,7 @@ Tests:
   condition matching only its statement (checked against the SQL: the binding
   writer leaves the stamp, last_seq and epoch columns alone).
 
-Command (export of d43fd2ca6, throwaway postgres `cdr-4202-u10pg`): from api,
+Command (export of d43fd2ca6, or of ca154ebae for the rows marked so; throwaway postgres `cdr-4202-u10pg`): from api,
 `GOFLAGS='-p=1 -buildvcs=false' GOMAXPROCS=4 go test -race -count=1 -timeout=6m
 ./internal/workersvc -run '<selection>' -v`. Diffs and logs:
 `.uzi/scratch/ctl-logs/<log name>.{diff,log}`.
@@ -2549,7 +2549,7 @@ Command (export of d43fd2ca6, throwaway postgres `cdr-4202-u10pg`): from api,
 | u10-return-before-commit | (c) ordering | the applied result with B's material is returned before `tx.Commit` (:116); the commit becomes unreachable | bundle (both auth modes); rollback commit | u10-return-before-commit (bundle), u10-return-before-commit-rollback (commit leaf) | bundle :79 "old capability still authorized" (both leaves: the returned material belongs to a switch the caller's rollback undid); rollback :46 "write failure returned auth" |
 | u10-mint-hash | (d) behavioural write mutation (not a guard removal) | the mint writes the run's old hash instead of the freshly minted one (`Hash: func() []byte { _ = hash; return run.CodexCapHash }()`, :58) | bundle | u10-mint-hash | bundle :83 "replacement capability cannot authorize credential release codex capability does not match", both leaves |
 | u10-journal-err | (d) guard, ca154ebae | journal insert `err != nil` → `false && err != nil` (:80) | zero-row journal | u10-journal-err | zero-row test :47 "journal: zero-row write returned auth … outcome=applied ordinal=0" |
-| u10-mint-redundant | redundant-fence guard (decision 9), ca154ebae | mint zero-row has three copies: the mint `err != nil` (:60), the `capabilityEpoch <= 0` check (:65) and the journal insert's `r.codex_claim_epoch = @capability_epoch` predicate (runtime.sql :2466) surfacing at :80. (i) :60 alone; (ii) :65 alone; (iii) :60+:65; (iv) :60+:65+:80 | zero-row mint | u10-mint-err-only, u10-mint-epochcheck-only, u10-mint-both, u10-mint-triple | (i) still refused, red only at the error-identity assertion :56 ("incomplete Codex switch material, want pgx.ErrNoRows": :65 refused); (ii) EXIT=0; (iii) EXIT=0 (the journal predicate refused epoch 0 with ErrNoRows at :80); (iv) :47 "mint: zero-row write returned auth … outcome=applied" |
+| u10-mint-redundant | redundant-fence guard (decision 9), ca154ebae | mint zero-row has three copies: the mint `err != nil` (:60), the `capabilityEpoch <= 0` check (:65) and the journal insert's `r.codex_claim_epoch = @capability_epoch` predicate (runtime.sql :2466) surfacing at :80. (i) :60 alone; (ii) :65 alone; (iii) :60+:65; (iv) :60+:65+:80 | zero-row mint | u10-mint-err-only, u10-mint-epochcheck-only, u10-mint-both, u10-mint-triple | (i) still refused, red only at the error-identity assertion :56 ("incomplete Codex switch material, want pgx.ErrNoRows": :65 refused); (ii) EXIT=0; (iii) EXIT=0 (the journal predicate refused epoch 0 with ErrNoRows at :80); (iv) :47 "mint: zero-row write returned auth … outcome=applied". Arm (iv) also neutralizes the journal's own error check (:80), so attributing the third copy to the :2466 epoch predicate is reasoning (the skipped mint leaves epoch 0, which that predicate cannot match), not an isolating mutant; arm (iv) going red is evidence that no fourth copy exists on this path. Census scope: `applyCodexSwitchLocked` (:29–125) and the SQL of the statements it runs |
 
 Not credited: the first u10-mint-hash form (`Hash: run.CodexCapHash`) failed
 to compile (`declared and not used: hash`,
@@ -2577,8 +2577,9 @@ first-round records.)
 
 Credit: the binding rewrite, capability remint, journal, stamp clear and
 message commit together or not at all, including when any of the six writes
-affects zero rows without a server error (for the mint, any one of three
-copies suffices); B's material is returned only after a successful commit (a
+affects zero rows without a server error (the mint is redundantly fenced: it
+went red only with :60, :65 and :80 all disabled; per-copy sufficiency is not
+inferred, and :60 refusing first follows from code order only); B's material is returned only after a successful commit (a
 commit failure or a return placed before the commit is detected); the persisted
 capability hash is the newly minted one. Not credited: storage or power-loss
 durability (process-loss model only), concurrent readers' isolation beyond
