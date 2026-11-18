@@ -64,7 +64,7 @@ describe("Codex credential switch", () => {
     fireEvent.click(confirm());
     await waitFor(() => expect(onSwitched).toHaveBeenCalledWith(returned));
     expect(api.setRunCredential).toHaveBeenCalledExactlyOnceWith("run-1", { mode: "pinned", secret_id: other.id });
-    // onSwitched runs before submit's finally clears busy; focus returns once busy is false.
+    // onSwitched runs before the closed, not-busy render commits; focus returns after that commit.
     await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "Switch credential" })));
   });
   it("does not auto-select the first available credential or resolve a missing ID by label", () => {

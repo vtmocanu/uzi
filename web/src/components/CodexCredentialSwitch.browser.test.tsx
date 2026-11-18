@@ -100,7 +100,8 @@ it.each([
   await userEvent.type(page.elementLocator(confirm), "{Enter}", { skipClick: true });
   await waitFor(() => expect(onSwitched).toHaveBeenCalledWith(returned));
   expect(api.setRunCredential).toHaveBeenCalledExactlyOnceWith(run.id, { mode: "pinned", secret_id: targetId });
-  expect(document.activeElement).toBe(trigger);
+  // onSwitched runs before the closed, not-busy render commits; focus returns after that commit.
+  await waitFor(() => expect(document.activeElement).toBe(trigger));
   expect(screen.getByText(currentLabel)).toBeTruthy();
   rerender(<Header value={returned} />);
   expect(screen.getByText("switch pending")).toBeTruthy();
