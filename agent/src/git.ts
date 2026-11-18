@@ -1118,6 +1118,9 @@ export interface GitCacheOptions {
    *  the clone is moved fails the retire closed, a failure in a metadata step after it leaves the binding where it was),
    *  and a throw from a step with no failure path simulates a crash at that point. Production never passes it. */
   retireBindingStep?: (step: RetireBindingStep) => void | Promise<void>;
+  /** issue #4263 — test-only: LOWER (never raise) the foreign-bare scan limits of compactAttemptLedger, and replace its clock
+   *  (milliseconds) so a deadline can be exercised. A value above the production limit is ignored. Production never passes it. */
+  compactForeignScanForTest?: { maxBares?: number; maxConfigBytes?: number; maxRecords?: number; deadlineMs?: number; now?: () => number };
   /** issue #3239 — test-only seams inside {@link GitCache.commitWipMarker}, in firing order:
    *  `afterOmissionCheck` after the omission scan and before staging (to race a file past the
    *  cap); `afterCommit` right after the commit call returns and BEFORE the backstop reads the
@@ -2554,6 +2557,11 @@ function attemptLedgerValue(entry: AttemptLedgerEntry): string {
 /** Most binding keys one bare may carry, counting every entry under the `uzi-retire-scratch.` prefix (valid or not);
  *  a bare over the cap reads as `unknown`, never as a truncated list. */
 export const RETIRE_BINDING_MAX_PER_BARE = 64;
+/** Issue #4263: the finite bounds of the foreign-bare scan compactAttemptLedger runs (see GitCache.scanForeignAttemptIds). A test
+ *  may only LOWER them ({@link GitCacheOptions.compactForeignScanForTest}). */
+const COMPACT_FOREIGN_SCAN_LIMITS = { maxBares: 1024, maxConfigBytes: 16 * 1024 * 1024, maxRecords: 131_072, deadlineMs: 5000 } as const;
+type CompactForeignSkipReason = "bare_cap" | "bytes_cap" | "records_cap" | "deadline" | "unreadable" | "binding_unknown" |
+  "binding_undecodable" | "ledger_unidentified";
 
 const RETIRE_BINDING_PREFIX = "uzi-retire-scratch.";
 const RETIRE_BINDING_KEY_RE = /^uzi-retire-scratch\.([0-9a-f-]{36})\.binding$/;
@@ -2577,7 +2585,7 @@ export type RetireBindingStep =
   | "removing-write" | "removing-sync" | "removing-written"
   | "removed" | "root-synced-after-rm" | "unset" | "unset-sync" | "unset-done"
   | "unmoved-unset" | "unmoved-unset-sync" | "unmoved-unset-done"
-  | "recover-clone-dir-sync" | "recover-root-sync";
+  | "recover-clone-dir-sync" | "recover-root-sync" | "compact-foreign-scanned";
 
 export interface RetireBinding {
   v: 1;
@@ -2735,14 +2743,22 @@ export function retireCrossBareConflict(others: readonly RetireScratchBareEviden
         continue;
       }
       if (raw.includes(attemptId) || retireParsedNamesAttempt(raw, attemptId)) return true;
-      let other: unknown;
-      try { other = JSON.parse(raw); } catch { return true; }
-      if (typeof other !== "object" || other === null || Array.isArray(other)) return true;
-      const id = (other as { attemptId?: unknown }).attemptId;
-      if (typeof id !== "string" || !ATTEMPT_ID_RE.test(id) || id === attemptId) return true;
+      if (retireIdentifiedAttempt(raw) === undefined) return true;
     }
   }
   return false;
+}
+
+/** Issue #4263: the attempt id a ledger value POSITIVELY identifies: its own id when canonical, else the well-formed string
+ *  `attemptId` of the non-null, non-array object it parses to. Undefined when the value cannot be attributed to an attempt. */
+function retireIdentifiedAttempt(raw: string): string | undefined {
+  const e = parseAttemptLedgerEntry(raw);
+  if (e && raw === attemptLedgerValue(e)) return e.attemptId;
+  let other: unknown;
+  try { other = JSON.parse(raw); } catch { return undefined; }
+  if (typeof other !== "object" || other === null || Array.isArray(other)) return undefined;
+  const id = (other as { attemptId?: unknown }).attemptId;
+  return typeof id === "string" && ATTEMPT_ID_RE.test(id) ? id : undefined;
 }
 
 /** Does a non-canonical value parse (JSON escapes decoded, so the id need not appear literally) to an object naming the attempt? */
@@ -5624,6 +5640,9 @@ export class GitCache {
   private readonly retentionDeleteSeam: GitCacheOptions["retentionDelete"];
   /** See {@link GitCacheOptions.retireBindingStep}; undefined in production. */
   private readonly retireBindingStepSeam: GitCacheOptions["retireBindingStep"];
+  /** The foreign-bare scan limits of compactAttemptLedger: the production constants, lowered only by the test seam. */
+  private readonly compactForeignLimits: { maxBares: number; maxConfigBytes: number; maxRecords: number; deadlineMs: number };
+  private readonly compactForeignNow: () => number;
   private readonly archivedPinClock: NonNullable<GitCacheOptions["archivedPinClockForTest"]>;
   private readonly terminalRecordProtection: GitCacheOptions["terminalRecordProtection"];
   /** See {@link GitCacheOptions.canonicalFree}; undefined in production. */
@@ -5669,6 +5688,16 @@ export class GitCache {
     this.scratchProvisioner = opts.scratchProvisioner;
     this.retentionDeleteSeam = opts.retentionDelete;
     this.retireBindingStepSeam = opts.retireBindingStep;
+    const lowered = (production: number, requested: number | undefined): number =>
+      typeof requested === "number" && requested >= 0 ? Math.min(production, requested) : production;
+    const foreignSeam = opts.compactForeignScanForTest;
+    this.compactForeignLimits = {
+      maxBares: lowered(COMPACT_FOREIGN_SCAN_LIMITS.maxBares, foreignSeam?.maxBares),
+      maxConfigBytes: lowered(COMPACT_FOREIGN_SCAN_LIMITS.maxConfigBytes, foreignSeam?.maxConfigBytes),
+      maxRecords: lowered(COMPACT_FOREIGN_SCAN_LIMITS.maxRecords, foreignSeam?.maxRecords),
+      deadlineMs: lowered(COMPACT_FOREIGN_SCAN_LIMITS.deadlineMs, foreignSeam?.deadlineMs),
+    };
+    this.compactForeignNow = foreignSeam?.now ?? (() => Date.now());
     this.archivedPinClock = opts.archivedPinClockForTest ?? {
       now: () => Date.now(),
       schedule: (fn, ms) => { const handle = setTimeout(fn, ms); return () => clearTimeout(handle); },
@@ -18137,6 +18166,18 @@ export class GitCache {
    * collapsed to a last value nor dropped: the ledger of ALL branches is read, and an id is conflicted when its canonical
    * values carry more than one (branch, runId, clonePath), or a decoded binding names it with an identity that some canonical
    * value does not share. retireLedgerLast reads exactly this history and answers "tainted" for it.
+   * A FOREIGN attempt id (issue #4263) is one that ANOTHER bare of this worker names, by a decoded retirement binding or by a
+   * ledger value (canonical, or non-canonical but identified as an object with a well-formed string `attemptId`). It joins the
+   * conflicted ids, whether or not this bare binds it, so this branch's values of it are kept verbatim at their position; a
+   * non-canonical value here naming one is tainted likewise. GUARANTEE: compaction preserves every cross-bare conflict
+   * observed in the foreign snapshot it read (each other bare's config is read once, before any rewrite decision, WITHOUT that
+   * bare's lock). A mention written into another bare after that read is outside the guarantee; legitimate writers only write
+   * fresh-minted ({@link mintAttemptId}: timestamp, claim generation, 64 random bits) or same-bare attempt ids into their own
+   * bare under its lock, so a later foreign mention of an id this bare holds is not a legitimate event.
+   * The foreign scan is BOUNDED ({@link COMPACT_FOREIGN_SCAN_LIMITS}: bares, config bytes, records, a wall-clock deadline) and
+   * strict (an unlistable, symlinked or non-directory `.git` candidate, an unreadable config, an undecodable or unknown binding
+   * set, or a ledger value that cannot be attributed to an attempt all fail it). When it fails, compaction is SKIPPED before any
+   * rewrite (the ledger is byte-identical) and a warning with a fixed reason token is logged.
    * Nothing is rewritten when nothing would change.
    *
    * The rewrite is ATOMIC ({@link rewriteLedgerAtomically}): the full compacted value set lands in
@@ -18160,6 +18201,16 @@ export class GitCache {
         b.parsed !== undefined && b.parsed.attemptId === e.attemptId && b.parsed.runId === e.runId && b.parsed.clonePath === e.clonePath);
       const allRaw = await this.readAllAttemptLedgerRaw(barePath);
       const raw = allRaw.filter(([b]) => b === branch).map(([, v]) => v);
+      // issue #4263: every attempt id ANOTHER bare names (a decoded binding, or a ledger value) is cross-bare evidence that
+      // epoch reclaim (retireCrossBareConflict) refuses on, so this bare's values of it are kept verbatim. The scan is bounded
+      // and reads each other bare once without its lock; when it cannot complete, nothing is compacted.
+      const foreign = await this.scanForeignAttemptIds(barePath);
+      await this.retireStep("compact-foreign-scanned");
+      if ("reason" in foreign) {
+        this.log.warn("attempt ledger compaction skipped: foreign retire evidence unavailable", { branch, reason: foreign.reason });
+        return;
+      }
+      const foreignIds = foreign.ids;
       // A CONFLICTED attempt id (issue #4263): its canonical values, over ALL branches, carry more than one (branch, runId,
       // clonePath), or a decoded binding names it with an identity some canonical value does not share. Those values are
       // preserved verbatim (never collapsed to a last value, dropped or re-serialized), since retireLedgerLast reads them.
@@ -18171,7 +18222,7 @@ export class GitCache {
         set.add(JSON.stringify([b, e.runId, e.clonePath]));
         identities.set(e.attemptId, set);
       }
-      const conflictedIds = new Set<string>();
+      const conflictedIds = new Set<string>(foreignIds);
       for (const [id, set] of identities) if (set.size > 1) conflictedIds.add(id);
       if (bindingRead.state === "read") {
         for (const bd of bindingRead.bindings) {
@@ -18189,7 +18240,8 @@ export class GitCache {
       const tainted = (v: string): boolean => {
         const e = parseAttemptLedgerEntry(v);
         if (e !== undefined && v === attemptLedgerValue(e)) return false;
-        return bindingsUndecodable || boundAttemptIds.some(id => v.includes(id) || retireParsedNamesAttempt(v, id));
+        return bindingsUndecodable || boundAttemptIds.some(id => v.includes(id) || retireParsedNamesAttempt(v, id)) ||
+          [...foreignIds].some(id => v.includes(id) || retireParsedNamesAttempt(v, id));
       };
       // One ordered pass: a tainted value stays at its own position; the last (untainted, parseable) value per attemptId stays
       // at ITS position, re-serialized; everything else is dropped. With no taint this is the previous last-write order.
@@ -18220,6 +18272,68 @@ export class GitCache {
     } catch (err) {
       this.checkRecoveryInterruption();
       this.log.warn("attempt ledger compaction failed; the ledger is left as it was", { branch, error: gitErrorMessage(err) });
+    }
+  }
+
+  /**
+   * issue #4263: every attempt id a bare OTHER than `barePath` names (a decoded retirement binding, or an identified ledger
+   * value), from one read of each other bare's config. No other bare's lock is taken. Strict and bounded
+   * ({@link COMPACT_FOREIGN_SCAN_LIMITS}, possibly lowered by the test seam): it returns the fixed reason it could not
+   * complete instead of a partial answer. Only a recovery interruption is rethrown.
+   */
+  private async scanForeignAttemptIds(barePath: string): Promise<{ ids: Set<string> } | { reason: CompactForeignSkipReason }> {
+    const limits = this.compactForeignLimits;
+    const started = this.compactForeignNow();
+    const expired = (): boolean => this.compactForeignNow() - started > limits.deadlineMs;
+    const ids = new Set<string>();
+    try {
+      let names: string[];
+      try {
+        names = await this.retainedNames(this.reposRoot);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+        names = [];
+      }
+      const own = path.resolve(barePath);
+      const candidates = names.filter(n => n.endsWith(".git")).sort().map(n => path.join(this.reposRoot, n))
+        .filter(p => path.resolve(p) !== own);
+      if (candidates.length > limits.maxBares) return { reason: "bare_cap" };
+      let bytes = 0;
+      let records = 0;
+      for (const bare of candidates) {
+        this.checkRecoveryInterruption();
+        if (expired()) return { reason: "deadline" };
+        const st = await this.retainedIO(() => fs.lstat(bare));
+        if (!st.isDirectory() || st.isSymbolicLink()) return { reason: "unreadable" };
+        // Bound the read before git does it: the config file's size is the most `config --list` can return.
+        const config = await this.retainedIO(() => fs.stat(path.join(bare, "config")));
+        if (config.size > limits.maxConfigBytes - bytes) return { reason: "bytes_cap" };
+        const snapshot = await this.configEntries(bare);
+        this.checkRecoveryInterruption();
+        for (const entry of snapshot) bytes += Buffer.byteLength(entry) + 1;
+        if (bytes > limits.maxConfigBytes) return { reason: "bytes_cap" };
+        if (expired()) return { reason: "deadline" };
+        const bindings = await this.readRetireBindingsUnderLock(bare, snapshot);
+        if (bindings.state !== "read") return { reason: "binding_unknown" };
+        const ledger = await this.readAllAttemptLedgerRaw(bare, snapshot);
+        this.checkRecoveryInterruption();
+        records += bindings.bindings.length + ledger.length;
+        if (records > limits.maxRecords) return { reason: "records_cap" };
+        if (expired()) return { reason: "deadline" };
+        for (const b of bindings.bindings) {
+          if (b.parsed === undefined) return { reason: "binding_undecodable" };
+          ids.add(b.parsed.attemptId);
+        }
+        for (const [, raw] of ledger) {
+          const id = retireIdentifiedAttempt(raw);
+          if (id === undefined) return { reason: "ledger_unidentified" };
+          ids.add(id);
+        }
+      }
+      return { ids };
+    } catch {
+      this.checkRecoveryInterruption();
+      return { reason: "unreadable" };
     }
   }
 

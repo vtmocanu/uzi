@@ -453,6 +453,163 @@ describe("conflicting canonical history for one attempt id (#4263)", () => {
   });
 });
 
+// Compaction must not erase evidence another bare of the worker holds (retireCrossBareConflict refuses epoch reclaim on it).
+describe("compactAttemptLedger keeps cross-bare evidence (#4263)", () => {
+  const OTHER_ATTEMPT = formatAttemptId(new Date("2026-11-05T10:10:59Z"), 1, "0123456789abcdef");
+  const Y_CLONE = "/data/runner/slug/y-gone-attempt";
+  const gitAt = (b: string, args: string[]): string => execFileSync("git", ["-C", b, ...args], { encoding: "utf8", env: ENV }).trim();
+  const valuesAt = (b: string): string[] => { try { return gitAt(b, ["config", "--local", "--get-all", LEDGER_KEY]).split("\n"); } catch { return []; } };
+  const addAt = (b: string, raw: string): void => { gitAt(b, ["config", "--local", "--add", LEDGER_KEY, raw]); };
+  const xClone = (): string => attemptClonePath(cache.runnerClonePath(bare, KEY), ATTEMPT);
+  const entryOf = (attemptId: string, runId: string, clonePath: string, state = "live"): string => JSON.stringify({ attemptId, runId, clonePath, state });
+  const xRetired = (id = ATTEMPT): string => entryOf(id, "run-4263", xClone(), "retired");
+  const yValue = (): string => entryOf(ATTEMPT, "run-y", Y_CLONE);
+  const bindX = (): void => setBinding(UUID, retireBindingValue(binding({ class: "owner_terminal", phase: "settled", clonePath: xClone() })));
+  let y: string;
+  beforeEach(() => {
+    y = path.join(fx.dataDir, "repos", "y.git");
+    execFileSync("git", ["init", "--bare", "-q", y], { env: ENV });
+    fs.chmodSync(y, 0o700);
+  });
+  type Warn = { msg: string; fields: unknown };
+  const cacheWith = (opts: GitCacheOptionsForTest = {}): { c: GitCache; warns: Warn[] } => {
+    const warns: Warn[] = [];
+    const log = nullLogger();
+    log.warn = (msg: string, fields?: unknown) => { warns.push({ msg, fields }); };
+    return { c: new GitCache(fx.dataDir, log, undefined, testGitCacheOptions(opts)), warns };
+  };
+  type GitCacheOptionsForTest = NonNullable<ConstructorParameters<typeof GitCache>[3]>;
+  const compactOn = (c: GitCache, b: string): Promise<void> =>
+    (c as unknown as { compactAttemptLedger(b: string, br: string): Promise<void> }).compactAttemptLedger(b, BRANCH);
+  const SKIP = "attempt ledger compaction skipped: foreign retire evidence unavailable";
+  const skipReasons = (warns: Warn[]): unknown[] => warns.filter(w => w.msg === SKIP).map(w => (w.fields as { reason: string }).reason);
+
+  for (const order of [["x", "y"], ["y", "x"]] as const) {
+    for (const [label, value] of [["canonical", yValue], ["non-canonical (reordered)", () => JSON.stringify({ runId: "run-y", attemptId: ATTEMPT, clonePath: Y_CLONE, state: "live" })]] as const) {
+      it(`keeps another bare's unbound ${label} value of a bound attempt verbatim, compacting ${order.join(" then ")}`, async () => {
+        const ret = xRetired();
+        addAt(bare, ret);
+        bindX();
+        addAt(y, value());
+        const { c } = cacheWith();
+        for (const w of order) await compactOn(c, w === "x" ? bare : y);
+        assert.deepEqual(valuesAt(y), [value()]);
+        assert.deepEqual(valuesAt(bare), [ret]);
+      });
+    }
+  }
+
+  it("positive control: a different attempt id in the other bare does not stop normal compaction", async () => {
+    addAt(bare, xRetired(OTHER_ATTEMPT));
+    addAt(y, yValue());
+    const { c, warns } = cacheWith();
+    await compactOn(c, y);
+    assert.deepEqual(valuesAt(y), [], "the gone, unbound, unshared value is dropped");
+    assert.deepEqual(skipReasons(warns), []);
+  });
+
+  describe("falls back to no compaction, with the ledger byte-identical and a reason", () => {
+    const expectSkipped = async (c: GitCache, warns: Warn[], reason: string): Promise<void> => {
+      const before = fs.readFileSync(path.join(y, "config"));
+      await compactOn(c, y);
+      assert.ok(fs.readFileSync(path.join(y, "config")).equals(before), "the bare config is byte-identical");
+      assert.deepEqual(valuesAt(y), [yValue()]);
+      assert.deepEqual(skipReasons(warns), [reason]);
+    };
+
+    it("another bare has an undecodable binding", async () => {
+      setBinding(UUID, "{");
+      addAt(y, yValue());
+      const { c, warns } = cacheWith();
+      await expectSkipped(c, warns, "binding_undecodable");
+    });
+
+    it("another bare has an unknown (over-cap) binding set", async () => {
+      for (let i = 0; i <= RETIRE_BINDING_MAX_PER_BARE; i++) setBinding(randomUUID(), retireBindingValue(binding()));
+      addAt(y, yValue());
+      const { c, warns } = cacheWith();
+      await expectSkipped(c, warns, "binding_unknown");
+    });
+
+    for (const raw of ["{}", '{"attemptId":42}', "not json"]) {
+      it(`another bare holds a ledger value whose attempt cannot be identified: ${raw}`, async () => {
+        addAt(bare, raw);
+        addAt(y, yValue());
+        const { c, warns } = cacheWith();
+        await expectSkipped(c, warns, "ledger_unidentified");
+      });
+    }
+
+    for (const [name, make] of [
+      ["a symlink named z.git", (): void => { fs.symlinkSync(bare, path.join(fx.dataDir, "repos", "z.git")); }],
+      ["a regular file named f.git", (): void => { fs.writeFileSync(path.join(fx.dataDir, "repos", "f.git"), "x"); }],
+    ] as const) {
+      it(`an unreadable candidate: ${name}`, async () => {
+        make();
+        addAt(y, yValue());
+        const { c, warns } = cacheWith();
+        await expectSkipped(c, warns, "unreadable");
+      });
+    }
+
+    it("the bare limit, lowered by the seam", async () => {
+      addAt(y, yValue());
+      const { c, warns } = cacheWith({ compactForeignScanForTest: { maxBares: 0 } });
+      await expectSkipped(c, warns, "bare_cap");
+    });
+
+    it("the config byte limit, lowered by the seam", async () => {
+      addAt(y, yValue());
+      const { c, warns } = cacheWith({ compactForeignScanForTest: { maxConfigBytes: 8 } });
+      await expectSkipped(c, warns, "bytes_cap");
+    });
+
+    it("the record limit, lowered by the seam", async () => {
+      addAt(bare, xRetired(OTHER_ATTEMPT));
+      addAt(bare, xRetired(OTHER_ATTEMPT));
+      addAt(y, yValue());
+      const { c, warns } = cacheWith({ compactForeignScanForTest: { maxRecords: 1 } });
+      await expectSkipped(c, warns, "records_cap");
+    });
+
+    it("an expired deadline", async () => {
+      addAt(y, yValue());
+      let t = 0;
+      const { c, warns } = cacheWith({ compactForeignScanForTest: { deadlineMs: 1000, now: () => (t += 10_000) } });
+      await expectSkipped(c, warns, "deadline");
+    });
+
+    it("the seam can only lower a limit: a raised bare limit is ignored", async () => {
+      addAt(y, yValue());
+      const { c, warns } = cacheWith({ compactForeignScanForTest: { maxBares: 1_000_000, maxRecords: 1_000_000_000 } });
+      await compactOn(c, y);
+      assert.deepEqual(valuesAt(y), [], "a fixture within the production limits compacts normally");
+      assert.deepEqual(skipReasons(warns), []);
+    });
+  });
+
+  describe("interleaving at compact-foreign-scanned", () => {
+    it("a foreign mention first written after the snapshot read is outside the guarantee", async () => {
+      addAt(y, yValue());
+      const { c } = cacheWith({
+        retireBindingStep: step => { if (step === "compact-foreign-scanned") addAt(bare, xRetired()); },
+      });
+      await compactOn(c, y);
+      assert.deepEqual(valuesAt(y), [], "the mention was absent from the snapshot, so the droppable value is dropped");
+    });
+
+    it("a mention written at that step of an attempt that WAS in the snapshot is preserved", async () => {
+      addAt(bare, xRetired());
+      addAt(y, yValue());
+      const { c } = cacheWith({
+        retireBindingStep: step => { if (step === "compact-foreign-scanned") { addAt(bare, entryOf(ATTEMPT, "run-late", "/data/runner/slug/late", "retired")); bindX(); } },
+      });
+      await compactOn(c, y);
+      assert.deepEqual(valuesAt(y), [yValue()]);
+    });
+  });
+});
+
 describe("syncDirectory", () => {
   it("syncs a directory and refuses a symlink", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-syncdir-"));

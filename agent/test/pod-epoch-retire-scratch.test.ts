@@ -1690,3 +1690,50 @@ describe("cross-bare attempt identity conflicts", PROC, () => {
     assert.deepEqual(w.bindingRaws(s.uuid), [s.raw]);
   });
 });
+
+// Compaction of either bare must not erase the evidence the cross-bare refusal reads (a real second bare, not a faked read).
+describe("ledger compaction keeps the cross-bare conflict the reclaim refuses on", PROC, () => {
+  const compactOf = (b: string): Promise<void> =>
+    (w.cache as unknown as { compactAttemptLedger(b: string, br: string): Promise<void> }).compactAttemptLedger(b, BRANCH);
+  const LEDGER_KEY = `uzi-attempts.${BRANCH}.entry`;
+  /** A second real bare holding an UNBOUND canonical value for the seeded attempt, with another run id and a gone clone path. */
+  const otherBareHolding = (attemptId: string): { bare: string; value: string } => {
+    const bare = path.join(w.fx.dataDir, "repos", "another.git");
+    execFileSync("git", ["init", "--bare", "-q", bare], { env: ENV });
+    fs.chmodSync(bare, 0o700);
+    const value = JSON.stringify({ attemptId, runId: "run-another", clonePath: path.join(w.runnerRoot, "slug", "another-gone-attempt"), state: "live" });
+    execFileSync("git", ["-C", bare, "config", "--local", "--add", LEDGER_KEY, value], { env: ENV });
+    return { bare, value };
+  };
+  const valuesOf = (bare: string): string[] => execFileSync("git", ["-C", bare, "config", "--local", "--get-all", LEDGER_KEY], { encoding: "utf8", env: ENV }).trim().split("\n");
+
+  for (const order of [["seed", "other"], ["other", "seed"]] as const) {
+    it(`a present parent stays kept as conflict after compacting ${order.join(" then ")}`, async () => {
+      const s = w.seed();
+      const other = otherBareHolding(s.attemptId);
+      const seeded = valuesOf(w.bare);
+      for (const which of order) await compactOf(which === "seed" ? w.bare : other.bare);
+      assert.deepEqual(valuesOf(other.bare), [other.value], "the other bare's unbound value survives verbatim");
+      assert.deepEqual(valuesOf(w.bare), seeded, "the seeded bare's retired entry survives");
+      const result = await w.run();
+      assert.equal(result.retire_scratch.reclaimed, 0);
+      assert.equal(result.retire_scratch.kept_by_reason.conflict, 1, JSON.stringify(result.retire_scratch.kept_by_reason));
+      assert.equal(exists(s.parent), true);
+      untouched(s);
+    });
+
+    it(`a gone parent is not recovered and its binding is untouched after compacting ${order.join(" then ")}`, async () => {
+      const s = w.seed({ withParent: false });
+      const other = otherBareHolding(s.attemptId);
+      const seeded = valuesOf(w.bare);
+      for (const which of order) await compactOf(which === "seed" ? w.bare : other.bare);
+      assert.deepEqual(valuesOf(other.bare), [other.value]);
+      assert.deepEqual(valuesOf(w.bare), seeded);
+      const result = await w.run();
+      assert.equal(result.retire_scratch.recovered, 0);
+      // The cross-bare check precedes the gone-parent recovery check, so the reason is the same `conflict`.
+      assert.equal(result.retire_scratch.kept_by_reason.conflict, 1, JSON.stringify(result.retire_scratch.kept_by_reason));
+      assert.deepEqual(w.bindingRaws(s.uuid), [s.raw]);
+    });
+  }
+});
