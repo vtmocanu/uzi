@@ -1,0 +1,39 @@
+{
+  "name": "uzi-agent",
+  "version": "0.1.0-m4",
+  "private": true,
+  "type": "module",
+  "description": "uzi worker: outbound-only agent runtime that claims runs, works in an isolated git worktree, and reports back to the uzi API.",
+  "main": "src/main.ts",
+  "scripts": {
+    "start": "tsx src/main.ts",
+    "eval:pr-description": "tsx src/pr-description-eval-cli.ts",
+    "eval:code-cross-check": "tsx src/code-cross-check-replay-cli.ts",
+    "lint": "oxlint --config .oxlintrc.json -D correctness --report-unused-disable-directives-severity=error src test",
+    "knip": "knip",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx test/run-unit-tests.ts",
+    "test:cross-check-confinement": "task --dir .. test:cross-check-confinement",
+    "deps-check": "npm ls --depth=0",
+    "audit": "npm audit --audit-level=high --include=dev"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.3.319",
+    "agent-browser": "0.39.2",
+    "smol-toml": "1.9.1",
+    "tsx": "^4.19.2",
+    "undici": "8.12.4",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^26.0.0",
+    "knip": "6.42.1",
+    "oxlint": "1.89.0",
+    "typescript": "^7.0.0"
+  },
+  "overrides": {
+    "fast-uri": "^4.0.0",
+    "qs": "^6.16.0",
+    "hono": "^4.13.5"
+  }
+}

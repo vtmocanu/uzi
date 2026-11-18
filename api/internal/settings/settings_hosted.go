@@ -58,6 +58,25 @@ func (c *Cache) WorkerHibernationIdleAfter(ctx context.Context) (time.Duration, 
 	return d, err
 }
 
+// WorkerHibernationSurplus reports whether surplus members of an equivalence pool may be
+// hibernated while a warm worker stays (issue #4395). It acts only while WorkerHibernationEnabled
+// and WorkerHibernationAuto are also on. A malformed value falls back to the default (false).
+func (c *Cache) WorkerHibernationSurplus(ctx context.Context) (bool, error) {
+	return c.boolSetting(ctx, KeyWorkerHibernationSurplus)
+}
+
+// WorkerHibernationSurplusIdleAfter returns how long a surplus pool member must show no run
+// activity before the pass hibernates it (issue #4395). A missing, unparseable or out-of-range
+// stored value falls back to the compiled-in default (2h).
+func (c *Cache) WorkerHibernationSurplusIdleAfter(ctx context.Context) (time.Duration, error) {
+	v, err := c.get(ctx, KeyWorkerHibernationSurplusIdleAfter)
+	d, perr := time.ParseDuration(strings.TrimSpace(v))
+	if perr != nil || d < workerHibernationSurplusIdleAfterMin || d > workerHibernationSurplusIdleAfterMax {
+		d, _ = time.ParseDuration(DefaultWorkerHibernationSurplusIdleAfter)
+	}
+	return d, err
+}
+
 // HostedWorkerQuota returns the per-user hosted-worker quota (PRD #58 Decision 8);
 // 0 means self-service provisioning is disabled.
 //
@@ -101,6 +120,24 @@ const (
 	workerHibernationIdleAfterMin = time.Hour
 	workerHibernationIdleAfterMax = 2160 * time.Hour
 )
+
+const (
+	workerHibernationSurplusIdleAfterMin = 15 * time.Minute
+	workerHibernationSurplusIdleAfterMax = 336 * time.Hour
+)
+
+// validateWorkerHibernationSurplusIdleAfter is the write-time gate for
+// worker_hibernation_surplus_idle_after (issue #4395): a Go duration between 15m and 336h.
+func validateWorkerHibernationSurplusIdleAfter(value string) error {
+	d, err := time.ParseDuration(strings.TrimSpace(value))
+	if err != nil {
+		return errors.New(`must be a duration like "2h"`)
+	}
+	if d < workerHibernationSurplusIdleAfterMin || d > workerHibernationSurplusIdleAfterMax {
+		return errors.New("must be between 15m and 336h")
+	}
+	return nil
+}
 
 // validateWorkerHibernationIdleAfter is the write-time gate for worker_hibernation_idle_after
 // (issue #4207): a Go duration between one hour and 90 days.

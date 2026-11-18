@@ -107,6 +107,7 @@ type Store interface {
 	// fleet.hibernation (issue #4207): idle workers the automatic pass could not hibernate, and
 	// workers whose only runs are parked; each row carries the exact window total.
 	ListAutoHibernationBlockers(context.Context, store.ListAutoHibernationBlockersParams) ([]store.ListAutoHibernationBlockersRow, error)
+	ListAutoHibernationBlockersSurplusMode(context.Context, store.ListAutoHibernationBlockersSurplusModeParams) ([]store.ListAutoHibernationBlockersSurplusModeRow, error)
 }
 
 // Settings is the slice of the settings cache healthsvc reads: the run-health kill switch
@@ -128,6 +129,9 @@ type Settings interface {
 	WorkerHibernationEnabled(context.Context) (bool, error)
 	WorkerHibernationAuto(context.Context) (bool, error)
 	WorkerHibernationIdleAfter(context.Context) (time.Duration, error)
+	// Warm-reserve surplus hibernation (issue #4395).
+	WorkerHibernationSurplus(context.Context) (bool, error)
+	WorkerHibernationSurplusIdleAfter(context.Context) (time.Duration, error)
 }
 
 // dbStat is the db check's raw probe result. Separating it from the severity logic is what

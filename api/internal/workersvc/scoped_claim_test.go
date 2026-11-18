@@ -39,8 +39,8 @@ func (*scopedClaimTx) Commit(context.Context) error                 { return nil
 func (*scopedClaimTx) Rollback(context.Context) error               { return nil }
 func (tx *scopedClaimTx) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
 	if strings.Contains(sql, "name: SetWorkerSnapshotState ") {
-		tx.worker.SnapshotEpoch = args[0].(int64)
-		if args[1].(bool) {
+		tx.worker.SnapshotEpoch = args[2].(int64) // $1 held receipt, $2 register nonce, $3 epoch, $4 overflow
+		if args[3].(bool) {
 			tx.worker.PendingOverflowUntil = pgconv.Time(time.Now().Add(time.Hour))
 		}
 	}
