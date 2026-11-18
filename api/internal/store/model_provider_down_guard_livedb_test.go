@@ -173,16 +173,31 @@ func TestModelProviderDownGuardsLiveDB(t *testing.T) {
 		t.Fatalf("00469 Down with no selected source: %v", err)
 	}
 
-	// 00478: a run still parked on a provider gateway limit blocks the Down (it would otherwise be coerced
-	// to 'unknown' and stranded as an owner-wait the sweeper and Resume can no longer match).
+	// 00478: a run still waiting (limit_wait) on a provider gateway limit blocks the Down (it would otherwise
+	// be coerced to 'unknown' and stranded as an owner-wait the sweeper and Resume can no longer match).
 	mustExec(ctx, t, pool, `INSERT INTO runs(id,user_id,repo_id,worker_id,kind,issue_iid,issue_title,issue_description,status,claim_generation,rate_limit_type)
  VALUES($1,$2,$3,$4,'issue',2,'t','d','limit_wait',0,'provider_gateway_limit')`, run, user, repo, worker)
 	if err := run00("00478_runs_provider_gateway_limit_type.sql"); err == nil || !strings.Contains(err.Error(), "refusing to roll back 00478") {
-		t.Fatalf("00478 Down with a provider_gateway_limit run: %v, want a refusal", err)
+		t.Fatalf("00478 Down with a limit_wait provider_gateway_limit run: %v, want a refusal", err)
 	}
-	mustExec(ctx, t, pool, "UPDATE runs SET rate_limit_type = 'unknown' WHERE id = $1", run)
-	if err := run00("00478_runs_provider_gateway_limit_type.sql"); err != nil {
-		t.Fatalf("00478 Down with no provider_gateway_limit run: %v", err)
+	// Once the run is terminal the type is only history: it does not block, and it is mapped to unknown.
+	mustExec(ctx, t, pool, "UPDATE runs SET status = 'cancelled' WHERE id = $1", run)
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, down("00478_runs_provider_gateway_limit_type.sql")); err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatalf("00478 Down with a terminal provider_gateway_limit run: %v, want it to pass", err)
+	}
+	var mapped string
+	if err := tx.QueryRow(ctx, "SELECT rate_limit_type FROM runs WHERE id = $1", run).Scan(&mapped); err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	_ = tx.Rollback(ctx)
+	if mapped != "unknown" {
+		t.Fatalf("00478 Down mapped a terminal provider_gateway_limit run to %q, want unknown", mapped)
 	}
 	mustExec(ctx, t, pool, "DELETE FROM runs WHERE id = $1", run)
 

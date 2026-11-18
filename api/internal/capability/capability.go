@@ -282,9 +282,11 @@ const CrossCheckGatedV1 = "cross_check_gated_v1"
 // with an empty Anthropic credential, so a provider-bound run is claimable only by a worker
 // that advertises it. The worker (agent/src/worker.ts) does NOT advertise it yet: the worker
 // side (claim decoder, env, scrubber registration, the capability check on a provider claim) has
-// landed, but the advertisement is blocked on the owner's decision about the Claude CLI following
-// gateway redirects (PRD #4320 Decision Log). Until a worker reports it, a provider-bound run stays
-// queued behind the capability reason.
+// landed, but the advertisement is blocked: the pinned Claude CLI follows gateway redirects (PRD
+// #4320 Decision Log, "M2 finding: the pinned Claude CLI follows gateway redirects"), and module 7
+// makes activation depend on that test. The decision on a redirect-refusing mechanism is pending
+// with the owner. Until a worker reports it, a provider-bound run stays queued behind the
+// capability reason.
 const ClaudeProviderV1 = "claude_provider_v1"
 
 // CrossCheckSemanticPlanV1 identifies workers whose Claude/Codex checker understands the

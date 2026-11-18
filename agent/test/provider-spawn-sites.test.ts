@@ -21,6 +21,7 @@ import type { WorkerClient } from "../src/client.js";
 import type { AdviceUsageSnapshot } from "../src/harness.js";
 import { nonexistentWorktreeFactory, nullLogger } from "./helpers.js";
 import { testOwnedPassHomeRoot } from "./teardown-fixtures.js";
+import { secretRecordingLogger } from "./runner-harness.js";
 
 // PRD #4320 module 6/7 (agent half): every converted spawn builder's env and model in provider mode,
 // the gateway-limit and switch refusals, and the second-layer lane refusals. The gateway key is
@@ -382,7 +383,8 @@ describe("lanes the server refuses reject a provider claim with provider_lane_un
     const { client, states, calls } = recordingClient();
     let modelCalls = 0;
     const queryFn = (() => { modelCalls++; return (async function* () { /* none */ })(); }) as unknown as SdkQueryFn;
-    await new JudgeRunner(client, nullLogger(), { homeRoot: testOwnedPassHomeRoot(), queryFn }).execute({
+    const { logger, added, removed } = secretRecordingLogger();
+    await new JudgeRunner(client, logger, { homeRoot: testOwnedPassHomeRoot(), queryFn }).execute({
       run_id: "judge-1", kind: "judge", target_run_id: "t", issue_iid: null, issue_title: "J", issue_description: "", repo: {} as never,
       secrets: secrets as never, last_seq: 0, agents: [], judge_model: "haiku", claim_generation: 3,
     } as unknown as ClaimResponse);
@@ -391,6 +393,8 @@ describe("lanes the server refuses reject a provider claim with provider_lane_un
     const failed = states.find((s) => s.body.status === "failed");
     assert.ok(failed, "the judge is reported failed");
     assert.match(failed.body.failure_reason ?? "", /provider_lane_unsupported/);
+    assert.ok(added.includes(KEY), "the gateway key was registered with the logger");
+    assert.ok(removed.includes(KEY), "and evicted again on the refusal path");
   });
 
   it("job: fails terminally with the typed reason before any workspace or model work", async () => {
@@ -398,7 +402,8 @@ describe("lanes the server refuses reject a provider claim with provider_lane_un
     let modelCalls = 0;
     const queryFn = (() => { modelCalls++; return (async function* () { /* none */ })(); }) as unknown as SdkQueryFn;
     const jobsRoot = path.join(homeDir, "jobs");
-    await new JobRunner(client, nullLogger(), { queryFn, jobsRoot, batchMs: 5, cancelPollMs: 10 }).execute({
+    const { logger, added, removed } = secretRecordingLogger();
+    await new JobRunner(client, logger, { queryFn, jobsRoot, batchMs: 5, cancelPollMs: 10 }).execute({
       run_id: "job-1", kind: "job", issue_iid: null, issue_title: "", issue_description: "", repo: undefined, secrets: secrets as never, last_seq: 0, agents: [],
       claim_generation: 4, budget_wall_seconds: 30, job: { type: "research", title: "t", prompt: "p", inputs: [] }, config: {},
     } as unknown as ClaimResponse);
@@ -407,6 +412,8 @@ describe("lanes the server refuses reject a provider claim with provider_lane_un
     const failed = states.find((s) => s.body.status === "failed");
     assert.ok(failed, "the job is reported failed");
     assert.match(failed.body.failure_reason ?? "", /provider_lane_unsupported/);
+    assert.ok(added.includes(KEY), "the gateway key was registered with the logger");
+    assert.ok(removed.includes(KEY), "and evicted again when the job ended");
   });
 
   it("isolated: the preflight refuses with provider_lane_unsupported", () => {
