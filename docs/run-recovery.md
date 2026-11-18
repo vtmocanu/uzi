@@ -2860,9 +2860,14 @@ Further cases that keep a leaf as unknown (`run_local_unknown`):
 - **A retired ledger row** (`attempt_ledger`) whose clone path is not this bare's
   canonical attempt clone for its attempt id (the census's identity contract), or whose
   generation is unreadable, gives unknown.
-- **Interrupted reads:** the authority slot reads stop starting new reads at the pass's
-  abort or deadline. Reaching the deadline keeps the leaf as unknown (`classifier`); an
-  abort stops the scratch phase, so the leaf survives without a kept count.
+- **Interrupted reads:** the authority slot reads and the authenticated
+  recovery-maintenance inspection each stop starting new reads once the pass's abort
+  signal fires or its read deadline passes; a read already started is awaited, never
+  abandoned. A read that detects expiry before the pass aborts leaves the classification
+  unknown: the leaf is kept and counted as `run_local_unknown` with source `classifier`.
+  A pass abort, or the pass deadline stopping the phase while a read is in flight, makes
+  the scratch phase report `stopped` (reason `pass_deadline` on the deadline); the leaf is
+  untouched and is not counted under `classifier` (no kept count).
 
 New `scratch.kept` reasons for run leaves:
 
