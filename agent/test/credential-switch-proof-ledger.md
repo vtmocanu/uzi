@@ -414,7 +414,7 @@ control is still absent, not that the functional criterion was deferred.
 | Strict usable persistence, clear confirmation and continuation on A before teardown | R1–R4 credit three failed-save/inspection variants and empty applied-ACK; U3 credits op mismatch, target, claim_released ownership before/after, combined nonce fence and no-remaining-pending guards; pending-absent-before, other ownership legs, lost-reply clear and reopen's other guards not controlled |
 | Proven A root/tool reap before B material, login and model work; fresh CODEX_HOME | R5 (runner hold) and U4: executor reap proof for root and command-root failures, combined no-B-before-reap fence, distinct per-epoch HOME (b); in-flight tool callbacks, launcher must-not-exist and other phases not controlled |
 | Whole operation-scope/refresh/identity/capability/summary replacement and retired-A rejection | A2 one reader; A3 scope namespace; R7 B dispatcher readiness; R8 retired API-key A reconcile fence; U5 retired A refresh bridge pre-call refusal (P3), combined executor summary-guard refusal, B expected identity carried (b); A-account rejection, bridge post-call copy, assertRefreshAdmission and Now stale-result drops not separately controlled |
-| Exact saved-ID resume; confirmed-refusal-only fresh fallback and lineage; preservation re-hold | R6 uncertain-error classification; U6 exact resume id, lineage notice, combined preserve re-hold, crash missing-id disclosure (d) and preserve retained refusal (b); confirmed-refusal classification (timeout), :4148 check and session_missing on the switch path not controlled |
+| Exact saved-ID resume; confirmed-refusal-only fresh fallback and lineage; preservation re-hold | R6 uncertain-error classification; U6 resume carries the saved id, lineage notice, three-copy preserve re-hold, crash missing-id disclosure (d) and preserve retained refusal with a saved conversation (b); confirmed-refusal classification (timeout), :4148 check and session_missing on the switch path not controlled |
 | Policy episode rejection at request and under apply lock | D74–D77 credit the two isolated owner cases and the same two conditions introduced after READY before apply; paused holds, concurrent interleavings and other policy clauses unvalidated |
 | Refresh lease/intent exclusion, account lock ordering and boundary reconciliation before revoke | D78/D79 credit isolated A coordination-lease and rotating-intent server checks; actual refresh admission, multi-account lock ordering and worker reconciliation ordering remain unvalidated |
 | Post-switch release epoch and secret-hash authorization | B5/B6 preservation sensitivity controls below, through real worker apply and release routes; final reauthorization timing unvalidated |
@@ -2191,11 +2191,13 @@ one-at-a-time export; commit c5ad0d0cf59ac44ea54338bd74bf4a7eeb03f5c0):
 
 | Control | Kind | Mutation | Case(s) | Red at |
 |---|---|---|---|---|
-| u6-resume-id | (d) guard | `resumeSessionId: sessionId` → `` sessionId && `${sessionId}-wrong` `` (:4166) | confirmed refusal fresh lineage; baseline api_key→subscription | :35357 resumed thread ids `[saved-wrong]` vs `[saved]`, both |
+| u6-resume-id | (d) data-flow control | `resumeSessionId: sessionId` → `` sessionId && `${sessionId}-wrong` `` (:4166) | confirmed refusal fresh lineage; baseline api_key→subscription | :35357 resumed thread ids `[saved-wrong]` vs `[saved]`, both |
 | u6-lineage-notice | (d) guard | fresh lineage's `ctx.emit({… resume_lineage_break …})` → `void (…)` (:4195) | Codex real Runner confirmed B resume refusal starts exactly one fresh lineage | :35376 lineage notices 0 vs 1 |
-| u6-preserve-redundant | redundant-fence guard | `preserveConversation` neutralized in the runner refusal branch (runner.ts :17689) and in `startFreshLineage` (:4186), the two copies of "a preserve-only run never starts a fresh B thread" | Codex real Runner wire preserve-only claim re-holds confirmed B saved-thread resume refusal | :34706 switch error cause |
-| u6-crash-missing-id | (d) guard | `else if (!sessionId && claim.secrets.codex && flight.retainedEpisode)` → `false && …` (runner.ts :15698) | Codex switch crash during B login retains committed B; recovery ordinary missing persisted ID | :35216 "changed-cwd recovery visibly discloses the path lineage break" |
-| u6-crash-preserve-attempt | (b) preservation sensitivity | `attempt_path` refusal → `false && …` (runner.ts :15427; a233 :15149) | Codex switch crash during B login retains committed B; recovery preserve missing persisted ID | :35180 "retained recovery must refuse even when a saved ID and rollout exist" |
+| u6-preserve-redundant | cause attribution only | `preserveConversation` neutralized in the runner refusal branch (runner.ts :17689) and in `startFreshLineage` (:4186) | Codex real Runner wire preserve-only claim re-holds confirmed B saved-thread resume refusal | :34706 cause `session_missing` vs `provider_resume_rejected`: the harness copy still refused, so this credits only the cause |
+| u6-preserve-3copy | redundant-fence guard | the same two copies plus the harness fresh-thread branch (codex-harness.ts :1155, condition made unsatisfiable with `&& Number.NaN > 0`), the three copies on this path of "a preserve-only run never starts a fresh B thread" (codex-switch-coordinator.ts :208 is off the path: only its types are imported) | same case | :34705 `switchError instanceof PolicyContinuationRejected` false (no re-hold) |
+| u6-crash-missing-id | (d) guard | `else if (!sessionId && claim.secrets.codex && flight.retainedEpisode)` → `false && …` (runner.ts :15698) | Codex switch crash during B login retains committed B; recovery ordinary missing persisted ID | :35216–35219 lineage-break `reason === "session_id_unavailable"` assertion |
+| u6-crash-preserve-attempt | cause attribution only | `attempt_path` refusal → `false && …` (runner.ts :15427; a233 :15149) | …; recovery preserve missing persisted ID | :35180 cause `session_missing` vs `attempt_path` (runner.ts :15444 still refused) |
+| u6-crash-preserve-saved | (b) preservation sensitivity | same mutation | Codex switch crash during B login retains committed B; recovery preserve saved conversation | :35174 "preservation refusal launches no provider root" (1 vs 0) |
 
 Not credited (timeouts, `.uzi/scratch/ctl-logs/*.timeout.log`): u6-resume-id's
 first form (`resumeSessionId` → undefined) and u6-classify-never (confirmed
@@ -2205,15 +2207,24 @@ barrier timed out; a timeout is not an assertion red. The opposite direction
 `sessionId !== saved` check (:4148) has no control: the runner always passes
 the saved id. The `session_missing` guard (runner.ts :15444) is not reached by
 the switch crash cases (the retained `attempt_path` refusal fires first); it is
-covered only by non-switch runner-policy-preserve tests. Crash controls ran
-through the crash-during-login publication only; the other three crash
-publications share the same recovery code but were not mutated.
+covered only by non-switch runner-policy-preserve tests, although
+u6-crash-preserve-attempt shows it is the next fence on the missing-id path.
+Crash controls ran through the crash-during-login publication only; the other
+three crash publications were not mutated (crash after A teardown recovers A,
+not B). u6-resume-id's first (undefined) form survives only as its timeout
+log; its spec and diff were overwritten by the second form.
 
-Every credited mutant passed typecheck and exited 1 at the named assertion.
-Unchanged candidate, primary clone: the five cases pass, 5/5, EXIT=0
-(`.uzi/scratch/ctl-logs/u6-green.log`); agent `npm run lint` 0/0.
+Every credited mutant passed typecheck and exited 1 at the named assertion
+(u6-preserve-3copy's first form failed typecheck, TS18048,
+`u6-preserve-3copy.compilefail.log`, no credit). Unchanged candidate, primary
+clone: the five cases pass, 5/5, EXIT=0 (`.uzi/scratch/ctl-logs/u6-green.log`),
+plus the preserve-saved-conversation case, 1/1, EXIT=0 (`u6-green2.log`);
+agent `npm run lint` 0/0.
 
-Credit: B resumes the exact saved thread id; a fresh lineage emits its
-notice; a preserve-only run re-holds instead of starting fresh (combined
+Credit: B's `thread/resume` carries the exact saved thread id (later turns on
+that thread are not pinned in the baseline case, and the returned thread id is
+not checked against the requested one); a fresh lineage emits its notice; a
+preserve-only run re-holds instead of starting a fresh B thread (three-copy
 fence); after worker loss a missing persisted id is disclosed as a lineage
-break, and a preserve-only retained recovery refuses (preserved behaviour).
+break; a preserve-only retained recovery with a saved conversation refuses
+without launching a provider (preserved behaviour).
