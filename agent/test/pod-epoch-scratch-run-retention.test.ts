@@ -348,6 +348,16 @@ describe("attempt footprint and authority slot (a retired ledger entry is ended 
     }
   });
 
+  it("ID1: a later row of the same run and branch reusing an attempt id at another CANONICAL clone path is unknown, not folded", async () => {
+    // Canonical for this attempt id (same repo dir, valid attempt basename), so the per-entry identity check accepts it:
+    // only the ledger fold's path comparison can refuse it.
+    const otherPath = `${git.runnerClonePath(bare, "issue-4421")}.attempt-${attempt}`;
+    assert.notEqual(otherPath, clonePath);
+    cfg(`uzi-attempts.${BRANCH}.entry`, ledger("live"));
+    cfg(`uzi-attempts.${BRANCH}.entry`, ledger("retired", RUN, otherPath));
+    assert.deepEqual(await classify(), unknown("attempt_ledger"));
+  });
+
   it("ID1 control: rows of one identical identity keep last-value-wins (retired, live, retired is ended; live last is active)", async () => {
     cfg(`uzi-attempts.${BRANCH}.entry`, ledger("retired"));
     cfg(`uzi-attempts.${BRANCH}.entry`, ledger("live"));

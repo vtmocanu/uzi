@@ -1447,6 +1447,27 @@ test("#4420 kept: a later ledger row of another run reusing this run's attempt i
   });
 });
 
+test("#4420 kept: a LIVE ledger row of this run, then a retired row of another run reusing its attempt id, keeps the run leaf as unknown from attempt_ledger (ID1, live row)", FD_ONLY, async () => {
+  await withRunWorld([leafOf(RUN_A)], async (w, rw) => {
+    noAuthoritySlots(w);
+    // Seeding and retiring leaves a cleared journal and no slot; the only keep source left is the ledger itself.
+    const clonePath = await seedRetiredAttempt(rw, RUN_A);
+    await settleOutboxRun(rw, RUN_A);
+    assert.equal(rw.gitIn(["config", "--local", `uzi-recovery.${RUN_BRANCH}.clone`]), "");
+    const row = JSON.parse(rw.gitIn(["config", "--get-all", `uzi-attempts.${RUN_BRANCH}.entry`]).split("\n").at(-1)!);
+    // RUN_A's attempt is live again with its clone on disk, then another run's retired row claims the same attempt id.
+    fs.mkdirSync(clonePath, { recursive: true });
+    rw.gitIn(["config", "--local", "--add", `uzi-attempts.${RUN_BRANCH}.entry`, JSON.stringify({ ...row, state: "live" })]);
+    rw.gitIn(["config", "--local", "--add", `uzi-attempts.${RUN_BRANCH}.entry`,
+      JSON.stringify({ ...row, runId: "99999999-8888-4777-8666-555555555555", state: "retired" })]);
+    const result = await run(w);
+    assert.equal(result.scratch.state, "ran");
+    assert.deepEqual(result.scratch.run_local_sources, { attempt_ledger: 1 });
+    assert.deepEqual([...w.calls.discards], [], "the leaf is not deleted");
+    assert.equal(result.scratch.deleted, 0);
+  });
+});
+
 /** Drives the real Outbox to the settled manifest-only run directory a normally finished run leaves behind. */
 async function settleOutboxRun(rw: RunWorld, runId: string): Promise<string> {
   await rw.outbox.appendSegment(runId, 1, [{ seq: 1, kind: "text", payload: { text: "hi" } }]);
