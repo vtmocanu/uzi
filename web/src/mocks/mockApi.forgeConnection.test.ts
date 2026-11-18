@@ -67,5 +67,13 @@ describe("mockApi — forge connection duplicate guard", () => {
     expect(connection.forge_type).toBe("forgejo");
     expect(connection.base_url).toBe(HOST);
     expect(connection.id).not.toBe(gitlab.id);
+
+    // A distinct target is ADDED: the gitlab connection stays stored, unchanged.
+    const after = await api.listConnections();
+    expect(after.connections.find((c) => c.id === gitlab.id)).toEqual(gitlab);
+    expect(after.connections.find((c) => c.id === connection.id)).toMatchObject({
+      forge_type: "forgejo",
+      base_url: HOST,
+    });
   });
 });

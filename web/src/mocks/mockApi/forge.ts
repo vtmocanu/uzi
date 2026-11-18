@@ -207,7 +207,7 @@ export const forgeApi = {
     };
     connections = existing
       ? connections.map((c) => (c.id === existing.id ? conn : c))
-      : [conn];
+      : [...connections, conn];
     return delay({ connection: { ...conn } }, 600);
   },
   verifyConnection: async (id: string) => {
