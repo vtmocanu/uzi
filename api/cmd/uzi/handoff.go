@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
+	"time"
+	"unicode"
 
 	"github.com/spf13/cobra"
 
@@ -41,7 +44,7 @@ func newHandoffCmd(env Env, gf *globalFlags) *cobra.Command {
 			"with your own git credentials, and dispatches it; the worker commits onto that same\n" +
 			"branch, which you pull. Pass --issue to link an existing issue, --mr to open a merge request.\n\n" +
 			"Context comes from -m, or -f <file> ('-' for stdin), or piped stdin. The repo is\n" +
-			"auto-detected from the origin remote; pass --repo to override.\n\n" +
+			"auto-detected from the origin remote; pass --repo to pick among the repos origin matches (path and host).\n\n" +
 			"The dispatch confirmation prints how to pull, watch, continue, and clean up the run.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -56,7 +59,7 @@ func newHandoffCmd(env Env, gf *globalFlags) *cobra.Command {
 	handoff.Flags().Bool("then-fix", false, "after the review, auto-apply a fix run for its findings to the same branch (turns on --review)")
 	handoff.Flags().Bool("interactive", false, "Keep the task alive after signal_done to iterate conversationally; wind down with 'uzi run stop'")
 	handoff.Flags().Int64("issue", 0, "link this handoff to an existing issue IID")
-	handoff.Flags().String("repo", "", "repo id to run against (overrides origin auto-detection; see 'uzi repo list')")
+	handoff.Flags().String("repo", "", "repo id to run against (picks among the repos origin matches by path and host; see 'uzi repo list')")
 
 	handoff.AddCommand(newHandoffRmCmd(env, gf))
 	handoff.AddCommand(newHandoffReviewCmd(env, gf))
@@ -193,9 +196,10 @@ func resolveHandoffContext(env Env, msg, file string) (string, error) {
 
 // resolveHandoffRepo returns the repo id for the handoff. Handoff ALWAYS resolves origin,
 // because the seed push targets the local `origin` remote (runHandoffCreate step 2). When
-// --repo is set it is validated to name the SAME forge repo origin points at; otherwise the
-// origin path is matched against the caller's repos by PathWithNamespace (exactly one match
-// resolves, zero or many is a usage error naming --repo as the escape hatch).
+// --repo is set it is validated to name the SAME forge repo origin points at (path and host);
+// otherwise origin is matched against the caller's repos by PathWithNamespace and host
+// (exactly one match resolves). --repo only picks among the repos origin matches; it never
+// targets one origin does not point at.
 func resolveHandoffRepo(env Env, ctx context.Context, c uzicli.Client, repoFlag string) (string, error) {
 	// issue #403 F2: handoff pushes local HEAD to origin (git push origin …:refs/heads/<branch>),
 	// so the run's repo MUST be the same forge repo origin points at — else the worker clones a
@@ -211,30 +215,62 @@ func resolveHandoffRepo(env Env, ctx context.Context, c uzicli.Client, repoFlag 
 	path := parseRepoPath(origin)
 	if path == "" {
 		return "", uzicli.Exitf(uzicli.ExitUsage,
-			"could not parse origin %q into an owner/repo path; handoff pushes local HEAD to origin, so it must be a resolvable remote", origin)
+			"could not parse origin %q into an owner/repo path; handoff pushes local HEAD to origin, so it must be a resolvable remote", redactOrigin(origin))
+	}
+	info, err := parseRemote(origin)
+	if err != nil {
+		return "", uzicli.Exitf(uzicli.ExitUsage, "%v", err)
 	}
 	repos, err := c.ListRepos(ctx)
 	if err != nil {
 		return "", err
 	}
+	oh := &originHost{info: info, origin: origin}
+	originName := info.host + "/" + path
 
 	if repoFlag := strings.TrimSpace(repoFlag); repoFlag != "" {
 		for _, r := range repos {
-			if r.ID == repoFlag {
-				if r.PathWithNamespace != path {
-					return "", uzicli.Exitf(uzicli.ExitUsage,
-						"--repo %s (%s) does not match origin %s; handoff pushes local HEAD to origin, so they must be the same repo", repoFlag, r.PathWithNamespace, path)
-				}
-				return repoFlag, nil
+			if r.ID != repoFlag {
+				continue
 			}
+			if r.PathWithNamespace != path {
+				return "", uzicli.Exitf(uzicli.ExitUsage,
+					"--repo %s (%s/%s) does not match origin %s; handoff pushes local HEAD to origin, so they must be the same repo",
+					repoFlag, displayHost(webHost(r)), r.PathWithNamespace, originName)
+			}
+			resolved, rerr := oh.resolve(ctx, env)
+			if rerr != nil {
+				return "", rerr
+			}
+			if !hostsMatch(info.form, resolved, webHost(r)) {
+				return "", uzicli.Exitf(uzicli.ExitUsage,
+					"--repo %s (%s/%s) does not match origin %s%s; handoff pushes local HEAD to origin, so they must be the same repo",
+					repoFlag, displayHost(webHost(r)), r.PathWithNamespace, originName, oh.note(resolved))
+			}
+			return repoFlag, nil
 		}
 		return "", uzicli.Exitf(uzicli.ExitUsage,
 			"--repo %s is not one of your uzi repos (see 'uzi repo list')", repoFlag)
 	}
 
-	var matches []apitypes.RepoDTO
+	var pathMatches []apitypes.RepoDTO
 	for _, r := range repos {
 		if r.PathWithNamespace == path {
+			pathMatches = append(pathMatches, r)
+		}
+	}
+	if len(pathMatches) == 0 {
+		return "", uzicli.Exitf(uzicli.ExitUsage,
+			"could not match origin %s to a uzi repo; pass --repo <id> (see 'uzi repo list')", originName)
+	}
+	// Origin facts are evaluated once, and only now that a path-equal candidate exists.
+	resolved, err := oh.resolve(ctx, env)
+	if err != nil {
+		return "", err
+	}
+	var matches []apitypes.RepoDTO
+	for _, r := range pathMatches {
+		if hostsMatch(info.form, resolved, webHost(r)) {
 			matches = append(matches, r)
 		}
 	}
@@ -243,11 +279,358 @@ func resolveHandoffRepo(env Env, ctx context.Context, c uzicli.Client, repoFlag 
 		return matches[0].ID, nil
 	case 0:
 		return "", uzicli.Exitf(uzicli.ExitUsage,
-			"could not match origin %s to a uzi repo; pass --repo <id> (see 'uzi repo list')", path)
+			"could not match origin %s%s to a uzi repo on the same host; handoff pushes local HEAD to origin, so use an origin on the forge's host (an https remote works)", originName, oh.note(resolved))
 	default:
 		return "", uzicli.Exitf(uzicli.ExitUsage,
-			"origin %s is ambiguous — it matches %d uzi repos; pass --repo <id> to pick one (see 'uzi repo list')", path, len(matches))
+			"origin %s is ambiguous — it matches %d uzi repos; pass --repo <id> to pick one (see 'uzi repo list')", originName, len(matches))
 	}
+}
+
+// remoteForm is the syntax family of an origin URL.
+type remoteForm int
+
+const (
+	formHTTPS  remoteForm = iota + 1 // http:// and https://
+	formSCP                          // scp-like [user@]host:path
+	formSSHURL                       // ssh://[user@]host[:port]/path
+)
+
+// isSSH reports whether the remote is reached over ssh (scp-like or ssh://).
+func (f remoteForm) isSSH() bool { return f == formSCP || f == formSSHURL }
+
+// remoteInfo is what parseRemote extracts from an origin URL. host is lowercased only
+// (a trailing dot is kept, as ssh would pass it through).
+type remoteInfo struct {
+	form    remoteForm
+	host    string
+	user    string
+	port    string
+	hasUser bool
+	hasPort bool
+	path    string // ssh forms: the repo path git sends in its remote command
+	sshHost string // ssh forms: host as spelled in the origin, as git passes it to ssh
+}
+
+// parseRemote classifies an origin URL and extracts its host (and, for ssh, the user and
+// port that ssh -G needs). It fails closed: anything that is not http(s), ssh:// or the
+// scp-like form (git://, file://, git+ssh://, local paths, bracketed hosts) is an error
+// naming the origin, because the host cannot be compared with the forge's.
+func parseRemote(remote string) (remoteInfo, error) {
+	s := strings.TrimSpace(remote)
+	refuse := func(why string) (remoteInfo, error) {
+		return remoteInfo{}, fmt.Errorf("origin %q is not supported for handoff (%s); handoff pushes local HEAD to origin and must verify its host, so use an https or ssh remote", redactOrigin(remote), why)
+	}
+	if s == "" || strings.HasPrefix(s, "[") {
+		return refuse("unrecognized remote")
+	}
+	if i := strings.Index(s, "://"); i >= 0 {
+		scheme := strings.ToLower(s[:i])
+		switch scheme {
+		case "http", "https":
+			u, err := url.Parse(s)
+			if err != nil || u.Hostname() == "" {
+				return refuse("unparsable URL")
+			}
+			if hasSpaceOrControl(u.Hostname()) {
+				return refuse("whitespace or control character in host")
+			}
+			return remoteInfo{form: formHTTPS, host: strings.ToLower(u.Hostname())}, nil
+		case "ssh":
+			// git percent-decodes the whole ssh:// URL before splitting it, while
+			// url.Parse decodes only per component, so any '%' can make the host we
+			// verify differ from the one git connects to.
+			if strings.Contains(s, "%") {
+				return refuse("percent-encoding in an ssh:// URL")
+			}
+			u, err := url.Parse(s)
+			if err != nil || u.Hostname() == "" {
+				return refuse("unparsable URL")
+			}
+			info := remoteInfo{form: formSSHURL, host: strings.ToLower(u.Hostname()), sshHost: u.Hostname()}
+			if u.User != nil {
+				if _, hasPass := u.User.Password(); hasPass {
+					return refuse("password in an ssh:// user")
+				}
+				if u.User.Username() == "" {
+					return refuse("empty ssh user")
+				}
+				info.user, info.hasUser = u.User.Username(), true
+			}
+			if strings.HasSuffix(u.Host, ":") {
+				return refuse("empty ssh port")
+			}
+			if p := u.Port(); p != "" {
+				info.port, info.hasPort = p, true
+			}
+			if hasSpaceOrControl(info.host) || hasSpaceOrControl(info.user) || hasSpaceOrControl(info.port) {
+				return refuse("whitespace or control character in ssh host, user or port")
+			}
+			// git takes the path raw from the first '/' after the authority.
+			rest := s[i+3:]
+			if j := strings.Index(rest, "/"); j >= 0 {
+				info.path = gitSSHPath(rest[j:])
+			}
+			return info, nil
+		default:
+			return refuse("unsupported scheme " + scheme + "://")
+		}
+	}
+	// scp-like: only when a ':' appears before the first '/' (git's rule).
+	colon := strings.Index(s, ":")
+	slash := strings.Index(s, "/")
+	if colon < 0 || (slash >= 0 && slash < colon) {
+		return refuse("local path or unrecognized remote")
+	}
+	hostPart := s[:colon]
+	if strings.Contains(hostPart, "[") {
+		return refuse("bracketed host")
+	}
+	info := remoteInfo{form: formSCP}
+	if at := strings.LastIndex(hostPart, "@"); at >= 0 {
+		info.user, info.hasUser = hostPart[:at], true
+		hostPart = hostPart[at+1:]
+		if info.user == "" {
+			return refuse("empty ssh user")
+		}
+	}
+	if hostPart == "" {
+		return refuse("empty host")
+	}
+	info.host, info.sshHost = strings.ToLower(hostPart), hostPart
+	if hasSpaceOrControl(info.host) || hasSpaceOrControl(info.user) {
+		return refuse("whitespace or control character in ssh host or user")
+	}
+	info.path = gitSSHPath(s[colon+1:])
+	return info, nil
+}
+
+// redactOrigin drops the userinfo of a URL-form origin, so a password or token
+// embedded in it never reaches an error message. scp-like origins carry no password.
+func redactOrigin(remote string) string {
+	i := strings.Index(remote, "://")
+	if i < 0 {
+		return remote
+	}
+	rest := remote[i+3:]
+	auth := rest
+	if j := strings.IndexAny(rest, "/?#"); j >= 0 {
+		auth = rest[:j]
+	}
+	at := strings.LastIndex(auth, "@")
+	if at < 0 {
+		return remote
+	}
+	return remote[:i+3] + "<redacted>@" + rest[at+1:]
+}
+
+// gitSSHPath applies git's ssh path rule: "/~user/repo" is sent as "~user/repo".
+func gitSSHPath(p string) string {
+	if len(p) > 1 && p[0] == '/' && p[1] == '~' {
+		return p[1:]
+	}
+	return p
+}
+
+// receivePackCommand is the remote command git push runs over ssh for path: the default
+// receive-pack program with the path single-quoted as git's sq_quote does (' and ! leave
+// the quotes as \' and \!). ssh -G gets it
+// so that Match command / sessiontype rules resolve as they will for the push.
+func receivePackCommand(path string) string {
+	var b strings.Builder
+	b.WriteString("git-receive-pack '")
+	for _, r := range path {
+		if r == '\'' || r == '!' {
+			b.WriteString(`'\` + string(r) + `'`)
+			continue
+		}
+		b.WriteRune(r)
+	}
+	b.WriteString("'")
+	return b.String()
+}
+
+// hasSpaceOrControl reports whether s holds any whitespace or control rune (newline, tab,
+// NUL, DEL, ...). Such a value could forge a line of ssh -G output or garble a message.
+func hasSpaceOrControl(s string) bool {
+	return strings.IndexFunc(s, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) >= 0
+}
+
+// webHost is the lowercased host of a connected repo's forge web URL, "" when it is
+// empty or unparsable (and so never matches).
+func webHost(r apitypes.RepoDTO) string {
+	u, err := url.Parse(r.WebURL)
+	if err != nil {
+		return ""
+	}
+	return strings.ToLower(u.Hostname())
+}
+
+func displayHost(h string) string {
+	if h == "" {
+		return "(unknown host)"
+	}
+	return h
+}
+
+// hostsMatch is the pure per-candidate host comparison: both hosts must be known; https
+// compares them directly; ssh additionally accepts GitHub's ssh.github.com alias for
+// github.com (ssh only: an https remote never resolves through it).
+func hostsMatch(form remoteForm, resolved, web string) bool {
+	if resolved == "" || web == "" {
+		return false
+	}
+	if resolved == web {
+		return true
+	}
+	return form.isSSH() && resolved == "ssh.github.com" && web == "github.com"
+}
+
+// sshConfigTimeout bounds one ssh -G evaluation; tests shrink it.
+var sshConfigTimeout = 5 * time.Second
+
+// originHost memoizes the facts about origin's effective host for one handoff: the
+// resolved host, a refusal, or a failed ssh -G evaluation. It never memoizes a match
+// result, which is per candidate (hostsMatch).
+type originHost struct {
+	info     remoteInfo
+	origin   string
+	done     bool
+	host     string
+	err      error // refusal (usage error)
+	evalFail error // ssh -G evaluation failure: no resolved host, not a refusal
+}
+
+func (o *originHost) resolve(ctx context.Context, env Env) (string, error) {
+	if !o.done {
+		o.done = true
+		o.host, o.err = o.compute(ctx, env)
+	}
+	return o.host, o.err
+}
+
+// note renders the " (ssh -G resolved X)" / evaluation-failure suffix for messages.
+func (o *originHost) note(resolved string) string {
+	if !o.info.form.isSSH() {
+		return ""
+	}
+	if resolved != "" {
+		return " (ssh -G resolved " + resolved + ")"
+	}
+	if o.evalFail != nil {
+		return " (ssh -G evaluation failed: " + o.evalFail.Error() + ")"
+	}
+	return ""
+}
+
+func (o *originHost) compute(ctx context.Context, env Env) (string, error) {
+	info := o.info
+	if !info.form.isSSH() {
+		return info.host, nil
+	}
+	refuse := func(format string, a ...any) (string, error) {
+		return "", uzicli.Exitf(uzicli.ExitUsage, "origin %q: "+format+"; use an https remote instead", append([]any{redactOrigin(o.origin)}, a...)...)
+	}
+	// (a) transport overrides change where ssh actually connects, in ways ssh -G cannot see.
+	for _, k := range []string{"GIT_SSH", "GIT_SSH_COMMAND"} {
+		if env.envSet(k) {
+			return refuse("%s is set, which overrides the ssh transport, so the real host cannot be verified", k)
+		}
+	}
+	// GIT_CONFIG redirects `git config` (only) to one file, so the core.sshCommand lookup
+	// below would not see the scopes git push reads.
+	if env.envSet("GIT_CONFIG") {
+		return refuse("GIT_CONFIG is set, which hides the git configuration push uses, so core.sshCommand cannot be checked")
+	}
+	out, gerr := env.Git(".", "config", "--get", "core.sshCommand")
+	present, cerr := sshCommandConfigured(out, gerr)
+	if cerr != nil {
+		return refuse("could not determine whether core.sshCommand is set (%v)", cerr)
+	}
+	if present {
+		return refuse("core.sshCommand is set, which overrides the ssh transport, so the real host cannot be verified")
+	}
+	// (b) input validation: nothing option-shaped or explicitly empty reaches ssh.
+	if info.sshHost == "" || (info.hasUser && info.user == "") || (info.hasPort && info.port == "") {
+		return refuse("the ssh host, user or port is empty")
+	}
+	for _, v := range []string{info.sshHost, info.user, info.port} {
+		if strings.HasPrefix(v, "-") {
+			return refuse("the ssh host, user or port starts with '-'")
+		}
+	}
+	// git strips its repository-local variables (GIT_DIR, ...) before it starts ssh for
+	// the push; the installed git names them, and the probe drops the same set.
+	lev, lerr := env.Git(".", "rev-parse", "--local-env-vars")
+	localEnv := strings.Fields(lev)
+	if lerr != nil || len(localEnv) == 0 {
+		return refuse("could not list git's repository-local environment variables (%v)", lerr)
+	}
+	// git push runs ssh from the worktree root, whatever directory handoff starts in.
+	top, terr := env.Git(".", "rev-parse", "--show-toplevel")
+	top = strings.TrimSpace(top)
+	if terr != nil || top == "" {
+		return refuse("could not find the worktree root git push runs ssh from (%v)", terr)
+	}
+	// (c) ssh -G: evaluates (does not connect) the user's ssh config.
+	args := []string{"-G"}
+	if info.hasUser {
+		args = append(args, "-l", info.user)
+	}
+	if info.hasPort {
+		args = append(args, "-p", info.port)
+	}
+	// The origin's own spelling: ssh's %n (and so a Match exec rule) sees what git passes.
+	args = append(args, "--", info.sshHost, receivePackCommand(info.path))
+	cctx, cancel := context.WithTimeout(ctx, sshConfigTimeout)
+	defer cancel()
+	cfg, err := env.sshConfig(cctx, sshProbe{dir: top, unset: localEnv, args: args})
+	if err != nil {
+		o.evalFail = err
+		return "", nil
+	}
+	if len(cfg) > sshConfigMaxOutput {
+		o.evalFail = errSSHConfigOverflow
+		return "", nil
+	}
+	// (d) the effective hostname.
+	// Exactly one line of exactly two fields may name the hostname; anything else (a
+	// repeated or malformed line, control characters in the value) is an evaluation failure.
+	hostname := ""
+	seen := 0
+	for _, line := range strings.Split(cfg, "\n") {
+		f := strings.Fields(line)
+		if len(f) >= 1 && strings.EqualFold(f[0], "hostname") {
+			seen++
+			if len(f) == 2 {
+				hostname = f[1]
+			}
+		}
+	}
+	switch {
+	case seen == 0:
+		o.evalFail = errors.New("no hostname in ssh -G output")
+	case seen > 1 || hostname == "":
+		o.evalFail = errors.New("ambiguous hostname in ssh -G output")
+	case hasSpaceOrControl(hostname):
+		o.evalFail = errors.New("control character in ssh -G hostname")
+	default:
+		return strings.ToLower(hostname), nil
+	}
+	return "", nil
+}
+
+// sshCommandConfigured classifies the result of `git config --get core.sshCommand`:
+// success means set (any value, even empty); exit status 1 means unset; anything else
+// is an error the caller must treat as a refusal.
+func sshCommandConfigured(_ string, err error) (bool, error) {
+	if err == nil {
+		return true, nil
+	}
+	var ec interface{ ExitCode() int }
+	if errors.As(err, &ec) && ec.ExitCode() == 1 {
+		return false, nil
+	}
+	return false, err
 }
 
 // parseRepoPath extracts the owner/namespace/repo path from a git remote URL,

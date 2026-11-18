@@ -1856,7 +1856,8 @@ This does three things, in order, and stops before the third if either of the
 first two fails:
 
 1. **Create** — a new `task` run, on the repo matched from your `origin`
-   remote (`--repo <id>` overrides the auto-detection, see `uzi repo list`).
+   remote (`--repo <id>` only picks among the repos your origin matches, see
+   `uzi repo list`; see [Origin matching](#origin-matching) below).
    The server names the branch: `uzi/task/<run-id>`.
 2. **Push** — your local HEAD (or `--base <ref>`, if given) to that branch,
    with **your own** git credentials — the same push you'd type by hand.
@@ -1883,6 +1884,34 @@ git fetch origin uzi/task/<run-id> && git switch uzi/task/<run-id>
 Continuation is the same `uzi run follow-up <id>` you'd use on any other run;
 watch it with `uzi run get`/`uzi run logs --follow`, or drop into
 [`uzi tui`](#watching-runs-live-uzi-tui).
+
+### Origin matching
+
+Because the push goes to `origin`, the connected repo must be the one `origin`
+fetches from: its owner/repo path **and** its host must match. The check reads
+only the fetch URL (`git remote get-url origin`). It does not check a push URL,
+a `pushInsteadOf` rewrite, extra `remote.origin.url` values or a custom
+`remote.origin.receivepack`, so with any of those the push can go elsewhere.
+Check the push destination with `git remote get-url --push --all origin` before
+you run handoff. `--repo` never bypasses this check; it only picks among repos
+that already match.
+
+- **https / http origin:** the host must equal the host of the forge's web URL.
+- **SSH origin (scp-like `git@host:owner/repo` or `ssh://`):** the host your SSH
+  config resolves to must be the forge's web host (or `ssh.github.com` for a
+  GitHub repo on `github.com`). The CLI finds it with `ssh -G`, passing the
+  remote's user, port and the `git-receive-pack` command the push runs, so
+  `Match command` rules resolve as they will for the push. `ssh -G` does not connect, but it does evaluate your
+  SSH config, including any `Match exec` blocks, which can run local commands.
+- **Transport overrides are refused**, even when empty: `GIT_SSH`,
+  `GIT_SSH_COMMAND` and `core.sshCommand` can send the push somewhere `ssh -G`
+  cannot see. `GIT_CONFIG` is refused too: it hides from `git config` the
+  settings the push reads. Use an https remote instead.
+- **Anything else is refused:** `git://`, `file://`, `git+ssh://`, local paths
+  and other schemes, an `ssh://` origin containing `%` or a password, and any
+  origin whose host, user or port holds whitespace or control characters.
+
+No flag bypasses the check.
 
 A few things worth knowing before you rely on this:
 

@@ -2215,8 +2215,12 @@ EOF
 # child sees ONLY that env — it needs a global config FILE.
 #
 # The origin is a REAL git-over-https URL to forge-fake's host-published git smart-HTTP
-# endpoint (https://uzi-bot:<pat>@127.0.0.1:<port>/group/repo.git), NOT an insteadOf
-# rewrite to the local bare. insteadOf is fundamentally incompatible with handoff here:
+# endpoint (https://uzi-bot:<pat>@forge-fake.e2e:<port>/group/repo.git), NOT an insteadOf
+# rewrite to the local bare. Handoff only accepts an origin whose HOST equals the host of
+# the connected repo's forge web URL (forge-fake.e2e), and forge-fake.e2e does not resolve
+# on the host, so `http.curloptResolve` below maps forge-fake.e2e:<port> to 127.0.0.1 (the
+# published port): the URL names the forge host, the TCP connection still lands locally.
+# insteadOf is fundamentally incompatible with handoff here:
 # `git remote get-url origin` EXPANDS insteadOf, so resolveHandoffRepo (handoff.go) would
 # read the rewritten LOCAL PATH instead of the https URL and parseRepoPath could never
 # derive `group/repo` from it (a bare filesystem path has no url.Parse Host, so it yields
@@ -2227,8 +2231,9 @@ EOF
 #
 # safe.directory=* is retained for the same #366 dubious-ownership reason the worker's
 # gitconfig documents, and http.sslVerify=false because forge-fake's cert is self-signed
-# for forge-fake.e2e while we connect to 127.0.0.1 (no name match), so the host CLI's git
-# over https must not verify. env -i cannot pass an inline `-c`, hence the file.
+# for forge-fake.e2e; the origin host now matches that name, but the cert is not chained to
+# a trusted CA, so the host CLI's git over https must still not verify. env -i cannot pass
+# an inline `-c`, hence the file.
 #
 # This file is NOT sufficient on its own: GIT_CONFIG_GLOBAL only replaces the GLOBAL scope,
 # so the runner's SYSTEM /etc/gitconfig is still read and its URL-scoped keys outrank this
@@ -2241,6 +2246,7 @@ cat > "$RUNROOT/host-gitconfig" <<EOF
 	directory = *
 [http]
 	sslVerify = false
+	curloptResolve = forge-fake.e2e:${FAKE_PORT}:127.0.0.1
 EOF
 
 # Per-run env-file: strong generated secrets for the base stack + the scratch dir
