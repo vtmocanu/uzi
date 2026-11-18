@@ -260,6 +260,11 @@ for (const width of [1440, 400]) {
     it(`a deep link to ${NEAR_END_ID} too close to the page end to reach the line lights its own pill`, async () => {
       await mount(width, TALL[width], `#${NEAR_END_ID}`);
       const target = document.getElementById(NEAR_END_ID)!;
+      // The page owns a delayed jump. Wait for it and its clamp, rather than
+      // assuming mount's first frame means the deep-link scroll already ran.
+      await expect.poll(() => window.scrollY, { message: "the page actually scrolled" }).toBeGreaterThan(0);
+      await expect.poll(() => window.scrollY + window.innerHeight, { message: "page is scrolled to its end" })
+        .toBeGreaterThanOrEqual(document.documentElement.scrollHeight - 1);
       // Precondition: the page could not bring the target up to the reading line.
       await nextFrame();
       expect(target.getBoundingClientRect().top, "target stays below the reading line").toBeGreaterThan(readingLine());

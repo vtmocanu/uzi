@@ -301,7 +301,8 @@ describe("agent-source Health navigation", () => {
     await waitFor(() => expect(mockApi.getAgentSource).toHaveBeenCalledTimes(1));
     const section = document.getElementById("agent-source")!;
     expect(section).toBeTruthy();
-    expect(scroll.mock.contexts).toContain(section);
+    // The deep-link jump runs two frames after the load (it waits for the pinned offset).
+    await waitFor(() => expect(scroll.mock.contexts).toContain(section));
     expect(scroll).toHaveBeenCalledWith({ block: "start" });
     await within(section).findByRole("heading", { name: /Agent source/ });
     scroll.mockClear();

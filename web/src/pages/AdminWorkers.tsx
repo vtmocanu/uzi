@@ -62,11 +62,25 @@ export function AdminWorkers() {
     if (loaded && ADMIN_WORKERS_ANCHOR_IDS.has(hash.slice(1))) {
       // Near the page end the scroll cannot bring the target to the line: remember it so
       // evaluate() lights its own pill.
-      pendingRef.current = hash.slice(1);
-      document.getElementById(hash.slice(1))?.scrollIntoView?.({ block: "start" });
-      // A page already at its end does not move, so no observer fires: evaluate once.
-      const raf = requestAnimationFrame(() => evaluateRef.current?.());
-      return () => cancelAnimationFrame(raf);
+      const id = hash.slice(1);
+      // The section pills mount with this load, so the pinned block grows in the same
+      // commit and its ResizeObserver rewrites --pinned-h (the root scroll-padding) only
+      // after the next layout. Scroll two frames later, once that offset is current, so
+      // the card is not left under the pill row; then evaluate once (a page already at
+      // its end does not move, so no observer fires).
+      let raf2 = 0;
+      const raf = requestAnimationFrame(() => {
+        raf2 = requestAnimationFrame(() => {
+          // Set right before the jump: an observer evaluation during the delay clears it.
+          pendingRef.current = id;
+          document.getElementById(id)?.scrollIntoView?.({ block: "start" });
+          evaluateRef.current?.();
+        });
+      });
+      return () => {
+        cancelAnimationFrame(raf);
+        cancelAnimationFrame(raf2);
+      };
     }
   }, [loaded, hash, key]);
 
