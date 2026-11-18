@@ -11,6 +11,16 @@ import (
 // Reconcile context.
 type placementTickKey struct{}
 
+// placementClaimChanged detects fresh evidence that the tick's counted claim is
+// no longer the same placement input. Size and resourceVersion changes do not
+// affect placement; identity, presence and the create-time stamp do.
+func placementClaimChanged(before, after *reconcile.ClaimObservation) bool {
+	if before == nil || after == nil {
+		return before != after
+	}
+	return before.UID != after.UID || before.PlacementNew != after.PlacementNew
+}
+
 // newPlacementStamped reports whether a worker renders the new placement: newPlacement is
 // configured and every observed PVC (Terminating included) carries the stamp. A worker with
 // no PVCs counts as stamped, because every PVC it creates this tick is stamped.

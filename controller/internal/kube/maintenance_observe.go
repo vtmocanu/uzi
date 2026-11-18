@@ -83,7 +83,10 @@ func (m *Materializer) maintenanceObservation(ctx context.Context, id, ns string
 	o.DinDPVCUID, o.DinDPVCPhase = "", ""
 	o.DinDPVCLive = false
 	o.DinDPVCCreatedAt = nil
+	o.DinDClaim = nil
 	if o.HasDinDDataPVC {
+		claim := claimObservationOf(ns, id, p)
+		o.DinDClaim = &claim
 		o.DinDPVCUID = string(p.UID)
 		o.DinDPVCLive = p.DeletionTimestamp == nil
 		o.DinDPVCPhase = string(p.Status.Phase)
