@@ -421,7 +421,7 @@ control is still absent, not that the functional criterion was deferred.
 | Transactional frozen binding rewrite, capability revoke/remint and post-commit material response | U10 credits the zero-row fences (binding, mint redundant ×3, journal, stamp, message, last_seq), the commit-error check, material returned only after commit (c) and the persisted new hash, with the existing error-injection rollback test; A's refusal after remint by B5/B6; per-statement server-error returns (argued equivalent), the empty-AccessToken check and the caller's deferred rollback not separately controlled |
 | Ordinal-zero baseline, successor journal ordinal/capability relation and usage attribution | U11 credits typed baseline-missing and baseline-match refusals (preflight), exact ordinal N+1 and its restart per generation, journal epoch independence from the ordinal, and B usage attribution via the preserved clamp (b); per-field baseline comparisons, the epoch<=0 refusal, the uncommitted-ordinal and generation-scope clamp branches on the Codex path, and cross-generation spend joins not controlled |
 | Atomic rollback, lost-reply replay, stale/foreign apply and target fences | U10 rollback; U12 credits the Codex replay answer and its redundant no-material copies, the new-generation replay fence (b) and the non-owner ErrRunNotOwned ownership query (b; the refusal itself has at least four copies, not isolated), all through apply; and nonce/generation/released/status fence conjuncts, op mismatch, target mismatch and both target-moved checks through preflight; preflight's own non-owner refusal, the validator replay copy, Step 1 worker check, apply Step 0 copies, other fence conjuncts, the stamp checks, target sub-checks and old-alias refusals not controlled |
-| Stopped-support negotiation, immutable expected-epoch latch and unsupported-response obligation | Unvalidated |
+| Stopped-support negotiation, immutable expected-epoch latch and unsupported-response obligation | U13 credits owner-request negotiation/stopped/heartbeat refusals, both negotiation conjuncts, preflight worker_upgrade_required, worker stopped admission (capability and feature), untyped-refusal retained stop, settlement after withdrawal, the frozen tuple and the successor epoch latch; the runner's own admission check and the fence/Step 0 negotiation copies not controlled |
 | Stopped numeric epoch equality: stale/mismatched running and paused, applied successor | D controls: five individually executed cases above |
 | Stopped pending-input exclusion for eight named kinds in running and paused states | D controls: sixteen individually executed cases above; other control flags/cutoffs unvalidated |
 | Paused replay rejects expired wall budget | D: paused_expired_budget; other wall-budget branches unvalidated |
@@ -2771,3 +2771,101 @@ refusal (:133–134, seen still refusing in u12-fence-gen); the target generatio
 target auth mode (:200) and target account key (:261) checks; old-alias
 `credential_changed`/`credential_gone` refusals (:208–217, :239–244); and
 apply-route reds for the validator conjuncts.
+
+### U13 — stopped-support negotiation, expected-epoch latch and unsupported-response obligation (2026-11-18)
+
+Baselines: at a233883de3c36bae2e940f999cd9d582889dad00 none of these seams
+exist — `api/internal/workersvc/credential_switch_codex.go`,
+`api/internal/workersvc/codex_switch_stopped.go` and
+`agent/src/codex-switch-preflight.ts` are absent, `agent/src/client.ts` has no
+`codex_switch_stopped_v1` or `settleCodexSwitchStopped`, the a233
+`run_credential.go` has no `CodexSwitchStoppedV1`, and a233 refused every
+Codex owner request (credential_override.go :204, see D74) and live switch
+(runner.ts :25735–25738). All controls are class (d).
+
+Mechanism (candidate):
+- Server negotiation: `codexSwitchNegotiated` (credential_switch_codex.go
+  :393–395) requires the `codex_credential_switch_v1` capability and
+  `currentSwitchApplyRegistration` (:398–402: the snapshot nonce equals the
+  apply nonce). The owner request refuses with
+  `CredentialSwitchWorkerUnsupportedError` when the holding worker is not
+  negotiated, lacks `codex_switch_stopped_v1`, or has a stale heartbeat
+  (run_credential.go :635); worker preflight answers
+  `not_applied/worker_upgrade_required` without stopped support
+  (credential_switch_codex.go :78–80).
+- Worker admission: `supportsCodexSwitchStopped` (client.ts :2209–2212)
+  requires this registration's stopped capability and the server's stopped
+  feature as well as Codex apply.
+- Unsupported-response obligation: a preflight refusal whose reason is not in
+  the typed set (e.g. `worker_upgrade_required`) is a retained stop, never a
+  clear (codex-switch-preflight.ts :125). After admission, a withdrawn feature
+  does not cancel the one bounded stopped settlement on the admitted tuple
+  (`settleCodexSwitchStopped`, client.ts :2215–2240, deliberately not gated on
+  the feature; a nonce change fences it).
+- Epoch latch: the runner freezes `{claimGeneration, registerNonce,
+  expectedEpoch}` from the first READY (runner.ts :17430, :17494–17496) and
+  replays that identical tuple; a successor READY with a different epoch
+  pauses instead of applying (:17595).
+
+New test (69c028a39): `TestOwnerCodexSwitchUnsupportedWorkerLiveDB`
+(api/internal/workersvc/credential_switch_codex_owner_unsupported_livedb_test.go),
+leaves supported (:49, :52), missing_switch_capability,
+stale_apply_registration, missing_stopped_capability, stale_heartbeat: each
+refusal must be `CredentialSwitchWorkerUnsupportedError` (:58) with the switch
+stamp unchanged (:62) and no target written (:65). Existing: the handler route
+test `TestWorkerCodexSwitchPreflightRouteLiveDB`
+(api/internal/handler/codex_switch_preflight_routes_livedb_test.go, leaf
+missing_stopped_support, :38, assertion :55), `codex-switch-preflight.test.ts`
+("committed or unknown refusal retains A gate", :179–183),
+`client-credential-switch-apply.test.ts` (stopped admission matrix :573–582;
+settlement after withdrawal :584–600) and the executor matrix
+(`Codex real Runner pending op disappears after clean A teardown (…)`, frozen
+identical tuple asserted at :32770–32780; `Codex real Runner rejects successor
+READY epoch 12 after latching epoch 11`, :34277).
+
+Commands. Go (export of 69c028a39, throwaway postgres `cdr-4202-u13pg`): from
+api, `GOFLAGS='-p=1 -buildvcs=false' GOMAXPROCS=4 go test -race -count=1
+-timeout=6m <package> -run '<selection>' -v`. Agent (export of 69c028a39 with
+the primary agent/node_modules symlinked): `npm run typecheck && node --import
+tsx --test --test-timeout=120000 --test-name-pattern='<pattern>' <file>`.
+Logs `.uzi/scratch/ctl-logs/<log name>.{diff,log}`.
+
+| Control | Kind | Mutation | Selection | Red at |
+|---|---|---|---|---|
+| u13-own-negotiated | (d) guard | owner request `!codexSwitchNegotiated(w)` → `false` (run_credential.go :635) | unsupported leaves missing_switch_capability, stale_apply_registration | :58 "… not refused as unsupported: <nil>", both |
+| u13-own-stopped | (d) guard | owner request stopped-capability check → `false` (:635) | missing_stopped_capability | :58 |
+| u13-own-heartbeat | (d) guard | owner request stale-heartbeat check → `false` (:635) | stale_heartbeat | :58 |
+| u13-neg-cap | (d) guard | `codexSwitchNegotiated` capability conjunct → `true` (credential_switch_codex.go :394) | missing_switch_capability | :58 |
+| u13-neg-reg | (d) guard | `codexSwitchNegotiated` registration conjunct → `true` (:394) | stale_apply_registration | :58 |
+| u13-preflight-stopped | (d) guard | preflight stopped-support check → `false && …` (:78) | handler preflight route, missing_stopped_support | handler test :55 "unnegotiated preflight status=200 body={\"outcome\":\"fenced\" …}" (want not_applied/worker_upgrade_required) |
+| u13-w-unknown-reason | (d) guard | untyped-reason retained stop made unsatisfiable (`… && Number.NaN > 0`, codex-switch-preflight.ts :125) | unknown refusal retains A gate | codex-switch-preflight.test.ts :181 (retained_stop expected) |
+| u13-w-admit-cap | (d) guard | `supportsCodexSwitchStopped` capability conjunct → `(… \|\| true)` (client.ts :2211) | stopped admission matrix | client test :579 |
+| u13-w-admit-feature | (d) guard | its feature conjunct → `true` (:2211) | stopped admission matrix | client test :579 |
+| u13-w-withdrawal | (d) behavioural mutation | settlement additionally gated on `supportsCodexSwitchStopped()` (client.ts :2220) | settlement after withdrawal | client test :593 (the admitted settlement after withdrawal returned unconfirmed, not confirmed) |
+| u13-w-latch-frozen | (d) guard | `Object.freeze({…})` → `({…})` for the stopped tuple (runner.ts :17494) | clean-stopped-lost-reply | executor :34285 "fake ownership is independent of local park evidence": the frozen-tuple assertion (:32776) runs inside the production-called settlement hook, so its failure surfaced as a missing park, not at :32776 |
+| u13-w-latch-successor | (d) guard | successor epoch inequality made unsatisfiable (`Number.NaN > 0 && …`, runner.ts :17595) | successor READY epoch 12 after latching 11 | executor :34277 "advanced successor epoch reached a forbidden second apply" |
+
+Not credited: the first u13-w-unknown-reason (`false && …`) and u13-w-admit-cap
+(`true && …`) forms failed typecheck (TS2339, TS6133;
+`*.compilefail.log`). The runner's own admission check
+`!this.client.supportsCodexSwitchStopped()` (runner.ts :17380) has no control
+(the executor matrix stubs `supportsCodexSwitchStopped`); the feature-withdrawal
+matrix leaf `clean-stopped-withdrawn` and `clean-stopped-unsupported` are
+positive only; `codexSwitchFence`'s negotiation conjunct (:324) and apply Step 0's
+(credential_switch_apply.go :309) are redundant copies not isolated here (see
+U12).
+
+Unchanged candidate 69c028a39: the unsupported-worker and preflight tests
+(workersvc), the handler preflight route test, the two agent unit files (140/140)
+and the seven executor cases pass, EXIT=0
+(`.uzi/scratch/ctl-logs/u13-green-{workersvc,handler,agent}.log`); `task lint:api`
+0 issues (`u13-lint-api.log`).
+
+Credit: the owner request refuses an un-negotiated, stopped-unsupported or
+stale worker as unsupported without writing the stamp; negotiation needs both
+the Codex capability and a current apply registration; preflight without
+stopped support answers `worker_upgrade_required`; the worker admits a Codex
+switch only with both the stopped capability and feature, treats an untyped
+refusal as a retained stop, keeps the one admitted settlement after feature
+withdrawal, freezes the expected-epoch tuple, and refuses a successor whose
+epoch moved.
