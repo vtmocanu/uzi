@@ -72,6 +72,19 @@ function verifyNodes(nodes, packages, name, findings, errors) {
   }
 }
 
+function verifyManifest(manifest, root) {
+  const mismatch = () => { throw new Error('manifest and lockfile disagree; regenerate the lockfile'); };
+  if (!object(manifest) || !object(root)) mismatch();
+  for (const field of ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies']) {
+    const declared = manifest[field] === undefined ? {} : manifest[field];
+    const locked = root[field] === undefined ? {} : root[field];
+    if (!object(declared) || !object(locked)) mismatch();
+    const entries = Object.entries(declared);
+    if (entries.length !== Object.keys(locked).length || entries.some(([name, spec]) =>
+      typeof spec !== 'string' || !Object.hasOwn(locked, name) || locked[name] !== spec)) mismatch();
+  }
+}
+
 // Each traversal owns its visited set: caching a partial cyclic traversal can lose roots.
 function rootsFor(start, records) {
   const roots = new Map(), visited = new Set(), pending = [start], errors = [];
@@ -102,7 +115,7 @@ function rootsFor(start, records) {
   return { roots: [...roots.values()], errors };
 }
 
-export function evaluate({ rows, component, level, auditJson, lockJson, today }) {
+export function evaluate({ rows, component, level, auditJson, lockJson, manifestJson, today }) {
   const findings = [], lifecycle = [], errors = [], used = new Set(), accepted = new Map();
   const threshold = severity(level);
   const now = day(today);
@@ -111,6 +124,7 @@ export function evaluate({ rows, component, level, auditJson, lockJson, today })
       auditJson.error != null) throw new Error('unsupported audit report');
   if (!object(lockJson) || lockJson.lockfileVersion !== 3 || !object(lockJson.packages)) throw new Error('unsupported lockfile');
   const applicable = rows.filter(row => row.component === component);
+  if (applicable.length) verifyManifest(manifestJson, lockJson.packages['']);
   // Validate programmatic inputs too, not only the TSV parser's output.
   parseRows(columns.join('\t') + '\n' + rows.map(row => columns.map(key => row[key]).join('\t')).join('\n'), today);
   const records = auditJson.vulnerabilities;
@@ -199,7 +213,8 @@ function main(args) {
   if (mode === 'has-rows') return rows.some(row => row.component === component) ? 0 : 3;
   if (!rows.some(row => row.component === component)) throw new Error('no applicable exception rows');
   const result = evaluate({ rows, component, level, today,
-    auditJson: readJson(auditPath, 'audit'), lockJson: readJson(resolve(packageRoot, 'package-lock.json'), 'lockfile') });
+    auditJson: readJson(auditPath, 'audit'), lockJson: readJson(resolve(packageRoot, 'package-lock.json'), 'lockfile'),
+    manifestJson: readJson(resolve(packageRoot, 'package.json'), 'manifest') });
   for (const message of result.messages) process[result.code ? 'stderr' : 'stdout'].write(message + '\n');
   return result.code;
 }

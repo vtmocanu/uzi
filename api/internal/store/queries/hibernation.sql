@@ -37,7 +37,11 @@ UPDATE workers SET
     last_wake_settled_at = sqlc.narg('last_wake_settled_at'),
     hibernation_blocked_reason = sqlc.narg('hibernation_blocked_reason'),
     hibernation_blocked_at = sqlc.narg('hibernation_blocked_at'),
-    hibernation_blocked_since = sqlc.narg('hibernation_blocked_since')
+    hibernation_blocked_since = sqlc.narg('hibernation_blocked_since'),
+    hibernation_origin_op_id = sqlc.narg('hibernation_origin_op_id'),
+    hibernation_admit_origin = sqlc.narg('hibernation_admit_origin'),
+    hibernation_wake_origin = sqlc.narg('hibernation_wake_origin'),
+    last_manual_wake_settled_at = sqlc.narg('last_manual_wake_settled_at')
 WHERE id = @id
 RETURNING *;
 

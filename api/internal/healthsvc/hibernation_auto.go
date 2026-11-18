@@ -125,7 +125,9 @@ func hibernationIdleFor(d time.Duration) string {
 // hibernated by the automatic pass: either the pass recorded a blocker for it (a recovery
 // custody hold, cordon, maintenance, roll, ...) or every run assigned to it is parked and the
 // oldest parked run is older than the idle threshold. `na` when no hosted workers are
-// configured or automatic hibernation is off (hibernation enabled AND automatic both on);
+// configured or automatic hibernation is off (hibernation enabled AND automatic both on; with
+// surplus mode on the idle rows are judged by the pass's own long eligibility, see
+// ListAutoHibernationBlockersSurplusMode);
 // `unknown` when a setting or the query cannot be read. The summary is fixed text. Evidence
 // is the exact worker count (one statement over both disjoint sources), then at most
 // hibernationEvidenceRows rows in total (idle workers first), then an explicit More row when the
@@ -165,9 +167,24 @@ func (s *Service) checkFleetHibernation(ctx context.Context, now time.Time, work
 	if err != nil {
 		return unknown("worker_hibernation_idle_after", err)
 	}
-	cutoff := pgconv.Time(now.Add(-idleAfter))
-	rows, err := s.cfg.Store.ListAutoHibernationBlockers(ctx, store.ListAutoHibernationBlockersParams{Cutoff: cutoff, MaxRows: hibernationEvidenceRows})
+	surplus, err := s.cfg.Settings.WorkerHibernationSurplus(ctx)
 	if err != nil {
+		return unknown("worker_hibernation_surplus", err)
+	}
+	cutoff := pgconv.Time(now.Add(-idleAfter))
+	var rows []store.ListAutoHibernationBlockersRow
+	if surplus {
+		// Surplus mode (issue #4395): pooled workers are judged by the owner-clock long anchor, the
+		// same eligibility the policy pass uses; the rows have the same shape and render the same.
+		sr, err := s.cfg.Store.ListAutoHibernationBlockersSurplusMode(ctx, store.ListAutoHibernationBlockersSurplusModeParams{Cutoff: cutoff, MaxRows: hibernationEvidenceRows})
+		if err != nil {
+			return unknown("blockers", err)
+		}
+		rows = make([]store.ListAutoHibernationBlockersRow, len(sr))
+		for i, r := range sr {
+			rows[i] = store.ListAutoHibernationBlockersRow(r)
+		}
+	} else if rows, err = s.cfg.Store.ListAutoHibernationBlockers(ctx, store.ListAutoHibernationBlockersParams{Cutoff: cutoff, MaxRows: hibernationEvidenceRows}); err != nil {
 		return unknown("blockers", err)
 	}
 	if len(rows) == 0 {

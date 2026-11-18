@@ -631,7 +631,13 @@ a new checkpoint or an available recovery archive.
 An **online** worker is heartbeating to uzi; it may still be unable to reach
 the forge directly. An applied exhausted clone/fetch retry group updates a
 cooldown for that authenticated owner, worker and canonical actual Git
-origin. Repositories sharing that origin share the cooldown on that worker;
+origin. A publication park after an exhausted transient failure (see
+[Forge unreachable while publishing](#forge-unreachable-while-publishing))
+updates it too: the stamped Git origin for a push or base refresh, the
+API origin for merge request creation. Its retry time is then the later of the
+capped backoff and that origin's cooldown. A worker-reported publication
+hold updates no cooldown, since the forge did not fail.
+Repositories sharing that origin share the cooldown on that worker;
 another worker or origin has its own admission decision.
 
 Before the cooldown is due, that worker cannot claim the affected origin.
@@ -726,15 +732,17 @@ permission errors, history or movement proofs, local git errors, aborts and
 residue blocks. The hops after the merge request exists are unchanged and
 are not covered: description publish, title read/write and PR-head verify.
 
-One refusal that looks permanent is retried: a push refused only with git's
-bare `! [remote rejected] <src> -> <dst> (failed)` line, with no other
-diagnostic (observed from GitHub; reason undocumented, and whether it is transient is unproven). It is treated as
+Two refusals that look permanent are retried: a push refused only with git's
+bare `! [remote rejected] <src> -> <dst> (failed)` or
+`! [remote rejected] <src> -> <dst> (missing necessary objects)` line, with no
+other diagnostic (both observed from GitHub; reasons undocumented, and whether
+they are transient is unproven). Either is treated as
 transient and the same non-forced push is retried on the same schedule, with
 the full publication proof on every attempt. If it keeps failing, it is
 classified `publication_forge_unreachable` like any other exhausted push. Any
 other reason, a `[rejected]` line, authentication, protected-branch or hook
 refusals, workflow scope and push protection stay permanent. A deterministic
-refusal that prints only `(failed)` is therefore retried too: a run that is not
+refusal that prints only one of those two reasons is therefore retried too: a run that is not
 enrolled pays about 31 s of backoff before failing, and an enrolled run retries
 until a publication park at or past the hold threshold
 (`RUN_PROVIDER_PARK_MAX_DURATION`); the threshold is checked only at park
