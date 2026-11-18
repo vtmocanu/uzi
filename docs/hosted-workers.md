@@ -630,7 +630,7 @@ How the stamp works:
 Before you start, check the worker StorageClass (`workers.storageClass`, or the cluster
 default when it is empty). It must use `volumeBindingMode: WaitForFirstConsumer`, or
 otherwise provision in the new pool's zone. With `Immediate` binding a recreated volume
-is provisioned before any pod asks for it and can land in the old zone, after step 2.4
+is provisioned before any pod asks for it and can land in the old zone, after step 2.5
 has already deleted the worker's data; the worker then stays Pending on the new pool.
 Delayed binding alone is not enough: the provisioner must also be able to create
 volumes in the new pool's topology (no `allowedTopologies` or storage policy limited to
@@ -654,10 +654,16 @@ Procedure:
       terminated. Under GitOps, pause self-heal for it first, or the sync restores it.
    3. Scale the worker's Deployment (`uzi-hw-<id>`, where `<id>` is the worker id) to 0
       and confirm no worker pod exists.
-   4. Delete all of the worker's volumes (`uzi-hw-<id>-data`, `uzi-hw-<id>-nix`, and
+   4. Before deleting anything, confirm the restore in step 5 can be admitted: the
+      paced roll's prerequisites hold for this worker (usable, uncordoned coverage from
+      another worker of the same owner and lane where pacing requires it, capability
+      coverage where required, a known image and version, and no blocking canary in
+      flight). If they do not, postpone the move: the restore waits on them, and the
+      worker stays at zero replicas. Do not weaken pacing to get past it.
+   5. Delete all of the worker's volumes (`uzi-hw-<id>-data`, `uzi-hw-<id>-nix`, and
       `uzi-hw-<id>-dind-data` on Docker workers) and confirm they are gone, not
       Terminating.
-   5. Start the controller again (restore its replicas and self-heal). On the following
+   6. Start the controller again (restore its replicas and self-heal). On the following
       reconcile passes it creates the volumes stamped, re-renders the worker's
       Deployment with the new placement, and restores its replicas once the existing
       placement guards permit: the controller does not start a worker pod over a
@@ -666,7 +672,7 @@ Procedure:
       for the worker, a free roll slot in its pool, no other unpromoted canary), so it
       can wait on that. With a `WaitForFirstConsumer` StorageClass the volumes bind in the
       new zone when the pod is scheduled.
-   6. Confirm the worker is online on a new node, then uncordon it.
+   7. Confirm the worker is online on a new node, then uncordon it.
 3. When no unstamped worker remains, copy `newPlacement` into `workers.nodeSelector` and
    `workers.tolerations` first, then clear `newPlacement`. Helm merges maps into the
    chart default, so an empty `nodeSelector: {}` keeps the default
@@ -683,7 +689,7 @@ kubectl get pvc -n <worker namespace> \
 
 Caveats:
 
-- Step 2.4 permanently deletes the worker's `/data` (run clones and the recovery store)
+- Step 2.5 permanently deletes the worker's `/data` (run clones and the recovery store)
   and any Docker state. The controller does not guard a manual delete, so step 2.1 is the
   only safety gate.
 - While the controller is stopped, no worker is provisioned, rolled, hibernated or
