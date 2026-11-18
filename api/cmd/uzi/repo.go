@@ -153,9 +153,10 @@ func vaultLockedNote(gf *globalFlags) string {
 // close-quote, backslash-quote, reopen-quote) unless it is
 // non-empty and made only of characters that are safe unquoted.
 func shellQuote(s string) string {
-	safe := s != ""
+	// A leading '=' is not safe: zsh expands a word starting with it to a command path.
+	safe := s != "" && s[0] != '='
 	for _, r := range s {
-		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("._:/@=+-", r)) {
+		if !shellSafeRune(r) {
 			safe = false
 			break
 		}
@@ -164,6 +165,10 @@ func shellQuote(s string) string {
 		return s
 	}
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+func shellSafeRune(r rune) bool {
+	return r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("._:/@=+-", r)
 }
 
 // runEnvValueCell is the VALUE column: a secret never shows a value, a plain value

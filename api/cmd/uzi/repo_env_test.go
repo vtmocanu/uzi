@@ -73,7 +73,7 @@ func TestRepoEnvListRequiresRepo(t *testing.T) {
 }
 
 func TestRepoEnvListVaultLockedNote(t *testing.T) {
-	const note = "Your vault is locked"
+	const note = "Your vault is locked or its state could not be checked: plain values are withheld. If it is locked, run uzi vault unlock"
 	locked := repoEnvFake()
 	locked.RepoEnvResult.VaultLocked = true
 	out, errOut, code := runCLI(t, fakeEnv(locked), "repo", "env", "list", "r1")
@@ -113,5 +113,22 @@ func TestRepoEnvListVaultLockedNoteCarriesFlags(t *testing.T) {
 	const want = "uzi vault unlock --context 'my ctx' --url https://uzi.example.com"
 	if !strings.Contains(errOut, want) {
 		t.Errorf("note missing %q: %q", want, errOut)
+	}
+}
+
+func TestShellQuote(t *testing.T) {
+	for in, want := range map[string]string{
+		"":                    "''",
+		"prod":                "prod",
+		"https://u.example/x": "https://u.example/x",
+		"my ctx":              "'my ctx'",
+		"o'brien":             `'o'\''brien'`,
+		"$HOME":               "'$HOME'",
+		"=foo":                "'=foo'",
+		"a=b":                 "a=b",
+	} {
+		if got := shellQuote(in); got != want {
+			t.Errorf("shellQuote(%q) = %s; want %s", in, got, want)
+		}
 	}
 }
