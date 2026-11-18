@@ -125,6 +125,9 @@ func newRepoEnvCmd(env Env, gf *globalFlags) *cobra.Command {
 					uzicli.CellText(v.Description), v.UpdatedAt.UTC().Format("2006-01-02 15:04:05Z"),
 				})
 			}
+			if out.VaultLocked {
+				_, _ = fmt.Fprintln(env.Stderr, "Your vault is locked: plain values are withheld until you unlock it (uzi vault unlock).")
+			}
 			return p.Table([]string{"NAME", "KIND", "STATE", "VALUE", "DESCRIPTION", "UPDATED"}, rows)
 		},
 	}
@@ -133,14 +136,15 @@ func newRepoEnvCmd(env Env, gf *globalFlags) *cobra.Command {
 }
 
 // runEnvValueCell is the VALUE column: a secret never shows a value, a plain value
-// the server withheld (vault locked) says so, otherwise the user-authored value,
-// terminal-sanitized.
+// the server withheld says so without guessing why (the vault may be locked, absent,
+// or unable to open the value; the list's vault_locked tells which), otherwise the
+// user-authored value, terminal-sanitized.
 func runEnvValueCell(v apitypes.RunEnvVarDTO) string {
 	switch {
 	case v.Secret:
 		return "(secret)"
 	case v.ValueWithheld || v.Value == nil:
-		return "(vault locked)"
+		return "(withheld)"
 	default:
 		return uzicli.CellText(*v.Value)
 	}

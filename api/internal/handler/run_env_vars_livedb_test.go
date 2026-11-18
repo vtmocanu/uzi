@@ -1072,3 +1072,30 @@ func TestRunEnvRotationVaultMaterialHeadroomLiveDB(t *testing.T) {
 	}
 	f.put("ROTATE_ME", jsonBody(map[string]any{"value": strings.Repeat("r", 10000)}), http.StatusOK) // growth inside the slack
 }
+
+// An escaped unpaired UTF-16 surrogate would decode to U+FFFD and store a value other
+// than the one sent, so it is refused; a valid pair and an escaped backslash followed by
+// literal text are stored byte-exact.
+func TestRunEnvPutSurrogateEscapesLiveDB(t *testing.T) {
+	f := newEnvFixture(t)
+	for i, v := range []string{`\ud800`, `\udc00`, `\udc00\ud800`, `abc\uD83D`, `\uDBFF`, `\udfff`} {
+		rec := f.do(http.MethodPut, "/SURR_BAD", `{"value":"`+v+`","secret":false}`)
+		f.must(rec, http.StatusBadRequest)
+		if f.rowCount("name='SURR_BAD'") != 0 {
+			t.Fatalf("case %d (%s) wrote a row", i, v)
+		}
+	}
+	if rec := f.do(http.MethodPut, "/SURR_BAD", `{"value":"ok-value","description":"\ud800"}`); rec.Code != http.StatusBadRequest {
+		t.Fatalf("lone surrogate in description: status %d", rec.Code)
+	}
+	for _, c := range []struct{ name, body, want string }{
+		{"SURR_PAIR", `{"value":"x\ud83d\ude00y","secret":false}`, "x\U0001F600y"},
+		{"SURR_ESC", `{"value":"\\ud800","secret":false}`, `\ud800`},
+	} {
+		f.put(c.name, c.body, http.StatusCreated)
+		got := f.find(f.list(), c.name)
+		if got == nil || got.Value == nil || *got.Value != c.want {
+			t.Fatalf("%s stored %+v, want %q", c.name, got, c.want)
+		}
+	}
+}

@@ -36,7 +36,7 @@ func TestRepoEnvListTable(t *testing.T) {
 	}
 	for _, want := range []string{"NAME", "KIND", "STATE", "VALUE", "DESCRIPTION", "UPDATED",
 		"API_URL", "plain", "https://api.example.test", "base url",
-		"TOKEN", "secret", "(secret)", "disabled", "(vault locked)", "2026-03-04"} {
+		"TOKEN", "secret", "(secret)", "disabled", "(withheld)", "2026-03-04"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("output missing %q:\n%s", want, out)
 		}
@@ -69,5 +69,24 @@ func TestRepoEnvListRequiresRepo(t *testing.T) {
 	_, _, code := runCLI(t, fakeEnv(repoEnvFake()), "repo", "env", "list")
 	if code == uzicli.ExitOK {
 		t.Fatal("want usage failure without a repo")
+	}
+}
+
+func TestRepoEnvListVaultLockedNote(t *testing.T) {
+	const note = "Your vault is locked"
+	locked := repoEnvFake()
+	locked.RepoEnvResult.VaultLocked = true
+	out, errOut, code := runCLI(t, fakeEnv(locked), "repo", "env", "list", "r1")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(errOut, note) || !strings.Contains(errOut, "uzi vault unlock") || strings.Contains(out, note) {
+		t.Errorf("locked: stderr=%q stdout has note=%v", errOut, strings.Contains(out, note))
+	}
+	if _, errOut, _ := runCLI(t, fakeEnv(repoEnvFake()), "repo", "env", "list", "r1"); strings.Contains(errOut, note) {
+		t.Errorf("unlocked list printed the note: %q", errOut)
+	}
+	if _, errOut, _ := runCLI(t, fakeEnv(locked), "repo", "env", "list", "r1", "--json"); strings.Contains(errOut, note) {
+		t.Errorf("--json printed the note: %q", errOut)
 	}
 }

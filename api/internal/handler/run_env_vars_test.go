@@ -98,3 +98,32 @@ func TestRunEnvWriteDTOWithholdsWhenVaultLocked(t *testing.T) {
 		t.Fatalf("write response under a locked vault: %+v", dto)
 	}
 }
+
+func TestHasLoneSurrogateEscape(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{"lone high", `{"value":"\ud800"}`, true},
+		{"lone low", `{"value":"\udc00"}`, true},
+		{"reversed pair", `{"value":"\udc00\ud800"}`, true},
+		{"high at end of string", `{"value":"abc\uD83D"}`, true},
+		{"uppercase hex", `{"value":"\uDBFF"}`, true},
+		{"mixed case low", `{"value":"\uDfFf"}`, true},
+		{"high then non-surrogate", `{"value":"\ud800\u0041"}`, true},
+		{"in description", `{"description":"\udc00"}`, true},
+		{"valid pair", `{"value":"\ud83d\ude00"}`, false},
+		{"valid pair uppercase", `{"value":"\uD83D\uDE00"}`, false},
+		{"escaped backslash then text", `{"value":"\\ud800"}`, false},
+		{"escaped backslash then pair", `{"value":"\\\ud83d\ude00"}`, false},
+		{"plain bmp escape", `{"value":"\u00e9"}`, false},
+		{"literal emoji", "{\"value\":\"\U0001F600\"}", false},
+		{"truncated escape", `\u12`, false},
+	}
+	for _, c := range cases {
+		if got := hasLoneSurrogateEscape([]byte(c.body)); got != c.want {
+			t.Errorf("%s: got %v, want %v for %s", c.name, got, c.want, c.body)
+		}
+	}
+}

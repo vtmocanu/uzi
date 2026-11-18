@@ -320,6 +320,12 @@ func (h *Handler) PutRepoEnvVar(w http.ResponseWriter, r *http.Request) {
 		httpx.RespondDecodeError(w, err, "invalid request body")
 		return
 	}
+	// An escaped unpaired UTF-16 surrogate also decodes to U+FFFD; refuse it for the same
+	// reason. The walk is valid only on a body that already decoded as JSON.
+	if hasLoneSurrogateEscape(raw) {
+		httpx.Error(w, http.StatusBadRequest, "the request body contains an unpaired UTF-16 surrogate escape (\\uD800-\\uDFFF)")
+		return
+	}
 	if req.Description != nil {
 		if err := runenv.ValidateDescription(*req.Description); err != nil {
 			writeRunEnvRule(w, err)
