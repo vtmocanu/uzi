@@ -194,10 +194,11 @@ func resolveHandoffContext(env Env, msg, file string) (string, error) {
 	return resolveMessage(env, ""), nil
 }
 
-// resolveHandoffRepo returns the repo id for the handoff. Handoff ALWAYS resolves origin,
-// because the seed push targets the local `origin` remote (runHandoffCreate step 2). When
-// --repo is set it is validated to name the SAME forge repo origin points at (path and host);
-// otherwise origin is matched against the caller's repos by PathWithNamespace and host
+// resolveHandoffRepo returns the repo id for the handoff. Handoff ALWAYS resolves origin's
+// push destination (`git remote get-url --push --all origin`, which must list exactly one
+// URL), because the seed push targets the local `origin` remote (runHandoffCreate step 2).
+// When --repo is set it is validated to name the SAME forge repo the push destination points
+// at (path and host); otherwise it is matched against the caller's repos by PathWithNamespace and host
 // (exactly one match resolves). --repo only picks among the repos origin matches; it never
 // targets one origin does not point at.
 func resolveHandoffRepo(env Env, ctx context.Context, c uzicli.Client, repoFlag string) (string, error) {
@@ -207,11 +208,24 @@ func resolveHandoffRepo(env Env, ctx context.Context, c uzicli.Client, repoFlag 
 	// dropping the user's HEAD. We therefore always resolve+parse origin and require --repo (when
 	// given) to match it; --repo remains only the disambiguator for an origin that matches several
 	// of the caller's repos, never a way to target a repo origin does NOT point at.
-	origin, err := env.Git(".", "remote", "get-url", "origin")
+	// The PUSH destination, not the fetch URL: `--push --all` applies pushurl, pushInsteadOf
+	// and lists every configured destination, and handoff pushes to exactly one.
+	listing, err := env.Git(".", "remote", "get-url", "--push", "--all", "origin")
 	if err != nil {
 		return "", uzicli.Exitf(uzicli.ExitUsage,
 			"not in a git repo with an 'origin' remote (%v); handoff pushes local HEAD to origin, so run it from a checkout", err)
 	}
+	var dests []string
+	for _, line := range strings.Split(listing, "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			dests = append(dests, line)
+		}
+	}
+	if len(dests) != 1 {
+		return "", uzicli.Exitf(uzicli.ExitUsage,
+			"origin has %d push destinations (git remote get-url --push --all origin); handoff pushes local HEAD to origin and supports a single push destination", len(dests))
+	}
+	origin := dests[0]
 	path := parseRepoPath(origin)
 	if path == "" {
 		return "", uzicli.Exitf(uzicli.ExitUsage,
@@ -542,12 +556,21 @@ func (o *originHost) compute(ctx context.Context, env Env) (string, error) {
 		return refuse("GIT_CONFIG is set, which hides the git configuration push uses, so core.sshCommand cannot be checked")
 	}
 	out, gerr := env.Git(".", "config", "--get", "core.sshCommand")
-	present, cerr := sshCommandConfigured(out, gerr)
+	present, cerr := gitConfigKeySet(out, gerr)
 	if cerr != nil {
 		return refuse("could not determine whether core.sshCommand is set (%v)", cerr)
 	}
 	if present {
 		return refuse("core.sshCommand is set, which overrides the ssh transport, so the real host cannot be verified")
+	}
+	// remote.origin.receivepack changes the remote command, which the ssh -G probe below evaluates.
+	rout, rerr := env.Git(".", "config", "--get", "remote.origin.receivepack")
+	rpSet, rcerr := gitConfigKeySet(rout, rerr)
+	if rcerr != nil {
+		return refuse("could not determine whether remote.origin.receivepack is set (%v)", rcerr)
+	}
+	if rpSet {
+		return refuse("remote.origin.receivepack is set, which changes the remote command, so the real host cannot be verified")
 	}
 	// (b) input validation: nothing option-shaped or explicitly empty reaches ssh.
 	if info.sshHost == "" || (info.hasUser && info.user == "") || (info.hasPort && info.port == "") {
@@ -619,10 +642,10 @@ func (o *originHost) compute(ctx context.Context, env Env) (string, error) {
 	return "", nil
 }
 
-// sshCommandConfigured classifies the result of `git config --get core.sshCommand`:
-// success means set (any value, even empty); exit status 1 means unset; anything else
-// is an error the caller must treat as a refusal.
-func sshCommandConfigured(_ string, err error) (bool, error) {
+// gitConfigKeySet classifies the result of `git config --get <key>` (core.sshCommand,
+// remote.origin.receivepack): success means set (any value, even empty); exit status 1
+// means unset; anything else is an error the caller must treat as a refusal.
+func gitConfigKeySet(_ string, err error) (bool, error) {
 	if err == nil {
 		return true, nil
 	}

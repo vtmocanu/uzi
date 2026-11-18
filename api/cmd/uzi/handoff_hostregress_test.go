@@ -19,7 +19,7 @@ func hostRegressEnv() (*uzicli.FakeClient, *handoffRecorder, Env) {
 		CreatedTaskRun: taskRun("rh", "uzi/task/rh"),
 		DispatchedRun:  taskRun("rh", "uzi/task/rh"),
 	}
-	rec := &handoffRecorder{gitOut: map[string]string{"remote get-url origin": "https://other.example/acme/widgets.git"}}
+	rec := &handoffRecorder{gitOut: map[string]string{"remote get-url --push --all origin": "https://other.example/acme/widgets.git"}}
 	env, _ := handoffEnv(fc, rec)
 	return fc, rec, env
 }

@@ -1889,12 +1889,12 @@ watch it with `uzi run get`/`uzi run logs --follow`, or drop into
 
 Because the push goes to `origin`, the connected repo must be the one `origin`
 fetches from: its owner/repo path **and** its host must match. The check reads
-only the fetch URL (`git remote get-url origin`). It does not check a push URL,
-a `pushInsteadOf` rewrite, extra `remote.origin.url` values or a custom
-`remote.origin.receivepack`, so with any of those the push can go elsewhere.
-Check the push destination with `git remote get-url --push --all origin` before
-you run handoff. `--repo` never bypasses this check; it only picks among repos
-that already match.
+the push destination (`git remote get-url --push --all origin`), which applies
+`pushurl`, `pushInsteadOf` rewrites and multiple `remote.origin.url` values.
+Handoff requires exactly one push destination and refuses otherwise. For SSH
+origins it also refuses a set `remote.origin.receivepack`, which changes the
+remote command the host check evaluates. `--repo` never bypasses this check; it
+only picks among repos that already match.
 
 - **https / http origin:** the host must equal the host of the forge's web URL.
 - **SSH origin (scp-like `git@host:owner/repo` or `ssh://`):** the host your SSH
@@ -1904,8 +1904,8 @@ that already match.
   `Match command` rules resolve as they will for the push. `ssh -G` does not connect, but it does evaluate your
   SSH config, including any `Match exec` blocks, which can run local commands.
 - **Transport overrides are refused**, even when empty: `GIT_SSH`,
-  `GIT_SSH_COMMAND` and `core.sshCommand` can send the push somewhere `ssh -G`
-  cannot see. `GIT_CONFIG` is refused too: it hides from `git config` the
+  `GIT_SSH_COMMAND`, `core.sshCommand` and `remote.origin.receivepack` can send
+  the push somewhere `ssh -G` cannot see. `GIT_CONFIG` is refused too: it hides from `git config` the
   settings the push reads. Use an https remote instead.
 - **Anything else is refused:** `git://`, `file://`, `git+ssh://`, local paths
   and other schemes, an `ssh://` origin containing `%` or a password, and any

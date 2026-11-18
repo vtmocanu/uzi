@@ -2221,7 +2221,7 @@ EOF
 # on the host, so `http.curloptResolve` below maps forge-fake.e2e:<port> to 127.0.0.1 (the
 # published port): the URL names the forge host, the TCP connection still lands locally.
 # insteadOf is fundamentally incompatible with handoff here:
-# `git remote get-url origin` EXPANDS insteadOf, so resolveHandoffRepo (handoff.go) would
+# `git remote get-url --push --all origin` (the push destination) EXPANDS insteadOf (and pushInsteadOf, pushurl), so resolveHandoffRepo (handoff.go) would
 # read the rewritten LOCAL PATH instead of the https URL and parseRepoPath could never
 # derive `group/repo` from it (a bare filesystem path has no url.Parse Host, so it yields
 # the whole path) — handoff would error before dispatch with "could not match origin".

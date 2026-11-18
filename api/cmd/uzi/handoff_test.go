@@ -15,7 +15,7 @@ import (
 // interleaved with the client's create/dispatch, an ordered `seq` so a test can prove
 // the Decision-6 create → push → dispatch ordering that per-verb captures cannot show.
 // gitOut/gitErr are keyed by the space-joined args so a test can canned-reply to
-// `remote get-url origin` and inject a push failure.
+// `remote get-url --push --all origin` and inject a push failure.
 type handoffRecorder struct {
 	seq      []string
 	gitCalls [][]string
@@ -59,8 +59,12 @@ func handoffEnv(fc *uzicli.FakeClient, rec *handoffRecorder) (Env, *handoffClien
 	if rec.gitOut == nil {
 		rec.gitOut = map[string]string{}
 	}
-	if _, ok := rec.gitOut["remote get-url origin"]; !ok {
-		rec.gitOut["remote get-url origin"] = "https://github.com/acme/widgets.git"
+	if _, legacy := rec.gitOut["remote get-url origin"]; legacy {
+		// handoff reads the push destination now; a stub keyed on the fetch URL is silently ignored.
+		panic(`handoffEnv: stale stub key "remote get-url origin"; use "remote get-url --push --all origin"`)
+	}
+	if _, ok := rec.gitOut["remote get-url --push --all origin"]; !ok {
+		rec.gitOut["remote get-url --push --all origin"] = "https://github.com/acme/widgets.git"
 	}
 	if len(fc.Repos) == 0 {
 		fc.Repos = []apitypes.RepoDTO{{ID: "p1", PathWithNamespace: "acme/widgets", WebURL: "https://github.com/acme/widgets"}}
@@ -72,6 +76,9 @@ func handoffEnv(fc *uzicli.FakeClient, rec *handoffRecorder) (Env, *handoffClien
 	}
 	if _, ok := rec.gitErr["config --get core.sshCommand"]; !ok {
 		rec.gitErr["config --get core.sshCommand"] = exitCodeErr{1}
+	}
+	if _, ok := rec.gitErr[receivePackKey]; !ok {
+		rec.gitErr[receivePackKey] = exitCodeErr{1}
 	}
 	if _, ok := rec.gitOut[topKey]; !ok {
 		rec.gitOut[topKey] = "/work/widgets\n"
@@ -88,8 +95,10 @@ func handoffEnv(fc *uzicli.FakeClient, rec *handoffRecorder) (Env, *handoffClien
 }
 
 const (
-	localEnvKey = "rev-parse --local-env-vars"
-	topKey      = "rev-parse --show-toplevel"
+	receivePackKey = "config --get remote.origin.receivepack"
+	pushDestKey    = "remote get-url --push --all origin"
+	localEnvKey    = "rev-parse --local-env-vars"
+	topKey         = "rev-parse --show-toplevel"
 )
 
 // exitCodeErr is a git failure carrying an exit status, like *exec.ExitError.
@@ -391,7 +400,7 @@ func TestHandoffRepoAutoDetect(t *testing.T) {
 				CreatedTaskRun: taskRun("rd", "uzi/task/rd"),
 				DispatchedRun:  taskRun("rd", "uzi/task/rd"),
 			}
-			rec := &handoffRecorder{gitOut: map[string]string{"remote get-url origin": tc.origin}}
+			rec := &handoffRecorder{gitOut: map[string]string{"remote get-url --push --all origin": tc.origin}}
 			env, _ := handoffEnv(fc, rec)
 
 			_, _, code := runCLI(t, env, "handoff", "-m", "x")
@@ -412,7 +421,7 @@ func TestHandoffRepoFlagMatchesOrigin(t *testing.T) {
 		CreatedTaskRun: taskRun("rf", "uzi/task/rf"),
 		DispatchedRun:  taskRun("rf", "uzi/task/rf"),
 	}
-	rec := &handoffRecorder{gitOut: map[string]string{"remote get-url origin": "https://github.com/acme/widgets.git"}}
+	rec := &handoffRecorder{gitOut: map[string]string{"remote get-url --push --all origin": "https://github.com/acme/widgets.git"}}
 	env, _ := handoffEnv(fc, rec)
 
 	_, _, code := runCLI(t, env, "handoff", "--repo", "p1", "-m", "x")
@@ -437,7 +446,7 @@ func TestHandoffRepoFlagMismatchOrigin(t *testing.T) {
 		CreatedTaskRun: taskRun("rf", "uzi/task/rf"),
 		DispatchedRun:  taskRun("rf", "uzi/task/rf"),
 	}
-	rec := &handoffRecorder{gitOut: map[string]string{"remote get-url origin": "https://github.com/acme/widgets.git"}}
+	rec := &handoffRecorder{gitOut: map[string]string{"remote get-url --push --all origin": "https://github.com/acme/widgets.git"}}
 	env, _ := handoffEnv(fc, rec)
 
 	_, _, code := runCLI(t, env, "handoff", "--repo", "pB", "-m", "x")
@@ -465,7 +474,7 @@ func TestHandoffRepoFlagUnknown(t *testing.T) {
 		CreatedTaskRun: taskRun("rf", "uzi/task/rf"),
 		DispatchedRun:  taskRun("rf", "uzi/task/rf"),
 	}
-	rec := &handoffRecorder{gitOut: map[string]string{"remote get-url origin": "https://github.com/acme/widgets.git"}}
+	rec := &handoffRecorder{gitOut: map[string]string{"remote get-url --push --all origin": "https://github.com/acme/widgets.git"}}
 	env, _ := handoffEnv(fc, rec)
 
 	_, _, code := runCLI(t, env, "handoff", "--repo", "nope", "-m", "x")
@@ -493,7 +502,7 @@ func TestHandoffRepoFlagDisambiguates(t *testing.T) {
 		CreatedTaskRun: taskRun("rf", "uzi/task/rf"),
 		DispatchedRun:  taskRun("rf", "uzi/task/rf"),
 	}
-	rec := &handoffRecorder{gitOut: map[string]string{"remote get-url origin": "https://github.com/acme/widgets.git"}}
+	rec := &handoffRecorder{gitOut: map[string]string{"remote get-url --push --all origin": "https://github.com/acme/widgets.git"}}
 	env, _ := handoffEnv(fc, rec)
 
 	_, _, code := runCLI(t, env, "handoff", "--repo", "p2", "-m", "x")
