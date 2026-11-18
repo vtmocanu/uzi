@@ -322,15 +322,7 @@ func TestHandoffMixedHostSamePath(t *testing.T) {
 // The classification of `git config --get core.sshCommand` must hold for the real git:
 // unset is exit status 1 (absent); set to the empty string succeeds (present).
 func TestSSHCommandConfiguredRealGit(t *testing.T) {
-	// Inherited location or config-injection variables (a hook, git bisect run) would
-	// point these real git calls at the caller's repository.
-	for _, k := range []string{"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
-		"GIT_COMMON_DIR", "GIT_CONFIG", "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"} {
-		t.Setenv(k, "")
-		_ = os.Unsetenv(k)
-	}
-	t.Setenv("GIT_CONFIG_GLOBAL", "/dev/null")
-	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	isolateRealGit(t)
 	dir := t.TempDir()
 	if _, err := realGit(dir, "init", "-q"); err != nil {
 		t.Skipf("git unavailable: %v", err)
@@ -503,12 +495,7 @@ func TestHandoffSSHProbeRunsFromWorktreeRoot(t *testing.T) {
 // TestSSHProbeDirMatchesGitPushRealGit pins the premise against real git: from a nested
 // directory, git push starts ssh in the worktree root, the directory handoff resolves.
 func TestSSHProbeDirMatchesGitPushRealGit(t *testing.T) {
-	for _, k := range []string{"GIT_DIR", "GIT_WORK_TREE", "GIT_CONFIG", "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"} {
-		t.Setenv(k, "")
-		_ = os.Unsetenv(k)
-	}
-	t.Setenv("GIT_CONFIG_GLOBAL", "/dev/null")
-	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	isolateRealGit(t)
 	root := t.TempDir()
 	if _, err := realGit(root, "init", "-q"); err != nil {
 		t.Skipf("git unavailable: %v", err)
@@ -534,4 +521,18 @@ func TestSSHProbeDirMatchesGitPushRealGit(t *testing.T) {
 	if strings.TrimSpace(string(got)) != strings.TrimSpace(top) {
 		t.Errorf("git push ran ssh in %q, handoff probes from %q", strings.TrimSpace(string(got)), strings.TrimSpace(top))
 	}
+}
+
+// isolateRealGit keeps a real-git test off the caller's repository and config: inherited
+// location or config-injection variables (a hook, git bisect run) would point its git
+// calls elsewhere. t.Setenv restores each value at cleanup; os.Unsetenv removes it now.
+func isolateRealGit(t *testing.T) {
+	t.Helper()
+	for _, k := range []string{"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+		"GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR", "GIT_CONFIG", "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"} {
+		t.Setenv(k, "")
+		_ = os.Unsetenv(k)
+	}
+	t.Setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
 }
