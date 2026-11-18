@@ -125,6 +125,9 @@ func newRepoEnvCmd(env Env, gf *globalFlags) *cobra.Command {
 					uzicli.CellText(v.Description), v.UpdatedAt.UTC().Format("2006-01-02 15:04:05Z"),
 				})
 			}
+			if out.VaultLocked {
+				_, _ = fmt.Fprintln(env.Stderr, vaultLockedNote(gf))
+			}
 			return p.Table([]string{"NAME", "KIND", "STATE", "VALUE", "DESCRIPTION", "UPDATED"}, rows)
 		},
 	}
@@ -132,15 +135,56 @@ func newRepoEnvCmd(env Env, gf *globalFlags) *cobra.Command {
 	return cmd
 }
 
+// vaultLockedNote is the stderr hint printed when the list reports vault_locked (the
+// vault is locked or its state could not be checked). The suggested unlock command
+// carries the caller's --context/--url so it targets the same server.
+func vaultLockedNote(gf *globalFlags) string {
+	cmd := "uzi vault unlock"
+	if gf.context != "" {
+		cmd += " --context " + shellQuote(gf.context)
+	}
+	if gf.url != "" {
+		cmd += " --url " + shellQuote(gf.url)
+	}
+	// The command sits alone on its own line with no trailing punctuation, so a copied
+	// final argument (a --url or a quoted --context) stays exactly what was passed.
+	return uzicli.CellText("Your vault is locked or its state could not be checked: plain values are withheld. If it is locked, run:") +
+		"\n  " + uzicli.CellText(cmd)
+}
+
+// shellQuote wraps s in POSIX single quotes (each embedded single quote becomes
+// close-quote, backslash-quote, reopen-quote) unless it is
+// non-empty and made only of characters that are safe unquoted.
+func shellQuote(s string) string {
+	// A leading '=' is not safe: zsh expands a word starting with it to a command path.
+	safe := s != "" && s[0] != '='
+	for _, r := range s {
+		if !shellSafeRune(r) {
+			safe = false
+			break
+		}
+	}
+	if safe {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+func shellSafeRune(r rune) bool {
+	return r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("._:/@=+-", r)
+}
+
 // runEnvValueCell is the VALUE column: a secret never shows a value, a plain value
-// the server withheld (vault locked) says so, otherwise the user-authored value,
-// terminal-sanitized.
+// the server withheld says so without guessing why (the vault may be locked, absent,
+// or unable to open the value; the list's vault_locked is only a fail-closed hint,
+// true when the vault is locked or its state could not be checked), otherwise the
+// user-authored value, terminal-sanitized.
 func runEnvValueCell(v apitypes.RunEnvVarDTO) string {
 	switch {
 	case v.Secret:
 		return "(secret)"
 	case v.ValueWithheld || v.Value == nil:
-		return "(vault locked)"
+		return "(withheld)"
 	default:
 		return uzicli.CellText(*v.Value)
 	}

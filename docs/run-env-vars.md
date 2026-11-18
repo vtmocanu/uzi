@@ -64,9 +64,103 @@ Allowed: `DATABASE_URL`, cloud credentials such as `AWS_ACCESS_KEY_ID`,
 `NPM_TOKEN`, `GRADLE_OPTS`, `DOCKER_AUTH_CONFIG`, `NO_COLOR`. The full list is
 `fixtures/run-env/name-rules.json`.
 
+## Entering a value
+
+The value field is a single line by default; a secret is masked by a password
+field. Turn on **Multiline** for values with line breaks, such as PEM keys or
+JSON. Pasting a value that contains line breaks into the single-line field
+switches to Multiline automatically and keeps the line breaks. A paste with only
+a single trailing line break, such as a token copied from a terminal, is trimmed
+and stays single-line. The form saves line endings as LF. A multiline secret is masked with CSS, which is not portable
+across browsers.
+
+## Worked examples
+
+These describe how the variables will be used once injection ships. Today they
+are only stored. All hosts are placeholders.
+
+### An API
+
+| Name | Kind | Value | Why |
+|---|---|---|---|
+| `EXAMPLE_API_URL` | plain | `https://api.example.com` | Not sensitive; plain values are readable in the UI and CLI. |
+| `EXAMPLE_API_KEY` | secret | the key | A credential; never shown again and redacted from output. |
+
+### A private Maven repository
+
+| Name | Kind | Value | Why |
+|---|---|---|---|
+| `MAVEN_REPO_URL` | plain | `https://maven.example.com/releases` | Not sensitive. Keep credentials out of it: rule 3 refuses a plain URL with a user or password. |
+| `MAVEN_REPO_USER` | plain | the user name | Usually not sensitive. Make it secret if the name itself is. |
+| `MAVEN_REPO_PASSWORD` | secret | the password | A credential; at least 8 characters. |
+
+A build can reference them, for example a `settings.xml` server entry:
+
+```xml
+<server>
+  <id>example</id>
+  <username>${env.MAVEN_REPO_USER}</username>
+  <password>${env.MAVEN_REPO_PASSWORD}</password>
+</server>
+```
+
+and a matching repository declaration. Declare it in a `settings.xml` profile
+that is listed under `<activeProfiles>`:
+
+```xml
+<profiles>
+  <profile>
+    <id>example</id>
+    <repositories>
+      <repository>
+        <id>example</id>
+        <url>${env.MAVEN_REPO_URL}</url>
+      </repository>
+    </repositories>
+  </profile>
+</profiles>
+<activeProfiles>
+  <activeProfile>example</activeProfile>
+</activeProfiles>
+```
+
+The repository `id` must match the server `id`, or Maven sends no credentials.
+
+Maven 3.10.0 and later, and Maven 4.0.0 and later, bind a server's credentials
+to the origins (scheme, host and port) of the same-id repositories declared in an
+active `settings.xml` profile, so a same-id repository at another origin gets
+none. A repository declared only in a `pom.xml` is not known in advance. When the
+server has no known origin, the default `origin` scope still sends its
+credentials, with a warning; `maven.repository.credentialScope=strict` refuses
+that fallback. `maven.repository.credentialScope=id` restores matching by `id`
+alone, with no origin binding, and a repository can set it in its own
+`.mvn/maven.config`; check the effective value before relying on origin binding. Maven 3.9.x and earlier match
+credentials by `id` alone, so a same-id repository in any dependency or parent
+POM receives them; use 3.10.0 or later.
+
+### A container registry
+
+| Name | Kind | Value | Why |
+|---|---|---|---|
+| `REGISTRY_HOST` | plain | `registry.example.com` | Not sensitive; keeping it plain leaves it readable in logs. |
+| `REGISTRY_USER` | plain | the user name | Usually not sensitive. |
+| `REGISTRY_PASSWORD` | secret | the password or token | A credential. |
+
+The agent or your repo scripts log in, for example:
+
+```sh
+printf '%s' "$REGISTRY_PASSWORD" | docker login "$REGISTRY_HOST" -u "$REGISTRY_USER" --password-stdin &&
+  docker pull "$REGISTRY_HOST/team/image:tag"
+```
+
+Login persistence across commands is not yet available, so log in in the same
+command that uses the registry.
+
 ## Edit, disable, delete
 
 1. **Edit** without a new value changes only the description; entering a value replaces it.
+   Switching a secret to plain is the exception: it replaces the secret with
+   whatever the field holds, even an empty value.
 2. **Replace the value** to rotate it. A secret keeps its secret flag unless
    you change it.
 3. **Disable** stops injection without deleting the variable; enable it again

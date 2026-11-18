@@ -319,6 +319,15 @@ var knownInstructions = []knownInstruction{
 			"This is CLI/HTTP evidence; the fixture is not a booted API.",
 	},
 	{
+		command:  "uzi vault unlock",
+		evidence: evidenceGoTest,
+		where:    "TestVaultUnlockPrompt",
+		note: "RUNTIME: `uzi repo env list` prints it to stderr when the list reports vault_locked " +
+			"(repo.go vaultLockedNote), on its own indented line, with the caller's --context/--url appended. " +
+			"TestVaultUnlockPrompt executes the real cobra command against a fake client, " +
+			"asserting the password prompt, one unlock call and \"Vault unlocked.\".",
+	},
+	{
 		command:  "uzi run cancel",
 		evidence: evidenceGoTest,
 		where:    "TestDiskOwnerActionsSinglePOST",

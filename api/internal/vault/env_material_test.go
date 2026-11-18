@@ -3,6 +3,7 @@ package vault
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -116,6 +117,40 @@ func TestEnvMaterialEnableDisableRoundTrip(t *testing.T) {
 		if err != nil || string(got) != r.plain {
 			t.Fatalf("%s after disable: %q, %v", r.name, got, err)
 		}
+	}
+}
+
+// The lock-order fence must come first in convertMaterial: the connection fence, then the
+// repo fence, both before the first measurement of the owner's material and before any
+// material row lock (the real ordering is exercised against PostgreSQL in the store and
+// handler LiveDB suites; this pins that convertMaterial asks for it).
+func TestConvertMaterialTakesEnvFenceBeforeMeasuringOrLocking(t *testing.T) {
+	v, _, st := newTestVaultWithStore(t)
+	uid := uuid.New()
+	st.states[uid] = store.LockVaultAuthStateRow{VaultMode: store.VaultModeUnprotected, VaultEpoch: 2}
+	seedEnv(t, v, st, uid, fixtureEnvRows())
+	st.resetCalls()
+	if err := v.Enable(context.Background(), uid, "current-login-password"); err != nil {
+		t.Fatal(err)
+	}
+	calls := st.callLog()
+	first := func(names ...string) int {
+		for i, c := range calls {
+			for _, n := range names {
+				if c == n {
+					return i
+				}
+			}
+		}
+		t.Fatalf("none of %v was called: %v", names, calls)
+		return -1
+	}
+	conns := first("LockVaultEnvConnectionsKeyShare")
+	repos := first("LockVaultEnvReposKeyShare")
+	totals := first("GetVaultMaterialTotals")
+	batch := first("LockVaultAccountMaterialBatch", "LockVaultSecretMaterialBatch", "LockVaultEnvMaterialBatch")
+	if conns >= repos || repos >= totals || totals >= batch {
+		t.Fatalf("want connections < repos < totals < first material batch lock, got %d, %d, %d, %d in %v", conns, repos, totals, batch, calls)
 	}
 }
 
@@ -242,6 +277,72 @@ func TestEnvMaterialConversionToleratesConcurrentEnvDelete(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// A repo delete can cascade a whole candidate page between the unlocked listing and the
+// row lock, leaving nothing locked for that page while later env rows still exist. The
+// scan must advance past the vanished candidates, not stop at the first empty lock.
+func TestEnvMaterialConversionSurvivesWholePageVanishing(t *testing.T) {
+	v, _, st := newTestVaultWithStore(t)
+	uid := uuid.New()
+	ctx := context.Background()
+	st.states[uid] = store.LockVaultAuthStateRow{VaultMode: store.VaultModeUnprotected, VaultEpoch: 2}
+	var fixture []envFixtureRow
+	for i := 0; i < int(maxBatchRows)+6; i++ { // more than one page
+		fixture = append(fixture, envFixtureRow{name: fmt.Sprintf("BULK_VAR_%03d", i), secret: true, plain: fmt.Sprintf("value-%03d", i)})
+	}
+	rows := seedEnv(t, v, st, uid, fixture)
+
+	vanished := map[uuid.UUID]bool{}
+	var lastVanished uuid.UUID
+	hs := &candidateHookStore{fakeVaultStore: st}
+	hs.after = func(page []uuid.UUID) { // the cascade lands after the first page was listed
+		lastVanished = page[len(page)-1]
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		for _, id := range page {
+			vanished[id] = true
+		}
+		kept := st.envs[:0:0]
+		for _, e := range st.envs {
+			if !vanished[e.id] {
+				kept = append(kept, e)
+			}
+		}
+		st.envs = kept
+	}
+	v.transact = st.transaction(hs)
+	if err := v.Enable(ctx, uid, "current-login-password"); err != nil {
+		t.Fatalf("Enable with a whole env page deleted before its lock = %v; want success", err)
+	}
+	if len(vanished) != int(maxBatchRows) {
+		t.Fatalf("hook removed %d rows; want one full page of %d", len(vanished), maxBatchRows)
+	}
+	// The listing right after the vanished page must resume from that page's last listed
+	// id; nothing was locked for the page, so a cursor that followed locked rows would not.
+	if len(hs.afterIDs) < 2 {
+		t.Fatalf("listing calls = %d; want at least 2", len(hs.afterIDs))
+	}
+	if got := hs.afterIDs[1]; !got.Valid || got.Bytes != lastVanished {
+		t.Fatalf("second listing AfterID = %+v; want the vanished page's last id %s", got, lastVanished)
+	}
+	resealed := 0
+	for _, r := range rows {
+		e := envRowByID(st, r.id)
+		if vanished[r.id] {
+			if e != nil {
+				t.Fatalf("%s came back after its delete", r.name)
+			}
+			continue
+		}
+		resealed++
+		if e == nil || e.sealedWith != store.SealedWithDEK {
+			t.Fatalf("%s after the vanished page was not resealed to the DEK: %+v", r.name, e)
+		}
+	}
+	if resealed != 6 {
+		t.Fatalf("resealed %d rows after the vanished page; want 6", resealed)
 	}
 }
 

@@ -82,6 +82,20 @@ func (p *conversionProgress) add(rows, size int64) error {
 // Accounts precede secret rows; all material is read locked and in ascending ID
 // order; run environment variables follow the secret rows. Each returned collection is capped by SQL at 64 slots and 1 MiB.
 func (v *Vault) convertMaterial(ctx context.Context, q Store, userID uuid.UUID, source store.GetUserVaultStateRow, targetMode string, targetEpoch int64, private *secretbox.Box, lazy bool) error {
+	// Lock-order fence. A repo delete (DeleteRepoForUser) and a forge-connection delete
+	// (DeleteForgeConnectionForUser) cascade run_env_vars rows without the
+	// secret-mutation lock, so they can run against this conversion. Taking KEY SHARE on
+	// the owner's env-bearing connections and then repos (each in id order) before any env
+	// row lock makes both orders one-directional: a delete either finishes first, or waits
+	// for this transaction at its connection/repo row before it reaches an env row. The
+	// connection fence is needed because a connection delete cascades its repos in scan
+	// order, which would otherwise lock a repo after this transaction holds env rows.
+	if _, err := q.LockVaultEnvConnectionsKeyShare(ctx, userID); err != nil {
+		return err
+	}
+	if _, err := q.LockVaultEnvReposKeyShare(ctx, userID); err != nil {
+		return err
+	}
 	totals, err := q.GetVaultMaterialTotals(ctx, userID)
 	if err != nil {
 		return err
@@ -212,12 +226,24 @@ func (v *Vault) convertMaterial(ctx context.Context, q Store, userID uuid.UUID, 
 	// The sealing context is rebuilt from the row's own columns.
 	cursor = pgtype.UUID{}
 	for {
-		rows, err := q.LockVaultEnvMaterialBatch(ctx, store.LockVaultEnvMaterialBatchParams{UserID: userID, AfterID: cursor})
+		// Candidates are listed unlocked, then locked by id. Rows can vanish in between,
+		// so the scan ends only on an empty candidate list. The cursor follows the last
+		// candidate, so a listed id is never listed again (defensive: a vanished id
+		// would also drop out of the next listing on its own).
+		candidates, err := q.ListVaultEnvMaterialCandidates(ctx, store.ListVaultEnvMaterialCandidatesParams{UserID: userID, AfterID: cursor})
 		if err != nil {
 			return err
 		}
-		if len(rows) == 0 {
+		if len(candidates) == 0 {
 			break
+		}
+		if int64(len(candidates)) > maxBatchRows {
+			return ErrInvalidState
+		}
+		lastCandidate := candidates[len(candidates)-1]
+		rows, err := q.LockVaultEnvMaterialBatch(ctx, store.LockVaultEnvMaterialBatchParams{UserID: userID, Ids: candidates})
+		if err != nil {
+			return err
 		}
 		if int64(len(rows)) > maxBatchRows {
 			return ErrInvalidState
@@ -256,14 +282,22 @@ func (v *Vault) convertMaterial(ctx context.Context, q Store, userID uuid.UUID, 
 					return ErrInvalidState
 				}
 			}
-			cursor = pgtype.UUID{Bytes: row.ID, Valid: true}
 		}
+		cursor = pgtype.UUID{Bytes: lastCandidate, Valid: true}
 	}
+	// progress counts the pre-reseal sizes of the rows this pass locked and compares them
+	// with totals, which was measured before any row was resealed. Only the fresh
+	// fallback below reads post-reseal sizes. Both comparisons, and the totals model as a
+	// whole, rely on resealing preserving ciphertext length (every mode is AES-GCM:
+	// nonce plus a constant tag).
 	if progress.rows != totals.MaterialRows || progress.bytes != totals.CiphertextBytes {
-		// A repo or forge-connection delete cascades its env rows without the secret-mutation
-		// lock (and the fresh read relies on READ COMMITTED, postgres.go), so an env
-		// row not yet locked can vanish after the first measurement. Every row is locked
-		// now, so one fresh read is the settled total: accept it only on an exact match.
+		// The fence above is taken before the first measurement, so no env row can vanish
+		// to a repo or forge-connection delete (which cascades env rows without the
+		// secret-mutation lock) during this conversion, and every env-row writer takes the
+		// secret-mutation advisory lock this conversion holds (withSecretLock and
+		// mutateLiveRunEnv in handler/run_env_vars.go); a new writer must too. This branch
+		// stays defensive: one fresh read (READ COMMITTED, postgres.go) is the settled
+		// total, accepted only on an exact match.
 		fresh, err := q.GetVaultMaterialTotals(ctx, userID)
 		if err != nil {
 			return err

@@ -136,6 +136,15 @@ func (m *memVaultStore) LockVaultAccountMaterialBatch(context.Context, store.Loc
 func (m *memVaultStore) LockVaultSecretMaterialBatch(context.Context, store.LockVaultSecretMaterialBatchParams) ([]store.LockVaultSecretMaterialBatchRow, error) {
 	return nil, nil
 }
+func (m *memVaultStore) LockVaultEnvConnectionsKeyShare(context.Context, uuid.UUID) ([]uuid.UUID, error) {
+	return nil, nil
+}
+func (m *memVaultStore) LockVaultEnvReposKeyShare(context.Context, uuid.UUID) ([]uuid.UUID, error) {
+	return nil, nil
+}
+func (m *memVaultStore) ListVaultEnvMaterialCandidates(context.Context, store.ListVaultEnvMaterialCandidatesParams) ([]uuid.UUID, error) {
+	return nil, nil
+}
 func (m *memVaultStore) LockVaultEnvMaterialBatch(context.Context, store.LockVaultEnvMaterialBatchParams) ([]store.LockVaultEnvMaterialBatchRow, error) {
 	return nil, nil
 }

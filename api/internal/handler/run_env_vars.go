@@ -53,7 +53,14 @@ var errRunEnvRepoGone = errors.New("run env: repo not found")
 // lockRunEnvRepo pins the repo row (FOR KEY SHARE) right after the users-row fence and
 // before any run_env_vars statement, so a concurrent repo delete (whose cascade takes the
 // env rows) cannot interleave with this write. The lock order of every env writer is:
-// secret-mutation advisory lock, users row, repos row, env rows.
+// secret-mutation advisory lock, users row, repos row, env rows. The full vault conversion
+// lock order (lockLifecycleState, lockVaultRows, convertMaterial) is:
+//  1. the settings admission lock (LockSettingsAdmission), taken when the lifecycle takes it;
+//  2. the secret-mutation advisory lock;
+//  3. the users row, then the user_vaults row (lockVaultRows);
+//  4. connections, repos, accounts, secrets, env rows (convertMaterial).
+//
+// An env writer's order is a subsequence of this one, so the two cannot deadlock.
 func lockRunEnvRepo(ctx context.Context, q *store.Queries, repoID uuid.UUID) error {
 	if _, err := q.LockRepoKeyShare(ctx, repoID); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -316,6 +323,12 @@ func (h *Handler) PutRepoEnvVar(w http.ResponseWriter, r *http.Request) {
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&req); err != nil {
 		httpx.RespondDecodeError(w, err, "invalid request body")
+		return
+	}
+	// An escaped unpaired UTF-16 surrogate also decodes to U+FFFD; refuse it for the same
+	// reason. The walk is valid only on a body that already decoded as JSON.
+	if hasLoneSurrogateEscape(raw) {
+		httpx.Error(w, http.StatusBadRequest, "the request body contains an unpaired UTF-16 surrogate escape (\\uD800-\\uDFFF)")
 		return
 	}
 	if req.Description != nil {
