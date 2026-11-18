@@ -2921,7 +2921,8 @@ whose assertions are "stop acceptance mismatch" (:263) and "refusal mismatch"
 (`started_at` NULL, NULL wall, zero fixture timeout: accept only through the
 unstarted arm).
 
-Command (export of f7a795fb1, throwaway postgres `cdr-4202-u14pg`): from api,
+Command (export of f7a795fb1 for u14-* rows, 1b3afe49e for u14r-* rows except
+u14r-cutoff-equal at 039947e1d, a ledger-only child; throwaway postgres `cdr-4202-u14pg`): from api,
 `GOFLAGS='-p=1 -buildvcs=false' GOMAXPROCS=4 go test -race -count=1 -timeout=6m
 ./internal/handler -run '^TestWorkerCodexStoppedGuardsRouteLiveDB$/^<leaf>$' -v`;
 logs `.uzi/scratch/ctl-logs/<log name>.{diff,log}`.
@@ -2937,6 +2938,7 @@ logs `.uzi/scratch/ctl-logs/<log name>.{diff,log}`.
 | u14r-unstarted-isolated | (d) guard, 1b3afe49e | `OR r.started_at IS NULL` → `OR false` | budget_unstarted_zero_base | :391 "stop acceptance mismatch: status=409 applied=false" |
 | (superseded) u14-unstarted | observation only, f7a795fb1 | the same arm alone (`u14-unstarted-arm-only`) and `GREATEST(0, elapsed)` → `(0 + elapsed)` alone (`u14-unstarted-greatest-only`) both EXIT=0 on budget_unstarted_exempt; both together red at :381 (`u14-unstarted-both`) | budget_unstarted_exempt (positive 60 s wall) | not credited: the combined arm also removes the elapsed clamp, a second fence; the apparent redundancy holds only while the base is positive (`GREATEST` ignores the NULL elapsed) |
 | u14r-cutoff-boundary | (d) guard, 1b3afe49e | `AND i.id <= a.stop_cutoff` → `AND true` | input_stop_above_cutoff | :391 "refusal mismatch: status=200 applied=true" |
+| u14r-cutoff-equal | (d) guard, 039947e1d | `AND i.id <= a.stop_cutoff` → `AND i.id < a.stop_cutoff` | input_stop_under_cutoff (pending id equals the cutoff) | :391 "stop acceptance mismatch: status=409 applied=false" |
 | u14-extension | (d) behavioural mutation | `+ r.budget_extension_seconds` → `+ 0` | budget_extension_keeps_positive | :381 "stop acceptance mismatch" |
 | u14-finalize | (d) behavioural mutation | `+ r.budget_finalize_seconds` → `+ 0` | budget_finalize_keeps_positive | :381, as above |
 | u14-paused-secs | (d) behavioural mutation | `- r.budget_paused_seconds` → `- 0` | budget_paused_seconds_keeps_positive | :381, as above |
