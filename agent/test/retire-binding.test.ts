@@ -418,6 +418,32 @@ describe("conflicting canonical history for one attempt id (#4263)", () => {
     });
   }
 
+  // No binding yet when compaction runs: only the identity-count rule (over every branch) can keep the history.
+  for (const order of [[BRANCH, OTHER_BRANCH], [OTHER_BRANCH, BRANCH]]) {
+    it(`unbound: compaction keeps a gone cross-branch identity conflict, compacting ${order.join(" then ")}, for a later binding`, async () => {
+      const live = entry("live");
+      const ret = entry("retired");
+      addTo(OTHER_KEY, live);
+      addTo(LEDGER_KEY, ret);
+      for (const br of order) await compactBranch(br);
+      assert.deepEqual(valuesOf(OTHER_KEY), [live]);
+      assert.deepEqual(valuesOf(LEDGER_KEY), [ret]);
+      bindSettled();
+      const { ledger, bindings } = await realEvidence();
+      assert.deepEqual(await evalReal(ledger, bindings), { exam: { kind: "keep", reason: "ledger_mismatch" }, recovery: "unresolved" });
+    });
+  }
+
+  it("unbound: compaction keeps a same-branch run id conflict verbatim, for a later binding", async () => {
+    const input = [entry("live", { runId: "run-other" }), entry("retired")];
+    for (const v of input) addTo(LEDGER_KEY, v);
+    await compactBranch(BRANCH);
+    assert.deepEqual(ledgerValues(), input);
+    bindSettled();
+    const { ledger, bindings } = await realEvidence();
+    assert.deepEqual(await evalReal(ledger, bindings), { exam: { kind: "keep", reason: "ledger_mismatch" }, recovery: "unresolved" });
+  });
+
   it("compaction keeps a gone entry whose run id differs from a decoded binding's", async () => {
     const only = entry("retired", { runId: "run-other" });
     addTo(LEDGER_KEY, only);

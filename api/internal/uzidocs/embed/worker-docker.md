@@ -767,8 +767,8 @@ Kept reasons for bound parents include `bound_intent`, `interrupted_removal`,
 
 An attempt id has one identity: if any of its attempt-ledger values, on any
 branch, names a run, clone path or branch other than the binding's, the parent
-is kept as `ledger_mismatch`, and a second binding naming the same attempt with
-another identity keeps both as `conflict`. Ledger compaction keeps every value
+is kept (`ledger_mismatch`), and a second binding naming the same attempt with
+another identity keeps each parent (`conflict`). Ledger compaction keeps every value
 of such an attempt as written, so the conflict survives it.
 
 Still kept: legacy parents created before bindings, attempt-less retires,
