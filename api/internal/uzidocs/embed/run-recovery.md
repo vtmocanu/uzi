@@ -2848,18 +2848,21 @@ Further cases that keep a leaf as unknown (`run_local_unknown`):
 
 - **The run's refs** (`run_refs`): the listing is read with stderr, so any git warning
   or failure is unknown. After a clean empty listing, the loose ref storage under the
-  run's ref prefixes (`refs/uzi-owed`, `uzi-recovery-episode`, `uzi-recovery-pin`,
-  `uzi-coverage`, `uzi-settle`, `uzi-archive` and `refs/uzi-cross-check/<runId>`) and
+  run's ref prefixes (`refs/uzi-owed/`, `refs/uzi-recovery-episode/`,
+  `refs/uzi-recovery-pin/`, `refs/uzi-coverage/`, `refs/uzi-settle/`, `refs/uzi-archive/`
+  and `refs/uzi-cross-check/<runId>`) and
   `packed-refs` are checked directly. Any non-directory entry under them (a broken or
   dangling ref, symlink, FIFO or stale lock file), a symlinked or non-directory
-  ancestor, any `packed-refs` line naming the run, or reftable ref storage keeps the
+  ancestor, any `packed-refs` line naming the run, or a ref storage extension
+  (`extensions.refstorage`, or a `reftable` directory) keeps the
   leaf as unknown. A stale `*.lock` left under a run's ref directory therefore keeps
   that leaf until it is removed.
 - **A retired ledger row** (`attempt_ledger`) whose clone path is not this bare's
   canonical attempt clone for its attempt id (the census's identity contract), or whose
   generation is unreadable, gives unknown.
-- **Interrupted reads:** the authority slot reads stop at the pass's abort or deadline,
-  and the leaf is kept as unknown.
+- **Interrupted reads:** the authority slot reads stop starting new reads at the pass's
+  abort or deadline. Reaching the deadline keeps the leaf as unknown (`classifier`); an
+  abort stops the scratch phase, so the leaf survives without a kept count.
 
 New `scratch.kept` reasons for run leaves:
 
