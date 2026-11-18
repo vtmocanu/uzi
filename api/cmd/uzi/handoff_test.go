@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -83,7 +84,7 @@ func handoffEnv(fc *uzicli.FakeClient, rec *handoffRecorder) (Env, *handoffClien
 // exitCodeErr is a git failure carrying an exit status, like *exec.ExitError.
 type exitCodeErr struct{ code int }
 
-func (e exitCodeErr) Error() string { return "exit status " + string(rune('0'+e.code)) }
+func (e exitCodeErr) Error() string { return "exit status " + strconv.Itoa(e.code) }
 func (e exitCodeErr) ExitCode() int { return e.code }
 
 // sshConfigRecorder is a fake Env.SSHConfig recording argv and call count.

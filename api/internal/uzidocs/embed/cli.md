@@ -1901,7 +1901,8 @@ never bypasses this; it only picks among repos that already match.
   `GIT_SSH_COMMAND` and `core.sshCommand` can send the push somewhere `ssh -G`
   cannot see. Use an https remote instead.
 - **Anything else is refused:** `git://`, `file://`, `git+ssh://`, local paths
-  and other schemes.
+  and other schemes, an `ssh://` origin containing `%` or a password, and any
+  origin whose host, user or port holds whitespace or control characters.
 
 No flag bypasses the check.
 
