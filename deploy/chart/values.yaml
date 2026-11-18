@@ -778,6 +778,32 @@ workers:
   # the workers the same way a nodeSelector change does. The controller validates the
   # list at boot. The api, web and controller pods are not affected.
   tolerations: []
+  # An opt-in second placement for moving workers to a new node pool (for example a
+  # dedicated, tainted pool in another storage zone). Off by default: empty renders
+  # no env and nothing changes. When set, the controller stamps a worker volume it
+  # creates with `uzi.dev/placement: new` unless that worker still has an unstamped
+  # volume (a legacy worker's missing volume is recreated unstamped), and ONLY a worker
+  # whose volumes are all stamped uses it; every other worker keeps the global
+  # nodeSelector/tolerations above. Setting it rolls no worker still on the global
+  # placement; changing it, or re-setting it with different values, rolls already-stamped
+  # workers through normal roll admission. A roll does not move their volumes: retarget
+  # only to nodes that can attach every stamped worker's existing volumes; otherwise do
+  # not retarget (the per-worker procedure cannot move already-stamped workers).
+  #
+  # Both fields REPLACE (never merge with) the global ones for such a worker: keep
+  # `kubernetes.io/arch: amd64` in nodeSelector and repeat any global toleration still
+  # needed. A tolerations-only newPlacement renders no nodeSelector at all.
+  #
+  # Moving each worker is a manual, per-worker procedure that permanently deletes its
+  # volumes: see docs/hosted-workers.md "Moving workers to a new node pool". When no
+  # unstamped worker remains, copy newPlacement into workers.nodeSelector and
+  # workers.tolerations FIRST, then clear newPlacement; clearing it earlier sends
+  # stamped workers back to the old nodes. Helm merges maps, so an empty
+  # `nodeSelector: {}` keeps the amd64 default: use `nodeSelector: null` when the new
+  # placement has none, and render the chart to confirm before clearing newPlacement.
+  newPlacement:
+    nodeSelector: {}
+    tolerations: []
   # A cluster-scoped PriorityClass for hosted worker pods (issue #1341). When enabled,
   # the chart creates the PriorityClass AND the controller stamps its name onto every
   # worker pod's priorityClassName, so a busy worker outranks lower-priority pods for
