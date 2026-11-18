@@ -1055,7 +1055,8 @@ names that surface.
 
 ### 2. Requirement to test to control map
 
-Status is the ledger's Clause-accounting wording, not a new assessment. No
+Status summarizes the ledger's Clause-accounting entries ("partly credited" is this
+index's own label) and is not a new assessment. No
 requirement below is fully credited: each carries the residual the ledger names.
 
 | # | Requirement | Tests | Controls (class) | Status | Residual named in the ledger |
@@ -1090,7 +1091,7 @@ Crash points (U21 leaves, with the controls named in the ledger):
 | 2. API commit, reply lost | "Codex switch crash after apply commit loses auth response and recovers committed B"; `TestCodexApplyCommittedLostReplyLiveDB` (U12) | same four U21 controls; u12-replay-codex, u12-replay-nomaterial | partly credited | as U21 and U12 |
 | 3. After apply acknowledgment, before B login | "Codex switch crash after apply acknowledgement before B login recovers committed B" | same four U21 controls | partly credited | as U21; U6 crash controls ran through the crash-during-login publication only |
 | 4. During B login | "Codex switch crash during B login retains committed B"; U6 crash cases | same four U21 controls; u6-crash-missing-id, u6-crash-preserve-saved (u6-crash-preserve-attempt cause only) | partly credited | as U21 and U6 |
-| 5. Predecessor host unreachable | none | none | **unvalidated and uncredited** (owner decision recorded 2026-11-18, environmental limitation; its fail-closed premise is false cross-worker; a fresh owner decision is requested at completion) | The code does not enforce predecessor quiescence on cross-worker reclaim; recorded in "Decision 11 recovery controls and crash point 5". A fresh claim with a pending stamp from an older generation also passes `expireCodexSwitchOnFreshClaim` (not found in ledger). Fresh owner decision pending |
+| 5. Predecessor host unreachable | none | none | **unvalidated and uncredited** (owner decision recorded 2026-11-18, environmental limitation; its fail-closed premise is false cross-worker; a fresh owner decision is requested at completion) | The code does not enforce predecessor quiescence on cross-worker reclaim; recorded in "Decision 11 recovery controls and crash point 5". A fresh claim also goes through `expireCodexSwitchOnFreshClaim` (not found in ledger), which expires a still-pending switch from an older generation and is a no-op after an applied one, so B is still delivered. Fresh owner decision pending |
 
 ### 3. PRD #1147 constraints
 
@@ -1124,7 +1125,7 @@ the plan's own; the last column is the ledger evidence.
 - Owner acceptance: live cross-account `thread/resume`, not verified.
 - Owner partial decision on every unvalidated residue: the "not controlled"
   residues in the ledger's Clause-accounting table, the clauses that fit no
-  proof class, crash point 5 and the cross-worker path of decision 11. The owner's case 5
+  proof class, crash point 5, the cross-worker path of decision 11, and the two authorities with no Clause-accounting row and no ledger evidence: the owner-scoped usage refresh (`handleCodexUsageUnauthorized`) and the fresh-claim pending expiry (`expireCodexSwitchOnFreshClaim`), both unvalidated and uncredited. The owner's case 5
   decision (unvalidated and uncredited, environmental limitation) is recorded,
   but it rested on the runtime staying fail-closed, which the code does not
   hold across workers; a fresh owner decision is requested at completion. m3
@@ -1162,7 +1163,7 @@ forge, e2e, scripts, workflows, shell or YAML, so `test:e2e-lib`,
 affected and were not run.
 
 The `task scan:secrets` log reports non-gating findings in untracked
-`.uzi/scratch` logs (UUID-shaped run and operation ids); those files are not
+`.uzi/scratch` logs (which, from a sampled line, appear to be UUID-shaped run and operation ids); those files are not
 tracked or published.
 
-Final-head re-run: the lead re-ran `check:api-v1-compat`, `check:token-literals`, `scan:secrets` and `sast:semgrep` at the commit that adds this line. The logs are `.uzi/scratch/ctl-logs/m4f-*.log`, each ending `SHA=… EXIT=…`, and the results are in the PR verification list.
+Final-head re-run: the lead re-ran `check:api-v1-compat`, `check:token-literals`, `scan:secrets` and `sast:semgrep` on 607b1ebff, the commit that first added this paragraph. All four logs (`.uzi/scratch/ctl-logs/m4f-*.log`) end `SHA=607b1ebff… EXIT=0`. Later commits change only this record.
