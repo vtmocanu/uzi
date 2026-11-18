@@ -430,7 +430,7 @@ reading, not an outcome seen in practice.
 On a uid-split pod (`UZI_UID_SPLIT=1`) `retireRunnerClone` never writes
 `settled`. A bound parent of any class, `owner_terminal` and
 `verified_successor` included, stays at its `intent` phase with the parent and
-the moved clone left in place (`unproven`, logged as deferred). No new phase was
+the moved clone left in place (`unproven`, logged as kept in place). No new phase was
 added. The `settle-write`, `settle-sync` and `settled` retire steps no longer
 exist; `RETIRE_PHASES` still parses `settled` so a pre-existing value is read
 and kept. This adds no disposition authority and removes none that earlier code
@@ -768,7 +768,7 @@ An architect, auditor and reviewer examined two judgments and found no stop.
   from exact-head CI `test-agent-worker-uid` unless reported otherwise; this
   amendment does not claim them.
 - The real worker-UID lane cases call `discardRetireScratchParent` directly, with
-  no binding. Binding `removing` retention and the two never-settling classes are
+  no binding. Binding `removing` retention and the never-settling split classes are
   therefore proven only by hermetic tests (`agent/test/retire-binding-writes.test.ts`,
   `agent/test/pod-epoch-retire-scratch.test.ts`). The lane's clone-pin mount-id
   half is not exercised (it needs CAP_SYS_ADMIN).

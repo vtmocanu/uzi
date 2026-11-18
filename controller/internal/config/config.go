@@ -311,8 +311,8 @@ type Config struct {
 	// WorkerRetireScratchOutcomes controls worker retirement-scratch outcome records
 	// (UZI_RETIRE_SCRATCH_OUTCOMES). Default true; false renders the worker opt-out.
 	WorkerRetireScratchOutcomes bool
-	// WorkerRetireScratchReclaim controls the verified-epoch reclaim of bound `.retire-*`
-	// parents (UZI_RETIRE_SCRATCH_RECLAIM). Default true; false renders the worker opt-out.
+	// WorkerRetireScratchReclaim controls the verified-epoch retire-scratch phase, which
+	// deletes no bound `.retire-*` parent and clears the binding of a gone one (UZI_RETIRE_SCRATCH_RECLAIM). Default true; false renders the worker opt-out.
 	WorkerRetireScratchReclaim bool
 	// WorkerDinDImage is the fully-pinned DinD sidecar image
 	// (docker:<tag>-dind-rootless@sha256:... or, non-rootless, docker:<tag>-dind@...).

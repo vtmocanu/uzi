@@ -20650,11 +20650,11 @@ export class GitCache {
             };
             const bound = rb.bound;
             if (bound && split) {
-              // issue #4263 [7] (C-prime): a bound split parent is never settled. A process-proof revocation arriving during a
-              // settle write could leave `settled`, which authorizes deletion by the pod epoch, so on a uid-split pod the
-              // binding stays `intent` and the epoch keeps it.
+              // issue #4263 [7] (C-prime): a bound split parent is never settled. A settle write could race a process-proof
+              // revocation (residual R), so no retire writes `settled`: on a uid-split pod the binding stays `intent`, and the
+              // epoch keeps every bound parent (a pre-existing `settled` reads `settled_kept`).
               beforeDestroy();
-              // The deferred parent is left in place exactly as a failed in-process scratch removal leaves it today.
+              // The parent is left in place exactly as a failed in-process scratch removal leaves it today.
               unproven();
               this.log.info("retire scratch parent kept in place (split pod, binding stays intent)", { path: scratch });
             } else {
@@ -20907,8 +20907,8 @@ export class GitCache {
    *  rename targets of {@link createRetireScratchParent}). `<runnerRoot>` persists across pod
    *  replacements now, so a crash between the rename and the disposal leaves one behind that no
    *  retire context remembers. It runs ONCE at worker startup, strictly before the claim loop and
-   *  before any retire or recovery path is reachable, and REMOVES NOTHING (issue #4263: the verified pod-epoch pass, which runs just before it, is the only
-   *  thing that reclaims a bound parent; this inspection runs after it, still before the claim loop): reclaim needs the
+   *  before any retire or recovery path is reachable, and REMOVES NOTHING (issue #4263: the verified pod-epoch pass, which runs just before it, deletes no
+   *  bound parent (C-prime) and only clears the binding of a gone one; this inspection runs after it, still before the claim loop): reclaim needs the
    *  retirement/custody/writer-exclusion proofs, and a surviving daemon container can still bind-mount
    *  or hold its cwd in even an EMPTY parent, so emptiness is no evidence it is unused.
    *    - a parent whose mtime is at or after `processStartMs` is skipped (this process made it);
