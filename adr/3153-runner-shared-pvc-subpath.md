@@ -531,17 +531,17 @@ verdict or reason and reports only a `retire_scratch` block and
   (`retireCrossBareConflict`): any other bare's binding entry that cannot be
   decoded, any decoded binding naming the attempt, or any ledger value not
   positively identified as a different attempt keeps the parent. For a present
-  parent this is reported as `conflict` for a `settled` binding (`intent` and
-  `removing` are already kept for their own reasons); for a gone parent every
-  phase is checked.
-  Unidentified values include unparseable text, `{}`, `null`, a non-string or
-  malformed `attemptId` and values naming the attempt. This holds at nomination,
+  parent with a `settled` binding it is reported as `conflict` unless an earlier
+  reason applies (`intent` and `removing` are already kept for their own
+  reasons); for a gone parent every phase is checked. Values that keep it
+  include unparseable text, `{}`, `null`, a non-string or malformed `attemptId`
+  and values naming the attempt. This holds at nomination,
   under the lock for deletion and in gone-parent recovery (kept as `conflict` at
   nomination, `metadata_unresolved` under the lock). A gone parent whose uuid is
   bound in more than one bare is kept as `conflict`. The check reads only bares
-  other than the parent's own, so one undecodable binding or unidentified ledger
-  value in any bare keeps every bound parent of every other bare (settled, or
-  gone in any phase) until it is removed.
+  other than the parent's own, so one undecodable binding or ledger value that
+  cannot be attributed to any attempt, in any bare, keeps every bound parent of
+  every other bare (settled, or gone in any phase) until it is removed.
   Under B the source-use check is read-only (a held lease from
   another sink, or an active slot, keeps with `source_use_held`; nothing is
   admitted or taken over); the parent must be a worker-owned 0700 directory with
