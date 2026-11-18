@@ -2,6 +2,8 @@ package kube
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -10,6 +12,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/vtmocanu/uzi/controller/internal/protocol"
 )
@@ -93,6 +96,37 @@ func (e *wakeClaimEnv) claim(t *testing.T, name string) (*corev1.PersistentVolum
 	return p, true
 }
 
+func (e *wakeClaimEnv) assertClaimCreatedBeforeWake(t *testing.T, name string) {
+	t.Helper()
+	created, woke := -1, -1
+	for i, a := range e.client.Actions() {
+		if a.GetNamespace() != e.ns {
+			continue
+		}
+		if c, ok := a.(k8stesting.CreateAction); ok && a.GetResource().Resource == "persistentvolumeclaims" {
+			if p, ok := c.GetObject().(*corev1.PersistentVolumeClaim); ok && p.Name == name && created == -1 {
+				created = i
+			}
+		}
+		if p, ok := a.(k8stesting.PatchAction); ok && a.GetResource().Resource == "deployments" && p.GetName() == deploymentName(e.w.ID) {
+			var patch struct {
+				Spec struct {
+					Replicas *int32 `json:"replicas"`
+				} `json:"spec"`
+			}
+			if err := json.Unmarshal(p.GetPatch(), &patch); err != nil {
+				t.Fatal(err)
+			}
+			if patch.Spec.Replicas != nil && *patch.Spec.Replicas == 1 && woke == -1 {
+				woke = i
+			}
+		}
+	}
+	if created == -1 || woke == -1 || created >= woke {
+		t.Fatalf("claim %s create action %d must precede replicas-1 patch %d", name, created, woke)
+	}
+}
+
 func TestWakeHeldWhileAClaimIsTerminating(t *testing.T) {
 	for _, mode := range []string{"newPlacement-off", "newPlacement-on"} {
 		for _, tc := range []struct {
@@ -152,6 +186,7 @@ func TestWakeHeldWhileAClaimIsTerminating(t *testing.T) {
 				if p.DeletionTimestamp != nil {
 					t.Fatalf("recreated claim %s is still terminating", claimName)
 				}
+				e.assertClaimCreatedBeforeWake(t, claimName)
 			})
 		}
 	}
@@ -199,6 +234,7 @@ func TestWakeProceedsWhenAClaimIsCreatedThisTick(t *testing.T) {
 	if got := e.replicas(t); got != 1 {
 		t.Fatalf("replicas = %d on the tick that created the claim, want 1", got)
 	}
+	e.assertClaimCreatedBeforeWake(t, dataPVCName("w1"))
 }
 
 // Control: an undersized but live /nix claim is a size-drift matter, not a doomed volume,
@@ -218,5 +254,61 @@ func TestWakeNotHeldByUndersizedLiveNixClaim(t *testing.T) {
 	e.tick(t)
 	if got := e.replicas(t); got != 1 {
 		t.Fatalf("replicas = %d with an undersized live nix claim, want 1", got)
+	}
+}
+
+// Observe folds namespaces in order. A leftover same-ID claim in the other lane
+// must neither hide a target claim's deletion nor hold a wake on live target claims.
+func TestWakeUsesTargetNamespaceClaimTermination(t *testing.T) {
+	for _, docker := range []bool{false, true} {
+		for _, kind := range []string{"data", "nix", "dind-data"} {
+			if kind == "dind-data" && !docker {
+				continue
+			}
+			for _, targetTerminating := range []bool{false, true} {
+				t.Run(fmt.Sprintf("docker=%t/%s/targetTerminating=%t", docker, kind, targetTerminating), func(t *testing.T) {
+					e := wakeClaimSetup(t, false, docker, func(claims []*corev1.PersistentVolumeClaim) []runtime.Object {
+						var out []runtime.Object
+						for _, p := range claims {
+							out = append(out, p)
+						}
+						return out
+					})
+					e.m.cfg.DockerNamespace = "uzi-workers-docker"
+					otherNS := e.m.cfg.DockerNamespace
+					if docker {
+						otherNS = e.m.cfg.Namespace
+					}
+					name := map[string]string{"data": dataPVCName("w1"), "nix": nixPVCName("w1"), "dind-data": dindDataPVCName("w1")}[kind]
+					p, ok := e.claim(t, name)
+					if !ok {
+						t.Fatal("target claim absent")
+					}
+					foreign := p.DeepCopy()
+					foreign.Namespace = otherNS
+					now := metav1.Now()
+					if targetTerminating {
+						p.DeletionTimestamp = &now
+					} else {
+						foreign.DeletionTimestamp = &now
+					}
+					if _, err := e.client.CoreV1().PersistentVolumeClaims(e.ns).Update(context.Background(), p, metav1.UpdateOptions{}); err != nil {
+						t.Fatal(err)
+					}
+					if _, err := e.client.CoreV1().PersistentVolumeClaims(otherNS).Create(context.Background(), foreign, metav1.CreateOptions{}); err != nil {
+						t.Fatal(err)
+					}
+					e.client.ClearActions()
+					e.tick(t)
+					want := int32(1)
+					if targetTerminating {
+						want = 0
+					}
+					if got := e.replicas(t); got != want {
+						t.Fatalf("replicas = %d, want %d for target claim state", got, want)
+					}
+				})
+			}
+		}
 	}
 }

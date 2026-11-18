@@ -369,6 +369,12 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 		// flight would otherwise read the doomed volume's size as live. Compute the flag
 		// once and let each case decide what it means for that claim.
 		terminating := p.DeletionTimestamp != nil
+		if terminating && (p.Name == dataPVCName(id) || p.Name == nixPVCName(id) || p.Name == dindDataPVCName(id)) {
+			if o.TerminatingClaims == nil {
+				o.TerminatingClaims = map[string]bool{}
+			}
+			o.TerminatingClaims[ns+"/"+p.Name] = true
+		}
 		if !terminating && p.Status.Phase == corev1.ClaimPending && (p.Name == nixPVCName(id) || p.Name == dataPVCName(id) || p.Name == dindDataPVCName(id)) {
 			o.SchedulerPendingClaims = append(o.SchedulerPendingClaims, reconcile.SchedulerPendingClaim{Namespace: ns, Name: p.Name, CreatedAt: p.CreationTimestamp.Time})
 		}
