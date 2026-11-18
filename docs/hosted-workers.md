@@ -623,8 +623,10 @@ How the stamp works:
   setting it again with values different from before, changes stamped workers' pod
   templates, and they roll through normal roll admission. A roll does not move their
   volumes. Before retargeting `newPlacement`, confirm the new nodes can attach every
-  stamped worker's existing volumes; if they cannot, move those workers with the
-  per-worker procedure below instead, or their pods stay Pending.
+  stamped worker's existing volumes. If they cannot, do not apply the retarget, or those
+  pods stay Pending: every stamped worker's placement changes at once, so the per-worker
+  procedure below cannot move them gradually. Plan a separate storage or cohort
+  migration instead.
 - Which volumes are recreated decides which workers move. A recycle for data plus Nix
   pressure on a plain worker moves it. A Nix-only size recycle stays on the old
   placement, and so does a Docker pressure recycle, which keeps `/data`. Run-bound
@@ -640,7 +642,7 @@ volumes in the new pool's topology (no `allowedTopologies` or storage policy lim
 the old zone). Prove it first, for example with a throwaway claim and pod pinned to a new
 node, before deleting any worker's volumes.
 
-Procedure:
+Procedure (it moves unstamped workers that are on the global placement):
 
 1. Set `workers.newPlacement` (`nodeSelector` and `tolerations`) in your values and
    apply it (`helm upgrade`, or let the GitOps sync finish). Editing the values file alone
