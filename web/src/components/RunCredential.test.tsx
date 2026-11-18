@@ -38,6 +38,40 @@ function cred(over: {
   };
 }
 
+describe("RunCredential provider branch (PRD #4320 M7)", () => {
+  const provider = (id: string | null, name: string | null) => ({
+    ...cred({}),
+    provider_id: id,
+    provider_name: name,
+  });
+
+  it.each(["full", "compact"] as const)("%s: names the provider instead of the Anthropic token", (variant) => {
+    render(<RunCredential run={provider("prov-1", "team-gateway")} variant={variant} />);
+    expect(screen.getByText("team-gateway")).toBeTruthy();
+    expect(screen.queryByText(/console-key/)).toBeNull();
+    expect(screen.queryByText(/deleted/)).toBeNull();
+  });
+
+  it.each(["full", "compact"] as const)("%s: a deleted provider (null name) says so", (variant) => {
+    render(<RunCredential run={provider("prov-1", null)} variant={variant} />);
+    expect(screen.getByText(/\(deleted\)/)).toBeTruthy();
+    expect(screen.queryByText(/console-key/)).toBeNull();
+  });
+
+  it("renders a hostile name as escaped, sanitized text", () => {
+    const { container } = render(
+      <RunCredential run={provider("prov-1", "<img src=x onerror=alert(1)>‮evil")} variant="compact" />,
+    );
+    expect(container.querySelector("img")).toBeNull();
+    expect(container.textContent).not.toContain("‮");
+  });
+
+  it("a vendor run (provider_id null) still renders the token label", () => {
+    render(<RunCredential run={provider(null, null)} />);
+    expect(screen.getByText(/console-key/)).toBeTruthy();
+  });
+});
+
 describe("RunCredential (PRD #111 M1)", () => {
   it("names the credential the run spent", () => {
     render(

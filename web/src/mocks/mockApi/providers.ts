@@ -9,6 +9,13 @@ import { delay, mockScenario, requireSession } from "./shared";
 const featureOn = mockScenario() === "providers";
 let providers: ProviderDTO[] = featureOn ? mockProviders.map((p) => ({ ...p })) : [];
 let nextId = 1;
+// The user's selected Claude source (UserSettings.claude_provider_id); null = Anthropic.
+let claudeProviderId: string | null = null;
+
+/** Read by the mock GET /me/settings so the settings projection and this module agree. */
+export function mockClaudeProviderId(): string | null {
+  return claudeProviderId;
+}
 
 function fail(status: number, reason: string, message: string): never {
   throw new ApiError(status, message, { error: message, reason });
@@ -131,8 +138,32 @@ export const providersApi = {
   deleteProvider: async (id: string) => {
     requireSession();
     find(id);
+    // Mirrors the server: a provider still selected as the Claude source cannot be deleted.
+    if (claudeProviderId === id) {
+      fail(409, "provider_in_use_as_source", "the provider is in use as your Claude source");
+    }
     providers = providers.filter((p) => p.id !== id);
     return delay(null);
+  },
+  // Mirrors handler.SetMyClaudeProviderSource: null clears; an unknown id is a 404; a retired,
+  // keyless or key-disabled provider is a 409 provider_source_unusable.
+  setClaudeProviderSource: async (providerId: string | null) => {
+    requireSession();
+    if (providerId === null) {
+      claudeProviderId = null;
+      return delay({ claude_provider_id: null });
+    }
+    const p = find(providerId);
+    const why = p.retired
+      ? "the provider is retired"
+      : !p.has_key
+        ? "it has no key"
+        : !p.key_enabled
+          ? "its key is disabled"
+          : null;
+    if (why) fail(409, "provider_source_unusable", `the provider cannot be the Claude source: ${why}`);
+    claudeProviderId = providerId;
+    return delay({ claude_provider_id: providerId });
   },
   testProvider: async (id: string) => {
     requireSession();

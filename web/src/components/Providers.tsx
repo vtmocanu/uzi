@@ -113,7 +113,18 @@ const REASON_MESSAGES: Record<string, string> = {
   provider_retired: "This provider is retired and can no longer be changed.",
   provider_name_taken: "You already have a provider with that name.",
   provider_probe_rate_limited: "Tests are rate limited. Wait a moment, then test again.",
+  provider_source_unusable: "This provider cannot be your Claude source right now. Check that it is not retired and has an enabled key.",
 };
+
+// Why a provider cannot be selected as the Claude source, or null when it can. Mirrors the
+// server's usability rules (the server stays authoritative and answers 409
+// provider_source_unusable); the feature-off case never reaches a row.
+function sourceBlockedReason(p: ProviderDTO): string | null {
+  if (p.retired) return "A retired provider cannot be your Claude source.";
+  if (!p.has_key) return "Set a key before using this provider.";
+  if (!p.key_enabled) return "Enable the key before using this provider.";
+  return null;
+}
 
 function providerError(err: unknown, fallback: string): string {
   if (err instanceof ApiError) {
@@ -256,12 +267,14 @@ function ProviderRow({
   busy,
   run,
   onProbe,
+  isSource,
 }: {
   provider: ProviderDTO;
   allowed: string[];
   busy: boolean;
   run: RunFn;
   onProbe: (id: string, probe: ProviderProbe) => void;
+  isSource: boolean;
 }) {
   const p = provider;
   const uid = useId();
@@ -351,11 +364,13 @@ function ProviderRow({
   const canTest = p.has_key && p.key_enabled && !p.retired;
   const mapped = ROLES.filter(({ role }) => p.model_map[role]);
   const rowBusy = busy || testing;
+  const blocked = sourceBlockedReason(p);
 
   return (
     <li className="space-y-3 rounded-lg border border-edge bg-raised/40 p-4" data-testid={`provider-${p.id}`}>
       <div className="flex flex-wrap items-center gap-2">
         <h3 className="text-sm font-semibold text-fg">{sanitizeLabel(p.name)}</h3>
+        {isSource && <Badge tone="info">Claude source</Badge>}
         {p.retired && <Badge tone="neutral">Retired</Badge>}
         {!p.has_key ? (
           <Badge tone="warning">No key</Badge>
@@ -394,6 +409,32 @@ function ProviderRow({
       </dl>
 
       <div className="flex flex-wrap gap-2">
+        {isSource ? (
+          <Button
+            size="sm"
+            disabled={rowBusy}
+            onClick={() =>
+              void run(() => api.setClaudeProviderSource(null), "Claude runs use Anthropic again.", "Failed to stop using the provider")
+            }
+          >
+            Stop using
+          </Button>
+        ) : (
+          <Button
+            size="sm"
+            disabled={rowBusy || blocked !== null}
+            title={blocked ?? undefined}
+            onClick={() =>
+              void run(
+                () => api.setClaudeProviderSource(p.id),
+                "This provider is now your Claude source.",
+                "Failed to use the provider",
+              )
+            }
+          >
+            Use as Claude source
+          </Button>
+        )}
         {!p.retired && (
           <>
             <Button size="sm" variant="secondary" disabled={rowBusy} onClick={() => open("edit")} aria-expanded={panel === "edit"}>
@@ -450,6 +491,9 @@ function ProviderRow({
           Delete
         </Button>
       </div>
+      {!isSource && blocked && (
+        <p className="text-xs text-faint" data-testid={`source-blocked-${p.id}`}>{blocked}</p>
+      )}
       {!canTest && !p.retired && (
         <p className="text-xs text-faint">Testing needs a key that is set and enabled.</p>
       )}
@@ -603,10 +647,23 @@ export function Providers() {
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
+  // UserSettings.claude_provider_id: null = Anthropic; undefined = not read yet / unreadable.
+  const [sourceId, setSourceId] = useState<string | null | undefined>(undefined);
 
   const reload = useCallback(async () => {
     try {
-      setData(await api.listProviders());
+      const [list, source] = await Promise.all([
+        api.listProviders(),
+        (async () => {
+          try {
+            return (await api.getMySettings(true)).settings.claude_provider_id ?? null;
+          } catch {
+            return undefined; // the selection is advisory here; the list still renders
+          }
+        })(),
+      ]);
+      setData(list);
+      if (source !== undefined) setSourceId(source);
       setLoadError("");
     } catch (err) {
       setLoadError(errorMessage(err, "Failed to load providers"));
@@ -662,6 +719,21 @@ export function Providers() {
         </p>
       ) : data ? (
         <>
+          <div className="space-y-1 text-sm" data-testid="claude-source">
+            <p>
+              <span className="text-muted">Current Claude source: </span>
+              <span className="font-medium text-fg">
+                {sourceId === undefined
+                  ? "unknown"
+                  : sourceId === null
+                    ? "Anthropic"
+                    : data.providers.find((p) => p.id === sourceId)
+                      ? sanitizeLabel(data.providers.find((p) => p.id === sourceId)!.name)
+                      : "a provider that no longer exists"}
+              </span>
+            </p>
+            <p className="text-xs text-faint">Runs that use a provider wait in the queue until workers support providers.</p>
+          </div>
           {data.providers.length === 0 ? (
             <p className="text-sm text-muted">No providers yet.</p>
           ) : (
@@ -674,6 +746,7 @@ export function Providers() {
                   busy={busy}
                   run={run}
                   onProbe={onProbe}
+                  isSource={sourceId === p.id}
                 />
               ))}
             </ul>

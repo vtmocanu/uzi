@@ -3794,6 +3794,12 @@ export interface Run {
       truncated: boolean;
     }[];
   };
+  /** PRD #4320: the custom model provider this run was bound to; null for a vendor (Anthropic)
+   *  run. Owner-scoped DTOs only; optional so a build talking to an older server reads absent as null. */
+  provider_id?: string | null;
+  /** The provider's name for display. null for a vendor run OR when the provider has since been
+   *  deleted (provider_id is then still set). UNTRUSTED user text: render as escaped plain text. */
+  provider_name?: string | null;
   /** Repo display path on detail reads; absent on older servers, empty when unavailable. */
   repo_path?: string;
   /** Frozen repo inference policy; explicit requirements take precedence. */

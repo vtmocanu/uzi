@@ -3062,7 +3062,8 @@ export function RunView() {
               <RunHarnessDecision run={run} />
               {/* Only a requested or released switch adds a second token chip. The
                   stored choice and applied history live in Run settings. */}
-              {(run.credential_switch === "requested" || run.credential_switch === "released") && (
+              {/* A provider run spends no Anthropic token and the server refuses credential switches on it. */}
+              {!run.provider_id && (run.credential_switch === "requested" || run.credential_switch === "released") && (
                 <RunCredentialOverride run={run} />
               )}
               {settingsStates.map(state => <Badge key={state} tone="neutral">{state}</Badge>)}
@@ -3575,7 +3576,7 @@ export function RunView() {
           {/* PRD #1429 M4b (D7): the server-truthed per-run cost_status, distinct from
               the client-derived `usage` above — "" on a pre-M1 run reads defensively
               as cost-unavailable inside the panel, never as a complete $0. */}
-          <RunUsagePanel usage={usage} costStatus={run.usage?.cost_status ?? ""} harness={run.harness} />
+          <RunUsagePanel usage={usage} costStatus={run.usage?.cost_status ?? ""} harness={run.harness} provider={!!run.provider_id} />
         </Card>
       )}
 

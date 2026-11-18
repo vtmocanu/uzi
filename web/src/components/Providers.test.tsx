@@ -25,6 +25,8 @@ vi.mock("../lib/api", async (importActual) => {
       retireProvider: vi.fn(),
       deleteProvider: vi.fn(),
       testProvider: vi.fn(),
+      getMySettings: vi.fn(),
+      setClaudeProviderSource: vi.fn(),
     },
   };
 });
@@ -69,6 +71,8 @@ async function renderCard(data: ProvidersList = list()) {
 
 beforeEach(() => {
   mockApi.listProviders.mockReset();
+  mockApi.getMySettings.mockReset().mockResolvedValue({ settings: { claude_provider_id: null } } as never);
+  mockApi.setClaudeProviderSource.mockReset();
 });
 afterEach(() => {
   cleanup();
@@ -347,5 +351,73 @@ describe("Providers — delete", () => {
     expect(mockApi.deleteProvider).not.toHaveBeenCalled();
     fireEvent.click(within(row).getByRole("button", { name: "Confirm delete" }));
     expect((await screen.findByRole("alert")).textContent).toMatch(/still in use as a model source/);
+  });
+});
+
+describe("Providers — Claude source (PRD #4320 M7)", () => {
+  const USE = { name: "Use as Claude source" };
+
+  it("shows Anthropic as the current source and the queue-wait note by default", async () => {
+    await renderCard();
+    const box = await screen.findByTestId("claude-source");
+    expect(box.textContent).toMatch(/Current Claude source: Anthropic/);
+    expect(box.textContent).toMatch(/Runs that use a provider wait in the queue until workers support providers\./);
+  });
+
+  it("selects a provider, then reloads and shows it as the source with Stop using", async () => {
+    mockApi.setClaudeProviderSource.mockResolvedValue({ claude_provider_id: "p1" });
+    await renderCard();
+    const row = await screen.findByTestId("provider-p1");
+    mockApi.getMySettings.mockResolvedValue({ settings: { claude_provider_id: "p1" } } as never);
+    fireEvent.click(within(row).getByRole("button", USE));
+    await waitFor(() => expect(mockApi.setClaudeProviderSource).toHaveBeenCalledWith("p1"));
+    await waitFor(() => expect(screen.getByTestId("claude-source").textContent).toMatch(/Current Claude source: team-gateway/));
+    expect(within(row).getByText("Claude source")).toBeTruthy();
+    expect(within(row).queryByRole("button", USE)).toBeNull();
+  });
+
+  it("Stop using reverts to Anthropic", async () => {
+    mockApi.getMySettings.mockResolvedValue({ settings: { claude_provider_id: "p1" } } as never);
+    mockApi.setClaudeProviderSource.mockResolvedValue({ claude_provider_id: null });
+    await renderCard();
+    const row = await screen.findByTestId("provider-p1");
+    await waitFor(() => expect(screen.getByTestId("claude-source").textContent).toMatch(/team-gateway/));
+    mockApi.getMySettings.mockResolvedValue({ settings: { claude_provider_id: null } } as never);
+    fireEvent.click(within(row).getByRole("button", { name: "Stop using" }));
+    await waitFor(() => expect(mockApi.setClaudeProviderSource).toHaveBeenCalledWith(null));
+    await waitFor(() => expect(screen.getByTestId("claude-source").textContent).toMatch(/Anthropic/));
+  });
+
+  it.each([
+    ["retired", { retired: true }, /retired provider cannot be your Claude source/],
+    ["keyless", { has_key: false, key_enabled: false }, /Set a key before using/],
+    ["key disabled", { key_enabled: false }, /Enable the key before using/],
+  ])("disables Use as Claude source for a %s provider and says why", async (_n, over, reason) => {
+    await renderCard(list({ providers: [provider(over)] }));
+    const row = await screen.findByTestId("provider-p1");
+    const btn = within(row).getByRole("button", USE) as HTMLButtonElement;
+    expect(btn.disabled).toBe(true);
+    expect(btn.title).toMatch(reason);
+    expect(screen.getByTestId("source-blocked-p1").textContent).toMatch(reason);
+  });
+
+  it("offers no source controls when the feature is off", async () => {
+    await renderCard(list({ enabled: false, allowed_base_urls: [], providers: [] }));
+    expect(screen.queryByTestId("claude-source")).toBeNull();
+    expect(screen.queryByRole("button", USE)).toBeNull();
+  });
+
+  it("surfaces a provider_source_unusable refusal", async () => {
+    mockApi.setClaudeProviderSource.mockRejectedValue(apiError(409, "provider_source_unusable"));
+    await renderCard();
+    fireEvent.click(within(await screen.findByTestId("provider-p1")).getByRole("button", USE));
+    expect((await screen.findByRole("alert")).textContent).toMatch(/cannot be your Claude source/);
+  });
+
+  it("still renders the list when the settings read fails", async () => {
+    mockApi.getMySettings.mockRejectedValue(new Error("boom"));
+    await renderCard();
+    expect(await screen.findByTestId("provider-p1")).toBeTruthy();
+    expect(screen.getByTestId("claude-source").textContent).toMatch(/unknown/);
   });
 });

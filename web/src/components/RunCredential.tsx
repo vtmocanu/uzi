@@ -45,6 +45,8 @@ export function RunCredential({
     | "codex_secret_id"
     | "codex_secret_label"
     | "codex_select_reason"
+    | "provider_id"
+    | "provider_name"
   >;
   // variant "compact" (PRD #295) is the Runs-list rendering: label + a tone dot
   // (non-neutral only) + `(deleted)`, with mode/hint moved into the title so the
@@ -54,6 +56,27 @@ export function RunCredential({
   // Personal list presentation only; the recorded snapshot remains in the tooltip.
   displayLabel?: string;
 }) {
+  // PRD #4320: a run bound to a custom model provider names the provider, never an
+  // Anthropic token (it spent none). provider_name is user-authored text: sanitized like a
+  // label and rendered as escaped JSX. null name with an id means the provider was deleted.
+  if (run.provider_id) {
+    const name = run.provider_name ? sanitizeLabel(run.provider_name) : null;
+    const gone = name === null;
+    const title = gone
+      ? "This run used a custom model provider that has since been deleted."
+      : `This run used the custom model provider “${name}”, not an Anthropic token.`;
+    return variant === "compact" ? (
+      <Badge tone="info" title={title}>
+        <span className="max-w-[12rem] truncate">{gone ? "provider" : name}</span>
+        {gone && " (deleted)"}
+      </Badge>
+    ) : (
+      <Badge tone="info" wrap title={title}>
+        provider {!gone && <>“<span className="font-semibold">{name}</span>”</>}
+        {gone && "(deleted)"}
+      </Badge>
+    );
+  }
   const codex = run.harness === "codex";
   const label = codex ? run.codex_secret_label : run.anthropic_secret_label;
   if (!label) return null;

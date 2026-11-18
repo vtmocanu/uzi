@@ -727,6 +727,10 @@ const realApi = {
     request<{ provider: ProviderDTO }>("PATCH", `/me/providers/${id}/key/enabled`, { enabled }),
   retireProvider: (id: string) => request<{ provider: ProviderDTO }>("POST", `/me/providers/${id}/retire`),
   deleteProvider: (id: string) => request<null>("DELETE", `/me/providers/${id}`),
+  // PUT /me/providers/claude-source: select a provider as the Claude source, or null to
+  // return to Anthropic. A 409 reason provider_source_unusable names why it cannot serve.
+  setClaudeProviderSource: (providerId: string | null) =>
+    request<{ claude_provider_id: string | null }>("PUT", "/me/providers/claude-source", { provider_id: providerId }),
   testProvider: (id: string) =>
     request<{ probe: ProviderProbe }>("POST", `/me/providers/${id}/test`),
   testSecret: (kind: "anthropic_token" | "codex_auth" | "openai_api_key", id: string) =>
