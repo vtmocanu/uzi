@@ -50,6 +50,11 @@ func TestCodexApplyCommittedLostReplyLiveDB(t *testing.T) {
 	if replay.Outcome != ApplyOutcomeRefusedCommitted || replay.Codex != nil || replay.Token != "" {
 		t.Fatal("committed retry returned or reminted authority")
 	}
+	// The Codex replay answers credential_changed without consulting the
+	// Anthropic replay path (which would look the secret up as an Anthropic token).
+	if replay.Reason != applyReasonCredentialChanged {
+		t.Fatalf("committed Codex replay reason = %q, want %q", replay.Reason, applyReasonCredentialChanged)
+	}
 	if f.snap(t, run) != before {
 		t.Fatal("committed replay wrote state")
 	}

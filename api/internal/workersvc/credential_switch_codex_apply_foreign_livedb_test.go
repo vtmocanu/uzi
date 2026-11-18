@@ -37,9 +37,10 @@ func TestCodexApplyForeignWorkerFencedLiveDB(t *testing.T) {
 	}
 }
 
-// A committed op replayed under a NEW claim generation hits the prior-journal
-// generation check (the journal row belongs to the old generation) and is fenced
-// rather than reported as refused_committed.
+// A committed op replayed under a NEW claim generation, on a live running claim,
+// hits the prior-journal generation check (credential_switch_apply.go Step 1: the
+// journal row belongs to the old generation) and is fenced rather than reported
+// as refused_committed.
 func TestCodexReplayCommittedOpUnderNewGenerationFencedLiveDB(t *testing.T) {
 	x := newOutageCodexFlight(t, codexAuthModeAPIKey)
 	id := x.f.runID
@@ -62,9 +63,13 @@ func TestCodexReplayCommittedOpUnderNewGenerationFencedLiveDB(t *testing.T) {
 	if fresh, err := x.f.svc.Claim(x.env.ctx, hbWorker(t, x.env, x.f.workerID), nil); err != nil || fresh == nil {
 		t.Fatal("fresh recovery claim failed", err)
 	}
+	// The fresh claim leaves the run claimed; move it to running (as the
+	// first generation's fixture does) so the live-status fence passes and the
+	// prior-journal generation check is what decides the replay.
+	x.env.exec("UPDATE runs SET status='running' WHERE id=$1", id)
 	after := mustRun(t, x.env, id)
-	if after.ClaimGeneration != pending.ClaimGeneration+1 {
-		t.Fatal("fresh claim did not advance the generation")
+	if after.ClaimGeneration != pending.ClaimGeneration+1 || after.Status != "running" {
+		t.Fatal("fresh claim did not advance the generation to a running claim")
 	}
 	snap := func() string {
 		var s string
