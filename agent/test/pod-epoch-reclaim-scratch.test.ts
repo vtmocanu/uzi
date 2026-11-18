@@ -1388,6 +1388,22 @@ test("#4420 sensitivity control: with no authority slots, a retired ledger row a
   });
 });
 
+test("#4420 the pass forwards its signal and a finite deadline to the per-attempt slot read", FD_ONLY, async () => {
+  await withRunWorld([leafOf(RUN_A)], async (w, rw) => {
+    noAuthoritySlots(w);
+    await seedRetiredAttempt(rw, RUN_A);
+    await settleOutboxRun(rw, RUN_A);
+    const bounds: unknown[] = [];
+    w.options.scratch!.authority!.peekSlot = (async (_clonePath: string, bound?: unknown) => { bounds.push(bound); return null; }) as never;
+    const result = await run(w);
+    assert.equal(result.scratch.state, "ran");
+    assert.equal(bounds.length, 1, "the retired row's slot is read once");
+    const bound = bounds[0] as { signal?: unknown; deadline?: unknown } | undefined;
+    assert.ok(bound?.signal instanceof AbortSignal, "the pass's signal is forwarded");
+    assert.ok(typeof bound.deadline === "number" && Number.isFinite(bound.deadline), "a finite deadline is forwarded");
+  });
+});
+
 test("#4420 kept: a retired ledger row naming an unrelated missing path (not the bare's canonical attempt clone) keeps the run leaf as unknown from attempt_ledger", FD_ONLY, async () => {
   await withRunWorld([leafOf(RUN_A)], async (w, rw) => {
     noAuthoritySlots(w);

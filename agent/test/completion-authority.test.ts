@@ -1756,8 +1756,9 @@ for (const scenario of INTERRUPT_SCENARIOS) {
       const f = await fixture(t);
       const run = await scenario.setup(f);
       const ins = instrumentFs(scenario.hold(f));
-      await ins.install();
+      // Registered first: restore() is idempotent (its undo list is drained) and safe after a partial install.
       t.after(() => ins.restore());
+      await ins.install();
       const controller = new AbortController();
       const bound: AuthorityReadBound = { signal: controller.signal, deadline: Number.MAX_SAFE_INTEGER };
       const pending = run(bound);

@@ -447,6 +447,19 @@ describe("attempt footprint and authority slot (a retired ledger entry is ended 
     }
   });
 
+  it("per-attempt slot read: the pass's signal and deadline reach peekSlot as its bound", async () => {
+    retire();
+    const controller = new AbortController();
+    const deadline = Date.now() + 60_000;
+    let calls = 0;
+    let received: unknown;
+    const peekSlot = (async (_clonePath: string, bound?: unknown) => { calls++; received = bound; return null; }) as never;
+    assert.deepEqual(await classify({ signal: controller.signal, deadline, peekSlot }), ENDED);
+    assert.equal(calls, 1, "the retired row with a missing footprint reads the slot once");
+    assert.deepEqual(received, { signal: controller.signal, deadline });
+    assert.equal((received as { signal: AbortSignal }).signal, controller.signal);
+  });
+
   it("authority inventory: read once per pass through the memo", async () => {
     let reads = 0;
     const memo: NonNullable<EpochScratchRunRetentionOptions["memo"]> = {};
