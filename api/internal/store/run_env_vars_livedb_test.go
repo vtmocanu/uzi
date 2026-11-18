@@ -226,18 +226,48 @@ func TestRunEnvVarQueriesLiveDB(t *testing.T) {
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	tq := q.WithTx(tx)
-	batch, err := tq.LockVaultEnvMaterialBatch(ctx, LockVaultEnvMaterialBatchParams{UserID: user})
-	if err != nil || len(batch) != 6 {
-		t.Fatalf("batch = %d rows, %v; want all 6 of the owner", len(batch), err)
+	cands, err := tq.ListVaultEnvMaterialCandidates(ctx, ListVaultEnvMaterialCandidatesParams{UserID: user})
+	if err != nil || len(cands) != 6 {
+		t.Fatalf("candidates = %d ids, %v; want all 6 of the owner", len(cands), err)
 	}
-	for i := 1; i < len(batch); i++ {
-		if bytes.Compare(batch[i-1].ID[:], batch[i].ID[:]) >= 0 {
+	for i := 1; i < len(cands); i++ {
+		if bytes.Compare(cands[i-1][:], cands[i][:]) >= 0 {
+			t.Fatal("candidates are not in ascending id order")
+		}
+	}
+	// Listing candidates takes no row lock.
+	vaultMaterialWantUnlocked(t, pool, "SELECT id FROM run_env_vars WHERE id=$1 FOR UPDATE NOWAIT", cands[0])
+	tail, err := tq.ListVaultEnvMaterialCandidates(ctx, ListVaultEnvMaterialCandidatesParams{UserID: user, AfterID: pgtype.UUID{Bytes: cands[2], Valid: true}})
+	if err != nil || len(tail) != 3 || tail[0] != cands[3] {
+		t.Fatalf("keyset tail = %d ids, %v", len(tail), err)
+	}
+	if foreignCands, err := tq.ListVaultEnvMaterialCandidates(ctx, ListVaultEnvMaterialCandidatesParams{UserID: foreign}); err != nil || len(foreignCands) != 1 {
+		t.Fatalf("foreign candidates = %d, %v; want only the foreign owner's row", len(foreignCands), err)
+	}
+	// The lock batch is owner scoped by id: foreign ids lock nothing, vanished ids are absent.
+	if got, err := tq.LockVaultEnvMaterialBatch(ctx, LockVaultEnvMaterialBatchParams{UserID: foreign, Ids: cands}); err != nil || len(got) != 0 {
+		t.Fatalf("lock under a foreign owner = %d rows, %v; want none", len(got), err)
+	}
+	batch, err := tq.LockVaultEnvMaterialBatch(ctx, LockVaultEnvMaterialBatchParams{UserID: user, Ids: append([]uuid.UUID{uuid.New()}, cands...)})
+	if err != nil || len(batch) != 6 {
+		t.Fatalf("batch = %d rows, %v; want all 6 of the owner (the unknown id absent)", len(batch), err)
+	}
+	for i := range batch {
+		if batch[i].ID != cands[i] {
 			t.Fatal("batch is not in ascending id order")
 		}
 	}
-	tail, err := tq.LockVaultEnvMaterialBatch(ctx, LockVaultEnvMaterialBatchParams{UserID: user, AfterID: pgtype.UUID{Bytes: batch[2].ID, Valid: true}})
-	if err != nil || len(tail) != 3 || tail[0].ID != batch[3].ID {
-		t.Fatalf("keyset tail = %d rows, %v", len(tail), err)
+	vaultMaterialWantLocked(t, pool, "SELECT id FROM run_env_vars WHERE id=$1 FOR UPDATE NOWAIT", batch[0].ID)
+	// A partial id list locks only those rows.
+	if part, err := tq.LockVaultEnvMaterialBatch(ctx, LockVaultEnvMaterialBatchParams{UserID: user, Ids: cands[3:]}); err != nil || len(part) != 3 || part[0].ID != cands[3] {
+		t.Fatalf("partial lock = %d rows, %v", len(part), err)
+	}
+	// The connection and repo fence queries return the owner's env-bearing parents only.
+	if conns, err := tq.LockVaultEnvConnectionsKeyShare(ctx, user); err != nil || len(conns) != 1 || conns[0] != s.conn {
+		t.Fatalf("connection fence = %v, %v; want the owner's one env-bearing connection", conns, err)
+	}
+	if repos, err := tq.LockVaultEnvReposKeyShare(ctx, user); err != nil || len(repos) != 1 || repos[0] != s.repo {
+		t.Fatalf("repo fence = %v, %v; want the owner's one env-bearing repo", repos, err)
 	}
 	const snapshot = `SELECT to_jsonb(e)-ARRAY['ciphertext','sealed_with'] FROM run_env_vars e WHERE id=$1`
 	var before, after []byte

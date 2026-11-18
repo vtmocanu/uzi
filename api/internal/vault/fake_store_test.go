@@ -202,7 +202,13 @@ func (f *fakeVaultStore) ResealVaultSecretMaterial(_ context.Context, arg store.
 	}
 	return 0, nil
 }
-func (f *fakeVaultStore) LockVaultEnvMaterialBatch(_ context.Context, arg store.LockVaultEnvMaterialBatchParams) ([]store.LockVaultEnvMaterialBatchRow, error) {
+func (f *fakeVaultStore) LockVaultEnvConnectionsKeyShare(context.Context, uuid.UUID) ([]uuid.UUID, error) {
+	return nil, nil
+}
+func (f *fakeVaultStore) LockVaultEnvReposKeyShare(context.Context, uuid.UUID) ([]uuid.UUID, error) {
+	return nil, nil
+}
+func (f *fakeVaultStore) ListVaultEnvMaterialCandidates(_ context.Context, arg store.ListVaultEnvMaterialCandidatesParams) ([]uuid.UUID, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var matching []*fakeEnv
@@ -212,17 +218,57 @@ func (f *fakeVaultStore) LockVaultEnvMaterialBatch(_ context.Context, arg store.
 		}
 	}
 	sort.Slice(matching, func(i, j int) bool { return bytes.Compare(matching[i].id[:], matching[j].id[:]) < 0 })
-	var out []store.LockVaultEnvMaterialBatchRow
+	var out []uuid.UUID
 	var size int64
 	for _, e := range matching {
 		size += int64(len(e.ciphertext))
 		if int64(len(out)) == maxBatchRows || size > maxBatchBytes {
 			break
 		}
+		out = append(out, e.id)
+	}
+	return out, nil
+}
+func (f *fakeVaultStore) LockVaultEnvMaterialBatch(_ context.Context, arg store.LockVaultEnvMaterialBatchParams) ([]store.LockVaultEnvMaterialBatchRow, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var matching []*fakeEnv
+	for _, e := range f.envs {
+		if e.userID != arg.UserID {
+			continue
+		}
+		for _, id := range arg.Ids {
+			if id == e.id {
+				matching = append(matching, e)
+				break
+			}
+		}
+	}
+	sort.Slice(matching, func(i, j int) bool { return bytes.Compare(matching[i].id[:], matching[j].id[:]) < 0 })
+	var out []store.LockVaultEnvMaterialBatchRow
+	for _, e := range matching {
 		out = append(out, store.LockVaultEnvMaterialBatchRow{ID: e.id, RepoID: e.repoID, Name: e.name, Secret: e.secret,
 			Ciphertext: append([]byte(nil), e.ciphertext...), SealedWith: e.sealedWith})
 	}
 	return out, nil
+}
+
+// candidateHookStore lets a test act between the env candidate listing and the row
+// lock, which is where a cascade delete can remove a whole page. after runs once, right
+// after the first non-empty candidate list is returned.
+type candidateHookStore struct {
+	*fakeVaultStore
+	after func(candidates []uuid.UUID)
+	fired bool
+}
+
+func (s *candidateHookStore) ListVaultEnvMaterialCandidates(ctx context.Context, arg store.ListVaultEnvMaterialCandidatesParams) ([]uuid.UUID, error) {
+	ids, err := s.fakeVaultStore.ListVaultEnvMaterialCandidates(ctx, arg)
+	if err == nil && len(ids) > 0 && !s.fired && s.after != nil {
+		s.fired = true
+		s.after(ids)
+	}
+	return ids, err
 }
 func (f *fakeVaultStore) ResealVaultEnvMaterial(_ context.Context, arg store.ResealVaultEnvMaterialParams) (int64, error) {
 	f.mu.Lock()

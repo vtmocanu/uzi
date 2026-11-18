@@ -65,9 +65,32 @@ WHERE s.user_id = @user_id AND b.batch_bytes <= 1048576
 ORDER BY s.id
 FOR UPDATE OF s;
 
--- name: LockVaultEnvMaterialBatch :many
--- Same bounded shape as the secret batch, over run_env_vars (PRD #4416). Every row
--- is returned with the columns the AAD is rebuilt from: scope, repo, secret flag, name.
+-- name: LockVaultEnvConnectionsKeyShare :many
+-- Lock-order fence, step 1 (see convertMaterial). Repo delete (DeleteRepoForUser) and
+-- forge-connection delete (DeleteForgeConnectionForUser) cascade run_env_vars rows
+-- without the secret-mutation lock. KEY SHARE on the connections that own the owner's
+-- env-bearing repos, in id order, blocks a connection delete until commit.
+SELECT c.id FROM forge_connections c
+WHERE c.id IN (SELECT r.connection_id FROM repos r
+               WHERE r.id IN (SELECT e.repo_id FROM run_env_vars e
+                              WHERE e.user_id = @user_id AND e.repo_id IS NOT NULL))
+ORDER BY c.id
+FOR KEY SHARE OF c;
+
+-- name: LockVaultEnvReposKeyShare :many
+-- Lock-order fence, step 2: KEY SHARE on the owner's env-bearing repos, in id order,
+-- blocks a repo delete until commit. Taken after the connections and before any env row lock.
+SELECT r.id FROM repos r
+WHERE r.id IN (SELECT e.repo_id FROM run_env_vars e
+               WHERE e.user_id = @user_id AND e.repo_id IS NOT NULL)
+ORDER BY r.id
+FOR KEY SHARE OF r;
+
+-- name: ListVaultEnvMaterialCandidates :many
+-- The bounded page window (at most 64 ids whose cumulative ciphertext fits 1 MiB) of the
+-- owner's env rows after the cursor, ids only and no lock. The caller locks exactly these
+-- ids with LockVaultEnvMaterialBatch and advances its cursor to the last candidate id,
+-- so rows that vanish between the two statements cannot end the scan early.
 WITH candidates AS MATERIALIZED (
     SELECT e.id, octet_length(e.ciphertext)::bigint AS ciphertext_bytes
     FROM run_env_vars e
@@ -78,9 +101,16 @@ WITH candidates AS MATERIALIZED (
     SELECT id, sum(ciphertext_bytes) OVER (ORDER BY id) AS batch_bytes
     FROM candidates
 )
+SELECT b.id FROM bounded b
+WHERE b.batch_bytes <= 1048576
+ORDER BY b.id;
+
+-- name: LockVaultEnvMaterialBatch :many
+-- Locks the given candidate ids (PRD #4416). Ids that no longer exist are simply absent.
+-- Every row is returned with the columns the AAD is rebuilt from: scope, repo, secret flag, name.
 SELECT e.id, e.repo_id, e.name, e.secret, e.ciphertext, e.sealed_with
-FROM run_env_vars e JOIN bounded b ON b.id = e.id
-WHERE e.user_id = @user_id AND b.batch_bytes <= 1048576
+FROM run_env_vars e
+WHERE e.user_id = @user_id AND e.id = ANY(@ids::uuid[])
 ORDER BY e.id
 FOR UPDATE OF e;
 
