@@ -243,6 +243,27 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **Removing a worker no longer answers 404 when its hibernation cache cleanup settles mid-delete ([#4389](https://github.com/vtmocanu/uzi/pull/4389), [#4398](https://github.com/vtmocanu/uzi/pull/4398)).**
   The delete retries once through the same guards; an absent worker is still not found, and a present worker that loses both attempts to a cleanup race gets a retryable 409.
 
+- **A Claude run whose Anthropic API key runs out of prepaid credit is held for the owner instead of failing ([#4426](https://github.com/vtmocanu/uzi/pull/4426), [#4427](https://github.com/vtmocanu/uzi/pull/4427)).**
+  The run parks in `recovery_wait` with cause `anthropic_spend_limit`, exactly like an Anthropic spend limit: work and custody are kept, nothing resumes it on a timer, and the owner tops up credit and Resumes, switches token, or cancels; the feed's detail line carries the provider sentence `Credit balance is too low`, and a worker or api that cannot park still fails with the unchanged `provider error: 400 …` message. This supersedes the earlier #3767 note that credit depletion is not covered by the hold.
+
+- **Long runs that keep rewriting large files no longer resend already-published history at every checkpoint ([#4439](https://github.com/vtmocanu/uzi/pull/4439), [#4446](https://github.com/vtmocanu/uzi/pull/4446)).**
+  When the server names the default branch, a checkpoint pack now omits blobs reachable from the run's confirmed checkpoint, so a growing branch stops piling up toward the `pack_too_large` limit. A single checkpoint whose own new blobs exceed the limit is still refused. If the checkpoint ref is deleted and origin garbage-collects those blobs, the push is rejected and the existing publish-failure path applies until the ref is restored.
+
+- **Enabling a repo returns once it is saved, and its first issue import shows progress on the board ([#4399](https://github.com/vtmocanu/uzi/pull/4399), [#4409](https://github.com/vtmocanu/uzi/pull/4409)).**
+  The first import now runs on the background poller instead of inside the request, and the board shows waiting, importing, or failed-and-retrying while cached cards stay visible; an import too large for one poll still times out and retries, and Refresh still syncs inside its own request.
+
+- **Tab rows no longer show a stray vertical scrollbar, and tabs and section pills stay pinned while you scroll ([#4419](https://github.com/vtmocanu/uzi/pull/4419), [#4425](https://github.com/vtmocanu/uzi/pull/4425)).**
+  Settings, Admin, Runs, Schedules, Workers, Judge and Findings share one tab row whose underline sits on its line, the row stays at the top of the window (under the app bar on narrow screens), Admin → Instance keeps its section pills pinned with the current section highlighted, and Judge keeps its filter visible.
+
+- **A resumed run no longer re-announces milestones already reported complete ([#4412](https://github.com/vtmocanu/uzi/pull/4412)).**
+  The run feed's milestone frames now also skip completions the server already holds, so a resume or re-claim does not repeat "milestone mN reported complete" lines; a cross-worker reseed that clears the list still re-announces them.
+
+- **A finalize push GitHub refuses with only `(missing necessary objects)` is retried ([#4438](https://github.com/vtmocanu/uzi/pull/4438), [#4440](https://github.com/vtmocanu/uzi/pull/4440)).**
+  The bare `! [remote rejected] ... (missing necessary objects)` line is now retried like the bare `(failed)` line from #3929, with the same non-forced push and per-attempt publication proofs; any extra diagnostic line, a different reason or a lookalike stays permanent, and a persistent refusal still ends as `publication_forge_unreachable`.
+
+- **Unlocking your vault refreshes every Anthropic token's meter ([#4408](https://github.com/vtmocanu/uzi/pull/4408)).**
+  Previously only the default token was re-polled on unlock, so other pooled tokens stayed stale until their next successful scheduled poll.
+
 ### Added
 
 - **A preview of the new Overview at /overview/next, decisions first ([#3878](https://github.com/vtmocanu/uzi/pull/3878), [#3952](https://github.com/vtmocanu/uzi/pull/3952)).**
@@ -389,7 +410,16 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **The chart's Gateway API HTTPRoute can give input-file uploads a longer gateway timeout ([#4401](https://github.com/vtmocanu/uzi/pull/4401), [#4403](https://github.com/vtmocanu/uzi/pull/4403)).**
   Set `web.httpRoute.timeouts` (recommended `request` and `backendRequest` of 300s) on a gateway that supports HTTPRoute timeouts to add an `/api/v1/files` rule carrying them; empty, the route renders as before.
 
+- **Admin → Workers page with editable ephemeral worker cap, default size and lease ([#4212](https://github.com/vtmocanu/uzi/pull/4212), [#4421](https://github.com/vtmocanu/uzi/pull/4421)).**
+  The worker controls moved from Admin → Instance to Admin → Workers, and the ephemeral per-user cap, ephemeral default size, ephemeral lease and the persistent provision form's default size are now admin settings that apply without a restart; a non-empty `UZI_EPHEMERAL_MAX_PER_USER`, `UZI_EPHEMERAL_DEFAULT_SIZE` or `UZI_EPHEMERAL_LEASE` still wins and locks the field (a cap of `0` in the environment still means `2`), lowering the cap evicts no worker, and on upgrade the chart values `workers.ephemeralLease` and `workers.ephemeralDefaultSize` are unset by default so installs that set them keep them locked while others get editable fields with the same `2h` and `m`; setting `UZI_EPHEMERAL_LEASE` in `api.config` or `api.secretEnv` now fails the chart render, so set it through `workers.ephemeralLease`.
+
+- **Admins can keep one idle worker warm and sleep the rest of an owner's interchangeable workers sooner ([#4395](https://github.com/vtmocanu/uzi/pull/4395), [#4430](https://github.com/vtmocanu/uzi/pull/4430)).**
+  The new `worker_hibernation_surplus` setting is off by default and only applies while automatic hibernation is on; surplus workers sleep after `worker_hibernation_surplus_idle_after` (default 2h); a surplus sleep runs the same cache cleanup as any hibernation. When a pool has no warm worker and its owner is active, the api wakes one automatically hibernated member (reason "automatic: warm reserve"), and a pooled worker's long idle clock runs from the owner's latest run activity rather than its own; warm and system wakes do not extend it.
+
 ### Changed
+
+- **Routine dependency updates ([#4402](https://github.com/vtmocanu/uzi/pull/4402)).**
+  Dependency manifest and image bumps that carry no entry of their own.
 
 - **Routine dependency updates ([#4326](https://github.com/vtmocanu/uzi/pull/4326)).**
   Dependency manifest and image bumps that carry no entry of their own.
@@ -531,6 +561,12 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 - **A publication-context snapshot deadline error is now logged ([#4302](https://github.com/vtmocanu/uzi/pull/4302), [#4371](https://github.com/vtmocanu/uzi/pull/4371)).**
   When either snapshot read in a refresh publication check encounters a deadline error (its context is capped at five seconds), the api logs `publication_context_snapshot_deadline` with the phase, elapsed time and starting budget; the unknown reason returned to the worker is unchanged.
+
+- **npm audit supports maintainer-approved, expiring exceptions for exact development-only advisories ([#4435](https://github.com/vtmocanu/uzi/pull/4435), [#4436](https://github.com/vtmocanu/uzi/pull/4436)).**
+  The full dependency audit stays at high severity. Exceptions fail closed on missing evidence, production occurrences, range or severity changes, and expired or unused rows. Direct dependency maps must agree between the manifest and lockfile root before development classifications can authorize an exception. The initial picomatch rows (web, agent) were maintainer-approved on 2026-11-17 and expire after December 1, 2026 UTC.
+
+- **API database pool size is now explicit and admin health `db` warns on measured connection waits ([#4418](https://github.com/vtmocanu/uzi/pull/4418), [#4422](https://github.com/vtmocanu/uzi/pull/4422)).**
+  `DB_MAX_CONNS` defaults to 20 per replica instead of pgx's max(4, NumCPU), so hosts with more than 20 CPUs get a smaller pool and upload write slots on small nodes rise to their default of 4 (for example 2 to 4 on 4 CPUs); the `db` check now warns when requests waited 250ms or more in total per 60s for a pooled connection, not on a 7-of-8 occupancy snapshot.
 
 ### Security
 
