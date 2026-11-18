@@ -197,9 +197,9 @@ func resolveHandoffContext(env Env, msg, file string) (string, error) {
 // resolveHandoffRepo returns the repo id for the handoff. Handoff ALWAYS resolves origin's
 // push destination (`git remote get-url --push --all origin`, which must list exactly one
 // URL), because the seed push targets the local `origin` remote (runHandoffCreate step 2).
-// When --repo is set it is validated to name the SAME forge repo the push destination points
-// at (path and host); otherwise it is matched against the caller's repos by PathWithNamespace and host
-// (exactly one match resolves). --repo only picks among the repos origin matches; it never
+// When --repo is set it is validated to name the SAME forge repo the push destination
+// points at (path and host); otherwise it is matched against the caller's repos by
+// PathWithNamespace and host (exactly one match resolves). --repo only picks among the repos origin matches; it never
 // targets one origin does not point at.
 func resolveHandoffRepo(env Env, ctx context.Context, c uzicli.Client, repoFlag string) (string, error) {
 	// issue #403 F2: handoff pushes local HEAD to origin (git push origin …:refs/heads/<branch>),

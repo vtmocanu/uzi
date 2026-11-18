@@ -1888,7 +1888,7 @@ watch it with `uzi run get`/`uzi run logs --follow`, or drop into
 ### Origin matching
 
 Because the push goes to `origin`, the connected repo must be the one `origin`
-fetches from: its owner/repo path **and** its host must match. The check reads
+pushes to: its owner/repo path **and** its host must match. The check reads
 the push destination (`git remote get-url --push --all origin`), which applies
 `pushurl`, `pushInsteadOf` rewrites and multiple `remote.origin.url` values.
 Handoff requires exactly one push destination and refuses otherwise. For SSH
@@ -1904,8 +1904,8 @@ only picks among repos that already match.
   `Match command` rules resolve as they will for the push. `ssh -G` does not connect, but it does evaluate your
   SSH config, including any `Match exec` blocks, which can run local commands.
 - **Transport overrides are refused**, even when empty: `GIT_SSH`,
-  `GIT_SSH_COMMAND`, `core.sshCommand` and `remote.origin.receivepack` can send
-  the push somewhere `ssh -G` cannot see. `GIT_CONFIG` is refused too: it hides from `git config` the
+  `GIT_SSH_COMMAND` and `core.sshCommand` can send the push somewhere `ssh -G`
+  cannot see. `GIT_CONFIG` is refused too: it hides from `git config` the
   settings the push reads. Use an https remote instead.
 - **Anything else is refused:** `git://`, `file://`, `git+ssh://`, local paths
   and other schemes, an `ssh://` origin containing `%` or a password, and any

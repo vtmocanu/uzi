@@ -104,12 +104,32 @@ func TestHandoffRefusesEmptyOrFailingPushListing(t *testing.T) {
 	t.Run("command fails", func(t *testing.T) {
 		fc, rec, env := pushEnv("")
 		rec.gitErr[pushDestKey] = errors.New("boom")
-		_, _, code := runCLI(t, env, "handoff", "-m", "x")
+		_, stderr, code := runCLI(t, env, "handoff", "-m", "x")
 		if code != uzicli.ExitUsage {
 			t.Fatalf("exit = %d, want usage", code)
 		}
+		// The command-failure branch, not the zero-count one (the recorder returns "" on error).
+		if !strings.Contains(stderr, "not in a git repo with an 'origin' remote") || !strings.Contains(stderr, "boom") {
+			t.Errorf("message should report the failed listing:\n%s", stderr)
+		}
 		assertNothingSent(t, fc, rec)
 	})
+}
+
+// Each listed line is trimmed: a CRLF-terminated URL resolves, and a whitespace-only
+// line is not a destination.
+func TestHandoffTrimsPushListingLines(t *testing.T) {
+	for name, listing := range map[string]string{
+		"crlf":             "https://github.com/acme/widgets.git\r\n",
+		"whitespace lines": "https://github.com/acme/widgets.git\n  \n\t\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			fc, _, env := pushEnv(listing)
+			if _, stderr, code := runCLI(t, env, "handoff", "-m", "x"); code != uzicli.ExitOK || fc.LastCreateTaskRepoID != "p1" {
+				t.Fatalf("exit=%d repo=%q, want OK and p1:\n%s", code, fc.LastCreateTaskRepoID, stderr)
+			}
+		})
+	}
 }
 
 func TestHandoffReceivePackRefusedForSSHOrigin(t *testing.T) {
