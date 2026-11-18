@@ -164,8 +164,10 @@ func runEnvState(r runEnvRow) string {
 
 // runEnvDTO builds the response view of one row. A secret's value is never opened. A
 // plain value is opened through the vault; a locked vault (or a value that cannot be
-// opened) withholds it and reports locked=true only for the locked case.
-func (h *Handler) runEnvDTO(userID, repoID uuid.UUID, row runEnvRow) (dto apitypes.RunEnvVarDTO, locked bool) {
+// opened) withholds it and reports locked=true only for the locked case. vaultLocked
+// withholds every plain value without opening it: a row read before the vault was
+// protected and locked may still carry master_aad material the master key opens.
+func (h *Handler) runEnvDTO(userID, repoID uuid.UUID, row runEnvRow, vaultLocked bool) (dto apitypes.RunEnvVarDTO, locked bool) {
 	dto = apitypes.RunEnvVarDTO{
 		VarID:       row.VarID,
 		Name:        row.Name,
@@ -186,6 +188,10 @@ func (h *Handler) runEnvDTO(userID, repoID uuid.UUID, row runEnvRow) (dto apityp
 	if h.vault == nil {
 		dto.ValueWithheld = true
 		return dto, false
+	}
+	if vaultLocked {
+		dto.ValueWithheld = true
+		return dto, true
 	}
 	if runEnvMasterSealed(row.SealedWith) {
 		slog.Error("run env value sealed without AAD", "name", row.Name)
@@ -234,11 +240,13 @@ func (h *Handler) ListRepoEnvVars(w http.ResponseWriter, r *http.Request) {
 	}
 	// Secret rows never open here, so a secret-only list cannot tell a locked vault from
 	// an unlocked one by its rows: ask the vault itself (fail-closed on a lookup error).
+	// Asked after the rows are read, so a lock that lands in between still withholds them.
 	if h.vault != nil {
 		out.VaultLocked = h.vault.RequiresUnlock(r.Context(), userID)
 	}
+	vaultLocked := out.VaultLocked
 	for _, row := range rows {
-		dto, locked := h.runEnvDTO(userID, repoID, row)
+		dto, locked := h.runEnvDTO(userID, repoID, row, vaultLocked)
 		out.VaultLocked = out.VaultLocked || locked
 		out.Variables = append(out.Variables, dto)
 		out.Counts.Total++
@@ -490,7 +498,7 @@ func (h *Handler) PutRepoEnvVar(w http.ResponseWriter, r *http.Request) {
 		h.writeRunEnvTxError(w, err, "write run env var")
 		return
 	}
-	dto, _ := h.runEnvDTO(userID, repoID, saved)
+	dto, _ := h.runEnvDTO(userID, repoID, saved, false)
 	status := http.StatusOK
 	if !exists {
 		status = http.StatusCreated
@@ -518,7 +526,7 @@ func (h *Handler) putRunEnvDescription(ctx context.Context, w http.ResponseWrite
 			return
 		}
 	}
-	dto, _ := h.runEnvDTO(userID, repoID, row)
+	dto, _ := h.runEnvDTO(userID, repoID, row, false)
 	w.Header().Set("Cache-Control", "no-store")
 	httpx.JSON(w, http.StatusOK, apitypes.RunEnvWriteDTO{Variable: dto})
 }
@@ -574,7 +582,7 @@ func (h *Handler) setRepoEnvVarDisabled(w http.ResponseWriter, r *http.Request, 
 		h.writeRunEnvTxError(w, err, "disable run env var")
 		return
 	}
-	dto, _ := h.runEnvDTO(userID, repoID, row)
+	dto, _ := h.runEnvDTO(userID, repoID, row, false)
 	w.Header().Set("Cache-Control", "no-store")
 	httpx.JSON(w, http.StatusOK, apitypes.RunEnvWriteDTO{Variable: dto})
 }
