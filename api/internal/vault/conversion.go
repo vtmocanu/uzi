@@ -293,9 +293,11 @@ func (v *Vault) convertMaterial(ctx context.Context, q Store, userID uuid.UUID, 
 	if progress.rows != totals.MaterialRows || progress.bytes != totals.CiphertextBytes {
 		// The fence above is taken before the first measurement, so no env row can vanish
 		// to a repo or forge-connection delete (which cascades env rows without the
-		// secret-mutation lock) during this conversion. This branch stays defensive: one
-		// fresh read (READ COMMITTED, postgres.go) is the settled total, accepted only on
-		// an exact match.
+		// secret-mutation lock) during this conversion, and every env-row writer takes the
+		// secret-mutation advisory lock this conversion holds (withSecretLock and
+		// mutateLiveRunEnv in handler/run_env_vars.go); a new writer must too. This branch
+		// stays defensive: one fresh read (READ COMMITTED, postgres.go) is the settled
+		// total, accepted only on an exact match.
 		fresh, err := q.GetVaultMaterialTotals(ctx, userID)
 		if err != nil {
 			return err

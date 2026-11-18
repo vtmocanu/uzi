@@ -126,11 +126,13 @@ that is listed under `<activeProfiles>`:
 
 The repository `id` must match the server `id`, or Maven sends no credentials.
 
-Maven 3.10.0 and later, and Maven 4, bind a server's credentials to the hosts
-of the same-id repositories declared in `settings.xml`, so a same-id repository
-at another host gets none. A repository declared only in a `pom.xml` is not
-known in advance: Maven still sends it the credentials, with a warning, unless
-`maven.repository.credentialScope=strict` is set. Maven 3.9.x and earlier match
+Maven 3.10.0 and later, and Maven 4.0.0 and later, bind a server's credentials
+to the origins (scheme, host and port) of the same-id repositories declared in an
+active `settings.xml` profile, so a same-id repository at another origin gets
+none. A repository declared only in a `pom.xml` is not known in advance. When the
+server has no known origin, the default `origin` scope still sends its
+credentials, with a warning; `maven.repository.credentialScope=strict` refuses
+that fallback. Maven 3.9.x and earlier match
 credentials by `id` alone, so a same-id repository in any dependency or parent
 POM receives them; use 3.10.0 or later.
 
