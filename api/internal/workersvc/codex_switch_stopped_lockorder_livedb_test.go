@@ -14,8 +14,8 @@ import (
 // A late control written (uncommitted) before the report starts must fence it.
 // pause_run_only writes the run row without the worker lock, as single-statement
 // owner writers do, so only the report's run row locks can fence it. The control
-// commits only once a backend is blocked behind its transaction or the report has
-// already finished, so the outcome does not depend on goroutine scheduling.
+// commits only once a backend is blocked behind its transaction, so the outcome
+// does not depend on goroutine scheduling; a report that returns first fails.
 func TestCodexSwitchStoppedLateControlLockOrderLiveDB(t *testing.T) {
 	for _, control := range []string{"policy", "registration", "pause", "pause_run_only"} {
 		t.Run(control, func(t *testing.T) {

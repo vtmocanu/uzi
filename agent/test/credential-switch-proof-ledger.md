@@ -429,7 +429,7 @@ control is still absent, not that the functional criterion was deferred.
 | Stopped registration nonce equality | D25–D56: running/paused registration_nonce_mismatch; U15 credits the worker-latched generation, epoch and nonce bounds (lower, upper, inclusive edges; nonce empty/length/NUL at the route; UTF-8 supporting only, uncredited); worker ownership is credited in the claim-generation row; a NULL snapshot nonce not controlled; resume/reclaim/re-registration are the withdrawn X/Y row |
 | Stopped claim generation and unreleased claim | D25–D56: running/paused generation/release without reconciliation; U15 credits the reconciliation path's generation and release refusals (two copies each, Go copy (b)) and worker ownership; the reconciled `*g <= 0` copy not controlled |
 | Stopped frozen secret and capability hash presence | D25–D56: running/paused missing_frozen_secret and missing_capability_hash; U15 credits binding ownership as the composite FK (b); binding identity beyond ownership has no predicate clause and stays unvalidated (owner batch) |
-| Stopped switch-request/generation, ordinary hold, pause-request/mode, stop-kind/reason and reserve-hold markers | D25–D56: individual running/paused marker cases; U16 credits a pending second switch (both markers) and the running policy hold (shape, Go and SQL copies); late competing controls are the next row |
+| Stopped switch-request/generation, ordinary hold, pause-request/mode, stop-kind/reason and reserve-hold markers | D25–D56: individual running/paused marker cases; U16 credits a pending second switch (both markers together, redundant-fence) and the running policy hold (shape, Go and SQL copies); late competing controls are the next row |
 | Stopped refusal of claimed status | D25–D56: running/paused status_claimed; U15 credits refusal of queued, limit_wait, pool_wait, recovery_wait, completed, failed and cancelled (running origin) |
 | Stopped ownership, lane and policy fences | D57–D60 credit pending-fresh/unresolved-outcome; D61 paused policy-hold; D62/D63 stable user-owner mismatch running/paused. D64–D73 credit the five enumerated STOP lane exclusions running/paused; U16 credits concurrent late controls (worker-row by the worker lock, run-row by the run locks alone, (b)) and the running policy hold; paused-origin replay under concurrency and op-less withdrawals not covered; owner writers that take no worker or run row lock not covered |
 | Stopped replay after withdrawn X/Y; resume/reclaim and incarnation changes | U16 credits refusal while Y is pending, the withdraw op fence against a delayed op-carrying X withdrawal ((b); op-less v1 withdrawals are unfenced by op), and refusal after resume (three copies), reclaim and re-registration; settlement after withdrawn X/Y is positive coverage only (no guard to remove) |
@@ -3124,10 +3124,12 @@ leaves.
 The lock-order test differs from the existing
 `TestCodexSwitchStoppedConcurrentLateControlLiveDB`, whose late control is
 written after the report starts and could commit before the report reads,
-so a lock mutant there need not go red. Here the control is written,
-uncommitted, under the held worker lock before the report starts; the test
-commits only once `pg_blocking_pids` shows a backend blocked behind the
-control's transaction, or the report has already returned.
+so a lock mutant there need not go red. Here (at 8cca0f215) the control is
+written, uncommitted, under the held worker lock before the report starts;
+the test commits only once `pg_blocking_pids` shows a backend blocked behind
+the control's transaction, or the report has already returned. From b853f9487
+the pause_run_only control takes no worker lock, and a report that returns
+without having been seen blocked fails.
 
 a233 reference: the stopped settlement is new (no
 `api/internal/workersvc/codex_switch_stopped.go` or
@@ -3169,7 +3171,7 @@ ends `SHA=8cca0f215… EXIT=1`.
 
 | Control | Class | Mutation | Leaf | Red |
 | --- | --- | --- | --- | --- |
-| u16-y-markers | (d) on the marker pair (both conjuncts neutralized together) | both switch-marker conjuncts → `true` | xy route y_pending | codex_switch_stopped_xy_livedb_test.go:67 "refusal mismatch: status=200 applied=true" |
+| u16-y-markers | redundant-fence (the two pending-switch markers, both set by Y; each is separately credited by D25–D56) | both switch-marker conjuncts → `true` | xy route y_pending | codex_switch_stopped_xy_livedb_test.go:67 "refusal mismatch: status=200 applied=true" |
 | u16-stale-withdraw | (b) preservation | withdraw op conjunct `runs.credential_switch_op_id = $4::uuid` → `$4::uuid = $4::uuid` | xy route stale_x_withdraw | :75 "delayed X withdraw status=200; want 409" |
 | u16-resume | redundant-fence (3 copies) | status IN list removed; epoch → `$6::bigint = $6::bigint`; `AND r.codex_cap_hash IS NOT NULL` removed | ResumeReclaimReregistration resume | codex_switch_stopped_livedb_test.go:177 "delayed report/replay disposition mismatch" |
 | u16-reclaim | (d) | generation → `$4::bigint = $4::bigint` | reclaim | :177 (same message) |
@@ -3179,13 +3181,13 @@ ends `SHA=8cca0f215… EXIT=1`.
 | u16r-worker-lock | (b), b853f9487 | as u16-worker-lock | lock-order registration | :89 "accepted=true err=<nil>"; policy, pause and pause_run_only PASS |
 | u16r-run-locks | redundant-fence (the two run-lock clauses; (b)), b853f9487 | both `FOR UPDATE` clauses removed, worker lock kept | lock-order pause_run_only (control writes the run row without the worker lock) | :89 "accepted=true err=<nil>"; policy, registration and pause PASS (their controls hold the worker lock) |
 | u16r-locks | redundant-fence, b853f9487 | both changes | all four lock-order leaves | :89 (all four) |
-| u16-policy-hold | redundant-fence (3 copies incl. schema; (b) for the Go and schema copies, (d) for the new SQL copy), at 8cca0f215 (test unchanged at b853f9487) | Go hold arm removed; SQL `r.hold_reason IS NULL` → `(… OR r.hold_reason = 'codex_policy_hold')`; 00397 hold arm → `OR (policy_outcome_id IS NOT NULL)` (fresh database) | RunningPolicyHold | :107 "running policy hold accepted <nil>" |
+| u16-policy-hold | redundant-fence (3 copies incl. schema; (b) for the Go and schema copies, (d) for the new SQL copy), at 8cca0f215 (function unchanged at b853f9487, where its Fatal is at :113) | Go hold arm removed; SQL `r.hold_reason IS NULL` → `(… OR r.hold_reason = 'codex_policy_hold')`; 00397 hold arm → `OR (policy_outcome_id IS NOT NULL)` (fresh database) | RunningPolicyHold | :107 "running policy hold accepted <nil>" |
 
 Review rework b853f9487 adds the lock-order leaf pause_run_only and requires
 the report to have been observed blocked behind the control
 (`report was refused without waiting behind the control`), which moves the
 red line from :86 to :89; the u16r rows ran there and their logs end
-`SHA=b853f9487… EXIT=1`. At b853f9487 every `^TestCodexSwitchStopped`
+`SHA=b853f9487… EXIT=1` (same `ctl.sh` command and `cdr-4202-u16pg`). At b853f9487 every `^TestCodexSwitchStopped`
 workersvc test passes (75 PASS lines, `u16r-green-w.log`), the route test
 passes (4 PASS lines, `u16r-green-h.log`), both EXIT=0; `task lint:api` 0
 issues (`u16r-lint-api.log`).
@@ -3220,8 +3222,8 @@ row lock on the worker or run is not covered (the auditor found none on this
 path: inserts into run_user_inputs and run_milestone_reconciliations take a
 key-share lock on the run through their foreign keys, and the unlocked
 `disposition='superseded'` updates only remove fences). A paused-origin stop
-replays with no write and no lock wait, so the caller's locks are its only
-fence there, and no lock-order leaf covers that branch. The barrier matches
+replays with no write, its statement taking no lock of its own, so the
+caller's locks are its only fence there, and no lock-order leaf covers that branch. The barrier matches
 any backend blocked behind the control's transaction, not specifically the
 report's (the test runs alone, `-p=1`, no `t.Parallel`). Op-less (v1)
 `credential_switch_failed` withdrawals carry no op id and are unfenced by op
