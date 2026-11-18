@@ -23,13 +23,13 @@ func TestParseRemote(t *testing.T) {
 		{"https://github.com/acme/widgets.git", remoteInfo{form: formHTTPS, host: "github.com"}},
 		{"http://git.example/acme/widgets", remoteInfo{form: formHTTPS, host: "git.example"}},
 		{"https://GitHub.COM/acme/widgets", remoteInfo{form: formHTTPS, host: "github.com"}},
-		{"ssh://git@github.com:2222/acme/widgets.git", remoteInfo{form: formSSHURL, host: "github.com", user: "git", port: "2222", hasUser: true, hasPort: true}},
-		{"ssh://github.com/acme/widgets.git", remoteInfo{form: formSSHURL, host: "github.com"}},
-		{"git@github.com:acme/widgets.git", remoteInfo{form: formSCP, host: "github.com", user: "git", hasUser: true}},
-		{"github.com:acme/widgets.git", remoteInfo{form: formSCP, host: "github.com"}},
-		{"git@GitHub.COM:acme/widgets.git", remoteInfo{form: formSCP, host: "github.com", user: "git", hasUser: true}},
-		{"git@github.com.:acme/widgets.git", remoteInfo{form: formSCP, host: "github.com.", user: "git", hasUser: true}},
-		{"a@b@host:acme/widgets", remoteInfo{form: formSCP, host: "host", user: "a@b", hasUser: true}},
+		{"ssh://git@github.com:2222/acme/widgets.git", remoteInfo{form: formSSHURL, host: "github.com", user: "git", port: "2222", hasUser: true, hasPort: true, path: "/acme/widgets.git"}},
+		{"ssh://github.com/acme/widgets.git", remoteInfo{form: formSSHURL, host: "github.com", path: "/acme/widgets.git"}},
+		{"git@github.com:acme/widgets.git", remoteInfo{form: formSCP, host: "github.com", user: "git", hasUser: true, path: "acme/widgets.git"}},
+		{"github.com:acme/widgets.git", remoteInfo{form: formSCP, host: "github.com", path: "acme/widgets.git"}},
+		{"git@GitHub.COM:acme/widgets.git", remoteInfo{form: formSCP, host: "github.com", user: "git", hasUser: true, path: "acme/widgets.git"}},
+		{"git@github.com.:acme/widgets.git", remoteInfo{form: formSCP, host: "github.com.", user: "git", hasUser: true, path: "acme/widgets.git"}},
+		{"a@b@host:acme/widgets", remoteInfo{form: formSCP, host: "host", user: "a@b", hasUser: true, path: "acme/widgets"}},
 	}
 	for _, tc := range ok {
 		got, err := parseRemote(tc.in)
@@ -140,6 +140,15 @@ func sshCmdVal(s string) *string { return &s }
 
 func TestHandoffOriginHostResolution(t *testing.T) {
 	bigOut := "hostname github.com\n" + strings.Repeat("x", sshConfigMaxOutput)
+	rp, rpAbs := "git-receive-pack 'acme/widgets.git'", "git-receive-pack '/acme/widgets.git'"
+	// matchCommand models an ssh config `Match command "git-receive-pack*"` that sends the
+	// push elsewhere: only a probe that passes the push's remote command sees it.
+	matchCommand := func(_ context.Context, args []string) (string, error) {
+		if strings.HasPrefix(args[len(args)-1], "git-receive-pack ") {
+			return "hostname evil.example\n", nil
+		}
+		return "hostname github.com\n", nil
+	}
 	cases := []hostCase{
 		{name: "https same host", origin: "https://github.com/acme/widgets.git", wantMatch: true, wantCalls: 0},
 		{name: "https uppercase host", origin: "https://GITHUB.com/acme/widgets.git", wantMatch: true},
@@ -148,25 +157,25 @@ func TestHandoffOriginHostResolution(t *testing.T) {
 			env: map[string]string{"GIT_SSH": "x", "GIT_SSH_COMMAND": ""}, coreSSH: sshCmdVal("x"), wantMatch: true},
 		{name: "https ssh.github.com vs github.com", origin: "https://ssh.github.com/acme/widgets.git", wantMatch: false},
 		{name: "scp equal host resolves same", origin: "git@github.com:acme/widgets.git", wantMatch: true, wantCalls: 1,
-			wantArgv: []string{"-G", "-l", "git", "--", "github.com"}},
+			wantArgv: []string{"-G", "-l", "git", "--", "github.com", rp}},
 		{name: "scp no user omits -l", origin: "github.com:acme/widgets.git", wantMatch: true, wantCalls: 1,
-			wantArgv: []string{"-G", "--", "github.com"}},
+			wantArgv: []string{"-G", "--", "github.com", rp}},
 		{name: "scp equal raw host, stub resolves elsewhere", origin: "git@github.com:acme/widgets.git",
 			stubOut: "hostname evil.example\n", wantMatch: false, wantCalls: 1},
 		{name: "ssh:// equal raw host, stub resolves elsewhere", origin: "ssh://git@github.com/acme/widgets.git",
 			stubOut: "hostname evil.example\n", wantMatch: false, wantCalls: 1},
 		{name: "scp alias to web host", origin: "git@work:acme/widgets.git", stubOut: "user git\nhostname github.com\n",
-			wantMatch: true, wantCalls: 1, wantArgv: []string{"-G", "-l", "git", "--", "work"}},
+			wantMatch: true, wantCalls: 1, wantArgv: []string{"-G", "-l", "git", "--", "work", rp}},
 		{name: "ssh:// ssh.github.com:443", origin: "ssh://git@ssh.github.com:443/acme/widgets.git", stubOut: "hostname ssh.github.com\n",
-			wantMatch: true, wantCalls: 1, wantArgv: []string{"-G", "-l", "git", "-p", "443", "--", "ssh.github.com"}},
+			wantMatch: true, wantCalls: 1, wantArgv: []string{"-G", "-l", "git", "-p", "443", "--", "ssh.github.com", rpAbs}},
 		{name: "ssh:// port only", origin: "ssh://github.com:2222/acme/widgets.git", wantMatch: true, wantCalls: 1,
-			wantArgv: []string{"-G", "-p", "2222", "--", "github.com"}},
+			wantArgv: []string{"-G", "-p", "2222", "--", "github.com", rpAbs}},
 		{name: "ssh.github.com alias not for other web host", origin: "git@x:acme/widgets.git", stubOut: "hostname ssh.github.com\n",
 			web: "https://gitlab.example/acme/widgets", wantMatch: false, wantCalls: 1},
 		{name: "trailing dot passed to stub", origin: "git@github.com.:acme/widgets.git", wantMatch: true, wantCalls: 1,
-			wantArgv: []string{"-G", "-l", "git", "--", "github.com."}},
+			wantArgv: []string{"-G", "-l", "git", "--", "github.com.", rp}},
 		{name: "uppercase origin and HostName normalized", origin: "git@GitHub.COM:acme/widgets.git", stubOut: "HostName GitHub.COM\n",
-			wantMatch: true, wantCalls: 1, wantArgv: []string{"-G", "-l", "git", "--", "github.com"}},
+			wantMatch: true, wantCalls: 1, wantArgv: []string{"-G", "-l", "git", "--", "github.com", rp}},
 		{name: "stub error", origin: "git@github.com:acme/widgets.git", stubErr: errors.New("boom"), wantMatch: false, wantCalls: 1},
 		{name: "ssh not found", origin: "git@github.com:acme/widgets.git", stubErr: exec.ErrNotFound, wantMatch: false, wantCalls: 1},
 		{name: "oversize output", origin: "git@github.com:acme/widgets.git", stubOut: bigOut, wantMatch: false, wantCalls: 1},
@@ -178,6 +187,9 @@ func TestHandoffOriginHostResolution(t *testing.T) {
 		{name: "GIT_SSH set empty", origin: "git@github.com:acme/widgets.git", env: map[string]string{"GIT_SSH": ""}, wantMatch: false},
 		{name: "GIT_SSH_COMMAND set", origin: "ssh://git@github.com/acme/widgets.git", env: map[string]string{"GIT_SSH_COMMAND": "ssh -x"}, wantMatch: false},
 		{name: "GIT_SSH_COMMAND set empty", origin: "git@github.com:acme/widgets.git", env: map[string]string{"GIT_SSH_COMMAND": ""}, wantMatch: false},
+		{name: "GIT_CONFIG set", origin: "git@github.com:acme/widgets.git", env: map[string]string{"GIT_CONFIG": "/dev/null"}, wantMatch: false},
+		{name: "GIT_CONFIG ignored for https", origin: "https://github.com/acme/widgets.git", env: map[string]string{"GIT_CONFIG": "/dev/null"}, wantMatch: true},
+		{name: "Match command redirects the push", origin: "git@github.com:acme/widgets.git", stubFn: matchCommand, wantMatch: false, wantCalls: 1},
 		{name: "core.sshCommand set", origin: "git@github.com:acme/widgets.git", coreSSH: sshCmdVal("ssh -x"), wantMatch: false},
 		{name: "core.sshCommand set empty", origin: "git@github.com:acme/widgets.git", coreSSH: sshCmdVal(""), wantMatch: false},
 		{name: "core.sshCommand sentinel value", origin: "git@github.com:acme/widgets.git", coreSSH: sshCmdVal("uzi-handoff-core-sshcommand-unset"), wantMatch: false},
@@ -372,5 +384,24 @@ func TestNewSSHConfigCmd(t *testing.T) {
 	// exec.Command — dropping the timeout — fails here.
 	if cmd.Cancel == nil {
 		t.Errorf("Cancel = nil: the command is not bound to its context (exec.CommandContext required)")
+	}
+}
+
+func TestReceivePackCommandMatchesGit(t *testing.T) {
+	cases := []struct{ origin, want string }{
+		{"git@github.com:acme/widgets.git", "git-receive-pack 'acme/widgets.git'"},
+		{"ssh://git@github.com/acme/widgets.git", "git-receive-pack '/acme/widgets.git'"},
+		{"ssh://git@github.com/~acme/widgets.git", "git-receive-pack '~acme/widgets.git'"},
+		{"git@github.com:/~acme/widgets.git", "git-receive-pack '~acme/widgets.git'"},
+		{"git@github.com:acme/wid'gets.git", `git-receive-pack 'acme/wid'\''gets.git'`},
+	}
+	for _, tc := range cases {
+		info, err := parseRemote(tc.origin)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.origin, err)
+		}
+		if got := receivePackCommand(info.path); got != tc.want {
+			t.Errorf("%s: command %q, want %q", tc.origin, got, tc.want)
+		}
 	}
 }

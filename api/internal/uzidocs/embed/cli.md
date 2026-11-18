@@ -1895,11 +1895,13 @@ never bypasses this; it only picks among repos that already match.
 - **SSH origin (scp-like `git@host:owner/repo` or `ssh://`):** the host your SSH
   config resolves to must be the forge's web host (or `ssh.github.com` for a
   GitHub repo on `github.com`). The CLI finds it with `ssh -G`, passing the
-  remote's user and port. `ssh -G` does not connect, but it does evaluate your
+  remote's user, port and the `git-receive-pack` command the push runs, so
+  `Match command` rules resolve as they will for the push. `ssh -G` does not connect, but it does evaluate your
   SSH config, including any `Match exec` blocks, which can run local commands.
 - **Transport overrides are refused**, even when empty: `GIT_SSH`,
   `GIT_SSH_COMMAND` and `core.sshCommand` can send the push somewhere `ssh -G`
-  cannot see. Use an https remote instead.
+  cannot see. `GIT_CONFIG` is refused too: it hides from `git config` the
+  settings the push reads. Use an https remote instead.
 - **Anything else is refused:** `git://`, `file://`, `git+ssh://`, local paths
   and other schemes, an `ssh://` origin containing `%` or a password, and any
   origin whose host, user or port holds whitespace or control characters.

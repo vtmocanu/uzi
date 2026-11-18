@@ -307,6 +307,7 @@ type remoteInfo struct {
 	port    string
 	hasUser bool
 	hasPort bool
+	path    string // ssh forms: the repo path git sends in its remote command
 }
 
 // parseRemote classifies an origin URL and extracts its host (and, for ssh, the user and
@@ -363,6 +364,11 @@ func parseRemote(remote string) (remoteInfo, error) {
 			if hasSpaceOrControl(info.host) || hasSpaceOrControl(info.user) || hasSpaceOrControl(info.port) {
 				return refuse("whitespace or control character in ssh host, user or port")
 			}
+			// git takes the path raw from the first '/' after the authority.
+			rest := s[i+3:]
+			if j := strings.Index(rest, "/"); j >= 0 {
+				info.path = gitSSHPath(rest[j:])
+			}
 			return info, nil
 		default:
 			return refuse("unsupported scheme " + scheme + "://")
@@ -393,7 +399,23 @@ func parseRemote(remote string) (remoteInfo, error) {
 	if hasSpaceOrControl(info.host) || hasSpaceOrControl(info.user) {
 		return refuse("whitespace or control character in ssh host or user")
 	}
+	info.path = gitSSHPath(s[colon+1:])
 	return info, nil
+}
+
+// gitSSHPath applies git's ssh path rule: "/~user/repo" is sent as "~user/repo".
+func gitSSHPath(p string) string {
+	if len(p) > 1 && p[0] == '/' && p[1] == '~' {
+		return p[1:]
+	}
+	return p
+}
+
+// receivePackCommand is the remote command git push runs over ssh for path: the default
+// receive-pack program with the path single-quoted as git's sq_quote does. ssh -G gets it
+// so that Match command / sessiontype rules resolve as they will for the push.
+func receivePackCommand(path string) string {
+	return "git-receive-pack '" + strings.ReplaceAll(path, "'", `'\''`) + "'"
 }
 
 // hasSpaceOrControl reports whether s holds any whitespace or control rune (newline, tab,
@@ -483,6 +505,11 @@ func (o *originHost) compute(ctx context.Context, env Env) (string, error) {
 			return refuse("%s is set, which overrides the ssh transport, so the real host cannot be verified", k)
 		}
 	}
+	// GIT_CONFIG redirects `git config` (only) to one file, so the core.sshCommand lookup
+	// below would not see the scopes git push reads.
+	if _, ok := env.lookupEnv("GIT_CONFIG"); ok {
+		return refuse("GIT_CONFIG is set, which hides the git configuration push uses, so core.sshCommand cannot be checked")
+	}
 	out, gerr := env.Git(".", "config", "--get", "core.sshCommand")
 	present, cerr := sshCommandConfigured(out, gerr)
 	if cerr != nil {
@@ -508,7 +535,7 @@ func (o *originHost) compute(ctx context.Context, env Env) (string, error) {
 	if info.hasPort {
 		args = append(args, "-p", info.port)
 	}
-	args = append(args, "--", info.host)
+	args = append(args, "--", info.host, receivePackCommand(info.path))
 	cctx, cancel := context.WithTimeout(ctx, sshConfigTimeout)
 	defer cancel()
 	cfg, err := env.sshConfig(cctx, args...)
