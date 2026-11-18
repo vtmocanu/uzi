@@ -2860,10 +2860,15 @@ Further cases that keep a leaf as unknown (`run_local_unknown`):
 - **A retired ledger row** (`attempt_ledger`) whose clone path is not this bare's
   canonical attempt clone for its attempt id (the census's identity contract), or whose
   generation is unreadable, gives unknown.
+- **Conflicting ledger rows** (`attempt_ledger`): if a bare's attempt ledger holds two
+  rows for one attempt id whose branch, run id or clone path differ, the bare's ledger is
+  unknown for every run classified against it. Successive rows of one identical identity
+  are state changes, and the last one wins.
 - **Interrupted reads:** the authority slot reads and the authenticated
   recovery-maintenance inspection each stop starting new reads once the pass's abort
-  signal fires or its read deadline passes; a read already started is awaited, never
-  abandoned. A read that detects expiry before the pass aborts leaves the classification
+  signal fires or its read deadline passes; a read already started is awaited, except
+  that when the pass cannot settle within its settlement bound (about 5 s after an
+  abort), the pass fails fatally. A read that detects expiry before the pass aborts leaves the classification
   unknown: the leaf is kept and counted as `run_local_unknown` with source `classifier`.
   A pass abort, or the pass deadline stopping the phase while a read is in flight, makes
   the scratch phase report `stopped` (reason `pass_deadline` on the deadline); the leaf is
