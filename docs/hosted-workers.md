@@ -644,6 +644,10 @@ node, before deleting any worker's volumes.
 
 Procedure (it moves unstamped workers that are on the global placement):
 
+Do not manually delete or replace worker claims while the controller is running.
+Concurrent partial recreation can leave the worker on global placement rather than
+move it; follow the stop-and-confirm sequence below.
+
 1. Set `workers.newPlacement` (`nodeSelector` and `tolerations`) in your values and
    apply it (`helm upgrade`, or let the GitOps sync finish). Editing the values file alone
    changes nothing. Confirm the running controller has it before step 2: its Deployment
