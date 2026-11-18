@@ -209,6 +209,13 @@ func (m *Materializer) reconcileDinD(ctx context.Context, w protocol.DesiredWork
 		if o.DinDPVCLive && o.DinDPVCPhase == string(corev1.ClaimBound) && o.DinDPVCUID != "" && o.DinDPVCUID != op.PVCUID &&
 			o.DeploymentUID != "" && o.DeploymentUID != op.DeploymentUID && !o.DeploymentTerminating &&
 			(o.SpecHash != wantHash || o.Generation != w.Generation) {
+			// Permission to reconcile an unchanged worker is not roll admission.
+			// A fresh list may also find a different same-name Deployment: neither
+			// can reuse the earlier decision. Let the next tick plan and reserve it.
+			if e := rollFrom(ctx, w.ID); !m.drain.ForceRoll &&
+				(e == nil || !e.admitted || !e.drift || e.marker == nil || e.dep == nil || string(e.dep.UID) != o.DeploymentUID) {
+				return true, nil
+			}
 			return true, m.reconcileReplacement(ctx, w, o)
 		}
 		if !o.DinDPVCLive || o.DinDPVCPhase != string(corev1.ClaimBound) || o.DinDPVCUID == "" || o.DeploymentUID == "" || o.DeploymentUID == op.DeploymentUID || o.DeploymentTerminating || !o.PodsKnown || o.ReadyPodUID == "" || o.ReadyPodUID == op.DeploymentUID || o.SpecHash != wantHash || o.Generation != w.Generation || o.Roll.Phase != protocol.PhaseSettled {
