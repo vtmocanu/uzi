@@ -945,17 +945,29 @@ Owner decision on crash point 5 (predecessor host unreachable), 2026-11-18:
 recorded scope decision, **unvalidated and uncredited**, an environmental
 limitation. Fencing refuses stale uzi operations, but a different B credential
 and revoking A's uzi capability do not stop a provider credential that an
-unreachable predecessor already holds. No option-B protocol work. The runtime
-stays fail-closed; the owner's required property is that B is never used while
-predecessor quiescence is unproven,
-and the run is held for the owner instead. "Held for the owner" is the
-owner's wording and is true only in that the clone and custody are kept for the
-owner; on the same-worker path above the run is a terminal `failed` report, not
-an owner pause. U21 evidences this only for same-worker retained recovery; a successor on another worker has no local
-retained journal, so the U21 gate does not run there, and how the api treats
-that claim is not evidenced here. This is not an exception to the quiescence
-guarantee, and continuation is never credited because the host is gone. This
-covers crash point 5 only.
+unreachable predecessor already holds. No option-B protocol work on this run.
+
+The owner's stated requirement is that B is never used while predecessor
+quiescence is unproven, and that the run is held for the owner instead.
+"Held for the owner" is the owner's wording; on the same-worker path above the
+run is a terminal `failed` report with clone and custody kept, not an owner
+pause. **The code does not enforce that requirement on the cross-worker path.**
+A stale worker's run is requeued (`RequeueRunsOfStaleWorkers`); `ClaimRun`'s
+affinity pin lets another of the user's workers claim it once the owner is
+heartbeat-stale past the grace period, after the affinity ceiling (default 2h),
+or when the worker row is deleted; `codexClaimSecrets` then mints a fresh
+capability and delivers the run's current binding (B after an applied switch).
+The new worker has no retained journal, so `if (retainedJournal)` in
+`agent/src/runner.ts` is false, `recoverRetainedClaim` is skipped, the
+`predecessor_capture` / `quiescence_failed` gate never runs, and the run
+proceeds with B. B can therefore be used while an unreachable predecessor may
+still hold provider credential A. Without a switch the same path delivers A to
+the new worker; the claim path has no switch-specific logic (read from the
+code, not executed). U21 evidences the gate only for same-worker retained
+recovery. The cross-worker path is unvalidated and uncredited, and the gap goes
+to the owner as a formal decision; fail-closing it would need new
+claim-affinity design, which the approved plan does not include. Continuation is
+never credited because the host is gone. This covers crash point 5 only.
 
 ## m3.2 candidate-level checks (2026-11-18)
 

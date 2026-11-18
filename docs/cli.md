@@ -4331,7 +4331,7 @@ Without `--policy-mode`, `uzi run resume-now <id>` is unchanged.
 subscription or OpenAI API-key label. Codex refuses `--auto`, `--default`
 and `--inherit`; it does not use Anthropic pool or binding selection.
 The web picker offers the same explicit choice. An ambiguous eligible label
-(two matching credentials) is refused before anything is written; rename a
+(two or more matching credentials, compared case-insensitively) is refused before anything is written; rename a
 credential in the web UI, since the CLI cannot rename, then retry. Running and worker-held
 awaiting_approval/input/followup runs switch at the next safe boundary.
 Claimed returns 409; queued and every park return 422, including worker-held

@@ -437,7 +437,7 @@ control is still absent, not that the functional criterion was deferred.
 | Stopped known extra typed member and register_nonce case alias | D25–D56: four running/paused wire cases only |
 | Bounded strict stopped request, other forbidden combinations, op_id and minimal acknowledgement | U18 credits the 1 MiB inclusive bound and the single-value rule (one copy each), op_id and unknown-field refusal (two copies each), expected_epoch on a running report (two copies), and the acknowledgement's four-key run object and 16 KiB bound under a 64 KiB plan; other statuses and the envelope key count not controlled; null/missing fields and case aliases beyond D25–D56 not controlled |
 | Decision 11: no worker-side use of delivered Codex material before the predecessor proof (crash points 1–4) | U21 credits, for API-key A → subscription B on same-worker retained recovery, no executor-client release or refresh before the proof ((c) insertion, (b)) and, on survivors/unverified, no executor run and the `quiescence_failed` blocker ((d), (b)); bodies, launches and requests before the proof asserted only; "discarded" not shown observably (non-use only); other auth directions, the `kind` half of the gate, the re-hold variant and cross-worker recovery not controlled |
-| Crash point 5: predecessor host unreachable | Owner decision 2026-11-18: recorded scope decision, unvalidated and uncredited (environmental limitation); fail-closed per decision 11, which U21 evidences only for same-worker retained recovery |
+| Crash point 5: predecessor host unreachable | Owner decision 2026-11-18: recorded scope decision, unvalidated and uncredited (environmental limitation). Not enforced by the code: on a successor claim on another worker there is no retained journal, so the decision 11 gate (U21, same-worker retained recovery only) does not run and the run proceeds with the binding the claim delivers; see the case 5 record below. Formal owner decision pending |
 | Tokens absent from all inputs/acknowledgements/messages/logs | U19 credits B material's registration with the Runner's log and run-message redactors ((d), each separately; the executor's second log registration not controlled), the Codex apply route's log redaction (`LogValue`, (d)) and the stopped acknowledgement and log (effect-injection); the remaining surfaces are guardless by construction and go to the owner batch; m4 security gates remain required |
 
 ## Baseline absence and the class (d) method boundary
@@ -3624,9 +3624,12 @@ ledger-only child of cd0970196): 88 tests, `ℹ pass 88`, 155.7 s
 (`u20f-describe.log`, `SHA=3fdfe9127… EXIT=0`). Timing
 is not a finding: the 24-leaf runs on disk took 30.3 s (`u20f-green`), 33.3 s
 (`u20r-pre-commit`), 36.8 s (`u20-green`, c85f434e7), 39.1 s (`u20-first`) and
-43.7 s (`u20r-first`), all on the same worker and node with a warm cache.
-Run-to-run noise of about ±5 s on the same 18 leaves spans the reported delta,
-so no wait change is established or ruled out. Hosted effect unmeasured.
+43.7 s (`u20r-first`), all on the same worker and node. The five 24-leaf runs
+span 30.3–43.7 s, about ±6.7 s around their midpoint. The 18-leaf runs on disk
+are `u20-green-pre` at 20.9 s and `u20-now-gate` at 29.3 s (different revisions
+and one with a mutant, so not a noise estimate). The 24-leaf spread is
+comparable to the reported delta, so no wait change is established or ruled
+out. Hosted effect unmeasured.
 
 Credit: during B preparation the executor's switch admission check refuses
 child work except the replacement build itself ((d)). R7 covers the B
@@ -3652,7 +3655,8 @@ Not credited:
   after Now's publishB (:17684) without Now's finishB, so from there
   `switchGate` is the only Now-level gate until `nowSummary?.stop()` in
   `settleExecution` (runner.ts:18979), because nothing on that path clears it
-  (only Now's `finishB` lease opens it, now-summary.ts:354); the executor's
+  (Now's `finishB` lease opens it, now-summary.ts:354, and `reopenA` also calls
+  `open()` at :361 but refuses once B is published); the executor's
   switch admission likely still refuses behind it. No selected leaf covers that path.
   Separating the copies needs a controller-level test
   (`NowSummaryController.suspendCodexSwitch` with an un-aborted lifecycle);
@@ -3731,7 +3735,7 @@ attempts did not compile (`u21-*.compilefail*.log`) and earn nothing.
 
 | Control | Class | Mutation (runner.ts) | Red |
 | --- | --- | --- | --- |
-| u21r-exec-release-before-proof | (c) insertion of the real first use ahead of the proof, (b) | before the proof (:31038, the line before `await check()` and the proof call that starts at :31040) insert a `releaseCodex` through the executor's own provider client (`flight.executor.opts.client`), the client its eager release uses | at feb16cdf2: 32 of 32 at :35217 "no delivered Codex material is used before the first predecessor proof", actual `releases=1 …` |
+| u21r-exec-release-before-proof | (c) insertion of the real first use ahead of the proof, (b) | before the proof (:31038, the `await check()` line itself, ahead of the proof call that starts at :31040) insert a `releaseCodex` through the executor's own provider client (`flight.executor.opts.client`), the client its eager release uses | at feb16cdf2: 32 of 32 at :35217 "no delivered Codex material is used before the first predecessor proof", actual `releases=1 …` |
 | u21r-exec-refresh-before-proof | (c) insertion, (b) | the same position, a `refreshCodex` through the executor's provider client | at feb16cdf2: 32 of 32 at :35217, actual `refreshes=1 …` |
 | u21-release-before-proof | (c) insertion, sensitivity of the Runner-client counter only | the same position, a `releaseCodex` on the Runner's own client (production never releases through it) | at e3bc3e722: 32 of 32 at :35216 (the assertion's start line at that revision), `runner=1` |
 | u21-gate | (d) removal, (b) | the `quiescence_failed` gate (:31050) → `if ((…) && Number.NaN > 0)` | at e3bc3e722: 8 of 32 (every forced leaf) at :35219 "unproven predecessor never reaches the executor body"; the 24 quiescent leaves pass. Rerun as u21f-gate at e0f730e4f (a ledger-only child of feb16cdf2; log `.uzi/scratch/ctl-logs/u21f-gate.log`): the same 8 of 32 at :35220 |
@@ -3782,13 +3786,29 @@ recorded scope decision, **unvalidated and uncredited**, an environmental
 limitation. Fencing refuses stale uzi operations (generation, capability,
 registration), but neither a different B credential nor revoking A's uzi
 capability stops a provider credential that an unreachable predecessor
-already holds. No option-B protocol work. The runtime stays fail-closed:
-the owner's required property is that delivered material is never used while
-predecessor quiescence is unproven, with the run held for the owner instead
-(on the same-worker path that is a terminal `failed` report with clone and
-custody kept, not an owner pause). U21 (above) evidences this only for
-same-worker retained recovery; a successor on another worker, which is the
-case-5 situation, has no local retained journal, so that gate does not run
-there, and how the api treats such a claim is not evidenced here. This is not an exception to
-the quiescence guarantee, and continuation is never credited because the host
-is gone.
+already holds. No option-B protocol work on this run.
+
+The owner's stated requirement is that B is never used while predecessor
+quiescence is unproven, with the run held for the owner instead. **The code
+does not enforce that requirement on this path.** Traced at HEAD:
+1. `RequeueRunsOfStaleWorkers` (runtime.sql) requeues a stale worker's run.
+2. `ClaimRun`'s affinity pin (runtime.sql) lets another of the user's workers
+   claim it once the owner is heartbeat-stale past the grace period, after the
+   affinity ceiling (default 2h), or when the worker row is deleted.
+3. `codexClaimSecrets` (workersvc/codexauthz.go) mints a fresh capability and
+   delivers the run's current binding, which after an applied switch is B.
+4. The new worker has no retained journal, so `if (retainedJournal)` in
+   `agent/src/runner.ts` is false, `recoverRetainedClaim` is skipped, the
+   `predecessor_capture` / `quiescence_failed` gate never runs, and the run
+   proceeds with B.
+
+So B can be used while an unreachable predecessor may still hold provider
+credential A. Without a switch the same path delivers A to the new worker. The
+claim path contains no switch-specific logic, so this is not introduced by the
+switch (read from the code, not executed). U21 (above) evidences the gate only
+for same-worker retained recovery; the cross-worker path is unvalidated and
+uncredited. This gap goes to the owner as a formal decision; fail-closing it
+would need new claim-affinity design, which the approved plan does not include.
+On the same-worker path the held outcome is a terminal `failed` report with
+clone and custody kept, not an owner pause. Continuation is never credited
+because the host is gone.

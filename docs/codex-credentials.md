@@ -321,20 +321,32 @@ Crash recovery gives two separate guarantees. The server fences stale uzi
 operations: a fresh claim increments the generation, remints the capability and
 records the baseline, and stale applies and capabilities are refused. That does
 not prove the old processes stopped. On the worker, same-worker retained
-recovery runs the predecessor quiescence proof before the run starts. Until it
-passes, the delivered Codex material (old or new) is not used for login,
-provider start, refresh or release. If the proof finds survivors or cannot be
+recovery runs the predecessor quiescence proof before the run starts. The
+design property is that until it passes, the delivered Codex material (old or
+new) is not used for login, provider start, refresh or release. The evidence is
+narrower: same-worker retained recovery for an OpenAI API key switched to a
+subscription, with release and refresh controlled before the proof; request
+bodies, launches and requests are asserted only, and other credential
+directions are uncredited. If the proof finds survivors or cannot be
 verified, the run ends `failed` with the `quiescence_failed` blocker
 (`worker_residue_blocked`) and keeps its clone and custody. That is a terminal
 failure, not an owner pause.
 
 If the predecessor's host is unreachable, uzi cannot prove it stopped, and
 neither a different credential nor revoking the old uzi capability stops a
-provider credential that predecessor already holds. This case is an owner-recorded
-limitation, unvalidated: the required property is that the new credential is
-never used while the predecessor is unproven, and it is evidenced only for
-same-worker retained recovery. A successor on another worker has no local
-retained journal, so that gate does not run there.
+provider credential that predecessor already holds. This case is an
+owner-recorded limitation, unvalidated and uncredited. The owner's stated
+requirement is that the new credential is never used while the predecessor is
+unproven, but **uzi does not enforce that across workers.** If the lost host's
+run is claimed by another of your workers (once the old worker is stale past the
+grace period, past the affinity ceiling, or deleted), that worker has no local
+retained journal, so the quiescence proof does not run, and the run continues
+with its current credential: the new one after a switch, or the old one if you
+never switched. The unreachable host may still hold the old credential.
+
+If a worker host is lost, revoke or rotate the old credential at the provider
+(OpenAI). Removing it in uzi, or switching away from it, does not stop a copy
+an unreachable host already holds.
 
 This is not a universal crash-resume or storage-durability guarantee.
 Cross-account provider acceptance is **unproven**: evidence uses fakes, and

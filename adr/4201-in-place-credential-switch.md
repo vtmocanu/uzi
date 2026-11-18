@@ -57,14 +57,21 @@ recovery notice. Preservation refuses fresh cwd or a missing conversation.
 Recovery after a crash is two separate guarantees (decision 11). **uzi-operation
 fencing (server):** a fresh claim increments the generation, remints the
 capability and records the baseline, and stale applies and stale capabilities
-are refused (`codexSwitchFence` in `api/internal/workersvc/credential_switch_codex.go`,
-`ErrStaleClaim`). Settlement does not prove the run's processes stopped
-(`settleCredentialSwitchHold`), and fencing refuses stale uzi operations only.
+are refused. A failed fence check (`codexSwitchFence` in
+`api/internal/workersvc/credential_switch_codex.go`) returns
+`Outcome: ApplyOutcomeFenced`; the apply's zero-row writes
+(`credential_switch_codex_apply.go`) return `ErrStaleClaim`. Settlement does not
+prove the run's processes stopped (`settleCredentialSwitchHold`), and fencing
+refuses stale uzi operations only.
 **Predecessor stop (worker):** `recoverRetainedClaimBody` (`agent/src/runner.ts`)
-runs the `predecessor_capture` quiescence proof before `executor.run`. On
-same-worker retained recovery, delivered Codex material (A or B) is not used for
-login, provider start, refresh, release or any other credential operation
-before that proof passes. If the proof reports survivors or is unverified, the
+runs the `predecessor_capture` quiescence proof before `executor.run`. The
+design property is that, on same-worker retained recovery, delivered Codex
+material (A or B) is not used for login, provider start, refresh, release or
+any other credential operation before that proof passes. The evidence is
+narrower: same-worker retained recovery for API-key A to subscription B, with
+release and refresh controlled before the proof (ledger U21). Request bodies,
+launches and requests before the proof are asserted only, and other auth
+directions are uncredited. If the proof reports survivors or is unverified, the
 material stays unused and the run ends as a terminal `failed` with the
 `quiescence_failed` blocker (`worker_residue_blocked`), clone and custody kept.
 That is not an owner pause. Claim-payload delivery of the material may remain;
@@ -74,20 +81,36 @@ delivery is not evidence of quiescence.
 decision (2026-11-18): unvalidated and uncredited, an environmental limitation.
 Fencing refuses stale uzi operations, but neither a different B credential nor
 revoking A's uzi capability stops a provider credential an unreachable
-predecessor already holds. A successor on another worker has no local retained
-journal, so the same-worker gate does not run there. The owner's required
-property is that B is never used while predecessor quiescence is unproven, with
-the run held for the owner instead; it is evidenced only for same-worker
-retained recovery (ledger U21), not for the cross-worker case. Continuation is
-never justified by "the host is gone". No new credential-delivery protocol was
-started.
+predecessor already holds. The owner's stated requirement is that B is never
+used while predecessor quiescence is unproven, with the run held for the owner
+instead (on the same-worker path that means terminal `failed`,
+`worker_residue_blocked`, with clone and custody kept; not an owner pause).
+**The code does not enforce that requirement across workers.** A stale worker's
+run is requeued (`RequeueRunsOfStaleWorkers`); `ClaimRun`'s affinity pin lets
+another of the user's workers claim it once the owner is heartbeat-stale past
+the grace period, after the affinity ceiling (default 2h), or when the worker
+row is deleted; `codexClaimSecrets` mints a fresh capability and delivers the
+run's current binding (B after an applied switch). The new worker has no local
+retained journal, so the `predecessor_capture` / `quiescence_failed` gate never
+runs and the run proceeds with B, possibly while an unreachable predecessor
+still holds provider credential A. Without a switch the same path delivers A
+(the claim path has no switch-specific logic; read from the code, not executed).
+The gap is unvalidated and uncredited and goes to the owner as a formal
+decision; fail-closing it needs new claim-affinity design, outside the approved
+plan. Continuation is never justified by "the host is gone". No new
+credential-delivery protocol was started.
 
-Residuals recorded as unvalidated and uncredited, never as proven: token-absence
-surfaces with no guard to remove (outside the stopped route), stopped-route
-binding identity, positive X/Y withdrawn-switch settlement credit, Now and
-summary gating during B publication (masked), suspension of B's startup refresh
-before finish (its red was a timeout), and crash point 5. The source of truth is
-the "Clause accounting" table in `agent/test/credential-switch-proof-ledger.md`.
+Residuals recorded as unvalidated and uncredited, never as proven, including:
+token-absence surfaces with no guard to remove (outside the stopped route),
+stopped-route binding identity, positive X/Y withdrawn-switch settlement credit,
+Now's gate during B publication (masked) and summary gating (untested),
+suspension of B's startup refresh before finish (its red was a timeout), the
+explicit-request refusals the ledger lists as unvalidated (pool_wait, terminal
+statuses, pinned-without-secret, lane, no-live-worker, unsupported-worker and
+foreign-subscription), and crash point 5. Every residue the ledger's "Clause
+accounting" table marks unvalidated or not controlled is recorded as
+unvalidated and uncredited; the table in
+`agent/test/credential-switch-proof-ledger.md` is the source of truth.
 
 Real cross-account provider acceptance remains UNPROVEN; fake-provider
 evidence does not settle it. Owner two-account acceptance is pending and
