@@ -1605,3 +1605,88 @@ describe("the pre-effect steps are bounded by the phase window less the settleme
     }
   });
 });
+
+describe("cross-bare attempt identity conflicts", PROC, () => {
+  const otherBare = (over: Partial<RetireScratchBareEvidence>): RetireScratchBareEvidence => ({
+    barePath: path.join(w.fx.dataDir, "repos", "another.git"),
+    bindings: [], protectedPaths: [], restoreBranches: [], recovery: [], stoppedRuns: [], ledger: [], ...over,
+  });
+  /** Wraps the evidence read so another bare is added from the `from`-th call on (1 = every call). */
+  const addBare = (extra: RetireScratchBareEvidence, from = 1): void => {
+    const git = w.options.retire!.git;
+    const read = git.readRetireScratchEvidence;
+    let calls = 0;
+    git.readRetireScratchEvidence = async opts => {
+      const result = await read(opts);
+      calls++;
+      if (result.state !== "read" || calls < from) return result;
+      return { ...result, bares: [...result.bares, extra] };
+    };
+  };
+  const ledgerRaw = (attemptId: string) => JSON.stringify({ attemptId, runId: "other-run", clonePath: path.join(w.runnerRoot, "other", "attempt"), state: "retired" });
+  const ledgerOf = (...raws: string[]) => otherBare({ ledger: raws.map(raw => ({ branch: "agent/other", raw })) });
+
+  it("another bare's conflicting attempt identity must keep the settled parent", async () => {
+    const s = w.seed();
+    addBare(ledgerOf(ledgerRaw(s.attemptId)));
+    const result = await w.run();
+    assert.equal(result.retire_scratch.reclaimed, 0, "conflicting identity across bares must not grant deletion authority");
+    assert.equal(result.retire_scratch.kept_by_reason.conflict, 1);
+    assert.equal(exists(s.parent), true);
+    untouched(s);
+  });
+
+  it("control: another bare naming a different well-formed attempt does not stop the reclaim", async () => {
+    const s = w.seed();
+    const other = formatAttemptId(new Date(Date.UTC(2026, 10, 5, 10, 10, 59)), 1, "0123456789abcdef");
+    addBare(ledgerOf(ledgerRaw(other)));
+    const result = await w.run();
+    assert.equal(result.retire_scratch.reclaimed, 1);
+    assert.equal(exists(s.parent), false);
+  });
+
+  it("another bare with an undecodable binding entry keeps the parent as conflict", async () => {
+    const s = w.seed();
+    addBare(otherBare({ bindings: [{ key: "uzi-retire-scratch.x.binding", raw: "" }] }));
+    const result = await w.run();
+    assert.equal(result.retire_scratch.reclaimed, 0);
+    assert.equal(result.retire_scratch.kept_by_reason.conflict, 1);
+    untouched(s);
+  });
+
+  for (const raw of ["{}", "null", '{"attemptId":42}']) {
+    it(`another bare's unidentified ledger value ${raw} keeps the parent`, async () => {
+      const s = w.seed();
+      addBare(ledgerOf(raw));
+      const result = await w.run();
+      assert.equal(result.retire_scratch.reclaimed, 0);
+      assert.equal(result.retire_scratch.kept_by_reason.conflict, 1);
+      untouched(s);
+    });
+  }
+
+  it("a conflicting bare that appears only at the deletion-time re-read keeps the parent", async () => {
+    const s = w.seed();
+    addBare(ledgerOf(ledgerRaw(s.attemptId)), 2);
+    const result = await w.run();
+    assert.equal(result.retire_scratch.reclaimed, 0);
+    assert.equal(result.retire_scratch.kept_by_reason.conflict, 1);
+    untouched(s);
+  });
+
+  it("a gone parent is not recovered while another bare conflicts, and its binding is untouched", async () => {
+    const s = w.seed({ withParent: false });
+    addBare(ledgerOf(ledgerRaw(s.attemptId)));
+    const result = await w.run();
+    assert.equal(result.retire_scratch.recovered, 0);
+    assert.deepEqual(w.bindingRaws(s.uuid), [s.raw]);
+  });
+
+  it("a gone parent whose conflicting bare appears only at the re-read is not recovered", async () => {
+    const s = w.seed({ withParent: false });
+    addBare(ledgerOf(ledgerRaw(s.attemptId)), 2);
+    const result = await w.run();
+    assert.equal(result.retire_scratch.recovered, 0);
+    assert.deepEqual(w.bindingRaws(s.uuid), [s.raw]);
+  });
+});

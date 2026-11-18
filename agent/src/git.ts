@@ -2717,6 +2717,34 @@ function retireOtherBindingConflicts(evidence: RetireScratchBareEvidence, key: s
     (o.parsed.branch !== b.branch || o.parsed.runId !== b.runId || o.parsed.clonePath !== b.clonePath));
 }
 
+/**
+ * Issue #4263: does ANOTHER bare hold evidence that could give the attempt id a second identity? An attempt id belongs to
+ * one clone of one bare, so the single-bare checks cannot clear it: a different bare's binding or ledger value naming the
+ * same id (whatever its runId, clonePath or branch) conflicts. Fail closed: a hit is any undecodable binding entry, any
+ * decoded binding naming the id, and any ledger value not POSITIVELY identified as a different attempt. A value is exempt
+ * only when it is canonical with another id, or non-canonical, not containing the id text, and parsing to an object whose
+ * `attemptId` is a well-formed string other than the id.
+ */
+export function retireCrossBareConflict(others: readonly RetireScratchBareEvidence[], attemptId: string): boolean {
+  for (const o of others) {
+    if (o.bindings.some(b => b.parsed === undefined || b.parsed.attemptId === attemptId)) return true;
+    for (const { raw } of o.ledger) {
+      const e = parseAttemptLedgerEntry(raw);
+      if (e && raw === attemptLedgerValue(e)) {
+        if (e.attemptId === attemptId) return true;
+        continue;
+      }
+      if (raw.includes(attemptId) || retireParsedNamesAttempt(raw, attemptId)) return true;
+      let other: unknown;
+      try { other = JSON.parse(raw); } catch { return true; }
+      if (typeof other !== "object" || other === null || Array.isArray(other)) return true;
+      const id = (other as { attemptId?: unknown }).attemptId;
+      if (typeof id !== "string" || !ATTEMPT_ID_RE.test(id) || id === attemptId) return true;
+    }
+  }
+  return false;
+}
+
 /** Does a non-canonical value parse (JSON escapes decoded, so the id need not appear literally) to an object naming the attempt? */
 function retireParsedNamesAttempt(raw: string, attemptId: string): boolean {
   if (parseAttemptLedgerEntry(raw)?.attemptId === attemptId) return true;
@@ -2756,6 +2784,7 @@ function retireJournalOf(evidence: RetireScratchBareEvidence, branch: string): R
  */
 export function evaluateRetireBinding(input: {
   evidence: RetireScratchBareEvidence; uuid: string; runnerRoot: string; expectRaw?: string; acrossBares?: number;
+  otherBares?: readonly RetireScratchBareEvidence[];
 }): RetireBindingExam {
   const keep = (reason: RetireKeepReason): RetireBindingExam => ({ kind: "keep", reason });
   const { evidence, uuid } = input;
@@ -2769,6 +2798,7 @@ export function evaluateRetireBinding(input: {
   if (b.phase === "removing") return keep("interrupted_removal");
   if (!RETIRE_RECLAIM_CLASSES.has(b.class)) return keep("class_ineligible");
   if (retireOtherBindingConflicts(evidence, entry.key, b)) return keep("conflict");
+  if (input.otherBares && retireCrossBareConflict(input.otherBares, b.attemptId)) return keep("conflict");
   const last = retireLedgerLast(evidence, b);
   if (last === "tainted") return keep("ledger_mismatch");
   if (!last) return keep("ledger_missing");
@@ -2784,13 +2814,14 @@ export function evaluateRetireBinding(input: {
 /** The two metadata-only resolutions of a binding whose parent directory is gone (see {@link RetireScratchLocked.recoverGone}). */
 export function evaluateRetireRecovery(input: {
   evidence: RetireScratchBareEvidence; uuid: string; runnerRoot: string; expectRaw: string;
-  canonical: { present: boolean; ino?: string };
+  canonical: { present: boolean; ino?: string }; otherBares?: readonly RetireScratchBareEvidence[];
 }): "case1" | "case2" | "unresolved" {
   const { evidence, uuid } = input;
   const own = evidence.bindings.filter(b => b.key === retireBindingKey(uuid));
   const b = own.length === 1 && own[0]!.raw === input.expectRaw ? own[0]!.parsed : undefined;
   if (!b) return "unresolved";
   if (retireOtherBindingConflicts(evidence, own[0]!.key, b)) return "unresolved";
+  if (input.otherBares && retireCrossBareConflict(input.otherBares, b.attemptId)) return "unresolved";
   const last = retireLedgerLast(evidence, b);
   if (!last || last === "tainted" || last.branch !== b.branch || last.entry.runId !== b.runId || last.entry.clonePath !== b.clonePath) return "unresolved";
   const journal = retireJournalOf(evidence, b.branch);
@@ -2809,13 +2840,13 @@ export interface RetireScratchLocked {
   /** Fresh evidence of this bare. */
   evidence(): Promise<RetireScratchBareEvidence>;
   /** The full keep/ready decision for `uuid` (metadata, custody stores, quarantine, canonical footprint). */
-  examine(uuid: string, expectRaw: string, acrossBares?: number): Promise<RetireBindingExam>;
+  examine(uuid: string, expectRaw: string, acrossBares?: number, otherBares?: readonly RetireScratchBareEvidence[]): Promise<RetireBindingExam>;
   /** Durably write the `removing` phase; the binding must still read exactly `settledRaw`. Returns the written value. */
   markRemoving(uuid: string, settledRaw: string): Promise<string>;
   /** Durably unset a binding that still reads exactly `expectRaw`. */
   unset(uuid: string, expectRaw: string): Promise<void>;
   /** Metadata-only resolution of a binding whose parent is gone; `unresolved` leaves the binding untouched. */
-  recoverGone(uuid: string, expectRaw: string): Promise<"recovered" | "metadata_unresolved">;
+  recoverGone(uuid: string, expectRaw: string, otherBares?: readonly RetireScratchBareEvidence[]): Promise<"recovered" | "metadata_unresolved">;
 }
 
 /** The live binding of one retireRunnerClone call (issue #4263): the scratch parent, its pin until the move is verified,
@@ -17336,9 +17367,10 @@ export class GitCache {
     const runnerRoot = path.resolve(this.runnerRoot);
     const locked: RetireScratchLocked = {
       evidence: async () => this.retireEvidenceOf(barePath, await this.configEntries(barePath)),
-      examine: async (uuid, expectRaw, acrossBares) => {
+      examine: async (uuid, expectRaw, acrossBares, otherBares) => {
         const evidence = await locked.evidence();
-        const pure = evaluateRetireBinding({ evidence, uuid, runnerRoot, expectRaw, ...(acrossBares === undefined ? {} : { acrossBares }) });
+        const pure = evaluateRetireBinding({ evidence, uuid, runnerRoot, expectRaw, ...(acrossBares === undefined ? {} : { acrossBares }),
+          ...(otherBares === undefined ? {} : { otherBares }) });
         if (pure.kind !== "ready") return pure;
         const b = pure.binding;
         const stores = await readProtectedStores(
@@ -17364,7 +17396,7 @@ export class GitCache {
         return bound.raw;
       },
       unset: (uuid, expectRaw) => this.unsetRetireBindingUnderLock(barePath, uuid, expectRaw),
-      recoverGone: async (uuid, expectRaw) => {
+      recoverGone: async (uuid, expectRaw, otherBares) => {
         try {
           const evidence = await locked.evidence();
           const entry = evidence.bindings.find(b => b.key === retireBindingKey(uuid));
@@ -17377,7 +17409,7 @@ export class GitCache {
           if (st === undefined || (st !== null && (st.isSymbolicLink() || !st.isDirectory()))) return "metadata_unresolved";
           const canonical = st === null ? { present: false } : { present: true, ino: st.ino.toString() };
           if (st === null && !await this.missingFootprintOf(b.clonePath)) return "metadata_unresolved";
-          const verdict = evaluateRetireRecovery({ evidence, uuid, runnerRoot, expectRaw, canonical });
+          const verdict = evaluateRetireRecovery({ evidence, uuid, runnerRoot, expectRaw, canonical, ...(otherBares === undefined ? {} : { otherBares }) });
           if (verdict === "unresolved") return "metadata_unresolved";
           if (verdict === "case2") { await this.retireStep("recover-clone-dir-sync"); await syncDirectory(path.dirname(b.clonePath)); }
           await this.retireStep("recover-root-sync");

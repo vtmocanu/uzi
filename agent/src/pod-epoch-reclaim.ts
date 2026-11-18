@@ -14,7 +14,7 @@ import { isRunOwnershipLost } from "./client.js";
 import { parsePodEpochEvidence, assertPodEpochEvidenceBinding } from "./pod-epoch-evidence.js";
 import { openPodEpochDaemonBarrier, PodEpochDaemonError, type PodEpochDaemonGuard } from "./pod-epoch-daemon.js";
 import type { EpochScratchDiscardInput, GitCache, RetainedDiscardResult, RetainedHoldsSnapshot, RetainedLifecycleSnapshot, RetainedSourceSelector, RetainedWorkCounters } from "./git.js";
-import { evaluateRetireBinding, newRetainedWorkCounters, storesNameRetireParent, type RetireScratchParentOutcome, type RetireScratchPassReport } from "./git.js";
+import { evaluateRetireBinding, newRetainedWorkCounters, retireCrossBareConflict, storesNameRetireParent, type RetireScratchParentOutcome, type RetireScratchPassReport } from "./git.js";
 import type { RecoveryHoldsResponse, RunOwnershipResponse } from "./protocol.js";
 import { SCRATCH_DELETE_LIMITS, censusScratchRoot } from "./rmtree.js";
 import { uidSplitActive } from "./runner-uid.js";
@@ -914,11 +914,13 @@ async function retireBody(ctx: RetireContext, pin: ScratchRootPin, root: string,
     // Nomination: the metadata half of every keep reason on the evidence already read. B repeats it under the lock.
     const entry = owner.bare.bindings.find(b => b.uuid === uuid);
     const raw = entry?.raw ?? "";
+    const others = evidence.bares.filter(x => x !== owner.bare);
     if (present === "present") {
-      const nominated = evaluateRetireBinding({ evidence: owner.bare, uuid, runnerRoot: root, expectRaw: raw, acrossBares: owner.count });
+      const nominated = evaluateRetireBinding({ evidence: owner.bare, uuid, runnerRoot: root, expectRaw: raw, acrossBares: owner.count, otherBares: others });
       if (nominated.kind === "keep") { keep(name, nominated.reason, true); continue; }
       if (protectedNow.has(name)) { keep(name, "protected_by_retained_source", true); continue; }
     } else if (entry?.parsed === undefined) { keep(name, "malformed_binding", false); continue; }
+    else if (owner.count !== 1 || retireCrossBareConflict(others, entry.parsed.attemptId)) { keep(name, "conflict", false); continue; }
     const runId = entry!.parsed!.runId;
     const barePath = owner.bare.barePath;
     let removingWritten = false;
@@ -944,6 +946,19 @@ async function retireBody(ctx: RetireContext, pin: ScratchRootPin, root: string,
         // (Present parents only: a gone parent's case 2 recovery requires the journal in the owning bare to name the clone path.)
         if (again === undefined || protectedLeaves(again, root, [name]).has(name) ||
             (present === "present" && storesNameRetireParent(again, root, uuid, entry!.parsed!.clonePath))) return { kind: "keep", reason: "protected_by_retained_source" };
+        // Other bares' bindings and attempt ledgers may also have changed since the nomination read: re-read them inside S.
+        // Same consistency rule as above: writers on other bares take their own bare's lock, never this one.
+        let reread: Awaited<ReturnType<typeof deps.git.readRetireScratchEvidence>>;
+        try { reread = await ctx.owned(() => deps.git.readRetireScratchEvidence({ signal: controller.signal, deadline: phaseDeadline() }), ctx.hardPass); }
+        catch (error) {
+          if (error instanceof PodEpochSettlementError || ctx.interrupted()) throw error;
+          reread = { state: "unknown", reason: "read failed" };
+        }
+        if (reread.state !== "read") {
+          if (phaseEnd <= ctx.now()) return { kind: "keep", reason: "budget_deferred" };
+          return { kind: "keep", reason: present === "present" ? "conflict" : "metadata_unresolved" };
+        }
+        const othersNow = reread.bares.filter(x => x.barePath !== barePath);
         const lockOpts = { signal: controller.signal, deadline: phaseDeadline(5000) };
         return deps.git.withRetireScratchBare(barePath, lockOpts, async (locked): Promise<RetireStep> => {
           // ---- recovery route: the parent is gone, so only metadata can be wrong ----
@@ -951,9 +966,9 @@ async function retireBody(ctx: RetireContext, pin: ScratchRootPin, root: string,
             if (phaseEnd - ctx.now() < RETIRE_CANDIDATE_MIN_MS) return { kind: "keep", reason: "budget_deferred" };
             if (parentPresence(io, pin, name) !== "gone") return { kind: "keep", reason: "identity_changed" };
             live();
-            return (await locked.recoverGone(uuid, raw)) === "recovered" ? { kind: "recovered" } : { kind: "keep", reason: "metadata_unresolved" };
+            return (await locked.recoverGone(uuid, raw, othersNow)) === "recovered" ? { kind: "recovered" } : { kind: "keep", reason: "metadata_unresolved" };
           }
-          const ready = await locked.examine(uuid, raw, owner.count);
+          const ready = await locked.examine(uuid, raw, owner.count, othersNow);
           if (ready.kind !== "ready") return { kind: "keep", reason: ready.reason };
           const b = ready.binding;
           for (const p of [b.clonePath, path.join(root, name, "clone")]) {

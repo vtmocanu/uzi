@@ -6,8 +6,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
-  GitCache, RETIRE_BINDING_MAX_PER_BARE, evaluateRetireBinding, evaluateRetireRecovery, parseAttemptLedgerEntry, parseRetireBinding, parseRetireBindingKey, retireBindingKey, retireBindingValue,
-  type RetireBinding, type RetireBindingRead,
+  GitCache, RETIRE_BINDING_MAX_PER_BARE, evaluateRetireBinding, evaluateRetireRecovery, parseAttemptLedgerEntry, parseRetireBinding, parseRetireBindingKey, retireBindingKey, retireCrossBareConflict, retireBindingValue,
+  type RetireBinding, type RetireBindingRead, type RetireScratchBareEvidence,
 } from "../src/git.js";
 import { syncDirectory } from "../src/authority-lock.js";
 import { attemptClonePath, formatAttemptId } from "../src/attempt-path.js";
@@ -462,5 +462,47 @@ describe("syncDirectory", () => {
       fs.symlinkSync(dir, link);
       await assert.rejects(syncDirectory(link));
     } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+describe("retireCrossBareConflict", () => {
+  const OTHER = formatAttemptId(new Date("2026-11-05T10:10:59Z"), 1, "0123456789abcdef");
+  const bare = (over: Partial<RetireScratchBareEvidence> = {}): RetireScratchBareEvidence => ({
+    barePath: "/data/repos/other.git", bindings: [], ledger: [], protectedPaths: [], restoreBranches: [], recovery: [], stoppedRuns: [], ...over,
+  });
+  const ledgerOf = (...raws: string[]) => bare({ ledger: raws.map(raw => ({ branch: "agent/other", raw })) });
+  const canonical = (attemptId: string) => JSON.stringify({ attemptId, runId: "other-run", clonePath: "/data/runner/other/attempt", state: "retired" });
+
+  it("no other bares, or empty ones, never conflict", () => {
+    assert.equal(retireCrossBareConflict([], ATTEMPT), false);
+    assert.equal(retireCrossBareConflict([bare()], ATTEMPT), false);
+  });
+  it("an undecodable binding entry is a hit whatever its raw", () => {
+    for (const raw of ["", "{}", "garbage"])
+      assert.equal(retireCrossBareConflict([bare({ bindings: [{ key: "uzi-retire-scratch.x.binding", raw }] })], ATTEMPT), true, raw);
+  });
+  it("a decoded binding naming the attempt is a hit, one naming another attempt is not", () => {
+    const named = (attemptId: string): RetireBindingRead => ({ key: retireBindingKey(UUID), uuid: UUID, raw: "r", parsed: binding({ attemptId }) });
+    assert.equal(retireCrossBareConflict([bare({ bindings: [named(ATTEMPT)] })], ATTEMPT), true);
+    assert.equal(retireCrossBareConflict([bare({ bindings: [named(OTHER)] })], ATTEMPT), false);
+  });
+  it("a canonical ledger value naming the attempt is a hit, one naming a different attempt is not", () => {
+    assert.equal(retireCrossBareConflict([ledgerOf(canonical(ATTEMPT))], ATTEMPT), true);
+    assert.equal(retireCrossBareConflict([ledgerOf(canonical(OTHER))], ATTEMPT), false);
+  });
+  it("a non-canonical object with a different well-formed attempt id is not a hit", () => {
+    assert.equal(retireCrossBareConflict([ledgerOf(JSON.stringify({ attemptId: OTHER, extra: 1 }))], ATTEMPT), false);
+  });
+  it("non-canonical values naming the attempt, literally or by JSON escape, are hits", () => {
+    assert.equal(retireCrossBareConflict([ledgerOf(JSON.stringify({ attemptId: ATTEMPT, extra: 1 }))], ATTEMPT), true);
+    assert.equal(retireCrossBareConflict([ledgerOf(`{"attemptId":"${ATTEMPT.replace(/^./, c => `\\u00${c.charCodeAt(0).toString(16)}`)}"}`)], ATTEMPT), true);
+    assert.equal(retireCrossBareConflict([ledgerOf(`x ${ATTEMPT}`)], ATTEMPT), true);
+  });
+  it("values not positively identified as a different attempt are hits", () => {
+    for (const raw of ["not json", "{}", "null", "[]", `[{"attemptId":"${OTHER}"}]`, '{"attemptId":42}', '{"attemptId":"bad id"}', '{"attemptId":null}', ""])
+      assert.equal(retireCrossBareConflict([ledgerOf(raw)], ATTEMPT), true, raw);
+  });
+  it("one hit among several bares and values is enough", () => {
+    assert.equal(retireCrossBareConflict([bare(), ledgerOf(canonical(OTHER), "{}")], ATTEMPT), true);
   });
 });
