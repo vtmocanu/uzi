@@ -436,7 +436,7 @@ control is still absent, not that the functional criterion was deferred.
 | Stopped preservation of binding, journals, session, gates, questions and custody without input consumption/time banking | E1 base-journal deletion, E2 applied-input deletion, E3 custody timestamp corruption, E4 owner-discard/live-reference loss, E5 direct paused-time credit, E6 applied-switch journal deletion; U17 effect-injection for session id, gate presentation id and row, question id and message on the first stop, and a run-row write (`updated_at`) and presentation deletion on replay; other gate columns and other replay tables compared but not individually injected; Slack, `cross_checks` and other trigger-closure tables outside the snapshot |
 | Stopped known extra typed member and register_nonce case alias | D25–D56: four running/paused wire cases only |
 | Bounded strict stopped request, other forbidden combinations, op_id and minimal acknowledgement | U18 credits the 1 MiB inclusive bound and the single-value rule (one copy each), op_id and unknown-field refusal (two copies each), expected_epoch on a running report (two copies), and the acknowledgement's four-key run object and 16 KiB bound under a 64 KiB plan; other statuses and the envelope key count not controlled; null/missing fields and case aliases beyond D25–D56 not controlled |
-| Tokens absent from all inputs/acknowledgements/messages/logs | U19 credits B material's registration with the log and run-message redactors after a real Runner switch ((d), each separately) and the stopped acknowledgement and log (effect-injection); the remaining surfaces are guardless by construction and go to the owner batch; m4 security gates remain required |
+| Tokens absent from all inputs/acknowledgements/messages/logs | U19 credits B material's registration with the Runner's log and run-message redactors ((d), each separately; the executor's second log registration not controlled), the Codex apply route's log redaction (`LogValue`, (d)) and the stopped acknowledgement and log (effect-injection); the remaining surfaces are guardless by construction and go to the owner batch; m4 security gates remain required |
 
 ## Baseline absence and the class (d) method boundary
 
@@ -3507,17 +3507,55 @@ about 12 s together, as before, unmeasured as a delta); the new handler test
 is about 1 s in-package after migration (LiveDB, skipped without
 `UZI_TEST_DATABASE_URL`). Hosted effect unmeasured.
 
+Review rework c24bfa7fa71fccc439735e1cc62218a8a6af6ee8:
+- api/internal/handler/codex_switch_apply_log_livedb_test.go
+  (`TestWorkerCodexApplyLogRedactionRouteLiveDB`) performs a real Codex apply
+  through the authenticated apply route with slog set to the production JSON
+  handler (cmd/server/main.go:170), requires the response to carry B's access
+  token and capability, and requires the captured "worker credential switch
+  apply" line (worker_protocol.go:1868 logs `"result", res`) to carry
+  neither. The guard is `CredentialSwitchApplyResult.LogValue`
+  (workersvc/credential_switch_apply.go:136); without it the JSON handler
+  marshals the wire shape (:157–170), codex material included. `LogValue`
+  exists at a233 (credential_switch_apply.go:134) but the result had no Codex
+  field there, so the Codex exclusion is new: class (d).
+- The stopped token test now checks both fixture secrets (the bound A and the
+  withdrawn target) and matches with `strpos` rather than `LIKE`.
+
+| Control | Class | Mutation | Red |
+| --- | --- | --- | --- |
+| u19r-log-value | (d) | `LogValue` renamed to `logValue` (and `String` follows), so the result is no longer a `slog.LogValuer` | codex_switch_apply_log_livedb_test.go:40 "Codex apply logged B material" |
+| u19r-ack-leak | effect-injection | as u19-ack-leak, rerun on the extended test | codex_switch_stopped_token_livedb_test.go:50 |
+| u19r-log-leak | effect-injection | as u19-log-leak, rerun | :65 |
+
+Each u19r mutant log ends `SHA=c24bfa7fa… EXIT=1`. Unchanged c24bfa7fa: both
+handler tests pass (`u19r-green-h.log`), the six agent leaves pass
+(`u19r-green-a.log`), both EXIT=0; `task lint:api` 0 issues and agent
+`npm run lint` 0 warnings and 0 errors (`u19r-lint-*.log`).
+
 Credit: after a real Runner Codex switch, B's access token and capability are
-registered with both the log redactor and the run-message redactor (each
-registration controlled separately); the stopped settlement keeps the bound
-secret out of its acknowledgement and the server log (effect-injection), and
-the test also asserts run messages and inputs stay free of it.
+registered with the Runner's log redactor and its run-message redactor (each
+registration controlled separately in the test wiring). In production the
+Runner and the Codex executor share one logger (agent/src/main.ts:763–764,
+:841), and the executor's `publishB` registers B with it again
+(codex/codex-executor.ts:3210–3214, :4139); the test gives the executor a
+no-op logger, so u19-agent-log-redactor isolates the Runner's copy, and the
+executor's copy is not controlled. `flight.runScopedSecrets.push` (terminal
+eviction, runner.ts:7615) is retention hygiene and not controlled. The Codex
+apply route's server log stays free of B material through `LogValue` ((d)).
+The stopped settlement keeps both fixture secrets out of its acknowledgement
+and the server log (effect-injection); the test also asserts run messages and
+inputs stay free of them.
 
 Not credited (no qualifying class; for the owner batch): every other surface
 keeps the token out by construction, with no redaction or omission guard to
 remove — the server apply/preflight responses' non-token fields, the Codex
 switch feed message and journals (`TestCodexTransactionalApplyBundleLiveDB`
-asserts them), server logs on the apply path, the worker client's fixed
+asserts them), the apply route's error log (its errors wrap no material;
+the comment at worker_protocol.go:1863–1864 is inaccurate for Codex, where
+B is decrypted before later apply errors, but its conclusion holds), the
+stopped route's run row and journals (compared by the U14–U17 snapshot,
+not checked for material), the worker client's fixed
 detail strings (`client-credential-switch-apply.test.ts` asserts them), the
 owner set-token input (it carries a secret id, never material), and message
 and input injection on the stopped route (asserted, not injected). The
