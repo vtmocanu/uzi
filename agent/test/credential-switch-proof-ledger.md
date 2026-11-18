@@ -413,7 +413,7 @@ control is still absent, not that the functional criterion was deferred.
 | Same successful flight/generation/worktree with no new attempt, custody or release/reclaim | U2 effect-injection sensitivity controls (owner-extended decision 10, U2 only): claimRun, attempt directory, custody release, queued transition, worktree reassignment, through the real Runner success test; other effects and the fresh_B return not separately controlled |
 | Strict usable persistence, clear confirmation and continuation on A before teardown | R1–R4 credit three failed-save/inspection variants and empty applied-ACK; U3 credits op mismatch, target, claim_released ownership before/after, combined nonce fence and no-remaining-pending guards; pending-absent-before, other ownership legs, lost-reply clear and reopen's other guards not controlled |
 | Proven A root/tool reap before B material, login and model work; fresh CODEX_HOME | R5 (runner hold) and U4: executor reap proof for root and command-root failures, combined no-B-before-reap fence, distinct per-epoch HOME (b); in-flight tool callbacks, launcher must-not-exist and other phases not controlled |
-| Whole operation-scope/refresh/identity/capability/summary replacement and retired-A rejection | A2 one reader; A3 scope namespace; R7 B dispatcher readiness; U20 executor switch admission (B preparation child, (d)); B refresh suspension (fail-closed downstream, timeout red) and Now/summary gating during publication not credited (Now redundant with the lifecycle abort; summaries not exercised); R8 retired API-key A reconcile fence; U5 retired A refresh bridge pre-call refusal (P3), combined executor summary-guard refusal, B expected identity carried (b); A-account rejection, bridge post-call copy, assertRefreshAdmission and Now stale-result drops not separately controlled |
+| Whole operation-scope/refresh/identity/capability/summary replacement and retired-A rejection | A2 one reader; A3 scope namespace; R7 B dispatcher readiness; U20 executor switch admission (B preparation child, (d)); B refresh suspension (fail-closed downstream, timeout red) and Now/summary gating during publication not credited (Now's switchGate redundant with the lifecycle abort except on the preserve-only resume-refusal path; summaries not exercised); R8 retired API-key A reconcile fence; U5 retired A refresh bridge pre-call refusal (P3), combined executor summary-guard refusal, B expected identity carried (b); A-account rejection, bridge post-call copy, assertRefreshAdmission and Now stale-result drops not separately controlled |
 | Exact saved-ID resume; confirmed-refusal-only fresh fallback and lineage; preservation re-hold | R6 uncertain-error classification; U6 resume carries the saved id, lineage notice, three-copy preserve re-hold, crash missing-id disclosure (d) and preserve retained refusal with a saved conversation (b); confirmed-refusal classification (timeout), :4148 check and session_missing on the switch path not controlled |
 | Policy episode rejection at request and under apply lock | D74–D77 owner request and post-READY apply; U7 episode starting before preflight (both arms); hold arm unreachable in live statuses by `runs_policy_hold_shape`, paused hold refused by status (u1-status1); concurrent lock-order contention not controlled |
 | Refresh lease/intent exclusion, account lock ordering and boundary reconciliation before revoke | D78/D79 credit isolated A coordination-lease and rotating-intent server checks; U8 credits alias and enablement (old/target) lock presence and NOWAIT keyword, the account lock and its NOWAIT against a reverse-order writer, the busy mapping, intent count/lock (A's account) and real admitted-refresh lease/intent redundant fences, and the executor A reconcile inside reconcileA before teardown (c); per-account lock isolation, the target account's intent check, the refresh admission's binding recheck in isolation and global lock sorting not controlled |
@@ -3607,16 +3607,19 @@ disk.
 | --- | --- | --- | --- |
 | u20f-exec-admission | (d), at cd0970196 (also u20-exec-admission at 8a0d54655 and u20r-exec-admission at 21327f701, same result) | executor admission check codex-executor.ts:2509 `if (this.switchAdmissionClosed && (!construction \|\| construction !== this.switchBuildAuthority)) throw` → `if (false && …)` | EXIT=1, 6 of 18 red, all at "B preparation child sends no ordinary request at login" (test :34425 at cd0970196): both gated leaves, three partial-publication leaves and the deferred-refresh leaf |
 | u20r-b-refresh | not credited (timeout red), at b0ddd1c14 | B's refresh suspension (:4164) `replacementRefresh = fresh.harness.suspendRefreshAdmission();` → `replacementRefresh = undefined;` | EXIT=1, 1 of 18 red, but by "timed out waiting for M2 B turn"; the diagnostics show "credential switch unconfirmed; retaining work", so the switch fails closed downstream before either moved assertion runs |
-| u20-exec-summary-switch, u20-exec-summary-both, u20-summary-all | diagnostic only | `summaryAllowed` terms (:3302–3303) and the summary guard (:2979), with Now's `switchGate` for the last | EXIT=0, 18 pass: no plan or intent summary is started during the window (producers are aborted and joined at :4066–4074), so these lines are never exercised |
-| u20-now-gate | diagnostic only | Now's `!this.switchGate &&` (now-summary.ts:499) removed | EXIT=0, 18 pass |
-| u20-now-gate-lifecycle, u20-now-switch-gates | diagnostic only (multi-fence; timeout reds) | `switchGate` removed with Now's lifecycle-abort condition, or with that condition relaxed for a `CredentialSwitchSignal` abort | EXIT=1 by "timed out waiting for M2 B usage and ordinary cancellation"; no assertion fires |
+| u20-exec-summary-switch (at 8a0d54655), u20-exec-summary-both (log at c85f434e7), u20-summary-all (at 8a0d54655) | diagnostic only (multi-fence where more than one line is removed) | `summaryAllowed` terms (:3302–3303) and the summary guard (:2979), with Now's `switchGate` for the last | EXIT=0, 18 pass: no plan or intent summary is started during the window (producers are aborted and joined at :4066–4074), so `summaryAllowed` is not exercised; the shared factory guard (:2975–2981) is reached only by a Now build, which never begins, and the removed `switchGate` line is evaluated but masked by the lifecycle condition |
+| u20-now-gate (log at c85f434e7; the same result at 8a0d54655) | diagnostic only | Now's `!this.switchGate &&` (now-summary.ts:499) removed | EXIT=0, 18 pass |
+| u20-now-gate-lifecycle, u20-now-switch-gates (at c85f434e7) | diagnostic only (multi-fence; timeout reds) | `switchGate` removed with Now's lifecycle-abort condition, or with that condition relaxed for a `CredentialSwitchSignal` abort | EXIT=1 by "timed out waiting for M2 B usage and ordinary cancellation"; no assertion fires |
 
 R7 (above) is the Runner's B dispatcher publication-readiness guard for the
 scope-replacement stage; it is unchanged here.
 
 Unchanged candidate cd0970196: the 18 selected leaves plus the six baseline
 leaves pass (`ℹ pass 24`, 30.3 s, `u20f-green.log`, `SHA=cd0970196… EXIT=0`);
-agent `npm run lint` 0 warnings and 0 errors (`u20f-lint-agent.log`). The
+agent `npm run lint` 0 warnings and 0 errors (`u20f-lint-agent.log`). The whole
+"M2 actualRunner credential replacement" describe passes at 3fdfe9127 (a
+ledger-only child of cd0970196): 88 tests, `ℹ pass 88`, 155.7 s
+(`u20f-describe.log`, `SHA=3fdfe9127… EXIT=0`). The
 net test change adds no wait. Hosted effect unmeasured.
 
 Credit: during B preparation the executor's switch admission check refuses
@@ -3634,8 +3637,13 @@ Not credited:
   :17718). Behind that, `begin()` aborts a call when the lifecycle is aborted,
   and the executor's summary factory guard (`assertAuthority` /
   `assertSwitchAdmission`, codex-executor.ts:2943–2957, checked before the
-  build at :3043) refuses before a build. `switchGate` is therefore
-  structurally redundant with the lifecycle fence and cannot redden alone.
+  build at :3043) refuses before a build. On the success path and on
+  failure before Now's finishB, `switchGate` is therefore redundant with the
+  lifecycle fence and cannot redden alone. On the preserve-only confirmed
+  resume-refusal path the Runner re-arms the lifecycle (runner.ts:17699–17700)
+  after Now's publishB (:17684) without Now's finishB, so from there until the
+  throw unwinds `switchGate` is the only Now-level gate (the executor's switch
+  admission likely still refuses behind it); no selected leaf covers that path.
   Separating the copies needs a controller-level test
   (`NowSummaryController.suspendCodexSwitch` with an un-aborted lifecycle);
   none was added.
