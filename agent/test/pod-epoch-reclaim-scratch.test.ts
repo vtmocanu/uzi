@@ -1501,7 +1501,7 @@ async function enrollRealAuthority(w: World, rw: RunWorld, admit: boolean): Prom
     await store.admitSourceUse(tx, sourceDir);
     return store.slotKey(tx, sourceDir);
   });
-  w.options.scratch!.authority!.peekAllSlots = max => peekAllAuthoritySlots({ dataDir, workerToken }, max);
+  w.options.scratch!.authority!.peekAllSlots = (max, bound) => peekAllAuthoritySlots({ dataDir, workerToken }, max, bound);
   return key;
 }
 
@@ -1562,6 +1562,29 @@ test("#4420 authority inventory: a head-recorded slot whose file or whole slots 
       await untouched(w, [leafOf(RUN_A)]);
     });
   }
+});
+
+test("#4420 authority inventory: an abort of the pass mid-read interrupts the real inventory, keeps the leaf, and the pass resolves", FD_ONLY, async () => {
+  await withRunWorld([leafOf(RUN_A)], async (w, rw) => {
+    await seedRetiredAttempt(rw, RUN_A);
+    await enrollRealAuthority(w, rw, true);
+    const real = w.options.scratch!.authority!.peekAllSlots!;
+    const outcomes: string[] = [];
+    w.options.scratch!.authority!.peekAllSlots = (max, bound) => {
+      // Abort while the real enumeration is mid-read (it makes hundreds of separate fs calls).
+      setImmediate(() => w.parent.abort());
+      return real(max, bound).then(
+        slots => { outcomes.push("returned"); return slots; },
+        (error: unknown) => { outcomes.push((error as Error).message); throw error; },
+      );
+    };
+    const result = (await runPodEpochShadow(w.options))!;
+    assert.deepEqual(outcomes, ["authority read interrupted"], "the real inventory observed the pass's abort between its reads");
+    assert.equal(result.scratch.state, "stopped");
+    assert.deepEqual(keptRun(result), {});
+    assert.deepEqual(w.calls.discards, []);
+    await untouched(w, [leafOf(RUN_A)]);
+  });
 });
 
 test("#4420 kept run_local_active: the run's recovery record, a journal naming the clone, a live ledger, outbox protection and an in-flight credential switch", FD_ONLY, async () => {

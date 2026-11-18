@@ -15,7 +15,7 @@ import { openPodEpochDaemonBarrier, PodEpochDaemonError, type PodEpochDaemonGuar
 import type { EpochRetainedDiscoveryResult, EpochScratchDiscardInput, GitCache, RetainedDiscardResult, RetainedHoldsSnapshot, RetainedLifecycleSnapshot, RetainedSourceSelector, RetainedWorkCounters } from "./git.js";
 import { newRetainedWorkCounters } from "./git.js";
 import type { Outbox } from "./outbox.js";
-import type { SlotSnapshot } from "./completion-authority.js";
+import type { AuthorityReadBound, SlotSnapshot } from "./completion-authority.js";
 import { ENDED, RUN_KEPT_REASONS, activeRetention, normalizeRetention, unknownRetention, type MaintenanceInspection, type RunRetention } from "./pod-epoch-run-retention.js";
 import type { RecoveryHoldsResponse, RunOwnershipResponse } from "./protocol.js";
 import { censusScratchRoot } from "./rmtree.js";
@@ -106,9 +106,9 @@ export interface PodEpochScratchDeps {
     Partial<Pick<GitCache, "classifyEpochScratchRunRetention">>;
   /** Issue #4420: the read-only authority slot accessor (AuthorityRuntime.peekSlot). Absent keeps a retired attempt (`authority_slot`). */
   authority?: {
-    peekSlot(clonePath: string): Promise<SlotSnapshot | null>;
+    peekSlot(clonePath: string, bound?: AuthorityReadBound): Promise<SlotSnapshot | null>;
     /** Read-only, bounded enumeration of every slot (AuthorityRuntime.peekAllSlots). Absent keeps every run (`authority_inventory`). */
-    peekAllSlots?(max: number): Promise<SlotSnapshot[]>;
+    peekAllSlots?(max: number, bound?: AuthorityReadBound): Promise<SlotSnapshot[]>;
     /** The authenticated recovery-maintenance read (RecoveryMaintenance.inspectRun). Absent keeps a run while that store exists. */
     inspectMaintenance?(runId: string): Promise<MaintenanceInspection>;
   };
@@ -478,8 +478,8 @@ async function runLeafKeep(ctx: ScratchContext, name: string): Promise<(typeof R
       const peek = deps.authority;
       local = normalizeRetention(await ctx.owned(() => classify.call(deps.git, runId, {
         lifecycle, holds, signal: controller.signal, deadline: ctx.deadlineAt(), discovery: ctx.runDiscovery, memo: ctx.runMemo,
-        ...(peek ? { peekSlot: (clonePath: string) => peek.peekSlot(clonePath) } : {}),
-        ...(peek?.peekAllSlots ? { peekAllSlots: (max: number) => peek.peekAllSlots!(max) } : {}),
+        ...(peek ? { peekSlot: (clonePath: string, bound?: AuthorityReadBound) => peek.peekSlot(clonePath, bound) } : {}),
+        ...(peek?.peekAllSlots ? { peekAllSlots: (max: number, bound?: AuthorityReadBound) => peek.peekAllSlots!(max, bound) } : {}),
         ...(peek?.inspectMaintenance ? { inspectMaintenance: (id: string) => peek.inspectMaintenance!(id) } : {}),
       }), ctx.hardPass));
     } catch (error) { rethrow(error); local = unknownRetention("classifier"); }

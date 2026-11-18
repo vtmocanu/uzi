@@ -66,7 +66,7 @@ function contract(text: string): void {
   // The scratch dependencies are passed after the runtime TMPDIR was restored (restore < shadow above) and
   // carry no scratch gate sentinel or test seam.
   assert.match(main.slice(shadow, admission),
-    /scratch: buildPodEpochScratchDeps\(\{\s*git, dockerHost: config.dockerWiring.dockerHost, activation: epochScratchDeletion,\s*authority: \{\s*peekSlot: clonePath => authority\.peekSlot\(clonePath\), peekAllSlots: max => authority\.peekAllSlots\(max\),\s*inspectMaintenance: runId => new RecoveryMaintenance\(\{\s*root: path\.join\(config\.dataDir, "recovery-maintenance"\), workerToken: config\.workerToken,\s*\}\)\.inspectRun\(runId\),\s*\}, outbox,\s*\}\)/,
+    /scratch: buildPodEpochScratchDeps\(\{\s*git, dockerHost: config.dockerWiring.dockerHost, activation: epochScratchDeletion,\s*authority: \{\s*peekSlot: \(clonePath, bound\) => authority\.peekSlot\(clonePath, bound\), peekAllSlots: \(max, bound\) => authority\.peekAllSlots\(max, bound\),\s*inspectMaintenance: runId => new RecoveryMaintenance\(\{\s*root: path\.join\(config\.dataDir, "recovery-maintenance"\), workerToken: config\.workerToken,\s*\}\)\.inspectRun\(runId\),\s*\}, outbox,\s*\}\)/,
     "the pass receives the production scratch dependencies, including the read-only authority slot accessors, the authenticated maintenance reader and the outbox");
   assert.ok(!main.includes("scratchTestGate") && !main.includes("seams"), "main never passes the scratch test gate or seams");
   const cancellation = at("if (controller.signal.aborted) {");

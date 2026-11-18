@@ -36,7 +36,7 @@ import { absorbBareConfigValue, classifyScratchSettlement, isNeverRemovedScratch
 import {
   ENDED, activeRetention, classifyRunDataDirRecords, isRunUuid, judgeAuthoritySlot, judgeRetainedEvidence, judgeRunRefListing, unknownRetention, type MaintenanceInspection, type RunRetention,
 } from "./pod-epoch-run-retention.js";
-import type { SlotSnapshot } from "./completion-authority.js";
+import type { AuthorityReadBound, SlotSnapshot } from "./completion-authority.js";
 import { classifyForgeError, withForgeRetry } from "./forge-retry.js";
 import { RunDiskLocks } from "./run-disk-locks.js";
 import {
@@ -2717,13 +2717,13 @@ export interface EpochScratchRunRetentionOptions {
   /** Absolute wall-clock deadline. */
   deadline: number;
   /** Read-only authority slot accessor (AuthorityRuntime.peekSlot); absent makes a retired entry unknown. */
-  peekSlot?: (clonePath: string) => Promise<SlotSnapshot | null>;
+  peekSlot?: (clonePath: string, bound?: AuthorityReadBound) => Promise<SlotSnapshot | null>;
   /** Pass-scoped memo of the worker-wide retained census, so N run leaves cost one census. */
   discovery?: { value?: Promise<EpochRetainedDiscoveryResult> };
   /** Pass-scoped memo of each bare's `config --local --null --list` text (keyed by bare path), so N run leaves read each bare once. */
   memo?: { bareConfigs?: Map<string, Promise<string>>; slots?: Promise<SlotSnapshot[]> };
   /** Read-only, bounded enumeration of every authority slot (AuthorityRuntime.peekAllSlots); absent makes the run unknown (`authority_inventory`). */
-  peekAllSlots?: (max: number) => Promise<SlotSnapshot[]>;
+  peekAllSlots?: (max: number, bound?: AuthorityReadBound) => Promise<SlotSnapshot[]>;
   /** The authenticated recovery-maintenance read (RecoveryMaintenance.inspectRun); absent makes a present maintenance store unknown. */
   inspectMaintenance?: (runId: string) => Promise<MaintenanceInspection>;
 }
@@ -5113,7 +5113,7 @@ export class GitCache {
       if (footprint === "unknown") return unknownRetention("attempt_footprint");
       if (!opts.peekSlot) return unknownRetention("authority_slot");
       let slot: SlotSnapshot | null;
-      try { slot = await this.retainedIO(() => opts.peekSlot!(entry.clonePath)); }
+      try { slot = await this.retainedIO(() => opts.peekSlot!(entry.clonePath, { signal: opts.signal, deadline: opts.deadline })); }
       catch { this.checkRecoveryInterruption(); return unknownRetention("authority_slot"); }
       const judged = judgeAuthoritySlot(footprint, slot);
       if (judged.state !== "ended") return judged;
@@ -5129,9 +5129,10 @@ export class GitCache {
     if (!opts.peekAllSlots) return unknownRetention("authority_inventory");
     let slots: SlotSnapshot[];
     try {
+      const bound = { signal: opts.signal, deadline: opts.deadline };
       const inventory = opts.memo
-        ? (opts.memo.slots ??= this.retainedIO(() => opts.peekAllSlots!(limits.maxDirectoryEntries)))
-        : this.retainedIO(() => opts.peekAllSlots!(limits.maxDirectoryEntries));
+        ? (opts.memo.slots ??= this.retainedIO(() => opts.peekAllSlots!(limits.maxDirectoryEntries, bound)))
+        : this.retainedIO(() => opts.peekAllSlots!(limits.maxDirectoryEntries, bound));
       slots = await inventory;
     } catch { this.checkRecoveryInterruption(); return unknownRetention("authority_inventory"); }
     for (const slot of slots) {

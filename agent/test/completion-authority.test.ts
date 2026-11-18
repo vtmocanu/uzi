@@ -10,7 +10,7 @@ import {
   acquireWorkerLifetime, AuthorityRefusal, type AuthorityTransaction, withAuthorityTransaction, type WorkerLifetime,
 } from "../src/authority-lock.js";
 import {
-  type AuthorityFsOps, AuthorityStore, installWorkerLifetime, leaseEpoch, leaseHarness, leaseSlotKey, openAuthorityStore,
+  type AuthorityFsOps, type AuthorityReadBound, AuthorityStore, installWorkerLifetime, leaseEpoch, leaseHarness, leaseSlotKey, openAuthorityStore,
   peekAllAuthoritySlots, peekAuthoritySlot, requireWorkerLifetime, SourceUseLease, type SlotSnapshot,
 } from "../src/completion-authority.js";
 import { buildClaudeSourceCore, buildCodexSourceCore, type CompletionSourceV2, sourceCoreDigest } from "../src/completion-source.js";
@@ -1558,6 +1558,251 @@ test("peekAllAuthoritySlots refuses a head-recorded slot whose file or whole slo
     if (mode === "file") assert.deepEqual(fs.readdirSync(slotsDir(f)), [], mode);
     else assert.equal(fs.existsSync(slotsDir(f)), false, mode);
   }
+});
+
+// ---- issue #4420 CR3: the inventory read honours the pass's signal and deadline between fs operations ----
+
+interface FsHold { op: string; path: string; nth: number }
+
+/**
+ * Test-side instrumentation only: wraps the fs/promises namespace functions, the FileHandle prototype and the 25 ms retry
+ * timer; every wrapper records the call, really starts the real operation, and for the one chosen (op, path, nth) holds the
+ * real result behind a gate until `release()`.
+ */
+function instrumentFs(hold: FsHold) {
+  const log: Array<{ op: string; path: string }> = [];
+  const counts = new Map<string, number>();
+  const handlePaths = new WeakMap<object, string>();
+  const state = { recording: true, opened: 0, closed: 0, heldIndex: -1 };
+  let release!: () => void;
+  const released = new Promise<void>((resolve) => { release = resolve; });
+  let reachedResolve!: () => void;
+  const reached = new Promise<void>((resolve) => { reachedResolve = resolve; });
+  let done = false;
+  const note = (op: string, p: string): Promise<void> | undefined => {
+    log.push({ op, path: p });
+    const k = `${op}\0${p}`;
+    const n = (counts.get(k) ?? 0) + 1;
+    counts.set(k, n);
+    if (!done && op === hold.op && p === hold.path && n === hold.nth) {
+      done = true;
+      state.heldIndex = log.length - 1;
+      reachedResolve();
+      return released;
+    }
+    return undefined;
+  };
+  type AnyFn = (this: unknown, ...args: unknown[]) => Promise<unknown>;
+  const ns = fsp as unknown as Record<string, AnyFn>;
+  const originals: Array<() => void> = [];
+  const patch = (target: Record<string, unknown>, name: string, wrap: (real: AnyFn) => AnyFn): void => {
+    const real = target[name] as AnyFn;
+    target[name] = wrap(real);
+    originals.push(() => { target[name] = real; });
+  };
+  const start = (real: AnyFn, self: unknown, args: unknown[]): Promise<unknown> => {
+    const pending = real.apply(self, args);
+    pending.catch(() => undefined);
+    return pending;
+  };
+  return {
+    log, state, release, reached,
+    async install(): Promise<void> {
+      const probe = await fsp.open(process.execPath, "r");
+      const handleProto = Object.getPrototypeOf(probe) as Record<string, unknown>;
+      await probe.close();
+      for (const name of ["lstat", "readdir", "realpath"]) {
+        patch(ns, name, (real) => async function (this: unknown, ...args: unknown[]) {
+          const gated = state.recording ? note(name, String(args[0])) : undefined;
+          const pending = start(real, this, args);
+          if (gated) await gated;
+          return pending;
+        });
+      }
+      patch(ns, "open", (real) => async function (this: unknown, ...args: unknown[]) {
+        const p = String(args[0]);
+        const gated = state.recording ? note("open", p) : undefined;
+        const pending = start(real, this, args);
+        if (gated) await gated;
+        const handle = await pending as object;
+        if (state.recording) {
+          handlePaths.set(handle, p);
+          state.opened++;
+          // close is an own (instance) member of a FileHandle on this Node, so it is wrapped per handle, not on the prototype.
+          const realClose = (handle as { close: AnyFn }).close;
+          (handle as { close: AnyFn }).close = function (this: unknown, ...a: unknown[]) {
+            state.closed++;
+            log.push({ op: "close", path: p });
+            return realClose.apply(handle, a);
+          } as AnyFn;
+        }
+        return handle;
+      });
+      for (const name of ["read", "stat"]) {
+        patch(handleProto, name, (real) => function (this: unknown, ...args: unknown[]) {
+          const tracked = state.recording && handlePaths.has(this as object);
+          const gated = tracked ? note(name, handlePaths.get(this as object)!) : undefined;
+          const pending = start(real, this, args);
+          return gated ? gated.then(() => pending) : pending;
+        });
+      }
+      const realSet = globalThis.setTimeout;
+      globalThis.setTimeout = ((cb: (...a: unknown[]) => void, ms?: number, ...rest: unknown[]) => {
+        if (state.recording && ms === 25) {
+          const gated = note("sleep", "");
+          if (gated) return realSet(() => { void gated.then(() => cb(...rest)); }, ms);
+        }
+        return realSet(cb, ms, ...rest);
+      }) as unknown as typeof setTimeout;
+      originals.push(() => { globalThis.setTimeout = realSet; });
+      syncBuiltinESMExports();
+    },
+    restore(): void {
+      state.recording = false;
+      release();
+      for (const undo of originals.splice(0).reverse()) undo();
+      syncBuiltinESMExports();
+    },
+  };
+}
+
+type PeekRun = (bound: AuthorityReadBound | undefined) => Promise<unknown>;
+interface InterruptScenario { name: string; hold: (f: Fixture) => FsHold; setup: (f: Fixture) => Promise<PeekRun> }
+
+const headsDirOf = (f: Fixture): string => path.join(authorityDir(f), "heads");
+const inventory = (f: Fixture): PeekRun => (bound) => peekAllAuthoritySlots({ dataDir: f.root, workerToken: f.token }, 16, bound);
+
+async function twoSlots(f: Fixture): Promise<PeekRun> {
+  const s = await store(f);
+  await tx(f, (t2) => s.admitSourceUse(t2, source(f, "runner/qa")));
+  await tx(f, (t2) => s.admitSourceUse(t2, source(f, "runner/qb")));
+  return inventory(f);
+}
+/** A slot one ahead of its head: the slot rename landed, the head update failed (the crash window). */
+async function aheadSlot(f: Fixture): Promise<string> {
+  const src = source(f, "runner/qa");
+  const flags = { head: false };
+  const s = await store(f, {
+    ops: {
+      syncFile: (h) => h.sync(), syncDir: (h) => h.sync(),
+      rename: async (a, b) => {
+        if (flags.head && path.basename(path.dirname(b)) === "heads") throw new Error("injected head failure");
+        fs.renameSync(a, b);
+      },
+    },
+  });
+  flags.head = true;
+  await assert.rejects(tx(f, (t2) => s.admitSourceUse(t2, src)), /injected head failure/);
+  return src;
+}
+
+const INTERRUPT_SCENARIOS: InterruptScenario[] = [
+  { name: "the canonical-root realpath", hold: (f) => ({ op: "realpath", path: f.root, nth: 1 }), setup: twoSlots },
+  { name: "the enrollment read", hold: (f) => ({ op: "read", path: enrollmentFile(f), nth: 1 }), setup: twoSlots },
+  { name: "a heads guard open inside readHead", hold: (f) => ({ op: "open", path: headsDirOf(f), nth: 3 }), setup: twoSlots },
+  { name: "a heads guard stat inside readHead", hold: (f) => ({ op: "stat", path: headsDirOf(f), nth: 3 }), setup: twoSlots },
+  { name: "a guard check() lstat", hold: (f) => ({ op: "lstat", path: headsDirOf(f), nth: 6 }), setup: twoSlots },
+  { name: "the requireCompleteHeads readdir", hold: (f) => ({ op: "readdir", path: headsDirOf(f), nth: 1 }), setup: twoSlots },
+  { name: "the slots directory lstat", hold: (f) => ({ op: "lstat", path: slotsDir(f), nth: 1 }), setup: twoSlots },
+  { name: "the slots directory readdir", hold: (f) => ({ op: "readdir", path: slotsDir(f), nth: 1 }), setup: twoSlots },
+  {
+    name: "a read of a slot file", setup: twoSlots,
+    hold: (f) => ({ op: "read", path: path.join(slotsDir(f), `${fs.readdirSync(slotsDir(f)).sort()[0]}`), nth: 1 }),
+  },
+  {
+    name: "the final stat of the last slot (inventory)",
+    hold: (f) => ({ op: "stat", path: path.join(slotsDir(f), fs.readdirSync(slotsDir(f))[0]!), nth: 2 }),
+    setup: async (f) => {
+      const s = await store(f);
+      await tx(f, (t2) => s.admitSourceUse(t2, source(f, "runner/qa")));
+      return inventory(f);
+    },
+  },
+  {
+    name: "the final stat of the slot (peekAuthoritySlot)",
+    hold: (f) => ({ op: "stat", path: path.join(slotsDir(f), fs.readdirSync(slotsDir(f))[0]!), nth: 2 }),
+    setup: async (f) => {
+      const s = await store(f);
+      const src = source(f, "runner/qa");
+      await tx(f, (t2) => s.admitSourceUse(t2, src));
+      return (bound) => peekAuthoritySlot({ dataDir: f.root, workerToken: f.token }, src, bound);
+    },
+  },
+  {
+    name: "an ancestor lstat of peekAuthoritySlot",
+    hold: (f) => ({ op: "lstat", path: path.join(f.root, "runner"), nth: 1 }),
+    setup: async (f) => {
+      await store(f);
+      const src = source(f, "runner/deep/qa");
+      return (bound) => peekAuthoritySlot({ dataDir: f.root, workerToken: f.token }, src, bound);
+    },
+  },
+  {
+    name: "the retry sleep (inventory)", hold: () => ({ op: "sleep", path: "", nth: 1 }),
+    setup: async (f) => { await aheadSlot(f); return inventory(f); },
+  },
+  {
+    name: "the retry sleep (peekAuthoritySlot)", hold: () => ({ op: "sleep", path: "", nth: 1 }),
+    setup: async (f) => {
+      const src = await aheadSlot(f);
+      return (bound) => peekAuthoritySlot({ dataDir: f.root, workerToken: f.token }, src, bound);
+    },
+  },
+];
+
+for (const scenario of INTERRUPT_SCENARIOS) {
+  for (const mode of ["abort", "deadline"] as const) {
+    test(`an interrupted authority read (${mode}) during ${scenario.name} rejects only after the held operation settles`, async (t) => {
+      const f = await fixture(t);
+      const run = await scenario.setup(f);
+      const ins = instrumentFs(scenario.hold(f));
+      await ins.install();
+      t.after(() => ins.restore());
+      const controller = new AbortController();
+      const bound: AuthorityReadBound = { signal: controller.signal, deadline: Number.MAX_SAFE_INTEGER };
+      const pending = run(bound);
+      let settled = false;
+      pending.then(() => { settled = true; }, () => { settled = true; });
+      try {
+        await Promise.race([
+          ins.reached,
+          new Promise<void>((_, reject) => setTimeout(() => reject(new Error("the held operation was never reached")), 5000)),
+        ]);
+        if (mode === "abort") controller.abort();
+        else {
+          bound.deadline = Date.now() + 20;
+          await new Promise((resolve) => setTimeout(resolve, 60));
+          assert.ok(Date.now() >= bound.deadline, "the deadline has passed while the operation is held");
+        }
+        for (let i = 0; i < 8; i++) await new Promise((resolve) => setImmediate(resolve));
+        assert.equal(settled, false, "the accessor never returns while the started operation is still in flight");
+      } finally { ins.release(); }
+      await assert.rejects(pending, /authority read interrupted/);
+      const started = ins.log.slice(ins.state.heldIndex + 1).filter((r) => r.op !== "close");
+      assert.deepEqual(started, [], "no operation starts after the held one");
+      assert.equal(ins.state.closed, ins.state.opened, "every opened handle was closed");
+      ins.restore();
+    });
+  }
+}
+
+test("an uninterrupted bounded authority read returns exactly what the unbounded read returns", async (t) => {
+  const f = await fixture(t);
+  const s = await store(f);
+  const a = source(f, "runner/qa");
+  await tx(f, (t2) => s.admitSourceUse(t2, a));
+  await tx(f, (t2) => s.admitSourceUse(t2, source(f, "runner/qb")));
+  const bound = (): AuthorityReadBound => ({ signal: new AbortController().signal, deadline: Date.now() + 60_000 });
+  const options = { dataDir: f.root, workerToken: f.token };
+  assert.deepEqual(await peekAllAuthoritySlots(options, 16, bound()), await peekAllAuthoritySlots(options, 16));
+  assert.equal((await peekAllAuthoritySlots(options, 16, bound())).length, 2);
+  assert.deepEqual(await peekAuthoritySlot(options, a, bound()), await peekAuthoritySlot(options, a));
+  assert.ok(await peekAuthoritySlot(options, a, bound()));
+  // An already-aborted or already-expired bound refuses before any read.
+  const aborted = new AbortController();
+  aborted.abort();
+  await assert.rejects(peekAllAuthoritySlots(options, 16, { signal: aborted.signal, deadline: Date.now() + 60_000 }), /authority read interrupted/);
+  await assert.rejects(peekAuthoritySlot(options, a, { signal: new AbortController().signal, deadline: Date.now() - 1 }), /authority read interrupted/);
 });
 
 test("a fresh epoch over a live publication needs the explicit consuming purpose; nothing else mints one", async (t) => {

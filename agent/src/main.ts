@@ -1288,7 +1288,7 @@ async function mainBody(): Promise<void> {
       scratch: buildPodEpochScratchDeps({
         git, dockerHost: config.dockerWiring.dockerHost, activation: epochScratchDeletion,
         authority: {
-          peekSlot: clonePath => authority.peekSlot(clonePath), peekAllSlots: max => authority.peekAllSlots(max),
+          peekSlot: (clonePath, bound) => authority.peekSlot(clonePath, bound), peekAllSlots: (max, bound) => authority.peekAllSlots(max, bound),
           inspectMaintenance: runId => new RecoveryMaintenance({
             root: path.join(config.dataDir, "recovery-maintenance"), workerToken: config.workerToken,
           }).inspectRun(runId),
