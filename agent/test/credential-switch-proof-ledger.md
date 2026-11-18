@@ -2550,7 +2550,7 @@ to compile (`declared and not used: hash`,
 named the rollback commit leaf in a top-level alternation that `-run` does not
 match, so only the bundle half ran there (the commit leaf was re-run as
 u10-return-before-commit-rollback). The `capabilityEpoch <= 0` / empty
-material check before journalling (:66–68) and the journal insert's own errors
+material check before journalling (:65–67) and the journal insert's own errors
 are not controlled. Revocation of A's capability is the epoch bump plus the new
 hash; the epoch and hash guards that refuse A are credited by B5/B6, and
 u10-mint-hash credits that the new hash is what is persisted.
