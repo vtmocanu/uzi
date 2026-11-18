@@ -2326,7 +2326,7 @@ New tests:
   UPDATE on the alias state row or the user_secrets row; apply must be an empty
   busy decision with no writes and an unchanged account/intent/alias snapshot,
   and the same request then applies. Apply's transaction runs through
-  `codexLockTimeoutBeginner` (:76–100), a test-only `SET LOCAL lock_timeout =
+  `codexLockTimeoutBeginner` (:77–102), a test-only `SET LOCAL lock_timeout =
   '1s'` issued right after the service's isolation statement: NOWAIT refusals
   are unaffected, and a mutant that would wait on a held row fails at the busy
   assertion with SQLSTATE 55P03 instead of the test deadline.
