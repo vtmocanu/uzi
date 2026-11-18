@@ -32877,7 +32877,10 @@ describe("M2 actualRunner credential replacement", () => {
           applyRequests.push({ claimGeneration: req.claimGeneration, opId: req.opId });
           applies++;
           if (reapUnproven) forbiddenUnprovenApply.resolve();
-          if (publication === "baseline") events.push("apply");
+          if (publication === "baseline") {
+            events.push("apply");
+            aCredentialAtApply = { ...aCredentialCalls };
+          }
           if (successorEpochAdvance) {
             if (applies > 1) forbiddenSuccessorApply.resolve();
             assert.equal(applies, 1, "successor apply is forbidden after READY advances the latched epoch");
@@ -33181,6 +33184,17 @@ describe("M2 actualRunner credential replacement", () => {
         };
         const release = rig.client.releaseCodex.bind(rig.client);
         let credentialReleases = 0, credentialRefreshes = 0, bCredentialReleases = 0;
+        // A-capability credential API calls; the drain probe's armed refresh is a worker callback, not counted.
+        const aCredentialCalls = { releases: 0, refreshes: 0 };
+        type ACredentialCalls = typeof aCredentialCalls;
+        let aCredentialInReconcile: ACredentialCalls | undefined;
+        let aCredentialAtTeardown: ACredentialCalls | undefined;
+        let aCredentialAtApply: ACredentialCalls | undefined;
+        let aCredentialAfterReconcile: ACredentialCalls | undefined;
+        const assertNoACredentialCallBetweenTeardownAndApply = () => {
+          assert.deepEqual(aCredentialAtApply, aCredentialAtTeardown,
+            "no A credential call between teardown entry and apply");
+        };
         let retainedAReconcile: import("../src/codex/safety.js").ReconcileBeforeBoundary | undefined;
         let retainedBoundaryActive = false, retainedBoundaryReleasedA = false;
         const retiredBoundaries: { result: string; releaseCalls: number; releasedA: boolean }[] = [];
@@ -33206,6 +33220,7 @@ describe("M2 actualRunner credential replacement", () => {
           }
           if (resumeVariant && applies > 0) assert.equal(req.capability, next.capability, "A auth never revives after apply");
           credentialReleases++;
+          if (req.capability === oldClaim.capability) aCredentialCalls.releases++;
           if (retainedBoundaryActive && req.capability === oldClaim.capability) retainedBoundaryReleasedA = true;
           if (req.capability === next.capability) bCredentialReleases++;
           return req.capability === next.capability ? { access_token: next.access_token } : release(id, req);
@@ -33261,6 +33276,7 @@ describe("M2 actualRunner credential replacement", () => {
           }
           if (resumeVariant && applies > 0) assert.equal(req.capability, next.capability, "no A refresh after apply");
           credentialRefreshes++;
+          if (req.capability === oldClaim.capability) aCredentialCalls.refreshes++;
           if (req.capability !== next.capability) return refresh(id, req);
           ordinaryBRefreshes++;
           bRefreshExpected.push(expected);
@@ -33327,6 +33343,14 @@ describe("M2 actualRunner credential replacement", () => {
         const assertAReconcileBeforeTeardown = () => {
           assert.deepEqual(aReconcileAtTeardown, { calls: 1, outcomes: ["ready"] },
             "real A credential reconcile completes ready exactly once before teardown can revoke A");
+          // Executor reconcileA calls the run-lane reconcile once: a subscription A sends one refreshCodex
+          // (retained operation_id), an api_key A one fresh releaseCodex; neither mode does the other's call.
+          const expectedInReconcile = oldClaim.auth_mode === "subscription"
+            ? { releases: 0, refreshes: 1 } : { releases: 1, refreshes: 0 };
+          assert.deepEqual(aCredentialInReconcile, expectedInReconcile,
+            `real A credential reconcile (${oldClaim.auth_mode === "subscription" ? "subscription refresh" : "api_key release"}) runs inside reconcileA before teardown`);
+          assert.deepEqual(aCredentialAtTeardown, aCredentialAfterReconcile,
+            "no A credential call between reconcileA completion and teardown entry");
           const order = ["A-reconcile-start", "A-reconcile-ready", "A-persist", "preflight", "A-teardown-entry"];
           for (const [index, event] of order.entries()) {
             assert.ok(events.includes(event), `observed ${event}`);
@@ -33369,7 +33393,11 @@ describe("M2 actualRunner credential replacement", () => {
             reconcileA: publication === "baseline" ? async function (this: unknown, ...args: Parameters<typeof lease.reconcileA>) {
               aReconcileCalls++;
               events.push("A-reconcile-start");
+              const before = { ...aCredentialCalls };
               const result = await Reflect.apply(lease.reconcileA, this, args);
+              aCredentialInReconcile = { releases: aCredentialCalls.releases - before.releases,
+                refreshes: aCredentialCalls.refreshes - before.refreshes };
+              aCredentialAfterReconcile = { ...aCredentialCalls };
               aReconcileOutcomes.push(result.kind);
               events.push(`A-reconcile-${result.kind}`);
               return result;
@@ -33392,6 +33420,7 @@ describe("M2 actualRunner credential replacement", () => {
               if (publication === "baseline") {
                 // Snapshot before the production lease retires authority; assert outside Runner's catch paths.
                 aReconcileAtTeardown = { calls: aReconcileCalls, outcomes: [...aReconcileOutcomes] };
+                aCredentialAtTeardown = { ...aCredentialCalls };
                 events.push("A-teardown-entry");
                 aTeardownEntered.resolve();
               }
@@ -35256,6 +35285,7 @@ describe("M2 actualRunner credential replacement", () => {
           });
           if (publication === "baseline") {
             assertAReconcileBeforeTeardown();
+            assertNoACredentialCallBetweenTeardownAndApply();
             assert.equal(aReconcileCalls, 1, "B stale-boundary probe does not count as switch reconciliation");
             assert.deepEqual(aReconcileOutcomes, ["ready"]);
             assert.ok(events.includes("apply"));
