@@ -426,11 +426,11 @@ control is still absent, not that the functional criterion was deferred.
 | Stopped pending-input exclusion for eight named kinds in running and paused states | D controls: sixteen individually executed cases above; U14 credits the applied and superseded carve-outs, the stop-cutoff exemption, its kind restriction and its id boundary (running run; stop only); paused-run carve-out variants, cancel/reject_plan under the cutoff and the cutoff's run correlation not controlled |
 | Paused replay rejects expired wall budget | D: paused_expired_budget; U14 credits the running-clock arm, interactive and unstarted exemptions, extension, finalize and paused seconds, and the NULL-wall coalesce; chat/judge exemption unreachable; the RunTimeout value, the future-started_at clamp and the production default not controlled |
 | Paused replay uses original pause clock and performs no run update | D: paused_replay_original_clock and paused_replay_no_write |
-| Stopped registration nonce equality | D25–D56: running/paused registration_nonce_mismatch only; worker-latched bounds and other incarnation clauses unvalidated |
-| Stopped claim generation and unreleased claim | D25–D56: running/paused generation/release without reconciliation; ownership and other reconciliation paths unvalidated |
-| Stopped frozen secret and capability hash presence | D25–D56: running/paused missing_frozen_secret and missing_capability_hash; binding identity/ownership unvalidated |
+| Stopped registration nonce equality | D25–D56: running/paused registration_nonce_mismatch; U15 credits the worker-latched generation, epoch and nonce bounds (lower, upper, inclusive edges; nonce empty/length/NUL at the route, UTF-8 at the service entry) and worker identity (same-user foreign worker, four copies); a NULL snapshot nonce not controlled; resume/reclaim/re-registration are the withdrawn X/Y row |
+| Stopped claim generation and unreleased claim | D25–D56: running/paused generation/release without reconciliation; U15 credits the reconciliation path's generation and release refusals (two copies each, Go copy (b)) and worker ownership; the reconciled `*g <= 0` copy not controlled |
+| Stopped frozen secret and capability hash presence | D25–D56: running/paused missing_frozen_secret and missing_capability_hash; U15 credits binding ownership as the composite FK (b); binding identity beyond ownership has no predicate clause and stays unvalidated (owner batch) |
 | Stopped switch-request/generation, ordinary hold, pause-request/mode, stop-kind/reason and reserve-hold markers | D25–D56: individual running/paused marker cases; policy and other competing controls unvalidated |
-| Stopped refusal of claimed status | D25–D56: running/paused status_claimed; other statuses unvalidated |
+| Stopped refusal of claimed status | D25–D56: running/paused status_claimed; U15 credits refusal of queued, limit_wait, pool_wait, recovery_wait, completed, failed and cancelled (running origin) |
 | Stopped ownership, lane and policy fences | D57–D60 credit pending-fresh/unresolved-outcome; D61 paused policy-hold; D62/D63 stable user-owner mismatch running/paused. D64–D73 credit the five enumerated STOP lane exclusions running/paused; concurrent owner changes and other policy clauses unvalidated |
 | Stopped replay after withdrawn X/Y; resume/reclaim and incarnation changes | Unvalidated; the fixture's single HTTP withdrawal does not discharge X/Y |
 | Stopped preservation of binding, journals, session, gates, questions and custody without input consumption/time banking | E1 base-journal deletion, E2 applied-input deletion, E3 custody timestamp corruption, E4 owner-discard/live-reference loss, E5 direct paused-time credit, E6 applied-switch journal deletion only; other dispositions/effects, replay sensitivity and broader clauses unvalidated |
@@ -2973,3 +2973,115 @@ reconciliation writer normally marks superseded (milestone_reconciliation.go
 :584), a running run with NULL `started_at` has no known production writer, and
 `interactive` is set on an issue run; the predicate keys on none of these, so
 the controls stand, but the states are synthetic.
+
+### U15 — stopped bounds, ownership, reconciliation path, statuses and binding ownership (class (d), redundant-fence, (b))
+
+Candidate b52b38e6d9e573dda9663b12b32b9d06e709c948 adds
+api/internal/handler/codex_switch_stopped_authority_bounds_livedb_test.go
+(`TestWorkerCodexStoppedAuthorityBoundsRouteLiveDB`, 12 leaves;
+`TestWorkerCodexStoppedOwnershipRouteLiveDB`, 11 leaves) and extends
+api/internal/workersvc/codex_switch_stopped_test.go
+(`TestCodexSwitchStoppedAuthorityBounds`: empty, invalid UTF-8, NUL and
+129-byte nonces at the service entry). Every route leaf goes through the
+authenticated WorkerRoutes `/state` route and the pool transaction of
+`setupStoppedGuardsRoute`, after withdrawal, and asserts no write
+(`assertStoppedSnapshot`).
+
+a233 reference: the stopped settlement is new.
+`git show a233883de3c36bae2e940f999cd9d582889dad00:api/internal/workersvc/codex_switch_stopped.go`
+and `…:api/internal/store/queries/codex_switch_stopped.sql` do not exist, and
+a233's worker_state_decode.go has no `codex_switch_stopped` branch, so the
+bounds, reconciliation-path, status and worker-join controls are class (d).
+Three seams are identical at a233 and are recorded as (b) preservation
+controls: `validateReconciledGeneration` (milestone_reconciliation.go:343 at
+both), the worker filters of `GetRunOwnedByWorkerForUpdate` /
+`GetRunOwnedByWorker` (runtime.sql.go :8290 / :8027 at a233), and the
+composite binding foreign key (00202_run_codex_binding.sql:73–74 at both).
+
+Copy census (search: `grep -rn 9007199254740991 api/internal --include=*.go`
+excluding tests, plus the stopped path read from the decoder through
+`stopCodexSwitch`; exhaustive for that path):
+- claim_generation / expected_epoch bounds: decoder
+  worker_state_decode.go:52–53 and service codex_switch_stopped.go:22–23 (two
+  copies; `validateReconciledGeneration`'s `*g <= 0` is a third lower-bound
+  copy only when a reconciliation exists, which these leaves do not have);
+- empty nonce: decoder :53 `req.RegisterNonce == ""` and service :24
+  `validHoldRegisterNonce` (`nonce != ""`, credential_switch.go:576);
+- nonce length, NUL and UTF-8: service :24 only;
+- reconciled generation / release: `validateReconciledGeneration`
+  (milestone_reconciliation.go:343) and the stopped query
+  (codex_switch_stopped.sql.go:21);
+- worker identity: `GetRunOwnedByWorkerForUpdate` (runtime.sql.go:8535
+  candidates and :8558 final select, called from `beginClaimMutation`,
+  milestone_reconciliation.go:298), the stopped join (codex_switch_stopped.sql.go:19,
+  with `w.id = $2`), and `runOwnedByWorker` → `GetRunOwnedByWorker`
+  (service.go:6913, runtime.sql.go:8254; called at codex_switch_stopped.go:47
+  before commit);
+- status: the stopped query's IN list (codex_switch_stopped.sql.go:27) only;
+  `beginClaimMutation` reads no status.
+
+Command (export of b52b38e6d, throwaway postgres `cdr-4202-u15pg`; the FK
+control used a fresh `cdr-4202-u15fk`, since a migration edit applies only to
+an empty database), from the export's api directory:
+
+```sh
+GOFLAGS='-p=1 -buildvcs=false' GOMAXPROCS=4 go test -race -count=1 -timeout=6m \
+  ./internal/handler -run '^<Test>$/^<leaf regex>$' -v
+```
+
+(`./internal/workersvc -run '^TestCodexSwitchStoppedAuthorityBounds$'` for
+u15-utf8). Mutants and logs: `.uzi/scratch/ctl-logs/u15-*.{diff,log}`; each log
+ends `SHA=b52b38e6d… EXIT=1`. Bounds leaves report at
+codex_switch_stopped_authority_bounds_livedb_test.go:67 ("bounds mismatch");
+the ownership leaves at :82, :89 and :110 are `reportStoppedRoute` call sites
+("refusal mismatch"), :101 is "foreign worker refusal mismatch", :131 is the
+foreign_binding report.
+
+| Control | Class | Mutation | Leaf | Red |
+| --- | --- | --- | --- | --- |
+| u15-gen-lower | redundant-fence (2 copies) | `*req.ClaimGeneration <= 0 \|\|` removed in decoder and service | generation_zero, generation_negative | :67 "status=409 … want 400" (both) |
+| u15-gen-upper | redundant-fence (2 copies) | `\|\| *req.ClaimGeneration > 9007199254740991` removed in both | generation_unsafe | :67 "status=409 … want 400" |
+| u15-gen-edge | (d), both copies | `>` → `>=` in both | generation_max_safe | :67 "status=400 … want 409" |
+| u15-epoch-lower | redundant-fence (2 copies) | `*req.ExpectedEpoch <= 0 \|\|` removed in both | epoch_zero, epoch_negative | :67 "status=409 … want 400" (both) |
+| u15-epoch-upper | redundant-fence (2 copies) | `\|\| *req.ExpectedEpoch > 9007199254740991` removed in both | epoch_unsafe | :67 "status=409 … want 400" |
+| u15-epoch-edge | (d), both copies | `>` → `>=` in both | epoch_max_safe | :67 "status=400 … want 409" |
+| u15-nonce-empty | redundant-fence (2 copies) | decoder `\|\| req.RegisterNonce == ""` removed; service `!validHoldRegisterNonce(…)` → `len(req.RegisterNonce) > 128` | nonce_empty | :67 "status=409 … want 400" |
+| u15-nonce-length | (d) | service `!validHoldRegisterNonce(…)` → `req.RegisterNonce == ""` | nonce_over_128 | :67 "status=409 … want 400" |
+| u15-nonce-edge | (d) | `len(nonce) <= 128` → `< 128` (shared helper) | nonce_128 | :67 "status=400 … want 409" |
+| u15-nonce-nul | (d) | `strings.ContainsRune(…, 0)` → `(…, -1)` (never true) | nonce_nul | :67 "status=500 … want 400" |
+| u15-utf8 | (d), service entry | `!utf8.ValidString(req.RegisterNonce)` → `!utf8.ValidString("")` | TestCodexSwitchStoppedAuthorityBounds `"\xff"` | codex_switch_stopped_test.go:36 "semantic completion authority unavailable" |
+| u15-recon-generation | redundant-fence (2 copies; Go copy (b)) | `*g != r.ClaimGeneration \|\|` removed; SQL `r.claim_generation = $4::bigint` → `$4::bigint = $4::bigint` | reconciled_generation_mismatch | :82 "refusal mismatch: status=200 applied=true" |
+| u15-recon-released | redundant-fence (2 copies; Go copy (b)) | `\|\| r.ClaimReleasedAt.Valid` removed; SQL `AND r.claim_released_at IS NULL` removed | reconciled_claim_released | :89 "refusal mismatch: status=200 applied=true" |
+| u15-foreign-worker | redundant-fence (4 copies; query copies (b)) | both `runs.worker_id = $2` filters of GetRunOwnedByWorkerForUpdate and GetRunOwnedByWorker's `worker_id = $2` → `$2::uuid = $2::uuid`; stopped join `w.id = r.worker_id` → `true` | foreign_worker (same user, own nonce) | :101 "status=200 applied=true" |
+| u15-status | (d) | the stopped IN list removed | status_queued, _limit_wait, _pool_wait, _recovery_wait, _completed, _failed, _cancelled | :110 "refusal mismatch: status=200 applied=true" (all seven) |
+| u15-binding-fk | (b) preservation (schema) | 00202 FK `(user_id, codex_secret_id) → user_secrets(user_id, id)` → `(codex_secret_id) → user_secrets(id)` | foreign_binding | :131 "refusal mismatch: status=200 applied=true" |
+
+Unchanged candidate b52b38e6d: the two new tests plus
+`TestWorkerCodexStoppedGuardsRouteLiveDB` and
+`TestWorkerCodexStoppedAuthorityRouteLiveDB` pass (94 PASS lines, no FAIL or
+SKIP), `SHA=b52b38e6d… EXIT=0` (`.uzi/scratch/ctl-logs/u15-green.log`);
+`TestCodexSwitchStoppedAuthorityBounds` passes (`u15-unit-green.log`);
+`task lint:api` 0 issues (`u15-lint-api.log`). Runtime: the two new tests add
+18.7 s to the handler package (`ok … 18.699s`, `u15-first.log`, same worker,
+warm cache, one serial run); hosted effect on test-livedb-workersvc and
+test-api-store-it is unmeasured.
+
+Credit: the worker-latched bounds (generation and epoch lower, upper and the
+inclusive 2^53−1 edge; nonce non-empty, ≤128 bytes inclusive, no NUL, valid
+UTF-8 at the service entry); generation and release refusal on the
+reconciliation path; worker identity (a same-user foreign worker with its own
+current nonce); refusal of the seven statuses outside the live set and
+`claimed` (D); binding ownership as the composite foreign key, identical at
+a233 (the predicate checks presence only, so a foreign binding is refused by
+being unrepresentable).
+
+Not credited: the redundant copies individually (no single-copy mutant was
+run; each copy's removal alone is expected to be masked); the NUL guard's
+contribution is the typed 400 only, since without it Postgres rejects the NUL
+byte (500) and nothing is accepted; UTF-8 is controlled at the service entry,
+not the route (encoding/json substitutes U+FFFD); a NULL
+`snapshot_register_nonce`; a cross-user worker (D62/D63 cover the user-owner
+comparisons); `validateReconciledGeneration`'s `*g <= 0` copy; binding identity
+beyond ownership (the alias relinked to another provider account) — the
+stopped predicate has no such clause, settlement reads and releases no
+material, and this stays unvalidated for the owner batch.
