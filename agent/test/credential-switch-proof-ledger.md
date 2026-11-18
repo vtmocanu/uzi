@@ -413,7 +413,7 @@ control is still absent, not that the functional criterion was deferred.
 | Same successful flight/generation/worktree with no new attempt, custody or release/reclaim | U2 effect-injection sensitivity controls (owner-extended decision 10, U2 only): claimRun, attempt directory, custody release, queued transition, worktree reassignment, through the real Runner success test; other effects and the fresh_B return not separately controlled |
 | Strict usable persistence, clear confirmation and continuation on A before teardown | R1–R4 credit three failed-save/inspection variants and empty applied-ACK; U3 credits op mismatch, target, claim_released ownership before/after, combined nonce fence and no-remaining-pending guards; pending-absent-before, other ownership legs, lost-reply clear and reopen's other guards not controlled |
 | Proven A root/tool reap before B material, login and model work; fresh CODEX_HOME | R5 (runner hold) and U4: executor reap proof for root and command-root failures, combined no-B-before-reap fence, distinct per-epoch HOME (b); in-flight tool callbacks, launcher must-not-exist and other phases not controlled |
-| Whole operation-scope/refresh/identity/capability/summary replacement and retired-A rejection | A2 one reader; A3 scope namespace; R7 B dispatcher readiness; R8 retired API-key A reconcile fence; U5 retired A refresh bridge pre-call refusal (P3), combined executor summary-guard refusal, B expected identity carried (b); A-account rejection, bridge post-call copy, assertRefreshAdmission and Now stale-result drops not separately controlled |
+| Whole operation-scope/refresh/identity/capability/summary replacement and retired-A rejection | A2 one reader; A3 scope namespace; R7 B dispatcher readiness; U20 executor switch admission (B preparation child) and B refresh suspension until finishB, Now/summary gating during publication not credited (layered, masked); R8 retired API-key A reconcile fence; U5 retired A refresh bridge pre-call refusal (P3), combined executor summary-guard refusal, B expected identity carried (b); A-account rejection, bridge post-call copy, assertRefreshAdmission and Now stale-result drops not separately controlled |
 | Exact saved-ID resume; confirmed-refusal-only fresh fallback and lineage; preservation re-hold | R6 uncertain-error classification; U6 resume carries the saved id, lineage notice, three-copy preserve re-hold, crash missing-id disclosure (d) and preserve retained refusal with a saved conversation (b); confirmed-refusal classification (timeout), :4148 check and session_missing on the switch path not controlled |
 | Policy episode rejection at request and under apply lock | D74–D77 owner request and post-READY apply; U7 episode starting before preflight (both arms); hold arm unreachable in live statuses by `runs_policy_hold_shape`, paused hold refused by status (u1-status1); concurrent lock-order contention not controlled |
 | Refresh lease/intent exclusion, account lock ordering and boundary reconciliation before revoke | D78/D79 credit isolated A coordination-lease and rotating-intent server checks; U8 credits alias and enablement (old/target) lock presence and NOWAIT keyword, the account lock and its NOWAIT against a reverse-order writer, the busy mapping, intent count/lock (A's account) and real admitted-refresh lease/intent redundant fences, and the executor A reconcile inside reconcileA before teardown (c); per-account lock isolation, the target account's intent check, the refresh admission's binding recheck in isolation and global lock sorting not controlled |
@@ -3565,3 +3565,68 @@ owner set-token input (it carries a secret id, never material), and message
 and input injection on the stopped route (asserted, not injected). The
 redactors' own matching (`SecretSet`, the log scrubber) is outside this
 seam. m4 `scan:secrets` and `sast:semgrep` remain required.
+
+### U20 — publication ordering and admission gates (2026-11-18)
+
+Existing real Runner leaves in agent/test/codex-executor.test.ts ("M2 actualRunner
+credential replacement"): the two "… publication gates Now, retired A and B
+preparation children; finished B root dispatch admits work" leaves, the eleven
+"… partial B publication never reopens A (<stage>)" leaves (injected failure
+at each publication stage), "Codex subscription startup refresh stays deferred
+until B finish", and the six baseline leaves. At every publication barrier
+(scope clear/install, executor publication, Now publication, B preparation,
+login, prepared) they already try Now, the retired A refresh bridge, the
+retained A root dispatch, a retired-broker child, the newly installed B
+context dispatcher before finishB, and a B-preparation child.
+
+Candidate c85f434e73fd6aff8b1c8cb49bb261c91a66922e adds the missing Now probe
+("Codex switch publication keeps Now refresh and child dispatch gated", a
+comment and the existing assertion "ordinary Now cannot construct a
+half-published harness"): at each barrier the test advances the Runner clock
+past Now's 5-minute minimum interval (`NOW_MIN_INTERVAL_MS`, now-summary.ts:57),
+triggers Now, and lets a zero-delay timer run before the check.
+
+a233 reference: a233883de3c36bae2e940f999cd9d582889dad00's
+agent/src/codex/codex-executor.ts has neither `switchAdmissionClosed` nor
+`suspendRefreshAdmission` (`grep -c` is 0), so the controls are class (d).
+
+Command: `.uzi/scratch/u8tools/actl.sh` (export, `npm run typecheck`, then
+`node --import tsx --test --test-timeout=120000 --test-name-pattern='publication gates Now|startup refresh stays deferred until B finish|partial B publication never reopens A' test/codex-executor.test.ts`,
+18 leaves). Diffs and logs `.uzi/scratch/ctl-logs/u20-*.{diff,log}`.
+
+| Control | Class | Mutation | Result |
+| --- | --- | --- | --- |
+| u20-exec-admission | (d), at 8a0d54655 | executor admission check codex-executor.ts:2509 `if (this.switchAdmissionClosed && (!construction \|\| construction !== this.switchBuildAuthority)) throw` → `if (false && …)` | EXIT=1, 6 of 18 red: both gated leaves, three partial-publication leaves and the deferred-refresh leaf, at "B preparation child sends no ordinary request at login" (:34427) |
+| u20-b-refresh | (d), at 8a0d54655 | B's refresh suspension during preparation (:4164) `replacementRefresh = fresh.harness.suspendRefreshAdmission();` → `replacementRefresh = undefined;` | EXIT=1, 1 of 18 red: the deferred-refresh leaf, at "startup refresh remains deferred through full B preparation" (:33471) |
+| u20-exec-summary-switch | not credited, at 8a0d54655 | the `!this.switchAdmissionClosed` term of `summaryAllowed` (:3302–3303) removed | EXIT=0, 18 pass (masked) |
+| u20-exec-summary-both | not credited, at 8a0d54655 and again at c85f434e7 | both `!this.summaryLifecycleClosed` and `!this.switchAdmissionClosed` removed from `summaryAllowed` | EXIT=0, 18 pass at both |
+| u20-summary-all | not credited, at 8a0d54655 | the two summaryAllowed terms, the summary guard `if (this.summaryLifecycleClosed) throw` (:2979) and Now's `!this.switchGate` removed together | EXIT=0, 18 pass |
+| u20-now-gate | not credited, at 8a0d54655 and c85f434e7 | Now's `!this.switchGate &&` (now-summary.ts:499) removed | EXIT=0, 18 pass at both |
+| u20-now-gate-lifecycle, u20-now-switch-gates | not credited (timeout reds), at c85f434e7 | switchGate removed together with the lifecycle-abort condition, or with that condition relaxed for a `CredentialSwitchSignal` abort | EXIT=1, but the three red leaves time out ("timed out waiting for M2 B usage and ordinary cancellation"); no assertion fires, so no credit |
+
+R7 (above) is the Runner's B dispatcher publication-readiness guard for the
+scope-replacement stage; it is unchanged here.
+
+Unchanged candidate c85f434e7: the 18 selected leaves plus the six baseline
+leaves pass (`ℹ pass 24`, `u20-green.log`, `SHA=c85f434e7… EXIT=0`); the same
+18 passed before the probe at 8a0d54655 (`u20-green-pre.log`, 20.9 s); agent
+`npm run lint` 0 warnings and 0 errors (`u20-lint-agent.log`). Runtime: the
+24-leaf run took 36.8 s, of which the six baseline leaves take about 12 s, so
+the probe adds a few seconds to the 18 leaves (estimated, not measured as a
+delta); hosted effect unmeasured.
+
+Credit: the executor's switch admission check refuses child and root work
+during B preparation except the replacement build itself, and B's refresh
+admission stays suspended until finishB (both (d)); R7 covers the B
+dispatcher's readiness.
+
+Not credited: Now and plan-summary gating during publication. The probes pass
+(Now builds nothing and no ordinary request is sent at any barrier), but no
+single or combined removal of `switchGate`, `summaryLifecycleClosed`,
+`switchAdmissionClosed` in `summaryAllowed` or the summary guard turns them
+red: at least one further layer (the Runner lifecycle abort during the switch,
+or the run-message batcher held for the credential switch keeping frames from
+Now) still holds, and the combined lifecycle mutants only time out. The new
+interval probe is therefore not shown to bite. The retired A root dispatch and
+retired-broker child refusals rest on the retired-authority guards (U5), not on
+these gates.
