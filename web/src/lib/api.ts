@@ -156,6 +156,10 @@ import type {
   TemplateAllocation,
   TemplateAllocationsInput,
   TemplateSkills,
+  RunEnvDeleteResult,
+  RunEnvList,
+  RunEnvVar,
+  RunEnvWriteInput,
   ToolAllowlistEntry,
   ToolAllowlistWriteInput,
   TriageCounts,
@@ -944,6 +948,32 @@ const realApi = {
     request<{ packages: string[] }>("PUT", `/repos/${repoId}/tool-profile`, {
       packages,
     }),
+
+  // Per-repo run environment variables (PRD #4416 M1). Owner-only; writes carry the
+  // CSRF header through request(). A secret's value is write-only.
+  listRepoEnv: (repoId: string) =>
+    request<RunEnvList>("GET", `/repos/${repoId}/env`),
+  putRepoEnv: (repoId: string, name: string, input: RunEnvWriteInput) =>
+    request<{ variable: RunEnvVar }>(
+      "PUT",
+      `/repos/${repoId}/env/${encodeURIComponent(name)}`,
+      input,
+    ),
+  disableRepoEnv: (repoId: string, name: string) =>
+    request<{ variable: RunEnvVar }>(
+      "POST",
+      `/repos/${repoId}/env/${encodeURIComponent(name)}/disable`,
+    ),
+  enableRepoEnv: (repoId: string, name: string) =>
+    request<{ variable: RunEnvVar }>(
+      "POST",
+      `/repos/${repoId}/env/${encodeURIComponent(name)}/enable`,
+    ),
+  deleteRepoEnv: (repoId: string, name: string) =>
+    request<RunEnvDeleteResult>(
+      "DELETE",
+      `/repos/${repoId}/env/${encodeURIComponent(name)}`,
+    ),
 
   // Forge integration.
   forgeConfig: () => request<ForgeConfig>("GET", "/forge/config"),

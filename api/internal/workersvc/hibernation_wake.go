@@ -144,8 +144,12 @@ func (s *Service) DemandWake(ctx context.Context, runID, workerID uuid.UUID) (De
 		return DemandWakeNone, ierr
 	}
 	res := DemandWakeAttached
-	if moveToWaking(&w, now, "demand: run "+runID.String()) {
-		res = DemandWakeWoke
+	wasWaking, cancelAsked := w.HibernationState == "waking", w.CleanupCancelRequested
+	if moveToWaking(&w, now, "demand: run "+runID.String(), WakeOriginDemand) {
+		// An origin-only upgrade of an op that was already waking moved nothing: the run only attaches.
+		if !wasWaking || w.CleanupCancelRequested != cancelAsked {
+			res = DemandWakeWoke
+		}
 		if _, werr := writeHibernation(ctx, q, w); werr != nil {
 			return DemandWakeNone, werr
 		}

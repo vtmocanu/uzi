@@ -335,6 +335,10 @@ WITH prev AS (
         registered_pod_uid = sqlc.narg('registered_pod_uid')::uuid,
         roll_heartbeat_at = NULL,
         draining_reason = NULL,
+        -- Issue #4395: a fresh registration starts with no persisted memory-authority loss; the
+        -- next run-lane claim of THIS registration re-establishes it if it is still lost.
+        memory_authority_lost_at = NULL,
+        memory_authority_held_at = NULL,
         snapshot_register_nonce = @snapshot_register_nonce,
         snapshot_epoch      = 0,
         last_heartbeat_at   = now(),
@@ -8559,7 +8563,16 @@ ON CONFLICT (worker_id, run_id) DO UPDATE SET
 -- pending_overflow_until = now() + the lease (the worker-level stand-in for the row-level
 -- leases it could not express, D11); an unflagged one clears both, which is what a valid
 -- unflagged snapshot uses to reopen claiming before expiry.
+-- Issue #4395: a snapshot-carrying run-lane claim also passes the held receipt time and the
+-- snapshot's register nonce; memory_authority_held_at is set only when the receipt is given and
+-- the nonce equals the row's current snapshot_register_nonce (the registration fence), otherwise
+-- it is left unchanged. Every other caller passes NULL receipt and leaves the column alone.
 UPDATE workers SET
+    memory_authority_held_at = CASE
+        WHEN sqlc.narg(memory_authority_held_at)::timestamptz IS NOT NULL
+         AND snapshot_register_nonce = sqlc.narg(held_register_nonce)::text
+        THEN sqlc.narg(memory_authority_held_at)::timestamptz
+        ELSE memory_authority_held_at END,
     snapshot_epoch         = @snapshot_epoch,
     pending_overflow       = @pending_overflow,
     pending_overflow_until = CASE WHEN @pending_overflow::boolean

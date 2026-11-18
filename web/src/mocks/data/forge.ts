@@ -84,6 +84,7 @@ export const mockRepos: Repo[] = [
     repo_devbox_opt_in: true,
     // The uzi repo dogfoods self-improve (PRD #686), so the fold capability is on.
     repo_fold_improve_uzi_backlog: true,
+    env_var_count: 0,
     // PRD #2170 M3: owner guidance for the code cross-checker, so the Code
     // cross-check panel opens with text and a byte count under VITE_UZI_MOCK=1.
     // The checker's CLAUDE.md consent stays off: it is separate from the lead's.
@@ -119,6 +120,7 @@ export const mockRepos: Repo[] = [
     repo_claudemd_enabled: false,
     repo_devbox_opt_in: false,
     repo_fold_improve_uzi_backlog: false,
+    env_var_count: 0,
     pipeline: {
       status: "success",
       web_url: "https://gitlab.example.com/myorg/atlas-api/-/pipelines/3311",
@@ -153,6 +155,7 @@ export const mockRepos: Repo[] = [
     repo_claudemd_enabled: false,
     repo_devbox_opt_in: false,
     repo_fold_improve_uzi_backlog: false,
+    env_var_count: 0,
     pipeline: null,
     guardrail_override: null,
     guardrail_blocked: true,
@@ -173,6 +176,7 @@ export const mockRepos: Repo[] = [
     repo_claudemd_enabled: false,
     repo_devbox_opt_in: false,
     repo_fold_improve_uzi_backlog: false,
+    env_var_count: 0,
     pipeline: null,
     guardrail_override: null,
     guardrail_blocked: false,
@@ -206,6 +210,7 @@ export const mockRepos: Repo[] = [
     repo_claudemd_enabled: false,
     repo_devbox_opt_in: false,
     repo_fold_improve_uzi_backlog: false,
+    env_var_count: 0,
     pipeline: null,
     guardrail_override: null,
     guardrail_blocked: true,
@@ -232,6 +237,7 @@ export const mockRepos: Repo[] = [
     repo_claudemd_enabled: false,
     repo_devbox_opt_in: false,
     repo_fold_improve_uzi_backlog: false,
+    env_var_count: 0,
     pipeline: null,
     guardrail_override: null,
     guardrail_blocked: true,

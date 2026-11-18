@@ -351,6 +351,11 @@ func (rollHealthSettings) WorkerHibernationIdleAfter(context.Context) (time.Dura
 	return 0, nil
 }
 
+func (rollHealthSettings) WorkerHibernationSurplus(context.Context) (bool, error) { return false, nil }
+func (rollHealthSettings) WorkerHibernationSurplusIdleAfter(context.Context) (time.Duration, error) {
+	return 2 * time.Hour, nil
+}
+
 func (rollHealthSettings) CustodyHoldLimit(context.Context) (int32, error)   { return 8, nil }
 func (rollHealthSettings) HealthEnabled(context.Context) (bool, error)       { return true, nil }
 func (rollHealthSettings) ReleaseCheckEnabled(context.Context) (bool, error) { return false, nil }

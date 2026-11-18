@@ -22,6 +22,11 @@ func (autoSettings) WorkerHibernationIdleAfter(context.Context) (time.Duration, 
 	return 14 * 24 * time.Hour, nil
 }
 
+func (autoSettings) WorkerHibernationSurplus(context.Context) (bool, error) { return false, nil }
+func (autoSettings) WorkerHibernationSurplusIdleAfter(context.Context) (time.Duration, error) {
+	return 2 * time.Hour, nil
+}
+
 // TestHibernationAutoThenScheduleWakeLiveDB is PRD #4207 examples 1 and 2 at the api level: the
 // automatic pass admits the worker idle 15 days and not its sibling idle 13 days; the
 // controller's transitions take it to hibernated; a queued schedule-triggered run of the owner

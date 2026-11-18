@@ -10,6 +10,7 @@ import { useAuth } from "../auth/AuthContext";
 import { Alert, Badge, Button, Card, cx, EmptyState, Input, ListSkeleton, PageHeader, Select, Textarea, Toggle } from "../components/ui";
 import { PipelineBadge } from "../components/PipelineBadge";
 import { RepoSetupChip } from "../components/RepoSetupChip";
+import { RepoEnvPanel } from "../components/RepoEnvPanel";
 import { RepoAgentSourceSetting } from "../components/RepoAgentSourceSetting";
 import { Modal } from "../components/Modal";
 import { BoardIcon, XIcon } from "../components/icons";
@@ -96,6 +97,15 @@ export function Repos() {
   const [allowlist, setAllowlist] = useState<ToolAllowlistEntry[] | null>(null);
   const [toolSelection, setToolSelection] = useState<Set<string>>(new Set());
   const [toolsBusy, setToolsBusy] = useState(false);
+  // Environment variables panel (PRD #4416 M1): the repo whose panel is open. The panel
+  // reports the live count back so the row badge follows adds and deletes.
+  const [envRepoId, setEnvRepoId] = useState<string | null>(null);
+  const setEnvLiveCount = useCallback(
+    (n: number) => {
+      setRepos((prev) => prev.map((r) => (r.id === envRepoId && r.env_var_count !== n ? { ...r, env_var_count: n } : r)));
+    },
+    [envRepoId],
+  );
   // GitHub Projects v2 sync panel (PRD #534): the repo whose sync panel is open,
   // the fetched status (null until loaded, or when the repo is not linked), and
   // the load/action flags. The panel renders OUTSIDE the table like the Trusted/
@@ -895,6 +905,7 @@ export function Repos() {
       checkerClaudemdDraft !== (crossCheckRepo.cross_check_repo_instructions_enabled ?? false));
   // The repo whose tool-profile picker is expanded (rendered below the table).
   const toolsRepo = repos.find((r) => r.id === toolsRepoId) ?? null;
+  const envRepo = repos.find((r) => r.id === envRepoId) ?? null;
   // The repo whose Allow-anyway modal is open, and the exact block findings it will
   // accept — read from the connection report for DISPLAY only (the STATE decision is
   // r.guardrail_blocked; the block rule is never re-implemented here).
@@ -1014,6 +1025,7 @@ export function Repos() {
                     <th className="px-4 py-3 font-medium">Trusted repo</th>
                     <th className="px-4 py-3 font-medium">Code cross-check</th>
                     <th className="px-4 py-3 font-medium">Tools</th>
+                    <th className="px-4 py-3 font-medium">Variables</th>
                     <th className="px-4 py-3 font-medium">Project sync</th>
                     <th className="px-4 py-3 text-right font-medium">Actions</th>
                   </tr>
@@ -1021,7 +1033,7 @@ export function Repos() {
                 <tbody className="divide-y divide-edge">
                   {repos.length === 0 ? (
                     <tr>
-                      <td colSpan={8} className="px-4 py-6 text-center text-faint">
+                      <td colSpan={9} className="px-4 py-6 text-center text-faint">
                         {refreshing ? "Loading…" : "No projects found for this bot."}
                       </td>
                     </tr>
@@ -1281,6 +1293,26 @@ export function Repos() {
                             >
                               {toolsRepoId === r.id ? "Close" : "Tools"}
                             </Button>
+                          )}
+                        </td>
+                        <td className="px-4 py-3">
+                          {!r.enabled ? (
+                            <span className="text-xs text-faint">—</span>
+                          ) : (
+                            <div className="flex flex-wrap items-center gap-2">
+                              <Badge tone={r.env_var_count > 0 ? "info" : "neutral"} dot>
+                                {r.env_var_count}
+                              </Badge>
+                              <Button
+                                variant="secondary"
+                                size="sm"
+                                aria-expanded={envRepoId === r.id}
+                                aria-label={`Environment variables for ${maskRepoPath(r.path_with_namespace, demo)}`}
+                                onClick={() => setEnvRepoId((id) => (id === r.id ? null : r.id))}
+                              >
+                                {envRepoId === r.id ? "Close" : "Manage"}
+                              </Button>
+                            </div>
                           )}
                         </td>
                         <td className="px-4 py-3">
@@ -1843,6 +1875,17 @@ export function Repos() {
                   )}
                 </div>
               </div>
+            )}
+
+            {/* Environment variables for one repo (PRD #4416 M1), below the table like
+                the Tools panel so the list is never clipped by the horizontal scroll. */}
+            {envRepo && (
+              <RepoEnvPanel
+                key={envRepo.id}
+                repoId={envRepo.id}
+                repoLabel={maskRepoPath(envRepo.path_with_namespace, demo)}
+                onLiveCount={setEnvLiveCount}
+              />
             )}
 
             {/* GitHub Projects v2 sync panel (PRD #534). Rendered OUTSIDE the

@@ -36,6 +36,20 @@ func (q *Queries) DeleteAllCodexProviderAccountsForOwner(ctx context.Context, us
 	return result.RowsAffected(), nil
 }
 
+const deleteAllRunEnvVarsForOwner = `-- name: DeleteAllRunEnvVarsForOwner :execrows
+DELETE FROM run_env_vars WHERE user_id = $1
+`
+
+// Every run_env_vars row of the owner: live, retired and pending deletion, whatever
+// the sealing marker (PRD #4416). Their ciphertext is unreadable after a reset.
+func (q *Queries) DeleteAllRunEnvVarsForOwner(ctx context.Context, userID uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteAllRunEnvVarsForOwner, userID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const deleteAllUserSecretsForOwner = `-- name: DeleteAllUserSecretsForOwner :execrows
 DELETE FROM user_secrets WHERE user_id = $1
 `

@@ -645,6 +645,7 @@ func (h *Handler) ListProjects(w http.ResponseWriter, r *http.Request) {
 	// A store error degrades gracefully (empty map → field stays nil), never failing
 	// the whole list, matching the docker-allowlist direction.
 	syncLinks := syncLinksForRepos(r.Context(), h.q, repoIDs, "list projects")
+	envCounts := h.envVarCountsForUser(r.Context(), user.ID, "list projects")
 	// PRD #1432: the member's latest override-request per repo, so a not-yet-enabled
 	// blocked repo can surface what they already asked for. Non-fatal on error — this
 	// is enrichment like GuardrailBlocked, so a store failure logs and leaves the map
@@ -659,6 +660,7 @@ func (h *Handler) ListProjects(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, rp := range repos {
 		d := repoToDTO(rp)
+		d.EnvVarCount = envCounts[rp.ID]
 		d.Pipeline = pipelines[rp.ID]
 		d.GuardrailBlocked = guardrailBlockedForRepo(report, rp.ID.String(), rp.GuardrailOverrideReason.Valid)
 		d.DockerAllowlisted = allowSet[rp.ID]
@@ -786,8 +788,10 @@ func (h *Handler) ListRepos(w http.ResponseWriter, r *http.Request) {
 	// PRD #576 M2: batch-load each repo's GitHub Projects v2 sync-health once, keyed by
 	// repo id, degrading gracefully on a store error (see syncLinksForRepos).
 	syncLinks := syncLinksForRepos(r.Context(), h.q, repoIDs, "list repos")
+	envCounts := h.envVarCountsForUser(r.Context(), user.ID, "list repos")
 	for _, rp := range repos {
 		d := repoToDTO(rp)
+		d.EnvVarCount = envCounts[rp.ID]
 		d.Pipeline = pipelines[rp.ID]
 		d.GuardrailBlocked = guardrailBlockedForRepo(reports[rp.ConnectionID], rp.ID.String(), rp.GuardrailOverrideReason.Valid)
 		d.DockerAllowlisted = allowSet[rp.ID]
@@ -901,7 +905,9 @@ func (h *Handler) SetRepoEnabled(w http.ResponseWriter, r *http.Request) {
 		h.requestInitialImport(id)
 	}
 
-	httpx.JSON(w, http.StatusOK, map[string]any{"repo": repoToDTO(repo)})
+	dto := repoToDTO(repo)
+	dto.EnvVarCount = h.envVarCountForRepo(r.Context(), user.ID, repo.ID)
+	httpx.JSON(w, http.StatusOK, map[string]any{"repo": dto})
 }
 
 // DeleteRepo removes a single repo row (PRD #357), cascading its derived data
@@ -1558,7 +1564,9 @@ func (h *Handler) PatchRepo(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	response := map[string]any{"repo": repoToDTO(repo)}
+	repoDTO := repoToDTO(repo)
+	repoDTO.EnvVarCount = h.envVarCountForRepo(r.Context(), user.ID, repo.ID)
+	response := map[string]any{"repo": repoDTO}
 	var overlap []string
 	for _, cap := range repo.RequiredCapabilities {
 		if slices.Contains(repo.IgnoredInferredCapabilities, cap) {

@@ -1,0 +1,184 @@
+{
+  "harness_versions": {
+    "claude_agent_sdk": "0.3.319",
+    "codex": "0.167.0"
+  },
+  "denied_names": [
+    "HOME",
+    "PATH",
+    "TMPDIR",
+    "LANG",
+    "SHELL",
+    "ENV",
+    "IFS",
+    "PS4",
+    "PROMPT_COMMAND",
+    "SHELLOPTS",
+    "BASHOPTS",
+    "DOCKER_HOST",
+    "DOCKER_CONFIG",
+    "DOCKER_CONTEXT",
+    "DOCKER_TLS_VERIFY",
+    "DOCKER_CERT_PATH",
+    "BUILDKIT_HOST",
+    "GOMAXPROCS",
+    "GOFLAGS",
+    "GOTMPDIR",
+    "GOMODCACHE",
+    "GOCACHE",
+    "GOPROXY",
+    "GOSUMDB",
+    "GOENV",
+    "GOTOOLCHAIN",
+    "NPM_CONFIG_CACHE",
+    "npm_config_cache",
+    "NODE_OPTIONS",
+    "NODE_PATH",
+    "NODE_EXTRA_CA_CERTS",
+    "NODE_TLS_REJECT_UNAUTHORIZED",
+    "JAVA_TOOL_OPTIONS",
+    "_JAVA_OPTIONS",
+    "JDK_JAVA_OPTIONS",
+    "CURL_HOME",
+    "NETRC",
+    "WGETRC",
+    "CURL_CA_BUNDLE",
+    "REQUESTS_CA_BUNDLE",
+    "RUBYOPT",
+    "AGENT_BROWSER_ARGS",
+    "AGENT_BROWSER_EXECUTABLE_PATH",
+    "CHROME_PATH",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "UZI_SQLC_DIR",
+    "UZI_RUN_ATTEMPT",
+    "UZI_RUN_CLONE",
+    "UZI_RUN_CLONE_KEY",
+    "UZI_WORKER_SPAWN",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_PARAMETERS",
+    "API_TIMEOUT_MS",
+    "MAX_THINKING_TOKENS",
+    "MAX_MCP_OUTPUT_TOKENS"
+  ],
+  "denied_prefixes": [
+    "UZI_",
+    "CLAUDE_",
+    "ANTHROPIC_",
+    "CODEX_",
+    "OPENAI_",
+    "MCP_",
+    "DISABLE_",
+    "GH_",
+    "GITHUB_",
+    "GITLAB_",
+    "GLAB_",
+    "GIT_",
+    "SSH_",
+    "LD_",
+    "DYLD_",
+    "BASH_",
+    "XDG_",
+    "SSL_CERT_",
+    "PYTHON",
+    "PERL5",
+    "NIX_",
+    "DEVBOX_"
+  ],
+  "denied_suffixes": [
+    "_PROXY"
+  ],
+  "overlaps": [
+    {
+      "name": "AWS_REGION",
+      "harness": "claude",
+      "decision": "allowed",
+      "reason": "application configuration; the Claude CLI reads it only after a CLAUDE_CODE_USE_* provider selector, which the CLAUDE_ prefix denies"
+    },
+    {
+      "name": "AWS_ACCESS_KEY_ID",
+      "harness": "claude",
+      "decision": "allowed",
+      "reason": "cloud credential used by builds and tests; no effect on the CLI while no provider selector is set"
+    },
+    {
+      "name": "AWS_SECRET_ACCESS_KEY",
+      "harness": "claude",
+      "decision": "allowed",
+      "reason": "cloud credential used by builds and tests; no effect on the CLI while no provider selector is set"
+    },
+    {
+      "name": "AWS_PROFILE",
+      "harness": "claude",
+      "decision": "allowed",
+      "reason": "application configuration; no effect on the CLI while no provider selector is set"
+    },
+    {
+      "name": "GOOGLE_APPLICATION_CREDENTIALS",
+      "harness": "claude",
+      "decision": "allowed",
+      "reason": "cloud credential used by builds and tests; no effect on the CLI while no provider selector is set"
+    },
+    {
+      "name": "AZURE_CLIENT_SECRET",
+      "harness": "claude",
+      "decision": "allowed",
+      "reason": "cloud credential used by builds and tests; no effect on the CLI while no provider selector is set"
+    },
+    {
+      "name": "CLOUD_ML_REGION",
+      "harness": "claude",
+      "decision": "allowed",
+      "reason": "read by the CLI only with the Vertex selector, which is denied by the CLAUDE_ prefix"
+    },
+    {
+      "name": "CLAUDE_CODE_USE_BEDROCK",
+      "harness": "claude",
+      "decision": "denied",
+      "reason": "provider selector; user variables cannot change the provider the worker selects"
+    },
+    {
+      "name": "API_TIMEOUT_MS",
+      "harness": "claude",
+      "decision": "denied",
+      "reason": "harness control outside the denied prefixes: request timeout of the Claude CLI"
+    },
+    {
+      "name": "MAX_THINKING_TOKENS",
+      "harness": "claude",
+      "decision": "denied",
+      "reason": "harness control outside the denied prefixes: thinking budget of the Claude CLI"
+    },
+    {
+      "name": "MAX_MCP_OUTPUT_TOKENS",
+      "harness": "claude",
+      "decision": "denied",
+      "reason": "harness control outside the denied prefixes: tool output bound of the Claude CLI"
+    },
+    {
+      "name": "DISABLE_TELEMETRY",
+      "harness": "claude",
+      "decision": "denied",
+      "reason": "feature switch read by the Claude CLI; denied by the DISABLE_ prefix"
+    },
+    {
+      "name": "HTTPS_PROXY",
+      "harness": "claude",
+      "decision": "denied",
+      "reason": "network routing of the harness process; denied by the _PROXY suffix"
+    },
+    {
+      "name": "OPENAI_API_KEY",
+      "harness": "codex",
+      "decision": "denied",
+      "reason": "provider credential selection for Codex; denied by the OPENAI_ prefix"
+    },
+    {
+      "name": "NO_COLOR",
+      "harness": "codex",
+      "decision": "allowed",
+      "reason": "read by commands the agent runs; the app-server environment never receives user variables"
+    }
+  ]
+}

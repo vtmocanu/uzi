@@ -866,6 +866,8 @@ export interface Repo {
   /** Separate checker consent; absent on older APIs means off. */
   cross_check_repo_instructions_enabled?: boolean;
   code_cross_check_guidance?: string | null;
+  /** Live environment variables (enabled and disabled; not those pending deletion). */
+  env_var_count: number;
   id: string;
   connection_id: string;
   forge_project_id: number;
@@ -1138,6 +1140,49 @@ export interface ToolAllowlistEntry {
   updated_by: string | null;
   created_at: string;
   updated_at: string;
+}
+
+// Per-repo run environment variables (PRD #4416 M1). A secret's value is never
+// returned: `value` is null for it. A plain value is null only while the vault is
+// locked (`value_withheld`).
+export type RunEnvState = "enabled" | "disabled" | "pending_deletion";
+
+export interface RunEnvVar {
+  var_id: string;
+  name: string;
+  secret: boolean;
+  description: string;
+  value: string | null;
+  value_withheld: boolean;
+  state: RunEnvState;
+  rev: number;
+  disabled_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface RunEnvCounts {
+  total: number;
+  disabled: number;
+  pending_deletion: number;
+  limit: number;
+}
+
+export interface RunEnvList {
+  variables: RunEnvVar[];
+  counts: RunEnvCounts;
+  vault_locked: boolean;
+}
+
+/** Write body: every field optional; an omitted value keeps the stored one. */
+export interface RunEnvWriteInput {
+  value?: string;
+  secret?: boolean;
+  description?: string;
+}
+
+export interface RunEnvDeleteResult {
+  state: "deleted" | "pending_deletion";
 }
 
 export interface ToolAllowlistWriteInput {
@@ -1434,6 +1479,11 @@ export interface AppSettings {
   // duration (default "336h", valid 1h..2160h). Optional for older responses.
   worker_hibernation_auto?: string;
   worker_hibernation_idle_after?: string;
+  // Warm reserve (PRD #4395): "true"/"false", default "false", effective only while
+  // enabled and auto are both "true". surplus_idle_after is a Go duration (default
+  // "2h", valid 15m..336h); the server uses min(surplus_idle_after, idle_after).
+  worker_hibernation_surplus?: string;
+  worker_hibernation_surplus_idle_after?: string;
   // Per-user persistent hosted-worker quota: integer 0..20, default 2. Zero disables provisioning.
   hosted_worker_quota: string;
   // Ephemeral worker admin settings (PRD #4212). Optional for older responses.

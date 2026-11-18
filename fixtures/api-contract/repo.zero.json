@@ -19,5 +19,6 @@
   "guardrail_override": null,
   "guardrail_blocked": false,
   "docker_allowlisted": false,
-  "docker_blocked": false
+  "docker_blocked": false,
+  "env_var_count": 0
 }
