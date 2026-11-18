@@ -1757,13 +1757,14 @@ async function enrollAheadAuthority(w: World, rw: RunWorld): Promise<void> {
 }
 
 /** Soft-deadline margin the deadline cases leave the real inventory: the pass's `deadlineAt()` is `Date.now() + this`. */
-const EPOCH_DEADLINE_LEFT_MS = 1200;
+const EPOCH_DEADLINE_LEFT_MS = 3000;
 
 /**
  * One interruption of the real run-leaf inventory through the real runPodEpochShadow. `abort`: the pass's parent signal
  * aborts while the chosen real operation is held. `deadline`: the soft deadline (hardPass - 5000) passes while it is held.
  * The pass clock is a stub that jumps (inside the ownership read, before the classifier call) to EPOCH_DEADLINE_LEFT_MS
- * short of the soft deadline, so the hard timer (5000 ms later) has not fired during the ~1.5 s hold.
+ * short of the soft deadline, so the hard timer (5000 ms later) has not fired during the ~3.4 s hold. The margin is wide
+ * so a slow host still reaches the held operation before the soft deadline.
  */
 async function interruptInventoryThroughEpoch(mode: "abort" | "deadline", scenario: "readdir" | "retry-sleep") {
   await withRunWorld([leafOf(RUN_A)], async (w, rw) => {
@@ -1787,7 +1788,12 @@ async function interruptInventoryThroughEpoch(mode: "abort" | "deadline", scenar
       let settled = false;
       pass.then(() => { settled = true; }, () => { settled = true; });
       try {
-        await Promise.race([ins.reached, new Promise<void>((_, reject) => setTimeout(() => reject(new Error("the held operation was never reached")), 10_000))]);
+        let reachTimer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          await Promise.race([ins.reached, new Promise<void>((_, reject) => {
+            reachTimer = setTimeout(() => reject(new Error("the held operation was never reached")), 10_000);
+          })]);
+        } finally { clearTimeout(reachTimer); }
         if (mode === "abort") w.parent.abort();
         else while (Date.now() - jumpedAt < EPOCH_DEADLINE_LEFT_MS + 400) await new Promise(resolve => setTimeout(resolve, 50));
         for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve));
