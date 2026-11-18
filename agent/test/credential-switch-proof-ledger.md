@@ -420,7 +420,7 @@ control is still absent, not that the functional criterion was deferred.
 | Post-switch release epoch and secret-hash authorization | B5/B6 preservation sensitivity controls below, through real worker apply and release routes; U9 credits the final reauthorization's presence (b) and placement after the material read (c) against a switch apply committed between the two authorizations (subscription A release path, service level); the API-key A path and the vault-locked branch after a switch not controlled |
 | Transactional frozen binding rewrite, capability revoke/remint and post-commit material response | U10 credits the zero-row fences (binding, mint redundant ×3, journal, stamp, message, last_seq), the commit-error check, material returned only after commit (c) and the persisted new hash, with the existing error-injection rollback test; A's refusal after remint by B5/B6; per-statement server-error returns (argued equivalent), the empty-AccessToken check and the caller's deferred rollback not separately controlled |
 | Ordinal-zero baseline, successor journal ordinal/capability relation and usage attribution | U11 credits typed baseline-missing and baseline-match refusals (preflight), exact ordinal N+1 and its restart per generation, journal epoch independence from the ordinal, and B usage attribution via the preserved clamp (b); per-field baseline comparisons, the epoch<=0 refusal, the uncommitted-ordinal and generation-scope clamp branches on the Codex path, and cross-generation spend joins not controlled |
-| Atomic rollback, lost-reply replay, stale/foreign apply and target fences | U10 rollback; U12 credits the Codex replay answer and its redundant no-material copies, the new-generation replay fence (b), nonce/generation/released/status fence conjuncts, op mismatch, target mismatch and both target-moved checks (preflight/apply); foreign-worker refusal positive only (a233 ownership query), Step 1 worker check, apply Step 0 copies, harness/user conjuncts and old-alias refusals not controlled |
+| Atomic rollback, lost-reply replay, stale/foreign apply and target fences | U10 rollback; U12 credits the Codex replay answer and its redundant no-material copies, the new-generation replay fence (b), the non-owner ErrRunNotOwned ownership query (b, refusal itself redundant ×4), nonce/generation/released/status fence conjuncts, op mismatch, target mismatch and both target-moved checks (all through preflight); preflight's own non-owner refusal, the validator replay copy, Step 1 worker check, apply Step 0 copies, other fence conjuncts and target sub-checks, and old-alias refusals not controlled |
 | Stopped-support negotiation, immutable expected-epoch latch and unsupported-response obligation | Unvalidated |
 | Stopped numeric epoch equality: stale/mismatched running and paused, applied successor | D controls: five individually executed cases above |
 | Stopped pending-input exclusion for eight named kinds in running and paused states | D controls: sixteen individually executed cases above; other control flags/cutoffs unvalidated |
@@ -2729,7 +2729,8 @@ assertion :135).
 |---|---|---|---|---|
 | u12-replay-codex | (d) guard | Codex replay branch `if run.Harness == harnessCodex {` → `if false && …` (credential_switch_apply.go :325) | lost-reply | lostreply :56 "committed Codex replay reason = \"credential_gone\", want \"credential_changed\"" |
 | u12-replay-nomaterial | redundant-fence guard (decision 9) | (i) kind filter `AND kind = 'anthropic_token'` dropped from `LockAnthropicSecretForApply` (generated runtime.sql.go :16533) alone; (ii) with the Codex branch also removed | lost-reply | (i) EXIT=0 (`u12-replay-kind-only`); (ii) lostreply :51 "committed retry returned or reminted authority" (`u12-replay-nomaterial-both`): with neither copy, the shared Anthropic replay hands back the Codex secret |
-| u12-replay-gen | (b) **preservation sensitivity control** | `prior.ClaimGeneration != gen ||` → `false && …` (:322) | new-generation replay | foreign test :93 "committed op replayed under a new generation was not fenced: [outcome=refused_committed …]" |
+| u12-foreign-owner | (b) **preservation sensitivity control** (ownership query identical at a233), 7d0205caa | worker filter dropped from both clauses of `GetRunOwnedByWorkerForUpdate` (generated runtime.sql.go, `$2` kept referenced); arms with further copies: + Step 0 worker conjunct (credential_switch_apply.go :313); + Step 0 and the validator worker conjunct (credential_switch_codex.go :326); validator conjunct alone | foreign worker | :27, on the error identity: owner-query alone and owner+Step 0 return `fenced` (no material) instead of `ErrRunNotOwned`; owner+Step 0+validator returns `run claim is stale` (the binding writer's own `worker_id` predicate, codex_binding.sql :345, is a fourth copy); validator conjunct alone EXIT=0. No arm removed every copy, so the non-owner refusal itself is not isolated |
+| u12-replay-gen | (b) **preservation sensitivity control** (a233 code identity only; not executed at a233) | `prior.ClaimGeneration != gen ||` → `false && …` (:322) | new-generation replay | foreign test :93 "committed op replayed under a new generation was not fenced: [outcome=refused_committed …]" |
 | u12-fence-nonce | (d) guard | nonce conjunct of `codexSwitchFence` → `true` (:325) | preflight stale_nonce | :135 "Outcome:ready … want fenced" |
 | u12-fence-gen | (d) guard | generation conjunct → `true` (:327) | preflight stale_generation | :135 "Outcome:not_applied Reason:generation_mismatch … want fenced" (the later stamp-generation check still refused, with the wrong outcome) |
 | u12-fence-released | (d) guard | released conjunct → `true` (:327) | preflight released | :135 "Outcome:ready … want fenced" |
@@ -2744,7 +2745,10 @@ new tests, write-rollback and zero-row pass, EXIT=0
 (`.uzi/scratch/ctl-logs/u12-green.log`); `task lint:api` 0 issues
 (`u12-lint-api.log`).
 
-Credit: a committed Codex op replayed in its own generation answers
+Credit: a non-owner worker's apply fails with `ErrRunNotOwned` because of the
+ownership query (preserved), and the refusal is backed by at least three more
+copies (Step 0, the validator fence, the binding writer); a committed Codex op
+replayed in its own generation answers
 `refused_committed`/`credential_changed` and never returns material (the Codex
 branch and the Anthropic replay's kind filter are redundant copies of the
 no-material property); replayed under a new generation it is fenced (preserved
@@ -2752,11 +2756,17 @@ check); a stale nonce, stale generation, released claim or non-live status
 fences the validator; a different pending op is superseded; a foreign or wrong
 target is refused `target_mismatch`; a target whose material or account
 revision moved after preflight is refused `target_moved`; partial writes roll
-back (U10). Not credited: the foreign-worker refusal (decided by the a233
-ownership query in `beginClaimMutation`, not by `codexSwitchFence`'s worker
-conjunct; only positive here), the Step 1 worker check (unreachable in a live
-generation without a reclaim), the apply path's own Step 0 copies for Codex
-(the validator copies are controlled through preflight; Step 0 is shared with
-the Anthropic path), the harness/user/lane conjuncts (lane: D64–D73 for the
-stopped route), old-alias `credential_changed`/`credential_gone` refusals
-(:208–217, :239–244), and apply-route reds for the validator conjuncts.
+back (U10). The fence-conjunct, op and target-mismatch controls ran through
+preflight; the two target-moved controls failed at the preflight assertion
+(:168), so the apply assertion (:172) was not exercised by them. Not
+credited: the preflight path's own non-owner refusal (credential_switch_codex.go
+:69–74, new code) and the validator's copy of the prior-journal check (:114–120)
+— both positive only; the Step 1 worker check (a redundant copy: the
+generation check short-circuits first, even after a reclaim); the apply path's
+Step 0 copies for Codex, including the Codex-only negotiation conjunct
+(credential_switch_apply.go :309); `codexSwitchFence`'s worker (:326),
+negotiation (:324), harness and user conjuncts (lane: D64–D73 for the stopped
+route); the no_pending_switch arm (:128); the target generation and op (:140–141),
+target auth mode (:200) and target account key (:261) checks; old-alias
+`credential_changed`/`credential_gone` refusals (:208–217, :239–244); and
+apply-route reds for the validator conjuncts.
