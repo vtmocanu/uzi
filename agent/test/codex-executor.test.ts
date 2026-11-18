@@ -33231,6 +33231,8 @@ describe("M2 actualRunner credential replacement", () => {
         let aSuspendOwned: ReturnType<CodexExecutor["suspendCodexEpoch"]> | undefined;
         let ordinaryBRefreshes = 0, refreshDeliveries = 0, bFinished = false;
         let aRefreshesAfterFinish = 0;
+        let retiredATransportCounts: { before: number[]; after: number[] } | undefined;
+        let bRefreshExpectedAtFinish: typeof bRefreshExpected | undefined;
         let retiredAAfterFinish: unknown;
         const bRefreshExpected: (Parameters<WorkerClient["refreshCodex"]>[2] | undefined)[] = [];
         const refreshDelivered = installerBarrier(), refreshResponded = installerBarrier();
@@ -33447,8 +33449,8 @@ describe("M2 actualRunner credential replacement", () => {
                 const sends = [a.transport.requests.length, b.transport.requests.length];
                 try { await retiredARefresh({ operationId: "retired-A-after-finishB", signal: new AbortController().signal }); }
                 catch (error) { retiredAAfterFinish = error; }
-                assert.ok(retiredAAfterFinish, "retired A refresh refuses after finishB");
-                assert.deepEqual([a.transport.requests.length, b.transport.requests.length], sends);
+                // Assert in the final block: a throw inside this production-called hook would fail the switch instead.
+                retiredATransportCounts = { before: sends, after: [a.transport.requests.length, b.transport.requests.length] };
               }
               if (publication === "subscription-refresh") {
                 await withTimeout(refreshResponded.promise, 5000, "deferred B refresh settlement after finish");
@@ -33459,9 +33461,8 @@ describe("M2 actualRunner credential replacement", () => {
                   chatgptPlanType: null } });
                 assert.equal(ordinaryBRefreshes, 1, "delivered deferred request actually reaches B refresh bridge");
                 assert.equal(next.auth_mode, "subscription");
-                assert.equal(bRefreshExpected.length, 1);
-                assert.deepEqual(bRefreshExpected, [{ authMode: "subscription", chatgptAccountId: next.chatgpt_account_id }],
-                  "B refresh expectation names B's account, never A's");
+                // Identity is asserted in the final block, outside this production-called hook.
+                bRefreshExpectedAtFinish = [...bRefreshExpected];
               }
             },
           };
@@ -35309,6 +35310,13 @@ describe("M2 actualRunner credential replacement", () => {
             assert.ok(retiredAAfterFinish instanceof TrustedExecutionRefusal,
               `retired A refresh refused by a trusted-execution guard, got: ${String(retiredAAfterFinish)}`);
             assert.equal(retiredAAfterFinish.message, "codex credential authority retired", "retired A bridge refused by the retired-authority guard");
+            assert.ok(retiredATransportCounts);
+            assert.deepEqual(retiredATransportCounts.after, retiredATransportCounts.before, "retired A refresh sends nothing on A or B transport");
+          }
+          if (publication === "subscription-refresh") {
+            assert.ok(next.auth_mode === "subscription");
+            assert.deepEqual(bRefreshExpectedAtFinish, [{ authMode: "subscription", chatgptAccountId: next.chatgpt_account_id }],
+              "B refresh expectation names B's account");
           }
           assert.equal(aRefreshesAfterFinish, 0, "no refreshCodex call carries A's capability after finishB");
           assert.ok(retiredADenial);
