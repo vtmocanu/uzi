@@ -436,10 +436,36 @@ describe("Providers — Claude source (PRD #4320 M7)", () => {
     expect(screen.getByTestId("source-blocked-p1").textContent).toMatch(reason);
   });
 
-  it("offers no source controls when the feature is off", async () => {
+  it("offers no source controls when the feature is off and Anthropic is selected", async () => {
     await renderCard(list({ enabled: false, allowed_base_urls: [], providers: [] }));
     expect(screen.queryByTestId("claude-source")).toBeNull();
     expect(screen.queryByRole("button", USE)).toBeNull();
+  });
+
+  it("can stop using a selected source while the feature is off", async () => {
+    mockApi.getMySettings.mockResolvedValue({ settings: { claude_provider_id: "p1" } } as never);
+    mockApi.setClaudeProviderSource.mockResolvedValue({ claude_provider_id: null });
+    await renderCard(list({ enabled: false, allowed_base_urls: [], providers: [] }));
+    const stop = await screen.findByRole("button", { name: "Stop using" });
+    // A failed refresh must not hide the successful clear returned by the PUT.
+    mockApi.getMySettings.mockRejectedValue(new Error("refresh unavailable"));
+    fireEvent.click(stop);
+    await waitFor(() => expect(mockApi.setClaudeProviderSource).toHaveBeenCalledWith(null));
+    expect(await screen.findByText("Claude runs use Anthropic again.")).toBeTruthy();
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Stop using" })).toBeNull());
+    expect(screen.queryByRole("button", USE)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Add provider" })).toBeNull();
+  });
+
+  it("keeps the feature-off clear control available when clearing fails", async () => {
+    mockApi.getMySettings.mockResolvedValue({ settings: { claude_provider_id: "p1" } } as never);
+    mockApi.setClaudeProviderSource.mockRejectedValue(new Error("clear unavailable"));
+    await renderCard(list({ enabled: false, allowed_base_urls: [], providers: [] }));
+    fireEvent.click(await screen.findByRole("button", { name: "Stop using" }));
+    expect(await screen.findByRole("alert")).toBeTruthy();
+    const retry = screen.getByRole("button", { name: "Stop using" }) as HTMLButtonElement;
+    await waitFor(() => expect(retry.disabled).toBe(false));
+    expect(mockApi.setClaudeProviderSource).toHaveBeenCalledWith(null);
   });
 
   it("surfaces a provider_source_unusable refusal", async () => {

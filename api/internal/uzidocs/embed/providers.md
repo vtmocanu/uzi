@@ -106,6 +106,10 @@ uzi provider use corp-gw     # select by name or id
 uzi provider use --none      # back to your Anthropic token
 ```
 
+If the operator turns custom providers off while one is selected, Settings still offers
+**Stop using**. You can clear the source there or with `uzi provider use --none` to use
+Anthropic for new runs.
+
 Both call `PUT /api/me/providers/claude-source` and accept a Bearer token, since selecting reveals no
 key and cannot move a destination. The selection applies to runs you start afterwards. A selection is refused (409 `provider_source_unusable`)
 unless the provider is yours, not retired, on the operator's allowlist and has an enabled key.

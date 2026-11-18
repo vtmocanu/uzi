@@ -738,10 +738,30 @@ export function Providers() {
       {!data && !loadError ? (
         <Skeleton className="h-16 w-full" />
       ) : data && !data.enabled ? (
-        <p className="rounded-lg border border-edge bg-raised/60 px-4 py-3 text-sm text-muted">
-          Custom providers are off. Your operator has not enabled them by setting{" "}
-          <code className="rounded bg-raised px-1 py-0.5 text-fg">UZI_PROVIDER_ALLOWED_BASE_URLS</code>.
-        </p>
+        <>
+          <p className="rounded-lg border border-edge bg-raised/60 px-4 py-3 text-sm text-muted">
+            Custom providers are off. Your operator has not enabled them by setting{" "}
+            <code className="rounded bg-raised px-1 py-0.5 text-fg">UZI_PROVIDER_ALLOWED_BASE_URLS</code>.
+          </p>
+          {sourceId !== undefined && sourceId !== null && (
+            <div className="space-y-2">
+              <p className="text-sm text-muted">A custom provider is still selected as your Claude source.</p>
+              <Button
+                size="sm"
+                disabled={busy}
+                onClick={() =>
+                  void run(
+                    async () => setSourceId((await api.setClaudeProviderSource(null)).claude_provider_id),
+                    "Claude runs use Anthropic again.",
+                    "Failed to stop using the provider",
+                  )
+                }
+              >
+                Stop using
+              </Button>
+            </div>
+          )}
+        </>
       ) : data ? (
         <>
           <div className="space-y-1 text-sm" data-testid="claude-source">
