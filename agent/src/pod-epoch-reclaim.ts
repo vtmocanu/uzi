@@ -606,7 +606,8 @@ export interface RetireStepBound { signal: AbortSignal; deadline: number }
 interface RetireVerdict {
   state: "not_run" | "refused" | "ran" | "stopped";
   reason: string;
-  /** Bound parents (or bindings of gone parents) the phase considered, at most 64. */
+  /** Bound parents (or bindings of gone parents) the phase considered: the present parents kept at nomination (no work slot)
+   *  plus the work slots, which hold at most 64 per pass. */
   examined: number;
   reclaimed: number;
   /** Bindings of already-gone parents cleared by the metadata-only recovery route. */
@@ -863,7 +864,24 @@ async function retireBody(ctx: RetireContext, pin: ScratchRootPin, root: string,
     }
   }
   const candidates = [...owners.keys()].map(u => `.retire-${u}`).sort();
-  const work = candidates.slice(0, RETIRE_MAX_CANDIDATES);
+  // A listed (present) parent whose nomination over the evidence already read is a keep is kept whatever this pass does
+  // (C-prime: every present binding phase keeps), so it is reported below without taking one of the per-pass work slots;
+  // otherwise 64 lexically earlier kept parents would starve gone-parent recovery forever. Pure: no IO, no effect.
+  // Gone parents are not pre-classified: their keeps stay in the loop.
+  const preKept: Array<{ name: string; reason: string }> = [];
+  const workable: string[] = [];
+  for (const name of candidates) {
+    if (listed.has(name)) {
+      const uuid = RETIRE_PARENT_RE.exec(name)![1]!;
+      const owner = owners.get(uuid)!;
+      const raw = owner.bare.bindings.find(b => b.uuid === uuid)?.raw ?? "";
+      const others = evidence.bares.filter(x => x !== owner.bare);
+      const nominated = evaluateRetireBinding({ evidence: owner.bare, uuid, runnerRoot: root, expectRaw: raw, acrossBares: owner.count, otherBares: others });
+      if (nominated.kind === "keep") { preKept.push({ name, reason: nominated.reason }); continue; }
+    }
+    workable.push(name);
+  }
+  const work = workable.slice(0, RETIRE_MAX_CANDIDATES);
   const protectedNow = protectedLeaves(storedPaths, root, work);
   const scanRoots = root === "/data/runner" ? [root, "/data/runner-shared"] : [root];
   const scan = (names: readonly string[]): ReturnType<typeof scanScratchProcesses> => {
@@ -879,7 +897,7 @@ async function retireBody(ctx: RetireContext, pin: ScratchRootPin, root: string,
   const firstScan = scan(work);
   if ("refused" in firstScan) return refuse(firstScan.refused);
   out.state = "ran"; out.reason = "complete";
-  out.examined = work.length;
+  out.examined = preKept.length + work.length;
   out.unbound = [...listed].filter(n => !owners.has(RETIRE_PARENT_RE.exec(n)![1]!)).length;
 
   const count = (reason: string, n = 1): void => { out.kept_by_reason[reason] = (out.kept_by_reason[reason] ?? 0) + n; };
@@ -887,6 +905,7 @@ async function retireBody(ctx: RetireContext, pin: ScratchRootPin, root: string,
     out.kept++; count(reason);
     if (exists) ctx.parents.push({ name, outcome: "kept", reason, bytes: 0, bytesState: "unknown" });
   };
+  for (const k of preKept) keep(k.name, k.reason, true);
   const defer = (names: readonly string[], reason: string): void => {
     out.deferred += names.length;
     for (const n of names) if (parentPresence(io, pin, n) === "present") ctx.parents.push({ name: n, outcome: "kept", reason, bytes: 0, bytesState: "unknown" });
@@ -1070,8 +1089,8 @@ async function retireBody(ctx: RetireContext, pin: ScratchRootPin, root: string,
         break;
     }
   }
-  // Bound parents beyond the cap were never looked at.
-  const beyond = candidates.slice(RETIRE_MAX_CANDIDATES);
+  // Workable bound parents beyond the work-slot cap were never looked at (pre-kept parents were reported above).
+  const beyond = workable.slice(RETIRE_MAX_CANDIDATES);
   if (beyond.length > 0) defer(beyond, "budget_deferred");
   if (halted !== undefined) stopPhase(halted);
 }

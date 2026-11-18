@@ -617,6 +617,76 @@ describe("budget", PROC, () => {
 
 });
 
+// A present parent that nomination keeps takes no work slot, so 64 of them never starve a gone parent that sorts after them.
+describe("budget: kept present parents do not take work slots", PROC, () => {
+  const GONE_UUID = "ffffffff-ffff-4fff-bfff-ffffffffffff";
+  const keptUuid = (i: number): string => `00000000-0000-4000-8000-${String(i).padStart(12, "0")}`;
+  /** Every relative path with its content and inode, so an in-place change or a replacement both show. */
+  function snapshot(dir: string, rel = ""): string[] {
+    const here = path.join(dir, rel);
+    const st = fs.lstatSync(here, { bigint: true });
+    if (!st.isDirectory()) return [`${rel}\t${st.ino}\t${fs.readFileSync(here, "utf8")}`];
+    return [`${rel}/\t${st.ino}`, ...fs.readdirSync(here).sort().flatMap(e => snapshot(dir, path.join(rel, e)))];
+  }
+
+  const rawsOn = (bare: string, uuid: string): string[] => { const f = w.bare; w.bare = bare; try { return w.bindingRaws(uuid); } finally { w.bare = f; } };
+
+  async function scenario(phase: "intent" | "settled", keptOnSecond: number, halt: boolean): Promise<void> {
+    const reason = phase === "intent" ? "bound_intent" : "settled_kept";
+    const keptTotal = 64 + keptOnSecond;
+    const second = makeFixture();
+    try {
+      const bare2 = await w.cache.ensureClone(second.originPath);
+      fs.chmodSync(path.dirname(bare2), 0o700);
+      fs.chmodSync(bare2, 0o700);
+      const first = w.bare;
+      const keptSeeds: Seed[] = [];
+      const keptBare: string[] = [];
+      for (let i = 1; i <= 64; i++) { keptSeeds.push(w.seed({ uuid: keptUuid(i), phase, n: i })); keptBare.push(first); }
+      w.bare = bare2;
+      for (let i = 65; i < 65 + keptOnSecond; i++) { keptSeeds.push(w.seed({ uuid: keptUuid(i), phase, n: i })); keptBare.push(bare2); }
+      const gone = w.seed({ uuid: GONE_UUID, withParent: false, n: 100 });
+      w.bare = first;
+      const before = keptSeeds.map(s => snapshot(s.parent));
+      if (halt) {
+        // Spend the window after the work slots are chosen: the loop halts at its first candidate without refusing the phase.
+        const scan = w.scan;
+        let spent = false;
+        w.scan = names => { if (!spent) { spent = true; w.clock += 105_000; } return scan(names); };
+      }
+      const result = await w.run();
+      const r = result.retire_scratch;
+      assert.equal(r.kept, keptTotal, JSON.stringify(r));
+      assert.equal(r.kept_by_reason[reason], keptTotal, JSON.stringify(r.kept_by_reason));
+      assert.equal(r.examined, keptTotal + 1);
+      assert.equal(w.spawns.length, 0);
+      if (halt) {
+        assert.equal(r.state, "stopped");
+        assert.equal(r.reason, "budget_deferred");
+        assert.equal(r.recovered, 0);
+        assert.equal(r.deferred, 1);
+        assert.deepEqual(rawsOn(bare2, gone.uuid), [gone.raw], "the gone binding is unchanged");
+        assert.deepEqual(w.reserveCalls, []);
+      } else {
+        assert.equal(r.recovered, 1);
+        assert.equal(r.deferred, 0);
+        assert.deepEqual(rawsOn(bare2, gone.uuid), [], "the gone binding was unset");
+        assert.deepEqual(w.reserveCalls, [gone.runId]);
+      }
+      keptSeeds.forEach((s, i) => {
+        assert.deepEqual(rawsOn(keptBare[i]!, s.uuid), [s.raw], `binding of ${s.uuid}`);
+        assert.deepEqual(snapshot(s.parent), before[i], `tree of ${s.uuid}`);
+      });
+    } finally { second.cleanup(); }
+  }
+
+  it("64 kept intent parents do not starve a later gone parent", () => scenario("intent", 0, false));
+  it("65 kept intent parents (past the work cap) do not starve a later gone parent", () => scenario("intent", 1, false));
+  it("64 kept settled parents do not starve a later gone parent", () => scenario("settled", 0, false));
+  it("65 kept settled parents (past the work cap) do not starve a later gone parent", () => scenario("settled", 1, false));
+  it("a halt at the first workable candidate keeps the kept parents and defers the gone one", () => scenario("intent", 0, true));
+});
+
 describe("budget inside the locked section", PROC, () => {
   it("a recovery under an exhausted window is deferred and the binding stays", async () => {
     const s = w.seed({ withParent: false });
