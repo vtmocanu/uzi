@@ -235,7 +235,6 @@ export function AdminSettings() {
       // Near the page end the scroll cannot bring the target to the line: remember it so
       // evaluate() lights its own pill.
       const id = hash.slice(1);
-      pendingRef.current = id;
       // The section pills mount with this load, so the pinned block grows in the same
       // commit and its ResizeObserver rewrites --pinned-h (the root scroll-padding) only
       // after the next layout. Scroll two frames later, once that offset is current, so
@@ -244,6 +243,8 @@ export function AdminSettings() {
       let raf2 = 0;
       const raf = requestAnimationFrame(() => {
         raf2 = requestAnimationFrame(() => {
+          // Set right before the jump: an observer evaluation during the delay clears it.
+          pendingRef.current = id;
           document.getElementById(id)?.scrollIntoView?.({ block: "start" });
           evaluateRef.current?.();
         });
