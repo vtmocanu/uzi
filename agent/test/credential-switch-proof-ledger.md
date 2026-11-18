@@ -414,7 +414,7 @@ control is still absent, not that the functional criterion was deferred.
 | Strict usable persistence, clear confirmation and continuation on A before teardown | R1–R4 credit three failed-save/inspection variants and empty applied-ACK; U3 credits op mismatch, target, claim_released ownership before/after, combined nonce fence and no-remaining-pending guards; pending-absent-before, other ownership legs, lost-reply clear and reopen's other guards not controlled |
 | Proven A root/tool reap before B material, login and model work; fresh CODEX_HOME | R5 (runner hold) and U4: executor reap proof for root and command-root failures, combined no-B-before-reap fence, distinct per-epoch HOME (b); in-flight tool callbacks, launcher must-not-exist and other phases not controlled |
 | Whole operation-scope/refresh/identity/capability/summary replacement and retired-A rejection | A2 one reader; A3 scope namespace; R7 B dispatcher readiness; R8 retired API-key A reconcile fence; U5 retired A refresh bridge pre-call refusal (P3), combined executor summary-guard refusal, B expected identity carried (b); A-account rejection, bridge post-call copy, assertRefreshAdmission and Now stale-result drops not separately controlled |
-| Exact saved-ID resume; confirmed-refusal-only fresh fallback and lineage; preservation re-hold | R6 credits uncertain-error classification only; confirmed-refusal/preserve companions positive, independent preservation and other clauses unvalidated |
+| Exact saved-ID resume; confirmed-refusal-only fresh fallback and lineage; preservation re-hold | R6 uncertain-error classification; U6 exact resume id, lineage notice, combined preserve re-hold, crash missing-id disclosure (d) and preserve retained refusal (b); confirmed-refusal classification (timeout), :4148 check and session_missing on the switch path not controlled |
 | Policy episode rejection at request and under apply lock | D74–D77 credit the two isolated owner cases and the same two conditions introduced after READY before apply; paused holds, concurrent interleavings and other policy clauses unvalidated |
 | Refresh lease/intent exclusion, account lock ordering and boundary reconciliation before revoke | D78/D79 credit isolated A coordination-lease and rotating-intent server checks; actual refresh admission, multi-account lock ordering and worker reconciliation ordering remain unvalidated |
 | Post-switch release epoch and secret-hash authorization | B5/B6 preservation sensitivity controls below, through real worker apply and release routes; final reauthorization timing unvalidated |
@@ -2119,9 +2119,9 @@ New probes in agent/test/codex-executor.test.ts (this commit), all inside
   authority changed" or "codex credential authority retired" (current code:
   the former).
 
-Command (agent, one-at-a-time export; candidate
-85914608424d23f765700f50e7b0f591010b6f17 plus this commit's test file, sha256
-a9f25155fb8c…): `npm run typecheck && node --import tsx --test
+Command (agent, one-at-a-time export; first round: commit
+85914608424d23f765700f50e7b0f591010b6f17 plus test-file sha256 a9f25155fb8c…,
+superseded by the review-fix rerun below): `npm run typecheck && node --import tsx --test
 --test-timeout=120000 --test-name-pattern='<pattern>' test/codex-executor.test.ts`.
 
 Review fix (commit a51553c28): P1's transport-count check and P2 first
@@ -2160,3 +2160,60 @@ reaches the client; the executor summary factory's guard refuses retired A
 (combined fence); B's refresh carries B's expected account through the switch
 path (b). Not credited: rejection of A's account under a subscription→
 subscription switch (that pair runs only in the baseline case).
+
+U5 checkpoint record: the owner confirmed the published checkpoint ref equals
+c5ad0d0cf59ac44ea54338bd74bf4a7eeb03f5c0 and contains 85914608424d….
+
+### U6 — saved-ID resume, confirmed-refusal-only fresh lineage, preserve re-hold, crash-point IDs (2026-11-18)
+
+Baseline: a233 `agent/src/runner.ts`:25735–25738 refused every Codex switch
+(A1), so the switch's resume (`restartAndResume`), fresh-lineage
+(`startFreshLineage`) and preserve re-hold paths are new. The retained-recovery
+`attempt_path` refusal is old:
+`git show a233883de3c36bae2e940f999cd9d582889dad00:agent/src/runner.ts` :15149
+reads `if (flight.effectiveAttemptPaths) throw new PolicyContinuationRejected("attempt_path", true);`
+(candidate :15427, reached by the switch crash-recovery tests). The retained
+`session_id_unavailable` lineage branch (candidate runner.ts :15698) has no a233
+counterpart.
+
+Production (codex-executor.ts unless noted): `restartAndResume` sends
+`resumeSessionId: sessionId` (:4166) after `sessionId !== saved` refuses
+(:4148); a `CodexResumeError` alone is a confirmed refusal (:4175);
+`startFreshLineage` requires `resumeRefused`, refuses under
+`preserveConversation` (:4186) and emits `resume_lineage_break` (:4196). The
+runner (runner.ts :17688–17704) re-holds a preserve-only run with
+`PolicyContinuationRejected("provider_resume_rejected")`.
+
+No test change in this unit; existing real Runner cases. Command (agent,
+one-at-a-time export; commit c5ad0d0cf59ac44ea54338bd74bf4a7eeb03f5c0):
+`npm run typecheck && node --import tsx --test --test-timeout=120000
+--test-name-pattern='<pattern>' test/codex-executor.test.ts`.
+
+| Control | Kind | Mutation | Case(s) | Red at |
+|---|---|---|---|---|
+| u6-resume-id | (d) guard | `resumeSessionId: sessionId` → `` sessionId && `${sessionId}-wrong` `` (:4166) | confirmed refusal fresh lineage; baseline api_key→subscription | :35357 resumed thread ids `[saved-wrong]` vs `[saved]`, both |
+| u6-lineage-notice | (d) guard | fresh lineage's `ctx.emit({… resume_lineage_break …})` → `void (…)` (:4195) | Codex real Runner confirmed B resume refusal starts exactly one fresh lineage | :35376 lineage notices 0 vs 1 |
+| u6-preserve-redundant | redundant-fence guard | `preserveConversation` neutralized in the runner refusal branch (runner.ts :17689) and in `startFreshLineage` (:4186), the two copies of "a preserve-only run never starts a fresh B thread" | Codex real Runner wire preserve-only claim re-holds confirmed B saved-thread resume refusal | :34706 switch error cause |
+| u6-crash-missing-id | (d) guard | `else if (!sessionId && claim.secrets.codex && flight.retainedEpisode)` → `false && …` (runner.ts :15698) | Codex switch crash during B login retains committed B; recovery ordinary missing persisted ID | :35216 "changed-cwd recovery visibly discloses the path lineage break" |
+| u6-crash-preserve-attempt | (b) preservation sensitivity | `attempt_path` refusal → `false && …` (runner.ts :15427; a233 :15149) | Codex switch crash during B login retains committed B; recovery preserve missing persisted ID | :35180 "retained recovery must refuse even when a saved ID and rollout exist" |
+
+Not credited (timeouts, `.uzi/scratch/ctl-logs/*.timeout.log`): u6-resume-id's
+first form (`resumeSessionId` → undefined) and u6-classify-never (confirmed
+refusal never classified) both stalled the switch until the test's own
+barrier timed out; a timeout is not an assertion red. The opposite direction
+(uncertain error never starts a fresh thread) remains credited by R6. The
+`sessionId !== saved` check (:4148) has no control: the runner always passes
+the saved id. The `session_missing` guard (runner.ts :15444) is not reached by
+the switch crash cases (the retained `attempt_path` refusal fires first); it is
+covered only by non-switch runner-policy-preserve tests. Crash controls ran
+through the crash-during-login publication only; the other three crash
+publications share the same recovery code but were not mutated.
+
+Every credited mutant passed typecheck and exited 1 at the named assertion.
+Unchanged candidate, primary clone: the five cases pass, 5/5, EXIT=0
+(`.uzi/scratch/ctl-logs/u6-green.log`); agent `npm run lint` 0/0.
+
+Credit: B resumes the exact saved thread id; a fresh lineage emits its
+notice; a preserve-only run re-holds instead of starting fresh (combined
+fence); after worker loss a missing persisted id is disclosed as a lineage
+break, and a preserve-only retained recovery refuses (preserved behaviour).
