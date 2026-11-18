@@ -32587,6 +32587,7 @@ describe("M2 actualRunner credential replacement", () => {
         const nowRuns: string[] = [];
         const owners: import("../src/codex/summary-ownership.js").SummaryOwnership[] = [];
         let retiredADenied = false, liveBAdmitted = false;
+        let retiredADenial: { refusal: boolean; message: string } | undefined;
         const triggerNow = async (id: string) => {
           await context.reportProgress!({ completed: [], in_progress: [id] }, [{ id, title: `Inspect ${id}` }] as never);
           context.emit({ kind: "tool_use", agent: "lead", payload: { id, name: "Bash", input: { command: "true", description: `Inspect ${id}` } } });
@@ -33229,6 +33230,9 @@ describe("M2 actualRunner credential replacement", () => {
         let aRefreshReturnSnapshot: ReturnType<typeof aRefreshSnapshot> | undefined;
         let aSuspendOwned: ReturnType<CodexExecutor["suspendCodexEpoch"]> | undefined;
         let ordinaryBRefreshes = 0, refreshDeliveries = 0, bFinished = false;
+        let aRefreshesAfterFinish = 0;
+        let retiredAAfterFinish: unknown;
+        const bRefreshExpected: (Parameters<WorkerClient["refreshCodex"]>[2] | undefined)[] = [];
         const refreshDelivered = installerBarrier(), refreshResponded = installerBarrier();
         const respond = b.transport.respond.bind(b.transport);
         const refreshRefusals: Parameters<FakeTransport["respond"]>[1][] = [];
@@ -33241,6 +33245,7 @@ describe("M2 actualRunner credential replacement", () => {
           if (id === 91) refreshResponded.resolve();
         };
         rig.client.refreshCodex = async (id, req, expected?: Parameters<WorkerClient["refreshCodex"]>[2]) => {
+          if (bFinished && req.capability === oldClaim.capability) aRefreshesAfterFinish++;
           if (aRefreshWindow && req.capability === oldClaim.capability) aRefreshExchanges++;
           if (aRefreshArmed && !aRefreshTaken && req.capability === oldClaim.capability) {
             aRefreshTaken = true;
@@ -33256,6 +33261,7 @@ describe("M2 actualRunner credential replacement", () => {
           credentialRefreshes++;
           if (req.capability !== next.capability) return refresh(id, req);
           ordinaryBRefreshes++;
+          bRefreshExpected.push(expected);
           assert.equal(bFinished, true, "ordinary B refresh requires full initialization and finishB reopen");
           return { access_token: next.access_token, generation: req.observed_generation + 1,
             chatgpt_account_id: next.auth_mode === "subscription" ? next.chatgpt_account_id : "unused-api-key-account", outcome: "advanced" };
@@ -33435,6 +33441,15 @@ describe("M2 actualRunner credential replacement", () => {
               }
               await lease.finishB(...args);
               bFinished = true;
+              if (publication === "gated" && oldClaim.auth_mode === "subscription") {
+                // Retired A's real bridge callback, called after B is fully live, with a live signal.
+                assert.ok(retiredARefresh, "real A auth bridge captured before teardown");
+                const sends = [a.transport.requests.length, b.transport.requests.length];
+                try { await retiredARefresh({ operationId: "retired-A-after-finishB", signal: new AbortController().signal }); }
+                catch (error) { retiredAAfterFinish = error; }
+                assert.ok(retiredAAfterFinish, "retired A refresh refuses after finishB");
+                assert.deepEqual([a.transport.requests.length, b.transport.requests.length], sends);
+              }
               if (publication === "subscription-refresh") {
                 await withTimeout(refreshResponded.promise, 5000, "deferred B refresh settlement after finish");
                 const replies = b.transport.responses.filter(response => response.requestId === 91);
@@ -33443,6 +33458,10 @@ describe("M2 actualRunner credential replacement", () => {
                   chatgptAccountId: next.auth_mode === "subscription" ? next.chatgpt_account_id : "unused-api-key-account",
                   chatgptPlanType: null } });
                 assert.equal(ordinaryBRefreshes, 1, "delivered deferred request actually reaches B refresh bridge");
+                assert.equal(next.auth_mode, "subscription");
+                assert.equal(bRefreshExpected.length, 1);
+                assert.deepEqual(bRefreshExpected, [{ authMode: "subscription", chatgptAccountId: next.chatgpt_account_id }],
+                  "B refresh expectation names B's account, never A's");
               }
             },
           };
@@ -33491,7 +33510,11 @@ describe("M2 actualRunner credential replacement", () => {
                   await nowContinue.promise;
                   events.push("A-Now-drained");
                 } else if (!isA) {
-                  try { owners[0]!.guard(); } catch { retiredADenied = true; }
+                  try { owners[0]!.guard(); } catch (error) {
+                    retiredADenied = true;
+                    retiredADenial = { refusal: error instanceof TrustedExecutionRefusal,
+                      message: error instanceof Error ? error.message : String(error) };
+                  }
                   if (probeEpochConsumers) {
                     // Seed only a stale revision while exercising the actual B factory guard.
                     // Restore synchronously before any other producer can observe the test input.
@@ -35282,6 +35305,16 @@ describe("M2 actualRunner credential replacement", () => {
           if (publication !== "baseline") assert.deepEqual(bChildProbes, resumeRefusal ? ["login", "resume", "fresh", "prepared"] : ["login", "prepared"]);
           assert.equal(nowBuilds.length, 2, "real owned composition constructs A then B Now");
           assert.equal(retiredADenied, true, "A guard rejected during live B construction");
+          if (publication === "gated" && oldClaim.auth_mode === "subscription") {
+            assert.ok(retiredAAfterFinish instanceof TrustedExecutionRefusal,
+              `retired A refresh refused by a trusted-execution guard, got: ${String(retiredAAfterFinish)}`);
+            assert.equal(retiredAAfterFinish.message, "codex credential authority retired", "retired A bridge refused by the retired-authority guard");
+          }
+          assert.equal(aRefreshesAfterFinish, 0, "no refreshCodex call carries A's capability after finishB");
+          assert.ok(retiredADenial);
+          assert.equal(retiredADenial.refusal, true, "retired A summary guard refuses with TrustedExecutionRefusal");
+          assert.ok(["summary credential authority changed", "codex credential authority retired"].includes(retiredADenial.message),
+            `retired A summary guard refuses for authority replacement, got: ${retiredADenial.message}`);
           assert.equal(liveBAdmitted, true, "B guard accepted before executor shutdown");
           if (probeEpochConsumers) assert.equal(staleSummaryCapture, "capture-refused", "B summary rejects stale capture revision");
           assert.deepEqual(nowRuns, phase === "factory" ? [next.capability] : [oldClaim.capability, next.capability]);

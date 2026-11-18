@@ -413,7 +413,7 @@ control is still absent, not that the functional criterion was deferred.
 | Same successful flight/generation/worktree with no new attempt, custody or release/reclaim | U2 effect-injection sensitivity controls (owner-extended decision 10, U2 only): claimRun, attempt directory, custody release, queued transition, worktree reassignment, through the real Runner success test; other effects and the fresh_B return not separately controlled |
 | Strict usable persistence, clear confirmation and continuation on A before teardown | R1–R4 credit three failed-save/inspection variants and empty applied-ACK; U3 credits op mismatch, target, claim_released ownership before/after, combined nonce fence and no-remaining-pending guards; pending-absent-before, other ownership legs, lost-reply clear and reopen's other guards not controlled |
 | Proven A root/tool reap before B material, login and model work; fresh CODEX_HOME | R5 (runner hold) and U4: executor reap proof for root and command-root failures, combined no-B-before-reap fence, distinct per-epoch HOME (b); in-flight tool callbacks, launcher must-not-exist and other phases not controlled |
-| Whole operation-scope/refresh/identity/capability/summary replacement and retired-A rejection | A2 credits one reader; A3 retained-A/Sub→Sub B-scope namespace isolation; R7 B dispatcher publication readiness; R8 retired API-key A reconcile release-request fence during B login; remaining mixed clauses unvalidated |
+| Whole operation-scope/refresh/identity/capability/summary replacement and retired-A rejection | A2 one reader; A3 scope namespace; R7 B dispatcher readiness; R8 retired API-key A reconcile fence; U5 retired A refresh bridge pre-call refusal (P3) and combined summary-authority refusal; identity following B unvalidated (control timed out); bridge post-call copy and assertRefreshAdmission not separately controlled |
 | Exact saved-ID resume; confirmed-refusal-only fresh fallback and lineage; preservation re-hold | R6 credits uncertain-error classification only; confirmed-refusal/preserve companions positive, independent preservation and other clauses unvalidated |
 | Policy episode rejection at request and under apply lock | D74–D77 credit the two isolated owner cases and the same two conditions introduced after READY before apply; paused holds, concurrent interleavings and other policy clauses unvalidated |
 | Refresh lease/intent exclusion, account lock ordering and boundary reconciliation before revoke | D78/D79 credit isolated A coordination-lease and rotating-intent server checks; actual refresh admission, multi-account lock ordering and worker reconciliation ordering remain unvalidated |
@@ -2063,8 +2063,8 @@ abc0af4aba05…): `npm run typecheck && node --import tsx --test
 
 Copy-census scope: every `reaped`/reap-proof read in agent/src between the
 switch teardown and apply or B start (runner.ts attemptCodexCredentialSwitch,
-codex-executor.ts suspendEpoch closures, now-summary.ts). The checks in
-codex-switch-coordinator.ts (:103, :173) are off the path: `coordinateCodexSwitch`
+codex-executor.ts suspendEpoch closures; now-summary.ts searched, none there).
+The checks in codex-switch-coordinator.ts (:103, :174) are off the path: `coordinateCodexSwitch`
 has no caller in agent/src.
 
 Every mutant passed typecheck and exited 1 at the named assertion. Unchanged
@@ -2084,3 +2084,58 @@ assertion (every mutant fails earlier at applies); the production launcher's
 `mkdir -m 700` must-not-exist check (the rig injects the provider launch);
 "created after reap" beyond the combined fence. Sessions-only and `auth.json`
 exclusion remain credited by B1–B3.
+
+U4 checkpoint record: the owner confirmed the published checkpoint ref equals
+85914608424d23f765700f50e7b0f591010b6f17 (pasted `git rev-parse HEAD`
+output) and contains 5cd892025bdf….
+
+### U5 — refresh bridge, identity, capability and summary authority follow B (2026-11-18)
+
+Baseline: a233 `agent/src/runner.ts`:25735–25738 refused every Codex switch
+(A1). The per-epoch authority retirement (`createCodexEpochAuthority`,
+codex-executor.ts :2074–2095; `retire()` in teardown :4114; `publishB` builds
+B's authority :4138) and the summary factory's authority check are new. The
+bridge's expected identity is old: `git show a233883de3c36bae2e940f999cd9d582889dad00:agent/src/codex/codex-executor.ts`
+:870 already reads `{ authMode: "subscription", chatgptAccountId },`.
+
+New probes in agent/test/codex-executor.test.ts (this commit), all inside
+`describe("M2 actualRunner credential replacement")`:
+- P1 (retired A refresh bridge): in the gated subscription→API-key case, right
+  after B finishes, the rig calls A's captured real `auth.config.bridge.refresh`
+  and asserts a `TrustedExecutionRefusal` "codex credential authority retired"
+  with unchanged A/B transport counts.
+- P3 (A capability): `aRefreshesAfterFinish` counts `refreshCodex` calls with A's
+  capability after B finishes; the final block asserts 0 in every case.
+- P2 (identity): B's ordinary refresh records `expected`; the subscription
+  startup-refresh case asserts it equals B's account.
+- P4 (summary authority): the retired-A summary `guard()` probe records the
+  error and asserts a `TrustedExecutionRefusal` with "summary credential
+  authority changed" or "codex credential authority retired" (current code:
+  the former).
+
+Command (agent, one-at-a-time export; candidate
+85914608424d23f765700f50e7b0f591010b6f17 plus this commit's test file, sha256
+a9f25155fb8c…): `npm run typecheck && node --import tsx --test
+--test-timeout=120000 --test-name-pattern='<pattern>' test/codex-executor.test.ts`.
+
+| Control | Kind | Mutation | Case(s) | Red at |
+|---|---|---|---|---|
+| u5-bridge-pre | (d) guard | the refresh wrapper's pre-call `authority.assertCurrent();` (:5750) → `void authority;` | Codex subscription to api_key publication gates Now… | :35313 "no refreshCodex call carries A's capability after finishB" (1 vs 0) |
+| u5-summary-redundant | redundant-fence guard | in the summary factory's `assertAuthority` (:2945–2948) the `currentCodexAuthority !== authority` test and `authority.assertCurrent()`, the two copies of "retired A summary authority refuses" | baseline api_key→subscription and both "publication gates Now" cases | :35315 "retired A summary guard refuses with TrustedExecutionRefusal" (false), all three |
+
+Not credited: u5-identity (bridge expected account → empty string, (b)) first
+failed typecheck (`u5-identity.compilefail.log`), then on a compiling mutant
+the B turn timed out at :35253 before the P2 assertion (client-side
+validation stalls B's refresh); a timeout is not an assertion red. The bridge's
+post-call `assertCurrent()` (:5754) and `assertRefreshAdmission` (:5741) have no
+separate control (P1 stays green with only the pre-call check removed, because
+the post-call copy still refuses; the A refresh then reaches the client, which
+P3 catches). Capability use is credited only for the refresh path (P3) plus
+earlier A3/R8/B5/B6.
+
+Unchanged candidate, primary clone, same test file: four cases pass, 4/4,
+EXIT=0 (`.uzi/scratch/ctl-logs/u5-green.log`); agent `npm run lint` 0/0.
+
+Credit: retired A's refresh bridge refuses before any A-capability refresh
+reaches the client, and retired A's summary authority refuses (combined
+fence). Identity following B remains unvalidated (P2 is a positive check only).
