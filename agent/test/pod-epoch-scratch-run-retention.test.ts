@@ -284,6 +284,10 @@ describe("attempt footprint and authority slot (a retired ledger entry is ended 
       unknown("authority_inventory"));
     assert.deepEqual(await classify({ peekSlot, peekAllSlots: (async () => [slot({ state: "retired", key: "k2" })]) as never }),
       unknown("authority_inventory"), "the attributed slot is not the one in the inventory");
+    for (const over of [{ state: "active" }, { state: "retiring" }, { pending: {} }, { retiring: {} }]) {
+      assert.deepEqual(await classify({ peekSlot, peekAllSlots: (async () => [slot({ state: "retired", key: "k1", ...over })]) as never }),
+        unknown("authority_inventory"), `same key, differing inventory snapshot ${JSON.stringify(over)}`);
+    }
   });
 
   it("authority inventory: read once per pass through the memo", async () => {

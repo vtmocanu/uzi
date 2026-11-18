@@ -1005,7 +1005,9 @@ export class AuthorityStore {
       for (let attempt = 0; ; attempt++) {
         try {
           const slot = await this.#load(dir, key, true);
-          // Listed or head-recorded, a key that now reads as absent is an unresolved read inconsistency: refuse.
+          // Listed or head-recorded, a key that now reads as absent is an unresolved read inconsistency: refuse. Defensive:
+          // a head-recorded key already refuses inside #load ("authority slot missing"), so this branch is reached only by a
+          // listed, head-less file removed between the listing and its read, which no test injects.
           if (slot === null) throw new AuthorityRefusal("authority slot vanished during listing");
           out.push(slot);
           break;

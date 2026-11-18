@@ -5002,7 +5002,8 @@ export class GitCache {
     for (const slot of slots) {
       if (slot == null || typeof slot !== "object") return unknownRetention("authority_inventory");
       if (slot.publication === null) {
-        if (typeof slot.key === "string" && attributedEnded.has(slot.key)) continue;
+        // Attributed by key AND itself still an ended tombstone: a differing snapshot of the same key is unresolved.
+        if (typeof slot.key === "string" && attributedEnded.has(slot.key) && judgeAuthoritySlot("missing", slot).state === "ended") continue;
         return unknownRetention("authority_inventory");
       }
       if (slot.publication === undefined || typeof slot.publication !== "object") return unknownRetention("authority_inventory");
