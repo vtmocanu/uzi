@@ -437,7 +437,7 @@ control is still absent, not that the functional criterion was deferred.
 | Stopped known extra typed member and register_nonce case alias | D25–D56: four running/paused wire cases only |
 | Bounded strict stopped request, other forbidden combinations, op_id and minimal acknowledgement | U18 credits the 1 MiB inclusive bound and the single-value rule (one copy each), op_id and unknown-field refusal (two copies each), expected_epoch on a running report (two copies), and the acknowledgement's four-key run object and 16 KiB bound under a 64 KiB plan; other statuses and the envelope key count not controlled; null/missing fields and case aliases beyond D25–D56 not controlled |
 | Decision 11: no worker-side use of delivered Codex material before the predecessor proof (crash points 1–4) | U21 credits, for API-key A → subscription B on same-worker retained recovery, no executor-client release or refresh before the proof ((c) insertion, (b)) and, on survivors/unverified, no executor run and the `quiescence_failed` blocker ((d), (b)); bodies, launches and requests before the proof asserted only; discard shown only as non-use; other auth directions, the `kind` half of the gate, the re-hold variant and cross-worker recovery not controlled |
-| Crash point 5: predecessor host unreachable | Owner decision 2026-11-18: recorded scope decision, unvalidated and uncredited (environmental limitation); runtime fail-closed per decision 11 |
+| Crash point 5: predecessor host unreachable | Owner decision 2026-11-18: recorded scope decision, unvalidated and uncredited (environmental limitation); fail-closed per decision 11, which U21 evidences only for same-worker retained recovery |
 | Tokens absent from all inputs/acknowledgements/messages/logs | U19 credits B material's registration with the Runner's log and run-message redactors ((d), each separately; the executor's second log registration not controlled), the Codex apply route's log redaction (`LogValue`, (d)) and the stopped acknowledgement and log (effect-injection); the remaining surfaces are guardless by construction and go to the owner batch; m4 security gates remain required |
 
 ## Baseline absence and the class (d) method boundary
@@ -3725,7 +3725,7 @@ attempts did not compile (`u21-*.compilefail*.log`) and earn nothing.
 | u21r-exec-release-before-proof | (c) insertion of the real first use ahead of the proof, (b) | before the proof (:31038) insert a `releaseCodex` through the executor's own provider client (`flight.executor.opts.client`), the client its eager release uses | at feb16cdf2: 32 of 32 at :35217 "no delivered Codex material is used before the first predecessor proof", actual `releases=1 …` |
 | u21r-exec-refresh-before-proof | (c) insertion, (b) | the same position, a `refreshCodex` through the executor's provider client | at feb16cdf2: 32 of 32 at :35217, actual `refreshes=1 …` |
 | u21-release-before-proof | (c) insertion, sensitivity of the Runner-client counter only | the same position, a `releaseCodex` on the Runner's own client (production never releases through it) | at e3bc3e722: 32 of 32 at :35217, `runner=1` |
-| u21-gate | (d) removal, (b) | the `quiescence_failed` gate (:31050) → `if ((…) && Number.NaN > 0)` | at e3bc3e722: 8 of 32 (every forced leaf) at :35219 "unproven predecessor never reaches the executor body"; the 24 quiescent leaves pass |
+| u21-gate | (d) removal, (b) | the `quiescence_failed` gate (:31050) → `if ((…) && Number.NaN > 0)` | at e3bc3e722: 8 of 32 (every forced leaf) at :35219 "unproven predecessor never reaches the executor body"; the 24 quiescent leaves pass. Rerun as u21f-gate at e0f730e4f (a ledger-only child of feb16cdf2): the same 8 of 32 at :35220 |
 | u21r-blocker | (d), (b) | the gate's `blocker = "quiescence_failed"` → `"preservation_failed"` (:31051) | at feb16cdf2: 8 of 32 (every forced leaf) at :35232 "an unproven predecessor takes the quiescence_failed blocker", the executor still unrun |
 
 Unchanged candidate feb16cdf2: 32 of 32 pass (`u21r-green.log`, 92.2 s,
@@ -3773,7 +3773,10 @@ limitation. Fencing refuses stale uzi operations (generation, capability,
 registration), but neither a different B credential nor revoking A's uzi
 capability stops a provider credential that an unreachable predecessor
 already holds. No option-B protocol work. The runtime stays fail-closed:
-delivered material is never used while predecessor quiescence is unproven
-(above), and the run stops for the owner instead. This is not an exception to
+delivered material is never used while predecessor quiescence is unproven, and
+the run stops for the owner instead. U21 (above) evidences this only for
+same-worker retained recovery; a successor on another worker, which is the
+case-5 situation, has no local retained journal, so that gate does not run
+there, and how the api treats such a claim is not evidenced here. This is not an exception to
 the quiescence guarantee, and continuation is never credited because the host
 is gone.
