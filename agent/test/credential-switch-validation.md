@@ -950,3 +950,47 @@ retained journal, so the U21 gate does not run there, and how the api treats
 that claim is not evidenced here. This is not an exception to the quiescence
 guarantee, and continuation is never credited because the host is gone. This
 covers crash point 5 only.
+
+## m3.2 candidate-level checks (2026-11-18)
+
+Run serially by the lead, one command at a time, on the same worker with a warm
+cache. Logs are under `.uzi/scratch/ctl-logs/m32-*`, each ending
+`SHA=<tested revision> EXIT=<status>`.
+
+- `task test:codex-m4` at 9555784fc: 209 pass, run-completeness OK, EXIT=0
+  (121 s).
+- `UZI_DEADCODE_AGENT_REQUIRED=1 task check:agent` at 9555784fc: EXIT=0. No
+  provisioning/lockfile mismatch.
+- `task check:api` at 9555784fc: EXIT=0 (lint 0 issues, deadcode clean).
+- `-race -count=1`, one package at a time, without `UZI_TEST_DATABASE_URL`
+  (LiveDB tests compile and skip; their focused runs are recorded per unit on
+  `cdr-*`):
+  - workersvc, store and handler: ok at 9555784fc;
+  - `api/cmd/uzi` failed at 9555784fc in `TestPrintedInstructionsAreRegistered`
+    (the set-token help and the ambiguous-label error named "`uzi token`" for
+    renaming, which is web-only and has no registry entry). The fix at
+    ca76b1a31 names the web UI; the same test is the regression test (red at
+    9555784fc, green at ca76b1a31). The package then passed at ca76b1a31, and
+    `task lint:api` reported 0 issues.
+- `task check:web` at ca76b1a31: EXIT=0.
+- Touched Vitest files:
+  - `RunCredentialOverride.test.tsx`: 21 pass.
+  - `CodexCredentialSwitch.test.tsx`: 1 of 39 failed in the full-file run at
+    ca76b1a31. The focus check raced `submit`'s `busy` reset; it passed alone
+    twice. The test now waits for focus (e0287607a, test only, component
+    unchanged), and all 39 pass at e0287607a.
+  - `CodexCredentialSwitch.browser.test.tsx` (Chromium): 10 pass at e0287607a.
+- The 16 agent test files this branch touches, each run alone with
+  `--test-timeout=120000`, all pass at ca76b1a31, including
+  `codex-executor.test.ts` (1966 tests, 863 s) and `worker.test.ts`.
+
+The full agent unit suite, `test:api`, `test:web`, `test:web-browser` and the
+run-store-it LiveDB sweep remain pending exact-head PR CI. These are landing
+obligations, not claimed here.
+
+Residual clauses: the m3.1 units U1–U21 are complete. The batched owner question
+on clauses that fit no proof class, and on the "not controlled" residues in
+the ledger's Clause-accounting table, could not reach a human. The lead's
+stated assumption is to record them all as unvalidated and uncredited, run
+m3.2 and m4, and request the owner's formal partial decision at completion.
+m3 stays open until that decision.
