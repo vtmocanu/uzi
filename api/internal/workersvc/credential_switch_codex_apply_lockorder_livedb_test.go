@@ -66,7 +66,7 @@ func (x codexLockOrderFixture) wantBusy(t *testing.T, ctx context.Context, leaf 
 	x.f.noWrite(t, x.run, func() {
 		got, err := x.f.svc.ApplyCredentialSwitch(ctx, worker, x.run, x.req)
 		if err == nil && got.Outcome == ApplyOutcomeApplied {
-			t.Fatalf("%s: apply was APPLIED while its blocker row lock was held", leaf)
+			t.Fatalf("%s: apply was APPLIED; expected credential_busy", leaf)
 		}
 		if err != nil || got.Outcome != ApplyOutcomeNotApplied || got.Reason != applyReasonCredentialBusy || got.Codex != nil || got.Token != "" {
 			t.Fatalf("%s: contended apply did not return an empty credential_busy decision (err=%v outcome=%q reason=%q)", leaf, err, got.Outcome, got.Reason)
@@ -74,9 +74,39 @@ func (x codexLockOrderFixture) wantBusy(t *testing.T, ctx context.Context, leaf 
 	})
 }
 
+// codexLockTimeoutBeginner bounds every lock wait in apply's transaction with a
+// test-only lock_timeout, set right after the service's isolation statement.
+// A NOWAIT refusal is unaffected; a guard-removed mutant that would WAIT on a
+// held row instead fails fast with SQLSTATE 55P03 from that later statement,
+// surfacing as an apply error at the busy-decision assertion, not a test deadline.
+type codexLockTimeoutBeginner struct{ TxBeginner }
+
+type codexLockTimeoutTx struct{ pgx.Tx }
+
+func (b codexLockTimeoutBeginner) Begin(ctx context.Context) (pgx.Tx, error) {
+	tx, err := b.TxBeginner.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return codexLockTimeoutTx{tx}, nil
+}
+
+func (tx codexLockTimeoutTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	tag, err := tx.Tx.Exec(ctx, sql, args...)
+	if err == nil && strings.HasPrefix(sql, "SET TRANSACTION ISOLATION LEVEL") {
+		if _, err := tx.Tx.Exec(ctx, "SET LOCAL lock_timeout = '1s'"); err != nil {
+			return tag, err
+		}
+	}
+	return tag, err
+}
+
 // A held alias row or enablement row, on either side, must make NOWAIT return
 // the public busy decision with no writes; the same request then applies. A
-// successful blocker Scan is the readiness barrier.
+// successful blocker Scan is the readiness barrier. Apply's lock waits are
+// bounded by codexLockTimeoutBeginner, so a removed NOWAIT guard fails at an
+// assertion even when apply would otherwise block on a later statement (for
+// example the runs.codex_secret_id foreign-key check on B's user_secrets row).
 func TestCodexApplyAliasRowContentionLiveDB(t *testing.T) {
 	const aliasSQL = "SELECT user_secret_id FROM codex_credential_state WHERE user_secret_id=$1 AND user_id=$2 FOR UPDATE"
 	const enablementSQL = "SELECT id FROM user_secrets WHERE id=$1 AND user_id=$2 FOR UPDATE"
@@ -92,6 +122,7 @@ func TestCodexApplyAliasRowContentionLiveDB(t *testing.T) {
 	} {
 		t.Run(leaf.name, func(t *testing.T) {
 			x := newCodexLockOrderFixture(t)
+			x.f.svc.SetTxBeginner(codexLockTimeoutBeginner{x.f.env.pool})
 			held := x.aliasA
 			if leaf.target {
 				held = x.aliasB
@@ -151,10 +182,13 @@ func (tx *codexLockOrderTx) QueryRow(ctx context.Context, sql string, args ...an
 	return tx.Tx.QueryRow(ctx, sql, args...)
 }
 
-// Pins that a re-login-style writer taking A's account first and then A's
-// alias row (the order codex_binding.sql LockCodexAliasForShareNowait documents
-// for BumpCodexMaterialRevision / LinkCodexCredentialState) cannot deadlock with
-// apply, which holds the alias share locks and then NOWAIT-locks the account.
+// Pins that a writer taking A's account first and then A's alias row cannot
+// deadlock with apply, which holds the alias share locks and then NOWAIT-locks
+// the account. Real writers in that order: the reconciler's quarantine/reauth
+// restore (RefreshCodexAccountLogin, then LinkCodexCredentialState, in one
+// installAndLink transaction, codexcred.go) and account deletion cascading
+// ON DELETE SET NULL to the alias. (BumpCodexMaterialRevision and the healthy
+// link path take the alias or user_secrets row first, the same order as apply.)
 // The account step is a row lock in the test's writer tx (the real reconciler
 // cannot be paused between its steps deterministically); the alias step is the
 // real LinkCodexCredentialState query on A's current revision, rolled back.
@@ -172,7 +206,7 @@ func TestCodexApplyReverseOrderReloginWriterLiveDB(t *testing.T) {
 
 	var writer pgx.Tx
 	writerDone := make(chan error, 1)
-	fired := false
+	fired, writerStarted, writerDrained := false, false, false
 	observer := &codexLockOrderObserver{TxBeginner: f.env.pool}
 	observer.before = func(_ string, id uuid.UUID) {
 		if fired || id != x.accountA {
@@ -191,6 +225,7 @@ func TestCodexApplyReverseOrderReloginWriterLiveDB(t *testing.T) {
 		if err := writer.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&pid); err != nil {
 			t.Fatal("writer pid unavailable")
 		}
+		writerStarted = true
 		go func() {
 			n, err := f.env.q.WithTx(writer).LinkCodexCredentialState(ctx, store.LinkCodexCredentialStateParams{
 				ProviderAccountID: stateA.ProviderAccountID, UserSecretID: x.aliasA, UserID: f.o.userID, MaterialRevision: stateA.MaterialRevision,
@@ -210,6 +245,7 @@ func TestCodexApplyReverseOrderReloginWriterLiveDB(t *testing.T) {
 			}
 			select {
 			case err := <-writerDone:
+				writerDrained = true
 				t.Fatalf("writer alias step finished before apply released its alias share lock: %v", err)
 			case <-ctx.Done():
 				t.Fatal("writer alias step never blocked on apply's alias lock")
@@ -219,18 +255,24 @@ func TestCodexApplyReverseOrderReloginWriterLiveDB(t *testing.T) {
 	}
 	f.svc.SetTxBeginner(observer)
 	defer func() {
-		if writer != nil {
-			_ = writer.Rollback(f.env.ctx)
+		if writer == nil {
+			return
 		}
+		// Never touch the writer's connection while its goroutine may still use it.
+		if writerStarted && !writerDrained {
+			cancel()
+			if err := <-writerDone; err != nil {
+				t.Logf("writer alias step result on failure path: %v", err)
+			}
+		}
+		_ = writer.Rollback(f.env.ctx)
 	}()
 
 	worker := f.worker(t)
 	f.noWrite(t, x.run, func() {
+		// An apply-side 40P01 is mapped to an opaque read error by
+		// codexSwitchReadFailure and fails the busy assertion below.
 		got, err := f.svc.ApplyCredentialSwitch(ctx, worker, x.run, x.req)
-		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == "40P01" {
-			t.Fatal("DEADLOCK: apply was aborted with 40P01 against a reverse-order account-then-alias writer")
-		}
 		if err == nil && got.Outcome == ApplyOutcomeApplied {
 			t.Fatal("apply was APPLIED while a writer held A's account lock")
 		}
@@ -243,6 +285,7 @@ func TestCodexApplyReverseOrderReloginWriterLiveDB(t *testing.T) {
 	}
 	select {
 	case err := <-writerDone:
+		writerDrained = true
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "40P01" {
 			t.Fatal("DEADLOCK: the reverse-order writer was aborted with 40P01 (deadlock_detected)")
