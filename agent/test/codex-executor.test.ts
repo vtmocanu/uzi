@@ -33523,6 +33523,8 @@ describe("M2 actualRunner credential replacement", () => {
           return run(ctx);
         };
         const diagnostics = recordingLogger();
+        const loggedSecrets: string[] = [];
+        diagnostics.logger.addSecret = secret => { loggedSecrets.push(secret); };
         const runner = m2Runner.runnerWith(() => { factories++; return { executor, homeDir: m2Runner.homeDir }; },
           m2Runner.fakeGitlab().gitlab, undefined, diagnostics.logger, {
             ...(policyOutbox ? { outbox: policyOutbox,
@@ -35284,6 +35286,14 @@ describe("M2 actualRunner credential replacement", () => {
             throw new Error(JSON.stringify({ events, applies, hooks, diagnostics: diagnostics.lines, messages: api.messages(claim.run_id) }), { cause: error });
           });
           if (publication === "baseline") {
+            // B's material reaches both redactors before B work: the run-message redactor
+            // (flight.secrets / redactText) and the log redactor.
+            const redaction = actualFlight as unknown as { secrets: { values(): readonly string[] }; redactText: (text: string) => string };
+            for (const secret of [next.access_token, next.capability]) {
+              assert.ok(loggedSecrets.includes(secret), "Codex switch registers B material with the log redactor");
+              assert.ok(redaction.secrets.values().includes(secret) && !redaction.redactText(`B ${secret} end`).includes(secret),
+                "Codex switch redacts B material from run messages");
+            }
             assertAReconcileBeforeTeardown();
             assertNoACredentialCallBetweenTeardownAndApply();
             assert.equal(aReconcileCalls, 1, "B stale-boundary probe does not count as switch reconciliation");
