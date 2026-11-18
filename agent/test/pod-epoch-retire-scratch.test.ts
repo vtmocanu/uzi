@@ -1689,6 +1689,85 @@ describe("cross-bare attempt identity conflicts", PROC, () => {
     assert.equal(result.retire_scratch.recovered, 0);
     assert.deepEqual(w.bindingRaws(s.uuid), [s.raw]);
   });
+
+  /** Replaces the result of the `n`-th evidence read only (1 = the nomination read, 2 = the re-read inside the reservation). */
+  type ReadResult = Awaited<ReturnType<ReturnType<typeof w.splitGit>["readRetireScratchEvidence"]>>;
+  const onRead = (n: number, change: (r: ReadResult) => ReadResult): void => {
+    const git = w.options.retire!.git;
+    const read = git.readRetireScratchEvidence;
+    let calls = 0;
+    git.readRetireScratchEvidence = async opts => { const r = await read(opts); return ++calls === n ? change(r) : r; };
+  };
+  const withBare = (extra: RetireScratchBareEvidence) => (r: ReadResult): ReadResult =>
+    r.state === "read" ? { ...r, bares: [...r.bares, extra] } : r;
+
+  it("a conflicting bare seen only at nomination keeps a present parent as conflict before any reservation", async () => {
+    const s = w.seed();
+    onRead(1, withBare(ledgerOf(ledgerRaw(s.attemptId))));
+    const result = await w.run();
+    assert.equal(result.retire_scratch.reclaimed, 0);
+    assert.equal(result.retire_scratch.kept_by_reason.conflict, 1);
+    assert.deepEqual(w.reserveCalls, []);
+    assert.equal(w.spawns.length, 0);
+    assert.equal(exists(s.parent), true);
+    untouched(s);
+  });
+
+  it("a conflicting bare seen only at nomination keeps a gone parent as conflict, binding untouched, no reservation", async () => {
+    const s = w.seed({ withParent: false });
+    onRead(1, withBare(ledgerOf(ledgerRaw(s.attemptId))));
+    const result = await w.run();
+    assert.equal(result.retire_scratch.recovered, 0);
+    assert.equal(result.retire_scratch.kept_by_reason.conflict, 1);
+    assert.deepEqual(w.reserveCalls, []);
+    assert.deepEqual(w.bindingRaws(s.uuid), [s.raw]);
+  });
+
+  it("a gone parent whose uuid is bound in two bares is not recovered and is kept as conflict", async () => {
+    const s = w.seed({ withParent: false });
+    // A different attempt id keeps the cross-bare identity check quiet, so only the two-owner count can refuse it.
+    const otherRaw = retireBindingValue({ ...s.binding, attemptId: formatAttemptId(new Date(Date.UTC(2026, 10, 5, 10, 10, 59)), 1, "0123456789abcdef") });
+    const parsed = parseRetireBinding(s.uuid, otherRaw);
+    assert.ok(parsed.ok);
+    addBare(otherBare({ bindings: [{ key: retireBindingKey(s.uuid), uuid: s.uuid, raw: otherRaw, parsed: parsed.binding }] }));
+    const result = await w.run();
+    assert.equal(result.retire_scratch.recovered, 0);
+    assert.equal(result.retire_scratch.kept_by_reason.conflict, 1);
+    assert.deepEqual(w.reserveCalls, []);
+    assert.deepEqual(w.bindingRaws(s.uuid), [s.raw]);
+  });
+
+  const unreadable = (): ReadResult => ({ state: "unknown", reason: "unreadable" } as unknown as ReadResult);
+
+  it("an unknown re-read inside the reservation keeps a present parent as conflict", async () => {
+    const s = w.seed();
+    onRead(2, unreadable);
+    const result = await w.run();
+    assert.equal(result.retire_scratch.reclaimed, 0);
+    assert.equal(result.retire_scratch.kept_by_reason.conflict, 1);
+    untouched(s);
+  });
+
+  it("an unknown re-read inside the reservation leaves a gone parent's binding as metadata_unresolved", async () => {
+    const s = w.seed({ withParent: false });
+    onRead(2, unreadable);
+    const result = await w.run();
+    assert.equal(result.retire_scratch.recovered, 0);
+    assert.equal(result.retire_scratch.kept_by_reason.metadata_unresolved, 1);
+    assert.deepEqual(w.bindingRaws(s.uuid), [s.raw]);
+  });
+
+  for (const withParent of [true, false]) {
+    it(`an unknown re-read that spends the phase window defers a ${withParent ? "present" : "gone"} parent as budget_deferred`, async () => {
+      const s = w.seed({ withParent });
+      onRead(2, () => { w.clock += 125_000; return unreadable(); });
+      const result = await w.run();
+      assert.equal(result.retire_scratch.deferred, 1);
+      assert.equal(result.retire_scratch.kept, 0);
+      assert.equal(result.retire_scratch.reclaimed + result.retire_scratch.recovered, 0);
+      assert.deepEqual(w.bindingRaws(s.uuid), [s.raw]);
+    });
+  }
 });
 
 // Compaction of either bare must not erase the evidence the cross-bare refusal reads (a real second bare, not a faked read).
