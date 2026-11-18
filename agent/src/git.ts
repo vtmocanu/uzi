@@ -5058,11 +5058,11 @@ export class GitCache {
 
   private async classifyRunLocalRecords(runId: string, id: string, opts: EpochScratchRunRetentionOptions,
       limits: Required<EpochRetainedLimits>): Promise<RunRetention> {
-    const ledger: Array<AttemptLedgerEntry & { bare: string }> = [];
+    const ledger: Array<AttemptLedgerEntry & { bare: string; branch: string }> = [];
     let configBytes = 0;
     for (const bare of await this.retainedBares(undefined, { strict: true })) {
       this.checkRecoveryInterruption();
-      const found = await this.withLock(bare, async (): Promise<RunRetention | { ledger: AttemptLedgerEntry[] }> => {
+      const found = await this.withLock(bare, async (): Promise<RunRetention | { ledger: Array<AttemptLedgerEntry & { branch: string }> }> => {
         await this.assertRecoveryBare(bare);
         // Pass-scoped memo: each bare's config listing is read once per pass. This is safe only because the pass holds
         // exclusive pod-epoch ownership before admission and no other writer runs during it, so the config cannot change
@@ -5163,9 +5163,9 @@ export class GitCache {
    * preserved by cleanupRecoveryGeneration), not retention of a TMPDIR leaf, so its presence neither keeps nor
    * releases. Any other `uzi-*` key is ignored unless it names the run.
    */
-  private scanRunBareConfig(config: string, id: string): RunRetention | { ledger: AttemptLedgerEntry[] } {
+  private scanRunBareConfig(config: string, id: string): RunRetention | { ledger: Array<AttemptLedgerEntry & { branch: string }> } {
     const protectedFamily = /^uzi-(?:recovery|retained|attempts|stopped|recoveryowner|restore)\./;
-    const ledger = new Map<string, AttemptLedgerEntry>();
+    const ledger = new Map<string, AttemptLedgerEntry & { branch: string }>();
     const journals = new Map<string, string>();
     for (const item of config.split("\0")) {
       const nl = item.indexOf("\n");
@@ -5179,7 +5179,7 @@ export class GitCache {
       if (m) {
         const entry = parseAttemptLedgerEntry(value);
         if (!entry) return unknownRetention("attempt_ledger");
-        ledger.set(entry.attemptId, entry);
+        ledger.set(entry.attemptId, { ...entry, branch: m[1]! });
         continue;
       }
       m = /^uzi-recovery\.(.+)\.clone$/.exec(key);

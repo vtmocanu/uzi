@@ -5,6 +5,8 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import fs from "node:fs";
 import { EventEmitter } from "node:events";
+import fsp from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import { PassThrough } from "node:stream";
 import type { spawn, ChildProcess } from "node:child_process";
 import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
@@ -1624,6 +1626,199 @@ test("#4420 authority inventory: an abort of the pass mid-read interrupts the re
     await untouched(w, [leafOf(RUN_A)]);
   });
 });
+
+// ---- Issue #4420 CR3 through the epoch: a REAL in-flight fs operation of the REAL inventory is held behind a gate while
+// the pass is interrupted (an abort of the pass, or the soft deadline passing). Test-side instrumentation only. ----
+
+interface FsHold { op: string; path: string; nth: number }
+
+/**
+ * Wraps the fs/promises namespace functions, the FileHandle prototype and the 25 ms retry timer: every wrapper records the
+ * call, really starts the real operation, and for the one chosen (op, path, nth) holds the real result behind a gate until
+ * `release()`. Adapted from the instrumentation in completion-authority.test.ts.
+ */
+function instrumentFs(hold: FsHold) {
+  const log: Array<{ op: string; path: string }> = [];
+  const counts = new Map<string, number>();
+  const handlePaths = new WeakMap<object, string>();
+  const state = { recording: true, heldIndex: -1 };
+  let release!: () => void;
+  const released = new Promise<void>(resolve => { release = resolve; });
+  let reachedResolve!: () => void;
+  const reached = new Promise<void>(resolve => { reachedResolve = resolve; });
+  let done = false;
+  const note = (op: string, p: string): Promise<void> | undefined => {
+    log.push({ op, path: p });
+    const k = `${op}\0${p}`;
+    const n = (counts.get(k) ?? 0) + 1;
+    counts.set(k, n);
+    if (!done && op === hold.op && p === hold.path && n === hold.nth) {
+      done = true;
+      state.heldIndex = log.length - 1;
+      reachedResolve();
+      return released;
+    }
+    return undefined;
+  };
+  type AnyFn = (this: unknown, ...args: unknown[]) => Promise<unknown>;
+  const ns = fsp as unknown as Record<string, AnyFn>;
+  const originals: Array<() => void> = [];
+  const patch = (target: Record<string, unknown>, name: string, wrap: (real: AnyFn) => AnyFn): void => {
+    const real = target[name] as AnyFn;
+    target[name] = wrap(real);
+    originals.push(() => { target[name] = real; });
+  };
+  const start = (real: AnyFn, self: unknown, args: unknown[]): Promise<unknown> => {
+    const pending = real.apply(self, args);
+    pending.catch(() => undefined);
+    return pending;
+  };
+  return {
+    log, state, release, reached,
+    async install(): Promise<void> {
+      const probe = await fsp.open(process.execPath, "r");
+      const handleProto = Object.getPrototypeOf(probe) as Record<string, unknown>;
+      await probe.close();
+      for (const name of ["lstat", "readdir", "realpath"]) {
+        patch(ns, name, real => async function (this: unknown, ...args: unknown[]) {
+          const gated = state.recording ? note(name, String(args[0])) : undefined;
+          const pending = start(real, this, args);
+          if (gated) await gated;
+          return pending;
+        });
+      }
+      patch(ns, "open", real => async function (this: unknown, ...args: unknown[]) {
+        const p = String(args[0]);
+        const gated = state.recording ? note("open", p) : undefined;
+        const pending = start(real, this, args);
+        if (gated) await gated;
+        const handle = await pending as object;
+        if (state.recording) {
+          handlePaths.set(handle, p);
+          // close is an own (instance) member of a FileHandle on this Node, so it is wrapped per handle, not on the prototype.
+          const realClose = (handle as { close: AnyFn }).close;
+          (handle as { close: AnyFn }).close = function (this: unknown, ...a: unknown[]) {
+            log.push({ op: "close", path: p });
+            return realClose.apply(handle, a);
+          } as AnyFn;
+        }
+        return handle;
+      });
+      for (const name of ["read", "stat"]) {
+        patch(handleProto, name, real => function (this: unknown, ...args: unknown[]) {
+          const tracked = state.recording && handlePaths.has(this as object);
+          const gated = tracked ? note(name, handlePaths.get(this as object)!) : undefined;
+          const pending = start(real, this, args);
+          return gated ? gated.then(() => pending) : pending;
+        });
+      }
+      const realSet = globalThis.setTimeout;
+      globalThis.setTimeout = ((cb: (...a: unknown[]) => void, ms?: number, ...rest: unknown[]) => {
+        if (state.recording && ms === 25) {
+          const gated = note("sleep", "");
+          if (gated) return realSet(() => { void gated.then(() => cb(...rest)); }, ms);
+        }
+        return realSet(cb, ms, ...rest);
+      }) as unknown as typeof setTimeout;
+      originals.push(() => { globalThis.setTimeout = realSet; });
+      syncBuiltinESMExports();
+    },
+    /** Idempotent and safe after a partial install. */
+    restore(): void {
+      state.recording = false;
+      release();
+      for (const undo of originals.splice(0).reverse()) undo();
+      syncBuiltinESMExports();
+    },
+  };
+}
+
+/** A real enrolled store holding one slot one ahead of its head (the slot rename landed, the head update failed). */
+async function enrollAheadAuthority(w: World, rw: RunWorld): Promise<void> {
+  const dataDir = fs.realpathSync(rw.fx.dataDir);
+  const workerToken = "unit-reclaim-" + "token-4420";
+  const lifetime = await acquireWorkerLifetime(dataDir, testLockOptions());
+  const sourceDir = join(dataDir, "runner", "slug", "issue-4420");
+  fs.mkdirSync(sourceDir, { recursive: true });
+  const flags = { head: false };
+  const store = await withAuthorityTransaction(lifetime, { timeoutMs: 5000 }, tx => openAuthorityStore(tx, {
+    workerToken,
+    ops: {
+      syncFile: h => h.sync(), syncDir: h => h.sync(),
+      rename: async (a, b) => {
+        if (flags.head && basename(dirname(b)) === "heads") throw new Error("injected head failure");
+        fs.renameSync(a, b);
+      },
+    },
+  }));
+  flags.head = true;
+  await assert.rejects(withAuthorityTransaction(lifetime, { timeoutMs: 5000 }, tx => store.admitSourceUse(tx, sourceDir)), /injected head failure/);
+  w.options.scratch!.authority!.peekAllSlots = (max, bound) => peekAllAuthoritySlots({ dataDir, workerToken }, max, bound);
+}
+
+/** Soft-deadline margin the deadline cases leave the real inventory: the pass's `deadlineAt()` is `Date.now() + this`. */
+const EPOCH_DEADLINE_LEFT_MS = 1200;
+
+/**
+ * One interruption of the real run-leaf inventory through the real runPodEpochShadow. `abort`: the pass's parent signal
+ * aborts while the chosen real operation is held. `deadline`: the soft deadline (hardPass - 5000) passes while it is held.
+ * The pass clock is a stub that jumps (inside the ownership read, before the classifier call) to EPOCH_DEADLINE_LEFT_MS
+ * short of the soft deadline, so the hard timer (5000 ms later) has not fired during the ~1.5 s hold.
+ */
+async function interruptInventoryThroughEpoch(mode: "abort" | "deadline", scenario: "readdir" | "retry-sleep") {
+  await withRunWorld([leafOf(RUN_A)], async (w, rw) => {
+    await seedRetiredAttempt(rw, RUN_A);
+    const authority = join(fs.realpathSync(rw.fx.dataDir), ".uzi-authority");
+    if (scenario === "readdir") await enrollRealAuthority(w, rw, true); else await enrollAheadAuthority(w, rw);
+    let clock = 0, jumpedAt = 0;
+    if (mode === "deadline") {
+      w.options.now = () => clock;
+      const ownership = w.options.client.getRunOwnership;
+      w.options.client.getRunOwnership = async (...args) => {
+        clock = 600_000 - 5000 - EPOCH_DEADLINE_LEFT_MS; jumpedAt = Date.now();
+        return ownership(...args);
+      };
+    }
+    const ins = instrumentFs(scenario === "readdir" ? { op: "readdir", path: join(authority, "slots"), nth: 1 } : { op: "sleep", path: "", nth: 1 });
+    // restore() is idempotent and safe after a partial install.
+    try {
+      await ins.install();
+      const pass = runPodEpochShadow(w.options);
+      let settled = false;
+      pass.then(() => { settled = true; }, () => { settled = true; });
+      try {
+        await Promise.race([ins.reached, new Promise<void>((_, reject) => setTimeout(() => reject(new Error("the held operation was never reached")), 10_000))]);
+        if (mode === "abort") w.parent.abort();
+        else while (Date.now() - jumpedAt < EPOCH_DEADLINE_LEFT_MS + 400) await new Promise(resolve => setTimeout(resolve, 50));
+        for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve));
+        assert.equal(settled, false, "epoch handover waits: the pass does not resolve while the started operation is in flight");
+      } finally { ins.release(); }
+      const result = (await pass)!; // a PodEpochSettlementError would reject here and fail the test; it is not caught
+      const after = ins.log.slice(ins.state.heldIndex + 1).filter(r => r.op === "sleep" || r.path.startsWith(authority));
+      assert.deepEqual(after.filter(r => r.op !== "close"), [], "no inventory operation starts after the held one");
+      const mine = ins.log.filter(r => r.path.startsWith(authority));
+      assert.equal(mine.filter(r => r.op === "close").length, mine.filter(r => r.op === "open").length, "every opened inventory handle was closed");
+      if (mode === "deadline") {
+        assert.deepEqual(keptRun(result), { run_local_unknown: 1 });
+        assert.deepEqual(result.scratch.run_local_sources, { classifier: 1 });
+      } else {
+        assert.equal(result.scratch.state, "stopped");
+        assert.deepEqual(keptRun(result), {});
+      }
+      assert.deepEqual(w.calls.discards, []);
+      assert.equal(result.scratch.deleted, 0);
+      await untouched(w, [leafOf(RUN_A)]);
+    } finally { ins.restore(); }
+  });
+}
+
+for (const mode of ["abort", "deadline"] as const) {
+  for (const scenario of ["readdir", "retry-sleep"] as const) {
+    test(`#4420 through the epoch: ${mode} while the real inventory's ${scenario === "readdir" ? "slots readdir" : "bounded 25 ms retry sleep"} is held keeps the leaf, starts nothing after the hold, and the pass waits then resolves`, FD_ONLY, async () => {
+      await interruptInventoryThroughEpoch(mode, scenario);
+    });
+  }
+}
 
 test("#4420 kept run_local_active: the run's recovery record, a journal naming the clone, a live ledger, outbox protection and an in-flight credential switch", FD_ONLY, async () => {
   const cases: Array<[string, string, (rw: RunWorld) => Promise<void>]> = [
