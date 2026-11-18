@@ -2470,7 +2470,7 @@ Command (export of 628535ef9, throwaway postgres `cdr-4202-u9pg`): from api,
 | Control | Kind | Mutation | Log, commit | Red at |
 |---|---|---|---|---|
 | u9-recheck | (b) **preservation sensitivity control** (the guard is the unchanged a233 recheck; the switch interleaving that triggers it is new) | final reauthorization `aerr != nil` → `false && aerr != nil` (codexrefresh.go :1335) | `.uzi/scratch/ctl-logs/u9-recheck.{diff,log}`, 628535ef9 | test :41 "release returned A's token after a switch apply committed before the final reauthorization" |
-| u9-recheck-relocate | (c) ordering | the same reauthorization moved from after the material read (:1335) to just before `releaseCodexCredential` (:1325) | `.uzi/scratch/ctl-logs/u9-recheck-relocate.{diff,log}`, 628535ef9 | test :41, as above |
+| u9-recheck-relocate | (c) ordering | the same reauthorization moved from after the material read (:1335) to just before `releaseCodexCredential` (:1325) | `.uzi/scratch/ctl-logs/u9-recheck-relocate.{diff,log}`, fc465e5aa (code identical to 628535ef9; fc465e5aa changed only the ledger). The `.diff` holds the applied final-state relocation; the driver's intermediate removal-only diff is kept separately as `u9-recheck-relocate.diff.with-intermediate` | test :41, as above |
 
 Unchanged candidate 628535ef9: the test passes, EXIT=0
 (`.uzi/scratch/ctl-logs/u9-green.log`); `task lint:api` 0 issues
@@ -2481,8 +2481,12 @@ Credit: when a switch apply commits between a release's first authorization
 and placed after the material read — is what keeps A's token from being
 returned; the release fails with the stale-epoch authorization error. An apply
 that commits after the final reauthorization passed, before the response is
-written, still returns A's token: that window is inherent (no lock spans the
-response) and the token is one the worker already held under A's epoch. Not credited: the API-key A
+written, still returns A's token: nothing is checked between the passing
+reauthorization and `return result, nil` (:1341), and the token is one A's
+epoch was still authorized to receive when the reauthorization passed. The
+test exercises one point in the window (after the account read, before the
+login is opened); other points are refused the same way by reading the code,
+not by test. Not credited: the API-key A
 release path (its material read is not hooked here), the vault-locked branch of
 the same recheck after a switch (pinned without a switch by
 `TestReleaseCodexCredentialVaultLockedAuthorityLostLiveDB`), and releases that complete before the apply
