@@ -212,3 +212,17 @@ func TestAttachRefusesATagTheBotCannotUse(t *testing.T) {
 		}
 	}
 }
+
+func TestTagListingTakesNoQueryAndNeedsFields(t *testing.T) {
+	srv := NewServer(t)
+	base := "/api/tags/" + EligibilityTagID + "/issues"
+	if status, _ := call(t, srv, http.MethodGet, base+"?fields=id&query=x", ""); status != http.StatusBadRequest {
+		t.Errorf("a query parameter = %d, want 400", status)
+	}
+	if status, _ := call(t, srv, http.MethodGet, base, ""); status != http.StatusBadRequest {
+		t.Errorf("no fields = %d, want 400", status)
+	}
+	if status, _ := call(t, srv, http.MethodGet, base+"?fields=id", ""); status != http.StatusOK {
+		t.Errorf("fields only = %d, want 200", status)
+	}
+}

@@ -185,7 +185,7 @@ func (h *Handler) ListPulls(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	ch, err := h.codeHostForRepo(r.Context(), repo.ID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
+	ch, err := h.codeHostForRepo(r.Context(), repo.UserID, repo.ID, repo.IssueTrackerConnectionID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
 		slog.Error("forge view: build forge", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -294,7 +294,7 @@ func (h *Handler) GetPull(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "invalid pull id")
 		return
 	}
-	ch, err := h.codeHostForRepo(r.Context(), repo.ID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
+	ch, err := h.codeHostForRepo(r.Context(), repo.UserID, repo.ID, repo.IssueTrackerConnectionID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
 		slog.Error("forge view: build forge", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -393,7 +393,7 @@ func (h *Handler) ListCIRuns(w http.ResponseWriter, r *http.Request) {
 	if limit > forgeViewCIRunsMax {
 		limit = forgeViewCIRunsMax
 	}
-	ch, err := h.codeHostForRepo(r.Context(), repo.ID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
+	ch, err := h.codeHostForRepo(r.Context(), repo.UserID, repo.ID, repo.IssueTrackerConnectionID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
 		slog.Error("forge view: build forge", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -445,7 +445,7 @@ func (h *Handler) GetCIRun(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "invalid run id")
 		return
 	}
-	ch, err := h.codeHostForRepo(r.Context(), repo.ID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
+	ch, err := h.codeHostForRepo(r.Context(), repo.UserID, repo.ID, repo.IssueTrackerConnectionID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
 		slog.Error("forge view: build forge", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")

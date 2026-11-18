@@ -30,6 +30,9 @@ func (m *Materializer) reconcileDinD(ctx context.Context, w protocol.DesiredWork
 	if !w.Docker || w.Ephemeral || !supported {
 		return active, nil
 	}
+	// The tick's placement was decided from this claim, before the maintenance
+	// relist. A new identity or stamp must wait for a new whole-worker observation.
+	placementClaim := o.DinDClaim
 	transition := func(next protocol.DindMaintenance) {
 		if _, err := c.TransitionDinD(ctx, w.ID, next); err != nil {
 			m.log.Info("DinD maintenance waiting for server preconditions", "worker_id", w.ID, "phase", next.Phase, "error", err)
@@ -49,6 +52,9 @@ func (m *Materializer) reconcileDinD(ctx context.Context, w protocol.DesiredWork
 		o, err = m.maintenanceObservation(ctx, w.ID, ns, o)
 		if err != nil {
 			return true, err
+		}
+		if m.cfg.NewPlacementSet() && placementClaimChanged(placementClaim, o.DinDClaim) {
+			return true, nil
 		}
 		if o.DinDPVCCreatedAt != nil && m.now().Sub(*o.DinDPVCCreatedAt) < m.recycle.Cooldown {
 			m.log.Info(fmt.Sprintf("disk-recycle-skipped-cooldown worker=%s", w.ID))
@@ -88,7 +94,7 @@ func (m *Materializer) reconcileDinD(ctx context.Context, w protocol.DesiredWork
 			}
 		}
 	}
-	wantHash := RenderDeployment(m.cfg, w, spec).Spec.Template.Annotations[AnnotationSpecHash]
+	wantHash := RenderDeployment(m.renderCfgFor(ctx, w, o), w, spec).Spec.Template.Annotations[AnnotationSpecHash]
 	if !m.recycle.Enabled && (op.Phase == "requested" || op.Phase == "ready") {
 		next.Phase = "cancelled"
 		next.Reason = "recycle_disabled"
@@ -100,6 +106,9 @@ func (m *Materializer) reconcileDinD(ctx context.Context, w protocol.DesiredWork
 		o, err = m.maintenanceObservation(ctx, w.ID, ns, o, op)
 		if err != nil {
 			return true, err
+		}
+		if m.cfg.NewPlacementSet() && placementClaimChanged(placementClaim, o.DinDClaim) {
+			return true, nil
 		}
 	}
 	switch op.Phase {
@@ -199,6 +208,28 @@ func (m *Materializer) reconcileDinD(ctx context.Context, w protocol.DesiredWork
 		if !o.HasDinDDataPVC || !o.HasDeployment {
 			if o.HasDinDDataPVC && !o.DinDPVCLive {
 				return true, nil
+			}
+			return true, m.reconcileReplacement(ctx, w, o)
+		}
+		// Replacement template drift (#4455): the replacement Deployment and its bound
+		// DinD claim exist, so converge the template through the admission-gated path.
+		// The identity terms repeat the old-PVC branch and old-daemon guard above as
+		// defence in depth.
+		if o.DinDPVCLive && o.DinDPVCPhase == string(corev1.ClaimBound) && o.DinDPVCUID != "" && o.DinDPVCUID != op.PVCUID &&
+			o.DeploymentUID != "" && o.DeploymentUID != op.DeploymentUID && !o.DeploymentTerminating &&
+			(o.SpecHash != wantHash || o.Generation != w.Generation) {
+			// Permission to reconcile an unchanged worker is not roll admission.
+			// A fresh list may also find a different same-name Deployment: neither
+			// can reuse the earlier decision. Let the next tick plan and reserve it.
+			if e := rollFrom(ctx, w.ID); !m.drain.ForceRoll {
+				if e == nil || !e.admitted || !e.drift || e.marker == nil || e.dep == nil || string(e.dep.UID) != o.DeploymentUID {
+					return true, nil
+				}
+				// Use the reservation from the same fresh read as the patch RV.
+				// Status updates may advance RV, but cancellation must still fence us.
+				if o.MaintenanceRollAnnotation == "" || o.MaintenanceRollAnnotation != e.dep.Annotations[annotationRoll] {
+					return true, nil
+				}
 			}
 			return true, m.reconcileReplacement(ctx, w, o)
 		}

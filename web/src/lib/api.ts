@@ -979,11 +979,17 @@ const realApi = {
   forgeConfig: () => request<ForgeConfig>("GET", "/forge/config"),
   listConnections: () =>
     request<{ connections: ForgeConnection[] }>("GET", "/forge/connections"),
-  createConnection: (baseUrl: string, token: string, forgeType = "gitlab") =>
+  // replace=true is the explicit opt-in to rotate an EXISTING connection's
+  // credential. Without it the API refuses a create that targets an already
+  // connected user + forge type + base URL with 409 forge_connection_exists, so a
+  // user who re-submits the same host cannot silently destroy the token they
+  // already had.
+  createConnection: (baseUrl: string, token: string, forgeType = "gitlab", replace = false) =>
     request<{ connection: ForgeConnection }>("POST", "/forge/connections", {
       base_url: baseUrl,
       token,
       forge_type: forgeType,
+      ...(replace ? { replace: true } : {}),
     }),
   verifyConnection: (id: string) =>
     request<{ connection: ForgeConnection }>(

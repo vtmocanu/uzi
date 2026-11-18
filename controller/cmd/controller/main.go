@@ -96,6 +96,7 @@ func main() {
 		EpochReclaimDeletionCanaryID:  cfg.WorkerEpochReclaimDeletionCanaryID,
 		EpochScratchDeletion:          cfg.WorkerEpochScratchDeletion,
 		RetireScratchOutcomesDisabled: !cfg.WorkerRetireScratchOutcomes,
+		RetireScratchReclaimDisabled:  !cfg.WorkerRetireScratchReclaim,
 		DinDImage:                     cfg.WorkerDinDImage,
 		// Config carries the POSITIVE `rootless` bool (matching the chart value); the
 		// render side carries the NEGATIVE `non-rootless` so its zero value is the safe
@@ -129,6 +130,8 @@ func main() {
 		DeploymentLabels:            cfg.WorkerDeploymentLabels,
 		DeploymentAnnotations:       cfg.WorkerDeploymentAnnotations,
 		Tolerations:                 cfg.WorkerTolerations,
+		NewPlacementNodeSelector:    cfg.WorkerNewPlacementNodeSelector,
+		NewPlacementTolerations:     cfg.WorkerNewPlacementTolerations,
 		MaxConcurrentRuns:           cfg.WorkerMaxConcurrentRuns,
 		MemoryGuardEnabled:          cfg.WorkerMemoryGuardEnabled,
 		MemoryGuardReserveBytes:     cfg.WorkerMemoryGuardReserveBytes,

@@ -37,6 +37,11 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// PRD 4173 D13: refused before the forge write, so nothing is created that the
+	// issue-number guard would then strand.
+	if refuseNeverEnabled(w, repo.AwaitingFirstEnable, repo.IssueSourceLocked) {
+		return
+	}
 	var req createIssueRequest
 	if err := httpx.DecodeJSON(r, &req); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
@@ -52,7 +57,7 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tr, err := h.issueTrackerForRepo(r.Context(), repo.ID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
+	tr, err := h.issueTrackerForRepo(r.Context(), repo.UserID, repo.ID, repo.IssueTrackerConnectionID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
 		slog.Error("build forge for connection", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -65,6 +70,9 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 	created, err := tr.CreateIssue(r.Context(), repo.ForgeProjectID, title, req.Description, []string{uziLabel})
 	if err != nil {
 		// err is already PAT-redacted by the driver.
+		if writeIssueWriteNotOffered(w, err) {
+			return
+		}
 		httpx.Error(w, http.StatusBadGateway, "could not create the issue on the forge: "+err.Error())
 		return
 	}
@@ -99,6 +107,7 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 		Author:         pgconv.TextOrNull(created.Author),
 		HasPrdLink:     forgesvc.HasPRDLink(req.Description),
 		ForgeUpdatedAt: pgtype.Timestamptz{Time: updated, Valid: true},
+		IssueKey:       pgtype.Text{}, // only the linked sync writes issue_key (D10)
 	})
 	if err != nil {
 		// The issue exists on the forge; only the local cache write failed. The
@@ -202,12 +211,17 @@ func (h *Handler) GetIssueDetail(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// PRD 4173 D13: a re-listed project whose issue source was an issue tracker reads no forge
+	// issue by number (the forge's numbers are not the ones its history used).
+	if refuseNeverEnabled(w, repo.AwaitingFirstEnable, repo.IssueSourceLocked) {
+		return
+	}
 	iid, err := parseInt64(chi.URLParam(r, "iid"))
 	if err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid issue id")
 		return
 	}
-	tr, err := h.issueTrackerForRepo(r.Context(), repo.ID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
+	tr, err := h.issueTrackerForRepo(r.Context(), repo.UserID, repo.ID, repo.IssueTrackerConnectionID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
 		slog.Error("build forge for connection", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")

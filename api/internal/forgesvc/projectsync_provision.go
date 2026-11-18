@@ -31,7 +31,7 @@ import (
 // An unintrospectable PAT proceeds best-effort — the first mutation surfaces the
 // real error, captured in the link row's last_error.
 func (s *ProjectSyncService) Adopt(ctx context.Context, repoID uuid.UUID, projectNumber int, ownerKind forge.ProjectV2OwnerKind) error {
-	repo, syncer, err := s.projectSyncPreamble(ctx, repoID)
+	repo, syncer, err := s.projectSyncSeedPreamble(ctx, repoID)
 	if err != nil {
 		return err
 	}
@@ -85,7 +85,7 @@ func (s *ProjectSyncService) Adopt(ctx context.Context, repoID uuid.UUID, projec
 // Preconditions and the CLEAR sentinels it returns are identical to Adopt (see
 // projectSyncPreamble). title defaults to a sensible value when empty.
 func (s *ProjectSyncService) Provision(ctx context.Context, repoID uuid.UUID, ownerKind forge.ProjectV2OwnerKind, title string) error {
-	repo, syncer, err := s.projectSyncPreamble(ctx, repoID)
+	repo, syncer, err := s.projectSyncSeedPreamble(ctx, repoID)
 	if err != nil {
 		return err
 	}
@@ -508,7 +508,7 @@ func (s *ProjectSyncService) Resync(ctx context.Context, repoID uuid.UUID) (stri
 		return "", fmt.Errorf("project sync: resync load link: %w", err)
 	}
 
-	repo, syncer, err := s.projectSyncPreamble(ctx, repoID)
+	repo, syncer, err := s.projectSyncSeedPreamble(ctx, repoID)
 	if err != nil {
 		return "", err
 	}
@@ -610,7 +610,7 @@ func (s *ProjectSyncService) AutoCreateColumns(ctx context.Context, repoID uuid.
 		return "", fmt.Errorf("project sync: autocreate load link: %w", err)
 	}
 
-	repo, syncer, err := s.projectSyncPreamble(ctx, repoID)
+	repo, syncer, err := s.projectSyncSeedPreamble(ctx, repoID)
 	if err != nil {
 		return "", err
 	}

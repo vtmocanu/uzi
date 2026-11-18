@@ -42,6 +42,9 @@ export const SELF_IMPROVE_LABEL = "uzi-self-improve";
  * render filter, the runnable marker, the solid-vs-quiet treatment and the
  * Start-vs-Promote affordance, so the button state matches what a Start would do.
  *
+ * A card with a non-empty `issue_key` is also uzi's: the linked sync caches only issues
+ * that carry the link's eligibility tag, so its presence is the eligibility signal.
+ *
  * `botForgeUserID > 0` guards an unresolved bot id (mirrors the server's `@bot_id>0` /
  * M2's `botID<=0` guard): a 0/absent id must never mark every assigned card runnable.
  *
@@ -52,11 +55,14 @@ export const SELF_IMPROVE_LABEL = "uzi-self-improve";
  * predicate falls back to label-only rather than throwing on `undefined.includes`.
  */
 export function isUziCard(
-  card: Pick<Card, "labels" | "assignee_ids">,
+  card: Pick<Card, "labels" | "assignee_ids" | "issue_key">,
   uziLabel: string,
   botForgeUserID: number | undefined,
 ): boolean {
   const botId = botForgeUserID ?? 0;
+  // A card the linked sync cached carries an issue_key and is eligible by its issue tracker
+  // tag (a stored name that may differ from the configured uzi label), so it needs no label.
+  if (card.issue_key) return true;
   return card.labels.includes(uziLabel) || (botId > 0 && (card.assignee_ids ?? []).includes(botId));
 }
 

@@ -1,7 +1,11 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
-import { teardownDocker } from "../src/run-quiescence.js";
+import fs from "node:fs";
+import net from "node:net";
+import os from "node:os";
+import path from "node:path";
+import { dockerRunningContainers, recordMaintenanceBootstrap, teardownDocker, terminalMaintenanceProof } from "../src/run-quiescence.js";
 
 async function listen(server: http.Server): Promise<number> {
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -163,6 +167,76 @@ describe("teardownDocker overall deadline", () => {
       assert.equal(listings, 3);
     } finally {
       await shutdown(server);
+    }
+  });
+});
+
+describe("dockerRequest cancellation is joined", () => {
+  // The plain (unscoped) request used to reject BEFORE the socket's close event; a caller that then reported the step settled
+  // left a closing socket behind. The rejection must follow the request's close (and the response's, when one arrived).
+  for (const peer of ["silent", "headers then stalled body"] as const) {
+    it(`an abort while the peer is ${peer} settles only after the request and response closed`, { timeout: 10_000 }, async () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "docker-join-"));
+      const sock = path.join(dir, "d.sock");
+      const sockets = new Set<net.Socket>();
+      const server = peer === "silent"
+        ? net.createServer(c => { sockets.add(c); c.on("error", () => undefined); })
+        : http.createServer((_req, res) => { res.writeHead(200, { "content-type": "application/json" }); res.flushHeaders(); });
+      await new Promise<void>(resolve => server.listen(sock, resolve));
+      const realRequest = http.request;
+      let requestClosed = false, responseSeen = false, responseClosed = false;
+      (http as { request: unknown }).request = (...args: unknown[]) => {
+        const req = (realRequest as (...a: unknown[]) => http.ClientRequest)(...args);
+        req.on("close", () => { requestClosed = true; });
+        req.on("response", r => { responseSeen = true; r.on("close", () => { responseClosed = true; }); });
+        return req;
+      };
+      try {
+        const controller = new AbortController();
+        setTimeout(() => controller.abort(), 300);
+        assert.equal(await dockerRunningContainers(`unix://${sock}`, controller.signal), "unknown");
+        assert.equal(requestClosed, true, "the request socket was still closing when the call settled");
+        if (peer !== "silent") assert.ok(responseSeen);
+        assert.equal(responseClosed, responseSeen, "the response was still closing when the call settled");
+      } finally {
+        (http as { request: unknown }).request = realRequest;
+        if (server instanceof http.Server) server.closeAllConnections();
+        for (const c of sockets) c.destroy();
+        await new Promise<void>(resolve => server.close(() => resolve()));
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+describe("terminalMaintenanceProof under a caller bound", () => {
+  it("its process scan and inter-scan sleep end at the bound, and nothing starts once the bound has passed", { timeout: 20_000 }, async () => {
+    recordMaintenanceBootstrap([]);
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "proof-bound-"));
+    const sock = path.join(dir, "d.sock");
+    const sockets = new Set<net.Socket>();
+    let accepted = 0;
+    const server = net.createServer(c => { accepted++; sockets.add(c); c.resume(); c.on("error", () => undefined); });
+    await new Promise<void>(resolve => server.listen(sock, resolve));
+    try {
+      // Three scans 250 ms apart take ~650 ms unbounded; the bound must cut that short (the scan itself is not quiescent here,
+      // so the daemon is never reached: its own bound is covered by the dockerRunningContainers tests).
+      const window = 300;
+      const started = Date.now();
+      const bound = { signal: AbortSignal.timeout(window), deadline: started + window };
+      assert.equal(await terminalMaintenanceProof(3, `unix://${sock}`, bound), false, "no proof was given");
+      const elapsed = Date.now() - started;
+      assert.ok(elapsed < window + 250, `proof returned ${elapsed} ms into a ${window} ms bound`);
+      const seen = accepted;
+      const late = Date.now();
+      assert.equal(await terminalMaintenanceProof(3, `unix://${sock}`, { signal: AbortSignal.timeout(1), deadline: late - 1 }), false);
+      assert.ok(Date.now() - late < 250);
+      await new Promise(r => setTimeout(r, 50));
+      assert.equal(accepted, seen, "no request after the bound passed");
+    } finally {
+      for (const c of sockets) c.destroy();
+      await new Promise<void>(resolve => server.close(() => resolve()));
+      fs.rmSync(dir, { recursive: true, force: true });
     }
   });
 });

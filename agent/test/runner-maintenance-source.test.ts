@@ -1,4 +1,5 @@
 import { it } from "node:test";
+import { execFileSync } from "node:child_process";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -21,12 +22,13 @@ installHarness();
 // An observation names one fresh source; it never proves source-family completeness.
 type TailView = { executionTails: ReadonlyMap<string, Promise<unknown>> };
 
-for (const mode of ["normal", "latched-pause", "failed-stop", "late-shutdown", "late-fence", "failed-reap", "failed-cache", "failed-skills", "failed-retire", "failed-retired-append", "failed-holding-dispose", "failed-scratch-dispose", "failed-owed", "retention-failure", "canonical", "adopted-source"] as const) {
+for (const mode of ["normal", "latched-pause", "failed-stop", "late-shutdown", "late-fence", "failed-reap", "failed-cache", "failed-skills", "failed-retire", "failed-retired-append", "failed-holding-dispose", "failed-scratch-dispose", "intent-write-failed", "intent-sync-failed", "failed-owed", "retention-failure", "canonical", "adopted-source"] as const) {
   it(`#3031 owner pause ${mode}: exact fresh source is observed only after cleanup`, { skip: ["normal", "latched-pause", "retention-failure"].includes(mode) ? LINUX_ONLY : false }, async (t) => {
     const claim = gitlabClaim(3033, { claim_generation: 1 });
     const started = deferred(), finish = deferred(), cleaning = deferred(), finishCleanup = deferred();
     let expected: unknown;
     let parked = false;
+    let branchSeen = "";
     const seed = git.runnerCloneForBranch.bind(git);
     t.mock.method(git, "runnerCloneForBranch", async (...args: Parameters<typeof seed>) => {
       const attempt = args[7];
@@ -48,6 +50,8 @@ for (const mode of ["normal", "latched-pause", "failed-stop", "late-shutdown", "
     }
     if (mode === "failed-owed") t.mock.method(git, "retainCurrentOwedCandidate", async () => ({ kind: "not_updated" as const, reason: "preservation_failed" as const }));
     if (mode === "failed-retire") t.mock.method(git, "retireRunnerClone", async () => { throw new Error("retire failed"); });
+    // issue #4263: this owner-pause flight is parked, so its terminal retire is classed owner_terminal_covered (never settles; passthrough spy).
+    const retireSpy = mode === "normal" ? t.mock.method(git, "retireRunnerClone") : undefined;
     let internalFaults = 0;
     const warnings: string[] = [];
     const runLogger = nullLogger();
@@ -93,6 +97,27 @@ for (const mode of ["normal", "latched-pause", "failed-stop", "late-shutdown", "
         });
       }
     }
+    if (mode === "intent-write-failed" || mode === "intent-sync-failed") {
+      // issue #4263: the owner terminal retire cannot write its scratch binding on the EXDEV branch. It must fail closed
+      // before the move, exactly as a retirement failure does today: the caller's documented outcome, no run-status change.
+      t.mock.method(runLogger, "warn", (message: string) => { warnings.push(message); });
+      const holdingRoot = path.join(fx.dataDir, "runner-quarantine");
+      const rename = fs.rename.bind(fs);
+      t.mock.method(fs, "rename", async (...args: Parameters<typeof rename>) => {
+        if (String(args[1]).startsWith(holdingRoot + path.sep))
+          throw Object.assign(new Error("cross-device holding move"), { code: "EXDEV" });
+        return rename(...args);
+      });
+      const seam = git as unknown as { retireBindingStepSeam?: (step: string) => void };
+      const previous = seam.retireBindingStepSeam;
+      seam.retireBindingStepSeam = step => {
+        if (step === (mode === "intent-write-failed" ? "intent-write" : "intent-sync")) {
+          internalFaults++;
+          throw new Error("injected intent failure");
+        }
+      };
+      t.after(() => { seam.retireBindingStepSeam = previous; });
+    }
     const ackStarted = deferred(), releaseAck = deferred();
     if (mode === "late-fence") {
       const ack = client.ackInputs.bind(client);
@@ -125,6 +150,7 @@ for (const mode of ["normal", "latched-pause", "failed-stop", "late-shutdown", "
       executor: {
         run: async ctx => {
           await fs.writeFile(path.join(ctx.worktreePath, "pause-work.txt"), "fresh work\n");
+          branchSeen = ctx.branch;
           if (mode === "failed-cache") {
             const target = path.join(homeDir, claim.run_id);
             await fs.mkdir(path.join(target, "kept"), { recursive: true });
@@ -162,6 +188,11 @@ for (const mode of ["normal", "latched-pause", "failed-stop", "late-shutdown", "
         docker: { state: "not_wired", removed: [], detail: "" },
       }),
     });
+    // Keep a handle on the real flight, so the caller's documented flag can be asserted directly.
+    let flightSeen: { sourceJoinFailed?: boolean } | undefined;
+    const priv = runner as unknown as { buildFlight(...args: unknown[]): { sourceJoinFailed?: boolean } };
+    const buildFlight = priv.buildFlight.bind(runner);
+    t.mock.method(priv, "buildFlight", (...args: unknown[]) => { flightSeen = buildFlight(...args); return flightSeen; });
     const executing = runner.execute(claim);
     try {
       await Promise.race([started.promise, executing.then(() => { throw new Error("executor never started"); })]);
@@ -180,6 +211,9 @@ for (const mode of ["normal", "latched-pause", "failed-stop", "late-shutdown", "
         assert.ok(expected, "real attempt onSeeded ran");
         assert.deepEqual(await tail, { ...expected as object, terminal: "normal_park" });
       } else assert.equal(await tail, undefined);
+      if (retireSpy) {
+        assert.deepEqual(retireSpy.mock.calls.map(c => (c.arguments[4] as { dispositionClass?: string }).dispositionClass), ["owner_terminal_covered"]);
+      }
       if (mode === "failed-retired-append" || mode === "failed-holding-dispose" || mode === "failed-scratch-dispose") {
         assert.equal(internalFaults, 1, "actual retirement reached the injected internal failure once");
         if (mode === "failed-retired-append") {
@@ -192,6 +226,30 @@ for (const mode of ["normal", "latched-pause", "failed-stop", "late-shutdown", "
           assert.equal((await fs.readdir(path.join(fx.dataDir, "runner"))).filter(name => name.startsWith(".retire-")).length, 1);
         }
         assert.ok(!warnings.includes("runner clone cleanup failed"), "helper still resolves after its internal failure");
+      }
+      if (mode === "intent-write-failed" || mode === "intent-sync-failed") {
+        assert.equal(internalFaults, 1, "the retire reached the injected binding failure once");
+        assert.ok(warnings.includes("runner clone cleanup failed"), "owner terminal: warn runner clone cleanup failed");
+        const clonePath = (expected as { genesis: { clonePath: string } }).genesis.clonePath;
+        assert.equal(await fs.readFile(path.join(clonePath, "pause-work.txt"), "utf8"), "fresh work\n", "the clone stays at its canonical path");
+        assert.deepEqual((await fs.readdir(path.join(fx.dataDir, "runner"))).filter(name => name.startsWith(".retire-")), [],
+          "no scratch parent remains");
+        // The caller's documented outcome is unchanged: the failed retire sets sourceJoinFailed (no completed-source
+        // observation is retained), the terminal status is the baseline owner park (never failed or cancelled), and the
+        // journal and ledger are exactly what the pre-retire state left: still journaled, no retired entry, no cleared journal.
+        assert.equal(flightSeen?.sourceJoinFailed, true, "the failed retire sets the flight's sourceJoinFailed");
+        assert.equal(await tail, undefined, "sourceJoinFailed: the source cleanup did not complete, so nothing is observed");
+        const statuses = api.states.map(s => s.body.status);
+        assert.ok(statuses.includes("paused"), "terminal status is the baseline owner park");
+        assert.ok(!statuses.some(st => st === "failed" || st === "completed"), `no other terminal status: ${statuses.join(",")}`);
+        const bare = git.barePathFor(fx.originPath);
+        const cfg = (...args: string[]): string[] => {
+          try { return execFileSync("git", ["-C", bare, "config", "--local", ...args], { encoding: "utf8" }).split("\n").filter(Boolean); } catch { return []; }
+        };
+        const entries = cfg("--get-all", `uzi-attempts.${branchSeen}.entry`).map(raw => JSON.parse(raw) as { clonePath: string; state: string });
+        assert.ok(entries.length > 0 && entries.every(e => e.state !== "retired"), "the ledger carries no retired entry");
+        assert.ok(cfg("--get", `uzi-recovery.${branchSeen}.clone`).join("").includes(clonePath), "the journal still names the clone");
+        if (mode === "intent-write-failed") assert.deepEqual(cfg("--get-regexp", "^uzi-retire-scratch\\."), [], "no binding was written");
       }
       assert.equal(tails.has(claim.run_id), false, "no completed registry");
     } finally {

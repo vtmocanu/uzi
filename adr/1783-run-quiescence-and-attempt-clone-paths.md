@@ -173,7 +173,11 @@ authority. See [ADR-1597's residual boundaries](1597-midturn-checkpoint-durabili
 14. The ledger is compacted per seed, but identities for present paths remain.
     Compaction is not a bound on identity metadata or retained bytes. As inventory
     grows, existing per-seed process/teardown scope over non-live paths and ledger
-    compaction work also grow; no cap skips safety checks.
+    compaction work also grow; no cap skips safety checks. Since issue #4263,
+    compaction may be skipped (ledger unchanged) when another bare's retire
+    evidence is unreadable or unidentifiable, or its foreign scan exceeds its
+    bare, byte, record or time bounds, and such a skip can persist
+    worker-wide until an operator clears it; see ADR-3153.
 
 ### Option A — the accepted resume trade-off
 
@@ -278,7 +282,10 @@ authority. See [ADR-1597's residual boundaries](1597-midturn-checkpoint-durabili
   not a design gap. The compaction that removes obsolete ledger entries
   (`compactAttemptLedger`) is itself best-effort: it catches its own failure,
   logs "attempt ledger compaction failed; the ledger is left as it was", and
-  leaves the ledger uncompacted rather than failing the run. A volume without
+  leaves the ledger uncompacted rather than failing the run. Since issue #4263
+  it also skips, ledger unchanged, when another bare's retire evidence is
+  unreadable or unidentifiable, or the foreign scan exceeds its bounds (see ADR-3153); that skip can persist worker-wide
+  until an operator clears it. A volume without
   hard link support therefore degrades to unbounded ledger growth over time,
   not a hard failure.
 - Legacy journaled root-owned canonical retire (residue that predates M3) is a

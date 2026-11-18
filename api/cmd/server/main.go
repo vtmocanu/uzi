@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -34,6 +35,9 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/healthsvc"
 	"github.com/vtmocanu/uzi/api/internal/hostedsvc"
 	"github.com/vtmocanu/uzi/api/internal/hub"
+	"github.com/vtmocanu/uzi/api/internal/issuesource"
+	"github.com/vtmocanu/uzi/api/internal/issuetracker"
+	"github.com/vtmocanu/uzi/api/internal/issuetrackersvc"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/notifysvc"
 	"github.com/vtmocanu/uzi/api/internal/oidc"
@@ -1067,6 +1071,20 @@ func run() error {
 	wsvc.SetRepoGuard(pcheck)
 
 	h := handler.New(pool, q, cfg, box, svc, wsvc, pcheck, liveHub, settingsCache)
+	// External issue tracker connections and the repo link (PRD #4173 M4). The link and
+	// the reconnect rule run in transactions on the pool. An empty allowlist
+	// (ISSUE_TRACKER_ALLOWED_BASE_URLS) still boots: Connect then refuses every URL.
+	itSvc := issuetrackersvc.New(q, box, cfg.IssueTrackerBaseURLAllowed, issuetracker.New).
+		UseTransactions(pool, func(tx pgx.Tx) issuetrackersvc.Querier { return q.WithTx(tx) })
+	h.SetIssueTrackerService(itSvc)
+	// The same service is forgesvc's driver source for a linked repo's issue side (DL-5);
+	// without it a linked repo fails closed.
+	svc.SetIssueTrackerDrivers(itSvc)
+	// DL-5: the services M2 left on their own forge factories resolve a linked repo's
+	// issue side through forgesvc too; each fails closed for a linked repo without it.
+	// provisionsvc needs none: enabling a linked repo only records column rows.
+	wsvc.SetIssueSources(svc)
+	lifecycle.SetIssueSources(svc)
 	svc.SetMergedPredecessorRecovery(q, h.RecoveryService())
 
 	var bgWG sync.WaitGroup
@@ -1121,6 +1139,7 @@ func run() error {
 	// schedule that came due while the api was down fire promptly after a restart.
 	if cfg.SchedulerCheckInterval > 0 {
 		scheduler := schedsvc.New(q, wsvc, svc, settingsCache, notifier, vlt, cfg.SchedulerCheckInterval, slog.Default())
+		scheduler.SetIssueSources(svc)
 		scheduler.SetCIRepair(schedsvc.CIRepairConfig{MaxJobs: cfg.CIFixMaxJobs, LogTailBytes: cfg.CIFixLogTailBytes, MaxAttempts: cfg.CIAutofixMaxAttempts, ConfigPaths: cfg.CIAutofixConfigPaths, ArtifactMaxFiles: cfg.CIArtifactMaxFiles, ArtifactMaxBytes: cfg.CIArtifactMaxBytes})
 		// Admin-health loop-beat: the scheduler is one of the four loops (PRD #1484 M2, D15).
 		// Registered ONLY inside this started-block, so a not-started scheduler
@@ -1243,6 +1262,7 @@ func run() error {
 		CIWatchRunWindow:             cfg.CIWatchRunWindow,
 		Registry:                     healthBeats,
 		ForgeSyncRegistry:            forgeHealth.ForgeSyncRegistry,
+		IssueTrackerSyncRegistry:     forgeHealth.IssueTrackerSyncRegistry,
 		ForgeSyncInterval:            forgeHealth.ForgeSyncInterval,
 	})
 	// M6 wires the notice fan-out into the SAME reconciler: the persist-first notifysvc
@@ -1951,20 +1971,33 @@ func (g gateSubmitter) SubmitChatMessage(ctx context.Context, userID, runID uuid
 // failure (retry), all without a workersvc import on the slacksvc side.
 func (g gateSubmitter) ConfirmProposalForUser(ctx context.Context, userID, runID, propID uuid.UUID) (slacksvc.CreatedIssue, error) {
 	ci, err := g.svc.ConfirmProposalForUser(ctx, userID, runID, propID)
+	if err != nil {
+		return slacksvc.CreatedIssue{}, translateConfirmProposalErr(err)
+	}
+	return slacksvc.CreatedIssue{IID: ci.IID, WebURL: ci.WebURL, Title: ci.Title}, nil
+}
+
+// translateConfirmProposalErr maps a workersvc confirm failure to the slacksvc sentinel. The
+// issue-write refusal on a linked repo is matched BEFORE ErrForgeIssueWrite because workersvc
+// wraps it inside that error: retrying can never succeed, so Slack must not say "press Create
+// again".
+func translateConfirmProposalErr(err error) error {
 	switch {
 	case errors.Is(err, workersvc.ErrProposalNotPending):
-		return slacksvc.CreatedIssue{}, slacksvc.ErrChatProposalHandled
+		return slacksvc.ErrChatProposalHandled
 	case errors.Is(err, workersvc.ErrProposalNotFound):
-		return slacksvc.CreatedIssue{}, slacksvc.ErrChatProposalGone
+		return slacksvc.ErrChatProposalGone
+	case errors.Is(err, workersvc.ErrRepoNeverEnabled):
+		return slacksvc.ErrChatProposalRepoNeverEnabled
+	case errors.Is(err, issuesource.ErrIssueWriteNotOffered):
+		return slacksvc.ErrChatProposalLinkedRepo
 	case errors.Is(err, workersvc.ErrProposalRepoGone),
 		errors.Is(err, workersvc.ErrForgeBuild),
 		errors.Is(err, workersvc.ErrForgeIssueWrite),
 		errors.Is(err, workersvc.ErrForgesUnavailable):
-		return slacksvc.CreatedIssue{}, slacksvc.ErrChatProposalForge
-	case err != nil:
-		return slacksvc.CreatedIssue{}, err
+		return slacksvc.ErrChatProposalForge
 	}
-	return slacksvc.CreatedIssue{IID: ci.IID, WebURL: ci.WebURL, Title: ci.Title}, nil
+	return err
 }
 
 // DismissProposalForUser adapts the Slack proposal card's Dismiss (PRD #191 M4): the
@@ -2074,6 +2107,7 @@ func steerRunCardMessage(err error) string {
 func isInternalStartRunErr(err error) bool {
 	switch {
 	case errors.Is(err, workersvc.ErrRepoNotFound), errors.Is(err, workersvc.ErrIssueNotFound),
+		errors.Is(err, workersvc.ErrRepoNeverEnabled),
 		errors.Is(err, workersvc.ErrNotPRDIssue),
 		errors.Is(err, workersvc.ErrActiveRunExists), errors.Is(err, workersvc.ErrBranchInUse),
 		errors.Is(err, workersvc.ErrDescriptionTooLarge), errors.Is(err, workersvc.ErrForgeIssueRead):
@@ -2090,6 +2124,12 @@ func startRunCardMessage(err error) string {
 	switch {
 	case errors.Is(err, workersvc.ErrRepoNotFound):
 		return "That repo isn't yours, or it no longer exists."
+	case errors.Is(err, store.ErrRepoSourceLocked):
+		// Checked first: ErrRepoSourceLocked matches ErrRepoNeverEnabled under errors.Is, but
+		// enabling the repo is refused, so the never-enabled advice would be wrong.
+		return "That repo's issues were on an issue tracker link that was removed, so it can't be used in uzi."
+	case errors.Is(err, workersvc.ErrRepoNeverEnabled):
+		return "That repo has never been enabled; enable it in uzi first."
 	case errors.Is(err, workersvc.ErrIssueNotFound):
 		return "That issue isn't on this repo's board."
 	case errors.Is(err, workersvc.ErrNotPRDIssue):

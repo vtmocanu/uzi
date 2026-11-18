@@ -102,6 +102,28 @@ type ytActivity struct {
 	Removed   ytTags  `json:"removed"`
 }
 
+// ytTextActivity is an activity of the issue's text (creation, summary or
+// description) as D11 reads it: who made the change, nothing of what changed.
+// An activity without an author (null) leaves Author nil.
+type ytTextActivity struct {
+	ID        string  `json:"id"`
+	Timestamp int64   `json:"timestamp"`
+	Author    *ytUser `json:"author"`
+	Category  *struct {
+		ID string `json:"id"`
+	} `json:"category"`
+}
+
+// ytCommentActivity is a change to a comment's text: who made it and the id of
+// the comment it changed.
+type ytCommentActivity struct {
+	ID     string  `json:"id"`
+	Author *ytUser `json:"author"`
+	Target *struct {
+		ID string `json:"id"`
+	} `json:"target"`
+}
+
 // checkIssue refuses an issue whose entity id, id-readable or tag ids are not
 // well formed: those ids end up in request paths and in WebURL. The tag count is
 // capped while decoding (ytTags).
@@ -119,7 +141,8 @@ func (y *youTrack) checkIssue(w ytIssue) error {
 
 // toIssue maps a wire issue to the neutral type. The issue must carry a valid
 // entity id and id-readable. Its labels follow readLabel, so a tag is reported
-// only when a write could address it.
+// only when a write could address it, and a name labelNameProblem refuses (any
+// user can name a tag, and a caller passes the name on) is left out as well.
 func (y *youTrack) toIssue(ctx context.Context, w ytIssue) (forge.Issue, error) {
 	if err := y.checkIssue(w); err != nil {
 		return forge.Issue{}, err
@@ -145,7 +168,7 @@ func (y *youTrack) toIssue(ctx context.Context, w ytIssue) (forge.Issue, error) 
 		if err != nil {
 			return forge.Issue{}, err
 		}
-		if ok {
+		if ok && !labelNameProblem(name) {
 			issue.Labels = append(issue.Labels, name)
 		}
 	}

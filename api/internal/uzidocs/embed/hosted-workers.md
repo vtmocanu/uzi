@@ -590,6 +590,134 @@ attempt, and could scale a worker down in the middle of a prune. CHECK constrain
 on the worker row refuse an old-code write that would reopen claims during an
 unsettled attempt, so such a write fails instead of silently dropping the fence.
 
+## Moving workers to a new node pool
+
+Changing `workers.nodeSelector` or `workers.tolerations` rolls every worker with its
+old volumes. When the new nodes are a dedicated, tainted pool, possibly in a different
+storage topology zone, those volumes may not attach there. The opt-in
+`workers.newPlacement` chart value lets you move workers one at a time instead, by
+recreating each worker's volumes where the new placement applies.
+
+How the stamp works:
+
+- While `workers.newPlacement` is set, the controller stamps a worker volume it
+  creates with the annotation `uzi.dev/placement: new`, unless that worker still has
+  an unstamped volume (then the new volume is created unstamped, per the rules below).
+  It never adds, removes or rewrites the stamp on an existing volume, and it deletes
+  nothing.
+- Per worker on each reconcile pass: if any of its volumes is Terminating, it creates
+  none; if none exist, it creates all of them stamped; if all existing ones are stamped,
+  it creates the missing ones stamped; if any existing one is unstamped, it creates the
+  missing ones unstamped.
+- A worker is stamped when `newPlacement` is set and every one of its volumes is
+  stamped (a worker with no volumes counts as stamped). Stamped workers render
+  `newPlacement`; all others render the global `workers.nodeSelector` and
+  `workers.tolerations`.
+- For a stamped worker both `newPlacement` fields replace the global ones, they do not
+  merge. A tolerations-only `newPlacement` therefore renders no node selector at all:
+  keep `kubernetes.io/arch: amd64` in `newPlacement.nodeSelector` and repeat any global
+  toleration the worker still needs.
+- Setting `newPlacement` rolls no worker that is still on the global placement: those
+  workers' pod templates are unchanged. Clearing it sends stamped workers back to the
+  global placement; the stamps are kept, so setting it again resumes. Changing it, or
+  setting it again with values different from before, changes stamped workers' pod
+  templates, and they roll through normal roll admission. A roll does not move their
+  volumes. Before retargeting `newPlacement`, confirm the new nodes can attach every
+  stamped worker's existing volumes. If they cannot, do not apply the retarget, or those
+  pods stay Pending: every stamped worker's placement changes at once, so the per-worker
+  procedure below cannot move them gradually. Plan a separate storage or cohort
+  migration instead.
+- Which volumes are recreated decides which workers move. A recycle for data plus Nix
+  pressure on a plain worker moves it. A Nix-only size recycle stays on the old
+  placement, and so does a Docker pressure recycle, which keeps `/data`. Run-bound
+  (ephemeral) workers get fresh volumes, so they move. Hibernation is unchanged.
+
+Before you start, check the worker StorageClass (`workers.storageClass`, or the cluster
+default when it is empty). It must use `volumeBindingMode: WaitForFirstConsumer`, or
+otherwise provision in the new pool's zone. With `Immediate` binding a recreated volume
+is provisioned before any pod asks for it and can land in the old zone, after step 2.6
+has already deleted the worker's data; the worker then stays Pending on the new pool.
+Delayed binding alone is not enough: the provisioner must also be able to create
+volumes in the new pool's topology (no `allowedTopologies` or storage policy limited to
+the old zone). Prove it first, for example with a throwaway claim and pod pinned to a new
+node, before deleting any worker's volumes.
+
+Procedure (it moves unstamped workers that are on the global placement):
+
+Do not manually delete or replace worker claims while the controller is running.
+Concurrent partial recreation can leave the worker on global placement rather than
+move it; follow the stop-and-confirm sequence below.
+
+1. Set `workers.newPlacement` (`nodeSelector` and `tolerations`) in your values and
+   apply it (`helm upgrade`, or let the GitOps sync finish). Editing the values file alone
+   changes nothing. Confirm the running controller has it before step 2: its Deployment
+   carries `UZI_WORKER_NEW_PLACEMENT_NODE_SELECTOR` and/or
+   `UZI_WORKER_NEW_PLACEMENT_TOLERATIONS` with the expected values, and its pod has
+   restarted onto that spec. A controller still on the old configuration would recreate
+   the deleted volumes unstamped. No worker on the global placement rolls.
+2. For each worker that is not hibernated (wake a hibernated worker first, or leave it
+   for later):
+   1. Cordon the worker and wait until it holds no assigned run and no recovery custody
+      hold. Back up anything you need from `/data`.
+   2. Confirm that the restore in step 2.7 can be admitted. The paced roll's
+      prerequisites must hold for this worker:
+      - usable, uncordoned coverage from another worker of the same owner and lane,
+        where pacing requires it;
+      - capability coverage, where required;
+      - a known image and version;
+      - no blocking canary in flight.
+
+      If they do not hold, stop here and uncordon the worker; nothing has changed yet.
+      Do not weaken pacing to get past it.
+   3. Stop the controller: scale its Deployment to 0 and wait until its pods have
+      terminated. Under GitOps, pause self-heal for it first, or the sync restores it.
+   4. Scale the worker's Deployment (`uzi-hw-<id>`, where `<id>` is the worker id) to 0
+      and confirm no worker pod exists.
+   5. Recheck step 2.2; another worker may have been cordoned since. If the
+      prerequisites no longer hold, do not delete anything. Instead:
+      1. restore the worker Deployment's replicas;
+      2. start the controller again and restore self-heal;
+      3. uncordon the worker.
+
+      It returns on its old placement with its volumes intact.
+   6. Delete all of the worker's volumes (`uzi-hw-<id>-data`, `uzi-hw-<id>-nix`, and
+      `uzi-hw-<id>-dind-data` on Docker workers) and confirm they are gone, not
+      Terminating.
+   7. Start the controller again (restore its replicas and self-heal). On the following
+      reconcile passes it creates the volumes stamped, re-renders the worker's
+      Deployment with the new placement, and restores its replicas once the existing
+      placement guards permit: the controller does not start a worker pod over a
+      missing or Terminating volume, and waits until it has observed the recreated
+      claims live. The restore goes through the normal paced roll admission (roll evidence
+      for the worker, a free roll slot in its pool, no other unpromoted canary), so it
+      can wait on that. With a `WaitForFirstConsumer` StorageClass the volumes bind in the
+      new zone when the pod is scheduled.
+   8. Confirm the worker is online on a new node, then uncordon it.
+3. When no unstamped worker remains, copy `newPlacement` into `workers.nodeSelector` and
+   `workers.tolerations` first, then clear `newPlacement`. Helm merges maps into the
+   chart default, so an empty `nodeSelector: {}` keeps the default
+   `kubernetes.io/arch: amd64`; when the new placement has no node selector, set
+   `workers.nodeSelector: null`. Render the chart and confirm the global selector and
+   tolerations equal the new placement before clearing it.
+
+Check which workers are stamped. Annotations are not shown by `-L`, so use:
+
+```sh
+kubectl get pvc -n <worker namespace> \
+  -o 'custom-columns=NAME:.metadata.name,PLACEMENT:.metadata.annotations.uzi\.dev/placement'
+```
+
+Caveats:
+
+- Step 2.6 permanently deletes the worker's `/data` (run clones and the recovery store)
+  and any Docker state. The controller does not guard a manual delete, so step 2.1 is the
+  only safety gate.
+- While the controller is stopped, no worker is provisioned, rolled, hibernated or
+  woken. Keep that window to minutes.
+- Clearing `newPlacement` before updating the global placement sends stamped workers back
+  to the old nodes, where their new volumes may not attach. Rolling back to a controller
+  version without this feature has the same effect, because it ignores the stamp.
+
 ## Pod shutdown grace
 
 Worker pods render `terminationGracePeriodSeconds: 40`. On a stop, the worker joins its own already-authorized authority settlements and logs one `worker_shutdown_result` line within 35 s of the first signal; the extra 5 s is margin (the result is described in [Configuration](./configuration.md)). The field is part of the pod spec, so upgrading the controller changes the pod spec hash once and every hosted worker rolls once through the existing paced roll ([ADR-1470](../adr/1470-paced-hosted-worker-rolls.md)). If a worker stops on its own and its shutdown is `incomplete` (exit 1), the container restarts in the live pod, and the roll health view may briefly name that terminated container (exit 1) as the blocking one; a pod being deleted by the roll is normally not shown. An `incomplete` result never certifies anything: any unresolved record keeps its protections (a successor still refuses it), while a write already started may still complete after the diagnostic. Hosted end-to-end acceptance is pending.
@@ -949,9 +1077,14 @@ or supported manual settled-tree cleanup frees space. See
 bounds, periodic reclaim, admission stop and the bounded `data_volume_full`
 park, and [Run recovery](./run-recovery.md) for supported inspect/discard
 procedures; pressure does not authorize deleting protected sources.
-[PRD #3431](../prds/3431-pod-epoch-reclaim.md) M1b settlement/deletion is
-implemented behind an off-by-default startup opt-in, so production deletes
-nothing unless an operator selects one canary worker, and #3329's genuine-idle reclaim roll is deferred. This policy adds
+[PRD #3431](../prds/3431-pod-epoch-reclaim.md) M1b attempt deletion is
+implemented behind an off-by-default startup opt-in, so production deletes no
+attempts unless an operator selects one canary worker, and #3329's genuine-idle reclaim roll is deferred. One exception is requested by default but still runs only on an eligible pass with an attested runtime declaration (the chart's default empty runtime declaration supplies no attestation, so with chart defaults it deletes nothing): the
+runner TMPDIR scratch reclaim (#4043, see
+[startup disable and observation](./run-recovery.md#runner-tmpdir-scratch-reclaim-startup-disable-and-observation)).
+The bound `.retire-*` parent phase (#4263, see
+[Disk-full residual](./worker-docker.md#disk-full-residual-on-the-data-volume)) deletes no
+bound parent on a uid-split pod: nothing writes `settled`, so every bound parent is kept. This policy adds
 no reclaim authority.
 
 ### Docker workers: run directory on the data volume

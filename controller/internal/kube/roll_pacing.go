@@ -195,7 +195,7 @@ func (m *Materializer) planRoll(ctx context.Context, desired []protocol.DesiredW
 		if w.Ephemeral {
 			// Ephemeral workers are outside the roll pools and slots; only the layout
 			// migration hold is surfaced for them (pacing entry, no roll entry).
-			m.surfaceEphemeralLayoutHold(t, w, observed[w.ID])
+			m.surfaceEphemeralLayoutHold(ctx, t, w, observed[w.ID])
 			continue
 		}
 		ns, err := m.cfg.Placement(w)
@@ -208,7 +208,7 @@ func (m *Materializer) planRoll(ctx context.Context, desired []protocol.DesiredW
 			t.unplanned = append(t.unplanned, unplannedWorker{id: w.ID, ns: ns, nsKnown: true})
 			continue
 		}
-		target := RenderDeployment(m.cfg, w, spec)
+		target := RenderDeployment(m.renderCfgFor(ctx, w, observed[w.ID]), w, spec)
 		e := &rollEntry{w: w, o: observed[w.ID], target: target, ns: ns}
 		t.entries[w.ID] = e
 		namespaces[ns] = append(namespaces[ns], e)
@@ -1139,7 +1139,7 @@ func (m *Materializer) maintenanceDespiteBusy(ctx context.Context, w protocol.De
 	if err != nil {
 		return false
 	}
-	dep := RenderDeployment(m.cfg, w, spec)
+	dep := RenderDeployment(m.renderCfgFor(ctx, w, obs), w, spec)
 	if obs.Generation != w.Generation || obs.SpecHash != dep.Spec.Template.Annotations[AnnotationSpecHash] {
 		return false
 	}

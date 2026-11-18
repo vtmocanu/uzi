@@ -1,0 +1,2 @@
+EnsureLabels(77, [{Name:"In Progress" Color:"#1f75cb"}])
+UpdateIssueLabels(77, 4, ["In Progress"], ["Later"])

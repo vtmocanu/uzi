@@ -157,7 +157,7 @@ func (h *Handler) StartRunRework(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusConflict, "MR rework is unavailable: the trusted review bot list could not be read")
 			return
 		}
-		ch, err := h.codeHostForRepo(r.Context(), repo.ID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
+		ch, err := h.codeHostForRepo(r.Context(), repo.UserID, repo.ID, repo.IssueTrackerConnectionID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 		if err != nil {
 			slog.Error("mr-rework: build forge for connection", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")

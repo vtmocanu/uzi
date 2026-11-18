@@ -1171,6 +1171,25 @@ it("a lead's non-closing declaration (no interlock) survives the resume: the mer
   assert.ok(!/Closes #5399/.test(writtenBodies(forge)), `no closing directive: ${writtenBodies(forge)}`);
 });
 
+// PRD 4173: a run linked to an issue tracker (claim.issue_key) records no closing issue, and its resume is not
+// mistaken for an original delivery that failed to close: the resumed body names the key and never says the issue stays open.
+for (const [issue_key, related] of [["ABC-12", /^Related to ABC-12\.$/m], ["not a key", /^Related to the linked issue\.$/m]] as const) {
+  it(`a linked run (issue_key ${JSON.stringify(issue_key)}) records closing [] and resumes without the original-delivery non-closing path`, async () => {
+    const { claim, last } = await enrolAndPark(5391, await mkOutbox(), { claim: { issue_key } });
+    assert.deepEqual(last.mr.closing, [], "a linked run records no closing issue");
+    reset();
+    const c = counts();
+    const forge = fakeGitlab({ head: last.candidate });
+    await build(tripwireExecutor(c), { gitlab: forge.gitlab }, await mkOutbox(), { c }).execute(resumeClaim(claim, last));
+    assert.deepEqual(c, counts());
+    assert.equal(completed(claim.run_id).length, 1, JSON.stringify(states(claim.run_id).map(s => s.status === "failed" ? `failed:${s.failure_reason}` : s.status)));
+    const bodies = writtenBodies(forge);
+    assert.match(bodies, related);
+    assert.doesNotMatch(bodies, /Closes/);
+    assert.doesNotMatch(bodies, /Issue remains open/);
+  });
+}
+
 it("control: an ordinary full delivery still closes its issue on the resume", async () => {
   const { claim, last } = await enrolAndPark(5398, await mkOutbox());
   assert.deepEqual(last.mr.closing, ["#5398"]);
