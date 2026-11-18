@@ -2913,13 +2913,13 @@ Known consequences and not shipped:
   run, so the leaf classifier reads it as bare-config retention and keeps that run's
   leaf (`run_local_active`, `bare_config`) for as long as the binding exists. On a
   uid-split pod a non-completion retire's binding stays `intent` and the epoch never
-  clears it, so that run's leaf is kept with it. A completion retire unsets its binding
-  in-process; a binding of an already-gone parent is cleared by the retire phase, which
+  clears it, so that run's leaf is kept with it. A completion retire that succeeds unsets
+  its binding in-process (a failed one leaves `removing`, and the leaf is kept with it); a binding of an already-gone parent is cleared by the retire phase, which
   runs after the scratch phase, so the leaf is reclaimed at the earliest on a later
   start. This fails closed; an exemption backed by settled-binding evidence is open on
   #4453.
 - The retire phase gets no reserved share of the pass: it runs last and is deferred
-  (`budget_deferred`) when less than 30 s remains. Many run leaves, each costing up to
+  (`budget_deferred`) when less than 30 s of the pass budget remains after its 5 s reserve. Many run leaves, each costing up to
   two 30 s server reads plus the local classifier, can use the pass budget before the
   attempt and retire phases run; everything not reached is kept.
 

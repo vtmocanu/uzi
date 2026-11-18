@@ -777,7 +777,7 @@ An architect, auditor and reviewer examined two judgments and found no stop.
 
 - **Retire-phase budget after the run-leaf scratch phase (issue #4420).** The retire
   phase has no reserved share of the pass: it refuses with `budget_deferred` when less
-  than `RETIRE_PHASE_MIN_MS` (30 s) remains. The #4420 scratch phase spends up to two
+  than `RETIRE_PHASE_MIN_MS` (30 s) of the pass budget remains after its 5 s reserve. The #4420 scratch phase spends up to two
   30 s server reads plus the local classifier per run leaf, so a worker with many run
   leaves can starve the attempt and retire phases. Everything not reached is kept; no
   deadline or budget was changed when the two features were merged.
