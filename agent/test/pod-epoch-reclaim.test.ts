@@ -1518,9 +1518,12 @@ test("retire-scratch: an M1b downgrade to partial closes the retire gate; every 
       assert.deepEqual(spies, { reserve: [], tx: 0, bareLock: 0, discards: 0 });
       assert.equal(result.retire_scratch.state, "stopped", JSON.stringify(result.retire_scratch));
       assert.equal(result.retire_scratch.reason, "epoch_not_eligible");
-      assert.equal(result.retire_scratch.deferred, 1);
+      // #4263 review: the present settled parent is kept at nomination (settled_kept, no work slot), so nothing is deferred.
+      assert.equal(result.retire_scratch.deferred, 0);
+      assert.equal(result.retire_scratch.kept, 1);
+      assert.deepEqual(result.retire_scratch.kept_by_reason, { settled_kept: 1 });
       assert.equal(result.retire_scratch.reclaimed, 0);
-      assert.deepEqual(result.retire_report.parents.map(p => [p.name, p.outcome, p.reason]), [[name, "kept", "epoch_not_eligible"]]);
+      assert.deepEqual(result.retire_report.parents.map(p => [p.name, p.outcome, p.reason]), [[name, "kept", "settled_kept"]]);
     });
   } finally { await rm(root, { recursive: true, force: true }); }
 });

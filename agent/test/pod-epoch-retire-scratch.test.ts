@@ -517,6 +517,9 @@ describe("whole-phase refusals keep everything", PROC, () => {
       assert.equal(result.retire_scratch.state, "refused", label);
       assert.equal(result.retire_scratch.reason, reason, label);
       assert.equal(result.retire_scratch.reclaimed, 0);
+      // A refusal writes only its own block: the present parent kept at nomination is not reported (#4263 review).
+      assert.equal(result.retire_scratch.kept, 0, label);
+      assert.deepEqual(result.retire_scratch.kept_by_reason, {}, label);
       assert.deepEqual(w.reserveCalls, []);
       assert.equal(w.spawns.length, 0);
       untouched(s);
@@ -593,7 +596,7 @@ describe("budget", PROC, () => {
     assert.deepEqual(result.partial_causes, {});
   });
 
-  it("at most 64 bound parents are examined, the rest deferred", async () => {
+  it("at most 64 work slots per pass: of 66 gone parents 64 are examined, the rest deferred", async () => {
     // The binding cap is 64 per bare, so a second bare carries the overflow.
     const second = makeFixture();
     try {

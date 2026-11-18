@@ -867,7 +867,8 @@ async function retireBody(ctx: RetireContext, pin: ScratchRootPin, root: string,
   // A listed (present) parent whose nomination over the evidence already read is a keep is kept whatever this pass does
   // (C-prime: every present binding phase keeps), so it is reported below without taking one of the per-pass work slots;
   // otherwise 64 lexically earlier kept parents would starve gone-parent recovery forever. Pure: no IO, no effect.
-  // Gone parents are not pre-classified: their keeps stay in the loop.
+  // Gone parents are not pre-classified: their keeps stay in the loop. Presence here is the listing, not a live lstat: a
+  // parent that vanishes after the listing is kept this pass (recovered by a later one), and an lstat error is not consulted.
   const preKept: Array<{ name: string; reason: string }> = [];
   const workable: string[] = [];
   for (const name of candidates) {
@@ -906,13 +907,19 @@ async function retireBody(ctx: RetireContext, pin: ScratchRootPin, root: string,
     if (exists) ctx.parents.push({ name, outcome: "kept", reason, bytes: 0, bytesState: "unknown" });
   };
   for (const k of preKept) keep(k.name, k.reason, true);
+  // With no work slot filled the loop below never runs its soft-stop check, so an aborted pass or an epoch that is no
+  // longer eligible must still stop the phase rather than report it complete.
+  let halted: string | undefined;
+  if (work.length === 0) {
+    if (controller.signal.aborted) halted = "pass_aborted";
+    else if (!ctx.eligibleNow()) halted = "epoch_not_eligible";
+  }
   const defer = (names: readonly string[], reason: string): void => {
     out.deferred += names.length;
     for (const n of names) if (parentPresence(io, pin, n) === "present") ctx.parents.push({ name: n, outcome: "kept", reason, bytes: 0, bytesState: "unknown" });
   };
   const t0Ms = fence.t0Ms;
   let entriesLeft: number = SCRATCH_DELETE_LIMITS.maxEntries;
-  let halted: string | undefined;
   for (const [index, name] of work.entries()) {
     // Soft stop: no new parent once the pass was aborted, a helper ran out of budget, or the phase window is too short.
     if (halted === undefined && controller.signal.aborted) halted = "pass_aborted";
