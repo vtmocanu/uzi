@@ -771,6 +771,17 @@ is kept (`ledger_mismatch`), and a second binding naming the same attempt with
 another identity keeps each parent (`conflict`). Ledger compaction keeps every value
 of such an attempt as written, so the conflict survives it.
 
+The rule spans bares: any other bare's binding or ledger value naming the
+attempt, or any one that cannot be identified (an undecodable binding, an
+unparseable or attempt-less ledger value), keeps the parent as `conflict`. An
+unreadable re-read of the other bares also keeps it (`conflict`, or
+`metadata_unresolved` for a gone parent). One such binding or value in any other
+bare therefore keeps every bound parent on the pod until it is removed.
+Compaction preserves this evidence, and skips with the warning
+`attempt ledger compaction skipped: foreign retire evidence unavailable` (plus a
+fixed reason) when another bare cannot be read within its bounds. A kept
+unidentifiable value does not heal itself: remove it from that bare's config.
+
 Still kept: legacy parents created before bindings, attempt-less retires,
 anything unbound, every non-eligible class (never reclaimed by the epoch), any
 parent on a single-uid worker (never reclaimed by the epoch; single-uid workers

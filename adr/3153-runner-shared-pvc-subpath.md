@@ -386,6 +386,17 @@ record: neither the journal nor the ledger gained a field.
   A read that finds more than 64 is `unknown`, never a truncated list, and keeps
   everything. The cap also bounds the added records against the epoch metadata
   caps and the ACK reader's 1024-entry config cap.
+  - Bindings that never settle and are never removed hold slots permanently:
+    `intent` for `owner_terminal_covered` and `other`, an interrupted `removing`,
+    and leftovers from a crash or a revoked settle. The cap fills at 64 such keys
+    in one bare.
+  - After that, later eligible `owner_terminal` or `verified_successor`
+    retirements write no binding and get the existing unbound in-process removal
+    attempt, which can succeed. When it fails (typical on a uid-split pod), the
+    parent and possibly partial residue is retained unbound and never reclaimed by
+    the epoch. Retention can grow with each further retirement in that bare whose
+    removal fails.
+  - This is an accepted residual. No purge route exists.
 
 ### Who binds, and which classes can settle
 
@@ -415,6 +426,21 @@ write), no quarantine or process revocation arrived, and any process proof still
 holds. Otherwise the binding stays `intent`. This adds no new disposition
 authority: the binding makes the same authority recoverable after a failed or
 crashed attempt and adds the epoch exclusion.
+
+The settle write's guard runs after the `settle-write` step and before the config
+write. It re-reads terminal protection, process proof and the residue quarantine.
+Guarantee, narrowed: a revocation visible at the guard's final check never writes
+`settled`.
+
+- **Residual R is OPEN and not accepted; it awaits an owner decision on MR !4429.**
+  A revocation that arrives after that final check (while the config write or its
+  sync runs), followed by a crash, power loss or nothing at all, can leave
+  `settled`.
+- Process proof and the quarantine latch are in-memory only, so a crash erases the
+  revocation. The epoch's later checks (server authority, source use, ctime fence,
+  mounts and inventory, quiesce, process scan, durable custody) do not rediscover
+  it.
+- No compensation for R is shipped.
 
 ### Write and sync ordering, failure model
 
@@ -489,9 +515,25 @@ verdict or reason and reports only a `retire_scratch` block and
   that is at most about 115 s.
 - **Per-candidate exclusion.** Each candidate is re-proven under the existing
   A, S, B order: the authority transaction (A), the run's source reservation (S),
-  and the parent bare's lock (B). Inside B the binding, ledger, journal, restore
-  holder, every other bare's protected paths, custody, quarantine and canonical
-  footprint are read again; the source-use check is read-only (a held lease from
+  and the parent bare's lock (B). Every other bare's protected paths and
+  retire evidence (bindings and attempt ledgers) are read again inside S, before B;
+  writers on other bares take their own bare's lock, never this one, so that read
+  sees what a read inside B would. Inside B the binding, ledger, journal, restore
+  holder, custody, quarantine and canonical footprint are read again. If the S
+  re-read of the other bares is unknown, the parent is kept: `budget_deferred` when
+  the phase window is over, else `conflict` for a present parent or
+  `metadata_unresolved` for a gone one. **Cross-bare attempt identity**
+  (`retireCrossBareConflict`): any other bare's binding entry that cannot be
+  decoded, any decoded binding naming the attempt, or any ledger value not
+  positively identified as a different attempt keeps the parent as `conflict`.
+  Unidentified values include unparseable text, `{}`, `null`, a non-string or
+  malformed `attemptId` and values naming the attempt. This holds at nomination,
+  under the lock for deletion and in gone-parent recovery (kept as `conflict` at
+  nomination, `metadata_unresolved` under the lock). A gone parent whose uuid is
+  bound in more than one bare is kept as `conflict`. One undecodable binding or
+  unidentified ledger value in any other bare therefore keeps every bound parent
+  on the pod until it is removed.
+  Under B the source-use check is read-only (a held lease from
   another sink, or an active slot, keeps with `source_use_held`; nothing is
   admitted or taken over); the parent must be a worker-owned 0700 directory with
   the bound inode on the root's device, holding only `clone`, older than the
@@ -564,7 +606,7 @@ cross-check and every in-pass check. Reader-by-reader decisions (abbreviated;
 | Epoch census, maintenance and recovery families, FINAL inventory, terminal attribution, restore census and restore-route | No change. They match exact key families and ignore the prefix; none lists the runner root. |
 | ACK reader and runGit config accounting | Entries count toward their caps (1024 entries); the 64-per-bare cap bounds the addition. |
 | Startup inspector | Changed: reads bindings and reports binding-aware reasons. |
-| Attempt-ledger compaction | Changed: an attempt named by a binding keeps its `retired` entry; an unreadable or undecodable binding set keeps every entry; an attempt whose ledger values, on any branch, or a binding name more than one run, clone path or branch keeps every value verbatim, never dropped or collapsed (issue #4263); its binding is kept as `ledger_mismatch`, or `conflict` when a second binding names it. Such a conflict no longer heals by compaction, so readers that already refuse it (terminal attribution `duplicate_attempt`, the recovery source ledger check) keep refusing; normal flows never write a second identity for an attempt id. |
+| Attempt-ledger compaction | Changed: an attempt named by a binding keeps its `retired` entry; an unreadable or undecodable binding set keeps every entry; an attempt whose ledger values, on any branch, or a binding name more than one run, clone path or branch keeps every value verbatim, never dropped or collapsed (issue #4263); its binding is kept as `ledger_mismatch`, or `conflict` when a second binding names it. Such a conflict no longer heals by compaction, so readers that already refuse it (terminal attribution `duplicate_attempt`, the recovery source ledger check) keep refusing; normal flows never write a second identity for an attempt id. Cross-bare: compaction reads every other bare's config once, without that bare's lock, and preserves verbatim any attempt id another bare names (a decoded binding or an identified ledger value); while any other bare holds a decoded binding, own values that cannot be attributed to an attempt are kept too. Guarantee: every cross-bare conflict observed in that snapshot is preserved; a mention written after the read is outside it (legitimate writers only write fresh-minted ids, `mintAttemptId`: timestamp, claim generation, 64 random bits, or same-bare ids into their own bare under its lock). The scan is bounded (1024 bares, 16 MiB, 131072 records, a 5 s budget checked between reads); on any failure compaction is skipped, the ledger is unchanged and it warns `attempt ledger compaction skipped: foreign retire evidence unavailable` with a fixed reason (`bare_cap`, `bytes_cap`, `records_cap`, `deadline`, `unreadable`, `binding_unknown`, `binding_undecodable`, `ledger_unidentified`). A kept unattributable value is self-sustaining (the refused reclaim leaves its binding, and other bares' compaction skips on it); remediation is removing it from that bare's config. One unreadable or unidentifiable foreign bare disables compaction worker-wide. |
 | Hibernation census (filesystem walk of the runner root) | No change. A bound parent reports `unknown`, which blocks volume retirement conservatively (a residual below). |
 | `backup-runs.sh` config reads | No change. They match exact keys; a retired, discarded clone is not backup material. |
 
@@ -601,7 +643,14 @@ An architect, auditor and reviewer examined two judgments and found no stop.
   uid and groups as the capture git, so it cannot list or unlink that content
   either; the worker's step is only `rmdir`, which fails on a non-empty directory
   and leaves residue (the binding stays `removing`, the bytes survive). The
-  invariant holds only while there is a single runner pass, no chmod by helper or
+  invariant covers runner-unreadable directories only, not gitignored files.
+  Gitignored files are already outside every capture and outside terminal coverage
+  by the existing contract (the accepted residuals in
+  `adr/1786-stopped-source-retention.md`; `docs/run-recovery.md`, "Gitignored files
+  are not covered by any capture" and its "Gitignored files are not covered."
+  bullet), so runner-readable ignored content can be removed under that exclusion.
+  The capture contract is unchanged, and the receipt is still not proof of
+  emptiness. The invariant holds only while there is a single runner pass, no chmod by helper or
   worker, identity and groups equal to the capture git identity, and no runner-cmd
   process alive (the process scan refuses non-worker uids). Any second identity or
   a chmod makes both classes ineligible.
