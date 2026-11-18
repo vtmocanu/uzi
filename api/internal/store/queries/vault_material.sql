@@ -11,6 +11,9 @@ SELECT EXISTS (
     SELECT 1 FROM user_secrets s
     WHERE s.user_id = @user_id AND s.sealed_with IN ('master', 'master_aad')
     UNION ALL
+    SELECT 1 FROM run_env_vars e
+    WHERE e.user_id = @user_id AND e.sealed_with IN ('master', 'master_aad')
+    UNION ALL
     SELECT 1 FROM codex_provider_account a
     WHERE a.user_id = @user_id
       AND (a.sealed_with IN ('master', 'master_aad')
@@ -23,6 +26,12 @@ WITH secrets AS (
            coalesce(sum(octet_length(s.ciphertext)), 0)::bigint AS ciphertext_bytes,
            coalesce(max(octet_length(s.ciphertext)), 0)::bigint AS max_row_bytes
     FROM user_secrets s WHERE s.user_id = @user_id
+), env AS (
+    -- PRD #4416: run_env_vars rows (live, retired and pending deletion) are vault material.
+    SELECT count(*)::bigint AS material_rows,
+           coalesce(sum(octet_length(e.ciphertext)), 0)::bigint AS ciphertext_bytes,
+           coalesce(max(octet_length(e.ciphertext)), 0)::bigint AS max_row_bytes
+    FROM run_env_vars e WHERE e.user_id = @user_id
 ), accounts AS (
     SELECT (count(*) + count(a.recovery_sealed))::bigint AS material_rows,
            coalesce(sum(octet_length(a.sealed_login)::bigint
@@ -31,10 +40,10 @@ WITH secrets AS (
                         + coalesce(octet_length(a.recovery_sealed), 0)::bigint), 0)::bigint AS max_row_bytes
     FROM codex_provider_account a WHERE a.user_id = @user_id
 )
-SELECT (secrets.material_rows + accounts.material_rows)::bigint AS material_rows,
-       (secrets.ciphertext_bytes + accounts.ciphertext_bytes)::bigint AS ciphertext_bytes,
-       greatest(secrets.max_row_bytes, accounts.max_row_bytes)::bigint AS max_row_bytes
-FROM secrets CROSS JOIN accounts;
+SELECT (secrets.material_rows + env.material_rows + accounts.material_rows)::bigint AS material_rows,
+       (secrets.ciphertext_bytes + env.ciphertext_bytes + accounts.ciphertext_bytes)::bigint AS ciphertext_bytes,
+       greatest(secrets.max_row_bytes, env.max_row_bytes, accounts.max_row_bytes)::bigint AS max_row_bytes
+FROM secrets CROSS JOIN env CROSS JOIN accounts;
 
 -- name: LockVaultSecretMaterialBatch :many
 -- Materialize at most 64 metadata rows, then fetch only the prefix whose actual
@@ -55,6 +64,25 @@ FROM user_secrets s JOIN bounded b ON b.id = s.id
 WHERE s.user_id = @user_id AND b.batch_bytes <= 1048576
 ORDER BY s.id
 FOR UPDATE OF s;
+
+-- name: LockVaultEnvMaterialBatch :many
+-- Same bounded shape as the secret batch, over run_env_vars (PRD #4416). Every row
+-- is returned with the columns the AAD is rebuilt from: scope, repo, secret flag, name.
+WITH candidates AS MATERIALIZED (
+    SELECT e.id, octet_length(e.ciphertext)::bigint AS ciphertext_bytes
+    FROM run_env_vars e
+    WHERE e.user_id = @user_id
+      AND (sqlc.narg('after_id')::uuid IS NULL OR e.id > sqlc.narg('after_id')::uuid)
+    ORDER BY e.id LIMIT 64
+), bounded AS (
+    SELECT id, sum(ciphertext_bytes) OVER (ORDER BY id) AS batch_bytes
+    FROM candidates
+)
+SELECT e.id, e.repo_id, e.name, e.secret, e.ciphertext, e.sealed_with
+FROM run_env_vars e JOIN bounded b ON b.id = e.id
+WHERE e.user_id = @user_id AND b.batch_bytes <= 1048576
+ORDER BY e.id
+FOR UPDATE OF e;
 
 -- name: LockVaultAccountMaterialBatch :many
 -- Both slots of an account travel together. The 64-material-row budget counts a
@@ -83,6 +111,11 @@ FOR UPDATE OF a;
 -- name: ResealVaultSecretMaterial :execrows
 -- Crypto only: preserve timestamps, defaults, enablement and material revisions.
 UPDATE user_secrets SET ciphertext = @ciphertext, sealed_with = @sealed_with
+WHERE user_id = @user_id AND id = @id;
+
+-- name: ResealVaultEnvMaterial :execrows
+-- Crypto only: preserve revision, flags and timestamps.
+UPDATE run_env_vars SET ciphertext = @ciphertext, sealed_with = @sealed_with
 WHERE user_id = @user_id AND id = @id;
 
 -- name: ResealVaultAccountMaterial :execrows

@@ -156,6 +156,10 @@ import type {
   TemplateAllocation,
   TemplateAllocationsInput,
   TemplateSkills,
+  RunEnvDeleteResult,
+  RunEnvList,
+  RunEnvVar,
+  RunEnvWriteInput,
   ToolAllowlistEntry,
   ToolAllowlistWriteInput,
   TriageCounts,
@@ -945,15 +949,47 @@ const realApi = {
       packages,
     }),
 
+  // Per-repo run environment variables (PRD #4416 M1). Owner-only; writes carry the
+  // CSRF header through request(). A secret's value is write-only.
+  listRepoEnv: (repoId: string) =>
+    request<RunEnvList>("GET", `/repos/${repoId}/env`),
+  putRepoEnv: (repoId: string, name: string, input: RunEnvWriteInput) =>
+    request<{ variable: RunEnvVar }>(
+      "PUT",
+      `/repos/${repoId}/env/${encodeURIComponent(name)}`,
+      input,
+    ),
+  disableRepoEnv: (repoId: string, name: string) =>
+    request<{ variable: RunEnvVar }>(
+      "POST",
+      `/repos/${repoId}/env/${encodeURIComponent(name)}/disable`,
+    ),
+  enableRepoEnv: (repoId: string, name: string) =>
+    request<{ variable: RunEnvVar }>(
+      "POST",
+      `/repos/${repoId}/env/${encodeURIComponent(name)}/enable`,
+    ),
+  deleteRepoEnv: (repoId: string, name: string) =>
+    request<RunEnvDeleteResult>(
+      "DELETE",
+      `/repos/${repoId}/env/${encodeURIComponent(name)}`,
+    ),
+
   // Forge integration.
   forgeConfig: () => request<ForgeConfig>("GET", "/forge/config"),
   listConnections: () =>
     request<{ connections: ForgeConnection[] }>("GET", "/forge/connections"),
-  createConnection: (baseUrl: string, token: string, forgeType = "gitlab") =>
+  // replace=true is the explicit opt-in to rotate an EXISTING connection's
+  // credential. Without it the API refuses a create that targets an already
+  // connected user + forge type + base URL with 409 forge_connection_exists, so a
+  // user who re-submits the same host cannot silently destroy the token they
+  // already had.
+  createConnection: (baseUrl: string, token: string, forgeType = "gitlab", replace = false) =>
     request<{ connection: ForgeConnection }>("POST", "/forge/connections", {
       base_url: baseUrl,
       token,
       forge_type: forgeType,
+      ...(replace ? { replace: true } : {}),
     }),
   verifyConnection: (id: string) =>
     request<{ connection: ForgeConnection }>(
