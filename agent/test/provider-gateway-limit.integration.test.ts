@@ -40,13 +40,17 @@ describe("the pinned CLI's terminal frame for a persistent gateway 429 / 529", (
       roots.push(root);
       const home = path.join(root, "home");
       const worktree = path.join(root, "worktree");
-      for (const d of [path.join(home, ".claude"), worktree]) fs.mkdirSync(d, { recursive: true });
+      const tmp = path.join(root, "tmp");
+      for (const d of [path.join(home, ".claude"), worktree, tmp]) fs.mkdirSync(d, { recursive: true });
       fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
       const env = {
         ...buildSdkEnv({
           kind: "provider", baseUrl: `http://127.0.0.1:${port}`, authStyle: "bearer", key: KEY,
           modelMap: { sonnet: { model: "corp-sonnet" }, haiku: { model: "corp-haiku" } },
         }, home),
+        // The real CLI creates cc-socks and claude-<uid> under TMPDIR. Keep them
+        // inside the test root removed by the suite's existing cleanup.
+        TMPDIR: tmp,
         DISABLE_TELEMETRY: "1", DISABLE_AUTOUPDATER: "1", CLAUDE_CODE_MAX_RETRIES: "1",
       } as Record<string, string | undefined>;
       const controller = new AbortController();
