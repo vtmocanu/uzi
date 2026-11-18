@@ -5,7 +5,7 @@ SET LOCAL lock_timeout = '5s';
 -- rate_limit_type 'provider_gateway_limit' (no subscription window exists to name). This widens the
 -- runs_rate_limit_type_check of 00091 by that one value, for runs whose model_provider_key_mode is set.
 -- Existing rows satisfy the wider form; the new constraint is NOT VALID here (no full scan of the busy
--- runs table under the lock) and validated in 00479. This file touches runs only. The CHECK does not
+-- runs table under the lock) and validated in 00487. This file touches runs only. The CHECK does not
 -- tie the value to model_provider_key_mode: only the provider park path writes it, and the vocabulary
 -- is what the constraint enforces.
 ALTER TABLE runs DROP CONSTRAINT runs_rate_limit_type_check;
@@ -30,7 +30,7 @@ LOCK TABLE runs IN ACCESS EXCLUSIVE MODE;
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM runs WHERE status = 'limit_wait' AND rate_limit_type = 'provider_gateway_limit') THEN
-        RAISE EXCEPTION 'refusing to roll back 00478: run(s) are still waiting (limit_wait) on a provider gateway limit; resume or cancel those waiting runs before downgrading';
+        RAISE EXCEPTION 'refusing to roll back 00486: run(s) are still waiting (limit_wait) on a provider gateway limit; resume or cancel those waiting runs before downgrading';
     END IF;
 END
 $$;

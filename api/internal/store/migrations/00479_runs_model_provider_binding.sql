@@ -4,7 +4,7 @@ SET LOCAL lock_timeout = '5s';
 -- PRD #4320 M1: the per-run model provider binding columns, frozen at run creation by a later
 -- milestone. Deliberately NO foreign keys: a revoked provider or key must not null or block a
 -- bound run's row, and a FK would also lock the busy parent tables. This file touches runs only.
--- The CHECKs are NOT VALID here and validated in 00472.
+-- The CHECKs are NOT VALID here and validated in 00480.
 ALTER TABLE runs
     ADD COLUMN model_provider_id uuid,
     ADD COLUMN model_provider_revision integer,
@@ -33,14 +33,14 @@ SET LOCAL lock_timeout = '5s';
 -- the run would read back as a vendor run. The table is locked BEFORE the guard so a binding
 -- created concurrently cannot land between the check and the column drop (ACCESS EXCLUSIVE blocks
 -- every reader and writer, and is taken up front so no lock upgrade can deadlock).
--- The guard seq-scans runs: 00473's Down has already dropped idx_runs_model_provider by the
+-- The guard seq-scans runs: 00481's Down has already dropped idx_runs_model_provider by the
 -- time this runs (Downs run in reverse), so no index serves the check; a one-off downgrade can pay it.
 LOCK TABLE runs IN ACCESS EXCLUSIVE MODE;
 -- +goose StatementBegin
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM runs WHERE model_provider_id IS NOT NULL) THEN
-        RAISE EXCEPTION 'refusing to roll back 00471: run(s) are still bound to a model provider; delete them explicitly before downgrading';
+        RAISE EXCEPTION 'refusing to roll back 00479: run(s) are still bound to a model provider; delete them explicitly before downgrading';
     END IF;
 END
 $$;

@@ -55,7 +55,7 @@ A run freezes its binding on the run row at creation, in the create transaction:
 
 `runs` is a busy table. The `model_provider_*` binding columns carry only a CHECK that they are all null or all set (`runs_model_provider_binding_check`). There is deliberately no FK to `model_providers`, `model_provider_revisions` or `user_secrets`, so deleting a provider or key never cascades into runs and never takes a lock on `runs`. A binding that outlives its target is **detected at claim**, as `provider_binding_stale`, and is never nulled. Nulling would turn a revocation into a silent vendor fallback.
 
-The same reason shapes selection: `users.claude_provider_id` has a composite FK to `model_providers` with `ON DELETE RESTRICT` (migration 00469), so deleting a selected provider is refused (`provider_in_use_as_source`) and the source is never auto-nulled. A set but unusable source (retired, URL removed, key missing or disabled) is a typed refusal, `provider_source_unusable`, before any same-engine or cross-engine fallback. A null source leaves the existing Claude ladder unchanged.
+The same reason shapes selection: `users.claude_provider_id` has a composite FK to `model_providers` with `ON DELETE RESTRICT` (migration 00477), so deleting a selected provider is refused (`provider_in_use_as_source`) and the source is never auto-nulled. A set but unusable source (retired, URL removed, key missing or disabled) is a typed refusal, `provider_source_unusable`, before any same-engine or cross-engine fallback. A null source leaves the existing Claude ladder unchanged.
 
 ### D4. Route split: what a Bearer token may do
 
@@ -79,7 +79,7 @@ Run-level credential overrides (`--token`, per-run or per-schedule overrides) an
 
 ### D6. Issue runs wait out a gateway limit on a fixed schedule; chat ends the turn
 
-A gateway 429 or overload on an issue run reuses the existing non-terminal `limit_wait` with `rate_limit_type='provider_gateway_limit'` (migration 00478) and a fixed capped backoff as its resume time, keyed on `runs.model_provider_limit_streak` (the value before the park):
+A gateway 429 or overload on an issue run reuses the existing non-terminal `limit_wait` with `rate_limit_type='provider_gateway_limit'` (migration 00486) and a fixed capped backoff as its resume time, keyed on `runs.model_provider_limit_streak` (the value before the park):
 
 | Streak before the park | Retry time |
 |---|---|
@@ -90,9 +90,9 @@ A gateway 429 or overload on an issue run reuses the existing non-terminal `limi
 
 Owner Resume resets the streak. The vendor pool reads in `limitwait.go` (`anthropic_secret_id`, earliest pool reset) are skipped for provider runs, and no subscription reset time is invented. A run set not to wait out limits fails instead of parking, and jobs fail terminally.
 
-**Chat ends the turn with no park.** This is the owner decision recorded in the PRD Decision Log as "Chat gateway limits end the turn without parking" (also recorded as D15 on `main`, which this branch does not carry, so the landing rebase reconciles the two): a chat turn that hits a gateway 429 or overload emits an error naming `provider_gateway_limit` and is not retried or parked (`agent/src/chat-executor.ts`).
+**Chat ends the turn with no park.** This is the owner decision recorded in the PRD Decision Log as D15 ("Provider chat keeps chat's turn-ending behaviour on a gateway limit"): a chat turn that hits a gateway 429 or overload emits an error naming `provider_gateway_limit` and is not retried or parked (`agent/src/chat-executor.ts`).
 
-Migration 00478's Down refuses only while a run is still `limit_wait` on `provider_gateway_limit`, and maps terminal or resumed rows to `unknown`.
+Migration 00486's Down refuses only while a run is still `limit_wait` on `provider_gateway_limit`, and maps terminal or resumed rows to `unknown`.
 
 ### D7. The Test probe: direct, pinned, never follows a redirect
 
@@ -121,7 +121,7 @@ An attacker with database write could repoint a binding or the unsealed `base_ur
 ## Rollback hazards
 
 - **Image-only api rollback.** Pause or cancel queued provider runs and gateway waits first. An older api does not know the `provider_gateway_limit` type, the provider holds or the claim `provider` object.
-- **Migration Downs refuse live gateway waits.** 00478's Down raises while any run is `limit_wait` on `provider_gateway_limit`. Resume or cancel those runs, then downgrade.
+- **Migration Downs refuse live gateway waits.** 00486's Down raises while any run is `limit_wait` on `provider_gateway_limit`. Resume or cancel those runs, then downgrade.
 
 ## Known, accepted limit: the CLI follows redirects, and activation is blocked
 

@@ -51,7 +51,7 @@ LOCK TABLE model_providers IN SHARE ROW EXCLUSIVE MODE;
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM model_providers) THEN
-        RAISE EXCEPTION 'refusing to roll back 00466: model provider row(s) still exist; delete them explicitly before downgrading';
+        RAISE EXCEPTION 'refusing to roll back 00474: model provider row(s) still exist; delete them explicitly before downgrading';
     END IF;
 END
 $$;

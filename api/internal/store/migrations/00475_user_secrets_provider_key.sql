@@ -15,7 +15,7 @@ ALTER TABLE user_secrets ADD COLUMN provider_id uuid;
 ALTER TABLE user_secrets ADD CONSTRAINT user_secrets_provider_fkey
     FOREIGN KEY (user_id, provider_id) REFERENCES model_providers (owner_user_id, id) ON DELETE CASCADE NOT VALID;
 -- A provider key carries a provider and nothing else does. The kind check, this fkey and the CHECK
--- are NOT VALID here (no full scan under the lock), validated in 00468.
+-- are NOT VALID here (no full scan under the lock), validated in 00476.
 ALTER TABLE user_secrets ADD CONSTRAINT user_secrets_provider_key_check
     CHECK ((kind = 'anthropic_compatible_key') = (provider_id IS NOT NULL)) NOT VALID;
 -- One key per (user, provider).
@@ -33,7 +33,7 @@ LOCK TABLE user_secrets IN SHARE ROW EXCLUSIVE MODE;
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM user_secrets WHERE kind = 'anthropic_compatible_key') THEN
-        RAISE EXCEPTION 'refusing to roll back 00467: provider key row(s) (anthropic_compatible_key) still exist; delete them explicitly before downgrading';
+        RAISE EXCEPTION 'refusing to roll back 00475: provider key row(s) (anthropic_compatible_key) still exist; delete them explicitly before downgrading';
     END IF;
 END
 $$;

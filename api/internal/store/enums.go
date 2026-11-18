@@ -29,7 +29,7 @@ const KindOpenAIAPIKey = "openai_api_key" //nolint:gosec // G101: a user_secrets
 const KindCodexAuth = "codex_auth"
 
 // KindAnthropicCompatibleKey is user_secrets.kind for a model provider's gateway key (migration
-// 00467, PRD #4320): bound to one provider through user_secrets.provider_id, never a default,
+// 00475, PRD #4320): bound to one provider through user_secrets.provider_id, never a default,
 // never in the auto-select pool.
 const KindAnthropicCompatibleKey = "anthropic_compatible_key"
 
