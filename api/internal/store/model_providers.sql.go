@@ -502,6 +502,42 @@ func (q *Queries) ListModelProvidersForOwner(ctx context.Context, ownerUserID uu
 	return items, nil
 }
 
+const listRunProviderNames = `-- name: ListRunProviderNames :many
+SELECT r.id AS run_id, p.name
+FROM runs r
+JOIN model_providers p ON p.id = r.model_provider_id AND p.owner_user_id = r.user_id
+WHERE r.id = ANY($1::uuid[])
+`
+
+type ListRunProviderNamesRow struct {
+	RunID uuid.UUID `json:"run_id"`
+	Name  string    `json:"name"`
+}
+
+// The current name of the provider each given run was bound to (PRD #4320 run surfaces). The join
+// matches the provider only under the RUN'S owner (the composite owner key), so a name can never
+// cross users; a run with no binding, or whose provider row has since been deleted (runs carry no
+// foreign key to model_providers), returns no row.
+func (q *Queries) ListRunProviderNames(ctx context.Context, runIds []uuid.UUID) ([]ListRunProviderNamesRow, error) {
+	rows, err := q.db.Query(ctx, listRunProviderNames, runIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListRunProviderNamesRow{}
+	for rows.Next() {
+		var i ListRunProviderNamesRow
+		if err := rows.Scan(&i.RunID, &i.Name); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const lockModelProviderForShare = `-- name: LockModelProviderForShare :one
 SELECT id, current_revision, retired_at FROM model_providers
 WHERE id = $1 AND owner_user_id = $2

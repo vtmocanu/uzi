@@ -252,6 +252,9 @@ var runDTOKeys = []string{
 	"disk_park_count",
 	// PRD #1733: the open provider-park streak (count, and when it began; null when none is open).
 	"provider_park_count", "provider_park_streak_started_at",
+	// PRD #4320: the bound custom model provider (both null for a vendor run; the name is also null
+	// once the provider is deleted).
+	"provider_id", "provider_name",
 	// PRD #1590 D6: the derived owner action for a codex_account_unavailable hold (null otherwise).
 	"codex_account_action",
 	// Issue #1730: the run's bound alias id and its independent snapshotted label.

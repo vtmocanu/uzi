@@ -15,7 +15,7 @@ import (
 // newProviderCmd — `uzi provider` manages the caller's model providers (PRD #4320): a named
 // Anthropic-compatible gateway the Claude engine can be pointed at.
 //
-// The CLI covers list / create / edit / test / retire, which are RequireUser routes. The KEY
+// The CLI covers list / create / edit / test / retire / use, which are RequireUser routes. The KEY
 // (add, replace, remove, enable/disable), a destination change (base URL, auth style) and
 // deleting a provider are cookie-only web actions on purpose: they mint or redirect a credential,
 // which a stolen CLI token must not be able to do (the same reasoning as `uzi token`). So there is
@@ -23,7 +23,7 @@ import (
 func newProviderCmd(env Env, gf *globalFlags) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "provider",
-		Short: "List, create, edit, test and retire your model providers",
+		Short: "List, create, edit, test, retire and select your model providers",
 		Long: "Manage model providers: named Anthropic-compatible gateways that Claude can be pointed at.\n\n" +
 			"The base URL must be one your operator allowed (UZI_PROVIDER_ALLOWED_BASE_URLS); ask\n" +
 			"your operator which ones. Adding or replacing the provider's API key, changing its\n" +
@@ -278,7 +278,60 @@ func newProviderCmd(env Env, gf *globalFlags) *cobra.Command {
 		},
 	}
 
-	cmd.AddCommand(list, create, edit, test, retire)
+	var useNone bool
+	use := &cobra.Command{
+		Use:   "use <name|id> | --none",
+		Short: "Run your Claude runs on a model provider, or back on Anthropic with --none",
+		Long: "Select the model provider your Claude runs use, by name or id, or clear the selection with\n" +
+			"--none so Claude runs use Anthropic directly again. A provider must not be retired, must have\n" +
+			"an enabled key (added in the web Settings) and must have a base URL your operator still allows.\n" +
+			"The selection applies to runs you start afterwards; a run already started keeps what it was\n" +
+			"bound to. Codex runs are unaffected.",
+		Args: cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if useNone == (len(args) == 1) {
+				return uzicli.Exitf(uzicli.ExitUsage, "pass a provider name or id, or --none (not both)")
+			}
+			c, err := env.client(gf)
+			if err != nil {
+				return err
+			}
+			var want *string
+			var name string
+			if !useNone {
+				target, err := resolveProvider(cmd, c, args[0])
+				if err != nil {
+					return err
+				}
+				if err := providerUsableRefusal(target); err != nil {
+					return err
+				}
+				want, name = &target.ID, target.Name
+			}
+			got, err := c.SetClaudeProviderSource(cmd.Context(), want)
+			if err != nil {
+				return providerUseErr(err)
+			}
+			p := env.printer(gf)
+			if p.Format == uzicli.FormatJSON {
+				return p.JSON(struct {
+					ClaudeProviderID *string `json:"claude_provider_id"`
+					Name             *string `json:"name"`
+				}{got, nilIfEmpty(name)})
+			}
+			if !gf.quiet {
+				if got == nil {
+					p.Printf("Claude runs now use Anthropic directly (no model provider selected).\n")
+				} else {
+					p.Printf("Claude runs you start now use provider %q.\n", cellText(name))
+				}
+			}
+			return nil
+		},
+	}
+	use.Flags().BoolVar(&useNone, "none", false, "clear the selection: Claude runs use Anthropic directly")
+
+	cmd.AddCommand(list, create, edit, test, retire, use)
 	return cmd
 }
 
@@ -307,6 +360,41 @@ func resolveProvider(cmd *cobra.Command, c uzicli.Client, arg string) (apitypes.
 	}
 	return apitypes.ProviderDTO{}, uzicli.Exitf(uzicli.ExitNotFound,
 		"no provider named or with id %q; `uzi provider list` shows yours", cellText(arg))
+}
+
+// providerUsableRefusal refuses, before any write, a provider the list already shows cannot be the
+// Claude source, with the one step that fixes it. The server applies the same rules (and the
+// operator allowlist, which the list does not show), so this only saves a round trip and names
+// the fix; it is never the authority.
+func providerUsableRefusal(d apitypes.ProviderDTO) error {
+	switch {
+	case d.Retired:
+		return uzicli.Exitf(uzicli.ExitConflict, "provider %q is retired and cannot be used; pick another with `uzi provider list`", cellText(d.Name))
+	case !d.HasKey:
+		return uzicli.Exitf(uzicli.ExitConflict, "provider %q has no key; add its API key in the web Settings (keys are web-only), then run `uzi provider use %s`", cellText(d.Name), cellText(d.ID))
+	case !d.KeyEnabled:
+		return uzicli.Exitf(uzicli.ExitConflict, "provider %q has its key disabled; enable it in the web Settings, then run `uzi provider use %s`", cellText(d.Name), cellText(d.ID))
+	}
+	return nil
+}
+
+// providerUseErr maps the server's typed refusal of the source selection onto a message that
+// names the fix. provider_source_unusable already carries the cause (retired, no key, key
+// disabled, base URL not on the operator allowlist, provider gone); the next step is appended.
+func providerUseErr(err error) error {
+	var ee *uzicli.ExitError
+	if errors.As(err, &ee) && ee.Reason == "provider_source_unusable" {
+		return providerErr(&uzicli.ExitError{Code: ee.Code, Reason: ee.Reason, RetryAfter: ee.RetryAfter,
+			Err: fmt.Errorf("%s; pick another provider or fix this one in the web Settings", strings.TrimSuffix(ee.Error(), "."))})
+	}
+	return providerErr(err)
+}
+
+func nilIfEmpty(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
 }
 
 // providerErr appends the server's machine-readable reason to an error that carries one, so a

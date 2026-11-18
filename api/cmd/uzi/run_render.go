@@ -398,7 +398,7 @@ func renderRunDetailAt(p *uzicli.Printer, r apitypes.RunDTO, now time.Time, orig
 	// carries a usage bundle at all (pre-#40 / unclaimed runs have none), like the budget
 	// rows above.
 	if r.Usage != nil {
-		rows = append(rows, []string{"COST", costDetailCell(*r.Usage)})
+		rows = append(rows, []string{"COST", runCostDetailCell(r)})
 	}
 	// EST. TAIL (issue #2014, ADR-2014): the ESTIMATED usage of an interrupted Claude
 	// session, a separate row beside COST and never folded into it. Absent for the all-zero
@@ -440,6 +440,11 @@ func renderRunDetailAt(p *uzicli.Printer, r apitypes.RunDTO, now time.Time, orig
 	//     write path that skips validation, and through a direct database write.
 	if r.AnthropicSecretLabel != nil && *r.AnthropicSecretLabel != "" {
 		rows = append(rows, []string{"ANTHROPIC_TOKEN", credentialCell(r)})
+	}
+	// The custom model provider the run was bound to (PRD #4320), in place of an Anthropic token
+	// (a provider run has none). The name is user-authored: providerCell runs it through cellText.
+	if isProviderRun(r) {
+		rows = append(rows, []string{"PROVIDER", providerCell(r)})
 	}
 	if r.Harness == "codex" && r.CodexSecretLabel != nil && *r.CodexSecretLabel != "" {
 		rows = append(rows, []string{"CODEX_ALIAS", codexAliasCell(r)})

@@ -60,3 +60,18 @@ func (c *HTTPClient) TestProvider(ctx context.Context, id string) (*apitypes.Pro
 	}
 	return env.Probe, nil
 }
+
+// SetClaudeProviderSource sends {"provider_id": <id>|null} and returns the selection the server
+// reports back (claude_provider_id), nil when it is cleared.
+func (c *HTTPClient) SetClaudeProviderSource(ctx context.Context, id *string) (*string, error) {
+	var out struct {
+		ClaudeProviderID *string `json:"claude_provider_id"`
+	}
+	body := struct {
+		ProviderID *string `json:"provider_id"`
+	}{id}
+	if err := c.put(ctx, "/api/me/providers/claude-source", body, &out); err != nil {
+		return nil, err
+	}
+	return out.ClaudeProviderID, nil
+}

@@ -255,6 +255,15 @@ var knownInstructions = []knownInstruction{
 			"client and assert the messages name it.",
 	},
 	{
+		command:  "uzi provider use",
+		evidence: evidenceGoTest,
+		where:    "TestProviderUseRefusesUnusableBeforeWrite",
+		note: "RUNTIME: refusing a keyless or key-disabled provider names the fix and the retry " +
+			"command `uzi provider use <id>` (provider.go). TestProviderUseRefusesUnusableBeforeWrite " +
+			"runs the real cobra command against a fake client and asserts the retry command is " +
+			"printed with the provider's id.",
+	},
+	{
 		command:  "uzi provider test",
 		evidence: evidenceGoTest,
 		where:    "TestProviderCreateSendsMapAndHintsKey",

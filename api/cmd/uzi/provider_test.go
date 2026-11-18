@@ -158,7 +158,7 @@ func TestProviderCreateHasNoKeyFlag(t *testing.T) {
 		t.Errorf("a --key flag must not exist (code %d, sent %+v)", code, fc.LastProviderCreate)
 	}
 	provider := findCmd(newRootCmd(fakeEnv(fc)), "provider")
-	for _, verb := range []string{"use", "delete", "key"} {
+	for _, verb := range []string{"delete", "key"} {
 		if findCmd(provider, verb) != nil {
 			t.Errorf("provider %s must not exist", verb)
 		}
@@ -377,5 +377,131 @@ func TestParseModelFlagsContextWindowSuffix(t *testing.T) {
 	var ee *uzicli.ExitError
 	if !errors.As(err, &ee) || ee.Code != uzicli.ExitUsage {
 		t.Fatalf("overflowing window: err = %v", err)
+	}
+}
+
+func TestProviderUseSelectsByNameAndID(t *testing.T) {
+	keyed := providerFixture("Corp GW")
+	keyed.HasKey, keyed.KeyEnabled = true, true
+	fc := &uzicli.FakeClient{ProviderList: enabledList(keyed)}
+	out, errOut, code := runCLI(t, fakeEnv(fc), "provider", "use", "corp gw")
+	if code != uzicli.ExitOK || fc.ProviderSourceCalls != 1 || fc.LastProviderSource == nil || *fc.LastProviderSource != providerTestID {
+		t.Fatalf("by name: code %d calls %d sent %v stderr %q", code, fc.ProviderSourceCalls, fc.LastProviderSource, errOut)
+	}
+	if !strings.Contains(out, `use provider "Corp GW"`) {
+		t.Errorf("output = %q", out)
+	}
+	if _, _, code := runCLI(t, fakeEnv(fc), "provider", "use", providerTestID); code != uzicli.ExitOK || fc.ProviderSourceCalls != 2 {
+		t.Errorf("by id: code %d calls %d", code, fc.ProviderSourceCalls)
+	}
+	out, _, code = runCLI(t, fakeEnv(fc), "--json", "provider", "use", "corp gw")
+	var got struct {
+		ID   *string `json:"claude_provider_id"`
+		Name *string `json:"name"`
+	}
+	if code != uzicli.ExitOK || json.Unmarshal([]byte(out), &got) != nil || got.ID == nil || *got.ID != providerTestID || got.Name == nil || *got.Name != "Corp GW" {
+		t.Errorf("json: code %d out %q", code, out)
+	}
+}
+
+func TestProviderUseNoneClears(t *testing.T) {
+	fc := &uzicli.FakeClient{}
+	out, errOut, code := runCLI(t, fakeEnv(fc), "provider", "use", "--none")
+	if code != uzicli.ExitOK || !fc.ProviderSourceSet || fc.LastProviderSource != nil || fc.ProviderSourceCalls != 1 {
+		t.Fatalf("code %d set=%v sent=%v stderr %q", code, fc.ProviderSourceSet, fc.LastProviderSource, errOut)
+	}
+	if !strings.Contains(out, "Anthropic directly") {
+		t.Errorf("output = %q", out)
+	}
+	out, _, code = runCLI(t, fakeEnv(fc), "--json", "provider", "use", "--none")
+	if code != uzicli.ExitOK || !strings.Contains(out, `"claude_provider_id": null`) && !strings.Contains(out, `"claude_provider_id":null`) {
+		t.Errorf("json: code %d out %q", code, out)
+	}
+}
+
+func TestProviderUseArgumentErrors(t *testing.T) {
+	fc := &uzicli.FakeClient{ProviderList: enabledList(providerFixture("corp"))}
+	for _, args := range [][]string{{"provider", "use"}, {"provider", "use", "corp", "--none"}, {"provider", "use", "a", "b"}} {
+		if _, _, code := runCLI(t, fakeEnv(fc), args...); code != uzicli.ExitUsage || fc.ProviderSourceCalls != 0 {
+			t.Errorf("%v: code %d calls %d, want usage and no write", args, code, fc.ProviderSourceCalls)
+		}
+	}
+	_, errOut, code := runCLI(t, fakeEnv(fc), "provider", "use", "nope")
+	if code != uzicli.ExitNotFound || fc.ProviderSourceCalls != 0 || !strings.Contains(errOut, "uzi provider list") {
+		t.Errorf("unknown: code %d stderr %q", code, errOut)
+	}
+}
+
+// A provider the list already shows is unusable is refused before any write, naming the fix.
+func TestProviderUseRefusesUnusableBeforeWrite(t *testing.T) {
+	retired := providerFixture("old")
+	retired.HasKey, retired.KeyEnabled, retired.Retired = true, true, true
+	keyless := providerFixture("bare")
+	keyless.ID = "22222222-2222-4222-8222-222222222222"
+	disabled := providerFixture("off")
+	disabled.ID = "33333333-3333-4333-8333-333333333333"
+	disabled.HasKey = true
+	fc := &uzicli.FakeClient{ProviderList: enabledList(retired, keyless, disabled)}
+	for name, want := range map[string]string{"old": "retired", "bare": "no key", "off": "key disabled"} {
+		_, errOut, code := runCLI(t, fakeEnv(fc), "provider", "use", name)
+		if code != uzicli.ExitConflict || !strings.Contains(errOut, want) {
+			t.Errorf("%s: code %d stderr %q, want conflict naming %q", name, code, errOut, want)
+		}
+	}
+	// A fixable refusal names the retry command with the provider's id (safe to paste).
+	if _, errOut, _ := runCLI(t, fakeEnv(fc), "provider", "use", "bare"); !strings.Contains(errOut, "uzi provider use "+keyless.ID) {
+		t.Errorf("keyless refusal lacks the retry command: %q", errOut)
+	}
+	if fc.ProviderSourceCalls != 0 {
+		t.Errorf("an unusable provider reached the server %d times", fc.ProviderSourceCalls)
+	}
+}
+
+// The server's typed refusal (for example a base URL no longer on the allowlist, which the list
+// cannot show) keeps its exit code, shows its cause and reason, and names the next step.
+func TestProviderUseServerRefusalMapped(t *testing.T) {
+	keyed := providerFixture("corp")
+	keyed.HasKey, keyed.KeyEnabled = true, true
+	fc := &uzicli.FakeClient{ProviderList: enabledList(keyed)}
+	fw := &testFailingSource{FakeClient: fc, err: &uzicli.ExitError{Code: uzicli.ExitConflict,
+		Err:    errors.New("the provider cannot be the Claude source: its base URL is not on the operator allowlist"),
+		Reason: "provider_source_unusable"}}
+	_, errOut, code := runCLI(t, fakeEnv(fw), "provider", "use", "corp")
+	for _, want := range []string{"not on the operator allowlist", "provider_source_unusable", "pick another provider"} {
+		if !strings.Contains(errOut, want) {
+			t.Errorf("stderr missing %q: %q", want, errOut)
+		}
+	}
+	if code != uzicli.ExitConflict {
+		t.Errorf("code = %d, want conflict", code)
+	}
+	// An unrelated typed error passes through with its reason appended.
+	fw.err = &uzicli.ExitError{Code: uzicli.ExitNotFound, Err: errors.New("provider not found"), Reason: "provider_not_found"}
+	_, errOut, code = runCLI(t, fakeEnv(fw), "provider", "use", "corp")
+	if code != uzicli.ExitNotFound || !strings.Contains(errOut, "provider_not_found") {
+		t.Errorf("not found: code %d stderr %q", code, errOut)
+	}
+}
+
+type testFailingSource struct {
+	*uzicli.FakeClient
+	err error
+}
+
+func (f *testFailingSource) SetClaudeProviderSource(_ context.Context, _ *string) (*string, error) {
+	return nil, f.err
+}
+
+// The provider name is user-authored text: it must not reach the terminal raw from use.
+func TestProviderUseNameNeverReachesTerminalRaw(t *testing.T) {
+	hostile := providerFixture(hostileANSI + hostileBidi)
+	hostile.HasKey, hostile.KeyEnabled = true, true
+	fc := &uzicli.FakeClient{ProviderList: enabledList(hostile)}
+	out, errOut, code := runCLI(t, fakeEnv(fc), "provider", "use", providerTestID)
+	if code != uzicli.ExitOK {
+		t.Fatalf("code %d stderr %q", code, errOut)
+	}
+	if strings.ContainsRune(out, 0x1b) || strings.ContainsRune(out, '\u202e') {
+		t.Errorf("raw control or bidi in output: %q", out)
 	}
 }

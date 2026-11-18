@@ -402,6 +402,11 @@ type FakeClient struct {
 	LastProviderID      string
 	ProviderRetireCalls int
 	ProviderTestCalls   int
+	// ProviderSourceCalls counts SetClaudeProviderSource; LastProviderSource is the id it was last
+	// asked to select (nil = clear) and ProviderSourceSet says it was called at all.
+	ProviderSourceCalls int
+	ProviderSourceSet   bool
+	LastProviderSource  *string
 
 	// Secrets drives ListSecrets (PRD #104 M2).
 	Secrets                  []apitypes.SecretDTO

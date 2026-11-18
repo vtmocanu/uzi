@@ -804,6 +804,15 @@ type RunDTO struct {
 	// account, so it must not reach latestRunDTO without that struct's IsMine gate.
 	AnthropicSecretID    *string `json:"anthropic_secret_id"`
 	AnthropicSecretLabel *string `json:"anthropic_secret_label"`
+	// ProviderID / ProviderName name the custom model provider the run is bound to (PRD #4320).
+	// ProviderID is the run's bound provider id (a run carries no foreign key to the provider,
+	// so it outlives a deleted provider); null for a run on the vendor's own API. ProviderName is
+	// the provider's CURRENT name, resolved under the run's owner, and is null for a vendor run
+	// and for a run whose provider has since been deleted. The name is USER-AUTHORED text: render
+	// it as plain text (the CLI through cellText/renderer.Plain, the web escaped). Owner-or-admin
+	// scoped like the Anthropic label above; never added to the shared board DTO.
+	ProviderID   *string `json:"provider_id"`
+	ProviderName *string `json:"provider_name"`
 	// AnthropicSelectReason is the MODE that named that credential, and it is why
 	// the label alone was never enough (PRD #111 M5, D20). An auto pick and a default
 	// fallback can name the SAME token, so "which account paid" and "why that account"
@@ -1757,6 +1766,15 @@ type RunSummaryItemDTO struct {
 	// account, so it must not reach latestRunDTO without that struct's IsMine gate.
 	AnthropicSecretID    *string `json:"anthropic_secret_id"`
 	AnthropicSecretLabel *string `json:"anthropic_secret_label"`
+	// ProviderID / ProviderName name the custom model provider the run is bound to (PRD #4320).
+	// ProviderID is the run's bound provider id (a run carries no foreign key to the provider,
+	// so it outlives a deleted provider); null for a run on the vendor's own API. ProviderName is
+	// the provider's CURRENT name, resolved under the run's owner, and is null for a vendor run
+	// and for a run whose provider has since been deleted. The name is USER-AUTHORED text: render
+	// it as plain text (the CLI through cellText/renderer.Plain, the web escaped). Owner-or-admin
+	// scoped like the Anthropic label above; never added to the shared board DTO.
+	ProviderID   *string `json:"provider_id"`
+	ProviderName *string `json:"provider_name"`
 	// AnthropicSelectReason is the MODE that named that credential, and it is why
 	// the label alone was never enough (PRD #111 M5, D20). An auto pick and a default
 	// fallback can name the SAME token, so "which account paid" and "why that account"
@@ -2237,6 +2255,8 @@ func RunSummaryOf(item RunListItemDTO) RunSummaryItemDTO {
 		OwnAgents:                     item.OwnAgents,
 		AnthropicSecretID:             item.AnthropicSecretID,
 		AnthropicSecretLabel:          item.AnthropicSecretLabel,
+		ProviderID:                    item.ProviderID,
+		ProviderName:                  item.ProviderName,
 		AnthropicSelectReason:         item.AnthropicSelectReason,
 		AnthropicHeadroomPct:          item.AnthropicHeadroomPct,
 		Usage:                         item.Usage,
@@ -2431,6 +2451,8 @@ func (s RunSummaryItemDTO) ListItem() RunListItemDTO {
 			OwnAgents:                     s.OwnAgents,
 			AnthropicSecretID:             s.AnthropicSecretID,
 			AnthropicSecretLabel:          s.AnthropicSecretLabel,
+			ProviderID:                    s.ProviderID,
+			ProviderName:                  s.ProviderName,
 			AnthropicSelectReason:         s.AnthropicSelectReason,
 			AnthropicHeadroomPct:          s.AnthropicHeadroomPct,
 			Usage:                         s.Usage,

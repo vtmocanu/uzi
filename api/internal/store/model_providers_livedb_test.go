@@ -414,3 +414,47 @@ func TestModelProviderNameUniquePerOwnerLiveDB(t *testing.T) {
 		t.Fatalf("engine codex = %v, want a CHECK violation until PRD #4323 widens it", err)
 	}
 }
+
+// TestListRunProviderNamesLiveDB: the run-surface name lookup returns the provider's current name
+// for a bound run, nothing for a vendor run, nothing for a run whose provider row was deleted
+// (runs carry no foreign key to it), and nothing for a run whose owner is not the provider's owner.
+func TestListRunProviderNamesLiveDB(t *testing.T) {
+	ctx, pool, q := productLiveDB(t)
+	owner, _ := newProductUser(ctx, t, pool)
+	other, _ := newProductUser(ctx, t, pool)
+	p := newProvider(ctx, t, q, owner, "corp gateway")
+	gone := newProvider(ctx, t, q, owner, "short lived")
+
+	insertRun := func(user uuid.UUID, provider *uuid.UUID) uuid.UUID {
+		t.Helper()
+		var id uuid.UUID
+		var err error
+		if provider == nil {
+			err = pool.QueryRow(ctx, `INSERT INTO runs (user_id, issue_title, issue_description, kind, job_type)
+				VALUES ($1, 'j', 'x', 'job', 'research') RETURNING id`, user).Scan(&id)
+		} else {
+			err = pool.QueryRow(ctx, `INSERT INTO runs (user_id, issue_title, issue_description, kind, job_type,
+				model_provider_id, model_provider_revision, model_provider_key_mode, model_provider_key_secret_id, model_provider_key_rev)
+				VALUES ($1, 'j', 'x', 'job', 'research', $2, 1, 'user_key', $3, 1) RETURNING id`, user, *provider, uuid.New()).Scan(&id)
+		}
+		if err != nil {
+			t.Fatalf("insert run: %v", err)
+		}
+		return id
+	}
+	vendor := insertRun(owner, nil)
+	bound := insertRun(owner, &p.ID)
+	orphan := insertRun(owner, &gone.ID)
+	foreign := insertRun(other, &p.ID)
+	if n, err := q.DeleteModelProvider(ctx, store.DeleteModelProviderParams{ID: gone.ID, OwnerUserID: owner}); err != nil || n != 1 {
+		t.Fatalf("delete = %d, %v", n, err)
+	}
+
+	rows, err := q.ListRunProviderNames(ctx, []uuid.UUID{vendor, bound, orphan, foreign})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].RunID != bound || rows[0].Name != "corp gateway" {
+		t.Fatalf("rows = %+v, want exactly the bound run named %q", rows, "corp gateway")
+	}
+}

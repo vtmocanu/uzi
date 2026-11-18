@@ -670,6 +670,7 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 	// PRD #1590 D6: the derived owner action of a run held on its Codex account (null
 	// otherwise). Best-effort, and queried only for such a held run.
 	h.overlayCodexAccountActions(r.Context(), &dto)
+	h.overlayProviderNames(r.Context(), &dto)
 	// PRD #3454: queue_reason "maintenance" for a queued run the intake pause holds back.
 	h.overlayQueueReasons(r.Context(), &dto)
 	h.overlayRunForgeOriginCooldowns(r.Context(), &dto)

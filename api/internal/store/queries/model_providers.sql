@@ -109,6 +109,16 @@ LEFT JOIN user_secrets k ON k.user_id = p.owner_user_id AND k.provider_id = p.id
 LEFT JOIN model_provider_probe_results pr ON pr.provider_id = p.id AND pr.revision = p.current_revision
 WHERE p.id = $1 AND p.owner_user_id = $2;
 
+-- name: ListRunProviderNames :many
+-- The current name of the provider each given run was bound to (PRD #4320 run surfaces). The join
+-- matches the provider only under the RUN'S owner (the composite owner key), so a name can never
+-- cross users; a run with no binding, or whose provider row has since been deleted (runs carry no
+-- foreign key to model_providers), returns no row.
+SELECT r.id AS run_id, p.name
+FROM runs r
+JOIN model_providers p ON p.id = r.model_provider_id AND p.owner_user_id = r.user_id
+WHERE r.id = ANY(@run_ids::uuid[]);
+
 -- name: UpsertModelProviderProbeResult :execrows
 -- Stores the latest Test probe result for the provider's CURRENT revision only (PRD #4320 section
 -- 8): the row is written only while the owner's provider still has that revision as its current

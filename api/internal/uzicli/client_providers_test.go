@@ -2,9 +2,11 @@ package uzicli
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
@@ -61,5 +63,42 @@ func TestHTTPClientProviders(t *testing.T) {
 	probe, err := c.TestProvider(ctx, "p/1")
 	if err != nil || probe == nil || probe.AuthResult != "ok" || probe.ToolResult != "not_supported" || got.method != http.MethodPost {
 		t.Fatalf("test: %+v err=%v seen=%+v", probe, err, got)
+	}
+}
+
+func TestHTTPClientSetClaudeProviderSource(t *testing.T) {
+	var method, path, body string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		method, path, body = r.Method, r.URL.EscapedPath(), string(b)
+		if strings.Contains(body, "unusable") {
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(`{"error":"the provider cannot be the Claude source: the provider is retired","reason":"provider_source_unusable"}`))
+			return
+		}
+		if strings.Contains(body, "null") {
+			_, _ = w.Write([]byte(`{"claude_provider_id":null}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"claude_provider_id":"p-1"}`))
+	}))
+	defer srv.Close()
+	c := newTestClient(srv)
+	ctx := context.Background()
+
+	id := "p-1"
+	got, err := c.SetClaudeProviderSource(ctx, &id)
+	if err != nil || got == nil || *got != "p-1" || method != http.MethodPut || path != "/api/me/providers/claude-source" || body != `{"provider_id":"p-1"}` {
+		t.Fatalf("select: %v err=%v %s %s %s", got, err, method, path, body)
+	}
+	got, err = c.SetClaudeProviderSource(ctx, nil)
+	if err != nil || got != nil || body != `{"provider_id":null}` {
+		t.Fatalf("clear: %v err=%v body=%s", got, err, body)
+	}
+	bad := "unusable"
+	_, err = c.SetClaudeProviderSource(ctx, &bad)
+	var ee *ExitError
+	if !errors.As(err, &ee) || ee.Code != ExitConflict || ee.Reason != "provider_source_unusable" {
+		t.Fatalf("refusal = %#v, want a conflict carrying the reason", err)
 	}
 }

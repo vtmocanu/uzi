@@ -111,6 +111,11 @@ type Client interface {
 	EditProvider(ctx context.Context, id string, req apitypes.ProviderPatchRequest) (apitypes.ProviderDTO, error)
 	RetireProvider(ctx context.Context, id string) (apitypes.ProviderDTO, error)
 	TestProvider(ctx context.Context, id string) (*apitypes.ProviderProbeDTO, error)
+	// SetClaudeProviderSource selects (id non-nil) or clears (nil) the caller's Claude model-provider
+	// source via PUT /api/me/providers/claude-source and returns the id the server now reports (nil
+	// once cleared). An unusable provider (retired, keyless, not allowlisted) is a 409 with reason
+	// provider_source_unusable, an unknown or foreign one a 404.
+	SetClaudeProviderSource(ctx context.Context, id *string) (*string, error)
 	// SetTokenAutoEligible opts one of the caller's Anthropic tokens into or out of
 	// the auto-selection pool (PRD #111 M2, D2): PATCH
 	// /api/me/secrets/anthropic_token/{id}/auto-eligible {auto_eligible}.
