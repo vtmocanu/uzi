@@ -2833,7 +2833,14 @@ Each server read is bounded at 30 s; a failed read keeps the leaf. Owner decisio
 `refs/uzi-runner/<branch>`, not retention of the leaf, so it neither keeps nor
 releases it; an authority slot in state `ineligible` or `retired` with no pending,
 retiring or publication record counts as ended only together with the verified
-missing footprint, and any other slot keeps.
+missing footprint, and any other slot keeps. The worker-wide slot inventory is
+checked against the authenticated heads (a head-recorded slot whose file or `slots`
+directory is gone refuses the inventory, which keeps the leaf), and an inventory slot
+with no publication record keeps the leaf as unknown unless the run's own ledger
+entry attributed it and judged it ended. An outbox manifest or finalize record that
+the outbox could not load at startup (unreadable, malformed, unauthenticated,
+cross-run or a non-canonical name) keeps the leaf as unknown for the life of that
+process.
 
 New `scratch.kept` reasons for run leaves:
 
@@ -2861,6 +2868,10 @@ Known consequences and not shipped:
 - Startup throughput, run-procs and cache-cap attribution of the leaf are deferred.
 - When retained discovery overflows, all run leaves are kept for that pass.
 - A run reassigned to another worker is kept (`run_unknown`) on the old worker.
+- Retired authority slots are never removed, and the inventory spans the whole
+  worker. One retired slot that no ledger entry of the run attributes therefore keeps
+  every run leaf on that worker as `run_local_unknown` (`authority_inventory`), so in
+  practice reclaim stops once another run has retired a source there.
 
 #### One-worker deletion canary checklist
 
