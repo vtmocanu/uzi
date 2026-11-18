@@ -2844,6 +2844,23 @@ name, including a finalize temp file a crash left behind), or a run directory it
 not list, keeps the leaf as unknown for the life of that process. Undrained outbox
 messages kept under a case alias of the run id keep the leaf.
 
+Further cases that keep a leaf as unknown (`run_local_unknown`):
+
+- **The run's refs** (`run_refs`): the listing is read with stderr, so any git warning
+  or failure is unknown. After a clean empty listing, the loose ref storage under the
+  run's ref prefixes (`refs/uzi-owed`, `uzi-recovery-episode`, `uzi-recovery-pin`,
+  `uzi-coverage`, `uzi-settle`, `uzi-archive` and `refs/uzi-cross-check/<runId>`) and
+  `packed-refs` are checked directly. Any non-directory entry under them (a broken or
+  dangling ref, symlink, FIFO or stale lock file), a symlinked or non-directory
+  ancestor, any `packed-refs` line naming the run, or reftable ref storage keeps the
+  leaf as unknown. A stale `*.lock` left under a run's ref directory therefore keeps
+  that leaf until it is removed.
+- **A retired ledger row** (`attempt_ledger`) whose clone path is not this bare's
+  canonical attempt clone for its attempt id (the census's identity contract), or whose
+  generation is unreadable, gives unknown.
+- **Interrupted reads:** the authority slot reads stop at the pass's abort or deadline,
+  and the leaf is kept as unknown.
+
 New `scratch.kept` reasons for run leaves:
 
 | Reason | Meaning |
@@ -2870,10 +2887,14 @@ Known consequences and not shipped:
 - Startup throughput, run-procs and cache-cap attribution of the leaf are deferred.
 - When retained discovery overflows, all run leaves are kept for that pass.
 - A run reassigned to another worker is kept (`run_unknown`) on the old worker.
-- Retired authority slots are never removed, and the inventory spans the whole
-  worker. One retired slot that no ledger entry of the run attributes therefore keeps
-  every run leaf on that worker as `run_local_unknown` (`authority_inventory`), so in
-  practice reclaim stops once another run has retired a source there.
+- Authority slots are never removed, and the inventory spans the whole worker. The keep
+  rule covers every unattributed publication-null slot, not only retired tombstones.
+  That includes a settled bare-mutation slot: after a successful bare mutation the
+  slot's pending is cleared and its publication stays null, and a completed mutation
+  alone does not establish source settlement or a missing footprint. One such slot that
+  no ledger entry of the run attributes therefore keeps every run leaf on that worker
+  as `run_local_unknown` (`authority_inventory`), so in practice reclaim stops once
+  another run has retired a source or settled a bare mutation there.
 
 #### One-worker deletion canary checklist
 
