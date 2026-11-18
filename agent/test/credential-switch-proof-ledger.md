@@ -423,8 +423,8 @@ control is still absent, not that the functional criterion was deferred.
 | Atomic rollback, lost-reply replay, stale/foreign apply and target fences | U10 rollback; U12 credits the Codex replay answer and its redundant no-material copies, the new-generation replay fence (b) and the non-owner ErrRunNotOwned ownership query (b; the refusal itself has at least four copies, not isolated), all through apply; and nonce/generation/released/status fence conjuncts, op mismatch, target mismatch and both target-moved checks through preflight; preflight's own non-owner refusal, the validator replay copy, Step 1 worker check, apply Step 0 copies, other fence conjuncts, the stamp checks, target sub-checks and old-alias refusals not controlled |
 | Stopped-support negotiation, immutable expected-epoch latch and unsupported-response obligation | U13 credits owner-request negotiation, stopped-capability and stale-heartbeat refusals, the negotiation capability conjunct and a nonce-mismatched apply registration, preflight worker_upgrade_required, client stopped admission (capability and feature), untyped-refusal retained stop, settlement after withdrawal, the frozen tuple and the successor epoch latch; the runner's own admission check, fence/Step 0 negotiation copies, null-heartbeat and registration sub-conjuncts, the in-place conjunct, identical-tuple replay, first-READY latch, the unchanged-stamp assertions and the worker-side worker_upgrade_required reason not controlled |
 | Stopped numeric epoch equality: stale/mismatched running and paused, applied successor | D controls: five individually executed cases above |
-| Stopped pending-input exclusion for eight named kinds in running and paused states | D controls: sixteen individually executed cases above; other control flags/cutoffs unvalidated |
-| Paused replay rejects expired wall budget | D: paused_expired_budget; other wall-budget branches unvalidated |
+| Stopped pending-input exclusion for eight named kinds in running and paused states | D controls: sixteen individually executed cases above; U14 credits the applied and superseded carve-outs, the stop-cutoff exemption and its kind restriction (running run; stop only); paused-run carve-out variants and cancel/reject_plan under the cutoff not controlled |
+| Paused replay rejects expired wall budget | D: paused_expired_budget; U14 credits the running-clock arm, interactive exemption, unstarted exemption (redundant ×2), extension, finalize and paused seconds and the NULL-wall timeout fallback; chat/judge exemption unreachable, production default timeout not exercised |
 | Paused replay uses original pause clock and performs no run update | D: paused_replay_original_clock and paused_replay_no_write |
 | Stopped registration nonce equality | D25–D56: running/paused registration_nonce_mismatch only; worker-latched bounds and other incarnation clauses unvalidated |
 | Stopped claim generation and unreleased claim | D25–D56: running/paused generation/release without reconciliation; ownership and other reconciliation paths unvalidated |
@@ -2882,3 +2882,72 @@ switch only with both the stopped capability and feature (in the client; the
 runner's own check is uncontrolled), treats an untyped refusal as a retained
 stop, keeps the admitted settlement after feature withdrawal, freezes the expected-epoch tuple, and refuses a successor whose
 epoch moved.
+
+### U14 — stopped pending-input carve-outs and wall-budget branches (2026-11-18)
+
+Baseline: the stopped settlement is new — a233 has no
+`api/internal/store/queries/codex_switch_stopped.sql` or
+`api/internal/workersvc/codex_switch_stopped.go` (see D1–D24 and U13) — so all
+controls are class (d).
+
+Mechanism: `SetCodexSwitchStopped` (api/internal/store/queries/codex_switch_stopped.sql;
+generated api/internal/store/codex_switch_stopped.sql.go, which the mutants
+edit) refuses while an unapplied, non-superseded input of the eight
+competing kinds exists, except a `stop`/`cancel`/`reject_plan` input at or
+below a milestone reconciliation's `stop_cutoff`; and refuses when the wall
+budget is exhausted unless the run is interactive or not yet started.
+Remaining budget = `COALESCE(budget_wall_seconds, timeout) +
+budget_extension_seconds + budget_finalize_seconds - (GREATEST(0, elapsed) -
+budget_paused_seconds)`, with elapsed measured to `status_since` when paused
+and to the statement clock when running. The service passes
+`TimeoutSeconds: int32(s.p.RunTimeout.Seconds())`
+(api/internal/workersvc/codex_switch_stopped.go :42); the route fixture builds
+the service without `RunTimeout`, so the fixture default is 0.
+
+New leaves (f7a795fb1) in `TestWorkerCodexStoppedGuardsRouteLiveDB`
+(api/internal/handler/codex_switch_stopped_guards_livedb_test.go, table from
+:337, cutoff helper `insertStoppedCutoff` :159), all on a running run:
+input_applied_pause, input_superseded_pause, input_stop_under_cutoff (accept);
+input_pause_under_cutoff (refuse); budget_running_expired (refuse);
+budget_interactive_exempt, budget_unstarted_exempt,
+budget_extension_keeps_positive, budget_finalize_keeps_positive,
+budget_paused_seconds_keeps_positive (accept); budget_default_timeout (refuse:
+a NULL wall falls back to the 0 fixture timeout);
+budget_default_timeout_with_extension (accept). Each uses `reportStoppedRoute`,
+whose assertions are "stop acceptance mismatch" (:263) and "refusal mismatch"
+(:275); as a `t.Helper` they report at the table call site :381.
+
+Command (export of f7a795fb1, throwaway postgres `cdr-4202-u14pg`): from api,
+`GOFLAGS='-p=1 -buildvcs=false' GOMAXPROCS=4 go test -race -count=1 -timeout=6m
+./internal/handler -run '^TestWorkerCodexStoppedGuardsRouteLiveDB$/^<leaf>$' -v`;
+logs `.uzi/scratch/ctl-logs/<log name>.{diff,log}`.
+
+| Control | Kind | Mutation (generated SQL) | Leaf | Red at |
+|---|---|---|---|---|
+| u14-applied | (d) guard | drop `i.applied_at IS NULL AND` | input_applied_pause | :381 "stop acceptance mismatch: status=409 applied=false" |
+| u14-superseded | (d) guard | drop `AND i.disposition IS DISTINCT FROM 'superseded'` | input_superseded_pause | :381, as above |
+| u14-cutoff | (d) guard | cutoff exemption made unsatisfiable (`i.id <= a.stop_cutoff AND false`) | input_stop_under_cutoff | :381, as above |
+| u14-cutoff-kind | (d) guard | drop the cutoff's `AND i.kind IN ('stop','cancel','reject_plan')` | input_pause_under_cutoff | :381 "refusal mismatch: status=200 applied=true" |
+| u14-running-clock | (d) behavioural mutation | running elapsed measured to `r.started_at` instead of the clock (`ELSE r.started_at END`) | budget_running_expired | :381 "refusal mismatch" |
+| u14-interactive | (d) guard | `OR r.interactive` → `OR false` | budget_interactive_exempt | :381 "stop acceptance mismatch" |
+| u14-unstarted | redundant-fence guard (decision 9) | (i) `OR r.started_at IS NULL` → `OR false` alone; (ii) `GREATEST(0, elapsed)` → `(0 + elapsed)` alone; (iii) both | budget_unstarted_exempt | (i) EXIT=0 (`u14-unstarted-arm-only`: `GREATEST` ignores the NULL elapsed, so the remainder stays positive); (ii) EXIT=0; (iii) :381 "stop acceptance mismatch" (`u14-unstarted-both`). Arm (ii) also removes the clamp at 0 for a future `started_at`, which no leaf exercises |
+| u14-extension | (d) behavioural mutation | `+ r.budget_extension_seconds` → `+ 0` | budget_extension_keeps_positive | :381 "stop acceptance mismatch" |
+| u14-finalize | (d) behavioural mutation | `+ r.budget_finalize_seconds` → `+ 0` | budget_finalize_keeps_positive | :381, as above |
+| u14-paused-secs | (d) behavioural mutation | `- r.budget_paused_seconds` → `- 0` | budget_paused_seconds_keeps_positive | :381, as above |
+| u14-default-timeout | (d) behavioural mutation | `COALESCE(budget_wall_seconds, $7)` → `COALESCE(budget_wall_seconds, $7 + 1000000)` | budget_default_timeout | :381 "refusal mismatch" |
+
+Unchanged candidate f7a795fb1: the whole test passes (38 PASS lines, parent
+and all old and new leaves, no skips), EXIT=0
+(`.uzi/scratch/ctl-logs/u14-green.log`); `task lint:api` 0 issues
+(`u14-lint-api.log`).
+
+Credit: an applied or superseded competing input does not block the stopped
+settlement; a stop/cancel/reject_plan at or below a reconciliation cutoff does
+not, but a pause under the same cutoff still does; a running run is measured
+to the clock and refused when its budget is spent; interactive and unstarted
+runs are exempt (the unstarted exemption has two copies); extension, finalize
+and paused seconds each count; a NULL wall uses the passed timeout. Not
+credited: the chat/judge budget exemption (unreachable: the kind filter
+excludes them earlier), the production 6-hour default timeout (the fixture
+passes 0), awaiting_* statuses, the paused-run variants of the input carve-outs,
+and the cancel/reject_plan kinds under the cutoff (only stop was exercised).
