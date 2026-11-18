@@ -18178,11 +18178,13 @@ export class GitCache {
    * attempt (unparseable, `{}`, a non-string `attemptId`, an empty value) is tainted too: retireCrossBareConflict refuses that
    * bare's reclaim on exactly such a value. With no foreign binding such values are dropped as usual, and a value identified as
    * a different attempt is exempt there, so it may be dropped. (A first foreign binding written after the scan read none may
-   * let such a value be dropped; that value is not about the binding's own attempt, so only an earlier reclaim follows.)
+   * let such a value be dropped; by the legitimate-writer argument above it is not about the binding's own attempt, so only an
+   * earlier reclaim follows.)
    * Such a kept value is self-sustaining: the refused reclaim leaves its binding in place, and every other bare's compaction
-   * skips on the same value (`ledger_unidentified`). Remediation is removing that value from this bare's config; nothing heals it.
+   * skips on the same value (`ledger_unidentified`). Only an operator removing that value (an unsupported, worker-stopped
+   * step) clears it; nothing heals it.
    * The foreign scan is BOUNDED ({@link COMPACT_FOREIGN_SCAN_LIMITS}: bares, config bytes, records, and a 5 s budget checked
-   * before each bare and after each config read; a single read is bounded by its own git or filesystem call, not by that budget) and
+   * before each bare and after each read; a git read is bounded by the git command timeout, a filesystem call is not bounded) and
    * strict (an unlistable, symlinked or non-directory `.git` candidate, an unreadable config, an undecodable or unknown binding
    * set, or a ledger value that cannot be attributed to an attempt all fail it). When it fails, compaction is SKIPPED before any
    * rewrite (the ledger is byte-identical) and a warning with a fixed reason token is logged. One unreadable or unidentifiable
