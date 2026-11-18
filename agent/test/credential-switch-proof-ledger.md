@@ -426,7 +426,7 @@ control is still absent, not that the functional criterion was deferred.
 | Stopped pending-input exclusion for eight named kinds in running and paused states | D controls: sixteen individually executed cases above; U14 credits the applied and superseded carve-outs, the stop-cutoff exemption, its kind restriction and its id boundary (running run; stop only); paused-run carve-out variants, cancel/reject_plan under the cutoff and the cutoff's run correlation not controlled |
 | Paused replay rejects expired wall budget | D: paused_expired_budget; U14 credits the running-clock arm, interactive and unstarted exemptions, extension, finalize and paused seconds, and the NULL-wall coalesce; chat/judge exemption unreachable; the RunTimeout value, the future-started_at clamp and the production default not controlled |
 | Paused replay uses original pause clock and performs no run update | D: paused_replay_original_clock and paused_replay_no_write |
-| Stopped registration nonce equality | D25–D56: running/paused registration_nonce_mismatch; U15 credits the worker-latched generation, epoch and nonce bounds (lower, upper, inclusive edges; nonce empty/length/NUL at the route, UTF-8 at the service entry) and worker identity (same-user foreign worker, four copies); a NULL snapshot nonce not controlled; resume/reclaim/re-registration are the withdrawn X/Y row |
+| Stopped registration nonce equality | D25–D56: running/paused registration_nonce_mismatch; U15 credits the worker-latched generation, epoch and nonce bounds (lower, upper, inclusive edges; nonce empty/length/NUL at the route, UTF-8 at the service entry) (worker identity is credited in the claim-generation row); a NULL snapshot nonce not controlled; resume/reclaim/re-registration are the withdrawn X/Y row |
 | Stopped claim generation and unreleased claim | D25–D56: running/paused generation/release without reconciliation; U15 credits the reconciliation path's generation and release refusals (two copies each, Go copy (b)) and worker ownership; the reconciled `*g <= 0` copy not controlled |
 | Stopped frozen secret and capability hash presence | D25–D56: running/paused missing_frozen_secret and missing_capability_hash; U15 credits binding ownership as the composite FK (b); binding identity beyond ownership has no predicate clause and stays unvalidated (owner batch) |
 | Stopped switch-request/generation, ordinary hold, pause-request/mode, stop-kind/reason and reserve-hold markers | D25–D56: individual running/paused marker cases; policy and other competing controls unvalidated |
@@ -2982,15 +2982,18 @@ api/internal/handler/codex_switch_stopped_authority_bounds_livedb_test.go
 `TestWorkerCodexStoppedOwnershipRouteLiveDB`, 11 leaves) and extends
 api/internal/workersvc/codex_switch_stopped_test.go
 (`TestCodexSwitchStoppedAuthorityBounds`: empty, invalid UTF-8, NUL and
-129-byte nonces at the service entry). Every route leaf goes through the
-authenticated WorkerRoutes `/state` route and the pool transaction of
-`setupStoppedGuardsRoute`, after withdrawal, and asserts no write
-(`assertStoppedSnapshot`).
+129-byte nonces at the service entry). Every route leaf except
+foreign_binding goes through the authenticated WorkerRoutes `/state` route and
+the pool transaction of `setupStoppedGuardsRoute`, after withdrawal, and
+asserts no write (`assertStoppedSnapshot`). foreign_binding, on the candidate,
+asserts only that `runs_codex_secret_fk` refuses the foreign binding (23503,
+constraint name pinned at f355da022) and reaches the route only when that FK
+is relaxed.
 
 a233 reference: the stopped settlement is new.
 `git show a233883de3c36bae2e940f999cd9d582889dad00:api/internal/workersvc/codex_switch_stopped.go`
 and `…:api/internal/store/queries/codex_switch_stopped.sql` do not exist, and
-a233's worker_state_decode.go has no `codex_switch_stopped` branch, so the
+worker_state_decode.go does not exist at a233, so the
 bounds, reconciliation-path, status and worker-join controls are class (d).
 Three seams are identical at a233 and are recorded as (b) preservation
 controls: `validateReconciledGeneration` (milestone_reconciliation.go:343 at
@@ -3049,22 +3052,25 @@ foreign_binding report.
 | u15-nonce-length | (d) | service `!validHoldRegisterNonce(…)` → `req.RegisterNonce == ""` | nonce_over_128 | :67 "status=409 … want 400" |
 | u15-nonce-edge | (d) | `len(nonce) <= 128` → `< 128` (shared helper) | nonce_128 | :67 "status=400 … want 409" |
 | u15-nonce-nul | (d) | `strings.ContainsRune(…, 0)` → `(…, -1)` (never true) | nonce_nul | :67 "status=500 … want 400" |
-| u15-utf8 | (d), service entry | `!utf8.ValidString(req.RegisterNonce)` → `!utf8.ValidString("")` | TestCodexSwitchStoppedAuthorityBounds `"\xff"` | codex_switch_stopped_test.go:36 "semantic completion authority unavailable" |
+| u15-utf8 | service-entry unit control (not (d); not route evidence) | `!utf8.ValidString(req.RegisterNonce)` → `!utf8.ValidString("")` | TestCodexSwitchStoppedAuthorityBounds `"\xff"` | codex_switch_stopped_test.go:36 "semantic completion authority unavailable" |
 | u15-recon-generation | redundant-fence (2 copies; Go copy (b)) | `*g != r.ClaimGeneration \|\|` removed; SQL `r.claim_generation = $4::bigint` → `$4::bigint = $4::bigint` | reconciled_generation_mismatch | :82 "refusal mismatch: status=200 applied=true" |
 | u15-recon-released | redundant-fence (2 copies; Go copy (b)) | `\|\| r.ClaimReleasedAt.Valid` removed; SQL `AND r.claim_released_at IS NULL` removed | reconciled_claim_released | :89 "refusal mismatch: status=200 applied=true" |
 | u15-foreign-worker | redundant-fence (4 copies; query copies (b)) | both `runs.worker_id = $2` filters of GetRunOwnedByWorkerForUpdate and GetRunOwnedByWorker's `worker_id = $2` → `$2::uuid = $2::uuid`; stopped join `w.id = r.worker_id` → `true` | foreign_worker (same user, own nonce) | :101 "status=200 applied=true" |
 | u15-status | (d) | the stopped IN list removed | status_queued, _limit_wait, _pool_wait, _recovery_wait, _completed, _failed, _cancelled | :110 "refusal mismatch: status=200 applied=true" (all seven) |
-| u15-binding-fk | (b) preservation (schema) | 00202 FK `(user_id, codex_secret_id) → user_secrets(user_id, id)` → `(codex_secret_id) → user_secrets(id)` | foreign_binding | :131 "refusal mismatch: status=200 applied=true" |
+| u15-binding-fk | (b) preservation (schema) | 00202 FK `(user_id, codex_secret_id) → user_secrets(user_id, id)` → `(codex_secret_id) → user_secrets(id)` | foreign_binding | :131 "refusal mismatch: status=200 applied=true"; rerun as u15r-binding-fk at f355da022 (constraint name pinned), same red |
 
 Unchanged candidate b52b38e6d: the two new tests plus
 `TestWorkerCodexStoppedGuardsRouteLiveDB` and
 `TestWorkerCodexStoppedAuthorityRouteLiveDB` pass (94 PASS lines, no FAIL or
 SKIP), `SHA=b52b38e6d… EXIT=0` (`.uzi/scratch/ctl-logs/u15-green.log`);
 `TestCodexSwitchStoppedAuthorityBounds` passes (`u15-unit-green.log`);
-`task lint:api` 0 issues (`u15-lint-api.log`). Runtime: the two new tests add
-18.7 s to the handler package (`ok … 18.699s`, `u15-first.log`, same worker,
-warm cache, one serial run); hosted effect on test-livedb-workersvc and
-test-api-store-it is unmeasured.
+`task lint:api` 0 issues (`u15-lint-api.log`). After the constraint-name pin,
+f355da022: the two new tests pass (25 PASS lines), `SHA=f355da022… EXIT=0`
+(`u15r-green.log`), lint 0 issues (`u15r-lint-api.log`). Runtime: about 9.6 s
+marginal in-package (5.16 s + 4.41 s in u15-green.log, same worker, warm
+cache, migrated schema, one serial run); the standalone 18.7 s in
+u15-first.log (no SHA line) includes one-time schema migration. Hosted effect
+on test-livedb-workersvc and test-api-store-it is unmeasured.
 
 Credit: the worker-latched bounds (generation and epoch lower, upper and the
 inclusive 2^53−1 edge; nonce non-empty, ≤128 bytes inclusive, no NUL, valid
@@ -3084,4 +3090,16 @@ not the route (encoding/json substitutes U+FFFD); a NULL
 comparisons); `validateReconciledGeneration`'s `*g <= 0` copy; binding identity
 beyond ownership (the alias relinked to another provider account) — the
 stopped predicate has no such clause, settlement reads and releases no
-material, and this stays unvalidated for the owner batch.
+material, and this stays unvalidated for the owner batch; the egress-lane
+`laneMismatch` check in `runOwnedByWorker` (fail-closed via rollback, not an
+identity copy); the two GetRunOwnedByWorkerForUpdate copies differ under a
+lock wait (only the final FOR UPDATE select re-checks the newest row), which
+no single-copy control separates. The stopped query's identity copy is the
+join together with `w.id = $2`; the mutant removed the join term.
+
+Fixture-shape notes: the status leaves set only `status` on a running run that
+keeps its worker, `started_at` and an unreleased claim, a state production
+does not reach for queued or terminal runs (DB CHECKs permit it), so the IN
+list is shown to be the sole fence only in this synthetic state; the foreign
+worker is inserted directly with a hand-set `snapshot_register_nonce` rather
+than registered, which the predicate (nonce equality) does not distinguish.
