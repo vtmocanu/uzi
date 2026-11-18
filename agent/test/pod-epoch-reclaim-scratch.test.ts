@@ -1372,16 +1372,47 @@ async function enrollRealAuthority(w: World, rw: RunWorld, admit: boolean): Prom
   return key;
 }
 
-test("#4420 authority inventory: an enrolled store with an intact admitted slot (or none) still reclaims the run leaf", FD_ONLY, async () => {
+test("#4420 authority inventory: an enrolled store that never admitted a slot reclaims the run leaf; an intact admitted (active, unpublished) slot keeps it as unknown", FD_ONLY, async () => {
   for (const admit of [false, true]) {
     await withRunWorld([leafOf(RUN_A)], async (w, rw) => {
       await seedRetiredAttempt(rw, RUN_A);
       await enrollRealAuthority(w, rw, admit);
       const result = await run(w);
-      assert.deepEqual(keptRun(result), {}, `admit=${admit}`);
-      assert.deepEqual(w.calls.discards, [leafOf(RUN_A)], `admit=${admit}`);
+      if (!admit) {
+        assert.deepEqual(keptRun(result), {}, `admit=${admit}`);
+        assert.deepEqual(w.calls.discards, [leafOf(RUN_A)], `admit=${admit}`);
+      } else {
+        assert.deepEqual(keptRun(result), { run_local_unknown: 1 }, `admit=${admit}`);
+        assert.deepEqual(result.scratch.run_local_sources, { authority_inventory: 1 }, `admit=${admit}`);
+        assert.deepEqual(w.calls.discards, [], `admit=${admit}`);
+      }
     });
   }
+});
+
+const SLOT_KEY = "a".repeat(64);
+const tombstone = { state: "retired", key: SLOT_KEY, pending: null, retiring: null, publication: null };
+
+test("#4420 authority inventory: an active unpublished slot with no ledger entry keeps the run leaf as unknown", FD_ONLY, async () => {
+  await withRunWorld([leafOf(RUN_A)], async (w, rw) => {
+    rw.slots = [{ state: "active", key: SLOT_KEY, pending: null, retiring: null, publication: null }];
+    const result = await run(w);
+    assert.deepEqual(keptRun(result), { run_local_unknown: 1 });
+    assert.deepEqual(result.scratch.run_local_sources, { authority_inventory: 1 });
+    assert.deepEqual(w.calls.discards, []);
+    await untouched(w, [leafOf(RUN_A)]);
+  });
+});
+
+test("#4420 authority inventory: a retired tombstone attributed through the run's ledger clone path still reclaims the run leaf", FD_ONLY, async () => {
+  await withRunWorld([leafOf(RUN_A)], async (w, rw) => {
+    const clonePath = await seedRetiredAttempt(rw, RUN_A);
+    rw.peek = async path => (path === clonePath ? tombstone : null);
+    rw.slots = [tombstone];
+    const result = await run(w);
+    assert.deepEqual(keptRun(result), {});
+    assert.deepEqual(w.calls.discards, [leafOf(RUN_A)]);
+  });
 });
 
 test("#4420 authority inventory: a head-recorded slot whose file or whole slots directory was deleted keeps the run leaf as unknown", FD_ONLY, async () => {

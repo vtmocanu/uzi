@@ -266,6 +266,26 @@ describe("attempt footprint and authority slot (a retired ledger entry is ended 
     assert.ok(cap > 0 && Number.isSafeInteger(cap), "the enumeration is bounded");
   });
 
+  it("authority inventory: a publication-less slot with no ledger entry is unknown, whatever its state", async () => {
+    for (const over of [{ state: "active" }, { state: "retiring" }, { pending: {} }, { retiring: {} }, { state: "weird" },
+      { state: "ineligible", key: "k1" }, { state: "retired", key: "k1" }]) {
+      assert.deepEqual(await classify({ peekAllSlots: (async () => [slot(over)]) as never }), unknown("authority_inventory"), JSON.stringify(over));
+    }
+    assert.deepEqual(await classify({ peekAllSlots: (async () => [null]) as never }), unknown("authority_inventory"), "a malformed slot");
+    assert.deepEqual(await classify({ peekAllSlots: (async () => [slot({ publication: undefined })]) as never }), unknown("authority_inventory"));
+  });
+
+  it("authority inventory: a tombstone attributed through the ledger is ended; an unattributed sibling makes it unknown", async () => {
+    retire();
+    const attributed = slot({ state: "retired", key: "k1" });
+    const peekSlot = (async () => attributed) as never;
+    assert.deepEqual(await classify({ peekSlot, peekAllSlots: (async () => [attributed]) as never }), ENDED);
+    assert.deepEqual(await classify({ peekSlot, peekAllSlots: (async () => [attributed, slot({ state: "retired", key: "k2" })]) as never }),
+      unknown("authority_inventory"));
+    assert.deepEqual(await classify({ peekSlot, peekAllSlots: (async () => [slot({ state: "retired", key: "k2" })]) as never }),
+      unknown("authority_inventory"), "the attributed slot is not the one in the inventory");
+  });
+
   it("authority inventory: read once per pass through the memo", async () => {
     let reads = 0;
     const memo: NonNullable<EpochScratchRunRetentionOptions["memo"]> = {};

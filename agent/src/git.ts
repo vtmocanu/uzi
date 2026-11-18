@@ -4969,6 +4969,8 @@ export class GitCache {
     for (const entry of ledger) {
       if (entry.state !== "retired") return activeRetention(`ledger_${entry.state}`);
     }
+    // Keys of slots the ledger loop attributed to this run and judged ended (a verified missing footprint).
+    const attributedEnded = new Set<string>();
     for (const entry of ledger) {
       // The footprint first: an authority slot never stands in for it.
       const footprint = await this.epochFootprintState(entry.clonePath);
@@ -4980,10 +4982,15 @@ export class GitCache {
       catch { this.checkRecoveryInterruption(); return unknownRetention("authority_slot"); }
       const judged = judgeAuthoritySlot(footprint, slot);
       if (judged.state !== "ended") return judged;
+      if (slot != null && typeof slot.key === "string") attributedEnded.add(slot.key);
     }
-    // A slot whose publication cohort names this run is a live authority record even when no ledger entry of the run
-    // remains to name its clone path (ledger compaction can drop one). Read-only, capped, once per pass; any failure,
-    // an unreadable or unauthenticated slot, a cap or a missing accessor is unknown.
+    // Every slot is judged. A slot whose publication cohort names this run is a live authority record even when no
+    // ledger entry of the run remains to name its clone path (ledger compaction can drop one); a cohort naming
+    // another run is excluded. A slot with no publication carries no run identity, so it is excluded only when the
+    // ledger loop above attributed it to this run and judged it ended; every other publication-less slot (active,
+    // retiring, pending, unexpected state, malformed, or an unattributed tombstone whose footprint cannot be
+    // verified) is unknown. Read-only, capped, once per pass; any failure, an unreadable or unauthenticated slot, a
+    // cap or a missing accessor is unknown.
     if (!opts.peekAllSlots) return unknownRetention("authority_inventory");
     let slots: SlotSnapshot[];
     try {
@@ -4993,9 +5000,15 @@ export class GitCache {
       slots = await inventory;
     } catch { this.checkRecoveryInterruption(); return unknownRetention("authority_inventory"); }
     for (const slot of slots) {
-      const cohortRun = slot?.publication?.cohort?.runId;
-      if (slot?.publication != null && typeof cohortRun !== "string") return unknownRetention("authority_inventory");
-      if (typeof cohortRun === "string" && cohortRun.toLowerCase() === id) return activeRetention("authority_slot");
+      if (slot == null || typeof slot !== "object") return unknownRetention("authority_inventory");
+      if (slot.publication === null) {
+        if (typeof slot.key === "string" && attributedEnded.has(slot.key)) continue;
+        return unknownRetention("authority_inventory");
+      }
+      if (slot.publication === undefined || typeof slot.publication !== "object") return unknownRetention("authority_inventory");
+      const cohortRun = slot.publication.cohort?.runId;
+      if (typeof cohortRun !== "string") return unknownRetention("authority_inventory");
+      if (cohortRun.toLowerCase() === id) return activeRetention("authority_slot");
     }
     // custodyHeld folds an unreadable store into "held" (fail closed), so that case reads as active here.
     if (await this.custodyHeld(runId)) return activeRetention("custody");
