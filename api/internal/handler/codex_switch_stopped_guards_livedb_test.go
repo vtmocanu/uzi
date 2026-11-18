@@ -346,6 +346,11 @@ func TestWorkerCodexStoppedGuardsRouteLiveDB(t *testing.T) {
 		{"input_pause_under_cutoff", func(t *testing.T, e *applyRouteEnv) {
 			insertStoppedCutoff(t, e, "pause")
 		}, false},
+		// A stop filed after the cutoff (higher id) is not covered by it.
+		{"input_stop_above_cutoff", func(t *testing.T, e *applyRouteEnv) {
+			insertStoppedCutoff(t, e, "stop")
+			stoppedRouteExec(t, e, "INSERT INTO run_user_inputs(run_id,kind,body) VALUES($1,'stop','x')", e.run)
+		}, false},
 		{"budget_running_expired", func(t *testing.T, e *applyRouteEnv) {
 			stoppedRouteExec(t, e, `UPDATE runs SET `+hourAgo+`,budget_wall_seconds=60,budget_paused_seconds=0,budget_extension_seconds=0,budget_finalize_seconds=0 WHERE id=$1`, e.run)
 		}, false},
@@ -354,6 +359,11 @@ func TestWorkerCodexStoppedGuardsRouteLiveDB(t *testing.T) {
 		}, true},
 		{"budget_unstarted_exempt", func(t *testing.T, e *applyRouteEnv) {
 			stoppedRouteExec(t, e, `UPDATE runs SET started_at=NULL,budget_wall_seconds=60 WHERE id=$1`, e.run)
+		}, true},
+		// With a zero base (NULL wall, zero fixture timeout) only the unstarted
+		// exemption accepts: the elapsed clamp alone leaves a zero remainder.
+		{"budget_unstarted_zero_base", func(t *testing.T, e *applyRouteEnv) {
+			stoppedRouteExec(t, e, `UPDATE runs SET started_at=NULL,budget_wall_seconds=NULL,budget_paused_seconds=0,budget_extension_seconds=0,budget_finalize_seconds=0 WHERE id=$1`, e.run)
 		}, true},
 		{"budget_extension_keeps_positive", func(t *testing.T, e *applyRouteEnv) {
 			stoppedRouteExec(t, e, `UPDATE runs SET `+hourAgo+`,budget_wall_seconds=60,budget_paused_seconds=0,budget_extension_seconds=7200,budget_finalize_seconds=0 WHERE id=$1`, e.run)
