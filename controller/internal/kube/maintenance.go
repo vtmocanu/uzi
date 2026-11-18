@@ -202,6 +202,15 @@ func (m *Materializer) reconcileDinD(ctx context.Context, w protocol.DesiredWork
 			}
 			return true, m.reconcileReplacement(ctx, w, o)
 		}
+		// Replacement template drift (#4455): the replacement Deployment and its bound
+		// DinD claim exist, so converge the template through the admission-gated path.
+		// The identity terms repeat the old-PVC branch and old-daemon guard above as
+		// defence in depth.
+		if o.DinDPVCLive && o.DinDPVCPhase == string(corev1.ClaimBound) && o.DinDPVCUID != "" && o.DinDPVCUID != op.PVCUID &&
+			o.DeploymentUID != "" && o.DeploymentUID != op.DeploymentUID && !o.DeploymentTerminating &&
+			(o.SpecHash != wantHash || o.Generation != w.Generation) {
+			return true, m.reconcileReplacement(ctx, w, o)
+		}
 		if !o.DinDPVCLive || o.DinDPVCPhase != string(corev1.ClaimBound) || o.DinDPVCUID == "" || o.DeploymentUID == "" || o.DeploymentUID == op.DeploymentUID || o.DeploymentTerminating || !o.PodsKnown || o.ReadyPodUID == "" || o.ReadyPodUID == op.DeploymentUID || o.SpecHash != wantHash || o.Generation != w.Generation || o.Roll.Phase != protocol.PhaseSettled {
 			return true, nil
 		}
