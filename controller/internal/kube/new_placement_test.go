@@ -224,12 +224,21 @@ func TestNewPlacementAC3NoClaimsWorkersAreStamped(t *testing.T) {
 		t.Fatal(err)
 	}
 	created := createdPVCs(client)
-	if len(created) < 7 {
-		t.Fatalf("created pvcs = %d, want plain 2 + docker 3 + ephemeral >=2", len(created))
+	if len(created) != 7 {
+		t.Fatalf("created pvcs = %d, want plain 2 + docker 3 + ephemeral 2", len(created))
 	}
-	for name := range created {
-		if !isStamped(created[name]) {
-			t.Errorf("created pvc %s is not stamped", name)
+	for _, claim := range []struct{ ns, name string }{
+		{cfg.Namespace, dataPVCName("p1")},
+		{cfg.Namespace, nixPVCName("p1")},
+		{cfg.DockerNamespace, dataPVCName("d1")},
+		{cfg.DockerNamespace, nixPVCName("d1")},
+		{cfg.DockerNamespace, dindDataPVCName("d1")},
+		{cfg.Namespace, dataPVCName("e1")},
+		{cfg.Namespace, nixPVCName("e1")},
+	} {
+		p := npPVC(t, client, claim.ns, claim.name)
+		if p.Namespace != claim.ns || p.Name != claim.name || !isStamped(p) {
+			t.Errorf("claim %s/%s = %s/%s, stamp=%q", claim.ns, claim.name, p.Namespace, p.Name, p.Annotations[AnnotationPlacement])
 		}
 	}
 	for _, c := range []struct{ id, ns string }{{"p1", cfg.Namespace}, {"d1", cfg.DockerNamespace}, {"e1", cfg.Namespace}} {
