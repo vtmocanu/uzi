@@ -2690,8 +2690,8 @@ switch, runner.ts :25735–25738) are new: class (d).
 
 Mechanism (candidate). `ApplyCredentialSwitch` takes worker then run locks in
 `beginClaimMutation` (credential_switch_apply.go :288; a run the worker does
-not own fails there with `ErrRunNotOwned`), applies the Step 0 fence (:297–316),
-then Step 1 looks up a journal row for the op (:319–331): a row from another
+not own fails there with `ErrRunNotOwned`), applies the Step 0 fence (:298–316),
+then Step 1 looks up a journal row for the op (:318–331): a row from another
 generation or worker is fenced; a Codex row answers `refused_committed` /
 `credential_changed` without material (:325–327). Otherwise the Codex
 validator `validateCodexSwitchLocked` repeats the fence (`codexSwitchFence`,
