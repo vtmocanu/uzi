@@ -2894,10 +2894,11 @@ Known consequences and not shipped:
   rule covers every unattributed publication-null slot, not only retired tombstones.
   That includes a settled bare-mutation slot: after a successful bare mutation the
   slot's pending is cleared and its publication stays null, and a completed mutation
-  alone does not establish source settlement or a missing footprint. One such slot that
-  no ledger entry of the run attributes therefore keeps every run leaf on that worker
-  as `run_local_unknown` (`authority_inventory`), so in practice reclaim stops once
-  another run has retired a source or settled a bare mutation there.
+  alone does not establish source settlement or a missing footprint. One such slot
+  therefore keeps any candidate run leaf whose ledger cannot attribute it, as
+  `run_local_unknown` (`authority_inventory`); since other runs' ledgers do not
+  attribute it, in practice reclaim stops once another run has retired a source or
+  settled a bare mutation there.
 
 #### One-worker deletion canary checklist
 
