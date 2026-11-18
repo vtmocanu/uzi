@@ -53,7 +53,7 @@ uzi provider create --name corp-gw \
   model. Measured at the pinned CLI, the configured window was enforced for `corp-sonnet` and
   `corp-claude-x`, and was **not honoured** for `claude-sonnet-4-5`,
   `us.anthropic.claude-sonnet-4-5` and `claude-corp-custom`. So for model names containing
-  "claude", `context_window` may not take effect; the CLI was observed to ignore it for such
+  "claude", `context_window` may not take effect; the CLI was observed to ignore it for some such
   names. Not every name containing "claude" was ignored, and the rule behind the difference is
   not known.
 

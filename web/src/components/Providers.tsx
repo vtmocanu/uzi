@@ -41,7 +41,7 @@ const NO_CONTEXT_WARNING =
   "No context window set. Without it the Claude CLI assumes a 200k-token window for unrecognized model names and compacts too late if the gateway's window is smaller.";
 
 const CATALOG_CONTEXT_WARNING =
-  "context_window may not take effect for model names containing 'claude'; the CLI was observed to ignore it for such names.";
+  "context_window may not take effect for model names containing 'claude'; the CLI was observed to ignore it for some such names.";
 
 interface ModelRow {
   model: string;

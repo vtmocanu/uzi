@@ -93,8 +93,8 @@ func newProviderCmd(env Env, gf *globalFlags) *cobra.Command {
 			"as listed (path included). --model maps a Claude alias to a gateway model and is repeatable:\n" +
 			"alias=model[:context_window], with alias one of haiku, sonnet, opus, fable. haiku is required.\n" +
 			"Set the context window to the gateway model's real window; without it Claude assumes 200000\n" +
-			"for model names it does not recognise. Caveat: for model names containing \"claude\" the Claude\n" +
-			"CLI was observed to ignore the configured window, so it may not take effect there.\n\n" +
+			"for model names it does not recognise. Caveat: for some model names containing \"claude\" the\n" +
+			"Claude CLI was observed to ignore the configured window, so it may not take effect there.\n\n" +
 			"The API key is added in the web Settings, never from the CLI.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -150,7 +150,7 @@ func newProviderCmd(env Env, gf *globalFlags) *cobra.Command {
 		Long: "Rename a provider (--name) and/or replace its model map (--model, repeatable, same form as\n" +
 			"`create`). Giving any --model replaces the whole map, so repeat every alias you want to keep,\n" +
 			"context windows included. A context window may not take effect for model names containing\n" +
-			"\"claude\": the Claude CLI was observed to ignore it for such names.\n\n" +
+			"\"claude\": the Claude CLI was observed to ignore it for some such names.\n\n" +
 			"Changing the base URL or auth style is web-only (Settings).",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -472,7 +472,7 @@ func warnClaudeWindow(env Env, mm apitypes.ModelMapDTO) {
 		if e.m == nil || e.m.ContextWindow == nil || !strings.Contains(strings.ToLower(e.m.Model), "claude") {
 			continue
 		}
-		_, _ = fmt.Fprintf(env.Stderr, "warning: --model %s: context_window may not take effect for model names containing 'claude'; the Claude CLI was observed to ignore it for such names\n", e.alias)
+		_, _ = fmt.Fprintf(env.Stderr, "warning: --model %s: context_window may not take effect for model names containing 'claude'; the Claude CLI was observed to ignore it for some such names\n", e.alias)
 	}
 }
 

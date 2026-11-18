@@ -178,7 +178,7 @@ describe("Providers — create", () => {
     expect(screen.queryByTestId("ctx-unenforced-haiku")).toBeNull();
     fireEvent.change(within(form()).getByLabelText("Haiku context window"), { target: { value: "65536" } });
     expect(screen.getByTestId("ctx-unenforced-haiku").textContent).toMatch(
-      /context_window may not take effect for model names containing 'claude'; the CLI was observed to ignore it for such names/,
+      /context_window may not take effect for model names containing 'claude'; the CLI was observed to ignore it for some such names/,
     );
     fireEvent.change(within(form()).getByLabelText("Haiku model (required)"), { target: { value: "gw-small" } });
     expect(screen.queryByTestId("ctx-unenforced-haiku")).toBeNull();
