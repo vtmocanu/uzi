@@ -675,8 +675,10 @@ export async function peekAuthoritySlot(
 
 /**
  * Issue #4420: every slot of the store, read-only (the same enrollment and head checks as {@link peekAuthoritySlot}, no
- * transaction, no write, no head repair). An unenrolled empty store has none. More than `max` slot files, an unexpected
- * name, a non-directory slots dir or any unreadable or unauthenticated slot rejects; the caller treats a rejection as unknown.
+ * transaction, no write, no head repair). An unenrolled empty store has none. The directory listing is checked against the
+ * authenticated heads: a slot a head records whose file (or whole slots directory) is gone rejects. More than `max` slots
+ * (listed or head-recorded), an unexpected name, a non-directory slots dir or any unreadable or unauthenticated slot rejects;
+ * the caller treats a rejection as unknown.
  */
 export async function peekAllAuthoritySlots(
   options: { dataDir: string; workerToken: string; uid?: number }, max: number,
@@ -968,28 +970,47 @@ export class AuthorityStore {
     }
   }
 
-  /** Issue #4420: every slot, read-only (see {@link peekAllAuthoritySlots}); each is loaded exactly as {@link peekSlot} loads one. */
+  /**
+   * Issue #4420: every slot, read-only (see {@link peekAllAuthoritySlots}); each is loaded exactly as {@link peekSlot} loads one.
+   * The directory listing is checked against the authenticated heads: every key a head records (seq > 0) is loaded too, so a
+   * deleted slot file or a deleted slots directory refuses ("authority slot missing") instead of listing as absent.
+   */
   async peekAllSlots(max: number): Promise<SlotSnapshot[]> {
     const dir = path.join(this.#init.ctxDir, SLOTS_DIR);
-    let names: string[];
+    const keys = new Set<string>();
+    for (const shard of SHARD_NAMES) {
+      for (const [key, seq] of await readHead(this.#identityOf(), shard)) {
+        if (seq > 0) keys.add(key);
+      }
+      if (keys.size > max) throw new AuthorityRefusal("authority slot listing exceeds its cap");
+    }
+    const listed = new Set<string>();
+    let names: string[] = [];
     try {
       if (!(await fsp.lstat(dir)).isDirectory()) throw new AuthorityRefusal("authority slots path is not a directory");
       names = await fsp.readdir(dir);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
-      throw error;
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
     if (names.length > max) throw new AuthorityRefusal("authority slot listing exceeds its cap");
-    const out: SlotSnapshot[] = [];
     for (const name of names) {
       // An orphaned writeDurable temp file is not a slot record.
       if (name.startsWith(".") && name.endsWith(".tmp")) continue;
       const m = /^([0-9a-f]{64})\.json$/.exec(name);
       if (!m) throw new AuthorityRefusal("unexpected entry in authority slots");
+      listed.add(m[1]!);
+      keys.add(m[1]!);
+    }
+    if (keys.size > max) throw new AuthorityRefusal("authority slot listing exceeds its cap");
+    const out: SlotSnapshot[] = [];
+    for (const key of keys) {
       for (let attempt = 0; ; attempt++) {
         try {
-          const slot = await this.#load(dir, m[1]!, true);
-          if (slot === null) throw new AuthorityRefusal("authority slot vanished during listing");
+          const slot = await this.#load(dir, key, true);
+          if (slot === null) {
+            if (listed.has(key)) throw new AuthorityRefusal("authority slot vanished during listing");
+            break;
+          }
           out.push(slot);
           break;
         } catch (error) {

@@ -23,6 +23,9 @@ import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { formatAttemptId } from "../src/attempt-path.js";
 import { Outbox } from "../src/outbox.js";
 import { RecoveryMaintenance } from "../src/recovery-maintenance.js";
+import { acquireWorkerLifetime, withAuthorityTransaction } from "../src/authority-lock.js";
+import { openAuthorityStore, peekAllAuthoritySlots } from "../src/completion-authority.js";
+import { testLockOptions } from "./authority-test-support.js";
 import { WorkerClient } from "../src/client.js";
 import { execFileSync } from "node:child_process";
 import { ENABLE_DELETION_FOR_TEST, ENABLE_SCRATCH_FOR_TEST, perGroupInspect } from "./pod-epoch-reclaim-support.js";
@@ -1349,6 +1352,52 @@ test("#4420 reclaimed: a terminal zero-hold run with normal settled metadata (re
     assert.deepEqual(rw.calls, ["ownership", "holds"], "one lifecycle read then one holds read, for the run leaf only");
     assert.deepEqual(rw.classified, [RUN_A]);
   });
+});
+
+// Issue #4420: the slot inventory is checked against the authenticated heads, driven through the REAL authority store
+// enrolled in the fixture's data dir and the REAL read-only enumeration (only the world's slot stub is replaced).
+async function enrollRealAuthority(w: World, rw: RunWorld, admit: boolean): Promise<string> {
+  const dataDir = fs.realpathSync(rw.fx.dataDir);
+  const workerToken = "unit-reclaim-" + "token-4420";
+  const lifetime = await acquireWorkerLifetime(dataDir, testLockOptions());
+  const sourceDir = join(dataDir, "runner", "slug", "issue-4420");
+  fs.mkdirSync(sourceDir, { recursive: true });
+  const key = await withAuthorityTransaction(lifetime, { timeoutMs: 5000 }, async tx => {
+    const store = await openAuthorityStore(tx, { workerToken });
+    if (!admit) return "";
+    await store.admitSourceUse(tx, sourceDir);
+    return store.slotKey(tx, sourceDir);
+  });
+  w.options.scratch!.authority!.peekAllSlots = max => peekAllAuthoritySlots({ dataDir, workerToken }, max);
+  return key;
+}
+
+test("#4420 authority inventory: an enrolled store with an intact admitted slot (or none) still reclaims the run leaf", FD_ONLY, async () => {
+  for (const admit of [false, true]) {
+    await withRunWorld([leafOf(RUN_A)], async (w, rw) => {
+      await seedRetiredAttempt(rw, RUN_A);
+      await enrollRealAuthority(w, rw, admit);
+      const result = await run(w);
+      assert.deepEqual(keptRun(result), {}, `admit=${admit}`);
+      assert.deepEqual(w.calls.discards, [leafOf(RUN_A)], `admit=${admit}`);
+    });
+  }
+});
+
+test("#4420 authority inventory: a head-recorded slot whose file or whole slots directory was deleted keeps the run leaf as unknown", FD_ONLY, async () => {
+  for (const mode of ["file", "directory"] as const) {
+    await withRunWorld([leafOf(RUN_A)], async (w, rw) => {
+      await seedRetiredAttempt(rw, RUN_A);
+      const key = await enrollRealAuthority(w, rw, true);
+      const slots = join(fs.realpathSync(rw.fx.dataDir), ".uzi-authority", "slots");
+      if (mode === "file") fs.rmSync(join(slots, `${key}.json`)); else fs.rmSync(slots, { recursive: true, force: true });
+      const result = await run(w);
+      assert.deepEqual(keptRun(result), { run_local_unknown: 1 }, mode);
+      assert.deepEqual(result.scratch.run_local_sources, { authority_inventory: 1 }, mode);
+      assert.deepEqual(w.calls.discards, [], mode);
+      await untouched(w, [leafOf(RUN_A)]);
+    });
+  }
 });
 
 test("#4420 kept run_local_active: the run's recovery record, a journal naming the clone, a live ledger, outbox protection and an in-flight credential switch", FD_ONLY, async () => {

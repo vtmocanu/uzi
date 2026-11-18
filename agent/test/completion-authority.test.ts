@@ -1522,11 +1522,13 @@ test("peekAllAuthoritySlots lists every slot read-only, bounded, and refuses wha
   await tx(f, (t2) => s.admitSourceUse(t2, a));
   await tx(f, (t2) => s.admitSourceUse(t2, b));
   const keys = [await tx(f, (t2) => s.slotKey(t2, a)), await tx(f, (t2) => s.slotKey(t2, b))].sort();
-  const stamp = (): string => fs.readdirSync(slotsDir(f)).sort().map((n) => fs.readFileSync(path.join(slotsDir(f), n), "utf8")).join("|");
+  const headsDir = path.join(authorityDir(f), "heads");
+  const dirStamp = (d: string): string => fs.readdirSync(d).sort().map((n) => `${n}=${fs.readFileSync(path.join(d, n), "utf8")}`).join("|");
+  const stamp = (): string => `${dirStamp(slotsDir(f))}#${dirStamp(headsDir)}`;
   const before = stamp();
   const seen = await all();
   assert.deepEqual(seen.map((x) => x.key).sort(), keys);
-  assert.equal(stamp(), before, "listing writes nothing");
+  assert.equal(stamp(), before, "listing writes nothing (slots and heads)");
   await assert.rejects(all(1), /exceeds its cap/);
   await assert.rejects(peekAllAuthoritySlots({ dataDir: f.root, workerToken: f.token + "x" }, 16), /authenticat/);
   fs.writeFileSync(path.join(slotsDir(f), "stray.json"), "{}");
@@ -1534,6 +1536,21 @@ test("peekAllAuthoritySlots lists every slot read-only, bounded, and refuses wha
   fs.rmSync(path.join(slotsDir(f), "stray.json"));
   fs.writeFileSync(path.join(slotsDir(f), `.${keys[0]}.json.00000000-0000-4000-8000-000000000000.tmp`), "x");
   assert.equal((await all()).length, 2, "an orphaned write temp file is not a slot");
+});
+
+test("peekAllAuthoritySlots refuses a head-recorded slot whose file or whole slots directory was deleted", async (t) => {
+  for (const mode of ["file", "directory"] as const) {
+    const f = await fixture(t);
+    const all = (): Promise<SlotSnapshot[]> => peekAllAuthoritySlots({ dataDir: f.root, workerToken: f.token }, 16);
+    const s = await store(f);
+    const a = source(f, "runner/qa");
+    await tx(f, (t2) => s.admitSourceUse(t2, a));
+    const key = await tx(f, (t2) => s.slotKey(t2, a));
+    assert.equal((await all()).length, 1, mode);
+    if (mode === "file") fs.rmSync(path.join(slotsDir(f), `${key}.json`));
+    else fs.rmSync(slotsDir(f), { recursive: true, force: true });
+    await assert.rejects(all(), /authority slot missing/, mode);
+  }
 });
 
 test("a fresh epoch over a live publication needs the explicit consuming purpose; nothing else mints one", async (t) => {
