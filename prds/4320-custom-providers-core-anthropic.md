@@ -3,7 +3,7 @@
 **Issue**: [#4320](https://github.com/vtmocanu/uzi/issues/4320)
 **Umbrella**: [#4319](https://github.com/vtmocanu/uzi/issues/4319)
 **Priority**: High
-**Status**: Draft
+**Status**: Implemented, activation blocked (pending loopback relay and owner acceptance)
 
 ## Problem
 
@@ -114,6 +114,17 @@ Acceptance: example 1; feature off when the variable is unset; a user cannot rea
 `claude_provider_id` and resolver; create-tx freeze; claim binding with capability `claude_provider_v1`; `buildSdkEnv` provider mode at every spawn site; model resolution; exclusive-routing test; override and switch refusals; gateway-limit parking; `provider_lane_unsupported` for judge, jobs and cross-check; isolated-lane refusal (until PRD #4322 M3); usage and cost unknown; CLI `provider use`; ADR.
 Acceptance: examples 2 and 3; a rotated key is not sent to an old destination; same-run continuation inherits the frozen binding; a user with a null source sees today's behaviour byte-for-byte (env and claim snapshots).
 
+### Implementation status (m7, 2026-11-18)
+
+The PRD has no checkboxes; this records what the branch ships against the milestones above. Nothing here is validated against a real gateway or the hosted restricted tier; that is owner acceptance.
+
+**Shipped (code and tests exist):** the allowlist parser and flags; provider tables, revisions and the `anthropic_compatible_key` kind; CRUD with bounds; the Test probe (direct pinned dial, no redirects, in-memory limiter); the web Custom providers card and `uzi provider list|create|edit|test|retire`; selection through `PUT /api/me/providers/claude-source`, `uzi provider use <name|id>|--none` and a Settings "Use as Claude source" control; run DTOs and cards that name the bound provider (or "(deleted)") with cost shown as unknown (`web/src/components/RunCredential.test.tsx`, `api/internal/handler/run_provider_dto_test.go`); resolver, create-transaction freeze and inherited successors; the claim `provider` object, claim-time revocation parks (`provider_destination_not_allowed`, `provider_binding_stale`); worker env and every spawn site; model resolution; issue-run gateway-limit parking; chat ending its turn; `cost_status='unreported'`; lane refusals; the ADR ([adr/4320-custom-model-providers.md](../adr/4320-custom-model-providers.md)), user, operator and ARCHITECTURE docs.
+
+**Not shipped:**
+- **Activation.** Workers do not advertise `claude_provider_v1` (`agent/test/worker-provider-capability.test.ts` pins this), so acceptance examples 2 and 3 do not run end to end and module 7's "activation is blocked on this test" is in force. The exclusive-routing test (`agent/test/provider-exclusive-routing.integration.test.ts`) characterizes the redirect behaviour; it does not pass the "redirect is not followed with the key" assertion the PRD asked for.
+- A loopback relay that refuses redirects: deferred to a separate issue the owner files, with its own design review.
+- Real-gateway and hosted-tier behaviour, and the E2E phases against a provider: owner acceptance, not run.
+
 ## Decision Log
 
 - **D1: Provider is a first-class object with immutable revisions.** Reason: per-run binding must freeze the destination, and roles must be able to reference providers later. Rejected: an instance-wide gateway setting.
@@ -150,3 +161,4 @@ Acceptance: examples 2 and 3; a rotated key is not sent to an old destination; s
 - **Chat gateway limits end the turn without parking (2026-11-18).** Reason: owner decision. A chat turn that hits a gateway 429 or overload ends with a `provider_gateway_limit` reason and is not retried or parked; the `limit_wait` park in the Gateway limits paragraph applies to issue runs. The owner reports this decision is recorded as D15 on main; this clone's main (e253c7063) does not carry it, so the landing rebase reconciles the two.
 - **Provider runs record `cost_status` `unreported` (2026-11-18).** Reason: the vendor-priced cost on the CLI result frame does not describe a gateway's pricing, so the server records `cost_status` `unreported` (cost "unknown") for provider runs; tokens are still recorded.
 - **The gateway-limit streak resets only on owner Resume (2026-11-18).** Reason: the capped backoff counts automatic retries since the last owner Resume: three automatic retries (1, 5, 15 minutes), then the run waits for the owner.
+- **Ship with activation blocked; loopback relay later (2026-11-18).** Reason: owner decision. The pinned Claude CLI follows gateway redirects, which the PRD's activation test was meant to rule out, so the feature merges with `claude_provider_v1` unadvertised and provider runs stay queued ("no worker that supports model providers is online") until a loopback relay, filed by the owner as a separate issue with its own design review, lands. The advertisement and the guard test flip in that change. Rejected: advertising the capability with the redirect leak documented; delaying the whole merge on the relay.

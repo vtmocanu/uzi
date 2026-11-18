@@ -246,7 +246,15 @@ possible with an allowlist that is **separate** from every other allowlist on th
 The api is the destination authority: it checks the list when a provider is saved or its endpoint
 edited, and a saved URL is stored as the matching list entry. Removing an entry stops later saves and
 tests of providers that used it (every save re-checks the URL it carries, a key save included, and
-so does every Test, right before it connects) and, once providers can run, their run claims.
+so does every Test, right before it connects) and the claims of runs already bound to them: such a
+run is paused as `provider_destination_not_allowed` and never starts on an Anthropic token. A
+run's frozen URL is not re-read from the list while its claim is held; cancel is the immediate stop.
+
+**Activation is blocked.** Workers do not advertise the capability `claude_provider_v1` that provider
+runs need, because the pinned Claude CLI follows gateway redirects (see
+[ADR-4320](../adr/4320-custom-model-providers.md#known-accepted-limit-the-cli-follows-redirects-and-activation-is-blocked)).
+Setting the allowlist lets users define, test and select providers, but a run bound to one stays
+queued ("no worker that supports model providers is online") until a later release removes the block.
 
 **Helm.** Set the allowlist with the first-class value `providers.allowedBaseURLs` (a list of exact
 URLs, rendered into `UZI_PROVIDER_ALLOWED_BASE_URLS`; setting the variable in `api.config` as well

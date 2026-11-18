@@ -11,8 +11,14 @@ example) that you register with its own API key and a map from Claude's model na
 gateway's models. Settings has a **Custom providers** card for them, and `uzi provider` covers
 the same ground from a terminal.
 
-Selecting a provider as your Claude source arrives in a later release step. Until then you can
-create, edit, test and retire providers, and nothing runs through them.
+> **Runs through a provider are currently blocked.** You can create, edit, test, retire and
+> select providers, but a run that is bound to one **stays queued** and shows "no worker that
+> supports model providers is online; waiting for a worker roll". Workers do not yet advertise
+> the capability that provider runs need, because the pinned Claude CLI follows redirects from a
+> gateway, which could re-send your key or request body to a location the gateway names. A
+> loopback relay that removes that risk is planned as a separate change. Until it lands, do not
+> select a provider as your Claude source unless you want your Claude runs to queue; clear it to
+> go back to your Anthropic token. Details: [ADR-4320](../adr/4320-custom-model-providers.md).
 
 ## Which URLs you can use
 
@@ -78,6 +84,80 @@ IPv6 unique-local) and refuses link-local (including cloud metadata), unspecifie
 and broadcast addresses. Loopback is refused unless the operator turned on the development
 flag. Limits: one test at a time per user, 30 per hour per user, and at most 4 tests running at once across the whole instance; the counts reset when the
 api restarts. Past any of these limits the request fails with the reason `provider_probe_rate_limited`.
+
+## Use a provider as your Claude source
+
+Your **Claude source** decides which credential your Claude runs and chats use. Unset (the
+default), they use your Anthropic token exactly as before. Set to a provider, they use that
+provider's gateway and key, with no Anthropic credential in the run, even if you also hold one.
+The source is a separate setting, so your Anthropic token keeps its own default untouched.
+
+In Settings, each provider row has **Use as Claude source** (disabled, with the reason, when the
+provider is retired, has no key or has a disabled key); the selected one shows **Stop using** and
+Settings names it as your current Claude source. From a terminal:
+
+```sh
+uzi provider use corp-gw     # select by name or id
+uzi provider use --none      # back to your Anthropic token
+```
+
+Both call `PUT /api/me/providers/claude-source` and accept a Bearer token, since selecting reveals no
+key and cannot move a destination. The selection applies to runs you start afterwards. A selection is refused (409 `provider_source_unusable`)
+unless the provider is yours, not retired, on the operator's allowlist and has an enabled key.
+
+- **A set source is never skipped.** If it becomes unusable (retired, its URL removed from the
+  allowlist, its key missing or disabled), new runs are refused with `provider_source_unusable`.
+  They do not fall back to your Anthropic token or to Codex.
+- **Deleting a selected provider is refused** (`provider_in_use_as_source`). Clear the source first.
+  Retiring is allowed and leaves the source set, so the next run is refused as above.
+- **No overrides.** A per-run credential override (`--token`) and switching a running run's
+  credential are refused for a provider-sourced owner.
+- **Automatic harness choice and overflow skip Claude** while a provider is your source: unknown
+  usage is never compared with vendor readings, and your run never moves to another engine's
+  credential.
+- **Lanes that cannot use a provider refuse.** The judge, jobs and cross-check lanes refuse an
+  owner whose source is set, with `provider_lane_unsupported`, including that owner's runs that
+  use an Anthropic token. The isolated research lane refuses provider runs.
+- **Models.** Every model the run uses (the lead, each agent template, summaries and advice
+  passes) must be in the provider's model map. An unmapped alias or a full Anthropic model id is
+  refused with `provider_model_unmapped`; uzi never swaps it for another model.
+
+### What a run keeps
+
+A run freezes its provider, revision and key at creation. Continuations of that run (resume,
+recovery, restart, automatic rework) and its follow-on rework, review and chat runs keep the
+frozen binding, not whatever your source is later. CI-fix and handoff runs have no source run and
+use your current source. Editing a provider's model map creates a new revision for later runs
+and older ones keep theirs.
+
+Revocation takes effect at the run's **next claim**, not mid-claim, and cancelling is the
+immediate stop. If the operator removes the URL from the allowlist, the run pauses as
+`provider_destination_not_allowed` and resumes by itself once the URL is allowed again. If the
+key was replaced, disabled or deleted, the run pauses as `provider_binding_stale`: it cannot
+continue, so cancel it and start a new run, which uses the current key.
+
+### Gateway rate limits
+
+If the gateway keeps answering 429 or overloaded on an **issue run**, the run parks and retries
+1 minute later, then 5, then 15, then waits for you to Resume (see
+[the schedule](./run-limit-wait.md#a-custom-providers-gateway-rate-limit)). A **chat** turn that
+hits a gateway limit ends with an error naming `provider_gateway_limit`; ask again in a moment.
+It does not park or retry.
+
+### Usage and cost
+
+A run card names the provider the run used (or "(deleted)" if it was deleted since), shows no
+Anthropic token for it, and hides the credential override. Usage and cost show as **unknown** for provider runs: the model names are the gateway's, so the
+vendor price table does not apply. Token counts are still recorded, and run, time and
+concurrency limits still apply.
+
+## Gateways behind a private CA
+
+The Test probe trusts the operator's `workers.extraCA` bundle (the chart also mounts it into the
+api pod). Under the chart's `workers.uidSplit`, the Claude CLI runs as a different uid that
+cannot read that bundle, so `workers.extraCA` reaches only the worker process there, not the CLI.
+A private-CA gateway can therefore pass **Test** and still fail from a run on a uid-split worker.
+Workers without `uidSplit` and isolated-lane workers are covered. Ask your operator which applies.
 
 ## Retire or delete
 
