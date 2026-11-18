@@ -79,7 +79,7 @@ func (x codexLockOrderFixture) wantBusy(t *testing.T, ctx context.Context, leaf 
 // successful blocker Scan is the readiness barrier.
 func TestCodexApplyAliasRowContentionLiveDB(t *testing.T) {
 	const aliasSQL = "SELECT user_secret_id FROM codex_credential_state WHERE user_secret_id=$1 AND user_id=$2 FOR UPDATE"
-	const secretSQL = "SELECT id FROM user_secrets WHERE id=$1 AND user_id=$2 FOR UPDATE"
+	const enablementSQL = "SELECT id FROM user_secrets WHERE id=$1 AND user_id=$2 FOR UPDATE"
 	for _, leaf := range []struct {
 		name   string
 		sql    string
@@ -87,8 +87,8 @@ func TestCodexApplyAliasRowContentionLiveDB(t *testing.T) {
 	}{
 		{"old_alias", aliasSQL, false},
 		{"target_alias", aliasSQL, true},
-		{"old_enablement", secretSQL, false},
-		{"target_enablement", secretSQL, true},
+		{"old_enablement", enablementSQL, false},
+		{"target_enablement", enablementSQL, true},
 	} {
 		t.Run(leaf.name, func(t *testing.T) {
 			x := newCodexLockOrderFixture(t)
