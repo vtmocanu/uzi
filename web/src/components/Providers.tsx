@@ -38,7 +38,10 @@ const CTX_MIN = 8192;
 const CTX_MAX = 10_000_000;
 
 const NO_CONTEXT_WARNING =
-  "No context window set. Without it the Claude CLI assumes a 200k-token window for unrecognized model names and compacts too late if the gateway's window is smaller.";
+  "No context window set. Without it the Claude CLI assumes a 200k-token window for unrecognized model names and compacts too late if the gateway's window is smaller. A context window is not enforced for model names the Claude CLI recognises (claude-*).";
+
+const CATALOG_CONTEXT_WARNING =
+  "The context window is not enforced for model names the Claude CLI recognises (claude-*); the CLI keeps its own window for this model.";
 
 interface ModelRow {
   model: string;
@@ -200,6 +203,11 @@ function ModelMapFields({
             {row.model.trim() !== "" && row.ctx.trim() === "" && (
               <p className="text-xs text-warn" data-testid={`ctx-warning-${role}`}>
                 {label}: {NO_CONTEXT_WARNING}
+              </p>
+            )}
+            {row.model.trim().toLowerCase().startsWith("claude-") && row.ctx.trim() !== "" && (
+              <p className="text-xs text-warn" data-testid={`ctx-unenforced-${role}`}>
+                {label}: {CATALOG_CONTEXT_WARNING}
               </p>
             )}
           </div>

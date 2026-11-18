@@ -380,4 +380,39 @@ describe("ChatRunner — provider gateway key redaction (PRD #4320)", () => {
     assert.ok(!emitted.includes(PROVIDER_KEY), "the key never reaches a chat message");
     assert.ok(emitted.includes("REDACTED"), "it was replaced, not dropped");
   });
+
+  async function resultPayloads(claim: ChatClaimResponse): Promise<Record<string, unknown>[]> {
+    const { messages, client } = fakeClient();
+    const queryFn: SdkQueryFn = (params) => (async function* () {
+      for await (const _ of params.prompt) { /* drain */ }
+      yield assistantText("answer");
+      yield {
+        type: "result", subtype: "success", is_error: false, session_id: "sess-1", total_cost_usd: 0.42,
+        usage: { input_tokens: 11, output_tokens: 7 },
+        modelUsage: { "corp-sonnet": { inputTokens: 11, outputTokens: 7, costUSD: 0.42 } },
+      } as unknown as SDKMessage;
+    })();
+    const executor = new ChatExecutor(nullLogger(), homeDir, { queryFn });
+    await new ChatRunner(client, () => executor, nullLogger(), 5, DEFAULTS, JOIN, { makeSource: () => fakeSource([msg("hi"), { kind: "idle" }]) }).execute(claim);
+    return messages.map((m) => m.payload).filter((p) => "modelUsage" in p);
+  }
+
+  it("a provider chat keeps result tokens but drops both vendor cost fields", async () => {
+    const payloads = await resultPayloads(providerClaim());
+    assert.strictEqual(payloads.length, 1, "exactly one result frame carries modelUsage");
+    const p = payloads[0]!;
+    assert.ok(!Object.hasOwn(p, "total_cost_usd"), "total_cost_usd is stripped");
+    const mu = (p["modelUsage"] as Record<string, Record<string, unknown>>)["corp-sonnet"]!;
+    assert.ok(!Object.hasOwn(mu, "costUSD"), "modelUsage costUSD is stripped");
+    assert.strictEqual(mu["inputTokens"], 11);
+    assert.strictEqual(mu["outputTokens"], 7);
+  });
+
+  it("a vendor chat keeps its cost unchanged", async () => {
+    const payloads = await resultPayloads(baseClaim());
+    assert.strictEqual(payloads.length, 1);
+    const p = payloads[0]!;
+    assert.strictEqual(p["total_cost_usd"], 0.42);
+    assert.strictEqual((p["modelUsage"] as Record<string, Record<string, unknown>>)["corp-sonnet"]!["costUSD"], 0.42);
+  });
 });

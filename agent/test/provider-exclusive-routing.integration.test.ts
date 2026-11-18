@@ -197,8 +197,6 @@ describe("exclusive routing of the real CLI in provider mode (PRD #4320 module 7
     const env = {
       ...buildSdkEnv(opts.cred, home),
       TMPDIR: tmp,
-      DISABLE_TELEMETRY: "1",
-      DISABLE_AUTOUPDATER: "1",
       HTTPS_PROXY: recorderUrl,
       HTTP_PROXY: recorderUrl,
       https_proxy: recorderUrl,

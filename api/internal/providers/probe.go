@@ -300,32 +300,36 @@ func toolVerdict(body []byte) string {
 	if json.Unmarshal(m["content"], &raws) != nil {
 		return ToolInconclusive
 	}
-	passed, badInput := false, false
+	passed := false
 	for _, raw := range raws {
 		if r := bytes.TrimSpace(raw); len(r) == 0 || r[0] != '{' {
 			return ToolInconclusive
 		}
 		var b struct {
 			Type  string          `json:"type"`
+			Text  *string         `json:"text"`
+			ID    *string         `json:"id"`
 			Name  string          `json:"name"`
 			Input json.RawMessage `json:"input"`
 		}
-		if json.Unmarshal(raw, &b) != nil {
+		if json.Unmarshal(raw, &b) != nil || b.Type == "" {
 			return ToolInconclusive
 		}
-		if b.Type != "tool_use" || b.Name != probeToolName {
-			continue
-		}
-		if in := bytes.TrimSpace(b.Input); len(in) > 0 && in[0] == '{' {
-			passed = true
-		} else {
-			badInput = true
+		switch b.Type {
+		case "text":
+			if b.Text == nil {
+				return ToolInconclusive
+			}
+		case "tool_use":
+			if in := bytes.TrimSpace(b.Input); b.ID == nil || len(in) == 0 || in[0] != '{' {
+				return ToolInconclusive
+			}
+			if b.Name == probeToolName {
+				passed = true
+			}
 		}
 	}
-	switch {
-	case badInput:
-		return ToolInconclusive
-	case passed:
+	if passed {
 		return ToolPassed
 	}
 	return ToolNotSupported

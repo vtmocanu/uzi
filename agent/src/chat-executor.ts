@@ -37,7 +37,7 @@ import type { ClaimProviderBinding } from "./protocol.js";
 import type { UziToolHandlers } from "./uzi-tools.js";
 import type { Logger } from "./log.js";
 import { buildSdkEnv, type SdkCredential } from "./sdk-env.js";
-import { isGatewayLimitStatus, PROVIDER_GATEWAY_LIMIT, resolveProviderModel, sdkCredentialFromBinding } from "./provider-binding.js";
+import { isGatewayLimitStatus, PROVIDER_GATEWAY_LIMIT, resolveProviderModel, sdkCredentialFromBinding, stripProviderCost } from "./provider-binding.js";
 import { buildPreToolUseHook, buildPathGuardHook, NESTED_AGENT_TOOL, ASYNC_DEFERRAL_TOOLS } from "./guardrails.js";
 import { killProcessGroup, spawnDetached } from "./sdk-spawn.js";
 import {
@@ -521,7 +521,8 @@ export class ChatExecutor {
         const sid = sessionIdOf(msg);
         if (sid) turnSessionId = sid;
         rateLimits.observe(msg);
-        for (const em of mapSdkMessage(msg)) ctx.emit(em);
+        // PRD #4320: a provider chat never carries the vendor's cost (same strip as an issue run).
+        for (const raw of mapSdkMessage(msg)) ctx.emit(ctx.provider ? stripProviderCost(raw) : raw);
         if (isResult(msg)) {
           resultFrame = msg;
           if (isErrorResult(msg)) {

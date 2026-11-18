@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import type { Options } from "@anthropic-ai/claude-agent-sdk";
+import { buildSdkEnv } from "../src/sdk-env.js";
 
 // PRD #4320 M2 (agent half): does CLAUDE_CODE_MAX_CONTEXT_TOKENS / CLAUDE_CODE_AUTO_COMPACT_WINDOW
 // change the REAL bundled CLI's auto-compaction point for a model name it does not recognize
@@ -280,6 +281,25 @@ describe("context-window env keys vs a model name the CLI does not recognize (PR
     const o = await run({ CLAUDE_CODE_AUTO_COMPACT_WINDOW: "50000" }, false);
     // Unfloored, a 50000 window would compact near 17k; the floor keeps it above 50k and within 100k.
     within(firstCompaction(o, "lead", "AUTO_COMPACT_WINDOW=50000"), 50_000, 100_000, "AUTO_COMPACT_WINDOW=50000", o);
+  });
+
+  // A catalog-style mapped name (one the CLI knows) with a smaller configured window, the context env
+  // taken from the production buildSdkEnv.
+  it("single model, mapped catalog name claude-sonnet-4-5 with a 50000 window from buildSdkEnv", { timeout: 120_000 }, async () => {
+    const prod = buildSdkEnv(
+      { kind: "provider", baseUrl: "http://127.0.0.1:1", authStyle: "bearer", key: "k", modelMap: { sonnet: { model: "claude-sonnet-4-5", context_window: 50_000 }, haiku: { model: SUB_MODEL } } },
+      "/unused-home",
+    );
+    assert.equal(prod.CLAUDE_CODE_MAX_CONTEXT_TOKENS, "50000");
+    const o = await run({ ANTHROPIC_DEFAULT_SONNET_MODEL: "claude-sonnet-4-5", CLAUDE_CODE_MAX_CONTEXT_TOKENS: prod.CLAUDE_CODE_MAX_CONTEXT_TOKENS! }, false);
+    assert.ok(o.gw.calls.some((c) => c.model === "claude-sonnet-4-5"), `the catalog name reached the gateway\ncalls: ${trace(o)}`);
+    // OBSERVED at the pin (SDK 0.3.319 / CLI 2.1.319, 2026-11-18): the configured window is NOT enforced
+    // for a name the CLI recognises. The CLI keeps its catalog window (larger than the 200k default here:
+    // no compaction through 400k+ reported tokens), so a context_window on a claude-* mapped name is
+    // inert. This pins that behaviour as a KNOWN REQUIREMENT GAP (PRD Decision Log); if a CLI bump
+    // starts enforcing it, this fails and the docs/warning must be revisited.
+    const n = o.gw.tokensAtFirstCompaction("lead");
+    assert.ok(n === undefined || n > DEFAULT_WINDOW, `the catalog window was not retained (first compaction at ${n}, configured 50000)\ncalls: ${trace(o)}`);
   });
 
   it("lead + subagent on different unrecognized models: no context env, both assume the same 200k default", { timeout: 120_000 }, async () => {
