@@ -129,6 +129,8 @@ func main() {
 		DeploymentLabels:            cfg.WorkerDeploymentLabels,
 		DeploymentAnnotations:       cfg.WorkerDeploymentAnnotations,
 		Tolerations:                 cfg.WorkerTolerations,
+		NewPlacementNodeSelector:    cfg.WorkerNewPlacementNodeSelector,
+		NewPlacementTolerations:     cfg.WorkerNewPlacementTolerations,
 		MaxConcurrentRuns:           cfg.WorkerMaxConcurrentRuns,
 		MemoryGuardEnabled:          cfg.WorkerMemoryGuardEnabled,
 		MemoryGuardReserveBytes:     cfg.WorkerMemoryGuardReserveBytes,

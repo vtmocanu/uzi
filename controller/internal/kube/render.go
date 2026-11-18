@@ -84,6 +84,16 @@ const (
 	// AS RENDERED HERE, which sidesteps diffing against server-defaulted state
 	// entirely: the standard Helm checksum/config idiom.
 	AnnotationSpecHash = "uzi.dev/spec-hash"
+
+	// AnnotationPlacement stamps a worker's PVCs with the placement they were created
+	// under. Only a worker whose PVCs ALL carry placementNew renders the new-placement
+	// nodeSelector/tolerations (RenderConfig.withPlacement); an unstamped worker keeps
+	// the global placement, so legacy workers never move.
+	AnnotationPlacement = "uzi.dev/placement"
+
+	// placementNew is the AnnotationPlacement value that opts a worker into the new
+	// placement.
+	placementNew = "new"
 )
 
 // Secret keys, and the paths they mount at.
@@ -577,6 +587,12 @@ type RenderConfig struct {
 	// tolerations key (json omitempty), so an install without them hashes exactly as
 	// before this field existed. Changing them re-hashes the template and rolls.
 	Tolerations []corev1.Toleration
+	// NewPlacementNodeSelector / NewPlacementTolerations are the opt-in second placement,
+	// applied only to a worker whose PVCs all carry the AnnotationPlacement=new stamp (see
+	// withPlacement). For such a worker each REPLACES, never merges with, NodeSelector /
+	// Tolerations. Unset, they change nothing and legacy hashes stay byte-identical.
+	NewPlacementNodeSelector map[string]string
+	NewPlacementTolerations  []corev1.Toleration
 	// MaxConcurrentRuns is the per-worker slot cap rendered into the pod's
 	// WORKER_MAX_CONCURRENT_RUNS. Zero (a RenderConfig{} built in a test, or a caller
 	// that never set it) renders "1", so the default stays 1 everywhere; see config.go,
@@ -1619,6 +1635,25 @@ func specHash(tmpl corev1.PodTemplateSpec) string {
 	}
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:])
+}
+
+// NewPlacementSet reports whether the opt-in second placement is configured: a
+// non-empty selector or non-empty tolerations.
+func (c RenderConfig) NewPlacementSet() bool {
+	return len(c.NewPlacementNodeSelector) > 0 || len(c.NewPlacementTolerations) > 0
+}
+
+// withPlacement returns the config to render a worker with. For a stamped worker (every
+// PVC carries AnnotationPlacement=new) and a configured new placement, NodeSelector and
+// Tolerations are REPLACED by the new-placement ones (never merged; an empty new
+// selector renders no nodeSelector). Otherwise c is returned unchanged.
+func (c RenderConfig) withPlacement(stamped bool) RenderConfig {
+	if !stamped || !c.NewPlacementSet() {
+		return c
+	}
+	c.NodeSelector = c.NewPlacementNodeSelector
+	c.Tolerations = c.NewPlacementTolerations
+	return c
 }
 
 // SpecHashOf exposes the hash of what we WOULD render, so the reconciler can
