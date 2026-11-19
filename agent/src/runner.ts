@@ -18888,7 +18888,7 @@ export class RunRunner {
    * returns the finalize outcome; observing `running` through ownership never proves admission.
    *
    * `parkSeq` is local to one park. Before every send that follows no unknown send, the negotiated feature
-   * and a usable publication resume are re-checked; without them the outcome is returned untouched, as before.
+   * and a usable publication resume are re-checked; without them the outcome is returned untouched, as before, unless a cancel arrived.
    * After a send whose reply is unknown the loop only ever resends (the server replay is idempotent)
    * under the interrupts of the publication enrollment reconciliation: it never re-runs the park and
    * never lets the finalize outcome through unconfirmed.
@@ -18918,7 +18918,7 @@ export class RunRunner {
     const unsendable = (why: string): void => {
       if (unsendableLogged) return;
       unsendableLogged = true;
-      runLog.warn("interactive task: follow-up finalize cannot be sent after an unconfirmed attempt; holding until it can", { run_id: flight.runId, why });
+      runLog.warn("interactive task: follow-up finalize is not being resent after an unconfirmed attempt; holding until it can be", { run_id: flight.runId, why });
     };
     const keep = (): void => {
       flight.preserveRecoveryClone = true;
@@ -18926,8 +18926,8 @@ export class RunRunner {
       flight.stoppedSourceKept = true;
     };
     // The #3846 interrupt set. A cancel is not thrown: it becomes the cancelled outcome, which the
-    // executor raises as REASON_CANCELLED. A credential-switch lifecycle abort after an ambiguous
-    // send is skipped (the park is never re-run), so it counts as unconfirmed.
+    // executor raises as REASON_CANCELLED. A credential-switch abort after an unknown
+    // send is deliberately skipped (the park is never re-run, so it counts as unconfirmed).
     const interrupted = (): boolean => {
       try {
         if (flight.steering.claimFence() !== undefined) throw new StaleClaimError();
@@ -18963,13 +18963,13 @@ export class RunRunner {
         if (error instanceof StaleClaimError || error instanceof RetainedRecoveryStop) throw error;
         if (error instanceof ReportPreconditionError) {
           // Thrown by the client before any request: never ambiguous.
-          if (!ambiguous) return outcome;
+          if (!ambiguous) return flight.steering.isCancelled() ? cancelled : outcome;
           unsendable("client_precondition");
           result = { kind: "unconfirmed" };
         } else if (isFollowupFinalizeUnsupported(error)) {
           // A rolled-back api that does not know the state: today's behaviour on the first send, and
           // never a license to finalize once an earlier send might have applied.
-          if (!ambiguous) return outcome;
+          if (!ambiguous) return flight.steering.isCancelled() ? cancelled : outcome;
           unsendable("api_does_not_know_the_state");
           result = { kind: "unconfirmed" };
         } else if (this.isDefinitiveApiRefusal(error)) {

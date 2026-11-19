@@ -819,4 +819,52 @@ describe("interactive follow-up finalize admission (issue #4479)", () => {
     assert.equal(m.finalizeRequests, 0);
     assert.deepEqual(log.outcomes[0], { kind: "ended", reason: "idle" });
   });
+  it("a credential-switch signal thrown by the send after an unconfirmed attempt does not re-run the park and resends until admitted", async () => {
+    const { claim, m, outbox, log } = await idleSetup({
+      script: [{ kind: "lost" }, { kind: "lost" }, { kind: "lost" }, { kind: "admitted" }],
+    });
+    let calls = 0;
+    const r = build(parkingExecutor(log), outbox);
+    captureFlight(r, flight => {
+      // The closure consults this before every send: the second send is cut off by the switch signal.
+      flight.steering.approveRefusedBySwitchPending = () => ++calls === 2;
+    });
+    await finish(r, claim);
+
+    assert.equal(m.parkSeq, 1, "the park was not re-run");
+    assert.equal(m.finalizeRequests, ATTEMPTS + 1, "the unknown round, the cut-off send (no request), then the admitting resend");
+    assert.ok(calls >= 3, "the loop sent again after the signal");
+    assert.deepEqual(log.outcomes, [{ kind: "ended", reason: "idle" }]);
+    assert.equal(statuses(claim.run_id).at(-1), "completed");
+  });
+
+  it("a cancel that arrives during a rolled-back (generic 400) first send ends cancelled", async () => {
+    const r0 = { cap: undefined as Captured | undefined };
+    const { claim, m, outbox, log } = await idleSetup({
+      script: [{ kind: "raw", status: 400, body: { error: GENERIC_400 } }],
+      onFinalize: index => { if (index === 0) r0.cap!.flight!.steering.markCancelled(); },
+    });
+    const r = build(parkingExecutor(log), outbox);
+    r0.cap = captureFlight(r);
+    await finish(r, claim);
+
+    assert.equal(m.finalizeRequests, 1);
+    assert.deepEqual(log.outcomes.at(-1), { kind: "ended", reason: "cancelled" });
+    assert.ok(!statuses(claim.run_id).includes("completed"));
+  });
+  it("a cancel that arrives before a locally refused first send ends cancelled, not with the idle outcome", async () => {
+    const { claim, outbox, log } = await idleSetup();
+    const r = build(parkingExecutor(log), outbox);
+    const cap = captureFlight(r);
+    const real = client.reportState.bind(client);
+    client.reportState = (async (...a: Parameters<typeof real>) => {
+      if (a[1].status !== "followup_finalize") return real(...a);
+      cap.flight!.steering.markCancelled();
+      throw new ReportPreconditionError("local guard");
+    }) as typeof client.reportState;
+    await finish(r, claim);
+
+    assert.deepEqual(log.outcomes.at(-1), { kind: "ended", reason: "cancelled" });
+    assert.ok(!statuses(claim.run_id).includes("completed"));
+  });
 });
