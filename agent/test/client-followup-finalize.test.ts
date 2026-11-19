@@ -115,7 +115,16 @@ describe("client followup_finalize report", () => {
     assert.deepEqual(requests, []);
   });
 
-  for (const [name, text] of [["the generic invalid-state error", GENERIC_400], ["the strict-decode error", "invalid request body"]] as const) {
+  const PRE_FINALIZE_400 = GENERIC_400.replace(" followup_finalize,", "");
+  const PRE_UNCERTAIN_400 = PRE_FINALIZE_400.replace(" credential_switch_uncertain,", "");
+  assert.notEqual(PRE_FINALIZE_400, GENERIC_400);
+  assert.notEqual(PRE_UNCERTAIN_400, PRE_FINALIZE_400);
+  for (const [name, text] of [
+    ["the generic invalid-state error", GENERIC_400],
+    ["the generic invalid-state error of an api before followup_finalize", PRE_FINALIZE_400],
+    ["the generic invalid-state error of an api before credential_switch_uncertain", PRE_UNCERTAIN_400],
+    ["the strict-decode error of an api that rejects the unknown field", "invalid request body"],
+  ] as const) {
     it(`${name} propagates unchanged, is sent once and is recognised as an unsupported api`, async t => {
       const bodies: unknown[] = [];
       t.mock.method(globalThis, "fetch", async (_url: string, init?: RequestInit) => {

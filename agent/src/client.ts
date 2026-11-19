@@ -3216,7 +3216,7 @@ export class WorkerClient {
       if (!this.hasFeature(FOLLOWUP_FINALIZE_ADMISSION_FEATURE) ||
           !Number.isSafeInteger(body.claim_generation) || (body.claim_generation ?? 0) <= 0 ||
           !Number.isSafeInteger(body.followup_park_seq) || (body.followup_park_seq ?? 0) <= 0)
-        throw new Error("follow-up finalize requires the followup_finalize_admission_v1 feature, a positive claim_generation and a positive followup_park_seq");
+        throw new ReportPreconditionError("follow-up finalize requires the followup_finalize_admission_v1 feature, a positive claim_generation and a positive followup_park_seq");
       return this.reportStateOnce(runId, path, body, signal, CROSS_CHECK_RESPONSE_MAX_BYTES);
     }
     // Once a source fence is negotiated, never retry its write without that fence

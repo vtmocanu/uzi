@@ -3303,6 +3303,8 @@ interface RunFlight {
     midRunTrigger?: { observation: number; tip: string };
     midRunSeq?: number;
   };
+  /** Issue #4479: how many times a followup_pending refusal re-armed this flight's follow-up wait. */
+  followUpPendingRearms?: number;
 }
 
 /** PRD #1390 M2a: the four run states a worker's ActiveSnapshot may report as a `phase`
@@ -17996,9 +17998,9 @@ export class RunRunner {
         let outcome = await steering.awaitFollowUp(idleMs);
         // Issue #4479: an idle or stopped end is about to finalize; move the server's awaiting_followup
         // row back to running first, or the publication intent refuses it forever. Nothing changes
-        // without the negotiated feature, a usable publication resume and this park's sequence.
-        if (parkSeq !== undefined && outcome.kind === "ended" && (outcome.reason === "idle" || outcome.reason === "stopped") &&
-            this.client.hasFeature(FOLLOWUP_FINALIZE_ADMISSION_FEATURE) && this.publicationResumeAvailable()) {
+        // without this park's sequence, the negotiated feature or a usable publication resume (the
+        // callee checks the last two before every send).
+        if (parkSeq !== undefined && outcome.kind === "ended" && (outcome.reason === "idle" || outcome.reason === "stopped")) {
           outcome = await this.admitFollowUpFinalize(flight, outcome, idleMs, parkSeq, (body) => reportState(body));
         }
         if (outcome.kind === "followup" && flight.workerMemory) flight.workerMemory.resumeReady = true;
@@ -18885,11 +18887,16 @@ export class RunRunner {
    * sequence its park ACK carried) BEFORE the outcome reaches the executor. Only an `admitted` reply
    * returns the finalize outcome; observing `running` through ownership never proves admission.
    *
-   * `parkSeq` is local to one park. The caller only enters here with the negotiated feature, a usable
-   * publication resume and a park sequence; without them the outcome is returned untouched, as before.
+   * `parkSeq` is local to one park. Before every send that follows no unknown send, the negotiated feature
+   * and a usable publication resume are re-checked; without them the outcome is returned untouched, as before.
    * After a send whose reply is unknown the loop only ever resends (the server replay is idempotent)
    * under the interrupts of the publication enrollment reconciliation: it never re-runs the park and
    * never lets the finalize outcome through unconfirmed.
+   *
+   * An unconfirmed admission holds the flight indefinitely: it resends until a reply confirms it, or
+   * until a cancel, a shutdown, a lifecycle abort or a claim fence interrupts the loop. It publishes
+   * nothing meanwhile. An error thrown before any request is issued (the client's local guard) is never
+   * ambiguous: while no earlier send is unknown, the outcome returns untouched, as before.
    */
   private async admitFollowUpFinalize(
     flight: RunFlight,
@@ -18929,12 +18936,11 @@ export class RunRunner {
     for (;;) {
       if (outcome.kind !== "ended" || (outcome.reason !== "idle" && outcome.reason !== "stopped")) return outcome;
       const stopped = outcome.reason === "stopped";
+      // While no earlier send is unknown, a withdrawn feature or publication resume means today's behaviour.
+      if (!ambiguous && (!this.client.hasFeature(FOLLOWUP_FINALIZE_ADMISSION_FEATURE) || !this.publicationResumeAvailable())) return outcome;
       if (sentOnce) {
         if (interrupted()) return cancelled;
-      } else {
-        if (!this.client.hasFeature(FOLLOWUP_FINALIZE_ADMISSION_FEATURE) || !this.publicationResumeAvailable()) return outcome;
-        if (flight.steering.isCancelled()) return cancelled;
-      }
+      } else if (flight.steering.isCancelled()) return cancelled;
       sentOnce = true;
       let result: FollowupFinalizeResult;
       try {
@@ -18942,7 +18948,11 @@ export class RunRunner {
         result = ack.followupFinalize ?? { kind: "unconfirmed" };
       } catch (error) {
         if (error instanceof StaleClaimError || error instanceof RetainedRecoveryStop) throw error;
-        if (isFollowupFinalizeUnsupported(error)) {
+        if (error instanceof ReportPreconditionError) {
+          // Thrown by the client before any request: never ambiguous.
+          if (!ambiguous) return outcome;
+          result = { kind: "unconfirmed" };
+        } else if (isFollowupFinalizeUnsupported(error)) {
           // A rolled-back api that does not know the state: today's behaviour on the first send, and
           // never a license to finalize once an earlier send might have applied.
           if (!ambiguous) return outcome;
@@ -18962,27 +18972,30 @@ export class RunRunner {
         case "admitted":
           runLog.info("interactive task: follow-up finalize admitted", { run_id: flight.runId, reason: outcome.reason });
           return flight.steering.isCancelled() ? cancelled : outcome;
-        case "stale_claim":
-          throw new StaleClaimError();
+        // A stale_claim reply never reaches here: the reportState closure throws StaleClaimError first.
         case "refused": {
           if (result.reason === "followup_finalize_refused")
             throw new TrustedExecutionRefusal(`${REASON_FOLLOWUP_NOT_PARKED} (the server refused the follow-up finalize admission)`);
           if (result.reason === "followup_pending" && stopped)
             throw new TrustedExecutionRefusal(`${REASON_FOLLOWUP_NOT_PARKED} (the server reports a pending follow-up after a stop)`);
-          runLog.info("interactive task: follow-up finalize refused; waiting again", { run_id: flight.runId, reason: result.reason });
+          if (result.reason === "followup_pending") flight.followUpPendingRearms = (flight.followUpPendingRearms ?? 0) + 1;
+          runLog.info("interactive task: follow-up finalize refused; waiting again", {
+            run_id: flight.runId, reason: result.reason, followup_pending_rearms: flight.followUpPendingRearms ?? 0,
+          });
           // A definite answer: the run is still parked. Wait again with a fresh idle window; a pending
           // follow-up or cancel is delivered by the poll loop and resolves this wait.
           ambiguous = false;
           outcome = await flight.steering.awaitFollowUp(idleMs);
           if (outcome.kind === "ended" && (outcome.reason === "idle" || outcome.reason === "stopped")) {
-            // A sticky stop (or an immediate idle) returns at once: pay the backoff so the resend is bounded.
-            try { await this.waitRecoveryRetry(flight, false, this.recoveryRetryMs); } catch (error) { keep(); throw error; }
+            // The wait ended idle or stopped again: pay the backoff so the resend is bounded (a sticky
+            // stop returns at once).
+            await this.waitRecoveryRetry(flight, false, this.recoveryRetryMs);
           }
           break;
         }
         case "unconfirmed":
           ambiguous = true;
-          try { await this.waitRecoveryRetry(flight, false, this.recoveryRetryMs); } catch (error) { keep(); throw error; }
+          await this.waitRecoveryRetry(flight, false, this.recoveryRetryMs);
           break;
       }
     }

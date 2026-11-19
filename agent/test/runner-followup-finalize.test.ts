@@ -16,7 +16,9 @@ import { randomUUID } from "node:crypto";
 import type { Executor, FollowUpOutcome, RunContext } from "../src/executor.js";
 import { FOLLOWUP_FINALIZE_ADMISSION_FEATURE } from "../src/client.js";
 import { Outbox } from "../src/outbox.js";
-import { REASON_FOLLOWUP_NOT_PARKED, RunRunner } from "../src/runner.js";
+import { REASON_FOLLOWUP_NOT_PARKED, RunRunner, StaleClaimError } from "../src/runner.js";
+import { ActiveRunRegistry } from "../src/active-run-registry.js";
+import { CredentialSwitchSignal, PauseNowSignal } from "../src/steering.js";
 import type { ClaimResponse, StateRequest } from "../src/protocol.js";
 import { api, client, fakeGitlab, fx, git, installHarness } from "./runner-harness.js";
 import { makeClaim, nullLogger } from "./helpers.js";
@@ -181,16 +183,45 @@ function parkingExecutor(log: { outcomes: FollowUpOutcome[] }, idleMs = 40): Exe
   };
 }
 
-function build(executor: Executor, outbox: Outbox | undefined, gitlab = fakeGitlab().gitlab): RunRunner {
+function build(executor: Executor, outbox: Outbox | undefined, gitlab = fakeGitlab().gitlab, extra: Record<string, unknown> = {}): RunRunner {
   const r = new RunRunner(client, git, () => ({ executor }), nullLogger(), 20, undefined, {
     pollMs: 5, planApprovalTimeoutMs: 0, prDescriptionHeadLagMs: 0, recoveryRetryMs: 5,
     checkpointTestHooks: { retryBackoffMs: [0, 0] }, gitlab,
-    ...(outbox ? { outbox } : {}),
+    ...(outbox ? { outbox } : {}), ...extra,
   });
   const seams = r as unknown as { forgeRetrySleep: (ms: number) => Promise<void>; publicationRetry: unknown };
   seams.forgeRetrySleep = async () => {};
   seams.publicationRetry = { retryDelaysMs: [0, 0, 0], sleep: async () => {} };
   return r;
+}
+
+/** The flight the runner hands the admission loop, so a test can reach its steering and flags. */
+interface Captured { flight?: { steering: { abortLifecycle(reason?: unknown, terminal?: boolean): void; approveRefusedBySwitchPending(): boolean }; preserveRecoveryClone?: boolean; preserveSession?: boolean; stoppedSourceKept?: boolean; followUpPendingRearms?: number } }
+function captureFlight(r: RunRunner, onEnter?: (flight: NonNullable<Captured["flight"]>) => void): Captured {
+  const cap: Captured = {};
+  const seam = r as unknown as { admitFollowUpFinalize: (flight: NonNullable<Captured["flight"]>, ...rest: unknown[]) => Promise<unknown> };
+  const real = seam.admitFollowUpFinalize.bind(r);
+  seam.admitFollowUpFinalize = (flight, ...rest) => { cap.flight = flight; onEnter?.(flight); return real(flight, ...rest); };
+  return cap;
+}
+
+/** Counts the followup_finalize reports the runner hands the client, whether or not a request follows. */
+function spyFinalizeSends(): { count: number } {
+  const seen = { count: 0 };
+  const real = client.reportState.bind(client);
+  client.reportState = (async (...a: Parameters<typeof real>) => {
+    if (a[1].status === "followup_finalize") seen.count++;
+    return real(...a);
+  }) as typeof client.reportState;
+  return seen;
+}
+
+/** Records every snapshot phase change into the model's event list. */
+function trackPhases(m: Model): ActiveRunRegistry {
+  const registry = new ActiveRunRegistry();
+  const real = registry.setPhase.bind(registry);
+  registry.setPhase = (runId, phase) => { m.events.push(`phase:${phase}`); real(runId, phase); };
+  return registry;
 }
 
 const states = (runId: string) => api.states.filter(s => s.runId === runId).map(s => s.body);
@@ -374,12 +405,16 @@ describe("interactive follow-up finalize admission (issue #4479)", () => {
       script: [{ kind: "refuse", reason: "followup_pending", apply: false }, { kind: "admitted" }],
       onFinalize: index => { if (index === 0) api.setInputs(claim.run_id, [{ id: 11, kind: "follow_up", body: "one more thing" }]); },
     });
-    await finish(build(parkingExecutor(log), outbox), claim);
+    // A wide idle window: the re-armed wait must not idle out before the poll loop delivers the follow-up.
+    const r = build(parkingExecutor(log, 600), outbox);
+    const cap = captureFlight(r);
+    await finish(r, claim, 20_000);
 
     assert.deepEqual(log.outcomes, [{ kind: "followup", id: 11, body: "one more thing" }, { kind: "ended", reason: "idle" }]);
     assert.deepEqual(finalizeBodies(claim.run_id).map(b => b.followup_park_seq), [1, 2], "each park binds its own sequence");
     assert.equal(statuses(claim.run_id).at(-1), "completed");
     assert.equal(m.parkSeq, 2);
+    assert.equal(cap.flight?.followUpPendingRearms, 1, "the followup_pending re-arm is counted");
   });
 
   it("followup_pending after a stop is a protocol fault: the run fails and the stop is never re-armed", async () => {
@@ -420,6 +455,7 @@ describe("interactive follow-up finalize admission (issue #4479)", () => {
     await finish(build(parkingExecutor(log), outbox), claim);
 
     assert.equal(m.finalizeRequests, 1);
+    assert.deepEqual(log.outcomes, [], "the reportState closure threw StaleClaimError: the outcome never reached the executor");
     assert.ok(!statuses(claim.run_id).includes("completed") && !statuses(claim.run_id).includes("failed"));
     assert.equal(api.publicationIntentRequests.length, 0);
   });
@@ -428,8 +464,10 @@ describe("interactive follow-up finalize admission (issue #4479)", () => {
     observed.length = 0;
     const { claim, m, outbox, log } = await idleSetup();
     client.protocolFeatures = BASE_FEATURES;
+    const sends = spyFinalizeSends();
     await observeThenCancel(build(parkingExecutor(log), outbox), claim, 250);
 
+    assert.equal(sends.count, 0, "the runner never even hands the client a followup_finalize report");
     assert.equal(m.finalizeRequests, 0);
     assert.equal(finalizeBodies(claim.run_id).length, 0);
   });
@@ -531,5 +569,191 @@ describe("interactive follow-up finalize admission (issue #4479)", () => {
     assert.equal(m.finalizeRequests, 1);
     assert.equal(states(claim.run_id).filter(b => b.status === "recovery_wait").length, 1);
     assert.ok(!statuses(claim.run_id).includes("completed"));
+  });
+
+  it("after a definite refusal a withdrawn feature returns the outcome and stops sending (no spin)", async () => {
+    observed.length = 0;
+    const { claim, m, outbox, log } = await idleSetup({
+      script: [{ kind: "refuse", reason: "followup_pending", apply: false }],
+      onFinalize: () => { client.protocolFeatures = BASE_FEATURES; },
+    });
+    const sends = spyFinalizeSends();
+    await observeThenCancel(build(parkingExecutor(log), outbox), claim, 400);
+
+    assert.equal(sends.count, 1, "no further report is handed to the client once the feature is gone");
+    assert.equal(m.finalizeRequests, 1);
+    assert.deepEqual(log.outcomes[0], { kind: "ended", reason: "idle" }, "the outcome reached the executor as it would today");
+  });
+
+  it("a credential-switch signal thrown before the send is not an ambiguous send: it propagates and the re-park finalizes", async () => {
+    const { claim, m, outbox } = await idleSetup();
+    const caught: unknown[] = [];
+    const executor: Executor = {
+      async run(ctx: RunContext) {
+        await ctx.checkpoint?.({ reap: true });
+        for (;;) {
+          try { await ctx.awaitFollowUp!(40); break; } catch (error) { caught.push(error); }
+        }
+        commitWork(ctx, "after switch");
+        return { branch: ctx.branch };
+      },
+    };
+    let armed = true;
+    const r = build(executor, outbox);
+    captureFlight(r, flight => {
+      flight.steering.approveRefusedBySwitchPending = () => { const now = armed; armed = false; return now; };
+    });
+    await finish(r, claim);
+
+    assert.equal(caught.length, 1);
+    assert.ok(caught[0] instanceof CredentialSwitchSignal, "surfaced to the executor, not swallowed as unconfirmed");
+    assert.equal(m.finalizeRequests, 1, "only the re-park's send reached the wire");
+    assert.equal(finalizeBodies(claim.run_id)[0]!.followup_park_seq, 2);
+    assert.equal(statuses(claim.run_id).at(-1), "completed");
+  });
+
+  it("the snapshot phase and the hold stay at awaiting_followup until an admitted ACK, never after an unconfirmed one", async () => {
+    const { claim, m, outbox, log } = await idleSetup({
+      script: [{ kind: "raw", status: 200, body: {}, apply: false }, { kind: "raw", status: 200, body: {}, apply: false }, { kind: "admitted" }],
+    });
+    await finish(build(parkingExecutor(log), outbox, undefined, { activeRuns: trackPhases(m) }), claim);
+
+    const parked = m.events.lastIndexOf("phase:awaiting_followup");
+    const admitted = m.events.indexOf("finalize:admitted");
+    assert.ok(parked >= 0 && admitted > parked, m.events.join(","));
+    const between = m.events.slice(parked + 1, admitted);
+    assert.ok(between.includes("finalize:raw"), "unconfirmed replies came first");
+    assert.ok(!between.includes("phase:running"), `running only after the admitted ACK: ${m.events.join(",")}`);
+    assert.ok(m.events.indexOf("phase:running", admitted) > admitted, "and then it does move to running");
+  });
+
+  it("an outbox without the publication_resume_v1 feature sends no followup_finalize and behaves as today", async () => {
+    const { claim, m, outbox, log } = await idleSetup();
+    client.protocolFeatures = [FOLLOWUP_FINALIZE_ADMISSION_FEATURE, "recovery_park_cause"];
+    const sends = spyFinalizeSends();
+    await finish(build(parkingExecutor(log), outbox), claim);
+
+    assert.equal(sends.count, 0);
+    assert.equal(m.finalizeRequests, 0);
+    assert.equal(statuses(claim.run_id).at(-1), "completed");
+  });
+
+  it("a cancel seen when the admitted ACK returns yields the cancelled outcome and publishes nothing", async () => {
+    let release!: () => void;
+    const hold = new Promise<void>(resolve => { release = resolve; });
+    const { claim, outbox, log } = await idleSetup({
+      onFinalize: index => {
+        if (index !== 0) return;
+        api.setInputs(claim.run_id, [{ id: 8, kind: "cancel", body: null }]);
+        setTimeout(release, 200);
+      },
+    });
+    api.afterPersistState(claim.run_id, b => b.status === "followup_finalize", hold);
+    await finish(build(parkingExecutor(log), outbox), claim);
+
+    assert.deepEqual(log.outcomes.at(-1), { kind: "ended", reason: "cancelled" });
+    assert.equal(api.publicationIntentRequests.length, 0);
+    assert.ok(!statuses(claim.run_id).includes("completed"));
+  });
+
+  it("cancel_pending on a sticky stop resends at the recovery backoff, not in a tight loop", async () => {
+    observed.length = 0;
+    const { claim, m, outbox, log } = await idleSetup({
+      script: [{ kind: "refuse", reason: "cancel_pending", apply: false }],
+      onPark: () => api.setInputs(claim.run_id, [{ id: 7, kind: "stop", body: null }]),
+    });
+    await observeThenCancel(build(parkingExecutor(log, 60_000), outbox), claim, 400);
+
+    assert.ok(m.finalizeRequests >= 3, `it keeps resending: ${m.finalizeRequests}`);
+    assert.ok(m.finalizeRequests <= 90, `bounded by the 5 ms backoff within a 400 ms window: ${m.finalizeRequests}`);
+  });
+
+  describe("interrupts after an unknown send", () => {
+    const lostFirst = { script: [{ kind: "lost" }] satisfies Reply[] };
+    const flags = (f: Captured["flight"]) => [f?.preserveRecoveryClone, f?.preserveSession, f?.stoppedSourceKept];
+
+    it("a credential-switch lifecycle abort does not re-run the park and counts as unconfirmed", async () => {
+      observed.length = 0;
+      let cap!: Captured;
+      const { claim, m, outbox, log } = await idleSetup({
+        ...lostFirst, onFinalize: index => { if (index === 0) cap.flight!.steering.abortLifecycle(new CredentialSwitchSignal(), false); },
+      });
+      const r = build(parkingExecutor(log), outbox);
+      cap = captureFlight(r);
+      await observeThenCancel(r, claim, 400);
+
+      assert.equal(m.parkSeq, 1, "the park was not re-run");
+      assert.ok(m.finalizeRequests > ATTEMPTS, "it keeps resending");
+      assert.ok(!observed[0]!.statuses.includes("failed"), "the flight neither failed nor threw the switch");
+    });
+
+    it("a claim fence stops with StaleClaimError and keeps the custody flags", async () => {
+      let cap!: Captured;
+      const { claim, outbox, log } = await idleSetup({
+        ...lostFirst, onFinalize: index => { if (index === 0) (cap.flight!.steering as unknown as { fence: string }).fence = "stale"; },
+      });
+      const r = build(parkingExecutor(log), outbox);
+      cap = captureFlight(r);
+      await finish(r, claim);
+
+      assert.deepEqual(flags(cap.flight), [true, true, true]);
+      assert.deepEqual(log.outcomes, []);
+      assert.ok(!statuses(claim.run_id).includes("completed"));
+      assert.ok(new StaleClaimError() instanceof Error);
+    });
+
+    it("a shutdown throws and keeps the custody flags", async () => {
+      let cap!: Captured;
+      const { claim, outbox, log } = await idleSetup({
+        ...lostFirst, onFinalize: index => { if (index === 0) (r as unknown as { shuttingDownGlobal: boolean }).shuttingDownGlobal = true; },
+      });
+      const r = build(parkingExecutor(log), outbox);
+      cap = captureFlight(r);
+      await finish(r, claim);
+
+      assert.deepEqual(flags(cap.flight), [true, true, true]);
+      assert.deepEqual(log.outcomes, []);
+      assert.ok(!statuses(claim.run_id).includes("completed"));
+    });
+
+    it("a lifecycle abort throws and keeps the custody flags", async () => {
+      let cap!: Captured;
+      const { claim, outbox, log } = await idleSetup({
+        ...lostFirst, onFinalize: index => { if (index === 0) cap.flight!.steering.abortLifecycle(new PauseNowSignal(), false); },
+      });
+      const r = build(parkingExecutor(log), outbox);
+      cap = captureFlight(r);
+      await finish(r, claim);
+
+      assert.deepEqual(flags(cap.flight), [true, true, true]);
+      assert.deepEqual(log.outcomes, []);
+      assert.ok(!statuses(claim.run_id).includes("completed"));
+    });
+  });
+
+  it("a definitive non-generic 4xx (run not owned) keeps the custody flags and stops the flight", async () => {
+    const { claim, m, outbox, log } = await idleSetup({ script: [{ kind: "raw", status: 404, body: { error: "run not found for this worker" } }] });
+    const r = build(parkingExecutor(log), outbox);
+    const cap = captureFlight(r);
+    await finish(r, claim);
+
+    assert.equal(m.finalizeRequests, 1, "not retried");
+    assert.deepEqual([cap.flight?.preserveRecoveryClone, cap.flight?.preserveSession, cap.flight?.stoppedSourceKept], [true, true, true]);
+    assert.deepEqual(log.outcomes, []);
+    assert.ok(!statuses(claim.run_id).includes("completed") && !statuses(claim.run_id).includes("failed"));
+  });
+
+  it("a malformed 409 is unconfirmed at the runner level: it resends until a reply confirms", async () => {
+    const { claim, m, outbox, log } = await idleSetup({
+      script: [
+        { kind: "raw", status: 409, body: { applied: false }, apply: false },
+        { kind: "raw", status: 409, body: { applied: false, reason: "something_else" }, apply: false },
+        { kind: "admitted" },
+      ],
+    });
+    await finish(build(parkingExecutor(log), outbox), claim);
+
+    assert.equal(m.finalizeRequests, 3);
+    assert.equal(statuses(claim.run_id).at(-1), "completed");
   });
 });
