@@ -8,6 +8,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -163,6 +164,58 @@ func TestCodexProvenanceHoldNudgeSuppression(t *testing.T) {
 				t.Fatalf("nudge = %v (notifiedAt=%v), want %v", b.healthNudges, w.HealthNotifiedAt, tc.wantNudge)
 			}
 		})
+	}
+}
+
+// A named held row that was quieted by another transition (leaving maintenance or an expired Codex
+// admission wait) is never nudged afterwards: no stale-requeue or owner-hold window covered the
+// episode, so there is no post-window nudge owed.
+func TestCodexProvenanceHeldQuietTransitionsNeverLateNudge(t *testing.T) {
+	cases := []struct {
+		name  string
+		prior string
+	}{
+		{"leaving maintenance", reasonMaintenance},
+		{"leaving an expired rate limit admission", apitypes.CodexAdmissionReason("rate_limit", t0.Add(-time.Hour))},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := heldCodexRun("A")
+			r.Health = healthWaitingWorker
+			r.HealthReason = pgtype.Text{String: tc.prior, Valid: true}
+			r.HealthSince = ago(time.Hour)
+			fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}}
+			svc, b := pinSvc(fs, defaultHealthSettings())
+			svc.detectRunHealth(context.Background(), t0)
+			w := lastWrite(t, fs, r.ID)
+			if w.HealthReason.String != wantHeldA || w.HealthNotifiedAt.Valid || len(b.healthNudges) != 1 || b.healthNudges[0] {
+				t.Fatalf("tick 1: reason=%q nudges=%v notified=%v, want the held reason without a nudge", w.HealthReason.String, b.healthNudges, w.HealthNotifiedAt)
+			}
+
+			r.HealthReason, r.HealthSince, r.HealthNotifiedAt = w.HealthReason, w.HealthSince, w.HealthNotifiedAt
+			fs2 := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}}
+			svc2, b2 := pinSvc(fs2, defaultHealthSettings())
+			svc2.detectRunHealth(context.Background(), t0.Add(30*time.Second))
+			if len(fs2.writes) != 0 || len(b2.healthNudges) != 0 {
+				t.Fatalf("tick 2: writes=%d nudges=%v, want neither", len(fs2.writes), b2.healthNudges)
+			}
+		})
+	}
+}
+
+// Entering the unavailable-provenance hold from a non-ok state nudges (the cooldown permitting).
+func TestCodexProvenanceUnavailableNudgesOnEntryFromNonOK(t *testing.T) {
+	r := heldCodexRun("")
+	r.Health = healthStalled
+	r.HealthReason = pgtype.Text{String: reasonOutcomeUndelivered, Valid: true}
+	r.HealthSince = ago(2 * time.Hour)
+	r.HealthNotifiedAt = ago(time.Hour)
+	fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}}
+	svc, b := pinSvc(fs, defaultHealthSettings())
+	svc.detectRunHealth(context.Background(), t0)
+	w := lastWrite(t, fs, r.ID)
+	if w.HealthReason.String != wantHeldUnavailble || !w.HealthNotifiedAt.Valid || len(b.healthNudges) != 1 || !b.healthNudges[0] {
+		t.Fatalf("reason=%q nudges=%v notified=%v, want one nudge on entry", w.HealthReason.String, b.healthNudges, w.HealthNotifiedAt)
 	}
 }
 

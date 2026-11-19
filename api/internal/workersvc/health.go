@@ -548,11 +548,12 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		// Issue #4476: a provenance hold that began inside a quiet window (see quietCodexHold below)
 		// keeps the same reason text after the window ends, so the unchanged-reason skip would never
 		// nudge it. Once the window has passed and this episode was never nudged, re-evaluate it.
-		// Only the named reason can start quiet (the unavailable one nudges at entry), and the
+		// Only the named reason can start quiet (the unavailable one nudges on entry), only an
+		// episode a window actually quieted qualifies (quietWindowCoveredEpisode), and the
 		// cooldown gates it here too, so a cooled-down run is not rewritten every tick.
 		quietHoldEnded := r.Health == target && textEq(r.HealthReason, reason) &&
 			isCodexProvenanceHoldReason(reason) && reason != codexProvenanceUnavailableText &&
-			!s.quietCodexHold(now, r, reason) &&
+			!s.quietCodexHold(now, r, reason) && s.quietWindowCoveredEpisode(r) &&
 			r.HealthSince.Valid && (!r.HealthNotifiedAt.Valid || r.HealthNotifiedAt.Time.Before(r.HealthSince.Time)) &&
 			(cooldown == 0 || !r.HealthNotifiedAt.Valid || now.Sub(r.HealthNotifiedAt.Time) >= cooldown)
 		if r.Health == target && textEq(r.HealthReason, reason) && !quietHoldEnded &&
@@ -599,7 +600,10 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		// Issue #4257: publication_withheld never nudges itself, so a run leaving it into a real fault
 		// (stalled, looping, ...) is a new episode no earlier DM described: nudge-eligible, cooldown applies.
 		leftWithheld := r.Health == healthPublicationWithheld && target != healthPublicationWithheld && target != healthOK
-		nudge := target != healthOK && (r.Health == healthOK || leftPin || leftWithheld || enteredRunBound || quietHoldEnded || (leftAccountCooldown && independentFault)) &&
+		// Issue #4476: the unavailable-provenance hold never resolves on its own, so entering it from
+		// any other state nudges (cooldown applies), like entry into the per-run custody bound.
+		enteredProvenanceUnavailable := reason == codexProvenanceUnavailableText && !textEq(r.HealthReason, reason)
+		nudge := target != healthOK && (r.Health == healthOK || leftPin || leftWithheld || enteredRunBound || enteredProvenanceUnavailable || quietHoldEnded || (leftAccountCooldown && independentFault)) &&
 			(cooldown == 0 || !r.HealthNotifiedAt.Valid || now.Sub(r.HealthNotifiedAt.Time) >= cooldown)
 		// PRD #1349 M6 (D10): SUPPRESS the per-run Slack nudge for the custody-limit reason. The
 		// owner-level custody-episode reconciler (slacksvc) coalesces this crossing into ONE owner
@@ -2398,6 +2402,28 @@ func (s *Service) quietCodexHold(now time.Time, r store.ListActiveRunsForHealthR
 	_, pinned := s.staleRequeuePin(now, r)
 	_, ownerHeld := s.ownerHold(now, r)
 	return pinned || ownerHeld
+}
+
+// quietWindowCoveredEpisode reports whether the stale-requeue or owner-hold window was still open
+// when the current health episode began (its end instant is after health_since). It mirrors
+// staleRequeuePin and ownerHold without their now check, so only an episode a window actually
+// quieted can owe the one post-window nudge.
+func (s *Service) quietWindowCoveredEpisode(r store.ListActiveRunsForHealthRow) bool {
+	if !r.HealthSince.Valid || !r.UpdatedAt.Valid {
+		return false
+	}
+	ceilingEnd := r.UpdatedAt.Time.Add(s.p.WorkerAffinityCeiling)
+	if r.OwnerHoldPinnable && ceilingEnd.After(r.HealthSince.Time) {
+		return true
+	}
+	if s.p.WorkerStaleRequeueGrace > 0 && r.StaleRequeuePinnable && r.StatusSince.Valid {
+		end := r.StatusSince.Time.Add(s.p.WorkerStaleRequeueGrace)
+		if ceilingEnd.Before(end) {
+			end = ceilingEnd
+		}
+		return end.After(r.HealthSince.Time)
+	}
+	return false
 }
 
 // isCodexProvenanceHoldReason matches both texts codexProvenanceHoldReason produces.
