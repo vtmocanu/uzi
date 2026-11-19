@@ -33,12 +33,10 @@ describe("codex U broker policy (real broker / screener / fileop)", () => {
   it(CODEX_U_NATIVE_DISPATCH_TITLE, async () => {
     const h = makeUBroker(mods, { grants: leadGrants() });
 
-    // Every NATIVE execution name the shipped Codex could expose. None is a recognized worker
-    // capability, so each denies `unknown_tool` BEFORE any grant/effect (a dynamic worker name is
-    // `uzi_*`/a recognized callback — deliberately distinct, so an allowed callback is never a
-    // native one). `write_stdin` is the retained-terminal probe; `apply_patch` bare is the native
-    // freeform surface (config `apply_patch_freeform=false`) — the worker file-write is the
-    // DISTINCT `uzi_apply_patch`/canonical apply_patch, not this raw native name via the broker.
+    // These representative native execution names are not recognized worker capabilities and
+    // deny unknown_tool before effects. Bare native apply_patch is a separate runtime surface;
+    // apply_patch_freeform=false is ignored at pin 0.167.0, not a runtime suppression control.
+    // Worker patch authority uses the recognized callback/broker path. See native-patch-inert.test.ts.
     const nativeNames = ["shell", "shell_command", "exec_command", "unified_exec", "write_stdin", "local_shell", "container.exec", "exec", "code_interpreter"];
     for (const name of nativeNames) {
       const r = await h.broker.handleToolCall(rt(), name, { command: ["/bin/sh", "-c", "touch /tmp/native"] }, "root");

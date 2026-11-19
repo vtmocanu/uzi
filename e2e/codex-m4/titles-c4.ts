@@ -32,6 +32,6 @@ export const CODEX_U_ADVICE_APIKEY_NO_FALLBACK_TITLE =
 
 // ── Failure closure — real config builders + real broker/handler ──
 export const CODEX_U_FAILURE_HOOKS_DISABLED_TITLE =
-  "codex U failure closure: the production + loopback config builders disable hooks and every native execution feature (no hooks=true, no bypass-hook-trust), so an upstream hook failure can never become production permission";
+  "codex U failure closure: the production + loopback config builders disable hooks and pin fixed feature settings (no hooks=true, no bypass-hook-trust), so an upstream hook failure can never become production permission";
 export const CODEX_U_FAILURE_BROKER_CLOSURE_TITLE =
   "codex U failure closure: a throwing/unwired worker tool handler and a rejecting command spawn fail closed (handler_error/denied_tool/broker_error) with no fabricated success, while a well-behaved handler still succeeds";
