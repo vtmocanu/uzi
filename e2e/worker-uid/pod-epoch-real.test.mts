@@ -1087,7 +1087,7 @@ function asCommandRoot(argv: string[]) {
 const ACL_ENTRY = "u:10002:rwx";
 const listAcl = (target: string) => asWorker(["/usr/bin/getfacl", "--absolute-names", "--physical", "--skip-base", "--numeric", "--", target]);
 
-test("pod epoch real managed bare: a setgid 2775 bare is admitted under the real runner-group probe and getfacl, runner uids cannot write or set ACLs, and an ACL or a wrong group refuses the proof", { timeout: 600000 }, async () => {
+test("pod epoch real managed bare: a setgid 2775 bare is admitted under the real runner-group probe and getfacl, runner uids cannot write or set ACLs, and an ACL or a wrong group refuses the proof", { timeout: 200000 }, async () => {
   const f = fixture();
   const bases: string[] = [];
   let primary: unknown;
@@ -1124,7 +1124,8 @@ test("pod epoch real managed bare: a setgid 2775 bare is admitted under the real
     assert.equal(listAcl(admitted.bare).stdout, "", "the admitted bare carries no extended ACL");
     for (const [label, run] of [["runner", asRunner], ["runner-cmd", asCommandRoot]] as const) {
       for (const script of [`mkdir ${admitted.bare}/objects/zz`, `: > ${admitted.bare}/objects/zz-file`]) {
-        const r = run(["/bin/sh", "-c", script]);
+        const r = run(["/bin/sh", "-c", `id -u; ${script}`]);
+        assert.equal(r.stdout.trim(), String(label === "runner" ? RUNNER_ID : CMD_ID), `${label}: the identity the operation ran as`);
         assert.notEqual(r.status, 0, `${label}: ${script} must fail: ${r.stdout}${r.stderr}`);
         assert.match(r.stderr, /Permission denied/, `${label}: ${script}: ${r.stderr}`);
       }
@@ -1156,7 +1157,8 @@ test("pod epoch real managed bare: a setgid 2775 bare is admitted under the real
     // d. The runner identities cannot set an ACL; the owner can, which also proves the tooling and the filesystem work.
     const target = await make();
     for (const [label, run] of [["runner", asRunner], ["runner-cmd", asCommandRoot]] as const) {
-      const r = run(["/usr/bin/setfacl", "-m", ACL_ENTRY, target.bare]);
+      const r = run(["/bin/sh", "-c", `id -u; /usr/bin/setfacl -m ${ACL_ENTRY} ${target.bare}`]);
+      assert.equal(r.stdout.trim(), String(label === "runner" ? RUNNER_ID : CMD_ID), `${label}: the identity the operation ran as`);
       assert.notEqual(r.status, 0, `${label} setfacl must fail: ${r.stdout}${r.stderr}`);
       assert.match(r.stderr, /Operation not permitted/, `${label}: ${r.stderr}`);
     }
@@ -1166,7 +1168,7 @@ test("pod epoch real managed bare: a setgid 2775 bare is admitted under the real
     assert.match(listAcl(target.bare).stdout, /user:10002:rwx/, "control: the ACL is observable");
 
     // e. A bare of the wrong group at 2775 is refused: the runner group and the codex-session group.
-    for (const gid of [RUNNER_ID, CODEX_SESSION]) {
+    for (const gid of [RUNNER_ID, CMD_ID, CODEX_SESSION]) {
       const wrong = await make();
       own(wrong.bare, WORKER_ID, gid, 0o2775);
       assert.equal(fs.statSync(wrong.bare).mode & 0o7777, 0o2775);
