@@ -873,8 +873,8 @@ func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) (Fir
 			// candidate would be refused the same way: a fire that has started nothing returns
 			// the error (advance's transient arm: not advanced, retried next tick, the
 			// skipReasonForErr map deliberately unchanged). One that already started runs this
-			// fire records a fetch_failed skip for this candidate and stops, so it advances, as
-			// the credential-disabled and stored-override arms above do: holding it would re-fire
+			// fire records a fetch_failed skip for this candidate and stops, so it advances; the
+			// credential-disabled and stored-override arms above also stop and advance. Holding it would re-fire
 			// the whole sweep and could start up to max_issues more on top of this fire's runs.
 			if len(out.Started) == 0 {
 				return FireOutcome{}, err

@@ -357,6 +357,12 @@ func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 			s.recordJudgeSkip(ctx, run.ID, judgeHarness, reason)
 			return
 		}
+		if errors.Is(err, ErrTerminalConsumerGateBusy) {
+			// Issue #4488: the repository's consumer gate stayed busy for the whole bounded wait.
+			// Nothing was created and this fire-once hook does not retry (ADR-4007 T3 residual limit).
+			slog.Warn("judge enqueue: terminal consumer gate busy, no judge created", "run", run.ID, "error", err)
+			return
+		}
 		slog.Warn("judge enqueue: create judge run", "run", run.ID, "error", err)
 		return
 	}
@@ -414,6 +420,11 @@ func (s *Service) maybeEnqueueTaskReview(ctx context.Context, run store.Run) {
 			// visible reason is not accepted.
 			slog.Debug("task review enqueue: inherited harness has no usable credential, skipping review",
 				"run", run.ID, "harness", run.Harness)
+			return
+		}
+		if errors.Is(err, ErrTerminalConsumerGateBusy) {
+			// Issue #4488: see maybeEnqueueJudge; the fire-once hook does not retry.
+			slog.Warn("task review enqueue: terminal consumer gate busy, no review created", "run", run.ID, "error", err)
 			return
 		}
 		slog.Warn("task review enqueue: create review run", "run", run.ID, "error", err)
@@ -497,6 +508,11 @@ func (s *Service) maybeEnqueueThenFix(ctx context.Context, reviewRun store.Run) 
 			// visible reason is not accepted.
 			slog.Debug("then-fix enqueue: inherited harness has no usable credential, skipping fix",
 				"review_run", reviewRun.ID, "target", original.ID, "harness", original.Harness)
+			return
+		}
+		if errors.Is(err, ErrTerminalConsumerGateBusy) {
+			// Issue #4488: see maybeEnqueueJudge; the fire-once hook does not retry.
+			slog.Warn("then-fix enqueue: terminal consumer gate busy, no fix created", "review_run", reviewRun.ID, "target", original.ID, "error", err)
 			return
 		}
 		slog.Warn("then-fix enqueue: create fix run", "review_run", reviewRun.ID, "target", original.ID, "error", err)

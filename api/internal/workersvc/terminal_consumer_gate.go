@@ -95,7 +95,7 @@ func (s *Service) insertGatedNoBeginner(ctx context.Context, q *store.Queries, r
 // transaction; a tx-bound one (the claim-locked facade, whose states return before the MR
 // reconcile) fails closed with store.ErrTerminalConsumerGateNestedTx.
 func (s *Service) reconcileRunMRGated(ctx context.Context, repo pgtype.UUID, arg store.ReconcileRunMRParams) error {
-	ctx = context.WithoutCancel(ctx)
+	ctx = context.WithoutCancel(ctx) // also detached by the caller (setStateWithTx postCtx); no deadline
 	var tx pgx.Tx
 	var err error
 	switch q, isQueries := s.q.(*store.Queries); {
@@ -117,8 +117,16 @@ func (s *Service) reconcileRunMRGated(ctx context.Context, repo pgtype.UUID, arg
 	if err := s.takeConsumerGate(ctx, tx, repo.Bytes); err != nil {
 		return err
 	}
-	if _, err := store.New(tx).ReconcileRunMR(ctx, arg); err != nil {
+	qtx := store.New(tx)
+	// After the gate: the run must still be in the repository whose gate was taken.
+	if err := requireGateTargetRepo(ctx, qtx, arg.ID, repo); err != nil {
 		return err
+	}
+	if _, err := qtx.ReconcileRunMR(ctx, arg); err != nil {
+		return err
+	}
+	if s.reconcileBeforeCommitHook != nil {
+		s.reconcileBeforeCommitHook(arg.ID)
 	}
 	return tx.Commit(ctx)
 }
