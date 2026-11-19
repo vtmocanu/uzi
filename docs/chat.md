@@ -43,6 +43,12 @@ a meter against what you expected to spend.
   **steer** card with an editable text box prefilled with its proposed
   instruction. Nothing happens on the run until *you* click — Start / Cancel
   run / Send — and any model text on the card renders inert, never Markdown.
+  The Start card also shows a read-only line, "If started now: …", naming the
+  harness, model, effort and token a one-click start would use, each with its
+  source, plus a **Run defaults** link to
+  [Settings → Run defaults](./board.md#starting-a-run-with-options). It is a
+  prediction only: the Start request is unchanged (the repository and the
+  issue), and the line never blocks the button.
   Steering only applies to issue runs; ask it to steer a chat and it tells
   you so, since a chat's own follow-ups go through the conversation itself.
 

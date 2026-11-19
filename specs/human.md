@@ -828,6 +828,7 @@ ADR at `adr/0035-run-limit-retry.md`.
   does not exist, and a toggle also reaches autopilot, `ci_fix` and `self_improve`
   runs, which have no start affordance at all]
 - An optional Run options dialog beside one-click Start run (the **Options** button on a board card and on the issue page) carries the harness, Anthropic token, model and reasoning effort for one run; settings left on Default resolve as today, and Start run without opening it sends today's request body. It does not carry wait-on-limit or MR rework. [PRD #3250, user decision P1] (AI-synced 2026-11-14)
+- A read-only "If started now" preview on the board card, issue page, Run options dialog and chat start card shows the server-predicted harness, model, effort and token with their sources, from a shared per-user, per-refresh cache; it never gates Start. [#3261] (AI-synced 2026-11-19)
 - `RUN_LIMIT_MAX_WAITS` stays at its default of 5 — a retry budget, not a
   credential-count budget; a large-pool operator raises it via env. [user 2026-07-27]
 - When a run parked on a usage limit resumes, the owner gets a Slack message in the run's thread. [user 2026-09-05, PRD #1116]
