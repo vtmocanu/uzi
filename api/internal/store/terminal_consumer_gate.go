@@ -116,6 +116,11 @@ func (q *Queries) LockTerminalConsumerGateShared(ctx context.Context, repoID uui
 		return err
 	}
 	if _, err := q.db.Exec(ctx, "SELECT set_config('lock_timeout', $1, true)", prevTimeout); err != nil {
+		if ctx.Err() != nil {
+			// The context ended after the grant: the transaction cannot continue, nothing was
+			// created, and the caller may retry, like a cancellation during the wait.
+			return errors.Join(ErrTerminalConsumerGateBusy, err)
+		}
 		return fmt.Errorf("terminal consumer gate: restore lock_timeout: %w", err)
 	}
 	return nil

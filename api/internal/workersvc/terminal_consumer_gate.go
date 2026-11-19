@@ -47,8 +47,12 @@ func (s *Service) takeConsumerGate(ctx context.Context, tx pgx.Tx, repo uuid.UUI
 		if ctx.Err() != nil {
 			return errors.Join(ErrTerminalConsumerGateBusy, err)
 		}
-		// 25001: a statement already ran, so the isolation level was fixed by whoever began the
-		// transaction and cannot be forced to READ COMMITTED. Fail closed as the helper does.
+		// 25001: a statement already ran and the transaction is at another level, so it cannot be
+		// forced to READ COMMITTED. Fail closed as the helper does. This check does NOT prove the
+		// gate is first: on a READ COMMITTED transaction (or a savepoint) that already ran
+		// statements the SET succeeds silently. Gate-first holds because every caller passes a
+		// transaction it has just begun (createRunAtomic, insertGatedNoBeginner,
+		// reconcileRunMRGated).
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == sqlStateActiveSQLTransaction {
 			return errors.Join(store.ErrTerminalConsumerGateIsolation, err)
@@ -86,9 +90,10 @@ func (s *Service) insertGatedNoBeginner(ctx context.Context, q *store.Queries, r
 // reconcileRunMRGated runs ReconcileRunMR in a transaction of its own under the repository's shared
 // consumer gate (ADR-4007 T3): the write is status-agnostic and can give a nonterminal ci_fix the
 // mr_iid of another source, which is a consumer of that source. It runs detached from the request's
-// cancellation, as the rest of the post-commit report does. A repo-less run, a store that cannot
-// open a transaction (the in-memory unit fake) and a service with no transaction handle use the
-// plain write.
+// cancellation. A repo-less run and a store that is not *store.Queries (the in-memory unit fake)
+// use the plain write. With no transaction beginner a pool-bound *store.Queries opens its own
+// transaction; a tx-bound one (the claim-locked facade, whose states return before the MR
+// reconcile) fails closed with store.ErrTerminalConsumerGateNestedTx.
 func (s *Service) reconcileRunMRGated(ctx context.Context, repo pgtype.UUID, arg store.ReconcileRunMRParams) error {
 	ctx = context.WithoutCancel(ctx)
 	var tx pgx.Tx

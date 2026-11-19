@@ -79,7 +79,7 @@ func consumerRunsOf(t *testing.T, env codexTestEnv, userID, source uuid.UUID) in
 }
 
 // While a retirement holds the gate, creates that are not consumers of this repository's terminal
-// refs (a prompt run on the same repository, an issue run on another repository) complete and never
+// refs (a prompt run and a plain task on the same repository, an issue run on another repository) complete and never
 // queue on the gate.
 func TestTerminalConsumerGatePositiveControlsLiveDB(t *testing.T) {
 	f, svc := raceFixture(t, raceFamily{})
@@ -104,6 +104,23 @@ func TestTerminalConsumerGatePositiveControlsLiveDB(t *testing.T) {
 	if n := gateLocks(t, f, f.e.repoID, "ShareLock", false); n != 0 {
 		g.release()
 		t.Fatalf("a prompt run queued on the gate (%d waiters)", n)
+	}
+
+	// A plain task (no continued issue) matches no blocker predicate and takes no gate.
+	taskStart := time.Now()
+	if _, err := svc.CreateTaskRun(f.e.ctx, f.e.userID, f.e.repoID, "plain task", "", false, false, false, false, nil); err != nil {
+		g.release()
+		t.Fatalf("plain task run on the gated repository: %v", err)
+	}
+	// The retirement's idle bound (2s) ends the hold, so a gated create would succeed late: the
+	// elapsed time, not the error, is what shows the plain task did not queue on the gate.
+	if d := time.Since(taskStart); d > time.Second {
+		g.release()
+		t.Fatalf("plain task run took %v while the gate was held: it queued on the gate", d)
+	}
+	if n := gateLocks(t, f, f.e.repoID, "ShareLock", false); n != 0 {
+		g.release()
+		t.Fatalf("a plain task run queued on the gate (%d waiters)", n)
 	}
 
 	other := uuid.New()

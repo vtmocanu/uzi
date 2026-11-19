@@ -30,6 +30,7 @@ func terminalGateSites() []gateSite {
 		{"mr-rework start", func(w http.ResponseWriter, err error) { writeStartReworkError(w, uuid.New(), err) }},
 		{"ci-fix create", writeCIFixCreateError},
 		{"judge rerun", writeRerunJudgeError},
+		{"schedule run-now", func(w http.ResponseWriter, err error) { writeRunScheduleNowError(w, uuid.New(), err) }},
 	}
 }
 

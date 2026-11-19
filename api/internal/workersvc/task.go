@@ -202,9 +202,7 @@ func (s *Service) CreateTaskRun(ctx context.Context, userID, repoID uuid.UUID, i
 			// defaulting every other creation path applies (ci_fix/mr_rework/CreateRun).
 			WaitOnLimit: s.resolveWaitOnLimit(ctx, userID, nil),
 		})
-		// Gated on every task create, not only a continued-issue one: the gate is cheap and a
-		// plain task is never a consumer, so an unconditional key keeps the funnel uniform.
-	}, harnessCreationOrigin{ConsumerGateRepo: gateRepoOf(repoID)})
+	}, taskConsumerGateOrigin(continued.Valid, repoID))
 	if err != nil {
 		return store.Run{}, taskCreateError(err)
 	}
@@ -483,4 +481,14 @@ func taskCreateError(err error) error {
 		}
 	}
 	return err
+}
+
+// taskConsumerGateOrigin gates a task create only when it continues an issue: that run matches a
+// terminal source's same-issue check (continued_issue_iid), so it is a consumer (issue #4488,
+// ADR-4007 T3). A plain task matches no blocker predicate and takes no gate.
+func taskConsumerGateOrigin(continuesIssue bool, repoID uuid.UUID) harnessCreationOrigin {
+	if !continuesIssue {
+		return harnessCreationOrigin{}
+	}
+	return harnessCreationOrigin{ConsumerGateRepo: gateRepoOf(repoID)}
 }

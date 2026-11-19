@@ -869,12 +869,13 @@ func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) (Fir
 		if errors.Is(err, workersvc.ErrTerminalConsumerGateBusy) {
 			// Issue #4488: a terminal-ref retirement briefly holds this repository's consumer
 			// gate and nothing was created. Contention is retryable and must never become a
-			// consumed trigger, so it is not a fetch_failed skip (which would advance a one-time
-			// sweep to fired with no run started). The hold is repo-wide, so every remaining
+			// consumed trigger with no run started. The hold is repo-wide, so every remaining
 			// candidate would be refused the same way: a fire that has started nothing returns
 			// the error (advance's transient arm: not advanced, retried next tick, the
-			// skipReasonForErr map deliberately unchanged); one that already started runs this
-			// fire records the skip and stops, as the stored-override lookup failure above does.
+			// skipReasonForErr map deliberately unchanged). One that already started runs this
+			// fire records a fetch_failed skip for this candidate and stops, so it advances, as
+			// the credential-disabled and stored-override arms above do: holding it would re-fire
+			// the whole sweep and could start up to max_issues more on top of this fire's runs.
 			if len(out.Started) == 0 {
 				return FireOutcome{}, err
 			}
