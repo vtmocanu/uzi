@@ -1304,8 +1304,8 @@ are kept by cleanup.
   ineligible.
 
 `uzi run discard` does not remove refusal refs, records, incomplete markers or
-admissions; they stay reachable in the worker's bare (no worker-side run discard
-exists). In a mixed fleet an older worker may treat a bare holding
+admissions; they stay reachable in the worker's bare (no worker-side discard
+removes them). In a mixed fleet an older worker may treat a bare holding
 these records as disposable and leak the nested refs and records. The gate
 is consulted on every inventory-guarded release, but it is a no-op when the
 run has no refusal evidence and is below the cap, so releases with no refusal evidence below the cap

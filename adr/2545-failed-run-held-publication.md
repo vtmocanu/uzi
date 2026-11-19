@@ -501,8 +501,8 @@ recovery` or `uzi run discard`):
 - Older workers in a mixed fleet may treat a bare holding the new records as
   disposable and leak the nested refs and records.
 - Owner discard does not remove refusal artifacts (refusal refs, records,
-  incomplete markers and admissions); they stay reachable. No worker-side run
-  discard exists; only the bare's removal deletes them.
+  incomplete markers and admissions); they stay reachable. No worker-side
+  discard removes them; only the bare's removal deletes them.
 - A stranded temp file in `info/uzi-refusals` keeps the gate ineligible.
 
 **Owner-decided residual (2026-11-19).** Provenance gates only the automatic
