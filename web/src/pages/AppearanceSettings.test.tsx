@@ -488,4 +488,18 @@ describe("AppearanceSettings — sidebar icon animations toggle", () => {
     // The failure path re-syncs from the server (the mock's refresh writes "off").
     expect(document.documentElement.dataset.motion).toBe("off");
   });
+
+  it("rolls the attribute and pre-paint cache back locally when both the PUT and the session re-read fail", async () => {
+    mockApi.putMySettings.mockRejectedValueOnce(new ApiError(500, "boom"));
+    // Outage: the session re-read fails too and re-applies nothing.
+    refresh.mockRejectedValueOnce(new Error("network down"));
+    renderPage();
+    fireEvent.click(motionSwitch());
+    expect(document.documentElement.dataset.motion).toBe("on");
+    await waitFor(() => expect(screen.getByText(/boom/)).toBeTruthy());
+    await waitFor(() => expect(motionSwitch().getAttribute("aria-checked")).toBe("false"));
+    expect(document.documentElement.dataset.motion).toBe("off");
+    const cached = JSON.parse(localStorage.getItem("uzi.appearance") ?? "{}");
+    expect(cached.sidebarMotion).toBe(false);
+  });
 });

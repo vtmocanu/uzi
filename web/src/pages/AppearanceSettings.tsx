@@ -237,7 +237,15 @@ export function AppearanceSettings() {
       await refresh(); // sync overrides + re-apply the authoritative appearance
     } catch (err) {
       setAppearanceError(errorMessage(err, "Failed to save appearance"));
-      await refresh(); // revert the optimistic stamp to the server's truth
+      // Roll the optimistic stamp (and the pre-paint cache) back locally first, so an
+      // outage that also fails the session re-read cannot leave a failed choice applied
+      // and cached for the next load; then reconcile with the server if it answers.
+      applyAppearance(current);
+      try {
+        await refresh();
+      } catch {
+        // Session re-read failed too: the local rollback above stands.
+      }
     } finally {
       setAppearanceBusy(false);
       setPendingMotion(null);
