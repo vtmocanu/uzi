@@ -369,11 +369,11 @@ const CIConfigGuardV1 = "ci_config_guard_v1"
 // kill-switch, so a worker image that predates the linked intake can never claim such a run.
 const IssueKeyV1 = "issue_key_v1"
 
-// RunEnvV1 (PRD #4416 M2): the worker decodes ClaimSecrets.run_env / run_env_redact, merges the
-// variables into the run's command environment, registers their redaction forms and runs the
-// exact-value scan before each publish. The ClaimRun clause for a run that receives repository
-// variables reads it directly from workers.protocol_capabilities, so a worker image that predates
-// the feature can never claim such a run (and never publishes a secret value unscanned).
+// RunEnvV1 (PRD #4416): advertised by a worker that handles ClaimSecrets.run_env / run_env_redact,
+// meaning it merges the variables into the run's command environment, registers their redaction
+// forms and runs the exact-value scan before each publish. The capability is planned to gate the
+// claim of runs that receive repository variables, so a worker image that predates the feature is
+// never offered one; that gating is not part of this constant.
 const RunEnvV1 = "run_env_v1"
 
 const RepoAgentSourceV1 = "repo_agent_source_v1"

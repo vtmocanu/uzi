@@ -47,8 +47,17 @@ export interface DecodedRunEnv {
 export const RUN_ENV_MAX_VARS = 50;
 export const RUN_ENV_MAX_VALUE_BYTES = 65536;
 export const RUN_ENV_MAX_TOTAL_VALUE_BYTES = 262144;
-export const RUN_ENV_MAX_REDACT_ENTRIES = 200;
-export const RUN_ENV_MAX_REDACT_TOTAL_BYTES = 2097152;
+/** Redact bounds, per scope held: up to 200 retired versions (2097152 bytes of retired history)
+ *  plus up to 50 disabled or pending-deletion versions (262144 bytes), so 250 entries and
+ *  2097152 + 262144 = 2359296 bytes. M2 delivers the repo scope only; M4's user scope adds another
+ *  50 entries and 262144 bytes, to be added here then. */
+const RUN_ENV_REDACT_RETIRED_VERSIONS = 200;
+const RUN_ENV_REDACT_RETIRED_BYTES = 2097152;
+const RUN_ENV_REDACT_INACTIVE_VERSIONS = 50;
+const RUN_ENV_REDACT_INACTIVE_BYTES = 262144;
+export const RUN_ENV_MAX_REDACT_ENTRIES = RUN_ENV_REDACT_RETIRED_VERSIONS + RUN_ENV_REDACT_INACTIVE_VERSIONS;
+export const RUN_ENV_MAX_REDACT_TOTAL_BYTES = RUN_ENV_REDACT_RETIRED_BYTES + RUN_ENV_REDACT_INACTIVE_BYTES;
+const RUN_ENV_MAX_REV = 2147483647;
 export const RUN_ENV_MAX_DESCRIPTION_BYTES = 1024;
 
 /** Thrown for any claim breach. The message names the field and the rule, never a value. */
@@ -69,6 +78,7 @@ function isRecord(v: unknown): v is Record<string, unknown> {
 function str(rec: Record<string, unknown>, key: string, where: string): string {
   const v = rec[key];
   if (typeof v !== "string") throw new RunEnvClaimError(`${where}.${key} must be a string`);
+  if (v.includes("\u0000")) throw new RunEnvClaimError(`${where}.${key} must not contain NUL`);
   return v;
 }
 
@@ -78,8 +88,8 @@ function common(rec: Record<string, unknown>, where: string): { var_id: string; 
   const scope = rec["scope"];
   if (scope !== "repo" && scope !== "user") throw new RunEnvClaimError(`${where}.scope must be "repo" or "user"`);
   const rev = rec["rev"];
-  if (typeof rev !== "number" || !Number.isSafeInteger(rev) || rev < 1) {
-    throw new RunEnvClaimError(`${where}.rev must be a positive integer`);
+  if (typeof rev !== "number" || !Number.isSafeInteger(rev) || rev < 1 || rev > RUN_ENV_MAX_REV) {
+    throw new RunEnvClaimError(`${where}.rev must be an integer from 1 to ${RUN_ENV_MAX_REV}`);
   }
   const name = str(rec, "name", where);
   if (!NAME_REGEXP.test(name)) throw new RunEnvClaimError(`${where}.name must match ${NAME_REGEXP.source}`);
@@ -131,6 +141,8 @@ export function decodeRunEnv(secrets: unknown): DecodedRunEnv {
   if (secrets === undefined || secrets === null) return { runEnv: [], runEnvRedact: [] };
   if (!isRecord(secrets)) throw new RunEnvClaimError("secrets must be an object");
   const seen = new Set<string>();
+  const envVarIds = new Set<string>();
+  const envNames = new Set<string>();
 
   const rawEnv = secrets["run_env"];
   const runEnv: RunEnvVar[] = [];
@@ -152,6 +164,10 @@ export function decodeRunEnv(secrets: unknown): DecodedRunEnv {
       const k = key(c.var_id, c.rev);
       if (seen.has(k)) throw new RunEnvClaimError(`${where}: duplicate (var_id, rev)`);
       seen.add(k);
+      if (envVarIds.has(c.var_id.toLowerCase())) throw new RunEnvClaimError(`${where}: duplicate var_id`);
+      envVarIds.add(c.var_id.toLowerCase());
+      if (envNames.has(c.name)) throw new RunEnvClaimError(`${where}: duplicate name`);
+      envNames.add(c.name);
       total += Buffer.byteLength(c.value, "utf8");
       if (total > RUN_ENV_MAX_TOTAL_VALUE_BYTES) {
         throw new RunEnvClaimError(`run_env values exceed ${RUN_ENV_MAX_TOTAL_VALUE_BYTES} bytes in total`);
@@ -173,6 +189,9 @@ export function decodeRunEnvRedactResponse(body: unknown): RunEnvRedactResponse 
   const versions = decodeRedactList(body["versions"], "versions", new Set<string>());
   if (!prot && versions.length > 0) {
     throw new RunEnvClaimError("run-env-redact response: protected=false must carry no versions");
+  }
+  if (prot && versions.length === 0) {
+    throw new RunEnvClaimError("run-env-redact response: protected=true must carry versions");
   }
   return { protected: prot, versions };
 }

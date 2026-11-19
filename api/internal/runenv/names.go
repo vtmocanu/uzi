@@ -16,7 +16,7 @@ import (
 // configuration and managed directories) plus the harness controls outside the
 // denied prefixes.
 var deniedNames = []string{
-	"HOME", "PATH", "TMPDIR", "TMP", "TEMP", "LANG", "SHELL", "ENV", "IFS", "PS4", "PROMPT_COMMAND", "SHELLOPTS",
+	"HOME", "PATH", "TMPDIR", "TMP", "TEMP", "LANG", "LANGUAGE", "SHELL", "ENV", "IFS", "PS4", "PROMPT_COMMAND", "SHELLOPTS",
 	"BASHOPTS", "CDPATH", "ZDOTDIR", "DOCKER_HOST", "DOCKER_CONFIG", "DOCKER_CONTEXT", "DOCKER_TLS_VERIFY",
 	"DOCKER_CERT_PATH", "BUILDKIT_HOST", "GOMAXPROCS", "GOFLAGS", "GOTMPDIR", "GOMODCACHE", "GOCACHE", "GOPROXY",
 	"GOSUMDB", "GOENV", "GOTOOLCHAIN", "NPM_CONFIG_CACHE", "npm_config_cache", "NODE_OPTIONS", "NODE_PATH",
@@ -40,13 +40,13 @@ var deniedNames = []string{
 	"ENABLE_PID_BASED_VERSION_LOCKING", "FORCE_AUTOUPDATE_PLUGINS", "TEST_ENABLE_SESSION_PERSISTENCE",
 	"SLASH_COMMAND_TOOL_CHAR_BUDGET", "SYSTEM_REMINDER_MEMORY_CONTEXT", "USE_API_CONTEXT_MANAGEMENT",
 	"USE_BUILTIN_RIPGREP", "EMBEDDED_SEARCH_TOOLS", "ALLOW_ANT_COMPUTER_USE_MCP", "ULTRAPLAN_PROMPT_FILE",
-	"ENVIRONMENT_SERVICE_KEY", "LOCAL_BRIDGE", "VITALS_EMITTER_BIN",
+	"ENVIRONMENT_SERVICE_KEY", "LOCAL_BRIDGE", "VITALS_EMITTER_BIN", "ANT_CLAUDE_CODE_METRICS_ENDPOINT",
 }
 
 var deniedPrefixes = []string{
 	"UZI_", "CLAUDE_", "ANTHROPIC_", "CODEX_", "OPENAI_", "MCP_", "DISABLE_", "GH_", "GITHUB_", "GITLAB_",
 	"GLAB_", "GIT_", "SSH_", "LD_", "DYLD_", "BASH_", "XDG_", "SSL_CERT_", "PYTHON", "PERL5", "NIX_", "DEVBOX_",
-	"BUN_", "ANT_", "AGENT_PROXY_", "SELF_HOSTED_RUNNER_", "CCR_",
+	"BUN_", "ANT_OTEL_", "AGENT_PROXY_", "SELF_HOSTED_RUNNER_", "CCR_", "LC_", "MIMALLOC_",
 }
 
 var deniedSuffixes = []string{"_PROXY"}
@@ -85,11 +85,20 @@ func deniedBy(name string) string {
 	return ""
 }
 
+// ValidateNameShape applies only the name shape. Disable, enable and delete use it so a
+// row whose name a later denylist change denies stays manageable.
+func ValidateNameShape(name string) error {
+	if !NameRegexp.MatchString(name) {
+		return &RuleError{Field: "name", Rule: "must match ^[A-Z_][A-Z0-9_]{0,127}$ (upper-case letters, digits and underscores, not starting with a digit, at most 128 characters)"}
+	}
+	return nil
+}
+
 // ValidateName applies the name shape and the denylist. A non-nil result is a
 // *RuleError whose message names the broken rule.
 func ValidateName(name string) error {
-	if !NameRegexp.MatchString(name) {
-		return &RuleError{Field: "name", Rule: "must match ^[A-Z_][A-Z0-9_]{0,127}$ (upper-case letters, digits and underscores, not starting with a digit, at most 128 characters)"}
+	if err := ValidateNameShape(name); err != nil {
+		return err
 	}
 	if rule := deniedBy(name); rule != "" {
 		return &RuleError{Field: "name", Rule: rule}

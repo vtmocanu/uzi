@@ -1186,8 +1186,8 @@ export interface ClaimSecrets {
    *  exclusivity and building the SDK env from it is a later milestone. See {@link ClaimProviderBinding}. */
   provider?: ClaimProviderBinding;
   /** The effective repository variables of a run that receives them (PRD #4416 M2). Absent
-   *  otherwise. Secret entries carry usable values: never logged, never serialized. Decoded
-   *  (bounded, fail closed) by decodeRunEnv in run-env-claim.ts. */
+   *  otherwise. Secret entries carry usable values: never logged, never serialized. The
+   *  field is the wire shape only; run-env-claim.ts holds the types and bounds for it. */
   run_env?: RunEnvVar[];
   /** Secret versions the run holds a receipt for that are not in `run_env`: redaction and
    *  scanning only, never set in an environment or a prompt. */

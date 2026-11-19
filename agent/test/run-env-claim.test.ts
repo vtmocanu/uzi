@@ -95,16 +95,16 @@ describe("decodeRunEnv fails closed", () => {
     it(`scope ${JSON.stringify(scope)}`, () => breaches({ run_env: [plain({ scope })] }, "scope"));
   }
   for (const rev of [0, -1, 1.5, Number.NaN, 2 ** 60]) {
-    it(`rev ${String(rev)}`, () => breaches({ run_env: [plain({ rev })] }, "rev must be a positive integer"));
+    it(`rev ${String(rev)}`, () => breaches({ run_env: [plain({ rev })] }, "rev must be an integer from 1 to"));
   }
   for (const name of ["", "lower", "1ABC", "A-B", "A".repeat(129), "NAME\n"]) {
     it(`name ${JSON.stringify(name.length > 20 ? `${name.length} chars` : name)}`, () => breaches({ run_env: [plain({ name })] }, "name must match"));
   }
 
   it("more than 50 run_env entries", () => {
-    const ok = Array.from({ length: RUN_ENV_MAX_VARS }, (_, i) => plain({ var_id: uuidN(i + 1) }));
+    const ok = Array.from({ length: RUN_ENV_MAX_VARS }, (_, i) => plain({ var_id: uuidN(i + 1), name: `V_${i}` }));
     assert.equal(decodeRunEnv({ run_env: ok }).runEnv.length, RUN_ENV_MAX_VARS);
-    breaches({ run_env: [...ok, plain({ var_id: uuidN(99) })] }, "more than 50 entries");
+    breaches({ run_env: [...ok, plain({ var_id: uuidN(99), name: "V_99" })] }, "more than 50 entries");
   });
 
   it("a value over 65536 bytes (multi-byte counted in bytes)", () => {
@@ -115,28 +115,30 @@ describe("decodeRunEnv fails closed", () => {
 
   it("total run_env value bytes over 262144", () => {
     const full = "a".repeat(RUN_ENV_MAX_VALUE_BYTES);
-    const four = Array.from({ length: 4 }, (_, i) => plain({ var_id: uuidN(i + 1), value: full }));
+    const four = Array.from({ length: 4 }, (_, i) => plain({ var_id: uuidN(i + 1), name: `V_${i}`, value: full }));
     assert.equal(RUN_ENV_MAX_TOTAL_VALUE_BYTES, 4 * RUN_ENV_MAX_VALUE_BYTES);
     assert.equal(decodeRunEnv({ run_env: four }).runEnv.length, 4);
-    breaches({ run_env: [...four, plain({ var_id: uuidN(9), value: "b" })] }, "run_env values exceed 262144 bytes in total");
+    breaches({ run_env: [...four, plain({ var_id: uuidN(9), name: "V_9", value: "b" })] }, "run_env values exceed 262144 bytes in total");
   });
 
-  it("more than 200 redact entries", () => {
+  it("more than 250 redact entries", () => {
+    assert.equal(RUN_ENV_MAX_REDACT_ENTRIES, 250);
     const ok = Array.from({ length: RUN_ENV_MAX_REDACT_ENTRIES }, (_, i) => redact({ var_id: uuidN(i + 1) }));
     assert.equal(decodeRunEnv({ run_env_redact: ok }).runEnvRedact.length, RUN_ENV_MAX_REDACT_ENTRIES);
-    breaches({ run_env_redact: [...ok, redact({ var_id: uuidN(999) })] }, "more than 200 entries");
+    breaches({ run_env_redact: [...ok, redact({ var_id: uuidN(999) })] }, "more than 250 entries");
   });
 
   it("a redact value over 65536 bytes", () => {
     breaches({ run_env_redact: [redact({ value: "a".repeat(RUN_ENV_MAX_VALUE_BYTES + 1) })] }, "value exceeds 65536 bytes");
   });
 
-  it("total redact bytes over 2097152", () => {
+  it("total redact bytes over 2359296", () => {
+    assert.equal(RUN_ENV_MAX_REDACT_TOTAL_BYTES, 2097152 + 262144);
     const full = "a".repeat(RUN_ENV_MAX_VALUE_BYTES);
-    const per = RUN_ENV_MAX_REDACT_TOTAL_BYTES / RUN_ENV_MAX_VALUE_BYTES;
+    const per = RUN_ENV_MAX_REDACT_TOTAL_BYTES / RUN_ENV_MAX_VALUE_BYTES; // 36
     const ok = Array.from({ length: per }, (_, i) => redact({ var_id: uuidN(i + 1), value: full }));
     assert.equal(decodeRunEnv({ run_env_redact: ok }).runEnvRedact.length, per);
-    breaches({ run_env_redact: [...ok, redact({ var_id: uuidN(999) })] }, "values exceed 2097152 bytes in total");
+    breaches({ run_env_redact: [...ok, redact({ var_id: uuidN(999) })] }, "values exceed 2359296 bytes in total");
   });
 
   it("a secret under 8 characters, in run_env and in run_env_redact", () => {
@@ -158,13 +160,40 @@ describe("decodeRunEnv fails closed", () => {
     breaches({ run_env: [plain(), plain({ name: "OTHER" })] }, "duplicate (var_id, rev)");
     breaches({ run_env_redact: [redact(), redact()] }, "duplicate (var_id, rev)");
     breaches({ run_env: [plain({ var_id: ID2, rev: 1 })], run_env_redact: [redact()] }, "duplicate (var_id, rev)");
-    assert.equal(decodeRunEnv({ run_env: [plain(), plain({ rev: 2 })] }).runEnv.length, 2);
+  });
+
+  it("a var_id twice in run_env, even at different revs", () => {
+    breaches({ run_env: [plain(), plain({ rev: 2, name: "OTHER" })] }, "duplicate var_id");
+    breaches({ run_env: [plain(), plain({ var_id: ID.toUpperCase(), rev: 2, name: "OTHER" })] }, "duplicate var_id");
+  });
+
+  it("a name twice in run_env", () => {
+    breaches({ run_env: [plain(), plain({ var_id: ID2 })] }, "duplicate name");
+  });
+
+  it("NUL in a value or a description", () => {
+    breaches({ run_env: [plain({ value: "a\u0000b" })] }, "must not contain NUL");
+    breaches({ run_env: [plain({ description: "a\u0000b" })] }, "must not contain NUL");
+    breaches({ run_env_redact: [redact({ value: "abcdefg\u0000h" })] }, "must not contain NUL");
+  });
+
+  it("rev up to int32 max, one past refused", () => {
+    assert.equal(decodeRunEnv({ run_env: [plain({ rev: 2147483647 })] }).runEnv.length, 1);
+    breaches({ run_env: [plain({ rev: 2147483648 })] }, "rev must be an integer from 1 to 2147483647");
   });
 });
 
 describe("decodeRunEnvRedactResponse fails closed", () => {
   it("non-object body", () => assert.throws(() => decodeRunEnvRedactResponse([]), RunEnvClaimError));
   it("missing protected flag", () => assert.throws(() => decodeRunEnvRedactResponse({ versions: [] }), RunEnvClaimError));
+  it("protected=true without versions (absent, null, empty)", () => {
+    for (const body of [{ protected: true }, { protected: true, versions: null }, { protected: true, versions: [] }]) {
+      assert.throws(() => decodeRunEnvRedactResponse(body), RunEnvClaimError);
+    }
+  });
+  it("protected=false without versions is accepted", () => {
+    assert.equal(decodeRunEnvRedactResponse({ protected: false }).versions.length, 0);
+  });
   it("protected=false with versions", () => {
     assert.throws(() => decodeRunEnvRedactResponse({ protected: false, versions: [redact()] }), RunEnvClaimError);
   });
@@ -174,8 +203,9 @@ describe("decodeRunEnvRedactResponse fails closed", () => {
   it("duplicate (var_id, rev)", () => {
     assert.throws(() => decodeRunEnvRedactResponse({ protected: true, versions: [redact(), redact()] }), RunEnvClaimError);
   });
-  it("more than 200 versions", () => {
+  it("more than 250 versions, 250 accepted", () => {
     const many = Array.from({ length: RUN_ENV_MAX_REDACT_ENTRIES + 1 }, (_, i) => redact({ var_id: uuidN(i + 1) }));
+    assert.equal(decodeRunEnvRedactResponse({ protected: true, versions: many.slice(0, RUN_ENV_MAX_REDACT_ENTRIES) }).versions.length, 250);
     assert.throws(() => decodeRunEnvRedactResponse({ protected: true, versions: many }), RunEnvClaimError);
   });
 });

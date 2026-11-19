@@ -581,14 +581,10 @@ type ClaimRunEnvVar struct {
 }
 
 // ClaimRunEnvRedact is a secret version delivered for redaction and scanning only (PRD #4416).
-// It carries no description and no secret flag: every entry is a secret. Never logged.
-type ClaimRunEnvRedact struct {
-	VarID uuid.UUID `json:"var_id"`
-	Scope string    `json:"scope"`
-	Rev   int32     `json:"rev"`
-	Name  string    `json:"name"`
-	Value string    `json:"value"`
-}
+// It carries no description and no secret flag: every entry is a secret. Never logged. It is
+// the same type as the maintenance route's apitypes.RunEnvRedactVersion, so the two wires
+// cannot drift.
+type ClaimRunEnvRedact = apitypes.RunEnvRedactVersion
 
 // ClaimCodexSecrets is the usable Codex credential for one claim of a Codex-bound run
 // (PRD #1147 M2, B7; PRD #1171 M1). It carries only what the worker needs to act as

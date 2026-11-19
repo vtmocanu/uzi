@@ -3,8 +3,8 @@ package apitypes
 import "github.com/google/uuid"
 
 // RunEnvRedactVersion is one secret version the worker registers for redaction and the
-// exact-value scan (PRD #4416). It mirrors workersvc.ClaimRunEnvRedact on the wire; the
-// maintenance route answers with it so a worker that no longer holds a run's claim can still
+// exact-value scan (PRD #4416). workersvc.ClaimRunEnvRedact is an alias of it, so the claim and the
+// maintenance route share one wire shape; the maintenance route answers with it so a worker that no longer holds a run's claim can still
 // protect a later publish. Never logged: Value is the usable secret.
 type RunEnvRedactVersion struct {
 	VarID uuid.UUID `json:"var_id"`

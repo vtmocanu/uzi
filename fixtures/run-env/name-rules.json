@@ -35,6 +35,11 @@
       "note": "locale the worker pins for deterministic command output"
     },
     {
+      "value": "LANGUAGE",
+      "invariant": "shell_semantics",
+      "note": "GNU locale message-language list; overrides the LANG the worker pins for deterministic command output"
+    },
+    {
       "value": "SHELL",
       "invariant": "shell_semantics",
       "note": "login shell the harness spawns commands with"
@@ -613,6 +618,11 @@
       "value": "VITALS_EMITTER_BIN",
       "invariant": "process_loader",
       "note": "binary the Claude CLI runs"
+    },
+    {
+      "value": "ANT_CLAUDE_CODE_METRICS_ENDPOINT",
+      "invariant": "network_wiring",
+      "note": "metrics export endpoint of the Claude CLI; the broader ANT_ prefix is not denied so Apache Ant build options stay allowed"
     }
   ],
   "denied_prefixes": [
@@ -729,12 +739,12 @@
     {
       "value": "BUN_",
       "invariant": "process_loader",
-      "note": "Bun runtime controls: BUN_OPTIONS, BUN_BE_BUN, BUN_CONFIG_VERBOSE_FETCH (prints request headers), BUN_INSPECT and the BUN_FEATURE_FLAG_* family"
+      "note": "Bun runtime controls: BUN_OPTIONS, BUN_BE_BUN, BUN_CONFIG_VERBOSE_FETCH (prints request headers), BUN_INSPECT and the BUN_FEATURE_FLAG_* family. It also denies Bun package-manager settings (BUN_CONFIG_REGISTRY and similar); set NPM_CONFIG_REGISTRY or an .npmrc instead"
     },
     {
-      "value": "ANT_",
+      "value": "ANT_OTEL_",
       "invariant": "network_wiring",
-      "note": "ANT_OTEL_* telemetry export wiring of the Claude CLI"
+      "note": "ANT_OTEL_* telemetry export wiring of the Claude CLI; the prefix is narrow so Apache Ant build options (ANT_OPTS, ANT_HOME, ANT_ARGS) stay allowed"
     },
     {
       "value": "AGENT_PROXY_",
@@ -750,6 +760,16 @@
       "value": "CCR_",
       "invariant": "harness_control",
       "note": "remote-session proxy and controls of the Claude CLI"
+    },
+    {
+      "value": "LC_",
+      "invariant": "shell_semantics",
+      "note": "locale categories (LC_ALL, LC_CTYPE and the rest) override the LANG the worker pins, so they would undo its deterministic command output"
+    },
+    {
+      "value": "MIMALLOC_",
+      "invariant": "harness_control",
+      "note": "mimalloc allocator controls read by the Bun-based Claude CLI binary (memory limits, verbose output)"
     }
   ],
   "denied_suffixes": [
@@ -860,7 +880,7 @@
       "name": "DEBUG",
       "harness": "claude",
       "decision": "allowed",
-      "reason": "read by the debug npm module in the CLI and by many application stacks; the CLI's own debug output goes through the worker's redacted log, and the dedicated switches (DEBUG_AUTH, DEBUG_SDK) are denied"
+      "reason": "the Claude CLI treats DEBUG like DEBUG_SDK, but the pinned SDK (sdk.mjs) deletes DEBUG from the env of the CLI it spawns unless DEBUG_CLAUDE_AGENT_SDK is set, and that name is denied; DEBUG is therefore allowed for application stacks. Recheck on every SDK bump (a test that DEBUG is absent from the spawned CLI env is planned)"
     },
     {
       "name": "TZ",
@@ -902,7 +922,7 @@
       "name": "OTEL_EXPORTER_OTLP_ENDPOINT",
       "harness": "claude",
       "decision": "allowed",
-      "reason": "application telemetry configuration; the CLI exports nothing unless CLAUDE_CODE_ENABLE_TELEMETRY is set, which the CLAUDE_ prefix denies; the CLI-only content switches (OTEL_LOG_*) are denied"
+      "reason": "application telemetry configuration; the CLI can only enable telemetry through denied switches (CLAUDE_CODE_ENABLE_TELEMETRY, ENABLE_BETA_TRACING_DETAILED, BETA_TRACING_ENDPOINT) or managed policy settings, which the worker does not ship; the CLI-only content switches (OTEL_LOG_*) are denied"
     },
     {
       "name": "EDITOR",

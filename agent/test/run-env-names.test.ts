@@ -112,6 +112,8 @@ describe("runEnvNameViolation", () => {
     "AWS_REGION",
     "NPM_TOKEN",
     "GRADLE_OPTS",
+    "ANT_OPTS",
+    "ANT_HOME",
     "DOCKER_AUTH_CONFIG",
     "TESTCONTAINERS_HOST_OVERRIDE",
     "NODE_ENV",
@@ -146,7 +148,8 @@ describe("runtime controls found by the pinned-harness review are denied", () =>
   for (const name of [
     "BUN_BE_BUN", "BUN_CONFIG_VERBOSE_FETCH", "BUN_OPTIONS", "NODE_DEBUG", "NODE_V8_COVERAGE",
     "NODE_REDIRECT_WARNINGS", "NODE_ICU_DATA", "NODE_USE_ENV_PROXY", "NODE_COMPILE_CACHE",
-    "UV_THREADPOOL_SIZE", "SSLKEYLOGFILE",
+    "UV_THREADPOOL_SIZE", "SSLKEYLOGFILE", "ANT_OTEL_EXPORTER", "ANT_CLAUDE_CODE_METRICS_ENDPOINT",
+    "LC_ALL", "LC_CTYPE", "LANGUAGE", "MIMALLOC_VERBOSE",
   ]) {
     it(`denies ${name}`, () => {
       assert.notEqual(runEnvNameViolation(name), null);

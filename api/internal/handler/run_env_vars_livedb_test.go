@@ -460,6 +460,34 @@ func TestRunEnvValueAndNameRulesLiveDB(t *testing.T) {
 	}
 }
 
+// A row written before a name joined the denylist (here renamed in SQL to simulate it)
+// stays manageable: disable, enable and delete check only the name shape, while a PUT of
+// the same name is still refused.
+func TestRunEnvNowDeniedNameStaysManageableLiveDB(t *testing.T) {
+	f := newEnvFixture(t)
+	f.put("STRANDED_ONE", jsonBody(map[string]any{"value": "12345678"}), http.StatusCreated)
+	f.put("STRANDED_TWO", jsonBody(map[string]any{"value": "12345678"}), http.StatusCreated)
+	cliMustExec(t, f.pool, `UPDATE run_env_vars SET name='TMP' WHERE repo_id=$1 AND name='STRANDED_ONE'`, f.repo)
+	cliMustExec(t, f.pool, `UPDATE run_env_vars SET name='TEMP' WHERE repo_id=$1 AND name='STRANDED_TWO'`, f.repo)
+
+	f.must(f.do(http.MethodPut, "/TMP", jsonBody(map[string]any{"value": "12345678"})), http.StatusUnprocessableEntity)
+	f.must(f.do(http.MethodPost, "/TMP/disable", ""), http.StatusOK)
+	if f.rowCount("name='TMP' AND disabled_at IS NOT NULL AND retired_at IS NULL") != 1 {
+		t.Fatal("the denied-name row was not disabled")
+	}
+	f.must(f.do(http.MethodPost, "/TMP/enable", ""), http.StatusOK)
+	if f.rowCount("name='TMP' AND disabled_at IS NULL AND retired_at IS NULL") != 1 {
+		t.Fatal("the denied-name row was not enabled")
+	}
+	f.must(f.do(http.MethodDelete, "/TEMP", ""), http.StatusOK)
+	if f.rowCount("name='TEMP'") != 0 {
+		t.Fatal("the denied-name row was not deleted")
+	}
+	// A malformed name is still refused by shape.
+	f.must(f.do(http.MethodPost, "/lower_case/disable", ""), http.StatusUnprocessableEntity)
+	f.must(f.do(http.MethodDelete, "/lower_case", ""), http.StatusUnprocessableEntity)
+}
+
 func TestRunEnvScopeLimitsLiveDB(t *testing.T) {
 	f := newEnvFixture(t)
 	conflictCode := func(rec *httptest.ResponseRecorder) string {
