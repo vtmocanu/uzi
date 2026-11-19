@@ -3,6 +3,7 @@ package workersvc
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 
@@ -24,7 +25,6 @@ import (
 // no forge user ids, as the YouTrack driver's do.
 type ytTracker struct {
 	forgetest.BaseFake
-	createErr error
 }
 
 func (*ytTracker) GetIssue(_ context.Context, _, iid int64) (forge.Issue, error) {
@@ -34,8 +34,22 @@ func (*ytTracker) GetIssue(_ context.Context, _, iid int64) (forge.Issue, error)
 func (*ytTracker) ListIssueComments(context.Context, int64, int64) ([]forge.IssueComment, error) {
 	return []forge.IssueComment{{Body: "yt comment"}}, nil
 }
-func (y *ytTracker) CreateIssue(context.Context, int64, string, string, []string) (forge.Issue, error) {
-	return forge.Issue{}, y.createErr
+
+// createRecorder is a linked repo's issue tracker that records the CreateIssue it receives.
+type createRecorder struct {
+	forgetest.BaseFake
+	createErr    error
+	created      forge.Issue
+	creates      int
+	createdTitle string
+	createdLabel []string
+}
+
+func (c *createRecorder) CreateIssue(_ context.Context, _ int64, title, _ string, labels []string) (forge.Issue, error) {
+	c.creates++
+	c.createdTitle = title
+	c.createdLabel = labels
+	return c.created, c.createErr
 }
 
 type fakeSources struct {
@@ -160,25 +174,65 @@ func TestUnlinkedRunCaptureNeverConsultsResolver(t *testing.T) {
 	}
 }
 
-func TestLinkedConfirmProposalIsRefusedAndReverts(t *testing.T) {
+// PRD #4173 M5 (converted from TestLinkedConfirmProposalIsRefusedAndReverts, which modelled the
+// M4 guard's refusal): a confirmed chat proposal is created through the resolver's issue side
+// with the uzi label mapped to the stored eligibility name and the autopilot label dropped.
+func TestLinkedConfirmProposalCreatesThroughTheResolverWithTheEligibilityTag(t *testing.T) {
 	svc, fs, fb := confirmFixture(t)
 	fs.repoRow.IssueTrackerConnectionID = pgtype.UUID{Bytes: uuid.New(), Valid: true}
-	refused := errors.New("create issue: issue writes on a repo linked to an issue tracker are not offered yet")
-	src := &fakeSources{tr: &ytTracker{createErr: refused}}
+	fs.repoRow.EligibilityTagName = pgtype.Text{String: "ready-for-uzi", Valid: true}
+	fs.claimProposalRow.Labels = []byte(`["bug","uzi","autopilot"]`)
+	tr := &createRecorder{created: forge.Issue{IID: 9, WebURL: "https://yt.test/UZI-9", Title: "t"}}
+	src := &fakeSources{tr: tr}
 	svc.SetIssueSources(src)
 
-	_, err := svc.ConfirmProposalForUser(context.Background(), uuid.New(), uuid.New(), uuid.New())
-	if !errors.Is(err, ErrForgeIssueWrite) || !strings.Contains(err.Error(), "not offered") {
-		t.Fatalf("err = %v, want the guard's refusal behind ErrForgeIssueWrite", err)
+	created, err := svc.ConfirmProposalForUser(context.Background(), uuid.New(), uuid.New(), uuid.New())
+	if err != nil || created.IID != 9 {
+		t.Fatalf("created = %+v, err = %v, want issue 9", created, err)
+	}
+	if want := []string{"bug", "ready-for-uzi"}; !slices.Equal(tr.createdLabel, want) {
+		t.Fatalf("labels = %v, want %v", tr.createdLabel, want)
 	}
 	if fb.f.createCalls != 0 {
 		t.Fatal("the forge's CreateIssue was called for a linked repo")
 	}
-	if len(fs.revertedProposals) != 1 || fs.markedProposalConfirm != nil {
-		t.Fatalf("the claim must revert to pending: reverts=%d", len(fs.revertedProposals))
+	if len(fs.revertedProposals) != 0 || fs.markedProposalConfirm == nil || fs.markedProposalConfirm.CreatedIssueIid.Int64 != 9 {
+		t.Fatalf("the proposal must settle confirmed with iid 9: reverts=%d", len(fs.revertedProposals))
 	}
 	if len(src.calls) != 1 {
 		t.Fatalf("resolver calls = %d, want 1", len(src.calls))
+	}
+}
+
+// A confirmed proposal without the uzi label carries no eligibility tag.
+func TestLinkedConfirmProposalWithoutTheUziLabelCarriesNoEligibilityTag(t *testing.T) {
+	svc, fs, _ := confirmFixture(t)
+	fs.repoRow.IssueTrackerConnectionID = pgtype.UUID{Bytes: uuid.New(), Valid: true}
+	fs.repoRow.EligibilityTagName = pgtype.Text{String: "ready-for-uzi", Valid: true}
+	tr := &createRecorder{created: forge.Issue{IID: 9}}
+	svc.SetIssueSources(&fakeSources{tr: tr})
+
+	if _, err := svc.ConfirmProposalForUser(context.Background(), uuid.New(), uuid.New(), uuid.New()); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"bug"}; !slices.Equal(tr.createdLabel, want) {
+		t.Fatalf("labels = %v, want %v", tr.createdLabel, want)
+	}
+}
+
+// An issue tracker failure on a linked repo still reverts the claim to pending.
+func TestLinkedConfirmProposalFailureReverts(t *testing.T) {
+	svc, fs, fb := confirmFixture(t)
+	fs.repoRow.IssueTrackerConnectionID = pgtype.UUID{Bytes: uuid.New(), Valid: true}
+	fs.repoRow.EligibilityTagName = pgtype.Text{String: "ready-for-uzi", Valid: true}
+	svc.SetIssueSources(&fakeSources{tr: &createRecorder{createErr: errors.New("youtrack unreachable")}})
+
+	_, err := svc.ConfirmProposalForUser(context.Background(), uuid.New(), uuid.New(), uuid.New())
+	if !errors.Is(err, ErrForgeIssueWrite) {
+		t.Fatalf("err = %v, want ErrForgeIssueWrite", err)
+	}
+	if fb.f.createCalls != 0 || len(fs.revertedProposals) != 1 || fs.markedProposalConfirm != nil {
+		t.Fatalf("forge creates=%d reverts=%d: the claim must revert", fb.f.createCalls, len(fs.revertedProposals))
 	}
 }
 
@@ -195,10 +249,15 @@ func TestLinkedConfirmProposalWithoutSourcesFailsClosed(t *testing.T) {
 	}
 }
 
-func TestLinkedRepoFilesNoScheduledProposal(t *testing.T) {
+// PRD #4173 M5 (converted from TestLinkedRepoFilesNoScheduledProposal, the M4 skip): a scheduled
+// proposal is filed through the resolver's issue side with the proposal marker only (no
+// eligibility tag), and the audit row is stamped.
+func TestLinkedRepoFilesTheScheduledProposalThroughTheResolver(t *testing.T) {
 	svc, fs, ff, run := proposalFixture(t, "feature-bingo")
 	fs.repoRow.IssueTrackerConnectionID = pgtype.UUID{Bytes: uuid.New(), Valid: true}
-	src := &fakeSources{tr: &ytTracker{}}
+	fs.repoRow.EligibilityTagName = pgtype.Text{String: "ready-for-uzi", Valid: true}
+	tr := &createRecorder{created: forge.Issue{IID: 11}}
+	src := &fakeSources{tr: tr}
 	svc.SetIssueSources(src)
 
 	svc.maybeFileProposal(context.Background(), run, aProposal())
@@ -206,8 +265,27 @@ func TestLinkedRepoFilesNoScheduledProposal(t *testing.T) {
 	if ff.createCalls != 0 {
 		t.Fatal("a proposal was filed on the forge for a linked repo")
 	}
-	if fs.createdProposal != nil {
-		t.Fatal("a pending audit row was left behind for a skipped filing")
+	if want := []string{"proposal::feature-bingo"}; tr.creates != 1 || !slices.Equal(tr.createdLabel, want) {
+		t.Fatalf("creates = %d labels = %v, want one create with %v", tr.creates, tr.createdLabel, want)
+	}
+	if fs.createdProposal == nil || fs.stampedProposal == nil || fs.stampedProposal.Iid.Int64 != 11 {
+		t.Fatalf("the audit row must be inserted and stamped with iid 11: %+v %+v", fs.createdProposal, fs.stampedProposal)
+	}
+	if len(src.calls) != 1 || src.calls[0].user != run.UserID {
+		t.Fatalf("the resolver is bound by the run's owner, got %+v", src.calls)
+	}
+}
+
+// With no resolver a linked repo files nothing, falls back to nothing, and leaves no
+// pending audit row.
+func TestLinkedRepoScheduledProposalWithoutSourcesFilesNothing(t *testing.T) {
+	svc, fs, ff, run := proposalFixture(t, "feature-bingo")
+	fs.repoRow.IssueTrackerConnectionID = pgtype.UUID{Bytes: uuid.New(), Valid: true}
+
+	svc.maybeFileProposal(context.Background(), run, aProposal())
+
+	if ff.createCalls != 0 || fs.createdProposal != nil {
+		t.Fatalf("forge creates = %d, audit row = %v: nothing may be filed", ff.createCalls, fs.createdProposal)
 	}
 }
 

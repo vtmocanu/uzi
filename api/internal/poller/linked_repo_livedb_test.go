@@ -46,7 +46,7 @@ func trustFake(t *testing.T, srv *youtracktest.Server) {
 
 type refusingDrivers struct{ calls int }
 
-func (r *refusingDrivers) DriverFor(context.Context, uuid.UUID, uuid.UUID, issuetracker.Binding, string, string, string) (issuetracker.Driver, error) {
+func (r *refusingDrivers) DriverFor(context.Context, uuid.UUID, uuid.UUID, issuetracker.Binding, issuetracker.StateMapping) (issuetracker.Driver, error) {
 	r.calls++
 	return nil, errors.New("base URL is not in the allowed issue tracker list")
 }
@@ -439,5 +439,55 @@ func TestLinkedRepoPollCachesTaggedIssuesLiveDB(t *testing.T) {
 	}
 	if want := fmt.Sprintf("%s-%d", youtracktest.ProjectShortName, n); key == nil || *key != want {
 		t.Fatalf("issue_key = %v, want %s", key, want)
+	}
+}
+
+// The poller hands a linked repo's issue side to the board-free MR-state recorder: an
+// issue run whose MR closed moves its cached Human Review card to In Progress through the
+// issue tracker.
+func TestLinkedRepoPollMovesTheCardWhenItsMRClosesLiveDB(t *testing.T) {
+	srv := youtracktest.NewServer(t)
+	trustFake(t, srv)
+	srv.SeedState("In Progress", false)
+	srv.SeedState("In Review", false)
+	env := newLinkedEnv(t, srv, nil)
+	exec := func(sql string, args ...any) {
+		t.Helper()
+		if _, err := env.pool.Exec(env.ctx, sql, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	exec(`INSERT INTO repo_issue_tracker_states (repo_id, open_state, closed_state) VALUES ($1, 'Open', 'Fixed')`, env.repo)
+	exec(`INSERT INTO repo_issue_tracker_column_states (repo_id, label_name, state_name) VALUES ($1, 'Human Review', 'In Review'), ($1, 'In Progress', 'In Progress')`, env.repo)
+
+	n := srv.SeedIssue("a card", "body", youtracktest.EligibilityTagID)
+	tr, err := env.svc.IssueTrackerForRepo(env.ctx, env.user, env.repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tr.MoveToColumn(env.ctx, 42, n, forge.ColumnMove{Column: "Human Review"}); err != nil {
+		t.Fatal(err)
+	}
+	run := uuid.New()
+	exec("INSERT INTO runs(id,user_id,repo_id,kind,issue_iid,issue_title,issue_description,branch,mr_iid,mr_state,status,created_at) VALUES($1,$2,$3,'issue',$4,'t','d',$5,13,'opened','completed','2020-01-01')",
+		run, env.user, env.repo, n, "agent/issue-"+run.String())
+
+	env.poll(t)
+	if got := srv.IssueState(n); got != "In Progress" {
+		t.Fatalf("State = %q, want In Progress after the MR closed", got)
+	}
+	var column *string
+	if err := env.pool.QueryRow(env.ctx, `SELECT issue_tracker_column FROM issues WHERE repo_id = $1 AND forge_issue_iid = $2`, env.repo, n).Scan(&column); err != nil {
+		t.Fatal(err)
+	}
+	if column == nil || *column != "In Progress" {
+		t.Fatalf("cached column = %v, want In Progress", column)
+	}
+	var state *string
+	if err := env.pool.QueryRow(env.ctx, `SELECT mr_state FROM runs WHERE id = $1`, run).Scan(&state); err != nil {
+		t.Fatal(err)
+	}
+	if state == nil || *state != forge.MRStateClosed {
+		t.Fatalf("mr_state = %v, want closed", state)
 	}
 }

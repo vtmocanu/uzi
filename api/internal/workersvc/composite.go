@@ -154,13 +154,17 @@ func (s *Service) ConfirmProposalForUser(ctx context.Context, userID, runID, pro
 		}
 	}
 
-	// PRD #4173 DL-5: a linked repo's resolver wraps the write guard, which refuses
-	// CreateIssue before any request (writes arrive in M5). The claim reverts below, so
-	// the proposal stays pending and nothing was created.
+	// PRD #4173 DL-5: a linked repo creates through its resolver, never the forge. The
+	// labels map the uzi label to the link's stored eligibility name and drop the
+	// autopilot label (D12, D14); a proposal without the uzi label carries no eligibility
+	// tag. A failure reverts the claim, so the proposal stays pending.
 	tr, err := issuesource.For(ctx, s.issueSources, repo.IssueTrackerConnectionID.Valid, userID, repo.ID, f)
 	if err != nil {
 		s.revertProposal(ctx, propID)
 		return CreatedIssue{}, fmt.Errorf("%w: %v", ErrForgeBuild, err)
+	}
+	if repo.IssueTrackerConnectionID.Valid {
+		labels = issuesource.LinkedLabels(labels, s.uziLabel(ctx), s.autopilotLabel(ctx), repo.EligibilityTagName.String)
 	}
 	created, err := tr.CreateIssue(ctx, repo.ForgeProjectID, claim.Title, claim.Description, labels)
 	if err != nil {

@@ -91,15 +91,6 @@ func (e *Scheduler) fireSelfImprove(ctx context.Context, sched store.RunSchedule
 		return FireOutcome{}, err
 	}
 
-	// PRD #4173 M4: self-improve files a tracking issue on the repo's issue tracker, and a
-	// linked repo has none to write to until M5 (the write guard would refuse it anyway).
-	// Skipped as a benign, logged no-op before any forge call; never falls back to the forge.
-	if repo.IssueTrackerConnectionID.Valid {
-		e.logger.Info("scheduler: self_improve skipped, issue creation is not offered on a repo linked to an issue tracker",
-			"schedule", sched.ID.String(), "repo", repo.ID.String())
-		return FireOutcome{Matched: 1, Skips: []Skip{{Reason: SkipConfigNotSupported}}}, nil
-	}
-
 	// 2. Active-run pre-check, per repo. On a DB error retry next tick (transient). If a run
 	// is already active for this repo, benign skip — no notification (mirrors firePrompt's
 	// active skip); the per-repo unique index is the hard guard, this just skips the forge work.
@@ -132,9 +123,14 @@ func (e *Scheduler) fireSelfImprove(ctx context.Context, sched store.RunSchedule
 		return FireOutcome{}, fmt.Errorf("build forge driver: %w", err) // transient
 	}
 	// One driver, two halves: MR reads go through the code host, the tracking issue
-	// through the issue tracker.
+	// through the repo's issue side: the forge driver for an unlinked repo, the linked
+	// issue tracker for a linked one (PRD #4173 M5), never the forge for a linked repo.
+	// The tracking issue carries no eligibility tag, so the next linked full sync evicts it.
 	var ch forge.CodeHost = f
-	var tr forge.IssueTracker = f
+	tr, err := e.issueSide(ctx, repo, f)
+	if err != nil {
+		return FireOutcome{}, fmt.Errorf("resolve issue tracker: %w", err) // transient
+	}
 
 	// 4b. Cap concurrent OPEN self-improve MRs per repo (PRD #686 D10/D12). This runs BEFORE
 	// ensureTrackingIssue so a capped cycle does NO forge write. Open-state is resolved LIVE

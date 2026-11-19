@@ -7,7 +7,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgtype"
 
-	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/issuesource"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/schedtmpl"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -156,12 +156,14 @@ func (s *Service) maybeFileProposal(ctx context.Context, run store.Run, proposal
 		slog.Warn("file proposal: build forge", "run_id", run.ID, "error", err)
 		return
 	}
-	// PRD #4173 M4: filing a proposal creates an issue, which a linked repo does not
-	// offer until M5, so it is skipped before the audit row (no pending row is left
-	// behind) and never falls back to the forge, whose project number means nothing there.
-	if repo.IssueTrackerConnectionID.Valid {
-		slog.Warn("file proposal: skipped, issue creation is not offered on a repo linked to an issue tracker",
-			"run_id", run.ID, "repo_id", repo.ID)
+	// A linked repo files through its resolver (PRD #4173 M5), never the forge, whose
+	// project number means nothing there. It is resolved before the audit row so a failed
+	// resolution leaves no pending row behind. The labels are the proposal marker alone:
+	// a scheduled proposal carries no eligibility tag, so the next linked full sync evicts
+	// it from the cache.
+	tr, err := issuesource.For(ctx, s.issueSources, repo.IssueTrackerConnectionID.Valid, run.UserID, repo.ID, f)
+	if err != nil {
+		slog.Warn("file proposal: resolve issue tracker", "run_id", run.ID, "error", err)
 		return
 	}
 
@@ -187,7 +189,6 @@ func (s *Service) maybeFileProposal(ctx context.Context, run store.Run, proposal
 		return
 	}
 
-	var tr forge.IssueTracker = f
 	created, err := tr.CreateIssue(ctx, repo.ForgeProjectID, proposal.Title, proposal.Body, labels)
 	if err != nil {
 		// err is already PAT-redacted by the driver. The pending audit row stays for

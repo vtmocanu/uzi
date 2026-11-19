@@ -101,6 +101,11 @@ func TestMovedLinkedIssueSkipsTheWriteAndTheCodeHostSideCompletesLiveDB(t *testi
 	if err := forgesvc.EnsureBoardColumnRows(ctx, q, repo); err != nil {
 		t.Fatal(err)
 	}
+	// Since M5 the issue tracker refuses a move onto a column with no State mapped before it
+	// reads the issue, and a refusal keeps the marker; the mapping is saved so the write
+	// reaches the moved-away issue and answers not-found.
+	srv.SeedState("In Review", false)
+	saveStateMapping(t, pool, repo)
 	issueN := srv.SeedIssue("a youtrack card", "body", youtracktest.EligibilityTagID)
 	exec(`INSERT INTO issues (repo_id, forge_issue_iid, title, state, labels, web_url, forge_updated_at, synced_at)
 	      VALUES ($1, $2, 't', 'opened', '[]', 'https://yt.test/i', now(), now())`, repo, issueN)

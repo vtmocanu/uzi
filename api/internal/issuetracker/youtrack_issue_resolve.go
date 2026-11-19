@@ -67,8 +67,11 @@ func (y *youTrack) issueByEntity(ctx context.Context, id string) (ytIssue, error
 	if err != nil {
 		return ytIssue{}, err
 	}
-	if !y.inBoundProject(w) || w.ID != id {
-		return ytIssue{}, y.fail("youtrack: created issue is not in the bound project")
+	if !y.inBoundProject(w) {
+		return ytIssue{}, &forge.IssueNotFoundError{Err: y.fail("youtrack: created issue is not in the bound project")}
+	}
+	if w.ID != id {
+		return ytIssue{}, y.fail("youtrack: created issue read back under a different id")
 	}
 	return w, nil
 }

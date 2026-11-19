@@ -89,7 +89,7 @@ func TestAccountCooldownReadersLiveDB(t *testing.T) {
 			if single.AccountCooldownClass.Valid || single.AccountCooldownEligibleAt.Valid {
 				t.Fatal("single board projection survived invalid authority")
 			}
-			cards := assembleCards([]store.Issue{{ForgeIssueIid: r.IssueIid.Int64}}, rows, nil, nil, nil, fx.userID, "github", nil, 0)
+			cards := assembleCards([]store.Issue{{ForgeIssueIid: r.IssueIid.Int64}}, rows, nil, nil, nil, fx.userID, "github", false, nil, 0)
 			board := cards[0].LatestRun
 			if board.Health != "ok" || board.HealthReason != nil || board.AccountCooldownClass != nil {
 				t.Fatalf("stale board: %+v", board)

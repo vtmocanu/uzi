@@ -14,6 +14,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	"github.com/vtmocanu/uzi/api/internal/issuedraft"
+	"github.com/vtmocanu/uzi/api/internal/issuesource"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -133,7 +134,7 @@ func (h *Handler) FileFinding(w http.ResponseWriter, r *http.Request) {
 	// in the body. A user-chosen run-eligible label is therefore the owner's own deliberate
 	// action, not an agent-injected one.
 	marker, _ := h.settings.FindingLabel(ctx)
-	filedLabels, requiredLabels := h.findingFilingLabels(ctx, marker, req.Labels, req.SendToUzi)
+	filedLabels, requiredLabels := h.findingFilingLabels(ctx, repo, marker, req.Labels, req.SendToUzi)
 
 	// (5) Claim-first (D4): a guarded open→filing UPDATE. 0 rows affected means the coordinate
 	// is already filed or being filed (the single row is not `open`), so exactly one of two
@@ -308,7 +309,29 @@ func assembleFindingLabels(marker string, userLabels []string) []string {
 // findingFilingLabels preserves assembleFindingLabels' explicit-label budget, then appends
 // the requested run labels without displacing accepted user labels. Required forge labels
 // are built independently so an explicit-label collision never skips ensuring a run label.
-func (h *Handler) findingFilingLabels(ctx context.Context, marker string, userLabels []string, sendToUzi bool) ([]string, []forge.Label) {
+//
+// On a repo linked to an issue tracker the filed set maps the uzi label to the stored
+// eligibility name and drops the autopilot label, and neither run label is ensured: the
+// eligibility tag already exists by id and is never created, and autopilot is not
+// offered (PRD #4173 D12, D14).
+func (h *Handler) findingFilingLabels(ctx context.Context, repo store.GetRepoForUserRow, marker string, userLabels []string, sendToUzi bool) ([]string, []forge.Label) {
+	filed, required := h.forgeFindingFilingLabels(ctx, marker, userLabels, sendToUzi)
+	eligibility, linked := linkedEligibility(repo)
+	if !linked {
+		return filed, required
+	}
+	uzi, autopilot := h.runLabelNames(ctx)
+	linkedRequired := make([]forge.Label, 0, len(required))
+	for _, l := range required {
+		if l.Name != uzi && l.Name != autopilot && l.Name != eligibility {
+			linkedRequired = append(linkedRequired, l)
+		}
+	}
+	return issuesource.LinkedLabels(filed, uzi, autopilot, eligibility), linkedRequired
+}
+
+// forgeFindingFilingLabels is the unlinked assembly findingFilingLabels starts from.
+func (h *Handler) forgeFindingFilingLabels(ctx context.Context, marker string, userLabels []string, sendToUzi bool) ([]string, []forge.Label) {
 	filed := assembleFindingLabels(marker, userLabels)
 	required := []forge.Label{{Name: marker}}
 	if !sendToUzi {

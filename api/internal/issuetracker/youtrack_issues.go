@@ -8,6 +8,7 @@ import (
 	"slices"
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/issuesource"
 )
 
 // ListIssues implements forge.IssueTracker. Without labels it queries the
@@ -22,6 +23,23 @@ import (
 // ceilings before the project filter, so a tag with more issues elsewhere than
 // a ceiling allows fails the listing rather than returning part of it.
 func (y *youTrack) ListIssues(ctx context.Context, projectID int64, opts forge.ListIssuesOptions) ([]forge.Issue, error) {
+	stated, err := y.ListIssuesWithState(ctx, projectID, opts)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]forge.Issue, 0, len(stated))
+	for _, s := range stated {
+		out = append(out, s.Issue)
+	}
+	return out, nil
+}
+
+// ListIssuesWithState lists the issues ListIssues does, from the same single
+// walk, each with the name of its State field value ("" when it has none, or
+// when the name is one stateNameProblem refuses). It implements
+// issuesource.IssueStateLister. An issue with more than maxCustomFields custom
+// fields fails the listing.
+func (y *youTrack) ListIssuesWithState(ctx context.Context, projectID int64, opts forge.ListIssuesOptions) ([]issuesource.StatedIssue, error) {
 	p, err := y.requireProject(projectID)
 	if err != nil {
 		return nil, err
@@ -35,13 +53,13 @@ func (y *youTrack) ListIssues(ctx context.Context, projectID int64, opts forge.L
 	}
 	for _, l := range opts.Labels {
 		if _, ok := tagIDs[l]; !ok {
-			return []forge.Issue{}, nil
+			return []issuesource.StatedIssue{}, nil
 		}
 	}
 	byTag := len(opts.Labels) > 0
-	path, query := []string{"issues"}, url.Values{"query": {issueQuery(p.ShortName, opts)}, "fields": {issueFields}}
+	path, query := []string{"issues"}, url.Values{"query": {issueQuery(p.ShortName, opts)}, "fields": {listingIssueFields}}
 	if byTag {
-		path, query = []string{"tags", y.listingTagID(opts.Labels, tagIDs), "issues"}, url.Values{"fields": {issueFields}}
+		path, query = []string{"tags", y.listingTagID(opts.Labels, tagIDs), "issues"}, url.Values{"fields": {listingIssueFields}}
 	}
 	var matched []ytIssue
 	seen := map[string]bool{}
@@ -69,13 +87,13 @@ func (y *youTrack) ListIssues(ctx context.Context, projectID int64, opts forge.L
 	if opts.Limit > 0 && len(matched) > opts.Limit {
 		matched = matched[:opts.Limit]
 	}
-	out := make([]forge.Issue, 0, len(matched))
+	out := make([]issuesource.StatedIssue, 0, len(matched))
 	for _, w := range matched {
 		issue, err := y.toIssue(ctx, w)
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, issue)
+		out = append(out, issuesource.StatedIssue{Issue: issue, State: y.stateName(w)})
 	}
 	return out, nil
 }
@@ -98,6 +116,8 @@ func (y *youTrack) GetIssue(ctx context.Context, projectID, issueIID int64) (for
 	}
 	return y.toIssue(ctx, w)
 }
+
+var _ issuesource.IssueStateLister = (*youTrack)(nil)
 
 // CreateIssue implements forge.IssueTracker. The labels resolve to tag ids first
 // (see resolveTagIDs; created when missing), so a failure there leaves no issue

@@ -24,11 +24,12 @@ type Sources interface {
 // is deliberately no fallback to the forge, whose issue numbers mean nothing there.
 var ErrNotWired = errors.New("repo is linked to an issue tracker but no issue tracker source is wired")
 
-// ErrIssueWriteNotOffered is returned for every write to a linked external issue
-// tracker (YouTrack writes arrive in PRD #4173 M5). forgesvc.ErrIssueWriteNotOffered
-// is this same value; it lives here so a package that cannot import forgesvc can
-// wrap and match it.
-var ErrIssueWriteNotOffered = errors.New("issue writes on a repo linked to an issue tracker are not offered yet")
+// ErrIssueWriteNotOffered is returned for the one write to a linked external issue
+// tracker that is not offered: a label write that removes the eligibility name
+// (PRD #4173 M5).
+// forgesvc.ErrIssueWriteNotOffered is this same value; it lives here so a package that
+// cannot import forgesvc can wrap and match it.
+var ErrIssueWriteNotOffered = errors.New("this issue write is not offered on a repo linked to an issue tracker")
 
 // For returns the issue side a caller should use for one repo row. linked is
 // whether the row's issue_tracker_connection_id is set. An unlinked row gets
@@ -42,4 +43,32 @@ func For(ctx context.Context, src Sources, linked bool, userID, repoID uuid.UUID
 		return nil, ErrNotWired
 	}
 	return src.IssueTrackerForRepo(ctx, userID, repoID)
+}
+
+// LinkedLabels is the label set an issue uzi creates on a repo linked to an issue tracker
+// carries (PRD #4173 D12, D14): the configured uzi label becomes the link's stored
+// eligibility name, the autopilot label is dropped because autopilot is not offered on a
+// linked repo, and each name appears once, in the order first seen. A blank name is
+// dropped. Only a linked repo's create site calls it; an unlinked repo keeps its labels
+// untouched.
+func LinkedLabels(labels []string, uziLabel, autopilotLabel, eligibilityName string) []string {
+	out := make([]string, 0, len(labels))
+	seen := make(map[string]struct{}, len(labels))
+	for _, l := range labels {
+		if l == autopilotLabel {
+			continue
+		}
+		if l == uziLabel {
+			l = eligibilityName
+		}
+		if l == "" {
+			continue
+		}
+		if _, dup := seen[l]; dup {
+			continue
+		}
+		seen[l] = struct{}{}
+		out = append(out, l)
+	}
+	return out
 }

@@ -111,17 +111,38 @@ func TestLinkedProposalDigestWithoutSourcesIsSkipped(t *testing.T) {
 	}
 }
 
-func TestLinkedSelfImproveIsSkippedWithoutAnyIssueWrite(t *testing.T) {
-	h, tr, _ := linkedHarness(true)
+// PRD #4173 M5 (converted from TestLinkedSelfImproveIsSkippedWithoutAnyIssueWrite, the M4
+// refusal): the tracking issue is created through the resolver's issue side, never the
+// forge, carries only the tracking label (no eligibility tag), and the cycle starts.
+func TestLinkedSelfImproveFilesTheTrackingIssueThroughTheResolver(t *testing.T) {
+	h, tr, src := linkedHarness(true)
+	tr.createdIID = 501
 	out, err := h.sched.fireOne(context.Background(), h.selfImproveSchedule())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(out.Skips) != 1 || out.Skips[0].Reason != SkipConfigNotSupported {
-		t.Fatalf("out = %+v, want one config_not_supported skip", out)
+	if len(out.Started) != 1 || len(h.runs.selfImprove) != 1 {
+		t.Fatalf("out = %+v, runs = %d, want one started self_improve run", out, len(h.runs.selfImprove))
 	}
-	if h.fb.f.createCount != 0 || h.fb.f.listCount != 0 || tr.createCount != 0 || tr.listCount != 0 || len(h.runs.selfImprove) != 0 {
-		t.Fatal("self_improve touched an issue tracker or started a run on a linked repo")
+	if tr.listCount != 1 || tr.createCount != 1 || h.fb.f.createCount != 0 || h.fb.f.listCount != 0 {
+		t.Fatalf("resolver list/create = %d/%d, forge list/create = %d/%d, want 1/1 and 0/0",
+			tr.listCount, tr.createCount, h.fb.f.listCount, h.fb.f.createCount)
+	}
+	if len(tr.createdLabels) != 1 || tr.createdLabels[0] != SelfImproveTrackingLabel {
+		t.Fatalf("tracking issue labels = %v, want only %q", tr.createdLabels, SelfImproveTrackingLabel)
+	}
+	if len(src.users) == 0 || src.users[0] != h.owner || src.repos[0] != h.repoID {
+		t.Fatalf("the resolver is bound by owner and repo row, got %v %v", src.users, src.repos)
+	}
+}
+
+func TestLinkedSelfImproveWithoutSourcesFailsClosedAndNeverTouchesTheForge(t *testing.T) {
+	h, _, _ := linkedHarness(false)
+	if _, err := h.sched.fireOne(context.Background(), h.selfImproveSchedule()); err == nil {
+		t.Fatal("a linked repo with no resolver fired")
+	}
+	if h.fb.f.createCount != 0 || h.fb.f.listCount != 0 || len(h.runs.selfImprove) != 0 {
+		t.Fatal("self_improve fell back to the forge or started a run on an unresolved linked repo")
 	}
 }
 

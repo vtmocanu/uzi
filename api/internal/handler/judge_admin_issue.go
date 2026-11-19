@@ -270,7 +270,7 @@ func (h *Handler) AdminFileJudgeIssue(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	created, err := tr.CreateIssue(ctx, repo.ForgeProjectID, title, description, labels)
+	created, err := tr.CreateIssue(ctx, repo.ForgeProjectID, title, description, h.createLabelsFor(ctx, repo, labels))
 	if err != nil {
 		// Forge rejected the write: the claim reverts, nothing persists, the coordinate is
 		// fileable again. err is already PAT-redacted by the driver.

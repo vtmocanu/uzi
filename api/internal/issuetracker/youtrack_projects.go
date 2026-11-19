@@ -30,14 +30,19 @@ type ytProjectField struct {
 }
 
 type ytStateValue struct {
-	ID         string `json:"id"`
-	Name       string `json:"name"`
-	IsResolved bool   `json:"isResolved"`
-	Ordinal    int    `json:"ordinal"`
+	ID            string `json:"id"`
+	Name          string `json:"name"`
+	LocalizedName string `json:"localizedName"`
+	IsResolved    bool   `json:"isResolved"`
+	Archived      bool   `json:"archived"`
+	Ordinal       int    `json:"ordinal"`
 }
 
 // ListStates implements Driver. It finds the project's State field (named by
-// Options.StateField, "State" by default) and lists the values of its bundle.
+// Options.StateField, "State" by default) and lists the values of its bundle. A
+// value with a malformed id fails the listing. A value whose name
+// stateNameProblem refuses is left out, and a localized name it refuses is
+// cleared, because any user who administers a bundle can name its values.
 func (y *youTrack) ListStates(ctx context.Context, projectID string) ([]State, error) {
 	if !entityIDRE.MatchString(projectID) {
 		return nil, y.fail("youtrack: invalid project id")
@@ -61,13 +66,23 @@ func (y *youTrack) ListStates(ctx context.Context, projectID string) ([]State, e
 		return nil, y.fail("youtrack: state field with a malformed id in the response")
 	}
 	values, err := ytList[ytStateValue](ctx, y, []string{"admin", "projects", projectID, "customFields", fieldID, "bundle", "values"},
-		url.Values{"fields": {"id,name,isResolved,ordinal"}})
+		url.Values{"fields": {"id,name,localizedName,isResolved,archived,ordinal"}})
 	if err != nil {
 		return nil, err
 	}
 	out := make([]State, 0, len(values))
 	for _, v := range values {
-		out = append(out, State{ID: v.ID, Name: v.Name, Resolved: v.IsResolved, Ordinal: v.Ordinal})
+		if !entityIDRE.MatchString(v.ID) {
+			return nil, y.fail("youtrack: state with a malformed id in the response")
+		}
+		if stateNameProblem(v.Name) {
+			continue
+		}
+		localized := v.LocalizedName
+		if stateNameProblem(localized) {
+			localized = ""
+		}
+		out = append(out, State{ID: v.ID, Name: v.Name, LocalizedName: localized, Resolved: v.IsResolved, Archived: v.Archived, Ordinal: v.Ordinal})
 	}
 	return out, nil
 }

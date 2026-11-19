@@ -1126,6 +1126,9 @@ var wantRouteMounts = []routeMount{
 	{"PUT", "/api/repos/{id}/github-project-sync/visibility", noLimiter},
 	// PRD #4173 M4: the repo link reads the issue tracker (token, projects, tags).
 	{"PUT", "/api/repos/{id}/issue-tracker-link", limForge},
+	// PRD #4173 M5: the State mapping reads the issue tracker's States on both verbs.
+	{"GET", "/api/repos/{id}/issue-tracker-link/states", limForge},
+	{"PUT", "/api/repos/{id}/issue-tracker-link/states", limForge},
 	{"PUT", "/api/repos/{id}/tool-profile", noLimiter},
 	{"PUT", "/api/repos/{id}/env/{name}", noLimiter},
 	// PRD #35 Decision 7, the per-run toggle. noLimiter for the same reason as

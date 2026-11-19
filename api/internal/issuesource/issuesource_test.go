@@ -45,3 +45,40 @@ func TestForLinkedUsesSourcesAndFailsClosedWithout(t *testing.T) {
 		t.Fatalf("resolver error lost: %v", err)
 	}
 }
+
+func TestLinkedLabels(t *testing.T) {
+	cases := []struct {
+		name   string
+		labels []string
+		want   []string
+	}{
+		{"uzi becomes the eligibility name", []string{"uzi"}, []string{"ready"}},
+		{"autopilot is dropped", []string{"uzi", "autopilot"}, []string{"ready"}},
+		{"order is kept", []string{"finding", "autopilot", "uzi", "extra"}, []string{"finding", "ready", "extra"}},
+		{"dedupe after the mapping", []string{"uzi", "ready", "uzi"}, []string{"ready"}},
+		{"no run labels", []string{"finding"}, []string{"finding"}},
+		{"empty", nil, []string{}},
+		{"only autopilot", []string{"autopilot"}, []string{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := LinkedLabels(tc.labels, "uzi", "autopilot", "ready")
+			if len(got) != len(tc.want) {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Fatalf("got %v, want %v", got, tc.want)
+				}
+			}
+		})
+	}
+}
+
+func TestLinkedLabelsDoesNotMutateItsInput(t *testing.T) {
+	in := []string{"uzi", "autopilot"}
+	_ = LinkedLabels(in, "uzi", "autopilot", "ready")
+	if in[0] != "uzi" || in[1] != "autopilot" {
+		t.Fatalf("input mutated: %v", in)
+	}
+}

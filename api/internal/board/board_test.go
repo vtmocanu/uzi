@@ -128,3 +128,43 @@ func TestPlanLabelMove(t *testing.T) {
 		})
 	}
 }
+
+func TestCardColumnLabels(t *testing.T) {
+	labels := []string{"uzi", "Planned"}
+	tests := []struct {
+		name   string
+		linked bool
+		labels []string
+		column string
+		want   []string
+	}{
+		{"unlinked keeps the labels", false, labels, "", labels},
+		{"unlinked ignores a stray cached column", false, labels, "In Progress", labels},
+		{"unlinked nil stays nil", false, nil, "", nil},
+		{"linked reads the cached column only", true, labels, "In Progress", []string{"In Progress"}},
+		{"linked with no cached column is the Open lane", true, labels, "", nil},
+		{"linked never reads a column label", true, []string{"Planned"}, "", nil},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := CardColumnLabels(tc.linked, tc.labels, tc.column)
+			if len(got) != len(tc.want) || (tc.want == nil) != (got == nil) {
+				t.Fatalf("CardColumnLabels = %#v, want %#v", got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Fatalf("CardColumnLabels = %#v, want %#v", got, tc.want)
+				}
+			}
+		})
+	}
+	// The unlinked result is the input slice itself, so ResolveColumn sees identical input.
+	if got := CardColumnLabels(false, labels, "x"); &got[0] != &labels[0] {
+		t.Fatal("an unlinked repo must get its labels back unchanged")
+	}
+	pos := map[string]int{"In Progress": 1, "Planned": 0}
+	col, closed, conflict := ResolveColumn(CardColumnLabels(true, labels, "In Progress"), "opened", pos)
+	if col != "In Progress" || closed || conflict {
+		t.Fatalf("ResolveColumn = %q %v %v", col, closed, conflict)
+	}
+}
