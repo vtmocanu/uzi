@@ -22,6 +22,7 @@ import (
 
 	"github.com/vtmocanu/uzi/controller/internal/preset"
 	"github.com/vtmocanu/uzi/controller/internal/protocol"
+	"github.com/vtmocanu/uzi/controller/internal/reconcile"
 )
 
 // Lost-canary recovery (issue #4466). These tests drive a real cohort through the
@@ -803,11 +804,18 @@ func noNewCanaryWhileProven(t *testing.T, foreign bool) {
 			t.Fatalf("a drifted unreserved worker was written while reservations were orphaned: %v", actionTrace(o.c))
 		}
 	}
-	if got := templatePatches(o.c); len(got) != 0 {
-		t.Fatalf("template patched while the cohort had no canary: %v", got)
+	for _, name := range templatePatches(o.c) {
+		if name != "uzi-hw-w9" { // the foreign owner's own pool rolls independently
+			t.Fatalf("template patched while the cohort had no canary: %v", templatePatches(o.c))
+		}
 	}
 	if mk := o.marker(t, "w4"); mk != nil {
 		t.Fatalf("w4 was admitted: %+v", mk)
+	}
+	if foreign {
+		if mk := o.marker(t, "w9"); mk == nil || !mk.Canary {
+			t.Fatalf("the foreign canary did not survive the tick under test: %+v", mk)
+		}
 	}
 	if _, _, _, canary := o.pacing("w4"); canary == "w4" {
 		t.Fatal("w4 reported as canary")
@@ -1093,9 +1101,18 @@ func (o *orphanCohort) addForeignCanary(t *testing.T, id, owner string) {
 	if !ok {
 		t.Fatal("foreign worker has no coverage evidence")
 	}
-	// A complete, decodable reservation copied from a participant, re-owned.
+	// A complete, decodable reservation copied from a participant, re-owned and
+	// re-pinned to w9's own rendered target, so owner-B's pool keeps it instead of
+	// cancelling it as an obsolete pin (independently of pool iteration order).
+	spec, err := o.m.resolver.Resolve(w.Template, w.Size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := RenderDeployment(o.m.renderCfgFor(context.Background(), w, reconcile.ObservedWorker{}), w, spec)
 	mk := o.marker(t, "w2")
 	mk.Coverage, mk.Canary, mk.Completed = cov, true, false
+	mk.Hash, mk.Image = target.Spec.Template.Annotations[AnnotationSpecHash], workerImage(target)
+	mk.TargetVersion = targetVersion(o.m.cfg, mk.Image)
 	raw, _ := json.Marshal(mk)
 	if d.Annotations == nil {
 		d.Annotations = map[string]string{}
