@@ -1100,10 +1100,26 @@ db_psql() {
 # only `\r`, keeping `\n` row separators, and drops any DML command-completion tag LINE
 # (see db_psql) so a stray `INSERT 0 1` can never masquerade as an enumerated row. PGPW
 # is the memoized module var db_psql uses.
-db_psql_rows() {
-  [ -n "$PGPW" ] || PGPW="$(grep '^POSTGRES_PASSWORD=' "$ENVFILE" | cut -d= -f2-)"
-  "${COMPOSE[@]}" exec -T -e PGPASSWORD="$PGPW" db psql -U uzi -d uzi -tAc "$1" | _psql_strip_tags
-}
+#
+# Optional SECS (a positive integer, else return 1) bounds the whole read: the compose exec runs
+# under `timeout --signal=KILL SECS` (or `gtimeout`); with neither installed it prints
+# 'db_psql_rows: no timeout limiter' to stderr and returns non-zero rather than run unbounded.
+# The body is a ( ... ) subshell with its own `set -o pipefail`, so a psql/compose failure or a
+# limiter kill is the function's exit status instead of being masked by the strip filter, and the
+# option never leaks into the caller. (PGPW is therefore re-read per call; the grep is cheap.)
+db_psql_rows() (
+  set -o pipefail
+  local pw="$PGPW" secs="${2:-}" lim=()
+  [ -n "$pw" ] || pw="$(grep '^POSTGRES_PASSWORD=' "$ENVFILE" | cut -d= -f2-)"
+  if [ -n "$secs" ]; then
+    case "$secs" in *[!0-9]*) return 1 ;; esac
+    [ "$((10#$secs))" -gt 0 ] || return 1
+    if command -v timeout >/dev/null 2>&1; then lim=(timeout --signal=KILL "$secs")
+    elif command -v gtimeout >/dev/null 2>&1; then lim=(gtimeout --signal=KILL "$secs")
+    else echo 'db_psql_rows: no timeout limiter' >&2; return 1; fi
+  fi
+  "${lim[@]}" "${COMPOSE[@]}" exec -T -e PGPASSWORD="$pw" db psql -U uzi -d uzi -tAc "$1" | _psql_strip_tags
+)
 # create_run REPO_ID ISSUE_IID — POST a run, tolerating ONLY the transient
 # `404 "issue not found on this repo's board"`. That 404 is a create-then-immediately-use
 # race against the fast (2s) poller the PRD #24 MR-close phase leaves running: a board
@@ -1150,6 +1166,21 @@ apiput_code() { curl -sS -o /dev/null -w '%{http_code}' -b "$JAR" -X PUT "$BASE$
 # asserting a 422 (the uzi run-eligibility gate refusing a non-uzi issue).
 apipost_code() { curl -sS -o /dev/null -w '%{http_code}' -b "$JAR" -X POST "$BASE$1" \
   -H 'Content-Type: application/json' -H "X-CSRF-Token: $(csrf)" -d "$2"; }
+# boundary_cancel PATH SECS EVIDENCE_PREFIX — the end-of-phase boundary's one-shot run cancel
+# (e2e/driver.sh). Bounded by curl --max-time SECS, and every outcome is kept as evidence files:
+# PREFIX.body (response), PREFIX.http (status), PREFIX.stderr, PREFIX.exit (curl's exit status).
+# Returns 0 iff curl exited 0 AND the status is 2xx; a timeout (curl 28), a transport failure and a
+# 4xx/5xx all return 1, and the caller reads PREFIX.exit/.http to tell them apart.
+boundary_cancel() {
+  local rc=0 code
+  curl -sS --max-time "$2" -o "$3.body" -w '%{http_code}' -b "$JAR" -X POST "$BASE$1" \
+    -H 'Content-Type: application/json' -H "X-CSRF-Token: $(csrf)" \
+    -d '{"kind":"cancel","body":""}' > "$3.http" 2> "$3.stderr" || rc=$?
+  printf '%s\n' "$rc" > "$3.exit"
+  [ "$rc" -eq 0 ] || return 1
+  code="$(cat "$3.http")"
+  case "$code" in 2??) return 0 ;; *) return 1 ;; esac
+}
 
 # wait_http — poll /api/health until the stack answers. Instrumented (PRD #97 M9b)
 # even though it is defined ABOVE record_margin: bash resolves function names at call
