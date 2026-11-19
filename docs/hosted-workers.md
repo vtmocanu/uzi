@@ -797,16 +797,19 @@ A roll pool whose participants still carry incomplete reservations but no canary
 (for example after its reservation annotation was reset) recovers on its own when
 one participant already has full current-incarnation proof: a fresh registration,
 exact version, heartbeat and coverage on its reserved template with one replica,
-and it is not cordoned or drained. The first tick only marks that participant canary and does nothing else in the
+and it is not cordoned or drained.
+The first tick only marks that participant canary and does nothing else in the
 pool. Later ticks restore the other participants through normal admission, for
 example recreating a paused worker's claims and scaling it back. Removing only one
 participant's marker, uncordoning, or deleting a previously registered worker's
 Deployment need not repair the pool: the other markers remain, uncordoning alone
-supplies no registration proof, and deletion loses the evidence: unless the
-worker kept a retained claim reservation or is under independent maintenance, it
-usually trips the missing-deployment guard (`missing deployment lacks
+supplies no registration proof, and deletion loses the evidence. A deleted
+worker usually trips the missing-deployment guard (`missing deployment lacks
 first-provision evidence; explicit recovery required`), which blocks adoption for
-the whole pool and leaves that Deployment missing until explicit recovery.
+the whole pool. If it kept a retained claim reservation, the guard is avoided but
+the pool still holds with `participant reservation without canary; explicit
+recovery required`. Either way that Deployment stays missing until a canary
+exists again or explicit recovery.
 
 While no canary exists the pool can stay held:
 
