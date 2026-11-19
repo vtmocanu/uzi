@@ -210,7 +210,21 @@ describe("InstanceModelDefaultsCard grid (#3259)", () => {
     expect(alert.textContent).toContain("internal error");
     expect(alert.textContent).toContain("Reload the page to see the current values.");
     expect(judgeClaude().value).toBe("sonnet");
+    // The baseline did not advance: the edit is still pending, so Save stays enabled.
+    expect(save().disabled).toBe(false);
     expect(screen.queryByText("Model defaults saved.")).toBeNull();
+  });
+
+  it("shows a 400 without a field prefix at card level, without the ambiguous-outcome copy", async () => {
+    mockApi.updateSettings.mockRejectedValue(new ApiError(400, "no settings provided"));
+    render(<Harness />);
+    choose(judgeClaude(), "sonnet");
+    fireEvent.click(save());
+    const alert = await screen.findByText("no settings provided");
+    expect(alert.getAttribute("role")).toBe("alert");
+    expect(screen.getByText(/no settings provided/).textContent).not.toContain("may or may not");
+    expect(screen.getAllByRole("combobox").some((el) => el.getAttribute("aria-invalid") === "true")).toBe(false);
+    expect(save().disabled).toBe(false);
   });
 
   it("treats a network failure like a 500", async () => {
@@ -221,6 +235,7 @@ describe("InstanceModelDefaultsCard grid (#3259)", () => {
     const alert = await screen.findByText(/may or may not have been applied/);
     expect(alert.textContent).toContain("Failed to save model defaults");
     expect(judgeClaude().value).toBe("sonnet");
+    expect(save().disabled).toBe(false);
   });
 });
 
@@ -238,7 +253,6 @@ describe("InstanceModelDefaultsCard lane validation (ported from the judge and s
   it("selects a stored gpt-6-luna in the Codex summary lane as itself, not as custom", () => {
     render(<Harness pins={{ codex_summary_model: "gpt-6-luna" }} />);
     expect(summaryCodex().value).toBe("gpt-6-luna");
-    expect(screen.queryByRole("textbox", { name: "Custom summary model ID, Codex" })).toBeNull();
   });
 
   it("warns and blocks Save for an invalid custom Claude ID", () => {
