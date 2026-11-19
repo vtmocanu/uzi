@@ -13,8 +13,9 @@ import (
 )
 
 // modelSettingSpec describes one settable model or effort setting of `uzi settings set|reset`
-// (PRD #3264). Adding a setting (the cross-check pins, #3264 M2) is one more entry in
-// modelSettingSpecs; the command, the validation and the output read this table.
+// (PRD #3264). Adding a one-value setting is one more entry in modelSettingSpecs; the command,
+// the validation and the output read this table. The cross-check pins have their own path
+// (runCrossCheckWrite).
 type modelSettingSpec struct {
 	// name is the CLI setting name.
 	name string
@@ -95,42 +96,161 @@ func (s modelSettingSpec) apiField(harness string, harnessSet bool) (string, err
 	return field, nil
 }
 
+// crossCheckSetting is the CLI name of the cross-check pin setting (PRD #3264 M2). It is not a
+// modelSettingSpec: it has a stage and two members instead of one harness lane and one value.
+const crossCheckSetting = "cross-check"
+
+// crossCheckFlags are the cross-check selectors of `uzi settings set|reset`.
+type crossCheckFlags struct {
+	stage, model, effort string
+}
+
+// crossCheckColumns is the header of the cross-check table, the same columns `uzi settings get` prints.
+var crossCheckColumns = []string{"STAGE", "HARNESS", "STATUS", "STORED MODEL", "WORKER DEFAULT MODEL",
+	"RESOLVED MODEL", "MODEL SOURCE", "STORED EFFORT", "RESOLVED EFFORT", "EFFORT SOURCE"}
+
+// crossCheckEffortLevels are the effort levels a checker pin accepts: the worker levels without runtime.
+var crossCheckEffortLevels = slices.DeleteFunc(slices.Clone(effortLevels), func(l string) bool { return l == "runtime" })
+
 func newSettingsSetCmd(env Env, gf *globalFlags) *cobra.Command {
 	var harness string
+	var cc crossCheckFlags
 	cmd := &cobra.Command{
-		Use:   "set <setting> <value>",
-		Short: "Set a model or effort default: worker-model, effort, judge-model, summary-model, judge-runs-on",
+		Use:   "set <setting> [<value>]",
+		Short: "Set a model or effort default: worker-model, effort, judge-model, summary-model, judge-runs-on, cross-check",
 		Long: "Set one model or effort default for new runs.\n\n" +
 			"  uzi settings set worker-model --harness claude <model-id>\n" +
 			"  uzi settings set effort --harness codex <low|medium|high|xhigh|max|runtime>\n" +
 			"  uzi settings set judge-model --harness codex <model-id>\n" +
 			"  uzi settings set summary-model --harness claude <model-id>\n" +
-			"  uzi settings set judge-runs-on <same-as-run|claude|codex>\n\n" +
+			"  uzi settings set judge-runs-on <same-as-run|claude|codex>\n" +
+			"  uzi settings set cross-check --stage plan|code --harness claude|codex [--model <model-id>] [--effort <low|medium|high|xhigh|max>]\n\n" +
 			"worker-model, effort, judge-model and summary-model need --harness claude|codex; judge-runs-on\n" +
-			"takes none. A model id is passed through and the server validates it. Undo with `uzi settings reset`.",
-		Args: cobra.ExactArgs(2),
+			"takes none. cross-check pins the checker of one stage and family: it takes no value, needs --stage and\n" +
+			"--harness and at least one of --model and --effort, and leaves a member you omit unchanged. A model id\n" +
+			"is passed through and the server validates it. Undo with `uzi settings reset`.",
+		Args: cobra.RangeArgs(1, 2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runModelSettingWrite(cmd, env, gf, args[0], harness, cmd.Flags().Changed("harness"), &args[1])
+			flags := cmd.Flags()
+			if args[0] == crossCheckSetting {
+				if len(args) != 1 {
+					return uzicli.Exitf(uzicli.ExitUsage, "cross-check takes no value; use --model and --effort")
+				}
+				return runCrossCheckWrite(cmd, env, gf, cc, harness, flags.Changed("harness"), flags.Changed("stage"),
+					flags.Changed("model"), flags.Changed("effort"), false)
+			}
+			if flags.Changed("stage") || flags.Changed("model") || flags.Changed("effort") {
+				return uzicli.Exitf(uzicli.ExitUsage, "--stage, --model and --effort apply only to the cross-check setting")
+			}
+			if len(args) != 2 {
+				return uzicli.Exitf(uzicli.ExitUsage, "usage: uzi settings set <setting> <value>")
+			}
+			return runModelSettingWrite(cmd, env, gf, args[0], harness, flags.Changed("harness"), &args[1])
 		},
 	}
 	cmd.Flags().StringVar(&harness, "harness", "", "harness the setting applies to: claude or codex")
+	cmd.Flags().StringVar(&cc.stage, "stage", "", "cross-check stage: plan or code")
+	cmd.Flags().StringVar(&cc.model, "model", "", "cross-check checker model id")
+	cmd.Flags().StringVar(&cc.effort, "effort", "", "cross-check checker effort: low, medium, high, xhigh or max")
 	return cmd
 }
 
 func newSettingsResetCmd(env Env, gf *globalFlags) *cobra.Command {
 	var harness string
+	var cc crossCheckFlags
 	cmd := &cobra.Command{
 		Use:   "reset <setting>",
 		Short: "Clear a model or effort default back to its inherited value",
 		Long: "Clear one model or effort default so it inherits again (judge-runs-on returns to same as the run).\n" +
-			"Takes the same settings and --harness as `uzi settings set`.",
+			"Takes the same settings and --harness as `uzi settings set`.\n\n" +
+			"  uzi settings reset cross-check --stage plan|code --harness claude|codex\n\n" +
+			"clears both the model and the effort pin of that checker cell, so it follows the worker default again.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runModelSettingWrite(cmd, env, gf, args[0], harness, cmd.Flags().Changed("harness"), nil)
+			flags := cmd.Flags()
+			if args[0] == crossCheckSetting {
+				return runCrossCheckWrite(cmd, env, gf, cc, harness, flags.Changed("harness"), flags.Changed("stage"), false, false, true)
+			}
+			if flags.Changed("stage") {
+				return uzicli.Exitf(uzicli.ExitUsage, "--stage applies only to the cross-check setting")
+			}
+			return runModelSettingWrite(cmd, env, gf, args[0], harness, flags.Changed("harness"), nil)
 		},
 	}
 	cmd.Flags().StringVar(&harness, "harness", "", "harness the setting applies to: claude or codex")
+	cmd.Flags().StringVar(&cc.stage, "stage", "", "cross-check stage: plan or code")
 	return cmd
+}
+
+// runCrossCheckWrite validates a cross-check write client-side (exit 2, no request), sends one cell
+// holding only the members being changed (a reset sends both as null), then prints that cell.
+func runCrossCheckWrite(cmd *cobra.Command, env Env, gf *globalFlags, cc crossCheckFlags, harness string,
+	harnessSet, stageSet, modelSet, effortSet, reset bool) error {
+	if !stageSet || !slices.Contains([]string{"plan", "code"}, cc.stage) {
+		return uzicli.Exitf(uzicli.ExitUsage, "cross-check needs --stage plan or --stage code")
+	}
+	if !harnessSet || !slices.Contains([]string{"claude", "codex"}, harness) {
+		return uzicli.Exitf(uzicli.ExitUsage, "cross-check needs --harness claude or --harness codex")
+	}
+	members := map[string]*string{}
+	if reset {
+		members["model"], members["effort"] = nil, nil
+	} else {
+		if !modelSet && !effortSet {
+			return uzicli.Exitf(uzicli.ExitUsage, "cross-check needs --model, --effort or both")
+		}
+		if modelSet {
+			m, err := parseModelID(cc.model)
+			if err != nil {
+				return uzicli.Exitf(uzicli.ExitUsage, "%v", err)
+			}
+			members["model"] = m
+		}
+		if effortSet {
+			if !slices.Contains(crossCheckEffortLevels, cc.effort) {
+				return uzicli.Exitf(uzicli.ExitUsage, "invalid cross-check effort %q; use %s", cc.effort, strings.Join(crossCheckEffortLevels, ", "))
+			}
+			e := cc.effort
+			members["effort"] = &e
+		}
+	}
+	c, err := env.client(gf)
+	if err != nil {
+		return err
+	}
+	res, err := c.PutCrossCheckPins(cmd.Context(), []uzicli.CrossCheckPinWire{{Stage: cc.stage, Harness: harness, Members: members}})
+	if err != nil {
+		return err
+	}
+	p := env.printer(gf)
+	if p.Format == uzicli.FormatJSON {
+		return printModelSettingsJSON(p, res)
+	}
+	var rows [][]string
+	for _, row := range settingsCrossCheckRows(res.Settings) {
+		if row[0] == cc.stage && row[1] == harness {
+			rows = append(rows, row)
+		}
+	}
+	if len(rows) == 0 {
+		p.Println("Saved cross-check " + cc.stage + " (" + harness + ")")
+		return nil
+	}
+	p.Println("Cross-check")
+	return p.Table(crossCheckColumns, rows)
+}
+
+// printModelSettingsJSON prints the server's {"settings": ...} envelope unchanged, re-encoding the
+// decoded settings only when the client kept no raw bytes.
+func printModelSettingsJSON(p *uzicli.Printer, res uzicli.ModelSettingsResult) error {
+	raw := res.Raw
+	if len(raw) == 0 {
+		var err error
+		if raw, err = json.Marshal(map[string]apitypes.UserSettingsDTO{"settings": res.Settings}); err != nil {
+			return err
+		}
+	}
+	return p.JSON(raw)
 }
 
 // runModelSettingWrite validates everything client-side (exit 2, no request), sends the one-field
@@ -160,13 +280,7 @@ func runModelSettingWrite(cmd *cobra.Command, env Env, gf *globalFlags, setting,
 	}
 	p := env.printer(gf)
 	if p.Format == uzicli.FormatJSON {
-		raw := res.Raw
-		if len(raw) == 0 {
-			if raw, err = json.Marshal(map[string]apitypes.UserSettingsDTO{"settings": res.Settings}); err != nil {
-				return err
-			}
-		}
-		return p.JSON(raw)
+		return printModelSettingsJSON(p, res)
 	}
 	// The write is durable once the PUT answers 200, so a failed effective readback never fails
 	// the command: readEffectiveSettings reports it on stderr and the stored values are shown.

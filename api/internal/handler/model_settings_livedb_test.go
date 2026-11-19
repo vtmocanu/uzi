@@ -185,6 +185,11 @@ func TestPutMyModelSettingsParityWithPutMySettingsLiveDB(t *testing.T) {
 		{"codex_summary_model", `"gpt-6-luna"`, true},
 		{"codex_summary_model", `null`, true},
 		{"codex_summary_model", `"nope"`, false},
+		{"cross_check_pins", `[{"stage":"plan","harness":"claude","effort":"high"}]`, true},
+		{"cross_check_pins", `[]`, true},
+		{"cross_check_pins", `null`, false},
+		{"cross_check_pins", `[{"stage":"plan","harness":"claude","effort":"runtime"}]`, false},
+		{"cross_check_pins", `[{"stage":"x","harness":"claude"}]`, false},
 	}
 	covered := map[string]bool{}
 	outer := f.t
@@ -370,7 +375,7 @@ func TestPutMyModelSettingsRejectsWithoutWritingLiveDB(t *testing.T) {
 		{`{"default_effort":"high","zzz_unknown":1}`, "zzz_unknown"},
 		{`{"default_effort":"high","default_harness":"codex"}`, "default_harness"},
 		{`{"default_effort":"high","default_model":"opus"}`, "default_model"},
-		{`{"default_effort":"high","cross_check_pins":[]}`, "cross_check_pins"},
+		{`{"default_effort":"high","cross_check_pins":null}`, "cross_check_pins"},
 		{`{"default_effort":"high","theme":"mission"}`, "theme"},
 		{`{"default_effort":"high","summary_model":"gpt-6-sol"}`, "summary_model"},
 		{`{"default_claude_model":"sonnet","codex_summary_model":"nope"}`, "codex_summary_model"},

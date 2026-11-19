@@ -192,6 +192,31 @@ func unsupportedRouteError(status int, body []byte, message string) *ExitError {
 }
 
 func (c *HTTPClient) PutModelSettings(ctx context.Context, patch map[string]*string) (ModelSettingsResult, error) {
+	return c.putModelSettingsBody(ctx, patch)
+}
+
+// CrossCheckPinWire is the wire form of one cross_check_pins cell of PUT /api/me/model-settings: a
+// member present in Members is sent (nil is JSON null, a clear) and an absent member is left alone.
+type CrossCheckPinWire struct {
+	Stage   string
+	Harness string
+	Members map[string]*string
+}
+
+// MarshalJSON renders {"stage":..,"harness":..,<member>:<string|null>...}.
+func (p CrossCheckPinWire) MarshalJSON() ([]byte, error) {
+	cell := map[string]any{"stage": p.Stage, "harness": p.Harness}
+	for k, v := range p.Members {
+		cell[k] = v
+	}
+	return json.Marshal(cell)
+}
+
+func (c *HTTPClient) PutCrossCheckPins(ctx context.Context, cells []CrossCheckPinWire) (ModelSettingsResult, error) {
+	return c.putModelSettingsBody(ctx, map[string][]CrossCheckPinWire{"cross_check_pins": cells})
+}
+
+func (c *HTTPClient) putModelSettingsBody(ctx context.Context, patch any) (ModelSettingsResult, error) {
 	const path = "/api/me/model-settings"
 	resp, body, err := c.doJSONRead(ctx, http.MethodPut, path, patch)
 	if err != nil {

@@ -29,7 +29,7 @@ const (
 
 // modelSettingsAllowlist is the closed set of keys PUT /api/me/model-settings accepts. Anything
 // else, including default_harness, the legacy default_model, appearance and every consent
-// switch, is a 400 naming the key. cross_check_pins joins in the cross-check milestone (#3264 M2).
+// switch, is a 400 naming the key.
 var modelSettingsAllowlist = map[string]struct{}{
 	"default_claude_model": {},
 	"default_codex_model":  {},
@@ -40,6 +40,7 @@ var modelSettingsAllowlist = map[string]struct{}{
 	"judge_runs_on":        {},
 	"summary_model":        {},
 	"codex_summary_model":  {},
+	"cross_check_pins":     {},
 }
 
 // modelSettingsField is one decoded tri-state field: absent (present=false) leaves the column,
@@ -54,9 +55,15 @@ type modelSettingsWrite struct {
 	claude, codex, effort, codexEffort modelSettingsField
 	judge, codexJudge, judgeRunsOn     modelSettingsField
 	summary, codexSummary              modelSettingsField
+	// crossCheckPins are the decoded cross_check_pins patches (decodeCrossCheckPins); empty when
+	// the key is absent or an empty list.
+	crossCheckPins []store.PatchUserCrossCheckPinParams
 }
 
 func (w modelSettingsWrite) any() bool {
+	if len(w.crossCheckPins) > 0 {
+		return true
+	}
 	for _, f := range []modelSettingsField{w.claude, w.codex, w.effort, w.codexEffort,
 		w.judge, w.codexJudge, w.judgeRunsOn, w.summary, w.codexSummary} {
 		if f.present {
@@ -146,6 +153,17 @@ func (h *Handler) PutMyModelSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		*st.into = modelSettingsField{present: true, val: v}
+	}
+	// cross_check_pins decodes last, as in PutMySettings, with the same semantics: an array of at
+	// most four unique stage/harness cells, omitted members unchanged, a null member clears it,
+	// a top-level null is rejected.
+	if raw, present := req["cross_check_pins"]; present {
+		patches, err := decodeCrossCheckPins(raw, user.ID)
+		if err != nil {
+			writeModelSettingsFieldError(w, "cross_check_pins", err.Error())
+			return
+		}
+		in.crossCheckPins = patches
 	}
 
 	if in.any() {
@@ -272,12 +290,12 @@ func (h *Handler) applyModelSettings(ctx context.Context, tx pgx.Tx, userID uuid
 			return err
 		}
 	}
-	// codex_summary_model is written last: the forced-failure test arms a trigger on it to
-	// prove every earlier write in this transaction rolls back.
 	if in.codexSummary.present {
 		if _, err := q.SetUserCodexSummaryModel(ctx, store.SetUserCodexSummaryModelParams{ID: userID, CodexSummaryModel: in.codexSummary.val}); err != nil {
 			return err
 		}
 	}
-	return nil
+	// The pin cells are written last: the users row lock above is taken first, then the cell
+	// rows in (stage, harness) order, the order every pin writer uses.
+	return saveCrossCheckPinsTx(ctx, q, in.crossCheckPins)
 }

@@ -152,6 +152,54 @@ func (f *FakeClient) PutModelSettings(_ context.Context, patch map[string]*strin
 	return ModelSettingsResult{Settings: f.Settings, Raw: raw}, nil
 }
 
+// PutCrossCheckPins records the cells, then answers like PutModelSettings; without a canned reply
+// each cell's present members are applied to the matching Settings.CrossCheckPins cell (appended
+// when absent) and the display fields are left as they were.
+func (f *FakeClient) PutCrossCheckPins(_ context.Context, cells []CrossCheckPinWire) (ModelSettingsResult, error) {
+	f.ModelSettingsCalls++
+	f.LastCrossCheckPins = make([]CrossCheckPinWire, len(cells))
+	for i, c := range cells {
+		members := make(map[string]*string, len(c.Members))
+		for k, v := range c.Members {
+			members[k] = v
+		}
+		f.LastCrossCheckPins[i] = CrossCheckPinWire{Stage: c.Stage, Harness: c.Harness, Members: members}
+	}
+	if f.PutModelSettingsErr != nil {
+		return ModelSettingsResult{}, f.PutModelSettingsErr
+	}
+	if f.Err != nil {
+		return ModelSettingsResult{}, f.Err
+	}
+	if f.ModelSettingsResult != nil {
+		return *f.ModelSettingsResult, nil
+	}
+	for _, c := range cells {
+		idx := -1
+		for i, p := range f.Settings.CrossCheckPins {
+			if p.Stage == c.Stage && p.Harness == c.Harness {
+				idx = i
+			}
+		}
+		if idx < 0 {
+			f.Settings.CrossCheckPins = append(f.Settings.CrossCheckPins, apitypes.CrossCheckPinDTO{Stage: c.Stage, Harness: c.Harness, Active: true})
+			idx = len(f.Settings.CrossCheckPins) - 1
+		}
+		p := &f.Settings.CrossCheckPins[idx]
+		if v, ok := c.Members["model"]; ok {
+			p.Model = v
+		}
+		if v, ok := c.Members["effort"]; ok {
+			p.Effort = v
+		}
+	}
+	raw, err := json.Marshal(map[string]apitypes.UserSettingsDTO{"settings": f.Settings})
+	if err != nil {
+		return ModelSettingsResult{}, err
+	}
+	return ModelSettingsResult{Settings: f.Settings, Raw: raw}, nil
+}
+
 // PreviewScheduleSettings serves SchedulePreview and records the id; unset it answers 404.
 func (f *FakeClient) PreviewScheduleSettings(_ context.Context, scheduleID string) (apitypes.ScheduleSettingsPreviewDTO, error) {
 	f.SchedulePreviewIDs = append(f.SchedulePreviewIDs, scheduleID)

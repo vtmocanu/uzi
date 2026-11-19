@@ -191,6 +191,8 @@ uzi settings codex-mode default|auto
 uzi settings harness-overflow on|off
 uzi settings set <setting> [--harness claude|codex] <value>
 uzi settings reset <setting> [--harness claude|codex]
+uzi settings set cross-check --stage plan|code --harness claude|codex [--model <id>] [--effort <level>]
+uzi settings reset cross-check --stage plan|code --harness claude|codex
 uzi context list
 uzi context current
 uzi context use <name>
@@ -411,6 +413,16 @@ uzi version
   applied; check with `uzi settings get`" when the commit outcome is unknown, and with
   "settings saved; reading them back failed" when the save is durable. A server without
   the route exits 1 ("upgrade the server").
+- `uzi settings set cross-check --stage plan|code --harness claude|codex [--model <id>]
+  [--effort low|medium|high|xhigh|max]` and `uzi settings reset cross-check --stage
+  plan|code --harness claude|codex` — pin or clear the checker model and effort of one
+  cross-check cell (`PUT /api/me/model-settings`, key `cross_check_pins`). `set` needs
+  `--stage`, `--harness` and at least one of `--model` and `--effort`, and leaves an
+  omitted member unchanged; `runtime` is not a checker effort. `reset` clears both
+  members so the cell follows the worker default again. Prints that cell with its pin,
+  resolved value and source; `--json` prints the server envelope. Usage exit 2 (no
+  request) on a missing or invalid `--stage`, `--harness`, member or effort, or when
+  those flags are given to another setting.
 
 ### Named contexts
 

@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -80,6 +81,136 @@ func TestSettingsSetUsageErrorsSendNothing(t *testing.T) {
 		if code != uzicli.ExitUsage || fc.ModelSettingsCalls != 0 {
 			t.Errorf("%v: code=%d calls=%d stderr=%s", args, code, fc.ModelSettingsCalls, stderr)
 		}
+	}
+}
+
+func ccCell(stage, harness string, members map[string]*string) []uzicli.CrossCheckPinWire {
+	return []uzicli.CrossCheckPinWire{{Stage: stage, Harness: harness, Members: members}}
+}
+
+// TestSettingsCrossCheckPatches pins the exact cells sent: only the given members, both null on reset.
+func TestSettingsCrossCheckPatches(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		want []uzicli.CrossCheckPinWire
+	}{
+		{"model only", []string{"set", "cross-check", "--stage", "plan", "--harness", "claude", "--model", "opus"},
+			ccCell("plan", "claude", map[string]*string{"model": msPtr("opus")})},
+		{"effort only", []string{"set", "cross-check", "--stage", "code", "--harness", "codex", "--effort", "xhigh"},
+			ccCell("code", "codex", map[string]*string{"effort": msPtr("xhigh")})},
+		{"both", []string{"set", "cross-check", "--harness", "codex", "--stage", "code", "--model", "gpt-6-sol", "--effort", "low"},
+			ccCell("code", "codex", map[string]*string{"model": msPtr("gpt-6-sol"), "effort": msPtr("low")})},
+		{"reset", []string{"reset", "cross-check", "--stage", "plan", "--harness", "codex"},
+			ccCell("plan", "codex", map[string]*string{"model": nil, "effort": nil})},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fc := &uzicli.FakeClient{}
+			_, stderr, code := runCLI(t, fakeEnv(fc), append([]string{"settings"}, tc.args...)...)
+			if code != 0 || fc.ModelSettingsCalls != 1 || fc.LastModelSettingsPatch != nil {
+				t.Fatalf("code=%d calls=%d stderr=%s", code, fc.ModelSettingsCalls, stderr)
+			}
+			if !reflect.DeepEqual(fc.LastCrossCheckPins, tc.want) {
+				t.Fatalf("cells = %+v, want %+v", fc.LastCrossCheckPins, tc.want)
+			}
+		})
+	}
+}
+
+// TestSettingsCrossCheckWireBody runs the real client: omitted members are absent, a reset sends nulls.
+func TestSettingsCrossCheckWireBody(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"set", "cross-check", "--stage", "plan", "--harness", "claude", "--effort", "max"},
+			`{"cross_check_pins":[{"effort":"max","harness":"claude","stage":"plan"}]}`},
+		{[]string{"reset", "cross-check", "--stage", "code", "--harness", "claude"},
+			`{"cross_check_pins":[{"effort":null,"harness":"claude","model":null,"stage":"code"}]}`},
+	} {
+		var got string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			b, _ := io.ReadAll(r.Body)
+			got = string(b)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"settings":{}}`))
+		}))
+		_, stderr, code := runCLI(t, httpEnv(srv), append([]string{"settings"}, tc.args...)...)
+		srv.Close()
+		if code != 0 || strings.TrimSpace(got) != tc.want {
+			t.Errorf("%v: code=%d body=%q want %q stderr=%s", tc.args, code, got, tc.want, stderr)
+		}
+	}
+}
+
+func TestSettingsCrossCheckUsageErrorsSendNothing(t *testing.T) {
+	for _, args := range [][]string{
+		{"set", "cross-check", "--harness", "claude", "--model", "opus"},                             // no stage
+		{"set", "cross-check", "--stage", "plan", "--model", "opus"},                                 // no harness
+		{"set", "cross-check", "--stage", "plan", "--harness", "claude"},                             // no member
+		{"set", "cross-check", "--stage", "review", "--harness", "claude", "--model", "opus"},        // bad stage
+		{"set", "cross-check", "--stage", "", "--harness", "claude", "--model", "opus"},              // empty stage
+		{"set", "cross-check", "--stage", "plan", "--harness", "gpt", "--model", "opus"},             // bad harness
+		{"set", "cross-check", "--stage", "plan", "--harness", "claude", "--effort", "runtime"},      // runtime refused
+		{"set", "cross-check", "--stage", "plan", "--harness", "claude", "--effort", "ultra"},        // bad effort
+		{"set", "cross-check", "--stage", "plan", "--harness", "claude", "--model", " "},             // empty model
+		{"set", "cross-check", "--stage", "plan", "--harness", "claude", "--model", "opus", "extra"}, // positional value
+		{"set", "worker-model", "--harness", "claude", "--stage", "plan", "m"},                       // stage on another setting
+		{"set", "worker-model", "--harness", "claude", "--model", "m", "m"},                          // model on another setting
+		{"set", "effort", "--harness", "claude", "--effort", "high", "high"},                         // effort on another setting
+		{"reset", "cross-check", "--harness", "claude"},                                              // no stage
+		{"reset", "cross-check", "--stage", "plan"},                                                  // no harness
+		{"reset", "cross-check", "--stage", "plan", "--harness", "claude", "--model", "opus"},        // reset takes no member flags
+		{"reset", "worker-model", "--harness", "claude", "--stage", "plan"},                          // stage on another setting
+		{"reset", "cross-check", "--stage", "nope", "--harness", "claude"},                           // bad stage
+	} {
+		fc := &uzicli.FakeClient{}
+		_, stderr, code := runCLI(t, fakeEnv(fc), append([]string{"settings"}, args...)...)
+		if code != uzicli.ExitUsage || fc.ModelSettingsCalls != 0 {
+			t.Errorf("%v: code=%d calls=%d stderr=%s", args, code, fc.ModelSettingsCalls, stderr)
+		}
+	}
+}
+
+func TestSettingsCrossCheckHumanOutputShowsPinAndSource(t *testing.T) {
+	fc := &uzicli.FakeClient{ModelSettingsResult: &uzicli.ModelSettingsResult{Settings: apitypes.UserSettingsDTO{
+		CrossCheckPins: []apitypes.CrossCheckPinDTO{
+			{Stage: "plan", Harness: "claude", Active: true, Model: msPtr("opus"), ResolvedModel: msPtr("opus"), ModelSource: "pin",
+				ResolvedEffort: "high", EffortSource: "cross-check default"},
+			{Stage: "code", Harness: "codex", Active: true, Model: msPtr("gpt-6-sol"), ResolvedModel: msPtr("gpt-6-sol"), ModelSource: "pin",
+				ResolvedEffort: "low", Effort: msPtr("low"), EffortSource: "pin"},
+		}}}}
+	out, stderr, code := runCLI(t, fakeEnv(fc), "settings", "set", "cross-check", "--stage", "plan", "--harness", "claude", "--model", "opus")
+	if code != 0 {
+		t.Fatalf("code=%d stderr=%s", code, stderr)
+	}
+	for _, w := range []string{"plan", "claude", "opus", "Pin"} {
+		if !strings.Contains(out, w) {
+			t.Errorf("missing %q in:\n%s", w, out)
+		}
+	}
+	if strings.Contains(out, "gpt-6-sol") {
+		t.Errorf("only the changed cell is shown:\n%s", out)
+	}
+
+	// A reset shows the cell back on the worker default.
+	fc = &uzicli.FakeClient{Settings: apitypes.UserSettingsDTO{CrossCheckPins: []apitypes.CrossCheckPinDTO{
+		{Stage: "code", Harness: "claude", Active: true, Model: msPtr("opus"), Effort: msPtr("max")}}}}
+	out, _, code = runCLI(t, fakeEnv(fc), "settings", "reset", "cross-check", "--stage", "code", "--harness", "claude")
+	if code != 0 || strings.Contains(out, "opus") || !strings.Contains(out, "Default") {
+		t.Fatalf("code=%d out=%s", code, out)
+	}
+}
+
+func TestSettingsCrossCheckJSONIsServerEnvelope(t *testing.T) {
+	raw := `{"settings":{"cross_check_pins":[],"future_key":1},"top_level_extra":true}`
+	fc := &uzicli.FakeClient{ModelSettingsResult: &uzicli.ModelSettingsResult{Raw: json.RawMessage(raw)}}
+	out, stderr, code := runCLI(t, fakeEnv(fc), "settings", "set", "cross-check", "--stage", "plan", "--harness", "codex", "--effort", "low", "--json")
+	var got, want any
+	_ = json.Unmarshal([]byte(out), &got)
+	_ = json.Unmarshal([]byte(raw), &want)
+	if code != 0 || !reflect.DeepEqual(got, want) || stderr != "" {
+		t.Fatalf("code=%d out=%s stderr=%q", code, out, stderr)
 	}
 }
 

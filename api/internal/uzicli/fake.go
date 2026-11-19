@@ -388,6 +388,10 @@ type FakeClient struct {
 	LastModelSettingsPatch map[string]*string
 	ModelSettingsResult    *ModelSettingsResult
 	PutModelSettingsErr    error
+	// PutCrossCheckPins capture: the same counters and canned reply as above, shared with
+	// ModelSettingsCalls/ModelSettingsResult/PutModelSettingsErr; LastCrossCheckPins is a copy of
+	// the last cells sent. Without a canned reply the cells are applied to Settings.CrossCheckPins.
+	LastCrossCheckPins []CrossCheckPinWire
 
 	// SchedulePreview and SchedulePreviewErr drive PreviewScheduleSettings; with both unset the
 	// fake answers 404 like a foreign schedule. SchedulePreviewIDs records the ids asked for.

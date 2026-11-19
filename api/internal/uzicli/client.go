@@ -239,6 +239,11 @@ type Client interface {
 	// and the server's envelope bytes so --json can print them unchanged. A server without the
 	// route answers an error-less 404 or 405, mapped to an "upgrade the server" error.
 	PutModelSettings(ctx context.Context, patch map[string]*string) (ModelSettingsResult, error)
+	// PutCrossCheckPins writes checker pins through the same route (PRD #3264 M2): the body is
+	// {"cross_check_pins": cells}. A cell names its stage and harness and carries only the members
+	// being changed; a nil member value is JSON null (a clear). The reply and the older-server
+	// mapping are PutModelSettings'.
+	PutCrossCheckPins(ctx context.Context, cells []CrossCheckPinWire) (ModelSettingsResult, error)
 	// PreviewScheduleSettings returns what firing a saved schedule now, and claiming the run,
 	// would use (PRD #3254): POST /api/me/effective-settings/schedule-preview with the schedule
 	// id. RequireUser, read-only, owner-scoped; the server loads the stored override, so a stored
