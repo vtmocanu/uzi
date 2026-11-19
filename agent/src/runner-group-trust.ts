@@ -118,21 +118,23 @@ type EvalInput = {
   gid: number;
   runner: ChildResult;
   command: ChildResult;
+  /** Test factory only: skip the production worker uid/gid identity checks (the status-text checks still apply). */
+  anyIdentity?: boolean;
 };
 
 /** The pure decision shared by the probe and the test factory. */
 function evaluate(input: EvalInput): ManagedBareGroupTrust {
   if (!input.split) return off("single_uid");
-  if (input.uid !== WORKER_UID) return off("worker_uid");
+  if (!input.anyIdentity && input.uid !== WORKER_UID) return off("worker_uid");
   const trustedGid: number = input.gid;
   const sharedGids: readonly number[] = [RUNNER_UID, COMMAND_UID, CODEX_SESSION_GID];
-  if (trustedGid !== WORKER_UID || sharedGids.includes(trustedGid)) {
+  if (!input.anyIdentity && (trustedGid !== WORKER_UID || sharedGids.includes(trustedGid))) {
     return off("worker_gid");
   }
   for (const [id, res] of [[RUNNER_ID, input.runner], [COMMAND_ID, input.command]] as const) {
     if (!res.ok) return off(`${id.label}_${res.reason}`);
     if (res.code !== 0 || res.signal !== null) return off(`${id.label}_exit`);
-    const bad = checkStatus(res.stdout, id, trustedGid);
+    const bad = checkStatus(res.stdout, id, input.anyIdentity ? WORKER_UID : trustedGid);
     if (bad !== undefined) return off(`${id.label}_${bad}`);
   }
   return build({ state: "trusted", gid: trustedGid });
@@ -148,6 +150,9 @@ export function managedBareGroupTrustForTest(o: {
   split?: boolean;
   uid?: number;
   gid?: number;
+  /** A test process is not the production worker (uid/gid 10001): the value carries `gid` (its own group) while the
+   *  status-text group-exclusion checks still run against the production worker group (10001). */
+  anyIdentity?: boolean;
 }): ManagedBareGroupTrust {
   const ok = (stdout: string): ChildResult => ({ ok: true, code: 0, signal: null, stdout });
   return evaluate({
@@ -156,6 +161,7 @@ export function managedBareGroupTrustForTest(o: {
     gid: o.gid ?? WORKER_UID,
     runner: ok(o.runnerStatus),
     command: ok(o.commandStatus),
+    anyIdentity: o.anyIdentity,
   });
 }
 
