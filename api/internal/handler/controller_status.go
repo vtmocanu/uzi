@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"math"
 	"net/http"
+	"strings"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -58,7 +60,11 @@ const maxStatusBodyBytes = 1 << 20
 // Answers 204 with NO BODY. That is Decision 10 made structural: there is no response
 // for the controller to read state out of, so this endpoint cannot quietly grow into a
 // second desired-state channel. Per-row garbage is dropped with a warning rather than
-// failing the report — one bad row must never blind the whole fleet.
+// failing the report — one bad row must never blind the whole fleet. The optional
+// pacing diagnostic and roll marker are weaker still: a malformed one is discarded
+// (see decodeOptionalPacing) and the row's health is recorded regardless, so a
+// discarded pacing is treated as absent (a fleet report clears stored pacing; a
+// readiness or legacy report preserves it).
 func (h *Handler) ControllerStatus(w http.ResponseWriter, r *http.Request) {
 	// A ROUTE-LOCAL LENIENT DECODER, and it must stay lenient.
 	//
@@ -72,7 +78,7 @@ func (h *Handler) ControllerStatus(w http.ResponseWriter, r *http.Request) {
 	// If you are here to "fix" this by using the house helper: the contract TEST does
 	// set DisallowUnknownFields (drift is caught at the gate), and the production
 	// decoder deliberately does not. Two decoders, opposite policies, one wire.
-	var req hostedsvc.StatusReport
+	var req statusEnvelope
 	var raw json.RawMessage
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxStatusBodyBytes))
 	if err := dec.Decode(&raw); err != nil && !errors.Is(err, io.EOF) {
@@ -141,7 +147,7 @@ func (h *Handler) ControllerStatus(w http.ResponseWriter, r *http.Request) {
 	for _, row := range wire.Workers {
 		// Decode independently: repeated workers arrays may reuse struct elements
 		// during the envelope decode, retaining an earlier row's identity or fields.
-		var ws hostedsvc.WorkerStatus
+		var ws statusRow
 		if err := json.Unmarshal(row, &ws); err != nil {
 			dropped++
 			continue
@@ -160,10 +166,12 @@ func (h *Handler) ControllerStatus(w http.ResponseWriter, r *http.Request) {
 				"worker_id", ws.ID, "phase", sanitizeSelfReported(ws.Phase, maxSelfReportedBytes))
 			continue
 		}
-		pacing, err := workersvc.NormalizePacingReport(ws.Pacing)
-		if err != nil {
-			dropped++
-			continue
+		// Pacing is an optional diagnostic: a malformed one is discarded (the row's
+		// health and marker still land) and an unusable identifier is omitted alone.
+		pacing, pacingReason := decodeOptionalPacing(ws.Pacing)
+		if pacingReason != "" {
+			slog.Warn("controller status: ignoring invalid optional pacing diagnostic",
+				"worker_id", id.String(), "reason", pacingReason)
 		}
 		// The marker is display-only: an invalid one is logged (without its raw value)
 		// and discarded, never a reason to drop the entry.
@@ -173,7 +181,7 @@ func (h *Handler) ControllerStatus(w http.ResponseWriter, r *http.Request) {
 			marker = nil
 		}
 		n, err := h.wsvc.RecordRollHealth(r.Context(), workersvc.RollHealthReport{
-			BlockingKind:         rawBlockingKind(ws, row),
+			BlockingKind:         rawBlockingKind(ws.WorkerStatus, row),
 			Kind:                 req.Kind,
 			Pacing:               pacing,
 			RollMarker:           marker,
@@ -213,6 +221,80 @@ func (h *Handler) ControllerStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	// 204, no body. See the doc comment.
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// statusRow is one wire worker entry whose optional pacing diagnostic stays raw. The
+// shallower Pacing field shadows the embedded hostedsvc.WorkerStatus.Pacing under
+// encoding/json's field-resolution rules, so a mistyped pacing value can fail neither
+// the envelope decode nor the row decode; decodeOptionalPacing interprets it.
+type statusRow struct {
+	hostedsvc.WorkerStatus
+	Pacing json.RawMessage `json:"pacing"`
+}
+
+// statusEnvelope is the report envelope with raw-pacing rows.
+type statusEnvelope struct {
+	hostedsvc.StatusReport
+	Workers []statusRow `json:"workers"`
+}
+
+// decodeOptionalPacing interprets an optional pacing diagnostic leniently. Absent or
+// null is nil with no reason. A wrongly shaped value yields nil and
+// "invalid_pacing_shape"; a worker identifier that is not a string holding a UUID is
+// omitted alone (siblings kept) with "invalid_canary_id" or
+// "invalid_blocking_worker_id" (comma-joined when both apply); content the strict
+// workersvc.NormalizePacingReport refuses yields nil and "invalid_pacing_content".
+// Reasons are fixed tokens, never controller-supplied text.
+func decodeOptionalPacing(raw json.RawMessage) (*workersvc.PacingReport, string) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil, ""
+	}
+	// encoding/json silently replaces invalid UTF-8 with U+FFFD, which would hide the
+	// corruption from NormalizePacingReport's utf8.ValidString bound; check the raw
+	// bytes first so corrupt pacing is discarded rather than repaired.
+	if !utf8.Valid(raw) {
+		return nil, "invalid_pacing_content"
+	}
+	var wire struct {
+		State            string          `json:"state"`
+		TargetImage      string          `json:"target_image"`
+		TargetVersion    string          `json:"target_version"`
+		CanaryID         json.RawMessage `json:"canary_id"`
+		BlockingWorkerID json.RawMessage `json:"blocking_worker_id"`
+		BlockingReason   *string         `json:"blocking_reason"`
+		RetainedImage    *string         `json:"retained_image"`
+		RetainedVersion  *string         `json:"retained_version"`
+	}
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		return nil, "invalid_pacing_shape"
+	}
+	var reasons []string
+	parseID := func(v json.RawMessage, reason string) *string {
+		if len(v) == 0 || string(v) == "null" {
+			return nil
+		}
+		var s string
+		if err := json.Unmarshal(v, &s); err != nil || !workersvc.ValidPacingWorkerID(s) {
+			reasons = append(reasons, reason)
+			return nil
+		}
+		return &s
+	}
+	report := workersvc.PacingReport{
+		State:            wire.State,
+		TargetImage:      wire.TargetImage,
+		TargetVersion:    wire.TargetVersion,
+		CanaryID:         parseID(wire.CanaryID, "invalid_canary_id"),
+		BlockingWorkerID: parseID(wire.BlockingWorkerID, "invalid_blocking_worker_id"),
+		BlockingReason:   wire.BlockingReason,
+		RetainedImage:    wire.RetainedImage,
+		RetainedVersion:  wire.RetainedVersion,
+	}
+	normalized, err := workersvc.NormalizePacingReport(&report)
+	if err != nil {
+		return nil, "invalid_pacing_content"
+	}
+	return normalized, strings.Join(reasons, ",")
 }
 
 // sanitizeSelfReportedPtr applies the same bound-and-strip treatment to an optional

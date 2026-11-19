@@ -641,7 +641,10 @@ func (m *Materializer) planPool(ctx context.Context, t *rollTick, pool []*rollEn
 	canary := ""
 	inFlight := 0
 	active := false
-	blocker := ""
+	// blocker holds only a real worker ID. Pool-level holds carry their text in
+	// poolReason and no worker identity, because the API requires UUID identities
+	// and drops the whole worker status row otherwise (#4467).
+	blocker, poolReason := "", ""
 	for _, e := range pool {
 		if e.blocked != "" {
 			blocker = e.w.ID
@@ -665,10 +668,10 @@ func (m *Materializer) planPool(ctx context.Context, t *rollTick, pool []*rollEn
 		active = active || e.drift
 	}
 	if changed {
-		blocker = "pin-change"
+		blocker, poolReason = "", "roll target pin changed; pool held until reservations settle"
 	}
 	if inFlight > 0 && canary == "" {
-		blocker = "missing-canary"
+		blocker, poolReason = "", "participant reservation without canary; explicit recovery required"
 		for _, e := range pool {
 			if e.marker != nil {
 				e.blocked = "participant reservation without canary; explicit recovery required"
@@ -681,7 +684,7 @@ func (m *Materializer) planPool(ctx context.Context, t *rollTick, pool []*rollEn
 			allPromoted = false
 		}
 	}
-	if allPromoted && blocker == "" {
+	if allPromoted && blocker == "" && poolReason == "" {
 		// A held worker whose own reservation could not be withdrawn marked this pool
 		// uncertain earlier in the tick: completing the canary now would pair a
 		// Completed cohort with that worker's still-incomplete marker.
@@ -744,7 +747,7 @@ func (m *Materializer) planPool(ctx context.Context, t *rollTick, pool []*rollEn
 	}
 	// Releases are attempted before sibling admission; uncertainty lasts this tick.
 	for _, e := range pool {
-		if blocker != "" || e.blocked != "" || (e.marker == nil && budget <= 0) {
+		if blocker != "" || poolReason != "" || e.blocked != "" || (e.marker == nil && budget <= 0) {
 			m.releaseRollHold(ctx, t, e)
 		}
 	}
@@ -757,6 +760,9 @@ func (m *Materializer) planPool(ctx context.Context, t *rollTick, pool []*rollEn
 		}
 	}
 	reason := "pool participant unresolved"
+	if poolReason != "" {
+		reason = poolReason
+	}
 	for _, e := range pool {
 		if e.w.ID == blocker && e.blocked != "" {
 			reason = e.blocked
@@ -775,7 +781,7 @@ func (m *Materializer) planPool(ctx context.Context, t *rollTick, pool []*rollEn
 				break
 			}
 		}
-		if blocker != "" {
+		if blocker != "" || poolReason != "" {
 			p.BlockingWorkerID = pacingText(blocker)
 			p.BlockingReason = pacingText(reason)
 		}
@@ -802,7 +808,7 @@ func (m *Materializer) planPool(ctx context.Context, t *rollTick, pool []*rollEn
 		if e.blocked != "" {
 			p.BlockingReason = pacingText(e.blocked)
 		}
-		if blocker != "" {
+		if blocker != "" || poolReason != "" {
 			if e.recovery && e.blocked == "" {
 				e.admitted = true
 			}
