@@ -1097,8 +1097,12 @@ affinity ceiling (two hours by default), even if another capable worker
 comes online. This preserves unpublished work on the previous worker's
 volume before a cold move is allowed. A Codex run that has been claimed is
 stricter: no other worker, including a new ephemeral one, takes it at the
-ceiling; it stays held for the worker that last ran it until that worker returns
-or the owner cancels the run (`uzi run cancel <id>`; see
+ceiling. With valid claimant provenance, wait for the recorded worker or follow
+the health reason's restart advice. Runs claimed before this deployment have no
+recorded claimant (no backfill): waiting cannot enable a fresh claim, even by
+their last worker. An existing flight may continue through readoption under the
+existing fences; otherwise cancel with `uzi run cancel <id>`. Cancellation does
+not itself release custody (see
 [Codex credentials](./codex-credentials.md#a-codex-run-held-for-its-last-worker)).
 
 ## Disk self-heal
