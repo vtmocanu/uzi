@@ -2,17 +2,21 @@
 
 ## Wait for a contributor
 
-Run `scripts/watch-pr.sh OWNER/REPO PR --since FULL_REVIEWED_SHA [interval] [max_polls]`.
-Exit 13 (`RESULT=author_attention`) names `head_changed`, `human_activity` or
+Run `scripts/watch-pr.sh OWNER/REPO PR --since FULL_REVIEWED_SHA [--after ISO8601] [interval] [max_polls]`.
+Exit 13 (`RESULT=author_attention`) names `head_changed`, `author_activity` or
 `ci_approval_required`. Inspect the signal; this mode never establishes merge-readiness.
 It uses the same poll budget, unknown handling (exit 9), timeout (2) and GitHub quota
 handback (12), without polling merge gates or requesting a review.
 
-Use the reviewed commit's full 40-hex SHA. Its committer time is the discussion watermark:
-any human issue comment, submitted review (including an empty body), or inline reply
-created strictly later counts, including maintainers and already-present discussion.
-Bot activity, pending reviews and edits to older comments do not count. A changed head or
-an approval-required pull-request workflow run on the head triggers immediately. Re-arm
+Use the reviewed commit's full 40-hex SHA. Count only activity from the PR author login,
+excluding bots: issue comments, submitted reviews (including empty bodies), and inline
+replies. The default discussion cutoff is watcher startup, at whole-second resolution;
+activity at or before it does not trigger. Pass `--after ISO8601` to catch author activity
+strictly after an explicit moment, such as your review time. Include seconds and `Z` or
+a signed `HH:MM` UTC offset; fractional seconds are accepted. The cutoff stays fixed
+across polls. Other humans, pending reviews and edits to older comments do not count.
+A changed head or an approval-required pull-request workflow run on the head triggers
+immediately, regardless of the discussion cutoff. Re-arm
 readiness after reviewing updates; exit 13 never approves CI or authorizes a merge.
 
 Everything here is measured on this repo (PRs #1421, #1426, #1428, 2026-09-16/17, plus

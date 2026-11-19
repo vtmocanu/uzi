@@ -86,12 +86,28 @@ _prc_sha() {
 # open_threads_json THREAD_NODES -> JSON array of thread items. rc 1 on unreadable input.
 open_threads_json() { printf '%s' "$1" | jq -c "$PRC_JQ"' open_threads' 2>/dev/null; }
 
-# new_human_activity_json PAGINATED_JSON KIND SINCE_EPOCH -> first new human item's
+# iso8601_epoch TIMESTAMP -> epoch seconds, allowing fractions and numeric offsets.
+iso8601_epoch() {
+  jq -enr --arg t "$1" '
+    $t | capture("^(?<date>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(?<fraction>\\.[0-9]+)?(?<zone>Z|[+-][0-9]{2}:[0-9]{2})$") as $p
+    | ($p.date + "Z" | fromdateiso8601) as $base
+    | if ($base | strftime("%Y-%m-%dT%H:%M:%S")) != $p.date then error("invalid date") else
+        (if $p.zone == "Z" then 0 else
+          ($p.zone[1:3] | tonumber) as $h | ($p.zone[4:6] | tonumber) as $m
+          | if $h > 23 or $m > 59 then error("invalid offset") else
+              ($h * 3600 + $m * 60) * (if $p.zone[0:1] == "+" then 1 else -1 end)
+            end end) as $offset
+        | $base + (("0" + ($p.fraction // "")) | tonumber) - $offset
+      end' 2>/dev/null
+}
+
+# new_author_activity_json PAGINATED_JSON KIND AFTER_EPOCH AUTHOR -> first new author's
 # numeric id, or null. Include empty review bodies and thread replies. Unlike merge
 # acknowledgements, creation time governs activity; editing an old comment is not new.
-new_human_activity_json() {
-  printf '%s' "$1" | jq -cs --arg kind "$2" --argjson since "$3" '
+new_author_activity_json() {
+  printf '%s' "$1" | jq -cs --arg kind "$2" --argjson since "$3" --arg author "$4" '
     [ .[][]
+      | select(.user.login == $author)
       | if .user.type == "Bot" then empty
         elif .user.type != "User" then error("unknown author type")
         elif $kind == "review" and .submitted_at == null and .state == "PENDING" then empty

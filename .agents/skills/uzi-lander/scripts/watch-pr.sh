@@ -23,12 +23,14 @@
 #                    [--reviewer any|coderabbit|greptile|none] [--reviewer-grace MIN]
 #                    [--max-unknown N]
 #   --since SHA       wait for contributor activity instead of merge-readiness. Use the
-#                     full reviewed commit SHA. Exit 13 on a changed head, a human issue
-#                     comment/review/thread reply created after that commit's committer
-#                     time, or head CI needing approval. Existing post-commit discussion
-#                     counts immediately, including the maintainer's own review. Bot
-#                     activity and edits to older comments do not count. Never merges,
+#                     full reviewed commit SHA. Exit 13 on a changed head, a PR-author
+#                     comment/review/thread reply created after watcher startup, or head
+#                     CI needing approval. Ignore other humans, bots and edits to older
+#                     comments. Never merges,
 #                     requests reviews, or approves CI. Other readiness flags do not gate.
+#   --after ISO8601   override the discussion cutoff (requires --since); accept seconds,
+#                     optional fractional seconds, and Z or a signed HH:MM UTC offset.
+#                     Activity must be strictly newer. Head/CI triggers ignore this cutoff.
 #   interval_secs default 60, max_polls default 60.
 #   --reviewer        which bot must have reviewed the head (default any: either one).
 #                     Selecting ONE bot (coderabbit|greptile) also makes the OTHER fully
@@ -86,7 +88,7 @@
 #      (RESULT=unknown_persistent lookups=a,b). Fix or inspect that lookup; never merge on it.
 #  10  ci_fix ownership — active on this branch (even with green CI), or recent while CI is red.
 #      CI_FIX_ACTIVE/RECENT name the runs; decide wait/cancel/review before local work.
-#  13  author attention — --since observed head_changed, human_activity or
+#  13  author attention — --since observed head_changed, author_activity or
 #      ci_approval_required. Inspect the reason; this is never merge-readiness.
 # Branch-writer resolution precedes conflicts: unreadable uzi plus CONFLICTING is exit 9, not 8.
 #
@@ -130,14 +132,15 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/lib/ci-fix.sh"
 net_retry_install
 
-usage() { echo "usage: watch-pr.sh OWNER/REPO PR [--since FULL_SHA] [interval_secs] [max_polls] [--reviewer any|coderabbit|greptile|none] [--reviewer-grace MIN] [--max-unknown N] [--ci-grace MIN]" >&2; exit 2; }
+usage() { echo "usage: watch-pr.sh OWNER/REPO PR [--since FULL_SHA [--after ISO8601]] [interval_secs] [max_polls] [--reviewer any|coderabbit|greptile|none] [--reviewer-grace MIN] [--max-unknown N] [--ci-grace MIN]" >&2; exit 2; }
 
 REVIEWER="any"; GRACE_MIN=10; MAX_UNKNOWN="${WATCH_PR_MAX_UNKNOWN:-5}"; CI_GRACE_MIN="${WATCH_PR_CI_GRACE:-15}"
-SINCE=""; since_time=""
+SINCE=""; AFTER=""; activity_after=""
 POS=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --since) [ $# -ge 2 ] && [ -n "$2" ] || usage; SINCE=$2; shift 2;;
+    --after) [ $# -ge 2 ] && [ -n "$2" ] || usage; AFTER=$2; shift 2;;
     --reviewer) REVIEWER="${2:?}"; shift 2;;
     --reviewer-grace) GRACE_MIN="${2:?}"; shift 2;;
     --max-unknown) MAX_UNKNOWN="${2:?}"; shift 2;;
@@ -157,6 +160,10 @@ case "$MAX_UNKNOWN" in ''|*[!0-9]*|0) echo "bad --max-unknown: $MAX_UNKNOWN" >&2
 case "$CI_GRACE_MIN" in ''|*[!0-9]*) echo "bad --ci-grace: $CI_GRACE_MIN" >&2; usage;; esac
 if [ -n "$SINCE" ] && ! [[ "$SINCE" =~ ^[0-9a-fA-F]{40}$ ]]; then echo 'bad --since: use a full commit SHA' >&2; usage; fi
 SINCE=$(printf '%s' "$SINCE" | tr 'A-F' 'a-f')
+if [ -n "$AFTER" ]; then
+  [ -n "$SINCE" ] || { echo '--after requires --since' >&2; usage; }
+  activity_after=$(iso8601_epoch "$AFTER") || { echo 'bad --after: use an ISO8601 timestamp with seconds and a timezone' >&2; usage; }
+fi
 cj_errf=$(mktemp "${TMPDIR:-/tmp}/watch-pr-checks.XXXXXX") || exit 2
 trap 'rm -f "$cj_errf"' EXIT
 
@@ -191,17 +198,12 @@ is_array() { printf '%s' "$1" | jq -e 'type=="array"' >/dev/null 2>&1; }
 # Share the existing poll budget and unknown/quota handling. Fetch only activity,
 # not merge gates: a contributor may respond while CI or review findings remain red.
 watch_author_activity() {
-  local baseline raw kind item runs run_id
+  local raw kind item runs run_id pr_author
   if ! [[ "$head" =~ ^[0-9a-f]{40}$ ]]; then unk pr_view; return; fi
   if [ "$head" != "$SINCE" ]; then
     echo "RESULT=author_attention reason=head_changed head=$head"; exit 13
   fi
-  if [ -z "$since_time" ]; then
-    if baseline=$(gh api "repos/$REPO/commits/$SINCE" 2>/dev/null) &&
-       since_time=$(printf '%s' "$baseline" | jq -er --arg sha "$SINCE" '
-         select(.sha == $sha) | .commit.committer.date | fromdateiso8601' 2>/dev/null); then :
-    else unk since_commit; return; fi
-  fi
+  pr_author=$(printf '%s' "$pv" | jq -er '.author.login | select(type == "string" and length > 0)' 2>/dev/null) || { unk author_identity; return; }
   for kind in comment review reply; do
     case "$kind" in
       comment) item="issues/$PR/comments" ;;
@@ -209,9 +211,9 @@ watch_author_activity() {
       reply) item="pulls/$PR/comments" ;;
     esac
     if raw=$(gh api --paginate "repos/$REPO/$item?per_page=100" 2>/dev/null) && pages_are_arrays "$raw" &&
-       item=$(new_human_activity_json "$raw" "$kind" "$since_time"); then
+       item=$(new_author_activity_json "$raw" "$kind" "$activity_after" "$pr_author"); then
       if [ "$item" != null ]; then
-        echo "RESULT=author_attention reason=human_activity kind=$kind id=$item head=$head"; exit 13
+        echo "RESULT=author_attention reason=author_activity kind=$kind id=$item head=$head"; exit 13
       fi
     else unk "author_$kind"; fi
   done
@@ -238,6 +240,9 @@ watch_author_activity() {
 repo_id=""
 repo_known=0
 start_ts=$(date +%s)
+[ -n "$activity_after" ] || activity_after=$start_ts
+pr_fields=headRefOid,state,baseRefName,mergeable,mergeStateStatus,headRefName
+[ -z "$SINCE" ] || pr_fields="$pr_fields,author"
 
 i=0
 while [ "$i" -lt "$MAX" ]; do
@@ -257,7 +262,7 @@ while [ "$i" -lt "$MAX" ]; do
     fi
   fi
 
-  pv=$(gh pr view "$PR" --repo "$REPO" --json headRefOid,state,baseRefName,mergeable,mergeStateStatus,headRefName 2>/dev/null || true)
+  pv=$(gh pr view "$PR" --repo "$REPO" --json "$pr_fields" 2>/dev/null || true)
   head=$(printf '%s' "$pv" | jq -r '.headRefOid // empty' 2>/dev/null || true)
   req_base=$(printf '%s' "$pv" | jq -r '.baseRefName // empty' 2>/dev/null || true)
   pstate=$(printf '%s' "$pv" | jq -r '.state // empty' 2>/dev/null || true)

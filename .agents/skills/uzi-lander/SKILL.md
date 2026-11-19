@@ -281,10 +281,10 @@ For a queued sweep issue without a run ID, use the watcher's `watch-issue.sh` at
    | 13 | `--since` observed an author-attention signal | inspect the push, human activity or CI approval request; never merge on this exit |
 
    When waiting for a contributor, run `S/watch-pr.sh OWNER/REPO PR --since FULL_REVIEWED_SHA 60 60`.
-   It watches head changes, human comments/reviews/thread replies after that commit's committer
-   time, and head CI requiring approval. Existing post-commit discussion, including your own
-   review, triggers immediately. It ignores bots and edits to older comments; it neither
-   requests reviews nor approves CI. Read [review-signals.md](references/review-signals.md)
+   It watches head changes, the PR author's comments/reviews/thread replies after startup,
+   and head CI requiring approval. Pass `--after ISO8601` to use an explicit discussion cutoff,
+   such as your review time. Ignore other humans, bots and edits to older comments; the mode
+   neither requests reviews nor approves CI. Read [review-signals.md](references/review-signals.md)
    for the watermark and exit contract. Re-arm readiness separately after reviewing the response.
 
    Let an auto-review that is already running finish; never re-trigger it. Greptile skips a

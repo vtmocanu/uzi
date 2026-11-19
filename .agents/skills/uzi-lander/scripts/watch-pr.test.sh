@@ -995,6 +995,10 @@ unset UZI_REPO_JSON UZI_RUNS_JSON CHECKS_JSON
 # Author mode is isolated from readiness fixtures. Unexpected gate or write calls fail.
 mkdir -p "$WORK/author-bin" "$WORK/activity"
 cp "$WORK/bin/sleep" "$WORK/author-bin/sleep"
+cat > "$WORK/author-bin/date" <<'STUB'
+#!/usr/bin/env bash
+if [ "$*" = '+%s' ]; then echo "$AUTHOR_NOW"; else /bin/date "$@"; fi
+STUB
 cat > "$WORK/author-bin/uzi" <<'STUB'
 #!/usr/bin/env bash
 echo 'author mode must not query uzi' >&2
@@ -1005,13 +1009,13 @@ cat > "$WORK/author-bin/gh" <<'STUB'
 set -eu
 echo "$*" >> "$ACTIVITY/calls"
 if [ "$1 $2" = 'pr view' ]; then
-  printf '{"headRefOid":"%s","state":"OPEN"}\n' "${AUTHOR_HEAD:-deadbeefdeadbeefdeadbeefdeadbeefdeadbeef}"
+  if [ "${AUTHOR_VIEW_FAIL:-0}" = 1 ]; then echo 'HTTP 403: rate limit exceeded' >&2; exit 1; fi
+  printf '{"headRefOid":"%s","state":"OPEN","author":{"login":"%s"}}\n' "${AUTHOR_HEAD:-deadbeefdeadbeefdeadbeefdeadbeefdeadbeef}" "${AUTHOR_LOGIN-pr-contributor}"
   exit 0
 fi
 [ "$1" = api ] || exit 1
 case "$*" in
   *rate_limit*) cat "$ACTIVITY/quota" ;;
-  *'/commits/'*) cat "$ACTIVITY/commit" ;;
   *'/issues/42/comments?'*) cat "$ACTIVITY/comment" ;;
   *'/pulls/42/reviews?'*) cat "$ACTIVITY/review" ;;
   *'/pulls/42/comments?'*) cat "$ACTIVITY/reply" ;;
@@ -1019,60 +1023,73 @@ case "$*" in
   *) echo "unexpected author lookup: $*" >&2; exit 1 ;;
 esac
 STUB
-chmod +x "$WORK/author-bin/gh" "$WORK/author-bin/uzi"
+chmod +x "$WORK/author-bin/gh" "$WORK/author-bin/uzi" "$WORK/author-bin/date"
 export PATH="$WORK/author-bin:$PATH" ACTIVITY="$WORK/activity"
+export AUTHOR_NOW
+AUTHOR_NOW=$(jq -nr '"2026-11-19T09:00:00Z" | fromdateiso8601')
 since=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef
 reset_activity() {
-  printf '{"sha":"%s","commit":{"committer":{"date":"2026-11-19T09:00:00Z"}}}\n' "$since" > "$ACTIVITY/commit"
   printf '[]\n' > "$ACTIVITY/comment"
   printf '[]\n' > "$ACTIVITY/review"
   printf '[]\n' > "$ACTIVITY/reply"
   printf '{"workflow_runs":[]}\n' > "$ACTIVITY/runs"
   printf '{"resources":{"core":{"limit":5000,"remaining":10,"reset":1800000000}}}\n' > "$ACTIVITY/quota"
   : > "$ACTIVITY/calls"
-  unset AUTHOR_HEAD
+  unset AUTHOR_HEAD AUTHOR_VIEW_FAIL AUTHOR_LOGIN
 }
 author_watch() {
   local name=$1 want=$2 got=0
-  bash "$SCRIPT" test/repo 42 --since "$since" 0 2 --max-unknown 1 > "$WORK/author-$name.out" 2>&1 || got=$?
+  shift 2
+  bash "$SCRIPT" test/repo 42 --since "$since" 0 2 --max-unknown 1 "$@" > "$WORK/author-$name.out" 2>&1 || got=$?
   [ "$got" -eq "$want" ] || fail "author $name rc=$got: $(cat "$WORK/author-$name.out")"
 }
 reset_activity
 export AUTHOR_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-author_watch push 13
+author_watch push 13 --after 2100-01-01T00:00:00Z
 grep -q '^RESULT=author_attention reason=head_changed head=aaaa' "$WORK/author-push.out" || fail 'push not named'
 [ "$(wc -l < "$ACTIVITY/calls" | tr -d ' ')" -eq 1 ] || fail 'push queried unrelated gates'
 
-# Include our own review, an empty review body, and a resolved thread's reply.
+# Include an empty author review body and a resolved thread's author reply.
 # Only fixed metadata is printed, never comment text.
 for kind in comment review reply; do
   reset_activity
-  jq -n --arg kind "$kind" '[{id:123,user:{type:"User",login:"maintainer"},created_at:"2026-11-19T09:00:01Z",submitted_at:"2026-11-19T09:00:01Z",body:(if $kind == "review" then "" else "UNTRUSTED_BODY" end)}]' > "$ACTIVITY/$kind"
+  jq -n --arg kind "$kind" '[{id:123,user:{type:"User",login:"pr-contributor"},created_at:"2026-11-19T09:00:01Z",submitted_at:"2026-11-19T09:00:01Z",body:(if $kind == "review" then "" else "UNTRUSTED_BODY" end)}]' > "$ACTIVITY/$kind"
   author_watch "$kind" 13
-  grep -qxF "RESULT=author_attention reason=human_activity kind=$kind id=123 head=$since" "$WORK/author-$kind.out" || fail "missed $kind"
+  grep -qxF "RESULT=author_attention reason=author_activity kind=$kind id=123 head=$since" "$WORK/author-$kind.out" || fail "missed $kind"
   if grep -q 'UNTRUSTED_BODY' "$WORK/author-$kind.out"; then fail 'printed activity body'; fi
 done
 reset_activity
-printf '[]\n[{"id":124,"user":{"type":"User"},"created_at":"2026-11-19T09:00:01Z"}]\n' > "$ACTIVITY/comment"
+printf '[]\n[{"id":124,"user":{"type":"User","login":"pr-contributor"},"created_at":"2026-11-19T09:00:01Z"}]\n' > "$ACTIVITY/comment"
 author_watch pagination 13
 
 reset_activity
 jq -n --arg sha "$since" '{workflow_runs:[{id:456,head_sha:$sha,status:"completed",conclusion:"action_required"}]}' > "$ACTIVITY/runs"
-author_watch approval 13
+author_watch approval 13 --after 2100-01-01T00:00:00Z
 grep -qxF "RESULT=author_attention reason=ci_approval_required run=456 head=$since" "$WORK/author-approval.out" || fail 'approval not named'
 
 reset_activity
-jq -n '[{id:1,user:{type:"Bot"},created_at:"2026-11-19T10:00:00Z"},
-  {id:2,user:{type:"User"},created_at:"2026-11-19T09:00:00Z",updated_at:"2026-11-19T10:00:00Z"},
-  {id:3,user:{type:"User"},created_at:"2026-11-19T08:59:59Z"}]' > "$ACTIVITY/comment"
-jq -n '[{id:4,user:{type:"User"},state:"PENDING",submitted_at:null}]' > "$ACTIVITY/review"
+jq -n '[{id:1,user:{type:"Bot",login:"pr-contributor"},created_at:"2026-11-19T10:00:00Z"},
+  {id:2,user:{type:"User",login:"pr-contributor"},created_at:"2026-11-19T09:00:00Z",updated_at:"2026-11-19T10:00:00Z"},
+  {id:3,user:{type:"User",login:"pr-contributor"},created_at:"2026-11-19T08:59:59Z"},
+  {id:6,user:{type:"User",login:"maintainer"},created_at:"2026-11-19T10:00:00Z"}]' > "$ACTIVITY/comment"
+jq -n '[{id:4,user:{type:"User",login:"pr-contributor"},state:"PENDING",submitted_at:null},
+  {id:7,user:{type:"User",login:"reviewer"},submitted_at:"2026-11-19T10:00:00Z"}]' > "$ACTIVITY/review"
+jq -n '[{id:8,user:{type:"User",login:"someone-else"},created_at:"2026-11-19T10:00:00Z"}]' > "$ACTIVITY/reply"
 printf '{"workflow_runs":[{"id":5,"head_sha":"old","conclusion":"action_required"}]}\n' > "$ACTIVITY/runs"
 author_watch no-change 2
 grep -qxF RESULT=timeout "$WORK/author-no-change.out" || fail 'no-change did not time out'
-[ "$(grep -c '/commits/' "$ACTIVITY/calls")" -eq 1 ] || fail 'baseline fetched again between polls'
+if grep -q '/commits/' "$ACTIVITY/calls"; then fail 'discussion used the reviewed commit time'; fi
 [ "$(grep -c '^pr view' "$ACTIVITY/calls")" -eq 2 ] || fail 'did not use the existing poll budget'
 
-for broken in comment review reply runs commit; do
+reset_activity
+jq -n '[{id:9,user:{type:"User",login:"pr-contributor"},created_at:"2026-11-19T08:59:59Z"}]' > "$ACTIVITY/comment"
+author_watch existing-author 2
+author_watch after-override 13 --after 2026-11-19T08:59:58Z
+author_watch after-offset 13 --after 2026-11-19T10:59:58+02:00
+author_watch after-fraction 13 --after 2026-11-19T06:59:58.5-02:00
+author_watch after-newer-fraction 2 --after 2026-11-19T08:59:59.5Z
+
+for broken in comment review reply runs; do
   reset_activity
   printf '{}\n' > "$ACTIVITY/$broken"
   author_watch "bad-$broken" 9
@@ -1081,10 +1098,13 @@ reset_activity
 printf '[]\n{"truncated":true}\n' > "$ACTIVITY/comment"
 author_watch partial-page 9
 reset_activity
-printf '[{"id":1,"user":{"type":"User"},"created_at":"bad-date"}]\n' > "$ACTIVITY/comment"
+printf '[{"id":1,"user":{"type":"User","login":"pr-contributor"},"created_at":"bad-date"}]\n' > "$ACTIVITY/comment"
 author_watch bad-date 9
 reset_activity
-printf '{}\n' > "$ACTIVITY/commit"
+export AUTHOR_LOGIN=''
+author_watch missing-author 9
+reset_activity
+export AUTHOR_VIEW_FAIL=1
 printf '{"resources":{"core":{"limit":5000,"remaining":0,"reset":1800000000}}}\n' > "$ACTIVITY/quota"
 author_watch quota 12
 grep -q '^RESULT=gh_rate_limited ' "$WORK/author-quota.out" || fail 'author mode lost quota handback'
@@ -1094,5 +1114,13 @@ for invalid in '' abc abcdefg; do
   bash "$SCRIPT" test/repo 42 --since "$invalid" 0 1 > "$WORK/author-invalid.out" 2>&1 || rc=$?
   [ "$rc" -eq 2 ] || fail 'invalid baseline accepted'
 done
+for invalid in '' yesterday 2026-02-30T09:00:00Z 2026-11-19T09:00:00+25:00; do
+  rc=0
+  bash "$SCRIPT" test/repo 42 --since "$since" --after "$invalid" 0 1 > "$WORK/author-invalid-after.out" 2>&1 || rc=$?
+  [ "$rc" -eq 2 ] || fail 'invalid activity cutoff accepted'
+done
+rc=0
+bash "$SCRIPT" test/repo 42 --after 2026-11-19T09:00:00Z 0 1 > "$WORK/author-after-without-since.out" 2>&1 || rc=$?
+[ "$rc" -eq 2 ] || fail '--after changed readiness mode'
 
-echo "PASS watch-pr: readiness regressions and waiting-on-author push, human discussion, CI approval, timeout, malformed reads and quota handback"
+echo "PASS watch-pr: readiness regressions and waiting-on-author push, author-only discussion, startup/explicit cutoff, CI approval, timeout, malformed reads and quota handback"
