@@ -758,10 +758,6 @@ Caveats:
   `stuck` until the volume binds is expected. Waiting alone is not grounds to delete or
   recreate claims repeatedly, bypass pacing, force-roll or remove reservations. Pending
   alone proves neither a storage fault nor healthy storage (#4468).
-- Known issues that can stall a restore in step 2.7:
-  - the roll status can drop a worker's health row when its blocker is synthetic, and
-    the worker list shares that status (#4467); when it looks stale, inspect the live
-    Deployment, reservation, claims and pod, and the controller logs.
 
 ## Pod shutdown grace
 
