@@ -112,8 +112,8 @@ can be edited and reset but never removed.
 - **Removing.** A size is refused while any worker uses it or either default-size
   setting (`hosted_default_size`, `ephemeral_default_size`) names it; the refusal
   says what holds it. Change those first, then remove.
-- **Same gate as edits.** Adding and removing follow the ceilings and the read-only
-  rule below.
+- **Same gate as edits.** Adding follows the ceilings and the read-only rule below;
+  removing follows the read-only rule.
 
 - **What an edit reaches.** The selectors on Admin → Workers update right after a
   save; a provision form that is already open keeps its numbers until you reopen or
