@@ -560,6 +560,15 @@ func TestDuplicateCanaryAbsenceProofFailClosed(t *testing.T) {
 		{name: "malformed third pool reservation", n: 3, mutate: func(t *testing.T, o *orphanCohort) {
 			o.edit(t, "w3", func(d *appsv1.Deployment) { d.Annotations[annotationRoll] = "{not json" })
 		}},
+		{name: "third pool member with no marker and an empty-valued annotation on its data claim", n: 3, mutate: func(t *testing.T, o *orphanCohort) {
+			o.edit(t, "w3", func(d *appsv1.Deployment) { delete(d.Annotations, annotationRoll) })
+			o.editClaim(t, dataPVCName("w3"), func(p *corev1.PersistentVolumeClaim) {
+				if p.Annotations == nil {
+					p.Annotations = map[string]string{}
+				}
+				p.Annotations[annotationRoll] = ""
+			})
+		}},
 		{name: "malformed peer reservation with differing current coverage", mutate: func(t *testing.T, o *orphanCohort) {
 			o.outsider(t, false, true)
 			o.edit(t, "w9", func(d *appsv1.Deployment) { d.Annotations[annotationRoll] = "{not json" })

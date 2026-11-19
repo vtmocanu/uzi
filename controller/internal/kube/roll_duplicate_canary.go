@@ -186,9 +186,12 @@ func (m *Materializer) cancelAbsentDuplicateCanary(ctx context.Context, t *rollT
 	owner, lane := pool[0].coverage.Owner, pool[0].coverage.Lane
 	inPool := map[*rollEntry]bool{}
 	// Defence in depth: several guards below overlap. identityAmbiguous/strayReservation
-	// are namespace-wide (also refused in the peer loop); an undecodable annotation also
-	// blocks the entry in rollSnapshot; a lane migration fence also marks the pool key
-	// uncertain. Each is kept so that no single upstream change can open the write.
+	// are namespace-wide (also refused in the peer loop); an undecodable Deployment or
+	// claim annotation also blocks the entry in rollSnapshot, but the bare rawReservation
+	// arm (annotation key present with an empty value, or on a non-data claim) has no
+	// upstream block and is pinned by the "empty-valued annotation on its data claim"
+	// row of TestDuplicateCanaryAbsenceProofFailClosed; a lane migration fence also marks
+	// the pool key uncertain. Each is kept so that no single upstream change can open the write.
 	for _, e := range pool {
 		inPool[e] = true
 		if e.hibernation || e.w.Hibernation != nil || e.mutated || t.unavailable[e.w.ID] || e.snapshotIncomplete || e.blocked != "" ||
