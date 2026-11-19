@@ -63,6 +63,61 @@ func TestWorkersAdminSizeNamesKeepAttentionVisible(t *testing.T) {
 	}
 }
 
+// A custom size on a docker worker, rendered beside the whole demo fleet: KIND yields
+// before ATTENTION (the baseline "✕ data 92%" label survives at 80), the "+dk" marker
+// survives the cap, builtin codes stay whole, and no line overflows.
+func TestWorkersCustomSizeKeepsDockerMarkerAndFleetAttention(t *testing.T) {
+	docker := true
+	for _, width := range []int{80, 160} {
+		for _, admin := range []bool{false, true} {
+			t.Run(fmt.Sprintf("w%d/admin=%v", width, admin), func(t *testing.T) {
+				m := workersScene(true, "workers-list-120")
+				m.width, m.height = width, 60
+				m.view = viewWorkers
+				m.board.admin = admin
+				m.workers.admin = admin
+				m.workers.rows = append(m.workers.rows, workerRow{w: apitypes.WorkerDTO{ID: "wcustom", Name: "gpu-box", Status: "online", Kind: "hosted", HostedSize: sp("gpu-a100"), Docker: &docker, Version: sp("0.85.1")}})
+				text := stripANSI(m.View().Content)
+				for _, l := range strings.Split(text, "\n") {
+					if w := visualWidth(l); w > width {
+						t.Errorf("line is %d cells, terminal is %d: %q", w, width, l)
+					}
+				}
+				if !strings.Contains(text, "✕ data 92%") {
+					t.Errorf("baseline attention label lost:\n%s", text)
+				}
+				found := false
+				for _, l := range strings.Split(text, "\n") {
+					if strings.Contains(l, "gpu-box") {
+						found = true
+						if !strings.Contains(l, "host·") || !strings.Contains(l, "+dk") {
+							t.Errorf("custom docker KIND lost its prefix or +dk: %q", l)
+						}
+					}
+				}
+				if !found {
+					t.Errorf("custom worker row not rendered:\n%s", text)
+				}
+			})
+		}
+	}
+}
+
+func TestWorkerKindFitKeepsMarkersAndBuiltins(t *testing.T) {
+	docker := true
+	m := workersScene(true, "workers-list-120")
+	row := func(size string, eph bool) workerRow {
+		return workerRow{w: apitypes.WorkerDTO{Kind: "hosted", HostedSize: sp(size), Ephemeral: eph, Docker: &docker}}
+	}
+	if got := m.workerKindFit(row("l-highmem", false), workerKindAdminDenseWidth); got != "host·LHM+dk" {
+		t.Errorf("builtin altered: %q", got)
+	}
+	got := m.workerKindFit(row("gpu-a100", false), workerKindAdminDenseWidth)
+	if !strings.HasPrefix(got, "host·") || !strings.HasSuffix(got, "+dk") || visualWidth(got) > workerKindAdminDenseWidth {
+		t.Errorf("capped kind = %q", got)
+	}
+}
+
 func TestWorkersDetailSizeRowWrapsAt80(t *testing.T) {
 	m := workerRenderModel(true)
 	m.width = 80

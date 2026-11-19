@@ -748,6 +748,13 @@ func (m tuiModel) workersSummary(width int, hideIdleCrossChecks bool) string {
 }
 
 func (m tuiModel) workerKind(r workerRow) string {
+	return m.workerKindFit(r, 0)
+}
+
+// workerKindFit renders the KIND text. With maxCells > 0 an admin-added size code is
+// clamped to the cells left after the prefix ("host·", "eph·") and the "+dk" suffix, so
+// a capped cell never loses either marker. Builtin codes (S/M/L/LHM) are never clamped.
+func (m tuiModel) workerKindFit(r workerRow, maxCells int) string {
 	if r.w.Kind == "external" {
 		return "ext"
 	}
@@ -776,6 +783,13 @@ func (m tuiModel) workerKind(r workerRow) string {
 		// rune is two cells). A cut shows an ellipsis; the detail view carries the full name.
 		if name := strings.ToUpper(cellText(t.hostedSize)); name != "" {
 			size = clampVisual(name, workerSizeCodeWidth)
+			if maxCells > 0 {
+				suffix := 0
+				if r.w.Docker != nil && *r.w.Docker {
+					suffix = 3
+				}
+				size = clampVisual(size, max(1, maxCells-visualWidth(kind+"·")-suffix))
+			}
 		}
 	}
 	kind += "·" + size
@@ -846,7 +860,7 @@ const (
 	workerUptimeWidth       = 6  // 23h59m / 99d23h, the detail header's format
 	workerAttentionMinWidth = 16 // "✕ outbox blocked"
 	workerSizeCodeWidth     = 8  // cells of an admin-added size name in the KIND cell
-	workerKindMaxWidth      = 15 // "eph·" + size code + "+dk"
+	workerKindMaxWidth      = 15 // "host·" + 8-cell size code + "+dk"
 	// "eph·LHM+dk" is 10 cells; "host·LHM+dk" is the widest builtin code, 11.
 	workerKindAdminDenseWidth = 11
 )
@@ -891,9 +905,10 @@ func (m tuiModel) workerTableWidths(rows []workerRow, width int) workerTableWidt
 		columns.version = max(columns.version, visualWidth(m.renderer.Plain(workerTextOf(row).workerVersion, 18))+marker)
 	}
 	columns.dense = width >= 120 && (columns.intake == 0 || width >= 160)
-	if columns.dense && m.board.admin {
-		// The factory view also carries OWNER: hold KIND to the builtin docker
-		// l-highmem width so an admin-added size name cannot starve ATTENTION.
+	if (columns.dense && m.board.admin) || width < 100 {
+		// The factory view also carries OWNER, and a narrow terminal has little to
+		// spare: hold KIND to the builtin docker l-highmem width so an admin-added
+		// size name yields before ATTENTION does.
 		columns.kind = min(columns.kind, workerKindAdminDenseWidth)
 	}
 	// Cursor, name, state, kind, runs, cross-checks, resource cells, heartbeat, eleven separators,
@@ -933,7 +948,7 @@ func (m tuiModel) workerRowLine(r workerRow, selected bool, width int, columns w
 		fields = append(fields, cell(m.workerOwnerCell(r), 7, m.pal.faintC))
 	}
 	state := workerState(r)
-	fields = append(fields, cell(workerStateGlyph(state)+" "+state, columns.state, m.workerStateColor(state)), cell(m.workerKind(r), columns.kind, m.pal.faintC), cell(workerSlots(r.w), 5, nil), cell(workerCrossCheckSlots(r.w), 6, nil))
+	fields = append(fields, cell(workerStateGlyph(state)+" "+state, columns.state, m.workerStateColor(state)), cell(m.workerKindFit(r, columns.kind), columns.kind, m.pal.faintC), cell(workerSlots(r.w), 5, nil), cell(workerCrossCheckSlots(r.w), 6, nil))
 	if columns.dense {
 		cpu, disk := "?", "?"
 		var cpuC, diskC color.Color
