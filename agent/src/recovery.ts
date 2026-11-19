@@ -412,7 +412,7 @@ export const PREDECESSOR_REFUSAL_CLASSES: { readonly integrity: readonly string[
   integrity: ["bundle_header", "local_bytes_unverified", "frozen_coverage", "source_proof", "bundle_failed",
     "bundle_file_missing", "incomplete_local_inputs", "local_bundle_mismatch", "capture_exception",
     "record_unauthenticated", "record_removed", "inventory_snapshot_changed", "inventory_quiescence_breach",
-    "source_advanced", "coverage_context"],
+    "source_advanced", "coverage_context", "refusal_seal"],
   ordinary: ["record_or_run_state", "restrictions", "bundle", "mint_denied", "capture_state",
     "capture_status", "hold_not_open", "hold_settled", "oversized", "predecessor_observation_refused",
     "predecessor_upload_budget", "predecessor_decoded_budget"],
@@ -520,6 +520,9 @@ export interface RecoveryBundleProducer {
   readRemediationRestrictionFacts?: GitCache["readRemediationRestrictionFacts"];
   withRemediationRestrictionFacts?: GitCache["withRemediationRestrictionFacts"];
   enumerateOwedCandidates?(barePath: string, runId: string): Promise<OwedCandidate[]>;
+  /** issue #4481: the durable refusal release gate and the write-once release seal. */
+  refusalReleaseGate?: GitCache["refusalReleaseGate"];
+  sealRefusalRelease?: GitCache["sealRefusalRelease"];
   discoverOwedCandidates?(skipContext?: (context: OwedCandidateContext | HistoricalOwedContext) => Promise<boolean>): ReturnType<GitCache["discoverOwedCandidates"]>;
   retainCurrentOwedCandidate?(barePath: string, options: FetchAgentBranchOptions): Promise<TrackingUpdateResult>;
   buildRecoveryCoverage?(barePath: string, context: PositiveOwedCandidateContext, roots: string[], currentSha: string,
@@ -3101,9 +3104,37 @@ export class RecoveryCoordinator {
     return "verified";
   }
 
+  /** issue #4481: the durable refusal gate on the record's own source. `none` (no refusals, below the cap)
+   *  and `eligible` pass; `ineligible` keeps custody. A producer without the seam (older fakes) passes: a
+   *  GitCache always implements it. */
+  private async refusalGateAllows(record: RecoveryRecord): Promise<boolean> {
+    if (!this.git.refusalReleaseGate) return true;
+    const context = record.coverageContext;
+    if (!context || !Number.isSafeInteger(context.generation) || context.generation < 1) return true;
+    const gate = await ownedRecoveryIO(() => this.git.refusalReleaseGate!(context.barePath, record.runId, context.generation, record.sourceSha));
+    if (gate.kind === "ineligible") {
+      this.log.warn("recovery: refusal release gate ineligible; custody retained", { run_id: record.runId, generation: context.generation, reason: gate.reason });
+      return false;
+    }
+    return true;
+  }
+
+  /** issue #4481: the write-once release seal, taken immediately before a guarded FINAL is sent. `none`
+   *  leaves the ordinary path untouched; `sealed` and `matches` proceed; anything else sends nothing. */
+  private async refusalSealAllows(record: RecoveryRecord): Promise<boolean> {
+    if (!this.git.sealRefusalRelease) return true;
+    const context = record.coverageContext;
+    if (!context || !Number.isSafeInteger(context.generation) || context.generation < 1) return true;
+    const sealed = await ownedRecoveryIO(() => this.git.sealRefusalRelease!(context.barePath, record.runId, context.generation, record.sourceSha));
+    if (sealed === "none" || sealed === "sealed" || sealed === "matches") return true;
+    this.log.warn("recovery: refusal release seal refused; custody retained", { run_id: record.runId, generation: context.generation, seal: sealed });
+    return false;
+  }
+
   private async frozenCoverageProven(record: RecoveryRecord): Promise<boolean> {
     // Every still-unresolved root must be covered; an earlier archive cannot close a later inventory.
     if (!record.coverageContext || !this.git.enumerateOwedCandidates) return false;
+    if (!await this.refusalGateAllows(record)) return false;
     const unresolved = await ownedRecoveryIO(() => this.git.enumerateOwedCandidates!(record.coverageContext!.barePath, record.runId));
     const frozenRoots = record.originalRoots ?? [];
     const ancestry = await this.frozenSourceAncestry(record, unresolved);
@@ -3260,6 +3291,7 @@ export class RecoveryCoordinator {
       if (hold !== "open" && !await this.finalHoldAllowsReplay(record, hold)) return this.heldStopped(record, hold);
       if (residueQuarantine() !== undefined) { this.operatorRefuse("worker_quarantined"); return quarantinedOutcome(record.captureId); }
       if (!await this.restrictionsAllowCapturedC(record)) return this.unmet("restrictions");
+      if (!await this.refusalSealAllows(record)) return this.unmet("refusal_seal");
       // The operator's last client checkpoint and point of no return; nothing is awaited before the POST.
       if (replay) this.operatorBeforePost(replay);
       // The release POST goes through recoveryRPC, which refuses a scope that is no longer live at dispatch,
@@ -3507,6 +3539,7 @@ export class RecoveryCoordinator {
         replayProof = settled;
       }
       if (!await this.restrictionsAllowCapturedC(record)) return this.unmet("restrictions", kept());
+      if (!await this.refusalSealAllows(record)) return this.unmet("refusal_seal", kept());
       // The operator's last client checkpoint and point of no return; nothing is awaited before the POST.
       if (replay) this.operatorBeforePost(replay);
       const ack = await this.recoveryRPC(() => replayProof
@@ -4016,6 +4049,8 @@ export class RecoveryCoordinator {
         }
         if (tp.outcome !== "published" && tp.outcome !== "recorded") { result = "kept"; return; }
       }
+      // issue #4481: the publish closure re-proves the refusal gate immediately before the create.
+      if (!await this.refusalGateAllows(record)) { result = "kept"; return; }
       // V2 reconciles lost create answers before any retry. V1 retains its legacy
       // archive fallback, whose FINAL supplies the generation settlement authority.
       if (v2) record = await this.writeExistingRecord(record, cur => ({ ...cur, heldCreateUncertain: true }));
@@ -4457,6 +4492,10 @@ export class RecoveryCoordinator {
       }
       if (!hasJournaledBundle(record) && !this.newProductionAllowed(record)) {
         return { state: record.state, captureId: record.captureId, held: "kept" };
+      }
+      // issue #4481: no bundle production or upload while the durable refusal gate proves nothing.
+      if (!await this.refusalGateAllows(record)) {
+        return { state: record.state, captureId: record.captureId, reason: "frozen_coverage", held: "kept" };
       }
       if (input.attemptedHeadSha && !record.attemptedHeadSha && this.newProductionAllowed(record)) {
         const attempted = input.attemptedHeadSha;

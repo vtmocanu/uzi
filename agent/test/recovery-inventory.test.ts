@@ -5895,6 +5895,7 @@ async function issue3561RunnerCase(route: "terminal settlement" | "retained capt
     Object.assign(f.client, { hasHeldPublicationV2: () => false });
     Object.assign(f.git, {
       retainCurrentOwedCandidate: async () => ({ kind: "updated", candidateSha: H, retainedShas: [] }),
+      refusalReleaseGate: async () => ({ kind: "none" }),
       withRecoveryOperation: async (_signal: AbortSignal, _deadline: number, action: (signal: AbortSignal) => Promise<unknown>, inherited?: MaintenanceBudget) =>
         inherited ? MaintenanceBudget.run(inherited, () => action(inherited.signal)) : action(signal),
       reserveRecoveryIteration: async () => ({ attempts: 1, deadline: Date.now() + 60_000, backoffMs: 0, claimGeneration: 7 }),

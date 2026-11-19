@@ -1276,8 +1276,11 @@ type FetchBackOutcome =
 interface OwedAnnounced { heads: Set<string>; archived: Set<string> }
 
 class PreservationRefusedError extends Error {
-  constructor(message = "tracking preservation refused") {
+  /** issue #4481: the incoming head an owed-cap refusal named (`owed_limit` only). */
+  readonly refusedSha: string | undefined;
+  constructor(message = "tracking preservation refused", refusedSha?: string) {
     super(message);
+    this.refusedSha = refusedSha;
     this.name = "PreservationRefusedError";
   }
 }
@@ -2927,6 +2930,12 @@ interface RunFlight {
   /** Exact server name used only to authorize checkpoint blob omission. */
   readonly checkpointDefaultBranch: string | undefined;
   owedContext: Promise<OwedCandidateContext> | undefined;
+  /** issue #4481: latch for the one refusal-provenance admission of this flight's authenticated positive
+   *  generation. Independent of `owedContext`, which a soft-deadline reset may clear. */
+  refusalAdmission: Promise<"written" | "existing" | "failed"> | undefined;
+  /** issue #4481: the head the terminal transfer verified for a generation, so a second terminal pass
+   *  (the hook runs again when the terminal is journaled and sent) re-proves it instead of re-importing. */
+  terminalTransfer: { generation: number; head: string; viaCap: boolean } | undefined;
   /** `pending` names the terminal about to be sent, so a held-eligible failure can defer its archive
    *  capture (issue #2545); omitted, the pass freezes and captures as before. */
   prepareTerminalInventory: (pending?: PendingTerminal) => Promise<void>;
@@ -13976,6 +13985,8 @@ export class RunRunner {
       owedDefaultBranch: claim.repo.default_branch?.trim() || undefined,
       checkpointDefaultBranch: claim.repo.default_branch ?? undefined,
       owedContext: undefined,
+      refusalAdmission: undefined,
+      terminalTransfer: undefined,
       owedFeedClosed: false,
       owedLimitStop: undefined,
       owedAnnounced: this.owedAnnouncedFor(runId),
@@ -19202,6 +19213,15 @@ export class RunRunner {
       throw error;
     }
     if (context.barePath !== barePath || context.branch !== branch) throw new Error("owed candidate flight context changed");
+    // issue #4481: the only admission writer. One attempt per flight, before the first fetch or pin
+    // of this generation. A failed admission is latched and logged; that generation then lacks
+    // provenance, so the cap release gate fails closed later.
+    if (context.generation !== null && flight.refusalAdmission === undefined) {
+      const positive = context;
+      flight.refusalAdmission = (async () => this.git.admitRefusalProvenance(positive))().catch(() => "failed" as const);
+      const admitted = await flight.refusalAdmission;
+      if (admitted === "failed") flight.runLog.warn("refusal provenance admission failed; cap release will fail closed", { generation: positive.generation });
+    } else if (flight.refusalAdmission !== undefined) await flight.refusalAdmission;
     flight.trackingAttemptToken ??= newTrackingAttemptToken(() => this.ownershipRepairAdmitted(flight));
     const selected = this.remediationSource(flight);
     return { context, remotelyConfirmedSha: flight.lastCheckpointRefTip, attemptToken: flight.trackingAttemptToken,
@@ -19376,6 +19396,14 @@ export class RunRunner {
           ctx.runId === claim.run_id && ctx.generation === claim.claim_generation))?.sha;
         currentSha ??= originalSourceSha;
         if (!currentSha) { flight.preserveRecoveryClone = true; return; }
+        // issue #4481: a durable refusal ledger that does not prove completeness keeps custody open.
+        // `none` (no refusals at or below the cap) and `eligible` proceed unchanged.
+        const gate = await this.git.refusalReleaseGate(barePath, claim.run_id, claim.claim_generation!, currentSha);
+        if (gate.kind === "ineligible") {
+          flight.preserveRecoveryClone = true;
+          flight.runLog.warn("recovery: refusal release gate ineligible; no freeze, custody retained", { reason: gate.reason });
+          return;
+        }
         const record = await this.recovery.freezeInventory({
           context, currentSha, originalSourceSha, locallyQuiescent, repoId: claim.repo.id,
           heldPolicy: this.frozenHeldPolicy(flight),
@@ -19677,7 +19705,12 @@ export class RunRunner {
             sourceAuthorityWait ?? this.authorityWait(flight)),
         },
       );
-      if (result.kind === "not_updated") throw this.preservationRefused(flight, result.reason);
+      if (result.kind === "not_updated") {
+        const refused = this.preservationRefused(flight, result.reason);
+        // The cap stop stays latched on the flight; this throw only carries the refused head to the terminal transfer.
+        if (result.reason === "owed_limit" && result.refusedSha !== undefined) throw new PreservationRefusedError(refused.message, result.refusedSha);
+        throw refused;
+      }
       if (result.divergence === "divergent") {
         const heads = result.displacedSha && result.retainedShas.includes(result.displacedSha) ? [result.displacedSha] : [];
         for (const sha of heads) if (/^[0-9a-f]{40}$/.test(sha) && !flight.owedFeedClosed) {
@@ -23293,13 +23326,37 @@ export class RunRunner {
     // Fetch the run's tip into the worker bare's tracking ref (refs/uzi-runner/<branch>), so the exact
     // clone-only head's objects are now present in the trusted bare. fetchAgentBranch THROWS on
     // failure (unlike the void fetchBackBestEffort), so a failed transfer is caught here.
+    // issue #4481: a second terminal pass for this generation cannot re-import (the first closed the
+    // refusal fence). It re-proves the head the first pass transferred instead.
+    const prior = flight.terminalTransfer?.generation === generation ? flight.terminalTransfer : undefined;
+    if (prior) {
+      if (prior.viaCap) return await this.transferAtOwedCap(runLog, barePath, worktreePath, runId, generation, prior.head, check);
+      const head = await this.git.worktreeHead(worktreePath);
+      check();
+      if (head === null || head !== prior.head || !await this.git.verifyRunnerTrackingCovers(barePath, worktreePath, branch)) {
+        runLog.warn("recovery: settle transfer — the earlier terminal transfer no longer covers the run HEAD");
+        return null;
+      }
+      check();
+      const reanchored = await this.git.anchorRecoveryHead(barePath, runId, generation, head);
+      check();
+      return reanchored ? head : null;
+    }
     let fetched: Extract<TrackingUpdateResult, { kind: "updated" }>;
     try {
       fetched = await this.fetchTracking(flight, barePath, worktreePath, branch, {}, undefined,
         heldCapture ? { signal: heldCapture.signal, timeoutMs: Math.max(1, Math.min(this.codexBoundaryDeadlineMs, heldCapture.deadlineAt - Date.now())) } : undefined);
+      // The terminal import is this generation's last: later imports of it refuse (issue #4481).
+      this.closeRefusalFence(runId, generation);
       check();
     } catch (e) {
       runLog.warn("recovery: settle transfer fetch-back failed", { error: errMessage(e) });
+      if (e instanceof PreservationRefusedError && e.refusedSha !== undefined) {
+        this.closeRefusalFence(runId, generation);
+        const head = await this.transferAtOwedCap(runLog, barePath, worktreePath, runId, generation, e.refusedSha, check);
+        if (head !== null) flight.terminalTransfer = { generation, head, viaCap: true };
+        return head;
+      }
       return null;
     }
     // POSITIVELY VERIFY the bare's tracking ref now covers the run's current HEAD (incl. any WIP
@@ -23335,6 +23392,43 @@ export class RunRunner {
     check();
     if (!anchored) {
       runLog.warn("recovery: settle transfer — could not durably anchor the verified head in the trusted bare");
+      return null;
+    }
+    flight.terminalTransfer = { generation, head, viaCap: false };
+    return head;
+  }
+
+  /** issue #4481: closes the in-process refusal fence for this run and generation. Never throws. */
+  private closeRefusalFence(runId: string, generation: number): void {
+    if (!Number.isSafeInteger(generation) || generation < 1) return;
+    try { this.git.closeRefusalGeneration(runId, generation); } catch { /* an invalid id leaves nothing to fence */ }
+  }
+
+  /** issue #4481: the terminal fetch was refused at the owed cap for `refusedSha`. The head may still
+   *  transfer, only when it IS the clone head and the durable refusal gate proves every refused head
+   *  covered; the verified head is then anchored exactly as on the ordinary path (the tracking cover
+   *  check is skipped: the refused head was never imported into tracking). Otherwise null, as before. */
+  private async transferAtOwedCap(
+    runLog: Logger, barePath: string, worktreePath: string, runId: string,
+    generation: number, refusedSha: string, check: () => void,
+  ): Promise<string | null> {
+    if (generation < 1) return null;
+    const head = await this.git.worktreeHead(worktreePath);
+    check();
+    if (head === null || head !== refusedSha) {
+      runLog.warn("recovery: owed-cap refusal does not name the clone head; custody retained");
+      return null;
+    }
+    const gate = await this.git.refusalReleaseGate(barePath, runId, generation, head);
+    check();
+    if (gate.kind !== "eligible") {
+      runLog.warn("recovery: owed-cap release gate not eligible; custody retained", { gate: gate.kind === "ineligible" ? gate.reason : gate.kind });
+      return null;
+    }
+    const anchored = await this.git.anchorRecoveryHead(barePath, runId, generation, head);
+    check();
+    if (!anchored) {
+      runLog.warn("recovery: owed-cap head could not be anchored in the trusted bare");
       return null;
     }
     return head;
