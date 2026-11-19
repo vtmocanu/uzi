@@ -114,11 +114,21 @@ export function JudgeSettingsCard({
           Enable the run judge for this instance
         </label>
 
-        <p className="text-xs text-faint" data-testid="judge-instance-default">
-          Instance default: Claude {instanceModelText("judge_model", settings, sources, defaults)} &middot; Codex{" "}
-          {instanceModelText("codex_judge_model", settings, sources, defaults)} &middot; users may
-          override. <a href="#model-defaults">Model defaults</a>
-        </p>
+        <div
+          className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1 rounded-lg border border-edge px-3 py-2 text-xs text-muted"
+          data-testid="judge-instance-default"
+        >
+          <span>
+            Instance default: Claude{" "}
+            <span className="font-mono text-fg">{instanceModelText("judge_model", settings, sources, defaults)}</span>{" "}
+            &middot; Codex{" "}
+            <span className="font-mono text-fg">{instanceModelText("codex_judge_model", settings, sources, defaults)}</span>{" "}
+            &middot; users may override.
+          </span>{" "}
+          <a href="#model-defaults" className="text-brand hover:underline">
+            Model defaults &uarr;
+          </a>
+        </div>
 
         {/* Enforce-all (PRD #69 M4). Greyed when the kill-switch is off: the kill-switch
             dominates, so an enforce toggle over a disabled judge would be a lie. */}
@@ -144,7 +154,7 @@ export function JudgeSettingsCard({
             opt-in</strong>. A user with no
             usable credential for that harness is skipped, with a reason shown on the run, and is never charged
             to the other provider. On a subscription plan it also eats their rate-limit quota. Consider a
-            cheaper judge model in <a href="#model-defaults">Model defaults</a> before enforcing. The per-user
+            cheaper judge model in <a href="#model-defaults" className="text-brand hover:underline">Model defaults</a> before enforcing. The per-user
             judge toggle on the Users page becomes inert while this is on.
           </p>
         </div>

@@ -270,14 +270,17 @@ export function InstanceModelDefaultsCard({
 
       <form onSubmit={save} className="space-y-4">
         {/* Locked while a save is in flight so an edit made then is not silently replaced by the response. */}
-        <fieldset disabled={busy} className="m-0 min-w-0 space-y-4 border-0 p-0">
+        <fieldset disabled={busy} className="min-w-0 space-y-3 border-0 p-0">
           <div className="hidden gap-4 border-b border-edge pb-2 text-sm font-medium text-muted sm:grid sm:grid-cols-[180px_1fr_1fr]">
             <span>Setting</span>
             <FamilyLabel family="Claude" />
             <FamilyLabel family="Codex" />
           </div>
-          {ROWS.map((row) => (
-            <div key={row.label} className="grid gap-3 sm:grid-cols-[180px_1fr_1fr] sm:gap-4">
+          {ROWS.map((row, i) => (
+            <div
+              key={row.label}
+              className={`grid gap-3 sm:grid-cols-[180px_1fr_1fr] sm:gap-4 ${i > 0 ? "border-t border-edge pt-3" : ""}`}
+            >
               <div className="min-w-0">
                 <div className="text-sm font-medium text-fg">{row.label}</div>
                 <p className="mt-0.5 text-xs text-faint">{row.note}</p>
@@ -287,7 +290,7 @@ export function InstanceModelDefaultsCard({
           ))}
         </fieldset>
 
-        <p className="text-xs text-faint">
+        <p className="border-t border-edge pt-3 text-xs text-faint">
           Default follows uzi&rsquo;s built-in model, including future changes to it; picking a model pins it.
           Each column offers only that harness&rsquo;s models, with the same validation users get. A user&rsquo;s
           own choice under Settings &rarr; Run defaults wins over these. Worker models have no instance default.

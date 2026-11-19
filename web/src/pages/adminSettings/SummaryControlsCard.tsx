@@ -51,7 +51,11 @@ export function SummaryControlsCard({
         <p className="mt-2 text-sm text-muted">
           Runs write short plain-English summaries on{" "}
           <strong className="text-fg">the run owner&rsquo;s own credential</strong>. Summaries are advisory and
-          never block a run. Pick the summary models in <a href="#model-defaults">Model defaults</a>.
+          never block a run. Pick the summary models in{" "}
+          <a href="#model-defaults" className="text-brand hover:underline">
+            Model defaults
+          </a>
+          .
         </p>
       </div>
 
