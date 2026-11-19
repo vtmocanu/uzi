@@ -1,0 +1,254 @@
+package kube
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/vtmocanu/uzi/controller/internal/protocol"
+)
+
+// Duplicate canary reservations (issue #4475). planPool keeps two canary reservations
+// held unless both prove a current old pod. One narrow shape is provably safe to
+// settle: a recycled participant (scaled to zero, no pod, no storage) that a stale
+// canary reservation was copied onto, next to a current canary that is serving. The
+// stale reservation protects nothing, so it is cancelled by one conditioned
+// metadata-only patch and the pool is re-observed.
+
+const duplicateCancelledReason = "duplicate canary cancelled for absent worker; re-observation required"
+
+// storageFact is one namespace PVC as listed, whatever its labels.
+type storageFact struct {
+	name     string
+	workerID string
+}
+
+// replicaSetOwners indexes the Deployment owner references of every listed
+// ReplicaSet (terminating, foreign-owned or oddly named included) by "uid:<uid>" and
+// "name:<name>". It exists only for absence proof; rollEntry.sets keeps the narrower
+// serving-proof ancestry.
+type replicaSetOwners map[string][]metav1.OwnerReference
+
+func (r replicaSetOwners) record(rs *appsv1.ReplicaSet) {
+	var owners []metav1.OwnerReference
+	for _, ref := range rs.OwnerReferences {
+		if ref.Kind == "Deployment" {
+			owners = append(owners, ref)
+		}
+	}
+	if rs.UID != "" {
+		r["uid:"+string(rs.UID)] = owners
+	}
+	r["name:"+rs.Name] = owners
+}
+
+// lookup resolves a pod's ReplicaSet owner reference by UID, else by name, and reports
+// whether the ReplicaSet was listed at all.
+func (r replicaSetOwners) lookup(ref metav1.OwnerReference) ([]metav1.OwnerReference, bool) {
+	if ref.UID != "" {
+		if o, ok := r["uid:"+string(ref.UID)]; ok {
+			return o, true
+		}
+	}
+	o, ok := r["name:"+ref.Name]
+	return o, ok
+}
+
+func canonicalClaimNames(id string) []string {
+	return []string{dataPVCName(id), nixPVCName(id), dindDataPVCName(id)}
+}
+
+func isCanonicalClaim(id, name string) bool {
+	for _, c := range canonicalClaimNames(id) {
+		if c == name {
+			return true
+		}
+	}
+	return false
+}
+
+// countStorageObserved counts every claim that belongs to worker id: labelled with its
+// id whatever its provenance, or bearing one of its canonical names whatever its labels.
+func countStorageObserved(id string, claims []storageFact) int {
+	n := 0
+	for _, c := range claims {
+		if c.workerID == id || isCanonicalClaim(id, c.name) {
+			n++
+		}
+	}
+	return n
+}
+
+// podObservedForWorker reports whether pod could belong to e's worker by any identity
+// signal, ignoring deletion state, labels it may have lost, and naming conventions.
+func podObservedForWorker(e *rollEntry, pod corev1.Pod) bool {
+	id := e.w.ID
+	prefix := deploymentName(id) + "-"
+	if pod.Labels[LabelWorkerID] == id || strings.HasPrefix(pod.Name, prefix) {
+		return true
+	}
+	for _, v := range pod.Spec.Volumes {
+		if v.PersistentVolumeClaim != nil && isCanonicalClaim(id, v.PersistentVolumeClaim.ClaimName) {
+			return true
+		}
+	}
+	for _, ref := range pod.OwnerReferences {
+		switch ref.Kind {
+		case "Deployment":
+			if deploymentRefMatches(e, ref) {
+				return true
+			}
+		case "ReplicaSet":
+			owners, listed := e.absenceOwners.lookup(ref)
+			if !listed {
+				if strings.HasPrefix(ref.Name, prefix) {
+					return true
+				}
+				continue
+			}
+			for _, o := range owners {
+				if deploymentRefMatches(e, o) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func deploymentRefMatches(e *rollEntry, ref metav1.OwnerReference) bool {
+	if ref.Kind != "Deployment" {
+		return false
+	}
+	return ref.Name == deploymentName(e.w.ID) || (ref.UID != "" && e.dep != nil && ref.UID == e.dep.UID)
+}
+
+func liveRollDeployment(e *rollEntry) bool {
+	return e.dep != nil && e.dep.UID != "" && e.dep.ResourceVersion != "" && e.dep.DeletionTimestamp == nil
+}
+
+// physicallyAbsent is physical evidence only: a scaled-to-zero Deployment with no pod,
+// no storage and no PVC user anywhere in the namespace listings.
+func physicallyAbsent(e *rollEntry) bool {
+	return e.dep != nil && e.dep.Spec.Replicas != nil && *e.dep.Spec.Replicas == 0 &&
+		len(e.pods) == 0 && e.podsObserved == 0 &&
+		e.claim == nil && !e.rawReservation && e.storageObserved == 0 &&
+		len(e.o.PVCUserPodUIDs) == 0
+}
+
+// staleDuplicateEligible reports a canary reservation that no longer matches its own
+// Deployment's template and is not shielded by custody, maintenance, work or hibernation.
+// The Deployment's pin may be older than the survivor's, so equality is not required.
+func staleDuplicateEligible(e *rollEntry) bool {
+	r := e.marker
+	return r != nil && r.Canary && !r.Completed && e.dep != nil &&
+		e.dep.Spec.Template.Annotations[AnnotationSpecHash] != r.Hash && e.drift &&
+		!e.w.CustodyHeld && !maintenanceActive(e.w) && !e.w.Busy && e.w.Hibernation == nil
+}
+
+// currentSurvivor reports an incomplete canary reservation that matches the rendered
+// and deployed target exactly, on a live one-replica Deployment that is not absent.
+// It is not the negation of the stale predicate.
+func currentSurvivor(t *rollTick, e *rollEntry) bool {
+	r := e.marker
+	if r == nil || !r.Canary || r.Completed || !liveRollDeployment(e) || physicallyAbsent(e) ||
+		e.dep.Spec.Replicas == nil || *e.dep.Spec.Replicas != 1 || e.o.Roll.Phase == protocol.PhaseStuck ||
+		(e.claim != nil && e.claim.Annotations[annotationRoll] != "") {
+		return false
+	}
+	version := t.outcomes[e.w.ID].TargetVersion
+	if version == "" || r.TargetVersion != version || r.Hash != e.target.Spec.Template.Annotations[AnnotationSpecHash] ||
+		r.Image != workerImage(e.target) || e.dep.Spec.Template.Annotations[AnnotationSpecHash] != r.Hash || workerImage(e.dep) != r.Image {
+		return false
+	}
+	c, ok := coverageOf(e.w, e.ns)
+	return ok && r.Coverage.Owner == c.Owner && r.Coverage.Lane == e.ns
+}
+
+// cancelAbsentDuplicateCanary settles a two-canary pool when exactly one canary D is
+// provably absent and stale and the other S is a current serving canary. It returns
+// true when it wrote and fully settled the tick's outcomes for the pool (the caller
+// then returns); on any refusal it writes nothing and the caller's hold applies. A
+// failed write marks the pool uncertain and records an error, then returns false.
+func (m *Materializer) cancelAbsentDuplicateCanary(ctx context.Context, t *rollTick, pool, canaries []*rollEntry) bool {
+	if len(canaries) != 2 || len(pool) == 0 {
+		return false
+	}
+	ns, key := pool[0].ns, coverageKey(pool[0].coverage)
+	owner, lane := pool[0].coverage.Owner, pool[0].coverage.Lane
+	inPool := map[*rollEntry]bool{}
+	for _, e := range pool {
+		inPool[e] = true
+		if e.hibernation || e.w.Hibernation != nil || e.mutated || t.unavailable[e.w.ID] || e.snapshotIncomplete || e.blocked != "" ||
+			e.identityAmbiguous || e.strayReservation {
+			return false
+		}
+		if e.marker == nil && (e.rawReservation || (e.claim != nil && e.claim.Annotations[annotationRoll] != "") || (e.dep != nil && e.dep.Annotations[annotationRoll] != "")) {
+			return false
+		}
+	}
+	if t.uncertain[key] || migrationLaneFenced(t, pool[0].coverage) || t.layoutUncertain[key] != "" {
+		return false
+	}
+	for _, u := range t.unplanned {
+		if !u.nsKnown || u.ns == ns {
+			return false
+		}
+	}
+	for _, c := range canaries {
+		if coverageKey(c.marker.Coverage) != key {
+			return false
+		}
+	}
+	for _, p := range t.entries {
+		if p.ns != ns {
+			continue
+		}
+		if p.identityAmbiguous || p.strayReservation {
+			return false
+		}
+		if inPool[p] {
+			continue
+		}
+		if p.marker != nil && p.marker.Canary && p.marker.Coverage.Owner == owner && p.marker.Coverage.Lane == lane {
+			return false
+		}
+		if (p.marker != nil || p.rawReservation || (p.claim != nil && p.claim.Annotations[annotationRoll] != "") || hasOpenReservation(p)) &&
+			!rollPeerOutOfScope(p, owner) {
+			return false
+		}
+	}
+
+	var d, s *rollEntry
+	for i, c := range canaries {
+		if liveRollDeployment(c) && physicallyAbsent(c) && staleDuplicateEligible(c) {
+			if d != nil {
+				return false
+			}
+			d, s = c, canaries[1-i]
+		}
+	}
+	if d == nil || !currentSurvivor(t, s) {
+		return false
+	}
+
+	err := m.reserveRoll(ctx, d, nil)
+	t.uncertain[key] = true
+	if err != nil {
+		t.errors = append(t.errors, fmt.Errorf("worker %s: duplicate canary cancellation unconfirmed: %w; re-observe and re-poll required", d.w.ID, err))
+		return false
+	}
+	for _, e := range pool {
+		p := t.outcomes[e.w.ID]
+		e.admitted = false
+		e.blocked = duplicateCancelledReason
+		p.State = "held"
+		p.BlockingWorkerID = pacingText(d.w.ID)
+		p.BlockingReason = pacingText(e.blocked)
+	}
+	return true
+}
