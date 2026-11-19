@@ -1239,8 +1239,13 @@ func covers(w protocol.DesiredWorker, c rollCoverage) bool {
 	return contains(got.Scheduling, c.Scheduling) && contains(got.Protocol, c.Protocol)
 }
 func validRollOwner(r *rollMarker, e *rollEntry) bool {
-	coverage, ok := coverageOf(e.w, e.ns)
-	return r != nil && ok && r.Coverage.Owner == coverage.Owner && r.Coverage.Lane == e.ns
+	return rollOwnerMatches(r, e.w, e.ns)
+}
+
+// rollOwnerMatches reports whether marker r names w's coverage owner in lane ns.
+func rollOwnerMatches(r *rollMarker, w protocol.DesiredWorker, ns string) bool {
+	coverage, ok := coverageOf(w, ns)
+	return r != nil && ok && r.Coverage.Owner == coverage.Owner && r.Coverage.Lane == ns
 }
 func decodeRoll(raw string) (*rollMarker, error) {
 	if raw == "" {
