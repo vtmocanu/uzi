@@ -441,6 +441,52 @@ describe("WorkerSizesCard", () => {
     expect(onChanged).toHaveBeenCalledTimes(1);
   });
 
+  it("closes the add form on a 409 max_sizes: the re-read at 16 shows the cap note, no form, and a later Remove does not bring the form back", async () => {
+    mockApi.createAdminWorkerSize.mockRejectedValue(new ApiError(409, "at most 16 worker sizes", { error: "at most 16 worker sizes", reason: "max_sizes" }));
+    const full = withAdded(...Array.from({ length: 12 }, (_, i) => `x${i}`));
+    const view = render(
+      <MemoryRouter>
+        <WorkerSizesCard data={sizes()} loadError="" onChanged={vi.fn().mockResolvedValue(undefined)} />
+      </MemoryRouter>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Add size" }));
+    fireEvent.change(input("New size name"), { target: { value: "xs" } });
+    for (const [label, value] of [["CPU request", "1"], ["CPU limit", "2"], ["Memory request", "4"], ["Memory limit", "8"], ["Data disk", "10"], ["DinD data disk", "10"]]) {
+      fireEvent.change(input(`New size ${label} (${label.startsWith("CPU") ? "cores" : "GiB"})`), { target: { value } });
+    }
+    fireEvent.click(screen.getByRole("button", { name: "Add size XS" }));
+    await screen.findByText("At most 16 sizes. Remove an added size to add another.");
+    expect(screen.queryByRole("form", { name: "Add a size" })).toBeNull();
+    view.rerender(
+      <MemoryRouter>
+        <WorkerSizesCard data={full} loadError="" onChanged={vi.fn().mockResolvedValue(undefined)} />
+      </MemoryRouter>,
+    );
+    expect(screen.getByText("16 of 16 sizes. At most 16 sizes: remove an added size to add another.")).toBeTruthy();
+    expect(screen.queryByRole("form", { name: "Add a size" })).toBeNull();
+    expect(document.activeElement).not.toBe(document.body);
+  });
+
+  it("moves focus to the first invalid input when local validation refuses a submit", async () => {
+    renderCard();
+    fireEvent.click(screen.getByRole("button", { name: "Add size" }));
+    fireEvent.click(within(screen.getByRole("form", { name: "Add a size" })).getByRole("button", { name: /^Add size/ }));
+    await waitFor(() => expect(document.activeElement).toBe(input("New size name")));
+    // A valid name: the first invalid field in order takes focus.
+    fireEvent.change(input("New size name"), { target: { value: "xs" } });
+    fireEvent.change(input("New size CPU request (cores)"), { target: { value: "1" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add size XS" }));
+    await waitFor(() => expect(document.activeElement).toBe(input("New size CPU limit (cores)")));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit size L" }));
+    fireEvent.change(input("L Memory request (GiB)"), { target: { value: "x" } });
+    fireEvent.change(input("L Data disk (GiB)"), { target: { value: "x" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save size L" }));
+    await waitFor(() => expect(document.activeElement).toBe(input("L Memory request (GiB)")));
+    expect(mockApi.updateAdminWorkerSize).not.toHaveBeenCalled();
+  });
+
   it("offers no Add while read-only", () => {
     renderCard({ ...withAdded("xs"), editable: false, read_only_reason: "The controller report is stale.", read_only_code: "controller_report_stale" });
     expect(screen.queryByRole("button", { name: "Add size" })).toBeNull();
@@ -462,10 +508,11 @@ describe("WorkerSizesCard", () => {
 
     // Keep and Escape send nothing.
     fireEvent.click(group.getByRole("button", { name: "Keep" }));
-    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Edit size XS" }));
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Remove size XS" }));
     fireEvent.click(screen.getByRole("button", { name: "Remove size XS" }));
     fireEvent.keyDown(screen.getByRole("button", { name: "Remove" }), { key: "Escape" });
     expect(screen.queryByRole("group", { name: "Confirm removal of size XS" })).toBeNull();
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Remove size XS" }));
     expect(mockApi.deleteAdminWorkerSize).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByRole("button", { name: "Remove size XS" }));
@@ -494,6 +541,8 @@ describe("WorkerSizesCard", () => {
     expect(onChanged).not.toHaveBeenCalled();
     expect(rowOf("XS")).toBeTruthy();
     await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "Edit size XS" })));
+    // The refusal sits inside that row, under its actions.
+    expect(within(rowOf("XS")).getByRole("alert").textContent).toMatch(/^XS is still in use/);
     cleanup();
 
     // One worker and no setting, or only a setting, say only that.
@@ -510,6 +559,15 @@ describe("WorkerSizesCard", () => {
     await waitFor(() =>
       expect(screen.getByRole("alert").textContent).toBe("XS is still in use, so it was not removed. Set as the default size for new workers; choose another default first."),
     );
+  });
+
+  it("a 404 on remove says the size was already removed and moves focus to that message", async () => {
+    mockApi.deleteAdminWorkerSize.mockRejectedValue(new ApiError(404, "size not found", { error: "size not found" }));
+    renderCard(withAdded("xs"));
+    fireEvent.click(screen.getByRole("button", { name: "Remove size XS" }));
+    fireEvent.click(screen.getByRole("button", { name: "Remove" }));
+    const msg = await screen.findByText("Size XS was already removed.");
+    await waitFor(() => expect(document.activeElement).toBe(msg.parentElement));
   });
 
   it("spells a builtin refusal in the page's words if the api ever returns one", async () => {

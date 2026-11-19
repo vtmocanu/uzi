@@ -290,7 +290,13 @@ export function WorkerSizesCard({
   const addButton = useRef<HTMLButtonElement>(null);
   const addNameInput = useRef<HTMLInputElement>(null);
   const resultRegion = useRef<HTMLDivElement>(null);
-  type FocusKind = "edit" | "form" | "confirm" | "banner" | "add" | "addForm" | "result";
+  const errorRegion = useRef<HTMLDivElement>(null);
+  const capNote = useRef<HTMLParagraphElement>(null);
+  const removeButtons = useRef(new Map<string, HTMLButtonElement>());
+  // A refused removal, shown inline under that row's actions (and nowhere else).
+  const [rowRefusal, setRowRefusal] = useState<{ name: string; message: string } | null>(null);
+  // "field": `name` is the id of the first invalid input; "cap": the 16-of-16 note.
+  type FocusKind = "edit" | "form" | "confirm" | "banner" | "add" | "addForm" | "result" | "error" | "cap" | "field" | "remove";
   const focusTarget = useRef<{ kind: FocusKind; name: string } | null>(null);
   const setFocusTarget = (t: { kind: FocusKind; name: string }) => {
     focusTarget.current = t;
@@ -304,7 +310,11 @@ export function WorkerSizesCard({
       : t.kind === "confirm" ? confirmButton.current
       : t.kind === "add" ? addButton.current
       : t.kind === "addForm" ? addNameInput.current
-      : t.kind === "result" ? resultRegion.current
+      : t.kind === "result" ? (resultRegion.current ?? errorRegion.current)
+      : t.kind === "error" ? errorRegion.current
+      : t.kind === "cap" ? (capNote.current ?? errorRegion.current)
+      : t.kind === "field" ? document.getElementById(t.name)
+      : t.kind === "remove" ? (removeButtons.current.get(t.name) ?? null)
       : (editButtons.current.get(t.name) ?? null);
     // A button disabled while a write is in flight cannot take focus; try again once enabled.
     if (el && !(el instanceof HTMLButtonElement && el.disabled)) {
@@ -349,6 +359,7 @@ export function WorkerSizesCard({
   const startEdit = (row: AdminWorkerSize) => {
     if (adding) closeAdd();
     setEditing(row.name);
+    setRowRefusal(null);
     setDraft(draftOf(row));
     setFieldErrors({});
     setError("");
@@ -400,8 +411,12 @@ export function WorkerSizesCard({
   // lands; 400 fields → the inputs (each server message already names its chart path).
   const handleWriteError = (err: unknown, fallback: string, mapFields: boolean) => {
     if (err instanceof ApiError && err.status === 409 && (err.body as { reason?: string } | null)?.reason === "max_sizes") {
-      // Another admin filled the table meanwhile; the re-read hides Add.
+      // Another admin filled the table meanwhile; the re-read hides Add. Close the form so it
+      // does not linger (and resurface after a later Remove), and park focus on the cap note
+      // (the error message until the note exists).
+      closeAdd();
       setError(`At most ${maxSizes} sizes. Remove an added size to add another.`);
+      setFocusTarget({ kind: "cap", name: "" });
       void onChanged();
       return;
     }
@@ -433,6 +448,8 @@ export function WorkerSizesCard({
     setResult(null);
     if (Object.keys(parsed.errors).length > 0) {
       setFieldErrors(parsed.errors);
+      const first = FIELDS.find((f) => parsed.errors[f.key]);
+      if (first) setFocusTarget({ kind: "field", name: `worker-size-${editingRow.name}-${first.key}` });
       return;
     }
     setFieldErrors({});
@@ -452,12 +469,14 @@ export function WorkerSizesCard({
 
   const askConfirm = (row: AdminWorkerSize, action: "reset" | "remove") => {
     if (locked) return;
+    setRowRefusal(null);
     setConfirming({ name: row.name, action });
     setFocusTarget({ kind: "confirm", name: row.name });
   };
-  const keepRow = (name: string) => {
+  // Keep / Escape: back to the button that opened the confirmation.
+  const keepRow = (name: string, action: "reset" | "remove") => {
     setConfirming(null);
-    setFocusTarget({ kind: "edit", name });
+    setFocusTarget({ kind: action === "remove" ? "remove" : "edit", name });
   };
 
   const reset = async (row: AdminWorkerSize) => {
@@ -486,9 +505,12 @@ export function WorkerSizesCard({
     if (!addParsed || locked) return;
     setError("");
     setResult(null);
-    const errors = { ...addParsed.errors, ...(addNameError ? { name: addNameError } : {}) };
+    const errors: Record<string, string> = { ...addParsed.errors, ...(addNameError ? { name: addNameError } : {}) };
     if (Object.keys(errors).length > 0) {
       setFieldErrors(errors);
+      const firstField = FIELDS.find((f) => errors[f.key]);
+      const firstId = errors.name ? "add-worker-size-name" : firstField ? `add-worker-size-${firstField.key}` : "";
+      if (firstId) setFocusTarget({ kind: "field", name: firstId });
       return;
     }
     setFieldErrors({});
@@ -516,6 +538,7 @@ export function WorkerSizesCard({
     if (locked) return;
     const label = sizeLabel(row.name);
     setError("");
+    setRowRefusal(null);
     setResult(null);
     setBusy(true);
     try {
@@ -527,11 +550,14 @@ export function WorkerSizesCard({
     } catch (err) {
       const body = err instanceof ApiError ? (err.body as WorkerSizeDeleteRefusal | null) : null;
       if (err instanceof ApiError && err.status === 409 && (body?.reason === "in_use" || body?.reason === "builtin")) {
-        setError(removalRefusal(label, body, err.message));
+        // Under the row it came from, not above the table; focus stays on that row's Edit.
+        setRowRefusal({ name: row.name, message: removalRefusal(label, body, err.message) });
         setFocusTarget({ kind: "edit", name: row.name });
       } else if (err instanceof ApiError && err.status === 404) {
-        // Already gone (another admin removed it): the re-read drops the row.
+        // Already gone (another admin removed it): the re-read drops the row, so focus
+        // moves to the message.
         setError(`Size ${label} was already removed.`);
+        setFocusTarget({ kind: "result", name: "" });
         void onChanged();
       } else {
         handleWriteError(err, `Failed to remove size ${label}`, false);
@@ -578,7 +604,11 @@ export function WorkerSizesCard({
         </div>
       )}
       {loadError && <Alert message={loadError} />}
-      {error && <Alert message={error} />}
+      {error && (
+        <div ref={errorRegion} tabIndex={-1} className="outline-none">
+          <Alert message={error} />
+        </div>
+      )}
       {result && (
         <div ref={resultRegion} tabIndex={-1} className="outline-none">
           <Alert tone="success" message={`Size ${sizeLabel(result.name)} ${result.verb}.`} />
@@ -636,7 +666,7 @@ export function WorkerSizesCard({
                           onKeyDown={(e) => {
                             if (e.key === "Escape" && !busy) {
                               e.stopPropagation();
-                              keepRow(row.name);
+                              keepRow(row.name, "remove");
                             }
                           }}
                         >
@@ -645,7 +675,7 @@ export function WorkerSizesCard({
                             <Button ref={confirmButton} size="sm" variant="danger" disabled={locked} onClick={() => void remove(row)}>
                               {busy ? "Removing…" : "Remove"}
                             </Button>
-                            <Button size="sm" variant="ghost" disabled={busy} onClick={() => keepRow(row.name)}>
+                            <Button size="sm" variant="ghost" disabled={busy} onClick={() => keepRow(row.name, "remove")}>
                               Keep
                             </Button>
                           </div>
@@ -658,7 +688,7 @@ export function WorkerSizesCard({
                           onKeyDown={(e) => {
                             if (e.key === "Escape" && !busy) {
                               e.stopPropagation();
-                              keepRow(row.name);
+                              keepRow(row.name, "reset");
                             }
                           }}
                         >
@@ -670,7 +700,7 @@ export function WorkerSizesCard({
                             <Button ref={confirmButton} size="sm" variant="secondary" disabled={locked} onClick={() => void reset(row)}>
                               {busy ? "Resetting…" : "Confirm"}
                             </Button>
-                            <Button size="sm" variant="ghost" disabled={busy} onClick={() => keepRow(row.name)}>
+                            <Button size="sm" variant="ghost" disabled={busy} onClick={() => keepRow(row.name, "reset")}>
                               Keep
                             </Button>
                           </div>
@@ -698,12 +728,27 @@ export function WorkerSizesCard({
                               </Button>
                             )}
                             {canRemove && (
-                              <Button size="sm" variant="ghost" aria-label={`Remove size ${label}`} disabled={busy} onClick={() => askConfirm(row, "remove")}>
+                              <Button
+                                ref={(el) => {
+                                  if (el) removeButtons.current.set(row.name, el);
+                                  else removeButtons.current.delete(row.name);
+                                }}
+                                size="sm"
+                                variant="ghost"
+                                aria-label={`Remove size ${label}`}
+                                disabled={busy}
+                                onClick={() => askConfirm(row, "remove")}
+                              >
                                 Remove
                               </Button>
                             )}
                           </div>
                         )
+                      )}
+                      {rowRefusal?.name === row.name && (
+                        <div className="mt-2 w-[8rem] font-normal sm:w-auto sm:max-w-[16rem]">
+                          <Alert message={rowRefusal.message} />
+                        </div>
                       )}
                     </th>
                     <td className="whitespace-nowrap px-1.5 py-2 align-top tabular-nums sm:px-3">
@@ -777,7 +822,7 @@ export function WorkerSizesCard({
               Add size
             </Button>
           )}
-          <p className="text-xs text-muted">
+          <p ref={capNote} tabIndex={-1} className="text-xs text-muted outline-none">
             {data.sizes.length} of {maxSizes} sizes.
             {atCap && ` At most ${maxSizes} sizes: remove an added size to add another.`}
           </p>
