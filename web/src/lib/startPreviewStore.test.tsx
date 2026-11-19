@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import type { ReactNode } from "react";
+import { StrictMode, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { api } from "./api";
@@ -293,6 +293,28 @@ describe("StartPreviewProvider / useStartPreview", () => {
     });
     expect(m.result.result.current?.status).toBe("idle");
     expect(getCalls() + postCalls()).toBe(0);
+  });
+
+  it("publishes under StrictMode with exactly one GET and one POST per scope", async () => {
+    auth.userId = "u1";
+    let generation = 1;
+    const result = renderHook(() => useStartPreview(REQ_CLAUDE), {
+      wrapper: ({ children }: { children?: ReactNode }) => (
+        <StrictMode>
+          <StartPreviewProvider generation={generation}>{children}</StartPreviewProvider>
+        </StrictMode>
+      ),
+    });
+    await waitFor(() => expect(result.result.current?.status).toBe("ready"));
+    expect(getCalls()).toBe(1);
+    expect(postCalls()).toBe(1);
+
+    generation = 2;
+    result.rerender();
+    await waitFor(() => expect(postCalls()).toBe(2));
+    await waitFor(() => expect(result.result.current?.status).toBe("ready"));
+    expect(getCalls()).toBe(2);
+    expect(postCalls()).toBe(2);
   });
 
   it("fetches fresh after an unmount and remount", async () => {

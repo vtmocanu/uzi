@@ -183,8 +183,10 @@ function branchView(
 // A GET failure (effective null) keeps the response's harness and credential and reads the
 // defaults as unknown.
 export function startPreviewView(preview: StartPreview, effective: EffectiveSettings | null): StartPreviewViewModel {
-  const fixed = { claim: false, create: false };
   const hv = preview.harness;
+  // An explicit harness choice is fixed on the run now; every harness value reports
+  // fixed_at "create", so only the run_override source marks a choice made here.
+  const fixed = { claim: false, create: hv?.source === "run_override" };
   const base = {
     harness: hv?.value ?? null,
     harnessSource: hv ? modelSettingSourceLabel("harness", hv.source) : null,
@@ -197,8 +199,8 @@ export function startPreviewView(preview: StartPreview, effective: EffectiveSett
     alternatives: [] as BranchView[],
     fixed,
   };
-  // A top-level refusal renders the refusal alone: no model or effort rows.
-  if (preview.refusal) return { ...base, credential: null };
+  // A top-level refusal renders the refusal and the server's credential: no model or effort rows.
+  if (preview.refusal) return base;
   if (base.chosenAtCreate) {
     base.alternatives = (preview.alternatives ?? []).map((a) => branchView(a, effective, fixed));
     return base;

@@ -79,13 +79,19 @@ describe("startPreviewKey", () => {
 
 describe("startPreviewView", () => {
   it("joins a default preview with no override cells to the GET defaults", () => {
-    const v = startPreviewView(recorded("claude"), GET);
+    const v = startPreviewView(recorded("auto token"), GET);
     expect(v.harness).toBe("claude");
     expect(v.model).toEqual({ text: "opus", short: "opus", source: "lead template" });
     expect(v.effort).toEqual({ text: "medium", short: "medium", source: "built-in" });
-    expect(v.credential).toBe("chosen when the run starts");
+    expect(v.credential).toBe("automatic selection");
     expect(compactSummary(v)).toBe("Claude · opus · medium");
     expect(v.fixed).toEqual({ claim: true, create: false });
+  });
+
+  it("counts an explicit harness choice as fixed on the run now", () => {
+    const v = startPreviewView(recorded("claude"), GET);
+    expect(v.fixed.create).toBe(true);
+    expect(startPreviewView(recorded("auto token"), GET).fixed.create).toBe(false);
   });
 
   it("uses an explicit model alone and falls back to the GET effort", () => {
@@ -190,6 +196,7 @@ describe("startPreviewView", () => {
   it("renders a top-level refusal with no model or effort rows", () => {
     const v = startPreviewView(recorded("claude with an incompatible model"), GET);
     expect(v.refusal).toBe(startRefusalLabel("model_incompatible_with_harness"));
+    expect(v.credential).toBe("chosen when the run starts");
     expect(v.model).toBeNull();
     expect(v.effort).toBeNull();
     expect(v.alternatives).toEqual([]);

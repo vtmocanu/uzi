@@ -4,11 +4,14 @@
 // refreshes its start prerequisites; `null` means it has not applied its first prerequisites,
 // so nothing is fetched. No timers.
 //
-// Ordering rule: a response is published only when its scope is still the provider's current
-// scope AND the consumer still wants its key. A scope change (generation or user) takes
-// effect in the same render, so a response still pending from the old scope can never
-// publish, whichever order responses arrive in. Scope epochs only grow, so after A -> B -> A
-// the first A scope stays dead. A user change or logout drops every published value.
+// Ordering rule: a response is published only while the effect that requested it is still
+// live. The scope and the key are that effect's dependencies, so a scope change (generation
+// or user) or a key change runs the old effect's cleanup before anything else, and a response
+// still pending from the old scope or key can never publish, whichever order responses arrive
+// in. Every scope object is created purely (no render-phase mutation), so React StrictMode's
+// double render and double effect run are harmless; the per-scope promise maps keep that to
+// one request each. After A -> B -> A the first A scope is a different object and stays dead.
+// A user change or logout drops every published value.
 
 import { createContext, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { api } from "./api";
@@ -16,10 +19,7 @@ import type { EffectiveSettings, StartPreview, StartPreviewRequest } from "./api
 import { useOptionalAuth } from "../auth/AuthContext";
 import { startPreviewKey, startPreviewView, type StartPreviewViewModel } from "./startPreview";
 
-let nextEpoch = 0;
-
 interface Scope {
-  epoch: number;
   userId: string | null;
   generation: number | null;
   get: Promise<EffectiveSettings> | null;
@@ -28,20 +28,16 @@ interface Scope {
 
 interface StoreValue {
   scope: Scope;
-  // The epoch of the provider's newest scope, written as the scope is created.
-  latest: { epoch: number };
 }
 
 const StoreContext = createContext<StoreValue | null>(null);
 
 export function StartPreviewProvider({ generation, children }: { generation: number | null; children: ReactNode }) {
   const userId = useOptionalAuth()?.user?.id ?? null;
-  const [latest] = useState(() => ({ epoch: 0 }));
-  const value = useMemo<StoreValue>(() => {
-    const scope: Scope = { epoch: ++nextEpoch, userId, generation, get: null, posts: new Map() };
-    latest.epoch = scope.epoch;
-    return { scope, latest };
-  }, [userId, generation, latest]);
+  const value = useMemo<StoreValue>(
+    () => ({ scope: { userId, generation, get: null, posts: new Map() } }),
+    [userId, generation],
+  );
   return <StoreContext.Provider value={value}>{children}</StoreContext.Provider>;
 }
 
@@ -94,14 +90,13 @@ export function useStartPreview(request: StartPreviewRequest | null): StartPrevi
     setPublished((p) => (p && p.userId !== userId ? null : p));
   }, [userId]);
 
-  const latest = store?.latest ?? null;
   useEffect(() => {
     const req = requestRef.current;
-    if (!scope || !latest || !req || key === null || scope.userId === null || scope.generation === null) return;
+    if (!scope || !req || key === null || scope.userId === null || scope.generation === null) return;
     const uid = scope.userId;
     let live = true;
     void Promise.allSettled([scopeGet(scope), scopePost(scope, key, req)]).then(([g, p]) => {
-      if (!live || latest.epoch !== scope.epoch) return;
+      if (!live) return;
       setPublished({
         userId: uid,
         key,
@@ -113,7 +108,7 @@ export function useStartPreview(request: StartPreviewRequest | null): StartPrevi
     return () => {
       live = false;
     };
-  }, [scope, latest, key]);
+  }, [scope, key]);
 
   const visible = published && published.userId === userId && published.key === key ? published : null;
   const view = useMemo(
