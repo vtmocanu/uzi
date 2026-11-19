@@ -658,13 +658,23 @@ export function displayHealthReason(run: Pick<HealthFlaggable, "health_reason">)
     ? null : reason || null;
 }
 
+// reasonCustodyLimitUnavailable in api/internal/workersvc/health.go (issue #4423 points it to
+// Admin → Workers, where the custody hold limit lives since #4212).
+const CUSTODY_LIMIT_UNAVAILABLE =
+  "new runs are paused: the custody hold limit setting could not be read; an admin should check Admin → Workers settings";
+// Legacy compatibility reader only: the pre-#4423 wording, which an older API can still send
+// during a rolling upgrade. It must keep the same precedence as the current text.
+const CUSTODY_LIMIT_UNAVAILABLE_LEGACY =
+  "new runs are paused: the custody hold limit setting could not be read; an admin should check Admin → Instance settings";
+
 export function queuedBlockerPrecedesCodexAdmission(run: { status: string; health_reason?: string | null }): boolean {
   // Mirror the blockers before admission in queuedReasonWithEligibility (health.go).
   return run.status === "queued" && [
     "handoff setup has not finished",
     "your vault is locked, so this run can't start",
     "recovery custody capacity is full; retained holds still protect your work; resolve or discard a retained hold to free capacity",
-    "new runs are paused: the custody hold limit setting could not be read; an admin should check Admin → Instance settings",
+    CUSTODY_LIMIT_UNAVAILABLE,
+    CUSTODY_LIMIT_UNAVAILABLE_LEGACY,
     // apitypes.ReasonCustodyRunHoldBound (api/internal/apitypes/recovery.go).
     "this run has reached its own custody hold limit; retained holds still protect its work; resolve or discard this run's own retained holds to let it start",
     "your Codex account is unavailable (quarantined or being re-linked), so this run can't start",

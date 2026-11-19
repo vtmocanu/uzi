@@ -33,11 +33,12 @@ const MAX_REVISION_ROUNDS = 3;
 
 // Issue #3391: the Docker-allowlist gap, worded for the viewer. Verbatim copies of
 // reasonRepoNotDockerAllowedAdmin / reasonRepoNotDockerAllowedMember in
-// api/internal/workersvc/health.go, so the gate and the queued-run health text agree.
+// api/internal/workersvc/health.go, so the gate and the queued-run health text agree. Display
+// only: nothing here reads a run's health_reason, so no legacy wording is kept (issue #4423).
 const DOCKER_ALLOWLIST_ADMIN =
-  "this repo isn't on the Docker worker repo allowlist, so your Docker workers can't run it; add it under Admin → Instance → Docker worker repo allowlist";
+  "this repo isn't on the Docker worker repo allowlist, so your Docker workers can't run it; add it under Admin → Workers → Docker worker repo allowlist";
 const DOCKER_ALLOWLIST_MEMBER =
-  "this repo isn't on the Docker worker repo allowlist, so your Docker workers can't run it; ask an admin to add it under Admin → Instance → Docker worker repo allowlist";
+  "this repo isn't on the Docker worker repo allowlist, so your Docker workers can't run it; ask an admin to add it under Admin → Workers → Docker worker repo allowlist";
 
 // PlanRevision is the panel's derived view of the revision history (PRD #41 Decision
 // 9): all of it comes from the run's feed messages, never a separate fetch.
