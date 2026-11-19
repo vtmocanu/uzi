@@ -334,7 +334,10 @@ func run() error {
 	wsvc := workersvc.New(q, box, workersvc.Params{
 		// #3150: the claim and the health pill read the custody_hold_limit admin setting through
 		// the same settings cache every other custody consumer uses.
-		CustodyHoldLimit:              settingsCache,
+		CustodyHoldLimit: settingsCache,
+		// PRD #4320: the operator's provider allowlist, re-checked by run creation (api-enforced).
+		ProviderAllowedBaseURLs:       cfg.ProviderAllowedBaseURLs,
+		ProviderAllowLoopback:         cfg.ProviderAllowLoopback,
 		RunTimeout:                    cfg.RunTimeout,
 		RunWallCeiling:                cfg.RunWallCeiling,
 		PlanCrossCheckTimeout:         cfg.PlanCrossCheckTimeout,

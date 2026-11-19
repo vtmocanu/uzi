@@ -97,7 +97,7 @@ async function main(): Promise<void> {
   }
   console.log("PASS: both identities get raw EACCES and filtered ENOENT; provisioned tool executes");
 
-  const sdkEnv = sdk.buildSdkEnv("canary", path.join(root, "home"), toolEnv);
+  const sdkEnv = sdk.buildSdkEnv({ kind: "oauth", token: "canary" }, path.join(root, "home"), toolEnv);
   const checkEnv = sdk.buildCheckEnv(process.env, path.join(root, "home"), toolEnv);
   const commandEnv = codex.buildCommandEnv("/tmp", toolEnv);
   assert.equal(sdkEnv.PATH, toolEnv.PATH, "SDK must preserve provisioned PATH order");

@@ -6255,6 +6255,9 @@ export class RunRunner {
     const runScopedSecrets = [claim.secrets.forge_pat, gitBasic];
     if (claim.secrets.anthropic_oauth_token)
       runScopedSecrets.push(claim.secrets.anthropic_oauth_token);
+    // PRD #4320: the gateway key. The server has no value-based scrubber for an arbitrary gateway key, so
+    // this registration (with the redactors' below) is the only protection for it.
+    if (claim.secrets.provider?.credential) runScopedSecrets.push(claim.secrets.provider.credential);
     for (const s of runScopedSecrets) this.log.addSecret(s);
     // The codex canaries were ALREADY addSecret'd above (before makeExecutor); append them
     // to runScopedSecrets AFTER the add loop — never inside it — so each is registered
@@ -13780,6 +13783,7 @@ export class RunRunner {
     const secrets = [
       claim.secrets.forge_pat,
       claim.secrets.anthropic_oauth_token,
+      claim.secrets.provider?.credential,
       this.joinToken,
       gitBasic,
     ];
@@ -16898,7 +16902,7 @@ export class RunRunner {
             steering,
             claim: {
               kind: resolveRunKind(claim.kind),
-              claude: !claim.secrets.codex && !!claim.secrets.anthropic_oauth_token,
+              claude: !claim.secrets.codex && (!!claim.secrets.anthropic_oauth_token || !!claim.secrets.provider),
               ...nowSummaryCodexClaim(runId, claim.secrets.codex, this.nowSummaryOpts.codexAdviceHarnessFactory, claim.claim_generation),
             },
             emit: (m) => batcher.emit(m),
@@ -16909,6 +16913,7 @@ export class RunRunner {
             pass: {
               // Placeholder only: every call overrides it with the credential snapshot (deps.credential).
               token: flight.credential?.current().token ?? "",
+              ...(claim.secrets.provider ? { provider: claim.secrets.provider } : {}),
               homeRoot: this.nowSummaryOpts.homeRoot,
               queryFn: this.nowSummaryOpts.queryFn,
             },
@@ -17071,6 +17076,7 @@ export class RunRunner {
       // Issue #1583: the claim-secret text redactor, for projections that bound text pre-batcher.
       redactText: flight.redactText,
       oauthToken: claim.secrets.anthropic_oauth_token,
+      ...(claim.secrets.provider ? { provider: claim.secrets.provider } : {}),
       ...(flight.credential ? { credential: () => flight.credential!.current() } : {}),
       // PRD #362 M3c: the run-summary model resolved server-side (user-value-wins),
       // and whether the intent summary is already set so the executor skips

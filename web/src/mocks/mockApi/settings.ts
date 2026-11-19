@@ -28,6 +28,7 @@ import { daysAgo, mockBuildInfo } from "../data";
 import { hasAnthropicToken, isCodexUsable } from "../../lib/hasToken";
 import { trustedBotsValueError } from "../../lib/trustedReviewBots";
 import { mockVaultMaterial, state } from "../store";
+import { mockClaudeProviderId } from "./providers";
 import { delay, mockScenario, oidcDemo, requireSession, users } from "./shared";
 import { agentSource, mockAllowedAgentSourceHosts } from "./agentSource";
 import { secrets } from "./secrets";
@@ -116,6 +117,8 @@ const SEED_USER_SETTINGS: UserSettings = {
   default_harness: null,
   // PRD #3257: per-user "Judge runs on"; null = same as the run being reviewed.
   judge_runs_on: null,
+  // PRD #4320: provider the Claude lane runs on; null = vendor Claude ladder.
+  claude_provider_id: null,
   harness_overflow_enabled: false,
   // Issue #3719: how a new Codex run chooses its login. Seeded "auto" so the demo shows the
   // pool at work (a pooled login sits in mocks/data/secrets.ts); the server's own default is
@@ -638,7 +641,10 @@ function mySettingsResponse(): { settings: UserSettings } {
   const reserve = me
     ? { weekly_reserve_pct: me.weekly_reserve_pct ?? null, weekly_reserve_pause_running: me.weekly_reserve_pause_running ?? true }
     : {};
-  return { settings: { ...userSettings, ...reserve, cross_check_pins, judge_models, summary_models, effort_settings, default_model: projected ?? null } };
+  // PRD #4320: the Claude source selection lives with the mock providers (not the persisted
+  // settings blob) so it can never outlive the in-memory provider list it points into.
+  const claude_provider_id = mockClaudeProviderId();
+  return { settings: { ...userSettings, ...reserve, claude_provider_id, cross_check_pins, judge_models, summary_models, effort_settings, default_model: projected ?? null } };
 }
 
 export let appSettings: AppSettings = loadedSettings.appSettings;

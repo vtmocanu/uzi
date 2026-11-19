@@ -252,8 +252,17 @@ const (
 	// D3-fixed user-visible text. In M5A only internal test-only Codex rows exist, so this rung is
 	// reachable only for them (no public origin can create a Codex run yet). Maps to the SAME
 	// healthWaitingWorker enum (no migration — runs.health_reason is free text).
-	reasonNoCodexCapableWorker  = "no Codex-capable worker is online"
-	reasonNoCurrentCodexRuntime = "no worker with the current Codex runtime is online; waiting for the worker roll"
+	reasonNoCodexCapableWorker = "no Codex-capable worker is online"
+	// reasonNoProviderCapableWorker (PRD #4320 module 5) is emitted for a PROVIDER-BOUND queued run
+	// (runs.model_provider_key_mode set) whose owner has NO online worker advertising the
+	// 'claude_provider_v1' protocol capability. Like reasonNoCodexCapableWorker it names a
+	// NON-BYPASSABLE block: ClaimRun's dedicated provider clause sits outside fn_worker_can_claim,
+	// required_capabilities and the capability-aware kill-switch, so the run waits until a worker that
+	// supports provider claims comes online (the hosted fleet is pinned separately from the app tier,
+	// so provider runs need the next worker roll). Maps to the SAME healthWaitingWorker enum
+	// (runs.health_reason is free text).
+	reasonNoProviderCapableWorker = "no worker that supports model providers is online; waiting for a worker roll"
+	reasonNoCurrentCodexRuntime   = "no worker with the current Codex runtime is online; waiting for the worker roll"
 	// reasonNoCustomCodexCapableWorker (PRD #1551 M4, D6) is emitted for a CUSTOM-Codex-root queued
 	// run (harness='codex', not task-review/judge/chat, whose effective worker-root model is a
 	// non-curated id) whose owner has NO online worker advertising BOTH 'codex_harness_v1' AND
@@ -1645,6 +1654,19 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 			slog.Error("health: count current Codex runtime workers", "run_id", r.ID, "error", currentErr)
 		} else if current == 0 {
 			return reasonNoCurrentCodexRuntime
+		}
+	}
+	// PRD #4320 module 5: a PROVIDER-BOUND run whose owner has NO online worker advertising
+	// claude_provider_v1 is genuinely UNPLACEABLE (ClaimRun's non-bypassable provider clause can never be
+	// satisfied). Placed right after the Codex rungs for the same reason they sit ahead of the
+	// priority-class re-label. r.ModelProviderKeyMode is the claim clause's own discriminator, so the
+	// pill and the claim can never disagree. Read errors fall through.
+	if r.ModelProviderKeyMode.Valid {
+		c, cerr := s.q.CountOnlineWorkersSatisfyingClaudeProvider(ctx, r.UserID)
+		if cerr != nil {
+			slog.Error("health: count online workers satisfying claude provider", "run_id", r.ID, "error", cerr)
+		} else if c == 0 {
+			return reasonNoProviderCapableWorker
 		}
 	}
 	// PRD #1551 M4 (D6): a CUSTOM-Codex-root run whose owner has NO online worker advertising BOTH

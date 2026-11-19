@@ -8,6 +8,7 @@ export * from "./mrRework";
 export * from "./findings";
 export * from "./judge";
 export * from "./secrets";
+export * from "./providers";
 export * from "./forge";
 export * from "./boards";
 export * from "./workers";

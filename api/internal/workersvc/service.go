@@ -1206,6 +1206,11 @@ type Store interface {
 	// above, and off the hot path for the same reason — it runs only for a Codex-indicating queued
 	// run already past its health threshold.
 	CountOnlineWorkersSatisfyingCodexHarness(ctx context.Context, userID uuid.UUID) (int64, error)
+	// CountOnlineWorkersSatisfyingClaudeProvider backs PRD #4320 module 5's queued-reason rung: a
+	// PROVIDER-BOUND queued run whose owner has NO online worker advertising 'claude_provider_v1' gets
+	// reasonNoProviderCapableWorker. The Claude-provider twin of CountOnlineWorkersSatisfyingCodexHarness,
+	// off the hot path for the same reason.
+	CountOnlineWorkersSatisfyingClaudeProvider(ctx context.Context, userID uuid.UUID) (int64, error)
 	CountOnlineWorkersSatisfyingCodexRuntime(ctx context.Context, userID uuid.UUID) (int64, error)
 	// CountOnlineWorkersSatisfyingCodexCompletion checks the protocol intersection
 	// required by an interlocked Codex run, including a custom root when requested.
@@ -1512,6 +1517,12 @@ type Store interface {
 
 // Params are the runtime knobs the service needs, mirrored from config.
 type Params struct {
+	// ProviderAllowedBaseURLs and ProviderAllowLoopback (PRD #4320) mirror config's operator
+	// allowlist of model-provider base URLs. The api is the destination authority: run creation
+	// re-checks a provider source (and an inherited binding) against them. Empty = feature off,
+	// so every set source is unusable (base_url_not_allowed).
+	ProviderAllowedBaseURLs []string
+	ProviderAllowLoopback   bool
 	// CustodyHoldLimit supplies the per-owner custody admission limit (the custody_hold_limit
 	// admin setting; see CustodyHoldLimitReader). Nil means no usable value: claims refuse
 	// and the health pill reports the setting unreadable, never a fallback number.
@@ -7790,6 +7801,11 @@ func (s *Service) SetWorkerAnthropicToken(ctx context.Context, userID, workerID 
 				}
 				return err
 			}
+			// PRD #4320 D2: only an Anthropic token is bindable here; a provider key (or any other
+			// kind) answers like a foreign id, so it can never be pinned and later opened as one.
+			if row.Kind != store.KindAnthropicToken {
+				return ErrSecretNotOwned
+			}
 			// PRD #1732 D5: a new binding onto a disabled credential is refused, not stored.
 			// Read under the secret mutation lock, so a concurrent disable is serialized.
 			if row.Disabled {
@@ -7857,6 +7873,11 @@ func (s *Service) SetUserJudgeBinding(ctx context.Context, userID uuid.UUID, mod
 					return ErrSecretNotOwned
 				}
 				return err
+			}
+			// PRD #4320 D2: only an Anthropic token is bindable here; a provider key (or any other
+			// kind) answers like a foreign id, so it can never be pinned and later opened as one.
+			if row.Kind != store.KindAnthropicToken {
+				return ErrSecretNotOwned
 			}
 			// PRD #1732 D5: a new binding onto a disabled credential is refused, not stored.
 			// Read under the secret mutation lock, so a concurrent disable is serialized.
@@ -8606,9 +8627,16 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 			// PRD #1429 M2 (D1): the AUDITOR INVARIANT — runs.harness is stamped from the D11 result
 			// createRunAtomic resolved and froze inside THIS transaction, never a hardcoded literal, so
 			// the frozen row's harness equals the harness the freeze decision used.
-			Harness:                string(resolved.Harness),
-			CapturedPlanCrossCheck: capturedCreationFlag(resolved.CreationPolicy, true),
-			CapturedCodeCrossCheck: capturedCreationFlag(resolved.CreationPolicy, false),
+			Harness: string(resolved.Harness),
+			// PRD #4320 M4: the five provider binding columns (all NULL for a vendor run). Unstamped
+			// would be a silent vendor run; createRunAtomic asserts the inserted row against the resolution.
+			ModelProviderID:          bindingOf(resolved).ProviderID,
+			ModelProviderRevision:    bindingOf(resolved).Revision,
+			ModelProviderKeyMode:     bindingOf(resolved).KeyMode,
+			ModelProviderKeySecretID: bindingOf(resolved).KeySecret,
+			ModelProviderKeyRev:      bindingOf(resolved).KeyRev,
+			CapturedPlanCrossCheck:   capturedCreationFlag(resolved.CreationPolicy, true),
+			CapturedCodeCrossCheck:   capturedCreationFlag(resolved.CreationPolicy, false),
 			// PRD #1247 / #1429 M2: the per-run credential override columns, from the effective override
 			// resolved above (rawOverride validated against resolved.Harness, or a schedule's stored
 			// credOverride written as-is). nil ⇒ NULL/NULL ⇒ inherit the worker binding.

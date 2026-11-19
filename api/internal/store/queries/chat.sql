@@ -22,8 +22,9 @@ WITH seed AS (
 -- harness (PRD #1332 M5A / D2): SQL literal 'claude', not a param. A chat run never folds
 -- run_usage (the fold skips kind='chat'), but every production INSERT INTO runs writes the
 -- harness explicitly anyway, so the DEFAULT can never mask an omitted origin.
-INSERT INTO runs (id, user_id, kind, issue_title, issue_description, title, trigger_source, harness)
-VALUES (@run_id, @user_id, 'chat', @issue_title, @issue_description, @title, 'chat', 'claude')
+-- model_provider_* (PRD #4320 M4), class FRESH-RESOLVE: the owner's Claude source frozen by the chat create transaction (workersvc.CreateChatRun).
+INSERT INTO runs (id, user_id, kind, issue_title, issue_description, title, trigger_source, harness, model_provider_id, model_provider_revision, model_provider_key_mode, model_provider_key_secret_id, model_provider_key_rev)
+VALUES (@run_id, @user_id, 'chat', @issue_title, @issue_description, @title, 'chat', 'claude', sqlc.narg('model_provider_id')::uuid, sqlc.narg('model_provider_revision')::int, sqlc.narg('model_provider_key_mode')::text, sqlc.narg('model_provider_key_secret_id')::uuid, sqlc.narg('model_provider_key_rev')::bigint)
 RETURNING *;
 
 -- name: CreateChatContinueRun :one
@@ -36,8 +37,9 @@ RETURNING *;
 WITH affinity AS MATERIALIZED (
  SELECT * FROM workers WHERE workers.id = sqlc.narg('worker_id')::uuid FOR UPDATE
 )
-INSERT INTO runs (user_id, kind, issue_title, issue_description, title, resume_of_run_id, worker_id, trigger_source, harness)
-VALUES (@user_id, 'chat', @issue_title, '', @title, @resume_of_run_id, (SELECT affinity.id FROM affinity WHERE fn_worker_accepts_new_intake(affinity)), 'resume', 'claude')
+-- model_provider_* (PRD #4320 M4), class INHERITED: copied verbatim from the ended chat run (workersvc.ContinueChat), never the owner's current source.
+INSERT INTO runs (user_id, kind, issue_title, issue_description, title, resume_of_run_id, worker_id, trigger_source, harness, model_provider_id, model_provider_revision, model_provider_key_mode, model_provider_key_secret_id, model_provider_key_rev)
+VALUES (@user_id, 'chat', @issue_title, '', @title, @resume_of_run_id, (SELECT affinity.id FROM affinity WHERE fn_worker_accepts_new_intake(affinity)), 'resume', 'claude', sqlc.narg('model_provider_id')::uuid, sqlc.narg('model_provider_revision')::int, sqlc.narg('model_provider_key_mode')::text, sqlc.narg('model_provider_key_secret_id')::uuid, sqlc.narg('model_provider_key_rev')::bigint)
 RETURNING *;
 
 -- name: ListChatRunsForUser :many
@@ -120,8 +122,14 @@ WHERE id = (
       -- Codex-indicating chat run must NEVER be claimed by ANY worker, however capable. Checks
       -- all THREE binding facts (harness='codex' OR codex_material_revision IS NOT NULL OR
       -- codex_secret_id IS NOT NULL) so it stays closed on inconsistent/legacy data, exactly as
-      -- the run lane does. No new bind param, so ClaimChatRunParams is unchanged.
+      -- the run lane does.
       AND NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
+      -- PRD #4320 module 5: the NON-BYPASSABLE provider claim clause, the chat twin of ClaimRun's. A
+      -- provider-bound chat (model_provider_key_mode set) is claimable only by a worker reporting
+      -- 'claude_provider_v1' (@worker_protocol_caps is the claimant's stored workers.protocol_capabilities,
+      -- read under the claimant row lock by claimChatRun): an older worker would ignore the unknown
+      -- `provider` claim key and start the chat with an empty Anthropic token.
+      AND (r.model_provider_key_mode IS NULL OR 'claude_provider_v1' = ANY(@worker_protocol_caps::text[]))
       -- PRD #1906 M5: the chat lane never claims a profile-bound run. The schema already forbids a
       -- profile-bound chat (runs_egress_profile_not_chat, 00270); this is the claim-side backstop,
       -- so dropping that CHECK could never hand one to the chat executor's full tool set.

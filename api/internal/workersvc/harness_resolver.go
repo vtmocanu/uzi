@@ -208,12 +208,20 @@ type resolvedHarness struct {
 	// DefaultSkipped is true when users.default_harness named a harness with no usable credential
 	// and no explicit harness was given, so the resolver fell through to the availability rules.
 	DefaultSkipped bool
+	// ClaudeSourceSet is true when the owner selected a Claude provider source (usable or not;
+	// PRD #4320 M4). A set source makes the Claude engine ineligible for automatic harness choice and
+	// for creation overflow in either direction.
+	ClaudeSourceSet bool
+	// ProviderSource is the usable provider source a Claude run will freeze; nil for a vendor run
+	// (null source, a Codex run, or an inherited vendor successor).
+	ProviderSource *providerSource
 }
 
 // automaticHarnessEligible reports whether creation picks the harness by soonest weekly reset
 // (#3845): an unset default, no explicit harness, both harnesses usable and an eligible origin.
 func automaticHarnessEligible(res resolvedHarness, explicit *Harness, origin harnessCreationOrigin, p store.GetHarnessCreationPolicyRow) bool {
-	return res.DefaultUnset && explicit == nil && res.BothUsable && origin.eligible(p)
+	// A set Claude provider source (PRD #4320 D13) is never compared with vendor weekly readings.
+	return res.DefaultUnset && explicit == nil && res.BothUsable && !res.ClaudeSourceSet && origin.eligible(p)
 }
 
 // harnessResolverStore is the narrow C1-frozen read surface the store-backed resolver
@@ -227,6 +235,8 @@ func automaticHarnessEligible(res resolvedHarness, explicit *Harness, origin har
 // CountEnabledCodexSecrets); the any-credential variants are read only to classify an explicit
 // refusal as disabled-not-absent (errHarnessCredentialDisabled).
 type harnessResolverStore interface {
+	// PRD #4320 M4: the owner's Claude provider source, read before the vendor token rule.
+	GetUserClaudeProviderSource(ctx context.Context, id uuid.UUID) (store.GetUserClaudeProviderSourceRow, error)
 	UserHasAnthropicToken(ctx context.Context, userID uuid.UUID) (bool, error)
 	UserHasEnabledAnthropicToken(ctx context.Context, userID uuid.UUID) (bool, error)
 	GetUserDefaultHarness(ctx context.Context, id uuid.UUID) (pgtype.Text, error)
@@ -282,12 +292,52 @@ func (s *Service) resolveRunHarness(ctx context.Context, userID uuid.UUID, expli
 // leave a Codex row bound to a vanished credential. *store.Queries satisfies harnessResolverStore,
 // so a qtx derived via WithTx is a valid q here. resolveRunHarness is the ambient-q wrapper.
 func (s *Service) resolveRunHarnessQ(ctx context.Context, userID uuid.UUID, explicit *Harness, q harnessResolverStore) (resolvedHarness, error) {
-	// Claude usability is "does the user hold an ENABLED Anthropic token" (PRD #1732 D15: a
-	// slot whose tokens are all disabled has no default and counts as unavailable, so a new
-	// implicit request falls back as it would for a token-less user).
+	return s.resolveRunHarnessMode(ctx, userID, explicit, q, false)
+}
+
+// claudeAvailability is the Claude half of the availability facts. Without a provider source (the
+// null path, and every vendorOnly resolution) it is exactly today's rule: "does the user hold an
+// ENABLED Anthropic token" (PRD #1732 D15: a slot whose tokens are all disabled has no default and
+// counts as unavailable, so a new implicit request falls back as it would for a token-less user).
+// A usable provider source makes Claude usable regardless of any Anthropic token; a set but
+// unusable one makes it unusable (the caller then refuses rather than fall back). vendorOnly skips
+// the source read entirely: an inherited vendor successor resolves vendor credentials as today and
+// never consults the owner's current source (PRD #4320: successors use the source run's binding).
+func (s *Service) claudeAvailability(ctx context.Context, q harnessResolverStore, userID uuid.UUID, vendorOnly bool) (bool, ProviderSourceResult, error) {
+	var src ProviderSourceResult
+	if !vendorOnly {
+		var err error
+		src, err = s.claudeProviderSource(ctx, q, userID)
+		if err != nil {
+			return false, ProviderSourceResult{}, fmt.Errorf("harness resolve: %w", err)
+		}
+		switch src.State {
+		case ProviderSourceUsable:
+			return true, src, nil
+		case ProviderSourceUnusable:
+			return false, src, nil
+		}
+	}
 	claudeUsable, err := q.UserHasEnabledAnthropicToken(ctx, userID)
 	if err != nil {
-		return resolvedHarness{}, fmt.Errorf("harness resolve: anthropic token check: %w", err)
+		return false, src, fmt.Errorf("harness resolve: anthropic token check: %w", err)
+	}
+	return claudeUsable, src, nil
+}
+
+// resolveRunHarnessMode is resolveRunHarnessQ with the provider-source switch. vendorOnly resolves
+// as if the owner had no provider source (see claudeAvailability).
+//
+// With a set source (PRD #4320 module 4):
+//   - usable: Claude is usable, and a Claude result carries ProviderSource;
+//   - unusable: Claude is NOT usable and the result is the typed ErrProviderSourceUnusable BEFORE any
+//     same- or cross-engine fallback, unless the caller pinned Codex outright (explicit codex) or
+//     the owner's stored default is a usable Codex. An unset default (automatic) never picks Codex
+//     around an unusable source.
+func (s *Service) resolveRunHarnessMode(ctx context.Context, userID uuid.UUID, explicit *Harness, q harnessResolverStore, vendorOnly bool) (resolvedHarness, error) {
+	claudeUsable, src, err := s.claudeAvailability(ctx, q, userID, vendorOnly)
+	if err != nil {
+		return resolvedHarness{}, err
 	}
 
 	// Codex usability + the selected credential in one pass, so the fact that decided
@@ -302,6 +352,19 @@ func (s *Service) resolveRunHarnessQ(ctx context.Context, userID uuid.UUID, expl
 		return resolvedHarness{}, err
 	}
 	bothUsable := claudeUsable && codexUsable
+
+	if src.State == ProviderSourceUnusable {
+		// Claude would be the answer unless Codex is pinned outright or is the usable stored default.
+		codexWins := false
+		if explicit != nil {
+			codexWins = *explicit == HarnessCodex
+		} else {
+			codexWins = userDefault != nil && *userDefault == HarnessCodex && codexUsable
+		}
+		if !codexWins {
+			return resolvedHarness{}, src.Err()
+		}
+	}
 
 	h, rule, err := resolveHarness(resolveHarnessInput{
 		explicit:    explicit,
@@ -326,9 +389,15 @@ func (s *Service) resolveRunHarnessQ(ctx context.Context, userID uuid.UUID, expl
 			return resolvedHarness{}, errNoUsableCredential
 		}
 		choice := codexChoice
-		return resolvedHarness{Harness: HarnessCodex, Codex: &choice, DefaultUnset: defaultUnset, BothUsable: bothUsable, Rule: rule, DefaultSkipped: defaultSkipped}, nil
+		return resolvedHarness{Harness: HarnessCodex, Codex: &choice, DefaultUnset: defaultUnset, BothUsable: bothUsable, Rule: rule, DefaultSkipped: defaultSkipped, ClaudeSourceSet: src.Set()}, nil
 	}
-	return resolvedHarness{Harness: h, DefaultUnset: defaultUnset, BothUsable: bothUsable, Rule: rule, DefaultSkipped: defaultSkipped}, nil
+	out := resolvedHarness{Harness: h, DefaultUnset: defaultUnset, BothUsable: bothUsable, Rule: rule, DefaultSkipped: defaultSkipped, ClaudeSourceSet: src.Set()}
+	if src.State == ProviderSourceUsable {
+		// resolveHarness returns Claude only when claudeUsable, which a usable source implies.
+		bound := src.Source
+		out.ProviderSource = &bound
+	}
+	return out, nil
 }
 
 // explicitHarnessRefusal classifies an explicit harness's no-usable-credential refusal (PRD
@@ -378,11 +447,13 @@ func (s *Service) BothHarnessesUsable(ctx context.Context, userID uuid.UUID) (bo
 	if !ok {
 		return false, errHarnessStoreUnavailable
 	}
-	claude, err := q.UserHasEnabledAnthropicToken(ctx, userID)
+	claude, src, err := s.claudeAvailability(ctx, q, userID, false)
 	if err != nil {
-		return false, fmt.Errorf("harness resolve: anthropic token check: %w", err)
+		return false, err
 	}
-	if !claude {
+	// Plan cross-check needs both engines, and cross-check does not support a provider-sourced
+	// owner (provider_lane_unsupported until PRD #4322): a set source is never "both usable".
+	if !claude || src.Set() {
 		return false, nil
 	}
 	_, codex, err := s.resolveUsableCodexCredential(ctx, userID, q)
@@ -399,7 +470,7 @@ func (s *Service) BothHarnessesUsable(ctx context.Context, userID uuid.UUID) (bo
 func (s *Service) ResolveSettingsHarness(ctx context.Context, userID uuid.UUID) (Harness, error) {
 	res, err := s.resolveRunHarness(ctx, userID, nil)
 	if err != nil {
-		if errors.Is(err, errCredentialUnavailable) || errors.Is(err, errNoCredentialForHarness) {
+		if errors.Is(err, errCredentialUnavailable) || errors.Is(err, errNoCredentialForHarness) || errors.Is(err, ErrProviderSourceUnusable) {
 			return HarnessClaude, nil
 		}
 		return "", err
@@ -418,13 +489,17 @@ func (s *Service) ResolveSettingsHarnessWithDefault(ctx context.Context, userID 
 	if !ok {
 		return "", errHarnessStoreUnavailable
 	}
-	claudeUsable, err := q.UserHasEnabledAnthropicToken(ctx, userID)
+	claudeUsable, src, err := s.claudeAvailability(ctx, q, userID, false)
 	if err != nil {
-		return "", fmt.Errorf("harness resolve: anthropic token check: %w", err)
+		return "", err
 	}
 	_, codexUsable, err := s.resolveUsableCodexCredential(ctx, userID, q)
 	if err != nil {
 		return "", err
+	}
+	if src.Set() && (proposed == nil || *proposed != HarnessCodex || !codexUsable) {
+		// A set Claude source never projects to Codex (creation refuses rather than fall back).
+		return HarnessClaude, nil
 	}
 	h, _, err := resolveHarness(resolveHarnessInput{
 		userDefault: proposed,
@@ -640,12 +715,32 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 	if len(origins) > 0 {
 		origin = origins[0]
 	}
+	inherit := origin.InheritFrom
+	inheritedProvider := inherit != nil && providerBoundRun(*inherit)
 	if s.txBeginner == nil {
 		// No transaction available. Resolve via the ambient queries to learn the harness:
 		// Codex fails closed (it needs the atomic freeze); Claude keeps the cheap path.
-		res, err := s.resolveRunHarness(ctx, userID, explicit)
+		if inheritedProvider {
+			// A provider binding's re-check and insert need one transaction: fail closed.
+			return store.Run{}, resolvedHarness{}, errProviderCreateRequiresTx
+		}
+		rq, ok := s.harnessStore()
+		if !ok {
+			return store.Run{}, resolvedHarness{}, errHarnessStoreUnavailable
+		}
+		if origin.RefuseProviderOwner {
+			if err := s.refuseProviderLane(ctx, rq, userID); err != nil {
+				return store.Run{}, resolvedHarness{}, err
+			}
+		}
+		res, err := s.resolveRunHarnessMode(ctx, userID, explicit, rq, inherit != nil || origin.RefuseProviderOwner)
 		if err != nil {
 			return store.Run{}, resolvedHarness{}, err
+		}
+		if res.ProviderSource != nil {
+			// A provider freeze takes the secret and provider locks in the create transaction;
+			// there is no safe non-atomic insert (the resolver's Claude path is fail-closed here).
+			return store.Run{}, resolvedHarness{}, errProviderCreateRequiresTx
 		}
 		// An overflow or automatic decision needs the shared lock and the fence, so it refuses
 		// rather than decide without them.
@@ -681,8 +776,36 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 	defer func() { _ = tx.Rollback(ctx) }()
 	qtx := store.New(tx)
 
+	if origin.RefuseProviderOwner {
+		if err := s.refuseProviderLane(ctx, qtx, userID); err != nil {
+			return store.Run{}, resolvedHarness{}, err
+		}
+	}
+	if inheritedProvider {
+		// A successor of a provider-bound run uses the SOURCE RUN's binding and never consults the
+		// owner's current source (PRD #4320 inheritance).
+		run, res, err := s.createInheritedProviderRun(ctx, tx, qtx, userID, explicit, insert, *inherit)
+		if err != nil {
+			return store.Run{}, resolvedHarness{}, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return store.Run{}, resolvedHarness{}, err
+		}
+		return run, res, nil
+	}
+	// A successor of a vendor run resolves vendor credentials as today, WITHOUT the owner's
+	// provider source (vendorOnly): the source run's lineage, not the owner's setting, decides.
+	// A refused lane (judge, job, cross-check) does the same: the guard above already found no source,
+	// and a lane insert stamps no binding, so a second source read here could only see a source
+	// selected in between and then fail the binding assertion as an internal mismatch. The lane
+	// instead orders just before that selection (the source read above holds no secret lock).
+	vendorOnly := inherit != nil || origin.RefuseProviderOwner
+	resolve := func() (resolvedHarness, error) {
+		return s.resolveRunHarnessMode(ctx, userID, explicit, qtx, vendorOnly)
+	}
+
 	// Re-read the credential/default facts and resolve D11 INSIDE the transaction that commits.
-	res, err := s.resolveRunHarnessQ(ctx, userID, explicit, qtx)
+	res, err := resolve()
 	if err != nil {
 		return store.Run{}, resolvedHarness{}, err
 	}
@@ -704,7 +827,7 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 			s.codexSelectLockedHook(ctx)
 		}
 		// Re-resolve after the mutation lock, including default-account promotions.
-		res, err = s.resolveRunHarnessQ(ctx, userID, explicit, qtx)
+		res, err = resolve()
 		if err != nil {
 			return store.Run{}, resolvedHarness{}, err
 		}
@@ -746,8 +869,21 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 		pick = *decisionPick
 	}
 
+	if res.ProviderSource != nil {
+		// Freeze: secret-mutation lock (shared) THEN the provider row's share lock, then re-read and
+		// re-validate, so a rotation, edit, retire or URL change commits either before this read or
+		// after this transaction. Replaces the pre-lock source with what is committed now.
+		frozen, ferr := s.freezeProviderSource(ctx, tx, qtx, userID)
+		if ferr != nil {
+			return store.Run{}, resolvedHarness{}, ferr
+		}
+		res.ProviderSource = &frozen
+	}
 	run, err := insert(qtx, res)
 	if err != nil {
+		return store.Run{}, resolvedHarness{}, err
+	}
+	if err := s.verifyRunBinding(ctx, qtx, run, res); err != nil {
 		return store.Run{}, resolvedHarness{}, err
 	}
 
@@ -863,4 +999,62 @@ func codexDefaultMeta(ctx context.Context, q harnessResolverStore, userID uuid.U
 		return store.GetDefaultUserSecretMetaRow{}, false, fmt.Errorf("harness resolve: read default %s: %w", kind, err)
 	}
 	return row, true, nil
+}
+
+// verifyRunBinding is the fail-closed assertion every creation ends with: the inserted row carries
+// EXACTLY the resolution's binding (all NULL for a vendor run). An insert closure that forgot the
+// five binding params (a sqlc.narg trap: unstamped = NULL) would otherwise silently turn a
+// provider-sourced owner's run into a vendor run. For a provider run it also checks the lead model
+// and every enabled template's model against the frozen map (provider_model_unmapped).
+func (s *Service) verifyRunBinding(ctx context.Context, q *store.Queries, run store.Run, res resolvedHarness) error {
+	if !bindingOf(res).equalsRun(run) {
+		return errProviderBindingMismatch
+	}
+	if res.ProviderSource == nil {
+		return nil
+	}
+	if run.Harness != string(HarnessClaude) {
+		return errProviderBindingMismatch
+	}
+	return s.checkProviderModels(ctx, q, run, *res.ProviderSource)
+}
+
+// refuseProviderLane is the lane guard for judge, job, cross-check and isolated runs: an owner who
+// selected a Claude provider source (usable or not) cannot create one until PRD #4322, whatever
+// harness the lane resolves to, so a lane never borrows a vendor credential around the source.
+func (s *Service) refuseProviderLane(ctx context.Context, q providerSourceReader, userID uuid.UUID) error {
+	src, err := s.claudeProviderSource(ctx, q, userID)
+	if err != nil {
+		return err
+	}
+	if src.Set() {
+		return ErrProviderLaneUnsupported
+	}
+	return nil
+}
+
+// createInheritedProviderRun creates a successor of a provider-bound run (mr_rework, task child,
+// chat continuation): harness Claude from the source run, the binding copied verbatim, the owner's
+// CURRENT source never read. The copied binding is re-validated first: a rotated or disabled key is
+// provider_binding_stale, a no-longer-allowlisted URL provider_destination_not_allowed.
+func (s *Service) createInheritedProviderRun(ctx context.Context, tx store.DBTX, qtx *store.Queries, userID uuid.UUID, explicit *Harness, insert func(q *store.Queries, resolved resolvedHarness) (store.Run, error), src store.Run) (store.Run, resolvedHarness, error) {
+	if src.UserID != userID || src.Harness != string(HarnessClaude) || (explicit != nil && *explicit != HarnessClaude) {
+		return store.Run{}, resolvedHarness{}, errProviderBindingMismatch
+	}
+	bound, err := s.inheritProviderBinding(ctx, tx, qtx, src)
+	if err != nil {
+		return store.Run{}, resolvedHarness{}, err
+	}
+	res := resolvedHarness{Harness: HarnessClaude, ClaudeSourceSet: true, ProviderSource: &bound}
+	if bindingOf(res) != bindingOfRun(src) {
+		return store.Run{}, resolvedHarness{}, errProviderBindingMismatch
+	}
+	run, err := insert(qtx, res)
+	if err != nil {
+		return store.Run{}, resolvedHarness{}, err
+	}
+	if err := s.verifyRunBinding(ctx, qtx, run, res); err != nil {
+		return store.Run{}, resolvedHarness{}, err
+	}
+	return run, res, nil
 }

@@ -1,0 +1,25 @@
+{
+  "worker_recovery_episode": 0,
+  "worker_recovery_owner_episode": 0,
+  "memory_episode": 0,
+  "memory_intervention_count": 0,
+  "memory_policy": null,
+  "run_id": "<uuid>",
+  "kind": "chat",
+  "title": "hi",
+  "status": "claimed",
+  "session_id": null,
+  "resume_of_run_id": null,
+  "last_seq": 0,
+  "requeue_count": 0,
+  "claim_generation": 1,
+  "secrets": {
+    "anthropic_oauth_token": "anthropic-<uuid>-fixture-not-real"
+  },
+  "config": {
+    "idle_timeout_seconds": 3600,
+    "turn_timeout_seconds": 600,
+    "max_turns": 50,
+    "default_effort": "medium"
+  }
+}

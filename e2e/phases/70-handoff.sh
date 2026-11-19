@@ -19,7 +19,7 @@
 #
 # TRANSPORT: origin is a REAL git-over-https URL to forge-fake's host-published git
 # smart-HTTP endpoint — https://uzi-bot:<pat>@forge-fake.e2e:<port>/group/repo.git — with NO
-# insteadOf. `git remote get-url origin` returns that URL VERBATIM (no rewrite), so
+# insteadOf. `git remote get-url --push --all origin` (push destination) returns that URL VERBATIM (no rewrite), so
 # resolveHandoffRepo reads it, parseRepoPath parses it to `group/repo`
 # (Path=/group/repo; userinfo is not in Path), and parseRemote takes the host
 # forge-fake.e2e, which must EQUAL the host of the seeded repo's web_url (forge-fake's
@@ -31,7 +31,7 @@
 # forge-fake 401s otherwise) with sslVerify off for the self-signed forge-fake.e2e cert.
 # This is the SAME endpoint phase 20-git-push-basic-auth exercises for the worker; since
 # forge-fake serves the shared bare, the worker's pushed branch is visible here too.
-# (An insteadOf rewrite to the local bare would break resolveHandoffRepo: get-url expands
+# (An insteadOf rewrite to the local bare would break resolveHandoffRepo: get-url --push expands
 # insteadOf, so it would return the local PATH, which parseRepoPath cannot map to
 # group/repo — handoff would error before dispatch.)
 #
@@ -90,7 +90,7 @@ fi
 # compares with the repo's web_url; host-gitconfig's http.curloptResolve maps it to
 # 127.0.0.1). uzi-bot is the compose FORGE_FAKE_EXPECT_USER literal; DUMMY_FORGE_PAT
 # (== FORGE_FAKE_EXPECT_PAT) and FAKE_PORT are bootstrap globals from run-e2e.sh, inherited
-# by this phase subshell. origin therefore resolves (get-url returns this verbatim, no
+# by this phase subshell. origin therefore resolves (get-url --push returns this verbatim, no
 # rewrite) to group/repo for resolveHandoffRepo — no insteadOf, no --repo needed.
 WC="$RUNROOT/handoff-wc"
 rm -rf "$WC"
@@ -130,7 +130,7 @@ GIT_CONFIG_GLOBAL="$RUNROOT/host-gitconfig" GIT_CONFIG_NOSYSTEM=1 git clone -q "
   || fail "handoff: host-side clone of forge-fake's git endpoint FAILED though the transport probe passed. git said: $(tr '\n' ' ' <"$_clone_err") | forge-fake gitStats: $(fake_state | jq -c '.gitStats' 2>/dev/null). Check \$RUNROOT/host-gitconfig + GIT_CONFIG_NOSYSTEM=1 (see the lib.sh anchor 'HOST-side CLI's GIT_CONFIG_GLOBAL for \`uzi handoff\`')."
 
 # --- Positive control: the real Basic-authed git-over-https transport works ----
-# resolveHandoffRepo reads `git remote get-url origin`, maps its path to group/repo and its
+# resolveHandoffRepo reads the push destination `git remote get-url --push --all origin`, maps its path to group/repo and its
 # host (forge-fake.e2e) to the repo's web_url host; here origin IS the https URL (get-url
 # does not rewrite it). ls-remote reaches forge-fake's Basic-gated git endpoint and lists the seed
 # refs, proving transport + auth BEFORE the handoff — so a transport/auth mistake fails

@@ -4,7 +4,8 @@
 import { claudeSdkSettings } from "./sdk-plugin-policy.js";
 import type { HookInput, HookJSONOutput, Options as SdkOptions, SpawnedProcess } from "@anthropic-ai/claude-agent-sdk";
 import { spawnDetached } from "./sdk-spawn.js";
-import { buildSdkEnv } from "./sdk-env.js";
+import { buildSdkEnv, type SdkCredential } from "./sdk-env.js";
+import { resolveProviderModel } from "./provider-binding.js";
 import { promptStream, mapSdkMessage, isResult, isErrorResult } from "./sdk-messages.js";
 import { RateLimitObserver, type RateLimitObservation } from "./limit.js";
 import type { Logger } from "./log.js";
@@ -38,7 +39,8 @@ function buildDenyAllHook(reason: string) {
  *  compatibility surface the advice adapter absorbs from the old `consume` body. Kept
  *  in the Claude module rather than the SDK-free harness contract. */
 interface ClaudeAdviceInputs {
-  token: string;
+  /** The credential the CLI runs under: the OAuth token or (PRD #4320) a frozen provider binding. */
+  credential: SdkCredential;
   homeDir: string;
   abort: AbortController;
   queryFn: SdkQueryFn;
@@ -93,6 +95,8 @@ interface MessageUsage {
  *  point yields what the pass has provably spent so far, so an abort that never reaches a
  *  terminal frame still has its tokens counted. Never throws. */
 class AdviceUsageTracker {
+  /** PRD #4320 P7: a provider pass reports tokens only; the SDK's vendor-priced `costUSD` is dropped. */
+  constructor(private readonly omitCost = false) {}
   private readonly byMessage = new Map<string, MessageUsage>();
   private terminal: AdviceUsageSnapshot | undefined;
 
@@ -145,7 +149,7 @@ class AdviceUsageTracker {
           cacheCreationInputTokens: tokens(e["cacheCreationInputTokens"]) ?? 0,
         };
         const cost = e["costUSD"];
-        if (typeof cost === "number" && Number.isFinite(cost) && cost >= 0) entry.costUSD = cost;
+        if (!this.omitCost && typeof cost === "number" && Number.isFinite(cost) && cost >= 0) entry.costUSD = cost;
         out[model] = entry;
       }
       if (Object.keys(out).length > 0) this.terminal = out;
@@ -218,7 +222,12 @@ export class ClaudeAdviceHarness implements AdviceHarness {
   constructor(private readonly inputs: ClaudeAdviceInputs) {}
 
   async run(request: AdviceRequest, policy: AdviceResultPolicy): Promise<AdviceResult> {
-    const env = buildSdkEnv(this.inputs.token, this.inputs.homeDir);
+    // PRD #4320 module 7: a provider pass resolves its model through the bound map before anything is
+    // spawned; an unmapped model is a typed refusal the caller treats as a skipped pass. An empty model
+    // is the sonnet alias; the model is never rewritten.
+    const credential = this.inputs.credential;
+    const providerModel = credential.kind === "provider" ? resolveProviderModel(request.model, credential.modelMap) : undefined;
+    const env = buildSdkEnv(credential, this.inputs.homeDir);
     // PRD #2603: the output cap. buildSdkEnv is an allowlist, so the one variable the bundled
     // CLI reads is set on the object it returned, and only when the request asks for it.
     if (request.maxOutputTokens !== undefined) env[MAX_OUTPUT_TOKENS_ENV] = String(request.maxOutputTokens);
@@ -246,7 +255,8 @@ export class ClaudeAdviceHarness implements AdviceHarness {
       // this is defense-in-depth. (PRD #51 M4 — keep this rationale.)
       spawnClaudeCodeProcess: (spawnOpts) => spawnDetached(spawnOpts) as unknown as SpawnedProcess,
     };
-    if (request.model) options.model = request.model;
+    if (providerModel !== undefined) options.model = providerModel;
+    else if (request.model) options.model = request.model;
     if (request.effort) options.effort = request.effort;
     if (request.thinking === "disabled") options.thinking = { type: "disabled" };
 
@@ -256,7 +266,7 @@ export class ClaudeAdviceHarness implements AdviceHarness {
     let terminalMsg: unknown;
     let terminalIsError = false;
     const rateLimits = new RateLimitObserver();
-    const tracker = new AdviceUsageTracker();
+    const tracker = new AdviceUsageTracker(credential.kind === "provider");
     const publish = (): void => {
       if (!request.usageObserver) return;
       const snap = tracker.snapshot();

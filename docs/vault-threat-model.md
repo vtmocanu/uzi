@@ -28,9 +28,11 @@ records browser re-unlock and its rollback boundary. Users should start at
 
 ## What the vault protects — and what it does not
 
-- **Protected mode**: the user's `user_secrets` rows — three kinds today
+- **Protected mode**: the user's `user_secrets` rows — four kinds today
   (`anthropic_token`, `openai_api_key`, `codex_auth`; the latter two share one
-  default slot per user, separate from the Anthropic token's own default) —
+  default slot per user, separate from the Anthropic token's own default; and
+  `anthropic_compatible_key`, a provider-bound gateway key that is never a
+  default, never auto-eligible and never sent to Anthropic) —
   plus the per-account Codex login material in `codex_provider_account`. They
   are sealed with a per-user 256-bit DEK under normal operation. The DEK is
   stored wrapped under the password KEK: `secretbox(KEK, DEK)` where
@@ -329,6 +331,17 @@ unlock without soliciting or reading the secret. See
    ciphertext was sealed without the id and would stop opening — so it needs a
    re-seal migration of its own. This residual sits inside the DB-write threat
    model, which is already outside the passive-read model the vault was built for.
+9. **A provider key is bound to its provider by an unsealed pointer.** An
+   `anthropic_compatible_key` row names its provider through
+   `user_secrets.provider_id`, and the provider's `base_url` lives unsealed in
+   `model_provider_revisions`. A database-write adversary could re-point
+   `provider_id` at another of the same user's providers, or rewrite the
+   provider's `base_url`, and so redirect where the key is sent. Binding the
+   provider id into the AAD would not close this: the URL is unsealed, so the
+   adversary can change the destination without touching the ciphertext. The
+   api limits the destination to the operator allowlist at save time; a
+   database-write adversary is outside that check, which is the same threat
+   model as residual 8.
 
 ## Hosted worker join tokens (PRD #58)
 

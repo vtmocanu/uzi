@@ -92,6 +92,10 @@ type userSettingsDTO struct {
 	// "same as the run" (the judge runs on the harness of the run it reviews). A non-null
 	// value is claude|codex (validateJudgeRunsOn gates the write).
 	JudgeRunsOn *string `json:"judge_runs_on"`
+	// ClaudeProviderID is the owner's Claude model-provider source (PRD #4320), nullable: null =
+	// the vendor Claude ladder. READ-ONLY here: the settings PUT never writes it (it is set by
+	// PUT /api/me/providers/claude-source, which validates the provider).
+	ClaudeProviderID *string `json:"claude_provider_id"`
 	// JudgeModels is the read-only resolved view of both judge lanes (PRD #3245), ordered
 	// claude then codex. It is never accepted on a PUT.
 	JudgeModels []apitypes.ModelSettingCellDTO `json:"judge_models"`
@@ -216,6 +220,7 @@ func (h *Handler) userSettingsResponse(w http.ResponseWriter, r *http.Request, u
 			Typeface:               textPtrValue(s.Typeface.Valid, s.Typeface.String),
 			DefaultHarness:         textPtrValue(s.DefaultHarness.Valid, s.DefaultHarness.String),
 			JudgeRunsOn:            textPtrValue(s.JudgeRunsOn.Valid, s.JudgeRunsOn.String),
+			ClaudeProviderID:       uuidPtrValue(s.ClaudeProviderID),
 			JudgeModels:            judgeModelCells(judgeLane, codexJudgeLane, instance),
 			SummaryModels:          summaryModelCells(summaryLane, codexSummaryLane, instance),
 			EffortSettings: effortSettingCells(

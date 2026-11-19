@@ -36,7 +36,7 @@ async function runAdvice(frames: unknown[], usageObserver?: (s: AdviceUsageSnaps
     })()) as unknown as SdkQueryFn;
   const abort = new AbortController();
   const harness = new ClaudeAdviceHarness({
-    token: "dummy-advice-tok",
+    credential: { kind: "oauth", token: "dummy-advice-tok" },
     homeDir: path.join(os.tmpdir(), "uzi-2828-advice-home-does-not-exist"),
     abort,
     queryFn,

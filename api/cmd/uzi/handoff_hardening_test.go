@@ -9,6 +9,7 @@ import (
 )
 
 var sshCommandGitCall = []string{"config", "--get", "core.sshCommand"}
+var receivePackGitCall = []string{"config", "--get", "remote.origin.receivepack"}
 
 // Origins whose host, user or port could differ between what we verify and what git
 // connects to, or could forge a line of ssh -G output, are refused outright.
@@ -97,7 +98,7 @@ func TestHandoffSSHFactsGatheredLazily(t *testing.T) {
 			CreatedTaskRun: taskRun("rl", "uzi/task/rl"),
 			DispatchedRun:  taskRun("rl", "uzi/task/rl"),
 		}
-		rec := &handoffRecorder{gitOut: map[string]string{"remote get-url origin": origin}}
+		rec := &handoffRecorder{gitOut: map[string]string{"remote get-url --push --all origin": origin}}
 		env, _ := handoffEnv(fc, rec)
 		lookups := 0
 		env.LookupEnv = func(string) (string, bool) { lookups++; return "", false }
@@ -113,6 +114,9 @@ func TestHandoffSSHFactsGatheredLazily(t *testing.T) {
 		}
 		if hasGitCall(rec, sshCommandGitCall) {
 			t.Errorf("git config --get core.sshCommand must not run: %v", rec.gitCalls)
+		}
+		if hasGitCall(rec, receivePackGitCall) {
+			t.Errorf("git config --get remote.origin.receivepack must not run: %v", rec.gitCalls)
 		}
 	}
 

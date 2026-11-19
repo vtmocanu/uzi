@@ -35,6 +35,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/notifysvc"
 	"github.com/vtmocanu/uzi/api/internal/oidc"
 	"github.com/vtmocanu/uzi/api/internal/privcheck"
+	"github.com/vtmocanu/uzi/api/internal/providers"
 	"github.com/vtmocanu/uzi/api/internal/pushbroker"
 	"github.com/vtmocanu/uzi/api/internal/recovery"
 	"github.com/vtmocanu/uzi/api/internal/releasecheck"
@@ -55,6 +56,11 @@ type Handler struct {
 	vaultUnlockLimiter   *mw.Limiter
 	secretTestOnce       sync.Once
 	secretTestClients    *secretTestClients
+	// providerProbeOnce builds providerProber and providerProbeLimiter on first use (see
+	// providerProbe); a test may pin either before the first call.
+	providerProbeOnce    sync.Once
+	providerProber       *providers.Prober
+	providerProbeLimiter *providers.ProbeLimiter
 	pool                 *pgxpool.Pool
 	q                    *store.Queries
 	cfg                  config.Config

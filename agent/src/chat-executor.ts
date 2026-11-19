@@ -33,9 +33,11 @@ import { claudeSdkSettings } from "./sdk-plugin-policy.js";
 import fs from "node:fs/promises";
 import type { Options as SdkOptions, EffortLevel, SpawnOptions, SpawnedProcess } from "@anthropic-ai/claude-agent-sdk";
 import type { EmittedMessage } from "./executor.js";
+import type { ClaimProviderBinding } from "./protocol.js";
 import type { UziToolHandlers } from "./uzi-tools.js";
 import type { Logger } from "./log.js";
-import { buildSdkEnv } from "./sdk-env.js";
+import { buildSdkEnv, type SdkCredential } from "./sdk-env.js";
+import { isGatewayLimitStatus, PROVIDER_GATEWAY_LIMIT, resolveProviderModel, sdkCredentialFromBinding, stripProviderCost } from "./provider-binding.js";
 import { buildPreToolUseHook, buildPathGuardHook, NESTED_AGENT_TOOL, ASYNC_DEFERRAL_TOOLS } from "./guardrails.js";
 import { killProcessGroup, spawnDetached } from "./sdk-spawn.js";
 import {
@@ -139,8 +141,10 @@ export function buildChatSystemPrompt(srcDir: string = UZI_SRC_DIR): ChatSystemP
  *  the ChatRunner (Phase 2 wire) and the tests populate it the same way. */
 export interface ChatContext {
   runId: string;
-  /** Anthropic subscription OAuth token (CLAUDE_CODE_OAUTH_TOKEN). */
+  /** Anthropic subscription OAuth token (CLAUDE_CODE_OAUTH_TOKEN). Empty on a provider-bound chat. */
   oauthToken?: string;
+  /** PRD #4320: the decoded provider binding of a provider-bound chat (exclusive with `oauthToken`). */
+  provider?: ClaimProviderBinding;
   /** SDK session to resume; null/absent for a fresh chat (or a resume-of whose
    *  session the worker's disk no longer holds — Decision 11). */
   sessionId?: string | null;
@@ -352,18 +356,21 @@ export class ChatExecutor {
   async run(ctx: ChatContext): Promise<ChatExecutorResult> {
     this.spawnedPids.clear();
     const oauthToken = ctx.oauthToken?.trim();
-    if (!oauthToken) throw new Error(REASON_NO_TOKEN);
+    if (!oauthToken && !ctx.provider) throw new Error(REASON_NO_TOKEN);
 
     await fs.mkdir(this.homeDir, { recursive: true });
 
-    const env = buildSdkEnv(oauthToken, this.homeDir);
+    const credential: SdkCredential = ctx.provider ? sdkCredentialFromBinding(ctx.provider) : { kind: "oauth", token: oauthToken! };
+    const env = buildSdkEnv(credential, this.homeDir);
     const baseOptions = buildChatSdkOptions({
       env: env as unknown as Record<string, string | undefined>,
       systemPrompt: buildChatSystemPrompt(this.srcDir),
       cwd: this.srcDir,
       log: this.log,
       secretPaths: this.secretPaths,
-      model: ctx.model,
+      // PRD #4320 module 7: a provider-bound chat resolves its model through the bound map (an unset
+      // model is the sonnet alias); an unmapped one fails the chat with provider_model_unmapped.
+      model: ctx.provider ? resolveProviderModel(ctx.model, ctx.provider.model_map) : ctx.model,
       effort: ctx.effort,
       // Per-run (the ChatRunner's uzi-tools server, bound to this run id) wins over
       // any executor-level default.
@@ -514,7 +521,8 @@ export class ChatExecutor {
         const sid = sessionIdOf(msg);
         if (sid) turnSessionId = sid;
         rateLimits.observe(msg);
-        for (const em of mapSdkMessage(msg)) ctx.emit(em);
+        // PRD #4320: a provider chat never carries the vendor's cost (same strip as an issue run).
+        for (const raw of mapSdkMessage(msg)) ctx.emit(ctx.provider ? stripProviderCost(raw) : raw);
         if (isResult(msg)) {
           resultFrame = msg;
           if (isErrorResult(msg)) {
@@ -544,6 +552,14 @@ export class ChatExecutor {
       return finishTurn(this, ctx, turnTimer, onCancel, { sessionId: turnSessionId, outcome: "timeout" });
     }
     if (sawError) {
+      // PRD #4320 Decision Log "Chat gateway limits end the turn without parking": a provider chat turn that ends on a gateway 429 or overload names the provider
+      // gateway limit, never a subscription reset. The turn ends the ordinary chat way: no park, no
+      // auto-retry, no pool or vendor-meter write.
+      const status = (resultFrame as { api_error_status?: unknown } | undefined)?.api_error_status;
+      if (ctx.provider && typeof status === "number" && isGatewayLimitStatus(status)) {
+        ctx.emit({ kind: "error", agent: "worker", payload: { text: `provider gateway limit reached (${PROVIDER_GATEWAY_LIMIT}, HTTP ${status}) — ask again in a moment` } });
+        return finishTurn(this, ctx, turnTimer, onCancel, { sessionId: turnSessionId, outcome: "error" });
+      }
       const limit = classifyLimitFailure(resultFrame, rateLimits.latest, Date.now());
       const text = limit
         ? `Anthropic usage limit reached (${describeLimit(limit)}) — ask again once it resets`

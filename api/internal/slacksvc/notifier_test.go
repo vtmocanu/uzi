@@ -1444,6 +1444,46 @@ func TestRenderThreadBlocksDoesNotThreadRecoveryWait(t *testing.T) {
 	}
 }
 
+// TestProviderGatewayParkRendersAsGatewayWaitNotUsageLimit pins the Slack reading of a provider
+// gateway-limit park (PRD #4320 module 5): it names the gateway, not a usage limit or a reset, shows
+// the retry time when there is one and the owner resume path when there is not, and its resume line
+// no longer says a usage limit was cleared.
+func TestProviderGatewayParkRendersAsGatewayWaitNotUsageLimit(t *testing.T) {
+	rc := parkedCtx("provider_gateway_limit", 5*time.Minute, 2)
+	blocks, fallback, ok := renderThreadBlocks(rc, "https://uzi.example")
+	if !ok {
+		t.Fatal("a gateway park must thread like any park")
+	}
+	_, section := blockSummary(blocks)
+	all := section + contextText(blocks) + fallback
+	// The block heading and the notification fallback carry the same verb.
+	if !strings.Contains(fallback, "Waiting · provider gateway rate limit · ") || strings.Contains(fallback, "Paused") {
+		t.Errorf("fallback = %q, want the same Waiting heading as the blocks", fallback)
+	}
+	for _, want := range []string{"Waiting · provider gateway rate limit", "retrying <!date^", "(pause 2)"} {
+		if !strings.Contains(all, want) {
+			t.Errorf("thread = %q, want %q", all, want)
+		}
+	}
+	if strings.Contains(all, "usage limit") || strings.Contains(all, "resumes <!date^") {
+		t.Errorf("thread = %q must not read as a usage-limit park", all)
+	}
+	root, rootFallback := rootBlocks(rc, "https://uzi.example")
+	_, rootSection := blockSummary(root)
+	if !strings.Contains(rootSection+rootFallback, "provider gateway rate limit") || strings.Contains(rootSection+rootFallback, "usage limit") {
+		t.Errorf("root = %q / %q, want the gateway wording", rootSection, rootFallback)
+	}
+	owner := parkedCtx("provider_gateway_limit", 0, 4)
+	d := limitWaitDetail(owner)
+	if !strings.Contains(d, "waiting for you to resume") || !strings.Contains(d, "uzi run resume") || strings.Contains(d, "<!date^") {
+		t.Errorf("owner-wait detail = %q, want the resume path and no retry time", d)
+	}
+	resumed, _ := resumeThreadBlocks(rc, time.Minute, true, "https://uzi.example", "limit_wait", "")
+	if _, sec := blockSummary(resumed); !strings.Contains(sec, "provider gateway limit cleared") || strings.Contains(sec, "usage limit") {
+		t.Errorf("resume header = %q, want the gateway wording", sec)
+	}
+}
+
 // Every part is omitted rather than defaulted when unknown, matching the server's own
 // failure-reason composition: the detail must never claim a fact uzi does not have. The
 // park head is the section (⏸️ Paused · usage limit); the detail suffix is the context.

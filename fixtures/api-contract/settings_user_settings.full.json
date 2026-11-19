@@ -38,6 +38,7 @@
   "typeface": "x",
   "default_harness": "x",
   "judge_runs_on": "x",
+  "claude_provider_id": "x",
   "judge_models": [
     {
       "harness": "x",

@@ -420,12 +420,12 @@ func (s *Service) appendMessagesLocked(ctx context.Context, wkr store.Worker, ru
 		// the usage fold all see the same normalised note, whose usage entries carry the cost
 		// resolved for this run's harness.
 		if m.Kind == KindProgressNote {
-			m.Payload = normalizeProgressNotePayload(m.Payload, run.Harness)
+			m.Payload = normalizeProgressNotePayload(m.Payload, usageCostLane(run))
 		}
 		// Issue #2686: a summary_usage payload is rebuilt the same way, from only {pass,
 		// model_usage}, so `event` and `usage` can never reach the usage tail or the web fold.
 		if m.Kind == KindSummaryUsage {
-			m.Payload = normalizeSummaryUsagePayload(m.Payload, run.Harness)
+			m.Payload = normalizeSummaryUsagePayload(m.Payload, usageCostLane(run))
 		}
 		if c.any() {
 			slog.Warn("workersvc: sanitized unstorable bytes out of a worker message",
@@ -768,7 +768,7 @@ func foldUsageFrames(ctx context.Context, q usageFoldQuerier, run store.Run, fra
 			// to 'unreported' with cost 0 rather than a clamped, bogus metered dollar figure.
 			marker := resolveCostStatusMarker(mu.CostStatus)
 			emittedCostUSD, costPresent := resolveCostUSD(mu.CostUSD)
-			costStatus, costUSD := deriveUsageCost(run.Harness, marker, emittedCostUSD, costPresent)
+			costStatus, costUSD := deriveUsageCost(usageCostLane(run), marker, emittedCostUSD, costPresent)
 			if err := q.UpsertRunUsage(ctx, store.UpsertRunUsageParams{
 				RunID:               run.ID,
 				SessionID:           sessionID,
@@ -854,7 +854,24 @@ const (
 	// only for a Claude frame whose worker marker is exactly that string.
 	usageBasisPerLeg            = "per_leg"
 	usageBasisSessionCumulative = "session_cumulative"
+
+	// costLaneProviderUnpriced is the cost-derivation "harness" of a provider-bound run (PRD #4320
+	// P7). It is never stored: run_usage.harness keeps the run's real harness. deriveUsageCost and
+	// resolveProgressNoteCost resolve it to cost_status 'unreported', cost 0 whatever the worker
+	// reported, because a custom gateway's price is not Anthropic's and an SDK-computed dollar figure
+	// or a standard-table price would read as a real metered total. Tokens are kept.
+	costLaneProviderUnpriced = "claude_provider_unpriced"
 )
+
+// usageCostLane is the harness argument deriveUsageCost, resolveProgressNoteCost and the progress
+// note normalizers take for run: costLaneProviderUnpriced for a provider-bound run (keyed on
+// model_provider_key_mode, set once at create), else the run's harness unchanged.
+func usageCostLane(run store.Run) string {
+	if run.ModelProviderKeyMode.Valid {
+		return costLaneProviderUnpriced
+	}
+	return run.Harness
+}
 
 // costMarkerInvalid is the sentinel resolveCostStatusMarker returns for a costStatus that is
 // PRESENT but not a JSON string (e.g. `false`, `{}`, an array, a number). A JSON `null` is NOT
@@ -946,6 +963,9 @@ func resolveCostUSD(raw json.RawMessage) (value float64, present bool) {
 // keeps the insert within 00226's run_usage_nonmetered_zero_check (cost_status='metered' OR
 // cost_usd=0) — only 'metered' ever carries a non-zero cost, whatever the harness.
 func deriveUsageCost(harness, marker string, emittedCostUSD float64, costPresent bool) (costStatus string, costUSD pgtype.Numeric) {
+	if harness == costLaneProviderUnpriced {
+		return costStatusUnreported, numericUSD(0)
+	}
 	if harness != harnessCodex {
 		return costStatusMetered, numericUSD(emittedCostUSD)
 	}

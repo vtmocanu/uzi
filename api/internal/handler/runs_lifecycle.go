@@ -285,6 +285,9 @@ func (h *Handler) writeCredentialOverrideError(w http.ResponseWriter, err error)
 		httpx.Error(w, http.StatusNotFound, "credential override token not found")
 	case errors.Is(err, workersvc.ErrCredentialOverrideLaneNotSwitchable):
 		httpx.Error(w, http.StatusConflict, "this run's lane does not support a credential override")
+	case errors.Is(err, workersvc.ErrCredentialOverrideProviderSource):
+		// PRD #4320 D8: checked before the codex wording below, which it wraps.
+		httpx.Error(w, http.StatusUnprocessableEntity, "a credential override is not supported while your Claude source is a model provider")
 	case errors.Is(err, workersvc.ErrCredentialOverrideHarnessUnsupported):
 		httpx.Error(w, http.StatusUnprocessableEntity, "a credential override is not supported on the codex harness")
 	case errors.Is(err, workersvc.ErrCredentialOverridePinnedNeedsSecret):
@@ -393,6 +396,9 @@ func (h *Handler) writeStartRunError(w http.ResponseWriter, r *http.Request, err
 			"violations": ge.Findings,
 		})
 		return
+	}
+	if writeProviderCreateRefusal(w, err) {
+		return // PRD #4320: provider_source_unusable, provider_model_unmapped, provider_lane_unsupported, ...
 	}
 	switch {
 	case errors.Is(err, workersvc.ErrContinuedIssueNotFound):
@@ -664,6 +670,7 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 	// PRD #1590 D6: the derived owner action of a run held on its Codex account (null
 	// otherwise). Best-effort, and queried only for such a held run.
 	h.overlayCodexAccountActions(r.Context(), &dto)
+	h.overlayProviderNames(r.Context(), &dto)
 	// PRD #3454: queue_reason "maintenance" for a queued run the intake pause holds back.
 	h.overlayQueueReasons(r.Context(), &dto)
 	h.overlayRunForgeOriginCooldowns(r.Context(), &dto)

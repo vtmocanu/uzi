@@ -28,10 +28,12 @@ case "$*" in
     jq -n --arg h "$(pollfile health)" --arg w "$(cat "$WORK/worker_id")" --arg since "$(cat "$WORK/since" 2>/dev/null || true)" \
       --arg c "$(cat "$WORK/cause" 2>/dev/null || true)" \
       --arg rn "$(cat "$WORK/retry" 2>/dev/null || true)" \
+      --arg rl "$(cat "$WORK/rlt" 2>/dev/null || true)" \
+      --arg nb "$(cat "$WORK/nb" 2>/dev/null || true)" \
       --arg hr "$(cat "$WORK/hold" 2>/dev/null || true)" \
       --arg mh "$(cat "$WORK/memory" 2>/dev/null || echo OMIT)" \
       --arg dp "$(pollfile parks 2>/dev/null || true)" \
-      '{status:"running",hold_reason:(if $hr=="" then null else $hr end),recovery_wait_cause:(if $c=="" then null else $c end),recovery_retry_not_before:(if $rn=="" then null elif $rn=="EMPTY" then "" elif $rn=="FALSE" then false else $rn end),disk_park_count:(if $dp=="" then null else ($dp|tonumber) end),health:$h,health_reason:(if $h=="stalled" then "no progress 20m" else null end),health_since:(if $h=="ok" then null else ($since|if .=="" then null else . end) end),worker_id:(if $w=="" then null else $w end)} | (if $rn=="OMIT" then del(.recovery_retry_not_before) else . end) | if $mh=="OMIT" then . else .memory_hold=($mh|fromjson) end'
+      '{status:"running",hold_reason:(if $hr=="" then null else $hr end),recovery_wait_cause:(if $c=="" then null else $c end),recovery_retry_not_before:(if $rn=="" then null elif $rn=="EMPTY" then "" elif $rn=="FALSE" then false else $rn end),disk_park_count:(if $dp=="" then null else ($dp|tonumber) end),health:$h,health_reason:(if $h=="stalled" then "no progress 20m" else null end),health_since:(if $h=="ok" then null else ($since|if .=="" then null else . end) end),worker_id:(if $w=="" then null else $w end)} | .rate_limit_type=(if $rl=="" then null else $rl end) | .retry_not_before=(if $nb=="" then null else $nb end) | (if $rn=="OMIT" then del(.recovery_retry_not_before) else . end) | if $mh=="OMIT" then . else .memory_hold=($mh|fromjson) end'
     mv "$WORK/poll.next" "$WORK/poll" ;;
   "worker list --json") cat "$WORK/workers" ;;
   "run logs "*" --json") [ -f "$WORK/logs" ] || exit 1; cat "$WORK/logs" ;;
@@ -41,7 +43,7 @@ STUB
 chmod +x "$WORK/bin/uzi"
 
 # scenario NAME STATUSES HEALTHS WORKER_ID WORKERS_JSON
-reset() { rm -f "$WORK/since" "$WORK/cause" "$WORK/retry" "$WORK/hold" "$WORK/logs" "$WORK/memory"; : > "$WORK/parks"; printf '%s\n' "$1" > "$WORK/status"; printf '%s\n' "$2" > "$WORK/health"; printf '%s' "$3" > "$WORK/worker_id"; printf '%s\n' "$4" > "$WORK/workers"; rm -f "$WORK/poll" "$WORK/poll.next"; echo 0 > "$WORK/poll"; }
+reset() { rm -f "$WORK/rlt" "$WORK/nb" "$WORK/since" "$WORK/cause" "$WORK/retry" "$WORK/hold" "$WORK/logs" "$WORK/memory"; : > "$WORK/parks"; printf '%s\n' "$1" > "$WORK/status"; printf '%s\n' "$2" > "$WORK/health"; printf '%s' "$3" > "$WORK/worker_id"; printf '%s\n' "$4" > "$WORK/workers"; rm -f "$WORK/poll" "$WORK/poll.next"; echo 0 > "$WORK/poll"; }
 run() { PATH="$WORK/bin:$PATH" bash "$SCRIPT" rid completed,failed,cancelled 0 "${1:-6}" 2>/dev/null; }
 fresh=$(date -u +%Y-%m-%dT%H:%M:%S.123456Z)
 old=$(date -u -d '-1 hour' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v-1H +%Y-%m-%dT%H:%M:%SZ)
@@ -261,6 +263,19 @@ echo provider_outage > "$WORK/cause"
 rc=0; out=$(run) || rc=$?
 [ "$rc" -eq 3 ] || fail "timed recovery_wait should expire: $rc: $out"
 case "$out" in *STOP=*) fail "timed recovery_wait stopped: $out";; esac
+
+# 13b. an owner-held provider gateway limit_wait (null retry_not_before) always stops; a stamped one keeps polling
+reset limit_wait ok "" '[]'
+echo provider_gateway_limit > "$WORK/rlt"
+rc=0; out=$(WATCH_ATTENTION_POLLS=0 run) || rc=$?
+[ "$rc" -eq 0 ] || fail "owner-held gateway limit_wait: want exit 0, got $rc: $out"
+case "$out" in *"STOP=limit_wait:provider_gateway_limit"*"RESULT=stop:limit_wait") ;; *) fail "gateway limit_wait stop missing: $out";; esac
+echo 2099-01-01T00:00:00Z > "$WORK/nb"
+rc=0; out=$(WATCH_ATTENTION_POLLS=0 run) || rc=$?
+[ "$rc" -eq 3 ] || fail "stamped gateway limit_wait should keep polling to ELAPSED: $rc: $out"
+rm -f "$WORK/rlt" "$WORK/nb"; echo five_hour > "$WORK/rlt"
+rc=0; out=$(WATCH_ATTENTION_POLLS=0 run) || rc=$?
+[ "$rc" -eq 3 ] || fail "vendor limit_wait should keep polling to ELAPSED: $rc: $out"
 
 # 14. paused always stops (exit 0) with its hold_reason, even outside the stop set:
 #     a paused run never resumes on its own (#3304/#3303 parks sat unseen behind a terminal-only watch).

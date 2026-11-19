@@ -36,7 +36,7 @@ test("grouping: the Claude-lane env sends a real mktemp -d into <root>/run-<id>/
   const root = fixtureRoot(t);
   const prepared = await prepareRunTmpdir(ID_A, { layout: single(root) });
   assert.deepEqual(prepared, { dir: path.join(root, `run-${ID_A}`) });
-  const env = buildSdkEnv("tok", root, {}, undefined, undefined, undefined, (prepared as { dir: string }).dir);
+  const env = buildSdkEnv({ kind: "oauth", token: "tok" }, root, {}, undefined, undefined, undefined, (prepared as { dir: string }).dir);
   const made = execFileSync(MKTEMP, ["-d"], { env: { PATH: process.env.PATH, TMPDIR: env.TMPDIR } }).toString().trim();
   assert.equal(path.dirname(made), path.join(root, `run-${ID_A}`));
   assert.equal(path.dirname(path.dirname(made)), root);

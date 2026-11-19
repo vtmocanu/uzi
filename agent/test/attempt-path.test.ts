@@ -102,11 +102,11 @@ describe("R2 attempt marker / R4 worker mark", () => {
   const attempt = { marker: "run-1:20260907T030405Z-g3-0123456789abcdef", clonePath: "/data/runner/r/issue-17", cloneKey: "r/issue-17" };
 
   it("buildSdkEnv emits the three attempt keys only when an attempt is given", () => {
-    const withAttempt = buildSdkEnv("tok", "/home", {}, undefined, attempt);
+    const withAttempt = buildSdkEnv({ kind: "oauth", token: "tok" }, "/home", {}, undefined, attempt);
     assert.equal(withAttempt[RUN_ATTEMPT_ENV], attempt.marker);
     assert.equal(withAttempt[RUN_CLONE_ENV], attempt.clonePath);
     assert.equal(withAttempt[RUN_CLONE_KEY_ENV], attempt.cloneKey);
-    const without = buildSdkEnv("tok", "/home");
+    const without = buildSdkEnv({ kind: "oauth", token: "tok" }, "/home");
     assert.equal(RUN_ATTEMPT_ENV in without, false);
     assert.equal(RUN_CLONE_KEY_ENV in without, false);
   });
@@ -118,12 +118,12 @@ describe("R2 attempt marker / R4 worker mark", () => {
       [RUN_CLONE_KEY_ENV]: "forged/key",
       [WORKER_SPAWN_ENV]: "forged-nonce",
     };
-    const env = buildSdkEnv("tok", "/home", forged, undefined, attempt);
+    const env = buildSdkEnv({ kind: "oauth", token: "tok" }, "/home", forged, undefined, attempt);
     assert.equal(env[RUN_ATTEMPT_ENV], attempt.marker);
     assert.equal(env[RUN_CLONE_ENV], attempt.clonePath);
     assert.equal(env[RUN_CLONE_KEY_ENV], attempt.cloneKey);
     assert.equal(env[WORKER_SPAWN_ENV], undefined);
-    const noAttempt = buildSdkEnv("tok", "/home", forged);
+    const noAttempt = buildSdkEnv({ kind: "oauth", token: "tok" }, "/home", forged);
     assert.equal(noAttempt[RUN_ATTEMPT_ENV], undefined);
   });
 

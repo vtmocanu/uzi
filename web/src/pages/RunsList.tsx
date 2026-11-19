@@ -371,7 +371,7 @@ export function RunRow({
   // PRD #1429 M4b (D7): the row's cost display, folded from the closed cost_status —
   // never re-derived from cost_usd. undefined when the run has no usage bundle at all
   // (a pre-feature run), matching the meta line's existing `run.usage &&` gate below.
-  const cost = run.usage ? costDisplay(run.usage.cost_status, run.usage.cost_usd) : undefined;
+  const cost = run.usage ? costDisplay(run.usage.cost_status, run.usage.cost_usd, !!run.provider_id) : undefined;
   // PRD #320 M6: the owner's Expedite/undo action on a queued row. Owner-scoped +
   // queued-only, matching the server; a background/restored/normal row offers "Expedite",
   // an already-expedited row offers "Undo". The action lives INSIDE the row's <Link>, so
@@ -508,7 +508,7 @@ export function RunRow({
                     <span className="inline-flex items-center text-brand/90"><MetaSep />{cost.dollars}</span>
                   ) : (
                     <span className="inline-flex items-center text-faint">
-                      <MetaSep />cost n/a
+                      <MetaSep />{cost.kind === "unknown" ? "cost unknown" : "cost n/a"}
                     </span>
                   )}
                 </>
@@ -584,7 +584,7 @@ export function RunRow({
               {/* Which account this run used. Gated by
                   the caller (personal list: viewer holds >1 credential) and self-hiding
                   on a run with no recorded label. */}
-              {showCredential && <RunCredential run={run} variant="compact" displayLabel={listCredentialDisplayLabel(run, credentialCount)} />}
+              {(showCredential || !!run.provider_id) && <RunCredential run={run} variant="compact" displayLabel={listCredentialDisplayLabel(run, credentialCount)} />}
             </>
           )}
         </div>

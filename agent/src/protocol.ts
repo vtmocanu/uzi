@@ -1179,6 +1179,38 @@ export interface ClaimSecrets {
    *  run; ordinary Claude claims omit it so their wire is
    *  byte-identical. See {@link ClaimCodexSecrets}. */
   codex?: ClaimCodexSecrets;
+  /** The model-provider binding of a PROVIDER-BOUND run (PRD #4320 module 5). Present ONLY for such a
+   *  run, exclusive with `anthropic_oauth_token` (which is "" or absent then) and `codex`; vendor claims
+   *  omit it (not null, not empty) so their wire is byte-identical. Types only here: decoding the
+   *  exclusivity and building the SDK env from it is a later milestone. See {@link ClaimProviderBinding}. */
+  provider?: ClaimProviderBinding;
+}
+
+/** One mapped gateway model of a provider's model map: the gateway model name and an optional
+ *  context window in tokens (api/internal/providers ModelEntry). */
+export interface ClaimProviderModel {
+  model: string;
+  context_window?: number;
+}
+
+/** The provider binding a provider-bound claim carries (api/internal/workersvc ClaimProviderBinding;
+ *  PRD #4320 module 5): the frozen provider revision, the destination (`base_url`, an operator
+ *  allowlist entry), the auth style and the usable gateway key (`credential`: never logged).
+ *  `model_map` keys are the Claude aliases `opus`, `sonnet`, `haiku` (always present) and `fable`. */
+export interface ClaimProviderBinding {
+  provider_id: string;
+  revision: number;
+  engine: "claude";
+  protocol: "anthropic_messages";
+  base_url: string;
+  auth_style: "bearer" | "x_api_key";
+  credential: string;
+  model_map: {
+    opus?: ClaimProviderModel;
+    sonnet?: ClaimProviderModel;
+    haiku: ClaimProviderModel;
+    fable?: ClaimProviderModel;
+  };
 }
 
 /** PRD #3244: provenance tokens of a lead agent's requested model / effort. Closed sets, pinned to
@@ -2310,9 +2342,12 @@ export interface ChatClaimResponse extends ClaimMemoryState {
   config: ChatClaimConfig;
 }
 
-/** A chat claim's secrets — the Anthropic token and NOTHING else (Decision 9). */
+/** A chat claim's secrets — the Anthropic token (or, for a provider-bound chat, the provider binding) and NOTHING else (Decision 9). */
 export interface ChatClaimSecrets {
   anthropic_oauth_token: string;
+  /** PROVIDER-BOUND chat only (PRD #4320 module 5): `anthropic_oauth_token` is "" and this carries the
+   *  binding. Omitted on every vendor chat claim, so their wire is byte-identical. */
+  provider?: ClaimProviderBinding;
 }
 
 /** Chat lifecycle caps the server pushes down so the worker's clocks match (no

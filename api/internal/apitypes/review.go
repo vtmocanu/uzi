@@ -469,8 +469,8 @@ type PendingJudgeDTO struct {
 
 // JudgeSkipDTO is the recorded reason the automatic judge of a run was skipped (issue #3257):
 // the judge's harness had no usable credential. Harness is "claude" or "codex"; Reason is the
-// closed set "no_usable_credential" | "credential_disabled" | "codex_pool_unavailable"
-// (workersvc.JudgeSkipReasons); At is when it was recorded. Like PendingJudgeDTO it is a
+// closed set "no_usable_credential" | "credential_disabled" | "codex_pool_unavailable" |
+// "provider_lane_unsupported" (workersvc.JudgeSkipReasons); At is when it was recorded. Like PendingJudgeDTO it is a
 // SIBLING key on the review response ({"review": ..., "pending_judge": ..., "skip": ...}),
 // always present and null when nothing was skipped. It is non-null only for an unjudged run
 // with no judge in flight.

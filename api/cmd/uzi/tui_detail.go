@@ -825,6 +825,9 @@ func (m tuiModel) detailHeaderLines() []string {
 			cost = "n/a"
 		default:
 			cost = "n/a"
+			if providerCostUnknown(d.run) {
+				cost = "unknown"
+			}
 		}
 		statusTag += m.pal.faint.Render(" · " + cost)
 	}

@@ -29,6 +29,14 @@ type harnessCreationOrigin struct {
 	Explicit          *Harness
 	Model             *string
 	AnthropicOverride bool
+	// InheritFrom is the source run of a SUCCESSOR (mr_rework, task child, chat continuation; PRD
+	// #4320). A provider-bound source gives a provider-bound successor with the binding copied
+	// verbatim and the owner's current source never read; a vendor source gives a vendor successor
+	// resolved WITHOUT the owner's provider source. Nil for a fresh creation.
+	InheritFrom *store.Run
+	// RefuseProviderOwner refuses the creation (ErrProviderLaneUnsupported) when the owner selected
+	// a Claude provider source: judge, job and cross-check lanes (PRD #4322 enables them later).
+	RefuseProviderOwner bool
 }
 
 func (o harnessCreationOrigin) eligible(p store.GetHarnessCreationPolicyRow) bool {
@@ -243,6 +251,13 @@ func (s *Service) evaluateCreationOverflow(ctx context.Context, q *store.Queries
 	if automaticHarnessEligible(res, explicit, origin, p) {
 		// The overflow toggle is irrelevant here: an unset default has no preferred harness.
 		return s.evaluateAutomaticHarness(ctx, q, userID, res)
+	}
+	if res.ClaudeSourceSet {
+		// A set Claude provider source (usable or not, PRD #4320 D13): unknown provider usage is
+		// never compared with vendor readings, and the run never moves to the other engine's vendor
+		// credential. Exits before the other-side resolution, in either direction.
+		d.Reason = harnessReasonExcluded
+		return res, nil, nil
 	}
 	if res.DefaultUnset {
 		d.Reason = harnessReasonExcluded
