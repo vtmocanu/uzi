@@ -11408,6 +11408,13 @@ SELECT id, runs.user_id, status, auto_approve,
                   AND runs.claim_provenance_generation = runs.claim_generation
              THEN COALESCE((SELECT pw.name FROM workers pw WHERE pw.id = runs.claim_provenance_worker_id), runs.claim_provenance_worker_id::text)
              ELSE '' END)::text AS codex_provenance_worker_name,
+       -- Mirror ClaimRun's released-incarnation fence for the recorded claimant, not
+       -- the mutable worker_id affinity hint. NULL nonces match via IS NOT DISTINCT FROM.
+       EXISTS (SELECT 1 FROM workers pw
+               WHERE pw.id = runs.claim_provenance_worker_id
+                 AND runs.claim_provenance_generation = runs.claim_generation
+                 AND runs.released_worker_id = pw.id
+                 AND runs.released_worker_nonce IS NOT DISTINCT FROM pw.snapshot_register_nonce)::boolean AS codex_provenance_restart_required,
        (runs.kind = 'cross_check' AND EXISTS (SELECT 1 FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = runs.id WHERE pin.user_id = runs.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness AND (pin.model IS NOT NULL OR pin.effort IS NOT NULL)))::boolean AS cross_check_pin_required,
        (SELECT MIN(evidence.since) FROM (
            SELECT a.terminal_pending_since AS since FROM worker_active_runs a

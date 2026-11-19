@@ -269,11 +269,14 @@ genuine wait again.
 A queued Codex run that has already been claimed is held for the worker that last
 ran it (issue #4476, [ADR-4476](../adr/4476-codex-claim-provenance.md)); no stale-requeue
 grace, affinity ceiling, deleted owner row or cross-check exemption releases it to
-another worker. It shows `waiting_worker` with one of two reasons: "held for worker
+another worker. It shows `waiting_worker` with a recorded-worker or unavailable reason: "held for worker
 <name>: wait for it or cancel the run; only the worker that last ran this Codex run
 may resume it" (the name comes from the recorded claim provenance, or the worker id
-when that worker row was deleted), or "held: predecessor provenance unavailable;
-cancel the run; no worker may resume this Codex run" for a run with no usable
+when that worker row was deleted). If that worker is still fenced by its released
+registration nonce, the reason instead says "restart it or cancel the run; its
+previous process was released"; waiting alone cannot clear that fence. A new
+registration nonce restores ordinary waiting advice. "held: predecessor provenance unavailable;
+cancel the run; no worker may resume this Codex run" is shown for a run with no usable
 provenance (any Codex run at generation 1 or later when the rule deployed,
 including a paused or parked one, or a run claimed by an older api). The reason is
 shown from the first evaluation, after the isolated egress lane blocker and before
@@ -290,12 +293,12 @@ passed when the episode began. A held run outside any window (for example after 
 normal Resume onto a live worker) nudges on the first health tick, ignoring the
 young-run grace, and counts in `queue.waiting`. The unavailable reason never resolves
 itself, so it nudges on entering it from any state (the nudge cooldown still
-applies). Neither reason starts with "waiting until", so `queue.waiting` and
+applies). None of these reasons starts with "waiting until", so `queue.waiting` and
 `fleet.capacity` count these runs as genuine waits: a routine drain of the last
 worker of a Codex run can raise `queue.waiting` while no nudge is sent. The Slack
 nudge text for `waiting_worker` ("still waiting for a worker to pick it up") does
 not match the unavailable reason; this is a known inconsistency. Owner action: wait
-for the named worker, or `uzi run cancel <id>`.
+for the named worker, restart it when the reason requests that, or `uzi run cancel <id>`.
 
 A queued run whose previous worker is draining or in active maintenance instead shows
 "waiting until <time, RFC3339 UTC> for its previous worker <name> to finish draining or

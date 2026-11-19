@@ -147,12 +147,17 @@ The run-health reason (`api/internal/workersvc/health.go`) is one of:
   last ran this Codex run may resume it`. `<name>` comes from the recorded
   provenance, never from `runs.worker_id`; if the worker row was deleted the
   worker id text is shown.
+- `held for worker <name>: restart it or cancel the run; its previous process was
+  released; only the worker that last ran this Codex run may resume it` when the
+  released-worker pair still matches that recorded worker's registration nonce.
+  The comparison includes NULL nonces, like ClaimRun. It does not follow the
+  mutable `runs.worker_id` hint. After the nonce changes, ordinary waiting advice returns.
 - `held: predecessor provenance unavailable; cancel the run; no worker may resume
   this Codex run` for NULL or stale provenance (a legacy row at generation >= 1,
   including a paused or parked one, or a run claimed by an old api during a
   rollback window).
 
-Both are `waiting_worker`. Precedence: after the egress rung and before the
+All three are `waiting_worker`. Precedence: after the egress rung and before the
 manual-cordon, owner-hold and stale-pin rungs. The prerequisite rungs in
 `queuedPrerequisiteReason` (`api/internal/workersvc/health.go`) still outrank it,
 among them the instance intake pause (maintenance), the weekly usage reserve, the

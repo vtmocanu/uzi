@@ -17,6 +17,7 @@ import (
 const (
 	wantHeldA          = "held for worker A: wait for it or cancel the run; only the worker that last ran this Codex run may resume it"
 	wantHeldUnavailble = "held: predecessor provenance unavailable; cancel the run; no worker may resume this Codex run"
+	wantRestartA       = "held for worker A: restart it or cancel the run; its previous process was released; only the worker that last ran this Codex run may resume it"
 )
 
 func heldCodexRun(name string) store.ListActiveRunsForHealthRow {
@@ -29,13 +30,19 @@ func heldCodexRun(name string) store.ListActiveRunsForHealthRow {
 }
 
 func TestCodexProvenanceHoldReasonTexts(t *testing.T) {
-	if got := codexProvenanceHoldReason("A"); got != wantHeldA {
+	if got := codexProvenanceHoldReason("A", false); got != wantHeldA {
 		t.Fatalf("valid reason = %q, want %q", got, wantHeldA)
 	}
-	if got := codexProvenanceHoldReason(""); got != wantHeldUnavailble {
+	if got := codexProvenanceHoldReason("", false); got != wantHeldUnavailble {
 		t.Fatalf("unavailable reason = %q, want %q", got, wantHeldUnavailble)
 	}
-	for _, s := range []string{wantHeldA, wantHeldUnavailble} {
+	if got := codexProvenanceHoldReason("A", true); got != wantRestartA {
+		t.Fatalf("restart reason = %q, want %q", got, wantRestartA)
+	}
+	if got := codexProvenanceHoldReason("", true); got != wantHeldUnavailble {
+		t.Fatalf("restart without provenance = %q, want %q", got, wantHeldUnavailble)
+	}
+	for _, s := range []string{wantHeldA, wantHeldUnavailble, wantRestartA} {
 		if !isCodexProvenanceHoldReason(s) {
 			t.Fatalf("%q not recognised", s)
 		}

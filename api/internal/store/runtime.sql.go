@@ -12223,6 +12223,13 @@ SELECT id, runs.user_id, status, auto_approve,
                   AND runs.claim_provenance_generation = runs.claim_generation
              THEN COALESCE((SELECT pw.name FROM workers pw WHERE pw.id = runs.claim_provenance_worker_id), runs.claim_provenance_worker_id::text)
              ELSE '' END)::text AS codex_provenance_worker_name,
+       -- Mirror ClaimRun's released-incarnation fence for the recorded claimant, not
+       -- the mutable worker_id affinity hint. NULL nonces match via IS NOT DISTINCT FROM.
+       EXISTS (SELECT 1 FROM workers pw
+               WHERE pw.id = runs.claim_provenance_worker_id
+                 AND runs.claim_provenance_generation = runs.claim_generation
+                 AND runs.released_worker_id = pw.id
+                 AND runs.released_worker_nonce IS NOT DISTINCT FROM pw.snapshot_register_nonce)::boolean AS codex_provenance_restart_required,
        (runs.kind = 'cross_check' AND EXISTS (SELECT 1 FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = runs.id WHERE pin.user_id = runs.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness AND (pin.model IS NOT NULL OR pin.effort IS NOT NULL)))::boolean AS cross_check_pin_required,
        (SELECT MIN(evidence.since) FROM (
            SELECT a.terminal_pending_since AS since FROM worker_active_runs a
@@ -12307,60 +12314,61 @@ WHERE status IN ('queued', 'claimed', 'running', 'awaiting_approval')
 `
 
 type ListActiveRunsForHealthRow struct {
-	ID                        uuid.UUID          `json:"id"`
-	UserID                    uuid.UUID          `json:"user_id"`
-	Status                    string             `json:"status"`
-	AutoApprove               bool               `json:"auto_approve"`
-	CodexAdmissionClass       pgtype.Text        `json:"codex_admission_class"`
-	CodexAdmissionEligibleAt  pgtype.Timestamptz `json:"codex_admission_eligible_at"`
-	AccountCooldownClass      pgtype.Text        `json:"account_cooldown_class"`
-	AccountCooldownEligibleAt pgtype.Timestamptz `json:"account_cooldown_eligible_at"`
-	StartedAt                 pgtype.Timestamptz `json:"started_at"`
-	LastActivityAt            pgtype.Timestamptz `json:"last_activity_at"`
-	UpdatedAt                 pgtype.Timestamptz `json:"updated_at"`
-	StatusSince               pgtype.Timestamptz `json:"status_since"`
-	Health                    string             `json:"health"`
-	HealthReason              pgtype.Text        `json:"health_reason"`
-	HealthSince               pgtype.Timestamptz `json:"health_since"`
-	HealthNotifiedAt          pgtype.Timestamptz `json:"health_notified_at"`
-	BudgetWallSeconds         pgtype.Int4        `json:"budget_wall_seconds"`
-	BudgetPausedSeconds       int32              `json:"budget_paused_seconds"`
-	BudgetExtensionSeconds    int32              `json:"budget_extension_seconds"`
-	BudgetFinalizeSeconds     int32              `json:"budget_finalize_seconds"`
-	Interactive               bool               `json:"interactive"`
-	RepoID                    pgtype.UUID        `json:"repo_id"`
-	Kind                      string             `json:"kind"`
-	DispatchedAt              pgtype.Timestamptz `json:"dispatched_at"`
-	RequiredCapabilities      []string           `json:"required_capabilities"`
-	CompletionContractVersion pgtype.Int4        `json:"completion_contract_version"`
-	Harness                   string             `json:"harness"`
-	CodexMaterialRevision     pgtype.Int8        `json:"codex_material_revision"`
-	CodexSecretID             pgtype.UUID        `json:"codex_secret_id"`
-	WorkerID                  pgtype.UUID        `json:"worker_id"`
-	ClaimGeneration           int64              `json:"claim_generation"`
-	ReleasedWorkerID          pgtype.UUID        `json:"released_worker_id"`
-	EgressProfileID           pgtype.UUID        `json:"egress_profile_id"`
-	JobProtocol               pgtype.Int2        `json:"job_protocol"`
-	CiConfigGuard             bool               `json:"ci_config_guard"`
-	RepoAgentSourceCommit     pgtype.Text        `json:"repo_agent_source_commit"`
-	RepoAgentSourceRequired   bool               `json:"repo_agent_source_required"`
-	AgentSourceRequested      pgtype.Text        `json:"agent_source_requested"`
-	ModelProviderKeyMode      pgtype.Text        `json:"model_provider_key_mode"`
-	CiArtifactsAttached       bool               `json:"ci_artifacts_attached"`
-	RepoLinked                bool               `json:"repo_linked"`
-	StaleRequeuePinnable      bool               `json:"stale_requeue_pinnable"`
-	OwnerHoldPinnable         bool               `json:"owner_hold_pinnable"`
-	StaleRequeueWorkerName    string             `json:"stale_requeue_worker_name"`
-	CodexProvenanceHeld       bool               `json:"codex_provenance_held"`
-	CodexProvenanceWorkerName string             `json:"codex_provenance_worker_name"`
-	CrossCheckPinRequired     bool               `json:"cross_check_pin_required"`
-	TerminalPendingSince      pgtype.Timestamptz `json:"terminal_pending_since"`
-	CodexCustomRoot           bool               `json:"codex_custom_root"`
-	CodexAccountGated         bool               `json:"codex_account_gated"`
-	IntakePauseHeld           bool               `json:"intake_pause_held"`
-	ReserveHoldReason         string             `json:"reserve_hold_reason"`
-	ReleasedByMemoryPark      bool               `json:"released_by_memory_park"`
-	PublicationWithheldSince  pgtype.Timestamptz `json:"publication_withheld_since"`
+	ID                             uuid.UUID          `json:"id"`
+	UserID                         uuid.UUID          `json:"user_id"`
+	Status                         string             `json:"status"`
+	AutoApprove                    bool               `json:"auto_approve"`
+	CodexAdmissionClass            pgtype.Text        `json:"codex_admission_class"`
+	CodexAdmissionEligibleAt       pgtype.Timestamptz `json:"codex_admission_eligible_at"`
+	AccountCooldownClass           pgtype.Text        `json:"account_cooldown_class"`
+	AccountCooldownEligibleAt      pgtype.Timestamptz `json:"account_cooldown_eligible_at"`
+	StartedAt                      pgtype.Timestamptz `json:"started_at"`
+	LastActivityAt                 pgtype.Timestamptz `json:"last_activity_at"`
+	UpdatedAt                      pgtype.Timestamptz `json:"updated_at"`
+	StatusSince                    pgtype.Timestamptz `json:"status_since"`
+	Health                         string             `json:"health"`
+	HealthReason                   pgtype.Text        `json:"health_reason"`
+	HealthSince                    pgtype.Timestamptz `json:"health_since"`
+	HealthNotifiedAt               pgtype.Timestamptz `json:"health_notified_at"`
+	BudgetWallSeconds              pgtype.Int4        `json:"budget_wall_seconds"`
+	BudgetPausedSeconds            int32              `json:"budget_paused_seconds"`
+	BudgetExtensionSeconds         int32              `json:"budget_extension_seconds"`
+	BudgetFinalizeSeconds          int32              `json:"budget_finalize_seconds"`
+	Interactive                    bool               `json:"interactive"`
+	RepoID                         pgtype.UUID        `json:"repo_id"`
+	Kind                           string             `json:"kind"`
+	DispatchedAt                   pgtype.Timestamptz `json:"dispatched_at"`
+	RequiredCapabilities           []string           `json:"required_capabilities"`
+	CompletionContractVersion      pgtype.Int4        `json:"completion_contract_version"`
+	Harness                        string             `json:"harness"`
+	CodexMaterialRevision          pgtype.Int8        `json:"codex_material_revision"`
+	CodexSecretID                  pgtype.UUID        `json:"codex_secret_id"`
+	WorkerID                       pgtype.UUID        `json:"worker_id"`
+	ClaimGeneration                int64              `json:"claim_generation"`
+	ReleasedWorkerID               pgtype.UUID        `json:"released_worker_id"`
+	EgressProfileID                pgtype.UUID        `json:"egress_profile_id"`
+	JobProtocol                    pgtype.Int2        `json:"job_protocol"`
+	CiConfigGuard                  bool               `json:"ci_config_guard"`
+	RepoAgentSourceCommit          pgtype.Text        `json:"repo_agent_source_commit"`
+	RepoAgentSourceRequired        bool               `json:"repo_agent_source_required"`
+	AgentSourceRequested           pgtype.Text        `json:"agent_source_requested"`
+	ModelProviderKeyMode           pgtype.Text        `json:"model_provider_key_mode"`
+	CiArtifactsAttached            bool               `json:"ci_artifacts_attached"`
+	RepoLinked                     bool               `json:"repo_linked"`
+	StaleRequeuePinnable           bool               `json:"stale_requeue_pinnable"`
+	OwnerHoldPinnable              bool               `json:"owner_hold_pinnable"`
+	StaleRequeueWorkerName         string             `json:"stale_requeue_worker_name"`
+	CodexProvenanceHeld            bool               `json:"codex_provenance_held"`
+	CodexProvenanceWorkerName      string             `json:"codex_provenance_worker_name"`
+	CodexProvenanceRestartRequired bool               `json:"codex_provenance_restart_required"`
+	CrossCheckPinRequired          bool               `json:"cross_check_pin_required"`
+	TerminalPendingSince           pgtype.Timestamptz `json:"terminal_pending_since"`
+	CodexCustomRoot                bool               `json:"codex_custom_root"`
+	CodexAccountGated              bool               `json:"codex_account_gated"`
+	IntakePauseHeld                bool               `json:"intake_pause_held"`
+	ReserveHoldReason              string             `json:"reserve_hold_reason"`
+	ReleasedByMemoryPark           bool               `json:"released_by_memory_park"`
+	PublicationWithheldSince       pgtype.Timestamptz `json:"publication_withheld_since"`
 }
 
 // Run health detector (PRD #47) ----------------------------------------------
@@ -12493,6 +12501,7 @@ func (q *Queries) ListActiveRunsForHealth(ctx context.Context, codexCuratedModel
 			&i.StaleRequeueWorkerName,
 			&i.CodexProvenanceHeld,
 			&i.CodexProvenanceWorkerName,
+			&i.CodexProvenanceRestartRequired,
 			&i.CrossCheckPinRequired,
 			&i.TerminalPendingSince,
 			&i.CodexCustomRoot,

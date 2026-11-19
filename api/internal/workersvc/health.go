@@ -1474,7 +1474,7 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 	// stale-requeue-pin texts below, which all promise "another worker may take it after that"
 	// (false here). Account prerequisites already ran before this point and still outrank it.
 	if r.CodexProvenanceHeld {
-		return codexProvenanceHoldReason(r.CodexProvenanceWorkerName)
+		return codexProvenanceHoldReason(r.CodexProvenanceWorkerName, r.CodexProvenanceRestartRequired)
 	}
 	// Availability and manual diagnostics share one projection. Manual intent must
 	// remain visible alongside an automatic owner hold, but a claimable continuation
@@ -1982,7 +1982,7 @@ func (s *Service) youngQueuedTarget(ctx context.Context, now time.Time, r store.
 	// Issue #4476: a provenance-held Codex run is never claimable by another worker, so it carries
 	// the held reason from the first tick instead of waiting out the young-run grace.
 	if r.CodexProvenanceHeld {
-		return healthWaitingWorker, codexProvenanceHoldReason(r.CodexProvenanceWorkerName)
+		return healthWaitingWorker, codexProvenanceHoldReason(r.CodexProvenanceWorkerName, r.CodexProvenanceRestartRequired)
 	}
 	_, stalePinned := s.staleRequeuePin(now, r)
 	_, ownerHeld := s.ownerHold(now, r)
@@ -2380,16 +2380,20 @@ func isStaleRequeuePinReason(reason string) bool {
 const (
 	codexProvenanceHoldPrefix      = "held for worker "
 	codexProvenanceHoldSuffix      = ": wait for it or cancel the run; only the worker that last ran this Codex run may resume it"
+	codexProvenanceRestartSuffix   = ": restart it or cancel the run; its previous process was released; only the worker that last ran this Codex run may resume it"
 	codexProvenanceUnavailableText = "held: predecessor provenance unavailable; cancel the run; no worker may resume this Codex run"
 )
 
 // codexProvenanceHoldReason renders the waiting reason for a Codex run ClaimRun refuses to offer
 // to any other worker (issue #4476). name is the recorded provenance worker, never runs.worker_id;
 // "" means the provenance is missing or stale, so no worker may resume the run. The text is a pure
-// function of name, so it is stable across ticks for one episode.
-func codexProvenanceHoldReason(name string) string {
+// function of the recorded name and restart fence, so unchanged state has stable text.
+func codexProvenanceHoldReason(name string, restart bool) string {
 	if name == "" {
 		return codexProvenanceUnavailableText
+	}
+	if restart {
+		return codexProvenanceHoldPrefix + name + codexProvenanceRestartSuffix
 	}
 	return codexProvenanceHoldPrefix + name + codexProvenanceHoldSuffix
 }
@@ -2451,10 +2455,11 @@ func (s *Service) quietWindowEnded(now time.Time, r store.ListActiveRunsForHealt
 	return !now.Before(ceilingEnd)
 }
 
-// isCodexProvenanceHoldReason matches both texts codexProvenanceHoldReason produces.
+// isCodexProvenanceHoldReason matches the wait, restart and unavailable texts.
 func isCodexProvenanceHoldReason(reason string) bool {
 	return reason == codexProvenanceUnavailableText ||
-		(strings.HasPrefix(reason, codexProvenanceHoldPrefix) && strings.HasSuffix(reason, codexProvenanceHoldSuffix))
+		(strings.HasPrefix(reason, codexProvenanceHoldPrefix) &&
+			(strings.HasSuffix(reason, codexProvenanceHoldSuffix) || strings.HasSuffix(reason, codexProvenanceRestartSuffix)))
 }
 
 func isCodeCrossCheckWaitingReason(reason string) bool {

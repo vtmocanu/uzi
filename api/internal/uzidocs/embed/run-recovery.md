@@ -1218,7 +1218,8 @@ were never claimed are unchanged. The run shows `waiting_worker` with a reason
 naming the worker, or saying the predecessor provenance is unavailable; see
 [Run health](./admin-health.md) and
 [Codex credentials](./codex-credentials.md#a-codex-run-held-for-its-last-worker).
-Owner action: wait for the named worker, or `uzi run cancel <id>`.
+Owner action: wait for the named worker, restart that worker if the health reason
+requests it (the previous process is still fenced), or `uzi run cancel <id>`.
 
 Upgrade and rollback:
 
