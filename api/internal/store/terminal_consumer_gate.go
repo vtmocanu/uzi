@@ -17,7 +17,8 @@ import (
 
 var (
 	// ErrTerminalConsumerGateBusy: the shared gate could not be acquired within the wait
-	// (lock_timeout) or the context ended while waiting. The transaction is aborted.
+	// (lock_timeout) or the context ended before or while waiting. The transaction is aborted,
+	// or (context already ended) nothing was sent on it; roll it back either way.
 	ErrTerminalConsumerGateBusy = errors.New("store: terminal consumer gate busy")
 	// ErrTerminalConsumerGateNoTx: the helper was called on a pool-bound Queries. An XACT lock
 	// taken in autocommit mode releases at once and serializes nothing, so it is refused.
@@ -60,7 +61,8 @@ func (q *Queries) InTx() bool {
 // of its own, so the caller's next statement takes a fresh READ COMMITTED snapshot and sees
 // rows an exclusive holder committed before releasing.
 //
-// If the acquire fails the transaction is aborted and nothing more is sent on it: a lock
+// If the acquire fails the transaction is aborted and nothing more is sent on it (roll it
+// back; a context that had already ended before the call returns busy with nothing sent): a lock
 // timeout (55P03), a cancelled query (57014) or an ended context return an error satisfying
 // errors.Is(err, ErrTerminalConsumerGateBusy), joined with the driver error; any other error
 // is returned as is. An already-ended context is reported as busy too.

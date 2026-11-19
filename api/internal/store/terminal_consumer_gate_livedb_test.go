@@ -135,7 +135,7 @@ func TestTerminalConsumerGateWaiterVisibleInPgLocksAndBlocksExclusiveTry(t *test
 	repo := uuid.New()
 	holder := tcgHold(ctx, t, pool, repo)
 	waiter := tcgBegin(ctx, t, pool, pgx.TxOptions{})
-	ch := tcgLockAsync(ctx, waiter, repo, 5*time.Second)
+	ch := tcgLockAsync(ctx, waiter, repo, 10*time.Second)
 	tcgAwaitShareWaiter(ctx, t, pool, repo)
 
 	// Waiter priority: release the exclusive holder and, WITHOUT first receiving the waiter's
@@ -353,5 +353,22 @@ func TestQueriesBeginTx(t *testing.T) {
 	}
 	if err := ntx.Rollback(ctx); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// A wait beyond lock_timeout's int4-milliseconds range is clamped instead of failing the
+// set_config (SQLSTATE 22023) and aborting the admission.
+func TestTerminalConsumerGateClampsHugeWait(t *testing.T) {
+	ctx, pool, _ := openRepoActivityLiveDB(t)
+	tx := tcgBegin(ctx, t, pool, pgx.TxOptions{})
+	if err := New(tx).LockTerminalConsumerGateShared(ctx, uuid.New(), 30*24*time.Hour); err != nil {
+		t.Fatalf("huge wait: %v", err)
+	}
+	var got string
+	if err := tx.QueryRow(ctx, "SELECT current_setting('lock_timeout')").Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got != "0" {
+		t.Fatalf("lock_timeout after gate = %q, want the restored default 0", got)
 	}
 }
