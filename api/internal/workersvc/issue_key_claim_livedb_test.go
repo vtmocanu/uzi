@@ -184,9 +184,13 @@ func TestIssueKeySaturationMirrorsLiveDB(t *testing.T) {
 		}
 		return false
 	}
+	// Each filler run needs its own issue: deriving the number from a random worker id's
+	// first byte collided on uq_runs_one_active_per_issue for 1 in 256 worker pairs.
+	fillIssue := 900
 	fill := func(w store.Worker) {
+		fillIssue++
 		f.env.exec(`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, status, worker_id)
-		            VALUES ($1, $2, $3, 'issue', $4, 't', 'd', 'running', $5)`, uuid.New(), f.user, f.repo, 900+int(w.ID[0]), w.ID)
+		            VALUES ($1, $2, $3, 'issue', $4, 't', 'd', 'running', $5)`, uuid.New(), f.user, f.repo, fillIssue, w.ID)
 	}
 
 	// Only workers without the capability, one free and one full: nobody could ever claim the
