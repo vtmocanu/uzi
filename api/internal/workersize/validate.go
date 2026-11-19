@@ -245,7 +245,7 @@ func quotaAdvisories(name string, s Spec, cpuReqOK, memReqOK bool, c builtin.Cei
 			// absence of an exceeded warning never reads as "fits" (#4517).
 			out = append(out, Advisory{
 				Size: name, Tier: tier, Kind: KindQuotaUnavailable,
-				Message: fmt.Sprintf("quota advisory incomplete for the %s tier: only the worker container's requests x deployments are compared against %s.*; the DinD sidecars' requests (dind, dind-init, dind-meter) are not counted, so the absence of an exceeded warning does not mean the pod fits", tier, quotaPathPrefix[t]),
+				Message: fmt.Sprintf("quota advisory incomplete for the %s tier: only the worker container's requests x deployments are compared against %s.*; the DinD sidecars' requests (dind, dind-meter, and dind-init when rootless) are not counted, so the absence of an exceeded warning does not mean the pod fits", tier, quotaPathPrefix[t]),
 			})
 		}
 	}

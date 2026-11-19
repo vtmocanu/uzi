@@ -181,9 +181,9 @@ func TestQuotaAdvisoryUnavailableIsNeverFits(t *testing.T) {
 	}
 }
 
-// A docker tier whose worker requests alone fit exactly (1000m x 10 = 10000) but would
-// exceed once the DinD sidecars' requests are added must say the estimate is incomplete,
-// never stay silent (#4517).
+// A docker tier whose worker requests alone fit exactly (1000m x 10 = 10000), so any
+// sidecar request on top would exceed, must say the estimate is incomplete, never stay
+// silent (#4517). The api holds no sidecar requests, so the test pins only the note.
 func TestQuotaAdvisoryDockerSidecarExcludedIsIncomplete(t *testing.T) {
 	q := fullQuota(1e9, 1e9, 10)
 	q.Tier[builtin.TierDocker] = builtin.TierQuota{
@@ -202,6 +202,11 @@ func TestQuotaAdvisoryDockerSidecarExcludedIsIncomplete(t *testing.T) {
 		}
 	}
 	got := advisoryKinds(r)
+	for _, a := range r.Advisories {
+		if a.Kind == KindQuotaUnavailable && a.Tier != "docker" {
+			t.Errorf("complete %s tier must not read unavailable: %+v", a.Tier, a)
+		}
+	}
 	if incomplete != 1 || got["docker/"+KindQuotaExceeded] != 0 || got["docker/"+KindQuotaZero] != 0 {
 		t.Fatalf("docker advisories = %v, want exactly one incomplete and no exceeded/zero", got)
 	}
