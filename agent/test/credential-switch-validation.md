@@ -1186,12 +1186,16 @@ U table and crash-point table of section 2, or sections 3 and 5 above. Credited 
 - [ ] Admission refusals: pool_wait, terminal statuses, pinned-without-secret,
       lane, no-live-worker, unsupported-worker and foreign-subscription refusals; the no-write snapshot comparison, the
       stamp SQL's own status filter and the non-live-run copies (no control).
-- [ ] Same flight/generation/worktree: effects beyond the five U2 injections and
-      the fresh_B return.
+- [ ] Same flight/generation/worktree: effects beyond the U2 injections and the
+      fresh_B return; u2-attemptdir has no A→B→C credit and u2-worktree stays
+      green in the A→B→C test; the claim-generation assertions were not shown
+      sensitive; the plan-revision `awaiting_approval` restore is not covered by
+      u2-transition.
 - [ ] Strict persistence: pending-absent-before, other ownership legs, the
       lost-reply clear and reopen's other guards.
 - [ ] A reap before B: in-flight tool callbacks, launcher must-not-exist and other
-      phases.
+      phases, including pending launches at teardown and "created after reap"
+      beyond the combined fence.
 - [ ] Scope/refresh/identity/summary replacement: B refresh suspension, Now and
       summary gating during publication, A-account rejection, the bridge
       post-call copy, `assertRefreshAdmission` and Now stale-result drops.
@@ -1225,13 +1229,15 @@ U table and crash-point table of section 2, or sections 3 and 5 above. Credited 
 - [ ] Stopped pending input: paused-run carve-out variants, cancel/reject_plan
       under the cutoff and the cutoff's run correlation.
 - [ ] Wall budget: the RunTimeout value, the future-started_at clamp and the
-      production default; the awaiting_* statuses.
+      production default; the awaiting_* statuses; the chat/judge exemption
+      (unreachable, not credited).
 - [ ] Stopped nonce: a NULL snapshot nonce and the UTF-8 check at the service
       entry (supporting only, uncredited); claim generation: the reconciled
       `*g <= 0` copy.
 - [ ] Stopped binding identity beyond ownership (no predicate clause).
 - [ ] Stopped ownership/policy: paused-origin replay under concurrency, op-less
-      withdrawals, and owner writers that take no worker or run row lock.
+      withdrawals, settlement after withdrawn X/Y (`xy_settles`, positive only,
+      no guard to remove), and owner writers that take no worker or run row lock.
 - [ ] Stopped preservation: other gate columns and replay tables not
       individually injected; Slack, `cross_checks` and other trigger-closure
       tables outside the snapshot.
@@ -1248,11 +1254,12 @@ U table and crash-point table of section 2, or sections 3 and 5 above. Credited 
       only).
 - [ ] Authorities: the cookie-session path distinct from CLI Bearer (not found
       in ledger) and fresh-claim mint on the same worker (not separately
-      controlled).
+      controlled); cross-worker mint on a fresh claim (traced only, not
+      tested).
 - [ ] Publication (U20): plan and intent summaries (untested); wait-time
       effect unmeasured.
-- [ ] Crash point 3: U6 crash controls ran through the crash-during-login
-      publication only.
+- [ ] U6 crash controls: three of four crash publications not mutated (crash
+      points 1, 2 and 3; only the crash-during-login publication was).
 - [ ] PRD #1147: a control for the subscription-to-paid-key direction
       specifically, an apply-request-shape control showing no secret id, and
       evidence for concurrent runs on one subscription with no seat lock
@@ -1268,7 +1275,10 @@ U table and crash-point table of section 2, or sections 3 and 5 above. Credited 
 - [ ] **Known nonconformance, decision 11 cross-worker path:** a successor claim
       on another worker has no retained journal, so the `predecessor_capture`
       / `quiescence_failed` gate does not run and the run proceeds with the
-      delivered binding. Required: fail closed (hold for the owner) there too.
+      delivered binding. Required: fail closed and hold for the owner there.
+- [ ] **Decision 11 held outcome (same worker):** on `quiescence_failed` the
+      run ends in a terminal `failed` report with clone and custody kept, not an
+      owner hold as decision 11 requires.
 - [ ] Crash point 5 (predecessor host unreachable): owner-recorded environmental
       limitation, unvalidated and uncredited; its fail-closed premise depends
       on closing the item above.
