@@ -1258,6 +1258,45 @@ retained head once: a later checkpoint or a resume on the same worker
 announces only heads it has not announced, and archive notices are tracked
 separately from head notices.
 
+**A failed run stopped at the cap can still release its hold.** For a failed
+inventory-guarded issue run on an inventory-capable worker, the refused head is
+not discarded. The worker keeps it under run-attributed refs
+(`refs/uzi-incoming/<run-id>/<generation>/...`) and records it in a durable
+ledger under `info/uzi-refusals/` in the worker's bare repository (older
+workers ignore `info/`). At the terminal transfer, if a durable gate proves the
+ledger complete (admissions for every generation from the current worker
+process, every refused head covered by the release source, no leftover temp
+file), the freeze proceeds with the refused head as the current source and the
+ordinary held publication and final custody transfer release the hold. The
+gate is checked again before capture, before the held publish and before every
+final disposition, and a write-once seal fixes the evidence before the first
+final disposition is sent. After the terminal import no later fetch for that
+generation can add a refused head. Deleting a generation's local state removes
+its refusal refs and records only after the acknowledged final source covers
+them; any change in the evidence keeps everything locally.
+
+**These runs keep the hold and stay with the owner** (`uzi run recovery`,
+`uzi run export` or `uzi run discard`):
+
+- a run claimed before this behaviour shipped, a run that crossed an old or
+  another worker, a run whose history spans a worker-process restart, or a
+  generation whose admission write failed;
+- a later generation of a run after an earlier generation's cleanup, which
+  cannot cap-release automatically;
+- a refusal under a legacy or no-generation context, whose hold and cleanup stay
+  closed permanently;
+- a bare with a stranded temp file in `info/uzi-refusals`, which keeps the gate
+  ineligible.
+
+`uzi run discard` does not remove refusal refs or records; they stay reachable
+in the worker's bare. In a mixed fleet an older worker may treat a bare holding
+these records as disposable and leak the nested refs and records. The gate
+applies only to this automatic cap release: ordinary releases below the cap are
+not gated on these records. An old worker's refused head that old code deleted,
+followed by pins reconciling below the cap, leaves no trace, and the ordinary
+release proceeds as before. Design:
+[ADR-2545](../adr/2545-failed-run-held-publication.md), amendment 2026-11-19.
+
 ### When a run is stopped by a stale or fenced claim
 
 A worker stops a flight when its claim has gone stale (`stale_claim`) or when an
