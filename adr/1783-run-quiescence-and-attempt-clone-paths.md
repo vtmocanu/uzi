@@ -2009,3 +2009,82 @@ supervisor spawn and confirmed disposal by run ID, PID and start
 time. These records are diagnostic only. The observed occurrence supports the
 snapshot-race explanation but does not establish which claim spawned its
 supervisor.
+
+## Amendment 2026-11-19: group-writable managed bare under runner-group trust (#4486)
+
+Under the uid split, the worker runs with umask `002`. On a setgid data volume, its managed bare
+repositories are therefore `2775` worker:worker. The automatic content proof's `topology()` refused
+every group-writable managed bare (`unowned alternate store`). As a result, neither pod-epoch attempt
+reclaim nor the hibernation census could prove these clones. This amendment admits group write only
+under the trust contract below. Every other refusal is unchanged.
+
+### P1: process-level runner-group trust
+
+`agent/src/runner-group-trust.ts` probes once per worker process at startup, outside any epoch
+scope and before the GitCache is built. It spawns `/bin/cat /proc/self/status` through
+`runnerCommand` and through `commandRootCommand`. Trust holds only when all of these are true:
+
+- **Worker identity:** the worker is uid and gid 10001, and that gid is not 10002, 10003 or 10004.
+- **Child identity:** both children exit 0. All four `Uid:` fields equal 10002 or 10003, and all
+  four `Gid:` fields equal that identity's primary gid.
+- **Group exclusion:** gid 10001 is absent from the `Gid:` and `Groups:` lines.
+- **Capabilities:** `CapEff`, `CapPrm`, `CapInh` and `CapAmb` are 0, `CapBnd` is 0 or 0xc0, and
+  `NoNewPrivs` is 1.
+
+Any other outcome leaves the allowance off for the process. That includes single-uid, a spawn error,
+a timeout and unparsable output. The probe never throws, and it adds no startup-fatal path. It
+measures the actual effect of `setpriv --init-groups` on the pod `fsGroup`.
+
+### P2: every untrusted spawn goes through the launcher (static audit)
+
+P2 is a static invariant pinned by the runner-uid wrapper tests, not runtime evidence. The audit
+below is exhaustive for in-tree, non-test TypeScript and `.mjs` under `agent/src` at `6ac884bd7`. It
+was assembled from four sources:
+
+- `git grep -n child_process` over `agent/src`.
+- A spawn-family call pattern (`spawn`, `spawnSync`, `execFile`, `execFileSync`, `execSync`, `fork`,
+  `nodeSpawn`, `execFileAsync`, `.spawn(`, `promisify(`).
+- A sweep for the wrapper callers.
+- A trace of the git.ts helpers (`execScoped`, `runGitAsRunner`, `spawnGit`,
+  `spawnJoinedEpochChild`).
+
+Class (a) is a worker-trusted launch of a trusted binary. Class (b) is an untrusted surface.
+
+| Site | Launches | Class | Wrapper |
+|---|---|---|---|
+| `runner-uid.ts` `runnerSpawn` | any runner command; its sole caller is `sdk-spawn.ts` `spawnDetached`, the SDK CLI for every executor | b | `runnerCommand` |
+| `runner-uid.ts` kill helpers | `setpriv … kill` | a | `setprivArgsForUid` |
+| `provision.ts` `defaultRun` | devbox/nix, provision hooks | b | `runnerCommand` |
+| `provision.ts` `defaultPathProbe` | fixed worker-authored PATH probe script | a | identity chosen by the caller |
+| `js-deps.ts` `execInstall` | npm/pnpm/yarn install | b | `runnerCommand`, checked by `canonicalInstall` |
+| `self-improve.ts` check runner | agent-authored check command | b | `runnerCommand` |
+| `executor.ts` `readWorktreeHeadSha`, `StubExecutor.git` | git in the runner clone | b | `runnerCommand` |
+| `tick-spawner.ts` boundary spawn | boundary argv | b for identity `command`, a for `worker_pat` | `runnerCommand` |
+| `run-quiescence.ts` helper spawns | quiescence helpers | b | the caller's `wrap`, `runnerCommand` by default |
+| `rmtree.ts`, `run-procs.ts` helpers | worker-authored scripts run as the agent uids | a | `runnerCommand` / `commandRootCommand` |
+| `codex/launcher.ts` | supervisor and the Codex provider, setup, command and effect roots | b | `runnerCommand` / `commandRootCommand` / `workerBoundaryCommand` |
+| `codex/codex-capability.ts`, `authority-lock.ts`, `dind-*prune.ts`, `hibernation-cache-prune.ts`, `codex/launcher.ts` `id -u` | fixed trusted binaries | a | none |
+| `git.ts` `runGitAsRunner` / `runGitAsRunnerBytes` / `spawnGitAsRunnerWithStdin` | runner git; cwd is always a clone or worktree | b | `runnerCommand` |
+| `git.ts` `execScoped` / `execMeteredNative` / `spawnJoinedEpochChild` | argv supplied by the caller | set by the caller | the caller wraps; the epoch path is also checked by `preflightEpochNative` |
+| `git.ts` `spawnGit` and the worker `execScoped` callers | worker git on a bare or worker path; gitleaks | a | none |
+| eval and replay CLIs (`pr-description-eval*`, `code-cross-check-replay*`) | npm-script tooling, not on the worker run path | — | none |
+
+The audit found no class (b) site that bypasses a wrapper on the split path. One residual is
+accepted for a static P2. `execScoped`, `execMeteredNative` and `spawnJoinedEpochChild` take an
+arbitrary command and rely on the caller to wrap it. Outside the epoch preflight, no guard would
+catch a future unwrapped untrusted launch.
+
+Creation invariant (S4):
+
+- **Runner access to the bare is read-only.** Only two runner launches reference a managed bare:
+  the git.ts seed and attempt `clone --shared --no-checkout -- <bare> <clone>`. Both read the bare
+  and write only the clone, whose `objects/info/alternates` names the bare.
+- **Other runner git stays in the clone.** Every other runner git runs with the clone or worktree as
+  its cwd.
+- **The bare is worker-built.** Bare creation, config and fetch all run as the worker uid
+  (`clone --bare`, `config`, `fetch`).
+
+### P3: no untrusted container mounts `/data/repos`
+
+ADR-3153 pins this with `TestDindContainersMountOnlyTheRunnerSubPathOfTheDataVolume`. The rootful
+DinD daemon's reach remains the accepted #3831 residual.

@@ -30,6 +30,7 @@ import type { CommandSandboxMode } from "./config.js";
 import { validateCaptureGitRequest } from "./credential-free-capture.js";
 import { processGroupAlive } from "./tick-spawner.js";
 import { syncDirectory } from "./authority-lock.js";
+import type { ManagedBareGroupTrust } from "./runner-group-trust.js";
 import { RUNNER_UID, WORKER_UID, killRunnerGroupOnly, killRunnerGroup, runnerCommand, runnerPath, runnerTmpdir, uidSplitActive } from "./runner-uid.js";
 import { unmarkedSpawnEnv, workerSpawnEnv } from "./worker-spawn-mark.js";
 import { PINNED_SUBTREE_SCRIPT, SCRATCH_DELETE_LIMITS, TREE_NAME_RE, censusScratchRoot, rmRunnerTeardownTree } from "./rmtree.js";
@@ -1075,6 +1076,9 @@ export interface GitCacheOptions {
   recoveryDecodedLimitBytes?: number;
   /** Physical terminal custody, rooted at the configured outbox by the caller. */
   terminalRecordProtection?: (runId: string) => Promise<boolean>;
+  /** Result of the once-per-process runner-group probe (runner-group-trust.ts). Absent means the
+   *  group-writable managed bare allowance is off. */
+  managedBareGroupTrust?: ManagedBareGroupTrust;
   /** The gitleaks executable. Default `"gitleaks"` (PATH outside a boundary scope, the image's
    *  absolute `/usr/local/bin/gitleaks` inside one via resolveBoundaryExecutable). A test injects an
    *  absolute path to a shim. */
@@ -5997,6 +6001,9 @@ export class GitCache {
   private readonly compactForeignNow: () => number;
   private readonly archivedPinClock: NonNullable<GitCacheOptions["archivedPinClockForTest"]>;
   private readonly terminalRecordProtection: GitCacheOptions["terminalRecordProtection"];
+  private readonly managedBareGroupTrustValue: GitCacheOptions["managedBareGroupTrust"];
+  /** Unused until the managed-bare topology milestone consumes it; kept so the stored field is read. */
+  protected get managedBareGroupTrust(): GitCacheOptions["managedBareGroupTrust"] { return this.managedBareGroupTrustValue; }
   /** See {@link GitCacheOptions.canonicalFree}; undefined in production. */
   private readonly canonicalFreeSeam: GitCacheOptions["canonicalFree"];
   /** See {@link GitCacheOptions.wipCapture}; undefined in production. */
@@ -6059,6 +6066,7 @@ export class GitCache {
     this.reposRoot = path.join(dataDir, "repos");
     this.runnerRoot = path.join(dataDir, "runner");
     this.terminalRecordProtection = opts.terminalRecordProtection;
+    this.managedBareGroupTrustValue = opts.managedBareGroupTrust;
     this.runnerHoldingRoot = path.join(dataDir, "runner-quarantine");
     this.recoveryRoot = path.join(dataDir, "recovery");
     this.recoveryMaintenanceRoot = path.join(dataDir, "recovery-maintenance");
