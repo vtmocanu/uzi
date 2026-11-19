@@ -167,11 +167,14 @@ func currentSurvivor(t *rollTick, e *rollEntry) bool {
 		return false
 	}
 	c, ok := coverageOf(e.w, e.ns)
+	// Like the pool coverage-key check, an owner/lane mismatch is blocked in planRoll
+	// before pooling, so this is defensive.
 	return ok && r.Coverage.Owner == c.Owner && r.Coverage.Lane == e.ns
 }
 
 // cancelAbsentDuplicateCanary settles a two-canary pool when exactly one canary D is
-// provably absent and stale and the other S is a current serving canary. It returns
+// provably absent and stale and the other S is a current canary (see currentSurvivor;
+// no serving proof is required or granted). It returns
 // true when it wrote and fully settled the tick's outcomes for the pool (the caller
 // then returns); on any refusal it writes nothing and the caller's hold applies. A
 // failed write marks the pool uncertain and records an error, then returns false.
@@ -182,6 +185,10 @@ func (m *Materializer) cancelAbsentDuplicateCanary(ctx context.Context, t *rollT
 	ns, key := pool[0].ns, coverageKey(pool[0].coverage)
 	owner, lane := pool[0].coverage.Owner, pool[0].coverage.Lane
 	inPool := map[*rollEntry]bool{}
+	// Defence in depth: several guards below overlap. identityAmbiguous/strayReservation
+	// are namespace-wide (also refused in the peer loop); an undecodable annotation also
+	// blocks the entry in rollSnapshot; a lane migration fence also marks the pool key
+	// uncertain. Each is kept so that no single upstream change can open the write.
 	for _, e := range pool {
 		inPool[e] = true
 		if e.hibernation || e.w.Hibernation != nil || e.mutated || t.unavailable[e.w.ID] || e.snapshotIncomplete || e.blocked != "" ||
