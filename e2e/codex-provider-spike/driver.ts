@@ -141,6 +141,7 @@ export interface ProtocolTurnOptions {
   readonly credential: string;
   readonly provider: FakeProvider;
   readonly resumeOverride?: FakeProvider;
+  readonly onResumeProbe?: () => void;
   readonly session?: { seed?: string; resumeId?: string; save?: string };
 
   readonly fixture?: { table: (table: string) => string; env: NodeJS.ProcessEnv };
@@ -389,8 +390,7 @@ export async function runProtocolTurn(mods: ProtocolModules, opts: ProtocolTurnO
   let handle: Awaited<ReturnType<ProtocolModules["launchCodexRoot"]>> | undefined;
   let transport: ReturnType<ProtocolModules["createCodexTransport"]> | undefined;
   let sessionHome: string | undefined;
-  let primaryFailure: { error: unknown } | undefined;
-  try {
+  return withProtocolCleanup(async () => {
     let priming = opts.lifecycle === "resume";
     provider = opts.provider;
     const scratch = path.resolve(__dirname, "../../.uzi/scratch");
@@ -507,6 +507,7 @@ export async function runProtocolTurn(mods: ProtocolModules, opts: ProtocolTurnO
       // A separate worker-created thread, never Codex's upstream spawn_agent.
       await transport.request("thread/start", threadParams);
     }
+    if (opts.session?.resumeId) opts.onResumeProbe?.();
     const threadRes = opts.session?.resumeId
       ? await transport.request<{ thread?: { id?: string } }>("thread/resume", { ...threadParams, threadId: opts.session.resumeId })
       : await transport.request<{ thread?: { id?: string } }>("thread/start", threadParams);
@@ -522,6 +523,7 @@ export async function runProtocolTurn(mods: ProtocolModules, opts: ProtocolTurnO
       await deadline(primeCompletion, "saved root completion", opts.turnDeadlineMs ?? 12_000);
       priming = false;
       if (opts.resumeOverride) await provider.close();
+      opts.onResumeProbe?.();
       const resumed = await transport.request<{ thread?: { id?: string } }>("thread/resume", {
         threadId, model, modelProvider: mods.CODEX_M3B_LOOPBACK_PROVIDER_NAME, cwd,
         approvalPolicy: "never", config: { ...threadParams.config, ...(opts.resumeOverride ? { ["model_providers." + mods.CODEX_M3B_LOOPBACK_PROVIDER_NAME + ".base_url"]: opts.resumeOverride.baseUrl } : {}) }, developerInstructions: threadParams.developerInstructions,
@@ -559,18 +561,28 @@ export async function runProtocolTurn(mods: ProtocolModules, opts: ProtocolTurnO
       binaryEvidence,
       notes: rawNotes,
     };
-  } catch (error) {
-    primaryFailure = { error };
-    throw error;
-  } finally {
+  }, async () => {
     const results = await Promise.allSettled([
       Promise.resolve().then(() => transport?.close()),
       Promise.resolve().then(async () => { if (handle && !(await handle.dispose()).clean) throw new Error("cleanup-failure"); }),
     ]);
-    await Promise.all(ownedChildren.map(settle => settle()));
-    if (base) rmSync(base, { recursive: true, force: true });
-    if (results.some(r => r.status === "rejected")) throw new Error("cleanup-failure");
+    results.push(...await Promise.allSettled(ownedChildren.map(settle => settle())));
+    results.push(...await Promise.allSettled([Promise.resolve().then(() => { if (base) rmSync(base, { recursive: true, force: true }); })]));
+    const failures = results.flatMap(r => r.status === "rejected" ? [r.reason] : []);
+    if (failures.length) throw new AggregateError(failures, "cleanup-failure");
+  });
+}
+
+export async function withProtocolCleanup<T>(run: () => Promise<T>, cleanup: () => Promise<void>): Promise<T> {
+  let value: T | undefined;
+  let failure: { error: unknown } | undefined;
+  try { value = await run(); } catch (error) { failure = { error }; }
+  try { await cleanup(); } catch (error) {
+    if (!failure) throw error;
+    throw new AggregateError([failure.error, error], failure.error instanceof Error ? failure.error.message : "protocol-failure", { cause: failure.error });
   }
+  if (failure) throw failure.error;
+  return value as T;
 }
 
 export function validateFixtureEnv(env: NodeJS.ProcessEnv): void {

@@ -57,6 +57,7 @@ export class FakeProvider {
   nativeTools = false;
   nativeApplyPatch = false;
   unknownInventory = false;
+  inventoryObserved = false;
   readonly sockets = new Set<Socket>();
   readonly budget = new Budget(4 * 1024 * 1024, 16384);
   private constructor(readonly server: Server, readonly port: number, readonly options: ServerOptions) {}
@@ -82,6 +83,9 @@ export class FakeProvider {
     return p;
   }
   private handle(req: IncomingMessage, res: ServerResponse): void {
+    if (req.url === "/target") {
+      this.header ||= req.headers.authorization !== undefined || req.headers["x-spike-key"] !== undefined;
+    }
     try { this.budget.take(0); } catch { req.destroy(); return; }
     if (["/v1/responses", "/v1/models", "/target"].includes(req.url ?? "")) this.paths.add(req.url!);
     else if (this.errors.length === 0) this.errors.push("unexpected-path");
@@ -92,6 +96,7 @@ export class FakeProvider {
     let bytes = 0;
     const chunks: Buffer[] = [];
     req.on("data", (chunk: Buffer) => {
+      if (req.url === "/target" && chunk.length > 0) this.body = true;
       try {
         this.budget.take(chunk.length);
         if (bytes + chunk.length > 1024 * 1024) throw new Error("request-limit");
@@ -105,10 +110,6 @@ export class FakeProvider {
         : req.headers.authorization === `Bearer ${this.options.credential}`;
       this.credentialReceived ||= valid;
       this.responsePath ||= req.url === "/v1/responses";
-      if (req.url === "/target") {
-        this.header ||= req.headers.authorization !== undefined || req.headers["x-spike-key"] !== undefined;
-        this.body ||= bytes > 0;
-      }
       if (this.options.stall) return;
       if (!valid && this.options.guard !== false) { res.writeHead(401).end(); return; }
       this.accepted = true;
@@ -128,6 +129,7 @@ export class FakeProvider {
           this.callbackOutput ||= input.some((v: unknown) => v !== null && typeof v === "object" && ["custom_tool_call_output", "function_call_output"].includes(String((v as Record<string, unknown>).type)));
           this.callbackResultMatched ||= input.some(callbackResultMatches);
           const inventory = inventoryProjection(body);
+          this.inventoryObserved = true;
           this.nativeTools ||= !inventory.nativeSuppressed;
           this.nativeApplyPatch ||= inventory.nativeApplyPatch;
           this.unknownInventory ||= inventory.unknownInventory;
@@ -155,6 +157,16 @@ export class FakeProvider {
     });
   }
   private closing?: Promise<void>;
+  resetObservations(): void {
+    this.requests.length = 0;
+    this.paths.clear(); this.headerNames.clear();
+    this.header = false; this.body = false; this.accepted = false;
+    this.credentialReceived = false; this.responsePath = false; this.streamed = false;
+    this.callbackOutput = false; this.callbackResultMatched = false;
+    this.nativeTools = false; this.nativeApplyPatch = false; this.unknownInventory = false;
+    this.inventoryObserved = false;
+    // Budgets, errors and oversized remain cumulative across controls and measurements.
+  }
   close(): Promise<void> {
     return this.closing ??= this.closeOwned();
   }
@@ -181,8 +193,11 @@ export function inventoryProjection(body: ResponsesBody) {
     if (Array.isArray(value)) { for (const child of value) visit(child); return; }
     if (!value || typeof value !== "object") { unknownInventory = true; return; }
     const v = value as Record<string, unknown>;
-    if (typeof v.name === "string") name(v.name);
-    if (typeof v.type === "string" && !["function", "custom", "namespace"].includes(v.type)) unknownInventory = true;
+    if ("name" in v) {
+      if (typeof v.name === "string" && v.name.length > 0) name(v.name);
+      else unknownInventory = true;
+    }
+    if ("type" in v && (typeof v.type !== "string" || !["function", "custom", "namespace"].includes(v.type))) unknownInventory = true;
     if (typeof v.description === "string") {
       for (const declaration of v.description.matchAll(/declare const tools:\s*\{/g)) {
         const start = declaration.index! + declaration[0].length;

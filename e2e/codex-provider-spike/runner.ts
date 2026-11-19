@@ -3,7 +3,7 @@ import { randomBytes } from "node:crypto";
 import { readFileSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { request } from "node:http";
+import { request, type IncomingMessage } from "node:http";
 import { FakeProvider, Budget, SAFE_HEADER_NAMES, type ServerOptions } from "./fake-provider.js";
 import { runProtocolTurn, loadProtocolModules, type ProtocolTurnOptions } from "./driver.js";
 import { probeCodexRuntime } from "../../agent/src/codex/codex-runtime-probe.js";
@@ -19,8 +19,8 @@ export function validateName(name: string): asserts name is Name {
 export type Row = { name: Name; outcome: "observed-supported" | "observed-failure" | "unverified"; path: "production-launcher" | "fixture-config" | "fixture-control";
   streamed: boolean; credentialReceived: boolean; responsePath: boolean; header: boolean; body: boolean; caSSL: boolean; caCodex: boolean; credentialEnv: boolean;
   config: Name; requestPaths: string[]; headerNames: string[]; elapsedMs: number; actualSSL: boolean; actualCodex: boolean; actualCredentialEnv: boolean; keyInConfig: boolean;
-  callbackAttempted?: boolean; receiverControlHeader?: boolean; receiverControlBody?: boolean; callbackSeen?: boolean; effect?: boolean; denied?: boolean; roundtrip?: boolean; deadlineObserved?: boolean; nativeSuppressed?: boolean; nativeApplyPatch?: boolean; unknownInventory?: boolean; modelContextWindowOwn?: boolean; modelContextWindowNullableInteger?: boolean; fallbackWarningObserved?: boolean; untrusted?: boolean; nativeConfigDisabled?: boolean; poisonStripped?: boolean; auxiliaryConfigDisabled?: boolean; destinationMatched?: boolean; zeroRequestRetries?: boolean; zeroStreamRetries?: boolean; websocketsDisabled?: boolean; cancelled?: boolean; resumed?: boolean;
-  safetyOutcome?: "observed-supported" | "observed-failure";
+  callbackAttempted?: boolean; receiverControlHeader?: boolean; receiverControlBody?: boolean; observerControlPassed?: boolean; callbackSeen?: boolean; effect?: boolean; denied?: boolean; roundtrip?: boolean; deadlineObserved?: boolean; nativeSuppressed?: boolean; nativeApplyPatch?: boolean; unknownInventory?: boolean; modelContextWindowOwn?: boolean; modelContextWindowNullableInteger?: boolean; fallbackWarningObserved?: boolean; untrusted?: boolean; nativeConfigDisabled?: boolean; poisonStripped?: boolean; auxiliaryConfigDisabled?: boolean; destinationMatched?: boolean; zeroRequestRetries?: boolean; zeroStreamRetries?: boolean; websocketsDisabled?: boolean; cancelled?: boolean; resumed?: boolean;
+  safetyOutcome?: "observed-supported" | "observed-failure"; cleanupFailed?: boolean;
   held: boolean; reason: "completed" | "rejected" | "forwarded" | "config-or-runtime-failure" | "deadline" | "cross-host-bind" | "config-rejected" | "tls-refused" | "protocol-failure" | "harness-failure" | "native-authority-advertised" | "auxiliary-network-unverified" };
 export class Evidence {
   readonly budget = new Budget(1024 * 1024, 64);
@@ -93,6 +93,8 @@ async function main(): Promise<void> {
       }, 30000);
       let receiver: FakeProvider | undefined;
       let provider: FakeProvider | undefined;
+      let measuredProvider: FakeProvider | undefined;
+      const resumeProbe = { started: false };
       const fixture = ["env-key", "env-key-control", "alternate-header", "unsupported-wire", "responses-control"].includes(name) || name.startsWith("tls-");
       const row: Row = { name, outcome: "observed-failure", path: ["receiver-control", "destination-control"].includes(name) ? "fixture-control" : fixture || name === "same-process-override" ? "fixture-config" : "production-launcher",
         streamed: false, credentialReceived: false, responsePath: false, header: false, body: false, caSSL: false, caCodex: false, credentialEnv: false,
@@ -128,24 +130,19 @@ async function main(): Promise<void> {
           try {
           await new Promise<void>((resolve, reject) => {
             const req = request(options.redirect!.target, { method: "POST", headers: { authorization: `Bearer ${credential}` }, timeout: 3000 },
-              res => { res.resume(); res.once("end", resolve); });
+              res => settleReceiverResponse(res, resolve, reject));
             req.once("timeout", () => req.destroy(new Error("timeout"))); req.once("error", reject); req.end("synthetic");
           });
           } finally { receiver.options.stall = stalled; }
           row.receiverControlHeader = receiver!.header; row.receiverControlBody = receiver!.body;
           if (!row.receiverControlHeader || !row.receiverControlBody) throw new Error("receiver-control-failure");
           // Preserve the separately recorded positive control, not its target observations.
-          receiver!.header = false; receiver!.body = false;
-          receiver!.headerNames.clear(); receiver!.paths.clear(); receiver!.requests.length = 0;
-          receiver!.credentialReceived = false; receiver!.responsePath = false;
-          receiver!.accepted = false; receiver!.streamed = false;
-          receiver!.callbackOutput = false; receiver!.callbackResultMatched = false;
-          receiver!.nativeTools = false; receiver!.nativeApplyPatch = false; receiver!.unknownInventory = false;
+          receiver!.resetObservations();
         }
         if (name === "receiver-control") {
           await new Promise<void>((resolve, reject) => {
             const req = request(`http://127.0.0.1:${receiver!.port}/target`, { method: "POST", headers: { authorization: `Bearer ${credential}` }, timeout: 3000 },
-              res => { res.resume(); res.once("end", resolve); });
+              res => settleReceiverResponse(res, resolve, reject));
             req.once("timeout", () => req.destroy(new Error("timeout"))); req.once("error", reject); req.end("synthetic");
           });
           row.header = receiver!.header; row.body = receiver!.body;
@@ -154,6 +151,7 @@ async function main(): Promise<void> {
           continue;
         }
         provider = await FakeProvider.start(options); owned.add(provider);
+        measuredProvider = provider;
         if (name === "destination-control") {
           let rejected = false;
           try {
@@ -181,6 +179,7 @@ async function main(): Promise<void> {
           } };
         }
         const turnOptions: ProtocolTurnOptions = { provider, credential: ["wrong-key", "guard-removed", "env-key", "env-key-control"].includes(name) ? wrong : credential,
+          onResumeProbe: () => { resumeProbe.started = true; measuredProvider?.resetObservations(); },
           ...(name === "unknown-model" ? { model: "spike-unknown-model", metadataObservation: (value: { modelContextWindowOwn: boolean; modelContextWindowNullableInteger: boolean }) => Object.assign(row, value), warningObservation: () => { row.fallbackWarningObserved = true; } } : {}),
           adversarialAdvertisement: name === "tool-grant-denied", codeModeHost: m2 ? !["callback-disabled", "advice"].includes(name) : false, allowCallbacks: m2,
           lifecycle: name === "advice" ? "advice" : ["resume", "same-process-override"].includes(name) ? "resume" : "start",
@@ -208,20 +207,22 @@ async function main(): Promise<void> {
           receiver = await FakeProvider.start({ credential }); owned.add(receiver);
           const control = await runProtocolTurn(mods, { ...turnOptions, provider: receiver });
           if (control.turnStatus !== "completed" || !receiver.responsePath) throw new Error("B observer failure");
-          const beforeB = receiver.requests.length;
+          row.observerControlPassed = true;
+          receiver.resetObservations();
           const target = name === "restart-rebind" ? receiver : closedA;
+          measuredProvider = target;
           result = await runProtocolTurn(mods, { ...turnOptions, provider: target, session: { seed, resumeId: prime.threadId } });
           row.resumed = result.threadId === prime.threadId && result.turnStatus === "completed";
-          row.effect = receiver.requests.length > beforeB;
+          row.effect = receiver.requests.length > 0;
           row.streamed = receiver.streamed && row.resumed;
           if (name === "restart-rebind" ? !row.streamed || !row.effect : row.resumed || row.effect) broken = true;
         } else result = await runProtocolTurn(mods, turnOptions);
         if (m2) {
           row.callbackAttempted = result.callbackAttempted; row.callbackSeen = result.callbacks.length > 0; if (!name.startsWith("restart-")) row.effect = effects > 0;
           row.denied = result.callbacks.some(c => !c.result.ok);
-          row.roundtrip = provider.callbackOutput && (name !== "callback" || provider.callbackResultMatched); row.nativeSuppressed = !provider.nativeTools; row.nativeApplyPatch = provider.nativeApplyPatch; row.unknownInventory = provider.unknownInventory;
+          row.roundtrip = measuredProvider.callbackOutput && (name !== "callback" || measuredProvider.callbackResultMatched);
           row.cancelled = name === "cancel-stream" && caseAbort.signal.aborted && result.turnStatus === undefined;
-          if (!name.startsWith("restart-")) row.resumed = name === "resume" && provider.requests.length >= 2 && result.turnStatus === "completed";
+          if (!name.startsWith("restart-")) row.resumed = name === "resume" && resumeProbe.started && provider.requests.length > 0 && result.turnStatus === "completed";
           const valid = name === "callback" ? row.callbackSeen && row.effect && row.roundtrip && !row.denied
             : ["tool-grant-denied", "phase-denied"].includes(name) ? row.callbackSeen && row.denied && !row.effect && row.roundtrip
             : ["callback-disabled", "advice"].includes(name) ? !row.callbackSeen && !row.effect && (name !== "advice" || !row.callbackAttempted)
@@ -232,18 +233,19 @@ async function main(): Promise<void> {
         if (name === "same-process-override" && (result.turnStatus === "completed" || receiver?.responsePath)) broken = true;
         row.streamed = name === "restart-rebind" ? !!receiver?.streamed && result.turnStatus === "completed" : name === "restart-closed-a" ? false : provider.streamed && result.turnStatus === "completed";
         row.outcome = row.cancelled || row.streamed ? "observed-supported" : "observed-failure";
-        row.reason = row.cancelled || row.streamed ? "completed" : ["wrong-key", "env-key-control"].includes(name) && !provider.accepted && provider.responsePath ? "rejected" : name.startsWith("tls-") && !provider.responsePath ? "tls-refused" : "protocol-failure";
+        row.reason = row.cancelled || row.streamed ? "completed" : ["wrong-key", "env-key-control"].includes(name) && !provider.accepted && provider.responsePath ? "rejected" : name.startsWith("tls-") && !provider.responsePath && diagnosis === "tls-refused" ? "tls-refused" : "protocol-failure";
         if (name === "unknown-model" && (!row.modelContextWindowOwn || !row.modelContextWindowNullableInteger || !row.fallbackWarningObserved || !row.streamed)) broken = true;
         if (provider.errors.length || provider.oversized || receiver?.errors.length || receiver?.oversized) broken = true;
       } catch (error) {
+        if (error instanceof AggregateError) { row.cleanupFailed = true; broken = true; }
         row.reason = diagnosis ?? (caseAbort.signal.aborted || error instanceof Error && /deadline|timed out|timeout/i.test(error.message) ? "deadline" : "harness-failure");
         row.deadlineObserved = row.reason === "deadline";
         if (row.reason === "harness-failure") broken = true;
         if (name === "restart-rebind") broken = true;
-        if (name === "same-process-override" && row.reason === "deadline" && receiver && !receiver.responsePath) { row.resumed = false; row.effect = false; }
+        if (name === "same-process-override" && resumeDeadlineObserved(resumeProbe.started, row.reason, receiver?.requests.length)) { row.resumed = false; row.effect = false; }
         if (name === "destination-control" && (row.outcome !== "observed-supported" || row.destinationMatched !== false || row.actualSSL || row.actualCodex || row.actualCredentialEnv)) broken = true;
       if (name === "restart-rebind" && (!row.resumed || !row.effect || !row.streamed)) broken = true;
-      if (name === "restart-closed-a" && row.reason === "deadline" && receiver && receiver.requests.length === 1) {
+      if (name === "restart-closed-a" && row.observerControlPassed && resumeDeadlineObserved(resumeProbe.started, row.reason, receiver?.requests.length)) {
           row.resumed = false; row.effect = false;
         }
       }
@@ -251,21 +253,18 @@ async function main(): Promise<void> {
         await Promise.all([provider?.close(), receiver?.close()]);
         if (provider) owned.delete(provider); if (receiver) owned.delete(receiver);
         clearTimeout(caseTimer); globalAbort.signal.removeEventListener("abort", abortCase);
-        if (provider?.nativeTools) {
-          row.nativeSuppressed = false; row.nativeApplyPatch = provider.nativeApplyPatch; row.unknownInventory = provider.unknownInventory;
-          row.safetyOutcome = "observed-failure";
-        }
+        Object.assign(row, inventoryEvidence(measuredProvider));
         if (provider?.errors.length || provider?.oversized || receiver?.errors.length || receiver?.oversized) broken = true;
-        row.credentialReceived = provider?.credentialReceived ?? false;
-        row.responsePath = provider?.responsePath ?? false;
+        row.credentialReceived = measuredProvider?.credentialReceived ?? false;
+        row.responsePath = measuredProvider?.responsePath ?? false;
         row.header = (receiver ?? provider)?.header ?? false;
         row.body = (receiver ?? provider)?.body ?? false;
         if (name !== "receiver-control" && (row.header || row.body)) {
           row.outcome = "observed-failure"; row.reason = "forwarded";
         }
         row.elapsedMs = Date.now() - caseStarted;
-        row.requestPaths = [...new Set([...(provider?.paths ?? []), ...(receiver?.paths ?? [])])];
-        row.headerNames = [...new Set([...(provider?.headerNames ?? []), ...(receiver?.headerNames ?? [])])];
+        row.requestPaths = [...new Set([...(measuredProvider?.paths ?? []), ...(receiver?.paths ?? [])])];
+        row.headerNames = [...new Set([...(measuredProvider?.headerNames ?? []), ...(receiver?.headerNames ?? [])])];
         evidence.add(row);
       }
       if (["baseline", "guard-removed", "responses-control", "restart-rebind", "rebind-observer-control"].includes(name) && !row.streamed) broken = true;
@@ -295,6 +294,23 @@ if (require.main === module) void main().catch(() => { console.log(JSON.stringif
 
 export function runOpenSSL(args: string[], cwd: string) {
   return spawnSync("/opt/uzi-toolchain/bin/openssl", args, { cwd, env: { PATH: "/usr/bin:/bin" }, timeout: 5000, maxBuffer: 65536 });
+}
+
+export function inventoryEvidence(provider: FakeProvider | undefined): Partial<Row> {
+  if (!provider?.inventoryObserved) return {};
+  return { nativeSuppressed: !provider.nativeTools, nativeApplyPatch: provider.nativeApplyPatch,
+    unknownInventory: provider.unknownInventory, ...(provider.nativeTools ? { safetyOutcome: "observed-failure" as const } : {}) };
+}
+
+export function resumeDeadlineObserved(started: boolean, reason: Row["reason"], requests: number | undefined): boolean {
+  return started && reason === "deadline" && requests === 0;
+}
+
+export function settleReceiverResponse(res: IncomingMessage, resolve: () => void, reject: (error: Error) => void): void {
+  res.once("end", resolve);
+  res.once("error", reject);
+  res.once("close", () => { if (!res.complete) reject(new Error("receiver-response-incomplete")); });
+  res.resume();
 }
 
 export function wireFixture(table: string, name: "unsupported-wire" | "responses-control"): string {
