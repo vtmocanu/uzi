@@ -264,6 +264,8 @@ SELECT
     w.snapshot_register_nonce,
     w.registered_pod_uid,
     w.roll_heartbeat_at,
+    -- Fed to ClassifyUpgrade so the badge classifies a podless worker as the list does (#4514).
+    w.hibernation_state,
     r.blocking_kind,
     r.phase,
     r.phase_since,

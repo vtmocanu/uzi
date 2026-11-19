@@ -22,6 +22,8 @@ SELECT
     w.snapshot_register_nonce,
     w.registered_pod_uid,
     w.roll_heartbeat_at,
+    -- Fed to ClassifyUpgrade so the badge classifies a podless worker as the list does (#4514).
+    w.hibernation_state,
     r.blocking_kind,
     r.phase,
     r.phase_since,
@@ -57,6 +59,7 @@ type GetWorkerUpgradeSummaryForUserRow struct {
 	SnapshotRegisterNonce pgtype.Text        `json:"snapshot_register_nonce"`
 	RegisteredPodUid      pgtype.UUID        `json:"registered_pod_uid"`
 	RollHeartbeatAt       pgtype.Timestamptz `json:"roll_heartbeat_at"`
+	HibernationState      string             `json:"hibernation_state"`
 	BlockingKind          pgtype.Text        `json:"blocking_kind"`
 	Phase                 pgtype.Text        `json:"phase"`
 	PhaseSince            pgtype.Timestamptz `json:"phase_since"`
@@ -114,6 +117,7 @@ func (q *Queries) GetWorkerUpgradeSummaryForUser(ctx context.Context, userID uui
 			&i.SnapshotRegisterNonce,
 			&i.RegisteredPodUid,
 			&i.RollHeartbeatAt,
+			&i.HibernationState,
 			&i.BlockingKind,
 			&i.Phase,
 			&i.PhaseSince,
