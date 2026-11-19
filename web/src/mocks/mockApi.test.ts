@@ -1196,3 +1196,66 @@ describe("mock harness overflow persistence", () => {
     expect(settings.default_harness).toBe("codex");
   });
 });
+
+describe("mockApi instance model defaults grid (#3259)", () => {
+  it("refuses a mixed two-key save with a field-prefixed 400 and leaves the valid key unchanged", async () => {
+    installStorage();
+    const api = await reload();
+    const before = await api.getSettings();
+    expect(before.settings.summary_model).toBe("haiku");
+    expect(before.sources.summary_model).toBe("default");
+
+    await expect(
+      api.updateSettings({ summary_model: "sonnet", codex_judge_model: "not-a-model" }),
+    ).rejects.toMatchObject({ status: 400, message: "codex_judge_model: is not a Codex judge model" });
+
+    const after = await api.getSettings();
+    expect(after.settings.summary_model).toBe("haiku");
+    expect(after.sources.summary_model).toBe("default");
+    expect(after.sources.codex_judge_model).toBe("default");
+  });
+
+  it("keeps a user's own summary choice over the instance value on both lanes, then follows the instance once cleared", async () => {
+    installStorage();
+    const api = await reload();
+    const cells = async () => {
+      const list = (await api.getMySettings()).settings.summary_models ?? [];
+      return {
+        claude: list.find((c) => c.harness === "claude"),
+        codex: list.find((c) => c.harness === "codex"),
+      };
+    };
+
+    await api.putMySettings({ summary_model: "opus", codex_summary_model: "gpt-6-sol" });
+
+    // Admin pins, then resets, both lanes: the user's value wins after each step.
+    for (const instance of [
+      { summary_model: "sonnet", codex_summary_model: "gpt-6-astra" },
+      { summary_model: "", codex_summary_model: "" },
+    ]) {
+      await api.updateSettings(instance);
+      const c = await cells();
+      expect(c.claude?.resolved_model).toBe("opus");
+      expect(c.claude?.source).toBe("user_default");
+      expect(c.codex?.resolved_model).toBe("gpt-6-sol");
+      expect(c.codex?.source).toBe("user_default");
+    }
+
+    // Clear the user's overrides while the instance is pinned: cells follow the instance.
+    await api.updateSettings({ summary_model: "sonnet", codex_summary_model: "gpt-6-astra" });
+    await api.putMySettings({ summary_model: null, codex_summary_model: null });
+    let c = await cells();
+    expect(c.claude?.resolved_model).toBe("sonnet");
+    expect(c.claude?.source).toBe("instance_default");
+    expect(c.codex?.resolved_model).toBe("gpt-6-astra");
+    expect(c.codex?.source).toBe("instance_default");
+
+    // Reset the instance: cells fall back to the built-ins.
+    await api.updateSettings({ summary_model: "", codex_summary_model: "" });
+    c = await cells();
+    expect(c.claude?.resolved_model).toBe("haiku");
+    expect(c.claude?.source).toBe("builtin");
+    expect(c.codex?.resolved_model).toBe("gpt-6-luna");
+    expect(c.codex?.source).toBe("builtin");
+  });
+});
