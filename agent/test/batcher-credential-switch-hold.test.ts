@@ -148,11 +148,21 @@ describe("MessageBatcher credential switch hold", () => {
 
   it("prepare refuses a spilled batcher", async () => {
     const outbox = await mkOutbox();
+    // Issue #4489: prepare first awaits the in-flight spill write, and a write that outlasts
+    // the prepare deadline reports "unavailable", not "spilled" (seen once under CI load).
+    // Slow the spill write well past the deadline and wait for it to land before preparing,
+    // so the assertion is about the spill refusal and not about disk latency.
+    const appendSegment = outbox.appendSegment.bind(outbox);
+    outbox.appendSegment = async (...args: Parameters<Outbox["appendSegment"]>) => {
+      await sleep(800);
+      return appendSegment(...args);
+    };
     const a = api(true);
     const b = new MessageBatcher(a.client, RUN, 0, 5, nullLogger(), undefined, undefined,
       { outbox, generation: 1, transientTripMs: 30 });
     b.emit(text("s1"));
     await until(() => b.isSpilled(), 4000, "batcher enters spill");
+    await until(() => outbox.hasUndrainedMessages(RUN), 10_000, "the spilled frame is durable");
     const hold = b.holdForCredentialSwitch();
     const res = await hold.prepare(500);
     assert.equal(res.prepared, false);
