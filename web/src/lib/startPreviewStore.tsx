@@ -4,16 +4,17 @@
 // refreshes its start prerequisites; `null` means it has not applied its first prerequisites,
 // so nothing is fetched. No timers.
 //
-// Ordering rule: a response is published only while the effect that requested it is still
-// live. The scope and the key are that effect's dependencies, so a scope change (generation
-// or user) or a key change runs the old effect's cleanup before anything else, and a response
-// still pending from the old scope or key can never publish, whichever order responses arrive
-// in. Every scope object is created purely (no render-phase mutation), so React StrictMode's
-// double render and double effect run are harmless; the per-scope promise maps keep that to
-// one request each. After A -> B -> A the first A scope is a different object and stays dead.
-// A user change or logout drops every published value.
+// Ordering rule: a response is published only while (a) the effect that requested it is still
+// live (its passive cleanup has not run) AND (b) its scope is still the scope the latest commit
+// carries (a ref set in a layout effect). (b) is needed because React commits a new scope before
+// it runs passive cleanups, and outside act those cleanups can run as a later task, so a
+// response settling in between would pass (a) alone. A key change is covered by (a) and the
+// visibility key check. Every scope object is created purely (no render-phase mutation), so
+// React StrictMode's double render and double effect run are harmless; the per-scope promise
+// maps keep that to one request each. After A -> B -> A the first A scope is a different
+// object and stays dead. A user change or logout drops every published value.
 
-import { createContext, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { createContext, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { api } from "./api";
 import type { EffectiveSettings, StartPreview, StartPreviewRequest } from "./apiTypes";
 import { useOptionalAuth } from "../auth/AuthContext";
@@ -90,13 +91,21 @@ export function useStartPreview(request: StartPreviewRequest | null): StartPrevi
     setPublished((p) => (p && p.userId !== userId ? null : p));
   }, [userId]);
 
+  // The scope the latest COMMIT carries. Layout effects run synchronously during commit, before
+  // any passive cleanup, so this moves the moment a new scope commits; the passive cleanup below
+  // can run a task later, and a response settling in that gap must not publish.
+  const currentScope = useRef<Scope | null>(scope);
+  useLayoutEffect(() => {
+    currentScope.current = scope;
+  }, [scope]);
+
   useEffect(() => {
     const req = requestRef.current;
     if (!scope || !req || key === null || scope.userId === null || scope.generation === null) return;
     const uid = scope.userId;
     let live = true;
     void Promise.allSettled([scopeGet(scope), scopePost(scope, key, req)]).then(([g, p]) => {
-      if (!live) return;
+      if (!live || currentScope.current !== scope) return;
       setPublished({
         userId: uid,
         key,

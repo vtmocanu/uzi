@@ -201,6 +201,11 @@ describe("startPreviewView", () => {
     expect(v.effort).toBeNull();
     expect(v.alternatives).toEqual([]);
     expect(compactSummary(v)).toBe(v.refusal);
+    // The explicit harness choice is still fixed on the run, and a credential fixed at claim shows.
+    expect(v.fixed.create).toBe(true);
+    const p = recorded("claude with an incompatible model");
+    p.credential!.fixed_at = "claim";
+    expect(startPreviewView(p, GET).fixed.claim).toBe(true);
   });
 
   it("keeps the response's harness and credential and reads defaults as unknown when the GET failed", () => {

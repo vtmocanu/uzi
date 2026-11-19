@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
-import { StrictMode, type ReactNode } from "react";
+import { StrictMode, useLayoutEffect, type ReactNode } from "react";
+import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { api } from "./api";
@@ -219,6 +220,62 @@ describe("StartPreviewProvider / useStartPreview", () => {
     await act(async () => p2.resolve(byName("claude with a model")));
     await waitFor(() => expect(m.result.result.current?.status).toBe("ready"));
     expect(m.result.result.current?.view?.model?.source).toBe("this run");
+  });
+
+  it("shows loading with no preview while a new key's POST is pending, then that key's preview", async () => {
+    const dCodex = deferred<StartPreview>();
+    apiMock.previewStartSettings = vi.fn((req: StartPreviewRequest) => (req.harness === "codex" ? dCodex.promise : Promise.resolve(CLAUDE)));
+    const m = mount({ userId: "u1", generation: 1, request: REQ_CLAUDE });
+    await waitFor(() => expect(m.result.result.current?.status).toBe("ready"));
+    m.update({ request: REQ_CODEX });
+    await waitFor(() => expect(postCalls()).toBe(2));
+    expect(m.result.result.current?.status).toBe("loading");
+    expect(m.result.result.current?.preview).toBeNull();
+    await act(async () => dCodex.resolve(CODEX));
+    await waitFor(() => expect(m.result.result.current?.status).toBe("ready"));
+    expect(m.result.result.current?.preview).toEqual(CODEX);
+  });
+
+  it("never publishes a superseded scope's response that settles between the commit and its effect cleanup", async () => {
+    // Outside act, React commits the new scope and runs the old effect's passive cleanup as a
+    // later task; the old POST settles inside that gap (from a layout effect of the new commit).
+    const env = globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean };
+    const prevEnv = env.IS_REACT_ACT_ENVIRONMENT;
+    env.IS_REACT_ACT_ENVIRONMENT = false;
+    const p1 = deferred<StartPreview>();
+    const queue: Array<Promise<StartPreview>> = [p1.promise, new Promise<StartPreview>(() => {})];
+    apiMock.previewStartSettings = vi.fn(() => queue.shift()!);
+    auth.userId = "u1";
+    const log: string[] = [];
+    function Probe({ gen }: { gen: number }) {
+      const r = useStartPreview(REQ_CLAUDE);
+      log.push(`${gen}:${r?.status}`);
+      useLayoutEffect(() => {
+        if (gen === 2) p1.resolve(CLAUDE);
+      }, [gen]);
+      return null;
+    }
+    const tree = (gen: number) => (
+      <StartPreviewProvider generation={gen}>
+        <Probe gen={gen} />
+      </StartPreviewProvider>
+    );
+    const container = document.createElement("div");
+    const root = createRoot(container);
+    const settle = () => new Promise<void>((r) => setTimeout(r, 50));
+    try {
+      root.render(tree(1));
+      await settle();
+      expect(postCalls()).toBe(1);
+      root.render(tree(2));
+      await settle();
+      expect(postCalls()).toBe(2);
+      expect(log).not.toContain("2:ready");
+      expect(log[log.length - 1]).toBe("2:loading");
+    } finally {
+      root.unmount();
+      env.IS_REACT_ACT_ENVIRONMENT = prevEnv;
+    }
   });
 
   it("discards a response for a key the consumer no longer requests", async () => {

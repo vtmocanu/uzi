@@ -200,7 +200,10 @@ export function startPreviewView(preview: StartPreview, effective: EffectiveSett
     fixed,
   };
   // A top-level refusal renders the refusal and the server's credential: no model or effort rows.
-  if (preview.refusal) return base;
+  if (preview.refusal) {
+    fixedFor(fixed, preview.credential, undefined, undefined);
+    return base;
+  }
   if (base.chosenAtCreate) {
     base.alternatives = (preview.alternatives ?? []).map((a) => branchView(a, effective, fixed));
     return base;
