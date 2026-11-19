@@ -564,6 +564,14 @@ type PacingReport struct {
 	RetainedVersion  *string `json:"retained_version,omitempty"`
 }
 
+// ValidPacingWorkerID reports whether s is an acceptable pacing worker identifier
+// (a parseable UUID). It is the single definition NormalizePacingReport enforces and
+// the controller status handler uses to omit a bad identifier alone.
+func ValidPacingWorkerID(s string) bool {
+	_, err := uuid.Parse(s)
+	return err == nil
+}
+
 // NormalizePacingReport validates a whole entry and strips control characters from
 // its bounded display reason. Errors contain no controller-supplied values.
 func NormalizePacingReport(in *PacingReport) (*PacingReport, error) {
@@ -584,10 +592,8 @@ func NormalizePacingReport(in *PacingReport) (*PacingReport, error) {
 		return nil, fmt.Errorf("invalid pacing field bounds")
 	}
 	for _, id := range []*string{out.CanaryID, out.BlockingWorkerID} {
-		if id != nil {
-			if _, err := uuid.Parse(*id); err != nil {
-				return nil, fmt.Errorf("invalid pacing worker id")
-			}
+		if id != nil && !ValidPacingWorkerID(*id) {
+			return nil, fmt.Errorf("invalid pacing worker id")
 		}
 	}
 	clean := func(s string) string {
