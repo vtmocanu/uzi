@@ -253,7 +253,7 @@ export function RunOptionsDialog({
               defaultLabel={labels.effort}
             />
           </Field>
-          <StartPreview variant="open" request={previewRequest} />
+          <StartPreview variant="open" request={previewRequest} showNote={false} />
           <p id={defaultsHintId} className="text-xs text-faint">
             Settings left on Default are resolved when a worker picks the run up. A choice made here stays with this
             run, including after a resume.

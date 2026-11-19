@@ -101,8 +101,18 @@ export interface StartPreviewViewModel {
   model: ValueView | null;
   effort: ValueView | null;
   alternatives: BranchView[];
-  /** When the shown cells are fixed: at claim (a prediction) and/or on the run now. */
-  fixed: { claim: boolean; create: boolean };
+  /**
+   * When the shown cells are fixed: at claim (a prediction), on the run when it is created, and
+   * whether the request itself carried a choice (override), as opposed to a default that merely
+   * happens to be fixed at create.
+   */
+  fixed: FixedView;
+}
+
+export interface FixedView {
+  claim: boolean;
+  create: boolean;
+  override: boolean;
 }
 
 const UNKNOWN: ValueView = { text: "unknown", short: "unknown", source: null };
@@ -145,16 +155,17 @@ function noteWords(notes: string[]): string[] {
 }
 
 function fixedFor(
-  fixed: { claim: boolean; create: boolean },
+  fixed: FixedView,
   credential: Credential | null,
   model: { fixed_at?: string; source: string } | undefined,
   effort: { fixed_at?: string; source: string } | undefined,
 ): void {
   const add = (at: string | undefined, source?: string) => {
+    if (source === "run_override" || source === "token_override") fixed.override = true;
     if (source === "run_override" || at === "create") fixed.create = true;
     else if (at === "claim") fixed.claim = true;
   };
-  if (credential) add(credential.fixed_at);
+  if (credential) add(credential.fixed_at, credential.source);
   if (model) add(model.fixed_at, model.source);
   if (effort) add(effort.fixed_at, effort.source);
 }
@@ -162,7 +173,7 @@ function fixedFor(
 function branchView(
   alt: StartPreviewAlternative,
   effective: EffectiveSettings | null,
-  fixed: { claim: boolean; create: boolean },
+  fixed: FixedView,
 ): BranchView {
   if (alt.refusal) {
     return { harness: alt.harness, refusal: startRefusalLabel(alt.refusal), credential: null, model: null, effort: null };
@@ -188,7 +199,8 @@ export function startPreviewView(preview: StartPreview, effective: EffectiveSett
   const hv = preview.harness;
   // An explicit harness choice is fixed on the run now; every harness value reports
   // fixed_at "create", so only the run_override source marks a choice made here.
-  const fixed = { claim: false, create: hv?.source === "run_override" };
+  const explicitHarness = hv?.source === "run_override";
+  const fixed: FixedView = { claim: false, create: explicitHarness, override: explicitHarness };
   const base = {
     harness: hv?.value ?? null,
     harnessSource: hv ? modelSettingSourceLabel("harness", hv.source) : null,

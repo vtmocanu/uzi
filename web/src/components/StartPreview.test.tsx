@@ -91,6 +91,47 @@ describe("StartPreview compact", () => {
     expect(rows.getByText("Codex").nextElementSibling?.textContent).toContain("gpt-6-sol");
     // A chosen harness is never invented.
     expect(rows.queryByText("Model")).toBeNull();
+    // The harness row says it once, with the server's note and no repeated source label.
+    expect(rows.getByText("Harness").nextElementSibling?.textContent).toBe(
+      "Chosen when started · chosen by the soonest weekly reset",
+    );
+  });
+
+  it("a default start with a create-fixed credential does not claim a choice was made", async () => {
+    mockApi.previewStartSettings.mockResolvedValue(preview("default start"));
+    renderPreview("compact");
+    fireEvent.click(await screen.findByRole("button", { name: /If started now/ }));
+    expect(screen.queryByText(/A choice made here/)).toBeNull();
+    expect(screen.getByText("The harness and credential are fixed when the run is created.")).toBeTruthy();
+  });
+
+  it("showNote=false hides the note lines but keeps the link", async () => {
+    render(
+      <MemoryRouter>
+        <StartPreviewProvider generation={1}>
+          <StartPreview variant="open" showNote={false} request={DEFAULT_START_PREVIEW_REQUEST} />
+        </StartPreviewProvider>
+      </MemoryRouter>,
+    );
+    await screen.findByRole("button", { name: /If it started now/ });
+    expect(screen.queryByText(/A prediction/)).toBeNull();
+    expect(screen.queryByText(/A choice made here/)).toBeNull();
+    expect(screen.getByRole("link", { name: "Run defaults" }).className).toContain("min-h-6");
+  });
+
+  it("keeps the server's harness notes when the harness is undecided (panel and static)", async () => {
+    const overflow = RECORDED_EFFECTIVE_SCENARIOS.find((s) => s.name === "overflowCodexDefault")!;
+    mockApi.getEffectiveSettings.mockResolvedValue(structuredClone(overflow.get));
+    mockApi.previewStartSettings.mockResolvedValue(
+      structuredClone(overflow.start_previews.find((p) => p.name === "default start")!.response),
+    );
+    const note = "may move to the other harness near its limit";
+    const { unmount } = renderPreview("compact");
+    fireEvent.click(await screen.findByRole("button", { name: /If started now/ }));
+    expect(screen.getByText("Harness").nextElementSibling?.textContent).toContain(note);
+    unmount();
+    renderPreview("static");
+    expect(await screen.findByText(note)).toBeTruthy();
   });
 
   it("a refusal renders as text with no model or effort rows", async () => {

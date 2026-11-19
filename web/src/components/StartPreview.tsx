@@ -77,17 +77,33 @@ function Note({ view }: { view: StartPreviewViewModel }) {
       {view.fixed.claim && (
         <p>A prediction: settings left on Default are read when a worker picks the run up.</p>
       )}
-      {view.fixed.create && <p>A choice made here is fixed on the run now.</p>}
+      {view.fixed.override ? (
+        <p>A choice made here is fixed on the run now.</p>
+      ) : (
+        view.fixed.create && <p>The harness and credential are fixed when the run is created.</p>
+      )}
     </>
   );
 }
 
-function Panel({ view, id, hidden }: { view: StartPreviewViewModel; id: string; hidden: boolean }) {
+function Panel({
+  view,
+  id,
+  hidden,
+  showNote,
+}: {
+  view: StartPreviewViewModel;
+  id: string;
+  hidden: boolean;
+  showNote: boolean;
+}) {
   return (
     <div id={id} hidden={hidden} className="mt-1.5 space-y-1.5 text-xs text-fg">
       <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-0.5">
         {view.chosenAtCreate ? (
-          <Row label="Harness">Chosen when started{view.harnessSource ? ` · ${view.harnessSource}` : ""}</Row>
+          <Row label="Harness">
+            Chosen when started{view.notes.length > 0 ? ` · ${view.notes.join(", ")}` : ""}
+          </Row>
         ) : view.harness ? (
           <Row label="Harness">
             <Mono>{capitalize(view.harness)}</Mono>
@@ -119,14 +135,25 @@ function Panel({ view, id, hidden }: { view: StartPreviewViewModel; id: string; 
         ))}
       </dl>
       <div className="space-y-0.5 text-muted">
-        <Note view={view} />
+        {showNote && <Note view={view} />}
         <p>
-          <Link to={RUN_DEFAULTS_PATH} draggable={false} className="text-brand hover:text-brand-hover">
-            Run defaults
-          </Link>
+          <RunDefaultsLink />
         </p>
       </div>
     </div>
+  );
+}
+
+// The link is its own >= 24px target; a bare 12px text line is too small to hit.
+function RunDefaultsLink() {
+  return (
+    <Link
+      to={RUN_DEFAULTS_PATH}
+      draggable={false}
+      className="inline-flex min-h-6 items-center text-brand hover:text-brand-hover"
+    >
+      Run defaults
+    </Link>
   );
 }
 
@@ -134,10 +161,13 @@ export function StartPreview({
   request,
   variant,
   className,
+  showNote = true,
 }: {
   request: StartPreviewRequest | null;
   variant: StartPreviewVariant;
   className?: string;
+  /** False where the surface already carries its own defaults hint (the Run options dialog). */
+  showNote?: boolean;
 }) {
   const result = useStartPreview(request);
   const [open, setOpen] = useState(variant === "open");
@@ -167,15 +197,14 @@ export function StartPreview({
             {view.refusal ? "" : staticSources(view)}
           </p>
         )}
+        {view.chosenAtCreate && view.notes.length > 0 && <p className="text-muted">{view.notes.join(", ")}</p>}
         {view.alternatives.map((b) => (
           <p key={b.harness} className="pl-3 text-muted">
             {branchText(b)}
           </p>
         ))}
         <p>
-          <Link to={RUN_DEFAULTS_PATH} draggable={false} className="text-brand hover:text-brand-hover">
-            Run defaults
-          </Link>
+          <RunDefaultsLink />
         </p>
       </div>,
     );
@@ -199,7 +228,7 @@ export function StartPreview({
           {open ? <ChevronDownIcon width={12} height={12} /> : <ChevronRightIcon width={12} height={12} />}
         </span>
       </button>
-      <Panel view={view} id={panelId} hidden={!open} />
+      <Panel view={view} id={panelId} hidden={!open} showNote={showNote} />
     </>,
   );
 }

@@ -85,12 +85,20 @@ describe("startPreviewView", () => {
     expect(v.effort).toEqual({ text: "medium", short: "medium", source: "built-in" });
     expect(v.credential).toBe("automatic selection");
     expect(compactSummary(v)).toBe("Claude · opus · medium");
-    expect(v.fixed).toEqual({ claim: true, create: false });
+    expect(v.fixed).toEqual({ claim: true, create: false, override: false });
+  });
+
+  it("a create-fixed credential alone is not a choice made here", () => {
+    const v = startPreviewView(recorded("default start"), GET);
+    expect(v.fixed.create).toBe(true);
+    expect(v.fixed.override).toBe(false);
+    expect(startPreviewView(recorded("enabled pinned token"), GET).fixed.override).toBe(true);
   });
 
   it("counts an explicit harness choice as fixed on the run now", () => {
     const v = startPreviewView(recorded("claude"), GET);
     expect(v.fixed.create).toBe(true);
+    expect(v.fixed.override).toBe(true);
     expect(startPreviewView(recorded("auto token"), GET).fixed.create).toBe(false);
   });
 
