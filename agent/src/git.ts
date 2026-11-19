@@ -29620,8 +29620,7 @@ try {
   }
 
   /** Durable, irreversible companion of the in-process latch: it survives a restart, so a successor process
-   *  never trusts the run's refusal history. Cleanup never deletes it; only an owner discard or the bare's
-   *  removal does. Best effort and independent of the other recording steps; never throws. */
+   *  never trusts the run's refusal history. Cleanup never deletes it; only the bare's removal does. Best effort and independent of the other recording steps; never throws. */
   private async markRefusalIncomplete(c: StoredOwedContext): Promise<void> {
     try {
       await this.writeOwedFile(c.barePath, `incomplete-${c.runId}.json`,

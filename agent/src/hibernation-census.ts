@@ -532,7 +532,7 @@ const PROTECTED_PACKED_NESTED_INCOMING = / refs\/uzi-incoming\/[^/\s]+\//;
 async function protectedBareReason(dataDir: string, tree: Tree, bare: Node): Promise<string | undefined> {
   if (tree.children(`${bare.rel}/uzi-owed`).length > 0) return "owed_records";
   if (tree.children(`${bare.rel}/uzi-code-snapshots`).length > 0) return "code_snapshots";
-  // Admissions are written by inventory-guarded code-publishing flights and deleted at that generation's cleanup, so only evidence records protect.
+  // Admissions are written by inventory-guarded code-publishing flights and kept (cleanup never deletes them), so only evidence records protect.
   if (tree.children(`${bare.rel}/info/uzi-refusals`).some(n => /^(?:refusals-|final-|cleanup-|incomplete-|\.tmp-)/.test(lastSegment(n.rel)))) return "refusal_records";
   for (const dir of PROTECTED_REF_DIRS) {
     if (tree.descendants(`${bare.rel}/refs/${dir}`).some(n => n.type !== "dir")) return "recovery_refs";

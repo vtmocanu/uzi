@@ -515,3 +515,31 @@ it("F4: a successful terminal re-pin that lands exactly at the cap closes the fe
   assert.deepEqual(await directFetch(claim, work.clone!), { kind: "not_updated", reason: "ownership_unknown" }, "fenced");
   assert.equal(command(bare(), ["for-each-ref", "refs/"]), refsBefore, "no stage was created");
 });
+
+it("S4: a successful terminal fetch at the cap with an ineligible gate keeps custody", opts, async t => {
+  const { claim, server, work } = setup(44832, 3);
+  let results: (string | null)[] = [];
+  const r = await runFailed(claim, work, () => {
+    fs.mkdirSync(refusalDir(), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(refusalDir(), `incomplete-${claim.run_id}.json`), "{}\n", { mode: 0o600 });
+  }, runner => { results = spyTransfer(t, runner); });
+  assert.equal(command(bare(), ["for-each-ref", "refs/uzi-owed/"]).split("\n").length, 3, "the terminal import itself succeeded at the cap");
+  assert.ok(results.length >= 1 && results.every(h => h === null), "no pass released a head");
+  await redrive(r);
+  noHold(server, "incomplete history after a successful fetch");
+});
+
+it("N1: an unguarded run at the cap with a successful terminal fetch follows the base path (no fence, no gate)", opts, async t => {
+  Reflect.set(git, "maxOwedCandidates", 3);
+  const claim = gitlabClaim(44833, { claim_generation: GENERATION });
+  skipCheckpoints();
+  const work: Partial<Work> = {};
+  let results: (string | null)[] = [];
+  const r = runner(failingWork(work), fakeGitlab().gitlab, JOIN_TOKEN, { checkpointIntervalMs: 1 });
+  results = spyTransfer(t, r);
+  await r.execute(claim);
+  assert.equal(command(bare(), ["for-each-ref", "refs/uzi-owed/"]).split("\n").length, 3, "the terminal import succeeded at the cap");
+  assert.ok(results.length >= 1 && results.every(h => h !== null), "the base path released the head");
+  assert.equal(git["refusalGenerationClosed"]({ runId: claim.run_id, generation: GENERATION }), false, "the generation was never fenced");
+  assert.deepEqual(refusalFiles().filter(n => n.startsWith("admission-")), []);
+});

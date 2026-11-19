@@ -23371,11 +23371,12 @@ export class RunRunner {
       runLog.warn("recovery: settle transfer — run HEAD does not match the proved fetched candidate");
       return null;
     }
-    // issue #4481: a run at the cap, or with refusal evidence, releases only through the provenance gate even
-    // when this fetch succeeded (a re-pin of an already-held head). The fence closes, the second terminal pass
-    // re-proves instead of re-importing, and an ineligible gate retains custody. Ordinary below-cap runs
-    // (gate none) take the unchanged path below.
-    if (generation >= 1) {
+    // issue #4481: an inventory-guarded code-publishing flight (the only kind that writes admissions) at the cap,
+    // or with refusal evidence, releases only through the provenance gate even when this fetch succeeded (a
+    // re-pin of an already-held head). The fence closes, the second terminal pass re-proves instead of
+    // re-importing, and an ineligible gate retains custody. Ordinary below-cap flights (gate none) and every
+    // unguarded flight take the unchanged path below.
+    if (generation >= 1 && flight.inventoryGuarded === true && isCodePublishingKind(flight.runKind)) {
       const gate = await this.git.refusalReleaseGate(barePath, runId, generation, head);
       check();
       if (gate.kind !== "none") {

@@ -509,6 +509,8 @@ describe("issue4481 recording failure latch", { timeout: 300_000 }, () => {
       // The surviving evidence alone would look covered: the head is an ancestor of the gate head.
       const cover = coverOf([...kept, head]);
       assert.deepEqual(await gate(cover), { kind: "ineligible", reason: "refusal recording failed in this process" });
+      // The durable marker is written whenever the directory is writable (not in the chmod ledger-only variant).
+      if (!failLedger) assert.ok(fs.existsSync(path.join(refDir(), `incomplete-${RUN}.json`)), "the incomplete marker exists");
       assert.equal(await cache.sealRefusalRelease(bare, RUN, 1, cover), "ineligible");
       assert.equal(refusalFiles().some((n) => n.startsWith("final-")), false);
       // The latch is per run: another run on the same cache is unaffected.
@@ -535,6 +537,7 @@ describe("issue4481 recording failure latch", { timeout: 300_000 }, () => {
       return () => { internals.refusalNames = original; };
     });
     assert.equal(refusalFiles().some((n) => n.startsWith("refusals-")), false, "the failed seal check recorded nothing");
+    assert.ok(refusalFiles().includes(`incomplete-${RUN}.json`), "the failed seal check left the durable incomplete marker");
     assert.deepEqual(await gate(coverOf([...kept, head])), { kind: "ineligible", reason: "refusal recording failed in this process" });
   });
   it("a refused-ref write that does not read back is a failed write", async () => {
@@ -705,6 +708,29 @@ describe("issue4481 cleanup", { timeout: 300_000 }, () => {
     fs.rmSync(path.join(refDir(), `final-${RUN}-1.json`));
     assert.equal(await cleanup(cover), "retained");
     assert.equal(gitIn(bare, ["rev-parse", unrelated]), refused);
+    assert.equal(incomingRefs().length, 2);
+  });
+
+  /** Rewrites the intent with its digest recomputed so every hash rule holds, and drops the FINAL. */
+  function forgeIntent(change: (intent: any) => { stages: any[]; ledgerEntries: any[] }): void {
+    const intent = readJson(`cleanup-${RUN}-1.json`);
+    const { stages, ledgerEntries } = change(intent);
+    const lines = [...ledgerEntries.map((e: any) => `L ${e.generation} ${e.sha}`), ...stages.map((x: any) => `S ${x.ref} ${x.tip}`)].sort();
+    writeRaw(`cleanup-${RUN}-1.json`, { ...intent, stages, ledgerEntries, finalDigest: createHash("sha256").update(lines.join("\n")).digest("hex") });
+    fs.rmSync(path.join(refDir(), `final-${RUN}-1.json`));
+  }
+
+  it("S2: a self-consistent intent listing a ledger entry at generation G+1 is retained", async () => {
+    const { cover } = await intentWritten();
+    forgeIntent((i) => ({ stages: i.stages, ledgerEntries: [...i.ledgerEntries, { generation: 2, sha: base }] }));
+    assert.equal(await cleanup(cover), "retained");
+    assert.equal(incomingRefs().length, 2);
+  });
+
+  it("S3: a self-consistent intent whose stage tip is not among its ledger entries is retained", async () => {
+    const { cover } = await intentWritten();
+    forgeIntent((i) => ({ stages: [...i.stages, { ref: `refs/uzi-incoming/${RUN}/1/extra`, generation: 1, tip: base }], ledgerEntries: i.ledgerEntries }));
+    assert.equal(await cleanup(cover), "retained");
     assert.equal(incomingRefs().length, 2);
   });
 
