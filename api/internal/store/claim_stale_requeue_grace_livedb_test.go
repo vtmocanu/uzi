@@ -374,16 +374,23 @@ func TestClaimRunStaleRequeueCodexParkPromoteCyclesLiveDB(t *testing.T) {
 		// reset can explain fresh clocks below.
 		fx.age(run, 3*time.Hour, 3*time.Hour)
 		setGate(false) // the account recovers
+		var before, after time.Time
+		if err := fx.pool.QueryRow(fx.ctx, `SELECT clock_timestamp()`).Scan(&before); err != nil {
+			t.Fatal(err)
+		}
 		if rows, err := fx.q.PromoteCodexAccountWaitRun(fx.ctx, run); err != nil || rows != 1 {
 			t.Fatalf("cycle %d promote = (%d, %v), want (1, nil)", n, rows, err)
+		}
+		if err := fx.pool.QueryRow(fx.ctx, `SELECT clock_timestamp()`).Scan(&after); err != nil {
+			t.Fatal(err)
 		}
 		r := readRun()
 		if r.Status != "queued" || r.StaleRequeueGeneration != firstGen {
 			t.Fatalf("cycle %d: status=%s stale_gen=%v, want queued and the preserved %v", n, r.Status, r.StaleRequeueGeneration, firstGen)
 		}
 		// The clocks were back-dated 3h before this cycle; the promotion must have reset both.
-		if recent := time.Now().Add(-time.Hour); !r.StatusSince.Valid || !r.StatusSince.Time.After(recent) ||
-			!r.UpdatedAt.Valid || !r.UpdatedAt.Time.After(recent) {
+		if !r.StatusSince.Valid || r.StatusSince.Time.Before(before) || r.StatusSince.Time.After(after) ||
+			!r.UpdatedAt.Valid || r.UpdatedAt.Time.Before(before) || r.UpdatedAt.Time.After(after) {
 			t.Fatalf("cycle %d: status_since=%v updated_at=%v, want both reset by the promotion", n, r.StatusSince, r.UpdatedAt)
 		}
 		fx.mustBlock(p, staleGrace, staleCeiling, "cycle "+strconv.Itoa(n)+": the provenance gate refuses the peer after the promotion")

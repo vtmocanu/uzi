@@ -1,6 +1,7 @@
 package workersvc
 
 import (
+	"fmt"
 	"reflect"
 	"testing"
 	"time"
@@ -155,21 +156,33 @@ func TestCodexProvenanceCrossCheckDeadlineControlLiveDB(t *testing.T) {
 	}
 }
 
-// The control that the paired child is otherwise claimable: the same fixture, generation 0, claimed
-// by the lane worker. Without it the no-row assertions above could be a hidden capability or slot gate.
+// Paired children are claimable by the lane worker on both the first claim and a
+// recorded-worker reclaim. These controls rule out a hidden capability, slot or reclaim gate.
 func TestCodexProvenanceCrossCheckPairedChildIsClaimableLiveDB(t *testing.T) {
 	for _, stage := range []string{"plan", "code"} {
-		t.Run(stage, func(t *testing.T) {
-			f, w := admissionCheckerBase(t, stage)
-			f, _ = admissionCheckerSubmit(t, f, w, stage, 0, nil)
-			p := laneClaim(t, f, "cross_check", nil)
-			if p == nil || p.RunID != f.runID.String() || p.ClaimGeneration != 1 {
-				t.Fatalf("paired generation-0 checker not claimed: %+v", p)
-			}
-			r := mustRun(t, f.env, f.runID)
-			if r.WorkerID != pgconv.UUID(f.workerID) {
-				t.Fatalf("claimed by %v, want lane worker", r.WorkerID)
-			}
-		})
+		for _, generation := range []int64{0, 1} {
+			t.Run(fmt.Sprintf("%s/generation_%d", stage, generation), func(t *testing.T) {
+				f, w := admissionCheckerBase(t, stage)
+				f, _ = admissionCheckerSubmit(t, f, w, stage, 0, nil)
+				if generation == 1 {
+					f.env.exec(`UPDATE runs SET claim_generation = 1, worker_id = $2,
+					claim_provenance_worker_id = $2, claim_provenance_generation = 1 WHERE id = $1`, f.runID, f.workerID)
+				}
+				p := laneClaim(t, f, "cross_check", nil)
+				if p == nil {
+					t.Fatalf("paired checker not claimed: run=%s old_generation=%d", f.runID, generation)
+				}
+				if p.RunID != f.runID.String() || p.ClaimGeneration != generation+1 {
+					t.Fatalf("paired checker claim: run=%s generation=%d, want run=%s generation=%d", p.RunID, p.ClaimGeneration, f.runID, generation+1)
+				}
+				r := mustRun(t, f.env, f.runID)
+				if r.WorkerID != pgconv.UUID(f.workerID) {
+					t.Fatalf("claimed by %v, want lane worker", r.WorkerID)
+				}
+				if r.ClaimProvenanceWorkerID != pgconv.UUID(f.workerID) || !r.ClaimProvenanceGeneration.Valid || r.ClaimProvenanceGeneration.Int64 != generation+1 {
+					t.Fatalf("stored provenance = (%v,%v), want (%s,%d)", r.ClaimProvenanceWorkerID, r.ClaimProvenanceGeneration, f.workerID, generation+1)
+				}
+			})
+		}
 	}
 }

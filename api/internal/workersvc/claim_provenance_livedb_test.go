@@ -95,8 +95,11 @@ func (fx *claimProvFix) claim(t *testing.T, id uuid.UUID) *ClaimPayload {
 func (fx *claimProvFix) firstClaimByA(t *testing.T) {
 	t.Helper()
 	p := fx.claim(t, fx.workerA)
-	if p == nil || p.Secrets.Codex == nil {
-		t.Fatalf("A's first claim delivered no Codex payload: %+v", p)
+	if p == nil {
+		t.Fatalf("A's first claim delivered no payload for run %s", fx.runID)
+	}
+	if p.Secrets.Codex == nil {
+		t.Fatalf("A's first claim has no Codex block: run=%s generation=%d", p.RunID, p.ClaimGeneration)
 	}
 	r := mustRun(t, fx.env, fx.runID)
 	if r.Status != "claimed" || r.ClaimGeneration != 1 || r.WorkerID != pgconv.UUID(fx.workerA) {
@@ -124,23 +127,29 @@ type claimSnapshot struct {
 	CapHash    string
 	Epoch      int64
 	Holds      string
-	CredEpochs int
-	Msgs       int
+	CredEpochs string
+	Msgs       string
 }
 
 func (fx *claimProvFix) snapshot(t *testing.T) claimSnapshot {
 	t.Helper()
 	r := mustRun(t, fx.env, fx.runID)
 	var holds string
-	if err := fx.env.pool.QueryRow(fx.env.ctx, `SELECT COALESCE(string_agg(id::text || '/' || generation || '/' || state, ',' ORDER BY id), '')
+	if err := fx.env.pool.QueryRow(fx.env.ctx, `SELECT COALESCE(jsonb_agg(jsonb_build_array(
+		id, generation, original_worker_id, live_worker_id, live_run_id, state) ORDER BY id)::text, '[]')
 		FROM recovery_custody_holds WHERE run_id = $1`, fx.runID).Scan(&holds); err != nil {
 		t.Fatal(err)
 	}
-	var cred, msgs int
-	if err := fx.env.pool.QueryRow(fx.env.ctx, `SELECT count(*) FROM run_credential_epochs WHERE run_id = $1`, fx.runID).Scan(&cred); err != nil {
+	var cred, msgs string
+	if err := fx.env.pool.QueryRow(fx.env.ctx, `SELECT COALESCE(jsonb_agg(jsonb_build_array(
+		run_id, claim_generation, secret_id, label, select_reason, applied_at) ORDER BY claim_generation)::text, '[]')
+		FROM run_credential_epochs WHERE run_id = $1`, fx.runID).Scan(&cred); err != nil {
 		t.Fatal(err)
 	}
-	if err := fx.env.pool.QueryRow(fx.env.ctx, `SELECT count(*) FROM run_messages WHERE run_id = $1`, fx.runID).Scan(&msgs); err != nil {
+	// Message payloads may contain secrets; compare only identity and routing metadata.
+	if err := fx.env.pool.QueryRow(fx.env.ctx, `SELECT COALESCE(jsonb_agg(jsonb_build_array(
+		id, seq, kind, agent, agent_instance, claim_generation, created_at, credential_epoch_ordinal) ORDER BY seq)::text, '[]')
+		FROM run_messages WHERE run_id = $1`, fx.runID).Scan(&msgs); err != nil {
 		t.Fatal(err)
 	}
 	return claimSnapshot{Generation: r.ClaimGeneration, CapHash: fmt.Sprintf("%x", r.CodexCapHash), Epoch: r.CodexClaimEpoch,

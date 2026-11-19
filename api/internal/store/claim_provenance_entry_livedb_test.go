@@ -79,13 +79,14 @@ func entryStatus(fx *rollAffinityFixture, run uuid.UUID, want string) {
 // or when the ceiling lapsed; a live peer then claimed the Codex run cold.
 func TestCodexProvenanceEntryStaleSweepLiveDB(t *testing.T) {
 	for _, tc := range []struct {
-		name          string
-		grace         time.Duration
-		ageAfterSweep time.Duration
+		name       string
+		grace      time.Duration
+		statusAge  time.Duration
+		updatedAge time.Duration
 	}{
-		{"grace_disabled", 0, 0},
-		{"grace_expired", staleGrace, 11 * time.Minute},
-		{"ceiling_lapsed", staleGrace, 40 * time.Minute},
+		{"grace_disabled", 0, 0, 0},
+		{"grace_expired", staleGrace, 11 * time.Minute, 11 * time.Minute},
+		{"ceiling_lapsed", staleGrace, time.Minute, 40 * time.Minute},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fx := newRollAffinityFixture(t)
@@ -106,8 +107,8 @@ func TestCodexProvenanceEntryStaleSweepLiveDB(t *testing.T) {
 			if !found {
 				t.Fatalf("the stale sweep did not requeue run %s", run)
 			}
-			if tc.ageAfterSweep > 0 {
-				fx.age(run, tc.ageAfterSweep, tc.ageAfterSweep)
+			if tc.updatedAge > 0 {
+				fx.age(run, tc.statusAge, tc.updatedAge)
 			}
 			fx.mustBlock(b, tc.grace, staleCeiling, "live peer B after the stale sweep ("+tc.name+")")
 			fx.mustClaim(a, run, tc.grace, staleCeiling, "recorded claimant A after the stale sweep")
