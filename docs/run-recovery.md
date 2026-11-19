@@ -2725,8 +2725,8 @@ source at a time, and keeps everything else:
   exclusive lock and refuses run admission. An unreadable store, an alternate
   outside the clone's own or managed bare object stores, a promisor remote, a
   config include, or a redirected `.git` stops the epoch scope as unknown instead. The managed
-  bare alternate used by a shared clone is admitted when it is worker-owned and not
-  group-writable. A group-writable managed bare (`2775` on a setgid data volume under the uid
+  bare alternate used by a shared clone is admitted when it is worker-owned and neither
+  group- nor world-writable; a world-writable store is always unknown. A group-writable managed bare (`2775` on a setgid data volume under the uid
   split) is admitted only when the worker's startup runner-group trust probe passed and the
   per-store ownership, ancestor, `core.sharedRepository`, filesystem and ACL checks all hold;
   otherwise it is unknown, as before. The ACL check runs `getfacl`, which the worker images
