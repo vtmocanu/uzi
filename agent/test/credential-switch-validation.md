@@ -1021,7 +1021,7 @@ on clauses that fit no proof class, and on the "not controlled" residues in
 the ledger's Clause-accounting table, could not reach a human. The lead's
 stated assumption is to record them all as unvalidated and uncredited, run
 m3.2 and m4, and request the owner's formal partial decision at completion.
-m3 stays open until that decision.
+The owner's partial decision (2026-11-19) defers m3; see "Owner partial decision and deferred m3 checklist (2026-11-19)".
 
 ## Final inventory (m4, 2026-11-18)
 
@@ -1091,7 +1091,7 @@ Crash points (U21 leaves, with the controls named in the ledger):
 | 2. API commit, reply lost | "Codex switch crash after apply commit loses auth response and recovers committed B"; `TestCodexApplyCommittedLostReplyLiveDB` (U12) | same four U21 controls; u12-replay-codex, u12-replay-nomaterial | partly credited | as U21 and U12 |
 | 3. After apply acknowledgment, before B login | "Codex switch crash after apply acknowledgement before B login recovers committed B" | same four U21 controls | partly credited | as U21; U6 crash controls ran through the crash-during-login publication only |
 | 4. During B login | "Codex switch crash during B login retains committed B"; U6 crash cases | same four U21 controls; u6-crash-missing-id, u6-crash-preserve-saved (u6-crash-preserve-attempt cause only) | partly credited | as U21 and U6 |
-| 5. Predecessor host unreachable | none | none | **unvalidated and uncredited** (owner decision recorded 2026-11-18, environmental limitation; its fail-closed premise is false cross-worker; a fresh owner decision is requested at completion) | The code does not enforce predecessor quiescence on cross-worker reclaim; recorded in "Decision 11 recovery controls and crash point 5". A fresh claim also goes through `expireCodexSwitchOnFreshClaim` (not found in ledger), which expires a still-pending switch from an older generation and is a no-op after an applied one, so B is still delivered. Fresh owner decision pending |
+| 5. Predecessor host unreachable | none | none | **unvalidated and uncredited** (owner decision recorded 2026-11-18, environmental limitation; its fail-closed premise is false cross-worker; owner partial decision 2026-11-19 defers m3 with the cross-worker path a known nonconformance) | The code does not enforce predecessor quiescence on cross-worker reclaim; recorded in "Decision 11 recovery controls and crash point 5". A fresh claim also goes through `expireCodexSwitchOnFreshClaim` (not found in ledger), which expires a still-pending switch from an older generation and is a no-op after an applied one, so B is still delivered. Deferred by the owner partial decision of 2026-11-19 |
 
 ### 3. PRD #1147 constraints
 
@@ -1113,7 +1113,7 @@ the plan's own; the last column is the ledger evidence.
 
 | Decision | What was decided | Evidence | What remains open |
 | --- | --- | --- | --- |
-| 11 | The runtime stays fail-closed: B is never used while predecessor quiescence is unproven; the run holds instead. Crash point 5 is a recorded owner scope decision, unvalidated and uncredited, with no option-B protocol work. This is the decision as recorded, not a description of the code across workers | "Decision 11 recovery controls and crash point 5 (2026-11-18)" above; ledger U21 and Clause-accounting rows for decision 11 and crash point 5 | Open on the cross-worker path: the code does not enforce it there (a new worker has no retained journal, so the `predecessor_capture` and `quiescence_failed` gate does not run and the run proceeds with B). The owner's crash point 5 decision is recorded, but its premise (the runtime stays fail-closed) does not hold across workers; a fresh owner decision is requested at completion. On the same-worker path the held outcome is a terminal `failed` report with clone and custody kept, not an owner pause |
+| 11 | The runtime stays fail-closed: B is never used while predecessor quiescence is unproven; the run holds instead. Crash point 5 is a recorded owner scope decision, unvalidated and uncredited, with no option-B protocol work. This is the decision as recorded, not a description of the code across workers | "Decision 11 recovery controls and crash point 5 (2026-11-18)" above; ledger U21 and Clause-accounting rows for decision 11 and crash point 5 | Open on the cross-worker path: the code does not enforce it there (a new worker has no retained journal, so the `predecessor_capture` and `quiescence_failed` gate does not run and the run proceeds with B). The owner's crash point 5 decision is recorded, but its premise (the runtime stays fail-closed) does not hold across workers; the owner partial decision of 2026-11-19 defers this as a known nonconformance, not an accepted residual. On the same-worker path the held outcome is a terminal `failed` report with clone and custody kept, not an owner pause |
 | 12 | Narrow exception: the renumber helper's adjacent `.renum.*` and `.renumber-tmp-*` transient paths are permitted for one step, with the ancestry and clean-tree guards intact | "Default-branch merge and migration renumber (2026-11-17)" above: command and EXIT=0, `find ... -name '.renum*'` empty afterwards, `git status --porcelain --ignored` on the migrations directory showing only the two renames, 00465 to 00466 and 00466 to 00467 | Nothing open for this step. The record's verification is the post-run check; no later renumber is covered by the exception |
 
 ### 5. Pending, not claimed
@@ -1128,8 +1128,8 @@ the plan's own; the last column is the ledger evidence.
   proof class, crash point 5, the cross-worker path of decision 11, and the two authorities with no Clause-accounting row and no ledger evidence: the owner-scoped usage refresh (`handleCodexUsageUnauthorized`) and the fresh-claim pending expiry (`expireCodexSwitchOnFreshClaim`), both unvalidated and uncredited. The owner's case 5
   decision (unvalidated and uncredited, environmental limitation) is recorded,
   but it rested on the runtime staying fail-closed, which the code does not
-  hold across workers; a fresh owner decision is requested at completion. m3
-  stays open until that decision.
+  hold across workers. The owner partial decision of 2026-11-19 defers m3 and
+  these residues; see "Owner partial decision and deferred m3 checklist (2026-11-19)".
 - Optional deferred doc notes from the last review round (not applied here):
   - the affinity pin can also be released by a forge-origin cooldown
     (`fn_forge_origin_owner_pins`), and the case 5 texts do not list it;
@@ -1178,13 +1178,13 @@ Decision 11's fail-closed requirement stands: the current cross-worker
 recovery path is a **known nonconformance**, not an accepted residual.
 
 Each unchecked item is carried from the ledger's Clause-accounting table
-(`agent/test/credential-switch-proof-ledger.md`, "Clause accounting") or from
-section 5 above. Credited parts of each row stay credited as recorded there.
+(`agent/test/credential-switch-proof-ledger.md`, "Clause accounting"), the
+U table and crash-point table of section 2, or sections 3 and 5 above. Credited parts of each row stay credited as recorded there.
 
 ### Deferred m3 checklist (unvalidated, uncontrolled or unclassified)
 
 - [ ] Admission refusals: pool_wait, terminal statuses, pinned-without-secret,
-      lane, no-live-worker, unsupported-worker and foreign-subscription targets.
+      lane, no-live-worker, unsupported-worker and foreign-subscription refusals.
 - [ ] Same flight/generation/worktree: effects beyond the five U2 injections and
       the fresh_B return.
 - [ ] Strict persistence: pending-absent-before, other ownership legs, the
@@ -1209,7 +1209,8 @@ section 5 above. Credited parts of each row stay credited as recorded there.
       path, and cross-generation spend joins.
 - [ ] Rollback/replay/fences: preflight's own non-owner refusal, the validator
       replay copy, Step 1 worker check, apply Step 0 copies, other fence
-      conjuncts, the stamp checks, target sub-checks and old-alias refusals.
+      conjuncts, the stamp checks, target sub-checks and old-alias refusals; the apply-path non-owner refusal
+      copies are not isolated.
 - [ ] Stopped negotiation: the runner's own admission check, fence/Step 0
       negotiation copies, null-heartbeat and registration sub-conjuncts, the
       in-place conjunct, identical-tuple replay, first-READY latch, the
@@ -1219,7 +1220,8 @@ section 5 above. Credited parts of each row stay credited as recorded there.
       under the cutoff and the cutoff's run correlation.
 - [ ] Wall budget: the RunTimeout value, the future-started_at clamp and the
       production default.
-- [ ] Stopped nonce: a NULL snapshot nonce; claim generation: the reconciled
+- [ ] Stopped nonce: a NULL snapshot nonce and the UTF-8 check at the route
+      (supporting only, uncredited); claim generation: the reconciled
       `*g <= 0` copy.
 - [ ] Stopped binding identity beyond ownership (no predicate clause).
 - [ ] Stopped ownership/policy: paused-origin replay under concurrency, op-less
@@ -1230,12 +1232,26 @@ section 5 above. Credited parts of each row stay credited as recorded there.
 - [ ] Stopped request: other statuses, the envelope key count, null/missing fields
       and case aliases beyond D25–D56.
 - [ ] Decision 11 (same worker): other auth directions, the `kind` half of the
-      gate, the re-hold variant, and observable discard of delivered material.
+      gate, the re-hold variant, observable discard of delivered material, and
+      zero executor bodies, provider launches and requests before the proof
+      (asserted only).
 - [ ] Token absence: the executor's second log registration and the surfaces
-      that are guardless by construction.
+      that are guardless by construction; `flight.runScopedSecrets.push`; the
+      withdrawn target's and both secrets' absence from the stopped
+      acknowledgement, server log, run messages and inputs (asserted only).
+- [ ] Publication (U20): plan and intent summaries (untested); wait-time
+      effect unmeasured.
+- [ ] Crash point 3: U6 crash controls ran through the crash-during-login
+      publication only.
 - [ ] PRD #1147: a control for the subscription-to-paid-key direction
-      specifically, and an apply-request-shape control showing no secret id.
-- [ ] Clauses that fit no proof class (listed as "owner batch" in the ledger).
+      specifically, an apply-request-shape control showing no secret id, and
+      evidence for concurrent runs on one subscription with no seat lock
+      (reviewer check, not evidenced).
+- [ ] Clauses that fit no proof class ("owner batch" in the ledger): beyond the
+      binding-identity and guardless token-surface lines above, the ledger's
+      U15/U19 owner-batch prose (cross-user worker, egress-lane laneMismatch,
+      the two `GetRunOwnedByWorkerForUpdate` copies, and the uncredited
+      token surfaces).
 - [ ] Two unledgered authorities, with no Clause-accounting row and no ledger
       evidence: the owner-scoped usage refresh (`handleCodexUsageUnauthorized`)
       and the fresh-claim pending expiry (`expireCodexSwitchOnFreshClaim`).
@@ -1249,8 +1265,9 @@ section 5 above. Credited parts of each row stay credited as recorded there.
 
 ### Still pending outside m3
 
-- [ ] Landing obligation: `full agent suite: exact-head PR CI`, and the
-      exact-head run-store-it LiveDB sweep (test-api-store-it /
-      test-livedb-workersvc).
+- [ ] Landing obligations (exact-head PR CI): full agent suite; the run-store-it
+      LiveDB sweep (test-api-store-it / test-livedb-workersvc); `test:api`
+      (including `api/internal/capability`, not run with -race in-run),
+      `test:web` and `test:web-browser`.
 - [ ] Owner acceptance: live cross-account `thread/resume` on two real Codex
       accounts, not verified.
