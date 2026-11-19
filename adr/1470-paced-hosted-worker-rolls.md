@@ -86,6 +86,63 @@ confirm an identical non-nil marker without an artificial no-op revision advance
 changed markers and cancellation require confirmed revision advance. This
 handoff is not an additional journal and preserves legacy /data self-heal.
 
+#### Lost-canary adoption (#4466)
+
+When a pool has incomplete participant reservations but no canary (annotation
+reset, canary Deployment recreated), the controller may adopt one existing
+participant as canary instead of holding the pool for explicit recovery. The
+chosen participant must pass the unchanged promotion proof (D4: fresh
+registration with a new nonce, exact version, current pod UID/ancestry,
+heartbeat, coverage, and no pressure, maintenance or custody-drain fence), be on
+its reserved template with exactly one replica, not drift, and carry no claim
+mirror. The smallest worker ID wins. Only its marker's `canary` bit changes, by
+one metadata patch conditioned on the Deployment UID/resourceVersion; nonce,
+previous version, target, coverage and `completed=false` are preserved. No
+registration evidence is fabricated, nothing is completed, no peer is cleaned
+up and no cordon changes.
+
+Adoption needs a clean observation: no blocked or pin-changed pool; no write to
+any pool worker earlier in the same tick (reservation, claim mirror, drain
+release); no duplicate Deployments for a worker ID and no stray annotated
+Deployment in the namespace; no unplanned worker in scope; no uncertain,
+migration or layout fence; no hibernating, unavailable or unattributed
+reservation evidence; and no out-of-pool canary of the same owner and lane.
+
+The tick is adoption-only: the pool's planning ends after the write and its
+coverage is fenced, so no replacement, PVC or replica change happens that tick.
+Normal promotion, coverage and concurrency rules resume after re-observation. A
+conflicting or unconfirmed write keeps the pool closed until a fresh
+observation.
+
+Selection is restart-safe through two predicates. A participant is a
+*candidate* when it could be adopted now. It is *patch-fenced* when a delayed
+adoption patch for it can no longer commit, judged only from the currently
+observed Deployment: absent, terminating, replicas non-nil and not 1, template
+hash or image different from the marker, or marker absent or completed. Each of
+these implies a write to or removal of that Deployment, so an outstanding
+patch's UID/resourceVersion precondition fails. That precondition is carried by
+the request, not stored, and is unrecoverable after a restart; the marker
+records no Deployment UID and none is added. Not fencing: desired-state drift
+(for example generation rotation), target-version changes, claim mirrors,
+pod, heartbeat or cordon evidence, nil replicas, and a same-name Deployment
+recreated candidate-shaped (this errs toward holding). If any smaller-ID
+incomplete participant is neither candidate nor patch-fenced, the pool holds
+with "earlier participant may hold an unresolved adoption request".
+
+The invariant is that while orphaned, the controller writes blocked
+participants' Deployments only through metadata reservation writes that never
+undo a fence. An out-of-contract actor (an external edit, `forceRoll`) can still
+produce two canaries; the unchanged duplicate-canary hold keeps that pool
+closed.
+
+This deviates from "adopt the smallest eligible participant": adoption holds
+while an earlier participant is unresolved, and clears automatically once that
+participant regains proof or its Deployment changes. The
+layout-migration hold has a matching fence: a held canary keeps its incomplete
+reservation and fences the pool while incomplete same-cohort participants
+remain, instead of cancelling it, because cancelling would leave those
+participants without a canary.
+
 ### D4 — Promotion proves the current incarnation
 
 The promotion boundary in `controller/internal/kube/roll_pacing.go` requires:
@@ -296,6 +353,8 @@ API-server ordering/conflict rejection and hosted retained-fleet availability
 remain **open**. Local health/report persistence and retained-N-1 claim replay
 checks do not establish real API-server behavior or production availability.
 The existing KinD smoke disables the controller and covers the envelope only.
+Lost-canary adoption (#4466) is proven only against the simulated API server;
+real-API-server and hosted coverage of it stays with #3346.
 The
 [maintainer runbook](../docs/hosted-worker-roll-verification.md) defines the open
 bad-tag/good-tag, restart, delayed-write, nonce and recovery checks.
