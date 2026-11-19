@@ -44,7 +44,7 @@ docker compose --profile agent up    # additionally start a worker (needs join t
                         # `down -v` and never `-p uzi`.
 ```
 
-- **Read `run-e2e.sh`'s summary table, not its cleanup line.** A phase whose end-of-phase boundary finds undeclared residue (a non-terminal run, a worker row or an open custody hold) is a `FAIL` row, and every later row of a phase that ran afterwards carries ` [ran after contaminated boundary: <slug>]`; a `FAIL` row keeps the rundir and fails the suite (`e2e/README.md`, *End-of-phase boundary*).
+- **Read `run-e2e.sh`'s summary table.** Undeclared residue (a non-terminal run, worker row or open custody hold) still present when a phase's end-of-phase boundary ends, or an unverifiable boundary read, makes that phase a `FAIL` row; later rows carry ` [ran after contaminated boundary: <slug>]` (`e2e/README.md`, *End-of-phase boundary*).
 
 ### smoke.sh recipe
 

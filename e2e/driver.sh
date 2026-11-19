@@ -18,7 +18,7 @@
 #                    `|| true` throughout so a missing/short COMPOSE never reddens a run)
 #
 # KNOBS: PHASES_DIR (default $ROOT/e2e/phases), E2E_ONLY / E2E_SKIP (comma-lists
-#        of slug globs), E2E_FAULT_PHASE, E2E_BOUNDARY_TIMEOUT (seconds the
+#        of slug globs), E2E_FAULT_PHASE, and the hermetic-test-only E2E_BOUNDARY_TIMEOUT (seconds the
 #        end-of-phase boundary may wait for NEW residue to settle; default 120) and
 #        E2E_BOUNDARY_INTERVAL (seconds between samples; default 1). A value that
 #        is not a positive integer falls back to its default.

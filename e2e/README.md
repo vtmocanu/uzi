@@ -169,8 +169,10 @@ the deadline passes:
 - **Owner open custody holds** that were not open at phase start and are not declared by
   `# handoff-holds:`. These must settle (be released).
 
-All of it shares one **120 s deadline** per boundary (`E2E_BOUNDARY_TIMEOUT`, sampled every
-`E2E_BOUNDARY_INTERVAL`, default 1 s). There is **no SQL fallback**: an unverifiable read,
+The end-of-phase wait shares one **120 s deadline** (`E2E_BOUNDARY_TIMEOUT`, sampled every
+`E2E_BOUNDARY_INTERVAL`, default 1 s); every read and cancel gets only the remaining seconds.
+The phase-start snapshot adds two reads bounded to 10 s each, and a failed boundary one
+5 s history read, so one boundary is bounded by about 145 s (20 + 120 + 5) plus on-red artifact capture. There is **no SQL fallback**: an unverifiable read,
 a rejected cancel or an unusable phase-start snapshot is itself a FAIL, never a silent
 DB write. Residue still present in the last sample, or any such error, FAILs the phase
 (the body's own row when the body failed too, with `(declarations unavailable: body
@@ -190,20 +192,22 @@ Declarations are phase-header lines naming variables the body set, not values:
   after its cancel). A phase that declares nothing must leave nothing.
 
 **Known residue.** Residue a failed boundary reports becomes *known*: later boundaries
-sample it once and still FAIL while it is present, but do not wait for it again. Such an
+still sample it and FAIL while it is present, but never wait for it (a boundary with only
+known residue takes a single sample). Such an
 item is reported as `still present from <slug>` (the phase whose boundary first reported
 it). Every later row of a phase that ran after a failed boundary is annotated
-` [ran after contaminated boundary: <slug>]` (a SKIP, and a requires-miss FAIL that never
+` [ran after contaminated boundary: <slug>[ <slug>...]]` (a SKIP, and a requires-miss FAIL that never
 ran its body, are not), because a clean-looking result after a dirty boundary is not
 trustworthy evidence.
 
 Evidence: summary.md has a `## Boundary waits` table (phase, start_secs for the
 phase-start reads, end_secs for the end-of-phase wait, total_secs) and a
 `Total boundary seconds` sum. Per-boundary samples and reads are staged under
-`$RUNROOT/boundary/<NN-slug>/` and copied to `artifacts/<NN-slug>/boundary/` for a FAIL
-phase. `E2E_BOUNDARY_TIMEOUT` and `E2E_BOUNDARY_INTERVAL` are knobs for the hermetic
-driver test only; `run-e2e.sh` does not pass them through its `env -i` allowlist, so a real
-run always uses the defaults.
+`$RUNROOT/boundary/<NN-slug>/` and copied to `artifacts/<NN-slug>/boundary/` for a phase
+whose boundary FAILed. `E2E_BOUNDARY_TIMEOUT` and `E2E_BOUNDARY_INTERVAL` are knobs for the hermetic
+driver test only; `run-e2e.sh` does not pass them through its `env -i` allowlist, so a normal
+run uses the defaults (only invoking the internal `--e2e-sanitized` re-exec flag by hand
+skips that allowlist).
 
 ## Live-DB candidate-selection test (`run-store-it.sh`)
 

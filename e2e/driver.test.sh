@@ -480,7 +480,7 @@ end
 
 # ============================================================================
 # Case 10 — no capture on an all-GREEN run: neither artifacts/ nor .keep-rundir.
-# Mutation: capture on every phase (not just FAIL/LEAK) -> artifacts/ appears green.
+# Mutation: capture on every phase (not just FAIL) -> artifacts/ appears green.
 begin "case10: no capture on GREEN" 10
 mkphase "$PHASES_DIR/10-greenA.sh" "green A" no "" "" "" <<'BODY'
 pass "all good A"
@@ -1073,7 +1073,7 @@ end
 
 # ============================================================================
 # Case 31 — knobs: a non-positive-integer E2E_BOUNDARY_TIMEOUT falls back to 120, and the
-# runtime state is left clean (no stray LEAK anywhere).
+# runtime state is left clean (no stray LEAK status anywhere: that status was removed).
 # Mutation: honour 'abc' as 0 / drop the fallback -> the settlement bound is not 120.
 begin "case31: invalid E2E_BOUNDARY_TIMEOUT falls back to the 120s default" 31
 export E2E_BOUNDARY_TIMEOUT=abc
