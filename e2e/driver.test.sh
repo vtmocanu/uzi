@@ -1153,8 +1153,61 @@ BODY
 run_driver 32d
 has_row lastsleep FAIL || bad "not FAIL: $(cat "$TSV")"
 contains "$(row_msg lastsleep FAIL)" "not settled within 3s" || bad "message: $(row_msg lastsleep FAIL)"
-[ "$(qcount workers)" -eq 2 ] || bad "expected 2 worker samples, got $(qcount workers)"
-[ "$(bw_field lastsleep 3)" -eq 2 ] || bad "end_secs should be 2 (no final sleep), got $(bw_field lastsleep 3)"
+[ "$(qcount workers)" -eq 3 ] || bad "expected 3 worker samples (one final in-budget sample), got $(qcount workers)"
+[ "$(bw_field lastsleep 3)" -eq 2 ] || bad "end_secs should be 2 (no sleep past the deadline), got $(bw_field lastsleep 3)"
+end
+
+# Case 35a (cross-check) — residue that settles in the final, shorter-than-an-interval
+# window before the deadline is observed, so the phase PASSes rather than timing out early.
+# Mutation: stop as soon as remaining <= interval -> the third sample never runs -> FAIL.
+begin "case35a: residue settling in the final window before the deadline PASSes" 35a
+export E2E_BOUNDARY_TIMEOUT=3 E2E_BOUNDARY_INTERVAL=2
+seqf workers "$W1|$R1|1" "$W1|$R1|1" "-"
+mkphase "$PHASES_DIR/10-lastwin.sh" "worker row settles late" no "" "" "" <<'BODY'
+pass "body ok"
+BODY
+run_driver 35a
+has_row lastwin PASS || bad "settled-in-final-window phase not PASS: $(cat "$TSV")"
+[ "$(qcount workers)" -eq 3 ] || bad "expected 3 worker samples, got $(qcount workers)"
+end
+
+# Case 35b (cross-check) — one handoff-holds variable may hold several whitespace-separated
+# hold UUIDs; each is declared. A non-UUID token in the list is still malformed.
+# Mutation: validate the whole value as one UUID -> the two-ID phase FAILs as malformed.
+begin "case35b: a handoff-holds variable with several hold IDs declares each" 35b
+seqf holds "-" "$H1|$R1|1;$H2|$R2|1"
+mkphase "$PHASES_DIR/10-multi.sh" "two declared holds" no "" "" "" "" HOLDS_X <<BODY
+HOLDS_X="$H1 $H2"
+pass "body ok"
+BODY
+mkphase "$PHASES_DIR/11-badtok.sh" "one bad token" no "" "" "" "" HOLDS_Y <<BODY
+HOLDS_Y="$H1 not-a-uuid"
+pass "body ok"
+BODY
+run_driver 35b
+has_row multi PASS || bad "two declared holds did not PASS: $(cat "$TSV")"
+has_row badtok FAIL || bad "bad token not FAIL: $(cat "$TSV")"
+contains "$(row_msg badtok FAIL)" "malformed declaration HOLDS_Y" || bad "message: $(row_msg badtok FAIL)"
+end
+
+# Case 35c (cross-check) — a KNOWN hold that released before a later failed boundary is still
+# in that boundary's release-history read (it is neither residue nor baseline any more).
+# Mutation: build the history set from current residue and baseline only -> H1 missing.
+begin "case35c: release history includes known holds that have disappeared" 35c
+export E2E_BOUNDARY_TIMEOUT=2
+seqp 10-aleak holds "-" "$H1|$R1|1"
+seqp 11-bleak holds "-"
+seqp 11-bleak workers "$W1|$R2|1"
+seqf history "$H1|$R1|1|released|published|ev-1"
+mkphase "$PHASES_DIR/10-aleak.sh" "A leaks a hold" no "" "" "" <<'BODY'
+pass "body ok"
+BODY
+mkphase "$PHASES_DIR/11-bleak.sh" "B leaks a worker row" no "" "" "" <<'BODY'
+pass "body ok"
+BODY
+run_driver 35c
+has_row bleak FAIL || bad "bleak not FAIL: $(cat "$TSV")"
+contains "$(awk -F'\t' '$2=="11-bleak" && $3=="history"{print $6}' "$QL")" "'$H1'" || bad "B's history read omits the known hold $H1"
 end
 
 # Case 32e — a failed body whose boundary is clean keeps the boundary's settled-cancel note
