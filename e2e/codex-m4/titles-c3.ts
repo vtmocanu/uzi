@@ -33,7 +33,7 @@ export const CODEX_U_SIGNAL_ORIGIN_TITLE =
 export const CODEX_U_SIGNAL_REPLAY_TITLE =
   "codex U workflow signals: a replayed callback identity returns the cached terminal and a changed-payload reuse poisons, with no second effect";
 export const CODEX_U_TRUST_CONSTRUCTION_TITLE =
-  "codex U trust: production start/resume/turn construction pins the project untrusted with project_doc_max_bytes=0 and every native feature disabled, taking no repo AGENTS.md/.codex input";
+  "codex U trust: production start/resume/turn construction pins the project untrusted with project_doc_max_bytes=0 and fixed suppression settings, taking no repo AGENTS.md/.codex input";
 
 /** One evidence title per serial model/scenario case, also consumed by strict completeness. */
 export const NATIVE_PATCH_INERT_TITLES: Readonly<Record<string, string>> = Object.fromEntries(

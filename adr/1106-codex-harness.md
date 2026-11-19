@@ -1466,3 +1466,53 @@ record gains two weekly-reset fields and the reasons `auto_soonest_reset`,
 `auto_only_qualified` and `auto_fallback`. The decision runs under the same
 shared secret-mutation lock and creation fence described above. See
 [ADR-3845](3845-limit-aware-automatic-harness.md).
+
+## Adoption record: native patch execution denial (#4509, 2026-11-19)
+
+At pin 0.167.0, `apply_patch_freeform` is removed/ignored and model catalog
+metadata overrides `code_mode` / `code_mode_only`. Native `apply_patch` remains
+advertised under the run code-mode host. False config entries are useful
+construction checks, not proof that those native surfaces disappeared.
+Registration is not execution authority.
+
+Execution denial combines explicit `environments: []` at root `thread/start`
+and `turn/start` with launcher `CODEX_EXEC_SERVER_URL=none` in the replaced
+environment. Run, child, advice and cross-check turns select the empty list,
+including cold resumed turns. `thread/resume` has no `environments` field;
+the subsequent turn reasserts `[]`. Supported extension/hook suppression,
+project trust and document suppression, worker callback/broker authority and
+#1566 native async questions/read-only UTC exceptions remain unchanged. This
+adoption neither replaces the vendor model catalog nor changes worker callback
+admission. It does not assert that a native bypass was found.
+
+### Evidence and limits
+
+The real-binary [native-patch-inert matrix](../e2e/codex-m4/native-patch-inert.test.ts)
+covers the four curated models on fresh and truly cold roots (old root disposed,
+new PID/transport, retained thread). Nested and direct native patch attempts
+both return `No usable execution environment is available` at this pin. After
+each attempt, no marker exists and worker callbacks, spawns and fileops remain
+zero; subsequent nested worker patch and exec controls pass. Two independent
+omission fixtures remove resumed-turn selection or the launcher guard separately.
+Per-site request-contract mutations check the construction boundary separately.
+
+The matrix checks a finite exact inventory per model, including nested tools.
+Goal/resource utility names are registered inventory only, not grants of worker
+effects. `gpt-5.6-sol` omits the async and UTC helpers shown by the other curated
+models. The legacy [native-bypass probes](../e2e/codex-m4/native-bypass.test.ts)
+retain their representative top-level inventory assertion; they do not prove
+nested patch absence. P-layer protocol evidence uses injected OS seams: it is
+neither packaged OS isolation nor exhaustive proof about native OS effects.
+The [archived #4321 evidence](../prds/done/4321-codex-provider-spike.md)
+is background; this record states the current adoption boundary.
+
+### Local timing evidence (2026-11-19)
+
+`task test:codex-m4` exited 0 on baseline `be14e538a` in 57 seconds and on
+candidate `18b9a95d2` in 135 seconds (260 tests, 0 skips, 38 clauses, 80 executed
+evidence rows). These are dated local measurements, not durable test-count
+requirements. The 16 new cases took roughly 30 seconds in a focused run. The full 78-second delta cannot be attributed
+solely to those cases: concurrent reviews/scans and cache effects were not isolated.
+M4 runs serially in one agent shard, so its elapsed time contributes to that
+shard's critical path. Hosted shard/job critical-path, queue, rerun and cache
+contributions remain unmeasured.
