@@ -148,6 +148,26 @@ func New(client kubernetes.Interface, cfg RenderConfig, resolver preset.Resolver
 	return &Materializer{client: client, cfg: cfg, resolver: resolver, cordoner: cordoner, drain: drain, recycle: recycle, log: log, now: time.Now}
 }
 
+// resolveWorker is the ONE place a desired worker becomes a preset.Spec (PRD #4213):
+// it uses the integers the api sent on DesiredWorker.Resources when present, else the
+// compiled-in builtin for the size name. Every render, hash and PVC-size path goes
+// through it, so a size edit reaches the pod template, the spec-hash and the claims
+// identically; resolve_guard_test.go fails the build on any other resolver.Resolve call.
+func (m *Materializer) resolveWorker(w protocol.DesiredWorker) (preset.Spec, error) {
+	var res *preset.Resources
+	if r := w.Resources; r != nil {
+		res = &preset.Resources{
+			CPURequestMillicores: r.CPURequestMillicores,
+			CPULimitMillicores:   r.CPULimitMillicores,
+			MemoryRequestMiB:     r.MemoryRequestMiB,
+			MemoryLimitMiB:       r.MemoryLimitMiB,
+			DataGiB:              r.DataGiB,
+			DinDDataGiB:          r.DinDDataGiB,
+		}
+	}
+	return m.resolver.ResolveDesired(w.Template, w.Size, res)
+}
+
 // Observe lists the worker namespace and partitions it by PROVENANCE.
 //
 // No label selector on the list, deliberately: an orphan is by definition an object
@@ -764,7 +784,7 @@ func (m *Materializer) Reconcile(ctx context.Context, desired []protocol.Desired
 				// Independent fenced maintenance and mutation-free wake settlement
 				// are allowed even while image admission waits.
 				if ns, err := m.cfg.Placement(w); err == nil {
-					if spec, err := m.resolver.Resolve(w.Template, w.Size); err == nil {
+					if spec, err := m.resolveWorker(w); err == nil {
 						if e.blocked == "" {
 							var err error
 							if w.Hibernation != nil && w.Hibernation.State == protocol.HibernationWaking {
@@ -1111,7 +1131,7 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 		return nil
 	}
 
-	spec, err := m.resolver.Resolve(w.Template, w.Size)
+	spec, err := m.resolveWorker(w)
 	if err != nil {
 		if preset.IsUnknown(err) {
 			// Log and skip RENDERING. The worker stays desired (see Reconcile's contract),

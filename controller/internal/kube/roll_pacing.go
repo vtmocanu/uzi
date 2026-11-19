@@ -214,7 +214,7 @@ func (m *Materializer) planRoll(ctx context.Context, desired []protocol.DesiredW
 			t.unplanned = append(t.unplanned, unplannedWorker{id: w.ID})
 			continue
 		}
-		spec, err := m.resolver.Resolve(w.Template, w.Size)
+		spec, err := m.resolveWorker(w)
 		if err != nil {
 			t.unplanned = append(t.unplanned, unplannedWorker{id: w.ID, ns: ns, nsKnown: true})
 			continue
@@ -1287,7 +1287,7 @@ func (m *Materializer) releasePressureHold(ctx context.Context, t *rollTick, e *
 		e.dep.Spec.Replicas == nil || *e.dep.Spec.Replicas != 1 {
 		return
 	}
-	spec, err := m.resolver.Resolve(w.Template, w.Size)
+	spec, err := m.resolveWorker(w)
 	if err != nil || !e.o.HasNixPVC || e.o.NixPVCSize == nil || e.o.NixPVCSize.Cmp(spec.NixSize) < 0 ||
 		!e.o.HasDataPVC || !e.o.DataPVCLive || (w.Docker && (!e.o.HasDinDDataPVC || !e.o.DinDPVCLive)) {
 		return
@@ -1372,7 +1372,7 @@ func (m *Materializer) maintenanceDespiteBusy(ctx context.Context, w protocol.De
 	if e := rollFrom(ctx, w.ID); e != nil && (e.drift || (e.marker != nil && !e.marker.Completed) || (e.rawReservation && e.marker == nil)) {
 		return false
 	}
-	spec, err := m.resolver.Resolve(w.Template, w.Size)
+	spec, err := m.resolveWorker(w)
 	if err != nil {
 		return false
 	}

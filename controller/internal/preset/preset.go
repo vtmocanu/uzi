@@ -1,12 +1,18 @@
 // Package preset is the controller's authority on what a hosted worker's pod spec
 // actually contains (PRD #58 Decisions 1 and 7).
 //
-// The api sends NAMES — a template ("base") and a size ("m") — and never a
-// quantity, an image, or anything else a pod spec is made of. That is not a
-// stylistic split: the api holds zero kube-apiserver access, and the moment it
-// ships resolved values it becomes the authority on a pod spec it is not allowed to
-// know anything about. So every mapping from a name to a concrete value lives here,
-// in the component that already holds the cluster credential.
+// The api sends NAMES — a template ("base") and a size ("m") — and never an image or
+// anything else a pod spec is made of. That is not a stylistic split: the api holds
+// zero kube-apiserver access, and the moment it ships resolved values it becomes the
+// authority on a pod spec it is not allowed to know anything about. So every mapping
+// from a template name to an image lives here, in the component that already holds
+// the cluster credential.
+//
+// SIZES ARE THE EXCEPTION (PRD #4213 reverses Decision 7 for sizes only): admins edit
+// sizes in the api, so a DesiredWorker carries its size's plain integers (millicores,
+// MiB, GiB) and ResolveDesired builds every quantity from them. The compiled-in
+// `sizes` table remains the builtin default and the fallback for an older api that
+// sends only the name (Resolve).
 //
 // TWO TABLES, TWO GOLDENS, ONE FAILURE MODE. Both `sizes` and `templateImages` are
 // resolved against names the api independently validates, so both skew identically:
@@ -244,6 +250,88 @@ func (r Resolver) Resolve(template, size string) (Spec, error) {
 	return Spec{
 		Image:   fmt.Sprintf("%s/%s:%s", r.repo, image, r.tag),
 		Size:    sz,
+		NixSize: nixSize,
+	}, nil
+}
+
+// Resources is one size's resolved quantities as plain integers (PRD #4213): CPU in
+// millicores, memory in MiB, disks in GiB. It mirrors protocol.SizeResources; the kube
+// package converts, so this package stays free of the wire types.
+type Resources struct {
+	CPURequestMillicores int64
+	CPULimitMillicores   int64
+	MemoryRequestMiB     int64
+	MemoryLimitMiB       int64
+	DataGiB              int64
+	DinDDataGiB          int64
+}
+
+// Sanity bounds on the integers a size may carry. They exist so the shifts and the
+// quantity arithmetic below cannot overflow; they are not the operator ceilings.
+const (
+	maxMillicores = 64000
+	maxMiB        = 524288
+	maxGiB        = 2048
+)
+
+// InvalidResourcesError is the typed refusal for integers that are non-positive or
+// large enough to be overflow-prone. Never a partial Spec.
+type InvalidResourcesError struct {
+	// Field is the offending Resources field name.
+	Field string
+	Value int64
+	Max   int64
+}
+
+func (e *InvalidResourcesError) Error() string {
+	return fmt.Sprintf("invalid size resources: %s=%d must be between 1 and %d", e.Field, e.Value, e.Max)
+}
+
+func (r Resources) validate() error {
+	for _, f := range []struct {
+		name string
+		v    int64
+		max  int64
+	}{
+		{"cpu_request_millicores", r.CPURequestMillicores, maxMillicores},
+		{"cpu_limit_millicores", r.CPULimitMillicores, maxMillicores},
+		{"memory_request_mib", r.MemoryRequestMiB, maxMiB},
+		{"memory_limit_mib", r.MemoryLimitMiB, maxMiB},
+		{"data_gib", r.DataGiB, maxGiB},
+		{"dind_data_gib", r.DinDDataGiB, maxGiB},
+	} {
+		if f.v <= 0 || f.v > f.max {
+			return &InvalidResourcesError{Field: f.name, Value: f.v, Max: f.max}
+		}
+	}
+	return nil
+}
+
+// ResolveDesired is Resolve for a desired worker that may carry its size's integers.
+// With res non-nil every quantity is built from the integers alone (no per-field
+// fallback to the compiled-in table); with nil it is exactly Resolve, so an older api's
+// worker resolves as before and a non-builtin name is an UnknownError on "size".
+func (r Resolver) ResolveDesired(template, size string, res *Resources) (Spec, error) {
+	if res == nil {
+		return r.Resolve(template, size)
+	}
+	image, ok := templateImages[template]
+	if !ok {
+		return Spec{}, &UnknownError{Field: "template", Value: template}
+	}
+	if err := res.validate(); err != nil {
+		return Spec{}, err
+	}
+	return Spec{
+		Image: fmt.Sprintf("%s/%s:%s", r.repo, image, r.tag),
+		Size: Size{
+			CPURequest:    *resource.NewMilliQuantity(res.CPURequestMillicores, resource.DecimalSI),
+			CPULimit:      *resource.NewMilliQuantity(res.CPULimitMillicores, resource.DecimalSI),
+			MemoryRequest: *resource.NewQuantity(res.MemoryRequestMiB<<20, resource.BinarySI),
+			MemoryLimit:   *resource.NewQuantity(res.MemoryLimitMiB<<20, resource.BinarySI),
+			DataSize:      *resource.NewQuantity(res.DataGiB<<30, resource.BinarySI),
+			DinDDataSize:  *resource.NewQuantity(res.DinDDataGiB<<30, resource.BinarySI),
+		},
 		NixSize: nixSize,
 	}, nil
 }

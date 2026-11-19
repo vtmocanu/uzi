@@ -514,6 +514,7 @@ func (l *Loop) report(ctx context.Context, observed []ObservedWorker, desired []
 		WorkerImageTag:      l.workerImageTag,
 		Workers:             workers,
 		Hibernation:         protocol.HibernationProtocolVersion,
+		AdminSizes:          protocol.AdminSizesProtocolVersion,
 	}
 	if err := l.reporter.Report(ctx, report); err != nil {
 		l.log.Warn("reporting roll health failed; reconciliation is unaffected", "error", err, "workers", len(workers))
