@@ -187,7 +187,8 @@ prints `ok`, so a new live-DB test in an eleventh package must add that package 
 
 The script runs each package in a separate Go invocation against the same DSN,
 appending to one log for the aggregate and per-package guards. Each invocation has
-a 10-minute timeout except `store` and `handler` (20 minutes each) and `workersvc` (45 minutes).
+a 10-minute timeout except `store` (30 minutes, raised for headroom in #4502), `handler`
+(20 minutes) and `workersvc` (45 minutes).
 With artifact admission coverage, the worker-service suite took nearly 18 minutes
 in isolation and integrated sweeps exhausted 20 minutes. The local helper's larger
 bounded deadline provides headroom; it changes no test selection, race checking,

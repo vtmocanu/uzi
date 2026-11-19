@@ -216,11 +216,19 @@ LOG="$(mktemp "${TMPDIR:-/tmp}/uzi-store-it-log.XXXXXX")" || {
 # exhausted workersvc's cumulative 30m budget before completion (the last test
 # passes in isolation); allow 45m for the complete inventory. The #3343 baseline
 # also exhausted store's 10m budget after 525 passing cases; its then-running test
-# passes in isolation. Store and handler get 20m. Selection, assertions, race/skip
-# checks and serialization stay the same. Other packages reset to 10m each iteration.
+# passes in isolation, so store got 20m (handler already had 20m from #3055).
+# #4502 then saw store hit that
+# 20m cap twice on main CI (runs 44541811624 at b2ae51d5 and 44561146162 at
+# b4ebbd33, both ~1200.1s) while recent successful samples took 704.1-1162.9s, seven
+# of nine at least 987s. Store gets 30m as a stop-gap: headroom only, not a runtime
+# fix or a #4142 reduction (a maintainer-authorized exception). Handler keeps 20m.
+# Selection, assertions, race/skip checks and serialization stay the same. Other
+# packages reset to 10m each iteration.
 for p in "${PKGS[@]}"; do
   timeout=10m
-  if [ "$p" = "./internal/store/..." ] || [ "$p" = "./internal/handler/..." ]; then
+  if [ "$p" = "./internal/store/..." ]; then
+    timeout=30m
+  elif [ "$p" = "./internal/handler/..." ]; then
     timeout=20m
   elif [ "$p" = "./internal/workersvc/..." ]; then
     timeout=45m
