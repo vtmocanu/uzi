@@ -1,9 +1,10 @@
 package handler
 
-// Admin editing of hosted worker sizes (PRD #4213 M2): GET /api/admin/worker-sizes,
-// PUT /api/admin/worker-sizes/{name} and POST /api/admin/worker-sizes/{name}/reset.
+// Admin management of hosted worker sizes (PRD #4213 M2, M3): GET /api/admin/worker-sizes,
+// PUT /api/admin/worker-sizes/{name} (edit an existing size, or create an absent one),
+// DELETE /api/admin/worker-sizes/{name} and POST /api/admin/worker-sizes/{name}/reset.
 //
-// M2 edits and resets EXISTING rows only; adding and deleting sizes is M3. Every mutation is
+// Every mutation is
 // gated on a fresh controller capability report (adminSizesGate) so an edit the controller
 // would silently ignore is refused instead, and runs in one transaction under the table's
 // advisory lock. Validation is integer arithmetic in workersize.Validate.
@@ -11,11 +12,13 @@ package handler
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
@@ -29,7 +32,8 @@ import (
 )
 
 const (
-	// maxWorkerSizes is the table's size bound (PRD #4213); M3's add path enforces it.
+	// maxWorkerSizes is the table's size bound (PRD #4213); the add path enforces it, an edit
+	// or a delete never consults it.
 	maxWorkerSizes = 16
 	// adminSizesAdvertisedVersion is the lowest admin-sizes capability version that honours
 	// DesiredWorker.Resources.
@@ -267,7 +271,9 @@ func (h *Handler) beginSizeTx(ctx context.Context) (pgx.Tx, error) {
 	return tx, nil
 }
 
-// AdminPutWorkerSize serves PUT /api/admin/worker-sizes/{name}: edit an existing size.
+// AdminPutWorkerSize serves PUT /api/admin/worker-sizes/{name}: edit an existing size, or
+// create the size when no row has that name (201). A name that is not a well-formed size name
+// is a 400, since nothing could ever be stored under it.
 func (h *Handler) AdminPutWorkerSize(w http.ResponseWriter, r *http.Request) {
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {
@@ -288,7 +294,7 @@ func (h *Handler) AdminPutWorkerSize(w http.ResponseWriter, r *http.Request) {
 	}
 	name := chi.URLParam(r, "name")
 	if !builtin.WellFormed(name) {
-		httpx.Error(w, http.StatusNotFound, "worker size not found")
+		httpx.Error(w, http.StatusBadRequest, "invalid worker size name: use a lowercase letter then lowercase letters, digits or hyphens, at most 16 characters")
 		return
 	}
 	var req sizeEditRequest
@@ -312,7 +318,7 @@ func (h *Handler) AdminPutWorkerSize(w http.ResponseWriter, r *http.Request) {
 	qtx := store.New(tx)
 	row, err := qtx.LockWorkerSizeForUpdate(ctx, name)
 	if errors.Is(err, pgx.ErrNoRows) {
-		httpx.Error(w, http.StatusNotFound, "worker size not found")
+		h.createWorkerSize(ctx, w, tx, user.ID, name, spec)
 		return
 	}
 	if err != nil {
@@ -353,6 +359,113 @@ func (h *Handler) AdminPutWorkerSize(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, apitypes.AdminWorkerSizeWriteDTO{
 		Size: adminSizeDTO(updated), Warnings: warningDTOs(res.Warnings), Advisories: advisoryDTOs(res.Advisories),
 	})
+}
+
+// createWorkerSize is the create arm of PUT, running inside the size transaction after the
+// advisory lock is held and the name was found absent. There is no previous row, so no
+// disk_lowered warning. The count is its OWN statement read after the lock: the cap is refused
+// at 16 existing rows, and only an add consults it.
+func (h *Handler) createWorkerSize(ctx context.Context, w http.ResponseWriter, tx pgx.Tx, actor uuid.UUID, name string, spec workersize.Spec) {
+	res := workersize.Validate(name, spec, nil, h.cfg.WorkerSizeCeilings, h.cfg.WorkerSizeQuota)
+	if !res.OK() {
+		refuseFields(w, res.Fields)
+		return
+	}
+	n, err := store.CountWorkerSizes(ctx, tx)
+	if err != nil {
+		slog.Error("worker size count", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if n >= maxWorkerSizes {
+		httpx.JSON(w, http.StatusConflict, map[string]any{
+			"error":  fmt.Sprintf("at most %d worker sizes", maxWorkerSizes),
+			"reason": "max_sizes",
+		})
+		return
+	}
+	created, err := store.InsertAdminWorkerSize(ctx, tx, name, spec.CPURequestMillicores, spec.CPULimitMillicores,
+		spec.MemoryRequestMiB, spec.MemoryLimitMiB, spec.DataGiB, spec.DinDDataGiB, pgtype.UUID{Bytes: actor, Valid: true})
+	if err != nil {
+		slog.Error("worker size insert", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if err := tx.Commit(ctx); err != nil {
+		slog.Error("worker size commit", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	slog.Info("worker size created", "size", name, "by_user_id", actor)
+	httpx.JSON(w, http.StatusCreated, apitypes.AdminWorkerSizeWriteDTO{
+		Size: adminSizeDTO(created), Warnings: warningDTOs(res.Warnings), Advisories: advisoryDTOs(res.Advisories),
+	})
+}
+
+// AdminDeleteWorkerSize serves DELETE /api/admin/worker-sizes/{name}: remove an admin-added
+// size nothing uses. The guard (builtin, a worker using it, a stored default-size setting
+// naming it) is store.DeleteWorkerSizeGuarded, four separate statements under the size
+// advisory lock; it never takes the settings advisory lock. A refusal is 409 with
+// {error, reason: "builtin"|"in_use", used_by: {workers, settings}}; success is 200
+// {deleted: name}.
+func (h *Handler) AdminDeleteWorkerSize(w http.ResponseWriter, r *http.Request) {
+	user, ok := mw.UserFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	ctx := r.Context()
+	gate, err := h.adminSizesGate(ctx)
+	if err != nil {
+		slog.Error("worker sizes gate", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if !gate.Editable {
+		refuseReadOnly(w, gate)
+		return
+	}
+	name := chi.URLParam(r, "name")
+	if !builtin.WellFormed(name) {
+		httpx.Error(w, http.StatusNotFound, "worker size not found")
+		return
+	}
+	tx, err := h.beginSizeTx(ctx)
+	if err != nil {
+		slog.Error("worker size begin", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	err = store.DeleteWorkerSizeGuarded(ctx, tx, name)
+	var refusal *store.WorkerSizeRefusal
+	switch {
+	case errors.Is(err, store.ErrWorkerSizeNotFound):
+		httpx.Error(w, http.StatusNotFound, "worker size not found")
+		return
+	case errors.As(err, &refusal):
+		settingsKeys := refusal.Settings
+		if settingsKeys == nil {
+			settingsKeys = []string{}
+		}
+		httpx.JSON(w, http.StatusConflict, map[string]any{
+			"error":   refusal.Error(),
+			"reason":  refusal.Reason,
+			"used_by": map[string]any{"workers": refusal.Workers, "settings": settingsKeys},
+		})
+		return
+	case err != nil:
+		slog.Error("worker size delete", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if err := tx.Commit(ctx); err != nil {
+		slog.Error("worker size commit", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	slog.Info("worker size deleted", "size", name, "by_user_id", user.ID)
+	httpx.JSON(w, http.StatusOK, map[string]string{"deleted": name})
 }
 
 // AdminResetWorkerSize serves POST /api/admin/worker-sizes/{name}/reset: a builtin size goes

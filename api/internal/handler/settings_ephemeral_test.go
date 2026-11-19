@@ -24,8 +24,8 @@ func TestUpdateSettingsEphemeralRejectsInvalid(t *testing.T) {
 		{settings.KeyEphemeralMaxPerUser, "21"},
 		{settings.KeyEphemeralMaxPerUser, "-1"},
 		{settings.KeyEphemeralMaxPerUser, "abc"},
-		{settings.KeyEphemeralDefaultSize, "xl"},
-		{settings.KeyHostedDefaultSize, "xl"},
+		{settings.KeyEphemeralDefaultSize, "XL"},
+		{settings.KeyHostedDefaultSize, "has space"},
 		{settings.KeyEphemeralLease, "3h"},
 		{settings.KeyEphemeralLease, "-1m"},
 		{settings.KeyEphemeralLease, "abc"},
@@ -101,6 +101,10 @@ func TestUpdateSettingsEphemeralResetLiveDB(t *testing.T) {
 		t.Fatalf("open pool: %v", err)
 	}
 	t.Cleanup(pool.Close)
+	// PRD #4213 M3: a provision and a default-size write now check the size row exists.
+	if err := store.ReconcileBuiltinWorkerSizes(ctx, pool); err != nil {
+		t.Fatalf("seed builtin sizes: %v", err)
+	}
 
 	admin := mkSecretUser(t, pool)
 	h := &Handler{

@@ -125,6 +125,11 @@ func (f *sizeFx) put(t *testing.T, name, body string) *httptest.ResponseRecorder
 	return cookieReq(t, f.router, http.MethodPut, "/api/admin/worker-sizes/"+name, f.jwt, body)
 }
 
+func (f *sizeFx) del(t *testing.T, name string) *httptest.ResponseRecorder {
+	t.Helper()
+	return cookieReq(t, f.router, http.MethodDelete, "/api/admin/worker-sizes/"+name, f.jwt, "")
+}
+
 func (f *sizeFx) reset(t *testing.T, name string) *httptest.ResponseRecorder {
 	t.Helper()
 	return cookieReq(t, f.router, http.MethodPost, "/api/admin/worker-sizes/"+name+"/reset", f.jwt, "")
@@ -188,7 +193,7 @@ func TestAdminWorkerSizesGateLiveDB(t *testing.T) {
 				!strings.Contains(*g.ReadOnlyReason, tc.wantText) {
 				t.Fatalf("GET editable=%v reason=%v code=%v, want read-only %q", g.Editable, g.ReadOnlyReason, g.ReadOnlyCode, tc.wantCode)
 			}
-			for _, rec := range []*httptest.ResponseRecorder{f.put(t, testSizeName, body), f.reset(t, "m"), f.put(t, "nope", body)} {
+			for _, rec := range []*httptest.ResponseRecorder{f.put(t, testSizeName, body), f.reset(t, "m"), f.put(t, "nope", body), f.del(t, testSizeName)} {
 				if rec.Code != http.StatusConflict {
 					t.Fatalf("mutation while read-only = %d %s, want 409", rec.Code, rec.Body.String())
 				}
@@ -337,15 +342,11 @@ func TestAdminWorkerSizesEditAndRefusalsLiveDB(t *testing.T) {
 		}
 	}
 
-	// M2 edits an existing row only: an absent or malformed name is 404, nothing is created.
-	for _, name := range []string{"nope", "Bad_Name"} {
-		if rec := f.put(t, name, sizeBody(500, 2000, 1024, 2048, 10, 10)); rec.Code != http.StatusNotFound {
-			t.Errorf("PUT %q = %d, want 404", name, rec.Code)
+	// A malformed name is refused outright (400): nothing could be stored under it.
+	for _, name := range []string{"Bad_Name", "1x", "a-name-that-is-too-long"} {
+		if rec := f.put(t, name, sizeBody(500, 2000, 1024, 2048, 10, 10)); rec.Code != http.StatusBadRequest {
+			t.Errorf("PUT %q = %d, want 400", name, rec.Code)
 		}
-	}
-	var n int
-	if err := f.h.pool.QueryRow(context.Background(), `SELECT count(*) FROM worker_sizes WHERE name IN ('nope')`).Scan(&n); err != nil || n != 0 {
-		t.Errorf("a size was created by PUT: n=%d err=%v", n, err)
 	}
 
 	// Reset applies to builtins only.

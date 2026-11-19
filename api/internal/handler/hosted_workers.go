@@ -43,6 +43,10 @@ import (
 // lock that makes that count trustworthy.
 var errHostedQuotaExceeded = errors.New("hosted worker quota exceeded")
 
+// errUnknownHostedSize is raised by provisionHostedWorker when the requested size row is
+// absent once its FOR SHARE lock is taken (never created, or deleted since the early check).
+var errUnknownHostedSize = errors.New("unknown worker size")
+
 // ProvisionHostedWorker creates a hosted worker: a worker whose container the
 // CONTROLLER runs in the cluster (PRD #58). It mints the join token, but — unlike
 // CreateWorker — it NEVER returns it.
@@ -166,6 +170,10 @@ func (h *Handler) ProvisionHostedWorker(w http.ResponseWriter, r *http.Request) 
 
 	wkr, err := h.provisionHostedWorker(r.Context(), user.ID, name, template, size, req.Docker, quota)
 	if err != nil {
+		if errors.Is(err, errUnknownHostedSize) {
+			httpx.Error(w, http.StatusBadRequest, "unknown worker size")
+			return
+		}
 		if errors.Is(err, errHostedQuotaExceeded) {
 			// State, not policy: the user can delete a hosted worker and retry. Mirrors
 			// ErrWorkerHasActiveRuns → 409.
@@ -250,6 +258,19 @@ func (h *Handler) provisionHostedWorker(ctx context.Context, userID uuid.UUID, n
 	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1, $2)",
 		store.HostedProvisionLockClass, hostedProvisionLockObjID(userID)); err != nil {
 		return store.Worker{}, err
+	}
+
+	// FOR SHARE on the size row, still before any write: a size delete needs FOR UPDATE on the
+	// same row, so it cannot commit between this check and CreateHostedWorker below, and a
+	// delete that committed first makes this refuse. The pre-transaction Exists check is only a
+	// cheap early answer; this is the authoritative one. Lock order: this user's provision
+	// advisory lock, then the size row (a delete takes the size advisory lock, then the row).
+	present, err := store.LockWorkerSizeShared(ctx, tx, size)
+	if err != nil {
+		return store.Worker{}, err
+	}
+	if !present {
+		return store.Worker{}, errUnknownHostedSize
 	}
 
 	n, err := qtx.CountHostedWorkersForUser(ctx, userID)

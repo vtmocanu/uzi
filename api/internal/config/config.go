@@ -1556,8 +1556,10 @@ func Load() (Config, error) {
 	// expires (workersize's own doc). Reject a bad value at load rather than at use, and
 	// fall back to "m" with a boot warning so a typo cannot silently disable the feature.
 	cfg.EphemeralDefaultSize = strings.TrimSpace(getenv("UZI_EPHEMERAL_DEFAULT_SIZE", "m"))
-	// Builtins only: the size table does not exist yet at config load (PRD #4213), so the
-	// env may name a shipped preset; an admin-set ephemeral_default_size may name any size.
+	// Builtins only, by design (PRD #4213): the size table is not readable at config load, so
+	// the env may name a shipped preset only. That is also what lets a size delete skip the env
+	// overlay: a builtin cannot be deleted. An admin-set ephemeral_default_size may name any
+	// existing size (checked at write time inside the settings transaction).
 	if !builtin.ValidBuiltin(cfg.EphemeralDefaultSize) {
 		slog.Warn("UZI_EPHEMERAL_DEFAULT_SIZE is not a builtin worker size preset; falling back to \"m\"",
 			"configured", cfg.EphemeralDefaultSize, "valid", builtin.Names())

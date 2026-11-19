@@ -59,8 +59,8 @@ func (c *Cache) HostedDefaultSize(ctx context.Context) (string, error) {
 func (c *Cache) sizeSetting(ctx context.Context, key string) (string, error) {
 	v, err := c.get(ctx, key)
 	// Format only: whether a well-formed name still names a row is a database fact this
-	// cache-backed reader does not check (PRD #4213; a later milestone validates
-	// membership at write time and on delete).
+	// cache-backed reader does not check (PRD #4213: the admin PUT validates membership in its
+	// write transaction, and a delete refuses while a stored default names the size).
 	if !builtin.WellFormed(v) {
 		v = Defaults[key]
 	}
@@ -111,17 +111,17 @@ func validateEphemeralMaxPerUser(value string) error {
 	return nil
 }
 
-// validateWorkerSize is the write-time gate for the two default-size keys: a shipped
-// builtin size name; "" is the reset to the default. Builtins only until M3 of PRD #4213,
-// which replaces this with an in-transaction database membership check against
-// worker_sizes. Accepting any well-formed name before then would let an admin store a size
-// no row backs, and the controller could not render the worker.
+// validateWorkerSize is the write-time FORMAT gate for the two default-size keys: a
+// well-formed size name (builtin.WellFormed); "" is the reset to the default. Whether the
+// name still names a row is a database fact that cannot be checked here: the admin PUT
+// checks it inside its write transaction (FOR SHARE on the size rows), and deleting a size
+// refuses while a stored default names it (PRD #4213).
 func validateWorkerSize(value string) error {
 	v := strings.TrimSpace(value)
-	if v == "" || builtin.ValidBuiltin(v) {
+	if v == "" || builtin.WellFormed(v) {
 		return nil
 	}
-	return fmt.Errorf("must be one of: %s", strings.Join(builtin.Names(), ", "))
+	return errors.New("must be a size name: a lowercase letter then lowercase letters, digits or hyphens, at most 16 characters")
 }
 
 // validateEphemeralLease is the write-time gate for ephemeral_lease: a Go duration in
