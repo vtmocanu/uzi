@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
 
-import { runReadOnlyModelPass, type ReadOnlyModelPassOpts } from "../src/model-pass.js";
+import { runReadOnlyModelPass, redactingLogger, type ReadOnlyModelPassOpts } from "../src/model-pass.js";
 import { SummaryRunner } from "../src/summary-runner.js";
 import { errorClass } from "../src/summary-runner.js";
 import { ReviewRunner } from "../src/review-runner.js";
@@ -217,6 +217,60 @@ for (const key of KEYS) {
   });
 }
 
+describe("provider pass key encodings", () => {
+  // A key with a slash, an ampersand, angle brackets and a space.
+  const key = ["gwk", "a/b", "&c", "<d>", " e", "Zq8Lm3Xr"].join("");
+  const provider = binding(key);
+  const json = JSON.stringify(key).slice(1, -1);
+  const variants: Record<string, string> = {
+    "JSON with escaped slash": json.replaceAll("/", "\\/"),
+    "HTML-safe lowercase hex": json.replace(/[<>&]/g, (c) => `\\u00${c.charCodeAt(0).toString(16)}`),
+    "HTML-safe uppercase hex": json.replace(/[<>&]/g, (c) => `\\u00${c.charCodeAt(0).toString(16).toUpperCase()}`),
+    "percent-encoded": encodeURIComponent(key),
+    "percent-encoded lowercase hex": encodeURIComponent(key).replace(/%[0-9A-F]{2}/g, (m) => m.toLowerCase()),
+    "percent-encoded with plus for space": encodeURIComponent(key).replaceAll("%20", "+"),
+  };
+  for (const [name, variant] of Object.entries(variants)) {
+    it(`redacts the ${name} form completely`, async () => {
+      assert.notEqual(variant, key, "precondition: the variant differs from the raw key");
+      const echoed = `gateway said [${variant}] end`;
+      const stub = frames(assistant(echoed), OK);
+      assert.ok(echoed.includes(variant), "the variant is present in the stub output");
+      const out = await runReadOnlyModelPass(passOpts({ provider, queryFn: stub }));
+      assert.equal(out, `gateway said [${REDACTED}] end`);
+      assert.equal(out.includes(variant), false);
+    });
+  }
+
+  it("redacts a variant echoed in a thrown error", async () => {
+    const variant = variants["JSON with escaped slash"]!;
+    const thrown = (await caught(() => runReadOnlyModelPass(passOpts({ provider, queryFn: throwing(new Error(`bad ${variant}`)) })))) as Error;
+    assert.equal(thrown.message, `bad ${REDACTED}`);
+  });
+});
+
+describe("redactingLogger", () => {
+  it("scrubs the message and nested fields, including through child()", () => {
+    const key = ID_KEY;
+    const sink: Line[] = [];
+    const base: Logger = {
+      debug: () => {}, info: () => {}, error: () => {},
+      warn: (message, fields) => void sink.push({ level: "warn", message, fields }),
+      addSecret: () => {}, removeSecret: () => {},
+      child: (fields) => {
+        const inner: Logger = { ...base, warn: (message, f) => void sink.push({ level: "warn", message, fields: { ...fields, ...f } }), child: () => inner };
+        return inner;
+      },
+    };
+    const log = redactingLogger(base, makeTextRedactor([key]));
+    log.child({ ctx: `c-${key}` }).warn(`oops ${key}`, { nested: { k: key, list: [`l-${key}`] } });
+    assert.equal(sink.length, 1);
+    assert.equal(carries(sink, key), false);
+    assert.equal(sink[0]!.message, `oops ${REDACTED}`);
+    assert.deepEqual(sink[0]!.fields, { ctx: `c-${REDACTED}`, nested: { k: REDACTED, list: [`l-${REDACTED}`] } });
+  });
+});
+
 // ---------------------------------------------------------------------------------------------
 // Thrown values: redacted, with the caller-visible classification kept
 // ---------------------------------------------------------------------------------------------
@@ -227,6 +281,8 @@ describe("provider pass thrown values", () => {
 
   it("rewrites a writable Error in place and rethrows the same object", async () => {
     const err = Object.assign(new RangeError(`boom ${key}`), { reason: `reason ${key}`, code: 42 });
+    void err.stack; // materialize the lazily built stack so its redaction is actually exercised
+    assert.equal(carries(err.stack ?? "", key), true, "precondition: the stack carries the key");
     const thrown = await run(err);
     assert.equal(thrown, err);
     assert.ok(thrown instanceof RangeError);

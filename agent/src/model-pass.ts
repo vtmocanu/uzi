@@ -103,7 +103,8 @@ export interface ReadOnlyModelPassOpts {
    *  usage-limit death); on a success frame it is a capture side-effect. When omitted
    *  (review/summary), the helper's default applies: throw a generic
    *  `${label} model call returned an error result` on an error frame, return the
-   *  accumulated text on success. */
+   *  accumulated text on success. It receives the raw SDK message OUTSIDE the provider redaction
+   *  seam, so it must not be used on a provider pass (the judge refuses providers today). */
   onResult?(msg: unknown, ctx: { isError: boolean; latest: RateLimitObservation | undefined }): void;
   /** PRD #1429 M3: when set, this pass runs the ISOLATED CODEX advice harness (built via
    *  the injected `buildHarness` factory — never constructed in this file, per
@@ -251,9 +252,26 @@ interface ProviderScope {
   thrown(err: unknown): unknown;
 }
 
-function providerScope(key: string, base: Logger): ProviderScope {
-  const text = makeTextRedactor([key, JSON.stringify(key).slice(1, -1)]);
-  return { text, log: redactingLogger(base, text), thrown: (err) => sanitizeThrown(err, text) };
+/** Every encoding of `key` a gateway error body is known to echo it in: raw, JSON-escaped, JSON
+ *  with `\/`, the HTML-safe `\u00XX` forms Go's encoding/json emits (both hex cases), and the
+ *  percent-encoded forms (both hex cases, and `+` for a space). Longest first, so a raw
+ *  substring never leaves the surrounding escape characters behind. */
+function keyForms(key: string): string[] {
+  const json = JSON.stringify(key).slice(1, -1);
+  const htmlSafe = (hex: (s: string) => string): string =>
+    json.replace(/[<>&\u2028\u2029]/g, (c) => `\\u${hex(c.charCodeAt(0).toString(16).padStart(4, "0"))}`);
+  const pct = encodeURIComponent(key);
+  const forms = [
+    key, json, json.replaceAll("/", "\\/"), htmlSafe((h) => h), htmlSafe((h) => h.toUpperCase()),
+    pct, pct.replace(/%[0-9A-F]{2}/g, (m) => m.toLowerCase()),
+  ];
+  if (key.includes(" ")) forms.push(pct.replaceAll("%20", "+"));
+  return [...new Set(forms)].sort((a, b) => b.length - a.length);
+}
+
+function providerScope(key: string, base: Logger, label: string): ProviderScope {
+  const text = makeTextRedactor(keyForms(key));
+  return { text, log: redactingLogger(base, text), thrown: (err) => sanitizeThrown(err, text, label) };
 }
 
 const MAX_LOG_FIELD_DEPTH = 6;
@@ -267,9 +285,10 @@ function redactLogValue(v: unknown, text: TextRedactor, depth = 0): unknown {
   return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, redactLogValue(x, text, depth + 1)]));
 }
 
-/** A Logger over `base` that scrubs the message and every string field value. It never touches
- *  `base`'s secret registry: addSecret/removeSecret only delegate what a caller explicitly asks. */
-function redactingLogger(base: Logger, text: TextRedactor): Logger {
+/** A Logger over `base` that scrubs the message and the string fields of plain objects and arrays
+ *  (to a depth of MAX_LOG_FIELD_DEPTH); class instances and deeper values pass through. It never
+ *  touches `base`'s secret registry: addSecret/removeSecret only delegate what a caller explicitly asks. */
+export function redactingLogger(base: Logger, text: TextRedactor): Logger {
   const emit = (level: "debug" | "info" | "warn" | "error") => (msg: string, fields?: Record<string, unknown>): void => {
     if (fields === undefined) base[level](text(msg));
     else base[level](text(msg), redactLogValue(fields, text) as Record<string, unknown>);
@@ -308,11 +327,11 @@ function redactUsageSnapshot(snapshot: AdviceUsageSnapshot, text: TextRedactor):
   return Object.fromEntries(merged) as unknown as AdviceUsageSnapshot;
 }
 
-function sanitizeThrown(value: unknown, text: TextRedactor): unknown {
+function sanitizeThrown(value: unknown, text: TextRedactor, label: string): unknown {
   try {
     return value instanceof Error ? sanitizeError(value, text) : sanitizeNonError(value, text);
   } catch {
-    return new Error("model call failed");
+    return new Error(`${label} model call failed`);
   }
 }
 
@@ -328,6 +347,8 @@ function ownStringFields(obj: object): string[] {
   return Object.keys(obj).filter((k) => typeof safeRead(obj, k) === "string");
 }
 
+/** Redacts `message`, `stack`, `name` and the enumerable string fields of `err`. Other fields,
+ *  including a nested `cause`, are not inspected. */
 function sanitizeError(err: Error, text: TextRedactor): Error {
   const redacted = new Map<string, string>();
   for (const k of new Set(["message", "stack", "name", ...ownStringFields(err)])) {
@@ -432,7 +453,7 @@ export async function runReadOnlyModelPass(opts: ReadOnlyModelPassOpts): Promise
     throw new Error(`${opts.label} model pass requires a token or a codex claim`);
   }
   // Issue #4505: only a provider pass is scoped; a vendor pass uses opts.log and its text as-is.
-  const scope = opts.provider ? providerScope(opts.provider.credential, opts.log) : undefined;
+  const scope = opts.provider ? providerScope(opts.provider.credential, opts.log, opts.label) : undefined;
   const log = scope?.log ?? opts.log;
   const homeDir = await fs.mkdtemp(path.join(opts.homeRoot, opts.homePrefix));
   // PRD #1809 D7: unregistered after the cleanup attempt in the finally below (or on the
