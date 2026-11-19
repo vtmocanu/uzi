@@ -402,9 +402,9 @@ When a run is held, its health reason says so:
   ran this Codex run may resume it". Wait for that worker to come back (for
   example after a restart or a drain), or cancel the run with `uzi run cancel <id>`.
 - "held: predecessor provenance unavailable; cancel the run; no worker may resume
-  this Codex run". No worker can resume it. This is the state of a Codex run that
-  was already running when this rule was deployed, or that was claimed while an
-  older api was serving claims. Cancel it with `uzi run cancel <id>`.
+  this Codex run". No worker can resume it. This is the state of any Codex run at
+  generation 1 or later when this rule was deployed (including a paused or parked
+  one), or that was claimed while an older api was serving claims. Cancel it with `uzi run cancel <id>`.
 
 A run that its own worker is still running in its current flight keeps going; the
 hold applies at the next fresh claim. See [admin health](admin-health.md) for the

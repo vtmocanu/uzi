@@ -134,24 +134,32 @@ The run-health reason (`api/internal/workersvc/health.go`) is one of:
   provenance, never from `runs.worker_id`; if the worker row was deleted the
   worker id text is shown.
 - `held: predecessor provenance unavailable; cancel the run; no worker may resume
-  this Codex run` for NULL or stale provenance (a legacy row, or a run claimed by
-  an old api during a rollback window).
+  this Codex run` for NULL or stale provenance (a legacy row at generation >= 1,
+  including a paused or parked one, or a run claimed by an old api during a
+  rollback window).
 
 Both are `waiting_worker`. Precedence: after the egress rung and before the
-manual-cordon, owner-hold and stale-pin rungs; the account prerequisites
-(handoff setup, vault, custody, Codex account) still outrank them. The reason is
-shown from the first tick (the young-run gate does not delay it).
+manual-cordon, owner-hold and stale-pin rungs. The prerequisite rungs in
+`queuedPrerequisiteReason` (`api/internal/workersvc/health.go`) still outrank it,
+among them the instance intake pause (maintenance), the weekly usage reserve, the
+handoff setup, vault, custody and Codex account blockers, and the Codex admission
+wait. The held reason is shown from the first tick (the young-run gate does not
+delay it).
 
 Nudges follow PRD #3454 D12 for the named reason and deliberately depart from it
 for the unavailable reason:
 
 - The **named** reason is quiet while the stale-requeue pin or a draining or
-  maintenance owner-hold window would hold the run anyway, and nudges once when
-  that window ends. If the hold began through another quiet transition (leaving a
-  maintenance intake pause, a Codex admission wait, or a reserve), it nudges once
-  at `updated_at + WORKER_AFFINITY_CEILING`, and never if that ceiling had already
-  passed when the episode began (the same as other `waiting_worker` episodes after
-  a D12 quiet exit).
+  maintenance owner-hold window is in force by its clock, and nudges once when
+  that window ends. If the condition that made the run pinnable ends early (the
+  drain is cleared, or the worker row is deleted or replaced), the single nudge
+  comes at `updated_at + WORKER_AFFINITY_CEILING`. If the hold began through
+  another quiet transition (leaving a maintenance intake pause, a Codex admission
+  wait, or a reserve), it also nudges once at that point, and never if that ceiling
+  had already passed when the episode began (the same as other `waiting_worker`
+  episodes after a D12 quiet exit). A held run outside any window (for example a
+  normal Resume onto a live worker) nudges on the first health tick, bypassing the
+  young-run grace, and counts in `queue.waiting`.
 - The **unavailable** reason never resolves on its own, so it nudges on entry from
   any state (the nudge cooldown still applies). This is a deliberate exception to
   D12.

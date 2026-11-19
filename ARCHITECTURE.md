@@ -1511,7 +1511,9 @@ chain in the diagram above, with no intervening `running`.
   `refs/uzi-recovery/<run-id>` ref rather than deleting or overwriting it. See
   [ADR-1810](adr/1810-checkpoint-retention-follows-custody.md).
   This same affinity leg is what lets a **paused** run's `resume` fall open
-  to a different worker once the pinned one is stale or gone; see
+  to a different worker once the pinned one is stale or gone (not for a Codex run at
+  generation >= 1, which stays held for its recorded worker, see
+  [ADR-4476](adr/4476-codex-claim-provenance.md)); see
   [ADR-1190](adr/1190-run-pause-invariants.md).
 
 - **Codex claim provenance** ([ADR-4476](adr/4476-codex-claim-provenance.md), issue #4476).

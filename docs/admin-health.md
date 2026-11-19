@@ -274,15 +274,21 @@ another worker. It shows `waiting_worker` with one of two reasons: "held for wor
 may resume it" (the name comes from the recorded claim provenance, or the worker id
 when that worker row was deleted), or "held: predecessor provenance unavailable;
 cancel the run; no worker may resume this Codex run" for a run with no usable
-provenance (one that was mid-flight when the rule deployed, or claimed by an older
-api). The reason is shown from the first evaluation, after the isolated egress lane
-blocker and before the manual cordon, owner hold and stale-requeue pin reasons;
-the account prerequisites above still take precedence. The named reason nudges
-once when a stale-requeue pin or draining or maintenance hold that was already
-explaining the wait ends, or, for a hold that began in another quiet state (leaving
-a maintenance intake pause, a Codex admission wait or a reserve), once at the
-affinity ceiling after the run's last update, and not at all when that ceiling had
-already passed when the episode began. The unavailable reason never resolves
+provenance (any Codex run at generation 1 or later when the rule deployed,
+including a paused or parked one, or a run claimed by an older api). The reason is
+shown from the first evaluation, after the isolated egress lane blocker and before
+the manual cordon, owner hold and stale-requeue pin reasons; the account
+prerequisites above, the intake pause, the weekly reserve and the Codex admission
+wait still take precedence. The named reason is quiet while a stale-requeue pin
+or a draining or maintenance hold is in force by its clock, and nudges once when
+that window ends. If the condition behind the window ends early (the drain is
+cleared, or the worker row is deleted or replaced), the single nudge comes at the
+affinity ceiling after the run's last update; a hold that began in another quiet
+state (leaving a maintenance intake pause, a Codex admission wait or a reserve)
+nudges once at that point too, and not at all when that ceiling had already
+passed when the episode began. A held run outside any window (for example after a
+normal Resume onto a live worker) nudges on the first health tick, ignoring the
+young-run grace, and counts in `queue.waiting`. The unavailable reason never resolves
 itself, so it nudges on entering it from any state (the nudge cooldown still
 applies). Neither reason starts with "waiting until", so `queue.waiting` and
 `fleet.capacity` count these runs as genuine waits: a routine drain of the last
