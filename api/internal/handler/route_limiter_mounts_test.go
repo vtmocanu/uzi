@@ -1099,6 +1099,9 @@ var wantRouteMounts = []routeMount{
 	{"PUT", "/api/me/usage-reserve", noLimiter},
 	{"PUT", "/api/me/codex-account-mode", noLimiter},
 	{"PUT", "/api/me/harness-overflow", noLimiter},
+	// PRD #3264: the model and effort defaults (PutMyModelSettings). One bounded body, one transaction
+	// on the caller's own users row, no spend, no forge write, no fan-out: like /me/usage-reserve.
+	{"PUT", "/api/me/model-settings", noLimiter},
 	// PRD #46: the run-judge consent toggle (SetJudgeEnabled). A single boolean
 	// UPDATE on the caller's own users row, spends no Anthropic token at toggle time
 	// — noLimiter, matching /me/autopilot and /me/ci-autofix beside it. Its route

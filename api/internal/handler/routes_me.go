@@ -270,6 +270,27 @@ func (h *Handler) mountMeRoutes(r chi.Router, authLimiter *mw.Limiter) {
 	// account mode, it is owner-scoped and Bearer-reachable; cookie writes require CSRF.
 	r.With(h.requireUser()).Put("/me/harness-overflow", h.SetHarnessOverflowEnabled)
 
+	// Current-user model and effort defaults (PRD #3264, `uzi settings set|reset`): a closed
+	// allowlist of the worker-model lanes, ordinary effort, judge and summary models and the
+	// judge harness, written in one transaction. RequireUser, so a uzc_ CLI Bearer works;
+	// PUT /me/settings (the whole settings surface) stays cookie-only above.
+	//
+	// THE ARGUMENT IS NON-ADDITIVITY, as for /me/usage-reserve, /me/codex-account-mode and
+	// /me/harness-overflow. These fields choose among the models and credentials the user
+	// already holds, and judge_runs_on (and the cross-check pins, once they join) choose how
+	// work the user already consented to executes. None grants consent to spend unattended:
+	// the switches that enable the judge, cross-check, autopilot and the rest (/me/judge,
+	// /me/cross-check, ...) stay cookie-only, and the handler's allowlist rejects their keys.
+	//
+	// CAVEAT, as for /me/rate-limits (D23): this rests on POST /repos/{id}/runs, the per-run
+	// model/effort overrides and schedule create staying RequireUser. A stolen uzc_ that sets
+	// default_effort=max only raises the spend of runs the user already consented to, which
+	// those routes already allow. If that authority is ever narrowed, revisit this mount.
+	//
+	// A uza_ admin token reaches handlers with IsAdmin=true; that is irrelevant here, the
+	// handler has no admin branch and the identity is the authenticated user, never the body.
+	r.With(h.requireUser()).Put("/me/model-settings", h.PutMyModelSettings)
+
 	// Current-user Claude rate-limit meters (PRD #53): the caller's own 5h/7d
 	// windows. Self-scoped; admins use /api/admin/rate-limits for everyone.
 	//

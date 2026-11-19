@@ -71,6 +71,13 @@ type Handler struct {
 	// statement fails and prove a storage error answers 503 temporarily_unavailable at every step
 	// (PRD #1910 D7). nil in production: New leaves it unset.
 	oauthBeginTx func(ctx context.Context) (pgx.Tx, error)
+	// modelSettingsBeginTx and modelSettingsReadback are test seams of PUT /api/me/model-settings.
+	// A non-nil modelSettingsBeginTx replaces h.pool.Begin, so a LiveDB test can hand the route a
+	// transaction whose Commit reports an error after (or instead of) applying; a non-nil
+	// modelSettingsReadback replaces the post-commit settings read, so a test can fail it. Both
+	// are nil in production: New leaves them unset.
+	modelSettingsBeginTx  func(ctx context.Context) (pgx.Tx, error)
+	modelSettingsReadback func(r *http.Request, userID uuid.UUID) (userSettingsDTO, error)
 	// secretBeginTx supplies a real transaction for secret mutations in tests.
 	// Production uses pool.BeginTx; withSecretLock enforces READ COMMITTED.
 	secretBeginTx func(ctx context.Context) (pgx.Tx, error)

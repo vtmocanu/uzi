@@ -604,6 +604,64 @@ func TestCLIReachesSettingsOverBearerLiveDB(t *testing.T) {
 	}
 }
 
+// TestCLIReachesModelSettingsOverBearerLiveDB pins the PRD #3264 mount: PUT /api/me/model-settings is
+// RequireUser, so a uzc_ Bearer writes the caller's own model defaults (the write is real: the
+// stored column changes), a cookie without the CSRF header is refused, and an unauthenticated
+// request is 401. The generic PUT /api/me/settings stays cookie-only (see
+// TestCLIRejectsBearerOnCookieOnlyRoutesLiveDB), and the consent switches are not reachable
+// through this route.
+func TestCLIReachesModelSettingsOverBearerLiveDB(t *testing.T) {
+	_, router, pool := cliLiveDB(t)
+	user := cliSeedUser(t, pool, false)
+	uzc := cliMintToken(t, pool, user, clitoken.ScopeUser)
+
+	rec := bearerReqBody(router, http.MethodPut, "/api/me/model-settings", uzc, `{"default_effort":"runtime","judge_model":"haiku"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PUT /api/me/model-settings over Bearer = %d, want 200\nbody: %s", rec.Code, rec.Body.String())
+	}
+	if body := rec.Body.String(); !strings.Contains(body, `"settings"`) {
+		t.Fatalf("response carries no settings object: %s", body)
+	}
+	var effort, judge *string
+	if err := pool.QueryRow(context.Background(), `SELECT default_effort, judge_model FROM users WHERE id = $1`, user).Scan(&effort, &judge); err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if effort == nil || *effort != "runtime" || judge == nil || *judge != "haiku" {
+		t.Fatalf("stored default_effort=%v judge_model=%v, want runtime and haiku", effort, judge)
+	}
+
+	// A consent switch is not in the allowlist, even over a valid Bearer.
+	rec = bearerReqBody(router, http.MethodPut, "/api/me/model-settings", uzc, `{"judge_enabled":true}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("judge_enabled over Bearer = %d, want 400\nbody: %s", rec.Code, rec.Body.String())
+	}
+
+	// A cookie session without the CSRF header is refused at the CSRF check.
+	jwt := cliMintJWT(t, pool, user)
+	req := httptest.NewRequest(http.MethodPut, "/api/me/model-settings", strings.NewReader(`{"default_effort":"low"}`))
+	req.AddCookie(&http.Cookie{Name: auth.AuthCookieName, Value: jwt}) //nolint:gosec // G124: test-only client cookie on an httptest request; Secure/HttpOnly/SameSite are response-side attributes irrelevant to a cookie a unit test sends.
+	req.Header.Set("Content-Type", "application/json")
+	noCSRF := httptest.NewRecorder()
+	router.ServeHTTP(noCSRF, req)
+	if noCSRF.Code != http.StatusForbidden {
+		t.Fatalf("cookie PUT without CSRF = %d, want 403\nbody: %s", noCSRF.Code, noCSRF.Body.String())
+	}
+	if err := pool.QueryRow(context.Background(), `SELECT default_effort FROM users WHERE id = $1`, user).Scan(&effort); err != nil || effort == nil || *effort != "runtime" {
+		t.Fatalf("stored default_effort after the CSRF-less cookie PUT = %v (err %v), want runtime unchanged", effort, err)
+	}
+	// With the CSRF header the cookie path writes.
+	if rec := cookieReq(t, router, http.MethodPut, "/api/me/model-settings", jwt, `{"default_effort":"low"}`); rec.Code != http.StatusOK {
+		t.Fatalf("cookie PUT with CSRF = %d, want 200\nbody: %s", rec.Code, rec.Body.String())
+	}
+	if err := pool.QueryRow(context.Background(), `SELECT default_effort FROM users WHERE id = $1`, user).Scan(&effort); err != nil || effort == nil || *effort != "low" {
+		t.Fatalf("stored default_effort after cookie write = %v (err %v), want low", effort, err)
+	}
+
+	if rec := bearerReqBody(router, http.MethodPut, "/api/me/model-settings", "", `{"default_effort":"low"}`); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated PUT /api/me/model-settings = %d, want 401", rec.Code)
+	}
+}
+
 // TestCLIReachesEffectiveSettingsOverBearerLiveDB pins the PRD #3254 mounts: the effective-settings
 // routes are RequireUser (a uzc_ Bearer reaches them) and none is public (401 without
 // credentials). The start-preview and schedule-preview write verbs are reads, so a CLI token may
