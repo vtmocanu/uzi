@@ -229,6 +229,37 @@ func costDetailCell(u apitypes.UsageDTO) string {
 	}
 }
 
+// isProviderRun reports whether the run is bound to a custom model provider (PRD #4320). Such a
+// run carries cost_status "unreported": the gateway's own accounting is not Anthropic's, so no
+// dollar figure is derived for it.
+func isProviderRun(r apitypes.RunDTO) bool { return r.ProviderID != nil && *r.ProviderID != "" }
+
+// providerCostUnknown reports whether the run's cost reads "unknown (custom provider)": a provider
+// run whose usage is not metered or legacy-subscription. A metered reading is never overridden.
+func providerCostUnknown(r apitypes.RunDTO) bool {
+	return isProviderRun(r) && r.Usage != nil && classifyCostStatus(r.Usage.CostStatus) == costStatusUnavailable
+}
+
+// runCostDetailCell is costDetailCell for a run: a provider run's unmetered cost reads
+// "cost unknown (custom provider)" instead of the generic "cost unavailable".
+func runCostDetailCell(r apitypes.RunDTO) string {
+	if providerCostUnknown(r) {
+		u := r.Usage
+		return fmtTokens(u.InputTokens+u.CacheReadTokens+u.CacheCreationTokens+u.OutputTokens) + " tokens · cost unknown (custom provider)"
+	}
+	return costDetailCell(*r.Usage)
+}
+
+// providerCell is the PROVIDER row/column text: the provider's current name as plain text (it is
+// user-authored), or "(name unavailable)" when only the run's id is known: a null name does not
+// prove deletion (mutation responses and failed lookups leave it null too).
+func providerCell(r apitypes.RunDTO) string {
+	if r.ProviderName == nil || *r.ProviderName == "" {
+		return "(name unavailable)"
+	}
+	return cellText(*r.ProviderName)
+}
+
 // usageTailReasonText is the plain-words sentence for each reason of the closed coverage-reason
 // set the server emits (ADR-2014). The strings are identical to REASON_TEXT in web
 // lib/usageTail.ts and to the list in docs/run-cost.md; TestUsageTailReasonSentences pins all

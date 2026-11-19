@@ -1,0 +1,365 @@
+import { after, describe, it } from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import http from "node:http";
+import type { AddressInfo, Socket } from "node:net";
+import os from "node:os";
+import path from "node:path";
+import { query } from "@anthropic-ai/claude-agent-sdk";
+import type { Options } from "@anthropic-ai/claude-agent-sdk";
+import { buildSdkEnv, type SdkCredential } from "../src/sdk-env.js";
+
+// PRD #4320 module 7 (activation-blocking): does the REAL bundled CLI, run with the provider-mode
+// env uzi builds, send every request (main agent, Task subagent, haiku auxiliary calls) ONLY to the
+// bound base URL, and does it refuse to follow a gateway redirect for either auth style?
+//
+// The SDK `env` REPLACES the child environment (sdk-env.ts), so the CLI's environment is built from
+// {...buildSdkEnv(providerCredential, home), HTTPS_PROXY, HTTP_PROXY, NO_PROXY} (the SDK may add its own
+// entrypoint variables on top; the worker's process environment does not leak in). The proxy variables are
+// TEST-ONLY: they point at a loopback recorder that records and refuses every CONNECT and absolute-URI
+// request, so a request the CLI sends anywhere except the (NO_PROXY-exempt) fake gateway is recorded.
+// CALIBRATION comes first: a binding to https://foreign.invalid must be recorded at the recorder,
+// else routing cannot be observed and the whole suite fails (routing UNVERIFIED), never passes.
+// CLAUDE_CODE_MAX_RETRIES=1 is likewise test-only: it bounds the CLI's own retry of a refused call.
+
+const DRIVE_BUDGET_MS = 60_000;
+const GATEWAY_PREFIX = "/gw/anthropic";
+const SUB_IDENTITY = "SUBAGENT-IDENTITY-routing-4d2a";
+const SUBAGENT_TOKEN = "SUBAGENT-TASK-routing-91c3";
+// Assembled at runtime: no provider-token-shaped literal in source.
+const KEY = ["gw", "key", "do-not-scan", "9999", "abcdefgh"].join("-");
+
+interface Seen {
+  method: string;
+  url: string;
+  headers: http.IncomingHttpHeaders;
+  body: string;
+}
+
+/** A loopback server that records every request and answers with `respond`. */
+class RecordingServer {
+  readonly seen: Seen[] = [];
+  protected readonly server: http.Server;
+  constructor(respond: (req: http.IncomingMessage, res: http.ServerResponse, seen: Seen) => void) {
+    this.server = http.createServer((req, res) => {
+      req.socket.on("error", () => {});
+      const chunks: Buffer[] = [];
+      req.on("data", (c: Buffer) => chunks.push(c));
+      req.on("end", () => {
+        const seen: Seen = { method: req.method ?? "", url: req.url ?? "", headers: req.headers, body: Buffer.concat(chunks).toString("utf8") };
+        this.seen.push(seen);
+        respond(req, res, seen);
+      });
+    });
+  }
+  async listen(): Promise<{ port: number; origin: string }> {
+    await new Promise<void>((r) => this.server.listen(0, "127.0.0.1", r));
+    this.server.unref();
+    const port = (this.server.address() as AddressInfo).port;
+    return { port, origin: `http://127.0.0.1:${port}` };
+  }
+  async close(): Promise<void> {
+    this.server.closeAllConnections();
+    await new Promise<void>((resolve, reject) => this.server.close((e) => (e ? reject(e) : resolve())));
+  }
+}
+
+/** The forward-proxy recorder: CONNECT and absolute-URI requests are recorded and refused (403). */
+class Recorder extends RecordingServer {
+  readonly connects: string[] = [];
+  port = 0;
+  constructor() {
+    super((_req, res) => {
+      res.writeHead(403, { "content-type": "text/plain" });
+      res.end("refused by the routing recorder");
+    });
+    this.server.on("connect", (req: http.IncomingMessage, socket: Socket) => {
+      this.connects.push(req.url ?? "");
+      socket.on("error", () => {}); // the CLI may reset the refused tunnel; that is expected
+      socket.end("HTTP/1.1 403 Forbidden\r\nconnection: close\r\n\r\n");
+    });
+  }
+  /** Everything the recorder was asked to carry: CONNECT targets and absolute-URI request lines. */
+  get targets(): string[] {
+    return [...this.connects, ...this.seen.map((s) => s.url)];
+  }
+}
+
+function textOf(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content.map((b: { type?: string; text?: string; content?: unknown }) => (b.type === "tool_result" ? textOf(b.content) : typeof b.text === "string" ? b.text : "")).join("\n");
+}
+
+interface MessagesBody {
+  model?: string;
+  system?: string | Array<{ text?: string }>;
+  stream?: boolean;
+  tools?: Array<{ name: string }>;
+  messages: Array<{ role: string; content: unknown }>;
+}
+
+interface GatewayCall { path: string; model: string; agent: "lead" | "sub" | "side"; authorization?: string; xApiKey?: string }
+
+type Redirect = { to: string; status: number } | undefined;
+
+/** A Messages gateway under GATEWAY_PREFIX: scripted lead -> subagent -> done, optional 307 redirect. */
+class Gateway extends RecordingServer {
+  readonly calls: GatewayCall[] = [];
+  private spawned = false;
+  constructor(private readonly redirect: () => Redirect = () => undefined) {
+    super((req, res, seen) => this.handle(req, res, seen));
+  }
+  private handle(req: http.IncomingMessage, res: http.ServerResponse, seen: Seen): void {
+    const p = (req.url ?? "").split("?")[0] ?? "";
+    const json = (status: number, body: unknown): void => {
+      res.writeHead(status, { "content-type": "application/json" });
+      res.end(JSON.stringify(body));
+    };
+    const redirect = this.redirect();
+    if (redirect && req.method === "POST" && p.startsWith(`${GATEWAY_PREFIX}/v1/messages`)) {
+      res.writeHead(redirect.status, { location: redirect.to });
+      res.end();
+      return;
+    }
+    if (req.method === "POST" && p === `${GATEWAY_PREFIX}/v1/messages/count_tokens`) return json(200, { input_tokens: 100 });
+    if (req.method !== "POST" || p !== `${GATEWAY_PREFIX}/v1/messages`) return json(404, { type: "error", error: { type: "not_found_error", message: "nf" } });
+    const body = JSON.parse(seen.body) as MessagesBody;
+    const tools = (body.tools ?? []).map((t) => t.name);
+    const systemText = typeof body.system === "string" ? body.system : (body.system ?? []).map((b) => b.text ?? "").join("\n");
+    const firstText = body.messages[0] ? textOf(body.messages[0].content) : "";
+    const isSub = systemText.includes(SUB_IDENTITY) || firstText.includes(SUBAGENT_TOKEN);
+    const hasBash = tools.includes("Bash");
+    const agentTool = tools.includes("Agent") ? "Agent" : "Task";
+    let turn: { text: string } | { tool: string; input: Record<string, unknown> };
+    if (!hasBash) turn = { text: "ok" }; // side calls (titles etc.), the small/fast slot
+    else if (isSub) turn = { text: "subagent done" };
+    else if (!this.spawned && tools.includes(agentTool)) {
+      this.spawned = true;
+      turn = { tool: agentTool, input: { description: "sub", prompt: `${SUBAGENT_TOKEN}: do the steps`, subagent_type: "helper" } };
+    } else turn = { text: "lead done" };
+    this.calls.push({
+      path: p, model: body.model ?? "", agent: isSub ? "sub" : hasBash ? "lead" : "side",
+      authorization: req.headers.authorization, xApiKey: typeof req.headers["x-api-key"] === "string" ? req.headers["x-api-key"] : undefined,
+    });
+    const content = "text" in turn
+      ? [{ type: "text", text: turn.text }]
+      : [{ type: "tool_use", id: `toolu_${this.calls.length}`, name: turn.tool, input: turn.input }];
+    const stopReason = "text" in turn ? "end_turn" : "tool_use";
+    const usage = { input_tokens: 100, output_tokens: 20 };
+    const message = { id: `msg_${this.calls.length}`, type: "message", role: "assistant", model: body.model ?? "x", stop_reason: null as string | null, stop_sequence: null, usage };
+    if (!body.stream) return json(200, { ...message, content, stop_reason: stopReason });
+    res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+    const send = (event: string, data: unknown): void => { res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); };
+    send("message_start", { type: "message_start", message: { ...message, content: [] } });
+    content.forEach((block, index) => {
+      if (block.type === "text") {
+        send("content_block_start", { type: "content_block_start", index, content_block: { type: "text", text: "" } });
+        send("content_block_delta", { type: "content_block_delta", index, delta: { type: "text_delta", text: (block as { text: string }).text } });
+      } else {
+        const tu = block as { id: string; name: string; input: unknown };
+        send("content_block_start", { type: "content_block_start", index, content_block: { type: "tool_use", id: tu.id, name: tu.name, input: {} } });
+        send("content_block_delta", { type: "content_block_delta", index, delta: { type: "input_json_delta", partial_json: JSON.stringify(tu.input) } });
+      }
+      send("content_block_stop", { type: "content_block_stop", index });
+    });
+    send("message_delta", { type: "message_delta", delta: { stop_reason: stopReason, stop_sequence: null }, usage });
+    send("message_stop", { type: "message_stop" });
+    res.end();
+  }
+}
+
+function credential(baseUrl: string, authStyle: "bearer" | "x_api_key"): SdkCredential {
+  return { kind: "provider", baseUrl, authStyle, key: KEY, modelMap: { sonnet: { model: "corp-sonnet" }, haiku: { model: "corp-haiku" } } };
+}
+
+describe("exclusive routing of the real CLI in provider mode (PRD #4320 module 7)", () => {
+  const roots: string[] = [];
+  after(() => { for (const r of roots) fs.rmSync(r, { recursive: true, force: true }); });
+
+  /** Drive the real CLI once under the provider env; resolves with the SDK env it was given and its stderr. */
+  async function drive(opts: {
+    cred: SdkCredential;
+    proxy: Recorder;
+    noProxy: string;
+    withSubagent: boolean;
+    boundedRetries: boolean;
+    budgetMs?: number;
+  }): Promise<{ env: Record<string, string | undefined>; stderr: string; failed: boolean }> {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-routing-it-"));
+    roots.push(root);
+    const home = path.join(root, "home");
+    const worktree = path.join(root, "worktree");
+    const tmp = path.join(root, "tmp");
+    for (const d of [path.join(home, ".claude"), worktree, tmp]) fs.mkdirSync(d, { recursive: true });
+    fs.writeFileSync(path.join(home, ".claude", "settings.json"), "{}\n");
+    const recorderUrl = `http://127.0.0.1:${opts.proxy.port}`;
+    const env = {
+      ...buildSdkEnv(opts.cred, home),
+      TMPDIR: tmp,
+      HTTPS_PROXY: recorderUrl,
+      HTTP_PROXY: recorderUrl,
+      https_proxy: recorderUrl,
+      http_proxy: recorderUrl,
+      NO_PROXY: opts.noProxy,
+      no_proxy: opts.noProxy,
+      ...(opts.boundedRetries ? { CLAUDE_CODE_MAX_RETRIES: "1" } : {}),
+    } as Record<string, string | undefined>;
+    let stderr = "";
+    let failed = false;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), opts.budgetMs ?? DRIVE_BUDGET_MS);
+    const options: Options = {
+      cwd: worktree,
+      env,
+      model: "sonnet",
+      permissionMode: "bypassPermissions",
+      allowDangerouslySkipPermissions: true,
+      settingSources: [],
+      stderr: (d: string) => { stderr += d; },
+      abortController: controller,
+      ...(opts.withSubagent
+        ? { agents: { helper: { description: "does one step", prompt: `Do exactly what the task says. ${SUB_IDENTITY}`, tools: ["Bash"], model: "haiku" as const } } }
+        : {}),
+    };
+    try {
+      for await (const m of query({ prompt: "run the steps", options })) {
+        const mm = m as { type: string; is_error?: boolean };
+        if (mm.type === "result" && mm.is_error) failed = true;
+      }
+    } catch {
+      failed = true;
+    } finally {
+      clearTimeout(timer);
+    }
+    return { env, stderr, failed };
+  }
+
+  async function startRecorder(): Promise<Recorder> {
+    const rec = new Recorder();
+    rec.port = (await rec.listen()).port;
+    return rec;
+  }
+
+  it("CALIBRATION: a binding to https://foreign.invalid is recorded at the proxy recorder (else routing is unverified)", { timeout: 120_000 }, async () => {
+    const rec = await startRecorder();
+    try {
+      await drive({ cred: credential("https://foreign.invalid", "bearer"), proxy: rec, noProxy: "127.0.0.1:1", withSubagent: false, boundedRetries: true, budgetMs: 40_000 });
+      assert.ok(
+        rec.targets.some((t) => t.includes("foreign.invalid")),
+        `ROUTING UNVERIFIED: the CLI's request to a foreign destination did not reach the recorder (targets: ${JSON.stringify(rec.targets)})`,
+      );
+    } finally {
+      await rec.close();
+    }
+  });
+
+  for (const authStyle of ["bearer", "x_api_key"] as const) {
+    it(`${authStyle}: main agent, a Task subagent and the auxiliary calls reach only the bound gateway`, { timeout: 120_000 }, async () => {
+      const rec = await startRecorder();
+      const gw = new Gateway();
+      const { port, origin } = await gw.listen();
+      try {
+        const base = `${origin}${GATEWAY_PREFIX}`;
+        const { env, failed, stderr } = await drive({ cred: credential(base, authStyle), proxy: rec, noProxy: `127.0.0.1:${port}`, withSubagent: true, boundedRetries: false });
+        assert.ok(!failed, `the drive failed: ${stderr.slice(0, 800)}`);
+        // The child env: no OAuth token anywhere, exactly one auth variable.
+        assert.equal(env.CLAUDE_CODE_OAUTH_TOKEN, undefined);
+        assert.equal(env.ANTHROPIC_BASE_URL, base);
+        // The recorder (the only other reachable destination) saw nothing.
+        assert.deepStrictEqual(rec.targets, [], `a request left the gateway: ${JSON.stringify(rec.targets)}`);
+        // Everything the gateway saw is under the bound base URL, and every model is a mapped one.
+        const paths = [...new Set(gw.calls.map((c) => c.path))];
+        const allPaths = [...new Set(gw.seen.map((s) => s.url.split("?")[0]))];
+        console.log(`ROUTING paths seen by the gateway (${authStyle}): ${JSON.stringify(allPaths)}; messages calls: ${gw.calls.length}`);
+        for (const p of allPaths) assert.ok(p!.startsWith(`${GATEWAY_PREFIX}/`), `a request left the base URL path: ${p}`);
+        assert.ok(paths.includes(`${GATEWAY_PREFIX}/v1/messages`), "the lead reached /v1/messages under the base URL");
+        const models = new Set(gw.calls.map((c) => c.model));
+        for (const m of models) assert.ok(m === "corp-sonnet" || m === "corp-haiku", `an unmapped model reached the gateway: ${m}`);
+        assert.ok(models.has("corp-sonnet"), "the lead ran on the mapped sonnet model");
+        assert.ok(models.has("corp-haiku"), "a haiku-slot call (subagent or auxiliary) ran on the mapped haiku model");
+        assert.ok(gw.calls.some((c) => c.agent === "sub"), "the Task subagent reached the gateway");
+        // The key rides in exactly the configured auth header.
+        for (const c of gw.calls) {
+          if (authStyle === "bearer") {
+            assert.equal(c.authorization, `Bearer ${KEY}`);
+            assert.equal(c.xApiKey, undefined);
+          } else {
+            assert.equal(c.xApiKey, KEY);
+            assert.equal(c.authorization, undefined);
+          }
+        }
+      } finally {
+        await gw.close();
+        await rec.close();
+      }
+    });
+  }
+
+  // ── Redirects ───────────────────────────────────────────────────────────────────────────────
+  // OBSERVED at the pinned SDK 0.3.319 / CLI 2.1.319 (2026-11-18): the CLI FOLLOWS a gateway 307 for
+  // POST /v1/messages, to a same-origin sibling path (with the auth header) and to a second loopback
+  // origin (bearer: the Authorization header is dropped by the fetch cross-origin rule; x_api_key: the
+  // `x-api-key` header IS forwarded). The strict not-followed assertions below are therefore RED, so
+  // they carry `todo` (reported, non-blocking) and the capability stays unadvertised until this is
+  // decided; the characterization test beneath them is green and pins what was observed, so a CLI
+  // bump that changes it is noticed. Remove `todo` when redirects are refused.
+  async function redirectRun(authStyle: "bearer" | "x_api_key", target: "same-origin sibling path" | "second loopback server") {
+    const rec = await startRecorder();
+    const other = new RecordingServer((_req, res) => { res.writeHead(500); res.end("must never be reached"); });
+    const otherAddr = await other.listen();
+    let location = "";
+    const gw = new Gateway(() => ({ status: 307, to: location }));
+    const { port, origin } = await gw.listen();
+    location = target === "same-origin sibling path" ? "/other-tenant/v1/messages" : `${otherAddr.origin}/v1/messages`;
+    try {
+      const { failed } = await drive({
+        cred: credential(`${origin}${GATEWAY_PREFIX}`, authStyle), proxy: rec,
+        noProxy: `127.0.0.1:${port},127.0.0.1:${otherAddr.port}`, withSubagent: false, boundedRetries: true, budgetMs: 40_000,
+      });
+      const line = (s: Seen): string => `${s.method} ${s.url}`;
+      return {
+        failed,
+        gatewayLines: gw.seen.map(line),
+        gatewaySibling: gw.seen.filter((s) => s.url.startsWith("/other-tenant")),
+        otherSeen: other.seen,
+        recorderTargets: rec.targets,
+      };
+    } finally {
+      await gw.close();
+      await other.close();
+      await rec.close();
+    }
+  }
+
+  for (const authStyle of ["bearer", "x_api_key"] as const) {
+    for (const target of ["same-origin sibling path", "second loopback server"] as const) {
+      it(`${authStyle}: a 307 to a ${target} is not followed with the key`, {
+        timeout: 120_000,
+        todo: "the pinned CLI follows a gateway 307 (see the characterization test); owner decision: ship blocked, relay later; capability not advertised",
+      }, async () => {
+        const r = await redirectRun(authStyle, target);
+        assert.ok(r.gatewayLines.some((l) => l.startsWith("POST /gw/anthropic/v1/messages")), "the gateway issued the redirect");
+        assert.deepStrictEqual(r.gatewaySibling.map((s) => `${s.method} ${s.url}`), [], "the same-origin sibling path received a request: the CLI FOLLOWED the redirect");
+        assert.deepStrictEqual(r.otherSeen.map((s) => `${s.method} ${s.url}`), [], "the second loopback server received a request: the CLI FOLLOWED the redirect");
+        assert.deepStrictEqual(r.recorderTargets, [], "a request left the gateway through the proxy");
+        assert.ok(r.failed, "with no usable answer the turn ends as an error");
+      });
+    }
+  }
+
+  for (const authStyle of ["bearer", "x_api_key"] as const) {
+    it(`CHARACTERIZATION ${authStyle}: what the pinned CLI does with a 307 (followed; which auth header travels)`, { timeout: 120_000 }, async () => {
+      const sibling = await redirectRun(authStyle, "same-origin sibling path");
+      const cross = await redirectRun(authStyle, "second loopback server");
+      const sib = sibling.gatewaySibling[0];
+      const hop = cross.otherSeen[0];
+      console.log(`REDIRECT ${authStyle}: sibling followed=${sib !== undefined} authTravelled=${sib ? (authStyle === "bearer" ? sib.headers.authorization !== undefined : sib.headers["x-api-key"] !== undefined) : "n/a"}; second origin followed=${hop !== undefined} authTravelled=${hop ? (authStyle === "bearer" ? hop.headers.authorization !== undefined : hop.headers["x-api-key"] !== undefined) : "n/a"}`);
+      assert.ok(sib, "the same-origin sibling redirect is followed (observed)");
+      assert.ok(hop, "the cross-origin redirect is followed (observed)");
+      assert.equal(authStyle === "bearer" ? sib.headers.authorization : sib.headers["x-api-key"], authStyle === "bearer" ? `Bearer ${KEY}` : KEY, "the key travels to the same-origin sibling");
+      if (authStyle === "bearer") assert.equal(hop.headers.authorization, undefined, "bearer: the fetch cross-origin rule drops Authorization");
+      else assert.equal(hop.headers["x-api-key"], KEY, "x_api_key: the key is forwarded to the second origin");
+    });
+  }
+});

@@ -317,6 +317,17 @@ export const COMMAND_ENV_PROTECTED_KEYS: ReadonlySet<string> = new Set([
   "CLAUDE_CODE_OAUTH_TOKEN",
   "ANTHROPIC_API_KEY",
   "ANTHROPIC_AUTH_TOKEN",
+  // PRD #4320 module 6: the provider-mode routing, model and context-window keys.
+  "ANTHROPIC_BASE_URL",
+  "ANTHROPIC_DEFAULT_OPUS_MODEL",
+  "ANTHROPIC_DEFAULT_SONNET_MODEL",
+  "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+  "ANTHROPIC_DEFAULT_FABLE_MODEL",
+  "ANTHROPIC_SMALL_FAST_MODEL",
+  "CLAUDE_CODE_SUBAGENT_MODEL",
+  "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+  "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
+  "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
   "AGENT_BROWSER_ARGS",
   // Defence in depth: a provisioned toolEnv can never point a command's Node TLS trust at a
   // file of its choosing. Nothing on the Codex path sets it.

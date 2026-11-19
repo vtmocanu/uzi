@@ -877,6 +877,38 @@ func parkedRun(now time.Time) apitypes.RunDTO {
 	}
 }
 
+// TestLimitWaitLineProviderGateway pins the provider gateway-limit park reading (PRD #4320 module 5):
+// it names the gateway, never a subscription window or reset, and the owner-wait row (NULL
+// retry_not_before) says it is waiting for the owner and names the resume command.
+func TestLimitWaitLineProviderGateway(t *testing.T) {
+	now := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
+	gw := func(retry *time.Time) apitypes.RunDTO {
+		rlt := "provider_gateway_limit"
+		return apitypes.RunDTO{ID: "run-9", Kind: "issue", Status: statusLimitWait, Harness: "claude",
+			RateLimitType: &rlt, RetryNotBefore: retry, LimitWaitCount: 2}
+	}
+	retry := now.Add(5 * time.Minute)
+	got := limitWaitLine(gw(&retry), now)
+	for _, want := range []string{"waiting: your provider's gateway rate limit", "retrying at", "(in 5m)", "attempt 2"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("limitWaitLine = %q, want it to contain %q", got, want)
+		}
+	}
+	for _, bad := range []string{"usage limit", "Anthropic", "resumes in"} {
+		if strings.Contains(got, bad) {
+			t.Errorf("limitWaitLine = %q, must not contain %q", got, bad)
+		}
+	}
+	owner := limitWaitLine(gw(nil), now)
+	if !strings.Contains(owner, "waiting for you to resume (uzi run resume run-9)") || strings.Contains(owner, "retrying at") {
+		t.Errorf("owner-wait line = %q, want the resume command and no retry time", owner)
+	}
+	past := now.Add(-time.Second)
+	if line := limitWaitLine(gw(&past), now); !strings.Contains(line, "retrying shortly") {
+		t.Errorf("past-due line = %q, want retrying shortly", line)
+	}
+}
+
 // TestLimitWaitLine pins the ONE sentence every CLI surface renders for a park.
 func TestLimitWaitLine(t *testing.T) {
 	now := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)

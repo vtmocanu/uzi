@@ -64,7 +64,10 @@ const (
 // Reasons a not_applied (or refused_committed) outcome carries. They are a closed vocabulary the
 // worker may log; none carries credential material.
 const (
-	applyReasonNoPendingSwitch      = "no_pending_switch"
+	applyReasonNoPendingSwitch = "no_pending_switch"
+	// applyReasonProviderBound: the run is bound to a model provider (PRD #4320 D8), whose key is
+	// frozen with the run; an in-place switch to a vendor token is never applied.
+	applyReasonProviderBound        = "provider_bound"
 	applyReasonGenerationMismatch   = "generation_mismatch"
 	applyReasonNoCredential         = "no_credential"          //nolint:gosec // G101: an apply-outcome reason VOCABULARY value, not a credential.
 	applyReasonCredentialDisabled   = "credential_disabled"    //nolint:gosec // G101: an apply-outcome reason VOCABULARY value, not a credential.
@@ -293,6 +296,12 @@ func (s *Service) applyCredentialSwitchOnce(ctx context.Context, wkr store.Worke
 		!run.WorkerID.Valid || uuid.UUID(run.WorkerID.Bytes) != wkr.ID ||
 		run.ClaimGeneration != gen || run.ClaimReleasedAt.Valid || !applyLiveStatus(run.Status) {
 		return fenced, nil
+	}
+	// Step 0, provider binding (PRD #4320 D8): no in-place credential switch on a provider-bound
+	// run. Nothing commits; a provider-bound run never has a pending switch (SetRunCredential
+	// refuses to stamp one), so this is the defense in depth for a stamp from any other writer.
+	if providerBoundRun(run) {
+		return CredentialSwitchApplyResult{Outcome: ApplyOutcomeNotApplied, Reason: applyReasonProviderBound}, nil
 	}
 
 	// Step 1: replay. The operation already committed in this run and generation.

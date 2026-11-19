@@ -64,7 +64,12 @@ class SecretRegistry {
 
   scrub(line: string): string {
     let out = line;
-    for (const s of this.counts.keys()) out = out.split(s).join(REDACTED);
+    for (const s of this.counts.keys()) {
+      out = out.split(s).join(REDACTED);
+      // A JSON-serialized line carries a secret containing `"` or `\` in its escaped form.
+      const escaped = JSON.stringify(s).slice(1, -1);
+      if (escaped !== s) out = out.split(escaped).join(REDACTED);
+    }
     return out;
   }
 }

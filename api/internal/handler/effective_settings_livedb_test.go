@@ -123,6 +123,8 @@ func newEffFix(t *testing.T, instance settings.Store) *effFix {
 		Autoselect:             autoselect.Policy{Order: autoselect.OrderHeadroomFirst, MinHeadroom: 10, HeadroomTiePct: 5, InflightPenalty: 10, MaxStaleness: 15 * time.Minute},
 		UsagePollInterval:      5 * time.Minute,
 		CodexUsagePollInterval: 10 * time.Minute,
+		// PRD #4320: the provider tests select a source at effProviderBase; no other test selects one.
+		ProviderAllowedBaseURLs: []string{effProviderBase},
 	})
 	wsvc.SetTxBeginner(pool)
 	wsvc.SetForges(effForges{})

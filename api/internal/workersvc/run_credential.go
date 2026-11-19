@@ -185,9 +185,21 @@ func (s *Service) SetRunCredential(ctx context.Context, userID, runID uuid.UUID,
 	// The ONE validator (D5/D9/D10): lane (409) → harness (422) → mode (404/400). It never
 	// writes, so validating before the status dispatch is safe; a refusal returns a typed
 	// error the handler maps to a status and no override is written.
-	resolved, err := s.validateCredentialOverride(ctx, userID, run.Kind, harness, mode, secretID)
+	// PRD #4320 D8: no live credential switching on a provider-bound run (its credential is the
+	// frozen provider key), whatever the mode, and no switch of a vendor run to `default` while the
+	// owner's Claude source is a provider. Checked before the status dispatch, so nothing is written.
+	// This covers `uzi run set-token` and `uzi approve --token`, which is a client-side SetRunCredential.
+	if providerBoundRun(run) {
+		return SetRunCredentialResult{}, ErrCredentialOverrideProviderSource
+	}
+	resolved, err := s.validateRunSwitchOverride(ctx, userID, run.Kind, harness, mode, secretID)
 	if err != nil {
 		return SetRunCredentialResult{}, err
+	}
+	if mode == CredentialOverrideModeDefault {
+		if err := refuseOverrideForProviderOwner(ctx, s.q, userID); err != nil {
+			return SetRunCredentialResult{}, err
+		}
 	}
 
 	// issue #3194: a base-attestation hold never runs again, so no token switch can resume it.

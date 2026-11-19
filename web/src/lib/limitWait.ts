@@ -78,7 +78,35 @@ export const RATE_LIMIT_WINDOW_LABELS: Readonly<Record<string, string>> = {
   seven_day_overage_included: "7-day window (overage included)",
   overage: "overage limit",
   unknown: "usage window",
+  // PRD #4320: a provider-bound run parked on a persistent gateway 429/529. No subscription window.
+  provider_gateway_limit: "provider gateway rate limit",
 };
+
+/** The server's literal for a provider gateway-limit park (`workersvc.RateLimitTypeProviderGatewayLimit`). */
+export const PROVIDER_GATEWAY_LIMIT = "provider_gateway_limit";
+
+export function isProviderGatewayLimit(type: string | null | undefined): boolean {
+  return type === PROVIDER_GATEWAY_LIMIT;
+}
+
+/**
+ * The words for a provider gateway-limit park (PRD #4320 module 5). The run DTO does not carry the
+ * provider's name yet, so this says "your provider"; naming it follows the DTO addition in M7.
+ * It never says "usage limit" or a reset time: no subscription window exists, and the server
+ * records no resets_at. A null `retryIso` is the owner-wait row (the fourth gateway park onward).
+ */
+export function providerGatewayLimitHeadline(): string {
+  return "Waiting: your provider's gateway rate limit";
+}
+
+export function providerGatewayLimitDetail(retryIso: string | null | undefined, nowMs: number): string {
+  if (!retryIso) return "Waiting for you to resume.";
+  const target = Date.parse(retryIso);
+  if (!Number.isFinite(target)) return "Waiting for you to resume.";
+  const countdown = formatCountdown(retryIso, nowMs);
+  const at = new Date(target).toLocaleTimeString(undefined, { timeStyle: "short" });
+  return countdown ? `Retrying at ${at} (in ${countdown}).` : "Retrying shortly.";
+}
 
 /**
  * The label for a SERVER-ALLOWLISTED type (a run row's `rate_limit_type`).

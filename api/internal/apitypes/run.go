@@ -469,6 +469,9 @@ type RunDTO struct {
 	// 'iteration_budget_exhausted' for an iteration park (Resume/Cancel; Extend adds time only),
 	// 'credential_disabled' while a credential the run needs is disabled (PRD #1732 D14),
 	// 'credentials_reset' while a run created before an account reset waits for a new credential (PRD #3989),
+	// 'provider_destination_not_allowed' / 'provider_binding_stale' while a provider-bound run's next claim was
+	// refused (PRD #4320: the operator no longer allows its URL, which re-queues by itself once allowed again;
+	// or its provider or key changed after creation, which is final; Resume is refused for both),
 	// 'credential_switch_settling' while the worker is still finishing its own operations on a run whose
 	// token switch could not be proven settled (Resume is refused until it finishes; Cancel works),
 	// 'credential_switch_unsettled' once it finished them, processes not proven stopped (Resume is open) (issue
@@ -801,6 +804,17 @@ type RunDTO struct {
 	// account, so it must not reach latestRunDTO without that struct's IsMine gate.
 	AnthropicSecretID    *string `json:"anthropic_secret_id"`
 	AnthropicSecretLabel *string `json:"anthropic_secret_label"`
+	// ProviderID / ProviderName name the custom model provider the run is bound to (PRD #4320).
+	// ProviderID is the run's bound provider id (a run carries no foreign key to the provider,
+	// so it outlives a deleted provider); null for a run on the vendor's own API. ProviderName is
+	// the provider's CURRENT name, resolved under the run's owner. A null ProviderName means a
+	// vendor run (ProviderID also null) OR that the name was not resolved for this response
+	// (provider deleted, lookup failed, or a mutation response that does not resolve names), so
+	// a client must not read null-name-with-id as "deleted". The name is USER-AUTHORED text:
+	// render it as plain text (the CLI through cellText/renderer.Plain, the web escaped).
+	// Owner-or-admin scoped like the Anthropic label above; never added to the shared board DTO.
+	ProviderID   *string `json:"provider_id"`
+	ProviderName *string `json:"provider_name"`
 	// AnthropicSelectReason is the MODE that named that credential, and it is why
 	// the label alone was never enough (PRD #111 M5, D20). An auto pick and a default
 	// fallback can name the SAME token, so "which account paid" and "why that account"
@@ -1445,6 +1459,9 @@ type RunSummaryItemDTO struct {
 	// 'iteration_budget_exhausted' for an iteration park (Resume/Cancel; Extend adds time only),
 	// 'credential_disabled' while a credential the run needs is disabled (PRD #1732 D14),
 	// 'credentials_reset' while a run created before an account reset waits for a new credential (PRD #3989),
+	// 'provider_destination_not_allowed' / 'provider_binding_stale' while a provider-bound run's next claim was
+	// refused (PRD #4320: the operator no longer allows its URL, which re-queues by itself once allowed again;
+	// or its provider or key changed after creation, which is final; Resume is refused for both),
 	// 'credential_switch_settling' while the worker is still finishing its own operations on a run whose
 	// token switch could not be proven settled (Resume is refused until it finishes; Cancel works),
 	// 'credential_switch_unsettled' once it finished them, processes not proven stopped (Resume is open) (issue
@@ -1751,6 +1768,17 @@ type RunSummaryItemDTO struct {
 	// account, so it must not reach latestRunDTO without that struct's IsMine gate.
 	AnthropicSecretID    *string `json:"anthropic_secret_id"`
 	AnthropicSecretLabel *string `json:"anthropic_secret_label"`
+	// ProviderID / ProviderName name the custom model provider the run is bound to (PRD #4320).
+	// ProviderID is the run's bound provider id (a run carries no foreign key to the provider,
+	// so it outlives a deleted provider); null for a run on the vendor's own API. ProviderName is
+	// the provider's CURRENT name, resolved under the run's owner. A null ProviderName means a
+	// vendor run (ProviderID also null) OR that the name was not resolved for this response
+	// (provider deleted, lookup failed, or a mutation response that does not resolve names), so
+	// a client must not read null-name-with-id as "deleted". The name is USER-AUTHORED text:
+	// render it as plain text (the CLI through cellText/renderer.Plain, the web escaped).
+	// Owner-or-admin scoped like the Anthropic label above; never added to the shared board DTO.
+	ProviderID   *string `json:"provider_id"`
+	ProviderName *string `json:"provider_name"`
 	// AnthropicSelectReason is the MODE that named that credential, and it is why
 	// the label alone was never enough (PRD #111 M5, D20). An auto pick and a default
 	// fallback can name the SAME token, so "which account paid" and "why that account"
@@ -2231,6 +2259,8 @@ func RunSummaryOf(item RunListItemDTO) RunSummaryItemDTO {
 		OwnAgents:                     item.OwnAgents,
 		AnthropicSecretID:             item.AnthropicSecretID,
 		AnthropicSecretLabel:          item.AnthropicSecretLabel,
+		ProviderID:                    item.ProviderID,
+		ProviderName:                  item.ProviderName,
 		AnthropicSelectReason:         item.AnthropicSelectReason,
 		AnthropicHeadroomPct:          item.AnthropicHeadroomPct,
 		Usage:                         item.Usage,
@@ -2425,6 +2455,8 @@ func (s RunSummaryItemDTO) ListItem() RunListItemDTO {
 			OwnAgents:                     s.OwnAgents,
 			AnthropicSecretID:             s.AnthropicSecretID,
 			AnthropicSecretLabel:          s.AnthropicSecretLabel,
+			ProviderID:                    s.ProviderID,
+			ProviderName:                  s.ProviderName,
 			AnthropicSelectReason:         s.AnthropicSelectReason,
 			AnthropicHeadroomPct:          s.AnthropicHeadroomPct,
 			Usage:                         s.Usage,

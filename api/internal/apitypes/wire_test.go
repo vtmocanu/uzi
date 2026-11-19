@@ -252,6 +252,9 @@ var runDTOKeys = []string{
 	"disk_park_count",
 	// PRD #1733: the open provider-park streak (count, and when it began; null when none is open).
 	"provider_park_count", "provider_park_streak_started_at",
+	// PRD #4320: the bound custom model provider (both null for a vendor run; the name is also null
+	// once the provider is deleted).
+	"provider_id", "provider_name",
 	// PRD #1590 D6: the derived owner action for a codex_account_unavailable hold (null otherwise).
 	"codex_account_action",
 	// Issue #1730: the run's bound alias id and its independent snapshotted label.
@@ -1229,6 +1232,8 @@ func TestUserSettingsDTOTags(t *testing.T) {
 		"now_summary_enabled",
 		// PRD #3245: the Codex judge lane and the read-only resolved judge cells.
 		"codex_judge_model", "judge_models", "judge_runs_on",
+		// PRD #4320: the provider the Claude lane runs on (null ⇒ vendor ladder).
+		"claude_provider_id",
 		// PRD #3248: the Codex summary lane and the read-only resolved summary cells.
 		"codex_summary_model", "summary_models",
 		// PRD #3247: the read-only resolved ordinary effort cells.

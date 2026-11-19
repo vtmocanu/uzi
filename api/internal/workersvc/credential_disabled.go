@@ -247,14 +247,45 @@ func (s *Service) promoteCredentialDisabledRun(ctx context.Context, userID, runI
 		return "", err
 	}
 	if run.Status != "paused" || !run.HoldReason.Valid ||
-		(run.HoldReason.String != holdCredentialDisabled && run.HoldReason.String != holdCredentialsReset) {
+		(run.HoldReason.String != holdCredentialDisabled && run.HoldReason.String != holdCredentialsReset &&
+			run.HoldReason.String != holdProviderDestinationNotAllowed) {
 		return "", nil // no longer this hold
 	}
 	// (3) + (4) The requirement source and the requirement credential.
 	var met bool
-	if run.HoldReason.String == holdCredentialsReset {
+	switch run.HoldReason.String {
+	case holdProviderDestinationNotAllowed:
+		// PRD #4320 module 5: the one provider refusal with a promoter. The requirement is the run's OWN
+		// frozen binding (never the owner's Anthropic default or current provider source): re-queue only
+		// when its URL is allowlisted again AND the binding is otherwise intact. provider_binding_stale
+		// is not in this hold set at all: it has no promoter.
+		var reason string
+		reason, err = s.providerHoldRefusal(ctx, q, promotionRunBinding(run))
+		if err != nil {
+			return "", err
+		}
+		if reason == holdProviderBindingStale {
+			// The binding broke while parked: the destination hold's copy ("resumes automatically") is
+			// false now, so the hold becomes the final provider_binding_stale, in this same transaction
+			// under the run lock (never a promotion).
+			n, werr := q.RewriteProviderDestinationHoldStale(ctx, store.RewriteProviderDestinationHoldStaleParams{
+				ID: run.ID, UserID: run.UserID, ClaimGeneration: run.ClaimGeneration,
+			})
+			if werr != nil {
+				return "", fmt.Errorf("rewrite provider hold stale: %w", werr)
+			}
+			if n != 1 {
+				return "", nil
+			}
+			if err := tx.Commit(ctx); err != nil {
+				return "", err
+			}
+			return "paused", nil
+		}
+		met = reason == ""
+	case holdCredentialsReset:
 		met, err = s.credentialsResetRequirementMet(ctx, q, run)
-	} else {
+	default:
 		heartbeatCutoff := pgconv.Time(s.now().Add(-s.p.WorkerHeartbeatStale))
 		met, err = credentialRequirementMet(ctx, q, run, heartbeatCutoff)
 	}
@@ -537,6 +568,13 @@ func (s *Service) reassignCredentialDisabledRun(ctx context.Context, userID, run
 // resolved (no recorded worker, a deleted credential) is promoted, so the next claim decides
 // with its own checks instead of the run waiting forever on something that no longer exists.
 func credentialRequirementMet(ctx context.Context, q *store.Queries, run store.LockCredentialDisabledRunForPromotionRow, heartbeatCutoff pgtype.Timestamptz) (bool, error) {
+	// PRD #4320 module 5: a provider-bound run has no Anthropic credential requirement: its claim never
+	// reads the owner's default, worker or judge binding, so none of them can ever satisfy (or be
+	// promoted on) its hold. It is never promoted through this credential ladder; the one provider hold
+	// with a promoter (provider_destination_not_allowed) is decided by providerHoldRefusal.
+	if providerBoundRun(promotionRunBinding(run)) {
+		return false, nil
+	}
 	if run.Harness == harnessCodex {
 		if !run.CodexSecretID.Valid {
 			return true, nil
@@ -615,7 +653,13 @@ func credentialRequirementMet(ctx context.Context, q *store.Queries, run store.L
 // causes a terminal failure.
 func (s *Service) credentialsResetRequirementMet(ctx context.Context, q *store.Queries, run store.LockCredentialDisabledRunForPromotionRow) (bool, error) {
 	harness := Harness(run.Harness)
-	_, err := s.resolveRunHarnessQ(ctx, run.UserID, &harness, q)
+	// PRD #4320: a provider-bound run does not depend on a vendor credential, and a held run's
+	// requirement is its own lineage's, never the owner's CURRENT provider source: a bound run is
+	// released (its claim re-validates the frozen binding), a vendor run is resolved vendor-only.
+	if providerBoundRun(promotionRunBinding(run)) {
+		return true, nil
+	}
+	_, err := s.resolveRunHarnessMode(ctx, run.UserID, &harness, q, true)
 	switch {
 	case err == nil:
 		return true, nil

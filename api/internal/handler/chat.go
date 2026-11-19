@@ -39,7 +39,7 @@ func (h *Handler) CreateChat(w http.ResponseWriter, r *http.Request) {
 	}
 	run, err := h.wsvc.CreateChatRun(r.Context(), user.ID, req.Message)
 	if err != nil {
-		if h.writeChatInputError(w, err) {
+		if h.writeChatInputError(w, err) || writeProviderCreateRefusal(w, err) {
 			return
 		}
 		slog.Error("create chat", "error", err)
@@ -168,6 +168,7 @@ func (h *Handler) ContinueChat(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusNotFound, "chat not found")
 		case errors.Is(err, workersvc.ErrChatNotEnded):
 			httpx.Error(w, http.StatusConflict, "this conversation is still active")
+		case writeProviderCreateRefusal(w, err):
 		default:
 			slog.Error("continue chat", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")

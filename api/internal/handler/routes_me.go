@@ -87,6 +87,42 @@ func (h *Handler) mountMeRoutes(r chi.Router, authLimiter *mw.Limiter) {
 		})
 	})
 
+	// Model providers (PRD #4320 M1): user-defined Anthropic-compatible endpoints. Reads, create,
+	// the name/model-map edit and retire are RequireUser (a CLI `uzi provider` command can drive
+	// them): none reveals or replaces a credential, and the destination they can set is bound to
+	// the operator allowlist. Everything that handles the key or moves the destination (key
+	// set/rotate/delete/enable, the endpoint edit, delete) stays cookie-only, DELIBERATELY, for the
+	// same reason /me/secrets writes are: a stolen uzc_ must not replace a key or repoint the
+	// destination the key is sent to.
+	r.Route("/me/providers", func(r chi.Router) {
+		r.Group(func(r chi.Router) {
+			r.Use(h.requireUser())
+			r.Get("/", h.ListMyProviders)
+			r.Post("/", h.CreateMyProvider)
+			r.Get("/{id}", h.GetMyProvider)
+			r.Patch("/{id}", h.PatchMyProvider)
+			r.Post("/{id}/retire", h.RetireMyProvider)
+			// The Claude provider source (PRD #4320 M4): selecting or clearing which provider the
+			// caller's Claude runs use. RequireUser (a CLI `uzi provider use` can drive it, plan
+			// decision P1): it reveals no key and cannot move a destination, and a select is
+			// refused unless the provider is the caller's, usable and allowlisted. A static path,
+			// matched ahead of /{id}.
+			r.Put("/claude-source", h.SetMyClaudeProviderSource)
+			// The Test probe sends the stored key to the stored (allowlisted) destination and
+			// returns only two outcome words, so a Bearer caller can run it but cannot read the
+			// key or move the destination. Rate-limited by its own in-memory admission limiter.
+			r.Post("/{id}/test", h.TestMyProvider)
+		})
+		r.Group(func(r chi.Router) {
+			r.Use(h.requireAuth())
+			r.Put("/{id}/key", h.PutMyProviderKey)
+			r.Delete("/{id}/key", h.DeleteMyProviderKey)
+			r.Patch("/{id}/key/enabled", h.PatchMyProviderKeyEnabled)
+			r.Patch("/{id}/endpoint", h.PatchMyProviderEndpoint)
+			r.Delete("/{id}", h.DeleteMyProvider)
+		})
+	})
+
 	// CLI token management (PRD #64): the credential the `uzi` CLI presents as a
 	// Bearer token. Cookie-only, DELIBERATELY (Decision 16) — never RequireUser:
 	// a Bearer-reachable CRUD would let a stolen uzc_ mint replacements (revocation

@@ -31,6 +31,7 @@ import type {
   Proposal,
   ReviewCommentsSnapshot,
   RunKind,
+  ClaimProviderBinding,
 } from "./protocol.js";
 import type { AnswerVerdict, PauseMode, PlanVerdict } from "./steering.js";
 import { normalizeVerifiedSha, type PrSummaryClaim } from "./signals.js";
@@ -321,8 +322,11 @@ export interface RunContext {
    *  redactor is built from. The Codex executor applies it to projected tool text BEFORE bounding,
    *  so a claim secret straddling the cut cannot leave an unredacted prefix. Absent ⇒ identity. */
   redactText?: (s: string) => string;
-  /** Anthropic subscription OAuth token (CLAUDE_CODE_OAUTH_TOKEN) for the SDK. */
+  /** Anthropic subscription OAuth token (CLAUDE_CODE_OAUTH_TOKEN) for the SDK. Empty on a provider run. */
   oauthToken?: string;
+  /** PRD #4320 module 5/6: the decoded provider binding of a provider-bound run (exclusive with
+   *  `oauthToken`). Every Claude spawn of the run builds its env from it, never from an OAuth token. */
+  provider?: ClaimProviderBinding;
   /** Issue #4201: the run's current Anthropic credential, an immutable `{token, ordinal}` snapshot
    *  that an in-place switch advances. Absent on stubs, which keep reading `oauthToken`. */
   credential?: () => Readonly<{ token: string; ordinal: number }>;

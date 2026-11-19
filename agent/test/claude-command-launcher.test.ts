@@ -428,12 +428,12 @@ describe("guardedCommandEnv", () => {
   it("issue #3382: a cliEnv built by buildSdkEnv carries the configured Go concurrency into the guarded command env", () => {
     try {
       configureGoConcurrency({ buildParallelism: 2, maxProcs: 3 });
-      const out = guardedCommandEnv(buildSdkEnv("oauth", "/home/runner"));
+      const out = guardedCommandEnv(buildSdkEnv({ kind: "oauth", token: "oauth" }, "/home/runner"));
       assert.equal(out.GOFLAGS, "-p=2");
       assert.equal(out.GOMAXPROCS, "3");
       assert.ok(!("CLAUDE_CODE_OAUTH_TOKEN" in out));
       configureGoConcurrency({});
-      const bare = guardedCommandEnv(buildSdkEnv("oauth", "/home/runner"));
+      const bare = guardedCommandEnv(buildSdkEnv({ kind: "oauth", token: "oauth" }, "/home/runner"));
       assert.equal(Object.hasOwn(bare, "GOFLAGS"), false);
       assert.equal(Object.hasOwn(bare, "GOMAXPROCS"), false);
     } finally {
@@ -442,7 +442,7 @@ describe("guardedCommandEnv", () => {
   });
 
   it("issue #3907: a cliEnv built by buildSdkEnv keeps the browser discovery paths in the guarded command env", () => {
-    const out = guardedCommandEnv(buildSdkEnv("oauth", "/home/runner", { CHROME_PATH: "/evil/chrome" }));
+    const out = guardedCommandEnv(buildSdkEnv({ kind: "oauth", token: "oauth" }, "/home/runner", { CHROME_PATH: "/evil/chrome" }));
     assert.equal(out.AGENT_BROWSER_EXECUTABLE_PATH, "/usr/local/bin/uzi-chromium");
     assert.equal(out.CHROME_PATH, "/usr/local/bin/uzi-chromium");
   });

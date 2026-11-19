@@ -71,6 +71,9 @@ services:
       # Issue tracker SSRF allowlist (PRD #4173 S3): separate from the forge one, https
       # only, empty by default (no issue tracker connection can be created). Not worker egress.
       ISSUE_TRACKER_ALLOWED_BASE_URLS: ${ISSUE_TRACKER_ALLOWED_BASE_URLS:-}
+      # PRD #4320: exact model-provider base URLs with path; empty = feature off. Loopback (dev only) needs the flag.
+      UZI_PROVIDER_ALLOWED_BASE_URLS: ${UZI_PROVIDER_ALLOWED_BASE_URLS:-}
+      UZI_PROVIDER_ALLOW_LOOPBACK: ${UZI_PROVIDER_ALLOW_LOOPBACK:-false}
       FORGE_POLL_INTERVAL: ${FORGE_POLL_INTERVAL:-60s}
       FORGE_RECONCILE_EVERY: ${FORGE_RECONCILE_EVERY:-10}
       FORGE_HTTP_TIMEOUT: ${FORGE_HTTP_TIMEOUT:-15s}

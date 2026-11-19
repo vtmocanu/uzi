@@ -177,8 +177,8 @@ func TestSourceEndDeclinedMigrationAndLegacyResumeLiveDB(t *testing.T) {
 		}
 	}
 	mustExec(ctx, t, pool, "UPDATE runs SET status='recovery_wait' WHERE id=$1", run)
-	// Generated queries expand workers.* and so name columns added by later migrations:
-	// bring the schema to head before calling them. The 462/463 assertions above stay pinned.
+	// Generated queries expand workers.* and runs.* to current columns, so bring the
+	// schema to head before calling them. The 462/463 assertions above stay pinned.
 	if err := store.Migrate(ctx, dsn); err != nil {
 		t.Fatal(err)
 	}

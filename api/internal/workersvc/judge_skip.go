@@ -23,6 +23,9 @@ const (
 	JudgeSkipNoUsableCredential   = "no_usable_credential" //nolint:gosec // G101: fixed skip reason code, not a credential
 	JudgeSkipCredentialDisabled   = "credential_disabled"  //nolint:gosec // G101: fixed skip reason code, not a credential
 	JudgeSkipCodexPoolUnavailable = "codex_pool_unavailable"
+	// JudgeSkipProviderLaneUnsupported (PRD #4320): the owner's Claude source is a model provider,
+	// which the judge lane does not serve yet (PRD #4322).
+	JudgeSkipProviderLaneUnsupported = "provider_lane_unsupported"
 )
 
 // JudgeSkipReasons lists every reason the judge_skips CHECK accepts.
@@ -30,6 +33,7 @@ var JudgeSkipReasons = []string{
 	JudgeSkipNoUsableCredential,
 	JudgeSkipCredentialDisabled,
 	JudgeSkipCodexPoolUnavailable,
+	JudgeSkipProviderLaneUnsupported,
 }
 
 // JudgeSkip is the recorded reason the automatic judge of a run was skipped.

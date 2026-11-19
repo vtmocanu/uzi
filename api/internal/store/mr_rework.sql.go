@@ -62,7 +62,7 @@ const createAutoMRReworkRun = `-- name: CreateAutoMRReworkRun :one
 INSERT INTO runs (
     user_id, repo_id, kind, issue_title, issue_description,
     pipeline_ref, mr_iid, target_run_id, review_comments, auto_approve, wait_on_limit, required_capabilities, hinted_capabilities, ignored_inferred_capabilities, trigger_source, harness, plan_cross_check_required
-, code_cross_check_required, ci_config_guard, ci_config_paths, repo_agent_source_required)
+, code_cross_check_required, ci_config_guard, ci_config_paths, repo_agent_source_required, model_provider_id, model_provider_revision, model_provider_key_mode, model_provider_key_secret_id, model_provider_key_rev)
 SELECT
     $1, $2::uuid, 'mr_rework', $3, $4,
     $5, $6, $7, $8::jsonb, true, $9,
@@ -78,7 +78,7 @@ SELECT
     (SELECT array_agg(DISTINCT x.p ORDER BY x.p) FROM (
         SELECT unnest(g.ci_config_paths) AS p FROM runs g WHERE g.repo_id = $2::uuid AND g.ci_config_guard
           AND (g.id = $7 OR g.branch = $5 OR 'uzi/prompt-' || g.id::text = $5)
-    ) x), true
+    ) x), true, $12::uuid, $13::int, $14::text, $15::uuid, $16::bigint
 WHERE NOT EXISTS (
     SELECT 1 FROM runs
     WHERE repo_id = $2::uuid
@@ -86,21 +86,26 @@ WHERE NOT EXISTS (
       AND pipeline_ref = $5
       AND status NOT IN ('completed', 'failed', 'cancelled')
 )
-RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash, pause_requested_at, pause_mode, pause_after_count, checkpoint_tip_at, recovery_wait_count, recovery_retry_not_before, completion_contract_version, contract_revision, completion_contract, completion_attempts, latest_completion_attempt, milestones_agents, hold_reason, hold_captured_head, completion_budget_exhausted_at, completion_question_at, budget_extension_seconds, claim_generation, harness, recovery_wait_cause, forge_park_count, credential_override_mode, credential_override_secret_id, claim_released_at, credential_switch_requested_at, credential_switch_generation, stale_requeue_generation, budget_finalize_seconds, released_worker_id, released_worker_nonce, gate_revision, gate_presentation_id, gate_presented_payload, gate_payload_digest, gate_refusal_count, gate_refusal_generation, disk_park_count, checkpoint_contains_latest, egress_profile_id, egress_snapshot, job_type, finalize_resume_generation, job_protocol, first_started_at, plan_cross_check_required, plan_cross_check_gate_reason, issue_raw_digest, issue_saved_body, issue_input_reason, auto_approve_blocked_reasons, plan_cross_check_diff_refusal, worker_recovery_episode, requeue_episode_baseline, worker_recovery_evidence, cross_check_lane, cross_check_lane_generation, completion_final_head, code_cross_check_required, provider_park_count, provider_park_streak_started_at, ci_config_guard, memory_episode, memory_intervention_count, memory_policy, completion_non_closing_reason, ci_artifact_manifest, checkpoint_attested_source, source_publication_intent, continued_issue_iid, checkpoint_coordinates, retained_park_count, ignored_inferred_capabilities, reserve_hold_reason, reserve_exempt_until, reserve_exempt_granted_at, reserve_exempt_credential_id, reserve_exempt_window_reset, reserve_exempt_prior_pct, hinted_capabilities, capability_inference_evidence, idle_stall_park_count, forge_admission, codex_select_reason, recovery_wait_phase, plan_cross_check_gated, policy_preserve_required, policy_pending_fresh, policy_outcome_id, policy_continuation_mode, policy_resolved_at, policy_applying_worker_id, policy_applying_generation, policy_source_generation, policy_refusal_count, policy_refusal_tag, policy_refusal_phase, policy_refusal_correlation_id, policy_hold_published, harness_preferred, harness_decision_reason, harness_preferred_score, harness_other_score, harness_preferred_measured, harness_other_measured, harness_preferred_held, harness_other_held, harness_preferred_weekly_reset_at, harness_other_weekly_reset_at, registration_evidence_generation, registration_evidence_nonce, registration_evidence_epoch, snapshot_departed_generation, snapshot_departed_nonce, snapshot_departed_epoch, repo_agent_source_commit, repo_agent_source_required, agent_source_requested, agent_source_requested_basis, plan_agent_source, ci_fix_mr_iid, policy_required_head, policy_recovery_verified_generation, policy_recovery_verified_head, policy_hold_cause, policy_fresh_consumed_generation, policy_fresh_confirmed_generation, recovery_wait_detail, credential_switch_op_id, credential_switch_hold_op_id, credential_switch_hold_generation, credential_switch_hold_worker_id, credential_switch_hold_register_nonce, effort, model_source, effort_source, checkpoint_withheld_since, checkpoint_withheld_status_since, checkpoint_withheld_worker_id, checkpoint_withheld_generation, checkpoint_withheld_nonce, checkpoint_withheld_report_seq
+RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash, pause_requested_at, pause_mode, pause_after_count, checkpoint_tip_at, recovery_wait_count, recovery_retry_not_before, completion_contract_version, contract_revision, completion_contract, completion_attempts, latest_completion_attempt, milestones_agents, hold_reason, hold_captured_head, completion_budget_exhausted_at, completion_question_at, budget_extension_seconds, claim_generation, harness, recovery_wait_cause, forge_park_count, credential_override_mode, credential_override_secret_id, claim_released_at, credential_switch_requested_at, credential_switch_generation, stale_requeue_generation, budget_finalize_seconds, released_worker_id, released_worker_nonce, gate_revision, gate_presentation_id, gate_presented_payload, gate_payload_digest, gate_refusal_count, gate_refusal_generation, disk_park_count, checkpoint_contains_latest, egress_profile_id, egress_snapshot, job_type, finalize_resume_generation, job_protocol, first_started_at, plan_cross_check_required, plan_cross_check_gate_reason, issue_raw_digest, issue_saved_body, issue_input_reason, auto_approve_blocked_reasons, plan_cross_check_diff_refusal, worker_recovery_episode, requeue_episode_baseline, worker_recovery_evidence, cross_check_lane, cross_check_lane_generation, completion_final_head, code_cross_check_required, provider_park_count, provider_park_streak_started_at, ci_config_guard, memory_episode, memory_intervention_count, memory_policy, completion_non_closing_reason, ci_artifact_manifest, checkpoint_attested_source, source_publication_intent, continued_issue_iid, checkpoint_coordinates, retained_park_count, ignored_inferred_capabilities, reserve_hold_reason, reserve_exempt_until, reserve_exempt_granted_at, reserve_exempt_credential_id, reserve_exempt_window_reset, reserve_exempt_prior_pct, hinted_capabilities, capability_inference_evidence, idle_stall_park_count, forge_admission, codex_select_reason, recovery_wait_phase, plan_cross_check_gated, policy_preserve_required, policy_pending_fresh, policy_outcome_id, policy_continuation_mode, policy_resolved_at, policy_applying_worker_id, policy_applying_generation, policy_source_generation, policy_refusal_count, policy_refusal_tag, policy_refusal_phase, policy_refusal_correlation_id, policy_hold_published, harness_preferred, harness_decision_reason, harness_preferred_score, harness_other_score, harness_preferred_measured, harness_other_measured, harness_preferred_held, harness_other_held, harness_preferred_weekly_reset_at, harness_other_weekly_reset_at, registration_evidence_generation, registration_evidence_nonce, registration_evidence_epoch, snapshot_departed_generation, snapshot_departed_nonce, snapshot_departed_epoch, repo_agent_source_commit, repo_agent_source_required, agent_source_requested, agent_source_requested_basis, plan_agent_source, ci_fix_mr_iid, policy_required_head, policy_recovery_verified_generation, policy_recovery_verified_head, policy_hold_cause, policy_fresh_consumed_generation, policy_fresh_confirmed_generation, recovery_wait_detail, credential_switch_op_id, credential_switch_hold_op_id, credential_switch_hold_generation, credential_switch_hold_worker_id, credential_switch_hold_register_nonce, effort, model_source, effort_source, checkpoint_withheld_since, checkpoint_withheld_status_since, checkpoint_withheld_worker_id, checkpoint_withheld_generation, checkpoint_withheld_nonce, checkpoint_withheld_report_seq, model_provider_id, model_provider_revision, model_provider_key_mode, model_provider_key_secret_id, model_provider_key_rev, model_provider_limit_streak
 `
 
 type CreateAutoMRReworkRunParams struct {
-	UserID           uuid.UUID   `json:"user_id"`
-	RepoID           uuid.UUID   `json:"repo_id"`
-	IssueTitle       string      `json:"issue_title"`
-	IssueDescription string      `json:"issue_description"`
-	PipelineRef      pgtype.Text `json:"pipeline_ref"`
-	MrIid            pgtype.Int8 `json:"mr_iid"`
-	TargetRunID      pgtype.UUID `json:"target_run_id"`
-	ReviewComments   []byte      `json:"review_comments"`
-	WaitOnLimit      bool        `json:"wait_on_limit"`
-	TriggerSource    string      `json:"trigger_source"`
-	Harness          string      `json:"harness"`
+	UserID                   uuid.UUID   `json:"user_id"`
+	RepoID                   uuid.UUID   `json:"repo_id"`
+	IssueTitle               string      `json:"issue_title"`
+	IssueDescription         string      `json:"issue_description"`
+	PipelineRef              pgtype.Text `json:"pipeline_ref"`
+	MrIid                    pgtype.Int8 `json:"mr_iid"`
+	TargetRunID              pgtype.UUID `json:"target_run_id"`
+	ReviewComments           []byte      `json:"review_comments"`
+	WaitOnLimit              bool        `json:"wait_on_limit"`
+	TriggerSource            string      `json:"trigger_source"`
+	Harness                  string      `json:"harness"`
+	ModelProviderID          pgtype.UUID `json:"model_provider_id"`
+	ModelProviderRevision    pgtype.Int4 `json:"model_provider_revision"`
+	ModelProviderKeyMode     pgtype.Text `json:"model_provider_key_mode"`
+	ModelProviderKeySecretID pgtype.UUID `json:"model_provider_key_secret_id"`
+	ModelProviderKeyRev      pgtype.Int8 `json:"model_provider_key_rev"`
 }
 
 // Queue an mr_rework run (PRD #700 M3, sibling of CreateCIFixRun). The NAME is
@@ -142,6 +147,7 @@ type CreateAutoMRReworkRunParams struct {
 // derived mr_rework inherits its source run's harness as an explicit selection (D4); M2 wires
 // that real value — the caller passes the D11-resolved, source-run-inherited harness, not a
 // stopgap. Keep in sync with CreateManualMRReworkRunAndAdvance's body below.
+// model_provider_* (PRD #4320 M4), class INHERITED: the five binding columns are copied verbatim from the source run's row by the caller (never the owner's current source); createRunAtomic re-validates the copied binding and asserts the inserted row carries it.
 func (q *Queries) CreateAutoMRReworkRun(ctx context.Context, arg CreateAutoMRReworkRunParams) (Run, error) {
 	row := q.db.QueryRow(ctx, createAutoMRReworkRun,
 		arg.UserID,
@@ -155,6 +161,11 @@ func (q *Queries) CreateAutoMRReworkRun(ctx context.Context, arg CreateAutoMRRew
 		arg.WaitOnLimit,
 		arg.TriggerSource,
 		arg.Harness,
+		arg.ModelProviderID,
+		arg.ModelProviderRevision,
+		arg.ModelProviderKeyMode,
+		arg.ModelProviderKeySecretID,
+		arg.ModelProviderKeyRev,
 	)
 	var i Run
 	err := row.Scan(
@@ -410,6 +421,12 @@ func (q *Queries) CreateAutoMRReworkRun(ctx context.Context, arg CreateAutoMRRew
 		&i.CheckpointWithheldGeneration,
 		&i.CheckpointWithheldNonce,
 		&i.CheckpointWithheldReportSeq,
+		&i.ModelProviderID,
+		&i.ModelProviderRevision,
+		&i.ModelProviderKeyMode,
+		&i.ModelProviderKeySecretID,
+		&i.ModelProviderKeyRev,
+		&i.ModelProviderLimitStreak,
 	)
 	return i, err
 }
@@ -417,9 +434,9 @@ func (q *Queries) CreateAutoMRReworkRun(ctx context.Context, arg CreateAutoMRRew
 const createManualMRReworkRunAndAdvance = `-- name: CreateManualMRReworkRunAndAdvance :one
 WITH led AS (
     INSERT INTO mr_rework_ledger (repo_id, ref, high_water, comment_marks, pending_unknown_keys)
-    SELECT $2::uuid, $5, $11,
-           mr_rework_merge_marks('{}'::jsonb, $12::jsonb),
-           mr_rework_merge_pending_keys('{}'::text[], $13::text[], $14::text[], $15::text[], $16::text[], '{}'::jsonb)
+    SELECT $2::uuid, $5, $16,
+           mr_rework_merge_marks('{}'::jsonb, $17::jsonb),
+           mr_rework_merge_pending_keys('{}'::text[], $18::text[], $19::text[], $20::text[], $21::text[], '{}'::jsonb)
     WHERE NOT EXISTS (
         SELECT 1 FROM runs
         WHERE repo_id = $2::uuid
@@ -435,13 +452,13 @@ WITH led AS (
                              ELSE mr_rework_merge_marks(mr_rework_ledger.comment_marks, EXCLUDED.comment_marks) END,
         pending_unknown_keys = CASE WHEN mr_rework_ledger.comment_marks IS NULL
                                     THEN mr_rework_ledger.pending_unknown_keys
-                                    ELSE mr_rework_merge_pending_keys(mr_rework_ledger.pending_unknown_keys, $13::text[], $14::text[], $15::text[], $16::text[], mr_rework_ledger.comment_marks) END,
+                                    ELSE mr_rework_merge_pending_keys(mr_rework_ledger.pending_unknown_keys, $18::text[], $19::text[], $20::text[], $21::text[], mr_rework_ledger.comment_marks) END,
         updated_at    = now()
 )
 INSERT INTO runs (
     user_id, repo_id, kind, issue_title, issue_description,
     pipeline_ref, mr_iid, target_run_id, review_comments, auto_approve, wait_on_limit, required_capabilities, hinted_capabilities, ignored_inferred_capabilities, trigger_source, harness, plan_cross_check_required
-, code_cross_check_required, ci_config_guard, ci_config_paths, repo_agent_source_required)
+, code_cross_check_required, ci_config_guard, ci_config_paths, repo_agent_source_required, model_provider_id, model_provider_revision, model_provider_key_mode, model_provider_key_secret_id, model_provider_key_rev)
 SELECT
     $1, $2::uuid, 'mr_rework', $3, $4,
     $5, $6, $7, $8::jsonb, true, $9,
@@ -459,7 +476,7 @@ SELECT
     (SELECT array_agg(DISTINCT x.p ORDER BY x.p) FROM (
         SELECT unnest(g.ci_config_paths) AS p FROM runs g WHERE g.repo_id = $2::uuid AND g.ci_config_guard
           AND (g.id = $7 OR g.branch = $5 OR 'uzi/prompt-' || g.id::text = $5)
-    ) x), true
+    ) x), true, $11::uuid, $12::int, $13::text, $14::uuid, $15::bigint
 WHERE NOT EXISTS (
     SELECT 1 FROM runs
     WHERE repo_id = $2::uuid
@@ -467,26 +484,31 @@ WHERE NOT EXISTS (
       AND pipeline_ref = $5
       AND status NOT IN ('completed', 'failed', 'cancelled')
 )
-RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash, pause_requested_at, pause_mode, pause_after_count, checkpoint_tip_at, recovery_wait_count, recovery_retry_not_before, completion_contract_version, contract_revision, completion_contract, completion_attempts, latest_completion_attempt, milestones_agents, hold_reason, hold_captured_head, completion_budget_exhausted_at, completion_question_at, budget_extension_seconds, claim_generation, harness, recovery_wait_cause, forge_park_count, credential_override_mode, credential_override_secret_id, claim_released_at, credential_switch_requested_at, credential_switch_generation, stale_requeue_generation, budget_finalize_seconds, released_worker_id, released_worker_nonce, gate_revision, gate_presentation_id, gate_presented_payload, gate_payload_digest, gate_refusal_count, gate_refusal_generation, disk_park_count, checkpoint_contains_latest, egress_profile_id, egress_snapshot, job_type, finalize_resume_generation, job_protocol, first_started_at, plan_cross_check_required, plan_cross_check_gate_reason, issue_raw_digest, issue_saved_body, issue_input_reason, auto_approve_blocked_reasons, plan_cross_check_diff_refusal, worker_recovery_episode, requeue_episode_baseline, worker_recovery_evidence, cross_check_lane, cross_check_lane_generation, completion_final_head, code_cross_check_required, provider_park_count, provider_park_streak_started_at, ci_config_guard, memory_episode, memory_intervention_count, memory_policy, completion_non_closing_reason, ci_artifact_manifest, checkpoint_attested_source, source_publication_intent, continued_issue_iid, checkpoint_coordinates, retained_park_count, ignored_inferred_capabilities, reserve_hold_reason, reserve_exempt_until, reserve_exempt_granted_at, reserve_exempt_credential_id, reserve_exempt_window_reset, reserve_exempt_prior_pct, hinted_capabilities, capability_inference_evidence, idle_stall_park_count, forge_admission, codex_select_reason, recovery_wait_phase, plan_cross_check_gated, policy_preserve_required, policy_pending_fresh, policy_outcome_id, policy_continuation_mode, policy_resolved_at, policy_applying_worker_id, policy_applying_generation, policy_source_generation, policy_refusal_count, policy_refusal_tag, policy_refusal_phase, policy_refusal_correlation_id, policy_hold_published, harness_preferred, harness_decision_reason, harness_preferred_score, harness_other_score, harness_preferred_measured, harness_other_measured, harness_preferred_held, harness_other_held, harness_preferred_weekly_reset_at, harness_other_weekly_reset_at, registration_evidence_generation, registration_evidence_nonce, registration_evidence_epoch, snapshot_departed_generation, snapshot_departed_nonce, snapshot_departed_epoch, repo_agent_source_commit, repo_agent_source_required, agent_source_requested, agent_source_requested_basis, plan_agent_source, ci_fix_mr_iid, policy_required_head, policy_recovery_verified_generation, policy_recovery_verified_head, policy_hold_cause, policy_fresh_consumed_generation, policy_fresh_confirmed_generation, recovery_wait_detail, credential_switch_op_id, credential_switch_hold_op_id, credential_switch_hold_generation, credential_switch_hold_worker_id, credential_switch_hold_register_nonce, effort, model_source, effort_source, checkpoint_withheld_since, checkpoint_withheld_status_since, checkpoint_withheld_worker_id, checkpoint_withheld_generation, checkpoint_withheld_nonce, checkpoint_withheld_report_seq
+RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash, pause_requested_at, pause_mode, pause_after_count, checkpoint_tip_at, recovery_wait_count, recovery_retry_not_before, completion_contract_version, contract_revision, completion_contract, completion_attempts, latest_completion_attempt, milestones_agents, hold_reason, hold_captured_head, completion_budget_exhausted_at, completion_question_at, budget_extension_seconds, claim_generation, harness, recovery_wait_cause, forge_park_count, credential_override_mode, credential_override_secret_id, claim_released_at, credential_switch_requested_at, credential_switch_generation, stale_requeue_generation, budget_finalize_seconds, released_worker_id, released_worker_nonce, gate_revision, gate_presentation_id, gate_presented_payload, gate_payload_digest, gate_refusal_count, gate_refusal_generation, disk_park_count, checkpoint_contains_latest, egress_profile_id, egress_snapshot, job_type, finalize_resume_generation, job_protocol, first_started_at, plan_cross_check_required, plan_cross_check_gate_reason, issue_raw_digest, issue_saved_body, issue_input_reason, auto_approve_blocked_reasons, plan_cross_check_diff_refusal, worker_recovery_episode, requeue_episode_baseline, worker_recovery_evidence, cross_check_lane, cross_check_lane_generation, completion_final_head, code_cross_check_required, provider_park_count, provider_park_streak_started_at, ci_config_guard, memory_episode, memory_intervention_count, memory_policy, completion_non_closing_reason, ci_artifact_manifest, checkpoint_attested_source, source_publication_intent, continued_issue_iid, checkpoint_coordinates, retained_park_count, ignored_inferred_capabilities, reserve_hold_reason, reserve_exempt_until, reserve_exempt_granted_at, reserve_exempt_credential_id, reserve_exempt_window_reset, reserve_exempt_prior_pct, hinted_capabilities, capability_inference_evidence, idle_stall_park_count, forge_admission, codex_select_reason, recovery_wait_phase, plan_cross_check_gated, policy_preserve_required, policy_pending_fresh, policy_outcome_id, policy_continuation_mode, policy_resolved_at, policy_applying_worker_id, policy_applying_generation, policy_source_generation, policy_refusal_count, policy_refusal_tag, policy_refusal_phase, policy_refusal_correlation_id, policy_hold_published, harness_preferred, harness_decision_reason, harness_preferred_score, harness_other_score, harness_preferred_measured, harness_other_measured, harness_preferred_held, harness_other_held, harness_preferred_weekly_reset_at, harness_other_weekly_reset_at, registration_evidence_generation, registration_evidence_nonce, registration_evidence_epoch, snapshot_departed_generation, snapshot_departed_nonce, snapshot_departed_epoch, repo_agent_source_commit, repo_agent_source_required, agent_source_requested, agent_source_requested_basis, plan_agent_source, ci_fix_mr_iid, policy_required_head, policy_recovery_verified_generation, policy_recovery_verified_head, policy_hold_cause, policy_fresh_consumed_generation, policy_fresh_confirmed_generation, recovery_wait_detail, credential_switch_op_id, credential_switch_hold_op_id, credential_switch_hold_generation, credential_switch_hold_worker_id, credential_switch_hold_register_nonce, effort, model_source, effort_source, checkpoint_withheld_since, checkpoint_withheld_status_since, checkpoint_withheld_worker_id, checkpoint_withheld_generation, checkpoint_withheld_nonce, checkpoint_withheld_report_seq, model_provider_id, model_provider_revision, model_provider_key_mode, model_provider_key_secret_id, model_provider_key_rev, model_provider_limit_streak
 `
 
 type CreateManualMRReworkRunAndAdvanceParams struct {
-	UserID              uuid.UUID   `json:"user_id"`
-	RepoID              uuid.UUID   `json:"repo_id"`
-	IssueTitle          string      `json:"issue_title"`
-	IssueDescription    string      `json:"issue_description"`
-	PipelineRef         pgtype.Text `json:"pipeline_ref"`
-	MrIid               pgtype.Int8 `json:"mr_iid"`
-	TargetRunID         pgtype.UUID `json:"target_run_id"`
-	ReviewComments      []byte      `json:"review_comments"`
-	WaitOnLimit         bool        `json:"wait_on_limit"`
-	Harness             string      `json:"harness"`
-	HighWater           int64       `json:"high_water"`
-	Marks               []byte      `json:"marks"`
-	PendingAdd          []string    `json:"pending_add"`
-	PendingRemove       []string    `json:"pending_remove"`
-	PendingSuperseded   []string    `json:"pending_superseded"`
-	PendingSupersededBy []string    `json:"pending_superseded_by"`
+	UserID                   uuid.UUID   `json:"user_id"`
+	RepoID                   uuid.UUID   `json:"repo_id"`
+	IssueTitle               string      `json:"issue_title"`
+	IssueDescription         string      `json:"issue_description"`
+	PipelineRef              pgtype.Text `json:"pipeline_ref"`
+	MrIid                    pgtype.Int8 `json:"mr_iid"`
+	TargetRunID              pgtype.UUID `json:"target_run_id"`
+	ReviewComments           []byte      `json:"review_comments"`
+	WaitOnLimit              bool        `json:"wait_on_limit"`
+	Harness                  string      `json:"harness"`
+	ModelProviderID          pgtype.UUID `json:"model_provider_id"`
+	ModelProviderRevision    pgtype.Int4 `json:"model_provider_revision"`
+	ModelProviderKeyMode     pgtype.Text `json:"model_provider_key_mode"`
+	ModelProviderKeySecretID pgtype.UUID `json:"model_provider_key_secret_id"`
+	ModelProviderKeyRev      pgtype.Int8 `json:"model_provider_key_rev"`
+	HighWater                int64       `json:"high_water"`
+	Marks                    []byte      `json:"marks"`
+	PendingAdd               []string    `json:"pending_add"`
+	PendingRemove            []string    `json:"pending_remove"`
+	PendingSuperseded        []string    `json:"pending_superseded"`
+	PendingSupersededBy      []string    `json:"pending_superseded_by"`
 }
 
 // ATOMIC on-demand (manual) mr_rework create + ledger advance (PRD #1202, review-finding
@@ -507,6 +529,7 @@ type CreateManualMRReworkRunAndAdvanceParams struct {
 // same-MR/active-branch 23505 -> whole statement aborts, ledger rolled back
 // (ErrActiveMRReworkExists/ErrBranchInUse); success -> run + ledger commit together. `ref` on
 // the ledger is the pipeline_ref (the branch), exactly as the two-step path passed it.
+// model_provider_* (PRD #4320 M4), class INHERITED: the five binding columns are copied verbatim from the source run's row by the caller (never the owner's current source); createRunAtomic re-validates the copied binding and asserts the inserted row carries it.
 func (q *Queries) CreateManualMRReworkRunAndAdvance(ctx context.Context, arg CreateManualMRReworkRunAndAdvanceParams) (Run, error) {
 	row := q.db.QueryRow(ctx, createManualMRReworkRunAndAdvance,
 		arg.UserID,
@@ -519,6 +542,11 @@ func (q *Queries) CreateManualMRReworkRunAndAdvance(ctx context.Context, arg Cre
 		arg.ReviewComments,
 		arg.WaitOnLimit,
 		arg.Harness,
+		arg.ModelProviderID,
+		arg.ModelProviderRevision,
+		arg.ModelProviderKeyMode,
+		arg.ModelProviderKeySecretID,
+		arg.ModelProviderKeyRev,
 		arg.HighWater,
 		arg.Marks,
 		arg.PendingAdd,
@@ -780,6 +808,12 @@ func (q *Queries) CreateManualMRReworkRunAndAdvance(ctx context.Context, arg Cre
 		&i.CheckpointWithheldGeneration,
 		&i.CheckpointWithheldNonce,
 		&i.CheckpointWithheldReportSeq,
+		&i.ModelProviderID,
+		&i.ModelProviderRevision,
+		&i.ModelProviderKeyMode,
+		&i.ModelProviderKeySecretID,
+		&i.ModelProviderKeyRev,
+		&i.ModelProviderLimitStreak,
 	)
 	return i, err
 }

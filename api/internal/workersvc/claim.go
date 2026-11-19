@@ -550,6 +550,13 @@ type ClaimSecrets struct {
 	// BYTE-IDENTICAL to today's wire (no `codex` key), and an old worker that never
 	// learns the key keeps working. Never logged — it carries a usable access token.
 	Codex *ClaimCodexSecrets `json:"codex,omitempty"`
+	// Provider is the model-provider binding of a PROVIDER-BOUND run (PRD #4320 module 5), present
+	// ONLY then and exclusive with AnthropicOAuthToken (which is "" on such a claim) and Codex:
+	// assertClaimSecretsExclusive refuses a payload carrying both. omitempty is load-bearing: every
+	// vendor claim leaves it nil so its emitted JSON is BYTE-IDENTICAL to today's wire (no `provider`
+	// key, not null, not empty; snapshot-tested). Only a worker advertising claude_provider_v1 is
+	// offered such a claim. Never logged: it carries the usable gateway key.
+	Provider *ClaimProviderBinding `json:"provider,omitempty"`
 }
 
 // ClaimCodexSecrets is the usable Codex credential for one claim of a Codex-bound run

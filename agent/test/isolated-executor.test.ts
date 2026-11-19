@@ -163,7 +163,7 @@ for (const mode of ["finish", "cancel"] as const) it(
 function options(gate = { passed: false }): SdkOptions {
   const fetch = buildFetchToolsServer({ fetcherUrl: "https://127.0.0.1:1", ca: "", credential: "cred", workspace, log: nullLogger() });
   return buildIsolatedSdkOptions({
-    env: isolateSdkEnv(buildSdkEnv(OAUTH, path.join(dir, "home"))),
+    env: isolateSdkEnv(buildSdkEnv({ kind: "oauth", token: OAUTH }, path.join(dir, "home"))),
     cwd: workspace,
     log: nullLogger(),
     secretPaths: SECRET_PATHS,
@@ -381,7 +381,7 @@ describe("isolated executor: the run secrets dir entry is load-bearing", () => {
   it("denies it even when the workspace root contains it, while the rest of the root stays readable", async () => {
     const fetch = buildFetchToolsServer({ fetcherUrl: "https://127.0.0.1:1", ca: "", credential: "cred", workspace: "/run", log: nullLogger() });
     const o = buildIsolatedSdkOptions({
-      env: isolateSdkEnv(buildSdkEnv(OAUTH, path.join(dir, "home"))),
+      env: isolateSdkEnv(buildSdkEnv({ kind: "oauth", token: OAUTH }, path.join(dir, "home"))),
       cwd: "/run",
       log: nullLogger(),
       secretPaths: [],
@@ -399,14 +399,16 @@ describe("isolated executor: the run secrets dir entry is load-bearing", () => {
 
 describe("isolated executor: env scope", () => {
   it("a normal run's env (buildSdkEnv, what SdkExecutor and ChatExecutor use) has no nonessential-traffic key", () => {
-    const env = buildSdkEnv(OAUTH, "/h");
+    const env = buildSdkEnv({ kind: "oauth", token: OAUTH }, "/h");
     assert.ok(!(NONESSENTIAL in env));
   });
 
   it("the isolated env sets it to 1 even when the input env tries to override it", () => {
-    const base = buildSdkEnv(OAUTH, "/h", { [NONESSENTIAL]: "0" });
-    assert.equal(base[NONESSENTIAL], "0", "precondition: the base env carries the override");
-    assert.equal(isolateSdkEnv(base)[NONESSENTIAL], "1");
+    // PRD #4320: the key is now protected, so a provisioned tool env cannot even set it on the base env;
+    // the isolated lane's own assignment still wins over whatever an input env carries.
+    const base = buildSdkEnv({ kind: "oauth", token: OAUTH }, "/h", { [NONESSENTIAL]: "0" });
+    assert.ok(!(NONESSENTIAL in base), "precondition: the provisioned override is dropped by the protected set");
+    assert.equal(isolateSdkEnv({ ...base, [NONESSENTIAL]: "0" })[NONESSENTIAL], "1");
   });
 
   it("the executor hands the SDK child that env, and never the fetch credential", async () => {

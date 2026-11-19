@@ -142,6 +142,55 @@ export interface SecretDependents {
   enabled_siblings: SecretDependentPage<{ id: string; label: string }>;
 }
 
+// ── Custom providers (PRD #4320 M3) ──────────────────────────────────────────
+export type ProviderModelRole = "opus" | "sonnet" | "haiku" | "fable";
+
+export interface ProviderModelEntry {
+  model: string;
+  context_window?: number;
+}
+
+// haiku is required by the server; the other roles are optional.
+export type ProviderModelMap = { haiku: ProviderModelEntry } & Partial<
+  Record<Exclude<ProviderModelRole, "haiku">, ProviderModelEntry>
+>;
+
+export type ProviderAuthStyle = "bearer" | "x_api_key";
+
+export interface ProviderProbe {
+  auth_result: "ok" | "rejected" | "inconclusive";
+  tool_result?: "passed" | "not_supported" | "inconclusive" | "not_run";
+  probed_at: string;
+}
+
+export interface ProviderDTO {
+  id: string;
+  name: string;
+  engine: "claude";
+  retired: boolean;
+  current_revision: number;
+  protocol: "anthropic_messages";
+  base_url: string;
+  auth_style: ProviderAuthStyle;
+  model_map: ProviderModelMap;
+  has_key: boolean;
+  key_enabled: boolean;
+  probe: ProviderProbe | null;
+}
+
+export interface ProvidersList {
+  enabled: boolean;
+  allowed_base_urls: string[];
+  providers: ProviderDTO[];
+}
+
+export interface CreateProviderInput {
+  name: string;
+  base_url: string;
+  auth_style: ProviderAuthStyle;
+  model_map: ProviderModelMap;
+}
+
 // TestSecretResult is the flat, sanitized response from the explicit credential Test action.
 export interface TestSecretResult {
   status: "ok" | "rejected" | "permission_denied" | "inconclusive";
@@ -258,7 +307,9 @@ type EffectiveCredentialSource =
 type EffectiveRefusal =
   | "no_credential_for_harness" | "no_usable_credential" | "credential_disabled" | "credential_not_found"
   | "credential_override_harness_unsupported" | "credential_override_invalid"
-  | "model_incompatible_with_harness";
+  | "model_incompatible_with_harness" | "provider_source_unusable"
+  | "provider_lane_unsupported" | "provider_model_unmapped" | "provider_binding_stale"
+  | "provider_destination_not_allowed" | "credential_override_provider_source";
 type EffectiveRefusalDetail = "credential_disabled" | "codex_pool_unavailable";
 type EffectiveModelSetting = "worker_model" | "judge_model" | "summary_model" | "task_review_model" | "cross_check_plan" | "cross_check_code";
 type EffectiveEffortSetting = "worker_effort" | "task_review_effort" | "cross_check_plan" | "cross_check_code";
@@ -384,7 +435,10 @@ export interface StartPreview {
 
 /** PRD #3254 M3: the schedule preview's refusals, the start-preview set plus the save-step
  *  (invalid_model, credential_override_lane_not_switchable) and fire-step (codex_override_conflict,
- *  codex_pool_unavailable) ones, mirroring handler/effective_settings_schedule.go and the
+ *  codex_pool_unavailable) ones; the PRD #4320 provider refusals (provider_source_unusable,
+ *  provider_lane_unsupported, provider_model_unmapped, provider_binding_stale,
+ *  provider_destination_not_allowed, credential_override_provider_source) are in EffectiveRefusal
+ *  and so in this union too. It mirrors handler/effective_settings_schedule.go and the
  *  scheduler's skip reasons it maps. */
 type ScheduleRefusal =
   | EffectiveRefusal | "invalid_model" | "credential_override_lane_not_switchable"
@@ -541,6 +595,10 @@ export interface UserSettings {
   /** Per-user "Judge runs on" (PRD #3257); null = same as the run being reviewed. One of
    *  claude|codex when set. Always present on the wire, like default_harness. */
   judge_runs_on: Harness | null;
+  /** Provider the Claude lane runs on (PRD #4320); null = the vendor Claude ladder. Always on the
+   *  wire; typed optional so pre-feature fixtures stay valid until the UI milestone. Read-only
+   *  on the settings PUT: it is set by PUT /api/me/providers/claude-source. */
+  claude_provider_id?: string | null;
 }
 
 // UserSettingsPatch is the PATCH-like body of PUT /me/settings: a field present
@@ -1263,6 +1321,8 @@ export interface LatestRun {
   // (api/internal/handler/board.go latestRunDTO.HoldReason). effectiveRunStatus overlays
   // 'credential_disabled' so the card reads "waiting: credential disabled", not "paused",
   // 'credentials_reset' (PRD #3989) likewise reads "waiting: credentials were reset", and
+  // 'provider_destination_not_allowed' / 'provider_binding_stale' (PRD #4320) read "provider URL not allowed: waiting" /
+  // "provider binding changed: start a new run", and
   // the issue #3181 token-switch holds ('credential_switch_settling' / 'credential_switch_unsettled')
   // so they read "settling: token switch" / "held: token switch".
   // 'base_attestation_missing' (issue #3194) reads "base unverified: owner hold" likewise.
@@ -2540,6 +2600,12 @@ export type ScheduleSkipReason =
   | "no_usable_credential"
   | "credential_disabled"
   | "codex_pool_unavailable"
+  | "provider_source_unusable"
+  | "provider_lane_unsupported"
+  | "provider_model_unmapped"
+  | "provider_binding_stale"
+  | "provider_destination_not_allowed"
+  | "credential_override_provider_source"
   | "ci_green"
   | "ci_already_handled"
   | "ci_halted_no_progress"
@@ -3728,6 +3794,12 @@ export interface Run {
       truncated: boolean;
     }[];
   };
+  /** PRD #4320: the custom model provider this run was bound to; null for a vendor (Anthropic)
+   *  run. Owner-scoped DTOs only; optional so a build talking to an older server reads absent as null. */
+  provider_id?: string | null;
+  /** The provider's name for display. null for a vendor run OR when the provider has since been
+   *  deleted (provider_id is then still set). UNTRUSTED user text: render as escaped plain text. */
+  provider_name?: string | null;
   /** Repo display path on detail reads; absent on older servers, empty when unavailable. */
   repo_path?: string;
   /** Frozen repo inference policy; explicit requirements take precedence. */

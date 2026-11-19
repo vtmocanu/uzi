@@ -31,12 +31,13 @@ SELECT * FROM cross_checks WHERE checker_run_id = @child_id;
 
 -- name: CreateCodeCrossCheckChild :one
 -- Preserve the lead's frozen inference policy; declared requirements keep their repo-hint source.
+-- model_provider_key_mode (PRD #4320 M4), class REFUSED-LANE: written as an explicit NULL because this lane does not support provider-sourced runs yet (PRD #4322); workersvc refuses provider_lane_unsupported BEFORE this INSERT for a provider-sourced owner.
 INSERT INTO runs (id, user_id, repo_id, kind, target_run_id, harness, priority,
  report_only, budget_wall_seconds, dispatched_at, auto_approve, issue_title,
- issue_description, required_capabilities, hinted_capabilities, ignored_inferred_capabilities, trigger_source, worker_id)
+ issue_description, required_capabilities, hinted_capabilities, ignored_inferred_capabilities, trigger_source, worker_id, model_provider_key_mode)
 SELECT @child_id, lead.user_id, lead.repo_id, 'cross_check', lead.id, @child_harness::text, 2,
  true, @budget_wall_seconds::int, now(), true, lead.issue_title, lead.issue_description,
- COALESCE(repo.required_capabilities, '{}'), COALESCE(repo.required_capabilities, '{}'), lead.ignored_inferred_capabilities, 'cross_check', lead.worker_id
+ COALESCE(repo.required_capabilities, '{}'), COALESCE(repo.required_capabilities, '{}'), lead.ignored_inferred_capabilities, 'cross_check', lead.worker_id, NULL::text
 FROM runs lead JOIN repos repo ON repo.id = lead.repo_id JOIN workers w ON w.id = lead.worker_id
 WHERE lead.id = @lead_run_id AND lead.user_id = @user_id AND lead.worker_id = @worker_id
  AND lead.claim_generation = @claim_generation AND lead.claim_released_at IS NULL

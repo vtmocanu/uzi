@@ -1122,6 +1122,8 @@ var queryInventory = []queryPin{
 		"../workersvc: reached through the owner reassignment"},
 	{"LockSecretEnablementForShareNowait", "credential_disabled.sql", unpinnedPin,
 		"declared when this file joined the inventory for PRD #3250; no test names this query. It runs inside the credential finisher or promoter path, which no test asserts statement by statement, so it is not observed here"},
+	{"RewriteProviderDestinationHoldStale", "credential_disabled.sql", "TestProviderDestinationHoldGoesStaleWhileParkedLiveDB",
+		"../workersvc: reached through the promoter pass; asserts the destination hold becomes provider_binding_stale with the pause anchor kept and that re-allowlisting never re-queues it"},
 	{"ListCredentialDisabledUsers", "credential_disabled.sql", "TestCredentialDisabledUsersWorklistLiveDB",
 		"the promoter sweep's owner worklist"},
 	{"LockCredentialDisabledRunForPromotion", "credential_disabled.sql", "TestCredentialPromoterTriggersLiveDB",

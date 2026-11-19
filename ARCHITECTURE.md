@@ -500,6 +500,40 @@ a Bearer-reachable mint would let a stolen CLI token replace a user's
 credentials. See [docs/anthropic-token.md](docs/anthropic-token.md) for the
 user-facing flow and `prds/done/104-named-anthropic-tokens.md` for the rationale.
 
+## Custom model providers (PRD #4320)
+
+A user can register an Anthropic-compatible gateway as a **provider** (`model_providers`
+with immutable `model_provider_revisions`) and select it as their Claude source
+(`users.claude_provider_id`). Its key is a separate vault kind, `anthropic_compatible_key`,
+never a default and never auto-eligible, so it cannot reach Anthropic and a subscription token
+cannot reach a gateway. The trust boundary is the operator allowlist
+`UZI_PROVIDER_ALLOWED_BASE_URLS`: exact URLs with a path, enforced **by the api only** at
+save/edit, the Test probe, run creation and the issue and chat claims. The worker validates the
+binding's shape and holds no copy of the list.
+
+A run freezes its binding (`runs.model_provider_*`: provider, revision, key mode, key secret,
+the key's `enablement_rev`) in the create transaction. There is deliberately no foreign key from
+`runs` to the provider tables, so a revoked binding is detected at the next claim and parks the
+run (`provider_destination_not_allowed`, or `provider_binding_stale`), never nulled into a
+vendor fallback. A provider run's claim carries one `provider` object and no
+`anthropic_oauth_token`; the worker maps it onto the SDK env in `buildSdkEnv`. Issue runs wait out
+a gateway 429 or overload as `limit_wait` (`provider_gateway_limit`) on a 1, 5, 15 minute
+schedule and then for the owner; chat ends the turn instead. Usage is recorded with
+`cost_status='unreported'`. The judge, job, cross-check and isolated lanes refuse provider-sourced
+owners (`provider_lane_unsupported`).
+
+The Test probe is dialed from the api, ignores proxy variables, never follows a redirect and
+admits private gateway ranges (refusing link-local, metadata, unspecified and, without the dev
+flag, loopback addresses).
+
+**Activation is blocked.** The pinned Claude CLI follows gateway redirects (a same-origin 307
+re-sends the key in both auth styles; a cross-origin one forwards `x-api-key` and the body), so
+workers do not advertise the capability `claude_provider_v1` and a provider-bound run stays queued
+("no worker that supports model providers is online"). A loopback relay is deferred to a separate
+issue. Design record, route split, inheritance rules and rollback hazards:
+[adr/4320-custom-model-providers.md](adr/4320-custom-model-providers.md); user docs:
+[docs/providers.md](docs/providers.md).
+
 ## Claude rate-limit visibility (PRD #53)
 
 A background engine (`api/internal/usagepoller`, the same `Boot()` immediate
@@ -1299,6 +1333,17 @@ chain in the diagram above, with no intervening `running`.
   `pool_wait`. All of it runs only after the vault gate, since queued runs are
   not claimed until the new vault exists and is unlocked. See
   [docs/vault-threat-model.md](docs/vault-threat-model.md#admin-issued-account-reset).
+
+- **claimed → paused (`provider_destination_not_allowed` / `provider_binding_stale`)**
+  (PRD #4320): a provider-bound run whose frozen binding was revoked is refused at its next
+  claim, never inside a held claim. `provider_destination_not_allowed` (the operator removed
+  the URL from `UZI_PROVIDER_ALLOWED_BASE_URLS`) is re-queued by the promoter once the URL is
+  allowed again; `provider_binding_stale` (its key was rotated, disabled or deleted, or its
+  provider revision is gone) is final for that run, and a manual resume of either is refused
+  with 409. Neither falls back to a vendor credential. A gateway 429 or overload parks an
+  issue run as `limit_wait` instead (1, 5, 15 minutes, then the owner). See
+  [adr/4320-custom-model-providers.md](adr/4320-custom-model-providers.md). Dormant until
+  activation lands: no worker advertises `claude_provider_v1` yet, so a provider run stays queued.
 
 - **running → recovery_wait → queued** (issue #1197): an SDK turn
   that comes back **positively empty** (zero reported turns, no model activity,

@@ -510,8 +510,8 @@ Refusals are closed tokens, with an optional `refusal_detail`:
 
 | Step | Tokens |
 |---|---|
-| Save | `invalid_model`, `credential_not_found`, `credential_disabled`, `credential_override_lane_not_switchable`, `credential_override_harness_unsupported`, `credential_override_invalid` |
-| Fire | `no_credential_for_harness`, `no_usable_credential`, `credential_disabled`, `codex_pool_unavailable`, `codex_override_conflict` |
+| Save | `invalid_model`, `credential_not_found`, `credential_disabled`, `credential_override_lane_not_switchable`, `credential_override_harness_unsupported`, `credential_override_provider_source`, `credential_override_invalid` |
+| Fire | `no_credential_for_harness`, `no_usable_credential`, `credential_disabled`, `codex_pool_unavailable`, `codex_override_conflict`, `provider_source_unusable`, `provider_lane_unsupported`, `provider_model_unmapped`, `provider_binding_stale`, `provider_destination_not_allowed`, `credential_override_provider_source` |
 
 The fire tokens other than `no_credential_for_harness` are the schedule
 [skip reasons](#fire-outcomes) a real fire would record. For an override that a fire threads, the checks run in this
@@ -772,6 +772,25 @@ exceed `max_issues` once backfill walks past a skip), which ones
   last fire, until the pool is fixed. On an unpinned label-selected sweep it
   is a per-candidate skip and scanning continues. An unpinned schedule whose
   harness resolves implicitly starts on Claude instead and records nothing.
+- `provider_source_unusable`, `provider_lane_unsupported`,
+  `provider_model_unmapped`, `provider_binding_stale`,
+  `provider_destination_not_allowed` and `credential_override_provider_source`
+  — your Claude source is a model provider and the fire was refused at run
+  creation. The fire starts nothing and never falls back to a vendor credential
+  or to Codex. A recurring schedule advances and re-fires next cadence. A
+  one-time schedule is **held** on `provider_source_unusable` (due, un-advanced,
+  with the skip recorded as its last fire) until you repair the provider, like a
+  disabled pin; on the other five reasons a one-time schedule is consumed like
+  any benign skip.
+  `provider_source_unusable`: the provider is retired, its URL is off the
+  operator allowlist, or its key is missing or disabled.
+  `provider_lane_unsupported`: judge, job, cross-check and isolated runs do not
+  support a provider yet. `provider_model_unmapped`: a model the run would use
+  is not in the provider's model map. `provider_binding_stale`: an inherited
+  provider key was rotated, disabled or deleted since the source run.
+  `provider_destination_not_allowed`: an inherited provider URL is no longer
+  allowlisted. `credential_override_provider_source`: a stored credential
+  override cannot be used while your Claude source is a provider.
 - `config_not_supported` — a removal-enabled schedule's effective target,
   timing or selector no longer supports removal (for example, a catalog
   selector changed to multiple labels). The fire starts nothing; an invalid

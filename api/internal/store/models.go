@@ -729,6 +729,34 @@ type MemoryParkRelease struct {
 	CreatedAt        pgtype.Timestamptz `json:"created_at"`
 }
 
+type ModelProvider struct {
+	ID              uuid.UUID          `json:"id"`
+	OwnerUserID     uuid.UUID          `json:"owner_user_id"`
+	Name            string             `json:"name"`
+	Engine          string             `json:"engine"`
+	CurrentRevision int32              `json:"current_revision"`
+	RetiredAt       pgtype.Timestamptz `json:"retired_at"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+}
+
+type ModelProviderProbeResult struct {
+	ProviderID uuid.UUID          `json:"provider_id"`
+	Revision   int32              `json:"revision"`
+	AuthResult string             `json:"auth_result"`
+	ToolResult pgtype.Text        `json:"tool_result"`
+	ProbedAt   pgtype.Timestamptz `json:"probed_at"`
+}
+
+type ModelProviderRevision struct {
+	ProviderID uuid.UUID          `json:"provider_id"`
+	Revision   int32              `json:"revision"`
+	Protocol   string             `json:"protocol"`
+	BaseUrl    string             `json:"base_url"`
+	AuthStyle  string             `json:"auth_style"`
+	ModelMap   []byte             `json:"model_map"`
+	CreatedAt  pgtype.Timestamptz `json:"created_at"`
+}
+
 type MrReviewAuthorQueue struct {
 	RepoID        uuid.UUID          `json:"repo_id"`
 	Ref           string             `json:"ref"`
@@ -1372,6 +1400,12 @@ type Run struct {
 	CheckpointWithheldGeneration      pgtype.Int8        `json:"checkpoint_withheld_generation"`
 	CheckpointWithheldNonce           pgtype.Text        `json:"checkpoint_withheld_nonce"`
 	CheckpointWithheldReportSeq       pgtype.Int8        `json:"checkpoint_withheld_report_seq"`
+	ModelProviderID                   pgtype.UUID        `json:"model_provider_id"`
+	ModelProviderRevision             pgtype.Int4        `json:"model_provider_revision"`
+	ModelProviderKeyMode              pgtype.Text        `json:"model_provider_key_mode"`
+	ModelProviderKeySecretID          pgtype.UUID        `json:"model_provider_key_secret_id"`
+	ModelProviderKeyRev               pgtype.Int8        `json:"model_provider_key_rev"`
+	ModelProviderLimitStreak          int32              `json:"model_provider_limit_streak"`
 }
 
 type RunCompletionAttempt struct {
@@ -1972,6 +2006,7 @@ type User struct {
 	CodexSummaryModel         pgtype.Text        `json:"codex_summary_model"`
 	CredentialsResetAt        pgtype.Timestamptz `json:"credentials_reset_at"`
 	JudgeRunsOn               pgtype.Text        `json:"judge_runs_on"`
+	ClaudeProviderID          pgtype.UUID        `json:"claude_provider_id"`
 }
 
 type UserCrossCheckPin struct {
@@ -1997,6 +2032,7 @@ type UserSecret struct {
 	EnablementRev              int64              `json:"enablement_rev"`
 	AnthropicRejectedAt        pgtype.Timestamptz `json:"anthropic_rejected_at"`
 	AnthropicSuccessGeneration int64              `json:"anthropic_success_generation"`
+	ProviderID                 pgtype.UUID        `json:"provider_id"`
 }
 
 type UserVault struct {

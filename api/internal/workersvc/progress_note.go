@@ -213,7 +213,7 @@ func resolveProgressNoteCost(harness, model string, mu progressNoteModelUsage) (
 	marker := resolveCostStatusMarker(mu.CostStatus)
 	emitted, present := resolveCostUSD(mu.CostUSD)
 	costStatus, costUSD := deriveUsageCost(harness, marker, emitted, present)
-	if harness != harnessCodex && !present {
+	if harness != harnessCodex && harness != costLaneProviderUnpriced && !present {
 		costStatus, costUSD = priceProgressNoteEntry(model, mu)
 	}
 	return costStatus, costUSD
@@ -285,7 +285,7 @@ func foldPrefixedModelUsage(ctx context.Context, q usageFoldQuerier, run store.R
 		if model == "" {
 			continue
 		}
-		costStatus, costUSD := resolveProgressNoteCost(run.Harness, model, mu)
+		costStatus, costUSD := resolveProgressNoteCost(usageCostLane(run), model, mu)
 		if err := q.UpsertRunUsage(ctx, store.UpsertRunUsageParams{
 			RunID:                  run.ID,
 			SessionID:              sessionID,

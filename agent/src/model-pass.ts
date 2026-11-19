@@ -36,7 +36,8 @@ import { errMessage } from "./util.js";
 import type { Logger } from "./log.js";
 import { codexDeferralReason, type WorkerClient } from "./client.js"; // client.ts imports no runner/model-pass, so the value import of codexDeferralReason adds no cycle
 import { postTerminalState, type TerminalOutboxDeps } from "./terminal-resolve.js";
-import type { StateRequest } from "./protocol.js";
+import type { ClaimProviderBinding, StateRequest } from "./protocol.js";
+import { sdkCredentialFromBinding } from "./provider-binding.js";
 import type { SdkQueryFn } from "./sdk-executor.js"; // type-only — erased at runtime, so no import cycle
 import type { CodexBinding } from "./codex/select.js"; // type-only — erased at runtime, no construction here
 import type { CodexAdviceHarnessFactory } from "./codex/codex-executor.js"; // type-only — the injected seam, never constructed here
@@ -52,6 +53,9 @@ export interface ReadOnlyModelPassOpts {
    *  judge/review claim carries no Anthropic token at all (PRD #1429 M3, D4's auditor
    *  invariant: no anthropic_oauth_token, no run_credential_epochs row). */
   token?: string;
+  /** PRD #4320: the decoded provider binding of a provider-bound claim. When set, the pass runs under
+   *  it (never `token`) and its model resolves through the bound map (`provider_model_unmapped`). */
+  provider?: ClaimProviderBinding;
   /** The model id; applied to the query only when non-empty. */
   model?: string;
   /** Reasoning effort; applied to the query only when set. */
@@ -246,7 +250,7 @@ export async function runReadOnlyModelPass(opts: ReadOnlyModelPassOpts): Promise
   if (opts.codex) return runCodexAdviceModelPass(opts, opts.codex);
 
   const token = opts.token;
-  if (!token) {
+  if (!token && !opts.provider) {
     // Defensive, not a runtime condition to degrade from: every existing Claude caller
     // (judge-runner.ts/review-runner.ts) already checked for a non-empty token before ever
     // calling this function without `codex` set (see their own "no anthropic token" fallback
@@ -312,7 +316,7 @@ export async function runReadOnlyModelPass(opts: ReadOnlyModelPassOpts): Promise
     ...(usage.observe ? { usageObserver: usage.observe } : {}),
   };
   const runPromise = new ClaudeAdviceHarness({
-    token,
+    credential: opts.provider ? sdkCredentialFromBinding(opts.provider) : { kind: "oauth", token: token! },
     homeDir,
     abort,
     queryFn: opts.queryFn,

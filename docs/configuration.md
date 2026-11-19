@@ -231,6 +231,68 @@ one operator-only piece is the SSRF allowlist for the clone target, a
 |---|---|---|
 | `AGENT_SOURCE_ALLOWED_BASE_URLS` | *(empty)* | Comma-separated SSRF allowlist for the agent-source clone URL; every entry must be a bare `https://host[:port]` (optional trailing `/`); an entry with userinfo, a path, a query or a fragment fails boot (previously reduced silently to the host). Unlike `FORGE_ALLOWED_BASE_URLS`, an **empty** list is not a boot error — the feature is off by default, so an unconfigured instance still boots — but it does mean nothing is allowed until you set at least one entry here, no matter what an admin saves in the URL field. |
 
+## Custom model providers (PRD #4320)
+
+A user can define their own Anthropic-compatible endpoint (a gateway, proxy or cloud-hosted
+Messages API) as a **provider** under their account. The operator decides which destinations are
+possible with an allowlist that is **separate** from every other allowlist on this page:
+
+| Var | Default | Notes |
+|---|---|---|
+| `UZI_PROVIDER_ALLOWED_BASE_URLS` | *(empty)* | Comma-separated list of exact provider base URLs, **path included** (for example `https://gw.example.com/anthropic`). A provider's base URL must equal one entry after normalization; there is no host, prefix or path-segment matching, so one tenant's path on a shared gateway cannot be repointed to another's. Entries are normalized (lowercase scheme and host, default port elided, one trailing `/` removed). An entry with a query, fragment, userinfo, a `.` or `..` path segment, any `%` encoding (`%2e`, `%2f`, ...), `;`, `\`, non-ASCII characters, more than 2048 bytes, a host with a trailing dot (`gw.example.com.`), a numeric-shorthand IPv4 host (`127.1`, `2130706433`, `0x7f.1`) or an unspecified or link-local IP literal (`0.0.0.0`, `::`, `169.254.169.254`, `fe80::1`) fails boot, naming the variable and the entry's position. **Empty or unset turns the feature off:** no provider can be created and the API reports `enabled: false`. |
+| `UZI_PROVIDER_ALLOW_LOOPBACK` | `false` | Dev flag. Only when `true` may the list hold a loopback host (`localhost`, any `*.localhost` name, `127.0.0.0/8`, `::1`) and plain `http` for it, and only then may the Test probe connect to a loopback address, so a local fake gateway works under compose. Never set it in production: the probe would be able to reach the api's own local ports. |
+| `UZI_PROVIDER_EXTRA_CA_FILE` | *(empty)* | Path to a PEM bundle the provider **Test** probe trusts **in addition to** the system roots, for a gateway behind a private CA. Unset means system roots only. The file is read once at boot; an unreadable file, or one with no certificate, refuses boot (the message names the variable, never the content). Only the probe's HTTP client uses it: the api's other outbound calls (forge, Anthropic, OIDC, ...) keep the system roots. Compose has no equivalent mount, so there set the variable to a file you bind-mount into the api container. Helm sets it for you, see below. |
+
+The api is the destination authority: it checks the list when a provider is saved or its endpoint
+edited, and a saved URL is stored as the matching list entry. Removing an entry stops later saves and
+tests of providers that used it (every save re-checks the URL it carries, a key save included, and
+so does every Test, right before it connects) and the claims of runs already bound to them: such a
+run is paused as `provider_destination_not_allowed` and never starts on an Anthropic token. A
+run's frozen URL is not re-read from the list while its claim is held; cancel is the immediate stop.
+
+**Activation is blocked.** Workers do not advertise the capability `claude_provider_v1` that provider
+runs need, because the pinned Claude CLI follows gateway redirects (see
+[ADR-4320](../adr/4320-custom-model-providers.md#known-accepted-limit-the-cli-follows-redirects-and-activation-is-blocked)).
+Setting the allowlist lets users define, test and select providers, but a run bound to one stays
+queued ("no worker that supports model providers is online") until a later release removes the block.
+
+**Helm.** Set the allowlist with the first-class value `providers.allowedBaseURLs` (a list of exact
+URLs, rendered into `UZI_PROVIDER_ALLOWED_BASE_URLS`; setting the variable in `api.config` as well
+fails the render). The chart checks every entry's shape (https only; no userinfo, query, fragment,
+`%`, `;`, `\`, dot or empty path segments, comma or whitespace) and the api re-validates at boot.
+`UZI_PROVIDER_ALLOW_LOOPBACK` is a compose development flag and has no chart value; setting it in
+`api.config` fails the render. For a gateway
+behind a private CA, set `workers.extraCA` (it needs `api.tls.enabled`): the chart mounts the same
+bundle read-only into the api pod, sets `UZI_PROVIDER_EXTRA_CA_FILE` to it and rolls the pod when the
+inline `pem` changes (an in-place edit of an existing ConfigMap needs an api restart). Without it, a
+private-CA gateway always tests as inconclusive while runs may still reach it.
+
+### The Test probe
+
+**Test** on a provider sends two small requests from the **api** to `<base_url>/v1/messages` with the
+provider's key: a one-token request (does the key authenticate and the endpoint speak the Messages
+protocol) and, only if that succeeds, a forced single-tool request (does the gateway return a
+`tool_use` block). Neither certifies full compatibility. The api must therefore be able to reach the
+gateway on the network, which is separate from any worker egress rule.
+
+- **Direct connections.** The probe ignores `HTTPS_PROXY`, `HTTP_PROXY` and `NO_PROXY`: it resolves the
+  host itself, checks every answer, and connects only to the checked addresses.
+- **Addresses.** Private gateway addresses are admitted: RFC 1918 (`10/8`, `172.16/12`, `192.168/16`),
+  IPv6 unique-local (`fc00::/7`) and carrier-grade NAT (`100.64/10`). Always refused: unspecified
+  (`0.0.0.0/8`, `::`), link-local (`169.254/16`, `fe80::/10`, which includes cloud metadata
+  `169.254.169.254`), `fd00:ec2::254`, multicast and broadcast. Loopback is refused unless
+  `UZI_PROVIDER_ALLOW_LOOPBACK=true`. If any answer for a host is refused, the whole host is refused.
+- **Bounds.** No redirects are followed (a redirect is "inconclusive"); 20 s per request; request body at
+  most 4 KiB; at most 64 KiB of the response is read; nothing from a response body is logged or
+  returned. Per user: one probe in flight and 30 per hour (create and retire do not reset it); four in
+  flight instance-wide. Over a limit the route answers 429 `provider_probe_rate_limited` with
+  `Retry-After`. The counters are in memory per api process.
+
+Network reach is a separate control. `workers.fqdnEgress.allowFQDNs` is **namespace-wide** (see
+ADR-0285): once an operator admits a gateway host there, every restricted-tier run in the worker
+namespace can reach it. It is network reach, not per-run authorization; the allowlist above is
+what decides which gateway a user's provider may name.
+
 ## CI status integration (PRD #6)
 
 uzi caches the latest pipeline per **watched ref** (a repo's default branch, plus the branches of that repo's recent agent runs) on the same poll tick as the issue sync — no second loop or interval — and renders it as a status badge on the repos list, the board header, and each card. A failed pipeline offers a **Fix CI** button that queues a plan-gated `ci_fix` agent run; when that run's fix branch pipeline concludes, the sync stamps the run `verified` or `fix_failed` ("uzi verifies its work"). See [ARCHITECTURE.md](../ARCHITECTURE.md) for the full pipeline-sync + verification design.
@@ -422,7 +484,7 @@ Predicts a manual issue start with a given harness and token choice, validated b
 
 `harness` is `claude` or `codex`; omit it (or send null) for the default. `credential_override.mode` is `inherit`, `auto`, `default` or `pinned`; `secret_id` names the pinned token. A bad enum or uuid is a 400. Any override other than `inherit` makes the creation-time policies ineligible, as at creation.
 
-The response has `harness`, `credential`, `refusal` and `refusal_detail`. A refusal is a closed token: `no_credential_for_harness` (detail `credential_disabled` or `codex_pool_unavailable`), `no_usable_credential`, `credential_disabled`, `credential_not_found`, `credential_override_harness_unsupported` or `credential_override_invalid`.
+The response has `harness`, `credential`, `refusal` and `refusal_detail`. A refusal is a closed token: `no_credential_for_harness` (detail `credential_disabled` or `codex_pool_unavailable`), `no_usable_credential`, `credential_disabled`, `credential_not_found`, `credential_override_harness_unsupported`, `credential_override_invalid`, `credential_override_provider_source` (a credential override while your Claude source is a model provider), or `provider_source_unusable` (your Claude source is a model provider that is retired, off the operator allowlist, or has no enabled key). The schedule preview additionally reports `provider_lane_unsupported`, `provider_model_unmapped`, `provider_binding_stale` and `provider_destination_not_allowed`, the schedule skip reasons of the same names.
 
 When the harness is chosen at creation, `harness.value` and `credential` are null and `alternatives` lists Claude then Codex, neither marked as the likely choice. Each alternative is computed as if that harness were chosen and carries its own `credential`, or its own `refusal` and `refusal_detail`. The top-level `refusal` is set only when the request fails before a harness is decided, or when **every** alternative is refused for the **same** reason. When the reasons differ, the top-level `refusal` and `refusal_detail` stay null and each alternative keeps its own reason; one branch's reason is never promoted to stand for both. If one alternative is valid, nothing is promoted either.
 

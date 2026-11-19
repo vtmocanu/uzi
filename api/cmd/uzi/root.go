@@ -449,6 +449,7 @@ func newRootCmd(env Env) *cobra.Command {
 		newFindingsCmd(env, gf),
 		newWorkerCmd(env, gf),
 		newTokenCmd(env, gf),
+		newProviderCmd(env, gf),
 		newRateLimitsCmd(env, gf),
 		newMemoryCmd(env, gf),
 		newDocsCmd(env, gf),

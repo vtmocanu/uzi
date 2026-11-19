@@ -203,7 +203,7 @@ negotiated `iteration_park_version: 1` and authoritative persisted `completion_a
 park needing explicit owner Resume. Prior-attempt, excluded and legacy runs keep their
 existing dispositions, including possible completion holds or failure. Leave the question
 unanswered, or answer and immediately `uzi run pause RUN --now`. A run at `limit_wait` is
-parked on an Anthropic usage limit and resumes itself — keep waiting. `recovery_wait` with cause
+parked on an Anthropic usage limit and resumes itself — keep waiting. The exception is a provider gateway limit park (`rate_limit_type` `provider_gateway_limit`) with a null `retry_not_before`: it waits for its owner, so the poller stops on it (`STOP=limit_wait:provider_gateway_limit`); back up, then the owner Resumes or Cancels. `recovery_wait` with cause
 `worker_requeue_exhausted` never resumes itself: the poller always stops on it
 (`STOP=recovery_wait:worker_requeue_exhausted`, exit 0, whatever the stop set, even one naming `recovery_wait`). Back up the
 work (*Recovering a failed run's work*), then `uzi run resume` or cancel. It stops the same way on
@@ -677,7 +677,7 @@ commit that merely removes the literal still ships the one that added it). Do NO
 secret-history rewriting on the OTHER failures, which have their own `fail_origin`: the
 behind-on-workflows rejection is `workflow_scope_missing`, a base-align conflict is
 `finalize_base_align_conflict`, and a generic gate/agent failure is `agent_failure`;
-`limit_wait` is a separate parked status, not a `fail_origin`, and clears on its own.
+`limit_wait` is a separate parked status, not a `fail_origin`, and clears on its own (a provider gateway park with no retry time waits for the owner).
 Report the `failure_reason` verbatim and decide re-run vs. revise vs. hand back to the user.
 
 **A run that hit its wall-clock time limit is `paused` with `hold_reason:

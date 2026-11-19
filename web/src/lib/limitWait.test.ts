@@ -4,7 +4,10 @@ import {
   canToggleWaitOnLimit,
   feedWindowLabel,
   formatCountdown,
+  isProviderGatewayLimit,
   parseFeedInstant,
+  providerGatewayLimitDetail,
+  providerGatewayLimitHeadline,
   runWindowLabel,
 } from "./limitWait";
 
@@ -181,5 +184,30 @@ describe("canToggleWaitOnLimit", () => {
     for (const s of ["completed", "failed", "cancelled"]) {
       expect(canToggleWaitOnLimit(s)).toBe(false);
     }
+  });
+});
+
+describe("provider gateway limit (PRD #4320)", () => {
+  it("is a labelled member of the vocabulary and is recognised by its literal only", () => {
+    expect(runWindowLabel("provider_gateway_limit")).toBe("provider gateway rate limit");
+    expect(isProviderGatewayLimit("provider_gateway_limit")).toBe(true);
+    expect(isProviderGatewayLimit("five_hour")).toBe(false);
+    expect(isProviderGatewayLimit(null)).toBe(false);
+  });
+
+  it("names the gateway, never a usage limit or a reset", () => {
+    expect(providerGatewayLimitHeadline()).toBe("Waiting: your provider's gateway rate limit");
+    expect(providerGatewayLimitHeadline()).not.toMatch(/usage limit|resets/i);
+  });
+
+  it("says retrying at a time when a retry is scheduled and waiting for the owner when it is NULL", () => {
+    const now = Date.UTC(2026, 6, 27, 12, 0, 0);
+    const at = new Date(now + 15 * 60_000);
+    const detail = providerGatewayLimitDetail(at.toISOString(), now);
+    expect(detail).toContain("Retrying at");
+    expect(detail).toContain("15m 00s");
+    expect(providerGatewayLimitDetail(null, now)).toBe("Waiting for you to resume.");
+    expect(providerGatewayLimitDetail("not a date", now)).toBe("Waiting for you to resume.");
+    expect(providerGatewayLimitDetail(new Date(now - 1000).toISOString(), now)).toBe("Retrying shortly.");
   });
 });

@@ -49,7 +49,7 @@ func TestCommandTree(t *testing.T) {
 
 	topWant := []string{
 		"login", "logout", "auth", "whoami", "run", "review", "findings",
-		"worker", "token", "rate-limits", "repo", "docs", "project-sync", "handoff", "job", "admin", "skill", "version",
+		"worker", "token", "provider", "rate-limits", "repo", "docs", "project-sync", "handoff", "job", "admin", "skill", "version",
 	}
 	for _, name := range topWant {
 		if findCmd(root, name) == nil {
@@ -66,6 +66,7 @@ func TestCommandTree(t *testing.T) {
 		"findings": {"list", "file", "dismiss", "resolve", "undo"},
 		"worker":   {"list", "rm", "set-token"},
 		"token":    {"list"},
+		"provider": {"list", "create", "edit", "test", "retire"},
 		"repo":     {"list", "remove"},
 		"docs":     {"list", "show", "search"},
 		// PRD #576 M7: read (status) + fix-loop re-seed (resync); Adopt/Provision are web-only.
@@ -551,6 +552,7 @@ func TestReviewShowJudgeSkip(t *testing.T) {
 		{"codex", "no_usable_credential", "Judge skipped 2026-11-10: Codex had no usable credential."},
 		{"codex", "credential_disabled", "Judge skipped 2026-11-10: the Codex credential is disabled."},
 		{"codex", "codex_pool_unavailable", "Judge skipped 2026-11-10: no pooled Codex account was available."},
+		{"claude", "provider_lane_unsupported", "Judge skipped 2026-11-10: the Claude source is a model provider, which the judge does not support yet."},
 		{"claude", "no_usable_credential", "Judge skipped 2026-11-10: Claude had no usable credential."},
 	}
 	for _, tc := range cases {

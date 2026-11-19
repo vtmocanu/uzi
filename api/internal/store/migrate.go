@@ -104,6 +104,14 @@ const ProductTokenMintLockClass int32 = 0x757A7074 // "uzpt"
 // *LockClass. XACT-scoped.
 const JobCreateLockClass int32 = 0x757A6A62 // "uzjb"
 
+// ModelProviderOwnerLockClass is the class half of the two-int advisory lock that serializes one
+// owner's model-provider creates, so the per-owner cap (PRD #4320: 20 providers, retired ones
+// included) cannot be passed twice by two concurrent creates under READ COMMITTED. Taken in SQL by
+// LockModelProviderOwner (queries/model_providers.sql), which carries this value as the literal
+// 1970957680; TestModelProviderOwnerLockClassMatchesSQL fails if the two disagree, and the
+// lockClassesFromSource collision check covers it like every other *LockClass. XACT-scoped.
+const ModelProviderOwnerLockClass int32 = 0x757A6D70 // "uzmp"
+
 // ReviewAuthorQueueLockClass is the class half of the two-int advisory lock that serializes
 // every mutation (admit, requeue, prune, stale eviction) of one (repo, ref) MR review-author
 // queue (issue #2347). Taken in SQL by LockReviewAuthorQueue (queries/mr_review_authors.sql),

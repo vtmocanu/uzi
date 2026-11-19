@@ -17,7 +17,10 @@
 import type { CostStatus, Harness } from "./apiTypes";
 import { formatCost } from "./formatTokens";
 
-export type CostDisplayKind = "metered" | "subscription" | "unavailable";
+// "unknown" is a run served through a user-configured custom model provider (PRD #4320):
+// the gateway's prices are not ours to know, so the cost is Unknown rather than the
+// Anthropic-priced figure, "$0" or a plain "Unavailable".
+export type CostDisplayKind = "metered" | "subscription" | "unavailable" | "unknown";
 
 export interface CostDisplay {
   kind: CostDisplayKind;
@@ -33,7 +36,10 @@ export interface CostDisplay {
  *  still narrows to "unavailable" at runtime even though it is not a member of the
  *  compile-time type (the union is a compile-time hint, not a runtime guarantee; see
  *  CostStatus in apiTypes.ts). */
-export function costDisplay(status: CostStatus | "", costUsd: number): CostDisplay {
+export function costDisplay(status: CostStatus | "", costUsd: number, provider = false): CostDisplay {
+  // `provider` is run.provider_id !== null/undefined, passed by the caller; a provider run's
+  // tokens are real but no price table applies, whatever cost_usd carries on the wire.
+  if (provider) return { kind: "unknown" };
   if (status === "metered") return { kind: "metered", dollars: formatCost(costUsd) };
   if (status === "subscription") return { kind: "subscription" };
   return { kind: "unavailable" };
@@ -46,6 +52,7 @@ export function costDisplay(status: CostStatus | "", costUsd: number): CostDispl
 export function costHeadline(d: CostDisplay): string {
   if (d.kind === "metered") return d.dollars as string;
   if (d.kind === "subscription") return "No estimate";
+  if (d.kind === "unknown") return "Unknown";
   return "Unavailable";
 }
 
@@ -60,6 +67,7 @@ export function costSubLabel(d: CostDisplay, harness?: Harness | string | null):
     return "API-equivalent";
   }
   if (d.kind === "subscription") return "no cost estimate recorded";
+  if (d.kind === "unknown") return "custom provider · cost not reported";
   return "tokens only · cost unavailable";
 }
 

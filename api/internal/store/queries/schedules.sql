@@ -393,12 +393,13 @@ WHERE schedule_id = @schedule_id
 -- per-run credential override (D1/D5), both sqlc.narg — NULL = inherit, byte-identical
 -- to a pre-#1247 prompt run. M1 always passes NULL; M6 wires the schedule's stored
 -- override onto the fired run through this seam.
+-- model_provider_* (PRD #4320 M4), class FRESH-RESOLVE: the five binding columns are the owner's Claude provider source frozen by workersvc.createRunAtomic (NULL = vendor run). An unstamped param is NULL = a vendor run, so createRunAtomic asserts the inserted row against its resolution.
 INSERT INTO runs (
     user_id, repo_id, kind, issue_title, issue_description, schedule_id, auto_approve, wait_on_limit, mr_rework_enabled, model, model_source, override_subagent_model, required_capabilities, hinted_capabilities, ignored_inferred_capabilities, trigger_source, harness, credential_override_mode, credential_override_secret_id, plan_cross_check_required, plan_cross_check_gated
-, code_cross_check_required, ci_config_guard, ci_config_paths, repo_agent_source_required) VALUES (
+, code_cross_check_required, ci_config_guard, ci_config_paths, repo_agent_source_required, model_provider_id, model_provider_revision, model_provider_key_mode, model_provider_key_secret_id, model_provider_key_rev) VALUES (
     @user_id, @repo_id::uuid, 'prompt', @issue_title, @issue_description, @schedule_id::uuid, @auto_approve, @wait_on_limit, sqlc.narg('mr_rework_enabled'), sqlc.narg('model'), CASE WHEN sqlc.narg('model')::text IS NOT NULL THEN 'schedule_pin' END, @override_subagent_model,
     COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), COALESCE((SELECT rp.ignored_inferred_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), 'schedule', @harness, sqlc.narg('credential_override_mode'), sqlc.narg('credential_override_secret_id'),
     (@auto_approve AND (SELECT u.plan_cross_check_enabled FROM users u WHERE u.id = @user_id)),
     (NOT @auto_approve AND (SELECT u.plan_cross_check_enabled FROM users u WHERE u.id = @user_id))
-, (SELECT u.code_cross_check_enabled FROM users u WHERE u.id = @user_id), COALESCE(sqlc.narg('ci_config_guard')::boolean, false), sqlc.narg('ci_config_paths'), true)
+, (SELECT u.code_cross_check_enabled FROM users u WHERE u.id = @user_id), COALESCE(sqlc.narg('ci_config_guard')::boolean, false), sqlc.narg('ci_config_paths'), true, sqlc.narg('model_provider_id')::uuid, sqlc.narg('model_provider_revision')::int, sqlc.narg('model_provider_key_mode')::text, sqlc.narg('model_provider_key_secret_id')::uuid, sqlc.narg('model_provider_key_rev')::bigint)
 RETURNING *;

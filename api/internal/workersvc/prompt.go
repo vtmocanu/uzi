@@ -125,6 +125,13 @@ func (s *Service) createPromptRunShared(ctx context.Context, in promptRunInput, 
 			CredentialOverrideSecretID: pgOverrideSecretID(credOverride),
 			// PRD #1429 M2 (D1 auditor invariant): the D11-resolved harness frozen in-tx.
 			Harness: string(resolved.Harness),
+			// PRD #4320 M4: the five provider binding columns (all NULL for a vendor run). Unstamped
+			// would be a silent vendor run; createRunAtomic asserts the inserted row against the resolution.
+			ModelProviderID:          bindingOf(resolved).ProviderID,
+			ModelProviderRevision:    bindingOf(resolved).Revision,
+			ModelProviderKeyMode:     bindingOf(resolved).KeyMode,
+			ModelProviderKeySecretID: bindingOf(resolved).KeySecret,
+			ModelProviderKeyRev:      bindingOf(resolved).KeyRev,
 		}
 		if g != nil {
 			if err := g.before(ctx, q); err != nil {
