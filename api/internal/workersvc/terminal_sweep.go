@@ -318,14 +318,14 @@ func (s *Service) terminalBegin(ctx context.Context) (*terminalSweepTx, error) {
 	return &terminalSweepTx{ctx: ctx, tx: tx, qt: store.New(tx)}, nil
 }
 
-// terminalRetireBounds are the server-side limits on how long tx-R1 may hold the consumer gate. The
+// terminalRetireBounds limit tx-R1's pre-commit work, not a stalled durable COMMIT. The
 // gate is an xact lock: if the process stalls or dies with the transaction open, only the server can
 // release it, so the bounds are set on the session before the gate is tried. Each value is a
 // PostgreSQL time literal. transaction is used on PostgreSQL 17 and later only.
 type terminalRetireBounds struct{ transaction, statement, idle, lock string }
 
 var (
-	// PostgreSQL 17+: transaction_timeout caps the whole transaction (and so the gate hold) at 4s.
+	// PostgreSQL 17+: transaction_timeout caps pre-commit processing at 4s.
 	// statement and idle bound the single stalled step more tightly than that.
 	terminalRetireBoundsPG17 = terminalRetireBounds{transaction: "4s", statement: "2500ms", idle: "2s", lock: terminalSweepLockTimeout}
 	// Earlier versions (the chart pins 16) have no transaction_timeout, so the hold is bounded by the
@@ -334,9 +334,9 @@ var (
 	// the run read, the blocker read, the cross-run consumer read, the retiring write (or the keep's
 	// schedule write), and COMMIT. The pool's default statement-cache mode may send a separate Prepare
 	// round trip for each of the 6 parameterised queries on a cold connection, so up to 14 round trips
-	// follow the gate statement, each waiting at most statement (150ms) on the server plus idle (150ms)
-	// for the client. With the gate statement's own tail the hold is at most
-	// 150ms + 14 x (150ms + 150ms) = 4.35s, below terminalConsumerGateWait (asserted by
+	// follow the gate statement, each budgeted statement (150ms) on the server plus idle (150ms)
+	// for the client. With the gate statement's own tail the pre-commit budget is
+	// 150ms + 14 x (150ms + 150ms) = 4.35s, excluding durable-commit I/O, below terminalConsumerGateWait (asserted by
 	// TestTerminalRetireBoundsInvariants). lock stays strictly below statement, so a contended
 	// preservation row surfaces as lock_not_available (busy), not as a statement timeout.
 	terminalRetireBoundsPG16 = terminalRetireBounds{statement: "150ms", idle: "150ms", lock: "120ms"}
@@ -358,8 +358,8 @@ func terminalRetireBoundsFor(version int) terminalRetireBounds {
 const terminalRetirePG16RoundTrips = 14
 
 // terminalConsumerGateWait bounds how long an admission waits for the shared consumer gate
-// (store.LockTerminalConsumerGateShared). Every retirement hold bound must stay strictly below it, so
-// plain contention with a retirement can never time an admission out.
+// (store.LockTerminalConsumerGateShared). Pre-commit budgets stay below it;
+// stalled durable-commit I/O can still hold the gate longer and make admission busy.
 const terminalConsumerGateWait = 6 * time.Second
 
 // terminalRetireGateBusyRecheck is when a row whose gate try failed is looked at again: an admission

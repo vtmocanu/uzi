@@ -162,8 +162,8 @@ repository UUID, `store.TerminalConsumerGateObjID`).
   writes `live -> retiring` must go through the same function.
 - **Waiter priority.** PostgreSQL makes a new lock request conflict with queued
   waiters as well as holders, so while an admission is queued every later
-  try-exclusive fails. A queued admission waits for at most one bounded
-  exclusive hold; plain contention cannot time it out.
+  try-exclusive fails. It waits behind at most one exclusive holder; durable
+  commit I/O is not bounded by the pre-commit budgets below.
 - **Retirement hold bound.** The gate is a transaction-scoped lock, so a
   stalled or killed tx-R1 can only be freed by the server. On PostgreSQL 17 and
   later tx-R1 sets `transaction_timeout = 4s` (with `statement_timeout = 2500ms`
@@ -173,10 +173,15 @@ repository UUID, `store.TerminalConsumerGateObjID`).
   `lock_timeout` drops to 120ms (below the statement timeout, so contention
   stays busy). tx-R1 makes at most 14 round trips after the gate (8 statements,
   6 of them parameterised and possibly preceded by a Prepare on a cold
-  connection), so the hold is at most 150ms + 14 x (150ms + 150ms) = 4.35s.
+  connection), giving a pre-commit budget of 150ms + 14 x (150ms + 150ms) = 4.35s.
   Invariant (asserted by a unit test over the production values): the
-  hold bound must stay strictly below the admissions' 6s gate wait, so a stalled
-  retirement can never time out a healthy admission. Enabling retirement on
+  pre-commit budget must stay below the admissions' 6s gate wait. This does not
+  bound durable COMMIT: PostgreSQL disables the transaction timeout before
+  durability and releases locks after the WAL flush
+  ([source](https://github.com/postgres/postgres/blob/REL_17_STABLE/src/backend/access/transam/xact.c)).
+  A stalled commit may therefore make admissions busy; testing and any stronger
+  protocol are deferred before enablement. Marker durability remains required.
+  Enabling retirement on
   PostgreSQL 16 also needs the protection query to fit those per-statement
   limits at real volume (indexes such as `cross_checks(checker_run_id)` and
   `runs(resume_of_run_id)`, part of the slice C/D protection-query work).
@@ -260,10 +265,9 @@ cancelled the post-commit waits; now a stuck row-lock or judge-lock holder keeps
 the report's handler goroutine and pool connection (and, inside a gated write,
 the shared gate, so retirement keeps `consumer_gate_busy` for that repository)
 until the holder ends. The gate wait itself stays bounded; the downstream waits
-are unbounded exactly as long as their holder is. A fire-once hook that times
-out on a busy gate (two full exclusive holds, which waiter priority rules out
-in normal operation) logs and drops its admission, as every other database
-error there does.
+are unbounded exactly as long as their holder is. A fire-once hook whose gate
+wait times out, including during a stalled durable commit, logs and drops its
+admission, as every other database error there does.
 
 ### Reopen semantics (narrowed)
 

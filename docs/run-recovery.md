@@ -3635,6 +3635,9 @@ Once retirement is on, you may see:
   the handler and a database connection until the lock holder ends. A held
   shared gate makes retirement keep the ref; other shared admissions remain
   compatible with it.
+  If a step's gate wait ends busy, that step is skipped: MR metadata may remain
+  unwritten, or a follow-up hook may create no child. The run's status is already
+  committed and later steps can still run. Failed steps have no durable retry.
 
 ### The worker side is built but switched off
 
