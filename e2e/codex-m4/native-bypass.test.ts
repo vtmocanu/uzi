@@ -250,7 +250,7 @@ test(CODEX_P_ISOLATION_ENV_TITLE, { skip: P_LAYER_SKIP }, async (t) => {
   // for an app-server-auth root — HOME/CODEX_HOME/the four XDG_*/TMPDIR plus a fixed
   // PATH/SHELL/LANG/TERM, and NO provider credential var (the credential rides the login RPC).
   const REPLACED_ENV_ALLOWLIST = [
-    "HOME", "CODEX_HOME",
+    "HOME", "CODEX_HOME", "CODEX_EXEC_SERVER_URL",
     "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME",
     "TMPDIR", "PATH", "SHELL", "LANG", "TERM",
   ].sort();

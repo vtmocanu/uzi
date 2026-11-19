@@ -238,6 +238,10 @@ it("production turn/start sends the unchanged Plan schema and omits Code schema 
   await r.run();
   const turns = r.requests.filter(frame => frame.method === "turn/start");
   assert.equal(turns.length, 1);
+  const threads = r.requests.filter(frame => frame.method === "thread/start");
+  assert.equal(threads.length, 1);
+  assert.deepEqual(threads[0]!.params!.environments, [], stage + " thread disables native environments");
+  assert.deepEqual(turns[0]!.params!.environments, [], stage + " turn disables native environments");
   if (stage === "plan") {
    assert.deepEqual(turns[0]!.params!.outputSchema, PLAN_VERDICT_SCHEMA);
    assert.equal(turns[0]!.params!.outputSchema.properties.summary.maxLength, 4096);
@@ -670,6 +674,7 @@ it("uses claimed model/effort, required wrappers, real Read broker and strict co
  assert.equal(thread.config.shell_tool, false);
  assert.equal(thread.config.project_doc_max_bytes, 0);
  assert.deepEqual(thread.environments, []);
+ assert.deepEqual(r.requests.find((f) => f.method === "turn/start")!.params!.environments, []);
  assert.equal(r.requests.find((f) => f.method === "turn/start")!.params!.effort, "high");
  assert.equal((r.specs[1] as CodexLaunchSpec).crossCheckReadOnly, true);
  assert.ok((r.specs[0] as CodexEffectLaunchSpec).args.includes("--cross-check"));

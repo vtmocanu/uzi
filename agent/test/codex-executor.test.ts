@@ -5632,6 +5632,7 @@ describe("CodexExecutor: child-thread delegation demux (part C)", () => {
     assert.equal(rig.transport.turnStartCount, 2, "a child turn/start was issued");
     const childTurn = rig.transport.requests.filter((request) => request.method === "turn/start")[1];
     assert.ok(childTurn);
+    assert.deepEqual(rec(childTurn.params).environments, [], "the child turn disables native execution environments");
     assert.equal(rec(childTurn.params).effort, "medium", "the delegated child inherits the configured effort through the real wire key");
     assert.equal(rec(childTurn.params).modelReasoningEffort, undefined, "the ignored internal field name never reaches the child wire");
     const childStart = rig.transport.requests.filter((request) => request.method === "thread/start")[1];
