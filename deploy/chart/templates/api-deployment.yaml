@@ -195,6 +195,12 @@ spec:
             # a non-empty pin also tells health checks to expect controller reports.
             - name: HOSTED_WORKER_VERSION
               value: {{ .Values.workers.image.tag | quote }}
+            # PRD #4213: the enabled worker tiers, their LimitRange ceilings and quotas as
+            # integers (cpu millicores, memory MiB, PVC GiB), so the api can validate admin
+            # hosted-worker sizes. See uzi.workerSizeEnv for the contract.
+            {{- with include "uzi.workerSizeEnv" . }}
+            {{- . | nindent 12 }}
+            {{- end }}
             {{- end }}
             # PRD #837 M4 disk-pressure threshold. The api derives a hosted worker's
             # `disk_pressure` boolean by comparing each reported volume's used/total

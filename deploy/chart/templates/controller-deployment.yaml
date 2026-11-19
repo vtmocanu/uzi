@@ -370,6 +370,16 @@ spec:
             - name: UZI_WORKER_MAX_PVC_STORAGE
               value: {{ . | quote }}
             {{- end }}
+            {{- with .Values.workers.limitRange.max }}
+            {{- with .cpu }}
+            - name: UZI_WORKER_MAX_CPU
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .memory }}
+            - name: UZI_WORKER_MAX_MEMORY
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
             {{- end }}
             # The Codex uid-split profile (PRD #1493 M4). Each renders ONLY when set away
             # from its default, so a default install's controller pod stays byte-identical:
@@ -481,6 +491,16 @@ spec:
             - name: UZI_WORKER_DOCKER_MAX_PVC_STORAGE
               value: {{ . | quote }}
             {{- end }}
+            {{- with .Values.workers.docker.limitRange.max }}
+            {{- with .cpu }}
+            - name: UZI_WORKER_DOCKER_MAX_CPU
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .memory }}
+            - name: UZI_WORKER_DOCKER_MAX_MEMORY
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
             {{- end }}
             {{- end }}
             {{- if include "uzi.workerExtraCAConfigMap" . }}
@@ -500,6 +520,18 @@ spec:
               value: {{ include "uzi.fetcherURL" . | quote }}
             - name: UZI_WORKER_ISOLATED_FETCHER_CA_FILE
               value: {{ printf "%s/ca.crt" (include "uzi.controllerFetcherCADir" .) | quote }}
+            {{- if .Values.workers.isolatedLane.limitRange.enabled }}
+            {{- with .Values.workers.isolatedLane.limitRange.max }}
+            {{- with .cpu }}
+            - name: UZI_WORKER_ISOLATED_MAX_CPU
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .memory }}
+            - name: UZI_WORKER_ISOLATED_MAX_MEMORY
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
             {{- end }}
           resources:
             {{- toYaml .Values.workers.controller.resources | nindent 12 }}
