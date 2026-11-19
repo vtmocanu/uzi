@@ -353,11 +353,18 @@ type sessionResponse struct {
 	EffectiveJudgeModel  string                    `json:"effective_judge_model"`
 }
 
+// sidebarMotionDefault is the instance default for animated sidebar icons when a
+// user has not chosen. Shipped code never assigns it; tests flip it to cover the
+// resolution path.
+var sidebarMotionDefault = theme.FallbackSidebarMotion
+
 type sessionAppearanceValues struct {
 	Mode       string `json:"mode"`
 	LightTheme string `json:"light_theme"`
 	DarkTheme  string `json:"dark_theme"`
 	Typeface   string `json:"typeface"`
+	// SidebarMotion is the instance default for animated sidebar icons (issue #4510).
+	SidebarMotion bool `json:"sidebar_motion"`
 }
 
 type sessionAppearanceOverrides struct {
@@ -365,15 +372,19 @@ type sessionAppearanceOverrides struct {
 	LightTheme *string `json:"light_theme"`
 	DarkTheme  *string `json:"dark_theme"`
 	Typeface   *string `json:"typeface"`
+	// SidebarMotion is the user's raw choice; null = not chosen.
+	SidebarMotion *bool `json:"sidebar_motion"`
 }
 
 type sessionAppearanceResponse struct {
-	Mode       string                     `json:"mode"`
-	LightTheme string                     `json:"light_theme"`
-	DarkTheme  string                     `json:"dark_theme"`
-	Typeface   string                     `json:"typeface"`
-	Overrides  sessionAppearanceOverrides `json:"overrides"`
-	Defaults   sessionAppearanceValues    `json:"defaults"`
+	Mode       string `json:"mode"`
+	LightTheme string `json:"light_theme"`
+	DarkTheme  string `json:"dark_theme"`
+	Typeface   string `json:"typeface"`
+	// SidebarMotion is the resolved animated-sidebar-icons flag (issue #4510).
+	SidebarMotion bool                       `json:"sidebar_motion"`
+	Overrides     sessionAppearanceOverrides `json:"overrides"`
+	Defaults      sessionAppearanceValues    `json:"defaults"`
 }
 
 // sessionPayload builds the auth/session bootstrap body the SPA reads on
@@ -440,13 +451,15 @@ func (h *Handler) sessionPayload(ctx context.Context, user store.User) sessionRe
 		UziLabel:       uziLabel,
 		Appearance: sessionAppearanceResponse{
 			Mode: appr.Mode, LightTheme: appr.Light, DarkTheme: appr.Dark, Typeface: appr.Typeface,
+			SidebarMotion: theme.ResolveSidebarMotion(boolPtrValue(user.SidebarMotion), sidebarMotionDefault),
 			Overrides: sessionAppearanceOverrides{
-				Mode:       textPtrValue(user.AppearanceMode.Valid, user.AppearanceMode.String),
-				LightTheme: textPtrValue(user.LightTheme.Valid, user.LightTheme.String),
-				DarkTheme:  textPtrValue(user.DarkTheme.Valid, user.DarkTheme.String),
-				Typeface:   textPtrValue(user.Typeface.Valid, user.Typeface.String),
+				Mode:          textPtrValue(user.AppearanceMode.Valid, user.AppearanceMode.String),
+				LightTheme:    textPtrValue(user.LightTheme.Valid, user.LightTheme.String),
+				DarkTheme:     textPtrValue(user.DarkTheme.Valid, user.DarkTheme.String),
+				Typeface:      textPtrValue(user.Typeface.Valid, user.Typeface.String),
+				SidebarMotion: boolPtrValue(user.SidebarMotion),
 			},
-			Defaults: sessionAppearanceValues{Mode: iMode, LightTheme: iLight, DarkTheme: iDark, Typeface: iTypeface},
+			Defaults: sessionAppearanceValues{Mode: iMode, LightTheme: iLight, DarkTheme: iDark, Typeface: iTypeface, SidebarMotion: sidebarMotionDefault},
 		},
 		// Deprecated trio preserves the painted slot, raw legacy override and
 		// legacy-chained instance dark default.

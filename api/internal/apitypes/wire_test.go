@@ -1221,6 +1221,8 @@ func TestUserSettingsDTOTags(t *testing.T) {
 		"mr_rework_enabled",
 		// PRD #1167: the four raw per-field appearance overrides (each null ⇒ inherit).
 		"appearance_mode", "light_theme", "dark_theme", "typeface",
+		// Issue #4510: the animated-sidebar-icons opt-in (raw, null = not chosen) and its resolved flag.
+		"sidebar_motion", "effective_sidebar_motion",
 		// PRD #1429 M1 (D3): the per-user default harness (null ⇒ no preference).
 		"default_harness",
 		// PRD #1209 M1: the linked Codex accounts surfaced on the sidebar rail (codex sibling

@@ -34,6 +34,8 @@
   "light_theme": "x",
   "dark_theme": "x",
   "typeface": "x",
+  "sidebar_motion": true,
+  "effective_sidebar_motion": true,
   "default_harness": "x",
   "judge_runs_on": "x",
   "claude_provider_id": "x",

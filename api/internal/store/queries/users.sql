@@ -320,7 +320,7 @@ RETURNING codex_summary_model;
 -- reviews, the settings surface exposes it as nullable claude|codex.
 -- claude_provider_id (PRD #4320 M4) rides it too, read-only on the settings surface: the owner's
 -- Claude model-provider source (NULL = the vendor ladder); written only by PUT /me/providers/claude-source.
-SELECT default_model, default_effort, judge_model, codex_judge_model, summary_model, codex_summary_model, theme, sidebar_token_ids, mr_rework_enabled, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, now_summary_enabled, weekly_reserve_pct, weekly_reserve_pause_running, judge_runs_on, claude_provider_id FROM users WHERE id = $1;
+SELECT default_model, default_effort, judge_model, codex_judge_model, summary_model, codex_summary_model, theme, sidebar_token_ids, mr_rework_enabled, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, now_summary_enabled, weekly_reserve_pct, weekly_reserve_pause_running, judge_runs_on, claude_provider_id, sidebar_motion FROM users WHERE id = $1;
 
 -- name: GetUserSchedulePause :one
 -- The current user's pause-all-schedules state (PRD #1093), returned RAW: the switch
@@ -346,7 +346,7 @@ RETURNING theme;
 
 -- name: SetUserAppearance :one
 -- PATCHes the current user's appearance (PRD #1167 M1) in ONE atomic statement:
--- each of the four fields is written only when its @set_* flag is true, otherwise
+-- each of the five fields is written only when its @set_* flag is true, otherwise
 -- the current column value is kept (the CASE keeps the row's own value). A true
 -- flag with a NULL value CLEARS that field back to the instance default (the
 -- resolver treats a NULL column as inherit). Because every unset field re-writes
@@ -358,9 +358,10 @@ UPDATE users
 SET appearance_mode = CASE WHEN @set_mode::bool THEN @appearance_mode ELSE appearance_mode END,
     light_theme = CASE WHEN @set_light::bool THEN @light_theme ELSE light_theme END,
     dark_theme = CASE WHEN @set_dark::bool THEN @dark_theme ELSE dark_theme END,
-    typeface = CASE WHEN @set_typeface::bool THEN @typeface ELSE typeface END
+    typeface = CASE WHEN @set_typeface::bool THEN @typeface ELSE typeface END,
+    sidebar_motion = CASE WHEN @set_sidebar_motion::bool THEN sqlc.narg('sidebar_motion')::boolean ELSE sidebar_motion END
 WHERE id = @id
-RETURNING appearance_mode, light_theme, dark_theme, typeface;
+RETURNING appearance_mode, light_theme, dark_theme, typeface, sidebar_motion;
 
 -- name: SetUserSidebarTokens :one
 -- Replaces the user's whole sidebar token-meter set (00123): the non-default
