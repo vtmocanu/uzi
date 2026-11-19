@@ -710,6 +710,12 @@ exceed `max_issues` once backfill walks past a skip), which ones
   stays active and due, and it fires once that run releases the branch.
 - `description_too_large` — the composed run instruction (issue body
   plus any [guidance](#guidance)) exceeds the size limit.
+- `consumer_gate_busy`: a sweep had already started work before a candidate's
+  repository gate was busy. The partial fire stops and is consumed. A one-time
+  sweep does not retry it automatically; start that issue manually or explicitly
+  re-fire the sweep as a new fire. If nothing had started, the schedule stays
+  armed and retries instead. Durable partial-fire progress is deferred to
+  [#4512](https://github.com/vtmocanu/uzi/issues/4512).
 - `fetch_failed` — a transient forge or database error while checking
   a sweep candidate. The same underlying error is handled differently
   by target: on a **pinned issue**, it's transient and the fire retries

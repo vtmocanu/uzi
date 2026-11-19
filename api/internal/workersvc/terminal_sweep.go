@@ -41,15 +41,20 @@ import (
 //     1. forge observation, outside any transaction: observed_at is read from the DATABASE clock
 //     BEFORE the forge read (the earliest, conservative stamp), then the lifetime is re-derived with
 //     terminalLifetime (the one classification the route also uses);
-//     2. tx-R1: run lock (NOWAIT), then the preservation row; the facts and every independent
-//     protection are re-checked; the observation must still be fresh on the database clock; then
-//     the irrevocable retiring is committed. A reopen between the forge answer and this commit
-//     is not seen: that is the documented behaviour, the decision is final once committed;
+//     2. tx-R1 (terminalLockRunForRetire): the server-side hold bounds, then the repository's
+//     consumer gate try-taken exclusively (never waited for; busy keeps the ref and records
+//     consumer_gate_busy), then the run lock (NOWAIT) and the preservation row; the facts and
+//     every independent protection are re-checked as statements after the gate; the observation
+//     must still be fresh on the database clock; then the irrevocable retiring is committed. A
+//     reopen between the forge answer and this commit is not seen: that is the documented
+//     behaviour, the decision is final once committed. No network call or ambient-pool read runs
+//     inside tx-R1;
 //     3. the remote effect, with no transaction open: list, CAS DeleteTerminal at retire_tip, list;
 //     4. tx-R2: deleted (absent), abandoned (foreign tip), or stay retiring with backoff (uncertain),
 //     in which case the next pass repeats only step 3.
 //
-// Lock order wherever more than one is taken: run, preservation, contribution. Every state or tip
+// Lock order wherever more than one is taken: consumer gate (tx-R1 only, first), run, preservation,
+// contribution. Every state or tip
 // write is under the run row lock, with one exception: the run-gone bound row (terminalSweepBound
 // via terminalLockPreservationOnly), whose run row no longer exists, is written under the
 // preservation row lock alone. A scheduling-only write (terminalSkip, terminalFail, terminalPark) is
@@ -294,14 +299,124 @@ func (t *terminalSweepTx) commit() error {
 // row FOR UPDATE. busy is true when the run (or the row) is held by someone else; the transaction is
 // then already rolled back. The run's repository must still be the row's.
 func (s *Service) terminalLockRun(ctx context.Context, row store.RunTerminalPreservation) (tt *terminalSweepTx, pres store.RunTerminalPreservation, busy bool, err error) {
+	tt, err = s.terminalBegin(ctx)
+	if err != nil {
+		return nil, pres, false, err
+	}
+	return s.terminalLockRunTx(tt, row, terminalSweepLockTimeout)
+}
+
+// terminalBegin opens a READ COMMITTED sweep transaction.
+func (s *Service) terminalBegin(ctx context.Context) (*terminalSweepTx, error) {
 	if s.txBeginner == nil {
-		return nil, pres, false, errors.New("terminal sweep: transactions are not wired")
+		return nil, errors.New("terminal sweep: transactions are not wired")
 	}
 	tx, err := s.beginReadCommitted(ctx)
 	if err != nil {
-		return nil, pres, false, fmt.Errorf("terminal sweep: begin: %s", secretscrub.Scrub(err.Error()))
+		return nil, fmt.Errorf("terminal sweep: begin: %s", secretscrub.Scrub(err.Error()))
 	}
-	tt = &terminalSweepTx{ctx: ctx, tx: tx, qt: store.New(tx)}
+	return &terminalSweepTx{ctx: ctx, tx: tx, qt: store.New(tx)}, nil
+}
+
+// terminalRetireBounds limit tx-R1's pre-commit work, not a stalled durable COMMIT. The
+// gate is an xact lock: if the process stalls or dies with the transaction open, only the server can
+// release it, so the bounds are set on the session before the gate is tried. Each value is a
+// PostgreSQL time literal. transaction is used on PostgreSQL 17 and later only.
+type terminalRetireBounds struct{ transaction, statement, idle, lock string }
+
+var (
+	// PostgreSQL 17+: transaction_timeout caps pre-commit processing at 4s.
+	// statement and idle bound the single stalled step more tightly than that.
+	terminalRetireBoundsPG17 = terminalRetireBounds{transaction: "4s", statement: "2500ms", idle: "2s", lock: terminalSweepLockTimeout}
+	// Earlier versions (the chart pins 16) have no transaction_timeout, so the hold is bounded by the
+	// per-round-trip statement and idle limits over the round trips tx-R1 makes after the gate. The
+	// longest path sends 8 statements: the run lock, SET LOCAL lock_timeout, the preservation row lock,
+	// the run read, the blocker read, the cross-run consumer read, the retiring write (or the keep's
+	// schedule write), and COMMIT. The pool's default statement-cache mode may send a separate Prepare
+	// round trip for each of the 6 parameterised queries on a cold connection, so up to 14 round trips
+	// follow the gate statement, each budgeted statement (150ms) on the server plus idle (150ms)
+	// for the client. With the gate statement's own tail the pre-commit budget is
+	// 150ms + 14 x (150ms + 150ms) = 4.35s, excluding durable-commit I/O, below terminalConsumerGateWait (asserted by
+	// TestTerminalRetireBoundsInvariants). lock stays strictly below statement, so a contended
+	// preservation row surfaces as lock_not_available (busy), not as a statement timeout.
+	terminalRetireBoundsPG16 = terminalRetireBounds{statement: "150ms", idle: "150ms", lock: "120ms"}
+)
+
+// terminalPG17 is the first server_version_num with transaction_timeout.
+const terminalPG17 = 170000
+
+// terminalRetireBoundsFor selects tx-R1's hold bounds for a server_version_num.
+func terminalRetireBoundsFor(version int) terminalRetireBounds {
+	if version >= terminalPG17 {
+		return terminalRetireBoundsPG17
+	}
+	return terminalRetireBoundsPG16
+}
+
+// terminalRetirePG16RoundTrips is the most round trips tx-R1 makes after the gate statement on a
+// server without transaction_timeout (see terminalRetireBoundsPG16).
+const terminalRetirePG16RoundTrips = 14
+
+// terminalConsumerGateWait bounds how long an admission waits for the shared consumer gate
+// (store.LockTerminalConsumerGateShared). Pre-commit budgets stay below it;
+// stalled durable-commit I/O can still hold the gate longer and make admission busy.
+const terminalConsumerGateWait = 6 * time.Second
+
+// terminalRetireGateBusyRecheck is when a row whose gate try failed is looked at again: an admission
+// holds the gate for moments, and a retry re-observes the forge, so a short delay would only spend
+// forge reads.
+const terminalRetireGateBusyRecheck = terminalSweepSkipBackoff
+
+// terminalLockRunForRetire is terminalLockRun for tx-R1 only. Inside one READ COMMITTED transaction:
+// (1) the server-side hold bounds, each its own statement, then (2) the consumer gate, try-taken
+// exclusively in its own statement so every later statement sees what an admission committed before it
+// released the gate, then (3) the terminalLockRun body. gateBusy is true when an admission or another
+// retirement holds the gate; the transaction is then rolled back. busy keeps its terminalLockRun meaning.
+func (s *Service) terminalLockRunForRetire(ctx context.Context, row store.RunTerminalPreservation) (tt *terminalSweepTx, pres store.RunTerminalPreservation, busy, gateBusy bool, err error) {
+	tt, err = s.terminalBegin(ctx)
+	if err != nil {
+		return nil, pres, false, false, err
+	}
+	fail := func(e error) (*terminalSweepTx, store.RunTerminalPreservation, bool, bool, error) {
+		tt.rollback()
+		return nil, pres, false, false, e
+	}
+	var version int
+	if err = tt.tx.QueryRow(ctx, "SELECT current_setting('server_version_num')::int").Scan(&version); err != nil {
+		return fail(fmt.Errorf("terminal sweep: server version: %w", err))
+	}
+	bounds := terminalRetireBoundsFor(version)
+	if o := s.terminal.retireBounds; o != nil {
+		bounds = *o
+	}
+	setters := []string{"SET LOCAL statement_timeout = '" + bounds.statement + "'", "SET LOCAL idle_in_transaction_session_timeout = '" + bounds.idle + "'"}
+	if version >= terminalPG17 {
+		setters = append([]string{"SET LOCAL transaction_timeout = '" + bounds.transaction + "'"}, setters...)
+	}
+	for _, q := range setters {
+		if _, err = tt.tx.Exec(ctx, q); err != nil {
+			return fail(fmt.Errorf("terminal sweep: hold bound: %w", err))
+		}
+	}
+	ok, err := tt.qt.TryLockTerminalConsumerGate(ctx, row.RepoID)
+	if err != nil {
+		return fail(fmt.Errorf("terminal sweep: consumer gate: %w", err))
+	}
+	if !ok {
+		tt.rollback()
+		return nil, pres, false, true, nil
+	}
+	if s.terminal.afterRetireGate != nil {
+		s.terminal.afterRetireGate()
+	}
+	tt, pres, busy, err = s.terminalLockRunTx(tt, row, bounds.lock)
+	return tt, pres, busy, false, err
+}
+
+// terminalLockRunTx is the lock body shared by terminalLockRun and terminalLockRunForRetire, on an open
+// transaction: the run lock (NOWAIT), the repository check, the lock timeout, the preservation row.
+func (s *Service) terminalLockRunTx(tt *terminalSweepTx, row store.RunTerminalPreservation, lockTimeout string) (_ *terminalSweepTx, pres store.RunTerminalPreservation, busy bool, err error) {
+	ctx, tx := tt.ctx, tt.tx
 	fail := func(e error) (*terminalSweepTx, store.RunTerminalPreservation, bool, error) {
 		tt.rollback()
 		if isLockNotAvailable(e) {
@@ -321,7 +436,7 @@ func (s *Service) terminalLockRun(ctx context.Context, row store.RunTerminalPres
 		tt.rollback()
 		return nil, pres, false, errors.New("terminal sweep: the run's repository no longer matches the preservation")
 	}
-	if _, err = tx.Exec(ctx, "SET LOCAL lock_timeout = '"+terminalSweepLockTimeout+"'"); err != nil {
+	if _, err = tx.Exec(ctx, "SET LOCAL lock_timeout = '"+lockTimeout+"'"); err != nil {
 		return fail(fmt.Errorf("terminal sweep: lock timeout: %w", err))
 	}
 	pres, err = tt.qt.GetTerminalPreservationForUpdate(ctx, row.RunID)
@@ -601,9 +716,15 @@ func (s *Service) terminalSweepLive(ctx context.Context, row store.RunTerminalPr
 // rests on lt, so the run, once locked, must still have the association lt observed; otherwise the
 // decision is discarded without a state write and re-observed on a later pass.
 func (s *Service) terminalRetireDecide(ctx context.Context, row store.RunTerminalPreservation, lt TerminalLifetime, reason string, observedAt time.Time) (int64, error) {
-	tt, pres, busy, err := s.terminalLockRun(ctx, row)
+	tt, pres, busy, gateBusy, err := s.terminalLockRunForRetire(ctx, row)
 	if err != nil {
 		return 0, err
+	}
+	if gateBusy {
+		// An admission (or another retirement) holds the consumer gate: nothing is decided, and no
+		// attempt is counted. Distinct from busy, which is the NOWAIT run lock.
+		slog.Info("terminal sweep: retire kept, the consumer gate is busy", "run", row.RunID)
+		return 0, s.terminalDeferWrite(ctx, row, terminalRetireGateBusyRecheck, "retire kept: consumer_gate_busy", 0)
 	}
 	if busy {
 		return 0, s.terminalSkip(ctx, row)
@@ -665,6 +786,9 @@ func (s *Service) terminalRetireDecide(ctx context.Context, row store.RunTermina
 	}
 	if err != nil {
 		return 0, fmt.Errorf("terminal sweep: retiring: %w", err)
+	}
+	if s.terminal.beforeRetiringCommit != nil {
+		s.terminal.beforeRetiringCommit()
 	}
 	if err = tt.commit(); err != nil {
 		return 0, fmt.Errorf("terminal sweep: commit: %s", secretscrub.Scrub(err.Error()))

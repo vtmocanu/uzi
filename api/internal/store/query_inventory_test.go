@@ -560,7 +560,8 @@ var queryInventory = []queryPin{
 			"TestJudgeSkipLateWriterLiveDB pins that the skip writer blocks on it"},
 	{"CurrentTransactionIsolation", "judge.sql", "TestJudgeCreateIsolationGuardFailsClosedLiveDB",
 		"issue #3257: reached through lockJudgeTargetForCreate in ../workersvc; the test runs both " +
-			"creation paths at REPEATABLE READ and asserts no judge and errJudgeCreateIsolation"},
+			"creation paths at REPEATABLE READ and asserts no judge (the rerun now fails closed at the " +
+			"consumer gate, store.ErrTerminalConsumerGateIsolation, issue #4488)"},
 	{"ListOwnedRecommendationsForCoords", "judge_bulk_disposition.sql", "TestBulkDispositionFiledMemberIsNotOpenLiveDB",
 		"named in NO test source: reached via handler.BulkSetDispositions -> workersvc. This pin is " +
 			"the one whose folds are recorded — dropping the filed-issues join's coordinate half " +

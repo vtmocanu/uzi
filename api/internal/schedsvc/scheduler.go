@@ -866,6 +866,24 @@ func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) (Fir
 			out.Skips = append(out.Skips, Skip{IssueIID: &iidCopy, Title: issue.Title, Reason: SkipFetchFailed, WebURL: issue.WebURL})
 			break
 		}
+		if errors.Is(err, workersvc.ErrTerminalConsumerGateBusy) {
+			// Issue #4488: a terminal-ref retirement briefly holds this repository's consumer
+			// gate and nothing was created. Contention is retryable and must never become a
+			// consumed trigger with no run started. The hold is repo-wide, so every remaining
+			// candidate would be refused the same way: a fire that has started nothing returns
+			// the error (advance's transient arm: not advanced, retried next tick, the
+			// skipReasonForErr map deliberately unchanged). One that already started runs this
+			// fire records a consumer_gate_busy skip for this candidate and stops, so it advances; the
+			// credential-disabled and stored-override arms above also stop and advance. Holding
+			// it would re-fire the whole sweep and could start up to max_issues more on top of
+			// this fire's runs.
+			if len(out.Started) == 0 {
+				return FireOutcome{}, err
+			}
+			e.logger.Info("scheduler: sweep stopped, terminal consumer gate busy", "schedule", sched.ID.String(), "issue", iid)
+			out.Skips = append(out.Skips, Skip{IssueIID: &iidCopy, Title: issue.Title, Reason: SkipConsumerGateBusy, WebURL: issue.WebURL})
+			break
+		}
 		if err != nil {
 			// A permanent/transient repo error mid-sweep is unexpected (the repo just
 			// resolved); record it as fetch_failed and keep going rather than aborting the
@@ -1224,6 +1242,20 @@ func (e *Scheduler) resolveRepoForge(ctx context.Context, sched store.RunSchedul
 // park and transient branches never touch last_fire, so a parked/transient fire keeps the
 // prior last_fire or none (Decision 5).
 func (e *Scheduler) advance(ctx context.Context, sched store.RunSchedule, out FireOutcome, fireErr error) {
+	// A gate wait can end because this context was canceled AFTER a candidate
+	// committed. Preserve the narrowed partial-fire disposition independently of
+	// that cancellation, but bound this metadata write. No further runs are created.
+	// This is still a separate best-effort write, not durable per-fire progress.
+	if fireErr == nil && len(out.Started) > 0 {
+		for _, skip := range out.Skips {
+			if skip.Reason == SkipConsumerGateBusy {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+				defer cancel()
+				break
+			}
+		}
+	}
 	if fireErr != nil {
 		if errors.Is(fireErr, workersvc.ErrRepoNotFound) {
 			e.park(ctx, sched, "the schedule's repo is disconnected or no longer owned by you")

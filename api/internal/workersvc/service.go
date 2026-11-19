@@ -2246,6 +2246,16 @@ type Service struct {
 	codexSelectHook            func(ctx context.Context)
 	codexSelectLockedHook      func(ctx context.Context)
 	codexSelectBeforeFenceHook func(ctx context.Context, picked uuid.UUID)
+	// createBeforeCommitHook is a test-only seam in createRunAtomic: it runs with the created run
+	// inserted in the open transaction, right before that transaction's COMMIT, on every
+	// transactional create path. Nil in production.
+	createBeforeCommitHook func(run store.Run)
+	// reconcileBeforeCommitHook is a test seam in reconcileRunMRGated (issue #4488): it runs after
+	// the gated ReconcileRunMR UPDATE, before that transaction's COMMIT. Nil in production.
+	reconcileBeforeCommitHook func(runID uuid.UUID)
+	// consumerGateWait is a test-only override of terminalConsumerGateWait for the shared
+	// consumer gate an admission takes (consumerGateWaitFor). Zero in production.
+	consumerGateWait time.Duration
 	// judgeBeforeLockHook / judgeAfterInsertHook are test seams in the judge insert closures
 	// (issue #3257): the first runs in the creating transaction after the isolation check and
 	// before the target lock, the second after the judge INSERT and before the commit. Nil in
@@ -6088,8 +6098,17 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 	// no-op; if the status transition no-oped (e.g. the run was cancelled or already
 	// terminal), this still captures the MR so the run never reports "MR: none".
 	// Best-effort: a failure here must not fail the worker's terminal report.
+	// Issue #4488 (ADR-4007 T3): the state transaction has committed, so everything below that
+	// must not be lost to a dropped request runs detached from its cancellation: the gated MR
+	// reconcile, the authoritative re-read (an error there skips every hook) and the three gated
+	// fire-once hooks (judge, task review, then-fix), whose only new wait is the bounded consumer
+	// gate. Deliberately NO deadline is added: the hooks warn-and-swallow and never retry, and their
+	// downstream waits (judge target lock, run-branch lock, row locks) have no timeout of their own,
+	// so any deadline could drop an otherwise-successful admission. Detached, those waits are no
+	// longer cut short by the request ending (ADR-4007 T3 residual limits). Other steps keep ctx.
+	postCtx := context.WithoutCancel(ctx)
 	if req.MrIID != nil {
-		if _, mrErr := s.q.ReconcileRunMR(ctx, store.ReconcileRunMRParams{
+		if mrErr := s.reconcileRunMRGated(postCtx, owned.RepoID, store.ReconcileRunMRParams{
 			MrIid: pgconv.Int8Ptr(req.MrIID), MrWebUrl: stripNULParam(req.MrWebURL), Branch: stripNULParam(req.Branch),
 			ID: runID, WorkerID: pgconv.UUID(wkr.ID),
 		}); mrErr != nil {
@@ -6113,7 +6132,7 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 	// held above, so 0 rows means the transition was not applied under either branch
 	// of SetRunCompleted's now-two-branch guard (terminal, unless a superseded
 	// run_timeout) → not applied.
-	run, err = s.runOwnedByWorker(ctx, runID, wkr)
+	run, err = s.runOwnedByWorker(postCtx, runID, wkr)
 	if err == nil && rows > 0 {
 		if s.bcast != nil {
 			s.bcast.PublishState(runID, run.Status)
@@ -6156,7 +6175,7 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		}
 		// PRD #46 Decision 2: enqueue a judge on the COMMITTED terminal transition
 		// (rows>0), not the lossy notify seam. Best-effort — never fails the report.
-		s.maybeEnqueueJudge(ctx, run)
+		s.maybeEnqueueJudge(postCtx, run)
 		// PRD #929 M2: file a scheduled issues-mode prompt run's proposal as a forge
 		// issue on this same committed completion. The worker's proposal is untrusted, so
 		// it is clamped (kind-gated + control-char-stripped + secret-scrubbed + bounded)
@@ -6166,12 +6185,12 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		s.maybeFileProposal(ctx, run, clampWireProposal(run, req.Proposal))
 		// PRD #400 M4a: auto-create a diff-review run for a just-completed --review task,
 		// on the SAME committed transition. Best-effort — never fails the report.
-		s.maybeEnqueueTaskReview(ctx, run)
+		s.maybeEnqueueTaskReview(postCtx, run)
 		// PRD #400 M5: auto-create a chained fix run when a --then-fix handoff's review
 		// completes with findings. Its gates fire ONLY for a completed review run, and
 		// maybeEnqueueTaskReview's review_target_run_id-null gate makes the two mutually
 		// exclusive. Best-effort — never fails the report.
-		s.maybeEnqueueThenFix(ctx, run)
+		s.maybeEnqueueThenFix(postCtx, run)
 		// PRD #1349 M4 (D1/D2/D3): on a terminal SUCCESS (status='completed'), release the
 		// COMPLETING GENERATION'S custody hold idempotently — a completed code-publishing run
 		// published its head, so its unpublished-work custody is moot. GENERATION-EXACT via
@@ -8653,6 +8672,7 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 	}, harnessCreationOrigin{
 		Kind: "issue", TriggerSource: triggerSource, Explicit: explicit, Model: model,
 		AnthropicOverride: credOverride != nil || (rawOverride != nil && rawOverride.Mode != CredentialOverrideModeInherit),
+		ConsumerGateRepo:  gateRepoOf(repoID),
 	})
 	if err != nil {
 		if isUniqueViolation(err) {

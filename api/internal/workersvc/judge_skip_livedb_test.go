@@ -469,17 +469,28 @@ func TestJudgeSkipCommittedAfterCreationBeganLiveDB(t *testing.T) {
 	}
 }
 
-// repeatableReadBeginner opens every transaction at REPEATABLE READ, the level the judge
-// creation guard must refuse.
+// repeatableReadBeginner opens every transaction at REPEATABLE READ and runs a statement, so the
+// level is fixed (the consumer gate's SET TRANSACTION ISOLATION LEVEL READ COMMITTED can no longer
+// downgrade it, issue #4488) and the creation must refuse.
 type repeatableReadBeginner struct{ pool *pgxpool.Pool }
 
 func (b repeatableReadBeginner) Begin(ctx context.Context) (pgx.Tx, error) {
-	return b.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
+	tx, err := b.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
+	if err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(ctx, "SELECT 1"); err != nil {
+		_ = tx.Rollback(ctx)
+		return nil, err
+	}
+	return tx, nil
 }
 
 // TestJudgeCreateIsolationGuardFailsClosedLiveDB: a creation transaction that is not READ
-// COMMITTED rolls back: no judge, no skip, for the automatic path (logged) and the rerun
-// (returned as errJudgeCreateIsolation).
+// COMMITTED rolls back: no judge, no skip, for the automatic path (logged) and the rerun. Since
+// issue #4488 the judge create takes the consumer gate first, which pins READ COMMITTED itself and
+// refuses (store.ErrTerminalConsumerGateIsolation) a transaction whose level is already fixed; the
+// closure's own errJudgeCreateIsolation check stays as the second line.
 func TestJudgeCreateIsolationGuardFailsClosedLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	userID, repoID := seedClaudeJudgeUser(t, env)
@@ -494,8 +505,8 @@ func TestJudgeCreateIsolationGuardFailsClosedLiveDB(t *testing.T) {
 	}
 
 	rerun := seedJudgeTarget(t, env, userID, repoID, "claude", 9562)
-	if _, err := svc.RerunJudge(env.ctx, userID, false, rerun.ID); !errors.Is(err, errJudgeCreateIsolation) {
-		t.Fatalf("RerunJudge = %v, want errJudgeCreateIsolation", err)
+	if _, err := svc.RerunJudge(env.ctx, userID, false, rerun.ID); !errors.Is(err, store.ErrTerminalConsumerGateIsolation) {
+		t.Fatalf("RerunJudge = %v, want store.ErrTerminalConsumerGateIsolation", err)
 	}
 	noJudgeAnywhere(t, env, rerun.ID, "rerun at REPEATABLE READ")
 	if n := judgeSkipCount(t, env, rerun.ID); n != 0 {

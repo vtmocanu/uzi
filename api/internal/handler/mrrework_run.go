@@ -234,42 +234,49 @@ func (h *Handler) StartRunRework(w http.ResponseWriter, r *http.Request) {
 
 	run, err = h.wsvc.StartMRReworkForRun(r.Context(), user.ID, runID, req.Guidance, res)
 	if err != nil {
-		switch {
-		case errors.Is(err, workersvc.ErrRunNotFound):
-			httpx.Error(w, http.StatusNotFound, "run not found")
-		case errors.Is(err, workersvc.ErrReworkKindUnsupported),
-			errors.Is(err, workersvc.ErrReworkRunNotCompleted),
-			errors.Is(err, workersvc.ErrReworkNoMR),
-			errors.Is(err, workersvc.ErrReworkNoBranch),
-			errors.Is(err, workersvc.ErrReworkMRNotOpen),
-			errors.Is(err, workersvc.ErrReworkNoToken),
-			errors.Is(err, workersvc.ErrReworkNothingNew),
-			errors.Is(err, workersvc.ErrReworkPermissionUnknown),
-			errors.Is(err, workersvc.ErrReworkLedgerChanged),
-			errors.Is(err, workersvc.ErrReviewLedgerBootstrapOverflow):
-			// Each carries its own user-facing reason (the service's sentinel message).
-			httpx.Error(w, http.StatusConflict, err.Error())
-		case errors.Is(err, workersvc.ErrBranchInUse):
-			// Issue #1626: an active issue run for the branch's issue, or a CI fix, can hold it.
-			httpx.Error(w, http.StatusConflict, "another run (an issue run or a CI fix) is already working this branch")
-		case errors.Is(err, workersvc.ErrActiveMRReworkExists):
-			httpx.Error(w, http.StatusConflict, "a rework is already running for this merge request")
-		case errors.Is(err, workersvc.ErrCodexPoolUnavailable):
-			httpx.JSON(w, http.StatusUnprocessableEntity, codexPoolUnavailableBody())
-		case writeProviderCreateRefusal(w, err):
-		case errors.Is(err, workersvc.ErrNoCredentialForHarness):
-			// PRD #1429 M2 (D4): the derived rework INHERITS the source run's harness explicitly; if
-			// that harness is no longer usable, creation refuses with no fallback. Surface the typed
-			// reason (422, stable no_credential_for_harness classification) rather than a 500.
-			httpx.JSON(w, http.StatusUnprocessableEntity, map[string]any{
-				"error": "the source run's harness has no usable credential",
-				"code":  "no_credential_for_harness",
-			})
-		default:
-			slog.Error("start run rework", "run_id", runID, "error", err)
-			httpx.Error(w, http.StatusInternalServerError, "internal error")
-		}
+		writeStartReworkError(w, runID, err)
 		return
 	}
 	httpx.JSON(w, http.StatusCreated, h.createdRunBody(r.Context(), runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues)))
+}
+
+// writeStartReworkError maps StartMRReworkForRun's refusals to an HTTP status (extracted so each arm is testable).
+func writeStartReworkError(w http.ResponseWriter, runID uuid.UUID, err error) {
+	switch {
+	case writeTerminalConsumerGateRefusal(w, err):
+		// issue #4488: 503 + Retry-After (busy, retryable) or 409 (target run identity).
+	case errors.Is(err, workersvc.ErrRunNotFound):
+		httpx.Error(w, http.StatusNotFound, "run not found")
+	case errors.Is(err, workersvc.ErrReworkKindUnsupported),
+		errors.Is(err, workersvc.ErrReworkRunNotCompleted),
+		errors.Is(err, workersvc.ErrReworkNoMR),
+		errors.Is(err, workersvc.ErrReworkNoBranch),
+		errors.Is(err, workersvc.ErrReworkMRNotOpen),
+		errors.Is(err, workersvc.ErrReworkNoToken),
+		errors.Is(err, workersvc.ErrReworkNothingNew),
+		errors.Is(err, workersvc.ErrReworkPermissionUnknown),
+		errors.Is(err, workersvc.ErrReworkLedgerChanged),
+		errors.Is(err, workersvc.ErrReviewLedgerBootstrapOverflow):
+		// Each carries its own user-facing reason (the service's sentinel message).
+		httpx.Error(w, http.StatusConflict, err.Error())
+	case errors.Is(err, workersvc.ErrBranchInUse):
+		// Issue #1626: an active issue run for the branch's issue, or a CI fix, can hold it.
+		httpx.Error(w, http.StatusConflict, "another run (an issue run or a CI fix) is already working this branch")
+	case errors.Is(err, workersvc.ErrActiveMRReworkExists):
+		httpx.Error(w, http.StatusConflict, "a rework is already running for this merge request")
+	case errors.Is(err, workersvc.ErrCodexPoolUnavailable):
+		httpx.JSON(w, http.StatusUnprocessableEntity, codexPoolUnavailableBody())
+	case writeProviderCreateRefusal(w, err):
+	case errors.Is(err, workersvc.ErrNoCredentialForHarness):
+		// PRD #1429 M2 (D4): the derived rework INHERITS the source run's harness explicitly; if
+		// that harness is no longer usable, creation refuses with no fallback. Surface the typed
+		// reason (422, stable no_credential_for_harness classification) rather than a 500.
+		httpx.JSON(w, http.StatusUnprocessableEntity, map[string]any{
+			"error": "the source run's harness has no usable credential",
+			"code":  "no_credential_for_harness",
+		})
+	default:
+		slog.Error("start run rework", "run_id", runID, "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+	}
 }

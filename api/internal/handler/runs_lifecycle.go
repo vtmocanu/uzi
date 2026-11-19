@@ -400,6 +400,9 @@ func (h *Handler) writeStartRunError(w http.ResponseWriter, r *http.Request, err
 	if writeProviderCreateRefusal(w, err) {
 		return // PRD #4320: provider_source_unusable, provider_model_unmapped, provider_lane_unsupported, ...
 	}
+	if writeTerminalConsumerGateRefusal(w, err) {
+		return // issue #4488: 503 + Retry-After (busy, retryable) or 409 (target run identity)
+	}
 	switch {
 	case errors.Is(err, workersvc.ErrContinuedIssueNotFound):
 		httpx.Error(w, http.StatusNotFound, err.Error())

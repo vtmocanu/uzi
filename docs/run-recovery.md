@@ -3599,6 +3599,46 @@ With no such record, completion behaves as before, and your own discard is
 never blocked. Since nothing creates a record yet, you should not see either
 reason today.
 
+### Retirement waits for run starts in the same repo
+
+Starting a run that could depend on a finished run's terminal ref (an issue,
+self-improve, continued task, review, fix, MR rework, CI fix or judge run) now
+coordinates with terminal-ref retirement in the same repo, so the two can never
+both act on stale facts. Retirement is still switched off, so in this release
+none of this is visible.
+
+Once retirement is on, you may see:
+
+- **A short 503.** If a retirement is deciding for the repo at that moment, a
+  start may wait up to about 6 seconds and, in the rare case it still cannot
+  proceed, answers `503` with `Retry-After: 1`. Nothing was created; retry. The
+  pollers and issue schedules treat it the same way: the trigger is not used up
+  and is tried again on the next pass. A sweep schedule that has started no run
+  in that fire is retried the same way; one that already started runs stops,
+  records the busy issue with the visible `consumer_gate_busy` reason
+  ("repository busy") and advances. A one-time sweep is then done; start the
+  skipped issue manually or explicitly re-fire the sweep as a new fire. A
+  recurring sweep considers it at its next fire. Later candidates were not
+  attempted. Resuming partial progress without replay or exceeding the original
+  cap needs the durable per-fire progress design deferred to
+  [#4512](https://github.com/vtmocanu/uzi/issues/4512).
+  The final outcome gets a bounded write after a canceled wait, but advancement
+  is separate from run creation: a crash or failed advance can still leave the
+  schedule due and replay work.
+- **`retire kept: consumer_gate_busy`** on a terminal-preservation record: a
+  run start was in progress, so retirement kept the ref and tries again later.
+- **A potentially longer worker report.** Each shared-gate acquisition has a
+  six-second lock-wait timeout (at most two acquisitions per report). This does
+  not bound the report: after acquiring the gate, MR row-lock and follow-up
+  advisory-lock waits have no added deadline. They continue after the worker
+  disconnects so the reported MR and follow-ups are not dropped, but can retain
+  the handler and a database connection until the lock holder ends. A held
+  shared gate makes retirement keep the ref; other shared admissions remain
+  compatible with it.
+  If a step's gate wait ends busy, that step is skipped: MR metadata may remain
+  unwritten, or a follow-up hook may create no child. The run's status is already
+  committed and later steps can still run. Failed steps have no durable retry.
+
 ### The worker side is built but switched off
 
 The worker code that captures a finished run's work and calls the terminal

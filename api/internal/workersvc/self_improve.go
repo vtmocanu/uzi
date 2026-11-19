@@ -88,7 +88,7 @@ func (s *Service) CreateSelfImproveRun(ctx context.Context, userID, repoID uuid.
 			ModelProviderKeySecretID: bindingOf(resolved).KeySecret,
 			ModelProviderKeyRev:      bindingOf(resolved).KeyRev,
 		})
-	})
+	}, harnessCreationOrigin{ConsumerGateRepo: gateRepoOf(repoID)})
 	if err != nil {
 		if isUniqueViolation(err) {
 			return store.Run{}, ErrActiveSelfImproveExists
