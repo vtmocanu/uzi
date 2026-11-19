@@ -38,9 +38,12 @@ BEGIN
     -- IS NOT TRUE, not NOT (...): a NULL conjunct (e.g. NEW.worker_id NULL) must raise too.
     IF (
         NEW.claim_generation = OLD.claim_generation + 1
-        AND (OLD.claim_generation < 1
-             OR COALESCE(OLD.claim_provenance_worker_id = NEW.worker_id
+        AND ((OLD.claim_generation < 1
+              AND OLD.claim_provenance_worker_id IS NULL AND OLD.claim_provenance_generation IS NULL)
+             OR (OLD.claim_generation >= 1
+                 AND COALESCE(OLD.claim_provenance_worker_id = NEW.worker_id
                          AND OLD.claim_provenance_generation = OLD.claim_generation, false))
+            )
         AND (OLD.claim_provenance_worker_id IS NULL) = (OLD.claim_provenance_generation IS NULL)
         AND (NEW.claim_provenance_worker_id IS NULL) = (NEW.claim_provenance_generation IS NULL)
         AND NEW.claim_provenance_worker_id IS NOT NULL

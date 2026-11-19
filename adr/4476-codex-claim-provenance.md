@@ -92,8 +92,9 @@ trigger rejects any provenance on insert.
    account-unavailable write or manual update that does not bump the generation
    by one cannot write it.
 2. **OLD-row admission for `NEW.worker_id`**: either `OLD.claim_generation < 1`
-   (first claim) or the OLD pair is complete and matches `NEW.worker_id` at
-   `OLD.claim_generation`. This re-checks the gate in the database, so a claim
+   with no existing pair (first claim), or `OLD.claim_generation >= 1` and the
+   OLD pair is complete and matches `NEW.worker_id` at `OLD.claim_generation`.
+   This re-checks the gate in the database, so a claim
    path that forgot the predicate still cannot re-stamp a held run.
 3. **Complete pairs** on OLD and NEW (both columns NULL or both set; NEW must be
    set). A half-written pair is never stored.
@@ -103,9 +104,10 @@ trigger rejects any provenance on insert.
 The condition is wrapped as `IS NOT TRUE`, so a NULL conjunct (for example a NULL
 `NEW.worker_id`) raises rather than passing.
 
-Because the trigger rejects every other write shape, no backfill, repair or
-re-stamp is possible in SQL without disabling it. That is deliberate: provenance
-cannot be forged by a later code path.
+The trigger rejects other provenance-changing write shapes, including a legacy
+backfill or a foreign re-stamp after a generation rewind. It does not inspect
+updates that leave both provenance columns untouched, and is not a privilege
+boundary against an SQL administrator who can disable it.
 
 ## Mirrors
 

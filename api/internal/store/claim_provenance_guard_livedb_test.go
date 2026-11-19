@@ -209,6 +209,17 @@ func TestCodexProvenanceLegacyNullHeldLiveDB(t *testing.T) {
 // stays byte-identical.
 func TestCodexProvenanceGuardRejectsLiveDB(t *testing.T) {
 
+	t.Run("generation_rewind_cannot_re_stamp_an_existing_pair", func(t *testing.T) {
+		fx := newRollAffinityFixture(t)
+		a, b := fx.worker("A", 0, false), fx.worker("B", 0, false)
+		run := entrySeedCodex(fx, a)
+		// The provenance trigger deliberately does not inspect unrelated writes.
+		// Rewinding the generation must not turn an existing pair into a first claim.
+		mustExec(fx.ctx, t, fx.pool, `UPDATE runs SET claim_generation = 0 WHERE id = $1`, run)
+		guardRejects(fx, run, "generation rewind followed by a foreign first-claim stamp",
+			`UPDATE runs SET claim_generation = 1, worker_id = $2, claim_provenance_worker_id = $2, claim_provenance_generation = 1 WHERE id = $1`, run, b)
+	})
+
 	t.Run("foreign_claimant_over_a_recorded_one", func(t *testing.T) {
 		fx := newRollAffinityFixture(t)
 		a, b := fx.worker("A", 0, false), fx.worker("B", 0, false)
@@ -636,6 +647,15 @@ func TestCodexProvenancePositiveControlsLiveDB(t *testing.T) {
 		if n := fx.strictEligibleCount(run, 0, staleCeiling); n != 1 {
 			t.Fatalf("strict_eligible = %d, want 1 (only the recorded claimant)", n)
 		}
+		mustExec(fx.ctx, t, fx.pool, `UPDATE workers SET status = 'offline' WHERE id = $1`, b)
+		if n := fx.strictEligibleCount(run, 0, staleCeiling); n != 1 {
+			t.Fatalf("only A online: strict_eligible = %d, want 1", n)
+		}
+		mustExec(fx.ctx, t, fx.pool, `UPDATE workers SET status = CASE WHEN id = $1 THEN 'offline' ELSE 'online' END WHERE id IN ($1, $2)`, a, b)
+		if n := fx.strictEligibleCount(run, 0, staleCeiling); n != 0 {
+			t.Fatalf("only B online: strict_eligible = %d, want 0", n)
+		}
+		mustExec(fx.ctx, t, fx.pool, `UPDATE workers SET status = 'online' WHERE id IN ($1, $2)`, a, b)
 		guardWantHealth(fx, run, true, "A", "recorded pair at the current generation: held for a fresh claimant, named A")
 	})
 }
