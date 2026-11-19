@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, describe, it, expect, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { useState } from "react";
 import { InstanceModelDefaultsCard } from "./InstanceModelDefaultsCard";
 import { CODEX_CURATED_MODELS, CODEX_ROLE_MODELS } from "../../lib/codexModels";
@@ -151,6 +151,21 @@ describe("InstanceModelDefaultsCard grid (#3259)", () => {
     expect(summaryClaude().value).toBe("sonnet");
     expect(judgeCodex().value).toBe("gpt-6-sol");
     expect(save().disabled).toBe(true);
+  });
+
+  it("locks the fields while a save is in flight and unlocks them when it settles", async () => {
+    let resolve!: (r: SettingsResponse) => void;
+    mockApi.updateSettings.mockReturnValue(new Promise<SettingsResponse>((r) => (resolve = r)));
+    render(<Harness />);
+    choose(judgeClaude(), "sonnet");
+    fireEvent.click(save());
+    // A disabled <fieldset> disables its controls (the :disabled state), not their own attribute.
+    await waitFor(() => expect(judgeClaude().matches(":disabled")).toBe(true));
+    expect(summaryCodex().matches(":disabled")).toBe(true);
+    resolve(response(view({ judge_model: "sonnet" })));
+    await screen.findByText("Model defaults saved.");
+    expect(judgeClaude().matches(":disabled")).toBe(false);
+    expect(summaryCodex().matches(":disabled")).toBe(false);
   });
 
   it("renders an env-sourced key read-only and never sends it", async () => {

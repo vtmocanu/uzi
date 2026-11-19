@@ -70,14 +70,14 @@ describe("JudgeSettingsCard read-only instance default line (#3259)", () => {
   it("shows the built-in for unpinned lanes and links to Model defaults", () => {
     renderCard();
     expect(instanceLine()).toContain(
-      "Instance default: Default · opus (built-in) (Claude) · Default · gpt-6.1-sol (built-in) (Codex) · users may override.",
+      "Instance default: Claude opus (built-in) · Codex gpt-6.1-sol (built-in) · users may override.",
     );
     expect(screen.getAllByRole("link", { name: "Model defaults" }).every((a) => a.getAttribute("href") === "#model-defaults")).toBe(true);
   });
 
   it("stays neutral when the server sent no defaults", () => {
     renderCard(settings, unpinned, {});
-    expect(instanceLine()).toContain("Instance default: Default (built-in) (Claude) · Default (built-in) (Codex)");
+    expect(instanceLine()).toContain("Instance default: Claude built-in · Codex built-in");
   });
 
   it("shows pinned values, marking an environment-set one", () => {
@@ -85,12 +85,12 @@ describe("JudgeSettingsCard read-only instance default line (#3259)", () => {
       { ...settings, judge_model: "sonnet", codex_judge_model: "gpt-6-astra" },
       { judge_model: "db", codex_judge_model: "env" },
     );
-    expect(instanceLine()).toContain("Instance default: sonnet (Claude) · gpt-6-astra (set from the environment) (Codex)");
+    expect(instanceLine()).toContain("Instance default: Claude sonnet · Codex gpt-6-astra, from the environment");
   });
 
   it("follows props: a rerender with new settings updates the line", () => {
     const { rerender } = renderCard();
-    expect(instanceLine()).toContain("Default · opus (built-in) (Claude)");
+    expect(instanceLine()).toContain("Claude opus (built-in)");
     rerender(
       <JudgeSettingsCard
         settings={{ ...settings, judge_model: "sonnet" }}
@@ -99,8 +99,8 @@ describe("JudgeSettingsCard read-only instance default line (#3259)", () => {
         onSaved={vi.fn()}
       />,
     );
-    expect(instanceLine()).toContain("Instance default: sonnet (Claude)");
-    expect(instanceLine()).not.toContain("Default · opus");
+    expect(instanceLine()).toContain("Instance default: Claude sonnet");
+    expect(instanceLine()).not.toContain("opus (built-in)");
   });
 
   it("does not make the card dirty when the instance default changes", () => {
@@ -124,6 +124,15 @@ describe("JudgeSettingsCard judge harness copy (#3257)", () => {
     renderCard();
     const text = (document.body.textContent ?? "").replace(/\s+/g, " ");
     expect(text).toContain("for the harness their “Judge runs on” choice picks, by default the run’s own");
+  });
+});
+
+// #3259: the enforce help states the Judge runs on default, the run's own harness.
+describe("JudgeSettingsCard enforce harness default (#3259)", () => {
+  it("says enforced judges follow Judge runs on, by default the run's own harness", () => {
+    renderCard();
+    const help = screen.getByText(/A user with no usable credential/).textContent?.replace(/\s+/g, " ") ?? "";
+    expect(help).toContain("following their “Judge runs on” choice (default: the run’s own harness)");
   });
 });
 

@@ -788,7 +788,7 @@ describe("AdminSettings — run judge policy (PRD #46, #3259)", () => {
     renderPage();
     const line = await screen.findByTestId("judge-instance-default");
     expect(line.textContent).toContain(
-      "Instance default: Default · opus (built-in) (Claude) · Default · gpt-6.1-sol (built-in) (Codex)",
+      "Instance default: Claude opus (built-in) · Codex gpt-6.1-sol (built-in)",
     );
   });
 
@@ -798,8 +798,8 @@ describe("AdminSettings — run judge policy (PRD #46, #3259)", () => {
     );
     renderPage();
     const line = await screen.findByTestId("judge-instance-default");
-    expect(line.textContent).toContain("sonnet (Claude)");
-    expect(line.textContent).toContain("gpt-6-sol (set from the environment) (Codex)");
+    expect(line.textContent).toContain("Claude sonnet");
+    expect(line.textContent).toContain("Codex gpt-6-sol, from the environment");
   });
 });
 
@@ -894,11 +894,11 @@ describe("AdminSettings — instance model defaults grid (PRD #3245, #3248, #325
     mockApi.updateSettings.mockResolvedValue(response({ judge_model: "haiku" }, {}, { judge_model: "db" }));
     renderPage();
     const line = await screen.findByTestId("judge-instance-default");
-    expect(line.textContent).toContain("Default · opus (built-in) (Claude)");
+    expect(line.textContent).toContain("Claude opus (built-in)");
     fireEvent.change(await lane("Judge model, Claude"), { target: { value: "haiku" } });
     fireEvent.click(gridSave());
-    await waitFor(() => expect(screen.getByTestId("judge-instance-default").textContent).toContain("Instance default: haiku (Claude)"));
-    expect(screen.getByTestId("judge-instance-default").textContent).not.toContain("Default · opus");
+    await waitFor(() => expect(screen.getByTestId("judge-instance-default").textContent).toContain("Instance default: Claude haiku"));
+    expect(screen.getByTestId("judge-instance-default").textContent).not.toContain("opus (built-in)");
   });
 });
 
@@ -944,6 +944,15 @@ describe("AdminSettings — model defaults placement (#3259)", () => {
     expect(within(document.getElementById("run-summaries")!).getByLabelText("Model-written Now line")).toBeTruthy();
     expect(within(document.getElementById("model-defaults")!).getByLabelText("Judge model, Claude")).toBeTruthy();
     expect(document.getElementById("model-defaults")!.querySelector("#run-judge")).toBeNull();
+  });
+
+  it("omits the Model defaults pill when the settings failed to load, like its card", async () => {
+    mockApi.getSettings.mockRejectedValue(new Error("boom"));
+    renderPage();
+    const nav = await screen.findByRole("navigation", { name: "Sections on this page" });
+    expect(nav.querySelector('a[href="#forge-labels"]')).not.toBeNull();
+    expect(nav.querySelector('a[href="#model-defaults"]')).toBeNull();
+    expect(document.getElementById("model-defaults")).toBeNull();
   });
 
   it("lists Model defaults in the section index between Credential protection and Forge labels", async () => {

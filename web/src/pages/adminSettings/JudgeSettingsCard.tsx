@@ -16,10 +16,10 @@ function instanceModelText(
 ): string {
   if (sources[key] !== "default") {
     const value = settings[key] ?? "";
-    return sources[key] === "env" ? `${value} (set from the environment)` : value;
+    return sources[key] === "env" ? `${value}, from the environment` : value;
   }
   const builtin = defaults[key];
-  return builtin ? `Default · ${builtin} (built-in)` : "Default (built-in)";
+  return builtin ? `${builtin} (built-in)` : "built-in";
 }
 
 // JudgeSettingsCard is the admin surface for the run judge policy (PRD #46): the global
@@ -115,8 +115,8 @@ export function JudgeSettingsCard({
         </label>
 
         <p className="text-xs text-faint" data-testid="judge-instance-default">
-          Instance default: {instanceModelText("judge_model", settings, sources, defaults)} (Claude) &middot;{" "}
-          {instanceModelText("codex_judge_model", settings, sources, defaults)} (Codex) &middot; users may
+          Instance default: Claude {instanceModelText("judge_model", settings, sources, defaults)} &middot; Codex{" "}
+          {instanceModelText("codex_judge_model", settings, sources, defaults)} &middot; users may
           override. <a href="#model-defaults">Model defaults</a>
         </p>
 
@@ -140,7 +140,8 @@ export function JudgeSettingsCard({
           <p className="text-xs text-faint">
             With this on, EVERY user&rsquo;s finished runs are judged — bypassing their per-user opt-in — and
             each is spent on <strong className="text-fg">that user&rsquo;s own Claude or Codex credential,
-            following their &ldquo;Judge runs on&rdquo; choice, without their opt-in</strong>. A user with no
+            following their &ldquo;Judge runs on&rdquo; choice (default: the run&rsquo;s own harness), without their
+            opt-in</strong>. A user with no
             usable credential for that harness is skipped, with a reason shown on the run, and is never charged
             to the other provider. On a subscription plan it also eats their rate-limit quota. Consider a
             cheaper judge model in <a href="#model-defaults">Model defaults</a> before enforcing. The per-user
