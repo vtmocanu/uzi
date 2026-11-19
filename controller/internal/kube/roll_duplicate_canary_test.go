@@ -3,6 +3,7 @@ package kube
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -11,12 +12,22 @@ import (
 )
 
 // Characterization for #4475: the mapping-correction retarget in planPool (marker Hash
-// and Image still match the target, only TargetVersion differs) rewrites the marker in
-// place and preserves its Canary bit; it never sets the bit on another worker. These
-// cases drive Observe/Reconcile (ForceRoll off) and assert that no tick leaves a second
-// canary=true reservation on any Deployment or data-claim mirror, and that no worker
-// other than w1 ever carries one. The retarget is proven to have run by checking that
-// the marker's TargetVersion moved to the new version where a marker is observable.
+// and Image still match the target, only TargetVersion differs) rewrites the entry's
+// own marker in place: TargetVersion moves to the new version, Completed is reset to
+// false, and Canary is copied from that same marker. The branch never reads another
+// worker's marker, so it cannot hand the bit to a second worker. These cases drive
+// Observe/Reconcile (ForceRoll off) and observe that no tick leaves a canary=true
+// reservation on anything but w1's Deployment or claim mirrors, i.e. no second holder.
+// That is an observation of these two scenarios, not a proof for every cohort shape.
+// The first case also advances the roll to canary completion at the new version. The
+// second cannot: w1's Deployment is gone and nothing in the fake cluster recreates it,
+// so no current-incarnation proof is possible; its claim is limited to the period while
+// the canary is unproven.
+//
+// Non-vacuity: the cases pin the in-place rewrite itself. With the retarget arm
+// disabled, the following arms cancel and re-admit the entries instead (w1's Nonce
+// changes, w2/w3 lose their reservations), so the Nonce and the participants'
+// retargeted markers asserted below fail rather than pass through another arm.
 
 // canaryHolders lists every Deployment and data-PVC mirror whose decoded roll marker
 // has Canary=true, as "kind/name".
@@ -48,23 +59,22 @@ func (o *orphanCohort) canaryHolders(t *testing.T) []string {
 func (o *orphanCohort) assertSingleCanary(t *testing.T, when string) {
 	t.Helper()
 	holders := o.canaryHolders(t)
-	seen := map[string]bool{}
 	for _, h := range holders {
 		switch h {
 		case "deployment/" + deploymentName("w1"), "pvc/" + dataPVCName("w1"), "pvc/" + nixPVCName("w1"):
-			seen["w1"] = true
 		default:
 			t.Fatalf("%s: non-w1 canary holder %q (all: %v)", when, h, holders)
 		}
 	}
-	deployCanaries := 0
-	for _, h := range holders {
-		if len(h) > 11 && h[:11] == "deployment/" {
-			deployCanaries++
-		}
-	}
-	if deployCanaries > 1 {
-		t.Fatalf("%s: %d canary Deployments: %v", when, deployCanaries, holders)
+}
+
+// assertParticipantRetargeted requires id to hold a non-canary participant reservation
+// at version. Without the retarget arm the participant reservations are cancelled.
+func (o *orphanCohort) assertParticipantRetargeted(t *testing.T, when, id, version string) {
+	t.Helper()
+	mk := o.marker(t, id)
+	if mk == nil || mk.Canary || mk.TargetVersion != version {
+		t.Fatalf("%s: %s was not retargeted in place to %s as a non-canary participant: %+v", when, id, version, mk)
 	}
 }
 
@@ -85,27 +95,57 @@ func TestRetargetedNonCurrentCanaryNeverYieldsSecondCanary(t *testing.T) {
 		if before == nil || !before.Canary || before.Completed || before.TargetVersion == newVersion {
 			t.Fatalf("fixture marker unusable: %+v", before)
 		}
+		origHash := before.Hash
 
 		o.m.cfg.RollTargetVersion = newVersion
-		retargeted := false
-		for i := 0; i < 4; i++ {
-			_ = o.tick(t) // holds and unconfirmed writes are legitimate here
-			o.assertSingleCanary(t, "tick "+string(rune('1'+i)))
-			if mk := o.marker(t, "w1"); mk != nil && mk.TargetVersion == newVersion {
-				retargeted = true
-				if !mk.Canary {
-					t.Fatalf("retarget dropped the canary bit: %+v", mk)
-				}
-			}
-			for _, id := range []string{"w2", "w3"} {
-				if mk := o.marker(t, id); mk != nil && mk.Canary {
-					t.Fatalf("tick %d: %s became a canary: %+v", i, id, mk)
-				}
-			}
+		_ = o.tick(t) // holds and unconfirmed writes are legitimate here
+		o.assertSingleCanary(t, "tick 1")
+		mk := o.marker(t, "w1")
+		if mk == nil || !mk.Canary || mk.TargetVersion != newVersion {
+			t.Fatalf("tick 1: w1 not retargeted in place keeping its canary bit: %+v", mk)
 		}
-		t.Logf("retarget branch ran (w1 TargetVersion %q -> %q): %v", before.TargetVersion, newVersion, retargeted)
-		if !retargeted {
-			t.Fatalf("retarget never rewrote w1's marker; the case is vacuous")
+		if mk.Nonce != before.Nonce {
+			t.Fatalf("tick 1: w1 nonce %q -> %q; the marker was cancelled and re-admitted, not rewritten in place", before.Nonce, mk.Nonce)
+		}
+		o.assertParticipantRetargeted(t, "tick 1", "w2", newVersion)
+		o.assertParticipantRetargeted(t, "tick 1", "w3", newVersion)
+		for i := 2; i <= 3; i++ {
+			_ = o.tick(t)
+			o.assertSingleCanary(t, fmt.Sprintf("tick %d", i))
+		}
+
+		// Advance: w1 is brought back (scaled up, original template, a current
+		// incarnation proving the new version) and so are the participants; the roll
+		// must progress without ever producing a second canary.
+		one := int32(1)
+		o.edit(t, "w1", func(d *appsv1.Deployment) {
+			d.Spec.Replicas = &one
+			d.Spec.Template.Annotations[AnnotationSpecHash] = origHash
+		})
+		if err := o.c.Tracker().Delete(appsv1.SchemeGroupVersion.WithResource("replicasets"), o.m.cfg.Namespace, "rs-w1"); err != nil {
+			t.Fatal(err)
+		}
+		currentProof(t, o.c, o.at("w1"), m5Now)
+		for _, id := range []string{"w2", "w3"} {
+			o.prove(t, id)
+		}
+		for _, id := range []string{"w1", "w2", "w3"} {
+			v := newVersion
+			o.at(id).RollEvidence.RegisteredVersion = &v
+		}
+		for i := 4; i <= 6; i++ {
+			_ = o.tick(t)
+			o.assertSingleCanary(t, fmt.Sprintf("tick %d", i))
+		}
+		// The retargeted canary completed at the new version and the cohort closed:
+		// the participants' reservations are cleaned up, w1 stays the only canary.
+		if mk := o.marker(t, "w1"); mk == nil || !mk.Canary || !mk.Completed || mk.TargetVersion != newVersion {
+			t.Fatalf("w1 did not complete as the canary at %s: %+v", newVersion, mk)
+		}
+		for _, id := range []string{"w2", "w3"} {
+			if mk := o.marker(t, id); mk != nil {
+				t.Fatalf("%s reservation not cleaned up after the canary completed: %+v", id, mk)
+			}
 		}
 	})
 
@@ -129,20 +169,24 @@ func TestRetargetedNonCurrentCanaryNeverYieldsSecondCanary(t *testing.T) {
 		o.assertSingleCanary(t, "fixture")
 
 		o.m.cfg.RollTargetVersion = newVersion
-		retargeted := false
-		for i := 0; i < 4; i++ {
-			_ = o.tick(t)
-			o.assertSingleCanary(t, "tick "+string(rune('1'+i)))
-			p, err := o.c.CoreV1().PersistentVolumeClaims(o.m.cfg.Namespace).Get(context.Background(), dataPVCName("w1"), metav1.GetOptions{})
-			if err == nil {
-				if m2, err := decodeRoll(p.Annotations[annotationRoll]); err == nil && m2 != nil && m2.TargetVersion == newVersion {
-					retargeted = true
-				}
-			}
+		_ = o.tick(t)
+		o.assertSingleCanary(t, "tick 1")
+		p, err := o.c.CoreV1().PersistentVolumeClaims(o.m.cfg.Namespace).Get(context.Background(), dataPVCName("w1"), metav1.GetOptions{})
+		if err != nil {
+			t.Fatal(err)
 		}
-		t.Logf("retarget branch ran on the mirror: %v", retargeted)
-		if !retargeted {
-			t.Fatalf("mirror marker never retargeted; the case is vacuous (holders %v)", o.canaryHolders(t))
+		m2, err := decodeRoll(p.Annotations[annotationRoll])
+		if err != nil || m2 == nil {
+			t.Fatalf("tick 1: w1 mirror marker unreadable: %v %+v", err, m2)
+		}
+		if m2.TargetVersion != newVersion || !m2.Canary || m2.Completed || m2.Nonce != mk.Nonce {
+			t.Fatalf("tick 1: mirror not retargeted in place as an incomplete canary (completed history reopened): %+v", m2)
+		}
+		o.assertParticipantRetargeted(t, "tick 1", "w2", newVersion)
+		o.assertParticipantRetargeted(t, "tick 1", "w3", newVersion)
+		for i := 2; i <= 4; i++ {
+			_ = o.tick(t)
+			o.assertSingleCanary(t, fmt.Sprintf("tick %d", i))
 		}
 	})
 }
