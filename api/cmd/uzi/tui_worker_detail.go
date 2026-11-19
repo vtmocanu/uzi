@@ -413,6 +413,9 @@ func (m tuiModel) workerDetailLines(now time.Time) ([]string, int) {
 	}
 	if w.Kind == "hosted" {
 		kind += " · size " + m.renderer.Plain(t.hostedSize, width)
+		if spec := workerSizeSpecText(w.HostedSizeSpec); spec != "" {
+			kind += " · " + spec
+		}
 	}
 	if w.Ephemeral {
 		lease := "?"

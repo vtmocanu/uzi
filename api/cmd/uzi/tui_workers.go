@@ -761,6 +761,7 @@ func (m tuiModel) workerKind(r workerRow) string {
 	}
 	size := "?"
 	switch strings.ToUpper(t.hostedSize) {
+	case "":
 	case "S":
 		size = "S"
 	case "M":
@@ -769,6 +770,12 @@ func (m tuiModel) workerKind(r workerRow) string {
 		size = "L"
 	case "L-HIGHMEM":
 		size = "LHM"
+	default:
+		// An admin-added size: its name is untrusted text (D7), so sanitize through
+		// cellText before bounding it to 8 runes.
+		if name := []rune(strings.ToUpper(cellText(t.hostedSize))); len(name) > 0 {
+			size = string(name[:min(len(name), 8)])
+		}
 	}
 	kind += "·" + size
 	if r.w.Docker != nil && *r.w.Docker {

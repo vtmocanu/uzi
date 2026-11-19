@@ -27,6 +27,52 @@ func TestWorkersHighmemKindCode(t *testing.T) {
 	}
 }
 
+func TestWorkersAdminSizeKindCode(t *testing.T) {
+	m := workersScene(true, "workers-list-120")
+	for _, tc := range []struct {
+		name string
+		size *string
+		kind string
+	}{
+		{"admin-added", sp("xs"), "host·XS"},
+		{"truncated to 8 runes", sp("extra-large-thing"), "host·EXTRA-LA"},
+		{"escape sequence sanitized", sp("a\x1b[31mb\x07c"), ""},
+		{"empty", sp(""), "host·?"},
+		{"absent", nil, "host·?"},
+	} {
+		r := workerRow{w: apitypes.WorkerDTO{Kind: "hosted", HostedSize: tc.size}}
+		got := m.workerKind(r)
+		if strings.ContainsAny(got, "\x1b\x07") {
+			t.Errorf("%s: control char reached the kind cell: %q", tc.name, got)
+		}
+		if tc.kind != "" && got != tc.kind {
+			t.Errorf("%s: got %q want %q", tc.name, got, tc.kind)
+		}
+		if n := len([]rune(strings.TrimPrefix(got, "host·"))); n > 8 {
+			t.Errorf("%s: size code %q exceeds 8 runes", tc.name, got)
+		}
+	}
+}
+
+func TestWorkersDetailShowsSizeQuantities(t *testing.T) {
+	m := workerRenderModel(true)
+	m.workers.rows[0].w.HostedSize = sp("xs")
+	m.workers.rows[0].w.HostedSizeSpec = &apitypes.WorkerSizeSpec{
+		CPURequestMillicores: 250, CPULimitMillicores: 1000, MemoryRequestMiB: 1024, MemoryLimitMiB: 2048, DataGiB: 5,
+	}
+	lines, _ := m.workerDetailLines(time.Now())
+	text := stripANSI(strings.Join(lines, "\n"))
+	if !strings.Contains(text, "xs · 0.25–1 CPU · 1–2 GiB RAM · 5 GiB data") {
+		t.Fatalf("detail lacks the size quantities:\n%s", text)
+	}
+	m.workers.rows[0].w.HostedSizeSpec = nil
+	lines, _ = m.workerDetailLines(time.Now())
+	text = stripANSI(strings.Join(lines, "\n"))
+	if !strings.Contains(text, "size xs") || strings.Contains(text, "CPU") {
+		t.Fatalf("spec-less detail should show the bare name:\n%s", text)
+	}
+}
+
 func TestWorkersHighmemKindRowUnclamped(t *testing.T) {
 	for _, width := range []int{80, 120} {
 		t.Run(fmt.Sprintf("width=%d", width), func(t *testing.T) {
