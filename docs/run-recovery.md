@@ -1259,7 +1259,7 @@ announces only heads it has not announced, and archive notices are tracked
 separately from head notices.
 
 **A failed run stopped at the cap can still release its hold.** For a failed
-inventory-guarded issue run on an inventory-capable worker, the refused head is
+inventory-guarded code-publishing run on an inventory-capable worker, the refused head is
 not discarded. The worker keeps it under run-attributed refs
 (`refs/uzi-incoming/<run-id>/<generation>/...`) and records it in a durable
 ledger under `info/uzi-refusals/` in the worker's bare repository (older
@@ -1270,7 +1270,7 @@ file), the freeze proceeds with the refused head as the current source and the
 ordinary held publication and final custody transfer release the hold. The
 gate is checked again before capture, before the held publish and before every
 final disposition, and a write-once seal fixes the evidence before the first
-final disposition is sent. After the terminal import no later fetch for that
+final disposition is sent. On the cap path, after the terminal import no later fetch for that
 generation can add a refused head. Deleting a generation's local state removes
 its refusal refs and records only after the acknowledged final source covers
 them; any change in the evidence keeps everything locally.
@@ -1291,8 +1291,11 @@ them; any change in the evidence keeps everything locally.
 `uzi run discard` does not remove refusal refs or records; they stay reachable
 in the worker's bare. In a mixed fleet an older worker may treat a bare holding
 these records as disposable and leak the nested refs and records. The gate
-applies only to this automatic cap release: ordinary releases below the cap are
-not gated on these records. An old worker's refused head that old code deleted,
+is consulted on every inventory-guarded release, but it is a no-op when the
+run has no refusal evidence and is below the cap, so ordinary below-cap
+releases are not held up by these records. A run with earlier recorded
+refusals, or exactly at the cap, needs complete admissions even if its
+terminal fetch succeeded. An old worker's refused head that old code deleted,
 followed by pins reconciling below the cap, leaves no trace, and the ordinary
 release proceeds as before. Design:
 [ADR-2545](../adr/2545-failed-run-held-publication.md), amendment 2026-11-19.
