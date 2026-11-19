@@ -152,7 +152,11 @@ admission on a tick free of uncertainty and migration fences. A waking worker
 supplies no serving coverage until its wake settles. Once its cohort's canary
 is observed and normal admission permits it, the worker may wake; readiness
 reporting then needs no further mutation admission, so the API can settle the
-wake. Preparing and hibernated workers remain outside roll planning, and wakes
+wake. A retained canary reservation on the data claim can admit recreation of
+its missing Deployment through the same recovery path, carrying the marker
+forward, but only with matching API owner and placement evidence. A mirror
+alone does not authorize wake. Preparing and hibernated workers remain outside
+roll planning, and wakes
 with no open reservation or only a completed reservation retain their existing
 behaviour. An out-of-contract actor (an external edit, `forceRoll`) can still
 produce two canaries; the unchanged duplicate-canary hold keeps that pool
