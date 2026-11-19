@@ -275,17 +275,22 @@ func (h *Handler) mountMeRoutes(r chi.Router, authLimiter *mw.Limiter) {
 	// judge harness, written in one transaction. RequireUser, so a uzc_ CLI Bearer works;
 	// PUT /me/settings (the whole settings surface) stays cookie-only above.
 	//
-	// THE ARGUMENT IS NON-ADDITIVITY, as for /me/usage-reserve, /me/codex-account-mode and
-	// /me/harness-overflow. These fields choose among the models and credentials the user
-	// already holds, and judge_runs_on (and the cross-check pins, once they join) choose how
-	// work the user already consented to executes. None grants consent to spend unattended:
-	// the switches that enable the judge, cross-check, autopilot and the rest (/me/judge,
-	// /me/cross-check, ...) stay cookie-only, and the handler's allowlist rejects their keys.
+	// Two different arguments cover the fields.
 	//
-	// CAVEAT, as for /me/rate-limits (D23): this rests on POST /repos/{id}/runs, the per-run
-	// model/effort overrides and schedule create staying RequireUser. A stolen uzc_ that sets
-	// default_effort=max only raises the spend of runs the user already consented to, which
-	// those routes already allow. If that authority is ever narrowed, revisit this mount.
+	// The worker model and effort lanes are NON-ADDITIVE: per-run model/effort overrides
+	// already exist on requireUser POST /repos/{id}/runs and schedule create, so a Bearer
+	// that sets default_effort=max only raises the spend of runs the user already consented
+	// to. CAVEAT, as for /me/rate-limits (D23): this rests on those routes staying
+	// RequireUser; if that authority is ever narrowed, revisit this mount.
+	//
+	// The judge and summary lanes (judge_model, codex_judge_model, summary_model,
+	// codex_summary_model) and judge_runs_on are a DELIBERATE NEW Bearer authority: before
+	// this route they were writable only through cookie-only PutMySettings, and CreateRun
+	// takes no judge or summary override. They redirect which model or harness
+	// already-enabled judge and summary work uses and never enable it: the consent switches
+	// (/me/judge, /me/cross-check, autopilot, ...) stay cookie-only and the handler's
+	// allowlist rejects their keys. The authority is bounded by a token that can already
+	// create runs and spend.
 	//
 	// A uza_ admin token reaches handlers with IsAdmin=true; that is irrelevant here, the
 	// handler has no admin branch and the identity is the authenticated user, never the body.

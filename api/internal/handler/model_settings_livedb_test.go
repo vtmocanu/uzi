@@ -237,6 +237,51 @@ func TestPutMyModelSettingsParityWithPutMySettingsLiveDB(t *testing.T) {
 	}
 }
 
+// With two invalid allowlisted fields in one body, both handlers report the same first error.
+func TestPutMyModelSettingsParityFirstOfTwoErrorsLiveDB(t *testing.T) {
+	f := newEffFix(t, nil)
+	f.clearModelColumns()
+	for _, body := range []string{
+		`{"default_codex_effort":"bogus","judge_model":"gpt-6-sol"}`,
+		`{"judge_model":"gpt-6-sol","default_codex_effort":"bogus"}`,
+	} {
+		old := f.putSettings(body)
+		cur := f.putModel(body)
+		if old.Code != http.StatusBadRequest || cur.Code != http.StatusBadRequest {
+			t.Fatalf("%s: PUT /me/settings = %d, PUT /me/model-settings = %d, want both 400", body, old.Code, cur.Code)
+		}
+		if o, c := modelErrBody(t, old)["error"], modelErrBody(t, cur)["error"]; o == "" || o != c {
+			t.Fatalf("%s: first error differs: %q vs %q", body, o, c)
+		}
+	}
+}
+
+// When the effective harness is Codex, the legacy default_model mirror follows the Codex lane,
+// whichever lane the request writes.
+func TestPutMyModelSettingsMirrorFollowsCodexLiveDB(t *testing.T) {
+	f := newEffFix(t, nil)
+	f.clearModelColumns()
+	f.codexDefault()
+	f.policy("codex", false)
+	f.exec(`UPDATE users SET default_codex_model = 'gpt-6-sol' WHERE id = $1`, f.user)
+
+	if rec := f.putModel(`{"default_claude_model":"opus"}`); rec.Code != http.StatusOK {
+		t.Fatalf("set claude lane = %d %s", rec.Code, rec.Body.String())
+	}
+	row := f.modelRow()
+	if row["default_claude_model"] != "opus" || row["default_model"] != "gpt-6-sol" {
+		t.Fatalf("claude-lane write with Codex effective: %v, want default_model = stored codex lane gpt-6-sol", row)
+	}
+
+	if rec := f.putModel(`{"default_codex_model":"gpt-6-luna"}`); rec.Code != http.StatusOK {
+		t.Fatalf("set codex lane = %d %s", rec.Code, rec.Body.String())
+	}
+	row = f.modelRow()
+	if row["default_claude_model"] != "opus" || row["default_model"] != "gpt-6-luna" {
+		t.Fatalf("codex-lane write: %v, want default_model gpt-6-luna", row)
+	}
+}
+
 // Set, reset and the runtime/null distinction for every scalar field, both families.
 func TestPutMyModelSettingsSetAndResetEveryFieldLiveDB(t *testing.T) {
 	f := newEffFix(t, nil)
@@ -475,7 +520,7 @@ func (c commitFailTx) Commit(ctx context.Context) error {
 	if c.apply {
 		_ = c.Tx.Commit(ctx)
 	} else {
-		_ = c.Tx.Rollback(ctx)
+		_ = c.Rollback(ctx)
 	}
 	return errors.New("connection reset by peer")
 }

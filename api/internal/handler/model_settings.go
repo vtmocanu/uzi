@@ -189,7 +189,7 @@ func (e commitUnknownError) Unwrap() error { return e.err }
 // transaction the users row is locked first, then every write goes through the transaction's
 // queries, so a failure at any statement rolls all of them back.
 //
-// Invariant (see the live-DB test that pins it): none of the columns written below is users.id
+// Invariant (documented in the header of model_settings_livedb_test.go; no test asserts it): none of the columns written below is users.id
 // or a unique or foreign-key-referenced column of users, so the FOR NO KEY UPDATE row lock is
 // the same strength as the lock each UPDATE takes on its own and conflicts with exactly the
 // other settings writers.
@@ -230,6 +230,9 @@ func (h *Handler) applyModelSettings(ctx context.Context, tx pgx.Tx, userID uuid
 		return err
 	}
 	if in.claude.present || in.codex.present {
+		// harnessModelParams is the shared lane/mirror builder. buildHarnessModels is not used:
+		// it needs default_harness/default_model input this route has none of, and the
+		// harness is resolved before Begin.
 		params, _, err := harnessModelParams(ctx, q, userID, harnessModelInputs{},
 			in.claude.present, in.claude.val, in.codex.present, in.codex.val, mirror)
 		if err != nil {

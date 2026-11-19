@@ -1247,8 +1247,8 @@ type harnessModelInputs struct {
 //
 // All reads/decisions happen before the single write, so a conflict/cross-vocab 400 writes
 // nothing. A store error (resolver or the stored-lane read) is returned raw for a 500.
-// q is the querier for the stored-lane read: h.q for PutMySettings, the transaction's queries for
-// PUT /api/me/model-settings so the read sees the row the transaction has locked.
+// q is the querier for the stored-lane read (PutMySettings passes h.q). PUT /api/me/model-settings
+// does not call this function; it calls harnessModelParams directly with its transaction's queries.
 func (h *Handler) buildHarnessModels(ctx context.Context, q *store.Queries, userID uuid.UUID, in harnessModelInputs) (store.SetUserHarnessModelsParams, bool, error) {
 	if !in.modelPresent && !in.claudePresent && !in.codexPresent && !in.harnessPresent {
 		return store.SetUserHarnessModelsParams{}, false, nil

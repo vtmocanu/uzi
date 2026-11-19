@@ -16,8 +16,6 @@ type settingsFieldError struct {
 	Message string
 }
 
-func (e *settingsFieldError) Error() string { return e.Message }
-
 // decodeNullableText unmarshals one present tri-state value (a JSON string or null) into *string.
 // A value of any other JSON type is the caller's "invalid <field>" error.
 func decodeNullableText(raw json.RawMessage, field string) (*string, *settingsFieldError) {
