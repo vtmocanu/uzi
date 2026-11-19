@@ -79,6 +79,27 @@ it("a click on the disclosure inside a draggable card toggles it, and the button
   expect(b.getAttribute("aria-expanded")).toBe("false");
 });
 
+it("interacting with the disclosure never starts a drag on the draggable card", async () => {
+  mount();
+  const b = await button();
+  const card = screen.getByTestId("card");
+  const onDragStart = vi.fn();
+  card.addEventListener("dragstart", onDragStart);
+  // Control: the spy does fire for a dragstart dispatched on the card itself.
+  card.dispatchEvent(new Event("dragstart", { bubbles: true }));
+  expect(onDragStart).toHaveBeenCalledTimes(1);
+  onDragStart.mockClear();
+
+  await userEvent.click(b);
+  expect(b.getAttribute("aria-expanded")).toBe("true");
+  b.focus();
+  await userEvent.keyboard("{Enter}");
+  expect(b.getAttribute("aria-expanded")).toBe("false");
+  await userEvent.keyboard(" ");
+  expect(b.getAttribute("aria-expanded")).toBe("true");
+  expect(onDragStart).not.toHaveBeenCalled();
+});
+
 function rgb(color: string): [number, number, number] {
   const m = color.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
   if (!m) throw new Error(`unparsed colour ${color}`);

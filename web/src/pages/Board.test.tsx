@@ -3695,6 +3695,68 @@ describe("Board — run-start preview (#3261)", () => {
     expect([gets(), posts()]).toEqual([2, 2]);
   });
 
+  // The same default choice (same request key) can still predict a different value once the
+  // settings behind it change: these serve the GET with a given Claude worker model cell.
+  function getWithModel(model: string, source: string) {
+    const get = structuredClone(SCENARIOS[0].get);
+    for (const c of get.models) {
+      if (c.setting === "worker_model" && c.harness === "claude") {
+        c.default_model = model;
+        c.resolved_model = model;
+        c.source = source as typeof c.source;
+      }
+    }
+    return get;
+  }
+  const modelRow = (panel: HTMLElement) => within(panel).getByText("Model").nextElementSibling as HTMLElement;
+  async function openFirstPanel() {
+    const button = (await screen.findAllByRole("button", { name: /If started now: Claude/ }))[0];
+    if (button.getAttribute("aria-expanded") !== "true") fireEvent.click(button);
+    return document.getElementById(button.getAttribute("aria-controls")!) as HTMLElement;
+  }
+
+  it("a same-choice refresh with changed settings replaces the shown value and source", async () => {
+    mockApi.getEffectiveSettings.mockResolvedValue(getWithModel("opus", "user_default"));
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      renderBoard();
+      let panel = await openFirstPanel();
+      expect(modelRow(panel).textContent).toBe("opus · your choice");
+      // The user's setting is gone and the credentials changed; the next tick sees both.
+      mockApi.getEffectiveSettings.mockResolvedValue(getWithModel("sonnet", "builtin"));
+      mockApi.listSecrets.mockResolvedValue({ secrets: [token("anthropic_token"), token("openai_api_key")] });
+      mockApi.getMySettings.mockClear();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(10_500);
+      });
+      await waitFor(() => expect(gets()).toBe(2));
+      await waitFor(() => expect(modelRow(panel).textContent).toBe("sonnet · built-in"));
+      panel = await openFirstPanel();
+      expect(panel.textContent).not.toContain("opus");
+      expect(modelRow(panel).textContent).toBe("sonnet · built-in");
+      // Every card, not just the first, shows the new prediction.
+      expect(screen.queryByRole("button", { name: /If started now: Claude · opus/ })).toBeNull();
+      expect((await screen.findAllByRole("button", { name: /If started now: Claude · sonnet/ })).length).toBe(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("unmounting and remounting after a settings change shows the new value and source", async () => {
+    mockApi.getEffectiveSettings.mockResolvedValue(getWithModel("opus", "user_default"));
+    const view = renderBoard();
+    let panel = await openFirstPanel();
+    expect(modelRow(panel).textContent).toBe("opus · your choice");
+    view.unmount();
+    mockApi.getEffectiveSettings.mockResolvedValue(getWithModel("sonnet", "builtin"));
+    mockApi.listSecrets.mockResolvedValue({ secrets: [token("anthropic_token"), token("openai_api_key")] });
+    renderBoard();
+    panel = await openFirstPanel();
+    await waitFor(() => expect(modelRow(panel).textContent).toBe("sonnet · built-in"));
+    expect(panel.textContent).not.toContain("opus");
+    expect(modelRow(panel).textContent).not.toContain("your choice");
+  });
+
   it("the Options dialog sends one deduplicated POST per distinct choice", async () => {
     renderBoard();
     await screen.findByText("issue A");
