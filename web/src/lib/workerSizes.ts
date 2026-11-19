@@ -106,10 +106,15 @@ const DECIMAL = /^(\d+)(?:\.(\d+))?$/;
 
 // A typed decimal as an exact fraction whole/10^scale, from its digit string (never a
 // float, so "1.0005" cannot drift). null when the text is not a plain decimal.
-function decimalParts(text: string): { whole: bigint; scale: bigint; digits: number } | null {
+function decimalParts(
+  text: string,
+  dropTrailingZeros = false,
+): { whole: bigint; scale: bigint; digits: number } | null {
   const m = DECIMAL.exec(text.trim());
   if (!m) return null;
-  const frac = m[2] ?? "";
+  // Only the matched fraction digits are trimmed, after the text validated as a decimal,
+  // so a malformed string such as "1.5.0" or "4.0." is still refused.
+  const frac = dropTrailingZeros ? (m[2] ?? "").replace(/0+$/, "") : (m[2] ?? "");
   return { whole: BigInt(m[1] + frac), scale: 10n ** BigInt(frac.length), digits: frac.length };
 }
 
@@ -133,11 +138,11 @@ export function parseCores(text: string): ParsedQuantity {
  * Memory in GiB typed by an admin → MiB, ×1024, which must come out a whole MiB exactly
  * ("1.5" → 1536, "0.0009765625" → 1; "0.1" or "1.0000000001" is refused rather than
  * rounded, since the pod would differ). Integer arithmetic on the digit string; ten
- * decimal places suffice for 1/1024 GiB, so more are refused.
+ * decimal places suffice for 1/1024 GiB, so more significant digits are refused (trailing zeros are ignored).
  */
 export function parseMemoryGiB(text: string): ParsedQuantity {
   // Trailing zeros of the fraction carry no value, so "1.50000000000" is just 1.5.
-  const p = decimalParts(text.trim().replace(/(\.\d*?)0+$/, "$1").replace(/\.$/, ""));
+  const p = decimalParts(text, true);
   if (!p) return { ok: false, error: "Enter memory in GiB, such as 4 or 1.5" };
   const mib = p.whole * 1024n;
   if (p.digits > 10 || mib % p.scale !== 0n) return { ok: false, error: "Must be a whole number of MiB (GiB × 1024)" };

@@ -182,6 +182,7 @@ describe("human units", () => {
     // Exact, not within a float tolerance: this used to save as 1024.
     expect(parseMemoryGiB("1.0000000001")).toEqual({ ok: false, error: "Must be a whole number of MiB (GiB × 1024)" });
     expect(parseMemoryGiB("1.50000000000")).toEqual({ ok: true, value: 1536 }); // trailing zeros are not digits
+    for (const bad of ["1.5.0", "1.0.0", "4.0.", "1.", "10."]) expect(parseMemoryGiB(bad).ok).toBe(false); // malformed stays refused
     expect(parseMemoryGiB("1.00000000000")).toEqual({ ok: true, value: 1024 });
     expect(parseMemoryGiB("1.50000000001")).toEqual({ ok: false, error: "Must be a whole number of MiB (GiB × 1024)" }); // > 10 significant places
     expect(parseMemoryGiB("1.5000000000")).toEqual({ ok: true, value: 1536 });

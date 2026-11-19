@@ -860,7 +860,7 @@ const (
 	workerUptimeWidth       = 6  // 23h59m / 99d23h, the detail header's format
 	workerAttentionMinWidth = 16 // "✕ outbox blocked"
 	workerSizeCodeWidth     = 8  // cells of an admin-added size name in the KIND cell
-	workerKindMaxWidth      = 15 // "host·" + 8-cell size code + "+dk"
+	workerKindMaxWidth      = 15 // "eph·" + 8-cell code + "+dk"; "host·" codes clamp to 7 cells
 	// "eph·LHM+dk" is 10 cells; "host·LHM+dk" is the widest builtin code, 11.
 	workerKindAdminDenseWidth = 11
 )
