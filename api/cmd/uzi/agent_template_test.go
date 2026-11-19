@@ -95,6 +95,20 @@ func TestAgentTemplateExactIDBeatsName(t *testing.T) {
 	}
 }
 
+// TestAgentTemplateIDMatchIsCaseInsensitive pins the case-insensitive id match with an id that has
+// hex letters, so an upper-case ref differs from the stored id (an all-digit id cannot tell).
+func TestAgentTemplateIDMatchIsCaseInsensitive(t *testing.T) {
+	const lettered = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+	fc := &uzicli.FakeClient{AgentTemplates: []uzicli.AgentTemplatePins{
+		{ID: lettered, Name: "reviewer", Scope: "user", Editable: true},
+	}}
+	ref := strings.ToUpper(lettered)
+	_, stderr, code := runCLI(t, fakeEnv(fc), "agent-template", "set", ref, "--harness", "claude", "m")
+	if code != 0 || fc.LastAgentTemplateID != lettered || fc.AgentTemplatePutCalls != 1 {
+		t.Fatalf("ref %q: code=%d id=%q puts=%d stderr=%s", ref, code, fc.LastAgentTemplateID, fc.AgentTemplatePutCalls, stderr)
+	}
+}
+
 func TestAgentTemplateAmbiguousNameExit2ListsIDsAndWritesNothing(t *testing.T) {
 	for _, args := range [][]string{
 		{"show", "coder"},

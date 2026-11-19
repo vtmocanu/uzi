@@ -3593,13 +3593,13 @@ lists the ids; pass the id of one.
 | Exit | Meaning |
 | --- | --- |
 | 0 | The template was read or the pin written. |
-| 1 | The server predates the routes: the list answered an error-less 404 or 405, printing `this server does not support CLI model-setting writes; upgrade the server`. A malformed success response also exits 1. |
+| 1 | The server predates the routes: the list answered an error-less 404 or 405 (or the write an error-less 405), printing `this server does not support CLI model-setting writes; upgrade the server`. A malformed success response also exits 1. |
 | 2 | Usage error: a missing or invalid `--harness`, a missing or empty model, or an ambiguous name (the ids are listed), refused before any write. A pin the server rejects (a model of the wrong family) also exits 2 with the server's message and nothing is written. |
 | 3 | Authentication failed, or the template is builtin or global. |
 | 4 | The template does not exist or belongs to another user, including a `404` on the write. |
 | 6 | Server error or rate limit, including a typed 500 for an unknown commit outcome or a failed readback. |
 
-Only the list's error-less 404 or 405 means an older server; a 404 on the write
+Only the list's error-less 404 or 405, or an error-less 405 on the write, means an older server; a 404 on the write
 is always exit 4. A malformed template id is a 400, as on `/api/agent-templates`.
 
 ### Effective settings
