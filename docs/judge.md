@@ -174,7 +174,7 @@ The Claude built-in is **opus** — the strongest model, since the judge's
 recommendations feed the [self-improvement job](./scheduling.md#default-jobs)
 and a shallow retrospective produces shallow self-improvement work. Your
 admin can pin a cheaper instance-wide Claude default (`haiku` or `sonnet`)
-from **Admin → Instance → Run judge**; your own value only changes your runs,
+from **Admin → Instance → Instance model defaults**; your own value only changes your runs,
 while the admin's is the fallback for everyone who hasn't set one.
 
 Where to set each lane:
@@ -186,8 +186,8 @@ Where to set each lane:
   judge model**, shown only if you can run Codex. **Save judge models** saves
   the lanes you changed. Under each field, **In effect: <model> · <source>** names what a
   judge run would resolve to and where that came from.
-- **Instance Claude and Codex judge models:** **Admin → Instance → Run judge**
-  (the same two fields; their Default option reads **Default · <model>
+- **Instance Claude and Codex judge models:** **Admin → Instance → Instance
+  model defaults** (the Judge model row, with the same two fields; their Default option reads **Default · <model>
   (built-in)**). The Claude field shows a **Not a Claude model** warning when
   its stored value is a Codex id.
 

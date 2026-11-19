@@ -475,6 +475,10 @@ Tracked as GitLab issue vtmocanu/uzi#46; PRD at `prds/done/46-run-judge-self-imp
   `gpt-6-luna` (Codex); the Codex lane takes only Codex role models, the Claude lane
   rejects them; the Claude value also drives Claude PR descriptions. (#3248)
   (AI-synced 2026-11-05)
+- The instance judge and summary model defaults (Claude and Codex) are edited in one
+  Admin → Instance "Instance model defaults" grid with one save; the judge policy
+  and the Now-line kill switch keep their own cards and saves. (#3259)
+  (AI-synced 2026-11-19)
 - A Codex intent/plan summary skipped because the run's Codex credential could not
   be used (refresh denied, vault locked, account unavailable, credential rejected;
   typed evidence only) shows one fixed worker status line in the run feed; the run
