@@ -4,7 +4,7 @@ import { ApiError, errorMessage } from "../../lib/apiError";
 import { ModelSelect } from "../../components/ModelSelect";
 import { ClaudeIcon, OpenAIIcon } from "../../components/icons";
 import { modelFieldWarning } from "../../lib/agentTemplates";
-import { CODEX_ROLE_MODELS } from "../../lib/codexModels";
+import { CODEX_CURATED_MODELS, CODEX_ROLE_MODELS } from "../../lib/codexModels";
 import { Alert, Button, Card, Input, SectionTitle } from "../../components/ui";
 
 type ModelKey = "judge_model" | "codex_judge_model" | "summary_model" | "codex_summary_model";
@@ -111,6 +111,11 @@ export function InstanceModelDefaultsCard({
   const isEnv = (key: ModelKey) => view.sources[key] === "env";
   const dirtyOf = (key: ModelKey) => !isEnv(key) && values[key] !== baseline[key];
   const isCodexIdInClaude = (l: Lane) => l.family === "Claude" && CODEX_ROLE_MODELS.includes(values[l.key].trim());
+  // The Codex judge lane is a closed list (the server accepts curated ids only), yet a stored
+  // non-curated value still renders as itself so it never vanishes: flag it, and refuse to
+  // save one as a change.
+  const notCuratedCodexJudge = (l: Lane) =>
+    l.key === "codex_judge_model" && values[l.key].trim() !== "" && !CODEX_CURATED_MODELS.includes(values[l.key].trim());
   const customEmpty = (l: Lane) => !isEnv(l.key) && custom[l.key] && values[l.key].trim() === "";
 
   const dirty = LANES.some((l) => dirtyOf(l.key));
@@ -119,7 +124,8 @@ export function InstanceModelDefaultsCard({
   const blocked = LANES.some(
     (l) =>
       customEmpty(l) ||
-      (dirtyOf(l.key) && (modelFieldWarning(values[l.key]) !== "" || isCodexIdInClaude(l))),
+      (dirtyOf(l.key) &&
+        (modelFieldWarning(values[l.key]) !== "" || isCodexIdInClaude(l) || notCuratedCodexJudge(l))),
   );
 
   // ModelSelect has no invalid prop, so mirror the field error onto its select by id.
@@ -236,6 +242,12 @@ export function InstanceModelDefaultsCard({
             {dirtyOf(l.key) && isCodexIdInClaude(l) && (
               <p className="text-xs text-danger" role="alert">
                 That is a Codex model. Choose it under the Codex column instead.
+              </p>
+            )}
+            {notCuratedCodexJudge(l) && !isEnv(l.key) && (
+              <p className="text-xs text-warn" role="status">
+                Not a listed Codex judge model: Codex judges accept only the models in this list. Choose one, or
+                Default.
               </p>
             )}
             {customEmpty(l) && (

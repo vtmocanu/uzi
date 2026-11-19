@@ -20,18 +20,22 @@ const DEFAULTS = {
 };
 
 type View = { settings: AppSettings; sources: Record<string, SettingSource> };
-const view = (codexJudge = ""): View => ({
-  settings: { ...DEFAULTS, codex_judge_model: codexJudge === "" ? DEFAULTS.codex_judge_model : codexJudge } as unknown as AppSettings,
+const view = (codexJudge = "", codexSummary = ""): View => ({
+  settings: {
+    ...DEFAULTS,
+    codex_judge_model: codexJudge === "" ? DEFAULTS.codex_judge_model : codexJudge,
+    codex_summary_model: codexSummary === "" ? DEFAULTS.codex_summary_model : codexSummary,
+  } as unknown as AppSettings,
   sources: {
     judge_model: "default",
     codex_judge_model: codexJudge === "" ? "default" : "db",
     summary_model: "default",
-    codex_summary_model: "default",
+    codex_summary_model: codexSummary === "" ? "default" : "db",
   },
 });
 
-function Harness({ codexJudge = "" }: { codexJudge?: string }) {
-  const [v, setV] = useState(view(codexJudge));
+function Harness({ codexJudge = "", codexSummary = "" }: { codexJudge?: string; codexSummary?: string }) {
+  const [v, setV] = useState(view(codexJudge, codexSummary));
   return (
     <InstanceModelDefaultsCard
       settings={v.settings}
@@ -94,4 +98,23 @@ it("pins a Codex judge model through the real select and saves one key", async (
   await waitFor(() => expect(mockApi.updateSettings).toHaveBeenCalledWith({ codex_judge_model: "gpt-6-sol" }));
   await screen.findByText("Model defaults saved.");
   expect(codex.value).toBe("gpt-6-sol");
+});
+
+// Ported from the retired SummarySettingsCard browser suite: the Codex summary lane's reset
+// through the real select sends "" and lands back on Default after the response.
+it("resets a pinned Codex summary lane to Default through the real select and saves an empty string", async () => {
+  mockApi.updateSettings.mockResolvedValue({
+    ...view(),
+    secrets: {},
+    defaults: DEFAULTS,
+    slack_status: "disabled",
+  } as unknown as SettingsResponse);
+  render(<Harness codexSummary="gpt-6-astra" />);
+  const codex = (await screen.findByLabelText("Summary model, Codex")) as HTMLSelectElement;
+  expect(codex.value).toBe("gpt-6-astra");
+  await userEvent.selectOptions(codex, "inherit");
+  await userEvent.click(screen.getByRole("button", { name: "Save model defaults" }));
+  await waitFor(() => expect(mockApi.updateSettings).toHaveBeenCalledWith({ codex_summary_model: "" }));
+  await waitFor(() => expect(codex.value).toBe("inherit"));
+  expect(screen.getAllByText("Default · gpt-6-luna (built-in)").length).toBeGreaterThan(0);
 });

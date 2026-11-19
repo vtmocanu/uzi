@@ -329,6 +329,28 @@ describe("InstanceModelDefaultsCard lane validation (ported from the judge and s
     expect(payload).toEqual({ summary_model: "sonnet" });
   });
 
+  it("flags a stored non-curated Codex judge pin without locking an unrelated save, and blocks saving another", async () => {
+    mockApi.updateSettings.mockResolvedValue(response(view({ codex_judge_model: "gpt-6-luna", judge_model: "sonnet" })));
+    render(<Harness pins={{ codex_judge_model: "gpt-6-luna" }} />);
+    // A syntactically valid id outside the curated list: shown as itself, with the membership warning.
+    expect(screen.getByDisplayValue("gpt-6-luna")).toBeTruthy();
+    expect(screen.getByText(/Not a listed Codex judge model/)).toBeTruthy();
+    choose(judgeClaude(), "sonnet");
+    expect(save().disabled).toBe(false);
+    fireEvent.click(save());
+    await screen.findByText("Model defaults saved.");
+    expect(mockApi.updateSettings.mock.calls[0]?.[0]).toEqual({ judge_model: "sonnet" });
+  });
+
+  it("refuses to save an edited non-curated Codex judge id", () => {
+    render(<Harness pins={{ codex_judge_model: "gpt-6-luna" }} />);
+    fireEvent.change(screen.getByDisplayValue("gpt-6-luna"), { target: { value: "gpt-7-nova" } });
+    expect(screen.getByText(/Not a listed Codex judge model/)).toBeTruthy();
+    expect(save().disabled).toBe(true);
+    fireEvent.submit(save().closest("form")!);
+    expect(mockApi.updateSettings).not.toHaveBeenCalled();
+  });
+
   it("does not resend an untouched stored custom value when another lane changes", async () => {
     mockApi.updateSettings.mockResolvedValue(response(view({ summary_model: "claude-x-1", judge_model: "sonnet" })));
     render(<Harness pins={{ summary_model: "claude-x-1" }} />);
