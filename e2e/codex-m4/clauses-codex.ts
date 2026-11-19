@@ -15,6 +15,7 @@ import { LARGE_RESUME_TITLE } from "./large-resume-title.js";
 import { EXCEPTIONS_TITLE } from "./native-exceptions.js";
 import { CODEX_STARTUP_SMOKE_TITLE } from "./titles.js";
 import {
+  NATIVE_PATCH_INERT_TITLES,
   CODEX_P_NATIVE_ABSENT_TITLE,
   CODEX_P_ISOLATION_ENV_TITLE,
   CODEX_P_SHELL_POLICY_TITLE,
@@ -43,6 +44,14 @@ import {
 } from "./titles-c4.js";
 
 export const CODEX_CLAUSES: ClauseRow[] = [
+  {
+    id: "codex-p-native-patch-inert", adapter: "codex", layer: "P", family: "Native execution bypass",
+    seam: "harness-p production launcher/config/auth/transport/broker with offline loopback provider",
+    positiveControl: "nested uzi_apply_patch reaches broker fileop and nested uzi_bash reaches command seam; outputs return to provider",
+    negativeOracle: "each native nested/direct patch output precedes all controls with zero callbacks, spawns, fileops and markers; exact per-request inventories and model IDs",
+    intendedOutcome: "native utility registration grants no execution authority on fresh and truly cold roots across every curated model, including single-guard omission fixtures",
+    tests: Object.values(NATIVE_PATCH_INERT_TITLES),
+  },
   {
     id: "codex-p-bounded-large-cold-resume",
     adapter: "codex",
