@@ -1192,6 +1192,55 @@ contains "$m" "not settled within 3s" || bad "timeout tag missing: $m"
 contains "$m" "deadline exhausted" && bad "final-window budget exhaustion reported as unverifiable: $m"
 end
 
+# Case 35e — a run FIRST seen in a complete final-window sample whose cancel times out is
+# named, keeps its cancel reason, and becomes known (it must not be blamed on the next phase).
+# Mutation: drop the final sample's residue/cancel reasons -> run=R2 vanishes.
+begin "case35e: a new run in the final sample with a timed-out cancel is reported and known" 35e
+export E2E_BOUNDARY_TIMEOUT=3 E2E_BOUNDARY_INTERVAL=2 FAKE_CANCEL_EXIT=28
+seqf runs "-" "-" "$R2"
+seqf workers "$W1|$R1|1" "$W1|$R1|1" "-"
+mkphase "$PHASES_DIR/10-finalnew.sh" "new run in the final sample" no "" "" "" <<'BODY'
+pass "body ok"
+BODY
+run_driver 35e
+has_row finalnew FAIL || bad "not FAIL: $(cat "$TSV")"
+m="$(row_msg finalnew FAIL)"
+contains "$m" "run=$R2" || bad "final-sample run not named: $m"
+contains "$m" "cancel timed out run=$R2" || bad "cancel reason dropped: $m"
+contains "$(cat "$RUNROOT/boundary/10-finalnew/known-residue.txt" 2>/dev/null)" "run:$R2" || bad "run:$R2 not recorded as known"
+end
+
+# Case 35f — the final sample's runs read succeeds (new run R2) but the later reads run out of
+# budget: R2 is still named (its cancel was never sent) and the out-of-budget reads fall back
+# to the previous sample's rows.
+begin "case35f: a new run in a partly read final sample is still reported" 35f
+export E2E_BOUNDARY_TIMEOUT=3 E2E_BOUNDARY_INTERVAL=2 FAKE_RUNS_SLEEP=1
+seqf runs "$R1" "$R2"
+mkphase "$PHASES_DIR/10-partial.sh" "partly read final sample" no "" "" "" <<'BODY'
+pass "body ok"
+BODY
+run_driver 35f
+has_row partial FAIL || bad "not FAIL: $(cat "$TSV")"
+m="$(row_msg partial FAIL)"
+contains "$m" "run=$R2" || bad "final-sample run not named: $m"
+contains "$m" "cancel not sent run=$R2" || bad "unsent cancel not reported: $m"
+contains "$m" "deadline exhausted before read" && bad "read-budget reasons should become the timeout: $m"
+contains "$(cat "$RUNROOT/boundary/10-partial/known-residue.txt" 2>/dev/null)" "run:$R2" || bad "run:$R2 not recorded as known"
+end
+
+# Case 35g — a declared variable holding newline-separated hold IDs declares each one.
+# Mutation: drop the newline split -> only the first line is declared -> FAIL naming H2.
+begin "case35g: newline-separated IDs in one declaration are each declared" 35g
+seqf holds "-" "$H1|$R1|1;$H2|$R2|1"
+mkphase "$PHASES_DIR/10-nl.sh" "newline list" no "" "" "" "" HOLDS_N <<BODY
+HOLDS_N="$H1
+$H2"
+pass "body ok"
+BODY
+run_driver 35g
+has_row nl PASS || bad "newline-separated declaration did not PASS: $(cat "$TSV")"
+end
+
 # Case 35b (cross-check) — one handoff-holds variable may hold several whitespace-separated
 # hold UUIDs; each is declared. A non-UUID token in the list is still malformed.
 # Mutation: validate the whole value as one UUID -> the two-ID phase FAILs as malformed.

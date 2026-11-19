@@ -69,7 +69,7 @@ _BASE=" "; _H_RUNS=" "; _H_HOLDS=" "; _B_CANC=" "; _B_HOLD_OBS=" "; _B_DECL=" "
 _R_KEYS=(); _R_DESC=()        # residue keys and (same index) their human identity
 _B_NOTE=""; _B_REASONS=(); _B_BREASONS=(); _B_PARSED=()
 _B_SR=(); _B_SW=(); _B_SH=()
-_OWNER=""; _bdir=""; _B_N=0; _B_DEADLINE=0; _B_READERR=0; _B_HOLDS_OK=0
+_OWNER=""; _bdir=""; _B_BUDGET=" "; _B_N=0; _B_DEADLINE=0; _B_READERR=0; _B_HOLDS_OK=0
 _B_FAILED=0; _B_MESSAGE=""; _B_START_SECS=0; _B_END_SECS=0; _B_OUT=""
 
 _Q_RUNS="select id from runs where status not in ('completed','failed','cancelled')"
@@ -264,8 +264,11 @@ _b_fetch() {
   stem="$_bdir/last-${label// /-}"
   _B_PARSED=()
   rem="$(_b_rem)"
-  if [ "$rem" -le 0 ]; then _b_reason "unverifiable $label (deadline exhausted before read)"; return 1; fi
+  if [ "$rem" -le 0 ]; then _b_reason "unverifiable $label (deadline exhausted before read)"; _B_BUDGET="$_B_BUDGET$label "; return 1; fi
   _b_read "$label" "$sql" "$rem" "$stem" || rc=1
+  if [ "$rc" -ne 0 ]; then
+    case "${_B_REASONS[${#_B_REASONS[@]}-1]}" in *"(timed out, exit "*) _B_BUDGET="$_B_BUDGET$label " ;; esac
+  fi
   if [ "$_B_N" -eq 1 ]; then cp "$stem.out" "$_bdir/first-${label// /-}.out" 2>/dev/null || true; fi
   [ "$rc" -eq 0 ] || return 1
   if ! _b_parse "$kind" "$_B_OUT"; then _b_reason "unverifiable $label (malformed row)"; return 1; fi
@@ -403,7 +406,7 @@ _boundary_begin() {
 # Sets _B_FAILED (0/1), _B_MESSAGE (`boundary: …`) and _B_END_SECS.
 _boundary_end() {
   local nn_slug="$1" slug="$2" handoff="$3" holds="$4" body_rc="$5"
-  local t0 timeout interval rem k kn i timed_out=0 final=0 parts=() sv_keys=() sv_desc=() sv_obs="" sv_ok=0 kept=() hit=0
+  local t0 timeout interval rem k kn i timed_out=0 final=0 fbud=0 n0=0 parts=() sv_sr=() sv_sw=() sv_sh=() sv_obs="" sv_ok=0 kept=()
   t0="$(date +%s)"
   timeout="$(_pos_int "${E2E_BOUNDARY_TIMEOUT:-}" 120)"
   interval="$(_pos_int "${E2E_BOUNDARY_INTERVAL:-}" 1)"
@@ -419,31 +422,38 @@ _boundary_end() {
   while :; do
     _B_N=$((_B_N + 1))
     if [ "$final" -eq 1 ]; then
-      # Snapshot the last complete sample: the final-window sample must never erase it.
-      sv_keys=(${_R_KEYS[@]+"${_R_KEYS[@]}"}); sv_desc=(${_R_DESC[@]+"${_R_DESC[@]}"})
-      sv_obs="$_B_HOLD_OBS"; sv_ok="$_B_HOLDS_OK"
+      # Snapshot the previous sample's rows: a final-window read that runs out of budget
+      # must not erase what the last complete read of that kind showed.
+      sv_sr=(${_B_SR[@]+"${_B_SR[@]}"}); sv_sw=(${_B_SW[@]+"${_B_SW[@]}"}); sv_sh=(${_B_SH[@]+"${_B_SH[@]}"})
+      sv_obs="$_B_HOLD_OBS"; sv_ok="$_B_HOLDS_OK"; n0=${#_B_REASONS[@]}
     fi
+    _B_BUDGET=" "
     _b_sample
+    if [ "$final" -eq 1 ] && [ "$_B_BUDGET" != " " ]; then
+      # Only the READS that ran out of budget fall back to the previous sample's rows; their
+      # read-budget reasons become the timeout. Successful reads, and every cancel reason
+      # (rejected, timed out, not sent), stand.
+      ! _in_set "$_B_BUDGET" runs || _B_SR=(${sv_sr[@]+"${sv_sr[@]}"})
+      ! _in_set "$_B_BUDGET" workers || _B_SW=(${sv_sw[@]+"${sv_sw[@]}"})
+      if _in_set "$_B_BUDGET" holds; then _B_SH=(${sv_sh[@]+"${sv_sh[@]}"}); _B_HOLD_OBS="$sv_obs"; _B_HOLDS_OK="$sv_ok"; fi
+      kept=()
+      for ((i = 0; i < ${#_B_REASONS[@]}; i++)); do
+        k="${_B_REASONS[$i]}"
+        if [ "$i" -ge "$n0" ]; then
+          case "$k" in
+            "unverifiable runs ("*|"unverifiable workers ("*|"unverifiable holds ("*)
+              case "$k" in *"(deadline exhausted before read)"|*"(timed out, exit "*) continue ;; esac ;;
+          esac
+        fi
+        kept+=("$k")
+      done
+      _B_REASONS=(${kept[@]+"${kept[@]}"})
+      printf 'final sample out of budget:%s(previous rows kept for those reads)\n' "$_B_BUDGET" > "$_bdir/final-budget.txt" 2>/dev/null || true
+      fbud=1
+    fi
     _b_residue
     _b_cancel_new
-    if [ "$final" -eq 1 ] && [ "${#_B_REASONS[@]}" -gt 0 ]; then
-      # A final-window read or cancel that ran out of budget is a timeout, not an
-      # unverifiable boundary: keep the previous complete sample's residue and any other
-      # (genuine) reason, and report the timeout.
-      kept=(); hit=0
-      for k in "${_B_REASONS[@]}"; do
-        case "$k" in
-          *"deadline exhausted"*|*"(timed out, exit "*|"cancel timed out "*) hit=1 ;;
-          *) kept+=("$k") ;;
-        esac
-      done
-      if [ "$hit" -eq 1 ]; then
-        _B_REASONS=(${kept[@]+"${kept[@]}"})
-        _R_KEYS=(${sv_keys[@]+"${sv_keys[@]}"}); _R_DESC=(${sv_desc[@]+"${sv_desc[@]}"})
-        _B_HOLD_OBS="$sv_obs"; _B_HOLDS_OK="$sv_ok"
-        timed_out=1; break
-      fi
-    fi
+    [ "$fbud" -eq 0 ] || { timed_out=1; break; }
     # Any sticky reason (unverifiable read, rejected or timed-out cancel, phase-start or
     # declaration error) ends the loop after this sample: more samples cannot clear it.
     [ "${#_B_REASONS[@]}" -eq 0 ] || break
