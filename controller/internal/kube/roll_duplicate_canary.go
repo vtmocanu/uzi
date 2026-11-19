@@ -28,11 +28,19 @@ type storageFact struct {
 	workerID string
 }
 
-// replicaSetOwners indexes the Deployment owner references of every listed
-// ReplicaSet (terminating, foreign-owned or oddly named included) by "uid:<uid>" and
-// "name:<name>". It exists only for absence proof; rollEntry.sets keeps the narrower
-// serving-proof ancestry.
-type replicaSetOwners map[string][]metav1.OwnerReference
+// replicaSetAbsenceFact retains ownership and desired replicas from the full list,
+// including terminating, foreign-owned and oddly named ReplicaSets.
+type replicaSetAbsenceFact struct {
+	owners        []metav1.OwnerReference
+	uid, name     string
+	workerID      string
+	replicas      int32
+	replicasKnown bool
+}
+
+// replicaSetOwners indexes absence facts by UID and name. rollEntry.sets keeps the
+// narrower serving-proof ancestry unchanged.
+type replicaSetOwners map[string]replicaSetAbsenceFact
 
 func (r replicaSetOwners) record(rs *appsv1.ReplicaSet) {
 	var owners []metav1.OwnerReference
@@ -41,10 +49,15 @@ func (r replicaSetOwners) record(rs *appsv1.ReplicaSet) {
 			owners = append(owners, ref)
 		}
 	}
-	if rs.UID != "" {
-		r["uid:"+string(rs.UID)] = owners
+	fact := replicaSetAbsenceFact{owners: owners, uid: string(rs.UID), name: rs.Name,
+		workerID: rs.Labels[LabelWorkerID], replicasKnown: rs.Spec.Replicas != nil}
+	if rs.Spec.Replicas != nil {
+		fact.replicas = *rs.Spec.Replicas
 	}
-	r["name:"+rs.Name] = owners
+	if rs.UID != "" {
+		r["uid:"+string(rs.UID)] = fact
+	}
+	r["name:"+rs.Name] = fact
 }
 
 // lookup resolves a pod's ReplicaSet owner reference and reports whether that exact
@@ -55,10 +68,33 @@ func (r replicaSetOwners) record(rs *appsv1.ReplicaSet) {
 func (r replicaSetOwners) lookup(ref metav1.OwnerReference) ([]metav1.OwnerReference, bool) {
 	if ref.UID != "" {
 		o, ok := r["uid:"+string(ref.UID)]
-		return o, ok
+		return o.owners, ok
 	}
 	o, ok := r["name:"+ref.Name]
-	return o, ok
+	return o.owners, ok
+}
+
+// pendingForWorker counts possible pod producers, including terminating sets and
+// sets whose ownership labels or references have been removed. A nil replicas field
+// is not zero (the apiserver normally defaults it to one).
+func (r replicaSetOwners) pendingForWorker(e *rollEntry) int {
+	n := 0
+	for key, fact := range r {
+		if strings.HasPrefix(key, "name:") && fact.uid != "" {
+			continue // Count UID-bearing sets once.
+		}
+		if fact.uid != "" && fact.replicasKnown && fact.replicas == 0 {
+			continue
+		}
+		matches := fact.workerID == e.w.ID || strings.HasPrefix(fact.name, deploymentName(e.w.ID)+"-")
+		for _, ref := range fact.owners {
+			matches = matches || deploymentRefMatches(e, ref)
+		}
+		if matches {
+			n++
+		}
+	}
+	return n
 }
 
 func canonicalClaimNames(id string) []string {
@@ -106,17 +142,14 @@ func podObservedForWorker(e *rollEntry, pod corev1.Pod) bool {
 				return true
 			}
 		case "ReplicaSet":
-			owners, listed := e.absenceOwners.lookup(ref)
-			if !listed {
-				if strings.HasPrefix(ref.Name, prefix) {
-					return true
-				}
-				continue
-			}
+			owners, _ := e.absenceOwners.lookup(ref)
 			for _, o := range owners {
 				if deploymentRefMatches(e, o) {
 					return true
 				}
+			}
+			if strings.HasPrefix(ref.Name, prefix) {
+				return true
 			}
 		}
 	}
@@ -135,9 +168,10 @@ func liveRollDeployment(e *rollEntry) bool {
 }
 
 // physicallyAbsent is physical evidence only: a scaled-to-zero Deployment with no pod,
-// no storage and no PVC user anywhere in the namespace listings.
+// no storage, no pending ReplicaSet producer and no PVC user in the namespace listings.
 func physicallyAbsent(e *rollEntry) bool {
 	return e.dep != nil && e.dep.Spec.Replicas != nil && *e.dep.Spec.Replicas == 0 &&
+		e.replicaSetsPending == 0 &&
 		len(e.pods) == 0 && e.podsObserved == 0 &&
 		e.claim == nil && !e.rawReservation && e.storageObserved == 0 &&
 		len(e.o.PVCUserPodUIDs) == 0
@@ -158,7 +192,7 @@ func staleDuplicateEligible(e *rollEntry) bool {
 // It is not the negation of the stale predicate.
 func currentSurvivor(t *rollTick, e *rollEntry) bool {
 	r := e.marker
-	if r == nil || !r.Canary || r.Completed || !liveRollDeployment(e) || physicallyAbsent(e) ||
+	if r == nil || !r.Canary || r.Completed || e.w.CustodyHeld || e.rawReservation || !liveRollDeployment(e) || physicallyAbsent(e) ||
 		e.dep.Spec.Replicas == nil || *e.dep.Spec.Replicas != 1 || e.o.Roll.Phase == protocol.PhaseStuck ||
 		(e.claim != nil && e.claim.Annotations[annotationRoll] != "") {
 		return false

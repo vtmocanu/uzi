@@ -94,12 +94,13 @@ type rollEntry struct {
 	// historyRetireUnknown marks a candidate whose marker retirement write is unconfirmed;
 	// reconcileHibernation writes nothing for it this tick.
 	historyRetireUnknown bool
-	// storageObserved, podsObserved and absenceOwners are physical-absence facts read
+	// storageObserved, podsObserved, replicaSetsPending and absenceOwners are absence facts read
 	// only by roll_duplicate_canary.go (see physicallyAbsent). They are deliberately
 	// broader than e.pods, e.claim and e.sets, which keep their narrower meaning.
-	storageObserved int
-	podsObserved    int
-	absenceOwners   replicaSetOwners
+	storageObserved    int
+	podsObserved       int
+	replicaSetsPending int
+	absenceOwners      replicaSetOwners
 }
 type rollTick struct {
 	entries   map[string]*rollEntry
@@ -1878,6 +1879,7 @@ func (m *Materializer) rollSnapshot(ctx context.Context, ns string, entries []*r
 		}
 		e.volumeRefs = map[string]bool{}
 		e.absenceOwners = absence
+		e.replicaSetsPending = absence.pendingForWorker(e)
 		e.storageObserved = countStorageObserved(e.w.ID, storage)
 		for _, pod := range pods {
 			if podObservedForWorker(e, pod) {

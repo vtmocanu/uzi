@@ -250,6 +250,8 @@ func (o *orphanCohort) recycleCurrent(t *testing.T, id string) {
 func staleDuplicate(t *testing.T, o *orphanCohort, older bool) {
 	t.Helper()
 	o.recycle(t, "w2")
+	zero := int32(0)
+	o.setSetReplicas(t, "old-rs-"+deploymentName("w2"), &zero)
 	mk := o.marker(t, "w2")
 	mk.Canary = true
 	if older {
@@ -372,6 +374,18 @@ func (o *orphanCohort) addSet(t *testing.T, rs *appsv1.ReplicaSet) {
 	}
 }
 
+func (o *orphanCohort) setSetReplicas(t *testing.T, name string, replicas *int32) {
+	t.Helper()
+	rs, err := o.c.AppsV1().ReplicaSets(o.m.cfg.Namespace).Get(context.Background(), name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rs.Spec.Replicas = replicas
+	if err := o.c.Tracker().Update(appsv1.SchemeGroupVersion.WithResource("replicasets"), rs, rs.Namespace); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // ownedBy is a controller owner reference to kind/name/uid.
 func ownedBy(kind, name string, uid types.UID) []metav1.OwnerReference {
 	yes := true
@@ -395,6 +409,7 @@ func TestDuplicateCanaryAbsenceProofFailClosed(t *testing.T) {
 	w2uid := types.UID("dep-" + deploymentName("w2"))
 	now := metav1.NewTime(m5Now)
 	one := int32(1)
+	zero := int32(0)
 	evidenceOf := func(o *orphanCohort, id string) *protocol.RollEvidence { return o.at(id).RollEvidence }
 	cases := []struct {
 		name      string
@@ -409,6 +424,16 @@ func TestDuplicateCanaryAbsenceProofFailClosed(t *testing.T) {
 	}{
 		{name: "D replicas 1", mutate: func(t *testing.T, o *orphanCohort) {
 			o.edit(t, "w2", func(d *appsv1.Deployment) { d.Spec.Replicas = &one })
+		}},
+		{name: "owned ReplicaSet still requests a replica without pods", mutate: func(t *testing.T, o *orphanCohort) {
+			o.setSetReplicas(t, "old-rs-"+deploymentName("w2"), &one)
+		}},
+		{name: "owned ReplicaSet replicas are unknown", mutate: func(t *testing.T, o *orphanCohort) {
+			o.setSetReplicas(t, "old-rs-"+deploymentName("w2"), nil)
+		}},
+		{name: "terminating noncanonical owned ReplicaSet still requests a replica", mutate: func(t *testing.T, o *orphanCohort) {
+			o.addSet(t, &appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{Name: "late-producer", DeletionTimestamp: &now,
+				OwnerReferences: ownedBy("Deployment", deploymentName("w2"), w2uid)}, Spec: appsv1.ReplicaSetSpec{Replicas: &one}})
 		}},
 		{name: "labelled pod remains", mutate: func(t *testing.T, o *orphanCohort) {
 			o.addPod(t, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "stray-w2", Labels: objectLabels("w2")}})
@@ -433,7 +458,7 @@ func TestDuplicateCanaryAbsenceProofFailClosed(t *testing.T) {
 			o.addPod(t, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "dying-w2", Labels: objectLabels("w2"), DeletionTimestamp: &now}})
 		}},
 		{name: "noncanonical pod under a terminating noncanonical replicaset of D", mutate: func(t *testing.T, o *orphanCohort) {
-			o.addSet(t, &appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{Name: "zzz", DeletionTimestamp: &now, OwnerReferences: ownedBy("Deployment", deploymentName("w2"), w2uid)}})
+			o.addSet(t, &appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{Name: "zzz", DeletionTimestamp: &now, OwnerReferences: ownedBy("Deployment", deploymentName("w2"), w2uid)}, Spec: appsv1.ReplicaSetSpec{Replicas: &zero}})
 			o.addPod(t, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "odd-2", OwnerReferences: ownedBy("ReplicaSet", "zzz", "uid-zzz")}})
 		}},
 		{name: "noncanonical pod owned directly by D", mutate: func(t *testing.T, o *orphanCohort) {
@@ -441,6 +466,17 @@ func TestDuplicateCanaryAbsenceProofFailClosed(t *testing.T) {
 		}},
 		{name: "pod owned by an unlisted replicaset with D's name prefix", mutate: func(t *testing.T, o *orphanCohort) {
 			o.addPod(t, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "odd-4", OwnerReferences: ownedBy("ReplicaSet", deploymentName("w2")+"-gone", "gone")}})
+		}},
+		{name: "pod under a listed ownerless ReplicaSet with D prefix", mutate: func(t *testing.T, o *orphanCohort) {
+			name := deploymentName("w2") + "-orphan"
+			o.addSet(t, &appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{Name: name, UID: "orphan-set"}, Spec: appsv1.ReplicaSetSpec{Replicas: &zero}})
+			o.addPod(t, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "odd-orphan", OwnerReferences: ownedBy("ReplicaSet", name, "orphan-set")}})
+		}},
+		{name: "pod under a listed foreign-owned ReplicaSet with D prefix", mutate: func(t *testing.T, o *orphanCohort) {
+			name := deploymentName("w2") + "-foreign"
+			o.addSet(t, &appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{Name: name, UID: "foreign-set",
+				OwnerReferences: ownedBy("Deployment", "somewhere-else", "other-deployment")}, Spec: appsv1.ReplicaSetSpec{Replicas: &zero}})
+			o.addPod(t, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "odd-foreign", OwnerReferences: ownedBy("ReplicaSet", name, "foreign-set")}})
 		}},
 		{name: "pod owned by an unlisted replicaset uid whose name another deployment's replicaset reuses", mutate: func(t *testing.T, o *orphanCohort) {
 			reused := deploymentName("w2") + "-old"
@@ -592,6 +628,10 @@ func TestDuplicateCanaryAbsenceProofFailClosed(t *testing.T) {
 			currentProof(t, o.c, o.at("w2"), m5Now)
 		}},
 		{name: "survivor absent but matching its reservation", mutate: func(t *testing.T, o *orphanCohort) { o.recycleCurrent(t, "w1") }},
+		{name: "survivor custody held", mutate: func(t *testing.T, o *orphanCohort) { o.at("w1").CustodyHeld = true }},
+		{name: "survivor raw reservation on non-data claim", mutate: func(t *testing.T, o *orphanCohort) {
+			o.editClaim(t, nixPVCName("w1"), func(p *corev1.PersistentVolumeClaim) { p.Annotations = map[string]string{annotationRoll: "{not-json"} })
+		}},
 		{name: "survivor deployment terminating", mutate: func(t *testing.T, o *orphanCohort) {
 			o.edit(t, "w1", func(d *appsv1.Deployment) { d.DeletionTimestamp, d.Finalizers = &now, []string{"hold"} })
 		}},
@@ -659,14 +699,37 @@ func TestDuplicateCanaryAbsenceProofFailClosed(t *testing.T) {
 			if tc.mutate != nil {
 				tc.mutate(t, o)
 			}
+			reservations := map[string]string{}
+			for i := 1; i <= n; i++ {
+				id := fmt.Sprintf("w%d", i)
+				dep, err := o.c.AppsV1().Deployments(o.m.cfg.Namespace).Get(context.Background(), deploymentName(id), metav1.GetOptions{})
+				if apierrors.IsNotFound(err) {
+					continue // Some negatives deliberately remove a canary's Deployment.
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				raw := dep.Annotations[annotationRoll]
+				mk, err := decodeRoll(raw)
+				if i <= 2 || (err == nil && mk != nil && mk.Canary) {
+					reservations[id] = raw
+				}
+			}
 			o.c.ClearActions()
 			err := o.tick(t)
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("tick error = %v, want error: %v", err, tc.wantErr)
 			}
 			for _, line := range actionTrace(o.c) {
-				if line == "patch deployments "+deploymentName("w1")+" metadata" || line == "patch deployments "+deploymentName("w2")+" metadata" {
-					t.Fatalf("a canary reservation was written: %v", actionTrace(o.c))
+				for id := range reservations {
+					if line == "patch deployments "+deploymentName(id)+" metadata" {
+						t.Fatalf("a canary reservation was written: %v", actionTrace(o.c))
+					}
+				}
+			}
+			for id, raw := range reservations {
+				if got := o.dep(t, id).Annotations[annotationRoll]; got != raw {
+					t.Fatalf("%s reservation changed: %q -> %q", id, raw, got)
 				}
 			}
 			for i, id := range []string{"w1", "w2"} {
