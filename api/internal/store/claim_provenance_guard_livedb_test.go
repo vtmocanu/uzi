@@ -1,6 +1,7 @@
 package store_test
 
 import (
+	"context"
 	"embed"
 	"encoding/json"
 	"errors"
@@ -685,6 +686,13 @@ func TestCodexProvenanceEphemeralMirrorsLiveDB(t *testing.T) {
 
 	t.Run("unplaceable_and_saturation_exclude_a_held_run", func(t *testing.T) {
 		fx := newFleetFixture(t)
+		// These opted-in controls are valid global provisioning demand. Remove
+		// this owner before the shared LiveDB sweep reaches later packages.
+		t.Cleanup(func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			mustExec(ctx, t, fx.pool, `DELETE FROM users WHERE id = $1`, fx.userID)
+		})
 		optInEphemeral(fx)
 		busy := fx.worker("persistent", capOf(1), true)
 		fx.holdActive(busy, 1) // saturated
