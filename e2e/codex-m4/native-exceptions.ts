@@ -1,4 +1,4 @@
-import { parseSync } from "../../agent/node_modules/oxc-parser/src-js/index.js";
+import { parseSync } from "../../agent/test/codex-inventory-parser.js";
 import type { ResponsesBody } from "./fake-provider.js";
 
 /** #1566: catalog send_user_message_async is DirectModelOnly; no nested async call is assumed.

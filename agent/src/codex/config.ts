@@ -96,6 +96,7 @@ function nativeDisabledConfigLines(
     `enabled = false`,
     ``,
     `[features]`,
+    `goals = false`,
     `apps = false`,
     `plugins = false`,
     `shell_tool = false`,

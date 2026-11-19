@@ -48,8 +48,8 @@ export const CODEX_CLAUSES: ClauseRow[] = [
     id: "codex-p-native-patch-inert", adapter: "codex", layer: "P", family: "Native execution bypass",
     seam: "harness-p production launcher/config/auth/transport/broker with offline loopback provider",
     positiveControl: "nested uzi_apply_patch reaches broker fileop and nested uzi_bash reaches command seam; outputs return to provider",
-    negativeOracle: "each native nested/direct patch output precedes all controls with zero callbacks, spawns, fileops and markers; exact per-request inventories and model IDs",
-    intendedOutcome: "native utility registration grants no execution authority on fresh and truly cold roots across every curated model, including single-guard omission fixtures",
+    negativeOracle: "each nested/direct patch refusal, unsupported goal dispatch and exact empty/unknown-server resource outcome precedes controls with zero callbacks, spawns, fileops and markers; exact inventories and model IDs",
+    intendedOutcome: "native patch execution is denied and goal tools are disabled across curated fresh/cold roots; three registered MCP helpers have fixed no-server outcomes, with exact-clause owner acceptance unresolved",
     tests: Object.values(NATIVE_PATCH_INERT_TITLES),
   },
   {

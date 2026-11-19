@@ -43,6 +43,7 @@ before(async () => {
  *  are construction checks, not runtime suppression proof (pin 0.167.0). Native patch remains
  *  advertised; environments: [] and launcher CODEX_EXEC_SERVER_URL=none deny execution. */
 const NATIVE_FEATURES = [
+  "goals",
   "shell_tool",
   "unified_exec",
   "code_mode",
@@ -123,6 +124,7 @@ describe("codex U failure closure (a): production hooks are DISABLED (config.ts)
     const prodSubRun = config.buildCodexProductionConfigToml({ ...opts, authMode: "subscription", codeModeHost: true });
     const loopbackRun = config.buildCodexLoopbackTestConfigToml({ ...opts, authMode: "subscription", codeModeHost: true }, "http://127.0.0.1:5599/v1");
     for (const [label, toml] of [["prod api_key (run lane)", prodApiRun], ["prod subscription (run lane)", prodSubRun], ["loopback (run lane)", loopbackRun]] as const) {
+      assert.doesNotMatch(toml, /\bmcp_servers\b/, `${label}: no native MCP server configured`);
       const features = tomlSections(toml).get("features") ?? [];
       assert.doesNotMatch(toml, /^\s*remote_models\s*=/m, `${label}: the removed compatibility key is omitted`);
       // The run lane flips ONLY code_mode_host on (line-anchored) …

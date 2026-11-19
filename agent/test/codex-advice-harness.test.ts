@@ -735,6 +735,7 @@ describe("CodexAdviceHarness: the advice ceiling without worker callbacks", () =
         "code_mode_only",
         "code_mode_prewarm",
         "enable_request_compression",
+        "goals",
         "hooks",
         "multi_agent",
         "multi_agent_v2",
