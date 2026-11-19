@@ -1,9 +1,12 @@
 import type { AdminWorkerSize, AdminWorkerSizes, AdminWorkerSizeWrite, HostedConfigSize, WorkerSizeAdvisory, WorkerSizeSpec, WorkerSizeWarning } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
-import { ABSOLUTE_MAX, BUILTIN_WORKER_SIZES } from "../../lib/workerSizes";
+import { ABSOLUTE_MAX, BUILTIN_WORKER_SIZES, MAX_WORKER_SIZES, SIZE_NAME_PATTERN } from "../../lib/workerSizes";
 import { delay, mockScenario, requireAdmin } from "./shared";
+import { mockStoredSizeSettings } from "./settings";
+import { workers } from "./workers";
 
-// Admin worker sizes (PRD #4213): GET /admin/worker-sizes, PUT /admin/worker-sizes/{name} and
+// Admin worker sizes (PRD #4213): GET /admin/worker-sizes, PUT /admin/worker-sizes/{name} (edit,
+// or create an absent name, M3), DELETE /admin/worker-sizes/{name} (M3) and
 // POST /admin/worker-sizes/{name}/reset. The rows are module state, seeded from the builtin
 // sizes, and they are the ONE size list the mock serves: hostedConfig and
 // provisionHostedWorker (workers.ts) read it too, so an edit here shows up in the provision
@@ -155,6 +158,58 @@ function write(row: AdminWorkerSize, spec: WorkerSizeSpec, customized: boolean):
 
 const same = (a: WorkerSizeSpec, b: WorkerSizeSpec) => FIELDS.every((f) => a[f] === b[f]);
 
+// The api's text for a name nothing could ever be stored under (handler AdminPutWorkerSize).
+const INVALID_NAME = "invalid worker size name: use a lowercase letter then lowercase letters, digits or hyphens, at most 16 characters";
+
+// PUT, as the api serves it: the gate, then the name, then an edit of an existing row or the
+// create arm (validate, then the 16-row cap, then insert after the highest display_order).
+function put(name: string, spec: WorkerSizeSpec): AdminWorkerSizeWrite {
+  refuseIfReadOnly();
+  if (!SIZE_NAME_PATTERN.test(name)) throw new ApiError(400, INVALID_NAME);
+  const row = rows.find((r) => r.name === name);
+  if (row) return write(row, spec, row.builtin && (!row.shipped || !same(row.shipped, spec)));
+  const fields = validate(spec);
+  if (Object.keys(fields).length > 0) throw new ApiError(400, "the size has values that cannot be saved", { error: "the size has values that cannot be saved", fields });
+  if (rows.length >= MAX_WORKER_SIZES) {
+    const error = `at most ${MAX_WORKER_SIZES} worker sizes`;
+    throw new ApiError(409, error, { error, reason: "max_sizes" });
+  }
+  const created: AdminWorkerSize = {
+    name,
+    ...spec,
+    display_order: Math.max(0, ...rows.map((r) => r.display_order)) + 1,
+    builtin: false,
+    customized: false,
+    shipped: null,
+    updated_at: new Date().toISOString(),
+  };
+  rows = [...rows, created];
+  return { size: { ...created }, warnings: [], advisories: [] };
+}
+
+// DELETE's guard, in the api's order and text (store.DeleteWorkerSizeGuarded): absent → 404,
+// builtin → 409, then a worker using it and a stored default-size setting naming it → 409.
+function remove(name: string): { deleted: string } {
+  refuseIfReadOnly();
+  if (!SIZE_NAME_PATTERN.test(name)) throw new ApiError(404, "worker size not found");
+  const row = find(name);
+  if (row.builtin) {
+    const error = "builtin sizes cannot be removed; reset it instead";
+    throw new ApiError(409, error, { error, reason: "builtin", used_by: { workers: 0, settings: [] } });
+  }
+  const using = workers.filter((w) => w.hosted_size === name).length;
+  const settings = mockStoredSizeSettings(name);
+  if (using > 0 || settings.length > 0) {
+    const parts: string[] = [];
+    if (using > 0) parts.push(`${using} worker(s) still use it`);
+    if (settings.length > 0) parts.push(`it is the stored value of ${settings.join(", ")}`);
+    const error = `size is in use: ${parts.join("; ")}`;
+    throw new ApiError(409, error, { error, reason: "in_use", used_by: { workers: using, settings } });
+  }
+  rows = rows.filter((r) => r.name !== name);
+  return { deleted: name };
+}
+
 export const workerSizesApi = {
   getAdminWorkerSizes: async (): Promise<AdminWorkerSizes> => {
     requireAdmin();
@@ -165,14 +220,21 @@ export const workerSizesApi = {
       read_only_reason: readOnly() ? READ_ONLY_REASON : null,
       read_only_code: readOnly() ? READ_ONLY_CODE : null,
       advisories: advisories(),
-      max_sizes: 16,
+      max_sizes: MAX_WORKER_SIZES,
     });
   },
+  // Both verbs are the api's one PUT: an existing name is edited, an absent one created.
   updateAdminWorkerSize: async (name: string, spec: WorkerSizeSpec): Promise<AdminWorkerSizeWrite> => {
     requireAdmin();
-    refuseIfReadOnly();
-    const row = find(name);
-    return delay(write(row, pick(spec), row.builtin && (!row.shipped || !same(row.shipped, spec))));
+    return delay(put(name, pick(spec)));
+  },
+  createAdminWorkerSize: async (name: string, spec: WorkerSizeSpec): Promise<AdminWorkerSizeWrite> => {
+    requireAdmin();
+    return delay(put(name, pick(spec)));
+  },
+  deleteAdminWorkerSize: async (name: string): Promise<{ deleted: string }> => {
+    requireAdmin();
+    return delay(remove(name));
   },
   resetAdminWorkerSize: async (name: string): Promise<AdminWorkerSizeWrite> => {
     requireAdmin();

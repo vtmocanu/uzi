@@ -4,11 +4,14 @@ import {
   BUILTIN_WORKER_SIZES,
   BUILTIN_WORKER_SIZE_NAMES,
   cpuCores,
+  MAX_WORKER_SIZES,
   memoryGiB,
   memoryQuantity,
+  newSizeNameError,
   parseCores,
   parseDiskGiB,
   parseMemoryGiB,
+  SIZE_NAME_PATTERN,
   sizeChoices,
   sizeOptionLabel,
   sizeSummary,
@@ -91,8 +94,8 @@ describe("BUILTIN_WORKER_SIZES mirrors the api's builtin seed", () => {
       `BUILTIN_WORKER_SIZES (web/src/lib/workerSizes.ts) drifted from ${NAMES_GOLDEN}.\n` +
         "The golden is generated from the api's builtin seed, which is the authority: if the " +
         "seed deliberately changed, copy its integers here. The live list always comes from " +
-        "the api; this constant is only the fallback for an older api and the builtin names " +
-        "a default-size setting accepts.",
+        "the api; this constant is only the fallback for an older api and for the default-size " +
+        "selectors while the size list cannot be read.",
     ).toEqual(seed);
     expect([...BUILTIN_WORKER_SIZE_NAMES]).toEqual(seed.map((s) => s.name));
   });
@@ -201,5 +204,26 @@ describe("human units", () => {
       expect(parseCores(cpuCores(s.cpu_request_millicores))).toEqual({ ok: true, value: s.cpu_request_millicores });
       expect(parseMemoryGiB(memoryGiB(s.memory_limit_mib))).toEqual({ ok: true, value: s.memory_limit_mib });
     }
+  });
+});
+
+describe("newSizeNameError (PRD #4213 M3)", () => {
+  const existing = ["s", "m", "l", "l-highmem"];
+  it("accepts a well-formed new name, up to 16 characters", () => {
+    for (const ok of ["xs", "x", "gpu-2", "a".repeat(16), "x-"]) expect(newSizeNameError(ok, existing), ok).toBeNull();
+  });
+  it("matches the api's builtin.WellFormed pattern", () => {
+    expect(SIZE_NAME_PATTERN.source).toBe("^[a-z][a-z0-9-]{0,15}$");
+    expect(MAX_WORKER_SIZES).toBe(16);
+  });
+  it("says why a name cannot be a new size", () => {
+    expect(newSizeNameError("", existing)).toBe("Enter a name for the size, such as xs");
+    expect(newSizeNameError("XS", existing)).toBe("Use lowercase letters only, such as xs");
+    expect(newSizeNameError("a".repeat(17), existing)).toBe("Use at most 16 characters");
+    for (const bad of ["1x", "-x", "x_s", "x s", "é"]) {
+      expect(newSizeNameError(bad, existing), bad).toBe("Start with a lowercase letter, then use only lowercase letters, digits or hyphens");
+    }
+    // The api's PUT on an existing name edits it, so adding one is refused locally.
+    expect(newSizeNameError("l-highmem", existing)).toBe("A size named l-highmem already exists; edit it in the table instead");
   });
 });

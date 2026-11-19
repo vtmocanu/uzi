@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent, type Ref } from "react";
 import { Link } from "react-router-dom";
 import {
   api,
@@ -7,6 +7,7 @@ import {
   type WorkerSizeAdvisory,
   type WorkerSizeCeilings,
   type WorkerSizeSpec,
+  type WorkerSizeDeleteRefusal,
   type WorkerSizeWarning,
 } from "../../lib/api";
 import { ApiError, errorMessage } from "../../lib/apiError";
@@ -15,10 +16,12 @@ import {
   ABSOLUTE_MAX,
   cpuCores,
   memoryGiB,
+  newSizeNameError,
   parseCores,
   parseDiskGiB,
   parseMemoryGiB,
   sizeLabel,
+  sizeOptionLabel,
   type ParsedQuantity,
 } from "../../lib/workerSizes";
 
@@ -26,8 +29,9 @@ import {
 // each size buys, in human units (CPU cores, GiB), edited per row and saved as the api's
 // integers. The api is authoritative: it validates against the chart ceilings, answers 400
 // with per-field errors, and 409 while the controller cannot honour an edit (the editor is
-// then read-only and says why). This unit edits and resets existing sizes; adding and
-// removing sizes come later, so rows are keyed by name and actions are per row.
+// then read-only and says why). Builtin sizes are edited and reset; admin-added sizes (M3)
+// are added below the table and edited or removed per row. A removal the api refuses
+// because something still uses the size says what, in the words of this page.
 //
 // The list itself is owned by AdminWorkers, which reads it once and re-reads it after every
 // successful write and after a 409 (onChanged), so the default-size selectors on the same page pick up an
@@ -57,6 +61,8 @@ const HEAD = "px-1.5 py-2 font-medium sm:px-3";
 const FIELD_KEYS = new Set<string>(FIELDS.map((f) => f.key));
 
 type Draft = Record<FieldKey, string>;
+
+const EMPTY_DRAFT = Object.fromEntries(FIELDS.map((f) => [f.key, ""])) as Draft;
 
 function withoutKey(m: Record<string, string>, key: string): Record<string, string> {
   const next = { ...m };
@@ -103,7 +109,25 @@ function ceilingsLine(c: WorkerSizeCeilings): string {
   return `Limits: up to ${parts.join(" / ")} (from chart values ${unique.join(", ")}).`;
 }
 
-type WriteResult = { name: string; verb: "saved" | "reset to shipped values"; warnings: WorkerSizeWarning[] };
+type WriteResult = { name: string; verb: "saved" | "reset to shipped values" | "added" | "removed"; warnings: WorkerSizeWarning[] };
+
+// The default-size settings a removal refusal can name, as this page labels them.
+const SETTING_USE: Record<string, string> = {
+  hosted_default_size: "new workers",
+  ephemeral_default_size: "ephemeral workers",
+};
+
+// A refused removal in the page's words: what still uses the size, and that it stays.
+function removalRefusal(label: string, body: WorkerSizeDeleteRefusal | null, fallback: string): string {
+  if (body?.reason === "builtin") return `${label} is a builtin size and cannot be removed. Reset it to shipped values instead.`;
+  if (body?.reason !== "in_use") return fallback;
+  const parts = [`${label} is still in use, so it was not removed.`];
+  const n = body.used_by?.workers ?? 0;
+  if (n > 0) parts.push(`Still used by ${n} ${n === 1 ? "worker" : "workers"}.`);
+  const uses = (body.used_by?.settings ?? []).map((k) => SETTING_USE[k] ?? k);
+  if (uses.length > 0) parts.push(`Set as the default size for ${uses.join(" and ")}; choose another default first.`);
+  return parts.join(" ");
+}
 
 // "At most 4 cores (workers.limitRange.max.cpu)": a bound in the editor's own units.
 const coresWord = (millicores: number) => `${cpuCores(millicores)} ${millicores === 1000 ? "core" : "cores"}`;
@@ -141,6 +165,87 @@ function fieldBound(key: FieldKey, c: WorkerSizeCeilings): { max: number; messag
   return out;
 }
 
+// Parse a whole draft; a field that cannot be an api integer, or is above a bound the list
+// already names, reports why locally, in the editor's units.
+function parseDraft(draft: Draft, ceilings: WorkerSizeCeilings): { values: Partial<WorkerSizeSpec>; errors: Record<string, string> } {
+  const values: Partial<WorkerSizeSpec> = {};
+  const errors: Record<string, string> = {};
+  for (const f of FIELDS) {
+    const p = f.parse(draft[f.key]);
+    if (!p.ok) {
+      errors[f.key] = p.error;
+      continue;
+    }
+    values[f.key] = p.value;
+    // The tightest bound names the real limit (a chart ceiling is below the absolute cap).
+    const over = fieldBound(f.key, ceilings)
+      .sort((x, y) => x.max - y.max)
+      .find((bound) => p.value > bound.max);
+    if (over) errors[f.key] = over.message;
+  }
+  if (!errors.cpu_request_millicores && !errors.cpu_limit_millicores && values.cpu_request_millicores! > values.cpu_limit_millicores!) {
+    errors.cpu_request_millicores = "The request cannot be above the limit";
+  }
+  if (!errors.memory_request_mib && !errors.memory_limit_mib && values.memory_request_mib! > values.memory_limit_mib!) {
+    errors.memory_request_mib = "The request cannot be above the limit";
+  }
+  return { values, errors };
+}
+
+// The six inputs, shared by the edit and the add forms. Each input's accessible name starts
+// with `labelPrefix` (the size's label, or "New size"), so two forms never read alike.
+function SizeFields({
+  idPrefix,
+  labelPrefix,
+  draft,
+  errors,
+  locked,
+  firstInputRef,
+  onChange,
+}: {
+  idPrefix: string;
+  labelPrefix: string;
+  draft: Draft;
+  errors: Record<string, string>;
+  locked: boolean;
+  firstInputRef?: Ref<HTMLInputElement>;
+  onChange: (key: FieldKey, value: string) => void;
+}) {
+  return (
+    <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
+      {FIELDS.map((f, i) => {
+        const id = `${idPrefix}-${f.key}`;
+        const err = errors[f.key];
+        return (
+          <div key={f.key} className="min-w-0 space-y-1">
+            <label htmlFor={id} className="block text-xs font-medium text-muted">
+              {f.label} ({f.unit})
+            </label>
+            <Input
+              ref={i === 0 ? firstInputRef : undefined}
+              id={id}
+              type="text"
+              inputMode={f.unit === "GiB" && f.key.startsWith("d") ? "numeric" : "decimal"}
+              aria-label={`${labelPrefix} ${f.label} (${f.unit})`}
+              aria-invalid={err ? true : undefined}
+              aria-describedby={err ? `${id}-error` : undefined}
+              value={draft[f.key]}
+              disabled={locked}
+              onChange={(e) => onChange(f.key, e.target.value)}
+              className="px-2.5 py-1.5 tabular-nums disabled:opacity-60 aria-invalid:border-danger/70"
+            />
+            {err && (
+              <p id={`${id}-error`} className="text-xs text-danger [overflow-wrap:anywhere]">
+                {err}
+              </p>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 export function WorkerSizesCard({
   data,
   loadError,
@@ -159,8 +264,13 @@ export function WorkerSizesCard({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [result, setResult] = useState<WriteResult | null>(null);
-  // The row whose Reset is waiting for Confirm / Keep.
-  const [confirming, setConfirming] = useState<string | null>(null);
+  // The row whose Reset or Remove is waiting for Confirm / Keep.
+  const [confirming, setConfirming] = useState<{ name: string; action: "reset" | "remove" } | null>(null);
+  // The add form (M3): open or not, the typed name and the six fields. Opening it closes the
+  // edit form and the reverse, so one fieldErrors map serves whichever is open.
+  const [adding, setAdding] = useState(false);
+  const [addName, setAddName] = useState("");
+  const [addDraft, setAddDraft] = useState<Draft>(EMPTY_DRAFT);
   // A 409 on a write: the controller stopped advertising support after the list was read.
   // It holds only until the next list arrives (the 409 itself asks for one), which is then
   // the authority on whether sizes are editable.
@@ -174,9 +284,15 @@ export function WorkerSizesCard({
   const firstInput = useRef<HTMLInputElement>(null);
   const confirmButton = useRef<HTMLButtonElement>(null);
   // Set alongside the state change that renders the target; focused once it is mounted.
+  // Add opens onto the name input and returns to the Add button; a removal lands on its
+  // success message, since the row it came from is gone.
   const readOnlyBanner = useRef<HTMLDivElement>(null);
-  const focusTarget = useRef<{ kind: "edit" | "form" | "confirm" | "banner"; name: string } | null>(null);
-  const setFocusTarget = (t: { kind: "edit" | "form" | "confirm" | "banner"; name: string }) => {
+  const addButton = useRef<HTMLButtonElement>(null);
+  const addNameInput = useRef<HTMLInputElement>(null);
+  const resultRegion = useRef<HTMLDivElement>(null);
+  type FocusKind = "edit" | "form" | "confirm" | "banner" | "add" | "addForm" | "result";
+  const focusTarget = useRef<{ kind: FocusKind; name: string } | null>(null);
+  const setFocusTarget = (t: { kind: FocusKind; name: string }) => {
     focusTarget.current = t;
   };
   useEffect(() => {
@@ -186,6 +302,9 @@ export function WorkerSizesCard({
       t.kind === "banner" ? readOnlyBanner.current
       : t.kind === "form" ? firstInput.current
       : t.kind === "confirm" ? confirmButton.current
+      : t.kind === "add" ? addButton.current
+      : t.kind === "addForm" ? addNameInput.current
+      : t.kind === "result" ? resultRegion.current
       : (editButtons.current.get(t.name) ?? null);
     // A button disabled while a write is in flight cannot take focus; try again once enabled.
     if (el && !(el instanceof HTMLButtonElement && el.disabled)) {
@@ -217,8 +336,18 @@ export function WorkerSizesCard({
   const locked = readOnly || busy;
   const editingRow = data.sizes.find((s) => s.name === editing) ?? null;
   const ceilings = data.ceilings;
+  const maxSizes = data.max_sizes || 16;
+  const atCap = data.sizes.length >= maxSizes;
+
+  const closeAdd = () => {
+    setAdding(false);
+    setAddName("");
+    setAddDraft(EMPTY_DRAFT);
+    setFieldErrors({});
+  };
 
   const startEdit = (row: AdminWorkerSize) => {
+    if (adding) closeAdd();
     setEditing(row.name);
     setDraft(draftOf(row));
     setFieldErrors({});
@@ -238,33 +367,28 @@ export function WorkerSizesCard({
     setError("");
   };
 
-  // Parse the whole draft; a field that cannot be an api integer, or is above a bound the
-  // list already names, reports why locally, in the editor's units.
-  const parsed = (() => {
-    if (!draft) return null;
-    const values: Partial<WorkerSizeSpec> = {};
-    const errors: Record<string, string> = {};
-    for (const f of FIELDS) {
-      const p = f.parse(draft[f.key]);
-      if (!p.ok) {
-        errors[f.key] = p.error;
-        continue;
-      }
-      values[f.key] = p.value;
-      // The tightest bound names the real limit (a chart ceiling is below the absolute cap).
-      const over = fieldBound(f.key, ceilings)
-        .sort((x, y) => x.max - y.max)
-        .find((bound) => p.value > bound.max);
-      if (over) errors[f.key] = over.message;
-    }
-    if (!errors.cpu_request_millicores && !errors.cpu_limit_millicores && values.cpu_request_millicores! > values.cpu_limit_millicores!) {
-      errors.cpu_request_millicores = "The request cannot be above the limit";
-    }
-    if (!errors.memory_request_mib && !errors.memory_limit_mib && values.memory_request_mib! > values.memory_limit_mib!) {
-      errors.memory_request_mib = "The request cannot be above the limit";
-    }
-    return { values, errors };
-  })();
+  const startAdd = () => {
+    if (locked || atCap) return;
+    closeEdit();
+    setAdding(true);
+    setAddName("");
+    setAddDraft(EMPTY_DRAFT);
+    setFieldErrors({});
+    setError("");
+    setResult(null);
+    setConfirming(null);
+    setFocusTarget({ kind: "addForm", name: "" });
+  };
+  const cancelAdd = () => {
+    closeAdd();
+    setError("");
+    setFocusTarget({ kind: "add", name: "" });
+  };
+
+  const parsed = draft ? parseDraft(draft, ceilings) : null;
+  const addParsed = adding ? parseDraft(addDraft, ceilings) : null;
+  const typedName = addName.trim();
+  const addNameError = adding ? newSizeNameError(typedName, data.sizes.map((s) => s.name)) : null;
 
   const diskLowered =
     !!editingRow &&
@@ -275,6 +399,12 @@ export function WorkerSizesCard({
   // Map a refused write onto the editor: 409 → read-only until the re-read it triggers
   // lands; 400 fields → the inputs (each server message already names its chart path).
   const handleWriteError = (err: unknown, fallback: string, mapFields: boolean) => {
+    if (err instanceof ApiError && err.status === 409 && (err.body as { reason?: string } | null)?.reason === "max_sizes") {
+      // Another admin filled the table meanwhile; the re-read hides Add.
+      setError(`At most ${maxSizes} sizes. Remove an added size to add another.`);
+      void onChanged();
+      return;
+    }
     if (err instanceof ApiError && err.status === 409) {
       const body = err.body as { read_only_reason?: string } | null;
       setConflict({ reason: body?.read_only_reason || err.message, against: data });
@@ -320,9 +450,9 @@ export function WorkerSizesCard({
     }
   };
 
-  const askReset = (row: AdminWorkerSize) => {
+  const askConfirm = (row: AdminWorkerSize, action: "reset" | "remove") => {
     if (locked) return;
-    setConfirming(row.name);
+    setConfirming({ name: row.name, action });
     setFocusTarget({ kind: "confirm", name: row.name });
   };
   const keepRow = (name: string) => {
@@ -345,6 +475,67 @@ export function WorkerSizesCard({
     } catch (err) {
       // A reset has no inputs to map onto, so every field error is spelled out in the alert.
       handleWriteError(err, `Failed to reset size ${sizeLabel(row.name)}`, false);
+    } finally {
+      setConfirming(null);
+      setBusy(false);
+    }
+  };
+
+  const add = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!addParsed || locked) return;
+    setError("");
+    setResult(null);
+    const errors = { ...addParsed.errors, ...(addNameError ? { name: addNameError } : {}) };
+    if (Object.keys(errors).length > 0) {
+      setFieldErrors(errors);
+      return;
+    }
+    setFieldErrors({});
+    setBusy(true);
+    const name = typedName;
+    try {
+      const resp = await api.createAdminWorkerSize(name, addParsed.values as WorkerSizeSpec);
+      closeAdd();
+      setResult({ name, verb: "added", warnings: resp.warnings });
+      // The new row's Edit mounts once the re-read lands; the focus effect waits for it.
+      setFocusTarget({ kind: "edit", name });
+      await onChanged();
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 400 && err.message.startsWith("invalid worker size name")) {
+        setFieldErrors({ name: "Start with a lowercase letter, then use only lowercase letters, digits or hyphens (at most 16 characters)" });
+      } else {
+        handleWriteError(err, `Failed to add size ${sizeLabel(name)}`, true);
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const remove = async (row: AdminWorkerSize) => {
+    if (locked) return;
+    const label = sizeLabel(row.name);
+    setError("");
+    setResult(null);
+    setBusy(true);
+    try {
+      await api.deleteAdminWorkerSize(row.name);
+      if (editing === row.name) closeEdit();
+      setResult({ name: row.name, verb: "removed", warnings: [] });
+      setFocusTarget({ kind: "result", name: "" });
+      await onChanged();
+    } catch (err) {
+      const body = err instanceof ApiError ? (err.body as WorkerSizeDeleteRefusal | null) : null;
+      if (err instanceof ApiError && err.status === 409 && (body?.reason === "in_use" || body?.reason === "builtin")) {
+        setError(removalRefusal(label, body, err.message));
+        setFocusTarget({ kind: "edit", name: row.name });
+      } else if (err instanceof ApiError && err.status === 404) {
+        // Already gone (another admin removed it): the re-read drops the row.
+        setError(`Size ${label} was already removed.`);
+        void onChanged();
+      } else {
+        handleWriteError(err, `Failed to remove size ${label}`, false);
+      }
     } finally {
       setConfirming(null);
       setBusy(false);
@@ -388,7 +579,11 @@ export function WorkerSizesCard({
       )}
       {loadError && <Alert message={loadError} />}
       {error && <Alert message={error} />}
-      {result && <Alert tone="success" message={`Size ${sizeLabel(result.name)} ${result.verb}.`} />}
+      {result && (
+        <div ref={resultRegion} tabIndex={-1} className="outline-none">
+          <Alert tone="success" message={`Size ${sizeLabel(result.name)} ${result.verb}.`} />
+        </div>
+      )}
       {result?.warnings.map((w, i) => <Alert key={`${w.field}-${i}`} tone="warning" message={w.message} />)}
 
       <div className="space-y-2">
@@ -414,7 +609,10 @@ export function WorkerSizesCard({
                 const label = sizeLabel(row.name);
                 const isEditing = editing === row.name && draft !== null;
                 const canReset = row.builtin && row.customized && row.shipped !== null;
-                const isConfirming = confirming === row.name && canReset;
+                // Only an admin-added size can be removed; a builtin is reset instead.
+                const canRemove = !row.builtin;
+                const confirmAction = confirming?.name === row.name ? confirming.action : null;
+                const isConfirming = (confirmAction === "reset" && canReset) || (confirmAction === "remove" && canRemove);
                 const resetLowers =
                   !!row.shipped && (row.shipped.data_gib < row.data_gib || row.shipped.dind_data_gib < row.dind_data_gib);
                 return (
@@ -430,7 +628,29 @@ export function WorkerSizesCard({
                           Shipped: {specSummary(row.shipped!)}
                         </p>
                       )}
-                      {isConfirming ? (
+                      {isConfirming && confirmAction === "remove" ? (
+                        <div
+                          role="group"
+                          aria-label={`Confirm removal of size ${label}`}
+                          className="mt-2 w-[8rem] space-y-2 font-normal sm:w-auto sm:max-w-[16rem]"
+                          onKeyDown={(e) => {
+                            if (e.key === "Escape" && !busy) {
+                              e.stopPropagation();
+                              keepRow(row.name);
+                            }
+                          }}
+                        >
+                          <p className="text-xs text-fg">Remove size {label}? Workers can no longer be provisioned with it.</p>
+                          <div className="flex gap-2">
+                            <Button ref={confirmButton} size="sm" variant="danger" disabled={locked} onClick={() => void remove(row)}>
+                              {busy ? "Removing…" : "Remove"}
+                            </Button>
+                            <Button size="sm" variant="ghost" disabled={busy} onClick={() => keepRow(row.name)}>
+                              Keep
+                            </Button>
+                          </div>
+                        </div>
+                      ) : isConfirming ? (
                         <div
                           role="group"
                           aria-label={`Confirm reset of size ${label}`}
@@ -473,8 +693,13 @@ export function WorkerSizesCard({
                               Edit
                             </Button>
                             {canReset && (
-                              <Button size="sm" variant="ghost" aria-label={`Reset size ${label} to shipped values`} disabled={busy} onClick={() => askReset(row)}>
+                              <Button size="sm" variant="ghost" aria-label={`Reset size ${label} to shipped values`} disabled={busy} onClick={() => askConfirm(row, "reset")}>
                                 Reset
+                              </Button>
+                            )}
+                            {canRemove && (
+                              <Button size="sm" variant="ghost" aria-label={`Remove size ${label}`} disabled={busy} onClick={() => askConfirm(row, "remove")}>
+                                Remove
                               </Button>
                             )}
                           </div>
@@ -517,40 +742,18 @@ export function WorkerSizesCard({
           className="space-y-3 rounded-lg border border-edge bg-raised/40 p-3 sm:p-4"
         >
           <h3 className="text-sm font-medium text-fg">Edit size {editLabel}</h3>
-          <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
-            {FIELDS.map((f, i) => {
-              const id = `worker-size-${editingRow.name}-${f.key}`;
-              const err = fieldErrors[f.key];
-              return (
-                <div key={f.key} className="min-w-0 space-y-1">
-                  <label htmlFor={id} className="block text-xs font-medium text-muted">
-                    {f.label} ({f.unit})
-                  </label>
-                  <Input
-                    ref={i === 0 ? firstInput : undefined}
-                    id={id}
-                    type="text"
-                    inputMode={f.unit === "GiB" && f.key.startsWith("d") ? "numeric" : "decimal"}
-                    aria-label={`${editLabel} ${f.label} (${f.unit})`}
-                    aria-invalid={err ? true : undefined}
-                    aria-describedby={err ? `${id}-error` : undefined}
-                    value={draft[f.key]}
-                    disabled={locked}
-                    onChange={(e) => {
-                      setDraft({ ...draft, [f.key]: e.target.value });
-                      if (err) setFieldErrors((prev) => withoutKey(prev, f.key));
-                    }}
-                    className="px-2.5 py-1.5 tabular-nums disabled:opacity-60 aria-invalid:border-danger/70"
-                  />
-                  {err && (
-                    <p id={`${id}-error`} className="text-xs text-danger [overflow-wrap:anywhere]">
-                      {err}
-                    </p>
-                  )}
-                </div>
-              );
-            })}
-          </div>
+          <SizeFields
+            idPrefix={`worker-size-${editingRow.name}`}
+            labelPrefix={editLabel}
+            draft={draft}
+            errors={fieldErrors}
+            locked={locked}
+            firstInputRef={firstInput}
+            onChange={(key, value) => {
+              setDraft({ ...draft, [key]: value });
+              if (fieldErrors[key]) setFieldErrors((prev) => withoutKey(prev, key));
+            }}
+          />
           {diskLowered && (
             <Alert tone="warning" message="Existing workers keep their larger disk; only new workers get the smaller size." />
           )}
@@ -559,6 +762,96 @@ export function WorkerSizesCard({
               {busy ? "Saving…" : `Save size ${editLabel}`}
             </Button>
             <Button type="button" size="sm" variant="ghost" onClick={cancelEdit} disabled={busy}>
+              Cancel
+            </Button>
+          </div>
+        </form>
+      )}
+
+      {/* Adding a size (M3): one quiet line under the table until asked for, then a form in
+          the edit form's shape. Hidden while read-only, like every other write. */}
+      {!readOnly && !adding && (
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+          {!atCap && (
+            <Button ref={addButton} size="sm" variant="secondary" disabled={busy} onClick={startAdd}>
+              Add size
+            </Button>
+          )}
+          <p className="text-xs text-muted">
+            {data.sizes.length} of {maxSizes} sizes.
+            {atCap && ` At most ${maxSizes} sizes: remove an added size to add another.`}
+          </p>
+        </div>
+      )}
+      {adding && !atCap && addParsed && (
+        <form
+          onSubmit={add}
+          onKeyDown={(e) => {
+            if (e.key === "Escape" && !busy) {
+              e.preventDefault();
+              cancelAdd();
+            }
+          }}
+          noValidate
+          aria-label="Add a size"
+          className="space-y-3 rounded-lg border border-edge bg-raised/40 p-3 sm:p-4"
+        >
+          <h3 className="text-sm font-medium text-fg">Add a size</h3>
+          <div className="max-w-xs space-y-1">
+            <label htmlFor="add-worker-size-name" className="block text-xs font-medium text-muted">
+              Name
+            </label>
+            <Input
+              ref={addNameInput}
+              id="add-worker-size-name"
+              type="text"
+              autoComplete="off"
+              autoCapitalize="none"
+              spellCheck={false}
+              maxLength={32}
+              aria-label="New size name"
+              aria-invalid={fieldErrors.name ? true : undefined}
+              aria-describedby={fieldErrors.name ? "add-worker-size-name-error add-worker-size-name-help" : "add-worker-size-name-help"}
+              value={addName}
+              disabled={locked}
+              onChange={(e) => {
+                setAddName(e.target.value);
+                if (fieldErrors.name) setFieldErrors((prev) => withoutKey(prev, "name"));
+              }}
+              className="px-2.5 py-1.5 disabled:opacity-60 aria-invalid:border-danger/70"
+            />
+            {fieldErrors.name && (
+              <p id="add-worker-size-name-error" className="text-xs text-danger [overflow-wrap:anywhere]">
+                {fieldErrors.name}
+              </p>
+            )}
+            <p id="add-worker-size-name-help" className="text-xs text-faint">
+              A lowercase letter, then lowercase letters, digits or hyphens; at most 16 characters.
+            </p>
+          </div>
+          <SizeFields
+            idPrefix="add-worker-size"
+            labelPrefix="New size"
+            draft={addDraft}
+            errors={fieldErrors}
+            locked={locked}
+            onChange={(key, value) => {
+              setAddDraft({ ...addDraft, [key]: value });
+              if (fieldErrors[key]) setFieldErrors((prev) => withoutKey(prev, key));
+            }}
+          />
+          {/* What the provision form and the default-size selectors will offer, once the
+              name and every quantity are valid: the size is checked where it will be read. */}
+          {!addNameError && Object.keys(addParsed.errors).length === 0 && (
+            <p className="text-xs text-muted">
+              Pickers will show: <span className="text-fg">{sizeOptionLabel({ name: typedName, ...(addParsed.values as WorkerSizeSpec) })}</span>
+            </p>
+          )}
+          <div className="flex flex-wrap gap-2">
+            <Button type="submit" size="sm" disabled={locked}>
+              {busy ? "Adding…" : addNameError ? "Add size" : `Add size ${sizeLabel(typedName)}`}
+            </Button>
+            <Button type="button" size="sm" variant="ghost" onClick={cancelAdd} disabled={busy}>
               Cancel
             </Button>
           </div>

@@ -1552,8 +1552,8 @@ export interface AppSettings {
   hosted_worker_quota: string;
   // Ephemeral worker admin settings (PRD #4212). Optional for older responses.
   // ephemeral_max_per_user: integer 0..20, default "2"; ephemeral_default_size and
-  // hosted_default_size: a worker size name, defaults "m" and "l" (writes accept only the
-  // builtin names s, m, l, l-highmem until admin-added sizes land, PRD #4213);
+  // hosted_default_size: a worker size name, defaults "m" and "l" (writes accept any size
+  // that exists, builtin or admin-added; "<key>: unknown worker size" otherwise, PRD #4213);
   // ephemeral_lease: Go duration 0..2h, default "2h".
   ephemeral_max_per_user?: string;
   ephemeral_default_size?: string;
@@ -3431,6 +3431,16 @@ export interface AdminWorkerSizeWrite {
   size: AdminWorkerSize;
   warnings: WorkerSizeWarning[];
   advisories: WorkerSizeAdvisory[];
+}
+
+/**
+ * The 409 body of DELETE /admin/worker-sizes/{name}: a builtin size (reset it instead), or a
+ * size still in use by hosted workers and/or named by a stored default-size setting key.
+ */
+export interface WorkerSizeDeleteRefusal {
+  error: string;
+  reason: "builtin" | "in_use";
+  used_by?: { workers: number; settings: string[] };
 }
 
 export type RunStatus =

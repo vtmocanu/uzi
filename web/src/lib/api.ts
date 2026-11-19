@@ -1317,6 +1317,13 @@ const realApi = {
     request<AdminWorkerSizeWrite>("PUT", `/admin/worker-sizes/${encodeURIComponent(name)}`, spec),
   resetAdminWorkerSize: (name: string) =>
     request<AdminWorkerSizeWrite>("POST", `/admin/worker-sizes/${encodeURIComponent(name)}/reset`),
+  // PRD #4213 M3: PUT on an absent name creates the size (201); the editor checks locally
+  // that the name is new, since the same PUT on an existing name edits it.
+  createAdminWorkerSize: (name: string, spec: WorkerSizeSpec) =>
+    request<AdminWorkerSizeWrite>("PUT", `/admin/worker-sizes/${encodeURIComponent(name)}`, spec),
+  // 409 {reason: "builtin" | "in_use", used_by: {workers, settings}} when the size cannot go.
+  deleteAdminWorkerSize: (name: string) =>
+    request<{ deleted: string }>("DELETE", `/admin/worker-sizes/${encodeURIComponent(name)}`),
   /**
    * Provision a hosted worker: one the CONTROLLER runs in the cluster.
    *

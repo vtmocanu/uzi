@@ -7,8 +7,8 @@
 //   * the display helpers that turn those integers into the human units the UI shows
 //     (CPU cores, memory and disk quantities), so every surface spells a size alike;
 //   * the builtin seed, used ONLY where a fallback is required: an older api whose config
-//     carries no `sizes`, and the default-size settings writes, which the server accepts
-//     for the builtin names only until admin-added sizes land.
+//     carries no `sizes`, and the default-size selectors while the size list is unreadable;
+//   * the size-name rule and the size cap the add form checks before the api does (M3).
 //
 // The builtin seed is pinned to api/internal/hostedsvc/testdata/hosted_sizes.json (the
 // seed contract the api generates) by workerSizes.test.ts. Do not put a number in this
@@ -30,7 +30,7 @@ export const BUILTIN_WORKER_SIZES: readonly NamedWorkerSize[] = [
   { name: "l-highmem", cpu_request_millicores: 1000, cpu_limit_millicores: 4000, memory_request_mib: 24576, memory_limit_mib: 32768, data_gib: 50, dind_data_gib: 50 },
 ];
 
-/** The builtin size names, which are the only names a default-size setting accepts for now. */
+/** The builtin size names: the bare fallback a default-size selector offers without a list. */
 export const BUILTIN_WORKER_SIZE_NAMES: readonly string[] = BUILTIN_WORKER_SIZES.map((s) => s.name);
 
 /**
@@ -165,3 +165,27 @@ export function parseDiskGiB(text: string): ParsedQuantity {
  * field error in its own units; the api still enforces them.
  */
 export const ABSOLUTE_MAX = { millicores: 64000, memoryMiB: 524288, diskGiB: 2048 } as const;
+
+/**
+ * A well-formed size name, as the api's builtin.WellFormed: a lowercase letter, then
+ * lowercase letters, digits or hyphens, at most 16 characters in all.
+ */
+export const SIZE_NAME_PATTERN = /^[a-z][a-z0-9-]{0,15}$/;
+
+/** The most sizes the api stores (its maxWorkerSizes); GET /admin/worker-sizes says so too. */
+export const MAX_WORKER_SIZES = 16;
+
+/**
+ * Why a typed name cannot be a NEW size, or null when it can. A name already in the list is
+ * refused here because the api's PUT on an existing name edits that size instead of adding one.
+ */
+export function newSizeNameError(text: string, existing: readonly string[]): string | null {
+  if (text === "") return "Enter a name for the size, such as xs";
+  if (!SIZE_NAME_PATTERN.test(text)) {
+    if (/[A-Z]/.test(text) && SIZE_NAME_PATTERN.test(text.toLowerCase())) return "Use lowercase letters only, such as xs";
+    if (text.length > 16) return "Use at most 16 characters";
+    return "Start with a lowercase letter, then use only lowercase letters, digits or hyphens";
+  }
+  if (existing.includes(text)) return `A size named ${text} already exists; edit it in the table instead`;
+  return null;
+}

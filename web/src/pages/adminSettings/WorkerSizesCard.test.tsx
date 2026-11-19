@@ -1,4 +1,5 @@
 // @vitest-environment jsdom
+import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
@@ -9,7 +10,10 @@ import { BUILTIN_WORKER_SIZES } from "../../lib/workerSizes";
 
 vi.mock("../../lib/api", async (importActual) => {
   const actual = await importActual<typeof import("../../lib/api")>();
-  return { ...actual, api: { updateAdminWorkerSize: vi.fn(), resetAdminWorkerSize: vi.fn() } };
+  return {
+    ...actual,
+    api: { updateAdminWorkerSize: vi.fn(), resetAdminWorkerSize: vi.fn(), createAdminWorkerSize: vi.fn(), deleteAdminWorkerSize: vi.fn() },
+  };
 });
 
 const mockApi = vi.mocked(api);
@@ -323,5 +327,201 @@ describe("WorkerSizesCard", () => {
     expect(screen.getByRole("alert").textContent).toBe("Failed to load worker sizes");
     fireEvent.click(screen.getByRole("button", { name: "Retry loading worker sizes" }));
     expect(onChanged).toHaveBeenCalledTimes(1);
+  });
+
+  // PRD #4213 M3: adding and removing sizes.
+  const xsSpec = { cpu_request_millicores: 250, cpu_limit_millicores: 1000, memory_request_mib: 1024, memory_limit_mib: 2048, data_gib: 5, dind_data_gib: 10 };
+  const added = (name: string, i: number): AdminWorkerSize => ({
+    name, ...xsSpec, display_order: 4 + i, builtin: false, customized: false, shipped: null, updated_at: "2026-11-19T09:00:00Z",
+  });
+  const withAdded = (...names: string[]): AdminWorkerSizes => {
+    const base = sizes();
+    return { ...base, sizes: [...base.sizes, ...names.map(added)] };
+  };
+
+  // A page stand-in: onChanged re-reads by swapping in `next`, as AdminWorkers lifts the list.
+  function Harness({ first, next }: { first: AdminWorkerSizes; next: AdminWorkerSizes }) {
+    const [data, setData] = useState(first);
+    return (
+      <MemoryRouter>
+        <WorkerSizesCard data={data} loadError="" onChanged={async () => setData(next)} />
+      </MemoryRouter>
+    );
+  }
+
+  it("adds a size: local name checks, the exact integers on the wire, then the new row with focus on its Edit", async () => {
+    mockApi.createAdminWorkerSize.mockResolvedValue({ size: added("xs", 0), warnings: [], advisories: [] });
+    render(<Harness first={sizes()} next={withAdded("xs")} />);
+    expect(screen.getByText("4 of 16 sizes.")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Add size" }));
+    const name = input("New size name");
+    expect(document.activeElement).toBe(name);
+    const submit = () => fireEvent.click(within(screen.getByRole("form", { name: "Add a size" })).getByRole("button", { name: /^Add size/ }));
+
+    // Nothing typed: every field says what it needs, and nothing is sent.
+    submit();
+    expect(await screen.findByText("Enter a name for the size, such as xs")).toBeTruthy();
+    expect(name.getAttribute("aria-invalid")).toBe("true");
+    expect(input("New size CPU limit (cores)").getAttribute("aria-invalid")).toBe("true");
+    for (const [typed, why] of [
+      ["XS", "Use lowercase letters only, such as xs"],
+      ["1x", "Start with a lowercase letter, then use only lowercase letters, digits or hyphens"],
+      ["x_s", "Start with a lowercase letter, then use only lowercase letters, digits or hyphens"],
+      ["abcdefghijklmnopq", "Use at most 16 characters"],
+      // A PUT on an existing name would edit that size, so it is refused here.
+      ["l", "A size named l already exists; edit it in the table instead"],
+    ] as const) {
+      fireEvent.change(input("New size name"), { target: { value: typed } });
+      submit();
+      expect(await screen.findByText(why)).toBeTruthy();
+    }
+    expect(mockApi.createAdminWorkerSize).not.toHaveBeenCalled();
+
+    fireEvent.change(input("New size name"), { target: { value: "xs" } });
+    fireEvent.change(input("New size CPU request (cores)"), { target: { value: "0.25" } });
+    fireEvent.change(input("New size CPU limit (cores)"), { target: { value: "1" } });
+    fireEvent.change(input("New size Memory request (GiB)"), { target: { value: "1" } });
+    fireEvent.change(input("New size Memory limit (GiB)"), { target: { value: "2" } });
+    fireEvent.change(input("New size Data disk (GiB)"), { target: { value: "5" } });
+    fireEvent.change(input("New size DinD data disk (GiB)"), { target: { value: "10" } });
+    // The option text the pickers will show, before saving.
+    expect(screen.getByText("XS — up to 1 CPU / 2Gi RAM / 5Gi disk")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Add size XS" }));
+    await waitFor(() => expect(mockApi.createAdminWorkerSize).toHaveBeenCalledWith("xs", xsSpec));
+    expect(await screen.findByText("Size XS added.")).toBeTruthy();
+    expect(screen.queryByRole("form", { name: "Add a size" })).toBeNull();
+    const xs = within(rowOf("XS"));
+    expect(xs.queryByText("Builtin")).toBeNull();
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "Edit size XS" })));
+    expect(screen.getByText("5 of 16 sizes.")).toBeTruthy();
+  });
+
+  it("maps a refused add onto its inputs, and Cancel or Escape returns focus to Add size", async () => {
+    const serverText = "memory limit 40960 MiB exceeds the 32768 MiB ceiling (workers.limitRange.max.memory)";
+    mockApi.createAdminWorkerSize.mockRejectedValue(
+      new ApiError(400, "the size has values that cannot be saved", { error: "the size has values that cannot be saved", fields: { memory_limit_mib: serverText } }),
+    );
+    // The local check passes for 32 GiB, so the server's refusal is the one shown.
+    renderCard(sizes({}, { ceilings: { ...sizes().ceilings, memory_limit_mib: null } }));
+    fireEvent.click(screen.getByRole("button", { name: "Add size" }));
+    fireEvent.change(input("New size name"), { target: { value: "big" } });
+    for (const [label, value] of [["CPU request", "1"], ["CPU limit", "2"], ["Memory request", "4"], ["Memory limit", "40"], ["Data disk", "10"], ["DinD data disk", "10"]]) {
+      fireEvent.change(input(`New size ${label} (${label.startsWith("CPU") ? "cores" : "GiB"})`), { target: { value } });
+    }
+    fireEvent.click(screen.getByRole("button", { name: "Add size BIG" }));
+    expect(await screen.findByText(serverText)).toBeTruthy();
+    expect(input("New size Memory limit (GiB)").getAttribute("aria-invalid")).toBe("true");
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("form", { name: "Add a size" })).toBeNull();
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Add size" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add size" }));
+    fireEvent.keyDown(input("New size name"), { key: "Escape" });
+    expect(screen.queryByRole("form", { name: "Add a size" })).toBeNull();
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Add size" }));
+  });
+
+  it("hides Add at the 16-size cap and says so; a 409 max_sizes says so too and re-reads", async () => {
+    const full = withAdded(...Array.from({ length: 12 }, (_, i) => `x${i}`));
+    renderCard(full);
+    expect(screen.queryByRole("button", { name: "Add size" })).toBeNull();
+    expect(screen.getByText("16 of 16 sizes. At most 16 sizes: remove an added size to add another.")).toBeTruthy();
+    cleanup();
+
+    mockApi.createAdminWorkerSize.mockRejectedValue(new ApiError(409, "at most 16 worker sizes", { error: "at most 16 worker sizes", reason: "max_sizes" }));
+    const onChanged = renderCard();
+    fireEvent.click(screen.getByRole("button", { name: "Add size" }));
+    fireEvent.change(input("New size name"), { target: { value: "xs" } });
+    for (const [label, value] of [["CPU request", "1"], ["CPU limit", "2"], ["Memory request", "4"], ["Memory limit", "8"], ["Data disk", "10"], ["DinD data disk", "10"]]) {
+      fireEvent.change(input(`New size ${label} (${label.startsWith("CPU") ? "cores" : "GiB"})`), { target: { value } });
+    }
+    fireEvent.click(screen.getByRole("button", { name: "Add size XS" }));
+    expect(await screen.findByText("At most 16 sizes. Remove an added size to add another.")).toBeTruthy();
+    // Not the read-only 409: the editor stays writable.
+    expect(screen.queryByText(/Sizes are read-only/)).toBeNull();
+    expect(onChanged).toHaveBeenCalledTimes(1);
+  });
+
+  it("offers no Add while read-only", () => {
+    renderCard({ ...withAdded("xs"), editable: false, read_only_reason: "The controller report is stale.", read_only_code: "controller_report_stale" });
+    expect(screen.queryByRole("button", { name: "Add size" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Remove size XS" })).toBeNull();
+  });
+
+  it("offers Remove on added sizes only, confirms inline, then removes and announces it", async () => {
+    mockApi.deleteAdminWorkerSize.mockResolvedValue({ deleted: "xs" });
+    render(<Harness first={withAdded("xs")} next={sizes()} />);
+    for (const builtin of ["S", "M", "L", "L-HIGHMEM"]) {
+      expect(screen.queryByRole("button", { name: `Remove size ${builtin}` })).toBeNull();
+    }
+    expect(screen.getAllByRole("rowheader").map((h) => h.textContent)).toEqual(["SBuiltinEdit", "MBuiltinEdit", "LBuiltinEdit", "L-HIGHMEMBuiltinEdit", "XSEditRemove"]);
+    fireEvent.click(screen.getByRole("button", { name: "Remove size XS" }));
+    const group = within(screen.getByRole("group", { name: "Confirm removal of size XS" }));
+    expect(group.getByText("Remove size XS? Workers can no longer be provisioned with it.")).toBeTruthy();
+    expect(document.activeElement).toBe(group.getByRole("button", { name: "Remove" }));
+    expect(mockApi.deleteAdminWorkerSize).not.toHaveBeenCalled();
+
+    // Keep and Escape send nothing.
+    fireEvent.click(group.getByRole("button", { name: "Keep" }));
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Edit size XS" }));
+    fireEvent.click(screen.getByRole("button", { name: "Remove size XS" }));
+    fireEvent.keyDown(screen.getByRole("button", { name: "Remove" }), { key: "Escape" });
+    expect(screen.queryByRole("group", { name: "Confirm removal of size XS" })).toBeNull();
+    expect(mockApi.deleteAdminWorkerSize).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove size XS" }));
+    fireEvent.click(screen.getByRole("button", { name: "Remove" }));
+    await waitFor(() => expect(mockApi.deleteAdminWorkerSize).toHaveBeenCalledWith("xs"));
+    const done = await screen.findByText("Size XS removed.");
+    expect(screen.queryByRole("button", { name: "Edit size XS" })).toBeNull();
+    // The row is gone, so focus lands on the message that says so.
+    await waitFor(() => expect(document.activeElement).toBe(done.parentElement));
+  });
+
+  it("says what still uses a size the api refuses to remove, and keeps the row", async () => {
+    const error = "size is in use: 2 worker(s) still use it; it is the stored value of ephemeral_default_size, hosted_default_size";
+    mockApi.deleteAdminWorkerSize.mockRejectedValue(
+      new ApiError(409, error, { error, reason: "in_use", used_by: { workers: 2, settings: ["ephemeral_default_size", "hosted_default_size"] } }),
+    );
+    const onChanged = renderCard(withAdded("xs"));
+    fireEvent.click(screen.getByRole("button", { name: "Remove size XS" }));
+    fireEvent.click(screen.getByRole("button", { name: "Remove" }));
+    await waitFor(() =>
+      expect(screen.getByRole("alert").textContent).toBe(
+        "XS is still in use, so it was not removed. Still used by 2 workers. Set as the default size for ephemeral workers and new workers; choose another default first.",
+      ),
+    );
+    expect(screen.queryByText(/Sizes are read-only/)).toBeNull();
+    expect(onChanged).not.toHaveBeenCalled();
+    expect(rowOf("XS")).toBeTruthy();
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "Edit size XS" })));
+    cleanup();
+
+    // One worker and no setting, or only a setting, say only that.
+    mockApi.deleteAdminWorkerSize.mockRejectedValueOnce(new ApiError(409, "size is in use: 1 worker(s) still use it", { error: "", reason: "in_use", used_by: { workers: 1, settings: [] } }));
+    renderCard(withAdded("xs"));
+    fireEvent.click(screen.getByRole("button", { name: "Remove size XS" }));
+    fireEvent.click(screen.getByRole("button", { name: "Remove" }));
+    await waitFor(() => expect(screen.getByRole("alert").textContent).toBe("XS is still in use, so it was not removed. Still used by 1 worker."));
+    cleanup();
+    mockApi.deleteAdminWorkerSize.mockRejectedValueOnce(new ApiError(409, "x", { error: "x", reason: "in_use", used_by: { workers: 0, settings: ["hosted_default_size"] } }));
+    renderCard(withAdded("xs"));
+    fireEvent.click(screen.getByRole("button", { name: "Remove size XS" }));
+    fireEvent.click(screen.getByRole("button", { name: "Remove" }));
+    await waitFor(() =>
+      expect(screen.getByRole("alert").textContent).toBe("XS is still in use, so it was not removed. Set as the default size for new workers; choose another default first."),
+    );
+  });
+
+  it("spells a builtin refusal in the page's words if the api ever returns one", async () => {
+    mockApi.deleteAdminWorkerSize.mockRejectedValue(
+      new ApiError(409, "builtin sizes cannot be removed; reset it instead", { error: "builtin sizes cannot be removed; reset it instead", reason: "builtin", used_by: { workers: 0, settings: [] } }),
+    );
+    // A row the list marks added but the api knows as builtin (a stale list).
+    renderCard(withAdded("xs"));
+    fireEvent.click(screen.getByRole("button", { name: "Remove size XS" }));
+    fireEvent.click(screen.getByRole("button", { name: "Remove" }));
+    await waitFor(() =>
+      expect(screen.getByRole("alert").textContent).toBe("XS is a builtin size and cannot be removed. Reset it to shipped values instead."),
+    );
   });
 });

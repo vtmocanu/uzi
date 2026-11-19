@@ -406,6 +406,29 @@ describe("HostedWorkers provisioning", () => {
     await waitFor(() => expect(mockApi.provisionHostedWorker).toHaveBeenCalledWith("base", "s", false));
   });
 
+  it("lists an admin-added size in the api's order, labelled with its limits, and provisions it", async () => {
+    const xs = { name: "xs", cpu_request_millicores: 250, cpu_limit_millicores: 1000, memory_request_mib: 1024, memory_limit_mib: 2048, data_gib: 5, dind_data_gib: 10 };
+    mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 2, ephemeral_enabled: false, default_size: "l", sizes: [...seed, xs] });
+    mockApi.provisionHostedWorker.mockResolvedValue({ worker: provisioned });
+    renderCard(0);
+    expect(await optionTexts()).toEqual([
+      "S — up to 1 CPU / 4Gi RAM / 5Gi disk",
+      "L — up to 4 CPU / 20Gi RAM / 50Gi disk",
+      "XS — up to 1 CPU / 2Gi RAM / 5Gi disk",
+    ]);
+    fireEvent.change(screen.getByLabelText("Hosted worker size"), { target: { value: "xs" } });
+    fireEvent.click(await provisionButton());
+    await waitFor(() => expect(mockApi.provisionHostedWorker).toHaveBeenCalledWith("base", "xs", false));
+  });
+
+  it("preselects an admin-added default size", async () => {
+    const xs = { name: "xs", cpu_request_millicores: 250, cpu_limit_millicores: 1000, memory_request_mib: 1024, memory_limit_mib: 2048, data_gib: 5, dind_data_gib: 10 };
+    mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 2, ephemeral_enabled: false, default_size: "xs", sizes: [...seed, xs] });
+    renderCard(0);
+    await optionTexts();
+    expect((screen.getByLabelText("Hosted worker size") as HTMLSelectElement).value).toBe("xs");
+  });
+
   it("falls back to the builtin sizes when an older api sends no list", async () => {
     mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 2, ephemeral_enabled: false });
     renderCard(0);

@@ -99,11 +99,94 @@ describe("mock admin worker sizes", () => {
     await expect(api.provisionHostedWorker("base", "xl")).rejects.toMatchObject({ status: 400, message: "unknown worker size" });
   });
 
-  it("keeps default-size settings builtins-only, with the server's error text", async () => {
+  // PRD #4213 M3: adding and removing sizes.
+  const xs = { cpu_request_millicores: 250, cpu_limit_millicores: 1000, memory_request_mib: 1024, memory_limit_mib: 2048, data_gib: 5, dind_data_gib: 10 };
+
+  it("creates an absent size with PUT, after the builtins, and ships it to provisioning", async () => {
+    const api = await fresh();
+    const made = await api.createAdminWorkerSize("xs", xs);
+    expect(made).toEqual({
+      size: expect.objectContaining({ name: "xs", ...xs, display_order: 4, builtin: false, customized: false, shipped: null }),
+      warnings: [],
+      advisories: [],
+    });
+    expect((await api.getAdminWorkerSizes()).sizes.map((s) => s.name)).toEqual(["s", "m", "l", "l-highmem", "xs"]);
+    expect((await api.hostedConfig()).sizes?.map((s) => s.name)).toContain("xs");
+    const { worker } = await api.provisionHostedWorker("base", "xs");
+    expect(worker).toMatchObject({ hosted_size: "xs", hosted_size_spec: xs });
+    // The same PUT on the now-existing name edits it, as the api's does.
+    const edited = await api.updateAdminWorkerSize("xs", { ...xs, data_gib: 6 });
+    expect(edited.size).toMatchObject({ name: "xs", data_gib: 6, builtin: false, customized: false });
+  });
+
+  it("refuses a malformed name, invalid values and a 17th size with the api's text", async () => {
+    const api = await fresh();
+    for (const bad of ["XS", "1x", "-x", "a".repeat(17), "x_s"]) {
+      await expect(api.createAdminWorkerSize(bad, xs)).rejects.toMatchObject({
+        status: 400,
+        message: "invalid worker size name: use a lowercase letter then lowercase letters, digits or hyphens, at most 16 characters",
+      });
+    }
+    await expect(api.createAdminWorkerSize("xs", { ...xs, memory_limit_mib: 40960 })).rejects.toMatchObject({
+      status: 400,
+      body: { fields: { memory_limit_mib: "memory limit 40960 MiB exceeds the 32768 MiB ceiling (workers.limitRange.max.memory)" } },
+    });
+    for (let i = 0; i < 12; i++) await api.createAdminWorkerSize(`x${i}`, xs);
+    expect((await api.getAdminWorkerSizes()).sizes).toHaveLength(16);
+    await expect(api.createAdminWorkerSize("one-more", xs)).rejects.toMatchObject({
+      status: 409,
+      message: "at most 16 worker sizes",
+      body: { error: "at most 16 worker sizes", reason: "max_sizes" },
+    });
+    // The cap binds only an add: an edit at 16 rows still saves.
+    await expect(api.updateAdminWorkerSize("x0", { ...xs, data_gib: 7 })).resolves.toMatchObject({ size: { data_gib: 7 } });
+  });
+
+  it("removes an unused added size, refuses a builtin, an absent one and one still in use", async () => {
+    const api = await fresh();
+    await expect(api.deleteAdminWorkerSize("l")).rejects.toMatchObject({
+      status: 409,
+      body: { error: "builtin sizes cannot be removed; reset it instead", reason: "builtin" },
+    });
+    await expect(api.deleteAdminWorkerSize("nope")).rejects.toMatchObject({ status: 404, message: "worker size not found" });
+
+    await api.createAdminWorkerSize("xs", xs);
+    const { worker } = await api.provisionHostedWorker("base", "xs");
+    await api.updateSettings({ ephemeral_default_size: "xs", hosted_default_size: "xs" });
+    await expect(api.deleteAdminWorkerSize("xs")).rejects.toMatchObject({
+      status: 409,
+      message: "size is in use: 1 worker(s) still use it; it is the stored value of ephemeral_default_size, hosted_default_size",
+      body: { reason: "in_use", used_by: { workers: 1, settings: ["ephemeral_default_size", "hosted_default_size"] } },
+    });
+    await api.deleteWorker(worker.id);
+    await api.updateSettings({ ephemeral_default_size: "", hosted_default_size: "" });
+    await expect(api.deleteAdminWorkerSize("xs")).resolves.toEqual({ deleted: "xs" });
+    expect((await api.getAdminWorkerSizes()).sizes.map((s) => s.name)).toEqual(["s", "m", "l", "l-highmem"]);
+    await expect(api.provisionHostedWorker("base", "xs")).rejects.toMatchObject({ status: 400, message: "unknown worker size" });
+  });
+
+  it("refuses add and remove with the read-only 409 under ?mock=sizes-readonly", async () => {
+    localStorage.setItem("uzi_mock_scenario", "sizes-readonly");
+    const api = await fresh();
+    await expect(api.createAdminWorkerSize("xs", xs)).rejects.toMatchObject({ status: 409, body: { reason: "controller_unsupported" } });
+    await expect(api.deleteAdminWorkerSize("xs")).rejects.toMatchObject({ status: 409, body: { reason: "controller_unsupported" } });
+  });
+
+  it("accepts any existing size for the two default-size settings and refuses an unknown one with the api's text", async () => {
     const api = await fresh();
     await expect(api.updateSettings({ hosted_default_size: "xl" })).rejects.toMatchObject({
       status: 400,
-      message: "hosted_default_size: must be one of: s, m, l, l-highmem",
+      message: "hosted_default_size: unknown worker size",
     });
+    await expect(api.updateSettings({ ephemeral_default_size: "xs" })).rejects.toMatchObject({
+      status: 400,
+      message: "ephemeral_default_size: unknown worker size",
+    });
+    await api.createAdminWorkerSize("xs", xs);
+    const saved = await api.updateSettings({ ephemeral_default_size: "xs", hosted_default_size: "xs" });
+    expect(saved.settings).toMatchObject({ ephemeral_default_size: "xs", hosted_default_size: "xs" });
+    expect((await api.getSettings()).settings).toMatchObject({ ephemeral_default_size: "xs", hosted_default_size: "xs" });
+    // The provision form preselects the admin's default, now an added size.
+    expect((await api.hostedConfig()).default_size).toBe("xs");
   });
 });
