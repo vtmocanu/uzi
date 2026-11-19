@@ -10,7 +10,7 @@ import (
 // so each pin compares text and not layout.
 func provSQL(t *testing.T, path string) string {
 	t.Helper()
-	raw, err := os.ReadFile(path)
+	raw, err := os.ReadFile(path) //nolint:gosec // G304: path is a fixed file inside this package's queries/migrations dirs.
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -20,7 +20,7 @@ func provSQL(t *testing.T, path string) string {
 // provBlock returns the named query's text from a queries file, whitespace-stripped.
 func provBlock(t *testing.T, path, name string) string {
 	t.Helper()
-	raw, err := os.ReadFile(path)
+	raw, err := os.ReadFile(path) //nolint:gosec // G304: path is a fixed file inside this package's queries dir.
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,7 +90,7 @@ func TestClaimProvenanceMigrationText(t *testing.T) {
 		"(OLD.claim_generation<1ORCOALESCE(OLD.claim_provenance_worker_id=NEW.worker_idANDOLD.claim_provenance_generation=OLD.claim_generation,false))",
 		"(OLD.claim_provenance_worker_idISNULL)=(OLD.claim_provenance_generationISNULL)",
 		"(NEW.claim_provenance_worker_idISNULL)=(NEW.claim_provenance_generationISNULL)",
-		"NEW.claim_provenance_worker_idISNOTNULLANDNEW.claim_provenance_worker_id=NEW.worker_idANDNEW.claim_provenance_generation=NEW.claim_generation",
+		"NEW.claim_provenance_worker_idISNOTNULLANDNEW.claim_provenance_worker_id=NEW.worker_idANDNEW.claim_provenance_generation=NEW.claim_generation)ISNOTTRUETHEN",
 		"CREATETRIGGERtrg_runs_claim_provenance_guardBEFOREUPDATEONruns",
 	} {
 		if !strings.Contains(sql, c) {

@@ -64,4 +64,16 @@ func TestClaimRunCodexProvenanceSeamLiveDB(t *testing.T) {
 	if _, err := fx.pool.Exec(fx.ctx, `UPDATE runs SET claim_provenance_worker_id = $2 WHERE id = $1`, codex, b); err == nil {
 		t.Fatal("direct provenance rewrite was accepted, want the guard trigger to refuse it")
 	}
+
+	// The guard fails closed on a NULL conjunct: a claim-shaped 0 -> 1 step that records A while
+	// leaving worker_id NULL must raise (an IF NOT (...) on a NULL conjunction would not).
+	fresh := uuid.New()
+	mustExec(fx.ctx, t, fx.pool,
+		`INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, status, claim_generation)
+		 VALUES ($1, $2, $3, $4, 't', 'd', 'queued', 0)`, fresh, fx.userID, fx.repoID, fx.nextIID())
+	if _, err := fx.pool.Exec(fx.ctx,
+		`UPDATE runs SET claim_generation = 1, claim_provenance_worker_id = $2, claim_provenance_generation = 1 WHERE id = $1`,
+		fresh, a); err == nil {
+		t.Fatal("provenance stamped with a NULL worker_id was accepted, want the guard trigger to refuse it")
+	}
 }

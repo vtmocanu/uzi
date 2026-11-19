@@ -60,11 +60,34 @@ func staleCutoff(grace time.Duration) pgtype.Timestamptz {
 // stale_requeue_generation == claim_generation.
 func (fx *rollAffinityFixture) staleRequeuedRun(owner uuid.UUID) uuid.UUID {
 	fx.t.Helper()
+	return fx.staleRequeuedRunWith(owner, false)
+}
+
+// staleRequeuedRunWithProvenance is staleRequeuedRun with the generation-1 claim recorded as
+// owner's (issue #4476 claim provenance): the row is inserted at generation 0 and stepped to 1 in
+// one claim-shaped UPDATE, the only shape trg_runs_claim_provenance_guard admits.
+func (fx *rollAffinityFixture) staleRequeuedRunWithProvenance(owner uuid.UUID) uuid.UUID {
+	fx.t.Helper()
+	return fx.staleRequeuedRunWith(owner, true)
+}
+
+func (fx *rollAffinityFixture) staleRequeuedRunWith(owner uuid.UUID, provenance bool) uuid.UUID {
+	fx.t.Helper()
 	id := uuid.New()
-	mustExec(fx.ctx, fx.t, fx.pool,
-		`INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, status, worker_id, claim_generation)
-		 VALUES ($1, $2, $3, $4, 't', 'd', 'claimed', $5, 1)`,
-		id, fx.userID, fx.repoID, fx.nextIID(), owner)
+	if provenance {
+		mustExec(fx.ctx, fx.t, fx.pool,
+			`INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, status, worker_id, claim_generation)
+			 VALUES ($1, $2, $3, $4, 't', 'd', 'claimed', $5, 0)`,
+			id, fx.userID, fx.repoID, fx.nextIID(), owner)
+		mustExec(fx.ctx, fx.t, fx.pool,
+			`UPDATE runs SET claim_generation = 1, worker_id = $2, claim_provenance_worker_id = $2, claim_provenance_generation = 1
+			 WHERE id = $1`, id, owner)
+	} else {
+		mustExec(fx.ctx, fx.t, fx.pool,
+			`INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, status, worker_id, claim_generation)
+			 VALUES ($1, $2, $3, $4, 't', 'd', 'claimed', $5, 1)`,
+			id, fx.userID, fx.repoID, fx.nextIID(), owner)
+	}
 	// RequeueRunsOfStaleWorkers is a global sweep over every stale worker in the database, so
 	// these tests must stay serial: never add t.Parallel to this file.
 	rows, err := fx.q.RequeueRunsOfStaleWorkers(fx.ctx, store.RequeueRunsOfStaleWorkersParams{
@@ -276,7 +299,13 @@ func stalePredecessor(id uuid.UUID) uuid.UUID {
 // promotion opens a fresh grace AND restarts the ceiling: the pin is per-episode, and there is
 // NO global bound across park/promote cycles (documented in ClaimRun's comment). The test pins
 // exactly that, plus: stale_requeue_generation survives each cycle (the #1390 readoption and
-// refund provenance), and an expiry inside an episode releases the run.
+// refund provenance).
+//
+// Issue #4476: the run's generation-1 claim is recorded as W's (claim provenance), so the Codex
+// provenance gate admits only W. The peer P is therefore refused in every cycle AND after the
+// grace expires inside an episode (before #4476 that expiry released the run to P), while W, the
+// recorded claimant, still re-claims it at the end (the positive control). The per-episode grace
+// itself is no longer observable through a Codex peer; it still governs Claude runs (tests above).
 //
 // The account gate is toggled with ccs.material_revision (1 = ahead of the run's frozen 0 on a
 // 'staging' alias: gated and parked; 0 = open), the minimal state the shared gate predicate
@@ -297,7 +326,7 @@ func TestClaimRunStaleRequeueCodexParkPromoteCyclesLiveDB(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("insert credential state: %v", err)
 	}
-	run := fx.staleRequeuedRun(w)
+	run := fx.staleRequeuedRunWithProvenance(w)
 	if _, err := fx.q.FreezeRunCodexBinding(fx.ctx, store.FreezeRunCodexBindingParams{
 		SecretID: secret, AuthMode: "subscription", SecretLabel: "codex", MaterialRevision: 0,
 		ID: run, UserID: fx.userID,
@@ -354,10 +383,8 @@ func TestClaimRunStaleRequeueCodexParkPromoteCyclesLiveDB(t *testing.T) {
 	cycle(2)
 
 	// Issue #4476: before the claim provenance gate an expiry inside an episode released this
-	// Codex run to the peer. A Codex run at claim_generation >= 1 is now admitted only for its
-	// recorded last Codex claimant, and this seeded run has no recorded provenance (legacy), so
-	// the grace expiring releases it to nobody: neither the peer nor the stale owner.
+	// Codex run to the peer. Now only its recorded last Codex claimant W is admitted.
 	fx.age(run, 11*time.Minute, 11*time.Minute)
 	fx.mustBlock(p, staleGrace, staleCeiling, "grace expired inside the second episode: provenance gate holds the Codex run")
-	fx.mustBlock(w, staleGrace, staleCeiling, "legacy NULL provenance: not even the stale owner gets a fresh claim")
+	fx.mustClaim(w, run, staleGrace, staleCeiling, "the recorded claimant re-claims its Codex run")
 }

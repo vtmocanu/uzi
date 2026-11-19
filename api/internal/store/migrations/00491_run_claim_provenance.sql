@@ -23,8 +23,9 @@ $$;
 -- +goose StatementEnd
 
 -- Provenance changes only through an admitted claimant's +1 claim (ClaimRun sets worker_id,
--- claim_generation and the pair in one UPDATE). No park, Resume, promoter, account-unavailable,
--- delete or backfill path can write it: every other writer is rejected here.
+-- claim_generation and the pair in one UPDATE). Any write not shaped like an admitted +1 claim is
+-- rejected here, so no park, Resume, promoter, account-unavailable, delete or backfill path can
+-- write it.
 -- +goose StatementBegin
 CREATE FUNCTION runs_claim_provenance_guard() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
@@ -34,7 +35,8 @@ BEGIN
         END IF;
         RETURN NEW;
     END IF;
-    IF NOT (
+    -- IS NOT TRUE, not NOT (...): a NULL conjunct (e.g. NEW.worker_id NULL) must raise too.
+    IF (
         NEW.claim_generation = OLD.claim_generation + 1
         AND (OLD.claim_generation < 1
              OR COALESCE(OLD.claim_provenance_worker_id = NEW.worker_id
@@ -44,7 +46,7 @@ BEGIN
         AND NEW.claim_provenance_worker_id IS NOT NULL
         AND NEW.claim_provenance_worker_id = NEW.worker_id
         AND NEW.claim_provenance_generation = NEW.claim_generation
-    ) THEN
+    ) IS NOT TRUE THEN
         RAISE EXCEPTION 'claim provenance may change only through an admitted claim of run %', OLD.id
             USING ERRCODE = 'check_violation';
     END IF;

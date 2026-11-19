@@ -2122,7 +2122,7 @@ UPDATE runs SET
     -- claim. Returned in the claim payload; the hold above binds the identical value.
     claim_generation = runs.claim_generation + 1,
     -- Issue #4476: Codex claim provenance, the (worker, generation) pair of this claim. Written only here,
-    -- for Codex-indicating rows; trg_runs_claim_provenance_guard rejects every other writer.
+    -- for Codex-indicating rows; trg_runs_claim_provenance_guard rejects any write that is not an admitted +1 claim.
     claim_provenance_worker_id = CASE WHEN (runs.harness = 'codex' OR runs.codex_material_revision IS NOT NULL OR runs.codex_secret_id IS NOT NULL) THEN @worker_id::uuid ELSE runs.claim_provenance_worker_id END,
     claim_provenance_generation = CASE WHEN (runs.harness = 'codex' OR runs.codex_material_revision IS NOT NULL OR runs.codex_secret_id IS NOT NULL) THEN runs.claim_generation + 1 ELSE runs.claim_provenance_generation END,
     -- Compatible-lane one-claim Fresh (#3607 Mf): a pending authorization is consumed by exactly this
