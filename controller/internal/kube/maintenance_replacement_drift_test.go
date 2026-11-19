@@ -43,13 +43,50 @@ type driftHarness struct {
 // deploymentUID is the observed Deployment UID and pvcUID the DinD claim UID.
 func newDriftHarness(t *testing.T, deploymentUID, pvcUID string) *driftHarness {
 	t.Helper()
+	return newDriftHarnessWith(t, deploymentUID, pvcUID, false)
+}
+
+// newStampedDriftHarness seeds the same recycling operation for a worker moved to
+// the opt-in new placement: newPlacement is configured, every claim carries the
+// create-time stamp and the replacement Deployment renders the new placement.
+func newStampedDriftHarness(t *testing.T, deploymentUID, pvcUID string) *driftHarness {
+	t.Helper()
+	h := newDriftHarnessWith(t, deploymentUID, pvcUID, true)
+	o, err := h.m.Observe(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(o) != 1 || !newPlacementStamped(h.m.cfg, o[0]) {
+		t.Fatalf("seeded worker is not observed as stamped: %+v", o)
+	}
+	spec, err := h.m.resolver.Resolve(h.w.Template, h.w.Size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := RenderDeployment(h.m.cfg.withPlacement(true), h.w, spec).Spec.Template.Annotations[AnnotationSpecHash]; got != h.oldRev {
+		t.Fatalf("stamped render %s differs from the seeded template %s", got, h.oldRev)
+	}
+	if podPlacement(h.deployment()) != "new" {
+		t.Fatalf("seeded replacement placement = %s, want new", podPlacement(h.deployment()))
+	}
+	return h
+}
+
+func newDriftHarnessWith(t *testing.T, deploymentUID, pvcUID string, stamped bool) *driftHarness {
+	t.Helper()
 	cfg := dockerTestConfig()
+	if stamped {
+		p := placementConfig()
+		cfg.NodeSelector, cfg.Tolerations = p.NodeSelector, p.Tolerations
+		cfg.NewPlacementNodeSelector, cfg.NewPlacementTolerations = p.NewPlacementNodeSelector, p.NewPlacementTolerations
+	}
 	w := evidence(desiredDocker("w1"), m5Now)
 	w.DindMaintenance = &protocol.DindMaintenance{Phase: "recycling", Fenced: true, DeploymentUID: driftOldDeployment, PVCUID: driftOldPVC}
-	d := markedDeployment(t, cfg, w, true)
+	d := markedDeployment(t, cfg.withPlacement(stamped), w, true)
 	d.UID = types.UID(deploymentUID)
 	objects := []runtime.Object{d}
-	for _, p := range RenderPVCs(cfg, w, testSpec(t, w.Template, w.Size)) {
+	for _, obj := range livePVCs(t, cfg, w, stamped) {
+		p := obj.(*corev1.PersistentVolumeClaim)
 		p.UID, p.ResourceVersion = types.UID(p.Name), "1"
 		p.Status.Phase = corev1.ClaimBound
 		if p.Name == dindDataPVCName(w.ID) {
@@ -75,8 +112,15 @@ func (h *driftHarness) pinChange() {
 	h.m.cfg.RollTargetVersion = driftPinVersion
 }
 
-// addInFlightPeer adds a second worker at the new pin whose canary reservation is
-// still in flight, so no other worker can be admitted for an image turn.
+// clearPlacement clears workers.newPlacement: the stamped worker's desired
+// template returns to the global placement while its stamps stay.
+func (h *driftHarness) clearPlacement() {
+	h.t.Helper()
+	h.m.cfg = globalOnly(h.m.cfg)
+}
+
+// addInFlightPeer adds a second worker at the current desired render whose canary
+// reservation is still in flight, so no other worker can be admitted for a roll turn.
 func (h *driftHarness) addInFlightPeer() {
 	h.t.Helper()
 	peer := evidence(desiredDocker("w0"), m5Now)
@@ -148,8 +192,12 @@ func TestDinDRecyclingReplacementTemplateDriftHeld(t *testing.T) {
 		setup func(h *driftHarness)
 		// deploymentUID is the observed Deployment UID; empty means the replacement.
 		deploymentUID string
+		// placement seeds a stamped worker and clears newPlacement instead of
+		// changing the image pin.
+		placement bool
 	}{
 		{name: "no admission", setup: func(h *driftHarness) { h.addInFlightPeer() }},
+		{name: "cleared newPlacement, no admission", placement: true, setup: func(h *driftHarness) { h.addInFlightPeer() }},
 		{name: "busy", setup: func(h *driftHarness) { h.w.Busy = true }},
 		{name: "busy with ForceRoll", setup: func(h *driftHarness) { h.w.Busy, h.m.drain.ForceRoll = true, true }},
 		{name: "custody held", setup: func(h *driftHarness) { h.w.CustodyHeld = true }},
@@ -162,8 +210,17 @@ func TestDinDRecyclingReplacementTemplateDriftHeld(t *testing.T) {
 			if uid == "" {
 				uid = driftNewDeployment
 			}
-			h := newDriftHarness(t, uid, driftNewPVC)
-			h.pinChange()
+			var h *driftHarness
+			if c.placement {
+				h = newStampedDriftHarness(t, uid, driftNewPVC)
+				h.clearPlacement()
+			} else {
+				h = newDriftHarness(t, uid, driftNewPVC)
+				h.pinChange()
+			}
+			if h.wantHash() == h.oldRev {
+				t.Fatal("trigger did not change the desired hash")
+			}
 			c.setup(h)
 			for i := 0; i < 6; i++ {
 				h.tick()
@@ -198,7 +255,17 @@ func (h *driftHarness) addFlappingReadyPod(startedAgo time.Duration) {
 	if _, err := h.client.CoreV1().Pods(h.cfg.DockerNamespace).Create(context.Background(), ready, metav1.CreateOptions{}); err != nil {
 		h.t.Fatal(err)
 	}
-	version, nonce, uid, at := driftPinVersion, "new-registration", "new-pod", m5Now
+	// Register at the roll's actual target: an image turn targets the new pin, a
+	// placement-only turn keeps the current one.
+	var marker rollMarker
+	if err := json.Unmarshal([]byte(d.Annotations[annotationRoll]), &marker); err != nil {
+		h.t.Fatalf("replacement roll marker: %v", err)
+	}
+	version := h.m.cfg.RollTargetVersion
+	if version == "" || marker.TargetVersion != version || marker.Completed {
+		h.t.Fatalf("replacement reservation target %q (completed %v), want an open reservation for %q", marker.TargetVersion, marker.Completed, version)
+	}
+	nonce, uid, at := "new-registration", "new-pod", m5Now
 	h.w.RollEvidence.RegisteredVersion, h.w.RollEvidence.RegisterNonce, h.w.RollEvidence.PodUID, h.w.RollEvidence.HeartbeatAt = &version, &nonce, &uid, &at
 }
 
@@ -293,6 +360,24 @@ func TestDinDRecyclingReplacementTemplateDrift(t *testing.T) {
 			t.Fatal("pin change did not change the desired hash")
 		}
 		h.convergeThenSettle(func() bool { return h.templateHash() == want })
+	})
+
+	t.Run("cleared newPlacement converges to the global placement and then completes", func(t *testing.T) {
+		h := newStampedDriftHarness(t, driftNewDeployment, driftNewPVC)
+		h.clearPlacement()
+		want := h.wantHash()
+		if want == h.oldRev {
+			t.Fatal("clearing newPlacement did not change the desired hash")
+		}
+		h.convergeThenSettle(func() bool { return h.templateHash() == want })
+		if got := podPlacement(h.deployment()); got != "global" {
+			t.Fatalf("converged placement = %s, want global", got)
+		}
+		for _, n := range []string{dataPVCName(h.w.ID), nixPVCName(h.w.ID), dindDataPVCName(h.w.ID)} {
+			if !isStamped(npPVC(t, h.client, h.cfg.DockerNamespace, n)) {
+				t.Fatalf("stamp on %s was removed", n)
+			}
+		}
 	})
 
 	t.Run("generation-only drift converges and then completes", func(t *testing.T) {
