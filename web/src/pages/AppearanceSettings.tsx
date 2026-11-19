@@ -209,10 +209,23 @@ export function AppearanceSettings() {
     light: appearance.light_theme,
     dark: appearance.dark_theme,
     typeface: appearance.typeface,
+    // Strict: an absent field (older server) reads as off, never as a stored value.
+    sidebarMotion: appearance.sidebar_motion === true,
   };
 
+  // Optimistic local state for the sidebar-animations toggle: it flips at once and
+  // clears when the save settles (success re-reads the session, failure rolls back).
+  const [pendingMotion, setPendingMotion] = useState<boolean | null>(null);
+  const motionChecked = pendingMotion ?? current.sidebarMotion;
+
   const saveAppearance = async (
-    optimistic: { mode: string; light: string; dark: string; typeface: string },
+    optimistic: {
+      mode: string;
+      light: string;
+      dark: string;
+      typeface: string;
+      sidebarMotion: boolean;
+    },
     patch: UserSettingsPatch,
   ) => {
     setAppearanceError("");
@@ -227,6 +240,7 @@ export function AppearanceSettings() {
       await refresh(); // revert the optimistic stamp to the server's truth
     } finally {
       setAppearanceBusy(false);
+      setPendingMotion(null);
     }
   };
 
@@ -238,6 +252,10 @@ export function AppearanceSettings() {
     saveAppearance({ ...current, dark }, { dark_theme: dark });
   const pickTypeface = (typeface: string) =>
     saveAppearance({ ...current, typeface }, { typeface });
+  const pickMotion = (sidebarMotion: boolean) => {
+    setPendingMotion(sidebarMotion);
+    return saveAppearance({ ...current, sidebarMotion }, { sidebar_motion: sidebarMotion });
+  };
   const useInstanceDefaults = () =>
     saveAppearance(
       {
@@ -245,8 +263,16 @@ export function AppearanceSettings() {
         light: appearance.defaults.light_theme,
         dark: appearance.defaults.dark_theme,
         typeface: appearance.defaults.typeface,
+        // The server's compiled default, not a hardcoded off.
+        sidebarMotion: appearance.defaults.sidebar_motion === true,
       },
-      { appearance_mode: null, light_theme: null, dark_theme: null, typeface: null },
+      {
+        appearance_mode: null,
+        light_theme: null,
+        dark_theme: null,
+        typeface: null,
+        sidebar_motion: null,
+      },
     );
 
   // Which polarity currently paints (so the other picker is dimmed). An explicit
@@ -388,6 +414,24 @@ export function AppearanceSettings() {
               );
             })}
           </div>
+        </div>
+
+        {/* SIDEBAR ICON ANIMATIONS: opt-in, off by default; saved like the rest. */}
+        <div className="flex items-center justify-between gap-4 rounded-lg border border-edge bg-raised/60 px-4 py-3">
+          <div>
+            <p className="text-sm font-medium text-fg">Sidebar icon animations</p>
+            <p id="sidebar-motion-desc" className="mt-1 text-xs text-faint">
+              Plays a small one-shot animation on sidebar icons on hover, focus and
+              click. Respects your system&apos;s reduced-motion setting.
+            </p>
+          </div>
+          <Toggle
+            checked={motionChecked}
+            onChange={pickMotion}
+            label="Sidebar icon animations"
+            disabled={appearanceBusy}
+            aria-describedby="sidebar-motion-desc"
+          />
         </div>
 
         <div className="border-t border-edge pt-4">

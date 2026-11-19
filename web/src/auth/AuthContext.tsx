@@ -52,12 +52,20 @@ function fallbackAppearance(
     light_theme: DEFAULT_LIGHT_THEME,
     dark_theme: dark,
     typeface: "system",
-    overrides: { mode: null, light_theme: null, dark_theme: overrideDark, typeface: null },
+    sidebar_motion: false,
+    overrides: {
+      mode: null,
+      light_theme: null,
+      dark_theme: overrideDark,
+      typeface: null,
+      sidebar_motion: null,
+    },
     defaults: {
       mode: "dark",
       light_theme: DEFAULT_LIGHT_THEME,
       dark_theme: defaultDark,
       typeface: "system",
+      sidebar_motion: false,
     },
   };
 }
@@ -180,6 +188,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       light: nextAppearance.light_theme,
       dark: nextAppearance.dark_theme,
       typeface: nextAppearance.typeface,
+      sidebarMotion: nextAppearance.sidebar_motion === true,
     });
     // Absent field (older server) reads as unlocked, so no spurious banner.
     setVaultMetadataPending(false);

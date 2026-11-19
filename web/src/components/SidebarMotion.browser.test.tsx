@@ -204,10 +204,8 @@ describe.each(RAILS)("%s rail: gestures start real CSS animations", (rail) => {
     await cdp().send("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", clickCount: 1 });
     try {
       expect(m.link.matches(":active"), "link is :active").toBe(true);
-      expect(
-        allAnims(m.svg).some((a) => typeof CSSTransition !== "undefined" && a instanceof CSSTransition),
-        "the :active transition is running",
-      ).toBe(true);
+      // Held state, not the 60ms transition (which can finish before this check runs).
+      expect(getComputedStyle(m.svg).transform, "the :active dip is applied while held").not.toBe("none");
       for (const a of cssAnims(m.svg)) a.finish();
       await awaitRest(m.svg);
     } finally {

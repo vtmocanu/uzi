@@ -53,8 +53,15 @@ const baseAppearance = (
   light_theme: "hall",
   dark_theme: "ember",
   typeface: "system",
-  overrides: { mode: null, light_theme: null, dark_theme: null, typeface: null },
-  defaults: { mode: "dark", light_theme: "hall", dark_theme: "ember", typeface: "system" },
+  sidebar_motion: false,
+  overrides: { mode: null, light_theme: null, dark_theme: null, typeface: null, sidebar_motion: null },
+  defaults: {
+    mode: "dark",
+    light_theme: "hall",
+    dark_theme: "ember",
+    typeface: "system",
+    sidebar_motion: false,
+  },
   ...over,
 });
 
@@ -119,6 +126,7 @@ afterEach(() => {
   window.localStorage.clear();
   document.documentElement.removeAttribute("data-theme");
   document.documentElement.removeAttribute("data-font");
+  document.documentElement.removeAttribute("data-motion");
 });
 
 describe("AppearanceSettings — Appearance card (PRD #1167 'Lights on')", () => {
@@ -252,8 +260,27 @@ describe("AppearanceSettings — Appearance card (PRD #1167 'Lights on')", () =>
         light_theme: null,
         dark_theme: null,
         typeface: null,
+        sidebar_motion: null,
       }),
     );
+  });
+
+  it("'Use instance defaults' stamps the session default for sidebar motion, not a hardcoded off", async () => {
+    mockAuth(
+      baseUser,
+      baseAppearance({
+        sidebar_motion: false,
+        overrides: { mode: null, light_theme: null, dark_theme: null, typeface: null, sidebar_motion: false },
+        defaults: { mode: "dark", light_theme: "hall", dark_theme: "ember", typeface: "system", sidebar_motion: true },
+      }),
+    );
+    render(
+      <MemoryRouter>
+        <AppearanceSettings />
+      </MemoryRouter>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /use instance defaults/i }));
+    await waitFor(() => expect(document.documentElement.dataset.motion).toBe("on"));
   });
 
   it("gives each appearance option card a keyboard focus ring (WCAG 2.4.7)", async () => {
@@ -346,5 +373,64 @@ describe("AppearanceSettings — Demo mode card (PRD #886)", () => {
     await waitFor(() => expect(toggle().getAttribute("aria-checked")).toBe("true"));
     expect(row.textContent).toContain("Demo mode: On");
     expect(window.localStorage.getItem("uzi_demo_mode")).toBe("1");
+  });
+});
+
+describe("AppearanceSettings — sidebar icon animations toggle", () => {
+  const motionSwitch = () => screen.getByRole("switch", { name: "Sidebar icon animations" });
+  const renderPage = () =>
+    render(
+      <MemoryRouter>
+        <AppearanceSettings />
+      </MemoryRouter>,
+    );
+
+  it("renders off for a user with no override", () => {
+    renderPage();
+    expect(motionSwitch().getAttribute("aria-checked")).toBe("false");
+  });
+
+  it("renders off and stays off for an explicit false", () => {
+    mockAuth(
+      baseUser,
+      baseAppearance({
+        overrides: { mode: null, light_theme: null, dark_theme: null, typeface: null, sidebar_motion: false },
+      }),
+    );
+    renderPage();
+    expect(motionSwitch().getAttribute("aria-checked")).toBe("false");
+  });
+
+  it("flips on and stamps data-motion before the PUT resolves, then sends sidebar_motion:true", async () => {
+    let release!: (v: { settings: never }) => void;
+    mockApi.putMySettings.mockReturnValueOnce(
+      new Promise((resolve) => {
+        release = resolve as typeof release;
+      }),
+    );
+    renderPage();
+    fireEvent.click(motionSwitch());
+    // The PUT is still pending: the toggle and the attribute already reflect the choice.
+    expect(motionSwitch().getAttribute("aria-checked")).toBe("true");
+    expect(document.documentElement.dataset.motion).toBe("on");
+    expect(mockApi.putMySettings).toHaveBeenCalledWith({ sidebar_motion: true });
+    await act(async () => {
+      release({ settings: {} as never });
+    });
+    await waitFor(() => expect(refresh).toHaveBeenCalled());
+  });
+
+  it("rolls the toggle and attribute back and shows the error when the PUT fails", async () => {
+    mockApi.putMySettings.mockRejectedValueOnce(new ApiError(500, "boom"));
+    // refresh re-applies the server truth (off), as the real provider does.
+    refresh.mockImplementationOnce(async () => {
+      document.documentElement.dataset.motion = "off";
+    });
+    renderPage();
+    fireEvent.click(motionSwitch());
+    await waitFor(() => expect(screen.getByText(/boom/)).toBeTruthy());
+    await waitFor(() => expect(motionSwitch().getAttribute("aria-checked")).toBe("false"));
+    expect(document.documentElement.dataset.motion).toBe("off");
+    expect(refresh).toHaveBeenCalled();
   });
 });
