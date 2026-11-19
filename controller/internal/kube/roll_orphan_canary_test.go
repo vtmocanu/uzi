@@ -749,6 +749,13 @@ func TestOrphanRollCohortDelayedAdoptionAcrossRestart(t *testing.T) {
 // admit a drifted worker as a second canary while a withheld adoption patch for the
 // proven participant can commit.
 func TestOrphanRollCohortNoNewCanaryWhileProvenReservationsRemain(t *testing.T) {
+	t.Run("single owner", func(t *testing.T) { noNewCanaryWhileProven(t, false) })
+	// A canary of another owner in the same namespace must not exempt the pool from
+	// the hold (only a same owner/lane sibling-pool canary does).
+	t.Run("another owner's canary in the namespace", func(t *testing.T) { noNewCanaryWhileProven(t, true) })
+}
+
+func noNewCanaryWhileProven(t *testing.T, foreign bool) {
 	// w1 canary (promoted), w2 and w3 reserved, w4 drifted and unreserved.
 	m, c, workers, cordon := matrixFixture(t, 4)
 	m.cfg.RollConcurrency = 2
@@ -786,6 +793,9 @@ func TestOrphanRollCohortNoNewCanaryWhileProvenReservationsRemain(t *testing.T) 
 	// Restart: w3 now has fresh proof, so nothing in the pool is in flight.
 	o.m = matrixRestart(o.m)
 	o.prove(t, "w3")
+	if foreign {
+		o.addForeignCanary(t, "w9", "owner-B")
+	}
 	o.c.ClearActions()
 	_ = o.tick(t)
 	for _, line := range actionTrace(o.c) {
@@ -811,7 +821,12 @@ func TestOrphanRollCohortNoNewCanaryWhileProvenReservationsRemain(t *testing.T) 
 	for i := 0; i < 2; i++ {
 		_ = o.tick(t)
 	}
-	got := o.canaries(t)
+	var got []string
+	for _, name := range o.canaries(t) {
+		if name != "uzi-hw-w9" { // the foreign owner's own canary is not this cohort's
+			got = append(got, name)
+		}
+	}
 	if len(got) != 1 || got[0] == "uzi-hw-w4" {
 		t.Fatalf("canaries after the late request = %v, want exactly one participant canary", got)
 	}
@@ -1065,4 +1080,34 @@ func TestOrphanRollCohortCanaryLossEntryPoints(t *testing.T) {
 			}
 		}
 	})
+}
+
+// addForeignCanary adds a worker of another owner in the same namespace whose
+// Deployment carries that owner's incomplete canary reservation.
+func (o *orphanCohort) addForeignCanary(t *testing.T, id, owner string) {
+	t.Helper()
+	w := evidence(desired(id), m5Now)
+	w.RollEvidence.OwnerID = owner
+	d := deployedWorker(id, 0, "old")
+	cov, ok := coverageOf(w, o.m.cfg.Namespace)
+	if !ok {
+		t.Fatal("foreign worker has no coverage evidence")
+	}
+	// A complete, decodable reservation copied from a participant, re-owned.
+	mk := o.marker(t, "w2")
+	mk.Coverage, mk.Canary, mk.Completed = cov, true, false
+	raw, _ := json.Marshal(mk)
+	if d.Annotations == nil {
+		d.Annotations = map[string]string{}
+	}
+	d.Annotations[annotationRoll] = string(raw)
+	for _, obj := range physicalOld(t, d) {
+		if err := o.c.Tracker().Add(obj); err != nil {
+			t.Fatal(err)
+		}
+	}
+	o.workers = append(o.workers, w)
+	if got, err := decodeRoll(o.dep(t, id).Annotations[annotationRoll]); err != nil || got == nil || !got.Canary || got.Coverage.Owner != owner {
+		t.Fatalf("foreign canary reservation unreadable: %+v %v", got, err)
+	}
 }

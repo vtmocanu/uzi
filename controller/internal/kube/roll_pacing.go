@@ -872,9 +872,9 @@ func (m *Materializer) planPool(ctx context.Context, t *rollTick, pool []*rollEn
 		for _, e := range pool {
 			inPool[e] = true
 		}
-		owner, lane := pool[0].coverage.Owner, pool[0].coverage.Lane
+		ns, owner, lane := pool[0].ns, pool[0].coverage.Owner, pool[0].coverage.Lane
 		for _, p := range t.entries {
-			if !inPool[p] && p.marker != nil && p.marker.Canary && p.marker.Coverage.Owner == owner && p.marker.Coverage.Lane == lane {
+			if !inPool[p] && p.ns == ns && p.marker != nil && p.marker.Canary && p.marker.Coverage.Owner == owner && p.marker.Coverage.Lane == lane {
 				orphanReservation = false
 				break
 			}
