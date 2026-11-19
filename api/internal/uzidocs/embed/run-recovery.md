@@ -3619,10 +3619,14 @@ Once retirement is on, you may see:
   done, and a recurring one picks the issue up at its next fire).
 - **`retire kept: consumer_gate_busy`** on a terminal-preservation record: a
   run start was in progress, so retirement kept the ref and tries again later.
-- **A slightly slower worker report.** A finished run's report can wait, usually
-  under 4 seconds and at most 6, per gated step (at most two steps) before its follow-up runs
-  are created. Those follow-ups, and the MR it reports, are still recorded if the
-  worker drops the connection meanwhile.
+- **A potentially longer worker report.** Each shared-gate acquisition has a
+  six-second lock-wait timeout (at most two acquisitions per report). This does
+  not bound the report: after acquiring the gate, MR row-lock and follow-up
+  advisory-lock waits have no added deadline. They continue after the worker
+  disconnects so the reported MR and follow-ups are not dropped, but can retain
+  the handler and a database connection until the lock holder ends. A held
+  shared gate makes retirement keep the ref; other shared admissions remain
+  compatible with it.
 
 ### The worker side is built but switched off
 
