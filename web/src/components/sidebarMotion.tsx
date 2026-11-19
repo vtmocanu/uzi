@@ -5,9 +5,8 @@
 //    plus class hooks the CSS section "Sidebar icon motion" in index.css animates. At rest the
 //    glyph draws exactly like the icons.tsx original (a browser test rasterizes both and
 //    compares pixels).
-//      Split rule: an original sub-path becomes its own element only when its stroke touches no
-//      other stroke (BoardIcon's two columns, SkillIcon's two minis).
-//      Copy rule: otherwise the original stays byte-identical and visible at rest, and the
+//      Copy rule: the original path data stays byte-identical and visible at rest (splitting a
+//      path changes antialiasing, which the pixel comparison catches), and the
 //      moving part is a separate copy with inline opacity="0". While playing, the keyframes hide
 //      the affected original (class nm-orig) and show the copy, so nothing is drawn twice.
 //  - useNavIconMotion: the gesture hook. It only toggles the `nm-play` class on the row's svg;
@@ -50,14 +49,16 @@ export const SIDEBAR_MOTION_ICONS: Record<string, () => ReactElement> = {
         <path className="nm-door" d="M9 22V12h6v10" opacity="0" />
       </>,
     ),
-  // BoardIcon: the two column strokes touch nothing, so they split into moving elements.
+  // BoardIcon: the joined column path stays the rest glyph; while playing it hides and two
+  // rest-invisible column copies show and move.
   repos: () =>
     glyph(
       "repos",
       <>
         <rect x="3" y="3" width="18" height="18" rx="2" />
-        <path className="nm-col-a" d="M8 7v10" />
-        <path className="nm-col-b" d="M16 7v6" />
+        <path className="nm-orig" d="M8 7v10M16 7v6" />
+        <path className="nm-col-a" d="M8 7v10" opacity="0" />
+        <path className="nm-col-b" d="M16 7v6" opacity="0" />
       </>,
     ),
   // ActivityIcon: a pathLength=1 copy retraces by dash offset.
@@ -125,7 +126,8 @@ export const SIDEBAR_MOTION_ICONS: Record<string, () => ReactElement> = {
         <path d="M9 17h6" />
       </>,
     ),
-  // SkillIcon: the two small sparkles touch neither the big one nor each other, so they split.
+  // SkillIcon: the big sparkle moves itself; the joined small-sparkle path stays the rest glyph
+  // and, while playing, hides behind two rest-invisible copies that twinkle.
   skills: () =>
     glyph(
       "skills",
@@ -134,18 +136,19 @@ export const SIDEBAR_MOTION_ICONS: Record<string, () => ReactElement> = {
           className="nm-star"
           d="m12 3-1.9 5.8a2 2 0 0 1-1.3 1.3L3 12l5.8 1.9a2 2 0 0 1 1.3 1.3L12 21l1.9-5.8a2 2 0 0 1 1.3-1.3L21 12l-5.8-1.9a2 2 0 0 1-1.3-1.3z"
         />
-        <path className="nm-mini" d="M5 3v4M3 5h4" />
-        <path className="nm-mini nm-mini2" d="M19 17v4M17 19h4" />
+        <path className="nm-orig" d="M5 3v4M3 5h4M19 17v4M17 19h4" />
+        <path className="nm-mini" d="M5 3v4M3 5h4" opacity="0" />
+        <path className="nm-mini nm-mini2" d="M19 17v4M17 19h4" opacity="0" />
       </>,
     ),
-  // ServerIcon: the original LED path stays; accent LED copies blink over it.
+  // ServerIcon: the original LED path hides while playing; accent LED copies blink alone.
   workers: () =>
     glyph(
       "workers",
       <>
         <rect x="2" y="4" width="20" height="7" rx="2" />
         <rect x="2" y="13" width="20" height="7" rx="2" />
-        <path d="M6 7.5h.01M6 16.5h.01" />
+        <path className="nm-orig" d="M6 7.5h.01M6 16.5h.01" />
         <path className="nm-led nm-led1" d="M6 7.5h.01" opacity="0" />
         <path className="nm-led nm-led2" d="M6 16.5h.01" opacity="0" />
       </>,
@@ -209,8 +212,12 @@ function motionAllowed(): boolean {
   return true;
 }
 
+// Only CSS keyframe animations count: the 60ms :active press transition on the svg is a
+// CSSTransition and must not keep the play class alive.
 function animationsLeft(svg: SVGElement): boolean {
-  return typeof svg.getAnimations === "function" ? svg.getAnimations({ subtree: true }).length > 0 : false;
+  if (typeof svg.getAnimations !== "function") return false;
+  const isCss = (a: Animation) => typeof CSSAnimation === "undefined" || a instanceof CSSAnimation;
+  return svg.getAnimations({ subtree: true }).some(isCss);
 }
 
 // animationend/animationcancel bubble from the parts. The class goes once none of the svg's

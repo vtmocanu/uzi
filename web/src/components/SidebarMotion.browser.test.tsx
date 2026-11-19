@@ -3,27 +3,13 @@ import "../index.css";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { cdp, userEvent } from "vitest/browser";
 import { act, cleanup, render } from "@testing-library/react";
-import { useEffect, type ComponentType, type ReactElement, type SVGProps } from "react";
+import { useEffect, type ReactElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { MemoryRouter, useNavigate, type NavigateFunction } from "react-router-dom";
 import { NavItem } from "./AppShell";
 import { NAV_SECTIONS, type NavDef } from "./navItems";
 import { SIDEBAR_MOTION_ICONS } from "./sidebarMotion";
-import {
-  ActivityIcon,
-  BoardIcon,
-  BookIcon,
-  BotIcon,
-  BugIcon,
-  ChatIcon,
-  ClockIcon,
-  GearIcon,
-  HomeIcon,
-  ScaleIcon,
-  ServerIcon,
-  ShieldIcon,
-  SkillIcon,
-} from "./icons";
+import { ClockIcon } from "./icons";
 import type { HealthDoc } from "../lib/api";
 
 // Issue #4510: the opt-in animated sidebar icons, against the real stylesheet in Chromium.
@@ -44,6 +30,19 @@ async function emulateReducedMotion(reduce: boolean) {
   await cdp().send("Emulation.setEmulatedMedia", {
     features: [{ name: "prefers-reduced-motion", value: reduce ? "reduce" : "" }],
   });
+}
+
+// Pointer coordinates for CDP mouse events are page coordinates; the test runs in an iframe.
+function pagePoint(el: Element) {
+  const r = el.getBoundingClientRect();
+  const frame = window.frameElement as HTMLElement | null;
+  const f = frame?.getBoundingClientRect();
+  // The runner may scale the iframe: map iframe-local CSS px to the page.
+  const scale = frame && frame.offsetWidth ? (f?.width ?? 0) / frame.offsetWidth : 1;
+  return {
+    x: (f?.x ?? 0) + (r.x + r.width / 2) * scale,
+    y: (f?.y ?? 0) + (r.y + r.height / 2) * scale,
+  };
 }
 
 const frames = async (n = 2) => {
@@ -157,8 +156,14 @@ describe.each(RAILS)("%s rail: gestures start real CSS animations", (rail) => {
         expect(allAnims(m.svg), `${def.key} ${name} rest`).toHaveLength(0);
         // The same gesture again runs again.
         if (name === "focus") {
-          m.link.blur();
+          // After a scripted blur Tab continues from the link's sequential focus position and
+          // would not land on it again. Park focus on a sentinel that precedes the row, then Tab.
+          const sentinel = document.createElement("button");
+          document.body.prepend(sentinel);
+          sentinel.focus();
           await userEvent.tab();
+          expect(document.activeElement, `${def.key} focus repeat lands on the link`).toBe(m.link);
+          sentinel.remove();
         } else {
           await gesture(m);
         }
@@ -188,7 +193,22 @@ describe.each(RAILS)("%s rail: gestures start real CSS animations", (rail) => {
     }
   });
 
-  it("plays nothing with data-motion off", { timeout: 120000 }, async () => {
+  it("clears the play class when the last animation ends during a press (the :active transition does not count)", { timeout: 60000 }, async () => {
+    const m = mount("overview", rail);
+    await hover(m.link);
+    expect(cssAnims(m.svg).length).toBeGreaterThan(0);
+    const { x, y } = pagePoint(m.link);
+    await cdp().send("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", clickCount: 1 });
+    try {
+      expect(m.link.matches(":active"), "link is :active").toBe(true);
+      for (const a of cssAnims(m.svg)) a.finish();
+      await awaitRest(m.svg);
+    } finally {
+      await cdp().send("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1 });
+    }
+  });
+
+  it("plays nothing with data-motion off",{ timeout: 120000 }, async () => {
     setMotion("off");
     for (const def of DEFS) {
       const m = mount(def.key, rail);
@@ -198,6 +218,18 @@ describe.each(RAILS)("%s rail: gestures start real CSS animations", (rail) => {
       await userEvent.tab();
       expect(allAnims(m.svg), def.key).toHaveLength(0);
       expect(m.svg.classList.contains(PLAY), def.key).toBe(false);
+      // Press and hold: the :active dip is part of the motion setting, so with it off the svg
+      // neither transforms nor transitions while the pointer is down.
+      const { x, y } = pagePoint(m.link);
+      await cdp().send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
+      await cdp().send("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", clickCount: 1 });
+      try {
+        expect(m.link.matches(":active"), `${def.key} link is :active`).toBe(true);
+        expect(getComputedStyle(m.svg).transform, `${def.key} held`).toBe("none");
+        expect(allAnims(m.svg), `${def.key} held animations`).toHaveLength(0);
+      } finally {
+        await cdp().send("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1 });
+      }
       cleanup();
       await userEvent.unhover(document.body);
     }
@@ -337,23 +369,6 @@ describe("static icons never animate", () => {
   });
 });
 
-// The live icons.tsx components, not copies: a future glyph change must fail here loudly.
-const ORIGINALS: Record<string, ComponentType<SVGProps<SVGSVGElement>>> = {
-  overview: HomeIcon,
-  repos: BoardIcon,
-  runs: ActivityIcon,
-  findings: BugIcon,
-  schedules: ClockIcon,
-  chat: ChatIcon,
-  agents: BotIcon,
-  skills: SkillIcon,
-  workers: ServerIcon,
-  judge: ScaleIcon,
-  settings: GearIcon,
-  admin: ShieldIcon,
-  docs: BookIcon,
-};
-
 const SIZE = 96;
 async function rasterize(markup: string): Promise<Uint8ClampedArray> {
   const holder = document.createElement("div");
@@ -384,10 +399,12 @@ async function rasterize(markup: string): Promise<Uint8ClampedArray> {
 
 describe("rest geometry", () => {
   it("each sidebar glyph rasterizes pixel-identically to its icons.tsx original", { timeout: 60000 }, async () => {
-    expect(Object.keys(ORIGINALS).sort()).toEqual(DEFS.map((d) => d.key).sort());
+    // The original is each live NAV_SECTIONS def.icon (the icons.tsx element the sidebar used
+    // before this feature), so swapping an icon in navItems.tsx without updating the sidebar
+    // glyph fails here.
+    expect(Object.keys(SIDEBAR_MOTION_ICONS).sort()).toEqual(DEFS.map((d) => d.key).sort());
     for (const def of DEFS) {
-      const Original = ORIGINALS[def.key]!;
-      const a = await rasterize(renderToStaticMarkup(<Original />));
+      const a = await rasterize(renderToStaticMarkup(def.icon as ReactElement));
       const b = await rasterize(renderToStaticMarkup(SIDEBAR_MOTION_ICONS[def.key]!()));
       let inked = 0;
       for (let i = 0; i < a.length; i += 4) if (a[i] !== 255 || a[i + 1] !== 255 || a[i + 2] !== 255) inked++;
@@ -408,8 +425,9 @@ describe("rest geometry", () => {
 describe("stationary geometry while a part moves", () => {
   const transformKeyframes = (a: Animation) =>
     (a.effect as KeyframeEffect).getKeyframes().some((k) => "transform" in k && k.transform !== undefined);
+  // getBoundingClientRect includes CSS transforms; getBBox ignores them and could not fail here.
   const box = (el: SVGGraphicsElement) => {
-    const b = el.getBBox();
+    const b = el.getBoundingClientRect();
     return [b.x, b.y, b.width, b.height];
   };
   const q = (svg: Element, sel: string) => svg.querySelector(sel) as SVGGraphicsElement;
@@ -426,7 +444,8 @@ describe("stationary geometry while a part moves", () => {
       const minuteAnim = cssAnims(m.svg).find((a) => a.animationName === "nm-minute")!;
       expect(minuteAnim, "minute animation").toBeDefined();
       expect(endTimeOf(minuteAnim)).toBe(1800);
-      expect(minuteAnim.effect!.getComputedTiming().easing).toMatch(/^steps\(12/);
+      // animation-timing-function is per keyframe, not the effect-level easing.
+      expect(getComputedStyle(minute).animationTimingFunction).toContain("steps(12");
       expect(hour.getAnimations().some(transformKeyframes), "hour transform animation").toBe(false);
 
       let prev = "";

@@ -518,8 +518,8 @@ html[data-pinned-block] {
    it is not outranked by Tailwind's layered utilities. Every rule sits inside the
    no-preference media query AND under the root `data-motion="on"` attribute (stamped from the
    user's Appearance setting), so with the setting off, or under prefers-reduced-motion,
-   nothing here matches and no animation runs; turning either on mid-flight cancels a play in
-   progress. All animations are finite and use fill-mode none: after the last frame the svg
+   nothing here matches and no animation runs; turning the setting off, or reduced motion on,
+   mid-flight cancels a play in progress. All animations are finite and use fill-mode none: after the last frame the svg
    is back to its plain rest glyph. Each icon's total (parts, repeats, delays) is 0.7s to 1.8s.
    Only svg parts move; the icon's wrapper span and the collapsed-rail dots never transform.
    Where a glyph has a moving copy (class nm-orig hides the original, the copy starts
@@ -531,7 +531,6 @@ html[data-pinned-block] {
   :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="overview"] { --nm-d: 1100ms; }
   :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="repos"] { --nm-d: 830ms; }
   :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="runs"] { --nm-d: 1700ms; }
-  :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="findings"] { --nm-d: 780ms; }
   :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="schedules"] { --nm-d: 1800ms; }
   :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="chat"] { --nm-d: 700ms; }
   :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="agents"] { --nm-d: 800ms; }
@@ -553,11 +552,12 @@ html[data-pinned-block] {
     30%, 65% { opacity: 1; fill: rgb(var(--brand)); stroke: rgb(var(--brand)); }
   }
 
-  /* Repos 830ms spring: one board column dips, the other stretches. */
+  /* Repos 830ms spring: one board column dips, the other stretches (copies; the joined original hides). */
+  :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="repos"] .nm-orig { animation: nm-hide var(--nm-d) linear; }
   :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="repos"] .nm-col-a { transform-box: fill-box; transform-origin: 50% 50%; animation: nm-col-a var(--nm-d) cubic-bezier(.34, 1.56, .64, 1); }
   :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="repos"] .nm-col-b { transform-box: fill-box; transform-origin: 50% 50%; animation: nm-col-b var(--nm-d) cubic-bezier(.34, 1.56, .64, 1); }
-  @keyframes nm-col-a { 50% { transform: translateY(2px); } }
-  @keyframes nm-col-b { 50% { transform: translateY(-2px) scaleY(1.3); } }
+  @keyframes nm-col-a { 0%, 100% { opacity: 1; } 50% { opacity: 1; transform: translateY(2px); } }
+  @keyframes nm-col-b { 0%, 100% { opacity: 1; } 50% { opacity: 1; transform: translateY(-2px) scaleY(1.3); } }
 
   /* Runs 1700ms ease-in-out: the activity line retraces (a pathLength=1 copy). */
   :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="runs"] .nm-orig { animation: nm-hide var(--nm-d) linear; }
@@ -591,12 +591,18 @@ html[data-pinned-block] {
 
   /* Skills 900ms spring: the big sparkle twists, the small ones twinkle (the second 190ms late). */
   :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="skills"] .nm-star { transform-box: view-box; transform-origin: 12px 12px; animation: nm-twist var(--nm-d) cubic-bezier(.34, 1.56, .64, 1); }
-  :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="skills"] .nm-mini { transform-box: fill-box; transform-origin: 50% 50%; animation: nm-twinkle 710ms ease-in-out; }
-  :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="skills"] .nm-mini2 { animation-delay: 190ms; }
+  :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="skills"] .nm-orig { animation: nm-hide var(--nm-d) linear; }
+  :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="skills"] .nm-mini { transform-box: fill-box; transform-origin: 50% 50%; animation: nm-twinkle var(--nm-d) ease-in-out; }
+  :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="skills"] .nm-mini2 { animation-name: nm-twinkle2; }
   @keyframes nm-twist { 50% { transform: rotate(25deg) scale(1.1); } }
-  @keyframes nm-twinkle { 30% { opacity: .2; transform: scale(.5); } 70% { opacity: 1; transform: scale(1.3); } }
+  /* Both copies span the whole 900ms (the original is hidden that long); the second twinkles
+     190ms after the first, so it holds still until 21%. */
+  @keyframes nm-twinkle { 0%, 79%, 100% { opacity: 1; transform: none; } 24% { opacity: .2; transform: scale(.5); } 55% { opacity: 1; transform: scale(1.3); } }
+  @keyframes nm-twinkle2 { 0%, 21%, 100% { opacity: 1; transform: none; } 45% { opacity: .2; transform: scale(.5); } 76% { opacity: 1; transform: scale(1.3); } }
 
-  /* Workers 2 x 830ms steps: the two rack LEDs blink in the accent, one after the other. */
+  /* Workers 2 x 830ms steps: the two rack LEDs blink in the accent, one after the other
+     (the original LED path hides for the whole play, so only the copies show). */
+  :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="workers"] .nm-orig { animation: nm-hide var(--nm-d) linear; }
   :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="workers"] .nm-led { stroke: rgb(var(--brand)); stroke-width: 4; animation: nm-led 830ms steps(1, end); }
   :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="workers"] .nm-led2 { animation-delay: 830ms; }
   @keyframes nm-led { 0%, 50% { opacity: 1; } 51%, 100% { opacity: 0; } }
