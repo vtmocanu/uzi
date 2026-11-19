@@ -94,9 +94,10 @@ func TestManualCompletedReservationNextAdmission(t *testing.T) {
 					// canary remains healthy in its own pool, but it fences no
 					// Deployment in the xy pool, where w2's incomplete
 					// reservation has no canary: that pool holds instead of
-					// admitting w3 as a fresh canary.
+					// admitting w3 as a fresh canary. The hold names no worker (#4467: a
+					// pool-level reason carries no synthetic worker identity).
 					p := outcomes["w3"]
-					if len(patches) != 0 || r != nil || p == nil || p.BlockingReason == nil || *p.BlockingReason != "pool participant unresolved" || p.BlockingWorkerID == nil || *p.BlockingWorkerID != "missing-canary" {
+					if len(patches) != 0 || r != nil || p == nil || p.BlockingReason == nil || *p.BlockingReason != "participant reservation without canary; explicit recovery required" || p.BlockingWorkerID != nil {
 						t.Fatalf("missing-y control did not hold the canary-less pool: patches=%v marker=%+v outcome=%+v", patches, r, p)
 					}
 					if p.CanaryID != nil {
