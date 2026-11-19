@@ -926,6 +926,13 @@ jobs:
           class: repo-lint
           module: api
       - uses: ./.github/actions/setup-task
+      # PRDs may skip validate-web, but their artifact links must still be checked.
+      # This checker uses only Node built-ins; no npm install or cache is needed.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7
+        with:
+          node-version: "26"
+      - name: Check documentation links and metadata
+        run: task check-docs:web
       - name: Install shellcheck (pinned, sha256-verified)
         run: |
           set -euo pipefail
@@ -1141,6 +1148,12 @@ jobs:
               # the web bundles the assembled CHANGELOG.md, not changelog.d. Dynamic reader
               # caveat (rollupbench text pool): scripts/ci-safe-paths.test.rb.
               - added|modified: 'changelog.d/**'
+              # PRDs and mockups: check-docs:web runs unconditionally in lint-repo.
+              - added|modified: 'prds/**'
+            # Direct component-test inputs within otherwise safe roots. Keep this
+            # exact-path inventory aligned with the reader audit in ci-safe-paths.test.rb.
+            component_consumed:
+              - 'prds/done/1230-semantic-completion-contract.md'
             api:
               - 'api/**'
             web:
@@ -1175,22 +1188,24 @@ jobs:
         env:
           ALL_COUNT: ${{ steps.filter.outputs.all_count }}
           SAFE_COUNT: ${{ steps.filter.outputs.component_safe_count }}
+          CONSUMED_COUNT: ${{ steps.filter.outputs.component_consumed_count }}
           EXPECTED_COUNT: ${{ github.event.pull_request.changed_files }}
           # The component_safe roots, space-separated, without the trailing /**.
-          SAFE_ROOTS: .agents/skills/uzi-lander changelog.d
+          SAFE_ROOTS: .agents/skills/uzi-lander changelog.d prds
         run: |
           # Only a nonempty, entirely allowlisted diff authorizes skipping.
           # Numeric sentinel avoids Actions' case-insensitive string comparisons;
           # missing/malformed outputs or a failed changes job keep the full run.
           # The PR count also rejects a truncated API file list (limit: 3000).
           skip=0
-          if [[ "$ALL_COUNT" =~ ^[1-9][0-9]*$ && "$SAFE_COUNT" == "$ALL_COUNT" && "$EXPECTED_COUNT" == "$ALL_COUNT" ]]; then
-            # test-agent's Codex pin scan (agent/test/codex-pins.ts) greps every tracked
-            # file. Any pin prefix under a safe root vetoes the skip so that test still
-            # judges it; only a confirmed no-match (rc 1) skips, and a git error runs full CI.
+          if [[ "$ALL_COUNT" =~ ^[1-9][0-9]*$ && "$SAFE_COUNT" == "$ALL_COUNT" && "$EXPECTED_COUNT" == "$ALL_COUNT" && "$CONSUMED_COUNT" == 0 ]]; then
+            # Match test-agent's Codex pin scan coverage (agent/test/codex-pins.ts):
+            # historical PRDs/fragments are excluded, but a live pin under any other
+            # safe root vetoes the skip. ci-safe-paths.test.rb guards exclusion drift.
+            # Only a confirmed no-match (rc 1) skips; a git error runs full CI.
             read -r -a roots <<< "$SAFE_ROOTS"
             rc=0
-            git grep -q -I -F -e '/opt/uzi-codex/' -e 'codex-cli ' -e 'Codex worker uses runtime ' -- "${roots[@]}" || rc=$?
+            git grep -q -I -F -e '/opt/uzi-codex/' -e 'codex-cli ' -e 'Codex worker uses runtime ' -- "${roots[@]}" ':(exclude)changelog.d/**' ':(exclude)prds/**' || rc=$?
             if [[ "$rc" == 1 ]]; then skip=1; fi
           fi
           echo "skip_components=$skip" >> "$GITHUB_OUTPUT"
