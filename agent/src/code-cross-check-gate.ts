@@ -119,11 +119,11 @@ export class CodeCrossCheckGate {
     if (!this.current(row)) return { action: "proceed" };
     // With no implementation iteration left the findings are advisory only: skip the repair and fall
     // through to the empty finalizer, which records every finding as not_reported. The same holds
-    // when every finding is a verification caveat (exact `Coverage uncertainty:` title prefix, the
+    // when every finding is a minor verification caveat (exact `Coverage uncertainty:` title prefix, the
     // pr-description grouping rule): it names checks the read-only checker could not perform, so a
     // repair turn could change nothing.
     if (first && row.findings.length > 0 && row.finalized_at == null && opts.repairAvailable !== false
-      && !row.findings.every(f => f.title.startsWith(COVERAGE_CAVEAT_PREFIX))) {
+      && !row.findings.every(f => f.severity === "minor" && f.title.startsWith(COVERAGE_CAVEAT_PREFIX))) {
       this.repairSignal = new AbortController();
       this.active = row;
       return { action: "repair", followUp: buildAutomaticRevisionPrompt("code", { findings: row.findings }) };

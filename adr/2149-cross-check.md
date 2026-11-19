@@ -409,7 +409,7 @@ hashes are repinned; frozen replay inputs and baseline hashes are unchanged.
 The brief above still files a minor `Coverage uncertainty:` finding for a
 criterion that needs a run result, and every finding opened the one repair turn,
 so a caveat-only report kept costing a lead iteration that could only record
-declines. The worker's code gate now skips the repair when every finding's raw
+declines. The worker's code gate now skips the repair when every finding is minor and its raw
 title starts exactly with `Coverage uncertainty:` (the same match the merge
 request section uses to group caveats) and finalizes through the existing empty
 dispositions call, recording each caveat as not reported, as it already does

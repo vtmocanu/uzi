@@ -241,3 +241,11 @@ for (const findings of [
     assert.deepEqual(r.batches, []);
   });
 }
+
+for (const severity of ["major", "critical"] as const) {
+  it(`review: a ${severity} finding cannot skip repair solely through the caveat prefix`, async () => {
+    const r = rig({ findings: [{ ...finding, severity, title: "Coverage uncertainty: graded finding" }] });
+    assert.equal((await r.gate.done()).action, "repair");
+    assert.deepEqual(r.batches, []);
+  });
+}

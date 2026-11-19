@@ -1034,7 +1034,7 @@ and it is not re-checked.
 
 With findings, the lead gets one repair turn and reports a disposition per
 finding through `report_cross_check_dispositions` (worker-authenticated,
-write-once). When every finding is a `Coverage uncertainty:` verification
+write-once). When every finding is a minor `Coverage uncertainty:` verification
 caveat, or no implementation iteration is left, no repair turn runs and
 the worker finalizes with an empty batch, so each finding is recorded as
 not reported (`CodeCrossCheckGate.done` in
