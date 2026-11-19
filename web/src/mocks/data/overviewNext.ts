@@ -1,4 +1,5 @@
 import type { Run, RunMessage, Worker } from "../../lib/api";
+import { builtinSizeSpec } from "./workerSizes";
 import { minsAgo, minsAhead } from "./time";
 import { mockRuns } from "./runs";
 import { mockWorkers } from "./workers";
@@ -367,6 +368,7 @@ export function overviewNextOwnerWorkers(): Worker[] {
       name: "ephemeral-4b2d9e70",
       kind: "hosted",
       hosted_size: "l-highmem",
+      hosted_size_spec: builtinSizeSpec("l-highmem"),
       ephemeral: true,
       busy: true,
       active_runs: 1,
@@ -387,6 +389,7 @@ export function overviewNextOwnerWorkers(): Worker[] {
       name: "base.l-highmem-b54d",
       kind: "hosted",
       hosted_size: "l-highmem",
+      hosted_size_spec: builtinSizeSpec("l-highmem"),
       busy: true,
       active_runs: 1,
       max_concurrent_runs: 2,
@@ -410,6 +413,7 @@ export function overviewNextOwnerWorkers(): Worker[] {
       name: "ephemeral-9e17a0d3",
       kind: "hosted",
       hosted_size: "l-highmem",
+      hosted_size_spec: builtinSizeSpec("l-highmem"),
       ephemeral: true,
       max_concurrent_runs: 1,
       ephemeral_lease_expires_at: minsAhead(75),

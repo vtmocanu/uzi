@@ -3,6 +3,7 @@ import { api, type AppSettings, type SettingSource, type SettingsResponse } from
 import { errorMessage } from "../../lib/apiError";
 import { Alert, Button, Card, SectionTitle } from "../../components/ui";
 import { SettingControl } from "./SettingControl";
+import type { NamedWorkerSize } from "../../lib/workerSizes";
 
 // EphemeralWorkersCard is the admin surface for the ephemeral worker
 // auto-provisioning instance kill-switch (PRD #529 / #649 M1). A single-bool card
@@ -16,11 +17,14 @@ export function EphemeralWorkersCard({
   settings,
   sources = {},
   defaults,
+  sizeOptions,
   onSaved,
 }: {
   settings: AppSettings;
   sources?: Record<string, SettingSource>;
   defaults?: Record<string, string>;
+  /** The worker sizes the default-size selector offers (PRD #4213), lifted from Admin → Workers. */
+  sizeOptions?: readonly NamedWorkerSize[];
   onSaved: (resp: SettingsResponse) => void;
 }) {
   const [enabled, setEnabled] = useState(settings.ephemeral_workers_enabled === "true");
@@ -104,6 +108,7 @@ export function EphemeralWorkersCard({
         value={settings.ephemeral_default_size ?? ""}
         source={sources["ephemeral_default_size"]}
         defaultValue={defaults?.["ephemeral_default_size"]}
+        sizeOptions={sizeOptions}
         onSaved={onSaved}
       />
       <SettingControl

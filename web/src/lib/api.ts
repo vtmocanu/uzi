@@ -32,6 +32,9 @@ import type {
   AdminMaintenance,
   MaintenanceState,
   AdminDockerAllowlistRepos,
+  AdminWorkerSizes,
+  AdminWorkerSizeWrite,
+  WorkerSizeSpec,
   AdminCodexRateLimits,
   AdminRateLimits,
   AdminUsage,
@@ -1306,6 +1309,14 @@ const realApi = {
   // Hosted workers (PRD #58). Deletion rides deleteWorker above — the route is
   // kind-blind on purpose, so there is no hosted delete to add here.
   hostedConfig: () => request<HostedConfig>("GET", "/workers/hosted/config"),
+  // Admin worker sizes (PRD #4213). The read is open to every admin; the edit and reset are
+  // cookie-only writes the api refuses with 409 (read_only_reason) until a fresh controller
+  // report advertises admin-size support, and with 400 { fields } on a value it cannot save.
+  getAdminWorkerSizes: () => request<AdminWorkerSizes>("GET", "/admin/worker-sizes"),
+  updateAdminWorkerSize: (name: string, spec: WorkerSizeSpec) =>
+    request<AdminWorkerSizeWrite>("PUT", `/admin/worker-sizes/${encodeURIComponent(name)}`, spec),
+  resetAdminWorkerSize: (name: string) =>
+    request<AdminWorkerSizeWrite>("POST", `/admin/worker-sizes/${encodeURIComponent(name)}/reset`),
   /**
    * Provision a hosted worker: one the CONTROLLER runs in the cluster.
    *

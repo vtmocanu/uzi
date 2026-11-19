@@ -70,6 +70,7 @@ const ADMIN_SETTINGS_ANCHORS: { id: string; label: string; keywords: string[] }[
 // keywords keep the old and new vocabulary findable). In page order.
 const ADMIN_WORKERS_ANCHORS: { id: string; label: string; keywords: string[] }[] = [
   { id: "docker-allowlist", label: "Docker workers", keywords: ["docker", "allowlist", "repos"] },
+  { id: "worker-sizes", label: "Worker sizes", keywords: ["sizes", "cpu", "memory", "disk", "resources", "ceilings", "quota"] },
   { id: "hosted-worker-quota", label: "Hosted worker quota", keywords: ["workers", "quota", "limit", "default size", "size"] },
   { id: "custody-hold-limit", label: "Custody hold limit", keywords: ["custody", "recovery", "hold"] },
   { id: "ephemeral-workers", label: "Ephemeral workers", keywords: ["workers", "run-bound", "autoscale", "cap", "per-user", "lease", "ephemeral size", "default size"] },

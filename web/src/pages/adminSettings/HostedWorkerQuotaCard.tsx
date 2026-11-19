@@ -3,6 +3,7 @@ import { api, type AppSettings, type SettingSource, type SettingsResponse } from
 import { errorMessage } from "../../lib/apiError";
 import { Alert, Button, Card, Field, Input, SectionTitle } from "../../components/ui";
 import { SettingControl } from "./SettingControl";
+import type { NamedWorkerSize } from "../../lib/workerSizes";
 
 // Mirrors validateHostedWorkerQuota in settings_hosted.go; the API rechecks every write.
 function quotaError(value: string): string | null {
@@ -17,10 +18,12 @@ function displayQuota(value: string): string {
   return quotaError(value) === null ? String(Number(value.trim())) : value;
 }
 
-export function HostedWorkerQuotaCard({ settings, sources = {}, defaults, onSaved }: {
+export function HostedWorkerQuotaCard({ settings, sources = {}, defaults, sizeOptions, onSaved }: {
   settings: AppSettings;
   sources?: Record<string, SettingSource>;
   defaults?: Record<string, string>;
+  /** The worker sizes the default-size selector offers (PRD #4213), lifted from Admin → Workers. */
+  sizeOptions?: readonly NamedWorkerSize[];
   onSaved: (resp: SettingsResponse) => void;
 }) {
   const savedValue = displayQuota(settings.hosted_worker_quota);
@@ -86,6 +89,7 @@ export function HostedWorkerQuotaCard({ settings, sources = {}, defaults, onSave
         value={settings.hosted_default_size ?? ""}
         source={sources["hosted_default_size"]}
         defaultValue={defaults?.["hosted_default_size"]}
+        sizeOptions={sizeOptions}
         onSaved={onSaved}
       />
     </Card>

@@ -11,7 +11,7 @@ import {
   type VaultStatus,
   type VaultDisableResponse,
 } from "../../lib/api";
-import { WORKER_SIZES } from "../../lib/workerSizes";
+import { BUILTIN_WORKER_SIZE_NAMES } from "../../lib/workerSizes";
 import { ApiError } from "../../lib/apiError";
 import { trimAllowlistToken, uuidIdentity } from "../../lib/dockerAllowlist";
 import {
@@ -1148,8 +1148,10 @@ export const settingsApi = {
           if (m0) for (const m of m0[1].matchAll(new RegExp(comp, "g"))) seconds += Number(m[1]) * units[m[2]];
           if (!m0) throw new ApiError(400, 'ephemeral_lease: must be a duration like "30m"');
           if (seconds > 2 * 3600) throw new ApiError(400, "ephemeral_lease: must be between 0s and 2h");
-        } else if (!(WORKER_SIZES as readonly string[]).includes(t)) {
-          throw new ApiError(400, `${key}: must be one of ${WORKER_SIZES.join(", ")}`);
+        } else if (!BUILTIN_WORKER_SIZE_NAMES.includes(t)) {
+          // Builtin names only, as the api's settings write is until admin-added sizes land
+          // (PRD #4213); the text matches its "must be one of: s, m, l, l-highmem".
+          throw new ApiError(400, `${key}: must be one of: ${BUILTIN_WORKER_SIZE_NAMES.join(", ")}`);
         }
         explicitWorkerKeys.add(key);
         (nonSecret as Record<string, string>)[key] = t;
