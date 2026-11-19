@@ -285,7 +285,8 @@ for scenario in success optional retained-missing-run retained-missing-closure-r
   : > "$case_dir/expected"
   for pkg in "${expected_pkgs[@]}"; do
     limit=10m
-    if [ "$pkg" = store ] || [ "$pkg" = handler ]; then limit=20m; fi
+    if [ "$pkg" = store ]; then limit=30m; fi
+    if [ "$pkg" = handler ]; then limit=20m; fi
     if [ "$pkg" = workersvc ]; then limit=45m; fi
     printf '%s\ttest\t-buildvcs=false\t-count=1\t-v\t-race\t-p\t1\t-timeout\t%s\t-run\tLiveDB$\t./internal/%s/...\n' \
       "$dsn" "$limit" "$pkg" >> "$case_dir/expected"
@@ -362,7 +363,8 @@ for scenario in artifact-success artifact-disabled artifact-go-fail artifact-top
   : > "$case_dir/expected"
   for pkg in "${expected_pkgs[@]}"; do
     limit=10m
-    if [ "$pkg" = store ] || [ "$pkg" = handler ]; then limit=20m; fi
+    if [ "$pkg" = store ]; then limit=30m; fi
+    if [ "$pkg" = handler ]; then limit=20m; fi
     if [ "$pkg" = workersvc ]; then limit=45m; fi
     printf '%s\ttest\t-buildvcs=false\t-count=1\t-v\t-race\t-p\t1\t-timeout\t%s\t-run\tLiveDB$\t./internal/%s/...\n' \
       "$dsn" "$limit" "$pkg" >> "$case_dir/expected"
@@ -481,9 +483,9 @@ for scenario in group-unset group-workersvc group-rest group-rest-proof group-em
   dsn="$(cut -f1 "$case_dir/go.log" | head -n 1)"
   : > "$case_dir/expected"
   case "$scenario" in
-    group-unset) want=(store:20m handler:20m forgesvc:10m schedsvc:10m workersvc:45m recovery:10m poller:10m hostedsvc:10m issuetrackersvc:10m runlifecycle:10m) ;;
+    group-unset) want=(store:30m handler:20m forgesvc:10m schedsvc:10m workersvc:45m recovery:10m poller:10m hostedsvc:10m issuetrackersvc:10m runlifecycle:10m) ;;
     group-workersvc) want=(workersvc:45m) ;;
-    group-rest|group-rest-proof) want=(store:20m handler:20m forgesvc:10m schedsvc:10m recovery:10m poller:10m hostedsvc:10m issuetrackersvc:10m runlifecycle:10m) ;;
+    group-rest|group-rest-proof) want=(store:30m handler:20m forgesvc:10m schedsvc:10m recovery:10m poller:10m hostedsvc:10m issuetrackersvc:10m runlifecycle:10m) ;;
   esac
   for entry in "${want[@]}"; do group_line "$dsn" "${entry%%:*}" "${entry#*:}" >> "$case_dir/expected"; done
   if [ "$scenario" = group-rest-proof ]; then
