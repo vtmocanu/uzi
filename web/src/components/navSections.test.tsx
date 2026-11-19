@@ -42,7 +42,7 @@ describe("navSections", () => {
 
   it("advertises exactly the 14 unconditional Admin Settings sections", () => {
     expect([...ADMIN_SETTINGS_ANCHOR_IDS]).toEqual([
-      "vault-policy", "forge-labels", "run-judge", "run-summaries", "agent-source", "maintenance",
+      "vault-policy", "model-defaults", "forge-labels", "run-judge", "run-summaries", "agent-source", "maintenance",
       "updates", "slack", "run-health", "review-bots",
       "completion-interlock", "github-project-sync", "fetch-caps",
     ]);

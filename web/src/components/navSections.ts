@@ -52,9 +52,10 @@ const ADMIN_TABS: SectionDef[] = [
 // cards render only under some configurations, so a menu entry could dead-end.
 const ADMIN_SETTINGS_ANCHORS: { id: string; label: string; keywords: string[] }[] = [
   { id: "vault-policy", label: "Credential protection", keywords: ["vault", "policy", "encryption", "password"] },
+  { id: "model-defaults", label: "Model defaults", keywords: ["model", "judge", "summary", "claude", "codex", "default"] },
   { id: "forge-labels", label: "Forge labels", keywords: ["labels", "uzi", "autopilot", "appearance"] },
   { id: "run-judge", label: "Run judge", keywords: ["judge", "recommendations", "model"] },
-  { id: "run-summaries", label: "Run summaries", keywords: ["summary", "model", "now"] },
+  { id: "run-summaries", label: "Run summaries", keywords: ["summary", "now", "kill-switch"] },
   { id: "agent-source", label: "Agent source", keywords: ["sync", "roles", "templates", "git"] },
   { id: "maintenance", label: "Maintenance mode", keywords: ["drain", "pause", "downtime"] },
   { id: "updates", label: "Updates", keywords: ["release", "version", "upgrade", "banner"] },

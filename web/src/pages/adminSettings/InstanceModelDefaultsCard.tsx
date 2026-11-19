@@ -269,7 +269,8 @@ export function InstanceModelDefaultsCard({
       {notice && <Alert tone="success" message={notice} />}
 
       <form onSubmit={save} className="space-y-4">
-        <div className="space-y-4">
+        {/* Locked while a save is in flight so an edit made then is not silently replaced by the response. */}
+        <fieldset disabled={busy} className="m-0 min-w-0 space-y-4 border-0 p-0">
           <div className="hidden gap-4 border-b border-edge pb-2 text-sm font-medium text-muted sm:grid sm:grid-cols-[180px_1fr_1fr]">
             <span>Setting</span>
             <FamilyLabel family="Claude" />
@@ -284,7 +285,7 @@ export function InstanceModelDefaultsCard({
               {LANES.filter((l) => l.row === row.label).map(renderCell)}
             </div>
           ))}
-        </div>
+        </fieldset>
 
         <p className="text-xs text-faint">
           Default follows uzi&rsquo;s built-in model, including future changes to it; picking a model pins it.
