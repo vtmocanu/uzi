@@ -211,12 +211,15 @@ is not repeated, because the next tick sees one canary.
 The pool stays in the existing hold (`duplicate canary reservations unresolved;
 explicit recovery required`) when any absence proof is not met; when the absent
 duplicate is already on the target template (not drifted), because cancelling it
-would leave a markerless worker held as "target template has no reservation
+can leave a markerless worker held as "target template has no reservation
 proof"; when the pool has a waking hibernation member; when the survivor is
 physically absent, terminating, stuck or otherwise not current; and with three or
-more canaries or two live canaries. Manual recovery for a held case: an operator
-removes the stale `uzi.dev/image-roll` annotation from the absent worker's
-Deployment, after which the worker re-enters as a fresh drifted participant.
+more canaries or two live canaries. When the absent worker has drifted
+and no retained data claim carries its reservation, manual recovery is to remove
+the stale `uzi.dev/image-roll` annotation from its Deployment; the worker then
+re-enters as a fresh drifted participant. A data claim carrying the annotation
+must be cleared too, or rollSnapshot restores it onto the Deployment. Other held
+shapes need case-specific recovery.
 
 How the second canary arises is not established. Characterization tests found
 that the mapping-correction retarget rewrites only an entry's own marker (keeping

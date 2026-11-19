@@ -849,10 +849,13 @@ or unconfirmed write keeps the hold and is reported as an error.
 The pool stays held with the unresolved-duplicate reason when any of those
 conditions fails: the absent worker is already on the target template, a worker is
 waking from hibernation, the surviving canary is absent, terminating, stuck or
-otherwise not current, or there are three or more canaries or two live ones. To
-recover such a pool, remove the stale `uzi.dev/image-roll` annotation from the
-absent worker's Deployment; the worker then re-enters the roll as a fresh drifted
-participant.
+otherwise not current, or there are three or more canaries or two live ones.
+When the absent worker has drifted and no retained data claim carries its
+reservation, an operator can recover the pool by removing the stale
+`uzi.dev/image-roll` annotation from that worker's Deployment; the worker then
+re-enters the roll as a fresh drifted participant. If its data claim carries the
+annotation, remove it there as well, or the controller restores it. Other held
+shapes need case-specific recovery.
 
 Design: [ADR-1470](../adr/1470-paced-hosted-worker-rolls.md).
 
