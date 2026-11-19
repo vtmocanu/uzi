@@ -548,10 +548,10 @@ export function isFollowupFinalizeUnsupported(error: unknown): boolean {
 /** Issue #4479: fold one `followup_finalize` reply into its typed result. Anything this does not
  *  positively recognise is unconfirmed, never a guess in either direction. */
 function foldFollowupFinalize(status: number, fields: {
-  applied?: boolean; status?: string; reason?: string; staleClaim?: boolean; followupFinalizeAdmitted?: boolean;
-}): FollowupFinalizeResult {
+  runId?: unknown; applied?: boolean; status?: string; reason?: string; staleClaim?: boolean; followupFinalizeAdmitted?: boolean;
+}, runId: string): FollowupFinalizeResult {
   if (fields.staleClaim === true) return { kind: "stale_claim" };
-  if (status === 200 && fields.applied === true && fields.followupFinalizeAdmitted === true && fields.status === "running")
+  if (status === 200 && fields.runId === runId && fields.applied === true && fields.followupFinalizeAdmitted === true && fields.status === "running")
     return { kind: "admitted" };
   if (status === 409 && fields.applied === false &&
       (fields.reason === "followup_pending" || fields.reason === "cancel_pending" || fields.reason === "followup_finalize_refused"))
@@ -3683,7 +3683,7 @@ export class WorkerClient {
           // Issue #4479: the park sequence rides an applied awaiting_followup ACK only.
           if (body.status === "awaiting_followup" && res.status === 200 && fields.status === "awaiting_followup" &&
               fields.followupParkSeq !== undefined) ack.followupParkSeq = fields.followupParkSeq;
-          if (body.status === "followup_finalize") ack.followupFinalize = foldFollowupFinalize(res.status, fields);
+          if (body.status === "followup_finalize") ack.followupFinalize = foldFollowupFinalize(res.status, fields, runId);
           // PRD #1795 M1 (decision 5): the revision an awaiting_approval report was answered with,
           // read like contractRevision off the same single-use body (top-level, beside `run`).
           if (fields.gateRevision !== undefined) ack.gateRevision = fields.gateRevision;

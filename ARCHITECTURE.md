@@ -1421,6 +1421,12 @@ chain in the diagram above, with no intervening `running`.
     custody and publishes nothing. It retries until a cancel, a shutdown, a
     lifecycle abort or the claim fence ends it, and sends nothing while the
     feature is withdrawn.
+  - **Stale-worker recovery.** If admission committed but its ACK was lost,
+    the worker can still report `awaiting_followup` in its snapshot. Both
+    snapshot readopt paths restore `running` for that same admitted generation
+    instead of recreating a park. The park sequence and admission stamp stay
+    unchanged; the worker still needs the explicit admission replay ACK before
+    finalizing. An unadmitted park still restores `awaiting_followup`.
   - **Triggers (migration 00491).** They bind every writer, old api pods
     included:
     - `runs_followup_park_identity_trg` numbers each logical park. A retried

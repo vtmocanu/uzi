@@ -160,7 +160,7 @@ func TestFollowupFinalizeWireLiveDB(t *testing.T) {
 			t.Fatalf("park: status %d, want %d: %v", code, fx.ParkAck.HTTPStatus, out)
 		}
 		seq, ok := out["followup_park_seq"].(float64)
-		if !ok || int64(seq) != fx.ParkAck.FollowupParkSeq {
+		if !ok || seq != float64(fx.ParkAck.FollowupParkSeq) {
 			t.Fatalf("park ACK followup_park_seq = %v, want %d (the fixture's first park)", out["followup_park_seq"], fx.ParkAck.FollowupParkSeq)
 		}
 		return runID, int64(seq)
@@ -186,15 +186,15 @@ func TestFollowupFinalizeWireLiveDB(t *testing.T) {
 		t.Fatalf("fixture has no refusal %q", reason)
 		return 0, false
 	}
-	wantRefusal := func(what string, runID uuid.UUID, reason string, mutate func(map[string]any)) {
+	wantRefusal := func(what string, runID uuid.UUID, reason, wantStatus string, mutate func(map[string]any)) {
 		t.Helper()
 		code, out := finalize(runID, mutate)
 		wantCode, wantApplied := refusal(reason)
 		if code != wantCode || out["applied"] != wantApplied || out["reason"] != reason {
 			t.Fatalf("%s: (%d, applied %v, reason %v), want (%d, %v, %q): %v", what, code, out["applied"], out["reason"], wantCode, wantApplied, reason, out)
 		}
-		if run, _ := out["run"].(map[string]any); run == nil || run["status"] == "" {
-			t.Fatalf("%s: refusal carries no run: %v", what, out)
+		if run, _ := out["run"].(map[string]any); run == nil || run["status"] != wantStatus {
+			t.Fatalf("%s: refusal must carry run status %q: %v", what, wantStatus, out)
 		}
 	}
 
@@ -229,7 +229,7 @@ func TestFollowupFinalizeWireLiveDB(t *testing.T) {
 		if oc, oo := ownerPost(runID, `{"kind":"follow_up","body":"not yet"}`); oc != http.StatusAccepted {
 			t.Fatalf("owner follow-up = (%d, %v), want 202", oc, oo)
 		}
-		wantRefusal("pending follow-up", runID, "followup_pending", nil)
+		wantRefusal("pending follow-up", runID, "followup_pending", "awaiting_followup", nil)
 	})
 
 	t.Run("a deliverable cancel refuses with cancel_pending", func(t *testing.T) {
@@ -237,12 +237,12 @@ func TestFollowupFinalizeWireLiveDB(t *testing.T) {
 		if oc, oo := ownerPost(runID, `{"kind":"cancel"}`); oc != http.StatusAccepted && oc != http.StatusOK {
 			t.Fatalf("owner cancel = (%d, %v)", oc, oo)
 		}
-		wantRefusal("pending cancel", runID, "cancel_pending", nil)
+		wantRefusal("pending cancel", runID, "cancel_pending", "awaiting_followup", nil)
 	})
 
 	t.Run("a different park refuses with followup_finalize_refused", func(t *testing.T) {
 		runID, seq := newParked()
-		wantRefusal("stale seq", runID, "followup_finalize_refused", func(b map[string]any) { b["followup_park_seq"] = seq + 5 })
+		wantRefusal("stale seq", runID, "followup_finalize_refused", "awaiting_followup", func(b map[string]any) { b["followup_park_seq"] = seq + 5 })
 	})
 
 	t.Run("a superseded claim keeps the stale_claim disposition", func(t *testing.T) {
@@ -261,7 +261,7 @@ func TestFollowupFinalizeWireLiveDB(t *testing.T) {
 		// must still carry a reason on the wire.
 		runID, _ := newParked()
 		cliMustExec(t, pool, `UPDATE runs SET status = 'paused', hold_reason = 'iteration_budget_exhausted' WHERE id = $1`, runID)
-		wantRefusal("iteration-budget pause", runID, "followup_finalize_refused", nil)
+		wantRefusal("iteration-budget pause", runID, "followup_finalize_refused", "paused", nil)
 	})
 
 	t.Run("a malformed report is a 400", func(t *testing.T) {

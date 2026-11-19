@@ -18960,7 +18960,7 @@ export class RunRunner {
         result = ack.followupFinalize ?? { kind: "unconfirmed" };
         unsendableLogged = false;
       } catch (error) {
-        if (error instanceof StaleClaimError || error instanceof RetainedRecoveryStop) throw error;
+        if (error instanceof StaleClaimError || error instanceof RetainedRecoveryStop || error instanceof ServerWallParkedError) throw error;
         if (error instanceof ReportPreconditionError) {
           // Thrown by the client before any request: never ambiguous.
           if (!ambiguous) return flight.steering.isCancelled() ? cancelled : outcome;

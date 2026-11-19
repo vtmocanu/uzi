@@ -20938,7 +20938,11 @@ WITH candidates AS MATERIALIZED (
     WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
 )
 UPDATE runs r SET
-    status = a.phase,
+    -- A lost finalize ACK leaves the snapshot parked although this claim was
+    -- already admitted. Recover its running state without creating a new park.
+    status = CASE WHEN a.phase = 'awaiting_followup'
+                       AND r.followup_finalize_generation = r.claim_generation
+                  THEN 'running' ELSE a.phase END,
     status_since = now(),
     health = 'ok', health_reason = NULL, health_since = NULL,
     budget_paused_seconds = r.budget_paused_seconds
@@ -21000,6 +21004,8 @@ type ReadoptRunsFromSnapshotRow struct {
 // (D2: the stale requeue charged THIS exact generation); a NULL/mismatched provenance never refunds.
 // stale_requeue_generation is cleared after. claim_released_at IS NULL is #1247's fence (a run the
 // credential switch released must not be revived). Held-state content columns are UNTOUCHED here.
+// Issue #4479: an awaiting_followup snapshot can predate a committed finalize admission (lost ACK).
+// Restore running for that already-admitted generation; do not recreate a park or change its seq.
 func (q *Queries) ReadoptRunsFromSnapshot(ctx context.Context, workerID uuid.UUID) ([]ReadoptRunsFromSnapshotRow, error) {
 	rows, err := q.db.Query(ctx, readoptRunsFromSnapshot, workerID)
 	if err != nil {

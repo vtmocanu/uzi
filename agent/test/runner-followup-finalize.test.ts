@@ -461,6 +461,21 @@ describe("interactive follow-up finalize admission (issue #4479)", () => {
     assert.equal(api.publicationIntentRequests.length, 0);
   });
 
+  it("a newer same-worker wall park stops the old finalize flight and retains its source", async () => {
+    const { claim, m, outbox, log } = await idleSetup();
+    m.script = [{ kind: "raw", status: 409,
+      body: { disposition: "stale_claim", run: { id: claim.run_id, status: "paused", hold_reason: "budget_exhausted", claim_generation: GEN + 1 } } }];
+    const r = build(parkingExecutor(log), outbox);
+    const cap = captureFlight(r);
+    await finish(r, claim);
+    assert.equal(m.finalizeRequests, 1);
+    assert.deepEqual(log.outcomes, []);
+    assert.equal(cap.flight?.preserveRecoveryClone, true);
+    assert.equal(cap.flight?.preserveSession, true);
+    assert.ok(!statuses(claim.run_id).includes("completed") && !statuses(claim.run_id).includes("failed"));
+    assert.equal(api.publicationIntentRequests.length, 0);
+  });
+
   it("without the negotiated token nothing new is sent", async () => {
     observed.length = 0;
     const { claim, m, outbox, log } = await idleSetup();

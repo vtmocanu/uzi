@@ -3,6 +3,7 @@ package workersvc
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -128,6 +129,77 @@ func TestFollowupFinalizeRegistersPublicationLiveDB(t *testing.T) {
 	}
 	if err := f.ffEnroll(id, 1); err != nil {
 		t.Fatalf("enrollment after admission: %v", err)
+	}
+}
+
+func TestFollowupFinalizeLostAckReadoptLiveDB(t *testing.T) {
+	for _, frozen := range []bool{false, true} {
+		for _, admitted := range []bool{false, true} {
+			t.Run(fmt.Sprintf("frozen_%v/admitted_%v", frozen, admitted), func(t *testing.T) {
+				f := newGateFix(t, 3)
+				id, seq := f.ffParked()
+				if admitted {
+					// The server committed admission, but the lost ACK leaves the worker's
+					// local snapshot at awaiting_followup.
+					if _, applied, err := f.ffFinalize(id, 1, seq); err != nil || !applied {
+						t.Fatalf("admission: applied=%v err=%v", applied, err)
+					}
+				}
+				f.exec(`UPDATE runs SET status='queued', stale_requeue_generation=claim_generation WHERE id=$1`, id)
+				f.exec(`INSERT INTO worker_active_runs(worker_id,run_id,claim_generation,phase,terminal_pending,snapshot_epoch,reported_at)
+				        VALUES($1,$2,1,'awaiting_followup',false,1,now())`, f.wkr.ID, id)
+				tx, err := f.pool.Begin(f.ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = tx.Rollback(f.ctx) }()
+				q := store.New(tx)
+				if _, err := q.GetWorkerForUpdate(f.ctx, f.wkr.ID); err != nil {
+					t.Fatal(err)
+				}
+				if frozen {
+					locks, err := captureWorkerRecoveryLocks(f.ctx, q, f.wkr.ID, []validatedEntry{{runID: id}})
+					if err != nil {
+						t.Fatal(err)
+					}
+					ledger, parents, err := locks.parameters()
+					if err != nil {
+						t.Fatal(err)
+					}
+					rows, err := q.FrozenReadoptRunsFromSnapshot(f.ctx, store.FrozenReadoptRunsFromSnapshotParams{WorkerID: f.wkr.ID, FrozenTargets: ledger, LockedParentIds: parents})
+					if err != nil || len(rows) != 1 || rows[0].ID != id {
+						t.Fatalf("frozen readopt: rows=%+v err=%v", rows, err)
+					}
+				} else {
+					rows, err := q.ReadoptRunsFromSnapshot(f.ctx, f.wkr.ID)
+					if err != nil || len(rows) != 1 || rows[0].ID != id {
+						t.Fatalf("readopt: rows=%+v err=%v", rows, err)
+					}
+				}
+				if err := tx.Commit(f.ctx); err != nil {
+					t.Fatal(err)
+				}
+				wantStatus, wantGen := "awaiting_followup", int64(-1)
+				if admitted {
+					wantStatus, wantGen = "running", 1
+				}
+				got := f.ffRow(id)
+				if got.status != wantStatus || got.parkSeq != seq || got.finalizeGen != wantGen || got.claimGen != 1 {
+					t.Fatalf("readopt changed the admitted park identity: %+v", got)
+				}
+				if admitted {
+					if _, applied, err := f.ffFinalize(id, 1, seq); err != nil || !applied {
+						t.Fatalf("replay: applied=%v err=%v", applied, err)
+					}
+					if replay := f.ffRow(id); replay != got {
+						t.Fatalf("replay wrote: before=%+v after=%+v", got, replay)
+					}
+					if err := f.ffEnroll(id, 1); err != nil {
+						t.Fatalf("publication after readopt: %v", err)
+					}
+				}
+			})
+		}
 	}
 }
 
@@ -465,16 +537,18 @@ func TestFollowupFinalizeRaceOrdersLiveDB(t *testing.T) {
 		if err != nil || rows != 1 {
 			t.Fatalf("admit in tx = (%d, %v)", rows, err)
 		}
+		conn, err := f.pool.Acquire(f.ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Release()
+		submitting := f.svc.boundClaimControlService(store.New(conn))
 		done := make(chan error, 1)
 		go func() {
-			_, err := f.submit(id, "follow_up", nil, SubmitInputOptions{})
+			_, err := submitting.SubmitInputWithOptions(f.ctx, f.userID, id, "follow_up", "because", nil, SubmitInputOptions{})
 			done <- err
 		}()
-		select {
-		case err := <-done:
-			t.Fatalf("the follow-up did not wait for the admission lock: %v", err)
-		case <-time.After(400 * time.Millisecond):
-		}
+		f.ffWaitForBackendBlock(conn.Conn().PgConn().PID(), tx.Conn().PgConn().PID(), done)
 		if err := tx.Commit(f.ctx); err != nil {
 			t.Fatal(err)
 		}
@@ -500,31 +574,19 @@ func TestFollowupFinalizeRaceOrdersLiveDB(t *testing.T) {
 		if err != nil {
 			t.Fatalf("follow-up insert in tx: %v", err)
 		}
+		conn, err := f.pool.Acquire(f.ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Release()
+		admitting := f.svc.boundClaimControlService(store.New(conn))
+		admitting.SetTxBeginner(conn)
 		done := make(chan error, 1)
 		go func() {
-			_, _, err := f.ffFinalize(id, 1, seq)
+			_, _, err := admitting.SetState(f.ctx, f.wkr, id, StateRequest{State: stateFollowupFinalize, ClaimGeneration: i64(1), FollowupParkSeq: i64(seq)})
 			done <- err
 		}()
-		// Event-driven: wait until the admission is blocked on a lock, then make sure it has not returned.
-		deadline := time.Now().Add(10 * time.Second)
-		for {
-			var waiting int
-			if err := f.pool.QueryRow(f.ctx, `SELECT count(*) FROM pg_locks WHERE NOT granted`).Scan(&waiting); err != nil {
-				t.Fatal(err)
-			}
-			if waiting > 0 {
-				break
-			}
-			select {
-			case err := <-done:
-				t.Fatalf("the admission did not wait for the uncommitted follow-up: %v", err)
-			default:
-			}
-			if time.Now().After(deadline) {
-				t.Fatal("the admission never blocked on the follow-up's run lock")
-			}
-			time.Sleep(10 * time.Millisecond)
-		}
+		f.ffWaitForBackendBlock(conn.Conn().PgConn().PID(), tx.Conn().PgConn().PID(), done)
 		if err := tx.Commit(f.ctx); err != nil {
 			t.Fatal(err)
 		}
@@ -550,6 +612,29 @@ func TestFollowupFinalizeRaceOrdersLiveDB(t *testing.T) {
 		f.ffFollowUp(id)
 		f.ffRefused(id, 1, seq, ErrFollowupFinalizePending)
 	})
+}
+
+func (f *gateFix) ffWaitForBackendBlock(waiter, blocker uint32, done <-chan error) {
+	f.t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var blocked bool
+		if err := f.pool.QueryRow(f.ctx, `SELECT $2::int = ANY(pg_blocking_pids($1::int))`, waiter, blocker).Scan(&blocked); err != nil {
+			f.t.Fatal(err)
+		}
+		if blocked {
+			return
+		}
+		select {
+		case err := <-done:
+			f.t.Fatalf("backend %d completed before waiting on backend %d: %v", waiter, blocker, err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			f.t.Fatalf("backend %d never blocked on backend %d", waiter, blocker)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 func TestFollowupFinalizeAfterAdmissionLiveDB(t *testing.T) {

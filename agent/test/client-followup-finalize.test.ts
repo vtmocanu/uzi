@@ -72,6 +72,8 @@ describe("client followup_finalize report", () => {
     ["a 200 with another disposition", 200, { ...good, disposition: "clarification_settled" }],
     ["a 200 whose run is not running", 200, { ...good, ...runBody("awaiting_followup") }],
     ["a 200 with an empty body", 200, {}],
+    ["a 200 without its run ID", 200, { ...good, run: { status: "running" } }],
+    ["a 200 with another run ID", 200, { ...good, run: { id: "aaaaaaaa-2222-4333-8444-555555555555", status: "running" } }],
     ["a 409 without applied", 409, { reason: "followup_pending", ...runBody("awaiting_followup") }],
     ["a 409 with applied true", 409, { applied: true, reason: "followup_pending", ...runBody("awaiting_followup") }],
     ["a 409 without a reason", 409, { applied: false, ...runBody("awaiting_followup") }],
