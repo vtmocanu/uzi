@@ -164,6 +164,16 @@ repository UUID, `store.TerminalConsumerGateObjID`).
   waiters as well as holders, so while an admission is queued every later
   try-exclusive fails. A queued admission waits for at most one bounded
   exclusive hold; plain contention cannot time it out.
+- **Retirement hold bound.** The gate is a transaction-scoped lock, so a
+  stalled or killed tx-R1 can only be freed by the server. On PostgreSQL 17 and
+  later tx-R1 sets `transaction_timeout = 4s` (with `statement_timeout = 2500ms`
+  and `idle_in_transaction_session_timeout = 2s`). Earlier versions (the chart
+  pins 16) have no `transaction_timeout`: they set `statement_timeout = 250ms`
+  and `idle_in_transaction_session_timeout = 250ms`, and the preservation row
+  `lock_timeout` drops to 250ms; over the at most 8 statements tx-R1 sends
+  after the gate that sums to at most 8 x (250ms + 250ms) = 4s. Invariant: the
+  hold bound must stay strictly below the admissions' 6s gate wait, so a stalled
+  retirement can never time out a healthy admission.
 - **Why not a source-row lock.** A row lock on the target deadlocked against an
   FK cascade in #3257 (`api/internal/store/queries/judge.sql`, the
   `LockRunForJudge` note); the gate is an advisory lock no cascade takes.
@@ -240,8 +250,8 @@ call, no lifetime read, no delete), so every terminal ref is retained in this
 delivery. Enabling it needs work that is not built: a complete protection
 list and indexes for the protection query (slices C and D). The
 consumer-admission fence is built (T3 above): admissions always take its shared
-lock, which contends with nothing until the retire lane runs. A constant keeps the irrevocable delete unreachable by configuration error
-until those exist. Tests enable the lane through an unexported hook only.
+lock, which contends with nothing until the retire lane runs. A constant keeps
+the irrevocable delete unreachable by configuration error until those exist. Tests enable the lane through an unexported hook only.
 
 ### Gate scoping: the completed-release gate
 
@@ -313,8 +323,8 @@ and the total. A race that reaches the RESTRICT FK maps to the same 409.
   escape for removal-blocking refs lands.
 - **C**: reclaim and custody.
 - **C/D**: retirement enablement: a complete protection list (the
-  consumer-admission fence is built, T3 #4488), the indexes for the protection query, and then flipping the
-  constant.
+  consumer-admission fence is built, T3 #4488), the indexes for the
+  protection query, and then flipping the constant.
 - **D**: activation, and an owner escape for removal-blocking refs, with CLI.
 - **E**: fleet rollout.
 - **Purge** of finished rows.
@@ -351,7 +361,8 @@ of the two new completion reasons is the one part that is not gated (see
   deletes nothing; removal of incomplete private refs is slice C's.
 - **Still deferred.** The T4 shared excluded-origin fence, D's owner escape
   with CLI (including clearing a `localBlock`), one-worker activation and
-  startup disable (including upgrade-time pending journals), retirement enablement (the T3 consumer gate is built, #4488),
+  startup disable (including upgrade-time pending journals), retirement
+  enablement (the T3 consumer gate is built, #4488),
   reclaim and custody (C, including G12), fleet rollout (E), hosted
   acceptance, the named follow-up "#4007 slice B2-contracts" (the kept labels'
   output-contract analysis and the G7 callers) and the #4001 predecessor

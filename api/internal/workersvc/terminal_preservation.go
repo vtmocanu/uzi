@@ -154,6 +154,12 @@ type terminalHooks struct {
 	// beforeRetiringCommit runs in terminalRetireDecide after MarkTerminalPreservationRetiring and
 	// before tx-R1's COMMIT. Test-only; nil in production.
 	beforeRetiringCommit func()
+	// afterRetireGate runs in terminalLockRunForRetire right after the consumer gate was acquired.
+	// Test-only; nil in production.
+	afterRetireGate func()
+	// retireBounds replaces the server-side hold bounds of tx-R1 (tests only, to avoid multi-second
+	// sleeps); nil in production.
+	retireBounds *terminalRetireBounds
 }
 
 func (h terminalHooks) prepareFn() func(context.Context, pushbroker.TerminalPackOptions) (*pushbroker.PreparedTerminalPack, error) {
