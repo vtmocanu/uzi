@@ -40,7 +40,7 @@ func tcgHold(ctx context.Context, t *testing.T, pool *pgxpool.Pool, repo uuid.UU
 // gate key of repo, failing the test if none appears in 5s.
 func tcgAwaitShareWaiter(ctx context.Context, t *testing.T, pool *pgxpool.Pool, repo uuid.UUID) {
 	t.Helper()
-	objID := uint32(TerminalConsumerGateObjID(repo))
+	objID := uint32(TerminalConsumerGateObjID(repo)) //nolint:gosec // reinterpret the int4 lock key as pg_locks' oid
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		var n int
