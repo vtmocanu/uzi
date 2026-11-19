@@ -592,6 +592,7 @@ type Issue struct {
 	SyncedAt       pgtype.Timestamptz `json:"synced_at"`
 	BoardPosition  pgtype.Int8        `json:"board_position"`
 	AssigneeIds    []byte             `json:"assignee_ids"`
+	IssueKey       pgtype.Text        `json:"issue_key"`
 }
 
 type IssueProposal struct {
@@ -726,6 +727,34 @@ type MemoryParkRelease struct {
 	LiftedAt         pgtype.Timestamptz `json:"lifted_at"`
 	SupersededAt     pgtype.Timestamptz `json:"superseded_at"`
 	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+}
+
+type ModelProvider struct {
+	ID              uuid.UUID          `json:"id"`
+	OwnerUserID     uuid.UUID          `json:"owner_user_id"`
+	Name            string             `json:"name"`
+	Engine          string             `json:"engine"`
+	CurrentRevision int32              `json:"current_revision"`
+	RetiredAt       pgtype.Timestamptz `json:"retired_at"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+}
+
+type ModelProviderProbeResult struct {
+	ProviderID uuid.UUID          `json:"provider_id"`
+	Revision   int32              `json:"revision"`
+	AuthResult string             `json:"auth_result"`
+	ToolResult pgtype.Text        `json:"tool_result"`
+	ProbedAt   pgtype.Timestamptz `json:"probed_at"`
+}
+
+type ModelProviderRevision struct {
+	ProviderID uuid.UUID          `json:"provider_id"`
+	Revision   int32              `json:"revision"`
+	Protocol   string             `json:"protocol"`
+	BaseUrl    string             `json:"base_url"`
+	AuthStyle  string             `json:"auth_style"`
+	ModelMap   []byte             `json:"model_map"`
+	CreatedAt  pgtype.Timestamptz `json:"created_at"`
 }
 
 type MrReviewAuthorQueue struct {
@@ -1075,6 +1104,22 @@ type Repo struct {
 	InitialImportGeneration           int64              `json:"initial_import_generation"`
 	InitialImportErrorClass           pgtype.Text        `json:"initial_import_error_class"`
 	InitialImportUpdatedAt            pgtype.Timestamptz `json:"initial_import_updated_at"`
+	AwaitingFirstEnable               bool               `json:"awaiting_first_enable"`
+	IssueTrackerConnectionID          pgtype.UUID        `json:"issue_tracker_connection_id"`
+	IssueTrackerProjectID             pgtype.Text        `json:"issue_tracker_project_id"`
+	IssueTrackerProjectShort          pgtype.Text        `json:"issue_tracker_project_short"`
+	EligibilityTagID                  pgtype.Text        `json:"eligibility_tag_id"`
+	EligibilityTagName                pgtype.Text        `json:"eligibility_tag_name"`
+	IssueTrackerLinkedAt              pgtype.Timestamptz `json:"issue_tracker_linked_at"`
+}
+
+type RepoRemovalMarker struct {
+	UserID         uuid.UUID          `json:"user_id"`
+	ForgeType      string             `json:"forge_type"`
+	BaseUrl        string             `json:"base_url"`
+	ForgeProjectID int64              `json:"forge_project_id"`
+	WasLinked      bool               `json:"was_linked"`
+	RemovedAt      pgtype.Timestamptz `json:"removed_at"`
 }
 
 type RepoToolProfile struct {
@@ -1355,6 +1400,12 @@ type Run struct {
 	CheckpointWithheldGeneration      pgtype.Int8        `json:"checkpoint_withheld_generation"`
 	CheckpointWithheldNonce           pgtype.Text        `json:"checkpoint_withheld_nonce"`
 	CheckpointWithheldReportSeq       pgtype.Int8        `json:"checkpoint_withheld_report_seq"`
+	ModelProviderID                   pgtype.UUID        `json:"model_provider_id"`
+	ModelProviderRevision             pgtype.Int4        `json:"model_provider_revision"`
+	ModelProviderKeyMode              pgtype.Text        `json:"model_provider_key_mode"`
+	ModelProviderKeySecretID          pgtype.UUID        `json:"model_provider_key_secret_id"`
+	ModelProviderKeyRev               pgtype.Int8        `json:"model_provider_key_rev"`
+	ModelProviderLimitStreak          int32              `json:"model_provider_limit_streak"`
 }
 
 type RunCompletionAttempt struct {
@@ -1409,6 +1460,25 @@ type RunDecisionMemo struct {
 	ClaimGeneration int64              `json:"claim_generation"`
 	FormatVersion   int16              `json:"format_version"`
 	Body            string             `json:"body"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+}
+
+type RunEnvVar struct {
+	ID              uuid.UUID          `json:"id"`
+	VarID           uuid.UUID          `json:"var_id"`
+	UserID          uuid.UUID          `json:"user_id"`
+	RepoID          pgtype.UUID        `json:"repo_id"`
+	Name            string             `json:"name"`
+	Secret          bool               `json:"secret"`
+	Description     string             `json:"description"`
+	Ciphertext      []byte             `json:"ciphertext"`
+	SealedWith      string             `json:"sealed_with"`
+	ValueBytes      int32              `json:"value_bytes"`
+	Rev             int32              `json:"rev"`
+	RetiredAt       pgtype.Timestamptz `json:"retired_at"`
+	DisabledAt      pgtype.Timestamptz `json:"disabled_at"`
+	PendingDeleteAt pgtype.Timestamptz `json:"pending_delete_at"`
 	CreatedAt       pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
 }
@@ -1936,6 +2006,7 @@ type User struct {
 	CodexSummaryModel         pgtype.Text        `json:"codex_summary_model"`
 	CredentialsResetAt        pgtype.Timestamptz `json:"credentials_reset_at"`
 	JudgeRunsOn               pgtype.Text        `json:"judge_runs_on"`
+	ClaudeProviderID          pgtype.UUID        `json:"claude_provider_id"`
 }
 
 type UserCrossCheckPin struct {
@@ -1961,6 +2032,7 @@ type UserSecret struct {
 	EnablementRev              int64              `json:"enablement_rev"`
 	AnthropicRejectedAt        pgtype.Timestamptz `json:"anthropic_rejected_at"`
 	AnthropicSuccessGeneration int64              `json:"anthropic_success_generation"`
+	ProviderID                 pgtype.UUID        `json:"provider_id"`
 }
 
 type UserVault struct {
@@ -2091,6 +2163,12 @@ type Worker struct {
 	HibernationBlockedReason   pgtype.Text        `json:"hibernation_blocked_reason"`
 	HibernationBlockedAt       pgtype.Timestamptz `json:"hibernation_blocked_at"`
 	HibernationBlockedSince    pgtype.Timestamptz `json:"hibernation_blocked_since"`
+	MemoryAuthorityLostAt      pgtype.Timestamptz `json:"memory_authority_lost_at"`
+	HibernationOriginOpID      pgtype.UUID        `json:"hibernation_origin_op_id"`
+	HibernationAdmitOrigin     pgtype.Text        `json:"hibernation_admit_origin"`
+	HibernationWakeOrigin      pgtype.Text        `json:"hibernation_wake_origin"`
+	LastManualWakeSettledAt    pgtype.Timestamptz `json:"last_manual_wake_settled_at"`
+	MemoryAuthorityHeldAt      pgtype.Timestamptz `json:"memory_authority_held_at"`
 }
 
 type WorkerActiveRun struct {

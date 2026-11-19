@@ -1,0 +1,3 @@
+GetIssue(42, 7)
+RepositoryAuthorEligibility(42, 2)
+ListIssueComments(42, 7)

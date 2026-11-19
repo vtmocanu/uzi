@@ -31,8 +31,9 @@
 -- create seam (workersvc.createRunAtomic), not the SQL literal 'claude'. A handoff task uses
 -- D11; M2/M3 wire the real resolved value. Every current caller passes string(HarnessClaude)
 -- as a mechanical stopgap.
-INSERT INTO runs (id, user_id, repo_id, continued_issue_iid, kind, branch, base_branch, open_mr, interactive, review_requested, then_fix_requested, issue_title, issue_description, auto_approve, wait_on_limit, required_capabilities, hinted_capabilities, ignored_inferred_capabilities, budget_wall_seconds, budget_max_iterations, trigger_source, harness, code_cross_check_required, repo_agent_source_required)
-VALUES (@run_id, @user_id, @repo_id::uuid, sqlc.narg('continued_issue_iid'), 'task', @branch, sqlc.narg('base_branch'), @open_mr, @interactive, @review_requested, @then_fix_requested, @issue_title, @issue_description, true, @wait_on_limit, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), COALESCE((SELECT rp.ignored_inferred_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), sqlc.narg('budget_wall_seconds'), sqlc.narg('budget_max_iterations'), 'task', @harness, (SELECT u.code_cross_check_enabled FROM users u WHERE u.id = @user_id), true)
+-- model_provider_* (PRD #4320 M4), class FRESH-RESOLVE: the five binding columns are the owner's Claude provider source frozen by workersvc.createRunAtomic (NULL = vendor run). An unstamped param is NULL = a vendor run, so createRunAtomic asserts the inserted row against its resolution. A handoff task has no source run (implicit D11).
+INSERT INTO runs (id, user_id, repo_id, continued_issue_iid, kind, branch, base_branch, open_mr, interactive, review_requested, then_fix_requested, issue_title, issue_description, auto_approve, wait_on_limit, required_capabilities, hinted_capabilities, ignored_inferred_capabilities, budget_wall_seconds, budget_max_iterations, trigger_source, harness, code_cross_check_required, repo_agent_source_required, model_provider_id, model_provider_revision, model_provider_key_mode, model_provider_key_secret_id, model_provider_key_rev)
+VALUES (@run_id, @user_id, @repo_id::uuid, sqlc.narg('continued_issue_iid'), 'task', @branch, sqlc.narg('base_branch'), @open_mr, @interactive, @review_requested, @then_fix_requested, @issue_title, @issue_description, true, @wait_on_limit, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), COALESCE((SELECT rp.ignored_inferred_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), sqlc.narg('budget_wall_seconds'), sqlc.narg('budget_max_iterations'), 'task', @harness, (SELECT u.code_cross_check_enabled FROM users u WHERE u.id = @user_id), true, sqlc.narg('model_provider_id')::uuid, sqlc.narg('model_provider_revision')::int, sqlc.narg('model_provider_key_mode')::text, sqlc.narg('model_provider_key_secret_id')::uuid, sqlc.narg('model_provider_key_rev')::bigint)
 RETURNING *;
 
 -- name: CreateThenFixRun :one
@@ -62,13 +63,14 @@ RETURNING *;
 -- create seam (workersvc.createRunAtomic). A then-fix inherits its original task's harness as
 -- an explicit selection (D4); M3 wires that real value. Every current caller passes
 -- string(HarnessClaude) as a mechanical stopgap.
+-- model_provider_* (PRD #4320 M4), class INHERITED: the five binding columns are copied verbatim from the source run's row by the caller (never the owner's current source); createRunAtomic re-validates the copied binding and asserts the inserted row carries it.
 INSERT INTO runs (
     id, user_id, repo_id, continued_issue_iid, kind, branch, base_branch,
     then_fix_of_run_id, review_target_run_id, dispatched_at,
     auto_approve, open_mr, review_requested, then_fix_requested, wait_on_limit,
     issue_title, issue_description, required_capabilities, hinted_capabilities, ignored_inferred_capabilities,
     budget_wall_seconds, budget_max_iterations, trigger_source, harness
-, code_cross_check_required, repo_agent_source_required)
+, code_cross_check_required, repo_agent_source_required, model_provider_id, model_provider_revision, model_provider_key_mode, model_provider_key_secret_id, model_provider_key_rev)
 VALUES (
     @run_id, @user_id, @repo_id::uuid, (SELECT source.continued_issue_iid FROM runs source WHERE source.id = @then_fix_of_run_id AND source.user_id = @user_id AND source.repo_id = @repo_id::uuid), 'task', @branch, sqlc.narg('base_branch'),
     @then_fix_of_run_id, NULL, now(),
@@ -76,7 +78,7 @@ VALUES (
     @issue_title, @issue_description,
     COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), COALESCE((SELECT rp.ignored_inferred_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'),
     sqlc.narg('budget_wall_seconds'), sqlc.narg('budget_max_iterations'), 'then_fix', @harness
-, (SELECT u.code_cross_check_enabled FROM users u WHERE u.id = @user_id), true)
+, (SELECT u.code_cross_check_enabled FROM users u WHERE u.id = @user_id), true, sqlc.narg('model_provider_id')::uuid, sqlc.narg('model_provider_revision')::int, sqlc.narg('model_provider_key_mode')::text, sqlc.narg('model_provider_key_secret_id')::uuid, sqlc.narg('model_provider_key_rev')::bigint)
 RETURNING *;
 
 -- name: CreateTaskReviewRun :one
@@ -95,17 +97,18 @@ RETURNING *;
 -- create seam (workersvc.createRunAtomic). A task-review inherits its reviewed target's harness
 -- as an explicit selection (D4); M3 wires that real value. Every current caller passes
 -- string(HarnessClaude) as a mechanical stopgap.
+-- model_provider_* (PRD #4320 M4), class INHERITED: the five binding columns are copied verbatim from the source run's row by the caller (never the owner's current source); createRunAtomic re-validates the copied binding and asserts the inserted row carries it.
 INSERT INTO runs (
     id, user_id, repo_id, continued_issue_iid, kind, branch, base_branch,
     review_target_run_id, dispatched_at, auto_approve, open_mr, review_requested,
     issue_title, issue_description, required_capabilities, hinted_capabilities, ignored_inferred_capabilities, trigger_source, harness
-, code_cross_check_required)
+, code_cross_check_required, model_provider_id, model_provider_revision, model_provider_key_mode, model_provider_key_secret_id, model_provider_key_rev)
 VALUES (
     @run_id, @user_id, @repo_id::uuid, (SELECT source.continued_issue_iid FROM runs source WHERE source.id = @target_run_id AND source.user_id = @user_id AND source.repo_id = @repo_id::uuid), 'task', @branch, sqlc.narg('base_branch'),
     @target_run_id, now(), true, false, false,
     @issue_title, '',
     COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), COALESCE((SELECT rp.ignored_inferred_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), 'task_review', @harness
-, (SELECT u.code_cross_check_enabled FROM users u WHERE u.id = @user_id))
+, (SELECT u.code_cross_check_enabled FROM users u WHERE u.id = @user_id), sqlc.narg('model_provider_id')::uuid, sqlc.narg('model_provider_revision')::int, sqlc.narg('model_provider_key_mode')::text, sqlc.narg('model_provider_key_secret_id')::uuid, sqlc.narg('model_provider_key_rev')::bigint)
 RETURNING *;
 
 -- name: UpsertTaskReviewWithFindings :one

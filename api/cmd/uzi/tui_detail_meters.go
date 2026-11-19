@@ -40,13 +40,20 @@ func (m tuiModel) renderSpend(usedRows int) string {
 		total = "n/a"
 	default:
 		total = "Unavailable"
+		if providerCostUnknown(m.detail.run) {
+			total = "Unknown"
+		}
 	}
 	fresh := u.InputTokens + u.CacheCreationTokens
 	pct := cacheDisplayPct(u.InputTokens, u.CacheReadTokens, u.CacheCreationTokens)
 	head := m.pal.faint.Render("SPEND") + "  " + lipgloss.NewStyle().Foreground(m.pal.tungsten).Render(total)
 	inOut := m.pal.faint.Render("in " + fmtTokens(fresh) + "  out " + fmtTokens(u.OutputTokens))
 	cache := m.pal.faint.Render("cache " + fmtTokens(u.CacheReadTokens) + " " + itoa(pct) + "%")
-	lines := []string{head, m.pal.faint.Render("API-equivalent"), inOut, cache}
+	basis := "API-equivalent"
+	if providerCostUnknown(m.detail.run) {
+		basis = "custom provider" // the gateway's accounting is not Anthropic's: no price is derived
+	}
+	lines := []string{head, m.pal.faint.Render(basis), inOut, cache}
 	// Whole-block-or-nothing: the -1 is the blank "\n\n" separator the caller prepends (same budget
 	// arithmetic railRateMeters uses).
 	if len(lines) > m.transcriptViewport()-usedRows-1 {

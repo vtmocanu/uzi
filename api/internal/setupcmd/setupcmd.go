@@ -63,6 +63,12 @@ type Backend struct {
 	// Workers creates the owner's first worker. Required only when
 	// --worker-name is given.
 	Workers Workers
+	// Begin and Bind run the first enable of each repo in one transaction that
+	// holds the repo row lock (PRD #4173 D13): Begin opens it and Bind returns
+	// the store whose statements run in it. Production sets both; nil in a test
+	// backend leaves transactions off.
+	Begin provisionsvc.TxBeginner
+	Bind  func(pgx.Tx) provisionsvc.Store
 }
 
 // WorkerResult is the outcome of Workers.CreateFirst.
@@ -217,7 +223,7 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	}
 
 	// Every precondition holds. From here on, writes may happen and are kept.
-	prov := provisionsvc.New(be.Q, be.Forges, be.Guard, cfg.ForgeBaseURLAllowed).WithLogger(r.logger())
+	prov := provisionsvc.New(be.Q, be.Forges, be.Guard, cfg.ForgeBaseURLAllowed).WithLogger(r.logger()).UseTransactions(be.Begin, be.Bind)
 	r.report = &Report{SchemaVersion: ReportSchemaVersion, Status: ReportOK}
 	conn, forgeOK := r.connectForge(ctx, prov, be.Q, owner.ID, in, normBase)
 	discovered := forgeOK && r.discoverRepos(ctx, prov, owner.ID, conn.ID)

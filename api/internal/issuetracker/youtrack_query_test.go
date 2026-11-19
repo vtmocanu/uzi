@@ -11,14 +11,16 @@ import (
 
 func TestIssueQuery(t *testing.T) {
 	after := time.Date(2026, 3, 1, 23, 30, 0, 0, time.UTC)
-	got := issueQuery("UZI", []string{"a b", "c"}, forge.ListIssuesOptions{
-		Labels: []string{"ignored"}, State: forge.StateOpened, UpdatedAfter: &after,
+	// Labels are given on purpose: no tag name is ever sent in a search query (a
+	// listing with labels pages the tag's issues by id), so none may appear.
+	got := issueQuery("UZI", forge.ListIssuesOptions{
+		Labels: []string{"a b", "c"}, State: forge.StateOpened, UpdatedAfter: &after,
 	})
-	want := "project: {UZI} tag: {a b} tag: {c} #Unresolved updated: 2026-02-28 .. * sort by: updated asc"
+	want := "project: {UZI} #Unresolved updated: 2026-02-28 .. * sort by: updated asc"
 	if got != want {
 		t.Fatalf("got %q, want %q", got, want)
 	}
-	if got := issueQuery("UZI", nil, forge.ListIssuesOptions{State: forge.StateClosed}); got != "project: {UZI} #Resolved sort by: updated asc" {
+	if got := issueQuery("UZI", forge.ListIssuesOptions{State: forge.StateClosed}); got != "project: {UZI} #Resolved sort by: updated asc" {
 		t.Fatalf("got %q", got)
 	}
 }

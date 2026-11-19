@@ -99,6 +99,27 @@ forge:
 issueTracker:
   allowedBaseURLs: []
 
+# --- providers: the operator allowlist for user-defined model providers (PRD #4320) -----
+#
+# Renders into the api's UZI_PROVIDER_ALLOWED_BASE_URLS env. A user may create a provider
+# (an Anthropic-compatible gateway with its own key) only at a base URL that EQUALS one
+# of these entries exactly, path included: https://gateway.example.com/anthropic allows
+# that URL (and the same with a trailing slash) and nothing under or beside it. Each entry
+# must be https; userinfo, a query, a fragment, percent-encoding, a semicolon, a backslash,
+# dot or empty path segments, a comma or whitespace fail the render (the message never
+# echoes the entry); the api re-validates at boot. Empty (the default) turns the feature
+# off. It never feeds the worker egress lists: a worker's network access to the gateway is
+# yours to open, and the api itself must reach the gateway (the Test button dials from the
+# api, directly, ignoring HTTPS_PROXY/HTTP_PROXY, and admits private gateway addresses).
+# The compose-only loopback dev flag (UZI_PROVIDER_ALLOW_LOOPBACK) has no chart value, and
+# setting it in api.config fails the render: in a cluster it would let the probe reach the
+# api's own local ports. Set this
+# per-cluster instead of api.config.UZI_PROVIDER_ALLOWED_BASE_URLS (setting BOTH fails the
+# render, see api-configmap.yaml). A gateway behind a private CA also needs
+# workers.extraCA, which the provider Test probe trusts too (see there).
+providers:
+  allowedBaseURLs: []
+
 # --- releaseCheck: the periodic GitHub release-availability check (PRD #836) -------
 #
 # The api periodically polls GitHub's releases API for vtmocanu/uzi and surfaces an
@@ -509,6 +530,10 @@ workers:
   # turning it on also adds UZI_CLI_CA_FILE to the worker pod template, which can start
   # paced worker rolls; a roll does not rewrite an existing worker's Secret, so
   # reprovisioning is still what delivers the CA to it.
+  # The same bundle is also mounted read-only into the api pod (UZI_PROVIDER_EXTRA_CA_FILE)
+  # and trusted, on top of the system roots, by the provider Test probe (providers.*) and by
+  # no other api client; the api refuses to boot if the file is unreadable or holds no
+  # certificate, and rolls when the inline pem changes.
   extraCA:
     pem: ""
     configMap:
@@ -727,7 +752,7 @@ workers:
     # so the fleet rolls as its workers finish their runs. It must be concrete: the
     # controller-deployment template wraps it in `required`, so a blank tag fails the
     # render loudly rather than shipping an empty image reference.
-    tag: "0.87.0-rc.15"
+    tag: "0.87.0-rc.18"
   # The Harbor pull secret IN THE WORKER NAMESPACE. It cannot be the release
   # namespace's copy: a ServiceAccount's imagePullSecrets can only name a Secret in
   # its OWN namespace. Empty = no pull secret (the KinD smoke, where the agent image
@@ -778,6 +803,32 @@ workers:
   # the workers the same way a nodeSelector change does. The controller validates the
   # list at boot. The api, web and controller pods are not affected.
   tolerations: []
+  # An opt-in second placement for moving workers to a new node pool (for example a
+  # dedicated, tainted pool in another storage zone). Off by default: empty renders
+  # no env and nothing changes. When set, the controller stamps a worker volume it
+  # creates with `uzi.dev/placement: new` unless that worker still has an unstamped
+  # volume (a legacy worker's missing volume is recreated unstamped), and ONLY a worker
+  # whose volumes are all stamped uses it; every other worker keeps the global
+  # nodeSelector/tolerations above. Setting it rolls no worker still on the global
+  # placement; changing it, or re-setting it with different values, rolls already-stamped
+  # workers through normal roll admission. A roll does not move their volumes: retarget
+  # only to nodes that can attach every stamped worker's existing volumes; otherwise do
+  # not retarget (the per-worker procedure cannot move already-stamped workers).
+  #
+  # Both fields REPLACE (never merge with) the global ones for such a worker: keep
+  # `kubernetes.io/arch: amd64` in nodeSelector and repeat any global toleration still
+  # needed. A tolerations-only newPlacement renders no nodeSelector at all.
+  #
+  # Moving each worker is a manual, per-worker procedure that permanently deletes its
+  # volumes: see docs/hosted-workers.md "Moving workers to a new node pool". When no
+  # unstamped worker remains, copy newPlacement into workers.nodeSelector and
+  # workers.tolerations FIRST, then clear newPlacement; clearing it earlier sends
+  # stamped workers back to the old nodes. Helm merges maps, so an empty
+  # `nodeSelector: {}` keeps the amd64 default: use `nodeSelector: null` when the new
+  # placement has none, and render the chart to confirm before clearing newPlacement.
+  newPlacement:
+    nodeSelector: {}
+    tolerations: []
   # A cluster-scoped PriorityClass for hosted worker pods (issue #1341). When enabled,
   # the chart creates the PriorityClass AND the controller stamps its name onto every
   # worker pod's priorityClassName, so a busy worker outranks lower-priority pods for
@@ -1096,9 +1147,15 @@ workers:
     # Supplies no attestation; empty runtime below keeps scratch. Attempt deletion stays canary-only.
     scratchDeletion: true
     # Default-on per-startup observation records for `.retire-*` retirement scratch parents
-    # (kept only; no reclaim). false renders worker UZI_RETIRE_SCRATCH_OUTCOMES=0 after
-    # controller reconciliation; takes effect at the next worker startup.
+    # (they delete nothing; retireScratchReclaim below gates the epoch's retire-scratch phase). false renders
+    # worker UZI_RETIRE_SCRATCH_OUTCOMES=0 after controller reconciliation; takes effect at the
+    # next worker startup.
     retireScratchOutcomes: true
+    # Default-on verified-epoch retire-scratch phase (uid-split Docker workers only): it deletes
+    # no bound `.retire-*` parent and clears the binding of a gone one; unbound parents stay kept; binding writes continue either way. false renders worker
+    # UZI_RETIRE_SCRATCH_RECLAIM=0 after controller reconciliation (a no-op on older worker
+    # images); takes effect at the next worker startup.
+    retireScratchReclaim: true
     deletionCanaryWorkerId: ""
   docker:
     podEpochReclaim:

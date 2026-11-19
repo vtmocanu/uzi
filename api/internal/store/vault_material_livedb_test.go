@@ -34,7 +34,7 @@ func vaultMaterialWantLocked(t *testing.T, pool *pgxpool.Pool, query string, id 
 
 func TestVaultMaterialQueriesLiveDB(t *testing.T) {
 	ctx := context.Background()
-	pool, _ := codexJudgeMigrationDB(t, migrationVersionByName(t, "vault_mode"))
+	pool, _ := codexJudgeMigrationDB(t, migrationVersionByName(t, "run_env_vars"))
 	q := New(pool)
 	owner, foreign := cjSeedUser(t, pool, nil), cjSeedUser(t, pool, nil)
 	if totals, err := q.GetVaultMaterialTotals(ctx, owner); err != nil || totals != (GetVaultMaterialTotalsRow{}) {
@@ -178,7 +178,7 @@ func TestVaultMaterialQueriesLiveDB(t *testing.T) {
 
 func TestVaultMaterialBatchBytesLiveDB(t *testing.T) {
 	ctx := context.Background()
-	pool, _ := codexJudgeMigrationDB(t, migrationVersionByName(t, "vault_mode"))
+	pool, _ := codexJudgeMigrationDB(t, migrationVersionByName(t, "run_env_vars"))
 	q := New(pool)
 	secretOwner, accountOwner, oversizedOwner := cjSeedUser(t, pool, nil), cjSeedUser(t, pool, nil), cjSeedUser(t, pool, nil)
 	const halfMiB = 512 * 1024

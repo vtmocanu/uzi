@@ -419,7 +419,7 @@ func (q *Queries) GetUserSecretCiphertextByID(ctx context.Context, arg GetUserSe
 const getUserSecretForUpdate = `-- name: GetUserSecretForUpdate :one
 SELECT id, kind, label, is_default, auto_eligible, disabled_at, enablement_rev,
        anthropic_success_generation FROM user_secrets
-WHERE id = $1 AND user_id = $2
+WHERE id = $1 AND user_id = $2 AND provider_id IS NULL
 FOR UPDATE
 `
 
@@ -444,6 +444,11 @@ type GetUserSecretForUpdateRow struct {
 // per-(user,kind) advisory lock the mutation takes first, it is what lets
 // set-default's clear-then-set and delete-default's guard read a stable picture.
 // Owner-scoped, so a foreign id is pgx.ErrNoRows (a 404), never another user's row.
+//
+// provider_id IS NULL (PRD #4320): a model provider's gateway key (kind anthropic_compatible_key)
+// is invisible to every generic /me/secrets mutation, all of which start here, so a rename,
+// rotate, set-default or delete addressed at a provider key's id is a 404 and cannot reseal it
+// under another kind's AAD. The provider routes use GetProviderKeyForUpdate instead.
 func (q *Queries) GetUserSecretForUpdate(ctx context.Context, arg GetUserSecretForUpdateParams) (GetUserSecretForUpdateRow, error) {
 	row := q.db.QueryRow(ctx, getUserSecretForUpdate, arg.ID, arg.UserID)
 	var i GetUserSecretForUpdateRow

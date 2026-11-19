@@ -31,6 +31,7 @@ import type {
   Proposal,
   ReviewCommentsSnapshot,
   RunKind,
+  ClaimProviderBinding,
 } from "./protocol.js";
 import type { AnswerVerdict, PauseMode, PlanVerdict } from "./steering.js";
 import { normalizeVerifiedSha, type PrSummaryClaim } from "./signals.js";
@@ -218,6 +219,11 @@ export interface RunContext {
    *  pre-plan JS-deps install, and is inherited by Bash, subagents and the guarded command lane.
    *  Absent when the runner could not prepare one (launch proceeds without GOTMPDIR). */
   managedGoWorkDir?: string;
+  /** Issue #4420, Claude run flight only (the runner sets it; Codex never does): the run-owned
+   *  scratch leaf `<scratch root>/run-<runId>`. It becomes TMPDIR for the lead CLI, the provisioning
+   *  subprocess and the pre-plan JS-deps install, and is inherited by Bash and subagents. Absent when
+   *  the runner could not prepare one (launch proceeds with the shared runner TMPDIR). */
+  runTmpdir?: string;
   /** PRD #3244: the claim's single lead-config reporter, constructed by the runner only. Executors
    *  call `enterPhase` before a lead turn; absent for stub/test executors and non-lead lanes. */
   leadConfig?: import("./lead-config-report.js").LeadConfigReporter;
@@ -253,6 +259,8 @@ export interface RunContext {
   kind?: RunKind;
   /** The worked issue for an issue run; null for a ci_fix run (no issue). */
   issueIid: number | null;
+  /** PRD 4173: the linked issue's key (ClaimResponse.issue_key); absent on an unlinked run. */
+  issueKey?: string;
   issueTitle: string;
   issueDescription: string;
   /** PRD #381: the bounded, bot/system-filtered snapshot of the issue's human
@@ -314,8 +322,11 @@ export interface RunContext {
    *  redactor is built from. The Codex executor applies it to projected tool text BEFORE bounding,
    *  so a claim secret straddling the cut cannot leave an unredacted prefix. Absent ⇒ identity. */
   redactText?: (s: string) => string;
-  /** Anthropic subscription OAuth token (CLAUDE_CODE_OAUTH_TOKEN) for the SDK. */
+  /** Anthropic subscription OAuth token (CLAUDE_CODE_OAUTH_TOKEN) for the SDK. Empty on a provider run. */
   oauthToken?: string;
+  /** PRD #4320 module 5/6: the decoded provider binding of a provider-bound run (exclusive with
+   *  `oauthToken`). Every Claude spawn of the run builds its env from it, never from an OAuth token. */
+  provider?: ClaimProviderBinding;
   /** Issue #4201: the run's current Anthropic credential, an immutable `{token, ordinal}` snapshot
    *  that an in-place switch advances. Absent on stubs, which keep reading `oauthToken`. */
   credential?: () => Readonly<{ token: string; ordinal: number }>;

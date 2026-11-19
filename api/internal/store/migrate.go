@@ -104,6 +104,14 @@ const ProductTokenMintLockClass int32 = 0x757A7074 // "uzpt"
 // *LockClass. XACT-scoped.
 const JobCreateLockClass int32 = 0x757A6A62 // "uzjb"
 
+// ModelProviderOwnerLockClass is the class half of the two-int advisory lock that serializes one
+// owner's model-provider creates, so the per-owner cap (PRD #4320: 20 providers, retired ones
+// included) cannot be passed twice by two concurrent creates under READ COMMITTED. Taken in SQL by
+// LockModelProviderOwner (queries/model_providers.sql), which carries this value as the literal
+// 1970957680; TestModelProviderOwnerLockClassMatchesSQL fails if the two disagree, and the
+// lockClassesFromSource collision check covers it like every other *LockClass. XACT-scoped.
+const ModelProviderOwnerLockClass int32 = 0x757A6D70 // "uzmp"
+
 // ReviewAuthorQueueLockClass is the class half of the two-int advisory lock that serializes
 // every mutation (admit, requeue, prune, stale eviction) of one (repo, ref) MR review-author
 // queue (issue #2347). Taken in SQL by LockReviewAuthorQueue (queries/mr_review_authors.sql),
@@ -134,11 +142,32 @@ const OAuthAuthorizeLockClass int32 = 0x757A6F61 // "uzoa"
 // XACT-scoped.
 const OAuthUserLockClass int32 = 0x757A6F75 // "uzou"
 
+// HibernationOwnerLockClass is the class half of the two-int advisory lock that serializes one
+// owner's automatic hibernation policy decisions (issue #4395, PRD warm reserve): the pass reads
+// an owner's whole pool, decides, and writes one worker, so two passes (two api replicas, or a
+// pass and its retry) deciding on the same owner would each see the other's candidate as a
+// ready keeper and could hibernate both members of a pool. A row lock on the candidate alone
+// cannot prevent that because the two transactions lock different rows.
+//
+// The lock is taken from Go (workersvc.hibernationOwnerTx), as the FIRST locking statement of
+// the transaction, before any worker or run row lock: no path may take it while already holding
+// a worker or run row lock. It is keyed by HibernationOwnerLockObjID(owner). XACT-scoped. The
+// source-enumeration collision test (TestProductTokenMintLockClassMatchesSQL) covers it like
+// every other *LockClass.
+const HibernationOwnerLockClass int32 = 0x757A686F // "uzho"
+
+// HibernationOwnerLockObjID derives the objid half of the per-owner hibernation lock from the
+// owner's uuid, the same derivation as the secret-mutation lock (the class half differs).
+func HibernationOwnerLockObjID(ownerID uuid.UUID) int32 { return userLockObjID(ownerID) }
+
 // SecretMutationLockObjID derives the objid half of the per-user secret mutation lock from
 // a user's uuid, exactly as the hosted-provision lock does: a uuid's leading bytes are
 // random, so two users can collide and serialize for a moment, a contention non-event,
 // never a correctness one.
-func SecretMutationLockObjID(userID uuid.UUID) int32 {
+func SecretMutationLockObjID(userID uuid.UUID) int32 { return userLockObjID(userID) }
+
+// userLockObjID is the shared per-user objid derivation: the first four uuid bytes.
+func userLockObjID(userID uuid.UUID) int32 {
 	return int32(binary.BigEndian.Uint32(userID[:4])) //nolint:gosec // wraparound is fine: a lock key, not a number
 }
 

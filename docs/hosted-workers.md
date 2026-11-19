@@ -251,6 +251,9 @@ finished on it for `worker_hibernation_idle_after` (default `336h`, between `1h`
 its last completed wake, and its creation. Logins and heartbeats do not count. A
 user's last or only worker is included, and there is no per-user opt-out.
 
+With [surplus mode](#surplus-warm-reserve) on, a pooled worker's long clock is owner-wide
+instead: see [Owner-wide long clock](#owner-wide-long-clock).
+
 **The pass.** The sweeper runs the pass at most once per minute and hibernates at
 most 10 workers per pass, oldest idle first. Each worker goes through the same
 admission checks as a manual hibernation (see the refusal list above) and the same
@@ -266,14 +269,102 @@ starve clean ones. When the controller refuses before scaling down, the worker i
 not tried again for at least 1 hour. Admin health's `fleet.hibernation` check names
 idle workers that are blocked this way and runs that have been parked past the
 threshold; see [Admin health](./admin-health.md).
+With surplus mode on, the check judges a pooled worker by the
+[owner-wide long clock](#owner-wide-long-clock): it lists the worker only when it is
+long-idle and a block was recorded at or after that anchor, so a refusal recorded by the
+surplus rule alone does not raise it.
 
 **Waking.** Every completed wake restarts the idle clock: a manual wake, a demand
 wake, turning the setting off, or a withdrawn hibernation. A woken worker gets a full
 threshold before it is considered again.
 
+With surplus mode on, the long clock of a pooled worker is the exception: only completed
+manual and demand wakes extend it, and warm and system wakes do not (see
+[Owner-wide long clock](#owner-wide-long-clock)). The surplus clock still restarts on every
+completed wake.
+
 **Record.** Automatic hibernations write no hibernation audit event. The worker's
 hibernation reason reads "automatic: no run activity for ..." (for example
-"automatic: no run activity for 14d").
+"automatic: no run activity for 14d"); a surplus admission (below) reads
+"automatic: surplus in pool, idle ..." (for example "automatic: surplus in pool, idle 2h").
+
+#### Surplus warm reserve
+
+With `worker_hibernation_surplus` on (default off; effective only while
+`worker_hibernation_enabled` and `worker_hibernation_auto` are both on), the pass
+also hibernates surplus workers sooner than the long idle rule. Among an owner's
+interchangeable workers, one idle, ready worker stays awake and the pool's other
+idle workers are hibernated once they have shown no run activity for the surplus
+threshold, `worker_hibernation_surplus_idle_after` (default `2h`, between `15m` and
+`336h`). The pass uses the shorter of that and `worker_hibernation_idle_after`; the
+settings card shows a hint when the surplus threshold is longer. See
+[Admin settings](./admin-settings.md#worker-hibernation). The long
+`worker_hibernation_idle_after` rule still applies, within the same per-pass budget
+and one-change-per-owner limit.
+
+**Equivalence pool.** Workers are interchangeable when they share the same owner,
+template, size, isolated lane, Docker setting, effective capabilities, protocol
+capabilities, max concurrent runs and cross-check slots. Ephemeral and unregistered
+workers are in no pool, so the rule never touches them.
+
+**Ready.** A worker counts as ready when it is online with a fresh heartbeat, awake,
+accepting new work (not cordoned, draining or in maintenance), has no assigned run, has
+no pending-outcome overflow, its cache cleanup has settled, and its memory authority is
+not lost. A worker that reported losing memory authority is not counted as ready. A
+worker advertising memory authority reporting (`worker_memory_pressure_v1` and
+`worker_memory_authority_claim_v1`) is counted as ready only after a recent `held`
+report from its current registration, within the worker heartbeat-staleness window.
+Until then its memory authority is unknown; after a loss it is lost. Neither is counted.
+
+**Which worker stays.** The kept worker is the most recently used ready one in the
+pool. A locked owner vault, the owner's custody-hold limit and an instance intake
+pause do not affect which worker is kept.
+
+**Limits.** The pass makes at most 10 state changes, and at most one per owner per pass,
+oldest first. A worker the usual admission checks refuse records its blocker as it does
+today (see the refusal list above and
+[Diagnosing a blocked hibernation](#diagnosing-a-blocked-hibernation-or-a-stuck-roll)).
+If the api runs with `UZI_ACTIVE_SNAPSHOT_DISABLED`, memory authority is unknown, so
+memory-capable pools are not surplus-hibernated.
+
+**Docker workers.** A surplus sleep goes through the same
+[cache cleanup before sleep](#cache-cleanup-before-sleep) as any hibernation, so a
+worker advertising `hibernation_cache_prune_v1` whose cleanup completes re-wakes with a
+pruned build cache.
+
+##### Owner-wide long clock
+
+While `worker_hibernation_surplus` is on, the long idle clock
+of a pooled worker runs from the latest of the owner's run activity, the worker's
+creation, and its last completed manual or demand wake. Owner run activity is any run of
+the owner, including runs on no worker; a run that is not terminal keeps the owner
+active, so none of its pooled workers is long-idle. Warm and system wakes do not extend
+this clock. The surplus clock above still restarts on every completed wake. An unpooled
+worker keeps the per-worker clock described under Idle.
+
+##### Warm reserve replenishment
+
+When no ready idle worker is awake in a pool, the api
+wakes one automatically hibernated member so the owner's next run finds a warm worker.
+All of these must hold:
+
+- The pool (at least two members) has no ready idle worker, no waking worker whose wake
+  has not failed, and no member with a demand wake pending.
+- The owner was active within the idle threshold (`worker_hibernation_idle_after`) or is
+  active now.
+- Instance intake is not paused. Only the instance intake pause suppresses a warm wake: a
+  locked owner vault and the owner being at the custody-hold limit do not, because a
+  warm worker is still useful there (cross-check and continuation claims and chat claims
+  are exempt from the limit).
+
+The wake takes a member the automatic pass hibernated (a manual hibernation is never
+warm-woken); a member that is still preparing is withdrawn first, then hibernated
+members, most recently used first. A member with a wake error, a manual cordon or
+maintenance in effect is never chosen. The worker's reason reads "automatic: warm
+reserve". It counts against the same 10 per pass and one per owner budget as a
+hibernation, and it writes no hibernation audit event. When memory authority is not
+persisted (`UZI_ACTIVE_SNAPSHOT_DISABLED`), memory-capable pools get no warm wake, as for
+the surplus sleep.
 
 #### Diagnosing a blocked hibernation or a stuck roll
 
@@ -498,6 +589,165 @@ Starting an older image outside this procedure is unsupported: it does not know 
 attempt, and could scale a worker down in the middle of a prune. CHECK constraints
 on the worker row refuse an old-code write that would reopen claims during an
 unsettled attempt, so such a write fails instead of silently dropping the fence.
+
+## Moving workers to a new node pool
+
+Changing `workers.nodeSelector` or `workers.tolerations` rolls every worker with its
+old volumes. When the new nodes are a dedicated, tainted pool, possibly in a different
+storage topology zone, those volumes may not attach there. The opt-in
+`workers.newPlacement` chart value lets you move workers one at a time instead, by
+recreating each worker's volumes where the new placement applies.
+
+How the stamp works:
+
+- While `workers.newPlacement` is set, the controller stamps a worker volume it
+  creates with the annotation `uzi.dev/placement: new`, unless that worker still has
+  an unstamped volume (then the new volume is created unstamped, per the rules below).
+  It never adds, removes or rewrites the stamp on an existing volume, and it deletes
+  nothing.
+- Per worker on each reconcile pass: if any of its volumes is Terminating, it creates
+  none; if none exist, it creates all of them stamped; if all existing ones are stamped,
+  it creates the missing ones stamped; if any existing one is unstamped, it creates the
+  missing ones unstamped.
+- A worker is stamped when `newPlacement` is set and every one of its volumes is
+  stamped (a worker with no volumes counts as stamped). Stamped workers render
+  `newPlacement`; all others render the global `workers.nodeSelector` and
+  `workers.tolerations`.
+- For a stamped worker both `newPlacement` fields replace the global ones, they do not
+  merge. A tolerations-only `newPlacement` therefore renders no node selector at all:
+  keep `kubernetes.io/arch: amd64` in `newPlacement.nodeSelector` and repeat any global
+  toleration the worker still needs.
+- Setting `newPlacement` rolls no worker that is still on the global placement: those
+  workers' pod templates are unchanged. Clearing it sends stamped workers back to the
+  global placement; the stamps are kept, so setting it again resumes. Changing it, or
+  setting it again with values different from before, changes stamped workers' pod
+  templates, and they roll through normal roll admission. A roll does not move their
+  volumes. Before retargeting `newPlacement`, confirm the new nodes can attach every
+  stamped worker's existing volumes. If they cannot, do not apply the retarget, or those
+  pods stay Pending: every stamped worker's placement changes at once, so the per-worker
+  procedure below cannot move them gradually. Plan a separate storage or cohort
+  migration instead.
+- Which volumes are recreated decides which workers move. A recycle for data plus Nix
+  pressure on a plain worker moves it. A Nix-only size recycle stays on the old
+  placement, and so does a Docker pressure recycle, which keeps `/data`. Run-bound
+  (ephemeral) workers get fresh volumes, so they move. Hibernation is unchanged.
+
+Before you start, check the worker StorageClass (`workers.storageClass`, or the cluster
+default when it is empty). It must use `volumeBindingMode: WaitForFirstConsumer`, or
+otherwise provision in the new pool's zone. With `Immediate` binding a recreated volume
+is provisioned before any pod asks for it and can land in the old zone, after step 2.6
+has already deleted the worker's data; the worker then stays Pending on the new pool.
+Delayed binding alone is not enough: the provisioner must also be able to create
+volumes in the new pool's topology (no `allowedTopologies` or storage policy limited to
+the old zone). Prove it first, for example with a throwaway claim and pod pinned to a new
+node, before deleting any worker's volumes.
+
+Also test whether an existing worker volume can attach on a new node: pin a throwaway pod
+to a new node that mounts a disposable or retired volume still on the old backing
+datastore, topology and storage policy, and not mounted elsewhere. A fresh copy
+provisioned for the test proves only new-volume creation. If the old volume cannot
+attach, step 3 is safe only after every worker has moved: a worker still on its old
+volumes would stay Pending under the new global placement.
+
+Procedure (it moves unstamped workers that are on the global placement):
+
+Do not manually delete or replace worker claims while the controller is running.
+Concurrent partial recreation can leave the worker on global placement rather than
+move it; follow the stop-and-confirm sequence below.
+
+1. Set `workers.newPlacement` (`nodeSelector` and `tolerations`) in your values and
+   apply it (`helm upgrade`, or let the GitOps sync finish). Editing the values file alone
+   changes nothing. Confirm the running controller has it before step 2: its Deployment
+   carries `UZI_WORKER_NEW_PLACEMENT_NODE_SELECTOR` and/or
+   `UZI_WORKER_NEW_PLACEMENT_TOLERATIONS` with the expected values, and its pod has
+   restarted onto that spec. A controller still on the old configuration would recreate
+   the deleted volumes unstamped. No worker on the global placement rolls.
+2. For each worker that is not hibernated (wake a hibernated worker first, or leave it
+   for later), one worker at a time. Two workers of the same owner and lane that are each
+   other's only usable coverage cannot both be moved at once: each restore waits on the
+   other, so neither comes back. A hibernated or cordoned worker gives no coverage, so
+   wake an owner's other worker first when it is the only cover.
+   1. Cordon the worker and wait until it holds no assigned run and no recovery custody
+      hold. Back up anything you need from `/data`.
+      - The cordon is the intake fence; idle checks do not replace it, since a run can be
+        claimed between two checks and step 2.4 would then kill it. The CLI cordons only
+        your own workers: have the owner cordon theirs, or defer the move.
+      - Completion alone does not clear an open custody hold, including on task and
+        prompt runs. Preserve or recover its output first (verified forge output or a
+        usable recovery export); only the run's owner can explicitly discard the hold.
+        Do not reach step 2.6 while a hold is open: deleting the volumes destroys the
+        local copy without settling the hold, which stays listed until the owner
+        discards it.
+   2. Confirm that the restore in step 2.7 can be admitted. The paced roll's
+      prerequisites must hold for this worker:
+      - usable, uncordoned coverage from another worker of the same owner and lane,
+        where pacing requires it;
+      - capability coverage, where required;
+      - a known image and version;
+      - no blocking canary in flight.
+
+      If they do not hold, stop here and uncordon the worker; nothing has changed yet.
+      Do not weaken pacing to get past it. A manual cordon on the only usable covering
+      worker, or on the pool's unpromoted canary, also holds the restore back.
+   3. Stop the controller: scale its Deployment to 0 and wait until its pods have
+      terminated. Under GitOps, pause self-heal for it first, or the sync restores it.
+   4. Scale the worker's Deployment (`uzi-hw-<id>`, where `<id>` is the worker id) to 0
+      and confirm no worker pod exists.
+   5. Recheck step 2.2; another worker may have been cordoned since. If the
+      prerequisites no longer hold, do not delete anything. Instead:
+      1. restore the worker Deployment's replicas;
+      2. start the controller again and restore self-heal;
+      3. uncordon the worker.
+
+      It returns on its old placement with its volumes intact.
+   6. Delete all of the worker's volumes (`uzi-hw-<id>-data`, `uzi-hw-<id>-nix`, and
+      `uzi-hw-<id>-dind-data` on Docker workers) and confirm they are gone, not
+      Terminating.
+   7. Start the controller again (restore its replicas and self-heal). On the following
+      reconcile passes it creates the volumes stamped, re-renders the worker's
+      Deployment with the new placement, and restores its replicas once the existing
+      placement guards permit: the controller does not start a worker pod over a
+      missing or Terminating volume, and waits until it has observed the recreated
+      claims live. The restore goes through the normal paced roll admission (roll evidence
+      for the worker, a free roll slot in its pool, no other unpromoted canary), so it
+      can wait on that. With a `WaitForFirstConsumer` StorageClass the volumes bind in the
+      new zone when the pod is scheduled.
+   8. Confirm the worker is online on a new node, then uncordon it.
+3. When no unstamped worker remains (hibernated workers included), copy `newPlacement`
+   into `workers.nodeSelector` and `workers.tolerations` first, then clear
+   `newPlacement`. Helm merges maps into the
+   chart default, so an empty `nodeSelector: {}` keeps the default
+   `kubernetes.io/arch: amd64`; when the new placement has no node selector, set
+   `workers.nodeSelector: null`. Render the chart and confirm the global selector and
+   tolerations equal the new placement before clearing it.
+
+Check which workers are stamped. Annotations are not shown by `-L`, so use:
+
+```sh
+kubectl get pvc -n <worker namespace> \
+  -o 'custom-columns=NAME:.metadata.name,PLACEMENT:.metadata.annotations.uzi\.dev/placement'
+```
+
+Caveats:
+
+- Step 2.6 permanently deletes the worker's `/data` (run clones and the recovery store)
+  and any Docker state. The controller does not guard a manual delete, so step 2.1 is the
+  only safety gate.
+- While the controller is stopped, no worker is provisioned, rolled, hibernated or
+  woken. Keep that window to minutes.
+- Clearing `newPlacement` before updating the global placement sends stamped workers back
+  to the old nodes, where their new volumes may not attach. Rolling back to a controller
+  version without this feature has the same effect, because it ignores the stamp.
+- Known issues that can stall a restore in step 2.7:
+  - a roll pool whose participant reservations have lost their canary holds every
+    participant, and the controller does not recover it yet (#4466);
+  - while a restore waits on admission, its `WaitForFirstConsumer` claims stay Pending
+    before any consumer has tried to bind them, and can be reported stranded after the
+    bind timeout (#4468); Pending alone proves neither a storage fault nor healthy
+    storage;
+  - the roll status can drop a worker's health row when its blocker is synthetic, and
+    the worker list shares that status (#4467); when it looks stale, inspect the live
+    Deployment, reservation, claims and pod, and the controller logs.
 
 ## Pod shutdown grace
 
@@ -858,9 +1108,14 @@ or supported manual settled-tree cleanup frees space. See
 bounds, periodic reclaim, admission stop and the bounded `data_volume_full`
 park, and [Run recovery](./run-recovery.md) for supported inspect/discard
 procedures; pressure does not authorize deleting protected sources.
-[PRD #3431](../prds/3431-pod-epoch-reclaim.md) M1b settlement/deletion is
-implemented behind an off-by-default startup opt-in, so production deletes
-nothing unless an operator selects one canary worker, and #3329's genuine-idle reclaim roll is deferred. This policy adds
+[PRD #3431](../prds/3431-pod-epoch-reclaim.md) M1b attempt deletion is
+implemented behind an off-by-default startup opt-in, so production deletes no
+attempts unless an operator selects one canary worker, and #3329's genuine-idle reclaim roll is deferred. One exception is requested by default but still runs only on an eligible pass with an attested runtime declaration (the chart's default empty runtime declaration supplies no attestation, so with chart defaults it deletes nothing): the
+runner TMPDIR scratch reclaim (#4043, see
+[startup disable and observation](./run-recovery.md#runner-tmpdir-scratch-reclaim-startup-disable-and-observation)).
+The bound `.retire-*` parent phase (#4263, see
+[Disk-full residual](./worker-docker.md#disk-full-residual-on-the-data-volume)) deletes no
+bound parent on a uid-split pod: nothing writes `settled`, so every bound parent is kept. This policy adds
 no reclaim authority.
 
 ### Docker workers: run directory on the data volume

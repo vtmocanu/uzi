@@ -238,6 +238,40 @@ var knownInstructions = []knownInstruction{
 			"resolution check is the complete bar for a help reference.",
 	},
 	{
+		command:  "uzi provider create",
+		evidence: evidenceGoTest,
+		where:    "TestProviderListEmptyShowsAllowedURLs",
+		note: "RUNTIME: `uzi provider list` on an enabled server with no providers points at " +
+			"the create verb (provider.go). TestProviderListEmptyShowsAllowedURLs runs the real " +
+			"cobra command against a fake client and asserts the hint is printed.",
+	},
+	{
+		command:  "uzi provider list",
+		evidence: evidenceGoTest,
+		where:    "TestProviderNameOrIDResolution",
+		note: "RUNTIME: an unknown provider name points at the list verb (provider.go), as does " +
+			"a create without --base-url (listing the allowed URLs). TestProviderNameOrIDResolution " +
+			"and TestProviderCreateRejectsBadFlags run the real cobra command against a fake " +
+			"client and assert the messages name it.",
+	},
+	{
+		command:  "uzi provider use",
+		evidence: evidenceGoTest,
+		where:    "TestProviderUseRefusesUnusableBeforeWrite",
+		note: "RUNTIME: refusing a keyless or key-disabled provider names the fix and the retry " +
+			"command `uzi provider use <id>` (provider.go). TestProviderUseRefusesUnusableBeforeWrite " +
+			"runs the real cobra command against a fake client and asserts the retry command is " +
+			"printed with the provider's id.",
+	},
+	{
+		command:  "uzi provider test",
+		evidence: evidenceGoTest,
+		where:    "TestProviderCreateSendsMapAndHintsKey",
+		note: "RUNTIME: `uzi provider create` ends with a next-step hint naming the test verb " +
+			"(provider.go). TestProviderCreateSendsMapAndHintsKey runs the real cobra command " +
+			"against a fake client and asserts the hint is printed.",
+	},
+	{
 		command:  "uzi token pool",
 		evidence: evidenceHelpOnly,
 		// ARRIVED WITH PRD #111 M3. `uzi worker set-token --auto` names the command
@@ -317,6 +351,15 @@ var knownInstructions = []knownInstruction{
 			"TestDiskOwnerActionsSinglePOST executes the real cobra command against an HTTP " +
 			"fixture, asserting one bodyless Resume POST, queued success and refusal/error exits. " +
 			"This is CLI/HTTP evidence; the fixture is not a booted API.",
+	},
+	{
+		command:  "uzi vault unlock",
+		evidence: evidenceGoTest,
+		where:    "TestVaultUnlockPrompt",
+		note: "RUNTIME: `uzi repo env list` prints it to stderr when the list reports vault_locked " +
+			"(repo.go vaultLockedNote), on its own indented line, with the caller's --context/--url appended. " +
+			"TestVaultUnlockPrompt executes the real cobra command against a fake client, " +
+			"asserting the password prompt, one unlock call and \"Vault unlocked.\".",
 	},
 	{
 		command:  "uzi run cancel",

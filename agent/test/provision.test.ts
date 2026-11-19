@@ -373,3 +373,41 @@ describe("fixed devbox request provenance", () => {
     }, input, source, signal, async () => {}), /guard must be synchronous/);
   });
 });
+
+describe("run-owned TMPDIR (issue #4420)", () => {
+  const runLeaf = "/data/.tmp/run-123e4567-e89b-42d3-a456-426614174000";
+
+  it("buildProvisionEnv uses the run leaf over the ambient TMPDIR, and only when given", () => {
+    const source = { PATH: "/usr/bin:/bin", TMPDIR: "/shared/tmp" };
+    assert.strictEqual(buildProvisionEnv(source, "/home", runLeaf).TMPDIR, runLeaf);
+    assert.strictEqual(buildProvisionEnv(source, "/home").TMPDIR, "/shared/tmp");
+  });
+
+  it("provisionTools hands TMPDIR=<run leaf> to both devbox calls; an input without runTmpdir keeps the shared TMPDIR", async () => {
+    const seen: Array<string | undefined> = [];
+    const run = async (_cmd: string, args: string[], opts: { cwd: string; env: NodeJS.ProcessEnv }): Promise<RunResult> => {
+      seen.push(opts.env.TMPDIR);
+      return { stdout: args[0] === "shellenv" ? 'export PATH="/nix/bin:$PATH"' : "", stderr: "" };
+    };
+    const processEnv = { PATH: "/usr/bin", TMPDIR: "/shared/tmp" };
+    await provisionTools({ packages: ["go"], runDir: path.join(tmp, "a"), homeDir: tmp, runTmpdir: runLeaf },
+      { log: nullLogger(), run, processEnv, runPathProbe: async () => ({ stdout: "[]", stderr: "" }) });
+    assert.deepStrictEqual(seen.slice(0, 2), [runLeaf, runLeaf]);
+    seen.length = 0;
+    await provisionTools({ packages: ["go"], runDir: path.join(tmp, "b"), homeDir: tmp },
+      { log: nullLogger(), run, processEnv, runPathProbe: async () => ({ stdout: "[]", stderr: "" }) });
+    assert.deepStrictEqual(seen.slice(0, 2), ["/shared/tmp", "/shared/tmp"]);
+  });
+
+  it("the fixed devbox request binds the run leaf and refuses an env carrying a different TMPDIR", () => {
+    const input = { runDir: "/data/provision/run", homeDir: "/data/provision/home", runTmpdir: runLeaf };
+    const source = { PATH: "/usr/bin:/bin", TMPDIR: "/shared/tmp" };
+    const signal = new AbortController().signal;
+    const env = buildProvisionEnv(source, input.homeDir, runLeaf);
+    const req = prepareSupervisedProvision("devbox", ["install"], { cwd: input.runDir, env }, input, source, signal, () => {});
+    assert.strictEqual(req.env.TMPDIR, runLeaf);
+    assertSupervisedProvisionRequest(req);
+    assert.throws(() => prepareSupervisedProvision("devbox", ["install"],
+      { cwd: input.runDir, env: buildProvisionEnv(source, input.homeDir) }, input, source, signal, () => {}), /not canonical/);
+  });
+});

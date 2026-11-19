@@ -225,6 +225,7 @@ uzi worker list | rm <id> | set-token <worker-id> <label> | set-token <worker-id
 uzi worker cordon <id> [-m <reason>] [--json]
 uzi worker uncordon <id> [--json]
 uzi repo list | remove <id> [--force]
+uzi repo env list <id> [--json]
 uzi project-sync status <repo> | resync <repo>
 uzi pr list [--repo <id>] | checks <iid> [--repo <id>] [--watch]
 uzi ci list [--repo <id>] [--limit <n>] | jobs <run-id> [--repo <id>] | fix <ref> [--repo <id>]
@@ -1855,7 +1856,8 @@ This does three things, in order, and stops before the third if either of the
 first two fails:
 
 1. **Create** — a new `task` run, on the repo matched from your `origin`
-   remote (`--repo <id>` overrides the auto-detection, see `uzi repo list`).
+   remote (`--repo <id>` only picks among the repos your origin matches, see
+   `uzi repo list`; see [Origin matching](#origin-matching) below).
    The server names the branch: `uzi/task/<run-id>`.
 2. **Push** — your local HEAD (or `--base <ref>`, if given) to that branch,
    with **your own** git credentials — the same push you'd type by hand.
@@ -1882,6 +1884,47 @@ git fetch origin uzi/task/<run-id> && git switch uzi/task/<run-id>
 Continuation is the same `uzi run follow-up <id>` you'd use on any other run;
 watch it with `uzi run get`/`uzi run logs --follow`, or drop into
 [`uzi tui`](#watching-runs-live-uzi-tui).
+
+### Origin matching
+
+Because the push goes to `origin`, the connected repo must be the one `origin`
+pushes to: its owner/repo path **and** its host must match. The check reads
+the push destination (`git remote get-url --push --all origin`), which applies
+`pushurl`, `pushInsteadOf` rewrites and multiple `remote.origin.url` values.
+Handoff requires exactly one push destination and refuses otherwise. For SSH
+origins it also refuses a set `remote.origin.receivepack`, which changes the
+remote command the host check evaluates. `--repo` never bypasses this check; it
+only picks among repos that already match.
+
+The check covers creating a handoff only:
+
+- **Pulling the result:** `git fetch origin` (the command above and the CLI's
+  hint) reads origin's *fetch* URL. If that differs from the push destination,
+  add a separate remote for the repository handoff pushed to. Confirm
+  `git remote get-url <remote>` names that repository, then run
+  `git fetch <remote> uzi/task/<run-id>`. Don't paste the output of
+  `git remote get-url --push` back into git, because `insteadOf` rules can
+  rewrite it a second time.
+- **`uzi handoff rm`:** it deletes the branch with `git push origin --delete`,
+  which runs no check and goes to every push destination. Confirm
+  `git remote get-url --push --all origin` before removing.
+
+- **https / http origin:** the host must equal the host of the forge's web URL.
+- **SSH origin (scp-like `git@host:owner/repo` or `ssh://`):** the host your SSH
+  config resolves to must be the forge's web host (or `ssh.github.com` for a
+  GitHub repo on `github.com`). The CLI finds it with `ssh -G`, passing the
+  remote's user, port and the `git-receive-pack` command the push runs, so
+  `Match command` rules resolve as they will for the push. `ssh -G` does not connect, but it does evaluate your
+  SSH config, including any `Match exec` blocks, which can run local commands.
+- **Transport overrides are refused**, even when empty: `GIT_SSH`,
+  `GIT_SSH_COMMAND` and `core.sshCommand` can send the push somewhere `ssh -G`
+  cannot see. `GIT_CONFIG` is refused too: it hides from `git config` the
+  settings the push reads. Use an https remote instead.
+- **Anything else is refused:** `git://`, `file://`, `git+ssh://`, local paths
+  and other schemes, an `ssh://` origin containing `%` or a password, and any
+  origin whose host, user or port holds whitespace or control characters.
+
+No flag bypasses the check.
 
 A few things worth knowing before you rely on this:
 
@@ -2880,6 +2923,49 @@ the same repo scope.
 it straight into `file`/`dismiss`/`resolve`. Treat `location`, the title and `repo_path` as
 untrusted free text (they are agent-authored): render them as data, and branch only
 on the `status`/`bucket` enums.
+
+## Model providers: `uzi provider`
+
+A [model provider](./providers.md) is a named Anthropic-compatible gateway with its own key
+and model map. The CLI manages the parts that never handle a credential:
+
+```sh
+uzi provider list                              # NAME, URL, AUTH, MODELS, KEY, TEST, RETIRED
+uzi provider create --name corp-gw --base-url https://gw.example.com/anthropic \
+  --model haiku=corp-haiku:200000 --model sonnet=corp-sonnet:200000
+uzi provider edit corp-gw --name corp --model haiku=corp-haiku:200000
+uzi provider test corp                         # auth and tool-call results, separately
+uzi provider retire corp
+uzi provider use corp                          # select as your Claude source; --none clears it
+```
+
+`<name|id>` matches an id exactly or a name without regard to case. `create` needs `--name`,
+`--base-url` (exactly one of the URLs your operator allowed; `uzi provider list --json` shows
+them as `allowed_base_urls`) and `--model haiku=...`. `--auth-style` is `bearer` (default) or
+`x_api_key`. `--model` is `alias=model[:context_window]` and repeatable; `edit --model` replaces
+the whole map. A trailing `:0` stays part of the model id; any other all-digit suffix after the
+last colon is read as the context window.
+
+`test` prints an `auth:` line (`ok`, `rejected`, `inconclusive`) and a `tools:` line (`passed`,
+`not_supported`, `inconclusive`, `not_run`), then "Neither result certifies full compatibility
+with Claude." `--json` carries the same fields. Tests are limited to one at a time and 30 per hour
+per user.
+
+Web-only, deliberately: the **API key** (add, replace, remove, enable), a **base URL or auth
+style change**, and **deleting** a provider. There is no key verb or flag, so a stolen CLI token
+cannot mint or redirect a credential. `create` ends by pointing you at Settings for the key.
+A server without `UZI_PROVIDER_ALLOWED_BASE_URLS` has the feature off: `list` says so
+(`--json` gives `enabled: false`); `create` is refused with `provider_base_url_not_allowed` (exit 2), and `edit`, `test` and `retire` exit 5. A refusal prints the server's
+`reason` (for example `provider_base_url_not_allowed`) after the message. Selecting a provider
+as your Claude source is `uzi provider use <name|id>`; `uzi provider use --none` clears it so Claude
+runs use your Anthropic token again (see
+[Use a provider as your Claude source](./providers.md#use-a-provider-as-your-claude-source)). It
+applies to runs you start afterwards and Codex runs are unaffected. Exit codes: 2 for usage errors
+(pass a name or id, or `--none`, not both), 4 when the provider is not found, 5 when it is retired,
+has no key or a disabled key, the feature is off, or the server answers `provider_source_unusable`
+(`use --none` only clears the selection, so it succeeds even with the feature off).
+`--json` prints `{"claude_provider_id", "name"}`. `run get` shows a `PROVIDER` row and cost as
+"unknown (custom provider)". Runs through a provider are currently blocked and stay queued; see [Model providers](./providers.md).
 
 ## Anthropic tokens
 
@@ -3968,7 +4054,10 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   mode](./handoff.md#interactive-mode);
 - `limit_wait` — parked on a Claude or Codex subscription usage window, promoted
   back to `queued` once past its `retry_not_before` (reset plus jitter, or bounded
-  fallback when no usable reset is known); see [Paused on a usage limit](run-limit-wait.md);
+  fallback when no usable reset is known); see [Paused on a usage limit](run-limit-wait.md).
+  A custom-provider run's gateway rate limit also parks here, retries at 1, 5 and
+  15 minutes and then waits for you; `uzi run resume` resumes it (see
+  [A custom provider's gateway rate limit](run-limit-wait.md#a-custom-providers-gateway-rate-limit));
 - `pool_wait` — an `auto` worker held because its Anthropic token pool is
   genuinely empty, resumed once a token is pooled — see [Letting uzi pick the
   token](anthropic-token.md#letting-uzi-pick-the-token-auto-selection);
@@ -4044,6 +4133,15 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   Settings, or `uzi run set-token` where the run accepts a token switch),
   `run list` shows `paused (credential disabled)`, and the TUI draws it as
   `⊘ cred disabled` in NEEDS YOU.
+  A `paused` run can also be **held on a model provider** (PRD #4320):
+  `hold_reason: provider_destination_not_allowed` means the operator removed the provider's
+  URL from `UZI_PROVIDER_ALLOWED_BASE_URLS`, and the run resumes by itself once it is allowed
+  again; `hold_reason: provider_binding_stale` means the provider's key or revision changed
+  after the run was created, so it cannot continue. `run get` prints a `HOLD` row reading
+  `provider URL not allowed` or `provider binding changed`; `run logs --follow` and `run wait`
+  name the next step (wait, or `uzi run cancel` and start a new run). No worker claims a provider
+  run yet (activation is blocked), so these holds cannot occur until it lands. `run resume` is refused with a 409 for both, and neither
+  falls back to an Anthropic token. See [Model providers](./providers.md#what-a-run-keeps).
   A `paused` run can also be **waiting because your credentials were reset**
   (`hold_reason: credentials_reset`): a Claude or chat run created before an
   admin-issued [account reset](auth-design.md) found no model credential at

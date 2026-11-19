@@ -7,8 +7,8 @@ import {
   type AuthorityTransaction, type WorkerLifetime,
 } from "./authority-lock.js";
 import {
-  AuthorityPostWriteRefusal, leaseEpoch, leaseHarness, openAuthorityStore, peekAuthoritySlot, peekSourceRootIdentity, processWorkerIncarnation,
-  type AuthorityFsOps, type AuthorityStore, type EndedSlotReceipt, type SlotCohort, type SlotSnapshot, type SourceUseLease,
+  AuthorityPostWriteRefusal, leaseEpoch, leaseHarness, openAuthorityStore, peekAllAuthoritySlots, peekAuthoritySlot, peekSourceRootIdentity, processWorkerIncarnation,
+  type AuthorityFsOps, type AuthorityReadBound, type AuthorityStore, type EndedSlotReceipt, type SlotCohort, type SlotSnapshot, type SourceUseLease,
 } from "./completion-authority.js";
 import {
   sourceCoreDigest, sourceFenceOf, verifyCertifiedSource, verifyPublishedSource,
@@ -894,8 +894,13 @@ export class AuthorityRuntime implements AuthorityScope {
    * key derivation is the only touch of `clonePath` (its lstat walk); nothing inside the clone is read. Rejects on any
    * uncertainty (an unreadable or unauthenticated store, a slot one ahead of its head); null when no slot exists.
    */
-  peekSlot(clonePath: string): Promise<SlotSnapshot | null> {
-    return peekAuthoritySlot({ dataDir: this.#options.lifetime.dataDir, workerToken: this.#options.workerToken }, path.resolve(clonePath));
+  peekSlot(clonePath: string, bound?: AuthorityReadBound): Promise<SlotSnapshot | null> {
+    return peekAuthoritySlot({ dataDir: this.#options.lifetime.dataDir, workerToken: this.#options.workerToken }, path.resolve(clonePath), bound);
+  }
+
+  /** Issue #4420: every slot through {@link peekAllAuthoritySlots} (read-only, bounded by `max`); rejects on any uncertainty. */
+  peekAllSlots(max: number, bound?: AuthorityReadBound): Promise<SlotSnapshot[]> {
+    return peekAllAuthoritySlots({ dataDir: this.#options.lifetime.dataDir, workerToken: this.#options.workerToken }, max, bound);
   }
 
   /** issue #3644 m4a - the data root and join token the restore boundary records are read and authenticated with. */

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/vtmocanu/uzi/api/internal/issuesource"
 	"github.com/vtmocanu/uzi/api/internal/slacksvc"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
@@ -34,6 +35,28 @@ func TestTranslateGateSubmitErr(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := translateGateSubmitErr(tc.in); !errors.Is(got, tc.want) || (tc.want == nil && got != nil) {
 				t.Fatalf("translateGateSubmitErr(%v) = %v, want %v", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// A refused linked filing arrives as ErrForgeIssueWrite wrapping the issuesource refusal; Slack
+// must get the non-retryable sentinel, not the "press Create again" one.
+func TestTranslateConfirmProposalErr(t *testing.T) {
+	linked := fmt.Errorf("%w: %w", workersvc.ErrForgeIssueWrite, issuesource.ErrIssueWriteNotOffered)
+	cases := []struct {
+		name string
+		in   error
+		want error
+	}{
+		{"linked repo refusal", linked, slacksvc.ErrChatProposalLinkedRepo},
+		{"plain forge write failure", workersvc.ErrForgeIssueWrite, slacksvc.ErrChatProposalForge},
+		{"not pending", workersvc.ErrProposalNotPending, slacksvc.ErrChatProposalHandled},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := translateConfirmProposalErr(tc.in); !errors.Is(got, tc.want) {
+				t.Fatalf("translateConfirmProposalErr(%v) = %v, want %v", tc.in, got, tc.want)
 			}
 		})
 	}

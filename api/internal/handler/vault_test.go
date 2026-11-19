@@ -131,6 +131,21 @@ func (m *memVaultQ) LockVaultAccountMaterialBatch(context.Context, store.LockVau
 func (m *memVaultQ) LockVaultSecretMaterialBatch(context.Context, store.LockVaultSecretMaterialBatchParams) ([]store.LockVaultSecretMaterialBatchRow, error) {
 	return nil, nil
 }
+func (m *memVaultQ) LockVaultEnvConnectionsKeyShare(context.Context, uuid.UUID) ([]uuid.UUID, error) {
+	return nil, nil
+}
+func (m *memVaultQ) LockVaultEnvReposKeyShare(context.Context, uuid.UUID) ([]uuid.UUID, error) {
+	return nil, nil
+}
+func (m *memVaultQ) ListVaultEnvMaterialCandidates(context.Context, store.ListVaultEnvMaterialCandidatesParams) ([]uuid.UUID, error) {
+	return nil, nil
+}
+func (m *memVaultQ) LockVaultEnvMaterialBatch(context.Context, store.LockVaultEnvMaterialBatchParams) ([]store.LockVaultEnvMaterialBatchRow, error) {
+	return nil, nil
+}
+func (m *memVaultQ) ResealVaultEnvMaterial(context.Context, store.ResealVaultEnvMaterialParams) (int64, error) {
+	return 0, errors.New("memory vault: no env material")
+}
 func (m *memVaultQ) ResealVaultAccountMaterial(context.Context, store.ResealVaultAccountMaterialParams) (int64, error) {
 	return 0, errors.New("memory vault: no account material")
 }

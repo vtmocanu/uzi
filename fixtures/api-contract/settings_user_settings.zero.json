@@ -21,6 +21,7 @@
   "typeface": null,
   "default_harness": null,
   "judge_runs_on": null,
+  "claude_provider_id": null,
   "judge_models": null,
   "summary_models": null,
   "effort_settings": null,

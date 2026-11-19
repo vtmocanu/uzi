@@ -404,6 +404,16 @@ func (m tuiModel) boardAccountCols(rows []apitypes.RunListItemDTO) boardAccountC
 // boardCredLabel selects the run's snapshot, then applies the personal-list-only
 // display hint. A deleted snapshot and every admin label keep their recorded name.
 func (m tuiModel) boardCredLabel(r apitypes.RunListItemDTO) string {
+	if isProviderRun(r.RunDTO) {
+		// A provider run has no Anthropic token: the column names the provider (plain text, it is
+		// user-authored), or the short "(no name)" when only the id is known: the column is
+		// boardCredWidth wide, which "(name unavailable)" would clamp. Never claims deletion.
+		cell := "(no name)"
+		if r.ProviderName != nil && *r.ProviderName != "" {
+			cell = providerCell(r.RunDTO)
+		}
+		return clampVisual(m.renderer.Plain(cell, boardCredWidth), boardCredWidth)
+	}
 	var label, id *string
 	count := 0
 	switch r.Harness {

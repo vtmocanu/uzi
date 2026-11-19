@@ -52,7 +52,7 @@ func issueQueries(t *testing.T, srv *youtracktest.Server) []string {
 // eligibility name, but the tag is followed by id. After a rename in YouTrack
 // the tagged issue is still listed, under the stored name; an issue carrying
 // only the account's tag of the old name, or only someone else's tag of the new
-// name, is not.
+// name, is not. No query carries a tag name.
 func TestListIssuesFollowsARenamedEligibilityTag(t *testing.T) {
 	y, srv := newFakeDriver(t)
 	eligible := srv.SeedIssue("eligible", "", youtracktest.EligibilityTagID)
@@ -65,9 +65,13 @@ func TestListIssuesFollowsARenamedEligibilityTag(t *testing.T) {
 	if got := listedIIDs(t, y, youtracktest.EligibilityTagName); !slices.Equal(got, []int64{eligible}) {
 		t.Fatalf("stored eligibility name lists %v after the rename, want only %d (not %d or %d)", got, eligible, oldName, newName)
 	}
-	queries := issueQueries(t, srv)
-	if len(queries) == 0 || !strings.Contains(queries[0], "tag: {renamed}") || strings.Contains(queries[0], youtracktest.EligibilityTagName) {
-		t.Errorf("queries = %q, want the live name and not the stored one", queries)
+	// Changed on purpose (PRD #4173 M4, replacing the check that the query carried
+	// the tag's live name): the listing pages the tag's issues by id, so no tag
+	// name, live or stored, is sent in a search query at all.
+	for _, q := range issueQueries(t, srv) {
+		if strings.Contains(q, "tag:") || strings.Contains(q, "renamed") || strings.Contains(q, youtracktest.EligibilityTagName) {
+			t.Errorf("a listing sent the query %q, want no tag name in any query", q)
+		}
 	}
 	got, err := y.GetIssue(context.Background(), testProjectID, eligible)
 	if err != nil || !slices.Equal(got.Labels, []string{youtracktest.EligibilityTagName}) {

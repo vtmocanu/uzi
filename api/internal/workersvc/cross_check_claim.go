@@ -116,7 +116,9 @@ func singleFamilyCheckerCustody(harness string, payload *ClaimPayload) bool {
 	case string(HarnessCodex):
 		return payload.Secrets.Codex != nil && payload.Secrets.AnthropicOAuthToken == ""
 	case string(HarnessClaude):
-		return payload.Secrets.AnthropicOAuthToken != "" && payload.Secrets.Codex == nil
+		// PRD #4320 module 5: a checker child never holds a provider binding (cross-check has no
+		// provider support until PRD #4322); assembleClaim refuses a provider-bound child first.
+		return payload.Secrets.AnthropicOAuthToken != "" && payload.Secrets.Codex == nil && payload.Secrets.Provider == nil
 	}
 	return false
 }

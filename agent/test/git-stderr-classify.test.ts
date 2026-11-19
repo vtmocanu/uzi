@@ -3,11 +3,18 @@ import assert from "node:assert/strict";
 import { classifyGitStderr, classifyGitStderrText, GitCache } from "../src/git.js";
 import { nullLogger } from "./helpers.js";
 
-// #3929: GitHub's bare `! [remote rejected] <sha> -> <branch> (failed)` is the only remote-rejected
-// shape classified transient; everything that states a reason, and any ambiguity, stays permanent.
+// #3929, #4438: GitHub's bare `! [remote rejected] <sha> -> <branch> (failed)` and its
+// `(missing necessary objects)` sibling are the only remote-rejected shapes classified transient;
+// everything that states any other reason, and any ambiguity, stays permanent.
 
 const SHA = "0123456789abcdef0123456789abcdef01234567";
 const URL = "https://github.com/org/repo.git";
+const MNO = "missing necessary objects";
+// The exact stderr observed in #4438 (leading space and five spaces after `]` are load-bearing).
+const OBSERVED_MNO_STDERR =
+  "To https://github.com/vtmocanu/uzi.git\n" +
+  " ! [remote rejected]     8e69f19016fa9f10cd8ba8ced7f7afc6d8cccd27 -> agent/issue-4395 (missing necessary objects)\n" +
+  "error: failed to push some refs to 'https://github.com/vtmocanu/uzi.git'\n";
 const status = (branch: string, reason = "failed") => ` ! [remote rejected] ${SHA} -> ${branch} (${reason})\n`;
 const trailer = (url = URL) => `error: failed to push some refs to '${url}'\n`;
 const full = (branch: string, reason = "failed", remote = "", url = URL) =>
@@ -21,6 +28,13 @@ describe("classifyGitStderrText", () => {
     ["CR-separated lines", full("agent/issue-7").replace(/\n/g, "\r")],
     ["CRLF-separated lines", full("agent/issue-7").replace(/\n/g, "\r\n")],
     ["an empty remote: line", full("agent/issue-7", "failed", "remote: \n")],
+    ["observed #4438 stderr (missing necessary objects)", OBSERVED_MNO_STDERR],
+    ["missing necessary objects", full("agent/issue-7", MNO)],
+    ["missing necessary objects, destination agent/issue-404", full("agent/issue-404", MNO)],
+    ["missing necessary objects, CR-separated", full("agent/issue-7", MNO).replace(/\n/g, "\r")],
+    ["missing necessary objects, CRLF-separated", full("agent/issue-7", MNO).replace(/\n/g, "\r\n")],
+    ["missing necessary objects with an empty remote: line", full("agent/issue-7", MNO, "remote: \n")],
+    ["both retryable reasons in one push", `To ${URL}\n${status("a")}${status("b", MNO)}${trailer()}`],
   ];
   for (const [name, text] of transient) {
     it(`transient: ${name}`, () => assert.equal(classifyGitStderrText(text), "transient"));
@@ -50,6 +64,24 @@ describe("classifyGitStderrText", () => {
     ["bare (failed) plus a non-remote line", full("agent/issue-7", "failed", "hint: something odd\n")],
     ["one (failed) and one hook-declined status", `To ${URL}\n${status("a")}${status("b", "pre-receive hook declined")}${trailer()}`],
     ["[rejected] fetch first", `To ${URL}\n ! [rejected]        main -> main (fetch first)\n${trailer()}`],
+    // #4438: only the exact bare reasons retry; near-misses and other reasons stay permanent.
+    ["missing necessary objects with trailing text", `To ${URL}\n ! [remote rejected] ${SHA} -> agent/issue-7 (${MNO}) x\n${trailer()}`],
+    ["singular missing necessary object", full("agent/issue-7", "missing necessary object")],
+    ["missing necessary objects with a detail suffix", full("agent/issue-7", `${MNO}: abc123`)],
+    ["unpacker error", full("agent/issue-7", "n/a (unpacker error)")],
+    ["bad pack", full("agent/issue-7", "bad pack")],
+    ["shallow update not allowed", full("agent/issue-7", "shallow update not allowed")],
+    ["status line without the ! marker", `To ${URL}\n [remote rejected] ${SHA} -> agent/issue-7 (${MNO})\n${trailer()}`],
+    ["status line without ->", `To ${URL}\n ! [remote rejected] ${SHA} agent/issue-7 (${MNO})\n${trailer()}`],
+    ["status line without parens around the reason", `To ${URL}\n ! [remote rejected] ${SHA} -> agent/issue-7 ${MNO}\n${trailer()}`],
+    ["missing necessary objects plus a pre-receive hook declined ref", `To ${URL}\n${status("a", MNO)}${status("b", "pre-receive hook declined")}${trailer()}`],
+    ["bare (failed) plus a bad pack ref", `To ${URL}\n${status("a")}${status("b", "bad pack")}${trailer()}`],
+    ["missing necessary objects plus GH006", full("agent/issue-7", MNO, "remote: error: GH006: Protected branch update failed for refs/heads/agent/issue-7.\n")],
+    ["missing necessary objects plus GH001", full("agent/issue-7", MNO, "remote: error: GH001: Large files detected.\n")],
+    ["missing necessary objects plus an unmarked remote: policy line", full("agent/issue-7", MNO, "remote: Push blocked by repository policy\n")],
+    ["missing necessary objects plus a non-remote line", full("agent/issue-7", MNO, "hint: something odd\n")],
+    ["[rejected] fetch first beside missing necessary objects", `To ${URL}\n${status("a", MNO)} ! [rejected]        main -> main (fetch first)\n${trailer()}`],
+    ["[rejected] non-fast-forward beside missing necessary objects", `To ${URL}\n${status("a", MNO)} ! [rejected]        main -> main (non-fast-forward)\n${trailer()}`],
     ["empty stderr", ""],
     ["whitespace stderr", "  \n"],
     ["non-push stderr", "fatal: the remote end hung up on policy grounds"],
@@ -84,6 +116,10 @@ describe("classifyGitStderr through a real runGit failure", () => {
 
   it("retained bare (failed) stderr is transient even when the argv carries agent/issue-404", async () => {
     assert.equal(await classifyOf(full("agent/issue-404")), "transient");
+  });
+
+  it("retained observed #4438 missing-necessary-objects stderr is transient", async () => {
+    assert.equal(await classifyOf(OBSERVED_MNO_STDERR), "transient");
   });
 
   it("retained stderr with a stated reason stays permanent", async () => {

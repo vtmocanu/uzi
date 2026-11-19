@@ -75,3 +75,10 @@ dependencies or raising the threshold would suppress unrelated findings. Fork,
 git and file overrides add unreviewed code and can remove dependency coverage from
 the registry audit. Adding a third-party allowlist tool would still require the
 lockfile proof and would add a dependency to the gate itself.
+
+## Update 2026-11-18: rows removed
+
+GitHub withdrew GHSA-fc5q-39xc-vjpf on 2026-11-18, so npm audit stopped reporting it,
+and both rows became unused and failed the gate as designed. Both rows were removed,
+the exceptions file keeps only its header, and #4435 is closed. The mechanism stays
+for future rows under the approval rule above.

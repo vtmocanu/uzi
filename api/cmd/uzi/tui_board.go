@@ -284,6 +284,12 @@ func runStateWord(r apitypes.RunListItemDTO) string {
 	if isCredentialsResetHold(r.RunDTO) {
 		return credsResetWord
 	}
+	if isProviderDestinationHold(r.RunDTO) {
+		return providerURLBlockedWord
+	}
+	if isProviderBindingStaleHold(r.RunDTO) {
+		return providerBindingStaleWord
+	}
 	if isCredentialSwitchSettlingHold(r.RunDTO) {
 		return credSwitchSettlingWord
 	}

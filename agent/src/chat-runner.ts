@@ -139,9 +139,12 @@ export class ChatRunner {
     // token keeps it scrubbed.
     const oauthToken = claim.secrets.anthropic_oauth_token;
     if (oauthToken) this.log.addSecret(oauthToken);
+    // PRD #4320: a provider-bound chat's gateway key is scrubbed exactly like the OAuth token.
+    const providerKey = claim.secrets.provider?.credential;
+    if (providerKey) this.log.addSecret(providerKey);
 
     const runLog = this.log.child({ run_id: runId, kind: "chat" });
-    const secrets = [claim.secrets.anthropic_oauth_token, this.joinToken];
+    const secrets = [claim.secrets.anthropic_oauth_token, providerKey, this.joinToken];
     const redact = makeRedactor(secrets);
     const redactText = makeTextRedactor(secrets);
     // redactText also covers the PRD #99 top-level agent_label/agent_instance the
@@ -271,6 +274,7 @@ export class ChatRunner {
       const ctx: ChatContext = {
         runId,
         oauthToken: claim.secrets.anthropic_oauth_token,
+        ...(claim.secrets.provider ? { provider: claim.secrets.provider } : {}),
         // Preflighted above: the claim's id, or undefined when its transcript is not
         // on this worker (issue #105).
         sessionId,
@@ -339,6 +343,7 @@ export class ChatRunner {
       await source.stop().catch(() => undefined);
       // Evict this chat's token now the run is terminal (Decision 7).
       if (oauthToken) this.log.removeSecret(oauthToken);
+      if (providerKey) this.log.removeSecret(providerKey);
     }
   }
 }

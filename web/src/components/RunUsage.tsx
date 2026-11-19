@@ -147,15 +147,18 @@ export function RunUsagePanel({
   usage,
   costStatus,
   harness,
+  provider = false,
 }: {
   usage: RunUsage;
   costStatus: CostStatus | "";
   harness?: Harness | null;
+  /** The run is bound to a custom model provider (run.provider_id): cost reads Unknown. */
+  provider?: boolean;
 }) {
   if (!usagePanelVisible(usage)) return null;
   const { hasConfirmed, hasLiveTokens, total, noteTotal, summaryTotal, model, phases, agents, agentTotal, agentModels } = usage;
   const { liveByModel, liveByAgent, liveTotal } = usage;
-  const cost = costDisplay(costStatus, total.costUsd);
+  const cost = costDisplay(costStatus, total.costUsd, provider);
   // Never Math.round(cacheHitRatio * 100) here: 99.6% rounds to a "100% from cache"
   // label beside a zero-width warn segment while fresh tokens exist. See cacheDisplayPct.
   const cachePct = cacheDisplayPct(total);

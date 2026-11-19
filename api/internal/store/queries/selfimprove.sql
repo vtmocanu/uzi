@@ -47,9 +47,10 @@
 -- create seam (workersvc.createRunAtomic), not the SQL literal 'claude'. Self-improve uses
 -- implicit D11; M2 wires the real resolved value. Every current caller passes
 -- string(HarnessClaude) as a mechanical stopgap.
+-- model_provider_* (PRD #4320 M4), class FRESH-RESOLVE: the five binding columns are the owner's Claude provider source frozen by workersvc.createRunAtomic (NULL = vendor run). An unstamped param is NULL = a vendor run, so createRunAtomic asserts the inserted row against its resolution.
 INSERT INTO runs (
     user_id, repo_id, kind, issue_iid, issue_title, issue_description, auto_approve, wait_on_limit, model, model_source, override_subagent_model, mr_rework_enabled, required_capabilities, hinted_capabilities, ignored_inferred_capabilities, trigger_source, harness, plan_cross_check_required
-, code_cross_check_required, repo_agent_source_required) VALUES (
+, code_cross_check_required, repo_agent_source_required, model_provider_id, model_provider_revision, model_provider_key_mode, model_provider_key_secret_id, model_provider_key_rev) VALUES (
     @user_id, @repo_id::uuid, 'self_improve', @issue_iid, @issue_title, @issue_description, true, @wait_on_limit, sqlc.narg('model'), CASE WHEN sqlc.narg('model')::text IS NOT NULL THEN 'schedule_pin' END, @override_subagent_model, sqlc.narg('mr_rework_enabled'),
     -- required_capabilities (PRD #84 M2, issue #512 M1): a self_improve run is REPO-BEARING
     -- (it targets uzi's own repo, the likeliest to require docker to build/test), so it must
@@ -58,7 +59,7 @@ INSERT INTO runs (
     -- subquery reusing @repo_id, so no new Go struct field. Same expression CreateRun uses.
     COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), COALESCE((SELECT rp.ignored_inferred_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), 'self_improve', @harness,
     (SELECT u.plan_cross_check_enabled FROM users u WHERE u.id = @user_id)
-, (SELECT u.code_cross_check_enabled FROM users u WHERE u.id = @user_id), true)
+, (SELECT u.code_cross_check_enabled FROM users u WHERE u.id = @user_id), true, sqlc.narg('model_provider_id')::uuid, sqlc.narg('model_provider_revision')::int, sqlc.narg('model_provider_key_mode')::text, sqlc.narg('model_provider_key_secret_id')::uuid, sqlc.narg('model_provider_key_rev')::bigint)
 RETURNING *;
 
 -- name: CountActiveSelfImproveRunsForRepo :one

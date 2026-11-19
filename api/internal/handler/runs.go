@@ -378,6 +378,7 @@ func (h *Handler) overlayListDecorations(r *http.Request, items []apitypes.RunLi
 		dtos = append(dtos, &items[i].RunDTO)
 	}
 	h.overlayCodexAccountActions(r.Context(), dtos...)
+	h.overlayProviderNames(r.Context(), dtos...)
 	h.overlayQueueReasons(r.Context(), dtos...)
 	h.overlayRunForgeOriginCooldowns(r.Context(), dtos...)
 	h.overlayRunPublicationIntents(r.Context(), dtos...)

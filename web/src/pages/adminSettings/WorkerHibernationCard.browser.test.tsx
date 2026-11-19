@@ -48,6 +48,8 @@ it("saves the switch, automatic hibernation and threshold together and confirms"
       worker_hibernation_enabled: "true",
       worker_hibernation_auto: "true",
       worker_hibernation_idle_after: "72h",
+      worker_hibernation_surplus: "false",
+      worker_hibernation_surplus_idle_after: "2h",
     }),
   );
   expect(await screen.findByText("Worker hibernation settings saved.")).toBeTruthy();

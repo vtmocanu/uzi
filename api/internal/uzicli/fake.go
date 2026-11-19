@@ -391,6 +391,23 @@ type FakeClient struct {
 	LastReservePct   *int
 	LastReservePause bool
 
+	// Model providers (PRD #4320): ProviderList drives ListProviders; ProviderResult and
+	// ProviderProbe are the canned replies of the writes and the test; the Last* fields record
+	// what the command sent.
+	ProviderList        apitypes.ProviderListDTO
+	ProviderResult      apitypes.ProviderDTO
+	ProviderProbe       *apitypes.ProviderProbeDTO
+	LastProviderCreate  *apitypes.ProviderCreateRequest
+	LastProviderPatch   *apitypes.ProviderPatchRequest
+	LastProviderID      string
+	ProviderRetireCalls int
+	ProviderTestCalls   int
+	// ProviderSourceCalls counts SetClaudeProviderSource; LastProviderSource is the id it was last
+	// asked to select (nil = clear) and ProviderSourceSet says it was called at all.
+	ProviderSourceCalls int
+	ProviderSourceSet   bool
+	LastProviderSource  *string
+
 	// Secrets drives ListSecrets (PRD #104 M2).
 	Secrets                  []apitypes.SecretDTO
 	SecretTestResult         apitypes.SecretTestResult
@@ -640,6 +657,11 @@ type FakeClient struct {
 	GetProjectSyncStatusErr     error
 	LastResyncProjectSyncRepoID string
 	ResyncProjectSyncErr        error
+
+	// Repo run variables (PRD #4416): ListRepoEnv returns RepoEnvResult (or Err) and
+	// records the repo id it was asked about.
+	RepoEnvResult         apitypes.RunEnvListDTO
+	LastListRepoEnvRepoID string
 
 	// GetRunHook, when non-nil, drives GetRun instead of the static RunByID map. It
 	// is the sequencing seam `uzi run wait`'s tests need: a poll loop calls GetRun

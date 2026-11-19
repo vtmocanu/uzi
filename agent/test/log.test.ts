@@ -78,3 +78,17 @@ describe("SecretRegistry — run-scoped, reference-counted eviction (PRD #42 Dec
     assert.ok(line.includes("short and sweet"), "a too-short value is never scrubbed");
   });
 });
+
+describe("SecretRegistry: JSON-escaped secrets (PRD #4320)", () => {
+  it("redacts a secret containing a quote and a backslash even though JSON.stringify escapes both", () => {
+    const log = createLogger("info");
+    // Assembled at runtime: no provider-token-shaped literal in source.
+    const secret = ["gw", 'key"with', "back\\slash", "tail-abcdefgh"].join("-");
+    assert.ok(JSON.stringify(secret).slice(1, -1) !== secret, "the fixture really is escaped by JSON");
+    log.addSecret(secret);
+    const out = capture(() => log.info("failed", { detail: `gateway said ${secret}`, nested: { s: secret } }));
+    assert.ok(!out.includes(secret), "raw form absent");
+    assert.ok(!out.includes(JSON.stringify(secret).slice(1, -1)), "escaped form absent");
+    assert.ok(out.includes("***REDACTED***"));
+  });
+});

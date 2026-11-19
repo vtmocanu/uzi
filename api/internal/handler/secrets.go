@@ -98,6 +98,10 @@ func (h *Handler) ListMySecrets(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]apitypes.SecretDTO, 0, len(rows))
 	for _, s := range rows {
+		// A model provider's gateway key is managed through /me/providers and is not a token.
+		if s.Kind == store.KindAnthropicCompatibleKey {
+			continue
+		}
 		dto := secretMeta(s.ID, s.Kind, s.Label, s.IsDefault, s.AutoEligible, s.CreatedAt, s.UpdatedAt)
 		dto.Enabled = !s.DisabledAt.Valid
 		if s.DisabledAt.Valid {

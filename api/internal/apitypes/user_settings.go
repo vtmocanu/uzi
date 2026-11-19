@@ -76,6 +76,9 @@ type UserSettingsDTO struct {
 	// #3257); null = same as the run. `uzi settings get` displays it; writes are
 	// cookie-only until #3264.
 	JudgeRunsOn *string `json:"judge_runs_on"`
+	// ClaudeProviderID is the CLI decode mirror of the provider the owner's Claude lane runs on
+	// (PRD #4320); null = the vendor Claude ladder. Read-only: set via the provider source route.
+	ClaudeProviderID *string `json:"claude_provider_id"`
 	// DefaultClaudeModel and DefaultCodexModel are the CLI decode mirrors of the retained
 	// per-harness worker-model lanes (PRD #1551 M1 / D2); each null = inherit. Fidelity only.
 	DefaultClaudeModel *string `json:"default_claude_model"`

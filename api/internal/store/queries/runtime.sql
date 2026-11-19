@@ -335,6 +335,10 @@ WITH prev AS (
         registered_pod_uid = sqlc.narg('registered_pod_uid')::uuid,
         roll_heartbeat_at = NULL,
         draining_reason = NULL,
+        -- Issue #4395: a fresh registration starts with no persisted memory-authority loss; the
+        -- next run-lane claim of THIS registration re-establishes it if it is still lost.
+        memory_authority_lost_at = NULL,
+        memory_authority_held_at = NULL,
         snapshot_register_nonce = @snapshot_register_nonce,
         snapshot_epoch      = 0,
         last_heartbeat_at   = now(),
@@ -680,14 +684,15 @@ WHERE status = 'online'
 -- query's own "name every column" convention so an unstamped path is visible in a diff
 -- of THIS file, and guarded by a per-path test rather than the compiler (the narg trap
 -- above applies identically).
-INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, issue_saved_body, issue_raw_digest, issue_input_reason, auto_approve_blocked_reasons, origin_column, move_pending_since, auto_approve, wait_on_limit, mr_rework_enabled, plan_md, plan_source, agent_source, agent_exclusions, planned_base_commit, require_base_match, model, effort, model_source, effort_source, override_subagent_model, issue_comments, review_comments, required_capabilities, hinted_capabilities, ignored_inferred_capabilities, trigger_source, completion_contract_version, harness, credential_override_mode, credential_override_secret_id, plan_cross_check_required, plan_cross_check_gated, code_cross_check_required, repo_agent_source_required, agent_source_requested, agent_source_requested_basis)
+-- model_provider_* (PRD #4320 M4), class FRESH-RESOLVE: the five binding columns are the owner's Claude provider source frozen by workersvc.createRunAtomic (NULL = vendor run). An unstamped param is NULL = a vendor run, so createRunAtomic asserts the inserted row against its resolution.
+INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, issue_saved_body, issue_raw_digest, issue_input_reason, auto_approve_blocked_reasons, origin_column, move_pending_since, auto_approve, wait_on_limit, mr_rework_enabled, plan_md, plan_source, agent_source, agent_exclusions, planned_base_commit, require_base_match, model, effort, model_source, effort_source, override_subagent_model, issue_comments, review_comments, required_capabilities, hinted_capabilities, ignored_inferred_capabilities, trigger_source, completion_contract_version, harness, credential_override_mode, credential_override_secret_id, plan_cross_check_required, plan_cross_check_gated, code_cross_check_required, repo_agent_source_required, agent_source_requested, agent_source_requested_basis, model_provider_id, model_provider_revision, model_provider_key_mode, model_provider_key_secret_id, model_provider_key_rev)
 VALUES (@user_id, @repo_id::uuid, @issue_iid, @issue_title, @issue_description, sqlc.narg('issue_saved_body'), sqlc.narg('issue_raw_digest'), sqlc.narg('issue_input_reason'), COALESCE(sqlc.narg('auto_approve_blocked_reasons')::text[], '{}'), sqlc.narg('origin_column'), now(), @auto_approve, @wait_on_limit, sqlc.narg('mr_rework_enabled'), sqlc.narg('plan_md'), @plan_source, sqlc.narg('agent_source'), sqlc.narg('agent_exclusions')::jsonb, sqlc.narg('planned_base_commit'), @require_base_match, sqlc.narg('model'), sqlc.narg('effort'), sqlc.narg('model_source'), sqlc.narg('effort_source'), @override_subagent_model, sqlc.narg('issue_comments')::jsonb, sqlc.narg('review_comments')::jsonb, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), COALESCE((SELECT rp.ignored_inferred_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), @trigger_source, sqlc.narg('completion_contract_version'), @harness, sqlc.narg('credential_override_mode'), sqlc.narg('credential_override_secret_id'),
     (@auto_approve AND @plan_source <> 'seeded' AND COALESCE(sqlc.narg('captured_plan_cross_check')::boolean, (SELECT u.plan_cross_check_enabled FROM users u WHERE u.id = @user_id))),
     (NOT @auto_approve AND @plan_source <> 'seeded' AND COALESCE(sqlc.narg('captured_plan_cross_check')::boolean, (SELECT u.plan_cross_check_enabled FROM users u WHERE u.id = @user_id))), COALESCE(sqlc.narg('captured_code_cross_check')::boolean, (SELECT u.code_cross_check_enabled FROM users u WHERE u.id = @user_id)), true,
     COALESCE(sqlc.narg('agent_source_requested')::text, (SELECT rp.agent_source_default FROM repos rp WHERE rp.id = @repo_id::uuid)),
     CASE WHEN sqlc.narg('agent_source_requested')::text IS NOT NULL THEN 'explicit'
          WHEN (SELECT rp.agent_source_default FROM repos rp WHERE rp.id = @repo_id::uuid) IS NOT NULL THEN 'repo_default'
-    END)
+    END, sqlc.narg('model_provider_id')::uuid, sqlc.narg('model_provider_revision')::int, sqlc.narg('model_provider_key_mode')::text, sqlc.narg('model_provider_key_secret_id')::uuid, sqlc.narg('model_provider_key_rev')::bigint)
 RETURNING *;
 
 -- name: GetRunByIDForUser :one
@@ -1474,6 +1479,10 @@ WITH checker_template_pins AS MATERIALIZED (
       -- fn_worker_can_claim, required_capabilities and @capability_aware). A GUARDED run
       -- (ci_config_guard) is claimable only by a worker reporting 'ci_config_guard_v1'.
       AND (NOT r.ci_config_guard OR 'ci_config_guard_v1' = ANY(@worker_protocol_caps::text[]))
+      -- PRD #4173: a run on a LINKED repo (repos.issue_tracker_connection_id) is claimable only by a
+      -- worker reporting 'issue_key_v1' (it renders the run's references by issue_key and never
+      -- writes Closes #<iid>). Standalone, outside fn_worker_can_claim and @capability_aware.
+      AND ('issue_key_v1' = ANY(@worker_protocol_caps::text[]) OR NOT EXISTS (SELECT 1 FROM repos lr WHERE lr.id = r.repo_id AND lr.issue_tracker_connection_id IS NOT NULL))
       AND ((NOT r.repo_agent_source_required AND r.repo_agent_source_commit IS NULL) OR 'repo_agent_source_v1' = ANY(@worker_protocol_caps::text[]))
       AND (r.agent_source_requested IS NULL OR 'agent_source_request_v1' = ANY(@worker_protocol_caps::text[]))
       AND (NOT (r.policy_preserve_required OR r.policy_pending_fresh OR (r.policy_outcome_id IS NOT NULL AND r.policy_resolved_at IS NULL) OR r.policy_required_head IS NOT NULL) OR 'provider_policy_hold_v1' = ANY(@worker_protocol_caps::text[]))
@@ -1499,6 +1508,11 @@ WITH checker_template_pins AS MATERIALIZED (
       AND (r.completion_contract_version IS NULL
            OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
            OR 'codex_completion_interlock_v1' = ANY(@worker_protocol_caps::text[]))
+      -- PRD #4320 module 5: the NON-BYPASSABLE provider claim clause (standalone, outside fn_worker_can_claim,
+      -- required_capabilities and @capability_aware). A provider-bound run (model_provider_key_mode set)
+      -- is claimable only by a worker reporting 'claude_provider_v1': an older worker would ignore the
+      -- unknown claim key and start the run with no model credential. Same @worker_protocol_caps.
+      AND (r.model_provider_key_mode IS NULL OR 'claude_provider_v1' = ANY(@worker_protocol_caps::text[]))
       AND (NOT (r.plan_cross_check_required OR (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan')))
            OR 'cross_check_v1' = ANY(@worker_protocol_caps::text[]))
       AND (NOT (r.kind = 'cross_check' AND r.harness = 'claude' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
@@ -1756,6 +1770,10 @@ WITH checker_template_pins AS MATERIALIZED (
                 -- fn_worker_can_claim, required_capabilities and @capability_aware). A GUARDED run
                 -- (ci_config_guard) is claimable only by a worker reporting 'ci_config_guard_v1'.
                 AND (NOT r.ci_config_guard OR 'ci_config_guard_v1' = ANY(p.protocol_capabilities))
+                -- PRD #4173: a run on a LINKED repo (repos.issue_tracker_connection_id) is claimable only by a
+                -- worker reporting 'issue_key_v1' (it renders the run's references by issue_key and never
+                -- writes Closes #<iid>). Standalone, outside fn_worker_can_claim and @capability_aware.
+                AND ('issue_key_v1' = ANY(p.protocol_capabilities) OR NOT EXISTS (SELECT 1 FROM repos lr WHERE lr.id = r.repo_id AND lr.issue_tracker_connection_id IS NOT NULL))
                 AND ((NOT r.repo_agent_source_required AND r.repo_agent_source_commit IS NULL) OR 'repo_agent_source_v1' = ANY(p.protocol_capabilities))
                 AND (r.agent_source_requested IS NULL OR 'agent_source_request_v1' = ANY(p.protocol_capabilities))
       AND (NOT (r.policy_preserve_required OR r.policy_pending_fresh OR (r.policy_outcome_id IS NOT NULL AND r.policy_resolved_at IS NULL) OR r.policy_required_head IS NOT NULL) OR 'provider_policy_hold_v1' = ANY(p.protocol_capabilities))
@@ -1771,6 +1789,9 @@ WITH checker_template_pins AS MATERIALIZED (
                 AND (r.completion_contract_version IS NULL
                      OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                      OR 'codex_completion_interlock_v1' = ANY(p.protocol_capabilities))
+                -- PRD #4320 module 5: MIRROR the provider claim clause for the peer, or fleet-spread could DEFER a
+                -- provider-bound run to a peer that lacks 'claude_provider_v1' and could never claim it.
+                AND (r.model_provider_key_mode IS NULL OR 'claude_provider_v1' = ANY(p.protocol_capabilities))
       AND (NOT (r.plan_cross_check_required OR (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan')))
            OR 'cross_check_v1' = ANY(p.protocol_capabilities))
       AND (NOT (r.kind = 'cross_check' AND r.harness = 'claude' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
@@ -2249,6 +2270,9 @@ SELECT r.checkpoint_tip,
        -- the shared evaluator downgrades the waivable "bot is too strong" findings —
        -- never protection_unreadable, which still refuses even an overridden repo.
        rp.guardrail_override_reason,
+       -- PRD #4173 D11 wiring: the repo's issue tracker project short name, NULL for an
+       -- unlinked repo. A linked run's claim derives issue_key from it and the run's iid.
+       rp.issue_tracker_project_short,
        c.forge_type,
        c.base_url,
        c.bot_username,
@@ -3540,6 +3564,12 @@ UPDATE runs SET
     rate_limit_type      = sqlc.narg('rate_limit_type'),
     retry_not_before     = @retry_not_before,
     limit_wait_count     = limit_wait_count + 1,
+    -- PRD #4320 M6: a provider-bound run counts its gateway parks since the owner last resumed it.
+    -- The increment is in this statement so the count and the transition are one write; the caller
+    -- selected retry_not_before from the value BEFORE this increment (workersvc providerLimitSchedule).
+    -- A vendor run (model_provider_key_mode NULL) keeps 0.
+    model_provider_limit_streak = CASE WHEN model_provider_key_mode IS NOT NULL
+        THEN model_provider_limit_streak + 1 ELSE model_provider_limit_streak END,
     -- Boundary reconcile precedes park; revoke this Codex flight atomically.
     codex_cap_hash       = CASE WHEN harness = 'codex' THEN NULL ELSE codex_cap_hash END,
     codex_claim_epoch    = CASE WHEN harness = 'codex' THEN codex_claim_epoch + 1 ELSE codex_claim_epoch END,
@@ -3759,6 +3789,32 @@ WHERE runs.id = @id AND runs.user_id = @user_id AND runs.status = 'limit_wait'
       WHERE cc.checker_run_id = runs.id AND runs.id = ANY(checks.ids)
         AND cc.lead_run_id = runs.target_run_id AND lead.user_id = runs.user_id
   ));
+
+-- name: ResumeProviderGatewayLimitWait :execrows
+-- PRD #4320 M6: the OWNER's Resume of a provider gateway-limit park. A provider-bound run parked as
+-- limit_wait with rate_limit_type 'provider_gateway_limit' after the third gateway park waits for
+-- the owner (retry_not_before NULL), and may be resumed earlier from any of the first three rows.
+-- The mutation set is PromoteLimitWaitRunNow's (fresh wall, cleared pause bank, revoked codex cap,
+-- reset health) PLUS the two columns that make this an owner reset: model_provider_limit_streak back
+-- to 0 and retry_not_before cleared, so the next gateway park starts the schedule over.
+--
+-- Vendor limit_wait is NOT resumable here: the predicate requires a provider binding AND the gateway
+-- limit type, so a vendor park (which auto-resumes at its window) stays a 409 at the handler.
+-- Owner- and status-scoped; 0 rows is a race or an ineligible run, which the handler maps to 409.
+UPDATE runs SET
+    status     = 'queued',
+    status_since = now(),
+    started_at = NULL,
+    budget_paused_seconds = 0,
+    codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
+    model_provider_limit_streak = 0,
+    retry_not_before = NULL,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE runs.id = @id AND runs.user_id = @user_id AND runs.status = 'limit_wait'
+  AND runs.model_provider_key_mode IS NOT NULL
+  AND runs.rate_limit_type = 'provider_gateway_limit'
+  AND runs.kind NOT IN ('judge', 'job', 'cross_check');
 
 -- name: ListLimitWaitReeval :many
 -- The duration-time auto-failover worklist (PRD #1247 M3, D8): every run STILL parked
@@ -4608,6 +4664,11 @@ WITH candidates AS MATERIALIZED (
   AND runs.hold_reason IS DISTINCT FROM 'credential_disabled'
   -- PRD #3989: a credentials_reset hold is released only by the credential promoter.
   AND runs.hold_reason IS DISTINCT FROM 'credentials_reset'
+  -- PRD #4320 module 5: the provider refusals are released only by the promoter (the destination hold,
+  -- once the URL is allowlisted again and the binding is intact) or never (provider_binding_stale: a new
+  -- run picks up the current key). An owner Resume must not re-queue a run the next claim would refuse.
+  AND runs.hold_reason IS DISTINCT FROM 'provider_destination_not_allowed'
+  AND runs.hold_reason IS DISTINCT FROM 'provider_binding_stale'
   -- #3607 M2a: refuse ONLY an unresolved policy episode (its own owner resume is ResumePolicyHold).
   -- A resolved preserving run still resumes ordinary holds and keeps its constraint: this writer
   -- touches no policy column.
@@ -4710,6 +4771,11 @@ WHERE runs.id = @id AND runs.user_id = @user_id
   AND runs.hold_reason IS DISTINCT FROM 'credential_disabled'
   -- PRD #3989: a credentials_reset hold is released only by the credential promoter.
   AND runs.hold_reason IS DISTINCT FROM 'credentials_reset'
+  -- PRD #4320 module 5: the provider refusals are released only by the promoter (the destination hold,
+  -- once the URL is allowlisted again and the binding is intact) or never (provider_binding_stale: a new
+  -- run picks up the current key). An owner Resume must not re-queue a run the next claim would refuse.
+  AND runs.hold_reason IS DISTINCT FROM 'provider_destination_not_allowed'
+  AND runs.hold_reason IS DISTINCT FROM 'provider_binding_stale'
   -- #3607 M2a: refuse ONLY an unresolved policy episode (its own owner resume is ResumePolicyHold).
   -- A resolved preserving run still resumes ordinary holds and keeps its constraint: this writer
   -- touches no policy column.
@@ -8559,7 +8625,16 @@ ON CONFLICT (worker_id, run_id) DO UPDATE SET
 -- pending_overflow_until = now() + the lease (the worker-level stand-in for the row-level
 -- leases it could not express, D11); an unflagged one clears both, which is what a valid
 -- unflagged snapshot uses to reopen claiming before expiry.
+-- Issue #4395: a snapshot-carrying run-lane claim also passes the held receipt time and the
+-- snapshot's register nonce; memory_authority_held_at is set only when the receipt is given and
+-- the nonce equals the row's current snapshot_register_nonce (the registration fence), otherwise
+-- it is left unchanged. Every other caller passes NULL receipt and leaves the column alone.
 UPDATE workers SET
+    memory_authority_held_at = CASE
+        WHEN sqlc.narg(memory_authority_held_at)::timestamptz IS NOT NULL
+         AND snapshot_register_nonce = sqlc.narg(held_register_nonce)::text
+        THEN sqlc.narg(memory_authority_held_at)::timestamptz
+        ELSE memory_authority_held_at END,
     snapshot_epoch         = @snapshot_epoch,
     pending_overflow       = @pending_overflow,
     pending_overflow_until = CASE WHEN @pending_overflow::boolean
@@ -11075,7 +11150,9 @@ ORDER BY id DESC;
 SELECT r.status, r.issue_iid, r.repo_id, r.origin_column, r.board_column, r.move_pending_since,
        r.auto_approve, r.mr_iid,
        rp.forge_project_id, rp.web_url AS repo_web_url,
-       c.forge_type, c.base_url, c.token_ciphertext
+       rp.issue_tracker_connection_id, rp.awaiting_first_enable,
+       c.forge_type, c.base_url, c.token_ciphertext,
+       r.user_id
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 JOIN forge_connections c ON c.id = rp.connection_id AND c.user_id = r.user_id -- #1688: owner-scoped token
@@ -11090,8 +11167,11 @@ WHERE r.id = @run_id;
 -- not currently hold return no row, so a cross-tenant read is a 404, not a leak. A
 -- repo-less run has no repos row and returns no row too; the service checks repo_id
 -- off the owned run FIRST so it can tell that apart and answer 409.
-SELECT rp.forge_project_id,
-       c.forge_type, c.base_url, c.token_ciphertext, c.bot_forge_user_id
+-- PRD #4173 M4 adds repo_id, the connection owner's user_id and the repo's issue
+-- tracker link, so the worker proxy can resolve the issue source per repo and owner.
+SELECT rp.id AS repo_id, rp.forge_project_id,
+       rp.issue_tracker_connection_id,
+       c.user_id, c.forge_type, c.base_url, c.token_ciphertext, c.bot_forge_user_id
 FROM runs r
 JOIN repos rp ON rp.id = r.repo_id
 JOIN forge_connections c ON c.id = rp.connection_id AND c.user_id = r.user_id -- #1688: owner-scoped token
@@ -11220,6 +11300,9 @@ WHERE id = @id;
 -- PRD #1226 M1: completion_contract_version rides this read so the queued arm can surface a
 -- completion-capability reason for an INTERLOCKED run (version non-null) that no online worker
 -- implements the completion protocol — the non-bypassable claim clause can never be satisfied.
+-- PRD #4320 module 5: model_provider_key_mode rides this read so the queued arm can surface a
+-- provider-capability reason for a PROVIDER-BOUND run that no online worker advertises
+-- 'claude_provider_v1' for: the non-bypassable provider claim clause can never be satisfied.
 -- PRD #1332 M5A (D3): harness, codex_material_revision and codex_secret_id ride this read so the
 -- queued arm can surface a Codex-capability reason for a CODEX-INDICATING run (any of the three set)
 -- that no online worker advertises 'codex_harness_v1' — the non-bypassable Codex claim clause can
@@ -11290,7 +11373,10 @@ SELECT id, runs.user_id, status, auto_approve,
        repo_id, kind, dispatched_at, required_capabilities, completion_contract_version,
        harness, codex_material_revision, codex_secret_id, worker_id, claim_generation, released_worker_id,
        egress_profile_id, job_protocol, ci_config_guard, repo_agent_source_commit, repo_agent_source_required, agent_source_requested,
+       model_provider_key_mode,
        EXISTS (SELECT 1 FROM job_files af WHERE af.run_id = runs.id AND af.direction = 'input' AND af.state = 'attached')::boolean AS ci_artifacts_attached,
+       -- PRD #4173: true when the run's repo is linked to an external issue tracker; gates the queued-reason issue_key rung so an unlinked run makes no extra query.
+       EXISTS (SELECT 1 FROM repos lr WHERE lr.id = runs.repo_id AND lr.issue_tracker_connection_id IS NOT NULL)::boolean AS repo_linked,
        COALESCE(runs.status = 'queued' AND runs.kind <> 'cross_check'
                 AND runs.worker_id IS NOT NULL
                 AND runs.stale_requeue_generation = runs.claim_generation
@@ -11634,6 +11720,10 @@ WHERE run.id = @run_id
   -- fn_worker_can_claim, required_capabilities and @capability_aware). A GUARDED run
   -- (ci_config_guard) is claimable only by a worker reporting 'ci_config_guard_v1'.
   AND (NOT run.ci_config_guard OR 'ci_config_guard_v1' = ANY(w.protocol_capabilities))
+  -- PRD #4173: a run on a LINKED repo (repos.issue_tracker_connection_id) is claimable only by a
+  -- worker reporting 'issue_key_v1' (it renders the run's references by issue_key and never
+  -- writes Closes #<iid>). Standalone, outside fn_worker_can_claim and @capability_aware.
+  AND ('issue_key_v1' = ANY(w.protocol_capabilities) OR NOT EXISTS (SELECT 1 FROM repos lr WHERE lr.id = run.repo_id AND lr.issue_tracker_connection_id IS NOT NULL))
   AND ((NOT run.repo_agent_source_required AND run.repo_agent_source_commit IS NULL) OR 'repo_agent_source_v1' = ANY(w.protocol_capabilities))
   AND (run.agent_source_requested IS NULL OR 'agent_source_request_v1' = ANY(w.protocol_capabilities))
       AND (NOT (run.policy_preserve_required OR run.policy_pending_fresh OR (run.policy_outcome_id IS NOT NULL AND run.policy_resolved_at IS NULL) OR run.policy_required_head IS NOT NULL) OR 'provider_policy_hold_v1' = ANY(w.protocol_capabilities))
@@ -11643,6 +11733,8 @@ WHERE run.id = @run_id
   AND (run.completion_contract_version IS NULL
        OR NOT (run.harness = 'codex' OR run.codex_material_revision IS NOT NULL OR run.codex_secret_id IS NOT NULL)
        OR 'codex_completion_interlock_v1' = ANY(w.protocol_capabilities))
+  -- PRD #4320 module 5: the provider claim clause, mirrored (see ClaimRun).
+  AND (run.model_provider_key_mode IS NULL OR 'claude_provider_v1' = ANY(w.protocol_capabilities))
       AND (NOT (run.plan_cross_check_required OR (run.kind = 'cross_check' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = run.id AND pc.stage = 'plan')))
            OR 'cross_check_v1' = ANY(w.protocol_capabilities))
       AND (NOT (run.kind = 'cross_check' AND run.harness = 'claude' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = run.id AND pc.stage = 'plan'))
@@ -11870,6 +11962,24 @@ WHERE w.user_id = @user_id
   AND NOT w.isolated_lane
   AND 'ci_config_guard_v1' = ANY(w.protocol_capabilities);
 
+-- name: IssueKeyWorkerMissingForRepo :one
+-- PRD #4173: true when the repo is LINKED to an external issue tracker and none of the user's
+-- ONLINE, intake-accepting, non-ephemeral, non-lane workers self-reports 'issue_key_v1'. It
+-- drives the queued-reason resolver's issue_key rung: ClaimRun's standalone issue_key clause can
+-- never be satisfied for such a repo. Mirrors CountOnlineWorkersSatisfyingCIConfigGuard's filters.
+SELECT COALESCE((EXISTS (
+  SELECT 1 FROM repos lr
+  WHERE lr.id = @repo_id AND lr.issue_tracker_connection_id IS NOT NULL
+) AND NOT EXISTS (
+  SELECT 1 FROM workers w
+  WHERE w.user_id = @user_id
+    AND w.status = 'online'
+    AND fn_worker_accepts_new_intake(w)
+    AND NOT w.ephemeral
+    AND NOT w.isolated_lane
+    AND 'issue_key_v1' = ANY(w.protocol_capabilities)
+)), false)::boolean AS missing;
+
 -- name: CountOnlineWorkersSatisfyingRepoAgentSource :one
 SELECT count(*) FROM workers w
 WHERE w.user_id = @user_id
@@ -11929,6 +12039,25 @@ WHERE w.user_id = @user_id
   -- claims an unbound run, so it is never a satisfier here.
   AND NOT w.isolated_lane
   AND 'codex_harness_v1' = ANY(w.protocol_capabilities);
+
+-- name: CountOnlineWorkersSatisfyingClaudeProvider :one
+-- PRD #4320 module 5: how many of a user's ONLINE, non-draining, non-ephemeral workers self-report the
+-- 'claude_provider_v1' PROTOCOL capability. It drives the queued-reason resolver's provider rung
+-- (reasonNoProviderCapableWorker): a 0 here for a PROVIDER-BOUND queued run (model_provider_key_mode
+-- set) means every online worker predates provider claims, so ClaimRun's NON-BYPASSABLE provider clause
+-- ('claude_provider_v1' = ANY(@worker_protocol_caps)) can never be satisfied. Same filters as
+-- CountOnlineWorkersSatisfyingCodexHarness, the twin this mirrors; only called for a provider-bound
+-- queued run already past its health threshold (or one the early docker-allowlist probe found
+-- online-but-ineligible), so it is off the hot path.
+SELECT count(*) FROM workers w
+WHERE w.user_id = @user_id
+  AND w.status = 'online'
+  AND fn_worker_accepts_new_intake(w)
+  AND NOT w.ephemeral
+  -- The lane half of ClaimRun's isolated-lane clause: these rungs only run for an UNBOUND run, and a
+  -- lane worker never claims an unbound run, so it is never a satisfier here.
+  AND NOT w.isolated_lane
+  AND 'claude_provider_v1' = ANY(w.protocol_capabilities);
 
 -- name: CountOnlineWorkersSatisfyingCodexRuntime :one
 -- Current Codex baseline for the worker-roll queued reason.
@@ -12092,6 +12221,10 @@ WHERE r.status = 'queued'
   -- run's one uq_workers_ephemeral_run slot and never claim it, and the lane trigger
   -- (ListIsolatedQueuedRunsForEphemeral) could then never provision the worker that can.
   AND r.egress_profile_id IS NULL
+  -- PRD #4320: provider execution is not activated: ephemeral images do not advertise
+  -- claude_provider_v1. Lift this exclusion when activation lands. Until then a pod
+  -- could never claim this run and would consume its unique slot and the owner's cap.
+  AND r.model_provider_key_mode IS NULL
   -- #3000: draining or maintenance owners hold independently of stale-requeue grace.
   AND NOT COALESCE(
         r.worker_id IS NOT NULL AND r.kind <> 'cross_check'
@@ -12130,7 +12263,9 @@ WHERE r.status = 'queued'
   -- the CODE exclusion above keeps known CODE children on their own worker.
   -- PRD #2865: a GUARDED run (ci_config_guard) is demand too: with no worker reporting
   -- ci_config_guard_v1 online, only a freshly provisioned worker can claim it.
-  AND (r.checkpoint_coordinates IS NOT NULL OR cardinality(r.required_capabilities) > 0 OR r.plan_cross_check_required OR r.kind = 'cross_check' OR r.ci_config_guard OR r.repo_agent_source_required OR fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, @worker_docker_enabled::boolean, r.repo_id, r.kind, r.egress_profile_id, @docker_repo_allowlist::uuid[]))
+  -- PRD #4173: a run on a LINKED repo is demand too: with no worker reporting issue_key_v1 online,
+  -- only a freshly provisioned worker can claim it.
+  AND (r.checkpoint_coordinates IS NOT NULL OR cardinality(r.required_capabilities) > 0 OR r.plan_cross_check_required OR r.kind = 'cross_check' OR r.ci_config_guard OR r.repo_agent_source_required OR EXISTS (SELECT 1 FROM repos lr WHERE lr.id = r.repo_id AND lr.issue_tracker_connection_id IS NOT NULL) OR fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, @worker_docker_enabled::boolean, r.repo_id, r.kind, r.egress_profile_id, @docker_repo_allowlist::uuid[]))
 
   -- PRD #4205 M5: the per-worker placement block (capabilities, protocol, lane, lease and
   -- cross-check predicates) lives in fn_placement_admitting_workers so the hibernation wake-demand
@@ -12352,6 +12487,10 @@ WHERE r.status = 'queued'
         -- fn_worker_can_claim, required_capabilities and @capability_aware). A GUARDED run
         -- (ci_config_guard) is claimable only by a worker reporting 'ci_config_guard_v1'.
         AND (NOT r.ci_config_guard OR 'ci_config_guard_v1' = ANY(w.protocol_capabilities))
+        -- PRD #4173: a run on a LINKED repo (repos.issue_tracker_connection_id) is claimable only by a
+        -- worker reporting 'issue_key_v1' (it renders the run's references by issue_key and never
+        -- writes Closes #<iid>). Standalone, outside fn_worker_can_claim and @capability_aware.
+        AND ('issue_key_v1' = ANY(w.protocol_capabilities) OR NOT EXISTS (SELECT 1 FROM repos lr WHERE lr.id = r.repo_id AND lr.issue_tracker_connection_id IS NOT NULL))
         AND ((NOT r.repo_agent_source_required AND r.repo_agent_source_commit IS NULL) OR 'repo_agent_source_v1' = ANY(w.protocol_capabilities))
         AND (r.agent_source_requested IS NULL OR 'agent_source_request_v1' = ANY(w.protocol_capabilities))
       AND (NOT (r.policy_preserve_required OR r.policy_pending_fresh OR (r.policy_outcome_id IS NOT NULL AND r.policy_resolved_at IS NULL) OR r.policy_required_head IS NOT NULL) OR 'provider_policy_hold_v1' = ANY(w.protocol_capabilities))
@@ -12361,6 +12500,8 @@ WHERE r.status = 'queued'
                  AND (r.completion_contract_version IS NULL
                       OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                       OR 'codex_completion_interlock_v1' = ANY(w.protocol_capabilities))
+  -- PRD #4320 module 5: the provider claim clause, mirrored (see ClaimRun).
+  AND (r.model_provider_key_mode IS NULL OR 'claude_provider_v1' = ANY(w.protocol_capabilities))
                  AND (
                      NOT (
                          r.harness = 'codex'
@@ -12440,6 +12581,10 @@ WHERE r.status = 'queued'
         -- fn_worker_can_claim, required_capabilities and @capability_aware). A GUARDED run
         -- (ci_config_guard) is claimable only by a worker reporting 'ci_config_guard_v1'.
         AND (NOT r.ci_config_guard OR 'ci_config_guard_v1' = ANY(w.protocol_capabilities))
+        -- PRD #4173: a run on a LINKED repo (repos.issue_tracker_connection_id) is claimable only by a
+        -- worker reporting 'issue_key_v1' (it renders the run's references by issue_key and never
+        -- writes Closes #<iid>). Standalone, outside fn_worker_can_claim and @capability_aware.
+        AND ('issue_key_v1' = ANY(w.protocol_capabilities) OR NOT EXISTS (SELECT 1 FROM repos lr WHERE lr.id = r.repo_id AND lr.issue_tracker_connection_id IS NOT NULL))
         AND ((NOT r.repo_agent_source_required AND r.repo_agent_source_commit IS NULL) OR 'repo_agent_source_v1' = ANY(w.protocol_capabilities))
         AND (r.agent_source_requested IS NULL OR 'agent_source_request_v1' = ANY(w.protocol_capabilities))
       AND (NOT (r.policy_preserve_required OR r.policy_pending_fresh OR (r.policy_outcome_id IS NOT NULL AND r.policy_resolved_at IS NULL) OR r.policy_required_head IS NOT NULL) OR 'provider_policy_hold_v1' = ANY(w.protocol_capabilities))
@@ -12449,6 +12594,8 @@ WHERE r.status = 'queued'
                  AND (r.completion_contract_version IS NULL
                       OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                       OR 'codex_completion_interlock_v1' = ANY(w.protocol_capabilities))
+  -- PRD #4320 module 5: the provider claim clause, mirrored (see ClaimRun).
+  AND (r.model_provider_key_mode IS NULL OR 'claude_provider_v1' = ANY(w.protocol_capabilities))
                  AND (
                      NOT (
                          r.harness = 'codex'
@@ -13173,12 +13320,13 @@ SELECT * FROM cross_checks WHERE lead_run_id = @lead_run_id AND stage = 'plan' O
 
 -- name: CreatePlanCrossCheckChild :one
 -- Preserve the lead's frozen inference policy; declared requirements keep their repo-hint source.
+-- model_provider_key_mode (PRD #4320 M4), class REFUSED-LANE: written as an explicit NULL because this lane does not support provider-sourced runs yet (PRD #4322); workersvc refuses provider_lane_unsupported BEFORE this INSERT for a provider-sourced owner.
 INSERT INTO runs (id, user_id, repo_id, kind, target_run_id, harness, priority,
                   report_only, budget_wall_seconds, dispatched_at, auto_approve,
-                  issue_title, issue_description, required_capabilities, hinted_capabilities, ignored_inferred_capabilities, trigger_source, worker_id)
+                  issue_title, issue_description, required_capabilities, hinted_capabilities, ignored_inferred_capabilities, trigger_source, worker_id, model_provider_key_mode)
 SELECT @child_id, lead.user_id, lead.repo_id, 'cross_check', lead.id, @child_harness::text, 2,
        true, @budget_wall_seconds::int, now(), true, lead.issue_title, lead.issue_description,
-       COALESCE(repo.required_capabilities, '{}'), COALESCE(repo.required_capabilities, '{}'), lead.ignored_inferred_capabilities, 'cross_check', lead.worker_id
+       COALESCE(repo.required_capabilities, '{}'), COALESCE(repo.required_capabilities, '{}'), lead.ignored_inferred_capabilities, 'cross_check', lead.worker_id, NULL::text
 FROM runs lead JOIN repos repo ON repo.id = lead.repo_id
 WHERE lead.id = @lead_run_id AND lead.user_id = @user_id
   AND lead.worker_id = @worker_id AND lead.claim_generation = @claim_generation

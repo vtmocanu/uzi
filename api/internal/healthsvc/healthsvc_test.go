@@ -47,6 +47,8 @@ type fakeStore struct {
 	custodyAggregateParams []store.GetCustodyAggregateForOwnerParams
 	enabledIDs             []uuid.UUID
 	enabledErr             error
+	linkedIDs              []uuid.UUID
+	linkedErr              error
 	workers                []store.ListAllWorkersRow
 	workersErr             error
 	workerQueries          atomic.Int32
@@ -80,6 +82,8 @@ type fakeStore struct {
 	hibRows                []store.ListAutoHibernationBlockersRow
 	hibErr                 error
 	hibParams              []store.ListAutoHibernationBlockersParams
+	hibSurplusRows         []store.ListAutoHibernationBlockersSurplusModeRow
+	hibSurplusParams       []store.ListAutoHibernationBlockersSurplusModeParams
 }
 
 func (f *fakeStore) RecoveryStorageHealth(ctx context.Context, p store.RecoveryStorageHealthParams) ([]store.RecoveryStorageHealthRow, error) {
@@ -101,6 +105,10 @@ func (f *fakeStore) GetUserByID(ctx context.Context, id uuid.UUID) (store.User, 
 
 func (f *fakeStore) ListEnabledRepoIDs(context.Context) ([]uuid.UUID, error) {
 	return f.enabledIDs, f.enabledErr
+}
+
+func (f *fakeStore) ListEnabledLinkedRepoIDs(context.Context) ([]uuid.UUID, error) {
+	return f.linkedIDs, f.linkedErr
 }
 
 func (f *fakeStore) ListWorkerUpgradeBlockers(_ context.Context, ids []uuid.UUID) ([]store.ListWorkerUpgradeBlockersRow, error) {
@@ -168,6 +176,11 @@ func (f *fakeStore) ListAutoHibernationBlockers(_ context.Context, p store.ListA
 	return f.hibRows, f.hibErr
 }
 
+func (f *fakeStore) ListAutoHibernationBlockersSurplusMode(_ context.Context, p store.ListAutoHibernationBlockersSurplusModeParams) ([]store.ListAutoHibernationBlockersSurplusModeRow, error) {
+	f.hibSurplusParams = append(f.hibSurplusParams, p)
+	return f.hibSurplusRows, f.hibErr
+}
+
 type fakeSettings struct {
 	sourceEnabled  bool
 	sourceURL      string
@@ -186,6 +199,7 @@ type fakeSettings struct {
 	custodyErr   error
 	// hibernation (issue #4207) backs WorkerHibernationEnabled/Auto/IdleAfter.
 	hibEnabled, hibAuto bool
+	hibSurplus          bool
 	hibIdleAfter        time.Duration
 	hibErr              error
 }
@@ -198,6 +212,13 @@ func (f *fakeSettings) WorkerHibernationAuto(context.Context) (bool, error) {
 }
 func (f *fakeSettings) WorkerHibernationIdleAfter(context.Context) (time.Duration, error) {
 	return f.hibIdleAfter, f.hibErr
+}
+
+func (f *fakeSettings) WorkerHibernationSurplus(context.Context) (bool, error) {
+	return f.hibSurplus, nil
+}
+func (f *fakeSettings) WorkerHibernationSurplusIdleAfter(context.Context) (time.Duration, error) {
+	return 2 * time.Hour, nil
 }
 
 func (f *fakeSettings) HealthEnabled(context.Context) (bool, error) {
@@ -1214,10 +1235,10 @@ func TestEvaluateRollupAndRegistry(t *testing.T) {
 	// (integrations), so it is 14, not 11; PRD #1809 M6 added fleet.rundisk
 	// (workers), issue #2203 adds forge.sync (integrations), and issue #2213 adds
 	// fleet.quarantine and issue #3142 adds fleet.memory_authority (workers); pricing.codex follows release.check, db.size follows db and
-	// Hibernation checks follow memory authority: wake, cleanup, automatic policy, retirement; 27 checks total.
+	// Hibernation checks follow memory authority: wake, cleanup, automatic policy, retirement; 28 checks total, with issue_tracker.sync after forge.sync.
 	wantIDs := []string{
 		"fleet.roll", "fleet.capacity", "fleet.disk", "fleet.rundisk", "fleet.quarantine", "fleet.memory_authority", "fleet.hibernation_wake", "fleet.hibernation_cleanup", "fleet.hibernation", "fleet.hibernation_retirement", "queue.waiting", "queue.undispatched",
-		"controller.report", "db", "db.size", "loops", "forge.ciwatch", "forge.sync", "slack.socket",
+		"controller.report", "db", "db.size", "loops", "forge.ciwatch", "forge.sync", "issue_tracker.sync", "slack.socket",
 		"schedules.paused", "maintenance.active", "board.drift", "custody.holds", "recovery.storage", "release.check", "agentsource.update", "pricing.codex",
 	}
 	if len(doc.Checks) != len(wantIDs) {

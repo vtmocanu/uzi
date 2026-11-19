@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/vtmocanu/uzi/api/internal/httpx"
+	"github.com/vtmocanu/uzi/api/internal/issuesource"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
@@ -38,7 +39,7 @@ func (h *Handler) CreateChat(w http.ResponseWriter, r *http.Request) {
 	}
 	run, err := h.wsvc.CreateChatRun(r.Context(), user.ID, req.Message)
 	if err != nil {
-		if h.writeChatInputError(w, err) {
+		if h.writeChatInputError(w, err) || writeProviderCreateRefusal(w, err) {
 			return
 		}
 		slog.Error("create chat", "error", err)
@@ -167,6 +168,7 @@ func (h *Handler) ContinueChat(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusNotFound, "chat not found")
 		case errors.Is(err, workersvc.ErrChatNotEnded):
 			httpx.Error(w, http.StatusConflict, "this conversation is still active")
+		case writeProviderCreateRefusal(w, err):
 		default:
 			slog.Error("continue chat", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -346,6 +348,10 @@ func (h *Handler) ConfirmProposal(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case errors.Is(err, workersvc.ErrProposalRepoGone):
 			httpx.Error(w, http.StatusNotFound, "the proposal's target repo is no longer available")
+		case errors.Is(err, workersvc.ErrRepoNeverEnabled):
+			writeNeverEnabled(w, err)
+		case errors.Is(err, issuesource.ErrIssueWriteNotOffered):
+			writeIssueWriteNotOffered(w, err)
 		case errors.Is(err, workersvc.ErrForgeIssueWrite):
 			// err wraps the driver's already-redacted message.
 			httpx.Error(w, http.StatusBadGateway, err.Error())

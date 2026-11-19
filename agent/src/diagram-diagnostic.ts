@@ -7,7 +7,7 @@ import { CODEX_PR_DESCRIPTION_MODEL } from "./codex/pr-description-model.js";
 interface Claim {
   run_id: string;
   summary_model?: string | null;
-  secrets: { anthropic_oauth_token?: string; codex?: unknown };
+  secrets: { anthropic_oauth_token?: string; codex?: unknown; provider?: { credential: string } };
 }
 
 export function diagramIdentity(claim: Claim, extraSecrets: string[] = []): { harness: string; editor_model: string } {
@@ -21,7 +21,8 @@ export function diagramIdentity(claim: Claim, extraSecrets: string[] = []): { ha
   }
   const selected = claim.summary_model?.trim() ?? "";
   const model = codex ? CODEX_PR_DESCRIPTION_MODEL : isValidModel(selected) ? selected : "haiku";
-  const secrets = [claim.secrets.anthropic_oauth_token, ...extraSecrets];
+  // PRD #4320: a provider claim's gateway key is redacted from the identity label like the OAuth token.
+  const secrets = [claim.secrets.anthropic_oauth_token, claim.secrets.provider?.credential, ...extraSecrets];
   if (claim.secrets.codex && typeof claim.secrets.codex === "object") {
     secrets.push(...Object.values(claim.secrets.codex).filter((v): v is string => typeof v === "string"));
   }

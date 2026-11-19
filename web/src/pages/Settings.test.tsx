@@ -12,6 +12,8 @@ vi.mock("../lib/api", async (importActual) => {
     ...actual,
     api: {
       listSecrets: vi.fn(),
+      // The Custom providers card loads its own list; feature off keeps it inert here.
+      listProviders: vi.fn().mockResolvedValue({ enabled: false, allowed_base_urls: [], providers: [] }),
       putAnthropicToken: vi.fn(),
       deleteAnthropicToken: vi.fn(),
       // PRD #104 M2 token CRUD, driven by the AnthropicTokens card.

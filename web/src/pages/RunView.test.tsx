@@ -4311,6 +4311,7 @@ describe("JudgePanel (PRD #46 M4)", () => {
       repo_claudemd_enabled: false,
       repo_devbox_opt_in: false,
       repo_fold_improve_uzi_backlog: false,
+      env_var_count: 0,
       pipeline: null,
       guardrail_blocked: false,
       docker_allowlisted: false,
@@ -5315,6 +5316,50 @@ describe("LimitWaitPanel (PRD #35)", () => {
       limit_wait_count: 2,
       ...over,
     });
+
+  // PRD #4320 module 5: a provider-bound gateway-limit park names the gateway, not a subscription
+  // window, and is the one limit_wait the owner can Resume.
+  const gateway = (over: Partial<Run> = {}) =>
+    run({
+      status: "limit_wait",
+      wait_on_limit: true,
+      rate_limit_type: "provider_gateway_limit",
+      limit_resets_at: null,
+      retry_not_before: ahead(5 * 60_000),
+      limit_wait_count: 2,
+      ...over,
+    });
+
+  it("renders a provider gateway-limit park with the retry time and a Resume button, never a usage limit", () => {
+    const onResume = vi.fn();
+    const { container } = render(
+      <LimitWaitPanel run={gateway()} busy={false} onToggle={() => {}} onStop={() => {}} onResume={onResume} />,
+    );
+    expect(container.textContent).toContain("Waiting: your provider's gateway rate limit");
+    expect(container.textContent).toContain("Retrying at");
+    expect(container.textContent).toContain("5m 00s");
+    expect(container.textContent).not.toContain("Anthropic usage limit");
+    expect(container.textContent).not.toContain("Paused on");
+    fireEvent.click(screen.getByRole("button", { name: "Resume" }));
+    expect(onResume).toHaveBeenCalledTimes(1);
+  });
+
+  it("renders the owner-wait row (no retry time) as waiting for the owner to resume", () => {
+    const { container } = render(
+      <LimitWaitPanel run={gateway({ retry_not_before: null })} busy={false} onToggle={() => {}} onStop={() => {}} onResume={() => {}} />,
+    );
+    expect(container.textContent).toContain("Waiting for you to resume.");
+    expect(container.textContent).not.toContain("Retrying at");
+    expect(screen.getByRole("button", { name: "Resume" })).toBeTruthy();
+  });
+
+  it("offers no Resume for a vendor limit_wait or to a non-owner", () => {
+    render(<LimitWaitPanel run={parked()} busy={false} onToggle={() => {}} onStop={() => {}} onResume={() => {}} />);
+    expect(screen.queryByRole("button", { name: "Resume" })).toBeNull();
+    cleanup();
+    render(<LimitWaitPanel run={gateway()} busy={false} canSteer={false} onToggle={() => {}} onStop={() => {}} onResume={() => {}} />);
+    expect(screen.queryByRole("button", { name: "Resume" })).toBeNull();
+  });
 
   it("renders NOTHING for a terminal run — there is no future limit to opt into", () => {
     for (const status of ["completed", "failed", "cancelled"] as const) {

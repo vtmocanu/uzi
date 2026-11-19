@@ -28,6 +28,7 @@ import { daysAgo, mockBuildInfo } from "../data";
 import { hasAnthropicToken, isCodexUsable } from "../../lib/hasToken";
 import { trustedBotsValueError } from "../../lib/trustedReviewBots";
 import { mockVaultMaterial, state } from "../store";
+import { mockClaudeProviderId } from "./providers";
 import { delay, mockScenario, oidcDemo, requireSession, users } from "./shared";
 import { agentSource, mockAllowedAgentSourceHosts } from "./agentSource";
 import { secrets } from "./secrets";
@@ -116,6 +117,8 @@ const SEED_USER_SETTINGS: UserSettings = {
   default_harness: null,
   // PRD #3257: per-user "Judge runs on"; null = same as the run being reviewed.
   judge_runs_on: null,
+  // PRD #4320: provider the Claude lane runs on; null = vendor Claude ladder.
+  claude_provider_id: null,
   harness_overflow_enabled: false,
   // Issue #3719: how a new Codex run chooses its login. Seeded "auto" so the demo shows the
   // pool at work (a pooled login sits in mocks/data/secrets.ts); the server's own default is
@@ -174,6 +177,9 @@ const SEED_APP_SETTINGS: AppSettings = {
   // PRD #4207: automatic hibernation of idle workers, default OFF, 14-day threshold.
   worker_hibernation_auto: "false",
   worker_hibernation_idle_after: "336h",
+  // PRD #4395: keep one warm worker per pool and hibernate the surplus, default OFF, 2h.
+  worker_hibernation_surplus: "false",
+  worker_hibernation_surplus_idle_after: "2h",
   hosted_worker_quota: "2",
   // PRD #4212: ephemeral cap/size/lease and the persistent-worker default size.
   ephemeral_max_per_user: "2",
@@ -635,7 +641,10 @@ function mySettingsResponse(): { settings: UserSettings } {
   const reserve = me
     ? { weekly_reserve_pct: me.weekly_reserve_pct ?? null, weekly_reserve_pause_running: me.weekly_reserve_pause_running ?? true }
     : {};
-  return { settings: { ...userSettings, ...reserve, cross_check_pins, judge_models, summary_models, effort_settings, default_model: projected ?? null } };
+  // PRD #4320: the Claude source selection lives with the mock providers (not the persisted
+  // settings blob) so it can never outlive the in-memory provider list it points into.
+  const claude_provider_id = mockClaudeProviderId();
+  return { settings: { ...userSettings, ...reserve, claude_provider_id, cross_check_pins, judge_models, summary_models, effort_settings, default_model: projected ?? null } };
 }
 
 export let appSettings: AppSettings = loadedSettings.appSettings;
@@ -1058,6 +1067,7 @@ export const settingsApi = {
         key === "ephemeral_workers_enabled" ||
         key === "worker_hibernation_enabled" ||
         key === "worker_hibernation_auto" ||
+        key === "worker_hibernation_surplus" ||
         key === "now_summary_enabled" ||
         key === "release_check_enabled" ||
         key === "release_check_banner_enabled" ||
@@ -1088,6 +1098,23 @@ export const settingsApi = {
           throw new ApiError(400, "worker_hibernation_idle_after: must be between 1h and 2160h");
         }
         nonSecret.worker_hibernation_idle_after = value;
+        continue;
+      }
+      if (key === "worker_hibernation_surplus_idle_after") {
+        // PRD #4395: same Go time.ParseDuration subset as idle_after, bounded 15m..336h.
+        const units: Record<string, number> = { h: 3600, m: 60, s: 1, ms: 1e-3, us: 1e-6, "µs": 1e-6, ns: 1e-9 };
+        const comp = "(\\d+(?:\\.\\d*)?|\\.\\d+)(ns|us|µs|ms|h|m|s)";
+        const m0 = new RegExp(`^([-+]?)(0|(?:${comp})+)$`).exec(value.trim());
+        if (!m0) {
+          throw new ApiError(400, 'worker_hibernation_surplus_idle_after: must be a duration like "2h"');
+        }
+        let seconds = 0;
+        for (const m of m0[2].matchAll(new RegExp(comp, "g"))) seconds += Number(m[1]) * units[m[2]];
+        if (m0[1] === "-") seconds = -seconds;
+        if (seconds < 15 * 60 || seconds > 336 * 3600) {
+          throw new ApiError(400, "worker_hibernation_surplus_idle_after: must be between 15m and 336h");
+        }
+        nonSecret.worker_hibernation_surplus_idle_after = value;
         continue;
       }
       if (key === "custody_hold_limit") {

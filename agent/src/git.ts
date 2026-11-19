@@ -29,10 +29,15 @@ import type { CredentialFreeCaptureContext } from "./harness.js";
 import type { CommandSandboxMode } from "./config.js";
 import { validateCaptureGitRequest } from "./credential-free-capture.js";
 import { processGroupAlive } from "./tick-spawner.js";
+import { syncDirectory } from "./authority-lock.js";
 import { RUNNER_UID, WORKER_UID, killRunnerGroupOnly, killRunnerGroup, runnerCommand, runnerPath, runnerTmpdir, uidSplitActive } from "./runner-uid.js";
 import { unmarkedSpawnEnv, workerSpawnEnv } from "./worker-spawn-mark.js";
 import { PINNED_SUBTREE_SCRIPT, SCRATCH_DELETE_LIMITS, TREE_NAME_RE, censusScratchRoot, rmRunnerTeardownTree } from "./rmtree.js";
-import { absorbBareConfigValue, classifyScratchSettlement, isNeverRemovedScratchName, newPathSink, parseScratchCensus, postCensusOf, readProtectedStores, type ProtectedPathsRead, type Settlement } from "./pod-epoch-scratch.js";
+import { absorbBareConfigValue, canonicalRunnerAlias, classifyScratchSettlement, isNeverRemovedScratchName, newPathSink, parseScratchCensus, postCensusOf, protectedLeaves, readProtectedStores, type ProtectedPathsRead, type Settlement } from "./pod-epoch-scratch.js";
+import {
+  ENDED, activeRetention, classifyRunDataDirRecords, isRunUuid, judgeAuthoritySlot, judgeRetainedEvidence, judgeRunRefListing, unknownRetention, type MaintenanceInspection, type RunRetention,
+} from "./pod-epoch-run-retention.js";
+import type { AuthorityReadBound, SlotSnapshot } from "./completion-authority.js";
 import { classifyForgeError, withForgeRetry } from "./forge-retry.js";
 import { RunDiskLocks } from "./run-disk-locks.js";
 import {
@@ -525,21 +530,23 @@ export function classifyGitStderr(error: unknown): "transient" | "permanent" {
   return stderr ? classifyGitStderrText(stderr) : "permanent";
 }
 
-const BARE_REMOTE_REJECTED_FAILED = /^\s*!\s+\[remote rejected\]\s+\S+\s+->\s+\S+\s+\(failed\)\s*$/;
+const BARE_REMOTE_REJECTED_RETRYABLE = /^\s*!\s+\[remote rejected\]\s+\S+\s+->\s+\S+\s+\((?:failed|missing necessary objects)\)\s*$/;
 const PUSH_FRAMING_LINES: RegExp[] = [
   /^To \S+\s*$/,
-  BARE_REMOTE_REJECTED_FAILED,
+  BARE_REMOTE_REJECTED_RETRYABLE,
   /^error: failed to push some refs to '[^']*'\s*$/,
   /^remote:\s*$/,
   /^\s*$/,
 ];
 
 /**
- * Classify push stderr text (#3929, ADR-0284 amendment). GitHub was observed refusing a push with a
+ * Classify push stderr text (#3929, #4438, ADR-0284 amendment). GitHub was observed refusing a push with a
  * bare ` ! [remote rejected] <sha> -> <branch> (failed)` and no stated reason (cause undocumented and
- * unproven); the permanent `remote rejected` pattern would fail that fast. By decision, that shape is
- * transient only when at least one bare `(failed)` status line is present and every line is a whole git
- * framing line (`To <url>`, the bare status line, `error: failed to push some refs`, empty `remote:`).
+ * unproven), and later with `(missing necessary objects)` (#4438, cause also unproven); the permanent
+ * `remote rejected` pattern would fail those fast. By decision, retrying them is a policy exception: the
+ * shape is transient only when at least one bare `(failed)` or `(missing necessary objects)` status line
+ * is present and every line is a whole git framing line (`To <url>`, the bare status line,
+ * `error: failed to push some refs`, empty `remote:`).
  * Any other line, a `remote:` diagnostic included, may state a reason and keeps today's classification.
  * Framing lines carry the branch and URL, so they are matched whole (`agent/issue-404` must not decide);
  * nothing inside any other line is masked.
@@ -548,7 +555,8 @@ export function classifyGitStderrText(stderr: string): "transient" | "permanent"
   if (!stderr.trim()) return "permanent";
   const lines = stderr.split(/\r?\n|\r/);
   // Every other line, any other `remote rejected` reason or a `[rejected]` line included, is not framing.
-  if (lines.some((l) => BARE_REMOTE_REJECTED_FAILED.test(l)) && lines.every((l) => PUSH_FRAMING_LINES.some((re) => re.test(l)))) {
+  // Both retryable reasons (`failed`, `missing necessary objects`) are a policy exception (#3929, #4438).
+  if (lines.some((l) => BARE_REMOTE_REJECTED_RETRYABLE.test(l)) && lines.every((l) => PUSH_FRAMING_LINES.some((re) => re.test(l)))) {
     return "transient";
   }
   return classifyForgeError(new Error(stderr));
@@ -749,6 +757,11 @@ interface CheckpointPackOptions {
   /** issue #2753: false on non-GitHub forges: the chain skips GATE 3 and takes realTip's own tree
    *  instead of swapping in P's `.github/workflows` subtree. Absent/true: today's GitHub behaviour. */
   chainWorkflowSwap?: boolean;
+  /** The server-confirmed checkpoint ref tip, as the unpinned path's source of the BLOB-ONLY
+   *  confirmed omission (see {@link CheckpointRange.confirmedBlobSha}). Separate from
+   *  `markerTrustedTip`, which is the park-marker trust contract. Ignored when a pinned range is
+   *  supplied: then only `pinned.confirmedBlobSha` counts. */
+  confirmedBlobTip?: string;
 }
 
 /** Copy only the identity fields before any await, including waiting for B. */
@@ -1024,6 +1037,16 @@ export interface CheckpointRange {
   scanFloorShas?: string[];
   /** Captured server-named origin tracking commit; only its reachable blobs may be omitted. */
   defaultBlobSha?: string;
+  /** Captured server-confirmed checkpoint tip. A BLOB-ONLY omission authority: blobs reachable from
+   *  it may be left out of the selective pack, but it is never a commit/tree exclusion, a scan floor
+   *  or a pack floor. Used only when it is an ancestor of the packed candidate; part of the
+   *  immutable replay set. When it is an ancestor of the raw tip it is also a scan floor through
+   *  `confirmedTip` (see `scanFloorShas`); otherwise (e.g. a chain/overlay candidate that descends
+   *  from it while the raw tip does not) it is not. Either way,
+   *  omitting blobs cannot publish unscanned content: omission only removes objects from the
+   *  pack and the scan range is unchanged. terminal-range.ts
+   *  intentionally does not persist this field: no terminal producer sets it. */
+  confirmedBlobSha?: string;
   /** issue #3242: TRANSPORT-only pack exclusions, replacing `^excludeSha` in the pack (never the
    *  scan, never the floor validation). Set only for a zero range (`tipSha === excludeSha`) with no
    *  origin branch: the pack would otherwise be empty, and the broker cannot prove it will fetch the
@@ -1067,7 +1090,8 @@ export interface GitCacheOptions {
    *  Production never passes it, so the real provisioner runs and fails closed off Linux. */
   scratchProvisioner?: (clonePath: string) => Promise<void>;
   /** issue #1783 M2 — test-only seam for the runner-uid deletions (operator discard's, and M3's
-   *  canonical-path free). `split` overrides {@link uidSplitActive} for these deletions alone; `run`
+   *  canonical-path free). `split` overrides {@link uidSplitActive} for these deletions alone, and also selects the
+   *  retire-binding keep-vs-remove posture of retireRunnerClone (issue #4263); `run`
    *  executes the ALREADY runner-wrapped delete argv in place of the real spawn. Production never
    *  passes it. The rest drive the REAL spawn/timeout/close-wait path of runRunnerUidDelete
    *  (and so must not be combined with `run`): `spawn` stands in for the detached spawn of the
@@ -1093,6 +1117,14 @@ export interface GitCacheOptions {
     rename?: (from: string, to: string) => Promise<void>;
     residueUuid?: () => string;
   };
+  /** issue #4263 — test-only step hook of the retirement-scratch binding lifecycle in retireRunnerClone. It is awaited at
+   *  each named step ({@link RetireBindingStep}); an error it throws takes that step's own failure path (a failure before
+   *  the clone is moved fails the retire closed, a failure in a metadata step after it leaves the binding where it was),
+   *  and a throw from a step with no failure path simulates a crash at that point. Production never passes it. */
+  retireBindingStep?: (step: RetireBindingStep) => void | Promise<void>;
+  /** issue #4263 — test-only: LOWER (never raise) the foreign-bare scan limits of compactAttemptLedger, and replace its clock
+   *  (milliseconds) so a deadline can be exercised. A value above the production limit is ignored. Production never passes it. */
+  compactForeignScanForTest?: { maxBares?: number; maxConfigBytes?: number; maxRecords?: number; deadlineMs?: number; now?: () => number };
   /** issue #3239 — test-only seams inside {@link GitCache.commitWipMarker}, in firing order:
    *  `afterOmissionCheck` after the omission scan and before staging (to race a file past the
    *  cap); `afterCommit` right after the commit call returns and BEFORE the backstop reads the
@@ -2515,6 +2547,353 @@ function attemptLedgerValue(entry: AttemptLedgerEntry): string {
   });
 }
 
+// ─── issue #4263 — retirement-scratch bindings ─────────────────────────────────────────────
+//
+// Each `<runnerRoot>/.retire-<uuid>/` retirement scratch parent is bound durably in the bare
+// config key `uzi-retire-scratch.<uuid>.binding`, so its parent is kept and identifiable (C-prime: no retire
+// writes `settled`; the verified pass deletes no bound parent and only clears the binding of a gone one). The value
+// is canonical JSON (field order below, no whitespace, no device number); a reader accepts ONLY a value
+// that re-serializes to itself. The key prefix is not an attribution prefix and not a protected-record
+// family. Existing readers: the attribution readers ignore the prefix, except the #4420 run-leaf classifier
+// (`scanRunBareConfig`), whose catch-all keeps a run's TMPDIR leaf while any binding value names the run (fail
+// closed; a split-pod non-completion binding stays `intent`, so that leaf is kept with it); `collectEpochScratchProtectedPaths` absorbs absolute
+// paths from the JSON value into its protected set and returns `unknown` on a valueless `uzi-*` key (both fail closed);
+// binding entries count toward existing readers' config-entry caps (the ACK reader's is 1024). See
+// test/retire-binding-old-readers.test.ts.
+
+/** Most binding keys one bare may carry, counting every entry under the `uzi-retire-scratch.` prefix (valid or not);
+ *  a bare over the cap reads as `unknown`, never as a truncated list. */
+export const RETIRE_BINDING_MAX_PER_BARE = 64;
+/** Issue #4263: the finite bounds of the foreign-bare scan compactAttemptLedger runs (see GitCache.scanForeignAttemptIds). A test
+ *  may only LOWER them ({@link GitCacheOptions.compactForeignScanForTest}). */
+const COMPACT_FOREIGN_SCAN_LIMITS = { maxBares: 1024, maxConfigBytes: 16 * 1024 * 1024, maxRecords: 131_072, deadlineMs: 5000 } as const;
+type CompactForeignSkipReason = "bare_cap" | "bytes_cap" | "records_cap" | "deadline" | "unreadable" | "binding_unknown" |
+  "binding_undecodable" | "ledger_unidentified";
+
+const RETIRE_BINDING_PREFIX = "uzi-retire-scratch.";
+const RETIRE_BINDING_KEY_RE = /^uzi-retire-scratch\.([0-9a-f-]{36})\.binding$/;
+const RETIRE_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const RETIRE_RUN_ID_RE = /^[A-Za-z0-9_-]{1,160}$/;
+const RETIRE_POD_RE = /^[A-Za-z0-9_-]{0,160}$/;
+const RETIRE_INODE_RE = /^(0|[1-9][0-9]{0,19})$/;
+const RETIRE_CLASSES = ["completion", "verified_successor", "owner_terminal", "owner_terminal_covered", "other"] as const;
+const RETIRE_PHASES = ["intent", "settled", "removing"] as const;
+
+/** The disposition class a caller passes to retireRunnerClone; it is the binding's `class`. */
+export type RetireDispositionClass = (typeof RETIRE_CLASSES)[number];
+
+/** The named points of the binding lifecycle at which {@link GitCacheOptions.retireBindingStep} is awaited. */
+export type RetireBindingStep =
+  | "parent-created" | "parent-pinned" | "root-synced" | "cap-checked"
+  | "intent-write" | "intent-sync" | "intent-written"
+  | "renamed" | "rename-dir-sync" | "move-verified"
+  | "journal-cleared" | "ledger-appended" | "config-sync"
+  | "removing-write" | "removing-sync" | "removing-written"
+  | "removed" | "root-synced-after-rm" | "unset" | "unset-sync" | "unset-done"
+  | "unmoved-unset" | "unmoved-unset-sync" | "unmoved-unset-done"
+  | "recover-clone-dir-sync" | "recover-root-sync" | "compact-foreign-scanned";
+
+export interface RetireBinding {
+  v: 1;
+  class: RetireDispositionClass;
+  attemptId: string;
+  runId: string;
+  branch: string;
+  clonePath: string;
+  phase: (typeof RETIRE_PHASES)[number];
+  parentIno: string;
+  cloneIno: string;
+  pod: string;
+}
+
+export function retireBindingKey(uuid: string): string {
+  return `${RETIRE_BINDING_PREFIX}${uuid}.binding`;
+}
+
+/** The uuid a well-formed binding key names, else undefined. */
+export function parseRetireBindingKey(key: string): string | undefined {
+  const m = RETIRE_BINDING_KEY_RE.exec(key);
+  return m && RETIRE_UUID_RE.test(m[1]!) ? m[1] : undefined;
+}
+
+/** One binding value in the documented field order. */
+export function retireBindingValue(b: RetireBinding): string {
+  return JSON.stringify({
+    v: b.v, class: b.class, attemptId: b.attemptId, runId: b.runId, branch: b.branch,
+    clonePath: b.clonePath, phase: b.phase, parentIno: b.parentIno, cloneIno: b.cloneIno, pod: b.pod,
+  });
+}
+
+/** At most 4096 chars, no C0/DEL control characters and no bidi controls. */
+function retireTextOk(s: string): boolean {
+  if (s.length > 4096) return false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c <= 0x1f || c === 0x7f || (c >= 0x202a && c <= 0x202e) || (c >= 0x2066 && c <= 0x2069)) return false;
+  }
+  return true;
+}
+
+/** A non-zero inode that fits an unsigned 64-bit integer. */
+function retireInodeOk(s: string): boolean {
+  return RETIRE_INODE_RE.test(s) && BigInt(s) !== 0n && BigInt(s) <= 18446744073709551615n;
+}
+
+/** Strict decode of one binding: the key uuid must be valid and the raw text must be exactly the canonical serialization. */
+export function parseRetireBinding(keyUuid: string, raw: string): { ok: true; binding: RetireBinding } | { ok: false } {
+  const bad = { ok: false } as const;
+  if (!RETIRE_UUID_RE.test(keyUuid) || raw === "") return bad;
+  let parsed: unknown;
+  try { parsed = JSON.parse(raw); } catch { return bad; }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return bad;
+  const o = parsed as Record<string, unknown>;
+  const str = (k: string): string | undefined => typeof o[k] === "string" ? o[k] as string : undefined;
+  const cls = str("class"), phase = str("phase"), attemptId = str("attemptId"), runId = str("runId"), branch = str("branch");
+  const clonePath = str("clonePath"), parentIno = str("parentIno"), cloneIno = str("cloneIno"), pod = str("pod");
+  if (o.v !== 1 || cls === undefined || phase === undefined || attemptId === undefined || runId === undefined ||
+    branch === undefined || clonePath === undefined || parentIno === undefined || cloneIno === undefined || pod === undefined) return bad;
+  if (!(RETIRE_CLASSES as readonly string[]).includes(cls) || !(RETIRE_PHASES as readonly string[]).includes(phase)) return bad;
+  if (!ATTEMPT_ID_RE.test(attemptId) || !RETIRE_RUN_ID_RE.test(runId) || branch === "") return bad;
+  if (!retireTextOk(branch) || branch.startsWith("-") || !retireTextOk(clonePath)) return bad;
+  if (!path.isAbsolute(clonePath) || path.resolve(clonePath) !== clonePath) return bad;
+  if (!retireInodeOk(parentIno) || !retireInodeOk(cloneIno) || !RETIRE_POD_RE.test(pod)) return bad;
+  const binding: RetireBinding = {
+    v: 1, class: cls as RetireBinding["class"], attemptId, runId, branch, clonePath,
+    phase: phase as RetireBinding["phase"], parentIno, cloneIno, pod,
+  };
+  return retireBindingValue(binding) === raw ? { ok: true, binding } : bad;
+}
+
+/** One `uzi-retire-scratch.*` entry of a bare: `key` is the full config key, `uuid` is set only when the key is a well-formed
+ *  binding key, and `parsed` is undefined for a malformed, valueless or duplicated entry. */
+export interface RetireBindingRead { key: string; uuid?: string; raw: string; parsed?: RetireBinding }
+export type RetireBindingsRead = { state: "read"; bindings: RetireBindingRead[] } | { state: "unknown" };
+
+// ─── issue #4263 M4 — bound-parent evidence and decisions ────────────────────────────────────
+
+/** Why a bound retire-scratch parent is kept; fixed tokens only. */
+export type RetireKeepReason =
+  | "conflict" | "malformed_binding" | "bound_intent" | "interrupted_removal" | "class_ineligible"
+  | "ledger_missing" | "ledger_mismatch" | "protected_by_retained_source" | "custody" | "canonical_present" | "settled_kept";
+
+/** One bare's raw metadata as the retire-scratch reclaim reads it under that bare's lock. */
+export interface RetireScratchBareEvidence {
+  barePath: string;
+  bindings: RetireBindingRead[];
+  /** Every raw attempt-ledger value in config order. */
+  ledger: Array<{ branch: string; raw: string }>;
+  /** Every absolute path any `uzi-*` value names, except the attempt ledger and the bindings themselves. */
+  protectedPaths: string[];
+  /** Branches that carry a non-empty restore entry. */
+  restoreBranches: string[];
+  /** Non-empty recovery journals, raw. */
+  recovery: Array<{ branch: string; raw: string }>;
+  /** Run ids with a stopped-canonical marker. */
+  stoppedRuns: string[];
+}
+
+export type RetireScratchEvidenceRead = { state: "read"; bares: RetireScratchBareEvidence[] } | { state: "unknown"; reason: string };
+
+export type RetireBindingExam = { kind: "keep"; reason: RetireKeepReason } | { kind: "ready"; binding: RetireBinding; raw: string };
+
+const RETIRE_RECLAIM_CLASSES: ReadonlySet<string> = new Set(["verified_successor", "owner_terminal"]);
+
+function retireCanonicalRetired(b: RetireBinding): string {
+  return attemptLedgerValue({ attemptId: b.attemptId, runId: b.runId, clonePath: b.clonePath, state: "retired" });
+}
+
+/**
+ * The last canonical ledger value for the binding's attempt across the bare's branches, undefined when none, or "tainted"
+ * when any NON-canonical value (reordered, padded, extra field, unparseable) still names the attempt id: such a value could
+ * be a later state this reader cannot interpret, so no earlier canonical `retired` stays authoritative over it.
+ * Also "tainted" (issue #4263) when ANY canonical value for the attempt id, earlier or last, names a (branch, runId, clonePath)
+ * different from the binding's: an attempt id has one identity, so a second one is conflicting history, not a superseded state.
+ * Only same-identity values (live then retired) are accepted.
+ */
+function retireLedgerLast(evidence: RetireScratchBareEvidence, b: RetireBinding): { branch: string; raw: string; entry: AttemptLedgerEntry } | undefined | "tainted" {
+  const attemptId = b.attemptId;
+  let last: { branch: string; raw: string; entry: AttemptLedgerEntry } | undefined;
+  for (const { branch, raw } of evidence.ledger) {
+    const entry = parseAttemptLedgerEntry(raw);
+    if (entry && raw === attemptLedgerValue(entry)) {
+      if (entry.attemptId === attemptId) {
+        if (branch !== b.branch || entry.runId !== b.runId || entry.clonePath !== b.clonePath) return "tainted";
+        last = { branch, raw, entry };
+      }
+    } else if (raw.includes(attemptId) || retireParsedNamesAttempt(raw, attemptId)) return "tainted";
+  }
+  return last;
+}
+
+/** Issue #4263: does ANOTHER decoded binding (a different key) name the same attempt id with a different (branch, runId, clonePath)? */
+function retireOtherBindingConflicts(evidence: RetireScratchBareEvidence, key: string, b: RetireBinding): boolean {
+  return evidence.bindings.some(o => o.key !== key && o.parsed !== undefined && o.parsed.attemptId === b.attemptId &&
+    (o.parsed.branch !== b.branch || o.parsed.runId !== b.runId || o.parsed.clonePath !== b.clonePath));
+}
+
+/**
+ * Issue #4263: does ANOTHER bare hold evidence that could give the attempt id a second identity? An attempt id belongs to
+ * one clone of one bare, so the single-bare checks cannot clear it: a different bare's binding or ledger value naming the
+ * same id (whatever its runId, clonePath or branch) conflicts. Fail closed: a hit is any undecodable binding entry, any
+ * decoded binding naming the id, and any ledger value not POSITIVELY identified as a different attempt. A value is exempt
+ * only when it is canonical with another id, or non-canonical, not containing the id text, and parsing to an object whose
+ * `attemptId` is a well-formed string other than the id.
+ */
+export function retireCrossBareConflict(others: readonly RetireScratchBareEvidence[], attemptId: string): boolean {
+  for (const o of others) {
+    if (o.bindings.some(b => b.parsed === undefined || b.parsed.attemptId === attemptId)) return true;
+    for (const { raw } of o.ledger) {
+      const e = parseAttemptLedgerEntry(raw);
+      if (e && raw === attemptLedgerValue(e)) {
+        if (e.attemptId === attemptId) return true;
+        continue;
+      }
+      if (raw.includes(attemptId) || retireParsedNamesAttempt(raw, attemptId)) return true;
+      if (retireIdentifiedAttempt(raw) === undefined) return true;
+    }
+  }
+  return false;
+}
+
+/** Issue #4263: the attempt id a ledger value POSITIVELY identifies: its own id when canonical, else the well-formed string
+ *  `attemptId` of the non-null, non-array object it parses to. Undefined when the value cannot be attributed to an attempt. */
+function retireIdentifiedAttempt(raw: string): string | undefined {
+  const e = parseAttemptLedgerEntry(raw);
+  if (e && raw === attemptLedgerValue(e)) return e.attemptId;
+  let other: unknown;
+  try { other = JSON.parse(raw); } catch { return undefined; }
+  if (typeof other !== "object" || other === null || Array.isArray(other)) return undefined;
+  const id = (other as { attemptId?: unknown }).attemptId;
+  return typeof id === "string" && ATTEMPT_ID_RE.test(id) ? id : undefined;
+}
+
+/** Does a non-canonical value parse (JSON escapes decoded, so the id need not appear literally) to an object naming the attempt? */
+function retireParsedNamesAttempt(raw: string, attemptId: string): boolean {
+  if (parseAttemptLedgerEntry(raw)?.attemptId === attemptId) return true;
+  try {
+    const v: unknown = JSON.parse(raw);
+    return typeof v === "object" && v !== null && (v as { attemptId?: unknown }).attemptId === attemptId;
+  } catch { return false; }
+}
+
+/** Does any recorded path equal, lie under, or contain the parent or the binding's clone path? Alias-aware for the parent. */
+function retireNamed(evidence: RetireScratchBareEvidence, runnerRoot: string, parentName: string, clonePath: string): boolean {
+  if (protectedLeaves(evidence.protectedPaths, runnerRoot, [parentName]).has(parentName)) return true;
+  return pathNamed(evidence.protectedPaths, clonePath);
+}
+
+/** Does a recorded store path name the retire parent (`<runnerRoot>/.retire-<uuid>`) or the binding's clone path, alias-aware? */
+export function storesNameRetireParent(recorded: readonly string[], runnerRoot: string, uuid: string, clonePath: string): boolean {
+  return pathNamed(recorded, path.join(runnerRoot, `.retire-${uuid}`)) || pathNamed(recorded, clonePath);
+}
+
+/** Does any recorded path equal, lie under, or contain `target`, treating `/data/runner-shared/...` as `/data/runner/...`? */
+function pathNamed(recorded: readonly string[], target: string): boolean {
+  const t = canonicalRunnerAlias(target);
+  return recorded.some(p => { const r = canonicalRunnerAlias(p); return isWithinPath(r, t) || isWithinPath(t, r); });
+}
+
+function retireJournalOf(evidence: RetireScratchBareEvidence, branch: string): RecoveryJournalEntry | "unparseable" | undefined {
+  const raw = evidence.recovery.find(r => r.branch === branch)?.raw;
+  if (raw === undefined) return undefined;
+  try { return parseRecoveryJournal(raw); } catch { return "unparseable"; }
+}
+
+/**
+ * Pure decision over one bare's evidence for the binding `uuid`: the metadata half of every keep reason. It reads no
+ * filesystem and writes nothing; the async half (custody stores, quarantine, canonical footprint) is checked by the locked
+ * context. `acrossBares` is the number of bindings that name the uuid over all bares (the nomination pass supplies it).
+ */
+export function evaluateRetireBinding(input: {
+  evidence: RetireScratchBareEvidence; uuid: string; runnerRoot: string; expectRaw?: string; acrossBares?: number;
+  otherBares?: readonly RetireScratchBareEvidence[];
+}): RetireBindingExam {
+  const keep = (reason: RetireKeepReason): RetireBindingExam => ({ kind: "keep", reason });
+  const { evidence, uuid } = input;
+  const own = evidence.bindings.filter(b => b.key === retireBindingKey(uuid));
+  if (own.length !== 1 || (input.acrossBares ?? 1) !== 1) return keep("conflict");
+  const entry = own[0]!;
+  if (input.expectRaw !== undefined && entry.raw !== input.expectRaw) return keep("conflict");
+  const b = entry.parsed;
+  if (!b) return keep("malformed_binding");
+  if (b.phase === "intent") return keep("bound_intent");
+  if (b.phase === "removing") return keep("interrupted_removal");
+  // C-prime (#4263 [7]): no writer produces `settled`; a pre-existing one is kept, never reclaimed.
+  if (b.phase === "settled") return keep("settled_kept");
+  if (!RETIRE_RECLAIM_CLASSES.has(b.class)) return keep("class_ineligible");
+  if (retireOtherBindingConflicts(evidence, entry.key, b)) return keep("conflict");
+  if (input.otherBares && retireCrossBareConflict(input.otherBares, b.attemptId)) return keep("conflict");
+  const last = retireLedgerLast(evidence, b);
+  if (last === "tainted") return keep("ledger_mismatch");
+  if (!last) return keep("ledger_missing");
+  if (last.branch !== b.branch || last.raw !== retireCanonicalRetired(b)) return keep("ledger_mismatch");
+  const parentName = `.retire-${uuid}`;
+  const journal = retireJournalOf(evidence, b.branch);
+  if (journal === "unparseable" || evidence.restoreBranches.includes(b.branch) ||
+      retireNamed(evidence, input.runnerRoot, parentName, b.clonePath)) return keep("protected_by_retained_source");
+  if (evidence.stoppedRuns.includes(b.runId) || journal?.remediationRecovery !== undefined) return keep("custody");
+  return { kind: "ready", binding: b, raw: entry.raw };
+}
+
+/** The two metadata-only resolutions of a binding whose parent directory is gone (see {@link RetireScratchLocked.recoverGone}). */
+export function evaluateRetireRecovery(input: {
+  evidence: RetireScratchBareEvidence; uuid: string; runnerRoot: string; expectRaw: string;
+  canonical: { present: boolean; ino?: string }; otherBares?: readonly RetireScratchBareEvidence[];
+}): "case1" | "case2" | "unresolved" {
+  const { evidence, uuid } = input;
+  const own = evidence.bindings.filter(b => b.key === retireBindingKey(uuid));
+  const b = own.length === 1 && own[0]!.raw === input.expectRaw ? own[0]!.parsed : undefined;
+  if (!b) return "unresolved";
+  if (retireOtherBindingConflicts(evidence, own[0]!.key, b)) return "unresolved";
+  if (input.otherBares && retireCrossBareConflict(input.otherBares, b.attemptId)) return "unresolved";
+  const last = retireLedgerLast(evidence, b);
+  if (!last || last === "tainted" || last.branch !== b.branch || last.entry.runId !== b.runId || last.entry.clonePath !== b.clonePath) return "unresolved";
+  const journal = retireJournalOf(evidence, b.branch);
+  if (journal === "unparseable" || evidence.restoreBranches.includes(b.branch)) return "unresolved";
+  const named = pathNamed(evidence.protectedPaths, b.clonePath);
+  if (last.raw === retireCanonicalRetired(b)) {
+    return !input.canonical.present && !named && journal?.completionSourceFence === undefined ? "case1" : "unresolved";
+  }
+  if (b.phase === "intent" && input.canonical.present && input.canonical.ino === b.cloneIno && named &&
+      journal !== undefined && journal.clonePath === b.clonePath) return "case2";
+  return "unresolved";
+}
+
+/** What the retire-scratch reclaim may do to one bare while it holds that bare's lock. */
+export interface RetireScratchLocked {
+  /** Fresh evidence of this bare. */
+  evidence(): Promise<RetireScratchBareEvidence>;
+  /** The full keep/ready decision for `uuid` (metadata, custody stores, quarantine, canonical footprint). */
+  examine(uuid: string, expectRaw: string, acrossBares?: number, otherBares?: readonly RetireScratchBareEvidence[]): Promise<RetireBindingExam>;
+  /** Durably write the `removing` phase; the binding must still read exactly `settledRaw`. Returns the written value. */
+  markRemoving(uuid: string, settledRaw: string): Promise<string>;
+  /** Durably unset a binding that still reads exactly `expectRaw`. */
+  unset(uuid: string, expectRaw: string): Promise<void>;
+  /** Metadata-only resolution of a binding whose parent is gone; `unresolved` leaves the binding untouched. */
+  recoverGone(uuid: string, expectRaw: string, otherBares?: readonly RetireScratchBareEvidence[]): Promise<"recovered" | "metadata_unresolved">;
+}
+
+/** The live binding of one retireRunnerClone call (issue #4263): the scratch parent, its pin until the move is verified,
+ *  and the last value durably written under the bare lock. */
+interface RetireBound {
+  uuid: string;
+  parent: string;
+  binding: RetireBinding;
+  /** The raw config value last written (and synced) for this binding; an unset must still find exactly this. */
+  raw: string;
+  pin: FileHandle | undefined;
+  /** The device of the clone as pinned when the retire began; the moved clone must still sit on it. */
+  cloneDev: bigint;
+  /** The clone was verified at `<parent>/clone` (inode and device) and the directories holding it were synced. */
+  moveVerified: boolean;
+  /** The journal clear and the `retired` ledger append were synced after the move (recorded for the step order; no settle decision reads it). */
+  durable: boolean;
+}
+
+/** Linux O_PATH is not in Node's fs.constants; elsewhere a plain read-only directory open stands in. */
+const RETIRE_PIN_FLAGS = (process.platform === "linux" ? 0o10000000 : fsConstants.O_RDONLY)
+  | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW;
+
 // ─── issue #1786 — retained stopped sources ────────────────────────────────────────────────
 //
 // A stopped generation's clone is kept, not discarded, until an operator
@@ -2684,6 +3063,26 @@ export interface RetainedSourceEvidence {
    *  `restoreTip`). It never changes the disposition, the descriptor digest or operator output, which
    *  never sets it. The pod-epoch shadow counts such candidates as `journal_extra_fields`. */
   epochJournalExtraFields?: true;
+}
+
+/** Issue #4420 m2: {@link GitCache.classifyEpochScratchRunRetention}'s options. */
+export interface EpochScratchRunRetentionOptions {
+  /** The server verdicts the caller read for this run; the retained-group inspection evaluates against them. */
+  lifecycle: RetainedLifecycleSnapshot;
+  holds: RetainedHoldsSnapshot;
+  signal: AbortSignal;
+  /** Absolute wall-clock deadline. */
+  deadline: number;
+  /** Read-only authority slot accessor (AuthorityRuntime.peekSlot); absent makes a retired entry unknown. */
+  peekSlot?: (clonePath: string, bound?: AuthorityReadBound) => Promise<SlotSnapshot | null>;
+  /** Pass-scoped memo of the worker-wide retained census, so N run leaves cost one census. */
+  discovery?: { value?: Promise<EpochRetainedDiscoveryResult> };
+  /** Pass-scoped memo of each bare's `config --local --null --list` text (keyed by bare path), so N run leaves read each bare once. */
+  memo?: { bareConfigs?: Map<string, Promise<string>>; slots?: Promise<SlotSnapshot[]> };
+  /** Read-only, bounded enumeration of every authority slot (AuthorityRuntime.peekAllSlots); absent makes the run unknown (`authority_inventory`). */
+  peekAllSlots?: (max: number, bound?: AuthorityReadBound) => Promise<SlotSnapshot[]>;
+  /** The authenticated recovery-maintenance read (RecoveryMaintenance.inspectRun); absent makes a present maintenance store unknown. */
+  inspectMaintenance?: (runId: string, bound?: AuthorityReadBound) => Promise<MaintenanceInspection>;
 }
 
 /** The server's lifecycle verdict for a run, read by the caller (never by GitCache) before it
@@ -3211,9 +3610,36 @@ export function readRetireScratchOutcomesActivation(env: NodeJS.ProcessEnv): boo
   throw new Error("UZI_RETIRE_SCRATCH_OUTCOMES must be unset, empty, 0 or 1");
 }
 
+/** Reads `UZI_RETIRE_SCRATCH_RECLAIM` (issue #4263): whether the verified pod-epoch pass runs its retire-scratch
+ *  phase (since C-prime it deletes no bound parent; it clears the binding of a gone one). On by default; `0` restores observation only. Anything else refuses startup. The
+ *  switch permits the phase and proves nothing: every gate in the pass still applies. */
+export function readRetireScratchReclaimActivation(env: NodeJS.ProcessEnv): boolean {
+  const raw = env.UZI_RETIRE_SCRATCH_RECLAIM;
+  if (raw === undefined || raw === "" || raw === "1") return true;
+  if (raw === "0") return false;
+  throw new Error("UZI_RETIRE_SCRATCH_RECLAIM must be unset, empty, 0 or 1");
+}
+
 type RetireScratchWalkReason = "entry_cap" | "time_cap" | "unreadable" | "cross_device" | "changed" | "vanished";
 type RetireScratchBytesState = "measured" | "partial" | "unknown";
-type RetireScratchSources = { state: "read"; paths: string[] } | { state: "unknown" } | { state: "not_attempted" };
+/** `bindings` are the decoded phase of every `uzi-retire-scratch.*` entry by uuid (`malformed` when undecodable); undefined or
+ *  `unknown` when they could not be read. */
+type RetireScratchBindingPhase = "intent" | "settled" | "removing" | "malformed";
+type RetireScratchSources = {
+  state: "read"; paths: string[]; bindings?: Map<string, RetireScratchBindingPhase> | "unknown";
+} | { state: "unknown" } | { state: "not_attempted" };
+
+/** One parent's outcome as the verified pod-epoch pass reports it to the startup inspector (issue #4263). */
+export interface RetireScratchParentOutcome {
+  name: string;
+  outcome: "reclaimed" | "kept";
+  /** Fixed token; for `reclaimed` always `reclaimed`. */
+  reason: string;
+  bytes: number;
+  bytesState: "measured" | "partial" | "unknown";
+}
+/** The retire-scratch phase as the pass reports it; `parents` holds one entry per parent the phase examined. */
+export interface RetireScratchPassReport { state: string; reason: string; parents: RetireScratchParentOutcome[] }
 
 interface RetireScratchWalkCtx {
   now: () => number;
@@ -3391,6 +3817,54 @@ export type JoinedEpochChild =
   | { joined: true; spawned: true; ticket: { settle(): void }; code: number | null; signal: NodeJS.Signals | null;
       stdout: string; stderr: string; stdoutBytes?: Buffer; stderrBytes?: Buffer; failure: unknown }
   | { joined: true; spawned: false; provenance?: "not-spawned"; ticket: { settle(): void }; failure: unknown };
+
+/** Issue #4263: one bound retire-scratch parent to empty and remove (see {@link GitCache.discardRetireScratchParent}). */
+export interface RetireScratchDiscardInput {
+  scope: PodEpochReclaimScope;
+  /** Absolute path of the runner root; only used to fsync it and to key the unsettled entry. */
+  root: string;
+  /** An open `O_PATH` descriptor of the runner root (>= 3), pinned by the caller. */
+  rootPin: number;
+  /** Decimal `st_dev` of the runner root. */
+  rootDev: string;
+  /** Decimal `mnt_id` of the runner root's mount; the parent and clone pins must report the same `mnt_id:` in fdinfo. */
+  rootMntId: string;
+  /** `.retire-<uuid>`: must match the retire binding key grammar. */
+  parentName: string;
+  /** Decimal inodes bound for the parent and its `clone`. */
+  parentIno: string;
+  cloneIno: string;
+  /** Absolute wall-clock deadline in milliseconds. */
+  deadline: number;
+  maxEntries: number;
+  maxDepth: number;
+  signal: AbortSignal;
+  /** Synchronous liveness check; throws to deny. Called before, and again after, the helper. */
+  live: () => void;
+  /**
+   * The caller's final pre-effect observation; rejects to deny. Every identity, posture and budget refusal precedes it,
+   * so the M4 caller records its durable `removing` phase here: a refusal after this callback returned is `not_live`
+   * only, and the caller must then treat the binding as `removing`.
+   */
+  beforeEffect: () => Promise<void>;
+}
+
+export type RetireScratchDiscardResult =
+  | { kind: "removed" }
+  /** Nothing was touched. */
+  | { kind: "refused"; reason: string }
+  /**
+   * The tree (or part of it) is kept; the binding must stay. `stderrBytes` is a bounded length, never content.
+   * Residue after the clone `rmdir` (for example `rmdir_parent_failed`, `parent_unverified`, `parent_still_linked`,
+   * `parent_identity_changed`, `fsync_failed`; not exhaustive) is permanent: the clone is already gone, so the M4 caller
+   * keeps the binding at `removing` permanently (owner decision) and never retries it. `removal_error` (an unexpected
+   * throw in the worker's own removal) can occur on either side of the clone `rmdir`; it is residue all the same.
+   * The parent is removed by name, so a rename-and-replace of that name between the final identity check and the
+   * `rmdir` can remove only an EMPTY directory planted there (`rmdir` never removes content); it is then reported as
+   * `parent_unverified`, never `removed`, because the pinned parent still has links. The root is a sticky, worker-owned
+   * directory (checked as `root_posture`), so no other uid can perform that swap.
+   */
+  | { kind: "residue"; reason: string; exit: number | null; stderrBytes?: number };
 
 /** Issue #4043: one admitted scratch leaf to delete (see {@link GitCache.discardEpochScratchLeaf}). */
 export interface EpochScratchDiscardInput {
@@ -4249,14 +4723,16 @@ export class GitCache {
     scope: PodEpochReclaimScope, command: string, args: string[],
     options: { env: NodeJS.ProcessEnv; timeout?: number; maxBuffer?: number; cwd?: string; input?: string | Buffer;
       bytes?: true; encoding?: "latin1"; identity: BoundaryProcessRequest["identity"];
-      signals: readonly AbortSignal[]; deadline: number },
+      signals: readonly AbortSignal[]; deadline: number;
+      /** One extra descriptor handed to the child as fd 3; the scope's EX lock is then fd 4. */
+      extraFd?: number },
   ): Promise<JoinedEpochChild> {
     const identity = options.identity;
     const ticket = scope.beginMutation();
     const deps = this.epochNativeTestDependencies;
     let child: ChildProcess;
     try {
-      const stdio = scope.inheritStdio(["pipe", "pipe", "pipe"]);
+      const stdio = scope.inheritStdio(options.extraFd === undefined ? ["pipe", "pipe", "pipe"] : ["pipe", "pipe", "pipe", options.extraFd]);
       child = (deps?.spawn ?? spawn)(command, args, {
         env: options.env, cwd: options.cwd, detached: true, stdio,
       });
@@ -4586,6 +5062,200 @@ export class GitCache {
   }
 
   /**
+   * Issue #4263: the fixed argv the retire-scratch `empty-fd` helper may launch. Exactly ONE wrapper is
+   * accepted, `runnerCommand` (the uid split must be active: single-uid it would run as the worker, so this
+   * refuses), never `commandRootCommand`, a worker wrapper, a retry identity or a chmod step. The argv is
+   * `[...wrap, "-e", PINNED_SUBTREE_SCRIPT, "fd:3", "-", <max>, <budget>, "empty-fd", <dev:ino>, "", "pinned", "-",
+   * "1", <depth>]` with env `{ PATH }`, cwd `/` and identity `command`.
+   */
+  private validateEpochRetireEmptyLaunch(command: string, args: readonly string[], env: NodeJS.ProcessEnv,
+    cwd: string | undefined, identity: BoundaryProcessRequest["identity"]): void {
+    const refuse = (): never => { throw new Error("epoch retire empty launch unaudited"); };
+    if (!uidSplitActive()) return refuse();
+    const wrap = runnerCommand(process.execPath, []);
+    if (command !== wrap.command || identity !== "command" || cwd !== "/") return refuse();
+    const keys = Object.keys(env);
+    if (keys.length !== 1 || keys[0] !== "PATH" || env.PATH !== "/usr/bin:/bin") return refuse();
+    if (args.length !== wrap.args.length + 13 || !wrap.args.every((arg, i) => args[i] === arg)) return refuse();
+    const [dash, script, home, rel, max, budget, mode, expect, sync, phase, rootExpect, oneFs, depth] = args.slice(wrap.args.length);
+    const lim = SCRATCH_DELETE_LIMITS;
+    const canon = (s: string | undefined, lo: number, hi: number): boolean =>
+      s !== undefined && /^[1-9][0-9]{0,9}$/.test(s) && Number(s) >= lo && Number(s) <= hi;
+    if (dash !== "-e" || script !== PINNED_SUBTREE_SCRIPT || home !== "fd:3" || rel !== "-" ||
+        !canon(max, 1, lim.maxEntries) || !canon(budget, EPOCH_SCRATCH_MIN_DELETE_BUDGET_MS, lim.budgetMs) ||
+        mode !== "empty-fd" || !/^[0-9]+:[0-9]+$/.test(expect!) || sync !== "" || phase !== "pinned" ||
+        rootExpect !== "-" || oneFs !== "1" || !canon(depth, 1, lim.maxDepth)) return refuse();
+  }
+
+  /**
+   * Issue #4263: empty and remove one bound `<runnerRoot>/.retire-<uuid>/clone` (worker-owned 0700 parent, runner-owned
+   * clone) with no chmod, no chown, no privilege increase and no raw fallback. The caller (the verified pod-epoch
+   * phase) owns every authority check; this method owns the identity and launch guarantees. Preflight (nothing is
+   * touched, `refused`; any unexpected throw is `preflight_failed`): the root is a worker-owned sticky directory, the
+   * parent pins through `rootPin` to a worker-owned 0700 directory with the bound inode on the root's device holding
+   * exactly `clone`, `clone` pins to the bound inode and device, and both pins report `rootMntId` (else
+   * `mount_changed`). Then the strict
+   * `empty-fd` helper runs as the runner with the clone pin as child fd 3 (the EX lock is fd 4). The helper's receipt
+   * is never taken as emptiness: the worker's own `rmdir` of `clone` and then of the parent (whose pin must then report
+   * `st_nlink` 0) is. Any helper
+   * non-receipt, rmdir failure, identity change or fsync failure is `residue` (the tree is kept). A child that cannot
+   * be proven joined stops the scope, leaves the unsettled entry and throws `epochScratchUnresolved`.
+   * Helper stderr is never read into a message; only its bounded byte length is reported.
+   */
+  async discardRetireScratchParent(input: RetireScratchDiscardInput): Promise<RetireScratchDiscardResult> {
+    const refused = (reason: string): RetireScratchDiscardResult => ({ kind: "refused", reason });
+    const scope = input?.scope;
+    const dec = /^[1-9][0-9]{0,19}$/;
+    const parentMatch = typeof input?.parentName === "string" ? /^\.retire-([0-9a-f-]{36})$/.exec(input.parentName) : null;
+    if (!scope || ["assertExclusive", "beginMutation", "inheritStdio", "stop", "stopped"]
+        .some(name => typeof scope[name as keyof PodEpochReclaimScope] !== "function") ||
+        !Number.isInteger(input.rootPin) || input.rootPin < 3 || typeof input.root !== "string" || !path.isAbsolute(input.root) ||
+        !parentMatch || !RETIRE_UUID_RE.test(parentMatch[1]!) ||
+        typeof input.rootMntId !== "string" || !dec.test(input.rootMntId) || !dec.test(String(input.rootDev)) || !dec.test(String(input.parentIno)) || !dec.test(String(input.cloneIno)) ||
+        typeof input.live !== "function" || typeof input.beforeEffect !== "function" || !(input.signal instanceof AbortSignal) ||
+        !Number.isFinite(input.deadline) || !Number.isInteger(input.maxEntries) || input.maxEntries < 1 ||
+        input.maxEntries > SCRATCH_DELETE_LIMITS.maxEntries || !Number.isInteger(input.maxDepth) || input.maxDepth < 1 ||
+        input.maxDepth > SCRATCH_DELETE_LIMITS.maxDepth) return refused("invalid_input");
+    if (!uidSplitActive()) return refused("split_inactive");
+    const procFd = "/proc/self/fd/";
+    const parentName = input.parentName;
+    const rootDev = BigInt(input.rootDev), parentIno = BigInt(input.parentIno), cloneIno = BigInt(input.cloneIno);
+    const parentPath = path.resolve(input.root, parentName);
+    const isNoEnt = (e: unknown) => (e as NodeJS.ErrnoException)?.code === "ENOENT";
+    let parentPin: FileHandle | undefined, clonePin: FileHandle | undefined;
+    let key: string | undefined;
+    let joined: JoinedEpochChild | undefined;
+    const release = () => {
+      if (key === undefined) return;
+      const pending = (this.unsettledDeletes.get(key) ?? 1) - 1;
+      if (pending > 0) this.unsettledDeletes.set(key, pending);
+      else this.unsettledDeletes.delete(key);
+      key = undefined;
+    };
+    try {
+      // ---- preflight: nothing below may have an effect ----
+      try {
+        input.signal.throwIfAborted();
+        if (Date.now() >= input.deadline) return refused("deadline");
+        scope.assertExclusive();
+        if (scope.stopped()) return refused("scope_stopped");
+        input.live();
+      } catch { return refused("not_live"); }
+      const self = BigInt(process.getuid?.() ?? -1);
+      // The root must be worker-owned and sticky: only then can no other uid rename or unlink the parent's name.
+      // The `rst.uid !== self` half of this check is exercised only by the root/real worker-UID lane (M6): an
+      // unprivileged test cannot create a root owned by another uid.
+      try {
+        const rst = await fs.stat(`${procFd}${input.rootPin}`, { bigint: true });
+        if (!rst.isDirectory() || rst.uid !== self || (rst.mode & 0o1000n) === 0n) return refused("root_posture");
+      } catch { return refused("preflight_failed"); }
+      try { parentPin = await fs.open(`${procFd}${input.rootPin}/${parentName}`, RETIRE_PIN_FLAGS); }
+      catch (e) { return refused(isNoEnt(e) ? "parent_missing" : "not_directory"); }
+      try {
+        const pst = await parentPin.stat({ bigint: true });
+        if (!pst.isDirectory()) return refused("not_directory");
+        if (pst.uid !== self) return refused("wrong_owner");
+        if ((pst.mode & 0o7777n) !== 0o700n) return refused("wrong_mode");
+        if (pst.ino !== parentIno || pst.dev !== rootDev) return refused("identity_changed");
+        const names: string[] = [];
+        const dir = await fs.opendir(`${procFd}${parentPin.fd}`);
+        try { for (let e = await dir.read(); e !== null && names.length < 2; e = await dir.read()) names.push(e.name); }
+        finally { await dir.close(); }
+        if (names.length !== 1 || names[0] !== "clone") return refused("unexpected_entries");
+        try { clonePin = await fs.open(`${procFd}${parentPin.fd}/clone`, RETIRE_PIN_FLAGS); }
+        catch (e) { return refused(isNoEnt(e) ? "clone_missing" : "not_directory"); }
+        const cst = await clonePin.stat({ bigint: true });
+        if (!cst.isDirectory()) return refused("not_directory");
+        if (cst.ino !== cloneIno || cst.dev !== rootDev) return refused("clone_identity_changed");
+        // Both pins must sit on the caller's mount: an unreadable fdinfo counts as a mismatch. A clone on a different
+        // mount_id than the root (a same-device bind mount) is not pinned by any test: creating one needs a bind mount
+        // (CAP_SYS_ADMIN), which neither the unit tests nor the real worker-UID lane have. That half is backed by the
+        // phase-level mount/bind classifier.
+        const mntId = async (fd: number): Promise<string | undefined> => {
+          try {
+            const ids = (await fs.readFile(`/proc/self/fdinfo/${fd}`, "utf8")).split("\n").filter(line => line.startsWith("mnt_id:"));
+            return ids.length === 1 ? /^mnt_id:[ \t]+(\d+)$/.exec(ids[0]!)?.[1] : undefined;
+          } catch { return undefined; }
+        };
+        if (await mntId(parentPin.fd) !== input.rootMntId || await mntId(clonePin.fd) !== input.rootMntId) return refused("mount_changed");
+      } catch { return refused("preflight_failed"); }
+
+      // ---- launch admission ----
+      const joinAllowance = 2 * (this.epochNativeTestDependencies?.joinMs ?? EPOCH_NATIVE_JOIN_MS);
+      const childDeadline = input.deadline - joinAllowance;
+      const budgetMs = Math.floor(Math.min(SCRATCH_DELETE_LIMITS.budgetMs,
+        childDeadline - Date.now() - SCRATCH_DELETE_LIMITS.killSlackMs));
+      if (budgetMs < EPOCH_SCRATCH_MIN_DELETE_BUDGET_MS) return refused("budget_exhausted");
+      const env = { PATH: "/usr/bin:/bin" };
+      const expect = `${rootDev}:${cloneIno}`;
+      const wrapped = runnerCommand(process.execPath, ["-e", PINNED_SUBTREE_SCRIPT, "fd:3", "-", String(input.maxEntries),
+        String(budgetMs), "empty-fd", expect, "", "pinned", "-", "1", String(input.maxDepth)]);
+      try { this.validateEpochRetireEmptyLaunch(wrapped.command, wrapped.args, env, "/", "command"); }
+      catch { return refused("launch_unaudited"); }
+      try { await input.beforeEffect(); input.live(); input.signal.throwIfAborted(); scope.assertExclusive(); }
+      catch { return refused("not_live"); }
+      if (scope.stopped()) return refused("scope_stopped");
+
+      // ---- the single runner pass ----
+      key = parentPath;
+      this.unsettledDeletes.set(key, (this.unsettledDeletes.get(key) ?? 0) + 1);
+      const unresolved = (cause?: unknown): never => {
+        scope.stop();
+        throw Object.assign(new Error("epoch retire scratch discard unresolved"),
+          { epochScratchUnresolved: true, ...(cause === undefined ? {} : { cause }) });
+      };
+      try {
+        joined = await this.spawnJoinedEpochChild(scope, wrapped.command, wrapped.args, {
+          env, cwd: "/", timeout: budgetMs + SCRATCH_DELETE_LIMITS.killSlackMs, identity: "command",
+          signals: [input.signal], deadline: childDeadline, extraFd: clonePin.fd,
+        });
+      } catch (error) { return unresolved(error); }
+      if (scope.stopped()) return unresolved();
+      const settle = () => { release(); joined!.ticket.settle(); };
+      if (!joined.spawned) {
+        settle();
+        return { kind: "residue", reason: "not_spawned", exit: null };
+      }
+      const exit = joined.code;
+      const stderrBytes = Math.min(Buffer.byteLength(joined.stderr), 65_536);
+      const receipt = !joined.failure && joined.signal === null && exit === 0 && joined.stdout === `UZI-SCRATCH-EMPTIED ${expect}\n`;
+      const residue = (reason: string): RetireScratchDiscardResult => { settle(); return { kind: "residue", reason, exit, stderrBytes }; };
+      if (!receipt) {
+        const byExit: Record<number, string> = { 3: "helper_identity", 4: "helper_remaining", 7: "helper_unopenable", 8: "helper_budget", 9: "helper_other_fs" };
+        return residue(joined.failure ? "helper_interrupted" : joined.signal !== null ? "helper_signal" : byExit[exit ?? -1] ?? "helper_failed");
+      }
+      try { input.live(); } catch { return residue("not_live"); }
+
+      // ---- the worker's own removal: the receipt is not emptiness proof, a successful rmdir is ----
+      const same = async (p: string, ino: bigint): Promise<boolean> => {
+        try { const st = await fs.lstat(p, { bigint: true }); return st.isDirectory() && st.ino === ino && st.dev === rootDev; }
+        catch { return false; }
+      };
+      const clonePath = `${procFd}${parentPin.fd}/clone`;
+      const parentViaRoot = `${procFd}${input.rootPin}/${parentName}`;
+      try {
+        if ((await clonePin.stat({ bigint: true })).ino !== cloneIno || !(await same(clonePath, cloneIno))) return residue("clone_identity_changed");
+        try { await fs.rmdir(clonePath); } catch { return residue("rmdir_clone_failed"); }
+        const pst2 = await parentPin.stat({ bigint: true });
+        if (pst2.ino !== parentIno || !(await same(parentViaRoot, parentIno))) return residue("parent_identity_changed");
+        try { await fs.rmdir(parentViaRoot); } catch { return residue("rmdir_parent_failed"); }
+        // The rmdir above is by name: only the pinned parent reporting no links proves it was the bound directory.
+        let unlinked = false;
+        try { unlinked = (await parentPin.stat({ bigint: true })).nlink === 0n; } catch { return residue("parent_unverified"); }
+        if (!unlinked) return residue("parent_unverified");
+        try { await fs.lstat(parentViaRoot); return residue("parent_still_linked"); }
+        catch (e) { if (!isNoEnt(e)) return residue("parent_unverified"); }
+        try { await syncDirectory(input.root); } catch { return residue("fsync_failed"); }
+      } catch { return residue("removal_error"); }
+      settle();
+      return { kind: "removed" };
+    } finally {
+      await clonePin?.close().catch(() => undefined);
+      await parentPin?.close().catch(() => undefined);
+    }
+  }
+
+  /**
    * Registers a copied, immutable binding for the worker coordinator. Raw journal bytes stay
    * private, outside the capability and inspect output. Registration alone permits no effects.
    */
@@ -4831,7 +5501,7 @@ export class GitCache {
    * already uses, under the same bare lock, bounds and recovery operation), then the four recovery
    * stores through a bounded fd-relative walk. Anything unreadable, malformed, truncated or over a cap
    * is `unknown`/`malformed` with a fixed reason token and no paths: the caller then refuses scratch. */
-  async collectEpochScratchProtectedPaths(opts: { signal: AbortSignal; deadline: number }): Promise<ProtectedPathsRead> {
+  async collectEpochScratchProtectedPaths(opts: { signal: AbortSignal; deadline: number; excludeDisposition?: boolean }): Promise<ProtectedPathsRead> {
     const sink = newPathSink();
     const limits = this.epochLimits();
     const outcome = async (): Promise<ProtectedPathsRead> => {
@@ -4846,6 +5516,9 @@ export class GitCache {
             const nl = item.indexOf("\n");
             const key = nl < 0 ? item : item.slice(0, nl);
             if (!key.startsWith("uzi-")) continue;
+            // `excludeDisposition`: the retire-scratch binding and the attempt ledger are the reclaim's own disposition
+            // records (they name the very clone path under test), not retained sources; every other record still counts.
+            if (opts.excludeDisposition && (key.startsWith(RETIRE_BINDING_PREFIX) || /^uzi-attempts\..+\.entry$/.test(key))) continue;
             // A valueless record is not a cleared value: other protection readers treat it as
             // undecodable. Refuse every valueless uzi-* key rather than silently omitting one.
             if (nl < 0) return { state: "unknown", reason: "bare_value_unparseable" };
@@ -4880,6 +5553,330 @@ export class GitCache {
     } catch {
       return { state: "unknown", reason: opts.signal.aborted ? "protected_aborted" : Date.now() >= opts.deadline ? "protected_deadline" : "bare_unreadable" };
     }
+  }
+
+  /**
+   * Issue #4420 m2: whether every LOCAL record of `runId` has positively ended, so the run's TMPDIR leaf
+   * (`run-<runId>` under the runner scratch root) may be reclaimed. Read-only, under the same scope as
+   * {@link collectEpochScratchProtectedPaths} (epoch limits plus a recovery operation); it creates and mutates no
+   * authority record, git config, ref or store, and never throws. `ended` only when EVERY source was observed
+   * and ended: ENOENT on a store root, run directory or the bare repos root is observed-absent (ended for that source);
+   * any other error, cap, symlink or special file, or malformed value is `unknown`; a live record is `active`.
+   * Sources: (1) per bare, the attempt ledger (state AND footprint AND authority slot), the recovery and restore
+   * journals, stopped/retained/recovery-owner records and the run's refs; (2) custody (recovery and settlement
+   * records plus terminal protection); (3) the run's dataDir records (pod-epoch-run-retention.ts); (4) the retained
+   * groups, judged by {@link judgeRetainedEvidence}. The outbox is NOT read here (see runScratchPhase). Source tokens
+   * are a fixed vocabulary.
+   */
+  async classifyEpochScratchRunRetention(runId: string, opts: EpochScratchRunRetentionOptions): Promise<RunRetention> {
+    try {
+      const id = runId.toLowerCase();
+      if (!isRunUuid(id)) return unknownRetention("run_id");
+      const limits = this.epochLimits();
+      const local = await this.epochRetained.run(limits, () => this.withRecoveryOperation(opts.signal, opts.deadline,
+        () => this.classifyRunLocalRecords(runId, id, opts, limits)));
+      if (local.state !== "ended") return local;
+      return await this.classifyRunRetainedGroups(id, opts);
+    } catch {
+      return unknownRetention(opts.signal.aborted ? "aborted" : "classifier");
+    }
+  }
+
+  /** The run's ref listing, judged by judgeRunRefListing. Unlike runGit this keeps stderr and the exit code: a plain
+   * failure or any stderr is unknown; residue and boundary aborts rethrow (as strictGitRead does). */
+  private async listRunRefs(bare: string, id: string): Promise<RunRetention> {
+    try {
+      const out = await this.execScoped("git", withDir(bare, ["for-each-ref", "--count=1", "--format=%(refname)",
+        `refs/uzi-owed/${id}/`, `refs/uzi-recovery-episode/${id}/`, `refs/uzi-recovery-pin/${id}/`,
+        `refs/uzi-coverage/${id}/`, `refs/uzi-settle/${id}/`, `refs/uzi-archive/${id}/`, `refs/uzi-cross-check/${id}`]),
+      { env: gitEnv(), timeout: GIT_TIMEOUT_MS });
+      return judgeRunRefListing({ code: 0, stdout: out.stdout, stderr: out.stderr });
+    } catch (err) {
+      if (err instanceof RunResidueBlockedError) throw err;
+      const abort = this.boundaryAbortError(err);
+      if (abort) throw abort;
+      this.checkRecoveryInterruption();
+      return unknownRetention("run_refs");
+    }
+  }
+
+  /** Read-only, bounded look at the bare's loose and packed ref storage for the run's refs. Called only after a clean,
+   * empty listing, so any run-named entry that is not an ordinary readable ref is something git declined to list:
+   * unknown, never ended. */
+  private async judgeRunRefStorage(bare: string, id: string, config: string, limits: Required<EpochRetainedLimits>): Promise<RunRetention> {
+    const refuse = unknownRetention("run_refs");
+    const probe = async (p: string): Promise<Stats | null | "error"> => this.retainedIO(async () => {
+      try { return await fs.lstat(p); }
+      catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT" ? null : "error"; }
+    });
+    // Reftable or any other ref storage extension: the loose/packed layout below does not describe it.
+    for (const item of config.split("\0")) {
+      const nl = item.indexOf("\n");
+      if ((nl < 0 ? item : item.slice(0, nl)).toLowerCase() === "extensions.refstorage") return refuse;
+    }
+    const reftable = await probe(path.join(bare, "reftable"));
+    if (reftable !== null) return refuse;
+    // An absent location passes; a symlink, non-directory or unreadable one at any ancestor is unknown (git reads a
+    // dangling symlink at an ancestor as a missing ref).
+    const dirAt = async (p: string): Promise<"absent" | "dir" | "bad"> => {
+      const st = await probe(p);
+      if (st === null) return "absent";
+      return st !== "error" && st.isDirectory() && !st.isSymbolicLink() ? "dir" : "bad";
+    };
+    let entries = 0;
+    const walk = async (dir: string): Promise<boolean> => {
+      this.checkRecoveryInterruption();
+      const handle = await fs.opendir(dir, { bufferSize: 1 });
+      try {
+        for (;;) {
+          const ent = await this.retainedIO(() => handle.read());
+          if (!ent) return true;
+          if (++entries > limits.maxDirectoryEntries) return false;
+          if (!ent.isDirectory() || ent.isSymbolicLink()) return false;
+          if (!await walk(path.join(dir, ent.name))) return false;
+        }
+      } finally { await handle.close(); }
+    };
+    try {
+      const refsDir = path.join(bare, "refs");
+      const top = await dirAt(refsDir);
+      if (top === "bad") return refuse;
+      if (top === "dir") {
+        for (const family of ["uzi-owed", "uzi-recovery-episode", "uzi-recovery-pin", "uzi-coverage", "uzi-settle", "uzi-archive", "uzi-cross-check"]) {
+          const famDir = path.join(refsDir, family);
+          const fam = await dirAt(famDir);
+          if (fam === "bad") return refuse;
+          if (fam === "absent") continue;
+          const leaf = path.join(famDir, id);
+          if (family === "uzi-cross-check") {
+            if (await probe(leaf) !== null) return refuse;
+            continue;
+          }
+          const run = await dirAt(leaf);
+          if (run === "bad") return refuse;
+          if (run === "dir" && !await walk(leaf)) return refuse;
+        }
+      }
+    } catch (err) {
+      if (err instanceof RunResidueBlockedError || isAbortLike(err) || this.boundaryAbortError(err)) throw err;
+      this.checkRecoveryInterruption();
+      return refuse;
+    }
+    // packed-refs, size-bounded before it is read.
+    const packedPath = path.join(bare, "packed-refs");
+    const packed = await probe(packedPath);
+    if (packed === null) return ENDED;
+    if (packed === "error" || !packed.isFile() || packed.size > limits.maxMetadataBytes) return refuse;
+    let text: string;
+    try { text = await this.retainedIO(() => fs.readFile(packedPath, "utf8")); }
+    catch (err) {
+      if (err instanceof RunResidueBlockedError || isAbortLike(err) || this.boundaryAbortError(err)) throw err;
+      this.checkRecoveryInterruption();
+      return refuse;
+    }
+    const prefixes = [`refs/uzi-owed/${id}/`, `refs/uzi-recovery-episode/${id}/`, `refs/uzi-recovery-pin/${id}/`,
+      `refs/uzi-coverage/${id}/`, `refs/uzi-settle/${id}/`, `refs/uzi-archive/${id}/`];
+    const cross = `refs/uzi-cross-check/${id}`;
+    for (const line of text.split("\n")) {
+      if (prefixes.some(p => line.includes(p))) return refuse;
+      for (let at = line.indexOf(cross); at >= 0; at = line.indexOf(cross, at + 1)) {
+        const next = line[at + cross.length];
+        if (next === undefined || next === "/" || /\s/.test(next)) return refuse;
+      }
+    }
+    return ENDED;
+  }
+
+  private async classifyRunLocalRecords(runId: string, id: string, opts: EpochScratchRunRetentionOptions,
+      limits: Required<EpochRetainedLimits>): Promise<RunRetention> {
+    const ledger: Array<AttemptLedgerEntry & { bare: string; branch: string }> = [];
+    let configBytes = 0;
+    for (const bare of await this.retainedBares(undefined, { strict: true })) {
+      this.checkRecoveryInterruption();
+      const found = await this.withLock(bare, async (): Promise<RunRetention | { ledger: Array<AttemptLedgerEntry & { branch: string }> }> => {
+        await this.assertRecoveryBare(bare);
+        // Pass-scoped memo: each bare's config listing is read once per pass. This is safe only because the pass holds
+        // exclusive pod-epoch ownership before admission and no other writer runs during it, so the config cannot change
+        // under the memo. A memoized failure re-throws for every leaf
+        // (unknown through the caller's catch). The byte cap is still charged per leaf against the memoized length.
+        let pending = opts.memo?.bareConfigs?.get(bare);
+        if (!pending) {
+          pending = this.runGit(bare, ["config", "--local", "--null", "--list"]);
+          if (opts.memo) (opts.memo.bareConfigs ??= new Map()).set(bare, pending);
+        }
+        const config = await pending;
+        if ((configBytes += config.length) > limits.maxMetadataBytes) return unknownRetention("bare_config");
+        const scanned = this.scanRunBareConfig(config, id);
+        if ("state" in scanned) return scanned;
+        // The run's pins and anchors. One bounded listing (`--count=1`: any match is enough); a read failure or any
+        // stderr is unknown("run_refs") from listRunRefs. Refs are keyed by the run id (a UUID survives the sanitising of
+        // the archive ref's id); refs/uzi-cross-check/<runId> is a single ref.
+        const listing = await this.listRunRefs(bare, id);
+        if (listing.state !== "ended") return listing;
+        // for-each-ref skips a ref it cannot read, so a clean empty listing proves little: read the loose and packed
+        // storage directly (read-only, bounded) for anything under the run's prefixes.
+        const storage = await this.judgeRunRefStorage(bare, id, config, limits);
+        if (storage.state !== "ended") return storage;
+        return scanned;
+      }, opts.signal);
+      if ("state" in found) return found;
+      for (const entry of found.ledger) ledger.push({ ...entry, bare });
+    }
+    for (const entry of ledger) {
+      if (entry.state !== "retired") return activeRetention(`ledger_${entry.state}`);
+    }
+    // Keys of slots the ledger loop attributed to this run and judged ended (a verified missing footprint).
+    const attributedEnded = new Set<string>();
+    for (const entry of ledger) {
+      // The census's path/attempt identity contract, before any probe: a row naming a path that is not this bare's
+      // canonical attempt clone (or whose attempt id differs from the path's) would probe an unrelated location as
+      // missing, so the run is unknown, never ended.
+      const parsed = parseAttemptPath(entry.clonePath, path.resolve(this.runnerRoot));
+      const key = parsed?.key ?? "";
+      if (!parsed || parsed.attemptId !== entry.attemptId || entry.runId === "" || !/^[A-Za-z0-9_-]+$/.test(key) ||
+          this.clonePathShape(entry.clonePath, this.runnerClonePath(entry.bare, key))?.attemptId !== entry.attemptId ||
+          attemptGenerationEvidence(entry.attemptId).unreadable) {
+        return unknownRetention("attempt_ledger");
+      }
+      // The footprint first: an authority slot never stands in for it.
+      const footprint = await this.epochFootprintState(entry.clonePath);
+      if (footprint === "present") return activeRetention("attempt_footprint");
+      if (footprint === "unknown") return unknownRetention("attempt_footprint");
+      if (!opts.peekSlot) return unknownRetention("authority_slot");
+      let slot: SlotSnapshot | null;
+      try { slot = await this.retainedIO(() => opts.peekSlot!(entry.clonePath, { signal: opts.signal, deadline: opts.deadline })); }
+      catch { this.checkRecoveryInterruption(); return unknownRetention("authority_slot"); }
+      const judged = judgeAuthoritySlot(footprint, slot);
+      if (judged.state !== "ended") return judged;
+      if (slot != null && typeof slot.key === "string") attributedEnded.add(slot.key);
+    }
+    // Every slot is judged. A slot whose publication cohort names this run is a live authority record even when no
+    // ledger entry of the run remains to name its clone path (ledger compaction can drop one); a cohort naming
+    // another run is excluded. A slot with no publication carries no run identity, so it is excluded only when the
+    // ledger loop above attributed it to this run and judged it ended; every other publication-less slot (active,
+    // retiring, pending, unexpected state, malformed, or an unattributed tombstone whose footprint cannot be
+    // verified) is unknown. Read-only, capped, once per pass; any failure, an unreadable or unauthenticated slot, a
+    // cap or a missing accessor is unknown.
+    if (!opts.peekAllSlots) return unknownRetention("authority_inventory");
+    let slots: SlotSnapshot[];
+    try {
+      const bound = { signal: opts.signal, deadline: opts.deadline };
+      const inventory = opts.memo
+        ? (opts.memo.slots ??= this.retainedIO(() => opts.peekAllSlots!(limits.maxDirectoryEntries, bound)))
+        : this.retainedIO(() => opts.peekAllSlots!(limits.maxDirectoryEntries, bound));
+      slots = await inventory;
+    } catch { this.checkRecoveryInterruption(); return unknownRetention("authority_inventory"); }
+    for (const slot of slots) {
+      if (slot == null || typeof slot !== "object") return unknownRetention("authority_inventory");
+      if (slot.publication === null) {
+        // Attributed by key AND itself still an ended tombstone: a differing snapshot of the same key is unresolved.
+        if (typeof slot.key === "string" && attributedEnded.has(slot.key) && judgeAuthoritySlot("missing", slot).state === "ended") continue;
+        return unknownRetention("authority_inventory");
+      }
+      if (slot.publication === undefined || typeof slot.publication !== "object") return unknownRetention("authority_inventory");
+      const cohortRun = slot.publication.cohort?.runId;
+      if (typeof cohortRun !== "string") return unknownRetention("authority_inventory");
+      if (cohortRun.toLowerCase() === id) return activeRetention("authority_slot");
+    }
+    // custodyHeld folds an unreadable store into "held" (fail closed), so that case reads as active here.
+    if (await this.custodyHeld(runId)) return activeRetention("custody");
+    return classifyRunDataDirRecords(path.dirname(this.reposRoot), id, {
+      interrupt: () => this.checkRecoveryInterruption(), maxDirectoryEntries: limits.maxDirectoryEntries,
+      // The classifier's own interruption bound travels with every maintenance read.
+      ...(opts.inspectMaintenance ? { inspectMaintenance: (id: string) => opts.inspectMaintenance!(id, { signal: opts.signal, deadline: opts.deadline }) } : {}),
+    });
+  }
+
+  /**
+   * One bare's config, for one run. Pure. The attempt ledger yields the run's entries (last value per attemptId
+   * wins); every other family yields a keep or is ignored. Matching is case-insensitive on the run id.
+   * `uzi-trackowner.<branch>.owner` is DELIBERATELY IGNORED (owner decision, issue #4420): it is seed provenance for
+   * refs/uzi-runner/<branch> (written by promoteTrackingUnderLock and the attempt repair, read by readTrackingOwner,
+   * preserved by cleanupRecoveryGeneration), not retention of a TMPDIR leaf, so its presence neither keeps nor
+   * releases. Any other `uzi-*` key is ignored unless it names the run; a #4263 `uzi-retire-scratch.<uuid>.binding`
+   * value always carries its runId, so it keeps that run's leaf for as long as the binding exists.
+   */
+  private scanRunBareConfig(config: string, id: string): RunRetention | { ledger: Array<AttemptLedgerEntry & { branch: string }> } {
+    const protectedFamily = /^uzi-(?:recovery|retained|attempts|stopped|recoveryowner|restore)\./;
+    const ledger = new Map<string, AttemptLedgerEntry & { branch: string }>();
+    const journals = new Map<string, string>();
+    for (const item of config.split("\0")) {
+      const nl = item.indexOf("\n");
+      const key = nl < 0 ? item : item.slice(0, nl);
+      if (!key.startsWith("uzi-") || key.startsWith("uzi-trackowner.")) continue;
+      // A valueless record is not a cleared value: it cannot be interpreted, so it is unknown, never skipped.
+      if (nl < 0) { if (protectedFamily.test(key)) return unknownRetention("bare_config"); continue; }
+      const value = item.slice(nl + 1);
+      const lowKey = key.toLowerCase();
+      let m = /^uzi-attempts\.(.+)\.entry$/.exec(key);
+      if (m) {
+        const entry = parseAttemptLedgerEntry(value);
+        if (!entry) return unknownRetention("attempt_ledger");
+        // One attempt id must keep one identity: a later row of another run, branch or path would otherwise fold
+        // over this run's row before the run filter below and release its clone.
+        const prev = ledger.get(entry.attemptId);
+        if (prev && (prev.branch !== m[1] || prev.runId !== entry.runId || prev.clonePath !== entry.clonePath)) return unknownRetention("attempt_ledger");
+        ledger.set(entry.attemptId, { ...entry, branch: m[1]! });
+        continue;
+      }
+      m = /^uzi-recovery\.(.+)\.clone$/.exec(key);
+      if (m) { journals.set(m[1]!, value); continue; }
+      if (restoreKeyBranch(key) !== undefined) {
+        if (value === "") continue;
+        try {
+          const parsed = parseRestoreValue(value);
+          const named = parsed.kind === "entry" ? parsed.remainder.runId : parsed.successor.runId;
+          if (typeof named !== "string" || named.toLowerCase() === id || value.toLowerCase().includes(id)) return activeRetention("restore_journal");
+        } catch { return unknownRetention("restore_journal"); }
+        continue;
+      }
+      const family = /^uzi-(stopped|retained|recoveryowner)\.([^.]+)\./.exec(lowKey);
+      if (family) {
+        if (family[2] === id) {
+          if (value === "") continue;
+          return activeRetention(family[1] === "stopped" ? "stopped_marker" : family[1] === "retained" ? "retained_descriptor" : "recovery_owner");
+        }
+        if (value !== "" && !value.startsWith("/")) { try { JSON.parse(value); } catch { return unknownRetention("bare_config"); } }
+        continue;
+      }
+      if (protectedFamily.test(key)) { if (value !== "" && value.toLowerCase().includes(id)) return activeRetention("bare_config"); continue; }
+      if (lowKey.includes(id) || value.toLowerCase().includes(id)) return activeRetention("bare_config");
+    }
+    for (const raw of journals.values()) {
+      if (raw === "") continue;
+      try { parseRecoveryJournal(raw); } catch { return unknownRetention("recovery_journal"); }
+      if (raw.toLowerCase().includes(id)) return activeRetention("recovery_journal");
+    }
+    return { ledger: [...ledger.values()].filter(entry => entry.runId.toLowerCase() === id) };
+  }
+
+  /** The run's retained groups from the worker-wide census, inspected against the caller's server verdicts. */
+  private async classifyRunRetainedGroups(id: string, opts: EpochScratchRunRetentionOptions): Promise<RunRetention> {
+    const discover = () => this.discoverEpochRetainedSources({ signal: opts.signal, deadline: opts.deadline, maxPhysicalPaths: 200 });
+    const census = await (opts.discovery ? (opts.discovery.value ??= discover()) : discover());
+    // An incomplete or overflowing inventory may have omitted this run's groups: unknown.
+    if (!census.inventoryComplete || census.unreadable > 0 || census.overflow > 0) return unknownRetention("retained_inventory");
+    const byBare = new Map<string, typeof census.groups>();
+    for (const group of census.groups) {
+      if (group.selector.runId.toLowerCase() !== id) continue;
+      byBare.set(group.barePath, [...(byBare.get(group.barePath) ?? []), group]);
+    }
+    for (const [barePath, groups] of byBare) {
+      const inspected = await this.inspectEpochRetainedGroups({
+        barePath, maxDescriptors: 200, isLivePath: () => false, signal: opts.signal, deadline: opts.deadline,
+        budgetMs: Math.max(1, opts.deadline - Date.now()),
+        requests: groups.map(group => ({ selector: group.selector, holds: opts.holds, lifecycle: opts.lifecycle, maxPhysicalPaths: group.paths.length })),
+      });
+      if (!Array.isArray(inspected) || inspected.length !== groups.length) return unknownRetention("retained_inventory");
+      for (const result of inspected) {
+        if (result.partial || result.unreadable > 0) return unknownRetention("retained_inventory");
+        for (const source of result.sources) {
+          const judged = judgeRetainedEvidence(source);
+          if (judged.state !== "ended") return judged;
+        }
+      }
+    }
+    return ENDED;
   }
 
   /** Local recovery clocks, including queued locks and actual child settlement. */
@@ -4993,6 +5990,11 @@ export class GitCache {
   private readonly scratchProvisioner: ((clonePath: string) => Promise<void>) | undefined;
   /** See {@link GitCacheOptions.retentionDelete}; undefined in production. */
   private readonly retentionDeleteSeam: GitCacheOptions["retentionDelete"];
+  /** See {@link GitCacheOptions.retireBindingStep}; undefined in production. */
+  private readonly retireBindingStepSeam: GitCacheOptions["retireBindingStep"];
+  /** The foreign-bare scan limits of compactAttemptLedger: the production constants, lowered only by the test seam. */
+  private readonly compactForeignLimits: { maxBares: number; maxConfigBytes: number; maxRecords: number; deadlineMs: number };
+  private readonly compactForeignNow: () => number;
   private readonly archivedPinClock: NonNullable<GitCacheOptions["archivedPinClockForTest"]>;
   private readonly terminalRecordProtection: GitCacheOptions["terminalRecordProtection"];
   /** See {@link GitCacheOptions.canonicalFree}; undefined in production. */
@@ -5037,6 +6039,17 @@ export class GitCache {
     this.chainMaxDiffBytes = opts.checkpointChainBounds?.maxDiffBytes ?? CHECKPOINT_CHAIN_MAX_DIFF_BYTES;
     this.scratchProvisioner = opts.scratchProvisioner;
     this.retentionDeleteSeam = opts.retentionDelete;
+    this.retireBindingStepSeam = opts.retireBindingStep;
+    const lowered = (production: number, requested: number | undefined): number =>
+      typeof requested === "number" && requested >= 0 ? Math.min(production, requested) : production;
+    const foreignSeam = opts.compactForeignScanForTest;
+    this.compactForeignLimits = {
+      maxBares: lowered(COMPACT_FOREIGN_SCAN_LIMITS.maxBares, foreignSeam?.maxBares),
+      maxConfigBytes: lowered(COMPACT_FOREIGN_SCAN_LIMITS.maxConfigBytes, foreignSeam?.maxConfigBytes),
+      maxRecords: lowered(COMPACT_FOREIGN_SCAN_LIMITS.maxRecords, foreignSeam?.maxRecords),
+      deadlineMs: lowered(COMPACT_FOREIGN_SCAN_LIMITS.deadlineMs, foreignSeam?.deadlineMs),
+    };
+    this.compactForeignNow = foreignSeam?.now ?? (() => Date.now());
     this.archivedPinClock = opts.archivedPinClockForTest ?? {
       now: () => Date.now(),
       schedule: (fn, ms) => { const handle = setTimeout(fn, ms); return () => clearTimeout(handle); },
@@ -14734,18 +15747,35 @@ export class GitCache {
   /** At most the path depth plus two leaves, charged to the epoch read budget; no retry.
    * Missing ancestors and symlinks cannot prove an absent footprint. */
   private async epochMissingFootprint(rec: GatheredRecord): Promise<boolean> {
-    const clone = rec.parts[0]!.clonePath;
+    return (await this.epochFootprintState(rec.parts[0]!.clonePath)) === "missing";
+  }
+
+  /** The footprint rule of {@link epochMissingFootprint} for one clone path (read by the retire-scratch phase): the
+   *  `missing` outcome of {@link epochFootprintState}. An unsafe clone path still reads the `.uzi-skills-` sibling
+   *  (within the same depth-plus-two-leaves bound); the answer is `false` either way. */
+  private async missingFootprintOf(clone: string): Promise<boolean> {
+    return (await this.epochFootprintState(clone)) === "missing";
+  }
+
+  /** The same walk as {@link epochMissingFootprint} with its three outcomes kept apart (also read by
+   *  {@link classifyEpochScratchRunRetention}): `missing` only when every ancestor is a real directory and both the
+   *  clone and its `.uzi-skills-` sibling are positively absent; `present` when either exists as a real directory;
+   *  `unknown` for a missing ancestor, a symlink, a non-directory or an unreadable path. */
+  private async epochFootprintState(clone: string): Promise<"missing" | "present" | "unknown"> {
     const parent = path.dirname(clone);
     const root = path.parse(parent).root;
     let current = root;
     for (const component of parent.slice(root.length).split(path.sep).filter(Boolean)) {
       current = path.join(current, component);
-      if ((await this.clonePresence(current)).presence !== "present") return false;
+      if ((await this.clonePresence(current)).presence !== "present") return "unknown";
     }
+    let state: "missing" | "present" | "unknown" = "missing";
     for (const target of [clone, path.join(parent, `.uzi-skills-${path.basename(clone)}`)]) {
-      if ((await this.clonePresence(target)).presence !== "missing") return false;
+      const presence = (await this.clonePresence(target)).presence;
+      if (presence === "present") return "present";
+      if (presence === "unsafe") state = "unknown";
     }
-    return true;
+    return state;
   }
 
   /** Narrow metadata-only retry evidence, from the complete ordered raw snapshot under B.
@@ -16628,6 +17658,190 @@ export class GitCache {
     return (await this.runGit(barePath, ["config", "--local", "--no-includes", "--null", "--list"])).split("\0");
   }
 
+  /**
+   * issue #4263: every `uzi-retire-scratch.*` key of the bare, decoded strictly, under the caller's bare lock (it takes
+   * none). Bounded: more than {@link RETIRE_BINDING_MAX_PER_BARE} such keys is `unknown`. A valueless, undecodable or
+   * duplicated key is returned as an entry with no `parsed`, never thrown. A git failure propagates to the caller.
+   */
+  private async readRetireBindingsUnderLock(barePath: string, snapshot?: readonly string[]): Promise<RetireBindingsRead> {
+    const items = (snapshot ?? await this.configEntries(barePath)).filter(item => item.startsWith(RETIRE_BINDING_PREFIX));
+    if (items.length > RETIRE_BINDING_MAX_PER_BARE) return { state: "unknown" };
+    const rows = items.map(item => {
+      const nl = item.indexOf("\n");
+      const key = nl < 0 ? item : item.slice(0, nl);
+      return { key, raw: nl < 0 ? "" : item.slice(nl + 1) };
+    });
+    const seen = new Map<string, number>();
+    for (const r of rows) seen.set(r.key, (seen.get(r.key) ?? 0) + 1);
+    const bindings = rows.map((r): RetireBindingRead => {
+      const uuid = parseRetireBindingKey(r.key);
+      const base = uuid === undefined ? { key: r.key, raw: r.raw } : { key: r.key, uuid, raw: r.raw };
+      if (uuid === undefined || seen.get(r.key) !== 1) return base;
+      const decoded = parseRetireBinding(uuid, r.raw);
+      return decoded.ok ? { ...base, parsed: decoded.binding } : base;
+    });
+    return { state: "read", bindings };
+  }
+
+  /** {@link readRetireBindingsUnderLock} under the bare lock. */
+  readRetireBindings(barePath: string): Promise<RetireBindingsRead> {
+    return this.withLock(barePath, () => this.readRetireBindingsUnderLock(barePath));
+  }
+
+  /**
+   * issue #4263 M4: one bare's evidence from its config listing, under the caller's bare lock. A valueless `uzi-*` key
+   * outside the attempt ledger and the binding family, an undecodable record family value or a path overflow throws (the
+   * caller maps that to `unknown`); the bindings family and the ledger never throw on a bad value (they are returned raw).
+   */
+  private async retireEvidenceOf(barePath: string, entries: readonly string[]): Promise<RetireScratchBareEvidence> {
+    const sink = newPathSink();
+    const ledger: RetireScratchBareEvidence["ledger"] = [], recovery: RetireScratchBareEvidence["recovery"] = [];
+    const restoreBranches = new Set<string>(), stoppedRuns = new Set<string>();
+    for (const item of entries) {
+      const nl = item.indexOf("\n");
+      const key = nl < 0 ? item : item.slice(0, nl);
+      if (!key.startsWith("uzi-")) continue;
+      const value = nl < 0 ? "" : item.slice(nl + 1);
+      const attempts = /^uzi-attempts\.(.+)\.entry$/.exec(key);
+      if (attempts) { ledger.push({ branch: attempts[1]!, raw: value }); continue; }
+      if (key.startsWith(RETIRE_BINDING_PREFIX)) continue;
+      if (nl < 0) throw new Error("valueless uzi key");
+      const restore = restoreKeyBranch(key);
+      if (restore !== undefined && value !== "") restoreBranches.add(restore);
+      const rec = /^uzi-recovery\.(.+)\.clone$/.exec(key);
+      if (rec && value !== "") recovery.push({ branch: rec[1]!, raw: value });
+      const stopped = /^uzi-stopped\.(.+)\.entry$/.exec(key);
+      if (stopped) stoppedRuns.add(stopped[1]!);
+      if (absorbBareConfigValue(key, value, sink) !== "ok") throw new Error("uzi value unparseable");
+    }
+    const read = await this.readRetireBindingsUnderLock(barePath, entries);
+    if (read.state !== "read") throw new Error("retire bindings over the cap");
+    return { barePath, bindings: read.bindings, ledger, protectedPaths: [...sink.paths].sort(), restoreBranches: [...restoreBranches].sort(),
+      recovery, stoppedRuns: [...stoppedRuns].sort() };
+  }
+
+  /**
+   * issue #4263 M4: every bare's evidence in ONE all-or-nothing pass, each bare read under its own lock inside one
+   * recovery operation (bounded by `deadline`, cancellable by `signal`). Any bare that cannot be read, any record cap and
+   * any undecodable protected value makes the whole read `unknown` with a fixed reason; nothing is partial.
+   */
+  async readRetireScratchEvidence(opts: { signal: AbortSignal; deadline: number }): Promise<RetireScratchEvidenceRead> {
+    const limits = this.epochLimits();
+    const bares: RetireScratchBareEvidence[] = [];
+    try {
+      let bytes = 0, records = 0;
+      await this.epochRetained.run(limits, () => this.withRecoveryOperation(opts.signal, opts.deadline, async (combined) => {
+        for (const bare of await this.retainedBares(undefined, { strict: true })) {
+          this.checkRecoveryInterruption();
+          await this.withLock(bare, async () => {
+            await this.assertRecoveryBare(bare);
+            const entries = await this.configEntries(bare);
+            for (const item of entries) bytes += Buffer.byteLength(item) + 1;
+            records += entries.length;
+            if (bytes > limits.maxMetadataBytes || records > limits.maxMetadataRecords) throw new Error("retire evidence limit");
+            bares.push(await this.retireEvidenceOf(bare, entries));
+          }, combined);
+        }
+      }));
+      return { state: "read", bares };
+    } catch {
+      return { state: "unknown", reason: opts.signal.aborted ? "aborted" : "unreadable" };
+    }
+  }
+
+  /**
+   * issue #4263 M4: run `fn` holding `barePath`'s lock inside one bounded recovery operation. The locked context is the
+   * ONLY way the retire-scratch reclaim reads or writes a binding after nomination: every decision it returns was made
+   * under the lock, and its two writes (`markRemoving`, `unset`) require the binding to still read exactly the value the
+   * caller last saw.
+   */
+  withRetireScratchBare<T>(barePath: string, opts: { signal: AbortSignal; deadline: number },
+    fn: (locked: RetireScratchLocked) => Promise<T>): Promise<T> {
+    const limits = this.epochLimits();
+    const runnerRoot = path.resolve(this.runnerRoot);
+    const locked: RetireScratchLocked = {
+      evidence: async () => this.retireEvidenceOf(barePath, await this.configEntries(barePath)),
+      examine: async (uuid, expectRaw, acrossBares, otherBares) => {
+        const evidence = await locked.evidence();
+        const pure = evaluateRetireBinding({ evidence, uuid, runnerRoot, expectRaw, ...(acrossBares === undefined ? {} : { acrossBares }),
+          ...(otherBares === undefined ? {} : { otherBares }) });
+        if (pure.kind !== "ready") return pure;
+        const b = pure.binding;
+        const stores = await readProtectedStores(
+          [this.recoveryRoot, this.recoveryMaintenanceRoot, this.recoverySettlementRoot, this.recoveryArchiveRoot],
+          { interrupt: () => this.checkRecoveryInterruption() });
+        if (stores.state !== "read" || storesNameRetireParent(stores.paths, runnerRoot, uuid, b.clonePath)) return { kind: "keep", reason: "protected_by_retained_source" };
+        if (residueQuarantine() !== undefined || await this.custodyHeld(b.runId) || (await this.listLocalRecords(b.runId)).length > 0)
+          return { kind: "keep", reason: "custody" };
+        if (!await this.missingFootprintOf(b.clonePath)) return { kind: "keep", reason: "canonical_present" };
+        return pure;
+      },
+      markRemoving: async (uuid, settledRaw) => {
+        const read = await this.readRetireBindingsUnderLock(barePath);
+        const entry = read.state === "read" ? read.bindings.filter(b => b.key === retireBindingKey(uuid)) : [];
+        const parsed = entry.length === 1 && entry[0]!.raw === settledRaw ? entry[0]!.parsed : undefined;
+        if (!parsed || parsed.phase !== "settled") throw new Error("retire binding changed");
+        const bound: RetireBound = { uuid, parent: path.join(runnerRoot, `.retire-${uuid}`), binding: parsed, raw: settledRaw,
+          pin: undefined, cloneDev: 0n, moveVerified: true, durable: true };
+        await this.advanceRetireBindingUnderLock(barePath, bound, "removing", async () => {
+          const raws = await this.retireBindingRaws(barePath, retireBindingKey(uuid));
+          if (raws.length !== 1 || raws[0] !== settledRaw) throw new Error("retire binding changed");
+        });
+        return bound.raw;
+      },
+      unset: (uuid, expectRaw) => this.unsetRetireBindingUnderLock(barePath, uuid, expectRaw),
+      recoverGone: async (uuid, expectRaw, otherBares) => {
+        try {
+          const evidence = await locked.evidence();
+          const entry = evidence.bindings.find(b => b.key === retireBindingKey(uuid));
+          const b = entry?.parsed;
+          if (!b || entry?.raw !== expectRaw) return "metadata_unresolved";
+          const parentGone = await fs.lstat(path.join(runnerRoot, `.retire-${uuid}`)).then(() => false,
+            (err: NodeJS.ErrnoException) => err.code === "ENOENT");
+          if (!parentGone) return "metadata_unresolved";
+          const st = await fs.lstat(b.clonePath, { bigint: true }).catch((err: NodeJS.ErrnoException) => err.code === "ENOENT" ? null : undefined);
+          if (st === undefined || (st !== null && (st.isSymbolicLink() || !st.isDirectory()))) return "metadata_unresolved";
+          const canonical = st === null ? { present: false } : { present: true, ino: st.ino.toString() };
+          if (st === null && !await this.missingFootprintOf(b.clonePath)) return "metadata_unresolved";
+          const verdict = evaluateRetireRecovery({ evidence, uuid, runnerRoot, expectRaw, canonical, ...(otherBares === undefined ? {} : { otherBares }) });
+          if (verdict === "unresolved") return "metadata_unresolved";
+          if (verdict === "case2") { await this.retireStep("recover-clone-dir-sync"); await syncDirectory(path.dirname(b.clonePath)); }
+          await this.retireStep("recover-root-sync");
+          await syncDirectory(runnerRoot);
+          await this.unsetRetireBindingUnderLock(barePath, uuid, expectRaw);
+          return "recovered";
+        } catch (err) {
+          this.checkRecoveryInterruption();
+          this.log.warn("retire scratch binding recovery left the binding", { bare: barePath, error: gitErrorMessage(err) });
+          return "metadata_unresolved";
+        }
+      },
+    };
+    return this.epochRetained.run(limits, () => this.withRecoveryOperation(opts.signal, opts.deadline,
+      (combined) => this.withLock(barePath, () => fn(locked), combined)));
+  }
+
+  /**
+   * issue #4263 M4: read-only allocated-bytes walk of one scratch parent as the worker uid, the inspector's own walk. Best
+   * effort: any failure is `unknown`. `entries` is what the walk listed, for the caller's entry budget.
+   */
+  async measureRetireScratchParent(name: string, opts: { signal: AbortSignal; deadline: number }):
+      Promise<{ bytes: number; bytesState: "measured" | "partial" | "unknown"; entries: number }> {
+    const unknown = { bytes: 0, bytesState: "unknown" as const, entries: 0 };
+    let rootHandle: FileHandle | undefined;
+    try {
+      const root = path.resolve(this.runnerRoot);
+      rootHandle = await fs.open(root, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
+      const rootDev = (await rootHandle.stat({ bigint: true })).dev;
+      const ctx: RetireScratchWalkCtx = { now: Date.now, deadline: opts.deadline, signal: opts.signal, entries: 0,
+        maxEntries: RETIRE_SCRATCH_WALK_MAX_ENTRIES, seen: new Set() };
+      const r = await retireWalkParent(ctx, rootHandle.fd, rootDev, root, { name, recent: false, kind: "dir" });
+      const bytes = r.bytes > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(r.bytes);
+      return { bytes, bytesState: r.bytesState, entries: ctx.entries };
+    } catch { return unknown; }
+    finally { await rootHandle?.close().catch(() => undefined); }
+  }
+
   /** {@link resolveBranchJournalUnderLock} under the bare lock, for callers that do not already hold it. */
   resolveBranchJournal(barePath: string, branch: string): Promise<BranchJournal> {
     return this.withLock(barePath, () => this.resolveBranchJournalUnderLock(barePath, branch));
@@ -17300,11 +18514,46 @@ export class GitCache {
    * gone (lstat ENOENT), whatever its state: a gone path has nothing left for any reader to
    * find. (Before issue #3153 `<runnerRoot>` was an emptyDir that vanished with the pod; it now
    * persists on the data volume, so an entry whose path is gone was removed by something else, and
-   * there is still nothing at that path for a reader to find. A surviving clone is NOT compacted.) Two exceptions are always kept:
+   * there is still nothing at that path for a reader to find. A surviving clone is NOT compacted.) Three exceptions are always kept:
    *   - an entry any branch's recovery journal still names (the journal is what (d′) and a capture
    *     resolve through the ledger);
    *   - a gone `reclaimed` entry while its run's journal or custody record (`recovery/<runId>`,
    *     `recovery-settlement/<runId>`) exists; with both gone it is dropped.
+   *   - an entry whose (attemptId, runId, clonePath) a decoded retirement binding names (issue #4263); an unreadable binding set
+   *     keeps every entry.
+   * A TAINTED value (issue #4263) is neither dropped nor compacted: a non-canonical value (unparseable, or not byte-identical
+   * to its canonical re-serialization) that names an attempt id a decoded binding references, or ANY non-canonical value while
+   * the bindings are undecodable or unreadable. It is preserved verbatim AT ITS ORIGINAL POSITION
+   * (each compacted entry stays at the position of its attempt's last value, so the relative order of everything kept is
+   * the input order and no reader's last-value-per-attemptId answer changes), and takes no part in last-value selection. This keeps the taint
+   * the reclaim evaluation's ledger read relies on (a non-canonical value naming the attempt blocks an earlier `retired`).
+   * A CONFLICTED attempt id (issue #4263) is likewise preserved verbatim at its position, every canonical value of it, never
+   * collapsed to a last value nor dropped: the ledger of ALL branches is read, and an id is conflicted when its canonical
+   * values carry more than one (branch, runId, clonePath), or a decoded binding names it with an identity that some canonical
+   * value does not share. retireLedgerLast reads exactly this history and answers "tainted" for it.
+   * A FOREIGN attempt id (issue #4263) is one that ANOTHER bare of this worker names, by a decoded retirement binding or by a
+   * ledger value (canonical, or non-canonical but identified as an object with a well-formed string `attemptId`). It joins the
+   * conflicted ids, whether or not this bare binds it, so this branch's values of it are kept verbatim at their position; a
+   * non-canonical value here naming one is tainted likewise. GUARANTEE: compaction preserves every cross-bare conflict
+   * observed in the foreign snapshot it read (each other bare's config is read once, before any rewrite decision, WITHOUT that
+   * bare's lock). A mention written into another bare after that read is outside the guarantee; legitimate writers only write
+   * fresh-minted ({@link mintAttemptId}: timestamp, claim generation, 64 random bits) or same-bare attempt ids into their own
+   * bare under its lock, so a later foreign mention of an id this bare holds is not a legitimate event.
+   * While ANY other bare holds a decoded binding, a non-canonical value here that retireIdentifiedAttempt cannot attribute to an
+   * attempt (unparseable, `{}`, a non-string `attemptId`, an empty value) is tainted too: retireCrossBareConflict refuses that
+   * bare's reclaim on exactly such a value. With no foreign binding such values are dropped as usual, and a value identified as
+   * a different attempt is exempt there, so it may be dropped. (A first foreign binding written after the scan read none may
+   * let such a value be dropped; by the legitimate-writer argument above it is not about the binding's own attempt, so only an
+   * earlier reclaim follows.)
+   * Such a kept value is self-sustaining: the refused reclaim leaves its binding in place, and every other bare's compaction
+   * skips on the same value (`ledger_unidentified`). Only an operator removing that value (an unsupported, worker-stopped
+   * step) clears it; nothing heals it.
+   * The foreign scan is BOUNDED ({@link COMPACT_FOREIGN_SCAN_LIMITS}: bares, config bytes, records, and a 5 s budget checked
+   * before each bare and after each read; a git read is bounded by the git command timeout, a filesystem call is not bounded) and
+   * strict (an unlistable, symlinked or non-directory `.git` candidate, an unreadable config, an undecodable or unknown binding
+   * set, or a ledger value that cannot be attributed to an attempt all fail it). When it fails, compaction is SKIPPED before any
+   * rewrite (the ledger is byte-identical) and a warning with a fixed reason token is logged. One unreadable or unidentifiable
+   * foreign bare therefore skips compaction worker-wide until it is fixed, the same strictness as the epoch evidence reader.
    * Nothing is rewritten when nothing would change.
    *
    * The rewrite is ATOMIC ({@link rewriteLedgerAtomically}): the full compacted value set lands in
@@ -17317,21 +18566,81 @@ export class GitCache {
     try {
       const key = attemptLedgerKey(branch);
       // issue #3644: compaction lstats every ledger path, a restored predecessor's included; it waits while THIS branch has a restore entry.
-      if (this.restoreValueIn(await this.configEntries(barePath), branch) !== undefined) return;
-      const raw = (await this.readAllAttemptLedgerRaw(barePath)).filter(([b]) => b === branch).map(([, v]) => v);
-      const last = new Map<string, AttemptLedgerEntry>();
+      const snapshot = await this.configEntries(barePath);
+      if (this.restoreValueIn(snapshot, branch) !== undefined) return;
+      // issue #4263: a retirement binding names (attemptId, runId, clonePath) of a kept scratch parent; its
+      // ledger entry is kept whatever its state. An unreadable binding set (over the cap) or any undecodable entry (a
+      // duplicated key, a non-canonical or future-version value) keeps every entry (no drop), like `unknown`.
+      const bindingRead = await this.readRetireBindingsUnderLock(barePath, snapshot);
+      const bindingsUndecodable = bindingRead.state === "unknown" || bindingRead.bindings.some(b => b.parsed === undefined);
+      const namedByBinding = (e: AttemptLedgerEntry): boolean => bindingsUndecodable || bindingRead.state === "read" && bindingRead.bindings.some(b =>
+        b.parsed !== undefined && b.parsed.attemptId === e.attemptId && b.parsed.runId === e.runId && b.parsed.clonePath === e.clonePath);
+      const allRaw = await this.readAllAttemptLedgerRaw(barePath);
+      const raw = allRaw.filter(([b]) => b === branch).map(([, v]) => v);
+      // issue #4263: every attempt id ANOTHER bare names (a decoded binding, or a ledger value) is cross-bare evidence that
+      // epoch reclaim (retireCrossBareConflict) refuses on, so this bare's values of it are kept verbatim. The scan is bounded
+      // and reads each other bare once without its lock; when it cannot complete, nothing is compacted.
+      const foreign = await this.scanForeignAttemptIds(barePath);
+      await this.retireStep("compact-foreign-scanned");
+      if ("reason" in foreign) {
+        this.log.warn("attempt ledger compaction skipped: foreign retire evidence unavailable", { branch, reason: foreign.reason });
+        return;
+      }
+      const foreignIds = foreign.ids;
+      // A CONFLICTED attempt id (issue #4263): its canonical values, over ALL branches, carry more than one (branch, runId,
+      // clonePath), or a decoded binding names it with an identity some canonical value does not share. Those values are
+      // preserved verbatim (never collapsed to a last value, dropped or re-serialized), since retireLedgerLast reads them.
+      const identities = new Map<string, Set<string>>();
+      for (const [b, v] of allRaw) {
+        const e = parseAttemptLedgerEntry(v);
+        if (!e || v !== attemptLedgerValue(e)) continue;
+        const set = identities.get(e.attemptId) ?? new Set<string>();
+        set.add(JSON.stringify([b, e.runId, e.clonePath]));
+        identities.set(e.attemptId, set);
+      }
+      const conflictedIds = new Set<string>(foreignIds);
+      for (const [id, set] of identities) if (set.size > 1) conflictedIds.add(id);
+      if (bindingRead.state === "read") {
+        for (const bd of bindingRead.bindings) {
+          const p = bd.parsed;
+          if (p === undefined) continue;
+          const set = identities.get(p.attemptId);
+          if (set !== undefined && [...set].some(i => i !== JSON.stringify([p.branch, p.runId, p.clonePath]))) conflictedIds.add(p.attemptId);
+        }
+      }
+      // A NON-canonical value (unparseable, or parseable but not byte-identical to its canonical form) naming a bound attempt is
+      // TAINTED: retireLedgerLast treats it as a possibly-later state it cannot interpret, so compaction must neither drop nor
+      // re-serialize it. With an undecodable binding set every non-canonical value is tainted (the binding may name it).
+      const boundAttemptIds = bindingRead.state === "read"
+        ? bindingRead.bindings.flatMap(b => b.parsed === undefined ? [] : [b.parsed.attemptId]) : [];
+      const tainted = (v: string): boolean => {
+        const e = parseAttemptLedgerEntry(v);
+        if (e !== undefined && v === attemptLedgerValue(e)) return false;
+        if (foreign.hasBinding && retireIdentifiedAttempt(v) === undefined) return true;
+        return bindingsUndecodable || boundAttemptIds.some(id => v.includes(id) || retireParsedNamesAttempt(v, id)) ||
+          [...foreignIds].some(id => v.includes(id) || retireParsedNamesAttempt(v, id));
+      };
+      // One ordered pass: a tainted value stays at its own position; the last (untainted, parseable) value per attemptId stays
+      // at ITS position, re-serialized; everything else is dropped. With no taint this is the previous last-write order.
+      const slots: Array<{ tainted: string } | { entry: AttemptLedgerEntry }> = [];
+      const lastIndex = new Map<string, number>();
       for (const v of raw) {
+        if (tainted(v)) { slots.push({ tainted: v }); continue; }
         const e = parseAttemptLedgerEntry(v);
         if (!e) continue;
-        last.delete(e.attemptId);
-        last.set(e.attemptId, e);
+        if (conflictedIds.has(e.attemptId)) { slots.push({ tainted: v }); continue; }
+        lastIndex.set(e.attemptId, slots.length);
+        slots.push({ entry: e });
       }
       const journaled = [...(await this.journaledClonePaths(barePath))];
       const namedByJournal = (p: string): boolean => journaled.some((j) => isWithinPath(j, p) || isWithinPath(p, j));
       const kept: string[] = [];
-      for (const e of last.values()) {
+      for (const [i, slot] of slots.entries()) {
+        if ("tainted" in slot) { kept.push(slot.tainted); continue; }
+        const e = slot.entry;
+        if (lastIndex.get(e.attemptId) !== i) continue;
         const gone = path.isAbsolute(e.clonePath) && !(await this.pathPresent(e.clonePath));
-        const droppable = gone && !namedByJournal(e.clonePath) && !(await this.hasPhysicalTerminalProtection(e.runId)) &&
+        const droppable = gone && !namedByJournal(e.clonePath) && !namedByBinding(e) && !(await this.hasPhysicalTerminalProtection(e.runId)) &&
           (e.state !== "reclaimed" || !(await this.custodyHeld(e.runId)));
         if (!droppable) kept.push(attemptLedgerValue(e));
       }
@@ -17340,6 +18649,73 @@ export class GitCache {
     } catch (err) {
       this.checkRecoveryInterruption();
       this.log.warn("attempt ledger compaction failed; the ledger is left as it was", { branch, error: gitErrorMessage(err) });
+    }
+  }
+
+  /**
+   * issue #4263: every attempt id a bare OTHER than `barePath` names (a decoded retirement binding, or an identified ledger
+   * value), from one read of each other bare's config. No other bare's lock is taken. Strict and bounded
+   * ({@link COMPACT_FOREIGN_SCAN_LIMITS}, possibly lowered by the test seam): it returns the fixed reason it could not
+   * complete instead of a partial answer. Only a recovery interruption is rethrown.
+   */
+  private async scanForeignAttemptIds(barePath: string): Promise<{ ids: Set<string>; hasBinding: boolean } | { reason: CompactForeignSkipReason }> {
+    const limits = this.compactForeignLimits;
+    const started = this.compactForeignNow();
+    const expired = (): boolean => this.compactForeignNow() - started > limits.deadlineMs;
+    const ids = new Set<string>();
+    // True when any other bare holds a decoded binding: retireCrossBareConflict then refuses reclaim on such a bare for any
+    // value in THIS bare that retireIdentifiedAttempt cannot attribute, so those values must survive compaction.
+    let hasBinding = false;
+    try {
+      let names: string[];
+      try {
+        names = await this.retainedNames(this.reposRoot);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+        names = [];
+      }
+      const own = path.resolve(barePath);
+      const candidates = names.filter(n => n.endsWith(".git")).sort().map(n => path.join(this.reposRoot, n))
+        .filter(p => path.resolve(p) !== own);
+      if (candidates.length > limits.maxBares) return { reason: "bare_cap" };
+      let bytes = 0;
+      let records = 0;
+      for (const bare of candidates) {
+        this.checkRecoveryInterruption();
+        if (expired()) return { reason: "deadline" };
+        const st = await this.retainedIO(() => fs.lstat(bare));
+        if (!st.isDirectory() || st.isSymbolicLink()) return { reason: "unreadable" };
+        // Bound the read before git does it: the config file's size is the most `config --list` can return.
+        const config = await this.retainedIO(() => fs.stat(path.join(bare, "config")));
+        if (config.size > limits.maxConfigBytes - bytes) return { reason: "bytes_cap" };
+        const snapshot = await this.configEntries(bare);
+        this.checkRecoveryInterruption();
+        for (const entry of snapshot) bytes += Buffer.byteLength(entry) + 1;
+        if (bytes > limits.maxConfigBytes) return { reason: "bytes_cap" };
+        // Every config entry counts toward the record cap, as in the epoch metadata accounting, not only uzi records.
+        records += snapshot.length;
+        if (records > limits.maxRecords) return { reason: "records_cap" };
+        if (expired()) return { reason: "deadline" };
+        const bindings = await this.readRetireBindingsUnderLock(bare, snapshot);
+        if (bindings.state !== "read") return { reason: "binding_unknown" };
+        const ledger = await this.readAllAttemptLedgerRaw(bare, snapshot);
+        this.checkRecoveryInterruption();
+        if (expired()) return { reason: "deadline" };
+        for (const b of bindings.bindings) {
+          if (b.parsed === undefined) return { reason: "binding_undecodable" };
+          ids.add(b.parsed.attemptId);
+          hasBinding = true;
+        }
+        for (const [, raw] of ledger) {
+          const id = retireIdentifiedAttempt(raw);
+          if (id === undefined) return { reason: "ledger_unidentified" };
+          ids.add(id);
+        }
+      }
+      return { ids, hasBinding };
+    } catch {
+      this.checkRecoveryInterruption();
+      return { reason: "unreadable" };
     }
   }
 
@@ -17574,7 +18950,8 @@ export class GitCache {
    * STREAMS, never buffers: a pack can exceed the 64 MiB `maxBuffer` cap runGit uses, so
    * this spawns `git pack-objects` and hands back its stdout as a Readable. It uses a
    * bounded explicit object list when a server-named default tracking commit was captured:
-   * every legacy commit and tree remains, and only default-reachable blobs are omitted.
+   * every legacy commit and tree remains, and only blobs reachable from the default or an
+   * eligible confirmed checkpoint tip (#4439) are omitted.
    * Without that captured authority (or on preparation cap exhaustion), the legacy revision
    * input is used. Both producers are non-thin. The stdout is returned
    * for the client to upload directly. Credential-free: this is a LOCAL read of the
@@ -17700,7 +19077,7 @@ export class GitCache {
     replay: (registerOwner: Parameters<GitCache["checkpointPackCaptured"]>[0]) => Promise<{ pack: Readable; exited: Promise<number>; cancel: () => void; settled: () => Promise<void> }>;
   } | null> {
     // Replay closes over literal OIDs and the original guard; it never rebuilds an overlay.
-    const openProducer = async (registerOwner: Parameters<GitCache["checkpointPackCaptured"]>[0], source: string, candidate: string, floor: string, defaultBlobSha?: string, packExcludes?: readonly string[]) => {
+    const openProducer = async (registerOwner: Parameters<GitCache["checkpointPackCaptured"]>[0], source: string, candidate: string, floor: string, defaultBlobSha?: string, packExcludes?: readonly string[], blobFloor?: string) => {
       this.checkCheckpointCooperation();
       onStep?.("scratch_preflight");
       await this.scratchPublicationPreflight(barePath, branch, source);
@@ -17709,6 +19086,10 @@ export class GitCache {
       if (defaultBlobSha && (!SHA40_RE.test(defaultBlobSha) ||
           await this.revParse(barePath, `${defaultBlobSha}^{commit}`) !== defaultBlobSha)) {
         throw new ScratchPublicationError("captured checkpoint default is unavailable");
+      }
+      if (blobFloor && (!SHA40_RE.test(blobFloor) ||
+          await this.revParse(barePath, `${blobFloor}^{commit}`) !== blobFloor)) {
+        throw new ScratchPublicationError("captured checkpoint confirmed tip is unavailable");
       }
       const excludes = Object.freeze([...(candidate === floor && packExcludes !== undefined ? packExcludes : [floor])]);
       const context = (restrictionFacts?: CheckpointPublicationContext["restrictionFacts"]): CheckpointPublicationContext => Object.freeze({
@@ -17719,7 +19100,7 @@ export class GitCache {
       if (!options.restrictionIdentity) await beforePack?.(candidate, context());
       this.checkCheckpointCooperation();
       const selected = defaultBlobSha && !(candidate === floor && packExcludes !== undefined)
-        ? await this.prepareCheckpointObjects(barePath, candidate, floor, defaultBlobSha) : undefined;
+        ? await this.prepareCheckpointObjects(barePath, candidate, floor, defaultBlobSha, blobFloor) : undefined;
       this.checkCheckpointCooperation();
       onStep?.("checkpoint_pack");
       // Preserve #3242's zero-range transport envelope. It is deliberately packed by
@@ -17748,12 +19129,29 @@ export class GitCache {
       // Release B after starting the producer, before handing out its stream.
       return options.restrictionIdentity ? this.withLock(barePath, start) : start();
     };
+    // Decided once per logical publish on the final candidate; replay reuses the literal result.
+    // Any non-abort failure means "not eligible", which is today's exact behaviour.
+    const confirmedBlobFloor = async (confirmed: string | undefined, candidate: string, floor: string): Promise<string | undefined> => {
+      this.checkCheckpointCooperation();
+      if (!confirmed || confirmed === candidate || confirmed === floor || !SHA40_RE.test(confirmed)) return undefined;
+      try {
+        if (await this.revParse(barePath, `${confirmed}^{commit}`) !== confirmed) return undefined;
+        if (!(await this.isAncestorRef(barePath, confirmed, candidate))) return undefined;
+      } catch (e) {
+        const abort = this.boundaryAbortError(e);
+        if (abort) throw abort;
+        return undefined;
+      }
+      this.checkCheckpointCooperation();
+      return confirmed;
+    };
     // A pinned range uses literal commit OIDs for the pack floor and candidate.
     // If an overlay is requested, its wrapper becomes the wanted OID while the
     // excluded floor remains pinned.
     if (pinned) {
-      const { tipSha, excludeSha, defaultBlobSha, packExcludeShas } = pinned;
+      const { tipSha, excludeSha, defaultBlobSha, packExcludeShas, confirmedBlobSha } = pinned;
       if (!SHA40_RE.test(tipSha) || !SHA40_RE.test(excludeSha) ||
+          (confirmedBlobSha !== undefined && !SHA40_RE.test(confirmedBlobSha)) ||
           (packExcludeShas !== undefined && (tipSha !== excludeSha || !packExcludeShas.every((x) => SHA40_RE.test(x)))) ||
           (sourceSha !== undefined && sourceSha !== tipSha)) {
         throw new ScratchPublicationError("pinned checkpoint range must be two 40-hex commit SHAs", undefined, {
@@ -17778,7 +19176,10 @@ export class GitCache {
         }
       }
       const candidate = wanted;
-      const replay = (currentRegisterOwner: typeof registerOwner) => openProducer(currentRegisterOwner, tipSha, candidate, excludeSha, defaultBlobSha, packExcludeShas);
+      // C is consulted only when the selective producer will run (same condition as openProducer).
+      const blobFloor = defaultBlobSha && !(candidate === excludeSha && packExcludeShas !== undefined)
+        ? await confirmedBlobFloor(confirmedBlobSha, candidate, excludeSha) : undefined;
+      const replay = (currentRegisterOwner: typeof registerOwner) => openProducer(currentRegisterOwner, tipSha, candidate, excludeSha, defaultBlobSha, packExcludeShas, blobFloor);
       return { tipOid: wanted, ...await replay(registerOwner), replay };
     }
     const defaultBlobSha = await this.captureCheckpointDefault(barePath, options.defaultBranch);
@@ -17848,7 +19249,10 @@ export class GitCache {
         kind: "checkpoint_range", step: "checkpoint_floor", ...execDetail(classifyExecFailure(e)),
       });
     }
-    const replay = (currentRegisterOwner: typeof registerOwner) => openProducer(currentRegisterOwner, realTip, wanted, floor, defaultBlobSha, packExcludes);
+    // C is consulted only when the selective producer will run (same condition as openProducer).
+    const blobFloor = defaultBlobSha && !(wanted === floor && packExcludes !== undefined)
+      ? await confirmedBlobFloor(options.confirmedBlobTip, wanted, floor) : undefined;
+    const replay = (currentRegisterOwner: typeof registerOwner) => openProducer(currentRegisterOwner, realTip, wanted, floor, defaultBlobSha, packExcludes, blobFloor);
     return { tipOid: wanted, ...await replay(registerOwner), replay };
   }
 
@@ -17878,7 +19282,7 @@ export class GitCache {
   /** Four sequential owned children; only the classifier has concurrent bounded input/output.
    * One failed child stops the pass. All cancellation and exit promises settle before fallback.
    * Rows retain Git's path spelling; classification never requests object contents. */
-  private async prepareCheckpointObjects(barePath: string, candidate: string, floor: string, defaultSha: string): Promise<Buffer | undefined> {
+  private async prepareCheckpointObjects(barePath: string, candidate: string, floor: string, defaultSha: string, blobFloor?: string): Promise<Buffer | undefined> {
     const limits = this.checkpointPackBounds;
     const maxRecords = Math.max(0, Math.min(65536, limits.records ?? 65536));
     const maxBytes = Math.max(0, Math.min(16 * 1024 * 1024, limits.bytes ?? 16 * 1024 * 1024));
@@ -17987,7 +19391,11 @@ export class GitCache {
         };
         await child(["rev-list", candidate, `^${floor}`], retain("commit"));
         await child(["rev-list", "--objects", candidate, `^${floor}`], retain("all"));
-        await child(["rev-list", "--objects", candidate, `^${floor}`, `^${defaultSha}`], retain("blob"));
+        // blobFloor (the confirmed checkpoint tip) only trims blobs: commits and trees are retained
+        // from the first two children. Unset: exactly the legacy arguments.
+        await child(["rev-list", "--objects", candidate, `^${floor}`,
+          ...(blobFloor ? [`^${blobFloor}`] : []), `^${defaultSha}`,
+          ...(blobFloor ? [`^${defaultSha}^{tree}`] : [])], retain("blob"));
         const iterator = rows.entries();
         const selected: Buffer[] = [];
         await child(["cat-file", "--batch-check=%(objectname) %(objecttype)"], line => {
@@ -18068,7 +19476,9 @@ export class GitCache {
   async resolveCheckpointRange(
     barePath: string,
     branch: string,
-    opts: { confirmedTip?: string; extraFloors?: string[]; tipSha?: string; defaultBranch?: string } = {},
+    opts: { confirmedTip?: string; extraFloors?: string[]; tipSha?: string; defaultBranch?: string;
+      /** Also capture `confirmedTip` as {@link CheckpointRange.confirmedBlobSha} (blob-only omission). */
+      captureConfirmedBlob?: true } = {},
   ): Promise<CheckpointRange | null> {
     try {
       // Issue #2545: a held publication names its tip explicitly (the frozen record's aggregate
@@ -18119,8 +19529,18 @@ export class GitCache {
       const defaultBlobSha = await this.captureCheckpointDefault(barePath, opts.defaultBranch);
       this.checkCheckpointCooperation();
       const packExcludeShas = await this.zeroRangePackExcludes(barePath, branch, tipSha, excludeSha);
+      // No ancestry check against the raw tip: a chain/overlay candidate may descend from the
+      // confirmed tip while the raw tip does not. Eligibility is judged on the final candidate.
+      let confirmedBlobSha: string | undefined;
+      if (opts.captureConfirmedBlob === true && confirmed && SHA40_RE.test(confirmed) &&
+          confirmed !== excludeSha &&
+          (await this.revParse(barePath, `${confirmed}^{commit}`)) === confirmed) {
+        confirmedBlobSha = confirmed;
+      }
+      this.checkCheckpointCooperation();
       return { tipSha, excludeSha, scanFloorShas,
         ...(defaultBlobSha === undefined ? {} : { defaultBlobSha }),
+        ...(confirmedBlobSha === undefined ? {} : { confirmedBlobSha }),
         ...(packExcludeShas === undefined ? {} : { packExcludeShas }) };
     } catch (err) {
       this.checkCheckpointCooperation();
@@ -19118,6 +20538,9 @@ export class GitCache {
     branch: string,
     ownerRunId: string,
     opts: { discard: boolean; attemptId?: string; orphanDiagnostics?: OrphanDiagnostics;
+      /** issue #4263: the caller's disposition class. With `attemptId`, it binds the retirement scratch parent
+       *  durably on the EXDEV branch; absent, the retire is unbound exactly as before. */
+      dispositionClass?: RetireDispositionClass;
       /** Synchronous deny-only proof; never grants retirement authority. */
       processProof?: () => boolean;
       onRetirementUnproven?: () => void;
@@ -19147,6 +20570,7 @@ export class GitCache {
     branch: string,
     ownerRunId: string,
     opts: { discard: boolean; attemptId?: string; orphanDiagnostics?: OrphanDiagnostics;
+      dispositionClass?: RetireDispositionClass;
       /** Synchronous deny-only proof; never grants retirement authority. */
       processProof?: () => boolean;
       onRetirementUnproven?: () => void;
@@ -19179,6 +20603,19 @@ export class GitCache {
     checkProcessProof();
     let stage: OrphanRetireStage = "journal_read";
     let dispatched: Promise<void> | undefined;
+    // issue #4263: the retirement scratch binding of this call (EXDEV branch only), shared with the completion disposal below.
+    const rb: { bound?: RetireBound } = {};
+    // The identity of the clone directory, pinned (O_PATH|O_NOFOLLOW|O_DIRECTORY) at the start of retire() under the bare
+    // lock, right after the journal pair is validated. Every later binding check (bind time, the move) is against this pin,
+    // never against a late lstat. A substitution of clonePath before retire() starts is runner-controlled content in the
+    // runner-writable repo dir and is a recorded residual: it gains no privilege and the deletion scope equals today's.
+    const early: { pin?: FileHandle; id?: { dev: bigint; ino: bigint } } = {};
+    const bindParent = async (scratchParent: string): Promise<void> => {
+      if (opts.attemptId === undefined || opts.dispositionClass === undefined) return;
+      rb.bound = await this.prepareRetireBinding(barePath, branch, clonePath, ownerRunId, opts.attemptId,
+        opts.dispositionClass, scratchParent, early.id);
+    };
+    const split = this.retentionDeleteSeam?.split ?? uidSplitActive();
     const retire = async (): Promise<{ holding?: string; scratch?: string; renamed: boolean; disposition: RunnerCloneRetireResult }> => {
       // 1. Pre-rename pair validation. Require the EXACT (ownerRunId, clonePath) pair
       //    to STILL be journaled before moving anything. A missing/malformed journal, or
@@ -19199,6 +20636,13 @@ export class GitCache {
       stage = "journal_validation";
       if (pending?.runId !== ownerRunId || pending.clonePath !== clonePath) {
         throw new CapturePathMismatchError(pending?.clonePath ?? "", clonePath, branch, ownerRunId);
+      }
+      if (opts.attemptId !== undefined && opts.dispositionClass !== undefined) {
+        try {
+          early.pin = await fs.open(clonePath, RETIRE_PIN_FLAGS);
+          const st = await early.pin.stat({ bigint: true });
+          if (st.isDirectory()) early.id = { dev: st.dev, ino: st.ino };
+        } catch { /* no pin: the parent stays unbound and the retire proceeds as before bindings existed */ }
       }
       // issue #3404 M2: only a certified completion retirement (checked against its expectedFence below)
       // may clear a fenced journal; any other retirement (orphan reclaim included) refuses before effects.
@@ -19372,6 +20816,13 @@ export class GitCache {
               checkProcessProof();
               const scratchParent = await this.createRetireScratchParent();
               if (opts.completionSource && !opts.completionSource.canDelete()) throw new Error("completion cleanup exclusion changed");
+              await bindParent(scratchParent);
+              if (opts.completionSource && !opts.completionSource.canDelete()) {
+                // Nothing moved: drop the intent just written and the empty parent, as an intent-write failure does.
+                if (rb.bound) { await this.dropUnmovedRetireBinding(barePath, rb.bound); rb.bound = undefined; }
+                await this.removeBestEffort(scratchParent, "retire-binding-parent", "emptyDir");
+                throw new Error("completion cleanup exclusion changed");
+              }
               renamed = await this.renameIntoScratchUnlessLatched(clonePath, scratchParent, undefined,
                 anchored ? () => checkSuccessor(anchored!) : undefined, checkProcessProof);
               scratch = scratchParent;
@@ -19413,6 +20864,7 @@ export class GitCache {
               stage = "intra_device_rename";
               checkProcessProof();
               const scratchParent = await this.createRetireScratchParent();
+              await bindParent(scratchParent);
               renamed = await this.renameIntoScratchUnlessLatched(clonePath, scratchParent, holdingDest, undefined, checkProcessProof);
               holding = holdingDest; // retained; step 6 no-ops since discard === false
               scratch = scratchParent;
@@ -19442,6 +20894,15 @@ export class GitCache {
           // Non-EXDEV path (rename success OR a confirmed source-already-free): unchanged
           // behavior — holdingDest is the retired residue iff we renamed it, no scratch.
           holding = renamed ? holdingDest : undefined;
+        } else if (rb.bound) {
+          if (renamed) {
+            await this.retireStep("renamed");
+            await this.verifyRetireMove(rb.bound);
+          } else {
+            // The clone was already free: nothing moved into the parent, which is disposed of as it always was.
+            await this.dropUnmovedRetireBinding(barePath, rb.bound);
+            rb.bound = undefined;
+          }
         }
         // 5. Journal clear — ONLY after a confirmed rename or a confirmed source-already-
         //    free. Re-read and clear only if it STILL matches (ownerRunId, clonePath); a
@@ -19489,6 +20950,7 @@ export class GitCache {
           cleared = true;
           await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
         }
+        if (rb.bound && !opts.completionSource) await this.retireStep("journal-cleared");
         // Completion keeps its existing journal until physical disposal succeeds, so a caught
         // disposal failure can restore the exact canonical source under the held bare lock.
         // issue #1783 M2: an attempt clone the owner's terminal retire disposed of is `retired` in
@@ -19498,7 +20960,8 @@ export class GitCache {
         if (opts.attemptId !== undefined && !opts.completionSource) {
           checkProcessProof();
           appended = true;
-          await this.appendAttemptLedger(barePath, branch, { attemptId: opts.attemptId, runId: ownerRunId, clonePath, state: "retired" }).catch(
+          await this.appendAttemptLedger(barePath, branch, { attemptId: opts.attemptId, runId: ownerRunId, clonePath, state: "retired" }).then(
+            undefined,
             (err: unknown) => {
               unproven();
               this.log.warn("retireRunnerClone: could not record the attempt as retired; the gone path is compacted later", {
@@ -19508,6 +20971,19 @@ export class GitCache {
               });
             },
           );
+          if (rb.bound) await this.retireStep("ledger-appended");
+        }
+        if (rb.bound && !opts.completionSource) {
+          // Make the journal clear and the retired append durable before any later removing transition.
+          try {
+            await this.retireStep("config-sync");
+            await this.syncConfigAndVerify(barePath, async () => {});
+            rb.bound.durable = true;
+          } catch (err) {
+            this.log.warn("retire scratch binding stays intent: the journal clear and ledger append were not synced", {
+              clone: clonePath, error: gitErrorMessage(err),
+            });
+          }
         }
         const result = { holding, scratch, renamed,
           disposition: holding ? "quarantined" as const : "source-already-absent" as const };
@@ -19535,20 +21011,58 @@ export class GitCache {
               if (residueQuarantine() !== undefined) throw new CloneRetainedByQuarantineError();
               this.checkRecoveryInterruption();
             };
-            // The guard and fs.rm dispatch run synchronously before this callback returns.
-            // Own the promise outside withLock, whose post-callback interruption may reject.
-            beforeDestroy();
-            dispatched = this.removeBestEffort(target, scratch ? "retire-scratch" : "retire-holding-dispose",
-              "tree").then(ok => {
-                if (!ok) {
+            const bound = rb.bound;
+            if (bound && split) {
+              // issue #4263 [7] (C-prime): a bound split parent is never settled. A settle write could race a process-proof
+              // revocation (residual R), so no retire writes `settled`: on a uid-split pod the binding stays `intent`, and the
+              // epoch keeps every bound parent (a pre-existing `settled` reads `settled_kept`).
+              beforeDestroy();
+              // The parent is left in place exactly as a failed in-process scratch removal leaves it today.
+              unproven();
+              this.log.info("retire scratch parent kept in place (split pod, binding stays intent)", { path: scratch });
+            } else {
+              let removingWritten = bound === undefined;
+              if (bound) {
+                // issue #4263: `removing` is durable before the first byte of the parent is deleted.
+                beforeDestroy();
+                try {
+                  await this.advanceRetireBindingUnderLock(barePath, bound, "removing");
+                  removingWritten = true;
+                } catch (err) {
                   unproven();
-                  if (holding && !scratch) this.log.warn("retireRunnerClone: holding dispose failed", { path: holding });
+                  this.log.warn("retire scratch parent kept: its removing binding was not confirmed durable", {
+                    path: scratch, error: gitErrorMessage(err),
+                    binding_phase: await this.currentRetireBindingPhase(barePath, bound.uuid),
+                  });
                 }
-              });
+              }
+              if (removingWritten) {
+                // The guard and fs.rm dispatch run synchronously before this callback returns.
+                // Own the promise outside withLock, whose post-callback interruption may reject.
+                beforeDestroy();
+                dispatched = this.removeBestEffort(target, scratch ? "retire-scratch" : "retire-holding-dispose",
+                  "tree").then(async ok => {
+                    if (!ok) {
+                      unproven();
+                      if (holding && !scratch) this.log.warn("retireRunnerClone: holding dispose failed", { path: holding });
+                      return;
+                    }
+                    if (!bound) return;
+                    try {
+                      await this.confirmRetireParentGone(bound);
+                    } catch (err) {
+                      this.log.warn("retire scratch binding kept in removing", { path: bound.parent, error: gitErrorMessage(err) });
+                      return;
+                    }
+                    await this.unsetRemovedRetireBinding(barePath, bound, true);
+                  });
+              }
+            }
           }
         }
         return result;
       } catch (error) {
+        if (rb.bound) await this.closeRetirePin(rb.bound);
         if (!opts.completionSource && !dispatched && opts.processProof) {
           // Preserve an already observed denial even if a later callback returns true.
           try { checkProcessProof(); } catch { /* rollback below */ }
@@ -19642,6 +21156,8 @@ export class GitCache {
         emitOrphanDiagnostic(opts.orphanDiagnostics, clonePath, "orphan_retirement_failed", stage, "canonical_retirement_failure", error, undefined, subreason);
       }
       throw error;
+    } finally {
+      await early.pin?.close().catch(() => undefined);
     }
     if (!opts.completionSource) {
       if (dispatched) await dispatched;
@@ -19662,10 +21178,14 @@ export class GitCache {
         protectedNow = await this.hasPhysicalTerminalProtection(ownerRunId) || !opts.completionSource.canDelete();
         if (!result.renamed || !opts.discard) throw new Error("completion disposal was not established");
         open();
+        // issue #4263: a bound parent is marked `removing` durably before the first byte of it is deleted. Any failure from
+        // here on (a partial delete, a failed rename-back) leaves `removing` in place; completion never settles.
+        if (rb.bound) await this.advanceRetireBindingUnderLock(barePath, rb.bound, "removing");
         if (holding && opts.discard) await fs.rm(holding, { recursive: true, force: true });
         open();
         if (scratch) await fs.rm(scratch, { recursive: true, force: true });
         open();
+        if (rb.bound) await this.confirmRetireParentGone(rb.bound);
         // Full disposal succeeded in this held lock. Retry only a metadata write, once;
         // every attempt rechecks exact ownership and exclusion. Failure keeps the receipt.
         const finishMetadata = async (): Promise<void> => {
@@ -19711,6 +21231,8 @@ export class GitCache {
           await finishMetadata();
         };
         await finishMetadata();
+        // Only now that the metadata is final and the removal is durable does the binding go; the bare lock is still held.
+        if (rb.bound) await this.unsetRemovedRetireBinding(barePath, rb.bound, false);
       } catch (error) {
         // One rollback attempt, still under adoption exclusion. Partial deletion or a failed
         // proof/rename retains the journal and remaining residue; no new crash discovery.
@@ -19748,7 +21270,8 @@ export class GitCache {
    *  rename targets of {@link createRetireScratchParent}). `<runnerRoot>` persists across pod
    *  replacements now, so a crash between the rename and the disposal leaves one behind that no
    *  retire context remembers. It runs ONCE at worker startup, strictly before the claim loop and
-   *  before any retire or recovery path is reachable, and REMOVES NOTHING: reclaim needs the
+   *  before any retire or recovery path is reachable, and REMOVES NOTHING (issue #4263: the verified pod-epoch pass, which runs just before it, deletes no
+   *  bound parent (C-prime) and only clears the binding of a gone one; this inspection runs after it, still before the claim loop): reclaim needs the
    *  retirement/custody/writer-exclusion proofs, and a surviving daemon container can still bind-mount
    *  or hold its cwd in even an EMPTY parent, so emptiness is no evidence it is unused.
    *    - a parent whose mtime is at or after `processStartMs` is skipped (this process made it);
@@ -19762,13 +21285,16 @@ export class GitCache {
    *  issue #4143 — with `opts.outcomes` (the default in main.ts; `UZI_RETIRE_SCRATCH_OUTCOMES=0`
    *  turns it off and leaves exactly the warning above, with no journal read and no walk), the
    *  warning is followed by OBSERVATION records only: at most RETIRE_SCRATCH_REPORTED_PATHS
-   *  `runner retire scratch outcome` rows (every one `kept`, only for parents) and exactly one
+   *  `runner retire scratch outcome` rows (`kept`, or since issue #4263 `reclaimed` from the pass's own report
+   *  `opts.reclaim.report`; a kept bound parent carries a binding-aware reason: `bound_intent`, `interrupted_removal`,
+   *  `malformed_binding`, `settled_kept` or the pass's own, while an unbound one keeps
+   *  `protected_by_retained_source` / `no_disposition_evidence`) and exactly one
    *  `runner retire scratch total` per startup whenever outcomes are on and the runner root was
    *  listed (it exists and is a real directory), including with zero parents. A missing,
    *  non-directory or symlink runner root emits no lines; if the step throws,
    *  `runner retire scratch outcomes failed` replaces the total. With zero parents no journal
-   *  read or walk happens and `retained_source_read` is `not_attempted`. They never remove,
-   *  change the owner of or reclaim anything.
+   *  read or walk happens and `retained_source_read` is `not_attempted`. The inspection itself never removes,
+   *  changes the owner of or reclaims anything; the binding phases it reads come from the same journal read.
    *    - No ordinary durable disposition binding proves this moved footprint: rollback repair can
    *      persist a protected moved-clone pointer, but the rename precedes the journal clear and the
    *      retired-ledger write, so a parent can exist with nothing naming it. A retired ledger,
@@ -19794,6 +21320,8 @@ export class GitCache {
   async inspectRetireScratchAtStartup(processStartMs: number, opts: {
     outcomes?: boolean;
     signal?: AbortSignal;
+    /** Issue #4263: the reclaim switch and the verified pass's report (undefined when no pass ran); outcome rows only. */
+    reclaim?: { enabled: boolean; report?: RetireScratchPassReport };
     /** Test hooks, never passed by main.ts. */
     now?: () => number;
     limits?: EpochRetainedLimits;
@@ -19886,6 +21414,8 @@ export class GitCache {
     try {
       const limits = this.epochLimits(limitsOverride);
       const paths = new Set<string>();
+      const bindings = new Map<string, RetireScratchBindingPhase>();
+      let bindingsUnknown = false;
       let configBytes = 0;
       let records = 0;
       await this.epochRetained.run(limits, () => this.withRecoveryOperation(signal, deadline, async (combined) => {
@@ -19898,6 +21428,14 @@ export class GitCache {
             if (configBytes > limits.maxMetadataBytes) throw new Error("retire scratch metadata byte limit");
             records += entries.length;
             if (records > limits.maxMetadataRecords) throw new Error("retire scratch metadata record limit");
+            const bindingRead = await this.readRetireBindingsUnderLock(bare, entries);
+            if (bindingRead.state !== "read") bindingsUnknown = true;
+            else for (const b of bindingRead.bindings) {
+              if (b.uuid === undefined) continue;
+              const phase: RetireScratchBindingPhase = b.parsed?.phase ?? "malformed";
+              // A uuid seen twice (two bares or a duplicated key) is never a clean phase.
+              bindings.set(b.uuid, bindings.has(b.uuid) ? "malformed" : phase);
+            }
             const branches = new Set<string>();
             // Last recovery raw value per branch, one pass, for the closure pre-charge below.
             const lastRecoveryRaw = new Map<string, string>();
@@ -19946,7 +21484,7 @@ export class GitCache {
           }, combined);
         }
       }));
-      return { state: "read", paths: [...paths].sort() };
+      return { state: "read", paths: [...paths].sort(), bindings: bindingsUnknown ? "unknown" : bindings };
     } catch {
       return { state: "unknown" };
     }
@@ -19955,7 +21493,7 @@ export class GitCache {
   /** issue #4143 — the observation records. Every parent is `kept`; nothing here can change disk. */
   private async emitRetireScratchOutcomes(root: string, parents: Array<{ name: string; recent: boolean; kind: "dir" | "symlink" | "other" }>,
     incomplete: boolean, deadline: number, opts: {
-      outcomes?: boolean; signal?: AbortSignal; now?: () => number; limits?: EpochRetainedLimits; walkLimits?: { maxEntries?: number };
+      outcomes?: boolean; signal?: AbortSignal; reclaim?: { enabled: boolean; report?: RetireScratchPassReport }; now?: () => number; limits?: EpochRetainedLimits; walkLimits?: { maxEntries?: number };
       readRetainedSources?: () => Promise<RetireScratchSources>; beforeEntry?: (dirPath: string, name: string) => Promise<void>;
       beforeOpen?: (dirPath: string) => Promise<void>;
     }): Promise<void> {
@@ -20009,30 +21547,56 @@ export class GitCache {
     } finally {
       await rootHandle?.close().catch(() => undefined);
     }
-    const row = (r: RetireScratchParentResult): {
-      retained_source: "named" | "not_named" | "unknown"; reason: "protected_by_retained_source" | "no_disposition_evidence";
-    } => {
-      if (sources.state !== "read") return { retained_source: "unknown", reason: "no_disposition_evidence" };
-      return namedParents.has(r.name) ? { retained_source: "named", reason: "protected_by_retained_source" }
-        : { retained_source: "not_named", reason: "no_disposition_evidence" };
+    const report = opts.reclaim?.report;
+    const reported = new Map((report?.parents ?? []).map(p => [p.name, p]));
+    const bindingOf = (name: string): "unbound" | RetireScratchBindingPhase | "unknown" => {
+      if (sources.state !== "read" || sources.bindings === undefined || sources.bindings === "unknown") return "unknown";
+      return sources.bindings.get(name.startsWith(".retire-") ? name.slice(".retire-".length) : name) ?? "unbound";
     };
-    for (const r of results.slice(0, RETIRE_SCRATCH_REPORTED_PATHS)) {
-      this.log.info("runner retire scratch outcome", {
+    // The first-listed reason is the row's `reason`: the pass's own for a parent it examined, else the binding-aware one.
+    const row = (r: RetireScratchParentResult): {
+      retained_source: "named" | "not_named" | "unknown"; binding: string; reason: string;
+    } => {
+      const retained_source = sources.state !== "read" ? "unknown" : namedParents.has(r.name) ? "named" : "not_named";
+      const binding = bindingOf(r.name);
+      const legacy = retained_source === "named" ? "protected_by_retained_source" : "no_disposition_evidence";
+      const examined = reported.get(r.name);
+      if (examined && examined.outcome === "kept") return { retained_source, binding, reason: examined.reason };
+      if (binding === "intent") return { retained_source, binding, reason: "bound_intent" };
+      if (binding === "removing") return { retained_source, binding, reason: "interrupted_removal" };
+      if (binding === "malformed") return { retained_source, binding, reason: "malformed_binding" };
+      if (binding === "settled") return { retained_source, binding, reason: "settled_kept" };
+      return { retained_source, binding, reason: legacy };
+    };
+    // Parents the pass reclaimed are gone from the listing, so their rows come from its report.
+    const reclaimed = (report?.parents ?? []).filter(p => p.outcome === "reclaimed");
+    type Entry = { name: string; line: Record<string, unknown> };
+    const entries: Entry[] = [
+      ...results.map((r): Entry => ({ name: r.name, line: {
         name: sanitizeForLog(r.name, 157), kind: r.kind, outcome: "kept", ...row(r),
-        empty: r.empty, recent: r.recent, bytes: Number(r.bytes), bytes_state: r.bytesState, partial_reasons: r.reasons,
-      });
-    }
+        empty: r.empty, recent: r.recent, bytes: Number(r.bytes), bytes_state: r.bytesState, partial_reasons: r.reasons } })),
+      ...reclaimed.map((p): Entry => ({ name: p.name, line: {
+        name: sanitizeForLog(p.name, 157), kind: "dir", outcome: "reclaimed", reason: "reclaimed", binding: "settled",
+        retained_source: "not_named", empty: false, recent: false, bytes: p.bytes, bytes_state: p.bytesState, partial_reasons: [] } })),
+    ].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    for (const e of entries.slice(0, RETIRE_SCRATCH_REPORTED_PATHS)) this.log.info("runner retire scratch outcome", e.line);
     const totalReasons = new Set<RetireScratchWalkReason>();
     for (const r of results) for (const reason of r.reasons) totalReasons.add(reason);
-    const protectedCount = results.filter((r) => row(r).reason === "protected_by_retained_source").length;
+    const rows = results.map(row);
+    const protectedCount = rows.filter(r => r.reason === "protected_by_retained_source").length;
+    const keptByReason: Record<string, number> = {};
+    for (const r of rows) keptByReason[r.reason] = (keptByReason[r.reason] ?? 0) + 1;
     const allMeasured = results.every((r) => r.bytesState === "measured");
     this.log.info("runner retire scratch total", {
-      parents_enumerated: results.length,
-      outcomes_omitted: results.length - Math.min(results.length, RETIRE_SCRATCH_REPORTED_PATHS),
+      parents_enumerated: entries.length,
+      outcomes_omitted: entries.length - Math.min(entries.length, RETIRE_SCRATCH_REPORTED_PATHS),
       kept: results.length,
-      reclaimed: 0,
+      reclaimed: reclaimed.length,
+      reclaimed_bytes: reclaimed.reduce((n, p) => n + p.bytes, 0),
       protected_by_retained_source: protectedCount,
-      no_disposition_evidence: results.length - protectedCount,
+      no_disposition_evidence: rows.filter(r => r.reason === "no_disposition_evidence").length,
+      kept_by_reason: keptByReason,
+      removing_bindings: rows.filter(r => r.binding === "removing").length,
       bytes: Number(results.reduce((n, r) => n + r.bytes, 0n)),
       bytes_state: allMeasured && !incomplete ? "measured" : results.every((r) => r.bytesState === "unknown") ? "unknown" : "partial",
       partial_reasons: [...totalReasons].sort(),
@@ -20066,17 +21630,237 @@ export class GitCache {
     }
   }
 
+  private async retireStep(step: RetireBindingStep): Promise<void> {
+    await this.retireBindingStepSeam?.(step);
+  }
+
+  /** Every raw value the bare config holds for exactly `key` (a valueless key reads as ""). */
+  private async retireBindingRaws(barePath: string, key: string): Promise<string[]> {
+    return (await this.configEntries(barePath)).flatMap(item =>
+      item === key ? [""] : item.startsWith(`${key}\n`) ? [item.slice(key.length + 1)] : []);
+  }
+
+  /**
+   * issue #4263: write one binding value under the caller's bare lock, then make it durable (fsync the config file and
+   * the bare directory) and require it to read back byte-identical. Returns the raw value written. `steps` names the
+   * {@link GitCacheOptions.retireBindingStep} points before the write and before the sync. `guard` runs after the write
+   * step and immediately before `git config`; a throw from it means nothing was written.
+   */
+  private async writeRetireBindingUnderLock(barePath: string, uuid: string, binding: RetireBinding,
+    steps?: { write: RetireBindingStep; sync: RetireBindingStep }, guard?: () => Promise<void>): Promise<string> {
+    const key = retireBindingKey(uuid), raw = retireBindingValue(binding);
+    if (steps) await this.retireStep(steps.write);
+    if (guard) await guard();
+    await this.runGit(barePath, ["config", "--local", key, raw]);
+    if (steps) await this.retireStep(steps.sync);
+    await this.syncConfigAndVerify(barePath, async () => {
+      const back = await this.retireBindingRaws(barePath, key);
+      if (back.length !== 1 || back[0] !== raw) throw new Error("retire binding read-back differs");
+    });
+    return raw;
+  }
+
+  /**
+   * issue #4263: remove one binding under the caller's bare lock, only if its current value is exactly `expectRaw`, then
+   * make the removal durable and require the key to be gone.
+   */
+  private async unsetRetireBindingUnderLock(barePath: string, uuid: string, expectRaw: string,
+    steps: { unset: RetireBindingStep; sync: RetireBindingStep; done: RetireBindingStep } =
+      { unset: "unset", sync: "unset-sync", done: "unset-done" }): Promise<void> {
+    const key = retireBindingKey(uuid);
+    const current = await this.retireBindingRaws(barePath, key);
+    if (current.length !== 1 || current[0] !== expectRaw) throw new Error("retire binding changed");
+    await this.retireStep(steps.unset);
+    await this.runGit(barePath, ["config", "--local", "--unset", key]);
+    await this.retireStep(steps.sync);
+    await this.syncConfigAndVerify(barePath, async () => {
+      if ((await this.retireBindingRaws(barePath, key)).length !== 0) throw new Error("retire binding unset read-back differs");
+    });
+    await this.retireStep(steps.done);
+  }
+
+  /** The phase the bare's binding for `uuid` reads as right now, for logs: its decoded phase, "absent", or "uncertain". */
+  private async currentRetireBindingPhase(barePath: string, uuid: string): Promise<string> {
+    try {
+      const raws = await this.retireBindingRaws(barePath, retireBindingKey(uuid));
+      if (raws.length === 0) return "absent";
+      const parsed = raws.length === 1 ? parseRetireBinding(uuid, raws[0]!) : undefined;
+      return parsed?.ok ? parsed.binding.phase : "uncertain";
+    } catch { return "uncertain"; }
+  }
+
+  /**
+   * issue #4263: bind the freshly created scratch parent `scratchParent` for one retirement, under the bare lock the caller
+   * holds, before the clone is moved into it. Pins the parent, syncs the runner root, records the clone's inode and writes
+   * the durable `intent`. Returns undefined, with nothing written, when the bare already carries
+   * {@link RETIRE_BINDING_MAX_PER_BARE} entries (or they cannot be read) or the identities are not representable, so the
+   * retire proceeds exactly as it did before bindings existed. Any other failure removes the empty parent and throws before
+   * anything is moved: the clone stays canonical and the journal and ledger are untouched. A binding already written when a
+   * later step fails stays `intent`, which is harmless metadata (the clone is canonical and the parent is gone).
+   */
+  private async prepareRetireBinding(barePath: string, branch: string, clonePath: string, ownerRunId: string,
+    attemptId: string, cls: RetireDispositionClass, scratchParent: string,
+    cloneId: { dev: bigint; ino: bigint } | undefined): Promise<RetireBound | undefined> {
+    const uuid = path.basename(scratchParent).slice(".retire-".length);
+    if (cloneId === undefined) {
+      this.log.warn("retire scratch binding needs the clone identity pinned at the start of the retire; the parent stays unbound",
+        { bare: barePath, run_id: ownerRunId });
+      return undefined;
+    }
+    const draft: RetireBinding = { v: 1, class: cls, attemptId, runId: ownerRunId, branch, clonePath, phase: "intent",
+      parentIno: "1", cloneIno: "1", pod: "" };
+    if (!parseRetireBinding(uuid, retireBindingValue(draft)).ok) {
+      this.log.warn("retire scratch binding not representable; the parent stays unbound", { bare: barePath, run_id: ownerRunId });
+      return undefined;
+    }
+    let pin: FileHandle | undefined;
+    try {
+      await this.retireStep("parent-created");
+      pin = await fs.open(scratchParent, RETIRE_PIN_FLAGS);
+      const parentStat = await pin.stat({ bigint: true });
+      if (!parentStat.isDirectory()) throw new Error("retire scratch parent is not a directory");
+      await this.retireStep("parent-pinned");
+      await syncDirectory(this.runnerRoot);
+      await this.retireStep("root-synced");
+      const cloneStat = await fs.lstat(clonePath, { bigint: true });
+      // The path must still be the directory pinned when the retire began; a substitution since then is not bound.
+      if (!cloneStat.isDirectory() || cloneStat.dev !== cloneId.dev || cloneStat.ino !== cloneId.ino)
+        throw new Error("retire source is not the directory pinned at the start of the retire");
+      let count: number | undefined;
+      try {
+        const read = await this.readRetireBindingsUnderLock(barePath);
+        if (read.state === "read") count = read.bindings.length;
+      } catch { count = undefined; }
+      await this.retireStep("cap-checked");
+      if (count === undefined || count >= RETIRE_BINDING_MAX_PER_BARE) {
+        this.log.warn("retire scratch binding cap reached", { bare: barePath, count: count ?? "unknown" });
+        await pin.close();
+        return undefined;
+      }
+      const binding: RetireBinding = { ...draft, parentIno: parentStat.ino.toString(), cloneIno: cloneId.ino.toString() };
+      if (!parseRetireBinding(uuid, retireBindingValue(binding)).ok) throw new Error("retire binding inode not representable");
+      const raw = await this.writeRetireBindingUnderLock(barePath, uuid, binding, { write: "intent-write", sync: "intent-sync" });
+      await this.retireStep("intent-written");
+      return { uuid, parent: scratchParent, binding, raw, pin, cloneDev: cloneId.dev, moveVerified: false, durable: false };
+    } catch (err) {
+      await pin?.close().catch(() => undefined);
+      await this.removeBestEffort(scratchParent, "retire-binding-parent", "emptyDir");
+      throw err;
+    }
+  }
+
+  private async closeRetirePin(bound: RetireBound): Promise<void> {
+    const pin = bound.pin;
+    bound.pin = undefined;
+    await pin?.close().catch(() => undefined);
+  }
+
+  /**
+   * issue #4263: after the real rename into `<parent>/clone`, re-open that path through the parent pin, require the same
+   * inode as before the move on the parent's device, then sync the directory the clone left and the parent it entered.
+   * A mismatch or sync failure only leaves `moveVerified` false (the binding stays `intent`); it never throws.
+   */
+  private async verifyRetireMove(bound: RetireBound): Promise<void> {
+    try {
+      const pin = bound.pin;
+      if (!pin) throw new Error("retire scratch parent pin is gone");
+      const child = await fs.open(process.platform === "linux" ? `/proc/self/fd/${pin.fd}/clone` : path.join(bound.parent, "clone"),
+        RETIRE_PIN_FLAGS);
+      let childStat: BigIntStats;
+      try { childStat = await child.stat({ bigint: true }); } finally { await child.close().catch(() => undefined); }
+      const parentStat = await pin.stat({ bigint: true });
+      const atPath = await fs.lstat(bound.parent, { bigint: true });
+      if (!childStat.isDirectory() || childStat.ino.toString() !== bound.binding.cloneIno ||
+          childStat.dev !== parentStat.dev || childStat.dev !== bound.cloneDev || parentStat.ino.toString() !== bound.binding.parentIno ||
+          atPath.ino !== parentStat.ino || atPath.dev !== parentStat.dev) throw new Error("retire scratch move not verified");
+      await this.retireStep("rename-dir-sync");
+      await syncDirectory(path.dirname(bound.binding.clonePath));
+      await syncDirectory(bound.parent);
+      bound.moveVerified = true;
+    } catch (err) {
+      this.log.warn("retire scratch move could not be verified; the binding stays intent", {
+        clone: bound.binding.clonePath, error: gitErrorMessage(err),
+      });
+    } finally {
+      await this.closeRetirePin(bound);
+    }
+    if (bound.moveVerified) await this.retireStep("move-verified");
+  }
+
+  /** The clone was already free, so nothing moved into the parent: best-effort drop of the intent just written. */
+  private async dropUnmovedRetireBinding(barePath: string, bound: RetireBound): Promise<void> {
+    await this.closeRetirePin(bound);
+    try {
+      await this.unsetRetireBindingUnderLock(barePath, bound.uuid, bound.raw,
+        { unset: "unmoved-unset", sync: "unmoved-unset-sync", done: "unmoved-unset-done" });
+    } catch (err) {
+      this.log.warn("retire scratch binding for an unmoved clone could not be removed", { bare: barePath, error: gitErrorMessage(err) });
+    }
+  }
+
+  /** Write the `removing` phase of a bound scratch parent and remember the value. No writer produces `settled` (C-prime). */
+  private async advanceRetireBindingUnderLock(barePath: string, bound: RetireBound, phase: "removing",
+    guard?: () => Promise<void>): Promise<void> {
+    const next: RetireBinding = { ...bound.binding, phase };
+    bound.raw = await this.writeRetireBindingUnderLock(barePath, bound.uuid, next,
+      { write: "removing-write", sync: "removing-sync" }, guard);
+    bound.binding = next;
+    await this.retireStep("removing-written");
+  }
+
+  /** issue #4263: require the removed scratch parent to read ENOENT, then sync the runner root so the removal is durable. */
+  private async confirmRetireParentGone(bound: RetireBound): Promise<void> {
+    await this.retireStep("removed");
+    const gone = await fs.lstat(bound.parent).then(() => false, (err: NodeJS.ErrnoException) => {
+      if (err.code === "ENOENT") return true;
+      throw err;
+    });
+    if (!gone) throw new Error("retire scratch parent still present");
+    await syncDirectory(this.runnerRoot);
+    await this.retireStep("root-synced-after-rm");
+  }
+
+  /**
+   * issue #4263: the scratch parent of a bound retire is confirmed gone: unset the `removing` binding, only if it still
+   * reads exactly as last written. `lock` takes the bare lock for it (the removal of a single-uid retire is awaited outside
+   * the lock; a completion still holds it). Any failure leaves the `removing` binding in place, permanently; it never throws.
+   */
+  private async unsetRemovedRetireBinding(barePath: string, bound: RetireBound, lock: boolean): Promise<void> {
+    try {
+      const unset = () => this.unsetRetireBindingUnderLock(barePath, bound.uuid, bound.raw);
+      await (lock ? this.withLock(barePath, unset) : unset());
+    } catch (err) {
+      this.log.warn("retire scratch binding kept in removing", { bare: barePath, parent: bound.parent, error: gitErrorMessage(err) });
+    }
+  }
+
   /** issue #1354 — create an intra-device scratch parent directly under runnerRoot (the
    *  SAME device as the canonical clone, so a rename into it is never EXDEV and survives a
    *  daemon file-hold where a recursive rm races). The mkdir is NON-recursive, so it throws
    *  EEXIST if a runner pre-planted the path — fail closed, rather than using a recursive
    *  0700 mkdir under the runner-writable tree as an ownership assertion; the lstat then
-   *  rejects a symlink or other type surprise. Returns the created scratch parent path. */
+   *  rejects a symlink or other type surprise. Returns the created scratch parent path.
+   *
+   *  The production runner root is setgid (mode 3775), so Linux gives the new directory S_ISGID and
+   *  the mkdir mode 0700 comes out as 02700. The pod-epoch discard refuses any parent whose mode is
+   *  not exactly 0700, so the parent is pinned and fchmod'ed to 0700 here (the owner may clear
+   *  S_ISGID without CAP_FSETID; access never widens), then re-read and required to be exactly 0700. */
   private async createRetireScratchParent(): Promise<string> {
     const scratchParent = path.join(this.runnerRoot, `.retire-${randomUUID()}`);
     await fs.mkdir(scratchParent, { mode: 0o700 }); // non-recursive ⇒ throws on EEXIST — fail closed
     const st = await fs.lstat(scratchParent);
     if (!st.isDirectory()) throw new Error("retire scratch parent is not a directory");
+    // Plain read-only directory open (not O_PATH): fchmod needs a real descriptor.
+    const handle = await fs.open(scratchParent, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
+    try {
+      const pinned = await handle.stat();
+      if (!pinned.isDirectory() || pinned.uid !== process.getuid?.()) throw new Error("retire scratch parent is not a directory owned by this uid");
+      await handle.chmod(0o700);
+      const after = await handle.stat();
+      if ((after.mode & 0o7777) !== 0o700) throw new Error("retire scratch parent mode is not 0700");
+    } finally {
+      await handle.close();
+    }
     return scratchParent;
   }
 

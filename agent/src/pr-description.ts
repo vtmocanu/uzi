@@ -60,6 +60,7 @@ import { SanitizedPrDescriptionFields } from "./client.js";
 import type { ClaimConfig, PrDescriptionSource } from "./protocol.js";
 import type { CompletionPending } from "./completion-pending.js";
 import { hasDriftContradiction, type SemanticObservationRecord } from "./semantic-drift.js";
+import { linkedIssueLabel } from "./linked-issue.js";
 
 // ── Markers ─────────────────────────────────────────────────────────────────────────────────
 
@@ -875,11 +876,12 @@ function breakClosingKeywords(s: string, mode: "all" | "directives"): string {
  * closing keywords are broken (zero-width space), and when even that still scans as closing the
  * fixed `Work on issue #N` stands in; the result never closes the issue.
  */
-export function nonClosingTitle(title: string, issueIid: number, repoPath?: string): string {
+export function nonClosingTitle(title: string, issueIid: number, repoPath?: string, issueLabel?: string): string {
   if (!closingDirectiveFor(title, issueIid, repoPath)) return title;
   const broken = breakClosingKeywords(title, "directives");
   if (!closingDirectiveFor(broken, issueIid, repoPath)) return broken;
-  return `Work on issue #${issueIid}`;
+  // `issueLabel` is a linked run's issue key (never `#N`, an unrelated forge issue there).
+  return `Work on issue ${issueLabel ?? `#${issueIid}`}`;
 }
 
 /** The api's breakMentions: U+200B after every `@` not preceded by an ASCII letter or digit, unless
@@ -1351,6 +1353,10 @@ function renderKindSection(section: KindSection): string {
 export interface CompletionBlockInput {
   /** The run's issue, for `Related to #N.` / `Closes #N` / the partial lines (issue arm only). */
   issueIid?: number | null;
+  /** PRD 4173: the run is linked to an external issue tracker. The issue arm then names the issue by
+   *  `label` (the key, or null for "the linked issue") instead of `#N` and NEVER renders `Closes`,
+   *  whatever `closes` says: `#N` is an unrelated forge issue there. */
+  linkedIssue?: { label: string | null };
   /** The source branch, for the footer. */
   branch: string;
   /** D14: a kind's one-line completion sentence. When set, the issue arm (Related/Closes, partial,
@@ -1474,6 +1480,8 @@ function driftBlock(record: SemanticObservationRecord): string[] {
 
 function issueArm(input: CompletionBlockInput): string[] {
   const iid = input.issueIid;
+  const linked = input.linkedIssue;
+  const ref = linked ? linkedIssueLabel({ linked: true, label: linked.label }) : `#${iid}`;
   const deferred = input.completionScope?.deferred ?? [];
   const pending = input.completionPending && input.completionPending.criteria.length > 0 ? input.completionPending : undefined;
   const accepted = input.completionScope?.accepted ?? [];
@@ -1483,7 +1491,7 @@ function issueArm(input: CompletionBlockInput): string[] {
   // never close, whatever `closes` says.
   const lines = isOwnerPartial
     ? [
-        `Implements part of #${iid} (partial delivery — owner scope decision; this MR does NOT close the issue).`,
+        `Implements part of ${ref} (partial delivery — owner scope decision; this MR does NOT close the issue).`,
         "",
         "> ⚠️ **Partial delivery — owner scope decision (PRD #1227).** The owner reduced this run's",
         "> completion scope. The milestone(s) below were DEFERRED BY THE OWNER and are NOT delivered by",
@@ -1493,7 +1501,7 @@ function issueArm(input: CompletionBlockInput): string[] {
       ]
     : input.scopeCapped
       ? [
-          `Implements part of #${iid} (partial delivery — see the scope note below; this MR does NOT close the issue).`,
+          `Implements part of ${ref} (partial delivery — see the scope note below; this MR does NOT close the issue).`,
           "",
           "> ⚠️ **Partial delivery — operator scope directive.** The operator narrowed this run's",
           `> scope mid-flight. ${input.scopeCapped.completedCount}${typeof input.scopeCapped.total === "number" ? ` of ${input.scopeCapped.total}` : ""} approved milestone(s) were completed and`,
@@ -1502,8 +1510,8 @@ function issueArm(input: CompletionBlockInput): string[] {
         ]
       : [
           // #1801: NOT `Implements issue #N.` (a GitLab closing keyword).
-          `Related to #${iid}.`,
-          ...(input.closes && !input.nonClosing && !pending ? ["", `Closes #${iid}`] : []),
+          `Related to ${ref}.`,
+          ...(input.closes && !input.nonClosing && !pending && !linked ? ["", `Closes #${iid}`] : []),
         ];
   if (input.nonClosing) {
     const reason = escapeInline(input.nonClosing.reason) || Array.from(input.nonClosing.reason, (c) =>

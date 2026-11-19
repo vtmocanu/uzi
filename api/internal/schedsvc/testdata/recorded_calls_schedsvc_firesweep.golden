@@ -1,0 +1,6 @@
+GetIssue(42, 1)
+RepositoryAuthorEligibility(42, 2)
+ListIssueComments(42, 1)
+GetIssue(42, 2)
+RepositoryAuthorEligibility(42, 2)
+ListIssueComments(42, 2)

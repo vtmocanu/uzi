@@ -398,7 +398,7 @@ func renderRunDetailAt(p *uzicli.Printer, r apitypes.RunDTO, now time.Time, orig
 	// carries a usage bundle at all (pre-#40 / unclaimed runs have none), like the budget
 	// rows above.
 	if r.Usage != nil {
-		rows = append(rows, []string{"COST", costDetailCell(*r.Usage)})
+		rows = append(rows, []string{"COST", runCostDetailCell(r)})
 	}
 	// EST. TAIL (issue #2014, ADR-2014): the ESTIMATED usage of an interrupted Claude
 	// session, a separate row beside COST and never folded into it. Absent for the all-zero
@@ -440,6 +440,11 @@ func renderRunDetailAt(p *uzicli.Printer, r apitypes.RunDTO, now time.Time, orig
 	//     write path that skips validation, and through a direct database write.
 	if r.AnthropicSecretLabel != nil && *r.AnthropicSecretLabel != "" {
 		rows = append(rows, []string{"ANTHROPIC_TOKEN", credentialCell(r)})
+	}
+	// The custom model provider the run was bound to (PRD #4320), in place of an Anthropic token
+	// (a provider run has none). The name is user-authored: providerCell runs it through cellText.
+	if isProviderRun(r) {
+		rows = append(rows, []string{"PROVIDER", providerCell(r)})
 	}
 	if r.Harness == "codex" && r.CodexSecretLabel != nil && *r.CodexSecretLabel != "" {
 		rows = append(rows, []string{"CODEX_ALIAS", codexAliasCell(r)})
@@ -666,6 +671,10 @@ func holdReasonLabel(reason string) string {
 		return "model choice unavailable"
 	case holdWeeklyReserve:
 		return "weekly usage reserve"
+	case holdProviderDestinationNotAllowed:
+		return "provider URL not allowed"
+	case holdProviderBindingStale:
+		return "provider binding changed"
 	default:
 		return cellText(reason)
 	}
@@ -714,6 +723,16 @@ func isCredentialDisabledHold(r apitypes.RunDTO) bool {
 // and deleted every model credential (PRD #3989: status paused, hold_reason credentials_reset).
 func isCredentialsResetHold(r apitypes.RunDTO) bool {
 	return r.Status == statusPaused && strOr(r.HoldReason, "") == holdCredentialsReset
+}
+
+// isProviderDestinationHold and isProviderBindingStaleHold report the two parks of a provider-bound run
+// whose next claim was refused (PRD #4320 module 5). Neither is owner-resumable (Resume is refused, 409).
+func isProviderDestinationHold(r apitypes.RunDTO) bool {
+	return r.Status == statusPaused && strOr(r.HoldReason, "") == holdProviderDestinationNotAllowed
+}
+
+func isProviderBindingStaleHold(r apitypes.RunDTO) bool {
+	return r.Status == statusPaused && strOr(r.HoldReason, "") == holdProviderBindingStale
 }
 
 // credentialsResetAction is the owner's next step for a credentials_reset hold (PRD #3989). The
@@ -790,6 +809,10 @@ func pausedHoldNotice(r apitypes.RunDTO, origin ...string) string {
 		return "held, " + holdReasonLabel(reason) + "; " + runOverrideAction(r)
 	case holdWeeklyReserve:
 		return "held by the weekly usage reserve; " + weeklyReserveAction(r)
+	case holdProviderDestinationNotAllowed:
+		return "held, the provider's URL is not allowed by the operator; the run resumes by itself once it is allowed again, or cancel: uzi run cancel " + id
+	case holdProviderBindingStale:
+		return "held, its provider or key changed after the run was created, so it cannot continue; start a new run, which uses the current key, and cancel this one: uzi run cancel " + id
 	default:
 		return "paused (" + holdReasonLabel(reason) + ")"
 	}
@@ -2854,6 +2877,9 @@ func limitWaitLine(r apitypes.RunDTO, now time.Time) string {
 	// PRD #1190 D13: the leading word is "waiting:", NOT "paused:". Once an owner pause
 	// exists, "paused:" on the rate-limit line would read as a user pause; "waiting:" says
 	// plainly that the run is held on a usage limit, not parked by its owner.
+	if strOr(r.RateLimitType, "") == providerGatewayLimitType {
+		return providerGatewayLimitLine(r, now)
+	}
 	line := "waiting: usage limit"
 	switch r.Harness {
 	case "claude":
@@ -2870,6 +2896,30 @@ func limitWaitLine(r apitypes.RunDTO, now time.Time) string {
 	// that ships on its own release cadence. 0 is a run that has not parked, which this
 	// function has already excluded — but the guard stays, because a server that
 	// reports a park without a count should print no number rather than "attempt 0".
+	if r.LimitWaitCount > 0 {
+		line += " · attempt " + itoa(int(r.LimitWaitCount))
+	}
+	return line
+}
+
+// providerGatewayLimitType is the server's rate_limit_type literal for a provider-bound run parked
+// on a persistent gateway 429/529 (PRD #4320 module 5): workersvc.RateLimitTypeProviderGatewayLimit.
+const providerGatewayLimitType = "provider_gateway_limit"
+
+// providerGatewayLimitLine is limitWaitLine's reading of a provider gateway-limit park. It names the
+// gateway, not a subscription window, and never claims a reset time: the run retries on a fixed
+// capped backoff (1, 5, then 15 minutes) and then waits for its owner, which is the NULL
+// RetryNotBefore case. The run DTO does not carry the provider's name yet, so it says "your provider".
+func providerGatewayLimitLine(r apitypes.RunDTO, now time.Time) string {
+	line := "waiting: your provider's gateway rate limit"
+	switch {
+	case r.RetryNotBefore == nil:
+		line += " · waiting for you to resume (uzi run resume " + r.ID + ")"
+	case !r.RetryNotBefore.After(now):
+		line += " · retrying shortly"
+	default:
+		line += " · retrying at " + r.RetryNotBefore.Local().Format("15:04") + " (in " + fmtUntil(r.RetryNotBefore.Sub(now)) + ")"
+	}
 	if r.LimitWaitCount > 0 {
 		line += " · attempt " + itoa(int(r.LimitWaitCount))
 	}

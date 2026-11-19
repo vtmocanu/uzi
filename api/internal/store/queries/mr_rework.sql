@@ -238,10 +238,11 @@ WHERE ledger.repo_id = @repo_id::uuid
 -- derived mr_rework inherits its source run's harness as an explicit selection (D4); M2 wires
 -- that real value — the caller passes the D11-resolved, source-run-inherited harness, not a
 -- stopgap. Keep in sync with CreateManualMRReworkRunAndAdvance's body below.
+-- model_provider_* (PRD #4320 M4), class INHERITED: the five binding columns are copied verbatim from the source run's row by the caller (never the owner's current source); createRunAtomic re-validates the copied binding and asserts the inserted row carries it.
 INSERT INTO runs (
     user_id, repo_id, kind, issue_title, issue_description,
     pipeline_ref, mr_iid, target_run_id, review_comments, auto_approve, wait_on_limit, required_capabilities, hinted_capabilities, ignored_inferred_capabilities, trigger_source, harness, plan_cross_check_required
-, code_cross_check_required, ci_config_guard, ci_config_paths, repo_agent_source_required)
+, code_cross_check_required, ci_config_guard, ci_config_paths, repo_agent_source_required, model_provider_id, model_provider_revision, model_provider_key_mode, model_provider_key_secret_id, model_provider_key_rev)
 SELECT
     @user_id, @repo_id::uuid, 'mr_rework', @issue_title, @issue_description,
     @pipeline_ref, @mr_iid, @target_run_id, sqlc.narg('review_comments')::jsonb, true, @wait_on_limit,
@@ -257,7 +258,7 @@ SELECT
     (SELECT array_agg(DISTINCT x.p ORDER BY x.p) FROM (
         SELECT unnest(g.ci_config_paths) AS p FROM runs g WHERE g.repo_id = @repo_id::uuid AND g.ci_config_guard
           AND (g.id = @target_run_id OR g.branch = @pipeline_ref OR 'uzi/prompt-' || g.id::text = @pipeline_ref)
-    ) x), true
+    ) x), true, sqlc.narg('model_provider_id')::uuid, sqlc.narg('model_provider_revision')::int, sqlc.narg('model_provider_key_mode')::text, sqlc.narg('model_provider_key_secret_id')::uuid, sqlc.narg('model_provider_key_rev')::bigint
 WHERE NOT EXISTS (
     SELECT 1 FROM runs
     WHERE repo_id = @repo_id::uuid
@@ -309,10 +310,11 @@ WITH led AS (
                                     ELSE mr_rework_merge_pending_keys(mr_rework_ledger.pending_unknown_keys, @pending_add::text[], @pending_remove::text[], @pending_superseded::text[], @pending_superseded_by::text[], mr_rework_ledger.comment_marks) END,
         updated_at    = now()
 )
+-- model_provider_* (PRD #4320 M4), class INHERITED: the five binding columns are copied verbatim from the source run's row by the caller (never the owner's current source); createRunAtomic re-validates the copied binding and asserts the inserted row carries it.
 INSERT INTO runs (
     user_id, repo_id, kind, issue_title, issue_description,
     pipeline_ref, mr_iid, target_run_id, review_comments, auto_approve, wait_on_limit, required_capabilities, hinted_capabilities, ignored_inferred_capabilities, trigger_source, harness, plan_cross_check_required
-, code_cross_check_required, ci_config_guard, ci_config_paths, repo_agent_source_required)
+, code_cross_check_required, ci_config_guard, ci_config_paths, repo_agent_source_required, model_provider_id, model_provider_revision, model_provider_key_mode, model_provider_key_secret_id, model_provider_key_rev)
 SELECT
     @user_id, @repo_id::uuid, 'mr_rework', @issue_title, @issue_description,
     @pipeline_ref, @mr_iid, @target_run_id, sqlc.narg('review_comments')::jsonb, true, @wait_on_limit,
@@ -330,7 +332,7 @@ SELECT
     (SELECT array_agg(DISTINCT x.p ORDER BY x.p) FROM (
         SELECT unnest(g.ci_config_paths) AS p FROM runs g WHERE g.repo_id = @repo_id::uuid AND g.ci_config_guard
           AND (g.id = @target_run_id OR g.branch = @pipeline_ref OR 'uzi/prompt-' || g.id::text = @pipeline_ref)
-    ) x), true
+    ) x), true, sqlc.narg('model_provider_id')::uuid, sqlc.narg('model_provider_revision')::int, sqlc.narg('model_provider_key_mode')::text, sqlc.narg('model_provider_key_secret_id')::uuid, sqlc.narg('model_provider_key_rev')::bigint
 WHERE NOT EXISTS (
     SELECT 1 FROM runs
     WHERE repo_id = @repo_id::uuid

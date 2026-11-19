@@ -70,7 +70,8 @@ function safeId(kind: string, id: string): string {
   return id;
 }
 
-function parseFile(text: string): Map<string, OpEntry> {
+/** The ledger's own strict file parse (throws on any malformed file or entry); exported for the read-only issue #4420 retention classifier. */
+export function parseFile(text: string): Map<string, OpEntry> {
   const parsed: unknown = JSON.parse(text);
   const ops = (parsed as { ops?: unknown } | null)?.ops;
   if (typeof ops !== "object" || ops === null || Array.isArray(ops)) throw new Error("credential switch ledger: malformed file");

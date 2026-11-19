@@ -203,6 +203,7 @@ import {
   type TerminalOutboxDeps,
 } from "./terminal-resolve.js";
 import { rmTeardownTree, type TeardownTestDeps } from "./rmtree.js";
+import { prepareRunTmpdir } from "./run-tmpdir.js";
 import { prepareManagedGoWork, removeGoWorkLeaves, type GoWorkFsOps } from "./go-work.js";
 import { uidSplitActive } from "./runner-uid.js";
 import { dropRunCaches } from "./run-caches.js";
@@ -305,6 +306,7 @@ import {
   repoPathFromUrl,
   type ReconcileResult,
 } from "./pr-description-publisher.js";
+import { linkedIssueKey, linkedIssueLabel } from "./linked-issue.js";
 import { closingDirectiveFor, escapeInline, nonClosingTitle, renderCompletionBlock, type KindSection } from "./pr-description.js";
 import type { CompletionQuestionTrigger } from "./completion-attempt.js";
 import type { SummaryRunner } from "./summary-runner.js";
@@ -2831,6 +2833,10 @@ interface RunFlight {
   sourceOriginalInputs?: Readonly<{ barePath: string; branch: string; key: string;
     kind: RunKind; defaultBranch: string; cloneUrl: string; repoId: string }>;
   sourceJoinFailed?: boolean;
+  /** issue #4263: retainStoppedSource lifted this flight's preserveRecoveryClone on a `covered` verdict, so the owner
+   *  terminal retire that follows is classed `owner_terminal_covered` (a retirement scratch binding that never settles).
+   *  A parked flight (`parked`) that reaches the ordinary terminal retire is classed the same way. */
+  coveredLiftRetire?: boolean;
   /** issue #3239: an unvetted marker may remain in history. Captures never reset this refusal;
    * only a complete-history absence proof permits publication of an exact candidate. */
   wipMarkerUnsafe?: boolean;
@@ -2894,6 +2900,9 @@ interface RunFlight {
   /** Issue #3870: this claim's managed Go work leaf (`<runHome>/.uzi-go-work/g<gen>`), set in
    *  phasePreflightHandoff for a Claude flight only; undefined when none was prepared. */
   managedGoWorkDir?: string;
+  /** Issue #4420: this flight's run-owned scratch leaf (`<scratch root>/run-<runId>`), set beside
+   *  managedGoWorkDir for a Claude flight only; undefined when none was prepared. */
+  runTmpdir?: string;
   readonly runScopedSecrets: string[];
   readonly runLog: Logger;
   /** Issue #4201: the ONE flight-scoped secret set every redaction sink reads at use time (the batcher's
@@ -3444,6 +3453,8 @@ export interface RunnerOptions {
   teardownTestDeps?: TeardownTestDeps;
   /** Test-only: inject a syscall failure into the managed Go work dir creation (issue #3870). */
   goWorkTestDeps?: { fsOps?: GoWorkFsOps };
+  /** Test-only: replace the run TMPDIR leaf preparation (issue #4420); production never sets it. */
+  runTmpdirTestDeps?: { prepare?: (runId: string) => ReturnType<typeof prepareRunTmpdir> };
   queueTerminalRejectionReconciliation?: (runId: string, generation: number) => void;
   /** How often the steering channel polls /inputs (default 3s). */
   pollMs?: number;
@@ -3734,6 +3745,7 @@ export class RunRunner {
   /** Issue #1831: test-only teardown seams; production always uses pinned removal. */
   private readonly teardownTestDeps: TeardownTestDeps | undefined;
   private readonly goWorkTestDeps: { fsOps?: GoWorkFsOps } | undefined;
+  private readonly runTmpdirTestDeps: { prepare?: (runId: string) => ReturnType<typeof prepareRunTmpdir> } | undefined;
   /** issue #1597 M2: test-only seams (undefined in production). */
   private readonly checkpointTestHooks: CheckpointTestHooks | undefined;
   private readonly planCrossCheckTiming: PlanCrossCheckTiming | undefined;
@@ -4040,6 +4052,7 @@ export class RunRunner {
     this.semanticCoverageTestTransport = opts.semanticCoverageTestTransport;
     this.teardownTestDeps = opts.teardownTestDeps;
     this.goWorkTestDeps = opts.goWorkTestDeps;
+    this.runTmpdirTestDeps = opts.runTmpdirTestDeps;
     this.shutdownPublishTimeoutMs = opts.shutdownPublishTimeoutMs ?? 15_000;
     this.recoveryRetryMs = Math.max(1, Math.min(opts.recoveryRetryMs ?? 1_000, 30_000));
     const holdBudget = opts.completionHoldReconcileTimeoutMs === undefined
@@ -5472,7 +5485,7 @@ export class RunRunner {
       if (after.process?.state !== "quiescent") return retain("not_quiescent");
       if (!open()) return retain("vetoed");
       await this.git.retireRunnerClone(ctx.barePath, source.clonePath, ctx.branch, ctx.runId, {
-        discard: true, attemptId: source.attemptId, completionSource: { expectedHead: source.expectedHead, canDelete: open,
+        discard: true, attemptId: source.attemptId, dispositionClass: "completion", completionSource: { expectedHead: source.expectedHead, canDelete: open,
           ...(durable ? { expectedFence: durable.expectedFence, beforeDestroy: durable.enter } : {}) },
         ...(classification.kind === "knownCodex" ? { processProof: open } : {}),
       });
@@ -6242,6 +6255,9 @@ export class RunRunner {
     const runScopedSecrets = [claim.secrets.forge_pat, gitBasic];
     if (claim.secrets.anthropic_oauth_token)
       runScopedSecrets.push(claim.secrets.anthropic_oauth_token);
+    // PRD #4320: the gateway key. The server has no value-based scrubber for an arbitrary gateway key, so
+    // this registration (with the redactors' below) is the only protection for it.
+    if (claim.secrets.provider?.credential) runScopedSecrets.push(claim.secrets.provider.credential);
     for (const s of runScopedSecrets) this.log.addSecret(s);
     // The codex canaries were ALREADY addSecret'd above (before makeExecutor); append them
     // to runScopedSecrets AFTER the add loop — never inside it — so each is registered
@@ -7744,6 +7760,7 @@ export class RunRunner {
               flight.branch!,
               runId,
               { discard: true, attemptId: flight.runnerClone?.attemptId,
+                dispositionClass: flight.parked || flight.coveredLiftRetire === true ? "owner_terminal_covered" : "owner_terminal",
                 ...(terminalCodex ? { processProof: cloneReleaseProof } : {}),
                 onRetirementUnproven: () => { flight.sourceJoinFailed = true; } },
             ));
@@ -7781,7 +7798,7 @@ export class RunRunner {
             const q = await this.quiesceRun(flight, flight.executor, { mode: "own", site: "terminal_retire" });
             if (!q.blocked && await acknowledged() && !this.cancellationExpired(flight)) {
               await this.runCancellationMaintenance(flight, () => this.git.retireRunnerClone(flight.barePath!, flight.worktreePath!, flight.branch!, runId, {
-                discard: true, attemptId: flight.attemptId,
+                discard: true, attemptId: flight.attemptId, dispositionClass: "verified_successor",
                 ...(terminalCodex ? { processProof: successorProcessProof } : {}),
                 verifiedSuccessor: { key: this.cloneCoordinates(claim).key, generation: flight.claimGeneration,
                   expected: flight.completedRetainedSuccessor!, acknowledged },
@@ -10236,6 +10253,9 @@ export class RunRunner {
     // and the live claim.config.non_closing decide there.
     if (claim.config?.completion_contract_version == null && resolveRunKind(claim.kind) === "issue" &&
         typeof claim.issue_iid === "number" && claim.config?.non_closing == null &&
+        // PRD 4173: a linked run never closes by design (nonClosingDelivery holds it non-closing),
+        // so its empty recorded closing set is not an "original delivery did not close" signal.
+        !linkedIssueKey(claim).linked &&
         (claim.config?.completion_scope?.deferred?.length ?? 0) === 0 &&
         !record.mr.closing.includes(`#${claim.issue_iid}`)) {
       flight.result.nonClosing = { reason: "The original delivery did not close its issue; the resumed publication keeps it open." };
@@ -11616,6 +11636,7 @@ export class RunRunner {
         runHome ?? os.tmpdir(),
         result.toolEnv,
         runHome ? flight.managedGoWorkDir : undefined,
+        flight.runTmpdir,
       );
       // Issue #1830: the governor's in-place drop keeps `.npm/_cacache` while this install runs.
       flight.jsDepsInstalling = true;
@@ -11683,7 +11704,10 @@ export class RunRunner {
     const refreshPublication = resolveRunKind(claim.kind) === "mr_rework" ||
       (resolveRunKind(claim.kind) === "ci_fix" && !!claim.pipeline && result.branch === claim.pipeline.ref);
     const publicationContextLatch = new PublicationContextLatch();
-    let closingGateIid = issuePublication && effectiveDeclared ? claim.issue_iid! : undefined;
+    // PRD 4173: a run linked to an external issue tracker never closes `#<iid>` (an unrelated forge issue
+    // there), so its commit messages are gated like a declared non-closing run's.
+    const linkedRun = issuePublication && linkedIssueKey(claim).linked;
+    let closingGateIid = issuePublication && (effectiveDeclared || linkedRun) ? claim.issue_iid! : undefined;
     const refreshPublicationContext = async (head: string | null): Promise<void> => {
       if (!refreshPublication) return;
       try {
@@ -11904,7 +11928,7 @@ export class RunRunner {
           // (phasePublicationOnly) uses this value only to TIGHTEN: when the live rules would close the issue of a
           // non-interlocked run but this set omits it, the resume delivers non-closing. It never adds a closing
           // directive: phasePublish recomputes those from the live claim and the delivery rules.
-          closing: issuePublication && typeof claim.issue_iid === "number" && !effectiveDeclared && !result.scopeCapped &&
+          closing: issuePublication && typeof claim.issue_iid === "number" && !effectiveDeclared && !linkedRun && !result.scopeCapped &&
             (completionScope?.deferred?.length ?? 0) === 0 && !interlocked ? [`#${claim.issue_iid}`] : [],
           contract_revision: claim.config?.completion_contract_version ?? 0,
         },
@@ -12039,7 +12063,7 @@ export class RunRunner {
       }
       publicationPending = publicationAck.completionPending;
       pendingNonClosing = (publicationPending?.criteria.length ?? 0) > 0;
-      if (effectiveDeclared || result.scopeCapped || publicationProjection.deferredIds.length > 0 || pendingNonClosing)
+      if (effectiveDeclared || linkedRun || result.scopeCapped || publicationProjection.deferredIds.length > 0 || pendingNonClosing)
         closingGateIid = claim.issue_iid!;
     }
 
@@ -13255,7 +13279,11 @@ export class RunRunner {
     // blocker arm (a delivery that must not close its issue) needs BOTH: a matching non-closing arm in
     // issueArm (setting this flag alone still renders `Closes #N`, and the publisher's scan skips uzi's
     // own completion block), and this flag set here rather than its own check at one of those sites.
-    const nonClosingDelivery = isOwnerPartial || !!result.scopeCapped || !!effectiveNonClosing || pendingNonClosing;
+    // PRD 4173: a run linked to an external issue tracker (claim.issue_key) is non-closing by the repo link:
+    // `#<iid>` is an unrelated forge issue there, so no body may carry a closing directive for it
+    // and issueArm's linkedIssue arm never writes Closes.
+    const linkedDelivery = runKind === "issue" && linkedIssueKey(claim).linked;
+    const nonClosingDelivery = isOwnerPartial || !!result.scopeCapped || !!effectiveNonClosing || pendingNonClosing || linkedDelivery;
     const createCloses = renderCloses && !nonClosingDelivery;
     // H1: a forge response over its byte cap (ForgeResponseTooLarge) is a deterministic answer, not
     // a blip: classifyForgeError classifies it permanent, so it is never retried. Both the publisher
@@ -13377,9 +13405,10 @@ export class RunRunner {
     // deliveries keep the plain title. Interlocked owner-partial and scope-capped publication also
     // refuses closing commit history using the publication-start projection and exact candidate.
     const nonClosingTitleDelivery = nonClosingDelivery && scanIid !== undefined;
+    const issueTitleLabel = linkedDelivery ? linkedIssueLabel(linkedIssueKey(claim)) : undefined;
     const titleFor = (): string => {
       const title = mrTitle(claim, result.scopeCapped, completionScope);
-      return nonClosingTitleDelivery ? nonClosingTitle(title, scanIid!, repoPath) : title;
+      return nonClosingTitleDelivery ? nonClosingTitle(title, scanIid!, repoPath, issueTitleLabel) : title;
     };
     let mr: Awaited<ReturnType<typeof forge.createMergeRequest>>;
     try {
@@ -13456,14 +13485,14 @@ export class RunRunner {
           const actual = await readTitle();
           if (actual === undefined) return false;
           if (!closingDirectiveFor(actual, scanIid!, repoPath)) return true;
-          let written = nonClosingTitle(actual, scanIid!, repoPath);
+          let written = nonClosingTitle(actual, scanIid!, repoPath, issueTitleLabel);
           try {
             await writeTitle(written);
           } catch (e) {
             // A forge may refuse the broken title (e.g. a length cap after the inserted characters);
             // one retry with the fixed non-closing fallback, anything else fails closed.
             if (!(e instanceof ForgeError && (e.status === 422 || e.status === 400))) throw e;
-            written = `Work on issue #${scanIid}`;
+            written = `Work on issue ${issueTitleLabel ?? `#${scanIid}`}`;
             await writeTitle(written);
           }
           const reread = await readTitle();
@@ -13754,6 +13783,7 @@ export class RunRunner {
     const secrets = [
       claim.secrets.forge_pat,
       claim.secrets.anthropic_oauth_token,
+      claim.secrets.provider?.credential,
       this.joinToken,
       gitBasic,
     ];
@@ -14649,7 +14679,7 @@ export class RunRunner {
         await this.git.releaseAttemptInPlace(barePath, journaledPath, branch, ownerRunId, "reclaimed");
         disposition = "retained-in-place";
       } else {
-        disposition = await this.git.retireRunnerClone(barePath, journaledPath, branch, ownerRunId, { discard: false, orphanDiagnostics: diagnostics });
+        disposition = await this.git.retireRunnerClone(barePath, journaledPath, branch, ownerRunId, { discard: false, orphanDiagnostics: diagnostics, dispositionClass: "other" });
       }
     } catch (error) {
       return refuseAfterReread(error instanceof AttemptReleaseError ? (error.stage === "ledger" ? "attempt_ledger" : "attempt_journal") : "retirement",
@@ -16872,7 +16902,7 @@ export class RunRunner {
             steering,
             claim: {
               kind: resolveRunKind(claim.kind),
-              claude: !claim.secrets.codex && !!claim.secrets.anthropic_oauth_token,
+              claude: !claim.secrets.codex && (!!claim.secrets.anthropic_oauth_token || !!claim.secrets.provider),
               ...nowSummaryCodexClaim(runId, claim.secrets.codex, this.nowSummaryOpts.codexAdviceHarnessFactory, claim.claim_generation),
             },
             emit: (m) => batcher.emit(m),
@@ -16883,6 +16913,7 @@ export class RunRunner {
             pass: {
               // Placeholder only: every call overrides it with the credential snapshot (deps.credential).
               token: flight.credential?.current().token ?? "",
+              ...(claim.secrets.provider ? { provider: claim.secrets.provider } : {}),
               homeRoot: this.nowSummaryOpts.homeRoot,
               queryFn: this.nowSummaryOpts.queryFn,
             },
@@ -16928,9 +16959,23 @@ export class RunRunner {
         if ("dir" in prepared) flight.managedGoWorkDir = prepared.dir;
       }
     }
+    // Issue #4420: the run-owned TMPDIR leaf. Same Claude-only gate as above; any failure launches with
+    // today's shared TMPDIR and logs a fixed reason token only.
+    if (!flight.executor.safety && flight.executor.sandboxesCommands !== true && !claim.secrets.codex &&
+      flight.runHome && process.platform === "linux") {
+      const prepared = await (this.runTmpdirTestDeps?.prepare ?? prepareRunTmpdir)(runId);
+      if ("dir" in prepared) flight.runTmpdir = prepared.dir;
+      else {
+        runLog.warn("run TMPDIR unavailable; launching with the shared TMPDIR", {
+          reason: prepared.reason,
+          generation: Number.isFinite(flight.claimGeneration) ? flight.claimGeneration : null,
+        });
+      }
+    }
     const ctx: RunContext = {
       semanticPlanning,
       managedGoWorkDir: flight.managedGoWorkDir,
+      runTmpdir: flight.runTmpdir,
       ...(claim.kind === "prompt" && claim.config?.ci_config_guard === true && claim.ci_repair != null ? {
         prepareCIEvidence: async () => {
           if (!flight.runHome) throw new Error("CI evidence requires a prepared run home");
@@ -16989,6 +17034,7 @@ export class RunRunner {
       } : {}),
       kind: resolveRunKind(claim.kind),
       issueIid: claim.issue_iid,
+      ...(claim.issue_key !== undefined ? { issueKey: claim.issue_key } : {}),
       issueTitle: claim.issue_title,
       issueDescription: claim.issue_description,
       // PRD #381: carry the snapshotted issue-comment set onto the ctx; the SDK
@@ -17030,6 +17076,7 @@ export class RunRunner {
       // Issue #1583: the claim-secret text redactor, for projections that bound text pre-batcher.
       redactText: flight.redactText,
       oauthToken: claim.secrets.anthropic_oauth_token,
+      ...(claim.secrets.provider ? { provider: claim.secrets.provider } : {}),
       ...(flight.credential ? { credential: () => flight.credential!.current() } : {}),
       // PRD #362 M3c: the run-summary model resolved server-side (user-value-wins),
       // and whether the intent summary is already set so the executor skips
@@ -20703,6 +20750,7 @@ export class RunRunner {
       const range = await this.git.resolveCheckpointRange(barePath, branch, {
         defaultBranch: flight.checkpointDefaultBranch,
         confirmedTip: flight.lastCheckpointRefTip,
+        captureConfirmedBlob: true,
         extraFloors: flight.publishedRealTips,
       });
       if (!range) {
@@ -22499,6 +22547,7 @@ export class RunRunner {
         [flight.lastAttemptedCheckpointRefTip, flight.lastCheckpointRefTip],
         { defaultBranch: flight.checkpointDefaultBranch, signal, restrictionIdentity: identity,
           markerTrustedTip: flight.lastCheckpointRefTip,
+          confirmedBlobTip: flight.lastCheckpointRefTip,
           chainWorkflowSwap: flight.checkpointChainForge === true }));
       // tracking tip unresolved (no tracking ref, or it could not be read) — nothing to pack; not a
       // publish failure, stay silent
@@ -28041,6 +28090,7 @@ export class RunRunner {
               if (terminalRequest && flight.terminalReleaseOwner) flight.terminalReleaseOwner.provisional(false);
               else flight.preserveRecoveryClone = false;
               flight.stoppedSourceKept = false;
+              flight.coveredLiftRetire = true;
               log.info("stopped source: clean and already held by the worker bare (tracking tip, owed pin or default branch); teardown proceeds", { clone: clonePath, reason });
               return "covered";
             }
@@ -32398,7 +32448,9 @@ export function mrTitle(
   if (kindTitle !== undefined) return kindTitle;
   // #1801: NOT `Resolve issue #N` — GitLab's default merge/squash commit messages carry the title,
   // and `Resolve` + ref there closes the issue on the default branch.
-  return `${prefix}Work on issue #${claim.issue_iid}`;
+  const linked = linkedIssueKey(claim);
+  const linkedIssue = resolveRunKind(claim.kind) === "issue" && linked.linked;
+  return `${prefix}Work on issue ${linkedIssue ? linkedIssueLabel(linked) : `#${claim.issue_iid}`}`;
 }
 
 /** PRD #1798: the options mrCompletionBlock takes after its positional parameters. All optional.
@@ -32459,12 +32511,14 @@ export function mrCompletionBlock(
   // RUN_KIND_PROFILES.completionLine. A row's undefined — ci_fix with no pipeline, and the
   // issue/chat/judge kinds that carry none — takes the issue arm (Related / Closes / partial /
   // accepted / gates) inside renderCompletionBlock.
+  const linked = linkedIssueKey(claim);
   const kindLine = RUN_KIND_PROFILES[resolveRunKind(claim.kind)].completionLine?.(claim, {
     branch,
     baseBranch: claim.base_branch?.trim() || undefined,
   });
   return renderCompletionBlock({
     issueIid: claim.issue_iid,
+    ...(resolveRunKind(claim.kind) === "issue" && linked.linked ? { linkedIssue: { label: linked.label } } : {}),
     branch,
     kindLine,
     kindSections: [selfImproveSection, promptGuardSection, codeCrossCheckSummary ? [{ codeCrossCheck: codeCrossCheckSummary }] : undefined],

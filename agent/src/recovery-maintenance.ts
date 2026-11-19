@@ -105,6 +105,12 @@ function index(table: Table): string[] {
     return [id, hash([id, cycle.config]), ...cycle.outputs.map(output => hash([id, output]))];
   }))].sort();
 }
+/** Interruption bound for the read-only inspection path (structurally the same as completion-authority's AuthorityReadBound). */
+export interface MaintenanceReadBound { signal: AbortSignal; deadline: number }
+/** Throws a refusal when the optional bound has been aborted or its deadline reached; a no-op without a bound. */
+function check(bound?: MaintenanceReadBound): void {
+  if (bound && (bound.signal.aborted || Date.now() >= bound.deadline)) refuse("maintenance_state_invalid");
+}
 const locks = new Map<string, Promise<void>>();
 const active = new Map<string, Map<string, Live>>();
 async function locked<T>(root: string, action: () => Promise<T>): Promise<T> {
@@ -158,7 +164,7 @@ export class RecoveryMaintenance {
     if (!Number.isSafeInteger(now) || now < 0) refuse("maintenance_clock_invalid");
     return now;
   }
-  private async root(): Promise<string> {
+  private async root(bound?: MaintenanceReadBound): Promise<string> {
     if (!this.options.workerToken || path.basename(this.requestedRoot) !== "recovery-maintenance")
       refuse("maintenance_state_invalid");
     // Reject symlink components rather than following even an otherwise canonical alias.
@@ -166,15 +172,19 @@ export class RecoveryMaintenance {
     const parent = path.dirname(this.requestedRoot);
     for (const part of parent.slice(current.length).split(path.sep).filter(Boolean)) {
       current = path.join(current, part);
+      check(bound);
       const stat = await fs.lstat(current);
       if (!stat.isDirectory() || stat.isSymbolicLink()) refuse("maintenance_state_invalid");
     }
+    check(bound);
     return path.join(await fs.realpath(parent), "recovery-maintenance");
   }
   private mac(value: unknown): string { return createHmac("sha256", this.key).update(canonical(value)).digest("hex"); }
-  private async read(file: string, max: number): Promise<unknown> {
+  private async read(file: string, max: number, bound?: MaintenanceReadBound): Promise<unknown> {
+    check(bound);
     const handle = await fs.open(file, C.O_RDONLY | C.O_NOFOLLOW | C.O_NONBLOCK);
     try {
+      check(bound);
       const stat = await handle.stat();
       if (!stat.isFile() || stat.nlink !== 1 || stat.size > max || stat.size < 1)
         refuse("maintenance_state_invalid");
@@ -182,6 +192,7 @@ export class RecoveryMaintenance {
       const buffer = Buffer.alloc(max + 1);
       let length = 0;
       while (length < buffer.length) {
+        check(bound);
         const { bytesRead } = await handle.read(buffer, length, buffer.length - length, null);
         if (!bytesRead) break;
         MaintenanceResources.consumeIfActive("metadataBytes", bytesRead);
@@ -277,8 +288,9 @@ export class RecoveryMaintenance {
     for (const cycle of table.cycles)
       if (outputs.has(cycle.identity.originalSource)) refuse("maintenance_state_invalid");
   }
-  private async load(root: string, initialize = true): Promise<Table> {
+  private async load(root: string, initialize = true, bound?: MaintenanceReadBound): Promise<Table> {
     let stat;
+    check(bound);
     try { stat = await fs.lstat(root); }
     catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
@@ -299,6 +311,7 @@ export class RecoveryMaintenance {
       await this.options.initializationHook?.("installed");
       return this.load(root);
     }
+    check(bound);
     try {
       await fs.lstat(root + ".initializing");
       refuse("maintenance_state_invalid");
@@ -307,15 +320,21 @@ export class RecoveryMaintenance {
     }
     if (!stat.isDirectory() || stat.isSymbolicLink()) refuse("maintenance_state_invalid");
     const names: string[] = [];
+    check(bound);
     const directory = await fs.opendir(root);
-    for await (const entry of directory) {
-      names.push(entry.name);
-      if (names.length > 2) refuse("maintenance_state_invalid");
-    }
+    try {
+      for (;;) {
+        check(bound);
+        const entry = await directory.read();
+        if (!entry) break;
+        names.push(entry.name);
+        if (names.length > 2) refuse("maintenance_state_invalid");
+      }
+    } finally { await directory.close().catch(() => undefined); }
     names.sort();
     if (canonical(names) !== canonical(["complete.json", "initialized.json"])) refuse("maintenance_state_invalid");
-    const table = tableSchema.parse(await this.read(path.join(root, "complete.json"), TABLE_BYTES));
-    const marker = markerSchema.parse(await this.read(path.join(root, "initialized.json"), MARKER_BYTES));
+    const table = tableSchema.parse(await this.read(path.join(root, "complete.json"), TABLE_BYTES, bound));
+    const marker = markerSchema.parse(await this.read(path.join(root, "initialized.json"), MARKER_BYTES, bound));
     this.validate(table, marker);
     return table;
   }
@@ -575,6 +594,37 @@ export class RecoveryMaintenance {
       // At most CAPACITY entries; a failed write still releases the owner without refund.
       for (const [id, reservation] of running ?? []) if (reservation === live) running!.delete(id);
     }
+  }
+
+  /**
+   * Issue #4420: whether any cycle of `run` (case-insensitive) may still do work, judged on the AUTHENTICATED, fully validated
+   * table pair (the same load every transaction uses, without initialising or writing anything). `absent`: neither the
+   * ledger root nor its initialisation stage exists. `ended`: valid table, no cycle of the run, or every one exhausted.
+   * `active`: a cycle of the run that is not exhausted. `unknown`: anything else (unreadable, unauthenticated, invalid,
+   * inconsistent pair, a partial initialisation).
+   */
+  async inspectRun(run: string, bound?: MaintenanceReadBound): Promise<"absent" | "ended" | "active" | "unknown"> {
+    try {
+      const root = await this.root(bound);
+      for (const candidate of [root, root + ".initializing"]) {
+        check(bound);
+        try { await fs.lstat(candidate); }
+        catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+          return "unknown";
+        }
+        if (candidate !== root) return "unknown";
+        check(bound);
+        const table = await locked(root, () => { check(bound); return this.load(root, false, bound); });
+        const id = run.toLowerCase();
+        const verdict = table.cycles.some(c => c.identity.run.toLowerCase() === id && !c.exhausted) ? "active" : "ended";
+        // Expiry or abort during the last read must not be reported as a definitive answer.
+        check(bound);
+        return verdict;
+      }
+      check(bound);
+      return "absent";
+    } catch { return "unknown"; }
   }
 }
 function checked(token: MaintenanceSlot): Live {

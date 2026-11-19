@@ -33,8 +33,13 @@ type Store interface {
 	GetVaultMaterialTotals(context.Context, uuid.UUID) (store.GetVaultMaterialTotalsRow, error)
 	LockVaultAccountMaterialBatch(context.Context, store.LockVaultAccountMaterialBatchParams) ([]store.LockVaultAccountMaterialBatchRow, error)
 	LockVaultSecretMaterialBatch(context.Context, store.LockVaultSecretMaterialBatchParams) ([]store.LockVaultSecretMaterialBatchRow, error)
+	LockVaultEnvConnectionsKeyShare(context.Context, uuid.UUID) ([]uuid.UUID, error)
+	LockVaultEnvReposKeyShare(context.Context, uuid.UUID) ([]uuid.UUID, error)
+	ListVaultEnvMaterialCandidates(context.Context, store.ListVaultEnvMaterialCandidatesParams) ([]uuid.UUID, error)
+	LockVaultEnvMaterialBatch(context.Context, store.LockVaultEnvMaterialBatchParams) ([]store.LockVaultEnvMaterialBatchRow, error)
 	ResealVaultAccountMaterial(context.Context, store.ResealVaultAccountMaterialParams) (int64, error)
 	ResealVaultSecretMaterial(context.Context, store.ResealVaultSecretMaterialParams) (int64, error)
+	ResealVaultEnvMaterial(context.Context, store.ResealVaultEnvMaterialParams) (int64, error)
 	ClaimVaultLockNotice(context.Context, uuid.UUID) (uuid.UUID, error)
 	ClearVaultLockNotice(context.Context, uuid.UUID) error
 }

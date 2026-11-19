@@ -426,6 +426,7 @@ describe("Dashboard onboarding step 4 is durable (PRD #1331)", () => {
       repo_claudemd_enabled: false,
       repo_devbox_opt_in: false,
       repo_fold_improve_uzi_backlog: false,
+      env_var_count: 0,
       pipeline: null,
       guardrail_blocked: false,
       docker_allowlisted: false,

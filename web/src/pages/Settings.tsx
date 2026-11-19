@@ -16,6 +16,7 @@ import { useAsyncData } from "../lib/useAsyncData";
 import { Alert, Card, SectionTitle } from "../components/ui";
 import { AnthropicTokens } from "../components/AnthropicTokens";
 import { CodexCredentials } from "../components/CodexCredentials";
+import { Providers } from "../components/Providers";
 import { SettingsShell } from "../components/SettingsShell";
 import { RateLimitCard } from "../components/RateLimitMeters";
 import { CodexRateLimitCard } from "../components/CodexRateLimitMeters";
@@ -124,7 +125,7 @@ export function Settings() {
   const demoMode = useDemoMode();
 
   return (
-    <SettingsShell description="Your Anthropic tokens, OpenAI / Codex credentials, vault, and account.">
+    <SettingsShell description="Your Anthropic tokens, OpenAI / Codex credentials, custom providers, vault, and account.">
       {(loadError || error) && <Alert message={loadError || error} />}
       {notice && <Alert tone="success" message={notice} />}
 
@@ -154,6 +155,10 @@ export function Settings() {
         accountMode={codexAccountMode}
         onAccountModeChange={setCodexAccountMode}
       />
+
+      {/* Custom providers (PRD #4320 M3). Self-contained: loads its own list and
+          reports into its own alert slots. */}
+      <Providers />
 
       {/* Codex per-account rate-limit meters (PRD #1209 M3). Self-gates: hidden when
           no subscription account is linked (an API-key-only default supplies none). The

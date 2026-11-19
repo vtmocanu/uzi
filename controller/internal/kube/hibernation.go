@@ -214,6 +214,18 @@ func deploymentPlacementBlocked(w protocol.DesiredWorker, obs reconcile.Observed
 	return (obs.HasNixPVC && !nixLiveAtSize) || dataBlocking || dindBlocking
 }
 
+// wakeClaimTerminating reports that one of the worker's /data, /nix or (Docker) dind-data
+// claims in the target namespace exists but is Terminating. Deliberately narrower than
+// deploymentPlacementBlocked: an absent claim (ensurePVCs creates it first) and an
+// undersized live Nix claim do not count, and no Bound phase is required (a
+// WaitForFirstConsumer claim binds only once the pod is scheduled).
+func wakeClaimTerminating(w protocol.DesiredWorker, obs reconcile.ObservedWorker, ns string) bool {
+	dataTerminating := obs.TerminatingClaims[ns+"/"+dataPVCName(w.ID)]
+	nixTerminating := obs.TerminatingClaims[ns+"/"+nixPVCName(w.ID)]
+	dindTerminating := w.Docker && obs.TerminatingClaims[ns+"/"+dindDataPVCName(w.ID)]
+	return dataTerminating || nixTerminating || dindTerminating
+}
+
 func (m *Materializer) reconcileHibernation(ctx context.Context, w protocol.DesiredWorker, obs reconcile.ObservedWorker, ns string, spec preset.Spec) error {
 	h := w.Hibernation
 	if h == nil || h.OpID == "" {
@@ -246,7 +258,7 @@ func (m *Materializer) createHibernationDeployment(ctx context.Context, w protoc
 	if deploymentPlacementBlocked(w, obs, spec) {
 		return nil
 	}
-	dep := RenderDeployment(m.cfg, w, spec)
+	dep := RenderDeployment(m.renderCfgFor(ctx, w, obs), w, spec)
 	dep.Spec.Replicas = &replicas
 	if dep.Annotations == nil {
 		dep.Annotations = map[string]string{}
@@ -695,7 +707,13 @@ func (m *Materializer) hibernateWake(ctx context.Context, w protocol.DesiredWork
 	if obs.DeploymentReplicas != nil && *obs.DeploymentReplicas == 0 && m.wakeHeldForPods(w, obs) {
 		return nil
 	}
-	dep := RenderDeployment(m.cfg, w, spec)
+	// Never scale a sleeping Deployment up over a claim that is going away (#4457): its
+	// pod would sit Pending on the doomed volume. Hold at zero; a later tick recreates
+	// the claim (ensurePVCs) and wakes then.
+	if obs.DeploymentReplicas != nil && *obs.DeploymentReplicas == 0 && wakeClaimTerminating(w, obs, ns) {
+		return nil
+	}
+	dep := RenderDeployment(m.renderCfgFor(ctx, w, obs), w, spec)
 	wantHash := dep.Spec.Template.Annotations[AnnotationSpecHash]
 	asleep := obs.DeploymentReplicas == nil || *obs.DeploymentReplicas == 0
 	drifted := obs.SpecHash != wantHash || obs.Generation != w.Generation

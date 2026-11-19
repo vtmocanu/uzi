@@ -42,16 +42,13 @@ func (y *youTrack) checkLabelNames(names ...[]string) error {
 	return nil
 }
 
-// issueQuery builds the YouTrack search query for ListIssues. tagNames are the
-// live tag names to narrow by (see queryTagNames); every one has passed
-// labelNameProblem, so none can close its brace group. The date floor is one UTC
-// day early: the query's granularity is a day, and the driver filters again on
-// the exact millisecond.
-func issueQuery(shortName string, tagNames []string, opts forge.ListIssuesOptions) string {
+// issueQuery builds the YouTrack search query for a ListIssues without labels:
+// the project, state and date terms. A tag name is never sent in a query; a
+// listing with labels pages the tag's issues by id instead. The date floor
+// is one UTC day early: the query's granularity is a day, and the driver
+// filters again on the exact millisecond.
+func issueQuery(shortName string, opts forge.ListIssuesOptions) string {
 	parts := []string{"project: {" + shortName + "}"}
-	for _, l := range tagNames {
-		parts = append(parts, "tag: {"+l+"}")
-	}
 	switch opts.State {
 	case forge.StateOpened:
 		parts = append(parts, "#Unresolved")
