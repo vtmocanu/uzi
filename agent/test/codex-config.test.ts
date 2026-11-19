@@ -45,15 +45,17 @@ describe("buildCodexConfigToml: stock native-disabled config", () => {
   });
 
   it("pins every [features] native knob to its disabled value", () => {
+    assert.doesNotMatch(toml, /\bmcp_servers\b/, "no native MCP server is configured");
     assert.doesNotMatch(toml, /^\s*remote_models\s*=/m, "the removed compatibility key is omitted");
     for (const key of [
-      "apps", "plugins", "shell_tool", "view_image", "sleep_tool", "apply_patch_freeform",
+      "goals", "apps", "plugins", "shell_tool", "view_image", "sleep_tool", "apply_patch_freeform",
       "shell_snapshot", "shell_snapshot_v2",
       "code_mode", "code_mode_only", "code_mode_host", "code_mode_prewarm",
       "unified_exec", "hooks", "multi_agent", "multi_agent_v2",
       "enable_request_compression",
     ]) {
-      assert.match(toml, new RegExp(`^${key} = false$`, "m"), `${key} must be false`);
+      const features = toml.split("[features]\n")[1]!.split("\n[")[0]!;
+      assert.match(features, new RegExp(`^${key} = false$`, "m"), `[features].${key} must be false`);
     }
   });
 

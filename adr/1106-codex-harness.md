@@ -1493,26 +1493,27 @@ new PID/transport, retained thread). Nested and direct native patch attempts
 both return `No usable execution environment is available` at this pin. After
 each attempt, no marker exists and worker callbacks, spawns and fileops remain
 zero; subsequent nested worker patch and exec controls pass. Two independent
-omission fixtures remove resumed-turn selection or the launcher guard separately.
+omission fixtures remove every explicit thread/turn selection or the launcher guard separately.
 Per-site request-contract mutations check the construction boundary separately.
 
 The matrix checks a finite exact inventory per model, including nested tools.
-Goal/resource utility names are registered inventory only, not grants of worker
-effects. `gpt-5.6-sol` omits the async and UTC helpers shown by the other curated
+Supported `features.goals = false` in the shared production/loopback/custom builder
+and the advice thread request map disables create_goal/get_goal/update_goal.
+Root thread config overrides only project settings; child/cross-check roots inherit
+the shared launcher config. Real-binary inventories exclude all three goal names,
+and forced nested calls return call-linked `tools.<name> is not a function` errors;
+forced top-level goal calls return `unsupported call: <name>`.
+The three MCP resource helpers remain natively registered. With no configured native
+MCP server, list_mcp_resources and list_mcp_resource_templates return exact empty
+resources/resourceTemplates JSON; read_mcp_resource for offline-fixture returns an
+unknown MCP server error. Each observed outcome precedes controls with zero callbacks,
+spawns, fileops or markers. These finite no-server observations do not prove global
+inertness. Acceptance of the remaining three helpers against the exact single-inert-native
+clause is an unresolved owner decision, not approved; INV_EXTRA_NATIVES is not closed.
+`gpt-5.6-sol` omits the async and UTC helpers shown by the other curated
 models. The legacy [native-bypass probes](../e2e/codex-m4/native-bypass.test.ts)
 retain their representative top-level inventory assertion; they do not prove
 nested patch absence. P-layer protocol evidence uses injected OS seams: it is
 neither packaged OS isolation nor exhaustive proof about native OS effects.
 The [archived #4321 evidence](../prds/done/4321-codex-provider-spike.md)
 is background; this record states the current adoption boundary.
-
-### Local timing evidence (2026-11-19)
-
-`task test:codex-m4` exited 0 on baseline `be14e538a` in 57 seconds and on
-candidate `18b9a95d2` in 135 seconds (260 tests, 0 skips, 38 clauses, 80 executed
-evidence rows). These are dated local measurements, not durable test-count
-requirements. The 16 new cases took roughly 30 seconds in a focused run. The full 78-second delta cannot be attributed
-solely to those cases: concurrent reviews/scans and cache effects were not isolated.
-M4 runs serially in one agent shard, so its elapsed time contributes to that
-shard's critical path. Hosted shard/job critical-path, queue, rerun and cache
-contributions remain unmeasured.

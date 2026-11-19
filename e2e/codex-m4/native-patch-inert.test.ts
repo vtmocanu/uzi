@@ -14,10 +14,25 @@ let mods: ProtocolModules;
 before(async () => { if (P_LAYER_SKIP === false) mods = await loadProtocolModules(); });
 const models = (JSON.parse(readFileSync(path.resolve(__dirname, "../../fixtures/codex-models/models.json"), "utf8")) as { curated: string[] }).curated;
 const structured = ["functions", "functions.exec", "functions.wait", "functions.request_user_input", "functions.request_user_input_async"];
-const nested = ["apply_patch", "create_goal", "get_goal", "list_mcp_resource_templates", "list_mcp_resources", "read_mcp_resource", "update_goal", "uzi_bash", "uzi_apply_patch", "clock__curr_time"];
+const nested = ["apply_patch", "list_mcp_resource_templates", "list_mcp_resources", "read_mcp_resource", "uzi_bash", "uzi_apply_patch", "clock__curr_time"];
+
+// Each call-linked outcome is checked before worker controls, with no native MCP servers.
+const goals = ["create_goal", "get_goal", "update_goal"] as const;
+const utilities = [
+  ...goals.map(name => ({ name, args: name === "create_goal" ? { objective: "offline fixture" }
+    : name === "update_goal" ? { status: "complete" } : {} })),
+  { name: "list_mcp_resources", args: {} },
+  { name: "list_mcp_resource_templates", args: {} },
+  { name: "read_mcp_resource", args: { server: "offline-fixture", uri: "fixture://missing" } },
+];
+const directGoalIds = goals.map(name => `direct-${name}`);
+const scenarios = ["fresh", "cold", "cold-no-explicit-selection", "fresh-no-launcher-guard"] as const;
+assert.deepEqual(Object.keys(NATIVE_PATCH_INERT_TITLES).sort(),
+  models.flatMap(model => scenarios.map(scenario => `${model}/${scenario}`)).sort(),
+  "native patch evidence titles must exactly match fixture models × scenarios");
 
 for (const model of models) {
-  for (const scenario of ["fresh", "cold", "cold-no-turn-selection", "fresh-no-launcher-guard"] as const) {
+  for (const scenario of scenarios) {
     const title = NATIVE_PATCH_INERT_TITLES[`${model}/${scenario}`]!;
     test(title, { skip: P_LAYER_SKIP, timeout: 119_000 }, async (t) => {
       assert.ok(CODEX_ROLE_MODELS.has(model), "curated model accepted by production role renderer");
@@ -31,6 +46,9 @@ for (const model of models) {
       const responder = scriptedStepsResponder([
         codeModeExecStep("native-nested", `text(await tools.apply_patch(${JSON.stringify(patch)}));`),
         nativeApplyPatchStep("native-direct", marker),
+        ...utilities.map(({ name, args }) => codeModeExecStep(name, `text(await tools.${name}(${JSON.stringify(args)}));`)),
+        ...utilities.filter(u => goals.includes(u.name as typeof goals[number])).map(({ name, args }) =>
+          ({ kind: "call" as const, callId: `direct-${name}`, name, args })),
         codeModeExecStep("worker-file", nestedWorkerCallScript("uzi_apply_patch", { path: "native-control.txt", content: "worker control" })),
         codeModeExecStep("worker-exec", nestedWorkerCallScript("uzi_bash", { command: "echo native-control" })),
         { kind: "finish" },
@@ -38,20 +56,32 @@ for (const model of models) {
       const obs = await runProtocolTurn(mods, {
         model, lifecycle: scenario.startsWith("cold") ? "cold" : "start", codeModeHost: true,
         omitLauncherGuardForTest: scenario === "fresh-no-launcher-guard",
-        omitResumedTurnEnvironmentsForTest: scenario === "cold-no-turn-selection",
+        omitAllEnvironmentsForTest: scenario === "cold-no-explicit-selection",
         credential: dummyCredential(),
         grants: { role: "coder", phase: "implement", allowedTools: new Set(["Bash", "apply_patch"]), allowedSkills: new Set(), isRoot: true },
         respond: responder,
         onProviderRequestForTest: (body, callbacks) => {
-          for (const id of ["native-nested", "native-direct"]) {
+          for (const id of ["native-nested", "native-direct", ...utilities.map(u => u.name), ...directGoalIds]) {
             const outputs = toolCallbackTexts([body], id);
             if (!outputs.length || boundaries.has(id)) continue;
             assert.equal(existsSync(marker), false, `${id}: no native marker`);
             assert.equal(spawns, 0, `${id}: no spawn before positive controls`);
             assert.equal(fileops, 0, `${id}: no fileop before positive controls`);
             assert.deepEqual(callbacks, [], `${id}: no worker callback`);
-            if (id === "native-nested") assert.match(outputs.join("\n"), /No usable execution environment is available/);
-            else assert.match(outputs.join("\n"), /No usable execution environment is available/);
+            const output = outputs.join("\n");
+            if (id.startsWith("native-")) {
+              assert.match(output, /No usable execution environment is available/, `${id}: native route refused`);
+            } else if (id.startsWith("direct-")) {
+              assert.ok(outputs.includes(`unsupported call: ${id.slice("direct-".length)}`), output);
+            } else if (goals.includes(id as typeof goals[number])) {
+              assert.ok(output.includes(`TypeError: tools.${id} is not a function`), output);
+            } else if (id === "read_mcp_resource") {
+              assert.ok(outputs.includes("Script error:\nunknown MCP server 'offline-fixture'"), output);
+            } else {
+              const expected = id === "list_mcp_resources" ? { resources: [] } : { resourceTemplates: [] };
+              assert.ok(outputs.includes(JSON.stringify(expected)), `${id}: exact empty JSON result: ${output}`);
+              assert.ok(outputs.every(text => !text.includes("Script error:")), output);
+            }
             boundaries.add(id);
           }
         },
@@ -67,7 +97,7 @@ for (const model of models) {
       });
       writeFileSync(path.join(artifacts, "observation.json"), JSON.stringify(obs, null, 2));
       t.diagnostic(`evidence=${artifacts} cold=${JSON.stringify(obs.coldRestart)}`);
-      assert.deepEqual([...boundaries].sort(), ["native-direct", "native-nested"]);
+      assert.deepEqual([...boundaries].sort(), ["native-direct", "native-nested", ...utilities.map(u => u.name), ...directGoalIds].sort());
       assert.equal(existsSync(marker), false);
       assert.equal(obs.turnStatus, "completed");
       assert.deepEqual(obs.providerErrors, []);
@@ -82,13 +112,19 @@ for (const model of models) {
           ? ["functions", "functions.exec", "functions.wait", "functions.request_user_input"] : structured;
         assert.deepEqual(inventory.structuredNames.sort(), [...expectedStructured].sort());
         const expectedNested = model === "gpt-5.6-sol"
-          ? ["apply_patch", "create_goal", "get_goal", "list_mcp_resource_templates", "list_mcp_resources", "read_mcp_resource", "update_goal", "uzi_bash", "uzi_apply_patch"] : nested;
+          ? ["apply_patch", "list_mcp_resource_templates", "list_mcp_resources", "read_mcp_resource", "uzi_bash", "uzi_apply_patch"] : nested;
         assert.deepEqual(inventory.nestedNames.sort(), [...expectedNested].sort());
       }
-      assert.deepEqual(obs.threadParams.environments, []);
       assert.equal(obs.spawnEnv.CODEX_EXEC_SERVER_URL, scenario === "fresh-no-launcher-guard" ? undefined : "none");
-      if (scenario === "cold-no-turn-selection") assert.equal(Object.hasOwn(obs.turnParams, "environments"), false);
-      else assert.deepEqual(obs.turnParams.environments, []);
+      const requests = [obs.threadParams, obs.turnParams];
+      if (scenario.startsWith("cold")) {
+        assert.ok(obs.primingTurnParams);
+        requests.push(obs.primingTurnParams);
+      }
+      for (const params of requests) {
+        if (scenario === "cold-no-explicit-selection") assert.equal(Object.hasOwn(params, "environments"), false);
+        else assert.deepEqual(params.environments, []);
+      }
       if (scenario.startsWith("cold")) {
         assert.ok(obs.primingRequests.length > 0);
         assert.ok(obs.coldRestart?.closureConfirmed);

@@ -57,13 +57,13 @@ describe("codex U repository trust construction (real config builders + real exe
     // Exact false config entries in BOTH postures, not proof of runtime suppression. code_mode_host is
     // NOT here: it is the authority-free run-lane callback-routing host — off on the default/advice
     // lane and enabled on the run lane — asserted posture-by-posture, not an always-off grant.
-    const otherNativeOff = ["hooks = false", "code_mode = false", "code_mode_only = false", "unified_exec = false", "shell_tool = false", "apply_patch_freeform = false", "apps = false", "plugins = false"];
+    const otherNativeOff = ["goals = false", "hooks = false", "code_mode = false", "code_mode_only = false", "unified_exec = false", "shell_tool = false", "apply_patch_freeform = false", "apps = false", "plugins = false"];
 
     for (const [label, toml] of [["production", production], ["loopback", loopback]] as const) {
       assert.match(toml, /project_doc_max_bytes = 0/, `${label} pins project_doc_max_bytes = 0`);
       assert.match(toml, /\[projects\."\/work\/repo"\]\ntrust_level = "untrusted"/, `${label} pins the project explicitly untrusted`);
       for (const off of otherNativeOff) {
-        assert.ok(toml.includes(off), `${label} disables native feature: ${off}`);
+        assert.ok(toml.split("[features]\n")[1]!.split("\n[")[0]!.split("\n").includes(off), `${label} disables native feature: ${off}`);
       }
       // DEFAULT/advice posture: the callback-routing host is OFF on the default (advice/stock) lane.
       assert.match(toml, /^code_mode_host = false$/m, `${label} keeps code_mode_host off on the default/advice lane`);
@@ -82,7 +82,7 @@ describe("codex U repository trust construction (real config builders + real exe
     for (const [label, toml] of [["production (run lane)", productionRun], ["loopback (run lane)", loopbackRun]] as const) {
       assert.match(toml, /^code_mode_host = true$/m, `${label} enables the run-lane code_mode_host = true`);
       for (const off of otherNativeOff) {
-        assert.ok(toml.includes(off), `${label} keeps every OTHER native feature off: ${off}`);
+        assert.ok(toml.split("[features]\n")[1]!.split("\n[")[0]!.split("\n").includes(off), `${label} keeps every OTHER native feature off: ${off}`);
       }
       assert.match(toml, /\[projects\."\/work\/repo"\]\ntrust_level = "untrusted"/, `${label} keeps the project untrusted on the run lane`);
       assert.doesNotMatch(toml, /trust_level = "trusted"/, `${label} never promotes trust on the run lane`);

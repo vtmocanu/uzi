@@ -38,6 +38,6 @@ export const CODEX_U_TRUST_CONSTRUCTION_TITLE =
 /** One evidence title per serial model/scenario case, also consumed by strict completeness. */
 export const NATIVE_PATCH_INERT_TITLES: Readonly<Record<string, string>> = Object.fromEntries(
   ["gpt-5.6-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol"].flatMap(model =>
-    ["fresh", "cold", "cold-no-turn-selection", "fresh-no-launcher-guard"].map(scenario =>
+    ["fresh", "cold", "cold-no-explicit-selection", "fresh-no-launcher-guard"].map(scenario =>
       [`${model}/${scenario}`, `codex P native patch inert: ${model}/${scenario}`])),
 );

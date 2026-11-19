@@ -130,6 +130,7 @@ export interface ProtocolObservation {
   readonly turnParams: Record<string, unknown>;
   readonly threadParams: Record<string, unknown>;
   readonly coldRestart?: { oldPid: number; newPid: number; transportChanged: boolean; retainedThreadId: string; closureConfirmed: true };
+  readonly primingTurnParams?: Record<string, unknown>;
   readonly primingRequests: readonly ResponsesBody[];
 }
 
@@ -169,7 +170,7 @@ export interface ProtocolTurnOptions {
   readonly lifecycle?: "start" | "resume" | "child" | "advice" | "cold";
   /** Offline fixture knobs, never production bypasses. */
   readonly omitLauncherGuardForTest?: boolean;
-  readonly omitResumedTurnEnvironmentsForTest?: boolean;
+  readonly omitAllEnvironmentsForTest?: boolean;
   readonly onProviderRequestForTest?: (body: ResponsesBody, callbacks: readonly ObservedCallback[]) => void;
   /** How long to wait for the single turn to complete (default 60s). */
   readonly turnDeadlineMs?: number;
@@ -448,7 +449,7 @@ export async function runProtocolTurn(mods: ProtocolModules, opts: ProtocolTurnO
       approvalsReviewer: "user",
       sandbox: "danger-full-access",
       ephemeral: false,
-      environments: [],
+      ...(opts.omitAllEnvironmentsForTest ? {} : { environments: [] }),
       dynamicTools: opts.lifecycle === "advice" ? [] : mods.buildCodexDynamicTools(opts.grants),
       config: { project_doc_max_bytes: 0, projects: { [cwd]: { trust_level: "untrusted" } } },
       developerInstructions: "M4 C3 P developer instructions",
@@ -461,10 +462,13 @@ export async function runProtocolTurn(mods: ProtocolModules, opts: ProtocolTurnO
     threadId = threadRes.thread?.id;
     if (threadId === undefined) throw new Error("thread/start returned no thread id");
 
+    let primingTurnParams: Record<string, unknown> | undefined;
     if (opts.lifecycle === "resume" || opts.lifecycle === "cold") {
-      const prime = await transport.request<{ turn?: { id?: string } }>("turn/start", {
-        threadId, model, environments: [], input: [{ type: "text", text: "save root before resume" }],
-      });
+      primingTurnParams = {
+        threadId, model, ...(opts.omitAllEnvironmentsForTest ? {} : { environments: [] }),
+        input: [{ type: "text", text: "save root before resume" }],
+      };
+      const prime = await transport.request<{ turn?: { id?: string } }>("turn/start", primingTurnParams);
       turnId = prime.turn?.id;
       await deadline(primeCompletion, "saved root completion", opts.turnDeadlineMs ?? 60_000);
       measuredRequestOffset = provider.requests.length;
@@ -509,7 +513,7 @@ export async function runProtocolTurn(mods: ProtocolModules, opts: ProtocolTurnO
     const turnParams = {
       threadId,
       input: [{ type: "text", text: "M4 C3 P: run the scripted turn" }],
-      ...(opts.omitResumedTurnEnvironmentsForTest ? {} : { environments: [] }),
+      ...(opts.omitAllEnvironmentsForTest ? {} : { environments: [] }),
       model,
       ...(opts.effort === undefined ? {} : { effort: opts.effort }),
     };
@@ -526,7 +530,7 @@ export async function runProtocolTurn(mods: ProtocolModules, opts: ProtocolTurnO
       turnStatus,
       providerRequests: provider.requests.slice(measuredRequestOffset),
       primingRequests: provider.requests.slice(0, measuredRequestOffset),
-      turnParams, threadParams, coldRestart,
+      turnParams, threadParams, primingTurnParams, coldRestart,
       providerErrors: [...provider.errors],
       elapsedMs: Date.now() - startedAt,
       binSource: resolved.source,
