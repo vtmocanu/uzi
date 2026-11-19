@@ -4399,7 +4399,7 @@ function parseRefusalCleanup(v: unknown): RefusalCleanup | undefined {
   }
   return v as unknown as RefusalCleanup;
 }
-function refusalEvidenceDigest(entries: Array<{ generation: number; sha: string }>, stages: RefusalStage[]): string {
+function refusalEvidenceDigest(entries: Array<{ generation: number; sha: string }>, stages: Array<{ ref: string; sha: string }>): string {
   const lines = [...entries.map(e => `L ${e.generation} ${e.sha}`).sort(), ...stages.map(s => `S ${s.ref} ${s.sha}`).sort()];
   return createHash("sha256").update(lines.join("\n")).digest("hex");
 }
@@ -29592,7 +29592,7 @@ try {
       const sealedGenerations = refusalFileGenerations(await this.refusalNames(c.barePath), "final", c.runId);
       if (sealedGenerations.some((g) => g >= generation)) outcome.sealed = true;
       return true;
-    })) { this.refusalRecordingFailed.add(c.runId); if (abort) throw abort; return outcome; }
+    })) { this.refusalRecordingFailed.add(c.runId); await this.markRefusalIncomplete(c); if (abort) throw abort; return outcome; }
     if (outcome.sealed) return outcome;
     // The refused ref and the ledger entry are independent: either alone still makes the gate demand coverage,
     // and a failure of either latches this run ineligible for the process lifetime.
@@ -29614,9 +29614,19 @@ try {
         barePath: ledger.barePath, entries: [...ledger.entries, { generation, sha, path: refusalPath }] }, REFUSAL_DIRECTORY);
       return true;
     });
-    if (!refWritten || !ledgerWritten) this.refusalRecordingFailed.add(c.runId);
+    if (!refWritten || !ledgerWritten) { this.refusalRecordingFailed.add(c.runId); await this.markRefusalIncomplete(c); }
     if (abort) throw abort;
     return outcome;
+  }
+
+  /** Durable, irreversible companion of the in-process latch: it survives a restart, so a successor process
+   *  never trusts the run's refusal history. Cleanup never deletes it; only an owner discard or the bare's
+   *  removal does. Best effort and independent of the other recording steps; never throws. */
+  private async markRefusalIncomplete(c: StoredOwedContext): Promise<void> {
+    try {
+      await this.writeOwedFile(c.barePath, `incomplete-${c.runId}.json`,
+        { version: 1, runId: c.runId, branch: c.branch, barePath: c.barePath }, REFUSAL_DIRECTORY);
+    } catch { /* the in-process latch still holds */ }
   }
 
   /** Writes one admission record per run and generation, never over an existing one. */
@@ -29651,6 +29661,8 @@ try {
     const ineligible = (reason: string): RefusalReleaseGate => ({ kind: "ineligible", reason });
     if (this.refusalRecordingFailed.has(runId)) return ineligible("refusal recording failed in this process");
     const names = await this.refusalNames(barePath);
+    // Valid or not, an incomplete marker is final: the history cannot be proven complete, whatever else is found.
+    if (names.includes(`incomplete-${runId}.json`)) return ineligible("refusal history incomplete");
     if (names.some((n) => n.startsWith(".tmp-"))) return ineligible("temporary refusal metadata present");
     const ledgerRead = await this.readRefusalRecord(barePath, `refusals-${runId}.json`, parseRefusalLedger);
     if (ledgerRead.state === "invalid") return ineligible("refusal ledger malformed");
@@ -29700,19 +29712,21 @@ try {
       if (typeof barePath !== "string" || !refusalRun(runId) || !refusalGeneration(generation, 1) || !refusalOid(sourceSha)) return "ineligible";
       return await this.withLock(barePath, async () => {
         const gate = await this.refusalGateUnderLock(barePath, runId, generation, sourceSha);
-        if (gate.kind === "none") return "none" as const;
         if (gate.kind === "ineligible") return "ineligible" as const;
         const name = `final-${runId}-${generation}.json`;
         const existing = await this.readRefusalRecord(barePath, name, parseRefusalFinal);
         if (existing.state === "absent") {
+          if (gate.kind === "none") return "none" as const;
           await this.writeOwedFile(barePath, name, { version: 1, runId, generation, sourceSha,
             evidenceDigest: gate.evidenceDigest, process: this.processNonce }, REFUSAL_DIRECTORY);
           return "sealed" as const;
         }
         if (existing.state === "invalid") return "mismatch" as const;
+        // An existing seal is always compared, even when the evidence it sealed has since vanished (gate none).
         const f = existing.value;
+        const digest = gate.kind === "eligible" ? gate.evidenceDigest : refusalEvidenceDigest([], []);
         return f.runId === runId && f.generation === generation && f.sourceSha === sourceSha &&
-          f.evidenceDigest === gate.evidenceDigest && f.process === this.processNonce ? "matches" as const : "mismatch" as const;
+          f.evidenceDigest === digest && f.process === this.processNonce ? "matches" as const : "mismatch" as const;
       });
     } catch { return "ineligible"; }
   }
@@ -29752,6 +29766,20 @@ try {
         const cleanup = read.value;
         if (cleanup.runId !== R || cleanup.generation !== G || cleanup.branch !== context.branch ||
             cleanup.barePath !== barePath || (final && final.evidenceDigest !== cleanup.finalDigest)) return retain;
+        // A listed head must keep exactly the generation the intent recorded, wherever it now sits (also G+1).
+        const listedShas = new Set([...cleanup.ledgerEntries.map((x) => x.sha), ...cleanup.stages.map((x) => x.tip)]);
+        for (const e of ledger?.entries ?? []) {
+          if (listedShas.has(e.sha) && !cleanup.ledgerEntries.some((x) => x.sha === e.sha && x.generation === e.generation)) return retain;
+        }
+        // The intent must still prove itself: its own lists hash to the sealed digest, and every listed stage
+        // is a ref of this run at a generation <= G whose tip the intent's ledger entries cover.
+        const stageRef = new RegExp(`^refs/uzi-incoming/${R}/(0|[1-9][0-9]*)/[A-Za-z0-9._-]+$`);
+        if (refusalEvidenceDigest(cleanup.ledgerEntries, cleanup.stages.map((x) => ({ ref: x.ref, sha: x.tip }))) !== cleanup.finalDigest) return retain;
+        for (const x of cleanup.stages) {
+          const m = stageRef.exec(x.ref);
+          if (!m || Number(m[1]) !== x.generation || x.generation > G || !cleanup.ledgerEntries.some((e) => e.sha === x.tip)) return retain;
+        }
+        if (cleanup.ledgerEntries.some((e) => e.generation > G)) return retain;
         // Current evidence must be an exact-pair subset of the lists; anything else is a rebound generation.
         if (!stages.every((s) => cleanup.stages.some((x) => x.ref === s.ref && x.tip === s.sha && x.generation === s.generation)) ||
             !entries.every((e) => cleanup.ledgerEntries.some((x) => x.sha === e.sha && x.generation === e.generation))) return retain;
@@ -30596,13 +30624,8 @@ try {
         await this.removeOwedFile(barePath, `final-${context.runId}-${context.generation}.json`, true, REFUSAL_DIRECTORY);
         await this.removeOwedFile(barePath, `cleanup-${context.runId}-${context.generation}.json`, true, REFUSAL_DIRECTORY);
       }
-      // issue #4481: this generation's admission served only its release gate. A crash before this leaves
-      // it, which is harmless. Earlier generations' admissions stay so their pending sealed FINAL replay
-      // remains eligible; a later generation of this run therefore cannot cap-release automatically
-      // (it fails closed). Same pre-mutation boundary as every other deletion here.
-      open();
-      boundary();
-      await this.removeOwedFile(barePath, `admission-${context.runId}-${context.generation}.json`, true, REFUSAL_DIRECTORY);
+      // issue #4481: admissions are kept (the seal's process-binding evidence); only an owner discard or the
+      // bare's removal deletes them.
       return "removed";
     });
   }

@@ -1201,7 +1201,7 @@ test("refusal proof 7: a FINAL written with no POST, then restart: the successor
 
 async function allGone(w: RefusalWorld, label: string): Promise<void> {
   assert.deepEqual(incomingRefs(w), [], `${label}: no refusal stage or refused ref remains`);
-  assert.deepEqual(rfFiles(w).filter((f) => !f.startsWith("refusals-")), [], `${label}: no admission, final, cleanup or temp remains`);
+  assert.deepEqual(rfFiles(w).filter((f) => !f.startsWith("refusals-")), [`admission-${RF_RUN}-1.json`], `${label}: only the kept admission remains, no final, cleanup or temp`);
   assert.deepEqual(ownedPins(w), [], `${label}: the anchors are released`);
 }
 
@@ -1293,7 +1293,7 @@ test("refusal proof 11: SIGKILL after the anchor deletes (before the first candi
   await allGone(w, "resumed");
 });
 
-test("refusal proof 12a: SIGKILL after the FINAL is deleted; resuming deletes the intent and the admission and re-creates nothing", { timeout: 180_000 }, async (t) => {
+test("refusal proof 12a: SIGKILL after the FINAL is deleted; resuming deletes the intent, keeps the admission and re-creates nothing", { timeout: 180_000 }, async (t) => {
   const w = await refusalWorld(t, 1);
   const [h] = w.heads as [string];
   await crashRefusal(t, w, [{ op: "admit" }, refuse(h), { op: "seal", sha: w.cover }, { op: "cleanup", covering: w.cover }],
@@ -1311,7 +1311,7 @@ test("refusal proof 12a: SIGKILL after the FINAL is deleted; resuming deletes th
   await allGone(w, "after a later seal attempt");
 });
 
-test("refusal proof 12b: SIGKILL after the cleanup intent is deleted; resuming deletes the admission", { timeout: 180_000 }, async (t) => {
+test("refusal proof 12b: SIGKILL after the cleanup intent is deleted; resuming keeps the admission", { timeout: 180_000 }, async (t) => {
   const w = await refusalWorld(t, 1);
   const [h] = w.heads as [string];
   await crashRefusal(t, w, [{ op: "admit" }, refuse(h), { op: "seal", sha: w.cover }, { op: "cleanup", covering: w.cover }],

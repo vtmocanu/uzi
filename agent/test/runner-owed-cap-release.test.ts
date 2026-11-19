@@ -140,7 +140,7 @@ it("a cap-stopped failed run releases through the held V2 publication and FINAL"
   assert.equal(server.acked(), 1);
   assert.equal(server.holdOpen(), false);
   assert.equal(server.archiveReserves(), 0, "no archive was captured");
-  assert.deepEqual(refusalFiles().filter(n => n.startsWith("admission-")), [], "the acked generation's admission was deleted");
+  assert.ok(refusalFiles().includes(`admission-${claim.run_id}-1.json`), "the acked generation's admission is kept");
 });
 
 it("a below-cap failed run still sends its FINAL and writes no seal", opts, async () => {
@@ -355,7 +355,7 @@ it("a below-cap run's second terminal pass re-imports exactly as before", opts, 
   assert.equal((await directFetch(claim, work.clone!)).kind, "updated", "the generation was never fenced");
 });
 
-it("a below-cap release still sends its FINAL with 4200 admission files present, and deletes its own", opts, async () => {
+it("a below-cap release still sends its FINAL with 4200 admission files present, and keeps its own", opts, async () => {
   const { claim, server, work } = setup(44827, 64);
   const r = await runFailed(claim, work, () => {
     fs.mkdirSync(refusalDir(), { recursive: true, mode: 0o700 });
@@ -366,7 +366,7 @@ it("a below-cap release still sends its FINAL with 4200 admission files present,
   await redrive(r);
   assert.equal(server.finals.length, 1);
   assert.equal(server.acked(), 1);
-  assert.ok(!refusalFiles().includes(`admission-${claim.run_id}-1.json`), "this run's admission is deleted after the release");
+  assert.ok(refusalFiles().includes(`admission-${claim.run_id}-1.json`), "this run's admission is kept after the release");
   assert.ok(refusalFiles().filter(n => n.startsWith("admission-")).length >= 4200, "other runs' admissions stay");
 });
 
@@ -500,4 +500,18 @@ it("after the cap transfer a re-import of a new head is refused by the fence, no
   assert.equal(command(bare(), ["for-each-ref", "refs/"]), refsBefore, "no new stage or ref");
   assert.ok(!ledgerBefore.includes(fresh));
   void server;
+});
+
+it("F4: a successful terminal re-pin that lands exactly at the cap closes the fence and the second pass re-proves", opts, async t => {
+  const { claim, server, work } = setup(44830, 3);
+  let results: (string | null)[] = [];
+  const r = await runFailed(claim, work, undefined, runner => { results = spyTransfer(t, runner); });
+  assert.equal(command(bare(), ["for-each-ref", "refs/uzi-owed/"]).split("\n").length, 3, "the terminal import succeeded and filled the cap");
+  assert.ok(results.length >= 2 && results.every(h => h !== null && h === results[0]), "the second pass returned the first pass's head");
+  await redrive(r);
+  assert.equal(server.acked(), 1, "the provenance-gated release still completes");
+  const refsBefore = command(bare(), ["for-each-ref", "refs/"]);
+  commit(work.clone!, "after-the-successful-pin.txt");
+  assert.deepEqual(await directFetch(claim, work.clone!), { kind: "not_updated", reason: "ownership_unknown" }, "fenced");
+  assert.equal(command(bare(), ["for-each-ref", "refs/"]), refsBefore, "no stage was created");
 });

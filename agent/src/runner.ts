@@ -23371,6 +23371,19 @@ export class RunRunner {
       runLog.warn("recovery: settle transfer — run HEAD does not match the proved fetched candidate");
       return null;
     }
+    // issue #4481: a run at the cap, or with refusal evidence, releases only through the provenance gate even
+    // when this fetch succeeded (a re-pin of an already-held head). The fence closes, the second terminal pass
+    // re-proves instead of re-importing, and an ineligible gate retains custody. Ordinary below-cap runs
+    // (gate none) take the unchanged path below.
+    if (generation >= 1) {
+      const gate = await this.git.refusalReleaseGate(barePath, runId, generation, head);
+      check();
+      if (gate.kind !== "none") {
+        this.closeRefusalFence(runId, generation);
+        flight.terminalTransfer = { generation, head };
+        return await this.transferAtOwedCap(runLog, barePath, worktreePath, runId, generation, head, check);
+      }
+    }
     // Durably anchor the exact verified head under a run+generation-scoped pin ref, so it stays
     // referenced through bundle production / journal handoff even if another run moves the branch
     // tracking ref afterward. A false anchor (the object is absent in the bare, or the update

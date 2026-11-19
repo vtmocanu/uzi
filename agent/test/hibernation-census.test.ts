@@ -473,7 +473,7 @@ it("issue 4481: refusal records and run-attributed incoming refs protect a bare;
   put("repos/rec.git/info/uzi-refusals/refusals-run.json", "{}");
   dir("repos/emptyrec.git/info/uzi-refusals");
   put("repos/adm.git/info/uzi-refusals/admission-run-1.json", "{}");
-  for (const n of ["final-run-1.json", "cleanup-run-1.json", ".tmp-x"]) put(`repos/ev-${n.replace(/\W/g, "")}.git/info/uzi-refusals/${n}`, "{}");
+  for (const n of ["final-run-1.json", "cleanup-run-1.json", "incomplete-run.json", ".tmp-x"]) put(`repos/ev-${n.replace(/\W/g, "")}.git/info/uzi-refusals/${n}`, "{}");
   put("repos/nest.git/refs/uzi-incoming/run/3/refused-abc", `${TIP}\n`);
   put("repos/nestp.git/packed-refs", `${TIP} refs/uzi-incoming/run/3/refused-abc\n`);
   put("repos/flat.git/refs/uzi-incoming/0b1c2d3e-aaaa-bbbb-cccc-444444444444", `${TIP}\n`);
@@ -483,7 +483,7 @@ it("issue 4481: refusal records and run-attributed incoming refs protect a bare;
   assert.equal(byPath(result, "repos/rec.git")?.detail, "refusal_records");
   assert.equal(byPath(result, "repos/nest.git")?.detail, "recovery_refs");
   assert.equal(byPath(result, "repos/nestp.git")?.detail, "recovery_refs");
-  for (const p of ["repos/ev-finalrun1json.git", "repos/ev-cleanuprun1json.git", "repos/ev-tmpx.git"]) assert.equal(byPath(result, p)?.detail, "refusal_records", p);
+  for (const p of ["repos/ev-finalrun1json.git", "repos/ev-cleanuprun1json.git", "repos/ev-incompleterunjson.git", "repos/ev-tmpx.git"]) assert.equal(byPath(result, p)?.detail, "refusal_records", p);
   for (const p of ["repos/adm.git", "repos/emptyrec.git", "repos/flat.git", "repos/flatp.git"]) assert.equal(byPath(result, p)?.classification, "disposable", p);
 });
 
