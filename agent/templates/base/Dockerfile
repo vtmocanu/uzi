@@ -31,8 +31,11 @@ WORKDIR /app
 # v2 subcommand plugin (`docker compose`), buildx the build plugin.
 # Retry apk on a transient Alpine-mirror blip (issue #739). 5 attempts, n*3s backoff;
 # the setpriv assertion stays outside the loop (it is not a network step).
-RUN n=0; until apk add --no-cache git bash tini curl xz tar setpriv docker-cli docker-cli-compose docker-cli-buildx; do n=$((n+1)); [ "$n" -ge 5 ] && { echo "apk add: giving up after $n attempts" >&2; exit 1; }; echo "apk add failed (attempt $n/5); retrying in $((n*3))s" >&2; sleep "$((n*3))"; done \
-    && /bin/setpriv --help 2>&1 | grep -q -- --reuid
+# acl (#4486): /usr/bin/getfacl is the managed-bare ACL observer the epoch proof runs by absolute path.
+RUN n=0; until apk add --no-cache git bash tini curl xz tar setpriv acl docker-cli docker-cli-compose docker-cli-buildx; do n=$((n+1)); [ "$n" -ge 5 ] && { echo "apk add: giving up after $n attempts" >&2; exit 1; }; echo "apk add failed (attempt $n/5); retrying in $((n*3))s" >&2; sleep "$((n*3))"; done \
+    && /bin/setpriv --help 2>&1 | grep -q -- --reuid \
+    && test -x /usr/bin/getfacl && /usr/bin/getfacl --version | grep -q '^getfacl ' \
+    && test -x /usr/bin/setfacl
 
 # Three runtime uids (PRD #51 A1 + PRD #1171 M1). `worker` (uid 10001) holds the run
 # credentials (join token, forge PAT, Anthropic token) and does all credentialed work;

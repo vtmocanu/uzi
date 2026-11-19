@@ -58,6 +58,7 @@ import { DiskGovernor } from "./cache-cap.js";
 import { sampleVolume } from "./stats.js";
 import { errMessage, runDirKey } from "./util.js";
 import { uidSplitActive } from "./runner-uid.js";
+import { probeRunnerGroupTrust, type ManagedBareGroupTrust } from "./runner-group-trust.js";
 import { resolveDockerWiring, dockerSidecarExpected, type DockerWiring } from "./docker-wiring.js";
 import { probeCodexRuntime } from "./codex/codex-runtime-probe.js";
 import { landlockProbeForMode, resolveCodexHarnessAvailability } from "./codex/codex-capability.js";
@@ -78,10 +79,13 @@ export function buildWorkerGitCache(
   /** issue #3404 M2: the production GitCache always asks the completion authority before a hooked
    *  effect; with no active transaction a hooked effect refuses before it runs. */
   authority: Pick<AuthorityRuntime, "hooks">,
+  /** The once-per-process runner-group probe result; absent means the allowance is off. */
+  managedBareGroupTrust?: ManagedBareGroupTrust,
 ): GitCache {
   return new GitCache(config.dataDir, log, undefined, {
     recoveryDecodedLimitBytes: config.recoveryDecodedLimitBytes,
     terminalRecordProtection,
+    managedBareGroupTrust,
     authority: authority.hooks,
     authorityRequired: true,
   });
@@ -699,10 +703,17 @@ async function mainBody(): Promise<void> {
   const memory = config.memoryGuard?.enabled
     ? new WorkerMemoryRuntime(config.memoryGuard, client, log, { secrets: [config.workerToken] })
     : undefined;
+  // Probed once per process, outside any epoch scope, before the authority runtime and GitCache are built (so the
+  // shutdown snapshot never sees an authority without its GitCache) and before
+  // runPodEpochShadow. Never throws; anything unproven yields state "off".
+  const managedBareGroupTrust = await probeRunnerGroupTrust();
+  log.info("managed_bare_group_trust", managedBareGroupTrust.state === "trusted"
+    ? { state: managedBareGroupTrust.state, gid: managedBareGroupTrust.gid }
+    : { state: managedBareGroupTrust.state, reason: managedBareGroupTrust.reason });
   // Issue #3404 M2 U3: the authority runtime over the W capability acquired at startup. Every
   // production path that reaches a hooked GitCache effect opens its transaction through it.
   const authority = new AuthorityRuntime({ lifetime: requireWorkerLifetime(), workerToken: config.workerToken, log });
-  const git = buildWorkerGitCache(config, log, (runId) => outbox.hasPhysicalTerminalProtection(runId), authority);
+  const git = buildWorkerGitCache(config, log, (runId) => outbox.hasPhysicalTerminalProtection(runId), authority, managedBareGroupTrust);
   shutdownAuthority = authority;
   shutdownGit = git;
   // issue #4066: every graceful exit below runs this barrier before its stop log (join, seal, drain, one decision).

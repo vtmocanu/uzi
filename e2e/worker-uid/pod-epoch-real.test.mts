@@ -9,6 +9,7 @@ import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
 import { entrypointFixture } from "./pod-epoch-entrypoint-fixture.mjs";
+import { commandRootCommand, runnerCommand } from "../../agent/src/runner-uid.js";
 
 const require = createRequire(import.meta.url);
 const { createRuntime } = require("../../agent/templates/pod-epoch-init.cjs");
@@ -1061,6 +1062,121 @@ test("pod epoch real retire scratch: a runner-uid racer swapping directories for
     if (out.result.kind === "removed") assert.equal(fs.existsSync(t.parent), false);
     else assert.equal(fs.existsSync(t.parent), true, "residue keeps the parent");
   } catch (e) { primary = e; throw e; } finally { await closeAfter(f, primary, () => t && dropTree(t)); }
+});
+
+// Issue #4486: a group-writable (setgid 2775) managed bare under the split. Everything is real: the worker child's
+// runner-group probe, the production bare and runner clone writers, the production proof and /usr/bin/getfacl (no
+// observer, getfacl or statfs seam). The root test process only builds directories and mutates the fixture between the
+// child's setup and prove ops; the runner identities are launched through the production wrapper argv.
+const SETPRIV_BIN = "/bin/setpriv";
+const CODEX_SESSION = 10004;
+const clean = { PATH: "/usr/bin:/bin" };
+function launch(w: { command: string; args: string[] }) {
+  return spawnSync(w.command, w.args, { env: clean, encoding: "utf8", timeout: 20000 });
+}
+function asWorker(argv: string[]) {
+  return launch({ command: SETPRIV_BIN, args: ["--reuid", String(WORKER_ID), "--regid", String(WORKER_ID), "--clear-groups", "--", ...argv] });
+}
+function asRunner(argv: string[]) { return launch(runnerCommand(argv[0]!, argv.slice(1), true)); }
+function asCommandRoot(argv: string[]) {
+  const saved = process.env.UZI_UID_SPLIT;
+  process.env.UZI_UID_SPLIT = "1";
+  try { return launch(commandRootCommand(argv[0]!, argv.slice(1))); }
+  finally { if (saved === undefined) delete process.env.UZI_UID_SPLIT; else process.env.UZI_UID_SPLIT = saved; }
+}
+const ACL_ENTRY = "u:10002:rwx";
+const listAcl = (target: string) => asWorker(["/usr/bin/getfacl", "--absolute-names", "--physical", "--skip-base", "--numeric", "--", target]);
+
+test("pod epoch real managed bare: a setgid 2775 bare is admitted under the real runner-group probe and getfacl, runner uids cannot write or set ACLs, and an ACL or a wrong group refuses the proof", { timeout: 200000 }, async () => {
+  const f = fixture();
+  const bases: string[] = [];
+  let primary: unknown;
+  try {
+    const owner = await retireOwner(f);
+    // The production layout under the split: the data dir and a setgid 2775 worker:worker repos root, a worker:runner 3775 runner root.
+    const make = async (beforeBare?: (repos: string) => void) => {
+      const base = fs.mkdtempSync("/data/managed-bare-"); bases.push(base);
+      fs.chmodSync(base, 0o755); fs.chownSync(base, WORKER_ID, WORKER_ID);
+      const repos = path.join(base, "repos"); fs.mkdirSync(repos); own(repos, WORKER_ID, WORKER_ID, 0o2775);
+      const runnerRoot = path.join(base, "runner"); fs.mkdirSync(runnerRoot); own(runnerRoot, WORKER_ID, RUNNER_ID, 0o3775);
+      beforeBare?.(repos);
+      const setup = await owner.ask({ op: "managed-bare-setup", dataDir: base }, 150000);
+      const detail = () => JSON.stringify(setup.trust) + "\nrunner status:\n" + setup.statuses.runner + "command status:\n" + setup.statuses.command;
+      assert.equal(setup.trust.state, "trusted", "the real probe in the image under the split must be trusted: " + detail());
+      assert.equal(setup.isIssued, true, "the trust is a value the probe issued");
+      assert.equal(setup.trust.gid, WORKER_ID);
+      assert.equal(setup.bareMode.toString(8), "2775", "a bare made under a setgid repos root with umask 002");
+      assert.equal(setup.bareGid, WORKER_ID); assert.equal(setup.bareUid, WORKER_ID);
+      return { base, repos, bare: setup.bare as string, dataDir: base };
+    };
+    const prove = (m: { dataDir: string }) => owner.ask({ op: "managed-bare-prove", dataDir: m.dataDir }, 150000);
+    const refused = async (label: string, m: { dataDir: string }) => {
+      const verdict = await prove(m);
+      assert.equal(verdict.proven, false, label + ": " + JSON.stringify(verdict));
+      assert.equal(verdict.reason, "completeness_unknown", label + ": " + JSON.stringify(verdict));
+      assert.equal(verdict.cloneExists, true, label + ": the proof deletes nothing");
+    };
+
+    // a. Admission, and (b) the runner identities cannot write into the objects directory.
+    const admitted = await make();
+    const verdict = await prove(admitted);
+    assert.deepEqual({ proven: verdict.proven, reason: verdict.reason }, { proven: true, reason: null }, JSON.stringify(verdict));
+    assert.equal(listAcl(admitted.bare).stdout, "", "the admitted bare carries no extended ACL");
+    for (const [label, run] of [["runner", asRunner], ["runner-cmd", asCommandRoot]] as const) {
+      for (const script of [`mkdir ${admitted.bare}/objects/zz`, `: > ${admitted.bare}/objects/zz-file`]) {
+        const r = run(["/bin/sh", "-c", `id -u; ${script}`]);
+        assert.equal(r.stdout.trim(), String(label === "runner" ? RUNNER_ID : CMD_ID), `${label}: the identity the operation ran as`);
+        assert.notEqual(r.status, 0, `${label}: ${script} must fail: ${r.stdout}${r.stderr}`);
+        assert.match(r.stderr, /Permission denied/, `${label}: ${script}: ${r.stderr}`);
+      }
+      assert.deepEqual(fs.readdirSync(path.join(admitted.bare, "objects")).filter(n => n.startsWith("zz")), [], label + " created nothing");
+    }
+
+    // c. An ACL keeps the allowance off: access ACL on a store path, a default ACL inherited from the repos root, and a
+    // non-inherited ACL on the repos root itself. Each starts from a fresh fixture, and the real getfacl is shown to see it.
+    const access = await make();
+    const set = asWorker(["/usr/bin/setfacl", "-m", ACL_ENTRY, path.join(access.bare, "objects")]);
+    assert.equal(set.status, 0, "the owner sets an ACL: " + set.stderr);
+    assert.match(listAcl(path.join(access.bare, "objects")).stdout, /user:10002:rwx/);
+    await refused("access ACL on objects", access);
+
+    const inherited = await make(repos => {
+      const r = asWorker(["/usr/bin/setfacl", "-d", "-m", ACL_ENTRY, repos]);
+      assert.equal(r.status, 0, "the owner sets a default ACL: " + r.stderr);
+    });
+    assert.match(listAcl(path.join(inherited.bare, "objects")).stdout, /user:10002:rwx/, "the bare inherited the ACL");
+    await refused("ACL inherited from the repos root", inherited);
+
+    const parent = await make();
+    const onRoot = asWorker(["/usr/bin/setfacl", "-m", ACL_ENTRY, parent.repos]);
+    assert.equal(onRoot.status, 0, "the owner sets an ACL on the repos root: " + onRoot.stderr);
+    assert.match(listAcl(parent.repos).stdout, /user:10002:rwx/);
+    assert.equal(listAcl(parent.bare).stdout, "", "the bare itself carries none");
+    await refused("ACL on the repos root", parent);
+
+    // d. The runner identities cannot set an ACL; the owner can, which also proves the tooling and the filesystem work.
+    const target = await make();
+    for (const [label, run] of [["runner", asRunner], ["runner-cmd", asCommandRoot]] as const) {
+      const r = run(["/bin/sh", "-c", `id -u; /usr/bin/setfacl -m ${ACL_ENTRY} ${target.bare}`]);
+      assert.equal(r.stdout.trim(), String(label === "runner" ? RUNNER_ID : CMD_ID), `${label}: the identity the operation ran as`);
+      assert.notEqual(r.status, 0, `${label} setfacl must fail: ${r.stdout}${r.stderr}`);
+      assert.match(r.stderr, /Operation not permitted/, `${label}: ${r.stderr}`);
+    }
+    assert.equal(listAcl(target.bare).stdout, "", "no runner ACL landed");
+    const control = asWorker(["/usr/bin/setfacl", "-m", ACL_ENTRY, target.bare]);
+    assert.equal(control.status, 0, "control: the owner sets the same ACL (setfacl and ACL support are required): " + control.stderr);
+    assert.match(listAcl(target.bare).stdout, /user:10002:rwx/, "control: the ACL is observable");
+
+    // e. A bare of the wrong group at 2775 is refused: the runner group and the codex-session group.
+    for (const gid of [RUNNER_ID, CMD_ID, CODEX_SESSION]) {
+      const wrong = await make();
+      own(wrong.bare, WORKER_ID, gid, 0o2775);
+      assert.equal(fs.statSync(wrong.bare).mode & 0o7777, 0o2775);
+      await refused(`bare of group ${gid}`, wrong);
+    }
+  } catch (e) { primary = e; throw e; } finally {
+    await closeAfter(f, primary, () => { for (const b of bases) dropTree({ base: b } as RetireTree); });
+  }
 });
 
 test("pod epoch real retire scratch: another uid owning the root or the parent is refused with nothing launched", { timeout: 150000 }, async () => {

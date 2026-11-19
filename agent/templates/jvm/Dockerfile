@@ -20,8 +20,11 @@ WORKDIR /app
 # NO dockerd, inert without a wired daemon (DOCKER_HOST not baked). MIRRORED from
 # templates/base (jvm is NOT `FROM base`; keep in lockstep).
 # Retry apk on a transient Alpine-mirror blip (issue #739); see templates/base for rationale.
-RUN n=0; until apk add --no-cache git bash tini curl xz tar openjdk17 setpriv docker-cli docker-cli-compose docker-cli-buildx; do n=$((n+1)); [ "$n" -ge 5 ] && { echo "apk add: giving up after $n attempts" >&2; exit 1; }; echo "apk add failed (attempt $n/5); retrying in $((n*3))s" >&2; sleep "$((n*3))"; done \
-    && /bin/setpriv --help 2>&1 | grep -q -- --reuid
+# acl (#4486): /usr/bin/getfacl is the managed-bare ACL observer the epoch proof runs by absolute path.
+RUN n=0; until apk add --no-cache git bash tini curl xz tar openjdk17 setpriv acl docker-cli docker-cli-compose docker-cli-buildx; do n=$((n+1)); [ "$n" -ge 5 ] && { echo "apk add: giving up after $n attempts" >&2; exit 1; }; echo "apk add failed (attempt $n/5); retrying in $((n*3))s" >&2; sleep "$((n*3))"; done \
+    && /bin/setpriv --help 2>&1 | grep -q -- --reuid \
+    && test -x /usr/bin/getfacl && /usr/bin/getfacl --version | grep -q '^getfacl ' \
+    && test -x /usr/bin/setfacl
 
 # JAVA_HOME + PATH so `java`/`javac` and Maven/Gradle wrappers resolve for the
 # agent's Bash tool. Alpine installs openjdk17 under this fixed prefix.

@@ -2009,3 +2009,172 @@ supervisor spawn and confirmed disposal by run ID, PID and start
 time. These records are diagnostic only. The observed occurrence supports the
 snapshot-race explanation but does not establish which claim spawned its
 supervisor.
+
+## Amendment 2026-11-19: group-writable managed bare under runner-group trust (#4486)
+
+Under the uid split, the worker runs with umask `002`. On a setgid data volume, its managed bare
+repositories are therefore `2775` worker:worker. The automatic content proof's `topology()` refused
+every group-writable managed bare (`unowned alternate store`). As a result, neither pod-epoch attempt
+reclaim nor the hibernation census could prove these clones. This amendment admits group write only
+under the trust contract below. Every other refusal is unchanged.
+
+### P1: process-level runner-group trust
+
+`agent/src/runner-group-trust.ts` probes once per worker process at startup, outside any epoch
+scope and before the GitCache is built. It spawns `/bin/cat /proc/self/status` through
+`runnerCommand` and through `commandRootCommand`. Trust holds only when all of these are true:
+
+- **Worker identity:** the worker is uid and gid 10001, and that gid is not 10002, 10003 or 10004.
+- **Child identity:** both children exit 0. All four `Uid:` fields equal 10002 or 10003, and all
+  four `Gid:` fields equal that identity's primary gid.
+- **Group exclusion:** gid 10001 is absent from the `Gid:` and `Groups:` lines.
+- **Capabilities:** `CapEff`, `CapPrm`, `CapInh` and `CapAmb` are 0, `CapBnd` is 0 or 0xc0, and
+  `NoNewPrivs` is 1.
+
+Any other outcome leaves the allowance off for the process. That includes single-uid, a spawn error,
+a timeout and unparsable output. The probe never throws, and it adds no startup-fatal path. It
+measures the actual effect of `setpriv --init-groups` on the pod `fsGroup`.
+
+### P2: every untrusted spawn goes through the launcher (static audit)
+
+P2 is a static invariant pinned by the runner-uid wrapper tests, not runtime evidence. The audit
+below is exhaustive for in-tree, non-test TypeScript and `.mjs` under `agent/src` at `6ac884bd7`. It
+was assembled from four sources:
+
+- `git grep -n child_process` over `agent/src`.
+- A spawn-family call pattern (`spawn`, `spawnSync`, `execFile`, `execFileSync`, `execSync`, `fork`,
+  `nodeSpawn`, `execFileAsync`, `.spawn(`, `promisify(`).
+- A sweep for the wrapper callers.
+- A trace of the git.ts helpers (`execScoped`, `runGitAsRunner`, `spawnGit`,
+  `spawnJoinedEpochChild`).
+
+Class (a) is a worker-trusted launch of a trusted binary. Class (b) is an untrusted surface.
+
+| Site | Launches | Class | Wrapper |
+|---|---|---|---|
+| `runner-uid.ts` `runnerSpawn` | any runner command; callers `sdk-spawn.ts` `spawnDetached` (the SDK CLI for every executor) and `env-probe.ts` `spawnRunnerProbe` | b | `runnerCommand` |
+| `env-probe.ts` `spawnRunnerProbe` | run-start environment probe as the runner | b | `runnerSpawn` (`runnerCommand`) |
+| `runner-uid.ts` kill helpers | `setpriv … kill` | a | `setprivArgsForUid` |
+| `provision.ts` `defaultRun` | devbox/nix, provision hooks | b | `runnerCommand` |
+| `provision.ts` `defaultPathProbe` | fixed worker-authored PATH probe script | a | identity chosen by the caller |
+| `js-deps.ts` `execInstall` | npm/pnpm/yarn install | b | `runnerCommand`, checked by `canonicalInstall` |
+| `self-improve.ts` check runner | agent-authored check command | b | `runnerCommand` |
+| `executor.ts` `readWorktreeHeadSha`, `StubExecutor.git` | git in the runner clone | b | `runnerCommand` |
+| `tick-spawner.ts` boundary spawn | boundary argv | b for identity `command`, a for `worker_pat` | `runnerCommand` |
+| `run-quiescence.ts` helper spawns | quiescence helpers | b | the caller's `wrap`, `runnerCommand` by default |
+| `rmtree.ts`, `run-procs.ts` helpers | worker-authored scripts run as the agent uids | a | `runnerCommand` / `commandRootCommand` |
+| `codex/launcher.ts` | supervisor and the Codex provider, setup, command and effect roots | b | `runnerCommand` / `commandRootCommand` / `workerBoundaryCommand` |
+| `codex/codex-capability.ts`, `authority-lock.ts`, `dind-*prune.ts`, `hibernation-cache-prune.ts`, `codex/launcher.ts` `id -u` | fixed trusted binaries | a | none |
+| `git.ts` `runGitAsRunner` / `runGitAsRunnerBytes` / `spawnGitAsRunnerWithStdin` | runner git; cwd is always a clone or worktree | b | `runnerCommand` |
+| `git.ts` `execScoped` / `execMeteredNative` / `spawnJoinedEpochChild` | argv supplied by the caller | set by the caller | the caller wraps; the epoch path is also checked by `preflightEpochNative` |
+| `git.ts` `spawnGit` and the worker `execScoped` callers | worker git on a bare or worker path; gitleaks | a | none |
+| eval and replay CLIs (`pr-description-eval*`, `code-cross-check-replay*`) | npm-script tooling, not on the worker run path | — | none |
+| `runner-group-trust.ts` P1 probe | `/bin/cat` of its own status file, once at startup | a (worker-authored fixed binary, run as the agent uids) | `runnerCommand` / `commandRootCommand` |
+
+The audit table was taken at `6ac884bd7`, plus the last row, which this amendment adds. The audit found no class (b) site that bypasses a wrapper on the split path. One residual is
+accepted for a static P2. `execScoped`, `execMeteredNative` and `spawnJoinedEpochChild` take an
+arbitrary command and rely on the caller to wrap it. Outside the epoch preflight, no guard would
+catch a future unwrapped untrusted launch.
+
+Creation invariant (runner access to the bare):
+
+- **Runner access to the bare is read-only.** Only two runner launches reference a managed bare:
+  the git.ts seed and attempt `clone --shared --no-checkout -- <bare> <clone>`. Both read the bare
+  and write only the clone, whose `objects/info/alternates` names the bare.
+- **Other runner git stays in the clone.** Every other runner git runs with the clone or worktree as
+  its cwd.
+- **The bare is worker-built.** Bare creation, config and fetch all run as the worker uid
+  (`clone --bare`, `config`, `fetch`).
+
+### P3: no untrusted container mounts `/data/repos`
+
+ADR-3153 pins this with `TestDindContainersMountOnlyTheRunnerSubPathOfTheDataVolume`. The rootful
+DinD daemon's reach remains the accepted #3831 residual.
+
+### The `topology()` allowance: S1 to S4
+
+The allowance applies per managed store in the alternate graph. Only the issued probe result counts:
+the consumer accepts a value only if the module issued it (a `WeakSet`).
+
+- **S1, store ownership and mode.** A wrong uid or a world-writable store is refused, unchanged. A
+  store that is not group-writable is admitted whatever its gid, unchanged. A group-writable store
+  needs issued trusted trust, `process.getgid()` equal to the trust gid (re-checked at use), and a
+  store gid equal to the trust gid. Otherwise the refusal is `unowned alternate store`.
+- **S3, ancestors.** Runs in both passes and uses `lstat` only. Every ancestor from the repos root up
+  to and including the data dir must be a directory, owned by the worker uid or 0, and not
+  world-writable (sticky is no mitigation). It may be group-writable only with the trusted gid.
+- **S4, `core.sharedRepository`.** Runs in both passes. Under the allowance it is refused: a byte scan
+  in the topology-only pass, a key check in the full pass.
+- **S2, bare tree, filesystem and ACLs.** Runs in full passes only, after the topology walk and before
+  content:
+  - a bounded walk of the whole bare tree, charged against the existing limits (an overflow is
+    unknown), where every path passes the S1 predicate;
+  - `statfs` of the bare and its ancestors must report ext4, xfs, btrfs, tmpfs or overlay;
+  - an ACL observation by `/usr/bin/getfacl --absolute-names --physical --skip-base --numeric --
+    <paths>`, in chunks of 512 paths with the ancestors in every chunk. It runs as the worker with
+    `PATH=/usr/bin:/bin` and `LC_ALL=C`, through a new audited epoch-native launch shape. Any output,
+    error, timeout or missing binary is unknown.
+
+Every full snapshot re-runs all of this, including the final store re-check. A proof takes 3 full
+snapshots, and any metadata change between snapshots is refused.
+
+### Fail-closed mapping
+
+Every refusal is the existing unknown (`AutomaticCompletenessUnknown`). It flows through the unchanged
+settlement-uncertain and fatal policy for the discard, and to `completeness_unknown` in the
+hibernation census. Nothing becomes a keep or an admission.
+
+### Image and rollout
+
+The base and jvm images install Alpine `acl` (`getfacl`, `setfacl`; `getfacl 2.3.2`), with a
+fail-closed build assert. `scripts/agent-runtime-key.sh` hashes the runtime stage, so the worker
+runtime key changes, the runtime image rebuilds, and the release worker-tag autobump rolls the fleet.
+A worker on an older image has no `getfacl`, so group-writable bares stay refused (unknown), as today.
+
+A pod-epoch-real case proves, in both images, admission under the real probe and the real `getfacl`.
+It also proves that runner (10002) and runner-cmd (10003) get `EACCES` in `<bare>/objects` and `EPERM`
+on `setfacl`, that an access ACL on the store, an inherited default ACL and a non-inherited ACL on the
+repos root each refuse, and that a `chgrp` to 10002, 10003 or 10004 at `2775` refuses.
+
+### Feasibility
+
+Measured in the base image with the real `getfacl`, on a full-history bare of this repository: 65,055
+packed objects in a pack of 173,397 KiB (about 170 MiB), plus 3,000 loose objects, 2775 gid 10001,
+real probe trusted.
+
+- **Paths and calls:** 3,293 walked paths per snapshot, in 7 `getfacl` calls (21 per proof).
+- **`getfacl` time:** 114 to 142 ms per snapshot. The slowest single call took 22 ms, against the
+  60 s per-call timeout.
+- **Whole proof:** about 53.2 s, against 51.1 s for a 0755 bare (n=3 each). Of the ~2.1 s
+  difference, `getfacl` accounts for ~0.4 s. The rest is attributed to the S2 walk, which this run
+  did not time; a host run of the walk measured about 0.5 s per snapshot.
+- **Limit usage per snapshot (same 3,000 loose objects):**
+  - The snapshot-wide directory-entry counter (host run) reached about 556 of
+    `maxDirectoryEntries` (16,384), about 3.4%. S2 lists the bare's whole tree, including the
+    objects root a second time and the refs, hooks and logs.
+  - The loose-leaf counter (host run) reached 6,000 of `maxMetadataRecords` (131,072), about 4.6%,
+    because loose objects are charged twice.
+  - The physical-object occurrence count, derived from `count-objects` rather than logged, predates
+    this change. It is the tightest of these record and entry counters: about 68,000 of the same
+    131,072 cap, about 52%.
+  - The per-snapshot content byte budget (`maxObjectStoreBytes`, 4 GiB) is closer still. S2 charges
+    it only for path and name bytes (under 1 MB here), not for object content. A derived lower bound for this bare is about 77% (the summed logical size of
+    the objects reachable from HEAD); it was not measured.
+
+Cost scales with paths. This is one measured point, not a worst case.
+
+### Residuals
+
+- A trusted operator's ACL or `chmod` change on the store or its ancestors after the proof is not
+  excluded.
+- The data dir's parent is not checked (S3 stops at the data dir).
+- The rootful DinD daemon's reach stays the accepted #3831 residual.
+- A failed probe turns the allowance off for the process lifetime.
+- P2 rests on the static audit and the runner-uid wrapper tests, not on runtime evidence.
+- `statfs` covers only the bare top and its ancestors, not a mount nested inside the bare. Creating
+  one needs a mount privilege the runner lacks.
+- For group-writable stores, loose objects are charged twice against the limits. This halves their
+  effective budget and fails closed.
+- Inherited gap, unchanged by this change by design ("keep today's admitted shapes"): the inner
+  directories of a non-group-writable bare are still not mode-checked, as before. It is filed
+  separately as an incidental finding.

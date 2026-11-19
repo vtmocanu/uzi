@@ -12,7 +12,7 @@ import { nullLogger } from "./helpers.js";
 
 test("startup uses the live worker GitCache factory", () => {
   const main = fs.readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
-  assert.match(main, /const git = buildWorkerGitCache\(config, log, \(runId\) => outbox\.hasPhysicalTerminalProtection\(runId\), authority\)/);
+  assert.match(main, /const git = buildWorkerGitCache\(config, log, \(runId\) => outbox\.hasPhysicalTerminalProtection\(runId\), authority, managedBareGroupTrust\)/);
   assert.equal((main.match(/new GitCache\(/g) ?? []).length, 1);
 });
 

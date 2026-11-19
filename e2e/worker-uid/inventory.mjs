@@ -30,6 +30,7 @@ const epochLeaves = [
   'pod epoch real retire scratch: the helper child sees only the clone pin at fd 3 and the EX lock at fd 4 and cannot reopen the worker-private parent',
   'pod epoch real retire scratch: a worker killed mid-helper leaves the binding at removing, so a successor keeps the parent and removes nothing',
   'pod epoch real retire scratch: a runner-uid racer swapping directories for outward symlinks while the helper walks a large tree never causes a deletion outside the clone',
+  'pod epoch real managed bare: a setgid 2775 bare is admitted under the real runner-group probe and getfacl, runner uids cannot write or set ACLs, and an ACL or a wrong group refuses the proof',
   'pod epoch real retire scratch: another uid owning the root or the parent is refused with nothing launched',
 ];
 // Issue #3907: the one lane whose container leaves /nix unmasked (a labelled named volume), so the
