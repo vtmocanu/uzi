@@ -80,7 +80,7 @@ export function TokenPicker({
   id,
   disabled = false,
   className = "",
-  inheritLabel = "Inherit the worker's token",
+  inheritLabel = "Default · worker's token (worker binding)",
 }: {
   value: CredentialSelection;
   onChange: (next: CredentialSelection) => void;
