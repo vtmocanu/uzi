@@ -132,6 +132,9 @@ can be edited and reset but never removed.
   overrides it. ResourceQuota is advisory only: an edit that does not fit shows a
   warning but saves, a quota of zero is accepted, and quota values the api cannot
   read show as "quota check unavailable", never as unlimited or as fitting.
+  The docker tier's check counts only the worker container's requests, not the
+  DinD sidecars', so it always also shows "quota check unavailable"
+  (incomplete): no exceeded warning there does not mean the pod fits.
 - **Read-only until supported.** The editor stays read-only, and saves are refused
   with `409`, until the controller advertises support on a fresh status report. On
   a rolling upgrade the api rolls first, so the card unlocks once the new controller
