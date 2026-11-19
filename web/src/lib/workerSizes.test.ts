@@ -137,10 +137,17 @@ describe("human units", () => {
     expect([memoryQuantity(4096), memoryQuantity(1536), memoryQuantity(512)]).toEqual(["4Gi", "1536Mi", "512Mi"]);
   });
 
-  it("parses cores to millicores, rounding to an integer", () => {
+  it("parses cores to exact millicores, refusing more than 3 decimal places rather than rounding", () => {
     expect(parseCores("0.25")).toEqual({ ok: true, value: 250 });
+    expect(parseCores("4")).toEqual({ ok: true, value: 4000 });
     expect(parseCores(" 4 ")).toEqual({ ok: true, value: 4000 });
-    expect(parseCores("1.0005")).toEqual({ ok: true, value: 1001 });
+    expect(parseCores("0.001")).toEqual({ ok: true, value: 1 });
+    // 0.1 + 0.2 style float drift cannot reach the digit-string parse.
+    expect(parseCores("4.105")).toEqual({ ok: true, value: 4105 });
+    const tooFine = { ok: false, error: "Use at most 3 decimal places (millicores)" };
+    expect(parseCores("1.0005")).toEqual(tooFine);
+    expect(parseCores("0.0005")).toEqual(tooFine);
+    expect(parseCores("0.000")).toEqual({ ok: false, error: "Must be more than 0 CPU" });
     expect(parseCores("0").ok).toBe(false);
     expect(parseCores("-1").ok).toBe(false);
     expect(parseCores("two").ok).toBe(false);
@@ -151,7 +158,12 @@ describe("human units", () => {
     expect(parseMemoryGiB("1.5")).toEqual({ ok: true, value: 1536 });
     expect(parseMemoryGiB("32")).toEqual({ ok: true, value: 32768 });
     expect(parseMemoryGiB("0.9765625")).toEqual({ ok: true, value: 1000 });
+    expect(parseMemoryGiB("0.0009765625")).toEqual({ ok: true, value: 1 });
     expect(parseMemoryGiB("0.1")).toEqual({ ok: false, error: "Must be a whole number of MiB (GiB × 1024)" });
+    // Exact, not within a float tolerance: this used to save as 1024.
+    expect(parseMemoryGiB("1.0000000001")).toEqual({ ok: false, error: "Must be a whole number of MiB (GiB × 1024)" });
+    expect(parseMemoryGiB("1.50000000000")).toEqual({ ok: false, error: "Must be a whole number of MiB (GiB × 1024)" }); // > 10 places
+    expect(parseMemoryGiB("1.5000000000")).toEqual({ ok: true, value: 1536 });
     expect(parseMemoryGiB("0").ok).toBe(false);
     expect(parseMemoryGiB("1e3").ok).toBe(false);
   });

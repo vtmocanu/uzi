@@ -45,10 +45,53 @@ describe("mock admin worker sizes", () => {
     const m = (await api.getAdminWorkerSizes()).sizes.find((s) => s.name === "m")!;
     await expect(api.updateAdminWorkerSize("m", { ...m, memory_limit_mib: 40960 })).rejects.toMatchObject({
       status: 400,
-      body: { fields: { memory_limit_mib: expect.stringContaining("32768") } },
+      body: { fields: { memory_limit_mib: "memory limit 40960 MiB exceeds the 32768 MiB ceiling (workers.limitRange.max.memory)" } },
     });
     const lowered = await api.updateAdminWorkerSize("m", { ...m, data_gib: 20 });
     expect(lowered.warnings.map((w) => [w.kind, w.field])).toEqual([["disk_lowered", "data_gib"]]);
+  });
+
+  it("spells every field error and warning exactly as the api's workersize.Validate does", async () => {
+    const api = await fresh();
+    const l = (await api.getAdminWorkerSizes()).sizes.find((s) => s.name === "l")!;
+    const fieldsOf = async (spec: Partial<typeof l>) => {
+      try {
+        await api.updateAdminWorkerSize("l", { ...l, ...spec });
+      } catch (err) {
+        return (err as { body: { fields: Record<string, string> } }).body.fields;
+      }
+      throw new Error("expected a refusal");
+    };
+    expect(await fieldsOf({ cpu_request_millicores: 3000, cpu_limit_millicores: 2000 })).toEqual({
+      cpu_request_millicores: "cpu request 3000 millicores exceeds the cpu limit of 2000 millicores",
+    });
+    expect(await fieldsOf({ memory_request_mib: 30000, memory_limit_mib: 20000 })).toEqual({
+      memory_request_mib: "memory request 30000 MiB exceeds the memory limit of 20000 MiB",
+    });
+    expect(await fieldsOf({ cpu_limit_millicores: 8000, dind_data_gib: 60 })).toEqual({
+      cpu_limit_millicores: "cpu limit 8000 millicores exceeds the 4000 millicores ceiling (workers.limitRange.max.cpu)",
+      dind_data_gib: "dind data disk 60 GiB exceeds the 50 GiB ceiling (workers.docker.limitRange.maxPVCStorage)",
+    });
+    expect(await fieldsOf({ data_gib: 0, memory_limit_mib: 600000 })).toEqual({
+      data_gib: "must be greater than 0 GiB",
+      memory_limit_mib: "600000 MiB exceeds the absolute maximum of 524288 MiB",
+    });
+    const lowered = await api.updateAdminWorkerSize("l", { ...l, dind_data_gib: 30 });
+    expect(lowered.warnings).toEqual([
+      { kind: "disk_lowered", field: "dind_data_gib", message: "dind data disk lowered from 50 GiB to 30 GiB: existing claims keep their size; only new claims use the lower value" },
+    ]);
+  });
+
+  it("?mock=sizes-readonly serves a read-only list and refuses every write with the api's 409", async () => {
+    localStorage.setItem("uzi_mock_scenario", "sizes-readonly");
+    const api = await fresh();
+    const got = await api.getAdminWorkerSizes();
+    const reason = "The controller does not support admin worker sizes yet (upgrade it); edits would be ignored.";
+    expect(got).toMatchObject({ editable: false, read_only_code: "controller_unsupported", read_only_reason: reason });
+    const l = got.sizes.find((s) => s.name === "l")!;
+    const refusal = { status: 409, body: { error: `worker sizes are read-only: ${reason}`, reason: "controller_unsupported", read_only_reason: reason } };
+    await expect(api.updateAdminWorkerSize("l", { ...l, data_gib: 40 })).rejects.toMatchObject(refusal);
+    await expect(api.resetAdminWorkerSize("l")).rejects.toMatchObject(refusal);
   });
 
   it("rejects provisioning a size the list does not have", async () => {

@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import { Link } from "react-router-dom";
 import {
   api,
@@ -12,6 +12,7 @@ import {
 import { ApiError, errorMessage } from "../../lib/apiError";
 import { Alert, Badge, Button, Card, Input, SectionTitle, Skeleton, type BadgeTone } from "../../components/ui";
 import {
+  ABSOLUTE_MAX,
   cpuCores,
   memoryGiB,
   parseCores,
@@ -29,7 +30,7 @@ import {
 // removing sizes come later, so rows are keyed by name and actions are per row.
 //
 // The list itself is owned by AdminWorkers, which reads it once and re-reads it after every
-// successful write (onChanged), so the default-size selectors on the same page pick up an
+// successful write and after a 409 (onChanged), so the default-size selectors on the same page pick up an
 // edited quantity at once.
 
 type FieldKey = keyof WorkerSizeSpec;
@@ -51,7 +52,7 @@ const FIELDS: readonly FieldDef[] = [
   { key: "dind_data_gib", label: "DinD data disk", unit: "GiB", parse: parseDiskGiB, show: String },
 ];
 
-const HEAD = "px-2 py-2 font-medium sm:px-3";
+const HEAD = "px-1.5 py-2 font-medium sm:px-3";
 
 const FIELD_KEYS = new Set<string>(FIELDS.map((f) => f.key));
 
@@ -104,6 +105,42 @@ function ceilingsLine(c: WorkerSizeCeilings): string {
 
 type WriteResult = { name: string; verb: "saved" | "reset to shipped values"; warnings: WorkerSizeWarning[] };
 
+// "At most 4 cores (workers.limitRange.max.cpu)": a bound in the editor's own units.
+const coresWord = (millicores: number) => `${cpuCores(millicores)} ${millicores === 1000 ? "core" : "cores"}`;
+const ABSOLUTE_NOTE = "the api's absolute maximum";
+
+// The most a field may hold before the api refuses it, in the editor's units: the chart
+// ceiling that binds it (limits and disks only; a request is bounded by its limit), else
+// the api's absolute cap. Checked locally so a refusal names the bound before saving.
+function fieldBound(key: FieldKey, c: WorkerSizeCeilings): { max: number; message: string }[] {
+  const at = (max: number, text: string, path: string) => ({ max, message: `At most ${text} (${path})` });
+  const out: { max: number; message: string }[] = [];
+  switch (key) {
+    case "cpu_request_millicores":
+    case "cpu_limit_millicores":
+      out.push(at(ABSOLUTE_MAX.millicores, coresWord(ABSOLUTE_MAX.millicores), ABSOLUTE_NOTE));
+      if (key === "cpu_limit_millicores" && c.cpu_limit_millicores) {
+        out.push(at(c.cpu_limit_millicores.value, coresWord(c.cpu_limit_millicores.value), c.cpu_limit_millicores.chart_path));
+      }
+      break;
+    case "memory_request_mib":
+    case "memory_limit_mib":
+      out.push(at(ABSOLUTE_MAX.memoryMiB, `${memoryGiB(ABSOLUTE_MAX.memoryMiB)} GiB`, ABSOLUTE_NOTE));
+      if (key === "memory_limit_mib" && c.memory_limit_mib) {
+        out.push(at(c.memory_limit_mib.value, `${memoryGiB(c.memory_limit_mib.value)} GiB`, c.memory_limit_mib.chart_path));
+      }
+      break;
+    case "data_gib":
+    case "dind_data_gib": {
+      out.push(at(ABSOLUTE_MAX.diskGiB, `${ABSOLUTE_MAX.diskGiB} GiB`, ABSOLUTE_NOTE));
+      const ceiling = c[key];
+      if (ceiling) out.push(at(ceiling.value, `${ceiling.value} GiB`, ceiling.chart_path));
+      break;
+    }
+  }
+  return out;
+}
+
 export function WorkerSizesCard({
   data,
   loadError,
@@ -113,7 +150,7 @@ export function WorkerSizesCard({
   data: AdminWorkerSizes | null;
   /** The last read's error, "" when it succeeded. */
   loadError: string;
-  /** Re-read the list and lift it to the page; called after every successful write and by Retry. */
+  /** Re-read the list and lift it to the page; called after every successful write, on a 409 and by Retry. */
   onChanged: () => Promise<void>;
 }) {
   const [editing, setEditing] = useState<string | null>(null);
@@ -122,8 +159,38 @@ export function WorkerSizesCard({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [result, setResult] = useState<WriteResult | null>(null);
+  // The row whose Reset is waiting for Confirm / Keep.
+  const [confirming, setConfirming] = useState<string | null>(null);
   // A 409 on a write: the controller stopped advertising support after the list was read.
-  const [conflictReason, setConflictReason] = useState<string | null>(null);
+  // It holds only until the next list arrives (the 409 itself asks for one), which is then
+  // the authority on whether sizes are editable.
+  const [conflict, setConflict] = useState<{ reason: string; against: AdminWorkerSizes | null } | null>(null);
+  const conflictReason = conflict && conflict.against === data ? conflict.reason : null;
+
+  // Focus management: Edit focuses the form's first input; Save, Cancel, Escape, Reset and
+  // Keep hand focus back to that row's Edit button (looked up by size name, since the
+  // button re-mounts after the form closes or the list is re-read).
+  const editButtons = useRef(new Map<string, HTMLButtonElement>());
+  const firstInput = useRef<HTMLInputElement>(null);
+  const confirmButton = useRef<HTMLButtonElement>(null);
+  // Set alongside the state change that renders the target; focused once it is mounted.
+  const focusTarget = useRef<{ kind: "edit" | "form" | "confirm"; name: string } | null>(null);
+  const setFocusTarget = (t: { kind: "edit" | "form" | "confirm"; name: string }) => {
+    focusTarget.current = t;
+  };
+  useEffect(() => {
+    const t = focusTarget.current;
+    if (!t) return;
+    const el =
+      t.kind === "form" ? firstInput.current
+      : t.kind === "confirm" ? confirmButton.current
+      : (editButtons.current.get(t.name) ?? null);
+    // A button disabled while a write is in flight cannot take focus; try again once enabled.
+    if (el && !(el instanceof HTMLButtonElement && el.disabled)) {
+      el.focus();
+      focusTarget.current = null;
+    }
+  });
 
   if (!data) {
     return (
@@ -147,6 +214,7 @@ export function WorkerSizesCard({
   const readOnly = readOnlyReason !== null;
   const locked = readOnly || busy;
   const editingRow = data.sizes.find((s) => s.name === editing) ?? null;
+  const ceilings = data.ceilings;
 
   const startEdit = (row: AdminWorkerSize) => {
     setEditing(row.name);
@@ -154,28 +222,43 @@ export function WorkerSizesCard({
     setFieldErrors({});
     setError("");
     setResult(null);
+    setConfirming(null);
+    setFocusTarget({ kind: "form", name: row.name });
   };
-  const cancelEdit = () => {
+  const closeEdit = () => {
     setEditing(null);
     setDraft(null);
     setFieldErrors({});
+  };
+  const cancelEdit = () => {
+    if (editing) setFocusTarget({ kind: "edit", name: editing });
+    closeEdit();
     setError("");
   };
 
-  // Parse the whole draft; a field that cannot be an api integer reports why, locally.
+  // Parse the whole draft; a field that cannot be an api integer, or is above a bound the
+  // list already names, reports why locally, in the editor's units.
   const parsed = (() => {
     if (!draft) return null;
     const values: Partial<WorkerSizeSpec> = {};
     const errors: Record<string, string> = {};
     for (const f of FIELDS) {
       const p = f.parse(draft[f.key]);
-      if (p.ok) values[f.key] = p.value;
-      else errors[f.key] = p.error;
+      if (!p.ok) {
+        errors[f.key] = p.error;
+        continue;
+      }
+      values[f.key] = p.value;
+      // The tightest bound names the real limit (a chart ceiling is below the absolute cap).
+      const over = fieldBound(f.key, ceilings)
+        .sort((x, y) => x.max - y.max)
+        .find((bound) => p.value > bound.max);
+      if (over) errors[f.key] = over.message;
     }
-    if (values.cpu_request_millicores !== undefined && values.cpu_limit_millicores !== undefined && values.cpu_request_millicores > values.cpu_limit_millicores) {
+    if (!errors.cpu_request_millicores && !errors.cpu_limit_millicores && values.cpu_request_millicores! > values.cpu_limit_millicores!) {
       errors.cpu_request_millicores = "The request cannot be above the limit";
     }
-    if (values.memory_request_mib !== undefined && values.memory_limit_mib !== undefined && values.memory_request_mib > values.memory_limit_mib) {
+    if (!errors.memory_request_mib && !errors.memory_limit_mib && values.memory_request_mib! > values.memory_limit_mib!) {
       errors.memory_request_mib = "The request cannot be above the limit";
     }
     return { values, errors };
@@ -187,11 +270,13 @@ export function WorkerSizesCard({
     ((parsed.values.data_gib !== undefined && parsed.values.data_gib < editingRow.data_gib) ||
       (parsed.values.dind_data_gib !== undefined && parsed.values.dind_data_gib < editingRow.dind_data_gib));
 
-  // Map a refused write onto the editor: 409 → read-only, 400 fields → the inputs.
+  // Map a refused write onto the editor: 409 → read-only until the re-read it triggers
+  // lands; 400 fields → the inputs (each server message already names its chart path).
   const handleWriteError = (err: unknown, fallback: string, mapFields: boolean) => {
     if (err instanceof ApiError && err.status === 409) {
       const body = err.body as { read_only_reason?: string } | null;
-      setConflictReason(body?.read_only_reason || err.message);
+      setConflict({ reason: body?.read_only_reason || err.message, against: data });
+      void onChanged();
       return;
     }
     if (err instanceof ApiError && err.status === 400) {
@@ -200,7 +285,8 @@ export function WorkerSizesCard({
       const other = Object.entries(fields).filter(([k]) => !(mapFields && FIELD_KEYS.has(k)));
       if (known.length > 0) setFieldErrors(Object.fromEntries(known));
       const detail = other.map(([k, v]) => `${FIELDS.find((f) => f.key === k)?.label ?? k}: ${v}`).join("; ");
-      setError(detail ? `${err.message}. ${detail}` : err.message);
+      if (known.length > 0) setError(["Fix the highlighted fields and save again.", detail].filter(Boolean).join(" "));
+      else setError(detail ? `${err.message}. ${detail}` : err.message);
       return;
     }
     setError(errorMessage(err, fallback));
@@ -219,15 +305,25 @@ export function WorkerSizesCard({
     setBusy(true);
     try {
       const resp = await api.updateAdminWorkerSize(editingRow.name, parsed.values as WorkerSizeSpec);
-      setEditing(null);
-      setDraft(null);
+      closeEdit();
       setResult({ name: editingRow.name, verb: "saved", warnings: resp.warnings });
+      setFocusTarget({ kind: "edit", name: editingRow.name });
       await onChanged();
     } catch (err) {
       handleWriteError(err, `Failed to save size ${sizeLabel(editingRow.name)}`, true);
     } finally {
       setBusy(false);
     }
+  };
+
+  const askReset = (row: AdminWorkerSize) => {
+    if (locked) return;
+    setConfirming(row.name);
+    setFocusTarget({ kind: "confirm", name: row.name });
+  };
+  const keepRow = (name: string) => {
+    setConfirming(null);
+    setFocusTarget({ kind: "edit", name });
   };
 
   const reset = async (row: AdminWorkerSize) => {
@@ -238,13 +334,15 @@ export function WorkerSizesCard({
     setBusy(true);
     try {
       const resp = await api.resetAdminWorkerSize(row.name);
-      if (editing === row.name) cancelEdit();
+      if (editing === row.name) closeEdit();
       setResult({ name: row.name, verb: "reset to shipped values", warnings: resp.warnings });
+      setFocusTarget({ kind: "edit", name: row.name });
       await onChanged();
     } catch (err) {
       // A reset has no inputs to map onto, so every field error is spelled out in the alert.
       handleWriteError(err, `Failed to reset size ${sizeLabel(row.name)}`, false);
     } finally {
+      setConfirming(null);
       setBusy(false);
     }
   };
@@ -255,7 +353,8 @@ export function WorkerSizesCard({
   const orphanAdvisories = data.advisories.filter((a) => !data.sizes.some((s) => s.name === a.size));
   if (orphanAdvisories.length > 0) advisoriesBySize.push({ size: "", items: orphanAdvisories });
 
-  const tiers = data.ceilings.enabled_tiers;
+  const tiers = ceilings.enabled_tiers;
+  const editLabel = editingRow ? sizeLabel(editingRow.name) : "";
 
   return (
     <Card className="space-y-5">
@@ -266,11 +365,11 @@ export function WorkerSizesCard({
           Saving a CPU or memory change rolls every idle worker of that size once onto the new values, and a busy one
           when it goes idle. A disk-only change rolls nothing: claims grow in place.
         </p>
-        <p className="mt-2 text-sm text-muted">{ceilingsLine(data.ceilings)}</p>
+        <p className="mt-2 text-sm text-muted">{ceilingsLine(ceilings)}</p>
         {tiers && tiers.length > 0 && (
           <p className="mt-1 text-xs text-faint">Checked against the enabled worker tiers: {tiers.join(", ")}.</p>
         )}
-        {data.ceilings.dind_overridden && (
+        {ceilings.dind_overridden && (
           <p className="mt-1 text-xs text-faint">
             The DinD data disk is fixed for every size by <code className="font-mono text-fg">workers.docker.dindDataSize</code>, so
             the DinD value here is not used while that override is set.
@@ -285,122 +384,178 @@ export function WorkerSizesCard({
       {result?.warnings.map((w, i) => <Alert key={`${w.field}-${i}`} tone="warning" message={w.message} />)}
 
       <div className="space-y-2">
-      <p className="text-xs text-muted">Request / limit. CPU in cores; memory and disks in GiB.</p>
-      <div className="overflow-x-auto rounded-lg border border-edge">
-        <table className="w-full text-left text-sm">
-
-          <thead className="border-b border-edge text-muted">
-            <tr>
-              <th scope="col" className={HEAD}>Size</th>
-              <th scope="col" className={HEAD}>CPU <span className="sr-only">(cores, request / limit)</span></th>
-              <th scope="col" className={HEAD}>Memory <span className="sr-only">(GiB, request / limit)</span></th>
-              <th scope="col" className={HEAD}>Data <span className="sr-only">disk (GiB)</span></th>
-              <th scope="col" className={HEAD}>DinD <span className="sr-only">data disk (GiB)</span></th>
-              <th scope="col" className={HEAD}><span className="sr-only">Actions</span></th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-edge">
-            {data.sizes.map((row) => {
-              const label = sizeLabel(row.name);
-              const isEditing = editing === row.name && draft !== null;
-              const canReset = row.builtin && row.customized && row.shipped !== null;
-              return [
-                <tr key={row.name} className={isEditing ? "bg-raised/40" : undefined}>
-                  <th scope="row" className="px-2 py-2 align-top sm:px-3 font-medium text-fg">
-                    <div className="flex flex-col items-start gap-1 sm:flex-row sm:flex-wrap sm:items-center sm:gap-1.5">
-                      <span>{label}</span>
-                      {row.builtin && <Badge>Builtin</Badge>}
-                      {row.customized && <Badge tone="brand">Customized</Badge>}
-                    </div>
-                    {canReset && (
-                      <p className="mt-1 max-w-[16rem] text-xs font-normal text-faint">Shipped: {specSummary(row.shipped!)}</p>
-                    )}
-                  </th>
-                  <td className="whitespace-nowrap px-2 py-2 align-top tabular-nums sm:px-3">
-                    <span className="text-muted">{cpuCores(row.cpu_request_millicores)}</span>
-                    <span className="text-faint"> / </span>
-                    <span className="text-fg">{cpuCores(row.cpu_limit_millicores)}</span>
-                  </td>
-                  <td className="whitespace-nowrap px-2 py-2 align-top tabular-nums sm:px-3">
-                    <span className="text-muted">{memoryGiB(row.memory_request_mib)}</span>
-                    <span className="text-faint"> / </span>
-                    <span className="text-fg">{memoryGiB(row.memory_limit_mib)}</span>
-                  </td>
-                  <td className="px-2 py-2 align-top sm:px-3 tabular-nums text-fg">{row.data_gib}</td>
-                  <td className="px-2 py-2 align-top sm:px-3 tabular-nums text-fg">{row.dind_data_gib}</td>
-                  <td className="px-2 py-2 align-top sm:px-3">
-                    <div className="flex justify-end gap-2">
-                      {!isEditing && (
-                        <Button size="sm" variant="secondary" aria-label={`Edit size ${label}`} disabled={locked} onClick={() => startEdit(row)}>
-                          Edit
-                        </Button>
-                      )}
+        <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
+          <p className="text-xs text-muted">Request / limit. CPU in cores; memory and disks in GiB.</p>
+          {readOnly && <span className="text-xs text-faint">Read-only</span>}
+        </div>
+        {/* Actions live in the Size column, the one a narrow screen always shows, so the
+            table may scroll sideways without hiding what a row can do. */}
+        <div className="overflow-x-auto rounded-lg border border-edge">
+          <table className="w-full text-left text-xs sm:text-sm">
+            <thead className="border-b border-edge text-muted">
+              <tr>
+                <th scope="col" className={HEAD}>Size</th>
+                <th scope="col" className={HEAD}>CPU <span className="sr-only">(cores, request / limit)</span></th>
+                <th scope="col" className={HEAD}>Memory <span className="sr-only">(GiB, request / limit)</span></th>
+                <th scope="col" className={HEAD}>Data <span className="sr-only">disk (GiB)</span></th>
+                <th scope="col" className={HEAD}>DinD <span className="sr-only">data disk (GiB)</span></th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-edge">
+              {data.sizes.map((row) => {
+                const label = sizeLabel(row.name);
+                const isEditing = editing === row.name && draft !== null;
+                const canReset = row.builtin && row.customized && row.shipped !== null;
+                const isConfirming = confirming === row.name && canReset;
+                const resetLowers =
+                  !!row.shipped && (row.shipped.data_gib < row.data_gib || row.shipped.dind_data_gib < row.dind_data_gib);
+                return (
+                  <tr key={row.name} className={isEditing || isConfirming ? "bg-raised/40" : undefined}>
+                    <th scope="row" className="px-1.5 py-2 align-top font-medium text-fg sm:px-3">
+                      <div className="flex flex-col items-start gap-1 sm:flex-row sm:flex-wrap sm:items-center sm:gap-1.5">
+                        <span className="whitespace-nowrap">{label}</span>
+                        {row.builtin && <Badge>Builtin</Badge>}
+                        {row.customized && <Badge tone="brand">Customized</Badge>}
+                      </div>
                       {canReset && (
-                        <Button size="sm" variant="ghost" aria-label={`Reset size ${label} to shipped values`} disabled={locked} onClick={() => void reset(row)}>
-                          Reset
-                        </Button>
+                        <p className="mt-1 w-[8rem] text-xs font-normal text-faint sm:w-auto sm:max-w-[16rem]">
+                          Shipped: {specSummary(row.shipped!)}
+                        </p>
                       )}
-                    </div>
-                  </td>
-                </tr>,
-                isEditing && (
-                  <tr key={`${row.name}-edit`} className="bg-raised/40">
-                    <td colSpan={6} className="px-2 pb-4 pt-1 sm:px-3">
-                      <form onSubmit={save} noValidate aria-label={`Edit size ${label}`} className="space-y-3">
-                        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
-                          {FIELDS.map((f) => {
-                            const id = `worker-size-${row.name}-${f.key}`;
-                            const err = fieldErrors[f.key];
-                            return (
-                              <div key={f.key} className="space-y-1">
-                                <label htmlFor={id} className="block text-xs font-medium text-muted">
-                                  {f.label} ({f.unit})
-                                </label>
-                                <Input
-                                  id={id}
-                                  type="text"
-                                  inputMode={f.unit === "GiB" && f.key.startsWith("d") ? "numeric" : "decimal"}
-                                  aria-label={`${label} ${f.label} (${f.unit})`}
-                                  aria-invalid={err ? true : undefined}
-                                  aria-describedby={err ? `${id}-error` : undefined}
-                                  value={draft[f.key]}
-                                  disabled={locked}
-                                  onChange={(e) => {
-                                    setDraft({ ...draft, [f.key]: e.target.value });
-                                    if (err) setFieldErrors((prev) => withoutKey(prev, f.key));
-                                  }}
-                                  className="px-2.5 py-1.5 tabular-nums disabled:opacity-60 aria-invalid:border-danger/70"
-                                />
-                                {err && (
-                                  <p id={`${id}-error`} className="text-xs text-danger">
-                                    {err}
-                                  </p>
-                                )}
-                              </div>
-                            );
-                          })}
+                      {isConfirming ? (
+                        <div
+                          role="group"
+                          aria-label={`Confirm reset of size ${label}`}
+                          className="mt-2 w-[8rem] space-y-2 font-normal sm:w-auto sm:max-w-[16rem]"
+                          onKeyDown={(e) => {
+                            if (e.key === "Escape" && !busy) {
+                              e.stopPropagation();
+                              keepRow(row.name);
+                            }
+                          }}
+                        >
+                          <p className="text-xs text-fg">
+                            Reset {label} to shipped values?
+                            {resetLowers && " Existing workers keep their larger disk; only new workers get the smaller size."}
+                          </p>
+                          <div className="flex gap-2">
+                            <Button ref={confirmButton} size="sm" variant="secondary" disabled={locked} onClick={() => void reset(row)}>
+                              {busy ? "Resetting…" : "Confirm"}
+                            </Button>
+                            <Button size="sm" variant="ghost" disabled={busy} onClick={() => keepRow(row.name)}>
+                              Keep
+                            </Button>
+                          </div>
                         </div>
-                        {diskLowered && (
-                          <Alert tone="warning" message="Existing workers keep their larger disk; only new workers get the smaller size." />
-                        )}
-                        <div className="flex flex-wrap gap-2">
-                          <Button type="submit" size="sm" disabled={locked}>
-                            {busy ? "Saving…" : `Save size ${label}`}
-                          </Button>
-                          <Button type="button" size="sm" variant="ghost" onClick={cancelEdit} disabled={busy}>
-                            Cancel
-                          </Button>
-                        </div>
-                      </form>
+                      ) : (
+                        !readOnly &&
+                        !isEditing && (
+                          <div className="mt-2 flex gap-2 font-normal">
+                            <Button
+                              ref={(el) => {
+                                if (el) editButtons.current.set(row.name, el);
+                                else editButtons.current.delete(row.name);
+                              }}
+                              size="sm"
+                              variant="secondary"
+                              aria-label={`Edit size ${label}`}
+                              disabled={busy}
+                              onClick={() => startEdit(row)}
+                            >
+                              Edit
+                            </Button>
+                            {canReset && (
+                              <Button size="sm" variant="ghost" aria-label={`Reset size ${label} to shipped values`} disabled={busy} onClick={() => askReset(row)}>
+                                Reset
+                              </Button>
+                            )}
+                          </div>
+                        )
+                      )}
+                    </th>
+                    <td className="whitespace-nowrap px-1.5 py-2 align-top tabular-nums sm:px-3">
+                      <span className="text-muted">{cpuCores(row.cpu_request_millicores)}</span>
+                      <span className="text-faint"> / </span>
+                      <span className="text-fg">{cpuCores(row.cpu_limit_millicores)}</span>
                     </td>
+                    <td className="whitespace-nowrap px-1.5 py-2 align-top tabular-nums sm:px-3">
+                      <span className="text-muted">{memoryGiB(row.memory_request_mib)}</span>
+                      <span className="text-faint"> / </span>
+                      <span className="text-fg">{memoryGiB(row.memory_limit_mib)}</span>
+                    </td>
+                    <td className="px-1.5 py-2 align-top tabular-nums text-fg sm:px-3">{row.data_gib}</td>
+                    <td className="px-1.5 py-2 align-top tabular-nums text-fg sm:px-3">{row.dind_data_gib}</td>
                   </tr>
-                ),
-              ];
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* The edit form sits below the table, outside its sideways scroll, so every input
+          is on screen at any width. */}
+      {editingRow && draft && (
+        <form
+          onSubmit={save}
+          onKeyDown={(e) => {
+            if (e.key === "Escape" && !busy) {
+              e.preventDefault();
+              cancelEdit();
+            }
+          }}
+          noValidate
+          aria-label={`Edit size ${editLabel}`}
+          className="space-y-3 rounded-lg border border-edge bg-raised/40 p-3 sm:p-4"
+        >
+          <h3 className="text-sm font-medium text-fg">Edit size {editLabel}</h3>
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
+            {FIELDS.map((f, i) => {
+              const id = `worker-size-${editingRow.name}-${f.key}`;
+              const err = fieldErrors[f.key];
+              return (
+                <div key={f.key} className="space-y-1">
+                  <label htmlFor={id} className="block text-xs font-medium text-muted">
+                    {f.label} ({f.unit})
+                  </label>
+                  <Input
+                    ref={i === 0 ? firstInput : undefined}
+                    id={id}
+                    type="text"
+                    inputMode={f.unit === "GiB" && f.key.startsWith("d") ? "numeric" : "decimal"}
+                    aria-label={`${editLabel} ${f.label} (${f.unit})`}
+                    aria-invalid={err ? true : undefined}
+                    aria-describedby={err ? `${id}-error` : undefined}
+                    value={draft[f.key]}
+                    disabled={locked}
+                    onChange={(e) => {
+                      setDraft({ ...draft, [f.key]: e.target.value });
+                      if (err) setFieldErrors((prev) => withoutKey(prev, f.key));
+                    }}
+                    className="px-2.5 py-1.5 tabular-nums disabled:opacity-60 aria-invalid:border-danger/70"
+                  />
+                  {err && (
+                    <p id={`${id}-error`} className="text-xs text-danger">
+                      {err}
+                    </p>
+                  )}
+                </div>
+              );
             })}
-          </tbody>
-        </table>
-      </div>
-      </div>
+          </div>
+          {diskLowered && (
+            <Alert tone="warning" message="Existing workers keep their larger disk; only new workers get the smaller size." />
+          )}
+          <div className="flex flex-wrap gap-2">
+            <Button type="submit" size="sm" disabled={locked}>
+              {busy ? "Saving…" : `Save size ${editLabel}`}
+            </Button>
+            <Button type="button" size="sm" variant="ghost" onClick={cancelEdit} disabled={busy}>
+              Cancel
+            </Button>
+          </div>
+        </form>
+      )}
 
       {advisoriesBySize.length > 0 && (
         <div className="space-y-2">

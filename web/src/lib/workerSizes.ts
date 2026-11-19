@@ -102,29 +102,45 @@ export function sizeOptionLabel(size: NamedWorkerSize): string {
 /** A parsed human-unit input: the api integer, or the reason it cannot be one. */
 export type ParsedQuantity = { ok: true; value: number } | { ok: false; error: string };
 
-const DECIMAL = /^\d+(\.\d+)?$/;
+const DECIMAL = /^(\d+)(?:\.(\d+))?$/;
+
+// A typed decimal as an exact fraction whole/10^scale, from its digit string (never a
+// float, so "1.0005" cannot drift). null when the text is not a plain decimal.
+function decimalParts(text: string): { whole: bigint; scale: bigint; digits: number } | null {
+  const m = DECIMAL.exec(text.trim());
+  if (!m) return null;
+  const frac = m[2] ?? "";
+  return { whole: BigInt(m[1] + frac), scale: 10n ** BigInt(frac.length), digits: frac.length };
+}
+
+// The api integers stay far below 2^53; a value past it is refused by the absolute caps
+// (see ABSOLUTE_MAX) once converted, so this conversion never matters for a valid size.
+const toNumber = (n: bigint): number => Number(n);
 
 /**
- * CPU cores typed by an admin → millicores, ×1000 rounded to an integer ("0.25" → 250).
- * Only obvious errors are caught here; the api is authoritative on every bound.
+ * CPU cores typed by an admin → millicores, ×1000 exactly ("0.25" → 250). More than three
+ * decimal places is refused, never rounded: a millicore is the smallest unit the pod has.
  */
 export function parseCores(text: string): ParsedQuantity {
-  const t = text.trim();
-  if (!DECIMAL.test(t)) return { ok: false, error: "Enter a number of CPU cores, such as 0.5 or 2" };
-  const value = Math.round(Number(t) * 1000);
+  const p = decimalParts(text);
+  if (!p) return { ok: false, error: "Enter a number of CPU cores, such as 0.5 or 2" };
+  if (p.digits > 3) return { ok: false, error: "Use at most 3 decimal places (millicores)" };
+  const value = toNumber((p.whole * 1000n) / p.scale);
   return value > 0 ? { ok: true, value } : { ok: false, error: "Must be more than 0 CPU" };
 }
 
 /**
- * Memory in GiB typed by an admin → MiB, ×1024, which must come out a whole MiB
- * ("1.5" → 1536; "0.1" is refused rather than rounded, since the pod would differ).
+ * Memory in GiB typed by an admin → MiB, ×1024, which must come out a whole MiB exactly
+ * ("1.5" → 1536, "0.0009765625" → 1; "0.1" or "1.0000000001" is refused rather than
+ * rounded, since the pod would differ). Integer arithmetic on the digit string; ten
+ * decimal places suffice for 1/1024 GiB, so more are refused.
  */
 export function parseMemoryGiB(text: string): ParsedQuantity {
-  const t = text.trim();
-  if (!DECIMAL.test(t)) return { ok: false, error: "Enter memory in GiB, such as 4 or 1.5" };
-  const raw = Number(t) * 1024;
-  const value = Math.round(raw);
-  if (Math.abs(raw - value) > 1e-6) return { ok: false, error: "Must be a whole number of MiB (GiB × 1024)" };
+  const p = decimalParts(text);
+  if (!p) return { ok: false, error: "Enter memory in GiB, such as 4 or 1.5" };
+  const mib = p.whole * 1024n;
+  if (p.digits > 10 || mib % p.scale !== 0n) return { ok: false, error: "Must be a whole number of MiB (GiB × 1024)" };
+  const value = toNumber(mib / p.scale);
   return value > 0 ? { ok: true, value } : { ok: false, error: "Must be more than 0 GiB" };
 }
 
@@ -135,3 +151,11 @@ export function parseDiskGiB(text: string): ParsedQuantity {
   const value = Number(t);
   return value > 0 ? { ok: true, value } : { ok: false, error: "Must be more than 0 GiB" };
 }
+
+/**
+ * The api's absolute caps on any size field, whatever the chart allows
+ * (api/internal/workersize/builtin MaxMillicores / MaxMemoryMiB / MaxDiskGiB): 64 cores,
+ * 512 GiB memory, 2048 GiB disk. The editor checks them locally so a huge number gets a
+ * field error in its own units; the api still enforces them.
+ */
+export const ABSOLUTE_MAX = { millicores: 64000, memoryMiB: 524288, diskGiB: 2048 } as const;

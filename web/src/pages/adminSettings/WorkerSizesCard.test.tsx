@@ -75,7 +75,7 @@ describe("WorkerSizesCard", () => {
     expect(s.getByText("20")).toBeTruthy(); // DinD GiB
     expect(s.getByText("Builtin")).toBeTruthy();
     expect(s.queryByText("Customized")).toBeNull();
-    expect(screen.getAllByRole("rowheader").map((h) => h.textContent)).toEqual(["SBuiltin", "MBuiltin", "LBuiltin", "L-HIGHMEMBuiltin"]);
+    expect(screen.getAllByRole("rowheader").map((h) => h.textContent)).toEqual(["SBuiltinEdit", "MBuiltinEdit", "LBuiltinEdit", "L-HIGHMEMBuiltinEdit"]);
     expect(
       screen.getByText(
         "Limits: up to 4 CPU / 32 GiB memory / 50 GiB disk (from chart values workers.limitRange.max.cpu, workers.limitRange.max.memory, workers.limitRange.maxPVCStorage).",
@@ -122,23 +122,44 @@ describe("WorkerSizesCard", () => {
     expect(mockApi.updateAdminWorkerSize).not.toHaveBeenCalled();
   });
 
-  it("maps a 400's field errors onto the matching inputs", async () => {
+  it("checks each limit against the chart ceilings and the absolute caps locally, in the editor's units", async () => {
+    renderCard();
+    fireEvent.click(screen.getByRole("button", { name: "Edit size L" }));
+    fireEvent.change(input("L CPU limit (cores)"), { target: { value: "8" } });
+    fireEvent.change(input("L Memory limit (GiB)"), { target: { value: "40" } });
+    fireEvent.change(input("L Data disk (GiB)"), { target: { value: "5000" } });
+    // No DinD ceiling applies in this list, so only the absolute cap binds it.
+    fireEvent.change(input("L DinD data disk (GiB)"), { target: { value: "3000" } });
+    fireEvent.change(input("L CPU request (cores)"), { target: { value: "100" } });
+    fireEvent.change(input("L Memory request (GiB)"), { target: { value: "1.0000000001" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save size L" }));
+    expect(await screen.findByText("At most 4 cores (workers.limitRange.max.cpu)")).toBeTruthy();
+    expect(screen.getByText("At most 32 GiB (workers.limitRange.max.memory)")).toBeTruthy();
+    expect(screen.getByText("At most 50 GiB (workers.limitRange.maxPVCStorage)")).toBeTruthy();
+    expect(screen.getByText("At most 2048 GiB (the api's absolute maximum)")).toBeTruthy();
+    expect(screen.getByText("At most 64 cores (the api's absolute maximum)")).toBeTruthy();
+    expect(screen.getByText("Must be a whole number of MiB (GiB × 1024)")).toBeTruthy();
+    expect(mockApi.updateAdminWorkerSize).not.toHaveBeenCalled();
+  });
+
+  it("maps a 400's field errors onto the matching inputs and asks to fix them", async () => {
+    const serverText = "memory limit 30720 MiB exceeds the 28672 MiB ceiling (workers.docker.limitRange.max.memory)";
     mockApi.updateAdminWorkerSize.mockRejectedValue(
       new ApiError(400, "the size has values that cannot be saved", {
         error: "the size has values that cannot be saved",
-        fields: { memory_limit_mib: "must be at most 32768 MiB (workers.limitRange.max.memory)" },
+        fields: { memory_limit_mib: serverText },
       }),
     );
     const onChanged = renderCard();
     fireEvent.click(screen.getByRole("button", { name: "Edit size L" }));
-    fireEvent.change(input("L Memory limit (GiB)"), { target: { value: "40" } });
+    fireEvent.change(input("L Memory limit (GiB)"), { target: { value: "30" } });
     fireEvent.click(screen.getByRole("button", { name: "Save size L" }));
-    const msg = await screen.findByText("must be at most 32768 MiB (workers.limitRange.max.memory)");
+    const msg = await screen.findByText(serverText);
     const field = input("L Memory limit (GiB)");
     expect(field.getAttribute("aria-invalid")).toBe("true");
     expect(field.getAttribute("aria-describedby")).toBe(msg.id);
     expect(input("L CPU limit (cores)").getAttribute("aria-invalid")).toBeNull();
-    expect(screen.getByRole("alert").textContent).toBe("the size has values that cannot be saved");
+    expect(screen.getByRole("alert").textContent).toBe("Fix the highlighted fields and save again.");
     expect(onChanged).not.toHaveBeenCalled();
   });
 
@@ -158,7 +179,7 @@ describe("WorkerSizesCard", () => {
     expect(await screen.findByText(/data disk lowered from 50 GiB to 25 GiB/)).toBeTruthy();
   });
 
-  it("resets a customized builtin to its shipped values, which it shows", async () => {
+  it("resets a customized builtin to its shipped values after a confirm, then returns focus to Edit", async () => {
     mockApi.resetAdminWorkerSize.mockResolvedValue(writeOk());
     const onChanged = renderCard(sizes({ l: { memory_limit_mib: 24576, customized: true } }));
     const l = within(rowOf("L"));
@@ -167,9 +188,54 @@ describe("WorkerSizesCard", () => {
     // Only a customized builtin can be reset.
     expect(screen.queryByRole("button", { name: "Reset size M to shipped values" })).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Reset size L to shipped values" }));
+    // Nothing is sent until the inline confirm; no disk lowers, so the prompt says only that.
+    const confirm = within(screen.getByRole("group", { name: "Confirm reset of size L" }));
+    expect(confirm.getByText("Reset L to shipped values?")).toBeTruthy();
+    expect(document.activeElement).toBe(confirm.getByRole("button", { name: "Confirm" }));
+    expect(mockApi.resetAdminWorkerSize).not.toHaveBeenCalled();
+    fireEvent.click(confirm.getByRole("button", { name: "Confirm" }));
     await waitFor(() => expect(mockApi.resetAdminWorkerSize).toHaveBeenCalledWith("l"));
     await waitFor(() => expect(onChanged).toHaveBeenCalledTimes(1));
     expect(screen.getByText("Size L reset to shipped values.")).toBeTruthy();
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "Edit size L" })));
+  });
+
+  it("says before resetting that a reset lowering a disk keeps existing workers' larger disk; Keep sends nothing", () => {
+    renderCard(sizes({ l: { data_gib: 80, customized: true } }));
+    fireEvent.click(screen.getByRole("button", { name: "Reset size L to shipped values" }));
+    const group = screen.getByRole("group", { name: "Confirm reset of size L" });
+    expect(group.textContent).toContain(
+      "Reset L to shipped values? Existing workers keep their larger disk; only new workers get the smaller size.",
+    );
+    fireEvent.click(within(group).getByRole("button", { name: "Keep" }));
+    expect(screen.queryByRole("group", { name: "Confirm reset of size L" })).toBeNull();
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Edit size L" }));
+    // Escape is Keep too.
+    fireEvent.click(screen.getByRole("button", { name: "Reset size L to shipped values" }));
+    fireEvent.keyDown(screen.getByRole("button", { name: "Confirm" }), { key: "Escape" });
+    expect(screen.queryByRole("group", { name: "Confirm reset of size L" })).toBeNull();
+    expect(mockApi.resetAdminWorkerSize).not.toHaveBeenCalled();
+  });
+
+  it("moves focus into the form on Edit, and back to that row's Edit on Escape, Cancel and Save", async () => {
+    mockApi.updateAdminWorkerSize.mockResolvedValue(writeOk());
+    // A re-read that takes a moment, as a real one does: Edit is disabled until it lands.
+    renderCard(sizes(), vi.fn(() => new Promise<void>((r) => setTimeout(r, 30))));
+    const editL = () => screen.getByRole("button", { name: "Edit size L" });
+    fireEvent.click(editL());
+    expect(document.activeElement).toBe(input("L CPU request (cores)"));
+    fireEvent.keyDown(input("L Memory limit (GiB)"), { key: "Escape" });
+    expect(screen.queryByRole("form", { name: "Edit size L" })).toBeNull();
+    expect(document.activeElement).toBe(editL());
+
+    fireEvent.click(editL());
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(document.activeElement).toBe(editL());
+
+    fireEvent.click(editL());
+    fireEvent.click(screen.getByRole("button", { name: "Save size L" }));
+    await waitFor(() => expect(screen.getByText("Size L saved.")).toBeTruthy());
+    await waitFor(() => expect(document.activeElement).toBe(editL()));
   });
 
   it("is read-only with the api's reason when the controller cannot apply edits", () => {
@@ -186,10 +252,10 @@ describe("WorkerSizesCard", () => {
     expect(screen.getByRole("status").textContent).toBe(
       "Sizes are read-only. The controller does not support admin worker sizes yet (upgrade it); edits would be ignored.",
     );
-    for (const name of ["S", "M", "L", "L-HIGHMEM"]) {
-      expect((screen.getByRole("button", { name: `Edit size ${name}` }) as HTMLButtonElement).disabled).toBe(true);
-    }
-    expect((screen.getByRole("button", { name: "Reset size L to shipped values" }) as HTMLButtonElement).disabled).toBe(true);
+    // One muted label instead of a disabled Edit per row; the alert says why.
+    expect(screen.getByText("Read-only")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /^Edit size / })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Reset size L to shipped values" })).toBeNull();
   });
 
   it("switches to read-only when a save is refused with 409", async () => {
@@ -197,15 +263,28 @@ describe("WorkerSizesCard", () => {
     mockApi.updateAdminWorkerSize.mockRejectedValue(
       new ApiError(409, `worker sizes are read-only: ${reason}`, { error: `worker sizes are read-only: ${reason}`, reason: "controller_report_stale", read_only_reason: reason }),
     );
-    const onChanged = renderCard();
+    const onChanged = vi.fn().mockResolvedValue(undefined);
+    const card = (data: AdminWorkerSizes) => (
+      <MemoryRouter>
+        <WorkerSizesCard data={data} loadError="" onChanged={onChanged} />
+      </MemoryRouter>
+    );
+    const { rerender } = render(card(sizes()));
     fireEvent.click(screen.getByRole("button", { name: "Edit size S" }));
     fireEvent.change(input("S CPU limit (cores)"), { target: { value: "2" } });
     fireEvent.click(screen.getByRole("button", { name: "Save size S" }));
     expect(await screen.findByText(`Sizes are read-only. ${reason}`)).toBeTruthy();
     expect(input("S CPU limit (cores)").disabled).toBe(true);
     expect((screen.getByRole("button", { name: "Save size S" }) as HTMLButtonElement).disabled).toBe(true);
-    expect((screen.getByRole("button", { name: "Edit size M" }) as HTMLButtonElement).disabled).toBe(true);
-    expect(onChanged).not.toHaveBeenCalled();
+    expect(screen.queryByRole("button", { name: "Edit size M" })).toBeNull();
+    // The 409 asks the page to re-read the list, which is then the authority.
+    expect(onChanged).toHaveBeenCalledTimes(1);
+
+    // The re-read says editable again (the controller reported meanwhile): the card follows it.
+    rerender(card(sizes()));
+    expect(screen.queryByText(`Sizes are read-only. ${reason}`)).toBeNull();
+    expect(input("S CPU limit (cores)").disabled).toBe(false);
+    expect((screen.getByRole("button", { name: "Edit size M" }) as HTMLButtonElement).disabled).toBe(false);
   });
 
   it("reads an unavailable quota as unavailable, never as fitting", () => {
