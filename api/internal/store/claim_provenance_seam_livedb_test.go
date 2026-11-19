@@ -1,10 +1,13 @@
 package store_test
 
 import (
+	"errors"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // Issue #4476: Codex claim provenance through the real ClaimRun and the guard trigger. Against
@@ -61,8 +64,8 @@ func TestClaimRunCodexProvenanceSeamLiveDB(t *testing.T) {
 	wantProv(codex, a, 2, "after the recorded claimant's re-claim")
 
 	// The guard: a direct write of provenance outside a +1 claim is refused.
-	if _, err := fx.pool.Exec(fx.ctx, `UPDATE runs SET claim_provenance_worker_id = $2 WHERE id = $1`, codex, b); err == nil {
-		t.Fatal("direct provenance rewrite was accepted, want the guard trigger to refuse it")
+	if _, err := fx.pool.Exec(fx.ctx, `UPDATE runs SET claim_provenance_worker_id = $2 WHERE id = $1`, codex, b); !isProvenanceGuardErr(err) {
+		t.Fatalf("direct provenance rewrite: got %v, want the guard trigger's check_violation", err)
 	}
 
 	// The guard fails closed on a NULL conjunct: a claim-shaped 0 -> 1 step that records A while
@@ -73,7 +76,15 @@ func TestClaimRunCodexProvenanceSeamLiveDB(t *testing.T) {
 		 VALUES ($1, $2, $3, $4, 't', 'd', 'queued', 0)`, fresh, fx.userID, fx.repoID, fx.nextIID())
 	if _, err := fx.pool.Exec(fx.ctx,
 		`UPDATE runs SET claim_generation = 1, claim_provenance_worker_id = $2, claim_provenance_generation = 1 WHERE id = $1`,
-		fresh, a); err == nil {
-		t.Fatal("provenance stamped with a NULL worker_id was accepted, want the guard trigger to refuse it")
+		fresh, a); !isProvenanceGuardErr(err) {
+		t.Fatalf("provenance stamped with a NULL worker_id: got %v, want the guard trigger's check_violation", err)
 	}
+}
+
+// isProvenanceGuardErr reports the guard trigger's own refusal: SQLSTATE 23514 with its message,
+// so an unrelated constraint can never stand in for it.
+func isProvenanceGuardErr(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23514" &&
+		strings.HasPrefix(pgErr.Message, "claim provenance may change only through an admitted claim")
 }

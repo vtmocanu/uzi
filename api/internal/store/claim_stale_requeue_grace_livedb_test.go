@@ -298,7 +298,8 @@ func stalePredecessor(id uuid.UUID) uuid.UUID {
 // and PromoteCodexAccountWaitRun. Each promotion resets status_since AND updated_at, so every
 // promotion opens a fresh grace AND restarts the ceiling: the pin is per-episode, and there is
 // NO global bound across park/promote cycles (documented in ClaimRun's comment). The test pins
-// exactly that, plus: stale_requeue_generation survives each cycle (the #1390 readoption and
+// the reset directly (status_since and updated_at move past the back-dated clocks after each
+// promotion), plus: stale_requeue_generation survives each cycle (the #1390 readoption and
 // refund provenance).
 //
 // Issue #4476: the run's generation-1 claim is recorded as W's (claim provenance), so the Codex
@@ -377,7 +378,12 @@ func TestClaimRunStaleRequeueCodexParkPromoteCyclesLiveDB(t *testing.T) {
 		if r.Status != "queued" || r.StaleRequeueGeneration != firstGen {
 			t.Fatalf("cycle %d: status=%s stale_gen=%v, want queued and the preserved %v", n, r.Status, r.StaleRequeueGeneration, firstGen)
 		}
-		fx.mustBlock(p, staleGrace, staleCeiling, "cycle "+strconv.Itoa(n)+": a fresh grace after the promotion")
+		// The clocks were back-dated 3h before this cycle; the promotion must have reset both.
+		if recent := time.Now().Add(-time.Hour); !r.StatusSince.Valid || !r.StatusSince.Time.After(recent) ||
+			!r.UpdatedAt.Valid || !r.UpdatedAt.Time.After(recent) {
+			t.Fatalf("cycle %d: status_since=%v updated_at=%v, want both reset by the promotion", n, r.StatusSince, r.UpdatedAt)
+		}
+		fx.mustBlock(p, staleGrace, staleCeiling, "cycle "+strconv.Itoa(n)+": the provenance gate refuses the peer after the promotion")
 	}
 	cycle(1)
 	cycle(2)
