@@ -1,7 +1,7 @@
 // Issue #4481 m2: a failed issue run whose owed heads reach the per-run cap releases custody through
 // the held V2 publication and FINAL when the durable refusal gate proves completeness, and keeps custody
 // (no publishHeld, no FINAL) whenever it cannot. Every case drives the real runner terminal hook.
-import { it } from "node:test";
+import { it, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
@@ -10,7 +10,7 @@ import type { RunContext } from "../src/executor.js";
 import { client, fakeGitlab, git, gitlabClaim, installHarness, runner } from "./runner-harness.js";
 import {
   HELD_LINUX_ONLY, JOIN_TOKEN, PUBLICATION_ID, bare, command, commit, failedStates, failingWork,
-  frozenRecords, heldServer, packObjects, redrive, skipCheckpoints, type HeldServer, type Work,
+  deferTerminalEvidence, frozenRecords, heldServer, packObjects, redrive, skipCheckpoints, type HeldServer, type Work,
 } from "./runner-held-publication-fixture.js";
 
 installHarness();
@@ -74,8 +74,10 @@ function noHold(server: HeldServer, label: string): void {
   assert.equal(server.holdOpen(), true, `${label}: the guarded hold stays open`);
 }
 
-async function runFailed(claim: Claim, work: Partial<Work>, extra?: (ctx: RunContext) => Promise<void> | void) {
+async function runFailed(claim: Claim, work: Partial<Work>, extra?: (ctx: RunContext) => Promise<void> | void,
+  onRunner?: (r: ReturnType<typeof runner>) => void) {
   const r = runner(failingWork(work, extra), fakeGitlab().gitlab, JOIN_TOKEN, { checkpointIntervalMs: 1 });
+  onRunner?.(r);
   await r.execute(claim);
   assert.equal(failedStates(claim.run_id).length, 1, "the honest failed report is sent once");
   return r;
@@ -85,6 +87,32 @@ async function runFailed(claim: Claim, work: Partial<Work>, extra?: (ctx: RunCon
 async function restartReplay(): Promise<void> {
   const r2 = runner({ run: async () => ({ branch: "x" }) }, fakeGitlab().gitlab, JOIN_TOKEN);
   await r2.resumePendingRecoveries(undefined, await r2.snapshotBootRecoveries());
+}
+
+/** Records what each terminal transfer pass returned for the run. */
+function spyTransfer(t: TestContext, r: ReturnType<typeof runner>): (string | null)[] {
+  const results: (string | null)[] = [];
+  const original = Reflect.get(r, "transferRestorePointToTrustedBare") as (...a: unknown[]) => Promise<string | null>;
+  t.mock.method(r as unknown as Record<string, (...a: unknown[]) => Promise<string | null>>, "transferRestorePointToTrustedBare",
+    async function (this: unknown, ...a: unknown[]) { const out = await original.apply(this, a); results.push(out); return out; });
+  return results;
+}
+
+const stackOf = (): string => new Error().stack ?? "";
+/** Calls `inject` once, on the first hold read that follows a coverage proof's refusal gate. */
+function injectAfterCoverageProof(armed: () => boolean, inject: () => void): () => boolean {
+  let lastWasCoverage = false, fired = false;
+  const gate = git.refusalReleaseGate.bind(git);
+  git.refusalReleaseGate = async (...a: Parameters<typeof gate>) => {
+    lastWasCoverage = /frozenCoverageProven/.test(stackOf());
+    return gate(...a);
+  };
+  const list = client.listRecoveryHolds.bind(client);
+  client.listRecoveryHolds = async (...a: Parameters<typeof list>) => {
+    if (!fired && armed() && lastWasCoverage && /heldOperationState|openInventoryHold/.test(stackOf())) { fired = true; inject(); }
+    return list(...a);
+  };
+  return () => fired;
 }
 
 const refusedHeld = (call: { run: string; generation: number; tip: string }) => ({ ok: true as const, body: {
@@ -112,6 +140,7 @@ it("a cap-stopped failed run releases through the held V2 publication and FINAL"
   assert.equal(server.acked(), 1);
   assert.equal(server.holdOpen(), false);
   assert.equal(server.archiveReserves(), 0, "no archive was captured");
+  assert.deepEqual(refusalFiles().filter(n => n.startsWith("admission-")), [], "the acked generation's admission was deleted");
 });
 
 it("a below-cap failed run still sends its FINAL and writes no seal", opts, async () => {
@@ -225,7 +254,7 @@ it("evidence appearing after the held create and before the FINAL sends no FINAL
   assert.ok(!refusalFiles().some(n => n.startsWith("final-")), "nothing was sealed");
 });
 
-it("evidence appearing after the archive upload and before the archive FINAL sends no FINAL", opts, async () => {
+it("evidence appearing after the archive upload and before the archive FINAL sends no FINAL", opts, async t => {
   const { claim, server, work } = setup(44820);
   server.heldAnswer = refusedHeld;
   const upload = client.uploadRecoveryBundle.bind(client);
@@ -234,7 +263,7 @@ it("evidence appearing after the archive upload and before the archive FINAL sen
     injectUnledgeredStage(claim);
     return out;
   };
-  const r = await runFailed(claim, work);
+  const r = await runFailed(claim, work, undefined, runner => deferTerminalEvidence(runner, t));
   await redrive(r);
   assert.ok(server.archiveUploads() >= 1, "the archive fallback uploaded");
   assert.equal(server.finals.length, 0, "the seal refused the archive FINAL");
@@ -305,4 +334,110 @@ it("a replay by another process keeps custody", opts, async () => {
   assert.equal(server.finals.length, 1, "no FINAL from a process that did not admit the generation");
   assert.equal(server.acked(), 0);
   assert.equal(server.holdOpen(), true);
+});
+
+it("a cap run whose terminal hook runs twice releases through the first pass's head", opts, async t => {
+  const { claim, server, work } = setup(44825);
+  let results: (string | null)[] = [];
+  const r = await runFailed(claim, work, undefined, runner => { results = spyTransfer(t, runner); });
+  assert.ok(results.length >= 2, "the terminal hook ran more than once");
+  assert.ok(results.every(h => h !== null && h === results[0]), "every pass returned the same released head");
+  await redrive(r);
+  assert.equal(server.acked(), 1);
+});
+
+it("a below-cap run's second terminal pass re-imports exactly as before", opts, async t => {
+  const { claim, work } = setup(44826, 64);
+  let results: (string | null)[] = [];
+  await runFailed(claim, work, undefined, runner => { results = spyTransfer(t, runner); });
+  assert.ok(results.length >= 2, "the terminal hook ran more than once");
+  assert.ok(results.every(h => h !== null), "no pass was fenced out");
+  assert.equal((await directFetch(claim, work.clone!)).kind, "updated", "the generation was never fenced");
+});
+
+it("a below-cap release still sends its FINAL with 4200 admission files present, and deletes its own", opts, async () => {
+  const { claim, server, work } = setup(44827, 64);
+  const r = await runFailed(claim, work, () => {
+    fs.mkdirSync(refusalDir(), { recursive: true, mode: 0o700 });
+    for (let i = 0; i < 4200; i++) {
+      fs.writeFileSync(path.join(refusalDir(), `admission-${String(i).padStart(8, "0")}-aaaa-bbbb-cccc-444444444444-1.json`), "{}\n", { mode: 0o600 });
+    }
+  });
+  await redrive(r);
+  assert.equal(server.finals.length, 1);
+  assert.equal(server.acked(), 1);
+  assert.ok(!refusalFiles().includes(`admission-${claim.run_id}-1.json`), "this run's admission is deleted after the release");
+  assert.ok(refusalFiles().filter(n => n.startsWith("admission-")).length >= 4200, "other runs' admissions stay");
+});
+
+it("an unguarded flight writes no admission", opts, async () => {
+  Reflect.set(git, "maxOwedCandidates", 64);
+  const claim = gitlabClaim(44828, { claim_generation: GENERATION });
+  skipCheckpoints();
+  const r = runner(failingWork({}), fakeGitlab().gitlab, JOIN_TOKEN, { checkpointIntervalMs: 1 });
+  await r.execute(claim);
+  assert.deepEqual(refusalFiles().filter(n => n.startsWith("admission-")), []);
+});
+
+it("evidence between the last coverage proof and the held create is caught by the publish gate", opts, async () => {
+  const { claim, server, work } = setup(44830);
+  const fired = injectAfterCoverageProof(() => server.heldCalls.length === 0, () => { injectUnledgeredStage(claim); });
+  const r = await runFailed(claim, work);
+  await redrive(r);
+  assert.ok(fired(), "the evidence arrived inside the window");
+  noHold(server, "publish window");
+});
+
+it("evidence between the archive coverage proof and the archive FINAL is caught by the seal", opts, async t => {
+  const { claim, server, work } = setup(44831);
+  server.heldAnswer = refusedHeld;
+  const upload = client.uploadRecoveryBundle.bind(client);
+  let uploaded = false;
+  client.uploadRecoveryBundle = async (...a: Parameters<typeof upload>) => { const out = await upload(...a); uploaded = true; return out; };
+  const fired = injectAfterCoverageProof(() => uploaded, () => { injectUnledgeredStage(claim); });
+  const r = await runFailed(claim, work, undefined, runner => deferTerminalEvidence(runner, t));
+  await redrive(r);
+  assert.ok(fired(), "the evidence arrived inside the window");
+  assert.equal(server.finals.length, 0, "the seal refused the archive FINAL");
+  assert.equal(server.holdOpen(), true);
+});
+
+it("evidence after the upload mints no archive FINAL request", opts, async t => {
+  const { claim, server, work } = setup(44832);
+  server.heldAnswer = refusedHeld;
+  const upload = client.uploadRecoveryBundle.bind(client);
+  client.uploadRecoveryBundle = async (...a: Parameters<typeof upload>) => { const out = await upload(...a); injectUnledgeredStage(claim); return out; };
+  const r = await runFailed(claim, work, undefined, runner => deferTerminalEvidence(runner, t));
+  await redrive(r);
+  const records = await frozenRecords(claim);
+  assert.ok(records.some(r => r.state === "uploaded"), "the archive was uploaded");
+  assert.ok(records.every(r => r.finalRequest === undefined), "the coverage proof refused before any FINAL was journaled");
+  assert.equal(server.finals.length, 0);
+});
+
+it("a clone head that moved after the refusal is not released", opts, async () => {
+  const { claim, server, work } = setup(44833);
+  const head = git.worktreeHead.bind(git);
+  let moved = false;
+  git.worktreeHead = async (p: string) => {
+    if (!moved && /transferAtOwedCap/.test(stackOf())) {
+      moved = true;
+      commit(p, "moved-after-refusal.txt");
+      command(bare(), ["fetch", "-q", "--no-tags", `file://${p}`, "+HEAD:refs/uzi-test/moved"]);
+    }
+    return head(p);
+  };
+  await runFailed(claim, work);
+  assert.ok(moved, "the clone moved inside the transfer");
+  assert.equal(server.heldCalls.length, 0, "the terminal transfer released nothing for a head it did not refuse");
+});
+
+it("control: with no evidence the archive fallback sends its archive FINAL", opts, async t => {
+  const { claim, server, work } = setup(44834);
+  server.heldAnswer = refusedHeld;
+  const r = await runFailed(claim, work, undefined, runner => deferTerminalEvidence(runner, t));
+  await redrive(r);
+  assert.equal(server.finals.length, 1);
+  assert.equal(server.finals[0]!.disposition?.kind, "archive");
+  assert.equal(server.acked(), 1);
 });

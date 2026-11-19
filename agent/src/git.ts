@@ -29549,6 +29549,9 @@ try {
       if ((cause as NodeJS.ErrnoException).code === "ENOENT") return [];
       throw cause;
     }
+    // Admission records are read by exact name (generations 1..G), never enumerated, so their number
+    // must not bound the listing every ordinary gate depends on.
+    names = names.filter((n) => !n.startsWith("admission-"));
     if (names.length > 4096) throw new Error("refusal metadata entry budget");
     return names.sort();
   }
@@ -30575,6 +30578,12 @@ try {
         open();
         await this.removeOwedFile(barePath, `final-${context.runId}-${context.generation}.json`, true, REFUSAL_DIRECTORY);
         await this.removeOwedFile(barePath, `cleanup-${context.runId}-${context.generation}.json`, true, REFUSAL_DIRECTORY);
+      }
+      // issue #4481: the generations' admissions served only their release gate. A crash before this
+      // leaves them, which is harmless; afterwards a later generation of this run cannot cap-release.
+      for (let g = 1; g <= context.generation && g <= REFUSAL_MAX_GENERATIONS; g++) {
+        open();
+        await this.removeOwedFile(barePath, `admission-${context.runId}-${g}.json`, true, REFUSAL_DIRECTORY);
       }
       return "removed";
     });

@@ -494,12 +494,30 @@ describe("issue4481 cleanup", { timeout: 300_000 }, () => {
     assert.deepEqual(refusalFiles(), []);
   });
 
-  it("a sealed, covered generation is cleaned up: stages, ledger, final and cleanup go; admissions stay", async () => {
+  it("a sealed, covered generation is cleaned up: stages, ledger, final, cleanup and admissions go", async () => {
     const { cover } = await sealed();
     assert.equal(await cleanup(cover), "removed");
     assert.deepEqual(incomingRefs(), []);
     assert.deepEqual(pinRefs(), []);
-    assert.deepEqual(refusalFiles(), [`admission-${RUN}-1.json`]);
+    assert.deepEqual(refusalFiles(), []);
+  });
+
+  it("a removed generation deletes the admissions of its own and earlier generations only", async () => {
+    const kept = await rewriteTimes(3);
+    assert.equal(await cache.admitRefusalProvenance(ctx), "written");
+    assert.equal(await cache.admitRefusalProvenance({ ...ctx, generation: 2 }), "written");
+    assert.equal(await cleanup(coverOf(kept)), "removed");
+    assert.deepEqual(refusalFiles(), [`admission-${RUN}-2.json`]);
+  });
+
+  it("the number of admission files never bounds the ordinary gate", async () => {
+    fs.mkdirSync(refDir(), { recursive: true, mode: 0o700 });
+    for (let i = 0; i < 4200; i++) {
+      const other = `${String(i).padStart(8, "0")}-aaaa-bbbb-cccc-444444444444`;
+      fs.writeFileSync(path.join(refDir(), `admission-${other}-1.json`), "{}\n", { mode: 0o600 });
+    }
+    assert.deepEqual(await gate(base), { kind: "none" });
+    assert.equal(await cache.sealRefusalRelease(bare, RUN, 1, base), "none");
   });
 
   it("evidence without a seal, or an uncovered change after the seal, retains everything", async () => {
@@ -550,6 +568,6 @@ describe("issue4481 cleanup", { timeout: 300_000 }, () => {
     gitIn(bare, ["update-ref", "-d", `refs/uzi-incoming/${RUN}/1/rebound`]);
     assert.equal(await cleanup(cover), "removed");
     assert.deepEqual(incomingRefs(), []);
-    assert.deepEqual(refusalFiles(), [`admission-${RUN}-1.json`]);
+    assert.deepEqual(refusalFiles(), []);
   });
 });
