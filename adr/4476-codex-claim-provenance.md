@@ -41,8 +41,9 @@ Consequences:
   (PRD #1296) stay open while the run is held, and they keep counting toward the
   owner's custody-admission limit (`fn_custody_admission_count`). Cancelling the run
   does not release them: the cancel statements do not touch
-  `recovery_custody_holds`. Release still comes from the existing custody-release
-  reconciler or an explicit discard. Until then, deleting a worker that is the live
+  `recovery_custody_holds`. Release still comes only from the existing custody
+  paths, for example the custody-release reconciler, the holder worker's own
+  release, the merged-predecessor reconciler, or an explicit discard. Until then, deleting a worker that is the live
   holder of such a hold is refused (`CountOpenCustodyHoldsForWorker`), even after the
   run is cancelled. Waiting or cancelling settles the run, not its custody cleanup.
 - A held **judge** run has no queued expiry, and the one-active-judge index blocks
