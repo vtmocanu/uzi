@@ -132,6 +132,32 @@ func (q *Queries) ListWorkerSizes(ctx context.Context) ([]WorkerSize, error) {
 	return items, nil
 }
 
+const lockWorkerSizeForUpdate = `-- name: LockWorkerSizeForUpdate :one
+SELECT name, cpu_request_millicores, cpu_limit_millicores, memory_request_mib, memory_limit_mib, data_gib, dind_data_gib, display_order, builtin, customized, updated_at, updated_by FROM worker_sizes WHERE name = $1 FOR UPDATE
+`
+
+// Re-read a size row inside the admin mutation transaction, after the table's advisory
+// lock is held. FOR UPDATE so a concurrent reset/refresh of the same row waits.
+func (q *Queries) LockWorkerSizeForUpdate(ctx context.Context, name string) (WorkerSize, error) {
+	row := q.db.QueryRow(ctx, lockWorkerSizeForUpdate, name)
+	var i WorkerSize
+	err := row.Scan(
+		&i.Name,
+		&i.CpuRequestMillicores,
+		&i.CpuLimitMillicores,
+		&i.MemoryRequestMib,
+		&i.MemoryLimitMib,
+		&i.DataGib,
+		&i.DindDataGib,
+		&i.DisplayOrder,
+		&i.Builtin,
+		&i.Customized,
+		&i.UpdatedAt,
+		&i.UpdatedBy,
+	)
+	return i, err
+}
+
 const refreshPristineBuiltinWorkerSize = `-- name: RefreshPristineBuiltinWorkerSize :execrows
 UPDATE worker_sizes
 SET cpu_request_millicores = $1,
@@ -222,4 +248,65 @@ func (q *Queries) ResetBuiltinWorkerSize(ctx context.Context, arg ResetBuiltinWo
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const updateWorkerSizeValues = `-- name: UpdateWorkerSizeValues :one
+UPDATE worker_sizes
+SET cpu_request_millicores = $1,
+    cpu_limit_millicores = $2,
+    memory_request_mib = $3,
+    memory_limit_mib = $4,
+    data_gib = $5,
+    dind_data_gib = $6,
+    customized = $7::boolean,
+    updated_by = $8,
+    updated_at = now()
+WHERE name = $9
+RETURNING name, cpu_request_millicores, cpu_limit_millicores, memory_request_mib, memory_limit_mib, data_gib, dind_data_gib, display_order, builtin, customized, updated_at, updated_by
+`
+
+type UpdateWorkerSizeValuesParams struct {
+	CpuRequestMillicores int64       `json:"cpu_request_millicores"`
+	CpuLimitMillicores   int64       `json:"cpu_limit_millicores"`
+	MemoryRequestMib     int64       `json:"memory_request_mib"`
+	MemoryLimitMib       int64       `json:"memory_limit_mib"`
+	DataGib              int64       `json:"data_gib"`
+	DindDataGib          int64       `json:"dind_data_gib"`
+	Customized           bool        `json:"customized"`
+	UpdatedBy            pgtype.UUID `json:"updated_by"`
+	Name                 string      `json:"name"`
+}
+
+// Admin edit of an EXISTING size (PRD #4213 M2). customized is computed by the caller:
+// true for a builtin whose values now differ from the shipped ones, false otherwise
+// (CHECK (builtin OR NOT customized) keeps admin-added rows at false). display_order and
+// builtin are never edited here.
+func (q *Queries) UpdateWorkerSizeValues(ctx context.Context, arg UpdateWorkerSizeValuesParams) (WorkerSize, error) {
+	row := q.db.QueryRow(ctx, updateWorkerSizeValues,
+		arg.CpuRequestMillicores,
+		arg.CpuLimitMillicores,
+		arg.MemoryRequestMib,
+		arg.MemoryLimitMib,
+		arg.DataGib,
+		arg.DindDataGib,
+		arg.Customized,
+		arg.UpdatedBy,
+		arg.Name,
+	)
+	var i WorkerSize
+	err := row.Scan(
+		&i.Name,
+		&i.CpuRequestMillicores,
+		&i.CpuLimitMillicores,
+		&i.MemoryRequestMib,
+		&i.MemoryLimitMib,
+		&i.DataGib,
+		&i.DindDataGib,
+		&i.DisplayOrder,
+		&i.Builtin,
+		&i.Customized,
+		&i.UpdatedAt,
+		&i.UpdatedBy,
+	)
+	return i, err
 }

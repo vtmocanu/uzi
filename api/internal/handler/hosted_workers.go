@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/hostedsvc"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	"github.com/vtmocanu/uzi/api/internal/jointoken"
@@ -180,9 +181,9 @@ func (h *Handler) ProvisionHostedWorker(w http.ResponseWriter, r *http.Request) 
 	// No "token" field, deliberately — see this handler's doc comment. The DTO is the
 	// same one the worker list returns, so the caller sees kind/hosted_size and can
 	// render the row it just created.
-	httpx.JSON(w, http.StatusCreated, map[string]any{
-		"worker": workerDTOFromWorker(wkr, 0, false, "", h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt),
-	})
+	dto := workerDTOFromWorker(wkr, 0, false, "", h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt)
+	h.overlayHostedSizeSpec(r.Context(), &dto)
+	httpx.JSON(w, http.StatusCreated, map[string]any{"worker": dto})
 }
 
 // derivedHostedWorkerName builds a display name for a provision that supplied none
@@ -328,10 +329,11 @@ func hostedProvisionLockObjID(userID uuid.UUID) int32 {
 // discovering it from a 403. Session-authenticated; it exposes only operator-set
 // policy, which is the same thing ForgeConfig does with the SSRF allowlist.
 //
-// The type and size LISTS are deliberately not here: this repo's pattern for a
-// curated registry the UI must render is a web-side mirror constant
-// (web/src/lib/workerTemplates.ts mirrors workertmpl.Names), and M5 adds the size
-// list the same way.
+// The template LIST is deliberately not here: it stays a web-side mirror constant
+// (web/src/lib/workerTemplates.ts mirrors workertmpl.Names). The SIZE list is here (PRD
+// #4213): sizes are admin-editable data, so the web reads each size's name and resolved
+// integers from this response rather than mirroring them. It stays cookie-only: the CLI
+// and TUI read a worker's resolved size from the worker DTO's hosted_size_spec instead.
 func (h *Handler) HostedConfig(w http.ResponseWriter, r *http.Request) {
 	// The quota is reported even when hosting is off. It is operator-set policy
 	// either way, and a client that reads enabled=false must not render a provision
@@ -355,7 +357,20 @@ func (h *Handler) HostedConfig(w http.ResponseWriter, r *http.Request) {
 		slog.Error("hosted default size setting", "error", err)
 		defaultSize = settings.DefaultHostedDefaultSize
 	}
+	sizes := []apitypes.HostedConfigSizeDTO{}
+	if h.q != nil {
+		rows, err := workersize.List(r.Context(), h.q)
+		if err != nil {
+			slog.Error("hosted config sizes", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		for _, row := range rows {
+			sizes = append(sizes, apitypes.HostedConfigSizeDTO{Name: row.Name, WorkerSizeSpec: specToDTO(rowSpec(row))})
+		}
+	}
 	httpx.JSON(w, http.StatusOK, map[string]any{
+		"sizes":             sizes,
 		"enabled":           h.cfg.WorkerHostingEnabled,
 		"docker_enabled":    h.cfg.WorkerHostingEnabled && h.cfg.WorkerDockerEnabled,
 		"quota":             quota,

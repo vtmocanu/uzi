@@ -54,3 +54,26 @@ WHERE name = @name AND builtin;
 -- name: GetControllerAdminSizesAdvertisement :one
 SELECT admin_sizes_version, admin_sizes_advertised_at, poll_interval_seconds
 FROM controller_report_status WHERE id = 1;
+
+-- name: LockWorkerSizeForUpdate :one
+-- Re-read a size row inside the admin mutation transaction, after the table's advisory
+-- lock is held. FOR UPDATE so a concurrent reset/refresh of the same row waits.
+SELECT * FROM worker_sizes WHERE name = @name FOR UPDATE;
+
+-- name: UpdateWorkerSizeValues :one
+-- Admin edit of an EXISTING size (PRD #4213 M2). customized is computed by the caller:
+-- true for a builtin whose values now differ from the shipped ones, false otherwise
+-- (CHECK (builtin OR NOT customized) keeps admin-added rows at false). display_order and
+-- builtin are never edited here.
+UPDATE worker_sizes
+SET cpu_request_millicores = @cpu_request_millicores,
+    cpu_limit_millicores = @cpu_limit_millicores,
+    memory_request_mib = @memory_request_mib,
+    memory_limit_mib = @memory_limit_mib,
+    data_gib = @data_gib,
+    dind_data_gib = @dind_data_gib,
+    customized = @customized::boolean,
+    updated_by = sqlc.narg('updated_by'),
+    updated_at = now()
+WHERE name = @name
+RETURNING *;

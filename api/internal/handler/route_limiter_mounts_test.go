@@ -411,6 +411,10 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/admin/release-check", noLimiter},
 	{"GET", "/api/admin/settings", noLimiter},
 	{"GET", "/api/admin/maintenance", noLimiter},
+	// PRD #4213 M2: the sizes editor. Local reads and writes (no token spend, no forge call).
+	{"GET", "/api/admin/worker-sizes", noLimiter},
+	{"PUT", "/api/admin/worker-sizes/{name}", noLimiter},
+	{"POST", "/api/admin/worker-sizes/{name}/reset", noLimiter},
 	{"GET", "/api/admin/docker-allowlist-repos", noLimiter},
 	{"GET", "/api/admin/slack/status", noLimiter},
 	{"GET", "/api/admin/usage", noLimiter},

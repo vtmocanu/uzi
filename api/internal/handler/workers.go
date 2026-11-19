@@ -19,6 +19,7 @@ import (
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/termsafe"
+	"github.com/vtmocanu/uzi/api/internal/workersize"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 	"github.com/vtmocanu/uzi/api/internal/workertmpl"
 )
@@ -776,6 +777,7 @@ func (h *Handler) workerDTOWithOverlays(ctx context.Context, row store.ListWorke
 	}
 	h.overlayEphemeralLease(&dto, row.LeaseSince, row.DrainingSince, h.currentEphemeralLease(ctx))
 	h.overlayWorkerReports(&dto, row.ID)
+	h.overlayHostedSizeSpec(ctx, &dto)
 	h.overlayReportedRuns(&dto, h.reportedRunsByWorker(ctx, ids), row.ID)
 	overlayRunDisk(&dto, h.runDiskByWorker(ctx, ids), row.ID)
 	return dto
@@ -811,6 +813,7 @@ func (h *Handler) ListWorkers(w http.ResponseWriter, r *http.Request) {
 	cooldowns := h.workerForgeOriginCooldowns(r.Context(), ids)
 	runDisk := h.runDiskByWorker(r.Context(), ids)
 	lease := h.currentEphemeralLease(r.Context())
+	sizeSpecs := h.hostedSizeSpecs(r.Context())
 	for _, row := range rows {
 		dto := workerDTOFromRow(row, h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt)
 		dto.ForgeOriginCooldowns = cooldowns[row.ID]
@@ -820,6 +823,7 @@ func (h *Handler) ListWorkers(w http.ResponseWriter, r *http.Request) {
 		}
 		h.overlayEphemeralLease(&dto, row.LeaseSince, row.DrainingSince, lease)
 		h.overlayWorkerReports(&dto, row.ID)
+		overlayHostedSizeSpec(&dto, sizeSpecs)
 		h.overlayReportedRuns(&dto, reported, row.ID)
 		overlayRunDisk(&dto, runDisk, row.ID)
 		out = append(out, dto)
@@ -852,6 +856,7 @@ func (h *Handler) AdminListWorkers(w http.ResponseWriter, r *http.Request) {
 	reported := h.reportedRunsByWorker(r.Context(), ids)
 	runDisk := h.runDiskByWorker(r.Context(), ids)
 	lease := h.currentEphemeralLease(r.Context())
+	sizeSpecs := h.hostedSizeSpecs(r.Context())
 	for _, row := range rows {
 		dto := adminWorkerDTOFromRow(row, h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt, h.cfg.WorkerHeartbeatStale)
 		appendUpgradeBlockers(&dto.WorkerDTO, blockers, row.Worker.ID)
@@ -860,6 +865,7 @@ func (h *Handler) AdminListWorkers(w http.ResponseWriter, r *http.Request) {
 		}
 		h.overlayEphemeralLease(&dto.WorkerDTO, row.Worker.LeaseSince, row.Worker.DrainingSince, lease)
 		h.overlayWorkerReports(&dto.WorkerDTO, row.Worker.ID)
+		overlayHostedSizeSpec(&dto.WorkerDTO, sizeSpecs)
 		h.overlayReportedRuns(&dto.WorkerDTO, reported, row.Worker.ID)
 		overlayRunDisk(&dto.WorkerDTO, runDisk, row.Worker.ID)
 		out = append(out, dto)
@@ -1133,6 +1139,7 @@ func (h *Handler) PatchWorker(w http.ResponseWriter, r *http.Request) {
 	dto := workerDTOFromWorker(wkr, 0, false, token.label, h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt)
 	h.overlayEphemeralLease(&dto, wkr.LeaseSince, wkr.DrainingSince, h.currentEphemeralLease(r.Context()))
 	h.overlayWorkerReports(&dto, wkr.ID)
+	h.overlayHostedSizeSpec(r.Context(), &dto)
 	// Reuse the batched query with a one-element id set (PRD #1390 M2c): this worker may hold a
 	// live snapshot, so without the overlay its reported_runs would read [] on this response.
 	reported := h.reportedRunsByWorker(r.Context(), []uuid.UUID{wkr.ID})
@@ -1200,4 +1207,43 @@ func rollMarkerDTO(kind string, data []byte, receipt pgtype.Timestamptz, now tim
 		}
 	}
 	return dto
+}
+
+// hostedSizeSpecs reads the size table once for a response: name to resolved integers. It is
+// display-only (WorkerDTO.HostedSizeSpec), so a read failure is logged and yields no specs
+// rather than failing the worker list.
+func (h *Handler) hostedSizeSpecs(ctx context.Context) map[string]apitypes.WorkerSizeSpec {
+	if h.q == nil {
+		return nil
+	}
+	rows, err := workersize.List(ctx, h.q)
+	if err != nil {
+		slog.Error("worker size specs", "error", err)
+		return nil
+	}
+	specs := make(map[string]apitypes.WorkerSizeSpec, len(rows))
+	for _, row := range rows {
+		specs[row.Name] = specToDTO(rowSpec(row))
+	}
+	return specs
+}
+
+// overlayHostedSizeSpec sets the DTO's hosted_size_spec from a size map; nil when the worker
+// has no size or no row of that name exists.
+func overlayHostedSizeSpec(dto *apitypes.WorkerDTO, specs map[string]apitypes.WorkerSizeSpec) {
+	dto.HostedSizeSpec = nil
+	if dto.HostedSize == nil {
+		return
+	}
+	if spec, ok := specs[*dto.HostedSize]; ok {
+		dto.HostedSizeSpec = &spec
+	}
+}
+
+// overlayHostedSizeSpec is the single-worker form: one size-table read for this response.
+func (h *Handler) overlayHostedSizeSpec(ctx context.Context, dto *apitypes.WorkerDTO) {
+	if dto.HostedSize == nil {
+		return
+	}
+	overlayHostedSizeSpec(dto, h.hostedSizeSpecs(ctx))
 }
