@@ -242,11 +242,13 @@ function usageLatch(opts: ReadOnlyModelPassOpts, scope?: ProviderScope): {
 // Provider output redaction (issue #4505). A provider pass runs under a gateway key the worker
 // log may not have registered, and a gateway can echo that key into the model's text, the model
 // ids of the usage evidence, thrown errors and the pass's own log lines. Everything the pass hands
-// back is scrubbed of the key in its raw and JSON-escaped forms. Vendor passes never build a scope.
+// back is scrubbed of the key in every form keyForms builds (raw, JSON-escaped, `\/`, HTML-safe
+// \u00XX, percent-encoded). Vendor passes never build a scope.
 
 interface ProviderScope {
   readonly text: TextRedactor;
-  /** The pass's logger: redacts the message and every string field before delegating. */
+  /** The pass's logger: redacts the message and the string fields of plain objects and arrays (up to depth 6)
+   *  before delegating. */
   readonly log: Logger;
   /** The value to throw in place of `err`: `err` itself when it carries no key form. */
   thrown(err: unknown): unknown;
