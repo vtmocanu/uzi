@@ -406,7 +406,7 @@ _boundary_begin() {
 # Sets _B_FAILED (0/1), _B_MESSAGE (`boundary: …`) and _B_END_SECS.
 _boundary_end() {
   local nn_slug="$1" slug="$2" handoff="$3" holds="$4" body_rc="$5"
-  local t0 timeout interval rem k kn i timed_out=0 final=0 fbud=0 n0=0 parts=() sv_sr=() sv_sw=() sv_sh=() sv_obs="" sv_ok=0 kept=()
+  local t0 timeout interval rem k kn i timed_out=0 final=0 fbud=0 n0=0 b="" parts=() sv_sr=() sv_sw=() sv_sh=() sv_obs="" sv_ok=0 kept=()
   t0="$(date +%s)"
   timeout="$(_pos_int "${E2E_BOUNDARY_TIMEOUT:-}" 120)"
   interval="$(_pos_int "${E2E_BOUNDARY_INTERVAL:-}" 1)"
@@ -448,6 +448,9 @@ _boundary_end() {
         kept+=("$k")
       done
       _B_REASONS=(${kept[@]+"${kept[@]}"})
+      # The final observation is incomplete, so the boundary cannot be clean: FAIL and say
+      # which reads went unread (their previous rows are still reported as residue).
+      b="${_B_BUDGET# }"; _b_reason "final sample incomplete: ${b% } unread"
       printf 'final sample out of budget:%s(previous rows kept for those reads)\n' "$_B_BUDGET" > "$_bdir/final-budget.txt" 2>/dev/null || true
       fbud=1
     fi

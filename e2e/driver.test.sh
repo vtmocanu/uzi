@@ -1241,6 +1241,37 @@ run_driver 35g
 has_row nl PASS || bad "newline-separated declaration did not PASS: $(cat "$TSV")"
 end
 
+# Case 35h — a final sample whose later reads never ran cannot PASS, even when the earlier
+# sample had no worker or hold rows: the boundary FAILs naming the unread reads.
+# Mutation: let a budget fallback with empty residue report clean -> PASS "(settled)".
+begin "case35h: an incomplete final sample FAILs even with no residue" 35h
+export E2E_BOUNDARY_TIMEOUT=3 E2E_BOUNDARY_INTERVAL=3 FAKE_RUNS_SLEEP=1
+seqf runs "$R2" "-"
+mkphase "$PHASES_DIR/10-pone.sh" "final reads unread" no "" "" "" <<'BODY'
+pass "body ok"
+BODY
+run_driver 35h
+has_row pone FAIL || bad "incomplete final sample did not FAIL: $(cat "$TSV")"
+contains "$(row_msg pone FAIL)" "final sample incomplete: workers holds unread" || bad "message: $(row_msg pone FAIL)"
+contains "$(row_msg pone FAIL)" "not settled within 3s" || bad "timeout tag missing: $(row_msg pone FAIL)"
+end
+
+# Case 35i — an out-of-budget final holds read falls back to the previous holds rows, so the
+# release history still covers a baseline hold that was no longer open.
+# Mutation: drop the holds fallback -> history omits the released baseline hold.
+begin "case35i: holds fallback keeps the baseline-release history" 35i
+export E2E_BOUNDARY_TIMEOUT=3 E2E_BOUNDARY_INTERVAL=3 FAKE_RUNS_SLEEP=1
+seqf holds "$H1|$R1|1" "-"
+seqf workers "$W1|$R1|1"
+seqf history "$H1|$R1|1|released|ok|x"
+mkphase "$PHASES_DIR/10-ptwo.sh" "holds read out of budget" no "" "" "" <<'BODY'
+pass "body ok"
+BODY
+run_driver 35i
+has_row ptwo FAIL || bad "not FAIL: $(cat "$TSV")"
+contains "$(row_msg ptwo FAIL)" "hold=$H1" || bad "history lacks baseline hold H1: $(row_msg ptwo FAIL)"
+end
+
 # Case 35b (cross-check) — one handoff-holds variable may hold several whitespace-separated
 # hold UUIDs; each is declared. A non-UUID token in the list is still malformed.
 # Mutation: validate the whole value as one UUID -> the two-ID phase FAILs as malformed.
