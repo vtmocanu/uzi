@@ -35,6 +35,10 @@ func sizesTx(t *testing.T) (context.Context, pgx.Tx, *store.Queries) {
 		t.Fatalf("begin: %v", err)
 	}
 	t.Cleanup(func() { _ = tx.Rollback(ctx) })
+	// Same order as production: the table lock first, then the mutation.
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1, 0)", store.WorkerSizesLockClass); err != nil {
+		t.Fatalf("lock: %v", err)
+	}
 	if _, err := tx.Exec(ctx, `DELETE FROM worker_sizes`); err != nil {
 		t.Fatalf("clear: %v", err)
 	}
@@ -83,6 +87,28 @@ func TestWorkerSizesRefreshPristineRewritesAChangedRowLiveDB(t *testing.T) {
 	}
 	if m.MemoryLimitMib != 12288 || m.DataGib != 25 || m.Customized {
 		t.Errorf("pristine m = %+v, want shipped 12288 MiB / 25 GiB", m)
+	}
+}
+
+func TestWorkerSizesRefreshPristineQueryRowCountLiveDB(t *testing.T) {
+	ctx, tx, q := sizesTx(t)
+	if err := store.ReconcileBuiltinWorkerSizesTx(ctx, tx); err != nil {
+		t.Fatal(err)
+	}
+	s := builtin.Sizes()[1]
+	params := store.RefreshPristineBuiltinWorkerSizeParams{
+		Name: s.Name, CpuRequestMillicores: s.CPURequestMillicores, CpuLimitMillicores: s.CPULimitMillicores,
+		MemoryRequestMib: s.MemoryRequestMiB, MemoryLimitMib: s.MemoryLimitMiB, DataGib: s.DataGiB,
+		DindDataGib: s.DinDDataGiB, DisplayOrder: s.DisplayOrder,
+	}
+	if n, err := q.RefreshPristineBuiltinWorkerSize(ctx, params); err != nil || n != 0 {
+		t.Fatalf("shipped values: %d rows, %v; want 0 (nothing to refresh)", n, err)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE worker_sizes SET memory_limit_mib = 9999 WHERE name = $1`, s.Name); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := q.RefreshPristineBuiltinWorkerSize(ctx, params); err != nil || n != 1 {
+		t.Fatalf("drifted values: %d rows, %v; want 1", n, err)
 	}
 }
 

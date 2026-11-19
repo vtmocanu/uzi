@@ -12,18 +12,16 @@ import (
 
 // The cross-module size golden (PRD #58 Decision 7).
 //
-// DesiredWorker.Size carries a preset NAME, which the controller resolves against
-// its own copy of the preset table — the api may not know cpu/memory, because it may
-// not be the authority on a pod spec (Decision 1). That leaves the LEGAL VALUES of
-// that field as a contract spanning two separately-built Go modules with nothing
-// but this file joining them. It sits beside controller_poll_wire.json rather than
-// in workersize/testdata precisely because it is part of the SAME contract: one
+// DesiredWorker.Size carries a preset NAME. The LEGAL VALUES of that field are a
+// contract spanning two separately-built Go modules with nothing but this file
+// joining them. It sits beside controller_poll_wire.json rather than in
+// workersize/testdata precisely because it is part of the SAME contract: one
 // directory, one place to look.
 //
-// This is the producer half: workersize.Names IS the golden. The consumer half is
-// M3's, in the controller module, which reads this same file the way
-// protocol_contract_test.go already reaches the wire golden across the module
-// boundary.
+// This is the producer half: the fixture pins the shipped names, their order and the
+// seeded integers. The consumer half is in the controller module, which reads this
+// same file the way protocol_contract_test.go already reaches the wire golden across
+// the module boundary.
 //
 // TWO HONEST LIMITS, recorded here rather than discovered later:
 //
@@ -96,7 +94,7 @@ func TestHostedSizeNamesContract(t *testing.T) {
 func TestWireGoldenSizesAreValidRegistryNames(t *testing.T) {
 	for _, w := range samplePollResponse().Workers {
 		if !builtin.ValidBuiltin(w.Size) {
-			t.Errorf("the wire golden carries size %q, which workersize.Valid rejects — "+
+			t.Errorf("the wire golden carries size %q, which builtin.ValidBuiltin rejects — "+
 				"the two goldens in this directory have drifted apart", w.Size)
 		}
 	}

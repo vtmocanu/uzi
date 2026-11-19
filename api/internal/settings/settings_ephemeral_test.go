@@ -63,7 +63,7 @@ func TestValidateWorkerSizeKeys(t *testing.T) {
 				t.Errorf("Validate(%s, %q) = %v, want nil", key, v, err)
 			}
 		}
-		for _, v := range []string{"M", "L-HIGHMEM", "1s", "has space", "l_highmem", "a-name-that-is-too-long"} {
+		for _, v := range []string{"M", "L-HIGHMEM", "1s", "has space", "l_highmem", "a-name-that-is-too-long", "xl", "tiny"} {
 			if err := Validate(key, v); err == nil {
 				t.Errorf("Validate(%s, %q) = nil, want a rejection", key, v)
 			}
@@ -88,6 +88,17 @@ func TestWellFormedStoredSizeIsReturnedAsIs(t *testing.T) {
 	bad := New(&fakeStore{rows: []store.AppSetting{row(KeyEphemeralDefaultSize, "XS ?")}}, time.Minute)
 	if s, _ := bad.EphemeralDefaultSize(ctx); s != "m" {
 		t.Errorf("a malformed stored size = %q, want the default m", s)
+	}
+}
+
+// Regression: a well-formed name that is not a shipped builtin ("xs" has no worker_sizes
+// row in M1) must be refused at write time, or the ephemeral provisioner creates a worker
+// the controller cannot render.
+func TestValidateWorkerSizeRejectsWellFormedNonBuiltin(t *testing.T) {
+	for _, key := range []string{KeyEphemeralDefaultSize, KeyHostedDefaultSize} {
+		if err := Validate(key, "xs"); err == nil {
+			t.Errorf("Validate(%s, %q) = nil, want a rejection of a well-formed non-builtin size", key, "xs")
+		}
 	}
 }
 

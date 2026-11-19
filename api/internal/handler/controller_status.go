@@ -127,9 +127,9 @@ func (h *Handler) ControllerStatus(w http.ResponseWriter, r *http.Request) {
 		if err := h.q.UpsertControllerReport(r.Context(), pgconv.Time(observedAt)); err != nil {
 			slog.Error("controller status: advancing controller-report singleton", "error", err)
 		}
-		// PRD #4205: record the hibernation protocol version and poll interval beside it (PRD #4213
-		// adds the admin-size version to the same write)
-		// (version 0 is an honest "this controller does not speak it"). Best-effort like
+		// PRD #4205: record the hibernation protocol version and poll interval beside it
+		// (version 0 is an honest "this controller does not speak it"). PRD #4213 adds the
+		// admin-size version to the same write. Best-effort like
 		// the write above; admission refuses on a missing or stale advertisement.
 		// Only a fleet report speaks for the advertisement: a readiness report carries
 		// Hibernation 0 by construction and must not overwrite a fleet report's value.

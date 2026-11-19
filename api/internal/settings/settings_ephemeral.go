@@ -111,15 +111,17 @@ func validateEphemeralMaxPerUser(value string) error {
 	return nil
 }
 
-// validateWorkerSize is the write-time gate for the two default-size keys: a
-// well-formed size name; "" is the reset to the default. Format only: membership in the
-// size table is checked against the database by a later milestone (PRD #4213), not here.
+// validateWorkerSize is the write-time gate for the two default-size keys: a shipped
+// builtin size name; "" is the reset to the default. Builtins only until M3 of PRD #4213,
+// which replaces this with an in-transaction database membership check against
+// worker_sizes. Accepting any well-formed name before then would let an admin store a size
+// no row backs, and the controller could not render the worker.
 func validateWorkerSize(value string) error {
 	v := strings.TrimSpace(value)
-	if v == "" || builtin.WellFormed(v) {
+	if v == "" || builtin.ValidBuiltin(v) {
 		return nil
 	}
-	return fmt.Errorf("must be a lowercase size name (letters, digits and hyphens, starting with a letter, at most 16 characters)")
+	return fmt.Errorf("must be one of: %s", strings.Join(builtin.Names(), ", "))
 }
 
 // validateEphemeralLease is the write-time gate for ephemeral_lease: a Go duration in
