@@ -356,7 +356,7 @@ _b_declared() {
     if ! [[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then _b_reason "malformed declaration $name (not a variable name)"; continue; fi
     v="${!name:-}"
     # A variable may hold several whitespace-separated UUIDs; each must be one.
-    ids=(); read -r -a ids <<< "$v"   # split on whitespace, no pathname expansion
+    ids=(); read -r -a ids <<< "$(printf '%s' "$v" | tr '\n\t' '  ')"   # split on any whitespace, incl. newlines; no pathname expansion
     for id in ${ids[@]+"${ids[@]}"}; do
       if _is_uuid "$id"; then _B_DECL="$_B_DECL$(_lc "$id") "; else _b_reason "malformed declaration $name (not a UUID: $id)"; fi
     done
@@ -403,7 +403,7 @@ _boundary_begin() {
 # Sets _B_FAILED (0/1), _B_MESSAGE (`boundary: …`) and _B_END_SECS.
 _boundary_end() {
   local nn_slug="$1" slug="$2" handoff="$3" holds="$4" body_rc="$5"
-  local t0 timeout interval rem k kn i timed_out=0 final=0 parts=()
+  local t0 timeout interval rem k kn i timed_out=0 final=0 parts=() sv_keys=() sv_desc=() sv_obs="" sv_ok=0 kept=() hit=0
   t0="$(date +%s)"
   timeout="$(_pos_int "${E2E_BOUNDARY_TIMEOUT:-}" 120)"
   interval="$(_pos_int "${E2E_BOUNDARY_INTERVAL:-}" 1)"
@@ -418,9 +418,32 @@ _boundary_end() {
 
   while :; do
     _B_N=$((_B_N + 1))
+    if [ "$final" -eq 1 ]; then
+      # Snapshot the last complete sample: the final-window sample must never erase it.
+      sv_keys=(${_R_KEYS[@]+"${_R_KEYS[@]}"}); sv_desc=(${_R_DESC[@]+"${_R_DESC[@]}"})
+      sv_obs="$_B_HOLD_OBS"; sv_ok="$_B_HOLDS_OK"
+    fi
     _b_sample
     _b_residue
     _b_cancel_new
+    if [ "$final" -eq 1 ] && [ "${#_B_REASONS[@]}" -gt 0 ]; then
+      # A final-window read or cancel that ran out of budget is a timeout, not an
+      # unverifiable boundary: keep the previous complete sample's residue and any other
+      # (genuine) reason, and report the timeout.
+      kept=(); hit=0
+      for k in "${_B_REASONS[@]}"; do
+        case "$k" in
+          *"deadline exhausted"*|*"(timed out, exit "*|"cancel timed out "*) hit=1 ;;
+          *) kept+=("$k") ;;
+        esac
+      done
+      if [ "$hit" -eq 1 ]; then
+        _B_REASONS=(${kept[@]+"${kept[@]}"})
+        _R_KEYS=(${sv_keys[@]+"${sv_keys[@]}"}); _R_DESC=(${sv_desc[@]+"${sv_desc[@]}"})
+        _B_HOLD_OBS="$sv_obs"; _B_HOLDS_OK="$sv_ok"
+        timed_out=1; break
+      fi
+    fi
     # Any sticky reason (unverifiable read, rejected or timed-out cancel, phase-start or
     # declaration error) ends the loop after this sample: more samples cannot clear it.
     [ "${#_B_REASONS[@]}" -eq 0 ] || break
@@ -431,6 +454,7 @@ _boundary_end() {
     # Less than a full interval left: take ONE last observation inside the remaining budget
     # (sleeping until 1 s before the deadline), so residue that settles in that final window
     # is seen, then stop. Never sleep past the deadline into a sample-less timeout.
+    if [ "$rem" -le 0 ]; then timed_out=1; break; fi
     if [ "$rem" -le "$interval" ]; then
       [ "$rem" -le 1 ] || sleep $((rem - 1))
       final=1; continue

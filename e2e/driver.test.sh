@@ -86,6 +86,8 @@ db_psql_rows() {
     *) echo "fake db_psql_rows: unexpected query: $1" >&2; return 99 ;;
   esac
   if [ "$key" != capture ]; then fake_seq "$key" || rc=$?; fi
+  # FAKE_RUNS_SLEEP=N: a runs read costs N virtual seconds (a slow DB on a real clock).
+  if [ "$key" = runs ] && [ -n "${FAKE_RUNS_SLEEP:-}" ]; then sleep "$FAKE_RUNS_SLEEP"; fi
   printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "${_bdir##*/}" "$key" "${2:-}" \
     "${FAKE_ROWS//$'\n'/;}" "$1" >> "$FAKE_Q_LOG"
   if [ "$key" = owner ] && [ -n "${FAKE_OWNER_SLEEP:-}" ]; then sleep "$FAKE_OWNER_SLEEP"; fi
@@ -175,7 +177,7 @@ begin() { cur="$1"; case_fail=0
   printf '%s' 1000000 > "$FAKE_SEQ/.clock"
   : > "$ENVFILE"; : > "$FAKE_API_LOG"; : > "$FAKE_DB_LOG"; : > "$FAKE_Q_LOG"
   unset E2E_ONLY E2E_SKIP E2E_FAULT_PHASE E2E_BOUNDARY_TIMEOUT E2E_BOUNDARY_INTERVAL \
-    FAKE_CANCEL_CODE FAKE_CANCEL_EXIT FAKE_DOCKER_SEQ FAKE_OWNER_SLEEP 2>/dev/null || true
+    FAKE_CANCEL_CODE FAKE_CANCEL_EXIT FAKE_DOCKER_SEQ FAKE_OWNER_SLEEP FAKE_RUNS_SLEEP 2>/dev/null || true
   # A small boundary budget (virtual seconds, see the fake clock); a case needing more sets its own.
   export E2E_BOUNDARY_TIMEOUT=2 E2E_BOUNDARY_INTERVAL=1
 }
@@ -1140,9 +1142,10 @@ contains "$(row_msg bclean FAIL)" "still present from astick: run=$R1" || bad "b
 [ "$(bw_field bclean 3)" -eq 0 ] || bad "bclean end_secs should be 0, got $(bw_field bclean 3)"
 end
 
-# Case 32d — no wasted final sleep. Timeout 3 s, interval 2 s, a worker row that persists:
-# sample 1, sleep 2 (1 s left), sample 2, and then stop at once because another interval
-# does not fit. Two samples, end_secs 2 (sleeping the remainder would make it 3).
+# Case 32d — no sleep past the deadline. Timeout 3 s, interval 2 s, a worker row that
+# persists: sample 1, sleep 2 (1 s left), sample 2, then ONE final in-budget sample with no
+# further sleep (another interval does not fit). Three samples, end_secs 2 (sleeping the
+# remainder would make it 3).
 # Mutation: sleep the remaining second before giving up -> end_secs 3.
 begin "case32d: no sleep after the last sample that fits" 32d
 export E2E_BOUNDARY_TIMEOUT=3 E2E_BOUNDARY_INTERVAL=2
@@ -1169,6 +1172,24 @@ BODY
 run_driver 35a
 has_row lastwin PASS || bad "settled-in-final-window phase not PASS: $(cat "$TSV")"
 [ "$(qcount workers)" -eq 3 ] || bad "expected 3 worker samples, got $(qcount workers)"
+end
+
+# Case 35d — a final-window sample whose reads run out of budget (slow DB) must not erase
+# the residue of the last complete sample: the leak is still named, timed out, and known.
+# Mutation: let the final sample's deadline-exhausted reads stand -> message is only
+# "unverifiable ... (deadline exhausted before read)", no worker named, no timeout tag.
+begin "case35d: an out-of-budget final sample keeps the previous residue" 35d
+export E2E_BOUNDARY_TIMEOUT=3 E2E_BOUNDARY_INTERVAL=2 FAKE_RUNS_SLEEP=1
+seqf workers "$W1|$R1|1"
+mkphase "$PHASES_DIR/10-slowdb.sh" "persisting worker row, slow reads" no "" "" "" <<'BODY'
+pass "body ok"
+BODY
+run_driver 35d
+has_row slowdb FAIL || bad "not FAIL: $(cat "$TSV")"
+m="$(row_msg slowdb FAIL)"
+contains "$m" "worker=$W1 run=$R1 generation=1" || bad "leaked worker row not named: $m"
+contains "$m" "not settled within 3s" || bad "timeout tag missing: $m"
+contains "$m" "deadline exhausted" && bad "final-window budget exhaustion reported as unverifiable: $m"
 end
 
 # Case 35b (cross-check) — one handoff-holds variable may hold several whitespace-separated

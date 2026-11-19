@@ -185,7 +185,8 @@ Declarations are phase-header lines naming variables the body set, not values:
 - `# handoff: VAR [VAR...]` — variables holding **run IDs** that intentionally outlive the
   phase (`-` for none).
 - `# handoff-holds: VAR [VAR...]` — variables holding **custody hold UUIDs** that
-  intentionally stay open. Unset or empty declares nothing. The driver round-trips the
+  intentionally stay open. Unset or empty declares nothing. In both headers one variable may
+  hold several whitespace-separated UUIDs; each must be a UUID. The driver round-trips the
   declared names itself; they need not appear in `provides:`. Phase 52 declares
   `OUTBOX_CASE3_HOLD_ID` (case 3's completed run keeps its hold; the other cases' holds
   must settle) and phase 72 declares `FRESH_ID` (the wedge run's fresh hold stays open
