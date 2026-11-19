@@ -2,8 +2,10 @@ package workersvc
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
@@ -17,8 +19,13 @@ import (
 // It runs inside the claim transaction, with locked being the worker row as read by
 // GetWorkerForUpdate, after the claim snapshot was validated against it. A lost report sets the
 // column when it is NULL (the first-lost time is kept) and clears memory_authority_held_at. A loss
-// is sticky for its registration (issue #4492): the agent's loss is one-way until it restarts
-// (agent/src/client.ts), so a later held report never clears it and only Register does. A held
+// is sticky for its registration (issue #4492): an explicit lost report is one-way until the worker
+// restarts (agent/src/client.ts), so a later held report never clears it and only Register does,
+// which keeps a delayed or reordered held report from undoing a newer loss. Accepted cost: a loss
+// recorded for a capable worker that merely omitted the member (memoryAuthorityLost; for example
+// a stale feature advert during a mixed-version roll) also stays until Register, so that worker is
+// not pool-ready until it restarts; this never withholds a run (claim enforcement reads the
+// request). A held
 // report on a worker with no recorded loss returns a receipt time (the service clock) that the
 // claim passes to applyWorkerActiveSnapshot to stamp memory_authority_held_at, which pool
 // readiness needs fresh for a worker with both capabilities; a held report on a worker with a
@@ -77,14 +84,32 @@ func (s *Service) recordMemoryAuthority(ctx context.Context, qtx *store.Queries,
 // ephemeral worker (never in a pool) and a service without a transaction beginner. The worker row
 // is locked and the snapshot validated against it exactly like the claim transaction; an invalid
 // or stale snapshot (including a delayed report from a replaced registration) persists nothing.
-// Any error is logged with the worker id only and swallowed, so the poll still reports idle.
+// A rejected snapshot is already logged by validatedActiveSnapshot and is a quiet no-op here; any
+// other error is logged with the worker id and a coarse class (the SQLSTATE when there is one)
+// and swallowed, so the poll still reports idle.
+//
+// Replay: this path validates the snapshot epoch but never advances snapshot_epoch (only an
+// applied snapshot does), so a retried or reordered older poll of the same registration is still
+// accepted while the owner stays locked. That is harmless for the two columns written here: a
+// lost report is true in any order, a held report under a recorded loss is refused, and a repeat
+// held report only re-stamps the receipt. Do not add a write here that relies on the epoch for
+// replay protection.
 func (s *Service) persistMemoryAuthorityVaultLocked(ctx context.Context, wkr store.Worker, snapshot *ActiveSnapshot, lane string, report MemoryAuthorityReport) {
 	if lane == "cross_check" || snapshot == nil || snapshot.RegisterNonce == "" || wkr.Ephemeral || s.txBeginner == nil {
 		return
 	}
-	if err := s.persistMemoryAuthorityVaultLockedTx(ctx, wkr, snapshot, report); err != nil {
-		slog.Warn("vault-locked memory authority persist failed", "worker_id", wkr.ID)
+	err := s.persistMemoryAuthorityVaultLockedTx(ctx, wkr, snapshot, report)
+	if err == nil || errors.Is(err, ErrActiveSnapshotInvalid) {
+		return
 	}
+	class := "error"
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		class = "sqlstate_" + pgErr.Code
+	} else if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		class = "context"
+	}
+	slog.Warn("vault-locked memory authority persist failed", "worker_id", wkr.ID, "class", class)
 }
 
 func (s *Service) persistMemoryAuthorityVaultLockedTx(ctx context.Context, wkr store.Worker, snapshot *ActiveSnapshot, report MemoryAuthorityReport) error {
@@ -98,9 +123,6 @@ func (s *Service) persistMemoryAuthorityVaultLockedTx(ctx context.Context, wkr s
 			_ = tx.Rollback(ctx)
 		}
 	}()
-	if _, err := tx.Exec(ctx, "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"); err != nil {
-		return err
-	}
 	qtx := store.New(tx)
 	locked, err := qtx.GetWorkerForUpdate(ctx, wkr.ID)
 	if err != nil {

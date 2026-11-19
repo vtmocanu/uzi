@@ -250,6 +250,17 @@ func TestMemoryAuthorityStaleRegistrationReportsChangeNothingLiveDB(t *testing.T
 		if _, ok := m.heldAt(t); ok {
 			t.Fatal("SetWorkerSnapshotState stamped a receipt while a loss is recorded")
 		}
+		// StampWorkerMemoryAuthorityHeld under the CURRENT nonce while the loss is recorded also
+		// stamps nothing: its lost_at IS NULL fence, not only its nonce fence, refuses.
+		n, err = m.f.env.q.StampWorkerMemoryAuthorityHeld(m.f.env.ctx, store.StampWorkerMemoryAuthorityHeldParams{
+			ID: m.w.ID, RegisterNonce: pgconv.TextOrNull(m.nonce), HeldAt: pgconv.Time(time.Now()),
+		})
+		if err != nil || n != 0 {
+			t.Fatalf("Stamp with the current nonce under a loss: rows=%d err=%v, want 0", n, err)
+		}
+		if _, ok := m.heldAt(t); ok {
+			t.Fatal("StampWorkerMemoryAuthorityHeld stamped a receipt while a loss is recorded")
+		}
 	})
 }
 

@@ -41,8 +41,9 @@ type SetWorkerMemoryAuthorityLostParams struct {
 // zero-row no-op.
 //
 // A recorded loss is sticky for its registration: nothing here clears it, and only Register does
-// (the agent's loss is one-way until restart). A held report therefore never clears the loss, and
-// the receipt writers (StampWorkerMemoryAuthorityHeld here, SetWorkerSnapshotState) refuse to
+// (an explicit lost report is one-way until the worker restarts; a loss recorded because a
+// capable worker omitted the member also stays, an accepted cost). A held report therefore never
+// clears the loss, and the receipt writers (StampWorkerMemoryAuthorityHeld here, SetWorkerSnapshotState) refuse to
 // stamp while the loss is set.
 //
 // workers.memory_authority_held_at (the last fresh held receipt) is written by
