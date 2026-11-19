@@ -482,41 +482,48 @@ func (h *Handler) RerunJudge(w http.ResponseWriter, r *http.Request) {
 	}
 	judge, err := h.wsvc.RerunJudge(r.Context(), user.ID, user.IsAdmin, id)
 	if err != nil {
-		switch {
-		case errors.Is(err, workersvc.ErrRunNotFound):
-			httpx.Error(w, http.StatusNotFound, "run not found")
-		case errors.Is(err, workersvc.ErrNotRunOwner):
-			httpx.Error(w, http.StatusForbidden, "only the run owner can run the judge")
-		case errors.Is(err, workersvc.ErrRunNotJudgeable):
-			httpx.Error(w, http.StatusUnprocessableEntity, "this run cannot be judged")
-		case errors.Is(err, workersvc.ErrJudgeDisabled):
-			httpx.Error(w, http.StatusConflict, "run judging is disabled")
-		case errors.Is(err, workersvc.ErrNoAnthropicToken):
-			httpx.Error(w, http.StatusUnprocessableEntity, "add an Anthropic token before running the judge")
-		case errors.Is(err, workersvc.ErrCodexPoolUnavailable):
-			httpx.JSON(w, http.StatusUnprocessableEntity, codexPoolUnavailableBody())
-		case writeProviderCreateRefusal(w, err):
-		case errors.Is(err, workersvc.ErrNoCredentialForHarness):
-			// PRD #1429 M3 (D4); PRD #3257: the judge is created on an explicit harness (the
-			// owner's "Judge runs on" choice, else the target's); if that harness is not usable,
-			// creation refuses with no fallback. Same 422 shape mrrework_run.go's identical case
-			// uses; the message names the judge's harness, carried by JudgeHarnessError.
-			msg := "the judge's harness has no usable credential"
-			var jhe *workersvc.JudgeHarnessError
-			if errors.As(err, &jhe) {
-				msg = fmt.Sprintf("the judge's harness (%s) has no usable credential", jhe.Harness)
-			}
-			httpx.JSON(w, http.StatusUnprocessableEntity, map[string]any{
-				"error": msg,
-				"code":  "no_credential_for_harness",
-			})
-		case errors.Is(err, workersvc.ErrJudgeAlreadyActive):
-			httpx.Error(w, http.StatusConflict, "a judge run is already in progress for this run")
-		default:
-			slog.Error("rerun judge", "error", err)
-			httpx.Error(w, http.StatusInternalServerError, "internal error")
-		}
+		writeRerunJudgeError(w, err)
 		return
 	}
 	httpx.JSON(w, http.StatusAccepted, h.createdRunBody(r.Context(), runToDTO(judge, h.runPriorityClass(r.Context(), judge), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues)))
+}
+
+// writeRerunJudgeError maps RerunJudge's refusals to an HTTP status (extracted so each arm is testable).
+func writeRerunJudgeError(w http.ResponseWriter, err error) {
+	switch {
+	case writeTerminalConsumerGateRefusal(w, err):
+		// issue #4488: 503 + Retry-After (busy, retryable) or 409 (target run identity).
+	case errors.Is(err, workersvc.ErrRunNotFound):
+		httpx.Error(w, http.StatusNotFound, "run not found")
+	case errors.Is(err, workersvc.ErrNotRunOwner):
+		httpx.Error(w, http.StatusForbidden, "only the run owner can run the judge")
+	case errors.Is(err, workersvc.ErrRunNotJudgeable):
+		httpx.Error(w, http.StatusUnprocessableEntity, "this run cannot be judged")
+	case errors.Is(err, workersvc.ErrJudgeDisabled):
+		httpx.Error(w, http.StatusConflict, "run judging is disabled")
+	case errors.Is(err, workersvc.ErrNoAnthropicToken):
+		httpx.Error(w, http.StatusUnprocessableEntity, "add an Anthropic token before running the judge")
+	case errors.Is(err, workersvc.ErrCodexPoolUnavailable):
+		httpx.JSON(w, http.StatusUnprocessableEntity, codexPoolUnavailableBody())
+	case writeProviderCreateRefusal(w, err):
+	case errors.Is(err, workersvc.ErrNoCredentialForHarness):
+		// PRD #1429 M3 (D4); PRD #3257: the judge is created on an explicit harness (the
+		// owner's "Judge runs on" choice, else the target's); if that harness is not usable,
+		// creation refuses with no fallback. Same 422 shape mrrework_run.go's identical case
+		// uses; the message names the judge's harness, carried by JudgeHarnessError.
+		msg := "the judge's harness has no usable credential"
+		var jhe *workersvc.JudgeHarnessError
+		if errors.As(err, &jhe) {
+			msg = fmt.Sprintf("the judge's harness (%s) has no usable credential", jhe.Harness)
+		}
+		httpx.JSON(w, http.StatusUnprocessableEntity, map[string]any{
+			"error": msg,
+			"code":  "no_credential_for_harness",
+		})
+	case errors.Is(err, workersvc.ErrJudgeAlreadyActive):
+		httpx.Error(w, http.StatusConflict, "a judge run is already in progress for this run")
+	default:
+		slog.Error("rerun judge", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+	}
 }
