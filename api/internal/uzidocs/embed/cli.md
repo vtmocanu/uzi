@@ -3384,7 +3384,9 @@ resolved model and effort, and each resolved field's source. Stored null
 fields show `Default`; explicit choices show `Pin · value`. All
 cells are active and editable in **Settings → Run defaults → Cross-check**:
 in each stage the Codex cell configures the checker of a Claude lead, the Claude cell the
-checker of a Codex lead. CLI set/reset is deferred to #1703.
+checker of a Codex lead. Pin or clear a cell from the CLI with `uzi settings
+set|reset cross-check` ([Changing model and effort
+settings](#changing-model-and-effort-settings)).
 
 JSON returns the decoded account settings DTO, including
 `cross_check_pins`. Each cell has nullable stored
@@ -3461,8 +3463,10 @@ uzi settings set effort --harness claude runtime
 uzi settings set judge-model --harness codex <model-id>
 uzi settings set summary-model --harness claude <model-id>
 uzi settings set judge-runs-on codex
+uzi settings set cross-check --stage plan --harness codex --model <model-id> --effort high
 uzi settings reset worker-model --harness codex
 uzi settings reset judge-runs-on
+uzi settings reset cross-check --stage plan --harness codex
 ```
 
 `uzi settings set <setting> <value>` and `uzi settings reset <setting>` write
@@ -3478,12 +3482,23 @@ the instance defaults are untouched.
 | `judge-model` | `claude` or `codex`, required | A model id, validated by the server (the Codex judge lane accepts only curated models) | [Run judge](./judge.md#which-model-it-runs-on) |
 | `summary-model` | `claude` or `codex`, required | A model id, validated by the server | [Run summaries](./run-summaries.md#which-model-it-runs-on) |
 | `judge-runs-on` | none (an error if given) | `same-as-run`, `claude` or `codex` | [Judge runs on](./judge.md#judge-runs-on) |
+| `cross-check` | `claude` or `codex`, required, plus `--stage plan` or `--stage code`, required | No positional value; `--model <id>` and `--effort low`, `medium`, `high`, `xhigh` or `max`, at least one of them (`runtime` is not a checker effort) | [Cross-check pins](./configuration.md#plan-cross-check-model-and-effort-pins) |
 
 `reset` takes the same setting and `--harness` and no value. It clears the stored
 pin, so the setting follows the upstream default again (nothing is stored, so a
 later change to the default applies). For `judge-runs-on`, `reset judge-runs-on` and
 `set judge-runs-on same-as-run` are the same write: they clear the stored value, so
 the judge runs on the harness of the run it reviews.
+
+`set cross-check` pins the checker of one stage and harness cell (the harness
+names the checker's family, as in the settings table). An omitted `--model` or
+`--effort` keeps its stored value, and the model is validated like the web
+control (a model of the wrong family is rejected). `reset cross-check --stage
+<stage> --harness <harness>` clears both the model and the effort of that cell
+only, so it follows the worker default again; the other cells are untouched.
+A missing or invalid `--stage`, `--harness` or effort, a `--model` or `--effort`
+with no member, and `--stage`, `--model` or `--effort` given to another setting
+exit 2 without a request.
 
 `effort ... runtime` is the explicit **Runtime default** mode: uzi sends no
 effort and the runtime picks its own level (see [Runtime
@@ -3494,7 +3509,9 @@ stored choice that `uzi settings get` shows as `runtime default`.
 Human output prints the changed row of the **Model settings** table from a fresh
 [effective-settings](#effective-settings) read, so `STORED` and `SOURCE` show what
 the write did (`your choice` after a set; the default's own source after a
-reset). `judge-runs-on` prints the `Judge runs on:` line instead. `--json` prints
+reset). `judge-runs-on` prints the `Judge runs on:` line instead, and
+`cross-check` prints that cell's row of the cross-check table (stored pin,
+resolved value and source). `--json` prints
 the server's `{"settings": {...}}` envelope unchanged, without the effective
 read.
 
@@ -3519,9 +3536,9 @@ server could not confirm or read back the write, while the exit 0 line means
 the server confirmed the write and only the CLI's own effective-settings read
 failed.
 
-The route is an allowlist of nine fields (the two worker-model lanes, the two
-effort lanes, the two judge-model lanes, the two summary-model lanes and
-`judge_runs_on`); any other key is a 400 naming it, and the fields of one request
+The route is an allowlist of ten fields (the two worker-model lanes, the two
+effort lanes, the two judge-model lanes, the two summary-model lanes,
+`judge_runs_on` and `cross_check_pins`); any other key is a 400 naming it, and the fields of one request
 are written in one transaction. Consent switches (enabling the judge, cross-check
 or autopilot) and the generic `PUT /api/me/settings` stay cookie-only:
 `judge-runs-on`, `judge-model` and `summary-model` choose which harness or model

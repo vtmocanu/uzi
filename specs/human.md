@@ -1975,12 +1975,13 @@ Design record: issue #4373 (extends PRD `prds/done/3875-command-menu.md`).
 
 ## Feature #3264 — CLI model and effort settings
 
-PRD at `prds/3264-cli-model-settings.md` (milestone M1 only: M2 cross-check pins and M3 agent-template pins are not shipped).
+PRD at `prds/3264-cli-model-settings.md` (milestones M1 and M2 shipped; M3 agent-template pins are not shipped).
 
-- A user can set and reset their own worker-model, effort, judge-model, summary-model (per harness) and judge-runs-on defaults from the CLI with `uzi settings set|reset`, over a `uzc_` or `uza_` token, through the dedicated allowlisted `PUT /api/me/model-settings` (nine fields, one transaction, unknown key 400). (AI-synced 2026-11-19)
+- A user can set and reset their own worker-model, effort, judge-model, summary-model (per harness) and judge-runs-on defaults from the CLI with `uzi settings set|reset`, over a `uzc_` or `uza_` token, through the dedicated allowlisted `PUT /api/me/model-settings` (ten fields including `cross_check_pins`, one transaction, unknown key 400). (AI-synced 2026-11-19)
 - `PUT /api/me/settings` and every consent switch (enable judge, cross-check, autopilot) stay cookie-only. The judge and summary fields only redirect which model or harness already-enabled work uses; they cannot enable it. (AI-synced 2026-11-19)
 - Reset clears the stored pin so the setting follows the upstream default; effort `runtime` is the explicit Runtime default mode and is distinct from reset. (AI-synced 2026-11-19)
-- A failed effective-settings readback after a confirmed save still exits 0; a commit-unknown or saved-but-unreadable server answer exits 6. An older server exits 1 with an upgrade message. Cross-check pins and agent-template pins from the CLI are not shipped. (AI-synced 2026-11-19)
+- A failed effective-settings readback after a confirmed save still exits 0; a commit-unknown or saved-but-unreadable server answer exits 6. An older server exits 1 with an upgrade message. Agent-template pins from the CLI are not shipped. (AI-synced 2026-11-19)
+- `uzi settings set cross-check --stage plan|code --harness claude|codex [--model <id>] [--effort <level>]` pins one checker cell (at least one of model and effort; an omitted member is preserved; `runtime` is rejected), and `uzi settings reset cross-check --stage --harness` clears both members of that cell only. It prints that cell's row; `--json` prints the envelope. (AI-synced 2026-11-19)
 
 ## Demo mode branding
 
