@@ -136,7 +136,8 @@ export function parseCores(text: string): ParsedQuantity {
  * decimal places suffice for 1/1024 GiB, so more are refused.
  */
 export function parseMemoryGiB(text: string): ParsedQuantity {
-  const p = decimalParts(text);
+  // Trailing zeros of the fraction carry no value, so "1.50000000000" is just 1.5.
+  const p = decimalParts(text.trim().replace(/(\.\d*?)0+$/, "$1").replace(/\.$/, ""));
   if (!p) return { ok: false, error: "Enter memory in GiB, such as 4 or 1.5" };
   const mib = p.whole * 1024n;
   if (p.digits > 10 || mib % p.scale !== 0n) return { ok: false, error: "Must be a whole number of MiB (GiB × 1024)" };

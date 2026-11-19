@@ -174,15 +174,17 @@ export function WorkerSizesCard({
   const firstInput = useRef<HTMLInputElement>(null);
   const confirmButton = useRef<HTMLButtonElement>(null);
   // Set alongside the state change that renders the target; focused once it is mounted.
-  const focusTarget = useRef<{ kind: "edit" | "form" | "confirm"; name: string } | null>(null);
-  const setFocusTarget = (t: { kind: "edit" | "form" | "confirm"; name: string }) => {
+  const readOnlyBanner = useRef<HTMLDivElement>(null);
+  const focusTarget = useRef<{ kind: "edit" | "form" | "confirm" | "banner"; name: string } | null>(null);
+  const setFocusTarget = (t: { kind: "edit" | "form" | "confirm" | "banner"; name: string }) => {
     focusTarget.current = t;
   };
   useEffect(() => {
     const t = focusTarget.current;
     if (!t) return;
     const el =
-      t.kind === "form" ? firstInput.current
+      t.kind === "banner" ? readOnlyBanner.current
+      : t.kind === "form" ? firstInput.current
       : t.kind === "confirm" ? confirmButton.current
       : (editButtons.current.get(t.name) ?? null);
     // A button disabled while a write is in flight cannot take focus; try again once enabled.
@@ -276,6 +278,8 @@ export function WorkerSizesCard({
     if (err instanceof ApiError && err.status === 409) {
       const body = err.body as { read_only_reason?: string } | null;
       setConflict({ reason: body?.read_only_reason || err.message, against: data });
+      // The open editor locks, so focus would fall to body; the banner explains why.
+      setFocusTarget({ kind: "banner", name: "" });
       void onChanged();
       return;
     }
@@ -377,7 +381,11 @@ export function WorkerSizesCard({
         )}
       </div>
 
-      {readOnly && <Alert tone="warning" message={`Sizes are read-only. ${readOnlyReason}`} />}
+      {readOnly && (
+        <div ref={readOnlyBanner} tabIndex={-1} className="outline-none">
+          <Alert tone="warning" message={`Sizes are read-only. ${readOnlyReason}`} />
+        </div>
+      )}
       {loadError && <Alert message={loadError} />}
       {error && <Alert message={error} />}
       {result && <Alert tone="success" message={`Size ${sizeLabel(result.name)} ${result.verb}.`} />}
@@ -514,7 +522,7 @@ export function WorkerSizesCard({
               const id = `worker-size-${editingRow.name}-${f.key}`;
               const err = fieldErrors[f.key];
               return (
-                <div key={f.key} className="space-y-1">
+                <div key={f.key} className="min-w-0 space-y-1">
                   <label htmlFor={id} className="block text-xs font-medium text-muted">
                     {f.label} ({f.unit})
                   </label>
@@ -535,7 +543,7 @@ export function WorkerSizesCard({
                     className="px-2.5 py-1.5 tabular-nums disabled:opacity-60 aria-invalid:border-danger/70"
                   />
                   {err && (
-                    <p id={`${id}-error`} className="text-xs text-danger">
+                    <p id={`${id}-error`} className="text-xs text-danger [overflow-wrap:anywhere]">
                       {err}
                     </p>
                   )}

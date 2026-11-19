@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
+  ABSOLUTE_MAX,
   BUILTIN_WORKER_SIZES,
   BUILTIN_WORKER_SIZE_NAMES,
   cpuCores,
@@ -47,6 +48,9 @@ import {
 // simply do not expect the compiler to have your back on these two lines.
 import namesRaw from "../../../api/internal/hostedsvc/testdata/hosted_sizes.json?raw";
 import specsRaw from "../../../controller/internal/preset/testdata/hosted_size_specs.json?raw";
+// Same ?raw rationale: the api's absolute caps, read from their Go source so ABSOLUTE_MAX
+// cannot drift from them silently.
+import builtinGoRaw from "../../../api/internal/workersize/builtin/builtin.go?raw";
 
 const NAMES_GOLDEN = "api/internal/hostedsvc/testdata/hosted_sizes.json";
 const SPECS_GOLDEN = "controller/internal/preset/testdata/hosted_size_specs.json";
@@ -64,6 +68,21 @@ type SpecEntry = {
 type SeedEntry = { name: string; cpu_request_millicores: number; cpu_limit_millicores: number; memory_request_mib: number; memory_limit_mib: number; data_gib: number; dind_data_gib: number };
 const seed = (JSON.parse(namesRaw) as { sizes: SeedEntry[] }).sizes;
 const specs = JSON.parse(specsRaw) as { sizes: SpecEntry[]; nix: string };
+
+describe("ABSOLUTE_MAX mirrors the api's absolute caps", () => {
+  const goConst = (name: string): number => {
+    const m = new RegExp(`\\b${name}\\s+int64\\s*=\\s*(\\d+)`).exec(builtinGoRaw);
+    if (!m) throw new Error(`${name} not found in api/internal/workersize/builtin/builtin.go`);
+    return Number(m[1]);
+  };
+  it("equals MaxMillicores / MaxMemoryMiB / MaxDiskGiB in builtin.go", () => {
+    expect(ABSOLUTE_MAX).toEqual({
+      millicores: goConst("MaxMillicores"),
+      memoryMiB: goConst("MaxMemoryMiB"),
+      diskGiB: goConst("MaxDiskGiB"),
+    });
+  });
+});
 
 describe("BUILTIN_WORKER_SIZES mirrors the api's builtin seed", () => {
   it("matches the cross-module golden, integer for integer and in order", () => {
@@ -162,7 +181,9 @@ describe("human units", () => {
     expect(parseMemoryGiB("0.1")).toEqual({ ok: false, error: "Must be a whole number of MiB (GiB × 1024)" });
     // Exact, not within a float tolerance: this used to save as 1024.
     expect(parseMemoryGiB("1.0000000001")).toEqual({ ok: false, error: "Must be a whole number of MiB (GiB × 1024)" });
-    expect(parseMemoryGiB("1.50000000000")).toEqual({ ok: false, error: "Must be a whole number of MiB (GiB × 1024)" }); // > 10 places
+    expect(parseMemoryGiB("1.50000000000")).toEqual({ ok: true, value: 1536 }); // trailing zeros are not digits
+    expect(parseMemoryGiB("1.00000000000")).toEqual({ ok: true, value: 1024 });
+    expect(parseMemoryGiB("1.50000000001")).toEqual({ ok: false, error: "Must be a whole number of MiB (GiB × 1024)" }); // > 10 significant places
     expect(parseMemoryGiB("1.5000000000")).toEqual({ ok: true, value: 1536 });
     expect(parseMemoryGiB("0").ok).toBe(false);
     expect(parseMemoryGiB("1e3").ok).toBe(false);
