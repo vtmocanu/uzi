@@ -37,8 +37,9 @@ export function AdminWorkers() {
   }, []);
 
   // The worker sizes (PRD #4213) are read once here and re-read whenever the sizes editor
-  // asks (after each successful write, on Retry and after some refused writes), then handed to the sizes editor AND the two default-size selectors, so an edited
-  // quantity shows in those selectors at once. A failed read leaves the last good list.
+  // asks (after each successful write, on Retry and after some refused writes), then
+  // handed to the sizes editor AND the two default-size selectors, so an edited quantity
+  // shows in those selectors at once. A failed read leaves the last good list.
   const [sizes, setSizes] = useState<AdminWorkerSizes | null>(null);
   const [sizesError, setSizesError] = useState("");
   const mounted = useRef(true);

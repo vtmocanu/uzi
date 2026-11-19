@@ -35,7 +35,8 @@ import {
 // because something still uses the size says what, in the words of this page.
 //
 // The list itself is owned by AdminWorkers, which reads it once and re-reads it after every
-// successful write and after a 409 (onChanged), so the default-size selectors on the same page pick up an
+// successful write and after the refusals that ask for one (onChanged; not an in-use or
+// builtin removal refusal), so the default-size selectors on the same page pick up an
 // edited quantity at once.
 
 type FieldKey = keyof WorkerSizeSpec;
@@ -344,7 +345,9 @@ export function WorkerSizesCard({
   const removeButtons = useRef(new Map<string, HTMLButtonElement>());
   // A refused removal, shown inline under that row's actions (and nowhere else). It lasts
   // until another Add, Edit, Remove or Reset starts, or until the next re-read of the list
-  // arrives: a new list may no longer be what the refusal explained.
+  // arrives: a new list may no longer be what the refusal explained. An earlier write's
+  // unawaited re-read that lands after a later refusal clears that refusal too (accepted:
+  // the list it shows is then newer than the explanation).
   const [rowRefusal, setRowRefusal] = useState<{ name: string; message: string } | null>(null);
   const [refusalData, setRefusalData] = useState(data);
   if (data !== refusalData) {
