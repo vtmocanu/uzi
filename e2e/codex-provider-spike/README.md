@@ -1,84 +1,100 @@
-# Codex provider spike (M1)
+# Offline Codex provider characterization
 
-Run serially from `agent/` with existing dependencies:
+Run the standalone target from the repository root:
 
 ```sh
-npx tsc -p ../e2e/codex-provider-spike/tsconfig.json
-node --import tsx --test --test-concurrency=1 --test-timeout=30000 ../e2e/codex-provider-spike/*.test.ts
-node --import tsx ../e2e/codex-provider-spike/runner.ts
+task test:codex-provider-spike
 ```
 
-The opt-in root Taskfile target is `test:codex-provider-spike`. No relay or forwarder exists.
-The runtime must be image-baked with its matching receipt and lock. Supervisor posture is synthetic,
-protocol-only; this makes no packaged OS isolation claim. No real credentials or host environment are used.
+It uses provisioned agent dependencies, typechecks this subtree, runs its fixture/policy
+tests and executes all 35 real-runtime/control rows. No existing CI job, gate or M4 target
+calls it. No dependency installation, runtime download, relay or production routing is added.
+The required CLI and matching code-mode host are image-baked at the lock pin. An absent or
+mismatched runtime is an incomplete prerequisite, never a passing skip.
 
-The 21 rows include production baseline, wrong-key rejection, guard removal, receiver positive control,
-provider-table env-key/alternate-header variants, unsupported wire and Responses restoration through the
-same fixture transform, redirects, and TLS CA variants. Controls fail the runner if their relation is wrong;
-unexpected fixture errors are harness failures. Cross-host bind failure is unverified.
-receiver-control uses Node's HTTP client and has path identity fixture-control; it does not
-exercise the production launcher. The other 20 rows use the native runtime (production-launcher
-or fixture-config). The new 307-port-stall receiver consumes the redirected body but stalls its
-response. Even when the turn throws on timeout, final evidence must retain body=true,
-reason=forwarded and outcome=observed-failure; losing that relation fails the runner.
-Observations are copied during finally independently of turn success; an unexpected harness
-error still marks the run broken even when forwarding overrides the row reason.
+For diagnosis only, the runner accepts one exact finite row name from agent/:
+`node --import tsx ../e2e/codex-provider-spike/runner.ts callback`.
+Selected rows are not evidence of a complete characterization.
 
-Schema 1 rows contain finite configuration identity, outcome/reason, elapsedMs, exact observed request
-paths and header names (no values), credential equality, and redirect-target credential-header presence
-and body presence independently. Production sparse env booleans are caSSL/caCodex/credentialEnv.
-Actual child booleans are actualSSL/actualCodex/actualCredentialEnv. keyInConfig identifies the
-alternate-header variant; env-key and alternate-header remain held for design decision.
+## Evidence and interpretation
 
-Provider transformations run only on the single generated provider table. Runtime validation after
-transformation permits only HTTP(S) numeric 127.0.0.1 or 127.0.0.2 with explicit port and /v1 path;
-credentials, queries, fragments and additional sections fail before spawn.
-Fixture env overrides allow only SSL_CERT_FILE, CODEX_CA_CERTIFICATE and SPIKE_KEY over the
-production sparse replacement. Code mode remains disabled for CA cases. TLS verification stays enabled.
+evidence.json is the full schema-2 output, retained verbatim in the originating PRD's Decision
+Log. evidence-m1.json preserves the earlier 21-row M1 result. The PRD records invocation,
+exit, pin, limitations, review and the resulting #4323 requirements.
 
-Resource limits: four concurrent sockets globally across provider and receiver; request body 1 MiB;
-aggregate body consumption 4 MiB/16384 chunks per server, checked before accumulation; 16 response
-placeholders; fixed SSE below 1 MiB; transient notifications 4 MiB/16384 items before callback handling.
-Unexpected tool callbacks fail, with no callback results retained. Raw notifications and request bodies
-are not retained. Bounded transient stderr is classified to finite codes, never emitted.
-Evidence is limited to 64 rows/1 MiB and 64 KiB per row.
+`outcome` describes technical compatibility. A working managed-auth streamed baseline is
+`observed-supported`; `safetyOutcome=observed-failure` separately records unexpected native
+or unknown inventory. This distinction does not approve a production provider. At this pin
+redirects forward bodies and unexpected inventory remains: #4323 is blocked on a verified
+safety design. Env-key and static-header variants also remain held for their broader secret
+surfaces. No vendor subscription credential is used or sent to a provider.
 
-Independent five-minute run and 30-second case timers abort the owned child and close owned sockets,
-including during auth; the case timer remains installed through cleanup. A separate 25-second child kill
-timer and eight-second turn wait also apply. Child settlement is registered immediately after spawn,
-and cleanup awaits its close even if exit preceded disposal. Server close is idempotent under concurrent
-watchdog/finally calls. No process.exit is used. Timers are event-loop timers, not an external supervisor:
-synchronous filesystem/crypto operations can delay their delivery. Certificate generation has individual
-five-second subprocess timeouts.
+Rows project only finite names, safe header names (never values), request paths, bounded
+failure codes, booleans and elapsed times. Callback/denial/effect/roundtrip, native inventory,
+policy config, stripped environment, metadata, cancellation and resume are separate facts.
+In restart rows `effect` means an additional B request after its positive control.
+`deadlineObserved` remains independent of reason/outcome. Same-process resume override is
+fixture-config evidence. Direct Node receiver and destination controls are fixture-control.
 
-M1 observed behavior: baseline and restored Responses stream successfully; wrong-key rejects,
-and removing the guard restores streaming. Env-key and alternate-header work but remain held.
-Same-origin redirects forward credential headers and bodies; cross-port/host redirects forward
-bodies while stripping the credential header. Trusted SSL_CERT_FILE, CODEX_CA_CERTIFICATE
-and their combination stream successfully. The pinned runtime retries TLS refusal beyond the
-eight-second turn observation window: no-CA and untrusted-CA report deadline, as does TLS stall.
-That deadline is the observed runtime surface; these rows do not distinguish certificate refusal
-from a stalled handshake. M2 remains pending, including auxiliary-destination verification.
+## What ran
 
-Timing evidence supplied by main: baseline 72 seconds versus integrated 152 seconds during
-concurrent validation. Queue, cache and contention costs were not isolated, so this is not an
-isolated runtime regression measurement. No CI lane was added.
+The production launcher, managed API-key login, transport, broker and registry are reused
+through the unchanged loopback seam. Code-host callback, host-disabled, role/phase denial,
+advice, streaming abort/control and same-session resume are real protocol cases with injected
+command/file effects. Supervisor posture is synthetic: no packaged OS isolation, descendant
+reaping, cross-worker quiescence or production recovery claim is made.
 
-Tester mutation coordinates (disposable exact-candidate export only):
-- ownership.ts ownChild: install the close listener inside the returned cleanup instead of at spawn.
-  The early-exit half of “owned child settlement handles exit before disposal and live disposal” must time out.
-- runner.ts runOpenSSL: replace the absolute executable with bare openssl; sparse PATH regression must fail.
-- runner.ts wireFixture: remove the Responses restoration conditional; fixture transform regression must fail.
-- fake-provider.ts connection listener: replace global connections.size check with p.sockets.size;
-  the shared-cap test must fail.
-- runner.ts finally: remove the header/body observation copy (or move it back after the awaited
-  runProtocolTurn). The real 307-port-stall row must lose body=true and its relation guard must
-  produce a nonzero exit. Also remove the forwarding override to test reason/outcome protection.
-- driver.ts validateFixtureTable: restore the column-zero-only section count; the indented tools
-  and array-section fixture tests must fail.
-- runner.ts receiver-control path: relabel it production-launcher; the regenerated row must fail
-  the tester's fixture-control identity assertion.
-No executable mutation was performed by this implementation unit. These are tester obligations.
+Fresh-root rebind saves only bounded synthetic sessions, disposes and settles A, seeds through
+the existing seedSession seam, authenticates on a fresh root and resumes the same thread at B.
+Both restart rows positively exercise B first. Retaining closed A times out without a new B
+request. The same-process dotted provider override separately failed within the observation
+window. Cancellation is owned-root abort after stream start, not a measured turn/interrupt RPC.
 
-Validation logs and remaining obligations are in the handoff to main. No repo suites, commits,
-secret scan, review, hosted checks or mutation proofs were performed by this unit.
+The unknown-model case observes a fallback warning and config/read's nullable-integer
+model_context_window property. No context-window override changes the fixed builder.
+No local /v1/models request was seen. Request/stream retries are configured zero and websockets
+false; analytics/feedback/startup-update disable assertions do not certify all discovery.
+External auxiliary network behavior remains unverified. The altered-loopback URL control
+must be rejected before spawn; it does not intercept native network traffic.
+
+Native inventory checks traverse top-level, namespace/additional tools and nested tools
+declarations with finite projections. apply_patch is not allowlisted as worker authority:
+the worker alias is uzi_apply_patch. Unknown inventory is not assumed safe or effectful.
+A separate native probe returned "No usable execution environment is available", with no
+marker or worker effect. Advertisement is established; an effectful bypass is not.
+
+## Bounds and isolation
+
+Servers bind numeric loopback on dynamic ports; four active sockets are shared globally.
+Request bodies and scripted streams are at most 1 MiB. Aggregate request/notification byte
+and item budgets apply before retention; request bodies/descriptions are transient, not saved
+as transcripts. Evidence is capped at 64 KiB per row and 1 MiB total. Synthetic session copy
+rejects symlinks, excessive depth/count and more than 4 MiB. Only sessions are copied,
+never the credential/configuration home.
+
+Thirty-second case and five-minute run timers abort owned children and close owned sockets,
+remaining installed through cleanup. Child close settlement is installed at spawn. Event-loop
+timers are not an external hard supervisor; synchronous filesystem/crypto work can delay them.
+Certificate subprocesses have five-second deadlines. No process.exit bypasses cleanup.
+
+Provider transformations change only the generated provider table, preserve its exact header
+and require numeric-loopback HTTP(S) /v1 URLs with an explicit port and no userinfo/query/fragment.
+Indented/array extra sections fail. Env overrides accept only fixture key/CA variables over
+the sparse replaced child environment. CA rows disable code-host execution; overrides are
+absent from callback/advice/resume rows. TLS verification remains on. Both CA variables worked
+independently in fixture config; production strips them. Missing/untrusted CA and a stalled
+handshake all surfaced the bounded observation deadline without a distinct certificate error.
+
+## Validation controls
+
+The tester owns executable mutation proof in disposable exact-candidate exports. Coordinates:
+wrong-key/guard removal; wireFixture restoration; receiver header/body observation; finally
+observation after stalled redirect; ownChild early-exit listener; sparse OpenSSL path;
+shared socket cap; finite header/error bounds; fixture table section/header validation;
+broker role/phase denial; onStream abort; sessions-only seed and closed-A binding; altered
+destination assertion; second nested native member; safetyOutcome versus compatibility
+classification; metadata/warning projection. Never mutate the primary candidate.
+
+Full agent suite remains pending exact-head PR CI. The standalone experiment adds no CI
+lane. Timings in the PRD are measured observations with cache/contention/queue limitations,
+not isolated runtime regression claims.

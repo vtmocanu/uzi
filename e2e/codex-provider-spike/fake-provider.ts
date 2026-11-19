@@ -21,6 +21,9 @@ export const stream = [
 ].map(f => `event: ${f.type}\ndata: ${JSON.stringify(f)}\n\n`).join("");
 export interface ServerOptions {
   credential: string;
+  holdStream?: boolean;
+  onStream?: () => void;
+  respond?: (body: ResponsesBody) => ResponseItem[];
   guard?: boolean;
   host?: "127.0.0.1" | "127.0.0.2";
   redirect?: { status: 307 | 308; target: string };
@@ -49,6 +52,10 @@ export class FakeProvider {
   responsePath = false;
   streamed = false;
   oversized = false;
+  callbackOutput = false;
+  nativeTools = false;
+  nativeApplyPatch = false;
+  unknownInventory = false;
   readonly sockets = new Set<Socket>();
   readonly budget = new Budget(4 * 1024 * 1024, 16384);
   private constructor(readonly server: Server, readonly port: number, readonly options: ServerOptions) {}
@@ -75,18 +82,20 @@ export class FakeProvider {
   }
   private handle(req: IncomingMessage, res: ServerResponse): void {
     try { this.budget.take(0); } catch { req.destroy(); return; }
-    if (["/v1/responses", "/target"].includes(req.url ?? "")) this.paths.add(req.url!);
+    if (["/v1/responses", "/v1/models", "/target"].includes(req.url ?? "")) this.paths.add(req.url!);
     else if (this.errors.length === 0) this.errors.push("unexpected-path");
     for (const name of Object.keys(req.headers)) {
       if (SAFE_HEADER_NAMES.has(name)) this.headerNames.add(name);
     }
     req.on("error", () => {});
     let bytes = 0;
+    const chunks: Buffer[] = [];
     req.on("data", (chunk: Buffer) => {
       try {
         this.budget.take(chunk.length);
         if (bytes + chunk.length > 1024 * 1024) throw new Error("request-limit");
         bytes += chunk.length;
+        if (this.options.respond || req.url === "/v1/responses") chunks.push(chunk);
       } catch { this.oversized = true; req.destroy(); }
     });
     req.on("end", () => {
@@ -109,9 +118,35 @@ export class FakeProvider {
       }
       if (this.requests.length >= 16) { res.writeHead(429).end(); return; }
       this.requests.push({});
-      if (Buffer.byteLength(stream) > 1024 * 1024) throw new Error("script-limit");
+      let data = stream;
+      if (this.options.respond || req.url === "/v1/responses") {
+        try {
+          const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as ResponsesBody;
+          chunks.length = 0;
+          const input = Array.isArray(body.input) ? body.input : [];
+          this.callbackOutput ||= input.some((v: unknown) => v !== null && typeof v === "object" && ["custom_tool_call_output", "function_call_output"].includes(String((v as Record<string, unknown>).type)));
+          const inventory = inventoryProjection(body);
+          this.nativeTools ||= !inventory.nativeSuppressed;
+          this.nativeApplyPatch ||= inventory.nativeApplyPatch;
+          this.unknownInventory ||= inventory.unknownInventory;
+          const items = this.options.respond?.(body);
+          if (items) {
+          const frames = [{ type: "response.created", response: { id: "spike" } },
+            ...items.map(item => ({ type: "response.output_item.done", item })),
+            { type: "response.completed", response: { id: "spike", usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 } } }];
+          data = frames.map(f => `event: ${f.type}\ndata: ${JSON.stringify(f)}\n\n`).join("");
+          }
+        } catch {
+          if (this.errors.length === 0) this.errors.push("script-failure");
+          res.writeHead(500).end(); return;
+        }
+      }
+      if (Buffer.byteLength(data) > 1024 * 1024) throw new Error("script-limit");
       this.streamed = true;
-      res.writeHead(200, { "content-type": "text/event-stream" }).end(stream);
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      if (this.options.holdStream) { res.write('event: response.created\ndata: {"type":"response.created","response":{"id":"spike"}}\n\n'); }
+      else res.end(data);
+      this.options.onStream?.();
     });
   }
   private closing?: Promise<void>;
@@ -127,3 +162,44 @@ export class FakeProvider {
     await Promise.all(closed);
   }
 }
+
+// Finite names only; never persist descriptions or model inputs.
+export function inventoryProjection(body: ResponsesBody) {
+  const allowed = new Set(["functions", "exec", "wait", "request_user_input", "request_user_input_async", "clock", "curr_time", "clock.curr_time", "clock__curr_time", "uzi_bash", "uzi_apply_patch"]);
+  let count = 0, nativeApplyPatch = false, unknownInventory = false;
+  const name = (n: string) => {
+    if (n === "apply_patch") nativeApplyPatch = true;
+    else if (!allowed.has(n)) unknownInventory = true;
+  };
+  const visit = (value: unknown): void => {
+    if (++count > 1024) { unknownInventory = true; return; }
+    if (Array.isArray(value)) { for (const child of value) visit(child); return; }
+    if (!value || typeof value !== "object") { unknownInventory = true; return; }
+    const v = value as Record<string, unknown>;
+    if (typeof v.name === "string") name(v.name);
+    if (typeof v.type === "string" && !["function", "custom", "namespace"].includes(v.type)) unknownInventory = true;
+    if (typeof v.description === "string") {
+      for (const declaration of v.description.matchAll(/declare const tools:\s*\{/g)) {
+        const start = declaration.index! + declaration[0].length;
+        let depth = 1, end = start;
+        for (; end < v.description.length && depth; end++) {
+          if (v.description[end] === "{") depth++;
+          if (v.description[end] === "}") depth--;
+        }
+        if (depth) unknownInventory = true;
+        const members = v.description.slice(start, end - 1);
+        let seen = false;
+        for (const member of members.matchAll(/\b([A-Za-z_][A-Za-z0-9_.]*)\s*\(/g)) { seen = true; name(member[1]); }
+        if (!seen) unknownInventory = true;
+      }
+    }
+    for (const key of ["tools", "function", "namespaces", "additional_tools"]) if (key in v) visit(v[key]);
+    if (!("name" in v) && !["tools", "function", "namespaces", "additional_tools"].some(k => k in v)) unknownInventory = true;
+  };
+  if (body.tools !== undefined) visit(body.tools);
+  if (body.additional_tools !== undefined) visit(body.additional_tools);
+  const input = Array.isArray(body.input) ? body.input : [];
+  for (const v of input) if (v && typeof v === "object" && (v as Record<string, unknown>).type === "additional_tools") visit((v as Record<string, unknown>).tools);
+  return { nativeSuppressed: !nativeApplyPatch && !unknownInventory, nativeApplyPatch, unknownInventory };
+}
+export function allowedInventory(body: ResponsesBody): boolean { return inventoryProjection(body).nativeSuppressed; }

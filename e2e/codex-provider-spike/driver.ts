@@ -3,7 +3,7 @@ import { ownChild } from "./ownership.js";
 import { ownedDeadline } from "./timers.js";
 import { EventEmitter } from "node:events";
 import { spawn as nodeSpawn, type ChildProcess } from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync, readdirSync, lstatSync, copyFileSync } from "node:fs";
 import { readFileSync } from "node:fs";
 import { probeCodexRuntime } from "../../agent/src/codex/codex-runtime-probe.js";
 import type { CodexNotification } from "../../agent/src/codex/transport.js";
@@ -112,6 +112,7 @@ export interface ProtocolObservation {
   readonly binSource: string;
   readonly binaryEvidence: { path: string; version: string; archiveDigest: string; receipt: string; integrity: true };
   readonly notes: readonly CodexNotification[];
+  readonly threadId: string;
 }
 
 /** Inputs to one driven turn. Only the policy-relevant knobs; the launch plumbing is fixed. */
@@ -128,9 +129,15 @@ export interface ProtocolTurnOptions {
   /** The exact bearer credential the app-server presents to the fake provider. */
   readonly credential: string;
   readonly provider: FakeProvider;
+  readonly resumeOverride?: FakeProvider;
+  readonly session?: { seed?: string; resumeId?: string; save?: string };
+
   readonly fixture?: { table: (table: string) => string; env: NodeJS.ProcessEnv };
+  readonly metadataObservation?: (value: { modelContextWindowOwn: boolean; modelContextWindowNullableInteger: boolean }) => void;
+  readonly warningObservation?: () => void;
   readonly diagnostic?: (code: "config-rejected" | "tls-refused") => void;
   readonly signal?: AbortSignal;
+  readonly configObservation?: (value: ReturnType<typeof configProjection>) => void;
   readonly captureActual?: (env: NodeJS.ProcessEnv) => void;
   readonly capture?: (env: NodeJS.ProcessEnv) => void;
   /** The scripted fake-provider responder (fixed items, never a model choice). */
@@ -152,6 +159,8 @@ export interface ProtocolTurnOptions {
    *  (a nested `exec` cell's worker callback then reaches the broker); `false`/absent keeps it
    *  disabled (the same exec cell fails with "code-mode host is disabled" and no callback fires). */
   readonly codeModeHost?: boolean;
+  readonly allowCallbacks?: boolean;
+  readonly adversarialAdvertisement?: boolean;
   /** #1566: worker-created child, saved-root resume, or isolated advice protocol posture. */
   readonly lifecycle?: "start" | "resume" | "child" | "advice";
   /** How long to wait for the single turn to complete (default 60s). */
@@ -165,10 +174,12 @@ export interface ProtocolTurnOptions {
  * is O-layer). The spawned env is captured into `envSink` (the sparse replaced env isolation
  * oracle). Disposal really SIGKILLs the codex child.
  */
-function makeDirectCodexSpawn(codexBin: string, expectUid: number, envSink: { env?: NodeJS.ProcessEnv }, opts: ProtocolTurnOptions, ownedChildren: Array<() => Promise<void>>): SpawnSupervisor {
+function makeDirectCodexSpawn(codexBin: string, expectUid: number, envSink: { env?: NodeJS.ProcessEnv }, opts: ProtocolTurnOptions, ownedChildren: Array<() => Promise<void>>, saveHome: (home: string) => void): SpawnSupervisor {
   return (_command, _args, options): SupervisorProcess => {
     envSink.env = options.env;
     opts.capture?.(options.env);
+    if (opts.session?.save) saveHome(options.env.CODEX_HOME!);
+
     if (opts.fixture) {
       const configPath = path.join(options.env.CODEX_HOME!, "config.toml");
       const config = readFileSync(configPath, "utf8");
@@ -180,6 +191,9 @@ function makeDirectCodexSpawn(codexBin: string, expectUid: number, envSink: { en
       validateFixtureEnv(opts.fixture.env);
       writeFileSync(configPath, config.slice(0, split) + table, { mode: 0o600 });
     }
+    const projection = configProjection(readFileSync(path.join(options.env.CODEX_HOME!, "config.toml"), "utf8"), options.cwd!, opts.provider.baseUrl);
+    opts.configObservation?.(projection);
+    if (!projection.untrusted || !projection.nativeConfigDisabled || !projection.auxiliaryConfigDisabled || !projection.destinationMatched || !projection.zeroRequestRetries || !projection.zeroStreamRetries || !projection.websocketsDisabled) throw new Error("config-policy");
     opts.signal?.throwIfAborted();
     opts.captureActual?.({ ...options.env, ...opts.fixture?.env });
     const child: ChildProcess = nodeSpawn(codexBin, ["app-server"], {
@@ -194,6 +208,7 @@ function makeDirectCodexSpawn(codexBin: string, expectUid: number, envSink: { en
     let diagnosticText = "";
     child.stderr?.on("data", (chunk: Buffer) => {
       diagnosticText = (diagnosticText + chunk.toString("utf8")).slice(-65536);
+      if (unknownModelWarning(diagnosticText)) opts.warningObservation?.();
       if (/unknown variant .unsupported.|unsupported.*wire_api/i.test(diagnosticText)) opts.diagnostic?.("config-rejected");
       if (/certificate verify failed|invalid peer certificate|UnknownIssuer|certificate.*unknown issuer/i.test(diagnosticText)) opts.diagnostic?.("tls-refused");
     });
@@ -315,6 +330,10 @@ const fakeMakeRunnerTrees: MakeRunnerTrees = (request) => {
   if (request.sharedSessionRead !== undefined) {
     mkdirSync(request.sharedSessionRead.sessionDir, { recursive: true, mode: 0o700 });
   }
+  if (request.sessionSeedDir) {
+    const home = request.sharedSessionRead?.codexHome ?? path.dirname(request.files.find(f => f.path.endsWith("/config.toml"))!.path);
+    copySyntheticSessions(request.sessionSeedDir, path.join(home, "sessions"));
+  }
   for (const file of request.files) writeFileSync(file.path, file.content, { mode: file.mode });
 };
 const fakeRemoveRunnerTree: RemoveRunnerTree = (request) => {
@@ -358,6 +377,7 @@ export async function runProtocolTurn(mods: ProtocolModules, opts: ProtocolTurnO
   let base: string | undefined;
   let handle: Awaited<ReturnType<ProtocolModules["launchCodexRoot"]>> | undefined;
   let transport: ReturnType<ProtocolModules["createCodexTransport"]> | undefined;
+  let sessionHome: string | undefined;
   let primaryFailure: { error: unknown } | undefined;
   try {
     let priming = opts.lifecycle === "resume";
@@ -395,16 +415,17 @@ export async function runProtocolTurn(mods: ProtocolModules, opts: ProtocolTurnO
       ownedDataRoot,
       ...(opts.codeModeHost !== undefined ? { codeModeHost: opts.codeModeHost } : {}),
     });
+    if (opts.session?.seed) copySyntheticSessions(opts.session.seed, path.join(ownedDataRoot + ".session-seed", "sessions"));
     const deps: LauncherDeps = {
       env: opts.launcherEnv ?? { UZI_UID_SPLIT: "1" },
       resolveRunnerUid: () => runnerUid,
       makeRunnerTrees: fakeMakeRunnerTrees,
       removeRunnerTree: fakeRemoveRunnerTree,
-      spawnSupervisor: makeDirectCodexSpawn(launchPlan.executableBin, runnerUid, envSink, opts, ownedChildren),
+      spawnSupervisor: makeDirectCodexSpawn(launchPlan.executableBin, runnerUid, envSink, opts, ownedChildren, home => { sessionHome = home; }),
       appServerAuthOpenAIBaseUrlForTest: provider.baseUrl,
       deadlines: { started: 5_000 },
     };
-    handle = await mods.launchCodexRoot(launchPlan.spec, deps);
+    handle = await mods.launchCodexRoot({ ...launchPlan.spec, ...(opts.session?.seed ? { seedSession: true } : {}) }, deps);
     const inbound = handle.transport.stdout;
     const outbound = handle.transport.stdin;
     if (inbound === null || outbound === null) throw new Error("the app-server transport streams are unavailable");
@@ -414,6 +435,13 @@ export async function runProtocolTurn(mods: ProtocolModules, opts: ProtocolTurnO
     if (opts.signal?.aborted) closeTransport();
     const auth = mods.createCodexAppServerAuth({ mode: "api_key", apiKey: opts.credential });
     await auth.authenticate(transport);
+    if (opts.metadataObservation) {
+      const response = await transport.request<{ config?: Record<string, unknown> }>("config/read", {});
+      const config = response.config ?? {};
+      const value = config.model_context_window;
+      opts.metadataObservation({ modelContextWindowOwn: Object.hasOwn(config, "model_context_window"),
+        modelContextWindowNullableInteger: value === null || typeof value === "number" && Number.isSafeInteger(value) });
+    }
 
     let threadId: string | undefined;
     let turnId: string | undefined;
@@ -425,6 +453,7 @@ export async function runProtocolTurn(mods: ProtocolModules, opts: ProtocolTurnO
       for await (const note of notes) {
         notificationBudget.take(Buffer.byteLength(JSON.stringify(note)));
         if (/certificate verify failed|invalid peer certificate|UnknownIssuer|certificate.*unknown issuer/i.test(JSON.stringify(note))) opts.diagnostic?.("tls-refused");
+        if (unknownModelWarning(JSON.stringify(note))) opts.warningObservation?.();
         // M1 consumes notifications without retaining transcripts.
         if (rawNotes.length > 0) throw new Error("unexpected-retention");
         if (note.kind === "turn_completed" && note.threadId === threadId && note.turnId === turnId) {
@@ -439,7 +468,12 @@ export async function runProtocolTurn(mods: ProtocolModules, opts: ProtocolTurnO
             transport!.respond(note.requestId, { error: { code: -32601, message: "codex advice is tool-less" } });
             continue;
           }
-          throw new Error("unexpected-callback");
+          if (!opts.allowCallbacks) throw new Error("unexpected-callback");
+          if (callbacks.length >= 16) throw new Error("callback-budget");
+          const result = await broker.handleToolCall(rt, p.tool, p.arguments, origin);
+          callbacks.push({ tool: String(p.tool), callId: rt.callId, result });
+          transport!.respond(note.requestId, { result: { success: result.ok,
+            contentItems: [{ type: "inputText", text: result.ok ? JSON.stringify(result.output) : result.message }] } });
         } else if (note.kind === "activity" && note.requestId !== undefined) {
           transport!.respond(note.requestId, { error: { code: -32601, message: opts.lifecycle === "advice" ? "codex advice is tool-less" : "unsupported request" } });
         }
@@ -456,7 +490,7 @@ export async function runProtocolTurn(mods: ProtocolModules, opts: ProtocolTurnO
       sandbox: "danger-full-access",
       ephemeral: false,
       environments: [],
-      dynamicTools: opts.lifecycle === "advice" ? [] : mods.buildCodexDynamicTools(opts.grants),
+      dynamicTools: opts.lifecycle === "advice" ? [] : mods.buildCodexDynamicTools(opts.adversarialAdvertisement ? { ...opts.grants, allowedTools: new Set(["Bash"]) } : opts.grants),
       config: { project_doc_max_bytes: 0, projects: { [cwd]: { trust_level: "untrusted" } } },
       developerInstructions: "M4 C3 P developer instructions",
     };
@@ -464,9 +498,12 @@ export async function runProtocolTurn(mods: ProtocolModules, opts: ProtocolTurnO
       // A separate worker-created thread, never Codex's upstream spawn_agent.
       await transport.request("thread/start", threadParams);
     }
-    const threadRes = await transport.request<{ thread?: { id?: string } }>("thread/start", threadParams);
+    const threadRes = opts.session?.resumeId
+      ? await transport.request<{ thread?: { id?: string } }>("thread/resume", { ...threadParams, threadId: opts.session.resumeId })
+      : await transport.request<{ thread?: { id?: string } }>("thread/start", threadParams);
     threadId = threadRes.thread?.id;
     if (threadId === undefined) throw new Error("thread/start returned no thread id");
+    if (opts.session?.resumeId && threadId !== opts.session.resumeId) throw new Error("resume identity mismatch");
 
     if (opts.lifecycle === "resume") {
       const prime = await transport.request<{ turn?: { id?: string } }>("turn/start", {
@@ -475,9 +512,10 @@ export async function runProtocolTurn(mods: ProtocolModules, opts: ProtocolTurnO
       turnId = prime.turn?.id;
       await deadline(primeCompletion, "saved root completion", opts.turnDeadlineMs ?? 12_000);
       priming = false;
+      if (opts.resumeOverride) await provider.close();
       const resumed = await transport.request<{ thread?: { id?: string } }>("thread/resume", {
         threadId, model, modelProvider: mods.CODEX_M3B_LOOPBACK_PROVIDER_NAME, cwd,
-        approvalPolicy: "never", config: threadParams.config, developerInstructions: threadParams.developerInstructions,
+        approvalPolicy: "never", config: { ...threadParams.config, ...(opts.resumeOverride ? { ["model_providers." + mods.CODEX_M3B_LOOPBACK_PROVIDER_NAME + ".base_url"]: opts.resumeOverride.baseUrl } : {}) }, developerInstructions: threadParams.developerInstructions,
       });
       if (resumed.thread?.id !== threadId) throw new Error("resume did not retain the saved root");
     }
@@ -494,7 +532,12 @@ export async function runProtocolTurn(mods: ProtocolModules, opts: ProtocolTurnO
 
     await deadline(consume, "codex turn completion", opts.turnDeadlineMs ?? 12_000);
 
+    if (opts.session?.save) {
+      if (!sessionHome) throw new Error("session home missing");
+      copySyntheticSessions(path.join(sessionHome, "sessions"), opts.session.save);
+    }
     return {
+      threadId,
       callbacks,
       advertisedTools: advertisedToolsOf(provider.requests),
       spawnEnv: envSink.env ?? {},
@@ -534,4 +577,42 @@ export function validateFixtureTable(table: string): void {
   if (!["http:", "https:"].includes(url.protocol) || !["127.0.0.1", "127.0.0.2"].includes(url.hostname)
       || url.username || url.password || url.search || url.hash || url.pathname !== "/v1" || !url.port)
     throw new Error("fixture-url");
+}
+
+// Copies only fixture-owned synthetic sessions. Symlinks, oversized trees and excess depth fail closed.
+export function copySyntheticSessions(source: string, target: string): void {
+  let files = 0, bytes = 0;
+  const visit = (from: string, to: string, depth: number): void => {
+    if (depth > 8) throw new Error("session-copy-limit");
+    const stat = lstatSync(from);
+    if (stat.isSymbolicLink()) throw new Error("session-copy-symlink");
+    if (stat.isDirectory()) {
+      if (++files > 128) throw new Error("session-copy-limit");
+      mkdirSync(to, { recursive: true, mode: 0o700 });
+      for (const name of readdirSync(from)) visit(path.join(from, name), path.join(to, name), depth + 1);
+    } else {
+      if (!stat.isFile() || ++files > 128 || (bytes += stat.size) > 4 * 1024 * 1024) throw new Error("session-copy-limit");
+      copyFileSync(from, to);
+    }
+  };
+  visit(source, target, 0);
+}
+
+export function configProjection(config: string, cwd: string, baseUrl: string) {
+  const has = (line: string) => config.split("\n").includes(line);
+  return {
+    untrusted: config.includes("[projects." + JSON.stringify(cwd) + "]\ntrust_level = \"untrusted\""),
+    nativeConfigDisabled: ["apps", "plugins", "shell_tool", "view_image", "sleep_tool", "apply_patch_freeform", "shell_snapshot", "shell_snapshot_v2", "code_mode", "code_mode_only", "code_mode_prewarm", "unified_exec", "hooks", "multi_agent", "multi_agent_v2"].every(k => has(k + " = false")) && has('web_search = "disabled"'),
+    auxiliaryConfigDisabled: has("check_for_update_on_startup = false") && config.includes("[analytics]\nenabled = false") && config.includes("[feedback]\nenabled = false"),
+    destinationMatched: has("base_url = " + JSON.stringify(baseUrl)) || has("base_url = " + JSON.stringify(baseUrl.replace("http:", "https:"))),
+    zeroRequestRetries: has("request_max_retries = 0"),
+    zeroStreamRetries: has("stream_max_retries = 0"),
+    websocketsDisabled: has("supports_websockets = false"),
+  };
+}
+
+// Only pinned static warning templates count; arbitrary model text is never emitted.
+export function unknownModelWarning(text: string): boolean {
+  return text.includes("Model metadata for `spike-unknown-model` not found. Defaulting to fallback metadata; this can degrade performance and cause issues.")
+    || text.includes("Unknown model spike-unknown-model is used. This will use fallback model metadata.");
 }

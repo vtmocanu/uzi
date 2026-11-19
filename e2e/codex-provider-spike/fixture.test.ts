@@ -176,3 +176,23 @@ test("owned child settlement handles exit before disposal and live disposal", as
     assert.ok(child.exitCode !== null || child.signalCode !== null, "owned-child-unsettled");
   }
 });
+
+
+// The request parser projects fixed observations and never retains scripted bodies.
+test("scripted callback output is projected without retaining request contents", async () => {
+  const provider = await FakeProvider.start({ credential: "synthetic", respond: () => [] });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const req = request(provider.baseUrl + "/responses", { method: "POST", headers: { authorization: "Bearer synthetic" } }, res => {
+        res.resume(); res.once("end", resolve);
+      });
+      req.once("error", reject);
+      req.end(JSON.stringify({ input: [{ type: "custom_tool_call_output", output: "synthetic" }],
+        tools: [{ name: "shell" }] }));
+    });
+    assert.equal(provider.callbackOutput, true);
+    assert.equal(provider.nativeTools, true);
+    assert.deepEqual(provider.requests, [{}]);
+    assert.deepEqual(provider.errors, []);
+  } finally { await provider.close(); }
+});
