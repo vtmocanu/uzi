@@ -72,7 +72,7 @@ func TestCodexAdmissionClaimKindsLiveDB(t *testing.T) {
 					mr_iid=CASE WHEN $2='mr_rework' THEN 1 ELSE NULL END,
 					target_run_id=$3 WHERE id=$1`, run, kind, target)
 				if resume {
-					seedClaimProvenance(t, e.exec, run, worker, 3)
+					seedClaimProvenance(t, e.ctx, e.pool, e.exec, run, worker, 3)
 				}
 				before := mustRun(t, e, run)
 				seedAdmissionCooldown(t, e, alias)
