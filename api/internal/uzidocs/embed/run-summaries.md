@@ -132,9 +132,10 @@ option (it names the model and where it comes from, for example
 `Default · haiku (built-in)`) to inherit; the line under it shows the model in
 effect. [`uzi settings get`](./cli.md#plan-cross-check-settings) prints both
 lanes as `summary` rows. See
-[Admin settings](./admin-settings.md#run-summaries) for the instance-wide
-defaults of both lanes (the **Run summaries** card has a Claude and a Codex
-picker, each with a **Default** option that follows the built-in).
+[Admin settings](./admin-settings.md#instance-model-defaults) for the
+instance-wide defaults of both lanes (the **Instance model defaults** card has
+a Claude and a Codex Summary model picker, each with a **Default** option that
+follows the built-in).
 
 **The Claude value also drives Claude PR descriptions.** A Claude run's PR
 description is written on the same resolved model (falling back to `haiku` when

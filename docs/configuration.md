@@ -1065,7 +1065,7 @@ The in-app chat agent ([chat.md](chat.md)) rides the run machinery as a `chat` r
 ## Run judge (PRD #46)
 
 See [judge.md](judge.md) for what the feature does; it's also gated by
-settings in **Admin → Instance** (global on/off, judge model), not
+settings in **Admin → Instance** (global on/off on the Run judge card, judge model on Instance model defaults), not
 env vars. Self-improvement is no longer an admin instance setting or an env
 var — it's the `self-improve` [default job](scheduling.md#default-jobs),
 enabled per repo from the Schedules page; see [judge.md](judge.md) for how
