@@ -760,6 +760,14 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 		if !ok {
 			return store.Run{}, resolvedHarness{}, errHarnessStoreUnavailable
 		}
+		if origin.ConsumerGateRepo.Valid {
+			// Test-only path: a gated create still takes the gate, in a transaction of its own.
+			run, err := s.insertGatedNoBeginner(ctx, q, origin.ConsumerGateRepo.Bytes, res, insert)
+			if err != nil {
+				return store.Run{}, resolvedHarness{}, err
+			}
+			return run, res, nil
+		}
 		run, err := insert(q, res)
 		if err != nil {
 			return store.Run{}, resolvedHarness{}, err
@@ -775,6 +783,14 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 	// any Codex freeze, so a create that does not fully succeed commits nothing.
 	defer func() { _ = tx.Rollback(ctx) }()
 	qtx := store.New(tx)
+
+	// Issue #4488: the consumer gate is the FIRST thing the transaction does, before the provider
+	// lane check, the inherited-provider freeze, the secret lock and every closure lock.
+	if origin.ConsumerGateRepo.Valid {
+		if err := s.takeConsumerGate(ctx, tx, origin.ConsumerGateRepo.Bytes); err != nil {
+			return store.Run{}, resolvedHarness{}, err
+		}
+	}
 
 	if origin.RefuseProviderOwner {
 		if err := s.refuseProviderLane(ctx, qtx, userID); err != nil {

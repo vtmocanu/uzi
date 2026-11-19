@@ -299,6 +299,10 @@ func (s *Service) RerunJudge(ctx context.Context, userID uuid.UUID, isAdmin bool
 		if err := s.lockJudgeTargetForCreate(ctx, q, target.ID); err != nil {
 			return store.Run{}, err
 		}
+		// Issue #4488: the target must still exist in the repository whose gate was taken.
+		if err := requireGateTargetRepo(ctx, q, target.ID, target.RepoID); err != nil {
+			return store.Run{}, err
+		}
 		judge, err := q.CreateJudgeRun(ctx, store.CreateJudgeRunParams{
 			UserID:           target.UserID,
 			TargetRunID:      pgconv.UUID(target.ID),
@@ -311,7 +315,7 @@ func (s *Service) RerunJudge(ctx context.Context, userID uuid.UUID, isAdmin bool
 			s.judgeAfterInsertHook(ctx)
 		}
 		return judge, err
-	}, harnessCreationOrigin{RefuseProviderOwner: true}) // PRD #4320: judge refuses a provider-sourced owner (PRD #4322 enables it)
+	}, harnessCreationOrigin{RefuseProviderOwner: true, ConsumerGateRepo: target.RepoID}) // PRD #4320: judge refuses a provider-sourced owner (PRD #4322 enables it)
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {

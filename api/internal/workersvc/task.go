@@ -202,7 +202,9 @@ func (s *Service) CreateTaskRun(ctx context.Context, userID, repoID uuid.UUID, i
 			// defaulting every other creation path applies (ci_fix/mr_rework/CreateRun).
 			WaitOnLimit: s.resolveWaitOnLimit(ctx, userID, nil),
 		})
-	})
+		// Gated on every task create, not only a continued-issue one: the gate is cheap and a
+		// plain task is never a consumer, so an unconditional key keeps the funnel uniform.
+	}, harnessCreationOrigin{ConsumerGateRepo: gateRepoOf(repoID)})
 	if err != nil {
 		return store.Run{}, taskCreateError(err)
 	}
@@ -290,7 +292,12 @@ func (s *Service) CreateTaskReviewRun(ctx context.Context, userID, repoID, targe
 	if err != nil {
 		return store.Run{}, err
 	}
+	origin.ConsumerGateRepo = gateRepoOf(repoID)
 	run, err := s.createRunResolved(ctx, userID, &targetHarness, func(q Store, resolved resolvedHarness) (store.Run, error) {
+		// After the gate: the target must still exist in the gate's repository.
+		if err := requireGateTargetRepo(ctx, q, targetRunID, origin.ConsumerGateRepo); err != nil {
+			return store.Run{}, err
+		}
 		return q.CreateTaskReviewRun(ctx, store.CreateTaskReviewRunParams{
 			RunID:       id,
 			UserID:      userID,
@@ -367,7 +374,12 @@ func (s *Service) CreateThenFixRun(ctx context.Context, userID, repoID, original
 	if err != nil {
 		return store.Run{}, err
 	}
+	origin.ConsumerGateRepo = gateRepoOf(repoID)
 	run, err := s.createRunResolved(ctx, userID, &originalHarness, func(q Store, resolved resolvedHarness) (store.Run, error) {
+		// After the gate: the original must still exist in the gate's repository.
+		if err := requireGateTargetRepo(ctx, q, originalRunID, origin.ConsumerGateRepo); err != nil {
+			return store.Run{}, err
+		}
 		return q.CreateThenFixRun(ctx, store.CreateThenFixRunParams{
 			RunID:            id,
 			UserID:           userID,

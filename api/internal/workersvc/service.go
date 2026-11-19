@@ -2250,6 +2250,9 @@ type Service struct {
 	// inserted in the open transaction, right before that transaction's COMMIT, on every
 	// transactional create path. Nil in production.
 	createBeforeCommitHook func(run store.Run)
+	// consumerGateWait is a test-only override of terminalConsumerGateWait for the shared
+	// consumer gate an admission takes (consumerGateWaitFor). Zero in production.
+	consumerGateWait time.Duration
 	// judgeBeforeLockHook / judgeAfterInsertHook are test seams in the judge insert closures
 	// (issue #3257): the first runs in the creating transaction after the isolation check and
 	// before the target lock, the second after the judge INSERT and before the commit. Nil in
@@ -6093,7 +6096,7 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 	// terminal), this still captures the MR so the run never reports "MR: none".
 	// Best-effort: a failure here must not fail the worker's terminal report.
 	if req.MrIID != nil {
-		if _, mrErr := s.q.ReconcileRunMR(ctx, store.ReconcileRunMRParams{
+		if mrErr := s.reconcileRunMRGated(ctx, owned.RepoID, store.ReconcileRunMRParams{
 			MrIid: pgconv.Int8Ptr(req.MrIID), MrWebUrl: stripNULParam(req.MrWebURL), Branch: stripNULParam(req.Branch),
 			ID: runID, WorkerID: pgconv.UUID(wkr.ID),
 		}); mrErr != nil {
@@ -8657,6 +8660,7 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 	}, harnessCreationOrigin{
 		Kind: "issue", TriggerSource: triggerSource, Explicit: explicit, Model: model,
 		AnthropicOverride: credOverride != nil || (rawOverride != nil && rawOverride.Mode != CredentialOverrideModeInherit),
+		ConsumerGateRepo:  gateRepoOf(repoID),
 	})
 	if err != nil {
 		if isUniqueViolation(err) {

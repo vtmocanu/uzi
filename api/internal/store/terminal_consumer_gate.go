@@ -84,6 +84,9 @@ func (q *Queries) LockTerminalConsumerGateShared(ctx context.Context, repoID uui
 	if err := q.db.QueryRow(ctx,
 		"SELECT current_setting('transaction_isolation'), current_setting('lock_timeout')",
 	).Scan(&isolation, &prevTimeout); err != nil {
+		if ctx.Err() != nil {
+			return errors.Join(ErrTerminalConsumerGateBusy, err)
+		}
 		return fmt.Errorf("terminal consumer gate: read session settings: %w", err)
 	}
 	if isolation != "read committed" {
@@ -97,6 +100,9 @@ func (q *Queries) LockTerminalConsumerGateShared(ctx context.Context, repoID uui
 		ms = math.MaxInt32 // lock_timeout is an int4 of milliseconds
 	}
 	if _, err := q.db.Exec(ctx, "SELECT set_config('lock_timeout', $1, true)", strconv.FormatInt(ms, 10)+"ms"); err != nil {
+		if ctx.Err() != nil {
+			return errors.Join(ErrTerminalConsumerGateBusy, err)
+		}
 		return fmt.Errorf("terminal consumer gate: set lock_timeout: %w", err)
 	}
 	if _, err := q.db.Exec(ctx, "SELECT pg_advisory_xact_lock_shared($1, $2)",

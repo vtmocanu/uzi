@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -205,6 +206,34 @@ func TestTerminalConsumerGateAlreadyCancelledContextIsBusy(t *testing.T) {
 	cctx, cancel := context.WithCancel(ctx)
 	cancel()
 	if err := New(tx).LockTerminalConsumerGateShared(cctx, uuid.New(), time.Second); !errors.Is(err, ErrTerminalConsumerGateBusy) {
+		t.Fatalf("err = %v, want ErrTerminalConsumerGateBusy", err)
+	}
+}
+
+// lateCancelCtx reports a nil Err() on its first call (the helper's entry check) and
+// context.Canceled afterwards, with Done() already closed, so the helper's preamble
+// statements (read session settings, set lock_timeout) are the ones that see the ended context.
+type lateCancelCtx struct {
+	context.Context
+	calls atomic.Int32
+	done  chan struct{}
+}
+
+func (c *lateCancelCtx) Done() <-chan struct{} { return c.done }
+func (c *lateCancelCtx) Err() error {
+	if c.calls.Add(1) == 1 {
+		return nil
+	}
+	return context.Canceled
+}
+
+func TestTerminalConsumerGateContextEndedDuringPreambleIsBusy(t *testing.T) {
+	ctx, pool, _ := openRepoActivityLiveDB(t)
+	tx := tcgBegin(ctx, t, pool, pgx.TxOptions{})
+	lc := &lateCancelCtx{Context: ctx, done: make(chan struct{})}
+	close(lc.done)
+	err := New(tx).LockTerminalConsumerGateShared(lc, uuid.New(), time.Second)
+	if !errors.Is(err, ErrTerminalConsumerGateBusy) {
 		t.Fatalf("err = %v, want ErrTerminalConsumerGateBusy", err)
 	}
 }

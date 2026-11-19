@@ -28,11 +28,12 @@ import (
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres (./e2e/run-store-it.sh).
 
 const (
-	// raceHold bounds how long a paused side waits for its release. It stays well under the 4s
-	// server-side transaction_timeout later put on tx-R1.
+	// raceHold bounds how long a paused side waits for its release. The pause must stay below the
+	// server-side hold bounds of tx-R1 (4s transaction_timeout on PostgreSQL 17, a 4.35s worst case
+	// on 16, see terminalRetireBounds), or the server would end the paused transaction itself.
 	raceHold = 3 * time.Second
-	// racePoll is how long the window assertion watches for a consumer commit.
-	racePoll = time.Second
+	// racePoll bounds the wait for the admission to show up in pg_locks as a queued waiter on the gate.
+	racePoll = 5 * time.Second
 	// raceWaitBound bounds every wait of the test goroutine.
 	raceWaitBound = 15 * time.Second
 )
@@ -44,7 +45,7 @@ type raceFamily struct {
 	name   string
 	reason string
 	arm    func(t *testing.T, f *sweepFix)
-	admit  func(t *testing.T, f *sweepFix, svc *Service) error
+	admit  func(f *sweepFix, svc *Service, iid int64) error
 }
 
 func raceSourceIID(t *testing.T, f *sweepFix) int64 {
@@ -74,36 +75,35 @@ func raceFamilies() []raceFamily {
 					VALUES ($1, $2, $3, 'race issue', 'opened', '["uzi"]', 'https://forge.e2e/i', false, now(), now())`,
 					uuid.New(), f.e.repoID, raceSourceIID(t, f))
 			},
-			admit: func(t *testing.T, f *sweepFix, svc *Service) error {
-				_, err := svc.CreateRun(f.e.ctx, f.e.userID, f.e.repoID, raceSourceIID(t, f), "desc", nil, nil, false, nil, nil, nil, nil, nil, nil)
+			admit: func(f *sweepFix, svc *Service, iid int64) error {
+				_, err := svc.CreateRun(f.e.ctx, f.e.userID, f.e.repoID, iid, "desc", nil, nil, false, nil, nil, nil, nil, nil, nil)
 				return err
 			},
 		},
 		{
 			name: "self-improve run", reason: "cross_run_consumer",
-			admit: func(t *testing.T, f *sweepFix, svc *Service) error {
-				_, err := svc.CreateSelfImproveRun(f.e.ctx, f.e.userID, f.e.repoID, raceSourceIID(t, f), "t", "d", nil, nil, false, nil)
+			admit: func(f *sweepFix, svc *Service, iid int64) error {
+				_, err := svc.CreateSelfImproveRun(f.e.ctx, f.e.userID, f.e.repoID, iid, "t", "d", nil, nil, false, nil)
 				return err
 			},
 		},
 		{
 			name: "continued-issue task", reason: "cross_run_consumer",
-			admit: func(t *testing.T, f *sweepFix, svc *Service) error {
-				iid := raceSourceIID(t, f)
+			admit: func(f *sweepFix, svc *Service, iid int64) error {
 				_, err := svc.CreateTaskRun(f.e.ctx, f.e.userID, f.e.repoID, "continue the issue", "", false, false, false, false, &iid)
 				return err
 			},
 		},
 		{
 			name: "then-fix child", reason: "dependent_run_active",
-			admit: func(_ *testing.T, f *sweepFix, svc *Service) error {
+			admit: func(f *sweepFix, svc *Service, _ int64) error {
 				_, err := svc.CreateThenFixRun(f.e.ctx, f.e.userID, f.e.repoID, f.run, "uzi/task/"+uuid.NewString(), "main", "fix findings", pgtype.Int4{}, pgtype.Int4{}, HarnessClaude)
 				return err
 			},
 		},
 		{
 			name: "task review", reason: "dependent_run_active",
-			admit: func(_ *testing.T, f *sweepFix, svc *Service) error {
+			admit: func(f *sweepFix, svc *Service, _ int64) error {
 				_, err := svc.CreateTaskReviewRun(f.e.ctx, f.e.userID, f.e.repoID, f.run, "uzi/task/"+uuid.NewString(), "main", HarnessClaude)
 				return err
 			},
@@ -114,7 +114,7 @@ func raceFamilies() []raceFamily {
 				branch = raceBranch(t, f)
 				f.e.exec(t, `UPDATE runs SET mr_iid=777, mr_state='opened' WHERE id=$1`, f.run)
 			},
-			admit: func(_ *testing.T, f *sweepFix, svc *Service) error {
+			admit: func(f *sweepFix, svc *Service, _ int64) error {
 				_, err := svc.StartMRReworkForRun(f.e.ctx, f.e.userID, f.run, "please rework the merge request", nil)
 				return err
 			},
@@ -122,7 +122,7 @@ func raceFamilies() []raceFamily {
 		{
 			name: "ci fix", reason: "mr_run_active",
 			arm: func(t *testing.T, f *sweepFix) { branch = raceBranch(t, f) },
-			admit: func(_ *testing.T, f *sweepFix, svc *Service) error {
+			admit: func(f *sweepFix, svc *Service, _ int64) error {
 				_, err := svc.CreateCIFixRun(f.e.ctx, f.e.userID, f.e.repoID, branch, "Fix CI", "desc", sampleSnapshot(), nil)
 				return err
 			},
@@ -132,7 +132,7 @@ func raceFamilies() []raceFamily {
 			arm: func(t *testing.T, f *sweepFix) {
 				f.e.exec(t, `UPDATE users SET judge_enabled = true WHERE id = $1`, f.e.userID)
 			},
-			admit: func(_ *testing.T, f *sweepFix, svc *Service) error {
+			admit: func(f *sweepFix, svc *Service, _ int64) error {
 				run, err := f.e.q.GetRunByID(f.e.ctx, f.run)
 				if err != nil {
 					return err
@@ -143,7 +143,7 @@ func raceFamilies() []raceFamily {
 		},
 		{
 			name: "judge (rerun)", reason: "dependent_run_active",
-			admit: func(_ *testing.T, f *sweepFix, svc *Service) error {
+			admit: func(f *sweepFix, svc *Service, _ int64) error {
 				_, err := svc.RerunJudge(f.e.ctx, f.e.userID, false, f.run)
 				return err
 			},
@@ -243,10 +243,17 @@ func raceRetirementFirst(t *testing.T, f *sweepFix, probe func() bool, admit fun
 
 	admDone := make(chan error, 1)
 	go func() { admDone <- admit() }()
-	committed := false
-	for deadline := time.Now().Add(racePoll); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+	// Wait until the admission is queued behind the retirement on the gate key (a not-granted
+	// ShareLock waiter, so it cannot have committed), or until its consumer shows up as committed
+	// inside the window, which is the failure.
+	committed, queued := false, false
+	for deadline := time.Now().Add(racePoll); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
 		if probe() {
 			committed = true
+			break
+		}
+		if gateLocks(t, f, f.e.repoID, "ShareLock", false) > 0 {
+			queued = true
 			break
 		}
 	}
@@ -255,6 +262,8 @@ func raceRetirementFirst(t *testing.T, f *sweepFix, probe func() bool, admit fun
 	admErr := raceAwait(t, admDone, "the admission")
 	if committed {
 		t.Errorf("consumer committed inside the retirement decision window")
+	} else if !queued {
+		t.Errorf("the admission never queued on the consumer gate within %v", racePoll)
 	}
 	if sweepErr != nil {
 		t.Errorf("retire pass: %v", sweepErr)
@@ -274,9 +283,10 @@ func TestTerminalConsumerRaceRetirementFirstLiveDB(t *testing.T) {
 	for _, fam := range raceFamilies() {
 		t.Run(fam.name, func(t *testing.T) {
 			f, svc := raceFixture(t, fam)
+			iid := raceSourceIID(t, f)
 			raceRetirementFirst(t, f,
 				func() bool { return f.consumerRows() > 0 },
-				func() error { return fam.admit(t, f, svc) })
+				func() error { return fam.admit(f, svc, iid) })
 		})
 	}
 }
@@ -285,22 +295,27 @@ func TestTerminalConsumerRaceConsumerFirstLiveDB(t *testing.T) {
 	for _, fam := range raceFamilies() {
 		t.Run(fam.name, func(t *testing.T) {
 			f, svc := raceFixture(t, fam)
+			iid := raceSourceIID(t, f)
 			g := newRaceGate(t)
 			svc.createBeforeCommitHook = func(store.Run) { g.pause() }
 			admDone := make(chan error, 1)
-			go func() { admDone <- fam.admit(t, f, svc) }()
+			go func() { admDone <- fam.admit(f, svc, iid) }()
 			raceReached(t, g, "the admission to reach its commit")
 
 			// The admission has inserted its consumer but not committed: a retire pass must not retire.
 			f.sweep()
 			p, _ := f.pres()
 			retired := f.deleteCount() != 0 || p.State != "live"
+			gateBusy := p.LastError.String == "retire kept: consumer_gate_busy"
 			g.release()
 			if err := raceAwait(t, admDone, "the admission"); err != nil {
 				t.Fatalf("admission: %v", err)
 			}
 			if retired {
 				t.Fatalf("retired while a consumer admission was in flight (deletes=%d state=%s)", f.deleteCount(), p.State)
+			}
+			if !gateBusy {
+				t.Fatalf("first pass last_error = %q, want the gate-busy keep while the admission held the gate", p.LastError.String)
 			}
 			if f.consumerRows() == 0 {
 				t.Fatal("the admission returned without committing its consumer")
