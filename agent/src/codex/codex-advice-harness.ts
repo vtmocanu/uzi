@@ -645,6 +645,7 @@ export class CodexAdviceHarness implements AdviceHarness {
   ): Promise<string> {
     const params: Record<string, unknown> = {
       threadId,
+      environments: [],
       input: [{ type: "text", text: rendered.prompt }],
     };
     if (model !== undefined) params.model = model;

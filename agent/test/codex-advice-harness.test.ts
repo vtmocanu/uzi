@@ -593,6 +593,7 @@ describe("CodexAdviceHarness: kind + a text advice pass", () => {
     const start = bits.transport.requests.find((r) => r.method === "turn/start");
     assert.ok(start);
     const params = start.params as Record<string, unknown>;
+    assert.deepEqual(params.environments, [], "the advice turn disables native execution environments");
     assert.deepEqual(params.input, [{ type: "text", text: "please review" }]);
     assert.equal(params.model, "gpt-6-astra");
     assert.equal(params.effort, "high");

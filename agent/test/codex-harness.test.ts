@@ -2087,8 +2087,15 @@ describe("CodexHarness: kind + thread configuration", () => {
     assert.doesNotMatch(JSON.stringify(params), /dangerously-bypass-hook-trust/);
   });
 
-  it("thread/resume ALSO carries untrusted + doc_max 0 and never a hook-trust bypass", async () => {
+  it("cold thread/resume on a fresh harness carries untrusted + doc_max 0 and disables turn environments", async () => {
+    const prior = makeHarness();
+    prior.transport.push(threadStarted()).push(turnCompleted("completed")).end();
+    await collect(prior.harness.startTurn(makeRequest()).events);
+
     const { harness, transport } = makeHarness();
+    assert.notEqual(harness, prior.harness);
+    assert.notEqual(transport, prior.transport);
+    assert.equal(transport.requests.length, 0, "cold resume has no prior transport state");
     transport.push(threadStarted("resumed-1")).end();
     const turn = harness.startTurn(makeRequest({ resumeSessionId: "resumed-1" }));
     const it = turn.events[Symbol.asyncIterator]();

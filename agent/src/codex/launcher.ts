@@ -93,7 +93,7 @@ export const PROVIDER_CHILD_ARGV = ["app-server"] as const;
  *  --cleanup-token / --cache-token flags accept. */
 const LOWERCASE_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const RESERVED_PROVIDER_ENV_KEYS = new Set([
-  "HOME", "CODEX_HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME",
+  "HOME", "CODEX_HOME", "CODEX_EXEC_SERVER_URL", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME",
   "TMPDIR", "PATH", "SHELL", "LANG", "TERM", "NODE_OPTIONS", "BASH_ENV", "ENV", "SHELLOPTS",
   "LD_PRELOAD", "LD_LIBRARY_PATH",
 ]);
@@ -774,7 +774,8 @@ function validateLaunchContract(spec: CodexLaunchSpec): void {
 
 /** The fully-REPLACED env allowlist (never a merge of the worker's env): HOME,
  *  CODEX_HOME, the four XDG_*_HOME, TMPDIR, a fixed PATH, SHELL/LANG/TERM, and the
- *  provider credential var ONLY for `kind:"provider"`. No inherited worker/forge/
+ *  fixed CODEX_EXEC_SERVER_URL=none for provider app-server roots, and the provider
+ *  credential var ONLY for provider roots without app-server auth. No inherited worker/forge/
  *  Anthropic creds, proxy, NODE_OPTIONS, git config, or host HOME. */
 function buildReplacedEnv(trees: OwnedTrees, spec: CodexLaunchSpec): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
@@ -790,6 +791,7 @@ function buildReplacedEnv(trees: OwnedTrees, spec: CodexLaunchSpec): NodeJS.Proc
     LANG: "C",
     TERM: "dumb",
   };
+  if (spec.kind === "provider") env.CODEX_EXEC_SERVER_URL = "none";
   // An app-server-auth root delivers its credential over the login RPC, NOT the env: never
   // inject the provider var for it (the credential must not be readable in /proc/<pid>/environ).
   if (spec.kind === "provider" && !spec.useAppServerAuth && spec.provider.credentialValue !== undefined) {
