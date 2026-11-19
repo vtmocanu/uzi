@@ -148,11 +148,30 @@ describe("MessageBatcher credential switch hold", () => {
 
   it("prepare refuses a spilled batcher", async () => {
     const outbox = await mkOutbox();
+    // Issue #4489: prepare first awaits the in-flight spill flush, and a flush that outlasts
+    // the prepare deadline reports "unavailable", not "spilled" (seen once under CI load).
+    // Slow both of the flush's writes well past the deadline, then wait for the flush's
+    // last write to settle before preparing, so the assertion is about the spill refusal
+    // and not about disk latency.
+    const appendSegment = outbox.appendSegment.bind(outbox);
+    outbox.appendSegment = async (...args: Parameters<Outbox["appendSegment"]>) => {
+      await sleep(800);
+      return appendSegment(...args);
+    };
+    let spillFlushDone!: () => void;
+    const spillFlushed = new Promise<void>((resolve) => { spillFlushDone = resolve; });
+    const clearSpillUnclean = outbox.clearSpillUnclean.bind(outbox);
+    outbox.clearSpillUnclean = async (...args: Parameters<Outbox["clearSpillUnclean"]>) => {
+      await sleep(800);
+      try { return await clearSpillUnclean(...args); } finally { spillFlushDone(); }
+    };
     const a = api(true);
     const b = new MessageBatcher(a.client, RUN, 0, 5, nullLogger(), undefined, undefined,
       { outbox, generation: 1, transientTripMs: 30 });
     b.emit(text("s1"));
     await until(() => b.isSpilled(), 4000, "batcher enters spill");
+    await spillFlushed;
+    await new Promise<void>((resolve) => setImmediate(resolve)); // let the flush's finally settle
     const hold = b.holdForCredentialSwitch();
     const res = await hold.prepare(500);
     assert.equal(res.prepared, false);
