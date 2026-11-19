@@ -192,7 +192,7 @@ func runAgentTemplateWrite(cmd *cobra.Command, env Env, gf *globalFlags, ref, fi
 // match. More than one name match is a usage error listing the ids; none is a not-found error.
 func resolveAgentTemplate(ts []uzicli.AgentTemplatePins, ref string) (int, error) {
 	for i, t := range ts {
-		if t.ID == ref {
+		if strings.EqualFold(t.ID, ref) {
 			return i, nil
 		}
 	}

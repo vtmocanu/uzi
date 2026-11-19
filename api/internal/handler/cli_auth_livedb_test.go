@@ -501,6 +501,7 @@ func TestCLIRejectsBearerOnCookieOnlyRoutesLiveDB(t *testing.T) {
 	user := cliSeedUser(t, pool, false)
 	uzc := cliMintToken(t, pool, user, clitoken.ScopeUser)
 	runID := uuid.New()
+	tplID := pinsSeedTemplate(t, pool, "builtin", uuid.Nil, nil, nil)
 
 	cases := []struct {
 		name, method, path string
@@ -535,6 +536,12 @@ func TestCLIRejectsBearerOnCookieOnlyRoutesLiveDB(t *testing.T) {
 		// PRD #3264 M3: the pin route under /api/me is Bearer-reachable, but the full template edit
 		// (prompt, tools, description, builtin and global rows) stays cookie-only.
 		{"template full edit (only the pin route is Bearer-reachable)", http.MethodPut, "/api/agent-templates/" + runID.String()},
+		// The template READ routes stay cookie-only too (D5): they return prompt bodies, which an
+		// admin_ro token must not be able to read for other users' templates. Only the pin routes
+		// under /api/me are Bearer-reachable.
+		{"template list (prompt bodies, D5)", http.MethodGet, "/api/agent-templates"},
+		{"template get (prompt body, D5)", http.MethodGet, "/api/agent-templates/" + tplID.String()},
+		{"template rendered (prompt body, D5)", http.MethodGet, "/api/agent-templates/" + tplID.String() + "/rendered"},
 	}
 	for _, tc := range cases {
 		rec := bearerReq(router, tc.method, tc.path, uzc)

@@ -79,6 +79,22 @@ func TestAgentTemplateResolution(t *testing.T) {
 	}
 }
 
+// TestAgentTemplateExactIDBeatsName pins that an id match wins over a name match: one template is
+// NAMED with another template's id, and the ref resolves to the template that HAS that id.
+func TestAgentTemplateExactIDBeatsName(t *testing.T) {
+	const tplImpostor = "44444444-4444-4444-8444-444444444444"
+	for _, ref := range []string{tplMine, strings.ToUpper(tplMine)} {
+		fc := &uzicli.FakeClient{AgentTemplates: []uzicli.AgentTemplatePins{
+			{ID: tplImpostor, Name: tplMine, Scope: "user", Editable: true},
+			{ID: tplMine, Name: "reviewer", Scope: "user", Editable: true},
+		}}
+		_, stderr, code := runCLI(t, fakeEnv(fc), "agent-template", "set", ref, "--harness", "claude", "m")
+		if code != 0 || fc.LastAgentTemplateID != tplMine || fc.AgentTemplatePutCalls != 1 {
+			t.Fatalf("ref %q: code=%d id=%q puts=%d stderr=%s", ref, code, fc.LastAgentTemplateID, fc.AgentTemplatePutCalls, stderr)
+		}
+	}
+}
+
 func TestAgentTemplateAmbiguousNameExit2ListsIDsAndWritesNothing(t *testing.T) {
 	for _, args := range [][]string{
 		{"show", "coder"},
@@ -278,8 +294,8 @@ func TestAgentTemplateServerMessagesEndToEnd(t *testing.T) {
 			if tc.name == "commit unknown" {
 				// The hint names a real command: run it against the same fixture.
 				puts = 0
-				if _, stderr, code := runCLI(t, httpEnv(srv), "agent-template", "show", "reviewer"); code != 0 {
-					t.Fatalf("hint command failed: code=%d stderr=%s", code, stderr)
+				if _, stderr, code := runCLI(t, httpEnv(srv), "agent-template", "show", "reviewer"); code != 0 || puts != 0 {
+					t.Fatalf("hint command failed: code=%d puts=%d stderr=%s", code, puts, stderr)
 				}
 			}
 		})

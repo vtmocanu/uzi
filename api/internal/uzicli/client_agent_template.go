@@ -62,10 +62,9 @@ func (c *HTTPClient) ListMyAgentTemplates(ctx context.Context) (AgentTemplateLis
 }
 
 // PutAgentTemplateModelPins sets (string) or clears (nil, JSON null) the pins named in patch, whose
-// keys are the API fields model and codex_model. A JSON 404 is a missing template (ExitNotFound);
-// an error-less 404 or 405 is a server without the route, mapped to the "upgrade the server" error
-// like the list (the list succeeded first in the CLI, so this only fires behind a proxy that
-// drops the PUT).
+// keys are the API fields model and codex_model. Any 404 is a missing template (ExitNotFound); an
+// error-less 405 is a server without the route, mapped to the "upgrade the server" error like the
+// list.
 func (c *HTTPClient) PutAgentTemplateModelPins(ctx context.Context, id string, patch map[string]*string) (AgentTemplatePinsResult, error) {
 	path := "/api/me/agent-templates/" + url.PathEscape(id) + "/model-pins"
 	resp, body, err := c.doJSONRead(ctx, http.MethodPut, path, patch)
@@ -73,8 +72,11 @@ func (c *HTTPClient) PutAgentTemplateModelPins(ctx context.Context, id string, p
 		return AgentTemplatePinsResult{}, err
 	}
 	if resp.StatusCode/100 != 2 {
-		if e := unsupportedRouteError(resp.StatusCode, body, errAgentTemplatesUnsupported); e != nil {
-			return AgentTemplatePinsResult{}, e
+		// Any 404 is not-found (exit 4), JSON or not; only an error-less 405 is an older server.
+		if resp.StatusCode != http.StatusNotFound {
+			if e := unsupportedRouteError(resp.StatusCode, body, errAgentTemplatesUnsupported); e != nil {
+				return AgentTemplatePinsResult{}, e
+			}
 		}
 		return AgentTemplatePinsResult{}, statusError(resp.StatusCode, body, resp.Header.Get("Retry-After"))
 	}
