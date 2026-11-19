@@ -37,12 +37,14 @@ const (
 //
 // One READ COMMITTED transaction. The candidate worker is locked FOR UPDATE, then the run row FOR
 // SHARE (worker-then-run, as ClaimRun), and the run's status is re-read under that lock: a run that
-// is no longer queued is never woken for.
+// is no longer queued is never woken for. Claim provenance is rechecked in a fresh
+// statement under the run lock before any wake is recorded or changed.
 //
 //   - A run that already has a wake row never gets another while that row's worker is waking or
 //     settled awake: one wake per pending run, and no sibling is woken. The row lives until the run
-//     leaves 'queued' (ReleaseStaleWake). A row whose worker is hibernated or preparing again (a
-//     recovery path: HibernateWorker refuses to re-hibernate under a queued run's wake) is deleted
+//     leaves 'queued' or stops admitting its recorded worker (ReleaseStaleWake). A row whose
+//     worker is hibernated or preparing again (a recovery path: HibernateWorker refuses to
+//     re-hibernate under a queued run's wake) is deleted
 //     under that worker's lock and the run is treated as fresh demand.
 //   - A waking candidate whose wake_error is set is refused: a failed wake must not capture demand.
 //   - A candidate that is already waking only gets the row (DemandWakeAttached). Otherwise it moves
@@ -99,6 +101,15 @@ func (s *Service) DemandWake(ctx context.Context, runID, workerID uuid.UUID) (De
 		return DemandWakeNone, err
 	}
 	if status != "queued" {
+		return DemandWakeNone, nil
+	}
+	admitted, err := q.HibernationWakeProvenanceAdmits(ctx, store.HibernationWakeProvenanceAdmitsParams{
+		RunID: runID, WorkerID: workerID,
+	})
+	if err != nil {
+		return DemandWakeNone, err
+	}
+	if !admitted {
 		return DemandWakeNone, nil
 	}
 
@@ -161,8 +172,9 @@ func (s *Service) DemandWake(ctx context.Context, runID, workerID uuid.UUID) (De
 }
 
 // ReleaseStaleWake deletes run runID's wake row when the run is no longer queued (or no longer
-// exists), or when the row's worker is hibernated or preparing again (the wake can no longer serve
-// the run). A row whose worker settled awake is kept while the run is queued: it already woke once.
+// exists), when its recorded worker no longer passes claim provenance, or when the row's worker
+// is hibernated or preparing again (the wake can no longer serve the run). A row whose worker
+// settled awake is kept while the run is queued and still admits that worker: it already woke once.
 // The worker is locked first and the staleness is re-checked under the lock, so a wake being
 // recorded concurrently is never torn. It reports whether a row was deleted.
 func (s *Service) ReleaseStaleWake(ctx context.Context, runID uuid.UUID) (bool, error) {
@@ -199,12 +211,21 @@ func (s *Service) ReleaseStaleWake(ctx context.Context, runID uuid.UUID) (bool, 
 	if cur.WorkerID != w.ID {
 		return false, nil // re-pointed while we waited for the lock
 	}
-	run, err := q.GetRunByID(ctx, runID)
+	status, err := q.LockRunForShare(ctx, runID)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return false, err
 	}
-	stale := errors.Is(err, pgx.ErrNoRows) || run.Status != "queued" ||
+	stale := errors.Is(err, pgx.ErrNoRows) || status != "queued" ||
 		w.HibernationState == "hibernated" || w.HibernationState == "preparing"
+	if !stale {
+		admitted, aerr := q.HibernationWakeProvenanceAdmits(ctx, store.HibernationWakeProvenanceAdmitsParams{
+			RunID: runID, WorkerID: w.ID,
+		})
+		if aerr != nil {
+			return false, aerr
+		}
+		stale = !admitted
+	}
 	if !stale {
 		return false, nil
 	}

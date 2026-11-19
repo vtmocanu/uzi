@@ -117,6 +117,11 @@ gate so that provisioning and health do not count a held run as demand:
 - `ListSaturationQueuedRunsForEphemeral`
 - `ListHibernationWakeDemand`
 
+Wake candidates are rechecked against the same predicate after taking the run's
+share lock, before recording a wake. A recorded wake also becomes stale when its
+worker is no longer admitted, so a claim/requeue between passes cannot leave an
+unclaimable worker's wake blocking the recorded claimant.
+
 `ListIsolatedQueuedRunsForEphemeral` keeps excluding Codex runs as before.
 Readoption (#1390) is untouched: it continues a run in its current flight and
 does not claim.

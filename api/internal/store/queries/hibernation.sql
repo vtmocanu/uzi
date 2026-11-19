@@ -134,17 +134,25 @@ SELECT EXISTS (
 -- uses). The caller reads the status AFTER the lock, so a claim that won the race is seen.
 SELECT status FROM runs WHERE id = @id FOR SHARE;
 
+-- name: HibernationWakeProvenanceAdmits :one
+-- Read after LockRunForShare on the same READ COMMITTED transaction. The separate
+-- statement observes any claim/requeue committed while the run lock was awaited.
+SELECT COALESCE(fn_codex_claim_provenance_admits(r, @worker_id::uuid), false)::boolean AS admitted
+FROM runs r WHERE r.id = @run_id;
+
 -- name: ListStaleHibernationWakes :many
 -- Release candidates (PRD #4205 "One wake per pending run"): a wake row lives until its run is no
--- longer queued. A run that left 'queued' (claimed, cancelled, finished) qualifies, and so does a row
--- whose worker is hibernated or preparing again (the wake can no longer serve the run). A row whose
--- worker settled to none is kept while the run is queued, so the run never wakes a worker twice.
+-- longer queued or no longer admits its recorded worker under claim provenance. A run that left
+-- 'queued' (claimed, cancelled, finished) qualifies, and so does a row whose worker is hibernated
+-- or preparing again (the wake can no longer serve the run). An awake worker's row is kept while
+-- the queued run still admits it, so one pending run never wakes a valid worker twice.
 -- A deleted run's row goes with it (ON DELETE CASCADE). The caller re-checks under the locks.
 SELECT hw.run_id, hw.worker_id
 FROM hibernation_wakes hw
 JOIN runs r ON r.id = hw.run_id
 JOIN workers w ON w.id = hw.worker_id
 WHERE r.status <> 'queued' OR w.hibernation_state IN ('hibernated', 'preparing')
+   OR NOT fn_codex_claim_provenance_admits(r, hw.worker_id)
 ORDER BY hw.worker_id, hw.run_id
 LIMIT @max_rows;
 
