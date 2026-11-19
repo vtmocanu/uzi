@@ -87,7 +87,7 @@ func TestClaimProvenanceMigrationText(t *testing.T) {
 	}
 	for _, c := range []string{
 		"NEW.claim_generation=OLD.claim_generation+1",
-		"(OLD.claim_generation<1ORCOALESCE(OLD.claim_provenance_worker_id=NEW.worker_idANDOLD.claim_provenance_generation=OLD.claim_generation,false))",
+		"((OLD.claim_generation<1ANDOLD.claim_provenance_worker_idISNULLANDOLD.claim_provenance_generationISNULL)OR(OLD.claim_generation>=1ANDCOALESCE(OLD.claim_provenance_worker_id=NEW.worker_idANDOLD.claim_provenance_generation=OLD.claim_generation,false)))",
 		"(OLD.claim_provenance_worker_idISNULL)=(OLD.claim_provenance_generationISNULL)",
 		"(NEW.claim_provenance_worker_idISNULL)=(NEW.claim_provenance_generationISNULL)",
 		"NEW.claim_provenance_worker_idISNOTNULLANDNEW.claim_provenance_worker_id=NEW.worker_idANDNEW.claim_provenance_generation=NEW.claim_generation)ISNOTTRUETHEN",
