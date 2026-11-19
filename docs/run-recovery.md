@@ -3612,12 +3612,15 @@ Once retirement is on, you may see:
 - **A short 503.** If a retirement is deciding for the repo at that moment, a
   start may wait up to about 6 seconds and, in the rare case it still cannot
   proceed, answers `503` with `Retry-After: 1`. Nothing was created; retry. The
-  pollers and the scheduler treat it the same way: the trigger is not used up
-  and is tried again on the next pass.
+  pollers and issue schedules treat it the same way: the trigger is not used up
+  and is tried again on the next pass. A sweep schedule that has started no run
+  in that fire is retried the same way; one that already started runs stops,
+  records the remaining issue as skipped and advances (a one-time sweep is then
+  done, and a recurring one picks the issue up at its next fire).
 - **`retire kept: consumer_gate_busy`** on a terminal-preservation record: a
   run start was in progress, so retirement kept the ref and tries again later.
-- **A slightly slower worker report.** A finished run's report can wait up to
-  about 4 seconds per gated step (at most two steps) before its follow-up runs
+- **A slightly slower worker report.** A finished run's report can wait, usually
+  under 4 seconds and at most 6, per gated step (at most two steps) before its follow-up runs
   are created. Those follow-ups, and the MR it reports, are still recorded if the
   worker drops the connection meanwhile.
 

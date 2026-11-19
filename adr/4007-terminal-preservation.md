@@ -233,13 +233,16 @@ kinds are disjoint, and review and then-fix are mutually exclusive).
 `ErrTerminalConsumerGateBusy`, always retryable: HTTP admissions answer 503
 with `Retry-After: 1`, the pollers and the scheduler leave the trigger
 unrecorded (CI autofix never maps it to the errors that record a pipeline), and
-a one-time schedule is not consumed.
+a schedule that has started nothing in that fire is not advanced. A sweep fire
+that already started runs records the busy candidate as a `fetch_failed` skip,
+stops and advances (holding it would re-fire the whole sweep), so a one-time
+sweep does not retry that candidate.
 
 **Residual limits.** A fire-once hook or `ReconcileRunMR` still drops its work
 on a genuine database fault, as every other database error there already does;
 a durable retry is not built. A busy repository can defer retirement
 indefinitely; that is safe, because the preservation is kept.
-Detachment has a cost: before T3 a worker disconnect or its HTTP timeout
+Detachment has a cost: before T3 a worker disconnect (including its client-side HTTP timeout)
 cancelled the post-commit waits; now a stuck row-lock or judge-lock holder keeps
 the report's handler goroutine and pool connection (and, inside a gated write,
 the shared gate, so retirement keeps `consumer_gate_busy` for that repository)

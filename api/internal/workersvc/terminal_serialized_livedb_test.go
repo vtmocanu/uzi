@@ -28,7 +28,7 @@ import (
 // a pass that meets the lock does not retire, and the pass after the admission committed keeps the
 // ref on the matching blocker. It does not execute the admission's own validation code.
 // Nor does it prove the real admission takes that row lock: the test takes its own FOR UPDATE, so the
-// lock clauses of GetRunOwnedByWorkerForUpdate and LockFrozenWorkerSnapshotRuns are pinned elsewhere.
+// lock clauses of GetRunOwnedByWorkerForUpdate and LockFrozenWorkerSnapshotRuns are not pinned here.
 //
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres (./e2e/run-store-it.sh).
 
