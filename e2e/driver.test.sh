@@ -1122,7 +1122,7 @@ end
 # cancel is rejected (403) and R1 persists; B is otherwise clean and still sees R1: it FAILs
 # `still present from <A>` after ONE runs sample and no wait.
 # Mutation: skip the known-map append when _B_REASONS is non-empty -> B treats R1 as new,
-# so it is cancelled/waited on again (more samples, no `still present from`).
+# so B re-cancels R1 (another 403) and reports it as new, without `still present from`.
 begin "case32c: residue present when a sticky error ended the loop is recorded as known" 32c
 export E2E_BOUNDARY_TIMEOUT=10 FAKE_CANCEL_CODE=403
 seqf runs "$R1"

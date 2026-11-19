@@ -970,7 +970,7 @@ cleanup() {
   # A red run KEEPS its scratch dir so the per-phase artifacts/ the driver captured
   # survive for post-mortem (and #967's upload). "Red" = a non-zero exit $code OR the
   # driver's `$RUNROOT/.keep-rundir` sentinel, which the driver `touch`es on ANY
-  # FAIL/LEAK — so a non-strict LEAK, which exits 0, still keeps the dir per D5. The
+  # FAIL (a failed end-of-phase boundary is a FAIL), per D5. The
   # existing KEEP (KEEP_RUNDIR) path keeps it unconditionally and is handled first.
   if [ -n "$KEEP" ]; then
     exit $code
@@ -1095,7 +1095,7 @@ db_psql() {
 }
 # db_psql_rows SQL — like db_psql but PRESERVES row boundaries (one row per line).
 # db_psql collapses newlines (tr -d '\r\n') for scalar reads; use THIS for any
-# query whose result is enumerated row-by-row (the quarantine id sweep, the
+# query whose result is enumerated row-by-row (the driver boundary's samples, the
 # multi-row artifact dumps) so 2+ rows don't fuse into one garbage token. It strips
 # only `\r`, keeping `\n` row separators, and drops any DML command-completion tag LINE
 # (see db_psql) so a stray `INSERT 0 1` can never masquerade as an enumerated row. The
@@ -1790,7 +1790,8 @@ run_claimed_at() { apiget "/api/runs/$1" | jq -r '.run.claimed_at // empty'; }
 # settle_runs_terminal TIMEOUT RUN... — best-effort wait for each run a phase cancelled to
 # become terminal (completed/failed/cancelled) before the phase exits. A cancel to a run with a
 # live worker is only ENQUEUED; the worker applies it at its next poll, so a phase that exits
-# right after its cleanup cancels hands the driver's quarantine a still-live run and logs a LEAK.
+# right after its cleanup cancels hands the driver's end-of-phase boundary a still-live run, which
+# it cancels again and (if it does not settle in time) FAILs the phase.
 # Never fails a phase: it returns 0 whatever happens, and empty ids are skipped. Each status
 # read is a single curl capped at 5s (run_status_quick, no retry), so a hung api cannot stretch
 # the wait much past TIMEOUT.

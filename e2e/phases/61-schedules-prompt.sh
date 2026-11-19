@@ -57,4 +57,4 @@ echo "$RUN_P_JSON" | jq -e '.run | has("created_issues") | not' >/dev/null \
 pass "prompt run $RUN_P completed through the stub and opened MR !$MR_P without created issues"
 
 uzi_cli schedule delete "$SID" >/dev/null || fail "schedule delete failed (exit $?)"
-pass "deleted prompt schedule $SID; run terminal (quarantine-clean)"
+pass "deleted prompt schedule $SID; run terminal (boundary-clean)"

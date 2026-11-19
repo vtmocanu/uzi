@@ -130,7 +130,7 @@ if [ "${1:-}" != "--e2e-sanitized" ]; then
     DOCKER_HOST DOCKER_CONTEXT DOCKER_CONFIG DOCKER_CERT_PATH DOCKER_TLS_VERIFY DOCKER_TLS_CERTDIR \
     UZI_E2E_EXECUTOR UZI_E2E_NO_RECLAIM UZI_E2E_COMPOSE_PROJECT UZI_E2E_COMPLETE_TIMEOUT UZI_E2E_FORGE \
     E2E_RUN_DIR E2E_GIT_SMART_HTTP KEEP_STACK KEEP_RUNDIR \
-    PHASES_DIR E2E_ONLY E2E_SKIP E2E_STRICT_LEAKS E2E_FAULT_PHASE E2E_FAULT_PREFLIGHT
+    PHASES_DIR E2E_ONLY E2E_SKIP E2E_FAULT_PHASE E2E_FAULT_PREFLIGHT
   do
     [ -n "${!_v+set}" ] && _e2e_env+=("$_v=${!_v}")
   done
@@ -291,16 +291,17 @@ pass "board columns present"
 # --- phase registry driver (PRD #966 M2) -------------------------------------
 # All driver semantics — lane filter, ONLY/SKIP selection, requires validation,
 # the errexit-safe subshell-per-phase, provides round-trip, fail-soft + critical,
-# end-of-phase quarantine, results (results.tsv / junit.xml / summary.md) and the
+# the end-of-phase boundary (#2892), results (results.tsv / junit.xml / summary.md) and the
 # roll-call — live in e2e/driver.sh. It is sourced HERE at top level (never inside
 # a function) so its loop and its `source "$RUNROOT/phase.env.next"` run in this
 # shell: a `declare -p`-dumped var re-sourced inside a function becomes
 # function-local, which would silently break every phase's `provides:`.
 #
-# driver.sh reads the functions (say/pass/fail/db_psql/apipost/apipost_code/
-# wait_status) and globals (ROOT/RUNROOT/ENVFILE/FORGE/EXECUTOR) established above,
-# plus the E2E_ONLY / E2E_SKIP / E2E_STRICT_LEAKS / E2E_FAULT_PHASE knobs (kept in
-# the env -i allowlist at the top of this file). It ENDS WITH `exit`, so this is
+# driver.sh reads the functions (say/pass/fail/db_psql_rows/boundary_cancel)
+# and globals (ROOT/RUNROOT/ENVFILE/FORGE/EXECUTOR/ADMIN_EMAIL) established above,
+# plus the E2E_ONLY / E2E_SKIP / E2E_FAULT_PHASE knobs (kept in
+# the env -i allowlist at the top of this file). E2E_BOUNDARY_TIMEOUT and
+# E2E_BOUNDARY_INTERVAL are hermetic-test knobs and are deliberately NOT in that allowlist. It ENDS WITH `exit`, so this is
 # the last thing the entry script runs and its exit drives the cleanup trap.
 # shellcheck disable=SC1090  # $ROOT is a runtime path; driver.sh is sourced by design
 source "$ROOT/e2e/driver.sh"

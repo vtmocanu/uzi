@@ -12,7 +12,7 @@
 #
 # DEPENDS (the caller must define these BEFORE sourcing; the hermetic test fakes
 # them): functions  say pass fail db_psql_rows (SQL [SECS]) boundary_cancel
-#                   (PATH SECS EVIDENCE_PREFIX) wait_status
+#                   (PATH SECS EVIDENCE_PREFIX)
 #         globals    ROOT RUNROOT ENVFILE FORGE EXECUTOR ADMIN_EMAIL  (MARGINS_FILE optional)
 #                    COMPOSE (array; used ONLY by on-red artifact capture, which is
 #                    `|| true` throughout so a missing/short COMPOSE never reddens a run)
