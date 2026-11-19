@@ -26,13 +26,18 @@ ALTER TABLE runs
 --     statement, then matches 0 rows and the run stays running. Writes that leave awaiting_followup
 --     are never skipped.
 --   * Otherwise a transition into awaiting_followup, or a re-park with a higher open_followup_id,
---     increments the sequence.
--- Ordering: BEFORE UPDATE row triggers on runs fire in trigger-name order. This one sorts after
--- completed_publication_run_guard, enforce_gated_plan_approval, guard_checkpoint_coordinates_trg,
--- guard_publication_resume_trg, normalize_recovery_wait_phase_trg and the runs_credential_switch_*
--- pair, which only validate or normalize NEW (no writes to other rows), so skipping the row after
--- them discards nothing but their in-memory edits; it sorts before runs_source_publication_intent_guard,
--- which is then not run for the skipped row, and no AFTER trigger fires for a skipped row.
+--     increments the sequence. A same-generation entry from queued is NOT a new park: it is the
+--     snapshot re-adopt of a stale-requeued park (ReadoptRunsFromSnapshot /
+--     FrozenReadoptRunsFromSnapshot, status = a.phase), and the worker still holds the seq from that
+--     park's ACK, so the seq must survive the requeue like the other follow-up identity columns.
+-- Ordering: BEFORE UPDATE row triggers on runs fire in trigger-name order. Every BEFORE UPDATE
+-- trigger on runs only validates or normalizes NEW (none writes another row, PERFORMs or NOTIFYs),
+-- so skipping the row discards nothing but in-memory edits of the triggers that sorted before this
+-- one (e.g. completed_publication_run_guard, guard_publication_resume_trg, the
+-- runs_awaiting_first_enable_guard / runs_egress_binding_immutable_trg / runs_credential_switch_*
+-- guards); the triggers sorting after it (runs_reset_cross_check_lane,
+-- runs_source_publication_intent_guard) are not run for the skipped row, and no AFTER trigger fires
+-- for a skipped row.
 -- +goose StatementBegin
 CREATE FUNCTION runs_followup_park_identity() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
@@ -42,7 +47,8 @@ BEGIN
        AND OLD.claim_released_at IS NULL THEN
         RETURN NULL;
     ELSIF NEW.status = 'awaiting_followup'
-          AND (OLD.status <> 'awaiting_followup'
+          AND ((OLD.status <> 'awaiting_followup'
+                AND NOT (OLD.status = 'queued' AND NEW.claim_generation = OLD.claim_generation))
                OR COALESCE(NEW.open_followup_id, 0) > COALESCE(OLD.open_followup_id, 0)) THEN
         NEW.followup_park_seq := OLD.followup_park_seq + 1;
     END IF;
@@ -65,7 +71,10 @@ CREATE FUNCTION run_user_inputs_followup_finalize() RETURNS trigger LANGUAGE plp
 DECLARE
     r runs%ROWTYPE;
 BEGIN
-    SELECT * INTO r FROM runs WHERE id = NEW.run_id FOR UPDATE;
+    -- FOR NO KEY UPDATE conflicts with the admission UPDATE and with beginClaimMutation's FOR UPDATE,
+    -- which is all the serialization needs, without blocking the run's FK-checked child inserts
+    -- (FOR KEY SHARE) such as run_messages.
+    SELECT * INTO r FROM runs WHERE id = NEW.run_id FOR NO KEY UPDATE;
     IF FOUND AND r.kind = 'task' AND r.interactive
        AND r.followup_finalize_generation IS NOT NULL
        AND r.followup_finalize_generation = r.claim_generation

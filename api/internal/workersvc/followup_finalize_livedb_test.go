@@ -134,6 +134,20 @@ func TestFollowupFinalizeRegistersPublicationLiveDB(t *testing.T) {
 func TestFollowupParkSeqLiveDB(t *testing.T) {
 	f := newGateFix(t, 3)
 
+	t.Run("a same-generation re-adopt of a requeued park keeps the seq and still admits", func(t *testing.T) {
+		id, seq := f.ffParked()
+		// The stale-heartbeat requeue and the snapshot re-adopt (ReadoptRunsFromSnapshot /
+		// FrozenReadoptRunsFromSnapshot write status = a.phase) at the SAME claim generation.
+		f.exec(`UPDATE runs SET status = 'queued' WHERE id = $1`, id)
+		f.exec(`UPDATE runs SET status = 'awaiting_followup' WHERE id = $1`, id)
+		if got := f.ffRow(id).parkSeq; got != seq {
+			t.Fatalf("re-adopt moved seq %d -> %d", seq, got)
+		}
+		if _, applied, err := f.ffFinalize(id, 1, seq); err != nil || !applied {
+			t.Fatalf("finalize with the ACK seq after re-adopt = (applied %v, err %v)", applied, err)
+		}
+	})
+
 	t.Run("park allocates a positive seq; the same park retried keeps it", func(t *testing.T) {
 		id := f.ffNewTask()
 		first := f.ffPark(id, 1, nil)
@@ -266,6 +280,24 @@ func TestFollowupFinalizeAdmissionLiveDB(t *testing.T) {
 			id, seq := f.ffParked()
 			f.exec(`UPDATE runs SET status = 'cancelled' WHERE id = $1`, id)
 			f.ffRefused(id, 1, seq, ErrFollowupFinalizeRefused)
+		})
+		t.Run("completed run", func(t *testing.T) {
+			id, seq := f.ffParked()
+			f.exec(`UPDATE runs SET status = 'completed' WHERE id = $1`, id)
+			f.ffRefused(id, 1, seq, ErrFollowupFinalizeRefused)
+		})
+		t.Run("a running run that never parked", func(t *testing.T) {
+			id := f.ffNewTask()
+			f.ffRefused(id, 1, 1, ErrFollowupFinalizeRefused)
+		})
+		t.Run("a superseded flight onto an iteration-budget pause is stale, not refused", func(t *testing.T) {
+			id, seq := f.ffParked()
+			f.reclaim(id)
+			f.exec(`UPDATE runs SET status = 'paused', hold_reason = $2 WHERE id = $1`, id, IterationBudgetExhausted)
+			_, applied, err := f.ffFinalize(id, 1, seq)
+			if applied || !errors.Is(err, ErrStaleClaim) {
+				t.Fatalf("finalize = (applied %v, err %v), want ErrStaleClaim", applied, err)
+			}
 		})
 		t.Run("held run", func(t *testing.T) {
 			id, seq := f.ffParked()

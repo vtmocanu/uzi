@@ -4848,6 +4848,11 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		}
 		return owned, false, nil
 	}
+	// Issue #4479: a superseded or released followup_finalize flight is told stale_claim, never a
+	// refusal, even onto a policy episode or an iteration-budget pause (the no-op exits below).
+	if req.State == stateFollowupFinalize && (owned.ClaimGeneration != *req.ClaimGeneration || owned.ClaimReleasedAt.Valid) {
+		return owned, false, ErrStaleClaim
+	}
 	// Compact policy episodes have no generic continuation authority. Cancel remains
 	// the ordinary terminal action; the dedicated report reconciles its own replay.
 	if unresolvedPolicyEpisode(owned) && req.State != "cancelled" {

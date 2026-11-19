@@ -2089,7 +2089,8 @@ func (g gateSubmitter) SteerRunFromCard(ctx context.Context, userID, runID uuid.
 		return nil
 	case errors.Is(err, workersvc.ErrChatInputNotAllowed),
 		errors.Is(err, workersvc.ErrRunNotFound),
-		errors.Is(err, workersvc.ErrRunTerminal):
+		errors.Is(err, workersvc.ErrRunTerminal),
+		errors.Is(err, workersvc.ErrFollowUpFinalizing):
 		return errors.New(steerRunCardMessage(err))
 	default:
 		slog.Error("slack steer-run card", "run_id", runID, "error", err)
@@ -2109,6 +2110,9 @@ func steerRunCardMessage(err error) string {
 		return "That run isn't yours, or it no longer exists."
 	case errors.Is(err, workersvc.ErrRunTerminal):
 		return "That run has already finished."
+	case errors.Is(err, workersvc.ErrFollowUpFinalizing):
+		// Issue #4479: the worker is finalizing the run; retrying cannot succeed.
+		return "That run is finishing; your follow-up was not delivered."
 	default:
 		return "Couldn't steer that run right now — try again, or steer it in uzi."
 	}
