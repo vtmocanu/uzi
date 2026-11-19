@@ -28,8 +28,49 @@ func goldenPath(name string) string {
 	return filepath.Join("..", "..", "..", "api", "internal", "hostedsvc", "testdata", name)
 }
 
+// sizeSeed is one entry of the api's builtin size seed contract (hosted_sizes.json):
+// the name plus the plain integers the api seeds and sends on DesiredWorker.Resources.
+type sizeSeed struct {
+	Name                 string `json:"name"`
+	CPURequestMillicores int64  `json:"cpu_request_millicores"`
+	CPULimitMillicores   int64  `json:"cpu_limit_millicores"`
+	MemoryRequestMiB     int64  `json:"memory_request_mib"`
+	MemoryLimitMiB       int64  `json:"memory_limit_mib"`
+	DataGiB              int64  `json:"data_gib"`
+	DinDDataGiB          int64  `json:"dind_data_gib"`
+}
+
+func readSizeSeeds(t *testing.T) []sizeSeed {
+	t.Helper()
+	raw, err := os.ReadFile(goldenPath("hosted_sizes.json"))
+	if err != nil {
+		t.Fatalf("read hosted_sizes.json: %v", err)
+	}
+	var doc struct {
+		Sizes []sizeSeed `json:"sizes"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("parse hosted_sizes.json: %v", err)
+	}
+	if len(doc.Sizes) == 0 {
+		// A golden that parsed to nothing would make every assertion below vacuously
+		// pass — the "test that cannot fail" this PRD's Decision Log keeps catching.
+		t.Fatal("hosted_sizes.json carries no sizes")
+	}
+	return doc.Sizes
+}
+
+// readGolden returns the names a golden carries: the size names from the seed contract,
+// or the template names from hosted_templates.json (a plain string array).
 func readGolden(t *testing.T, file, field string) []string {
 	t.Helper()
+	if file == "hosted_sizes.json" {
+		var names []string
+		for _, s := range readSizeSeeds(t) {
+			names = append(names, s.Name)
+		}
+		return names
+	}
 	raw, err := os.ReadFile(goldenPath(file))
 	if err != nil {
 		t.Fatalf("read %s: %v", file, err)
@@ -43,11 +84,45 @@ func readGolden(t *testing.T, file, field string) []string {
 		t.Fatalf("%s has no %q field", file, field)
 	}
 	if len(names) == 0 {
-		// A golden that parsed to nothing would make every assertion below vacuously
-		// pass — the "test that cannot fail" this PRD's Decision Log keeps catching.
 		t.Fatalf("%s carries no %s", file, field)
 	}
 	return names
+}
+
+// The compiled-in preset quantities equal the api's builtin seed integers, exactly:
+// CPU in millicores, memory in whole MiB, disks in whole GiB, no remainder. The api
+// seeds its size table from this file and sends the integers on DesiredWorker.Resources
+// (PRD #4213), so a drift here would make an api-seeded builtin render a different pod
+// than the compiled-in fallback for the same name.
+func TestPresetQuantitiesEqualTheSeedContract(t *testing.T) {
+	const mib, gib = int64(1) << 20, int64(1) << 30
+	for _, seed := range readSizeSeeds(t) {
+		s, ok := sizes[seed.Name]
+		if !ok {
+			t.Errorf("seed size %q has no compiled-in preset", seed.Name)
+			continue
+		}
+		milli := func(label string, q resource.Quantity, want int64) {
+			if got := q.MilliValue(); got != want {
+				t.Errorf("size %q %s = %d millicores, seed contract says %d", seed.Name, label, got, want)
+			}
+		}
+		exact := func(label string, q resource.Quantity, unit, want int64) {
+			v := q.Value()
+			if v%unit != 0 {
+				t.Errorf("size %q %s = %d bytes is not a whole number of units (remainder %d)", seed.Name, label, v, v%unit)
+			}
+			if got := v / unit; got != want {
+				t.Errorf("size %q %s = %d, seed contract says %d", seed.Name, label, got, want)
+			}
+		}
+		milli("cpu_request", s.CPURequest, seed.CPURequestMillicores)
+		milli("cpu_limit", s.CPULimit, seed.CPULimitMillicores)
+		exact("memory_request_mib", s.MemoryRequest, mib, seed.MemoryRequestMiB)
+		exact("memory_limit_mib", s.MemoryLimit, mib, seed.MemoryLimitMiB)
+		exact("data_gib", s.DataSize, gib, seed.DataGiB)
+		exact("dind_data_gib", s.DinDDataSize, gib, seed.DinDDataGiB)
+	}
 }
 
 // Every size the api will ever put on the wire must resolve here. This is the gate:

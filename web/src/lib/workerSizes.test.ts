@@ -55,7 +55,11 @@ type SpecEntry = {
   data: string;
 };
 
-const names = JSON.parse(namesRaw) as { sizes: string[] };
+// hosted_sizes.json is the builtin seed contract (PRD #4213): entries carry the name plus
+// integers; this file pins names only (the controller test pins the integers).
+const names = {
+  sizes: (JSON.parse(namesRaw) as { sizes: { name: string }[] }).sizes.map((s) => s.name),
+};
 const specs = JSON.parse(specsRaw) as { sizes: SpecEntry[]; nix: string };
 
 describe("WORKER_SIZES mirrors the api's size registry", () => {

@@ -3,7 +3,7 @@ package hostedsvc
 import (
 	"encoding/json"
 	"os"
-	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/vtmocanu/uzi/api/internal/workersize"
@@ -36,43 +36,55 @@ import (
 //     reconcile, never render a guessed pod spec). A build-time gate cannot make a
 //     runtime mismatch impossible — only loud when it is our own mistake.
 //
-// Regenerate with `UPDATE_GOLDEN=1 go test ./internal/hostedsvc/...`.
+// PRD #4213 CHANGE: the file is no longer generated from workersize.Names. It is the
+// BUILTIN SEED CONTRACT, hand-maintained: each shipped size's name plus the integers the
+// api seeds and sends on DesiredWorker.Resources. This test pins only the NAMES (and
+// their order) against workersize.Names; the integers are pinned on the controller side
+// (controller/internal/preset, TestPresetQuantitiesEqualTheSeedContract), where the
+// compiled-in preset table lives.
 const sizeContractFixture = "testdata/hosted_sizes.json"
 
 // sizeGolden is the fixture's shape. An object rather than a bare array so the file
-// can gain a field (a description map, a deprecation marker) without breaking every
-// parser that already reads it.
+// can gain a field without breaking every parser that already reads it.
 type sizeGolden struct {
-	Sizes []string `json:"sizes"`
+	Sizes []sizeGoldenEntry `json:"sizes"`
+}
+
+type sizeGoldenEntry struct {
+	Name string `json:"name"`
+	SizeResources
 }
 
 func TestHostedSizeNamesContract(t *testing.T) {
-	got, err := json.MarshalIndent(sizeGolden{Sizes: workersize.Names}, "", "  ")
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	got = append(got, '\n')
-
-	if os.Getenv("UPDATE_GOLDEN") == "1" {
-		if err := os.MkdirAll(filepath.Dir(sizeContractFixture), 0o755); err != nil {
-			t.Fatalf("mkdir testdata: %v", err)
-		}
-		if err := os.WriteFile(sizeContractFixture, got, 0o644); err != nil {
-			t.Fatalf("write golden: %v", err)
-		}
-		t.Log("golden file updated")
-		return
-	}
-
 	want, err := os.ReadFile(sizeContractFixture)
 	if err != nil {
-		t.Fatalf("read golden (regenerate with UPDATE_GOLDEN=1 go test ./internal/hostedsvc/...): %v", err)
+		t.Fatalf("read golden: %v", err)
 	}
-	if string(got) != string(want) {
+	var doc sizeGolden
+	if err := json.Unmarshal(want, &doc); err != nil {
+		t.Fatalf("parse golden: %v", err)
+	}
+	names := make([]string, 0, len(doc.Sizes))
+	for _, e := range doc.Sizes {
+		names = append(names, e.Name)
+	}
+	if !slices.Equal(names, workersize.Names) {
 		t.Fatalf("the hosted size registry drifted from the cross-module golden.\n"+
-			"If this is a deliberate preset change, the CONTROLLER's preset table must change with it "+
+			"If this is a deliberate change, the CONTROLLER's preset table must change with it "+
 			"(a size the api accepts but the controller cannot resolve provisions a worker whose pod is "+
-			"never rendered).\n got:\n%s\nwant:\n%s", got, want)
+			"never rendered).\n registry: %v\n golden:   %v", workersize.Names, names)
+	}
+	for _, e := range doc.Sizes {
+		r := e.SizeResources
+		for field, v := range map[string]int64{
+			"cpu_request_millicores": r.CPURequestMillicores, "cpu_limit_millicores": r.CPULimitMillicores,
+			"memory_request_mib": r.MemoryRequestMiB, "memory_limit_mib": r.MemoryLimitMiB,
+			"data_gib": r.DataGiB, "dind_data_gib": r.DinDDataGiB,
+		} {
+			if v <= 0 {
+				t.Errorf("golden size %q has non-positive %s = %d", e.Name, field, v)
+			}
+		}
 	}
 }
 
