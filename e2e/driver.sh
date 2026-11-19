@@ -39,6 +39,8 @@
 # the PASS row's message but does not fail the phase. Residue a boundary reports
 # becomes KNOWN: later boundaries sample it once without waiting for it again, but
 # still FAIL while it is present, and every row after a failed boundary is annotated.
+# Residue present in the sample a sticky error ended the loop on is recorded as known too,
+# even a run cancelled in that same sample that has not settled yet.
 #
 # 🔴 THE MAIN LOOP AND ITS `source "$RUNROOT/phase.env.next"` ARE AT TOP LEVEL,
 # NEVER INSIDE A FUNCTION. `declare -p` emits `declare --`, and sourcing that
@@ -743,7 +745,7 @@ for f in "$_PHASES_DIR"/[0-9][0-9]-*.sh; do
     elif [ "$_B_FAILED" -eq 1 ]; then
       fmsg="$msg; $_B_MESSAGE"
     else
-      fmsg="$msg"
+      fmsg="$msg${_B_NOTE:+; $_B_NOTE}"
     fi
     _record "$slug" FAIL "$secs" "$fmsg" "$title"
     # Window = body seconds + the boundary's own seconds (the evidence spans all of it).

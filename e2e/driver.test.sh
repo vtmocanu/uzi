@@ -1118,6 +1118,61 @@ contains "$(row_msg stickyowner FAIL)" "unverifiable owner" || bad "message: $(r
 [ "$(qcount runs)" -eq 1 ] || bad "expected exactly 1 runs sample, got $(qcount runs)"
 end
 
+# Case 32c — residue from the sample a sticky error ended the loop on becomes KNOWN. A's
+# cancel is rejected (403) and R1 persists; B is otherwise clean and still sees R1: it FAILs
+# `still present from <A>` after ONE runs sample and no wait.
+# Mutation: skip the known-map append when _B_REASONS is non-empty -> B treats R1 as new,
+# so it is cancelled/waited on again (more samples, no `still present from`).
+begin "case32c: residue present when a sticky error ended the loop is recorded as known" 32c
+export E2E_BOUNDARY_TIMEOUT=10 FAKE_CANCEL_CODE=403
+seqf runs "$R1"
+mkphase "$PHASES_DIR/10-astick.sh" "A rejected cancel" no "" "" "" <<'BODY'
+pass "body ok"
+BODY
+mkphase "$PHASES_DIR/11-bclean.sh" "B clean" no "" "" "" <<'BODY'
+pass "body ok"
+BODY
+run_driver 32c
+has_row astick FAIL || bad "astick not FAIL: $(cat "$TSV")"
+has_row bclean FAIL || bad "bclean not FAIL: $(cat "$TSV")"
+contains "$(row_msg bclean FAIL)" "still present from astick: run=$R1" || bad "bclean message: $(row_msg bclean FAIL)"
+[ "$(qcount runs 11-bclean)" -eq 1 ] || bad "bclean sampled runs $(qcount runs 11-bclean) times, want 1"
+[ "$(bw_field bclean 3)" -eq 0 ] || bad "bclean end_secs should be 0, got $(bw_field bclean 3)"
+end
+
+# Case 32d — no wasted final sleep. Timeout 3 s, interval 2 s, a worker row that persists:
+# sample 1, sleep 2 (1 s left), sample 2, and then stop at once because another interval
+# does not fit. Two samples, end_secs 2 (sleeping the remainder would make it 3).
+# Mutation: sleep the remaining second before giving up -> end_secs 3.
+begin "case32d: no sleep after the last sample that fits" 32d
+export E2E_BOUNDARY_TIMEOUT=3 E2E_BOUNDARY_INTERVAL=2
+seqf workers "$W1|$R1|1"
+mkphase "$PHASES_DIR/10-lastsleep.sh" "persisting worker row" no "" "" "" <<'BODY'
+pass "body ok"
+BODY
+run_driver 32d
+has_row lastsleep FAIL || bad "not FAIL: $(cat "$TSV")"
+contains "$(row_msg lastsleep FAIL)" "not settled within 3s" || bad "message: $(row_msg lastsleep FAIL)"
+[ "$(qcount workers)" -eq 2 ] || bad "expected 2 worker samples, got $(qcount workers)"
+[ "$(bw_field lastsleep 3)" -eq 2 ] || bad "end_secs should be 2 (no final sleep), got $(bw_field lastsleep 3)"
+end
+
+# Case 32e — a failed body whose boundary is clean keeps the boundary's settled-cancel note
+# in the FAIL row's message.
+# Mutation: fmsg="$msg" for a clean boundary -> the note is dropped.
+begin "case32e: failed body with a clean boundary keeps the settled-cancel note" 32e
+seqf runs "$R1" "-"
+mkphase "$PHASES_DIR/10-bodyfail.sh" "body fails" no "" "" "" <<'BODY'
+fail "body boom"
+BODY
+run_driver 32e
+has_row bodyfail FAIL || bad "not FAIL: $(cat "$TSV")"
+m="$(row_msg bodyfail FAIL)"
+contains "$m" "body boom" || bad "body message lost: $m"
+contains "$m" "boundary cancelled undeclared run $R1 (settled)" || bad "settled-cancel note dropped: $m"
+contains "$m" "; boundary:" && bad "clean boundary reported as failed: $m"
+end
+
 # ============================================================================
 # Case 33 — a requires-miss FAIL row never ran a body, so (like a SKIP) it is not annotated
 # as having run after a contaminated boundary.
