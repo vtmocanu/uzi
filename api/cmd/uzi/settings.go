@@ -91,6 +91,8 @@ func newSettingsCmd(env Env, gf *globalFlags) *cobra.Command {
 	cmd.AddCommand(newSettingsReserveCmd(env, gf))
 	cmd.AddCommand(newSettingsCodexModeCmd(env, gf))
 	cmd.AddCommand(newSettingsHarnessOverflowCmd(env, gf))
+	cmd.AddCommand(newSettingsSetCmd(env, gf))
+	cmd.AddCommand(newSettingsResetCmd(env, gf))
 	return cmd
 }
 

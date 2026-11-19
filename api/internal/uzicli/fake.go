@@ -379,6 +379,16 @@ type FakeClient struct {
 	Effective    *apitypes.EffectiveSettingsDTO
 	EffectiveErr error
 
+	// PutModelSettings capture (PRD #3264): ModelSettingsCalls counts the writes (zero proves a
+	// command refused before any request), LastModelSettingsPatch is a copy of the last patch
+	// (a nil value is a clear). ModelSettingsResult, when set, is the canned reply; otherwise the
+	// patch is applied to Settings and that is returned. PutModelSettingsErr wins over the blanket
+	// Err while the capture still proves the write was reached.
+	ModelSettingsCalls     int
+	LastModelSettingsPatch map[string]*string
+	ModelSettingsResult    *ModelSettingsResult
+	PutModelSettingsErr    error
+
 	// SchedulePreview and SchedulePreviewErr drive PreviewScheduleSettings; with both unset the
 	// fake answers 404 like a foreign schedule. SchedulePreviewIDs records the ids asked for.
 	SchedulePreview    *apitypes.ScheduleSettingsPreviewDTO

@@ -2,6 +2,7 @@ package uzicli
 
 import (
 	"context"
+	"encoding/json"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 )
@@ -113,6 +114,42 @@ func (f *FakeClient) GetEffectiveSettings(context.Context) (apitypes.EffectiveSe
 		return apitypes.EffectiveSettingsDTO{}, Exitf(ExitNotFound, "not found")
 	}
 	return *f.Effective, nil
+}
+
+// PutModelSettings records the patch, then answers the canned ModelSettingsResult or, without
+// one, applies the patch to Settings (a nil value clears the field) and returns that.
+func (f *FakeClient) PutModelSettings(_ context.Context, patch map[string]*string) (ModelSettingsResult, error) {
+	f.ModelSettingsCalls++
+	f.LastModelSettingsPatch = make(map[string]*string, len(patch))
+	for k, v := range patch {
+		f.LastModelSettingsPatch[k] = v
+	}
+	if f.PutModelSettingsErr != nil {
+		return ModelSettingsResult{}, f.PutModelSettingsErr
+	}
+	if f.Err != nil {
+		return ModelSettingsResult{}, f.Err
+	}
+	if f.ModelSettingsResult != nil {
+		return *f.ModelSettingsResult, nil
+	}
+	fields := map[string]**string{
+		"default_claude_model": &f.Settings.DefaultClaudeModel, "default_codex_model": &f.Settings.DefaultCodexModel,
+		"default_effort": &f.Settings.DefaultEffort, "default_codex_effort": &f.Settings.DefaultCodexEffort,
+		"judge_model": &f.Settings.JudgeModel, "codex_judge_model": &f.Settings.CodexJudgeModel,
+		"judge_runs_on": &f.Settings.JudgeRunsOn,
+		"summary_model": &f.Settings.SummaryModel, "codex_summary_model": &f.Settings.CodexSummaryModel,
+	}
+	for k, v := range patch {
+		if dst, ok := fields[k]; ok {
+			*dst = v
+		}
+	}
+	raw, err := json.Marshal(map[string]apitypes.UserSettingsDTO{"settings": f.Settings})
+	if err != nil {
+		return ModelSettingsResult{}, err
+	}
+	return ModelSettingsResult{Settings: f.Settings, Raw: raw}, nil
 }
 
 // PreviewScheduleSettings serves SchedulePreview and records the id; unset it answers 404.

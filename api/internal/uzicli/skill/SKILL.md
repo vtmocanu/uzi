@@ -189,6 +189,8 @@ uzi settings get
 uzi settings reserve
 uzi settings codex-mode default|auto
 uzi settings harness-overflow on|off
+uzi settings set <setting> [--harness claude|codex] <value>
+uzi settings reset <setting> [--harness claude|codex]
 uzi context list
 uzi context current
 uzi context use <name>
@@ -395,6 +397,20 @@ uzi version
   Prints the resulting reserve; `--json` returns `weekly_reserve_pct` and
   `weekly_reserve_pause_running`. Usage exit 2 on an out-of-range threshold. A uzc_ token
   can run it.
+- `uzi settings set <setting> [--harness claude|codex] <value>` and
+  `uzi settings reset <setting> [--harness claude|codex]` — write or clear one model or
+  effort default for new runs (`PUT /api/me/model-settings`). Settings: `worker-model`,
+  `effort` (`low|medium|high|xhigh|max|runtime`), `judge-model` and `summary-model` all
+  need `--harness`; `judge-runs-on` (`same-as-run|claude|codex`) takes none. A model id
+  is passed through and the server validates it; `reset` clears to the inherited value.
+  Prints the changed row with its source, from a fresh effective-settings read; when
+  that read fails the stored value is shown, the write still exits 0 and the read error
+  goes to stderr. `--json` prints the server's `{"settings": ...}` envelope unchanged.
+  Usage exit 2 (no request) on an unknown setting, a missing, invalid or unwanted
+  `--harness`, or an invalid value. Exit 6 with "the save may or may not have been
+  applied; check with `uzi settings get`" when the commit outcome is unknown, and with
+  "settings saved; reading them back failed" when the save is durable. A server without
+  the route exits 1 ("upgrade the server").
 
 ### Named contexts
 

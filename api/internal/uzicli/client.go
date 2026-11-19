@@ -233,6 +233,12 @@ type Client interface {
 	// caller (PRD #3254): GET /api/me/effective-settings. RequireUser, read-only, owner-scoped;
 	// no credential id, label or value is in the body. An older server answers 404.
 	GetEffectiveSettings(ctx context.Context) (apitypes.EffectiveSettingsDTO, error)
+	// PutModelSettings writes model and effort defaults (PRD #3264): PUT /api/me/model-settings
+	// with a patch object whose key is the API field and whose value is the string to set or nil
+	// to clear (JSON null). Absent keys are left alone. The result carries the decoded settings
+	// and the server's envelope bytes so --json can print them unchanged. A server without the
+	// route answers an error-less 404 or 405, mapped to an "upgrade the server" error.
+	PutModelSettings(ctx context.Context, patch map[string]*string) (ModelSettingsResult, error)
 	// PreviewScheduleSettings returns what firing a saved schedule now, and claiming the run,
 	// would use (PRD #3254): POST /api/me/effective-settings/schedule-preview with the schedule
 	// id. RequireUser, read-only, owner-scoped; the server loads the stored override, so a stored
@@ -1197,6 +1203,13 @@ const ReasonGateRevisionMismatch = "gate_revision_mismatch"
 // message so the cause is visible without --json.
 const ReasonCodexPoolUnavailable = "codex_pool_unavailable"
 
+// Reasons of the two 500s PUT /api/me/model-settings answers beyond a plain internal error
+// (PRD #3264): the write's outcome is unknown, or it is durable but could not be read back.
+const (
+	ReasonSettingsCommitUnknown       = "settings_commit_unknown"
+	ReasonSettingsSavedReadbackFailed = "settings_saved_readback_failed"
+)
+
 // Typed owner-reset refusals never authorize rebinding or retrying consent.
 const (
 	ReasonMilestoneReconciliationRequired = "milestone_reconciliation_required"
@@ -1221,6 +1234,14 @@ func statusError(status int, body []byte, retryAfter string) *ExitError {
 		e = Exitf(ExitConflict, "reset consent is stale or conflicts with the current gate; review uzi run get again and make a new explicit decision with its bindings; consent was not retried")
 	case ReasonMilestoneReconciliationNotReady:
 		e = Exitf(ExitConflict, "milestone reset is not ready; request a plan revision to attempt a fresh published checkpoint; if revisions are exhausted, cancel and start a new run")
+	}
+	// The model-settings write's two 500s are worded here, not from the server text, so the
+	// message never implies a rollback the client cannot prove.
+	switch reason {
+	case ReasonSettingsCommitUnknown:
+		e = Exitf(ExitUnreachable, "the save may or may not have been applied; check with `uzi settings get`")
+	case ReasonSettingsSavedReadbackFailed:
+		e = Exitf(ExitUnreachable, "settings saved; reading them back failed")
 	}
 	e.Reason = reason
 	if reason == ReasonGateRevisionMismatch {

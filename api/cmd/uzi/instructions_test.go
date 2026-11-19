@@ -459,7 +459,28 @@ var knownInstructions = []knownInstruction{
 		// RESOLVES, and `uzi findings release` is a real subcommand exercised by TestFindingsRelease.
 		note: "HELP: the `uzi findings release` usage line (findings.go).",
 	},
+	{
+		command:  "uzi settings set",
+		evidence: evidenceHelpOnly,
+		note: "HELP: the usage lines of `uzi settings set`'s Long help (settings_model_write.go). " +
+			"The path resolving is the complete bar for a help reference.",
+	},
+	{
+		command:  "uzi settings reset",
+		evidence: evidenceHelpOnly,
+		note: "HELP: `uzi settings set`'s and `uzi settings reset`'s help name the undo verb " +
+			"(settings_model_write.go). The path resolving is the complete bar.",
+	},
 	// ---- RUNTIME: emitted at a decision point. The bar is EXECUTION. --------------------
+	{
+		command:  "uzi settings get",
+		evidence: evidenceGoTest,
+		where:    "TestSettingsSetServerMessagesEndToEnd",
+		note: "RUNTIME: the settings_commit_unknown message (statusError in uzicli/client.go) tells " +
+			"the user to check with `uzi settings get`. TestSettingsSetServerMessagesEndToEnd " +
+			"runs the real cobra command against an HTTP fixture answering the typed 500 and " +
+			"asserts the message and exit 6.",
+	},
 	{
 		command:  "uzi findings release %s --confirm-no-issue",
 		evidence: evidenceGoTest,
