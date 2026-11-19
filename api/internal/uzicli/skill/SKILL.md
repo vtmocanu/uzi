@@ -419,7 +419,7 @@ uzi version
   cross-check cell (`PUT /api/me/model-settings`, key `cross_check_pins`). `set` needs
   `--stage`, `--harness` and at least one of `--model` and `--effort`, and leaves an
   omitted member unchanged; `runtime` is not a checker effort. `reset` clears both
-  members so the cell follows the worker default again. Prints that cell with its pin,
+  members: the model follows the worker default and the effort the cross-check default (high). Prints that cell with its pin,
   resolved value and source; `--json` prints the server envelope. Usage exit 2 (no
   request) on a missing or invalid `--stage`, `--harness`, member or effort, or when
   those flags are given to another setting.

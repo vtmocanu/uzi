@@ -164,7 +164,7 @@ func newSettingsResetCmd(env Env, gf *globalFlags) *cobra.Command {
 		Long: "Clear one model or effort default so it inherits again (judge-runs-on returns to same as the run).\n" +
 			"Takes the same settings and --harness as `uzi settings set`.\n\n" +
 			"  uzi settings reset cross-check --stage plan|code --harness claude|codex\n\n" +
-			"clears both the model and the effort pin of that checker cell, so it follows the worker default again.",
+			"clears both the model and the effort pin of that checker cell: its model follows the worker default and its effort the cross-check default (high).",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			flags := cmd.Flags()

@@ -231,6 +231,7 @@ func TestPutMyModelSettingsCrossCheckRejectsWithoutWritingLiveDB(t *testing.T) {
 			}
 		})
 	}
+	f.t = t
 
 	// A scalar error is reported before the pins are looked at, so an invalid scalar next to
 	// invalid pins names the scalar, as PutMySettings does.
@@ -479,7 +480,8 @@ func TestModelSettingsUserLockAllowsConcurrentPinInsertLiveDB(t *testing.T) {
 
 	npid := waitBlockedBy(ctx, t, f, pids, done, wpid)
 
-	// N is waiting on W, so N has already taken the users lock: the lock is first in the route.
+	// N is waiting on W while holding a FOR NO KEY UPDATE-strength lock on its users row (the explicit
+	// lock or its own earlier UPDATE). Lock ordering itself is pinned by the mirror-ordering test.
 	_, err := f.pool.Exec(ctx, `SELECT 1 FROM users WHERE id = $1 FOR UPDATE NOWAIT`, f.user)
 	var pgErr *pgconn.PgError
 	if !errors.As(err, &pgErr) || pgErr.Code != "55P03" {

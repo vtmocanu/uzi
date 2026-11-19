@@ -3495,7 +3495,8 @@ names the checker's family, as in the settings table). An omitted `--model` or
 `--effort` keeps its stored value, and the model is validated like the web
 control (a model of the wrong family is rejected). `reset cross-check --stage
 <stage> --harness <harness>` clears both the model and the effort of that cell
-only, so it follows the worker default again; the other cells are untouched.
+only: its model then follows the worker default and its effort the cross-check
+default (`high`); the other cells are untouched.
 A missing or invalid `--stage`, `--harness` or effort, a `--model` or `--effort`
 with no member, and `--stage`, `--model` or `--effort` given to another setting
 exit 2 without a request.
