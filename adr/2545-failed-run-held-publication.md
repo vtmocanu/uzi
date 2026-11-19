@@ -363,11 +363,16 @@ refusal at one chokepoint (`recordRefusalUnderLock`, under the bare lock,
 before the refusal is thrown). The fetch stage path (P2, at the fetch site)
 additionally records the incoming head directly through the same function when
 no refusal for it was noted, an eighth direct recording call. A recording
-failure never changes what is thrown and claims nothing. If writing the
-`refused-<sha>` ref fails, the refusal is not recorded: on P1 and P2 the kept
-fetch stage leaves the gate ineligible, and for P3-P7 the design relies on the
-refused head still being the run-owned tracking tip or journal tip, which the
-gate's tracking-tip rule requires to be covered.
+failure never changes what is thrown and claims nothing. The `refused-<sha>`
+ref write and the ledger append are independent steps: a failed ref write
+still attempts the ledger append. If either write fails, or the seal listing
+fails, or the ledger is invalid, unbound or full, the run is latched in-process
+(`refusalRecordingFailed`) and its gate and seal are ineligible ("refusal
+recording failed in this process") for the worker process lifetime. Across
+processes the restart rule already makes a successor ineligible. The gate's
+tracking-tip rule (the run's own branch tracking ref must be covered) is an
+extra check that matters for P3 (same run) and P7; it is not what protects the
+other paths.
 
 | Path | Producer |
 | --- | --- |
@@ -408,7 +413,8 @@ updates (P1-P6) for that run at generation at or below the closed one.
 land in the seal's gate or make it ineligible. Once `final-`
 exists the seal blocks recording on every path, including `retainCurrentOwedCandidate`.
 On the cap path a second terminal pass for the same generation re-proves the
-released head instead of re-importing, so no later fetch adds a refused head.
+released head instead of re-importing (this only stops the hook from
+re-importing); that no later fetch adds a refused head rests on the fence.
 
 **Invariants.**
 
@@ -467,8 +473,8 @@ recovery` or `uzi run discard`):
 cap release (the gate itself is consulted on every inventory-guarded release but
 is a no-op without refusal evidence below the cap). An old worker's refused head that old code deleted, followed by
 pins reconciling below the cap, leaves no trace; the ordinary release proceeds
-as today. This is pre-existing and accepted. Ordinary below-cap releases are not
-gated on admission records.
+as today. This is pre-existing and accepted. Releases with no refusal evidence
+below the cap are not gated on admission records.
 
 ## Consequences
 

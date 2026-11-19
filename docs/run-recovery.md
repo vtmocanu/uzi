@@ -1292,8 +1292,8 @@ them; any change in the evidence keeps everything locally.
 in the worker's bare. In a mixed fleet an older worker may treat a bare holding
 these records as disposable and leak the nested refs and records. The gate
 is consulted on every inventory-guarded release, but it is a no-op when the
-run has no refusal evidence and is below the cap, so ordinary below-cap
-releases are not held up by these records. A run with earlier recorded
+run has no refusal evidence and is below the cap, so releases with no refusal evidence below the cap
+are not held up by these records. A run with earlier recorded
 refusals, or exactly at the cap, needs complete admissions even if its
 terminal fetch succeeded. An old worker's refused head that old code deleted,
 followed by pins reconciling below the cap, leaves no trace, and the ordinary
