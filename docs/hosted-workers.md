@@ -100,7 +100,20 @@ is capacity someone else's worker doesn't get.
 The **Worker sizes** card on **Admin → Workers** edits the CPU request and limit,
 memory request and limit, data disk and DinD disk of each shipped size (`s`, `m`,
 `l`, `l-highmem`). **Reset** on a customized size returns it to its shipped values.
-Adding and removing sizes is not available yet.
+**Add size** adds a size of your own and **Remove** deletes one you added; shipped sizes
+can be edited and reset but never removed.
+
+- **Adding.** The table holds up to 16 sizes. A name is lowercase letters, digits and
+  hyphens, starts with a letter and is at most 16 characters. A new size is validated
+  against the same chart ceilings as an edit. Admin-added sizes appear in the
+  provision form, in the `SIZE` column of `uzi worker list` and `uzi worker get`, and
+  in the TUI. They can also be chosen as the
+  [ephemeral default size and the default size for new workers](./admin-settings.md#hosted-worker-quota).
+- **Removing.** A size is refused while any worker uses it or either default-size
+  setting (`hosted_default_size`, `ephemeral_default_size`) names it; the refusal
+  says what holds it. Change those first, then remove.
+- **Same gate as edits.** Adding and removing follow the ceilings and the read-only
+  rule below.
 
 - **What an edit reaches.** The selectors on Admin → Workers update right after a
   save; a provision form that is already open keeps its numbers until you reopen or

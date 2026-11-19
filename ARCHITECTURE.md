@@ -2703,6 +2703,19 @@ locks. The decision, partial supersession,
 capacity cost, and preservation of existing stored sizes are recorded in
 [ADR-2240](adr/2240-hosted-worker-default-size.md).
 
+Sizes themselves live in the api's `worker_sizes` table as integers (CPU and
+memory request and limit, data and DinD disk). The api seeds and refreshes the
+shipped sizes at boot, and admins edit, add and remove sizes on **Admin →
+Workers**; the default-size settings may name any existing size, while the env
+and chart overrides stay limited to shipped names because they are validated
+before the table exists. The integers ride inline on each `DesiredWorker`, and the
+controller resolves a worker's resources from them, falling back to its
+compiled-in presets only when they are absent. It refuses values above its chart
+ceilings and reports `size_refused` or `pvc_rejected`, which surface in Admin
+health. A size a worker or a default-size setting references cannot be deleted.
+See [ADR-4213](adr/4213-admin-worker-sizes.md) and
+[PRD #4213](prds/4213-admin-worker-sizes.md).
+
 **Codex on a hosted worker needs a third identity, and that is opt-in.** The
 restricted-tier namespace above starts every worker single-uid, which is one
 identity short of what the Codex harness's fail-closed launcher requires (a
