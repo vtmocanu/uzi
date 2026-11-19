@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -35,7 +36,9 @@ func TestWorkersAdminSizeKindCode(t *testing.T) {
 		kind string
 	}{
 		{"admin-added", sp("xs"), "host·XS"},
-		{"truncated to 8 runes", sp("extra-large-thing"), "host·EXTRA-LA"},
+		{"truncated to 8 cells with ellipsis", sp("extra-large-thing"), "host·EXTRA-L…"},
+		{"distinguishable prefix", sp("gpu-a100x"), "host·GPU-A10…"},
+		{"exactly 8 stays whole", sp("gpu-a100"), "host·GPU-A100"},
 		{"escape sequence sanitized", sp("a\x1b[31mb\x07c"), ""},
 		{"empty", sp(""), "host·?"},
 		{"absent", nil, "host·?"},
@@ -48,8 +51,8 @@ func TestWorkersAdminSizeKindCode(t *testing.T) {
 		if tc.kind != "" && got != tc.kind {
 			t.Errorf("%s: got %q want %q", tc.name, got, tc.kind)
 		}
-		if n := len([]rune(strings.TrimPrefix(got, "host·"))); n > 8 {
-			t.Errorf("%s: size code %q exceeds 8 runes", tc.name, got)
+		if n := visualWidth(strings.TrimPrefix(got, "host·")); n > 8 {
+			t.Errorf("%s: size code %q exceeds 8 cells", tc.name, got)
 		}
 	}
 }
@@ -62,13 +65,13 @@ func TestWorkersDetailShowsSizeQuantities(t *testing.T) {
 	}
 	lines, _ := m.workerDetailLines(time.Now())
 	text := stripANSI(strings.Join(lines, "\n"))
-	if !strings.Contains(text, "xs · 0.25–1 CPU · 1–2 GiB RAM · 5 GiB data") {
-		t.Fatalf("detail lacks the size quantities:\n%s", text)
+	if !regexp.MustCompile(`(?m)^\s+size\s+xs · 0\.25–1 CPU · 1–2 GiB RAM · 5 GiB data$`).MatchString(text) {
+		t.Fatalf("detail lacks the size row with quantities:\n%s", text)
 	}
 	m.workers.rows[0].w.HostedSizeSpec = nil
 	lines, _ = m.workerDetailLines(time.Now())
 	text = stripANSI(strings.Join(lines, "\n"))
-	if !strings.Contains(text, "size xs") || strings.Contains(text, "CPU") {
+	if !regexp.MustCompile(`(?m)^\s+size\s+xs$`).MatchString(text) || strings.Contains(text, "CPU") {
 		t.Fatalf("spec-less detail should show the bare name:\n%s", text)
 	}
 }
@@ -112,7 +115,7 @@ func TestWorkersHighmemDetailShowsFullSize(t *testing.T) {
 	m := workerRenderModel(true)
 	m.workers.rows[0].w.HostedSize = sp("l-highmem")
 	lines, _ := m.workerDetailLines(time.Now())
-	if !strings.Contains(stripANSI(strings.Join(lines, "\n")), "size l-highmem") {
+	if !regexp.MustCompile(`(?m)^\s+size\s+l-highmem`).MatchString(stripANSI(strings.Join(lines, "\n"))) {
 		t.Fatalf("detail lost the full size:\n%s", stripANSI(strings.Join(lines, "\n")))
 	}
 }

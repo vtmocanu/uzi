@@ -772,9 +772,10 @@ func (m tuiModel) workerKind(r workerRow) string {
 		size = "LHM"
 	default:
 		// An admin-added size: its name is untrusted text (D7), so sanitize through
-		// cellText before bounding it to 8 runes.
-		if name := []rune(strings.ToUpper(cellText(t.hostedSize))); len(name) > 0 {
-			size = string(name[:min(len(name), 8)])
+		// cellText before bounding it to workerSizeCodeWidth terminal cells (not runes: a CJK
+		// rune is two cells). A cut shows an ellipsis; the detail view carries the full name.
+		if name := strings.ToUpper(cellText(t.hostedSize)); name != "" {
+			size = clampVisual(name, workerSizeCodeWidth)
 		}
 	}
 	kind += "·" + size
@@ -844,6 +845,10 @@ const (
 	workerMemoryMinWidth    = 9  // includes ~12.0/16G
 	workerUptimeWidth       = 6  // 23h59m / 99d23h, the detail header's format
 	workerAttentionMinWidth = 16 // "✕ outbox blocked"
+	workerSizeCodeWidth     = 8  // cells of an admin-added size name in the KIND cell
+	workerKindMaxWidth      = 15 // "eph·" + size code + "+dk"
+	// "eph·LHM+dk" is 10 cells; "host·LHM+dk" is the widest builtin code, 11.
+	workerKindAdminDenseWidth = 11
 )
 
 func workerMemoryText(w apitypes.WorkerDTO) string {
@@ -878,7 +883,7 @@ func (m tuiModel) workerTableWidths(rows []workerRow, width int) workerTableWidt
 			text = "~" + text
 		}
 		columns.memory = max(columns.memory, visualWidth(text))
-		columns.kind = max(columns.kind, visualWidth(m.workerKind(row)))
+		columns.kind = min(workerKindMaxWidth, max(columns.kind, visualWidth(m.workerKind(row))))
 		marker := 0
 		if row.w.UpgradeStatus == "outdated" || workerRollFailure(row.w.UpgradeStatus) {
 			marker = 1
@@ -886,6 +891,11 @@ func (m tuiModel) workerTableWidths(rows []workerRow, width int) workerTableWidt
 		columns.version = max(columns.version, visualWidth(m.renderer.Plain(workerTextOf(row).workerVersion, 18))+marker)
 	}
 	columns.dense = width >= 120 && (columns.intake == 0 || width >= 160)
+	if columns.dense && m.board.admin {
+		// The factory view also carries OWNER: hold KIND to the builtin docker
+		// l-highmem width so an admin-added size name cannot starve ATTENTION.
+		columns.kind = min(columns.kind, workerKindAdminDenseWidth)
+	}
 	// Cursor, name, state, kind, runs, cross-checks, resource cells, heartbeat, eleven separators,
 	// and one attention glyph; factory scope adds owner plus its separator.
 	fixed := 1 + 13 + columns.state + columns.kind + 5 + 6 + workerCPUWidth + columns.memory + workerDiskWidth + 3 + 12

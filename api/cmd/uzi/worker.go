@@ -553,7 +553,7 @@ func sizeCell(w apitypes.WorkerDTO) string {
 		return "-"
 	}
 	if s := cellText(strOr(w.HostedSize, "")); s != "" {
-		return s
+		return capCell(s, 16)
 	}
 	return "-"
 }
