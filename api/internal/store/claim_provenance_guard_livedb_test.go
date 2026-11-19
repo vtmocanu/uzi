@@ -1,7 +1,10 @@
 package store_test
 
 import (
+	"embed"
+	"encoding/json"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -21,6 +24,11 @@ import (
 // regressions that must be red before the change live in claim_provenance_entry_livedb_test.go.
 //
 // Serial: the stale sweep is global and the fixture helpers are shared; never add t.Parallel here.
+
+// The pre-#4476 ClaimRun (commit 908b978ea): raw SQL and argument order, never regenerated.
+//
+//go:embed testdata/claim-provenance-legacy/*.sql testdata/claim-provenance-legacy/*.json
+var claimProvenanceLegacyFixtures embed.FS
 
 var guardCodexCaps = []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexCustomModelV1}
 
@@ -229,6 +237,20 @@ func TestCodexProvenanceGuardRejectsLiveDB(t *testing.T) {
 		guardRejects(fx, run, "+2 jump with an otherwise valid pair",
 			`UPDATE runs SET claim_generation = 3, worker_id = $2, claim_provenance_worker_id = $2, claim_provenance_generation = 3 WHERE id = $1`, run, a)
 	})
+	t.Run("valid_claim_shape_but_provenance_generation_is_not_the_new_generation", func(t *testing.T) {
+		fx := newRollAffinityFixture(t)
+		a := fx.worker("A", 0, false)
+		run := entrySeedCodex(fx, a)
+		guardRejects(fx, run, "recorded worker's +1 claim stamping generation 99",
+			`UPDATE runs SET claim_generation = 2, worker_id = $2, claim_provenance_worker_id = $2, claim_provenance_generation = 99 WHERE id = $1`, run, a)
+	})
+	t.Run("valid_claim_shape_but_provenance_worker_is_not_the_claimant", func(t *testing.T) {
+		fx := newRollAffinityFixture(t)
+		a, b := fx.worker("A", 0, false), fx.worker("B", 0, false)
+		run := entrySeedCodex(fx, a)
+		guardRejects(fx, run, "worker_id A with provenance worker B at g+1",
+			`UPDATE runs SET claim_generation = 2, worker_id = $2, claim_provenance_worker_id = $3, claim_provenance_generation = 2 WHERE id = $1`, run, a, b)
+	})
 	t.Run("half_pair_worker_without_generation", func(t *testing.T) {
 		fx := newRollAffinityFixture(t)
 		a := fx.worker("A", 0, false)
@@ -314,7 +336,8 @@ func TestCodexProvenanceGuardRejectsLiveDB(t *testing.T) {
 			{"generation only", `claim_provenance_generation`, `1`},
 			{"both", `claim_provenance_worker_id, claim_provenance_generation`, `$5, 1`},
 		} {
-			args := []any{uuid.New(), fx.userID, fx.repoID, fx.nextIID()}
+			id := uuid.New()
+			args := []any{id, fx.userID, fx.repoID, fx.nextIID()}
 			if strings.Contains(tc.vals, "$5") {
 				args = append(args, a)
 			}
@@ -324,6 +347,10 @@ func TestCodexProvenanceGuardRejectsLiveDB(t *testing.T) {
 			var pgErr *pgconn.PgError
 			if !errors.As(err, &pgErr) || pgErr.Code != "23514" || !strings.HasPrefix(pgErr.Message, "claim provenance cannot be set on insert") {
 				t.Fatalf("INSERT with %s: got %v, want check_violation 'claim provenance cannot be set on insert'", tc.name, err)
+			}
+			var n int
+			if err := fx.pool.QueryRow(fx.ctx, `SELECT count(*) FROM runs WHERE id = $1`, id).Scan(&n); err != nil || n != 0 {
+				t.Fatalf("INSERT with %s left %d rows (err %v), want none", tc.name, n, err)
 			}
 		}
 	})
@@ -366,22 +393,65 @@ func TestCodexProvenanceGuardAcceptsLiveDB(t *testing.T) {
 // recorded pair is stale. The guard does not fire for the old claim; afterwards no worker is admitted,
 // the guard refuses to re-stamp, and health reports the run held with no worker name.
 //
-// SUBSTITUTION, named on purpose: the preferred simulation is the frozen pre-change ClaimRun SQL
-// under testdata/custody-units-legacy, but that archive's claimant CTE selects an older workers column
-// list and fails against the current schema ("cannot cast type record to workers", SQLSTATE 42846), so
-// it cannot run here. The old claim is therefore simulated by the UPDATE it performs on the columns that
-// matter: worker_id and claim_generation + 1 with provenance left alone.
+// The old claim is the real pre-change ClaimRun: the generated claimRun SQL of commit 908b978ea,
+// frozen under testdata/claim-provenance-legacy and executed with that commit's argument order. It
+// is a real UPDATE of worker_id and claim_generation + 1 that knows nothing of provenance.
 func TestCodexProvenanceRollbackReUpgradeLiveDB(t *testing.T) {
 	fx := newRollAffinityFixture(t)
 	a, b := fx.worker("A", 0, false), fx.worker("B", 0, false)
 	guardCodexWorkers(fx, a, b)
 	run := entrySeedCodex(fx, a) // the new ClaimRun records (A,1)
 	guardWantProv(fx, run, a, 1, "new ClaimRun")
+	// Requeued past the ceiling so the old claim's pin lets B take it.
+	mustExec(fx.ctx, t, fx.pool, `UPDATE runs SET status = 'queued' WHERE id = $1`, run)
+	fx.age(run, 40*time.Minute, 40*time.Minute)
 
-	tag, err := fx.pool.Exec(fx.ctx,
-		`UPDATE runs SET worker_id = $2, claim_generation = claim_generation + 1, status = 'claimed' WHERE id = $1`, run, b)
+	sqlText, err := claimProvenanceLegacyFixtures.ReadFile("testdata/claim-provenance-legacy/legacy-ClaimRun.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta, err := claimProvenanceLegacyFixtures.ReadFile("testdata/claim-provenance-legacy/legacy-ClaimRun-bindings.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var bindings struct {
+		SourceSHA string   `json:"source_sha"`
+		Bindings  []string `json:"bindings"`
+	}
+	if err := json.Unmarshal(meta, &bindings); err != nil || bindings.SourceSHA != "908b978ea" || len(bindings.Bindings) == 0 {
+		t.Fatalf("legacy fixture metadata %+v: %v", bindings, err)
+	}
+	now := pgtype.Timestamptz{Time: time.Now(), Valid: true}
+	params := reflect.ValueOf(store.ClaimRunParams{
+		WorkerID:                 pgtype.UUID{Bytes: b, Valid: true},
+		UserID:                   fx.userID,
+		AffinityCutoff:           pgtype.Timestamptz{Time: time.Now().Add(-staleCeiling), Valid: true},
+		SpreadCutoff:             pgtype.Timestamptz{Time: time.Now().Add(-9 * time.Second), Valid: true},
+		HeartbeatCutoff:          pgtype.Timestamptz{Time: time.Now().Add(-45 * time.Second), Valid: true},
+		BackgroundGraceCutoff:    now,
+		CrossCheckEvaluatedAt:    now,
+		CrossCheckAffinityCutoff: pgtype.Timestamptz{Time: time.Now().Add(-2 * time.Minute), Valid: true},
+		WorkerCaps:               []string{},
+		WorkerProtocolCaps:       guardCodexCaps,
+		DockerRepoAllowlist:      []uuid.UUID{},
+		CodexCuratedModels:       []string{},
+	})
+	args := make([]any, len(bindings.Bindings))
+	for i, f := range bindings.Bindings {
+		fv := params.FieldByName(f)
+		if !fv.IsValid() {
+			t.Fatalf("legacy binding %d %q missing from ClaimRunParams", i+1, f)
+		}
+		args[i] = fv.Interface()
+	}
+	tag, err := fx.pool.Exec(fx.ctx, string(sqlText), args...)
 	if err != nil || tag.RowsAffected() != 1 {
-		t.Fatalf("simulated old-api claim as B: rows=%d err=%v (the guard must not fire: provenance is unchanged)", tag.RowsAffected(), err)
+		t.Fatalf("old-api ClaimRun as B: rows=%d err=%v (the guard must not fire: provenance is unchanged)", tag.RowsAffected(), err)
+	}
+	var gen int64
+	var worker uuid.UUID
+	if err := fx.pool.QueryRow(fx.ctx, `SELECT claim_generation, worker_id FROM runs WHERE id = $1`, run).Scan(&gen, &worker); err != nil || gen != 2 || worker != b {
+		t.Fatalf("after the old-api claim: generation=%d worker=%s (err %v), want 2 / B", gen, worker, err)
 	}
 	guardWantProv(fx, run, a, 1, "the old claim left provenance alone")
 
@@ -608,11 +678,28 @@ func TestCodexProvenanceEphemeralMirrorsLiveDB(t *testing.T) {
 		}
 		gapHeld, gapControl := mk(true, []string{"gh"}), mk(false, []string{"gh"}) // no worker has "gh"
 		satHeld, satControl := mk(true, []string{}), mk(false, []string{})         // capable but full
+		// Valid recorded provenance (A,1) with worker_id NULL (what a server-parked resume leaves).
+		a := fx.worker("recorded", capOf(1), false)
+		fx.holdActive(a, 1) // full too, so the saturation trigger still applies
+		mkRecorded := func(caps []string) uuid.UUID {
+			id := mk(false, caps)
+			mustExec(fx.ctx, t, fx.pool,
+				`UPDATE runs SET harness = 'codex', claim_generation = 1, worker_id = $2, claim_provenance_worker_id = $2, claim_provenance_generation = 1 WHERE id = $1`, id, a)
+			mustExec(fx.ctx, t, fx.pool, `UPDATE runs SET worker_id = NULL WHERE id = $1`, id)
+			return id
+		}
+		gapRec, satRec := mkRecorded([]string{"gh"}), mkRecorded([]string{})
 		gap := listedUnplaceable(fx, 1000, iv)
+		if gap[gapRec] {
+			t.Fatalf("unplaceable listed the recorded-provenance run %s with worker_id NULL: %v", gapRec, gap)
+		}
 		if gap[gapHeld] || !gap[gapControl] {
 			t.Fatalf("unplaceable listed %v; want the Claude control %s, not the held run %s", gap, gapControl, gapHeld)
 		}
 		sat := listedSaturation(fx, 1000, iv)
+		if sat[satRec] {
+			t.Fatalf("saturation listed the recorded-provenance run %s with worker_id NULL: %v", satRec, sat)
+		}
 		if sat[satHeld] || !sat[satControl] {
 			t.Fatalf("saturation listed %v; want the Claude control %s, not the held run %s", sat, satControl, satHeld)
 		}
