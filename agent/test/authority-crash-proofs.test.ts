@@ -939,6 +939,8 @@ interface RefusalWorld {
   heads: string[];
   /** A commit in the bare whose parents are every kept and refused head: the confirmed FINAL a seal would cover. */
   cover: string;
+  /** A child of `cover`: a different source that still covers every head. */
+  cover2: string;
   later: string;
   /** The frozen roots the cleanup caller holds: enumerated once, before any crash (production passes its journaled list, never a re-read of refs the dead worker may already have deleted). */
   frozen: Array<{ sha: string; contexts: PositiveOwedCandidateContext[] }>;
@@ -974,6 +976,9 @@ async function refusalWorld(t: TestContext, headCount: number, laterEntry = fals
   const cover = commit("cover", [...kept, ...heads], false);
   gitIn(clone, ["update-ref", "refs/heads/cover", cover]);
   gitIn(bare, ["fetch", "-q", "--no-tags", "--no-write-fetch-head", `file://${clone}`, "+refs/heads/cover:refs/uzi-test/cover"]);
+  const cover2 = commit("cover2", [cover], false);
+  gitIn(clone, ["update-ref", "refs/heads/cover2", cover2]);
+  gitIn(bare, ["fetch", "-q", "--no-tags", "--no-write-fetch-head", `file://${clone}`, "+refs/heads/cover2:refs/uzi-test/cover2"]);
   if (laterEntry) {
     const dir = path.join(bare, "info", "uzi-refusals");
     fs.mkdirSync(dir, { mode: 0o700, recursive: true });
@@ -981,7 +986,7 @@ async function refusalWorld(t: TestContext, headCount: number, laterEntry = fals
       entries: [{ generation: 2, sha: later, path: "P2" }] }) + "\n", { mode: 0o600 });
   }
   const frozen = (await plain.enumerateOwedCandidates(bare, RF_RUN)).map((c) => ({ sha: c.sha, contexts: c.contexts as PositiveOwedCandidateContext[] }));
-  return { dataDir, bare, clone, base, ctx, kept, heads, cover, later, frozen };
+  return { dataDir, bare, clone, base, ctx, kept, heads, cover, cover2, later, frozen };
 }
 
 const rfDir = (w: RefusalWorld): string => path.join(w.bare, "info", "uzi-refusals");
@@ -1189,7 +1194,8 @@ test("refusal proof 7: a FINAL written with no POST, then restart: the successor
   assert.equal(result, "ineligible", "another process may never replay or re-seal the release (it would be a send)");
   assert.equal(rfRaw(w, name), before, "the successor did not rewrite the FINAL");
   assert.equal(await deadWorkerReader(w).sealRefusalRelease(w.bare, RF_RUN, 1, w.cover), "matches");
-  assert.equal(await deadWorkerReader(w).sealRefusalRelease(w.bare, RF_RUN, 1, w.later), "ineligible", "a different source is never sealed over the existing FINAL");
+  assert.equal((await gateOf(w, deadWorkerReader(w), w.cover2)).kind, "eligible", "the other source covers every head, so only the existing FINAL can refuse it");
+  assert.equal(await deadWorkerReader(w).sealRefusalRelease(w.bare, RF_RUN, 1, w.cover2), "mismatch", "a different source is never sealed over the existing FINAL");
   assert.equal(rfRaw(w, name), before);
 });
 
@@ -1222,7 +1228,7 @@ test("refusal proof 8: SIGKILL with the cleanup intent written never deletes und
   assertNoLoss(w, "resumed", true);
 });
 
-for (const nth of [1, 3]) {
+for (const nth of [1, 2, 3, 4]) {
   test(`refusal proof 9: SIGKILL after refusal-stage delete ${nth} of 4 keeps the ledger and every head covered; resuming finishes`, { timeout: 180_000 }, async (t) => {
     const w = await refusalWorld(t, 2);
     const [h0, h1] = w.heads as [string, string];
@@ -1280,8 +1286,7 @@ test("refusal proof 11: SIGKILL after the anchor deletes (before the first candi
   assertNoLoss(w, "anchors deleted", true);
 
   const s = await refusalSuccessor(w);
-  const first = await resume(w, s, w.base).catch((error: Error) => `threw:${error.message}`);
-  assert.notEqual(first, "removed", "an uncovered source never completes the cleanup");
+  assert.equal(await resume(w, s, w.base), "retained", "an uncovered source never completes the cleanup");
   assert.ok(rfFiles(w).includes(`final-${RF_RUN}-1.json`), "nothing was deleted by the uncovered resume");
   assertNoLoss(w, "uncovered resume", true);
   assert.equal(await resume(w, s, w.cover), "removed");

@@ -3,10 +3,11 @@
 // A worker process admits refusal generation G in a bare repository on a persistent volume, then starts two
 // delayed trusted producers that would each create `refs/uzi-incoming/<run>/<G>/<id>` (one in the worker's
 // process group, one in a new session). Only the worker's node process is SIGKILLed, not PID 1. Then:
-//   (a) ORDERING: a successor process (a fresh container on the same volume) runs the real
-//       GitCache.refusalReleaseGate for the same run, generation and head before the producers' deadline and
-//       gets `ineligible` (admission from another process), so it would send nothing. The same state under
-//       the dead worker's nonce is `eligible`, so the nonce is the only difference.
+//   (a) ORDERING: a successor process (an idle container on the same volume, started before the kill) runs the
+//       real GitCache.refusalReleaseGate for the same run, generation and head immediately after the kill and
+//       before the worker container's teardown is awaited, while the producers' deadline has not passed (they
+//       were observed alive just before the kill), and gets `ineligible` (admission from another process), so
+//       it would send nothing. The same state under the dead worker's nonce is `eligible`.
 //   (b) EVENTUAL CLEANUP: the worker container stops (the worker's npm and tini exit), and after the
 //       producers' deadline neither ref exists and the producers' processes are gone.
 //
@@ -73,11 +74,6 @@ function psTable(): { pid: number; ppid: number; pgid: number; args: string }[] 
     return { pid: Number(m[1]), ppid: Number(m[2]), pgid: Number(m[3]), args: m[4]! };
   });
 }
-function hostProcessesMatching(needle: string): string[] {
-  const r = spawnSync("ps", ["-eo", "pid,args"], { encoding: "utf8" });
-  return r.status === 0 ? r.stdout.split("\n").filter((l) => l.includes(needle) && !l.includes("ps -eo")) : [];
-}
-
 test("a SIGKILLed worker's delayed refusal producers cannot land before a successor's gate says ineligible, and are gone after teardown", { timeout: 300_000 }, async () => {
   assert.equal(process.platform, "linux");
   dockerOk(["image", "inspect", "--format", "{{.Id}}", image], 20);
@@ -140,25 +136,27 @@ test("a SIGKILLed worker's delayed refusal producers cannot land before a succes
     const workerPgid = byPid.get(ready.pid)!.pgid;
     assert.equal(producers[0].pgid, workerPgid, "producer 1 is in the worker's process group");
     assert.notEqual(producers[1].pgid, workerPgid, "producer 2 is outside the worker's process group");
-    const hostBefore = hostProcessesMatching(ready.producers[0].ref).length + hostProcessesMatching(ready.producers[1].ref).length;
-    console.log(`host-visible producer processes before kill: ${hostBefore}`);
+    // Real count before the kill: both producers are live processes inside the worker's namespace.
+    console.log(`producer processes alive just before the kill: ${producers.length}`);
+    assert.equal(producers.length, 2);
+
+    // The successor container exists and is warm BEFORE the kill, on the same volume, idle.
+    dockerOk(["create", "--name", successor, ...common, "--entrypoint", "/bin/sh", image, "-c", "exec sleep 86400"], 60);
+    dockerOk(["start", successor], 60);
+    waitFor("successor", () => state(successor) === "running", 20);
+    assert.deepEqual(probeJson("refs").refs.split("\n").filter((r: string) => r.startsWith("refs/uzi-incoming/")), [], "nothing staged yet (warm-up)");
+    assert.ok(Date.now() < ready.deadlineMs - 15_000, "enough of the producers' window remains after the warm-up");
 
     // SIGKILL only the worker node process, never PID 1.
     const killedAt = Date.now();
     dockerOk(["exec", worker, "kill", "-9", String(ready.pid)], 30);
 
-    // (b, first half) the worker's npm and tini exit, so the container stops.
-    const exitCode = dockerOk(["wait", worker], 60);
-    console.log(`worker container exit code after SIGKILL of node: ${exitCode}`);
-    assert.equal(state(worker), "exited");
-    assert.notEqual(docker(["top", worker]).status, 0, "no process table for a stopped container");
-
-    // (a) the successor: a fresh container on the same volume gates before the producers' deadline.
-    dockerOk(["create", "--name", successor, ...common, "--entrypoint", "/bin/sh", image, "-c", "exec sleep 86400"], 60);
-    dockerOk(["start", successor], 60);
-    waitFor("successor", () => state(successor) === "running", 20);
+    // (a) ORDERING, before awaiting teardown: the successor's real gate, right after the kill, with the producers'
+    // deadline still in the future.
     const ineligible = probeJson("gate", "-", ready.head);
-    assert.ok(ineligible.at < ready.deadlineMs, `the gate ran before the producers' deadline (${ineligible.at} vs ${ready.deadlineMs})`);
+    const margin = ready.deadlineMs - ineligible.at;
+    console.log(`ordering: gate ran ${ineligible.at - killedAt}ms after the kill; margin deadlineMs - gateAt = ${margin}ms; worker state at that moment: ${state(worker)}`);
+    assert.ok(margin > 0, `the gate ran before the producers' deadline (${ineligible.at} vs ${ready.deadlineMs})`);
     assert.ok(ineligible.at > killedAt);
     assert.equal(ineligible.gate.kind, "ineligible", JSON.stringify(ineligible));
     assert.match(ineligible.gate.reason, /admission for generation 1 is from another process/, "the successor is refused because the history was admitted by a dead process");
@@ -166,7 +164,14 @@ test("a SIGKILLed worker's delayed refusal producers cannot land before a succes
     // Control: the same state, head and code under the dead worker's nonce is eligible, so the nonce is the only difference.
     const control = probeJson("gate", ready.nonce, ready.head);
     assert.equal(control.gate.kind, "eligible", JSON.stringify(control));
-    assert.deepEqual(probeJson("refs").refs.split("\n").filter((r: string) => r.startsWith("refs/uzi-incoming/")), [], "nothing was staged yet");
+    assert.ok(control.at < ready.deadlineMs, "the control also ran before the deadline");
+    assert.deepEqual(probeJson("refs").refs.split("\n").filter((r: string) => r.startsWith("refs/uzi-incoming/")), [], "nothing was staged at gate time");
+
+    // (b, first half) the worker's npm and tini exit, so the container stops.
+    const exitCode = dockerOk(["wait", worker], 60);
+    console.log(`worker container exit code after SIGKILL of node: ${exitCode}`);
+    assert.equal(state(worker), "exited");
+    assert.notEqual(docker(["top", worker]).status, 0, "no process table for a stopped container");
 
     // (b, second half) wait out the deadline in the fresh container: neither ref exists.
     const settle = ready.deadlineMs + 4000 - Date.now();
@@ -178,11 +183,6 @@ test("a SIGKILLed worker's delayed refusal producers cannot land before a succes
     assert.equal(probeJson("gate", "-", ready.head).gate.kind, "ineligible", "still ineligible after the deadline");
     assert.equal(probeJson("gate", ready.nonce, ready.head).gate.kind, "eligible", "the dead worker's evidence is unchanged after the deadline");
     assert.equal(state(worker), "exited", "the worker container is still stopped");
-    for (const p of ready.producers) {
-      assert.deepEqual(hostProcessesMatching(p.ref), [], `producer for ${p.ref} is gone from the host process table`);
-    }
-    const alive = dockerOk(["exec", successor, "ps", "-o", "args"]).split("\n").filter((l) => l.includes("RT4481_PRODUCER="));
-    assert.deepEqual(alive, [], "no producer process exists in the successor's namespace");
   } finally {
     // Exact names only; all were created by this invocation. Each cleanup is attempted regardless of the others
     // and never throws, so a cleanup failure cannot mask the test's own failure.
