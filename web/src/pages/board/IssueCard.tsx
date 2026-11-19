@@ -14,6 +14,8 @@ import { runDurationLabel } from "../../lib/runDuration";
 import { boundedChips } from "../../lib/labelChips";
 import { highlightSegments } from "../../lib/boardCards";
 import { Badge, Button, cx } from "../../components/ui";
+import { StartPreview } from "../../components/StartPreview";
+import { DEFAULT_START_PREVIEW_REQUEST } from "../../lib/startPreview";
 import { FixCiButton, PipelineBadge } from "../../components/PipelineBadge";
 import { MrChip } from "../../components/MrChip";
 import { forgePlatform } from "../../lib/forgeNoun";
@@ -557,6 +559,16 @@ export function IssueCard({
             )}
           </div>
         )
+      )}
+      {/* Issue #3261: the gate reason as visible text (the tooltips above stay), and the
+          read-only "if started now" prediction. The preview renders at full contrast even
+          when gated and never changes what Start does. The disclosure is a plain button, so
+          a click on it is not a drag. */}
+      {!promotable && !card.closed && isEligible && (
+        <>
+          {!gate.enabled && <p className="mt-1.5 text-xs text-fg">{gate.reason}</p>}
+          <StartPreview variant="compact" request={DEFAULT_START_PREVIEW_REQUEST} className="mt-1.5" />
+        </>
       )}
     </div>
   );

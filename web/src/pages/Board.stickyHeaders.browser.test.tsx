@@ -21,10 +21,17 @@ vi.mock("../lib/api", async (importOriginal) => {
       listSecrets: vi.fn(),
       listRuns: vi.fn(),
       getMySettings: vi.fn(),
+      getEffectiveSettings: vi.fn(),
+      previewStartSettings: vi.fn(),
     },
   };
 });
-vi.mock("../auth/AuthContext", () => ({ useAuth: vi.fn() }));
+vi.mock("../auth/AuthContext", () => {
+  const useAuth = vi.fn();
+  // The run-start preview store reads the signed-in user through useOptionalAuth; serve it from
+  // the same mocked value so one mockReturnValue(useAuth) drives both.
+  return { useAuth, useOptionalAuth: () => useAuth() };
+});
 
 const mockApi = vi.mocked(api);
 

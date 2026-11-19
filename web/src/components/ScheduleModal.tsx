@@ -1486,7 +1486,6 @@ export function ScheduleModal({
                   value={credentialSel}
                   onChange={onCredentialChange}
                   tokens={tokens}
-                  inheritLabel="Default · worker's token (worker binding)"
                 />
                 <p className="mt-1 text-[11px] text-faint">
                   Runs fired by this schedule spend this token. Leave on Default to follow the

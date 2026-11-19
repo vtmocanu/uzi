@@ -36,8 +36,10 @@ override or Plan/Code cross-check; other runs keep the usual resolution: an expl
 Claude). It picks the harness whose weekly allowance
 resets soonest, falling back to Claude when usage is unknown; see [How the
 automatic default picks a harness](./rate-limits.md#how-the-automatic-default-picks-a-harness).
-The start-run form still says **Use my default** for the harness; the
-schedule modal names the source instead (see [Which harness a schedule runs
+The Run options dialog names the source for the harness too: its Default
+option reads like `Default · Claude (your default harness)`, built from what
+Default would pick right now, or `Default · chosen when started` when uzi picks
+the harness at create. The schedule modal names the source as well (see [Which harness a schedule runs
 on](./scheduling.md#which-harness-a-schedule-runs-on)).
 
 Switching the default harness never clears either model. Each lane is its

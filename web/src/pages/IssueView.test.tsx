@@ -14,6 +14,7 @@ import {
   type Worker,
 } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
+import { RECORDED_EFFECTIVE_SCENARIOS } from "../mocks/data/effectiveSettings";
 
 // IssueView loads four endpoints and, for Promote (PRD #764), calls promoteIssue.
 // Mock the api and useAuth so the test stays offline.
@@ -27,12 +28,19 @@ vi.mock("../lib/api", async (importOriginal) => {
       listWorkers: vi.fn(),
       listSecrets: vi.fn(),
       getMySettings: vi.fn(),
+      getEffectiveSettings: vi.fn(),
+      previewStartSettings: vi.fn(),
       promoteIssue: vi.fn(),
       createRun: vi.fn(),
     },
   };
 });
-vi.mock("../auth/AuthContext", () => ({ useAuth: vi.fn() }));
+vi.mock("../auth/AuthContext", () => {
+  const useAuth = vi.fn();
+  // The run-start preview store reads the signed-in user through useOptionalAuth; serve it from
+  // the same mocked value so one mockReturnValue(useAuth) drives both.
+  return { useAuth, useOptionalAuth: () => useAuth() };
+});
 
 const mockApi = vi.mocked(api);
 
@@ -1761,4 +1769,67 @@ it.each([
   renderIssueView();
   const badge = await screen.findByText(label);
   expect(badge.classList.contains("text-warn")).toBe(true);
+});
+
+// Issue #3261: the open "If it started now" list under the start row, driven by the shared
+// preview store with the page's data identity as its refresh generation.
+describe("IssueView — run-start preview (#3261)", () => {
+  const SCENARIO = RECORDED_EFFECTIVE_SCENARIOS[0];
+  const named = (name: string) => structuredClone(SCENARIO.start_previews.find((p) => p.name === name)!.response);
+  const gets = () => mockApi.getEffectiveSettings.mock.calls.length;
+  const posts = () => mockApi.previewStartSettings.mock.calls.length;
+
+  beforeEach(async () => {
+    // Earlier tests in this file render a signed-in page too; a preview read they scheduled as
+    // their tree unmounted can land just after afterEach cleared the mocks. Let it land, then
+    // reset, so the counts below are this test's own.
+    await new Promise((r) => setTimeout(r, 0));
+    mockApi.getEffectiveSettings.mockReset();
+    mockApi.previewStartSettings.mockReset();
+    setAuth();
+    mockApi.getEffectiveSettings.mockResolvedValue(structuredClone(SCENARIO.get));
+    mockApi.previewStartSettings.mockResolvedValue(named("claude"));
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
+    mockApi.listSecrets.mockResolvedValue({ secrets: [aToken()] });
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["uzi"], has_prd_link: false }) });
+  });
+
+  it("renders the server values open by default, with one GET and one default POST for the page load", async () => {
+    renderIssueView();
+    const button = await screen.findByRole("button", { name: /If it started now: Claude · opus · medium/ });
+    expect(button.getAttribute("aria-expanded")).toBe("true");
+    const panel = document.getElementById(button.getAttribute("aria-controls")!)!;
+    expect(within(panel).getByText("Model").nextElementSibling?.textContent).toContain("opus");
+    expect(within(panel).getByRole("link", { name: "Run defaults" }).getAttribute("href")).toBe("/settings/run-defaults");
+    expect([gets(), posts()]).toEqual([1, 1]);
+    expect(mockApi.previewStartSettings.mock.calls[0][0]).toEqual({ harness: null, credential_override: null });
+  });
+
+  it("a reload after a refused start is a new generation: one more GET and POST", async () => {
+    mockApi.createRun.mockRejectedValueOnce(new ApiError(422, "no PRD"));
+    renderIssueView();
+    await screen.findByRole("button", { name: /If it started now/ });
+    const start = (await screen.findByRole("button", { name: /^start run$/i })) as HTMLButtonElement;
+    await waitFor(() => expect(start.disabled).toBe(false));
+    fireEvent.click(start);
+    await waitFor(() => expect([gets(), posts()]).toEqual([2, 2]));
+    expect(await screen.findByText("no PRD")).toBeTruthy();
+  });
+
+  it("a preview failure leaves Start enabled and shows the error text", async () => {
+    mockApi.previewStartSettings.mockRejectedValue(new Error("boom"));
+    renderIssueView();
+    expect(await screen.findByText("Preview unavailable; Start will validate your choices.")).toBeTruthy();
+    const start = (await screen.findByRole("button", { name: /^start run$/i })) as HTMLButtonElement;
+    await waitFor(() => expect(start.disabled).toBe(false));
+  });
+
+  it("chosen at create lists each alternative", async () => {
+    mockApi.previewStartSettings.mockResolvedValue(named("default start"));
+    renderIssueView();
+    const button = await screen.findByRole("button", { name: /If it started now: Chosen when started/ });
+    const panel = document.getElementById(button.getAttribute("aria-controls")!)!;
+    expect(within(panel).getByText("Claude").nextElementSibling?.textContent).toContain("opus");
+    expect(within(panel).getByText("Codex").nextElementSibling?.textContent).toContain("gpt-6-sol");
+  });
 });

@@ -25,6 +25,7 @@ import {
 } from "../lib/chat";
 import { useRunStream } from "../lib/useRunStream";
 import { ChatMessages } from "../components/ChatMessages";
+import { StartPreviewProvider } from "../lib/startPreviewStore";
 import { ChatComposer } from "../components/ChatComposer";
 import {
   Alert,
@@ -344,7 +345,11 @@ export function ChatConversation() {
       {actionErr && <Alert message={actionErr} />}
 
       <Card className="p-3 sm:p-4">
-        <ChatMessages chatId={id} messages={messages} connected={connected} live={!ended} />
+        {/* Issue #3261: generation 0 is applied at mount, so every start card in this
+            conversation shares one effective-settings read and one default preview. */}
+        <StartPreviewProvider generation={0}>
+          <ChatMessages chatId={id} messages={messages} connected={connected} live={!ended} />
+        </StartPreviewProvider>
       </Card>
 
       {ended ? (

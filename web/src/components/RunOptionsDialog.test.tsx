@@ -5,8 +5,13 @@
 // asserted on the component: row visibility per effective harness, the per-harness model
 // vocabulary, the harness-change reset, the poll that resets nothing, the blocked Other
 // entry, the submitting guards, the announced gate reason and the in-dialog refusal.
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
+import { api } from "../lib/api";
+import type { StartPreview, StartPreviewRequest } from "../lib/apiTypes";
+import { RECORDED_EFFECTIVE_SCENARIOS } from "../mocks/data/effectiveSettings";
+import { StartPreviewProvider } from "../lib/startPreviewStore";
 import { RunOptionsDialog, type RunOptionsStartCallbacks } from "./RunOptionsDialog";
 import { CODEX_CURATED_MODELS, CODEX_ROLE_MODELS } from "../lib/codexModels";
 import { runStartBody, type RunStartFacts, type RunStartOptions } from "../lib/startRun";
@@ -16,8 +21,22 @@ import type { StartRunGate } from "../lib/runStream";
 vi.mock("../lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/api")>();
   // TokenPicker is always handed its tokens here; stub listSecrets so nothing fetches.
-  return { ...actual, api: { ...actual.api, listSecrets: vi.fn(async () => ({ secrets: [] })) } };
+  return {
+    ...actual,
+    api: {
+      ...actual.api,
+      listSecrets: vi.fn(async () => ({ secrets: [] })),
+      // Issue #3261: the dialog's preview reads these two through the shared store.
+      getEffectiveSettings: vi.fn(),
+      previewStartSettings: vi.fn(),
+    },
+  };
 });
+// The preview store reads the signed-in user; only the preview describe renders a provider.
+vi.mock("../auth/AuthContext", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../auth/AuthContext")>()),
+  useOptionalAuth: () => ({ user: { id: "u1" } }),
+}));
 
 afterEach(cleanup);
 
@@ -72,8 +91,10 @@ describe("RunOptionsDialog rows", () => {
     const { dialog } = mount({ facts: BOTH });
     const labels = Array.from(dialog.querySelectorAll("label")).map((l) => l.textContent);
     expect(labels).toEqual(["Harness", "Anthropic token", "Model", "Reasoning effort"]);
-    expect(field(dialog, "Model")!.options[0].textContent).toBe("Default · your settings");
-    expect(field(dialog, "Reasoning effort")!.options[0].textContent).toBe("Default · your settings");
+    // No server prediction yet (no provider here): plain Default, never a claim about "your settings".
+    expect(field(dialog, "Model")!.options[0].textContent).toBe("Default");
+    expect(field(dialog, "Reasoning effort")!.options[0].textContent).toBe("Default");
+    expect(within(dialog).queryByText(/your settings/i)).toBeNull();
     expect(within(dialog).getByText(/#42 Add CSV export/)).toBeTruthy();
   });
 
@@ -327,5 +348,152 @@ describe("RunOptionsDialog start", () => {
     settle!();
     await waitFor(() => expect(document.activeElement).toBe(startButton(dialog)));
     expect(within(dialog).getByRole("alert").textContent).toBe("worker pool is full");
+  });
+});
+
+// Issue #3261: the read-only preview and the source-aware Default labels, inside the real store.
+describe("RunOptionsDialog start preview", () => {
+  const mockApi = vi.mocked(api);
+  beforeEach(() => {
+    mockApi.getEffectiveSettings.mockReset();
+    mockApi.previewStartSettings.mockReset();
+  });
+  const SCENARIO = RECORDED_EFFECTIVE_SCENARIOS[0];
+  const resp = (name: string): StartPreview => structuredClone(SCENARIO.start_previews.find((p) => p.name === name)!.response);
+  const isDefaultChoice = (r: StartPreviewRequest) => !r.harness && !r.credential_override && !r.model && !r.effort;
+
+  // `defaultResponse` answers the default-choice request; explicit harnesses get the recorded ones.
+  function serve(defaultResponse: StartPreview) {
+    mockApi.getEffectiveSettings.mockResolvedValue(structuredClone(SCENARIO.get));
+    mockApi.previewStartSettings.mockImplementation(async (r: StartPreviewRequest) => {
+      if (isDefaultChoice(r)) return structuredClone(defaultResponse);
+      return resp(r.harness === "codex" ? "codex" : "claude");
+    });
+  }
+
+  function mountWithPreview(facts: RunStartFacts = BOTH, onStart = vi.fn<StartFn>()) {
+    const props = { issueIid: 42, issueTitle: "Add CSV export", gate: () => OPEN, tokens: [token], onStart, onClose: vi.fn() };
+    render(
+      <MemoryRouter>
+        <StartPreviewProvider generation={1}>
+          <RunOptionsDialog {...props} facts={facts} />
+        </StartPreviewProvider>
+      </MemoryRouter>,
+    );
+    return { dialog: screen.getByRole("dialog", { name: "Run options for #42" }), onStart };
+  }
+
+  const requests = () => mockApi.previewStartSettings.mock.calls.map((c) => c[0] as StartPreviewRequest);
+
+  it("shows the open preview and a defaults hint that no longer claims 'your Settings'", async () => {
+    serve(resp("claude"));
+    const { dialog } = mountWithPreview();
+    expect(await within(dialog).findByRole("button", { name: /If it started now: Claude · opus · medium/ })).toBeTruthy();
+    expect(within(dialog).getByText(/Model and effort left on Default are resolved when a worker picks the run up/)).toBeTruthy();
+    expect(within(dialog).queryByText(/follows your Settings/)).toBeNull();
+  });
+
+  it("does not repeat the preview's note lines inside the dialog", async () => {
+    serve(resp("claude"));
+    const { dialog } = mountWithPreview();
+    expect(await within(dialog).findByRole("button", { name: /If it started now: Claude · opus · medium/ })).toBeTruthy();
+    expect(within(dialog).queryByText(/A prediction/)).toBeNull();
+    expect(within(dialog).queryByText(/A choice made here is fixed/)).toBeNull();
+  });
+
+  it("an undecided default names 'chosen when started' on the harness Default and depends-on-harness for model and effort", async () => {
+    serve(resp("default start"));
+    const { dialog } = mountWithPreview();
+    await waitFor(() => expect(field(dialog, "Harness")!.options[0].textContent).toBe("Default · chosen when started"));
+    expect(field(dialog, "Model")!.options[0].textContent).toBe("Default · depends on the harness chosen when started");
+    expect(field(dialog, "Reasoning effort")!.options[0].textContent).toBe("Default · depends on the harness chosen when started");
+  });
+
+  it("a decided Claude default shows the server source, never the client-derived harness", async () => {
+    serve(resp("auto token"));
+    const { dialog } = mountWithPreview();
+    await waitFor(() => expect(field(dialog, "Harness")!.options[0].textContent).toMatch(/^Default · Claude \(.+\)$/));
+    expect(field(dialog, "Model")!.options[0].textContent).toMatch(/^Default · opus \(.+\)$/);
+    expect(field(dialog, "Reasoning effort")!.options[0].textContent).toMatch(/^Default · medium \(.+\)$/);
+  });
+
+  it("explicit Codex with a Claude default: the harness Default stays Claude, model and effort Defaults show Codex", async () => {
+    serve(resp("auto token"));
+    const { dialog } = mountWithPreview();
+    await waitFor(() => expect(field(dialog, "Harness")!.options[0].textContent).toMatch(/^Default · Claude/));
+    fireEvent.change(field(dialog, "Harness")!, { target: { value: "codex" } });
+    await waitFor(() => expect(field(dialog, "Model")!.options[0].textContent).toMatch(/gpt-6-sol/));
+    expect(field(dialog, "Harness")!.options[0].textContent).toMatch(/^Default · Claude \(/);
+    expect(field(dialog, "Reasoning effort")!.options[0].textContent).toMatch(/^Default · medium \(/);
+  });
+
+  it("explicit Codex with an undecided default: the harness Default stays 'chosen when started'", async () => {
+    serve(resp("default start"));
+    const { dialog } = mountWithPreview();
+    await waitFor(() => expect(field(dialog, "Harness")!.options[0].textContent).toBe("Default · chosen when started"));
+    fireEvent.change(field(dialog, "Harness")!, { target: { value: "codex" } });
+    await waitFor(() => expect(field(dialog, "Model")!.options[0].textContent).toMatch(/gpt-6-sol/));
+    expect(field(dialog, "Harness")!.options[0].textContent).toBe("Default · chosen when started");
+  });
+
+  it("the preview follows the model and effort choice and sends one POST per distinct choice", async () => {
+    serve(resp("claude"));
+    const { dialog } = mountWithPreview(CLAUDE_ONLY);
+    await within(dialog).findByRole("button", { name: /If it started now/ });
+    fireEvent.change(field(dialog, "Model")!, { target: { value: "opus" } });
+    fireEvent.change(field(dialog, "Reasoning effort")!, { target: { value: "high" } });
+    await waitFor(() => expect(requests()).toContainEqual({ harness: null, credential_override: null, model: "opus", effort: "high" }));
+    fireEvent.change(field(dialog, "Reasoning effort")!, { target: { value: "inherit" } });
+    fireEvent.change(field(dialog, "Reasoning effort")!, { target: { value: "high" } });
+    await waitFor(() => expect(requests().length).toBeGreaterThanOrEqual(3));
+    const keys = requests().map((r) => JSON.stringify(r));
+    expect(new Set(keys).size).toBe(keys.length);
+  });
+
+  it("a token hidden by the Codex choice is not submitted to the preview", async () => {
+    serve(resp("claude"));
+    const { dialog } = mountWithPreview(BOTH);
+    await within(dialog).findByRole("button", { name: /If it started now/ });
+    fireEvent.change(field(dialog, "Anthropic token")!, { target: { value: "sec-1" } });
+    await waitFor(() => expect(requests().some((r) => r.credential_override?.secret_id === "sec-1")).toBe(true));
+    fireEvent.change(field(dialog, "Harness")!, { target: { value: "codex" } });
+    await waitFor(() => expect(requests().some((r) => r.harness === "codex")).toBe(true));
+    const codexReq = requests().find((r) => r.harness === "codex")!;
+    expect(codexReq.credential_override).toBeNull();
+  });
+
+  it("sends no preview request while the model is invalid, and debounces a custom entry", async () => {
+    serve(resp("claude"));
+    const { dialog } = mountWithPreview(CLAUDE_ONLY);
+    await within(dialog).findByRole("button", { name: /If it started now/ });
+    const before = requests().length;
+    fireEvent.change(field(dialog, "Model")!, { target: { value: "custom" } });
+    const input = within(dialog).getByLabelText("Custom model ID") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "two words" } });
+    await new Promise((r) => setTimeout(r, 600));
+    expect(requests().length).toBe(before);
+    // A valid entry reaches the request only after the pause in typing.
+    fireEvent.change(input, { target: { value: "claude-x-1" } });
+    expect(requests().some((r) => r.model === "claude-x-1")).toBe(false);
+    await waitFor(() => expect(requests().some((r) => r.model === "claude-x-1")).toBe(true), { timeout: 3000 });
+    // The stale invalid entry is never sent while the debounce catches up to the fix.
+    expect(requests().filter((r) => r.model === "two words")).toEqual([]);
+  });
+
+  it("a preview failure leaves Start enabled and the server error visible", async () => {
+    mockApi.getEffectiveSettings.mockRejectedValue(new Error("boom"));
+    mockApi.previewStartSettings.mockRejectedValue(new Error("boom"));
+    const onStart = vi.fn<StartFn>((_o, cb) => {
+      cb.onError("server said no");
+      cb.onSettled();
+    });
+    const { dialog } = mountWithPreview(BOTH, onStart);
+    expect(await within(dialog).findByText("Preview unavailable; Start will validate your choices.")).toBeTruthy();
+    expect(startButton(dialog).disabled).toBe(false);
+    // Default labels fall back to plain Default, never "your settings".
+    expect(field(dialog, "Model")!.options[0].textContent).toBe("Default");
+    fireEvent.click(startButton(dialog));
+    await waitFor(() => expect(within(dialog).getByRole("alert").textContent).toBe("server said no"));
+    expect(onStart).toHaveBeenCalledTimes(1);
   });
 });

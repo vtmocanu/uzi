@@ -5,6 +5,9 @@ import { MemoryRouter, Route, Routes, useNavigate } from "react-router-dom";
 import { Board, IssueCard } from "./Board";
 import { api, ApiError, type Board as BoardData, type Card, type LatestRun } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
+import type { StartPreview, StartPreviewRequest } from "../lib/apiTypes";
+import { RECORDED_EFFECTIVE_SCENARIOS } from "../mocks/data/effectiveSettings";
+import { deferred } from "../test-helpers";
 
 // The full Board mounts four endpoints and reads the configured label names off the
 // auth context; mock both so the drag test below stays offline.
@@ -28,10 +31,18 @@ vi.mock("../lib/api", async (importOriginal) => {
       // PRD #1429 M4a review Fix 1: the board's loadPreconditions fetches the viewer's
       // default_harness alongside listWorkers/listSecrets/listRuns.
       getMySettings: vi.fn(),
+      // Issue #3261: the shared run-start preview reads these two.
+      getEffectiveSettings: vi.fn(),
+      previewStartSettings: vi.fn(),
     },
   };
 });
-vi.mock("../auth/AuthContext", () => ({ useAuth: vi.fn() }));
+vi.mock("../auth/AuthContext", () => {
+  const useAuth = vi.fn();
+  // The run-start preview store reads the signed-in user through useOptionalAuth; serve it from
+  // the same mocked value so one mockReturnValue(useAuth) drives both.
+  return { useAuth, useOptionalAuth: () => useAuth() };
+});
 
 const mockApi = vi.mocked(api);
 
@@ -3511,4 +3522,280 @@ it.each([false, true])("account cooldown card keeps quiet chrome (revising=%s)",
   expect(container.textContent).toContain("waiting for account cooldown");
   expect(container.querySelector("[data-live], [data-attention], .animate-pulse")).toBeNull();
   expect(container.querySelector(".ring-2")).toBeNull();
+});
+
+// Issue #3261: the shared run-start preview on the board. The tests above run with `user: null`,
+// where the preview store fetches nothing; these set a signed-in user and mock the two reads.
+describe("Board — run-start preview (#3261)", () => {
+  const SCENARIOS = RECORDED_EFFECTIVE_SCENARIOS;
+  const named = (scenario: number, name: string) =>
+    structuredClone(SCENARIOS[scenario].start_previews.find((p) => p.name === name)!.response);
+  const isDefaultChoice = (r: StartPreviewRequest) => !r.harness && !r.credential_override && !r.model && !r.effort;
+
+  const authValue = (id: string) =>
+    ({
+      user: { id },
+      loading: false,
+      uziLabel: "uzi",
+      autopilotLabel: "autopilot",
+      appearance: {
+        mode: "dark",
+        light_theme: "hall",
+        dark_theme: "ember",
+        typeface: "system",
+        overrides: { mode: null, light_theme: null, dark_theme: null, typeface: null },
+        defaults: { mode: "dark", light_theme: "hall", dark_theme: "ember", typeface: "system" },
+      },
+      vaultUnlocked: true,
+      vaultExists: true,
+      hasPassword: true,
+      register: vi.fn(),
+      login: vi.fn(),
+      logout: vi.fn(),
+      refresh: vi.fn(),
+    }) as unknown as ReturnType<typeof useAuth>;
+
+  const token = (kind: string) =>
+    ({
+      id: `sec-${kind}`,
+      kind,
+      label: kind,
+      is_default: true,
+      auto_eligible: false,
+      created_at: "2026-01-01T00:00:00Z",
+      updated_at: "2026-01-01T00:00:00Z",
+    }) as unknown as import("../lib/api").SecretMeta;
+
+  function aBoard(): BoardData {
+    return {
+      repo_id: "repo-1",
+      path_with_namespace: "grp/one",
+      web_url: "https://gitlab.example.com/grp/one",
+      forge_type: "gitlab",
+      columns: [] as BoardData["columns"],
+      cards: [
+        aCard({ iid: 1, title: "issue A", column: "", labels: ["uzi"], has_prd_link: false }),
+        aCard({ iid: 2, title: "issue B", column: "", labels: ["uzi"], has_prd_link: false }),
+        aCard({ iid: 3, title: "issue C", column: "", labels: ["uzi"], has_prd_link: false }),
+      ],
+      pipeline: null,
+      bot_forge_user_id: 0,
+    };
+  }
+
+  // The default choice is the decided Claude response; any other choice is the recorded one.
+  function serve(scenario = 0, defaultResponse = named(0, "claude")) {
+    mockApi.getEffectiveSettings.mockResolvedValue(structuredClone(SCENARIOS[scenario].get));
+    mockApi.previewStartSettings.mockImplementation(async (r: StartPreviewRequest) =>
+      isDefaultChoice(r) ? structuredClone(defaultResponse) : named(scenario, r.harness === "codex" ? "codex" : "claude"),
+    );
+  }
+
+  beforeEach(() => {
+    vi.mocked(useAuth).mockReturnValue(authValue("u1"));
+    mockApi.getBoard.mockResolvedValue({ board: aBoard() });
+    mockApi.getBoardPrefs.mockResolvedValue({ extra_labels: null, show_all: false });
+    mockApi.listWorkers.mockResolvedValue({ workers: [{ id: "w1" } as unknown as import("../lib/api").Worker] });
+    mockApi.listSecrets.mockResolvedValue({ secrets: [token("anthropic_token")] });
+    mockApi.listRuns.mockResolvedValue({ runs: [] });
+    serve();
+  });
+
+  const tree = () => (
+    <MemoryRouter initialEntries={["/repos/repo-1/board"]}>
+      <Routes>
+        <Route path="/repos/:id/board" element={<Board />} />
+      </Routes>
+    </MemoryRouter>
+  );
+  const renderBoard = () => render(tree());
+  const gets = () => mockApi.getEffectiveSettings.mock.calls.length;
+  const posts = () => mockApi.previewStartSettings.mock.calls.length;
+  const disclosures = () => screen.findAllByRole("button", { name: /If started now: Claude · opus · medium/ });
+
+  it("sends exactly one GET and one default POST on load, however many cards", async () => {
+    renderBoard();
+    expect(await disclosures()).toHaveLength(3);
+    expect(gets()).toBe(1);
+    expect(posts()).toBe(1);
+    expect(mockApi.previewStartSettings.mock.calls[0][0]).toEqual({ harness: null, credential_override: null });
+    for (const b of await disclosures()) expect(b.getAttribute("aria-expanded")).toBe("false");
+  });
+
+  it("each successful poll tick of the prerequisites sends one more GET and one more POST, never one per card", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      renderBoard();
+      await disclosures();
+      expect([gets(), posts()]).toEqual([1, 1]);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(10_500);
+      });
+      await waitFor(() => expect([gets(), posts()]).toEqual([2, 2]));
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(10_000);
+      });
+      await waitFor(() => expect([gets(), posts()]).toEqual([3, 3]));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a start that settles with an error refreshes the prerequisites, so the preview refetches once", async () => {
+    mockApi.createRun.mockRejectedValueOnce(new ApiError(500, "boom"));
+    renderBoard();
+    await disclosures();
+    fireEvent.click(screen.getAllByRole("button", { name: "Start run" })[0]);
+    await waitFor(() => expect([gets(), posts()]).toEqual([2, 2]));
+  });
+
+  it("a response from before a refresh never renders once a newer generation applied", async () => {
+    const first = deferred<StartPreview>();
+    mockApi.previewStartSettings.mockReturnValueOnce(first.promise);
+    mockApi.createRun.mockRejectedValueOnce(new ApiError(500, "boom"));
+    renderBoard();
+    await screen.findByText("issue A");
+    await waitFor(() => expect(posts()).toBe(1));
+    expect((await screen.findAllByText("Resolving…")).length).toBeGreaterThan(0);
+    // The first generation is still pending when the prerequisites refresh again (a start settles).
+    fireEvent.click(screen.getAllByRole("button", { name: "Start run" })[0]);
+    await disclosures();
+    // The late first-generation answer (Codex) must not replace the current one.
+    await act(async () => {
+      first.resolve(named(0, "codex"));
+      await Promise.resolve();
+    });
+    expect(screen.queryByText(/If started now: Codex/)).toBeNull();
+    expect((await disclosures()).length).toBe(3);
+  });
+
+  it("an account change drops the previous user's value and a late answer for them", async () => {
+    const aAnswer = deferred<StartPreview>();
+    mockApi.previewStartSettings.mockReturnValueOnce(aAnswer.promise);
+    const view = renderBoard();
+    await screen.findByText("issue A");
+    await waitFor(() => expect(posts()).toBe(1));
+    vi.mocked(useAuth).mockReturnValue(authValue("u2"));
+    view.rerender(tree());
+    await disclosures();
+    expect([gets(), posts()]).toEqual([2, 2]);
+    await act(async () => {
+      aAnswer.resolve(named(0, "codex"));
+      await Promise.resolve();
+    });
+    expect(screen.queryByText(/If started now: Codex/)).toBeNull();
+  });
+
+  it("unmounting and remounting the board fetches fresh", async () => {
+    const view = renderBoard();
+    await disclosures();
+    view.unmount();
+    renderBoard();
+    await disclosures();
+    expect([gets(), posts()]).toEqual([2, 2]);
+  });
+
+  // The same default choice (same request key) can still predict a different value once the
+  // settings behind it change: these serve the GET with a given Claude worker model cell.
+  function getWithModel(model: string, source: string) {
+    const get = structuredClone(SCENARIOS[0].get);
+    for (const c of get.models) {
+      if (c.setting === "worker_model" && c.harness === "claude") {
+        c.default_model = model;
+        c.resolved_model = model;
+        c.source = source as typeof c.source;
+      }
+    }
+    return get;
+  }
+  const modelRow = (panel: HTMLElement) => within(panel).getByText("Model").nextElementSibling as HTMLElement;
+  async function openFirstPanel() {
+    const button = (await screen.findAllByRole("button", { name: /If started now: Claude/ }))[0];
+    if (button.getAttribute("aria-expanded") !== "true") fireEvent.click(button);
+    return document.getElementById(button.getAttribute("aria-controls")!) as HTMLElement;
+  }
+
+  it("a same-choice refresh with changed settings replaces the shown value and source", async () => {
+    mockApi.getEffectiveSettings.mockResolvedValue(getWithModel("opus", "user_default"));
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      renderBoard();
+      let panel = await openFirstPanel();
+      expect(modelRow(panel).textContent).toBe("opus · your choice");
+      // The user's setting is gone and the credentials changed; the next tick sees both.
+      mockApi.getEffectiveSettings.mockResolvedValue(getWithModel("sonnet", "builtin"));
+      mockApi.listSecrets.mockResolvedValue({ secrets: [token("anthropic_token"), token("openai_api_key")] });
+      mockApi.getMySettings.mockClear();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(10_500);
+      });
+      await waitFor(() => expect(gets()).toBe(2));
+      await waitFor(() => expect(modelRow(panel).textContent).toBe("sonnet · built-in"));
+      panel = await openFirstPanel();
+      expect(panel.textContent).not.toContain("opus");
+      expect(modelRow(panel).textContent).toBe("sonnet · built-in");
+      // Every card, not just the first, shows the new prediction.
+      expect(screen.queryByRole("button", { name: /If started now: Claude · opus/ })).toBeNull();
+      expect((await screen.findAllByRole("button", { name: /If started now: Claude · sonnet/ })).length).toBe(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("unmounting and remounting after a settings change shows the new value and source", async () => {
+    mockApi.getEffectiveSettings.mockResolvedValue(getWithModel("opus", "user_default"));
+    const view = renderBoard();
+    let panel = await openFirstPanel();
+    expect(modelRow(panel).textContent).toBe("opus · your choice");
+    view.unmount();
+    mockApi.getEffectiveSettings.mockResolvedValue(getWithModel("sonnet", "builtin"));
+    mockApi.listSecrets.mockResolvedValue({ secrets: [token("anthropic_token"), token("openai_api_key")] });
+    renderBoard();
+    panel = await openFirstPanel();
+    await waitFor(() => expect(modelRow(panel).textContent).toBe("sonnet · built-in"));
+    expect(panel.textContent).not.toContain("opus");
+    expect(modelRow(panel).textContent).not.toContain("your choice");
+  });
+
+  it("the Options dialog sends one deduplicated POST per distinct choice", async () => {
+    renderBoard();
+    await screen.findByText("issue A");
+    fireEvent.click(await screen.findByRole("button", { name: "Run options for #1" }));
+    const dialog = screen.getByRole("dialog", { name: "Run options for #1" });
+    await waitFor(() => expect(within(dialog).getByRole("button", { name: /If it started now/ })).toBeTruthy());
+    const before = posts();
+    fireEvent.change(within(dialog).getByLabelText("Reasoning effort"), { target: { value: "high" } });
+    await waitFor(() => expect(posts()).toBe(before + 1));
+    fireEvent.change(within(dialog).getByLabelText("Reasoning effort"), { target: { value: "inherit" } });
+    fireEvent.change(within(dialog).getByLabelText("Reasoning effort"), { target: { value: "high" } });
+    await new Promise((r) => setTimeout(r, 50));
+    expect(posts()).toBe(before + 1);
+  });
+
+  it("a preview failure leaves Start enabled and the server's create error still shows", async () => {
+    mockApi.previewStartSettings.mockRejectedValue(new Error("boom"));
+    const text = "This repo has no PRD for issue 1.";
+    mockApi.createRun.mockRejectedValueOnce(new ApiError(422, text));
+    renderBoard();
+    expect((await screen.findAllByText("Preview unavailable; Start will validate your choices.")).length).toBe(3);
+    const start = screen.getAllByRole("button", { name: "Start run" })[0] as HTMLButtonElement;
+    expect(start.disabled).toBe(false);
+    fireEvent.click(start);
+    expect(await screen.findByText(text)).toBeTruthy();
+  });
+
+  it("a gated card shows its reason as text next to the full preview", async () => {
+    mockApi.listWorkers.mockResolvedValue({ workers: [] });
+    renderBoard();
+    const reasons = await screen.findAllByText("Connect a worker first (Settings → Workers).");
+    expect(reasons.some((el) => el.tagName === "P" && el.className.includes("text-xs"))).toBe(true);
+    expect((await disclosures()).length).toBe(3);
+  });
+
+  it("Codex-only: the card predicts Codex from the server's own harness and cells", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [token("openai_api_key")] });
+    serve(1, named(1, "default start"));
+    renderBoard();
+    expect((await screen.findAllByRole("button", { name: /If started now: Codex · gpt-6\.1-sol · medium/ })).length).toBe(3);
+  });
 });
