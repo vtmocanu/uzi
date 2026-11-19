@@ -527,6 +527,15 @@ func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled, publication
 		// awaiting_approval gate. Advertised UNCONDITIONALLY: a worker sends the report ONLY after
 		// seeing this token, because an older api 400s the unknown state and field.
 		{"clarification_revision_settlement_v1"},
+		// Issue #4479: this api accepts {status:"followup_finalize", claim_generation,
+		// followup_park_seq}, answers an applied or replayed admission with disposition
+		// "followup_finalize_admitted" and a refusal with a 409 {applied:false, reason} where reason
+		// is followup_pending, cancel_pending or followup_finalize_refused, and echoes
+		// followup_park_seq on the awaiting_followup park ACK. It moves a parked interactive task run
+		// back to running just before the worker finalizes it. Advertised UNCONDITIONALLY: a worker
+		// sends the report ONLY after seeing this token, because an older api 400s the unknown state
+		// and field.
+		{"followup_finalize_admission_v1"},
 		// Issue #3607: this api accepts the compact provider policy hold report and the owner
 		// policy Resume. Advertised UNCONDITIONALLY; a worker negotiates the protocol by
 		// registering the same capability, and the claim SQL fences policy-held runs to workers
@@ -1591,6 +1600,20 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
+		// Issue #4479: a refused followup_finalize is a 409 {run, applied:false, reason}; the worker
+		// dispatches on the reason. A stale claim is not here: it keeps the stale_claim disposition
+		// below.
+		if reason, ok := workersvc.FollowupFinalizeRefusalReason(err); ok {
+			ack, ackErr := h.workerStateAck(w, r, run)
+			if ackErr != nil {
+				httpx.Error(w, http.StatusInternalServerError, "semantic completion authority unavailable")
+				return
+			}
+			ack["applied"] = false
+			ack["reason"] = reason
+			httpx.JSON(w, http.StatusConflict, ack)
+			return
+		}
 		switch {
 		case errors.Is(err, workersvc.ErrMessagesPending):
 			// PRD #1391 Run B M3c (D3): the terminal fence refused a completed/failed report whose
@@ -1674,7 +1697,7 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 			// The service error text already reads "invalid run state: a job run never parks (<state>)".
 			httpx.Error(w, http.StatusBadRequest, err.Error())
 		case errors.Is(err, workersvc.ErrInvalidState):
-			httpx.Error(w, http.StatusBadRequest, "state must be one of running, awaiting_approval, awaiting_input, awaiting_followup, limit_wait, recovery_wait, paused, pause_failed, credential_switch, credential_switch_failed, credential_switch_held, credential_switch_hold_settled, credential_switch_uncertain, clarification_settled, completed, failed")
+			httpx.Error(w, http.StatusBadRequest, "state must be one of running, awaiting_approval, awaiting_input, awaiting_followup, limit_wait, recovery_wait, paused, pause_failed, credential_switch, credential_switch_failed, credential_switch_held, credential_switch_hold_settled, credential_switch_uncertain, clarification_settled, followup_finalize, completed, failed")
 		default:
 			slog.Error("worker run state", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -1723,6 +1746,13 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 		if ackErr != nil {
 			httpx.Error(w, http.StatusInternalServerError, "semantic completion authority unavailable")
 			return
+		}
+		if req.State == "followup_finalize" {
+			// Issue #4479: an early no-op return in the service (an owner hold, a policy episode, an
+			// iteration-budget pause) is a refusal too. Without a reason the worker would read the
+			// 409 as unconfirmed and retry forever.
+			ack["applied"] = false
+			ack["reason"] = workersvc.FollowupFinalizeReasonRefused
 		}
 		if req.RequireRunning {
 			ack["applied"] = false
@@ -1789,6 +1819,17 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 		// Issue #3985: the settlement applied (or replayed): the run is back at awaiting_approval
 		// with the human revise still pending. The worker keys on this.
 		ack["disposition"] = "clarification_settled"
+	case "followup_finalize":
+		// Issue #4479: the admission applied (or replayed): the run is running again for the
+		// worker's finalize and will not re-park on this claim. The worker keys on this.
+		ack["applied"] = true
+		ack["disposition"] = "followup_finalize_admitted"
+	case "awaiting_followup":
+		// Issue #4479: the park sequence the worker echoes in its followup_finalize report. Only an
+		// applied park that left the run awaiting_followup carries it.
+		if run.Status == "awaiting_followup" && run.FollowupParkSeq > 0 {
+			ack["followup_park_seq"] = run.FollowupParkSeq
+		}
 	}
 	if req.State == "awaiting_approval" && gateRevision > 0 {
 		// PRD #1795 M1 (decision 5): the revision this report was answered with, allocated or

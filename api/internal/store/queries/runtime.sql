@@ -5487,6 +5487,99 @@ SELECT EXISTS (
             AND i.disposition IS DISTINCT FROM 'superseded')
 )::boolean;
 
+-- name: AdmitRunFollowupFinalize :execrows
+-- Issue #4479: the followup_finalize admission. An interactive task run parked at awaiting_followup
+-- whose worker is finalizing (idle timeout or owner stop) must be 'running' on the server before it
+-- can enroll a publication intent (RegisterPublicationIntent refuses any other status). This moves
+-- awaiting_followup -> running for exactly the park the worker observed (followup_park_seq echoed
+-- from the park ACK) and stamps followup_finalize_generation = claim_generation, which the
+-- runs_followup_park_identity_trg and run_user_inputs_followup_finalize_trg triggers (migration
+-- 00491) read to refuse a re-park and a later owner follow-up for this claim.
+--
+-- Modelled on SettleRunClarificationToGate: one fenced statement, SetRunRunning is NOT relaxed (its
+-- Decision-7 wake guard keeps requiring a follow-up newer than the watermark). Deliberately
+-- untouched: iteration_count, budgets, started_at, session_id, open_followup_id, milestones,
+-- stop_kind and budget_paused_seconds. No awaiting_followup gap is banked, matching SetRunRunning's
+-- CASE, which banks only the awaiting_approval and awaiting_input parks.
+--
+-- Refusals (0 rows), classified by the service under the same transaction: a pending follow-up
+-- (queued, consumed-unapplied, or applied above the park watermark) refuses unless the run carries
+-- the server-stamped stop_kind='stopped' (stop wins over an idle follow-up); a deliverable cancel
+-- always refuses, keyed on the cancel INPUT rows and not on stop_kind because a later stop
+-- overwrites 'cancelled'. The cancel predicate is the one GetRunOwnershipByWorker uses.
+UPDATE runs SET
+    status                       = 'running',
+    status_since                 = now(),
+    updated_at                   = now(),
+    health                       = 'ok',
+    health_reason                = NULL,
+    health_since                 = NULL,
+    followup_finalize_generation = claim_generation
+WHERE runs.id = @id
+  AND runs.worker_id = @worker_id
+  AND runs.claim_generation = @claim_generation
+  AND runs.claim_released_at IS NULL
+  AND runs.kind = 'task'
+  AND runs.interactive
+  AND runs.status = 'awaiting_followup'
+  AND runs.followup_park_seq = sqlc.arg('park_seq')::bigint
+  AND sqlc.arg('park_seq')::bigint > 0
+  AND runs.hold_reason IS NULL
+  AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
+  AND NOT EXISTS (
+          SELECT 1 FROM run_user_inputs i
+          WHERE i.run_id = runs.id AND i.kind = 'cancel'
+            AND i.applied_at IS NULL AND i.disposition IS DISTINCT FROM 'superseded'
+            AND NOT EXISTS (SELECT 1 FROM run_milestone_reconciliations a
+                            WHERE a.run_id = i.run_id AND i.id <= a.stop_cutoff))
+  AND (runs.stop_kind = 'stopped' OR NOT EXISTS (
+      SELECT 1 FROM run_user_inputs i
+      WHERE i.run_id = runs.id AND i.kind = 'follow_up' AND i.disposition IS NULL
+        AND (i.applied_at IS NULL OR i.id > COALESCE(runs.open_followup_id, 0))));
+
+-- name: GetFollowupFinalizeReplay :one
+-- Issue #4479: read-only idempotent replay for AdmitRunFollowupFinalize after a lost ACK. True only
+-- when the run is already 'running' on the SAME claim, admitted for the same park sequence and
+-- generation, and no cancel is deliverable (a cancel inserted after the admission turns the replay
+-- into a refusal, so the worker does not finalize over it). It writes nothing.
+SELECT EXISTS (
+    SELECT 1 FROM runs
+    WHERE runs.id = @id
+      AND runs.worker_id = @worker_id
+      AND runs.claim_generation = @claim_generation
+      AND runs.claim_released_at IS NULL
+      AND runs.status = 'running'
+      AND runs.followup_park_seq = sqlc.arg('park_seq')::bigint
+      AND runs.followup_finalize_generation = runs.claim_generation
+      AND NOT EXISTS (
+          SELECT 1 FROM run_user_inputs i
+          WHERE i.run_id = runs.id AND i.kind = 'cancel'
+            AND i.applied_at IS NULL AND i.disposition IS DISTINCT FROM 'superseded'
+            AND NOT EXISTS (SELECT 1 FROM run_milestone_reconciliations a
+                            WHERE a.run_id = i.run_id AND i.id <= a.stop_cutoff))
+)::boolean;
+
+-- name: GetFollowupFinalizeBlockers :one
+-- Issue #4479: read-only classification of a refused followup_finalize, run under the report's
+-- transaction after AdmitRunFollowupFinalize matched 0 rows. cancel_deliverable is the
+-- GetRunOwnershipByWorker deliverability triple; followup_pending is the admission's pending
+-- follow-up predicate. Nothing is written.
+SELECT
+    EXISTS (
+        SELECT 1 FROM run_user_inputs i
+        WHERE i.run_id = runs.id AND i.kind = 'cancel'
+          AND i.applied_at IS NULL AND i.disposition IS DISTINCT FROM 'superseded'
+          AND NOT EXISTS (SELECT 1 FROM run_milestone_reconciliations a
+                          WHERE a.run_id = i.run_id AND i.id <= a.stop_cutoff)
+    )::boolean AS cancel_deliverable,
+    EXISTS (
+        SELECT 1 FROM run_user_inputs i
+        WHERE i.run_id = runs.id AND i.kind = 'follow_up' AND i.disposition IS NULL
+          AND (i.applied_at IS NULL OR i.id > COALESCE(runs.open_followup_id, 0))
+    )::boolean AS followup_pending
+FROM runs
+WHERE runs.id = @id;
+
 -- name: ClearRunMilestonesCompleted :execrows
 -- PRD #628 M4: the ONLY non-union writer of milestones_completed. milestones_completed
 -- is otherwise a monotone union (SetRunRunning ~:926-930, SetRunCompleted ~:1470-1473 —

@@ -1853,6 +1853,9 @@ func translateGateSubmitErr(err error) error {
 		return slacksvc.ErrReviseCapReached
 	case errors.Is(err, workersvc.ErrInvalidSelection):
 		return slacksvc.ErrSelectionRejected
+	case errors.Is(err, workersvc.ErrFollowUpFinalizing):
+		// Issue #4479: the interactive run is finishing; the replier tells the user.
+		return slacksvc.ErrFollowUpFinalizing
 	}
 	return err
 }

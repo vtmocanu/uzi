@@ -29,6 +29,7 @@ func TestTranslateGateSubmitErr(t *testing.T) {
 		{"revise cap", workersvc.ErrReviseCapReached, slacksvc.ErrReviseCapReached},
 		{"approval milestones moved", workersvc.ErrApprovalMilestonesMoved, slacksvc.ErrGateRevisionMismatch},
 		{"invalid selection", workersvc.ErrInvalidSelection, slacksvc.ErrSelectionRejected},
+		{"follow-up finalizing", workersvc.ErrFollowUpFinalizing, slacksvc.ErrFollowUpFinalizing},
 		{"other passes through", other, other},
 	}
 	for _, tc := range cases {
