@@ -115,9 +115,11 @@ The branch also runs when every remaining participant is already proven (none
 is in flight): while incomplete participant reservations exist without a canary,
 ordinary planning admits no new canary, because an earlier adoption patch could
 still commit beside it. If adoption is refused there, the pool holds with the
-no-canary reason. A same owner/lane canary in a sibling capability pool keeps the
-existing ordinary planning; adoption refuses in that case anyway, and a patch
-sent before such a canary appeared is a residual the duplicate-canary hold closes.
+no-canary reason. A same owner/lane canary in a sibling capability pool does not
+lift this hold: it touches no Deployment in this pool, so it cannot fence an
+adoption patch still outstanding here. Adoption refuses beside it, so the pool
+holds with the no-canary reason until a canary exists in the pool again or
+explicit recovery.
 
 The tick is adoption-only: the pool's planning ends after the write and its
 coverage is fenced, so no replacement, PVC or replica change happens that tick.

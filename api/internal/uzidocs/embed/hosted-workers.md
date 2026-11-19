@@ -817,9 +817,10 @@ While no canary exists the pool can stay held:
   (for example a hibernating, unavailable or unplanned worker, a stray annotated
   Deployment, or an uncertain or migration fence): held with `participant
   reservation without canary; explicit recovery required`. This applies even when
-  every participant is already proven, so no new canary is admitted beside them.
-  When every participant is proven, a canary of the same owner in another
-  capability pool of the namespace keeps the existing ordinary planning instead;
+  every participant is already proven, so no new canary is admitted beside them,
+  and also when a canary of the same owner exists in another capability pool of
+  the namespace: that canary touches no Deployment in this pool, so it cannot
+  fence an adoption request still outstanding here;
 - a smaller-ID participant is neither proven nor fenced (stale evidence, a desired
   generation change, a claim mirror, or a Deployment recreated still carrying its
   marker): held with `earlier participant may hold an unresolved adoption

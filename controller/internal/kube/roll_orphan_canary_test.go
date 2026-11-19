@@ -435,10 +435,10 @@ func TestOrphanRollCohortRecoveryRequiresIncarnationProof(t *testing.T) {
 			o.requireCoverage(t, []string{"gpu"}, []string{"proto-1"}, true)
 		}},
 		{name: "frozen scheduling capability missing from evidence", mutate: func(t *testing.T, o *orphanCohort) {
-			o.requireCoverage(t, []string{"gpu"}, nil, false)
+			o.requireCoverage(t, []string{"gpu"}, []string{}, false)
 		}},
 		{name: "frozen protocol capability missing from evidence", mutate: func(t *testing.T, o *orphanCohort) {
-			o.requireCoverage(t, nil, []string{"proto-1"}, false)
+			o.requireCoverage(t, []string{}, []string{"proto-1"}, false)
 		}},
 		{name: "reservation lane differs from the observed namespace", mutate: func(t *testing.T, o *orphanCohort) {
 			mk := o.marker(t, "w2")
@@ -508,6 +508,10 @@ func (o *orphanCohort) requireCoverage(t *testing.T, sched, proto []string, w2Ha
 		mk.Coverage.Scheduling, mk.Coverage.Protocol = sched, proto
 		raw, _ := json.Marshal(mk)
 		o.edit(t, id, func(d *appsv1.Deployment) { d.Annotations[annotationRoll] = string(raw) })
+		// The marker must stay well-formed, or the case tests decoding, not coverage.
+		if got := o.marker(t, id); got == nil || !reflect.DeepEqual(got.Coverage.Scheduling, sched) || !reflect.DeepEqual(got.Coverage.Protocol, proto) {
+			t.Fatalf("%s coverage reservation did not round-trip: %+v", id, got)
+		}
 	}
 	if w2Has {
 		ev := o.at("w2").RollEvidence
@@ -752,7 +756,8 @@ func TestOrphanRollCohortDelayedAdoptionAcrossRestart(t *testing.T) {
 func TestOrphanRollCohortNoNewCanaryWhileProvenReservationsRemain(t *testing.T) {
 	t.Run("single owner", func(t *testing.T) { noNewCanaryWhileProven(t, false) })
 	// A canary of another owner in the same namespace must not exempt the pool from
-	// the hold (only a same owner/lane sibling-pool canary does).
+	// the hold; neither does a same owner/lane sibling-pool canary
+	// (TestReviewSiblingCanaryDoesNotLiftOutstandingAdoptionFence).
 	t.Run("another owner's canary in the namespace", func(t *testing.T) { noNewCanaryWhileProven(t, true) })
 }
 
@@ -1126,5 +1131,51 @@ func (o *orphanCohort) addForeignCanary(t *testing.T, id, owner string) {
 	o.workers = append(o.workers, w)
 	if got, err := decodeRoll(o.dep(t, id).Annotations[annotationRoll]); err != nil || got == nil || !got.Canary || got.Coverage.Owner != owner {
 		t.Fatalf("foreign canary reservation unreadable: %+v %v", got, err)
+	}
+}
+
+// A same owner/lane canary in a sibling capability pool touches no Deployment in this
+// pool, so it cannot fence an adoption patch still outstanding for a participant here:
+// ordinary new-canary admission stays closed (MR !4485 review).
+func TestReviewSiblingCanaryDoesNotLiftOutstandingAdoptionFence(t *testing.T) {
+	m, c, workers, cordon := matrixFixture(t, 4)
+	m.cfg.RollConcurrency = 2
+	o := &orphanCohort{m: m, c: c, base: c.ReactionChain[1], cordon: cordon, workers: workers}
+	rollTickTest(t, m, workers)
+	o.prove(t, "w1")
+	o.mustTick(t)
+	if o.marker(t, "w4") != nil {
+		t.Fatal("w4 already reserved")
+	}
+	o.prove(t, "w2")
+	o.eraseCanary(t)
+	var delayed k8stesting.Action
+	c.PrependReactor("patch", "deployments", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		if delayed == nil && isAdoptionPatch(a) {
+			delayed = a.DeepCopy()
+			return true, nil, fmt.Errorf("withheld adoption")
+		}
+		return false, nil, nil
+	})
+	_ = o.tick(t)
+	if delayed == nil {
+		t.Fatal("no outstanding adoption")
+	}
+	o.m = matrixRestart(o.m)
+	o.prove(t, "w3")
+	o.outsider(t, true, true)
+	c.ClearActions()
+	_ = o.tick(t)
+	if mk := o.marker(t, "w4"); mk != nil {
+		t.Errorf("fresh canary admitted beside outstanding adoption: w4=%+v actions=%v", mk, actionTrace(c))
+	}
+	if handled, _, err := o.base.React(delayed); !handled || err != nil {
+		t.Fatalf("delayed commit: handled=%v err=%v", handled, err)
+	}
+	got := o.canaries(t)
+	t.Logf("canaries after delayed commit: %v", got)
+	// w9 is the sibling pool's own canary; the original pool must hold exactly w2.
+	if want := []string{deploymentName("w2"), deploymentName("w9")}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("canaries after delayed commit = %v, want %v", got, want)
 	}
 }
