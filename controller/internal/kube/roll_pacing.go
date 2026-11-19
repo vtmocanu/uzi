@@ -437,13 +437,14 @@ func (m *Materializer) planRoll(ctx context.Context, desired []protocol.DesiredW
 // the snapshot already left the worker blocked with one still present), the pool is
 // marked uncertain and planPool skips completing its cohort this tick.
 //
-// Invariant relied on: a held canary never has in-flight participants. Participants
-// get roll budget only after the canary is promoted, and a promoted canary is on the
-// target template, so it is not drifted and cannot be held. This holds while the
-// pool's roll target is unchanged. A mid-cohort target change can re-drift a
-// promoted canary, which is then held only if it is custody-held and its observed
-// layout is old or unknown (a leftover old-layout pod, or a failed pod list); that
-// case is not specially guarded. With no decodable marker the fence keys on the
+// A held canary normally has no in-flight participants: participants get roll budget
+// only after the canary is promoted, and a promoted canary is on the target template,
+// so it is not drifted and cannot be held. A mid-cohort change (for example a
+// generation rotation) can re-drift a promoted canary, which is then held if it is
+// custody-held and its observed layout is old or unknown. In that case, while any
+// incomplete same-cohort participant remains, the canary's reservation is kept and
+// the pool is fenced instead of cancelled (issue #4466): withdrawing it would leave
+// those participants with no canary. With no decodable marker the fence keys on the
 // worker's current coverage, which can differ from a cohort reserved under older
 // capabilities.
 func (m *Materializer) holdForLayoutMigration(ctx context.Context, t *rollTick, e *rollEntry) {

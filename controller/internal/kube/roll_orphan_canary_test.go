@@ -675,6 +675,16 @@ func TestOrphanRollCohortAdoptionWriteOutcomes(t *testing.T) {
 			}
 		}
 	})
+	t.Run("smallest id wins even when it is busy and a larger id is idle", func(t *testing.T) {
+		// The pool is ordered idle-first; selection must still be by worker id.
+		o := prepare(t)
+		o.at("w2").Busy = true
+		o.c.ClearActions()
+		o.mustTick(t)
+		if got := adoptionPatches(o.c); !equalStrings(got, []string{"uzi-hw-w2"}) {
+			t.Fatalf("adopted %v, want [uzi-hw-w2]", got)
+		}
+	})
 	t.Run("metadata conflict closes the pool without a replacement", func(t *testing.T) {
 		o := prepare(t)
 		o.c.PrependReactor("patch", "deployments", func(a k8stesting.Action) (bool, runtime.Object, error) {
