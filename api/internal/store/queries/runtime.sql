@@ -11400,6 +11400,14 @@ SELECT id, runs.user_id, status, auto_approve,
                 AND EXISTS (SELECT 1 FROM workers ow WHERE ow.id = runs.worker_id AND fn_forge_origin_owner_pins(ow, runs, now())
                             AND (ow.draining_since IS NOT NULL OR ow.maintenance_phase IN ('requested','ready','stopping','recycling') OR ow.maintenance_fenced)), false)::boolean AS owner_hold_pinnable,
        COALESCE((SELECT ow.name FROM workers ow WHERE ow.id = runs.worker_id AND fn_forge_origin_owner_pins(ow, runs, now())), '')::text AS stale_requeue_worker_name,
+       -- issue #4476: a Codex-indicating run with a generation whose provenance does not admit any
+       -- claimant is held. The worker name comes ONLY from the recorded provenance (never runs.worker_id),
+       -- and only while the provenance generation is the current one.
+       (NOT fn_codex_claim_provenance_admits(runs, NULL::uuid))::boolean AS codex_provenance_held,
+       (CASE WHEN runs.claim_provenance_worker_id IS NOT NULL
+                  AND runs.claim_provenance_generation = runs.claim_generation
+             THEN COALESCE((SELECT pw.name FROM workers pw WHERE pw.id = runs.claim_provenance_worker_id), runs.claim_provenance_worker_id::text)
+             ELSE '' END)::text AS codex_provenance_worker_name,
        (runs.kind = 'cross_check' AND EXISTS (SELECT 1 FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = runs.id WHERE pin.user_id = runs.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness AND (pin.model IS NOT NULL OR pin.effort IS NOT NULL)))::boolean AS cross_check_pin_required,
        (SELECT MIN(evidence.since) FROM (
            SELECT a.terminal_pending_since AS since FROM worker_active_runs a

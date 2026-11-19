@@ -545,7 +545,17 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 	var changed int64
 	for _, r := range runs {
 		target, reason := s.healthTargetFor(ctx, now, r, th)
-		if r.Health == target && textEq(r.HealthReason, reason) &&
+		// Issue #4476: a provenance hold that began inside a quiet window (see quietCodexHold below)
+		// keeps the same reason text after the window ends, so the unchanged-reason skip would never
+		// nudge it. Once the window has passed and this episode was never nudged, re-evaluate it.
+		// Only the named reason can start quiet (the unavailable one nudges at entry), and the
+		// cooldown gates it here too, so a cooled-down run is not rewritten every tick.
+		quietHoldEnded := r.Health == target && textEq(r.HealthReason, reason) &&
+			isCodexProvenanceHoldReason(reason) && reason != codexProvenanceUnavailableText &&
+			!s.quietCodexHold(now, r, reason) &&
+			r.HealthSince.Valid && (!r.HealthNotifiedAt.Valid || r.HealthNotifiedAt.Time.Before(r.HealthSince.Time)) &&
+			(cooldown == 0 || !r.HealthNotifiedAt.Valid || now.Sub(r.HealthNotifiedAt.Time) >= cooldown)
+		if r.Health == target && textEq(r.HealthReason, reason) && !quietHoldEnded &&
 			(target != healthPublicationWithheld || r.HealthSince.Valid && r.PublicationWithheldSince.Valid && r.HealthSince.Time.Equal(r.PublicationWithheldSince.Time)) {
 			continue // nothing changed — skip the write (and, later, its broadcast)
 		}
@@ -589,7 +599,7 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		// Issue #4257: publication_withheld never nudges itself, so a run leaving it into a real fault
 		// (stalled, looping, ...) is a new episode no earlier DM described: nudge-eligible, cooldown applies.
 		leftWithheld := r.Health == healthPublicationWithheld && target != healthPublicationWithheld && target != healthOK
-		nudge := target != healthOK && (r.Health == healthOK || leftPin || leftWithheld || enteredRunBound || (leftAccountCooldown && independentFault)) &&
+		nudge := target != healthOK && (r.Health == healthOK || leftPin || leftWithheld || enteredRunBound || quietHoldEnded || (leftAccountCooldown && independentFault)) &&
 			(cooldown == 0 || !r.HealthNotifiedAt.Valid || now.Sub(r.HealthNotifiedAt.Time) >= cooldown)
 		// PRD #1349 M6 (D10): SUPPRESS the per-run Slack nudge for the custody-limit reason. The
 		// owner-level custody-episode reconciler (slacksvc) coalesces this crossing into ONE owner
@@ -643,6 +653,13 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		// Issues #2705/#3000: both owner-hold reasons are expected waiting; a worker-pickup
 		// nudge would be noise. Match the prefix shared by their deadline and worker name.
 		if isStaleRequeuePinReason(reason) {
+			nudge = false
+		}
+		// Issue #4476: a held Codex run naming its recorded worker is quiet while the
+		// stale-requeue or draining/maintenance window would also hold the run (a routine
+		// roll); after the windows it nudges like any stuck run. The unavailable-provenance
+		// reason never resolves on its own, so it is never suppressed.
+		if s.quietCodexHold(now, r, reason) {
 			nudge = false
 		}
 		// A live plan or code cross-check is expected waiting. A worker-pickup nudge would
@@ -1446,6 +1463,12 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 	if r.EgressProfileID.Valid {
 		return s.isolatedLaneReason(ctx, r)
 	}
+	// Issue #4476: a Codex run held by claim provenance outranks the manual-cordon, owner-hold and
+	// stale-requeue-pin texts below, which all promise "another worker may take it after that"
+	// (false here). Account prerequisites already ran before this point and still outrank it.
+	if r.CodexProvenanceHeld {
+		return codexProvenanceHoldReason(r.CodexProvenanceWorkerName)
+	}
 	// Availability and manual diagnostics share one projection. Manual intent must
 	// remain visible alongside an automatic owner hold, but a claimable continuation
 	// is not blocked by either soft intent.
@@ -1949,6 +1972,11 @@ func (s *Service) youngQueuedTarget(ctx context.Context, now time.Time, r store.
 	if r.EgressProfileID.Valid {
 		return healthOK, ""
 	}
+	// Issue #4476: a provenance-held Codex run is never claimable by another worker, so it carries
+	// the held reason from the first tick instead of waiting out the young-run grace.
+	if r.CodexProvenanceHeld {
+		return healthWaitingWorker, codexProvenanceHoldReason(r.CodexProvenanceWorkerName)
+	}
 	_, stalePinned := s.staleRequeuePin(now, r)
 	_, ownerHeld := s.ownerHold(now, r)
 	manualBlocked := false
@@ -2340,6 +2368,42 @@ func isStaleRequeuePinReason(reason string) bool {
 			strings.HasSuffix(reason, " to finish draining or maintenance; another worker may take it after that") ||
 			strings.HasSuffix(reason, " to return"+heldRepoAgentSourceGapSuffix) ||
 			strings.HasSuffix(reason, " to finish draining or maintenance"+heldRepoAgentSourceGapSuffix))
+}
+
+const (
+	codexProvenanceHoldPrefix      = "held for worker "
+	codexProvenanceHoldSuffix      = ": wait for it or cancel the run; only the worker that last ran this Codex run may resume it"
+	codexProvenanceUnavailableText = "held: predecessor provenance unavailable; cancel the run; no worker may resume this Codex run"
+)
+
+// codexProvenanceHoldReason renders the waiting reason for a Codex run ClaimRun refuses to offer
+// to any other worker (issue #4476). name is the recorded provenance worker, never runs.worker_id;
+// "" means the provenance is missing or stale, so no worker may resume the run. The text is a pure
+// function of name, so it is stable across ticks for one episode.
+func codexProvenanceHoldReason(name string) string {
+	if name == "" {
+		return codexProvenanceUnavailableText
+	}
+	return codexProvenanceHoldPrefix + name + codexProvenanceHoldSuffix
+}
+
+// quietCodexHold reports a provenance hold naming its recorded worker while the stale-requeue or
+// draining/maintenance window would also hold the run (a routine roll or a short stale return):
+// expected waiting, so not nudged. The unavailable-provenance reason never resolves on its own and
+// is never quiet. When the window ends, detectRunHealth nudges the episode once (quietHoldEnded).
+func (s *Service) quietCodexHold(now time.Time, r store.ListActiveRunsForHealthRow, reason string) bool {
+	if !isCodexProvenanceHoldReason(reason) || reason == codexProvenanceUnavailableText {
+		return false
+	}
+	_, pinned := s.staleRequeuePin(now, r)
+	_, ownerHeld := s.ownerHold(now, r)
+	return pinned || ownerHeld
+}
+
+// isCodexProvenanceHoldReason matches both texts codexProvenanceHoldReason produces.
+func isCodexProvenanceHoldReason(reason string) bool {
+	return reason == codexProvenanceUnavailableText ||
+		(strings.HasPrefix(reason, codexProvenanceHoldPrefix) && strings.HasSuffix(reason, codexProvenanceHoldSuffix))
 }
 
 func isCodeCrossCheckWaitingReason(reason string) bool {
