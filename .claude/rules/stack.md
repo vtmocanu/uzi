@@ -122,7 +122,7 @@ CI is GitHub Actions; there is no `.gitlab-ci.yml`. The workflows are
 
 | workflow | triggers | runs |
 |---|---|---|
-| `ci.yml` | every PR and `main` | component validate/test gates skip only on successfully classified PRs containing exclusively added/modified files under `.agents/skills/uzi-lander/`; repo lint and Helm checks always run. Main runs full component gates; image validation builds are path-filtered on PRs |
+| `ci.yml` | PRs, `main` | component gates skip for confirmed adds/edits in `.agents/skills/uzi-lander/`, `changelog.d/` or `prds/`, unless `component_consumed` or live-pin veto applies. Repo lint (docs links) and Helm always run. Deletions, renames, unknown classification and main run full CI; PR image builds are path-filtered |
 | `kind-smoke.yml` | push to `main`, `v*` tags, manual dispatch, path-filtered on `pull_request` (`deploy/**`, `scripts/smoke.sh`, `.github/workflows/kind-smoke.yml`) | ephemeral KinD cluster, `helm install`, `scripts/smoke.sh` through the web→api reverse proxy. The always-reporting `kind-smoke-gate` job is the stable required check, so a non-chart PR never wedges Pending |
 | `e2e.yml` | nightly schedule + manual dispatch, never PR or push | the compose harness `./e2e/run-e2e.sh` |
 | `codex-packaged-proof.yml` | nightly, dispatch, every `pull_request` (a `changes` job picks each leg by path) | `e2e/codex-proof/run-proof.sh` per template on amd64 (strict packaged proof, #3148), `package-exec.sh arm64` on native arm64 (#3212). `codex-packaged-proof-gate` is the always-reporting required check; scheduled failures update one `codex-packaged-proof` issue |

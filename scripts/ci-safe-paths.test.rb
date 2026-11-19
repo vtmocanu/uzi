@@ -139,6 +139,28 @@ end
 assert.call(Expression.new(reporter.fetch('if'), report_ctx.merge('github.ref' => 'refs/heads/ci/x')).value, false, 'no issue off main')
 assert.call(jobs.fetch('lint-repo').key?('needs'), false, 'repo gate remains independent')
 assert.call(jobs.fetch('lint-repo').key?('if'), false, 'repo gate remains unconditional')
+repo_steps = jobs.fetch('lint-repo').fetch('steps')
+docs_step = repo_steps.find { |step| step['run'] == 'task check-docs:web' }
+assert.call(!docs_step.nil?, true, 'repo gate runs the docs link checker')
+assert.call(docs_step.key?('if'), false, 'docs link checker is unconditional')
+repo_node = repo_steps.find { |step| step['uses'].to_s.start_with?('actions/setup-node@') }
+web_node = jobs.fetch('validate-web').fetch('steps').find { |step| step['uses'].to_s.start_with?('actions/setup-node@') }
+assert.call(repo_node&.fetch('uses'), web_node.fetch('uses'), 'repo docs checker uses the web Node action pin')
+assert.call(repo_node&.dig('with', 'node-version'), web_node.dig('with', 'node-version'), 'repo docs checker uses the web Node version')
+assert.call(repo_steps.index(repo_node) < repo_steps.index(docs_step), true, 'Node setup precedes docs validation')
+# Exercise the real dependency-free checker in a minimal full-checkout fixture.
+# A positive control rules out failures caused by missing npm modules or fixture setup.
+Dir.mktmpdir('ci-prd-docs') do |dir|
+  %w[.git docs web/scripts prds/done].each { |path| FileUtils.mkdir_p(File.join(dir, path)) }
+  FileUtils.cp(File.join(root, 'web/scripts/check-docs.mjs'), File.join(dir, 'web/scripts/check-docs.mjs'))
+  File.write(File.join(dir, 'prds/done/4521-check.md'), "See `prds/4521-missing.md`.\n")
+  _, err, status = Open3.capture3('node', File.join(dir, 'web/scripts/check-docs.mjs'))
+  assert.call(status.exitstatus, 1, 'broken archived PRD artifact link fails the repo docs checker')
+  assert.call(err.include?('stale backticked artifact path `prds/4521-missing.md`'), true, 'failure names the broken PRD path')
+  File.write(File.join(dir, 'prds/4521-missing.md'), "# Present\n")
+  _, err, status = Open3.capture3('node', File.join(dir, 'web/scripts/check-docs.mjs'))
+  assert.call(status.success?, true, "repaired PRD fixture passes without npm ci: #{err}")
+end
 assert.call(workflow.fetch('on').keys.sort, %w[pull_request push], 'triggers unchanged')
 assert.call(workflow.fetch('concurrency').fetch('cancel-in-progress'), "${{ github.ref != 'refs/heads/main' }}", 'PR supersession retained; main runs finish')
 assert.call(run_job.call('test-agent-worker-uid'), false, 'safe PR skips worker lane')
@@ -165,15 +187,15 @@ safe_step = jobs.fetch('changes').fetch('steps').find { |step| step['id'] == 'sa
 raise 'missing safe classification step' unless safe_step
 assert.call(jobs.fetch('changes').fetch('outputs').fetch('skip_components'), '${{ steps.safe.outputs.skip_components }}', 'classification output wiring')
 safe_env = safe_step.fetch('env')
-assert.call(safe_env.reject { |key, _| key == 'SAFE_ROOTS' }, {'ALL_COUNT' => '${{ steps.filter.outputs.all_count }}', 'SAFE_COUNT' => '${{ steps.filter.outputs.component_safe_count }}', 'EXPECTED_COUNT' => '${{ github.event.pull_request.changed_files }}'}, 'count source wiring')
+assert.call(safe_env.reject { |key, _| key == 'SAFE_ROOTS' }, {'ALL_COUNT' => '${{ steps.filter.outputs.all_count }}', 'SAFE_COUNT' => '${{ steps.filter.outputs.component_safe_count }}', 'CONSUMED_COUNT' => '${{ steps.filter.outputs.component_consumed_count }}', 'EXPECTED_COUNT' => '${{ github.event.pull_request.changed_files }}'}, 'count source wiring')
 # A pin-veto fixture repo: a tracked file under each safe root, optionally holding text.
-pin_repo = lambda do |text|
+pin_repo = lambda do |text, pin_root = nil|
   dir = Dir.mktmpdir('ci-safe-pins')
   git_env = {'GIT_CONFIG_GLOBAL' => '/dev/null', 'GIT_CONFIG_SYSTEM' => '/dev/null'}
   Open3.capture3(git_env, 'git', 'init', '-q', dir)
   safe_env.fetch('SAFE_ROOTS').split.each do |root_path|
     FileUtils.mkdir_p(File.join(dir, root_path))
-    File.write(File.join(dir, root_path, 'SKILL.md'), "# skill\n#{text}\n")
+    File.write(File.join(dir, root_path, 'SKILL.md'), "# skill\n#{pin_root.nil? || pin_root == root_path ? text : 'no pins here'}\n")
   end
   File.write(File.join(dir, 'outside.md'), 'codex-cli ' + "0.0.1\n")
   _, err, status = Open3.capture3(git_env, 'git', '-C', dir, 'add', '-A')
@@ -181,25 +203,34 @@ pin_repo = lambda do |text|
   dir
 end
 clean_repo = pin_repo.call('no pins here')
-classify = lambda do |all, safe, expected, dir = clean_repo|
+classify = lambda do |all, safe, expected, dir = clean_repo, consumed = '0'|
   Tempfile.create('ci-safe-output') do |file|
-    env = {'ALL_COUNT' => all, 'SAFE_COUNT' => safe, 'EXPECTED_COUNT' => expected, 'SAFE_ROOTS' => safe_env.fetch('SAFE_ROOTS'), 'GITHUB_OUTPUT' => file.path, 'GIT_CONFIG_GLOBAL' => '/dev/null', 'GIT_CONFIG_SYSTEM' => '/dev/null'}
+    env = {'ALL_COUNT' => all, 'SAFE_COUNT' => safe, 'CONSUMED_COUNT' => consumed, 'EXPECTED_COUNT' => expected, 'SAFE_ROOTS' => safe_env.fetch('SAFE_ROOTS'), 'GITHUB_OUTPUT' => file.path, 'GIT_CONFIG_GLOBAL' => '/dev/null', 'GIT_CONFIG_SYSTEM' => '/dev/null'}
     _, err, status = Open3.capture3(env, 'bash', '-e', '-c', safe_step.fetch('run'), chdir: dir)
     raise err unless status.success?
     File.read(file.path).strip
   end
 end
 assert.call(classify.call('2', '2', '2'), 'skip_components=1', 'nonempty complete safe list')
-# The Codex pin scan in test-agent greps every tracked file, safe roots included; a pin
-# prefix under a safe root must run full CI, a pin outside them is not this veto's concern.
+%w[1 2 junk 00].push('').each do |consumed|
+  assert.call(classify.call('2', '2', '2', clean_repo, consumed), 'skip_components=0', "consumed or unreadable PRD count #{consumed.inspect} runs full CI")
+end
+# Only safe roots covered by the Codex scan need the veto. Check each root independently,
+# and derive the expected verdict from the scan's exclusions so exclusion drift fails.
+pin_source = File.read(File.join(root, 'agent/test/codex-pins.ts'))
+scan_excludes = pin_source.scan(/":\(exclude\)([^"]+)"/).flatten
 pin_prefixes = ['/opt/uzi-codex/', 'codex-cli ', 'Codex worker uses runtime ']
 pin_prefixes.each do |prefix|
-  assert.call(classify.call('2', '2', '2', pin_repo.call("#{prefix}9.9.9")), 'skip_components=0', "pin prefix #{prefix.inspect} vetoes the skip")
+  safe_env.fetch('SAFE_ROOTS').split.each do |safe_root|
+    excluded = scan_excludes.include?("#{safe_root}/**")
+    expected = excluded ? 'skip_components=1' : 'skip_components=0'
+    assert.call(classify.call('2', '2', '2', pin_repo.call("#{prefix}9.9.9", safe_root)), expected,
+                "pin prefix #{prefix.inspect} under #{safe_root} follows the agent scan")
+  end
 end
 not_a_repo = Dir.mktmpdir('ci-safe-norepo')
 assert.call(classify.call('2', '2', '2', not_a_repo), 'skip_components=0', 'git grep error runs full CI')
 assert.call(safe_step.fetch('run').scan(/-e '([^']+)'/).flatten, pin_prefixes, 'veto greps exactly the pin prefixes')
-pin_source = File.read(File.join(root, 'agent/test/codex-pins.ts'))
 scan_pattern = pin_source[/PIN_SCAN_PATTERN = `\(([^)]*)\)/, 1] or raise 'PIN_SCAN_PATTERN not found'
 assert.call(scan_pattern.split('|'), pin_prefixes, 'veto prefixes match the agent pin scan')
 [['2', '1', '2'], ['0', '0', '0'], ['', '', ''], ['x', 'x', 'x'], ['01', '01', '01'], ['2', '2', '3'], ['2', '2', ''], ['3000', '3000', '3001']].each do |counts|
@@ -208,7 +239,24 @@ end
 filter_step = jobs.fetch('changes').fetch('steps').find { |step| step['id'] == 'filter' }
 rules = YAML.safe_load(filter_step.fetch('with').fetch('filters'))
 assert.call(rules.fetch('all'), ['**'], 'all changed paths counted')
-assert.call(rules.fetch('component_safe'), [{'added|modified' => '.agents/skills/uzi-lander/**'}, {'added|modified' => 'changelog.d/**'}], 'only audited additions/modifications allowed')
+# Conservatively collect literal PRD paths in Go/TS tests that exist in THIS checkout.
+# Most PRD path strings describe temp clones or DTOs. Only these three exact pairs
+# are known value-only fixtures; no whole-file or directory exclusions are allowed.
+# Any new existing literal must be vetoed until a reader audit proves it isolated.
+value_only_prds = {
+  'agent/test/sdk-executor.test.ts' => ['prds/done/72-prd-lifecycle-in-run.md'],
+  'api/internal/prdpath/prdpath_test.go' => ['prds/done/72-prd-lifecycle-in-run.md'],
+  'api/internal/workersvc/prd_done_path_test.go' => ['prds/done/72-prd-lifecycle-in-run.md']
+}
+test_paths, test_err, test_status = Open3.capture3('git', '-C', root, '-c', 'core.fsmonitor=false', 'ls-files', '--', 'api', 'controller', 'web', 'agent')
+assert.call(test_status.success?, true, "component test inventory is readable: #{test_err}")
+consumed_prds = test_paths.lines.map(&:strip).select { |path| path.match?(/(?:_test\.go|(?:\.test|\.integration)\.(?:ts|tsx))$/) }.flat_map do |path|
+  literals = File.read(File.join(root, path)).scan(/["'`](?:\.\.\/)*(prds\/[A-Za-z0-9_\/.\-]+\.md)["'`]/).flatten.uniq
+  existing = literals.select { |prd| File.file?(File.join(root, prd)) }
+  existing - value_only_prds.fetch(path, [])
+end.uniq.sort
+assert.call(rules.fetch('component_consumed').sort, consumed_prds, 'every existing literal PRD consumer retains full component CI')
+assert.call(rules.fetch('component_safe'), [{'added|modified' => '.agents/skills/uzi-lander/**'}, {'added|modified' => 'changelog.d/**'}, {'added|modified' => 'prds/**'}], 'only audited additions/modifications allowed')
 assert.call(safe_env.fetch('SAFE_ROOTS').split, rules.fetch('component_safe').map { |rule| rule.values.first.delete_suffix('/**') }, 'veto roots are exactly the component_safe roots')
 flags = File::FNM_PATHNAME | File::FNM_DOTMATCH
 # A file counts as safe when any component_safe rule matches it (dorny counts it once).
@@ -220,6 +268,18 @@ safe_file = lambda do |status, path|
   end
 end
 fixtures = [
+  [true, [['added', 'prds/4521-feature.md']]],
+  [true, [['modified', 'prds/done/4521-feature.md']]],
+  [true, [['added', 'prds/mockups/4521-example.html']]],
+  [true, [['modified', 'prds/4521-feature.md'], ['added', 'changelog.d/0b8e1c2a-1d3f-4c5e-9a7b-6f2d4e8c1a3b.md']]],
+  [true, [['modified', 'prds/4521-feature.md'], ['modified', '.agents/skills/uzi-lander/SKILL.md']]],
+  [false, [['modified', 'prds/4521-feature.md'], ['modified', 'web/src/App.tsx']]],
+  [false, [['deleted', 'prds/4521-feature.md']]],
+  [false, [['deleted', 'prds/4521-feature.md'], ['added', 'prds/done/4521-feature.md']]],
+  [false, [['deleted', 'prds/mockups/old.html'], ['added', 'prds/mockups/new.html']]],
+  [false, [['modified', 'prds/done/1230-semantic-completion-contract.md']]],
+  [false, [['added', 'prds/done/1230-semantic-completion-contract.md'], ['added', 'prds/mockups/example.html']]],
+  [false, [['modified', 'prds/done/1230-semantic-completion-contract.md'], ['modified', '.agents/skills/uzi-lander/SKILL.md']]],
   [true, [['modified', '.agents/skills/uzi-lander/SKILL.md']]],
   [true, [['added', '.agents/skills/uzi-lander/references/new.md']]],
   [true, [['added', 'changelog.d/0b8e1c2a-1d3f-4c5e-9a7b-6f2d4e8c1a3b.md']]],
@@ -235,7 +295,8 @@ fixtures = [
 ]
 fixtures.each_with_index do |(skips, files), index|
   safe = files.count { |status, path| safe_file.call(status, path) }
-  assert.call(classify.call(files.length.to_s, safe.to_s, files.length.to_s), skips ? 'skip_components=1' : 'skip_components=0', "path/status fixture #{index}")
+  consumed = files.count { |_, path| rules.fetch('component_consumed').include?(path) }
+  assert.call(classify.call(files.length.to_s, safe.to_s, files.length.to_s, clean_repo, consumed.to_s), skips ? 'skip_components=1' : 'skip_components=0', "path/status fixture #{index}")
 end
 # changelog.d is safe only while no component reads it. Direct readers: the agent Codex pin
 # scan must keep excluding it, and no component or e2e tree may name it. Dynamic readers
@@ -246,6 +307,198 @@ end
 assert.call(File.read(File.join(root, 'agent/test/codex-pins.ts')).include?('":(exclude)changelog.d/**"'), true, 'agent pin scan excludes changelog.d')
 component_refs, _, refs_status = Open3.capture3('git', '-C', root, 'grep', '-l', '-F', 'changelog.d', '--', 'api', 'web', 'controller', 'agent', 'docs', 'deploy/chart', 'e2e', ':!agent/test/codex-pins.ts')
 assert.call([refs_status.exitstatus, component_refs], [1, ''], 'no direct component reference to changelog.d')
+# Unlike changelog.d, prds/ already appears in runtime prompt/path strings, comments,
+# isolated fixture data and documentation. Exact audited files only, never directory
+# wildcards: a newly referencing file requires a reader audit before widening this list.
+# This inventory detects new files, not a new read hidden in an existing file or a
+# computed path. Review must still check those. Direct checkout readers include the
+# docs checker and workersvc's semantic_transport_doc_test.go; runtime PRD readers
+# otherwise operate on a run's clone. The consumed semantic PRD must retain its gate.
+# Dynamic reader: rollupbench loadTextPool consumes sorted tracked text up to 24 MiB,
+# filled by agent/api before prds. No test pins its corpus digest. Re-audit on a larger
+# cap or a digest assertion, as for changelog.d above.
+audited_prd_refs = %w[
+  agent/src/chat-executor.ts
+  agent/src/executor.ts
+  agent/src/prd-link.ts
+  agent/src/prompt.ts
+  agent/src/sdk-messages.ts
+  agent/src/signals.ts
+  agent/src/uzi-tools.ts
+  agent/templates/base/Dockerfile.dockerignore
+  agent/templates/jvm/Dockerfile.dockerignore
+  agent/test/chat-executor.test.ts
+  agent/test/codex-pins.ts
+  agent/test/executor.test.ts
+  agent/test/fixtures/repoagents/.claude/agents/researcher.md
+  agent/test/git-read-bare.test.ts
+  agent/test/m3-g1-prompts.json
+  agent/test/prd-link.test.ts
+  agent/test/prompt.test.ts
+  agent/test/provider-context-window.integration.test.ts
+  agent/test/runner-completion-attempt.test.ts
+  agent/test/runner-plan-gate.test.ts
+  agent/test/runner-semantic-drift.test.ts
+  agent/test/sdk-executor.test.ts
+  agent/test/secret-finding-render.test.ts
+  agent/test/semantic-plan.test.ts
+  agent/test/signals.test.ts
+  agent/test/uzi-tools.test.ts
+  api/Dockerfile
+  api/cmd/server/main.go
+  api/cmd/uzi/render_test.go
+  api/cmd/uzi/semantic_gate_test.go
+  api/cmd/uzi/tui_codex_meters.go
+  api/internal/apitypes/buildinfo.go
+  api/internal/apitypes/run.go
+  api/internal/forge/forgejo_test.go
+  api/internal/forge/gitlab_test.go
+  api/internal/forgesvc/prd_link_patch.go
+  api/internal/forgesvc/prd_link_patch_test.go
+  api/internal/forgesvc/service.go
+  api/internal/forgesvc/service_test.go
+  api/internal/forgesvc/testdata/recorded_calls_forgesvc_prdlinkpatches.golden
+  api/internal/handler/issue_detail_test.go
+  api/internal/handler/run_prd_link_dto_test.go
+  api/internal/handler/runs_dto.go
+  api/internal/handler/semantic_drift_livedb_test.go
+  api/internal/handler/sweep_uzi_gate_livedb_test.go
+  api/internal/poller/autopilot_test.go
+  api/internal/poller/linked_repo_livedb_test.go
+  api/internal/poller/poller.go
+  api/internal/poller/recorded_calls_livedb_test.go
+  api/internal/poller/testdata/recorded_calls_poller_tick.golden
+  api/internal/prdpath/links_test.go
+  api/internal/prdpath/prdpath.go
+  api/internal/prdpath/prdpath_test.go
+  api/internal/skilltmpl/builtins/prd-lifecycle/SKILL.md
+  api/internal/skilltmpl/prd_lifecycle_test.go
+  api/internal/slacksvc/chatactions_test.go
+  api/internal/store/prd_link_patch_integration_test.go
+  api/internal/store/queries/schedules.sql
+  api/internal/store/query_inventory_test.go
+  api/internal/store/schedules.sql.go
+  api/internal/uzicli/skill/SKILL.md
+  api/internal/uzidocs/embed/admin-health.md
+  api/internal/uzidocs/embed/admin-settings.md
+  api/internal/uzidocs/embed/agent-templates.md
+  api/internal/uzidocs/embed/auth-design.md
+  api/internal/uzidocs/embed/autopilot.md
+  api/internal/uzidocs/embed/board.md
+  api/internal/uzidocs/embed/cli.md
+  api/internal/uzidocs/embed/code-cross-check-replay.md
+  api/internal/uzidocs/embed/configuration.md
+  api/internal/uzidocs/embed/cross-check.md
+  api/internal/uzidocs/embed/egress-profiles.md
+  api/internal/uzidocs/embed/hosted-worker-roll-verification.md
+  api/internal/uzidocs/embed/hosted-workers.md
+  api/internal/uzidocs/embed/instance-maintenance.md
+  api/internal/uzidocs/embed/isolated-research-lane.md
+  api/internal/uzidocs/embed/memory.md
+  api/internal/uzidocs/embed/run-recovery.md
+  api/internal/uzidocs/embed/scheduling.md
+  api/internal/uzidocs/embed/seeded-plans.md
+  api/internal/uzidocs/embed/skills.md
+  api/internal/uzidocs/embed/slack.md
+  api/internal/uzidocs/embed/vault-threat-model.md
+  api/internal/uzidocs/embed/worker-docker.md
+  api/internal/workersvc/credential_override_livedb_test.go
+  api/internal/workersvc/prd_done_path.go
+  api/internal/workersvc/prd_done_path_test.go
+  api/internal/workersvc/run_usage_contract_test.go
+  api/internal/workersvc/semantic_drift_livedb_test.go
+  api/internal/workersvc/semantic_drift_test.go
+  api/internal/workersvc/semantic_prd_links.go
+  api/internal/workersvc/semantic_transport_doc_test.go
+  api/internal/workersvc/service.go
+  api/internal/workersvc/service_test.go
+  api/internal/workersvc/uzi_label_gate_test.go
+  docs/admin-health.md
+  docs/admin-settings.md
+  docs/agent-templates.md
+  docs/auth-design.md
+  docs/autopilot.md
+  docs/board.md
+  docs/cli.md
+  docs/code-cross-check-replay.md
+  docs/configuration.md
+  docs/cross-check.md
+  docs/egress-profiles.md
+  docs/hosted-worker-roll-verification.md
+  docs/hosted-workers.md
+  docs/instance-maintenance.md
+  docs/isolated-research-lane.md
+  docs/memory.md
+  docs/run-recovery.md
+  docs/scheduling.md
+  docs/seeded-plans.md
+  docs/skills.md
+  docs/slack.md
+  docs/vault-threat-model.md
+  docs/worker-docker.md
+  e2e/codex-m0/README.md
+  e2e/codex-m4/MAINTAINER-HANDOFF.md
+  e2e/codex-m4/README.md
+  e2e/codex-m4/receipts.test.ts
+  e2e/codex-m4/receipts.ts
+  e2e/phases/05-lane-forgejo.sh
+  e2e/phases/06-lane-github.sh
+  e2e/phases/12-cancel-queued.sh
+  e2e/phases/15-happy-path-restart.sh
+  e2e/phases/16-usage-limit-park.sh
+  e2e/phases/17-live-ws-cookie.sh
+  e2e/phases/18-cli-smoke.sh
+  e2e/phases/19-live-ws-bearer.sh
+  e2e/phases/20-git-push-basic-auth.sh
+  e2e/phases/22-steer-queue-delivery.sh
+  e2e/phases/26-plan-reject-verbatim.sh
+  e2e/phases/28-skills-templates-tools.sh
+  e2e/phases/29-autopilot-lifecycle.sh
+  e2e/phases/32-agent-mr-fix-crosskind.sh
+  e2e/phases/33-uzi-eligibility-gate.sh
+  e2e/phases/34-vault.sh
+  e2e/phases/35-judge-funnel.sh
+  e2e/phases/40-chat-agent.sh
+  e2e/phases/41-interleave-stream.sh
+  e2e/phases/42-api-outage-readoption.sh
+  e2e/phases/43-plan-revision-loop.sh
+  e2e/phases/44-ask-user-clarification.sh
+  e2e/phases/45-bounded-concurrency.sh
+  e2e/phases/46-run-health.sh
+  e2e/phases/48-auto-selection.sh
+  e2e/phases/50-worker-token-binding.sh
+  e2e/phases/51-auto-stop-poison.sh
+  e2e/phases/52-api-outage-outbox.sh
+  e2e/phases/72-custody-lifecycle.sh
+  e2e/phases/73-forge-unreachable-park.sh
+  e2e/phases/74-codex-activation.sh
+  web/scripts/check-docs.mjs
+  web/src/components/AgentPicker.tsx
+  web/src/components/BuildInfoPopover.test.tsx
+  web/src/components/BuildInfoPopover.tsx
+  web/src/components/NeedsDecisionCard.tsx
+  web/src/components/RunRequestCard.test.tsx
+  web/src/lib/apiTypes.ts
+  web/src/lib/runStream.test.ts
+  web/src/lib/runStream.ts
+  web/src/lib/runUsageContract.test.ts
+  web/src/mocks/data/agents.ts
+  web/src/mocks/data/runHistories.ts
+  web/src/mocks/data/runs.ts
+  web/src/mocks/data/runsDemo.ts
+  web/src/mocks/engine.ts
+  web/src/mocks/mockApi/boards.ts
+  web/src/pages/Board.test.tsx
+  web/src/pages/IssueView.test.tsx
+  web/src/pages/IssueView.tsx
+  web/src/pages/RunView.semantic.test.tsx
+  web/src/pages/RunView.test.tsx
+  web/src/pages/board/CreateIssueForm.tsx
+  web/src/pages/board/IssueCard.tsx
+]
+prd_refs, prd_err, prd_status = Open3.capture3('git', '-C', root, '-c', 'core.fsmonitor=false', 'grep', '-l', '-F', 'prds/', '--', 'api', 'web', 'controller', 'agent', 'docs', 'deploy/chart', 'e2e')
+assert.call(prd_status.exitstatus, 0, "PRD reader inventory is readable: #{prd_err}")
+assert.call(prd_refs.lines.map(&:strip).sort, audited_prd_refs.sort, 'PRD references require an explicit reader audit')
 # One LiveDB sweep per CI run, split across two producers (#4232): test-livedb-workersvc
 # runs `task test:livedb-workersvc`; test-codex-refresh-lostreply-e2e runs the canonical
 # recipe on the rest group (the sweep with its livedb-skip-guard, then the combined
