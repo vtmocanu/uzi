@@ -659,7 +659,12 @@
     {
       "value": "_CLAUDE_",
       "invariant": "provider_auth",
-      "note": "underscore-led Claude CLI internals; _CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL makes the CLI treat the worker-selected ANTHROPIC_BASE_URL as the first-party API"
+      "note": "_CLAUDE_-prefixed Claude CLI internals; _CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL makes the CLI treat the worker-selected ANTHROPIC_BASE_URL as the first-party API"
+    },
+    {
+      "value": "__CLAUDE_",
+      "invariant": "harness_control",
+      "note": "double-underscore Claude CLI internals; the CLI's shell prelude restores a scrubbed name such as GOPROXY or GOFLAGS from __CLAUDE_CC_KEEP_<NAME>"
     },
     {
       "value": "ANTHROPIC_",

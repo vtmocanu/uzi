@@ -250,6 +250,7 @@ func TestValidateNameTable(t *testing.T) {
 		{"LANGUAGE", "LANGUAGE is set or reserved"},
 		{"MIMALLOC_VERBOSE", "denied prefix MIMALLOC_"},
 		{"_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL", "denied prefix _CLAUDE_"},
+		{"__CLAUDE_CC_KEEP_GOPROXY", "denied prefix __CLAUDE_"},
 		{"CARES_HOSTS", "CARES_HOSTS is set or reserved"},
 		{"HOSTALIASES", "HOSTALIASES is set or reserved"},
 		{"LOCALDOMAIN", "LOCALDOMAIN is set or reserved"},

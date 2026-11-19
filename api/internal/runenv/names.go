@@ -44,7 +44,7 @@ var deniedNames = []string{
 }
 
 var deniedPrefixes = []string{
-	"UZI_", "CLAUDE_", "_CLAUDE_", "ANTHROPIC_", "CODEX_", "OPENAI_", "MCP_", "DISABLE_", "GH_", "GITHUB_", "GITLAB_",
+	"UZI_", "CLAUDE_", "_CLAUDE_", "__CLAUDE_", "ANTHROPIC_", "CODEX_", "OPENAI_", "MCP_", "DISABLE_", "GH_", "GITHUB_", "GITLAB_",
 	"GLAB_", "GIT_", "SSH_", "LD_", "DYLD_", "BASH_", "XDG_", "SSL_CERT_", "PYTHON", "PERL5", "NIX_", "DEVBOX_",
 	"BUN_", "ANT_OTEL_", "AGENT_PROXY_", "SELF_HOSTED_RUNNER_", "CCR_", "LC_", "MIMALLOC_",
 }
@@ -85,7 +85,7 @@ func deniedBy(name string) string {
 	return ""
 }
 
-// ValidateNameShape applies only the name shape. Disable, enable and delete use it so a
+// ValidateNameShape applies only the name shape. Disable and delete use it so a
 // row whose name a later denylist change denies stays manageable.
 func ValidateNameShape(name string) error {
 	if !NameRegexp.MatchString(name) {

@@ -42,7 +42,7 @@ export const RUN_ENV_DENIED_NAMES: readonly string[] = [
 ];
 
 export const RUN_ENV_DENIED_PREFIXES: readonly string[] = [
-  "UZI_", "CLAUDE_", "_CLAUDE_", "ANTHROPIC_", "CODEX_", "OPENAI_", "MCP_", "DISABLE_", "GH_", "GITHUB_", "GITLAB_",
+  "UZI_", "CLAUDE_", "_CLAUDE_", "__CLAUDE_", "ANTHROPIC_", "CODEX_", "OPENAI_", "MCP_", "DISABLE_", "GH_", "GITHUB_", "GITLAB_",
   "GLAB_", "GIT_", "SSH_", "LD_", "DYLD_", "BASH_", "XDG_", "SSL_CERT_", "PYTHON", "PERL5", "NIX_", "DEVBOX_",
   "BUN_", "ANT_OTEL_", "AGENT_PROXY_", "SELF_HOSTED_RUNNER_", "CCR_", "LC_", "MIMALLOC_"
 ];
