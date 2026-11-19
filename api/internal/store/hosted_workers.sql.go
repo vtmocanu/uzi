@@ -790,10 +790,20 @@ SELECT w.id,
        -- hibernation op, NULL when there is none (an awake worker, or an op with no observation yet).
        -- Only the status leaves the table here; never the entries.
        i.status AS inventory_status,
-       t.token_ciphertext
+       t.token_ciphertext,
+       -- The size's resolved integers (PRD #4213), NULL when workers.hosted_size names no row.
+       -- ws.name is the presence marker the caller keys on, not any single integer column.
+       ws.name AS size_row_name,
+       ws.cpu_request_millicores AS size_cpu_request_millicores,
+       ws.cpu_limit_millicores AS size_cpu_limit_millicores,
+       ws.memory_request_mib AS size_memory_request_mib,
+       ws.memory_limit_mib AS size_memory_limit_mib,
+       ws.data_gib AS size_data_gib,
+       ws.dind_data_gib AS size_dind_data_gib
 FROM workers w
 LEFT JOIN hosted_worker_tokens t ON t.worker_id = w.id
 LEFT JOIN worker_hibernation_inventories i ON i.worker_id = w.id AND i.op_id = w.hibernation_op_id
+LEFT JOIN worker_sizes ws ON ws.name = w.hosted_size
 WHERE w.kind = 'hosted'
 ORDER BY w.created_at ASC, w.id ASC
 LIMIT 513
@@ -848,6 +858,13 @@ type ListHostedWorkersForControllerRow struct {
 	CustodyHeld              bool               `json:"custody_held"`
 	InventoryStatus          pgtype.Text        `json:"inventory_status"`
 	TokenCiphertext          []byte             `json:"token_ciphertext"`
+	SizeRowName              pgtype.Text        `json:"size_row_name"`
+	SizeCpuRequestMillicores pgtype.Int8        `json:"size_cpu_request_millicores"`
+	SizeCpuLimitMillicores   pgtype.Int8        `json:"size_cpu_limit_millicores"`
+	SizeMemoryRequestMib     pgtype.Int8        `json:"size_memory_request_mib"`
+	SizeMemoryLimitMib       pgtype.Int8        `json:"size_memory_limit_mib"`
+	SizeDataGib              pgtype.Int8        `json:"size_data_gib"`
+	SizeDindDataGib          pgtype.Int8        `json:"size_dind_data_gib"`
 }
 
 // Hosted workers (PRD #58) --------------------------------------------------
@@ -919,6 +936,13 @@ func (q *Queries) ListHostedWorkersForController(ctx context.Context, arg ListHo
 			&i.CustodyHeld,
 			&i.InventoryStatus,
 			&i.TokenCiphertext,
+			&i.SizeRowName,
+			&i.SizeCpuRequestMillicores,
+			&i.SizeCpuLimitMillicores,
+			&i.SizeMemoryRequestMib,
+			&i.SizeMemoryLimitMib,
+			&i.SizeDataGib,
+			&i.SizeDindDataGib,
 		); err != nil {
 			return nil, err
 		}

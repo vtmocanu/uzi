@@ -127,7 +127,8 @@ func (h *Handler) ControllerStatus(w http.ResponseWriter, r *http.Request) {
 		if err := h.q.UpsertControllerReport(r.Context(), pgconv.Time(observedAt)); err != nil {
 			slog.Error("controller status: advancing controller-report singleton", "error", err)
 		}
-		// PRD #4205: record the hibernation protocol version and poll interval beside it
+		// PRD #4205: record the hibernation protocol version and poll interval beside it (PRD #4213
+		// adds the admin-size version to the same write)
 		// (version 0 is an honest "this controller does not speak it"). Best-effort like
 		// the write above; admission refuses on a missing or stale advertisement.
 		// Only a fleet report speaks for the advertisement: a readiness report carries
@@ -138,6 +139,10 @@ func (h *Handler) ControllerStatus(w http.ResponseWriter, r *http.Request) {
 			AdvertisedAt:        pgconv.Time(observedAt),
 			HibernationVersion:  pgtype.Int4{Int32: clampInt32(req.Hibernation), Valid: true},
 			PollIntervalSeconds: pgtype.Int4{Int32: clampInt32(req.PollIntervalSeconds), Valid: true},
+			// PRD #4213: the admin-size support version rides the same fleet-only upsert (0
+			// means the controller ignores DesiredWorker.Resources), stamped with the same
+			// receipt clock, so it is never advanced by a readiness report either.
+			AdminSizesVersion: pgtype.Int4{Int32: clampInt32(req.AdminSizes), Valid: true},
 		}); err != nil {
 			slog.Error("controller status: recording hibernation advertisement", "error", err)
 		}

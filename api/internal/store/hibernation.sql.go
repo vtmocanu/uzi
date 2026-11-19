@@ -1170,25 +1170,37 @@ func (q *Queries) SetHibernationInventoryStatus(ctx context.Context, arg SetHibe
 }
 
 const upsertControllerHibernationAdvertisement = `-- name: UpsertControllerHibernationAdvertisement :exec
-INSERT INTO controller_report_status (id, observed_at, hibernation_version, hibernation_advertised_at, poll_interval_seconds)
-VALUES (1, $1, $2, $1, $3)
+INSERT INTO controller_report_status (id, observed_at, hibernation_version, hibernation_advertised_at, poll_interval_seconds,
+                                      admin_sizes_version, admin_sizes_advertised_at)
+VALUES (1, $1, $2, $1, $3, $4, $1)
 ON CONFLICT (id) DO UPDATE SET
     hibernation_version = EXCLUDED.hibernation_version,
     hibernation_advertised_at = EXCLUDED.hibernation_advertised_at,
-    poll_interval_seconds = EXCLUDED.poll_interval_seconds
+    poll_interval_seconds = EXCLUDED.poll_interval_seconds,
+    admin_sizes_version = EXCLUDED.admin_sizes_version,
+    admin_sizes_advertised_at = EXCLUDED.admin_sizes_advertised_at
 `
 
 type UpsertControllerHibernationAdvertisementParams struct {
 	AdvertisedAt        pgtype.Timestamptz `json:"advertised_at"`
 	HibernationVersion  pgtype.Int4        `json:"hibernation_version"`
 	PollIntervalSeconds pgtype.Int4        `json:"poll_interval_seconds"`
+	AdminSizesVersion   pgtype.Int4        `json:"admin_sizes_version"`
 }
 
-// Record the controller's hibernation protocol version and poll interval from a status
-// report, stamped with the api's own receipt clock. Admission reads it back to refuse a
-// hibernate when no controller that understands the feature has reported recently.
+// Record the controller's hibernation protocol version, admin-size support version and poll
+// interval from a FLEET status report, stamped with the api's own receipt clock. Admission
+// reads the hibernation version back to refuse a hibernate when no controller that understands
+// the feature has reported recently; the admin-size version (PRD #4213, 0 is an honest "this
+// controller ignores DesiredWorker.Resources") is written in the same statement so the two
+// advertisements can never disagree about which report they came from.
 func (q *Queries) UpsertControllerHibernationAdvertisement(ctx context.Context, arg UpsertControllerHibernationAdvertisementParams) error {
-	_, err := q.db.Exec(ctx, upsertControllerHibernationAdvertisement, arg.AdvertisedAt, arg.HibernationVersion, arg.PollIntervalSeconds)
+	_, err := q.db.Exec(ctx, upsertControllerHibernationAdvertisement,
+		arg.AdvertisedAt,
+		arg.HibernationVersion,
+		arg.PollIntervalSeconds,
+		arg.AdminSizesVersion,
+	)
 	return err
 }
 

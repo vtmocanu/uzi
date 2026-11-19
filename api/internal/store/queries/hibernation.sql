@@ -61,15 +61,21 @@ SELECT hibernation_version, hibernation_advertised_at, poll_interval_seconds
 FROM controller_report_status WHERE id = 1;
 
 -- name: UpsertControllerHibernationAdvertisement :exec
--- Record the controller's hibernation protocol version and poll interval from a status
--- report, stamped with the api's own receipt clock. Admission reads it back to refuse a
--- hibernate when no controller that understands the feature has reported recently.
-INSERT INTO controller_report_status (id, observed_at, hibernation_version, hibernation_advertised_at, poll_interval_seconds)
-VALUES (1, @advertised_at, @hibernation_version, @advertised_at, @poll_interval_seconds)
+-- Record the controller's hibernation protocol version, admin-size support version and poll
+-- interval from a FLEET status report, stamped with the api's own receipt clock. Admission
+-- reads the hibernation version back to refuse a hibernate when no controller that understands
+-- the feature has reported recently; the admin-size version (PRD #4213, 0 is an honest "this
+-- controller ignores DesiredWorker.Resources") is written in the same statement so the two
+-- advertisements can never disagree about which report they came from.
+INSERT INTO controller_report_status (id, observed_at, hibernation_version, hibernation_advertised_at, poll_interval_seconds,
+                                      admin_sizes_version, admin_sizes_advertised_at)
+VALUES (1, @advertised_at, @hibernation_version, @advertised_at, @poll_interval_seconds, @admin_sizes_version, @advertised_at)
 ON CONFLICT (id) DO UPDATE SET
     hibernation_version = EXCLUDED.hibernation_version,
     hibernation_advertised_at = EXCLUDED.hibernation_advertised_at,
-    poll_interval_seconds = EXCLUDED.poll_interval_seconds;
+    poll_interval_seconds = EXCLUDED.poll_interval_seconds,
+    admin_sizes_version = EXCLUDED.admin_sizes_version,
+    admin_sizes_advertised_at = EXCLUDED.admin_sizes_advertised_at;
 
 -- name: ListStalePreparingWorkerIDs :many
 -- Candidates only: the pass re-checks the predicate on the locked row. The deadline is measured

@@ -26,7 +26,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/providers"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/settings"
-	"github.com/vtmocanu/uzi/api/internal/workersize"
+	"github.com/vtmocanu/uzi/api/internal/workersize/builtin"
 )
 
 // defaultDBMaxConns is the pgx pool size when neither DB_MAX_CONNS nor the DATABASE_URL
@@ -1549,9 +1549,11 @@ func Load() (Config, error) {
 	// expires (workersize's own doc). Reject a bad value at load rather than at use, and
 	// fall back to "m" with a boot warning so a typo cannot silently disable the feature.
 	cfg.EphemeralDefaultSize = strings.TrimSpace(getenv("UZI_EPHEMERAL_DEFAULT_SIZE", "m"))
-	if !workersize.Valid(cfg.EphemeralDefaultSize) {
-		slog.Warn("UZI_EPHEMERAL_DEFAULT_SIZE is not a known worker size preset; falling back to \"m\"",
-			"configured", cfg.EphemeralDefaultSize, "valid", workersize.Names)
+	// Builtins only: the size table does not exist yet at config load (PRD #4213), so the
+	// env may name a shipped preset; an admin-set ephemeral_default_size may name any size.
+	if !builtin.ValidBuiltin(cfg.EphemeralDefaultSize) {
+		slog.Warn("UZI_EPHEMERAL_DEFAULT_SIZE is not a builtin worker size preset; falling back to \"m\"",
+			"configured", cfg.EphemeralDefaultSize, "valid", builtin.Names())
 		cfg.EphemeralDefaultSize = "m"
 	}
 	// PRD #422: the concrete pinned hosted-worker image tag (deploy's workers.image.tag),

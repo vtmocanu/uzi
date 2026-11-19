@@ -63,11 +63,31 @@ func TestValidateWorkerSizeKeys(t *testing.T) {
 				t.Errorf("Validate(%s, %q) = %v, want nil", key, v, err)
 			}
 		}
-		for _, v := range []string{"xl", "M", "L-HIGHMEM", "tiny"} {
+		for _, v := range []string{"M", "L-HIGHMEM", "1s", "has space", "l_highmem", "a-name-that-is-too-long"} {
 			if err := Validate(key, v); err == nil {
 				t.Errorf("Validate(%s, %q) = nil, want a rejection", key, v)
 			}
 		}
+	}
+}
+
+// An admin-added size such as "xs" is a well-formed name the settings layer must carry as-is
+// (PRD #4213). Whether it still names a row is a database fact checked by a later milestone.
+func TestWellFormedStoredSizeIsReturnedAsIs(t *testing.T) {
+	ctx := context.Background()
+	c := New(&fakeStore{rows: []store.AppSetting{
+		row(KeyEphemeralDefaultSize, "xs"),
+		row(KeyHostedDefaultSize, "xs"),
+	}}, time.Minute)
+	if s, err := c.EphemeralDefaultSize(ctx); s != "xs" || err != nil {
+		t.Errorf("EphemeralDefaultSize = %q, %v; want xs, nil", s, err)
+	}
+	if s, err := c.HostedDefaultSize(ctx); s != "xs" || err != nil {
+		t.Errorf("HostedDefaultSize = %q, %v; want xs, nil", s, err)
+	}
+	bad := New(&fakeStore{rows: []store.AppSetting{row(KeyEphemeralDefaultSize, "XS ?")}}, time.Minute)
+	if s, _ := bad.EphemeralDefaultSize(ctx); s != "m" {
+		t.Errorf("a malformed stored size = %q, want the default m", s)
 	}
 }
 
@@ -153,7 +173,8 @@ func TestWorkerSizeAccessors(t *testing.T) {
 			{"default", "", tc.def},
 			{"stored", "s", "s"},
 			{"highmem", "l-highmem", "l-highmem"},
-			{"junk", "xl", tc.def},
+			{"admin-added size is kept", "xl", "xl"},
+			{"junk", "not a size", tc.def},
 			{"wrong case", "S", tc.def},
 		} {
 			t.Run(tc.key+"/"+rc.name, func(t *testing.T) {

@@ -336,6 +336,8 @@ type ControllerReportStatus struct {
 	HibernationVersion      pgtype.Int4        `json:"hibernation_version"`
 	HibernationAdvertisedAt pgtype.Timestamptz `json:"hibernation_advertised_at"`
 	PollIntervalSeconds     pgtype.Int4        `json:"poll_interval_seconds"`
+	AdminSizesVersion       pgtype.Int4        `json:"admin_sizes_version"`
+	AdminSizesAdvertisedAt  pgtype.Timestamptz `json:"admin_sizes_advertised_at"`
 }
 
 type CrossCheck struct {
@@ -2258,6 +2260,21 @@ type WorkerRunDisk struct {
 	CacheBytes int64              `json:"cache_bytes"`
 	Truncated  bool               `json:"truncated"`
 	SampledAt  pgtype.Timestamptz `json:"sampled_at"`
+}
+
+type WorkerSize struct {
+	Name                 string             `json:"name"`
+	CpuRequestMillicores int64              `json:"cpu_request_millicores"`
+	CpuLimitMillicores   int64              `json:"cpu_limit_millicores"`
+	MemoryRequestMib     int64              `json:"memory_request_mib"`
+	MemoryLimitMib       int64              `json:"memory_limit_mib"`
+	DataGib              int64              `json:"data_gib"`
+	DindDataGib          int64              `json:"dind_data_gib"`
+	DisplayOrder         int32              `json:"display_order"`
+	Builtin              bool               `json:"builtin"`
+	Customized           bool               `json:"customized"`
+	UpdatedAt            pgtype.Timestamptz `json:"updated_at"`
+	UpdatedBy            pgtype.UUID        `json:"updated_by"`
 }
 
 type WorkerUpgradeMute struct {

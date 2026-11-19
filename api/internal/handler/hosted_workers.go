@@ -22,6 +22,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/termsafe"
 	"github.com/vtmocanu/uzi/api/internal/workersize"
+	"github.com/vtmocanu/uzi/api/internal/workersize/builtin"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 	"github.com/vtmocanu/uzi/api/internal/workertmpl"
 )
@@ -101,7 +102,10 @@ func (h *Handler) ProvisionHostedWorker(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	size := strings.TrimSpace(req.Size)
-	if !workersize.Valid(size) {
+	// Cheap format gate first; membership is a database fact now (PRD #4213: sizes are
+	// admin-managed rows) and is checked below, after the policy gates, so a request that
+	// would be refused anyway never costs a query.
+	if !builtin.WellFormed(size) {
 		httpx.Error(w, http.StatusBadRequest, "unknown worker size")
 		return
 	}
@@ -145,6 +149,17 @@ func (h *Handler) ProvisionHostedWorker(w http.ResponseWriter, r *http.Request) 
 		// disables"), and no amount of deleting workers makes this request succeed.
 		// That is what separates it from the 409 below.
 		httpx.Error(w, http.StatusForbidden, "self-service worker provisioning is disabled")
+		return
+	}
+
+	known, err := workersize.Exists(r.Context(), h.q, size)
+	if err != nil {
+		slog.Error("provision hosted worker: reading worker sizes", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if !known {
+		httpx.Error(w, http.StatusBadRequest, "unknown worker size")
 		return
 	}
 

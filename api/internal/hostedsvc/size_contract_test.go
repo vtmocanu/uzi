@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/vtmocanu/uzi/api/internal/workersize"
+	"github.com/vtmocanu/uzi/api/internal/workersize/builtin"
 )
 
 // The cross-module size golden (PRD #58 Decision 7).
@@ -94,9 +95,38 @@ func TestHostedSizeNamesContract(t *testing.T) {
 // pair exists to prevent.
 func TestWireGoldenSizesAreValidRegistryNames(t *testing.T) {
 	for _, w := range samplePollResponse().Workers {
-		if !workersize.Valid(w.Size) {
+		if !builtin.ValidBuiltin(w.Size) {
 			t.Errorf("the wire golden carries size %q, which workersize.Valid rejects — "+
 				"the two goldens in this directory have drifted apart", w.Size)
+		}
+	}
+}
+
+// The builtin seed values the api inserts at boot (builtin.Sizes) must equal the golden
+// the controller's compiled-in table is pinned against, integers included. The two
+// together are the contract: seed values on this side, preset values on the other.
+func TestBuiltinSizesMatchSeedContract(t *testing.T) {
+	raw, err := os.ReadFile(sizeContractFixture)
+	if err != nil {
+		t.Fatalf("read golden: %v", err)
+	}
+	var doc sizeGolden
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("parse golden: %v", err)
+	}
+	got := builtin.Sizes()
+	if len(got) != len(doc.Sizes) {
+		t.Fatalf("builtin.Sizes has %d entries, golden has %d", len(got), len(doc.Sizes))
+	}
+	for i, g := range doc.Sizes {
+		b := got[i]
+		want := SizeResources{
+			CPURequestMillicores: b.CPURequestMillicores, CPULimitMillicores: b.CPULimitMillicores,
+			MemoryRequestMiB: b.MemoryRequestMiB, MemoryLimitMiB: b.MemoryLimitMiB,
+			DataGiB: b.DataGiB, DinDDataGiB: b.DinDDataGiB,
+		}
+		if b.Name != g.Name || want != g.SizeResources {
+			t.Fatalf("builtin size %d differs from the golden.\n builtin: %s %+v\n golden:  %s %+v", i, b.Name, want, g.Name, g.SizeResources)
 		}
 	}
 }
