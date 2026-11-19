@@ -171,16 +171,22 @@ func TestCodexProvenanceHoldNudgeSuppression(t *testing.T) {
 // with no pinnable flag set is silent until updated_at + the affinity ceiling, the latest end of
 // any window that could have covered it; it then nudges exactly once. Never at +30s.
 func TestCodexProvenanceHeldQuietTransitionsNudgeAtCeilingEnd(t *testing.T) {
+	expired := apitypes.CodexAdmissionReason("rate_limit", t0.Add(-time.Hour))
 	cases := []struct {
-		name  string
-		prior string
+		name        string
+		prior       string
+		stalePinned bool
 	}{
-		{"leaving maintenance", reasonMaintenance},
-		{"leaving an expired rate limit admission", apitypes.CodexAdmissionReason("rate_limit", t0.Add(-time.Hour))},
+		{"leaving maintenance", reasonMaintenance, false},
+		{"leaving an expired rate limit admission", expired, false},
+		// The stale flag stays true after the 20m grace (already over at 30m): it must not end the window.
+		{"leaving maintenance, stale flag past grace", reasonMaintenance, true},
+		{"leaving an expired admission, stale flag past grace", expired, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			r := heldCodexRun("A")
+			r.StaleRequeuePinnable = tc.stalePinned
 			r.StatusSince = ago(30 * time.Minute)
 			r.UpdatedAt = ago(30 * time.Minute)
 			r.Health = healthWaitingWorker
