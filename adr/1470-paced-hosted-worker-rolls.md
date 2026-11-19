@@ -89,9 +89,8 @@ handoff is not an additional journal and preserves legacy /data self-heal.
 #### Lost-canary adoption (#4466)
 
 When a pool has incomplete participant reservations but no canary (annotation
-reset, or a canary Deployment recreated without its marker by an actor outside
-the controller; the controller itself never recreates a deleted participant), the controller may adopt one existing
-participant as canary instead of holding the pool for explicit recovery. The
+reset, or a canary Deployment recreated without its marker outside the
+controller), the controller may adopt one existing participant as canary instead of holding the pool for explicit recovery. The
 chosen participant must pass the unchanged promotion proof (D4: fresh
 registration with a new nonce, exact version, current pod UID/ancestry,
 heartbeat, coverage, serving eligibility (not cordoned or drained), and no
@@ -141,11 +140,13 @@ closed.
 This deviates from "adopt the smallest eligible participant": adoption holds
 while an earlier participant is unresolved, and clears automatically once that
 participant regains proof or its Deployment is rescaled, retemplated or loses its
-marker. Deleting a previously registered participant's Deployment does not clear
-it: that worker then trips the missing-deployment guard ("missing deployment
-lacks first-provision evidence; explicit recovery required"), which blocks
-adoption for the whole pool. The
-layout-migration hold has a matching fence: a held canary keeps its incomplete
+marker. Deleting a previously registered participant's Deployment fences that
+participant but, unless it has a retained claim reservation or independent
+rebuild evidence, usually trips the missing-deployment guard ("missing
+deployment lacks first-provision evidence; explicit recovery required"), which
+blocks adoption for the whole pool; with a retained claim reservation the pool
+stays held and the controller restores the participant through its existing
+recovery path. The layout-migration hold has a matching fence: a held canary keeps its incomplete
 reservation and fences the pool while incomplete same-cohort participants
 remain, instead of cancelling it, because cancelling would leave those
 participants without a canary.

@@ -516,8 +516,8 @@ func rollPeerOutOfScope(p *rollEntry, owner string) bool {
 }
 
 // adoptOrphanCanary recovers a cohort whose canary evidence was lost (annotation
-// reset, Deployment recreated) while participants remain. It promotes exactly one
-// incomplete participant that is already proven on its current incarnation into the
+// reset, or a canary Deployment recreated without its marker) while participants
+// remain. It promotes exactly one incomplete participant that is already proven on its current incarnation into the
 // canary by a single metadata-only reservation patch. It never touches the template,
 // replicas or claims, and adopts nothing unless the whole pool observation is clean.
 //
