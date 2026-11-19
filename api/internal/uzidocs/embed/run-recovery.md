@@ -1273,7 +1273,7 @@ final disposition, and a write-once seal fixes the evidence before the first
 final disposition is sent. A sealed final is checked again even when the
 current evidence has since disappeared; empty evidence is a mismatch and
 custody is kept. After the terminal import on the cap path, and after a
-successful terminal import of a run that has refusal evidence or is at the cap,
+successful terminal import of an inventory-guarded run that has refusal evidence or is at the cap,
 no later fetch for that generation can add a refused head; ordinary below-cap
 runs are unchanged. Deleting a generation's local state removes
 its refusal refs and records only after the acknowledged final source covers

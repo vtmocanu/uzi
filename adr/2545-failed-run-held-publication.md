@@ -426,7 +426,7 @@ seal fixed, so the result is a mismatch and custody is kept. With no seal
 and gate `none`, nothing is written.
 
 **Fence.** After the terminal import on the cap path, and also after a
-successful terminal import whose gate is not `none` (refusal evidence exists or
+successful terminal import of an inventory-guarded code-publishing run whose gate is not `none` (refusal evidence exists or
 the run is at the cap; the path is re-proved through the cap transfer), an in-process fence
 (`closeRefusalGeneration`) refuses further producing fetches and tracking
 updates (P1-P6) for that run at generation at or below the closed one.
