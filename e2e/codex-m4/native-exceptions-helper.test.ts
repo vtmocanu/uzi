@@ -53,6 +53,55 @@ for (const declaration of [
   });
 }
 
+for (const declaration of [
+  "declare const /* inventory */ tools: { unknown_tool(): void };",
+  "declare /* inventory */ const tools: { unknown_tool(): void };",
+  "declare const tools: { /* inventory */ unknown_tool /* member */ (): void };",
+  "declare const tools: { unknown_tool /* member */ : () => void };",
+]) {
+  for (const fenced of [false, true]) {
+    test(`inventory parses commented declarations (fenced=${fenced}): ${declaration}`, () => {
+      const description = fenced ? `prose\n\`\`\`ts\n${declaration}\n\`\`\`` : declaration;
+      const inventory = execInventory(description);
+      assert.deepEqual(inventory.nestedNames, ["unknown_tool"]);
+      assert.deepEqual(inventory.unparsed, []);
+    });
+  }
+}
+
+for (const declaration of [
+  "declare namespace tools { function unknown_tool(): Promise<unknown>; }",
+  "declare /* inventory */ namespace tools { function unknown_tool(): void; }",
+  "declare let /* inventory */ tools: { unknown_tool(): void };",
+  "declare const /* inventory */ tools: SomeAlias;",
+  "declare function unknown_tool(): void;",
+  "declare class tools { unknown_tool(): void; }",
+]) {
+  for (const fenced of [false, true]) {
+    test(`inventory rejects unsupported declarations (fenced=${fenced}): ${declaration}`, () => {
+      const description = fenced ? `prose\n\`\`\`ts\n${declaration}\n\`\`\`` : declaration;
+      assert.ok(execInventory(description).unparsed.length > 0);
+    });
+  }
+}
+
+test("inventory supports shared type fences alongside tools declarations", () => {
+  const inventory = execInventory("Shared types\n```ts\ntype Args = { value: string };\n```\nTools\n```ts\ndeclare const tools: { unknown_tool(args: Args): void };\n```");
+  assert.deepEqual(inventory.nestedNames, ["unknown_tool"]);
+  assert.deepEqual(inventory.unparsed, []);
+});
+
+test("inventory excludes oversized descriptions while retaining sibling evidence", () => {
+  const oversized = "declare const tools: { omitted(): void };".padEnd(262145, " ");
+  const inventory = runtimeInventory([{ tools: [
+    { name: "oversized", description: oversized },
+    { name: "exec", description: "declare const tools: { retained(): void };" },
+  ] }]);
+  assert.deepEqual(inventory.unparsed, ["description size limit"]);
+  assert.equal(inventory.descriptions, "declare const tools: { retained(): void };");
+  assert.deepEqual(inventory.nestedNames, ["retained"]);
+});
+
 test("inventory traverses structured wrappers without treating schema names as tools", () => {
   const inventory = runtimeInventory([{ tools: [{ type: "function", function: {
     name: "unknown_direct", parameters: { name: "not_a_tool" },

@@ -19,8 +19,8 @@ export function runtimeInventory(requests: readonly ResponsesBody[]) {
   let nodes = 0, observed = false;
 
   function declarations(description: string): void {
-    if (description.length > 262144) { unparsed.add("description size limit"); return; }
-    const marker = /\bdeclare\s+(?:const|let|var)\s+tools\b/g;
+    // Discover declaration-bearing code broadly; Oxc validates the declaration shape.
+    const marker = /\bdeclare\b/g;
     const count = (s: string) => [...s.matchAll(marker)].length;
     const expected = count(description);
     if (!expected) return;
@@ -82,6 +82,7 @@ export function runtimeInventory(requests: readonly ResponsesBody[]) {
     if ("type" in item && !["function", "custom", "namespace", "additional_tools"].includes(item.type as string)) unparsed.add("unknown inventory type");
     if ("description" in item) {
       if (typeof item.description !== "string") unparsed.add("malformed description");
+      else if (item.description.length > 262144) unparsed.add("description size limit");
       else { descriptions.push(item.description); declarations(item.description); }
     }
     const keys = ["tools", "function", "namespaces", "additional_tools"].filter(key => key in item);
