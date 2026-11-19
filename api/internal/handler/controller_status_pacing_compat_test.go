@@ -118,3 +118,33 @@ func TestControllerStatusMixedPacingStrictContracts(t *testing.T) {
 		t.Fatal("control: valid stored pacing must render")
 	}
 }
+
+// A wrong-shape pacing value must poison neither the report envelope, the row decode
+// nor the capacity cause read from the raw row (#4467): the row still lands with its
+// scheduler_capacity blocking kind and no pacing.
+func TestControllerStatusWrongShapePacingKeepsRowAndBlockingKind(t *testing.T) {
+	for _, pacing := range []string{`"garbage"`, `[]`, `5`, `{"state":5}`, `{"state":"held","target_image":{}}`, `{"state":"held","canary_id":5}`} {
+		t.Run(pacing, func(t *testing.T) {
+			st := &statusStore{rows: 1}
+			h := newProtocolHandler(t, st)
+			body := `{"kind":"fleet","workers":[{"id":"11111111-1111-1111-1111-111111111111","phase":"stuck","pod_phase":"Pending",` +
+				`"blocking_reason":"scheduler capacity: insufficient cpu","blocking_kind":"scheduler_capacity","pacing":` + pacing + `}]}`
+			rec := httptest.NewRecorder()
+			h.ControllerStatus(rec, httptest.NewRequest(http.MethodPost, "/api/controller/status", strings.NewReader(body)))
+			if rec.Code != http.StatusNoContent || len(st.upserts) != 1 {
+				t.Fatalf("status=%d upserts=%d", rec.Code, len(st.upserts))
+			}
+			p := st.upserts[0]
+			if !p.BlockingKind.Valid || p.BlockingKind.String != "scheduler_capacity" || p.Phase != "stuck" || !p.UpdatePacing {
+				t.Fatalf("row: kind=%+v phase=%q update=%v", p.BlockingKind, p.Phase, p.UpdatePacing)
+			}
+			if pacing == `{"state":"held","canary_id":5}` {
+				if !strings.Contains(string(p.Pacing), `"state":"held"`) || strings.Contains(string(p.Pacing), "canary_id") {
+					t.Fatalf("identity not omitted alone: %s", p.Pacing)
+				}
+			} else if len(p.Pacing) != 0 {
+				t.Fatalf("malformed pacing persisted: %s", p.Pacing)
+			}
+		})
+	}
+}
