@@ -85,7 +85,10 @@ interface Env {
 const bareGit = (bare: string, ...args: string[]) =>
   execFileSync("git", ["-C", bare, ...args], { env: ENV, encoding: "utf8", stdio: "pipe" }).trim();
 
-async function setup(over: GitCacheOptions = {}, shape: "alternate" | "standalone" = "alternate"): Promise<Env> {
+type CloneShape = "alternate" | "standalone";
+const CLONE_SHAPES: readonly CloneShape[] = ["alternate", "standalone"];
+
+async function setup(over: GitCacheOptions = {}, shape: CloneShape = "alternate"): Promise<Env> {
   const fx = makeFixture({ "dir/inner.txt": "inner\n" });
   cleanups.push(() => { try { fs.chmodSync(fx.dataDir, 0o700); fs.chmodSync(path.join(fx.dataDir, "repos"), 0o700); } catch { /* gone */ } fx.cleanup(); });
   const acl: string[][] = [];
@@ -205,48 +208,50 @@ for (const shape of ["alternate", "standalone"] as const) {
 }
 
 describe("refused group-writable shapes (the clone and skills are never touched)", () => {
-  it("a group-writable bare of a foreign group", async () => {
-    const e = await setup();
-    widen(e);
-    fs.chownSync(e.bare, UID, foreignGid());
-    fs.chmodSync(e.bare, 0o2775);
-    await assertRefused(e);
-  });
-
-  for (const target of ["reposRoot", "dataDir"] as const) {
-    for (const shape of ["world-writable", "sticky world-writable", "group-writable foreign group"] as const) {
-      it(`an unsafe ancestor: ${target} ${shape}`, async () => {
-        const e = await setup();
-        widen(e);
-        const dir = target === "reposRoot" ? e.reposRoot : e.dataDir;
-        if (shape === "group-writable foreign group") { fs.chownSync(dir, UID, foreignGid()); fs.chmodSync(dir, 0o775); }
-        else fs.chmodSync(dir, shape === "world-writable" ? 0o777 : 0o1777);
-        await assertRefused(e);
-      });
-    }
-  }
-
-  it("an ancestor carrying a named ACL, observed through the ancestor paths of every chunk", async () => {
-    const seen: string[][] = [];
-    let repos = "";
-    const e = await setup({ managedBareAclObserve: async list => {
-      seen.push([...list]);
-      if (list.includes(repos)) throw new Error("named ACL entry on the repos root");
-    } });
-    repos = e.reposRoot;
-    widen(e);
-    await assertRefused(e);
-    assert.ok(seen.length >= 1);
-    assert.deepEqual(seen[0]!.slice(0, 2), [e.reposRoot, e.dataDir]);
-  });
-
-  it("a world-writable bare", async () => {
-    for (const mode of [0o777, 0o2777, 0o1777, 0o772]) {
-      const e = await setup();
-      widen(e, mode);
+  for (const clone of CLONE_SHAPES) {
+    it(`a group-writable bare of a foreign group (${clone})`, async () => {
+      const e = await setup({}, clone);
+      widen(e);
+      fs.chownSync(e.bare, UID, foreignGid());
+      fs.chmodSync(e.bare, 0o2775);
       await assertRefused(e);
+    });
+
+    for (const target of ["reposRoot", "dataDir"] as const) {
+      for (const shape of ["world-writable", "sticky world-writable", "group-writable foreign group"] as const) {
+        it(`an unsafe ancestor: ${target} ${shape} (${clone})`, async () => {
+          const e = await setup({}, clone);
+          widen(e);
+          const dir = target === "reposRoot" ? e.reposRoot : e.dataDir;
+          if (shape === "group-writable foreign group") { fs.chownSync(dir, UID, foreignGid()); fs.chmodSync(dir, 0o775); }
+          else fs.chmodSync(dir, shape === "world-writable" ? 0o777 : 0o1777);
+          await assertRefused(e);
+        });
+      }
     }
-  });
+
+    it(`an ancestor carrying a named ACL, observed through the ancestor paths of every chunk (${clone})`, async () => {
+      const seen: string[][] = [];
+      let repos = "";
+      const e = await setup({ managedBareAclObserve: async list => {
+        seen.push([...list]);
+        if (list.includes(repos)) throw new Error("named ACL entry on the repos root");
+      } }, clone);
+      repos = e.reposRoot;
+      widen(e);
+      await assertRefused(e);
+      assert.ok(seen.length >= 1);
+      assert.deepEqual(seen[0]!.slice(0, 2), [e.reposRoot, e.dataDir]);
+    });
+
+    it(`a world-writable bare (${clone})`, async () => {
+      for (const mode of [0o777, 0o2777, 0o1777, 0o772]) {
+        const e = await setup({}, clone);
+        widen(e, mode);
+        await assertRefused(e);
+      }
+    });
+  }
 
   it("a symlinked store", async () => {
     const e = await setup();
@@ -272,13 +277,15 @@ describe("refused group-writable shapes (the clone and skills are never touched)
     await assertRefused(e);
   });
 
-  it("an ACL observed on a path inside the store", async () => {
-    const e = await setup({ managedBareAclObserve: async paths => {
-      if (paths.some(p => p.endsWith(`${path.sep}HEAD`))) throw new Error("named ACL entry on HEAD");
-    } });
-    widen(e);
-    await assertRefused(e);
-  });
+  for (const clone of CLONE_SHAPES) {
+    it(`an ACL observed on a path inside the store (${clone})`, async () => {
+      const e = await setup({ managedBareAclObserve: async paths => {
+        if (paths.some(p => p.endsWith(`${path.sep}HEAD`))) throw new Error("named ACL entry on HEAD");
+      } }, clone);
+      widen(e);
+      await assertRefused(e);
+    });
+  }
 
   it("a disallowed filesystem type, on the bare or on any ancestor", async () => {
     for (const bad of ["bare", "reposRoot", "dataDir"] as const) {
@@ -311,22 +318,24 @@ describe("refused group-writable shapes (the clone and skills are never touched)
   });
 
   describe("trust values that are not a probe's positive result", () => {
-    const refusedWith = async (trust: ManagedBareGroupTrust | undefined, observe = true) => {
-      const e = await setup({ managedBareGroupTrust: trust });
+    const refusedWith = async (trust: ManagedBareGroupTrust | undefined, observe = true, clone: CloneShape = "alternate") => {
+      const e = await setup({ managedBareGroupTrust: trust }, clone);
       widen(e);
       await assertRefused(e);
       if (observe) assert.equal(e.acl.length, 0);
     };
-    it("P1 contamination: the runner groups contain the worker group", async () => {
-      const trust = managedBareGroupTrustForTest({ runnerStatus: runnerStatus("10002 10001"), commandStatus: commandStatus() });
-      assert.equal(trust.state, "off");
-      await refusedWith(trust);
-    });
-    it("a failed probe", async () => {
-      const trust = managedBareGroupTrustForTest({ runnerStatus: "garbage", commandStatus: commandStatus() });
-      assert.equal(trust.state, "off");
-      await refusedWith(trust);
-    });
+    for (const clone of CLONE_SHAPES) {
+      it(`P1 contamination: the runner groups contain the worker group (${clone})`, async () => {
+        const trust = managedBareGroupTrustForTest({ runnerStatus: runnerStatus("10002 10001"), commandStatus: commandStatus() });
+        assert.equal(trust.state, "off");
+        await refusedWith(trust, true, clone);
+      });
+      it(`a failed probe (${clone})`, async () => {
+        const trust = managedBareGroupTrustForTest({ runnerStatus: "garbage", commandStatus: commandStatus() });
+        assert.equal(trust.state, "off");
+        await refusedWith(trust, true, clone);
+      });
+    }
     it("a literal that no probe issued", async () => {
       await refusedWith({ state: "trusted", gid: GID } as unknown as ManagedBareGroupTrust);
     });
@@ -397,14 +406,16 @@ describe("refused group-writable shapes (the clone and skills are never touched)
   });
 
   describe("core.sharedRepository", () => {
-    it("is refused on a group-writable store, however it is spelled", async () => {
-      for (const line of ["[core]\n\tSharedRepository = group\n", "[CORE]\n\tsharedrepository = 0660\n"]) {
-        const e = await setup();
-        fs.appendFileSync(path.join(e.bare, "config"), line);
-        widen(e);
-        await assertRefused(e);
-      }
-    });
+    for (const clone of CLONE_SHAPES) {
+      it(`is refused on a group-writable store, however it is spelled (${clone})`, async () => {
+        for (const line of ["[core]\n\tSharedRepository = group\n", "[CORE]\n\tsharedrepository = 0660\n"]) {
+          const e = await setup({}, clone);
+          fs.appendFileSync(path.join(e.bare, "config"), line);
+          widen(e);
+          await assertRefused(e);
+        }
+      });
+    }
     it("is still proven on a store that is not group-writable", async () => {
       const e = await setup();
       fs.appendFileSync(path.join(e.bare, "config"), "[core]\n\tSharedRepository = group\n");
@@ -447,21 +458,23 @@ describe("a store that changes after the first observation", () => {
 });
 
 describe("the getfacl launch", () => {
-  it("an absent executable is UNKNOWN through the audited shape: no deletion, no unhandled rejection", async () => {
-    const rejections: unknown[] = [];
-    const listener = (reason: unknown) => { rejections.push(reason); };
-    process.on("unhandledRejection", listener);
-    try {
-      const absent = path.join(os.tmpdir(), `absent-getfacl-${process.pid}`);
-      assert.equal(fs.existsSync(absent), false);
-      const e = await setup({ managedBareAclObserve: undefined, managedBareGetfaclBin: absent });
-      widen(e);
-      // The census's proof, and the discard that consumes the same proof.
-      await assertRefused(e);
-      for (let i = 0; i < 3; i++) await new Promise<void>(resolve => setImmediate(resolve));
-    } finally { process.off("unhandledRejection", listener); }
-    assert.deepEqual(rejections, []);
-  });
+  for (const clone of CLONE_SHAPES) {
+    it(`an absent executable is UNKNOWN through the audited shape: no deletion, no unhandled rejection (${clone})`, async () => {
+      const rejections: unknown[] = [];
+      const listener = (reason: unknown) => { rejections.push(reason); };
+      process.on("unhandledRejection", listener);
+      try {
+        const absent = path.join(os.tmpdir(), `absent-getfacl-${process.pid}`);
+        assert.equal(fs.existsSync(absent), false);
+        const e = await setup({ managedBareAclObserve: undefined, managedBareGetfaclBin: absent }, clone);
+        widen(e);
+        // The census's proof, and the discard that consumes the same proof.
+        await assertRefused(e);
+        for (let i = 0; i < 3; i++) await new Promise<void>(resolve => setImmediate(resolve));
+      } finally { process.off("unhandledRejection", listener); }
+      assert.deepEqual(rejections, []);
+    });
+  }
 
   it("the production binary path is used when none is configured", async () => {
     const launched: string[] = [];

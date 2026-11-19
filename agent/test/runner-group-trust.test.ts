@@ -148,9 +148,75 @@ test("off: timeout without unhandled rejection", async () => {
   process.on("unhandledRejection", onRej);
   try {
     const { result } = await withSplitEnv(() =>
-      probe([{ hang: true }, { stdout: cmdOk() }], { timeoutMs: 30, kill: (w) => { killed.push(w); } }));
+      probe([{ hang: true }, { stdout: cmdOk() }], { timeoutMs: 30, joinGraceMs: 20, kill: (w) => { killed.push(w); } }));
     assert.equal(result.state, "off");
     assert.deepEqual(killed, ["runner"]);
+    await new Promise((r) => setImmediate(r));
+    assert.deepEqual(rejections, []);
+  } finally {
+    process.off("unhandledRejection", onRej);
+  }
+});
+
+// A child that hangs until killed; after the kill request it closes `closeDelayMs` later (never when undefined).
+function killableSpawn(events: string[], closeDelayMs: number | undefined) {
+  let n = 0;
+  return (): ChildProcess => {
+    const mine = n++;
+    const child = new EventEmitter() as unknown as ChildProcess & { stdout: EventEmitter; stderr: EventEmitter };
+    (child as unknown as { stdout: EventEmitter }).stdout = new EventEmitter();
+    (child as unknown as { stderr: EventEmitter }).stderr = new EventEmitter();
+    (child as unknown as { pid: number }).pid = 5000 + mine;
+    (child as unknown as { kill: () => boolean }).kill = () => true;
+    if (mine === 0) {
+      (child as unknown as { kill: () => boolean }).kill = () => {
+        events.push("kill");
+        if (closeDelayMs !== undefined) {
+          setTimeout(() => { events.push("close"); child.emit("close", null, "SIGKILL"); }, closeDelayMs);
+        }
+        return true;
+      };
+    } else {
+      setImmediate(() => { child.stdout.emit("data", Buffer.from(cmdOk())); child.emit("close", 0, null); });
+    }
+    return child;
+  };
+}
+
+test("timeout: the probe waits for the killed child to close before resolving off", async () => {
+  const events: string[] = [];
+  const rejections: unknown[] = [];
+  const onRej = (e: unknown) => { rejections.push(e); };
+  process.on("unhandledRejection", onRej);
+  try {
+    const result = await withSplitEnv(() => probeRunnerGroupTrust({
+      spawn: killableSpawn(events, 80), split: true, getuid: () => 10001, getgid: () => 10001,
+      timeoutMs: 20, joinGraceMs: 2000, kill: () => {},
+    }));
+    events.push("resolved");
+    assert.deepEqual(events, ["kill", "close", "resolved"]);
+    assert.deepEqual({ ...result }, { state: "off", reason: "runner_timeout" });
+    await new Promise((r) => setImmediate(r));
+    assert.deepEqual(rejections, []);
+  } finally {
+    process.off("unhandledRejection", onRej);
+  }
+});
+
+test("timeout: a child that never closes after kill resolves off after the join grace", async () => {
+  const events: string[] = [];
+  const rejections: unknown[] = [];
+  const onRej = (e: unknown) => { rejections.push(e); };
+  process.on("unhandledRejection", onRej);
+  try {
+    const t0 = Date.now();
+    const result = await withSplitEnv(() => probeRunnerGroupTrust({
+      spawn: killableSpawn(events, undefined), split: true, getuid: () => 10001, getgid: () => 10001,
+      timeoutMs: 20, joinGraceMs: 60, kill: () => {},
+    }));
+    assert.deepEqual(events, ["kill"]);
+    assert.ok(Date.now() - t0 >= 70, "waited for the grace after the timeout");
+    assert.deepEqual({ ...result }, { state: "off", reason: "runner_timeout_unjoined" });
     await new Promise((r) => setImmediate(r));
     assert.deepEqual(rejections, []);
   } finally {

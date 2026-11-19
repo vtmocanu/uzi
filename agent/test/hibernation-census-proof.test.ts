@@ -238,6 +238,30 @@ it("#4486: a 2775 managed-bare clone with trust and a clean ACL observation is c
   assert.ok(observed.length >= 2, "the bare tree was observed by every full snapshot");
 });
 
+it("#4486: an absent getfacl binary reaches the census as an unknown entry with detail completeness_unknown", async () => {
+  const rejections: unknown[] = [];
+  const onRej = (e: unknown) => { rejections.push(e); };
+  process.on("unhandledRejection", onRej);
+  try {
+    // No ACL observer seam: the real launch path runs and the nonexistent absolute binary fails with ENOENT.
+    git = groupWritableCache({ managedBareGetfaclBin: path.join(fx.dataDir, "no-such-getfacl") });
+    widenBare();
+    const result = await census();
+    const [entry] = attemptEntries(result);
+    assert.notEqual(entry?.content_state, "content_proven", JSON.stringify(result.entries));
+    assert.equal(entry?.classification, "unknown", JSON.stringify(entry));
+    assert.equal(entry?.detail, "completeness_unknown", JSON.stringify(entry));
+    assert.equal(entry?.content_state, "unproven_worktree_bytes");
+    assert.equal(entry?.tip, undefined);
+    // The census lists the unproven clone as an unknown entry (it blocks reclaim by classification); `complete`
+    // stays true because the clone is accounted for, as in the observed-ACL case above.
+    await new Promise((r) => setImmediate(r));
+    assert.deepEqual(rejections, []);
+  } finally {
+    process.off("unhandledRejection", onRej);
+  }
+});
+
 it("#4486: the same 2775 clone stays unproven without a trusted group, or with an observed ACL", async () => {
   for (const over of [{ managedBareGroupTrust: undefined, managedBareAclObserve: async () => {} },
     { managedBareAclObserve: async () => { throw new Error("named ACL entry"); } }] as GitCacheOptions[]) {

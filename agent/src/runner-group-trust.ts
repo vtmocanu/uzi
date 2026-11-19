@@ -29,6 +29,7 @@ export type ManagedBareGroupTrust = Readonly<
 > & { readonly [brand]: true };
 
 const PROBE_TIMEOUT_MS = 10_000;
+const JOIN_GRACE_MS = 5_000;
 const STDOUT_CAP_BYTES = 64 * 1024;
 /** The inert SETUID|SETGID bounding-set residue of the real setpriv path (profile.go). */
 const CAP_BND_RESIDUE = 0xc0n;
@@ -171,6 +172,8 @@ export type RunnerGroupTrustDeps = {
   getuid?: () => number;
   getgid?: () => number;
   timeoutMs?: number;
+  /** Bound on waiting for a killed child to close before resolving off anyway. */
+  joinGraceMs?: number;
   /** Uid-aware kill of a timed-out child; the worker cannot signal a runner uid directly. */
   kill?: (which: "runner" | "command", pid: number | undefined) => void;
 };
@@ -196,12 +199,22 @@ function runOne(
       try { (deps.kill ?? defaultKill)(which, child?.pid); } catch { /* best effort */ }
       try { child?.kill("SIGKILL"); } catch { /* best effort */ }
     };
-    const settle = (r: ChildResult, kill: boolean): void => {
+    let closed = false;
+    let onClosed: (() => void) | undefined;
+    // `join`: after the kill request, wait (bounded) for the child to close so a probe child is
+    // not left running when the result is returned. The result is the same either way.
+    const settle = (r: ChildResult, kill: boolean, join = false): void => {
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
-      if (kill) killChild();
-      resolve(r);
+      if (!kill) { resolve(r); return; }
+      killChild();
+      if (!join || closed) { resolve(r); return; }
+      const grace = setTimeout(() => {
+        onClosed = undefined;
+        resolve(r.ok ? r : { ok: false, reason: `${r.reason}_unjoined` });
+      }, deps.joinGraceMs ?? JOIN_GRACE_MS);
+      onClosed = () => { clearTimeout(grace); onClosed = undefined; resolve(r); };
     };
     try {
       const doSpawn = deps.spawn ?? spawn;
@@ -209,18 +222,20 @@ function runOne(
         env: { PATH: "/usr/bin:/bin" },
         stdio: ["ignore", "pipe", "pipe"],
       });
-      timer = setTimeout(() => settle({ ok: false, reason: "timeout" }, true), timeoutMs);
+      timer = setTimeout(() => settle({ ok: false, reason: "timeout" }, true, true), timeoutMs);
       child.on("error", () => settle({ ok: false, reason: "spawn_error" }, true));
       child.stderr?.on("data", () => { /* drained and discarded */ });
       child.stderr?.on("error", () => { /* ignored */ });
-      child.stdout?.on("error", () => settle({ ok: false, reason: "stdout_error" }, true));
+      child.stdout?.on("error", () => settle({ ok: false, reason: "stdout_error" }, true, true));
       child.stdout?.on("data", (d: Buffer | string) => {
         const b = typeof d === "string" ? Buffer.from(d) : d;
         bytes += b.length;
-        if (bytes > STDOUT_CAP_BYTES) { settle({ ok: false, reason: "oversize" }, true); return; }
+        if (bytes > STDOUT_CAP_BYTES) { settle({ ok: false, reason: "oversize" }, true, true); return; }
         chunks.push(b);
       });
       child.on("close", (code: number | null, signal: NodeJS.Signals | null) => {
+        closed = true;
+        onClosed?.();
         settle({ ok: true, code, signal, stdout: Buffer.concat(chunks).toString("utf8") }, false);
       });
     } catch {
