@@ -1095,7 +1095,11 @@ newer worker image.
 A resumed run can stay tied to its previous worker until the configured
 affinity ceiling (two hours by default), even if another capable worker
 comes online. This preserves unpublished work on the previous worker's
-volume before a cold move is allowed.
+volume before a cold move is allowed. A Codex run that has been claimed is
+stricter: no other worker, including a new ephemeral one, takes it at the
+ceiling; it stays held for the worker that last ran it until that worker returns
+or the owner cancels the run (`uzi run cancel <id>`; see
+[Codex credentials](./codex-credentials.md#a-codex-run-held-for-its-last-worker)).
 
 ## Disk self-heal
 

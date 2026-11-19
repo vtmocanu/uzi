@@ -4320,7 +4320,10 @@ finalization can open a new streak.
 The hold retains the claim, worker affinity and the issue lock for issue
 runs. Clone and HOME stay on the worker. Recovery depends on surviving
 worker storage or an available verified recovery copy; it does not promise
-that unpublished latest edits are available on another worker.
+that unpublished latest edits are available on another worker. A Codex run that
+has been claimed once is held for its last worker and is never offered to another;
+wait for that worker, or cancel the run with `uzi run cancel <id>`
+([details](./run-recovery.md#codex-runs-held-for-their-last-worker)).
 `run wait` prints the provider retry/hold notice and continues waiting
 through `paused` unless `--until paused` is selected.
 See [Provider outage streaks](./run-recovery-wait.md#provider-outage-streaks)

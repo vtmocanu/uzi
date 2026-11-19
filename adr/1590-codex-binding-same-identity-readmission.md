@@ -107,6 +107,11 @@ stale-worker affinity rules that admitted the cold claimant in the observed case
 changed. Older-generation holds stay open, so custody is retained across the hold. The queued
 sweeper park writes no `worker_id` (it has no claim of its own making).
 
+*Amendment (2026-11-19, issue #4476):* the statement above that the fall-open rules apply unchanged no longer holds for a Codex run at
+generation >= 1. Claim provenance now admits only the worker recorded for its current
+generation, and the affinity grace, ceiling and fall-open rules do not override it, so the
+cold claimant is refused rather than admitted. See [ADR-4476](4476-codex-claim-provenance.md).
+
 ## D5: the relaxation and its fences
 
 ### The statement

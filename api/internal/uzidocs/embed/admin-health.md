@@ -266,6 +266,31 @@ When the hold ends (the grace elapses, `WORKER_AFFINITY_CEILING` releases the ru
 row is deleted) the wait becomes a new episode, `health_since` is restamped, and it counts as a
 genuine wait again.
 
+A queued Codex run that has already been claimed is held for the worker that last
+ran it (issue #4476, [ADR-4476](../adr/4476-codex-claim-provenance.md)); no stale-requeue
+grace, affinity ceiling, deleted owner row or cross-check exemption releases it to
+another worker. It shows `waiting_worker` with one of two reasons: "held for worker
+<name>: wait for it or cancel the run; only the worker that last ran this Codex run
+may resume it" (the name comes from the recorded claim provenance, or the worker id
+when that worker row was deleted), or "held: predecessor provenance unavailable;
+cancel the run; no worker may resume this Codex run" for a run with no usable
+provenance (one that was mid-flight when the rule deployed, or claimed by an older
+api). The reason is shown from the first evaluation, after the isolated egress lane
+blocker and before the manual cordon, owner hold and stale-requeue pin reasons;
+the account prerequisites above still take precedence. The named reason nudges
+once when a stale-requeue pin or draining or maintenance hold that was already
+explaining the wait ends, or, for a hold that began in another quiet state (leaving
+a maintenance intake pause, a Codex admission wait or a reserve), once at the
+affinity ceiling after the run's last update, and not at all when that ceiling had
+already passed when the episode began. The unavailable reason never resolves
+itself, so it nudges on entering it from any state (the nudge cooldown still
+applies). Neither reason starts with "waiting until", so `queue.waiting` and
+`fleet.capacity` count these runs as genuine waits: a routine drain of the last
+worker of a Codex run can raise `queue.waiting` while no nudge is sent. The Slack
+nudge text for `waiting_worker` ("still waiting for a worker to pick it up") does
+not match the unavailable reason; this is a known inconsistency. Owner action: wait
+for the named worker, or `uzi run cancel <id>`.
+
 A queued run whose previous worker is draining or in active maintenance instead shows
 "waiting until <time, RFC3339 UTC> for its previous worker <name> to finish draining or
 maintenance; another worker may take it after that" (the name is omitted when empty).

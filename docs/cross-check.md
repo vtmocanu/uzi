@@ -187,7 +187,10 @@ generation and round, deadline, protocol, vault, credential, checker-slot and
 worker eligibility requirements still apply.
 
 The lead's worker is preferred. Another eligible worker of the same user may
-claim the child after `WORKER_AFFINITY_GRACE` (default 2 minutes). A cordoned
+claim the child after `WORKER_AFFINITY_GRACE` (default 2 minutes), except a Codex
+child that has already been claimed (generation 1 or later): it stays held for the
+worker that last claimed it and fails at its deadline as usual if that worker does
+not return ([ADR-4476](../adr/4476-codex-claim-provenance.md)). A cordoned
 worker may still claim its own pinned child; maintenance fences and worker
 quarantine remain authoritative. An ephemeral worker may check its bound lead
 or the child it was provisioned for, but cannot take another lead's child.

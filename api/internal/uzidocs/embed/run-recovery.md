@@ -1206,6 +1206,35 @@ Recovery archives and [job files](./jobs.md#job-files) live in the same database
 
 The owner and instance recovery quotas in the table above still apply on top of the shared budget. If you raise the budget or either store's quota, size the database volume for the budget plus your ordinary data ([Configuration](./configuration.md#job-files-and-product-skill-sets-prd-1909)). The design is recorded in [ADR-1909](../adr/1909-stored-file-budget.md).
 
+## Codex runs held for their last worker
+
+A Codex run that has been claimed at least once is claimed again only by the
+worker recorded as having claimed it in its current generation (issue #4476,
+[ADR-4476](../adr/4476-codex-claim-provenance.md)). The stale-requeue grace,
+the affinity ceiling, a deleted owner row, immediate affinity escape on a
+complete guarded history and the cross-check exemption do not release it to
+another worker, including a new ephemeral one. Claude runs and Codex runs that
+were never claimed are unchanged. The run shows `waiting_worker` with a reason
+naming the worker, or saying the predecessor provenance is unavailable; see
+[Run health](./admin-health.md) and
+[Codex credentials](./codex-credentials.md#a-codex-run-held-for-its-last-worker).
+Owner action: wait for the named worker, or `uzi run cancel <id>`.
+
+Upgrade and rollback:
+
+- **Upgrade.** There is no backfill. Every Codex run at generation 1 or later
+  when the change deploys has no recorded claimant, so it is held at its next
+  fresh claim, even on its own worker. A run that its worker is still running in
+  its current flight keeps going through readoption; otherwise cancel it.
+- **Rollback.** There is no in-database rollback fence. While an api from
+  before this change serves claims, nothing gates Codex claims, so any worker
+  can take such a run and that interval is unprotected. After you upgrade again,
+  a Codex run claimed by the older api has a stale record, is held, and cannot be
+  re-recorded; cancel it. Rolling the migration back drops the records.
+- **Not covered.** A held run does not prove that its previous flight has
+  ended; Claude runs and the forge token have the same gap, and a restarted
+  worker is admitted for its own earlier run ([ADR-4476](../adr/4476-codex-claim-provenance.md)).
+
 ## Custody: why a worker won't disappear
 
 While a run's committed work is unpublished and not yet durably captured
@@ -1593,6 +1622,9 @@ reachability. Immediate escape from ordinary worker affinity requires
 complete immutable guarded positive FINAL/source dispositions for
 generations 1..G and no open hold in any generation; missing, nonguarded,
 multiple/conflicting-source or local-only evidence remains protected.
+That escape does not apply to a Codex run that has been claimed at least once:
+it stays with the worker that last ran it (see
+[Codex runs held for their last worker](#codex-runs-held-for-their-last-worker)).
 An available archive alone does not establish that complete history.
 Resume preserves custody and cooldown and does not promise execution.
 Export an archive when one is available; a forge park does not promise one.
