@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -176,10 +177,16 @@ type pwVariant struct {
 }
 
 func pwVariants() []pwVariant {
+	dockerPlacement := dockerTestConfig()
+	dockerPlacement.NodeSelector = map[string]string{"kubernetes.io/arch": "amd64"}
+	dockerPlacement.Tolerations = uziTaint
+	dockerPlacement.NewPlacementNodeSelector = map[string]string{"pool": "new"}
+	dockerPlacement.NewPlacementTolerations = newPlacementTaint
 	return []pwVariant{
 		{"newPlacement-off", testConfig(), desired("w1")},
 		{"newPlacement-on", placementConfig(), desired("w1")},
 		{"docker", dockerTestConfig(), desiredDocker("w1")},
+		{"docker-newPlacement-on", dockerPlacement, desiredDocker("w1")},
 	}
 }
 
@@ -286,7 +293,7 @@ func pwClaimUIDs(t *testing.T, f *pwFix) map[string]string {
 }
 
 func TestPausedPacedRestoreResumesAfterAdmission(t *testing.T) {
-	for _, v := range pwVariants()[:2] {
+	for _, v := range pwVariants() {
 		t.Run(v.name, func(t *testing.T) {
 			f, _, peer := pwHeldFleet(t, v, time.Minute)
 			created := m5Now.Add(-time.Minute)
@@ -355,7 +362,11 @@ func TestPausedPacedRestoreResumesAfterAdmission(t *testing.T) {
 			}
 
 			// Binding clears it.
-			for _, name := range []string{dataPVCName("w1"), nixPVCName("w1")} {
+			bind := []string{dataPVCName("w1"), nixPVCName("w1")}
+			if v.worker.Docker {
+				bind = append(bind, dindDataPVCName("w1"))
+			}
+			for _, name := range bind {
 				p := npPVC(t, f.client, f.ns, name)
 				p.Status.Phase = corev1.ClaimBound
 				if _, err := f.client.CoreV1().PersistentVolumeClaims(f.ns).UpdateStatus(context.Background(), p, metav1.UpdateOptions{}); err != nil {
@@ -696,6 +707,89 @@ func runPWRow(t *testing.T, v pwVariant, row pwRow) {
 	}
 	if row.scGets != nil && total != *row.scGets {
 		t.Errorf("StorageClass reads = %d (%v), want %d", total, gets, *row.scGets)
+	}
+}
+
+// pwObserveFault observes a worker holding aged Pending WFFC claims, a labelled worker pod
+// carrying a real container fault that mounts every claim, and the given replica count.
+func pwObserveFault(t *testing.T, v pwVariant, replicas int32, status corev1.ContainerStatus) (reconcile.ObservedWorker, string) {
+	t.Helper()
+	w := evidence(v.worker, m5Now)
+	ns := pwWorkerNS(v.cfg, w)
+	dep, pvcs := pwTarget(t, v.cfg, w, 15*time.Minute)
+	dep.Spec.Replicas = &replicas
+	var claims []string
+	objs := []runtime.Object{dep, pwClass(pwWFFC, pwMode(storagev1.VolumeBindingWaitForFirstConsumer))}
+	for _, p := range pvcs {
+		claims = append(claims, p.Name)
+		objs = append(objs, p)
+	}
+	pod := pwPod("p1", ns, objectLabels("w1"), claims...)
+	pod.Annotations = map[string]string{AnnotationSpecHash: "retained-old-template"}
+	pod.Status = corev1.PodStatus{Phase: corev1.PodPending, ContainerStatuses: []corev1.ContainerStatus{status}}
+	objs = append(objs, pod)
+	var logs strings.Builder
+	m := New(enforcingClient(t, objs...), v.cfg, testResolver(t), nil, DrainPolicy{}, RecyclePolicy{Enabled: true}, slog.New(slog.NewTextHandler(&logs, nil)))
+	m.now = func() time.Time { return m5Now }
+	observed, err := m.Observe(reconcile.WithDesiredWorkers(context.Background(), []protocol.DesiredWorker{w}))
+	if err != nil {
+		t.Fatalf("Observe: %v", err)
+	}
+	for i := range observed {
+		if observed[i].ID == "w1" {
+			return observed[i], logs.String()
+		}
+	}
+	t.Fatalf("worker not observed: %+v", observed)
+	return reconcile.ObservedWorker{}, ""
+}
+
+// A worker pod with a real container fault keeps the exemption out of the way: the claims
+// still time out, and the fault evidence deriveRollHealth recorded (restart count, last
+// exit code, target image) survives flagStrandedPVCs exactly as it does without the paused
+// evidence.
+func TestPausedPacedRestoreTimeoutExemptionPreservesFaultEvidence(t *testing.T) {
+	exit1 := int32(1)
+	faults := []struct {
+		name         string
+		status       corev1.ContainerStatus
+		wantRestarts int32
+		wantExit     *int32
+	}{
+		{"CrashLoopBackOff", corev1.ContainerStatus{Name: workerContainerName, RestartCount: 4,
+			State:                corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"}},
+			LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 1, Reason: "Error"}}}, 4, &exit1},
+		{"ImagePullBackOff", corev1.ContainerStatus{Name: workerContainerName,
+			State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "ImagePullBackOff"}}}, 0, nil},
+	}
+	for _, v := range pwVariants() {
+		for _, f := range faults {
+			t.Run(v.name+"/"+f.name, func(t *testing.T) {
+				held, logs := pwObserveFault(t, v, 0, f.status)
+				base, _ := pwObserveFault(t, v, 1, f.status)
+				if len(held.TimeoutDeferredClaims) != 0 {
+					t.Errorf("claims deferred despite a labelled worker pod: %v", held.TimeoutDeferredClaims)
+				}
+				if held.Roll.Phase != protocol.PhaseStuck || !strings.Contains(held.Roll.BlockingReason, "bind-timeout") {
+					t.Errorf("roll = %+v, want stuck with the bind-timeout reason", held.Roll)
+				}
+				if !strings.Contains(logs, "pvc-bind-timeout worker=w1 pvc="+nixPVCName("w1")+" ") {
+					t.Errorf("missing pvc-bind-timeout line:\n%s", logs)
+				}
+				if held.Roll.RestartCount != f.wantRestarts {
+					t.Errorf("RestartCount = %d, want %d", held.Roll.RestartCount, f.wantRestarts)
+				}
+				if (held.Roll.LastExitCode == nil) != (f.wantExit == nil) || (f.wantExit != nil && *held.Roll.LastExitCode != *f.wantExit) {
+					t.Errorf("LastExitCode = %v, want %v", held.Roll.LastExitCode, f.wantExit)
+				}
+				if held.Roll.TargetImage == "" {
+					t.Errorf("TargetImage lost: %+v", held.Roll)
+				}
+				if !reflect.DeepEqual(held.Roll, base.Roll) {
+					t.Errorf("roll differs with paused evidence:\n held %+v\n base %+v", held.Roll, base.Roll)
+				}
+			})
+		}
 	}
 }
 

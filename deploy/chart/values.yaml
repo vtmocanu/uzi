@@ -560,8 +560,9 @@ workers:
   # (for example where a cluster admin owns RBAC) and expansion fails closed: the
   # controller logs class-lookup-forbidden and leaves every existing claim untouched.
   # The same read lets the controller confirm WaitForFirstConsumer for the paused-restore
-  # bind-timeout exemption (#4468); with it disabled the exemption does not apply and a
-  # waiting paced restore's claims can be reported stranded.
+  # bind-timeout exemption (#4468); with it disabled the exemption does not apply, a
+  # waiting paced restore's claims can be reported stranded after the bind timeout, and
+  # that report holds the restore's roll pool until the claims bind.
   storageClassRead:
     create: true
 

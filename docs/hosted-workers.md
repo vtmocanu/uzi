@@ -750,7 +750,8 @@ Caveats:
   admitted, and a pin change can cancel one while the worker stays at zero. Until the worker
   is admitted again its claims can still be reported stranded after the bind timeout, and
   the report alone does not distinguish that wait from a storage fault. The class read needs `workers.storageClassRead.create`
-  (default `true`); without it, a waiting restore's claims can be reported stranded. Claim
+  (default `true`); without it, a waiting restore's claims can be reported stranded after the bind
+  timeout, and that report holds the restore's roll pool until the claims bind. Claim
   ages are never reset: after replicas are restored the original age applies, so a brief
   `stuck` until the volume binds is expected. Waiting alone is not grounds to delete or
   recreate claims repeatedly, bypass pacing, force-roll or remove reservations. Pending
