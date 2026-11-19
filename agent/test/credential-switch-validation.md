@@ -1184,7 +1184,8 @@ U table and crash-point table of section 2, or sections 3 and 5 above. Credited 
 ### Deferred m3 checklist (unvalidated, uncontrolled or unclassified)
 
 - [ ] Admission refusals: pool_wait, terminal statuses, pinned-without-secret,
-      lane, no-live-worker, unsupported-worker and foreign-subscription refusals.
+      lane, no-live-worker, unsupported-worker and foreign-subscription refusals; the no-write snapshot comparison, the
+      stamp SQL's own status filter and the non-live-run copies (no control).
 - [ ] Same flight/generation/worktree: effects beyond the five U2 injections and
       the fresh_B return.
 - [ ] Strict persistence: pending-absent-before, other ownership legs, the
@@ -1199,11 +1200,16 @@ U table and crash-point table of section 2, or sections 3 and 5 above. Credited 
 - [ ] Policy under the apply lock: concurrent lock-order contention.
 - [ ] Lease/intent/lock order: per-account lock isolation, the target account's
       intent check, the refresh admission's binding recheck in isolation and
-      global lock sorting.
+      global lock sorting; the "no A call after reconcile" assertions (asserted
+      only) and other writers.
 - [ ] Final reauthorization: the API-key A path and the vault-locked branch after
-      a switch.
+      a switch; an apply committing after the final reauthorization and before
+      the response can still return A's token (one point of the window
+      controlled).
 - [ ] Transactional apply: per-statement server-error returns, the empty
-      AccessToken check and the caller's deferred rollback.
+      AccessToken check and the caller's deferred rollback; storage and
+      power-loss durability (process-loss model only) and concurrent-reader
+      isolation beyond Postgres READ COMMITTED (not claimed).
 - [ ] Ordinal/attribution: per-field baseline comparisons, the epoch<=0 refusal,
       the uncommitted-ordinal and generation-scope clamp branches on the Codex
       path, and cross-generation spend joins.
@@ -1219,9 +1225,9 @@ U table and crash-point table of section 2, or sections 3 and 5 above. Credited 
 - [ ] Stopped pending input: paused-run carve-out variants, cancel/reject_plan
       under the cutoff and the cutoff's run correlation.
 - [ ] Wall budget: the RunTimeout value, the future-started_at clamp and the
-      production default.
-- [ ] Stopped nonce: a NULL snapshot nonce and the UTF-8 check at the route
-      (supporting only, uncredited); claim generation: the reconciled
+      production default; the awaiting_* statuses.
+- [ ] Stopped nonce: a NULL snapshot nonce and the UTF-8 check at the service
+      entry (supporting only, uncredited); claim generation: the reconciled
       `*g <= 0` copy.
 - [ ] Stopped binding identity beyond ownership (no predicate clause).
 - [ ] Stopped ownership/policy: paused-origin replay under concurrency, op-less
@@ -1233,12 +1239,16 @@ U table and crash-point table of section 2, or sections 3 and 5 above. Credited 
       and case aliases beyond D25–D56.
 - [ ] Decision 11 (same worker): other auth directions, the `kind` half of the
       gate, the re-hold variant, observable discard of delivered material, and
-      zero executor bodies, provider launches and requests before the proof
-      (asserted only).
+      zero executor bodies, provider launches and requests before the proof,
+      including on the forced leaves (asserted only).
 - [ ] Token absence: the executor's second log registration and the surfaces
       that are guardless by construction; `flight.runScopedSecrets.push`; the
-      withdrawn target's and both secrets' absence from the stopped
-      acknowledgement, server log, run messages and inputs (asserted only).
+      withdrawn target's absence from the stopped acknowledgement and server
+      log, and both secrets' absence from run messages and inputs (asserted
+      only).
+- [ ] Authorities: the cookie-session path distinct from CLI Bearer (not found
+      in ledger) and fresh-claim mint on the same worker (not separately
+      controlled).
 - [ ] Publication (U20): plan and intent summaries (untested); wait-time
       effect unmeasured.
 - [ ] Crash point 3: U6 crash controls ran through the crash-during-login
@@ -1249,7 +1259,7 @@ U table and crash-point table of section 2, or sections 3 and 5 above. Credited 
       (reviewer check, not evidenced).
 - [ ] Clauses that fit no proof class ("owner batch" in the ledger): beyond the
       binding-identity and guardless token-surface lines above, the ledger's
-      U15/U19 owner-batch prose (cross-user worker, egress-lane laneMismatch,
+      U15 not-credited and U19 owner-batch items (cross-user worker, egress-lane laneMismatch,
       the two `GetRunOwnedByWorkerForUpdate` copies, and the uncredited
       token surfaces).
 - [ ] Two unledgered authorities, with no Clause-accounting row and no ledger
