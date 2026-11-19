@@ -293,7 +293,10 @@ passed when the episode began. A held run outside any window (for example after 
 normal Resume onto a live worker) nudges on the first health tick, ignoring the
 young-run grace, and counts in `queue.waiting`. The unavailable reason never resolves
 itself, so it nudges on entering it from any state (the nudge cooldown still
-applies). None of these reasons starts with "waiting until", so `queue.waiting` and
+applies). Known timing limitation, deferred from #4500: if stale grace overlaps
+an owner hold that clears after grace expires, the nudge can fire before the
+intended ceiling fallback. Admission, custody and run state are unaffected.
+None of these reasons starts with "waiting until", so `queue.waiting` and
 `fleet.capacity` count these runs as genuine waits: a routine drain of the last
 worker of a Codex run can raise `queue.waiting` while no nudge is sent. The Slack
 nudge text for `waiting_worker` ("still waiting for a worker to pick it up") does

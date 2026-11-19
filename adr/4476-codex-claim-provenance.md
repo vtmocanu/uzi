@@ -185,6 +185,12 @@ for the unavailable reason:
   any state (the nudge cooldown still applies). This is a deliberate exception to
   D12.
 
+Known timing limitation, deferred from #4500: if stale-requeue grace overlaps an
+owner hold and that hold clears after grace expires, the expired stale window
+can trigger the nudge before the intended ceiling fallback. Distinguishing that
+history from a stale-only episode needs a follow-up design. Admission, custody
+and run state are unaffected.
+
 Alarm effect: `queue.waiting` and `fleet.capacity` exclude only reasons `LIKE
 'waiting until %'`, and their code is unchanged. Held runs therefore now count as
 genuine waits, so a routine worker drain can trip `queue.waiting` while the Slack
