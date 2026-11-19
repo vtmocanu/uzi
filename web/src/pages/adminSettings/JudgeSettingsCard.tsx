@@ -137,7 +137,7 @@ export function JudgeSettingsCard({
             &middot; users may override.
           </span>{" "}
           <a href="#model-defaults" className="text-brand hover:underline">
-            Model defaults <span aria-hidden="true">&uarr;</span>
+            Model defaults<span aria-hidden="true"> &uarr;</span>
           </a>
         </div>
 
