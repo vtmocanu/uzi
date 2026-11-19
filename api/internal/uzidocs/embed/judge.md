@@ -28,8 +28,9 @@ Your admin enables the feature globally under **Admin → Instance →
 Run judge**. Once that's on, open **Settings → Run defaults → Run judge** and check
 **Judge my finished runs**. Admins can also force-enable or force-disable the
 judge for any individual user from **Admin → Users**. See
-[Admin settings](./admin-settings.md#run-judge) for the full set of
-instance-wide judge controls.
+[Admin settings](./admin-settings.md#run-judge) for the instance-wide judge
+controls, and [Instance model defaults](./admin-settings.md#instance-model-defaults)
+for the instance judge models.
 
 Opting in also means your instance admin can see your recommendations: they
 get an attribution-hidden aggregate across every user's — your name, your

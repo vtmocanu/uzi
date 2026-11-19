@@ -23,11 +23,12 @@ function instanceModelParts(
   return builtin ? { model: builtin, note: " (built-in)" } : { model: "", note: "built-in" };
 }
 
-// InstanceModel renders one "<Family> <model><note>" pair, kept on one line.
+// InstanceModel renders one "<Family> <model><note>" pair. As an inline block it moves to the
+// next line whole when it fits there, and a long custom id still breaks inside the strip.
 function InstanceModel({ family, parts }: { family: string; parts: { model: string; note: string } }) {
   return (
-    <span className="whitespace-nowrap">
-      {family} {parts.model && <span className="font-mono text-fg">{parts.model}</span>}
+    <span className="inline-block max-w-full">
+      {family} {parts.model && <span className="break-all font-mono text-fg">{parts.model}</span>}
       {parts.note}
     </span>
   );

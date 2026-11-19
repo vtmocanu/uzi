@@ -113,8 +113,8 @@ the lane of its own harness. The four keys are `judge_model`,
   ID)**, and an invalid ID (interior spaces, control or format characters, or
   too long) or an empty custom ID is blocked before save, with a message
   beneath the picker. An unchanged stored value does not block saving the other
-  lanes. A Claude judge lane holding a Codex id shows a **Not a Claude model**
-  warning; choose **Default** to clear it. Model keys store values trimmed, and
+  lanes. A Claude lane (judge or summary) holding a Codex id shows a **Not a
+  Claude model** warning; choose **Default** to clear it. Model keys store values trimmed, and
   a whitespace-only value stores empty and reads as source `default`. The Codex judge lane
   (`codex_judge_model`) takes curated Codex ids only. The Codex summary lane
   (`codex_summary_model`) takes the Codex role models, including `gpt-6-luna`,
@@ -147,8 +147,8 @@ are set in the **Instance model defaults** card, see
 [Instance model defaults](#instance-model-defaults). The card shows the current
 choice as a read-only **Instance default: Claude … · Codex … · users may
 override.** line with a link to **Model defaults**. The judge's recommendations
-feed self-improvement; pin a cheaper alias like `haiku` or `sonnet` to spend
-less. This switch only arms the feature instance-wide; each user still opts in
+feed self-improvement; pin a cheaper alias like `haiku` or `sonnet` in
+**Instance model defaults** to spend less. This switch only arms the feature instance-wide; each user still opts in
 under their own Settings, and the judge always spends that user's own credential
 for the harness it runs on (each user's [Judge runs on](./judge.md#judge-runs-on)
 choice, default the reviewed run's harness), never the admin's and never charged
