@@ -5,10 +5,11 @@
 //    plus class hooks the CSS section "Sidebar icon motion" in index.css animates. At rest the
 //    glyph draws exactly like the icons.tsx original (a browser test rasterizes both and
 //    compares pixels).
-//      Copy rule: the original path data stays byte-identical and visible at rest (splitting a
-//      path changes antialiasing, which the pixel comparison catches), and the
-//      moving part is a separate copy with inline opacity="0". While playing, the keyframes hide
-//      the affected original (class nm-orig) and show the copy, so nothing is drawn twice.
+//      Copy rule: where a moving part shares a path with a stationary part, the original path
+//      data stays byte-identical and visible at rest (splitting a path changes antialiasing,
+//      which the pixel comparison catches), and the moving part is a separate copy with inline
+//      opacity="0". While playing, the keyframes hide that original (class nm-orig) and show
+//      the copies, so nothing is drawn twice. Other parts may move the original element itself.
 //  - useNavIconMotion: the gesture hook. It only toggles the `nm-play` class on the row's svg;
 //    every animation rule is gated in CSS by the root `data-motion="on"` attribute and by
 //    prefers-reduced-motion, and this hook re-checks both before playing.

@@ -160,10 +160,13 @@ describe.each(RAILS)("%s rail: gestures start real CSS animations", (rail) => {
           // would not land on it again. Park focus on a sentinel that precedes the row, then Tab.
           const sentinel = document.createElement("button");
           document.body.prepend(sentinel);
-          sentinel.focus();
-          await userEvent.tab();
-          expect(document.activeElement, `${def.key} focus repeat lands on the link`).toBe(m.link);
-          sentinel.remove();
+          try {
+            sentinel.focus();
+            await userEvent.tab();
+            expect(document.activeElement, `${def.key} focus repeat lands on the link`).toBe(m.link);
+          } finally {
+            sentinel.remove();
+          }
         } else {
           await gesture(m);
         }
@@ -201,6 +204,10 @@ describe.each(RAILS)("%s rail: gestures start real CSS animations", (rail) => {
     await cdp().send("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", clickCount: 1 });
     try {
       expect(m.link.matches(":active"), "link is :active").toBe(true);
+      expect(
+        allAnims(m.svg).some((a) => typeof CSSTransition !== "undefined" && a instanceof CSSTransition),
+        "the :active transition is running",
+      ).toBe(true);
       for (const a of cssAnims(m.svg)) a.finish();
       await awaitRest(m.svg);
     } finally {
@@ -208,7 +215,7 @@ describe.each(RAILS)("%s rail: gestures start real CSS animations", (rail) => {
     }
   });
 
-  it("plays nothing with data-motion off",{ timeout: 120000 }, async () => {
+  it("plays nothing with data-motion off", { timeout: 120000 }, async () => {
     setMotion("off");
     for (const def of DEFS) {
       const m = mount(def.key, rail);
@@ -250,6 +257,19 @@ describe.each(RAILS)("%s rail: gestures start real CSS animations", (rail) => {
       await emulateReducedMotion(true);
       cleanup();
       await userEvent.unhover(document.body);
+    }
+  });
+
+  it("the stylesheet itself gates on prefers-reduced-motion: a hand-added play class animates nothing", async () => {
+    await emulateReducedMotion(true);
+    for (const def of DEFS) {
+      const m = mount(def.key, rail);
+      // Bypass the hook: only the CSS media query can stop this.
+      m.svg.classList.add(PLAY);
+      await frames();
+      expect(allAnims(m.svg), `${def.key} hand-added`).toHaveLength(0);
+      m.svg.classList.remove(PLAY);
+      cleanup();
     }
   });
 
@@ -481,6 +501,28 @@ describe("stationary geometry while a part moves", () => {
       if (getComputedStyle(beam).transform !== "none") moved = true;
     }
     expect(moved, "beam moved").toBe(true);
+  });
+
+  it("workers: each rack LED is drawn exactly once at every moment, accent in its own half", async () => {
+    const m = mount("workers", "expanded");
+    const orig = q(m.svg, ".nm-orig");
+    const led1 = q(m.svg, ".nm-led1");
+    const led2 = q(m.svg, ".nm-led2");
+    await hover(m.link);
+    const shown = (el: Element) => (Number(getComputedStyle(el).opacity) > 0 ? 1 : 0);
+    for (const t of [100, 400, 600, 830, 1000, 1245, 1500, 1650]) {
+      seek(m.svg, t);
+      // The original holds both LEDs; it is hidden for the whole play, so each copy must show.
+      expect(shown(orig), `orig @${t}`).toBe(0);
+      expect(shown(led1), `led1 @${t}`).toBe(1);
+      expect(shown(led2), `led2 @${t}`).toBe(1);
+    }
+    seek(m.svg, 100);
+    expect(getComputedStyle(led1).strokeWidth, "led1 accent @100").toBe("4px");
+    expect(getComputedStyle(led2).strokeWidth, "led2 plain @100").toBe("2px");
+    seek(m.svg, 1000);
+    expect(getComputedStyle(led1).strokeWidth, "led1 plain @1000").toBe("2px");
+    expect(getComputedStyle(led2).strokeWidth, "led2 accent @1000").toBe("4px");
   });
 
   it("findings: the body never transforms while the legs rock", async () => {

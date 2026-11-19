@@ -519,12 +519,12 @@ html[data-pinned-block] {
    no-preference media query AND under the root `data-motion="on"` attribute (stamped from the
    user's Appearance setting), so with the setting off, or under prefers-reduced-motion,
    nothing here matches and no animation runs; turning the setting off, or reduced motion on,
-   mid-flight cancels a play in progress. All animations are finite and use fill-mode none: after the last frame the svg
-   is back to its plain rest glyph. Each icon's total (parts, repeats, delays) is 0.7s to 1.8s.
-   Only svg parts move; the icon's wrapper span and the collapsed-rail dots never transform.
-   Where a glyph has a moving copy (class nm-orig hides the original, the copy starts
-   identical), nothing is drawn twice. Accent colour comes from here, never from an SVG
-   attribute: rgb(var(--brand)). */
+   mid-flight cancels a play in progress. All animations are finite and use fill-mode none:
+   after the last frame the svg is back to its plain rest glyph. Each icon's total (parts,
+   repeats, delays) is 0.7s to 1.8s. Only svg parts move; the icon's wrapper span and the
+   collapsed-rail dots never transform. Where a glyph has a moving copy (class nm-orig hides
+   the original, the copy starts identical), nothing is drawn twice. Accent colour comes from
+   here, never from an SVG attribute: rgb(var(--brand)). */
 @media (prefers-reduced-motion: no-preference) {
   @keyframes nm-hide { from, to { opacity: 0; } }
   @keyframes nm-show { from, to { opacity: 1; } }
@@ -600,12 +600,21 @@ html[data-pinned-block] {
   @keyframes nm-twinkle { 0%, 79%, 100% { opacity: 1; transform: none; } 24% { opacity: .2; transform: scale(.5); } 55% { opacity: 1; transform: scale(1.3); } }
   @keyframes nm-twinkle2 { 0%, 21%, 100% { opacity: 1; transform: none; } 45% { opacity: .2; transform: scale(.5); } 76% { opacity: 1; transform: scale(1.3); } }
 
-  /* Workers 2 x 830ms steps: the two rack LEDs blink in the accent, one after the other
-     (the original LED path hides for the whole play, so only the copies show). */
+  /* Workers 2 x 830ms: the two rack LEDs blink in the accent, one after the other. The
+     original LED path hides for the whole play; each copy runs the full duration (the delay is
+     in its keyframes) and is always drawn: accent and wider in its own half, plain otherwise. */
   :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="workers"] .nm-orig { animation: nm-hide var(--nm-d) linear; }
-  :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="workers"] .nm-led { stroke: rgb(var(--brand)); stroke-width: 4; animation: nm-led 830ms steps(1, end); }
-  :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="workers"] .nm-led2 { animation-delay: 830ms; }
-  @keyframes nm-led { 0%, 50% { opacity: 1; } 51%, 100% { opacity: 0; } }
+  :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="workers"] .nm-led1 { animation: nm-led1 var(--nm-d) linear; }
+  :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="workers"] .nm-led2 { animation: nm-led2 var(--nm-d) linear; }
+  @keyframes nm-led1 {
+    0%, 49.9% { opacity: 1; stroke: rgb(var(--brand)); stroke-width: 4; }
+    50%, 100% { opacity: 1; stroke: currentColor; stroke-width: 2; }
+  }
+  @keyframes nm-led2 {
+    0%, 49.9% { opacity: 1; stroke: currentColor; stroke-width: 2; }
+    50%, 99.9% { opacity: 1; stroke: rgb(var(--brand)); stroke-width: 4; }
+    100% { opacity: 1; stroke: currentColor; stroke-width: 2; }
+  }
 
   /* Judge 1220ms damped: the beam and both pans tilt left, right, then settle; the post holds. */
   :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="judge"] .nm-orig { animation: nm-hide var(--nm-d) linear; }
