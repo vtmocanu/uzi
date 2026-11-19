@@ -829,6 +829,31 @@ While no canary exists the pool can stay held:
   marker. Deleting that Deployment replaces this hold, usually with the
   missing-deployment guard above.
 
+A pool with exactly two incomplete canary reservations is normally held with
+`duplicate canary reservations unresolved; explicit recovery required`. The
+controller cancels one of them on its own only when it is provably stale: its
+Deployment is at zero replicas with no pod, PVC or claim attributable to that
+worker, its reservation no longer matches its deployed template and it has
+drifted from the target, and it is not custody-held, under maintenance, busy or
+hibernating. The other canary must be current: one replica, not stuck, with the
+reservation, deployed template and rendered target all matching, and no claim
+mirror. The rest of the pool and namespace must also be clean (no hibernating,
+waking, unavailable or blocked worker, no uncertainty, migration or layout fence,
+no unplanned worker, no stray or ambiguous reservation, no same-owner canary
+outside the pool). The controller then makes one metadata-only cancellation of the
+stale reservation, holds the pool with `duplicate canary cancelled for absent
+worker; re-observation required` for that tick, and resumes normal roll planning
+on the next. This grants the surviving canary no promotion proof. A conflicting
+or unconfirmed write keeps the hold and is reported as an error.
+
+The pool stays held with the unresolved-duplicate reason when any of those
+conditions fails: the absent worker is already on the target template, a worker is
+waking from hibernation, the surviving canary is absent, terminating, stuck or
+otherwise not current, or there are three or more canaries or two live ones. To
+recover such a pool, remove the stale `uzi.dev/image-roll` annotation from the
+absent worker's Deployment; the worker then re-enters the roll as a fresh drifted
+participant.
+
 Design: [ADR-1470](../adr/1470-paced-hosted-worker-rolls.md).
 
 `workers.drainDeadline` / `UZI_WORKER_DRAIN_DEADLINE` retains its `24h` default and
