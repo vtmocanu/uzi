@@ -1270,10 +1270,18 @@ file), the freeze proceeds with the refused head as the current source and the
 ordinary held publication and final custody transfer release the hold. The
 gate is checked again before capture, before the held publish and before every
 final disposition, and a write-once seal fixes the evidence before the first
-final disposition is sent. On the cap path, after the terminal import no later fetch for that
-generation can add a refused head. Deleting a generation's local state removes
+final disposition is sent. A sealed final is checked again even when the
+current evidence has since disappeared; empty evidence is a mismatch and
+custody is kept. After the terminal import on the cap path, and after a
+successful terminal import of a run that has refusal evidence or is at the cap,
+no later fetch for that generation can add a refused head; ordinary below-cap
+runs are unchanged. Deleting a generation's local state removes
 its refusal refs and records only after the acknowledged final source covers
-them; any change in the evidence keeps everything locally.
+them and the cleanup intent proves itself (its digest equals the seal's, every
+listed stage belongs to the run at a matching generation no later than the
+released one, and no ledger entry was rebound to another generation, including a
+later one); any change in the evidence keeps everything locally. Admissions
+are kept by cleanup.
 
 **These runs keep the hold and stay with the owner** (`uzi run recovery`,
 `uzi run export` or `uzi run discard`):
@@ -1282,19 +1290,22 @@ them; any change in the evidence keeps everything locally.
   another worker, a run whose history spans a worker-process restart (while durable refusal
   evidence exists or its pins stay at the cap), or a generation whose admission
   write failed;
-- a refusal whose refused-head ref and ledger writes both failed on a path
-  without a fetch stage, followed by a worker restart and pins that later
-  reconcile below the cap: nothing durable records that head, so the ordinary
-  release proceeds without proving it covered (a known residual, not yet accepted by the owner);
-- a later generation of a run after an earlier generation's cleanup, which
-  cannot cap-release automatically;
+- a run for which recording a refusal failed (seal-directory read, refused-head
+  ref write or ledger write): a durable, never-cleaned
+  `incomplete-<run>.json` marker keeps the gate ineligible across restarts, and
+  the census counts it as `refusal_records`. Only if the marker write also
+  fails, on a path without a fetch stage, followed by a worker restart and pins
+  that later reconcile below the cap, does nothing durable record that head, so
+  the ordinary release proceeds without proving it covered (a known residual,
+  not yet accepted by the owner);
 - a refusal under a legacy or no-generation context, whose hold and cleanup stay
   closed permanently;
 - a bare with a stranded temp file in `info/uzi-refusals`, which keeps the gate
   ineligible.
 
-`uzi run discard` does not remove refusal refs or records; they stay reachable
-in the worker's bare. In a mixed fleet an older worker may treat a bare holding
+`uzi run discard` does not remove refusal refs, records, incomplete markers or
+admissions; they stay reachable in the worker's bare (no worker-side run discard
+exists). In a mixed fleet an older worker may treat a bare holding
 these records as disposable and leak the nested refs and records. The gate
 is consulted on every inventory-guarded release, but it is a no-op when the
 run has no refusal evidence and is below the cap, so releases with no refusal evidence below the cap
