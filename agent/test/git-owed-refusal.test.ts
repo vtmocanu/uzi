@@ -514,6 +514,41 @@ describe("issue4481 recording failure latch", { timeout: 300_000 }, () => {
       assert.deepEqual(await cache.refusalReleaseGate(bare, "other-run", 1, cover), { kind: "none" });
     });
   }
+  /** A cap refusal of an unseen head with `inject` active only while the chokepoint runs. */
+  async function refuseWith(inject: (restore: () => void) => () => void): Promise<{ kept: string[]; head: string }> {
+    const kept = await atCap();
+    assert.equal(await cache.admitRefusalProvenance(ctx), "written");
+    const head = commitTree("unseen head", false);
+    toBare(head);
+    const restore = inject(() => {});
+    try { await assert.rejects(cache["pinOwedUnderLock"](ctx, head, "P4"), /owed candidate limit/); }
+    finally { restore(); }
+    return { kept, head };
+  }
+  it("a one-shot failure of the seal check latches the run for the process lifetime", async () => {
+    const internals = cache as unknown as { refusalNames: (barePath: string) => Promise<string[]> };
+    const { kept, head } = await refuseWith(() => {
+      const original = internals.refusalNames.bind(cache);
+      let calls = 0;
+      internals.refusalNames = async (barePath) => { if (calls++ === 0) throw new Error("injected seal-check failure"); return original(barePath); };
+      return () => { internals.refusalNames = original; };
+    });
+    assert.equal(refusalFiles().some((n) => n.startsWith("refusals-")), false, "the failed seal check recorded nothing");
+    assert.deepEqual(await gate(coverOf([...kept, head])), { kind: "ineligible", reason: "refusal recording failed in this process" });
+  });
+  it("a refused-ref write that does not read back is a failed write", async () => {
+    const internals = cache as unknown as { runGit: (cwd: string, args: string[], ...rest: unknown[]) => Promise<string> };
+    const { kept, head } = await refuseWith(() => {
+      const original = internals.runGit.bind(cache);
+      // The write "succeeds" but leaves nothing behind, so the read-back finds no ref.
+      internals.runGit = async (cwd, args, ...rest) =>
+        args[0] === "update-ref" && String(args[1]).includes("/refused-") ? "" : original(cwd, args, ...rest);
+      return () => { internals.runGit = original; };
+    });
+    assert.equal(incomingRefs().some((r) => r.includes("/refused-")), false);
+    assert.deepEqual(readJson(ledgerName).entries.map((e: any) => e.sha), [head], "the ledger entry alone was written");
+    assert.deepEqual(await gate(coverOf([...kept, head])), { kind: "ineligible", reason: "refusal recording failed in this process" });
+  });
   it("the writes are independent: a failed ref write still ledgers the head", async () => {
     const { head } = await refuseWithFailure(true, false);
     assert.deepEqual(readJson(ledgerName).entries.map((e: any) => e.sha), [head]);
