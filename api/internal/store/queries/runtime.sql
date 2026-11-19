@@ -8627,12 +8627,15 @@ ON CONFLICT (worker_id, run_id) DO UPDATE SET
 -- unflagged snapshot uses to reopen claiming before expiry.
 -- Issue #4395: a snapshot-carrying run-lane claim also passes the held receipt time and the
 -- snapshot's register nonce; memory_authority_held_at is set only when the receipt is given and
--- the nonce equals the row's current snapshot_register_nonce (the registration fence), otherwise
--- it is left unchanged. Every other caller passes NULL receipt and leaves the column alone.
+-- the nonce equals the row's current snapshot_register_nonce (the registration fence) and no
+-- memory-authority loss is recorded for this registration (issue #4492: a loss is sticky until
+-- Register, so a receipt never coexists with it), otherwise it is left unchanged. Every other
+-- caller passes NULL receipt and leaves the column alone.
 UPDATE workers SET
     memory_authority_held_at = CASE
         WHEN sqlc.narg(memory_authority_held_at)::timestamptz IS NOT NULL
          AND snapshot_register_nonce = sqlc.narg(held_register_nonce)::text
+         AND memory_authority_lost_at IS NULL
         THEN sqlc.narg(memory_authority_held_at)::timestamptz
         ELSE memory_authority_held_at END,
     snapshot_epoch         = @snapshot_epoch,

@@ -29612,6 +29612,7 @@ UPDATE workers SET
     memory_authority_held_at = CASE
         WHEN $1::timestamptz IS NOT NULL
          AND snapshot_register_nonce = $2::text
+         AND memory_authority_lost_at IS NULL
         THEN $1::timestamptz
         ELSE memory_authority_held_at END,
     snapshot_epoch         = $3,
@@ -29639,8 +29640,10 @@ type SetWorkerSnapshotStateParams struct {
 // unflagged snapshot uses to reopen claiming before expiry.
 // Issue #4395: a snapshot-carrying run-lane claim also passes the held receipt time and the
 // snapshot's register nonce; memory_authority_held_at is set only when the receipt is given and
-// the nonce equals the row's current snapshot_register_nonce (the registration fence), otherwise
-// it is left unchanged. Every other caller passes NULL receipt and leaves the column alone.
+// the nonce equals the row's current snapshot_register_nonce (the registration fence) and no
+// memory-authority loss is recorded for this registration (issue #4492: a loss is sticky until
+// Register, so a receipt never coexists with it), otherwise it is left unchanged. Every other
+// caller passes NULL receipt and leaves the column alone.
 func (q *Queries) SetWorkerSnapshotState(ctx context.Context, arg SetWorkerSnapshotStateParams) (int64, error) {
 	result, err := q.db.Exec(ctx, setWorkerSnapshotState,
 		arg.MemoryAuthorityHeldAt,

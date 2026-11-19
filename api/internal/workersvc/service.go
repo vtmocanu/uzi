@@ -3541,7 +3541,14 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 	// protection off needs no cached DEK. ClaimRun is scoped to wkr.UserID. A queued run
 	// sits indefinitely by design (no sweep touches status='queued'); the next
 	// unlock lets it claim within one poll cycle.
+	//
+	// Issue #4492: the gate returns before the claim transaction, where the memory-authority
+	// report is normally persisted, so a locked owner's workers would never earn a held receipt
+	// (and the warm-reserve policy would never count them ready). persistMemoryAuthorityVaultLocked
+	// records just that report (best effort, worker row only; no claim, snapshot apply or secrets)
+	// before the poll reports idle.
 	if s.vlt != nil && s.vlt.RequiresUnlock(ctx, wkr.UserID) {
+		s.persistMemoryAuthorityVaultLocked(ctx, wkr, snapshot, lane, report)
 		return nil, nil // idle: owner locked
 	}
 
