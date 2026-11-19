@@ -442,9 +442,20 @@ describe("rest geometry", () => {
     // before this feature), so swapping an icon in navItems.tsx without updating the sidebar
     // glyph fails here.
     expect(Object.keys(SIDEBAR_MOTION_ICONS).sort()).toEqual(DEFS.map((d) => d.key).sort());
+    // rasterize() forces both SVGs to SIZE x SIZE, so first pin the intrinsic sizing it would
+    // hide (a 1em -> 2em width change would otherwise widen the rail icon unnoticed).
+    const sizing = (markup: string) => {
+      const holder = document.createElement("div");
+      holder.innerHTML = markup;
+      const svg = holder.querySelector("svg")!;
+      return ["width", "height", "viewBox"].map((k) => `${k}=${svg.getAttribute(k)}`).join(" ");
+    };
     for (const def of DEFS) {
-      const a = await rasterize(renderToStaticMarkup(def.icon as ReactElement));
-      const b = await rasterize(renderToStaticMarkup(SIDEBAR_MOTION_ICONS[def.key]!()));
+      const origMarkup = renderToStaticMarkup(def.icon as ReactElement);
+      const glyphMarkup = renderToStaticMarkup(SIDEBAR_MOTION_ICONS[def.key]!());
+      expect(sizing(glyphMarkup), `${def.key} intrinsic size`).toBe(sizing(origMarkup));
+      const a = await rasterize(origMarkup);
+      const b = await rasterize(glyphMarkup);
       let inked = 0;
       for (let i = 0; i < a.length; i += 4) if (a[i] !== 255 || a[i + 1] !== 255 || a[i + 2] !== 255) inked++;
       expect(inked, `${def.key} draws something`).toBeGreaterThan(50);
