@@ -138,6 +138,11 @@ type Materializer struct {
 	// sleeping for ten minutes. Defaulted in New; overridden directly by tests,
 	// which live in this package.
 	now func() time.Time
+	// refusals is this tick's per-worker size refusals / PVC rejections (PRD #4213),
+	// reset at the start of every Reconcile and read by the fleet report. See
+	// recordRefusal.
+	refusalMu sync.Mutex
+	refusals  map[string]reconcile.Refusal
 }
 
 // New builds a Materializer. cordoner may be nil, which disables cordoning (a busy
@@ -165,7 +170,25 @@ func (m *Materializer) resolveWorker(w protocol.DesiredWorker) (preset.Spec, err
 			DinDDataGiB:          r.DinDDataGiB,
 		}
 	}
-	return m.resolver.ResolveDesired(w.Template, w.Size, res)
+	spec, err := m.resolver.ResolveDesired(w.Template, w.Size, res)
+	if err != nil {
+		var invalid *preset.InvalidResourcesError
+		if errors.As(err, &invalid) {
+			err = &RefusedError{Reason: fmt.Sprintf("size refused: invalid %s %d", invalid.Field, invalid.Value)}
+		}
+	} else {
+		err = m.checkSizeCeilings(w, spec)
+	}
+	if err != nil {
+		var refused *RefusedError
+		if errors.As(err, &refused) {
+			// Recorded here, at the one resolve seam, so every call site (render, roll
+			// planning, drain, migration, claim expansion) reports the same refusal.
+			m.recordRefusal(w.ID, protocol.BlockingKindSizeRefused, refused.Reason)
+		}
+		return preset.Spec{}, err
+	}
+	return spec, nil
 }
 
 // Observe lists the worker namespace and partitions it by PROVENANCE.
@@ -724,6 +747,7 @@ func (m *Materializer) flagOrphan(kind, name, ns string) {
 // FULL desired list, before anything is resolved or rendered, so no later failure
 // can silently shrink it.
 func (m *Materializer) Reconcile(ctx context.Context, desired []protocol.DesiredWorker, observed []reconcile.ObservedWorker) error {
+	m.resetRefusals()
 	// Pass 1: the desired set. EVERY id, unconditionally — no resolve, no render, no
 	// error can remove one from here.
 	desiredIDs := make(map[string]bool, len(desired))
@@ -1069,6 +1093,7 @@ func (m *Materializer) ensurePVCs(ctx context.Context, w protocol.DesiredWorker,
 		}
 		created, err := m.client.CoreV1().PersistentVolumeClaims(ns).Create(ctx, pvc, metav1.CreateOptions{})
 		if err != nil && !apierrors.IsAlreadyExists(err) {
+			m.recordPVCRejection(w.ID, pvc.Name, err)
 			return false, fmt.Errorf("create pvc %s: %w", pvc.Name, err)
 		}
 		if err != nil && placementSet {
@@ -1133,6 +1158,13 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 
 	spec, err := m.resolveWorker(w)
 	if err != nil {
+		if IsRefused(err) {
+			// Same posture as an unknown preset: render nothing, touch nothing, keep the
+			// worker desired. The reason reaches the fleet report via recordRefusal.
+			m.log.Warn("desired worker's size is refused; skipping its RENDER only (its existing objects are deliberately left alone)",
+				"worker_id", w.ID, "reason", err.Error())
+			return nil
+		}
 		if preset.IsUnknown(err) {
 			// Log and skip RENDERING. The worker stays desired (see Reconcile's contract),
 			// so its existing objects are untouched and it is picked up the moment this

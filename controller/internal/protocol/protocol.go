@@ -316,6 +316,17 @@ const (
 	PhaseSettled = "settled"
 )
 
+// BlockingKind values the controller emits for a worker it will not (or cannot) render
+// because of an admin-defined size (PRD #4213). They ride WorkerStatus.BlockingKind on a
+// PhaseStuck row with PodPhase "" (no pod is involved).
+const (
+	// BlockingKindSizeRefused: the size's integers are invalid or exceed a tier ceiling,
+	// so nothing is rendered for the worker; its existing objects are left alone.
+	BlockingKindSizeRefused = "size_refused"
+	// BlockingKindPVCRejected: the apiserver rejected a claim create for the worker.
+	BlockingKindPVCRejected = "pvc_rejected"
+)
+
 // WorkerStatus is one hosted worker's roll health.
 //
 // The pointer fields are pointers because their zero values are meaningful: a

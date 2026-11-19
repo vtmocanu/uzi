@@ -122,6 +122,12 @@ func main() {
 		// at boot, just below.
 		MaxPVCStorage:               cfg.WorkerMaxPVCStorage,
 		DockerMaxPVCStorage:         cfg.WorkerDockerMaxPVCStorage,
+		MaxCPU:                      cfg.WorkerMaxCPU,
+		MaxMemory:                   cfg.WorkerMaxMemory,
+		DockerMaxCPU:                cfg.WorkerDockerMaxCPU,
+		DockerMaxMemory:             cfg.WorkerDockerMaxMemory,
+		IsolatedMaxCPU:              cfg.WorkerIsolatedMaxCPU,
+		IsolatedMaxMemory:           cfg.WorkerIsolatedMaxMemory,
 		ServiceAccountName:          cfg.WorkerServiceAccount,
 		APIURL:                      cfg.WorkerAPIURL,
 		StorageClass:                cfg.WorkerStorageClass,
