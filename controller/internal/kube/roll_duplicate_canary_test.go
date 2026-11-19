@@ -24,10 +24,12 @@ import (
 // so no current-incarnation proof is possible; its claim is limited to the period while
 // the canary is unproven.
 //
-// Non-vacuity: the cases pin the in-place rewrite itself. With the retarget arm
-// disabled, the following arms cancel and re-admit the entries instead (w1's Nonce
-// changes, w2/w3 lose their reservations), so the Nonce and the participants'
-// retargeted markers asserted below fail rather than pass through another arm.
+// Non-vacuity: the cases pin the in-place rewrite itself. In the first case, with the
+// retarget arm disabled, the pin-cancellation arm cancels and re-admits w1 (its canary
+// bit and Nonce change) and cancels w2/w3, so the w1 and participant assertions fail.
+// In the second case w1 has no Deployment, and the retained-pin replacement arm would
+// write an identical mirror marker; that arm marks the pin changed and holds the pool,
+// so the tick-1 pacing-reason assertion (and the w2/w3 in-place checks) fail instead.
 
 // canaryHolders lists every Deployment and data-PVC mirror whose decoded roll marker
 // has Canary=true, as "kind/name".
@@ -134,7 +136,7 @@ func TestRetargetedNonCurrentCanaryNeverYieldsSecondCanary(t *testing.T) {
 			o.at(id).RollEvidence.RegisteredVersion = &v
 		}
 		for i := 4; i <= 6; i++ {
-			_ = o.tick(t)
+			o.mustTick(t)
 			o.assertSingleCanary(t, fmt.Sprintf("tick %d", i))
 		}
 		// The retargeted canary completed at the new version and the cohort closed:
@@ -179,8 +181,17 @@ func TestRetargetedNonCurrentCanaryNeverYieldsSecondCanary(t *testing.T) {
 		if err != nil || m2 == nil {
 			t.Fatalf("tick 1: w1 mirror marker unreadable: %v %+v", err, m2)
 		}
+		// The retarget reopens the completed history as an incomplete canary at the new
+		// version, keeping its nonce.
 		if m2.TargetVersion != newVersion || !m2.Canary || m2.Completed || m2.Nonce != mk.Nonce {
-			t.Fatalf("tick 1: mirror not retargeted in place as an incomplete canary (completed history reopened): %+v", m2)
+			t.Fatalf("tick 1: mirror not retargeted in place as an incomplete canary: %+v", m2)
+		}
+		// The retained-pin replacement arm writes an identical mirror marker but marks the
+		// pin changed and holds the pool; the retarget arm does not.
+		for _, id := range []string{"w1", "w2", "w3"} {
+			if _, _, reason, _ := o.pacing(id); reason == "roll target pin changed; pool held until reservations settle" {
+				t.Fatalf("tick 1: %s held by the retained-pin replacement arm, not the mapping retarget", id)
+			}
 		}
 		o.assertParticipantRetargeted(t, "tick 1", "w2", newVersion)
 		o.assertParticipantRetargeted(t, "tick 1", "w3", newVersion)
