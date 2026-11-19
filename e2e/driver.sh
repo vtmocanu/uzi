@@ -60,6 +60,7 @@ _FAILED_PROVIDES=""   # space-padded list of provides tokens of phases that FAIL
 # mutate THESE, never function-locals).
 # (No associative arrays, namerefs or ${x,,}: this file must run on bash 3.2.)
 _KN_K=(); _KN_V=()            # known residue: key / slug of the boundary that first reported it
+_CANCEL_ATTEMPTED=" "         # actual requests only; an unsent cancel may be tried later
 _contaminated=""              # space-prefixed slugs of phases whose boundary FAILed
 _bw_slugs=(); _bw_start=(); _bw_end=(); _bw_total=()
 # Per-boundary scratch.
@@ -223,8 +224,10 @@ _b_reason() { _B_REASONS+=("$1"); }
 _b_read() {
   local label="$1" sql="$2" secs="$3" stem="$4" rc=0
   _B_OUT="$(db_psql_rows "$sql" "$secs" 2> "$stem.stderr")" || rc=$?
-  printf '%s\n' "$rc" > "$stem.exit"
-  printf '%s\n' "$_B_OUT" > "$stem.out"
+  if ! printf '%s\n' "$rc" > "$stem.exit" || ! printf '%s\n' "$_B_OUT" > "$stem.out"; then
+    _b_reason "unverifiable $label (evidence write failed)"
+    return 1
+  fi
   if [ "$rc" -ne 0 ]; then
     case "$rc" in
       124|137) _b_reason "unverifiable $label (timed out, exit $rc)" ;;
@@ -325,19 +328,20 @@ _b_count_new() {
   done
 }
 
-# _b_cancel_new — cancel each NEW undeclared non-terminal run, ONCE per boundary, through
-# boundary_cancel bounded by the remaining seconds. Known runs are never re-cancelled. A
+# _b_cancel_new — cancel each undeclared non-terminal run at most ONCE per driver, through
+# boundary_cancel bounded by the remaining seconds. Attempted runs are never re-cancelled. A
 # non-2xx or transport failure is sticky (FAIL even if the run later turns terminal).
 _b_cancel_new() {
   local k id rem pre rc ex code
   for k in ${_R_KEYS[@]+"${_R_KEYS[@]}"}; do
     case "$k" in run:*) ;; *) continue ;; esac
-    [ -z "$(_known_get "$k")" ] || continue
     id="${k#run:}"
+    ! _in_set "$_CANCEL_ATTEMPTED" "$id" || continue
     ! _in_set "$_B_CANC" "$id" || continue
     _B_CANC="$_B_CANC$id "
     rem="$(_b_rem)"
     if [ "$rem" -le 0 ]; then _b_reason "cancel not sent run=$id (deadline exhausted)"; continue; fi
+    _CANCEL_ATTEMPTED="$_CANCEL_ATTEMPTED$id "
     pre="$_bdir/cancel-$id"
     rc=0
     boundary_cancel "/api/runs/$id/inputs" "$rem" "$pre" || rc=$?
@@ -377,8 +381,10 @@ _boundary_begin() {
   local t0 stem k id
   t0="$(date +%s)"
   _bdir="$RUNROOT/boundary/$1"
-  rm -rf "$_bdir"; mkdir -p "$_bdir"
   _OWNER=""; _BASE=" "; _B_REASONS=()
+  if ! rm -rf "$_bdir" || ! mkdir -p "$_bdir"; then
+    _b_reason "unverifiable boundary evidence (staging unavailable)"
+  fi
   if [ -z "${ADMIN_EMAIL:-}" ] || [[ "$ADMIN_EMAIL" == *\'* ]]; then
     _b_reason "unverifiable owner (ADMIN_EMAIL unusable)"
   elif _b_read owner "SELECT id FROM users WHERE email = '$ADMIN_EMAIL'" 10 "$_bdir/begin-owner"; then
@@ -424,17 +430,14 @@ _boundary_end() {
 
   while :; do
     _B_N=$((_B_N + 1))
-    if [ "$final" -eq 1 ]; then
-      # Snapshot the previous sample's rows: a final-window read that runs out of budget
-      # must not erase what the last complete read of that kind showed.
-      sv_sr=(${_B_SR[@]+"${_B_SR[@]}"}); sv_sw=(${_B_SW[@]+"${_B_SW[@]}"}); sv_sh=(${_B_SH[@]+"${_B_SH[@]}"})
-      sv_obs="$_B_HOLD_OBS"; sv_ok="$_B_HOLDS_OK"; n0=${#_B_REASONS[@]}
-    fi
+    # Every sample can exhaust the budget, including one outside the final window.
+    sv_sr=(${_B_SR[@]+"${_B_SR[@]}"}); sv_sw=(${_B_SW[@]+"${_B_SW[@]}"}); sv_sh=(${_B_SH[@]+"${_B_SH[@]}"})
+    sv_obs="$_B_HOLD_OBS"; sv_ok="$_B_HOLDS_OK"; n0=${#_B_REASONS[@]}
     _B_BUDGET=" "
     _b_sample
-    if [ "$final" -eq 1 ] && [ "$_B_BUDGET" != " " ]; then
-      # Only the READS that ran out of budget fall back to the previous sample's rows; their
-      # read-budget reasons become the timeout. Successful reads, and every cancel reason
+    if [ "$_B_BUDGET" != " " ]; then
+      # Only the READS that ran out of budget fall back to the previous sample's rows; in
+      # the final window their read-budget reasons become the timeout. Successful reads, and every cancel reason
       # (rejected, timed out, not sent), stand.
       ! _in_set "$_B_BUDGET" runs || _B_SR=(${sv_sr[@]+"${sv_sr[@]}"})
       ! _in_set "$_B_BUDGET" workers || _B_SW=(${sv_sw[@]+"${sv_sw[@]}"})
@@ -442,7 +445,7 @@ _boundary_end() {
       kept=()
       for ((i = 0; i < ${#_B_REASONS[@]}; i++)); do
         k="${_B_REASONS[$i]}"
-        if [ "$i" -ge "$n0" ]; then
+        if [ "$final" -eq 1 ] && [ "$i" -ge "$n0" ]; then
           case "$k" in
             "unverifiable runs ("*|"unverifiable workers ("*|"unverifiable holds ("*)
               case "$k" in *"(deadline exhausted before read)"|*"(timed out, exit "*) continue ;; esac ;;
@@ -451,10 +454,12 @@ _boundary_end() {
         kept+=("$k")
       done
       _B_REASONS=(${kept[@]+"${kept[@]}"})
-      # The final observation is incomplete, so the boundary cannot be clean: FAIL and say
+      # This observation is incomplete, so the boundary cannot be clean: FAIL and say
       # which reads went unread (their previous rows are still reported as residue).
-      b="${_B_BUDGET# }"; _b_reason "final sample incomplete: ${b% } unread"
-      printf 'final sample out of budget:%s(previous rows kept for those reads)\n' "$_B_BUDGET" > "$_bdir/final-budget.txt" 2>/dev/null || true
+      b="${_B_BUDGET# }"
+      if [ "$final" -eq 1 ]; then _b_reason "final sample incomplete: ${b% } unread"
+      else _b_reason "sample incomplete: ${b% } unread"; fi
+      printf 'sample out of budget:%s(previous rows kept for those reads)\n' "$_B_BUDGET" > "$_bdir/final-budget.txt" 2>/dev/null || true
       fbud=1
     fi
     _b_residue
@@ -505,7 +510,7 @@ _boundary_end() {
       if [ -z "$(_known_get "$k")" ]; then _KN_K+=("$k"); _KN_V+=("$slug"); fi
     done
     for ((i = 0; i < ${#_KN_K[@]}; i++)); do printf '%s\t%s\n' "${_KN_K[$i]}" "${_KN_V[$i]}"; done \
-      | sort > "$_bdir/known-residue.txt"
+      | sort > "$_bdir/known-residue.txt" || _B_MESSAGE="$_B_MESSAGE; boundary evidence write failed"
   else
     _B_MESSAGE=""
     # A run the boundary cancelled that then settled is not residue: keep the trace in the
@@ -546,8 +551,9 @@ _boundary_history() {
   while IFS= read -r id; do ids+=("'$id'"); done < <(printf '%s\n' $hs | sort -u)
   list="$(_join ',' "${ids[@]}")"
   out="$(db_psql_rows "SELECT id, run_id, generation, state, final_disposition, release_evidence FROM recovery_custody_holds WHERE id IN ($list)" 5 2> "$_bdir/history.stderr")" || rc=$?
-  printf '%s\n' "$rc" > "$_bdir/history.exit"
-  printf '%s\n' "$out" > "$_bdir/history.out"
+  if ! printf '%s\n' "$rc" > "$_bdir/history.exit" || ! printf '%s\n' "$out" > "$_bdir/history.out"; then
+    _B_HISTORY="release evidence unavailable (evidence write failed)"; return 0
+  fi
   if [ "$rc" -ne 0 ]; then _B_HISTORY="release evidence unavailable (exit $rc)"; return 0; fi
   while IFS= read -r line; do
     bars="${line//[^|]/}"
@@ -743,13 +749,13 @@ for f in "$_PHASES_DIR"/[0-9][0-9]-*.sh; do
       declare -p "$v"
     done > "$RUNROOT/phase.env.next"
     # The declared handoff / handoff-holds variables cross the same way, so the driver's
-    # top-level shell can read them for the boundary. An unset name declares nothing and a
+    # top-level shell can read them for the boundary. An unset name clears the parent's
+    # inherited value, and a
     # name already in `provides` is not emitted twice.
     for v in $handoff $handoff_holds; do
       case "$v" in env:*) continue ;; esac
       case " $provides " in *" $v "*) continue ;; esac
-      [ -n "${!v+x}" ] || continue
-      declare -p "$v"
+      if [ -n "${!v+x}" ]; then declare -p "$v"; else printf 'unset %s\n' "$v"; fi
     done >> "$RUNROOT/phase.env.next"
   ) > "$RUNROOT/logs/$nn_slug.log" 2>&1
   rc=$?

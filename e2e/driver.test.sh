@@ -34,6 +34,10 @@ cat > "$FAKES" <<'FAKES_EOF'
 say()  { printf '\n\033[1m==> %s\033[0m\n' "$1"; }
 pass() { printf '  \033[32mPASS\033[0m %s\n' "$1"; }
 fail() { printf '  \033[31mFAIL\033[0m %s\n' "$1"; exit 1; }
+mkdir() {
+  if [ "${FAKE_STAGE_FAILURE:-}" = yes ] && [[ "$*" == *"/boundary/"* ]]; then return 1; fi
+  command mkdir "$@"
+}
 
 # A VIRTUAL CLOCK. The boundary measures time with `date +%s` and waits with `sleep`; the
 # fakes below replace both with a counter in $FAKE_SEQ/.clock that only `sleep` advances. A
@@ -88,6 +92,9 @@ db_psql_rows() {
   if [ "$key" != capture ]; then fake_seq "$key" || rc=$?; fi
   # FAKE_RUNS_SLEEP=N: a runs read costs N virtual seconds (a slow DB on a real clock).
   if [ "$key" = runs ] && [ -n "${FAKE_RUNS_SLEEP:-}" ]; then sleep "$FAKE_RUNS_SLEEP"; fi
+  if [ "$key" = runs ] && [ -f "$FAKE_SEQ/${_bdir##*/}.runs-cost" ]; then
+    sleep "$(sed -n "$(cat "$FAKE_SEQ/.cnt.${_bdir##*/}.runs")p" "$FAKE_SEQ/${_bdir##*/}.runs-cost")"
+  fi
   printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "${_bdir##*/}" "$key" "${2:-}" \
     "${FAKE_ROWS//$'\n'/;}" "$1" >> "$FAKE_Q_LOG"
   if [ "$key" = owner ] && [ -n "${FAKE_OWNER_SLEEP:-}" ]; then sleep "$FAKE_OWNER_SLEEP"; fi
@@ -177,7 +184,7 @@ begin() { cur="$1"; case_fail=0
   printf '%s' 1000000 > "$FAKE_SEQ/.clock"
   : > "$ENVFILE"; : > "$FAKE_API_LOG"; : > "$FAKE_DB_LOG"; : > "$FAKE_Q_LOG"
   unset E2E_ONLY E2E_SKIP E2E_FAULT_PHASE E2E_BOUNDARY_TIMEOUT E2E_BOUNDARY_INTERVAL \
-    FAKE_CANCEL_CODE FAKE_CANCEL_EXIT FAKE_DOCKER_SEQ FAKE_OWNER_SLEEP FAKE_RUNS_SLEEP 2>/dev/null || true
+    FAKE_CANCEL_CODE FAKE_CANCEL_EXIT FAKE_DOCKER_SEQ FAKE_OWNER_SLEEP FAKE_RUNS_SLEEP FAKE_STAGE_FAILURE 2>/dev/null || true
   # A small boundary budget (virtual seconds, see the fake clock); a case needing more sets its own.
   export E2E_BOUNDARY_TIMEOUT=2 E2E_BOUNDARY_INTERVAL=1
 }
@@ -1413,6 +1420,82 @@ contains "$(row_msg bdeclare FAIL)" "still present from aleak: worker=$W1 run=$R
 [ "$(qcount runs 11-bdeclare)" -eq 1 ] && [ "$(qcount workers 11-bdeclare)" -eq 1 ] || bad "B sampled known run/worker more than once"
 [ "$(grep -c '^cancel ' "$FAKE_API_LOG")" -eq 1 ] || bad "B cancelled the known run again"
 [ "$(bw_field bdeclare 3)" -le 1 ] || bad "B waited again for the known run/worker"
+end
+
+begin "case37a: a known run whose cancellation was unsent gets one later attempt" 37a
+export E2E_BOUNDARY_TIMEOUT=3 E2E_BOUNDARY_INTERVAL=2 FAKE_RUNS_SLEEP=1
+seqp 10-partial runs "$R1" "$R2"
+seqp 11-retry runs "$R2"
+seqp 12-later runs "$R2"
+for ph in 10-partial 11-retry 12-later; do
+  mkphase "$PHASES_DIR/$ph.sh" "$ph" no "" "" "" <<'BODY'
+pass "body ok"
+BODY
+done
+run_driver 37a
+contains "$(row_msg partial FAIL)" "cancel not sent run=$R2" || bad "setup did not exhaust the cancellation budget"
+[ "$(grep -c "cancel /api/runs/$R2/inputs" "$FAKE_API_LOG")" -eq 1 ] || bad "unsent cancellation not attempted exactly once later"
+contains "$(row_msg retry FAIL)" "still present from partial: run=$R2" || bad "lost original attribution"
+[ "$(qcount runs 11-retry)" -eq 1 ] || bad "waited again for known run"
+end
+
+begin "case37b: a non-final exhausted sample preserves the previous worker rows" 37b
+export E2E_BOUNDARY_TIMEOUT=4 E2E_BOUNDARY_INTERVAL=1
+seqp 10-slow runs "-" "-"
+seqp 10-slow runs-cost 0 3
+seqp 10-slow workers "$W1|$R1|1"
+seqp 11-later workers "$W1|$R1|1"
+for ph in 10-slow 11-later; do
+  mkphase "$PHASES_DIR/$ph.sh" "$ph" no "" "" "" <<'BODY'
+pass "body ok"
+BODY
+done
+run_driver 37b
+contains "$(row_msg slow FAIL)" "worker=$W1 run=$R1 generation=1" || bad "exhausted sample erased worker"
+contains "$(row_msg later FAIL)" "still present from slow: worker=$W1" || bad "worker was not remembered"
+[ "$(qcount workers 11-later)" -eq 1 ] || bad "later boundary waited again"
+end
+
+begin "case37c: unavailable staging still records the phase FAIL and summary" 37c
+export FAKE_STAGE_FAILURE=yes
+mkphase "$PHASES_DIR/10-stage.sh" "staging failure" no "" "" "" <<'BODY'
+pass "body still runs"
+BODY
+run_driver 37c
+has_row stage FAIL || bad "missing FAIL row: $(cat "$TSV")"
+contains "$(row_msg stage FAIL)" "staging unavailable" || bad "staging failure not named"
+contains "$(cat "$LOG")" "body still runs" || bad "body skipped"
+[ -f "$RUNROOT/junit.xml" ] || bad "summary was abandoned"
+end
+
+begin "case37d: failed known-residue evidence write does not abandon results" 37d
+seqf holds "-" "$H1|$R1|1"
+mkphase "$PHASES_DIR/10-stage.sh" "staging write failure" no "" "" "" <<'BODY'
+mkdir "$RUNROOT/boundary/10-stage/known-residue.txt"
+pass "body ok"
+BODY
+run_driver 37d
+has_row stage FAIL || bad "missing FAIL row: $(cat "$TSV")"
+contains "$(row_msg stage FAIL)" "evidence write failed" || bad "evidence failure not named"
+[ -f "$RUNROOT/junit.xml" ] || bad "summary was abandoned"
+end
+
+begin "case37e: an unset required handoff clears its inherited value in the parent" 37e
+seqp 10-first runs "$R1"
+seqp 11-unsets runs "$R1"
+mkphase "$PHASES_DIR/10-first.sh" "retain a handoff" no "" RUN_X RUN_X <<BODY
+RUN_X=$R1
+pass "body ok"
+BODY
+mkphase "$PHASES_DIR/11-unsets.sh" "unset a required handoff" no RUN_X "" RUN_X <<'BODY'
+unset RUN_X
+pass "body ok"
+BODY
+run_driver 37e
+has_row first PASS || bad "retained handoff did not round-trip"
+has_row unsets FAIL || bad "unset handoff was still exempted"
+contains "$(row_msg unsets FAIL)" "run=$R1" || bad "unset run not named"
+[ "$(grep -c '^cancel ' "$FAKE_API_LOG")" -eq 1 ] || bad "unset handoff did not lose its exemption"
 end
 
 printf '\ncases=%s passed=%s\n' "$cases" "$passed"

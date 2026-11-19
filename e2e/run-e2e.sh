@@ -160,6 +160,13 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# Refuse before any scratch directory, build or stack mutation. Bounded boundary
+# reads must never silently fall back to an unbounded docker exec.
+if ! command -v timeout >/dev/null 2>&1 && ! command -v gtimeout >/dev/null 2>&1; then
+  echo 'error: E2E requires GNU timeout or gtimeout on PATH (coreutils)' >&2
+  exit 2
+fi
+
 # --- layout ------------------------------------------------------------------
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EXECUTOR="${UZI_E2E_EXECUTOR:-stub}"

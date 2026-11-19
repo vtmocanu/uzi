@@ -95,6 +95,8 @@ printf '#!/bin/sh\nexit 3\n' > "$DBR_DIR/compose-fail"
 printf '#!/bin/sh\nexec sleep 30\n' > "$DBR_DIR/compose-sleep"
 printf '#!/bin/sh\nprintf "row1\\r\\nINSERT 0 1\\nrow2\\n"\n' > "$DBR_DIR/compose-ok"
 chmod +x "$DBR_DIR"/compose-*
+mkdir -p "$DBR_DIR/bin"
+for t in grep cut tr awk; do ln -sf "$(command -v "$t")" "$DBR_DIR/bin/$t"; done
 # dbr_case NAME COMPOSE SECS-or-"" EXPECT(ok|fail) [OUT] [MAXSECS]
 dbr_case() {
   local name="$1" comp="$2" secs="$3" expect="$4" want="${5:-}" max="${6:-}" rc=0 out start elapsed ok=1
@@ -102,6 +104,15 @@ dbr_case() {
   start=$SECONDS
   out="$(
     set +o pipefail
+    # Functional checks need no host coreutils. Keep the real kill control separate.
+    if [ "$comp" != compose-sleep ]; then
+      PATH="$DBR_DIR/bin"
+      timeout() {
+        [ "$1" = --signal=KILL ] && [ "$2" = "$secs" ] || return 98
+        shift 2
+        "$@"
+      }
+    fi
     ENVFILE="$DBR_DIR/dbr.cfg"; PGPW=""; COMPOSE=("$DBR_DIR/$comp")
     if [ -n "$secs" ]; then db_psql_rows "SELECT 1" "$secs"; else db_psql_rows "SELECT 1"; fi
   )" || rc=$?
@@ -117,14 +128,16 @@ dbr_case() {
 }
 dbr_case "db_psql_rows: a failing compose is a non-zero status (caller pipefail off)" compose-fail "" fail
 dbr_case "db_psql_rows: a failing compose is non-zero with a SECS bound too" compose-fail 5 fail
-dbr_case "db_psql_rows: a hung exec is killed at SECS and fails within a bound" compose-sleep 1 fail "" 5
+if command -v timeout >/dev/null 2>&1 || command -v gtimeout >/dev/null 2>&1; then
+  dbr_case "db_psql_rows: a hung exec is killed at SECS and fails within a bound" compose-sleep 1 fail "" 5
+else
+  echo 'SKIP: real timeout process-kill control (requires host timeout or gtimeout)'
+fi
 dbr_case "db_psql_rows: SECS leaves rows intact and strips the command tag" compose-ok 5 ok $'row1\nrow2'
 dbr_case "db_psql_rows: no SECS behaves as before" compose-ok "" ok $'row1\nrow2'
 dbr_case "db_psql_rows: SECS=0 is refused" compose-ok 0 fail
 dbr_case "db_psql_rows: a non-integer SECS is refused" compose-ok abc fail
 cases=$((cases + 1))
-mkdir -p "$DBR_DIR/bin"
-for t in grep cut tr awk; do ln -sf "$(command -v "$t")" "$DBR_DIR/bin/$t"; done
 rc=0
 # shellcheck disable=SC2034  # ENVFILE/PGPW are read by the real db_psql_rows extracted from lib.sh
 err="$( ( set +o pipefail; PATH="$DBR_DIR/bin"; ENVFILE="$DBR_DIR/dbr.cfg"; PGPW=""; COMPOSE=("$DBR_DIR/compose-ok"); db_psql_rows "SELECT 1" 5 ) 2>&1 >/dev/null )" || rc=$?
@@ -132,6 +145,17 @@ if [ "$rc" -ne 0 ] && [ "$err" = "db_psql_rows: no timeout limiter" ]; then
   passed=$((passed + 1)); echo "PASS: db_psql_rows: no timeout limiter is refused, not run unbounded"
 else
   echo "FAIL: db_psql_rows: no-limiter case (rc=$rc err=[$err])"
+fi
+
+cases=$((cases + 1))
+printf '#!/bin/sh\necho docker-was-called\n' > "$DBR_DIR/bin/docker"
+chmod +x "$DBR_DIR/bin/docker"
+rc=0
+err="$(PATH="$DBR_DIR/bin" /bin/bash "$ROOT/e2e/run-e2e.sh" --e2e-sanitized 2>&1)" || rc=$?
+if [ "$rc" -eq 2 ] && [ "$err" = 'error: E2E requires GNU timeout or gtimeout on PATH (coreutils)' ]; then
+  passed=$((passed + 1)); echo 'PASS: run-e2e refuses a missing timeout limiter before stack startup'
+else
+  echo "FAIL: run-e2e limiter preflight (rc=$rc err=[$err])"
 fi
 
 # boundary_cancel PATH SECS PREFIX: a fake `curl` records its arguments and answers

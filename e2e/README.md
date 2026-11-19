@@ -12,7 +12,7 @@ side; this exercises the real wire).
 ./e2e/run-e2e.sh
 ```
 
-Requirements: Docker + Compose v2, and `openssl`, `jq`, `git`, `curl` on the
+Requirements: Docker + Compose v2, GNU `timeout` or `gtimeout` (coreutils), and `openssl`, `jq`, `git`, `curl` on the
 host — plus **`go`** (the PRD #97 M2 CLI leg builds `api/cmd/uzi` on the host and
 drives the running api with it). **Docker Engine >= 25** is recommended: the overlay's healthchecks set
 `start_interval: 1s` (probe every second during `start_period`), which trims the
@@ -21,6 +21,11 @@ the field, so the suite still runs correctly — just a few seconds slower per b
 First run builds the `api`/`web`/`agent` images plus the tiny `forge-fake` image
 (a few minutes); later runs reuse the layer cache. On success it prints
 `All E2E checks passed.` and tears everything down.
+
+The entrypoint checks for the timeout limiter before building or starting the stack.
+Without it, bounded database reads refuse to run. The hermetic helper tests supply a
+fake limiter for argument and status checks; their real process-kill control runs only
+when a host limiter is available (otherwise it prints an explicit SKIP).
 
 Fresh startup first verifies the default optional policy: the seed admin is Off
 (`mode=unprotected`, `unlocked=false`, `exists=false`) and its token uses
@@ -179,6 +184,11 @@ DB write. Residue still present in the last sample, or any such error, FAILs the
 failed)` noted, since a failed body's declarations are not trusted). An undeclared run the
 boundary cancelled that then settled does not fail the phase; the PASS row's message
 records it.
+
+A run reported after its cancellation budget was exhausted remains attributed to its
+original phase. A later boundary may send its first cancellation request; an actual
+attempt is never repeated. Reads that exhaust the budget retain the last successful
+rows for that relation and fail the boundary as incomplete.
 
 Declarations are phase-header lines naming variables the body set, not values:
 
