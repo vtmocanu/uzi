@@ -155,10 +155,10 @@ func (h *Handler) mountAdminRoutes(r chi.Router, forgeLimiter, authLimiter *mw.L
 		})
 		// Hosted worker sizes (PRD #4213 M2): the editor's read. Browser-session only (PRD: no
 		// new CLI-readable route), so any Bearer, uza_ included, 401s before the handler.
-		// RequireAdminRO keeps a read-only admin's web session able to see the editor.
+		// Cookie-only so no CLI token can read it; any admin browser session may read.
 		r.Group(func(r chi.Router) {
 			r.Use(h.requireAuth())
-			r.Use(mw.RequireAdminRO)
+			r.Use(mw.RequireAdmin)
 			r.Get("/worker-sizes", h.AdminListWorkerSizes)
 		})
 		// WRITES: cookie-only (RequireAuth + RequireAdmin), unchanged.

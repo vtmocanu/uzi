@@ -411,6 +411,16 @@ func TestAdminWorkerSizesAuthBoundaryLiveDB(t *testing.T) {
 	if rec := cookieReq(t, f.router, http.MethodGet, "/api/admin/worker-sizes", f.jwt, ""); rec.Code != http.StatusOK {
 		t.Errorf("admin session GET = %d, want 200", rec.Code)
 	}
+	// A safe GET needs no CSRF header: build the request without one.
+	{
+		req := httptest.NewRequest(http.MethodGet, "/api/admin/worker-sizes", nil)
+		req.AddCookie(&http.Cookie{Name: auth.AuthCookieName, Value: f.jwt}) //nolint:gosec // G124: test-only client cookie on an httptest request.
+		rec := httptest.NewRecorder()
+		f.router.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Errorf("admin session GET without CSRF = %d %s, want 200", rec.Code, rec.Body.String())
+		}
+	}
 	if rec := bearerReq(f.router, http.MethodGet, "/api/admin/worker-sizes", ""); rec.Code != http.StatusUnauthorized {
 		t.Errorf("anonymous GET = %d, want 401", rec.Code)
 	}

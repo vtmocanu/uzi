@@ -246,6 +246,28 @@ func TestPVCRejectionNamesTheClaim(t *testing.T) {
 	wantRefusal(t, m, "q2", protocol.BlockingKindPVCRejected, "Forbidden creating dind claim")
 }
 
+// Invalid and RequestEntityTooLarge are admission rejections of the claim itself, so they
+// record pvc_rejected like Forbidden does.
+func TestPVCRejectionRecordsInvalidAndTooLarge(t *testing.T) {
+	for name, tc := range map[string]struct {
+		err    error
+		reason string
+	}{
+		"invalid":  {apierrors.NewInvalid(schema.GroupKind{Kind: "PersistentVolumeClaim"}, "x", nil), "Invalid creating data claim"},
+		"toolarge": {apierrors.NewRequestEntityTooLargeError("too big"), "RequestEntityTooLarge creating data claim"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			m, client := refusalMat(t, testConfig())
+			client.PrependReactor("create", "persistentvolumeclaims", func(k8stesting.Action) (bool, runtime.Object, error) {
+				return true, nil, tc.err
+			})
+			w := newWorkerFixture(xsWorker("r1"))
+			_ = m.Reconcile(context.Background(), []protocol.DesiredWorker{w}, nil)
+			wantRefusal(t, m, "r1", protocol.BlockingKindPVCRejected, tc.reason)
+		})
+	}
+}
+
 // A transient create failure is not the cluster rejecting the claim: nothing is recorded,
 // and the error still surfaces.
 func TestTransientPVCCreateErrorsRecordNothing(t *testing.T) {
