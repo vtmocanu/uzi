@@ -279,6 +279,15 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **Admin → Workers section pills stay pinned under the tabs ([#4454](https://github.com/vtmocanu/uzi/pull/4454), [#4456](https://github.com/vtmocanu/uzi/pull/4456)).**
   They now match Admin → Instance: one sideways-scrolling row that no longer scrolls away or wraps, with the pill for the section being read highlighted.
 
+- **Repo variables: safer vault conversion, value entry and CLI labels ([#4416](https://github.com/vtmocanu/uzi/pull/4416), [#4460](https://github.com/vtmocanu/uzi/pull/4460)).**
+  Deleting a repo or forge connection while the vault is being enabled or disabled no longer fails the conversion; secret values use a masked single-line field with an explicit multiline mode, a secret switched to an empty plain value saves, unpaired surrogate escapes are refused, and `uzi repo env list` labels hidden plain values `(withheld)`.
+
+- **Waking a hibernated hosted worker no longer scales it up while one of its volumes is still being deleted ([#4457](https://github.com/vtmocanu/uzi/pull/4457), [#4462](https://github.com/vtmocanu/uzi/pull/4462)).**
+  The controller now keeps the worker at zero replicas while its `/data`, `/nix` or Docker data claim in the worker's namespace is Terminating, and wakes it once the claim has been recreated, instead of leaving the new pod Pending on a volume that is going away.
+
+- **uzi handoff checks the origin host, not just the path ([#4449](https://github.com/vtmocanu/uzi/pull/4449), [#4459](https://github.com/vtmocanu/uzi/pull/4459)).**
+  An origin on another host no longer resolves to a same-path connected repo; SSH origins are checked through `ssh -G`.
+
 ### Added
 
 - **A preview of the new Overview at /overview/next, decisions first ([#3878](https://github.com/vtmocanu/uzi/pull/3878), [#3952](https://github.com/vtmocanu/uzi/pull/3952)).**
@@ -437,6 +446,9 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **Hosted workers can move to a new node pool one at a time with `workers.newPlacement` ([#4451](https://github.com/vtmocanu/uzi/pull/4451), [#4452](https://github.com/vtmocanu/uzi/pull/4452)).**
   An opt-in second placement applies only to workers whose volumes all carry the controller's create-time `uzi.dev/placement: new` annotation, and its fields replace the global placement; the move itself is a manual per-worker procedure that deletes the worker's volumes (see Hosted workers).
 
+- **A repo created after this release can be linked to a YouTrack project and eligibility tag, and tagged issues start runs ([#4173](https://github.com/vtmocanu/uzi/pull/4173), [#4431](https://github.com/vtmocanu/uzi/pull/4431)).**
+  The link is made through the API before the repo's first enable, once the operator allows the YouTrack base URL (web and CLI screens come later); tagged issues sync onto the board with their YouTrack key (`ABC-12`), and comments and issue text by accounts other than the connection's own are withheld or need approval; issue writes on a linked repo come in a later release. Roll out the API before the workers: a worker needs `issue_key_v1` to claim a linked run. Forge health on a linked repo follows the code host, and issue tracker sync has its own `issue_tracker.sync` admin health check; enabling a repo does not race a link into forge label writes; a removed and re-listed repo keeps its issue source: it cannot be linked or flipped, and a re-listed repo that was linked reads no issues and starts no runs (issue detail, labels and board order are refused for a never-enabled repo too); autopilot runs on a linked repo are not auto-approved for an unmapped issue tracker author; over-long issue tracker ids are a 400; unusable tag names are not listed.
+
 ### Changed
 
 - **Routine dependency updates ([#4402](https://github.com/vtmocanu/uzi/pull/4402)).**
@@ -588,6 +600,12 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 - **API database pool size is now explicit and admin health `db` warns on measured connection waits ([#4418](https://github.com/vtmocanu/uzi/pull/4418), [#4422](https://github.com/vtmocanu/uzi/pull/4422)).**
   `DB_MAX_CONNS` defaults to 20 per replica instead of pgx's max(4, NumCPU), so hosts with more than 20 CPUs get a smaller pool and upload write slots on small nodes rise to their default of 4 (for example 2 to 4 on 4 CPUs); the `db` check now warns when requests waited 250ms or more in total per 60s for a pooled connection, not on a 7-of-8 occupancy snapshot.
+
+- **Claude run flights in the main run lane (issue, task, prompt, CI-fix, self-improve and MR-rework runs) keep their scratch in one per-run TMPDIR leaf that startup reclaim can remove once the run has ended ([#4420](https://github.com/vtmocanu/uzi/pull/4420), [#4432](https://github.com/vtmocanu/uzi/pull/4432)).**
+  The leaf `run-<runId>` is deleted only for a terminal run with zero open holds whose local retention has ended; run-end deletion is deferred, and the hibernation dry-run reports such leaves as protected until a later pod start's scratch phase reclaims them, if it does.
+
+- **Retirements on uid-split Docker workers now record a durable `.retire-*` binding and keep the parent in place ([#4263](https://github.com/vtmocanu/uzi/pull/4263), [#4429](https://github.com/vtmocanu/uzi/pull/4429)).**
+  Retirements record a durable `uzi-retire-scratch.<uuid>.binding` in the bare config; on a uid-split pod no binding is ever written as `settled`, so every bound non-completion parent stays at `intent` (`bound_intent`) and the verified pod epoch deletes none of them (more retention, never less; reclaim needs operator action or the existing discard paths). Past 64 bindings per bare a retire is unbound and takes the in-process removal path, and single-uid and completion disposal are unchanged. Disable the epoch phase with `workers.epochReclaim.retireScratchReclaim: false` (worker `UZI_RETIRE_SCRATCH_RECLAIM=0`; applies at the next worker startup); hosted rollout observation stays on #4143. Kept split parents no longer take the epoch's per-pass work slots, so they cannot starve recovery of bindings whose parents are already gone.
 
 ### Security
 
