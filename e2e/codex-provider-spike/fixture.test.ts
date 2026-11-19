@@ -196,3 +196,22 @@ test("scripted callback output is projected without retaining request contents",
     assert.deepEqual(provider.errors, []);
   } finally { await provider.close(); }
 });
+
+
+test("oversized scripted SSE returns controlled failure and owned teardown leaves process alive", async () => {
+  const credential = randomBytes(24).toString("hex");
+  const provider = await FakeProvider.start({ credential, respond: () => [{ text: "x".repeat(1024 * 1024) }] });
+  const exchange = () => new Promise<number>((resolve, reject) => {
+    const req = request(provider.baseUrl + "/responses", { method: "POST", headers: { authorization: `Bearer ${credential}` }, timeout: 3000 },
+      res => { res.resume(); res.once("end", () => resolve(res.statusCode!)); });
+    req.once("error", reject); req.once("timeout", () => req.destroy(new Error("timeout"))); req.end("{}");
+  });
+  try {
+    assert.equal(await exchange(), 500);
+    assert.equal(await exchange(), 500);
+    assert.deepEqual(provider.errors, ["script-limit"]);
+    assert.equal(provider.streamed, false);
+  } finally { await provider.close(); }
+  assert.equal(provider.sockets.size, 0);
+  assert.equal(provider.server.listening, false);
+});

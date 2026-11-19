@@ -143,7 +143,10 @@ export class FakeProvider {
           res.writeHead(500).end(); return;
         }
       }
-      if (Buffer.byteLength(data) > 1024 * 1024) throw new Error("script-limit");
+      if (Buffer.byteLength(data) > 1024 * 1024) {
+        if (this.errors.length === 0) this.errors.push("script-limit");
+        res.writeHead(500).end(); return;
+      }
       this.streamed = true;
       res.writeHead(200, { "content-type": "text/event-stream" });
       if (this.options.holdStream) { res.write('event: response.created\ndata: {"type":"response.created","response":{"id":"spike"}}\n\n'); }

@@ -1,0 +1,63 @@
+{
+  "schema": 1,
+  "invocation": {
+    "argv": [
+      "task",
+      "test:codex-provider-spike"
+    ],
+    "working_directory": "repository-root"
+  },
+  "source_base_revision": "5c73e9d323d62177c1296da5a2c18f52dbe94029",
+  "source_files_sha256": [
+    {
+      "path": "e2e/codex-provider-spike/driver.ts",
+      "sha256": "b317bf94eabf7de15fd839f36eee7cea795e17336819af71df0b70b76394bf77"
+    },
+    {
+      "path": "e2e/codex-provider-spike/fake-provider.ts",
+      "sha256": "413f500bc0ba174f701a9f4295c446f2609d936f24da248cd2acb6d618b5217c"
+    },
+    {
+      "path": "e2e/codex-provider-spike/fixture.test.ts",
+      "sha256": "216ea9aa94460aa92ce0f1850a644aab68c19a119e8504770b72bc2fe8682229"
+    },
+    {
+      "path": "e2e/codex-provider-spike/ownership.ts",
+      "sha256": "551dcf2f8db1bc92d324daff4470a62f6a0c047b0e4dda6cbb5a064ea4c144e1"
+    },
+    {
+      "path": "e2e/codex-provider-spike/policy.test.ts",
+      "sha256": "fda32da96d206990301b483239a77d389c1d2970cf03bf3b914e336fdc0dda1a"
+    },
+    {
+      "path": "e2e/codex-provider-spike/runner.ts",
+      "sha256": "dd7fdde9e858d2f103491b7d430593ad8658b6de173bc509a5f5bf2ab5f8981c"
+    },
+    {
+      "path": "e2e/codex-provider-spike/timers.ts",
+      "sha256": "237cdef004f5faa5de113dcfe485d7e9f270323c6c695b87931206bd9f6ad629"
+    },
+    {
+      "path": "e2e/codex-provider-spike/tsconfig.json",
+      "sha256": "1114142cb3d1520a82cf5a687a97f80231deb0fbfd9758f4f7628d72709698c4"
+    },
+    {
+      "path": "Taskfile.yml",
+      "sha256": "dda75f1a44f30eb7f2d5a9c220263454c0a9bfee72aecd40d4dea33d5a22237f"
+    },
+    {
+      "path": "agent/package-lock.json",
+      "sha256": "5cacad55fd255cd5a1ed53f1775ca5d0ab3fdbc0b0db16f8679e9129f559d532"
+    },
+    {
+      "path": "agent/codex/codex-package.lock",
+      "sha256": "b62a8b3b3887a55a24c4d02fe7c4ed23cc606f323af0cf2ea785e6d3b4c4ea02"
+    }
+  ],
+  "exit_status": 0,
+  "output_file": "evidence.json",
+  "output_sha256": "e07edbea7e4a4b3681bddbe38b56d96e2feb8bd8b94b86e7fa88d42dd1ae2af9",
+  "runtime_version": "0.167.0",
+  "runtime_source_commit": "086ccc833bc9cf01024ad2dd6af7dbd421b6bf9a",
+  "row_count": 36
+}

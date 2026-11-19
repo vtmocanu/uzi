@@ -4,7 +4,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync } from "node:fs";
 import path from "node:path";
-import { copySyntheticSessions, configProjection } from "./driver.js";
+import { copySyntheticSessions, configProjection, observeCallbackRequest } from "./driver.js";
 import { allowedInventory, callbackResultMatches } from "./fake-provider.js";
 import { buildCodexLoopbackTestConfigToml } from "../../agent/src/codex/config.js";
 
@@ -96,4 +96,19 @@ test("session copy charges growth after stat before copying bytes", () => {
     assert.equal(injected, true);
     assert.ok(original(path.join(base, "copy/session.jsonl")).size <= 4 * 1024 * 1024);
   } finally { fs.lstatSync = original; syncBuiltinESMExports(); rmSync(base, { recursive: true, force: true }); }
+});
+
+
+test("shared advice request handler records attempts before rejecting without dispatch", () => {
+  const observer = { attempts: 0 };
+  const responses: unknown[] = [];
+  const consumed = observeCallbackRequest({ kind: "activity", method: "item/tool/call", requestId: 7,
+    params: { tool: "unexpected", arguments: {} } }, "advice", observer,
+    (id, payload) => responses.push({ id, payload }));
+  assert.equal(consumed, true);
+  assert.equal(observer.attempts, 1);
+  assert.deepEqual(responses, [{ id: 7, payload: { error: { code: -32601, message: "codex advice is tool-less" } } }]);
+  assert.equal(observeCallbackRequest({ kind: "activity", method: "other", requestId: 8, params: {} }, "advice", observer,
+    () => assert.fail("unrelated request")), false);
+  assert.equal(observer.attempts, 1);
 });

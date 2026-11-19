@@ -9,9 +9,9 @@ import { runProtocolTurn, loadProtocolModules, type ProtocolTurnOptions } from "
 import { probeCodexRuntime } from "../../agent/src/codex/codex-runtime-probe.js";
 import { parseLock, resolveArch } from "../codex-m4/provision.js";
 
-export const names = ["baseline", "wrong-key", "guard-removed", "env-key", "alternate-header", "unsupported-wire", "responses-control",
+export const names = ["baseline", "wrong-key", "guard-removed", "env-key", "env-key-control", "alternate-header", "unsupported-wire", "responses-control",
   "receiver-control", "307-same", "308-same", "307-port", "307-port-stall", "308-port", "307-host", "308-host",
-  "tls-no-ca", "tls-ssl", "tls-codex", "tls-combined", "tls-untrusted", "tls-stall", "callback", "callback-disabled", "role-denied", "phase-denied", "advice", "cancel-stream", "cancel-control", "resume", "restart-rebind", "restart-closed-a", "rebind-observer-control", "same-process-override", "unknown-model", "destination-control"] as const;
+  "tls-no-ca", "tls-ssl", "tls-codex", "tls-combined", "tls-untrusted", "tls-stall", "callback", "callback-disabled", "tool-grant-denied", "phase-denied", "advice", "cancel-stream", "cancel-control", "resume", "restart-rebind", "restart-closed-a", "rebind-observer-control", "same-process-override", "unknown-model", "destination-control"] as const;
 export type Name = typeof names[number];
 export function validateName(name: string): asserts name is Name {
   if (!(names as readonly string[]).includes(name)) throw new Error("invalid-case");
@@ -19,7 +19,7 @@ export function validateName(name: string): asserts name is Name {
 export type Row = { name: Name; outcome: "observed-supported" | "observed-failure" | "unverified"; path: "production-launcher" | "fixture-config" | "fixture-control";
   streamed: boolean; credentialReceived: boolean; responsePath: boolean; header: boolean; body: boolean; caSSL: boolean; caCodex: boolean; credentialEnv: boolean;
   config: Name; requestPaths: string[]; headerNames: string[]; elapsedMs: number; actualSSL: boolean; actualCodex: boolean; actualCredentialEnv: boolean; keyInConfig: boolean;
-  callbackSeen?: boolean; effect?: boolean; denied?: boolean; roundtrip?: boolean; deadlineObserved?: boolean; nativeSuppressed?: boolean; nativeApplyPatch?: boolean; unknownInventory?: boolean; modelContextWindowOwn?: boolean; modelContextWindowNullableInteger?: boolean; fallbackWarningObserved?: boolean; untrusted?: boolean; nativeConfigDisabled?: boolean; poisonStripped?: boolean; auxiliaryConfigDisabled?: boolean; destinationMatched?: boolean; zeroRequestRetries?: boolean; zeroStreamRetries?: boolean; websocketsDisabled?: boolean; cancelled?: boolean; resumed?: boolean;
+  callbackAttempted?: boolean; receiverControlHeader?: boolean; receiverControlBody?: boolean; callbackSeen?: boolean; effect?: boolean; denied?: boolean; roundtrip?: boolean; deadlineObserved?: boolean; nativeSuppressed?: boolean; nativeApplyPatch?: boolean; unknownInventory?: boolean; modelContextWindowOwn?: boolean; modelContextWindowNullableInteger?: boolean; fallbackWarningObserved?: boolean; untrusted?: boolean; nativeConfigDisabled?: boolean; poisonStripped?: boolean; auxiliaryConfigDisabled?: boolean; destinationMatched?: boolean; zeroRequestRetries?: boolean; zeroStreamRetries?: boolean; websocketsDisabled?: boolean; cancelled?: boolean; resumed?: boolean;
   safetyOutcome?: "observed-supported" | "observed-failure";
   held: boolean; reason: "completed" | "rejected" | "forwarded" | "config-or-runtime-failure" | "deadline" | "cross-host-bind" | "config-rejected" | "tls-refused" | "protocol-failure" | "harness-failure" | "native-authority-advertised" | "auxiliary-network-unverified" };
 export class Evidence {
@@ -93,14 +93,14 @@ async function main(): Promise<void> {
       }, 30000);
       let receiver: FakeProvider | undefined;
       let provider: FakeProvider | undefined;
-      const fixture = ["env-key", "alternate-header", "unsupported-wire", "responses-control"].includes(name) || name.startsWith("tls-");
+      const fixture = ["env-key", "env-key-control", "alternate-header", "unsupported-wire", "responses-control"].includes(name) || name.startsWith("tls-");
       const row: Row = { name, outcome: "observed-failure", path: ["receiver-control", "destination-control"].includes(name) ? "fixture-control" : fixture || name === "same-process-override" ? "fixture-config" : "production-launcher",
         streamed: false, credentialReceived: false, responsePath: false, header: false, body: false, caSSL: false, caCodex: false, credentialEnv: false,
         config: name, requestPaths: [], headerNames: [], elapsedMs: 0, actualSSL: false, actualCodex: false, actualCredentialEnv: false, keyInConfig: name === "alternate-header",
-        held: name === "env-key" || name === "alternate-header", reason: "rejected" };
+        held: ["env-key", "env-key-control", "alternate-header"].includes(name), reason: "rejected" };
       let diagnosis: "config-rejected" | "tls-refused" | undefined;
       try {
-        const m2 = ["callback", "callback-disabled", "role-denied", "phase-denied", "advice", "cancel-stream", "cancel-control", "resume", "restart-rebind", "restart-closed-a", "rebind-observer-control", "same-process-override"].includes(name);
+        const m2 = ["callback", "callback-disabled", "tool-grant-denied", "phase-denied", "advice", "cancel-stream", "cancel-control", "resume", "restart-rebind", "restart-closed-a", "rebind-observer-control", "same-process-override"].includes(name);
         let effects = 0;
         const options: ServerOptions = { credential, guard: name !== "guard-removed", alternate: name === "alternate-header" };
         if (m2 && !["cancel-stream", "cancel-control", "resume", "restart-rebind", "restart-closed-a", "rebind-observer-control", "same-process-override"].includes(name)) {
@@ -121,6 +121,26 @@ async function main(): Promise<void> {
           owned.add(receiver!);
           const host = name.endsWith("-host") ? "127.0.0.2" : "127.0.0.1";
           options.redirect = { status: name.startsWith("308") ? 308 : 307, target: `http://${host}:${receiver.port}/target` };
+        }
+        if (receiver && name !== "receiver-control") {
+          const stalled = receiver.options.stall;
+          receiver.options.stall = false;
+          try {
+          await new Promise<void>((resolve, reject) => {
+            const req = request(options.redirect!.target, { method: "POST", headers: { authorization: `Bearer ${credential}` }, timeout: 3000 },
+              res => { res.resume(); res.once("end", resolve); });
+            req.once("timeout", () => req.destroy(new Error("timeout"))); req.once("error", reject); req.end("synthetic");
+          });
+          } finally { receiver.options.stall = stalled; }
+          row.receiverControlHeader = receiver!.header; row.receiverControlBody = receiver!.body;
+          if (!row.receiverControlHeader || !row.receiverControlBody) throw new Error("receiver-control-failure");
+          // Preserve the separately recorded positive control, not its target observations.
+          receiver!.header = false; receiver!.body = false;
+          receiver!.headerNames.clear(); receiver!.paths.clear(); receiver!.requests.length = 0;
+          receiver!.credentialReceived = false; receiver!.responsePath = false;
+          receiver!.accepted = false; receiver!.streamed = false;
+          receiver!.callbackOutput = false; receiver!.callbackResultMatched = false;
+          receiver!.nativeTools = false; receiver!.nativeApplyPatch = false; receiver!.unknownInventory = false;
         }
         if (name === "receiver-control") {
           await new Promise<void>((resolve, reject) => {
@@ -149,20 +169,20 @@ async function main(): Promise<void> {
         let fixtureOptions: ProtocolTurnOptions["fixture"];
         if (fixture) {
           const env: NodeJS.ProcessEnv = {};
-          if (name === "env-key") env.SPIKE_KEY = credential;
+          if (name === "env-key" || name === "env-key-control") env.SPIKE_KEY = name === "env-key" ? credential : wrong;
           if (["tls-ssl", "tls-combined", "tls-untrusted", "tls-stall"].includes(name)) env.SSL_CERT_FILE = path.join(base, name === "tls-untrusted" ? "untrusted.crt" : "trusted.crt");
           if (["tls-codex", "tls-combined"].includes(name)) env.CODEX_CA_CERTIFICATE = path.join(base, "trusted.crt");
           fixtureOptions = { env, table: table => {
             if (name.startsWith("tls-")) table = table.replace("http://", "https://");
             if (name === "unsupported-wire" || name === "responses-control") table = wireFixture(table, name);
-            if (name === "env-key") table = table.replace("requires_openai_auth = true", 'requires_openai_auth = false\nenv_key = "SPIKE_KEY"');
+            if (name === "env-key" || name === "env-key-control") table = table.replace("requires_openai_auth = true", 'requires_openai_auth = false\nenv_key = "SPIKE_KEY"');
             if (name === "alternate-header") table = table.replace("requires_openai_auth = true", `requires_openai_auth = false\nhttp_headers = { "x-spike-key" = "${credential}" }`);
             return table;
           } };
         }
-        const turnOptions: ProtocolTurnOptions = { provider, credential: ["wrong-key", "guard-removed"].includes(name) ? wrong : credential,
+        const turnOptions: ProtocolTurnOptions = { provider, credential: ["wrong-key", "guard-removed", "env-key", "env-key-control"].includes(name) ? wrong : credential,
           ...(name === "unknown-model" ? { model: "spike-unknown-model", metadataObservation: (value: { modelContextWindowOwn: boolean; modelContextWindowNullableInteger: boolean }) => Object.assign(row, value), warningObservation: () => { row.fallbackWarningObserved = true; } } : {}),
-          adversarialAdvertisement: name === "role-denied", codeModeHost: m2 ? !["callback-disabled", "advice"].includes(name) : false, allowCallbacks: m2,
+          adversarialAdvertisement: name === "tool-grant-denied", codeModeHost: m2 ? !["callback-disabled", "advice"].includes(name) : false, allowCallbacks: m2,
           lifecycle: name === "advice" ? "advice" : ["resume", "same-process-override"].includes(name) ? "resume" : "start",
           diagnostic: code => { diagnosis = code; }, signal: caseAbort.signal, fixture: fixtureOptions, turnDeadlineMs: 8000,
           launcherEnv: { UZI_UID_SPLIT: "1", SSL_CERT_FILE: "synthetic", CODEX_CA_CERTIFICATE: "synthetic", OPENAI_API_KEY: "synthetic-poison", OPENAI_BASE_URL: "http://127.0.0.1:1/v1", HTTPS_PROXY: "http://127.0.0.1:1", NODE_OPTIONS: "--synthetic-poison" },
@@ -170,7 +190,8 @@ async function main(): Promise<void> {
           captureActual: env => { row.actualSSL = env.SSL_CERT_FILE !== undefined; row.actualCodex = env.CODEX_CA_CERTIFICATE !== undefined; row.actualCredentialEnv = Object.values(env).includes(credential); },
           capture: env => { row.caSSL = env.SSL_CERT_FILE !== undefined; row.caCodex = env.CODEX_CA_CERTIFICATE !== undefined;
             row.credentialEnv = Object.values(env).includes(credential); row.poisonStripped = ["OPENAI_API_KEY", "OPENAI_BASE_URL", "HTTPS_PROXY", "NODE_OPTIONS"].every(k => env[k] === undefined); if (!row.poisonStripped) throw new Error("env-policy"); },
-          grants: { role: name === "role-denied" ? "reviewer" : "coder", phase: name === "phase-denied" ? "plan" : "implement", allowedTools: new Set(m2 && name !== "role-denied" ? ["Bash", "apply_patch"] : []), allowedSkills: new Set(), isRoot: true },
+          // Reviewer allocation lacks Bash even though the adversarial schema advertises it.
+          grants: { role: name === "tool-grant-denied" ? "reviewer" : "coder", phase: name === "phase-denied" ? "plan" : "implement", allowedTools: new Set(m2 && name !== "tool-grant-denied" ? ["Bash", "apply_patch"] : []), allowedSkills: new Set(), isRoot: true },
           spawnCommand: async () => { if (!m2) throw new Error("unexpected-command"); effects++; return { code: 0, stdout: "synthetic", stderr: "" }; }, fileop: { op: async () => { effects++; return { ok: true }; } } };
         if (name === "unknown-model") row.fallbackWarningObserved = false;
         let result;
@@ -196,14 +217,14 @@ async function main(): Promise<void> {
           if (name === "restart-rebind" ? !row.streamed || !row.effect : row.resumed || row.effect) broken = true;
         } else result = await runProtocolTurn(mods, turnOptions);
         if (m2) {
-          row.callbackSeen = result.callbacks.length > 0; if (!name.startsWith("restart-")) row.effect = effects > 0;
+          row.callbackAttempted = result.callbackAttempted; row.callbackSeen = result.callbacks.length > 0; if (!name.startsWith("restart-")) row.effect = effects > 0;
           row.denied = result.callbacks.some(c => !c.result.ok);
           row.roundtrip = provider.callbackOutput && (name !== "callback" || provider.callbackResultMatched); row.nativeSuppressed = !provider.nativeTools; row.nativeApplyPatch = provider.nativeApplyPatch; row.unknownInventory = provider.unknownInventory;
           row.cancelled = name === "cancel-stream" && caseAbort.signal.aborted && result.turnStatus === undefined;
           if (!name.startsWith("restart-")) row.resumed = name === "resume" && provider.requests.length >= 2 && result.turnStatus === "completed";
           const valid = name === "callback" ? row.callbackSeen && row.effect && row.roundtrip && !row.denied
-            : ["role-denied", "phase-denied"].includes(name) ? row.callbackSeen && row.denied && !row.effect && row.roundtrip
-            : ["callback-disabled", "advice"].includes(name) ? !row.callbackSeen && !row.effect
+            : ["tool-grant-denied", "phase-denied"].includes(name) ? row.callbackSeen && row.denied && !row.effect && row.roundtrip
+            : ["callback-disabled", "advice"].includes(name) ? !row.callbackSeen && !row.effect && (name !== "advice" || !row.callbackAttempted)
             : name === "cancel-stream" ? row.cancelled && provider.streamed
             : name === "resume" ? row.resumed : result.turnStatus === "completed" && !caseAbort.signal.aborted;
           if (!valid) broken = true;
@@ -211,7 +232,7 @@ async function main(): Promise<void> {
         if (name === "same-process-override" && (result.turnStatus === "completed" || receiver?.responsePath)) broken = true;
         row.streamed = name === "restart-rebind" ? !!receiver?.streamed && result.turnStatus === "completed" : name === "restart-closed-a" ? false : provider.streamed && result.turnStatus === "completed";
         row.outcome = row.cancelled || row.streamed ? "observed-supported" : "observed-failure";
-        row.reason = row.cancelled || row.streamed ? "completed" : name === "wrong-key" && !provider.accepted && provider.responsePath ? "rejected" : name.startsWith("tls-") && !provider.responsePath ? "tls-refused" : "protocol-failure";
+        row.reason = row.cancelled || row.streamed ? "completed" : ["wrong-key", "env-key-control"].includes(name) && !provider.accepted && provider.responsePath ? "rejected" : name.startsWith("tls-") && !provider.responsePath ? "tls-refused" : "protocol-failure";
         if (name === "unknown-model" && (!row.modelContextWindowOwn || !row.modelContextWindowNullableInteger || !row.fallbackWarningObserved || !row.streamed)) broken = true;
         if (provider.errors.length || provider.oversized || receiver?.errors.length || receiver?.oversized) broken = true;
       } catch (error) {
@@ -249,13 +270,16 @@ async function main(): Promise<void> {
       }
       if (["baseline", "guard-removed", "responses-control", "restart-rebind", "rebind-observer-control"].includes(name) && !row.streamed) broken = true;
       if (["baseline", "guard-removed", "responses-control", "restart-rebind", "rebind-observer-control"].includes(name) && row.outcome !== "observed-supported") broken = true;
-      if (["callback", "callback-disabled", "role-denied", "phase-denied", "advice", "cancel-stream", "cancel-control", "resume"].includes(name) && row.outcome !== "observed-supported") broken = true;
+      if (["callback", "callback-disabled", "tool-grant-denied", "phase-denied", "advice", "cancel-stream", "cancel-control", "resume"].includes(name) && row.outcome !== "observed-supported") broken = true;
       if (name === "destination-control" && (row.outcome !== "observed-supported" || row.destinationMatched !== false || row.actualSSL || row.actualCodex || row.actualCredentialEnv)) broken = true;
       if (name === "restart-rebind" && (!row.resumed || !row.effect || !row.streamed)) broken = true;
       if (name === "restart-closed-a" && (row.deadlineObserved !== true || row.resumed !== false || row.effect !== false)) broken = true;
       if (name === "same-process-override" && (row.deadlineObserved !== true || row.resumed !== false || row.effect !== false || receiver?.responsePath)) broken = true;
       if (name === "307-port-stall" && (!row.body || row.streamed || row.reason !== "forwarded" || row.outcome !== "observed-failure")) broken = true;
-      if (name === "wrong-key" && (row.reason !== "rejected" || !row.responsePath || row.credentialReceived)) broken = true;
+      if ((name.endsWith("-host") || name.endsWith("-port") || name === "307-port-stall") && (!row.receiverControlHeader || !row.receiverControlBody)) broken = true;
+      if (name === "env-key" && (!row.streamed || !row.credentialReceived || !row.actualCredentialEnv)) broken = true;
+      if (["wrong-key", "env-key-control"].includes(name) && (row.reason !== "rejected" || !row.responsePath || row.credentialReceived)) broken = true;
+      if (name === "env-key-control" && (row.streamed || row.outcome !== "observed-failure")) broken = true;
       if (name === "guard-removed" && row.credentialReceived) broken = true;
       if (name === "unsupported-wire" && (row.reason !== "config-rejected" || row.requestPaths.length !== 0)) broken = true;
     }

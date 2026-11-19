@@ -95,6 +95,7 @@ export interface ObservedCallback {
 export interface ProtocolObservation {
   /** Every model-selected callback the broker admitted/authorized, in order. */
   readonly callbacks: readonly ObservedCallback[];
+  readonly callbackAttempted: boolean;
   /** The advertised model-visible tool schema the app-server offered (the `tools` array on the
    *  FIRST provider request). Native authority reaching the model would appear HERE. */
   readonly advertisedTools: readonly Record<string, unknown>[];
@@ -113,6 +114,16 @@ export interface ProtocolObservation {
   readonly binaryEvidence: { path: string; version: string; archiveDigest: string; receipt: string; integrity: true };
   readonly notes: readonly CodexNotification[];
   readonly threadId: string;
+}
+
+/** Shared inbound callback observer; count before the advice rejection can hide an attempt. */
+export function observeCallbackRequest(note: CodexNotification, lifecycle: ProtocolTurnOptions["lifecycle"],
+  observer: { attempts: number }, respond: (id: string | number, payload: { error: { code: number; message: string } }) => void): boolean {
+  if (note.kind !== "activity" || note.requestId === undefined || note.method !== "item/tool/call") return false;
+  if (++observer.attempts > 16) throw new Error("callback-budget");
+  if (lifecycle !== "advice") return false;
+  respond(note.requestId, { error: { code: -32601, message: "codex advice is tool-less" } });
+  return true;
 }
 
 /** Inputs to one driven turn. Only the policy-relevant knobs; the launch plumbing is fixed. */
@@ -405,6 +416,7 @@ export async function runProtocolTurn(mods: ProtocolModules, opts: ProtocolTurnO
 
     const envSink: { env?: NodeJS.ProcessEnv } = {};
     const callbacks: ObservedCallback[] = [];
+    const callbackObserver = { attempts: 0 };
     const rawNotes: CodexNotification[] = [];
     const notificationBudget = new Budget(4 * 1024 * 1024, 16384);
     const launchPlan = buildProviderLaunchPlan(mods, {
@@ -461,13 +473,10 @@ export async function runProtocolTurn(mods: ProtocolModules, opts: ProtocolTurnO
           turnStatus = note.status;
           return;
         }
+        if (observeCallbackRequest(note, opts.lifecycle, callbackObserver, (id, payload) => transport!.respond(id, payload))) continue;
         if (note.kind === "activity" && note.requestId !== undefined && note.method === "item/tool/call") {
           const p = (note.params ?? {}) as Record<string, unknown>;
           const rt = { threadId: String(p.threadId), turnId: String(p.turnId), callId: String(p.callId) };
-          if (opts.lifecycle === "advice") {
-            transport!.respond(note.requestId, { error: { code: -32601, message: "codex advice is tool-less" } });
-            continue;
-          }
           if (!opts.allowCallbacks) throw new Error("unexpected-callback");
           if (callbacks.length >= 16) throw new Error("callback-budget");
           const result = await broker.handleToolCall(rt, p.tool, p.arguments, origin);
@@ -539,6 +548,7 @@ export async function runProtocolTurn(mods: ProtocolModules, opts: ProtocolTurnO
     return {
       threadId,
       callbacks,
+      callbackAttempted: callbackObserver.attempts > 0,
       advertisedTools: advertisedToolsOf(provider.requests),
       spawnEnv: envSink.env ?? {},
       turnStatus,
