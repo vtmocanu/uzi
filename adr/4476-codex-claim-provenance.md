@@ -59,7 +59,7 @@ Consequences:
 ## The provenance pair
 
 Two nullable columns on `runs`, with no default, no foreign key and no backfill
-(`api/internal/store/migrations/00491_run_claim_provenance.sql`; the number is a
+(`api/internal/store/migrations/00492_run_claim_provenance.sql`; the number is a
 draft and is renumbered at landing):
 
 - `claim_provenance_worker_id uuid`

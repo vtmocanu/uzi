@@ -78,7 +78,7 @@ func TestClaimProvenanceClausesPinnedPerQuery(t *testing.T) {
 
 // TestClaimProvenanceMigrationText pins the gate function body and the guard conditions.
 func TestClaimProvenanceMigrationText(t *testing.T) {
-	sql := provSQL(t, "migrations/00491_run_claim_provenance.sql")
+	sql := provSQL(t, "migrations/00492_run_claim_provenance.sql")
 	body := "SELECTNOT(r.harness='codex'ORr.codex_material_revisionISNOTNULLORr.codex_secret_idISNOTNULL)" +
 		"ORr.claim_generation<1" +
 		"ORCOALESCE(r.claim_provenance_worker_id=claimantANDr.claim_provenance_generation=r.claim_generation,false)"
