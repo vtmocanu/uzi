@@ -10,8 +10,10 @@
 //  - scenario "cleanup": GitCache's execScoped (the one place every git child is spawned) runs the
 //    `update-ref -d` through a detached /bin/sh that waits on a FIFO and then execs the REAL
 //    `git update-ref -d <ref> <sha>`. Everything else passes through untouched.
+//  - scenario "refusal" (issue #4481): the refusal-store ordering points. The child parks itself in-process before or after one
+//    real fs rename, fs unlink or git child (see RefusalHold), and the test SIGKILLs it there.
 // Neither seam fakes the deletion or the ref update; the barrier only delays when the real child acts.
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
@@ -25,7 +27,7 @@ import { manualClock, testLockOptions } from "../authority-test-support.js";
 
 export interface Barrier { armed: string; go: string; done: string; pid: string }
 export interface ChildConfig {
-  scenario: "delete" | "cleanup" | "late-queue" | "late-close-inline" | "pin-cleanup";
+  scenario: "delete" | "cleanup" | "late-queue" | "late-close-inline" | "pin-cleanup" | "refusal";
   dataDir: string;
   token: string;
   bare: string;
@@ -68,7 +70,32 @@ export interface ChildConfig {
   pin?: { runId: string; generation: number; sourceSha: string; deadlineMs: number; eligibleStallMs?: number };
   /** pin-cleanup: where the git wrapper script is written (put first on PATH). */
   wrapDir?: string;
+  /** issue #4481 scenario "refusal": the refusal-store operations run in order, with one in-process hold. */
+  refusal?: RefusalScenario;
 }
+
+/** One refusal-store operation of the owning worker, run inside an authority transaction. */
+export type RefusalOp =
+  | { op: "admit" }
+  /** Moves the clone's branch to `head`, then runs the real fetchAgentBranch import (at the owed cap it is refused). */
+  | { op: "fetch"; head: string }
+  | { op: "seal"; sha: string }
+  | { op: "cleanup"; covering: string };
+
+/**
+ * The hold: while operation `op` runs, the `nth` (default 1) real effect of `kind` whose subject matches `match` parks the
+ * worker on the barrier FIFOs, either before the effect starts or after it completed. The subject is the destination
+ * basename of an fs rename, the basename of an fs unlink, or the joined argv of a git child. The hold is in-process, so
+ * the test's SIGKILL of this very process is the crash; nothing is faked, the real effect is only ordered.
+ */
+export interface RefusalHold {
+  op: number;
+  kind: "rename-before" | "rename-after" | "unlink-before" | "unlink-after" | "git-before" | "git-after";
+  match: string;
+  nth?: number;
+}
+
+export interface RefusalScenario { cap: number; nonce: string; clone: string; ops: RefusalOp[]; hold?: RefusalHold }
 
 const quiet: Logger = {
   debug() {}, info() {}, warn() {}, error() {}, addSecret() {}, removeSecret() {},
@@ -298,8 +325,77 @@ async function runShutdownScenario(cfg: ChildConfig): Promise<void> {
   process.stdin.resume();
 }
 
+/**
+ * issue #4481: the owning worker of the refusal-store crash proofs. A real GitCache (authority hooks, authorityRequired, the
+ * configured owed cap and process nonce) runs the listed operations; the single hold parks it at one real effect (an fs rename,
+ * an fs unlink or a git child of GitCache.execScoped) before or after it ran, and the test SIGKILLs it there.
+ */
+async function runRefusalScenario(cfg: ChildConfig): Promise<void> {
+  const scenario = cfg.refusal!;
+  const rig = cfg.barrier!;
+  const context = cfg.context!;
+  const lifetime = await acquireWorkerLifetime(cfg.dataDir, testLockOptions());
+  const rt = new AuthorityRuntime({ lifetime, workerToken: cfg.token, timeoutMs: 20_000 });
+  const git = new GitCache(cfg.dataDir, quiet, undefined, {
+    authority: rt.hooks, authorityRequired: true, maxOwedCandidates: scenario.cap, processNonce: scenario.nonce,
+  });
+  let active: { hold: RefusalHold; count: number } | undefined;
+  const park = async (): Promise<void> => {
+    fs.writeFileSync(rig.pid, String(process.pid));
+    await fsp.writeFile(rig.armed, "armed\n");
+    await waitFifo(rig.go);
+  };
+  const around = async <T>(kind: "rename" | "unlink" | "git", subject: string, body: () => Promise<T>): Promise<T> => {
+    const h = active?.hold;
+    const hit = h !== undefined && h.kind.startsWith(kind) && new RegExp(h.match).test(subject) && ++active!.count === (h.nth ?? 1);
+    if (hit && h.kind.endsWith("-before")) await park();
+    const out = await body();
+    if (hit && h.kind.endsWith("-after")) await park();
+    return out;
+  };
+  const patched = fsp as unknown as {
+    rename(from: string, to: string): Promise<void>;
+    unlink(file: string): Promise<void>;
+  };
+  const realRename = patched.rename.bind(fsp);
+  const realUnlink = patched.unlink.bind(fsp);
+  patched.rename = (from, to) => around("rename", path.basename(String(to)), () => realRename(from, to));
+  patched.unlink = (file) => around("unlink", path.basename(String(file)), () => realUnlink(file));
+  const internals = git as unknown as {
+    execScoped(command: string, args: string[], options: object, ...rest: unknown[]): Promise<{ stdout: string; stderr: string }>;
+  };
+  const original = internals.execScoped.bind(git);
+  internals.execScoped = (command, args, options, ...rest) => command === "git"
+    ? around("git", args.join(" "), () => original(command, args, options, ...rest))
+    : original(command, args, options, ...rest);
+
+  say("W");
+  for (let i = 0; i < scenario.ops.length; i++) {
+    const o = scenario.ops[i]!;
+    active = scenario.hold?.op === i ? { hold: scenario.hold, count: 0 } : undefined;
+    const result = await rt.withTransaction(async () => {
+      if (o.op === "admit") return git.admitRefusalProvenance(context);
+      if (o.op === "fetch") {
+        execFileSync("git", ["-C", scenario.clone, "update-ref", `refs/heads/${context.branch}`, o.head], { stdio: "ignore" });
+        return git.fetchAgentBranch(cfg.bare, scenario.clone, context.branch, context.runId, { context });
+      }
+      if (o.op === "seal") return git.sealRefusalRelease(cfg.bare, context.runId, context.generation, o.sha);
+      const frozen = (await git.enumerateOwedCandidates(cfg.bare, context.runId)).map((c) => ({ sha: c.sha, contexts: c.contexts }));
+      return git.cleanupRecoveryGeneration(cfg.bare, context, frozen, [], [], o.covering, undefined, "archive");
+    });
+    say(`OP:${i}:${JSON.stringify(result)}`);
+  }
+  active = undefined;
+  say("DONE");
+  process.stdin.resume();
+}
+
 async function main(): Promise<void> {
   const cfg = JSON.parse(process.argv[2]!) as ChildConfig;
+  if (cfg.scenario === "refusal") {
+    await runRefusalScenario(cfg);
+    return;
+  }
   if (cfg.scenario === "late-queue" || cfg.scenario === "late-close-inline" || cfg.scenario === "pin-cleanup") {
     await runShutdownScenario(cfg);
     return;
