@@ -162,7 +162,9 @@ recovery required"; the Deployment stays missing until a canary exists again or
 explicit recovery. The layout-migration hold has a matching fence: a held
 canary keeps its incomplete reservation and fences the pool while incomplete same-cohort participants
 remain, instead of cancelling it, because cancelling would leave those
-participants without a canary.
+participants without a canary. A desired worker that cannot be rendered in the
+same or an unknown namespace also keeps this history: its cohort membership
+cannot be ruled out from the incomplete observation.
 
 ### D4 — Promotion proves the current incarnation
 

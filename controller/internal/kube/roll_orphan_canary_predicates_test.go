@@ -1,76 +1,96 @@
 package kube
 
 import (
+	"context"
 	"testing"
 
-	appsv1 "k8s.io/api/apps/v1"
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 
-	"github.com/vtmocanu/uzi/controller/internal/protocol"
+	"github.com/vtmocanu/uzi/controller/internal/reconcile"
 )
 
 // A withheld adoption request may commit later. A participant counts as unable to
 // accept it only from what is observed now, and every controller write that touches a
 // blocked participant must leave it that way.
-func orphanEntry(replicas int32, image, hash string) *rollEntry {
-	dep := &appsv1.Deployment{
-		ObjectMeta: metav1.ObjectMeta{Name: "uzi-hw-w2", UID: types.UID("dep-w2"), ResourceVersion: "1"},
-		Spec: appsv1.DeploymentSpec{Replicas: &replicas, Template: corev1.PodTemplateSpec{
-			ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{AnnotationSpecHash: hash}},
-			Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: workerContainerName, Image: image}}},
-		}},
+// Build the proof through the real cohort/snapshot seams so each fence starts
+// from a candidate; missing pod or registration evidence cannot mask a failure.
+func provenOrphanEntry(t *testing.T) (*Materializer, *rollTick, *rollEntry) {
+	t.Helper()
+	o := newOrphanCohort(t, 3, 2)
+	o.prove(t, "w2")
+	observed, err := o.m.Observe(context.Background())
+	if err != nil {
+		t.Fatal(err)
 	}
-	return &rollEntry{
-		w:      protocol.DesiredWorker{ID: "w2"},
-		ns:     "uzi-workers",
-		dep:    dep,
-		marker: &rollMarker{Version: 1, Hash: "h1", Image: "img:1", TargetVersion: "1.0.0", Coverage: rollCoverage{Owner: "owner-A", Lane: "uzi-workers"}},
+	byID := map[string]reconcile.ObservedWorker{}
+	for _, worker := range observed {
+		byID[worker.ID] = worker
 	}
+	tick, _ := o.m.planRoll(context.Background(), o.workers, byID)
+	e := tick.entries["w2"]
+	if e == nil || !o.m.orphanCanaryCandidate(tick, e) || orphanPatchFenced(e) {
+		t.Fatal("positive control is not an unfenced, proven adoption candidate")
+	}
+	return o.m, tick, e
 }
 
 func TestOrphanRollCohortFencedStaysFenced(t *testing.T) {
-	m, _ := newMat(t)
-	tick := &rollTick{outcomes: map[string]*protocol.Pacing{"w2": {TargetVersion: "1.0.0"}}, unavailable: map[string]bool{}, migrationFences: map[string]bool{}}
-
-	fencedBy := map[string]func() *rollEntry{
-		"scaled to zero":         func() *rollEntry { return orphanEntry(0, "img:1", "h1") },
-		"scaled to two":          func() *rollEntry { return orphanEntry(2, "img:1", "h1") },
-		"template hash changed":  func() *rollEntry { return orphanEntry(1, "img:1", "h2") },
-		"template image changed": func() *rollEntry { return orphanEntry(1, "img:2", "h1") },
-		"deployment gone":        func() *rollEntry { e := orphanEntry(1, "img:1", "h1"); e.dep = nil; return e },
-		"deployment terminating": func() *rollEntry {
-			e := orphanEntry(1, "img:1", "h1")
+	fencedBy := map[string]func(*rollEntry){
+		"scaled to zero": func(e *rollEntry) { zero := int32(0); e.dep.Spec.Replicas = &zero },
+		"scaled to two":  func(e *rollEntry) { two := int32(2); e.dep.Spec.Replicas = &two },
+		"template hash changed": func(e *rollEntry) {
+			e.dep.Spec.Template.Annotations[AnnotationSpecHash] = "different-hash"
+		},
+		"template image changed": func(e *rollEntry) {
+			e.dep.Spec.Template.Spec.Containers[0].Image = "worker:different"
+		},
+		"deployment gone": func(e *rollEntry) { e.dep = nil },
+		"deployment terminating": func(e *rollEntry) {
 			now := metav1.Now()
 			e.dep.DeletionTimestamp = &now
-			return e
 		},
-		"reservation completed": func() *rollEntry { e := orphanEntry(1, "img:1", "h1"); e.marker.Completed = true; return e },
-		"reservation absent":    func() *rollEntry { e := orphanEntry(1, "img:1", "h1"); e.marker = nil; return e },
+		"reservation completed": func(e *rollEntry) { e.marker.Completed = true },
+		"reservation absent":    func(e *rollEntry) { e.marker = nil },
 	}
 	// The controller's own writes to a participant: mapping correction rewrites the
 	// marker's version and clears Completed; pin, layout and historic cancellation
 	// withdraw the marker. Deployment shape is untouched by all of them.
-	writes := map[string]func(*rollEntry){
-		"mapping correction": func(e *rollEntry) {
+	writes := map[string]func(*rollEntry, *rollTick){
+		"mapping correction": func(e *rollEntry, tick *rollTick) {
 			if e.marker != nil {
 				e.marker.TargetVersion, e.marker.Completed = "2.0.0", false
+				// Keep version evidence consistent: otherwise a stale version,
+				// rather than the fence, would make the candidate check fail.
+				e.w.RollEvidence.RegisteredVersion = token("2.0.0")
+				tick.outcomes[e.w.ID].TargetVersion = "2.0.0"
 			}
 		},
-		"pin cancellation":      func(e *rollEntry) { e.marker = nil },
-		"layout cancellation":   func(e *rollEntry) { e.marker = nil },
-		"historic cancellation": func(e *rollEntry) { e.marker = nil },
+		"pin cancellation":      func(e *rollEntry, _ *rollTick) { e.marker = nil },
+		"layout cancellation":   func(e *rollEntry, _ *rollTick) { e.marker = nil },
+		"historic cancellation": func(e *rollEntry, _ *rollTick) { e.marker = nil },
 	}
-	for name, build := range fencedBy {
+	t.Run("mapping correction alone keeps the candidate proven", func(t *testing.T) {
+		m, tick, e := provenOrphanEntry(t)
+		writes["mapping correction"](e, tick)
+		if !m.orphanCanaryCandidate(tick, e) || orphanPatchFenced(e) {
+			t.Fatal("mapping correction invalidated the proof independently of a fence")
+		}
+	})
+	for name, fence := range fencedBy {
 		for write, apply := range writes {
+			// Completed-cohort planning returns before mapping correction; do
+			// not model the unreachable operation that clears its Completed bit.
+			if name == "reservation completed" && write == "mapping correction" {
+				continue
+			}
 			t.Run(name+" then "+write, func(t *testing.T) {
-				e := build()
-				if !orphanPatchFenced(e) {
-					t.Fatal("not fenced before the write")
+				m, tick, e := provenOrphanEntry(t)
+				fence(e)
+				if !orphanPatchFenced(e) || m.orphanCanaryCandidate(tick, e) {
+					t.Fatal("the fence did not exclude the proven candidate")
 				}
-				apply(e)
-				if name != "reservation completed" && name != "reservation absent" && !orphanPatchFenced(e) {
+				apply(e, tick)
+				if !orphanPatchFenced(e) {
 					t.Fatalf("%s lifted the fence", write)
 				}
 				if m.orphanCanaryCandidate(tick, e) {
@@ -80,10 +100,7 @@ func TestOrphanRollCohortFencedStaysFenced(t *testing.T) {
 		}
 	}
 	t.Run("unfenced shape is not fenced", func(t *testing.T) {
-		if orphanPatchFenced(orphanEntry(1, "img:1", "h1")) {
-			t.Fatal("a one-replica participant on its reserved template reads as fenced")
-		}
-		e := orphanEntry(1, "img:1", "h1")
+		_, _, e := provenOrphanEntry(t)
 		e.dep.Spec.Replicas = nil
 		if orphanPatchFenced(e) {
 			t.Fatal("nil replicas (defaulted to one) reads as fenced")

@@ -421,7 +421,7 @@ func (m *Materializer) planRoll(ctx context.Context, desired []protocol.DesiredW
 }
 
 // holdForLayoutMigration reports the worker held and withdraws its own incomplete
-// roll reservation (except a canary with incomplete same-cohort participants; see
+// roll reservation (except a canary with possible incomplete cohort participants; see
 // below). After ordinary pool planning, selectMigrationDrains separately
 // considers an image_roll cordon using frozen poll coverage, refreshed layout
 // evidence, and the owner/lane budget for observed, selected or possibly drained
@@ -443,8 +443,9 @@ func (m *Materializer) planRoll(ctx context.Context, desired []protocol.DesiredW
 // so it is not drifted and cannot be held. A mid-cohort change (for example a
 // generation rotation) can re-drift a promoted canary, which is then held if it is
 // custody-held and its observed layout is old or unknown. In that case, while any
-// incomplete same-cohort participant remains, the canary's reservation is kept and
-// the pool is fenced instead of cancelled (issue #4466): withdrawing it would leave
+// incomplete same-cohort participant remains (or an unplanned worker could be one),
+// the canary's reservation is kept and the pool is fenced instead of cancelled
+// (issue #4466): withdrawing it would leave
 // those participants with no canary. With no decodable marker the fence keys on the
 // worker's current coverage, which can differ from a cohort reserved under older
 // capabilities.
@@ -469,6 +470,14 @@ func (m *Materializer) holdForLayoutMigration(ctx context.Context, t *rollTick, 
 	// an incomplete participant of the same cohort remains, withdrawing it would leave
 	// that participant without a canary. Keep the reservation and fence the pool.
 	if e.marker.Canary {
+		// An unrenderable desired worker is absent from entries; its retained
+		// reservation may still need this canary's history.
+		for _, u := range t.unplanned {
+			if !u.nsKnown || u.ns == e.ns {
+				fence()
+				return
+			}
+		}
 		for _, p := range t.entries {
 			if p != e && p.marker != nil && !p.marker.Completed && !p.marker.Canary &&
 				coverageKey(p.marker.Coverage) == coverageKey(e.marker.Coverage) {

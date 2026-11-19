@@ -1093,6 +1093,46 @@ func TestOrphanRollCohortCanaryLossEntryPoints(t *testing.T) {
 			}
 		}
 	})
+
+	t.Run("layout hold keeps canary history beside an unplanned participant", func(t *testing.T) {
+		for _, reason := range []string{"unresolved template in the same namespace", "unresolved placement"} {
+			t.Run(reason, func(t *testing.T) {
+				cObjs, canary := lmObjects(t, lmOpts{id: "d1", custody: true, layout: "old", marker: "canary", promoted: true})
+				pObjs, part := lmObjects(t, lmOpts{id: "d2", layout: "new", marker: "participant"})
+				f := lmCluster(t, false, append(cObjs, pObjs...)...)
+				canary.Generation = 1
+				before, err := f.client.AppsV1().Deployments(lmNS()).Get(context.Background(), deploymentName(canary.ID), metav1.GetOptions{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if reason == "unresolved placement" {
+					part.Docker, part.Isolated = false, true
+					if _, err := f.m.cfg.Placement(part); err == nil {
+						t.Fatal("fixture placement unexpectedly resolved")
+					}
+				} else {
+					part.Template = "unavailable-template"
+					if _, err := f.m.resolver.Resolve(part.Template, part.Size); err == nil {
+						t.Fatal("fixture template unexpectedly resolved")
+					}
+				}
+				for tick := 0; tick < 3; tick++ {
+					_ = f.tickErr(t, canary, part)
+					after, err := f.client.AppsV1().Deployments(lmNS()).Get(context.Background(), deploymentName(canary.ID), metav1.GetOptions{})
+					if err != nil {
+						t.Fatal(err)
+					}
+					if after.Annotations[annotationRoll] != before.Annotations[annotationRoll] || !reflect.DeepEqual(after.Spec, before.Spec) {
+						t.Fatalf("tick %d: unplanned participant lost its canary history or changed the held Deployment", tick)
+					}
+					p := f.m.PacingOutcomes()[canary.ID]
+					if p == nil || p.State != "held" {
+						t.Fatalf("tick %d: custody-held canary pacing = %+v, want held", tick, p)
+					}
+				}
+			})
+		}
+	})
 }
 
 // addForeignCanary adds a worker of another owner in the same namespace whose
