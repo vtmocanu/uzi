@@ -761,11 +761,20 @@ func (m *Materializer) Reconcile(ctx context.Context, desired []protocol.Desired
 				continue // Unknown mutations require a new observation before sibling work.
 			}
 			if !e.admitted {
-				// Independent fenced maintenance is allowed even while image admission waits.
+				// Independent fenced maintenance and mutation-free wake settlement
+				// are allowed even while image admission waits.
 				if ns, err := m.cfg.Placement(w); err == nil {
 					if spec, err := m.resolver.Resolve(w.Template, w.Size); err == nil {
 						if e.blocked == "" {
-							if _, err := m.reconcileDinD(ctx, w, obs, ns, spec); err != nil {
+							var err error
+							if w.Hibernation != nil && w.Hibernation.State == protocol.HibernationWaking {
+								// The wake's own mutation guard still requires e.admitted.
+								// A ready participant needs only to report settlement.
+								err = m.hibernateWake(ctx, w, e.o, ns, spec)
+							} else {
+								_, err = m.reconcileDinD(ctx, w, obs, ns, spec)
+							}
+							if err != nil {
 								uncertain[key] = true
 								errs = append(errs, err)
 							}

@@ -78,11 +78,12 @@ type rollEntry struct {
 	// markerReport is the snapshot-time display summary, captured before planning
 	// rewrites e.marker in memory. Display-only.
 	markerReport *protocol.RollMarker
-	// hibernation marks a worker whose desired hibernation state is set (PRD #4205).
+	// hibernation marks a worker owned exclusively by the hibernation lane (PRD #4205).
 	// It stays in rollTick.entries so its snapshot evidence (marker, reservation,
 	// blocked) is readable through rollFrom, but it takes no part in pool grouping,
 	// admission, canary, slots or coverage: a parked worker is neither a roll
-	// participant nor a coverage provider.
+	// participant nor a coverage provider. A waking worker with open roll evidence
+	// instead rejoins ordinary admission after the snapshot below.
 	hibernation bool
 	// historyDependents marks a hibernation candidate whose completed-canary marker
 	// could not be retired because an in-scope peer still carries roll evidence.
@@ -224,8 +225,9 @@ func (m *Materializer) planRoll(ctx context.Context, desired []protocol.DesiredW
 		namespaces[ns] = append(namespaces[ns], e)
 		t.outcomes[w.ID] = &protocol.Pacing{State: "waiting_evidence", TargetImage: workerImage(target), TargetVersion: targetVersion(m.cfg, workerImage(target))}
 		if w.Hibernation != nil {
-			// Excluded from every roll decision below (see rollEntry.hibernation). The
-			// placeholder outcome is "completed", which PacingOutcomes never exports, so
+			// Lifecycle-owned unless an open wake reservation rejoins roll planning
+			// after the snapshot below. The placeholder outcome is "completed",
+			// which PacingOutcomes never exports, so
 			// a parked worker carries no pacing signal.
 			e.hibernation = true
 			t.outcomes[w.ID].State = "completed"
@@ -242,6 +244,14 @@ func (m *Materializer) planRoll(ctx context.Context, desired []protocol.DesiredW
 	// Capture the retained evidence before prepareMigrationDrains or any planning
 	// mutation rewrites e.marker (display-only; hibernation entries included).
 	for _, e := range t.entries {
+		if e.hibernation && e.w.Hibernation.State == protocol.HibernationWaking &&
+			(hibernationRollReservation(e) || e.snapshotIncomplete) {
+			// Waking cannot undo an orphan participant's Deployment fence. Its
+			// existing reservation rejoins the pacer before replicas/template may
+			// change; other hibernation states keep their exclusive lane.
+			e.hibernation = false
+			t.outcomes[e.w.ID].State = "waiting_evidence"
+		}
 		e.markerReport = captureRollMarkerReport(e)
 	}
 	// Account for drained held workers using the newer pod snapshot before any
@@ -639,7 +649,7 @@ func (m *Materializer) adoptOrphanCanary(ctx context.Context, t *rollTick, pool 
 // Deployment, with no competing claim mirror.
 func (m *Materializer) orphanCanaryCandidate(t *rollTick, e *rollEntry) bool {
 	r := e.marker
-	if r == nil || r.Canary || r.Completed || e.dep == nil || e.dep.UID == "" || e.dep.DeletionTimestamp != nil ||
+	if r == nil || r.Canary || r.Completed || e.w.Hibernation != nil || e.dep == nil || e.dep.UID == "" || e.dep.DeletionTimestamp != nil ||
 		e.dep.Spec.Replicas == nil || *e.dep.Spec.Replicas != 1 || e.drift || e.recovery || e.blocked != "" ||
 		(e.claim != nil && e.claim.Annotations[annotationRoll] != "") {
 		return false
@@ -1636,7 +1646,7 @@ func maintenanceActive(w protocol.DesiredWorker) bool {
 // servingEligible requires confirmed automatic release before counting coverage.
 // An omitted effective field preserves the older API's drain-only behavior.
 func servingEligible(w protocol.DesiredWorker) bool {
-	return w.ManualCordonedAt == nil && (w.EffectiveCordoned == nil || !*w.EffectiveCordoned) &&
+	return w.Hibernation == nil && w.ManualCordonedAt == nil && (w.EffectiveCordoned == nil || !*w.EffectiveCordoned) &&
 		w.DrainingSince == nil && !w.DiskPressure && !maintenanceActive(w)
 }
 
