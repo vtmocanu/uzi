@@ -3217,7 +3217,18 @@ export class WorkerClient {
           !Number.isSafeInteger(body.claim_generation) || (body.claim_generation ?? 0) <= 0 ||
           !Number.isSafeInteger(body.followup_park_seq) || (body.followup_park_seq ?? 0) <= 0)
         throw new ReportPreconditionError("follow-up finalize requires the followup_finalize_admission_v1 feature, a positive claim_generation and a positive followup_park_seq");
-      return this.reportStateOnce(runId, path, body, signal, CROSS_CHECK_RESPONSE_MAX_BYTES);
+      // An earlier transport attempt inside this call may have reached the server and admitted the
+      // finalize before its ACK was lost. A later attempt's rollback 400 (an old pod) then proves
+      // nothing about that earlier attempt, so it must not read as "unsupported, nothing applied":
+      // it is rethrown as an uncertain outcome, which the runner keeps as unconfirmed.
+      const evidence: StateAttemptEvidence = { ambiguous: false, refusals: 0 };
+      try {
+        return await this.reportStateOnce(runId, path, body, signal, CROSS_CHECK_RESPONSE_MAX_BYTES, evidence);
+      } catch (error) {
+        if ((evidence.refusedAfterAmbiguity || evidence.definiteAfterAmbiguity) && isFollowupFinalizeUnsupported(error))
+          throw new Error("follow-up finalize outcome uncertain", { cause: error });
+        throw error;
+      }
     }
     // Once a source fence is negotiated, never retry its write without that fence
     // on a rolled-back strict decoder. Initial older-API calls retain compatibility.

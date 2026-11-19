@@ -138,6 +138,25 @@ describe("client followup_finalize report", () => {
     });
   }
 
+  for (const [name, text] of [
+    ["the generic invalid-state error", PRE_FINALIZE_400],
+    ["the strict-decode error", "invalid request body"],
+  ] as const) {
+    it(`a lost response followed by ${name} in the same call is an uncertain outcome, not an unsupported api`, async t => {
+      let calls = 0;
+      t.mock.method(globalThis, "fetch", async () => {
+        calls++;
+        // Attempt 1 may have reached the server and admitted the finalize; its response is lost.
+        if (calls === 1) throw new TypeError("fetch failed");
+        return new Response(JSON.stringify({ error: text }), { status: 400 });
+      });
+      const error = await withFeature().reportState(RUN, finalize()).then(() => undefined, (e: unknown) => e);
+      assert.equal(calls, 2);
+      assert.ok(error instanceof Error && /outcome uncertain/.test(error.message));
+      assert.equal(isFollowupFinalizeUnsupported(error), false);
+    });
+  }
+
   it("another 400 is not an unsupported api", async t => {
     t.mock.method(globalThis, "fetch", async () => new Response(JSON.stringify({ error: "claim_generation_required" }), { status: 400 }));
     const error = await withFeature().reportState(RUN, finalize()).then(() => undefined, (e: unknown) => e);

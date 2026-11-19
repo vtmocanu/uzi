@@ -488,6 +488,63 @@ func TestFollowupFinalizeRaceOrdersLiveDB(t *testing.T) {
 		}
 	})
 
+	t.Run("an admission started while a follow-up insert is uncommitted waits for it and refuses with followup_pending", func(t *testing.T) {
+		id, seq := f.ffParked()
+		tx, err := f.pool.Begin(f.ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(f.ctx) }()
+		// The insert trigger takes the run row lock; the follow-up stays uncommitted.
+		in, err := store.New(tx).CreateRunInput(f.ctx, store.CreateRunInputParams{RunID: id, Kind: "follow_up"})
+		if err != nil {
+			t.Fatalf("follow-up insert in tx: %v", err)
+		}
+		done := make(chan error, 1)
+		go func() {
+			_, _, err := f.ffFinalize(id, 1, seq)
+			done <- err
+		}()
+		// Event-driven: wait until the admission is blocked on a lock, then make sure it has not returned.
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			var waiting int
+			if err := f.pool.QueryRow(f.ctx, `SELECT count(*) FROM pg_locks WHERE NOT granted`).Scan(&waiting); err != nil {
+				t.Fatal(err)
+			}
+			if waiting > 0 {
+				break
+			}
+			select {
+			case err := <-done:
+				t.Fatalf("the admission did not wait for the uncommitted follow-up: %v", err)
+			default:
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("the admission never blocked on the follow-up's run lock")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if err := tx.Commit(f.ctx); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case err := <-done:
+			if !errors.Is(err, ErrFollowupFinalizePending) {
+				t.Fatalf("admission after the follow-up committed = %v, want ErrFollowupFinalizePending", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("the admission never returned after the follow-up committed")
+		}
+		if got := f.ffRow(id); got.status != "awaiting_followup" || got.finalizeGen != -1 {
+			t.Fatalf("a refused admission wrote: %+v", got)
+		}
+		var deliverable bool
+		if err := f.pool.QueryRow(f.ctx, `SELECT disposition IS NULL AND applied_at IS NULL FROM run_user_inputs WHERE id = $1`, in.ID).Scan(&deliverable); err != nil || !deliverable {
+			t.Fatalf("the follow-up is no longer deliverable (deliverable %v, err %v)", deliverable, err)
+		}
+	})
+
 	t.Run("a follow-up committed first is seen by the admission", func(t *testing.T) {
 		id, seq := f.ffParked()
 		f.ffFollowUp(id)
