@@ -738,13 +738,29 @@ Caveats:
 - Clearing `newPlacement` before updating the global placement sends stamped workers back
   to the old nodes, where their new volumes may not attach. Rolling back to a controller
   version without this feature has the same effect, because it ignores the stamp.
+- A paced restore that waits on admission holds its worker at zero replicas, so its
+  `WaitForFirstConsumer` claims stay Pending: such a claim binds only once a pod is
+  scheduled to consume it. The controller does not report this narrowly evidenced pause as
+  stranded (no synthesized `stuck`, no `pvc-bind-timeout` log line) when, among other checks
+  (see [ADR-0837](../adr/0837-worker-disk-lifecycle.md) D6), the worker has one Deployment
+  held at explicit zero replicas under an open roll reservation for the API's desired
+  worker, no pod labelled for the worker exists, no pod mounts the claim, and the claim's
+  StorageClass reads as `WaitForFirstConsumer`. Without an open reservation there is no
+  exemption: a worker scaled to zero by hand in step 2.4 gets one only once its restore is
+  admitted, and a pin change can cancel one while the worker stays at zero. Until the worker
+  is admitted again its claims can still be reported stranded after the bind timeout, and
+  the report alone does not distinguish that wait from a storage fault. The class read
+  needs `workers.storageClassRead.create` (default `true`); without it, a waiting restore's
+  claims can be reported stranded after the bind timeout, and that report keeps the restore
+  unadmitted at zero replicas, so its claims cannot bind and its roll pool stays held until
+  the class read is restored or an operator intervenes. Claim
+  ages are never reset: after replicas are restored the original age applies, so a brief
+  `stuck` until the volume binds is expected. Waiting alone is not grounds to delete or
+  recreate claims repeatedly, bypass pacing, force-roll or remove reservations. Pending
+  alone proves neither a storage fault nor healthy storage (#4468).
 - Known issues that can stall a restore in step 2.7:
   - a roll pool whose participant reservations have lost their canary holds every
     participant, and the controller does not recover it yet (#4466);
-  - while a restore waits on admission, its `WaitForFirstConsumer` claims stay Pending
-    before any consumer has tried to bind them, and can be reported stranded after the
-    bind timeout (#4468); Pending alone proves neither a storage fault nor healthy
-    storage;
   - the roll status can drop a worker's health row when its blocker is synthetic, and
     the worker list shares that status (#4467); when it looks stale, inspect the live
     Deployment, reservation, claims and pod, and the controller logs.

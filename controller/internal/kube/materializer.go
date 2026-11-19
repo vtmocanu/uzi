@@ -183,6 +183,10 @@ func (m *Materializer) Observe(ctx context.Context) ([]reconcile.ObservedWorker,
 		pods:                map[string][]corev1.Pod{},
 		blocked:             map[string]bool{},
 		deploymentNamespace: map[string]string{},
+		deployments:         map[string]*appsv1.Deployment{},
+		dataClaims:          map[string]*corev1.PersistentVolumeClaim{},
+		claimMounts:         map[string]bool{},
+		incomplete:          map[string]bool{},
 	}
 	for _, ns := range namespaces {
 		if err := m.observeNamespace(ctx, ns, byID, deploymentCounts, &capacityEvidence); err != nil {
@@ -190,8 +194,10 @@ func (m *Materializer) Observe(ctx context.Context) ([]reconcile.ObservedWorker,
 		}
 	}
 
+	classCache := map[string]bool{}
 	out := make([]reconcile.ObservedWorker, 0, len(byID))
 	for _, o := range byID {
+		o.TimeoutDeferredClaims = m.timeoutDeferredClaims(ctx, o, &capacityEvidence, deploymentCounts[o.ID], classCache)
 		// Capacity uniqueness is proved only after every configured namespace fold.
 		recordSchedulerCapacity(o, capacityEvidence.pods[o.ID], capacityEvidence.deploymentNamespace[o.ID], capacityEvidence.podListFailed || capacityEvidence.blocked[o.ID] || deploymentCounts[o.ID] != 1)
 		out = append(out, *o)
@@ -225,11 +231,21 @@ func (m *Materializer) flagStrandedPVCs(workers []reconcile.ObservedWorker) {
 		}
 		var timedOut []target
 		for _, t := range targets {
+			// A direct-field claim whose bind-timeout is deferred (paused restore) falls
+			// through to the namespace-qualified scan below, which skips deferred keys.
+			if t.phase == string(corev1.ClaimPending) && t.created != nil && len(w.TimeoutDeferredClaims) > 0 {
+				for _, claim := range w.SchedulerPendingClaims {
+					if claim.Name == t.name && claim.CreatedAt.Equal(*t.created) && w.TimeoutDeferredClaims[claim.Namespace+"/"+claim.Name] {
+						t.phase, t.created = "", nil
+						break
+					}
+				}
+			}
 			// A later namespace fold may hide an older Pending claim of the same
 			// name. Retain legacy volume priority while checking every observed claim.
 			if t.phase != string(corev1.ClaimPending) || t.created == nil || m.now().Sub(*t.created) < pvcBindTimeout {
 				for _, claim := range w.SchedulerPendingClaims {
-					if claim.Name == t.name && m.now().Sub(claim.CreatedAt) >= pvcBindTimeout {
+					if claim.Name == t.name && m.now().Sub(claim.CreatedAt) >= pvcBindTimeout && !w.TimeoutDeferredClaims[claim.Namespace+"/"+claim.Name] {
 						t.phase, t.created = string(corev1.ClaimPending), &claim.CreatedAt
 						break
 					}
@@ -250,7 +266,7 @@ func (m *Materializer) flagStrandedPVCs(workers []reconcile.ObservedWorker) {
 		}
 		capacity := w.SchedulerCapacityReason != ""
 		for _, claim := range w.SchedulerPendingClaims {
-			if m.now().Sub(claim.CreatedAt) < pvcBindTimeout {
+			if m.now().Sub(claim.CreatedAt) < pvcBindTimeout || w.TimeoutDeferredClaims[claim.Namespace+"/"+claim.Name] {
 				continue
 			}
 			if !w.SchedulerMountedClaims[claim.Namespace+"/"+claim.Name] {
@@ -306,6 +322,9 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 	if err != nil {
 		return fmt.Errorf("list deployments in %s: %w", ns, err)
 	}
+	if deployments.Continue != "" {
+		capacityEvidence.incomplete[ns] = true
+	}
 	for i := range deployments.Items {
 		d := &deployments.Items[i]
 		id, ours := IsOurs(d.Labels)
@@ -316,6 +335,7 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 		o := get(id)
 		deploymentCounts[id]++
 		capacityEvidence.deploymentNamespace[id] = ns
+		capacityEvidence.deployments[id] = d
 		o.HasDeployment = true
 		o.DeploymentUID = string(d.UID)
 		o.DeploymentResourceVersion = d.ResourceVersion
@@ -356,6 +376,9 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 	if err != nil {
 		return fmt.Errorf("list persistentvolumeclaims in %s: %w", ns, err)
 	}
+	if pvcs.Continue != "" {
+		capacityEvidence.incomplete[ns] = true
+	}
 	for i := range pvcs.Items {
 		p := &pvcs.Items[i]
 		id, ours := IsOurs(p.Labels)
@@ -376,10 +399,15 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 			o.TerminatingClaims[ns+"/"+p.Name] = true
 		}
 		if !terminating && p.Status.Phase == corev1.ClaimPending && (p.Name == nixPVCName(id) || p.Name == dataPVCName(id) || p.Name == dindDataPVCName(id)) {
-			o.SchedulerPendingClaims = append(o.SchedulerPendingClaims, reconcile.SchedulerPendingClaim{Namespace: ns, Name: p.Name, CreatedAt: p.CreationTimestamp.Time})
+			class := ""
+			if p.Spec.StorageClassName != nil {
+				class = *p.Spec.StorageClassName
+			}
+			o.SchedulerPendingClaims = append(o.SchedulerPendingClaims, reconcile.SchedulerPendingClaim{Namespace: ns, Name: p.Name, CreatedAt: p.CreationTimestamp.Time, StorageClassName: class})
 		}
 		switch p.Name {
 		case dataPVCName(id):
+			capacityEvidence.dataClaims[ns+"/"+p.Name] = p
 			o.HasDataPVC = true // exists-in-ANY-state (gates the create, UNCHANGED)
 			dataClaim := claimObservationOf(ns, id, p)
 			o.DataClaim = &dataClaim // any state, Terminating included (issue #3890)
@@ -438,6 +466,11 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 			"namespace", ns, "error", err)
 		return nil
 	}
+	if pods.Continue != "" {
+		// An incomplete pod list cannot prove the absence of a consumer.
+		capacityEvidence.incomplete[ns] = true
+	}
+	recordClaimMounts(capacityEvidence, ns, pods.Items)
 	byWorker := map[string][]corev1.Pod{}
 	// claimUsers maps a PVC claim name to the uids of every pod in the namespace, labelled
 	// or not, that mounts it: a writer the worker's own label never shows (hibernation

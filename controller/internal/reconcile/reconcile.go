@@ -224,6 +224,10 @@ type ObservedWorker struct {
 	SchedulerCapacityReason string                  `json:"-"`
 	SchedulerMountedClaims  map[string]bool         `json:"-"` // namespace/name keys
 	SchedulerPendingClaims  []SchedulerPendingClaim `json:"-"`
+	// TimeoutDeferredClaims holds namespace/name keys of Pending claims whose bind-timeout
+	// is deferred because the worker is deliberately held at zero replicas under an open
+	// roll reservation (WaitForFirstConsumer claims cannot bind without a pod).
+	TimeoutDeferredClaims map[string]bool `json:"-"`
 }
 
 // RunnerLayout classifies where a Docker worker's pods keep the run workdir
@@ -247,6 +251,8 @@ type SchedulerPendingClaim struct {
 	Namespace string
 	Name      string
 	CreatedAt time.Time
+	// StorageClassName is the claim's spec.storageClassName ("" when unset).
+	StorageClassName string
 }
 
 // RollHealth is one worker's roll state as read from its pod, and it is the answer
@@ -407,7 +413,7 @@ func (l *Loop) Tick(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	observed, err := l.materializer.Observe(ctx)
+	observed, err := l.materializer.Observe(WithDesiredWorkers(ctx, resp.Workers))
 	if err != nil {
 		return err
 	}
