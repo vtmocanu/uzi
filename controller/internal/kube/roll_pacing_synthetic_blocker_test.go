@@ -62,6 +62,7 @@ func TestRollPacingPoolBlockersHaveNoSyntheticWorkerID(t *testing.T) {
 		name       string
 		reason     string
 		wantWorker string   // exact BlockingWorkerID required on every outcome, "" = unchecked
+		wantCanary string   // exact CanaryID required on every outcome, "" = must be absent
 		wantMut    []string // measured on the unfixed code; admission must not change
 		run        func(t *testing.T) (*Materializer, *fake.Clientset, []protocol.DesiredWorker)
 	}{
@@ -129,6 +130,7 @@ func TestRollPacingPoolBlockersHaveNoSyntheticWorkerID(t *testing.T) {
 			name:       "real-blocker",
 			reason:     "ImagePullBackOff",
 			wantWorker: syntheticBlockerID(2),
+			wantCanary: syntheticBlockerID(1),
 			wantMut: []string{
 				"patch deployments uzi-hw-00000000-0000-0000-0000-000000000001 sha256=4d7a7d5511e62cdc",
 				"create persistentvolumeclaims uzi-hw-00000000-0000-0000-0000-000000000001-data",
@@ -191,6 +193,13 @@ func TestRollPacingPoolBlockersHaveNoSyntheticWorkerID(t *testing.T) {
 				}
 				if p.BlockingReason != nil && strings.Contains(*p.BlockingReason, tc.reason) {
 					sawReason = true
+				}
+				gotCanary := ""
+				if p.CanaryID != nil {
+					gotCanary = *p.CanaryID
+				}
+				if gotCanary != tc.wantCanary {
+					t.Errorf("%s: CanaryID = %q, want %q", w.ID, gotCanary, tc.wantCanary)
 				}
 				if tc.wantWorker != "" && (p.BlockingWorkerID == nil || *p.BlockingWorkerID != tc.wantWorker) {
 					t.Errorf("%s: BlockingWorkerID = %v, want %s", w.ID, p.BlockingWorkerID, tc.wantWorker)

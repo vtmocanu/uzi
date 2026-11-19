@@ -148,3 +148,22 @@ func TestControllerStatusWrongShapePacingKeepsRowAndBlockingKind(t *testing.T) {
 		})
 	}
 }
+
+// encoding/json repairs invalid UTF-8 to U+FFFD, so corrupt pacing bytes must be
+// rejected before decoding: the pacing is discarded, the row still lands (#4467).
+func TestControllerStatusInvalidUTF8PacingIsDiscarded(t *testing.T) {
+	st := &statusStore{rows: 1}
+	h := newProtocolHandler(t, st)
+	body := []byte(`{"kind":"fleet","workers":[{"id":"11111111-1111-1111-1111-111111111111","phase":"stuck","pod_phase":"Pending",` +
+		`"blocking_reason":"scheduler capacity: insufficient cpu","blocking_kind":"scheduler_capacity",` +
+		`"pacing":{"state":"held","blocking_reason":"bad ` + "\xff" + ` byte"}}]}`)
+	rec := httptest.NewRecorder()
+	h.ControllerStatus(rec, httptest.NewRequest(http.MethodPost, "/api/controller/status", strings.NewReader(string(body))))
+	if rec.Code != http.StatusNoContent || len(st.upserts) != 1 {
+		t.Fatalf("status=%d upserts=%d", rec.Code, len(st.upserts))
+	}
+	p := st.upserts[0]
+	if len(p.Pacing) != 0 || !p.UpdatePacing || p.Phase != "stuck" || !p.BlockingKind.Valid {
+		t.Fatalf("pacing=%s update=%v phase=%q kind=%+v", p.Pacing, p.UpdatePacing, p.Phase, p.BlockingKind)
+	}
+}

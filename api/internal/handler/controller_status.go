@@ -8,6 +8,7 @@ import (
 	"math"
 	"net/http"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -247,6 +248,12 @@ type statusEnvelope struct {
 func decodeOptionalPacing(raw json.RawMessage) (*workersvc.PacingReport, string) {
 	if len(raw) == 0 || string(raw) == "null" {
 		return nil, ""
+	}
+	// encoding/json silently replaces invalid UTF-8 with U+FFFD, which would hide the
+	// corruption from NormalizePacingReport's utf8.ValidString bound; check the raw
+	// bytes first so corrupt pacing is discarded rather than repaired.
+	if !utf8.Valid(raw) {
+		return nil, "invalid_pacing_content"
 	}
 	var wire struct {
 		State            string          `json:"state"`
