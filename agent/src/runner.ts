@@ -6932,7 +6932,10 @@ export class RunRunner {
         flight.preserveRecoveryClone = true;
         flight.preserveSession = true;
         await batcher.close().catch(() => undefined);
-      } else if (flight.active?.shuttingDown && !(err instanceof RetainedRecoveryStop)) {
+      } else if (flight.active?.shuttingDown && !(err instanceof RetainedRecoveryStop) &&
+          !(err instanceof ServerWallParkedError)) {
+        // A confirmed server wall park keeps its clone, HOME and retirement path below,
+        // even if shutdown started after the ACK was parsed.
         // Issue #3767: a spend-limit terminal that arrives while the worker is already shutting down
         // takes this arm and sends no park request.
         if (err instanceof SpendLimitHoldError) {

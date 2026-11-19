@@ -184,8 +184,8 @@ function parkingExecutor(log: { outcomes: FollowUpOutcome[] }, idleMs = 40): Exe
   };
 }
 
-function build(executor: Executor, outbox: Outbox | undefined, gitlab = fakeGitlab().gitlab, extra: Record<string, unknown> = {}): RunRunner {
-  const r = new RunRunner(client, git, () => ({ executor }), nullLogger(), 20, undefined, {
+function build(executor: Executor, outbox: Outbox | undefined, gitlab = fakeGitlab().gitlab, extra: Record<string, unknown> = {}, homeDir?: string): RunRunner {
+  const r = new RunRunner(client, git, () => ({ executor, homeDir }), nullLogger(), 20, undefined, {
     pollMs: 5, planApprovalTimeoutMs: 0, prDescriptionHeadLagMs: 0, recoveryRetryMs: 5,
     checkpointTestHooks: { retryBackoffMs: [0, 0] }, gitlab,
     ...(outbox ? { outbox } : {}), ...extra,
@@ -472,6 +472,59 @@ describe("interactive follow-up finalize admission (issue #4479)", () => {
     assert.deepEqual(log.outcomes, []);
     assert.equal(cap.flight?.preserveRecoveryClone, true);
     assert.equal(cap.flight?.preserveSession, true);
+    assert.ok(!statuses(claim.run_id).includes("completed") && !statuses(claim.run_id).includes("failed"));
+    assert.equal(api.publicationIntentRequests.length, 0);
+  });
+
+  it("shutdown racing a wall-park ACK keeps the unpublished clone, HOME and wall-park retirement", async () => {
+    const { claim, m, outbox, log } = await idleSetup();
+    m.script = [{ kind: "raw", status: 409, body: { disposition: "stale_claim",
+      run: { id: claim.run_id, status: "paused", hold_reason: "budget_exhausted", claim_generation: GEN + 1 } } }];
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "followup-wall-shutdown-"));
+    roots.push(root);
+    const homeDir = path.join(root, "home");
+    let worktree = "";
+    const executor: Executor = { async run(ctx) {
+      worktree = ctx.worktreePath;
+      commitWork(ctx, "unpublished work before wall park");
+      fs.mkdirSync(homeDir, { recursive: true });
+      fs.writeFileSync(path.join(homeDir, "session"), "synthetic transcript");
+      log.outcomes.push(await ctx.awaitFollowUp!(40));
+      return { branch: ctx.branch };
+    } };
+    const r = build(executor, outbox, undefined, {}, homeDir);
+    const cap = captureFlight(r);
+    const internals = r as unknown as {
+      admitFollowUpFinalize(flight: NonNullable<Captured["flight"]>, ...rest: unknown[]): Promise<unknown>;
+      retireFinalizeRecord(flight: unknown, site: string): Promise<void>;
+      publishCheckpointOutcome(...args: unknown[]): Promise<{ published: false; reason: "rejected"; httpStatus: number }>;
+    };
+    const admit = internals.admitFollowUpFinalize.bind(r);
+    let wallSeen = false;
+    internals.admitFollowUpFinalize = async (flight, ...rest) => {
+      try { return await admit(flight, ...rest); }
+      catch (error) {
+        if (error instanceof Error && error.name === "ServerWallParkedError") {
+          wallSeen = true;
+          r.shutdown(); // ACK parsed; shutdown wins the race before dispatchFailure selects its arm.
+        }
+        throw error;
+      }
+    };
+    // No checkpoint can supply an alternate durability proof for deleting the clone.
+    internals.publishCheckpointOutcome = async () => ({ published: false, reason: "rejected", httpStatus: 403 });
+    const retire = internals.retireFinalizeRecord.bind(r);
+    const sites: string[] = [];
+    internals.retireFinalizeRecord = async (flight, site) => { sites.push(site); await retire(flight, site); };
+    await finish(r, claim);
+    assert.equal(wallSeen, true);
+    assert.equal(m.finalizeRequests, 1);
+    assert.equal(cap.flight?.preserveRecoveryClone, true);
+    assert.equal(cap.flight?.preserveSession, true);
+    assert.equal(fs.readFileSync(path.join(worktree, "UZI_RUN.md"), "utf8"), "# unpublished work before wall park\n");
+    assert.equal(fs.readFileSync(path.join(homeDir, "session"), "utf8"), "synthetic transcript");
+    assert.deepEqual(sites, ["server_wall_park"]);
+    assert.deepEqual(log.outcomes, []);
     assert.ok(!statuses(claim.run_id).includes("completed") && !statuses(claim.run_id).includes("failed"));
     assert.equal(api.publicationIntentRequests.length, 0);
   });
