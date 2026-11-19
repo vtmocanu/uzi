@@ -42,11 +42,13 @@ test("inventory sees a second native function after an allowed member", () => {
 });
 
 test("callback result requires matching call id and synthetic success content", () => {
-  const item = { type: "custom_tool_call_output", call_id: "spike-exec", output: [{ type: "text", text: 'Script completed: {"code":0,"stdout":"synthetic","stderr":""}' }] };
+  const item = { type: "custom_tool_call_output", call_id: "spike-exec", output: [{ type: "text", text: 'Script completed\nOutput:\n{"code":0,"stdout":"synthetic","stderr":""}' }] };
   assert.equal(callbackResultMatches(item), true);
   assert.equal(callbackResultMatches({ ...item, call_id: "wrong" }), false);
   assert.equal(callbackResultMatches({ ...item, output: "" }), false);
   assert.equal(callbackResultMatches({ ...item, output: '{"code":0,"stdout":"wrong"}' }), false);
+  assert.equal(callbackResultMatches({ ...item, output: '{"code":0.5,"stdout":"synthetic","stderr":""}' }), false);
+  assert.equal(callbackResultMatches({ ...item, output: '{"code":1,"stdout":"synthetic","stderr":"","nested":{"code":0}}' }), false);
 });
 
 test("session directory enumeration stops before bulk allocation", () => {
@@ -73,4 +75,25 @@ test("session directory enumeration stops before bulk allocation", () => {
     fs.readdirSync = bulk; fs.opendirSync = incremental; syncBuiltinESMExports();
     rmSync(base, { recursive: true, force: true });
   }
+});
+
+test("session copy charges growth after stat before copying bytes", () => {
+  const base = mkdtempSync(path.resolve(__dirname, "../../.uzi/scratch/session-growth-test-"));
+  const source = path.join(base, "sessions"); mkdirSync(source);
+  const file = path.join(source, "session.jsonl"); writeFileSync(file, "x");
+  const original = fs.lstatSync;
+  let injected = false;
+  fs.lstatSync = ((...args: any[]) => {
+    const stat = (original as any)(...args);
+    if (String(args[0]) === file && !injected) {
+      injected = true; writeFileSync(file, Buffer.alloc(4 * 1024 * 1024 + 1, 120));
+    }
+    return stat;
+  }) as typeof fs.lstatSync;
+  syncBuiltinESMExports();
+  try {
+    assert.throws(() => copySyntheticSessions(source, path.join(base, "copy")), /session-copy-limit/);
+    assert.equal(injected, true);
+    assert.ok(original(path.join(base, "copy/session.jsonl")).size <= 4 * 1024 * 1024);
+  } finally { fs.lstatSync = original; syncBuiltinESMExports(); rmSync(base, { recursive: true, force: true }); }
 });

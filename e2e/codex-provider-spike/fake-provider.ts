@@ -212,5 +212,14 @@ export function callbackResultMatches(value: unknown): boolean {
   if (!["custom_tool_call_output", "function_call_output"].includes(String(v.type)) || v.call_id !== "spike-exec") return false;
   const texts = typeof v.output === "string" ? [v.output] : Array.isArray(v.output)
     ? v.output.flatMap(c => c && typeof c === "object" && typeof c.text === "string" ? [c.text] : []) : [];
-  return texts.some(output => /"stdout"\s*:\s*"synthetic"/.test(output) && /"code"\s*:\s*0/.test(output));
+  return texts.some(output => {
+    const marker = "\nOutput:\n";
+    const payload = output.startsWith("Script completed") && output.includes(marker)
+      ? output.slice(output.indexOf(marker) + marker.length).trim() : output.trim();
+    try {
+      const result = JSON.parse(payload) as Record<string, unknown>;
+      return result !== null && typeof result === "object" && !Array.isArray(result)
+        && result.code === 0 && result.stdout === "synthetic" && result.stderr === "";
+    } catch { return false; }
+  });
 }
