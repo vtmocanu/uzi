@@ -794,25 +794,30 @@ independent. A pool with one worker can have an outage during its roll. Waiting
 indefinitely can delay capacity turnover and security fixes indefinitely.
 
 A roll pool whose participants still carry incomplete reservations but no canary
-(for example after the canary's Deployment was recreated) recovers on its own when
+(for example after its reservation annotation was reset) recovers on its own when
 one participant already has full current-incarnation proof: a fresh registration,
-exact version, heartbeat and coverage on its reserved template with one replica.
+exact version, heartbeat and coverage on its reserved template with one replica,
+and it is not cordoned or drained.
 The first tick only marks that participant canary and does nothing else in the
 pool. Later ticks restore the other participants through normal admission, for
 example recreating a paused worker's claims and scaling it back. Removing only one
 participant's marker, uncordoning, or deleting a previously registered worker's
-Deployment need not repair the pool: the other markers remain, uncordoning adds no
-proof, and deletion loses the evidence and trips the missing-deployment guard.
+Deployment need not repair the pool: the other markers remain, uncordoning alone
+supplies no registration proof, and deletion loses the evidence and trips the
+missing-deployment guard (`missing deployment lacks first-provision evidence;
+explicit recovery required`), which blocks adoption for the whole pool. The
+controller never recreates a deleted participant's Deployment.
 
 While no canary exists the pool can stay held:
 
 - no participant has the proof: held with `participant reservation without canary;
   explicit recovery required`;
 - a smaller-ID participant is neither proven nor fenced (stale evidence, a desired
-  generation change, a claim mirror, or a recreated Deployment): held with `earlier
+  generation change, a claim mirror, or a Deployment recreated still carrying its marker): held with `earlier
   participant may hold an unresolved adoption request`. It clears when that
-  participant regains proof or its Deployment changes (replicas, template, marker or
-  deletion).
+  participant regains proof or its Deployment is rescaled, retemplated or loses its
+  marker. Deleting that Deployment does not clear it: the missing-deployment guard
+  above takes over.
 
 Design: [ADR-1470](../adr/1470-paced-hosted-worker-rolls.md).
 

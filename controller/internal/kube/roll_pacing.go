@@ -421,7 +421,8 @@ func (m *Materializer) planRoll(ctx context.Context, desired []protocol.DesiredW
 }
 
 // holdForLayoutMigration reports the worker held and withdraws its own incomplete
-// roll reservation. After ordinary pool planning, selectMigrationDrains separately
+// roll reservation (except a canary with incomplete same-cohort participants; see
+// below). After ordinary pool planning, selectMigrationDrains separately
 // considers an image_roll cordon using frozen poll coverage, refreshed layout
 // evidence, and the owner/lane budget for observed, selected or possibly drained
 // held workers. This hold never admits replacement. The reservation must go because

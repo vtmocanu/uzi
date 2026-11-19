@@ -89,14 +89,17 @@ handoff is not an additional journal and preserves legacy /data self-heal.
 #### Lost-canary adoption (#4466)
 
 When a pool has incomplete participant reservations but no canary (annotation
-reset, canary Deployment recreated), the controller may adopt one existing
+reset, or a canary Deployment recreated without its marker by an actor outside
+the controller; the controller itself never recreates a deleted participant), the controller may adopt one existing
 participant as canary instead of holding the pool for explicit recovery. The
 chosen participant must pass the unchanged promotion proof (D4: fresh
 registration with a new nonce, exact version, current pod UID/ancestry,
-heartbeat, coverage, and no pressure, maintenance or custody-drain fence), be on
+heartbeat, coverage, serving eligibility (not cordoned or drained), and no
+pressure, maintenance or custody-drain fence), be on
 its reserved template with exactly one replica, not drift, and carry no claim
-mirror. The smallest worker ID wins. Only its marker's `canary` bit changes, by
-one metadata patch conditioned on the Deployment UID/resourceVersion; nonce,
+mirror. The smallest worker ID wins. Of the marker, only its `canary` bit changes, by
+one metadata patch (the usual operator labels and annotations are merged as on
+every reservation write) conditioned on the Deployment UID/resourceVersion; nonce,
 previous version, target, coverage and `completed=false` are preserved. No
 registration evidence is fabricated, nothing is completed, no peer is cleaned
 up and no cordon changes.
@@ -137,7 +140,11 @@ closed.
 
 This deviates from "adopt the smallest eligible participant": adoption holds
 while an earlier participant is unresolved, and clears automatically once that
-participant regains proof or its Deployment changes. The
+participant regains proof or its Deployment is rescaled, retemplated or loses its
+marker. Deleting a previously registered participant's Deployment does not clear
+it: that worker then trips the missing-deployment guard ("missing deployment
+lacks first-provision evidence; explicit recovery required"), which blocks
+adoption for the whole pool. The
 layout-migration hold has a matching fence: a held canary keeps its incomplete
 reservation and fences the pool while incomplete same-cohort participants
 remain, instead of cancelling it, because cancelling would leave those
