@@ -385,7 +385,10 @@ func rollSignalFromRow(w store.ListWorkersByUserRow) *workersvc.RollSignal {
 		t := w.RollUpgradingSince.Time
 		sig.UpgradingSince = &t
 	}
-	sig.BlockingKind = workersvc.EffectiveBlockingKind(sig)
+	// Stored, not effective: a size_refused / pvc_rejected kind must reach the classifier (it is
+	// what lets a pod-less worker surface its refusal); readers needing capacity still call
+	// EffectiveBlockingKind, which yields only scheduler_capacity.
+	sig.BlockingKind = workersvc.StoredBlockingKind(sig)
 	return sig
 }
 
@@ -424,7 +427,7 @@ func rollSignalFromAdminRow(w store.ListAllWorkersRow) *workersvc.RollSignal {
 		t := w.RollUpgradingSince.Time
 		sig.UpgradingSince = &t
 	}
-	sig.BlockingKind = workersvc.EffectiveBlockingKind(sig)
+	sig.BlockingKind = workersvc.StoredBlockingKind(sig) // see rollSignalFromRow
 	return sig
 }
 

@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sort"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -26,6 +27,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/termsafe"
 	"github.com/vtmocanu/uzi/api/internal/workersize"
 	"github.com/vtmocanu/uzi/api/internal/workersize/builtin"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
@@ -195,6 +197,7 @@ func (h *Handler) AdminListWorkerSizes(w http.ResponseWriter, r *http.Request) {
 		Editable:   gate.Editable,
 		Advisories: []apitypes.WorkerSizeAdvisoryDTO{},
 		MaxSizes:   maxWorkerSizes,
+		Refusals:   h.sizeRefusals(ctx),
 	}
 	if !gate.Editable {
 		reason, code := gate.Reason, gate.Code
@@ -206,6 +209,63 @@ func (h *Handler) AdminListWorkerSizes(w http.ResponseWriter, r *http.Request) {
 		out.Advisories = append(out.Advisories, advisoryDTOs(res.Advisories)...)
 	}
 	httpx.JSON(w, http.StatusOK, out)
+}
+
+// maxSizeRefusals bounds the refusals array of the size list.
+const (
+	maxSizeRefusals    = 50
+	maxRefusalTextByte = 256
+)
+
+// sizeRefusals lists the hosted workers whose latest FRESH stored roll signal is a stuck
+// size_refused or pvc_rejected report, keyed by hosted_size. Freshness is the same API-receipt
+// rule the health check and the worker classifier use (workersvc.DefaultControllerSignalTTL on
+// roll_observed_at). Always non-nil; a read failure yields an empty list, since the refusals
+// are advisory display beside the size table, not part of what an edit depends on.
+func (h *Handler) sizeRefusals(ctx context.Context) []apitypes.WorkerSizeRefusalDTO {
+	out := []apitypes.WorkerSizeRefusalDTO{}
+	if h.q == nil {
+		return out
+	}
+	rows, err := h.q.ListAllWorkers(ctx)
+	if err != nil {
+		slog.Warn("worker size refusals", "error", err)
+		return out
+	}
+	now := h.clock()
+	for _, row := range rows {
+		if row.Worker.Kind != "hosted" || !row.Worker.HostedSize.Valid ||
+			!row.RollObservedAt.Valid || now.Sub(row.RollObservedAt.Time) > workersvc.DefaultControllerSignalTTL {
+			continue
+		}
+		sig := rollSignalFromAdminRow(row)
+		if sig == nil || sig.Phase != workersvc.PhaseStuck {
+			continue
+		}
+		kind := workersvc.StoredBlockingKind(sig)
+		if kind != workersvc.BlockingKindSizeRefused && kind != workersvc.BlockingKindPVCRejected {
+			continue
+		}
+		clean := func(s string) string { return termsafe.SanitizeBounded(termsafe.CellText(s), maxRefusalTextByte) }
+		out = append(out, apitypes.WorkerSizeRefusalDTO{
+			Size: clean(row.Worker.HostedSize.String), WorkerID: row.Worker.ID.String(),
+			WorkerName: clean(row.Worker.Name), Kind: kind, Reason: clean(sig.BlockingReason),
+			ReportedAt: row.RollObservedAt.Time,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Size != out[j].Size {
+			return out[i].Size < out[j].Size
+		}
+		if out[i].WorkerName != out[j].WorkerName {
+			return out[i].WorkerName < out[j].WorkerName
+		}
+		return out[i].WorkerID < out[j].WorkerID
+	})
+	if len(out) > maxSizeRefusals {
+		out = out[:maxSizeRefusals]
+	}
+	return out
 }
 
 // refuseReadOnly answers 409 for a gated mutation, carrying the stable code and the reason.

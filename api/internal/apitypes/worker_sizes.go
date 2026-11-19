@@ -85,6 +85,20 @@ type AdminWorkerSizesDTO struct {
 	ReadOnlyCode *string                 `json:"read_only_code"`
 	Advisories   []WorkerSizeAdvisoryDTO `json:"advisories"`
 	MaxSizes     int                     `json:"max_sizes"`
+	// Refusals lists hosted workers whose latest fresh controller report refused their size or
+	// PVC (kind size_refused or pvc_rejected), keyed by the worker's hosted size. Always an
+	// array, at most 50, sorted by size then worker name.
+	Refusals []WorkerSizeRefusalDTO `json:"refusals"`
+}
+
+// WorkerSizeRefusalDTO is one hosted worker the controller refused to render or provision.
+type WorkerSizeRefusalDTO struct {
+	Size       string    `json:"size"`
+	WorkerID   string    `json:"worker_id"`
+	WorkerName string    `json:"worker_name"`
+	Kind       string    `json:"kind"`
+	Reason     string    `json:"reason"`
+	ReportedAt time.Time `json:"reported_at"`
 }
 
 // AdminWorkerSizeWriteDTO is the response of a size edit or reset.

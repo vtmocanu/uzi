@@ -11,10 +11,27 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/clitoken"
 	"github.com/vtmocanu/uzi/api/internal/healthsvc"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
+
+// wantRefusalDTO asserts a refused worker, hibernated or not, reads as a failed provisioning or
+// upgrade with the controller's reason (fixtures are offline and never registered).
+func wantRefusalDTO(t *testing.T, label, kind string, dto apitypes.WorkerDTO) {
+	t.Helper()
+	if dto.UpgradeStatus != workersvc.UpgradeStatusProvisioningFailed && dto.UpgradeStatus != workersvc.UpgradeStatusUpgradeFailed {
+		t.Errorf("%s: upgrade_status = %q, want a failed status", label, dto.UpgradeStatus)
+	}
+	want := "refused: " + kind
+	if dto.UpgradeBlockingReason == nil || *dto.UpgradeBlockingReason != want {
+		t.Errorf("%s: upgrade_blocking_reason = %v, want %q", label, dto.UpgradeBlockingReason, want)
+	}
+	if dto.UpgradeDetail == nil || !strings.Contains(*dto.UpgradeDetail, want) {
+		t.Errorf("%s: upgrade_detail = %v, want it to name %q", label, dto.UpgradeDetail, want)
+	}
+}
 
 // A controller refusal (size_refused, pvc_rejected) is stored as the worker's blocking kind and
 // shown in Admin health, for a normal hosted worker and for a hibernated (pod-less) one, which
@@ -99,10 +116,36 @@ func TestControllerStatusRefusalKindsPersistAndReachHealthLiveDB(t *testing.T) {
 			if dto.UpgradeStatus == workersvc.UpgradeStatusCapacityBlocked || dto.UpgradeBlockingKind != nil {
 				t.Errorf("%s: a stored %s reads as capacity (%s, %v)", f.name, f.kind, dto.UpgradeStatus, dto.UpgradeBlockingKind)
 			}
+			wantRefusalDTO(t, f.name+" (admin row)", f.kind, dto)
 		}
 	}
 	if checked != len(fxs) {
 		t.Fatalf("admin list returned %d of %d workers", checked, len(fxs))
+	}
+
+	// The owner's worker list (GET /api/workers) shows the same failed status and the refusal
+	// reason for the hibernated worker, not an opaque unknown.
+	rec = cookieReq(t, router, http.MethodGet, "/api/workers", cliMintJWT(t, pool, admin), "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/workers = %d %s", rec.Code, rec.Body.String())
+	}
+	var listed struct {
+		Workers []apitypes.WorkerDTO `json:"workers"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &listed); err != nil {
+		t.Fatal(err)
+	}
+	seen := 0
+	for _, dto := range listed.Workers {
+		for _, f := range fxs {
+			if dto.ID == f.id.String() {
+				seen++
+				wantRefusalDTO(t, f.name+" (GET /api/workers)", f.kind, dto)
+			}
+		}
+	}
+	if seen != len(fxs) {
+		t.Fatalf("GET /api/workers returned %d of %d fixture workers", seen, len(fxs))
 	}
 
 	// Admin health names every refused worker, hibernated ones included.
