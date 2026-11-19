@@ -9048,8 +9048,11 @@ export class GitCache {
     const stage = stageGeneration !== null && Number.isSafeInteger(stageGeneration) && stageGeneration > 0
       ? `refs/uzi-incoming/${opts.context.runId}/${stageGeneration}/${randomUUID()}`
       : `refs/uzi-incoming/${randomUUID()}`;
-    const acquireIncoming = async (): Promise<string> => {
+    const closedResult: TrackingUpdateResult = { kind: "not_updated", reason: "ownership_unknown" };
+    // undefined: the refusal generation closed while this import waited for the bare lock; nothing was written.
+    const acquireIncoming = async (): Promise<string | undefined> => {
       this.checkCheckpointCooperation();
+      if (this.refusalGenerationClosed(opts.context)) return undefined;
       opts.checkpointStep?.("checkpoint_import_transport");
       // Ordinary transport failures (including boundary aborts) deliberately throw.
       await this.runGit(barePath, [
@@ -9066,6 +9069,11 @@ export class GitCache {
       return incoming;
     };
     const promoteIncoming = async (incoming: string, authenticated = true): Promise<TrackingUpdateResult> => {
+      if (this.refusalGenerationClosed(opts.context)) {
+        // Closed after the stage was fetched: drop only our own private stage, pin and promote nothing.
+        await this.runGit(barePath, ["update-ref", "-d", stage, incoming]).catch(() => undefined);
+        return closedResult;
+      }
       // No observation survives an unlocked phase: preservation and CAS use current B custody.
       let observed = authenticated ? await this.observeTrackingUnderLock(barePath, branch) : undefined;
       if (observed) this.dropTrackingAttempt(opts.attemptToken, barePath, branch);
@@ -9117,7 +9125,9 @@ export class GitCache {
             // is recorded here when no refusal for it was noted.
             let note = this.refusalNotes.get(opts)?.get(incoming);
             if (!note) note = await this.recordRefusalUnderLock(opts.context, incoming, "P2");
-            if (note.alreadyLedgered && !note.sealed) await this.runGit(barePath, ["update-ref", "-d", stage, incoming]);
+            // A flat (unattributed) stage is no evidence of any run: it is deleted as before.
+            const attributed = stage.startsWith(`refs/uzi-incoming/${opts.context.runId}/`);
+            if (!attributed || (note.alreadyLedgered && !note.sealed)) await this.runGit(barePath, ["update-ref", "-d", stage, incoming]);
           }
         } catch (cause) {
           // An inconclusive owner with a successfully preserved incoming pin is
@@ -9142,7 +9152,8 @@ export class GitCache {
       return this.withLock(barePath, () => {
         const importBranch = async () => {
           const authenticated = await authenticate();
-          return promoteIncoming(await acquireIncoming(), authenticated);
+          const incoming = await acquireIncoming();
+          return incoming === undefined ? closedResult : promoteIncoming(incoming, authenticated);
         };
         return opts.checkpointImportMode === "milestone"
           ? this.withCheckpointHardOnly(importBranch, false) : importBranch();
@@ -9161,6 +9172,7 @@ export class GitCache {
     if (!authenticated) return { kind: "not_updated", reason: "ownership_unknown" };
     const importBranch = async () => {
       const incoming = await this.withLock(barePath, acquireIncoming);
+      if (incoming === undefined) return closedResult;
       return withSourceAuthority(() => this.withLock(barePath, async () => {
         const authenticated = await authenticate();
         if (await this.resolveCommitStrict(barePath, stage) !== incoming)
@@ -9397,7 +9409,7 @@ export class GitCache {
     return this.withLock(barePath, async () => {
       opts.checkpointStep?.("checkpoint_bridge");
       if (this.refusalGenerationClosed(c)) return { kind: "not_updated", reason: "ownership_unknown" };
-      const read =() => this.readRemediationUnderLock(barePath, branch, source, {}, "runtime-restrictions");
+      const read = () => this.readRemediationUnderLock(barePath, branch, source, {}, "runtime-restrictions");
       const record = await read();
       if (!record) throw new Error("remediation transformation requires enrollment");
       const canonical = await this.readRecoveryCaptureRaw(barePath, branch);
@@ -29479,7 +29491,7 @@ try {
    *  pin-producing path (fetchAgentBranch, promoteTrackingUnderLock, clearConflictingAncestorTrackingRefs,
    *  retainCurrentOwedCandidate) funnels through here. The check precedes every write, so a refusal
    *  leaves the existing pins, metadata and refs untouched. */
-  private async pinOwedUnderLock(c: StoredOwedContext, sha: string, refusalPath: RefusalPath = "P1"): Promise<void> {
+  private async pinOwedUnderLock(c: StoredOwedContext, sha: string, refusalPath: RefusalPath): Promise<void> {
     await this.assertBareClear(c.barePath, "owed-pin");
     await this.requireOwedCommit(c.barePath, sha);
     const ref = `refs/uzi-owed/${c.runId}/${sha}`;

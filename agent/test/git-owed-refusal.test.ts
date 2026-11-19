@@ -358,6 +358,69 @@ describe("issue4481 refusal ledger", { timeout: 300_000 }, () => {
     assert.equal(incomingRefs().some((r) => r.includes(`refused-${newer}`)), false);
   });
 
+  /** Hold the bare lock, start `call`, close the generation while it waits, then release. */
+  async function closeWhileWaiting<T>(call: () => Promise<T>): Promise<T> {
+    let release!: () => void;
+    const held = cache["withLock"](bare, () => new Promise<void>((resolve) => { release = resolve; }));
+    const pending = call();
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    cache.closeRefusalGeneration(RUN, 1);
+    release();
+    await held;
+    return pending;
+  }
+
+  it("a close that lands while fetchAgentBranch waits for the bare lock stages, pins and moves nothing", async () => {
+    await rewriteTimes(2);
+    const tip = gitIn(bare, ["rev-parse", `refs/uzi-runner/${BRANCH}`]);
+    const pins = pinRefs();
+    commitTree("raced", true);
+    const git = cache as unknown as { runGit: (cwd: string, args: string[], ...rest: unknown[]) => Promise<string> };
+    const original = git.runGit.bind(cache);
+    const transports: string[][] = [];
+    git.runGit = async (cwd, args, ...rest) => { if (args.includes("fetch")) transports.push(args); return original(cwd, args, ...rest); };
+    try {
+      assert.deepEqual(await closeWhileWaiting(() => fetchHead()), { kind: "not_updated", reason: "ownership_unknown" });
+    } finally { git.runGit = original; }
+    assert.deepEqual(transports, [], "the closed generation never starts the transport that would create its stage");
+    assert.deepEqual(incomingRefs(), []);
+    assert.deepEqual(pinRefs(), pins);
+    assert.equal(gitIn(bare, ["rev-parse", `refs/uzi-runner/${BRANCH}`]), tip);
+  });
+
+  it("a close that lands while updateTrackingRef waits for the bare lock pins and moves nothing", async () => {
+    await rewriteTimes(2);
+    const tip = gitIn(bare, ["rev-parse", `refs/uzi-runner/${BRANCH}`]);
+    const pins = pinRefs();
+    const next = commitTree("raced update", false);
+    toBare(next);
+    assert.deepEqual(await closeWhileWaiting(() => cache.updateTrackingRef(bare, BRANCH, next, opts)),
+      { kind: "not_updated", reason: "ownership_unknown" });
+    assert.deepEqual(pinRefs(), pins);
+    assert.equal(gitIn(bare, ["rev-parse", `refs/uzi-runner/${BRANCH}`]), tip);
+  });
+
+  it("P7 after the seal records a tracking head that was never ledgered: nothing", async () => {
+    const kept = await atCap();
+    assert.equal(await cache.admitRefusalProvenance(ctx), "written");
+    assert.equal(await cache.sealRefusalRelease(bare, RUN, 1, coverOf(kept)), "sealed");
+    unpinTrackingHead(kept);
+    assert.deepEqual(await cache.retainCurrentOwedCandidate(bare, opts), { kind: "not_updated", reason: "owed_limit" });
+    assert.equal(fs.existsSync(path.join(refDir(), ledgerName)), false);
+    assert.deepEqual(incomingRefs(), []);
+  });
+
+  it("a legacy (null generation) import refused at the cap leaves no flat stage, only the generation-0 refused ref", async () => {
+    const legacy: FetchAgentBranchOptions = { context: { ...ctx, generation: null, legacy: true } as FetchAgentBranchOptions["context"] };
+    for (let i = 0; i < CAP; i++) {
+      commitTree("legacy", true);
+      assert.equal((await fetchHead(legacy)).kind, "updated");
+    }
+    const refused = commitTree("legacy refused", true);
+    assert.deepEqual(await fetchHead(legacy), { kind: "not_updated", reason: "owed_limit", refusedSha: refused });
+    assert.deepEqual(incomingRefs(), [`refs/uzi-incoming/${RUN}/0/refused-${refused} ${refused}`]);
+  });
+
   it("P7 (retainCurrentOwedCandidate) records its refusal and honours the seal", async () => {
     const { kept, refused } = await eligibleState();
     const tracking = kept[kept.length - 1]!;
