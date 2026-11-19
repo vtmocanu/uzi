@@ -15,6 +15,7 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import type { Executor, FollowUpOutcome, RunContext } from "../src/executor.js";
 import { FOLLOWUP_FINALIZE_ADMISSION_FEATURE } from "../src/client.js";
+import { ReportPreconditionError } from "../src/client.js";
 import { Outbox } from "../src/outbox.js";
 import { REASON_FOLLOWUP_NOT_PARKED, RunRunner, StaleClaimError } from "../src/runner.js";
 import { ActiveRunRegistry } from "../src/active-run-registry.js";
@@ -196,7 +197,7 @@ function build(executor: Executor, outbox: Outbox | undefined, gitlab = fakeGitl
 }
 
 /** The flight the runner hands the admission loop, so a test can reach its steering and flags. */
-interface Captured { flight?: { steering: { abortLifecycle(reason?: unknown, terminal?: boolean): void; approveRefusedBySwitchPending(): boolean }; preserveRecoveryClone?: boolean; preserveSession?: boolean; stoppedSourceKept?: boolean; followUpPendingRearms?: number } }
+interface Captured { flight?: { steering: { abortLifecycle(reason?: unknown, terminal?: boolean): void; markCancelled(): void; approveRefusedBySwitchPending(): boolean }; preserveRecoveryClone?: boolean; preserveSession?: boolean; stoppedSourceKept?: boolean; followUpPendingRearms?: number } }
 function captureFlight(r: RunRunner, onEnter?: (flight: NonNullable<Captured["flight"]>) => void): Captured {
   const cap: Captured = {};
   const seam = r as unknown as { admitFollowUpFinalize: (flight: NonNullable<Captured["flight"]>, ...rest: unknown[]) => Promise<unknown> };
@@ -755,5 +756,67 @@ describe("interactive follow-up finalize admission (issue #4479)", () => {
 
     assert.equal(m.finalizeRequests, 3);
     assert.equal(statuses(claim.run_id).at(-1), "completed");
+  });
+  it("a cancel that arrives during the re-armed backoff beats a feature withdrawal and ends cancelled", async () => {
+    const { claim, outbox, log } = await idleSetup({ script: [{ kind: "refuse", reason: "followup_pending", apply: false }] });
+    const r = build(parkingExecutor(log), outbox);
+    const cap = captureFlight(r);
+    const seam = r as unknown as { waitRecoveryRetry: (...a: unknown[]) => Promise<void> };
+    const real = seam.waitRecoveryRetry.bind(r);
+    let first = true;
+    seam.waitRecoveryRetry = async (...a) => {
+      if (first) {
+        first = false;
+        cap.flight!.steering.markCancelled();
+        client.protocolFeatures = BASE_FEATURES;
+      }
+      return real(...a);
+    };
+    await finish(r, claim);
+
+    assert.deepEqual(log.outcomes[0], { kind: "ended", reason: "cancelled" }, "cancel wins over the withdrawal return");
+    assert.ok(!statuses(claim.run_id).includes("completed"));
+  });
+
+  it("an unknown send, then a followup_pending refusal, clears the ambiguity: a later withdrawn feature returns the outcome", async () => {
+    observed.length = 0;
+    const { claim, m, outbox, log } = await idleSetup({
+      script: [{ kind: "lost" }, { kind: "lost" }, { kind: "lost" }, { kind: "refuse", reason: "followup_pending", apply: false }],
+      onFinalize: index => { if (index === ATTEMPTS) client.protocolFeatures = BASE_FEATURES; },
+    });
+    const sends = spyFinalizeSends();
+    await observeThenCancel(build(parkingExecutor(log), outbox), claim, 400);
+
+    assert.equal(sends.count, 2, "one unknown round, one refused round, then it stops sending");
+    assert.equal(m.finalizeRequests, ATTEMPTS + 1);
+    assert.deepEqual(log.outcomes[0], { kind: "ended", reason: "idle" });
+  });
+
+  it("a cancel set after the idle outcome but before the first send produces no followup_finalize request", async () => {
+    const { claim, m, outbox, log } = await idleSetup();
+    const r = build(parkingExecutor(log), outbox);
+    captureFlight(r, flight => flight.steering.markCancelled());
+    await finish(r, claim);
+
+    assert.equal(m.finalizeRequests, 0);
+    assert.deepEqual(log.outcomes.at(-1), { kind: "ended", reason: "cancelled" });
+    assert.ok(!statuses(claim.run_id).includes("completed"));
+  });
+
+  it("a ReportPreconditionError on the first send is not ambiguous: one attempt, the outcome is returned", async () => {
+    observed.length = 0;
+    const { claim, m, outbox, log } = await idleSetup();
+    let attempts = 0;
+    const real = client.reportState.bind(client);
+    client.reportState = (async (...a: Parameters<typeof real>) => {
+      if (a[1].status !== "followup_finalize") return real(...a);
+      attempts++;
+      throw new ReportPreconditionError("local guard");
+    }) as typeof client.reportState;
+    await observeThenCancel(build(parkingExecutor(log), outbox), claim, 400);
+
+    assert.equal(attempts, 1, "never resent");
+    assert.equal(m.finalizeRequests, 0);
+    assert.deepEqual(log.outcomes[0], { kind: "ended", reason: "idle" });
   });
 });

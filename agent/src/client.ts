@@ -530,8 +530,8 @@ interface StateAttemptEvidence {
 }
 
 // The api's generic invalid-state 400 body (worker_protocol.go state handler).
-// Both spellings are generic: the list an api without credential_switch_uncertain prints, and the
-// one a current api prints.
+// All three spellings are generic: the list an api without credential_switch_uncertain prints, the one
+// an api without followup_finalize prints, and the one a current api prints.
 const GENERIC_INVALID_STATE_ERRORS: ReadonlySet<string> = new Set([
   "state must be one of running, awaiting_approval, awaiting_input, awaiting_followup, limit_wait, recovery_wait, paused, pause_failed, credential_switch, credential_switch_failed, credential_switch_held, credential_switch_hold_settled, clarification_settled, completed, failed",
   "state must be one of running, awaiting_approval, awaiting_input, awaiting_followup, limit_wait, recovery_wait, paused, pause_failed, credential_switch, credential_switch_failed, credential_switch_held, credential_switch_hold_settled, credential_switch_uncertain, clarification_settled, completed, failed",

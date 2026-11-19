@@ -17999,7 +17999,7 @@ export class RunRunner {
         // Issue #4479: an idle or stopped end is about to finalize; move the server's awaiting_followup
         // row back to running first, or the publication intent refuses it forever. Nothing changes
         // without this park's sequence, the negotiated feature or a usable publication resume (the
-        // callee checks the last two before every send).
+        // callee checks the last two before each send that follows no unknown send).
         if (parkSeq !== undefined && outcome.kind === "ended" && (outcome.reason === "idle" || outcome.reason === "stopped")) {
           outcome = await this.admitFollowUpFinalize(flight, outcome, idleMs, parkSeq, (body) => reportState(body));
         }
@@ -18896,7 +18896,9 @@ export class RunRunner {
    * An unconfirmed admission holds the flight indefinitely: it resends until a reply confirms it, or
    * until a cancel, a shutdown, a lifecycle abort or a claim fence interrupts the loop. It publishes
    * nothing meanwhile. An error thrown before any request is issued (the client's local guard) is never
-   * ambiguous: while no earlier send is unknown, the outcome returns untouched, as before.
+   * ambiguous: while no earlier send is unknown, the outcome returns untouched, as before. While the feature
+   * is absent after an unknown send nothing is resent (the loop only waits, and logs once per streak);
+   * sending resumes when a later heartbeat advert restores the feature.
    */
   private async admitFollowUpFinalize(
     flight: RunFlight,
@@ -18910,6 +18912,14 @@ export class RunRunner {
     let outcome: FollowUpOutcome = first;
     let ambiguous = false;
     let sentOnce = false;
+    let unsendableLogged = false;
+    // After an unknown send, a send the client refuses locally (feature gone) or an api that does not know
+    // the state leaves nothing to resend: say so once per streak.
+    const unsendable = (why: string): void => {
+      if (unsendableLogged) return;
+      unsendableLogged = true;
+      runLog.warn("interactive task: follow-up finalize cannot be sent after an unconfirmed attempt; holding until it can", { run_id: flight.runId, why });
+    };
     const keep = (): void => {
       flight.preserveRecoveryClone = true;
       flight.preserveSession = true;
@@ -18937,7 +18947,9 @@ export class RunRunner {
       if (outcome.kind !== "ended" || (outcome.reason !== "idle" && outcome.reason !== "stopped")) return outcome;
       const stopped = outcome.reason === "stopped";
       // While no earlier send is unknown, a withdrawn feature or publication resume means today's behaviour.
-      if (!ambiguous && (!this.client.hasFeature(FOLLOWUP_FINALIZE_ADMISSION_FEATURE) || !this.publicationResumeAvailable())) return outcome;
+      // A cancel that arrived meanwhile still wins over that return.
+      if (!ambiguous && (!this.client.hasFeature(FOLLOWUP_FINALIZE_ADMISSION_FEATURE) || !this.publicationResumeAvailable()))
+        return flight.steering.isCancelled() ? cancelled : outcome;
       if (sentOnce) {
         if (interrupted()) return cancelled;
       } else if (flight.steering.isCancelled()) return cancelled;
@@ -18946,16 +18958,19 @@ export class RunRunner {
       try {
         const ack = await send({ status: "followup_finalize", followup_park_seq: parkSeq });
         result = ack.followupFinalize ?? { kind: "unconfirmed" };
+        unsendableLogged = false;
       } catch (error) {
         if (error instanceof StaleClaimError || error instanceof RetainedRecoveryStop) throw error;
         if (error instanceof ReportPreconditionError) {
           // Thrown by the client before any request: never ambiguous.
           if (!ambiguous) return outcome;
+          unsendable("client_precondition");
           result = { kind: "unconfirmed" };
         } else if (isFollowupFinalizeUnsupported(error)) {
           // A rolled-back api that does not know the state: today's behaviour on the first send, and
           // never a license to finalize once an earlier send might have applied.
           if (!ambiguous) return outcome;
+          unsendable("api_does_not_know_the_state");
           result = { kind: "unconfirmed" };
         } else if (this.isDefinitiveApiRefusal(error)) {
           // The api will answer this the same way every time (ownership unknown): retain, report nothing.
