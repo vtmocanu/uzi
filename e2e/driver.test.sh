@@ -833,6 +833,7 @@ end
 # ============================================================================
 # Case 24 — the same ID, declared vs undeclared. Undeclared FAILs naming it; declared PASSes
 # AND the query log proves the holds / worker queries ran and observed the ID.
+# Use independent driver invocations: a declaration cannot forgive a prior known leak.
 # Mutation: skip the worker/holds reads for a declared handoff -> the log assertions fail.
 begin "case24a: undeclared hold FAILs, declared hold PASSes (and was observed)" 24a
 seqf holds "-" "$H1|$R1|1"
@@ -844,9 +845,12 @@ mkphase "$PHASES_DIR/11-declared.sh" "declared hold" no "" HOLD_X "" "" HOLD_X <
 HOLD_X=$H1
 pass "body ok"
 BODY
-run_driver 24a
+export E2E_ONLY=undeclared
+run_driver 24a-undeclared
 has_row undeclared FAIL || bad "undeclared hold did not FAIL: $(cat "$TSV")"
 contains "$(row_msg undeclared FAIL)" "hold=$H1" || bad "message does not name the hold"
+export E2E_ONLY=declared
+run_driver 24a-declared
 has_row declared PASS || bad "declared hold did not PASS: $(cat "$TSV")"
 contains "$(awk -F'\t' '$2=="11-declared" && $3=="holds"{print $5}' "$QL")" "$H1" || bad "holds query never observed $H1 in the declared phase"
 end
@@ -862,9 +866,12 @@ mkphase "$PHASES_DIR/11-declared.sh" "declared run" no "" "" RUN_X <<BODY
 RUN_X=$R1
 pass "body ok"
 BODY
-run_driver 24b
+export E2E_ONLY=undeclared
+run_driver 24b-undeclared
 has_row undeclared FAIL || bad "undeclared run did not FAIL: $(cat "$TSV")"
 contains "$(row_msg undeclared FAIL)" "run=$R1" || bad "message does not name the run"
+export E2E_ONLY=declared
+run_driver 24b-declared
 has_row declared PASS || bad "declared run did not PASS: $(cat "$TSV")"
 contains "$(awk -F'\t' '$2=="11-declared" && $3=="workers"{print $5}' "$QL")" "$R1" || bad "worker query never observed $R1 in the declared phase"
 contains "$(awk -F'\t' '$2=="11-declared" && $3=="runs"{print $5}' "$QL")" "$R1" || bad "runs query never observed $R1 in the declared phase"
@@ -1367,5 +1374,46 @@ contains "$(row_msg bnoset FAIL)" "run=$R1" || bad "bnoset message: $(row_msg bn
 end
 
 # ============================================================================
+# A later declaration cannot forgive residue an earlier failed boundary reported.
+begin "case36a: known hold stays residue despite a later handoff-holds declaration" 36a
+seqp 10-aleak holds "-" "$H1|$R1|1"
+seqp 11-bdeclare holds "$H1|$R1|1"
+mkphase "$PHASES_DIR/10-aleak.sh" "A leaks" no "" "" "" <<'BODY'
+pass "body ok"
+BODY
+mkphase "$PHASES_DIR/11-bdeclare.sh" "B declares known hold" no "" "" "" "" OWNED_HOLD <<BODY
+OWNED_HOLD=$H1
+pass "body ok"
+BODY
+run_driver 36a
+has_row aleak FAIL || bad "setup did not report A's hold leak: $(cat "$TSV")"
+has_row bdeclare FAIL || bad "B forgave known hold: $(cat "$TSV")"
+contains "$(row_msg bdeclare FAIL)" "still present from aleak: hold=$H1" || bad "B lost the hold's origin: $(row_msg bdeclare FAIL)"
+[ "$(qcount holds 11-bdeclare)" -eq 2 ] || bad "B did not take only baseline plus one hold sample"
+[ "$(bw_field bdeclare 3)" -le 1 ] || bad "B waited again for the known hold"
+end
+
+begin "case36b: known run and worker stay residue despite a later handoff declaration" 36b
+for ph in 10-aleak 11-bdeclare; do
+  seqp "$ph" runs "$R1"
+  seqp "$ph" workers "$W1|$R1|1"
+done
+mkphase "$PHASES_DIR/10-aleak.sh" "A leaks" no "" "" "" <<'BODY'
+pass "body ok"
+BODY
+mkphase "$PHASES_DIR/11-bdeclare.sh" "B declares known run" no "" "" OWNED_RUN <<BODY
+OWNED_RUN=$R1
+pass "body ok"
+BODY
+run_driver 36b
+has_row aleak FAIL || bad "setup did not report A's run leak: $(cat "$TSV")"
+has_row bdeclare FAIL || bad "B forgave known run: $(cat "$TSV")"
+contains "$(row_msg bdeclare FAIL)" "still present from aleak: run=$R1" || bad "B lost the run's origin: $(row_msg bdeclare FAIL)"
+contains "$(row_msg bdeclare FAIL)" "still present from aleak: worker=$W1 run=$R1 generation=1" || bad "B lost the worker's origin: $(row_msg bdeclare FAIL)"
+[ "$(qcount runs 11-bdeclare)" -eq 1 ] && [ "$(qcount workers 11-bdeclare)" -eq 1 ] || bad "B sampled known run/worker more than once"
+[ "$(grep -c '^cancel ' "$FAKE_API_LOG")" -eq 1 ] || bad "B cancelled the known run again"
+[ "$(bw_field bdeclare 3)" -le 1 ] || bad "B waited again for the known run/worker"
+end
+
 printf '\ncases=%s passed=%s\n' "$cases" "$passed"
 [ "$cases" -eq "$passed" ] || exit 1

@@ -293,22 +293,25 @@ _b_sample() {
 
 # _b_residue — residue of the latest sample into _R_KEYS / _R_DESC. Runs and worker rows
 # get no baseline exemption; holds compare by ID against the baseline and declarations.
+# Known keys stay residue even when a later phase explicitly declares them.
 _b_residue() {
   local k id w r g
   _R_KEYS=(); _R_DESC=()
   for id in ${_B_SR[@]+"${_B_SR[@]}"}; do
-    ! _in_set "$_H_RUNS" "$id" || continue
+    if [ -z "$(_known_get "run:$id")" ] && _in_set "$_H_RUNS" "$id"; then continue; fi
     _R_KEYS+=("run:$id"); _R_DESC+=("run=$id")
   done
   for k in ${_B_SW[@]+"${_B_SW[@]}"}; do
     IFS='|' read -r w r g <<< "$k"
-    ! _in_set "$_H_RUNS" "$r" || continue
+    if [ -z "$(_known_get "worker:$w/$r/$g")" ] && _in_set "$_H_RUNS" "$r"; then continue; fi
     _R_KEYS+=("worker:$w/$r/$g"); _R_DESC+=("worker=$w run=$r generation=$g")
   done
   for k in ${_B_SH[@]+"${_B_SH[@]}"}; do
     IFS='|' read -r id r g <<< "$k"
-    ! _in_set "$_BASE" "$id" || continue
-    ! _in_set "$_H_HOLDS" "$id" || continue
+    if [ -z "$(_known_get "hold:$id")" ]; then
+      ! _in_set "$_BASE" "$id" || continue
+      ! _in_set "$_H_HOLDS" "$id" || continue
+    fi
     _R_KEYS+=("hold:$id"); _R_DESC+=("hold=$id run=$r generation=$g")
   done
 }

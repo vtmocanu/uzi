@@ -194,7 +194,8 @@ Declarations are phase-header lines naming variables the body set, not values:
 
 **Known residue.** Residue a failed boundary reports becomes *known*: later boundaries
 still sample it and FAIL while it is present, but never wait for it (a boundary with only
-known residue takes a single sample). Such an
+known residue takes a single sample). Neither a later baseline nor a later
+`handoff:` / `handoff-holds:` declaration exempts a known item that is still present. Such an
 item is reported as `still present from <slug>` (the phase whose boundary first reported
 it). Every later row of a phase that ran after a failed boundary is annotated
 ` [ran after contaminated boundary: <slug>[ <slug>...]]` (a SKIP, and a requires-miss FAIL that never
