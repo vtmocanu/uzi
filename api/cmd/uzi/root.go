@@ -25,11 +25,11 @@ import (
 // so the caller can report a clean, actionable message. Stdin and stderr are
 // connected to the process so an interactive credential helper can prompt on a
 // push/delete (the user's own creds — PRD #400 Decision 6); stdout is captured so
-// a value read like `git remote get-url origin` is returned rather than printed.
+// a value read like `git remote get-url --push --all origin` is returned rather than printed.
 // stderr is BOTH streamed (so the prompt is visible) and captured (so the error
 // message is clean) via an io.MultiWriter.
 func realGit(dir string, args ...string) (string, error) {
-	cmd := exec.Command("git", args...) //nolint:gosec // G204: the CLI's own git shell-out seam — `git <args>` where args are internal command literals (`git remote get-url origin`, `push … uzi/task/<id>`), never remote/untrusted input; running the operator's git with the operator's creds is the intended behaviour (PRD #400 M3).
+	cmd := exec.Command("git", args...) //nolint:gosec // G204: the CLI's own git shell-out seam — `git <args>` where args are internal command literals (`git remote get-url --push --all origin`, `push … uzi/task/<id>`), never remote/untrusted input; running the operator's git with the operator's creds is the intended behaviour (PRD #400 M3).
 	cmd.Dir = dir
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout

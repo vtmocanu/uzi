@@ -1888,13 +1888,26 @@ watch it with `uzi run get`/`uzi run logs --follow`, or drop into
 ### Origin matching
 
 Because the push goes to `origin`, the connected repo must be the one `origin`
-fetches from: its owner/repo path **and** its host must match. The check reads
-only the fetch URL (`git remote get-url origin`). It does not check a push URL,
-a `pushInsteadOf` rewrite, extra `remote.origin.url` values or a custom
-`remote.origin.receivepack`, so with any of those the push can go elsewhere.
-Check the push destination with `git remote get-url --push --all origin` before
-you run handoff. `--repo` never bypasses this check; it only picks among repos
-that already match.
+pushes to: its owner/repo path **and** its host must match. The check reads
+the push destination (`git remote get-url --push --all origin`), which applies
+`pushurl`, `pushInsteadOf` rewrites and multiple `remote.origin.url` values.
+Handoff requires exactly one push destination and refuses otherwise. For SSH
+origins it also refuses a set `remote.origin.receivepack`, which changes the
+remote command the host check evaluates. `--repo` never bypasses this check; it
+only picks among repos that already match.
+
+The check covers creating a handoff only:
+
+- **Pulling the result:** `git fetch origin` (the command above and the CLI's
+  hint) reads origin's *fetch* URL. If that differs from the push destination,
+  add a separate remote for the repository handoff pushed to. Confirm
+  `git remote get-url <remote>` names that repository, then run
+  `git fetch <remote> uzi/task/<run-id>`. Don't paste the output of
+  `git remote get-url --push` back into git, because `insteadOf` rules can
+  rewrite it a second time.
+- **`uzi handoff rm`:** it deletes the branch with `git push origin --delete`,
+  which runs no check and goes to every push destination. Confirm
+  `git remote get-url --push --all origin` before removing.
 
 - **https / http origin:** the host must equal the host of the forge's web URL.
 - **SSH origin (scp-like `git@host:owner/repo` or `ssh://`):** the host your SSH

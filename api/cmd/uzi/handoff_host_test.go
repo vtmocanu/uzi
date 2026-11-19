@@ -113,7 +113,7 @@ func runHostCase(t *testing.T, tc hostCase, extra ...string) (*uzicli.FakeClient
 		CreatedTaskRun: taskRun("rh", "uzi/task/rh"),
 		DispatchedRun:  taskRun("rh", "uzi/task/rh"),
 	}
-	rec := &handoffRecorder{gitOut: map[string]string{"remote get-url origin": tc.origin}}
+	rec := &handoffRecorder{gitOut: map[string]string{"remote get-url --push --all origin": tc.origin}}
 	env, _ := handoffEnv(fc, rec)
 	if tc.stubOut != "" {
 		rec.sshCfg.out = tc.stubOut
@@ -229,7 +229,7 @@ func TestHandoffOriginHostBadWebURL(t *testing.T) {
 				CreatedTaskRun: taskRun("rh", "uzi/task/rh"),
 				DispatchedRun:  taskRun("rh", "uzi/task/rh"),
 			}
-			rec := &handoffRecorder{gitOut: map[string]string{"remote get-url origin": origin}}
+			rec := &handoffRecorder{gitOut: map[string]string{"remote get-url --push --all origin": origin}}
 			env, _ := handoffEnv(fc, rec)
 			if _, _, code := runCLI(t, env, "handoff", "-m", "x"); code != uzicli.ExitUsage || fc.LastCreateTaskRepoID != "" {
 				t.Errorf("WebURL %q origin %q: exit=%d repo=%q, want refusal", web, origin, code, fc.LastCreateTaskRepoID)
@@ -284,7 +284,7 @@ func TestHandoffMixedHostSamePath(t *testing.T) {
 						CreatedTaskRun: taskRun("rm", "uzi/task/rm"),
 						DispatchedRun:  taskRun("rm", "uzi/task/rm"),
 					}
-					rec := &handoffRecorder{gitOut: map[string]string{"remote get-url origin": origin}}
+					rec := &handoffRecorder{gitOut: map[string]string{"remote get-url --push --all origin": origin}}
 					env, _ := handoffEnv(fc, rec)
 					return fc, rec, env
 				}
@@ -333,7 +333,7 @@ func TestSSHCommandConfiguredRealGit(t *testing.T) {
 	if err == nil || !errors.As(err, &ec) || ec.ExitCode() != 1 {
 		t.Fatalf("unset core.sshCommand: err = %v, want an ExitCode()==1 error", err)
 	}
-	if present, cerr := sshCommandConfigured(out, err); present || cerr != nil {
+	if present, cerr := gitConfigKeySet(out, err); present || cerr != nil {
 		t.Errorf("unset classified present=%v err=%v, want absent", present, cerr)
 	}
 
@@ -344,11 +344,11 @@ func TestSSHCommandConfiguredRealGit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("empty core.sshCommand: err = %v, want nil", err)
 	}
-	if present, cerr := sshCommandConfigured(out, err); !present || cerr != nil {
+	if present, cerr := gitConfigKeySet(out, err); !present || cerr != nil {
 		t.Errorf("empty-set classified present=%v err=%v, want present", present, cerr)
 	}
 
-	if present, cerr := sshCommandConfigured("", exitCodeErr{2}); present || cerr == nil {
+	if present, cerr := gitConfigKeySet("", exitCodeErr{2}); present || cerr == nil {
 		t.Errorf("exit 2 must be an error, got present=%v err=%v", present, cerr)
 	}
 }
@@ -474,7 +474,7 @@ func TestHandoffSSHRefusesWithoutGitLocalEnvList(t *testing.T) {
 				CreatedTaskRun: taskRun("rh", "uzi/task/rh"),
 				DispatchedRun:  taskRun("rh", "uzi/task/rh"),
 			}
-			rec := &handoffRecorder{gitOut: map[string]string{"remote get-url origin": "git@github.com:acme/widgets.git"}}
+			rec := &handoffRecorder{gitOut: map[string]string{"remote get-url --push --all origin": "git@github.com:acme/widgets.git"}}
 			env, _ := handoffEnv(fc, rec)
 			mutate(rec)
 			_, stderr, code := runCLI(t, env, "handoff", "-m", "x")
