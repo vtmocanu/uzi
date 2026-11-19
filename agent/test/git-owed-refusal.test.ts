@@ -502,12 +502,23 @@ describe("issue4481 cleanup", { timeout: 300_000 }, () => {
     assert.deepEqual(refusalFiles(), []);
   });
 
-  it("a removed generation deletes the admissions of its own and earlier generations only", async () => {
+  it("a removed generation deletes only its own admission", async () => {
     const kept = await rewriteTimes(3);
     assert.equal(await cache.admitRefusalProvenance(ctx), "written");
     assert.equal(await cache.admitRefusalProvenance({ ...ctx, generation: 2 }), "written");
-    assert.equal(await cleanup(coverOf(kept)), "removed");
-    assert.deepEqual(refusalFiles(), [`admission-${RUN}-2.json`]);
+    const cover = coverOf(kept);
+    assert.equal(await cache.cleanupRecoveryGeneration(bare, { ...ctx, generation: 2 }, [], [], [], cover), "removed");
+    assert.deepEqual(refusalFiles(), [`admission-${RUN}-1.json`], "an earlier generation's admission stays");
+  });
+
+  it("an aborted first-mutation boundary leaves the admission untouched", async () => {
+    assert.equal(await cache.admitRefusalProvenance(ctx), "written");
+    const before = filesSnapshot();
+    await assert.rejects(cache.cleanupRecoveryGeneration(bare, ctx, [], [], [], base, () => true, "archive",
+      () => { throw new Error("client aborted"); }), /client aborted/);
+    assert.equal(filesSnapshot(), before);
+    assert.equal(await cache.cleanupRecoveryGeneration(bare, ctx, [], [], [], base), "removed");
+    assert.deepEqual(refusalFiles(), []);
   });
 
   it("the number of admission files never bounds the ordinary gate", async () => {

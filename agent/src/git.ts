@@ -30579,12 +30579,13 @@ try {
         await this.removeOwedFile(barePath, `final-${context.runId}-${context.generation}.json`, true, REFUSAL_DIRECTORY);
         await this.removeOwedFile(barePath, `cleanup-${context.runId}-${context.generation}.json`, true, REFUSAL_DIRECTORY);
       }
-      // issue #4481: the generations' admissions served only their release gate. A crash before this
-      // leaves them, which is harmless; afterwards a later generation of this run cannot cap-release.
-      for (let g = 1; g <= context.generation && g <= REFUSAL_MAX_GENERATIONS; g++) {
-        open();
-        await this.removeOwedFile(barePath, `admission-${context.runId}-${g}.json`, true, REFUSAL_DIRECTORY);
-      }
+      // issue #4481: this generation's admission served only its release gate. A crash before this leaves
+      // it, which is harmless. Earlier generations' admissions stay so their pending sealed FINAL replay
+      // remains eligible; a later generation of this run therefore cannot cap-release automatically
+      // (it fails closed). Same pre-mutation boundary as every other deletion here.
+      open();
+      boundary();
+      await this.removeOwedFile(barePath, `admission-${context.runId}-${context.generation}.json`, true, REFUSAL_DIRECTORY);
       return "removed";
     });
   }

@@ -441,3 +441,63 @@ it("control: with no evidence the archive fallback sends its archive FINAL", opt
   assert.equal(server.finals[0]!.disposition?.kind, "archive");
   assert.equal(server.acked(), 1);
 });
+
+it("an unguarded cap-stopped run uploads and releases nothing", opts, async () => {
+  Reflect.set(git, "maxOwedCandidates", CAP);
+  const claim = gitlabClaim(44840, { claim_generation: GENERATION });
+  const server = heldServer(claim);
+  skipCheckpoints();
+  const r = runner(failingWork({}), fakeGitlab().gitlab, JOIN_TOKEN, { checkpointIntervalMs: 1 });
+  await r.execute(claim);
+  await redrive(r);
+  assert.equal(server.archiveUploads(), 0, "no archive was uploaded");
+  assert.equal(server.finals.length, 0, "nothing was released");
+  assert.equal(server.heldCalls.length, 0);
+  assert.ok(command(bare(), ["for-each-ref", `refs/uzi-incoming/${claim.run_id}/`]).length > 0, "the refused stage is kept");
+  assert.ok(refusalFiles().some(n => n.startsWith("refusals-")), "the ledger is kept");
+});
+
+it("a second cap pass re-proves the clone head before returning the first pass's head", opts, async t => {
+  const { claim, server, work } = setup(44841);
+  let results: (string | null)[] = [];
+  let pass = 0;
+  const head = git.worktreeHead.bind(git);
+  git.worktreeHead = async (p: string) => {
+    if (/transferAtOwedCap/.test(stackOf()) && ++pass === 2) commit(p, "moved-between-passes.txt");
+    return head(p);
+  };
+  await runFailed(claim, work, undefined, runner => { results = spyTransfer(t, runner); });
+  assert.ok(results.length >= 2, "the terminal hook ran twice");
+  assert.notEqual(results[0], null);
+  assert.equal(results[1], null, "the second pass did not return a head the clone no longer has");
+  void server;
+});
+
+it("a second cap pass re-proves the gate before returning the first pass's head", opts, async t => {
+  const { claim, work } = setup(44842);
+  let results: (string | null)[] = [];
+  let pass = 0;
+  const gate = git.refusalReleaseGate.bind(git);
+  git.refusalReleaseGate = async (...a: Parameters<typeof gate>) => {
+    if (/transferAtOwedCap/.test(stackOf()) && ++pass === 2) injectUnledgeredStage(claim);
+    return gate(...a);
+  };
+  await runFailed(claim, work, undefined, runner => { results = spyTransfer(t, runner); });
+  assert.ok(results.length >= 2, "the terminal hook ran twice");
+  assert.notEqual(results[0], null);
+  assert.equal(results[1], null, "the second pass saw the new evidence");
+});
+
+it("after the cap transfer a re-import of a new head is refused by the fence, not recorded", opts, async () => {
+  const { claim, work, server } = setup(44843);
+  await runFailed(claim, work);
+  const ledgerBefore = fs.readFileSync(ledgerPath(claim), "utf8");
+  const refsBefore = command(bare(), ["for-each-ref", "refs/"]);
+  const fresh = commit(work.clone!, "after-the-cap.txt");
+  const result = await directFetch(claim, work.clone!);
+  assert.deepEqual(result, { kind: "not_updated", reason: "ownership_unknown" }, "fenced, not owed_limit");
+  assert.equal(fs.readFileSync(ledgerPath(claim), "utf8"), ledgerBefore, "no new ledger entry");
+  assert.equal(command(bare(), ["for-each-ref", "refs/"]), refsBefore, "no new stage or ref");
+  assert.ok(!ledgerBefore.includes(fresh));
+  void server;
+});
