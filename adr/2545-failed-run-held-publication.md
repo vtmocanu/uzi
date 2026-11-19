@@ -369,7 +369,13 @@ still attempts the ledger append. If either write fails, or the seal listing
 fails, or the ledger is invalid, unbound or full, the run is latched in-process
 (`refusalRecordingFailed`) and its gate and seal are ineligible ("refusal
 recording failed in this process") for the worker process lifetime. Across
-processes the restart rule already makes a successor ineligible. The gate's
+processes the latch is lost. While the run's owed pins stay at the cap (or any
+durable refusal evidence exists) the restart rule makes a successor
+ineligible. If both the `refused-<sha>` write and the ledger append failed on a
+path with no fetch stage (P3-P7) and the worker then restarts, and the run's
+pins later reconcile below the cap, nothing durable records that head and the
+ordinary (`none`) release proceeds without proving it covered; this is an
+accepted residual. The gate's
 tracking-tip rule (the run's own branch tracking ref must be covered) is an
 extra check that matters for P3 (same run) and P7; it is not what protects the
 other paths.
@@ -432,7 +438,8 @@ fsync, rename, directory fsync and read-back. No storage or power-loss claim is
 made for refs.
 
 **Restart rule versus eventual cleanup.** A cap-stopped run whose history
-spans a worker-process restart (or any other process) keeps its hold; the
+spans a worker-process restart (or any other process) keeps its hold while
+durable refusal evidence exists or its pins stay at the cap; the
 release ordering does not rely on container teardown. Eventual cleanup of a
 leaked producer is separate: tini as PID 1 exiting kills the container's PID
 namespace, which a real-container test in `e2e/worker-uid/` exercises.
@@ -458,8 +465,13 @@ a flat `refs/uzi-incoming/<uuid>` fetch stage remains unprotected.
 recovery` or `uzi run discard`):
 
 - A run claimed before this change, a run that crossed an old or another
-  worker, a run whose history spans a worker-process restart, and a generation
-  whose admission write failed.
+  worker, a run whose history spans a worker-process restart (while durable refusal
+  evidence exists or its pins stay at the cap), and a generation whose
+  admission write failed.
+- A refusal on a path with no fetch stage (P3-P7) whose `refused-<sha>` write
+  and ledger append both failed, followed by a worker restart and pins that
+  later reconcile below the cap, leaves nothing durable; the ordinary release
+  proceeds without proving that head covered.
 - A later generation of the same run after an earlier generation's cleanup
   deleted its admission cannot cap-release automatically.
 - A refusal under a legacy or no-generation context keeps that run's hold and

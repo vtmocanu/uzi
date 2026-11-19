@@ -1279,8 +1279,13 @@ them; any change in the evidence keeps everything locally.
 `uzi run export` or `uzi run discard`):
 
 - a run claimed before this behaviour shipped, a run that crossed an old or
-  another worker, a run whose history spans a worker-process restart, or a
-  generation whose admission write failed;
+  another worker, a run whose history spans a worker-process restart (while durable refusal
+  evidence exists or its pins stay at the cap), or a generation whose admission
+  write failed;
+- a refusal whose refused-head ref and ledger writes both failed on a path
+  without a fetch stage, followed by a worker restart and pins that later
+  reconcile below the cap: nothing durable records that head, so the ordinary
+  release proceeds without proving it covered (an accepted residual);
 - a later generation of a run after an earlier generation's cleanup, which
   cannot cap-release automatically;
 - a refusal under a legacy or no-generation context, whose hold and cleanup stay
