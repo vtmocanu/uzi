@@ -17,6 +17,7 @@ import type {
   StartPreviewRequest,
 } from "./apiTypes";
 import { codexRuntimeDefaultLabel, modelSettingSourceLabel } from "./modelSettings";
+import { stripUnsafeChars } from "./safeText";
 import { runStartBody, type RunStartFacts, type RunStartOptions } from "./startRun";
 
 type Refusal = NonNullable<StartPreview["refusal"]>;
@@ -119,7 +120,8 @@ function effortCell(effective: EffectiveSettings | null, harness: string | null)
 function modelValue(cell: ModelSettingCell | undefined): ValueView {
   if (!cell) return UNKNOWN;
   // "" means the runtime decides (note sdk_default).
-  const text = cell.resolved_model === "" ? modelSettingSourceLabel("note", "sdk_default") : cell.resolved_model;
+  const text =
+    cell.resolved_model === "" ? modelSettingSourceLabel("note", "sdk_default") : stripUnsafeChars(cell.resolved_model);
   return { text, short: text, source: modelSettingSourceLabel("model", cell.source) };
 }
 

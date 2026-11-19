@@ -468,6 +468,8 @@ describe("RunOptionsDialog start preview", () => {
     fireEvent.change(input, { target: { value: "claude-x-1" } });
     expect(requests().some((r) => r.model === "claude-x-1")).toBe(false);
     await waitFor(() => expect(requests().some((r) => r.model === "claude-x-1")).toBe(true), { timeout: 3000 });
+    // The stale invalid entry is never sent while the debounce catches up to the fix.
+    expect(requests().filter((r) => r.model === "two words")).toEqual([]);
   });
 
   it("a preview failure leaves Start enabled and the server error visible", async () => {

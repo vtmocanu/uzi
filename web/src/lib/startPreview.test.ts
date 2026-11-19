@@ -140,6 +140,14 @@ describe("startPreviewView", () => {
     expect(v.alternatives[0].refusal).toBeNull();
   });
 
+  it("strips bidi and zero-width characters from a server model id", () => {
+    const get = structuredClone(GET);
+    get.models.find((c) => c.setting === "worker_model" && c.harness === "claude")!.resolved_model = "op‮us​";
+    const model = startPreviewView(recorded("claude"), get).model;
+    expect(model?.text).toBe("opus");
+    expect(model?.short).toBe("opus");
+  });
+
   it("shows the Claude SDK default when the resolved model is empty", () => {
     const get = structuredClone(GET);
     get.models.find((c) => c.setting === "worker_model" && c.harness === "claude")!.resolved_model = "";

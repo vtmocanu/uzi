@@ -139,7 +139,8 @@ export function RunOptionsDialog({
     return () => clearTimeout(t);
   }, [options.model, modelCustom]);
   const previewModel = modelCustom ? typedModel : options.model;
-  const previewRequest = modelError ? null : startPreviewRequest({ ...options, model: previewModel }, facts);
+  const previewModelProblem = modelProblem(previewModel, modelCustom, rows.effectiveHarness, rows.showHarness);
+  const previewRequest = modelError || previewModelProblem ? null : startPreviewRequest({ ...options, model: previewModel }, facts);
   const selected = useStartPreview(previewRequest);
   const defaultChoice = useStartPreview(DEFAULT_START_PREVIEW_REQUEST);
   const labels = defaultChoiceLabels(

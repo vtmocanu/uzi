@@ -36,19 +36,18 @@ afterEach(() => {
   else document.documentElement.setAttribute("data-theme", originalTheme);
 });
 
-function mount(onDragStart = vi.fn()) {
+function mount() {
   render(
     <MemoryRouter>
       <StartPreviewProvider generation={1}>
         <div className="bg-ink p-4" data-testid="surface">
-          <div draggable onDragStart={onDragStart} className="rounded-xl border p-3" data-testid="card">
+          <div draggable className="rounded-xl border p-3" data-testid="card">
             <StartPreview variant="compact" request={DEFAULT_START_PREVIEW_REQUEST} />
           </div>
         </div>
       </StartPreviewProvider>
     </MemoryRouter>,
   );
-  return { onDragStart };
 }
 
 const button = () => screen.findByRole("button", { name: /If started now/ });
@@ -70,14 +69,14 @@ it("toggles from the keyboard with Enter and Space, with no hover involved", asy
   expect(b.getAttribute("aria-expanded")).toBe("false");
 });
 
-it("a click on the disclosure inside a draggable card toggles it and starts no drag", async () => {
-  const { onDragStart } = mount();
+it("a click on the disclosure inside a draggable card toggles it, and the button is not itself draggable", async () => {
+  mount();
   const b = await button();
+  expect(b.getAttribute("draggable")).toBe("false");
   await userEvent.click(b);
   expect(b.getAttribute("aria-expanded")).toBe("true");
   await userEvent.click(b);
   expect(b.getAttribute("aria-expanded")).toBe("false");
-  expect(onDragStart).not.toHaveBeenCalled();
 });
 
 function rgb(color: string): [number, number, number] {

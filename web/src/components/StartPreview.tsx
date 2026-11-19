@@ -186,6 +186,7 @@ export function StartPreview({
     <>
       <button
         type="button"
+        draggable={false}
         aria-expanded={open}
         aria-controls={panelId}
         onClick={() => setOpen((o) => !o)}
