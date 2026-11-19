@@ -297,6 +297,27 @@ func TestReapEphemeralWorkersLiveDB(t *testing.T) {
 		}
 	})
 
+	// Pins the status guard inside arm (g): a TERMINAL provider-bound run does not make an incapable
+	// worker reapable through (g). With a live ephemeral lease, arm (f) spares the worker from (a),
+	// so only (g) could reap it.
+	t.Run("(g) incapable worker with a live lease bound to a TERMINAL provider run: NOT reaped (status guard)", func(t *testing.T) {
+		fx := newFleetFixture(t)
+		runA := queuedRunWithCaps(fx, []string{})
+		bindRunToProvider(fx, runA, "reap-terminal-leased")
+		mustExec(fx.ctx, fx.t, fx.pool, `UPDATE runs SET status = 'completed' WHERE id = $1`, runA)
+		wID := seedEphemeralWorkerBound(fx, runA)
+		setWorkerClock(fx, wID, recent, recent)
+		mustExec(fx.ctx, fx.t, fx.pool, `UPDATE workers SET lease_since = now(), lease_repo_id = $2, lease_branch = 'agent/issue-1', draining_since = NULL WHERE id = $1`, wID, fx.repoID)
+
+		lease := pgtype.Interval{Microseconds: int64(time.Hour / time.Microsecond), Valid: true}
+		if _, err := store.ReapEphemeralWorkers(fx.ctx, fx.pool, cut, lease); err != nil {
+			t.Fatalf("ReapEphemeralWorkers: %v", err)
+		}
+		if !workerExists(fx, wID) {
+			t.Errorf("worker %s reaped: a live lease on a terminal run is spared by (f) and (g) must not apply to a terminal run", wID)
+		}
+	})
+
 	t.Run("non-ephemeral worker with a terminal run is never touched", func(t *testing.T) {
 		fx := newFleetFixture(t)
 		var persistentID uuid.UUID

@@ -250,6 +250,18 @@ func TestHibernationWakeDemandMatchesClaimLiveDB(t *testing.T) {
 			}, want: false,
 		},
 		{
+			// An AWAKE online worker that lacks claude_provider_v1 cannot claim the provider-bound chat,
+			// so it must not block the wake of the capable sleeper (claimsAfterWake agrees).
+			name: "provider-bound chat, awake incapable worker plus capable hibernated sleeper", chat: true,
+			opts: wakeWorkerOpts{protocol: []string{claudeProviderCap}},
+			setup: func(fx *fleetFixture, _ uuid.UUID) uuid.UUID {
+				hostedWorker(fx, wakeWorkerOpts{})
+				id := queuedChat(fx)
+				bindRunToProvider(fx, id, "wake-chat-awake-incapable")
+				return id
+			}, want: true,
+		},
+		{
 			name: "cross-check child, legacy run-lane worker", opts: wakeWorkerOpts{protocol: checkerProtocol},
 			setup: func(fx *fleetFixture, _ uuid.UUID) uuid.UUID { return queuedPlanChecker(fx) }, want: true,
 		},

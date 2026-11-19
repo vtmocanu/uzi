@@ -73,7 +73,7 @@ func TestEphemeralReapPredicateIdenticalAcrossLockAndDelete(t *testing.T) {
 		}
 	}
 	for name, p := range map[string]string{"lock": lock, "delete": del} {
-		if !strings.Contains(p, "claude_provider_v1") {
+		if !strings.Contains(p, "NOT ('claude_provider_v1' = ANY(w.protocol_capabilities))") {
 			t.Errorf("%s predicate does not carry the claude_provider_v1 arm (g)", name)
 		}
 		if !strings.Contains(p, "isolated_fetch_v1") {

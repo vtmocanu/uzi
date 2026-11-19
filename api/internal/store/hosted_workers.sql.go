@@ -1087,8 +1087,10 @@ type LockReapableEphemeralWorkersParams struct {
 //	    owner-cap slot. No deadline, like (d) and (e); the busy and custody guards above still apply.
 //	    The same register-before-heartbeat online_since caveat as (e) applies. Reaping frees the
 //	    slot so the provider run is demand again (ListUnplaceableQueuedRunsForEphemeral) and a fresh
-//	    worker is provisioned; until the worker image pin catches up that re-provision churn is
-//	    bounded and accepted.
+//	    worker is provisioned. Re-provision churn is limited in concurrency (the per-user
+//	    ephemeral cap) and in rate (the provision and reap ticks), but the total number of
+//	    cycles is NOT bounded while an image without claude_provider_v1 is provisioned; that is
+//	    accepted, as for arm (e), until the worker image pin advertises it (ADR-4320, 2026-11-19).
 //	(f) PRD #2006: arm (a) is spared while the worker's ephemeral lease is live at
 //	    clock_timestamp(); the lease ending (expiry, drain, re-register) makes (a) true again.
 //
