@@ -542,7 +542,7 @@ func TestFollowupFinalizeRaceOrdersLiveDB(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer conn.Release()
-		submitting := f.svc.boundClaimControlService(store.New(conn))
+		submitting := New(store.New(conn), f.svc.box, f.svc.p)
 		done := make(chan error, 1)
 		go func() {
 			_, err := submitting.SubmitInputWithOptions(f.ctx, f.userID, id, "follow_up", "because", nil, SubmitInputOptions{})
@@ -579,7 +579,7 @@ func TestFollowupFinalizeRaceOrdersLiveDB(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer conn.Release()
-		admitting := f.svc.boundClaimControlService(store.New(conn))
+		admitting := New(store.New(conn), f.svc.box, f.svc.p)
 		admitting.SetTxBeginner(conn)
 		done := make(chan error, 1)
 		go func() {
