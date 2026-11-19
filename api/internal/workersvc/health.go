@@ -549,11 +549,12 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		// keeps the same reason text after the window ends, so the unchanged-reason skip would never
 		// nudge it. Once the window has passed and this episode was never nudged, re-evaluate it.
 		// Only the named reason can start quiet (the unavailable one nudges on entry), only an
-		// episode a window actually quieted qualifies (quietWindowCoveredEpisode), and the
-		// cooldown gates it here too, so a cooled-down run is not rewritten every tick.
+		// episode a window could have covered by time qualifies (quietWindowCoveredEpisode), the
+		// window must have ended (quietWindowEnded), and the cooldown gates it here too, so a
+		// cooled-down run is not rewritten every tick.
 		quietHoldEnded := r.Health == target && textEq(r.HealthReason, reason) &&
 			isCodexProvenanceHoldReason(reason) && reason != codexProvenanceUnavailableText &&
-			!s.quietCodexHold(now, r, reason) && s.quietWindowCoveredEpisode(r) &&
+			!s.quietCodexHold(now, r, reason) && s.quietWindowCoveredEpisode(r) && s.quietWindowEnded(now, r) &&
 			r.HealthSince.Valid && (!r.HealthNotifiedAt.Valid || r.HealthNotifiedAt.Time.Before(r.HealthSince.Time)) &&
 			(cooldown == 0 || !r.HealthNotifiedAt.Valid || now.Sub(r.HealthNotifiedAt.Time) >= cooldown)
 		if r.Health == target && textEq(r.HealthReason, reason) && !quietHoldEnded &&
@@ -2418,6 +2419,18 @@ func (s *Service) quietWindowCoveredEpisode(r store.ListActiveRunsForHealthRow) 
 		return false
 	}
 	return r.UpdatedAt.Time.Add(s.p.WorkerAffinityCeiling).After(r.HealthSince.Time)
+}
+
+// quietWindowEnded reports whether the window that could have quieted the episode is over. With a
+// pinnable flag still set (and quietCodexHold already false), the flag-backed window ended by its
+// own clock, so it is over now. With both flags absent or dropped, no clock names the window's end,
+// so the run waits for the affinity ceiling end (updated_at + WorkerAffinityCeiling), the latest
+// instant any window can run to. It is only meaningful together with quietWindowCoveredEpisode.
+func (s *Service) quietWindowEnded(now time.Time, r store.ListActiveRunsForHealthRow) bool {
+	if r.StaleRequeuePinnable || r.OwnerHoldPinnable {
+		return true
+	}
+	return r.UpdatedAt.Valid && !now.Before(r.UpdatedAt.Time.Add(s.p.WorkerAffinityCeiling))
 }
 
 // isCodexProvenanceHoldReason matches both texts codexProvenanceHoldReason produces.

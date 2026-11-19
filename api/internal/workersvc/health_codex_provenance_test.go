@@ -167,10 +167,10 @@ func TestCodexProvenanceHoldNudgeSuppression(t *testing.T) {
 	}
 }
 
-// A named held row that was quieted by another transition (leaving maintenance or an expired Codex
-// admission wait) is never nudged afterwards: no stale-requeue or owner-hold window covered the
-// episode, so there is no post-window nudge owed.
-func TestCodexProvenanceHeldQuietTransitionsNeverLateNudge(t *testing.T) {
+// A named held row that left another quiet state (maintenance or an expired Codex admission wait)
+// with no pinnable flag set is silent until updated_at + the affinity ceiling, the latest end of
+// any window that could have covered it; it then nudges exactly once. Never at +30s.
+func TestCodexProvenanceHeldQuietTransitionsNudgeAtCeilingEnd(t *testing.T) {
 	cases := []struct {
 		name  string
 		prior string
@@ -181,13 +181,11 @@ func TestCodexProvenanceHeldQuietTransitionsNeverLateNudge(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			r := heldCodexRun("A")
+			r.StatusSince = ago(30 * time.Minute)
+			r.UpdatedAt = ago(30 * time.Minute)
 			r.Health = healthWaitingWorker
 			r.HealthReason = pgtype.Text{String: tc.prior, Valid: true}
-			r.HealthSince = ago(time.Hour)
-			// Queued long before: the affinity ceiling (2h in pinSvc) ended before the episode began, so
-			// no window covers it. With a recent updated_at the time window would still be open at
-			// health_since and the hold would nudge once at that window's end (accepted).
-			r.UpdatedAt = ago(3 * time.Hour)
+			r.HealthSince = ago(25 * time.Minute)
 			fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}}
 			svc, b := pinSvc(fs, defaultHealthSettings())
 			svc.detectRunHealth(context.Background(), t0)
@@ -203,7 +201,52 @@ func TestCodexProvenanceHeldQuietTransitionsNeverLateNudge(t *testing.T) {
 			if len(fs2.writes) != 0 || len(b2.healthNudges) != 0 {
 				t.Fatalf("tick 2: writes=%d nudges=%v, want neither", len(fs2.writes), b2.healthNudges)
 			}
+
+			// At updated_at + ceiling (2h in pinSvc) the one owed nudge fires.
+			end := r.UpdatedAt.Time.Add(svc2.p.WorkerAffinityCeiling)
+			fs3 := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}}
+			svc3, b3 := pinSvc(fs3, defaultHealthSettings())
+			svc3.detectRunHealth(context.Background(), end)
+			w3 := lastWrite(t, fs3, r.ID)
+			if len(b3.healthNudges) != 1 || !b3.healthNudges[0] || !w3.HealthNotifiedAt.Valid {
+				t.Fatalf("at the ceiling end: nudges=%v notified=%v, want exactly one nudge", b3.healthNudges, w3.HealthNotifiedAt)
+			}
+
+			r.HealthNotifiedAt = w3.HealthNotifiedAt
+			fs4 := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}}
+			svc4, _ := pinSvc(fs4, defaultHealthSettings())
+			if n := svc4.detectRunHealth(context.Background(), end.Add(time.Minute)); n != 0 {
+				t.Fatalf("after the nudge: changed=%d, want 0", n)
+			}
 		})
+	}
+}
+
+// With the ceiling already past before the episode began, no window covers it: such a row never
+// gets a late nudge, at tick 2 or after.
+func TestCodexProvenanceHeldQuietTransitionsNotCoveredNeverNudge(t *testing.T) {
+	for _, prior := range []string{reasonMaintenance, apitypes.CodexAdmissionReason("rate_limit", t0.Add(-time.Hour))} {
+		r := heldCodexRun("A")
+		r.UpdatedAt = ago(3 * time.Hour)
+		r.Health = healthWaitingWorker
+		r.HealthReason = pgtype.Text{String: prior, Valid: true}
+		r.HealthSince = ago(time.Hour)
+		fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}}
+		svc, _ := pinSvc(fs, defaultHealthSettings())
+		svc.detectRunHealth(context.Background(), t0)
+		w := lastWrite(t, fs, r.ID)
+		if w.HealthNotifiedAt.Valid {
+			t.Fatalf("tick 1 nudged for prior %q", prior)
+		}
+		r.HealthReason, r.HealthSince = w.HealthReason, w.HealthSince
+		fs2 := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}}
+		svc2, b2 := pinSvc(fs2, defaultHealthSettings())
+		for _, d := range []time.Duration{30 * time.Second, 4 * time.Hour} {
+			svc2.detectRunHealth(context.Background(), t0.Add(d))
+		}
+		if len(fs2.writes) != 0 || len(b2.healthNudges) != 0 {
+			t.Fatalf("prior %q: later ticks wrote=%d nudges=%v, want neither", prior, len(fs2.writes), b2.healthNudges)
+		}
 	}
 }
 
@@ -239,7 +282,8 @@ func TestCodexProvenanceUnavailableNudgesFromExpiredAdmission(t *testing.T) {
 }
 
 // The pinnable flags can drop mid-window (worker row replaced, drain ended, origin-owner pins
-// flipped); a quiet named hold must then still nudge exactly once, and not again.
+// flipped); a quiet named hold then nudges exactly once at updated_at + the affinity ceiling, not
+// before, and not again.
 func TestCodexProvenanceQuietHoldNudgesWhenPinFlagsDrop(t *testing.T) {
 	cases := []struct {
 		name string
@@ -262,21 +306,28 @@ func TestCodexProvenanceQuietHoldNudgesWhenPinFlagsDrop(t *testing.T) {
 
 			r.Health, r.HealthReason, r.HealthSince = healthWaitingWorker, w.HealthReason, w.HealthSince
 			tc.set(&r, false)
+			// Flags dropped: no clock names the window's end, so the run waits for updated_at + ceiling.
 			fs2 := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}}
 			svc2, b2 := pinSvc(fs2, defaultHealthSettings())
-			if n := svc2.detectRunHealth(context.Background(), t0.Add(5*time.Minute)); n != 1 {
-				t.Fatalf("tick 2: changed=%d, want 1", n)
+			if n := svc2.detectRunHealth(context.Background(), t0.Add(5*time.Minute)); n != 0 || len(b2.healthNudges) != 0 {
+				t.Fatalf("tick 2 (+5m): changed=%d nudges=%v, want neither", n, b2.healthNudges)
 			}
-			w2 := lastWrite(t, fs2, r.ID)
-			if len(b2.healthNudges) != 1 || !b2.healthNudges[0] || !w2.HealthNotifiedAt.Valid {
-				t.Fatalf("tick 2: nudges=%v notified=%v, want exactly one nudge", b2.healthNudges, w2.HealthNotifiedAt)
+			end := r.UpdatedAt.Time.Add(svc2.p.WorkerAffinityCeiling)
+			fs3 := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}}
+			svc3, b3 := pinSvc(fs3, defaultHealthSettings())
+			if n := svc3.detectRunHealth(context.Background(), end); n != 1 {
+				t.Fatalf("at the ceiling end: changed=%d, want 1", n)
+			}
+			w3 := lastWrite(t, fs3, r.ID)
+			if len(b3.healthNudges) != 1 || !b3.healthNudges[0] || !w3.HealthNotifiedAt.Valid {
+				t.Fatalf("at the ceiling end: nudges=%v notified=%v, want exactly one nudge", b3.healthNudges, w3.HealthNotifiedAt)
 			}
 
-			r.HealthNotifiedAt = w2.HealthNotifiedAt
-			fs3 := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}}
-			svc3, _ := pinSvc(fs3, defaultHealthSettings())
-			if n := svc3.detectRunHealth(context.Background(), t0.Add(10*time.Minute)); n != 0 {
-				t.Fatalf("tick 3: changed=%d, want 0", n)
+			r.HealthNotifiedAt = w3.HealthNotifiedAt
+			fs4 := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}}
+			svc4, _ := pinSvc(fs4, defaultHealthSettings())
+			if n := svc4.detectRunHealth(context.Background(), end.Add(time.Minute)); n != 0 {
+				t.Fatalf("after the nudge: changed=%d, want 0", n)
 			}
 		})
 	}
