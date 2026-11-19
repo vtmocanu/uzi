@@ -759,8 +759,6 @@ Caveats:
   recreate claims repeatedly, bypass pacing, force-roll or remove reservations. Pending
   alone proves neither a storage fault nor healthy storage (#4468).
 - Known issues that can stall a restore in step 2.7:
-  - a roll pool whose participant reservations have lost their canary holds every
-    participant, and the controller does not recover it yet (#4466);
   - the roll status can drop a worker's health row when its blocker is synthetic, and
     the worker list shares that status (#4467); when it looks stale, inspect the live
     Deployment, reservation, claims and pod, and the controller logs.
@@ -794,6 +792,44 @@ except for eligible custody-held migration drains; legacy recycle cannot evade
 that policy. Separately fenced DinD maintenance remains
 independent. A pool with one worker can have an outage during its roll. Waiting
 indefinitely can delay capacity turnover and security fixes indefinitely.
+
+A roll pool whose participants still carry incomplete reservations but no canary
+(for example after its reservation annotation was reset) recovers on its own when
+one participant already has full current-incarnation proof: a fresh registration,
+exact version, heartbeat and coverage on its reserved template with one replica,
+and it is not cordoned or drained.
+The first tick only marks that participant canary and does nothing else in the
+pool. Later ticks restore the other participants through normal admission, for
+example recreating a paused worker's claims and scaling it back. Removing only one
+participant's marker, uncordoning, or deleting a previously registered worker's
+Deployment need not repair the pool: the other markers remain, uncordoning alone
+supplies no registration proof, and deletion loses the evidence. A deleted
+worker usually trips the missing-deployment guard (`missing deployment lacks
+first-provision evidence; explicit recovery required`), which blocks adoption for
+the whole pool. If it kept a retained claim reservation, the guard is avoided but
+the pool still holds with `participant reservation without canary; explicit
+recovery required`. Either way that Deployment stays missing until a canary
+exists again or explicit recovery.
+
+While no canary exists the pool can stay held:
+
+- no participant has the proof, or the observation is not clean enough to adopt
+  (for example a hibernating, unavailable or unplanned worker, a stray annotated
+  Deployment, or an uncertain or migration fence): held with `participant
+  reservation without canary; explicit recovery required`. This applies even when
+  every participant is already proven, so no new canary is admitted beside them,
+  and also when a canary of the same owner exists in another capability pool of
+  the namespace: that canary touches no Deployment in this pool, so it cannot
+  fence an adoption request still outstanding here;
+- a smaller-ID participant is neither proven nor fenced (stale evidence, a desired
+  generation change, a claim mirror, or a Deployment recreated still carrying its
+  marker): held with `earlier participant may hold an unresolved adoption
+  request`. It clears when that
+  participant regains proof or its Deployment is rescaled, retemplated or loses its
+  marker. Deleting that Deployment replaces this hold, usually with the
+  missing-deployment guard above.
+
+Design: [ADR-1470](../adr/1470-paced-hosted-worker-rolls.md).
 
 `workers.drainDeadline` / `UZI_WORKER_DRAIN_DEADLINE` retains its `24h` default and
 positive-only parsing, now only for independent **nondrifted** pressure/nix-size

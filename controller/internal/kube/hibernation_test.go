@@ -587,8 +587,8 @@ func TestWakingCreatesAMissingDeploymentAwakeWithTheOpAnnotation(t *testing.T) {
 	}
 }
 
-// A wake that has to create the Deployment carries a retained roll marker onto it, the
-// same as the ordinary create path.
+// A wake with a retained reservation waits for ordinary roll admission, then carries
+// that marker onto the replacement Deployment, the same as the ordinary create path.
 func TestWakingCreateCarriesTheRetainedRollMarker(t *testing.T) {
 	cfg := testConfig()
 	base := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m"}
@@ -597,10 +597,29 @@ func TestWakingCreateCarriesTheRetainedRollMarker(t *testing.T) {
 	mirror.Annotations = map[string]string{annotationRoll: marker}
 	rec := &hibRec{fakeCordoner: &fakeCordoner{}}
 	m, client := newMatWithCordoner(t, rec, pvcNix("w1", "20Gi"), mirror)
-	if err := hibTick(t, m, hibW(protocol.HibernationWaking, "wake-op")); err != nil {
+	w := hibW(protocol.HibernationWaking, "wake-op")
+	for tick := 0; tick < 3; tick++ {
+		if err := hibTick(t, m, w); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := client.AppsV1().Deployments(cfg.Namespace).Get(context.Background(), deploymentName(w.ID), metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+			t.Fatalf("tick %d: wake without owner evidence did not hold: %v", tick, err)
+		}
+		p := m.PacingOutcomes()[w.ID]
+		if p == nil || p.BlockingReason == nil || *p.BlockingReason != "reservation owner or placement does not match API evidence" {
+			t.Fatalf("tick %d: missing reservation-owner evidence was not reported: %+v", tick, p)
+		}
+	}
+	// The retained marker is a canary reservation. Matching API evidence admits
+	// its recovery on a later tick; a mirror alone is never admission authority.
+	w = evidence(w, m5Now)
+	if err := hibTick(t, m, w); err != nil {
 		t.Fatal(err)
 	}
 	d := hibGet(t, client)
+	if d.Spec.Replicas == nil || *d.Spec.Replicas != 1 {
+		t.Fatalf("admitted wake did not create an awake Deployment: %v", d.Spec.Replicas)
+	}
 	if d.Annotations[annotationRoll] != marker {
 		t.Fatalf("created Deployment roll annotation = %q, want the retained marker %q", d.Annotations[annotationRoll], marker)
 	}
