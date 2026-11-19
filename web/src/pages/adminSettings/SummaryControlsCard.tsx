@@ -52,7 +52,7 @@ export function SummaryControlsCard({
           Runs write short plain-English summaries on{" "}
           <strong className="text-fg">the run owner&rsquo;s own credential</strong>. Summaries are advisory and
           never block a run. Pick the summary models in{" "}
-          <a href="#model-defaults" className="text-brand hover:underline">
+          <a href="#model-defaults" className="text-brand underline underline-offset-2">
             Model defaults
           </a>
           .

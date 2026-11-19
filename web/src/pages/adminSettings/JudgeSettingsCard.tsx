@@ -5,21 +5,32 @@ import { Alert, Button, Card, Field, Input, SectionTitle } from "../../component
 
 type JudgeKey = "judge_model" | "codex_judge_model";
 
-// instanceModelText renders one lane of the read-only "Instance default" line. A pinned lane
-// (source other than "default") shows its stored value, marked when the environment set it;
-// an unpinned lane names the built-in it follows, or stays neutral when the server sent none.
-function instanceModelText(
+// instanceModelParts splits one lane of the read-only "Instance default" line into the model
+// id (shown monospace) and a plain provenance note. A pinned lane (source other than
+// "default") shows its stored value, marked when the environment set it; an unpinned lane
+// names the built-in it follows, or stays neutral when the server sent none.
+function instanceModelParts(
   key: JudgeKey,
   settings: AppSettings,
   sources: Record<string, SettingSource>,
   defaults: Record<string, string>,
-): string {
+): { model: string; note: string } {
   if (sources[key] !== "default") {
     const value = settings[key] ?? "";
-    return sources[key] === "env" ? `${value}, from the environment` : value;
+    return { model: value, note: sources[key] === "env" ? ", from the environment" : "" };
   }
   const builtin = defaults[key];
-  return builtin ? `${builtin} (built-in)` : "built-in";
+  return builtin ? { model: builtin, note: " (built-in)" } : { model: "", note: "built-in" };
+}
+
+// InstanceModel renders one "<Family> <model><note>" pair, kept on one line.
+function InstanceModel({ family, parts }: { family: string; parts: { model: string; note: string } }) {
+  return (
+    <span className="whitespace-nowrap">
+      {family} {parts.model && <span className="font-mono text-fg">{parts.model}</span>}
+      {parts.note}
+    </span>
+  );
 }
 
 // JudgeSettingsCard is the admin surface for the run judge policy (PRD #46): the global
@@ -119,14 +130,14 @@ export function JudgeSettingsCard({
           data-testid="judge-instance-default"
         >
           <span>
-            Instance default: Claude{" "}
-            <span className="font-mono text-fg">{instanceModelText("judge_model", settings, sources, defaults)}</span>{" "}
-            &middot; Codex{" "}
-            <span className="font-mono text-fg">{instanceModelText("codex_judge_model", settings, sources, defaults)}</span>{" "}
+            Instance default:{" "}
+            <InstanceModel family="Claude" parts={instanceModelParts("judge_model", settings, sources, defaults)} />{" "}
+            &middot;{" "}
+            <InstanceModel family="Codex" parts={instanceModelParts("codex_judge_model", settings, sources, defaults)} />{" "}
             &middot; users may override.
           </span>{" "}
           <a href="#model-defaults" className="text-brand hover:underline">
-            Model defaults &uarr;
+            Model defaults <span aria-hidden="true">&uarr;</span>
           </a>
         </div>
 
@@ -154,7 +165,11 @@ export function JudgeSettingsCard({
             opt-in</strong>. A user with no
             usable credential for that harness is skipped, with a reason shown on the run, and is never charged
             to the other provider. On a subscription plan it also eats their rate-limit quota. Consider a
-            cheaper judge model in <a href="#model-defaults" className="text-brand hover:underline">Model defaults</a> before enforcing. The per-user
+            cheaper judge model in{" "}
+            <a href="#model-defaults" className="text-brand underline underline-offset-2">
+              Model defaults
+            </a>{" "}
+            before enforcing. The per-user
             judge toggle on the Users page becomes inert while this is on.
           </p>
         </div>
