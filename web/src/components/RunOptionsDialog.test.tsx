@@ -389,8 +389,16 @@ describe("RunOptionsDialog start preview", () => {
     serve(resp("claude"));
     const { dialog } = mountWithPreview();
     expect(await within(dialog).findByRole("button", { name: /If it started now: Claude · opus · medium/ })).toBeTruthy();
-    expect(within(dialog).getByText(/Settings left on Default are resolved when a worker picks the run up/)).toBeTruthy();
+    expect(within(dialog).getByText(/Model and effort left on Default are resolved when a worker picks the run up/)).toBeTruthy();
     expect(within(dialog).queryByText(/follows your Settings/)).toBeNull();
+  });
+
+  it("does not repeat the preview's note lines inside the dialog", async () => {
+    serve(resp("claude"));
+    const { dialog } = mountWithPreview();
+    expect(await within(dialog).findByRole("button", { name: /If it started now: Claude · opus · medium/ })).toBeTruthy();
+    expect(within(dialog).queryByText(/A prediction/)).toBeNull();
+    expect(within(dialog).queryByText(/A choice made here is fixed/)).toBeNull();
   });
 
   it("an undecided default names 'chosen when started' on the harness Default and depends-on-harness for model and effort", async () => {

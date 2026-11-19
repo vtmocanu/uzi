@@ -75,7 +75,7 @@ describe("StartPreview compact", () => {
     renderPreview("compact");
     fireEvent.click(await screen.findByRole("button", { name: /If started now/ }));
     // The claude preview mixes a claim-fixed model and credential with a run_override harness.
-    expect(screen.getByText(/A prediction: settings left on Default are read when a worker picks the run up/)).toBeTruthy();
+    expect(screen.getByText(/A prediction: claim-time settings are resolved when a worker picks the run up/)).toBeTruthy();
     expect(screen.getByText(/A choice made here is fixed on the run now/)).toBeTruthy();
     expect(screen.getByRole("link", { name: "Run defaults" }).getAttribute("href")).toBe("/settings/run-defaults");
   });
@@ -102,7 +102,7 @@ describe("StartPreview compact", () => {
     renderPreview("compact");
     fireEvent.click(await screen.findByRole("button", { name: /If started now/ }));
     expect(screen.queryByText(/A choice made here/)).toBeNull();
-    expect(screen.getByText("The harness and credential are fixed when the run is created.")).toBeTruthy();
+    expect(screen.queryByText(/fixed when the run is created/)).toBeNull();
   });
 
   it("showNote=false hides the note lines but keeps the link", async () => {

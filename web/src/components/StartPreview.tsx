@@ -75,13 +75,9 @@ function Note({ view }: { view: StartPreviewViewModel }) {
   return (
     <>
       {view.fixed.claim && (
-        <p>A prediction: settings left on Default are read when a worker picks the run up.</p>
+        <p>A prediction: claim-time settings are resolved when a worker picks the run up.</p>
       )}
-      {view.fixed.override ? (
-        <p>A choice made here is fixed on the run now.</p>
-      ) : (
-        view.fixed.create && <p>The harness and credential are fixed when the run is created.</p>
-      )}
+      {view.fixed.override && <p>A choice made here is fixed on the run now.</p>}
     </>
   );
 }

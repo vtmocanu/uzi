@@ -85,28 +85,26 @@ describe("startPreviewView", () => {
     expect(v.effort).toEqual({ text: "medium", short: "medium", source: "built-in" });
     expect(v.credential).toBe("automatic selection");
     expect(compactSummary(v)).toBe("Claude · opus · medium");
-    expect(v.fixed).toEqual({ claim: true, create: false, override: false });
+    expect(v.fixed).toEqual({ claim: true, override: false });
   });
 
   it("a create-fixed credential alone is not a choice made here", () => {
     const v = startPreviewView(recorded("default start"), GET);
-    expect(v.fixed.create).toBe(true);
     expect(v.fixed.override).toBe(false);
     expect(startPreviewView(recorded("enabled pinned token"), GET).fixed.override).toBe(true);
   });
 
   it("counts an explicit harness choice as fixed on the run now", () => {
     const v = startPreviewView(recorded("claude"), GET);
-    expect(v.fixed.create).toBe(true);
     expect(v.fixed.override).toBe(true);
-    expect(startPreviewView(recorded("auto token"), GET).fixed.create).toBe(false);
+    expect(startPreviewView(recorded("auto token"), GET).fixed.override).toBe(false);
   });
 
   it("uses an explicit model alone and falls back to the GET effort", () => {
     const v = startPreviewView(recorded("claude with a model"), GET);
     expect(v.model).toEqual({ text: "opus", short: "opus", source: "this run" });
     expect(v.effort?.source).toBe("built-in");
-    expect(v.fixed.create).toBe(true);
+    expect(v.fixed.override).toBe(true);
   });
 
   it("uses an explicit effort alone and falls back to the GET model", () => {
@@ -218,7 +216,7 @@ describe("startPreviewView", () => {
     expect(v.alternatives).toEqual([]);
     expect(compactSummary(v)).toBe(v.refusal);
     // The explicit harness choice is still fixed on the run, and a credential fixed at claim shows.
-    expect(v.fixed.create).toBe(true);
+    expect(v.fixed.override).toBe(true);
     const p = recorded("claude with an incompatible model");
     p.credential!.fixed_at = "claim";
     expect(startPreviewView(p, GET).fixed.claim).toBe(true);

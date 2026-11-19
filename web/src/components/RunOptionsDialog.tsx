@@ -255,8 +255,8 @@ export function RunOptionsDialog({
           </Field>
           <StartPreview variant="open" request={previewRequest} showNote={false} />
           <p id={defaultsHintId} className="text-xs text-faint">
-            Settings left on Default are resolved when a worker picks the run up. A choice made here stays with this
-            run, including after a resume.
+            Model and effort left on Default are resolved when a worker picks the run up. A choice made here stays
+            with this run, including after a resume.
           </p>
 
           {/* Server refusals (a 422 naming the harness and remedies, or a 400 from an
