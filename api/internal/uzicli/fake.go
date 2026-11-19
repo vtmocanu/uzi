@@ -393,6 +393,22 @@ type FakeClient struct {
 	// the last cells sent. Without a canned reply the cells are applied to Settings.CrossCheckPins.
 	LastCrossCheckPins []CrossCheckPinWire
 
+	// Agent-template pin capture (PRD #3264 M3). AgentTemplates is what the list answers (also
+	// updated by a write); AgentTemplateListErr fails the list; AgentTemplateListCalls and
+	// AgentTemplatePutCalls count requests (zero proves a refusal before any request);
+	// LastAgentTemplateID and LastAgentTemplatePatch record the last write (a nil value is a
+	// clear); AgentTemplatePutResult is a canned reply and AgentTemplatePutErr fails the write
+	// (it wins over the blanket Err while the capture still proves the write was reached).
+	AgentTemplates          []AgentTemplatePins
+	AgentTemplateListErr    error
+	AgentTemplateListCalls  int
+	AgentTemplatePutCalls   int
+	LastAgentTemplateID     string
+	LastAgentTemplatePatch  map[string]*string
+	AgentTemplatePutResult  *AgentTemplatePinsResult
+	AgentTemplatePutErr     error
+	AgentTemplateListResult *AgentTemplateListResult
+
 	// SchedulePreview and SchedulePreviewErr drive PreviewScheduleSettings; with both unset the
 	// fake answers 404 like a foreign schedule. SchedulePreviewIDs records the ids asked for.
 	SchedulePreview    *apitypes.ScheduleSettingsPreviewDTO

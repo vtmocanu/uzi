@@ -200,6 +200,64 @@ func (f *FakeClient) PutCrossCheckPins(_ context.Context, cells []CrossCheckPinW
 	return ModelSettingsResult{Settings: f.Settings, Raw: raw}, nil
 }
 
+// ListMyAgentTemplates answers AgentTemplateListResult when set, else AgentTemplates.
+func (f *FakeClient) ListMyAgentTemplates(context.Context) (AgentTemplateListResult, error) {
+	f.AgentTemplateListCalls++
+	if f.AgentTemplateListErr != nil {
+		return AgentTemplateListResult{}, f.AgentTemplateListErr
+	}
+	if f.Err != nil {
+		return AgentTemplateListResult{}, f.Err
+	}
+	if f.AgentTemplateListResult != nil {
+		return *f.AgentTemplateListResult, nil
+	}
+	ts := append([]AgentTemplatePins{}, f.AgentTemplates...)
+	raw, err := json.Marshal(map[string][]AgentTemplatePins{"templates": ts})
+	if err != nil {
+		return AgentTemplateListResult{}, err
+	}
+	return AgentTemplateListResult{Templates: ts, Raw: raw}, nil
+}
+
+// PutAgentTemplateModelPins records the write, then answers AgentTemplatePutResult or, without
+// one, applies the patch to the matching AgentTemplates entry (a nil value clears the pin).
+func (f *FakeClient) PutAgentTemplateModelPins(_ context.Context, id string, patch map[string]*string) (AgentTemplatePinsResult, error) {
+	f.AgentTemplatePutCalls++
+	f.LastAgentTemplateID = id
+	f.LastAgentTemplatePatch = make(map[string]*string, len(patch))
+	for k, v := range patch {
+		f.LastAgentTemplatePatch[k] = v
+	}
+	if f.AgentTemplatePutErr != nil {
+		return AgentTemplatePinsResult{}, f.AgentTemplatePutErr
+	}
+	if f.Err != nil {
+		return AgentTemplatePinsResult{}, f.Err
+	}
+	if f.AgentTemplatePutResult != nil {
+		return *f.AgentTemplatePutResult, nil
+	}
+	for i := range f.AgentTemplates {
+		if f.AgentTemplates[i].ID != id {
+			continue
+		}
+		t := &f.AgentTemplates[i]
+		if v, ok := patch["model"]; ok {
+			t.Model = v
+		}
+		if v, ok := patch["codex_model"]; ok {
+			t.CodexModel = v
+		}
+		raw, err := json.Marshal(map[string]AgentTemplatePins{"template": *t})
+		if err != nil {
+			return AgentTemplatePinsResult{}, err
+		}
+		return AgentTemplatePinsResult{Template: *t, Raw: raw}, nil
+	}
+	return AgentTemplatePinsResult{}, Exitf(ExitNotFound, "template not found")
+}
+
 // PreviewScheduleSettings serves SchedulePreview and records the id; unset it answers 404.
 func (f *FakeClient) PreviewScheduleSettings(_ context.Context, scheduleID string) (apitypes.ScheduleSettingsPreviewDTO, error) {
 	f.SchedulePreviewIDs = append(f.SchedulePreviewIDs, scheduleID)

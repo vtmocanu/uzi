@@ -440,6 +440,7 @@ func newRootCmd(env Env) *cobra.Command {
 		newWhoamiCmd(env, gf),
 		newVaultCmd(env, gf),
 		newSettingsCmd(env, gf),
+		newAgentTemplateCmd(env, gf),
 		newRunCmd(env, gf),
 		newPRCmd(env, gf),
 		newCICmd(env, gf),

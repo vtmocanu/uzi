@@ -193,6 +193,10 @@ uzi settings set <setting> [--harness claude|codex] <value>
 uzi settings reset <setting> [--harness claude|codex]
 uzi settings set cross-check --stage plan|code --harness claude|codex [--model <id>] [--effort <level>]
 uzi settings reset cross-check --stage plan|code --harness claude|codex
+uzi agent-template list
+uzi agent-template show <name|id>
+uzi agent-template set <name|id> --harness claude|codex <model>
+uzi agent-template reset <name|id> --harness claude|codex
 uzi context list
 uzi context current
 uzi context use <name>
@@ -423,6 +427,17 @@ uzi version
   resolved value and source; `--json` prints the server envelope. Usage exit 2 (no
   request) on a missing or invalid `--stage`, `--harness`, member or effort, or when
   those flags are given to another setting.
+- `uzi agent-template list|show <name|id>|set <name|id> --harness claude|codex <model>|reset
+  <name|id> --harness claude|codex` — read and edit the Claude (`model`) and Codex
+  (`codex_model`) pins of your own agent templates (`GET /api/me/agent-templates`,
+  `PUT /api/me/agent-templates/{id}/model-pins`). Every verb first lists to resolve the
+  argument: an exact id wins, else an exact name; a name matching several templates exits 2
+  and lists the ids, no match exits 4. Pins are stored per family; `reset` clears one so it
+  inherits. Output shows stored pins only (value or `inherit`), never a resolved model.
+  `--json` prints the server envelope (`show` prints `{"template": ...}`). Usage exit 2
+  (no request) on a missing or invalid `--harness`, or a missing or empty model. Builtin and
+  global templates exit 3 ("edited in the web UI by an admin"). Exit 6 on an unknown commit
+  outcome or a failed readback; a server without the routes exits 1 ("upgrade the server").
 
 ### Named contexts
 
