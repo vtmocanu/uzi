@@ -30,11 +30,12 @@ func TestStartRefusalMapsTheCreateSentinels(t *testing.T) {
 		{"plain explicit refusal", workersvc.ErrNoCredentialForHarness, refusal{Token: "no_credential_for_harness"}}, //nolint:gosec // G101: refusal-reason tokens, not secrets
 		{"all credentials disabled", workersvc.ErrHarnessCredentialDisabled, refusal{"no_credential_for_harness", "credential_disabled"}},
 		{"codex pool unavailable", workersvc.ErrCodexPoolUnavailable, refusal{"no_credential_for_harness", "codex_pool_unavailable"}},
-		{"neither usable", workersvc.ErrNoUsableCredential, refusal{Token: "no_usable_credential"}},                                     //nolint:gosec // G101: refusal-reason tokens, not secrets
-		{"disabled pinned token", workersvc.ErrCredentialDisabled, refusal{Token: "credential_disabled"}},                               //nolint:gosec // G101: refusal-reason tokens, not secrets
-		{"missing, deleted or foreign token", workersvc.ErrCredentialOverrideSecretNotFound, refusal{Token: "credential_not_found"}},    //nolint:gosec // G101: refusal-reason tokens, not secrets
-		{"codex harness", workersvc.ErrCredentialOverrideHarnessUnsupported, refusal{Token: "credential_override_harness_unsupported"}}, //nolint:gosec // G101: refusal-reason tokens, not secrets
-		{"pinned without a token", workersvc.ErrCredentialOverridePinnedNeedsSecret, refusal{Token: "credential_override_invalid"}},     //nolint:gosec // G101: refusal-reason tokens, not secrets
+		{"neither usable", workersvc.ErrNoUsableCredential, refusal{Token: "no_usable_credential"}},                                                            //nolint:gosec // G101: refusal-reason tokens, not secrets
+		{"disabled pinned token", workersvc.ErrCredentialDisabled, refusal{Token: "credential_disabled"}},                                                      //nolint:gosec // G101: refusal-reason tokens, not secrets
+		{"missing, deleted or foreign token", workersvc.ErrCredentialOverrideSecretNotFound, refusal{Token: "credential_not_found"}},                           //nolint:gosec // G101: refusal-reason tokens, not secrets
+		{"codex harness", workersvc.ErrCredentialOverrideHarnessUnsupported, refusal{Token: "credential_override_harness_unsupported"}},                        //nolint:gosec // G101: refusal-reason tokens, not secrets
+		{"provider source (wraps codex, checked first)", workersvc.ErrCredentialOverrideProviderSource, refusal{Token: "credential_override_provider_source"}}, //nolint:gosec // G101: refusal-reason tokens, not secrets
+		{"pinned without a token", workersvc.ErrCredentialOverridePinnedNeedsSecret, refusal{Token: "credential_override_invalid"}},                            //nolint:gosec // G101: refusal-reason tokens, not secrets
 		{"wrapped sentinel", fmt.Errorf("create: %w", workersvc.ErrHarnessCredentialDisabled), refusal{"no_credential_for_harness", "credential_disabled"}},
 	}
 	for _, c := range cases {

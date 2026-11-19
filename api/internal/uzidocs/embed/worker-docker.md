@@ -635,35 +635,50 @@ privileged reclaim and no per-run byte accounting, and no admission headroom
 is promised: run admission fails open when a disk sample is unknown and
 reopens after `UZI_DISK_ADMISSION_MAX_WAIT` (default 15 minutes).
 
-**`.retire-*` retirement scratch (observation only).** Each worker startup
-observes every `.retire-*` scratch parent the bounded root listing reaches
-(4096-entry budget; `enumeration_incomplete` marks a truncated listing) under
-`<dataDir>/runner` and keeps all of them: nothing is deleted, chowned or moved.
-The existing `runner retire scratch retained` warning is unchanged. Two further
-log lines are added:
+**`.retire-*` retirement scratch (bound parents are recorded but kept; a verified
+epoch deletes none on a uid-split pod).** Each worker startup observes every
+`.retire-*` scratch parent the bounded root listing reaches (4096-entry budget;
+`enumeration_incomplete` marks a truncated listing) under `<dataDir>/runner`.
+Nothing is deleted, chowned or moved by the observation itself. Since #4263
+retirements also record a durable binding (below), but on a uid-split pod the
+verified pod-epoch pass keeps every bound parent. The existing `runner retire scratch
+retained` warning is unchanged. Three log lines describe the result:
 
 - `runner retire scratch outcome`: per-parent rows only, up to 10 per startup,
-  sorted. Fields are name, kind, outcome (`kept`), reason, retained_source,
-  empty, recent, bytes, bytes_state and partial_reasons. `reason` is
-  `protected_by_retained_source` when a decoded recovery or restore journal's
-  `clonePath` (predecessor, successor or tombstone) or
-  `retainedSources[].clonePath` names the parent or a path under it (a
-  rollback-repair pointer), otherwise `no_disposition_evidence`.
-  `retained_source` is `named`, `not_named` or `unknown`; `unknown` means the
-  journal read failed or hit a cap, the deadline or an abort.
+  sorted. Fields are name, kind, outcome (`kept` or `reclaimed`), reason,
+  binding, retained_source, empty, recent, bytes, bytes_state and
+  partial_reasons. `retained_source` is `named`, `not_named` or `unknown`;
+  `unknown` means the journal read failed or hit a cap, the deadline or an abort.
+  `binding` is `unbound`, `intent`, `settled`, `removing`, `malformed` or
+  `unknown`. For an unbound parent `reason` is `protected_by_retained_source`
+  when a decoded recovery or restore journal's `clonePath` (predecessor,
+  successor or tombstone) or `retainedSources[].clonePath` names the parent or a
+  path under it (a rollback-repair pointer), otherwise `no_disposition_evidence`.
+  A bound parent reports the binding-aware reasons below.
 - `runner retire scratch total`: exactly one per startup (one per pod epoch on
   epoch workers) whenever records are on and the runner root exists, is a
   directory and was listed, including with zero parents. None is logged when the
   runner root is missing, not a directory or a symlink. If the step throws, a
   `runner retire scratch outcomes failed` warning replaces it. Fields are
-  parents_enumerated, outcomes_omitted, kept, reclaimed (always 0),
-  protected_by_retained_source, no_disposition_evidence, bytes, bytes_state,
-  partial_reasons, enumeration_incomplete and retained_source_read.
-  `retained_source_read` is `read`, `unknown` (the read was attempted and
-  failed) or `not_attempted` (no parents, so no journal read or walk happened).
-  With zero parents the total is `parents_enumerated: 0`, `kept: 0`, `bytes: 0`
-  and `bytes_state: measured` (a sum over zero parents is exact) unless
-  `enumeration_incomplete` is set, when it is `unknown`.
+  parents_enumerated, outcomes_omitted, kept, reclaimed, reclaimed_bytes,
+  protected_by_retained_source, no_disposition_evidence, kept_by_reason,
+  removing_bindings, bytes, bytes_state, partial_reasons, enumeration_incomplete
+  and retained_source_read. `retained_source_read` is `read`, `unknown` (the read
+  was attempted and failed) or `not_attempted` (no parents, so no journal read or
+  walk happened). With zero parents the total is `parents_enumerated: 0`,
+  `kept: 0`, `bytes: 0` and `bytes_state: measured` (a sum over zero parents is
+  exact) unless `enumeration_incomplete` is set, when it is `unknown`.
+- `pod_epoch_reclaim`: the verified pass's own line gains a `retire_scratch`
+  block (`state`, `reason`, `examined`, `reclaimed`, `recovered`, `kept`,
+  `deferred`, `unbound`, `residue`, `unset_failed`, `bytes`, `bytes_state`,
+  `kept_by_reason`) and `retire_scratch_phase_ms`. `deferred` counts candidates
+  left untouched because the phase budget ended or a whole-phase refusal stopped
+  it; it is never part of `kept`. `unbound` counts listed parents no binding
+  names, which are not examined.
+
+The startup inspector runs after the verified pass (still before the worker
+claims runs) so that it can report what the pass reclaimed and why it kept the
+rest.
 
 Bytes are allocated bytes (blocks x 512, hard links counted once) from a
 read-only, descriptor-relative walk as the worker uid that never follows
@@ -682,19 +697,151 @@ bares) took a median of 970 ms (max 1639) with records on, against 13 ms off;
 with 0 parents or 4096 mostly unrelated names the difference was within a few
 ms. This is not a production measurement.
 
-Disable with the chart value `workers.epochReclaim.retireScratchOutcomes:
-false` (controller `UZI_WORKER_RETIRE_SCRATCH_OUTCOMES`, worker
-`UZI_RETIRE_SCRATCH_OUTCOMES=0`; see [configuration](./configuration.md)).
-Off restores the count-only inspector exactly.
+**What is bound and what is kept.** A retire that moves a clone into a
+scratch parent (the cross-device fallback) and carries an attempt id writes a
+durable binding in the bare config, `uzi-retire-scratch.<uuid>.binding`: the
+class, attempt id, run id, branch, clone path, inodes and a phase (`intent`,
+`settled`, `removing`). It is a separate record in the same config store, not a
+field of the recovery journal or the attempt ledger. At most 64 are kept per
+bare; past that no binding is written and the parent gets today's in-process
+removal attempt on both postures. On a uid-split pod that worker removal usually
+fails on runner-owned content and leaves the parent (and possibly partial
+residue) behind unbound, as before this change; the retire logs `retire scratch
+binding cap reached` and reports it `unbound`. On a uid-split pod a retire never
+writes `settled`, whatever its class: every bound non-completion parent
+(`owner_terminal`, `verified_successor`, covered-lift or parked-flight
+`owner_terminal_covered`, and foreign-orphan `other`) stays at `intent` with the
+parent and clone left in place and no in-process removal (`bound_intent`), and no
+path reclaims it. This is a behaviour change: previously the worker's in-process
+`rm` attempted them (and usually failed on runner-owned content), so retention
+only grows, never shrinks. Attempt-less retires are never bound. Foreign-orphan
+retires carry no attempt id in production, so they are in practice unbound.
+Completion keeps its in-process removal: `removing` is written first and the
+binding is unset after success; on a single-uid pod every bound class does the
+same. See [ADR-3153](../adr/3153-runner-shared-pvc-subpath.md) for the full
+table and reasons.
 
-Nothing is reclaimed: no ordinary durable disposition binding proves this
-moved footprint (rollback repair can persist a protected moved-clone pointer),
-the rename into the scratch parent precedes the journal clear and the
-retired-ledger write, and the ledger names only the canonical clone path. A
-retired ledger, emptiness, age or the parent name grant nothing. The legacy
-stderr-proof repair (#4141, landed via #4152) does not certify remnants
-created by older code retroactively; #4137 is a distinct residual. Reclaim
-remains open on #4143 pending a durable parent-binding design.
+**Accepted cost.** Split-pod retire scratch is not reclaimed by the epoch; it is
+kept as `bound_intent` indefinitely, and reclaim needs operator action or the
+existing discard paths. Each `intent` binding holds one of the 64 per-bare
+slots, so after 64 kept split retires on one bare a further retire writes no
+binding and takes the unbound in-process removal path described above. The epoch
+fills at most 64 work slots per pass, sorted by uuid. Kept present parents are
+reported as kept without taking a slot, so they cannot starve gone-parent
+recovery. Gone parents still take slots, so 64 or more earlier-sorting gone
+parents that keep failing a check can block later ones for as long as those
+failures persist; that starvation can be permanent, and no eventual recovery is
+promised.
+
+**Verified-epoch phase.** On a uid-split Docker worker the verified pod-epoch
+pass has a last retire-scratch phase. Nothing writes `settled` any more, so the
+phase never deletes a bound parent: it keeps `intent` (`bound_intent`),
+`removing` (`interrupted_removal`) and any pre-existing `settled` value
+(`settled_kept`), and its live work is the gone-parent metadata-only recovery
+(unset a binding whose parent is already gone, after the custody, authority and
+eligibility gates). The disposal route below is retained without a production
+producer (the real-image e2e tests drive its helpers directly). When it runs it
+re-proves every candidate before touching it: a matching attempt-ledger `retired` entry, no journal, retained
+source, restore, custody, quarantine or stopped marker naming it (alias-aware for
+`/data/runner-shared`), a terminal run with no server holds, no source-use lease,
+a worker-owned 0700 parent holding only `clone` with the bound inodes, older than
+the pod-entry fence, no mount or bind at or under it, an idle worker and no
+process holding it. The phase is bounded: 30 s of headroom to start, a 120 s cap,
+20 s minimum per candidate, at most 64 work slots (kept present parents take none) and 2,000,000 helper entries.
+The helper gets at most min(300 s, phase window - 5 s), so at most about 115 s
+with the 120 s cap. The worker-idle proofs and the run-status and holds read are each
+cancelled 5 s before the phase window ends, keeping a 5 s reserve for joined teardown.
+If the first idle proof cannot start (under 6 s of window left) or is cut off, the whole
+phase is refused as `budget_deferred`; a per-candidate step that cannot start or is cut
+off defers that candidate (and the rest) as `budget_deferred` before any deletion effect.
+A deferral never changes the pass verdict.
+
+The retained removal route runs the strict pinned helper (`empty-fd`) as the runner uid only: no
+chmod, no chown, no privilege increase and no raw fallback. The worker then
+removes `clone` and the parent with its own `rmdir`, which is the proof that
+nothing was left. `removing` is written durably before the first deletion effect, and a removal
+that leaves anything behind leaves the binding there; **a `removing` binding is never retried or reclaimed** (it reads
+`interrupted_removal`, and `removing_bindings` in the total counts them). Every binding, `intent` and `removing` included, counts toward the 64-per-bare cap.
+A completion or single-uid in-process removal unsets its own binding after a confirmed
+removal; a retire that moved nothing drops its `intent` binding. On a uid-split pod an
+`intent` or `removing` binding left with its parent on disk is never released. A metadata-only
+recovery step clears a binding only when its `.retire-*` parent is already gone (and
+only in its narrow cases); it is not a remedy for a retained parent, which is on disk. Past the cap the fallback is the
+unbound in-process removal attempt described above. Permanently retained `intent` or
+`removing` bindings have no supported remedy in this release: no manual deletion,
+binding reset or cleanup route exists or is supported.
+
+Kept reasons for bound parents include `bound_intent`, `interrupted_removal`,
+`malformed_binding`, `conflict`, `ledger_missing`,
+`ledger_mismatch`, `protected_by_retained_source`, `custody`,
+`canonical_present`, `source_use_held`, `newer_than_predecessor`,
+`unexpected_entries`, `identity_changed`, `mount_changed`, `held`,
+`settled_kept`, `epoch_not_eligible` and `budget_deferred` (a settled binding
+row the pass did not report reads `settled_kept`; `disabled` is a whole-phase
+reason only). A whole-phase refusal
+(`retire_scratch.state: refused`) names one token, for example `split_inactive`,
+`not_idle`, `mount_unexpected`, `fs_unsupported`, `bind_unknown` or
+`evidence_unknown`, and keeps every parent.
+
+An attempt id has one identity: if any of its attempt-ledger values, on any
+branch, names a run, clone path or branch other than the binding's, the parent
+is kept (`ledger_mismatch`), and a second binding naming the same attempt with
+another identity keeps each parent (`conflict`). Ledger compaction keeps every value
+of such an attempt as written, so the conflict survives it.
+
+The rule spans bares: any other bare's binding or ledger value naming the
+attempt, or any one that cannot be identified (an undecodable binding, an
+unparseable or attempt-less ledger value), keeps the parent: a present parent
+is already kept for its own reason (`bound_intent`, `interrupted_removal` or
+`settled_kept`), and a gone parent is checked in every phase. The
+two re-reads inside the per-candidate exclusion are named separately. An unknown
+re-read of the protected paths keeps the parent as
+`protected_by_retained_source` (`budget_deferred` when the phase window is
+over). An unreadable re-read of the other bares' retire evidence keeps it as
+`budget_deferred` when the phase window is over, else `conflict` (or
+`metadata_unresolved` for a gone parent). The cross-bare check reads only bares
+other than the parent's own, so one such binding or value in any other bare
+keeps every bound parent of every other bare (present, or gone in any phase)
+until it is removed.
+Compaction preserves values naming another bare's attempts and, while any other
+bare holds a binding, its own values that cannot be attributed to an attempt. It
+skips, leaving the ledger unchanged, with the warning
+`attempt ledger compaction skipped: foreign retire evidence unavailable` (plus a
+fixed reason) when another bare cannot be read within its bounds, or its content
+is readable but unidentifiable (`binding_undecodable`, `ledger_unidentified`), or
+another bare's binding set is over its cap (`binding_unknown`). A kept unidentifiable value does not heal itself, and
+such a skip can persist worker-wide. Removing the value from that bare's config
+is an operator-only, unsupported step, done with the worker stopped: compaction
+computes what to keep from an earlier read, and its rewrite could reinstate a
+value removed after that read.
+
+Still kept: legacy parents created before bindings, attempt-less retires,
+anything unbound, every bound parent on a uid-split worker (never reclaimed by
+the epoch: `intent`, `removing` or a pre-existing `settled`), any parent on a
+single-uid worker (never reclaimed by the epoch; single-uid workers still remove
+them in-process), and a parent that any check refuses. The legacy stderr-proof repair (#4141, landed
+via #4152) does not certify remnants created by older code retroactively; #4137
+is a distinct residual.
+
+Single-uid disposal is unchanged, but a few things differ there: bindings are
+written, a failed intent write fails the retire closed (the clone stays
+canonical), the 64 cap applies, and a failed in-process `rm` leaves a permanent
+`removing` entry that keeps that attempt's ledger entry from compaction.
+
+Switches. The phase is requested by default, but it runs only on an eligible pass
+with an attested runtime declaration, so with the chart's default empty
+`runtime` it does not run; and it deletes no bound parent either way. Disable it with the chart value
+`workers.epochReclaim.retireScratchReclaim: false` (controller
+`UZI_WORKER_RETIRE_SCRATCH_RECLAIM`, worker `UZI_RETIRE_SCRATCH_RECLAIM=0`; see
+[configuration](./configuration.md)): the pass then reads and removes no binding,
+while binding writes continue. Disable the observation records with
+`workers.epochReclaim.retireScratchOutcomes: false` (controller
+`UZI_WORKER_RETIRE_SCRATCH_OUTCOMES`, worker `UZI_RETIRE_SCRATCH_OUTCOMES=0`);
+off restores the count-only inspector exactly. Both take effect at the next
+worker startup.
+
+Hosted rollout observation and the owner's keep-default decision for reclaim are
+not recorded here and stay on #4143.
 
 A worker holding custody can therefore fill its data volume, which impairs
 recovery bookkeeping, and then needs an operator. Use the supported inspect

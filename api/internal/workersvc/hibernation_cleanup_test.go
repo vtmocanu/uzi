@@ -83,11 +83,11 @@ func TestRequestCleanupCancelNeverAbandonsAStartedAttempt(t *testing.T) {
 func TestMoveToWakingRequestsCancelWithoutSettlingAStartedAttempt(t *testing.T) {
 	w := cleanupWorker(CleanupPhaseStarted)
 	w.HibernationState = "preparing"
-	if !moveToWaking(&w, time.Now(), "operator") || w.HibernationState != "waking" || w.CleanupPhase != CleanupPhaseStarted || !w.CleanupCancelRequested {
+	if !moveToWaking(&w, time.Now(), "operator", WakeOriginSystem) || w.HibernationState != "waking" || w.CleanupPhase != CleanupPhaseStarted || !w.CleanupCancelRequested {
 		t.Fatalf("moveToWaking = %q %q cancel=%v", w.HibernationState, w.CleanupPhase, w.CleanupCancelRequested)
 	}
 	// A wake of a row already waking with nothing left to cancel changes nothing.
-	if moveToWaking(&w, time.Now(), "again") {
+	if moveToWaking(&w, time.Now(), "again", WakeOriginSystem) {
 		t.Fatal("a repeated wake reported a change")
 	}
 }

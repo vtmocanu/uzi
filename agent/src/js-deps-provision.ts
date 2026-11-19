@@ -15,7 +15,7 @@ import { clampToDirCharset, errMessage } from "./util.js";
  * content installed by another run.
  */
 export function startDepsInstall(
-  ctx: Pick<RunContext, "runId" | "worktreePath" | "emit">,
+  ctx: Pick<RunContext, "runId" | "worktreePath" | "emit" | "runTmpdir">,
   log: Logger,
   homeDir: string,
   toolEnv: Record<string, string> | undefined,
@@ -43,7 +43,7 @@ export function startDepsInstall(
   try {
     return installDeps(
       ctx.worktreePath,
-      buildCheckEnv(process.env, homeDir, toolEnv, goWorkDir),
+      buildCheckEnv(process.env, homeDir, toolEnv, goWorkDir, ctx.runTmpdir),
       { signal },
     ).catch(failed);
   } catch (err: unknown) {

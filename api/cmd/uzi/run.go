@@ -136,6 +136,12 @@ const (
 	// holdRunOverrideUnavailable (issue #3250) holds a run whose chosen model or effort cannot run on
 	// its harness. Resume retries only if the choice has become available; otherwise the owner cancels.
 	holdRunOverrideUnavailable = "run_override_unavailable"
+	// holdProviderDestinationNotAllowed and holdProviderBindingStale (PRD #4320 module 5) are the parks of a
+	// provider-bound run whose next claim was refused: the operator no longer allows its provider URL (it
+	// re-queues by itself once allowed again), or its provider or key changed after the run was created
+	// (final; start a new run). Resume is refused for both (409).
+	holdProviderDestinationNotAllowed = "provider_destination_not_allowed"
+	holdProviderBindingStale          = "provider_binding_stale"
 )
 
 // nonCompletionHold is one row of nonCompletionHolds.
@@ -171,6 +177,9 @@ var nonCompletionHolds = map[string]nonCompletionHold{
 	holdCredentialSwitchUnsettled: {ownerResumable: true, announcesEntry: true, stopsDefaultWait: true, boardOwnerHold: true},
 	holdIterationExhausted:        {ownerResumable: true, announcesEntry: true, boardOwnerHold: true},
 	holdRunOverrideUnavailable:    {ownerResumable: true, announcesEntry: true, stopsDefaultWait: true, boardOwnerHold: true},
+	// PRD #4320 module 5: not owner-resumable (the promoter re-queues the first; the second is final).
+	holdProviderDestinationNotAllowed: {ownerResumable: false, announcesEntry: true, boardOwnerHold: true},
+	holdProviderBindingStale:          {ownerResumable: false, announcesEntry: true, stopsDefaultWait: true, boardOwnerHold: true},
 }
 
 // isNonCompletionHold reports whether reason is one of the nonCompletionHolds.

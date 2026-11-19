@@ -60,7 +60,7 @@ func TestResetOrdersCallbackBeforeDeletesBeforeEpochAdvance(t *testing.T) {
 	want := []string{
 		"LockSecretMutation", "LockOwnerWorkersForReset", "LockOwnerRunsForReset", "LockOwnerSecretsForReset", "LockVaultAuthState",
 		"fn",
-		"DeleteAllUserSecretsForOwner", "DeleteAllCodexProviderAccountsForOwner", "DeleteUserVault", "ClearSidebarCodexAccounts",
+		"DeleteAllUserSecretsForOwner", "DeleteAllRunEnvVarsForOwner", "DeleteAllCodexProviderAccountsForOwner", "DeleteUserVault", "ClearSidebarCodexAccounts",
 		"AdvanceUserVaultMode",
 	}
 	if got := st.callLog(); !slices.Equal(got, want) {
@@ -91,7 +91,7 @@ func TestResetCallbackErrorDeletesAndAdvancesNothing(t *testing.T) {
 		t.Fatalf("Reset error = %v, want the callback error", err)
 	}
 	for _, c := range st.callLog() {
-		if c == "DeleteAllUserSecretsForOwner" || c == "DeleteAllCodexProviderAccountsForOwner" ||
+		if c == "DeleteAllUserSecretsForOwner" || c == "DeleteAllRunEnvVarsForOwner" || c == "DeleteAllCodexProviderAccountsForOwner" ||
 			c == "DeleteUserVault" || c == "ClearSidebarCodexAccounts" || c == "AdvanceUserVaultMode" {
 			t.Fatalf("%s ran after a failed callback: %v", c, st.callLog())
 		}

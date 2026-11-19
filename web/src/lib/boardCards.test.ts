@@ -82,6 +82,18 @@ describe("isUziCard", () => {
     expect(isUziCard(card([], false, [BOT]), "uzi", undefined)).toBe(false);
     expect(isUziCard(card(["uzi"], false, []), "uzi", undefined)).toBe(true);
   });
+
+  it("counts a card carrying an issue_key as uzi's even without the uzi label", () => {
+    const keyed = { ...card(["Bug"]), issue_key: "ABC-12" };
+    expect(isUziCard(keyed, "uzi", NO_BOT)).toBe(true);
+    expect(canPromote(keyed, "uzi", NO_BOT)).toBe(false);
+  });
+
+  it("keeps the label/assignee rule when issue_key is absent or empty", () => {
+    expect(isUziCard({ ...card(["Bug"]) }, "uzi", NO_BOT)).toBe(false);
+    expect(isUziCard({ ...card(["Bug"]), issue_key: "" }, "uzi", NO_BOT)).toBe(false);
+    expect(isUziCard({ ...card(["uzi"]), issue_key: "" }, "uzi", NO_BOT)).toBe(true);
+  });
 });
 
 describe("visibleCards", () => {

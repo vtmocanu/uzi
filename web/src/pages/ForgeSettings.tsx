@@ -100,6 +100,10 @@ export function ForgeSettings() {
   // link, distinct from the plain string errors above.
   const [connectViolations, setConnectViolations] = useState<string[] | null>(null);
   const [connecting, setConnecting] = useState(false);
+  // The explicit opt-in to rotate an existing connection's credential. Off by
+  // default, because the form reads as "add a repo" and an implicit rotate would
+  // destroy the stored token.
+  const [replaceCredential, setReplaceCredential] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [checkingId, setCheckingId] = useState<string | null>(null);
   const [expandedId, setExpandedId] = useState<string | null>(null);
@@ -144,8 +148,9 @@ export function ForgeSettings() {
     resetMessages();
     setConnecting(true);
     try {
-      const { connection } = await api.createConnection(baseUrl, token, forgeType);
+      const { connection } = await api.createConnection(baseUrl, token, forgeType, replaceCredential);
       setToken("");
+      setReplaceCredential(false);
       setNotice(`Connected as ${maskUsername(connection.bot_username, "bot", demo)}.`);
       await reload();
     } catch (err) {
@@ -153,6 +158,20 @@ export function ForgeSettings() {
         const body = err.body as { violations?: string[] } | null;
         setError(err.message);
         setConnectViolations(body?.violations ?? []);
+      } else if (
+        err instanceof ApiError &&
+        err.status === 409 &&
+        (err.body as { code?: string } | null)?.code === "forge_connection_exists"
+      ) {
+        // A connection to this host already exists. The API refuses to rotate it
+        // implicitly, because this form reads as "add a repo" and a re-submit would
+        // destroy the stored credential. Say what actually happened and what the
+        // two real options are, rather than a generic error. Matched on the coded
+        // 409 specifically: any other 409 from this endpoint is a different
+        // condition and must not be described as a duplicate connection.
+        setError(
+          "A connection to this forge already exists. To use another repository, enable it on the existing connection below. To rotate this connection's credential, tick “Replace the existing connection's credential” and connect again.",
+        );
       } else {
         setError(errorMessage(err, "Connect failed"));
       }
@@ -346,6 +365,14 @@ export function ForgeSettings() {
               onChange={(e) => setToken(e.target.value)}
             />
           </Field>
+          <label className="flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={replaceCredential}
+              onChange={(e) => setReplaceCredential(e.target.checked)}
+            />
+            Replace the existing connection's credential
+          </label>
           <Button type="submit" disabled={connecting || !baseUrl || !forgeType || !token}>
             {connecting ? "Verifying…" : "Connect"}
           </Button>
@@ -500,7 +527,9 @@ export function ForgeSettings() {
       )}
 
       <p className="text-xs text-faint">
-        To rotate a token, connect again with the same base URL — the new PAT replaces the old one.
+        To rotate a token, connect again with the same base URL and tick “Replace the existing
+        connection's credential” — the new PAT replaces the old one. Without the tick, a connect to
+        an already-connected host is refused rather than overwriting the stored token.
       </p>
     </SettingsShell>
   );

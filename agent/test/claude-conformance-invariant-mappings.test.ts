@@ -296,7 +296,7 @@ async function captureAdviceOptions(): Promise<{ options: SdkOptions }> {
   }) as unknown as SdkQueryFn;
   const abort = new AbortController();
   await new ClaudeAdviceHarness({
-    token: "dummy-advice-tok",
+    credential: { kind: "oauth", token: "dummy-advice-tok" },
     homeDir: path.join(os.tmpdir(), "uzi-c2-advice-home-does-not-exist"),
     abort,
     queryFn,

@@ -139,6 +139,9 @@ func scheduleSaveRefusal(err error) (refusal, bool) {
 		return refusal{Token: refusalCredentialNotFound}, true
 	case errors.Is(err, workersvc.ErrCredentialOverrideLaneNotSwitchable):
 		return refusal{Token: refusalLaneNotSwitchable}, true
+	case errors.Is(err, workersvc.ErrCredentialOverrideProviderSource):
+		// Checked before the Codex arm below, which this sentinel wraps.
+		return refusal{Token: refusalOverrideProviderSource}, true
 	case errors.Is(err, workersvc.ErrCredentialOverrideHarnessUnsupported):
 		return refusal{Token: refusalOverrideUnsupported}, true
 	case errors.Is(err, workersvc.ErrCredentialOverridePinnedNeedsSecret), errors.Is(err, workersvc.ErrCredentialOverrideInvalidMode):
@@ -294,7 +297,11 @@ func scheduleFireRefusal(err error) (refusal, bool) {
 	if reason, ok := schedsvc.SkipReasonForErr(err); ok {
 		switch reason {
 		case schedsvc.SkipCredentialDisabled, schedsvc.SkipNoUsableCredential,
-			schedsvc.SkipCodexOverrideConflict, schedsvc.SkipCodexPoolUnavailable:
+			schedsvc.SkipCodexOverrideConflict, schedsvc.SkipCodexPoolUnavailable,
+			// PRD #4320 M4: the provider-source refusals a fire records, each its own token.
+			schedsvc.SkipProviderSourceUnusable, schedsvc.SkipProviderLaneUnsupported,
+			schedsvc.SkipProviderModelUnmapped, schedsvc.SkipProviderBindingStale,
+			schedsvc.SkipProviderDestinationNotAllowed, schedsvc.SkipCredentialOverrideProviderSource:
 			return refusal{Token: string(reason)}, true
 		}
 		return refusal{}, false

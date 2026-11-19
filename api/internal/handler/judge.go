@@ -495,6 +495,7 @@ func (h *Handler) RerunJudge(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusUnprocessableEntity, "add an Anthropic token before running the judge")
 		case errors.Is(err, workersvc.ErrCodexPoolUnavailable):
 			httpx.JSON(w, http.StatusUnprocessableEntity, codexPoolUnavailableBody())
+		case writeProviderCreateRefusal(w, err):
 		case errors.Is(err, workersvc.ErrNoCredentialForHarness):
 			// PRD #1429 M3 (D4); PRD #3257: the judge is created on an explicit harness (the
 			// owner's "Judge runs on" choice, else the target's); if that harness is not usable,

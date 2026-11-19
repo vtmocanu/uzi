@@ -243,6 +243,51 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **Removing a worker no longer answers 404 when its hibernation cache cleanup settles mid-delete ([#4389](https://github.com/vtmocanu/uzi/pull/4389), [#4398](https://github.com/vtmocanu/uzi/pull/4398)).**
   The delete retries once through the same guards; an absent worker is still not found, and a present worker that loses both attempts to a cleanup race gets a retryable 409.
 
+- **A Claude run whose Anthropic API key runs out of prepaid credit is held for the owner instead of failing ([#4426](https://github.com/vtmocanu/uzi/pull/4426), [#4427](https://github.com/vtmocanu/uzi/pull/4427)).**
+  The run parks in `recovery_wait` with cause `anthropic_spend_limit`, exactly like an Anthropic spend limit: work and custody are kept, nothing resumes it on a timer, and the owner tops up credit and Resumes, switches token, or cancels; the feed's detail line carries the provider sentence `Credit balance is too low`, and a worker or api that cannot park still fails with the unchanged `provider error: 400 …` message. This supersedes the earlier #3767 note that credit depletion is not covered by the hold.
+
+- **Long runs that keep rewriting large files no longer resend already-published history at every checkpoint ([#4439](https://github.com/vtmocanu/uzi/pull/4439), [#4446](https://github.com/vtmocanu/uzi/pull/4446)).**
+  When the server names the default branch, a checkpoint pack now omits blobs reachable from the run's confirmed checkpoint, so a growing branch stops piling up toward the `pack_too_large` limit. A single checkpoint whose own new blobs exceed the limit is still refused. If the checkpoint ref is deleted and origin garbage-collects those blobs, the push is rejected and the existing publish-failure path applies until the ref is restored.
+
+- **Enabling a repo returns once it is saved, and its first issue import shows progress on the board ([#4399](https://github.com/vtmocanu/uzi/pull/4399), [#4409](https://github.com/vtmocanu/uzi/pull/4409)).**
+  The first import now runs on the background poller instead of inside the request, and the board shows waiting, importing, or failed-and-retrying while cached cards stay visible; an import too large for one poll still times out and retries, and Refresh still syncs inside its own request.
+
+- **Tab rows no longer show a stray vertical scrollbar, and tabs and section pills stay pinned while you scroll ([#4419](https://github.com/vtmocanu/uzi/pull/4419), [#4425](https://github.com/vtmocanu/uzi/pull/4425)).**
+  Settings, Admin, Runs, Schedules, Workers, Judge and Findings share one tab row whose underline sits on its line, the row stays at the top of the window (under the app bar on narrow screens), Admin → Instance keeps its section pills pinned with the current section highlighted, and Judge keeps its filter visible.
+
+- **A resumed run no longer re-announces milestones already reported complete ([#4412](https://github.com/vtmocanu/uzi/pull/4412)).**
+  The run feed's milestone frames now also skip completions the server already holds, so a resume or re-claim does not repeat "milestone mN reported complete" lines; a cross-worker reseed that clears the list still re-announces them.
+
+- **A finalize push GitHub refuses with only `(missing necessary objects)` is retried ([#4438](https://github.com/vtmocanu/uzi/pull/4438), [#4440](https://github.com/vtmocanu/uzi/pull/4440)).**
+  The bare `! [remote rejected] ... (missing necessary objects)` line is now retried like the bare `(failed)` line from #3929, with the same non-forced push and per-attempt publication proofs; any extra diagnostic line, a different reason or a lookalike stays permanent, and a persistent refusal still ends as `publication_forge_unreachable`.
+
+- **Unlocking your vault refreshes every Anthropic token's meter ([#4408](https://github.com/vtmocanu/uzi/pull/4408)).**
+  Previously only the default token was re-polled on unlock, so other pooled tokens stayed stale until their next successful scheduled poll.
+
+- **A DinD maintenance replacement now converges to the desired worker template while recycling ([#4455](https://github.com/vtmocanu/uzi/pull/4455), [#4458](https://github.com/vtmocanu/uzi/pull/4458)).**
+  When the replacement Deployment and its bound DinD claim already existed but the image pin or generation changed, the controller stopped patching the template and the operation could not complete.
+
+- **Connecting a forge no longer overwrites an existing connection's credential ([#4296](https://github.com/vtmocanu/uzi/pull/4296)).**
+  A create that targets an already-connected user, forge type and base URL is refused with `409` and `code: forge_connection_exists` instead of silently rotating the stored token and bot identity; the refusal is an atomic create-only insert, so two concurrent creates cannot both pass a check and have the second overwrite the first; resend with `replace: true` to rotate the credential deliberately.
+
+- **A deep link to an Admin → Instance or Admin → Workers section no longer lands the card under the pinned pill row ([#4461](https://github.com/vtmocanu/uzi/pull/4461)).**
+  The scroll now waits until the pinned block has measured its new height.
+
+- **`uzi handoff` resolves an origin remote ending in `.git/` ([#4447](https://github.com/vtmocanu/uzi/pull/4447)).**
+  A trailing slash after `.git` no longer leaves `.git` in the parsed repo path, which had blocked handoff with or without `--repo`.
+
+- **Admin → Workers section pills stay pinned under the tabs ([#4454](https://github.com/vtmocanu/uzi/pull/4454), [#4456](https://github.com/vtmocanu/uzi/pull/4456)).**
+  They now match Admin → Instance: one sideways-scrolling row that no longer scrolls away or wraps, with the pill for the section being read highlighted.
+
+- **Repo variables: safer vault conversion, value entry and CLI labels ([#4416](https://github.com/vtmocanu/uzi/pull/4416), [#4460](https://github.com/vtmocanu/uzi/pull/4460)).**
+  Deleting a repo or forge connection while the vault is being enabled or disabled no longer fails the conversion; secret values use a masked single-line field with an explicit multiline mode, a secret switched to an empty plain value saves, unpaired surrogate escapes are refused, and `uzi repo env list` labels hidden plain values `(withheld)`.
+
+- **Waking a hibernated hosted worker no longer scales it up while one of its volumes is still being deleted ([#4457](https://github.com/vtmocanu/uzi/pull/4457), [#4462](https://github.com/vtmocanu/uzi/pull/4462)).**
+  The controller now keeps the worker at zero replicas while its `/data`, `/nix` or Docker data claim in the worker's namespace is Terminating, and wakes it once the claim has been recreated, instead of leaving the new pod Pending on a volume that is going away.
+
+- **uzi handoff checks the origin host, not just the path ([#4449](https://github.com/vtmocanu/uzi/pull/4449), [#4459](https://github.com/vtmocanu/uzi/pull/4459)).**
+  An origin on another host no longer resolves to a same-path connected repo; SSH origins are checked through `ssh -G`.
+
 ### Added
 
 - **A preview of the new Overview at /overview/next, decisions first ([#3878](https://github.com/vtmocanu/uzi/pull/3878), [#3952](https://github.com/vtmocanu/uzi/pull/3952)).**
@@ -389,7 +434,25 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **The chart's Gateway API HTTPRoute can give input-file uploads a longer gateway timeout ([#4401](https://github.com/vtmocanu/uzi/pull/4401), [#4403](https://github.com/vtmocanu/uzi/pull/4403)).**
   Set `web.httpRoute.timeouts` (recommended `request` and `backendRequest` of 300s) on a gateway that supports HTTPRoute timeouts to add an `/api/v1/files` rule carrying them; empty, the route renders as before.
 
+- **Admin → Workers page with editable ephemeral worker cap, default size and lease ([#4212](https://github.com/vtmocanu/uzi/pull/4212), [#4421](https://github.com/vtmocanu/uzi/pull/4421)).**
+  The worker controls moved from Admin → Instance to Admin → Workers, and the ephemeral per-user cap, ephemeral default size, ephemeral lease and the persistent provision form's default size are now admin settings that apply without a restart; a non-empty `UZI_EPHEMERAL_MAX_PER_USER`, `UZI_EPHEMERAL_DEFAULT_SIZE` or `UZI_EPHEMERAL_LEASE` still wins and locks the field (a cap of `0` in the environment still means `2`), lowering the cap evicts no worker, and on upgrade the chart values `workers.ephemeralLease` and `workers.ephemeralDefaultSize` are unset by default so installs that set them keep them locked while others get editable fields with the same `2h` and `m`; setting `UZI_EPHEMERAL_LEASE` in `api.config` or `api.secretEnv` now fails the chart render, so set it through `workers.ephemeralLease`.
+
+- **Admins can keep one idle worker warm and sleep the rest of an owner's interchangeable workers sooner ([#4395](https://github.com/vtmocanu/uzi/pull/4395), [#4430](https://github.com/vtmocanu/uzi/pull/4430)).**
+  The new `worker_hibernation_surplus` setting is off by default and only applies while automatic hibernation is on; surplus workers sleep after `worker_hibernation_surplus_idle_after` (default 2h); a surplus sleep runs the same cache cleanup as any hibernation. When a pool has no warm worker and its owner is active, the api wakes one automatically hibernated member (reason "automatic: warm reserve"), and a pooled worker's long idle clock runs from the owner's latest run activity rather than its own; warm and system wakes do not extend it.
+
+- **Per-repo secrets and variables for runs ([#4416](https://github.com/vtmocanu/uzi/pull/4416), [#4441](https://github.com/vtmocanu/uzi/pull/4441)).**
+  Define named secret or plain variables on a repo in the web UI and list them with `uzi repo env list`.
+
+- **Hosted workers can move to a new node pool one at a time with `workers.newPlacement` ([#4451](https://github.com/vtmocanu/uzi/pull/4451), [#4452](https://github.com/vtmocanu/uzi/pull/4452)).**
+  An opt-in second placement applies only to workers whose volumes all carry the controller's create-time `uzi.dev/placement: new` annotation, and its fields replace the global placement; the move itself is a manual per-worker procedure that deletes the worker's volumes (see Hosted workers).
+
+- **A repo created after this release can be linked to a YouTrack project and eligibility tag, and tagged issues start runs ([#4173](https://github.com/vtmocanu/uzi/pull/4173), [#4431](https://github.com/vtmocanu/uzi/pull/4431)).**
+  The link is made through the API before the repo's first enable, once the operator allows the YouTrack base URL (web and CLI screens come later); tagged issues sync onto the board with their YouTrack key (`ABC-12`), and comments and issue text by accounts other than the connection's own are withheld or need approval; issue writes on a linked repo come in a later release. Roll out the API before the workers: a worker needs `issue_key_v1` to claim a linked run. Forge health on a linked repo follows the code host, and issue tracker sync has its own `issue_tracker.sync` admin health check; enabling a repo does not race a link into forge label writes; a removed and re-listed repo keeps its issue source: it cannot be linked or flipped, and a re-listed repo that was linked reads no issues and starts no runs (issue detail, labels and board order are refused for a never-enabled repo too); autopilot runs on a linked repo are not auto-approved for an unmapped issue tracker author; over-long issue tracker ids are a 400; unusable tag names are not listed.
+
 ### Changed
+
+- **Routine dependency updates ([#4402](https://github.com/vtmocanu/uzi/pull/4402)).**
+  Dependency manifest and image bumps that carry no entry of their own.
 
 - **Routine dependency updates ([#4326](https://github.com/vtmocanu/uzi/pull/4326)).**
   Dependency manifest and image bumps that carry no entry of their own.
@@ -531,6 +594,18 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 - **A publication-context snapshot deadline error is now logged ([#4302](https://github.com/vtmocanu/uzi/pull/4302), [#4371](https://github.com/vtmocanu/uzi/pull/4371)).**
   When either snapshot read in a refresh publication check encounters a deadline error (its context is capped at five seconds), the api logs `publication_context_snapshot_deadline` with the phase, elapsed time and starting budget; the unknown reason returned to the worker is unchanged.
+
+- **npm audit supports maintainer-approved, expiring exceptions for exact development-only advisories ([#4435](https://github.com/vtmocanu/uzi/pull/4435), [#4436](https://github.com/vtmocanu/uzi/pull/4436)).**
+  The full dependency audit stays at high severity. Exceptions fail closed on missing evidence, production occurrences, range or severity changes, and expired or unused rows. Direct dependency maps must agree between the manifest and lockfile root before development classifications can authorize an exception. The initial picomatch rows (web, agent) were maintainer-approved on 2026-11-17 and expire after December 1, 2026 UTC.
+
+- **API database pool size is now explicit and admin health `db` warns on measured connection waits ([#4418](https://github.com/vtmocanu/uzi/pull/4418), [#4422](https://github.com/vtmocanu/uzi/pull/4422)).**
+  `DB_MAX_CONNS` defaults to 20 per replica instead of pgx's max(4, NumCPU), so hosts with more than 20 CPUs get a smaller pool and upload write slots on small nodes rise to their default of 4 (for example 2 to 4 on 4 CPUs); the `db` check now warns when requests waited 250ms or more in total per 60s for a pooled connection, not on a 7-of-8 occupancy snapshot.
+
+- **Claude run flights in the main run lane (issue, task, prompt, CI-fix, self-improve and MR-rework runs) keep their scratch in one per-run TMPDIR leaf that startup reclaim can remove once the run has ended ([#4420](https://github.com/vtmocanu/uzi/pull/4420), [#4432](https://github.com/vtmocanu/uzi/pull/4432)).**
+  The leaf `run-<runId>` is deleted only for a terminal run with zero open holds whose local retention has ended; run-end deletion is deferred, and the hibernation dry-run reports such leaves as protected until a later pod start's scratch phase reclaims them, if it does.
+
+- **Retirements on uid-split Docker workers now record a durable `.retire-*` binding and keep the parent in place ([#4263](https://github.com/vtmocanu/uzi/pull/4263), [#4429](https://github.com/vtmocanu/uzi/pull/4429)).**
+  Retirements record a durable `uzi-retire-scratch.<uuid>.binding` in the bare config; on a uid-split pod no binding is ever written as `settled`, so every bound non-completion parent stays at `intent` (`bound_intent`) and the verified pod epoch deletes none of them (more retention, never less; reclaim needs operator action or the existing discard paths). Past 64 bindings per bare a retire is unbound and takes the in-process removal path, and single-uid and completion disposal are unchanged. Disable the epoch phase with `workers.epochReclaim.retireScratchReclaim: false` (worker `UZI_RETIRE_SCRATCH_RECLAIM=0`; applies at the next worker startup); hosted rollout observation stays on #4143. Kept split parents no longer take the epoch's per-pass work slots, so they cannot starve recovery of bindings whose parents are already gone.
 
 ### Security
 

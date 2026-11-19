@@ -81,10 +81,21 @@ type comment struct {
 	author  string
 }
 
+// Activity categories the fake records and serves.
+const (
+	catTags        = "TagsCategory"
+	catIssueCreate = "IssueCreatedCategory"
+	catSummary     = "SummaryCategory"
+	catDescription = "DescriptionCategory"
+	catCommentText = "CommentTextCategory"
+)
+
 type activity struct {
 	id        string
+	category  string
 	timestamp int64
-	author    string
+	author    string   // login; empty is a null author
+	target    string   // comment id, for catCommentText
 	added     []string // tag ids
 	removed   []string
 }
@@ -122,6 +133,7 @@ type model struct {
 	stateField string
 	clock      int64
 	seq        int64
+	textSeq    int64 // separate from seq so recording text activities shifts no other id
 }
 
 func newModel() *model {
@@ -158,6 +170,14 @@ func (m *model) now() int64 {
 func (m *model) nextID(prefix int) string {
 	m.seq++
 	return fmt.Sprintf("%d-%d", prefix, m.seq)
+}
+
+// textActivityID is the id of an issue-created, summary, description or comment
+// text activity. It has its own counter so that recording these, which the fake
+// began to do after tests pinned the ids it hands out, leaves those ids alone.
+func (m *model) textActivityID() string {
+	m.textSeq++
+	return fmt.Sprintf("3-t%d", m.textSeq)
 }
 
 func (m *model) projectByID(id string) *project {
@@ -203,8 +223,8 @@ func covers(s sharing, userID string) bool {
 	return false
 }
 
-// visibleTo reports whether the user can see the tag.
-func (t *tag) visibleTo(userID string) bool { return t.owner == userID || covers(t.read, userID) }
+// visibleToBot reports whether the bot can see the tag.
+func (t *tag) visibleToBot() bool { return t.owner == BotID || covers(t.read, BotID) }
 
 // usableBy reports whether the user can apply the tag to an issue.
 func (t *tag) usableBy(userID string) bool { return t.owner == userID || covers(t.use, userID) }
@@ -213,7 +233,7 @@ func (t *tag) usableBy(userID string) bool { return t.owner == userID || covers(
 func (m *model) visibleTags() []*tag {
 	var out []*tag
 	for _, t := range m.tags {
-		if t.visibleTo(BotID) {
+		if t.visibleToBot() {
 			out = append(out, t)
 		}
 	}
@@ -227,6 +247,7 @@ func (m *model) newIssue(p *project, summary, description string) *issue {
 		id: m.nextID(2), project: p, number: p.next, summary: summary, description: description,
 		created: ts, updated: ts, reporter: BotLogin,
 	}
+	i.activities = append(i.activities, &activity{id: m.textActivityID(), category: catIssueCreate, timestamp: ts, author: BotLogin})
 	m.issues = append(m.issues, i)
 	m.aliases[i.readable()] = i
 	return i
@@ -263,7 +284,7 @@ func (m *model) addTag(i *issue, t *tag, author string) {
 	ts := m.now()
 	i.tags = append(i.tags, t.id)
 	i.updated = ts
-	i.activities = append(i.activities, &activity{id: m.nextID(3), timestamp: ts, author: author, added: []string{t.id}})
+	i.activities = append(i.activities, &activity{id: m.nextID(3), category: catTags, timestamp: ts, author: author, added: []string{t.id}})
 }
 
 func (m *model) removeTag(i *issue, t *tag, author string) {
@@ -279,7 +300,7 @@ func (m *model) removeTag(i *issue, t *tag, author string) {
 	}
 	i.tags = kept
 	i.updated = ts
-	i.activities = append(i.activities, &activity{id: m.nextID(3), timestamp: ts, author: author, removed: []string{t.id}})
+	i.activities = append(i.activities, &activity{id: m.nextID(3), category: catTags, timestamp: ts, author: author, removed: []string{t.id}})
 }
 
 func (m *model) stateByName(name string) *stateValue {

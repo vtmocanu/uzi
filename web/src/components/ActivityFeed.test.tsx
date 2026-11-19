@@ -1355,6 +1355,13 @@ describe("ActivityFeed — usage-limit park (PRD #35)", () => {
     expect(region().textContent).not.toContain("paused");
   });
 
+  it("announces a provider gateway limit death with provider wording, not an Anthropic usage limit", () => {
+    renderFeed([m(1, "limit_hit", { rate_limit_type: "provider_gateway_limit" }, "worker")], { status: "running" });
+    expect(region().textContent).toContain("hit a provider gateway rate limit");
+    expect(region().textContent).not.toContain("Anthropic");
+    expect(region().textContent).not.toContain("usage limit");
+  });
+
   it("🔴 announces FIXED text — the payload is worker-authored and this is read aloud", () => {
     // The announcement is heard out of context, so it interpolates nothing. Also note
     // it does not announce the reset time: the region fires once, at the park, while

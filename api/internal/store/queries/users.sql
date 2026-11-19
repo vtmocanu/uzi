@@ -318,7 +318,9 @@ RETURNING codex_summary_model;
 -- usage reserve, NULL threshold = off.
 -- judge_runs_on (PRD #3257) rides it too; NULL means the judge runs on the harness of the run it
 -- reviews, the settings surface exposes it as nullable claude|codex.
-SELECT default_model, default_effort, judge_model, codex_judge_model, summary_model, codex_summary_model, theme, sidebar_token_ids, mr_rework_enabled, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, now_summary_enabled, weekly_reserve_pct, weekly_reserve_pause_running, judge_runs_on FROM users WHERE id = $1;
+-- claude_provider_id (PRD #4320 M4) rides it too, read-only on the settings surface: the owner's
+-- Claude model-provider source (NULL = the vendor ladder); written only by PUT /me/providers/claude-source.
+SELECT default_model, default_effort, judge_model, codex_judge_model, summary_model, codex_summary_model, theme, sidebar_token_ids, mr_rework_enabled, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, now_summary_enabled, weekly_reserve_pct, weekly_reserve_pause_running, judge_runs_on, claude_provider_id FROM users WHERE id = $1;
 
 -- name: GetUserSchedulePause :one
 -- The current user's pause-all-schedules state (PRD #1093), returned RAW: the switch

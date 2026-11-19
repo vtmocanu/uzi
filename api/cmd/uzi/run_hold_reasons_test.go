@@ -107,9 +107,11 @@ func TestRunOverrideNoticeCopy(t *testing.T) {
 
 // The set drives the default `run wait` stop and the TUI owner band and count: membership is pinned.
 func TestHoldSetStopAndBoardMembership(t *testing.T) {
-	wantWait := map[string]bool{holdBaseAttestation: true, holdCredentialSwitchSettling: true, holdCredentialSwitchUnsettled: true, holdRunOverrideUnavailable: true}
+	wantWait := map[string]bool{holdBaseAttestation: true, holdCredentialSwitchSettling: true, holdCredentialSwitchUnsettled: true, holdRunOverrideUnavailable: true,
+		holdProviderBindingStale: true}
 	wantBoard := map[string]bool{holdCredentialDisabled: true, holdCredentialsReset: true, holdProviderUnavailable: true, holdIterationExhausted: true,
-		holdCredentialSwitchSettling: true, holdCredentialSwitchUnsettled: true, holdRunOverrideUnavailable: true}
+		holdCredentialSwitchSettling: true, holdCredentialSwitchUnsettled: true, holdRunOverrideUnavailable: true,
+		holdProviderDestinationNotAllowed: true, holdProviderBindingStale: true}
 	for reason := range nonCompletionHolds {
 		reason := reason
 		r := apitypes.RunDTO{ID: "r1", Status: statusPaused, HoldReason: &reason}
@@ -180,6 +182,33 @@ func TestHoldEntryNoticesKeepPreExistingBehavior(t *testing.T) {
 					t.Fatalf("notice %q present=%v, want %v; stderr: %s", notice, got, want, stderr)
 				}
 			})
+		}
+	}
+}
+
+// PRD #4320 module 5: the two provider-binding holds read as their own tokens on the board and the
+// detail (never the generic "paused"), and the stale hold's label names the binding, not only the key
+// (a deleted provider or revision strands the run too).
+func TestProviderBindingHoldTokensAndLabels(t *testing.T) {
+	for _, tc := range []struct{ reason, word, label string }{
+		{holdProviderDestinationNotAllowed, providerURLBlockedWord, "provider URL not allowed"},
+		{holdProviderBindingStale, providerBindingStaleWord, "provider binding changed"},
+	} {
+		reason := tc.reason
+		run := apitypes.RunDTO{ID: "r1", Status: statusPaused, Kind: "issue", HoldReason: &reason}
+		item := apitypes.RunListItemDTO{RunDTO: run}
+		if got := runStateWord(item); got != tc.word {
+			t.Errorf("%s: runStateWord = %q, want %q", tc.reason, got, tc.word)
+		}
+		if tok := (palette{}).runStateToken(run, false); tok.word != tc.word || tok.glyph != credDisabledGlyph {
+			t.Errorf("%s: runStateToken = %+v, want %s %s", tc.reason, tok, credDisabledGlyph, tc.word)
+		}
+		if got := holdReasonLabel(tc.reason); got != tc.label {
+			t.Errorf("%s: holdReasonLabel = %q, want %q", tc.reason, got, tc.label)
+		}
+		run.Status = "queued"
+		if tok := (palette{}).runStateToken(run, false); tok.word == tc.word {
+			t.Errorf("%s: a non-paused run must not carry the hold token", tc.reason)
 		}
 	}
 }

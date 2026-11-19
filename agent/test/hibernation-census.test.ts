@@ -331,6 +331,34 @@ it("runner scratch: protected records and foreign names block; ordinary leaves a
   assert.ok(result.entries.every(e => e.kind === "runner_scratch"), JSON.stringify(result.entries));
 });
 
+it("runner scratch: a run-<uuid> leaf is protected run_scratch and never counted as disposable", async () => {
+  const scratchRoot = path.join(dataDir, "runner/.tmp/uzi-runner");
+  const runLeaf = "run-0b1f3c2e-4d5a-4e6f-8a7b-9c0d1e2f3a4b";
+  put(`runner/.tmp/uzi-runner/${runLeaf}/f`); put("runner/.tmp/uzi-runner/leaf-a/f");
+  const result = await run({ scratchRoot, git: fakeGit({ collectEpochScratchProtectedPaths: async () => ({ state: "read", paths: [] }) }) });
+  const e = byPath(result, `runner/.tmp/uzi-runner/${runLeaf}`);
+  assert.equal(e?.classification, "protected");
+  assert.equal(e?.detail, "run_scratch");
+  assert.equal(byPath(result, "runner/.tmp/uzi-runner/leaf-a")?.classification, undefined, "non-run leaves stay folded into the aggregate");
+  const agg = byPath(result, "runner/.tmp/uzi-runner");
+  assert.equal(agg?.classification, "disposable");
+  assert.equal(agg?.detail, "leaves_1", "only the non-run leaf is counted disposable");
+});
+
+it("runner scratch: near-miss run names (not a lowercase uuid) are ordinary leaves, counted and not protected run_scratch", async () => {
+  const scratchRoot = path.join(dataDir, "runner/.tmp/uzi-runner");
+  const nearMisses = ["run-NOTAUUID", "run-0B1F3C2E-4D5A-4E6F-8A7B-9C0D1E2F3A4B"];
+  for (const n of nearMisses) put(`runner/.tmp/uzi-runner/${n}/f`);
+  const result = await run({ scratchRoot, git: fakeGit({ collectEpochScratchProtectedPaths: async () => ({ state: "read", paths: [] }) }) });
+  for (const n of nearMisses) {
+    assert.notEqual(byPath(result, `runner/.tmp/uzi-runner/${n}`)?.detail, "run_scratch", n);
+    assert.equal(byPath(result, `runner/.tmp/uzi-runner/${n}`)?.classification, undefined, `${n} stays folded into the aggregate`);
+  }
+  const agg = byPath(result, "runner/.tmp/uzi-runner");
+  assert.equal(agg?.classification, "disposable");
+  assert.equal(agg?.detail, "leaves_2");
+});
+
 it("the worker's own TMPDIR is in the fingerprint; empty is disposable", async () => {
   dir("runner/.tmp/uzi-worker");
   const tmp = path.join(dataDir, "runner/.tmp/uzi-worker");

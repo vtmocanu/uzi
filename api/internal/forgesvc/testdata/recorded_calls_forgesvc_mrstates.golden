@@ -1,0 +1,8 @@
+# opened->closed
+GetMergeRequest(77, 13)
+EnsureLabels(77, [{Name:"In Progress" Color:"#1f75cb"}])
+UpdateIssueLabels(77, 9, ["In Progress"], ["Human Review"])
+# closed->opened
+GetMergeRequest(77, 13)
+EnsureLabels(77, [{Name:"Human Review" Color:"#6e49cb"}])
+UpdateIssueLabels(77, 9, ["Human Review"], ["In Progress"])

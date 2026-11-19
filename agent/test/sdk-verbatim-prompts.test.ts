@@ -120,7 +120,7 @@ describe("verbatimPrompts reaches every Claude SDK query (#1563 M2)", () => {
     const { queryFn, seen } = capturing();
     const abort = new AbortController();
     await new ClaudeAdviceHarness({
-      token: "dummy-advice-tok",
+      credential: { kind: "oauth", token: "dummy-advice-tok" },
       homeDir: path.join(os.tmpdir(), "uzi-verbatim-advice-home-does-not-exist"),
       abort,
       queryFn,
@@ -254,7 +254,7 @@ describe("verbatimPrompts is set by every exported options builder (#1563 M2)", 
     const root = tmp("uzi-verbatim-iso-builder-");
     const fetch = buildFetchToolsServer({ fetcherUrl: "https://127.0.0.1:1", ca: "", credential: "cred", workspace: root, log: nullLogger() });
     const options = buildIsolatedSdkOptions({
-      env: isolateSdkEnv(buildSdkEnv(OAUTH, root)),
+      env: isolateSdkEnv(buildSdkEnv({ kind: "oauth", token: OAUTH }, root)),
       cwd: root,
       log: nullLogger(),
       secretPaths: ["/tmp/uzi-synthetic-deny/denied-file"],

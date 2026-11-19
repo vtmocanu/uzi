@@ -266,7 +266,10 @@ func (s *Service) openAnthropic(ctx context.Context, userID uuid.UUID, secretID 
 		return claimCred{}, fmt.Errorf("%w: Anthropic token %q is disabled; enable it in Settings", errCredentialDisabled, meta.Label)
 	}
 
-	tok, err := secretopen.OpenByID(ctx, s.q, s.vlt, s.box, userID, meta.ID)
+	// Kind-scoped open (PRD #4320 D2): an id that resolves to a provider key (or any non-Anthropic
+	// row) is refused as no credential and never opened. The by-id meta read above stays
+	// kind-agnostic so the existing lookup counts and failure texts are unchanged.
+	tok, err := secretopen.OpenByIDOfKind(ctx, s.q, s.vlt, s.box, userID, meta.ID, store.KindAnthropicToken)
 	if err != nil {
 		return claimCred{}, mapAnthropicOpenError(err)
 	}

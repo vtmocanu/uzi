@@ -55,7 +55,7 @@ describe("HealthOverviewCard", () => {
 
   it("shows both Codex pricing reasons and operator docs as a nonblocking warning", async () => {
     const doc = healthySilentDoc();
-    expect(doc.checks).toHaveLength(27);
+    expect(doc.checks).toHaveLength(28);
     const pricing = doc.checks.find((c) => c.id === "pricing.codex")!;
     pricing.severity = "warn";
     pricing.summary = "2 Codex models lack usable pricing";
@@ -99,11 +99,11 @@ describe("HealthOverviewCard", () => {
   });
 
   it("collapses to one quiet line when every applicable check passes", async () => {
-    mockApi.getAdminHealth.mockResolvedValue(healthySilentDoc()); // 27 checks: 26 ok, automatic hibernation off
+    mockApi.getAdminHealth.mockResolvedValue(healthySilentDoc()); // 28 checks: 27 ok, automatic hibernation off
     renderCard();
     // A healthy card is a status region (not an alert), scoped by its label.
     const card = await screen.findByRole("status", { name: "System health" });
-    expect(within(card).getByText("System health: all 26 checks passing, 1 not applicable")).toBeTruthy();
+    expect(within(card).getByText("System health: all 27 checks passing, 1 not applicable")).toBeTruthy();
     // No verdict/attention items in the quiet form.
     expect(within(card).queryByText(/uzi cannot run work/)).toBeNull();
     expect(within(card).getByRole("link", { name: "Open health" })).toBeTruthy();

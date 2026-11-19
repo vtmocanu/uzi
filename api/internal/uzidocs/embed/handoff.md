@@ -40,7 +40,8 @@ result" — is what handoff productizes.
    remote. The CLI creates a `task` run and gets back a server-named branch,
    `uzi/task/<run-id>` — the destination is never yours to name, which is
    part of what keeps it safe (see [Lifecycle and guardrails](#lifecycle-and-guardrails)
-   below).
+   below). The repo is matched from `origin` by path and host; see
+   [Origin matching](./cli.md#origin-matching).
 2. The CLI pushes your local HEAD to that branch, with **your own** git
    credentials — the same push you'd type by hand.
 3. The CLI dispatches the run. Only now can a worker claim it.

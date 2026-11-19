@@ -311,7 +311,7 @@ func (s *Service) RerunJudge(ctx context.Context, userID uuid.UUID, isAdmin bool
 			s.judgeAfterInsertHook(ctx)
 		}
 		return judge, err
-	})
+	}, harnessCreationOrigin{RefuseProviderOwner: true}) // PRD #4320: judge refuses a provider-sourced owner (PRD #4322 enables it)
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {

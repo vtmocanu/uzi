@@ -20,6 +20,7 @@ import type { RunRunner } from "../src/runner.js";
 import { JobRunner } from "../src/job-runner.js";
 import { ISOLATED_FETCH_CAPABILITY, ISOLATED_JOB_CAPABILITY, Worker } from "../src/worker.js";
 import { nullLogger, recordingLogger } from "./helpers.js";
+import { secretRecordingLogger } from "./runner-harness.js";
 
 const CRED = "iso-cred-" + "test-only-abcdef";
 
@@ -576,4 +577,25 @@ for (const mode of r1Modes) it("R1 disabled isolated-runner cached empty then " 
   assert.equal(states.filter(s => s.status === "completed" || s.status === "failed").length, expected);
 
   } finally { await r1fs.rm(root, { recursive: true, force: true }); }
+});
+
+describe("IsolatedRunner: a provider claim's gateway key is registered and evicted (PRD #4320)", () => {
+  it("scrubs the key for the refused claim's lifetime, then evicts it", async () => {
+    // Assembled at runtime: no provider-token-shaped literal in source.
+    const key = ["gw", "key", "do-not-scan", "7373", "abcdefgh"].join("-");
+    const { client, states } = recordingClient();
+    const { logger, added, removed } = secretRecordingLogger();
+    const iso = new IsolatedRunner(client, logger, {
+      dataDir, fetcherUrl: "https://uzi-fetcher.test:8443", fetcherCaFile: caFile, batchMs: 5, makeSource: noCancel(), splitActive: false,
+      executor: { run: async () => { throw new Error("a provider claim must never reach the executor"); } },
+    } as IsolatedRunnerOptions);
+    const provider = {
+      provider_id: "p-1", revision: 1, engine: "claude", protocol: "anthropic_messages", base_url: "https://gw.example.test/a",
+      auth_style: "bearer", credential: key, model_map: { haiku: { model: "corp-haiku" } },
+    };
+    await iso.execute(isolatedClaim({ secrets: { forge_pat: "", anthropic_oauth_token: "", provider } as never }));
+    assert.ok(added.includes(key), "the provider key was registered");
+    assert.ok(removed.includes(key), "and evicted");
+    assert.equal(states.at(-1)?.status, "failed");
+  });
 });

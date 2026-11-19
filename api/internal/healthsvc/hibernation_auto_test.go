@@ -309,3 +309,48 @@ func TestFleetHibernationAuto(t *testing.T) {
 		}
 	})
 }
+
+// Issue #4395: with surplus mode on the check reads ListAutoHibernationBlockersSurplusMode only
+// and renders its rows exactly like the long-rule rows, controller refusal included; with surplus
+// off the unchanged query is the only one read.
+func TestFleetHibernationSurplusModeUsesSurplusQuery(t *testing.T) {
+	hostedRows := []store.ListAllWorkersRow{{Worker: store.Worker{Kind: "hosted", Name: "h"}}}
+	stamp := func(at time.Time) pgtype.Timestamptz { return pgtype.Timestamptz{Time: at, Valid: true} }
+	row := store.ListAutoHibernationBlockersSurplusModeRow{
+		Kind: "idle", ID: uuid.New(), Name: "pooled-a", Anchor: stamp(fixedNow.Add(-20 * 24 * time.Hour)),
+		Reason: workersvc.BlockedControllerRefused, ControllerReason: "roll_cohort_cleanup_pending",
+		Since: stamp(fixedNow.Add(-10 * 24 * time.Hour)), Total: 1, OldestSince: stamp(fixedNow.Add(-10 * 24 * time.Hour)),
+	}
+	t.Run("surplus on", func(t *testing.T) {
+		fs := &fakeStore{hibSurplusRows: []store.ListAutoHibernationBlockersSurplusModeRow{row}}
+		set := &fakeSettings{hibEnabled: true, hibAuto: true, hibSurplus: true, hibIdleAfter: 14 * 24 * time.Hour}
+		c := newSvc(fs, set).checkFleetHibernation(context.Background(), fixedNow, hostedRows)
+		if c.Severity != sevWarn || len(c.Evidence) != 2 {
+			t.Fatalf("got %+v", c)
+		}
+		if got, want := c.Evidence[1].Value, "worker pooled-a idle 20d, hibernation blocked: controller refused (roll cohort cleanup pending)"; got != want {
+			t.Fatalf("got %q, want %q", got, want)
+		}
+		if len(fs.hibParams) != 0 || len(fs.hibSurplusParams) != 1 {
+			t.Fatalf("queries read: long %d, surplus %d; want 0 and 1", len(fs.hibParams), len(fs.hibSurplusParams))
+		}
+		if p := fs.hibSurplusParams[0]; !p.Cutoff.Time.Equal(fixedNow.Add(-14*24*time.Hour)) || p.MaxRows != hibernationEvidenceRows {
+			t.Fatalf("params = %+v", p)
+		}
+	})
+	t.Run("surplus on, no rows is ok", func(t *testing.T) {
+		set := &fakeSettings{hibEnabled: true, hibAuto: true, hibSurplus: true, hibIdleAfter: 14 * 24 * time.Hour}
+		c := newSvc(&fakeStore{}, set).checkFleetHibernation(context.Background(), fixedNow, hostedRows)
+		if c.Severity != sevOK {
+			t.Fatalf("got %+v", c)
+		}
+	})
+	t.Run("surplus off reads the unchanged query", func(t *testing.T) {
+		fs := &fakeStore{hibSurplusRows: []store.ListAutoHibernationBlockersSurplusModeRow{row}}
+		set := &fakeSettings{hibEnabled: true, hibAuto: true, hibIdleAfter: 14 * 24 * time.Hour}
+		c := newSvc(fs, set).checkFleetHibernation(context.Background(), fixedNow, hostedRows)
+		if c.Severity != sevOK || len(fs.hibParams) != 1 || len(fs.hibSurplusParams) != 0 {
+			t.Fatalf("got %+v, long %d surplus %d", c, len(fs.hibParams), len(fs.hibSurplusParams))
+		}
+	})
+}

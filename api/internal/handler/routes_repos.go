@@ -71,6 +71,11 @@ func (h *Handler) mountRepoRoutes(r chi.Router, forgeLimiter, boardOrderLimiter 
 			// The mutating link setup (Adopt/Provision/autocreate/disable) and the
 			// board-access controls stay on RequireAuth (cookie-only) below — web-only.
 			r.Get("/{id}/github-project-sync", h.GetGithubProjectSyncStatus)
+			// Per-repo environment variables for runs (PRD #4416): the list is RequireUser so
+			// the CLI's Bearer token reads it (names, kinds, descriptions and PLAIN values
+			// only; a secret's value is in no response). Owner-scoped (GetRepoForUser -> 404).
+			// The writes stay cookie-only below.
+			r.Get("/{id}/env", h.ListRepoEnvVars)
 			r.Post("/{id}/github-project-sync/resync", h.ResyncGithubProjectSync)
 			// Forge views (PRD #1255 M2a): read-only open-pulls and CI-runs reads for the
 			// TUI/CLI. RequireUser (NOT the cookie-only RequireAuth group below) so the
@@ -102,6 +107,11 @@ func (h *Handler) mountRepoRoutes(r chi.Router, forgeLimiter, boardOrderLimiter 
 			r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/override-request", h.RequestGuardrailOverride)
 			// Repo-skills opt-in toggle (PRD #16): repo owner or admin.
 			r.Patch("/{id}", h.PatchRepo)
+			// Link a never-enabled repo to an issue tracker project (PRD #4173 M4): web-only
+			// like the repo enable it must precede. It reads the issue tracker (token, project
+			// and tag lists), so it carries the per-user forge budget; owner-scoped in the
+			// service (404 for a foreign repo or connection). No unlink or relink route exists.
+			r.With(forgeLimiter.PerUserMiddleware).Put("/{id}/issue-tracker-link", h.LinkRepoToIssueTracker)
 			// GitHub Projects v2 sync, owner-or-admin (issue #534, PRD #364 follow-up):
 			// relocated out of /admin (D4). Owner path is guarded by a GetRepoForUser
 			// preflight inside each handler; admin skips it. Instance flag still gates.
@@ -132,6 +142,12 @@ func (h *Handler) mountRepoRoutes(r chi.Router, forgeLimiter, boardOrderLimiter 
 			// Owner-only (a repo belongs to one user's connection).
 			r.Get("/{id}/tool-profile", h.GetRepoToolProfile)
 			r.Put("/{id}/tool-profile", h.SetRepoToolProfile)
+			// Per-repo environment variable writes (PRD #4416): cookie and CSRF only, like every
+			// secret write. Owner-only behind the same preflight as the tool profile.
+			r.Put("/{id}/env/{name}", h.PutRepoEnvVar)
+			r.Post("/{id}/env/{name}/disable", h.DisableRepoEnvVar)
+			r.Post("/{id}/env/{name}/enable", h.EnableRepoEnvVar)
+			r.Delete("/{id}/env/{name}", h.DeleteRepoEnvVar)
 			r.Get("/{id}/board", h.GetBoard)
 			// Per-user, per-repo board view preferences (PRD #196 M3): the
 			// membership extras override and "show all other issues" toggle, moved

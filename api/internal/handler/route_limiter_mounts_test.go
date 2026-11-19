@@ -225,6 +225,9 @@ var limiterNames = [...]string{
 // (len(wantRouteMounts) at that change). Issue #4334 adds GET /api/admin/repo-activity (noLimiter); re-tallied at that change,
 // len(wantRouteMounts) is 414 (the earlier figures above were not re-tallied).
 // PRD #4208 adds the two noLimiter inventory/exclusion-final routes, making 416 rows.
+// PRD #4416 M1 adds the five per-repo environment variable routes (GET /api/repos/{id}/env,
+// PUT and DELETE /api/repos/{id}/env/{name}, POST .../disable and .../enable; all noLimiter,
+// local DB reads and writes with no forge call), making 421 rows; re-tallied at that change.
 // THIS SENTENCE IS DOWNSTREAM OF ANY NEW ROUTE — see the note above wantRouteMounts for
 // which lines a mount-adder owns.
 //
@@ -311,6 +314,8 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/admin/users/{id}/reset-link", noLimiter},
 	{"POST", "/api/admin/egress-profiles", noLimiter},
 	{"PUT", "/api/admin/egress-profiles/{name}", noLimiter},
+	{"PUT", "/api/me/providers/claude-source", noLimiter},
+	{"PUT", "/api/me/providers/{id}/key", noLimiter},
 	{"DELETE", "/api/admin/egress-profiles/{name}", noLimiter},
 	// PRD #685 M1: admin clear of a branding logo — cookie-only admin DB delete, no
 	// forge call → noLimiter, like the settings PUT and guardrail-override it sits
@@ -329,7 +334,10 @@ var wantRouteMounts = []routeMount{
 	{"DELETE", "/api/admin/products/{id}/egress-profiles/{name}", noLimiter},
 	{"DELETE", "/api/agent-templates/{id}", noLimiter},
 	{"DELETE", "/api/forge/connections/{id}", noLimiter},
+	{"DELETE", "/api/issue-trackers/connections/{id}", noLimiter},
 	{"DELETE", "/api/me/cli-tokens/{id}", noLimiter},
+	{"DELETE", "/api/me/providers/{id}", noLimiter},
+	{"DELETE", "/api/me/providers/{id}/key", noLimiter},
 	// PRD #1907 M5: revoke one of the caller's own product tokens, a cookie-only,
 	// owner-scoped DB write → noLimiter, like the CLI-token revoke above.
 	{"DELETE", "/api/me/product-tokens/{id}", noLimiter},
@@ -343,6 +351,7 @@ var wantRouteMounts = []routeMount{
 	// Explicit per-repo remove (PRD #357): owner-scoped DB delete, no forge call →
 	// noLimiter, like the schedule/connection deletes it sits beside.
 	{"DELETE", "/api/repos/{id}", noLimiter},
+	{"DELETE", "/api/repos/{id}/env/{name}", noLimiter},
 	// GitHub Projects v2 sync disable (issue #534, PRD #364 follow-up): relocated
 	// from /admin to the owner-or-admin /repos group (D4). Owner preflight + DB
 	// teardown, no user-spammable forge proxying → noLimiter, like the admin write
@@ -457,8 +466,15 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/forge/config", noLimiter},
 	{"GET", "/api/forge/connections/", noLimiter},
 	{"GET", "/api/forge/connections/{id}/projects", limForge},
+	// PRD #4173 M4: the issue tracker connection list reads only the store; projects and tags
+	// call the issue tracker, so they ride the per-user forge budget.
+	{"GET", "/api/issue-trackers/connections/", noLimiter},
+	{"GET", "/api/issue-trackers/connections/{id}/projects", limForge},
+	{"GET", "/api/issue-trackers/connections/{id}/tags", limForge},
 	{"GET", "/api/health", noLimiter},
 	{"GET", "/api/me/cli-tokens/", noLimiter},
+	{"GET", "/api/me/providers/", noLimiter},
+	{"GET", "/api/me/providers/{id}", noLimiter},
 	// PRD #1907 M5: the caller's own product-token list and the mint picker, cookie-only
 	// metadata reads with no forge call → noLimiter, like the CLI-token list above.
 	{"GET", "/api/me/product-tokens/", noLimiter},
@@ -535,6 +551,7 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/repos/{id}/ci/runs", limForge},
 	{"GET", "/api/repos/{id}/ci/runs/{run_id}", limForge},
 	{"GET", "/api/repos/{id}/tool-profile", noLimiter},
+	{"GET", "/api/repos/{id}/env", noLimiter},
 	// Issue #3811: owner-only bounded local history reads, no forge call or token spend.
 	{"GET", "/api/cross-checks", noLimiter},
 	{"GET", "/api/cross-checks/availability", noLimiter},
@@ -617,6 +634,9 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/workers/hosted/config", noLimiter},
 	{"GET", "/api/ws", noLimiter},
 	{"PATCH", "/api/admin/users/{id}", noLimiter},
+	{"PATCH", "/api/me/providers/{id}/key/enabled", noLimiter},
+	{"PATCH", "/api/me/providers/{id}/endpoint", noLimiter},
+	{"PATCH", "/api/me/providers/{id}", noLimiter},
 	// PRD #1907 M4: admin edit of a product's description / enabled flag — cookie-only
 	// admin DB write → noLimiter.
 	{"PATCH", "/api/admin/products/{id}", noLimiter},
@@ -761,12 +781,16 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/forge/connections/", noLimiter},
 	{"POST", "/api/forge/connections/{id}/privilege-check", limForge},
 	{"POST", "/api/forge/connections/{id}/verify", limForge},
+	{"POST", "/api/issue-trackers/connections/", limForge},
 	{"POST", "/api/me/cli-tokens/", noLimiter},
 	{"POST", "/api/me/cli-tokens/revoke-all", noLimiter},
 	// PRD #3254: start-preview is a read that takes a token choice in a body; it writes nothing.
 	{"POST", "/api/me/effective-settings/start-preview", noLimiter},
 	// PRD #3254 M3: schedule-preview is the same kind of read (a draft or a schedule id in the body).
 	{"POST", "/api/me/effective-settings/schedule-preview", noLimiter},
+	{"POST", "/api/me/providers/", noLimiter},
+	{"POST", "/api/me/providers/{id}/retire", noLimiter},
+	{"POST", "/api/me/providers/{id}/test", noLimiter},
 	// PRD #1907 M5: the product-token MINT rides the credential-surface limiter per user
 	// (a (pattern, user) bucket), on top of the handler's per-product cap (D15).
 	{"POST", "/api/me/product-tokens/", limAuth},
@@ -785,6 +809,8 @@ var wantRouteMounts = []routeMount{
 	// follow-up): relocated from /admin to owner-or-admin /repos (D4). Adopt/provision
 	// make forge calls but are infrequent manual actions, not user-spammable proxying,
 	// so they wear no per-user limiter → noLimiter, as in the admin write group they left.
+	{"POST", "/api/repos/{id}/env/{name}/disable", noLimiter},
+	{"POST", "/api/repos/{id}/env/{name}/enable", noLimiter},
 	{"POST", "/api/repos/{id}/github-project-sync", noLimiter},
 	{"POST", "/api/repos/{id}/github-project-sync/provision", noLimiter},
 	// PRD #576 M3 Resync: re-seed an already-linked board; infrequent manual action in
@@ -1098,7 +1124,10 @@ var wantRouteMounts = []routeMount{
 	{"PUT", "/api/repos/{id}/board/prefs", noLimiter},
 	// PRD #557 board-access visibility write: same owner-or-admin group → noLimiter.
 	{"PUT", "/api/repos/{id}/github-project-sync/visibility", noLimiter},
+	// PRD #4173 M4: the repo link reads the issue tracker (token, projects, tags).
+	{"PUT", "/api/repos/{id}/issue-tracker-link", limForge},
 	{"PUT", "/api/repos/{id}/tool-profile", noLimiter},
+	{"PUT", "/api/repos/{id}/env/{name}", noLimiter},
 	// PRD #35 Decision 7, the per-run toggle. noLimiter for the same reason as
 	// /me/wait-on-limit: one owner-scoped boolean UPDATE, no spend, no forge write,
 	// and it cannot even change the run's status. Contrast /runs/{id}/rejudge above,

@@ -8,6 +8,10 @@ import type {
   PrivilegeReport,
   ProjectSyncOwnerKind,
   ProjectSyncStatus,
+  RunEnvDeleteResult,
+  RunEnvList,
+  RunEnvVar,
+  RunEnvWriteInput,
   ToolAllowlistEntry,
   ToolAllowlistWriteInput,
 } from "../../lib/api";
@@ -47,6 +51,20 @@ function classifyGuardrailFindings(messages: string[]): {
     message: m,
   }));
   return { findings, waivable: messages.length > 0 && !messages.some(unreadable) };
+}
+
+// normalizeForgeBaseUrl mirrors config.NormalizeForgeBaseURL: https + lowercased
+// host, any path/query/fragment dropped. The mock compares connection targets in
+// this form so a trailing slash or a capital letter still collides, exactly as the
+// server's create-only insert does. An unparseable value is returned trimmed, which
+// is what the server's validation rejects with a 400 rather than a 409.
+function normalizeForgeBaseUrl(raw: string): string {
+  try {
+    const u = new URL(raw.trim());
+    return `https://${u.host.toLowerCase()}`;
+  } catch {
+    return raw.trim();
+  }
 }
 
 let connections = [{ ...mockConnection }];
@@ -125,6 +143,44 @@ const repoToolProfiles = new Map<string, string[]>(
 );
 let toolEntryCounter = 0;
 
+// Per-repo run environment variables (PRD #4416 M1). Rows carry no value; plain
+// values live beside them, as the real store keeps them sealed.
+const ENV_LIMIT = 50;
+const envStore = new Map<string, RunEnvVar[]>();
+const envValues = new Map<string, string>();
+
+function requireRepo(repoId: string) {
+  if (!repos.some((r) => r.id === repoId)) throw new ApiError(404, "repo not found");
+}
+function envRuleError(field: string, rule: string) {
+  return new ApiError(422, `${field}: ${rule}`, { error: `${field}: ${rule}`, field, rule });
+}
+function envView(repoId: string, v: RunEnvVar): RunEnvVar {
+  return { ...v, value: v.secret ? null : (envValues.get(`${repoId}/${v.name}`) ?? ""), value_withheld: false };
+}
+function envListFor(repoId: string): RunEnvList {
+  const rows = envStore.get(repoId) ?? [];
+  return {
+    variables: rows.map((v) => envView(repoId, v)),
+    counts: { total: rows.length, disabled: rows.filter((v) => v.state === "disabled").length, pending_deletion: 0, limit: ENV_LIMIT },
+    vault_locked: false,
+  };
+}
+function syncEnvCount(repoId: string) {
+  const n = (envStore.get(repoId) ?? []).length;
+  repos = repos.map((r) => (r.id === repoId ? { ...r, env_var_count: n } : r));
+}
+async function setEnvDisabled(repoId: string, name: string, disabled: boolean) {
+  requireRepo(repoId);
+  const rows = envStore.get(repoId) ?? [];
+  const cur = rows.find((v) => v.name === name);
+  if (!cur) throw new ApiError(404, "variable not found");
+  const now = new Date().toISOString();
+  const next: RunEnvVar = { ...cur, state: disabled ? "disabled" : "enabled", disabled_at: disabled ? now : null, updated_at: now };
+  envStore.set(repoId, rows.map((v) => (v.name === name ? next : v)));
+  return delay({ variable: envView(repoId, next) });
+}
+
 // issue #1432: the pending member override-request queue, mutated by the member
 // requestGuardrailOverride and the admin approve/reject below, and surfaced by
 // adminListBlockedRepos. Seeded with one pending request (dana's) so the admin queue
@@ -160,20 +216,40 @@ export const forgeApi = {
   // ── Forge ───────────────────────────────────────────────────────────────────
   forgeConfig: async () => delay({ ...mockForgeConfig, allowed_base_urls: [...mockForgeConfig.allowed_base_urls] }),
   listConnections: async () => delay({ connections: connections.map((c) => ({ ...c })) }),
-  createConnection: async (baseUrl: string, _token: string, forgeType = "gitlab") => {
+  // Mirrors the real create path: a create that targets an already-connected
+  // (forge type, base URL) is refused with 409 forge_connection_exists unless the
+  // caller passes replace=true, which rotates that connection's credential in
+  // place. The target is compared NORMALIZED (https + lowercased host, path
+  // dropped), because that is the form the server stores and looks up — a mock
+  // comparing the raw string would let a trailing slash or a capital letter
+  // through and hide the very duplicate the guard exists to catch.
+  createConnection: async (baseUrl: string, _token: string, forgeType = "gitlab", replace = false) => {
+    const target = normalizeForgeBaseUrl(baseUrl);
+    const existing = connections.find(
+      (c) => c.forge_type === forgeType && normalizeForgeBaseUrl(c.base_url) === target,
+    );
+    if (existing && !replace) {
+      throw new ApiError(
+        409,
+        "a connection to this forge already exists; enable a repository on it, or resend with replace=true to rotate its credential",
+        { code: "forge_connection_exists", connection_id: existing.id },
+      );
+    }
     const conn = {
       ...mockConnection,
-      id: `conn-${Date.now()}`,
-      base_url: baseUrl,
+      id: existing?.id ?? `conn-${Date.now()}`,
+      base_url: target,
       forge_type: forgeType,
-      created_at: new Date().toISOString(),
+      created_at: existing?.created_at ?? new Date().toISOString(),
       last_verified_at: new Date().toISOString(),
       // A freshly connected bot is unchecked until the first privilege check.
       privilege_status: null,
       privilege_checked_at: null,
       privilege_report: null,
     };
-    connections = [conn];
+    connections = existing
+      ? connections.map((c) => (c.id === existing.id ? conn : c))
+      : [...connections, conn];
     return delay({ connection: { ...conn } }, 600);
   },
   verifyConnection: async (id: string) => {
@@ -554,6 +630,57 @@ export const forgeApi = {
     const cleaned = [...new Set(packages)].sort();
     repoToolProfiles.set(repoId, cleaned);
     return delay({ packages: cleaned });
+  },
+  // Per-repo run environment variables (PRD #4416 M1). Same contract as the real API
+  // (a secret's value is never returned; 422 names the field and rule; 409 at the
+  // limit) except that a delete always drops the row: the mock has no run receipts,
+  // so the 202 pending-deletion path never occurs.
+  listRepoEnv: async (repoId: string): Promise<RunEnvList> => {
+    requireRepo(repoId);
+    return delay(envListFor(repoId));
+  },
+  putRepoEnv: async (repoId: string, name: string, input: RunEnvWriteInput) => {
+    requireRepo(repoId);
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+      throw envRuleError("name", "must start with a letter or underscore and use only letters, digits and underscores");
+    }
+    const rows = envStore.get(repoId) ?? [];
+    const cur = rows.find((v) => v.name === name);
+    const secret = input.secret ?? cur?.secret ?? true;
+    const now = new Date().toISOString();
+    const needsValue = !cur || input.value !== undefined || (cur.secret && !secret);
+    if (needsValue && input.value === undefined) {
+      throw envRuleError("value", cur ? "changing a secret to a plain value needs a new value in the same save" : "a value is required to create a variable");
+    }
+    if (input.value !== undefined && secret && input.value.length < 8) {
+      throw envRuleError("value", "a secret must be at least 8 characters");
+    }
+    if (!cur && rows.length >= ENV_LIMIT) {
+      throw new ApiError(409, "this repo is at its variable limit", { error: "this repo is at its variable limit", code: "env_limit_reached" });
+    }
+    const next: RunEnvVar = cur
+      ? { ...cur, secret, description: input.description ?? cur.description, updated_at: now }
+      : { var_id: crypto.randomUUID(), name, secret, description: input.description ?? "", value: null, value_withheld: false, state: "enabled", rev: 1, disabled_at: null, created_at: now, updated_at: now };
+    if (input.value !== undefined) {
+      envValues.set(`${repoId}/${name}`, input.value);
+      next.rev = cur ? cur.rev + 1 : 1;
+    } else if (cur && secret !== cur.secret) {
+      next.rev = cur.rev + 1;
+    }
+    envStore.set(repoId, cur ? rows.map((v) => (v.name === name ? next : v)) : [...rows, next].sort((a, b) => a.name.localeCompare(b.name)));
+    syncEnvCount(repoId);
+    return delay({ variable: envView(repoId, next) });
+  },
+  disableRepoEnv: async (repoId: string, name: string) => setEnvDisabled(repoId, name, true),
+  enableRepoEnv: async (repoId: string, name: string) => setEnvDisabled(repoId, name, false),
+  deleteRepoEnv: async (repoId: string, name: string): Promise<RunEnvDeleteResult> => {
+    requireRepo(repoId);
+    const rows = envStore.get(repoId) ?? [];
+    if (!rows.some((v) => v.name === name)) throw new ApiError(404, "variable not found");
+    envStore.set(repoId, rows.filter((v) => v.name !== name));
+    envValues.delete(`${repoId}/${name}`);
+    syncEnvCount(repoId);
+    return delay({ state: "deleted" as const });
   },
   // Issue #4334: the admin repo-activity read, DERIVED from the shared repos state and the
   // mock runs like the real endpoint: every enabled repo plus every disabled repo with a

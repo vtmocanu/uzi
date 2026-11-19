@@ -271,6 +271,12 @@ uzi worker set-token <worker-id> --auto
 uzi token list
 uzi token pool <label> [--kind anthropic|codex] --on|--off
 uzi token test <label> [--kind anthropic|codex|openai-key]
+uzi provider list
+uzi provider create --name <name> --base-url <url> [--auth-style bearer|x_api_key] --model haiku=<model>[:<window>] [--model <alias>=<model>[:<window>]]
+uzi provider edit <name|id> [--name <name>] [--model <alias>=<model>[:<window>] ...]
+uzi provider test <name|id>
+uzi provider retire <name|id>
+uzi provider use <name|id> | --none
 uzi rate-limits [--provider claude|codex]
 uzi memory list
 uzi memory rm <memory-id>
@@ -1875,6 +1881,22 @@ into `file`/`dismiss`/`resolve`. `undo` keys on the `disposition_id` field (read
   before you branch on the value. An un-pooled token reports `not_pooled` there
   rather than the table's `-`.
 - `uzi token test <label> [--kind anthropic|codex|openai-key]` — test one enabled credential on demand. A label shared by kinds requires `--kind`. The response is a bounded, metadata-only outcome (`ok`, `rejected`, `permission_denied`, or `inconclusive`); Anthropic may spend about one token on its Messages check. Saving a credential does not wait for this verdict.
+- `uzi provider list|create|edit|test|retire|use` — your model providers: named
+  Anthropic-compatible gateways Claude can be pointed at (docs: `uzi docs show providers`).
+  `list` shows NAME, URL, AUTH, MODELS, KEY (`yes`/`no`/`disabled`), TEST (`<auth>/<tool>` or `-`)
+  and RETIRED; under `--json` it is `{enabled, providers, allowed_base_urls}`, and `enabled:false`
+  means the operator has not configured an allowlist. `create` needs `--name`, `--base-url`
+  (exactly an allowlisted URL) and `--model haiku=<model>[:<window>]` (repeatable for sonnet,
+  opus, fable). `edit` renames and/or replaces the whole model map. `test` prints the auth and
+  tool-call results separately; neither certifies full compatibility. `retire` is permanent.
+  `use <name|id>` selects the provider your Claude runs start on (`use --none` goes back to
+  Anthropic); it refuses a retired, keyless or not-allowlisted provider (`provider_source_unusable`)
+  and a run already started keeps its binding. A run bound to a provider shows `provider_id` and
+  `provider_name` (null for a vendor run; the name is null if the provider was deleted) and its
+  cost reads unknown, never $0.
+  The API key, a base URL or auth-style change, and deleting a provider are web-only (cookie)
+  actions, so there is no CLI verb for them. `<name|id>` matches an id exactly or a name
+  case-insensitively. Refusals carry a `reason` (for example `provider_base_url_not_allowed`).
 - `uzi rate-limits [--provider claude|codex]` — your own rate-limit meters, the
   terminal twin of the web sidebar meters. `--provider claude` (the default) lists your
   Anthropic tokens as `TOKEN`/`STATUS`/`5H%`/`7D%`; `--provider codex` lists your linked
@@ -1894,6 +1916,14 @@ into `file`/`dismiss`/`resolve`. `undo` keys on the `disposition_id` field (read
   repo's board and run history, so it prompts `[y/N]` unless you pass
   `--force`/`-f`. A repo the bot can still see reappears (disabled) on the next
   projects refresh; to keep it out, remove the bot's forge access first.
+  `uzi repo env list <id>` — the repo's run variables (PRD #4416), **read-only**:
+  NAME, KIND (`secret`|`plain`), STATE, VALUE, DESCRIPTION, UPDATED; `--json` dumps the
+  full list with counts and `vault_locked`. A secret's value is never shown
+  (`(secret)`), and a plain value the server withheld reads `(withheld)` (vault
+  locked, no vault configured, or the value cannot be opened). When the list reports
+  `vault_locked` (the vault is locked or its state could not be checked), the table
+  path prints a note to stderr suggesting `uzi vault unlock`, carrying the same
+  `--context`/`--url` flags; `--json` prints no note. Variables are written in the web UI only; the CLI has no write verb.
 - `uzi admin users|runs|workers|health|usage|rate-limits|cli-tokens|guardrail-impact` and
   `uzi admin agent-source get|status` —
   **read-only** factory-wide views. These require an admin-scoped (`uza_`) token; a

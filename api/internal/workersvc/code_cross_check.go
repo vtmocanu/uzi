@@ -100,6 +100,10 @@ func (s *Service) SubmitCodeCrossCheck(ctx context.Context, worker store.Worker,
 			locked.Harness != lead.Harness || validateCrossCheckContext(locked.IssueTitle, locked.IssueDescription) != nil {
 			return store.Run{}, ErrCrossCheckRefused
 		}
+		if providerBoundRun(locked) {
+			// A provider-bound lead has no checker lane yet (PRD #4320, PRD #4322).
+			return store.Run{}, ErrProviderLaneUnsupported
+		}
 		prior, e := txq.GetCodeCrossCheck(ctx, leadID)
 		if e == nil {
 			if prior.LeadClaimGeneration != generation || prior.InterruptedAt.Valid || prior.BaseCommit.String != base || prior.HeadCommit.String != head || !input.matches(prior) {
@@ -142,11 +146,12 @@ func (s *Service) SubmitCodeCrossCheck(ctx context.Context, worker store.Worker,
 		}
 		result, e = txq.InsertCodeCrossCheck(ctx, store.InsertCodeCrossCheckParams{LeadRunID: leadID, CheckerRunID: child.ID, BaseCommit: base, HeadCommit: head, CandidateDigest: digest, CodeContext: contextBytes, GuidanceText: frozen.GuidanceText.String, RepoInstructionsCommit: frozen.RepoInstructionsCommit, RepoInstructionsEnabled: frozen.RepoInstructionsEnabled, RepoInstructionsText: frozen.RepoInstructionsText.String, DeadlineAt: pgtype.Timestamptz{Time: s.now().Add(timeout), Valid: true}})
 		return child, e
-	})
+	}, harnessCreationOrigin{RefuseProviderOwner: true}) // PRD #4320: cross-check refuses a provider-sourced owner (PRD #4322)
 	if errors.Is(err, retry) {
 		return result, nil
 	}
-	if errors.Is(err, ErrNoCredentialForHarness) || errors.Is(err, ErrHarnessCredentialDisabled) || errors.Is(err, ErrCrossCheckUnavailable) {
+	if errors.Is(err, ErrNoCredentialForHarness) || errors.Is(err, ErrHarnessCredentialDisabled) || errors.Is(err, ErrCrossCheckUnavailable) ||
+		errors.Is(err, ErrProviderLaneUnsupported) || errors.Is(err, ErrProviderSourceUnusable) {
 		return s.RecordCodeCrossCheckFailure(ctx, worker, leadID, generation, base, head, "checker_unavailable", input)
 	}
 	if err != nil {

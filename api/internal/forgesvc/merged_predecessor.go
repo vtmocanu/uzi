@@ -182,7 +182,10 @@ func (s *Service) verifyMergedPredecessor(ctx context.Context, row store.ListMer
 	}()
 	// The candidate query takes a fresh exact owner-scoped connection snapshot.
 	// Never reuse the ordinary tick's connection or cached MR state.
-	f, err := s.CodeHostForRepo(ctx, row.RepoID, row.ForgeType, row.BaseUrl, row.TokenCiphertext)
+	// Code-host side only (S2): the candidate row is already a fresh owner-scoped
+	// connection snapshot, so the driver is built from it directly and never reads
+	// the repo's issue tracker link.
+	f, err := s.ForgeForConnection(row.ForgeType, row.BaseUrl, row.TokenCiphertext)
 	if err != nil {
 		slog.Warn("merged predecessor reconciliation refused", "run_id", row.RunID, "reason", "client_unavailable")
 		return

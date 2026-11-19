@@ -40,7 +40,10 @@ const defaultName = cfg.defaultBranch;
 assert.equal(defaultName, "integration/custom", "default name comes from the Go server context");
 let history = floor;
 const publicBlobs: string[] = [];
-const big = cfg.mode === "PrimaryLargeHistory" || cfg.mode === "LargeRunOnly";
+const big = cfg.mode === "PrimaryLargeHistory" || cfg.mode === "LargeRunOnly" || cfg.mode === "ConfirmedLargeHistory";
+// Confirmed-checkpoint modes: C is the run's previously confirmed checkpoint tip.
+const confirmedChain = cfg.mode === "ConfirmedLargeHistory" || cfg.mode === "ConfirmedReplay";
+const replayMode = cfg.mode.startsWith("Replay") || cfg.mode === "ConfirmedReplay";
 for (let i = 0; i < (big ? 6 : 3); i++) {
   // Distinct compressible objects stay below the broker's per-object limit.
   const oid = blob(Buffer.alloc(big ? 24 * 1024 * 1024 : 128, 65 + i));
@@ -66,8 +69,31 @@ if (cfg.mode === "LargeRunOnly") {
 }
 const exact = cfg.mode === "ExactLinearHistory";
 const x = commit(tree([["private", privateBlob], ["public", publicBlobs[0]!]]), [floor], "X work");
-const d = commit(exact ? defaultTree : candidateTree, exact || cfg.mode === "NoDefaultMerge" || cfg.mode === "LargeRunOnly"
-  ? [x] : [x, defaultAtCapture], exact ? "D default" : "D merged");
+let confirmedTip: string | undefined;
+const confirmedHistoryBlobs: string[] = [];
+let confirmedMid: string | undefined;
+if (confirmedChain) {
+  // Run-own history above the floor rewrites one path with distinct blobs; C then replaces it with a
+  // small blob, so the large blobs live only in C's history and never in C's tip tree.
+  let runHead = x;
+  for (let i = 0; i < (big ? 6 : 2); i++) {
+    const oid = blob(big ? Buffer.alloc(24 * 1024 * 1024, 100 + i) : Buffer.from(`run history ${i}\n`));
+    confirmedHistoryBlobs.push(oid);
+    runHead = commit(tree([["big.bin", oid]]), [runHead], `R run ${i}`);
+  }
+  const smallBlob = blob("small final\n");
+  confirmedTip = commit(tree([["big.bin", smallBlob], ["private", privateBlob]]), [runHead], "C confirmed");
+  confirmedMid = tree([["big.bin", smallBlob], ["private", privateBlob], ["public", publicBlobs.at(-1)!]]);
+  candidateTree = tree([["big.bin", smallBlob], ["note", blob("final change\n")], ["private", privateBlob],
+    ["public", publicBlobs.at(-1)!]]);
+}
+if (cfg.mode === "ConfirmedNotAncestor") {
+  // Parented on X so a wrongly-eligible ^C would hide X's still-unpublished privateBlob.
+  confirmedTip = commit(tree([["side", blob("side\n")]]), [x], "C side commit");
+}
+const d = confirmedChain ? commit(confirmedMid!, [confirmedTip!, defaultAtCapture], "D merged")
+  : commit(exact ? defaultTree : candidateTree, exact || cfg.mode === "NoDefaultMerge" || cfg.mode === "LargeRunOnly"
+    ? [x] : [x, defaultAtCapture], exact ? "D default" : "D merged");
 const tip = commit(candidateTree, [d], "C candidate");
 if (exact) defaultTip = d;
 if (cfg.mode === "ReachableDefault") defaultTip = commit(defaultTree, [tip], "default includes candidate");
@@ -88,7 +114,16 @@ git(["update-ref", `refs/uzi-runner/${branch}`, tip]);
 if (cfg.mode !== "AbsentOriginBranch") git(["update-ref", `refs/remotes/origin/${branch}`, floor]);
 git(["update-ref", `refs/remotes/origin/${defaultName}`, defaultTip]);
 git(["update-ref", `refs/heads/${defaultName}`, defaultTip]);
-git(["push", "-q", "origin", `${defaultTip}:refs/heads/${defaultName}`, `${floor}:refs/heads/${branch}`]);
+if (cfg.mode === "ConfirmedNotAncestor") {
+  let ancestor = true;
+  try { git(["merge-base", "--is-ancestor", confirmedTip!, tip]); } catch (error) {
+    assert.equal((error as { status: number }).status, 1); ancestor = false;
+  }
+  assert.equal(ancestor, false, "C is not an ancestor of the candidate");
+}
+git(["push", "-q", "origin", `${defaultTip}:refs/heads/${defaultName}`, `${floor}:refs/heads/${branch}`,
+  // The prior confirmed checkpoint: the broker fetches it depth-one and requires strict descent.
+  ...(confirmedChain ? [`${confirmedTip}:refs/uzi-checkpoints/${branch}`] : [])]);
 if (cfg.mode === "AbsentOriginBranch") git(["push", "-q", "origin", `:refs/heads/${branch}`]);
 // Private worker has no origin/HEAD unless a negative-provenance control explicitly adds it.
 assert.equal(git(["for-each-ref", "--format=%(refname)", "refs/remotes/origin/HEAD"]), "");
@@ -127,6 +162,13 @@ type Packed = NonNullable<Awaited<ReturnType<GitCache["checkpointPack"]>>>;
 const defaultObjects = git(["rev-list", "--objects", defaultTip]).split("\n").map(row => row.split(" ")[0]!);
 const eligibleDefaultBlobs = git(["cat-file", "--batch-check=%(objectname) %(objecttype)"], defaultObjects.join("\n") + "\n")
   .split("\n").filter(row => row.endsWith(" blob")).sort();
+// Independent oracle for the confirmed tip: its closure's blobs may also be omitted.
+const confirmedClosureBlobs = confirmedChain
+  ? git(["cat-file", "--batch-check=%(objectname) %(objecttype)"],
+    git(["rev-list", "--objects", confirmedTip!]).split("\n").map(row => row.split(" ")[0]!).join("\n") + "\n")
+    .split("\n").filter(row => row.endsWith(" blob")).sort()
+  : [];
+let capturedConfirmed: string | undefined;
 const artifacts: { name: string; file: string; tip: string; inventory: string[]; reconstructed: number }[] = [];
 async function save(name: string, packed: Pick<Packed, "pack" | "exited" | "cancel">, oid: string) {
   const file = path.join(local, name + ".pack");
@@ -217,8 +259,23 @@ if (["ExpiredParent", "CancelledParent", "PreparationAbort", "PreparationDeadlin
     policy: { version: 1, blocked: false, everKnown: false, flaggedCommits: [], ciGlobs: ["private"], extraFloors: [] } });
   assert.deepEqual(guardedResult, { reason: "ci_config_guard" });
 } else {
-  const range = await cache.resolveCheckpointRange(bare, branch, { defaultBranch: process.env.UZI_SELECTIVE_BRIDGE_LEGACY === "1" ? undefined : authority });
+  const rangeDefault = process.env.UZI_SELECTIVE_BRIDGE_LEGACY === "1" ? undefined : authority;
+  if (confirmedTip) {
+    // Today's selection without C: the control proving the refusal exists without the confirmed tip.
+    const nocRange = await cache.resolveCheckpointRange(bare, branch, { defaultBranch: rangeDefault });
+    assert.ok(nocRange);
+    assert.equal(nocRange.confirmedBlobSha, undefined);
+    const noc = await cache.withBoundaryProcessSpawner(spawner, parent.signal,
+      () => cache.checkpointPack(bare, branch, undefined, nocRange, undefined, undefined, undefined, undefined,
+        { ...options, defaultBranch: rangeDefault }));
+    assert.ok(noc);
+    await save("selective-noc", noc, noc.tipOid);
+  }
+  const range = await cache.resolveCheckpointRange(bare, branch, { defaultBranch: rangeDefault,
+    ...(confirmedTip ? { confirmedTip, captureConfirmedBlob: true as const } : {}) });
   assert.ok(range);
+  if (confirmedTip) assert.equal(range.confirmedBlobSha, confirmedTip);
+  capturedConfirmed = range.confirmedBlobSha;
   capturedDefault = range.defaultBlobSha;
   capturedFloor = range.excludeSha;
   const packed = await cache.withBoundaryProcessSpawner(spawner, parent.signal,
@@ -227,7 +284,7 @@ if (["ExpiredParent", "CancelledParent", "PreparationAbort", "PreparationDeadlin
   // Mutation selector enters production without server authority; never supplies a test manifest.
   assert.ok(packed);
   await save("selective", packed, packed.tipOid);
-  if (cfg.mode.startsWith("Replay")) {
+  if (replayMode) {
     const next = commit(empty, cfg.mode === "ReplayRewrite" ? [floor] : [defaultTip], "changed after capture");
     if (cfg.mode === "ReplayDelete") {
       git(["update-ref", "-d", `refs/remotes/origin/${defaultName}`]);
@@ -274,4 +331,5 @@ const settled = preparationChildren.size === 0;
 assert.equal(fallbackSettled, true);
 console.log("SELECTIVE_SUMMARY " + JSON.stringify({ local, branch, defaultName, tip, floor, x, d,
   defaultTip, publicBlobs, privateBlob, candidateTree, protectedChanged, protectedBase,
-  stopped, calls, settled, capturedDefault, capturedFloor, historicalBlob, historicalBlobAbsentDepthOne, eligibleDefaultBlobs, artifacts }));
+  stopped, calls, settled, capturedDefault, capturedFloor, historicalBlob, historicalBlobAbsentDepthOne, eligibleDefaultBlobs, artifacts,
+  confirmedTip, capturedConfirmed, confirmedHistoryBlobs, confirmedClosureBlobs }));

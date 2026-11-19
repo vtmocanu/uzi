@@ -18,6 +18,7 @@ import { runsApi } from "./runs";
 import { crossChecksApi } from "./crossChecks";
 import { chatApi } from "./chat";
 import { secretsApi } from "./secrets";
+import { providersApi } from "./providers";
 import { workersApi } from "./workers";
 import { settingsApi } from "./settings";
 import { healthApi } from "./health";
@@ -49,6 +50,9 @@ export const mockApi = {
 
   // ── Secrets ─────────────────────────────────────────────────────────────────
   ...secretsApi,
+
+  // ── Custom providers (PRD #4320 M3) ──────────────────────────────────────────
+  ...providersApi,
 
   ...agentsApi,
 

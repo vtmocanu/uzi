@@ -526,6 +526,79 @@ true
 {{- end }}
 
 {{- /*
+  uzi.validateProviderBaseURLEntry: the shape check for a providers.allowedBaseURLs entry
+  (PRD #4320). Unlike uzi.validateBaseURLEntry, a provider entry is an EXACT base URL WITH
+  a path (https://gateway.example.com/anthropic), because the api matches a provider's URL
+  against it character for character (scheme and host case-folded, one trailing slash
+  ignored). It only ever fails; include it as
+  `{{- include "uzi.validateProviderBaseURLEntry" (dict "key" ... "pos" ... "entry" ...) -}}`.
+  Mirrors the api's providers.NormalizeBaseURL where a template can: https only; printable
+  ASCII only; no userinfo, query, fragment, percent sign, semicolon, backslash, comma or
+  whitespace (the list is joined with "," into one env var), no empty or dot path
+  segments. What a template cannot judge (a trailing-dot host, a numeric-shorthand IPv4
+  host, an unspecified or link-local IP literal, a loopback host) renders here and is
+  refused by the api at boot. No message prints the entry, which can carry credentials.
+*/}}
+{{- define "uzi.validateProviderBaseURLEntry" -}}
+{{- $raw := toString .entry }}
+{{- $where := printf "%s entry %d" .key (int .pos) }}
+{{- if contains "@" $raw }}
+{{- fail (printf "%s: must not contain userinfo (user@ or user:password@)" $where) }}
+{{- end }}
+{{- if regexMatch "[,\\s]" $raw }}
+{{- fail (printf "%s: must not contain a comma or whitespace (the entries are joined with \",\" into UZI_PROVIDER_ALLOWED_BASE_URLS; list each URL as its own entry)" $where) }}
+{{- end }}
+{{- if contains "?" $raw }}
+{{- fail (printf "%s: has a query; only an https URL with a path is allowed" $where) }}
+{{- end }}
+{{- if contains "#" $raw }}
+{{- fail (printf "%s: has a fragment; only an https URL with a path is allowed" $where) }}
+{{- end }}
+{{- if contains "%" $raw }}
+{{- fail (printf "%s: must not contain percent-encoding" $where) }}
+{{- end }}
+{{- if contains ";" $raw }}
+{{- fail (printf "%s: must not contain a semicolon" $where) }}
+{{- end }}
+{{- if contains "\\" $raw }}
+{{- fail (printf "%s: must not contain a backslash" $where) }}
+{{- end }}
+{{- if not (regexMatch "^[\\x21-\\x7E]+$" $raw) }}
+{{- fail (printf "%s: must contain only printable ASCII characters (non-ASCII hosts use the xn-- form)" $where) }}
+{{- end }}
+{{- if not (regexMatch "^(?i:https)://([A-Za-z0-9._-]+|\\[[0-9A-Fa-f:.]+\\])(:[0-9]{1,5})?(/.*)?$" $raw) }}
+{{- fail (printf "%s: must be an absolute https URL with a host, e.g. https://gateway.example.com/anthropic" $where) }}
+{{- end }}
+{{- $path := regexReplaceAll "^[^:]+://[^/]*" $raw "" }}
+{{- if regexMatch "(^|/)[.][.]?(/|$)" $path }}
+{{- fail (printf "%s: path must not contain dot segments" $where) }}
+{{- end }}
+{{- if contains "//" $path }}
+{{- fail (printf "%s: path must not contain empty segments" $where) }}
+{{- end }}
+{{- end }}
+
+{{- /*
+  uzi.providerAllowedBaseURLs: providers.allowedBaseURLs (PRD #4320) as a JSON list, every
+  entry validated fail-CLOSED by uzi.validateProviderBaseURLEntry. Entries are returned as
+  given. Nothing derives a worker egress rule from it (the api, not a worker, dials a
+  provider's base URL for the Test probe). Consumers:
+  `fromJsonArray (include "uzi.providerAllowedBaseURLs" .)`.
+*/}}
+{{- define "uzi.providerAllowedBaseURLs" -}}
+{{- $out := list }}
+{{- range $i, $e := (.Values.providers).allowedBaseURLs }}
+{{- include "uzi.validateProviderBaseURLEntry" (dict "key" "providers.allowedBaseURLs" "pos" (add1 $i) "entry" $e) -}}
+{{- $out = append $out $e }}
+{{- end }}
+{{- toJson $out }}
+{{- end }}
+
+{{- define "uzi.apiProviderExtraCADir" -}}
+/etc/uzi/provider-extra-ca
+{{- end -}}
+
+{{- /*
   uzi.validateFQDNEgress: the shared preconditions for every FQDN-egress provider.
   An empty forge list would leave the api on its built-in default forge while the egress
   policy allows none, silently blocking clone/fetch on the kube-native tier.

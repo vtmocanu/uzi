@@ -2803,6 +2803,128 @@ and the owner's keep-default decision remain pending on #4043; the PRD stays
 open pending hosted acceptance. Existing mechanism protections and residuals
 are recorded in [ADR-3153](../adr/3153-runner-shared-pvc-subpath.md).
 
+#### Per-run TMPDIR leaves (#4420)
+
+A Claude run flight in the main run lane (issue, task, prompt, CI-fix, self-improve
+and MR-rework runs) launches with its own `TMPDIR`, `<scratch root>/run-<runId>`
+(`agent/src/run-tmpdir.ts`), under the split root `/data/runner/.tmp/uzi-runner` or the
+single-UID root `/data/runner/.tmp`. The leaf is created by a runner-uid helper in split
+mode and by the worker in single-UID mode. The leaf
+is mode exactly `0700`; an existing leaf is reused only when it is exactly `0700` and
+has the right owner. Any failure falls back to the shared `TMPDIR` and logs a warning
+with a fixed reason token. The Claude SDK env, the pre-plan JS dependency install,
+self-improve checks and devbox provisioning use it; Codex, chat, job, isolated,
+advice, judge, review and cross-check lanes are unchanged.
+
+The startup scratch phase above stays the only deleter. Non-run leaves take the 512
+admission slots first and are processed first, in name order, so run leaves cannot
+starve them. A `run-<uuid>` leaf is additionally deleted only when all of these hold:
+
+- the server lifecycle is terminal (`completed`, `failed` or `cancelled`);
+- the run has zero open recovery holds (the deletion-side zero-hold rule);
+- every local retention source for the run has ended: bare-repository config
+  records, retained-source groups, authority slots, custody, run data-dir records
+  and the outbox (`classifyEpochScratchRunRetention` in `agent/src/git.ts`,
+  `agent/src/pod-epoch-run-retention.ts`, and the outbox check in
+  `agent/src/pod-epoch-reclaim.ts`).
+
+Each server read is bounded at 30 s; a failed read keeps the leaf. Owner decisions
+(#4420): the `uzi-trackowner.<branch>.owner` stamp is seed provenance for
+`refs/uzi-runner/<branch>`, not retention of the leaf, so it neither keeps nor
+releases it; an authority slot in state `ineligible` or `retired` with no pending,
+retiring or publication record counts as ended only together with the verified
+missing footprint, and any other slot keeps. The worker-wide slot inventory is
+checked against the authenticated heads (a head-recorded slot whose file or `slots`
+directory is gone refuses the inventory, which keeps the leaf), and an inventory slot
+with no publication record keeps the leaf as unknown unless the run's own ledger
+entry attributed it and judged it ended and the inventory copy is itself still an
+ended tombstone. An outbox manifest or finalize record that the outbox could not
+load at startup (unreadable, malformed, unauthenticated, cross-run or a non-canonical
+name, including a finalize temp file a crash left behind), or a run directory it could
+not list, keeps the leaf as unknown for the life of that process. Undrained outbox
+messages kept under a case alias of the run id keep the leaf.
+
+Further cases that keep a leaf as unknown (`run_local_unknown`):
+
+- **The run's refs** (`run_refs`): the listing is read with stderr, so any git warning
+  or failure is unknown. After a clean empty listing, the loose ref storage under the
+  run's ref prefixes (`refs/uzi-owed/`, `refs/uzi-recovery-episode/`,
+  `refs/uzi-recovery-pin/`, `refs/uzi-coverage/`, `refs/uzi-settle/`, `refs/uzi-archive/`
+  and `refs/uzi-cross-check/<runId>`) and
+  `packed-refs` are checked directly. Any non-directory entry under them (a broken or
+  dangling ref, symlink, FIFO or stale lock file), a symlinked or non-directory
+  ancestor, any `packed-refs` line naming the run, or a ref storage extension
+  (`extensions.refstorage`, or a `reftable` directory) keeps the
+  leaf as unknown. A stale `*.lock` left under a run's ref directory therefore keeps
+  that leaf until it is removed.
+- **A retired ledger row** (`attempt_ledger`) whose clone path is not this bare's
+  canonical attempt clone for its attempt id (the census's identity contract), or whose
+  generation is unreadable, gives unknown.
+- **Conflicting ledger rows** (`attempt_ledger`): if a bare's attempt ledger holds two
+  rows for one attempt id whose branch, run id or clone path differ, the bare's ledger is
+  unknown for every run classified against it. Successive rows of one identical identity
+  are state changes, and the last one wins.
+- **Interrupted reads:** the authority slot reads and the authenticated
+  recovery-maintenance inspection each stop starting new reads once the pass's abort
+  signal fires or its read deadline passes; a read already started is awaited, except
+  that when the pass cannot settle within its settlement bound (about 5 s after an
+  abort), the pass fails fatally. A read that detects expiry before the pass aborts leaves the classification
+  unknown: the leaf is kept and counted as `run_local_unknown` with source `classifier`.
+  A pass abort, or the pass deadline stopping the phase while a read is in flight, makes
+  the scratch phase report `stopped` (reason `pass_deadline` on the deadline); the leaf is
+  untouched and is not counted under `classifier` (no kept count).
+
+New `scratch.kept` reasons for run leaves:
+
+| Reason | Meaning |
+|---|---|
+| `run_active` | the run is not terminal on the server |
+| `run_retained` | the run still has open recovery holds |
+| `run_unknown` | the server reports the run as not this worker's (ownership 404), e.g. a run reassigned to another worker |
+| `run_unreadable` | a server read failed, timed out or was malformed |
+| `run_local_active` | a local retention source is still active |
+| `run_local_unknown` | a local retention source could not be read or classified |
+
+For the two `run_local_*` reasons, `scratch.run_local_sources` counts leaves by the
+fixed source token that kept them (never a path or run id).
+
+Known consequences and not shipped:
+
+- The hibernation census reports `run-<uuid>` leaves as protected (`run_scratch`),
+  so the hibernation retirement dry-run records a `protected_source` blocker for such
+  a worker until a later pod start's scratch phase reclaims them, if it does (reclaim
+  needs the scratch phase to run, deletion requested, an eligible and attested epoch,
+  and an ended run).
+- Deletion at run end is deferred: after the listing there is no fence against
+  sibling runner-uid writers or Docker-created mounts (the #4043 deferral).
+- Startup throughput, run-procs and cache-cap attribution of the leaf are deferred.
+- When retained discovery overflows, all run leaves are kept for that pass.
+- A run reassigned to another worker is kept (`run_unknown`) on the old worker.
+- Authority slots are never removed, and the inventory spans the whole worker. The keep
+  rule covers every unattributed publication-null slot, not only retired tombstones.
+  That includes a settled bare-mutation slot: after a successful bare mutation the
+  slot's pending is cleared and its publication stays null, and a completed mutation
+  alone does not establish source settlement or a missing footprint. One such slot
+  therefore keeps any candidate run leaf whose ledger cannot attribute it, as
+  `run_local_unknown` (`authority_inventory`); since other runs' ledgers do not
+  attribute it, in practice reclaim stops once another run has retired a source or
+  settled a bare mutation there.
+- A retire-scratch binding (`uzi-retire-scratch.<uuid>.binding`, issue #4263) names its
+  run, so the leaf classifier reads it as bare-config retention and keeps that run's
+  leaf (`run_local_active`, `bare_config`) for as long as the binding exists. On a
+  uid-split pod a non-completion retire's binding stays `intent` and the epoch never
+  clears it, so that run's leaf is kept with it. A completion retire that succeeds unsets
+  its binding in-process; a failed one, or one whose unset fails, leaves its binding
+  (`intent` if it failed before disposal began, `removing` after), and the leaf is kept
+  with it; a binding of an already-gone parent is cleared by the retire phase, which
+  runs after the scratch phase, so the leaf is reclaimed at the earliest on a later
+  start. This fails closed; an exemption backed by settled-binding evidence is open on
+  #4453.
+- The retire phase gets no reserved share of the pass: it runs last and is deferred
+  (`budget_deferred`) when less than 30 s of the pass budget remains after its 5 s reserve. Many run leaves, each costing up to
+  two 30 s server reads plus the local classifier, can use the pass budget before the
+  attempt and retire phases run; everything not reached is kept.
+
 #### One-worker deletion canary checklist
 
 Setting `workers.epochReclaim.deletionCanaryWorkerId` is an owner-run, evidence

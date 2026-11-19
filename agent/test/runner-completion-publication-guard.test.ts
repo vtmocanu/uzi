@@ -232,6 +232,37 @@ describe("M3 publication-start completion guard", () => {
     });
   }
 
+  // PRD 4173: an interlocked run linked to an issue tracker (claim.issue_key) is non-closing: the verified-head
+  // reconcile adds no Closes, and a commit message closing the unrelated forge issue #<iid> is still refused.
+  for (const issue_key of ["ABC-12", "not a key"]) {
+    it(`linked interlocked run (issue_key ${JSON.stringify(issue_key)}): non-closing proof, no Closes after the reconcile`, async () => {
+      api.setRegisterProtocolFeatures(["claim_generation_fence", "completion_non_closing_v1", "refresh_publication_context_v1"]);
+      await client.register("m3-linked");
+      const claim = claimFor("gitlab", []);
+      (claim as unknown as Record<string, unknown>).issue_key = issue_key;
+      api.setCompletionPermitResponse(true);
+      api.completionPermitScope = {};
+      const forge = fakeGitlab();
+      const pushed = followSuccessfulPush(git, forge.pr, true);
+      await runner(committing("Refs #3090").executor, forge.gitlab).execute(claim);
+      const done = api.states.find(s => s.runId === claim.run_id && s.body.status === "completed");
+      assert.ok(done, JSON.stringify(statuses(claim.run_id)));
+      assert.deepEqual(done.body.source_publication, { version: 1, published_head: pushed(), non_closing: true });
+      assert.doesNotMatch(forge.pr.description, /Closes/);
+      assert.match(forge.pr.description, issue_key === "ABC-12" ? /Related to ABC-12\./ : /Related to the linked issue\./);
+    });
+  }
+
+  it("linked interlocked run: a commit message closing #<iid> is still refused before any push", async t => {
+    const claim = claimFor("gitlab", []);
+    (claim as unknown as Record<string, unknown>).issue_key = "ABC-12";
+    const push = t.mock.method(git, "pushBranch", async () => { throw new Error("unexpected push"); });
+    await runner(committing("Closes #3090").executor, fakeGitlab().gitlab).execute(claim);
+    assert.equal(push.mock.callCount(), 0);
+    assert.equal(api.completionHoldRequests.length, 1);
+    noPublish(claim.run_id);
+  });
+
   for (const hold of ["confirmed", "ambiguous", "refused"] as const) {
     it(`capture exhaustion + ${hold} hold uses empty head and actual hold disposition`, async () => {
       const claim = claimFor();

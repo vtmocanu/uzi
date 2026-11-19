@@ -1,0 +1,3 @@
+EnsureLabels(77, [{Name:"Human Review" Color:"#6e49cb"}])
+UpdateIssueLabels(77, 4, ["Human Review"], ["Later"])
+CreateIssueNote(77, 4, "**Autopilot opened a merge request.**\n\nAutopilot finished this issue and opened merge request !42 for your review: https://gitlab.example.com/group/proj/-/merge_requests/42")

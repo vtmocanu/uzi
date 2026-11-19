@@ -125,7 +125,10 @@ type healthFakeStore struct {
 	satisfyingProtocol    int64
 	satisfyingProtocolErr error
 	// satisfyingCIGuard is the canned CountOnlineWorkersSatisfyingCIConfigGuard answer (PRD #2865).
-	satisfyingCIGuard    int64
+	satisfyingCIGuard int64
+	// issueKeyMissing is the canned IssueKeyWorkerMissingForRepo answer (PRD #4173); the calls are recorded.
+	issueKeyMissing      bool
+	issueKeyCalls        []store.IssueKeyWorkerMissingForRepoParams
 	satisfyingCIGuardErr error
 	ciGuardCalls         []uuid.UUID
 	// protocolCalls records every lookup's user id, so a test can prove the rung asks about THIS
@@ -318,6 +321,10 @@ func (f *healthFakeStore) CountOnlineWorkersSatisfyingCIConfigGuard(_ context.Co
 		return 0, f.satisfyingCIGuardErr
 	}
 	return f.satisfyingCIGuard, nil
+}
+func (f *healthFakeStore) IssueKeyWorkerMissingForRepo(_ context.Context, arg store.IssueKeyWorkerMissingForRepoParams) (bool, error) {
+	f.issueKeyCalls = append(f.issueKeyCalls, arg)
+	return f.issueKeyMissing, nil
 }
 func (f *healthFakeStore) CountOnlineEligibleWorkersForRepo(_ context.Context, arg store.CountOnlineEligibleWorkersForRepoParams) (int64, error) {
 	f.eligCalls = append(f.eligCalls, arg)

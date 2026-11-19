@@ -857,6 +857,23 @@ var queryInventory = []queryPin{
 	{"ResealVaultSecretMaterial", "vault_material.sql", "TestVaultMaterialQueriesLiveDB",
 		"direct calls reject foreign ownership, then change ciphertext/discriminator while a " +
 			"JSON snapshot asserts every non-crypto column is preserved"},
+	{"LockVaultEnvConnectionsKeyShare", "vault_material.sql", "TestVaultEnvFenceBlocksRepoAndConnectionDeleteLiveDB",
+		"direct call inside a transaction, then a second transaction's NOWAIT connection lock and a " +
+			"DeleteForgeConnectionForUser under lock_timeout fail 55P03; TestRunEnvVarQueriesLiveDB asserts " +
+			"the owner's env-bearing connection is the only id returned"},
+	{"LockVaultEnvReposKeyShare", "vault_material.sql", "TestVaultEnvFenceBlocksRepoAndConnectionDeleteLiveDB",
+		"direct call inside a transaction, then DeleteRepoForUser under lock_timeout fails 55P03 and " +
+			"succeeds once the transaction commits; TestRunEnvVarQueriesLiveDB asserts the returned ids"},
+	{"ListVaultEnvMaterialCandidates", "vault_material.sql", "TestRunEnvVarQueriesLiveDB",
+		"direct call — owner scope, ascending id order, the keyset tail, and that listing takes no row " +
+			"lock; the 64-row and 1 MiB window bounds mirror the secret batch and are not separately asserted"},
+	{"LockVaultEnvMaterialBatch", "vault_material.sql", "TestRunEnvVarQueriesLiveDB",
+		"direct call — locks exactly the given ids for the owner in ascending order (a foreign owner's " +
+			"ids and an unknown id yield no row) and a second connection's FOR UPDATE NOWAIT on a locked " +
+			"row fails 55P03, over live, retired and pending-deletion run_env_vars rows"},
+	{"ResealVaultEnvMaterial", "vault_material.sql", "TestRunEnvVarQueriesLiveDB",
+		"direct calls reject a foreign owner, then change ciphertext/discriminator while a JSON " +
+			"snapshot asserts every non-crypto column is preserved"},
 	{"ResealVaultAccountMaterial", "vault_material.sql", "TestVaultMaterialQueriesLiveDB",
 		"direct calls reject foreign ownership, update both slot discriminators together, retain " +
 			"empty recovery pairing and preserve every non-crypto column including revisions/generation"},
@@ -1105,6 +1122,8 @@ var queryInventory = []queryPin{
 		"../workersvc: reached through the owner reassignment"},
 	{"LockSecretEnablementForShareNowait", "credential_disabled.sql", unpinnedPin,
 		"declared when this file joined the inventory for PRD #3250; no test names this query. It runs inside the credential finisher or promoter path, which no test asserts statement by statement, so it is not observed here"},
+	{"RewriteProviderDestinationHoldStale", "credential_disabled.sql", "TestProviderDestinationHoldGoesStaleWhileParkedLiveDB",
+		"../workersvc: reached through the promoter pass; asserts the destination hold becomes provider_binding_stale with the pause anchor kept and that re-allowlisting never re-queues it"},
 	{"ListCredentialDisabledUsers", "credential_disabled.sql", "TestCredentialDisabledUsersWorklistLiveDB",
 		"the promoter sweep's owner worklist"},
 	{"LockCredentialDisabledRunForPromotion", "credential_disabled.sql", "TestCredentialPromoterTriggersLiveDB",

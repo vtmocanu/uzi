@@ -5,7 +5,7 @@ import type { PlanCrossCheckSummary } from "../lib/apiTypes";
 import { memo, useEffect, useRef, useState, type ReactNode } from "react";
 import type { RunMessage } from "../lib/api";
 import type { PhaseUsage } from "../lib/runUsage";
-import { feedWindowLabel, parseFeedInstant, usageLimitLabel } from "../lib/limitWait";
+import { feedWindowLabel, PROVIDER_GATEWAY_LIMIT, parseFeedInstant, usageLimitLabel } from "../lib/limitWait";
 import { formatTokens, formatCost } from "../lib/formatTokens";
 import { useNow } from "../lib/useNow";
 import { Markdown } from "./Markdown";
@@ -1014,7 +1014,9 @@ function LimitRow({
   payload?: Record<string, unknown>;
   parked?: boolean;
 }) {
-  const window = feedWindowLabel(payload?.["rate_limit_type"]);
+  // PRD #4320: a provider gateway-limit park is not a subscription window; its row names the gateway.
+  const gateway = payload?.["rate_limit_type"] === PROVIDER_GATEWAY_LIMIT;
+  const window = gateway ? null : feedWindowLabel(payload?.["rate_limit_type"]);
   const resetsAt = parseFeedInstant(payload?.["resets_at"]);
   const detail = [
     window,
@@ -1045,9 +1047,13 @@ function LimitRow({
           be accurate — but judge-runner.ts reports the same structured facts on its
           own failure path and gaining a feed line there is a one-line change. The
           outcome is true for every emitter; the cause is true for the current one. */}
-      {parked
-        ? `${usageLimitLabel(harness)} reached — paused until it resets`
-        : `${usageLimitLabel(harness)} reached — the run failed here`}
+      {gateway
+        ? parked
+          ? "Provider gateway rate limit reached — paused, retrying or waiting for you to resume"
+          : "Provider gateway rate limit reached — the run failed here"
+        : parked
+          ? `${usageLimitLabel(harness)} reached — paused until it resets`
+          : `${usageLimitLabel(harness)} reached — the run failed here`}
       {detail && <span className="font-normal opacity-90">({detail})</span>}
     </div>
   );

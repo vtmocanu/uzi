@@ -104,6 +104,18 @@ type Client interface {
 	// entry's value appears nowhere — there is no reveal endpoint.
 	ListSecrets(ctx context.Context) ([]apitypes.SecretDTO, error)
 	TestSecret(ctx context.Context, kind, id string) (apitypes.SecretTestResult, error)
+	// Model providers (PRD #4320): /api/me/providers, RequireUser. The key and endpoint routes
+	// are cookie-only and deliberately absent here.
+	ListProviders(ctx context.Context) (apitypes.ProviderListDTO, error)
+	CreateProvider(ctx context.Context, req apitypes.ProviderCreateRequest) (apitypes.ProviderDTO, error)
+	EditProvider(ctx context.Context, id string, req apitypes.ProviderPatchRequest) (apitypes.ProviderDTO, error)
+	RetireProvider(ctx context.Context, id string) (apitypes.ProviderDTO, error)
+	TestProvider(ctx context.Context, id string) (*apitypes.ProviderProbeDTO, error)
+	// SetClaudeProviderSource selects (id non-nil) or clears (nil) the caller's Claude model-provider
+	// source via PUT /api/me/providers/claude-source and returns the id the server now reports (nil
+	// once cleared). An unusable provider (retired, keyless, not allowlisted) is a 409 with reason
+	// provider_source_unusable, an unknown or foreign one a 404.
+	SetClaudeProviderSource(ctx context.Context, id *string) (*string, error)
 	// SetTokenAutoEligible opts one of the caller's Anthropic tokens into or out of
 	// the auto-selection pool (PRD #111 M2, D2): PATCH
 	// /api/me/secrets/anthropic_token/{id}/auto-eligible {auto_eligible}.
@@ -716,6 +728,11 @@ type Client interface {
 	// A foreign/unknown run or rec is a 404 (exit 4); an already-filed or mid-filing
 	// recommendation is a 409 (exit 5) — both come straight from statusError.
 	FileReviewIssue(ctx context.Context, runID, recID, repoID, title, description string) (ReviewIssueFileResult, error)
+
+	// ListRepoEnv reads a repo's run variables (PRD #4416): GET /api/repos/{id}/env.
+	// A secret's value is never in the response; a plain value is withheld while the
+	// vault is locked. Read-only: the CLI has no write twin.
+	ListRepoEnv(ctx context.Context, repoID string) (apitypes.RunEnvListDTO, error)
 
 	// GetProjectSyncStatus reads a repo's GitHub Projects v2 sync health (PRD #576
 	// M7): GET /api/repos/{id}/github-project-sync. RequireUser since M7 moved the

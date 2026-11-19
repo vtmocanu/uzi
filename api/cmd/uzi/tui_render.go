@@ -502,6 +502,14 @@ const (
 	credsResetWord = "creds reset"
 )
 
+// Words of the two provider-binding holds (PRD #4320 module 5), drawn with the credential glyph in the
+// same amber NEEDS YOU treatment: the run waits on the operator (URL allowlist) or is final (start a
+// new run). Fixed literals, never run text; 11 and 13 runes, within boardStatusWordWidth.
+const (
+	providerURLBlockedWord   = "url blocked"
+	providerBindingStaleWord = "binding stale"
+)
+
 const (
 	providerHoldWord  = "provider hold"
 	providerRetryWord = "provider wait"
@@ -555,6 +563,12 @@ func (p palette) runStateToken(r apitypes.RunDTO, isRevising bool) runToken {
 	}
 	if isCredentialsResetHold(r) {
 		return runToken{glyph: credDisabledGlyph, word: credsResetWord, color: p.amber}
+	}
+	if isProviderDestinationHold(r) {
+		return runToken{glyph: credDisabledGlyph, word: providerURLBlockedWord, color: p.amber}
+	}
+	if isProviderBindingStaleHold(r) {
+		return runToken{glyph: credDisabledGlyph, word: providerBindingStaleWord, color: p.amber}
 	}
 	if isCredentialSwitchSettlingHold(r) {
 		return runToken{glyph: credSwitchGlyph, word: credSwitchSettlingWord, color: p.amber}

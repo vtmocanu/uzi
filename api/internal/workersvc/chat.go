@@ -131,6 +131,11 @@ type ChatClaimPayload struct {
 // than a run.
 type ChatClaimSecrets struct {
 	AnthropicOAuthToken string `json:"anthropic_oauth_token"`
+	// Provider is the model-provider binding of a PROVIDER-BOUND chat (PRD #4320 module 5): present
+	// ONLY then, with AnthropicOAuthToken "" (the key stays non-omitempty, so a provider chat sends
+	// `anthropic_oauth_token: ""` plus `provider`). omitempty keeps every vendor chat claim
+	// BYTE-IDENTICAL to today's wire. Exclusive with the token (assertClaimSecretsExclusive).
+	Provider *ClaimProviderBinding `json:"provider,omitempty"`
 }
 
 // ChatClaimConfig are the chat lifecycle caps the worker enforces, delivered so the
@@ -176,6 +181,9 @@ func (s *Service) ClaimChat(ctx context.Context, wkr store.Worker) (*ChatClaimPa
 		// PRD #529 Decision 4: an ephemeral (run-bound) worker never claims a chat.
 		IsEphemeral:    wkr.Ephemeral,
 		AffinityCutoff: pgconv.Time(s.now().Add(-s.p.WorkerAffinityGrace)),
+		// PRD #4320 module 5: the claimant's protocol capabilities feed ClaimChatRun's NON-BYPASSABLE
+		// provider clause (claimChatRun re-reads them under the claimant row lock).
+		WorkerProtocolCaps: wkr.ProtocolCapabilities,
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -183,9 +191,14 @@ func (s *Service) ClaimChat(ctx context.Context, wkr store.Worker) (*ChatClaimPa
 		}
 		return nil, err
 	}
-	payload, err := s.assembleChatClaim(ctx, run)
+	payload, err := s.assembleChatClaim(ctx, wkr, run)
 	if errors.Is(err, errCredentialDisabled) {
 		return nil, s.parkChatCredentialDisabled(ctx, wkr, run, holdCredentialDisabled)
+	}
+	if refusal, ok := isProviderClaimRefusal(err); ok {
+		// PRD #4320 module 5 (D9): a provider-bound chat whose frozen binding was revoked parks on the
+		// provider reason, never on a vendor credential; the claim is idle.
+		return nil, s.parkChatCredentialDisabled(ctx, wkr, run, refusal.Reason)
 	}
 	if errors.Is(err, errNoModelCredential) {
 		// PRD #3989 M3: a chat created before its owner's account reset waits for a credential
@@ -279,7 +292,30 @@ func (s *Service) finishChatClaimTx(ctx context.Context, wkr store.Worker, run s
 	if locked.Status != "claimed" || locked.Kind != runkind.Chat {
 		return chatFinishIdle, nil // cancelled or reclaimed since: deliver nothing
 	}
-	if locked.AnthropicSecretID.Valid {
+	if providerBoundRun(locked) {
+		// PRD #4320 module 5 (D9): same lock order as the vendor arm (the chat row, then the frozen key
+		// row FOR SHARE NOWAIT, a 55P03 retried by finishChatClaim) and the same outcome: an undelivered
+		// claim parks (chatFinishParked), here with the provider reason, never on a vendor credential.
+		reason, err := s.lockedProviderRefusal(ctx, q, locked)
+		if err != nil {
+			return chatFinishIdle, err
+		}
+		if reason != "" {
+			n, err := q.ParkCredentialDisabledChatRun(ctx, store.ParkCredentialDisabledChatRunParams{
+				ID: run.ID, WorkerID: pgconv.UUID(wkr.ID), HoldReason: reason,
+			})
+			if err != nil {
+				return chatFinishIdle, fmt.Errorf("park chat on %s: %w", reason, err)
+			}
+			if err := tx.Commit(ctx); err != nil {
+				return chatFinishIdle, err
+			}
+			if n != 1 {
+				return chatFinishIdle, nil
+			}
+			return chatFinishParked, nil
+		}
+	} else if locked.AnthropicSecretID.Valid {
 		disabled, err := q.LockSecretEnablementForShareNowait(ctx, store.LockSecretEnablementForShareNowaitParams{
 			ID: uuid.UUID(locked.AnthropicSecretID.Bytes), UserID: locked.UserID,
 		})
@@ -371,7 +407,7 @@ func (s *Service) parkChatCredentialDisabled(ctx context.Context, wkr store.Work
 // It joins NO repo and NO forge connection (Decision 12): the only context it needs
 // beyond the run row is the resumed-from session for a Continue run, and the only
 // secret it opens is the Anthropic token.
-func (s *Service) assembleChatClaim(ctx context.Context, run store.Run) (*ChatClaimPayload, error) {
+func (s *Service) assembleChatClaim(ctx context.Context, wkr store.Worker, run store.Run) (*ChatClaimPayload, error) {
 	resumeSession, err := s.q.GetChatRunClaimContext(ctx, run.ID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -402,30 +438,43 @@ func (s *Service) assembleChatClaim(ctx context.Context, run store.Run) (*ChatCl
 	// (ClaimChat) rather than failing it. A token-less owner's chat fails, unless the owner
 	// redeemed an account reset after the chat was created: that chat parks on credentials_reset
 	// (PRD #3989).
-	cred, err := s.openAnthropic(ctx, run.UserID, nil)
-	if err != nil {
-		if perr := s.parkIfDefaultSlotDisabled(ctx, run.UserID, err); perr != nil {
-			return nil, perr
+	var anthropic []byte
+	var providerBinding *ClaimProviderBinding
+	if providerBoundRun(run) {
+		// PRD #4320 module 5: a provider-bound chat carries the frozen provider binding and NO vendor
+		// credential: openAnthropic, recordRunCredential and the credential_disabled/reset parks are
+		// never reached (the owner's Anthropic default is irrelevant to it).
+		pb, err := s.assembleProviderBinding(ctx, wkr, run)
+		if err != nil {
+			return nil, err
 		}
-		return nil, err
+		providerBinding = pb
+	} else {
+		cred, err := s.openAnthropic(ctx, run.UserID, nil)
+		if err != nil {
+			if perr := s.parkIfDefaultSlotDisabled(ctx, run.UserID, err); perr != nil {
+				return nil, perr
+			}
+			return nil, err
+		}
+		// Chat records its credential too (PRD #111 M1). Its reason is always "default"
+		// by construction — the nil above is the whole reason chat is not bindable — but
+		// the RECORD is not redundant: it is what lets M4's in-flight bias see chat spend
+		// against a credential at all (D18), and what makes a chat run's cost attributable
+		// alongside every other lane's.
+		// The nil override is passed through staticChoice rather than hand-writing the
+		// reason, so chat cannot drift from the one function that maps overrides to
+		// reasons. Its second argument is unreachable here by construction (a nil override
+		// is `default` whatever it says), and it is spelled selectReasonDefault rather than
+		// a placeholder so a reader does not have to check.
+		// emitSwitchMessage=false: chat is deliberately unbindable (D5), so it can never switch tokens
+		// and never emits a 'credential_switch' message. The returned last_seq is discarded (chat sets
+		// its ClaimPayload.LastSeq from run.LastSeq / the resume session directly).
+		if _, err := s.recordRunCredential(ctx, run, cred, staticChoice(nil, selectReasonDefault), false); err != nil {
+			return nil, err
+		}
+		anthropic = cred.Token
 	}
-	// Chat records its credential too (PRD #111 M1). Its reason is always "default"
-	// by construction — the nil above is the whole reason chat is not bindable — but
-	// the RECORD is not redundant: it is what lets M4's in-flight bias see chat spend
-	// against a credential at all (D18), and what makes a chat run's cost attributable
-	// alongside every other lane's.
-	// The nil override is passed through staticChoice rather than hand-writing the
-	// reason, so chat cannot drift from the one function that maps overrides to
-	// reasons. Its second argument is unreachable here by construction (a nil override
-	// is `default` whatever it says), and it is spelled selectReasonDefault rather than
-	// a placeholder so a reader does not have to check.
-	// emitSwitchMessage=false: chat is deliberately unbindable (D5), so it can never switch tokens
-	// and never emits a 'credential_switch' message. The returned last_seq is discarded (chat sets
-	// its ClaimPayload.LastSeq from run.LastSeq / the resume session directly).
-	if _, err := s.recordRunCredential(ctx, run, cred, staticChoice(nil, selectReasonDefault), false); err != nil {
-		return nil, err
-	}
-	anthropic := cred.Token
 
 	// PRD #1551 M4 (D4): Chat is the literal-Claude exception and always reads the CLAUDE lane
 	// (this PRD does not enable Codex Chat; assembleChatClaim refuses a Codex-indicating run
@@ -457,6 +506,10 @@ func (s *Service) assembleChatClaim(ctx context.Context, run store.Run) (*ChatCl
 	if err != nil {
 		return nil, err
 	}
+	secrets := ChatClaimSecrets{AnthropicOAuthToken: string(anthropic), Provider: providerBinding}
+	if err := assertClaimSecretsExclusive(ClaimSecrets{AnthropicOAuthToken: secrets.AnthropicOAuthToken, Provider: secrets.Provider}); err != nil {
+		return nil, fmt.Errorf("%w: %w", errCredentialUnavailable, err)
+	}
 	return &ChatClaimPayload{
 		RunID:                      run.ID.String(),
 		Kind:                       run.Kind,
@@ -472,9 +525,7 @@ func (s *Service) assembleChatClaim(ctx context.Context, run store.Run) (*ChatCl
 		MemoryEpisode:              run.MemoryEpisode,
 		MemoryInterventionCount:    run.MemoryInterventionCount,
 		MemoryPolicy:               frozenMemoryPolicy,
-		Secrets: ChatClaimSecrets{
-			AnthropicOAuthToken: string(anthropic),
-		},
+		Secrets:                    secrets,
 		Config: ChatClaimConfig{
 			IdleTimeoutSeconds: int(s.p.WorkerChatIdleTimeout.Seconds()),
 			TurnTimeoutSeconds: int(s.p.WorkerChatTurnTimeout.Seconds()),
@@ -499,17 +550,69 @@ func (s *Service) CreateChatRun(ctx context.Context, userID uuid.UUID, message s
 		return store.Run{}, err
 	}
 	title := deriveChatTitle(message)
-	run, err := s.q.CreateChatRun(ctx, store.CreateChatRunParams{
+	params := store.CreateChatRunParams{
 		RunID:            uuid.New(),
 		UserID:           userID,
 		IssueTitle:       title,
 		IssueDescription: message,
 		Title:            pgconv.TextOrNull(title),
-	})
+	}
+	// PRD #4320: a chat is Claude-only, so the owner's Claude source decides. NULL is today's
+	// non-transactional insert with no binding (byte-identical); a set source (usable or not)
+	// needs the freeze transaction, and an unusable one is a typed refusal, never a vendor chat.
+	if r, ok := s.q.(providerSourceReader); ok {
+		src, err := s.claudeProviderSource(ctx, r, userID)
+		if err != nil {
+			return store.Run{}, err
+		}
+		if src.Set() {
+			run, err := s.createChatRunBound(ctx, params)
+			if err != nil {
+				return store.Run{}, err
+			}
+			logRunCreated(run)
+			return run, nil
+		}
+	}
+	run, err := s.q.CreateChatRun(ctx, params)
 	if err != nil {
 		return store.Run{}, err
 	}
 	logRunCreated(run)
+	return run, nil
+}
+
+// createChatRunBound creates a provider-sourced chat in one transaction: the freeze locks and
+// re-validation, the insert carrying the five binding columns, the binding assertion and the
+// model-map check (the chat lead model: the owner's Claude lane default, else the sonnet alias).
+func (s *Service) createChatRunBound(ctx context.Context, params store.CreateChatRunParams) (store.Run, error) {
+	if s.txBeginner == nil {
+		return store.Run{}, errProviderCreateRequiresTx
+	}
+	tx, err := s.txBeginner.Begin(ctx)
+	if err != nil {
+		return store.Run{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	qtx := store.New(tx)
+	frozen, err := s.freezeProviderSource(ctx, tx, qtx, params.UserID)
+	if err != nil {
+		return store.Run{}, err
+	}
+	res := resolvedHarness{Harness: HarnessClaude, ClaudeSourceSet: true, ProviderSource: &frozen}
+	b := bindingOf(res)
+	params.ModelProviderID, params.ModelProviderRevision, params.ModelProviderKeyMode = b.ProviderID, b.Revision, b.KeyMode
+	params.ModelProviderKeySecretID, params.ModelProviderKeyRev = b.KeySecret, b.KeyRev
+	run, err := qtx.CreateChatRun(ctx, params)
+	if err != nil {
+		return store.Run{}, err
+	}
+	if err := s.verifyRunBinding(ctx, qtx, run, res); err != nil {
+		return store.Run{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return store.Run{}, err
+	}
 	return run, nil
 }
 
@@ -626,17 +729,65 @@ func (s *Service) ContinueChat(ctx context.Context, userID, runID uuid.UUID) (st
 	if !title.Valid {
 		title = pgconv.TextOrNull(src.IssueTitle)
 	}
-	run, err := s.q.CreateChatContinueRun(ctx, store.CreateChatContinueRunParams{
+	params := store.CreateChatContinueRunParams{
 		UserID:        userID,
 		IssueTitle:    src.IssueTitle,
 		Title:         title,
 		ResumeOfRunID: pgconv.UUID(src.ID),
 		WorkerID:      src.WorkerID, // affinity to the worker whose disk holds the session (may be NULL)
-	})
+	}
+	if providerBoundRun(src) {
+		// PRD #4320 inheritance: the continuation uses the ended chat's frozen binding (re-validated
+		// first), never the owner's current source.
+		run, err := s.continueChatBound(ctx, src, params)
+		if err != nil {
+			return store.Run{}, err
+		}
+		logRunCreated(run)
+		return run, nil
+	}
+	run, err := s.q.CreateChatContinueRun(ctx, params)
 	if err != nil {
 		return store.Run{}, err
 	}
 	logRunCreated(run)
+	return run, nil
+}
+
+// continueChatBound inserts the continuation of a provider-bound chat in one transaction, with the
+// source run's binding copied verbatim after re-validation (provider_binding_stale,
+// provider_destination_not_allowed).
+func (s *Service) continueChatBound(ctx context.Context, src store.Run, params store.CreateChatContinueRunParams) (store.Run, error) {
+	if s.txBeginner == nil {
+		return store.Run{}, errProviderCreateRequiresTx
+	}
+	tx, err := s.txBeginner.Begin(ctx)
+	if err != nil {
+		return store.Run{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	qtx := store.New(tx)
+	bound, err := s.inheritProviderBinding(ctx, tx, qtx, src)
+	if err != nil {
+		return store.Run{}, err
+	}
+	res := resolvedHarness{Harness: HarnessClaude, ClaudeSourceSet: true, ProviderSource: &bound}
+	b := bindingOf(res)
+	if b != bindingOfRun(src) {
+		return store.Run{}, errProviderBindingMismatch
+	}
+	params.ModelProviderID, params.ModelProviderRevision, params.ModelProviderKeyMode = b.ProviderID, b.Revision, b.KeyMode
+	params.ModelProviderKeySecretID, params.ModelProviderKeyRev = b.KeySecret, b.KeyRev
+	run, err := qtx.CreateChatContinueRun(ctx, params)
+	if err != nil {
+		return store.Run{}, err
+	}
+	if err := s.verifyRunBinding(ctx, qtx, run, res); err != nil {
+		return store.Run{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return store.Run{}, err
+	}
 	return run, nil
 }
 
@@ -755,10 +906,15 @@ func (s *Service) CreateProposal(ctx context.Context, wkr store.Worker, runID, r
 	}
 	// The target issue repo must belong to the same user (never trust a worker-
 	// supplied repo_id blindly).
-	if _, err := s.q.GetRepoForUser(ctx, store.GetRepoForUserParams{ID: repoID, UserID: wkr.UserID}); err != nil {
+	prow, err := s.q.GetRepoForUser(ctx, store.GetRepoForUserParams{ID: repoID, UserID: wkr.UserID})
+	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return store.IssueProposal{}, ErrRepoNotFound
 		}
+		return store.IssueProposal{}, err
+	}
+	// PRD 4173 D13: a proposal for a never-enabled repo could never be confirmed.
+	if err := store.RefuseNeverEnabled(prow.AwaitingFirstEnable, prow.IssueSourceLocked); err != nil {
 		return store.IssueProposal{}, err
 	}
 	count, err := s.q.CountPendingProposalsForRun(ctx, runID)
@@ -925,6 +1081,9 @@ func (s *Service) claimChatRun(ctx context.Context, wkr store.Worker, params sto
 		return store.Run{}, err
 	}
 	params.IsEphemeral = current.Ephemeral
+	// PRD #4320 module 5: the provider clause reads the claimant's stored capabilities, re-read here
+	// under the claimant row lock exactly like ClaimRun's.
+	params.WorkerProtocolCaps = current.ProtocolCapabilities
 	if current.IsolatedLane {
 		return store.Run{}, pgx.ErrNoRows
 	}

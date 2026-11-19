@@ -372,6 +372,15 @@ point at, so clearing them meant a React Router 6 → 7 major. `web/package.json
 since moved to `react-router-dom` `^7.0.0`, which removed that reason. The threshold
 itself is unchanged and is still `--audit-level=high`.
 
+Temporary npm exceptions live in `scripts/npm-audit-exceptions.tsv`, under
+[ADR-4435](../adr/4435-npm-audit-exceptions.md). Each row pins the component,
+advisory, package, range, severity ceiling, UTC recheck date and tracking issue.
+All affected lock nodes, including aliases, must remain dev-only. Expired or
+unused rows fail even on clean audits; missing evidence remains an instrument
+failure. Adding or extending a row changes security-gate policy: agents may
+prepare exact proposed rows, but only explicit maintainer approval before merge
+makes them policy. Never add or extend a row merely to clear CI.
+
 #### Temporary Mermaid KaTeX override (#2456)
 
 [Issue #2456](https://github.com/vtmocanu/uzi/issues/2456) pins Mermaid's KaTeX
@@ -645,6 +654,9 @@ scenarios are mutually exclusive by construction. Known values:
   otherwise collapse after approval. Now fixtures illustrate intended work
   from titles and role labels. Prompt tests check instructions and fences;
   live model wording remains a maintainer spot-check.
+- `providers` — `/settings?mock=providers` turns the model-providers feature on with one
+  seeded provider (PRD #4320), so the Settings Custom providers card shows its list, the allowed
+  URLs and the Test result lines. Without it the demo shows the feature off.
 - `oidc`, `oidc-degraded`, `sso-only` — the PRD #45 OIDC UX, otherwise
   unreachable in the demo (OIDC off, password on, by default).
 - `truncated-backlog` — `/judge?mock=truncated-backlog` puts the

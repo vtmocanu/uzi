@@ -237,7 +237,7 @@ For a queued sweep issue without a run ID, use the watcher's `watch-issue.sh` at
    owner acceptance outside the milestones and not ask); `awaiting_approval` past `SEQ` → the run re-planned
    (usually a lost worker resumed from the default branch): before steering the new gate with
    `uzi-watcher`, check `uzi run recovery RUN` for committed work worth landing instead; `limit_wait` / `pool_wait` / `recovery_wait` → one trail line,
-   keep polling (`limit_wait` and `pool_wait` resume on their own; a `recovery_wait` may need an owner action, so read its cause; a `data_volume_full` park is counted and exits the poller 4), except `recovery_wait` with cause
+   keep polling (`limit_wait` and `pool_wait` resume on their own, except a provider gateway `limit_wait` with a null `retry_not_before`, which waits for the owner and stops the poller (`STOP=limit_wait:provider_gateway_limit`); a `recovery_wait` may need an owner action, so read its cause; a `data_volume_full` park is counted and exits the poller 4), except `recovery_wait` with cause
    `worker_requeue_exhausted`, `retained_recovery_adoption_failed` and `retained_continuation_unwitnessed` (each regardless of retry timing),
    `worker_memory_pressure` (regardless of remaining interventions),
    `anthropic_spend_limit` (owner Resume after raising the limit, `uzi run set-token` (switchable kinds only; not chat, judge, self_improve or job), or Cancel),

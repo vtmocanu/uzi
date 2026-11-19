@@ -157,7 +157,7 @@ func (h *Handler) StartRunRework(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusConflict, "MR rework is unavailable: the trusted review bot list could not be read")
 			return
 		}
-		ch, err := h.codeHostForRepo(r.Context(), repo.ID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
+		ch, err := h.codeHostForRepo(r.Context(), repo.UserID, repo.ID, repo.IssueTrackerConnectionID, repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 		if err != nil {
 			slog.Error("mr-rework: build forge for connection", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -256,6 +256,7 @@ func (h *Handler) StartRunRework(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusConflict, "a rework is already running for this merge request")
 		case errors.Is(err, workersvc.ErrCodexPoolUnavailable):
 			httpx.JSON(w, http.StatusUnprocessableEntity, codexPoolUnavailableBody())
+		case writeProviderCreateRefusal(w, err):
 		case errors.Is(err, workersvc.ErrNoCredentialForHarness):
 			// PRD #1429 M2 (D4): the derived rework INHERITS the source run's harness explicitly; if
 			// that harness is no longer usable, creation refuses with no fallback. Surface the typed

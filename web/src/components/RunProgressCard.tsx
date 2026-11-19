@@ -164,7 +164,7 @@ export function RunProgressCard({ run, activity = null, usage, stage = null }: {
   const phaseLine = contextLine ? <div data-progress-context data-progress-phase={phase ? "" : undefined} className="mt-2 inline-flex rounded bg-raised px-2 py-1 text-xs text-muted" aria-current={phase ? "step" : undefined}>{contextLine}</div> : null;
   const trackLabel = badge ? `Plan approved; ${badge.reported ? `${badge.done} of ${badge.total} milestones reported complete` : `– of ${badge.total} reported; no milestone completion reported`}${active ? `; active milestone: ${stripUnsafeChars(milestones.find(m => m.id === active)?.title ?? active)}` : ""}` : "";
   const hasRecorded = usage && (usage.hasConfirmed || hasSideUsage(usage));
-  const cost = usage ? costDisplay(usage.hasConfirmed ? run.usage?.cost_status ?? "" : sideUsage(usage).status, usage.total.costUsd) : null;
+  const cost = usage ? costDisplay(usage.hasConfirmed ? run.usage?.cost_status ?? "" : sideUsage(usage).status, usage.total.costUsd, !!run.provider_id) : null;
   return <Card className="p-4">
     <section aria-label="Run progress" data-run-progress-card={stripUnsafeChars(p?.state ?? "history")} className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-4">
       <div data-progress-head className="flex flex-wrap items-baseline gap-3">

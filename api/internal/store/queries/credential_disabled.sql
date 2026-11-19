@@ -1,6 +1,11 @@
 -- PRD #3989 M3: the park writers take the hold reason (credential_disabled, or credentials_reset
--- for a run claimed after its owner's account reset), guarded to those two values. The promoter,
--- list, lock and settle queries below read both reasons; the two reassign queries stay on
+-- for a run claimed after its owner's account reset), guarded to those two values.
+-- PRD #4320 module 5: the same two park writers also park a PROVIDER-BOUND run whose claim was
+-- refused (hold_reason provider_destination_not_allowed or provider_binding_stale). Only the
+-- destination hold has a promoter arm (the list, lock and settle queries below read it too);
+-- provider_binding_stale is final: the run's frozen key or revision changed, so only a new run
+-- helps, and no query below reads it. The promoter, list, lock and settle queries below read
+-- both credential reasons plus the destination hold; the two reassign queries stay on
 -- credential_disabled (a credentials_reset hold has no credential to re-point).
 --
 -- Credential disablement parks an UNDELIVERED claim (status 'claimed', exact worker and
@@ -50,7 +55,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE runs.id = @id AND runs.worker_id = @worker_id
-  AND @hold_reason::text IN ('credential_disabled', 'credentials_reset')
+  AND @hold_reason::text IN ('credential_disabled', 'credentials_reset', 'provider_destination_not_allowed', 'provider_binding_stale')
   AND runs.claim_generation = @claim_generation
   AND runs.claim_released_at IS NULL
   AND runs.status = 'claimed';
@@ -135,7 +140,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE runs.id = @id AND runs.worker_id = @worker_id
-  AND @hold_reason::text IN ('credential_disabled', 'credentials_reset')
+  AND @hold_reason::text IN ('credential_disabled', 'credentials_reset', 'provider_destination_not_allowed', 'provider_binding_stale')
   AND runs.kind = 'chat'
   AND runs.status = 'claimed';
 
@@ -143,7 +148,7 @@ WHERE runs.id = @id AND runs.worker_id = @worker_id
 -- re-evaluates the current credential requirement before promoting each row.
 -- name: ListCredentialDisabledRuns :many
 SELECT id, user_id, status_since FROM runs
-WHERE user_id = @user_id AND status = 'paused' AND hold_reason IN ('credential_disabled', 'credentials_reset')
+WHERE user_id = @user_id AND status = 'paused' AND hold_reason IN ('credential_disabled', 'credentials_reset', 'provider_destination_not_allowed')
   AND (sqlc.narg('after_status_since')::timestamptz IS NULL
        OR (status_since, id) > (sqlc.narg('after_status_since')::timestamptz,
                                 sqlc.narg('after_id')::uuid))
@@ -156,7 +161,7 @@ LIMIT @page_size::int;
 WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
     WHERE runs.id = @id AND runs.user_id = @user_id
-  AND runs.status = 'paused' AND runs.hold_reason IN ('credential_disabled', 'credentials_reset')
+  AND runs.status = 'paused' AND runs.hold_reason IN ('credential_disabled', 'credentials_reset', 'provider_destination_not_allowed')
   AND runs.pause_requested_at IS NULL
   AND runs.credential_override_mode IS NOT DISTINCT FROM sqlc.narg('expected_override_mode')::text
   AND runs.credential_override_secret_id IS NOT DISTINCT FROM sqlc.narg('expected_override_secret_id')::uuid
@@ -218,7 +223,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE runs.id = @id AND runs.user_id = @user_id
-  AND runs.status = 'paused' AND runs.hold_reason IN ('credential_disabled', 'credentials_reset')
+  AND runs.status = 'paused' AND runs.hold_reason IN ('credential_disabled', 'credentials_reset', 'provider_destination_not_allowed')
   AND runs.pause_requested_at IS NULL
   -- The requirement the promoter evaluated must still be the run's requirement: a
   -- concurrent reassignment or rebind that is not serialized by the caller's locks
@@ -349,7 +354,7 @@ FOR SHARE NOWAIT;
 -- credential_disabled. The partial promoter index serves the DISTINCT scan.
 -- name: ListCredentialDisabledUsers :many
 SELECT DISTINCT user_id FROM runs
-WHERE status = 'paused' AND hold_reason IN ('credential_disabled', 'credentials_reset')
+WHERE status = 'paused' AND hold_reason IN ('credential_disabled', 'credentials_reset', 'provider_destination_not_allowed')
   AND (sqlc.narg('after_user_id')::uuid IS NULL OR user_id > sqlc.narg('after_user_id')::uuid)
 ORDER BY user_id
 LIMIT @page_size::int;
@@ -359,6 +364,10 @@ LIMIT @page_size::int;
 -- name: LockCredentialDisabledRunForPromotion :one
 SELECT id, user_id, kind, harness, status, hold_reason, pause_requested_at, pause_mode,
        credential_override_mode, credential_override_secret_id, codex_secret_id, worker_id, checkpoint_coordinates,
+       -- PRD #4320 module 5: the frozen provider binding rides the locked read, so the promoter's
+       -- provider arms decide on the run row it already locked instead of a second GetRunByID.
+       model_provider_id, model_provider_revision, model_provider_key_mode, model_provider_key_secret_id, model_provider_key_rev,
+       claim_generation,
        (runs.pause_requested_at IS NULL
         AND (runs.kind IN ('chat', 'judge') OR runs.interactive OR runs.started_at IS NULL OR
              (COALESCE(runs.budget_wall_seconds, @global_timeout_seconds::int)
@@ -368,6 +377,21 @@ SELECT id, user_id, kind, harness, status, hold_reason, pause_requested_at, paus
 FROM runs
 WHERE id = @id AND user_id = @user_id
 FOR UPDATE;
+
+-- PRD #4320 module 5: the promoter's rewrite of a provider_destination_not_allowed hold whose binding
+-- went stale while the run was parked (frozen key disabled, rotated, deleted, or the revision gone).
+-- The hold's copy ("resumes automatically when the URL is allowed") is false then, and only
+-- provider_binding_stale (a new run picks up the current key) is true. Guarded like the park writers:
+-- the exact status and hold, the claim generation the promoter read under the run lock, and a
+-- provider-bound run; status_since is untouched (it is the paused-time accounting anchor).
+-- name: RewriteProviderDestinationHoldStale :execrows
+UPDATE runs SET
+    hold_reason = 'provider_binding_stale',
+    updated_at = now()
+WHERE id = @id AND user_id = @user_id
+  AND status = 'paused' AND hold_reason = 'provider_destination_not_allowed'
+  AND claim_generation = @claim_generation
+  AND model_provider_id IS NOT NULL;
 
 -- The set-token verb's run lock (PRD #1733). SetRunCredential reads a run unlocked, validates the
 -- override, then takes the owner's secret mutation lock; this re-reads the run FOR UPDATE under
@@ -459,7 +483,7 @@ WITH settled_inputs AS (
     UPDATE run_user_inputs u SET consumed_at = COALESCE(u.consumed_at, now()), applied_at = now()
     WHERE u.run_id = @id AND u.kind = 'pause' AND u.applied_at IS NULL
       AND EXISTS (SELECT 1 FROM runs r WHERE r.id = @id AND r.user_id = @user_id
-                  AND r.status = 'paused' AND r.hold_reason IN ('credential_disabled', 'credentials_reset')
+                  AND r.status = 'paused' AND r.hold_reason IN ('credential_disabled', 'credentials_reset', 'provider_destination_not_allowed')
                   AND r.pause_requested_at IS NOT NULL)
 )
 UPDATE runs SET
@@ -472,7 +496,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE runs.id = @id AND runs.user_id = @user_id
-  AND runs.status = 'paused' AND runs.hold_reason IN ('credential_disabled', 'credentials_reset')
+  AND runs.status = 'paused' AND runs.hold_reason IN ('credential_disabled', 'credentials_reset', 'provider_destination_not_allowed')
   AND runs.pause_requested_at IS NOT NULL
   AND runs.credential_override_mode IS NOT DISTINCT FROM sqlc.narg('expected_override_mode')::text
   AND runs.credential_override_secret_id IS NOT DISTINCT FROM sqlc.narg('expected_override_secret_id')::uuid
@@ -501,7 +525,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE id = @id AND user_id = @user_id
-  AND status = 'paused' AND hold_reason IN ('credential_disabled', 'credentials_reset')
+  AND status = 'paused' AND hold_reason IN ('credential_disabled', 'credentials_reset', 'provider_destination_not_allowed')
   AND pause_requested_at IS NULL
   AND credential_override_mode IS NOT DISTINCT FROM sqlc.narg('expected_override_mode')::text
   AND credential_override_secret_id IS NOT DISTINCT FROM sqlc.narg('expected_override_secret_id')::uuid

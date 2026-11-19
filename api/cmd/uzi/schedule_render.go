@@ -146,6 +146,20 @@ var skipReasonLabels = map[string]string{ //nolint:gosec // G101: schedule skip-
 	"codex_pool_unavailable": "no pooled Codex account is available",
 	"harness_label_conflict": "issue harness label conflicts with schedule pin",
 	"harness_label_invalid":  "invalid issue harness labels",
+	// The remaining non-CI reasons, so every schedsvc skip reason renders a label (the same
+	// wording as web/src/lib/scheduleSkipReasons.ts).
+	"vault_locked":                "vault locked",
+	"self_improve_mr_cap_reached": "self-improve MR cap reached",
+	"open_mr_exists":              "issue already has an open MR",
+	"codex_override_conflict":     "Codex harness cannot use an Anthropic credential override",
+	"no_usable_credential":        "no usable credential",
+	// PRD #4320 M4: the owner's Claude source is a model provider and the fire was refused.
+	"provider_source_unusable":            "Claude provider is unusable",
+	"provider_lane_unsupported":           "this run kind does not support a Claude provider",
+	"provider_model_unmapped":             "model is not mapped by the Claude provider",
+	"provider_binding_stale":              "inherited provider key or URL changed",
+	"provider_destination_not_allowed":    "provider URL is no longer allowed",
+	"credential_override_provider_source": "credential override cannot be used with a Claude provider",
 	// PRD #2865: the ci_watch fire path.
 	"ci_green":              "CI is green",
 	"ci_already_handled":    "failure already handled",
@@ -180,6 +194,12 @@ var skipReasonHints = map[string]string{
 	"credential_disabled": "enable the credential in Settings, or change the schedule's token",
 	// Issue #3719: Codex account mode is auto and no pooled account can be bound.
 	"codex_pool_unavailable": "link, re-authenticate or pool a Codex account in Settings",
+	// PRD #4320 M4: the provider is only repaired by its owner.
+	"provider_source_unusable":            "repair the provider (key, URL, retired) or clear the Claude source in Settings",
+	"provider_model_unmapped":             "add the model to the provider's model map, or change the schedule's model",
+	"provider_binding_stale":              "start a fresh run; the source run's provider key or URL changed",
+	"provider_destination_not_allowed":    "ask the operator to allow the provider URL, or start a fresh run",
+	"credential_override_provider_source": "remove the schedule's token override, or clear the Claude source in Settings",
 }
 
 // skipReasonHint returns the remediation hint for a skip reason, or "" when none applies.

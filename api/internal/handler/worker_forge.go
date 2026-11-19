@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/forgesvc"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	"github.com/vtmocanu/uzi/api/internal/issueinput"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
@@ -98,6 +100,21 @@ func (h *Handler) resolveForgeRun(w http.ResponseWriter, r *http.Request) (worke
 	return conn, f, true
 }
 
+// workerIssueTracker is the issue side a worker route reads for the run's repo (PRD
+// #4173 DL-5): the forge driver already built for an unlinked repo, byte-identical to
+// before M4, and the owner-scoped resolver for a linked one. The worker never receives
+// an issue tracker token (S5): it only reaches the tracker through these routes. A
+// linked repo that cannot be resolved is an error, never the forge.
+func (h *Handler) workerIssueTracker(ctx context.Context, conn workersvc.ForgeConn, f forge.Forge) (forge.IssueTracker, error) {
+	if !conn.IssueTrackerConnectionID.Valid {
+		return f, nil
+	}
+	if h.svc == nil && h.forgeFactory == nil {
+		return nil, forgesvc.ErrLinkedRepoUnresolvable
+	}
+	return h.issueTrackerForRepo(ctx, conn.UserID, conn.RepoID, conn.IssueTrackerConnectionID, conn.ForgeType, conn.BaseUrl, conn.TokenCiphertext)
+}
+
 // forgeDriverError logs the (already PAT-redacted) driver error server-side and
 // answers with the fixed generic 502 — the URL the SDK embeds (host + project id)
 // must never reach the agent.
@@ -127,13 +144,18 @@ func (h *Handler) WorkerForgeGetIssue(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	ch, tr := forge.CodeHost(f), forge.IssueTracker(f)
+	ch := forge.CodeHost(f)
+	tr, err := h.workerIssueTracker(r.Context(), conn, f)
+	if err != nil {
+		h.forgeDriverError(w, err)
+		return
+	}
 	iid, err := parseInt64(chi.URLParam(r, "iid"))
 	if err != nil {
 		httpx.Error(w, http.StatusBadRequest, forgeErrInvalid)
 		return
 	}
-	assessment := issueinput.NewAssessment(r.Context(), ch, conn.ForgeProjectID)
+	assessment := issueinput.NewAssessment(r.Context(), ch, conn.ForgeProjectID, issueinput.WithIssueSide(tr))
 	defer assessment.Close()
 	own := conn.IssueIID != nil && *conn.IssueIID == iid
 	issue, err := tr.GetIssue(assessment.Context(), conn.ForgeProjectID, iid)
@@ -164,7 +186,7 @@ func (h *Handler) WorkerForgeGetIssue(w http.ResponseWriter, r *http.Request) {
 		issue.Title = conn.SavedTitle
 		issue.Description = conn.SavedBody
 	} else {
-		disposition, _ := assessment.Author(issue)
+		disposition, _ := assessment.IssueText(issue)
 		reason = issueinput.Reason(disposition)
 		if reason != "" {
 			issue.Title = issueinput.Placeholder
@@ -230,7 +252,11 @@ func (h *Handler) WorkerForgeListIssues(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
-	tr := forge.IssueTracker(f)
+	tr, err := h.workerIssueTracker(r.Context(), conn, f)
+	if err != nil {
+		h.forgeDriverError(w, err)
+		return
+	}
 	q := r.URL.Query()
 	var opts forge.ListIssuesOptions
 	switch q.Get("state") {
@@ -304,7 +330,11 @@ func (h *Handler) WorkerForgeListIssueLabelEvents(w http.ResponseWriter, r *http
 	if !ok {
 		return
 	}
-	tr := forge.IssueTracker(f)
+	tr, err := h.workerIssueTracker(r.Context(), conn, f)
+	if err != nil {
+		h.forgeDriverError(w, err)
+		return
+	}
 	iid, err := parseInt64(chi.URLParam(r, "iid"))
 	if err != nil {
 		httpx.Error(w, http.StatusBadRequest, forgeErrInvalid)

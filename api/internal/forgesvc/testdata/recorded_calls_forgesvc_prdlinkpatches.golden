@@ -1,0 +1,3 @@
+GetMergeRequest(4242, 99)
+GetIssue(4242, 7)
+UpdateIssueDescription(4242, 7, "Implements prds/done/72-x.md end to end. (edited)")

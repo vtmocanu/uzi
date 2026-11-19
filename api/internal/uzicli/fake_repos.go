@@ -55,6 +55,14 @@ func (f *FakeClient) DeleteRepo(_ context.Context, id string) error {
 	return f.Err
 }
 
+func (f *FakeClient) ListRepoEnv(_ context.Context, repoID string) (apitypes.RunEnvListDTO, error) {
+	f.LastListRepoEnvRepoID = repoID
+	if f.Err != nil {
+		return apitypes.RunEnvListDTO{}, f.Err
+	}
+	return f.RepoEnvResult, nil
+}
+
 func (f *FakeClient) GetProjectSyncStatus(_ context.Context, repoID string) (ProjectSyncStatus, error) {
 	f.LastProjectSyncStatusRepoID = repoID
 	if f.GetProjectSyncStatusErr != nil {

@@ -39,59 +39,6 @@ type ytIDRef struct {
 	ID string `json:"id"`
 }
 
-// queryTagNames gives the tag names the ListIssues query narrows by, one per
-// distinct label. Every label but the eligibility one is its own name (the
-// account-owned tag resolveTagIDs found carries exactly that name). The
-// eligibility label stands for the stored tag id, so its term uses the tag's
-// live name, read by id: the stored name may be stale after a rename in
-// YouTrack. A tag that cannot be read (gone, or no longer visible to the token)
-// is an error, so nothing is listed. A live name that labelNameProblem refuses
-// (a brace would break the query's quoting) gets no term at all: the project
-// term and the client-side id filter still select the right issues, at the cost
-// of a wider page walk.
-func (y *youTrack) queryTagNames(ctx context.Context, labels []string) ([]string, error) {
-	names := make([]string, 0, len(labels))
-	seen := make(map[string]bool, len(labels))
-	for _, l := range labels {
-		if seen[l] {
-			continue
-		}
-		seen[l] = true
-		if l != y.eligibility.Name {
-			names = append(names, l)
-			continue
-		}
-		live, err := y.eligibilityLiveName(ctx)
-		if err != nil {
-			return nil, err
-		}
-		if !labelNameProblem(live) {
-			names = append(names, live)
-		}
-	}
-	return names, nil
-}
-
-// eligibilityLiveName reads the eligibility tag by its stored id and returns
-// the name it has in YouTrack now.
-func (y *youTrack) eligibilityLiveName(ctx context.Context) (string, error) {
-	var t ytTag
-	_, _, err := y.do(ctx, ytCall{
-		method: http.MethodGet,
-		path:   []string{"tags", y.eligibility.ID},
-		query:  url.Values{"fields": {tagFields}},
-		limit:  objectBytes,
-		prov:   forge.ResponseSuccess,
-	}, &t)
-	if err != nil {
-		return "", err
-	}
-	if t.ID != y.eligibility.ID {
-		return "", y.fail("youtrack: the eligibility tag read by id came back as another tag")
-	}
-	return t.Name, nil
-}
-
 // eligibilitySharing reads the eligibility tag's read and tag sharing settings
 // as ids, plus its owner. A tag the driver creates gets the same settings, so
 // whoever can see and apply the eligibility tag can see and apply the tags the
@@ -252,21 +199,27 @@ func (y *youTrack) resolveTagIDs(ctx context.Context, names []string, create boo
 	return ids, nil
 }
 
-// ListLabels implements forge.IssueTracker. Labels are YouTrack tags, global
-// to the account; the result is every visible tag name, whoever owns the tag. A
-// name carried by several tags is listed once.
+// ListLabels implements forge.IssueTracker. The labels are the names a caller
+// can use: the stored eligibility name first, then every tag the token's own
+// account owns, each name once. A tag another user owns is left out, because
+// the driver never resolves a name to it (see resolveTagIDs). A name that
+// labelNameProblem refuses is left out too, as it is on the read side.
 func (y *youTrack) ListLabels(ctx context.Context, projectID int64) ([]forge.Label, error) {
 	if _, err := y.requireProject(projectID); err != nil {
 		return nil, err
 	}
-	tags, err := y.listTags(ctx, tagFields)
+	account, err := y.connAccount(ctx)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]forge.Label, 0, len(tags))
-	seen := make(map[string]bool, len(tags))
+	tags, err := y.listTags(ctx, ownedTagFields)
+	if err != nil {
+		return nil, err
+	}
+	out := []forge.Label{{Name: y.eligibility.Name}}
+	seen := map[string]bool{y.eligibility.Name: true}
 	for _, t := range tags {
-		if seen[t.Name] {
+		if t.ID == y.eligibility.ID || t.Owner == nil || t.Owner.ID != account.ID || seen[t.Name] || labelNameProblem(t.Name) {
 			continue
 		}
 		seen[t.Name] = true

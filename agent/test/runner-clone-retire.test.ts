@@ -265,6 +265,72 @@ describe("verified successor retirement", () => {
     await assertPredecessors(s, false);
   });
 
+  // issue #4263 M2: the verified successor's EXDEV retire writes a retirement scratch binding (class verified_successor).
+  function bindingSeams(t: import("node:test").TestContext, over: { step?: (step: string) => void; split?: boolean }): void {
+    const seam = git as unknown as { retireBindingStepSeam?: unknown; retentionDeleteSeam?: unknown };
+    const saved = { step: seam.retireBindingStepSeam, split: seam.retentionDeleteSeam };
+    if (over.step) seam.retireBindingStepSeam = over.step;
+    if (over.split !== undefined) seam.retentionDeleteSeam = { split: over.split };
+    t.after(() => { seam.retireBindingStepSeam = saved.step; seam.retentionDeleteSeam = saved.split; });
+    const rename = fsp.rename.bind(fsp);
+    t.mock.method(fsp, "rename", async (...args: Parameters<typeof fsp.rename>) => {
+      if (String(args[1]).startsWith(holdingRoot())) throw Object.assign(new Error("cross device"), { code: "EXDEV" });
+      return rename(...args);
+    });
+  }
+  const retireClassed = (s: Awaited<ReturnType<typeof seedCompleted>>) => git.retireRunnerClone(s.bare, s.expected.clonePath, s.branch, s.owner,
+    { ...s.opts, dispositionClass: "verified_successor" });
+  const retireBindings = (bare: string): string[] => {
+    try { return command(bare, "config", "--local", "--get-regexp", "^uzi-retire-scratch\\.").split("\n").filter(Boolean); } catch { return []; }
+  };
+
+  for (const fault of ["intent-write", "intent-sync"] as const) {
+    it(`verified successor ${fault} failure keeps the canonical successor, ledger and predecessors; no parent remains`, async (t) => {
+      const s = await seedCompleted();
+      bindingSeams(t, { step: step => { if (step === fault) throw new Error(`injected ${fault}`); } });
+      const journalKey = `uzi-recovery.${s.branch}.clone`;
+      const before = { ledger: s.ledger() };
+      await assert.rejects(retireClassed(s), new RegExp(`injected ${fault}`));
+      // The predecessor anchor is written before the move (and before the scratch parent exists), so the journal is the
+      // anchored form, exactly as after any later pre-move failure; it was not cleared and names the first predecessor.
+      const anchored = JSON.parse(command(s.bare, "config", "--get", journalKey)) as import("../src/git.js").RecoveryJournalEntry;
+      assert.equal(anchored.clonePath, s.expected.retainedSources![0]!.clonePath);
+      assert.deepEqual(s.ledger(), before.ledger);
+      assert.equal(fs.readFileSync(path.join(s.expected.clonePath, "predecessor.txt"), "utf8"), "successor bytes\n");
+      assert.deepEqual(fs.readdirSync(runnerRoot()).filter(n => n.startsWith(".retire-")), []);
+      for (const src of s.expected.retainedSources!)
+        assert.equal(fs.readFileSync(path.join(src.clonePath, "predecessor.txt"), "utf8"), s.bytes.get(src.clonePath));
+    });
+  }
+
+  it("verified successor on a simulated split leaves its binding at intent and the parent in place", async (t) => {
+    const s = await seedCompleted();
+    bindingSeams(t, { split: true });
+    await retireClassed(s);
+    const rows = retireBindings(s.bare);
+    assert.equal(rows.length, 1);
+    const raw = rows[0]!.slice(rows[0]!.indexOf(" ") + 1);
+    const parsed = JSON.parse(raw) as { class: string; phase: string; attemptId: string };
+    assert.deepEqual([parsed.class, parsed.phase, parsed.attemptId], ["verified_successor", "intent", s.opts.attemptId]);
+    assert.equal(fs.readdirSync(runnerRoot()).filter(n => n.startsWith(".retire-")).length, 1, "the parent is not disposed in process");
+    assert.equal(s.ledger().at(-1)!.state, "retired");
+  });
+
+  // C-prime (#4263 [7]): the verified successor's split retire never writes `settled`.
+  it("C-prime: a split verified_successor retire with a valid proof never reaches a settle step and stays intent", async (t) => {
+    const s = await seedCompleted();
+    const seen: string[] = [];
+    bindingSeams(t, { split: true, step: step => { seen.push(String(step)); } });
+    await retireClassed(s);
+    assert.ok(seen.includes("config-sync"), "the retire ran to its last binding step");
+    assert.deepEqual(seen.filter(n => n.startsWith("settle")), [], "no step whose name starts with settle");
+    const rows = retireBindings(s.bare);
+    assert.equal(rows.length, 1);
+    const parsed = JSON.parse(rows[0]!.slice(rows[0]!.indexOf(" ") + 1)) as { phase: string };
+    assert.equal(parsed.phase, "intent");
+    assert.equal(fs.readdirSync(runnerRoot()).filter(n => n.startsWith(".retire-")).length, 1, "the parent is present");
+  });
+
   for (const drift of ["journal", "ledger", "identity"] as const) {
     it(`mid-await ${drift} drift refuses verified successor before move`, async (t) => {
       const s = await seedCompleted();
@@ -2997,4 +3063,43 @@ it("normal: revocation during the quarantine rollback leaves the restored clone 
   assert.equal(fs.readFileSync(path.join(clonePath, "proof.txt"), "utf8"), "owner-only bytes\n");
   assert.equal(fs.existsSync(movedTo), false);
   assert.deepEqual(readJournal(bare, branch), journal, "journal still names the restored canonical clone");
+});
+
+// issue #4263: a PARKED flight (owner pause park, no preserveRecoveryClone) that reaches the ordinary terminal retire must be
+// classed owner_terminal_covered (a retirement scratch binding that never settles or reclaims), while a plain non-parked
+// terminal flight keeps owner_terminal.
+describe("ordinary terminal retire disposition class by park state (#4263)", () => {
+  const LINUX_ONLY = process.platform !== "linux" ? "needs the Linux-only run-quiescence / stopped-source proof" : false;
+  const quiesce = async (): Promise<QuiesceRunOutcome> => ({
+    process: { state: "quiescent", processes: [], killed: [], detail: "" },
+    docker: { state: "not_wired", removed: [], detail: "" },
+  });
+
+  for (const parked of [true, false]) {
+    it(`${parked ? "a pause-parked" : "a non-parked failed"} flight retires as ${parked ? "owner_terminal_covered" : "owner_terminal"}`, { skip: LINUX_ONLY }, async t => {
+      const iid = parked ? 4263 : 4264;
+      const claim = gitlabClaim(iid, { claim_generation: 1 });
+      const retireSpy = t.mock.method(git, "retireRunnerClone");
+      t.mock.method(client, "publishCheckpoint", async (...args: Parameters<typeof client.publishCheckpoint>) => {
+        for await (const chunk of args[2]) void chunk;
+        return { ok: true, body: { published: true, ref: "refs/uzi-checkpoints/fixture" } };
+      });
+      const runner = runnerWith(() => ({
+        homeDir: path.join(homeDir, claim.run_id),
+        executor: {
+          run: async ctx => {
+            fs.writeFileSync(path.join(ctx.worktreePath, "work.txt"), "fresh work\n");
+            if (!parked) throw new Error("terminal executor failure");
+            const pausedAt = { completedCount: 0 };
+            assert.equal(await ctx.parkForPause?.(pausedAt), true, "owner pause park accepted");
+            return { branch: ctx.branch, pausedAt };
+          },
+        },
+      }), fakeGitlab().gitlab, undefined, nullLogger(), { quiesceRun: quiesce });
+      await runner.execute(claim);
+      if (parked) assert.equal(api.states.some(s => s.body.status === "paused"), true, "the run parked");
+      assert.deepEqual(retireSpy.mock.calls.map(c => (c.arguments[4] as { dispositionClass?: string }).dispositionClass),
+        [parked ? "owner_terminal_covered" : "owner_terminal"]);
+    });
+  }
 });

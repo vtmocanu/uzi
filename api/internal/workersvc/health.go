@@ -231,6 +231,11 @@ const (
 	// NON-BYPASSABLE block: ClaimRun's standalone guard clause sits outside fn_worker_can_claim,
 	// required_capabilities and the capability-aware kill-switch, so an all-old-image fleet
 	// leaves the run queued until a worker that enforces the guard comes online.
+	// reasonNoIssueKeyCapableWorker (PRD #4173) is emitted for a queued run on a LINKED repo
+	// whose owner has no online worker self-reporting 'issue_key_v1': ClaimRun's standalone
+	// issue_key clause can never be satisfied until a worker that renders references by
+	// issue_key (and never closes #<iid>) comes online.
+	reasonNoIssueKeyCapableWorker           = "no online worker renders linked issue references (issue_key_v1); upgrade a worker"
 	reasonNoCIConfigGuardCapableWorker      = "no online worker enforces the CI-config push guard (ci_config_guard_v1); provision a capable worker"
 	reasonNoRepoAgentSourceCapableWorker    = "no regular online worker accepting new intake reads repo agents at a recorded default-branch revision (repo_agent_source_v1); upgrade a worker"
 	reasonNoAgentSourceRequestCapableWorker = "no regular online worker accepting new intake honours the run's requested agent source (agent_source_request_v1); upgrade a worker"
@@ -247,8 +252,17 @@ const (
 	// D3-fixed user-visible text. In M5A only internal test-only Codex rows exist, so this rung is
 	// reachable only for them (no public origin can create a Codex run yet). Maps to the SAME
 	// healthWaitingWorker enum (no migration — runs.health_reason is free text).
-	reasonNoCodexCapableWorker  = "no Codex-capable worker is online"
-	reasonNoCurrentCodexRuntime = "no worker with the current Codex runtime is online; waiting for the worker roll"
+	reasonNoCodexCapableWorker = "no Codex-capable worker is online"
+	// reasonNoProviderCapableWorker (PRD #4320 module 5) is emitted for a PROVIDER-BOUND queued run
+	// (runs.model_provider_key_mode set) whose owner has NO online worker advertising the
+	// 'claude_provider_v1' protocol capability. Like reasonNoCodexCapableWorker it names a
+	// NON-BYPASSABLE block: ClaimRun's dedicated provider clause sits outside fn_worker_can_claim,
+	// required_capabilities and the capability-aware kill-switch, so the run waits until a worker that
+	// supports provider claims comes online (the hosted fleet is pinned separately from the app tier,
+	// so provider runs need the next worker roll). Maps to the SAME healthWaitingWorker enum
+	// (runs.health_reason is free text).
+	reasonNoProviderCapableWorker = "no worker that supports model providers is online; waiting for a worker roll"
+	reasonNoCurrentCodexRuntime   = "no worker with the current Codex runtime is online; waiting for the worker roll"
 	// reasonNoCustomCodexCapableWorker (PRD #1551 M4, D6) is emitted for a CUSTOM-Codex-root queued
 	// run (harness='codex', not task-review/judge/chat, whose effective worker-root model is a
 	// non-curated id) whose owner has NO online worker advertising BOTH 'codex_harness_v1' AND
@@ -1551,6 +1565,20 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 			return reasonNoCIConfigGuardCapableWorker
 		}
 	}
+	// PRD #4173: a run on a LINKED repo with no online issue_key_v1 worker is unplaceable; a
+	// failed read falls through like the rungs above.
+	if r.RepoLinked && r.RepoID.Valid {
+		if q, ok := s.q.(interface {
+			IssueKeyWorkerMissingForRepo(context.Context, store.IssueKeyWorkerMissingForRepoParams) (bool, error)
+		}); ok {
+			missing, merr := q.IssueKeyWorkerMissingForRepo(ctx, store.IssueKeyWorkerMissingForRepoParams{RepoID: uuid.UUID(r.RepoID.Bytes), UserID: r.UserID})
+			if merr != nil {
+				slog.Error("health: check issue_key_v1 workers for linked repo", "run_id", r.ID, "error", merr)
+			} else if missing {
+				return reasonNoIssueKeyCapableWorker
+			}
+		}
+	}
 	sourceCapablePeerConfirmed := false
 	if r.RepoAgentSourceRequired || r.RepoAgentSourceCommit.Valid {
 		if q, ok := s.q.(interface {
@@ -1626,6 +1654,19 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 			slog.Error("health: count current Codex runtime workers", "run_id", r.ID, "error", currentErr)
 		} else if current == 0 {
 			return reasonNoCurrentCodexRuntime
+		}
+	}
+	// PRD #4320 module 5: a PROVIDER-BOUND run whose owner has NO online worker advertising
+	// claude_provider_v1 is genuinely UNPLACEABLE (ClaimRun's non-bypassable provider clause can never be
+	// satisfied). Placed right after the Codex rungs for the same reason they sit ahead of the
+	// priority-class re-label. r.ModelProviderKeyMode is the claim clause's own discriminator, so the
+	// pill and the claim can never disagree. Read errors fall through.
+	if r.ModelProviderKeyMode.Valid {
+		c, cerr := s.q.CountOnlineWorkersSatisfyingClaudeProvider(ctx, r.UserID)
+		if cerr != nil {
+			slog.Error("health: count online workers satisfying claude provider", "run_id", r.ID, "error", cerr)
+		} else if c == 0 {
+			return reasonNoProviderCapableWorker
 		}
 	}
 	// PRD #1551 M4 (D6): a CUSTOM-Codex-root run whose owner has NO online worker advertising BOTH
