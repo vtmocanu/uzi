@@ -187,7 +187,16 @@ func TestMemoryAuthorityVaultLockedLossIsStickyLiveDB(t *testing.T) {
 func TestMemoryAuthorityVaultLockedLossSurvivesUnlockUntilRegisterLiveDB(t *testing.T) {
 	p := newPoolFx(t)
 	cand, keeper := p.capableMember(6*time.Hour), p.capableMember(5*time.Hour)
-	cand.reregister() // Register shapes the worker row (pool key), so both members go through it
+	// Register shapes the worker row (pool key), so both members go through it BEFORE the scenario
+	// and the refusal below is about the keeper's loss, not about the members sitting in different
+	// pools.
+	cand.reregister()
+	keeper.reregister()
+	ck, cok := poolKey(p.poolRowOf(cand.id))
+	kk, kok := poolKey(p.poolRowOf(keeper.id))
+	if !cok || !kok || ck != kk {
+		t.Fatalf("setup: members not in one pool (cand %q %t, keeper %q %t)", ck, cok, kk, kok)
+	}
 	p.env.exec(`UPDATE workers SET snapshot_epoch = 5 WHERE id = $1`, keeper.id)
 	p.lockOwner()
 	keeper.mustIdle(11, "lost")
@@ -221,6 +230,9 @@ func TestMemoryAuthorityVaultLockedLossSurvivesUnlockUntilRegisterLiveDB(t *test
 		t.Fatalf("pass admitted %d, want 0", n)
 	}
 	keeper.reregister()
+	if k, ok := poolKey(p.poolRowOf(keeper.id)); !ok || k != ck {
+		t.Fatalf("keeper left the pool after Register: %q %t, want %q", k, ok, ck)
+	}
 	p.beatOnly(cand.id, keeper.id)
 	keeper.claim("held") // epoch 1 of the new registration
 	if _, ok := p.lostAtOf(keeper.id); ok {
