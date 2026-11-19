@@ -38,6 +38,10 @@ const (
 	// silently dropped and the matched == started + skipped invariant still balances.
 	SkipFetchFailed SkipReason = "fetch_failed"
 
+	// SkipConsumerGateBusy is recorded only after a sweep has already started work.
+	// That partial fire is consumed; before any start the busy error remains retryable.
+	SkipConsumerGateBusy SkipReason = "consumer_gate_busy"
+
 	// SkipVaultLocked ← the self_improve fire path (PRD #590 M1) when the enabling owner's
 	// vault DEK is not cached, so the autonomous run cannot spend the owner's token this
 	// cycle. Benign: the schedule advances normally (the cadence re-fires on schedule once
@@ -173,6 +177,7 @@ var AllSkipReasons = []SkipReason{
 	SkipAlreadyRunning,
 	SkipDescriptionTooLarge,
 	SkipFetchFailed,
+	SkipConsumerGateBusy,
 	SkipVaultLocked,
 	SkipSelfImproveMRCapReached,
 	SkipOpenMRExists,

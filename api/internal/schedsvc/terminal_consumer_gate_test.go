@@ -13,7 +13,7 @@ import (
 
 // TestTickOnceTerminalConsumerGateBusyIsNotConsumed pins issue #4488: a brief terminal-ref
 // retirement hold on the repo's consumer gate refuses a scheduled create with
-// ErrTerminalConsumerGateBusy (nothing created). A one-time schedule must stay un-advanced and
+// ErrTerminalConsumerGateBusy (nothing created). Before any start, a one-time schedule stays un-advanced and
 // un-parked on every scheduled create path, then fire normally once the gate frees. For the
 // sweep the busy refusal must not be recorded as a consumed fetch_failed skip.
 func TestTickOnceTerminalConsumerGateBusyIsNotConsumed(t *testing.T) {
@@ -67,8 +67,8 @@ func TestTickOnceTerminalConsumerGateBusyIsNotConsumed(t *testing.T) {
 	}
 }
 
-// A sweep's busy refusal is never mapped to a skip reason: skipReasonForErr stays unchanged so no
-// caller can turn contention into a consumed skip.
+// The global refusal map stays unchanged: a sweep may record the visible partial-fire
+// exception only at its own site, while a fire with no starts remains retryable.
 func TestSkipReasonForErrDoesNotMapTerminalConsumerGate(t *testing.T) {
 	for _, err := range []error{workersvc.ErrTerminalConsumerGateBusy, workersvc.ErrTerminalConsumerGateIdentity} {
 		if r, ok := skipReasonForErr(err); ok {

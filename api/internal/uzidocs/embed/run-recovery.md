@@ -3615,8 +3615,16 @@ Once retirement is on, you may see:
   pollers and issue schedules treat it the same way: the trigger is not used up
   and is tried again on the next pass. A sweep schedule that has started no run
   in that fire is retried the same way; one that already started runs stops,
-  records the remaining issue as skipped and advances (a one-time sweep is then
-  done, and a recurring one picks the issue up at its next fire).
+  records the busy issue with the visible `consumer_gate_busy` reason
+  ("repository busy") and advances. A one-time sweep is then done; start the
+  skipped issue manually or explicitly re-fire the sweep as a new fire. A
+  recurring sweep considers it at its next fire. Later candidates were not
+  attempted. Resuming partial progress without replay or exceeding the original
+  cap needs the durable per-fire progress design deferred to
+  [#4512](https://github.com/vtmocanu/uzi/issues/4512).
+  The final outcome gets a bounded write after a canceled wait, but advancement
+  is separate from run creation: a crash or failed advance can still leave the
+  schedule due and replay work.
 - **`retire kept: consumer_gate_busy`** on a terminal-preservation record: a
   run start was in progress, so retirement kept the ref and tries again later.
 - **A potentially longer worker report.** Each shared-gate acquisition has a
