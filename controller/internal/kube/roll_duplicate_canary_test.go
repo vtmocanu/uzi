@@ -27,9 +27,11 @@ import (
 // Non-vacuity: the cases pin the in-place rewrite itself. In the first case, with the
 // retarget arm disabled, the pin-cancellation arm cancels and re-admits w1 (its canary
 // bit and Nonce change) and cancels w2/w3, so the w1 and participant assertions fail.
-// In the second case w1 has no Deployment, and the retained-pin replacement arm would
-// write an identical mirror marker; that arm marks the pin changed and holds the pool,
-// so the tick-1 pacing-reason assertion (and the w2/w3 in-place checks) fail instead.
+// In the second case, with the retarget arm fully disabled, w2/w3 are pin-cancelled and
+// the pool is held (no reservation proof), so the tick-1 w1 pacing-state check fails
+// (the w2/w3 in-place checks would too). With only its dep-less path disabled, w1 takes
+// the retained-pin replacement arm, which writes an identical mirror marker but holds
+// the pool, so the tick-1 pacing assertion (w1 not held, no pin-changed reason) fails.
 
 // canaryHolders lists every Deployment and data-PVC mirror whose decoded roll marker
 // has Canary=true, as "kind/name".
@@ -192,6 +194,9 @@ func TestRetargetedNonCurrentCanaryNeverYieldsSecondCanary(t *testing.T) {
 			if _, _, reason, _ := o.pacing(id); reason == "roll target pin changed; pool held until reservations settle" {
 				t.Fatalf("tick 1: %s held by the retained-pin replacement arm, not the mapping retarget", id)
 			}
+		}
+		if state, _, reason, _ := o.pacing("w1"); state == "held" {
+			t.Fatalf("tick 1: w1 held (%q); the mapping retarget does not hold the pool", reason)
 		}
 		o.assertParticipantRetargeted(t, "tick 1", "w2", newVersion)
 		o.assertParticipantRetargeted(t, "tick 1", "w3", newVersion)
