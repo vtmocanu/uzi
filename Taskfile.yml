@@ -3582,6 +3582,14 @@ tasks:
             ../e2e/codex-m3b/run-lifecycle.sh
         done
 
+  test:codex-provider-spike:
+    desc: Offline pinned-runtime custom Responses provider characterization (standalone only)
+    dir: agent
+    cmds:
+      - ./node_modules/.bin/tsc --noEmit -p ../e2e/codex-provider-spike/tsconfig.json
+      - env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null node --import tsx --test --test-concurrency=1 --test-timeout=120000 ../e2e/codex-provider-spike/*.test.ts
+      - env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null node --import tsx ../e2e/codex-provider-spike/runner.ts
+
   test:codex-m4:
     desc: PRD 1287 C5 - strict Codex/Claude M4 conformance gate (claude/U + codex/U + codex/P)
     # The M4 conformance subsystem (e2e/codex-m4): the machine-readable clause registry, the strict

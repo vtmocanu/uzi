@@ -1,0 +1,9 @@
+{
+  "compilerOptions": {
+    "target": "ES2022", "module": "NodeNext", "moduleResolution": "NodeNext",
+    "lib": ["ES2024"], "typeRoots": ["../../agent/node_modules/@types"],
+    "types": ["node"], "strict": true, "noEmit": true, "skipLibCheck": true,
+    "esModuleInterop": true
+  },
+  "include": ["*.ts", "../codex-m4/harness-m0.d.ts"]
+}
