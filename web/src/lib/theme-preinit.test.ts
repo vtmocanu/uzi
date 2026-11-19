@@ -115,8 +115,6 @@ describe("theme-preinit.js pre-paint stamp (PRD #1167 m5)", () => {
     }
   });
 
-  // The legacy uzi.theme migration lookup is guarded the same way: a prototype
-  // member there does not migrate as a dark id.
   it("stamps data-motion=on only for a cached strict boolean true", () => {
     const attrs = run({ storage: { "uzi.appearance": appearance({ sidebarMotion: true }) }, osDark: false });
     expect(attrs["data-motion"]).toBe("on");
@@ -135,6 +133,8 @@ describe("theme-preinit.js pre-paint stamp (PRD #1167 m5)", () => {
     expect(broken["data-motion"]).toBe("off");
   });
 
+  // The legacy uzi.theme migration lookup is guarded the same way: a prototype
+  // member there does not migrate as a dark id.
   it("ignores a prototype-chain id in the stale uzi.theme migration", () => {
     const attrs = run({ storage: { "uzi.theme": "toString" }, osDark: false });
     expect(attrs["data-theme"]).toBe("hall"); // no-cache OS-light default, not "toString"

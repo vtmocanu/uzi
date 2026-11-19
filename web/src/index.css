@@ -528,6 +528,9 @@ html[data-pinned-block] {
 @media (prefers-reduced-motion: no-preference) {
   @keyframes nm-hide { from, to { opacity: 0; } }
   @keyframes nm-show { from, to { opacity: 1; } }
+  /* Inline svgs keep the UA overflow:hidden; parts that travel past the 24px box (chat pop,
+     findings legs, docs ribbon) must not clip at their peak. */
+  :root[data-motion="on"] svg[data-nav-motion].nm-play { overflow: visible; }
   :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="overview"] { --nm-d: 1100ms; }
   :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="repos"] { --nm-d: 830ms; }
   :root[data-motion="on"] svg[data-nav-motion].nm-play[data-nav-motion="runs"] { --nm-d: 1700ms; }

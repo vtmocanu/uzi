@@ -168,7 +168,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   // (PRD #1167): the server sends the resolved appearance, but a server that
   // predates the field is handled defensively by synthesising a minimal one from
   // the deprecated single-theme trio so the app still paints. applyAppearance
-  // stamps data-theme/data-font and arms the live system-mode listener.
+  // stamps data-theme/data-font/data-motion and arms the live system-mode listener.
   const applySession = useCallback((session: SessionResponse) => {
     currentUserID.current = session.user?.id ?? null;
     setUser(session.user);

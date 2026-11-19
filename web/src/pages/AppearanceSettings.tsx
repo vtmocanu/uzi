@@ -430,6 +430,7 @@ export function AppearanceSettings() {
             onChange={pickMotion}
             label="Sidebar icon animations"
             disabled={appearanceBusy}
+            focusableWhenDisabled
             aria-describedby="sidebar-motion-desc"
           />
         </div>

@@ -390,15 +390,67 @@ describe("AppearanceSettings — sidebar icon animations toggle", () => {
     expect(motionSwitch().getAttribute("aria-checked")).toBe("false");
   });
 
-  it("renders off and stays off for an explicit false", () => {
+  it("renders off and stays off for an explicit false over an on instance default", () => {
     mockAuth(
       baseUser,
       baseAppearance({
+        sidebar_motion: false,
         overrides: { mode: null, light_theme: null, dark_theme: null, typeface: null, sidebar_motion: false },
+        defaults: { mode: "dark", light_theme: "hall", dark_theme: "ember", typeface: "system", sidebar_motion: true },
       }),
     );
     renderPage();
     expect(motionSwitch().getAttribute("aria-checked")).toBe("false");
+  });
+
+  it("renders on when the resolved appearance has sidebar_motion true", () => {
+    mockAuth(baseUser, baseAppearance({ sidebar_motion: true }));
+    renderPage();
+    expect(motionSwitch().getAttribute("aria-checked")).toBe("true");
+  });
+
+  it("keeps data-motion on while a mode or typeface save is pending when motion is on", async () => {
+    mockAuth(baseUser, baseAppearance({ sidebar_motion: true }));
+    mockApi.putMySettings.mockReturnValue(new Promise(() => {}));
+    renderPage();
+    fireEvent.click(
+      within(screen.getByRole("radiogroup", { name: "Appearance mode" })).getByRole("radio", {
+        name: "Lights on",
+      }),
+    );
+    expect(document.documentElement.dataset.motion).toBe("on");
+    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({ appearance_mode: "light" }));
+    cleanup();
+    document.documentElement.removeAttribute("data-motion");
+    mockAuth(baseUser, baseAppearance({ sidebar_motion: true }));
+    renderPage();
+    fireEvent.click(
+      within(screen.getByRole("radiogroup", { name: "Typeface" })).getByRole("radio", {
+        name: "IBM Plex",
+      }),
+    );
+    expect(document.documentElement.dataset.motion).toBe("on");
+    expect(document.documentElement.dataset.font).toBe("plex");
+  });
+
+  it("keeps the switch focusable (aria-disabled, not disabled) while its own save is pending", async () => {
+    let release!: (v: { settings: never }) => void;
+    mockApi.putMySettings.mockReturnValueOnce(
+      new Promise((resolve) => {
+        release = resolve as typeof release;
+      }),
+    );
+    renderPage();
+    motionSwitch().focus();
+    fireEvent.click(motionSwitch());
+    expect(motionSwitch().getAttribute("aria-disabled")).toBe("true");
+    expect((motionSwitch() as HTMLButtonElement).disabled).toBe(false);
+    expect(document.activeElement).toBe(motionSwitch());
+    await act(async () => {
+      release({ settings: {} as never });
+    });
+    await waitFor(() => expect(motionSwitch().getAttribute("aria-disabled")).toBeNull());
+    expect(document.activeElement).toBe(motionSwitch());
   });
 
   it("flips on and stamps data-motion before the PUT resolves, then sends sidebar_motion:true", async () => {
@@ -428,9 +480,12 @@ describe("AppearanceSettings — sidebar icon animations toggle", () => {
     });
     renderPage();
     fireEvent.click(motionSwitch());
+    // Optimistic stamp lands before the failed PUT settles.
+    expect(document.documentElement.dataset.motion).toBe("on");
     await waitFor(() => expect(screen.getByText(/boom/)).toBeTruthy());
     await waitFor(() => expect(motionSwitch().getAttribute("aria-checked")).toBe("false"));
-    expect(document.documentElement.dataset.motion).toBe("off");
     expect(refresh).toHaveBeenCalled();
+    // The failure path re-syncs from the server (the mock's refresh writes "off").
+    expect(document.documentElement.dataset.motion).toBe("off");
   });
 });
