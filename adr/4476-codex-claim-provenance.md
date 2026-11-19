@@ -37,6 +37,14 @@ Consequences:
 - A Codex run whose last worker is gone (row deleted, offline for good) stays
   `queued` until the owner cancels it (`uzi run cancel <id>`). Nothing releases it
   automatically.
+- **Custody stays with the held run.** Custody holds opened by earlier claims
+  (PRD #1296) stay open while the run is held, and they keep counting toward the
+  owner's custody-admission limit (`fn_custody_admission_count`). Cancelling the run
+  does not release them: the cancel statements do not touch
+  `recovery_custody_holds`. Release still comes from the existing custody-release
+  reconciler or an explicit discard. Until then, deleting a worker that is the live
+  holder of such a hold is refused (`CountOpenCustodyHoldsForWorker`), even after the
+  run is cancelled. Waiting or cancelling settles the run, not its custody cleanup.
 - A held **judge** run has no queued expiry, and the one-active-judge index blocks
   later judges of the same target while it exists. This change adds no new terminal
   state for it (per the issue); the owner cancels it or waits for the worker.
