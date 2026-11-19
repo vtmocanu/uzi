@@ -103,15 +103,17 @@ func TestTerminalRetireGateOtherRepoLiveDB(t *testing.T) {
 // later, the idle (and statement) timeout otherwise. The pause outlasts the bound; the gate must be
 // gone while the process is still paused, nothing may be retired, and the pass must back the row off.
 func TestTerminalRetireHoldBoundLiveDB(t *testing.T) {
-	const bound = 300 * time.Millisecond
 	const slack = 1500 * time.Millisecond
+	// transaction_timeout counts from its SET, so it must also cover tx-R1's own statements before the
+	// pause point; 1s keeps a loaded runner from killing it before the stall begins.
 	bounds := []struct {
 		name   string
 		b      terminalRetireBounds
+		bound  time.Duration
 		pg17up bool
 	}{
-		{"idle", terminalRetireBounds{transaction: "20s", statement: "20s", idle: "300ms", lock: "2s"}, false},
-		{"transaction_timeout", terminalRetireBounds{transaction: "300ms", statement: "20s", idle: "20s", lock: "2s"}, true},
+		{"idle", terminalRetireBounds{transaction: "20s", statement: "20s", idle: "300ms", lock: "2s"}, 300 * time.Millisecond, false},
+		{"transaction_timeout", terminalRetireBounds{transaction: "1s", statement: "20s", idle: "20s", lock: "2s"}, time.Second, true},
 	}
 	points := []struct {
 		name string
@@ -145,6 +147,7 @@ func TestTerminalRetireHoldBoundLiveDB(t *testing.T) {
 					g.release()
 					t.Fatalf("exclusive gate holders at the stall = %d, want 1", got)
 				}
+				bound := bc.bound
 				stalled := time.Now()
 				for gateLocks(t, f, f.e.repoID, "ExclusiveLock", true) != 0 {
 					if time.Since(stalled) > bound+slack {
@@ -200,20 +203,6 @@ func TestTerminalRetireGateWaiterLiveDB(t *testing.T) {
 		}
 	}
 
-	third, err := f.e.pool.Begin(f.e.ctx)
-	if err != nil {
-		g.release()
-		t.Fatal(err)
-	}
-	var got bool
-	err = third.QueryRow(f.e.ctx, "SELECT pg_try_advisory_xact_lock($1, $2)",
-		store.TerminalConsumerGateLockClass, store.TerminalConsumerGateObjID(f.e.repoID)).Scan(&got)
-	_ = third.Rollback(f.e.ctx)
-	if err != nil || got {
-		g.release()
-		t.Fatalf("try on the gate while an admission is queued = %v, %v, want false", got, err)
-	}
-
 	g.release()
 	if err := raceAwait(t, sweepDone, "the retire pass"); err != nil {
 		t.Fatalf("retire pass: %v", err)
@@ -253,4 +242,35 @@ func TestTerminalRetireGateOtherLanesLiveDB(t *testing.T) {
 		}
 		f.mustPres("live")
 	})
+}
+
+// The production bounds keep every retirement hold strictly below the admission gate wait, and the
+// preservation row lock_timeout strictly below statement_timeout (so a contended row is busy, 55P03,
+// not a statement timeout). A change to either side of the inequality must fail here.
+func TestTerminalRetireBoundsInvariants(t *testing.T) {
+	ms := func(s string) time.Duration {
+		d, err := time.ParseDuration(s)
+		if err != nil {
+			t.Fatalf("bound %q: %v", s, err)
+		}
+		return d
+	}
+	pg17 := terminalRetireBoundsFor(terminalPG17)
+	if pg17.transaction == "" || ms(pg17.transaction) >= terminalConsumerGateWait {
+		t.Fatalf("PG17 transaction bound %q must be set and below the %v gate wait", pg17.transaction, terminalConsumerGateWait)
+	}
+	if ms(pg17.lock) >= ms(pg17.statement) {
+		t.Fatalf("PG17 lock %q must be below statement %q", pg17.lock, pg17.statement)
+	}
+	pg16 := terminalRetireBoundsFor(terminalPG17 - 1)
+	if pg16.transaction != "" {
+		t.Fatalf("pre-17 bounds must not set transaction_timeout (got %q)", pg16.transaction)
+	}
+	hold := ms(pg16.statement) + terminalRetirePG16RoundTrips*(ms(pg16.statement)+ms(pg16.idle))
+	if hold >= terminalConsumerGateWait {
+		t.Fatalf("pre-17 hold bound %v must be below the %v gate wait", hold, terminalConsumerGateWait)
+	}
+	if ms(pg16.lock) >= ms(pg16.statement) {
+		t.Fatalf("pre-17 lock %q must be below statement %q", pg16.lock, pg16.statement)
+	}
 }

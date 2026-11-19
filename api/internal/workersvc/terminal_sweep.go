@@ -328,17 +328,39 @@ var (
 	// PostgreSQL 17+: transaction_timeout caps the whole transaction (and so the gate hold) at 4s.
 	// statement and idle bound the single stalled step more tightly than that.
 	terminalRetireBoundsPG17 = terminalRetireBounds{transaction: "4s", statement: "2500ms", idle: "2s", lock: terminalSweepLockTimeout}
-	// Earlier versions (the chart pins 16) have no transaction_timeout, so the hold is bounded by the sum
-	// of the per-statement and idle limits over the statements tx-R1 sends after the gate. The longest
-	// path sends 8: the run lock, SET LOCAL lock_timeout, the preservation row lock, the run read, the
-	// blocker read, the cross-run consumer read, then the retiring write (or the keep's schedule write),
-	// and COMMIT. Each can wait at most statement (250ms) running plus idle (250ms) between statements,
-	// so the hold is at most 8 x (250ms + 250ms) = 4s. The preservation row lock waits at most lock.
-	terminalRetireBoundsPG16 = terminalRetireBounds{statement: "250ms", idle: "250ms", lock: "250ms"}
+	// Earlier versions (the chart pins 16) have no transaction_timeout, so the hold is bounded by the
+	// per-round-trip statement and idle limits over the round trips tx-R1 makes after the gate. The
+	// longest path sends 8 statements: the run lock, SET LOCAL lock_timeout, the preservation row lock,
+	// the run read, the blocker read, the cross-run consumer read, the retiring write (or the keep's
+	// schedule write), and COMMIT. The pool's default statement-cache mode may send a separate Prepare
+	// round trip for each of the 6 parameterised queries on a cold connection, so up to 14 round trips
+	// follow the gate statement, each waiting at most statement (150ms) on the server plus idle (150ms)
+	// for the client. With the gate statement's own tail the hold is at most
+	// 150ms + 14 x (150ms + 150ms) = 4.35s, below terminalConsumerGateWait (asserted by
+	// TestTerminalRetireBoundsInvariants). lock stays strictly below statement, so a contended
+	// preservation row surfaces as lock_not_available (busy), not as a statement timeout.
+	terminalRetireBoundsPG16 = terminalRetireBounds{statement: "150ms", idle: "150ms", lock: "120ms"}
 )
 
 // terminalPG17 is the first server_version_num with transaction_timeout.
 const terminalPG17 = 170000
+
+// terminalRetireBoundsFor selects tx-R1's hold bounds for a server_version_num.
+func terminalRetireBoundsFor(version int) terminalRetireBounds {
+	if version >= terminalPG17 {
+		return terminalRetireBoundsPG17
+	}
+	return terminalRetireBoundsPG16
+}
+
+// terminalRetirePG16RoundTrips is the most round trips tx-R1 makes after the gate statement on a
+// server without transaction_timeout (see terminalRetireBoundsPG16).
+const terminalRetirePG16RoundTrips = 14
+
+// terminalConsumerGateWait bounds how long an admission waits for the shared consumer gate
+// (store.LockTerminalConsumerGateShared). Every retirement hold bound must stay strictly below it, so
+// plain contention with a retirement can never time an admission out.
+const terminalConsumerGateWait = 6 * time.Second
 
 // terminalRetireGateBusyRecheck is when a row whose gate try failed is looked at again: an admission
 // holds the gate for moments, and a retry re-observes the forge, so a short delay would only spend
@@ -363,10 +385,7 @@ func (s *Service) terminalLockRunForRetire(ctx context.Context, row store.RunTer
 	if err = tt.tx.QueryRow(ctx, "SELECT current_setting('server_version_num')::int").Scan(&version); err != nil {
 		return fail(fmt.Errorf("terminal sweep: server version: %w", err))
 	}
-	bounds := terminalRetireBoundsPG16
-	if version >= terminalPG17 {
-		bounds = terminalRetireBoundsPG17
-	}
+	bounds := terminalRetireBoundsFor(version)
 	if o := s.terminal.retireBounds; o != nil {
 		bounds = *o
 	}

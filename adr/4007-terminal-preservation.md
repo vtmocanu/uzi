@@ -168,12 +168,18 @@ repository UUID, `store.TerminalConsumerGateObjID`).
   stalled or killed tx-R1 can only be freed by the server. On PostgreSQL 17 and
   later tx-R1 sets `transaction_timeout = 4s` (with `statement_timeout = 2500ms`
   and `idle_in_transaction_session_timeout = 2s`). Earlier versions (the chart
-  pins 16) have no `transaction_timeout`: they set `statement_timeout = 250ms`
-  and `idle_in_transaction_session_timeout = 250ms`, and the preservation row
-  `lock_timeout` drops to 250ms; over the at most 8 statements tx-R1 sends
-  after the gate that sums to at most 8 x (250ms + 250ms) = 4s. Invariant: the
+  pins 16) have no `transaction_timeout`: they set `statement_timeout = 150ms`
+  and `idle_in_transaction_session_timeout = 150ms`, and the preservation row
+  `lock_timeout` drops to 120ms (below the statement timeout, so contention
+  stays busy). tx-R1 makes at most 14 round trips after the gate (8 statements,
+  6 of them parameterised and possibly preceded by a Prepare on a cold
+  connection), so the hold is at most 150ms + 14 x (150ms + 150ms) = 4.35s.
+  Invariant (asserted by a unit test over the production values): the
   hold bound must stay strictly below the admissions' 6s gate wait, so a stalled
-  retirement can never time out a healthy admission.
+  retirement can never time out a healthy admission. Enabling retirement on
+  PostgreSQL 16 also needs the protection query to fit those per-statement
+  limits at real volume (indexes such as `cross_checks(checker_run_id)` and
+  `runs(resume_of_run_id)`, part of the slice C/D protection-query work).
 - **Why not a source-row lock.** A row lock on the target deadlocked against an
   FK cascade in #3257 (`api/internal/store/queries/judge.sql`, the
   `LockRunForJudge` note); the gate is an advisory lock no cascade takes.
