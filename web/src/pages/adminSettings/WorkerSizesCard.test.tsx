@@ -605,6 +605,81 @@ describe("WorkerSizesCard", () => {
     );
   });
 
+  // #4516: a removal refusal belongs to the failed attempt only; another action or a
+  // re-read of the list clears it.
+  const inUse = () => new ApiError(409, "size is in use: 1 worker(s) still use it", { error: "", reason: "in_use", used_by: { workers: 1, settings: [] } });
+  const refuseXs = async () => {
+    mockApi.deleteAdminWorkerSize.mockRejectedValueOnce(inUse());
+    fireEvent.click(screen.getByRole("button", { name: "Remove size XS" }));
+    fireEvent.click(screen.getByRole("button", { name: "Remove" }));
+    await waitFor(() =>
+      expect(within(rowOf("XS")).getByRole("alert").textContent).toBe("XS is still in use, so it was not removed. Still used by 1 worker."),
+    );
+  };
+  const noXsAlert = () => expect(within(rowOf("XS")).queryByRole("alert")).toBeNull();
+
+  it("keeps a removal refusal in its row until another action starts", async () => {
+    renderCard(withAdded("xs", "xl"));
+    await refuseXs();
+    // Still shown while nothing else happens; never in another row.
+    expect(within(rowOf("XL")).queryByRole("alert")).toBeNull();
+    expect(screen.getAllByRole("alert")).toHaveLength(1);
+  });
+
+  it("clears a removal refusal when Add size starts, and the new size's success stands alone", async () => {
+    mockApi.createAdminWorkerSize.mockResolvedValue({ size: added("tiny", 1), warnings: [], advisories: [] });
+    render(<Harness first={withAdded("xs")} next={withAdded("xs", "tiny")} />);
+    await refuseXs();
+    fireEvent.click(screen.getByRole("button", { name: "Add size" }));
+    // Cleared by starting the add, before anything is submitted or re-read.
+    noXsAlert();
+    fireEvent.change(input("New size name"), { target: { value: "tiny" } });
+    fireEvent.change(input("New size CPU request (cores)"), { target: { value: "0.25" } });
+    fireEvent.change(input("New size CPU limit (cores)"), { target: { value: "1" } });
+    fireEvent.change(input("New size Memory request (GiB)"), { target: { value: "1" } });
+    fireEvent.change(input("New size Memory limit (GiB)"), { target: { value: "2" } });
+    fireEvent.change(input("New size Data disk (GiB)"), { target: { value: "5" } });
+    fireEvent.change(input("New size DinD data disk (GiB)"), { target: { value: "10" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add size TINY" }));
+    expect(await screen.findByText("Size TINY added.")).toBeTruthy();
+    noXsAlert();
+    expect(screen.queryByText(/still in use/)).toBeNull();
+  });
+
+  it("clears a removal refusal when a re-read of the list arrives", async () => {
+    const view = render(
+      <MemoryRouter>
+        <WorkerSizesCard data={withAdded("xs")} loadError="" onChanged={vi.fn().mockResolvedValue(undefined)} />
+      </MemoryRouter>,
+    );
+    await refuseXs();
+    // A fresh list from a re-read (the list carries no usage, so equal content stands in
+    // for usage that changed elsewhere): the old explanation may no longer be current.
+    view.rerender(
+      <MemoryRouter>
+        <WorkerSizesCard
+          data={{ ...withAdded("xs"), advisories: [] }}
+          loadError=""
+          onChanged={vi.fn().mockResolvedValue(undefined)}
+        />
+      </MemoryRouter>,
+    );
+    noXsAlert();
+    expect(rowOf("XS")).toBeTruthy();
+  });
+
+  it("clears a removal refusal when another row's Remove or Edit starts", async () => {
+    renderCard(withAdded("xs", "xl"));
+    await refuseXs();
+    fireEvent.click(screen.getByRole("button", { name: "Remove size XL" }));
+    noXsAlert();
+    fireEvent.click(screen.getByRole("button", { name: "Keep" }));
+
+    await refuseXs();
+    fireEvent.click(screen.getByRole("button", { name: "Edit size L" }));
+    noXsAlert();
+  });
+
   it("a 404 on remove says the size was already removed and moves focus to that message", async () => {
     mockApi.deleteAdminWorkerSize.mockRejectedValue(new ApiError(404, "size not found", { error: "size not found" }));
     renderCard(withAdded("xs"));

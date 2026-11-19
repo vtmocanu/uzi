@@ -298,7 +298,11 @@ export function WorkerSizesCard({
   data: AdminWorkerSizes | null;
   /** The last read's error, "" when it succeeded. */
   loadError: string;
-  /** Re-read the list and lift it to the page; called after every successful write, on a 409 and by Retry. */
+  /**
+   * Re-read the list and lift it to the page; called after every successful write, on a
+   * read-only or max_sizes 409, on a 404 removal and by Retry. A removal refused as in use
+   * or builtin does not re-read.
+   */
   onChanged: () => Promise<void>;
 }) {
   const [editing, setEditing] = useState<string | null>(null);
@@ -320,15 +324,17 @@ export function WorkerSizesCard({
   const [conflict, setConflict] = useState<{ reason: string; against: AdminWorkerSizes | null } | null>(null);
   const conflictReason = conflict && conflict.against === data ? conflict.reason : null;
 
-  // Focus management: Edit focuses the form's first input; Save, Cancel, Escape, Reset and
-  // Keep hand focus back to that row's Edit button (looked up by size name, since the
-  // button re-mounts after the form closes or the list is re-read).
+  // Focus management: Edit focuses the form's first input; Save, Cancel, Escape, a Reset
+  // (confirmed or kept) and a refused removal hand focus back to that row's Edit button;
+  // Keep or Escape on a removal returns to that row's Remove button (both looked up by
+  // size name, since the buttons re-mount after the form closes or the list is re-read).
   const editButtons = useRef(new Map<string, HTMLButtonElement>());
   const firstInput = useRef<HTMLInputElement>(null);
   const confirmButton = useRef<HTMLButtonElement>(null);
   // Set alongside the state change that renders the target; focused once it is mounted.
-  // Add opens onto the name input and returns to the Add button; a removal lands on its
-  // success message, since the row it came from is gone.
+  // Add opens onto the name input, Cancel or Escape returns to the Add button, and a
+  // successful Add lands on the new row's Edit; a removal lands on its success message,
+  // since the row it came from is gone.
   const readOnlyBanner = useRef<HTMLDivElement>(null);
   const addButton = useRef<HTMLButtonElement>(null);
   const addNameInput = useRef<HTMLInputElement>(null);
@@ -336,8 +342,15 @@ export function WorkerSizesCard({
   const errorRegion = useRef<HTMLDivElement>(null);
   const capNote = useRef<HTMLParagraphElement>(null);
   const removeButtons = useRef(new Map<string, HTMLButtonElement>());
-  // A refused removal, shown inline under that row's actions (and nowhere else).
+  // A refused removal, shown inline under that row's actions (and nowhere else). It lasts
+  // until another Add, Edit, Remove or Reset starts, or until the next re-read of the list
+  // arrives: a new list may no longer be what the refusal explained.
   const [rowRefusal, setRowRefusal] = useState<{ name: string; message: string } | null>(null);
+  const [refusalData, setRefusalData] = useState(data);
+  if (data !== refusalData) {
+    setRefusalData(data);
+    setRowRefusal(null);
+  }
   // "field": `name` is the id of the first invalid input; "cap": the 16-of-16 note.
   type FocusKind = "edit" | "form" | "confirm" | "banner" | "add" | "addForm" | "result" | "error" | "cap" | "field" | "remove";
   const focusTarget = useRef<{ kind: FocusKind; name: string } | null>(null);
@@ -424,6 +437,7 @@ export function WorkerSizesCard({
   const startAdd = () => {
     if (locked || atCap) return;
     closeEdit();
+    setRowRefusal(null);
     setAdding(true);
     setAddName("");
     setAddDraft(EMPTY_DRAFT);
@@ -455,8 +469,9 @@ export function WorkerSizesCard({
   const handleWriteError = (err: unknown, fallback: string, mapFields: boolean) => {
     if (err instanceof ApiError && err.status === 409 && (err.body as { reason?: string } | null)?.reason === "max_sizes") {
       // Another admin filled the table meanwhile; the re-read hides Add. Close the form so it
-      // does not linger (and resurface after a later Remove), and park focus on the cap note
-      // (the error message until the note exists).
+      // does not linger (and resurface after a later Remove), and park focus on the cap note,
+      // which renders as soon as the form closes. The error message takes focus only when
+      // the note is not rendered (the card went read-only meanwhile).
       closeAdd();
       setError(`At most ${maxSizes} sizes. Remove an added size to add another.`);
       setFocusTarget({ kind: "cap", name: "" });
@@ -516,7 +531,8 @@ export function WorkerSizesCard({
     setConfirming({ name: row.name, action });
     setFocusTarget({ kind: "confirm", name: row.name });
   };
-  // Keep / Escape: back to the button that opened the confirmation.
+  // Keep / Escape: a removal goes back to the Remove button that opened it; a reset goes
+  // to that row's Edit button, as a confirmed reset does.
   const keepRow = (name: string, action: "reset" | "remove") => {
     setConfirming(null);
     setFocusTarget({ kind: action === "remove" ? "remove" : "edit", name });
