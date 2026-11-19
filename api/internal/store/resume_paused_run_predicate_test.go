@@ -13,7 +13,7 @@ import (
 func TestResumePausedRunFreshExceptionPredicateAtBothSites(t *testing.T) {
 	const predicate = "AND NOT (runs.hold_reason IS NOT DISTINCT FROM 'codex_policy_hold' " +
 		"OR (runs.policy_pending_fresh " +
-		"AND NOT (runs.hold_reason IS NOT DISTINCT FROM 'run_override_unavailable' " +
+		"AND NOT ((runs.hold_reason IS NOT DISTINCT FROM 'run_override_unavailable' OR runs.hold_reason IS NOT DISTINCT FROM 'run_env_history_unavailable') " +
 		"AND (runs.policy_outcome_id IS NOT NULL AND runs.policy_resolved_at IS NOT NULL))) " +
 		"OR (runs.policy_outcome_id IS NOT NULL AND runs.policy_resolved_at IS NULL))"
 

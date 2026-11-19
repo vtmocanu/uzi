@@ -30,6 +30,8 @@ import { mrCompletionBlock } from "../src/runner.js";
 import { SEEDED_PLAN_RULES } from "../src/seeded-plan.js";
 import { skillsPluginDir } from "../src/skills-plugin.js";
 import { guardedCommandEnv } from "../src/claude-command/env.js";
+import { runEnvVar } from "./run-env-catalogue.js";
+import { makeTextRedactor } from "../src/redact.js";
 import { detectRepoAgents } from "../src/repoagents.js";
 import { FINDINGS_SERVER_NAME, reportIncidentalIssueToolName } from "../src/findings-tools.js";
 import {
@@ -10348,5 +10350,85 @@ describe("SdkExecutor spend-limit terminal (issue #3767)", () => {
     const probe = makeCtx();
     const result = await new SdkExecutor(nullLogger(), homeDir, fast(queryFn)).run(probe.ctx);
     assert.ok(result, "the run completed without throwing");
+  });
+});
+
+// PRD #4416 M2: the Claude run lane gives the CLI the repository variables and lists them, sanitised
+// and without a secret value, in the lead and subagent prompts.
+describe("SdkExecutor: repository variables (PRD #4416 M2)", () => {
+  const SECRET_VALUE = ["top", "secret", "value", "0042"].join("-");
+  const runEnv = () => [
+    runEnvVar("SERVICE_URL", { value: "http://stub.example.test:8080", description: "Base URL" }),
+    runEnvVar("SERVICE_KEY", { value: SECRET_VALUE, secret: true, description: "key\u202e\u200b" }),
+    runEnvVar("NPM_TOKEN", { value: "npm-value" }),
+    runEnvVar("NODE_OPTIONS", { value: "--require /evil.js" }),
+    runEnvVar("PATH", { value: "/evil/bin" }),
+  ];
+  const coder: AgentTemplate = { name: "coder", description: "coder", prompt_body: "You code.", tools: null, skills: [] };
+
+  it("passes the variables to the CLI env and the lists to the lead and every subagent, never a secret value", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("# The Plan"), resultSuccess()],
+      [assistantText("implementing"), signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx({ runEnv: runEnv(), agents: [coder] });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn, envProbeSpawner: async () => ({ code: 0, stdout: "{\"uzi_envprobe\":1,\"proc\":\"ok\",\"home\":\"ok\",\"tmp\":\"ok\"}\n", cleanedUp: true }) }).run(probe.ctx);
+    const env = turns[0]!.options.env!;
+    assert.equal(env.NPM_TOKEN, "npm-value");
+    assert.equal(env.SERVICE_URL, "http://stub.example.test:8080");
+    assert.equal(env.SERVICE_KEY, SECRET_VALUE, "a secret reaches the command environment");
+    assert.ok(!("NODE_OPTIONS" in env));
+    assert.notEqual(env.PATH, "/evil/bin");
+    for (const t of [turns[0]!, turns[1]!]) {
+      const text = t.promptText ?? "";
+      assert.match(text, /SERVICE_URL \(repo plain\): Base URL \| value: "http:\/\/stub\.example\.test:8080"/);
+      assert.match(text, /SERVICE_KEY \(repo secret\)/);
+      assert.ok(!text.includes(SECRET_VALUE), "a secret value never appears in a prompt");
+    }
+    const sub = (turns[0]!.options.agents as Record<string, { prompt: string }>).coder!.prompt;
+    assert.match(sub, /SERVICE_URL \(repo plain\)/);
+    assert.ok(!sub.includes(SECRET_VALUE));
+    const dropped = probe.emits.filter((m) => m.kind === "status").map((m) => String(m.payload.text)).filter((t) => t.startsWith("repository variable"));
+    assert.deepEqual(dropped.sort(), [
+      "repository variable NODE_OPTIONS was not set: NODE_OPTIONS is set or reserved by the worker (denied name)",
+      "repository variable PATH was not set: PATH is set or reserved by the worker (denied name)",
+    ]);
+  });
+
+  it("a run without variables is unchanged", async () => {
+    const { queryFn, turns } = fakeTurns([[submitPlan("# The Plan"), resultSuccess()], [assistantText("x"), signalDone(), resultSuccess()]]);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(makeCtx({ agents: [coder] }).ctx);
+    assert.ok(!(turns[0]!.promptText ?? "").includes("<run_env_"));
+    assert.ok(!("SERVICE_URL" in turns[0]!.options.env!));
+  });
+});
+
+// PRD #4416 M2: the plan summary (POST /summary/plan) passes the run's redactor.
+describe("SdkExecutor: plan summary redaction (PRD #4416 M2)", () => {
+  const SECRET = ["plan", "summary", "secret", "0099"].join("-");
+  it("redacts the summary, each delta and the plan text before the POST", async () => {
+    const posts: Array<{ summary: string; deltas: Array<{ text: string }>; plan_md: string }> = [];
+    const summaryRunner = {
+      generateIntentSummary: async () => null,
+      generatePlanSummary: async (input: { onUsage?: (u: object) => void }) => {
+        input.onUsage?.({});
+        return { summary: `uses ${SECRET} for auth`, deltas: [{ kind: "added", text: `exports ${SECRET}` }] };
+      },
+    };
+    const client = { postIntentSummary: async () => undefined, postPlanSummary: async (_id: string, body: (typeof posts)[number]) => { posts.push(body); } };
+    const { queryFn } = fakeTurns([[submitPlan(`# Plan\nset token ${SECRET}`), resultSuccess()], [assistantText("done"), signalDone(), resultSuccess()]]);
+    let callbackDone: Promise<void> | undefined;
+    const { ctx } = makeCtx({
+      summaryIntentPresent: true, redactText: makeTextRedactor([SECRET]),
+      gatePlan: async (md, _milestones, persisted) => { callbackDone = persisted!(md); return { kind: "approve", selection: { status: "absent" } }; },
+    });
+    await new SdkExecutor(nullLogger(), homeDir, {
+      queryFn, client: client as unknown as WorkerClient, summaryRunner: summaryRunner as unknown as SummaryRunner, intentSettleBoundMs: 1,
+    }).run(ctx);
+    await callbackDone;
+    for (let i = 0; i < 50 && posts.length === 0; i++) await new Promise((r) => setTimeout(r, 5));
+    assert.equal(posts.length, 1);
+    assert.ok(!JSON.stringify(posts).includes(SECRET), "the secret reached /summary/plan");
+    assert.ok(JSON.stringify(posts).includes("***REDACTED***"));
   });
 });

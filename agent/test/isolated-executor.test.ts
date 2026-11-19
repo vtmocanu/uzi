@@ -22,6 +22,7 @@ import {
 import { laneJobSurface } from "../src/job-runner.js";
 import { buildFetchToolsServer } from "../src/fetch-tools.js";
 import { buildSdkEnv } from "../src/sdk-env.js";
+import { catalogue } from "./run-env-catalogue.js";
 import type { SdkQueryFn } from "../src/sdk-executor.js";
 import type { EmittedMessage } from "../src/executor.js";
 import { nullLogger } from "./helpers.js";
@@ -409,6 +410,14 @@ describe("isolated executor: env scope", () => {
     const base = buildSdkEnv({ kind: "oauth", token: OAUTH }, "/h", { [NONESSENTIAL]: "0" });
     assert.ok(!(NONESSENTIAL in base), "precondition: the provisioned override is dropped by the protected set");
     assert.equal(isolateSdkEnv({ ...base, [NONESSENTIAL]: "0" })[NONESSENTIAL], "1");
+  });
+
+  it("PRD #4416: a context carrying repository variables still gets an SDK env with no user variable", async () => {
+    const { queryFn, seen } = fakeQuery([realInit() as unknown as SDKMessage, resultSuccess()]);
+    await new IsolatedExecutor(nullLogger(), { queryFn, kill: () => true, secretPaths: SECRET_PATHS }).run({ ...ctx(), runEnv: catalogue() } as unknown as ReturnType<typeof ctx>);
+    const env = seen.options?.env as Record<string, string | undefined>;
+    for (const v of catalogue()) assert.ok(!Object.values(env).includes(v.value), `${v.name} leaked into the isolated env`);
+    assert.ok(!("NPM_TOKEN" in env) && !("AWS_REGION" in env));
   });
 
   it("the executor hands the SDK child that env, and never the fetch credential", async () => {

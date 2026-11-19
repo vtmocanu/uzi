@@ -25,6 +25,10 @@ import (
 // structured templates (PRD #3 provides several subagents that map to
 // programmatic SDK AgentDefinitions), not a single `template`.
 type ClaimPayload struct {
+	// runEnv is the (var_id, rev) snapshot the run_env lists were assembled from (PRD #4416 M2).
+	// Unexported, so it is never serialized: finishRunClaimTx recomputes the lists under the owner
+	// fence and compares them with it.
+	runEnv *runEnvSnapshot
 	// PublicationResume (issue #1324) is the active write-ahead publication intent, sent only to
 	// a publication_resume_v1 worker while an enrollment is active. Claim assembly is otherwise
 	// unchanged, including credentials.

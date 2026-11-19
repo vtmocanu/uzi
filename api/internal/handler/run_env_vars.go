@@ -4,7 +4,7 @@ package handler
 // are stored and managed here; nothing injects them into a run yet (M2).
 //
 // Every value, plain or secret, is sealed through the vault seam with the AAD that
-// runenv.AADKind builds. A secret's value is never opened for a response. Writes run
+// runenv.AADFor picks (version 2 for every new seal). A secret's value is never opened for a response. Writes run
 // in one transaction that takes the owner's secret-mutation advisory lock and then
 // the users-row fence, like every other secret writer (withSecretLock).
 
@@ -205,7 +205,7 @@ func (h *Handler) runEnvDTO(userID, repoID uuid.UUID, row runEnvRow, vaultLocked
 		dto.ValueWithheld = true
 		return dto, false
 	}
-	kind := runenv.AADKind(runenv.ScopeRepo, &repoID, row.Secret, row.Name)
+	kind := runenv.AADFor(runenv.Row{AADVersion: row.AadVersion, RepoID: &repoID, Secret: row.Secret, Name: row.Name, VarID: row.VarID, Rev: row.Rev})
 	plain, err := h.vault.Open(userID, kind, row.SealedWith, row.Ciphertext)
 	if err != nil {
 		dto.ValueWithheld = true
@@ -389,7 +389,7 @@ func (h *Handler) PutRepoEnvVar(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 			return
 		}
-		old, openErr := h.vault.Open(userID, runenv.AADKind(runenv.ScopeRepo, &repoID, cur.Secret, name), cur.SealedWith, cur.Ciphertext)
+		old, openErr := h.vault.Open(userID, runenv.AADFor(runenv.Row{AADVersion: cur.AadVersion, RepoID: &repoID, Secret: cur.Secret, Name: name, VarID: cur.VarID, Rev: cur.Rev}), cur.SealedWith, cur.Ciphertext)
 		if openErr != nil {
 			if h.writeVaultLocked(w, openErr) {
 				return
@@ -409,7 +409,14 @@ func (h *Handler) PutRepoEnvVar(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	material, err := h.vault.Seal(ctx, userID, runenv.AADKind(runenv.ScopeRepo, &repoID, secret, name), value, vault.SealForUse)
+	// Every new seal is AAD version 2, which binds the variable id and the revision this value is
+	// written under. Both are known before the transaction: a creation mints its var_id here, and a
+	// new version is cur.Rev+1 (the locked re-read below refuses the write when the live row moved).
+	varID, rev := uuid.New(), int32(1)
+	if exists {
+		varID, rev = cur.VarID, cur.Rev+1
+	}
+	material, err := h.vault.Seal(ctx, userID, runenv.AADKindV2(runenv.ScopeRepo, &repoID, secret, name, varID, rev), value, vault.SealForUse)
 	if err != nil {
 		if h.writeVaultLocked(w, err) {
 			return
@@ -455,6 +462,7 @@ func (h *Handler) PutRepoEnvVar(w http.ResponseWriter, r *http.Request) {
 		params := store.InsertRunEnvVarParams{
 			UserID: userID, RepoID: repo, Name: name, Secret: secret, Description: description,
 			Ciphertext: material.Ciphertext, SealedWith: material.SealedWith, ValueBytes: int32(newBytes), //nolint:gosec // G115: bounded to 65536 by ValidateValue.
+			AadVersion: runenv.AADVersion2, VarID: varID, Rev: rev,
 		}
 		if !exists {
 			if usage.LiveCount+usage.PendingCount >= runenv.MaxVarsPerScope {
@@ -466,7 +474,6 @@ func (h *Handler) PutRepoEnvVar(w http.ResponseWriter, r *http.Request) {
 			if err := vault.CheckMaterialHeadroom(totals, 1, int64(len(material.Ciphertext)), int64(len(material.Ciphertext))); err != nil {
 				return runEnvHeadroomConflict(runEnvCodeLimitReached, err)
 			}
-			params.VarID, params.Rev = uuid.New(), 1
 		} else {
 			if usage.ValueBytes-int64(live.ValueBytes)+newBytes > runenv.MaxScopeValueBytes {
 				return &runEnvConflictError{runEnvCodeLimitReached, fmt.Sprintf("the variables of this repo may hold at most %d bytes of values", runenv.MaxScopeValueBytes)}
@@ -508,7 +515,7 @@ func (h *Handler) PutRepoEnvVar(w http.ResponseWriter, r *http.Request) {
 					return err
 				}
 			}
-			params.VarID, params.Rev, params.DisabledAt = live.VarID, live.Rev+1, live.DisabledAt
+			params.DisabledAt = live.DisabledAt
 		}
 		inserted, err := q.InsertRunEnvVar(ctx, params)
 		if err != nil {

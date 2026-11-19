@@ -262,12 +262,12 @@ func (v *Vault) convertMaterial(ctx context.Context, q Store, userID uuid.UUID, 
 				return ErrInvalidState // env rows are never sealed without AAD (table CHECK)
 			}
 			if !lazy || row.SealedWith != store.SealedWithDEK {
-				scope, repoID := runenv.ScopeUser, (*uuid.UUID)(nil)
+				var repoID *uuid.UUID
 				if row.RepoID.Valid {
 					id := uuid.UUID(row.RepoID.Bytes)
-					scope, repoID = runenv.ScopeRepo, &id
+					repoID = &id
 				}
-				kind := runenv.AADKind(scope, repoID, row.Secret, row.Name)
+				kind := runenv.AADFor(runenv.Row{AADVersion: row.AadVersion, RepoID: repoID, Secret: row.Secret, Name: row.Name, VarID: row.VarID, Rev: row.Rev})
 				ciphertext, marker, err := v.convertCipher(userID, kind, row.Ciphertext, row.SealedWith, source, sourceBox, targetMode, targetEpoch, private, lazy)
 				if err != nil {
 					return err

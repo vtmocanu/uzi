@@ -208,6 +208,9 @@ export interface MemoryToolsDeps {
    *  server derives (user, repo) from it), never an arbitrary run. */
   runId: string;
   log: Logger;
+  /** PRD #4416 M2: the run's text redactor. save_memory persists across runs, so the title, body and
+   *  evidence pass it before the size checks. Absent ⇒ identity. */
+  redactText?: (s: string) => string;
 }
 
 /** The raw tool handlers (unit-testable). save_memory validates the size caps
@@ -218,14 +221,15 @@ export interface MemoryToolHandlers {
 
 export function makeMemoryToolHandlers(deps: MemoryToolsDeps): MemoryToolHandlers {
   const { client, runId, log, claimGeneration } = deps;
+  const redact = deps.redactText ?? ((s: string) => s);
   return {
     async saveMemory(args) {
       // Client-side cap mirror (a clear tool error, NOT a throw): the SDK schema
       // also enforces these, but validating here means the unit suite — which calls
       // the handler directly, bypassing the schema — proves the rejection, and an
       // over-cap call never reaches the network.
-      const title = (args.title ?? "").trim();
-      const body = args.body ?? "";
+      const title = redact((args.title ?? "").trim());
+      const body = redact(args.body ?? "");
       if (title.length === 0) return asText("save_memory needs a non-empty title.", true);
       const titleBytes = Buffer.byteLength(title, "utf8");
       if (titleBytes > MEMORY_TITLE_MAX_BYTES) {
@@ -240,7 +244,7 @@ export function makeMemoryToolHandlers(deps: MemoryToolsDeps): MemoryToolHandler
       // hard failure — PRD #90). Evidence is optional; normalize empty/whitespace to
       // undefined and byte-cap it with a clear tool error, like title/body.
       const basis: MemoryBasis = args.basis ?? "inferred";
-      const evidenceTrimmed = (args.evidence ?? "").trim();
+      const evidenceTrimmed = redact((args.evidence ?? "").trim());
       const evidence = evidenceTrimmed.length === 0 ? undefined : evidenceTrimmed;
       if (evidence !== undefined) {
         const evidenceBytes = Buffer.byteLength(evidence, "utf8");

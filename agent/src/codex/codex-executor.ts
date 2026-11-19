@@ -70,6 +70,8 @@ import path from "node:path";
 import { ATTEMPT_ID_RE, cloneKeyOf } from "../attempt-path.js";
 import { BROWSER_DISCOVERY_ENV } from "../browser-env.js";
 import type { SdkAttemptEnv } from "../sdk-env.js";
+import { mergeRunEnv, type RunEnvInput } from "../run-env-merge.js";
+import { runEnvInput } from "../run-env-prompt.js";
 import { goConcurrencyEnv } from "../go-concurrency.js";
 import { randomUUID } from "node:crypto";
 import { boundedCommandWait, enrollMemoryCommand } from "./memory-command.js";
@@ -135,12 +137,12 @@ import {
   type TurnStreamEnd,
 } from "../harness.js";
 import { RunTurnReducerImpl } from "../harness-reducer.js";
-import { buildRepoInstructionsContext, interruptedSnapshotNote, interruptedCallsNote, NON_CLOSING_REMINDER, COMPLETION_CONTRACT_GUIDANCE, CURRENT_EXECUTION_STATE_GUIDANCE, depsProvisionPlanNote, depsProvisionImplementNote, buildIssueContext, buildIssueCommentsContext, buildReviewCommentsContext, buildEnvironmentFactsBlock, buildLeadSystemPrompt, delegatesLine, REPO_SUBAGENT_UNTRUSTED_APPEND, REPO_SUBAGENT_PLANNING_APPEND, buildRevisePlanPrompt, buildAutomaticRevisionPrompt, renderPlanApprovalAdvice, milestoneStatusNote, PR_SUMMARY_GUIDANCE, publishedTipNote, dockerScratchResumeNote, renderFollowUpBatch, REVIEWED_RESUME_APPROVAL_GUIDANCE, selectPriorOwnerHistory, renderPriorOwnerHistory } from "../prompt.js";
+import { buildRepoInstructionsContext, interruptedSnapshotNote, interruptedCallsNote, NON_CLOSING_REMINDER, COMPLETION_CONTRACT_GUIDANCE, CURRENT_EXECUTION_STATE_GUIDANCE, depsProvisionPlanNote, depsProvisionImplementNote, buildIssueContext, buildIssueCommentsContext, buildReviewCommentsContext, buildEnvironmentFactsBlock, buildRunEnvBlock, buildLeadSystemPrompt, delegatesLine, REPO_SUBAGENT_UNTRUSTED_APPEND, REPO_SUBAGENT_PLANNING_APPEND, buildRevisePlanPrompt, buildAutomaticRevisionPrompt, renderPlanApprovalAdvice, milestoneStatusNote, PR_SUMMARY_GUIDANCE, publishedTipNote, dockerScratchResumeNote, renderFollowUpBatch, REVIEWED_RESUME_APPROVAL_GUIDANCE, selectPriorOwnerHistory, renderPriorOwnerHistory } from "../prompt.js";
 import { environmentFactsSummary, ProbeCleanupError, runEnvProbe, type EnvFacts, type EnvProbeSpawner } from "../env-probe.js";
 import { makeProgressObserver } from "../milestone-progress-observer.js";
 import { RUNNER_UID, WORKER_UID, uidSplitActive } from "../runner-uid.js";
 import { errMessage } from "../util.js";
-import { SummaryRunner, type PlanSummaryResult, type SummarySkipReason } from "../summary-runner.js";
+import { SummaryRunner, redactPlanSummary, type PlanSummaryResult, type SummarySkipReason } from "../summary-runner.js";
 import { summarySkipPayload } from "./summary-skip.js";
 import { resolvePrdInput } from "../prd-link.js";
 import { appendLeadTextTail, emitPlanMissingNotice, isProseOnlyPlanTurn, PLAN_MISSING_NUDGE, REASON_PLAN_MISSING, resolvePlanMissing } from "../plan-missing.js";
@@ -1543,6 +1545,8 @@ export interface CodexToolHandlerDeps {
    *  body/description of the requested granted skill; the broker has ALREADY gated the
    *  call on `allowedSkills` before the handler is reached. */
   readonly skills: readonly ClaimSkill[];
+  /** PRD #4416 M2: the run's text redactor for the sinks the tools write to (memory, findings, review replies). */
+  readonly redactText?: (s: string) => string;
 }
 
 /**
@@ -1581,14 +1585,14 @@ export function buildCodexToolHandlers(deps: CodexToolHandlerDeps): ReadonlyMap<
 
   // memory (one tool; ROOT-only — render never grants it to a subagent, and the broker's
   // allowedTools gate stops a subagent reaching this handler regardless).
-  const memHandlers: MemoryToolHandlers = makeMemoryToolHandlers({ client, runId, log, claimGeneration: deps.claimGeneration });
+  const memHandlers: MemoryToolHandlers = makeMemoryToolHandlers({ client, runId, log, claimGeneration: deps.claimGeneration, ...(deps.redactText ? { redactText: deps.redactText } : {}) });
   map.set(
     memoryToolNames()[0]!,
     (args) => memHandlers.saveMemory(args as Parameters<MemoryToolHandlers["saveMemory"]>[0]),
   );
 
   // findings (granted to the lead AND every subagent — stays in the subagent base).
-  const findingsHandlers: FindingsToolHandlers = makeFindingsToolHandlers({ client, runId, emit, log });
+  const findingsHandlers: FindingsToolHandlers = makeFindingsToolHandlers({ client, runId, emit, log, ...(deps.redactText ? { redactText: deps.redactText } : {}) });
   map.set(
     reportIncidentalIssueToolName(),
     (args) => findingsHandlers.reportIncidentalIssue(args as Parameters<FindingsToolHandlers["reportIncidentalIssue"]>[0]),
@@ -1597,7 +1601,7 @@ export function buildCodexToolHandlers(deps: CodexToolHandlerDeps): ReadonlyMap<
   // forge (8 tools; the 6 reads + 2 writes share the ONE per-run budget in makeForgeToolHandlers).
   // An explicit [suffix, handler] table so a rename cannot silently misalign the map; the
   // qualified keys equal forgeToolNames() by construction (same FORGE_SERVER_NAME + suffixes).
-  const forgeHandlers: ForgeToolHandlers = makeForgeToolHandlers({ client, runId, log });
+  const forgeHandlers: ForgeToolHandlers = makeForgeToolHandlers({ client, runId, log, ...(deps.redactText ? { redactText: deps.redactText } : {}) });
   const forgeEntries: ReadonlyArray<readonly [suffix: string, handler: ToolHandler]> = [
     ["get_issue", (a) => forgeHandlers.getIssue(a as Parameters<ForgeToolHandlers["getIssue"]>[0])],
     ["list_issues", (a) => forgeHandlers.listIssues(a as Parameters<ForgeToolHandlers["listIssues"]>[0])],
@@ -3268,10 +3272,11 @@ export class CodexExecutor implements Executor {
               return;
             }
             if (!allowed()) return;
+            const safe = redactPlanSummary(result, ctx.redactText);
             await this.opts.client.postPlanSummary(ctx.runId, {
-              ...result, plan_md: planMd.replaceAll("\u0000", ""),
+              ...safe, plan_md: (ctx.redactText?.(planMd) ?? planMd).replaceAll("\u0000", ""),
             });
-            if (allowed()) latestPlanSummary = result;
+            if (allowed()) latestPlanSummary = safe;
           } catch (error) {
             this.log.warn("plan summary hook failed", { run_id: ctx.runId, error: errMessage(error) });
           } finally { this.planFlights.delete(owned); }
@@ -3640,6 +3645,7 @@ export class CodexExecutor implements Executor {
           // Issue #3907: every model command runs under `commandSandbox` (makeDefaultSpawnCommand);
           // only the fileop root is forced to "required" for cross_check, and it runs no browser.
           commandSandbox === "off",
+          runEnvInput(ctx.runEnv, (text) => ctx.emit({ kind: "status", agent: "worker", payload: { text } })),
         ),
         await canonicalCheckoutPath(worktreePath),
       );
@@ -3693,6 +3699,7 @@ export class CodexExecutor implements Executor {
         skills: ctx.skills ?? [],
         ciEvidence: ctx.ciEvidence,
         codeCrossCheck: codeCrossCheckAccess(ctx),
+        ...(ctx.redactText ? { redactText: ctx.redactText } : {}),
       });
 
       // The low-level effect launcher, boundary seams and per-sink reconcile/eviction closures —
@@ -6739,6 +6746,7 @@ export class CodexExecutor implements Executor {
       prompt: prompt + ciEvidencePrompt(ctx.ciEvidence),
       systemPrompt,
       childTurnBudgetMs: this.childTurnDeadlineMs(),
+      ...(ctx.runEnv && ctx.runEnv.length > 0 ? { runEnvBlock: buildRunEnvBlock(ctx.runEnv) } : {}),
       phase,
       ownerDecisionRequested: ctx.completionInterlock === true && resolveRunKind(ctx.kind) === "issue" && !ctx.interactive,
       parkRunSupported: ctx.parkRunSupported,
@@ -6790,7 +6798,9 @@ export class CodexExecutor implements Executor {
     const review = buildReviewCommentsContext(ctx.reviewComments);
     const withReview = review ? `${head}\n\n${review}` : head;
     const block = buildEnvironmentFactsBlock(facts);
-    const body = `${withReview}\n\nProduce a plan for this work and submit it for approval.\n\n${depsProvisionPlanNote()}${block ? `\n\n${block}` : ""}`;
+    // PRD #4416 M2: the repository variables set in every command ("" ⇒ unchanged).
+    const runEnvBlock = buildRunEnvBlock(ctx.runEnv);
+    const body = `${withReview}\n\nProduce a plan for this work and submit it for approval.\n\n${depsProvisionPlanNote()}${block ? `\n\n${block}` : ""}${runEnvBlock ? `\n\n${runEnvBlock}` : ""}`;
     // PRD #1416 M1: these Codex builders bypass the shared buildPlanPrompt/buildImplementPrompt,
     // so prepend the published-floor paragraph here. Empty ⇒ unchanged (a fresh branch).
     // #1416 (MR-rework): thread autoApprove so an autopilot Codex run gets the autopilot-safe
@@ -6883,8 +6893,10 @@ export class CodexExecutor implements Executor {
     const prompt = withMilestoneNote(note ? `${note}\n\n${withClaims}` : withClaims, milestoneNote);
     const block = buildEnvironmentFactsBlock(facts);
     const withFacts = block ? `${prompt}\n\n${block}` : prompt;
+    const runEnvBlock = buildRunEnvBlock(ctx.runEnv);
+    const withRunEnv = runEnvBlock ? `${withFacts}\n\n${runEnvBlock}` : withFacts;
     const dockerResume = dockerScratchResumeNote(ctx.dockerScratchResume);
-    return dockerResume ? `${withFacts}\n\n${dockerResume}` : withFacts;
+    return dockerResume ? `${withRunEnv}\n\n${dockerResume}` : withRunEnv;
   }
 
   /** Issue #1866 M2: the Codex environment-probe spawner, routed through `epoch`'s registered
@@ -7747,11 +7759,19 @@ export function commandSandboxArgv(
  *     (/proc and /sys are not granted). Under `best-effort` it is not advertised either, by
  *     design, even on a Landlock-less (degraded, unconfined) kernel where Chromium might run:
  *     discovery is advertised only for the mode whose launch the worker-uid proof covers.
+ *   - PRD #4416 M2: `runEnv` (the run's repository variables, receiving lanes only) is merged right
+ *     after the fold at the lowest precedence, so everything above and below wins over it.
  *   - issue #1716: a `toolEnv` entry can NEVER inject git config (GIT_CONFIG_COUNT,
  *     GIT_CONFIG_KEY_n/VALUE_n, GIT_CONFIG_PARAMETERS); run() adds the worker's own
  *     trust afterwards ({@link withCommandGitTrust}).
  */
-export function buildCommandEnv(tmpdir: string, toolEnv: Record<string, string>, dockerHost?: string, browserDiscovery = false): NodeJS.ProcessEnv {
+export function buildCommandEnv(
+  tmpdir: string,
+  toolEnv: Record<string, string>,
+  dockerHost?: string,
+  browserDiscovery = false,
+  runEnv?: RunEnvInput,
+): NodeJS.ProcessEnv {
   const provisionedPath = toolEnv.PATH;
   const env: NodeJS.ProcessEnv = {
     // The fixed boundary dirs come first; a provisioned PATH is appended (never prepended,
@@ -7769,6 +7789,10 @@ export function buildCommandEnv(tmpdir: string, toolEnv: Record<string, string>,
     if (isGitConfigEnvKey(k)) continue;
     env[k] = v;
   }
+  // PRD #4416 M2: the repository variables of a receiving run, at the lowest precedence (an
+  // existing key, a protected key, an inline-git-config key or a denied name is dropped). The
+  // worker-set keys below are applied after and always win. Only the Codex run executor passes it.
+  mergeRunEnv(env as Record<string, string | undefined>, runEnv, (k) => COMMAND_ENV_PROTECTED_KEYS.has(k) || isGitConfigEnvKey(k));
   // Issue #3382: the worker's optional Go build concurrency defaults, applied after the fold.
   Object.assign(env, goConcurrencyEnv());
   if (dockerHost !== undefined) env.DOCKER_HOST = dockerHost;

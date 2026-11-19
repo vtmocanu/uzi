@@ -1,6 +1,7 @@
 package runenv
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -102,5 +103,106 @@ func TestAADKindSeparatesContexts(t *testing.T) {
 	want := "uzi-run-env-v1\x00user\x00\x001\x00\x00\x00\x00\x03ABC"
 	if got := AADKind(ScopeUser, nil, true, "ABC"); got != want {
 		t.Errorf("layout = %q, want %q", got, want)
+	}
+}
+
+// ctx builds "a<rune>b" from a code point, so the test source holds no invisible character.
+func ctx(r rune) string { return "a" + string(r) + "b" }
+
+// TestValidateDescriptionRejectsControlAndFormatCharacters pins the carried M2 W0 rule: a
+// description is shown on the run page and put in the lead's prompt, so it must be plain text.
+func TestValidateDescriptionRejectsControlAndFormatCharacters(t *testing.T) {
+	bad := map[string]string{
+		"TAB":                ctx(0x09),
+		"LF":                 ctx(0x0a),
+		"CR":                 ctx(0x0d),
+		"SOH":                ctx(0x01),
+		"US (last C0)":       ctx(0x1f),
+		"ESC":                "\x1b[31mred",
+		"DEL":                ctx(0x7f),
+		"first C1":           ctx(0x80),
+		"NEL (C1)":           ctx(0x85),
+		"last C1":            ctx(0x9f),
+		"ZWSP":               ctx(0x200b),
+		"ZWNJ":               ctx(0x200c),
+		"RLM (last of 200F)": ctx(0x200f),
+		"LINE SEPARATOR":     ctx(0x2028),
+		"PARA SEPARATOR":     ctx(0x2029),
+		"LRE":                ctx(0x202a),
+		"RLO (last of 202E)": ctx(0x202e),
+		"WORD JOINER":        ctx(0x2060),
+		"INVISIBLE PLUS":     ctx(0x2064),
+		"LRI":                ctx(0x2066),
+		"PDI":                ctx(0x2069),
+		"last of 2066..206F": ctx(0x206f),
+		"BOM":                ctx(0xfeff),
+	}
+	for label, d := range bad {
+		err := ValidateDescription(d)
+		var rule *RuleError
+		if !errors.As(err, &rule) || rule.Field != "description" {
+			t.Errorf("%s: ValidateDescription = %v, want a description rule error", label, err)
+		}
+	}
+	ok := map[string]string{
+		"ascii":                       "Base URL of the stub service",
+		"tilde, last printable ASCII": ctx(0x7e),
+		"NBSP, first after C1":        ctx(0xa0),
+		"e acute":                     ctx(0xe9),
+		"just before 200B":            ctx(0x200a),
+		"just after 200F":             ctx(0x2010),
+		"just after 2029":             ctx(0x202f),
+		"just before 2060":            ctx(0x205f),
+		"2065 unassigned":             ctx(0x2065),
+		"just after 206F":             ctx(0x2070),
+		"just before BOM":             ctx(0xfefe),
+		"CJK and emoji":               ctx(0x6d4b) + ctx(0x1f600),
+	}
+	for label, d := range ok {
+		if err := ValidateDescription(d); err != nil {
+			t.Errorf("%s: ValidateDescription rejected a plain description: %v", label, err)
+		}
+	}
+}
+
+func TestAADKindV2BindsVarIDAndRev(t *testing.T) {
+	a := uuid.New()
+	v1, v2 := uuid.New(), uuid.New()
+	seen := map[string]string{}
+	for label, k := range map[string]string{
+		"base":          AADKindV2(ScopeRepo, &a, true, "X", v1, 1),
+		"other rev":     AADKindV2(ScopeRepo, &a, true, "X", v1, 2),
+		"other var":     AADKindV2(ScopeRepo, &a, true, "X", v2, 1),
+		"plain":         AADKindV2(ScopeRepo, &a, false, "X", v1, 1),
+		"other name":    AADKindV2(ScopeRepo, &a, true, "Y", v1, 1),
+		"user scope":    AADKindV2(ScopeUser, nil, true, "X", v1, 1),
+		"v1 context":    AADKind(ScopeRepo, &a, true, "X"),
+		"rev 12":        AADKindV2(ScopeRepo, &a, true, "X", v1, 12),
+		"name X1 rev 2": AADKindV2(ScopeRepo, &a, true, "X1", v1, 2),
+		"name X rev 12": AADKindV2(ScopeRepo, &a, true, "X", v1, 112),
+	} {
+		if prev, dup := seen[k]; dup {
+			t.Errorf("%s and %s share a sealing context", label, prev)
+		}
+		seen[k] = label
+	}
+	if !strings.HasPrefix(AADKindV2(ScopeUser, nil, true, "ABC", v1, 7), "uzi-run-env-v2") {
+		t.Error("v2 context does not carry the v2 domain tag")
+	}
+}
+
+func TestAADForPicksByVersion(t *testing.T) {
+	a, v := uuid.New(), uuid.New()
+	row := Row{AADVersion: AADVersion1, RepoID: &a, Secret: true, Name: "TOKEN", VarID: v, Rev: 3}
+	if got, want := AADFor(row), AADKind(ScopeRepo, &a, true, "TOKEN"); got != want {
+		t.Errorf("version 1 row: AADFor = %q, want the v1 context", got)
+	}
+	row.AADVersion = AADVersion2
+	if got, want := AADFor(row), AADKindV2(ScopeRepo, &a, true, "TOKEN", v, 3); got != want {
+		t.Errorf("version 2 row: AADFor = %q, want the v2 context", got)
+	}
+	row.RepoID = nil
+	if got, want := AADFor(row), AADKindV2(ScopeUser, nil, true, "TOKEN", v, 3); got != want {
+		t.Errorf("user-scope version 2 row: AADFor = %q, want the v2 user context", got)
 	}
 }

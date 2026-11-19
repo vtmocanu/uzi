@@ -92,6 +92,13 @@ export interface PlanSummaryResult {
   deltas: Delta[];
 }
 
+/** PRD #4416 M2: a plan summary with the run's text redactor applied to every text field before it
+ *  is posted to /summary/plan or forwarded with the terminal result. Identity without a redactor. */
+export function redactPlanSummary(result: PlanSummaryResult, redact: ((s: string) => string) | undefined): PlanSummaryResult {
+  if (!redact) return result;
+  return { summary: redact(result.summary), deltas: result.deltas.map((d) => ({ ...d, text: redact(d.text) })) };
+}
+
 /** Common inputs to a summary turn. `prdText` is the resolved PRD body (M3b) or null
  *  when the run has no linked PRD — the summary then works from title + body alone. */
 export interface IntentSummaryInput {

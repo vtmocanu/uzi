@@ -1,4 +1,6 @@
 import type { RemediationRestrictionProgress, RetainedAdoptionRefusal } from "./git.js";
+import { runEnvForClaim } from "./run-env-merge.js";
+import { runEnvSecretForms } from "./run-env-forms.js";
 import { policyOwnershipGeneration, type CurrentPolicyAuthority } from "./policy-resolve.js";
 import { RESUME_LINEAGE_BREAK_EVENT } from "./harness-messages.js";
 import { terminalPreservationActive, type TerminalPreservationTestHooks } from "./terminal-preservation.js";
@@ -242,7 +244,7 @@ import {
   latchOnUnattributedUnreadable,
   residueQuarantine,
 } from "./residue-quarantine.js";
-import { SecretSet } from "./redact.js";
+import { SecretSet, redactStrings } from "./redact.js";
 import { CredentialHolder } from "./credential-holder.js";
 import { applyThroughLedger, type CredentialSwitchOpLedger, type LedgerApplyResult, NOT_APPLIED_PROOF_REASONS } from "./credential-switch-op-ledger.js";
 import { sessionTranscriptResolvable } from "./sdk-session.js";
@@ -6258,6 +6260,9 @@ export class RunRunner {
     // PRD #4320: the gateway key. The server has no value-based scrubber for an arbitrary gateway key, so
     // this registration (with the redactors' below) is the only protection for it.
     if (claim.secrets.provider?.credential) runScopedSecrets.push(claim.secrets.provider.credential);
+    // PRD #4416 M2: every registered form of every secret repository variable (run_env and
+    // run_env_redact), rebuilt from each claim; evicted with the rest at the terminal.
+    runScopedSecrets.push(...runEnvSecretForms(claim.secrets));
     for (const s of runScopedSecrets) this.log.addSecret(s);
     // The codex canaries were ALREADY addSecret'd above (before makeExecutor); append them
     // to runScopedSecrets AFTER the add loop — never inside it — so each is registered
@@ -13794,6 +13799,8 @@ export class RunRunner {
     if (claim.secrets.codex) {
       secrets.push(claim.secrets.codex.access_token, claim.secrets.codex.capability);
     }
+    // PRD #4416 M2: the repository variables' secret forms reach both redactors too.
+    secrets.push(...runEnvSecretForms(claim.secrets));
     // Issue #4201: ONE live set. An in-place switch adds its new token to it, and every sink below reads
     // the set at use time instead of a list frozen here.
     const secretSet = new SecretSet(secrets);
@@ -16936,7 +16943,7 @@ export class RunRunner {
     };
     const semanticPlanning = claim.semantic_planning === undefined ? undefined : parseSemanticEnrollment(claim.semantic_planning);
     const semanticGate = semanticPlanning ? new SemanticPlanningGate(this.client, runId, flight.claimGeneration,
-      () => steering.lifecycleSignal(), this.semanticCoverageTestTransport) : undefined;
+      () => steering.lifecycleSignal(), this.semanticCoverageTestTransport, flight.redactText) : undefined;
     // issue #3870: the managed Go work leaf for a Claude flight on Linux. A Codex executor's `safety`
     // is only populated inside run(), so it is excluded here by the signals known before launch
     // (`claim.secrets.codex`, `sandboxesCommands`), as isCodexCapture does. Only an ordinary
@@ -17076,6 +17083,7 @@ export class RunRunner {
       // Issue #1583: the claim-secret text redactor, for projections that bound text pre-batcher.
       redactText: flight.redactText,
       oauthToken: claim.secrets.anthropic_oauth_token,
+      ...(runEnvForClaim(claim).length > 0 ? { runEnv: runEnvForClaim(claim) } : {}),
       ...(claim.secrets.provider ? { provider: claim.secrets.provider } : {}),
       ...(flight.credential ? { credential: () => flight.credential!.current() } : {}),
       // PRD #362 M3c: the run-summary model resolved server-side (user-value-wins),
@@ -17394,7 +17402,12 @@ export class RunRunner {
         if (!(cause instanceof TransientRecoveryError) || (!cause.providerOrigin && cause.idleStallKind !== "zero_evidence") || !revisionRecovery) throw cause;
         return revisionRecovery.retry(cause, observer, remainingWallMs);
       },
-      gatePlan: async (planMd, milestones, onPlanPersisted, settles, semanticSubmission) => {
+      gatePlan: async (rawPlanMd, rawMilestones, onPlanPersisted, settles, semanticSubmission) => {
+        // PRD #4416 M2: the plan and milestones are redacted with the run's secrets once, up front,
+        // so the semantic candidate, the cross-check candidate and the presented gate all carry the
+        // same bytes (the semantic gate compares the plan it compiled with the plan it reviews).
+        const planMd = flight.redactText(rawPlanMd);
+        const milestones = redactStrings(rawMilestones, flight.redactText);
         flight.initialPlanningEligible = false;
         if (flight.workerMemory) flight.workerMemory.revisionContext = undefined;
         // PRD #71 M5: a CI-config-classified ci_fix plan must NOT take the auto-approve
@@ -17582,6 +17595,7 @@ export class RunRunner {
                     required_tools: toolchainDetection?.required_tools ?? [],
                     size_class: toolchainDetection?.size_class ?? "s", base_commit: runnerClone.baseCommit,
                     planning_diff: captured.diff }, batcher, signal: steering.lifecycleSignal(), timing: this.planCrossCheckTiming,
+                  redactText: flight.redactText,
                   round: crossCheckRound, allowAutomaticRevision: true as const };
                 // Literal-mode calls select the typed overloads: the gated result excludes
                 // "approve" at compile time (the runtime throw below stays as a backstop).
@@ -18150,6 +18164,7 @@ export class RunRunner {
           const done = async () => {
             codeGate ??= new CodeCrossCheckGate({
             client: this.client, runId, generation: flight.claimGeneration, signal: steering.lifecycleSignal(),
+            redactText: flight.redactText,
             readInstructions: async (instructionsCommit: string, signal: AbortSignal) => {
               if (!barePath) return "";
               const read = await readRepoInstructionsAtCommit(this.git, barePath, instructionsCommit, { timeoutMs: 15_000, signal });

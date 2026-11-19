@@ -6,16 +6,12 @@ import (
 	"github.com/google/uuid"
 )
 
-// RunEnvVersionHasReceipt reports whether any run holds a delivery receipt for one
-// version of a run environment variable: a receipted secret version is retired (or,
-// on delete, kept pending deletion) so the run can still mask it, and an unreceipted
-// one is dropped at once.
-//
-// PRD #4416 M1 stores variables but injects nothing, so no run_env_receipts table
-// exists yet and no version can have a receipt: this answers false. M2 adds the
-// receipts table and replaces this body with a query on (var_id, rev). Every write
-// path that retires or keeps a version asks this one function, so nothing else
-// changes when M2 lands.
-func (q *Queries) RunEnvVersionHasReceipt(_ context.Context, _ uuid.UUID, _ int32) (bool, error) {
-	return false, nil
+// RunEnvVersionHasReceipt reports whether any run holds a delivery receipt for one secret version
+// of a run environment variable: a receipted secret version is retired (or, on delete, kept pending
+// deletion) so the run can still mask it, and an unreceipted one is dropped at once. It reads
+// run_env_receipts (PRD #4416 M2). Every write path that retires or keeps a version asks this one
+// function. The generated query takes a parameter struct; this keeps the positional form the
+// handler's retention seam uses.
+func (q *Queries) RunEnvVersionHasReceipt(ctx context.Context, varID uuid.UUID, rev int32) (bool, error) {
+	return q.RunEnvSecretReceiptExists(ctx, RunEnvSecretReceiptExistsParams{VarID: varID, Rev: rev})
 }

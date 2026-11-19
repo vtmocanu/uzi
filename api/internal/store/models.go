@@ -1464,6 +1464,19 @@ type RunDecisionMemo struct {
 	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
 }
 
+type RunEnvReceipt struct {
+	RunID                uuid.UUID          `json:"run_id"`
+	UserID               uuid.UUID          `json:"user_id"`
+	VarID                uuid.UUID          `json:"var_id"`
+	Rev                  int32              `json:"rev"`
+	Scope                string             `json:"scope"`
+	Name                 string             `json:"name"`
+	Secret               bool               `json:"secret"`
+	FirstClaimGeneration int64              `json:"first_claim_generation"`
+	LastClaimGeneration  int64              `json:"last_claim_generation"`
+	CreatedAt            pgtype.Timestamptz `json:"created_at"`
+}
+
 type RunEnvVar struct {
 	ID              uuid.UUID          `json:"id"`
 	VarID           uuid.UUID          `json:"var_id"`
@@ -1481,6 +1494,15 @@ type RunEnvVar struct {
 	PendingDeleteAt pgtype.Timestamptz `json:"pending_delete_at"`
 	CreatedAt       pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+	AadVersion      int16              `json:"aad_version"`
+}
+
+type RunEnvVarID struct {
+	VarID  uuid.UUID   `json:"var_id"`
+	UserID uuid.UUID   `json:"user_id"`
+	RepoID pgtype.UUID `json:"repo_id"`
+	Scope  string      `json:"scope"`
+	Name   string      `json:"name"`
 }
 
 type RunFetch struct {

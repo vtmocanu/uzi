@@ -96,6 +96,8 @@ export interface ForgeToolsDeps {
    *  arbitrary one. */
   runId: string;
   log: Logger;
+  /** PRD #4416 M2: the run's text redactor; the review-thread reply body passes it. Absent ⇒ identity. */
+  redactText?: (s: string) => string;
 }
 
 /** The raw forge tool handlers (mirrors MemoryToolHandlers / FindingsToolHandlers).
@@ -151,6 +153,7 @@ export function forgeToolNames(): string[] {
  */
 export function makeForgeToolHandlers(deps: ForgeToolsDeps): ForgeToolHandlers {
   const { client, runId, log } = deps;
+  const redact = deps.redactText ?? ((s: string) => s);
 
   // Per-session budget. Shared by every read tool of this server (the server is built
   // once per executor). At the START of each read handler: if the cap is reached,
@@ -251,7 +254,7 @@ export function makeForgeToolHandlers(deps: ForgeToolsDeps): ForgeToolHandlers {
     // asymmetry (PRD #700 M4) is preserved exactly.
     async replyMrThread(args) {
       try {
-        const payload = await client.replyMRThread(runId, args.reply_id, args.body);
+        const payload = await client.replyMRThread(runId, args.reply_id, redact(args.body));
         return asText(
           payload.replied
             ? "replied in the review thread"

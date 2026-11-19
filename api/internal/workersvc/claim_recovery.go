@@ -65,6 +65,10 @@ type claimFinishQueries interface {
 	GetUserCredentialsResetAt(ctx context.Context, id uuid.UUID) (pgtype.Timestamptz, error)
 	RequeueClaimAssemblyExact(ctx context.Context, arg store.RequeueClaimAssemblyExactParams) (int64, error)
 	FailClaimAssemblyExact(ctx context.Context, arg store.FailClaimAssemblyExactParams) (int64, error)
+	// PRD #4416 M2: the owner fence, the snapshot recompute, the receipts and the history park.
+	LockUserVaultStateForShareNowait(ctx context.Context, id uuid.UUID) (store.LockUserVaultStateForShareNowaitRow, error)
+	ParkRunEnvHistoryUnavailableRun(ctx context.Context, arg store.ParkRunEnvHistoryUnavailableRunParams) (int64, error)
+	runEnvFinishQueries
 }
 
 // claimFinishTx is one open exact-claim transaction: its statements plus commit/rollback.
@@ -178,15 +182,18 @@ func (s *Service) finishRunClaim(ctx context.Context, run store.Run, payload *Cl
 	// Claude checker stays queued and expires through its own cc.deadline_at path.
 	transient := errors.Is(assemblyErr, store.ErrVaultSealStale) || errors.Is(assemblyErr, errVaultLocked) || errors.Is(assemblyErr, errAutoPoolEmpty) ||
 		errors.Is(assemblyErr, errCustomModelCapabilityMissing) || errors.Is(assemblyErr, errCrossCheckPinsCapabilityMissing) ||
-		errors.Is(assemblyErr, errReserveHeld)
+		errors.Is(assemblyErr, errReserveHeld) || errors.Is(assemblyErr, errRunEnvCapabilityMissing)
 	// errCredentialDisabled is its own non-terminal classification (PRD #1732 D14): neither
 	// transient nor terminal, so it must pass this early return to reach the fenced park. So is
 	// errRunOverrideUnavailable (PRD #3250), which parks on its own hold.
 	// PRD #4320 module 5: a provider claim refusal (revoked binding) is its own non-terminal
 	// classification, like errCredentialDisabled: it parks the run for the owner.
 	_, providerRefused := isProviderClaimRefusal(assemblyErr)
+	// PRD #4416 M2: errRunEnvHistoryUnavailable is its own non-terminal classification too: it parks
+	// the run on run_env_history_unavailable.
 	if assemblyErr != nil && !transient && !claimAssemblyTerminal(assemblyErr) &&
-		!errors.Is(assemblyErr, errCredentialDisabled) && !errors.Is(assemblyErr, errRunOverrideUnavailable) && !providerRefused {
+		!errors.Is(assemblyErr, errCredentialDisabled) && !errors.Is(assemblyErr, errRunOverrideUnavailable) && !providerRefused &&
+		!errors.Is(assemblyErr, errRunEnvHistoryUnavailable) {
 		return nil, assemblyErr
 	}
 	for attempt := 1; ; attempt++ {
@@ -330,6 +337,17 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 		locked.WorkerID != pgconv.UUID(identity.workerID) {
 		return nil, "", nil // another transition won; idle with no mutation
 	}
+	// PRD #4416 M2: a lead-lane run takes the owner's users row FOR SHARE NOWAIT right after the run
+	// lock (lock order worker, run, users, as vault/reset.go and the recovery wait paths). Every
+	// variable writer holds that row FOR UPDATE (FenceVaultWrite, LockUserVaultState), so the
+	// recompute below reads a state no writer can change until this transaction ends, and a writer
+	// mid-flight is 55P03 here, which rolls back for finishRunClaim's bounded retry.
+	runEnvLaneRun := runEnvLane(locked)
+	if runEnvLaneRun {
+		if _, err := q.LockUserVaultStateForShareNowait(ctx, locked.UserID); err != nil {
+			return nil, "", err
+		}
+	}
 
 	// The claim snapshot is the no-mint identity. A successful mint, including
 	// one followed by an assembly error, must carry its actual persisted identity.
@@ -466,7 +484,10 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 	// a distinct non-terminal park that the authority rewrite and the hold class never touch.
 	var overrideErr *runOverrideUnavailableError
 	overrideUnavailable := !credDisabled && errors.As(assemblyErr, &overrideErr)
-	if overrideUnavailable {
+	// PRD #4416 M2: a receipted secret version that is missing or cannot be opened parks the run on
+	// its own hold, never rewritten by the authority check or the hold class.
+	runEnvUnavailable := !credDisabled && !overrideUnavailable && errors.Is(assemblyErr, errRunEnvHistoryUnavailable)
+	if overrideUnavailable || runEnvUnavailable {
 		holdClass, transient = false, false
 	} else if credDisabled {
 		// A distinct non-terminal outcome: never a transient requeue, never the account
@@ -484,6 +505,20 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 		origin = "credential_unavailable"
 		if !holdClass {
 			transient = false
+		}
+	}
+	if decision == nil && runEnvLaneRun && payload != nil {
+		// PRD #4416 M2: recompute the effective and redact key lists under the owner fence and
+		// compare them with the snapshot assembly took (as refuseOversizeRunClaim measures the final
+		// payload). A change in between delivers nothing: the run returns to queued and its next claim
+		// assembles the current set. A description-only edit changes no (var_id, rev), so it is not a mismatch.
+		current, cerr := runEnvSnapshotCurrent(ctx, q, locked, payload)
+		if cerr != nil {
+			return nil, "", cerr
+		}
+		if !current {
+			decision, transient, holdClass = errRunEnvStale, true, false
+			payload = nil
 		}
 	}
 	if decision == nil {
@@ -513,6 +548,9 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 			decision, origin = serr, "provisioning_failed"
 			holdClass, transient = false, false
 		} else {
+			if err := recordRunEnvReceipts(ctx, q, locked, payload); err != nil {
+				return nil, "", err
+			}
 			if err := q.Commit(ctx); err != nil {
 				return nil, "", err
 			}
@@ -602,6 +640,12 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 				overrideSeq, err = q.InsertRunOverrideUnavailableMessage(ctx, store.InsertRunOverrideUnavailableMessageParams{RunID: run.ID, Payload: raw})
 			}
 		}
+	case runEnvUnavailable:
+		// The same exact-claim fence and undelivered-claim shape as the override park; the hold
+		// reason is fixed by the query.
+		n, err = q.ParkRunEnvHistoryUnavailableRun(ctx, store.ParkRunEnvHistoryUnavailableRunParams{
+			ID: run.ID, WorkerID: pgconv.UUID(identity.workerID), ClaimGeneration: run.ClaimGeneration,
+		})
 	case credDisabled:
 		// Status exactly 'claimed' at this generation and worker with an unreleased claim (the
 		// query's fence, which admits any hold_reason: a resumed completion_blocked annotation
@@ -676,7 +720,7 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 		s.SettleRetainedCheckpoint(run.ID)
 	}
 	switch {
-	case overrideUnavailable, credDisabled:
+	case overrideUnavailable, credDisabled, runEnvUnavailable:
 		return nil, "paused", nil
 	case !holdClass && !transient:
 		return nil, "failed", nil
@@ -695,8 +739,9 @@ const (
 const codexResetFailureReason = "the bound Codex login is unavailable after your account reset; start a new run"
 
 // claimCredentialsReset reports whether the run's owner redeemed an account reset link after the
-// run was created (PRD #3989). It is a plain read: it takes no users row lock, so it adds no edge to
-// the run-then-users lock order. A missing marker or user is "no".
+// run was created (PRD #3989). It is a plain read that takes no lock of its own; a lead-lane
+// finish already holds the owner's users row FOR SHARE for the run-env fence (PRD #4416 M2) in the
+// same run-then-users order, which is the only edge the finish adds. A missing marker or user is "no".
 func claimCredentialsReset(ctx context.Context, q claimFinishQueries, locked store.Run) (bool, error) {
 	marker, err := q.GetUserCredentialsResetAt(ctx, locked.UserID)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -766,7 +811,7 @@ func claimAssemblyOrigin(err error) string {
 		return "guardrail_blocked"
 	case errors.Is(err, errCredentialUnavailable):
 		return "credential_unavailable"
-	case errors.Is(err, errToolPackagesRejected), errors.Is(err, errClaimTooLarge):
+	case errors.Is(err, errToolPackagesRejected), errors.Is(err, errClaimTooLarge), errors.Is(err, errRunEnvBounds):
 		return "provisioning_failed"
 	// ErrCrossCheckRefused is a separate sentinel grouped under the same origin; the legacy
 	// mr_rework refusal arrives via errGuardrailBlockedClaim (legacyReviewClaimError).

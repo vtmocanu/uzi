@@ -6,6 +6,7 @@ import {
 } from "./client.js";
 import type { CandidateTransportReservation, MessageBatcher } from "./batcher.js";
 import type { StateAck } from "./protocol.js";
+import { redactStrings, type TextRedactor } from "./redact.js";
 
 /** Execution-local context only. Status proofs never create or replace a presentation. */
 export interface CheckedHumanGate {
@@ -44,6 +45,8 @@ interface CheckPlanOptions {
   /** "required" (default): an APPROVE releases the autopilot approval. "gated": an APPROVE yields
    * gated_pass and a human still approves. */
   mode?: "required" | "gated";
+  /** PRD #4416 M2: the run's text redactor; every text field of the candidate passes it before it is submitted. */
+  redactText?: TextRedactor;
 }
 
 export function checkPlan(options: CheckPlanOptions & { mode: "gated"; allowAutomaticRevision?: false }):
@@ -56,7 +59,14 @@ export function checkPlan(options: CheckPlanOptions & { mode?: "required" }):
   Promise<Exclude<CheckedPlanDecision, { kind: "gated_pass" }>>;
 export function checkPlan(options: CheckPlanOptions): Promise<CheckedPlanDecision>;
 export async function checkPlan(options: CheckPlanOptions): Promise<CheckedPlanDecision> {
-  const { client, runId, generation, candidate, batcher, signal } = options;
+  const { client, runId, generation, batcher, signal } = options;
+  // The semantic candidate carries its own digests and was compiled from redacted text; the
+  // structural text fields are redacted here, at the sink.
+  const { semantic_candidate: semanticCandidate, ...structuralFields } = options.candidate;
+  const candidate: PlanCrossCheckCandidate = {
+    ...redactStrings(structuralFields, options.redactText),
+    ...(semanticCandidate === undefined ? {} : { semantic_candidate: semanticCandidate }),
+  };
   const timing = options.timing;
   const round = options.round ?? 1;
   if (!Number.isSafeInteger(round) || round < 1 || round > 5)

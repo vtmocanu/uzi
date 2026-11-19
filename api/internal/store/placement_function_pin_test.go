@@ -108,6 +108,8 @@ func TestPlacementAdmittingWorkersCarriesEveryInlineClause(t *testing.T) {
 		"pc.worker_id IS DISTINCT FROM w.id":                                     1,
 		"protocol_check.round = (SELECT max(latest.round)":                       1,
 		"r.required_capabilities <@":                                             1,
+		// PRD #4416 M2: the run-env clause calls the one lane function and inlines no kind list.
+		"fn_run_env_lane(r.kind, r.review_target_run_id, r.egress_profile_id)": 1,
 	}
 	for _, c := range []string{
 		"milestone_reconciliation_claim_v1", "task_checkpoint_coordinates_v1", "publication_resume_v1",
@@ -116,7 +118,7 @@ func TestPlacementAdmittingWorkersCarriesEveryInlineClause(t *testing.T) {
 		"codex_completion_interlock_v1", "codex_custom_model_v1", "cross_check_v1",
 		"cross_check_codex_lead_v1", "cross_check_semantic_plan_v1", "cross_check_owner_steering_v1",
 		"completion_semantic_publication_v1", "cross_check_code_v1", "cross_check_lane_v1",
-		"cross_check_rounds_v1", "cross_check_pins_v1", "claude_provider_v1",
+		"cross_check_rounds_v1", "cross_check_pins_v1", "claude_provider_v1", "run_env_v1",
 	} {
 		want["'"+c+"' = ANY(w.protocol_capabilities)"] = 1
 	}

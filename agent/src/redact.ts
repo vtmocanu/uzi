@@ -125,6 +125,24 @@ export function makeRedactor(secrets: Array<string | undefined | null>): Payload
   return (payload) => walk(payload) as Record<string, unknown>;
 }
 
+/** Applies a text redactor to every string value of a JSON-like value (keys untouched), returning a
+ *  copy. Used for structured candidates and reports that leave the worker. Identity-preserving when
+ *  `redact` is undefined. */
+export function redactStrings<T>(value: T, redact: TextRedactor | undefined): T {
+  if (!redact) return value;
+  const walk = (v: unknown): unknown => {
+    if (typeof v === "string") return redact(v);
+    if (Array.isArray(v)) return v.map(walk);
+    if (v && typeof v === "object") {
+      const out: Record<string, unknown> = {};
+      for (const [k, x] of Object.entries(v)) out[k] = walk(x);
+      return out;
+    }
+    return v;
+  };
+  return walk(value) as T;
+}
+
 /**
  * A growable secret registry (issue #4201). An in-place credential switch publishes a NEW OAuth
  * token mid-run, after the flight's redactors were built, so the flight needs redactors that read

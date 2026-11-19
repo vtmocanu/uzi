@@ -21,6 +21,7 @@
 // (resume). PATH is inherited so the bundled Claude Code CLI can find `git`,
 // `bash`, and coreutils.
 
+import { mergeRunEnv, type RunEnvInput } from "./run-env-merge.js";
 import { BROWSER_DISCOVERY_ENV } from "./browser-env.js";
 import { goConcurrencyEnv } from "./go-concurrency.js";
 import { runnerPath, runnerTmpdir } from "./runner-uid.js";
@@ -191,6 +192,11 @@ function credentialEnv(credential: SdkCredential): Record<string, string | undef
  *                   this parameter (a provisioned GOTMPDIR behaves as before).
  * @param runTmpdir  issue #4420: the run-owned scratch leaf (`RunContext.runTmpdir`). When set it
  *                   is the TMPDIR instead of the shared runner TMPDIR; undefined ⇒ unchanged.
+ * @param runEnv     PRD #4416 M2: the repository variables of a receiving run lane. Merged right
+ *                   after the toolEnv fold at the LOWEST precedence (see mergeRunEnv): an existing
+ *                   key, a protected key or a name the shared name rules deny is dropped. Every
+ *                   worker-set key below is applied after the merge and so always wins. Only the
+ *                   SDK executor passes it; undefined ⇒ no user variable.
  */
 export function buildSdkEnv(
   credential: SdkCredential,
@@ -200,6 +206,7 @@ export function buildSdkEnv(
   attempt?: SdkAttemptEnv,
   goWorkDir?: string,
   runTmpdir?: string,
+  runEnv?: RunEnvInput,
 ): SdkEnv {
   const env = {
     ...credentialEnv(credential),
@@ -245,6 +252,7 @@ export function buildSdkEnv(
     if (PROTECTED_ENV_KEYS.has(k)) continue;
     env[k] = v;
   }
+  mergeRunEnv(env as unknown as Record<string, string | undefined>, runEnv, (k) => PROTECTED_ENV_KEYS.has(k));
   // Issue #3382: the worker's optional Go build concurrency defaults (GOFLAGS=-p=N,
   // GOMAXPROCS=N). Worker-set, applied AFTER the fold so a provisioned var cannot
   // override them; absent settings add no key at all. Not protected keys.

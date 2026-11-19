@@ -94,6 +94,12 @@ import type {
 } from "../src/codex/codex-advice-harness.js";
 import { CodexAdviceHarness } from "../src/codex/codex-advice-harness.js";
 import { makeRedactor, makeTextRedactor } from "../src/redact.js";
+import type { RunEnvInput } from "../src/run-env-merge.js";
+import type { RunEnvVar } from "../src/run-env-claim.js";
+import {
+  catalogue, DENIED_NAMES, GIT_AUTHORITY_NAMES, INJECTED_PACKAGE_NAMES, isAllowed, MANAGED_DIR_NAMES, NETWORK_WIRING_NAMES,
+  PROVIDER_AUTH_NAMES, runEnvVar, SDK_READ_ALLOWED_NAMES,
+} from "./run-env-catalogue.js";
 import { MessageBatcher } from "../src/batcher.js";
 import { JudgeEvidenceReducer, type JudgeEvidence } from "../src/judge-evidence.js";
 import { MAX_PROJECTED_BYTES } from "../src/codex/projection.js";
@@ -31681,5 +31687,171 @@ describe("issue #4313 real CodexExecutor + RunRunner over the done gate and resu
     assert.ok(!(obs.gateError instanceof SecretRemediationStoppedError), String(obs.gateError));
     assert.equal(obs.pendingAfterControl, true, "the preflight was still waiting for A after the control arrived");
     assert.equal(obs.decision?.action, "proceed", "the decision is the no-pause one (a clean fetch-back proceeds)");
+  });
+});
+
+// ================================================================================
+// PRD #4416 M2 — repository variables in the Codex command environment. Lowest precedence; the
+// worker's own keys, the tool profile's keys and the protected keys always win; the app-server
+// launch spec never receives a user variable.
+describe("CodexExecutor: repository variables (PRD #4416 M2)", () => {
+  const HOST = "unix:///run/dind/docker.sock";
+  const dropped: Array<[string, string]> = [];
+  const input = (vars: RunEnvVar[]): RunEnvInput => ({ vars, onDrop: (n, r) => dropped.push([n, r]) });
+  beforeEach(() => { dropped.length = 0; });
+
+  it("the hostile catalogue leaves every worker-built key byte-identical and drops every denied name", () => {
+    const tool = { PATH: "/provisioned/bin", NIX_SSL_CERT_FILE: "/nix/cert", TOOL_PROFILE_KEY: "tool" };
+    const baseline = buildCommandEnv("/private/tmp", tool, HOST, true);
+    const withVars = buildCommandEnv("/private/tmp", tool, HOST, true, input(catalogue()));
+    for (const [k, v] of Object.entries(baseline)) assert.equal(withVars[k], v, `${k} changed`);
+    for (const group of [PROVIDER_AUTH_NAMES, GIT_AUTHORITY_NAMES, MANAGED_DIR_NAMES, NETWORK_WIRING_NAMES]) {
+      for (const k of group) assert.equal(Object.hasOwn(withVars, k), Object.hasOwn(baseline, k), `${k} presence changed`);
+    }
+    for (const n of DENIED_NAMES) assert.ok(!Object.hasOwn(withVars, n) || Object.hasOwn(baseline, n), `denied ${n} was injected`);
+    for (const k of Object.keys(withVars).filter((x) => !Object.hasOwn(baseline, x))) assert.ok(isAllowed(k), `${k} is denied`);
+    for (const n of [...SDK_READ_ALLOWED_NAMES, ...INJECTED_PACKAGE_NAMES]) assert.equal(withVars[n], `value-of-${n}`, `${n} was not injected`);
+    assert.ok(Object.keys(withVars).every((k) => !isGitConfigKey(k)), "no inline git config key from a user variable");
+    const droppedNames = new Set(dropped.map(([n]) => n));
+    for (const n of DENIED_NAMES) assert.ok(droppedNames.has(n), `no drop event for ${n}`);
+  });
+
+  it("a smuggled PATH or BUN_BE_BUN is dropped; tool-profile and worker keys win", () => {
+    const e = buildCommandEnv("/private/tmp", { PATH: "/provisioned/bin", TOOL_PROFILE_KEY: "tool" }, HOST, false, input([
+      runEnvVar("PATH", { value: "/evil/bin" }), runEnvVar("BUN_BE_BUN", { value: "1" }), runEnvVar("TOOL_PROFILE_KEY", { value: "user" }),
+      runEnvVar("DOCKER_HOST", { value: "tcp://evil:2375" }), runEnvVar("TMPDIR", { value: "/evil/tmp" }),
+    ]));
+    assert.equal(e.PATH, "/opt/uzi-toolchain/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/provisioned/bin");
+    assert.ok(!("BUN_BE_BUN" in e));
+    assert.equal(e.TOOL_PROFILE_KEY, "tool");
+    assert.equal(e.DOCKER_HOST, HOST);
+    assert.equal(e.TMPDIR, "/private/tmp");
+    assert.match(dropped.find(([n]) => n === "TOOL_PROFILE_KEY")![1], /already set/);
+  });
+
+  it("without variables the environment is exactly today's", () => {
+    assert.deepStrictEqual(buildCommandEnv("/private/tmp", {}, HOST, false, input([])), buildCommandEnv("/private/tmp", {}, HOST, false));
+  });
+
+  it("a run executes every command with the variables, and the app-server launch receives none", async () => {
+    const rig = makeRig();
+    const launches: unknown[] = [];
+    const launch = rig.deps.launchProviderRoot!;
+    rig.deps = { ...rig.deps, launchProviderRoot: (async (...a: Parameters<typeof launch>) => { launches.push(a[0]); return launch(...a); }) as typeof launch };
+    rig.transport.push(threadStarted()).push(toolCall(1, "Bash", { command: "docker ps" }, "th-1", "tn-1", "docker-0"));
+    rig.transport.push(signalDone()).push(turnCompleted("completed")).end();
+    const { ctx, emitted } = makeCtx({ runEnv: catalogue() });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION), noopLog, { dockerHost: HOST }).run(ctx), 3000, "run with variables");
+    const commandEnvs = [rig.fileopSpawns[0]!.env, (rig.spawnCommandCalls[0]!.opts as { env: NodeJS.ProcessEnv }).env];
+    for (const commandEnv of commandEnvs) {
+      assert.equal(commandEnv.NPM_TOKEN, "value-of-NPM_TOKEN");
+      assert.equal(commandEnv.DOCKER_AUTH_CONFIG, "value-of-DOCKER_AUTH_CONFIG");
+      assert.equal(commandEnv.DOCKER_HOST, HOST);
+      assert.ok(!("BUN_BE_BUN" in commandEnv) && !("NODE_OPTIONS" in commandEnv) && !("GITHUB_TOKEN" in commandEnv));
+    }
+    assert.ok(launches.length > 0, "the provider root was launched");
+    assert.ok(!JSON.stringify(launches).includes("value-of-"), "the app-server launch spec carries no user variable");
+    const statuses = emitted.filter((m) => m.kind === "status").map((m) => String(m.payload.text));
+    assert.ok(statuses.some((t) => /repository variable NODE_OPTIONS was not set/.test(t)), "a dropped name is reported");
+    assert.ok(statuses.every((t) => !t.includes("value-of-")), "a status line never carries a value");
+  });
+
+  it("a run without variables is unchanged: no user variable in any command environment", async () => {
+    const rig = makeRig();
+    rig.transport.push(threadStarted()).push(toolCall(1, "Bash", { command: "docker ps" }, "th-1", "tn-1", "docker-0"));
+    rig.transport.push(signalDone()).push(turnCompleted("completed")).end();
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION), noopLog, { dockerHost: HOST }).run(makeCtx().ctx), 3000, "run without variables");
+    for (const commandEnv of [rig.fileopSpawns[0]!.env, (rig.spawnCommandCalls[0]!.opts as { env: NodeJS.ProcessEnv }).env]) {
+      assert.ok(!Object.values(commandEnv).some((v) => String(v).startsWith("value-of-")));
+    }
+  });
+});
+
+function isGitConfigKey(k: string): boolean {
+  return k === "GIT_CONFIG_COUNT" || k === "GIT_CONFIG_PARAMETERS" || /^GIT_CONFIG_(KEY|VALUE)_\d+$/.test(k);
+}
+
+describe("CodexExecutor: repository variables in the prompt (PRD #4416 M2)", () => {
+  const SECRET_VALUE = ["top", "secret", "value", "0042"].join("-");
+  const turnTexts = (t: FakeTransport): string[] =>
+    t.requests
+      .filter((r) => r.method === "turn/start")
+      .map((r) => (r.params as { input?: { text?: string }[] }).input?.[0]?.text ?? "");
+  const approve = { kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } } } as never;
+
+  it("the plan and the implement prompts list names and plain values, sanitised, and never a secret value", async () => {
+    const ESC = String.fromCharCode(27);
+    const rig = makeMultiEpochRig([
+      (c) => {
+        if (c.method === "thread/start") return { thread: { id: "th-plan" } };
+        if (c.method === "turn/start") {
+          c.transport
+            .push(threadStarted("th-plan"))
+            .push(toolCall(1, "submit_plan", { plan_md: "PLAN" }, "th-plan", "tn-plan", "c-plan"))
+            .push(turnCompleted("completed", "th-plan", "tn-plan"));
+          return { turn: { id: "tn-plan" } };
+        }
+        return {};
+      },
+      epochResponder("resumed-a", "tn-impl-a", (t, th, tn) => {
+        t.push(toolCall(72, "signal_done", {}, th, tn, "c-done")).push(turnCompleted("completed", th, tn));
+      }),
+    ]);
+    const runEnv = [
+      runEnvVar("SERVICE_URL", { value: "http://stub.example.test:8080", description: "Base URL" }),
+      runEnvVar("SERVICE_KEY", { value: SECRET_VALUE, secret: true, description: `key${ESC}[31m\r\nnext\u202eline\u2066x\u200by` }),
+    ];
+    const { ctx } = makeCtx({ planApproved: false, approvedPlan: undefined, checkpoint: async () => undefined, gatePlan: async () => approve, runEnv });
+    const executor = new CodexExecutor(
+      noopLog, "/data/agent-home/run-1",
+      { binding: bindingOf(SUBSCRIPTION), client: rig.client as never, provider },
+      { ...rig.deps, spawnCommand: async (argv) => (isEnvProbe(argv)
+        ? { code: 0, stdout: `${JSON.stringify({ uzi_envprobe: 1, proc: "ok", home: "ok", tmp: "ok" })}\n`, stderr: "" }
+        : { code: 0, stdout: "ok", stderr: "" }) },
+    );
+    await withTimeout(executor.run(ctx), 5000, "run env prompt run");
+    const prompts = [...turnTexts(rig.epochs[0]!.transport), ...turnTexts(rig.epochs[1]!.transport)];
+    assert.equal(prompts.length, 2);
+    for (const text of prompts) {
+      assert.match(text, /<run_env_[0-9a-f]{16}>/);
+      assert.match(text, /SERVICE_URL \(repo plain\): Base URL \| value: "http:\/\/stub\.example\.test:8080"/);
+      assert.match(text, /SERVICE_KEY \(repo secret\): key/);
+      assert.ok(!text.includes(SECRET_VALUE), "a secret value never appears in a prompt");
+      const block = text.slice(text.indexOf("<run_env_"), text.indexOf("</run_env_"));
+      for (const ch of block) { const cp = ch.codePointAt(0)!; assert.ok(cp === 10 || !(cp <= 0x1f || (cp >= 0x7f && cp <= 0x9f) || (cp >= 0x200b && cp <= 0x200f) || cp === 0x2028 || cp === 0x2029 || (cp >= 0x202a && cp <= 0x202e) || (cp >= 0x2060 && cp <= 0x206f) || cp === 0xfeff), `unsafe U+${cp.toString(16)} in the block`); }
+    }
+  });
+});
+
+// PRD #4416 M2: the Codex plan summary (POST /summary/plan) passes the run's redactor.
+describe("CodexExecutor: plan summary redaction (PRD #4416 M2)", () => {
+  const SECRET = ["plan", "summary", "secret", "0099"].join("-");
+  it("redacts the summary, each delta and the plan text before the POST", async () => {
+    const posts: Array<{ summary: string; deltas: Array<{ text: string }>; plan_md: string }> = [];
+    const summaryRunner = {
+      generateIntentSummary: async () => null,
+      generatePlanSummary: async (input: { onUsage?: (u: object) => void }) => {
+        input.onUsage?.({});
+        return { summary: `uses ${SECRET} for auth`, deltas: [{ kind: "added", text: `exports ${SECRET}` }] };
+      },
+    } as unknown as SummaryRunner;
+    let callbackDone: Promise<void> | undefined;
+    const gatePlan: NonNullable<RunContext["gatePlan"]> = async (md, _milestones, persisted) => {
+      callbackDone = persisted!(md);
+      return { kind: "approve", selection: { status: "absent" } };
+    };
+    const planResponder = epochResponder("th-plan", "tn-plan", (t, th, tn) =>
+      t.push(toolCall(98, "submit_plan", { plan_md: `# Plan\nset token ${SECRET}` }, th, tn, "plan")).push(turnCompleted("completed", th, tn)));
+    const implementResponder = epochResponder("th-impl", "tn-impl", (t, th, tn) =>
+      t.push(toolCall(99, "signal_done", {}, th, tn, "done")).push(turnCompleted("completed", th, tn)));
+    const rig = makeMultiEpochRig([planResponder, implementResponder]);
+    Object.assign(rig.client, { postIntentSummary: async () => {}, postPlanSummary: async (_id: string, body: (typeof posts)[number]) => { posts.push(body); } });
+    const { ctx } = makeCtx({ kind: "issue", planApproved: false, approvedPlan: undefined, summaryIntentPresent: true, gatePlan, redactText: makeTextRedactor([SECRET]) });
+    await withTimeout(makeExecutor(rig, bindingOf(API_KEY), noopLog, undefined, provider, { summaryRunner, summarySettleMs: 1 }).run(ctx), 5000, "codex plan summary run");
+    await callbackDone;
+    for (let i = 0; i < 50 && posts.length === 0; i++) await new Promise((r) => setTimeout(r, 5));
+    assert.equal(posts.length, 1);
+    assert.ok(!JSON.stringify(posts).includes(SECRET), "the secret reached /summary/plan");
+    assert.ok(JSON.stringify(posts).includes("***REDACTED***"));
   });
 });

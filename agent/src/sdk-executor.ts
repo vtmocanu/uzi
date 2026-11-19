@@ -89,12 +89,14 @@ import {
   buildAutomaticRevisionPrompt,
   renderPlanApprovalAdvice,
   buildSelfImprovePlanPrompt,
+  buildRunEnvBlock,
   dockerScratchResumeNote,
   isNotCodePlan,
 } from "./prompt.js";
 import { isRunSummaryKind, resolveRunKind } from "./run-kind.js";
 import { isDecisionsMemoKind } from "./decisions-memo.js";
 import { dropRunCaches, type RunCacheDropResult } from "./run-caches.js";
+import { runEnvInput } from "./run-env-prompt.js";
 import { defaultEnvProbeSpawner, environmentFactsSummary, runEnvProbe, type EnvFacts, type EnvProbeSpawner } from "./env-probe.js";
 import { readRepoInstructions } from "./repo-instructions.js";
 import {
@@ -143,7 +145,7 @@ import { emitPlanMissingNotice, isProseOnlyPlanTurn, PLAN_MISSING_NUDGE, REASON_
 import { errMessage } from "./util.js";
 import { assertResidueQuarantineOpen } from "./residue-quarantine.js";
 import { isSeededOwnerPlan } from "./seeded-plan.js";
-import { SummaryRunner, type PlanSummaryResult } from "./summary-runner.js";
+import { SummaryRunner, redactPlanSummary, type PlanSummaryResult } from "./summary-runner.js";
 import { resolvePrdInput, type PrdInput } from "./prd-link.js";
 import {
   STALL_LIMIT,
@@ -1502,10 +1504,11 @@ export class SdkExecutor implements Executor {
             },
           });
           if (!result || !allowed()) return;
+          const safe = redactPlanSummary(result, ctx.redactText);
           await this.client!.postPlanSummary(ctx.runId, {
-            ...result, plan_md: planMd.replaceAll("\u0000", ""),
+            ...safe, plan_md: (ctx.redactText?.(planMd) ?? planMd).replaceAll("\u0000", ""),
           });
-          if (allowed()) this.latestPlanSummary = result;
+          if (allowed()) this.latestPlanSummary = safe;
         } catch (error) {
           this.log.warn("plan summary hook failed", { run_id: ctx.runId, error: errMessage(error) });
         } finally { this.planFlights.delete(owned); }
@@ -1670,7 +1673,9 @@ export class SdkExecutor implements Executor {
     // agent starts is positively attributable to this attempt by the quiescence reaper.
     // PRD #4320 module 6: a provider run builds its env from the frozen binding and never carries an OAuth token.
     const credential: SdkCredential = ctx.provider ? sdkCredentialFromBinding(ctx.provider) : { kind: "oauth", token: oauthToken! };
-    const env = buildSdkEnv(credential, this.homeDir, toolEnv, this.dockerHost, ctx.runAttempt, ctx.managedGoWorkDir, ctx.runTmpdir);
+    const env = buildSdkEnv(credential, this.homeDir, toolEnv, this.dockerHost, ctx.runAttempt, ctx.managedGoWorkDir, ctx.runTmpdir,
+      // PRD #4416 M2: the repository variables, lowest precedence; a dropped name is a worker status line.
+      runEnvInput(ctx.runEnv, (text) => ctx.emit({ kind: "status", agent: "worker", payload: { text } })));
     // issue #1866 M2: measure the lead's execution environment once, before the plan turn. The
     // probe runs as the runner uid with this SDK env in its own process group: a baseline for
     // what the lead's commands can do, NOT provably identical to an SDK Bash tool call (the SDK
@@ -1797,10 +1802,13 @@ export class SdkExecutor implements Executor {
     // the materialized survivors, so it never lists a uzi:<name> not in the plugin
     // dir) plus the all-templates repo survivors (PRD §Worker point 3).
     const survivorNames = new Set(runSkills.map((s) => s.name));
+    // PRD #4416 M2: the repository variables block every subagent's prompt carries (one nonce per run).
+    const runEnvBlock = buildRunEnvBlock(ctx.runEnv);
     const assembled = assembleAgents(
       ctx.agents ?? [],
       survivorNames,
       prepared.repoSurvivorNames,
+      runEnvBlock,
     );
     // Model precedence (PRD #17 Decision 6): the run owner's per-user default
     // model wins over the lead template's model for the main thread. Set the key
@@ -1844,6 +1852,7 @@ export class SdkExecutor implements Executor {
         ctx.approvedSelection?.source === "repo" ? ctx.approvedSelection.exclusions : [],
         survivorNames,
         prepared.repoSurvivorNames,
+        runEnvBlock,
       )
       : assembled.subagents;
     const planTurn = planTurnSubagents(planPool);
@@ -2016,6 +2025,7 @@ export class SdkExecutor implements Executor {
         runId: ctx.runId,
         claimGeneration: ctx.claimGeneration,
         log: this.log,
+        ...(ctx.redactText ? { redactText: ctx.redactText } : {}),
       }).server;
       // PRD #158: run-lane forge READ tools (mcp__forge__*). Endpoints are
       // run-scoped, so the server needs only the client + runId — no RunContext
@@ -2029,6 +2039,7 @@ export class SdkExecutor implements Executor {
         client: this.client,
         runId: ctx.runId,
         log: this.log,
+        ...(ctx.redactText ? { redactText: ctx.redactText } : {}),
       }).server;
       // PRD #333 M2: the incidental-findings capture tool (mcp__findings__report_-
       // incidental_issue). A PLAIN working tool (POST → emit card → ack, turn
@@ -2043,6 +2054,7 @@ export class SdkExecutor implements Executor {
         runId: ctx.runId,
         emit: (m) => ctx.emit(m),
         log: this.log,
+        ...(ctx.redactText ? { redactText: ctx.redactText } : {}),
       }).server;
     }
 
@@ -2571,6 +2583,8 @@ export class SdkExecutor implements Executor {
             publishedTip: ctx.publishedTip,
             // PRD #501 REC B: thread the autopilot flag so the plan note renders.
             autoApprove: ctx.autoApprove,
+            // PRD #4416 M2: the repository variables set in every command (no block when empty).
+            runEnv: ctx.runEnv,
           });
         } else if (isSelfImprove) {
           // The self_improve run's issue_description carries the untrusted improve_uzi
@@ -2603,6 +2617,8 @@ export class SdkExecutor implements Executor {
             publishedTip: ctx.publishedTip,
             // PRD #501 REC B: thread the autopilot flag so the plan note renders.
             autoApprove: ctx.autoApprove,
+            // PRD #4416 M2: the repository variables set in every command (no block when empty).
+            runEnv: ctx.runEnv,
           });
         } else {
           planPrompt = buildPlanPrompt({
@@ -2636,6 +2652,8 @@ export class SdkExecutor implements Executor {
             publishedTip: ctx.publishedTip,
             // PRD #501 REC B: thread the autopilot flag so the plan note renders.
             autoApprove: ctx.autoApprove,
+            // PRD #4416 M2: the repository variables set in every command (no block when empty).
+            runEnv: ctx.runEnv,
             // issue #1866 M2: the run-start environment facts (no block when nothing to say).
             environmentFacts,
           });
@@ -3069,6 +3087,7 @@ export class SdkExecutor implements Executor {
         selection.exclusions,
         survivorNames,
         prepared.repoSurvivorNames,
+        buildRunEnvBlock(ctx.runEnv),
       );
       // PRD #305: repo-source defs are freshly built from repo files here and were NOT
       // touched by the own-roster override above; apply it so the flag covers the repo
@@ -3735,6 +3754,8 @@ export class SdkExecutor implements Executor {
             // issue #1866 M2: the run-start environment facts, rendered on first turns only
             // (gated inside buildImplementPrompt).
             environmentFacts,
+            // PRD #4416 M2: the repository variables, rendered on first turns only (gated inside buildImplementPrompt).
+            runEnv: ctx.runEnv,
             // issue #279: teach the lead the report-only evidence path, ISSUE RUNS ONLY —
             // gated on the same isIssueRun discriminator the signal_done schema uses.
             reportOnly: isIssueRun,

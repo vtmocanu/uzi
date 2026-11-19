@@ -27,6 +27,7 @@ import { uidSplitActive } from "./runner-uid.js";
 import { errMessage, sleep } from "./util.js";
 import { toolchainPreflight, type PreflightResult } from "./toolchain-preflight.js";
 import { memoryLauncherPreflight, type MemoryLauncherPreflightResult } from "./claude-command/preflight.js";
+import { RUN_ENV_CAPABILITY } from "./run-env-claim.js";
 import { CODEX_COMPLETION_INTERLOCK_CAPABILITY, CODEX_CUSTOM_MODEL_CAPABILITY, CODEX_HARNESS_CAPABILITY, CODEX_RUNTIME_V2_CAPABILITY } from "./codex/codex-runtime-probe.js";
 import { residueQuarantine } from "./residue-quarantine.js";
 import type { WorkerMemoryRuntime } from "./worker-memory-runtime.js";
@@ -1069,6 +1070,9 @@ export class Worker {
           // writes Closes #<iid>. Advertised UNCONDITIONALLY: the api offers a run on a linked
           // repo only to a worker advertising it.
           "issue_key_v1",
+          // PRD #4416 M2: this image receives, redacts and merges repository variables into the lead
+          // lanes' command environment. Advertised UNCONDITIONALLY: the api's claim gate keys on it.
+          RUN_ENV_CAPABILITY,
           // Verified artifact files use Linux descriptor anchoring; other hosts remain logs-only.
           ...(process.platform === "linux" ? ["ci_artifacts_v1"] : []),
         ];

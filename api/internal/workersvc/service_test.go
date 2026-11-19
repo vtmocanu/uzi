@@ -210,6 +210,8 @@ type fakeStore struct {
 	claimCredParked       *store.ParkCredentialDisabledRunParams
 	claimOverrideParked   *store.ParkRunOverrideUnavailableRunParams
 	claimOverrideMessages []store.InsertRunOverrideUnavailableMessageParams
+	// runEnv models the repository variables of a claim (PRD #4416 M2); nil is a repo without any.
+	runEnv *fakeRunEnv
 	// hasActiveRunForIssue is what the CreateRun dedup pre-check returns (PRD #754 M4);
 	// hasActiveRunForIssueErr forces its error path.
 	hasActiveRunForIssue    bool

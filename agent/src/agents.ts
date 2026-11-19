@@ -163,6 +163,7 @@ function toDefinition(
   t: AgentTemplate,
   availableSkills?: ReadonlySet<string>,
   allTemplateSkillNames: readonly string[] = [],
+  runEnvBlock = "",
 ): AgentDefinition {
   const def: AgentDefinition = {
     description: t.description,
@@ -176,12 +177,14 @@ function toDefinition(
     //  - SECRET_FIXTURE_HYGIENE_APPEND (PRD #1120): the secret-shaped-fixture source-hygiene
     //    rule, same constant as the lead prompt (buildLeadSystemPrompt) — one source of
     //    wording — so every subagent gets it without editing its body.
+    //  - runEnvBlock (PRD #4416 M2): the run's repository variables (names, descriptions, plain
+    //    values; never a secret value), passed in by the executor; "" adds nothing.
     //  - SUBAGENT_SAFETY_APPEND (issue #1660): the worker-owned safety block, LAST. Both
     //    rosters (assembleAgents, subagentsFromTemplates) build through here, so no role
     //    body, repo-authored included, can drop it.
     //  - CLAUDE_LONG_COMMAND_APPEND: the Claude Bash tool's long-command recipe. This path
     //    builds Claude subagents only (Codex renders through codex/render.ts without it).
-    prompt: `${t.prompt_body}\n\n${FINDINGS_NUDGE_APPEND}\n\n${WORKER_RUNTIME_APPEND}\n\n${SECRET_FIXTURE_HYGIENE_APPEND}\n\n${CLAUDE_LONG_COMMAND_APPEND}\n\n${SUBAGENT_SAFETY_APPEND}`,
+    prompt: `${t.prompt_body}\n\n${FINDINGS_NUDGE_APPEND}\n\n${WORKER_RUNTIME_APPEND}\n\n${SECRET_FIXTURE_HYGIENE_APPEND}\n\n${runEnvBlock === "" ? "" : `${runEnvBlock}\n\n`}${CLAUDE_LONG_COMMAND_APPEND}\n\n${SUBAGENT_SAFETY_APPEND}`,
     // No subagent may spawn nested agents (defense-in-depth over the fact that
     // `agents` + settingSources:[] already limit spawnable agents to these), reach
     // the run's workflow-signal MCP tools (SIGNAL_SERVER_DENY — the plan gate and
@@ -263,6 +266,7 @@ export function assembleAgents(
   templates: AgentTemplate[],
   availableSkills?: ReadonlySet<string>,
   repoSkillNames: readonly string[] = [],
+  runEnvBlock = "",
 ): AssembledAgents {
   const result: AssembledAgents = { subagents: {} };
   const lead = selectLeadTemplate(templates);
@@ -271,7 +275,7 @@ export function assembleAgents(
     if (lead.model) result.leadModel = lead.model;
   }
   for (const t of ownSubagentTemplates(templates)) {
-    result.subagents[t.name] = toDefinition(t, availableSkills, repoSkillNames);
+    result.subagents[t.name] = toDefinition(t, availableSkills, repoSkillNames, runEnvBlock);
   }
   return result;
 }
@@ -316,6 +320,7 @@ export function subagentsFromTemplates(
   exclude: ReadonlySet<string>,
   availableSkills?: ReadonlySet<string>,
   repoSkillNames: readonly string[] = [],
+  runEnvBlock = "",
 ): Record<string, AgentDefinition> {
   // The survivor set already CONTAINS the repo survivors (see PRECONDITION), so
   // unioning `repoSkillNames` back in would append a subset to its own superset —
@@ -325,7 +330,7 @@ export function subagentsFromTemplates(
   const subagents: Record<string, AgentDefinition> = {};
   for (const t of templates) {
     if (exclude.has(t.name)) continue;
-    subagents[t.name] = toDefinition(t, availableSkills, allTemplateSkillNames);
+    subagents[t.name] = toDefinition(t, availableSkills, allTemplateSkillNames, runEnvBlock);
   }
   return subagents;
 }
@@ -478,10 +483,11 @@ export function selectSubagents(
   exclusions: readonly string[],
   availableSkills?: ReadonlySet<string>,
   repoSkillNames: readonly string[] = [],
+  runEnvBlock = "",
 ): Record<string, AgentDefinition> {
   const exclude = new Set(exclusions);
   if (source === "repo") {
-    return subagentsFromTemplates(repoTemplates, exclude, availableSkills, repoSkillNames);
+    return subagentsFromTemplates(repoTemplates, exclude, availableSkills, repoSkillNames, runEnvBlock);
   }
   const out: Record<string, AgentDefinition> = {};
   for (const [name, def] of Object.entries(ownSubagents)) {

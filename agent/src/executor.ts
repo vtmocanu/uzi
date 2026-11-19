@@ -322,6 +322,10 @@ export interface RunContext {
    *  redactor is built from. The Codex executor applies it to projected tool text BEFORE bounding,
    *  so a claim secret straddling the cut cannot leave an unredacted prefix. Absent ⇒ identity. */
   redactText?: (s: string) => string;
+  /** PRD #4416 M2: the repository variables of a run that receives them (lead lanes only; runEnvForClaim).
+   *  Merged into the command environment at the lowest precedence and listed in the prompt. Secret
+   *  values are never rendered. Absent/empty ⇒ no user variable. */
+  runEnv?: readonly import("./run-env-claim.js").RunEnvVar[];
   /** Anthropic subscription OAuth token (CLAUDE_CODE_OAUTH_TOKEN) for the SDK. Empty on a provider run. */
   oauthToken?: string;
   /** PRD #4320 module 5/6: the decoded provider binding of a provider-bound run (exclusive with

@@ -1,3 +1,4 @@
+import { redactStrings, type TextRedactor } from "./redact.js";
 import { validateCoverageReport } from "./plan-contract-report.js";
 import { randomUUID, createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
@@ -19,7 +20,10 @@ const sameBinding = (a: SemanticBinding, b: SemanticBinding) =>
 export class SemanticPlanningGate {
   constructor(private readonly client: WorkerClient, private readonly runId: string,
     private readonly generation: number, private readonly signalSource: AbortSignal | (() => AbortSignal),
-    private readonly testTransport?: BoundedCoverageTestTransport) {}
+    private readonly testTransport?: BoundedCoverageTestTransport,
+    /** PRD #4416 M2: the run's text redactor. The structural candidate is redacted before it is
+     *  submitted and the coverage report before it is published. Absent ⇒ identity. */
+    private readonly redactText?: TextRedactor) {}
 
   /** The signal for one public call, resolved once on entry. A provider lets a caller whose
    * lifecycle controller is replaced (a credential-switch give-up) hand each call the live one. */
@@ -27,9 +31,12 @@ export class SemanticPlanningGate {
     return typeof this.signalSource === "function" ? this.signalSource() : this.signalSource;
   }
 
-  async compile(structural: PlanCrossCheckCandidate, proposal: SemanticSubmission | undefined,
+  async compile(rawStructural: PlanCrossCheckCandidate, proposal: SemanticSubmission | undefined,
     sources: readonly unknown[]): Promise<Compiled> {
     const signal = this.currentSignal();
+    // Redacted BEFORE the candidate is built, so the plan the server compiles and the "Foreign
+    // semantic plan" check below see the same bytes.
+    const structural = redactStrings(rawStructural, this.redactText);
     const compiled = await this.client.submitSemanticCandidate(this.runId, this.generation, structural, proposal, sources, signal);
     if (compiled.plan !== Buffer.from(structural.plan_md).toString("base64")) throw new Error("Foreign semantic plan");
     parseSemanticCandidate(compiled.candidate, { sources: compiled.sources, milestoneIds: structural.milestones.map(m => (m as { id: string }).id) });
@@ -135,7 +142,7 @@ export class SemanticPlanningGate {
     // Settlement is independent of publication. A failed settlement never publishes.
     if (result.report && last?.review_id && last.invocation_id && result.reason !== "coverage_settlement_failed") {
       await this.client.publishSemanticCoverage(this.runId, this.generation, {
-        review_id: last.review_id, invocation_id: last.invocation_id, report: result.report,
+        review_id: last.review_id, invocation_id: last.invocation_id, report: redactStrings(result.report, this.redactText),
       }, signal);
     }
     return result;

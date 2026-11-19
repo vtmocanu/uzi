@@ -14,6 +14,7 @@ import type { PublicationContextRequest, PublicationContextResponse } from "./pr
 import type { PublicationIntentRequest, PublicationIntentResult } from "./publication-intent.js";
 import type { CodexCatalogDefaultBody, LeadConfigReportBody } from "./protocol.js";
 import { decodeCompletionPending, type CompletionPending } from "./completion-pending.js";
+import { decodeRunEnv } from "./run-env-claim.js";
 import { CLAUDE_PROVIDER_CAPABILITY, decodeProviderBinding, ProviderBindingError } from "./provider-binding.js";
 import { SEMANTIC_GATE_ACK_MAX_BYTES, semanticGateAckSchema } from "./semantic-gate-wire.js";
 import { decodeInterruptedCalls, interruptedRegistration, type InterruptedRegistration, type InterruptedCalls } from "./interrupted-calls.js";
@@ -2554,6 +2555,14 @@ export class WorkerClient {
         if (provider) {
           this.requireProviderCapability();
           claim.secrets.provider = provider;
+        }
+        // PRD #4416 M2: repository variables are decoded fail-closed; a breach throws RunEnvClaimError
+        // (naming the rule, never a value) and the claim is unusable, like a malformed provider
+        // binding. The decoded copies replace the raw fields so nothing unvalidated travels on.
+        if (claim.secrets.run_env !== undefined || claim.secrets.run_env_redact !== undefined) {
+          const decoded = decodeRunEnv(claim.secrets);
+          claim.secrets.run_env = decoded.runEnv;
+          claim.secrets.run_env_redact = decoded.runEnvRedact;
         }
       }
       // PRD #1230 M4: a present-but-malformed maintainer-pending projection fails the claim closed.

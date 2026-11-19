@@ -2,6 +2,12 @@ import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { buildSdkEnv, PROTECTED_ENV_KEYS, type SdkCredential } from "../src/sdk-env.js";
 import { COMMAND_ENV_PROTECTED_KEYS } from "../src/codex/codex-executor.js";
+import { mergeRunEnv, type RunEnvInput } from "../src/run-env-merge.js";
+import type { RunEnvVar } from "../src/run-env-claim.js";
+import {
+  catalogue, DENIED_NAMES, GIT_AUTHORITY_NAMES, INJECTED_PACKAGE_NAMES, isAllowed, MANAGED_DIR_NAMES, NETWORK_WIRING_NAMES,
+  PROVIDER_AUTH_NAMES, runEnvVar, SDK_READ_ALLOWED_NAMES,
+} from "./run-env-catalogue.js";
 
 // PRD #4320 module 6: buildSdkEnv in provider mode. The gateway key is assembled at runtime: no
 // provider-token-shaped literal lives in source.
@@ -160,5 +166,80 @@ describe("buildSdkEnv provider mode (PRD #4320)", () => {
     ]) {
       assert.ok(PROTECTED_ENV_KEYS.has(k) && COMMAND_ENV_PROTECTED_KEYS.has(k), `${k} is protected in both sets`);
     }
+  });
+});
+
+// PRD #4416 M2: repository variables in the SDK environment. Lowest precedence; denied names,
+// protected keys and existing keys are dropped; worker-set keys always win.
+describe("buildSdkEnv repository variables (PRD #4416 M2)", () => {
+  const dropped: Array<[string, string]> = [];
+  const input = (vars: RunEnvVar[]): RunEnvInput => ({ vars, onDrop: (n, r) => dropped.push([n, r]) });
+  const worker = (cred: SdkCredential, runEnv?: RunEnvInput, toolEnv: Record<string, string> = { PATH: "/provisioned/bin", TOOL_PROFILE_KEY: "tool" }) =>
+    buildSdkEnv(cred, HOME_DIR, toolEnv, "unix:///run/dind/docker.sock", { marker: "m", clonePath: "/c", cloneKey: "k" }, "/data/go-work", "/data/run-tmp", runEnv);
+  beforeEach(() => { dropped.length = 0; process.env.UZI_CLI_CA_FILE = "/etc/ca/extra.pem"; });
+
+  for (const [label, cred] of [["provider", providerCred()], ["oauth", { kind: "oauth", token: FAKE_OAUTH } as SdkCredential]] as const) {
+    describe(`${label} run`, () => {
+      it("the hostile catalogue leaves every worker-built key byte-identical and drops every denied name", () => {
+        const baseline = worker(cred);
+        const withVars = worker(cred, input(catalogue()));
+        for (const [k, v] of Object.entries(baseline)) assert.equal(withVars[k], v, `${k} changed`);
+        // The groups the PRD names, key by key (a key absent without variables stays absent).
+        for (const group of [PROVIDER_AUTH_NAMES, GIT_AUTHORITY_NAMES, MANAGED_DIR_NAMES, NETWORK_WIRING_NAMES]) {
+          for (const k of group) assert.equal(Object.hasOwn(withVars, k), Object.hasOwn(baseline, k), `${k} presence changed`);
+        }
+        for (const k of Object.keys(withVars).filter((x) => !Object.hasOwn(baseline, x))) {
+          assert.ok(isAllowed(k), `${k} is a denied name and must not be injected`);
+        }
+        for (const n of DENIED_NAMES) assert.ok(!Object.hasOwn(withVars, n) || Object.hasOwn(baseline, n), `denied ${n} was injected`);
+        for (const k of Object.keys(withVars)) assert.ok(!k.startsWith("GIT_CONFIG") || Object.hasOwn(baseline, k));
+        // Allowed names are injected; package and build names too.
+        for (const n of [...SDK_READ_ALLOWED_NAMES, ...INJECTED_PACKAGE_NAMES]) assert.equal(withVars[n], `value-of-${n}`, `${n} was not injected`);
+        // Each denied name emits one drop naming a rule, and no value.
+        const droppedNames = new Set(dropped.map(([n]) => n));
+        for (const n of DENIED_NAMES) assert.ok(droppedNames.has(n), `no drop event for ${n}`);
+        for (const [, rule] of dropped) assert.ok(!rule.includes("value-of-"), "a drop reason never carries a value");
+      });
+
+      it("still selects the worker's provider and credential", () => {
+        const e = worker(cred, input(catalogue()));
+        if (cred.kind === "provider") {
+          assert.equal(e.ANTHROPIC_BASE_URL, GATEWAY_URL);
+          assert.equal(e.ANTHROPIC_AUTH_TOKEN, GATEWAY_KEY);
+          assert.equal(e.ANTHROPIC_DEFAULT_SONNET_MODEL, "corp-sonnet");
+          assert.equal(e.CLAUDE_CODE_OAUTH_TOKEN, undefined);
+        } else {
+          assert.equal(e.CLAUDE_CODE_OAUTH_TOKEN, FAKE_OAUTH);
+          assert.ok(!("ANTHROPIC_BASE_URL" in e));
+        }
+        for (const k of Object.keys(e)) assert.ok(!k.startsWith("CLAUDE_CODE_USE_"), `${k} would select another provider`);
+      });
+    });
+  }
+
+  it("a smuggled PATH or BUN_BE_BUN is dropped", () => {
+    const e = worker({ kind: "oauth", token: FAKE_OAUTH }, input([runEnvVar("PATH", { value: "/evil/bin" }), runEnvVar("BUN_BE_BUN", { value: "1" }), runEnvVar("NODE_OPTIONS", { value: "--require /evil.js" })]));
+    assert.equal(e.PATH, "/provisioned/bin");
+    assert.ok(!("BUN_BE_BUN" in e) && !("NODE_OPTIONS" in e));
+    assert.deepEqual(dropped.map(([n]) => n).sort(), ["BUN_BE_BUN", "NODE_OPTIONS", "PATH"]);
+  });
+
+  it("a tool-profile key wins over a user variable of the same name, and the drop names the rule", () => {
+    const e = worker({ kind: "oauth", token: FAKE_OAUTH }, input([runEnvVar("TOOL_PROFILE_KEY", { value: "user" })]));
+    assert.equal(e.TOOL_PROFILE_KEY, "tool");
+    assert.equal(dropped.length, 1);
+    assert.match(dropped[0]![1], /already set/);
+  });
+
+  it("without variables the environment is exactly today's", () => {
+    assert.deepStrictEqual(worker({ kind: "oauth", token: FAKE_OAUTH }, input([])), worker({ kind: "oauth", token: FAKE_OAUTH }));
+    assert.deepStrictEqual(worker({ kind: "oauth", token: FAKE_OAUTH }, undefined), worker({ kind: "oauth", token: FAKE_OAUTH }));
+  });
+
+  it("the merge itself skips a protected key whatever the name rules say", () => {
+    const env: Record<string, string | undefined> = { A: "a" };
+    mergeRunEnv(env, input([runEnvVar("B_PROTECTED"), runEnvVar("C_OK")]), (k) => k === "B_PROTECTED");
+    assert.deepEqual(env, { A: "a", C_OK: "value-of-C_OK" });
+    assert.match(dropped[0]![1], /protected/);
   });
 });

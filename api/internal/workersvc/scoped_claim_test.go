@@ -118,6 +118,9 @@ func (tx *scopedClaimTx) QueryRow(_ context.Context, sql string, args ...any) pg
 		return scopedClaimRow{err: pgx.ErrNoRows}
 	case "LockSecretEnablementForShareNowait":
 		return scopedClaimRow{value: false}
+	case "LockUserVaultStateForShareNowait":
+		// PRD #4416 M2: the lead-lane finish's owner fence.
+		return scopedClaimRow{value: store.LockUserVaultStateForShareNowaitRow{VaultMode: store.VaultModeUnprotected}}
 	case "GetUserCredentialsResetAt":
 		// Scoped-claim fixture users have never redeemed a reset link (NULL marker).
 		return scopedClaimRow{value: pgtype.Timestamptz{}}
@@ -157,7 +160,8 @@ func (tx *scopedClaimTx) Query(_ context.Context, sql string, _ ...any) (pgx.Row
 		if tx.afterTargets != nil {
 			tx.afterTargets()
 		}
-	case "ListWorkerPendingSince", "ListFreshWorkerPendingOutcomeSince", "LockOpenCustodyHoldsForRunWorkerGeneration":
+	case "ListWorkerPendingSince", "ListFreshWorkerPendingOutcomeSince", "LockOpenCustodyHoldsForRunWorkerGeneration",
+		"ListRunEnvEffectiveKeysForRun", "ListRunEnvRedactKeysForRun":
 	default:
 		return nil, fmt.Errorf("unexpected collection query %s", strings.Fields(sql)[2])
 	}

@@ -1076,6 +1076,16 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		s.recordCodexEpoch(ctx, run)
 	}
 
+	// PRD #4416 M2: the repository variables a lead-lane run receives, and the secret versions it
+	// must still mask. Both harnesses; an isolated run is outside the lane. An error here keeps a
+	// minted Codex capability's identity, so finishRunClaim settles that exact mint.
+	if err := s.attachRunEnv(ctx, wkr, run, payload); err != nil {
+		if errors.Is(err, errVaultLocked) || errors.Is(err, errRunEnvCapabilityMissing) || errors.Is(err, errRunEnvHistoryUnavailable) || errors.Is(err, errRunEnvBounds) {
+			return nil, crossCheckAssemblyError(payload, err)
+		}
+		return nil, err
+	}
+
 	// PRD #1798 D9: the existing PR's description record, for a PR-producing run whose PR
 	// already exists. Best-effort (a read error omits it); nil keeps the wire unchanged.
 	// Skipped for a profile-bound run (it has no PR, and stripForIsolation clears it anyway).

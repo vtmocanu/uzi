@@ -72,5 +72,28 @@ func ValidateDescription(description string) error {
 	if strings.IndexByte(description, 0) >= 0 {
 		return &RuleError{Field: "description", Rule: "must not contain NUL"}
 	}
+	for _, r := range description {
+		if r == 0x7f || (r >= 0x80 && r <= 0x9f) || r < 0x20 || isBidiOrFormat(r) {
+			return &RuleError{Field: "description", Rule: "must be plain text: control characters, escape sequences and bidirectional or invisible formatting characters are not allowed"}
+		}
+	}
 	return nil
+}
+
+// isBidiOrFormat reports the code points that can reorder or hide text where a description is
+// shown or put in a prompt: zero-width and directional marks (U+200B-200F), the line and paragraph
+// separators (U+2028, U+2029), the embedding and override controls (U+202A-202E), the word joiner
+// and invisible operators (U+2060-2064), the isolates and the deprecated formatting controls
+// (U+2066-206F), and the byte order mark (U+FEFF).
+func isBidiOrFormat(r rune) bool {
+	switch {
+	case r >= 0x200b && r <= 0x200f,
+		r == 0x2028, r == 0x2029,
+		r >= 0x202a && r <= 0x202e,
+		r >= 0x2060 && r <= 0x2064,
+		r >= 0x2066 && r <= 0x206f,
+		r == 0xfeff:
+		return true
+	}
+	return false
 }

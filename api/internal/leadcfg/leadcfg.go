@@ -142,3 +142,11 @@ func LeadLane(kind string, reviewTarget, egressProfileBound bool) bool {
 		return false
 	}
 }
+
+// RunEnvDelivered reports whether a run receives repository variables (PRD #4416 M2): exactly the
+// lead lane, so a review run and an isolated-lane run never do. It is LeadLane under the name the
+// run-environment code reads, and is mirrored in SQL by fn_run_env_lane (migration 00491), which
+// every claim, placement and health gate calls; a LiveDB test evaluates both over every run kind.
+func RunEnvDelivered(kind string, reviewTarget, egressProfileBound bool) bool {
+	return LeadLane(kind, reviewTarget, egressProfileBound)
+}
