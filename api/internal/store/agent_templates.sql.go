@@ -665,6 +665,55 @@ func (q *Queries) UpdateAgentTemplate(ctx context.Context, arg UpdateAgentTempla
 	return i, err
 }
 
+const updateAgentTemplateModelPins = `-- name: UpdateAgentTemplateModelPins :one
+UPDATE agent_templates
+SET model = $1,
+    codex_model = $2,
+    updated_by = $3,
+    updated_at = now()
+WHERE id = $4
+RETURNING id, name, description, model, tools, prompt_body, is_builtin, updated_by, created_at, updated_at, scope, user_id, customized, origin, codex_model
+`
+
+type UpdateAgentTemplateModelPinsParams struct {
+	Model      pgtype.Text `json:"model"`
+	CodexModel pgtype.Text `json:"codex_model"`
+	UpdatedBy  pgtype.UUID `json:"updated_by"`
+	ID         uuid.UUID   `json:"id"`
+}
+
+// CLI pin-only edit (PRD #3264 M3): writes ONLY the two model pins plus the audit
+// columns. description, tools, prompt_body, customized and origin are deliberately not
+// touched. The caller holds the row lock (GetAgentTemplateForUpdate) and passes the locked
+// current value for a lane the request omitted, so an omitted lane is preserved.
+func (q *Queries) UpdateAgentTemplateModelPins(ctx context.Context, arg UpdateAgentTemplateModelPinsParams) (AgentTemplate, error) {
+	row := q.db.QueryRow(ctx, updateAgentTemplateModelPins,
+		arg.Model,
+		arg.CodexModel,
+		arg.UpdatedBy,
+		arg.ID,
+	)
+	var i AgentTemplate
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.Description,
+		&i.Model,
+		&i.Tools,
+		&i.PromptBody,
+		&i.IsBuiltin,
+		&i.UpdatedBy,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.Scope,
+		&i.UserID,
+		&i.Customized,
+		&i.Origin,
+		&i.CodexModel,
+	)
+	return i, err
+}
+
 const updateSyncedGlobalTemplate = `-- name: UpdateSyncedGlobalTemplate :one
 UPDATE agent_templates
 SET description = $1,

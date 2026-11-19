@@ -78,6 +78,11 @@ type Handler struct {
 	// are nil in production: New leaves them unset.
 	modelSettingsBeginTx  func(ctx context.Context) (pgx.Tx, error)
 	modelSettingsReadback func(r *http.Request, userID uuid.UUID) (userSettingsDTO, error)
+	// templatePinsBeginTx and templatePinsReadback are the same kind of test seams for
+	// PUT /api/me/agent-templates/{id}/model-pins (PRD #3264 M3): a non-nil begin replaces
+	// h.pool.Begin, a non-nil readback replaces the post-commit row read. Both nil in production.
+	templatePinsBeginTx  func(ctx context.Context) (pgx.Tx, error)
+	templatePinsReadback func(ctx context.Context, id uuid.UUID) (store.AgentTemplate, error)
 	// secretBeginTx supplies a real transaction for secret mutations in tests.
 	// Production uses pool.BeginTx; withSecretLock enforces READ COMMITTED.
 	secretBeginTx func(ctx context.Context) (pgx.Tx, error)

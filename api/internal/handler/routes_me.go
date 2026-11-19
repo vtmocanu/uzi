@@ -298,6 +298,19 @@ func (h *Handler) mountMeRoutes(r chi.Router, authLimiter *mw.Limiter) {
 	// handler has no admin branch and the identity is the authenticated user, never the body.
 	r.With(h.requireUser()).Put("/me/model-settings", h.PutMyModelSettings)
 
+	// The caller's own agent templates for the CLI (PRD #3264 M3): a restricted list (identity,
+	// the two model pins, customized, editable; no prompt body, description or tools) and a
+	// pin-only write. Owner-scoped and Bearer-reachable, and only for the caller's OWN
+	// scope='user' templates: builtin and global templates stay web/admin-only through the
+	// cookie-only /api/agent-templates routes, and the pin route answers 403 for them even to
+	// an admin. A uza_ admin_ro token reaches handlers with IsAdmin=true, but neither handler
+	// has an admin branch (the list passes IsAdmin=false), so the list hides other users'
+	// templates even from an admin (D4, D5). Pins only choose a model for a template the
+	// caller already owns and can already edit in full in the web UI; the same Bearer cannot
+	// reach the prompt, tools or description.
+	r.With(h.requireUser()).Get("/me/agent-templates", h.ListMyAgentTemplates)
+	r.With(h.requireUser()).Put("/me/agent-templates/{id}/model-pins", h.PutMyAgentTemplateModelPins)
+
 	// Current-user Claude rate-limit meters (PRD #53): the caller's own 5h/7d
 	// windows. Self-scoped; admins use /api/admin/rate-limits for everyone.
 	//
