@@ -863,7 +863,10 @@ model and effort pins for each checker family, beside the Plan row (see
    "not reported". One `report_cross_check_dispositions` call may list several
    finding IDs, still one entry per ID with its own disposition and reason;
    entries may share the same explanation. The repair is not checked again;
-   there is no second check.
+   there is no second check. When every finding is a verification caveat
+   (its title starts exactly with `Coverage uncertainty:`), there is nothing
+   for the lead to fix, so no repair turn runs: the check is finalized at
+   once and each caveat shows as "not reported".
 
 `CODE_CROSS_CHECK_TIMEOUT` (default `30m`, at most `2h`; see
 [Configuration](./configuration.md#cross-check-settings)) is the checker's

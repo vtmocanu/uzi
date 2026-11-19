@@ -211,3 +211,33 @@ it("no repair iteration left: done proceeds, never activates repair, and records
   const dispositions = (r.row() as { dispositions: { disposition: string }[] }).dispositions;
   assert.deepEqual(dispositions.map(d => d.disposition), ["not_reported"]);
 });
+
+const caveat = (id: string, title: string) => ({ ...finding, id, severity: "minor" as const, title });
+for (const findings of [
+  [caveat("F_c1", "Coverage uncertainty: red/green run results are not supplied")],
+  [caveat("F_c1", "Coverage uncertainty: hosted proof"), caveat("F_c2", "Coverage uncertainty: gate logs not supplied")],
+]) {
+  it(`caveat-only findings (${findings.length}) skip the repair and finalize every caveat as not_reported`, async () => {
+    const r = rig({ findings });
+    assert.deepEqual(await r.gate.done(), { action: "proceed" });
+    assert.deepEqual(r.batches, [[]]);
+    assert.equal(r.gate.repairActive(), false);
+    assert.equal(await r.gate.repair(), undefined);
+    const dispositions = (r.row() as { dispositions: { finding_id: string; disposition: string }[] }).dispositions;
+    assert.deepEqual(dispositions.map(d => [d.finding_id, d.disposition]), findings.map(f => [f.id, "not_reported"]));
+  });
+}
+
+for (const findings of [
+  [finding, caveat("F_c1", "Coverage uncertainty: gate logs not supplied")],
+  [caveat("F_c1", "Coverage uncertainty: gate logs not supplied"), caveat("F_r", "Requirement gap: missing regression test")],
+  [caveat("F_c1", " Coverage uncertainty: leading space is not the exact prefix")],
+  [caveat("F_c1", "coverage uncertainty: lowercase is not the exact prefix")],
+]) {
+  it(`a graded or non-exact finding still gets the repair: ${JSON.stringify(findings.map(f => f.title))}`, async () => {
+    const r = rig({ findings });
+    assert.equal((await r.gate.done()).action, "repair");
+    assert.equal(r.gate.repairActive(), true);
+    assert.deepEqual(r.batches, []);
+  });
+}

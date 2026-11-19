@@ -404,6 +404,20 @@ invisible run evidence cost a repair turn without a code change. Supplying gate
 records stays parked (PRD #3167 "Gate evidence parked"). Only the revised brief
 hashes are repinned; frozen replay inputs and baseline hashes are unchanged.
 
+#### Caveat-only findings skip the repair turn (2026-11-19, self-improvement)
+
+The brief above still files a minor `Coverage uncertainty:` finding for a
+criterion that needs a run result, and every finding opened the one repair turn,
+so a caveat-only report kept costing a lead iteration that could only record
+declines. The worker's code gate now skips the repair when every finding's raw
+title starts exactly with `Coverage uncertainty:` (the same match the merge
+request section uses to group caveats) and finalizes through the existing empty
+dispositions call, recording each caveat as not reported, as it already does
+when no implementation iteration is left. Any graded finding, `Requirement gap:`
+included, keeps the one repair turn for the whole report. The brief, wire,
+schema, stored findings and server finalization are unchanged; gate evidence
+stays parked.
+
 ## Amendment 2026-10-31 (#3708)
 
 [PRD #3708](../prds/3708-gated-plan-cross-check.md) revisits the "Human-gated runs"
