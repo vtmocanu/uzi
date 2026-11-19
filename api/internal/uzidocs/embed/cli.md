@@ -3439,8 +3439,9 @@ claude, codex: `harness`, `effort`, `default_effort`, `default_source`,
 `catalog_default`: `state` (`known`, `unknown` or `varies`), `effort`, `model`,
 `runtime_version`, `observed_at`, the last four `null` when `state` is
 `unknown`). `resolved_effort` is `null` exactly when
-`mode` is `runtime_default`. The CLI cannot set effort: the write endpoint is
-cookie-only, so use **Settings → Run defaults → Reasoning effort**. See
+`mode` is `runtime_default`. Change effort with `uzi settings set effort`
+([Changing model and effort settings](#changing-model-and-effort-settings)) or in
+**Settings → Run defaults → Reasoning effort**. See
 [Reasoning effort](./worker-effort.md#runtime-default).
 
 The human output ends with a `Now summary: on (default)`, `on` or `off` line:
@@ -3449,6 +3450,80 @@ your own switch for the model-written [Now summary](./run-activity.md#now-summar
 [kill switch](./admin-settings.md#run-summaries) can still turn it off for the
 instance). `--json` carries it as `now_summary_enabled` (`null` when unset). Change it in
 **Settings → Run defaults → Run summaries**; there is no CLI write verb for it.
+
+### Changing model and effort settings
+
+```sh
+uzi settings set worker-model --harness codex gpt-5.5
+uzi settings set effort --harness claude runtime
+uzi settings set judge-model --harness codex <model-id>
+uzi settings set summary-model --harness claude <model-id>
+uzi settings set judge-runs-on codex
+uzi settings reset worker-model --harness codex
+uzi settings reset judge-runs-on
+```
+
+`uzi settings set <setting> <value>` and `uzi settings reset <setting>` write
+your own model and effort defaults for new runs (`PUT /api/me/model-settings`,
+which accepts a `uzc_` or `uza_` Bearer token). They write the same stored
+values as the matching **Settings → Run defaults** controls; the other users and
+the instance defaults are untouched.
+
+| Setting | `--harness` | Value | Web control |
+| --- | --- | --- | --- |
+| `worker-model` | `claude` or `codex`, required | A model id, passed through; the server validates it | [Worker model](./worker-model.md) |
+| `effort` | `claude` or `codex`, required | `low`, `medium`, `high`, `xhigh`, `max` or `runtime` | [Reasoning effort](./worker-effort.md) |
+| `judge-model` | `claude` or `codex`, required | A model id, validated by the server (the Codex judge lane accepts only curated models) | [Run judge](./judge.md#which-model-it-runs-on) |
+| `summary-model` | `claude` or `codex`, required | A model id, validated by the server | [Run summaries](./run-summaries.md#which-model-it-runs-on) |
+| `judge-runs-on` | none (an error if given) | `same-as-run`, `claude` or `codex` | [Judge runs on](./judge.md#judge-runs-on) |
+
+`reset` takes the same setting and `--harness` and no value. It clears the stored
+pin, so the setting follows the upstream default again (your value stops being
+a copy of it). For `judge-runs-on`, `reset judge-runs-on` and
+`set judge-runs-on same-as-run` are the same write: they clear the stored value, so
+the judge runs on the harness of the run it reviews.
+
+`effort ... runtime` is the explicit **Runtime default** mode: uzi sends no
+effort and the runtime picks its own level (see [Runtime
+default](./worker-effort.md#runtime-default)). It is not a reset. A reset
+removes your choice so the default applies (built-in medium); `runtime` is a
+stored choice that `uzi settings get` shows as `runtime default`.
+
+Human output prints the changed row of the **Model settings** table from a fresh
+[effective-settings](#effective-settings) read, so `STORED` and `SOURCE` show what
+the write did (`your choice` after a set; the default's own source after a
+reset). `judge-runs-on` prints the `Judge runs on:` line instead. `--json` prints
+the server's `{"settings": {...}}` envelope unchanged, without the effective
+read.
+
+A saved setting applies to runs that resolve it after the save. It never changes
+a run that froze its own choice, such as a run-level `--model` or `--effort`.
+Effort is resolved when a worker claims the run, so an already queued run picks
+up a new effort setting; see [Reasoning effort](./worker-effort.md). The judge's
+harness is frozen when the judge run is created.
+
+Exit codes:
+
+| Exit | Meaning |
+| --- | --- |
+| 0 | The write succeeded. If the follow-up effective-settings read fails, the command still exits 0 and prints `Saved; the effective view is unavailable, so only stored values are shown.` (the read error goes to stderr). |
+| 1 | The server predates the route: `this server does not support CLI model-setting writes; upgrade the server`. |
+| 2 | Usage error: an unknown setting, a missing, invalid or unwanted `--harness`, or an invalid value is refused before any request is sent. A value the server rejects (for example a model the harness cannot run) also exits 2, with the server's message; nothing is written. |
+| 3 | Authentication failed. |
+| 6 | Server error or rate limit. Two 500s are worded for the write's state: `the save may or may not have been applied; check with `uzi settings get`` (the commit outcome is unknown) and `settings saved; reading them back failed` (the save is durable). Run `uzi settings get` before retrying. |
+
+Exit 6 and the exit 0 `Saved; ...` line are different cases: exit 6 means the
+server could not confirm or read back the write, while the exit 0 line means
+the server confirmed the write and only the CLI's own effective-settings read
+failed.
+
+The route is an allowlist of nine fields (the two worker-model lanes, the two
+effort lanes, the two judge-model lanes, the two summary-model lanes and
+`judge_runs_on`); any other key is a 400 naming it, and the fields of one request
+are written in one transaction. Consent switches (enabling the judge, cross-check
+or autopilot) and the generic `PUT /api/me/settings` stay cookie-only:
+`judge-runs-on`, `judge-model` and `summary-model` choose which harness or model
+already-enabled judge and summary work uses, and cannot turn that work on.
 
 ### Effective settings
 
@@ -3660,8 +3735,9 @@ JSON includes `harness_overflow_enabled`.
 run (default)` when unset, otherwise `Judge runs on: Claude (your setting)` or
 `Judge runs on: Codex (your setting)`. `--json` carries the stored
 `judge_runs_on` (`claude`, `codex` or `null`) and, in `effective`, the
-`judge_harness` cell. The setting is changed in **Settings → Run defaults →
-Run judge**; there is no CLI write verb for it.
+`judge_harness` cell. Change it with `uzi settings set judge-runs-on`
+([Changing model and effort settings](#changing-model-and-effort-settings)) or in
+**Settings → Run defaults → Run judge**.
 
 Overflow applies at creation to new implicit issue runs started manually,
 by autopilot or by a schedule, with both harnesses usable, and only when your

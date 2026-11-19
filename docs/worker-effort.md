@@ -77,8 +77,12 @@ The [judge](./judge.md) uses the preference for its own harness. Task-review
 and internal PR-description passes retain their existing SDK/catalog effort
 behavior; their built-in Codex model remains `gpt-6-sol`.
 
-There is no CLI effort setter: the write endpoint is cookie-only, so use the
-web controls. `uzi settings get` reports the result (see
+From the CLI, `uzi settings set effort --harness claude|codex
+<low|medium|high|xhigh|max|runtime>` writes the same preference and `uzi
+settings reset effort --harness claude|codex` returns it to **Default · medium
+(built-in)**; `runtime` is **Runtime default**, which is not a reset (see
+[Changing model and effort settings](./cli.md#changing-model-and-effort-settings)).
+`uzi settings get` reports the result (see
 [Effort reporting](#effort-reporting)).
 
 ## Runtime default
@@ -89,7 +93,8 @@ not reported** for Claude. For Codex the label carries the catalog default last
 reported for your credential, or says it is unknown (see [What the Codex catalog
 default means](#what-the-codex-catalog-default-means)).
 It is stored as the token `runtime` in the same preference (`default_effort`
-or `default_codex_effort` on `PUT /api/me/settings`, cookie-only; `GET`
+or `default_codex_effort` on `PUT /api/me/settings`, cookie-only, or on
+`PUT /api/me/model-settings`, which also accepts a CLI token; `GET`
 returns the stored token).
 
 With Runtime default, uzi sends no effort: the Claude CLI gets no `--effort`

@@ -1973,6 +1973,15 @@ Design record: issue #4373 (extends PRD `prds/done/3875-command-menu.md`).
 - Ranking stays global (prefix, then word start, then substring); each new group shows at most five rows with a "+N more" note. Each list is read once per opening, never polled; a late response after close is dropped and a failed read hides only the groups built from it (a failed run-list read hides Needs you and Recent runs). API text is stripped of unsafe characters and repo paths are masked in demo mode. (AI-synced 2026-11-15)
 - Deep links reveal an item after load, on direct entry too: `/schedules?tab=schedules#schedule-name-<id>`, `/workers?tab=workers#worker-row-<id>` (scroll, focus, highlight) and `/skills?skill=<id>` (opens the skill). Admin Settings scrolls to any advertised section only after a successful load; a failed load stays at the top. Doc heading links use the doc page's own heading ids, computed at build time; untrusted markdown never gets heading ids. (AI-synced 2026-11-15)
 
+## Feature #3264 — CLI model and effort settings
+
+PRD at `prds/3264-cli-model-settings.md` (module 1 only: the other modules are not shipped).
+
+- A user can set and reset their own worker-model, effort, judge-model, summary-model (per harness) and judge-runs-on defaults from the CLI with `uzi settings set|reset`, over a `uzc_` or `uza_` token, through the dedicated allowlisted `PUT /api/me/model-settings` (nine fields, one transaction, unknown key 400). (AI-synced 2026-11-19)
+- `PUT /api/me/settings` and every consent switch (enable judge, cross-check, autopilot) stay cookie-only. The judge and summary fields only redirect which model or harness already-enabled work uses; they cannot enable it. (AI-synced 2026-11-19)
+- Reset clears the stored pin so the setting follows the upstream default; effort `runtime` is the explicit Runtime default mode and is distinct from reset. (AI-synced 2026-11-19)
+- A failed effective-settings readback after a confirmed save still exits 0; a commit-unknown or saved-but-unreadable server answer exits 6. An older server exits 1 with an upgrade message. Cross-check pins and agent-template pins from the CLI are not shipped. (AI-synced 2026-11-19)
+
 ## Demo mode branding
 
 - Web demo mode shows the stock uzi factory icon and wordmark, default tab title and favicon base, and hides all instance POWERED BY branding and the optional build-time license credit. Toggling it off restores the real branding live. This is per-device presentation only; server settings and the Admin Branding live preview stay real. (AI-synced 2026-11-01)

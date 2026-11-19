@@ -98,6 +98,12 @@ the judge runs on X" note, and the token picker is dimmed when the judge runs
 on Codex. The [effective settings](./configuration.md#effective-settings)
 view reports the choice as `judge_harness`.
 
+From the CLI, `uzi settings set judge-runs-on same-as-run|claude|codex` writes
+this choice and `uzi settings reset judge-runs-on` returns it to **Same as the
+run**. It only redirects where an already enabled judge runs; turning the judge
+on stays a web action. See [Changing model and effort
+settings](./cli.md#changing-model-and-effort-settings).
+
 ## Which token the judge spends
 
 **This picker covers judges that run on Claude only.** A judge that runs on
@@ -194,7 +200,11 @@ Where to set each lane:
 
 `uzi settings get` prints a **Model settings** table showing, per lane, what
 is stored, the default, what a judge run would resolve to, and where that came
-from; see [CLI](./cli.md#plan-cross-check-settings).
+from; see [CLI](./cli.md#plan-cross-check-settings). To change a lane from the
+CLI, use `uzi settings set judge-model --harness claude|codex <model-id>` and
+`uzi settings reset judge-model --harness claude|codex` (the value goes to the
+server's validation; a reset inherits the instance value again). See [Changing
+model and effort settings](./cli.md#changing-model-and-effort-settings).
 
 **Migration.** A curated Codex id previously stored in `judge_model` (yours or
 the instance's) is copied into the Codex lane; the Claude key is left unchanged
