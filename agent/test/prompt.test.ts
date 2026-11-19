@@ -1276,6 +1276,19 @@ describe("buildRevisePlanPrompt (PRD #41)", () => {
     assert.match(p, /Do NOT implement anything yet/i);
   });
 
+  it("requires a scoped validator pass on a substantive revision, final revision included", () => {
+    for (const q of [p, buildRevisePlanPrompt(feedback, "# Submitted plan\n- step one")]) {
+      assert.match(q, /map each instruction above to the plan mechanism it changes/);
+      assert.match(q, /removals and scope cuts count/);
+      assert.match(q, /allocated read-only validators in this\nturn/);
+      assert.match(q, /every caller of each function those\nmechanisms depend on/);
+      assert.match(q, /a final revision does not waive\nthis review/);
+      assert.match(q, /Only a purely editorial revision/);
+      assert.ok(q.indexOf(feedback) < q.indexOf("map each instruction"), "the rule follows the feedback");
+      assert.ok(q.indexOf("map each instruction") < q.indexOf("COMPLETE revised"), "and precedes the submit instruction");
+    }
+  });
+
   it("issue #1604 (D4): with no session, carries the submitted plan ahead of the unchanged instruction", () => {
     const prior = "# Submitted plan\n- step one";
     const q = buildRevisePlanPrompt(feedback, prior);
