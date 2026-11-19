@@ -30,14 +30,13 @@ const (
 
 // claimProvFix is a queued, never-claimed Codex subscription run plus three Codex-capable workers.
 type claimProvFix struct {
-	env                codexTestEnv
-	svc                *Service
-	userID, repoID     uuid.UUID
-	runID              uuid.UUID
-	workerA, workerB   uuid.UUID
-	workerC            uuid.UUID
-	nameA, nameB       string
-	claimedByAWithCaps bool
+	env              codexTestEnv
+	svc              *Service
+	userID, repoID   uuid.UUID
+	runID            uuid.UUID
+	workerA, workerB uuid.UUID
+	workerC          uuid.UUID
+	nameA, nameB     string
 }
 
 func newClaimProvFix(t *testing.T, env codexTestEnv) *claimProvFix {

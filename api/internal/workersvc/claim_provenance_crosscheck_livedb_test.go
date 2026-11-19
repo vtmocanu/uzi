@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 )
@@ -55,13 +56,19 @@ func holdChild(t *testing.T, f crossCheckContentionFixture, variant string) (rec
 		f.env.exec(`UPDATE runs SET claim_generation = 1 WHERE id = $1`, f.runID)
 	case "provenance":
 		recorded = uuid.New()
+		var submitted pgtype.UUID
+		if err := f.env.pool.QueryRow(f.env.ctx, `SELECT worker_id FROM runs WHERE id = $1`, f.runID).Scan(&submitted); err != nil {
+			t.Fatal(err)
+		}
 		f.env.exec(`INSERT INTO workers(id,user_id,name,token_hash,status,max_cross_check_slots,protocol_capabilities)
 			SELECT $2::uuid,user_id,'recorded-'||$2::text,$2::uuid::text::bytea,'online',1,protocol_capabilities FROM workers WHERE id=$1`,
 			f.workerID, recorded)
 		// One admitted +1 claim step by the recorded worker, then the run goes back to queued.
 		f.env.exec(`UPDATE runs SET claim_generation = 1, worker_id = $2, claim_provenance_worker_id = $2,
 			claim_provenance_generation = 1 WHERE id = $1`, f.runID, recorded)
-		f.env.exec(`UPDATE runs SET worker_id = NULL WHERE id = $1`, f.runID)
+		// Restore the submitted worker_id so the child differs from the paired control only in
+		// generation and provenance; any refusal is then the provenance gate, not a worker_id shape.
+		f.env.exec(`UPDATE runs SET worker_id = $2 WHERE id = $1`, f.runID, submitted)
 	}
 	if st := mustRun(t, f.env, f.runID).Status; st != "queued" {
 		t.Fatalf("held child status = %s, want queued", st)
@@ -70,7 +77,8 @@ func holdChild(t *testing.T, f crossCheckContentionFixture, variant string) (rec
 }
 
 // refuseHeldCheckerClaim: before the deadline, a checker held by provenance (or with none recorded)
-// is handed to no worker and a refused claim moves nothing. The paired generation-0 control is
+// is handed to no worker and a refused claim moves nothing. The held child keeps the paired
+// control's submitted worker_id and differs only in generation and provenance, and that control is
 // claimable (TestCodexProvenanceCrossCheckPairedChildIsClaimableLiveDB), so the refusal is the gate.
 func refuseHeldCheckerClaim(t *testing.T, stage, variant string) {
 	t.Helper()
@@ -127,24 +135,21 @@ func settleCrossCheckProvVariant(t *testing.T, stage, variant string) crossCheck
 }
 
 func TestCodexProvenanceCrossCheckDeadlineControlLiveDB(t *testing.T) {
+	setupCodexLiveDB(t) // skips when UZI_TEST_DATABASE_URL is unset
 	for _, stage := range []string{"plan", "code"} {
 		t.Run(stage, func(t *testing.T) {
 			for _, variant := range []string{"provenance", "null"} {
 				t.Run("refused "+variant, func(t *testing.T) { refuseHeldCheckerClaim(t, stage, variant) })
 			}
-			var ends []crossCheckProvEnd
-			for _, variant := range []string{"paired", "provenance", "null"} {
-				var end crossCheckProvEnd
-				t.Run(variant, func(t *testing.T) { end = settleCrossCheckProvVariant(t, stage, variant) })
-				ends = append(ends, end)
-			}
 			want := crossCheckProvEnd{Failed: true, TimedOut: true, DecidedAtDeadline: true, ChildStatus: "cancelled",
 				ChildFinished: true, ChildReleased: true, ChildGenerationUnchanged: true, ChildEpochUnchanged: true,
 				NoCapability: true, ChildHolds: 0, ProvenanceUnchanged: true}
-			for i, e := range ends {
-				if !reflect.DeepEqual(e, want) {
-					t.Fatalf("variant %d end state = %+v, want %+v", i, e, want)
-				}
+			for _, variant := range []string{"paired", "provenance", "null"} {
+				t.Run(variant, func(t *testing.T) {
+					if end := settleCrossCheckProvVariant(t, stage, variant); !reflect.DeepEqual(end, want) {
+						t.Fatalf("end state = %+v, want %+v", end, want)
+					}
+				})
 			}
 		})
 	}
