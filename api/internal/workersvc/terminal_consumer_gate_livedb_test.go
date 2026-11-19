@@ -285,18 +285,18 @@ func TestTerminalConsumerGateRollbackAfterWritesLiveDB(t *testing.T) {
 	ctx, cancel := context.WithCancel(env.ctx)
 	defer cancel()
 	var hookRun store.Run
-	var gateHeld, ledgerWritten int
+	var gateHeld int
 	svc.createBeforeCommitHook = func(run store.Run) {
 		hookRun = run
-		// Both writes are in the open transaction and the shared gate is held at this point.
-		if err := env.pool.QueryRow(env.ctx, `SELECT count(*) FROM pg_locks WHERE locktype='advisory'
-			AND classid::bigint=$1 AND objid::bigint=$2 AND objsubid=2 AND mode='ShareLock' AND granted`,
+		// Reaching the hook already implies the ledger upsert ran (it precedes the hook in the insert
+		// closure and a 0-row upsert errors first). Additionally require the shared gate and a write lock
+		// on the ledger table on ONE backend: the create's own transaction.
+		if err := env.pool.QueryRow(env.ctx, `SELECT count(*) FROM pg_locks g JOIN pg_locks w ON w.pid = g.pid
+			JOIN pg_class c ON c.oid = w.relation
+			WHERE g.locktype='advisory' AND g.classid::bigint=$1 AND g.objid::bigint=$2 AND g.objsubid=2
+			  AND g.mode='ShareLock' AND g.granted
+			  AND c.relname = 'mr_rework_ledger' AND w.mode = 'RowExclusiveLock' AND w.granted`,
 			int64(store.TerminalConsumerGateLockClass), gateObj).Scan(&gateHeld); err != nil {
-			t.Error(err)
-		}
-		// The ledger upsert's open write shows as a granted RowExclusiveLock on the ledger table.
-		if err := env.pool.QueryRow(env.ctx, `SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid = l.relation
-			WHERE c.relname = 'mr_rework_ledger' AND l.mode = 'RowExclusiveLock' AND l.granted`).Scan(&ledgerWritten); err != nil {
 			t.Error(err)
 		}
 		cancel()
@@ -307,8 +307,8 @@ func TestTerminalConsumerGateRollbackAfterWritesLiveDB(t *testing.T) {
 	if hookRun.ID == uuid.Nil {
 		t.Fatal("the create never reached its commit: the failure was not after the writes")
 	}
-	if gateHeld != 1 || ledgerWritten != 1 {
-		t.Fatalf("at the commit point: shared gate holders = %d, ledger writers = %d; want 1 and 1", gateHeld, ledgerWritten)
+	if gateHeld != 1 {
+		t.Fatalf("at the commit point: backends holding both the shared gate and a ledger write lock = %d, want 1", gateHeld)
 	}
 	if got := consumerRunsOf(t, env, userID, source); got != 0 {
 		t.Fatalf("%d run row(s) survived the rolled-back create", got)

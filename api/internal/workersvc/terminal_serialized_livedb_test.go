@@ -30,9 +30,10 @@ import (
 // statements require a live claim, else the equivalent SQL). That pins the retire side of the interleaving:
 // a pass that meets the lock does not retire, and the pass after the admission committed keeps the
 // ref on the matching blocker. It does not execute the admission's own validation code.
-// Because the lock comes from those production queries, dropping their FOR UPDATE clause fails the
-// test (the uncommitted footprint is invisible to the pass, so only the lock keeps the ref). It does not
-// prove the admission's Go code calls the query before writing; that ordering is read in review.
+// A first pass runs while ONLY that production lock is held (before any footprint write), so removing
+// every row-lock clause of the query (GetRunOwnedByWorkerForUpdate locks the source row twice, through
+// FOR UPDATE OF lead and FOR UPDATE OF runs) makes it retire and fails the test. It does not prove the
+// admission's Go code calls the query before writing; that ordering is read in review.
 //
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres (./e2e/run-store-it.sh).
 
@@ -71,7 +72,8 @@ func serialAsActive(ctx context.Context, tx pgx.Tx, f *sweepFix, checker uuid.UU
 }
 
 // serialLockLead takes the lead lock of the plan and code cross-check admissions (and the code failure
-// record): GetRunOwnedByWorkerForUpdate, FOR UPDATE OF lead.
+// record): GetRunOwnedByWorkerForUpdate, whose FOR UPDATE OF lead and FOR UPDATE OF runs both lock a
+// non-cross-check source.
 func serialLockLead(ctx context.Context, tx pgx.Tx, f *sweepFix) error {
 	run, err := store.New(tx).GetRunOwnedByWorkerForUpdate(ctx, store.GetRunOwnedByWorkerForUpdateParams{
 		ID: f.run, WorkerID: pgtype.UUID{Bytes: f.worker.ID, Valid: true},
@@ -199,6 +201,15 @@ func TestTerminalSerializedAdmissionsLiveDB(t *testing.T) {
 			if err = tc.lock(f.e.ctx, tx, f); err != nil {
 				t.Fatalf("admission lock: %v", err)
 			}
+			// Only the production query's lock is held here: it alone must keep the pass from retiring.
+			if n := f.sweep(); n != 0 {
+				t.Fatalf("pass changed %d rows while only the admission's lock query held the source run", n)
+			}
+			f.mustPres("live")
+			if f.deleteCount() != 0 {
+				t.Fatalf("deleted %d remote refs while only the admission's lock query held the source run", f.deleteCount())
+			}
+			f.due()
 			if err = tc.effect(f.e.ctx, tx, f); err != nil {
 				t.Fatalf("admission footprint: %v", err)
 			}
