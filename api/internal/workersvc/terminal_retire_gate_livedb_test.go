@@ -46,7 +46,7 @@ func gateLocks(t *testing.T, f *sweepFix, repo uuid.UUID, mode string, granted b
 	var n int
 	if err := f.e.pool.QueryRow(f.e.ctx, `SELECT count(*) FROM pg_locks
 		WHERE locktype='advisory' AND classid::bigint=$1 AND objid::bigint=$2 AND objsubid=2 AND mode=$3 AND granted=$4`,
-		int64(store.TerminalConsumerGateLockClass), int64(uint32(store.TerminalConsumerGateObjID(repo))), mode, granted).Scan(&n); err != nil {
+		int64(store.TerminalConsumerGateLockClass), int64(uint32(store.TerminalConsumerGateObjID(repo))), mode, granted).Scan(&n); err != nil { //nolint:gosec // reinterpret the int4 lock key as pg_locks' oid
 		t.Fatal(err)
 	}
 	return n
