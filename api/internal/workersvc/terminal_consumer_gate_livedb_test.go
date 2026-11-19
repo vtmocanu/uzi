@@ -270,6 +270,78 @@ func TestTerminalConsumerGateBusyRollsBackLedgerLiveDB(t *testing.T) {
 	}
 }
 
+// An MR-rework create that has taken the gate and written BOTH its run row and its ledger upsert, and
+// then fails before COMMIT (the request context ends at the commit), rolls back both writes together
+// and releases the gate; the retried create then succeeds.
+func TestTerminalConsumerGateRollbackAfterWritesLiveDB(t *testing.T) {
+	env, svc, userID, repoID := branchSerializeEnv(t)
+	const n int64 = 44885
+	branch := agentIssueBranch(n)
+	seedEligibleIssue(t, env, repoID, n)
+	source := seedCompletedSourceRun(t, env, userID, repoID, n, 448850)
+	res := reviewResultOf(sampleReviewSnapshot())
+
+	gateObj := int64(uint32(store.TerminalConsumerGateObjID(repoID))) //nolint:gosec // the int4 lock key read back as pg_locks' oid
+	ctx, cancel := context.WithCancel(env.ctx)
+	defer cancel()
+	var hookRun store.Run
+	var gateHeld, ledgerWritten int
+	svc.createBeforeCommitHook = func(run store.Run) {
+		hookRun = run
+		// Both writes are in the open transaction and the shared gate is held at this point.
+		if err := env.pool.QueryRow(env.ctx, `SELECT count(*) FROM pg_locks WHERE locktype='advisory'
+			AND classid::bigint=$1 AND objid::bigint=$2 AND objsubid=2 AND mode='ShareLock' AND granted`,
+			int64(store.TerminalConsumerGateLockClass), gateObj).Scan(&gateHeld); err != nil {
+			t.Error(err)
+		}
+		// The ledger upsert's open write shows as a granted RowExclusiveLock on the ledger table.
+		if err := env.pool.QueryRow(env.ctx, `SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid = l.relation
+			WHERE c.relname = 'mr_rework_ledger' AND l.mode = 'RowExclusiveLock' AND l.granted`).Scan(&ledgerWritten); err != nil {
+			t.Error(err)
+		}
+		cancel()
+	}
+	if _, err := svc.CreateAutoMRReworkRunAndAdvance(ctx, userID, repoID, branch, 448850, source, "Rework", "d", res, 5); err == nil {
+		t.Fatal("create whose commit ran on an ended context succeeded")
+	}
+	if hookRun.ID == uuid.Nil {
+		t.Fatal("the create never reached its commit: the failure was not after the writes")
+	}
+	if gateHeld != 1 || ledgerWritten != 1 {
+		t.Fatalf("at the commit point: shared gate holders = %d, ledger writers = %d; want 1 and 1", gateHeld, ledgerWritten)
+	}
+	if got := consumerRunsOf(t, env, userID, source); got != 0 {
+		t.Fatalf("%d run row(s) survived the rolled-back create", got)
+	}
+	if _, lerr := env.q.GetMRReworkLedger(env.ctx, store.GetMRReworkLedgerParams{RepoID: repoID, Ref: branch}); !errors.Is(lerr, pgx.ErrNoRows) {
+		t.Fatalf("ledger row present after the rolled-back create (err=%v)", lerr)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var held int
+		if err := env.pool.QueryRow(env.ctx, `SELECT count(*) FROM pg_locks WHERE locktype='advisory'
+			AND classid::bigint=$1 AND objid::bigint=$2 AND objsubid=2`,
+			int64(store.TerminalConsumerGateLockClass), gateObj).Scan(&held); err != nil {
+			t.Fatal(err)
+		}
+		if held == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the gate is still held %d time(s) after the rollback", held)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	svc.createBeforeCommitHook = nil
+	if _, err := svc.CreateAutoMRReworkRunAndAdvance(env.ctx, userID, repoID, branch, 448850, source, "Rework", "d", res, 5); err != nil {
+		t.Fatalf("retried create: %v", err)
+	}
+	if led, lerr := env.q.GetMRReworkLedger(env.ctx, store.GetMRReworkLedgerParams{RepoID: repoID, Ref: branch}); lerr != nil || led.AttemptCount != 1 {
+		t.Fatalf("ledger after the retried create = %+v, %v, want attempt_count 1", led, lerr)
+	}
+}
+
 // A service with no transaction beginner (the test-only fallback) still takes the gate on a gated
 // create: it queues behind an exclusive holder and completes once the holder ends. An ungated create
 // is unchanged.

@@ -2,6 +2,8 @@ package workersvc
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -21,14 +23,16 @@ import (
 //
 // WHAT THESE TESTS DO AND DO NOT PROVE. The real admissions refuse a terminal source whose claim is
 // released (the shape a retirement needs), so they cannot be driven end to end against it. Each case
-// therefore plays the admission's database footprint from a test transaction: the same row lock on the
-// source, then the same committed rows the admission writes (through the store queries the admission
+// therefore plays the admission's database footprint from a test transaction: the source row lock taken
+// through the admission's own store query (GetRunOwnedByWorkerForUpdate for the cross-check admissions,
+// LockFrozenWorkerSnapshotRuns for the active snapshot), then the same committed rows the admission writes (through the store queries the admission
 // uses where they can run, with the source briefly reopened inside the same transaction because those
 // statements require a live claim, else the equivalent SQL). That pins the retire side of the interleaving:
 // a pass that meets the lock does not retire, and the pass after the admission committed keeps the
 // ref on the matching blocker. It does not execute the admission's own validation code.
-// Nor does it prove the real admission takes that row lock: the test takes its own FOR UPDATE, so the
-// lock clauses of GetRunOwnedByWorkerForUpdate and LockFrozenWorkerSnapshotRuns are not pinned here.
+// Because the lock comes from those production queries, dropping their FOR UPDATE clause fails the
+// test (the uncommitted footprint is invisible to the pass, so only the lock keeps the ref). It does not
+// prove the admission's Go code calls the query before writing; that ordering is read in review.
 //
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres (./e2e/run-store-it.sh).
 
@@ -66,10 +70,50 @@ func serialAsActive(ctx context.Context, tx pgx.Tx, f *sweepFix, checker uuid.UU
 	return err
 }
 
+// serialLockLead takes the lead lock of the plan and code cross-check admissions (and the code failure
+// record): GetRunOwnedByWorkerForUpdate, FOR UPDATE OF lead.
+func serialLockLead(ctx context.Context, tx pgx.Tx, f *sweepFix) error {
+	run, err := store.New(tx).GetRunOwnedByWorkerForUpdate(ctx, store.GetRunOwnedByWorkerForUpdateParams{
+		ID: f.run, WorkerID: pgtype.UUID{Bytes: f.worker.ID, Valid: true},
+	})
+	if err != nil {
+		return err
+	}
+	if run.ID != f.run {
+		return fmt.Errorf("locked run %s, want the source %s", run.ID, f.run)
+	}
+	return nil
+}
+
+// serialLockSnapshot takes the active snapshot's run lock: LockFrozenWorkerSnapshotRuns, FOR UPDATE OF
+// r, with the frozen identity ledger the snapshot builds for a non-cross-check run (its own parent).
+func serialLockSnapshot(ctx context.Context, tx pgx.Tx, f *sweepFix) error {
+	frozen, err := json.Marshal([]map[string]any{{
+		"id": f.run, "kind": "issue", "target_run_id": nil, "worker_id": f.worker.ID,
+		"claim_generation": 1, "cross_check_id": nil, "parent_lead_id": f.run,
+	}})
+	if err != nil {
+		return err
+	}
+	ids, err := store.New(tx).LockFrozenWorkerSnapshotRuns(ctx, store.LockFrozenWorkerSnapshotRunsParams{
+		RunIds: []uuid.UUID{f.run}, WorkerID: pgtype.UUID{Bytes: f.worker.ID, Valid: true},
+		FrozenTargets: frozen, LockedParentIds: []uuid.UUID{f.run},
+	})
+	if err != nil {
+		return err
+	}
+	if len(ids) != 1 || ids[0] != f.run {
+		return fmt.Errorf("snapshot locked %v, want exactly the source %s", ids, f.run)
+	}
+	return nil
+}
+
 func TestTerminalSerializedAdmissionsLiveDB(t *testing.T) {
 	sha := strings.Repeat("a", 40)
 	cases := []struct {
 		name string
+		// lock takes the source row lock through the admission's own store query.
+		lock func(ctx context.Context, tx pgx.Tx, f *sweepFix) error
 		// effect is the admission's committed footprint, run in the transaction that holds the source row.
 		effect func(ctx context.Context, tx pgx.Tx, f *sweepFix) error
 		// reason is the blocker the pass after the commit records; "" means the footprint protects
@@ -78,6 +122,7 @@ func TestTerminalSerializedAdmissionsLiveDB(t *testing.T) {
 	}{
 		{
 			name: "plan cross-check admission",
+			lock: serialLockLead,
 			effect: func(ctx context.Context, tx pgx.Tx, f *sweepFix) error {
 				child, err := serialCheckerRun(ctx, tx, f, f.run)
 				if err != nil {
@@ -95,6 +140,7 @@ func TestTerminalSerializedAdmissionsLiveDB(t *testing.T) {
 		},
 		{
 			name: "code cross-check admission",
+			lock: serialLockLead,
 			effect: func(ctx context.Context, tx pgx.Tx, f *sweepFix) error {
 				child, err := serialCheckerRun(ctx, tx, f, f.run)
 				if err != nil {
@@ -116,6 +162,7 @@ func TestTerminalSerializedAdmissionsLiveDB(t *testing.T) {
 			// A recorded failure is a finished row: no checker run, no pending verdict. It protects
 			// nothing, so after the lock the pass retires.
 			name: "code cross-check failure record",
+			lock: serialLockLead,
 			effect: func(ctx context.Context, tx pgx.Tx, f *sweepFix) error {
 				return serialAsActive(ctx, tx, f, uuid.Nil, func() error {
 					_, err := store.New(tx).InsertFailedCodeCrossCheck(ctx, store.InsertFailedCodeCrossCheckParams{
@@ -129,6 +176,7 @@ func TestTerminalSerializedAdmissionsLiveDB(t *testing.T) {
 		},
 		{
 			name: "active snapshot",
+			lock: serialLockSnapshot,
 			effect: func(ctx context.Context, tx pgx.Tx, f *sweepFix) error {
 				_, err := tx.Exec(ctx, `INSERT INTO worker_active_runs (worker_id, run_id, claim_generation, phase, terminal_pending, snapshot_epoch, reported_at)
 					VALUES ($1, $2, 1, 'running', false, 1, now())`, f.worker.ID, f.run)
@@ -148,9 +196,8 @@ func TestTerminalSerializedAdmissionsLiveDB(t *testing.T) {
 				t.Fatal(err)
 			}
 			t.Cleanup(func() { _ = tx.Rollback(context.Background()) })
-			var locked uuid.UUID
-			if err = tx.QueryRow(f.e.ctx, `SELECT id FROM runs WHERE id = $1 FOR UPDATE`, f.run).Scan(&locked); err != nil {
-				t.Fatal(err)
+			if err = tc.lock(f.e.ctx, tx, f); err != nil {
+				t.Fatalf("admission lock: %v", err)
 			}
 			if err = tc.effect(f.e.ctx, tx, f); err != nil {
 				t.Fatalf("admission footprint: %v", err)
