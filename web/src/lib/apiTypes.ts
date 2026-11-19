@@ -3415,6 +3415,20 @@ export interface WorkerSizeAdvisory {
   message: string;
 }
 
+/**
+ * A worker the cluster would not run at its size (PRD #4213): the controller refused the
+ * size (size_refused, e.g. above a controller ceiling) or the cluster rejected one of its
+ * volume claims (pvc_rejected). reason is the controller's own text.
+ */
+export interface WorkerSizeRefusal {
+  size: string;
+  worker_id: string;
+  worker_name: string;
+  kind: "size_refused" | "pvc_rejected";
+  reason: string;
+  reported_at: string;
+}
+
 /** GET /admin/worker-sizes. */
 export interface AdminWorkerSizes {
   sizes: AdminWorkerSize[];
@@ -3424,6 +3438,8 @@ export interface AdminWorkerSizes {
   read_only_code: string | null;
   advisories: WorkerSizeAdvisory[];
   max_sizes: number;
+  /** Always an array on a current api; absent from an older one, which reads as none. */
+  refusals?: WorkerSizeRefusal[];
 }
 
 /** PUT /admin/worker-sizes/{name} and POST /admin/worker-sizes/{name}/reset. */

@@ -322,6 +322,50 @@ describe("WorkerSizesCard", () => {
     ]);
   });
 
+  it("shows a stored size the controller refused, with its reason and an Admin health link, in its row", () => {
+    const reason = "cpu limit 4000 millicores exceeds the controller's 3000 millicores ceiling";
+    renderCard(
+      sizes({ m: { customized: true } }, {
+        refusals: [
+          { size: "m", worker_id: "w-1", worker_name: "base.m-9f3c", kind: "size_refused", reason, reported_at: "2026-11-18T14:20:00Z" },
+        ],
+      }),
+    );
+    const m = within(rowOf("M"));
+    expect(m.getByText("Refused")).toBeTruthy();
+    const item = within(m.getByRole("list", { name: "Workers refused at size M" })).getByRole("listitem");
+    expect(item.textContent).toContain("base.m-9f3c");
+    expect(item.textContent).toContain("controller refused this size");
+    expect(item.textContent).toContain(reason);
+    const link = within(item).getByRole("link", { name: "base.m-9f3c in Admin health" });
+    expect(link.getAttribute("href")).toBe("/admin/health");
+    // Only the refused row says so; the generic Admin health link stays.
+    expect(within(rowOf("S")).queryByText("Refused")).toBeNull();
+    expect(screen.getByRole("link", { name: "Admin health" }).getAttribute("href")).toBe("/admin/health");
+  });
+
+  it("names a rejected volume claim in plain words and bounds a long list at three workers", () => {
+    const r = (n: number, kind: "size_refused" | "pvc_rejected" = "size_refused") => ({
+      size: "l", worker_id: `w-${n}`, worker_name: `base.l-${n}`, kind, reason: `reason ${n}`, reported_at: "2026-11-18T14:20:00Z",
+    });
+    renderCard(sizes({}, { refusals: [r(1, "pvc_rejected"), r(2), r(3), r(4), r(5)] }));
+    const list = within(rowOf("L")).getByRole("list", { name: "Workers refused at size L" });
+    const items = within(list).getAllByRole("listitem");
+    expect(items).toHaveLength(4);
+    expect(items[0].textContent).toContain("cluster rejected a volume claim");
+    expect(list.textContent).not.toContain("base.l-4");
+    expect(within(items[3]).getByRole("link", { name: "and 2 more workers in Admin health" }).getAttribute("href")).toBe("/admin/health");
+  });
+
+  it("renders no refusal when an older api sends no refusals field", () => {
+    const data = sizes();
+    delete (data as Partial<AdminWorkerSizes>).refusals;
+    renderCard(data);
+    expect(screen.queryByText("Refused")).toBeNull();
+    expect(screen.queryByRole("list", { name: /Workers refused/ })).toBeNull();
+    expect(screen.getByRole("link", { name: "Admin health" })).toBeTruthy();
+  });
+
   it("offers a retry when the first read failed", () => {
     const onChanged = renderCard(null, vi.fn().mockResolvedValue(undefined), "Failed to load worker sizes");
     expect(screen.getByRole("alert").textContent).toBe("Failed to load worker sizes");

@@ -1,4 +1,4 @@
-import type { AdminWorkerSize, AdminWorkerSizes, AdminWorkerSizeWrite, HostedConfigSize, WorkerSizeAdvisory, WorkerSizeSpec, WorkerSizeWarning } from "../../lib/api";
+import type { AdminWorkerSize, AdminWorkerSizes, AdminWorkerSizeWrite, HostedConfigSize, WorkerSizeAdvisory, WorkerSizeRefusal, WorkerSizeSpec, WorkerSizeWarning } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
 import { ABSOLUTE_MAX, BUILTIN_WORKER_SIZES, MAX_WORKER_SIZES, SIZE_NAME_PATTERN } from "../../lib/workerSizes";
 import { delay, mockScenario, requireAdmin } from "./shared";
@@ -14,7 +14,8 @@ import { workers } from "./workers";
 //
 // Ceilings mirror a chart with 4 CPU / 32768 MiB / 50 GiB disk and DinD; the editor is
 // editable (read-only under ?mock=sizes-readonly); one quota_unavailable advisory shows how a
-// missing quota reads (never as fits). Field errors and warnings use the api's exact text.
+// missing quota reads (never as fits); one size_refused refusal shows a refused size in its
+// row. Field errors and warnings use the api's exact text.
 
 const FIELDS = ["cpu_request_millicores", "cpu_limit_millicores", "memory_request_mib", "memory_limit_mib", "data_gib", "dind_data_gib"] as const;
 
@@ -74,6 +75,21 @@ function advisories(): WorkerSizeAdvisory[] {
     field: "",
     message: "quota advisory unavailable for the restricted tier: its quota values (workers.quota.*) are not available to the api",
   }];
+}
+
+// One worker the controller would not run at its size, as the api reports it: the demo's
+// cordoned M worker. Served only while its size exists, as the api does.
+const REFUSALS: WorkerSizeRefusal[] = [{
+  size: "m",
+  worker_id: "w-cordon-eu",
+  worker_name: "base.m-9f3c",
+  kind: "size_refused",
+  reason: "cpu limit 4000 millicores exceeds the controller's 3000 millicores ceiling",
+  reported_at: "2026-11-18T14:20:00Z",
+}];
+
+function refusals(): WorkerSizeRefusal[] {
+  return REFUSALS.filter((r) => rows.some((row) => row.name === r.size));
 }
 
 // Each field's unit, and the api's absolute cap per unit (api/internal/workersize/builtin),
@@ -221,6 +237,7 @@ export const workerSizesApi = {
       read_only_code: readOnly() ? READ_ONLY_CODE : null,
       advisories: advisories(),
       max_sizes: MAX_WORKER_SIZES,
+      refusals: refusals(),
     });
   },
   // Both verbs are the api's one PUT: an existing name is edited, an absent one created.

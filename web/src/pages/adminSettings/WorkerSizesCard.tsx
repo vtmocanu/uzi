@@ -8,6 +8,7 @@ import {
   type WorkerSizeCeilings,
   type WorkerSizeSpec,
   type WorkerSizeDeleteRefusal,
+  type WorkerSizeRefusal,
   type WorkerSizeWarning,
 } from "../../lib/api";
 import { ApiError, errorMessage } from "../../lib/apiError";
@@ -94,6 +95,48 @@ const ADVISORY_TONE: Record<WorkerSizeAdvisory["kind"], BadgeTone> = {
   quota_zero: "danger",
   quota_exceeded: "warning",
 };
+
+// A refused size in plain words: who refused it, before the controller's own reason.
+const REFUSAL_KIND: Record<WorkerSizeRefusal["kind"], string> = {
+  size_refused: "controller refused this size",
+  pvc_rejected: "cluster rejected a volume claim",
+};
+
+// The workers a row names before "and N more" (the rest are on Admin health).
+const REFUSALS_SHOWN = 3;
+
+const HEALTH_ROUTE = "/admin/health";
+
+// The workers the cluster would not run at this size: a danger badge in the row's badges,
+// then up to three workers, each linking to Admin health where its report lives.
+function SizeRefusals({ label, items }: { label: string; items: WorkerSizeRefusal[] }) {
+  const shown = items.slice(0, REFUSALS_SHOWN);
+  const more = items.length - shown.length;
+  return (
+    <ul aria-label={`Workers refused at size ${label}`} className="mt-2 w-[8rem] space-y-1.5 text-xs font-normal sm:w-auto sm:max-w-[16rem]">
+      {shown.map((r, i) => {
+        const who = r.worker_name || r.worker_id;
+        return (
+          <li key={`${r.worker_id}-${r.kind}-${i}`} className="[overflow-wrap:anywhere]">
+            {/* The accessible name starts with the visible worker name (label in name). */}
+            <Link to={HEALTH_ROUTE} aria-label={`${who} in Admin health`} className="font-medium text-info hover:underline">
+              {who}
+            </Link>
+            <span className="text-fg">: {REFUSAL_KIND[r.kind] ?? r.kind}</span>
+            {r.reason && <span className="block text-muted">{r.reason}</span>}
+          </li>
+        );
+      })}
+      {more > 0 && (
+        <li>
+          <Link to={HEALTH_ROUTE} className="text-info hover:underline">
+            and {more} more {more === 1 ? "worker" : "workers"} in Admin health
+          </Link>
+        </li>
+      )}
+    </ul>
+  );
+}
 
 function ceilingsLine(c: WorkerSizeCeilings): string {
   const parts: string[] = [];
@@ -574,6 +617,10 @@ export function WorkerSizesCard({
   const orphanAdvisories = data.advisories.filter((a) => !data.sizes.some((s) => s.name === a.size));
   if (orphanAdvisories.length > 0) advisoriesBySize.push({ size: "", items: orphanAdvisories });
 
+  // Refusals per size; an older api sends none, and one for a size no longer listed has no row.
+  const refusalsBySize = new Map<string, WorkerSizeRefusal[]>();
+  for (const r of data.refusals ?? []) refusalsBySize.set(r.size, [...(refusalsBySize.get(r.size) ?? []), r]);
+
   const tiers = ceilings.enabled_tiers;
   const editLabel = editingRow ? sizeLabel(editingRow.name) : "";
 
@@ -643,6 +690,7 @@ export function WorkerSizesCard({
                 const canRemove = !row.builtin;
                 const confirmAction = confirming?.name === row.name ? confirming.action : null;
                 const isConfirming = (confirmAction === "reset" && canReset) || (confirmAction === "remove" && canRemove);
+                const refused = refusalsBySize.get(row.name) ?? [];
                 const resetLowers =
                   !!row.shipped && (row.shipped.data_gib < row.data_gib || row.shipped.dind_data_gib < row.dind_data_gib);
                 return (
@@ -652,7 +700,9 @@ export function WorkerSizesCard({
                         <span className="whitespace-nowrap">{label}</span>
                         {row.builtin && <Badge>Builtin</Badge>}
                         {row.customized && <Badge tone="brand">Customized</Badge>}
+                        {refused.length > 0 && <Badge tone="danger">Refused</Badge>}
                       </div>
+                      {refused.length > 0 && <SizeRefusals label={label} items={refused} />}
                       {canReset && (
                         <p className="mt-1 w-[8rem] text-xs font-normal text-faint sm:w-auto sm:max-w-[16rem]">
                           Shipped: {specSummary(row.shipped!)}
@@ -929,7 +979,7 @@ export function WorkerSizesCard({
       <p className="text-xs text-muted">
         A size the cluster refuses, above a controller ceiling or with a disk claim it rejects, is reported per worker
         on{" "}
-        <Link to="/admin/health" className="text-info hover:underline">
+        <Link to={HEALTH_ROUTE} className="text-info hover:underline">
           Admin health
         </Link>
         .

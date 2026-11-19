@@ -26,6 +26,15 @@ describe("mock admin worker sizes", () => {
     expect(got.advisories.map((a) => a.kind)).toEqual(["quota_unavailable"]);
   });
 
+  it("serves one size_refused refusal on the builtin M size, naming a worker the mock lists", async () => {
+    const api = await fresh();
+    const got = await api.getAdminWorkerSizes();
+    expect(got.refusals?.map((r) => [r.size, r.kind, r.worker_name])).toEqual([["m", "size_refused", "base.m-9f3c"]]);
+    const { workers } = await api.listWorkers();
+    const w = workers.find((x) => x.id === got.refusals![0].worker_id);
+    expect(w).toMatchObject({ name: "base.m-9f3c", hosted_size: "m" });
+  });
+
   it("an edit reaches the provision config and new workers; a reset restores the shipped values", async () => {
     const api = await fresh();
     const l = (await api.getAdminWorkerSizes()).sizes.find((s) => s.name === "l")!;
