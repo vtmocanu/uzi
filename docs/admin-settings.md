@@ -310,6 +310,12 @@ Edit them in the **Hosted worker quota** card on **Admin → Workers**. The quot
 must be an integer from `0` to `20`; each setting saves independently of the other cards.
 Saving an empty default size (**Reset to default**) restores `l`; the quota itself has no reset and needs a number.
 
+The same tab has a **Worker sizes** card that edits what each shipped size provides
+(CPU, memory, data and DinD disk) and resets it to the shipped values; see
+[Editing sizes](./hosted-workers.md#editing-sizes-admins). The default-size settings
+here and under [Ephemeral workers](#ephemeral-workers) still accept only the shipped
+names.
+
 Every size counts the same 1 against this quota; see
 [Hosted workers](./hosted-workers.md#type-and-size). This setting exists (and
 is editable) on every instance, including compose ones — it's simply inert

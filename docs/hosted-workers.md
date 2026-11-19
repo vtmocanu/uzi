@@ -45,7 +45,8 @@ particular token afterwards from **Settings → Workers** if you want one.
 **L** (the default), or **L-HIGHMEM**, with larger presets providing more capacity. The provision
 form shows the exact numbers next to each option when you pick — they live
 there, not here, so they can't say something different from what you'll
-actually get. Every size also gets the same 20Gi tools cache (`/nix`),
+actually get. The numbers quoted on this page are the shipped defaults: an
+admin can [edit them](#editing-sizes-admins) per instance. Every size also gets the same 20Gi tools cache (`/nix`),
 regardless of size or type — the one number that doesn't change with your
 choice.
 
@@ -67,7 +68,8 @@ than **L**, so pick it only when a workload needs it. A pod only fits on a node 
 at least 24Gi allocatable plus its sidecars, and a fleet of them can hit the
 worker namespace's shared quota, which shows as a failed replica on the worker's
 Deployment. New persistent **M** workers allocate 25Gi of `/data`, and **L** and
-**L-HIGHMEM** workers allocate 50Gi. Ephemeral data uses its independent 40Gi default. Existing data volumes
+**L-HIGHMEM** workers allocate 50Gi. These are the shipped defaults; an admin can
+[edit them](#editing-sizes-admins). Ephemeral data uses its independent 40Gi default. Existing data volumes
 are converged **upward** to these sizes by the controller when the claim's StorageClass allows volume
 expansion; it never shrinks, deletes or recreates a volume. An accepted
 expansion grows the claim's request first. The filesystem can stay pending until the
@@ -92,6 +94,40 @@ not to save quota: **L** for large projects (a big JVM test suite, a large
 `go build`), **S** for light repos. A hosted worker's CPU, memory and disk
 are real capacity on a shared cluster, so an oversized pick you don't need
 is capacity someone else's worker doesn't get.
+
+### Editing sizes (admins)
+
+The **Worker sizes** card on **Admin → Workers** edits the CPU request and limit,
+memory request and limit, data disk and DinD disk of each shipped size (`s`, `m`,
+`l`, `l-highmem`). **Reset** on a customized size returns it to its shipped values.
+Adding and removing sizes is not available yet.
+
+- **What an edit reaches.** The provision form and size labels show the new
+  numbers at once. Existing idle workers pick up CPU and memory changes through the
+  controller's paced roll; a busy worker rolls once it is idle. A disk-only edit
+  rolls nothing: claims grow in place where the StorageClass allows expansion.
+  Lowering a disk only affects new workers, because claims never shrink (the editor
+  warns before you save).
+- **Chart ceilings.** A value above the namespace LimitRange ceilings is refused
+  with a message naming the chart value to raise. The binding ceiling is the minimum
+  over the enabled tiers: `workers.limitRange.max.cpu`, `.max.memory` and
+  `.maxPVCStorage`; `workers.docker.limitRange.*`;
+  `workers.isolatedLane.limitRange.max.*`. The DinD disk is checked against
+  `workers.docker.limitRange.maxPVCStorage` unless `workers.docker.dindDataSize`
+  overrides it. ResourceQuota is advisory only: an edit that does not fit shows a
+  warning but saves, a quota of zero is accepted, and quota values the api cannot
+  read show as "quota check unavailable", never as unlimited or as fitting.
+- **Read-only until supported.** The editor stays read-only, and saves are refused
+  with `409`, until the controller advertises support on a fresh status report. On
+  a rolling upgrade the api rolls first, so the card unlocks once the new controller
+  reports in. Downgrading the api or the controller after a customization is
+  unsupported.
+- **Refusals.** A size the controller refuses (above its own ceilings) or a PVC the
+  cluster rejects at create shows on the worker as provisioning or upgrade
+  failed, and in [Admin health](./admin-health.md) on the **Worker image roll** check (`fleet.roll`).
+
+`uzi worker list` and `uzi worker get` show a `SIZE` column; see
+[CLI reference](./cli.md#worker-size).
 
 ## Your quota
 
