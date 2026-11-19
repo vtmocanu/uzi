@@ -3599,6 +3599,28 @@ With no such record, completion behaves as before, and your own discard is
 never blocked. Since nothing creates a record yet, you should not see either
 reason today.
 
+### Retirement waits for run starts in the same repo
+
+Starting a run that could depend on a finished run's terminal ref (an issue,
+self-improve, continued task, review, fix, MR rework, CI fix or judge run) now
+coordinates with terminal-ref retirement in the same repo, so the two can never
+both act on stale facts. Retirement is still switched off, so in this release
+none of this is visible.
+
+Once retirement is on, you may see:
+
+- **A short 503.** If a retirement is deciding for the repo at that moment, a
+  start may wait up to about 6 seconds and, in the rare case it still cannot
+  proceed, answers `503` with `Retry-After: 1`. Nothing was created; retry. The
+  pollers and the scheduler treat it the same way: the trigger is not used up
+  and is tried again on the next pass.
+- **`retire kept: consumer_gate_busy`** on a terminal-preservation record: a
+  run start was in progress, so retirement kept the ref and tries again later.
+- **A slightly slower worker report.** A finished run's report can wait up to
+  about 4 seconds per gated step (at most two steps) before its follow-up runs
+  are created. Those follow-ups, and the MR it reports, are still recorded if the
+  worker drops the connection meanwhile.
+
 ### The worker side is built but switched off
 
 The worker code that captures a finished run's work and calls the terminal

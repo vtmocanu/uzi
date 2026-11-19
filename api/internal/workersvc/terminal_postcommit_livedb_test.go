@@ -504,8 +504,8 @@ func TestTerminalPostCommitCombinedContentionLiveDB(t *testing.T) {
 	if n := reviewsOf(t, f, task); n != 1 {
 		t.Fatalf("review runs created = %d, want 1", n)
 	}
-	// Each writer waits for its own holder: the gate-added time is the two holds, never more than two
-	// full bounded waits (4s on the holders' own bound) plus slack.
+	// Each writer waits for its own holder: the gate-added time is about the two 1s holds. The upper
+	// bound is a loose sanity limit; a writer that hit busy fails the mr_iid and review checks above.
 	if rep.took < 2*hold || rep.took > 2*4*time.Second+2*time.Second {
 		t.Fatalf("report took %v, want between %v and 10s", rep.took, 2*hold)
 	}

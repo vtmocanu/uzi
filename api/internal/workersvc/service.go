@@ -6103,8 +6103,9 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 	// reconcile, the authoritative re-read (an error there skips every hook) and the three gated
 	// fire-once hooks (judge, task review, then-fix), whose only new wait is the bounded consumer
 	// gate. Deliberately NO deadline is added: the hooks warn-and-swallow and never retry, and their
-	// downstream waits (judge target lock, run-branch lock, row locks) are unbounded today, so any
-	// deadline could drop an otherwise-successful admission. The other best-effort steps keep ctx.
+	// downstream waits (judge target lock, run-branch lock, row locks) have no timeout of their own,
+	// so any deadline could drop an otherwise-successful admission. Detached, those waits are no
+	// longer cut short by the request ending (ADR-4007 T3 residual limits). Other steps keep ctx.
 	postCtx := context.WithoutCancel(ctx)
 	if req.MrIID != nil {
 		if mrErr := s.reconcileRunMRGated(postCtx, owned.RepoID, store.ReconcileRunMRParams{

@@ -223,7 +223,7 @@ transaction commits, the gated `ReconcileRunMR`, the authoritative re-read that
 gates the hook block, and the fire-once judge, task-review and then-fix
 dispatches run on `context.WithoutCancel` of the request context, with **no
 aggregate or per-hook deadline**. Those hooks warn-and-swallow and never retry,
-and the judge target lock wait is unbounded today, so any new overall deadline
+and the judge target lock wait has no timeout of its own, so any new overall deadline
 could drop an otherwise successful fire-once admission even with retirement
 disabled. The only new wait is the gate's, bounded as above; at most two gated
 writers run per report (`ReconcileRunMR` plus one hook: judge kinds and task
@@ -239,6 +239,15 @@ a one-time schedule is not consumed.
 on a genuine database fault, as every other database error there already does;
 a durable retry is not built. A busy repository can defer retirement
 indefinitely; that is safe, because the preservation is kept.
+Detachment has a cost: before T3 a worker disconnect or its HTTP timeout
+cancelled the post-commit waits; now a stuck row-lock or judge-lock holder keeps
+the report's handler goroutine and pool connection (and, inside a gated write,
+the shared gate, so retirement keeps `consumer_gate_busy` for that repository)
+until the holder ends. The gate wait itself stays bounded; the downstream waits
+are unbounded exactly as long as their holder is. A fire-once hook that times
+out on a busy gate (two full exclusive holds, which waiter priority rules out
+in normal operation) logs and drops its admission, as every other database
+error there does.
 
 ### Reopen semantics (narrowed)
 
