@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -19,6 +20,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 
+	"github.com/vtmocanu/uzi/controller/internal/preset"
 	"github.com/vtmocanu/uzi/controller/internal/protocol"
 )
 
@@ -256,9 +258,24 @@ func TestOrphanRollCohortAdoptsProvenParticipant(t *testing.T) {
 			o.eraseCanary(t)
 			o.at(tc.proven).Busy = true
 			pre, preSpec := o.marker(t, tc.proven), o.dep(t, tc.proven).Spec.DeepCopy()
+			podBefore, err := o.c.CoreV1().Pods(o.m.cfg.Namespace).Get(context.Background(), "pod-"+tc.proven, metav1.GetOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			drainBefore, clearBefore := append([]string{}, o.cordon.calls...), append([]string{}, o.cordon.clearCalls...)
 			o.c.ClearActions()
 
 			o.mustTick(t)
+			podAfter, err := o.c.CoreV1().Pods(o.m.cfg.Namespace).Get(context.Background(), "pod-"+tc.proven, metav1.GetOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(podBefore, podAfter) {
+				t.Fatalf("recovery changed the busy provider's pod: before %+v after %+v", podBefore, podAfter)
+			}
+			if !equalStrings(o.cordon.calls, drainBefore) || !equalStrings(o.cordon.clearCalls, clearBefore) {
+				t.Fatalf("recovery tick cordoned or uncordoned: drain %v -> %v, clear %v -> %v", drainBefore, o.cordon.calls, clearBefore, o.cordon.clearCalls)
+			}
 			want := []string{"patch deployments " + deploymentName(tc.proven) + " metadata"}
 			if got := actionTrace(o.c); !equalStrings(got, want) {
 				t.Fatalf("recovery tick wrote %v, want exactly %v", got, want)
@@ -413,6 +430,30 @@ func TestOrphanRollCohortRecoveryRequiresIncarnationProof(t *testing.T) {
 		{name: "malformed marker on another participant", mutate: func(t *testing.T, o *orphanCohort) {
 			o.edit(t, "w3", func(d *appsv1.Deployment) { d.Annotations[annotationRoll] = "{not json" })
 		}},
+		{name: "positive control with a stricter reservation coverage adopts", adopts: true, mutate: func(t *testing.T, o *orphanCohort) {
+			o.requireCoverage(t, []string{"gpu"}, []string{"proto-1"}, true)
+		}},
+		{name: "frozen scheduling capability missing from evidence", mutate: func(t *testing.T, o *orphanCohort) {
+			o.requireCoverage(t, []string{"gpu"}, nil, false)
+		}},
+		{name: "frozen protocol capability missing from evidence", mutate: func(t *testing.T, o *orphanCohort) {
+			o.requireCoverage(t, nil, []string{"proto-1"}, false)
+		}},
+		{name: "reservation lane differs from the observed namespace", mutate: func(t *testing.T, o *orphanCohort) {
+			mk := o.marker(t, "w2")
+			mk.Coverage.Lane = "another-namespace"
+			raw, _ := json.Marshal(mk)
+			o.edit(t, "w2", func(d *appsv1.Deployment) { d.Annotations[annotationRoll] = string(raw) })
+		}},
+		{name: "out-of-pool canary without coverage evidence", canaries: []string{"uzi-hw-w9"}, mutate: func(t *testing.T, o *orphanCohort) {
+			o.outsider(t, true, false)
+		}},
+		{name: "out-of-pool incomplete reservation without coverage evidence", mutate: func(t *testing.T, o *orphanCohort) {
+			o.outsider(t, false, false)
+		}},
+		{name: "out-of-pool incomplete reservation in another coverage pool of the same owner", mutate: func(t *testing.T, o *orphanCohort) {
+			o.outsider(t, false, true)
+		}},
 		{name: "smaller-id participant with stale evidence only", wantReason: orphanHold, wantBlock: "w2", mutate: func(t *testing.T, o *orphanCohort) {
 			o.at("w2").RollEvidence = onlineEvidence(m5Now)
 			o.prove(t, "w3")
@@ -455,6 +496,55 @@ func TestOrphanRollCohortRecoveryRequiresIncarnationProof(t *testing.T) {
 			}
 		})
 	}
+}
+
+// requireCoverage freezes the given capability requirements into w2's and w3's
+// reservations; w2's evidence advertises them only when w2Has is set.
+func (o *orphanCohort) requireCoverage(t *testing.T, sched, proto []string, w2Has bool) {
+	t.Helper()
+	for _, id := range []string{"w2", "w3"} {
+		mk := o.marker(t, id)
+		mk.Coverage.Scheduling, mk.Coverage.Protocol = sched, proto
+		raw, _ := json.Marshal(mk)
+		o.edit(t, id, func(d *appsv1.Deployment) { d.Annotations[annotationRoll] = string(raw) })
+	}
+	if w2Has {
+		ev := o.at("w2").RollEvidence
+		ev.SchedulingCapabilities = append([]string{}, sched...)
+		ev.ProtocolCapabilities = append([]string{}, proto...)
+	}
+}
+
+// outsider adds a same-owner, same-namespace worker w9 outside the pool, carrying an
+// incomplete reservation (a canary one when canary is set). With otherPool it has
+// coverage evidence and a reservation under a different capability set, forming its own
+// pool; without it, it has no coverage evidence at all.
+func (o *orphanCohort) outsider(t *testing.T, canary, otherPool bool) {
+	t.Helper()
+	mk := o.marker(t, "w2")
+	mk.Canary = canary
+	w := desired("w9")
+	if otherPool {
+		w = evidence(w, m5Now)
+		w.RollEvidence.SchedulingCapabilities = []string{"zzz"}
+		mk.Coverage.Scheduling = []string{"zzz"}
+		// Keep the reservation current for w9's own target so its pool leaves it alone.
+		spec, err := o.m.resolver.Resolve(w.Template, w.Size)
+		if err != nil {
+			t.Fatal(err)
+		}
+		target := RenderDeployment(o.m.cfg, w, spec)
+		mk.Hash, mk.Image = target.Spec.Template.Annotations[AnnotationSpecHash], workerImage(target)
+	}
+	raw, _ := json.Marshal(mk)
+	dep := o.dep(t, "w2").DeepCopy()
+	dep.Name, dep.UID, dep.ResourceVersion = deploymentName("w9"), "uid-w9", ""
+	dep.Labels = objectLabels("w9")
+	dep.Annotations[annotationRoll] = string(raw)
+	if _, err := o.c.AppsV1().Deployments(dep.Namespace).Create(context.Background(), dep, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	o.workers = append(o.workers, w)
 }
 
 // duplicate adds a second Deployment of ours for the same worker id.
@@ -654,6 +744,141 @@ func TestOrphanRollCohortDelayedAdoptionAcrossRestart(t *testing.T) {
 	}
 }
 
+// A proven participant is not in flight, so once a later participant gains fresh proof
+// the pool can have no unproven reservation at all. Ordinary planning must still not
+// admit a drifted worker as a second canary while a withheld adoption patch for the
+// proven participant can commit.
+func TestOrphanRollCohortNoNewCanaryWhileProvenReservationsRemain(t *testing.T) {
+	// w1 canary (promoted), w2 and w3 reserved, w4 drifted and unreserved.
+	m, c, workers, cordon := matrixFixture(t, 4)
+	m.cfg.RollConcurrency = 2
+	o := &orphanCohort{m: m, c: c, base: c.ReactionChain[1], cordon: cordon, workers: workers}
+	rollTickTest(t, m, workers)
+	removeOldPod(t, c, "w1")
+	currentProof(t, c, &o.workers[0], m5Now)
+	rollTickTest(t, m, workers)
+	if mk := o.marker(t, "w2"); mk == nil || mk.Canary || mk.Completed {
+		t.Fatalf("w2 is not an incomplete participant: %+v", mk)
+	}
+	if mk := o.marker(t, "w3"); mk == nil || mk.Canary || mk.Completed {
+		t.Fatalf("w3 is not an incomplete participant: %+v", mk)
+	}
+	if mk := o.marker(t, "w4"); mk != nil {
+		t.Fatalf("w4 was reserved ahead of the scenario: %+v", mk)
+	}
+	o.prove(t, "w2")
+	o.eraseCanary(t)
+	var delayed k8stesting.Action
+	o.c.PrependReactor("patch", "deployments", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		if delayed == nil && isAdoptionPatch(a) {
+			delayed = a.DeepCopy()
+			return true, nil, fmt.Errorf("adoption response lost before commit")
+		}
+		return false, nil, nil
+	})
+	if err := o.tick(t); err == nil {
+		t.Fatal("lost adoption was reported as confirmed")
+	}
+	if delayed == nil || delayed.(k8stesting.PatchAction).GetName() != "uzi-hw-w2" {
+		t.Fatalf("w2 was not the adoption target: %v", delayed)
+	}
+
+	// Restart: w3 now has fresh proof, so nothing in the pool is in flight.
+	o.m = matrixRestart(o.m)
+	o.prove(t, "w3")
+	o.c.ClearActions()
+	_ = o.tick(t)
+	for _, line := range actionTrace(o.c) {
+		if strings.Contains(line, "uzi-hw-w4") {
+			t.Fatalf("a drifted unreserved worker was written while reservations were orphaned: %v", actionTrace(o.c))
+		}
+	}
+	if got := templatePatches(o.c); len(got) != 0 {
+		t.Fatalf("template patched while the cohort had no canary: %v", got)
+	}
+	if mk := o.marker(t, "w4"); mk != nil {
+		t.Fatalf("w4 was admitted: %+v", mk)
+	}
+	if _, _, _, canary := o.pacing("w4"); canary == "w4" {
+		t.Fatal("w4 reported as canary")
+	}
+
+	if handled, _, err := o.base.React(delayed); !handled {
+		t.Fatal("the delayed request was not handled")
+	} else {
+		_ = err // committed or rejected as stale; either way at most one canary
+	}
+	for i := 0; i < 2; i++ {
+		_ = o.tick(t)
+	}
+	got := o.canaries(t)
+	if len(got) != 1 || got[0] == "uzi-hw-w4" {
+		t.Fatalf("canaries after the late request = %v, want exactly one participant canary", got)
+	}
+}
+
+// Real controller writes that can reach a participant of an orphan pool must leave a
+// fenced participant fenced, judged from the Deployment the fake API now holds.
+func TestOrphanRollCohortRealWritesKeepFencedParticipantFenced(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(t *testing.T, o *orphanCohort)
+		want   string // the controller write the case must provoke
+	}{
+		{name: "version mapping correction", want: "patch deployments uzi-hw-w3 metadata", mutate: func(t *testing.T, o *orphanCohort) {
+			mk := o.marker(t, "w3")
+			mk.TargetVersion = "0.0.1"
+			raw, _ := json.Marshal(mk)
+			o.edit(t, "w3", func(d *appsv1.Deployment) { d.Annotations[annotationRoll] = string(raw) })
+		}},
+		{name: "pin cancellation", want: "patch deployments uzi-hw-w3 metadata", mutate: func(t *testing.T, o *orphanCohort) {
+			// A new release pin makes every reservation's hash and image obsolete.
+			r, err := preset.NewResolver("harbor.example.com/uzi", "v2.0.0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			o.m.resolver = r
+			o.m.cfg.RollTargetVersion = "2.0.0"
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			o := newOrphanCohort(t, 3, 2)
+			o.recycle(t, "w3")
+			o.prove(t, "w2")
+			o.eraseCanary(t)
+			tc.mutate(t, o)
+			o.c.ClearActions()
+			for i := 0; i < 2; i++ {
+				_ = o.tick(t)
+				if i == 0 {
+					wrote := false
+					for _, line := range actionTrace(o.c) {
+						wrote = wrote || line == tc.want
+					}
+					if !wrote {
+						t.Fatalf("the controller never made the write under test %q: %v", tc.want, actionTrace(o.c))
+					}
+					if got := adoptionPatches(o.c); len(got) != 0 {
+						t.Fatalf("adopted in the tick that rewrote w3: %v", got)
+					}
+				}
+				d := o.dep(t, "w3")
+				mk, err := decodeRoll(d.Annotations[annotationRoll])
+				if err != nil {
+					t.Fatal(err)
+				}
+				observed := &rollEntry{w: protocol.DesiredWorker{ID: "w3"}, dep: d, marker: mk}
+				if !orphanPatchFenced(observed) {
+					t.Fatalf("tick %d lifted the fence on w3: replicas=%v marker=%+v", i, d.Spec.Replicas, mk)
+				}
+				if mk != nil && mk.Canary {
+					t.Fatalf("tick %d made the fenced w3 a canary", i)
+				}
+			}
+		})
+	}
+}
+
 func TestOrphanRollCohortAdoptionWriteOutcomes(t *testing.T) {
 	prepare := func(t *testing.T) *orphanCohort {
 		o := newOrphanCohort(t, 4, 3)
@@ -810,6 +1035,33 @@ func TestOrphanRollCohortCanaryLossEntryPoints(t *testing.T) {
 			mk, err := decodeRoll(d.Annotations[annotationRoll])
 			if err != nil || mk == nil || !mk.Canary || mk.Completed {
 				t.Fatalf("tick %d: held canary's reservation was withdrawn: %+v (%v)", i, mk, err)
+			}
+		}
+	})
+	t.Run("layout hold keeps the canary reservation when the only incomplete participant is hibernating", func(t *testing.T) {
+		cObjs, canary := lmObjects(t, lmOpts{id: "d1", custody: true, layout: "old", marker: "canary", promoted: true})
+		pObjs, part := lmObjects(t, lmOpts{id: "d2", layout: "new", marker: "participant"})
+		f := lmCluster(t, false, append(cObjs, pObjs...)...)
+		canary.Generation = 1
+		// Preparing to hibernate, but refused (roll evidence): the participant keeps its
+		// incomplete reservation and stays a hibernation entry.
+		part.Hibernation = &protocol.Hibernation{State: protocol.HibernationPreparing, OpID: "op-1"}
+		for i := 0; i < 3; i++ {
+			f.tickAll(t, canary, part)
+			d, err := f.client.AppsV1().Deployments(lmNS()).Get(context.Background(), deploymentName("d1"), metav1.GetOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			mk, err := decodeRoll(d.Annotations[annotationRoll])
+			if err != nil || mk == nil || !mk.Canary || mk.Completed {
+				t.Fatalf("tick %d: held canary's reservation was withdrawn: %+v (%v)", i, mk, err)
+			}
+			pd, err := f.client.AppsV1().Deployments(lmNS()).Get(context.Background(), deploymentName("d2"), metav1.GetOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if pm, err := decodeRoll(pd.Annotations[annotationRoll]); err != nil || pm == nil || pm.Completed {
+				t.Fatalf("tick %d: the hibernating participant's reservation changed: %+v (%v)", i, pm, err)
 			}
 		}
 	})

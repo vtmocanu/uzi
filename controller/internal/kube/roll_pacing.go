@@ -470,7 +470,7 @@ func (m *Materializer) holdForLayoutMigration(ctx context.Context, t *rollTick, 
 	// that participant without a canary. Keep the reservation and fence the pool.
 	if e.marker.Canary {
 		for _, p := range t.entries {
-			if p != e && !p.hibernation && p.marker != nil && !p.marker.Completed && !p.marker.Canary &&
+			if p != e && p.marker != nil && !p.marker.Completed && !p.marker.Canary &&
 				coverageKey(p.marker.Coverage) == coverageKey(e.marker.Coverage) {
 				fence()
 				return
@@ -856,7 +856,16 @@ func (m *Materializer) planPool(ctx context.Context, t *rollTick, pool []*rollEn
 		blocker, poolReason = "", "roll target pin changed; pool held until reservations settle"
 	}
 	holdID := ""
-	if inFlight > 0 && canary == "" {
+	// An incomplete non-canary reservation that is already proven (so not counted in
+	// inFlight) can still be the target of a delayed adoption patch; ordinary new-canary
+	// admission must not run while one exists without a canary.
+	orphanReservation := false
+	for _, e := range pool {
+		if e.blocked == "" && e.marker != nil && !e.marker.Completed && !e.marker.Canary {
+			orphanReservation = true
+		}
+	}
+	if (inFlight > 0 || orphanReservation) && canary == "" {
 		var adopted bool
 		if adopted, holdID = m.adoptOrphanCanary(ctx, t, pool, blocker, changed); adopted {
 			return
