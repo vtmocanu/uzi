@@ -21,25 +21,36 @@ import (
 
 const ephemeralRaceSize = "zz-u9e"
 
+const raceWait = 15 * time.Second
+
+// stepHold parks the first transaction that reaches (stage, name) and records its backend pid
+// (read on the held transaction itself).
 type stepHold struct {
 	locked, release chan struct{}
 	once, relOnce   sync.Once
+	pid             int32 // written before locked is closed
+	pidErr          error // likewise
 }
 
 func holdStep(t *testing.T, stage, name string) *stepHold {
 	t.Helper()
 	h := &stepHold{locked: make(chan struct{}), release: make(chan struct{})}
-	restore := store.SetWorkerSizeStepHookForTest(func(s string, names []string) {
+	store.SetWorkerSizeStepHookForTest(t, func(s string, names []string, db store.DBTX) {
 		if s != stage || !slices.Contains(names, name) {
 			return
 		}
 		first := false
-		h.once.Do(func() { first = true; close(h.locked) })
+		h.once.Do(func() {
+			first = true
+			h.pidErr = db.QueryRow(context.Background(), `SELECT pg_backend_pid()`).Scan(&h.pid)
+			close(h.locked)
+		})
 		if first {
 			<-h.release
 		}
 	})
-	t.Cleanup(func() { h.rel(); restore() })
+	// Registered after the hook, so it runs first: release before the hook is cleared.
+	t.Cleanup(h.rel)
 	return h
 }
 
@@ -49,18 +60,23 @@ func (h *stepHold) waitLocked(t *testing.T) {
 	t.Helper()
 	select {
 	case <-h.locked:
-	case <-time.After(15 * time.Second):
+	case <-time.After(raceWait):
 		t.Fatal("the held transaction never reached its lock step")
+	}
+	if h.pidErr != nil {
+		t.Fatalf("read the held transaction's backend pid: %v", h.pidErr)
 	}
 }
 
-func waitLockWaitOn(t *testing.T, pool *pgxpool.Pool, marker string) {
+// waitBlockedBy polls until some backend's pg_blocking_pids contains the holder's backend pid,
+// within a bounded time.
+func waitBlockedBy(t *testing.T, pool *pgxpool.Pool, holderPid int32) {
 	t.Helper()
-	deadline := time.Now().Add(15 * time.Second)
+	deadline := time.Now().Add(raceWait)
 	for time.Now().Before(deadline) {
 		var n int
 		if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM pg_stat_activity
-			WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE $1`, "%"+marker+"%").Scan(&n); err != nil {
+			WHERE datname = current_database() AND $1::int = ANY(pg_blocking_pids(pid))`, holderPid).Scan(&n); err != nil {
 			t.Fatal(err)
 		}
 		if n > 0 {
@@ -68,7 +84,18 @@ func waitLockWaitOn(t *testing.T, pool *pgxpool.Pool, marker string) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("no backend ever waited on a Lock for a statement containing %q", marker)
+	t.Fatalf("no backend was ever blocked by backend pid %d", holderPid)
+}
+
+func awaitRace[T any](t *testing.T, ch <-chan T, what string) T {
+	t.Helper()
+	select {
+	case v := <-ch:
+		return v
+	case <-time.After(raceWait):
+		t.Fatalf("%s did not finish", what)
+		panic("unreachable")
+	}
 }
 
 func seedRaceSize(t *testing.T, e *wakeEnv) {
@@ -122,7 +149,7 @@ func TestEphemeralProvisionRacesSizeDeleteLiveDB(t *testing.T) {
 
 		dDone := make(chan error, 1)
 		go func() { dDone <- guardedDelete(e.ctx, e.pool, ephemeralRaceSize) }()
-		waitLockWaitOn(t, e.pool, "FOR UPDATE")
+		waitBlockedBy(t, e.pool, hold.pid)
 		select {
 		case err := <-dDone:
 			t.Fatalf("the delete finished while the provision held its lock: %v", err)
@@ -130,11 +157,11 @@ func TestEphemeralProvisionRacesSizeDeleteLiveDB(t *testing.T) {
 		}
 
 		hold.rel()
-		if p := <-pDone; p.err != nil || !p.ok {
+		if p := awaitRace(t, pDone, "the provision"); p.err != nil || !p.ok {
 			t.Fatalf("provision = %+v, want created", p)
 		}
 		var refusal *store.WorkerSizeRefusal
-		err := <-dDone
+		err := awaitRace(t, dDone, "the delete")
 		if !asRefusal(err, &refusal) || refusal.Reason != store.WorkerSizeRefusedInUse || refusal.Workers != 1 {
 			t.Fatalf("delete after a committed provision = %v, want in_use with 1 worker", err)
 		}
@@ -155,7 +182,7 @@ func TestEphemeralProvisionRacesSizeDeleteLiveDB(t *testing.T) {
 
 		pDone := make(chan provOut, 1)
 		go func() { ok, err := provisionAt(e, run); pDone <- provOut{ok, err} }()
-		waitLockWaitOn(t, e.pool, "FOR SHARE")
+		waitBlockedBy(t, e.pool, hold.pid)
 		select {
 		case p := <-pDone:
 			t.Fatalf("the provision finished while the delete held its lock: %+v", p)
@@ -163,11 +190,11 @@ func TestEphemeralProvisionRacesSizeDeleteLiveDB(t *testing.T) {
 		}
 
 		hold.rel()
-		if err := <-dDone; err != nil {
+		if err := awaitRace(t, dDone, "the delete"); err != nil {
 			t.Fatalf("delete = %v, want success", err)
 		}
 		// Skipped (false, nil): never an error, never a worker, and the run is untouched.
-		if p := <-pDone; p.err != nil || p.ok {
+		if p := awaitRace(t, pDone, "the provision"); p.err != nil || p.ok {
 			t.Fatalf("provision after the delete = %+v, want skipped (false, nil)", p)
 		}
 		if e.count(`SELECT count(*) FROM workers WHERE user_id = $1 AND ephemeral`, e.user) != 0 {

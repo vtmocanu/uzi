@@ -36,22 +36,15 @@ const (
 	WorkerSizeStepDeleteLocked = "delete_locked"
 )
 
-type workerSizeStepFunc func(stage string, names []string)
+type workerSizeStepFunc func(stage string, names []string, db DBTX)
 
+// workerSizeStepHook is nil in production; only SetWorkerSizeStepHookForTest (a
+// non-_test file compiled into the package so other packages' tests can use it) sets it.
 var workerSizeStepHook atomic.Pointer[workerSizeStepFunc]
 
-// SetWorkerSizeStepHookForTest installs a hook called synchronously after a worker-size row
-// lock is taken, so a test can hold a transaction at that point deterministically. It is a
-// no-op in production (no hook installed). The returned func removes it.
-func SetWorkerSizeStepHookForTest(fn func(stage string, names []string)) (restore func()) {
-	f := workerSizeStepFunc(fn)
-	workerSizeStepHook.Store(&f)
-	return func() { workerSizeStepHook.Store(nil) }
-}
-
-func workerSizeStep(stage string, names ...string) {
+func workerSizeStep(stage string, db DBTX, names ...string) {
 	if f := workerSizeStepHook.Load(); f != nil {
-		(*f)(stage, names)
+		(*f)(stage, names, db)
 	}
 }
 
@@ -67,7 +60,7 @@ func LockWorkerSizeShared(ctx context.Context, db DBTX, name string) (bool, erro
 	if err != nil {
 		return false, fmt.Errorf("lock worker size %q: %w", name, err)
 	}
-	workerSizeStep(WorkerSizeStepShared, name)
+	workerSizeStep(WorkerSizeStepShared, db, name)
 	return true, nil
 }
 
@@ -82,7 +75,7 @@ func LockWorkerSizesShared(ctx context.Context, db DBTX, names []string) ([]stri
 	if err != nil {
 		return nil, fmt.Errorf("lock worker sizes: %w", err)
 	}
-	workerSizeStep(WorkerSizeStepShared, names...)
+	workerSizeStep(WorkerSizeStepShared, db, names...)
 	return found, nil
 }
 
@@ -173,7 +166,7 @@ func DeleteWorkerSizeGuarded(ctx context.Context, db DBTX, name string) error {
 	if err != nil {
 		return fmt.Errorf("lock worker size %q: %w", name, err)
 	}
-	workerSizeStep(WorkerSizeStepDeleteLocked, name)
+	workerSizeStep(WorkerSizeStepDeleteLocked, db, name)
 	if isBuiltin {
 		return &WorkerSizeRefusal{Reason: WorkerSizeRefusedBuiltin}
 	}

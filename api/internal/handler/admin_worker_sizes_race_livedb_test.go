@@ -28,28 +28,37 @@ import (
 
 const raceWait = 15 * time.Second
 
-// raceHold pauses the first transaction that reaches (stage, name) until release.
+// raceHold pauses the first transaction that reaches (stage, name) until release, and records
+// that transaction's backend pid (read on the held transaction itself, before it is parked).
 type raceHold struct {
 	locked  chan struct{}
 	release chan struct{}
 	once    sync.Once
 	relOnce sync.Once
+	pid     int32 // written before locked is closed
+	pidErr  error // likewise
 }
 
 func holdAt(t *testing.T, stage, name string) *raceHold {
 	t.Helper()
 	h := &raceHold{locked: make(chan struct{}), release: make(chan struct{})}
-	restore := store.SetWorkerSizeStepHookForTest(func(s string, names []string) {
+	store.SetWorkerSizeStepHookForTest(t, func(s string, names []string, db store.DBTX) {
 		if s != stage || !slices.Contains(names, name) {
 			return
 		}
 		first := false
-		h.once.Do(func() { first = true; close(h.locked) })
+		h.once.Do(func() {
+			first = true
+			h.pidErr = db.QueryRow(context.Background(), `SELECT pg_backend_pid()`).Scan(&h.pid)
+			close(h.locked)
+		})
 		if first {
 			<-h.release
 		}
 	})
-	t.Cleanup(func() { h.Release(); restore() })
+	// Registered after the hook, so it runs first: the parked transaction is released before
+	// the hook is cleared.
+	t.Cleanup(h.Release)
 	return h
 }
 
@@ -62,18 +71,21 @@ func (h *raceHold) WaitLocked(t *testing.T) {
 	case <-time.After(raceWait):
 		t.Fatal("the held transaction never reached its lock step")
 	}
+	if h.pidErr != nil {
+		t.Fatalf("read the held transaction's backend pid: %v", h.pidErr)
+	}
 }
 
-// waitLockWait polls pg_stat_activity until a backend is waiting on a heavyweight Lock while
-// running a statement containing marker (the blocked statement's text is distinctive), within
-// a bounded time.
-func waitLockWait(t *testing.T, pool *pgxpool.Pool, marker string) {
+// waitBlockedBy polls until some backend's pg_blocking_pids contains the holder's backend pid,
+// i.e. the other side is genuinely queued behind the held transaction's lock, within a
+// bounded time.
+func waitBlockedBy(t *testing.T, pool *pgxpool.Pool, holderPid int32) {
 	t.Helper()
 	deadline := time.Now().Add(raceWait)
 	for time.Now().Before(deadline) {
 		var n int
 		err := pool.QueryRow(context.Background(), `SELECT count(*) FROM pg_stat_activity
-			WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE $1`, "%"+marker+"%").Scan(&n)
+			WHERE datname = current_database() AND $1::int = ANY(pg_blocking_pids(pid))`, holderPid).Scan(&n)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -82,7 +94,7 @@ func waitLockWait(t *testing.T, pool *pgxpool.Pool, marker string) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("no backend ever waited on a Lock for a statement containing %q", marker)
+	t.Fatalf("no backend was ever blocked by backend pid %d", holderPid)
 }
 
 func awaitResult[T any](t *testing.T, ch <-chan T, what string) T {
@@ -105,16 +117,13 @@ func notDone[T any](t *testing.T, ch <-chan T, what string) {
 	}
 }
 
-const (
-	markDelete = "FOR UPDATE"
-	markShare  = "FOR SHARE"
-)
-
-// raceWriter is one referencing write. run performs it; verdict checks the outcome of an
-// order (a) commit (the reference exists) or an order (b) refusal.
+// raceWriter is one referencing write. prepare runs on the test goroutine (it may t.Fatal) and
+// returns the work to run on another goroutine, which must never touch t; committed and
+// refused check the outcome of an order (a) commit (the reference exists) or an order (b)
+// refusal.
 type raceWriter struct {
-	name string
-	run  func(t *testing.T, f *sizeFx, size string) any
+	name    string
+	prepare func(t *testing.T, f *sizeFx, size string) func() any
 	// committed asserts the write committed and that the delete refused because of it.
 	committed func(t *testing.T, f *sizeFx, size string, writeOut any, del *httptest.ResponseRecorder)
 	// refused asserts the write was refused after the delete removed the size.
@@ -125,8 +134,9 @@ func raceWriters() []raceWriter {
 	settingWriter := func(key string) raceWriter {
 		return raceWriter{
 			name: "settings " + key,
-			run: func(t *testing.T, f *sizeFx, size string) any {
-				return cookieReq(t, f.router, http.MethodPut, "/api/admin/settings", f.jwt, `{"settings":{"`+key+`":"`+size+`"}}`)
+			prepare: func(t *testing.T, f *sizeFx, size string) func() any {
+				serve := cookieReqPrepared(t, f.router, http.MethodPut, "/api/admin/settings", f.jwt, `{"settings":{"`+key+`":"`+size+`"}}`)
+				return func() any { return serve() }
 			},
 			committed: func(t *testing.T, f *sizeFx, size string, out any, del *httptest.ResponseRecorder) {
 				if rec := out.(*httptest.ResponseRecorder); rec.Code != http.StatusOK {
@@ -153,9 +163,11 @@ func raceWriters() []raceWriter {
 	return []raceWriter{
 		{
 			name: "persistent provision",
-			run: func(t *testing.T, f *sizeFx, size string) any {
-				_, err := f.h.provisionHostedWorker(context.Background(), f.owner, "race-"+size, "base", size, false, 5)
-				return err
+			prepare: func(t *testing.T, f *sizeFx, size string) func() any {
+				return func() any {
+					_, err := f.h.provisionHostedWorker(context.Background(), f.owner, "race-"+size, "base", size, false, 5)
+					return err
+				}
 			},
 			committed: func(t *testing.T, f *sizeFx, size string, out any, del *httptest.ResponseRecorder) {
 				if out != nil && out.(error) != nil {
@@ -193,19 +205,21 @@ func TestWorkerSizeDeleteRacesReferencingWritersLiveDB(t *testing.T) {
 			}
 			hold := holdAt(t, store.WorkerSizeStepShared, size)
 
+			write := w.prepare(t, f, size)
 			wDone := make(chan any, 1)
-			go func() { wDone <- w.run(t, f, size) }()
+			go func() { wDone <- write() }()
 			hold.WaitLocked(t)
 
+			del := cookieReqPrepared(t, f.router, http.MethodDelete, "/api/admin/worker-sizes/"+size, f.jwt, "")
 			dDone := make(chan *httptest.ResponseRecorder, 1)
-			go func() { dDone <- f.del(t, size) }()
-			waitLockWait(t, f.h.pool, markDelete)
+			go func() { dDone <- del() }()
+			waitBlockedBy(t, f.h.pool, hold.pid)
 			notDone(t, dDone, "the delete")
 
 			hold.Release()
 			out := awaitResult(t, wDone, "the write")
-			del := awaitResult(t, dDone, "the delete")
-			w.committed(t, f, size, out, del)
+			delRec := awaitResult(t, dDone, "the delete")
+			w.committed(t, f, size, out, delRec)
 			if !f.exists(t, size) {
 				t.Fatal("the size was deleted although a committed write references it")
 			}
@@ -219,19 +233,21 @@ func TestWorkerSizeDeleteRacesReferencingWritersLiveDB(t *testing.T) {
 			}
 			hold := holdAt(t, store.WorkerSizeStepDeleteLocked, size)
 
+			del := cookieReqPrepared(t, f.router, http.MethodDelete, "/api/admin/worker-sizes/"+size, f.jwt, "")
 			dDone := make(chan *httptest.ResponseRecorder, 1)
-			go func() { dDone <- f.del(t, size) }()
+			go func() { dDone <- del() }()
 			hold.WaitLocked(t)
 
+			write := w.prepare(t, f, size)
 			wDone := make(chan any, 1)
-			go func() { wDone <- w.run(t, f, size) }()
-			waitLockWait(t, f.h.pool, markShare)
+			go func() { wDone <- write() }()
+			waitBlockedBy(t, f.h.pool, hold.pid)
 			notDone(t, wDone, "the write")
 
 			hold.Release()
-			del := awaitResult(t, dDone, "the delete")
-			if del.Code != http.StatusOK {
-				t.Fatalf("delete = %d %s, want 200", del.Code, del.Body.String())
+			delRec := awaitResult(t, dDone, "the delete")
+			if delRec.Code != http.StatusOK {
+				t.Fatalf("delete = %d %s, want 200", delRec.Code, delRec.Body.String())
 			}
 			w.refused(t, f, size, awaitResult(t, wDone, "the write"))
 			if f.exists(t, size) {
